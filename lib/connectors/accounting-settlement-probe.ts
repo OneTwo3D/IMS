@@ -59,7 +59,9 @@ function num(value: unknown): number | null {
  * `num()` IS DELIBERATELY STILL USED FOR THE COMPLETENESS ARITHMETIC BELOW. That cross-check asks a
  * different question — "does Xero's own total of what settles this document agree with the collection
  * it sent me?" — and its answer must not change because a figure was too finely stated to compare. It
- * is unchanged, and so are its tests.
+ * is unchanged, and so are its tests. Its OWN operands are not exact either, and its band is still the
+ * flat pre-o3d-6yho constant: that is the ninth site of this enumeration and it is o3d-r948, stated at
+ * `XERO_AMOUNT_EPSILON` rather than folded in here.
  */
 function statedAmount(raw: unknown, currency: string | null): Pick<LedgerSettlementRecord, 'amount' | 'unreadableAmount'> {
   const amount = readLedgerStatedAmount(raw, currency)
@@ -240,6 +242,7 @@ export async function probeXeroSettlement(
   // o3d-78rq: the wire numbers, kept for the completeness arithmetic below and for NOTHING ELSE. That
   // cross-check asks whether the COLLECTION is complete, not whether a figure in it can be compared
   // exactly, so it must go on reading exactly what it read before — see `statedAmount`.
+  // (Their own exactness is o3d-r948; it is stated at `XERO_AMOUNT_EPSILON` rather than fixed here.)
   const wireAmounts = (invoice.Payments ?? []).map((p) => num(p.Amount))
   const records: LedgerSettlementRecord[] = (invoice.Payments ?? []).map((p) => ({
     ...statedAmount(p.Amount, invoiceCurrency),
@@ -325,7 +328,18 @@ export async function probeXeroSettlement(
   return { ok: true, records }
 }
 
-/** Money compares to the half-penny here too — the same tolerance the classifier uses. */
+/**
+ * Money compares to the half-penny in the COMPLETENESS cross-checks above.
+ *
+ * o3d-78rq — AND THIS IS NO LONGER "the same tolerance the classifier uses", WHICH IS WHAT THIS
+ * COMMENT USED TO SAY. o3d-6yho gave the classifier a band derived from the document's own minor
+ * unit and o3d-78rq made both of its operands `Decimal`s; these four checks kept the flat constant
+ * and the wire doubles. That is a real gap and it is tracked as o3d-r948, not fixed here: the
+ * completeness question — "does the ledger's own total of what settles this document agree with the
+ * collection it sent me?" — is a different question from "is this record the payment IMS made", and
+ * changing both in one commit would have made neither reviewable. Its dangerous direction is TOO
+ * WIDE, since a swallowed shortfall lets a `clear` be built from an incomplete list.
+ */
 const XERO_AMOUNT_EPSILON = 0.005
 
 type QboLinkedTxn = { TxnId?: string; TxnType?: string }
@@ -409,7 +423,7 @@ const QBO_NON_SETTLING_LINK_TYPES: ReadonlySet<string> = new Set([
   'Invoice', 'Bill', 'InventoryQuantityAdjustment',
 ])
 
-/** Money compares to the half-penny, as everywhere else on this path. */
+/** The same flat half-penny, in the same completeness role, with the same gap — see o3d-r948. */
 const QBO_AMOUNT_EPSILON = 0.005
 
 /**

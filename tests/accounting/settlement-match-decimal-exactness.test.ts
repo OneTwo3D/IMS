@@ -135,8 +135,9 @@ test('[o3d-78rq] our own payment is recognised where the two doubles differ by M
 
 test('[o3d-78rq] a HISTORICAL row, with no exact decimal beside its number, is recognised too', () => {
   // ROUTE: the same, through `payloadExactAmount`'s fallback arm — the number's OWN decimal reading.
-  // MUTATION: fall back to the raw number (`amount: p.amount`) and the comparison is a double
-  //        subtraction again, so this returns `clear`.
+  // MUTATION (either kills it): return `null` from that fallback instead of `toDecimal(p.amount)`,
+  //        and this row becomes undescribable; or compare the operands as numbers again, and it
+  //        returns `clear`.
   //
   // The fix is NOT confined to rows written since o3d-1xq8. `toDecimal(aDouble)` is that double's
   // shortest decimal reading, which is exact where the subtraction of two doubles is not, so a row
@@ -203,9 +204,11 @@ test('[o3d-78rq] a ledger figure this connector cannot read exactly WITHHOLDS ra
   //        -> LedgerSettlementRecord.amount === null with `unreadableAmount` set
   //        -> classifyLedgerSettlement's `record-unmeasurable` arm -> `unknown`, which every caller
   //        treats as `present`.
-  // MUTATION: read the amount with the old `num(p.Amount)` — the bare finite check — and the probe
-  //        hands back the wire double; the comparison is then 0.0078125 against a 0.005 band and the
-  //        verdict is `clear`, which posts a second payment.
+  // MUTATION: drop the minor-unit scale rule from `readLedgerStatedAmount` — which is the whole of
+  //        what the old bare `num(p.Amount)` did — and the probe hands the figure back as though it
+  //        were stateable, so this record is no longer a refusal and the verdict is not `unknown`.
+  //        (With the OLD number comparison behind it the verdict was `clear` outright: the two
+  //        doubles are 0.0078125 apart against a 0.005 band, and a second payment posts.)
   //
   // THE PRECONDITION, ASSERTED: the token decodes to a double whose own decimal reading has THREE
   // decimals, which is not a figure a two-decimal currency can state.
@@ -313,8 +316,9 @@ test('[o3d-78rq] an ordinary settlement is read, matched, and an ordinary non-ma
   // rule refuses only what it says it refuses.
   //
   // ROUTE: probeXeroSettlement -> statedAmount -> readLedgerStatedAmount, then the match arm.
-  // MUTATION: size the scale rule with `COARSEST_SUPPORTED_MINOR_UNITS` instead of the document's own
-  //        currency and the KWD case below refuses a payment the ledger states perfectly well.
+  // MUTATION (either kills it): size the scale rule with a fixed `'GBP'` instead of the currency it
+  //        is asked about, and the KWD case below refuses a payment the ledger states perfectly well;
+  //        or drop the scale rule entirely, and the GBP three-decimal figure is admitted.
   const { get } = ledgerDouble({
     'Invoices/inv-1': {
       Invoices: [{
@@ -409,9 +413,11 @@ test('[o3d-78rq] the QuickBooks probe reads its applied amounts through the SAME
   // which is the one place a figure can stop being the one the ledger stated without any single
   // field being odd.
   //
-  // ROUTE: probeQuickBooksSettlement -> qboAmountAppliedTo -> statedAmount -> readLedgerStatedAmount.
-  // MUTATION: leave `amount: qboAmountAppliedTo(...)` as the bare number and the second case below is
-  //        admitted as a figure whose decimal reading nothing establishes.
+  // ROUTE: probeQuickBooksSettlement -> qboAmountAppliedTo -> statedAmount -> readLedgerStatedAmount,
+  //        with the currency read from the DOCUMENT's own `CurrencyRef`.
+  // MUTATION (either kills it): read the applied amount against a fixed `'KWD'` rather than the
+  //        document's currency, and the three-decimal figure is admitted; or drop the scale rule from
+  //        `readLedgerStatedAmount`, and it is admitted for every currency.
   const readable = ledgerDouble({
     'invoice/inv-1': { Invoice: { LinkedTxn: [{ TxnId: '55', TxnType: 'Payment' }], CurrencyRef: { value: 'GBP' }, TotalAmt: 10, Balance: 0 } },
     'payment/55': {
@@ -451,8 +457,9 @@ test('[o3d-78rq] parseLedgerAmount and readLedgerStatedAmount admit exactly the 
   // this branch has now closed five times.
   //
   // ROUTE: both exported readers, over the table each round of o3d-psrx pinned.
-  // MUTATION: reinstate the rules inside `parseLedgerAmount` and drop one of them (say the scale
-  //        rule) and the `0.005` rows below disagree.
+  // MUTATION: reinstate a number arm inside `parseLedgerAmount` that applies the magnitude bound and
+  //        not the scale rule — the exact shape r18 found — and the `0.005` row disagrees. Dropping
+  //        either rule from `readLedgerStatedAmount` fails it from the other side.
   const cases: Array<[unknown, string | null, boolean]> = [
     [10, 'GBP', true],
     ['10', 'GBP', true],
