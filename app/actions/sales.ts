@@ -812,7 +812,7 @@ export async function getSalesOrder(id: string): Promise<SoDetail | null> {
     // switched off expects no payment to post, and calling that a discrepancy would paint every paid
     // order permanently red for a setting someone chose on purpose.
     isAccountingSyncTypeEnabled('INVOICE_PAYMENT').catch(() => false),
-    loadInvoicePaymentSyncRows(so.id, activeConnector?.id ?? null),
+    loadInvoicePaymentSyncRows(so.id, activeConnector?.id ?? null, so.currency),
   ])
   const claimedForeign = claimedReceivedForeign(so)
   const settlement = settlementStatus({
@@ -830,13 +830,20 @@ export async function getSalesOrder(id: string): Promise<SoDetail | null> {
     // claims to have received — a part payment fully registered is settled for its size.
     totalForeign: Math.min(
       claimedForeign,
+      // o3d-6abj: `ledgerSalesInvoiceTotalForeign` answers a `Decimal` now, and this comparison — a
+      // DISPLAY verdict against `claimedReceivedForeign`, which is a number — takes the number
+      // reading explicitly rather than by an implicit conversion at the boundary.
+      // decimal-boundary-ok: display-only
       ledgerSalesInvoiceTotalForeign({
-        totalForeign: Number(so.totalForeign),
-        taxForeign: Number(so.taxForeign),
+        totalForeign: so.totalForeign,
+        taxForeign: so.taxForeign,
         pricesIncludeVat: so.pricesIncludeVat,
         importedFromShop: so.shoppingLinks.length > 0,
-      }),
+      }).toNumber(),
     ),
+    // o3d-6yho (3 of 3): the band that separates a part settlement from a full one is half one
+    // minor unit of THIS order's currency, not a hard-coded half-penny.
+    currency: so.currency,
   })
 
   return {

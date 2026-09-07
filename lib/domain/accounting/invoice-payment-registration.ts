@@ -18,6 +18,14 @@ import {
   type LedgerSettlementRecord,
 } from './ledger-settlement-evidence'
 import { isOperatorAssertedSettlement } from './sync-row-settlement'
+import {
+  addMoney,
+  compareDecimal,
+  ledgerAmountEpsilon,
+  subtractMoney,
+  toDecimal,
+  type Decimal,
+} from '@/lib/domain/math/decimal'
 
 export type InvoicePaymentRegistrationRefusal =
   /** Nothing is expected to post: the connector is off. Not a fault, and not worth a warning. */
@@ -61,8 +69,8 @@ export type InvoicePaymentRegistrationDecision =
   | {
       register: false
       refusal: InvoicePaymentRegistrationRefusal
-      alreadyRegistered?: number
-      ledgerTotal?: number
+      alreadyRegistered?: Decimal
+      ledgerTotal?: Decimal
       /** Why an unresolved attempt could not be cleared, for the operator warning. */
       detail?: string
     }
@@ -70,8 +78,24 @@ export type InvoicePaymentRegistrationDecision =
 /** One INVOICE_PAYMENT sync row, reduced to what the decision depends on. */
 export type ExistingInvoicePaymentSync = {
   status: 'PENDING' | 'PROCESSING' | 'SYNCED' | 'FAILED' | 'CANCELLED'
-  /** What was sent, in the document currency. Null when the payload did not record it. */
+  /**
+   * WHAT WAS SENT, as the JSON number the connector put on the wire and the ledger therefore holds.
+   *
+   * Kept, and NOT the field the capacity arithmetic reads (o3d-6abj). It is the right figure for
+   * the one question that compares against the LEDGER's own reply — `classifyLedgerSettlement`
+   * matches a probe record's amount to the attempt that may have created it — and the wrong one for
+   * summing parts against a stored `Decimal` total. See `registeredAmount`.
+   */
   amount?: number | null
+  /**
+   * WHAT WAS REGISTERED, EXACTLY, in the ORDER's currency — `payloadRegisteredAmount`'s answer, and
+   * the only field the capacity sum below reads (o3d-6abj).
+   *
+   * `null` / absent = this payload will not say, which the sum must read as UNKNOWABLE and never as
+   * zero. It covers a payload with no amount, one whose exact decimal string does not parse, and one
+   * stating a different currency — all three refuse rather than fall back to the double.
+   */
+  registeredAmount?: Decimal | null
   /** The date that attempt sent, `YYYY-MM-DD`. Null when the payload did not pin one. */
   paymentDate?: string | null
   /** The local Payment row it was queued for; null on rows queued before that was recorded. */
@@ -183,12 +207,18 @@ export function retiredDocumentInvoicePaymentAttempts(
 }
 
 /**
- * Sub-penny slack, so an exact settlement is not refused by float noise. Exported because the
- * POST-SITE capacity guard (invoice-payment-capacity.ts) must apply the identical tolerance: two
- * guards on one arithmetic that round differently would refuse at the enqueue and allow at the post,
- * or the reverse.
+ * `CAPACITY_EPSILON` WAS HERE, AND IS GONE (o3d-6yho, 1 of 3).
+ *
+ * It was a flat `0.005`, exported so the POST-SITE guard would apply the IDENTICAL tolerance — the
+ * right instinct, and the wrong shape for it. Half a penny is half one minor unit in GBP and FIVE
+ * whole minor units in a Gulf dinar, fifty in CLF, and this test reads
+ * `paymentAmount > remaining + band`: a larger band ADMITS more over-registration, which is the one
+ * direction that ends in a second payment on a supplier's ledger.
+ *
+ * The tolerance is now `ledgerAmountEpsilon(orderCurrency)` — half one minor unit of THIS document's
+ * currency — and both guards derive it from that one function rather than from a shared constant. So
+ * they still cannot round differently, and they are now right in every currency instead of in one.
  */
-export const CAPACITY_EPSILON = 0.005
 
 export function decideInvoicePaymentRegistration(input: {
   syncEnabled: boolean
@@ -196,7 +226,8 @@ export function decideInvoicePaymentRegistration(input: {
   accountingInvoiceId: string | null
   orderCurrency: string
   paymentCurrency: string
-  paymentAmount: number
+  /** The receipt being registered, as the stored `Decimal` and never a conversion of it (o3d-6abj). */
+  paymentAmount: Decimal
   /** The local Payment row being registered — its own sync row must not count against it. */
   paymentId: string
   /** The bank account mapped for this method/currency, or null when none is. */
@@ -211,8 +242,12 @@ export function decideInvoicePaymentRegistration(input: {
    * more. Callers with no unresolved attempts may pass null freely.
    */
   ledgerSettlements: LedgerSettlementRecord[] | null
-  /** What the ledger's copy of the invoice was built at (see ledgerSalesInvoiceTotalForeign). */
-  ledgerTotal: number
+  /**
+   * What the ledger's copy of the invoice was built at (see ledgerSalesInvoiceTotalForeign), as the
+   * stored `Decimal` (o3d-6abj). `Number(order.totalForeign)` is one of the two operands Codex's
+   * reproduction collapses; the other is the sum below.
+   */
+  ledgerTotal: Decimal
 }): InvoicePaymentRegistrationDecision {
   if (!input.syncEnabled) return { register: false, refusal: 'SYNC_DISABLED' }
   if (!input.accountingInvoiceId) return { register: false, refusal: 'DOCUMENT_NOT_POSTED' }
@@ -257,6 +292,8 @@ export function decideInvoicePaymentRegistration(input: {
     }
     for (const attempt of unresolved) {
       const verdict = classifyLedgerSettlement(
+        // `amount`, not `registeredAmount`: this compares against a figure the LEDGER reported, which
+        // is the JSON number that went on the wire (o3d-6abj).
         { amount: attempt.amount ?? null, date: attempt.paymentDate ?? null, marker: attempt.settlementMarker ?? null },
         { ok: true, records: input.ledgerSettlements },
       )
@@ -340,11 +377,18 @@ export function decideInvoicePaymentRegistration(input: {
 
   // An unreadable amount cannot be arithmetic. Treating it as zero would let this receipt through on the
   // assumption that the ledger holds nothing, which is precisely what is not known.
-  if (live.some((r) => typeof r.amount !== 'number')) {
+  //
+  // o3d-6abj: asked of `registeredAmount`, so a row whose exact decimal string is present but will
+  // not parse, or which states a currency that is not this order's, refuses here rather than being
+  // read from the lossy JSON number beside it.
+  if (live.some((r) => r.registeredAmount == null)) {
     return { register: false, refusal: 'LEDGER_AMOUNT_UNKNOWN', ledgerTotal: input.ledgerTotal }
   }
 
-  const alreadyRegistered = live.reduce((sum, r) => sum + (r.amount as number), 0)
+  const alreadyRegistered = live.reduce(
+    (sum, r) => addMoney(sum, r.registeredAmount as Decimal),
+    toDecimal(0),
+  )
   // What is LEFT of the invoice. With no live rows this is the whole invoice, which is exactly the
   // single-receipt rule this replaced — so the case that rule was written for still refuses, and now
   // the part-payment case does too. Refusing here names the numbers, where letting it through produces
@@ -355,7 +399,13 @@ export function decideInvoicePaymentRegistration(input: {
   // is left is every OTHER way a receipt can exceed its document (a credited or part-refunded invoice, a
   // mistyped amount), the invoices imported and posted before that fix, and now the deposit-plus-balance
   // case the receipt-scoped index deliberately admits.
-  if (input.paymentAmount > input.ledgerTotal - alreadyRegistered + CAPACITY_EPSILON) {
+  //
+  // o3d-6abj: IN DECIMAL, ON EVERY TERM. The same collapse Codex found at the post site is reachable
+  // here — a stored total of 35184372088832.0040 and a receipt of 35184372088832.01 are 0.006 apart
+  // and become the SAME double — and the two guards have to agree, so they now do the same
+  // arithmetic on the same kind of value rather than the same arithmetic on two roundings.
+  const remaining = subtractMoney(input.ledgerTotal, alreadyRegistered)
+  if (compareDecimal(input.paymentAmount, addMoney(remaining, ledgerAmountEpsilon(input.orderCurrency))) > 0) {
     return { register: false, refusal: 'WOULD_OVERPAY', alreadyRegistered, ledgerTotal: input.ledgerTotal }
   }
   return { register: true, bankAccountId: input.bankAccountId }

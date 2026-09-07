@@ -20,6 +20,7 @@ import {
   OPERATOR_ASSERTION_SETTLEMENT_BASIS,
   isOperatorAssertedSettlement,
 } from '@/lib/domain/accounting/sync-row-settlement'
+import { ledgerAmountEpsilon, toDecimal, type Decimal, type DecimalInput } from '@/lib/domain/math/decimal'
 import { hasPostEvidence, registrationLedgerStanding } from './payment-ledger-hold'
 
 /** The payment sync row for one invoice/bill, reduced to what the verdict depends on. */
@@ -117,6 +118,22 @@ export function settlementStatus(input: {
   payment: PaymentSyncRow | null
   /** The document total in its own currency, to tell a full settlement from a part payment. */
   totalForeign?: number | null
+  /**
+   * o3d-6yho (3 of 3) — THE DOCUMENT'S CURRENCY, because the two comparisons below turn on how small
+   * an amount counts as nothing and that answer is not the same in every currency.
+   *
+   * Both tests used to band a bare `0.005`, which is half a penny in GBP and FIVE whole minor units
+   * in a Gulf dinar, fifty in CLF. A document short by four fils then read as fully SETTLED: a green
+   * badge over a balance the ledger is still accounting for, which is the direction that stops
+   * anyone looking. The band is now `ledgerAmountEpsilon` — half one minor unit of THIS document's
+   * currency — the same rule the reversal readers and the capacity guards derive from.
+   *
+   * Absent or null takes the STRICTEST band, exactly as `ledgerAmountEpsilon` documents: too large a
+   * band hides a real shortfall behind a clean verdict, while too small a one can only move a
+   * document from SETTLED into PARTIALLY_SETTLED or OVER_SETTLED — a verdict that makes someone
+   * look. Optional so a caller that has no currency to state cannot state a wrong one.
+   */
+  currency?: string | null
 }): SettlementVerdict {
   if (!input.paidLocally) {
     // THE DISAGREEMENT POINTING THE OTHER WAY. Deleting a receipt whose registration already reached the
@@ -265,7 +282,9 @@ export function settlementStatus(input: {
       // "Paid" badge over the GBP999 the ledger still shows outstanding (Codex, PR #570 round 2).
       const total = input.totalForeign
       const paid = p.amount
-      if (typeof total === 'number' && typeof paid === 'number' && total > 0 && paid + 0.005 < total) {
+      // o3d-6yho: half one minor unit of THIS document's currency, not a hard-coded half-penny.
+      const settlementBand = ledgerAmountEpsilon(input.currency ?? null).toNumber()
+      if (typeof total === 'number' && typeof paid === 'number' && total > 0 && paid + settlementBand < total) {
         return {
           status: 'PARTIALLY_SETTLED',
           discrepancy: true,
@@ -281,7 +300,7 @@ export function settlementStatus(input: {
       // ledger keeps the larger payment, the correction is refused as a second live registration, and
       // comparing "ledger 100" against "claimed 40" one way round returned a green Settled over an
       // invoice the ledger has been over-paid on.
-      if (typeof total === 'number' && typeof paid === 'number' && total > 0 && paid > total + 0.005) {
+      if (typeof total === 'number' && typeof paid === 'number' && total > 0 && paid > total + settlementBand) {
         return {
           status: 'OVER_SETTLED',
           discrepancy: true,
@@ -507,13 +526,22 @@ export function aggregatePaymentSyncRows(rows: PaymentSyncRow[]): PaymentSyncRow
  * and they are the seam a per-order marker would attach to if the historical invoices are ever
  * distinguished properly (the posted SALES_INVOICE payload's own `lineAmountsIncludeTax` is the exact
  * signal); reading either of them again would re-introduce the defect this collapse removes.
+ *
+ * o3d-6abj — IT ANSWERS A `Decimal`, AND IT TAKES ONE. `SalesOrder.totalForeign` is `Decimal(18, 4)`
+ * and the capacity guards subtract this figure from a receipt to decide whether money may move. Both
+ * of them used to write `Number(order.totalForeign)` at the call site, and above ~4.5e13 the double
+ * spacing exceeds the band those guards allow: a stored total of `35184372088832.0040` and a receipt
+ * of `35184372088832.01` — 0.006 apart, which MUST refuse — convert to the SAME double, and the
+ * guard approves an over-settlement (Codex, o3d-acctmoney r20 HIGH). The conversion is not the
+ * caller's business to get right, so this function no longer offers one: it takes the stored value
+ * and hands back the exact figure. A caller that genuinely needs a number asks for it explicitly.
  */
 export function ledgerSalesInvoiceTotalForeign(input: {
-  totalForeign: number
-  taxForeign: number
+  totalForeign: DecimalInput
+  taxForeign: DecimalInput
   pricesIncludeVat: boolean
   /** Did this order arrive from a shop connector (WooCommerce), rather than being raised in IMS? */
   importedFromShop: boolean
-}): number {
-  return input.totalForeign
+}): Decimal {
+  return toDecimal(input.totalForeign)
 }

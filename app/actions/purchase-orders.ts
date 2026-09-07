@@ -864,6 +864,10 @@ export async function getPurchaseOrder(id: string): Promise<PoDetail | null> {
         documentPosted: !!inv.accountingInvoiceId,
         payment: billPaymentByInvoice.get(inv.id) ?? null,
         totalForeign: Number(inv.totalForeign),
+        // o3d-6yho (3 of 3): the part/over settlement band is half one minor unit of the PO's own
+        // currency — a bill stated in a three- or four-decimal currency was being judged against a
+        // half-penny, which reads several whole minor units of shortfall as fully settled.
+        currency: po.currency,
       }),
       createdAt: inv.createdAt.toISOString(),
       lines: inv.lines.map((il) => {
