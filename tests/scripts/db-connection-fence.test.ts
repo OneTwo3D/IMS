@@ -84,6 +84,7 @@ import {
   buildRevokeStatements,
   granteeHasConnect,
   aclPrivilegeRows,
+  DATACL_PRIVILEGES_SQL,
   compareClusterIdentity,
   CLUSTER_IDENTITY_PROVEN,
   CLUSTER_IDENTITY_UNPROVEN,
@@ -94,6 +95,9 @@ import {
   verifyRelease,
 } from '@/scripts/fence-db-connections.mjs'
 import { protectedLibraryLines, writeFenceCheckout } from './fence-artefact-harness.ts'
+import { Client } from 'pg'
+
+import { currentUser, freePort, startCluster } from './real-postgres-cluster.ts'
 import { shellConstant, shellFunction } from './shell-symbol.ts'
 
 /**
@@ -4791,5 +4795,236 @@ test('o3d-2sm1.5 r23: the binding is taken away on every exit, and a stale one i
     const fenceable = source.indexOf('require_fenceable_database\n')
     assert.ok(clear > 0, `${script}: a leftover snapshot is cleared`)
     assert.ok(fenceable > clear, `${script}: and cleared BEFORE the first question about the unit`)
+  }
+})
+
+// ---------------------------------------------------------------------------
+// AGAINST A REAL POSTGRESQL CLUSTER (o3d-secops r28, Codex HIGH 1 + HIGH 2)
+//
+// Both findings this section answers are about what a SERVER does, and neither can be measured
+// against a fixture without the fixture's author first modelling the thing the finding says was
+// modelled wrongly:
+//
+//   HIGH 2  `datacl::text` is an ARRAY LITERAL whose quoted elements backslash-escape their own
+//           quotes and backslashes. A test that writes the escaped form by hand is a test of
+//           whether its author can write it. So the roles are CREATEd, the grants are issued, and
+//           PostgreSQL prints what PostgreSQL prints.
+//   HIGH 1  "two clusters that both host a database of this name" is not something a mock can
+//           exhibit either. Two real clusters are started, both holding a database called `imsdb`
+//           with the same roles, and the audit is pointed at the wrong one THROUGH a URL that
+//           names the right one -- which is what DNS, a proxy or a failover actually produces.
+//
+// FRESH CLUSTERS, EVERY RUN. `initdb` into a throwaway directory: the database is new, its OID and
+// system identifier are new, and nothing here can pass because of state a previous run left. (PR
+// #663 on the sibling branch was approved and then failed CI on a fresh-database concurrency run;
+// a reused database is a different environment.)
+//
+// THE SAME PORT ON BOTH, which is what makes the cluster gate load-bearing rather than decorative:
+// the host, the port, the database name and the login role all match on the bystander cluster, so
+// every check that existed before this round passes there. Only one of the two binds TCP -- the
+// other is reached over its unix socket -- which is how two clusters can claim one port.
+// ---------------------------------------------------------------------------
+
+test('the shipped ACL query reads role names PostgreSQL has to quote, and a NULL datacl as the defaults (o3d-secops r28)', async (t) => {
+  const root = mkdtempSync(join(tmpdir(), 'ims-fence-pg-'))
+  const port = await freePort()
+  let cluster: ReturnType<typeof startCluster> | undefined
+  try {
+    cluster = startCluster(root, 'acl', port, '127.0.0.1')
+    const me = currentUser()
+    // THE NAMES THE OLD PARSER COULD NOT READ. Each is a role PostgreSQL must quote in `datacl`,
+    // and `we"ird` and `back\slash` are the two it must additionally BACKSLASH-ESCAPE inside that
+    // quoting -- which is the escaping the old parser ignored entirely.
+    const odd = ['we"ird', 'back\\slash', 'comma,role', 'UpperCase']
+    cluster.psql(['-c', `CREATE ROLE ${JSON.stringify('owner_role')} LOGIN`])
+    for (const role of odd) cluster.psql(['-c', `CREATE ROLE ${quoteIdent(role)} LOGIN`])
+    cluster.psql(['-c', 'CREATE ROLE imsapp LOGIN'])
+    cluster.psql(['-c', `CREATE DATABASE imsdb OWNER ${JSON.stringify('owner_role')}`])
+
+    // 1. THE UNTOUCHED DATABASE: `datacl` IS NULL, and that is not "no privileges".
+    assert.equal(cluster.psql(['-c', "SELECT datacl IS NULL FROM pg_database WHERE datname = 'imsdb'"]), 't',
+      'precondition: a database nobody has granted on carries a NULL datacl')
+    const readPrivileges = () => JSON.parse(cluster!.psql([
+      '-c', `SELECT ${DATACL_PRIVILEGES_SQL} FROM pg_database d WHERE d.datname = 'imsdb'`,
+    ]))
+    const defaults = readPrivileges()
+    assert.equal(granteeHasConnect(defaults, PUBLIC_GRANTEE), true,
+      `a NULL datacl grants CONNECT to PUBLIC, which is what acldefault() says and what a restore depends on:\n${JSON.stringify(defaults)}`)
+    assert.deepEqual(listDirectConnectGrantees(defaults), ['owner_role'],
+      'and everything to the owner, which is the only NAMED grantee there')
+    assert.equal(granteeHasConnect(defaults, 'imsapp'), false, 'and nothing to anybody else')
+
+    // 2. NOW THE GRANTS THAT NEED QUOTING. What PostgreSQL prints is recorded here as evidence of
+    //    the shape, not parsed: it is the input the old reader could not handle.
+    for (const role of [...odd, 'imsapp']) {
+      cluster.psql(['-c', `GRANT CONNECT ON DATABASE imsdb TO ${quoteIdent(role)}`])
+    }
+    const printed = cluster.psql(['-c', "SELECT datacl::text FROM pg_database WHERE datname = 'imsdb'"])
+    assert.match(printed, /\\"we\\"\\"ird\\"/,
+      `precondition: PostgreSQL backslash-escapes the quotes inside a quoted ACL element, which is the encoding the old parser ignored:\n${printed}`)
+    assert.match(printed, /comma,role/, `precondition: and quotes an element containing a comma:\n${printed}`)
+
+    const granted = readPrivileges()
+    for (const role of [...odd, 'imsapp']) {
+      assert.equal(granteeHasConnect(granted, role), true,
+        `${JSON.stringify(role)} holds CONNECT on the real server and must be read as holding it:\n${JSON.stringify(granted)}`)
+    }
+    assert.deepEqual(
+      listDirectConnectGrantees(granted).slice().sort(),
+      ['back\\slash', 'comma,role', 'imsapp', 'owner_role', 'UpperCase', 'we"ird'].sort(),
+      'every named grantee, by the name the catalogue gives it and not by one reconstructed from text',
+    )
+    assert.ok(!listDirectConnectGrantees(granted).includes(''), 'and PUBLIC is not among them')
+
+    // 3. AND THE REVOKE BUILT FROM THOSE NAMES ACTUALLY EXECUTES. Reading the name correctly is
+    //    half of it; the other half is that the statement the fence issues names the same role.
+    //    The old parser produced `\weird\`, which is a role no server has -- so the fence aborted.
+    for (const statement of buildRevokeStatements('imsdb', listDirectConnectGrantees(granted).filter((r) => r !== 'owner_role'))) {
+      cluster.psql(['-c', statement])
+    }
+    const afterRevoke = readPrivileges()
+    for (const role of odd) {
+      assert.equal(granteeHasConnect(afterRevoke, role), false,
+        `${JSON.stringify(role)} must actually lose CONNECT, which is what proves the name round-tripped:\n${JSON.stringify(afterRevoke)}`)
+    }
+    assert.deepEqual(listDirectConnectGrantees(afterRevoke), ['owner_role'], 'leaving the owner, as a fence does')
+  } finally {
+    cluster?.stop()
+    rmSync(root, { recursive: true, force: true })
+  }
+})
+
+test('a same-named database on a DIFFERENT CLUSTER does not clear the record (o3d-secops r28, Codex HIGH 1)', async (t) => {
+  const root = mkdtempSync(join(tmpdir(), 'ims-fence-two-'))
+  const dir = stateDir(t)
+  const stateFile = join(dir, 'db-connect-fence.json')
+  const port = await freePort()
+  const me = currentUser()
+  let real: ReturnType<typeof startCluster> | undefined
+  let bystander: ReturnType<typeof startCluster> | undefined
+  const previousAdmin = process.env.DEPLOY_ADMIN_DATABASE_URL
+  const previousApp = process.env.DATABASE_URL
+  try {
+    // ONE PORT, TWO CLUSTERS. The real one binds 127.0.0.1; the bystander binds no TCP address at
+    // all and is reached over its own socket directory while CLAIMING the same port. That is what
+    // lets the URL name the right server and the connection land on the wrong one -- the exact
+    // shape of "DNS, a proxy, or failover routing".
+    real = startCluster(root, 'real', port, '127.0.0.1')
+    bystander = startCluster(root, 'bystander', port, '')
+
+    for (const cluster of [real, bystander]) {
+      cluster.psql(['-c', 'CREATE ROLE owner_role LOGIN'])
+      cluster.psql(['-c', 'CREATE ROLE imsapp LOGIN'])
+      cluster.psql(['-c', 'CREATE DATABASE imsdb OWNER owner_role'])
+      // A DIRECT GRANT ON BOTH, which is what an installed application has and what makes the two
+      // clusters INDISTINGUISHABLE to every check that existed before this round. Left to the
+      // default ACL the bystander would show imsapp holding CONNECT only through PUBLIC, the
+      // reading would be MIXED rather than `absent`, and this test would be passing because the
+      // bystander looked odd instead of because the cluster gate fired.
+      cluster.psql(['-c', 'GRANT CONNECT ON DATABASE imsdb TO imsapp'])
+    }
+    // THE REAL CLUSTER IS FENCED: PUBLIC and imsapp have lost CONNECT, which is what the record
+    // describes. THE BYSTANDER IS NOT, because nothing ever fenced it -- and that is precisely the
+    // reading (`absent`) that made r26 and r27 delete the record.
+    real.psql(['-c', 'REVOKE CONNECT ON DATABASE imsdb FROM PUBLIC'])
+    real.psql(['-c', 'REVOKE CONNECT ON DATABASE imsdb FROM imsapp'])
+
+    const identityOf = (cluster: ReturnType<typeof startCluster>) => ({
+      systemIdentifier: cluster.psql(['-c', 'SELECT system_identifier::text FROM pg_control_system()']),
+      databaseOid: cluster.psql(['-c', "SELECT oid::text FROM pg_database WHERE datname = 'imsdb'"]),
+    })
+    const realIdentity = identityOf(real)
+    const bystanderIdentity = identityOf(bystander)
+    assert.notEqual(realIdentity.systemIdentifier, bystanderIdentity.systemIdentifier,
+      'precondition: two clusters initdb\'d separately have different system identifiers')
+    assert.match(realIdentity.systemIdentifier, /^[0-9]+$/, 'precondition: and it is readable as a number')
+
+    // THE RECORD, PUBLISHED BY THE SHIPPED VALIDATOR, carrying the REAL cluster's fingerprint and
+    // no applied stamp -- the shape the resolution wrapper exists for.
+    publishAuthority(stateFile, {
+      ...SAMPLE_STATE,
+      database: 'imsdb',
+      owner_role: 'owner_role',
+      app_role: 'imsapp',
+      revoked: [PUBLIC_GRANTEE, 'imsapp'],
+      cluster_system_identifier: realIdentity.systemIdentifier,
+      cluster_database_oid: realIdentity.databaseOid,
+    })
+    const published = JSON.parse(readFileSync(stateFile, 'utf8'))
+    delete published.fence_applied
+    delete published.fence_mode
+    writeFileSync(stateFile, `${JSON.stringify(published, null, 2)}\n`)
+    const untouched = readFileSync(stateFile, 'utf8')
+
+    // THE URL NAMES THE RIGHT SERVER IN BOTH RUNS. Only the connection differs, which is what the
+    // finding is: every value the identity gate compares is identical on the two.
+    process.env.DEPLOY_ADMIN_DATABASE_URL = `postgres://${me}@127.0.0.1:${port}/imsdb`
+    process.env.DATABASE_URL = `postgres://imsapp@127.0.0.1:${port}/imsdb`
+
+    const audit = async (cluster: ReturnType<typeof startCluster>) => {
+      const client = new Client({ host: cluster.socket, port, database: 'imsdb', user: me })
+      await client.connect()
+      const out: string[] = []
+      const err: string[] = []
+      const stdout = process.stdout.write.bind(process.stdout)
+      const stderr = process.stderr.write.bind(process.stderr)
+      process.stdout.write = ((chunk: string) => { out.push(String(chunk)); return true }) as typeof process.stdout.write
+      process.stderr.write = ((chunk: string) => { err.push(String(chunk)); return true }) as typeof process.stderr.write
+      try {
+        const code = await doAuditAuthority(client as never, {
+          stateFile, appRole: 'imsapp',
+          ...suppliedIdentity({ appHost: '127.0.0.1', appPort: String(port), appUser: 'imsapp', appDatabase: 'imsdb' }),
+        })
+        return { code, verdict: out.join(''), said: err.join('') }
+      } finally {
+        process.stdout.write = stdout
+        process.stderr.write = stderr
+        await client.end()
+      }
+    }
+
+    // 0. THE RIGHT CLUSTER STILL DECIDES, and says so on both channels. Without this the assertion
+    //    below is satisfied by a gate that refuses everything.
+    const onTheRealOne = await audit(real)
+    assert.equal(onTheRealOne.code, EXIT_FENCE_STANDING, `the fenced cluster must be readable:\n${onTheRealOne.said}`)
+    assert.match(onTheRealOne.verdict, new RegExp(`^legacy_fence_verdict=${LEGACY_FENCE_STANDS}$`, 'm'), onTheRealOne.verdict)
+    assert.match(onTheRealOne.verdict, new RegExp(`^legacy_fence_cluster=${CLUSTER_IDENTITY_PROVEN}$`, 'm'),
+      `and the reading must be attributable to the cluster the record names:\n${onTheRealOne.verdict}`)
+
+    // 1. THE FINDING. Same host, same port, same database name, same roles, different SERVER. The
+    //    bystander is unfenced, so every recorded grantee holds CONNECT there and the ACL verdict
+    //    would be `absent` -- the reading root DELETES on. It must not get that far.
+    const onTheBystander = await audit(bystander)
+    assert.equal(onTheBystander.code, EXIT_ERROR,
+      `an unfenced bystander cluster must settle nothing:\n${onTheBystander.said}`)
+    assert.equal(onTheBystander.verdict, '',
+      `and print NO verdict line at all, because the wrapper acts on a status and a verdict together:\n${onTheBystander.verdict}`)
+    assert.match(onTheBystander.said, /NOT AUDITED/, onTheBystander.said)
+    assert.match(onTheBystander.said, new RegExp(bystanderIdentity.systemIdentifier),
+      `naming the cluster that actually answered:\n${onTheBystander.said}`)
+    assert.equal(readFileSync(stateFile, 'utf8'), untouched,
+      'and the authority a fence on the OTHER cluster depends on must be byte for byte what it was')
+
+    // 2. AND THE READING IT WOULD HAVE GIVEN, PROVED RATHER THAN ASSERTED. Without this the test
+    //    would pass on a bystander that happened to look fenced, and would be measuring nothing.
+    const bystanderPrivileges = JSON.parse(bystander.psql([
+      '-c', `SELECT ${DATACL_PRIVILEGES_SQL} FROM pg_database d WHERE d.datname = 'imsdb'`,
+    ], { database: 'imsdb' }))
+    assert.equal(granteeHasConnect(bystanderPrivileges, PUBLIC_GRANTEE), true,
+      'the bystander is unfenced: PUBLIC holds CONNECT there')
+    assert.equal(granteeHasConnect(bystanderPrivileges, 'imsapp'), true, 'and so does the application role')
+    assert.deepEqual(
+      assessLegacyFenceEvidence({ recorded: [PUBLIC_GRANTEE, 'imsapp'], holding: [PUBLIC_GRANTEE, 'imsapp'] }).verdict,
+      LEGACY_FENCE_ABSENT,
+      'so the ACL verdict there is `absent` — the one the automatic clear used to act on',
+    )
+  } finally {
+    real?.stop()
+    bystander?.stop()
+    rmSync(root, { recursive: true, force: true })
+    if (previousAdmin === undefined) delete process.env.DEPLOY_ADMIN_DATABASE_URL
+    else process.env.DEPLOY_ADMIN_DATABASE_URL = previousAdmin
+    if (previousApp === undefined) delete process.env.DATABASE_URL
+    else process.env.DATABASE_URL = previousApp
   }
 })
