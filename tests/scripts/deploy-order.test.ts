@@ -13511,3 +13511,82 @@ for (const entry of FENCE_HARNESS) {
     }
   })
 }
+
+// ---------------------------------------------------------------------------
+// o3d-secops r32, Codex HIGH 1 — THE OTHER MACHINE LINES THIS BRANCH READS.
+//
+// The verdicts are not the only things read out of a captured stream. Root also reads the fence
+// PLAN (one JSON document), the digest of the record the validator published, the release's
+// cluster identity, and the audit's three verdict lines. Every one of them was `sed -n
+// 's/^key=\(.*\)$/\1/p' | tail -1` or a bare substring, and the two defects are separable:
+//
+//   THE CHANNEL. Fixed at the source: all eleven of the helper's `console.log` calls are on stderr
+//   now and its main() reseats `console.log`, so nothing carrying a database or role name can
+//   reach stdout. The producers of `authority_sha256=` do the same -- `CONNECT will be revoked
+//   from <roles> on <database>` is on stderr beside it.
+//
+//   THE READER. `tail -1` is duplicate-TOLERANT: a stream carrying the key twice is read as its
+//   last occurrence rather than refused, which is exactly how an appended line becomes the answer.
+//   That is what these measure, against the shipped readers, under a real shell.
+// ---------------------------------------------------------------------------
+
+test('[o3d-secops r32] the shared machine-field reader takes one value of the stated shape, or nothing', () => {
+  const FENCE_LIB = readFileSync(join(process.cwd(), 'scripts/lib/db-fence-protected.sh'), 'utf8')
+  const run = (stream: string) => runShell([
+    'set -uo pipefail',
+    shellFunction(FENCE_LIB, 'db_fence_machine_field'),
+    `stream=${JSON.stringify(stream)}`,
+    'if v="$(db_fence_machine_field "${stream}" authority_sha256 "^[0-9a-f]{64}\\$")"; then echo "TOOK=${v}"; else echo "REFUSED"; fi',
+  ].join('\n'))
+  const digest = 'a'.repeat(64)
+  const other = 'b'.repeat(64)
+
+  // THE ORDINARY CASE, so nothing below passes because the reader refuses everything.
+  assert.match(run(`authority_sha256=${digest}`).output, new RegExp(`^TOOK=${digest}$`, 'm'))
+  // AND IT IS A WHOLE LINE: prose that CONTAINS the key is not the key.
+  assert.match(run(`published authority_sha256=${digest} somewhere`).output, /^REFUSED$/m)
+  // MUTATION ROUTE (made against the shipped file and reverted): change `[[ "${hits}" -eq 1 ]]` to
+  // `-ge 1` and take the last value -- the two-line case below then reports the appended digest,
+  // which is the `tail -1` behaviour this replaced.
+  assert.match(run(`authority_sha256=${digest}\nauthority_sha256=${other}`).output, /^REFUSED$/m,
+    'a stream carrying the key twice has not answered')
+  // AND THE SHAPE IS ENFORCED: a value that is not the thing it claims to be is not a value.
+  assert.match(run('authority_sha256=not-a-digest').output, /^REFUSED$/m)
+  assert.match(run('nothing here at all').output, /^REFUSED$/m)
+})
+
+test('[o3d-secops r32] the recovery wrappers read their machine lines the same way', () => {
+  // THE WRAPPER'S OWN COPY, lifted out of the heredoc the library publishes rather than re-written
+  // here: these run as separate root-owned scripts and carry `machine_field` in their own text, so
+  // a rule fixed in the library and not in the wrapper would leave the finding open on the path an
+  // operator actually drives.
+  const FENCE_LIB = readFileSync(join(process.cwd(), 'scripts/lib/db-fence-protected.sh'), 'utf8')
+  // THE HEREDOC'S CONTENT, without its opener: that content IS the published wrapper, and it is a
+  // shell script in its own right. Slicing from the `cat <<'WRAPPER_EOF'` line instead hands the
+  // lexer an unterminated here-document, which it refuses to read -- correctly, and loudly.
+  const opener = FENCE_LIB.indexOf("cat <<'WRAPPER_EOF'")
+  assert.notEqual(opener, -1, 'precondition: the library must publish its wrappers from a heredoc')
+  const body = FENCE_LIB.slice(FENCE_LIB.indexOf('\n', opener) + 1, FENCE_LIB.indexOf('\nWRAPPER_EOF\n') + 1)
+  assert.ok(body.includes('machine_field()'), 'precondition: the published wrapper must carry the reader')
+  const reader = shellFunction(body, 'machine_field')
+  const run = (stream: string, key: string, shape: string) => runShell([
+    'set -uo pipefail',
+    reader,
+    `stream=${JSON.stringify(stream)}`,
+    `if v="$(machine_field "${'${stream}'}" ${key} ${JSON.stringify(shape)})"; then echo "TOOK=${'${v}'}"; else echo "REFUSED"; fi`,
+  ].join('\n'))
+
+  const IDENTITY = '^([0-9]+|<unavailable>)/([0-9]+|<unavailable>)$'
+  assert.match(run('release_cluster_identity=7401234/16400', 'release_cluster_identity', IDENTITY).output, /^TOOK=7401234\/16400$/m)
+  assert.match(run('release_cluster_identity=<unavailable>/16400', 'release_cluster_identity', IDENTITY).output, /^TOOK=<unavailable>\/16400$/m,
+    'a server that will not identify itself is a value, and the operator is shown it')
+  // TWO ANSWERS, AND THE SECOND ONE IS THE APPENDED ONE. Under `tail -1` this returned the
+  // attacker's; the confirmation token an operator types binds this value.
+  assert.match(run('release_cluster_identity=7401234/16400\nrelease_cluster_identity=9999999/16400', 'release_cluster_identity', IDENTITY).output, /^REFUSED$/m)
+  // AND THE AUDIT'S VERDICT IS AN ENUMERATION, not "anything after the equals sign".
+  const VERDICT = '^(absent|stands|ambiguous)$'
+  assert.match(run('legacy_fence_verdict=absent', 'legacy_fence_verdict', VERDICT).output, /^TOOK=absent$/m)
+  assert.match(run('legacy_fence_verdict=absent-ish', 'legacy_fence_verdict', VERDICT).output, /^REFUSED$/m)
+  assert.match(run('legacy_fence_verdict=stands\nlegacy_fence_verdict=absent', 'legacy_fence_verdict', VERDICT).output, /^REFUSED$/m,
+    'and a stream that says both is not evidence for either')
+})

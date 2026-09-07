@@ -1513,6 +1513,10 @@ test('a refused INITIAL fence leaves no authority behind, and a standing one is 
       FENCE_DISPLAY_DECLARATIONS,
       shellFunction(FENCE_LIBRARY, 'db_fence_authorise_plan'),
       shellFunction(FENCE_LIBRARY, 'db_fence_mark_authority_applied'),
+      // o3d-secops r32: db_fence_publish_authority() reads the digest of what it wrote through the
+      // shared machine-field reader now, so a rig that lifted the publisher without it would be
+      // measuring a publication that cannot report the bytes it published.
+      shellFunction(FENCE_LIBRARY, 'db_fence_machine_field'),
       shellFunction(FENCE_LIBRARY, 'db_fence_publish_authority'),
       shellFunction(FENCE_LIBRARY, 'db_fence_clear_authority'),
       mutate(shellFunction(FENCE_LIBRARY, 'db_fence_raise')),
@@ -1713,6 +1717,10 @@ test('db_fence_raise clears the authority a FAILED PUBLICATION left behind (o3d-
       FENCE_DISPLAY_DECLARATIONS,
       shellFunction(FENCE_LIBRARY, 'db_fence_authorise_plan'),
       shellFunction(FENCE_LIBRARY, 'db_fence_mark_authority_applied'),
+      // o3d-secops r32: db_fence_publish_authority() reads the digest of what it wrote through the
+      // shared machine-field reader now, so a rig that lifted the publisher without it would be
+      // measuring a publication that cannot report the bytes it published.
+      shellFunction(FENCE_LIBRARY, 'db_fence_machine_field'),
       shellFunction(FENCE_LIBRARY, 'db_fence_publish_authority'),
       shellFunction(FENCE_LIBRARY, 'db_fence_clear_authority'),
       mutate(shellFunction(FENCE_LIBRARY, 'db_fence_raise')),
@@ -2121,6 +2129,10 @@ test('only a status that means the revokes may be on the medium stamps the recor
       FENCE_DISPLAY_DECLARATIONS,
       shellFunction(FENCE_LIBRARY, 'db_fence_authorise_plan'),
       shellFunction(FENCE_LIBRARY, 'db_fence_mark_authority_applied'),
+      // o3d-secops r32: db_fence_publish_authority() reads the digest of what it wrote through the
+      // shared machine-field reader now, so a rig that lifted the publisher without it would be
+      // measuring a publication that cannot report the bytes it published.
+      shellFunction(FENCE_LIBRARY, 'db_fence_machine_field'),
       shellFunction(FENCE_LIBRARY, 'db_fence_publish_authority'),
       shellFunction(FENCE_LIBRARY, 'db_fence_clear_authority'),
       mutate(shellFunction(FENCE_LIBRARY, 'db_fence_raise')),
@@ -3840,7 +3852,7 @@ test('o3d-2sm1.5 r19/r32: the four options are parsed, and no file is read from 
     // o3d-secops r32: and the migration nonce, on the same terms -- `--print-migration-url` given
     // '' composes exactly the URL it composed before that round, with no `application_name` at all.
     { mode: 'release', stateFile: '/x', stateOwnerUid: 0, appRole: '', timeoutSeconds: 30, appHost: 'db.internal', appPort: '6432', appUser: 'imsapp', appDatabase: 'imsdb',
-      witnessNonce: '', witnessLock: '', witnessChallenge: '', migrationNonce: '' },
+      witnessNonce: '', witnessLock: '', witnessChallenge: '', migrationNonce: '', holdStamp: false },
   )
   // AND THE THREE ARE READ WHEN THEY ARE GIVEN (o3d-secops r31). MUTATION ROUTE: drop any of the
   // three `--witness-*` arms from parseArgs() and the matching field stays '' here.

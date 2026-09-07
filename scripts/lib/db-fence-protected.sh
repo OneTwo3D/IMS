@@ -1749,7 +1749,7 @@ db_fence_publish_authority() {
   _fence_published_digest=""
   local authorised
   authorised="$(printf '%s\n' "${plan}" | db_fence_authorise_plan "${expected_database}" "${expected_app_role}" "${destination}")" || return 1
-  _fence_published_digest="$(printf '%s\n' "${authorised}" | sed -n 's/^authority_sha256=\([0-9a-f]\{64\}\)$/\1/p' | tail -1)"
+  _fence_published_digest="$(db_fence_machine_field "${authorised}" authority_sha256 '^[0-9a-f]{64}$')" || _fence_published_digest=""
   return 0
 }
 
@@ -1961,6 +1961,29 @@ DB_FENCE_WITNESS_BOUND=0
 # challenge was ISSUED before it consults the answer -- see the `${#witness_argv[@]}` guards -- so
 # that the ABSENCE OF THE EXCHANGE can never read as a positive verdict, which is the shape this
 # branch has closed four times.
+# ONE VALUE FOR ONE KEY, ON A WHOLE LINE, OF A STATED SHAPE (o3d-secops r32, Codex HIGH 1 --
+# the "check the other machine lines" half). The wrapper heredoc carries the same rule as
+# machine_field(); this is the library's copy, for the two readings taken outside a wrapper.
+#
+# WHAT IT REPLACES, AND WHY IT MATTERS LESS HERE THAN IT LOOKS. Both callers read
+# `authority_sha256=` off a channel whose producer writes ONLY that line to stdout -- every word
+# an operator reads, `CONNECT will be revoked from <roles> on <database>` included, is on stderr --
+# so no name anybody chooses reaches it. What `sed … | tail -1` still got wrong is DUPLICATES: a
+# stream carrying the key twice was read as its last occurrence rather than refused, and "the last
+# one wins" is how an appended line becomes the answer. A digest that steers a privileged write is
+# not a place to keep that shape, whatever else is true of the channel.
+db_fence_machine_field() {
+  local stream="$1" key="$2" shape="$3" line value="" hits=0
+  while IFS= read -r line; do
+    case "${line}" in
+      "${key}="*) value="${line#"${key}="}"; hits=$((hits + 1)) ;;
+    esac
+  done <<<"${stream}"
+  [[ "${hits}" -eq 1 ]] || return 1
+  [[ "${value}" =~ ${shape} ]] || return 1
+  printf '%s\n' "${value}"
+}
+
 db_fence_machine_verdict() {
   local stream="$1" prefix="$2" nonce="$3" affirmative="$4"
   [[ "${nonce}" =~ ^[0-9a-f]{32,64}$ ]] || return 1
@@ -2854,7 +2877,7 @@ raise_the_fence() {
     # o3d-secops r28: bound to the bytes the validator just wrote, so the stamp cannot land on a
     # record something else replaced in between. Under the lock above that window is already shut;
     # this is the second answer to the same question and it costs one argument.
-    published_digest="$(printf '%s\n' "${published_digest}" | sed -n 's/^authority_sha256=\([0-9a-f]\{64\}\)$/\1/p' | tail -1)"
+    published_digest="$(machine_field "${published_digest}" authority_sha256 '^[0-9a-f]{64}$')" || published_digest=""
     if [[ -z "${published_digest}" ]]; then
       echo "The fence is up and the publication did not report the digest of the record it wrote, so this run cannot show that the record it would stamp is the one it just published. NOT STAMPING. Take the fence down with ${sudo_prefix}${release_wrapper} rather than re-running this one: a re-fence over an unstamped record is held to the strict rule and will refuse." >&2
     else
