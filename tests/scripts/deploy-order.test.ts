@@ -12804,10 +12804,12 @@ for (const entry of FENCE_HARNESS) {
         assert.ok(fenceNonce && challenge, `both nonces must reach the helper:\n${calls(dir)}`)
         assert.notEqual(fenceNonce, challenge, 'the release challenge must be fresh, not the fence own nonce')
 
-        // MUTATION ROUTE: in the entrypoint's release, assign clear_server unconditionally instead
-        // of from `witness_colocated=yes` -- the 'no' case then prints AUTHORITY_CLEARED. Drop the
-        // third argument from the db_fence_clear_authority call -- the 'yes' case prints
-        // AUTHORITY_REMAINS, and the ordinary cutover starts asking a human on every deploy.
+        // MUTATION ROUTE (all made against the shipped files and reverted): in the entrypoint's
+        // release, assign clear_server unconditionally instead of from `witness_colocated=yes` --
+        // the 'no' case then prints AUTHORITY_CLEARED. Drop the third argument from the
+        // db_fence_clear_authority call -- the 'yes' case prints AUTHORITY_REMAINS, and the
+        // ordinary cutover starts asking a human on every deploy. Make db_fence_witness_nonce()
+        // return a constant -- the freshness assertion above fails in both directions.
         if (cleared) {
           assert.match(result.output, /^AUTHORITY_CLEARED$/m,
             `a release whose own connection saw the witness must end its own record with nobody at a terminal:\n${result.output}`)

@@ -6125,11 +6125,11 @@ test('the connection witness is not what the fence drains (o3d-secops r31)', asy
  *   * a stopped witness cannot be challenged, which is the fallback the whole design leans on;
  *   * and a SECOND witness starts cleanly in the same shell, which is the exit trap's re-fence.
  *
- * MUTATION ROUTE (made against the shipped file and reverted): make db_fence_witness_challenge()
- * reuse ${DB_FENCE_WITNESS_NONCE} instead of minting one -- the freshness assertion fails. Delete
- * the `db_fence_witness_stop` call at the top of db_fence_witness_start() -- the second start
- * warns and the "SECOND READY" line does not appear. Make db_fence_witness_challenge() return 0
- * without asking anything -- the stopped-witness assertion fails.
+ * MUTATION ROUTE (all made against the shipped files and reverted): make db_fence_witness_nonce()
+ * return a constant -- the freshness assertions fail, here and in every entrypoint verdict test.
+ * Delete the `db_fence_witness_stop` call at the top of db_fence_witness_start() -- the second
+ * start warns and the "SECOND READY" line does not appear. Make db_fence_witness_challenge()
+ * return 0 without asking anything -- the stopped-witness assertion fails.
  */
 test('the witness co-process starts, answers fresh challenges, stops, and restarts (o3d-secops r31)', async (t) => {
   const root = stateDir(t)
