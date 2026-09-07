@@ -147,12 +147,14 @@ function sumExact(values: Array<Decimal | null>, seed: Decimal | null = toDecima
  * code cannot say that about — and a refusal here WITHHOLDS the payment rather than clearing it,
  * which is the direction this rule's asymmetry demands.
  *
- * `num()` IS DELIBERATELY STILL USED FOR THE COMPLETENESS ARITHMETIC BELOW. That cross-check asks a
- * different question — "does Xero's own total of what settles this document agree with the collection
- * it sent me?" — and its answer must not change because a figure was too finely stated to compare. It
- * is unchanged, and so are its tests. Its OWN operands are not exact either, and its band is still the
- * flat pre-o3d-6yho constant: that is the ninth site of this enumeration and it is o3d-r948, stated at
- * `XERO_AMOUNT_EPSILON` rather than folded in here.
+ * THIS READER IS DELIBERATELY NOT USED BY THE COMPLETENESS ARITHMETIC BELOW, AND o3d-r948 DID NOT
+ * CHANGE THAT. The cross-check asks a different question — "does Xero's own total of what settles this
+ * document agree with the collection it sent me?" — and its answer must not change because a figure
+ * was too finely stated to compare. A refusal there would SKIP the check, which is the lenient
+ * direction and the opposite of what that rule's asymmetry demands. So the completeness terms go
+ * through `wireDecimal`, which reads every stated number at its own exact decimal value and refuses
+ * nothing; what o3d-r948 changed is the ARITHMETIC (exact, not `+`) and the BAND (the document's own
+ * minor unit, not a flat half-penny). See `completenessBand`.
  */
 function statedAmount(raw: unknown, currency: string | null): Pick<LedgerSettlementRecord, 'amount' | 'unreadableAmount'> {
   const amount = readLedgerStatedAmount(raw, currency)
@@ -328,10 +330,10 @@ export async function probeXeroSettlement(
   const invoice = res.data?.Invoices?.[0]
   if (!invoice) return { ok: false, reason: 'Xero returned no document for that id' }
   const invoiceCurrency = ledgerCurrencyCode(invoice.CurrencyCode)
-  // o3d-78rq: the wire numbers, kept for the completeness arithmetic below and for NOTHING ELSE. That
+  // o3d-78rq: the wire figures, kept for the completeness arithmetic below and for NOTHING ELSE. That
   // cross-check asks whether the COLLECTION is complete, not whether a figure in it can be compared
-  // exactly, so it must go on reading exactly what it read before — see `statedAmount`.
-  // (Their own exactness is o3d-r948; it is stated at `XERO_AMOUNT_EPSILON` rather than fixed here.)
+  // exactly, so it goes on ADMITTING exactly what it admitted before — see `statedAmount`.
+  // o3d-r948: read as exact decimals rather than doubles, and summed without rounding.
   const wireAmounts = (invoice.Payments ?? []).map((p) => wireDecimal(p.Amount))
   const records: LedgerSettlementRecord[] = (invoice.Payments ?? []).map((p) => ({
     ...statedAmount(p.Amount, invoiceCurrency),
@@ -607,10 +609,12 @@ export async function probeQuickBooksSettlement(
 
   const documentCurrency = ledgerCurrencyCode(body.CurrencyRef?.value)
   const records: LedgerSettlementRecord[] = []
-  // o3d-78rq: as on the Xero side, the wire figures are kept for the completeness arithmetic and the
-  // records carry the exact ones. `qboAmountAppliedTo` SUMS a payment's lines, and a sum of doubles is
-  // exactly where a figure stops being the one the ledger stated — which is why the reading below is
-  // asked of the sum rather than assumed of it.
+  // o3d-78rq: as on the Xero side, the applied figures are kept for the completeness arithmetic and
+  // the records carry the ones `readLedgerStatedAmount` will vouch for. `qboAmountAppliedTo` SUMS a
+  // payment's lines, and a sum of doubles is exactly where a figure stops being the one the ledger
+  // stated — which is why the record's reading is asked of that sum rather than assumed of it.
+  //
+  // o3d-r948: and the completeness term is the SAME lines added exactly. Two readings, one walk.
   const wireApplied: Array<Decimal | null> = []
   for (const id of settlementIds) {
     const res = await qboGet<Record<string, { TxnDate?: string; PrivateNote?: string; Line?: QboPaymentLine[] } | undefined>>(
