@@ -1055,6 +1055,57 @@ test('a record this account could have written is never a record (o3d-secops r23
   ], 'restoring exactly what it names')
 })
 
+test('the privileged validator publishes atomically, and leaves the last record alone when it cannot', (t) => {
+  // THE DURABILITY ORDERING, WHICH MOVED WITH THE PUBLISHER (o3d-secops r23).
+  //
+  // Until r23 these three properties belonged to publishState() inside the helper and had three
+  // tests of their own; the helper has no publisher any more, so they are asserted where the
+  // publication now happens. The ordering is unchanged and is the whole reason the fence is safe:
+  // a REVOKE is a committed transaction that outlives a power cut, so the record that undoes it is
+  // written to a temporary, fsynced, renamed, and the directory entry fsynced — and a publication
+  // that cannot be completed leaves the PREVIOUS record byte for byte rather than a truncation.
+  //
+  // MEASURED BY MUTATION, ROUTE STATED AND VERIFIED UNDER A REAL SHELL: point the validator's
+  // `temporary` at the destination itself and drop the rename — an `openSync(destination, "w")`
+  // rather than `openSync(temporary, "wx")` + `renameSync`. The third case below then reports
+  // SUCCESS (exit 0) having CLOBBERED the standing record with the refused plan's content, where
+  // the shipped program exits 1 and leaves it byte for byte. That is the state a release cannot
+  // recover from: the grants it would restore are gone and the REVOKEs are not.
+  const dir = stateDir(t)
+  const stateFile = join(dir, 'db-connect-fence.json')
+  const plan = { ...SAMPLE_STATE, revoked: ['PUBLIC', 'imsapp'] }
+
+  const first = authorisePlan(plan, stateFile, 'imsdb', 'imsapp')
+  assert.equal(first.status, 0, `the first publication must succeed:\n${first.output}`)
+  const body = readFileSync(stateFile, 'utf8')
+  const keys = Object.keys(JSON.parse(body))
+  assert.equal(keys[keys.length - 1], 'state_complete',
+    `the sentinel must be written LAST, or it proves nothing about the fields above it:\n${body}`)
+  assert.deepEqual(readdirSync(dir), ['db-connect-fence.json'], 'and no temporary may be left behind')
+
+  // A SECOND PUBLICATION THAT CANNOT BE COMPLETED. The plan is refused after the destination has
+  // been examined and before anything is renamed, so what must survive is the FIRST record.
+  const refused = authorisePlan({ ...plan, fenced_at: 'not a timestamp' }, stateFile, 'imsdb', 'imsapp')
+  assert.notEqual(refused.status, 0, 'the refused publication must fail')
+  assert.equal(readFileSync(stateFile, 'utf8'), body, 'and the last durable record must be untouched')
+  assert.deepEqual(readdirSync(dir), ['db-connect-fence.json'], 'with no temporary left behind')
+
+  // AND ONE THAT FAILS AT THE WRITE ITSELF, after validation has passed: the destination
+  // directory refuses new entries. Same requirement, on the other side of the checks.
+  //
+  // ROOT BYPASSES DIRECTORY PERMISSIONS, so as root there is nothing here to refuse and the case
+  // would pass while measuring nothing. It is skipped out loud rather than asserted vacuously —
+  // the same guard readState()'s unreadable case makes, for the same reason.
+  if ((process.getuid?.() ?? 0) === 0) return
+  chmodSync(dir, 0o500)
+  const unwritable = authorisePlan({ ...plan, revoked: ['something else entirely'] }, stateFile, 'imsdb', 'imsapp')
+  chmodSync(dir, 0o700)
+  assert.notEqual(unwritable.status, 0, 'a publication that cannot create its temporary must fail, not return quietly')
+  assert.match(unwritable.output, /could not be published/, 'and say so')
+  assert.equal(readFileSync(stateFile, 'utf8'), body, 'and the last durable record must still be untouched')
+  assert.deepEqual(readdirSync(dir), ['db-connect-fence.json'], 'with no temporary left behind')
+})
+
 test('the privileged validator rebuilds the record and refuses what it cannot check', (t) => {
   // ROUTE: the shipped db_fence_authorise_plan_program(), run exactly as db_fence_authorise_plan()
   // runs it. It is the only thing that writes the authority, so what it will not accept is the
