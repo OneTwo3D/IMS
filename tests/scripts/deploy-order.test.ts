@@ -4337,6 +4337,13 @@ function harnessUid(): number {
   return process.getuid!()
 }
 
+/** THE DESCRIPTOR HELPER THE RELOCATION READS ITS SOURCE THROUGH (o3d-secops r21). Named here for
+ *  the reason install.sh's own rigs name ${IMS_CHOWN_TREE_HELPER}: these harnesses run the shipped
+ *  functions OUTSIDE the shipped file, so there is no ${BASH_SOURCE} for the default
+ *  `${IMS_SCRIPT_LIB_DIR}/pin-source-file.mjs` to resolve from. It is the shipped helper, not a
+ *  stand-in; that the entrypoints reach it by that default is asserted from the source below. */
+const PIN_SOURCE_HELPER = join(process.cwd(), 'scripts/lib/pin-source-file.mjs')
+
 /** Where the relocated marker lives in these harnesses: a directory of the run's own, named as a
  *  publication trust root exactly as /etc/ims-cutover is in production (it IS
  *  ${DB_ENV_SNAPSHOT_DIR} there, which is why no new root had to be added for it). */
@@ -4345,6 +4352,7 @@ LEGACY_STATE_DIR_FENCE_FILE="${dir}/DEPLOY-FENCED"
 FENCE_MARKER_DIR="${dir}/marker-dir"
 FENCE_FILE="\${FENCE_MARKER_DIR}/DEPLOY-FENCED"
 DB_ENV_SNAPSHOT_DIR="\${FENCE_MARKER_DIR}"
+IMS_FENCE_SOURCE_HELPER='${PIN_SOURCE_HELPER}'
 `
 
 for (const entry of R9_SCRIPTS) {
@@ -10460,4 +10468,419 @@ test('r34: the runbook says where a first-ever install gets the digest, in the w
     /performs NO credentialed fence execution/,
     'and the installer must be the thing that says it, in the refusal an operator would actually meet',
   )
+})
+
+// ---------------------------------------------------------------------------
+// THE SOURCE OF THE RELOCATION (o3d-secops r21, Codex HIGH)
+//
+// r20 moved the marker out of ${CUTOVER_STATE_DIR} and left the relocation reaching back into it BY
+// NAME: `[[ -f ]]`, which follows a symlink, and then a redirection that resolved the same name a
+// second time, as root, into publish_durable_file(). The destination checks all pass afterwards —
+// BECAUSE THE PUBLICATION MADE THEM PASS. What is measured below is the other end: the source is
+// opened once with O_NOFOLLOW, judged as a DESCRIPTOR, and copied from that descriptor.
+//
+// WHAT THIS HARNESS CAN AND CANNOT SHOW, again stated rather than glossed. It runs as ONE account,
+// so "${APP_USER} planted this and root did not" is not directly measurable. What IS measured, for
+// real and on a real filesystem: every shape that account can leave at the old path being refused
+// rather than read; the bytes a planted link points at NOT reaching ${FENCE_FILE}; the refusal
+// leaving the entry and the fence exactly where they were; and a genuine marker still relocating.
+// Ownership — the one property that cannot be exhibited unprivileged — is measured against the
+// shipped helper directly, by telling it a uid other than the file's, which is the same question
+// the entrypoints ask it with `$(id -u)`.
+// ---------------------------------------------------------------------------
+
+/** The shipped gate and the shipped read, quoted exactly, so every mutant below is a change to
+ *  SHIPPED TEXT rather than a re-implementation of it. If either stops matching, the mutation
+ *  helper throws — instead of silently running the shipped function and passing. */
+const SHIPPED_SOURCE_GATE = '  [[ -e "${LEGACY_STATE_DIR_FENCE_FILE}" || -L "${LEGACY_STATE_DIR_FENCE_FILE}" ]] || return 0'
+const SHIPPED_PINNED_READ = '  node "${helper}" "${LEGACY_STATE_DIR_FENCE_FILE}" "${self}" > "${staged}" || rc=$?'
+/** THE PRE-r21 PAIR. `[[ -f ]]` follows a symlink and asks nothing about who wrote what it found;
+ *  the read resolves the same name a second time. Everything else in the function — the ordering,
+ *  the publisher, the warnings, the refusal to remove the old marker — is the shipped text, so what
+ *  the mutants measure is exactly this pair and nothing else. */
+const PRE_R21_GATE = '  [[ -f "${LEGACY_STATE_DIR_FENCE_FILE}" ]] || return 0'
+const PRE_R21_READ = '  cat "${LEGACY_STATE_DIR_FENCE_FILE}" > "${staged}" || rc=$?'
+
+/** The shipped importer with its source pinning replaced by the construct it retired. */
+function preR21Importer(source: string): string {
+  const shipped = shellFunction(source, 'import_relocated_fence_marker')
+  assert.ok(shipped.includes(SHIPPED_SOURCE_GATE),
+    `the shipped importer must ask the NAME one question and act on a descriptor:\n${shipped}`)
+  assert.ok(shipped.includes(SHIPPED_PINNED_READ),
+    `the shipped importer must read the legacy marker through the descriptor helper:\n${shipped}`)
+  return shipped.replace(SHIPPED_SOURCE_GATE, PRE_R21_GATE).replace(SHIPPED_PINNED_READ, PRE_R21_READ)
+}
+
+/** The rig lines that follow a refusal. The importer `die`s, and `die` is `exit 1`, so it runs in a
+ *  SUBSHELL — otherwise the whole rig ends and none of the post-conditions below are observed. The
+ *  `2>&1` is what brings the refusal (and the helper's own reason, which node writes to stderr)
+ *  into the captured stdout; without it a run that exits 0 discards them. */
+const RELOCATION_OUTCOME = [
+  'rc=0; ( import_relocated_fence_marker ) 2>&1 || rc=$?; echo "RC=${rc}"',
+  '[[ -e "${FENCE_FILE}" ]] && echo PUBLISHED || echo NOT_PUBLISHED',
+  'if [[ -f "${FENCE_FILE}" ]] && grep -q "^ROOT_ONLY_BYTES=1$" "${FENCE_FILE}"; then echo SOURCE_BYTES_REPUBLISHED; else echo SOURCE_BYTES_NOT_REPUBLISHED; fi',
+  '[[ -e "${LEGACY_STATE_DIR_FENCE_FILE}" || -L "${LEGACY_STATE_DIR_FENCE_FILE}" ]] && echo ENTRY_LEFT_IN_PLACE || echo ENTRY_REMOVED',
+  // AND THEN THE ENTRY IS CLEARED, WHICH IS A FACT ABOUT THIS HARNESS AND NOT ABOUT THE CODE.
+  // runR9() reads ${dir}/DEPLOY-FENCED unconditionally when it returns; `readFileSync` on a FIFO
+  // blocks for ever waiting for a writer, and on a directory throws. The assertion above has
+  // already recorded that the shipped run left the entry alone, so removing it measures nothing
+  // away — and a rig that hangs is a rig that proves nothing at all.
+  'if [[ -p "${LEGACY_STATE_DIR_FENCE_FILE}" ]]; then rm -f "${LEGACY_STATE_DIR_FENCE_FILE}"; fi',
+  'if [[ -d "${LEGACY_STATE_DIR_FENCE_FILE}" && ! -L "${LEGACY_STATE_DIR_FENCE_FILE}" ]]; then rmdir "${LEGACY_STATE_DIR_FENCE_FILE}"; fi',
+]
+
+const RELOCATION_FUNCTIONS = ['fsync_path', 'publish_durable_file', 'ensure_fence_marker_dir', 'import_relocated_fence_marker']
+const RELOCATION_FUNCTIONS_FOR_MUTANT = ['fsync_path', 'publish_durable_file', 'ensure_fence_marker_dir']
+
+for (const entry of R9_SCRIPTS) {
+  test(`${entry.name} does not follow a symlink at the pre-r20 marker path, and does not republish what it points at`, () => {
+    /**
+     * ROUTE: the shipped import_relocated_fence_marker(), run for real, with a REAL symlink at
+     * ${LEGACY_STATE_DIR_FENCE_FILE} pointing at a file that is otherwise a perfectly well-formed
+     * marker — 0600, owned by this run, complete. Everything the destination checks would ask about
+     * it is true. The only thing wrong with it is that this run did not put it at that name.
+     */
+    const planted = [
+      'printf "phase=stopping\\nschema_touched=true\\nmarker_complete=1\\nROOT_ONLY_BYTES=1\\n" > "${CUTOVER_STATE_DIR}/somewhere-else"',
+      'chmod 600 "${CUTOVER_STATE_DIR}/somewhere-else"',
+      'ln -s "${CUTOVER_STATE_DIR}/somewhere-else" "${LEGACY_STATE_DIR_FENCE_FILE}"',
+    ]
+    const refused = runR9(entry, RELOCATION_FUNCTIONS, [...planted, ...RELOCATION_OUTCOME].join('\n'),
+      FENCE_RELOCATION_EXTRA('$CUTOVER_STATE_DIR'))
+
+    assert.match(refused.stdout, /^RC=1$/m, `a link at the marker's old name must end the run:\n${refused.stdout}`)
+    assert.match(refused.stdout, /is a SYMBOLIC LINK/,
+      `and the kernel's own refusal must be what says so:\n${refused.stdout}`)
+    assert.match(refused.stdout, /^NOT_PUBLISHED$/m, `nothing may be published from it:\n${refused.stdout}`)
+    assert.match(refused.stdout, /^SOURCE_BYTES_NOT_REPUBLISHED$/m,
+      `and above all the target's bytes must not become this host's record of an interrupted deploy:\n${refused.stdout}`)
+    // AND THE HOST IS LEFT AS FENCED AS IT WAS. The entry stays: an AssertPathExists=! installed by
+    // an earlier checkout is satisfied by whatever is at that name, so removing it is a release.
+    assert.match(refused.stdout, /^ENTRY_LEFT_IN_PLACE$/m,
+      `the entry may not be cleared by a run that refused to read it — that would release a fence:\n${refused.stdout}`)
+    assert.match(refused.stdout, /NOTHING HAS BEEN STOPPED/,
+      `and the refusal must say what state the host is in:\n${refused.stdout}`)
+    assert.match(refused.stdout, /LEFT WHERE IT IS/,
+      `and why the entry is still there:\n${refused.stdout}`)
+    assert.match(refused.stdout, /DropInPaths/,
+      `and where to look before removing it by hand:\n${refused.stdout}`)
+
+    // MEASURED BY MUTATION, ROUTE STATED: the same shipped importer with the pre-r21 pair — the
+    // `[[ -f ]]` that follows the link, and the read that resolves the name a second time. The
+    // target's bytes are then published at ${FENCE_FILE}, root-owned and 0600, where every
+    // provenance check the destination makes passes because the publication made it pass.
+    const mutated = runR9(entry, RELOCATION_FUNCTIONS_FOR_MUTANT,
+      [preR21Importer(entry.source), ...planted, ...RELOCATION_OUTCOME].join('\n'),
+      FENCE_RELOCATION_EXTRA('$CUTOVER_STATE_DIR'))
+    assert.match(mutated.stdout, /^RC=0$/m, `the retired construct accepts it without complaint:\n${mutated.stdout}`)
+    assert.match(mutated.stdout, /^SOURCE_BYTES_REPUBLISHED$/m,
+      `and launders the link's target into root-owned state at the marker's name — that is the finding:\n${mutated.stdout}`)
+  })
+
+  test(`${entry.name} refuses a pre-r20 marker that is rewritable, that has a second name, or that is not a file`, () => {
+    /**
+     * THE OTHER SHAPES THE ACCOUNT THAT OWNS THAT DIRECTORY CAN LEAVE THERE, each run for real
+     * through the shipped importer. ROUTE: the descriptor's own `fstat`, which is what answers all
+     * three — not a `stat` of the name.
+     *
+     * The FIFO is here for a reason beyond refusal: `open(2)` on a fifo without `O_NONBLOCK` blocks
+     * until a writer appears, so the shipped helper omitting that flag would park a root-side
+     * cutover for ever. This test completing at all is the measurement.
+     */
+    const cases = [
+      {
+        name: 'rewritable',
+        plant: [
+          'printf "phase=stopping\\nmarker_complete=1\\nROOT_ONLY_BYTES=1\\n" > "${LEGACY_STATE_DIR_FENCE_FILE}"',
+          'chmod 666 "${LEGACY_STATE_DIR_FENCE_FILE}"',
+        ],
+        reason: /writable by group or other/,
+      },
+      {
+        name: 'second-name',
+        plant: [
+          'printf "phase=stopping\\nmarker_complete=1\\nROOT_ONLY_BYTES=1\\n" > "${CUTOVER_STATE_DIR}/other-name"',
+          'chmod 600 "${CUTOVER_STATE_DIR}/other-name"',
+          'ln "${CUTOVER_STATE_DIR}/other-name" "${LEGACY_STATE_DIR_FENCE_FILE}"',
+        ],
+        reason: /has 2 links/,
+      },
+      {
+        name: 'fifo',
+        plant: ['mkfifo "${LEGACY_STATE_DIR_FENCE_FILE}"'],
+        reason: /is a FIFO/,
+      },
+      {
+        name: 'directory',
+        plant: ['mkdir "${LEGACY_STATE_DIR_FENCE_FILE}"'],
+        reason: /is a directory/,
+      },
+    ] as const
+
+    for (const shape of cases) {
+      const run = runR9(entry, RELOCATION_FUNCTIONS, [...shape.plant, ...RELOCATION_OUTCOME].join('\n'),
+        FENCE_RELOCATION_EXTRA('$CUTOVER_STATE_DIR'))
+      assert.match(run.stdout, /^RC=1$/m, `a ${shape.name} at the marker's old name must end the run:\n${run.stdout}`)
+      assert.match(run.stdout, shape.reason, `and the refusal must name what it is:\n${run.stdout}`)
+      assert.match(run.stdout, /^NOT_PUBLISHED$/m, `nothing may be published from a ${shape.name}:\n${run.stdout}`)
+      assert.match(run.stdout, /^ENTRY_LEFT_IN_PLACE$/m,
+        `and a run that refused to read a ${shape.name} may not clear it either:\n${run.stdout}`)
+    }
+
+    // MEASURED BY MUTATION, ROUTE STATED: the pre-r21 pair again, over the rewritable marker — the
+    // one shape a `cat` of the name is perfectly happy with. It is adopted.
+    const mutated = runR9(entry, RELOCATION_FUNCTIONS_FOR_MUTANT,
+      [preR21Importer(entry.source), ...cases[0].plant, ...RELOCATION_OUTCOME].join('\n'),
+      FENCE_RELOCATION_EXTRA('$CUTOVER_STATE_DIR'))
+    assert.match(mutated.stdout, /^SOURCE_BYTES_REPUBLISHED$/m,
+      `the retired construct adopts a marker anybody could have rewritten:\n${mutated.stdout}`)
+  })
+
+  test(`${entry.name} refuses a pre-r20 marker that is not owned by the account running the cutover`, () => {
+    /**
+     * THE ONE PROPERTY A SINGLE-ACCOUNT HARNESS CANNOT PLANT, asked the other way round: the file is
+     * owned by this run, and the run is told it is somebody else. `id -u` is what the shipped
+     * importer passes the helper, so shadowing it is the same question with the two sides swapped —
+     * "is this file owned by the account doing the cutover" is false either way.
+     *
+     * TWO SHIMS AND WHAT THEY STAND IN FOR. `id` answers 4242 for `-u` only, and delegates
+     * everything else to the real thing. `chown` becomes a no-op because ensure_fence_marker_dir()
+     * chowns the marker's directory to that same uid, which an unprivileged harness cannot do —
+     * the directory itself is created and chmod'ed for real, before the shims are installed, by the
+     * shipped function.
+     */
+    const rig = [
+      'ensure_fence_marker_dir',
+      'printf "phase=stopping\\nmarker_complete=1\\nROOT_ONLY_BYTES=1\\n" > "${LEGACY_STATE_DIR_FENCE_FILE}"',
+      'chmod 600 "${LEGACY_STATE_DIR_FENCE_FILE}"',
+      'id(){ if [[ "${1:-}" == "-u" ]]; then echo 4242; else command id "$@"; fi; }',
+      'chown(){ return 0; }',
+      ...RELOCATION_OUTCOME,
+    ]
+    const refused = runR9(entry, RELOCATION_FUNCTIONS, rig.join('\n'), FENCE_RELOCATION_EXTRA('$CUTOVER_STATE_DIR'))
+    assert.match(refused.stdout, /^RC=1$/m, `a marker written by another account must end the run:\n${refused.stdout}`)
+    assert.match(refused.stdout, new RegExp(`is owned by uid ${harnessUid()} and this cutover runs as uid 4242`),
+      `and the refusal must name both uids:\n${refused.stdout}`)
+    assert.match(refused.stdout, /^NOT_PUBLISHED$/m, refused.stdout)
+    assert.match(refused.stdout, /^ENTRY_LEFT_IN_PLACE$/m, refused.stdout)
+
+    /**
+     * MEASURED BY MUTATION, ROUTE STATED — and the measurement is WHERE EACH CONSTRUCT STOPS,
+     * because a one-account harness cannot make the publication succeed for a run that believes it
+     * is uid 4242: publish_durable_file() requires its staging directory to be owned by that same
+     * uid, and the shim above cannot chown to an account this harness is not. So what is compared
+     * is the refusal each construct produces. The shipped importer stops at the SOURCE, naming the
+     * two uids, and never reaches the publisher. The pre-r21 pair asks nothing about who wrote the
+     * bytes — the uid it computed is never used, because `cat` does not take one — reads them, and
+     * carries them all the way to the publication. That the bytes ARE handed back when the
+     * publication can succeed is measured directly against the shipped helper, in
+     * '[o3d-secops r21] the source helper judges the descriptor it opened' below.
+     */
+    const mutated = runR9(entry, RELOCATION_FUNCTIONS_FOR_MUTANT,
+      [preR21Importer(entry.source), ...rig].join('\n'), FENCE_RELOCATION_EXTRA('$CUTOVER_STATE_DIR'))
+    assert.doesNotMatch(mutated.stdout, /is owned by uid/,
+      `the retired construct asks nothing about who wrote the bytes:\n${mutated.stdout}`)
+    assert.match(mutated.stdout, /could not be published durably/,
+      `it reads them and carries them to the publisher, which is the step the shipped importer never reaches:\n${mutated.stdout}`)
+  })
+
+  test(`${entry.name} still relocates a genuine pre-r20 marker, leaves the host fenced throughout, and leaves no staged copy behind`, () => {
+    // THE ORDINARY CASE, which every refusal above is worthless without. ROUTE: the shipped importer
+    // through the shipped helper and the shipped publisher, against a marker of exactly the shape
+    // publish_durable_file() leaves — 0600, one link, owned by this run.
+    const moved = runR9(entry, RELOCATION_FUNCTIONS, [
+      'printf "phase=stopping\\nschema_touched=true\\nmarker_complete=1\\n" > "${LEGACY_STATE_DIR_FENCE_FILE}"',
+      'chmod 600 "${LEGACY_STATE_DIR_FENCE_FILE}"',
+      'import_relocated_fence_marker; echo "RC=$?"',
+      '[[ -f "${FENCE_FILE}" ]] && echo NEW_MARKER_PUBLISHED || echo NEW_MARKER_MISSING',
+      '[[ -f "${LEGACY_STATE_DIR_FENCE_FILE}" ]] && echo OLD_MARKER_STILL_FENCING || echo OLD_MARKER_GONE',
+      'cmp -s "${FENCE_FILE}" "${LEGACY_STATE_DIR_FENCE_FILE}" && echo SAME_BYTES || echo BYTES_DIFFER',
+      'stat -c "MARKER_MODE=%a MARKER_OWNER=%u" "${FENCE_FILE}"',
+      // AND NOTHING OF THE HOP IS LEFT. The descriptor's bytes are staged inside the marker's own
+      // root-owned directory so publish_durable_file() can take them on stdin; a copy of a cutover
+      // record left lying there afterwards is debris nothing would ever clear.
+      'echo "STAGED_LEFT=$(find "${FENCE_MARKER_DIR}" -maxdepth 1 -name ".legacy-marker.*" | wc -l)"',
+    ].join('\n'), FENCE_RELOCATION_EXTRA('$CUTOVER_STATE_DIR'))
+
+    assert.match(moved.stdout, /^RC=0$/m, moved.stdout)
+    assert.match(moved.stdout, /^NEW_MARKER_PUBLISHED$/m, `a genuine marker must still reach its new home:\n${moved.stdout}`)
+    assert.match(moved.stdout, /^SAME_BYTES$/m, `carrying what the interrupted run recorded:\n${moved.stdout}`)
+    assert.match(moved.stdout, /^OLD_MARKER_STILL_FENCING$/m,
+      `and the old one must survive it, because the drop-in on disk still asserts on it:\n${moved.stdout}`)
+    assert.match(moved.stdout, new RegExp(`^MARKER_MODE=600 MARKER_OWNER=${harnessUid()}$`, 'm'),
+      `and what is published must be adoptable by the checks the next phase makes:\n${moved.stdout}`)
+    assert.match(moved.stdout, /^STAGED_LEFT=0$/m,
+      `and the staged copy must not be left in the marker's directory:\n${moved.stdout}`)
+    assert.match(moved.stdout, /Moved the cutover marker out of the application's own data directory/,
+      `and the operator must be told:\n${moved.stdout}`)
+  })
+}
+
+test('all three entrypoints read the relocated marker through the descriptor helper, and none of them reads its name twice', () => {
+  // THE SHIPPED DEFAULT, which the rigs above override and therefore cannot measure: on a real host
+  // the helper is resolved from this script's own lib directory, the way db-fence-protected.sh,
+  // pg-auth-request.mjs and chown-tree.mjs already are.
+  assert.ok(existsSync(PIN_SOURCE_HELPER), `${PIN_SOURCE_HELPER} must ship with the entrypoints that run it`)
+
+  const bodies = R9_SCRIPTS.map((entry) => {
+    const body = shellFunction(entry.source, 'import_relocated_fence_marker')
+    assert.match(body, /helper="\$\{IMS_FENCE_SOURCE_HELPER:-\$\{IMS_SCRIPT_LIB_DIR:-\}\/pin-source-file\.mjs\}"/,
+      `${entry.name} must resolve the helper from its own lib directory:\n${body}`)
+    assert.ok(body.includes(SHIPPED_PINNED_READ),
+      `${entry.name} must read the legacy marker through the helper, passing the uid this run has:\n${body}`)
+
+    // AND THE RETIRED CONSTRUCT IS GONE, not merely unused. Both halves of it: the `[[ -f ]]` that
+    // followed a link, and the redirection that resolved the same name a second time.
+    assert.ok(!body.includes('[[ -f "${LEGACY_STATE_DIR_FENCE_FILE}" ]]'),
+      `${entry.name} asks \`[[ -f ]]\` of the legacy path again, which follows a symlink:\n${body}`)
+    assert.ok(!/< "\$\{LEGACY_STATE_DIR_FENCE_FILE\}"/.test(body),
+      `${entry.name} reads the legacy path by name again; the bytes must come from the descriptor:\n${body}`)
+
+    // AND THE PIN COMES BEFORE THE PUBLICATION. A judgement made after the publisher has already
+    // run is a judgement about a marker this host has already adopted.
+    const pinned = body.indexOf(SHIPPED_PINNED_READ)
+    const published = body.indexOf('publish_durable_file "${FENCE_FILE}"')
+    assert.ok(pinned !== -1 && published !== -1 && pinned < published,
+      `${entry.name} must judge the source before it publishes it:\n${body}`)
+
+    // AND A REFUSAL ENDS THE RUN. Skipping the relocation and continuing would re-point the drop-in
+    // at a marker that does not exist and then clear the entry that is fencing this host.
+    const refusal = body.indexOf('rm -f "${staged}"\n    die "The entry at ${LEGACY_STATE_DIR_FENCE_FILE} is not a cutover marker this run may believe')
+    assert.ok(refusal !== -1,
+      `${entry.name} must die on a source it cannot believe rather than proceed unfenced:\n${body}`)
+    return body
+  })
+
+  assert.equal(new Set(bodies).size, 1,
+    'the three entrypoints must carry the same importer, byte for byte:\n'
+    + R9_SCRIPTS.map((e, i) => `${e.name}:\n${bodies[i]}`).join('\n---\n'))
+})
+
+/** The shipped helper with one of its checks removed, written where it can be run as a module. Each
+ *  replacement is asserted to have matched, so a mutant that silently ran the shipped text — and
+ *  therefore measured nothing — fails instead of passing. */
+function mutatedPinHelper(t: { after?: unknown }, label: string, edits: readonly (readonly [string, string])[]): string {
+  let source = readFileSync(PIN_SOURCE_HELPER, 'utf8')
+  for (const [from, to] of edits) {
+    assert.ok(source.includes(from), `the shipped helper must still contain ${JSON.stringify(from)} for the ${label} mutant`)
+    source = source.replace(from, to)
+  }
+  const file = join(createTempDirSync(`ims-secops-r21-${label}-`, t as never), 'pin-source-file-mutant.mjs')
+  writeFileSync(file, source)
+  return file
+}
+
+const PIN_OPEN = 'constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK'
+const PIN_IDENTITY = 'if (named.dev !== held.dev || named.ino !== held.ino) {'
+const PIN_OWNER = 'if (held.uid !== expectedUid) {'
+const PIN_LINKS = 'if (held.nlink !== 1) {'
+
+test('[o3d-secops r21] the source helper judges the descriptor it opened, and each of its checks is what refuses', (t) => {
+  /**
+   * THE HELPER ITSELF, run for real against real files, because it is where every refusal above is
+   * actually decided. Each mutation removes ONE check from the SHIPPED text and shows the shape
+   * that check refuses being accepted — bytes on stdout — instead.
+   */
+  const dir = createTempDirSync('ims-secops-r21-helper-', t)
+  const good = join(dir, 'DEPLOY-FENCED')
+  const target = join(dir, 'somewhere-else')
+  const uid = harnessUid()
+  writeFileSync(good, 'phase=stopping\nmarker_complete=1\n')
+  chmodSync(good, 0o600)
+  writeFileSync(target, 'ROOT_ONLY_BYTES=1\n')
+  chmodSync(target, 0o600)
+  const linked = join(dir, 'linked')
+  symlinkSync(target, linked)
+
+  const q = (value: string) => JSON.stringify(value)
+  // `2>&1` BECAUSE THE REFUSAL IS THE MEASUREMENT. runShell() returns only stdout for a shell that
+  // exited 0, and this one always does — the status under test is node's, captured by the `echo`.
+  // Without the merge every "it must refuse, and say why" assertion below would be asserting
+  // against an empty string.
+  const run = (helper: string, path: string, expected = uid) =>
+    runShell(`timeout 20 node ${q(helper)} ${q(path)} ${expected} 2>&1; echo "RC=$?"`)
+
+  // THE GOOD ONE, first: a helper that refused everything would pass every assertion below.
+  const accepted = run(PIN_SOURCE_HELPER, good)
+  assert.match(accepted.output, /^RC=0$/m, accepted.output)
+  assert.match(accepted.output, /^phase=stopping$/m, `and the bytes must be the file's:\n${accepted.output}`)
+  assert.match(accepted.output, /^marker_complete=1$/m, accepted.output)
+
+  // A NAME THAT IS NOT THERE IS NOT A REFUSAL. It is the ordinary case on all but a handful of
+  // hosts, and the entrypoints distinguish it: exit 2 means "nothing to relocate".
+  assert.match(run(PIN_SOURCE_HELPER, join(dir, 'absent')).output, /^RC=2$/m)
+
+  // THE SYMLINK: refused by the kernel at the open, and NOT within the timeout by accident.
+  const link = run(PIN_SOURCE_HELPER, linked)
+  assert.match(link.output, /^RC=1$/m, link.output)
+  assert.doesNotMatch(link.output, /ROOT_ONLY_BYTES/, `the target's bytes must not reach stdout:\n${link.output}`)
+
+  // MUTATION 1, ROUTE STATED: O_NOFOLLOW dropped from the one open. The link is then followed — and
+  // the descriptor's own facts (regular file, owned by this run, 0600, one link) all say yes,
+  // because the attacker picked the target. What refuses it is the identity proof, and this is what
+  // shows that proof is load-bearing rather than decorative.
+  const noFollow = mutatedPinHelper(t, 'nofollow', [[PIN_OPEN, 'constants.O_RDONLY | constants.O_NONBLOCK']])
+  const followed = run(noFollow, linked)
+  assert.match(followed.output, /^RC=1$/m, followed.output)
+  assert.match(followed.output, /Either the open followed a link/,
+    `without O_NOFOLLOW the open succeeds and only the identity proof is left to catch it:\n${followed.output}`)
+  assert.doesNotMatch(followed.output, /ROOT_ONLY_BYTES/, followed.output)
+
+  // MUTATION 2, ROUTE STATED: both removed — which is the pre-r21 behaviour exactly. The link's
+  // target is read and emitted, and nothing anywhere says so.
+  const neither = mutatedPinHelper(t, 'neither', [
+    [PIN_OPEN, 'constants.O_RDONLY | constants.O_NONBLOCK'],
+    [PIN_IDENTITY, 'if (false) {'],
+  ])
+  const laundered = run(neither, linked)
+  assert.match(laundered.output, /^RC=0$/m, laundered.output)
+  assert.match(laundered.output, /^ROOT_ONLY_BYTES=1$/m,
+    `with neither check the helper hands back a file somebody else chose — that is the finding:\n${laundered.output}`)
+
+  // MUTATION 3, ROUTE STATED: the ownership check removed. A file this run did not write is
+  // accepted, which is what `cat` did.
+  const anyOwner = mutatedPinHelper(t, 'owner', [[PIN_OWNER, 'if (false) {']])
+  assert.match(run(PIN_SOURCE_HELPER, good, uid + 1).output, /^RC=1$/m)
+  assert.match(run(PIN_SOURCE_HELPER, good, uid + 1).output, new RegExp(`is owned by uid ${uid} and this cutover runs as uid ${uid + 1}`))
+  const foreign = run(anyOwner, good, uid + 1)
+  assert.match(foreign.output, /^RC=0$/m, foreign.output)
+  assert.match(foreign.output, /^phase=stopping$/m,
+    `without the ownership question a marker written by another account is read:\n${foreign.output}`)
+
+  // MUTATION 4, ROUTE STATED: the link count removed. A hard link is the one way to make a
+  // root-owned inode appear at a name in a directory the service account controls.
+  const hard = join(dir, 'hard-linked')
+  runShell(`ln ${q(target)} ${q(hard)}`)
+  const twoNames = run(PIN_SOURCE_HELPER, hard)
+  assert.match(twoNames.output, /^RC=1$/m, twoNames.output)
+  assert.match(twoNames.output, /has 2 links/, twoNames.output)
+  assert.doesNotMatch(twoNames.output, /ROOT_ONLY_BYTES/, twoNames.output)
+  const anyLinks = mutatedPinHelper(t, 'links', [[PIN_LINKS, 'if (false) {']])
+  const relinked = run(anyLinks, hard)
+  assert.match(relinked.output, /^RC=0$/m, relinked.output)
+  assert.match(relinked.output, /^ROOT_ONLY_BYTES=1$/m,
+    `without the link count an inode named twice is republished:\n${relinked.output}`)
+})
+
+test('[o3d-secops r21] a fifo at the marker path is answered rather than waited on, which is a claim about open(2)', (t) => {
+  /**
+   * NOT A CLAIM ABOUT THE SHIPPED CHECKS — a claim about the flag they are made through, measured
+   * on a real filesystem. `open(2)` on a FIFO for reading blocks until a writer appears, so a
+   * helper without O_NONBLOCK would park a root-side cutover indefinitely and no assertion about
+   * refusals would ever be reached. The mutant is the shipped helper with that one flag removed,
+   * and what separates the two is a TIMEOUT, which `timeout` reports as 124.
+   */
+  const dir = createTempDirSync('ims-secops-r21-fifo-', t)
+  const fifo = join(dir, 'DEPLOY-FENCED')
+  const q = (value: string) => JSON.stringify(value)
+  runShell(`mkfifo ${q(fifo)}`)
+
+  const shipped = runShell(`timeout 10 node ${q(PIN_SOURCE_HELPER)} ${q(fifo)} ${harnessUid()} 2>&1; echo "RC=$?"`)
+  assert.match(shipped.output, /^RC=1$/m, `a fifo must be refused, and refused now:\n${shipped.output}`)
+  assert.match(shipped.output, /is a FIFO/, shipped.output)
+
+  const blocking = mutatedPinHelper(t, 'noblock', [[PIN_OPEN, 'constants.O_RDONLY | constants.O_NOFOLLOW']])
+  const parked = runShell(`timeout 10 node ${q(blocking)} ${q(fifo)} ${harnessUid()} 2>&1; echo "RC=$?"`)
+  assert.match(parked.output, /^RC=124$/m,
+    `without O_NONBLOCK the open waits for a writer that never comes, and the cutover waits with it:\n${parked.output}`)
 })
