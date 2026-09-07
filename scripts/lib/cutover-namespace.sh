@@ -56,21 +56,32 @@
 #
 # WHY NOT /etc/ims-cutover, WHICH r20 ALREADY CREATED AND ALREADY OWNS. Because it is 0700 and
 # must stay 0700: it holds ${DB_ENV_SNAPSHOT_FILE}, which carries the database password, and
-# ${FENCE_FILE}, which is the boot authority. The DB fence directory has to be WRITABLE by
-# ${APP_USER} — the connection fence script runs as that account (`as_app_user … --state-file=`)
-# — and a subdirectory nobody but root may TRAVERSE is not writable by anybody. Relaxing that
-# directory to 0711 so a child could be reached would relax the one directory on the box that
-# exists to be private, to give a lock file a home. So the app-facing half of the namespace gets
-# its own root-owned parent at 0755 — the same shape ${DB_FENCE_RECOVERY_DIR} already has, and
-# for the same reason — and /etc/ims-cutover is not touched by this round at all.
+# ${FENCE_FILE}, which is the boot authority. ${DB_FENCE_STATE} has to be READABLE by ${APP_USER}
+# — the connection fence script runs as that account (`as_app_user … --state-file=`) and executes
+# the revocation and the restoration the record describes — and a directory nobody but root may
+# TRAVERSE is not readable by anybody. Relaxing /etc/ims-cutover to 0711 so a child could be
+# reached would relax the one directory on the box that exists to be private, to give a lock file
+# a home. So the fence namespace gets its own root-owned parent, and /etc/ims-cutover is not
+# touched by this round at all.
+#
+# READABLE, AND NOT WRITABLE (o3d-secops r23, Codex CRITICAL). r22 made ${DB_FENCE_DIR} app-OWNED,
+# because the helper published its own record into it — and the record is what `--release` builds
+# `GRANT CONNECT` out of, so the account being defended against chose what a privileged release
+# would restore, at any time, from a file it could pre-create. THE AUTHORITY THEREFORE STOPPED
+# BEING WRITTEN BY THE HELPER. It is now published by ROOT, through publish_durable_file(), out of
+# a plan the unprivileged helper PRINTS and a privileged validator re-emits field by field; see
+# db_fence_publish_authority() in lib/db-fence-protected.sh. What that leaves down here is a
+# directory nobody but root may write and anybody may read, which is exactly what an ACL record
+# an unprivileged executor must obey needs to be.
 #
 # WHAT LIVES WHERE, AFTER THIS ROUND:
 #
 #   /etc/ims-cutover              root:root 0700   the fence MARKER, the DB identity snapshot
 #   /etc/ims-cutover-recovery     root:root 0755   the protected fence artefact and its wrappers
-#   /etc/ims-cutover-state        root:root 0755   THIS ROUND: the shared cutover lock, and
-#     ├── cutover.lock            root:root 0644     the app-writable connection-fence directory
-#     └── db-fence/               app:app   0700
+#   /etc/ims-cutover-state        root:root 0711   the shared cutover lock, and the directory
+#     ├── cutover.lock            root:root 0600     the connection-fence AUTHORITY lives in
+#     └── db-fence/               root:root 0755
+#         └── db-connect-fence.json  root:root 0644
 #   ${CUTOVER_STATE_DIR}          app-owned        the crontab backup, the crontab lock directory
 #
 # The crontab backup is NOT moved by this round. It is its own finding, filed separately, and it
@@ -337,17 +348,55 @@ verify_held_lock() {
 #   • `chown -h` never dereferences, so even a path swapped between the check and the call
 #     changes the LINK and cannot hand a target away.
 #
-# NOTHING EVER WRITES THIS FILE. Its contents are meaningless; only its inode is the lock. 0644
-# so that it is exactly what crontab-lock.sh's is and for the same stated reason — a lock nobody
-# writes needs no write permission, and a mode nothing depends on is one nothing has to defend.
+# NOTHING EVER WRITES THIS FILE. Its contents are meaningless; only its inode is the lock.
+#
+# AND IT IS 0600, WHICH r23 PUT BACK AS A FACT (o3d-secops r23, Codex HIGH). r22 dropped the mode
+# assertion this file used to make, on the argument that "a lock nobody writes needs no write
+# permission, and a mode nothing depends on is one nothing has to defend". SOMETHING DEPENDED ON
+# IT: `flock(2)` applies to the OPEN FILE DESCRIPTION whatever its access mode, which is the whole
+# reason the lock is opened O_RDONLY — so READ permission is exactly what lets an account take
+# this lock. ${CUTOVER_ROOT_DIR} must be TRAVERSABLE by ${APP_USER}, because ${DB_FENCE_DIR} lives
+# beneath it; at 0644 that account could then open this file and hold `flock -n` on it forever,
+# and every deploy, update and install on the box would die at the exclusion with no way to see
+# why. A denial of service with no expiry, from a file nothing reads.
+#
+# THE MODE IS SET, NOT ASSERTED, AND THAT IS THE POINT OF THE r22 OBJECTION ANSWERED RATHER THAN
+# OVERRULED. r22 was right that a bare assertion turns an ambient umask into a refused cutover for
+# a property nothing repairs. So the create runs under a STATED umask rather than an inherited one
+# — `umask 077` makes the O_CREAT mode 0600 on any host — and narrow_held_lock() below then
+# NARROWS a file an older run left at 0644 and proves the result off the descriptor. An
+# environment can no longer produce a wide lock, so the refusal that remains is the one that
+# matters: a mode this run could not fix.
 prepare_cutover_lock_file() {
   local path="$1" kind
   if [[ ! -e "${path}" ]]; then
-    ( umask 022; set -C; : > "${path}" ) 2>/dev/null || true
+    ( umask 077; set -C; : > "${path}" ) 2>/dev/null || true
   fi
   kind="$(LC_ALL=C stat -c '%F' "${path}" 2>/dev/null || true)"
   [[ "${kind}" == "regular file" || "${kind}" == "regular empty file" ]] || return 1
   chown -h "$(id -u):$(id -g)" "${path}" 2>/dev/null || true
+  return 0
+}
+
+# THE MODE, APPLIED TO THE DESCRIPTOR AND THEN READ BACK OFF IT
+#
+#   narrow_held_lock <fd>
+#
+# `chmod` OF /proc/self/fd/N IS AN fchmod IN THE ONLY SPELLING A SHELL HAS, and it is the same
+# device own_service_subdir() uses when it chmods `.`: the magic link is resolved by the kernel to
+# the OPEN FILE, so no component of any pathname is walked a second time and there is no name for
+# a rename to aim. It is called only after verify_held_lock() has proved the descriptor is a
+# regular file owned by this run AND is that name's own inode, so the inode being narrowed is the
+# one this run is about to lock.
+#
+# THE READ-BACK IS THE ASSERTION, taken through the same descriptor. A `chmod` that silently did
+# nothing — a read-only mount, an immutable attribute — would otherwise leave a 0644 lock and a
+# run that believed it had a 0600 one, which is the shape of every finding in this file.
+narrow_held_lock() {
+  local fd="$1" mode
+  chmod 600 "/proc/self/fd/${fd}" 2>/dev/null || true
+  mode="$(LC_ALL=C stat -L -c '%a' "/proc/self/fd/${fd}" 2>/dev/null || true)"
+  [[ "${mode}" == "600" ]] || return 1
   return 0
 }
 
@@ -362,10 +411,19 @@ prepare_cutover_lock_file() {
 ensure_cutover_state_dirs() {
   mkdir -p "$CUTOVER_STATE_DIR" || return 1
   ensure_cutover_root_dir || return 1
-  # AND THE APP-WRITABLE HALF, BENEATH IT. own_service_subdir() walks ${CUTOVER_ROOT_DIR} ->
-  # ${DB_FENCE_DIR} one component at a time and applies the owner and the mode to the descriptor
-  # it lands on, so neither `chown` nor `chmod` ever names a path a second time.
-  own_service_subdir "$CUTOVER_ROOT_DIR" 077 "$DB_FENCE_DIR" "$APP_USER" 700
+  # AND THE FENCE AUTHORITY'S DIRECTORY, BENEATH IT. own_service_subdir() walks
+  # ${CUTOVER_ROOT_DIR} -> ${DB_FENCE_DIR} one component at a time and applies the owner and the
+  # mode to the descriptor it lands on, so neither `chown` nor `chmod` ever names a path a second
+  # time.
+  #
+  # OWNED BY THIS RUN, AT 0755 (o3d-secops r23). It was `"$APP_USER" 700` until r23; the owner is
+  # now the privileged account that owns this install, asked with `id -un` for the same reason
+  # publish_durable_file() asks `id -u` — the property is "the account root runs the cutover as",
+  # and asking lets an unprivileged harness exhibit the mechanism. AN UPGRADE REPAIRS THE OLD
+  # LAYOUT: a directory an earlier run handed to ${APP_USER} is walked to and re-owned here, and
+  # anything that account left INSIDE it is refused rather than read, because the fence helper
+  # requires the record to be owned by the account that published it.
+  own_service_subdir "$CUTOVER_ROOT_DIR" 022 "$DB_FENCE_DIR" "$(id -un)" 755
   return 0
 }
 
@@ -384,10 +442,16 @@ ensure_cutover_root_dir() {
   [[ -L "${CUTOVER_ROOT_DIR}" ]] && return 1
   saved="$(pwd -P)" || return 1
   cd -P "${CUTOVER_ROOT_DIR}" 2>/dev/null || return 1
-  # 0755: root-owned and traversable, so ${APP_USER} can reach ${DB_FENCE_DIR} beneath it and can
-  # create, replace and unlink NOTHING in it. That is the whole protection — not the mode of the
-  # lock file, which nothing reads, and not the mode of the fence directory, which is its own.
-  if ! chmod 755 . || ! chown "$(id -u):$(id -g)" .; then
+  # 0711: root-owned and TRAVERSABLE, so ${APP_USER} can reach ${DB_FENCE_DIR} beneath it and can
+  # create, replace and unlink NOTHING in it. That is the whole protection.
+  #
+  # TRAVERSABLE AND NOT LISTABLE (o3d-secops r23, Codex HIGH). r22 wrote 0755 and justified only
+  # the `x` bit; the `r` bit went with it unexamined, and r23 asked the question the mode of the
+  # lock file made unavoidable — what in here needs to be READABLE by that account? Nothing does.
+  # ${DB_FENCE_DIR} is reached by NAME, which needs `x` on this directory and not `r`, and the two
+  # names in here are compiled into the scripts rather than discovered. So the directory listing
+  # goes, and with it the enumeration that would tell that account when a fence record exists.
+  if ! chmod 711 . || ! chown "$(id -u):$(id -g)" .; then
     cd "${saved}" >/dev/null 2>&1 || true
     return 1
   fi
@@ -417,11 +481,15 @@ ensure_cutover_root_dir() {
 # variable without `eval`, and `eval` is refused by the lexical scanner these scripts are held to
 # (tests/scripts/shell-symbol.ts): a definition or an assignment inside an `eval` string is
 # invisible to every reading of the file, including bash's own deparse, so the count of what a
-# name is bound to could only be guessed. Three literals, allocated once:
+# name is bound to could only be guessed. Two literals, allocated once:
 #
 #   9  the canonical lock, ${CUTOVER_ROOT_DIR}/cutover.lock
-#   8  the /var/lib/ims-deploy namespace deploy.sh used before the shared one
-#   6  ${CUTOVER_STATE_DIR}/cutover.lock — where the canonical lock lived BEFORE r22
+#   8  the /var/lib/ims-deploy namespace deploy.sh used before the shared one — taken ONLY
+#      where that directory is proved to be one no other account may write
+#
+# (6 was ${CUTOVER_STATE_DIR}/cutover.lock, where the canonical lock lived before r22. r23 gave
+# it back: see THE BRIDGE r22 SHIPPED below. Nothing in this file opens a name inside a directory
+# the service account can write.)
 #
 # (7 is the crontab reconciliation lock; see lib/crontab-lock.sh, which explains why it is not
 # one of these and why none of these may be re-`exec`ed while a run is in flight.)
@@ -434,78 +502,105 @@ acquire_cutover_lock() {
   exec 9<"$LOCK_FILE"
   verify_held_lock 9 "$LOCK_FILE" || die \
     "The descriptor this run opened on ${LOCK_FILE} is not that name's own inode, or is not a regular file owned by this run and unwritable by anyone else. Either something followed a link at that name or the name was replaced between the open and the check. Refusing to take a cutover lock on a file this run cannot identify. NOTHING HAS BEEN STOPPED and nothing has been migrated."
-  flock -n 9 || die "Another cutover (deploy.sh, update.sh or install.sh) holds ${LOCK_FILE}. Refusing to run two cutovers at once."
-  # AND the lock the previous version of deploy.sh took, so a cutover started from a checkout
-  # that predates the shared namespace is still excluded. Only when that directory already
-  # exists: creating it would be re-creating the namespace this round retired.
-  if [[ -d "$LEGACY_CUTOVER_STATE_DIR" ]]; then
-    prepare_cutover_lock_file "${LEGACY_CUTOVER_STATE_DIR}/deploy.lock" || die \
-      "${LEGACY_CUTOVER_STATE_DIR}/deploy.lock is not a regular file this run may lock, so it cannot exclude a cutover started from a checkout that predates the shared namespace. Nothing has been stopped."
-    exec 8<"${LEGACY_CUTOVER_STATE_DIR}/deploy.lock"
-    verify_held_lock 8 "${LEGACY_CUTOVER_STATE_DIR}/deploy.lock" || die \
-      "The descriptor this run opened on ${LEGACY_CUTOVER_STATE_DIR}/deploy.lock is not that name's own inode, or is not a regular file owned by this run. Refusing to take a lock on a file this run cannot identify. Nothing has been stopped."
-    flock -n 8 || die "A cutover from a checkout that predates the shared namespace holds ${LEGACY_CUTOVER_STATE_DIR}/deploy.lock. Refusing to run two cutovers at once."
-  fi
-  acquire_pre_r22_cutover_lock
+  # AND IT IS UNREADABLE BY ANYONE ELSE BEFORE IT IS LOCKED (o3d-secops r23, Codex HIGH). `flock`
+  # needs no more than an open descriptor, so READ permission on this file is permission to take
+  # this lock and hold it: at 0644 the service account could freeze every cutover on the box for
+  # as long as it liked. Narrowed on the descriptor verify_held_lock() has just identified, and
+  # proven off that same descriptor, BEFORE the exclusion is claimed.
+  narrow_held_lock 9 || die \
+    "${LOCK_FILE} could not be narrowed to 0600, so this run cannot show that the exclusion it is about to take is one only a privileged account can take. \`flock\` needs nothing but an open descriptor, and a lock file any account may open is a lock any account may hold — indefinitely, against every future deploy, update and install. Refusing to run a cutover on it. Nothing has been stopped."
+  flock -n 9 || die "Another cutover (deploy.sh, update.sh or install.sh) holds ${LOCK_FILE}. Refusing to run two cutovers at once. If no cutover is running, something else is holding that descriptor — \`fuser -v ${LOCK_FILE}\` names it; a host upgraded from a checkout that left this file at 0644 could have had it opened by ${APP_USER} before this run narrowed it."
+  acquire_legacy_namespace_lock
+  state_pre_r22_cutovers_are_not_excluded
   warn_pre_r22_db_fence_state
 }
 
-# THE LOCK THIS ROUND MOVED, STILL TAKEN — AND WHY IT IS THE ONE CASE THAT DOES NOT DIE.
+# WHETHER A DIRECTORY IS ONE ONLY THIS RUN MAY WRITE
 #
-# Moving ${LOCK_FILE} out of ${CUTOVER_STATE_DIR} is the fix, and on its own it would also be a
-# REGRESSION of the thing the lock is for: a cutover already running from the PREVIOUS checkout
-# holds `${CUTOVER_STATE_DIR}/cutover.lock`, this run would hold a different inode, and both would
-# report exclusion while migrating the same database. So the old name is locked as well, for
-# exactly as long as a host can still have a pre-r22 checkout on it.
+#   dir_is_private_to_this_run <path>
 #
-# AND THIS ONE IS IN ${APP_USER}'S OWN DIRECTORY, WHICH IS WHY IT IS OPENED THE WAY IT IS AND WHY
-# A REFUSAL HERE IS A WARNING RATHER THAN A DEATH:
+# The precondition every continuity claim in this file now rests on, asked as a QUESTION instead
+# of assumed. A lock taken on a name inside a directory somebody else may write proves nothing
+# about who holds what: `unlink(2)` and `rename(2)` ask for write permission on the PARENT and ask
+# nothing at all about the file, so the entry a predecessor locked can be moved out from under it
+# and this run can be handed a fresh inode at the same name. Both processes then report an
+# exclusion neither has.
 #
-#   • IT IS NEVER CREATED. A missing name means no predecessor holds anything, and creating a
-#     file as root at a name that account controls is the entire finding — reintroducing it to
-#     take a compatibility lock would be trading the fix for the thing it fixed.
-#   • IT IS OPENED READ-ONLY and the descriptor is required to be the NAME'S OWN INODE, so a
-#     symlink there is refused by the same proof as above and nothing is ever followed.
-#   • OWNERSHIP IS NOT REQUIRED, deliberately. A read-only descriptor on somebody else's regular
-#     file is inert — there is nothing to truncate, nothing to write and nothing to hand over —
-#     and requiring root ownership would mean a pre-planted file made this run SKIP an exclusion
-#     that a genuine predecessor might be holding on that same inode.
-#   • AND A FAILURE IS NOT FATAL, because the alternative is worse. Dying here would let
-#     ${APP_USER} stop every future cutover by leaving a symlink at a name it owns — a permanent,
-#     unattended outage, caused by the compatibility path for a checkout that will not exist in a
-#     month. What is lost when it is skipped is stated out loud rather than swallowed: the
-#     canonical lock above is held, so two runs of THIS checkout still cannot overlap.
-acquire_pre_r22_cutover_lock() {
-  local legacy="${CUTOVER_STATE_DIR}/cutover.lock" kind
-  [[ "${legacy}" != "${LOCK_FILE}" ]] || return 0
-  [[ -e "${legacy}" || -L "${legacy}" ]] || return 0
-  # THE TYPE IS ASKED FIRST, WITH AN lstat, AND IT IS ASKED FOR TWO REASONS. It refuses a link
-  # before anything opens the name — `stat -c %F` reports "symbolic link" where `-L`, deliberately
-  # not used, would report the target's type — and it keeps the `exec` below from being the thing
-  # that discovers a bad name. `exec` REDIRECTIONS ARE PERMANENT: `exec 6<x 2>/dev/null` would
-  # send this script's stderr to /dev/null for the rest of the run, so the open cannot be quieted
-  # and must simply not be aimed at something that fails.
-  kind="$(LC_ALL=C stat -c '%F' "${legacy}" 2>/dev/null || true)"
-  if [[ "${kind}" != "regular file" && "${kind}" != "regular empty file" ]]; then
-    warn "${legacy} is a ${kind:-missing path} and not a regular file, so it is NOT what a predecessor cutover would have locked. Nothing was followed and nothing was written. A cutover from a checkout that predates ${LOCK_FILE} is not excluded by this run; two runs of THIS checkout still cannot overlap."
+# `stat` WITHOUT `-L`, so a symlink AT the directory reads as "symbolic link" and is refused
+# rather than described by its target; `|| true` and a comparison against a positive literal, so a
+# stat that could not run yields the empty string and the answer is "no".
+dir_is_private_to_this_run() {
+  local path="$1" meta kind owner mode
+  meta="$(LC_ALL=C stat -c '%F|%u|%a' "${path}" 2>/dev/null || true)"
+  IFS='|' read -r kind owner mode <<< "${meta}"
+  [[ "${kind}" == "directory" ]] || return 1
+  [[ -n "${owner}" && "${owner}" == "$(id -u)" ]] || return 1
+  [[ -n "${mode}" ]] && (( (8#${mode} & 0022) == 0 )) || return 1
+  return 0
+}
+
+# THE LOCK THE PREVIOUS deploy.sh NAMESPACE TOOK — CLAIMED ONLY WHERE THE CLAIM CAN BE MADE
+#
+# A cutover already running from the checkout that used /var/lib/ims-deploy holds
+# ${LEGACY_CUTOVER_STATE_DIR}/deploy.lock, and this run holds a different inode, so without this
+# the two would migrate the same database while each reported exclusion.
+#
+# AND THE CLAIM IS CONDITIONAL ON ITS OWN PRECONDITION (o3d-secops r23, Codex CRITICAL). Taking
+# that lock excludes a predecessor only if the entry cannot be moved between the predecessor's
+# open and this one, which is a property of the DIRECTORY and of nothing else. Where the directory
+# is one only this run may write, the exclusion is real and a conflict is fatal. Where it is not —
+# including where it does not exist at all — no lock is taken, nothing is created at a name
+# another account controls, and what is NOT excluded is said out loud. A bridge that reports a
+# continuity it cannot establish is worse than no bridge, because it reads as covered.
+acquire_legacy_namespace_lock() {
+  [[ "${LEGACY_CUTOVER_STATE_DIR:-}" != "${CUTOVER_STATE_DIR}" ]] || return 0
+  [[ -e "${LEGACY_CUTOVER_STATE_DIR:-}" || -L "${LEGACY_CUTOVER_STATE_DIR:-}" ]] || return 0
+  if ! dir_is_private_to_this_run "${LEGACY_CUTOVER_STATE_DIR}"; then
+    warn "${LEGACY_CUTOVER_STATE_DIR} is not a directory only this run may write, so a lock taken on a name inside it would prove nothing: the entry can be renamed between a predecessor's open and this one, and both runs would then report an exclusion neither holds. NOTHING WAS OPENED, LOCKED OR CREATED THERE. A cutover started from the checkout that used that namespace is NOT excluded by this run; two runs of THIS checkout still cannot overlap. Quiescing the other checkout is the operator's job — see docs/installation.md, 'Before a cutover: no other cutover'."
     return 0
   fi
-  if ! exec 6<"${legacy}"; then
-    warn "${legacy} could not be opened, so a cutover started from a checkout that predates ${LOCK_FILE} is not excluded by this run. Two runs of THIS checkout still cannot overlap."
-    return 0
-  fi
-  # AND THE DESCRIPTOR IS THAT NAME'S OWN INODE, which is the check the lstat above cannot make:
-  # the lstat is a question about a name and the open is another one, and the account that owns
-  # this directory is free to swap the name between them. verify_held_lock() would ALSO require
-  # the file to be owned by this run, which is the one property that must not be required here, so
-  # the inode identity is asked directly.
-  if [[ "$(LC_ALL=C stat -c '%d:%i' "${legacy}" 2>/dev/null || true)" \
-     != "$(LC_ALL=C stat -L -c '%d:%i' /proc/self/fd/6 2>/dev/null || true)" ]]; then
-    exec 6<&-
-    warn "${legacy} was replaced while this run was opening it, so the descriptor it holds is not that name's own inode. Nothing was followed and nothing was written. A cutover from a checkout that predates ${LOCK_FILE} is not excluded by this run; two runs of THIS checkout still cannot overlap."
-    return 0
-  fi
-  flock -n 6 || die "A cutover from a checkout that predates ${LOCK_FILE} holds ${legacy}. Refusing to run two cutovers at once."
+  prepare_cutover_lock_file "${LEGACY_CUTOVER_STATE_DIR}/deploy.lock" || die \
+    "${LEGACY_CUTOVER_STATE_DIR}/deploy.lock is not a regular file this run may lock, so it cannot exclude a cutover started from a checkout that predates the shared namespace. Nothing has been stopped."
+  exec 8<"${LEGACY_CUTOVER_STATE_DIR}/deploy.lock"
+  verify_held_lock 8 "${LEGACY_CUTOVER_STATE_DIR}/deploy.lock" || die \
+    "The descriptor this run opened on ${LEGACY_CUTOVER_STATE_DIR}/deploy.lock is not that name's own inode, or is not a regular file owned by this run. Refusing to take a lock on a file this run cannot identify. Nothing has been stopped."
+  narrow_held_lock 8 || die \
+    "${LEGACY_CUTOVER_STATE_DIR}/deploy.lock could not be narrowed to 0600, so an account other than this one could open it and hold the exclusion. Refusing to run a cutover on it. Nothing has been stopped."
+  flock -n 8 || die "A cutover from a checkout that predates the shared namespace holds ${LEGACY_CUTOVER_STATE_DIR}/deploy.lock. Refusing to run two cutovers at once."
+  return 0
+}
+
+# ---------------------------------------------------------------------------
+# THE BRIDGE r22 SHIPPED, AND WHY r23 DELETED IT INSTEAD OF REPAIRING IT
+# (o3d-secops r23, Codex CRITICAL)
+#
+# r22 moved ${LOCK_FILE} out of ${CUTOVER_STATE_DIR}, and — because moving a lock is also a way to
+# lose one — added acquire_pre_r22_cutover_lock(), which ALSO locked
+# `${CUTOVER_STATE_DIR}/cutover.lock` so that a cutover already running from the previous checkout
+# stayed excluded. The instinct was right and the bridge could not do what it claimed.
+#
+# THE ENTRY IS IN ${APP_USER}'S OWN DIRECTORY. A predecessor holds a lock on an INODE; the bridge
+# opened a NAME. That account may rename or unlink the name while the inode stays locked and put a
+# fresh regular file there, and every check the bridge made — lstat says regular file, the
+# descriptor is that name's own inode — passes on the replacement. The run then reported an
+# exclusion that had never been taken. The checks were not weak; the QUESTION was unanswerable,
+# because a pathname somebody else controls is not evidence about who is running.
+#
+# THE TWO WAYS OUT, AND THE ONE TAKEN. Either ship a TRANSITIONAL PREDECESSOR that also takes the
+# protected lock — which is honest and is not available from here, because a transitional release
+# has to reach a host BEFORE the checkout that moves the lock, and every host that has a pre-r22
+# checkout has it already — or REQUIRE OPERATOR-CONTROLLED QUIESCENCE and put the requirement
+# where a human can satisfy it. This file takes the second, and does the one part of it that is
+# code: acquire_legacy_namespace_lock() above still claims an exclusion where it can PROVE the
+# precondition, and this says, unconditionally and on every run, exactly what is not excluded.
+#
+# UNCONDITIONALLY IS THE POINT. Keying this on whether `${CUTOVER_STATE_DIR}/cutover.lock` exists
+# would be reading an absence as an answer at a name the service account controls — the same
+# mistake one layer up. The limitation is a property of the RELOCATION and not of anything on the
+# disk, so it is stated whenever a lock is taken, and it stops being true when no host on the
+# fleet has a checkout that predates ${LOCK_FILE}.
+state_pre_r22_cutovers_are_not_excluded() {
+  warn "This run's exclusion is ${LOCK_FILE}, and it excludes every cutover that takes THAT lock. A cutover launched from a checkout that predates it locks a name under ${CUTOVER_STATE_DIR}, which ${APP_USER} may rename between that run's open and this one's, so NOTHING HERE CAN EXCLUDE IT and this run does not pretend to: no lock is taken at that name. Two concurrent cutovers migrate one schema twice. Before starting one, make sure no other checkout is running one — see docs/installation.md, 'Before a cutover: no other cutover'."
   return 0
 }
 
