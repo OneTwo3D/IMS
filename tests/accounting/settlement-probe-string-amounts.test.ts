@@ -922,3 +922,261 @@ test('[o3d-nk5n] the rule is ONE function, and all three arms reach it', async (
     assert.notEqual(classifyLedgerSettlement(attemptFor('40.00'), probe).outcome, 'clear', `${label}: no clear`)
   }
 })
+
+/* ------------------------------------------------------------------------------------------- *
+ * 5. o3d-obyd r31 (Codex HIGH 1) — A RECORD IS EVIDENCE ABOUT ITSELF, NOT ABOUT ITS COLLECTION.
+ *
+ * The rule above ("an empty record list is a positive claim, so it needs a figure behind it")
+ * refused the figureless response ONLY when its record list was empty, on the stated reasoning that
+ * "a non-empty record list still answers — records are evidence in their own right". That sentence
+ * is true of a MATCH and false of a NON-MATCH, and the two conclusions are not symmetric:
+ *
+ *   A MATCHING RECORD proves the attempt settled. It is there, this code read it, and nothing the
+ *   response omitted can unmake it. Truncation is irrelevant to a positive find.
+ *
+ *   A NON-MATCHING RECORD proves only that SOME OTHER settlement exists. Concluding `clear` from it
+ *   means concluding something about the COLLECTION — "no settlement matching this attempt is in the
+ *   ledger" — which needs the list to be all of them. A returned record is not evidence of that.
+ *
+ * So a truncated response that omits the document totals, returns one unrelated settlement and omits
+ * the attempted one satisfied the old predicate on every arm, answered ok:true, matched nothing, and
+ * reached `clear` — which authorises a second payment. The probe now reports whether the collection
+ * is PROVED COMPLETE (from the document's own settled figure, never from the records), and the
+ * classifier spends that on the non-match alone.
+ * ------------------------------------------------------------------------------------------- */
+
+/** The truncated shape, per arm: a document stating no settled figure, holding ONE unrelated record. */
+const TRUNCATED = {
+  /** ARM 2. No Total/AmountDue/AmountPaid/AmountCredited; one payment that is not the attempt. */
+  invoice: () => probeInvoice({
+    CurrencyCode: 'GBP',
+    Payments: [{ PaymentID: 'PAY-SOMEONE-ELSE', Date: '2026-06-01T00:00:00', Amount: 99 }],
+  }),
+  /** ARM 1. No Total/RemainingCredit; one allocation to this bill that is not the attempt. */
+  note: () => probeNote({
+    CurrencyCode: 'GBP',
+    Allocations: [{ Amount: 99, Date: '/Date(1780272000000+0000)/', Invoice: { InvoiceID: 'inv-1' } }],
+  }),
+  /** ARM 3. No TotalAmt/Balance; one linked bill payment that is not the attempt. */
+  bill: () => probeQuickBooksSettlement(
+    { type: 'BILL_PAYMENT', payload: { accountingInvoiceId: 'bill-1' } },
+    ledgerDouble({
+      'bill/bill-1': { Bill: { LinkedTxn: [{ TxnId: '77', TxnType: 'BillPaymentCheck' }] } },
+      'billpayment/77': {
+        BillPayment: { TxnDate: '2026-06-01', Line: [{ Amount: 99, LinkedTxn: [{ TxnId: 'bill-1', TxnType: 'Bill' }] }] },
+      },
+    }).get,
+  ),
+}
+
+test('[o3d-obyd r31] a truncated response holding ONE UNRELATED record does not authorise a post', async () => {
+  // ROUTE: each arm -> its document figures are ABSENT so `settled`/`applied` is null -> the
+  //        shortfall cross-check is skipped (nothing to compare against) -> `settlementAnswer` sees
+  //        a NON-EMPTY record list, so it does not refuse, and reports `provedComplete: false` ->
+  //        `classifyLedgerSettlement` walks the records, matches none, and reaches the terminal
+  //        `clear` gate, which now answers `unknown` / `collection-unproved`.
+  // MUTATION: in `settlementAnswer`, return `provedComplete: true` unconditionally (or delete the
+  //        `!probe.provedComplete` gate at the end of `classifyLedgerSettlement`). Every arm below
+  //        then answers `clear`, which is what authorises the second payment — measured.
+
+  // THE ATTEMPT this response is being asked about: 40.00 on 2026-08-01.
+  const attempt = attemptFor('40.00')
+  assert.equal(attempt.amount?.toFixed(2), '40.00', 'the attempt states a figure to look for')
+  assert.equal(attempt.date, DATE)
+
+  for (const [label, run] of Object.entries(TRUNCATED)) {
+    const probe = await run()
+
+    // PRECONDITION 1 — the probe ANSWERED. This is not the already-covered refusal of a figureless
+    // EMPTY response; the arm got far enough to report records, which is the whole difficulty.
+    assert.equal(probe.ok, true, `${label}: the truncated response is an ANSWER, not a refusal`)
+
+    // PRECONDITION 2 — the list really is non-empty, and really does NOT hold the attempt. Without
+    // both, this test would be re-testing the empty case or the matching case.
+    assert.equal(probe.ok === true ? probe.records.length : 0, 1, `${label}: exactly one record came back`)
+    const only = probe.ok === true ? probe.records[0]! : null
+    assert.equal(only?.amount?.toFixed(2), '99.00', `${label}: and it is a settlement of 99.00...`)
+    assert.equal(only?.date, '2026-06-01', `${label}: ...on a different day from the attempt`)
+    assert.notEqual(only?.date, attempt.date, `${label}: so no amount-and-date match is available`)
+
+    // PRECONDITION 3 — nothing established the collection. This is the fact the verdict turns on,
+    // asserted directly so the test cannot pass because the arm happened to prove completeness.
+    assert.equal(probe.ok === true ? probe.provedComplete : null, false,
+      `${label}: the document stated no settled figure, so nothing measured this list`)
+
+    // THE VERDICT. Not `clear`, and for the right reason.
+    const verdict = classifyLedgerSettlement(attempt, probe)
+    assert.equal(verdict.outcome, 'unknown', `${label}: "not among these" is not "not in the ledger"`)
+    assert.equal(verdict.outcome === 'unknown' ? verdict.cause : null, 'collection-unproved', label)
+  }
+})
+
+test('[o3d-obyd r31] a MATCHING record still yields present with no document totals', async () => {
+  // The other half of the asymmetry, and the reason the gate sits AFTER both match passes rather
+  // than at the top of the classifier. `present` is what resolves the row and writes the matched id
+  // back; a probe whose collection is unproved must still be allowed to recognise our own payment.
+  //
+  // ROUTE: `settlementAnswer` reports `provedComplete: false` exactly as above -> the amount+date
+  //        pass (and, separately, the marker pass) returns `present` BEFORE the terminal gate is
+  //        reached.
+  // MUTATION: move the `!probe.provedComplete` refusal to the TOP of `classifyLedgerSettlement`
+  //        (before the marker pass). Both assertions below become `unknown`, and a payment IMS can
+  //        see in the ledger stops being recognised as its own.
+
+  const MARK = 'IMS-abc123abc123'
+
+  // (a) THE AMOUNT-AND-DATE MATCH, on a response that states no figures at all.
+  const matched = await probeInvoice({
+    CurrencyCode: 'GBP',
+    Payments: [{ PaymentID: 'PAY-OURS', Date: `${DATE}T00:00:00`, Amount: 40 }],
+  })
+  // PRECONDITION: unproved, so this really is the same shape the test above refuses on — the ONLY
+  // difference between them is whether the record matches.
+  assert.equal(matched.ok, true)
+  assert.equal(matched.ok === true ? matched.provedComplete : null, false,
+    'the same figureless response: nothing proved this collection whole')
+  const byFigures = classifyLedgerSettlement(attemptFor('40.00'), matched)
+  assert.equal(byFigures.outcome, 'present', 'a record that IS the attempt proves the attempt settled')
+  assert.equal(byFigures.outcome === 'present' ? byFigures.matchedId : null, 'PAY-OURS',
+    'and the id is carried, which is what a reconciliation writes back')
+
+  // (b) THE MARK, which survives an edit to the amount and the date — the case the pair cannot see.
+  const marked = await probeInvoice({
+    CurrencyCode: 'GBP',
+    Payments: [{ PaymentID: 'PAY-MARKED', Date: '2020-01-01T00:00:00', Amount: 999, Reference: MARK }],
+  })
+  assert.equal(marked.ok === true ? marked.provedComplete : null, false, 'unproved here too')
+  const byMark = classifyLedgerSettlement(
+    { amount: toDecimal('40.00'), currency: 'GBP', date: DATE, marker: MARK },
+    marked,
+  )
+  assert.equal(byMark.outcome, 'present', 'neither figure matches, and it is still our own payment')
+
+  // THE DISCRIMINATING HALF: the identical unproved probe, asked about an attempt it does NOT hold,
+  // withholds. Without this, "present" could be coming from a classifier that had stopped comparing.
+  assert.equal(classifyLedgerSettlement(attemptFor('12.34'), matched).outcome, 'unknown',
+    'the same probe still refuses to clear an attempt it cannot find')
+})
+
+test('[o3d-obyd r31] the ordinary first payment still posts, and the ordinary part-payment still clears', async () => {
+  // WHAT THE RULE COSTS THE ORDINARY DOCUMENT: nothing. Xero and QuickBooks state these figures on
+  // every document they return, so `provedComplete` is true for every real response and the
+  // non-match still clears. The refusals above are reachable only by a response that omits them.
+  //
+  // ROUTE: `settled`/`applied` computable -> the shortfall check passes -> `settlementAnswer`
+  //        reports `provedComplete: true` -> the classifier reaches `clear` as it always did.
+  // MUTATION: invert `provedComplete` in `settlementAnswer` (report `settled === null`). Every
+  //          assertion below flips to `unknown`, which is the visible cost of getting this backwards.
+
+  // (a) THE FIRST PAYMENT: an unsettled invoice states Total and AmountDue EQUAL, so the settled
+  //     figure is exactly zero and the EMPTY list is the ledger's own answer.
+  const unpaid = await probeInvoice({
+    CurrencyCode: 'GBP', Total: 40, AmountDue: 40, AmountPaid: 0, AmountCredited: 0, Payments: [],
+  })
+  assert.equal(unpaid.ok, true)
+  assert.equal(unpaid.ok === true ? unpaid.provedComplete : null, true,
+    'PRECONDITION: emptiness PROVED by the document\'s own figures, not assumed from missing ones')
+  assert.equal(classifyLedgerSettlement(attemptFor('40.00'), unpaid).outcome, 'clear',
+    'the ordinary first payment still posts')
+
+  // (b) THE PART-PAYMENT, which is the non-match this rule is about — a real other settlement, on a
+  //     document that accounts for it. The list is measured, so "this attempt is not among them" is
+  //     the ledger's answer and not this code's silence.
+  const partPaid = await probeInvoice({
+    CurrencyCode: 'GBP', Total: 100, AmountDue: 90, AmountPaid: 10, AmountCredited: 0,
+    Payments: [{ PaymentID: 'PAY-1', Date: '2026-06-01T00:00:00', Amount: 10 }],
+  })
+  assert.equal(partPaid.ok, true)
+  assert.equal(partPaid.ok === true ? partPaid.records.length : 0, 1,
+    'PRECONDITION: a real, non-matching settlement is on the document...')
+  assert.equal(partPaid.ok === true ? partPaid.provedComplete : null, true,
+    '...and the invoice\'s own figures account for it, so the collection is proved whole')
+  assert.equal(classifyLedgerSettlement(attemptFor('40.00'), partPaid).outcome, 'clear',
+    'a second instalment against a part-paid invoice is still sendable')
+
+  // (c) AND THE SAME PART-PAYMENT WITH THE FIGURES REMOVED is the truncated shape, which does not
+  //     clear. This is the pair that isolates the variable: identical records, identical attempt,
+  //     and the ONLY difference is whether the document stated what settles it.
+  const sameRecordsNoFigures = await probeInvoice({
+    CurrencyCode: 'GBP',
+    Payments: [{ PaymentID: 'PAY-1', Date: '2026-06-01T00:00:00', Amount: 10 }],
+  })
+  assert.deepEqual(
+    sameRecordsNoFigures.ok === true ? sameRecordsNoFigures.records : null,
+    partPaid.ok === true ? partPaid.records : undefined,
+    'PRECONDITION: the two responses carry the SAME record list',
+  )
+  assert.equal(classifyLedgerSettlement(attemptFor('40.00'), sameRecordsNoFigures).outcome, 'unknown',
+    'and the same records answer differently only because one collection is proved and the other is not')
+})
+
+/* ------------------------------------------------------------------------------------------- *
+ * 6. o3d-obyd r31 (Codex HIGH 2) — TWO FORMS OF ONE FIGURE THAT DISAGREE ARE NOT A FIGURE.
+ *
+ * `AmountDue = Total - AmountPaid - AmountCredited` is Xero's own definition, so `Total - AmountDue`
+ * and `AmountPaid + AmountCredited` are the SAME quantity rearranged. The fallback exists for a
+ * response that omits the totals, not because the two ask different questions. Preferring the first
+ * unconditionally let a response state both a proved ZERO and a stated credit at the same time.
+ * ------------------------------------------------------------------------------------------- */
+
+test('[o3d-obyd r31] contradictory settled figures refuse, rather than the zero one forging a clear', async () => {
+  // ROUTE: probeXeroSettlement's invoice arm -> both figure pairs are computable -> they differ by
+  //        more than `completenessBand` -> ok:false, before `settled` is used for anything.
+  // MUTATION: restore `const settled = settledFromTotals ?? settledFromComponents` and delete the
+  //        agreement check. The probe then answers ok:true over an EMPTY record list with a settled
+  //        figure of exactly zero, and `classifyLedgerSettlement` answers `clear` — measured.
+
+  // CODEX'S SHAPE, VERBATIM. Xero says the invoice is wholly outstanding AND that 10 was credited.
+  const CONTRADICTORY = {
+    CurrencyCode: 'GBP', Total: 100, AmountDue: 100, AmountPaid: 0, AmountCredited: 10, Payments: [],
+  }
+
+  // PRECONDITION 1 — the two derivations really do disagree, by arithmetic stated here rather than
+  // taken on trust from the probe.
+  assert.equal(CONTRADICTORY.Total - CONTRADICTORY.AmountDue, 0, 'Total less AmountDue says nothing settled')
+  assert.equal(CONTRADICTORY.AmountPaid + CONTRADICTORY.AmountCredited, 10, 'the component pair says 10 did')
+
+  // PRECONDITION 2 — the FIRST of those is exactly zero, which is why the old code could not catch
+  // this any other way: a zero settled figure makes `statesAnything` false, so the shortfall check
+  // passes over an empty collection without measuring anything. The contradiction is the ONLY
+  // evidence in the response that something is wrong.
+  assert.equal(CONTRADICTORY.Total - CONTRADICTORY.AmountDue, 0,
+    'a PROVED zero is what the preferred pair forges, and a proved zero clears')
+  assert.equal(CONTRADICTORY.Payments.length, 0, 'and there is no record to fall over instead')
+
+  const probe = await probeInvoice(CONTRADICTORY)
+  assert.equal(probe.ok, false, 'an incoherent response is refused, not resolved in either direction')
+  assert.match(reasonOf(probe), /two amounts settled against this document that do not agree/)
+  assert.match(reasonOf(probe), /0\.00 by Total less AmountDue/, 'and it names both, so an operator can look')
+  assert.match(reasonOf(probe), /10\.00 by AmountPaid plus AmountCredited/)
+
+  // THE END THIS PROTECTS: `clear` authorises the money post.
+  assert.notEqual(classifyLedgerSettlement(attemptFor('40.00'), probe).outcome, 'clear')
+
+  // THE DISCRIMINATING HALF, and it is the ORDINARY unsettled invoice: the same response made
+  // COHERENT still clears. Nothing about a real first payment moved — only the contradiction is new.
+  const coherent = await probeInvoice({ ...CONTRADICTORY, AmountCredited: 0 })
+  assert.equal(coherent.ok, true, 'a document whose two derivations agree at zero is still an answer')
+  assert.equal(coherent.ok === true ? coherent.provedComplete : null, true)
+  assert.equal(classifyLedgerSettlement(attemptFor('40.00'), coherent).outcome, 'clear',
+    'and the payment posts, which is what the fallback pair exists to allow')
+
+  // AND THE OTHER DIRECTION OF THE SAME CONTRADICTION, so this is not a rule about zero: a response
+  // whose component pair is the SMALLER one is equally incoherent and equally refused.
+  const inverted = await probeInvoice({
+    CurrencyCode: 'GBP', Total: 100, AmountDue: 40, AmountPaid: 10, AmountCredited: 0,
+    Payments: [{ PaymentID: 'PAY-1', Date: `${DATE}T00:00:00`, Amount: 10 }],
+  })
+  assert.equal(inverted.ok, false, '60 by one derivation and 10 by the other is still two answers')
+  assert.match(reasonOf(inverted), /60\.00 by Total less AmountDue and 10\.00 by AmountPaid plus AmountCredited/)
+
+  // AND A RESPONSE STATING ONLY ONE PAIR IS NOT A CONTRADICTION. The fallback still works: this is
+  // the shape it was added for, and refusing it would fail every response that omits the totals.
+  const componentsOnly = await probeInvoice({
+    CurrencyCode: 'GBP', AmountPaid: 10, AmountCredited: 0,
+    Payments: [{ PaymentID: 'PAY-1', Date: '2026-06-01T00:00:00', Amount: 10 }],
+  })
+  assert.equal(componentsOnly.ok, true, 'one stated pair is one figure, and one figure cannot disagree')
+  assert.equal(componentsOnly.ok === true ? componentsOnly.provedComplete : null, true,
+    'and it proves the collection just as the totals pair does')
+})

@@ -293,3 +293,88 @@ test('an unmarked settlement still matches on amount and date (o3d-0m56)', () =>
     'present',
   )
 })
+
+/* ------------------------------------------------------------------------------------------- *
+ * o3d-obyd r31 (Codex HIGH 1) — THE RULE ITSELF, AT THE BOUNDARY IT LIVES ON.
+ *
+ * The probe tests drive this end to end through a connector double; these drive the classifier
+ * directly, because the asymmetry is a property of `classifyLedgerSettlement` and not of any
+ * particular ledger response. Everything is held identical between the cases except the one fact.
+ * ------------------------------------------------------------------------------------------- */
+
+/** The same helper as `records`, for a collection nothing proved whole. */
+const unprovedRecords = (...rows: Array<Parameters<typeof recorded>[0]>) =>
+  ({ ok: true as const, provedComplete: false, records: rows.map(recorded) })
+
+test('[o3d-obyd r31] a NON-MATCH on an unproved collection is unknown, not clear', () => {
+  // ROUTE: `classifyLedgerSettlement` -> the marker pass finds nothing -> the record loop measures
+  //        every record and matches none -> the terminal gate reads `provedComplete`.
+  // MUTATION: delete the `if (!probe.provedComplete)` block before the final `return { outcome:
+  //        'clear' }`. This test answers `clear`, which is what authorises a second payment.
+
+  const other = { amount: 99, date: '2026-06-01', id: 'PAY-OTHER' } as const
+
+  // PRECONDITION — the record is READABLE and simply is not the attempt. If it were unmeasurable the
+  // verdict would be `record-unmeasurable` and this test would prove nothing about completeness.
+  const measured = recorded(other)
+  assert.notEqual(measured.amount, null, 'the record states an amount this module can read')
+  assert.notEqual(measured.date, null, 'and a date')
+  assert.notEqual(measured.date, attempt.date, 'and it is not the attempt')
+
+  const verdict = classifyLedgerSettlement(attempt, unprovedRecords(other))
+  assert.equal(verdict.outcome, 'unknown')
+  assert.equal(verdict.outcome === 'unknown' ? verdict.cause : null, 'collection-unproved')
+
+  // THE ISOLATED VARIABLE: the SAME attempt and the SAME records, differing only in whether the
+  // collection is proved. Nothing else in this pair can explain the difference in verdict.
+  assert.deepEqual(classifyLedgerSettlement(attempt, records(other)), { outcome: 'clear' },
+    'a proved collection that does not hold the attempt is still a clear')
+})
+
+test('[o3d-obyd r31] a MATCH on an unproved collection is still present', () => {
+  // The asymmetry, and why the gate is at the END of the classifier rather than the start: a found
+  // record is evidence in its own right, so an unproved collection must still be able to say
+  // `present` — which is the verdict that RESOLVES a row rather than holding it.
+  // ROUTE: the amount+date pass (and the marker pass) return before the terminal gate.
+  // MUTATION: move the `!probe.provedComplete` refusal above the marker pass. Both assertions here
+  //        become `unknown`, and IMS stops recognising a payment it can see in the ledger.
+
+  const ours = { amount: 10, date: '2026-08-01', id: 'PAY-OURS' } as const
+  const marker = settlementMarkerFor('token-r31')
+
+  // PRECONDITION — this collection really is unproved, so it is the same shape the test above
+  // refuses on. The only difference between the two is whether the record matches.
+  const probe = unprovedRecords(ours)
+  assert.equal(probe.provedComplete, false, 'nothing established that these are all of them')
+
+  const byFigures = classifyLedgerSettlement(attempt, probe)
+  assert.equal(byFigures.outcome, 'present')
+  assert.equal(byFigures.outcome === 'present' ? byFigures.matchedId : null, 'PAY-OURS')
+
+  const byMark = classifyLedgerSettlement(
+    described({ amount: 10, currency: 'GBP', date: '2026-08-01', marker }),
+    unprovedRecords({ amount: 999, date: '2020-01-01', id: 'PAY-M', reference: `Deposit ${marker}` }),
+  )
+  assert.equal(byMark.outcome, 'present', 'the mark identifies our payment whatever else the response omitted')
+})
+
+test('[o3d-obyd r31] an EMPTY unproved collection is unknown too, and an unmeasurable record still wins', () => {
+  // Two boundaries of the same rule.
+  // ROUTE: the empty loop body falls straight to the terminal gate; and the unmeasurable-record
+  //        refusal is reached BEFORE it, so the more specific sentence is the one an operator gets.
+  // MUTATION: narrow the gate to `records.length > 0 && !probe.provedComplete` — the first assertion
+  //        below answers `clear` on a probe that looked at nothing at all.
+
+  const empty = classifyLedgerSettlement(attempt, unprovedRecords())
+  assert.equal(empty.outcome, 'unknown', 'an empty list nothing measured is the weakest evidence there is')
+  assert.equal(empty.outcome === 'unknown' ? empty.cause : null, 'collection-unproved')
+
+  // AND THE ORDER: an unmeasurable record is diagnosed as such rather than swallowed by the newer,
+  // vaguer cause. Both withhold, so only the sentence is at stake — and the sentences send an
+  // operator to different places.
+  const unreadable = classifyLedgerSettlement(attempt,
+    unprovedRecords({ amount: null, unreadableAmount: '40.005', date: '2026-08-01', id: 'PAY-U' }))
+  assert.equal(unreadable.outcome, 'unknown')
+  assert.equal(unreadable.outcome === 'unknown' ? unreadable.cause : null, 'record-unmeasurable',
+    'the figure IMS could not read is the thing to say, not that the list might be short')
+})
