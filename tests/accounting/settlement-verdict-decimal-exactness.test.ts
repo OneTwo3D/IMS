@@ -456,7 +456,14 @@ test('[o3d-r948] an unresolved attempt with a refused figure is undescribable, n
     bankAccountId: 'bank-1',
     existing: [attempt(exact)],
     // Nothing on the document resembles the attempt, so a DESCRIBABLE attempt is positively clear.
-    ledgerSettlements: [{ amount: toDecimal('99.00'), date: R948_DATE, reference: null }],
+    ledgerSettlements: {
+      ok: true,
+      // o3d-obyd r31: the document's own settled figure was stated, so "nothing here resembles the
+      // attempt" is the ledger's answer and not this list's silence. Without it a non-match is
+      // `unknown`, which is a different fixture entirely.
+      provedComplete: true,
+      records: [{ amount: toDecimal('99.00'), date: R948_DATE, reference: null }],
+    },
     ledgerTotal: toDecimal('100.00'),
   })
 

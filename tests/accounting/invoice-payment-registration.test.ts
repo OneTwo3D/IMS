@@ -573,7 +573,13 @@ test('sales.ts asks the ledger exactly when the decision needs it (o3d-0m56)', a
   // unchanged; what it is asserted about is the whole probe.
   assert.match(body, /return probe\.ok \? probe : null/,
     'a probe that could not answer must become null — the value the decision refuses on')
-  assert.doesNotMatch(body, /probe\.ok \? probe\.records/,
+  // On the CODE, not the prose: the paragraph above this line in the source quotes the very
+  // expression being banned, so a `doesNotMatch` over the raw slice would fail on its own
+  // explanation — and one written to tolerate that would pass whether the code was fixed or not.
+  const bodyCode = body.split('\n').filter((l) => !/^\s*(\/\/|\*|\/\*)/.test(l)).join('\n')
+  assert.match(bodyCode, /return probe\.ok \? probe : null/,
+    'the comment strip must leave the return standing')
+  assert.doesNotMatch(bodyCode, /probe\.ok \? probe\.records/,
     'and an answering probe must reach the decision WHOLE: flattening it to its record list drops '
     + 'whether the collection was proved complete, which is what makes a non-match mean anything')
   assert.match(source.slice(at), /ledgerSettlements,/, 'and it must reach the decision')

@@ -54,7 +54,7 @@ const recorded = (r: Omit<LedgerSettlementRecord, 'amount'> & { amount: number |
 
 const attempt = described({ amount: 10, currency: 'GBP', date: '2026-08-01', marker: null })
 const records = (...rows: Array<Parameters<typeof recorded>[0]>) =>
-  ({ ok: true as const, records: rows.map(recorded) })
+  ({ ok: true as const, provedComplete: true, records: rows.map(recorded) })
 
 test('an empty ledger clears the attempt (o3d-0m56)', () => {
   assert.deepEqual(classifyLedgerSettlement(attempt, records()), { outcome: 'clear' })

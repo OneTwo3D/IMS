@@ -82,6 +82,7 @@ function registrationPayload(amount: string, currency = 'GBP') {
 
 const ledgerHolding = (...amounts: string[]): LedgerSettlementProbe => ({
   ok: true,
+  provedComplete: true,
   records: amounts.map((a, i) => ({ amount: toDecimal(a), date: DATE, id: `PAY-${i + 1}`, reference: null })),
 })
 
@@ -290,6 +291,7 @@ test('[o3d-78rq] and the two unmeasurable causes are told apart — no amount at
   //        sentence that sends an operator looking for a number that is not there.
   const noAmount = classifyLedgerSettlement(stated('10'), {
     ok: true,
+    provedComplete: true,
     records: [{ amount: null, date: DATE, id: 'PAY-1', reference: null }],
   })
   assert.equal(noAmount.outcome, 'unknown')
@@ -574,7 +576,7 @@ const reasonOf = (probe: LedgerSettlementProbe) => (probe.ok === false ? probe.r
 const attemptFor = (amount: string, marker: string | null = null): AttemptDescription =>
   ({ amount: toDecimal(amount), currency: 'GBP', date: DATE, marker })
 
-const holding = (records: LedgerSettlementRecord[]): LedgerSettlementProbe => ({ ok: true, records })
+const holding = (records: LedgerSettlementRecord[]): LedgerSettlementProbe => ({ ok: true, records, provedComplete: true })
 
 /* ------------------------------------------------------------------------------------------- *
  * 1. THE COMPLETENESS BAND IS THE DOCUMENT'S OWN MINOR UNIT (Codex HIGH 1).
@@ -615,7 +617,7 @@ test('[o3d-r948] a KWD invoice ONE FIL short of its stated settlement does not r
   // turned on. `settled` is 0.001, which is inside the GBP band too, so the settlement check reaches
   // the same "states nothing" the `AmountPaid` check does and this remains a test about the BAND.
   const gbp = await probeInvoice(xeroInvoice({ CurrencyCode: 'GBP', Total: 40, AmountDue: 39.999, AmountPaid: 0.001 }))
-  assert.deepEqual(gbp, { ok: true, records: [] })
+  assert.deepEqual(gbp, { ok: true, provedComplete: true, records: [] })
   assert.equal(
     classifyLedgerSettlement(
       describeAttempt('INVOICE_PAYMENT', { amount: 40, currency: 'GBP', paymentDate: DATE }),
@@ -671,12 +673,20 @@ test('[o3d-r948] all four completeness checks, on both connectors, are banded by
   // (3) ROUTE: the shape-independent settlement accounting — `Total - AmountDue` against everything
   //     the probe actually read. `AmountPaid` agrees with the collection here, so ONLY this check can
   //     be the one that fires.
+  //
+  //     o3d-obyd r31 (Codex HIGH 2): and the 0.001 that `AmountPaid` does NOT account for is now
+  //     stated as `AmountCredited`, so `Total - AmountDue` and `AmountPaid + AmountCredited` AGREE at
+  //     0.002. It read `AmountCredited: 0` before, which made those two derivations of one figure
+  //     say 0.002 and 0.001 — an incoherent response, which the probe now refuses outright, and this
+  //     test would have been measuring that refusal rather than the band. The route it names is
+  //     unchanged: the credit is not itemised in any collection, so `explained` is the 0.001 payment
+  //     against a settled 0.002, and the shortfall is the same 0.001 the band decides on.
   const settledVsExplained = (currency: string) => probeInvoice(xeroInvoice({
     CurrencyCode: currency,
     Total: 10.002,
     AmountDue: 10,
     AmountPaid: 0.001,
-    AmountCredited: 0,
+    AmountCredited: 0.001,
     Payments: [{ PaymentID: 'PAY-1', Date: DATE, Amount: 0.001 }],
   }))
   assert.equal((await settledVsExplained('GBP')).ok, true, 'the precondition')

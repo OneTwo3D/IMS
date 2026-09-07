@@ -163,8 +163,13 @@ test('[o3d-obyd] all THREE arms read a string figure, and each one\'s check then
 
   // (3) ARM 2, second check — the shape-independent `Total - AmountDue` accounting. `AmountPaid`
   //     agrees with the (empty) collection here, so the first check passes and ONLY this one can fire.
+  // o3d-obyd r31 (Codex HIGH 2): the 100 that `Total - AmountDue` reports settled is now stated as
+  // `AmountCredited`, so the two derivations of that one figure agree. It said `AmountCredited: 0.00`
+  // before, which made them say 100.00 and 0.00 about the same quantity — the contradiction the probe
+  // now refuses on, which would have replaced the shortfall this test is about. `AmountPaid` still
+  // agrees with the empty collection, so the first check still passes and only this one can fire.
   const settled = await probeInvoice({
-    CurrencyCode: 'GBP', Total: '100.00', AmountDue: '0.00', AmountPaid: '0.00', AmountCredited: '0.00',
+    CurrencyCode: 'GBP', Total: '100.00', AmountDue: '0.00', AmountPaid: '0.00', AmountCredited: '100.00',
     Payments: [],
   })
   assert.equal(settled.ok, false)
@@ -245,7 +250,7 @@ test('[o3d-obyd] an ABSENT figure is still a skip, and the ordinary document sti
   //        would "fix" this defect by breaking every ordinary post.
 
   // o3d-mm51 (Codex HIGH 2) — THE QUICKBOOKS CASE THAT USED TO BE ASSERTED HERE HAS MOVED, AND IT
-  // MOVED BECAUSE IT WAS WRONG. `probeBill({})` was asserted to be `{ ok: true, records: [] }` and
+  // MOVED BECAUSE IT WAS WRONG. `probeBill({})` was asserted to be `{ ok: true, provedComplete: true, records: [] }` and
   // therefore `clear`. Skipping an arithmetic check that cannot be run is right; concluding from a
   // MISSING figure that nothing has settled the document is a positive claim on no evidence, and it
   // authorises a payment. See the section below, where the corrected behaviour is stated.
@@ -255,12 +260,12 @@ test('[o3d-obyd] an ABSENT figure is still a skip, and the ordinary document sti
   //
   // o3d-nk5n — AND THE XERO CASE ASSERTED HERE HAS MOVED FOR THE SAME REASON THE QUICKBOOKS ONE DID.
   //
-  // `probeInvoice({ CurrencyCode: 'GBP', AmountPaid: 0 })` was asserted `{ ok: true, records: [] }`
+  // `probeInvoice({ CurrencyCode: 'GBP', AmountPaid: 0 })` was asserted `{ ok: true, provedComplete: true, records: [] }`
   // and therefore `clear`. That body states too little for EITHER form of the settlement figure —
   // no `Total`/`AmountDue` pair, and no `AmountPaid`/`AmountCredited` fallback pair — so no check ran
   // and the clear was drawn from having read nothing, which is the same positive claim on no evidence
   // the paragraph above records as wrong on the other connector. Both arms now refuse it, and the
-  // rule is one function (`emptyAnswerIsUnproved`) rather than one per connector.
+  // rule is one function (`settlementAnswer`) rather than one per connector.
   //
   // WHAT STAYS TRUE, AND IS STILL THE SUBJECT OF THIS TEST: an absent figure SKIPS the arithmetic it
   // is an operand of, and it does not refuse. `AmountCredited` is absent on every body below and none
@@ -270,11 +275,11 @@ test('[o3d-obyd] an ABSENT figure is still a skip, and the ordinary document sti
   // THE PRECONDITION: these bodies state NO `AmountCredited` at all, so the skip is genuinely being
   // reached rather than an arithmetic check being passed on a figure that is there.
   const invoice = await probeInvoice({ CurrencyCode: 'GBP', Total: 40, AmountDue: 40, AmountPaid: 0 })
-  assert.deepEqual(invoice, { ok: true, records: [] })
+  assert.deepEqual(invoice, { ok: true, provedComplete: true, records: [] })
   assert.equal(classifyLedgerSettlement(attemptFor('40.00'), invoice).outcome, 'clear')
 
   const note = await probeNote({ CurrencyCode: 'GBP', Total: 10, RemainingCredit: 10, Allocations: [] })
-  assert.deepEqual(note, { ok: true, records: [] }, 'an unapplied credit note is still positively unapplied')
+  assert.deepEqual(note, { ok: true, provedComplete: true, records: [] }, 'an unapplied credit note is still positively unapplied')
 
   // AND THE MOVED CASE, STATED WHERE IT USED TO BE ASSERTED, so a reader of this test cannot come
   // away thinking a figureless Xero document still clears.
@@ -371,7 +376,7 @@ test('[o3d-mm51] Codex\'s exact GBP pair is UNREADABLE, not a zero settlement', 
   //        NUMBER arm -> `Math.abs(value) >= ledgerDifferenceMagnitudeBound('GBP')` -> the unreadable
   //        reading -> completenessCannotRun -> ok:false -> classifyLedgerSettlement -> unknown.
   // MUTATION: delete the magnitude line from `wireAmount`'s number arm (which is exactly the reader
-  //        as o3d-obyd shipped it) and this probe answers `{ ok: true, records: [] }` and the
+  //        as o3d-obyd shipped it) and this probe answers `{ ok: true, provedComplete: true, records: [] }` and the
   //        classifier answers `clear` — the verdict that authorises a SECOND payment.
 
   // THE PRECONDITION, AND IT IS THE FINDING. These are two DIFFERENT figures a penny apart, and JSON
@@ -616,12 +621,12 @@ test('[o3d-mm51] an ORDINARY first payment still posts, and it is emptiness PROV
   assert.equal(UNPAID.TotalAmt, UNPAID.Balance, 'an unpaid bill states its total and balance equal')
 
   const probe = await probeBill(UNPAID)
-  assert.deepEqual(probe, { ok: true, records: [] }, 'nothing settles it, and the document says so')
+  assert.deepEqual(probe, { ok: true, provedComplete: true, records: [] }, 'nothing settles it, and the document says so')
   assert.equal(classifyLedgerSettlement(attemptFor('1200.00'), probe).outcome, 'clear', 'so the payment posts')
 
   // The same document with the figures as JSON NUMBERS, because both spellings reach the money.
   const asNumbers = await probeBill({ TotalAmt: 1200, Balance: 1200 })
-  assert.deepEqual(asNumbers, { ok: true, records: [] })
+  assert.deepEqual(asNumbers, { ok: true, provedComplete: true, records: [] })
   assert.equal(classifyLedgerSettlement(attemptFor('1200.00'), asNumbers).outcome, 'clear')
 
   // AND THE INVOICE SIDE, which is the other document kind the same fence covers.
@@ -629,7 +634,7 @@ test('[o3d-mm51] an ORDINARY first payment still posts, and it is emptiness PROV
     { type: 'INVOICE_PAYMENT', payload: { accountingInvoiceId: 'inv-1' } },
     ledgerDouble({ 'invoice/inv-1': { Invoice: { TotalAmt: '40.00', Balance: '40.00' } } }).get,
   )
-  assert.deepEqual(invoice, { ok: true, records: [] })
+  assert.deepEqual(invoice, { ok: true, provedComplete: true, records: [] })
   assert.equal(classifyLedgerSettlement(attemptFor('40.00'), invoice).outcome, 'clear')
 })
 
@@ -697,7 +702,7 @@ test('[o3d-mm51] the AmountPaid gate no longer excludes itself over a record the
  *
  * o3d-mm51 closed this on the QuickBooks arm (section 5) and FILED it on both Xero arms, because 25
  * fixtures modelled an ordinary first payment as a figureless stub Xero does not send. The fixtures
- * now state what Xero states, so the rule is one function — `emptyAnswerIsUnproved` — reached by all
+ * now state what Xero states, so the rule is one function — `settlementAnswer` — reached by all
  * three arms rather than one connector's own sentence.
  *
  * Every test below states the PRECONDITION it turns on, so none can pass by the shape under test
@@ -712,9 +717,9 @@ test('[o3d-nk5n] an INCOMPLETE Xero invoice cannot classify as clear', async () 
   // list — which `classifyLedgerSettlement` reads as `clear`, and `clear` authorises a SECOND payment.
   //
   // ROUTE: probeXeroSettlement's invoice arm -> `amountPaid`/`settled` both null -> both checks
-  //        skipped -> `emptyAnswerIsUnproved(settled, records)` -> ok:false ->
+  //        skipped -> `settlementAnswer(settled, records, ...)` -> ok:false ->
   //        classifyLedgerSettlement -> unknown/probe-unreadable.
-  // MUTATION: delete the `emptyAnswerIsUnproved` refusal at the end of the invoice arm and every one
+  // MUTATION: delete the `settlementAnswer` refusal at the end of the invoice arm and every one
   //        of the bodies below answers ok:true with an EMPTY record list, and each classifies `clear`.
 
   // THE PRECONDITION, AND IT IS WHAT THE TEST TURNS ON: none of these bodies states enough for EITHER
@@ -773,8 +778,8 @@ test('[o3d-nk5n] an INCOMPLETE Xero credit note cannot classify as clear', async
   // empty. That is `clear`, and `clear` allocates the same credit to the same bill a SECOND time.
   //
   // ROUTE: probeXeroSettlement's PURCHASE_CREDIT_NOTE_ALLOCATION arm -> `applied` null -> the
-  //        allocation check skipped -> `emptyAnswerIsUnproved(applied, records)` -> ok:false.
-  // MUTATION: delete the `emptyAnswerIsUnproved` refusal in the credit-note arm and each body below
+  //        allocation check skipped -> `settlementAnswer(applied, records, ...)` -> ok:false.
+  // MUTATION: delete the `settlementAnswer` refusal in the credit-note arm and each body below
   //        answers ok:true with an EMPTY record list, which classifies `clear`.
 
   // THE PRECONDITION: none of these states BOTH figures, and none carries an allocation to this bill,
@@ -828,9 +833,9 @@ test('[o3d-nk5n] a Xero document stating EQUAL readable totals proves zero settl
   // same sentence the QuickBooks arm has carried since o3d-mm51.
   //
   // ROUTE: probeXeroSettlement -> wireAmount reads both -> `settled` is exactly 0 -> statesAnything
-  //        false -> the check PASSES -> `emptyAnswerIsUnproved` is false because `settled` is a
+  //        false -> the check PASSES -> `settlementAnswer` is false because `settled` is a
   //        figure -> ok:true over an empty record list -> classifyLedgerSettlement -> clear.
-  // MUTATION: drop the `settled === null` half of `emptyAnswerIsUnproved` (refuse whenever `records`
+  // MUTATION: drop the `settled === null` half of `settlementAnswer` (refuse whenever `records`
   //        is empty) and every Xero first payment in the system stops — all four cases below fail.
 
   // (1) THE PRIMARY PAIR. THE PRECONDITION: the two figures are STATED and EQUAL, asserted so this
@@ -838,7 +843,7 @@ test('[o3d-nk5n] a Xero document stating EQUAL readable totals proves zero settl
   const UNPAID = { CurrencyCode: 'GBP', Total: 40, AmountDue: 40, AmountPaid: 0, Payments: [] }
   assert.equal(UNPAID.Total, UNPAID.AmountDue, 'an unpaid invoice states its total and amount due equal')
   const probe = await probeInvoice(UNPAID)
-  assert.deepEqual(probe, { ok: true, records: [] }, 'nothing settles it, and the document says so')
+  assert.deepEqual(probe, { ok: true, provedComplete: true, records: [] }, 'nothing settles it, and the document says so')
   assert.equal(classifyLedgerSettlement(attemptFor('40.00'), probe).outcome, 'clear', 'so the payment posts')
 
   // (2) A COMPLETE ZERO-VALUED FALLBACK TUPLE, which is the other proof the rule accepts and the one
@@ -847,7 +852,7 @@ test('[o3d-nk5n] a Xero document stating EQUAL readable totals proves zero settl
   const FALLBACK = { CurrencyCode: 'GBP', AmountPaid: 0, AmountCredited: 0, Payments: [] }
   assert.ok(!('Total' in FALLBACK) && !('AmountDue' in FALLBACK), 'the primary pair is not what proves this one')
   const viaFallback = await probeInvoice(FALLBACK)
-  assert.deepEqual(viaFallback, { ok: true, records: [] })
+  assert.deepEqual(viaFallback, { ok: true, provedComplete: true, records: [] })
   assert.equal(classifyLedgerSettlement(attemptFor('40.00'), viaFallback).outcome, 'clear')
 
   // (3) A PART-PAID INVOICE STILL ANSWERS. The rule is about an UNPROVED empty answer, not about
@@ -864,7 +869,7 @@ test('[o3d-nk5n] a Xero document stating EQUAL readable totals proves zero settl
   const UNAPPLIED = { CurrencyCode: 'GBP', Total: 40, RemainingCredit: 40, Allocations: [] }
   assert.equal(UNAPPLIED.Total, UNAPPLIED.RemainingCredit, 'an unapplied credit note states them equal')
   const note = await probeNote(UNAPPLIED)
-  assert.deepEqual(note, { ok: true, records: [] }, 'positively unapplied, on the note\'s own figures')
+  assert.deepEqual(note, { ok: true, provedComplete: true, records: [] }, 'positively unapplied, on the note\'s own figures')
   assert.equal(classifyLedgerSettlement(attemptFor('40.00'), note).outcome, 'clear')
 })
 
@@ -873,6 +878,13 @@ test('[o3d-nk5n] the rule is ONE function, and all three arms reach it', async (
   // Xero arms were closed by CALLING that same condition rather than by restating it, so a change to
   // the rule cannot reach one connector and miss the other. Both halves are checked: that the source
   // has one definition and three call sites, and that all three arms actually behave that way.
+  //
+  // o3d-obyd r31: the function is `settlementAnswer` and it is no longer a PREDICATE each arm
+  // consults before building its own `{ ok: true, records }` — it BUILDS the answer. That is what
+  // this test's own premise now buys: because every arm leaves through it, r31 changed what all
+  // three report about their collection's completeness by changing one function, and there is no
+  // route by which an arm could construct a successful probe without handing over the document
+  // figure that decides it.
 
   const source = await readFile(
     path.join(process.cwd(), 'lib/connectors/accounting-settlement-probe.ts'), 'utf8',
@@ -883,11 +895,11 @@ test('[o3d-nk5n] the rule is ONE function, and all three arms reach it', async (
   const code = source
     .replace(/\/\*[\s\S]*?\*\//g, '')
     .replace(/^[ \t]*\/\/.*$/gm, '')
-  assert.match(code, /function emptyAnswerIsUnproved/, 'the shared rule is defined in the module')
+  assert.match(code, /function settlementAnswer/, 'the shared rule is defined in the module')
 
-  const definitions = [...code.matchAll(/function emptyAnswerIsUnproved/g)]
+  const definitions = [...code.matchAll(/function settlementAnswer/g)]
   assert.equal(definitions.length, 1, 'exactly ONE definition, so there is one rule to change')
-  const callSites = [...code.matchAll(/emptyAnswerIsUnproved\s*\(/g)].map((m) => m.index!)
+  const callSites = [...code.matchAll(/settlementAnswer\s*\(/g)].map((m) => m.index!)
   assert.equal(callSites.length, 4, 'the definition plus one call from each of the three arms')
 
   // LOCATED, not merely counted: one call inside each probe, so this cannot be satisfied by three

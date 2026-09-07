@@ -240,7 +240,15 @@ test('a REPEAT attempt is refused when the ledger already holds it (o3d-0m56)', 
 
 test('a REPEAT attempt proceeds when the ledger does not hold it (o3d-0m56)', async () => {
   xeroCalls.length = 0
-  xeroResponse = { Invoices: [{ InvoiceID: 'inv-1', Payments: [{ PaymentID: 'PAY-1', Date: '2026-07-01', Amount: 10 }] }] }
+  // o3d-obyd r31: the invoice states its own settled figure, as Xero does on every invoice it
+  // returns. Without it the response proves nothing about whether these are ALL its payments, and
+  // "none of these is my attempt" is `unknown` rather than the clear this test is about.
+  xeroResponse = {
+    Invoices: [{
+      InvoiceID: 'inv-1', Total: 100, AmountDue: 90, AmountPaid: 10, AmountCredited: 0,
+      Payments: [{ PaymentID: 'PAY-1', Date: '2026-07-01', Amount: 10 }],
+    }],
+  }
   const { db } = dbDouble([{ id: 'log-1', remoteAttemptedAt: new Date('2026-08-01T10:00:00Z') }])
 
   assert.deepEqual(await (await load())({ ...payment, entryId: 'log-1', db }), { proceed: true })
@@ -448,8 +456,14 @@ test('a rival against a DIFFERENT document does not strand this payment (o3d-0m5
   // have settled this one — and is not even covered by this probe — so it is not a contender.
   const { settlementMarkerFor } = await import('@/lib/domain/accounting/ledger-settlement-evidence')
   xeroCalls.length = 0
+  // o3d-obyd r31: with the invoice's own figures, as Xero returns them — see the note in the
+  // repeat-attempt test above. The settlement here belongs to another document's row, and showing
+  // that it is not this attempt's requires knowing these are all the payments on this invoice.
   xeroResponse = {
-    Invoices: [{ InvoiceID: 'inv-1', Payments: [{ PaymentID: 'PAY-OLD', Date: '2026-08-04', Amount: 11.5, Reference: settlementMarkerFor('log-old') }] }],
+    Invoices: [{
+      InvoiceID: 'inv-1', Total: 100, AmountDue: 88.5, AmountPaid: 11.5, AmountCredited: 0,
+      Payments: [{ PaymentID: 'PAY-OLD', Date: '2026-08-04', Amount: 11.5, Reference: settlementMarkerFor('log-old') }],
+    }],
   }
   const { db } = dbDouble([
     { id: 'log-new', remoteAttemptedAt: null },
@@ -477,8 +491,13 @@ test('a rival too incomplete to have posted does not strand this payment (o3d-0m
   // is not a contender and the match is not its. (The amounts differ deliberately — a settlement
   // matching THIS row's own numbers is a human settlement, which round 4 refuses on, and would
   // confound what this test is about.)
+  // o3d-obyd r31: with the invoice's own figures — the clear this asserts is only available on a
+  // collection something outside it measured.
   xeroResponse = {
-    Invoices: [{ InvoiceID: 'inv-1', Payments: [{ PaymentID: 'PAY-X', Date: '2026-08-01', Amount: 10 }] }],
+    Invoices: [{
+      InvoiceID: 'inv-1', Total: 100, AmountDue: 90, AmountPaid: 10, AmountCredited: 0,
+      Payments: [{ PaymentID: 'PAY-X', Date: '2026-08-01', Amount: 10 }],
+    }],
   }
   const newPayload = { accountingInvoiceId: 'inv-1', bankAccountId: 'bank-1', amount: 42, paymentDate: '2026-09-09' }
   const { db } = dbDouble([
@@ -581,7 +600,12 @@ test('a settlement that is NOT this attempt still lets the first post through (o
   xeroResponse = {
     Invoices: [{
       InvoiceID: 'inv-1',
+      // o3d-obyd r31: `AmountPaid` alone leaves the settled figure uncomputable (the fallback pair
+      // needs `AmountCredited` too), so the list went unmeasured and a non-match could not clear.
+      Total: 200,
+      AmountDue: 101,
       AmountPaid: 99,
+      AmountCredited: 0,
       Payments: [{ PaymentID: 'PAY-OTHER', Date: '2026-06-01', Amount: 99 }],
     }],
   }
@@ -636,7 +660,12 @@ test('a virgin undated row is NOT stranded by a settlement it would not create (
   xeroResponse = {
     Invoices: [{
       InvoiceID: 'inv-1',
+      // o3d-obyd r31: the whole figure set, so the June payment is measured and known to be all of
+      // them — see the note on the not-this-attempt test above.
+      Total: 100,
+      AmountDue: 90,
       AmountPaid: 10,
+      AmountCredited: 0,
       Payments: [{ PaymentID: 'PAY-JUNE', Date: '2026-06-01', Amount: 10 }],
     }],
   }

@@ -56,7 +56,15 @@ test('a pinned money revival is refused when the ledger already holds the attemp
 
 test('a pinned money revival proceeds when the ledger does not hold it (o3d-0m56)', async () => {
   xeroCalls.length = 0
-  xeroResponse = { Invoices: [{ InvoiceID: 'inv-1', Payments: [{ PaymentID: 'PAY-1', Date: '2026-07-01', Amount: 10 }] }] }
+  // o3d-obyd r31: with the invoice's own settled figure, as Xero returns it. A response that omits
+  // it proves nothing about whether these are ALL the payments on the document, so "the ledger does
+  // not hold this attempt" is not available from it — which is the point of this test.
+  xeroResponse = {
+    Invoices: [{
+      InvoiceID: 'inv-1', Total: 100, AmountDue: 90, AmountPaid: 10, AmountCredited: 0,
+      Payments: [{ PaymentID: 'PAY-1', Date: '2026-07-01', Amount: 10 }],
+    }],
+  }
 
   assert.deepEqual(await (await load())(revival), { clear: true })
 })

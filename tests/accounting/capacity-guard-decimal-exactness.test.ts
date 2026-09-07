@@ -450,7 +450,7 @@ test('[o3d-6yho] an attempt with NO currency is still MATCHED at the wide band, 
   // rule in the repository takes — and this returns `clear`.
   // o3d-78rq: both operands are `Decimal`s now. The figures, and everything this test asserts about
   // them, are unchanged — only the type they are stated in.
-  const records = (amount: number) => ({ ok: true as const, records: [{ amount: toDecimal(amount), date: '2026-08-01', id: 'PAY-1' }] })
+  const records = (amount: number) => ({ ok: true as const, provedComplete: true, records: [{ amount: toDecimal(amount), date: '2026-08-01', id: 'PAY-1' }] })
   const unstated = { amount: toDecimal(10), currency: null, date: '2026-08-01', marker: null }
   assert.equal(classifyLedgerSettlement(unstated, records(10.001)).outcome, 'present',
     'a thousandth apart is the same payment, and this attempt must not be re-sent')

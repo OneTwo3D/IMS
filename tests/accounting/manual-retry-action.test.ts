@@ -182,7 +182,7 @@ mock.module('@/lib/connectors/accounting-settlement-probe', {
     probeLedgerSettlement: async (connector: string, target: { type: string; payload: unknown }) => {
       const key = settlementProbeKey(target)
       state.probeCalls.push(`${connector} ${key}`)
-      return state.probes.get(key) ?? { ok: true, records: [] }
+      return state.probes.get(key) ?? { ok: true, provedComplete: true, records: [] }
     },
   },
 })
@@ -236,6 +236,7 @@ const statusOf = (id: string) => state.rows.find((r) => r.id === id)?.status
 const ledgerHoldsTheAttemptOn = (invoiceId: string) =>
   state.probes.set(`INVOICE_PAYMENT ${invoiceId} `, {
     ok: true,
+    provedComplete: true,
     records: [{ amount: toDecimal(10), date: '2026-08-01', id: 'PAY-A' }],
   })
 
@@ -307,6 +308,7 @@ for (const action of ACTIONS) {
     seed(action.connector)
     state.probes.set('INVOICE_PAYMENT inv-2 ', {
       ok: true,
+      provedComplete: true,
       records: [{ amount: toDecimal(10), date: '2026-08-01', id: 'PAY-1' }],
     })
     const retry = await load(action)
@@ -343,6 +345,7 @@ for (const action of ACTIONS) {
     seed(action.connector)
     state.probes.set('INVOICE_PAYMENT inv-2 ', {
       ok: true,
+      provedComplete: true,
       records: [
         { amount: toDecimal(10), date: '2026-07-01', id: 'PAY-OLD' },
         { amount: toDecimal(25), date: '2026-08-01', id: 'PAY-OTHER' },
