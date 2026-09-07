@@ -2103,10 +2103,10 @@ resolve_legacy_fence() {
       *)
         echo "${self}: unrecognised argument '$1'. This wrapper takes one optional argument and no others:" >&2
         echo "" >&2
-        echo "  ${sudo_prefix}${self}                             read the record and the ACL, print what they say, change NOTHING" >&2
+        echo "  ${sudo_prefix}${self}                             inspect the record, audit the ACL, print what they say, change NOTHING" >&2
         echo "  ${sudo_prefix}${self} --this-fence-revoked-them   the same, and stamp the record IF the ACL shows every recorded grantee has lost CONNECT" >&2
         echo "" >&2
-        echo "Nothing has been read and nothing has been changed." >&2
+        echo "Nothing has been examined and nothing has been changed." >&2
         return 1 ;;
     esac
     shift
