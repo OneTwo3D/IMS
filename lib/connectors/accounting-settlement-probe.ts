@@ -771,12 +771,62 @@ function sumApplied(collection: XeroAppliedCollection | undefined, currency: str
  * subtraction in the direction that forges a `clear`; DROPPING it is an unbacked exclusion. Both are
  * guesses about money, so neither is made — the probe refuses and a human reads the response.
  *
- * AN UNSTATED FIELD IS NOT AN UNKNOWN ONE, AND IT COUNTS. Xero states neither field on the nested
- * payment stubs a credit-note GET returns, and refusing on absence would refuse EVERY ordinary
- * refunded credit note — the exact harm the round before this one removed, on the most ordinary
- * operation there is. There is nothing to act on when the ledger says nothing, and the ordinary
- * refund is the authorised one. What is refused is what Xero STATED and this code cannot account
- * for, which is `wireAmount`'s distinction carried onto the enumerated fields.
+ * AN UNSTATED FIELD IS NOT AN UNKNOWN ONE — AND THE ROUND THAT SAID SO MADE THIS GUARD INERT
+ * (o3d-acctmoney r3, Codex HIGH). The rule here was "an absent `Status` counts", justified by "Xero
+ * states neither field on the nested payment stubs a credit-note GET returns". THE TWO HALVES CANNOT
+ * BOTH BE TRUE: if Xero never states `Status` there, the DELETED branch never runs, a reversed refund
+ * and an authorised one are the SAME OBJECT on the wire, and both are subtracted — which is the
+ * defect this filter was added to close, now wearing the filter as a costume. A guard that reads as
+ * protection while being decoration is the thing the round before this one removed a guard FOR.
+ *
+ * WHAT THE SOURCES ACTUALLY SAY, since the premise was asserted and never checked:
+ *
+ *   THE PUBLISHED SCHEMA PERMITS BOTH FIELDS. `components.schemas.CreditNote.Payments` is
+ *   `items: $ref: '#/components/schemas/Payment'` — the FULL `Payment`, `Status` (AUTHORISED /
+ *   DELETED) and `PaymentType` included. A `$ref` is a NOMINAL type: it settles what may arrive and
+ *   says nothing about which members an endpoint in fact populates.
+ *   THIS REPO'S LIVE-TENANT MODELS OMIT BOTH. `scripts/audit-xero-live-contamination.ts` and
+ *   `scripts/remove-xero-live-e2e-footprint.ts` each type a nested credit-note payment as
+ *   `{ PaymentID, Amount }`, and both were written against the live tenant. The only nested-stub
+ *   claim in this tree with a live test behind it — the full-chain specs' "the invoice's own
+ *   Payments sub-resource omits the account" — also says the nested projection is NARROWER than
+ *   `Payment`.
+ *   NOTHING IN THIS REPOSITORY RECORDS AN ACTUAL RESPONSE. There is no captured `CreditNotes/{id}`
+ *   body anywhere in it, so no fixture can decide between them either, and a hand-written literal
+ *   asserting one shape would only be this paragraph again in a different file.
+ *   BUT `Payments/{id}` DOES STATE THEM. `audit-xero-live-contamination.ts` reads `Status` and
+ *   `PaymentType` off that endpoint against the live tenant, and Xero's own reversal is a POST of
+ *   `Status: 'DELETED'` to it — see `remove-xero-live-e2e-footprint.ts`.
+ *
+ * A SCHEMA THAT PERMITS A FIELD IS NOT AN ENDPOINT THAT RETURNS IT, so the sources DISAGREE and the
+ * disagreement cannot be settled from here. THAT IS NOT A GAP TO BE FILLED WITH A DEFAULT, because
+ * the two defaults are not each other's mirror:
+ *
+ *   COUNTING an unverified refund over-subtracts; an over-subtraction that reaches zero over an empty
+ *   `Allocations` collection is a false `clear`, which is a second payment and IRREVERSIBLE.
+ *   NOT COUNTING one overstates the usage; the note then refuses as a shortfall — visible and
+ *   recoverable, but on EVERY ordinary refunded credit note, which is the whole-class harm o3d-jfhi's
+ *   round removed at the most ordinary operation there is.
+ *
+ * SO THE DISCRIMINATOR IS FETCHED RATHER THAN GUESSED (`resolveCreditNoteRefunds`). When the stub
+ * does not state `Status`, this code asks `Payments/{PaymentID}` — the endpoint that does state it
+ * — and decides on THAT record, through this same function. When the stub states it, nothing is
+ * fetched, so a projection that turns out to be fully populated costs nothing at all. What that buys
+ * is the one outcome neither default can have: a reversed refund cannot forge a `clear`, AND an
+ * ordinary refunded credit note still authorises the balance it has left.
+ *
+ * FAIL CLOSED WHEN THE LOOKUP DOES NOT COMPLETE, and note what that costs. A transport failure
+ * refuses visibly and clears itself on the retry. The one non-transient case is a connection
+ * authorised without `accounting.payments` — PURCHASE_CREDIT_NOTE_ALLOCATION rides on the baseline
+ * grant and has never needed it — which arrives as Xero's own error inside the refusal sentence,
+ * which is how every other scope gap on this connector is surfaced and reconnected out of. It is NOT
+ * added to `SCOPE_BY_SYNC_TYPE`: that would block the whole sync type up front, including the notes
+ * with no refunds at all, trading a rare conditional refusal for an unconditional one.
+ *
+ * WHAT IS STILL DECIDED FROM THE STUB ALONE, and why it is a different question: a value Xero HAS
+ * stated and this code cannot account for. That is answered before any request — there is nothing
+ * to resolve when the ledger has already spoken and the answer is unreadable — and it is
+ * `wireAmount`'s distinction carried onto the enumerated fields.
  */
 const XERO_PAYMENT_STATUS_AUTHORISED = 'AUTHORISED'
 const XERO_PAYMENT_STATUS_DELETED = 'DELETED'
@@ -801,13 +851,24 @@ function wireEnum(value: unknown): { token: string | null; unreadable: string | 
 }
 
 /**
- * Is this credit-note payment a term of the identity above — and when this code cannot tell, WHY.
+ * Is this payment RECORD a term of the identity above — and when this code cannot tell, WHY.
  *
- * The three answers are distinct on purpose. `counts: true` is an authorised or unstated refund, the
- * ordinary case. `counts: false` with a null `unaccountable` is the ONE case this code positively
- * knows is not a term: an explicitly DELETED payment, whose money Xero has already returned to
- * `RemainingCredit`. A non-null `unaccountable` is a status or type the contract does not enumerate,
- * and it refuses rather than being silently counted in either direction.
+ * The three answers are distinct on purpose. `counts: false` with a null `unaccountable` is the case
+ * this code positively knows is not a term: an explicitly DELETED payment, whose money Xero has
+ * already returned to `RemainingCredit`. A non-null `unaccountable` is a status or type the contract
+ * does not enumerate, and it refuses rather than being silently counted in either direction.
+ * `counts: true` is an authorised refund.
+ *
+ * AND THE FOURTH ANSWER IS NOT THIS FUNCTION'S TO GIVE (o3d-acctmoney r3). A record that states NO
+ * `Status` also returns `counts: true` here, and that is deliberately NOT the final word on it: the
+ * caller resolves such a payment through `Payments/{id}` first and asks this same question of the
+ * record that comes back. The reason is written out on the constants above — an unstated `Status`
+ * counted as authorised is what made the DELETED branch unreachable on the very projection this
+ * filter exists to read. So the rule lives in one place and is applied to whichever record actually
+ * states something; what changed is WHICH RECORD is allowed to be silent.
+ *
+ * It takes an `unknown`-ish structural shape rather than a named response type because it is asked of
+ * both: the nested stub inside a credit note, and the full payment `Payments/{id}` returns.
  */
 function creditNoteRefundInclusion(
   payment: { Status?: string; PaymentType?: string },
@@ -829,6 +890,124 @@ function creditNoteRefundInclusion(
     return { counts: false, unaccountable: `a payment type of ${type.token}` }
   }
   return { counts: status.token !== XERO_PAYMENT_STATUS_DELETED, unaccountable: null }
+}
+
+/** What `Payments/{id}` answers with, reduced to the two fields this arm decides on. */
+type XeroPaymentLookupResponse = {
+  Payments?: Array<{ PaymentID?: string; Status?: string; PaymentType?: string }>
+}
+
+/**
+ * How many `Payments/{id}` lookups ONE credit note may cost before this arm refuses instead.
+ *
+ * The loop below is over a VENDOR-CONTROLLED array length inside the authorisation path of a money
+ * post, and Xero's limit is 60 calls per minute per tenant. An unbounded resolve would let one
+ * pathological document spend a whole minute's budget and starve every other row in the sweep. A
+ * refusal is visible and recoverable; a rate-limit outage across the connector is neither. Real
+ * refund counts are 0 or 1 — a note refunded in twenty-five tranches is not a shape this code should
+ * fail quietly on, and it does not fail quietly.
+ */
+const XERO_CREDIT_NOTE_REFUND_LOOKUP_LIMIT = 25
+
+/**
+ * Resolve the refunds whose `Status` the credit note's own projection did not state, and say so when
+ * one cannot be resolved.
+ *
+ * WHY THIS IS A SEPARATE PASS FROM THE STUB READING. A value Xero STATED and this code cannot account
+ * for is already an answer — there is nothing to go and ask about — so the caller refuses on those
+ * BEFORE this runs and no request is spent on a note that was going to refuse anyway.
+ *
+ * ONLY SILENCE IS RESOLVED. A stub that states a readable `Status` is decided from the stub; if Xero
+ * does populate the nested projection, this makes exactly zero requests. That is also what keeps the
+ * cost proportional to the thing being fixed rather than to the number of credit notes.
+ *
+ * REPEATED IDS COST ONE LOOKUP, and the cap counts REQUESTS rather than entries, so a collection that
+ * lists one payment many times cannot be turned into many calls.
+ *
+ * EVERY INCOMPLETE OUTCOME IS A REFUSAL, in the direction this arm's asymmetry demands: not the
+ * transport failure, not a response with no payment in it, not a resolved record that STILL states no
+ * status. Each would otherwise leave an unverified refund to be subtracted, which is the direction
+ * that forges a `clear`. The refusal names the payment so an operator has something to open.
+ */
+async function resolveCreditNoteRefunds(
+  payments: ReadonlyArray<{ PaymentID?: string; Status?: string; PaymentType?: string }>,
+  stated: ReadonlyArray<{ counts: boolean; unaccountable: string | null }>,
+  xeroGet: XeroFetcher,
+): Promise<{ inclusions: Array<{ counts: boolean; unaccountable: string | null }>; refusal: string | null }> {
+  // One sentence-ending for every way this can fail, so the refusals read as one rule rather than as
+  // a handful of unrelated errors that happen to share a code path.
+  const cannotTell = (what: string): string =>
+    `${what}, so IMS cannot tell whether that refund was reversed and cannot tell how much of the `
+    + 'credit is already allocated'
+
+  const inclusions = [...stated]
+  const resolved = new Map<string, { counts: boolean; unaccountable: string | null }>()
+  let lookups = 0
+
+  for (let index = 0; index < payments.length; index++) {
+    const payment = payments[index]!
+    // A STATED status is decided from the stub. An UNREADABLE one never reaches here — the caller has
+    // already refused on it — so `token === null` here means the field is absent, and nothing else.
+    if (wireEnum(payment.Status).token !== null) continue
+
+    const paymentId = str(payment.PaymentID)
+    if (paymentId === '') {
+      return {
+        inclusions,
+        refusal: cannotTell('Xero returned a payment against this credit note with neither a status nor '
+          + 'an id to resolve one by'),
+      }
+    }
+    const key = paymentId.toLowerCase()
+    const already = resolved.get(key)
+    if (already !== undefined) {
+      inclusions[index] = already
+      continue
+    }
+    if (lookups >= XERO_CREDIT_NOTE_REFUND_LOOKUP_LIMIT) {
+      return {
+        inclusions,
+        refusal: `Xero states more than ${XERO_CREDIT_NOTE_REFUND_LOOKUP_LIMIT} payments against this `
+          + 'credit note whose status it did not state, which IMS will not resolve one request at a '
+          + 'time, so it cannot tell how much of the credit is already allocated',
+      }
+    }
+
+    lookups++
+    const res = await xeroGet<XeroPaymentLookupResponse>(`Payments/${encodeURIComponent(paymentId)}`)
+    if (!res.ok) {
+      // Xero's own words, verbatim: a connection authorised without `accounting.payments` says so
+      // here, and that is the difference between an operator reconnecting and an operator guessing.
+      return {
+        inclusions,
+        refusal: cannotTell(`IMS could not read payment ${paymentId} against this credit note from Xero `
+          + `(${res.error ?? `HTTP ${res.status}`})`),
+      }
+    }
+    const full = res.data?.Payments?.[0]
+    if (full === undefined) {
+      return { inclusions, refusal: cannotTell(`Xero returned no payment for ${paymentId} against this credit note`) }
+    }
+    const inclusion = creditNoteRefundInclusion(full)
+    if (inclusion.unaccountable !== null) {
+      return {
+        inclusions,
+        refusal: `Xero states ${inclusion.unaccountable} on payment ${paymentId} against this credit `
+          + 'note, which IMS cannot account for, so it cannot tell how much of the credit is already '
+          + 'allocated',
+      }
+    }
+    // THE INERTNESS CHECK, MADE EXPLICIT. If the resolved record is silent too, `creditNoteRefundInclusion`
+    // would answer `counts: true` and this whole pass would have bought nothing. Refuse instead: the
+    // one thing that must not happen is an unverified refund being subtracted.
+    if (wireEnum(full.Status).token === null) {
+      return { inclusions, refusal: cannotTell(`Xero states no status on payment ${paymentId} against this credit note`) }
+    }
+    resolved.set(key, inclusion)
+    inclusions[index] = inclusion
+  }
+
+  return { inclusions, refusal: null }
 }
 
 /** The shape of the connector read each probe needs, so both can be driven without a network. */
@@ -1008,8 +1187,8 @@ export async function probeXeroSettlement(
     // only make `applied` LARGER, which is the shortfall direction and a VISIBLE refusal, never the
     // proved zero. The amount refusal below exists for the terms that ARE subtracted and still covers
     // every one of them.
-    const refundInclusions = notePayments.map((pmt) => creditNoteRefundInclusion(pmt))
-    const unaccountableRefund = refundInclusions.find((i) => i.unaccountable !== null)?.unaccountable ?? null
+    const statedInclusions = notePayments.map((pmt) => creditNoteRefundInclusion(pmt))
+    const unaccountableRefund = statedInclusions.find((i) => i.unaccountable !== null)?.unaccountable ?? null
     if (unaccountableRefund !== null) {
       return {
         ok: false,
@@ -1017,6 +1196,18 @@ export async function probeXeroSettlement(
           + 'cannot account for, so it cannot tell how much of the credit is already allocated',
       }
     }
+    // o3d-acctmoney r3 (Codex HIGH) — AND THE ONES IT STATED NOTHING ABOUT ARE ASKED ABOUT, NOT
+    // ASSUMED. The round before this one read the status off the nested stub and counted an absent
+    // one as authorised, which — on a projection this repository's own live-tenant models describe as
+    // carrying `PaymentID` and `Amount` and nothing else — is a filter that never fires. The argument
+    // and the sources are on `creditNoteRefundInclusion`; what happens here is that a refund whose
+    // status the credit note withheld is resolved through the endpoint that states it, and anything
+    // short of a complete answer refuses rather than being subtracted on trust.
+    const refundResolution = await resolveCreditNoteRefunds(notePayments, statedInclusions, xeroGet)
+    if (refundResolution.refusal !== null) {
+      return { ok: false, reason: refundResolution.refusal }
+    }
+    const refundInclusions = refundResolution.inclusions
     const refundReadings = notePayments
       .filter((_pmt, index) => refundInclusions[index]!.counts)
       .map((pmt) => wireAmount(pmt.Amount, noteCurrency))
