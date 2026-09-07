@@ -13059,11 +13059,21 @@ function witnessProtocolCheckout(
     confirmChallenge?: boolean
     sightings?: number
     binding?: 'colocated' | 'absent'
+    samplerStuck?: boolean
   } = {},
 ): void {
-  const { verdict = 'yes', extraStdout = [], confirmChallenge = true, sightings = 1, binding = 'colocated' } = options
+  const {
+    verdict = 'yes', extraStdout = [], confirmChallenge = true,
+    sightings = 1, binding = 'colocated', samplerStuck = false,
+  } = options
   const helper = writeFenceCheckout(dir, '')
   const sink = JSON.stringify(join(dir, 'challenge-nonce'))
+  // WHERE THE `--hold-stamp` PROBE ANNOUNCES ITSELF. In the shipped mechanism the witness sees that
+  // probe through `pg_stat_activity`; there is no PostgreSQL here and the witness is a different
+  // process, so the probe leaves a file and the witness stub counts it. What is under test in this
+  // file is the SHELL: that it runs the probe, asks the sampler on both sides of it, and refuses
+  // when the count did not move.
+  const held = JSON.stringify(join(dir, 'hold-stamp-probe'))
   writeFileSync(helper, [
     "import { appendFileSync, existsSync, readFileSync, writeFileSync } from 'node:fs'",
     `appendFileSync(${JSON.stringify(join(dir, 'calls.log'))}, process.argv.slice(2).join(' ') + '\\n')`,
@@ -13092,7 +13102,11 @@ function witnessProtocolCheckout(
     "      const w = /^watch ([0-9a-f]+)$/.exec(line)",
     "      if (w) process.stdout.write(`WITNESS_WATCHING ${w[1]}\\n`)",
     "      const g = /^sightings ([0-9a-f]+)$/.exec(line)",
-    `      if (g) process.stdout.write(\`WITNESS_SIGHTINGS \${g[1]} ${sightings}\\n\`)`,
+    // THE COUNT GROWS WHEN, AND ONLY WHEN, A `--hold-stamp` PROBE HAS RUN. `samplerStuck` is how
+    // a sampler that has DIED is exhibited: the probe runs and reports colocated, and the count
+    // does not move -- which reads exactly like "the migration went elsewhere" and must refuse.
+    `      const grown = ${samplerStuck ? '0' : `(existsSync(${held}) ? 1 : 0)`}`,
+    `      if (g) process.stdout.write(\`WITNESS_SIGHTINGS \${g[1]} \${${sightings} + grown}\n\`)`,
     "    }",
     "  })",
     "  await new Promise((resolve) => process.stdin.on('end', resolve))",
@@ -13101,6 +13115,7 @@ function witnessProtocolCheckout(
     "const lockArg = process.argv.find((a) => a.startsWith('--witness-lock='))?.slice('--witness-lock='.length) ?? ''",
     "const migrationArg = process.argv.find((a) => a.startsWith('--migration-nonce='))?.slice('--migration-nonce='.length) ?? ''",
     "if (process.argv.includes('--bind-migration')) {",
+    `  if (process.argv.includes('--hold-stamp')) writeFileSync(${held}, 'held')`,
     `  process.stdout.write(\`MIGRATION_BINDING \${migrationArg} ${binding}\\n\`)`,
     `  process.exit(${binding === 'colocated' ? 0 : 1})`,
     "}",
@@ -13373,34 +13388,76 @@ for (const entry of FENCE_HARNESS) {
     }
   })
 
+  const closeTheWindow = (dir: string) => [
+    'set -uo pipefail',
+    'exec 2>&1',
+    entry.preamble(dir),
+    'error() { echo "ERROR: $*" >&2; }',
+    'DB_FENCE_RAISED=false',
+    CUTOVER_DIR_PRIMITIVES,
+    shellFunction(entry.source, 'fence_db_connections'),
+    'fence_db_connections',
+    'require_migration_landed_on_fenced_server',
+    'echo "BOUND AT THE END=${DB_FENCE_WITNESS_BOUND}"',
+    'echo "STARTED THE NEW BUILD"',
+  ].join('\n')
+
+  // THE CLOSING GATE IS DETERMINISTIC, AND THIS IS WHY (o3d-secops r32).
+  //
+  // The first draft of this round made the refusal "did the sampler see prisma?". MEASURED against
+  // a real cluster: a warm `prisma migrate status` connects, reads and disconnects inside about
+  // 40ms, and a 50ms sampler missed it in EVERY run. Polling cannot promise to observe a connection
+  // somebody else opens and closes, so that gate would have refused ordinary cutovers -- trading
+  // this finding for an outage. What it asks now is a question about a connection THIS RUN HOLDS
+  // OPEN: `--bind-migration --hold-stamp` must both see the witness and BE SEEN by the sampler.
+  //
   // MUTATION ROUTE (made against the shipped file and reverted): change the `*)` arm of
   // require_migration_landed_on_fenced_server() from `die` to `warn` -- STARTED THE NEW BUILD is
-  // then printed after a window in which nothing observed where the migration went.
-  test(`${entry.name}: a window in which the witness never saw a migration backend refuses (o3d-secops r32, Codex HIGH 2)`, () => {
-    const dir = mkdtempSync(join(tmpdir(), 'ims-r32unseen-'))
+  // then printed after a window whose closing position nothing could establish.
+  test(`${entry.name}: a closing probe the sampler cannot see refuses (o3d-secops r32, Codex HIGH 2)`, () => {
+    const dir = mkdtempSync(join(tmpdir(), 'ims-r32stuck-'))
     try {
-      witnessProtocolCheckout(dir, { verdict: 'yes', binding: 'colocated', sightings: 0 })
-      const result = runShell([
-        'set -uo pipefail',
-        'exec 2>&1',
-        entry.preamble(dir),
-        'error() { echo "ERROR: $*" >&2; }',
-        'DB_FENCE_RAISED=false',
-        CUTOVER_DIR_PRIMITIVES,
-        shellFunction(entry.source, 'fence_db_connections'),
-        'fence_db_connections',
-        'require_migration_landed_on_fenced_server',
-        'echo "STARTED THE NEW BUILD"',
-      ].join('\n'))
+      // The probe runs and reports colocated; the sampler's count does not move. That is a sampler
+      // which has died, and it reads EXACTLY like "the migration went elsewhere" -- which is why it
+      // may not be allowed to produce the reassuring one of the two readings.
+      witnessProtocolCheckout(dir, { verdict: 'yes', binding: 'colocated', sightings: 3, samplerStuck: true })
+      const result = runShell(closeTheWindow(dir))
 
-      assert.match(result.output, /WITNESS_SIGHTINGS|never seen|NEVER SEEN/i,
-        `precondition: the witness must have been asked what it saw:\n${result.output}`)
+      assert.match(calls(dir), /^--bind-migration --hold-stamp /m,
+        `precondition: the closing probe must have run, holding its stamp:\n${calls(dir)}`)
       assert.doesNotMatch(result.output, /^STARTED THE NEW BUILD$/m,
         `nothing may start on a schema this run cannot place:\n${result.output}`)
       assert.match(result.output, /THE SCHEMA MAY HAVE MOVED/,
         `and the operator must be told that this refusal comes AFTER the DDL:\n${result.output}`)
       assert.match(result.output, /STILL UP/,
         `and that the fence is being held rather than released:\n${result.output}`)
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  // MUTATION ROUTE (made against the shipped file and reverted): delete `DB_FENCE_WITNESS_BOUND=0`
+  // from the `4)` arm -- the flag stays 1, the release goes on to remove the record automatically,
+  // and a window in which the migration's own backends were never observed ends with no trace for
+  // anybody to look at.
+  test(`${entry.name}: a window whose own backends were never seen keeps the record instead of refusing (o3d-secops r32, Codex HIGH 2)`, () => {
+    const dir = mkdtempSync(join(tmpdir(), 'ims-r32unseen-'))
+    try {
+      // The closing probe binds and IS seen -- the count moves from 0 to 1 -- so the string is
+      // where it should be and the sampler works. What was never seen is a backend carrying the
+      // stamp while the migration itself ran. Real evidence, and it costs the record's automatic
+      // removal; it does not cost the deploy, because a miss is a property of polling.
+      witnessProtocolCheckout(dir, { verdict: 'yes', binding: 'colocated', sightings: 0 })
+      const result = runShell(closeTheWindow(dir))
+
+      assert.match(calls(dir), /^--bind-migration --hold-stamp /m,
+        `precondition: the closing probe must have run:\n${calls(dir)}`)
+      assert.match(result.output, /^STARTED THE NEW BUILD$/m,
+        `a missed sample is a property of polling, not of the deploy, so the cutover must go on:\n${result.output}`)
+      assert.match(result.output, /^BOUND AT THE END=0$/m,
+        `but the attestation must be withheld, which is what keeps the record for a person:\n${result.output}`)
+      assert.match(result.output, /KEPT/,
+        `and the operator must be told that is what happened:\n${result.output}`)
     } finally {
       rmSync(dir, { recursive: true, force: true })
     }
