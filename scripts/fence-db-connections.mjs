@@ -727,81 +727,104 @@ export function assessDatabaseIdentity({
 }
 
 /**
- * Pure: split a `pg_database.datacl` text value into { grantee, privileges } entries.
- * An empty grantee is PUBLIC. Commas inside a quoted role name are not separators.
+ * THE ACL IS ASKED FOR AS ROWS, AND NEVER RE-DERIVED FROM ITS PRINTED FORM
+ * (o3d-secops r28, Codex HIGH).
+ *
+ * Until this round every reader of the database ACL took `d.datacl::text` and took it apart by
+ * hand: split on commas outside quotes, drop the quotes, split the remainder on `=` and `/`.
+ * That is not what `aclitem[]::text` is. It is an ARRAY LITERAL, and PostgreSQL's array output
+ * rules quote any element containing a comma, a space, a brace or a quote and BACKSLASH-ESCAPE
+ * the quotes and backslashes inside it. A grant to a role named `we"ird` is printed
+ *
+ *     {..., "\\"we\\"\\"ird\\"=c/dbowner", ...}
+ *
+ * and the old parser, which toggled on every `"` and discarded it, read that as a grantee called
+ * `\\weird\\` — a role that does not exist. The two ways that goes wrong are both live: a fence
+ * that aborts on a reconstructed role nobody can revoke from, and — where the reconstructed name
+ * happens to name a REAL role — a revoke aimed at the wrong one while the actual grantee keeps
+ * CONNECT straight through the migration window. `comma,role` is worse still: the escaped inner
+ * quotes desynchronise the toggle, so the element splits at its own comma into two entries.
+ *
+ * THE FIX IS NOT A BETTER PARSER. PostgreSQL already holds this structure and will hand it over:
+ * `aclexplode()` returns one row per (grantor, grantee, privilege) with the grantee as an OID, so
+ * there is no text to quote and nothing to unquote. The name comes back from
+ * `pg_get_userbyid()`, which is the catalogue's own answer and carries no escaping at all.
+ *
+ * AND `COALESCE(datacl, acldefault('d', datdba))`, WHICH IS THE OTHER HALF OF THE SAME MOVE. A
+ * NULL `datacl` does not mean "no privileges", it means "nobody has changed the defaults" — and
+ * the defaults grant CONNECT and TEMPORARY to PUBLIC and everything to the owner. The old
+ * readers knew that and each spelt the rule out for itself in JavaScript; `acldefault()` is
+ * where the rule actually lives, so it is asked instead of restated.
+ *
+ * THE OID IS CARRIED, NOT JUST THE NAME. Grantee 0 is PUBLIC, which is not a role and can never
+ * be one; comparing the printed name alone would confuse it with a role somebody created and
+ * called "PUBLIC".
  */
-export function parseAclEntries(datacl) {
-  const text = String(datacl ?? '').trim().replace(/^\{/, '').replace(/\}$/, '')
-  if (!text) return []
+export const DATACL_PRIVILEGES_SQL = `(SELECT COALESCE(json_agg(json_build_object(
+                'grantee_oid', a.grantee::text,
+                'grantee', CASE WHEN a.grantee = 0 THEN '' ELSE pg_catalog.pg_get_userbyid(a.grantee) END,
+                'privilege', a.privilege_type)), '[]'::json)
+           FROM pg_catalog.aclexplode(COALESCE(d.datacl, pg_catalog.acldefault('d', d.datdba))) a)`
 
-  const entries = []
-  let current = ''
-  let quoted = false
-  for (let index = 0; index < text.length; index += 1) {
-    const character = text[index]
-    if (character === '"') {
-      quoted = !quoted
-      continue
-    }
-    if (character === ',' && !quoted) {
-      entries.push(current)
-      current = ''
-      continue
-    }
-    current += character
+/**
+ * Pure: the rows DATACL_PRIVILEGES_SQL returns, normalised, with PUBLIC identified by its OID.
+ *
+ * `null`/`undefined` is NOT "the defaults" here and must never be read as them: the SQL above
+ * resolves the defaults server-side and cannot return null, so an absent value means the row was
+ * not there to read — a database that is gone, or a fixture that answered a question nobody
+ * asked. Every caller treats the empty list as "no privilege is known to be held", which fails
+ * towards refusing rather than towards granting.
+ *
+ * Anything that is neither absent nor an array THROWS. A shape this cannot read is not a shape
+ * it may summarise as "no privileges": that is the exact substitution this round removes.
+ */
+export function aclPrivilegeRows(privileges) {
+  if (privileges === null || privileges === undefined) return []
+  if (!Array.isArray(privileges)) {
+    throw new TypeError(
+      `the database ACL was expected as rows from aclexplode() and arrived as ${typeof privileges}. ` +
+        'It is not read as "no privileges": a shape this cannot read says nothing about who holds CONNECT.',
+    )
   }
-  entries.push(current)
+  return privileges.map((row) => ({
+    granteeOid: Number(row?.grantee_oid ?? row?.granteeOid ?? -1),
+    grantee: String(row?.grantee ?? ''),
+    privilege: String(row?.privilege ?? row?.privilege_type ?? ''),
+  }))
+}
 
-  return entries
-    .filter((entry) => entry.length > 0)
-    .map((entry) => {
-      const slash = entry.lastIndexOf('/')
-      const body = slash === -1 ? entry : entry.slice(0, slash)
-      const equals = body.indexOf('=')
-      return {
-        grantee: equals === -1 ? body : body.slice(0, equals),
-        privileges: equals === -1 ? '' : body.slice(equals + 1),
-      }
-    })
+/** Pure: does one aclexplode row grant CONNECT to `grantee` (PUBLIC being grantee OID 0)? */
+function rowGrantsConnect(row, grantee) {
+  if (row.privilege !== 'CONNECT') return false
+  return grantee === PUBLIC_GRANTEE ? row.granteeOid === 0 : row.granteeOid !== 0 && row.grantee === grantee
 }
 
 /**
  * Pure: did `grantee` hold CONNECT before we touched anything?
  *
- * A NULL datacl is not "no privileges" — it is "the defaults", which grant CONNECT to
- * PUBLIC and everything to the owner. Reading NULL as empty is how a restore ends up
- * granting nothing back.
+ * The defaults a NULL `datacl` stands for are already expanded by the SQL, so there is no
+ * client-side special case for them and no owner argument to get wrong.
  */
-export function granteeHasConnect(datacl, ownerRole, grantee) {
-  const isPublic = grantee === PUBLIC_GRANTEE
-  if (datacl === null || datacl === undefined || String(datacl).trim() === '') {
-    return isPublic || grantee === ownerRole
-  }
-  return parseAclEntries(datacl).some((entry) => {
-    const matches = isPublic ? entry.grantee === '' : entry.grantee === grantee
-    return matches && entry.privileges.includes('c')
-  })
+export function granteeHasConnect(privileges, grantee) {
+  return aclPrivilegeRows(privileges).some((row) => rowGrantsConnect(row, grantee))
 }
 
 /**
  * Pure: every named role holding CONNECT DIRECTLY on the database.
  *
  * PUBLIC is deliberately NOT in this list — it is not a role and the caller handles it
- * separately. A NULL datacl means "the defaults", which grant CONNECT to PUBLIC and
- * everything to the owner, so the owner is the only named grantee there.
+ * separately. Where the database still carries its default ACL the owner is the only named
+ * grantee, and that now falls out of `acldefault()` in the SQL rather than being asserted here.
  *
  * This is what turns "revoke from the two grantees we thought of" into "revoke from whatever
  * the database says holds it": a monitoring or BI role with its own grant is otherwise
  * terminated by the drain and back a moment later (o3d-2sm1.5).
  */
-export function listDirectConnectGrantees(datacl, ownerRole) {
-  if (datacl === null || datacl === undefined || String(datacl).trim() === '') {
-    return ownerRole ? [ownerRole] : []
-  }
+export function listDirectConnectGrantees(privileges) {
   const seen = []
-  for (const entry of parseAclEntries(datacl)) {
-    if (entry.grantee === '' || !entry.privileges.includes('c')) continue
-    if (!seen.includes(entry.grantee)) seen.push(entry.grantee)
+  for (const row of aclPrivilegeRows(privileges)) {
+    if (row.granteeOid === 0 || row.privilege !== 'CONNECT' || row.grantee === '') continue
+    if (!seen.includes(row.grantee)) seen.push(row.grantee)
   }
   return seen
 }
@@ -1014,9 +1037,15 @@ export function buildGrantStatements(database, grantees) {
   return grantees.map((grantee) => `GRANT CONNECT ON DATABASE ${quoteIdent(database)} TO ${grantee === PUBLIC_GRANTEE ? 'PUBLIC' : quoteIdent(grantee)};`)
 }
 
-/** Pure: the fence is released only when every grantee it revoked holds CONNECT again. */
-export function verifyRelease(datacl, ownerRole, grantees) {
-  const missing = grantees.filter((grantee) => !granteeHasConnect(datacl, ownerRole, grantee))
+/**
+ * Pure: the fence is released only when every grantee it revoked holds CONNECT again.
+ *
+ * o3d-secops r28: an ACL that could not be read comes through as the empty list, so a database
+ * the verification query found no row for reports every grantee MISSING rather than reporting
+ * the owner and PUBLIC restored on the strength of a NULL that was never there.
+ */
+export function verifyRelease(privileges, grantees) {
+  const missing = grantees.filter((grantee) => !granteeHasConnect(privileges, grantee))
   return { released: missing.length === 0, missing }
 }
 
@@ -1386,6 +1415,14 @@ export function assessAuthorityDrift({ authorised, current, mode }) {
 // ---------------------------------------------------------------------------
 
 /** Every recorded grantee still holds CONNECT: no fence took it away, so none is standing. */
+/**
+ * o3d-secops r28: the three answers compareClusterIdentity() gives. `unproven` is deliberately
+ * not spelt the same as `mismatch` anywhere a caller branches on it.
+ */
+export const CLUSTER_IDENTITY_PROVEN = 'proven'
+export const CLUSTER_IDENTITY_UNPROVEN = 'unproven'
+export const CLUSTER_IDENTITY_MISMATCH = 'mismatch'
+
 export const LEGACY_FENCE_ABSENT = 'absent'
 /**
  * Not one recorded grantee holds CONNECT. What a standing fence looks like -- and equally what an
@@ -1421,6 +1458,108 @@ export function assessLegacyFenceEvidence({ recorded, holding }) {
   return { verdict: LEGACY_FENCE_AMBIGUOUS, holding: stillHolding, lost, recorded: named }
 }
 
+/**
+ * WHICH CLUSTER IS ON THE OTHER END OF THIS CONNECTION (o3d-secops r28, Codex HIGH).
+ *
+ * THE DEFECT THIS ANSWERS. Every mode binds its identity by comparing the HOST, PORT and
+ * DATABASE NAME the invocation names against the URL it opened and the database it landed on.
+ * A name is not a cluster. DNS, a connection proxy, or a failover that re-pointed a CNAME can
+ * put that same name in front of a DIFFERENT server whose database is also called `imsdb` and
+ * whose roles are also called `imsapp` — and then every value the gate compares still matches
+ * while the ACL being read belongs to somebody else. `--audit-authority` is where that costs
+ * the most: an unfenced bystander cluster reads as `absent`, and the wrapper acting on it
+ * DELETES the sole record of a fence standing on the real one.
+ *
+ * WHAT WAS CHOSEN, AND WHAT WAS NOT.
+ *
+ *   system_identifier          THE IDENTITY. `pg_control_system()` reports the 64-bit value
+ *                              initdb stamps into pg_control. It is fixed for the life of the
+ *                              cluster, identical on every backend, survives restarts, and is
+ *                              inherited by a streaming replica — which is the RIGHT answer
+ *                              here, because a promoted standby IS the same cluster's data and
+ *                              a fence recorded against the primary describes its ACL too.
+ *                              Two clusters that both host a database called `imsdb` have
+ *                              different ones, which is exactly the case above.
+ *
+ *   pg_database.oid            THE SECOND HALF, and public where the first may not be. It
+ *                              separates a same-named database DROPPED AND RECREATED inside
+ *                              one cluster from the one the record was written for; the
+ *                              system identifier cannot see that at all.
+ *
+ *   pg_postmaster_start_time() NOT AN IDENTITY, and it is not used as one. It changes on every
+ *                              restart, so an ordinary `systemctl restart postgresql` between
+ *                              the fence and the audit would read as "a different cluster" and
+ *                              a record would be refused for a reason that is not true. It is
+ *                              a same-INSTANCE check, which is what --release already uses it
+ *                              for across its two connections, and it is REPORTED here as
+ *                              context and never compared.
+ *
+ *   inet_server_addr()/port()  NOT AN IDENTITY EITHER. They describe the transport: NULL over a
+ *                              unix socket (verified on PostgreSQL 17), one of several on a
+ *                              multi-homed host, and — the point — perfectly stable across
+ *                              precisely the proxy and failover routing this defect is about.
+ *                              Reported, never compared.
+ *
+ * AND IT IS READ IN A QUERY OF ITS OWN, BECAUSE IT MAY BE REFUSED. EXECUTE on
+ * `pg_control_system()` is revoked from PUBLIC and granted to roles an installation chooses; a
+ * database-owner admin can therefore be told no. Folded into the main SELECT that refusal would
+ * take every other fact down with it, so it is asked separately and a denial is recorded as
+ * "unavailable" with the server's own reason. An unavailable identity is never treated as a
+ * matching one — see the gate in doAuditAuthority().
+ */
+export async function readClusterIdentity(client) {
+  const identity = { systemIdentifier: '', unavailable: '' }
+  try {
+    const { rows } = await client.query(
+      'SELECT system_identifier::text AS system_identifier FROM pg_catalog.pg_control_system()',
+    )
+    identity.systemIdentifier = String(rows[0]?.system_identifier ?? '')
+  } catch (error) {
+    identity.unavailable = String(error?.message ?? error)
+  }
+  return identity
+}
+
+/**
+ * Pure: may the record in hand and the connection in hand be shown to be the same cluster?
+ *
+ * Three answers and they are not two. `mismatch` is POSITIVE evidence of the wrong cluster and
+ * every caller refuses on it. `unproven` is the absence of evidence — a record written before
+ * this round, or a server that would not report its identity — and callers must not act on it
+ * as though it were `proven`; that distinction is the whole finding.
+ */
+export function compareClusterIdentity(recorded, live) {
+  const recordedSystem = typeof recorded?.cluster_system_identifier === 'string' ? recorded.cluster_system_identifier : ''
+  const recordedOid = typeof recorded?.cluster_database_oid === 'string' ? recorded.cluster_database_oid : ''
+  const liveSystem = typeof live?.systemIdentifier === 'string' ? live.systemIdentifier : ''
+  const liveOid = typeof live?.databaseOid === 'string' ? live.databaseOid : ''
+  if (recordedSystem && liveSystem && recordedSystem !== liveSystem) {
+    return {
+      status: CLUSTER_IDENTITY_MISMATCH,
+      reason: `the record was written against the cluster whose system identifier is ${recordedSystem}, and this connection is attached to the cluster ${liveSystem}. Those are two different PostgreSQL clusters that both hold a database of this name.`,
+    }
+  }
+  if (recordedOid && liveOid && recordedOid !== liveOid) {
+    return {
+      status: CLUSTER_IDENTITY_MISMATCH,
+      reason: `the record was written against the database with OID ${recordedOid} and this connection is attached to the database with OID ${liveOid}. The name is the same and the database is not: one was dropped and recreated.`,
+    }
+  }
+  if (recordedSystem && liveSystem && recordedOid && liveOid) {
+    return { status: CLUSTER_IDENTITY_PROVEN, reason: `system identifier ${liveSystem}, database OID ${liveOid}` }
+  }
+  if (!recordedSystem || !recordedOid) {
+    return {
+      status: CLUSTER_IDENTITY_UNPROVEN,
+      reason: 'the record carries no cluster fingerprint at all. It was published by a validator that predates one, so nothing in it can be compared with the cluster that just answered.',
+    }
+  }
+  return {
+    status: CLUSTER_IDENTITY_UNPROVEN,
+    reason: `this connection would not report its own cluster identity${live?.unavailable ? ` (${live.unavailable})` : ''}, so the fingerprint the record carries has nothing to be compared against.`,
+  }
+}
+
 async function readFacts(client, appRole) {
   const { rows } = await client.query(
     `SELECT current_database()                                  AS database,
@@ -1435,7 +1574,19 @@ async function readFacts(client, appRole) {
             -- is checked against the login role, so this is the one the identity gate binds.
             session_user                                        AS admin_login_role,
             pg_catalog.pg_get_userbyid(d.datdba)                AS owner_role,
+            -- KEPT, AND NEVER PARSED (o3d-secops r28). This is what the record carries as
+            -- datacl_before: a human-readable note of what the ACL looked like before the
+            -- fence, for an operator reading the file. Every DECISION below is taken from the
+            -- rows beside it; see DATACL_PRIVILEGES_SQL for why the printed form is not
+            -- something this program may take apart.
             d.datacl::text                                      AS datacl,
+            ${DATACL_PRIVILEGES_SQL}                                  AS datacl_privileges,
+            -- THE CLUSTER FINGERPRINT'S PUBLIC HALF (o3d-secops r28, Codex HIGH). The OID
+            -- separates a same-named database that was dropped and recreated from the one a
+            -- record was written for, and unlike pg_control_system() it is readable by anyone.
+            d.oid::text                                         AS database_oid,
+            COALESCE(inet_server_addr()::text, '')              AS server_addr,
+            COALESCE(inet_server_port()::text, '')              AS server_port,
             (SELECT rolsuper FROM pg_roles WHERE rolname = current_user) AS admin_is_superuser,
             (SELECT rolsuper FROM pg_roles WHERE rolname = $1)   AS app_role_is_superuser,
             (SELECT count(*)::int FROM pg_roles WHERE rolname = $1) AS app_role_exists,
@@ -1450,7 +1601,13 @@ async function readFacts(client, appRole) {
       WHERE d.datname = current_database()`,
     [appRole],
   )
-  return rows[0]
+  const facts = rows[0]
+  if (facts) {
+    const cluster = await readClusterIdentity(client)
+    facts.cluster_system_identifier = cluster.systemIdentifier
+    facts.cluster_identity_unavailable = cluster.unavailable
+  }
+  return facts
 }
 
 /**
@@ -1509,10 +1666,10 @@ async function assessFence(client, appRole) {
     adminRole: facts.admin_role,
     adminIsSuperuser: facts.admin_is_superuser === true,
     adminIsOwner: facts.admin_role === facts.owner_role,
-    publicHasConnect: granteeHasConnect(facts.datacl, facts.owner_role, PUBLIC_GRANTEE),
-    appRoleHasConnect: granteeHasConnect(facts.datacl, facts.owner_role, appRole),
+    publicHasConnect: granteeHasConnect(facts.datacl_privileges, PUBLIC_GRANTEE),
+    appRoleHasConnect: granteeHasConnect(facts.datacl_privileges, appRole),
     appRoleHasEffectiveConnect: effective.stillConnects,
-    directConnectGrantees: listDirectConnectGrantees(facts.datacl, facts.owner_role),
+    directConnectGrantees: listDirectConnectGrantees(facts.datacl_privileges),
   })
   const role = assessMigrationRole({
     adminRole: facts.admin_role,
@@ -1737,6 +1894,35 @@ async function assessFenceRequest(client, options, prefix) {
     return { exitCode: EXIT_NOT_FENCEABLE }
   }
 
+  // AND A RECORD FROM ANOTHER CLUSTER IS NOT THIS CLUSTER'S RECORD EITHER (o3d-secops r28, Codex
+  // HIGH). The check above compares the database NAME, which two clusters can satisfy at once --
+  // that is the whole finding. Where the record carries a fingerprint and this connection reports
+  // one, a DISAGREEMENT is positive evidence and is refused: re-applying that record's grantee
+  // list here would revoke CONNECT on a cluster its fence was never raised on, and would then
+  // republish over the only account of the fence still standing on the other one.
+  //
+  // ABSENCE IS NOT DISAGREEMENT and is deliberately not refused here. Every record written before
+  // this round carries no fingerprint, and refusing those would break the re-fence path for every
+  // existing installation on the strength of no evidence at all. What absence costs is spelt out
+  // where it is actually dangerous -- doAuditAuthority(), where the action on the reading is a
+  // DELETE -- and there it withholds the automatic path instead.
+  if (existing) {
+    const sameCluster = compareClusterIdentity(existing, {
+      systemIdentifier: facts.cluster_system_identifier,
+      databaseOid: facts.database_oid,
+      unavailable: facts.cluster_identity_unavailable,
+    })
+    if (sameCluster.status === CLUSTER_IDENTITY_MISMATCH) {
+      console.error(`${prefix}: the fence record at ${options.stateFile} was written against a DIFFERENT PostgreSQL cluster from the one this connection reached.`)
+      console.error(`  ${sameCluster.reason}`)
+      console.error('The database NAME matches, which is why every other check passes; the server does not. Re-applying')
+      console.error('that record here would revoke CONNECT on a cluster its fence was never raised on, and would')
+      console.error('overwrite the only account of the fence that may still be standing on the other one.')
+      console.error('Nothing has been revoked. Point DEPLOY_ADMIN_DATABASE_URL at the cluster the record names.')
+      return { exitCode: EXIT_NOT_FENCEABLE }
+    }
+  }
+
   return { facts, appRole, freshPlan, existing }
 }
 
@@ -1786,6 +1972,14 @@ export async function doPlan(client, options) {
     admin_role: facts.admin_role,
     revoked,
     datacl_before: (existing ? existing.datacl_before : facts.datacl) ?? null,
+    // THE CLUSTER THIS FENCE IS BEING RAISED ON, WRITTEN DOWN (o3d-secops r28, Codex HIGH). Taken
+    // LIVE and not carried over from `existing`: the fence about to be applied is applied to the
+    // cluster this connection is attached to, and assessFenceRequest() has already refused the
+    // case where a record disagrees with it. An empty string becomes null rather than "" so that
+    // "this server would not say" and "a validator that predates the field" read identically to
+    // every consumer -- both are the absence of evidence and neither may be compared as a match.
+    cluster_system_identifier: facts.cluster_system_identifier || null,
+    cluster_database_oid: facts.database_oid || null,
     fenced_at: existing?.fenced_at || new Date().toISOString(),
   }
   process.stdout.write(`${JSON.stringify(record)}\n`)
@@ -2247,6 +2441,35 @@ export async function doRelease(client, options) {
     return EXIT_ERROR
   }
 
+  // AND IT IS NOT ANOTHER CLUSTER'S RECORD (o3d-secops r28, Codex HIGH). Everything below is a
+  // GRANT CONNECT built out of this record. The name check above is satisfied by any cluster
+  // hosting a database of that name, so where the record carries a fingerprint and this
+  // connection reports one, a DISAGREEMENT stops the release before a single GRANT: handing
+  // CONNECT back to a list of roles chosen for somebody else's ACL is how a role an
+  // administrator deliberately revoked here gets it back.
+  //
+  // ONLY ON A MISMATCH. A record with no fingerprint is every record written before this round,
+  // and the release is the escape hatch every refusal in this file points an operator at -- a
+  // gate that closed it on the absence of evidence would strand them.
+  const releaseCluster = await readClusterIdentity(client)
+  const { rows: releaseDatabase } = await client.query(
+    'SELECT oid::text AS database_oid FROM pg_database WHERE datname = current_database()',
+  )
+  const releaseIdentity = compareClusterIdentity(state, {
+    systemIdentifier: releaseCluster.systemIdentifier,
+    databaseOid: releaseDatabase[0]?.database_oid ?? '',
+    unavailable: releaseCluster.unavailable,
+  })
+  if (releaseIdentity.status === CLUSTER_IDENTITY_MISMATCH) {
+    console.error(`NOT RELEASED: the fence record at ${options.stateFile} was written against a DIFFERENT PostgreSQL cluster from the one this connection reached.`)
+    console.error(`  ${releaseIdentity.reason}`)
+    console.error('The database name is the same on both, which is why every other check passes. Granting CONNECT')
+    console.error('here would hand database access to a list of roles chosen for another server\'s ACL, and would')
+    console.error('leave the fence this record describes standing where it actually is.')
+    console.error('Nothing has been granted. Point DEPLOY_ADMIN_DATABASE_URL at the cluster the record names.')
+    return EXIT_ERROR
+  }
+
   const grants = buildGrantStatements(state.database, state.revoked)
   for (const statement of grants) {
     await client.query(statement)
@@ -2254,11 +2477,11 @@ export async function doRelease(client, options) {
   }
 
   const { rows } = await client.query(
-    `SELECT d.datacl::text AS datacl, pg_catalog.pg_get_userbyid(d.datdba) AS owner_role
+    `SELECT ${DATACL_PRIVILEGES_SQL} AS datacl_privileges, pg_catalog.pg_get_userbyid(d.datdba) AS owner_role
        FROM pg_database d WHERE d.datname = $1`,
     [state.database],
   )
-  const check = verifyRelease(rows[0]?.datacl, rows[0]?.owner_role, state.revoked)
+  const check = verifyRelease(rows[0]?.datacl_privileges, state.revoked)
   if (!check.released) {
     console.error(`Release did NOT take: ${check.missing.join(', ')} still lack CONNECT on ${state.database}.`)
     console.error('Run this by hand as a superuser before starting the application:')
@@ -2308,15 +2531,20 @@ export async function doAuditAuthority(client, options) {
             session_user                              AS audited_login_role,
             current_user                              AS audited_effective_role,
             pg_catalog.pg_get_userbyid(d.datdba)      AS audited_owner_role,
-            d.datacl::text                            AS audited_datacl
+            -- THE ACL AS ROWS (o3d-secops r28, Codex HIGH). This mode used to take
+            -- d.datacl::text and take it apart by hand, which cannot read PostgreSQL's own
+            -- escaping of a quoted role name; see DATACL_PRIVILEGES_SQL. Every grantee decision
+            -- below is taken from these rows and there is no text form here to be tempted by.
+            ${DATACL_PRIVILEGES_SQL}  AS audited_datacl_privileges,
+            -- AND THE HALF OF THE CLUSTER FINGERPRINT ANY ROLE MAY READ (o3d-secops r28).
+            d.oid::text                               AS audited_database_oid
        FROM pg_database d
       WHERE d.datname = current_database()`,
   )
   const connectedDatabase = audited[0]?.audited_database ?? ''
   const connectedLoginRole = audited[0]?.audited_login_role ?? ''
   const connectedEffectiveRole = audited[0]?.audited_effective_role ?? ''
-  const ownerRole = audited[0]?.audited_owner_role ?? ''
-  const datacl = audited[0]?.audited_datacl ?? null
+  const privileges = audited[0]?.audited_datacl_privileges ?? null
 
   // THE IDENTITY GATE EVERY OTHER CONNECTING MODE PASSES THROUGH, AND IT WAS MISSING FROM THIS ONE
   // (o3d-secops r27, Codex HIGH). This mode bound the DATABASE NAME and nothing else: it compared
@@ -2371,13 +2599,57 @@ export async function doAuditAuthority(client, options) {
     return EXIT_ERROR
   }
 
+  // A HOSTNAME IS NOT A CLUSTER IDENTITY (o3d-secops r28, Codex HIGH 1).
+  //
+  // WHAT r27 LEFT STANDING. The gate above binds the argv, the URL and the connection to one
+  // HOST, PORT and DATABASE NAME, and r27 said in as many words that this does not prove which
+  // SERVER answered. It then went on clearing the record automatically on an `absent` reading.
+  // That is the arm that DELETES: DNS, a connection proxy or a failover that re-pointed a name
+  // puts an unfenced bystander cluster behind the same host:port/imsdb, every recorded grantee
+  // still holds CONNECT there because nothing ever fenced it, the verdict is `absent`, and root
+  // removes the sole authority for a fence standing on the real cluster -- after which the
+  // release wrapper has no grantee list to restore from and nothing can take that fence down
+  // automatically. Documenting the limitation did not make the clear safe.
+  //
+  // SO THE IDENTITY IS ASKED OF THE SERVER, AND THE ANSWER IS ONE OF THREE.
+  //
+  //   mismatch   POSITIVE EVIDENCE of the wrong cluster. Refused here, with no verdict line at
+  //              all, so the wrapper -- which acts only on a status and a verdict that agree --
+  //              leaves the record byte for byte as it found it.
+  //   proven     the record's fingerprint and this connection's agree on both halves. The
+  //              reading below is a reading of the cluster the record was written against.
+  //   unproven   THE ABSENCE OF EVIDENCE, and it is not spelt the same as `proven` anywhere.
+  //              A LEGACY RECORD IS ALWAYS THIS, by definition: it was published by a validator
+  //              that predates the field, so there is nothing in it to compare. This mode still
+  //              does its whole read and still prints its verdict -- the evidence is worth
+  //              having and an operator can act on it -- but it says `unproven` on stdout beside
+  //              the verdict, and the wrapper will not DELETE on an unproven reading without an
+  //              operator saying so. Refusing beats deleting: a record left alone keeps every
+  //              automatic path refusing, which is recoverable, and a record deleted in error
+  //              destroys the only thing the release wrapper can restore from.
+  const liveCluster = await readClusterIdentity(client)
+  const clusterIdentity = compareClusterIdentity(state, {
+    systemIdentifier: liveCluster.systemIdentifier,
+    databaseOid: audited[0]?.audited_database_oid ?? '',
+    unavailable: liveCluster.unavailable,
+  })
+  if (clusterIdentity.status === CLUSTER_IDENTITY_MISMATCH) {
+    console.error(`NOT AUDITED: the authority at ${options.stateFile} was written against a DIFFERENT PostgreSQL cluster from the one this connection reached.`)
+    console.error(`  ${clusterIdentity.reason}`)
+    console.error('The database is called the same thing on both, which is why the host, port, database and role')
+    console.error('checks above all passed. The ACL this run would read is the other cluster\'s, and an answer')
+    console.error('about the other cluster is what makes root delete this one\'s record. Nothing has been read')
+    console.error('from the ACL and nothing has been changed.')
+    return EXIT_ERROR
+  }
+
   // WHICH OF THE RECORDED GRANTEES STILL HOLD CONNECT, asked as the inverse of the statement the
   // fence issues: `REVOKE CONNECT ON DATABASE <db> FROM <grantee>` takes the DIRECT grant, so the
   // direct grant is what is looked for. has_database_privilege() would answer a different question
   // — it counts membership and the superuser bit, neither of which a fence removes — and a role
   // that keeps CONNECT that way would be read as "the fence did not run".
   const recorded = Array.isArray(state.revoked) ? state.revoked : []
-  const holding = recorded.filter((grantee) => granteeHasConnect(datacl, ownerRole, grantee))
+  const holding = recorded.filter((grantee) => granteeHasConnect(privileges, grantee))
   const evidence = assessLegacyFenceEvidence({ recorded, holding })
 
   console.error(`The authority at ${options.stateFile} names ${evidence.recorded.length} grantee${evidence.recorded.length === 1 ? '' : 's'} on ${state.database}: ${evidence.recorded.join(', ') || '<none>'}.`)
@@ -2409,6 +2681,21 @@ export async function doAuditAuthority(client, options) {
     console.error('half applied and an administrator who removed one of these roles by hand look identical from')
     console.error('here, and this mode does not guess between them. NOTHING may be concluded.')
   }
+  // WHAT THE CLUSTER GATE CONCLUDED, ON THE MACHINE CHANNEL BESIDE THE VERDICT (o3d-secops r28).
+  // Two facts, two lines, and the caller reads BOTH: the verdict says what the ACL shows and this
+  // says whether the ACL that was read can be shown to belong to the cluster the record names.
+  // A wrapper that saw only the verdict would go on deleting on the strength of a reading it
+  // cannot attribute, which is the finding.
+  if (clusterIdentity.status === CLUSTER_IDENTITY_PROVEN) {
+    console.error(`The cluster this reading came from IS the cluster the record was written against (${clusterIdentity.reason}).`)
+  } else {
+    console.error('AND WHICH CLUSTER THIS READING CAME FROM IS NOT PROVEN:')
+    console.error(`  ${clusterIdentity.reason}`)
+    console.error('The host, port, database name and role all match, and two servers can satisfy all four at once.')
+    console.error('The reading above is therefore evidence about whatever server answered, and nothing here can')
+    console.error('show that it is the one this record was written against.')
+  }
+  process.stdout.write(`legacy_fence_cluster=${clusterIdentity.status}\n`)
   process.stdout.write(`legacy_fence_verdict=${evidence.verdict}\n`)
   if (evidence.verdict === LEGACY_FENCE_ABSENT) return EXIT_OK
   if (evidence.verdict === LEGACY_FENCE_STANDS) return EXIT_FENCE_STANDING
