@@ -1829,6 +1829,12 @@ db_fence_clear_authority() {
   # all -- adopt_db_connections() takes that path deliberately -- and a gate that turned an absent
   # file into a refusal would stop a recovery on the one state that needs no decision at all.
   [[ -e "${destination}" || -L "${destination}" ]] || return 0
+  if [[ "${attestation}" != "raised-by-this-run" ]]; then
+    echo "NOT REMOVING ${destination}: this run did not raise the fence that record describes, so it cannot show that the server it just released is the server the record was written against." >&2
+    echo "A copy of a fenced cluster -- a base backup, a restored snapshot, a staging clone reachable at the same name -- carries the fence with it and answers a release exactly as the original does; nothing readable separates the two. Removing the record here would destroy the only account of what a fence still standing on the real server revoked." >&2
+    echo "The grants this run issued are unaffected and are safe to repeat. What is left is the record, and it is ended by a person: run ${DB_FENCE_SUDO_PREFIX}${DB_FENCE_RELEASE_WRAPPER} as root, which reaches the same answer and then offers to remove it once, after a token derived from that record's exact bytes is typed at your terminal." >&2
+    return 2
+  fi
   # AND THE SECOND HALF OF THE ATTESTATION: WHICH SERVER (o3d-secops r31, Codex HIGH 1).
   #
   # r30 asked only whether THIS RUN raised the fence, which is a fact about this PROCESS. A process
@@ -1851,12 +1857,7 @@ db_fence_clear_authority() {
   if [[ "${server}" != "same-server-as-the-fence" && "${server}" != "nothing-was-revoked" ]]; then
     echo "NOT REMOVING ${destination}: nothing here can show that the server this run released is the server the record was written against, so the record is kept." >&2
     echo "A release runs on a connection, and a connection is what DNS, a pooler or a failover re-points; the fence and the release are two of them. This run held no connection witness across the pair, or the release's own connection could not see one -- so \"this run raised a fence\" is all that is known, and that is a fact about this process rather than about a server." >&2
-    echo "The grants this run issued are unaffected and are safe to repeat. What is left is the record, and it is ended by a person: run ${DB_FENCE_SUDO_PREFIX}${DB_FENCE_RELEASE_WRAPPER} as root, which reaches the same answer and then offers to remove it once, after a token derived from that record's exact bytes is typed at your terminal." >&2
-    return 2
-  fi
-  if [[ "${attestation}" != "raised-by-this-run" ]]; then
-    echo "NOT REMOVING ${destination}: this run did not raise the fence that record describes, so it cannot show that the server it just released is the server the record was written against." >&2
-    echo "A copy of a fenced cluster -- a base backup, a restored snapshot, a staging clone reachable at the same name -- carries the fence with it and answers a release exactly as the original does; nothing readable separates the two. Removing the record here would destroy the only account of what a fence still standing on the real server revoked." >&2
+    echo "A copy of a fenced cluster -- a base backup, a restored snapshot, a staging clone reachable at the same name -- answers a release exactly as the original does, so removing the record here could destroy the only account of what a fence still standing on the real server revoked." >&2
     echo "The grants this run issued are unaffected and are safe to repeat. What is left is the record, and it is ended by a person: run ${DB_FENCE_SUDO_PREFIX}${DB_FENCE_RELEASE_WRAPPER} as root, which reaches the same answer and then offers to remove it once, after a token derived from that record's exact bytes is typed at your terminal." >&2
     return 2
   fi

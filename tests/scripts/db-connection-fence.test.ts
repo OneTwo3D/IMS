@@ -93,6 +93,11 @@ import {
   CLUSTER_IDENTITY_NO_FINGERPRINT,
   CLUSTER_IDENTITY_UNVERIFIABLE,
   parseRoleFromConnectionString,
+  // o3d-secops r31: the connection witness -- its key derivation, the observation both --fence and
+  // --release make on their own connections, and where a witness is sent so the drain misses it.
+  advisoryKeyForWitnessNonce,
+  witnessLockIsHeld,
+  witnessConnectionStrings,
   planConnectionFence,
   quoteIdent,
   verifyRelease,
@@ -3822,8 +3827,20 @@ test('o3d-2sm1.5 r19/r32: the four options are parsed, and no file is read from 
     // invocation of this file is composed by a root-owned script or a root-owned wrapper, so the
     // safe value is the one a caller gets without asking; `--state-owner` exists so an
     // unprivileged harness can exhibit the mechanism.
-    { mode: 'release', stateFile: '/x', stateOwnerUid: 0, appRole: '', timeoutSeconds: 30, appHost: 'db.internal', appPort: '6432', appUser: 'imsapp', appDatabase: 'imsdb' },
+    // o3d-secops r31: and the three witness nonces, which every mode defaults to '' and every
+    // mode given '' behaves on exactly as it did before that round.
+    { mode: 'release', stateFile: '/x', stateOwnerUid: 0, appRole: '', timeoutSeconds: 30, appHost: 'db.internal', appPort: '6432', appUser: 'imsapp', appDatabase: 'imsdb',
+      witnessNonce: '', witnessLock: '', witnessChallenge: '' },
   )
+  // AND THE THREE ARE READ WHEN THEY ARE GIVEN (o3d-secops r31). MUTATION ROUTE: drop any of the
+  // three `--witness-*` arms from parseArgs() and the matching field stays '' here.
+  assert.deepEqual(
+    (({ witnessNonce, witnessLock, witnessChallenge }) => ({ witnessNonce, witnessLock, witnessChallenge }))(
+      parseArgs(['--witness', '--witness-nonce=' + 'a'.repeat(32), '--witness-lock=' + 'b'.repeat(32), '--witness-challenge=' + 'c'.repeat(32)]),
+    ),
+    { witnessNonce: 'a'.repeat(32), witnessLock: 'b'.repeat(32), witnessChallenge: 'c'.repeat(32) },
+  )
+  assert.equal(parseArgs(['--witness']).mode, 'witness', 'and --witness is a mode of its own')
   // And nothing remains that would take a unit name or a systemctl path.
   const withUnit = parseArgs(['--fence', '--service-unit=one-two-inventory.service', '--systemctl=/x/systemctl']) as Record<string, unknown>
   assert.equal(withUnit.serviceUnits, undefined, 'no unit is interrogated any more')
@@ -5785,13 +5802,15 @@ test('a release against a copy taken AFTER the fence still cannot end the record
     // THE GATE. Root asks a question the database cannot answer -- did THIS RUN raise the fence it
     // just released -- and without that answer it removes nothing.
     const CLEAR = shellFunction(FENCE_LIBRARY, 'db_fence_clear_authority')
-    const clear = (attestation: string) => spawnSync('bash', ['-c', [
+    // o3d-secops r31: the removal takes TWO answers now -- WHO raised it, and WHICH SERVER was
+    // released -- so this helper passes both and the assertions below say which one is under test.
+    const clear = (attestation: string, server = 'same-server-as-the-fence') => spawnSync('bash', ['-c', [
       'set -uo pipefail',
       'exec 2>&1',
       'DB_FENCE_SUDO_PREFIX=""',
       'DB_FENCE_RELEASE_WRAPPER="/opt/cutover/release-db-fence"',
       CLEAR,
-      `db_fence_clear_authority ${JSON.stringify(stateFile)} ${JSON.stringify(attestation)}`,
+      `db_fence_clear_authority ${JSON.stringify(stateFile)} ${JSON.stringify(attestation)} ${JSON.stringify(server)}`,
       'echo "RC=$?"',
     ].join('\n')], { encoding: 'utf8' })
 
@@ -5803,9 +5822,20 @@ test('a release against a copy taken AFTER the fence still cannot end the record
     assert.match(unattested.stdout, /base backup|restored snapshot|staging clone/,
       `and the refusal must say what it may be looking at:\n${unattested.stdout}`)
 
-    // AND THE GUARD IS NOT A BAN. With the attestation the removal happens, so a passing test
-    // above cannot be a function that refuses everything.
-    const attested = clear('raised-by-this-run')
+    // AND THE SECOND HALF OF THE SAME REFUSAL (o3d-secops r31, Codex HIGH 1). r30 stopped here, with
+    // "this run raised a fence" as the whole attestation -- and that is a fact about a PROCESS,
+    // which both connections of a run whose release was re-pointed to this very copy would still
+    // satisfy. So a run that DID raise the fence and cannot show WHICH SERVER it just released is
+    // refused too, and the record survives that as well.
+    const unwitnessed = clear('raised-by-this-run', '')
+    assert.match(unwitnessed.stdout, /^RC=2$/m,
+      `a release that cannot show which server it landed on must not end the record either:\n${unwitnessed.stdout}`)
+    assert.equal(existsSync(stateFile), true, 'and that record must still be there too')
+    assert.equal(readFileSync(stateFile, 'utf8'), untouched, 'byte for byte')
+
+    // AND THE GUARD IS NOT A BAN. With both answers the removal happens, so a passing test above
+    // cannot be a function that refuses everything.
+    const attested = clear('raised-by-this-run', 'same-server-as-the-fence')
     assert.match(attested.stdout, /^RC=0$/m, `an attested removal must still happen:\n${attested.stdout}`)
     assert.equal(existsSync(stateFile), false, 'and the record is gone')
   } finally {
@@ -5934,5 +5964,235 @@ test('a pre-fence copy with one grantee independently revoked is refused (o3d-se
     else process.env.DEPLOY_ADMIN_DATABASE_URL = previousAdmin
     if (previousApp === undefined) delete process.env.DATABASE_URL
     else process.env.DATABASE_URL = previousApp
+  }
+})
+
+/**
+ * THE ATTESTATION IS BOUND TO A CONNECTION, MEASURED ON REAL CLUSTERS (o3d-secops r31, Codex HIGH 1).
+ *
+ * r30 rested root's automatic removal of the fence record on ${DB_FENCE_RAISED} -- this run's
+ * memory of having raised the fence. That is a fact about a PROCESS, and the fence and the release
+ * are two processes on two connections; a proxy, a DNS change or a failover between them re-points
+ * the connection while the memory stays true, so the attestation could be spent against a backend
+ * that never saw the fence. r30's own clone test above is half of the demonstration: a release on a
+ * post-fence copy succeeds, and the literal then removes the record.
+ *
+ * WHAT THIS MEASURES, on a real origin and a real `pg_basebackup` copy of it:
+ *
+ *   1. the witness's session-scoped advisory lock is visible from the fenced database, so `--fence`
+ *      can establish on ITS OWN CONNECTION that the witness is on the backend it is about to revoke
+ *      on -- and the same lock is NOT visible on the copy, which is the whole property;
+ *   2. a nonce the witness has not been given reads as absent, so the check is not one that says
+ *      "held" about everything;
+ *   3. the copy cannot answer a challenge issued after it was taken, however it was taken.
+ *
+ * MUTATION ROUTE (made against the shipped file and reverted): in witnessLockIsHeld(), drop the
+ * `AND granted` and the two classid/objid comparisons so the count is over every advisory lock --
+ * assertion 2 fails, because an unrelated nonce then reads as held. Drop the whole predicate and
+ * return `true` -- assertion 1's negative half and assertion 3 fail on the copy.
+ */
+test('the witness lock is visible on the fenced instance and on no copy of it (o3d-secops r31, Codex HIGH 1)', async (t) => {
+  const root = stateDir(t)
+  const port = await freePort()
+  const clonePort = await freePort()
+  const me = currentUser()
+  let origin: ReturnType<typeof startCluster> | undefined
+  let copy: ReturnType<typeof startCluster> | undefined
+  let witness: Client | undefined
+  let fencing: Client | undefined
+  let onCopy: Client | undefined
+  try {
+    origin = startCluster(root, 'origin', port, '127.0.0.1', ['local replication all trust'])
+    origin.psql(['-c', 'CREATE DATABASE imsdb'])
+
+    // THE WITNESS IS NOT ON THE FENCED DATABASE, which is the shipped arrangement: completeFence()
+    // terminates every other client backend on the database it fences, so a witness there would be
+    // killed by the drain. `postgres` is the door the helper's own witnessConnectionStrings() picks.
+    witness = new Client({ host: origin.socket, port, database: 'postgres', user: me })
+    await witness.connect()
+    const nonce = 'a1'.repeat(16)
+    await witness.query('SELECT pg_advisory_lock($1::bigint)', [advisoryKeyForWitnessNonce(nonce)])
+
+    // 1. THE FENCING CONNECTION, on the database that is about to be fenced, can see it.
+    fencing = new Client({ host: origin.socket, port, database: 'imsdb', user: me })
+    await fencing.connect()
+    assert.equal(await witnessLockIsHeld(fencing as never, nonce), true,
+      'the connection about to revoke must be able to see the witness it will be measured against')
+
+    // 2. AND IT IS NOT A FUNCTION THAT SAYS YES. A nonce nobody holds must read as absent, or
+    //    assertion 1 establishes nothing at all.
+    assert.equal(await witnessLockIsHeld(fencing as never, 'b2'.repeat(16)), false,
+      'a nonce no session holds must read as absent')
+
+    // 3. THE COPY, taken WITH the lock held, cannot produce it. Advisory locks live in shared
+    //    memory; nothing in a data directory carries one, which is exactly why this and not the
+    //    system identifier, the database OID or the ACL -- all of which the copy does carry.
+    copy = cloneCluster(root, origin, 'after', clonePort)
+    onCopy = new Client({ host: copy.socket, port: clonePort, database: 'imsdb', user: me })
+    await onCopy.connect()
+    assert.equal(await witnessLockIsHeld(onCopy as never, nonce), false,
+      'a physical copy of the fenced cluster must not be able to answer for the witness')
+
+    // AND A CHALLENGE ISSUED AFTER THE COPY WAS TAKEN, which is the shape --release uses: the
+    // nonce did not exist when the copy was made, so no copy however made can contain it.
+    const challenge = 'c3'.repeat(16)
+    await witness.query('SELECT pg_advisory_lock($1::bigint)', [advisoryKeyForWitnessNonce(challenge)])
+    assert.equal(await witnessLockIsHeld(fencing as never, challenge), true, 'the origin answers a fresh challenge')
+    assert.equal(await witnessLockIsHeld(onCopy as never, challenge), false, 'and the copy cannot')
+  } finally {
+    await onCopy?.end().catch(() => {})
+    await fencing?.end().catch(() => {})
+    await witness?.end().catch(() => {})
+    copy?.stop()
+    origin?.stop()
+    rmSync(root, { recursive: true, force: true })
+  }
+})
+
+/**
+ * THE WITNESS SURVIVES THE DRAIN, AND THE DRAIN STILL FINDS THE ROOM EMPTY (o3d-secops r31).
+ *
+ * This is the constraint that decided where the witness attaches, and it is the one a later round
+ * would break by "simplifying" it onto the fenced database. completeFence() TERMINATES every other
+ * client backend on `current_database()` and then requires none to be left -- and it must keep
+ * requiring that, because a session attached across the migration window is the exact thing the
+ * fence exists to prevent. So the witness must be invisible to that statement and its lock still
+ * visible afterwards, and both halves are measured here with the shipped SQL rather than argued.
+ *
+ * MUTATION ROUTE (made against the shipped file and reverted): change witnessConnectionStrings()
+ * to leave the database as it was, so the witness attaches to the fenced database -- the drain
+ * terminates it, the second assertion sees a non-empty room or the third sees the lock gone.
+ */
+test('the connection witness is not what the fence drains (o3d-secops r31)', async (t) => {
+  const root = stateDir(t)
+  const port = await freePort()
+  const me = currentUser()
+  let origin: ReturnType<typeof startCluster> | undefined
+  let witness: Client | undefined
+  let fencing: Client | undefined
+  try {
+    origin = startCluster(root, 'origin', port, '127.0.0.1', ['local replication all trust'])
+    origin.psql(['-c', 'CREATE DATABASE imsdb'])
+    const nonce = 'd4'.repeat(16)
+
+    // THE WITNESS GOES WHERE THE SHIPPED CODE SENDS IT, read out of the shipped function rather
+    // than written down again here: a rig that hard-coded `postgres` would keep passing after the
+    // helper had been changed to attach somewhere the drain does reach.
+    const [first] = witnessConnectionStrings(`postgres://${me}@127.0.0.1:${port}/imsdb`)
+    assert.match(first, /\/postgres(\?|$)/, 'the witness is pointed at another database in the same cluster')
+    witness = new Client({ host: origin.socket, port, database: new URL(first).pathname.slice(1), user: me })
+    await witness.connect()
+    await witness.query('SELECT pg_advisory_lock($1::bigint)', [advisoryKeyForWitnessNonce(nonce)])
+
+    fencing = new Client({ host: origin.socket, port, database: 'imsdb', user: me })
+    await fencing.connect()
+    assert.equal(await witnessLockIsHeld(fencing as never, nonce), true, 'precondition: the fence can see the witness')
+
+    // THE DRAIN, WORD FOR WORD AS completeFence() ISSUES IT. Lifted from the shipped file so a
+    // change to that statement cannot leave this rig measuring the old one.
+    const HELPER = readFileSync(join(process.cwd(), 'scripts/fence-db-connections.mjs'), 'utf8')
+    assert.ok(HELPER.includes('SELECT pg_terminate_backend(pid)'), 'the drain must still be the statement this rig models')
+    await fencing.query(
+      `SELECT pg_terminate_backend(pid)
+         FROM pg_stat_activity
+        WHERE datname = current_database()
+          AND pid <> pg_backend_pid()
+          AND backend_type = 'client backend'`,
+    )
+    const { rows } = await fencing.query(
+      `SELECT count(*)::int AS n FROM pg_stat_activity
+        WHERE datname = current_database() AND pid <> pg_backend_pid() AND backend_type = 'client backend'`,
+    )
+    assert.equal(rows[0].n, 0, 'the fenced database must still drain to nothing: the witness may not weaken that')
+    assert.equal(await witnessLockIsHeld(fencing as never, nonce), true,
+      'and the witness must still be holding, or the release would have nothing to be measured against')
+  } finally {
+    await fencing?.end().catch(() => {})
+    await witness?.end().catch(() => {})
+    origin?.stop()
+    rmSync(root, { recursive: true, force: true })
+  }
+})
+
+/**
+ * THE WITNESS LIFECYCLE, DRIVEN BY THE SHIPPED SHELL AGAINST A REAL CLUSTER (o3d-secops r31).
+ *
+ * The three library functions are lifted out of scripts/lib/db-fence-protected.sh and run in a real
+ * bash, against a real `--witness` process talking to a real PostgreSQL. What it establishes:
+ *
+ *   * the co-process starts, holds, and says so, so the ordinary cutover keeps its automation;
+ *   * every challenge nonce is FRESH -- a reused one would be a fact a snapshot could contain;
+ *   * a stopped witness cannot be challenged, which is the fallback the whole design leans on;
+ *   * and a SECOND witness starts cleanly in the same shell, which is the exit trap's re-fence.
+ *
+ * MUTATION ROUTE (made against the shipped file and reverted): make db_fence_witness_challenge()
+ * reuse ${DB_FENCE_WITNESS_NONCE} instead of minting one -- the freshness assertion fails. Delete
+ * the `db_fence_witness_stop` call at the top of db_fence_witness_start() -- the second start
+ * warns and the "SECOND READY" line does not appear. Make db_fence_witness_challenge() return 0
+ * without asking anything -- the stopped-witness assertion fails.
+ */
+test('the witness co-process starts, answers fresh challenges, stops, and restarts (o3d-secops r31)', async (t) => {
+  const root = stateDir(t)
+  const port = await freePort()
+  const me = currentUser()
+  let origin: ReturnType<typeof startCluster> | undefined
+  try {
+    origin = startCluster(root, 'origin', port, '127.0.0.1', ['local replication all trust', 'host all all 127.0.0.1/32 trust'])
+    origin.psql(['-c', 'CREATE ROLE imsapp LOGIN'])
+    origin.psql(['-c', 'CREATE DATABASE imsdb'])
+
+    const program = [
+      'set -uo pipefail',
+      'DB_FENCE_SUDO_PREFIX=""',
+      'DB_FENCE_RELEASE_WRAPPER="/opt/cutover/release-db-fence"',
+      // The one part each entrypoint supplies for itself; here it is simply `node`, because this
+      // rig is about the lifecycle and not about how the three of them drop privilege.
+      'db_fence_helper() { local s="$1"; shift; node "$s" "$@"; }',
+      shellFunction(FENCE_LIBRARY, 'db_fence_witness_nonce'),
+      shellFunction(FENCE_LIBRARY, 'db_fence_witness_stop'),
+      shellFunction(FENCE_LIBRARY, 'db_fence_witness_start'),
+      shellFunction(FENCE_LIBRARY, 'db_fence_witness_challenge'),
+      'DB_FENCE_WITNESS_PID=""; DB_FENCE_WITNESS_NONCE=""; DB_FENCE_WITNESS_BOUND=0; DB_FENCE_WITNESS_CHALLENGE=""',
+      `IDENT=(--app-host=127.0.0.1 --app-port=${port} --app-user=imsapp --app-database=imsdb)`,
+      `db_fence_witness_start ${JSON.stringify(join(process.cwd(), 'scripts/fence-db-connections.mjs'))} "\${IDENT[@]}" || { echo "START FAILED"; exit 1; }`,
+      'echo "READY ${DB_FENCE_WITNESS_NONCE}"',
+      'DB_FENCE_WITNESS_BOUND=1',
+      'db_fence_witness_challenge || { echo "CHALLENGE 1 FAILED"; exit 1; }',
+      'echo "CHALLENGE1 ${DB_FENCE_WITNESS_CHALLENGE}"',
+      'db_fence_witness_challenge || { echo "CHALLENGE 2 FAILED"; exit 1; }',
+      'echo "CHALLENGE2 ${DB_FENCE_WITNESS_CHALLENGE}"',
+      'db_fence_witness_stop',
+      'if db_fence_witness_challenge; then echo "STOPPED WITNESS STILL ANSWERED"; else echo "STOPPED WITNESS CANNOT ANSWER"; fi',
+      `db_fence_witness_start ${JSON.stringify(join(process.cwd(), 'scripts/fence-db-connections.mjs'))} "\${IDENT[@]}" || { echo "SECOND START FAILED"; exit 1; }`,
+      'echo "SECOND READY ${DB_FENCE_WITNESS_NONCE}"',
+      'db_fence_witness_stop',
+      'echo "DONE"',
+    ].join('\n')
+    const run = spawnSync('bash', ['-c', program], {
+      encoding: 'utf8',
+      cwd: process.cwd(),
+      env: { ...process.env, DEPLOY_ADMIN_DATABASE_URL: `postgres://${me}@127.0.0.1:${port}/imsdb` },
+    })
+    const said = `${run.stdout}\n--- stderr ---\n${run.stderr}`
+
+    assert.match(run.stdout, /^READY [0-9a-f]{32}$/m, `the witness must start and report its nonce:\n${said}`)
+    const first = /^CHALLENGE1 ([0-9a-f]{32})$/m.exec(run.stdout)
+    const second = /^CHALLENGE2 ([0-9a-f]{32})$/m.exec(run.stdout)
+    const ready = /^READY ([0-9a-f]{32})$/m.exec(run.stdout)
+    assert.ok(first && second && ready, `both challenges must be answered:\n${said}`)
+    // FRESHNESS IS THE MECHANISM, not a detail. A challenge that reused an earlier nonce would be
+    // a lock some earlier snapshot of the cluster could already contain.
+    assert.notEqual(first![1], second![1], `each challenge must mint a new nonce:\n${said}`)
+    assert.notEqual(first![1], ready![1], `and none of them may be the fence's own nonce:\n${said}`)
+    assert.match(run.stdout, /^STOPPED WITNESS CANNOT ANSWER$/m,
+      `a witness that has been stopped must not be able to attest anything:\n${said}`)
+    assert.match(run.stdout, /^SECOND READY [0-9a-f]{32}$/m,
+      `and a second witness must start cleanly in the same shell -- the exit trap's re-fence does exactly that:\n${said}`)
+    assert.doesNotMatch(run.stderr, /still exists/,
+      `starting the second witness must not leave bash complaining about the first:\n${said}`)
+    assert.match(run.stdout, /^DONE$/m, `and the whole sequence must complete:\n${said}`)
+  } finally {
+    origin?.stop()
+    rmSync(root, { recursive: true, force: true })
   }
 })
