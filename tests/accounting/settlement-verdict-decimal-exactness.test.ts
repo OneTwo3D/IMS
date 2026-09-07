@@ -105,6 +105,13 @@ test('[o3d-4ozd] a document the ledger holds SIX THOUSANDTHS more than IMS claim
   assert.equal(v.status, 'OVER_SETTLED')
   assert.equal(v.discrepancy, true)
   assert.match(v.detail, /OVER-paid/)
+  // AND THE SENTENCE NAMES THE TWO FIGURES APART. A `toNumber()` here prints both as
+  // 35184372088832.01 — "recorded X against a settlement of X, so it is OVER-paid" — which is a
+  // refusal no operator can act on.
+  //
+  // ROUTE: the OVER_SETTLED detail's `toFixed()`.
+  // MUTATION: print `toNumber()` and the two figures become one string.
+  assert.match(v.detail, /35184372088832\.01 against a settlement of 35184372088832\.004/)
 })
 
 test('[o3d-4ozd] a document FOUR THOUSANDTHS short of its total is PARTIALLY_SETTLED', () => {
@@ -129,7 +136,9 @@ test('[o3d-4ozd] a document FOUR THOUSANDTHS short of its total is PARTIALLY_SET
   })
   assert.equal(v.status, 'PARTIALLY_SETTLED')
   assert.equal(v.discrepancy, true)
-  assert.match(v.detail, /PART payment/)
+  // ROUTE: the PARTIALLY_SETTLED detail's `toFixed()`.
+  // MUTATION: print `toNumber()` and both figures read 35184372088832.
+  assert.match(v.detail, /PART payment of 35184372088831\.999 against a total of 35184372088832\.003/)
 })
 
 // ---------------------------------------------------------------------------

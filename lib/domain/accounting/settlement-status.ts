@@ -347,7 +347,7 @@ export function settlementStatus(input: {
           detail:
             `An operator recorded this as paid in the ledger (payment ${p.externalTransactionId}) on their own ` +
             `assertion — IMS never made the call, never read the document and never compared the amount. The ` +
-            `figure shown here (${typeof p.amount === 'number' ? p.amount : 'unknown'}) is what IMS meant to send, ` +
+            `figure shown here (${syncRowSettledAmount(p)?.toFixed() ?? 'unknown'}) is what IMS meant to send, ` +
             `not what the ledger recorded, so a part payment against this invoice would look identical. Open ` +
             `payment ${p.externalTransactionId} in the accounting system and confirm its amount against the ` +
             `document total.`,
@@ -363,7 +363,10 @@ export function settlementStatus(input: {
       // stayed doubles, which is the same defect one layer out: an exact tolerance over collapsed
       // operands decides nothing, because the operands agreed before the band was consulted. Both
       // sides now arrive exact — the total from storage, the payment through `syncRowSettledAmount`
-      // — and the comparison is taken with `compareDecimal`. Only the SENTENCES convert.
+      // — and the comparison is taken with `compareDecimal`. The SENTENCES print `toFixed`, not
+      // `toNumber`: at the magnitudes this finding is about a `toNumber` would print the two figures
+      // as the SAME number, and "recorded 35184372088832.01 against a settlement of
+      // 35184372088832.01, so it is OVER-paid" is a sentence no operator can act on.
       const total = documentTotalDecimal(input.totalForeign)
       const paid = syncRowSettledAmount(p)
       // o3d-6yho: half one minor unit of THIS document's currency, not a hard-coded half-penny.
@@ -374,8 +377,8 @@ export function settlementStatus(input: {
             status: 'PARTIALLY_SETTLED',
             discrepancy: true,
             detail:
-              `The ledger recorded a PART payment of ${paid.toNumber()} against a total of ` +
-              `${total.toNumber()} (payment ${p.externalTransactionId}), so a balance is still ` +
+              `The ledger recorded a PART payment of ${paid.toFixed()} against a total of ` +
+              `${total.toFixed()} (payment ${p.externalTransactionId}), so a balance is still ` +
               `outstanding there while IMS shows this as paid in full.`,
             basis: 'LEDGER_CONFIRMED',
           }
@@ -390,7 +393,7 @@ export function settlementStatus(input: {
             status: 'OVER_SETTLED',
             discrepancy: true,
             detail:
-              `The ledger recorded ${paid.toNumber()} against a settlement of ${total.toNumber()} ` +
+              `The ledger recorded ${paid.toFixed()} against a settlement of ${total.toFixed()} ` +
               `(payment ${p.externalTransactionId}), so it is OVER-paid there — reverse or adjust the ` +
               `payment in the ledger.`,
             basis: 'LEDGER_CONFIRMED',
