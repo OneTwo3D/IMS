@@ -253,14 +253,34 @@ test('[o3d-obyd] an ABSENT figure is still a skip, and the ordinary document sti
   // WHAT STAYS TRUE HERE, AND IS THE REASON ABSENCE IS PERMISSIVE AT ALL: an absent figure SKIPS the
   // arithmetic, and every arm that has other evidence still answers with it.
   //
-  // THE PRECONDITION: these bodies state NO total at all, so the arms below are genuinely reaching
-  // the skip rather than passing an arithmetic check.
-  const invoice = await probeInvoice({ CurrencyCode: 'GBP', AmountPaid: 0 })
+  // o3d-nk5n — AND THE XERO CASE ASSERTED HERE HAS MOVED FOR THE SAME REASON THE QUICKBOOKS ONE DID.
+  //
+  // `probeInvoice({ CurrencyCode: 'GBP', AmountPaid: 0 })` was asserted `{ ok: true, records: [] }`
+  // and therefore `clear`. That body states too little for EITHER form of the settlement figure —
+  // no `Total`/`AmountDue` pair, and no `AmountPaid`/`AmountCredited` fallback pair — so no check ran
+  // and the clear was drawn from having read nothing, which is the same positive claim on no evidence
+  // the paragraph above records as wrong on the other connector. Both arms now refuse it, and the
+  // rule is one function (`emptyAnswerIsUnproved`) rather than one per connector.
+  //
+  // WHAT STAYS TRUE, AND IS STILL THE SUBJECT OF THIS TEST: an absent figure SKIPS the arithmetic it
+  // is an operand of, and it does not refuse. `AmountCredited` is absent on every body below and none
+  // of them is refused for it — a genuine skip. Absence is permissive; it just may not also be the
+  // whole of the answer.
+
+  // THE PRECONDITION: these bodies state NO `AmountCredited` at all, so the skip is genuinely being
+  // reached rather than an arithmetic check being passed on a figure that is there.
+  const invoice = await probeInvoice({ CurrencyCode: 'GBP', Total: 40, AmountDue: 40, AmountPaid: 0 })
   assert.deepEqual(invoice, { ok: true, records: [] })
   assert.equal(classifyLedgerSettlement(attemptFor('40.00'), invoice).outcome, 'clear')
 
   const note = await probeNote({ CurrencyCode: 'GBP', Total: 10, RemainingCredit: 10, Allocations: [] })
   assert.deepEqual(note, { ok: true, records: [] }, 'an unapplied credit note is still positively unapplied')
+
+  // AND THE MOVED CASE, STATED WHERE IT USED TO BE ASSERTED, so a reader of this test cannot come
+  // away thinking a figureless Xero document still clears.
+  const figureless = await probeInvoice({ CurrencyCode: 'GBP', AmountPaid: 0 })
+  assert.equal(figureless.ok, false, 'o3d-nk5n: an unproved empty answer is a refusal, not a clear')
+  assert.notEqual(classifyLedgerSettlement(attemptFor('40.00'), figureless).outcome, 'clear')
 })
 
 /* ------------------------------------------------------------------------------------------- *
@@ -457,7 +477,9 @@ test('[o3d-mm51] the SCALE rule is still not inherited: a finer-than-currency fi
   assert.match(reasonOf(fil), /Xero reports 0\.001 paid against this document but returned no payments/)
   assert.notEqual(readLedgerStatedAmount(0.001, 'KWD'), null, 'and the strict reader admits it too — this is the BAND, not the scale')
 
-  const belowBandInGbp = await probeInvoice({ CurrencyCode: 'GBP', AmountPaid: 0.001 })
+  // o3d-nk5n: the totals are stated, and stated consistently with the `AmountPaid` beside them, so
+  // the positive answer below is the BAND's and not the unproved empty this round closed.
+  const belowBandInGbp = await probeInvoice({ CurrencyCode: 'GBP', Total: 40, AmountDue: 39.999, AmountPaid: 0.001 })
   assert.equal(belowBandInGbp.ok, true, 'while in GBP the same figure is inside the band and states nothing')
 })
 

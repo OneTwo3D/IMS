@@ -19,7 +19,7 @@ import test, { mock } from 'node:test'
  */
 
 const xeroCalls: string[] = []
-let xeroResponse: unknown = { Invoices: [{ InvoiceID: 'inv-1', Payments: [] }] }
+let xeroResponse: unknown = { Invoices: [{ InvoiceID: 'inv-1', Total: 10, AmountDue: 10, AmountPaid: 0, Payments: [] }] }
 
 mock.module('@/lib/connectors/xero/api', {
   namedExports: {
@@ -212,7 +212,7 @@ test('the FIRST attempt is stamped, and READS the ledger before it is allowed (o
   // Round 4 removed the free pass. The stamp still happens first and still happens before any
   // call — but "this row has never posted" is no longer on its own a reason to send money.
   xeroCalls.length = 0
-  xeroResponse = { Invoices: [{ InvoiceID: 'inv-1', Payments: [] }] }
+  xeroResponse = { Invoices: [{ InvoiceID: 'inv-1', Total: 10, AmountDue: 10, AmountPaid: 0, Payments: [] }] }
   const { db, writes, rows } = dbDouble([{ id: 'log-1', remoteAttemptedAt: null }])
 
   const verdict = await (await load())({ ...payment, entryId: 'log-1', db })
@@ -380,7 +380,7 @@ test('a fresh row against a document nothing has been sent to posts once the led
   // see the cross-scope test below — so the sibling here is given an invoice of its own, which is
   // what "unrelated" has to mean now.
   xeroCalls.length = 0
-  xeroResponse = { Invoices: [{ InvoiceID: 'inv-1', Payments: [] }] }
+  xeroResponse = { Invoices: [{ InvoiceID: 'inv-1', Total: 10, AmountDue: 10, AmountPaid: 0, Payments: [] }] }
   const { db } = dbDouble([
     { id: 'log-new', remoteAttemptedAt: null },
     {
@@ -498,7 +498,7 @@ test('a rival whose outcome cannot be read stops the post (o3d-0m56)', async () 
   // cannot be matched against the ledger at all, and "I cannot tell" is not permission to send
   // money.
   xeroCalls.length = 0
-  xeroResponse = { Invoices: [{ InvoiceID: 'inv-1', Payments: [] }] }
+  xeroResponse = { Invoices: [{ InvoiceID: 'inv-1', Total: 10, AmountDue: 10, AmountPaid: 0, Payments: [] }] }
   const { db } = dbDouble([
     { id: 'log-new', remoteAttemptedAt: null },
     { id: 'log-vague', remoteAttemptedAt: new Date('2026-08-01T00:00:00Z'), payload: { accountingInvoiceId: 'inv-1', bankAccountId: 'bank-1', amount: 10 } },
@@ -681,7 +681,7 @@ test('an undescribable row still posts against a ledger that positively holds NO
   // in which there is nothing to duplicate, so such a row is not permanently unsendable — which
   // was the correct half of round 4's reasoning.
   xeroCalls.length = 0
-  xeroResponse = { Invoices: [{ InvoiceID: 'inv-1', AmountPaid: 0, Payments: [] }] }
+  xeroResponse = { Invoices: [{ InvoiceID: 'inv-1', Total: 10, AmountDue: 10, AmountPaid: 0, Payments: [] }] }
   const noAmount = { accountingInvoiceId: 'inv-1', bankAccountId: 'bank-1', paymentDate: '2026-08-01' }
   const { db } = dbDouble([{ id: 'log-1', remoteAttemptedAt: null, payload: noAmount }])
   assert.deepEqual(
@@ -727,7 +727,7 @@ test('two rows racing the SAME document cannot both post (o3d-0m56 r4, CRITICAL 
   // both were free to post: the fence read the ledger in the right place and still left a window
   // for a competing row to post inside it. The lock is what makes the read and the write one step.
   xeroCalls.length = 0
-  xeroResponse = { Invoices: [{ InvoiceID: 'inv-1', Payments: [] }] }
+  xeroResponse = { Invoices: [{ InvoiceID: 'inv-1', Total: 10, AmountDue: 10, AmountPaid: 0, Payments: [] }] }
   const { db } = dbDouble([
     { id: 'log-a', remoteAttemptedAt: null },
     { id: 'log-b', remoteAttemptedAt: null },
@@ -796,7 +796,7 @@ test('the loser of the race is then refused by the LEDGER, not allowed through (
 test('the fence releases the lock even when the post throws (o3d-0m56 r4)', async () => {
   // A lock that leaked on an exception would make the document unpayable until the process
   // restarted — a worse outage than the bug it prevents.
-  xeroResponse = { Invoices: [{ InvoiceID: 'inv-1', Payments: [] }] }
+  xeroResponse = { Invoices: [{ InvoiceID: 'inv-1', Total: 10, AmountDue: 10, AmountPaid: 0, Payments: [] }] }
   const { db } = dbDouble([{ id: 'log-1', remoteAttemptedAt: null }])
   const { lock, held } = lockDouble()
   const fence = await loadFence()
@@ -813,7 +813,7 @@ test('rows for DIFFERENT documents do not serialize against each other (o3d-0m56
   // concurrently. A lock coarse enough to serialize the whole connector would be a throughput
   // bug wearing a safety badge. A DIFFERENT SCOPE is no longer what makes them different (round
   // 6) — a different invoice is.
-  xeroResponse = { Invoices: [{ InvoiceID: 'inv-1', Payments: [] }] }
+  xeroResponse = { Invoices: [{ InvoiceID: 'inv-1', Total: 10, AmountDue: 10, AmountPaid: 0, Payments: [] }] }
   const otherDocument = { accountingInvoiceId: 'inv-2', bankAccountId: 'bank-1', amount: 10, paymentDate: '2026-08-01' }
   const { db } = dbDouble([
     { id: 'log-a', remoteAttemptedAt: null },
@@ -877,7 +877,7 @@ test('a lock lost DURING the post is detected afterwards and announced (o3d-0m56
   //
   // The successful outcome is KEPT: the payment is real, and its externalId is the handle any
   // reversal needs. Throwing it away would hide a real payment and prevent nothing.
-  xeroResponse = { Invoices: [{ InvoiceID: 'inv-1', AmountPaid: 0, Payments: [] }] }
+  xeroResponse = { Invoices: [{ InvoiceID: 'inv-1', Total: 10, AmountDue: 10, AmountPaid: 0, Payments: [] }] }
   const { db } = dbDouble([{ id: 'log-1', remoteAttemptedAt: null }])
   const { lock, loseIt } = lockDouble()
   const { lines, restore } = captureErrors()
@@ -901,7 +901,7 @@ test('a lock lost DURING the post is detected afterwards and announced (o3d-0m56
 test('a FAILED post whose lock was lost is reported as unsafe, not as an ordinary failure (o3d-0m56 r5)', async () => {
   // A failure and a lost exclusion together is the worst-read case: the call may still have
   // committed. The row must not go back as a plain "Xero said no" that reads as "try again".
-  xeroResponse = { Invoices: [{ InvoiceID: 'inv-1', AmountPaid: 0, Payments: [] }] }
+  xeroResponse = { Invoices: [{ InvoiceID: 'inv-1', Total: 10, AmountDue: 10, AmountPaid: 0, Payments: [] }] }
   const { db } = dbDouble([{ id: 'log-1', remoteAttemptedAt: null }])
   const { lock, loseIt } = lockDouble()
   const { lines, restore } = captureErrors()
@@ -923,7 +923,7 @@ test('a FAILED post whose lock was lost is reported as unsafe, not as an ordinar
 test('a post that THREW with the lock lost still announces the exclusion (o3d-0m56 r5)', async () => {
   // The throw path bypasses every return statement in the fence, which is exactly how a detection
   // written only on the happy path goes missing.
-  xeroResponse = { Invoices: [{ InvoiceID: 'inv-1', AmountPaid: 0, Payments: [] }] }
+  xeroResponse = { Invoices: [{ InvoiceID: 'inv-1', Total: 10, AmountDue: 10, AmountPaid: 0, Payments: [] }] }
   const { db } = dbDouble([{ id: 'log-1', remoteAttemptedAt: null }])
   const { lock, loseIt, held } = lockDouble()
   const { lines, restore } = captureErrors()
@@ -946,7 +946,7 @@ test('a post that THREW with the lock lost still announces the exclusion (o3d-0m
 
 test('a post whose lock SURVIVES announces nothing (o3d-0m56 r5)', async () => {
   // The alarm has to be silent in the ordinary case or it is noise, and noise is not detection.
-  xeroResponse = { Invoices: [{ InvoiceID: 'inv-1', AmountPaid: 0, Payments: [] }] }
+  xeroResponse = { Invoices: [{ InvoiceID: 'inv-1', Total: 10, AmountDue: 10, AmountPaid: 0, Payments: [] }] }
   const { db } = dbDouble([{ id: 'log-1', remoteAttemptedAt: null }])
   const { lock } = lockDouble()
   const { lines, restore } = captureErrors()
@@ -963,7 +963,7 @@ test('a lock lost between the reading and the post stops the post (o3d-0m56 r4)'
   // PostgreSQL frees a session advisory lock the instant its connection dies. A verdict taken
   // under an exclusion that has since evaporated is not stale, it is void: another worker may be
   // inside its own probe→post span right now. The reading must not be spent on a post.
-  xeroResponse = { Invoices: [{ InvoiceID: 'inv-1', Payments: [] }] }
+  xeroResponse = { Invoices: [{ InvoiceID: 'inv-1', Total: 10, AmountDue: 10, AmountPaid: 0, Payments: [] }] }
   const { db } = dbDouble([{ id: 'log-1', remoteAttemptedAt: null }])
   const { lock, loseIt, held } = lockDouble()
   loseIt()

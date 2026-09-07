@@ -608,7 +608,13 @@ test('[o3d-r948] a KWD invoice ONE FIL short of its stated settlement does not r
 
   // THE DISCRIMINATING HALF. The identical figures in GBP are a tenth of a penny — genuinely noise —
   // and still read as complete. The band is derived from the document, not tightened for everyone.
-  const gbp = await probeInvoice(xeroInvoice({ CurrencyCode: 'GBP', AmountPaid: 0.001 }))
+  //
+  // o3d-nk5n: `Total`/`AmountDue` are stated here, and stated CONSISTENTLY with the `AmountPaid`
+  // beside them — 40 owed less 39.999 still due is the same tenth of a penny. Without them the empty
+  // answer below would be the unproved one this round closed, and the band would not be what the test
+  // turned on. `settled` is 0.001, which is inside the GBP band too, so the settlement check reaches
+  // the same "states nothing" the `AmountPaid` check does and this remains a test about the BAND.
+  const gbp = await probeInvoice(xeroInvoice({ CurrencyCode: 'GBP', Total: 40, AmountDue: 39.999, AmountPaid: 0.001 }))
   assert.deepEqual(gbp, { ok: true, records: [] })
   assert.equal(
     classifyLedgerSettlement(

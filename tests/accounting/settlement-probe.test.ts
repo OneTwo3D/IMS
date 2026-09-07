@@ -62,7 +62,13 @@ test('xero reads payments from the SINGLE-invoice endpoint (o3d-0m56)', async ()
 })
 
 test('xero: a bill payment reads the same endpoint, and an unknown id fails closed (o3d-0m56)', async () => {
-  const { get } = xeroDouble({ 'Invoices/bill-1': { Invoices: [{ InvoiceID: 'bill-1' }] } })
+  // o3d-nk5n: the document STATES that nothing has settled it — `Total` and `AmountDue` equal, as
+  // Xero returns them on every bill that exists. It used to be the bare stub `{ InvoiceID: 'bill-1' }`,
+  // which said nothing at all, and the clear below was then drawn from having read no figure rather
+  // than from a figure that says zero. Same verdict, now on evidence.
+  const { get } = xeroDouble({
+    'Invoices/bill-1': { Invoices: [{ InvoiceID: 'bill-1', CurrencyCode: 'GBP', Total: 40, AmountDue: 40, AmountPaid: 0 }] },
+  })
   assert.deepEqual(
     await probeXeroSettlement({ type: 'BILL_PAYMENT', payload: { accountingInvoiceId: 'bill-1' } }, get),
     { ok: true, records: [] },
