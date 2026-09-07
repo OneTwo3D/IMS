@@ -13530,29 +13530,48 @@ for (const entry of FENCE_HARNESS) {
 //   That is what these measure, against the shipped readers, under a real shell.
 // ---------------------------------------------------------------------------
 
+/**
+ * A MULTI-LINE STREAM, BUILT SO THAT IT REALLY IS MULTI-LINE.
+ *
+ * `JSON.stringify('a\nb')` yields `"a\nb"`, and inside a bash DOUBLE-QUOTED assignment that is a
+ * backslash and an `n` -- one line, not two. The first draft of the tests below passed a
+ * JSON-stringified two-line stream, and BOTH of them stayed green when the duplicate guard was
+ * mutated away: the reader was refusing a one-line value of the wrong SHAPE, not a duplicate key,
+ * so the assertion said nothing about the rule it names. Each line is single-quoted separately and
+ * `printf` supplies the newlines.
+ */
+function shellStream(lines: readonly string[]): string {
+  const quoted = lines.map((line) => `'${line.replace(/'/g, `'\\''`)}'`).join(' ')
+  return `stream="$(printf '%s\\n' ${quoted})"`
+}
+
 test('[o3d-secops r32] the shared machine-field reader takes one value of the stated shape, or nothing', () => {
   const FENCE_LIB = readFileSync(join(process.cwd(), 'scripts/lib/db-fence-protected.sh'), 'utf8')
-  const run = (stream: string) => runShell([
+  const run = (lines: readonly string[]) => runShell([
     'set -uo pipefail',
     shellFunction(FENCE_LIB, 'db_fence_machine_field'),
-    `stream=${JSON.stringify(stream)}`,
+    shellStream(lines),
     'if v="$(db_fence_machine_field "${stream}" authority_sha256 "^[0-9a-f]{64}\\$")"; then echo "TOOK=${v}"; else echo "REFUSED"; fi',
   ].join('\n'))
   const digest = 'a'.repeat(64)
   const other = 'b'.repeat(64)
 
   // THE ORDINARY CASE, so nothing below passes because the reader refuses everything.
-  assert.match(run(`authority_sha256=${digest}`).output, new RegExp(`^TOOK=${digest}$`, 'm'))
+  assert.match(run([`authority_sha256=${digest}`]).output, new RegExp(`^TOOK=${digest}$`, 'm'))
+  // AND THE STREAM REALLY IS TWO LINES: a reader handed one line containing a literal backslash-n
+  // refuses for the wrong reason, and the duplicate rule below would go unmeasured.
+  assert.match(run([`authority_sha256=${digest}`, 'noise']).output, new RegExp(`^TOOK=${digest}$`, 'm'),
+    'precondition: a second, unrelated line must not disturb the reading')
   // AND IT IS A WHOLE LINE: prose that CONTAINS the key is not the key.
-  assert.match(run(`published authority_sha256=${digest} somewhere`).output, /^REFUSED$/m)
+  assert.match(run([`published authority_sha256=${digest} somewhere`]).output, /^REFUSED$/m)
   // MUTATION ROUTE (made against the shipped file and reverted): change `[[ "${hits}" -eq 1 ]]` to
-  // `-ge 1` and take the last value -- the two-line case below then reports the appended digest,
-  // which is the `tail -1` behaviour this replaced.
-  assert.match(run(`authority_sha256=${digest}\nauthority_sha256=${other}`).output, /^REFUSED$/m,
+  // `-ge 1` -- the reader then takes the LAST value, which is the `tail -1` behaviour this
+  // replaced, and the two-line case below reports the appended digest instead of refusing.
+  assert.match(run([`authority_sha256=${digest}`, `authority_sha256=${other}`]).output, /^REFUSED$/m,
     'a stream carrying the key twice has not answered')
   // AND THE SHAPE IS ENFORCED: a value that is not the thing it claims to be is not a value.
-  assert.match(run('authority_sha256=not-a-digest').output, /^REFUSED$/m)
-  assert.match(run('nothing here at all').output, /^REFUSED$/m)
+  assert.match(run(['authority_sha256=not-a-digest']).output, /^REFUSED$/m)
+  assert.match(run(['nothing here at all']).output, /^REFUSED$/m)
 })
 
 test('[o3d-secops r32] the recovery wrappers read their machine lines the same way', () => {
@@ -13569,24 +13588,28 @@ test('[o3d-secops r32] the recovery wrappers read their machine lines the same w
   const body = FENCE_LIB.slice(FENCE_LIB.indexOf('\n', opener) + 1, FENCE_LIB.indexOf('\nWRAPPER_EOF\n') + 1)
   assert.ok(body.includes('machine_field()'), 'precondition: the published wrapper must carry the reader')
   const reader = shellFunction(body, 'machine_field')
-  const run = (stream: string, key: string, shape: string) => runShell([
+  const run = (lines: readonly string[], key: string, shape: string) => runShell([
     'set -uo pipefail',
     reader,
-    `stream=${JSON.stringify(stream)}`,
+    shellStream(lines),
     `if v="$(machine_field "${'${stream}'}" ${key} ${JSON.stringify(shape)})"; then echo "TOOK=${'${v}'}"; else echo "REFUSED"; fi`,
   ].join('\n'))
 
   const IDENTITY = '^([0-9]+|<unavailable>)/([0-9]+|<unavailable>)$'
-  assert.match(run('release_cluster_identity=7401234/16400', 'release_cluster_identity', IDENTITY).output, /^TOOK=7401234\/16400$/m)
-  assert.match(run('release_cluster_identity=<unavailable>/16400', 'release_cluster_identity', IDENTITY).output, /^TOOK=<unavailable>\/16400$/m,
+  assert.match(run(['release_cluster_identity=7401234/16400'], 'release_cluster_identity', IDENTITY).output, /^TOOK=7401234\/16400$/m)
+  assert.match(run(['release_cluster_identity=<unavailable>/16400'], 'release_cluster_identity', IDENTITY).output, /^TOOK=<unavailable>\/16400$/m,
     'a server that will not identify itself is a value, and the operator is shown it')
+  assert.match(run(['release_cluster_identity=7401234/16400', 'release_state=already-released'], 'release_cluster_identity', IDENTITY).output, /^TOOK=7401234\/16400$/m,
+    'precondition: the stream really is several lines, or the duplicate rule below goes unmeasured')
   // TWO ANSWERS, AND THE SECOND ONE IS THE APPENDED ONE. Under `tail -1` this returned the
   // attacker's; the confirmation token an operator types binds this value.
-  assert.match(run('release_cluster_identity=7401234/16400\nrelease_cluster_identity=9999999/16400', 'release_cluster_identity', IDENTITY).output, /^REFUSED$/m)
+  // MUTATION ROUTE (made against the shipped file and reverted): `-eq 1` to `-ge 1` in the
+  // WRAPPER'S copy of machine_field() -- this line then reports 9999999/16400.
+  assert.match(run(['release_cluster_identity=7401234/16400', 'release_cluster_identity=9999999/16400'], 'release_cluster_identity', IDENTITY).output, /^REFUSED$/m)
   // AND THE AUDIT'S VERDICT IS AN ENUMERATION, not "anything after the equals sign".
   const VERDICT = '^(absent|stands|ambiguous)$'
-  assert.match(run('legacy_fence_verdict=absent', 'legacy_fence_verdict', VERDICT).output, /^TOOK=absent$/m)
-  assert.match(run('legacy_fence_verdict=absent-ish', 'legacy_fence_verdict', VERDICT).output, /^REFUSED$/m)
-  assert.match(run('legacy_fence_verdict=stands\nlegacy_fence_verdict=absent', 'legacy_fence_verdict', VERDICT).output, /^REFUSED$/m,
+  assert.match(run(['legacy_fence_verdict=absent'], 'legacy_fence_verdict', VERDICT).output, /^TOOK=absent$/m)
+  assert.match(run(['legacy_fence_verdict=absent-ish'], 'legacy_fence_verdict', VERDICT).output, /^REFUSED$/m)
+  assert.match(run(['legacy_fence_verdict=stands', 'legacy_fence_verdict=absent'], 'legacy_fence_verdict', VERDICT).output, /^REFUSED$/m,
     'and a stream that says both is not evidence for either')
 })
