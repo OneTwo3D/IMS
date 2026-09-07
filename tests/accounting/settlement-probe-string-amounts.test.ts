@@ -2243,3 +2243,283 @@ test('[o3d-jfhi] the contradiction checks still catch a genuine contradiction, b
     'and the sentence names the term that made it impossible, so an operator can act on it')
   assert.notEqual(classifyLedgerSettlement(attemptFor('400.00'), impossible).outcome, 'clear')
 })
+
+
+/* ------------------------------------------------------------------------------------------- *
+ * o3d-acctmoney r2 (Codex HIGH) — THE SAME RULE ABOUT THE SAME FIELD IS RIGHT ON ONE ARM AND
+ * WRONG ON THE OTHER, BECAUSE THE TERM IS ADDED IN ONE AND SUBTRACTED IN THE OTHER.
+ *
+ * THE DEFECT. The credit-note arm summed every entry of `Payments` into the term it SUBTRACTS from
+ * the note's allocation usage, without inspecting `Payment.Status`. The shared `Payment` schema
+ * enumerates that field as `AUTHORISED` / `DELETED`, and deletion REVERSES a payment: Xero returns
+ * the money to `RemainingCredit`, so a deleted refund is not one of the things `RemainingCredit` is
+ * net of. Subtracting it anyway UNDERSTATES how much of the credit has been allocated, and an
+ * understatement that reaches zero over an EMPTY `Allocations` collection is a proved-empty
+ * allocation list forged out of the incomplete one being checked — the false `clear` this probe
+ * exists to prevent, and the thing that authorises allocating the same credit twice.
+ *
+ * WHY THE STANDING SAFETY ARGUMENT MISSED IT. The round before this one argued that every
+ * over-subtraction is caught by the collection it over-subtracted past, because that collection still
+ * sums to the true usage and therefore EXCEEDS the understated figure. That needs a collection with
+ * something in it to exceed WITH. Here it comes back empty, and an empty collection switches the
+ * excess check off entirely.
+ *
+ * AND THE INVOICE ARM IS DELIBERATELY LEFT ALONE, which the last test below is about. There
+ * `Payments` is an ADDED term, counting a deleted payment makes the collection EXCEED `AmountPaid`,
+ * and an excess withholds proof rather than clearing — while FILTERING would make the collection
+ * short of an `AmountPaid` Xero did in fact count and HARD-REFUSE an ordinary invoice.
+ *
+ * Every test below states the PRECONDITION it turns on and names the mutation that was measured to
+ * make it fail.
+ * ------------------------------------------------------------------------------------------- */
+
+/** Codex's shape, verbatim: a real 100 allocated, an empty collection, and a reversed 100 refund. */
+const DELETED_REFUND_NOTE = {
+  CurrencyCode: 'GBP',
+  Total: 400,
+  RemainingCredit: 300,
+  Allocations: [],
+  Payments: [{ PaymentID: 'PAY-R1', Amount: 100, Status: 'DELETED' }],
+} as const
+
+test('[o3d-acctmoney r2] Codex\'s exact shape cannot clear: a DELETED refund is not subtracted', async () => {
+  // ROUTE: probeXeroSettlement's credit-note arm -> creditNoteRefundInclusion(Status 'DELETED') ->
+  //        counts:false -> the payment is dropped before `refundReadings` -> `refunded` = 0 ->
+  //        `applied` = 400 - 300 - 0 - 0 = 100 -> statesAnything(100) true -> allocated = 0 ->
+  //        shortBy(100, 0) -> ok:false -> classifyLedgerSettlement -> `unknown`, not `clear`.
+  // MUTATION: delete the `.filter((_pmt, index) => refundInclusions[index]!.counts)` line — i.e.
+  //        restore `notePayments.map(...)`, which is what stood at af7b9458. Measured: ok:true,
+  //        provedComplete:true, records [], classifier `clear` — the false clear, exactly.
+
+  // PRECONDITION 1 — the note really does say 100 of the credit has been used. If it did not there
+  // would be nothing for the deleted refund to conceal and this test would examine nothing.
+  assert.equal(DELETED_REFUND_NOTE.Total - DELETED_REFUND_NOTE.RemainingCredit, 100,
+    'PRECONDITION: Total less RemainingCredit says 100 of the credit has been spent...')
+  assert.equal(DELETED_REFUND_NOTE.Allocations.length, 0,
+    '...and the collection that is supposed to itemise it is EMPTY, which is the incompleteness')
+  // PRECONDITION 2 — and the deleted refund is EXACTLY the size of the gap, so counting it makes the
+  // usage come out at a clean zero. A refund of any other size would be caught by the arithmetic
+  // rather than by the status, and the finding would not be reachable.
+  assert.equal(DELETED_REFUND_NOTE.Payments[0]!.Amount, 100,
+    'PRECONDITION: the reversed refund is the same 100, so counting it forges a proved ZERO')
+  assert.equal(DELETED_REFUND_NOTE.Payments[0]!.Status, 'DELETED',
+    'PRECONDITION: and the ledger has said, in the enumerated field, that it was reversed')
+
+  const probe = await probeNote(DELETED_REFUND_NOTE)
+  assert.equal(probe.ok, false, 'a reversed refund cannot certify an empty allocation collection')
+  assert.match(reasonOf(probe), /100\.00 of this credit note already applied but returned no allocations/)
+  const verdict = classifyLedgerSettlement(attemptFor('100.00'), probe)
+  assert.notEqual(verdict.outcome, 'clear',
+    'and `clear` is what would authorise allocating the missing 100 a SECOND time')
+  assert.equal(verdict.outcome, 'unknown')
+
+  // ABSENT `Allocations` IS THE SAME CASE. Codex names both spellings, and in JavaScript an omitted
+  // collection and an empty one are the same value — which is the difference between "this credit was
+  // applied to nothing" and "Xero did not send the collection".
+  const absentCollection = await probeNote({
+    CurrencyCode: 'GBP', Total: 400, RemainingCredit: 300,
+    Payments: [{ PaymentID: 'PAY-R1', Amount: 100, Status: 'DELETED' }],
+  })
+  assert.equal(absentCollection.ok, false, 'an ABSENT allocation collection is not proved by a reversed refund either')
+  assert.notEqual(classifyLedgerSettlement(attemptFor('100.00'), absentCollection).outcome, 'clear')
+
+  // THE DISCRIMINATING HALF, and it is the property this fix must not break: the SAME note with the
+  // status unstated is an ordinary refunded credit note and still classifies normally. If this
+  // cleared for the wrong reason — because the arm had started refusing refunds outright — the
+  // assertion above would pass while the fix was a regression.
+  const ordinary = await probeNote({
+    CurrencyCode: 'GBP', Total: 400, RemainingCredit: 300, Allocations: [],
+    Payments: [{ PaymentID: 'PAY-R1', Amount: 100 }],
+  })
+  assert.equal(ordinary.ok, true, 'an ordinary refunded credit note is not an incoherent response')
+  assert.equal(ordinary.ok === true ? ordinary.provedComplete : null, true,
+    'its emptiness is still proved by the identity, exactly as o3d-jfhi left it')
+  assert.equal(classifyLedgerSettlement(attemptFor('300.00'), ordinary).outcome, 'clear',
+    'and the 300 that remains is still allocatable on the first attempt')
+
+  // AND AN EXCLUDED PAYMENT'S AMOUNT IS NEVER READ, so an unreadable amount on a DELETED payment does
+  // not refuse — there is nothing this code was going to do with the figure. The direction is safe
+  // because dropping a term from a SUBTRACTED sum can only make the usage LARGER, which refuses
+  // visibly. The control immediately after is what proves the exclusion is doing the work.
+  const COHERENT = { CurrencyCode: 'GBP', Total: 400, RemainingCredit: 400, Allocations: [] }
+  const deletedUnreadable = await probeNote({
+    ...COHERENT, Payments: [{ PaymentID: 'PAY-R1', Amount: 'a hundred', Status: 'DELETED' }],
+  })
+  assert.equal(deletedUnreadable.ok, true, 'a figure that is never subtracted is not a figure that must be read')
+  assert.equal(classifyLedgerSettlement(attemptFor('400.00'), deletedUnreadable).outcome, 'clear')
+  const countedUnreadable = await probeNote({
+    ...COHERENT, Payments: [{ PaymentID: 'PAY-R1', Amount: 'a hundred' }],
+  })
+  assert.equal(countedUnreadable.ok, false,
+    'PRECONDITION: the identical unreadable amount on a COUNTED payment still refuses (o3d-jfhi), so '
+    + 'the case above turns on the exclusion and not on the reader having gone soft')
+  assert.match(reasonOf(countedUnreadable), /a hundred on a payment against this credit note/)
+})
+
+test('[o3d-acctmoney r2] an ordinary refunded credit note still classifies normally, in every spelling', async () => {
+  // ROUTE: creditNoteRefundInclusion -> the status is absent, or AUTHORISED in either case, and the
+  //        type is absent or one of the two credit-note refund spellings -> counts:true -> the term
+  //        is subtracted exactly as before -> `applied` = 0 -> proved zero -> `clear`.
+  // MUTATION: make an ABSENT `Status` refuse (drop the `status.token !== null` guard on the
+  //        unenumerated-status branch). Measured: every case below stops clearing, which is every
+  //        ordinary refunded credit note in the system — the harm o3d-jfhi's round removed.
+  // MUTATION 2: make `counts` `status.token === XERO_PAYMENT_STATUS_AUTHORISED` instead of
+  //        `!== XERO_PAYMENT_STATUS_DELETED`. Measured: the UNSTATED and lower-case cases stop
+  //        clearing (ok:false, "100.00 ... already applied but returned no allocations").
+
+  const REFUNDED = { CurrencyCode: 'GBP', Total: 400, RemainingCredit: 300, Allocations: [] }
+  // PRECONDITION — without the refund term this note is a shortfall, so every case below is
+  // genuinely deciding whether the refund was counted rather than agreeing about nothing.
+  const withoutRefund = await probeNote(REFUNDED)
+  assert.equal(withoutRefund.ok, false,
+    'PRECONDITION: with no refund to explain it, 100 of this credit is unaccounted for and refuses')
+
+  for (const [label, payment] of [
+    ['no status and no type at all', { PaymentID: 'PAY-R1', Amount: 100 }],
+    ['an explicit AUTHORISED', { PaymentID: 'PAY-R1', Amount: 100, Status: 'AUTHORISED' }],
+    ['a lower-case authorised', { PaymentID: 'PAY-R1', Amount: 100, Status: 'authorised' }],
+    ['a padded AUTHORISED', { PaymentID: 'PAY-R1', Amount: 100, Status: '  AUTHORISED  ' }],
+    ['an ARCREDITPAYMENT', { PaymentID: 'PAY-R1', Amount: 100, PaymentType: 'ARCREDITPAYMENT' }],
+    ['an APCREDITPAYMENT', { PaymentID: 'PAY-R1', Amount: 100, PaymentType: 'APCREDITPAYMENT' }],
+    ['both fields stated', { PaymentID: 'PAY-R1', Amount: 100, Status: 'AUTHORISED', PaymentType: 'APCREDITPAYMENT' }],
+  ] as const) {
+    const probe = await probeNote({ ...REFUNDED, Payments: [payment] })
+    assert.equal(probe.ok, true, `${label}: a refund Xero has not reversed is still a term`)
+    assert.equal(probe.ok === true ? probe.provedComplete : null, true,
+      `${label}: so the empty allocation collection is proved by the identity, not assumed`)
+    assert.equal(classifyLedgerSettlement(attemptFor('300.00'), probe).outcome, 'clear',
+      `${label}: and the first allocation of the remaining 300 still posts`)
+  }
+
+  // AND THE MIXED NOTE, because an authorised refund and a reversed one must not cancel out: 400
+  // face, 100 genuinely refunded, 100 reversed, 100 allocated to another document.
+  const MIXED = {
+    CurrencyCode: 'GBP',
+    Total: 400,
+    RemainingCredit: 200,
+    Allocations: [{ Amount: 100, Date: '2026-06-01T00:00:00', Invoice: { InvoiceID: 'other-inv' } }],
+    Payments: [
+      { PaymentID: 'PAY-R1', Amount: 100, Status: 'AUTHORISED' },
+      { PaymentID: 'PAY-R2', Amount: 100, Status: 'DELETED' },
+    ],
+  }
+  // PRECONDITION — counting BOTH payments would put the usage at 0 against a collection of 100,
+  // which is the excess direction; counting the authorised one alone puts it at 100, which agrees.
+  assert.equal(MIXED.Total - MIXED.RemainingCredit, 200, 'PRECONDITION: 200 has come off the note...')
+  assert.equal(MIXED.Allocations[0]!.Amount, 100, '...of which 100 is itemised as an allocation')
+  const mixed = await probeNote(MIXED)
+  assert.equal(mixed.ok, true, 'the reversed refund is dropped and the remaining terms agree at 100')
+  assert.equal(mixed.ok === true ? mixed.provedComplete : null, true,
+    'so the collection is proved complete rather than contradicted by a payment Xero has undone')
+  assert.equal(classifyLedgerSettlement(attemptFor('200.00'), mixed).outcome, 'clear')
+})
+
+test('[o3d-acctmoney r2] a status or payment type the contract does not enumerate REFUSES', async () => {
+  // ROUTE: creditNoteRefundInclusion -> wireEnum -> the token is neither documented value (or is not
+  //        a readable token at all) -> `unaccountable` -> the explicit refusal beside the arithmetic
+  //        -> ok:false -> the classifier cannot reach `clear`.
+  // MUTATION: replace each `unaccountable` return with `{ counts: true, unaccountable: null }` — i.e.
+  //        count the unknown payment. Measured: every case below answers ok:true with
+  //        provedComplete:true and the classifier says `clear`. Replacing it with
+  //        `{ counts: false, unaccountable: null }` — silently dropping it — clears too. Both
+  //        directions of the guess are measured, which is why the rule refuses instead of picking.
+
+  // The base note is COHERENT AT ZERO and the payment's amount is ZERO, so counting the entry and
+  // dropping it produce the SAME arithmetic. Nothing but the status or type rule can decide these,
+  // which is what makes each refusal attributable rather than incidental.
+  const BASE = { CurrencyCode: 'GBP', Total: 400, RemainingCredit: 400, Allocations: [] }
+  const control = await probeNote({ ...BASE, Payments: [{ PaymentID: 'PAY-R1', Amount: 0, Status: 'AUTHORISED' }] })
+  assert.equal(control.ok, true,
+    'PRECONDITION: with a DOCUMENTED status this exact note is accepted, so nothing else does the refusing')
+  assert.equal(classifyLedgerSettlement(attemptFor('400.00'), control).outcome, 'clear',
+    'PRECONDITION: and it reaches clear, which is what each refusal below has to take away')
+
+  for (const [field, stated, named] of [
+    ['Status', 'VOIDED', 'a payment status of VOIDED'],
+    ['Status', 'REVERSED', 'a payment status of REVERSED'],
+    ['Status', '', 'a payment status of \\(blank\\)'],
+    ['Status', 5, 'a payment status of number'],
+    ['Status', { code: 'DELETED' }, 'a payment status of object'],
+    ['PaymentType', 'ACCRECPAYMENT', 'a payment type of ACCRECPAYMENT'],
+    ['PaymentType', 'APOVERPAYMENTPAYMENT', 'a payment type of APOVERPAYMENTPAYMENT'],
+    ['PaymentType', '', 'a payment type of \\(blank\\)'],
+    ['PaymentType', 7, 'a payment type of number'],
+  ] as const) {
+    const probe = await probeNote({
+      ...BASE, Payments: [{ PaymentID: 'PAY-R1', Amount: 0, [field]: stated }],
+    })
+    assert.equal(probe.ok, false,
+      `a ${field} of ${JSON.stringify(stated)} is not something IMS may count OR drop on its own judgement`)
+    assert.match(reasonOf(probe), new RegExp(named),
+      'and the refusal NAMES what it could not account for, so an operator is told which field it was')
+    assert.match(reasonOf(probe), /cannot account for/)
+    assert.notEqual(classifyLedgerSettlement(attemptFor('400.00'), probe).outcome, 'clear')
+  }
+
+  // AND AN UNKNOWN STATUS ON A NOTE THAT WOULD OTHERWISE CLEAR THROUGH THE PROVED-ZERO PATH — the
+  // shape the whole finding is about — is refused rather than reaching it by either route.
+  const unknownOnCodexShape = await probeNote({
+    ...DELETED_REFUND_NOTE, Payments: [{ PaymentID: 'PAY-R1', Amount: 100, Status: 'PENDING' }],
+  })
+  assert.equal(unknownOnCodexShape.ok, false, 'the unknown status refuses before the arithmetic can be spent')
+  assert.match(reasonOf(unknownOnCodexShape), /a payment status of PENDING/)
+  assert.notEqual(classifyLedgerSettlement(attemptFor('100.00'), unknownOnCodexShape).outcome, 'clear')
+})
+
+test('[o3d-acctmoney r2] the INVOICE arm still tolerates a DELETED payment without hard-refusing', async () => {
+  // THE ASYMMETRY, MEASURED RATHER THAN ASSERTED. This is the test that would fail if someone read
+  // the credit-note rule above and "made the two arms consistent".
+  //
+  // ROUTE: probeXeroSettlement's invoice arm -> `wireAmounts` sums EVERY payment, status and all ->
+  //        `seen` = 200 = `AmountPaid` -> no shortfall, no excess -> settled 200 = explained 200 ->
+  //        settlementAnswer(200, false, records) -> provedComplete:true -> `clear`.
+  // MUTATION: apply the credit-note rule here — filter `invoice.Payments` through
+  //        `creditNoteRefundInclusion` before building `wireAmounts`. Measured: `seen` becomes 100
+  //        against an `AmountPaid` of 200, `shortBy` fires, and the probe answers ok:false — "Xero
+  //        reports 200.00 paid against this document but returned payments totalling 100.00" — over
+  //        an ORDINARY part-paid invoice. That is the irreversible-workflow direction, and it is why
+  //        this arm does not filter.
+
+  const INVOICE_WITH_DELETED = {
+    CurrencyCode: 'GBP',
+    Total: 400,
+    AmountDue: 200,
+    AmountPaid: 200,
+    AmountCredited: 0,
+    Payments: [
+      { PaymentID: 'PAY-1', Date: `${DATE}T00:00:00`, Amount: 100, Status: 'AUTHORISED' },
+      { PaymentID: 'PAY-2', Date: `${DATE}T00:00:00`, Amount: 100, Status: 'DELETED' },
+    ],
+  }
+  // PRECONDITION 1 — Xero's own total COUNTS both entries, which is what makes filtering a shortfall
+  // rather than a tidy-up. If it counted only one, excluding the deleted payment would agree and the
+  // test would be examining nothing.
+  assert.equal(INVOICE_WITH_DELETED.Payments.reduce((sum, pay) => sum + pay.Amount, 0), 200)
+  assert.equal(INVOICE_WITH_DELETED.AmountPaid, 200,
+    'PRECONDITION: `AmountPaid` equals the WHOLE collection, deleted entry included')
+  // PRECONDITION 2 — and there is a DELETED entry to be tempted by.
+  assert.equal(INVOICE_WITH_DELETED.Payments[1]!.Status, 'DELETED')
+
+  const probe = await probeInvoice(INVOICE_WITH_DELETED)
+  assert.equal(probe.ok, true,
+    'the invoice arm does NOT hard-refuse an ordinary invoice over a status field it deliberately ignores')
+  assert.equal(probe.ok === true ? probe.records.length : -1, 2,
+    'both payments are still RECORDS, because a record is evidence of an attempt rather than a term')
+  assert.equal(probe.ok === true ? probe.provedComplete : null, true,
+    'and the collection agrees with `AmountPaid` exactly, so it is proved whole')
+
+  // AND THE DIRECTION THE INVOICE ARM FAILS IN, when Xero does NOT count the deleted payment: the
+  // collection comes out ABOVE `AmountPaid`, which is `exceeds` — proof withheld, `unknown`, never
+  // `clear`. That is the whole reason no filter is needed here.
+  const NOT_COUNTED = { ...INVOICE_WITH_DELETED, AmountDue: 300, AmountPaid: 100 }
+  assert.equal(NOT_COUNTED.AmountPaid, 100,
+    'PRECONDITION: now Xero states only the authorised 100 while the collection still lists 200')
+  const excess = await probeInvoice(NOT_COUNTED)
+  assert.equal(excess.ok, true, 'an excess withholds the proof; it does not refuse the probe')
+  assert.equal(excess.ok === true ? excess.provedComplete : null, false,
+    'the collection overruns the total that summarises it, so nothing is proved from it')
+  const verdict = classifyLedgerSettlement(attemptFor('400.00'), excess)
+  assert.equal(verdict.outcome, 'unknown',
+    'so the invoice arm reaches `unknown` on its own, with no status rule and no hard refusal')
+  assert.equal(verdict.outcome === 'unknown' ? verdict.cause : null, 'collection-unproved')
+})
