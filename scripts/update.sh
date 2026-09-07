@@ -5294,14 +5294,17 @@ fi
 cd "${APP_DIR}"
 
 header "Generating Prisma client"
+prisma_generate_rc=0
 run run_as_user "${APP_USER}" env DATABASE_URL="${MIGRATION_DATABASE_URL}" \
-  npx prisma generate --schema "${APP_DIR}/prisma/schema.prisma"
-success "Prisma client generated."
+  npx prisma generate --schema "${APP_DIR}/prisma/schema.prisma" || prisma_generate_rc=$?
 # A BUILD IS A DATABASE CONSUMER TOO, ON THE RECOVERY PATH (o3d-secops r33, Codex HIGH 1). On an
 # ordinary run this is a no-op: no fence is standing yet, so pin_migration_window() returns at once.
 # On a run that ADOPTED a standing fence it is not -- the migration URL is live by then, the sampler
 # is armed, and this step reaches the database through the same movable string as everything below.
+# Status captured, pin first, failure propagated after it (o3d-secops r34, Codex HIGH 2).
 pin_migration_window "The Prisma client generation"
+[[ "${prisma_generate_rc}" -eq 0 ]] || die "prisma generate exited ${prisma_generate_rc} — see above. Nothing has been stopped and nothing has been migrated."
+success "Prisma client generated."
 
 if ! $SKIP_BUILD; then
   header "Building the application"
@@ -5311,10 +5314,13 @@ if ! $SKIP_BUILD; then
   # DATABASE_URL and this changes nothing; under a held fence, without it, anything the
   # build touches in the database fails with "permission denied for database" — the fence
   # working as intended, presenting as a build error.
+  build_rc=0
   run run_as_user "${APP_USER}" env DATABASE_URL="${MIGRATION_DATABASE_URL}" \
-    npm run build --prefix "${APP_DIR}"
-  success "Build complete."
+    npm run build --prefix "${APP_DIR}" || build_rc=$?
+  # Status captured, pin first, failure propagated after it (o3d-secops r34, Codex HIGH 2).
   pin_migration_window "The build"
+  [[ "${build_rc}" -eq 0 ]] || die "Build failed — see above. Nothing has been stopped and nothing has been migrated."
+  success "Build complete."
 fi
 
 # ---------------------------------------------------------------------------
@@ -5470,13 +5476,16 @@ fence_db_connections
 if $DRY_RUN; then
   echo -e "${YELLOW}[DRY]${RESET}   would run: node scripts/check-db-writers.mjs"
 else
+  drain_probe_rc=0
   run_as_user "${APP_USER}" env \
     DATABASE_URL="${MIGRATION_DATABASE_URL}" \
     DEPLOY_ADMIN_DATABASE_URL="${DEPLOY_ADMIN_DATABASE_URL}" \
     node "${APP_DIR}/scripts/check-db-writers.mjs" \
-    || die "Another client is still connected to the database. Stop it and re-run; nothing has been migrated."
-  success "No other client backends on the database."
+    || drain_probe_rc=$?
+  # Status captured, pin first, failure propagated after it (o3d-secops r34, Codex HIGH 2).
   pin_migration_window "The drain probe"
+  [[ "${drain_probe_rc}" -eq 0 ]] || die "Another client is still connected to the database. Stop it and re-run; nothing has been migrated."
+  success "No other client backends on the database."
 fi
 
 # ---------------------------------------------------------------------------
@@ -5501,7 +5510,19 @@ else
   mkdir -p "${BACKUP_DIR}"
   info "Backing up database to ${BACKUP_TARGET}..."
   BACKUP_PARTIAL="${BACKUP_TARGET}.part"
-  if ! pg_dump "${MIGRATION_DATABASE_URL}" | gzip > "${BACKUP_PARTIAL}"; then
+  backup_rc=0
+  pg_dump "${MIGRATION_DATABASE_URL}" | gzip > "${BACKUP_PARTIAL}" || backup_rc=$?
+  # THE RESTORE POINT IS PLACED BEFORE IT IS OFFERED AS ONE (o3d-secops r33, Codex HIGH 2).
+  # `pg_dump` is a consumer of the same movable string as everything else, and the aggregate
+  # sighting could be satisfied entirely by prisma -- so a dump of ANOTHER cluster was recordable
+  # here as this run's restore point with every gate green.
+  #
+  # AND IT IS PLACED WHETHER OR NOT THE DUMP FINISHED (o3d-secops r34, Codex HIGH 2). A dump that
+  # read another cluster and then failed part-way is the one whose placement is worth having: it
+  # says the string moved before the migration, which the fence record cannot.
+  # Status captured, pin first, failure propagated after it (o3d-secops r34, Codex HIGH 2).
+  pin_migration_window "The pre-migration backup"
+  if [[ "${backup_rc}" -ne 0 ]]; then
     rm -f "${BACKUP_PARTIAL}"
     die "pg_dump did not complete; the partial file has been deleted. Nothing has been migrated and there is no restore point for this run."
   fi
@@ -5509,11 +5530,6 @@ else
   BACKUP_FILE="${BACKUP_TARGET}"
   success "Backup saved: ${BACKUP_FILE}"
   ls -t "${BACKUP_DIR}"/pre-update-*.sql.gz 2>/dev/null | tail -n +11 | xargs -r rm --
-  # THE RESTORE POINT IS PLACED BEFORE IT IS OFFERED AS ONE (o3d-secops r33, Codex HIGH 2).
-  # `pg_dump` is a consumer of the same movable string as everything else, and the aggregate
-  # sighting could be satisfied entirely by prisma -- so a dump of ANOTHER cluster was recordable
-  # here as this run's restore point with every gate green.
-  pin_migration_window "The pre-migration backup"
 fi
 
 header "Running database migrations"
@@ -5522,16 +5538,36 @@ header "Running database migrations"
 # exit trap: an interrupted, half-applied or SIGKILLed migration is exactly what the flag is
 # for, and a flag that only ever reached shell memory is false for every one of them.
 mark_schema_touched
+migrate_rc=0
 run run_as_user "${APP_USER}" env DATABASE_URL="${MIGRATION_DATABASE_URL}" \
-  npx prisma migrate deploy --schema prisma/schema.prisma
-success "Migrations applied."
+  npx prisma migrate deploy --schema prisma/schema.prisma || migrate_rc=$?
+# AND ITS PLACEMENT RUNS WHATEVER THE STEP DID (o3d-secops r34, Codex HIGH 2). Every consumer
+# in this file was written so that a non-zero exit left the script BEFORE its pin -- `set -e`
+# for the bare ones, an explicit `|| die` for the rest. The chain r33 built was therefore
+# complete only for consumers that SUCCEEDED, and the consumer whose placement matters most is
+# the other one: a stable redirect sends the migration to another cluster, it partially applies
+# DDL and then fails, and nothing ever asks where it ran. ${DB_FENCE_UP} is still true, so the
+# exit trap re-fences and reports an unknown schema state for the ORIGINAL database and says
+# nothing at all about the one the DDL reached.
+#
+# SO THE STATUS IS CAPTURED, THE PIN RUNS, AND ONLY THEN IS THE FAILURE PROPAGATED, and that
+# order is the point rather than an accident of layout. pin_migration_window() DIES on a
+# placement refusal, so a step that both failed AND cannot be placed reports the PLACEMENT --
+# "whatever that step wrote may be on another server, the fence is STILL UP" -- and never the
+# exit status, which is the weaker of the two answers and would mask it. The exit status is
+# propagated only once the placement has been established.
 pin_migration_window "The migration"
+[[ "${migrate_rc}" -eq 0 ]] || die "prisma migrate deploy exited ${migrate_rc} — see above. THE SCHEMA MAY HAVE PARTLY MOVED: a migration that fails part-way has applied what ran before the statement that failed. The step above has just been placed on the server this run fenced, so what it applied is on that server. The new version has NOT been started and the connection fence is STILL UP."
+success "Migrations applied."
 
 header "Validating database schema"
+drift_rc=0
 run run_as_user "${APP_USER}" env DATABASE_URL="${MIGRATION_DATABASE_URL}" \
-  node "${APP_DIR}/scripts/check-prisma-drift.mjs"
-success "Database schema matches prisma/schema.prisma."
+  node "${APP_DIR}/scripts/check-prisma-drift.mjs" || drift_rc=$?
+# Status captured, pin first, failure propagated after it (o3d-secops r34, Codex HIGH 2).
 pin_migration_window "The drift check"
+[[ "${drift_rc}" -eq 0 ]] || die "The deployed schema does not match prisma/schema.prisma — see above. The new version has NOT been started."
+success "Database schema matches prisma/schema.prisma."
 
 # AND THAT THE APPLICATION CAN ACTUALLY USE WHAT JUST LANDED (o3d-2sm1.5, Codex r4 CRITICAL).
 # Everything above — prisma, the drift check, pg_dump — runs on the ADMIN connection, which
@@ -5540,12 +5576,15 @@ pin_migration_window "The drift check"
 # success reported, and every request touching the new table failing with "permission denied".
 # This asks the database about the APPLICATION role, the one question none of the others ask.
 header "Checking the application role can use what the migration created"
+object_access_rc=0
 run run_as_user "${APP_USER}" env \
   DATABASE_URL="${MIGRATION_DATABASE_URL}" \
   DEPLOY_ADMIN_DATABASE_URL="${DEPLOY_ADMIN_DATABASE_URL}" \
   node "${DB_OBJECT_ACCESS_SCRIPT}" --state-file="${DB_FENCE_STATE}" \
-  || die "The migration left objects the application role cannot use — see above. The new version has NOT been started."
+  || object_access_rc=$?
+# Status captured, pin first, failure propagated after it (o3d-secops r34, Codex HIGH 2).
 pin_migration_window "The object-access check"
+[[ "${object_access_rc}" -eq 0 ]] || die "The migration left objects the application role cannot use — see above. The new version has NOT been started."
 success "The application role can use everything in the database."
 
 # ---------------------------------------------------------------------------
@@ -5561,12 +5600,12 @@ header "Running the migrations' own verification checks"
 if $DRY_RUN; then
   echo -e "${YELLOW}[DRY]${RESET}   would run: node scripts/run-migration-verifications.mjs"
 else
+  verify_hook_rc=0
   run_as_user "${APP_USER}" env \
     DATABASE_URL="${MIGRATION_DATABASE_URL}" \
     DEPLOY_ADMIN_DATABASE_URL="${DEPLOY_ADMIN_DATABASE_URL}" \
     node "${APP_DIR}/scripts/run-migration-verifications.mjs" \
-    || die "A migration's verification check did not return zero. The new version has NOT been started."
-  success "Every declared verification check returned zero (see the coverage report above for what was NOT declared)."
+    || verify_hook_rc=$?
   # AND ONLY NOW IS IT ASKED WHERE ALL OF THAT LANDED (o3d-secops r32, Codex HIGH 2 / o3d-mzcp).
   # Here rather than after `prisma migrate deploy`, because every consumer above -- the drain
   # probe, pg_dump, prisma, the drift check, the object-access check and this verification hook,
@@ -5575,7 +5614,13 @@ else
   # (o3d-secops r33, Codex HIGH 2), because one sighting of the shared stamp can never say that
   # every consumer was bound; this is the last link of that chain. Before the new version is
   # started, because starting is the first thing that would serve a schema this run cannot place.
+  #
+  # AND BEFORE THE HOOK'S OWN FAILURE IS PROPAGATED (o3d-secops r34, Codex HIGH 2). This is the
+  # last consumer, so the gate is its placement; running it only when the hook SUCCEEDED left the
+  # window unplaced on exactly the run where a verification query had just read the wrong server.
   require_migration_landed_on_fenced_server
+  [[ "${verify_hook_rc}" -eq 0 ]] || die "A migration's verification check did not return zero. The new version has NOT been started."
+  success "Every declared verification check returned zero (see the coverage report above for what was NOT declared)."
 fi
 
 # ---------------------------------------------------------------------------

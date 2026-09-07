@@ -4524,18 +4524,21 @@ if ! $SKIP_BUILD; then
     # the database would otherwise fail with "permission denied for database", which is
     # the fence working as intended and not a build error. On a normal run
     # MIGRATION_DATABASE_URL is empty and this is exactly `as_app_user`.
-    if ! as_app_user_db npm run build >"$BUILD_LOG" 2>&1; then
-      tail -40 "$BUILD_LOG" >&2
-      die "Build failed — see $BUILD_LOG. Nothing has been stopped and nothing has been migrated."
-    fi
-    tail -5 "$BUILD_LOG"
-    ok "Build complete."
+    build_rc=0
+    as_app_user_db npm run build >"$BUILD_LOG" 2>&1 || build_rc=$?
     # A BUILD IS A DATABASE CONSUMER TOO, ON THE RECOVERY PATH (o3d-secops r33, Codex HIGH 1). On
     # an ordinary run this is a no-op: no fence is standing yet, so pin_migration_window() returns
     # at once. On a run that ADOPTED a standing fence it is not -- the migration URL is live by
     # then, the sampler is armed, and this step reaches the database through the same movable
     # string as everything below.
+    # Status captured, pin first, failure propagated after it (o3d-secops r34, Codex HIGH 2).
     pin_migration_window "The build"
+    if [[ "$build_rc" -ne 0 ]]; then
+      tail -40 "$BUILD_LOG" >&2
+      die "Build failed — see $BUILD_LOG. Nothing has been stopped and nothing has been migrated."
+    fi
+    tail -5 "$BUILD_LOG"
+    ok "Build complete."
   fi
 fi
 
@@ -4632,10 +4635,12 @@ elif ! $RESTART_ONLY; then
   if $DRY_RUN; then
     echo -e "${YELLOW}[DRY]${RESET}   would run: node scripts/check-wms-push-state-enum.mjs  (as ${APP_USER})"
   else
-    as_app_user_db node scripts/check-wms-push-state-enum.mjs \
-      || die "This database does not have the WMS push-state vocabulary this build writes, and ${SKIP_MIGRATE_FLAG} applies no migration that would give it one. Re-run without ${SKIP_MIGRATE_FLAG} (add --skip-build if the build on disk is the one you want). Nothing has been stopped."
-    ok "WMS push-state vocabulary present."
+    push_state_rc=0
+    as_app_user_db node scripts/check-wms-push-state-enum.mjs || push_state_rc=$?
+    # Status captured, pin first, failure propagated after it (o3d-secops r34, Codex HIGH 2).
     pin_migration_window "The WMS push-state vocabulary check"
+    [[ "$push_state_rc" -eq 0 ]] || die "This database does not have the WMS push-state vocabulary this build writes, and ${SKIP_MIGRATE_FLAG} applies no migration that would give it one. Re-run without ${SKIP_MIGRATE_FLAG} (add --skip-build if the build on disk is the one you want). Nothing has been stopped."
+    ok "WMS push-state vocabulary present."
   fi
 fi
 ok "Artefact validated."
@@ -4939,10 +4944,12 @@ if ! $DRY_RUN && ! $SKIP_MIGRATE; then
   fence_db_connections
 
   info "Asking Postgres whether anything else is still connected..."
-  as_app_user_db node scripts/check-db-writers.mjs \
-    || die "Another client is still connected to the target database. Stop it and re-run; the migration has NOT been applied."
-  ok "No other client backends on the target database."
+  drain_probe_rc=0
+  as_app_user_db node scripts/check-db-writers.mjs || drain_probe_rc=$?
+  # Status captured, pin first, failure propagated after it (o3d-secops r34, Codex HIGH 2).
   pin_migration_window "The drain probe"
+  [[ "$drain_probe_rc" -eq 0 ]] || die "Another client is still connected to the target database. Stop it and re-run; the migration has NOT been applied."
+  ok "No other client backends on the target database."
 fi
 
 # ---------------------------------------------------------------------------
@@ -4966,14 +4973,34 @@ if ! $SKIP_MIGRATE; then
     # times out, half-applies or is SIGKILLed is exactly the case the flag exists for,
     # and a flag that only ever reached shell memory is false for every one of them.
     mark_schema_touched
-    as_app_user_db npx prisma migrate deploy --schema prisma/schema.prisma
-    ok "Migrations applied."
+    migrate_rc=0
+    as_app_user_db npx prisma migrate deploy --schema prisma/schema.prisma || migrate_rc=$?
+    # AND ITS PLACEMENT RUNS WHATEVER THE STEP DID (o3d-secops r34, Codex HIGH 2). Every consumer
+    # in this file was written so that a non-zero exit left the script BEFORE its pin -- `set -e`
+    # for the bare ones, an explicit `|| die` for the rest. The chain r33 built was therefore
+    # complete only for consumers that SUCCEEDED, and the consumer whose placement matters most is
+    # the other one: a stable redirect sends the migration to another cluster, it partially applies
+    # DDL and then fails, and nothing ever asks where it ran. ${DB_FENCE_UP} is still true, so the
+    # exit trap re-fences and reports an unknown schema state for the ORIGINAL database and says
+    # nothing at all about the one the DDL reached.
+    #
+    # SO THE STATUS IS CAPTURED, THE PIN RUNS, AND ONLY THEN IS THE FAILURE PROPAGATED, and that
+    # order is the point rather than an accident of layout. pin_migration_window() DIES on a
+    # placement refusal, so a step that both failed AND cannot be placed reports the PLACEMENT --
+    # "whatever that step wrote may be on another server, the fence is STILL UP" -- and never the
+    # exit status, which is the weaker of the two answers and would mask it. The exit status is
+    # propagated only once the placement has been established.
     pin_migration_window "The migration"
+    [[ "$migrate_rc" -eq 0 ]] || die "prisma migrate deploy exited ${migrate_rc} — see above. THE SCHEMA MAY HAVE PARTLY MOVED: a migration that fails part-way has applied what ran before the statement that failed. The step above has just been placed on the server this run fenced, so what it applied is on that server. The new build has NOT been started and the connection fence is STILL UP."
+    ok "Migrations applied."
 
     info "Validating the deployed schema against prisma/schema.prisma..."
-    as_app_user_db node scripts/check-prisma-drift.mjs
-    ok "Database schema matches prisma/schema.prisma."
+    drift_rc=0
+    as_app_user_db node scripts/check-prisma-drift.mjs || drift_rc=$?
+    # Status captured, pin first, failure propagated after it (o3d-secops r34, Codex HIGH 2).
     pin_migration_window "The drift check"
+    [[ "$drift_rc" -eq 0 ]] || die "The deployed schema does not match prisma/schema.prisma — see above. The new build has NOT been started."
+    ok "Database schema matches prisma/schema.prisma."
 
     # AND THAT THE APPLICATION CAN ACTUALLY USE WHAT JUST LANDED (o3d-2sm1.5, Codex r4
     # CRITICAL). Everything above this line — prisma, the drift check, pg_dump — runs on the
@@ -4983,9 +5010,12 @@ if ! $SKIP_MIGRATE; then
     # every request touching the new table failed with "permission denied". This asks the
     # database about the APPLICATION role, which is the one question none of the others ask.
     info "Checking that the application role can use every table, view and sequence..."
+    object_access_rc=0
     as_app_user_db node scripts/check-app-db-object-access.mjs --state-file="$DB_FENCE_STATE" \
-      || die "The migration left objects the application role cannot use — see above. The new build has NOT been started."
+      || object_access_rc=$?
+    # Status captured, pin first, failure propagated after it (o3d-secops r34, Codex HIGH 2).
     pin_migration_window "The object-access check"
+    [[ "$object_access_rc" -eq 0 ]] || die "The migration left objects the application role cannot use — see above. The new build has NOT been started."
     ok "The application role can use everything in the database."
   fi
 else
@@ -5010,9 +5040,8 @@ if ! $SKIP_MIGRATE; then
   if $DRY_RUN; then
     echo -e "${YELLOW}[DRY]${RESET}   would run: node scripts/run-migration-verifications.mjs  (as ${APP_USER})"
   else
-    as_app_user_db node scripts/run-migration-verifications.mjs \
-      || die "A migration's verification check did not return zero. The new build has NOT been started."
-    ok "Every declared verification check returned zero (the coverage report above says what was NOT declared)."
+    verify_hook_rc=0
+    as_app_user_db node scripts/run-migration-verifications.mjs || verify_hook_rc=$?
     # AND ONLY NOW IS IT ASKED WHERE ALL OF THAT LANDED (o3d-secops r32, Codex HIGH 2 / o3d-mzcp).
     # Here rather than after `prisma migrate deploy`, because every one of the five consumers above
     # -- the drain probe, prisma, the drift check, the object-access check and this verification
@@ -5021,7 +5050,13 @@ if ! $SKIP_MIGRATE; then
     # r33, Codex HIGH 2), because one sighting of the shared stamp can never say that every
     # consumer was bound; this is the last link of that chain. Before the new build is started,
     # because starting is the first thing that would serve a schema this run cannot place.
+    #
+    # AND BEFORE THE HOOK'S OWN FAILURE IS PROPAGATED (o3d-secops r34, Codex HIGH 2). This is the
+    # last consumer, so the gate is its placement; running it only when the hook SUCCEEDED left the
+    # window unplaced on exactly the run where a verification query had just read the wrong server.
     require_migration_landed_on_fenced_server
+    [[ "$verify_hook_rc" -eq 0 ]] || die "A migration's verification check did not return zero. The new build has NOT been started."
+    ok "Every declared verification check returned zero (the coverage report above says what was NOT declared)."
   fi
 else
   step "Verification checks — SKIPPED (--skip-migrate)"

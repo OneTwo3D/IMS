@@ -8891,14 +8891,17 @@ CUTOVER_STEP="build"
 header "Generating Prisma client"
 
 cd "${APP_DIR}"
+prisma_generate_rc=0
 run_as_user "${APP_USER}" env DATABASE_URL="${MIGRATION_DATABASE_URL}" \
-  npx prisma generate --schema prisma/schema.prisma
-success "Prisma client generated."
+  npx prisma generate --schema prisma/schema.prisma || prisma_generate_rc=$?
 # A BUILD IS A DATABASE CONSUMER TOO, ON THE RECOVERY PATH (o3d-secops r33, Codex HIGH 1). On an
 # ordinary run this is a no-op: no fence is standing yet, so pin_migration_window() returns at once.
 # On a run that ADOPTED a standing fence it is not -- the migration URL is live by then, the sampler
 # is armed, and this step reaches the database through the same movable string as everything below.
+# Status captured, pin first, failure propagated after it (o3d-secops r34, Codex HIGH 2).
 pin_migration_window "The Prisma client generation"
+[[ "${prisma_generate_rc}" -eq 0 ]] || die "prisma generate exited ${prisma_generate_rc} — see above. The existing installation has NOT been stopped and nothing has been migrated."
+success "Prisma client generated."
 
 header "Building Next.js application (existing installation still serving)"
 
@@ -8908,10 +8911,13 @@ header "Building Next.js application (existing installation still serving)"
 # changes; inside one, without it, anything the build touches in the database fails with
 # "permission denied for database" — the fence working as intended, presenting as a build
 # error.
+build_rc=0
 run_as_user "${APP_USER}" env DATABASE_URL="${MIGRATION_DATABASE_URL}" \
-  npm run build --prefix "${APP_DIR}"
-success "Build complete."
+  npm run build --prefix "${APP_DIR}" || build_rc=$?
+# Status captured, pin first, failure propagated after it (o3d-secops r34, Codex HIGH 2).
 pin_migration_window "The build"
+[[ "${build_rc}" -eq 0 ]] || die "Build failed — see above. The existing installation has NOT been stopped and nothing has been migrated."
+success "Build complete."
 
 CUTOVER_STEP="validate"
 [[ -f "${APP_DIR}/.next/BUILD_ID" ]] || die \
@@ -9005,13 +9011,16 @@ if ${UPGRADE_EXISTING}; then
   # and the migration opens its own afterwards with nothing holding the gap.
   fence_db_connections
   info "Asking Postgres whether anything else is still connected..."
+  drain_probe_rc=0
   ( cd "${APP_DIR}" && run_as_user "${APP_USER}" env \
       DATABASE_URL="${MIGRATION_DATABASE_URL}" \
       DEPLOY_ADMIN_DATABASE_URL="${DEPLOY_ADMIN_DATABASE_URL}" \
       node "${APP_DIR}/scripts/check-db-writers.mjs" ) \
-    || die "Another client is still connected to the target database. Stop it and re-run; the migration has NOT been applied."
-  success "No other client backends on the target database."
+    || drain_probe_rc=$?
+  # Status captured, pin first, failure propagated after it (o3d-secops r34, Codex HIGH 2).
   pin_migration_window "The drain probe"
+  [[ "${drain_probe_rc}" -eq 0 ]] || die "Another client is still connected to the target database. Stop it and re-run; the migration has NOT been applied."
+  success "No other client backends on the target database."
 
   # AND ONLY NOW MAY A WORKING CREDENTIAL BE TAKEN AWAY (o3d-2sm1.5 r38, Codex HIGH). Nothing is
   # serving, the reboot fence is standing, the crontab is fenced, the port is free, the connection
@@ -9035,17 +9044,37 @@ CUTOVER_STEP="migrate"
 # is exactly what this flag exists for, and one that only ever reached shell memory is false
 # for every one of those cases.
 mark_schema_touched
+migrate_rc=0
 run_as_user "${APP_USER}" env DATABASE_URL="${MIGRATION_DATABASE_URL}" \
-  npx prisma migrate deploy --schema prisma/schema.prisma
-success "Database migrations applied."
+  npx prisma migrate deploy --schema prisma/schema.prisma || migrate_rc=$?
+# AND ITS PLACEMENT RUNS WHATEVER THE STEP DID (o3d-secops r34, Codex HIGH 2). Every consumer
+# in this file was written so that a non-zero exit left the script BEFORE its pin -- `set -e`
+# for the bare ones, an explicit `|| die` for the rest. The chain r33 built was therefore
+# complete only for consumers that SUCCEEDED, and the consumer whose placement matters most is
+# the other one: a stable redirect sends the migration to another cluster, it partially applies
+# DDL and then fails, and nothing ever asks where it ran. ${DB_FENCE_UP} is still true, so the
+# exit trap re-fences and reports an unknown schema state for the ORIGINAL database and says
+# nothing at all about the one the DDL reached.
+#
+# SO THE STATUS IS CAPTURED, THE PIN RUNS, AND ONLY THEN IS THE FAILURE PROPAGATED, and that
+# order is the point rather than an accident of layout. pin_migration_window() DIES on a
+# placement refusal, so a step that both failed AND cannot be placed reports the PLACEMENT --
+# "whatever that step wrote may be on another server, the fence is STILL UP" -- and never the
+# exit status, which is the weaker of the two answers and would mask it. The exit status is
+# propagated only once the placement has been established.
 pin_migration_window "The migration"
+[[ "${migrate_rc}" -eq 0 ]] || die "prisma migrate deploy exited ${migrate_rc} — see above. THE SCHEMA MAY HAVE PARTLY MOVED: a migration that fails part-way has applied what ran before the statement that failed. The step above has just been placed on the server this run fenced, so what it applied is on that server. Nothing has been started and the connection fence is STILL UP."
+success "Database migrations applied."
 
 header "Validating database schema"
 
+drift_rc=0
 run_as_user "${APP_USER}" env DATABASE_URL="${MIGRATION_DATABASE_URL}" \
-  node "${APP_DIR}/scripts/check-prisma-drift.mjs"
-success "Database schema matches prisma/schema.prisma."
+  node "${APP_DIR}/scripts/check-prisma-drift.mjs" || drift_rc=$?
+# Status captured, pin first, failure propagated after it (o3d-secops r34, Codex HIGH 2).
 pin_migration_window "The drift check"
+[[ "${drift_rc}" -eq 0 ]] || die "The deployed schema does not match prisma/schema.prisma — see above. Nothing has been started."
+success "Database schema matches prisma/schema.prisma."
 
 # AND THAT THE APPLICATION CAN ACTUALLY USE WHAT JUST LANDED (o3d-2sm1.5, Codex r4 CRITICAL).
 # Everything above — prisma, the drift check — runs on the ADMIN connection, which owns
@@ -9055,13 +9084,16 @@ pin_migration_window "The drift check"
 # APPLICATION role, the one question none of the other steps ask.
 header "Checking the application role can use what the migration created"
 
+object_access_rc=0
 run_as_user "${APP_USER}" env \
   DATABASE_URL="${MIGRATION_DATABASE_URL}" \
   DEPLOY_ADMIN_DATABASE_URL="${DEPLOY_ADMIN_DATABASE_URL}" \
   node "${DB_OBJECT_ACCESS_SCRIPT}" --state-file="${DB_FENCE_STATE}" \
-  || die "The migration left objects the application role cannot use — see above. Nothing has been started."
-success "The application role can use everything in the database."
+  || object_access_rc=$?
+# Status captured, pin first, failure propagated after it (o3d-secops r34, Codex HIGH 2).
 pin_migration_window "The object-access check"
+[[ "${object_access_rc}" -eq 0 ]] || die "The migration left objects the application role cannot use — see above. Nothing has been started."
+success "The application role can use everything in the database."
 
 # ---------------------------------------------------------------------------
 # 10b. The migrations' own verification checks
@@ -9074,21 +9106,30 @@ pin_migration_window "The object-access check"
 CUTOVER_STEP="verify-migrations"
 header "Running the migrations' own verification checks"
 
+verify_hook_rc=0
 run_as_user "${APP_USER}" env \
   DATABASE_URL="${MIGRATION_DATABASE_URL}" \
   DEPLOY_ADMIN_DATABASE_URL="${DEPLOY_ADMIN_DATABASE_URL}" \
   node "${APP_DIR}/scripts/run-migration-verifications.mjs" \
-  || die "A migration's verification check did not return zero. Nothing has been started."
-success "Every declared verification check returned zero (the coverage report above says what was NOT declared)."
+  || verify_hook_rc=$?
+# Status captured, pin first, failure propagated after it (o3d-secops r34, Codex HIGH 2).
 pin_migration_window "The verification hook"
+[[ "${verify_hook_rc}" -eq 0 ]] || die "A migration's verification check did not return zero. Nothing has been started."
+success "Every declared verification check returned zero (the coverage report above says what was NOT declared)."
 
 header "Seeding database"
 
+seed_rc=0
 run_as_user "${APP_USER}" env DATABASE_URL="${MIGRATION_DATABASE_URL}" SEED_TEST_ADMIN="false" \
-  npm run db:seed --prefix "${APP_DIR}"
-success "Database seed applied."
+  npm run db:seed --prefix "${APP_DIR}" || seed_rc=$?
+# Status captured, pin first, failure propagated after it (o3d-secops r34, Codex HIGH 2).
 pin_migration_window "The seed"
+[[ "${seed_rc}" -eq 0 ]] || die "The database seed exited ${seed_rc} — see above. Nothing has been started."
+success "Database seed applied."
 
+# DECLARED OUTSIDE THE BRANCH, because the closing gate below reads it whether or not this
+# branch ran (o3d-secops r34, Codex HIGH 2), and `set -u` would kill the run otherwise.
+bootstrap_rc=0
 if [[ -n "${DEFAULT_ADMIN_EMAIL}" || -n "${SMTP_HOST}" || -n "${SMTP_FROM_EMAIL}" || -n "${APP_DOMAIN}" || -n "${WC_STORE_URL}" ]]; then
   header "Bootstrapping default admin and seeded settings"
   BOOTSTRAP_SCRIPT="${APP_DIR}/scripts/provision-instance.mjs"
@@ -9113,8 +9154,10 @@ if [[ -n "${DEFAULT_ADMIN_EMAIL}" || -n "${SMTP_HOST}" || -n "${SMTP_FROM_EMAIL}
     WC_STORE_URL="${WC_STORE_URL}" \
     WC_CONSUMER_KEY="${WC_CONSUMER_KEY}" \
     WC_CONSUMER_SECRET="${WC_CONSUMER_SECRET}" \
-    node "${BOOTSTRAP_SCRIPT}"
-  success "Bootstrap configuration complete."
+    node "${BOOTSTRAP_SCRIPT}" || bootstrap_rc=$?
+  # ITS PLACEMENT IS THE CLOSING GATE BELOW, so the status is carried past the `fi` and
+  # propagated after it (o3d-secops r34, Codex HIGH 2).
+  [[ "${bootstrap_rc}" -ne 0 ]] || success "Bootstrap configuration complete."
 fi
 
 # AND ONLY NOW IS IT ASKED WHERE ALL OF THAT LANDED (o3d-secops r32, Codex HIGH 2 / o3d-mzcp;
@@ -9134,7 +9177,14 @@ fi
 # section above that function -- so this is the last link of a chain rather than the only one.
 # Still before the application is started, because starting is the first thing that would SERVE a
 # schema this run cannot place.
+#
+# AND BEFORE THE BOOTSTRAP'S OWN FAILURE IS PROPAGATED (o3d-secops r34, Codex HIGH 2). The
+# bootstrap is the LAST consumer, so this gate is its placement; exiting on its status before
+# the gate ran left the whole window unplaced on exactly the run where the default
+# administrator, the SMTP configuration and the WooCommerce credentials may have been written
+# to another cluster.
 require_migration_landed_on_fenced_server
+[[ "${bootstrap_rc}" -eq 0 ]] || die "The bootstrap of the default administrator and the seeded settings exited ${bootstrap_rc} — see above. Nothing has been started."
 
 # The build does NOT live here any more (o3d-2sm1.5, Codex r4 CRITICAL). It ran above,
 # before the stop, with the existing installation still serving the old schema — which is
