@@ -1491,7 +1491,7 @@ function fail(m) { process.stderr.write("NOT STAMPED: " + m + "\n"); process.exi
 var destination = process.argv[1] || "";
 // THE DIGEST OF THE RECORD THE CALLER READ AND AUDITED (o3d-secops r28, Codex HIGH 3).
 //
-// WHAT IT CLOSES. This program used to read the record and, some lines later, rename a modified
+// WHAT IT CLOSES. This program used to load the record and, some lines later, rename a modified
 // copy over the path -- with no lock and nothing tying the write to the read. Between them a
 // concurrent release can restore CONNECT and remove the record; the rename then RESURRECTS it,
 // stamped, claiming a fence that is not standing. That stamped record buys the recovery rule and
@@ -1524,12 +1524,12 @@ var rawBytes = null;
 try { rawBytes = fs.readFileSync(destination); } catch (e) { fail(destination + " could not be opened (" + e.message + ")"); }
 raw = rawBytes.toString("utf8");
 // THE COMPARE, BEFORE ANYTHING IS DECIDED ABOUT THE CONTENT. A record that changed between the
-// caller's audit and this read is not a record whose "already stamped" is reassuring either: it
+// caller's audit and this one is not a record whose "already stamped" is reassuring either: it
 // is a DIFFERENT record, and the only safe thing to do with it is refuse and say so.
 if (expectedDigest !== null) {
   var actualDigest = require("crypto").createHash("sha256").update(rawBytes).digest("hex");
   if (actualDigest !== expectedDigest) {
-    fail(destination + " is not the record that was read and audited: it hashed to " + expectedDigest + " then and hashes to " + actualDigest + " now, so something rewrote or replaced it in between. Stamping it would attach a decision taken about one record to a different one. NOTHING HAS BEEN CHANGED; read it again and decide again.");
+    fail(destination + " is not the record that was inspected and audited: it hashed to " + expectedDigest + " then and hashes to " + actualDigest + " now, so something rewrote or replaced it in between. Stamping it would attach a decision taken about one record to a different one. NOTHING HAS BEEN CHANGED; inspect it again and decide again.");
   }
 }
 var record = null;
@@ -1678,7 +1678,7 @@ function fail(m) { process.stderr.write("NOT CLEARED: " + m + "\n"); process.exi
 var destination = process.argv[1] || "";
 var expectedDigest = String(process.argv[2] || "");
 if (!destination) fail("the removal was not told which authority it is clearing");
-if (!/^[0-9a-f]{64}$/.test(expectedDigest)) fail("the removal was not given the digest of the record that was read and audited, so it cannot show that the record it is about to destroy is that one");
+if (!/^[0-9a-f]{64}$/.test(expectedDigest)) fail("the removal was not given the digest of the record that was inspected and audited, so it cannot show that the record it is about to destroy is that one");
 var directory = path.dirname(destination);
 var meta = null;
 try { meta = fs.lstatSync(directory); } catch (e) { fail(directory + " could not be examined (" + e.message + ")"); }
@@ -1692,7 +1692,7 @@ if (fileMeta.uid !== process.getuid()) fail(destination + " is owned by uid " + 
 var rawBytes = null;
 try { rawBytes = fs.readFileSync(destination); } catch (e) { fail(destination + " could not be opened (" + e.message + ")"); }
 var actualDigest = require("crypto").createHash("sha256").update(rawBytes).digest("hex");
-if (actualDigest !== expectedDigest) fail(destination + " is not the record that was read and audited: it hashed to " + expectedDigest + " then and hashes to " + actualDigest + " now, so something rewrote or replaced it in between. Removing it would destroy an account of a fence nobody here has looked at. NOTHING HAS BEEN CHANGED; read it again and decide again.");
+if (actualDigest !== expectedDigest) fail(destination + " is not the record that was inspected and audited: it hashed to " + expectedDigest + " then and hashes to " + actualDigest + " now, so something rewrote or replaced it in between. Removing it would destroy an account of a fence nobody here has looked at. NOTHING HAS BEEN CHANGED; inspect it again and decide again.");
 try { fs.unlinkSync(destination); } catch (e) { fail(destination + " could not be removed (" + e.message + ")"); }
 var dirFd = -1;
 try {
@@ -1978,7 +1978,7 @@ db_fence_publish_operator_wrappers() {
   local app_user="$1" env_file="$2" state_file="$3" cutover_lock="$4" artefact_digest
   shift 4
   if [[ -z "${cutover_lock}" ]]; then
-    echo "The operator wrappers were not told which file the shared cutover lock lives at. They read a fence record, ask the database about it and then write or remove it, and a sequence that is not serialised against a running cutover can act on a record that changed underneath it. Refusing to publish them." >&2
+    echo "The operator wrappers were not told which file the shared cutover lock lives at. They open a fence record, ask the database about it and then write or remove it, and a sequence that is not serialised against a running cutover can act on a record that changed underneath it. Refusing to publish them." >&2
     return 1
   fi
   _fence_protected_dir_ready || return 1
@@ -2164,12 +2164,12 @@ take_cutover_lock() {
     # NO APOSTROPHE IN A ${x:-default}: inside double quotes bash processes the default word, and
     # a lone quote there opens a quoted string that never closes -- the whole wrapper then fails to
     # parse, which the `bash -n` the publisher is held to is what catches.
-    echo "REFUSING: the directory holding the cutover lock (${dir:-unset}) is not one this account owns, so a lock taken inside it excludes nobody -- the entry can be renamed between one run's open and another's. ${self} has read nothing and changed nothing." >&2
+    echo "REFUSING: the directory holding the cutover lock (${dir:-unset}) is not one this account owns, so a lock taken inside it excludes nobody -- the entry can be renamed between one run's open and another's. ${self} has examined nothing and changed nothing." >&2
     return 1
   fi
   dir_mode="$(LC_ALL=C stat -c '%a' "${dir}" 2>/dev/null || true)"
   if [[ -z "${dir_mode}" ]] || (( (8#${dir_mode} & 0022) != 0 )); then
-    echo "REFUSING: ${dir} is writable by group or other (mode ${dir_mode:-unreadable}), so the lock file inside it can be replaced under this run and the exclusion would be one this run does not hold. ${self} has read nothing and changed nothing." >&2
+    echo "REFUSING: ${dir} is writable by group or other (mode ${dir_mode:-unreadable}), so the lock file inside it can be replaced under this run and the exclusion would be one this run does not hold. ${self} has examined nothing and changed nothing." >&2
     return 1
   fi
   if [[ ! -e "${cutover_lock}" && ! -L "${cutover_lock}" ]]; then
@@ -2181,7 +2181,7 @@ take_cutover_lock() {
   # proof below is about the inode this run is actually locking.
   chmod 600 "${cutover_lock}" 2>/dev/null || true
   if ! exec 9<"${cutover_lock}"; then
-    echo "REFUSING: ${cutover_lock} could not be opened, so this run cannot take the exclusion every cutover on this host takes. ${self} has read nothing and changed nothing." >&2
+    echo "REFUSING: ${cutover_lock} could not be opened, so this run cannot take the exclusion every cutover on this host takes. ${self} has examined nothing and changed nothing." >&2
     return 1
   fi
   fd_meta="$(LC_ALL=C stat -L -c '%F|%u|%a|%i' /dev/fd/9 2>/dev/null || true)"
@@ -2192,12 +2192,12 @@ take_cutover_lock() {
   # has accepted both since r22 for exactly this reason; a check that took only one of them would
   # refuse every lock on the first run after it was created.
   if [[ ( "${fd_kind}" != "regular file" && "${fd_kind}" != "regular empty file" ) || "${fd_owner}" != "$(id -u)" || -z "${fd_mode}" || -z "${fd_inode}" || "${fd_inode}" != "${path_inode}" ]] || (( (8#${fd_mode} & 0077) != 0 )); then
-    echo "REFUSING: the descriptor this run opened on ${cutover_lock} is not that name's own inode, or is not a regular file owned by this account and unreadable by everyone else (${fd_meta:-unreadable}). Either something followed a link at that name, the name was replaced between the open and the check, or the file is one another account can open and therefore lock indefinitely. ${self} has read nothing and changed nothing." >&2
+    echo "REFUSING: the descriptor this run opened on ${cutover_lock} is not that name's own inode, or is not a regular file owned by this account and unreadable by everyone else (${fd_meta:-unreadable}). Either something followed a link at that name, the name was replaced between the open and the check, or the file is one another account can open and therefore lock indefinitely. ${self} has examined nothing and changed nothing." >&2
     exec 9<&-
     return 1
   fi
   if ! flock -n 9; then
-    echo "REFUSING: ${cutover_lock} is held by another run -- a cutover (deploy.sh, update.sh or install.sh) or another of these wrappers. This one reads the fence authority, asks the database about it and then writes or removes it, and two of those sequences interleaved can stamp a record that the other has already released. If nothing is running, \`fuser -v ${cutover_lock}\` names what holds it. ${self} has read nothing and changed nothing." >&2
+    echo "REFUSING: ${cutover_lock} is held by another run -- a cutover (deploy.sh, update.sh or install.sh) or another of these wrappers. This one reads the fence authority, asks the database about it and then writes or removes it, and two of those sequences interleaved can stamp a record that the other has already released. If nothing is running, \`fuser -v ${cutover_lock}\` names what holds it. ${self} has examined nothing and changed nothing." >&2
     exec 9<&-
     return 1
   fi

@@ -10148,7 +10148,7 @@ test('r26/r27/r28: the operator resolution acts only on a reading it can attribu
     const moved = runOnTty(paths.resolveWrapper, ['--this-fence-revoked-them'], movedToken)
     assert.equal(moved.status, 1, `a record that moved under the audit must not be stamped:\n${moved.output}`)
     assert.match(moved.output, /NOT STAMPED/, `and must say so:\n${moved.output}`)
-    assert.match(moved.output, /read and audited/, `naming the bytes it was held to:\n${moved.output}`)
+    assert.match(moved.output, /inspected and audited/, `naming the bytes it was held to:\n${moved.output}`)
     assert.equal(readFileSync(state, 'utf8'), replacement, 'and what is there is what the other writer left')
     assert.equal(JSON.parse(readFileSync(state, 'utf8')).fence_applied, undefined, 'unstamped')
     // AND THE SAME FOR THE REMOVAL, which is the more expensive of the two: a record deleted in
@@ -10159,7 +10159,7 @@ test('r26/r27/r28: the operator resolution acts only on a reading it can attribu
     assert.equal(movedClear.status, 1, `a record that moved under the audit must not be removed:\n${movedClear.stdout}${movedClear.stderr}`)
     assert.equal(existsSync(state), true, 'and must still be there')
     assert.match(movedClear.stderr, /NOT CLEARED/, movedClear.stderr)
-    assert.match(movedClear.stderr, /read and audited/, `saying that the bytes moved:\n${movedClear.stderr}`)
+    assert.match(movedClear.stderr, /inspected and audited/, `saying that the bytes moved:\n${movedClear.stderr}`)
 
     // PHASE 10 — AND ALL THREE WRAPPERS HOLD THE SHARED CUTOVER LOCK FOR THE WHOLE SEQUENCE
     // (o3d-secops r28, Codex HIGH 3). A cutover, or another wrapper, holding it means this one
