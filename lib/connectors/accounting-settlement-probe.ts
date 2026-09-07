@@ -754,6 +754,16 @@ export async function ledgerClearsFollowUpRevival(params: {
   const { classifyLedgerSettlement, describeAttempt, settlementMarkerFor } = await import('@/lib/domain/accounting/ledger-settlement-evidence')
   const probe = await probeLedgerSettlement(params.connector, { type: params.type, payload: params.payload })
   const marker = settlementMarkerFor(effectiveTokenFor(params.connector, { id: params.syncLogId ?? '', payload: params.payload }))
+  // o3d-r948 r3 — AND NO `settlementsOfOtherAttempts`, STATED RATHER THAN OMITTED.
+  //
+  // `classifyLedgerSettlement` will exclude a record whose IMMUTABLE ledger id IMS has already
+  // recorded against a different attempt, and that is the only exclusion it accepts: an amount or a
+  // date that differs is editable in both ledgers and so proves nothing (see the loop's own note).
+  // This function is handed ONE row and no siblings, so it holds no such ids — it would have to run
+  // its own query for them, and it has no database. It therefore excludes nothing, and an
+  // unmeasurable settlement on the document holds this revival back. That is the cost of the rule
+  // rather than a gap in it: the alternative available here is a mutable field, and a mutable field
+  // may only ever move a verdict towards withholding.
   const verdict = classifyLedgerSettlement(describeAttempt(params.type, params.payload, marker), probe)
   if (verdict.outcome === 'clear') return { clear: true }
   return {
@@ -1050,6 +1060,19 @@ export async function authoriseMoneyPost(
 
   for (const contender of contenders) {
     const marker = settlementMarkerFor(effectiveTokenFor(params.connector, contender))
+    // o3d-r948 r3 — NO `settlementsOfOtherAttempts` HERE EITHER, AND THIS ONE IS A PROOF, NOT A GAP.
+    //
+    // The exclusion would skip a record IMS recorded against a DIFFERENT attempt. Every attempt that
+    // could have recorded one on this document is IN `contenders` — that is what the sibling query
+    // selects — so the record it would skip is one this very loop judges on its own turn. And that
+    // turn cannot answer `clear` for it: the record is unmeasurable (the only case the exclusion
+    // changes), so its owner's turn returns `record-unmeasurable`. The verdict is therefore the same
+    // refusal either way, and only the sentence differs. Supplying the set would need
+    // `externalTransactionId` on the sibling select for no change in what money is allowed to move.
+    //
+    // The contenders this loop drops are dropped for reasons that also disqualify their recorded ids:
+    // `attemptCouldHaveReachedTheLedger` false PROVES no call was made, so the row owns no settlement,
+    // and `attemptCouldBeTheSameDocument` false means whatever it owns settles another document.
     const verdict = classifyLedgerSettlement(describeAttempt(params.type, contender.payload, marker), probe)
     if (verdict.outcome === 'clear') continue
     if (verdict.outcome === 'present') {
