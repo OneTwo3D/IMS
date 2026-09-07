@@ -875,8 +875,9 @@ test('[o3d-r948] the MARK still identifies our own settlement whatever its date 
   //
   // ROUTE: classifyLedgerSettlement's marker pass, ahead of the record loop.
   // MUTATION: add a `record.date !== attempt.date` skip to the MARKER loop and this reads `clear` —
-  //        the record is skipped by its date before its reference is ever looked at. Adding the
-  //        `settlementsOfOtherAttempts` skip there instead does the same for an excluded id.
+  //        the record is skipped by its date before its reference is ever looked at. (r6: the
+  //        identity skip this note used to name as the other way of breaking it no longer exists;
+  //        the mark pass is now the ONLY thing that can step past a record at all.)
   const marked = holding([{
     amount: null, unreadableAmount: '10.005', date: '2026-01-01', id: 'PAY-9', reference: 'IMS-abc123abc123',
   }])

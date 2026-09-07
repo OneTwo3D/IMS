@@ -1073,19 +1073,24 @@ export async function authoriseMoneyPost(
 
   for (const contender of contenders) {
     const marker = settlementMarkerFor(effectiveTokenFor(params.connector, contender))
-    // o3d-r948 r3 — NO `settlementsOfOtherAttempts` HERE EITHER, AND THIS ONE IS A PROOF, NOT A GAP.
+    // o3d-r948 r6 — THIS LOOP NEVER NEEDED THE EXCLUSION, AND NOW NOBODY HAS IT.
     //
-    // The exclusion would skip a record IMS recorded against a DIFFERENT attempt. Every attempt that
-    // could have recorded one on this document is IN `contenders` — that is what the sibling query
-    // selects — so the record it would skip is one this very loop judges on its own turn. And that
-    // turn cannot answer `clear` for it: the record is unmeasurable (the only case the exclusion
-    // changes), so its owner's turn returns `record-unmeasurable`. The verdict is therefore the same
-    // refusal either way, and only the sentence differs. Supplying the set would need
-    // `externalTransactionId` on the sibling select for no change in what money is allowed to move.
+    // r3 recorded here why omitting `settlementsOfOtherAttempts` cost this site nothing, and the
+    // argument survives the option's removal intact — it is worth keeping, because it is the one
+    // place in the codebase where the exclusion would provably have changed no verdict:
     //
-    // The contenders this loop drops are dropped for reasons that also disqualify their recorded ids:
-    // `attemptCouldHaveReachedTheLedger` false PROVES no call was made, so the row owns no settlement,
-    // and `attemptCouldBeTheSameDocument` false means whatever it owns settles another document.
+    //   Every attempt that could have recorded an id on this document is IN `contenders` — that is
+    //   what the sibling query selects — so a record the exclusion would skip is one this very loop
+    //   judges on its own turn. That turn cannot answer `clear` for it either: the record is
+    //   unmeasurable (the only case the exclusion ever changed), so its owner's turn returns
+    //   `record-unmeasurable`. The verdict is the same refusal either way; only the sentence differs.
+    //
+    //   The contenders this loop drops are dropped for reasons that also disqualify their recorded
+    //   ids: `attemptCouldHaveReachedTheLedger` false PROVES no call was made, so the row owns no
+    //   settlement, and `attemptCouldBeTheSameDocument` false means whatever it owns settles another
+    //   document.
+    //
+    // What changed in r6 is only that there is no option to omit. See `classifyLedgerSettlement`.
     const verdict = classifyLedgerSettlement(describeAttempt(params.type, contender.payload, marker), probe)
     if (verdict.outcome === 'clear') continue
     if (verdict.outcome === 'present') {
