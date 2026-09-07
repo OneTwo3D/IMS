@@ -49,10 +49,14 @@ const CUTOVER_NS_FUNCTIONS = new Set([
   'ensure_cutover_root_dir',
   'ensure_cutover_state_dirs',
   'verify_held_lock',
+  'narrow_held_lock',
+  'dir_is_private_to_this_run',
   'prepare_cutover_lock_file',
   'acquire_cutover_lock',
-  'acquire_pre_r22_cutover_lock',
+  'acquire_legacy_namespace_lock',
+  'state_pre_r22_cutovers_are_not_excluded',
   'warn_pre_r22_db_fence_state',
+  'warn_legacy_namespace_db_fence_state',
 ])
 /** Lift `name` from whichever shipped file defines it. */
 function shippedFrom(name: string): { source: string; where: string } {
