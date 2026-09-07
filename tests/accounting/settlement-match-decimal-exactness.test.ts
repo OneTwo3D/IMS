@@ -741,46 +741,129 @@ test('[o3d-r948] a refusal names the figure at its OWN scale — a fil is not 0.
 })
 
 /* ------------------------------------------------------------------------------------------- *
- * 3. WITHHOLD ONLY WHILE THE RECORD IS STILL A CANDIDATE (Codex MEDIUM).
+ * 3. A RECORD LEAVES THE MATCH ONLY ON AN IMMUTABLE IDENTITY (r3, Codex HIGH).
+ *
+ * r2 skipped a record whose readable half already differed from the attempt. Amounts and dates are
+ * EDITABLE in both ledgers -- the premise this whole module is built on -- so a differing readable
+ * half is not proof the record is somebody else's, and turning it into one turned an ambiguous
+ * settlement into permission to post again. The exclusion is now the ledger's own id, matched
+ * against what IMS recorded when a DIFFERENT row posted it.
  * ------------------------------------------------------------------------------------------- */
 
-test('[o3d-r948] a record proved unrelated by the half that IS readable does not withhold a first payment', () => {
-  // Withholding is the safe direction only while the record could actually be ours. The match rule is
-  // a CONJUNCTION — amount within the band AND the same date — so either readable half failing means
-  // this record is somebody else's, and its unreadable half decides nothing.
+test('[o3d-r948 r3] a differing but UNREADABLE half does not clear the record it cannot measure', () => {
+  // THE FINDING, directly. r2 read a readable date that is not this attempt's as proof the record
+  // belongs to someone else, and skipped it even though its amount was unreadable. It is not proof:
+  // a payment of OURS whose date was corrected in Xero after we made it looks exactly like this, and
+  // skipping the only record on the document produced `clear` -- which authorises a second payment.
   //
-  // ROUTE: classifyLedgerSettlement's record loop, the `amountRulesItOut || dateRulesItOut` skip.
-  // MUTATION: delete that `continue` and both `clear` assertions below read `unknown`.
+  // ROUTE: classifyLedgerSettlement's record loop, reached from every money fence
+  //        (authoriseMoneyPost, ledgerClearsFollowUpRevival, decideInvoicePaymentRegistration).
+  // MUTATION: restore r2's `if (amountRulesItOut || dateRulesItOut) continue` ahead of the
+  //        unmeasurable check and every assertion below reads `clear`.
 
-  // Unreadable amount, and a date that is not this attempt's.
+  // Unreadable amount, and a date that is not this attempt's. The date is the only readable
+  // discriminator and it is one the ledger can rewrite, so it settles nothing.
   const otherDay = holding([{ amount: null, unreadableAmount: '10.005', date: '2026-01-01', id: 'PAY-9', reference: null }])
-  assert.equal(classifyLedgerSettlement(attemptFor('10.00'), otherDay).outcome, 'clear')
+  const heldByDate = classifyLedgerSettlement(attemptFor('10.00'), otherDay)
+  assert.equal(heldByDate.outcome, 'unknown')
+  assert.equal(heldByDate.outcome === 'unknown' && heldByDate.cause, 'record-unmeasurable')
 
-  // Unreadable date, and an amount nothing near this attempt's.
+  // THE PRECONDITION this test turns on: the readable half really does differ, so r2's skip really
+  // would have fired here. Without this the assertion above could be passing for want of a mismatch.
+  assert.notEqual('2026-01-01', DATE, 'the record\'s readable date is NOT the attempt\'s')
+
+  // The mirror image: unreadable DATE beside an amount nothing near this attempt's. An amount is
+  // just as editable as a date, so it clears just as little.
   const otherAmount = holding([{ amount: toDecimal('999.00'), date: null, id: 'PAY-8', reference: null }])
-  assert.equal(classifyLedgerSettlement(attemptFor('10.00'), otherAmount).outcome, 'clear')
+  const heldByAmount = classifyLedgerSettlement(attemptFor('10.00'), otherAmount)
+  assert.equal(heldByAmount.outcome, 'unknown')
+  assert.equal(heldByAmount.outcome === 'unknown' && heldByAmount.cause, 'record-unmeasurable')
+  assert.ok(toDecimal('999.00').sub(toDecimal('10.00')).abs().gt(ledgerMatchEpsilon('GBP')),
+    'and the record\'s readable amount really is outside the band, so r2\'s skip would have fired')
+})
 
-  // THE DISCRIMINATING HALF, and it is what stops this being a loosening: the SAME unreadable record
-  // on the attempt's OWN date is still a candidate, and still withholds.
-  const sameDay = holding([{ amount: null, unreadableAmount: '10.005', date: DATE, id: 'PAY-9', reference: null }])
-  const held = classifyLedgerSettlement(attemptFor('10.00'), sameDay)
-  assert.equal(held.outcome, 'unknown')
-  assert.equal(held.outcome === 'unknown' && held.cause, 'record-unmeasurable')
+test('[o3d-r948 r3] a record the ledger IDENTIFIES as another attempt\'s does not withhold', () => {
+  // The exclusion that survives: `AccountingSyncLog.externalTransactionId` is the id the ledger
+  // assigned to the settlement a DIFFERENT row posted, and the ledger cannot re-assign it. A record
+  // carrying it was made by that row, whatever has since happened to its amount or its date -- so it
+  // is not this attempt, and holding this attempt back over a figure it cannot read retires nothing.
+  //
+  // ROUTE: classifyLedgerSettlement's `settlementsOfOtherAttempts` skip, supplied in production by
+  //        decideInvoicePaymentRegistration (see the registration test of the same round).
+  // MUTATION: delete the `excluded.has(...)` continue and the first assertion reads `unknown`.
+  const unmeasurable: LedgerSettlementRecord[] = [
+    { amount: null, unreadableAmount: '10.005', date: null, id: 'PAY-OTHER', reference: null },
+  ]
 
-  // ...and an unreadable date beside an amount that IS within the band withholds too.
-  const nearAmount = holding([{ amount: toDecimal('10.00'), date: null, id: 'PAY-7', reference: null }])
-  assert.equal(classifyLedgerSettlement(attemptFor('10.00'), nearAmount).outcome, 'unknown')
+  // THE PRECONDITION: this very record withholds when nothing identifies it, which is what makes the
+  // exclusion below the thing under test rather than the record being harmless all along.
+  assert.equal(classifyLedgerSettlement(attemptFor('10.00'), holding(unmeasurable)).outcome, 'unknown')
+
+  assert.equal(
+    classifyLedgerSettlement(attemptFor('10.00'), holding(unmeasurable), {
+      settlementsOfOtherAttempts: ['PAY-OTHER'],
+    }).outcome,
+    'clear',
+  )
+
+  // Case-folded, because a ledger GUID comes back in whatever case the connector feels like.
+  // MUTATION: drop the `.toLowerCase()` in `foldedIdentitySet` or at the record and this reads
+  //        `unknown`.
+  assert.equal(
+    classifyLedgerSettlement(attemptFor('10.00'), holding([{ ...unmeasurable[0], id: 'Pay-Other' }]), {
+      settlementsOfOtherAttempts: [' PAY-OTHER '],
+    }).outcome,
+    'clear',
+  )
+
+  // AND IT EXCLUDES NOTHING ELSE. A different id is still this attempt's problem, and a record with
+  // no id at all -- every Xero credit-note allocation -- can never be excluded by anything.
+  assert.equal(
+    classifyLedgerSettlement(attemptFor('10.00'), holding(unmeasurable), {
+      settlementsOfOtherAttempts: ['PAY-SOMEONE-ELSE', null, undefined, '  '],
+    }).outcome,
+    'unknown',
+  )
+  assert.equal(
+    classifyLedgerSettlement(attemptFor('10.00'), holding([{ amount: null, unreadableAmount: '10.005', date: null, reference: null }]), {
+      settlementsOfOtherAttempts: ['PAY-OTHER'],
+    }).outcome,
+    'unknown',
+  )
+})
+
+test('[o3d-r948 r3] an ordinary first payment still posts, and the ordinary match still matches', () => {
+  // The cost of the restored rule has to be paid by ambiguity and by nothing else. A document the
+  // ledger holds NOTHING against still clears, and a document holding a readable settlement that is
+  // this attempt's is still `present`.
+  //
+  // ROUTE: classifyLedgerSettlement's record loop, both exits.
+  // MUTATION: replace the loop's `return { outcome: 'clear' }` with a withhold and the first
+  //        assertion fails; drop the `record.date === attempt.date` conjunct and the third reads
+  //        `present` for a record dated a different day.
+  assert.equal(classifyLedgerSettlement(attemptFor('10.00'), holding([])).outcome, 'clear')
+
+  const mine = holding([{ amount: toDecimal('10.00'), date: DATE, id: 'PAY-1', reference: null }])
+  const matched = classifyLedgerSettlement(attemptFor('10.00'), mine)
+  assert.equal(matched.outcome, 'present')
+  assert.equal(matched.outcome === 'present' && matched.matchedId, 'PAY-1')
+
+  // A fully READABLE record that is not this attempt's still lets the attempt through -- that is the
+  // long-standing rule this round did not touch, and it is what keeps a second instalment sendable.
+  const someoneElse = holding([{ amount: toDecimal('10.00'), date: '2026-01-01', id: 'PAY-2', reference: null }])
+  assert.equal(classifyLedgerSettlement(attemptFor('10.00'), someoneElse).outcome, 'clear')
 })
 
 test('[o3d-r948] the MARK still identifies our own settlement whatever its date says', () => {
-  // The residual risk of the refinement is a settlement of OURS whose date was edited in the ledger.
-  // That risk is not new — a record with both halves readable and a different date is skipped today —
-  // and it is the risk the mark exists to retire. The mark is checked before the loop, so the
-  // refinement cannot skip past a record that carries it.
+  // A settlement of OURS whose date was edited in the ledger is the case the mark exists to retire,
+  // and r3 keeps the mark pass whole and AHEAD of the record loop: it runs across every record, is
+  // filtered by no identity and skipped by no discriminator, so nothing the loop below does can step
+  // past a record carrying this attempt's own reference.
   //
   // ROUTE: classifyLedgerSettlement's marker pass, ahead of the record loop.
-  // MUTATION: add the `record.date !== attempt.date` skip to the MARKER loop as well and this reads
-  //        `clear` — the record is skipped by its date before its reference is ever looked at.
+  // MUTATION: add a `record.date !== attempt.date` skip to the MARKER loop and this reads `clear` —
+  //        the record is skipped by its date before its reference is ever looked at. Adding the
+  //        `settlementsOfOtherAttempts` skip there instead does the same for an excluded id.
   const marked = holding([{
     amount: null, unreadableAmount: '10.005', date: '2026-01-01', id: 'PAY-9', reference: 'IMS-abc123abc123',
   }])

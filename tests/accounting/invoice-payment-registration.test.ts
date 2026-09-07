@@ -265,6 +265,74 @@ test('an attempt that PROVABLY never posted does not block the receipt (o3d-0m56
   assert.equal(d.register, true)
 })
 
+/* ------------------------------------------------------------------------------------------- *
+ * o3d-r948 r3 (Codex HIGH) — THE ONLY THING ALLOWED TO RULE A LEDGER RECORD OUT.
+ *
+ * r2 let a differing readable amount or date skip a record whose other half was unreadable. Both
+ * fields are editable in both ledgers, so that skipped OUR OWN edited payment just as readily as
+ * somebody else's — and a skipped record leads to `clear`, which authorises a second payment. The
+ * exclusion is now the settlement id IMS recorded when a DIFFERENT row posted it, which the ledger
+ * assigns and cannot re-assign. This is the production route that supplies it.
+ * ------------------------------------------------------------------------------------------- */
+
+test('[o3d-r948 r3] a SYNCED row s own unmeasurable payment stops blocking every later receipt', () => {
+  // The permanent hold this closes: `unresolvedInvoicePaymentAttempts` judges only FAILED and
+  // CANCELLED rows, so a SYNCED row's payment is never matched to its own attempt here. If the ledger
+  // states that payment's amount in a form IMS will not read, it can only ever BLOCK — for ever, and
+  // for every future receipt on the order.
+  //
+  // ROUTE: decideInvoicePaymentRegistration's unresolved-attempt loop → the
+  //        `settlementsOfOtherAttempts` it hands `classifyLedgerSettlement`.
+  // MUTATION: drop the `settlementsOfOtherAttempts` option at that call site and this refuses
+  //        UNRESOLVED_PAYMENT_ATTEMPT — which is exactly what the precondition below asserts.
+  const settled = live({
+    status: 'SYNCED',
+    amount: 40,
+    paymentId: 'pay-other',
+    accountingInvoiceId: 'INV-1',
+    externalTransactionId: 'PAY-OTHER',
+  })
+  const ledgerSettlements: LedgerSettlementRecord[] = [
+    // The SYNCED row's own payment, as a ledger that will not state a readable figure reports it.
+    { amount: null, unreadableAmount: '40.005', date: null, id: 'PAY-OTHER', reference: null },
+  ]
+  const input = {
+    ...base,
+    paymentAmount: toDecimal(60),
+    existing: [settled, unresolved({ amount: 100, paymentDate: '2026-08-01' })],
+    ledgerSettlements,
+  }
+
+  // THE PRECONDITION, and it is the whole test: with the settlement id NOT recorded against the other
+  // row, nothing identifies that record and the receipt is refused. So the exclusion is what carries
+  // the assertion below, not the record being harmless.
+  const unidentified = decideInvoicePaymentRegistration({
+    ...input,
+    existing: [{ ...settled, externalTransactionId: null }, input.existing[1]],
+  })
+  assert.equal(unidentified.register, false)
+  assert.equal(unidentified.register === false && unidentified.refusal, 'UNRESOLVED_PAYMENT_ATTEMPT')
+
+  assert.equal(decideInvoicePaymentRegistration(input).register, true)
+})
+
+test('[o3d-r948 r3] an attempt s OWN recorded settlement is never excluded from its own match', () => {
+  // The failure mode the exclusion could introduce, closed by construction. If the set were built
+  // from every row rather than from every row BUT THIS ONE, an attempt that already posted would skip
+  // the very record proving it — `clear`, and the receipt registers a second payment.
+  //
+  // ROUTE: decideInvoicePaymentRegistration builds the set with `.filter((row) => row !== attempt)`.
+  // MUTATION: remove that filter and this registers instead of refusing.
+  const attempt = unresolved({ amount: 100, paymentDate: '2026-08-01', externalTransactionId: 'PAY-MINE' })
+  const d = decideInvoicePaymentRegistration({
+    ...base,
+    existing: [attempt],
+    ledgerSettlements: [{ amount: null, unreadableAmount: '100.005', date: null, id: 'PAY-MINE', reference: null }],
+  })
+  assert.equal(d.register, false)
+  assert.equal(d.register === false && d.refusal, 'UNRESOLVED_PAYMENT_ATTEMPT')
+})
+
 // ---------------------------------------------------------------------------
 // o3d-hbgo, read side: WHICH ledger document a registration settled
 // ---------------------------------------------------------------------------
