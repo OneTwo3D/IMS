@@ -543,6 +543,31 @@ export async function probeXeroSettlement(
   // rather than refusing it, because such a record already yields `unknown` in the classifier and
   // counting it as zero here would fake a shortfall. Only the arithmetic and the band have changed.
   const seen = wireAmounts.every((a) => a !== null) ? sumExact(wireAmounts) : null
+  // o3d-mm51 — THE GATE'S PREMISE IS NOW CHECKED INSTEAD OF ASSUMED, because this round is what made
+  // it stop being true. The gate EXCLUDES this check rather than refusing it, and the whole
+  // justification for that direction is the sentence above: "such a record already yields `unknown`
+  // in the classifier", so nothing is lost by not running it.
+  //
+  // That held while `wireDecimal` refused strictly less than `readLedgerStatedAmount` did — every
+  // figure the completeness reader could not read was one the RECORD reader could not read either.
+  // The magnitude bound broke it: the completeness reader takes the HALVED bound and the record
+  // reader takes the full one, so a GBP payment amount in [2^45, 2^46) is refused HERE and ADMITTED
+  // there. The check is then excluded, the record is perfectly measurable, and a document whose
+  // records simply do not match the attempt answers `clear` — measured end to end before this was
+  // added.
+  //
+  // So the exclusion is kept exactly as wide as its justification: if every record IS measurable, the
+  // classifier can reach `clear` and the skipped check is a hole rather than a saving, and the probe
+  // refuses instead. Naming the figure is what stops the refusal reading as "this document is unpaid".
+  const unusablePaymentAt = wireAmounts.findIndex((a) => a === null)
+  if (unusablePaymentAt !== -1 && records.every((r) => r.amount !== null)) {
+    return {
+      ok: false,
+      reason: `Xero states ${String((invoice.Payments ?? [])[unusablePaymentAt]?.Amount)} on a payment against `
+        + 'this document, which IMS cannot use to check the collection against the total Xero reports '
+        + 'paid, so it cannot tell how much of the document is already settled',
+    }
+  }
   if (amountPaid !== null && seen !== null && shortBy(amountPaid, seen, invoiceCurrency)) {
     return {
       ok: false,

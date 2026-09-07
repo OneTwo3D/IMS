@@ -610,3 +610,61 @@ test('[o3d-mm51] an ORDINARY first payment still posts, and it is emptiness PROV
   assert.deepEqual(invoice, { ok: true, records: [] })
   assert.equal(classifyLedgerSettlement(attemptFor('40.00'), invoice).outcome, 'clear')
 })
+
+
+test('[o3d-mm51] the AmountPaid gate no longer excludes itself over a record the classifier CAN measure', async () => {
+  // THE EXCLUSION-WIDTH AUDIT'S OWN FINDING, and this round is what opened it. The `AmountPaid` check
+  // is EXCLUDED — not refused — when a payment amount cannot be read, and the entire justification
+  // for that direction is that such a record already yields `unknown` in the classifier, so nothing
+  // is lost by not running the check.
+  //
+  // That premise held while the completeness reader refused strictly less than the record reader. The
+  // magnitude bound broke it: the completeness reader takes the HALVED bound and the record reader
+  // takes the full one, so a GBP figure in [2^45, 2^46) is refused by one and admitted by the other.
+  //
+  // ROUTE: probeXeroSettlement -> wireDecimal(p.Amount, 'GBP') is null -> `unusablePaymentAt` -> every
+  //        record measurable -> ok:false -> classifyLedgerSettlement -> unknown/probe-unreadable.
+  // MUTATION: delete the `unusablePaymentAt` refusal and this document answers ok:true with one
+  //        perfectly measurable record of 40000000000000, which does not match a 10.00 attempt — so
+  //        the classifier answers `clear`, over a check that was silently dropped.
+
+  // THE PRECONDITION, AND IT IS THE WHOLE FINDING: this one figure is refused by the completeness
+  // reader and ADMITTED by the record reader. If the two bounds ever agree again this assertion says
+  // so rather than letting the test pass for the wrong reason.
+  const AMOUNT = 4e13
+  assert.ok(Math.abs(AMOUNT) >= ledgerDifferenceMagnitudeBound('GBP'), 'the completeness reader refuses it')
+  assert.ok(Math.abs(AMOUNT) < ledgerAmountMagnitudeBound('GBP'), 'and the record reader does not')
+  assert.notEqual(readLedgerStatedAmount(AMOUNT, 'GBP'), null, 'so the record IS measurable — no `unknown` to rely on')
+
+  const probe = await probeInvoice({
+    CurrencyCode: 'GBP',
+    Total: 100,
+    AmountDue: 100,
+    AmountPaid: 0,
+    AmountCredited: 0,
+    Payments: [{ PaymentID: 'PAY-1', Date: '2026-08-01T00:00:00', Amount: AMOUNT }],
+  })
+  assert.equal(probe.ok, false, 'a check that cannot run must not be dropped when the records can still clear')
+  assert.match(reasonOf(probe), /Xero states 40000000000000 on a payment against this document/)
+
+  const verdict = classifyLedgerSettlement(attemptFor('10.00'), probe)
+  assert.equal(verdict.outcome, 'unknown')
+  assert.equal(verdict.outcome === 'unknown' && verdict.cause, 'probe-unreadable')
+
+  // AND THE EXCLUSION IS STILL THERE FOR THE CASE IT WAS JUSTIFIED BY. A payment amount the RECORD
+  // reader also refuses yields an unmeasurable record, the classifier withholds on that, and the
+  // check is excluded rather than refused — exactly as before, and the probe still answers.
+  const alsoUnreadable = await probeInvoice({
+    CurrencyCode: 'GBP',
+    Total: 100,
+    AmountDue: 100,
+    AmountPaid: 0,
+    AmountCredited: 0,
+    Payments: [{ PaymentID: 'PAY-1', Date: '2026-08-01T00:00:00', Amount: 10.001 }],
+  })
+  assert.equal(readLedgerStatedAmount(10.001, 'GBP'), null, 'the precondition: this record is unmeasurable')
+  assert.equal(alsoUnreadable.ok, true, 'so the exclusion still applies and the probe still answers')
+  const held = classifyLedgerSettlement(attemptFor('10.00'), alsoUnreadable)
+  assert.equal(held.outcome, 'unknown')
+  assert.equal(held.outcome === 'unknown' && held.cause, 'record-unmeasurable', 'withheld by the record, as the gate assumed')
+})
