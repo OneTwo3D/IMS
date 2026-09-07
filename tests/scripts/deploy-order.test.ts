@@ -10858,49 +10858,84 @@ for (const entry of R9_SCRIPTS) {
 
   test(`${entry.name} does not truncate what a symlink at the lock path points at, and refuses to lock it`, () => {
     /**
-     * CRITICAL 1, EXHIBITED. ROUTE: the shipped acquire_cutover_lock() with a REAL symlink at
-     * ${LOCK_FILE} pointing at a file with content. What is measured is the victim's SIZE, before
-     * and after, and where the run stops.
+     * CRITICAL 1, EXHIBITED, AND ISOLATED — because the shipped run has TWO guards in front of that
+     * open and a test that only shows "the victim survived" does not say which of them saved it, or
+     * whether either did. So the same planted link is run past three constructs:
+     *
+     *   SHIPPED       prepare_cutover_lock_file() lstats the name, reads "symbolic link", and the
+     *                 run ends before anything is opened at all.
+     *   MUTANT A      that lstat neutered, the shipped READ-ONLY open kept. The link IS followed —
+     *                 and the target still cannot be truncated, because an `open(O_RDONLY)` has no
+     *                 O_TRUNC in it — and verify_held_lock() then refuses, because the descriptor is
+     *                 not that name's own inode. This is what the second guard is worth on its own.
+     *   MUTANT B      that lstat neutered AND the open restored to `exec 9>"$LOCK_FILE"`, which is
+     *                 the pre-r22 construct exactly. The victim is 0 bytes.
+     *
+     * Both mutants are built by replacing SHIPPED TEXT, asserted present first, so a mutant that
+     * stopped matching throws instead of quietly running the shipped function and passing.
      *
      * The parent is root-owned in production, so this shape cannot arise there — which is the fix.
      * It is planted here anyway because the mechanism must not rest on the mode of a directory:
      * that is an argument, and an argument is what the next round reads past.
      */
-    const run = runR9(entry, ['acquire_cutover_lock'], [
+    const plant = [
       'mkdir -p "${CUTOVER_ROOT_DIR}"',
       'printf "SECRET-CONTENT\\n" > "${CUTOVER_STATE_DIR}/victim"',
       'chmod 600 "${CUTOVER_STATE_DIR}/victim"',
       'echo "BEFORE=$(stat -c %s "${CUTOVER_STATE_DIR}/victim")"',
       'ln -s "${CUTOVER_STATE_DIR}/victim" "${LOCK_FILE}"',
-      ...NAMESPACE_OUTCOME,
+    ]
+    const readBack = [
       'echo "AFTER=$(stat -c %s "${CUTOVER_STATE_DIR}/victim")"',
       '[[ -L "${LOCK_FILE}" ]] && echo LINK_LEFT_ALONE || echo LINK_TOUCHED',
-    ].join('\n'), FENCE_RELOCATION_EXTRA('$CUTOVER_STATE_DIR'))
+    ]
 
+    const run = runR9(entry, ['acquire_cutover_lock'], [...plant, ...NAMESPACE_OUTCOME, ...readBack].join('\n'),
+      FENCE_RELOCATION_EXTRA('$CUTOVER_STATE_DIR'))
     assert.match(run.stdout, /^BEFORE=15$/m, `the victim must start with content, or this test measures nothing:\n${run.stdout}`)
     assert.match(run.stdout, /^RC=1$/m, `a name the run cannot identify must end it:\n${run.stdout}`)
     assert.match(run.stdout, /^AFTER=15$/m,
       `and the target must be untouched — the truncation is the whole of the damage:\n${run.stdout}`)
     assert.match(run.stdout, /is not a regular file this run may lock/,
-      `and the refusal must say what it found:\n${run.stdout}`)
-    assert.match(run.stdout, /Nothing has been stopped/, `and what state the host is in:\n${run.stdout}`)
+      `and the lstat of the NAME is what must have said so:\n${run.stdout}`)
+    assert.match(run.stdout, /Nothing has been stopped/, `and the refusal must say what state the host is in:\n${run.stdout}`)
     assert.match(run.stdout, /^LINK_LEFT_ALONE$/m, `and nothing may be created or removed at that name:\n${run.stdout}`)
 
-    // MEASURED BY MUTATION, ROUTE STATED: the retired open, in its own shell, over the same planted
-    // link. `exec 9>` is O_WRONLY|O_CREAT|O_TRUNC and the truncation lands before `flock` is
-    // reached, so the lock the run then reports is held on the attacker's chosen inode.
-    const mutated = runR9(entry, [], [
-      'printf "SECRET-CONTENT\\n" > "${CUTOVER_STATE_DIR}/victim2"',
-      'ln -s "${CUTOVER_STATE_DIR}/victim2" "${CUTOVER_STATE_DIR}/planted.lock"',
-      'LOCK_FILE="${CUTOVER_STATE_DIR}/planted.lock"',
-      'exec 9>"$LOCK_FILE"',
-      'flock -n 9 && echo PRE_R22_REPORTED_EXCLUSION',
-      'echo "MUTANT_AFTER=$(stat -c %s "${CUTOVER_STATE_DIR}/victim2")"',
+    // MUTATION A, ROUTE STATED: the type question removed from prepare_cutover_lock_file(), so the
+    // shipped open is reached with a symlink at that name and follows it.
+    const PREPARE = shellFunction(CUTOVER_NS_LIB, 'prepare_cutover_lock_file')
+    const KIND_CHECK = '  [[ "${kind}" == "regular file" || "${kind}" == "regular empty file" ]] || return 1'
+    assert.ok(PREPARE.includes(KIND_CHECK), `the shipped preparation must refuse anything that is not a plain file:\n${PREPARE}`)
+    const permissive = PREPARE.replace(KIND_CHECK, '  : "${kind}"')
+
+    const mutantA = runR9(entry, ['acquire_cutover_lock'], [
+      permissive, ...plant, ...NAMESPACE_OUTCOME, ...readBack,
     ].join('\n'), FENCE_RELOCATION_EXTRA('$CUTOVER_STATE_DIR'))
-    assert.match(mutated.stdout, /^PRE_R22_REPORTED_EXCLUSION$/m,
-      `the retired open reports a lock it took on somebody else's file:\n${mutated.stdout}`)
-    assert.match(mutated.stdout, /^MUTANT_AFTER=0$/m,
-      `having truncated it as root before the flock — that is the finding:\n${mutated.stdout}`)
+    assert.match(mutantA.stdout, /^RC=1$/m, `the descriptor check must still end the run:\n${mutantA.stdout}`)
+    assert.match(mutantA.stdout, /is not that name's own inode/,
+      `and it must be the descriptor check that says so, not the lstat this mutation removed:\n${mutantA.stdout}`)
+    assert.match(mutantA.stdout, /^AFTER=15$/m,
+      `and a followed link still cannot be truncated through an O_RDONLY open — that is what opening it for READING is worth:\n${mutantA.stdout}`)
+
+    // MUTATION B, ROUTE STATED: and the open restored to what it was. `exec 9>` is
+    // O_WRONLY|O_CREAT|O_TRUNC, the truncation lands before `flock` is reached, and the lock the
+    // run then reports is held on the attacker's chosen inode.
+    const ACQUIRE = shellFunction(CUTOVER_NS_LIB, 'acquire_cutover_lock')
+    const SHIPPED_OPEN = '  exec 9<"$LOCK_FILE"\n'
+    const SHIPPED_FLOCK = '  flock -n 9 || die'
+    const openAt = ACQUIRE.indexOf(SHIPPED_OPEN)
+    const flockAt = ACQUIRE.indexOf(SHIPPED_FLOCK)
+    assert.ok(openAt !== -1 && flockAt > openAt,
+      `the shipped lock must be opened for reading and judged before it is locked:\n${ACQUIRE}`)
+    const preR22Acquire = `${ACQUIRE.slice(0, openAt)}  exec 9>"$LOCK_FILE"\n${ACQUIRE.slice(flockAt)}`
+
+    const mutantB = runR9(entry, ['acquire_cutover_lock'], [
+      permissive, preR22Acquire, ...plant, ...NAMESPACE_OUTCOME, ...readBack,
+    ].join('\n'), FENCE_RELOCATION_EXTRA('$CUTOVER_STATE_DIR'))
+    assert.match(mutantB.stdout, /^RC=0$/m,
+      `the retired construct reports a lock it took on somebody else's file:\n${mutantB.stdout}`)
+    assert.match(mutantB.stdout, /^AFTER=0$/m,
+      `having truncated it as root before the flock — that is the finding:\n${mutantB.stdout}`)
   })
 
   test(`${entry.name} locks the descriptor it judged, and refuses one that is not the name's own inode`, () => {
