@@ -6484,7 +6484,45 @@ test('--bind-migration says colocated on the witness instance and absent on a by
       `and tell the operator which question was answered:\n${onBystander.err}`)
     assert.match(onBystander.err, /NOTHING HAS BEEN MIGRATED/, onBystander.err)
 
-    // 3. AND A STAMP THAT DID NOT SURVIVE IS ITS OWN REFUSAL, told apart from a redirect. This is
+    // 3. AND `--hold-stamp` KEEPS IT, which is the whole of the closing gate's determinism. The
+    //    pre-DDL probe above dropped its stamp so the sampler could not count it; this one must
+    //    NOT, and must still be wearing it while another connection looks.
+    // MUTATION ROUTE (made against the shipped file and reverted): drop the `if (!options.holdStamp)`
+    // guard so the SET always runs -- the observation below finds nothing and the shipped closing
+    // gate would then refuse every cutover, which is the failure this measures against.
+    {
+      const composed = buildMigrationConnectionString(
+        `postgres://${me}@${encodeURIComponent(real.socket)}:${port}/imsdb`, me, nonce,
+      )
+      const client = new Client({ connectionString: composed })
+      await client.connect()
+      const observer = new Client({ host: real.socket, port, database: 'postgres', user: me })
+      await observer.connect()
+      const sightings: string[] = []
+      try {
+        const probing = capturingFenceOutput(() => doBindMigration(client as never, {
+          migrationNonce: nonce, witnessLock: lock, holdStamp: true, ...suppliedIdentity({ appDatabase: 'imsdb' }),
+        }))
+        while (sightings.length === 0) {
+          const { rows } = await observer.query(
+            'SELECT application_name FROM pg_stat_activity WHERE application_name = $1',
+            [migrationApplicationName(nonce)],
+          )
+          for (const row of rows) sightings.push(String(row.application_name))
+          if (sightings.length > 0) break
+          await new Promise((resolve) => setTimeout(resolve, WITNESS_SAMPLE_INTERVAL_MS))
+        }
+        const held = await probing
+        assert.equal(held.value, EXIT_OK, `the holding probe must bind:\n${held.err}`)
+        assert.deepEqual(sightings, [migrationApplicationName(nonce)],
+          'a --hold-stamp probe must still be wearing the migration stamp while it is looked for')
+      } finally {
+        await client.end().catch(() => {})
+        await observer.end().catch(() => {})
+      }
+    }
+
+    // 4. AND A STAMP THAT DID NOT SURVIVE IS ITS OWN REFUSAL, told apart from a redirect. This is
     //    the case that would otherwise make every cutover refuse for a reason nobody could act on.
     const unstamped = new Client({ host: real.socket, port, database: 'imsdb', user: me })
     await unstamped.connect()
@@ -6557,11 +6595,16 @@ test("the witness's sampler counts the migration's own backends, and Prisma's co
       await waitFor(new RegExp(`^WITNESS_SIGHTINGS ${nonce} [1-9]`, 'm'),
         'a backend carrying the migration stamp must be counted')
 
-      // 2. PRISMA'S OWN CONNECTION, which is the consumer whose URL parser is NOT libpq. If the
-      //    schema engine dropped the parameter the stamp would never reach the backend and every
-      //    real cutover would refuse -- so this is measured against the shipped schema rather than
-      //    reasoned about. `migrate status` connects, reads _prisma_migrations and exits; it moves
-      //    no schema, which is what makes it safe to run here.
+      // 2. PRISMA'S OWN CONNECTION, which is the consumer whose URL parser is NOT libpq: the schema
+      //    engine is Rust and parses the URL itself. If it dropped `application_name` the stamp
+      //    would never reach the backend, and the evidence the fence record's removal now rests on
+      //    would be silently absent on every real cutover. `migrate status` connects, reads
+      //    _prisma_migrations and exits; it moves no schema, which is what makes it safe here.
+      //
+      //    AND THE SAMPLE RATE IS WHY THIS IS 10ms AND NOT 50 (o3d-secops r32). At 50ms this
+      //    assertion FAILED against a real cluster in every run -- Prisma's whole exchange is about
+      //    40ms warm -- and that measurement is the reason the shipped closing gate does not rest
+      //    on catching a foreign short-lived backend. See db_fence_migration_witnessed().
       const before = Number(/WITNESS_SIGHTINGS [0-9a-f]+ (\d+)/.exec(machine.join(''))?.[1] ?? '0')
       // SPAWNED, NOT spawnSync. The sampler is a `setInterval` in THIS process, and a synchronous
       // child blocks the event loop for its whole life -- so a `spawnSync` here would guarantee the
