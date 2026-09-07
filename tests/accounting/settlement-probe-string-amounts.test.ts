@@ -99,19 +99,34 @@ const probeInvoice = (body: Record<string, unknown>) => probeXeroSettlement(
  * note whose payments state no status must say here what those payments ARE, or the lookup 404s and
  * the arm refuses, loudly.
  */
-const probeNote = (body: Record<string, unknown>, refunds: Record<string, unknown> = {}) => probeXeroSettlement(
-  { type: 'PURCHASE_CREDIT_NOTE_ALLOCATION', payload: { accountingInvoiceId: 'inv-1', creditNoteId: 'cn-1' } },
-  ledgerDouble({
-    'CreditNotes/cn-1': { CreditNotes: [{ CreditNoteID: 'cn-1', ...body }] },
-    ...Object.fromEntries(Object.entries(refunds).map(([id, payment]) => [
-      `Payments/${id}`,
-      { Payments: [{ PaymentID: id, ...(payment as Record<string, unknown>) }] },
-    ])),
-  }).get,
-)
+const NOTE_TARGET = {
+  type: 'PURCHASE_CREDIT_NOTE_ALLOCATION', payload: { accountingInvoiceId: 'inv-1', creditNoteId: 'cn-1' },
+} as const
+
+const noteResponses = (body: Record<string, unknown>, refunds: Record<string, unknown>) => ({
+  'CreditNotes/cn-1': { CreditNotes: [{ CreditNoteID: 'cn-1', ...body }] },
+  ...Object.fromEntries(Object.entries(refunds).map(([id, payment]) => [
+    `Payments/${id}`,
+    // `null` stubs a response Xero answered with NO payment in it, which is a distinct failure from
+    // an id that was never stubbed at all (that one is the 404).
+    payment === null ? { Payments: [] } : { Payments: [{ PaymentID: id, ...(payment as Record<string, unknown>) }] },
+  ])),
+})
+
+const probeNote = (body: Record<string, unknown>, refunds: Record<string, unknown> = {}) =>
+  probeXeroSettlement(NOTE_TARGET, ledgerDouble(noteResponses(body, refunds)).get)
+
+/** The same arm with its call log, so the COST of a resolution is MEASURED rather than asserted. */
+async function probeNoteWithCalls(body: Record<string, unknown>, refunds: Record<string, unknown> = {}) {
+  const double = ledgerDouble(noteResponses(body, refunds))
+  const probe = await probeXeroSettlement(NOTE_TARGET, double.get)
+  return { probe, paths: double.calls.map((call) => call.path) }
+}
 
 /** The commonest resolution there is: the refund Xero has not reversed. */
 const AUTHORISED_REFUND = { Status: 'AUTHORISED', PaymentType: 'APCREDITPAYMENT' }
+/** And the one the whole finding is about: the refund Xero has put back. */
+const DELETED_REFUND = { Status: 'DELETED', PaymentType: 'APCREDITPAYMENT' }
 
 /* ------------------------------------------------------------------------------------------- *
  * 1. THE FINDING, END TO END: A STRING `TotalAmt` IS READ, THE CHECK RUNS ON IT, AND THE `clear`
@@ -2547,4 +2562,253 @@ test('[o3d-acctmoney r2] the INVOICE arm still tolerates a DELETED payment witho
   assert.equal(verdict.outcome, 'unknown',
     'so the invoice arm reaches `unknown` on its own, with no status rule and no hard refusal')
   assert.equal(verdict.outcome === 'unknown' ? verdict.cause : null, 'collection-unproved')
+})
+
+/* ------------------------------------------------------------------------------------------- *
+ * 8. o3d-acctmoney r3 (Codex HIGH): THE GUARD WAS INERT ON THE ONLY SHAPE THAT MATTERS, AND THE
+ *    DISCRIMINATOR IS NOW FETCHED RATHER THAN GUESSED.
+ *
+ * THE FINDING. r2 filtered DELETED payments out of the subtracted refund term and counted a payment
+ * whose `Status` was UNSTATED as authorised, arguing that Xero states neither field on the nested
+ * stubs a credit-note GET returns. If that argument is right the filter never fires: a reversed
+ * refund and an authorised one arrive as the SAME OBJECT and both are subtracted, which is the defect
+ * the filter was added to close. The guard read as protection while being decoration.
+ *
+ * WHAT THE SOURCES SAY, checked rather than assumed (the full account is on `creditNoteRefundInclusion`):
+ * the published schema `$ref`s the FULL `Payment` into `CreditNote.Payments[]`, so it PERMITS both
+ * discriminators; this repository's two live-tenant scripts type that nested element as
+ * `{ PaymentID, Amount }`; no captured response exists anywhere in the repo to settle it; and
+ * `Payments/{id}` does state them, which is where the live audit reads `PaymentType` from today.
+ *
+ * THE TRADE THAT WAS TAKEN, and its price. Not counting an unverifiable refund would refuse every
+ * ordinary refunded credit note; withholding the PROOF instead of refusing would confine that to
+ * `unknown`, but a refunded credit note would then never authorise anything again — the permanent
+ * hold class, back. So the status is RESOLVED through `Payments/{id}`, at one request per refund the
+ * projection was silent about, and a note with no refunds pays nothing.
+ * ------------------------------------------------------------------------------------------- */
+
+/** The nested element as this repo's live-tenant scripts model it: an id and an amount, nothing else. */
+const PRODUCTION_STUB = { PaymentID: 'PAY-R1', Amount: 100 } as const
+/** Codex's note: 100 has come off the 400 and the allocation collection is empty. */
+const AMBIGUOUS_NOTE = { CurrencyCode: 'GBP', Total: 400, RemainingCredit: 300, Allocations: [] } as const
+
+test('[o3d-acctmoney r3] the guard is NOT inert: a DELETED refund is caught on the PRODUCTION-shaped stub', async () => {
+  // ROUTE: the credit-note arm -> `creditNoteRefundInclusion` on the stub returns no `unaccountable`
+  //        and the stub states no `Status` -> `resolveCreditNoteRefunds` -> `Payments/PAY-R1` ->
+  //        the resolved record states DELETED -> `counts:false` -> the 100 is NOT subtracted ->
+  //        `applied` = 100 against an empty collection -> the shortfall refusal -> ok:false.
+  // MUTATION: delete the `resolveCreditNoteRefunds` call in the arm and use `statedInclusions`
+  //        directly — i.e. r2's code exactly. Measured: `deleted` below answers ok:true with
+  //        provedComplete:true and the classifier says `clear`, which is the second allocation of the
+  //        missing 100. That is the finding, reproduced on the stub shape rather than on a synthetic
+  //        nested `Status` the live models say Xero does not send.
+  // MUTATION 2: make the post-resolution silence check accept a resolved record with no `Status`
+  //        (drop the `wireEnum(full.Status).token === null` refusal). Measured: `silentAfterLookup`
+  //        below clears — the inert guard again, one indirection further away.
+
+  // PRECONDITION — the stub states NEITHER discriminator, which is the whole point. If it stated one,
+  // r2's rule would already have decided this and the resolution would be examining nothing.
+  assert.equal('Status' in PRODUCTION_STUB, false, 'PRECONDITION: the production-shaped stub states no status...')
+  assert.equal('PaymentType' in PRODUCTION_STUB, false, '...and no payment type either')
+  assert.equal(AMBIGUOUS_NOTE.Total - AMBIGUOUS_NOTE.RemainingCredit, 100,
+    'PRECONDITION: and 100 has come off the note, which the 100 refund exactly accounts for — so '
+    + 'counting it forges a proved ZERO over an empty collection')
+
+  const NOTE = { ...AMBIGUOUS_NOTE, Payments: [PRODUCTION_STUB] }
+
+  // THE REVERSED REFUND. Identical bytes on the credit note; the endpoint that states the status says
+  // it was put back.
+  const deleted = await probeNote(NOTE, { 'PAY-R1': DELETED_REFUND })
+  assert.equal(deleted.ok, false, 'a reversed refund cannot certify an empty allocation collection')
+  assert.match(reasonOf(deleted), /100\.00 of this credit note already applied but returned no allocations/)
+  assert.notEqual(classifyLedgerSettlement(attemptFor('100.00'), deleted).outcome, 'clear',
+    '`clear` is what would authorise allocating the missing 100 a SECOND time')
+  assert.equal(classifyLedgerSettlement(attemptFor('100.00'), deleted).outcome, 'unknown')
+
+  // THE DISCRIMINATING HALF, AND IT IS WHAT MAKES THE GUARD A GUARD. The SAME note and the SAME stub,
+  // resolved to an authorised refund, still clears. Without this the test above would pass just as
+  // well if the arm had started refusing every refunded credit note.
+  const authorised = await probeNote(NOTE, { 'PAY-R1': AUTHORISED_REFUND })
+  assert.equal(authorised.ok, true, 'an authorised refund is still a term of the identity')
+  assert.equal(authorised.ok === true ? authorised.provedComplete : null, true,
+    'so the empty collection is proved by the identity, not assumed')
+  assert.equal(classifyLedgerSettlement(attemptFor('300.00'), authorised).outcome, 'clear',
+    'and the 300 that remains is allocatable on the first attempt')
+
+  // SO THE TWO OUTCOMES DIFFER ON NOTHING BUT WHAT THE RESOLUTION SAID, which is the property r2
+  // could not have: on the wire these two credit notes are byte-identical.
+  assert.notEqual(deleted.ok, authorised.ok,
+    'the same credit-note response reaches opposite answers, decided by the payment record alone')
+
+  // AND A RESOLUTION THAT IS ITSELF SILENT BUYS NOTHING, so it refuses rather than completing the
+  // circle back to r2's default.
+  const silentAfterLookup = await probeNote(NOTE, { 'PAY-R1': { Amount: 100 } })
+  assert.equal(silentAfterLookup.ok, false,
+    'a payment record that states no status is not a payment this code may subtract on trust')
+  assert.match(reasonOf(silentAfterLookup), /states no status on payment PAY-R1/)
+  assert.notEqual(classifyLedgerSettlement(attemptFor('100.00'), silentAfterLookup).outcome, 'clear')
+})
+
+test('[o3d-acctmoney r3] a refunded credit note CAN still authorise, which is what the extra request buys', async () => {
+  // THE TRADE, ASSERTED RATHER THAN DESCRIBED. Two cheaper rules were available and both were
+  // rejected here, so this test states what the chosen one does that they do not:
+  //
+  //   NOT COUNTING an unverifiable refund overstates the usage and hard-refuses — `ok:false` on every
+  //   ordinary refunded credit note.
+  //   WITHHOLDING THE PROOF instead confines that to `unknown`, but the response never changes, so a
+  //   refunded credit note would never authorise anything again. That is a permanent hold on an
+  //   ordinary business event: a supplier credits 400, refunds 100 in cash, and the remaining 300 can
+  //   never be applied to a bill.
+  //
+  // ROUTE: `resolveCreditNoteRefunds` -> `Payments/PAY-R1` -> AUTHORISED -> counted -> `applied` = 0
+  //        -> proved zero over an empty collection -> `clear`.
+  // MUTATION: make `resolveCreditNoteRefunds` return `{ counts: false, unaccountable: null }` for a
+  //        resolved AUTHORISED payment (the "never subtract what you had to ask about" rule).
+  //        Measured: ok:false, "100.00 of this credit note already applied but returned no
+  //        allocations" — the whole-class refusal, on the most ordinary operation there is.
+  // MUTATION 2: return a refusal instead of an inclusion whenever a lookup was needed (the
+  //        withhold-everything rule). Measured: the same note stops clearing and holds for ever.
+
+  const refunded = await probeNote(
+    { ...AMBIGUOUS_NOTE, Payments: [PRODUCTION_STUB] }, { 'PAY-R1': AUTHORISED_REFUND },
+  )
+  assert.equal(refunded.ok, true, 'a refunded credit note is a coherent response, not a held one')
+  assert.equal(refunded.ok === true ? refunded.records.length : -1, 0,
+    'it has been allocated to nothing, and the emptiness is the ledger\'s own')
+  assert.equal(refunded.ok === true ? refunded.provedComplete : null, true,
+    'PROVED empty rather than assumed empty, which is the difference between `clear` and `unknown`')
+  assert.equal(classifyLedgerSettlement(attemptFor('300.00'), refunded).outcome, 'clear',
+    'so the 300 it has left still posts — a refunded credit note is not permanently held')
+
+  // AND THE SECOND ALLOCATION OF THE SAME CREDIT IS STILL STOPPED, so "it can authorise" has not been
+  // bought by letting it authorise twice. Same note, now with the 300 genuinely allocated to us.
+  const spent = await probeNote({
+    CurrencyCode: 'GBP',
+    Total: 400,
+    RemainingCredit: 0,
+    Allocations: [{ Amount: 300, Date: `${DATE}T00:00:00`, Invoice: { InvoiceID: 'inv-1' } }],
+    Payments: [PRODUCTION_STUB],
+  }, { 'PAY-R1': AUTHORISED_REFUND })
+  assert.equal(spent.ok, true, 'PRECONDITION: the response is coherent — 100 refunded, 300 allocated')
+  assert.equal(spent.ok === true ? spent.records.length : -1, 1,
+    'and the allocation to THIS bill is found, so a repeat attempt has something to collide with')
+  assert.notEqual(classifyLedgerSettlement(attemptFor('300.00'), spent).outcome, 'clear',
+    'the credit is already applied here; nothing about the refund rule lets it be applied again')
+})
+
+test('[o3d-acctmoney r3] a refund that cannot be resolved REFUSES rather than being subtracted', async () => {
+  // ROUTE: `resolveCreditNoteRefunds` -> each failure below -> a `refusal` sentence -> ok:false,
+  //        which the classifier cannot turn into `clear`.
+  // MUTATION: replace each refusal with `continue` — i.e. leave the stub's own `counts: true` in
+  //        place, which is r2's answer for an unresolvable payment. Measured: every case below
+  //        answers ok:true with provedComplete:true and classifies as `clear`, over the exact note
+  //        the finding is about. Fail-open here is the whole defect wearing a lookup.
+
+  const NOTE = { ...AMBIGUOUS_NOTE, Payments: [PRODUCTION_STUB] }
+  // PRECONDITION — resolved AUTHORISED this note clears, so every refusal below is taking a `clear`
+  // away rather than agreeing with a refusal that was going to happen anyway.
+  assert.equal(
+    classifyLedgerSettlement(attemptFor('300.00'), await probeNote(NOTE, { 'PAY-R1': AUTHORISED_REFUND })).outcome,
+    'clear', 'PRECONDITION: this note DOES clear when the refund resolves')
+
+  // (1) THE LOOKUP FAILED. Xero's own words are carried into the sentence: a connection authorised
+  // without `accounting.payments` says so here, which is what an operator reconnects on.
+  const unreachable = await probeNote(NOTE)
+  assert.equal(unreachable.ok, false, 'a refund IMS could not read is not a refund it may subtract')
+  assert.match(reasonOf(unreachable), /could not read payment PAY-R1 against this credit note from Xero/)
+  assert.match(reasonOf(unreachable), /not stubbed/, 'and the ledger\'s own error is quoted, not swallowed')
+  assert.notEqual(classifyLedgerSettlement(attemptFor('300.00'), unreachable).outcome, 'clear')
+
+  // (2) THE LOOKUP SUCCEEDED AND CARRIED NO PAYMENT. Distinct from a transport failure and not the
+  // same as "there is no such refund": the credit note has just told us there is one.
+  const empty = await probeNote(NOTE, { 'PAY-R1': null })
+  assert.equal(empty.ok, false, 'a 200 with nothing in it does not resolve anything')
+  assert.match(reasonOf(empty), /returned no payment for PAY-R1 against this credit note/)
+  assert.notEqual(classifyLedgerSettlement(attemptFor('300.00'), empty).outcome, 'clear')
+
+  // (3) NO ID TO RESOLVE BY. The ledger listed a payment, stated no status, and gave nothing to ask
+  // about — the one shape where the request cannot even be made.
+  const anonymous = await probeNote({ ...AMBIGUOUS_NOTE, Payments: [{ Amount: 100 }] })
+  assert.equal(anonymous.ok, false, 'a payment with no status and no id is not one to guess about')
+  assert.match(reasonOf(anonymous), /neither a status nor an id to resolve one by/)
+  assert.notEqual(classifyLedgerSettlement(attemptFor('300.00'), anonymous).outcome, 'clear')
+
+  // (4) THE RESOLVED RECORD STATES SOMETHING THE CONTRACT DOES NOT ENUMERATE. The stub rule and the
+  // resolved rule are the SAME function, so this refuses for the same reason a stated PENDING does —
+  // and the sentence names the payment, because here there was a request behind it.
+  const unenumerated = await probeNote(NOTE, { 'PAY-R1': { Status: 'PENDING', PaymentType: 'APCREDITPAYMENT' } })
+  assert.equal(unenumerated.ok, false, 'an unknown status is no more countable for having been fetched')
+  assert.match(reasonOf(unenumerated), /a payment status of PENDING on payment PAY-R1/)
+  assert.match(reasonOf(unenumerated), /cannot account for/)
+  assert.notEqual(classifyLedgerSettlement(attemptFor('300.00'), unenumerated).outcome, 'clear')
+
+  // AND EVERY ONE OF THEM IS A REFUSAL RATHER THAN A WITHHELD PROOF, which is deliberate: an
+  // unresolved refund is a fact about the RESPONSE, and an operator who is told which payment could
+  // not be read can go and look at it. A silent `unknown` would say only "something".
+  for (const probe of [unreachable, empty, anonymous, unenumerated]) {
+    assert.equal(probe.ok, false)
+    assert.match(reasonOf(probe), /credit is already allocated|cannot account for/)
+  }
+})
+
+test('[o3d-acctmoney r3] what the resolution COSTS: nothing when the status is stated, one request when it is not', async () => {
+  // THE COST CLAIM, MEASURED. The argument for fetching rests on the cost being proportional to the
+  // ambiguity rather than to the number of credit notes, so the call log is asserted rather than
+  // described.
+  // ROUTE: `resolveCreditNoteRefunds` -> `wireEnum(payment.Status).token !== null` -> `continue`.
+  // MUTATION: drop that early `continue` and resolve every payment. Measured: case (1) and case (2)
+  //        below both gain a `Payments/PAY-R1` call, and the first assertion fails — every credit
+  //        note with any payment on it would then cost a request per payment, forever.
+
+  // (1) NO PAYMENTS AT ALL — the ordinary credit note. One request, as before this change.
+  const plain = await probeNoteWithCalls({ CurrencyCode: 'GBP', Total: 40, RemainingCredit: 40, Allocations: [] })
+  assert.equal(plain.probe.ok, true)
+  assert.deepEqual(plain.paths, ['CreditNotes/cn-1'], 'a note with no refunds costs exactly what it always did')
+
+  // (2) A STATUS THE PROJECTION DID STATE. If Xero populates the nested stub after all, this change
+  // costs nothing anywhere — which is why the disagreement between the schema and the live models did
+  // not have to be settled to act on it.
+  const stated = await probeNoteWithCalls({
+    ...AMBIGUOUS_NOTE, Payments: [{ PaymentID: 'PAY-R1', Amount: 100, Status: 'AUTHORISED' }],
+  })
+  assert.equal(stated.probe.ok, true)
+  assert.deepEqual(stated.paths, ['CreditNotes/cn-1'], 'a stated status is decided from the stub, with no request')
+
+  // (3) A SILENT STUB COSTS ONE REQUEST, and a collection that lists the SAME payment twice still
+  // costs one: the lookups are cached by id.
+  const twice = await probeNoteWithCalls({
+    CurrencyCode: 'GBP', Total: 400, RemainingCredit: 200, Allocations: [],
+    Payments: [{ PaymentID: 'PAY-R1', Amount: 100 }, { PaymentID: 'pay-r1', Amount: 100 }],
+  }, { 'PAY-R1': AUTHORISED_REFUND })
+  assert.equal(twice.probe.ok, true, 'PRECONDITION: both entries are counted, so both were classified')
+  assert.equal(twice.probe.ok === true ? twice.probe.provedComplete : null, true)
+  assert.deepEqual(twice.paths, ['CreditNotes/cn-1', 'Payments/PAY-R1'],
+    'the second entry reuses the first lookup, and the id is matched case-insensitively as Xero\'s GUIDs are')
+
+  // (4) AND THE LOOP IS BOUNDED. It is over a vendor-controlled array length inside a money post, and
+  // Xero allows 60 calls a minute per tenant — an unbounded resolve would let one pathological
+  // document starve every other row in the sweep. Above the cap it refuses, visibly.
+  // MUTATION: raise `XERO_CREDIT_NOTE_REFUND_LOOKUP_LIMIT` past 26. Measured: this case answers
+  //        ok:true and 26 `Payments/` calls appear in the log.
+  const many = Array.from({ length: 26 }, (_unused, i) => ({ PaymentID: `PAY-${i}`, Amount: 1 }))
+  const capped = await probeNoteWithCalls(
+    { CurrencyCode: 'GBP', Total: 400, RemainingCredit: 374, Allocations: [], Payments: many },
+    Object.fromEntries(many.map((pmt) => [pmt.PaymentID, AUTHORISED_REFUND])),
+  )
+  assert.equal(capped.probe.ok, false, 'a note this code would have to make 26 requests about refuses instead')
+  assert.match(reasonOf(capped.probe), /more than 25 payments against this credit note whose status it did not state/)
+  assert.equal(capped.paths.filter((path) => path.startsWith('Payments/')).length, 25,
+    'and it stops AT the cap rather than discovering it afterwards')
+  assert.notEqual(classifyLedgerSettlement(attemptFor('26.00'), capped.probe).outcome, 'clear')
+
+  // THE DISCRIMINATING HALF OF THE CAP: 25 is fine, so the refusal above is the bound and not a
+  // blanket refusal of notes with several refunds.
+  const under = Array.from({ length: 25 }, (_unused, i) => ({ PaymentID: `PAY-${i}`, Amount: 1 }))
+  const allowed = await probeNoteWithCalls(
+    { CurrencyCode: 'GBP', Total: 400, RemainingCredit: 375, Allocations: [], Payments: under },
+    Object.fromEntries(under.map((pmt) => [pmt.PaymentID, AUTHORISED_REFUND])),
+  )
+  assert.equal(allowed.probe.ok, true, 'twenty-five resolvable refunds are resolved')
+  assert.equal(allowed.paths.filter((path) => path.startsWith('Payments/')).length, 25)
+  assert.equal(classifyLedgerSettlement(attemptFor('375.00'), allowed.probe).outcome, 'clear')
 })
