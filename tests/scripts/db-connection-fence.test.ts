@@ -660,6 +660,23 @@ const AUTHORISE_PLAN_PROGRAM = (() => {
   return FENCE_LIBRARY.slice(from + opener.length, to + 1)
 })()
 
+/**
+ * THE APPLIED STAMP, LIFTED THE SAME WAY (o3d-secops r25).
+ *
+ * A published authority and a STANDING fence are two different things now, and the difference is
+ * this program's one write. Fixtures below that mean "a fence is standing" must therefore run it,
+ * for the same reason they publish through the shipped validator rather than writing JSON: a rig
+ * that stamped the field itself would be proving that its author can set a key.
+ */
+const MARK_APPLIED_PROGRAM = (() => {
+  const opener = "  cat <<'MARK_APPLIED_EOF'\n"
+  const from = FENCE_LIBRARY.indexOf(opener)
+  assert.notEqual(from, -1, 'the shipped library must emit the applied stamp from one heredoc')
+  const to = FENCE_LIBRARY.indexOf('\nMARK_APPLIED_EOF\n', from)
+  assert.notEqual(to, -1, 'and that heredoc must be terminated')
+  return FENCE_LIBRARY.slice(from + opener.length, to + 1)
+})()
+
 /** Run the shipped validator over `plan`, exactly as root does. Returns its exit status. */
 function authorisePlan(plan: unknown, destination: string, database: string, appRole: string) {
   const run = spawnSync('node', ['-e', AUTHORISE_PLAN_PROGRAM, '--', database, appRole, destination], {
@@ -669,10 +686,29 @@ function authorisePlan(plan: unknown, destination: string, database: string, app
   return { status: run.status ?? -1, output: `${run.stdout}${run.stderr}` }
 }
 
+/** Run the shipped applied stamp over `destination`, exactly as root does after a `--fence`. */
+function markApplied(destination: string) {
+  const run = spawnSync('node', ['-e', MARK_APPLIED_PROGRAM, '--', destination], { encoding: 'utf8' })
+  return { status: run.status ?? -1, output: `${run.stdout}${run.stderr}` }
+}
+
 /** Publish a valid authority at `stateFile`, through the shipped validator, or throw. */
 function publishAuthority(stateFile: string, state: Record<string, unknown> = SAMPLE_STATE) {
   const run = authorisePlan(state, stateFile, String(state.database), String(state.app_role))
   assert.equal(run.status, 0, `the fixture must publish through the shipped validator:\n${run.output}`)
+}
+
+/**
+ * The record a fence that ACTUALLY STOOD leaves: published by root, and then stamped applied by
+ * root once `--fence` reported the REVOKEs were (or might be) on the medium. This is what buys the
+ * recovery rule; publishAuthority() alone no longer does, which is the whole of o3d-secops r25.
+ */
+function publishStandingAuthority(stateFile: string, state: Record<string, unknown> = SAMPLE_STATE) {
+  publishAuthority(stateFile, state)
+  const run = markApplied(stateFile)
+  assert.equal(run.status, 0, `the fixture must be stamped applied through the shipped stamp:\n${run.output}`)
+  assert.equal(JSON.parse(readFileSync(stateFile, 'utf8')).fence_applied, 1,
+    'and a "standing fence" fixture that is not stamped applied is measuring the wrong thing')
 }
 
 const SAMPLE_STATE = {
@@ -1093,16 +1129,18 @@ test('a recovery re-fence executes an authority whose grantees have already lost
   // re-apply `withdrawn` is not drift, it is the expected shape, and a bare equality rule would
   // make a standing fence impossible to re-apply or release.
   //
-  // ROUTE: a SECOND publication into the same directory. Root stamps `recovery` because an
-  // authority is already at the destination, which is a fact it can see and ${APP_USER} cannot
-  // forge — that directory is root-owned and unwritable by anything else.
+  // ROUTE: a SECOND publication over an authority that has been STAMPED APPLIED. Root stamps
+  // `recovery` because the record already there says a fence was applied behind it — a fact root
+  // writes after the revoke and ${APP_USER} cannot forge, that directory being root-owned and
+  // unwritable by anything else. Until o3d-secops r25 the fact asked for was merely that a file
+  // existed, which is why publishAuthority() twice used to be enough here and is not any more.
   //
   // MUTATION ROUTE (made against the shipped file and reverted): make `accepted` a plain equality
   // in both modes and this test fails at EXIT_OK — a standing fence can then never be re-applied.
   const dir = stateDir(t)
   const stateFile = join(dir, 'db-connect-fence.json')
   const record = { ...SAMPLE_STATE, revoked: ['PUBLIC', 'owner', 'imsapp'] }
-  publishAuthority(stateFile, record)
+  publishStandingAuthority(stateFile, record)
   publishAuthority(stateFile, record)
   assert.equal(JSON.parse(readFileSync(stateFile, 'utf8')).fence_mode, FENCE_MODE_RECOVERY,
     'a publication over a standing authority must be stamped as a recovery')
@@ -1143,14 +1181,22 @@ test('the plan cannot choose which rule its record is executed under (o3d-secops
   const dir = stateDir(t)
   const stateFile = join(dir, 'db-connect-fence.json')
 
-  const asking = authorisePlan({ ...SAMPLE_STATE, fence_mode: FENCE_MODE_RECOVERY }, stateFile, 'imsdb', 'imsapp')
+  const asking = authorisePlan({ ...SAMPLE_STATE, fence_mode: FENCE_MODE_RECOVERY, fence_applied: 1 }, stateFile, 'imsdb', 'imsapp')
   assert.equal(asking.status, 0, `a plan carrying an extra field must still publish:\n${asking.output}`)
   assert.equal(JSON.parse(readFileSync(stateFile, 'utf8')).fence_mode, FENCE_MODE_INITIAL,
     'nothing was at the destination, so this is an initial fence whatever the request said')
+  // AND THE FIELD THE MODE IS NOW COMPUTED FROM IS EQUALLY OUT OF THE PLAN'S REACH (o3d-secops
+  // r25). `fence_applied` decides what the NEXT publication stamps, so a plan that could carry it
+  // in as 1 would buy the recovery rule one run later — the same forgery, one step removed.
+  assert.equal(JSON.parse(readFileSync(stateFile, 'utf8')).fence_applied, 0,
+    'the applied stamp is root\'s own and is written 0 whatever the request said')
 
-  // AND THE CONVERSE: with a record standing, a plan asking for the strict rule does not get it
-  // either. The stamp answers to the filesystem and to nothing else.
-  const asserting = authorisePlan({ ...SAMPLE_STATE, fence_mode: FENCE_MODE_INITIAL }, stateFile, 'imsdb', 'imsapp')
+  // AND THE CONVERSE: with a fence standing, a plan asking for the strict rule does not get it
+  // either. The stamp answers to what root itself recorded and to nothing else. o3d-secops r25:
+  // "standing" is the APPLIED stamp root writes after the revoke, so the fixture has to raise it.
+  const stamped = markApplied(stateFile)
+  assert.equal(stamped.status, 0, `the standing-fence fixture must be stamped applied:\n${stamped.output}`)
+  const asserting = authorisePlan({ ...SAMPLE_STATE, fence_mode: FENCE_MODE_INITIAL, fence_applied: 1 }, stateFile, 'imsdb', 'imsapp')
   assert.equal(asserting.status, 0, asserting.output)
   assert.equal(JSON.parse(readFileSync(stateFile, 'utf8')).fence_mode, FENCE_MODE_RECOVERY,
     'an authority was already there, so this is a recovery whatever the request said')
@@ -1194,7 +1240,9 @@ test('a refused INITIAL fence leaves no authority behind, and a standing one is 
       // library between its own markers — the same bytes root hands `node -e` — so what runs here
       // is still the shipped validator and not a re-typed one.
       `db_fence_authorise_plan_program() {\n  cat <<'AUTHORISE_PLAN_EOF'\n${AUTHORISE_PLAN_PROGRAM}AUTHORISE_PLAN_EOF\n}`,
+      `db_fence_mark_applied_program() {\n  cat <<'MARK_APPLIED_EOF'\n${MARK_APPLIED_PROGRAM}MARK_APPLIED_EOF\n}`,
       shellFunction(FENCE_LIBRARY, 'db_fence_authorise_plan'),
+      shellFunction(FENCE_LIBRARY, 'db_fence_mark_authority_applied'),
       shellFunction(FENCE_LIBRARY, 'db_fence_publish_authority'),
       shellFunction(FENCE_LIBRARY, 'db_fence_clear_authority'),
       mutate(shellFunction(FENCE_LIBRARY, 'db_fence_raise')),
@@ -1207,6 +1255,7 @@ test('a refused INITIAL fence leaves no authority behind, and a standing one is 
       'db_fence_raise "/nonexistent/fence.mjs" "${state}" --app-database=imsdb --app-user=imsapp; echo "RC=$?"',
       '[[ -e "${state}" ]] && echo "AUTHORITY=PRESENT" || echo "AUTHORITY=GONE"',
       '[[ -e "${state}" ]] && echo "MODE=$(node -e \'process.stdout.write(String(JSON.parse(require("fs").readFileSync(process.argv[1],"utf8")).fence_mode))\' "${state}")"',
+      '[[ -e "${state}" ]] && echo "APPLIED=$(node -e \'process.stdout.write(String(JSON.parse(require("fs").readFileSync(process.argv[1],"utf8")).fence_applied))\' "${state}")"',
     ].join('\n')
     const run = spawnSync('bash', ['-c', program], { encoding: 'utf8' })
     return `${run.stdout ?? ''}${run.stderr ?? ''}`
@@ -1218,6 +1267,11 @@ test('a refused INITIAL fence leaves no authority behind, and a standing one is 
   assert.match(raised, /^RC=0$/m, `the ordinary raise must succeed:\n${raised}`)
   assert.match(raised, /^AUTHORITY=PRESENT$/m, `and leave the record a release is driven from:\n${raised}`)
   assert.match(raised, /^MODE=initial$/m, `stamped initial, because nothing was at the destination:\n${raised}`)
+  // AND o3d-secops r25: a raise that got as far as a REVOKE stamps its record APPLIED, which is
+  // what a later publication reads "a fence is standing" from. Asserted here rather than only in
+  // its own test because every "GONE"/"PRESENT" below is about a record whose applied state is the
+  // thing that now matters.
+  assert.match(raised, /^APPLIED=1$/m, `and the record must say the fence went up:\n${raised}`)
 
   // REFUSED BEFORE ANY REVOKE, WITH NOTHING STANDING: the record is this run's own, and it goes.
   const refused = raise('refused', 3)
@@ -1234,13 +1288,18 @@ test('a refused INITIAL fence leaves no authority behind, and a standing one is 
 
   // AND THE ONE IT MUST NEVER TOUCH: a fence was already standing when this run arrived, so that
   // record is the only account of what an earlier run revoked.
+  //
+  // AND THE FIXTURE IS A FENCE THAT ACTUALLY STOOD (o3d-secops r25): published AND stamped
+  // applied. A bare publication is no longer a standing fence, which is the point of the round —
+  // so a fixture that only published would be measuring a leftover, not the thing being protected.
   const standing = raise('standing', 3, [
     `printf '%s\\n' ${JSON.stringify(PLAN)} | db_fence_authorise_plan imsdb imsapp "\${state}" >/dev/null 2>&1`,
+    'db_fence_mark_authority_applied "${state}" >/dev/null 2>&1',
   ])
   assert.match(standing, /^RC=3$/m, standing)
   assert.match(standing, /^AUTHORITY=PRESENT$/m,
     `a standing fence's record may never be removed by a refusal — every grantee it names depends on it:\n${standing}`)
-  assert.match(standing, /^MODE=recovery$/m, `and it is a recovery, because an authority was already there:\n${standing}`)
+  assert.match(standing, /^MODE=recovery$/m, `and it is a recovery, because a fence was applied behind it:\n${standing}`)
 
   // AND A FENCE THAT MAY BE STANDING KEEPS ITS RECORD TOO. Exit 5 is "the COMMIT was issued and
   // this run never learned whether it took", which is the one outcome where the undo record is
@@ -1263,19 +1322,318 @@ test('a refused INITIAL fence leaves no authority behind, and a standing one is 
   assert.match(noCleanup, /^AUTHORITY=PRESENT$/m,
     `without the cleanup the refusal leaves an authority behind:\n${noCleanup}`)
   assert.match(noCleanup, /^MODE=initial$/m, `this run's own, stamped initial:\n${noCleanup}`)
-  // AND THE CONSEQUENCE, RUN RATHER THAN DESCRIBED: the very next attempt over that leftover is
-  // stamped a RECOVERY, so one re-run hands it the drift tolerance the refusal existed to withhold.
+  assert.match(noCleanup, /^APPLIED=0$/m, `and never applied to anything, because the fence was refused:\n${noCleanup}`)
+  // AND THE CONSEQUENCE, RUN RATHER THAN DESCRIBED. Under r24 the very next attempt over that
+  // leftover was stamped a RECOVERY — one re-run bought the drift tolerance the refusal existed to
+  // withhold, because "a fence is standing" was read off the pathname. Under r25 it is read off
+  // the APPLIED STAMP, which this leftover does not carry, so the retry is INITIAL and held to the
+  // strict rule EVEN WITH THE CLEANUP REMOVED. That is the architectural half of the fix stated as
+  // a measurement: the leftover is inert by construction rather than by having been tidied away.
   const secondAttempt = raise('nocleanup', 3, [], withoutCleanup)
-  assert.match(secondAttempt, /^MODE=recovery$/m,
-    `one re-run and the strict rule is gone — that is why a refused initial fence may not leave its record:\n${secondAttempt}`)
+  assert.match(secondAttempt, /^MODE=initial$/m,
+    `a record nothing ever applied may not buy the recovery rule, cleanup or no cleanup:\n${secondAttempt}`)
 
   // B: the cleanup with its ownership half removed — `rc` alone. It then removes a STANDING
   // fence's record, which is strictly worse than the finding it was added for.
   const anyAuthority = raise('anyauthority', 3, [
     `printf '%s\\n' ${JSON.stringify(PLAN)} | db_fence_authorise_plan imsdb imsapp "\${state}" >/dev/null 2>&1`,
+    'db_fence_mark_authority_applied "${state}" >/dev/null 2>&1',
   ], (body) => body.replace(CLEANUP, '  if [[ "${rc}" -eq 3 ]]; then'))
   assert.match(anyAuthority, /^AUTHORITY=GONE$/m,
     `without the "this run published it" half, a refusal destroys the only record of a standing fence:\n${anyAuthority}`)
+})
+
+/**
+ * WHERE r24 STOPPED, AND WHY A SECOND CLEANUP WOULD NOT HAVE BEEN ENOUGH (o3d-secops r25, Codex
+ * HIGH).
+ *
+ * r24 closed ONE route to a leftover authority — `--fence` returning EXIT_NOT_FENCEABLE — and left
+ * its sibling open. The validator's LAST barrier is the directory fsync, which runs AFTER the
+ * atomic rename; when it fails it says the name is not durable and deliberately leaves the record
+ * visible, because the file genuinely is there. r24's cleanup hangs off the EXECUTION's exit code
+ * and this route never reaches an execution at all, so the record survived and the instructed
+ * retry read the pathname as a standing fence.
+ *
+ * THE RULE, NOT THE ROUTE: DO NOT INFER A STANDING FENCE SOLELY FROM RECORD PRESENCE. Presence
+ * conflates "root published an authority" with "the fence was applied", and only the second is a
+ * standing fence. So the record carries `fence_applied`, written 0 by the validator and raised to
+ * 1 by root after `--fence` reports the revokes are on the medium; `fence_mode` is computed from
+ * THAT. A record left by any publication failure — this one, or one nobody has thought of — is
+ * then inert by construction rather than by having been cleaned up.
+ *
+ * ROUTE, AND IT IS THE REAL ONE: the shipped validator, run exactly as db_fence_authorise_plan()
+ * runs it, into a directory whose mode is 0300 — searchable and writable, so the temporary, the
+ * fsync, the chmod and the rename all succeed, and NOT readable, so `open(directory, 'r')` for the
+ * final fsync returns EACCES. Nothing is faked and no branch is simulated.
+ */
+test('a record left by a post-rename publication failure does not buy recovery (o3d-secops r25)', (t) => {
+  // ROOT BYPASSES THE MODE, so as root this would publish cleanly and every assertion below would
+  // pass while measuring nothing. The suite is run as an unprivileged account; this says so out
+  // loud rather than letting the day it is not be silent.
+  if ((process.getuid?.() ?? 0) === 0) {
+    assert.fail('this test measures a permission denial and root has none: run the unit suite as an unprivileged account')
+  }
+  const dir = stateDir(t)
+  const stateFile = join(dir, 'db-connect-fence.json')
+
+  chmodSync(dir, 0o300)
+  const torn = authorisePlan(SAMPLE_STATE, stateFile, 'imsdb', 'imsapp')
+  chmodSync(dir, 0o700)
+
+  // THE PRECONDITION, ASSERTED RATHER THAN ASSUMED — all three halves of it, because a test that
+  // reached none of them would still go green on the assertions that follow.
+  assert.notEqual(torn.status, 0, `the publication must FAIL when its name cannot be made durable:\n${torn.output}`)
+  assert.match(torn.output, /NAME is not durable/, `by the post-rename barrier and not an earlier one:\n${torn.output}`)
+  assert.equal(existsSync(stateFile), true,
+    `and the record must be VISIBLE anyway — that is the whole finding:\n${torn.output}`)
+  assert.equal(JSON.parse(readFileSync(stateFile, 'utf8')).fence_applied, 0,
+    'left by a publication, so nothing has been applied behind it')
+
+  // AND THE INSTRUCTED RETRY IS STILL AN INITIAL FENCE. This is the claim: a leftover record does
+  // not hand the next attempt the tolerance a strict rule would have withheld.
+  const retry = authorisePlan(SAMPLE_STATE, stateFile, 'imsdb', 'imsapp')
+  assert.equal(retry.status, 0, `the retry must publish:\n${retry.output}`)
+  assert.equal(JSON.parse(readFileSync(stateFile, 'utf8')).fence_mode, FENCE_MODE_INITIAL,
+    'a record nothing ever applied is not a standing fence, however visible it is')
+  assert.match(retry.output, /published and never stamped applied/,
+    `and the retry says why it is not treating it as one:\n${retry.output}`)
+
+  // MEASURED BY MUTATION, AGAINST THE SHIPPED PROGRAM TEXT, UNDER A REAL NODE. Restore r24's rule —
+  // "anything at the destination is a standing fence" — and the same leftover is stamped RECOVERY.
+  const APPLIED_RULE = 'prior.fence_applied === 1'
+  assert.ok(AUTHORISE_PLAN_PROGRAM.includes(APPLIED_RULE),
+    `the shipped validator must decide the mode from the applied stamp:\n${AUTHORISE_PLAN_PROGRAM}`)
+  const presenceIsEnough = AUTHORISE_PLAN_PROGRAM.replace(APPLIED_RULE, 'true')
+  assert.notEqual(presenceIsEnough, AUTHORISE_PLAN_PROGRAM, 'the mutation must have changed something')
+  const mutated = join(dir, 'mutated.json')
+  writeFileSync(mutated, readFileSync(stateFile, 'utf8'))
+  writeFileSync(mutated, `${JSON.stringify({ ...JSON.parse(readFileSync(mutated, 'utf8')), fence_applied: 0 }, null, 2)}\n`)
+  const regressed = spawnSync('node', ['-e', presenceIsEnough, '--', 'imsdb', 'imsapp', mutated], {
+    input: `${JSON.stringify(SAMPLE_STATE)}\n`,
+    encoding: 'utf8',
+  })
+  assert.equal(regressed.status, 0, `${regressed.stdout}${regressed.stderr}`)
+  assert.equal(JSON.parse(readFileSync(mutated, 'utf8')).fence_mode, FENCE_MODE_RECOVERY,
+    'with the applied stamp ignored, a leftover record buys the recovery rule again — which is the finding')
+})
+
+/**
+ * THE MINIMUM, AS DEFENCE IN DEPTH: this run's own visible authority is cleaned up on the
+ * PUBLICATION path too, not only on the execution's exit 3 (o3d-secops r25, Codex HIGH).
+ *
+ * ROUTE: the shipped db_fence_raise(), with the shipped validator and the shipped publisher, over
+ * a 0300 state directory — the same real post-rename failure as above, reached through the
+ * orchestration rather than through the validator directly. One stub, the privilege drop, which is
+ * the single part each entrypoint supplies for itself.
+ */
+test('db_fence_raise clears the authority a FAILED PUBLICATION left behind (o3d-secops r25)', (t) => {
+  if ((process.getuid?.() ?? 0) === 0) {
+    assert.fail('this test measures a permission denial and root has none: run the unit suite as an unprivileged account')
+  }
+  const dir = stateDir(t)
+  const PLAN = '{"database":"imsdb","owner_role":"owner","app_role":"imsapp","admin_role":"admin","revoked":["PUBLIC","imsapp"],"datacl_before":null,"fenced_at":"2026-01-01T00:00:00.000Z"}'
+
+  const raise = (name: string, mutate: (body: string) => string = (b) => b) => {
+    const stateFile = join(dir, `${name}.json`)
+    const program = [
+      'set -uo pipefail',
+      shellFunction(CUTOVER_NS_LIB_SOURCE, 'dir_is_private_to_this_run'),
+      `db_fence_authorise_plan_program() {\n  cat <<'AUTHORISE_PLAN_EOF'\n${AUTHORISE_PLAN_PROGRAM}AUTHORISE_PLAN_EOF\n}`,
+      `db_fence_mark_applied_program() {\n  cat <<'MARK_APPLIED_EOF'\n${MARK_APPLIED_PROGRAM}MARK_APPLIED_EOF\n}`,
+      shellFunction(FENCE_LIBRARY, 'db_fence_authorise_plan'),
+      shellFunction(FENCE_LIBRARY, 'db_fence_mark_authority_applied'),
+      shellFunction(FENCE_LIBRARY, 'db_fence_publish_authority'),
+      shellFunction(FENCE_LIBRARY, 'db_fence_clear_authority'),
+      mutate(shellFunction(FENCE_LIBRARY, 'db_fence_raise')),
+      `state=${JSON.stringify(stateFile)}`,
+      // THE DIRECTORY THE PUBLICATION CANNOT FSYNC. 0300 keeps `stat` (which is what
+      // dir_is_private_to_this_run asks), the temporary, the rename and the later `rm -f` all
+      // working — only the read the final fsync needs is denied.
+      `chmod 0300 ${JSON.stringify(dir)}`,
+      `db_fence_helper() { shift; case "$*" in *--plan*) printf '%s\\n' ${JSON.stringify(PLAN)}; return 0 ;; esac; echo "THE HELPER WAS INVOKED PAST THE PLAN" >&2; return 0; }`,
+      'db_fence_raise "/nonexistent/fence.mjs" "${state}" --app-database=imsdb --app-user=imsapp; echo "RC=$?"',
+      `chmod 0700 ${JSON.stringify(dir)}`,
+      '[[ -e "${state}" ]] && echo "AUTHORITY=PRESENT" || echo "AUTHORITY=GONE"',
+    ].join('\n')
+    const run = spawnSync('bash', ['-c', program], { encoding: 'utf8' })
+    return `${run.stdout ?? ''}${run.stderr ?? ''}`
+  }
+
+  const failed = raise('failed')
+  // THE PRECONDITION: the run really did reach the post-rename barrier, and really did refuse.
+  assert.match(failed, /NAME is not durable/, `the publication must fail after the rename:\n${failed}`)
+  assert.match(failed, /^RC=3$/m, `and the raise must refuse rather than revoke:\n${failed}`)
+  assert.doesNotMatch(failed, /THE HELPER WAS INVOKED PAST THE PLAN/,
+    `and nothing may execute a fence whose authority was not published:\n${failed}`)
+  assert.match(failed, /^AUTHORITY=GONE$/m,
+    `and the half-published record must not be left at the authoritative path:\n${failed}`)
+
+  // MEASURED BY MUTATION, ROUTE STATED, UNDER A REAL SHELL: remove the publication-path cleanup —
+  // which is exactly the shape r24 shipped — and the record survives.
+  const RAISE = shellFunction(FENCE_LIBRARY, 'db_fence_raise')
+  const PUBLICATION_CLEANUP = '    if [[ "${had_authority}" -eq 0 ]]; then\n      if ! db_fence_clear_authority "${state_file}"; then'
+  assert.ok(RAISE.includes(PUBLICATION_CLEANUP),
+    `the shipped orchestration must clear a failed publication's own record:\n${RAISE}`)
+  const withoutIt = (body: string) => body.replace(PUBLICATION_CLEANUP, '    if false; then\n      if ! db_fence_clear_authority "${state_file}"; then')
+  const leftBehind = raise('nocleanup', withoutIt)
+  assert.match(leftBehind, /^AUTHORITY=PRESENT$/m,
+    `without it a failed publication leaves its record at the authoritative path:\n${leftBehind}`)
+})
+
+/**
+ * AND THE RECORD OF A FENCE THAT PREDATES THE STAMP IS NOT STRANDED (o3d-secops r25).
+ *
+ * A fence raised before this upgrade is standing and its record has no `fence_applied` key at all.
+ * Refusing it recovery would leave it with neither a re-apply nor a release — the strict rule can
+ * never be satisfied by a standing fence's own record, because that fence is what took CONNECT
+ * from the grantees it names. So ABSENCE of the key means "written by a validator that predates
+ * the stamp", which can only be a fence raised earlier, and it is treated as standing.
+ *
+ * That is how it is told apart from a half-published record: a record from this round always HAS
+ * the key, holding 0, because the validator writes it in the same template as every other field.
+ * The discriminator is the key's presence, not its value, and it holds because the directory is
+ * root-owned and unwritable by anything else — the same argument `fence_mode` already rests on.
+ */
+test('a fence raised before the applied stamp still re-applies and releases (o3d-secops r25)', async (t) => {
+  const dir = stateDir(t)
+  const stateFile = join(dir, 'db-connect-fence.json')
+  const record = { ...SAMPLE_STATE, revoked: ['PUBLIC', 'owner', 'imsapp'] }
+
+  // THE LEGACY RECORD, BUILT BY STRIPPING WHAT THE OLD VALIDATOR NEVER WROTE rather than by
+  // hand-rolling one: the fields that remain are the shipped template's own.
+  publishAuthority(stateFile, record)
+  const published = JSON.parse(readFileSync(stateFile, 'utf8'))
+  delete published.fence_applied
+  delete published.fence_mode
+  writeFileSync(stateFile, `${JSON.stringify(published, null, 2)}\n`)
+
+  const republished = authorisePlan(record, stateFile, 'imsdb', 'imsapp')
+  assert.equal(republished.status, 0, `a re-fence over a legacy record must publish:\n${republished.output}`)
+  assert.equal(JSON.parse(readFileSync(stateFile, 'utf8')).fence_mode, FENCE_MODE_RECOVERY,
+    'a record with no applied stamp at all predates the stamp, so it is a fence that was raised and never released')
+  assert.match(republished.output, /carries no applied stamp at all/,
+    `and it says which of the two unstamped cases it decided this was:\n${republished.output}`)
+
+  // AND IT IS RE-APPLICABLE, WHICH IS WHAT "NOT STRANDED" MEANS. The ACL of a fenced database: the
+  // owner keeps its own entry and nobody else holds CONNECT, so every recorded grantee is
+  // `withdrawn` — fatal under the strict rule, expected under the one this record just earned.
+  const client = new FakeAdminClient({ stateFile, datacl: '{owner=CTc/owner}', stillConnectsBefore: false })
+  const code = await withAdminUrl(() => doFence(client as never, { stateFile, appRole: 'imsapp', timeoutSeconds: 1, ...suppliedIdentity({ appDatabase: 'imsdb' }) }))
+  assert.equal(code, EXIT_OK, `a fence raised before the stamp must still be re-applicable:\n${client.log.join(' | ')}`)
+  assert.deepEqual(client.revokes, [
+    'REVOKE CONNECT ON DATABASE "imsdb" FROM PUBLIC;',
+    'REVOKE CONNECT ON DATABASE "imsdb" FROM "owner";',
+    'REVOKE CONNECT ON DATABASE "imsdb" FROM "imsapp";',
+  ], 'over the whole recorded list, so the release still restores all of it')
+
+  // AND RELEASES. The release reads the record and grants back every role it names, and it does not
+  // consult the stamp at all — which is what makes the fail-closed direction of this design
+  // recoverable: an operator whose run died between the REVOKE and the stamp still has a working
+  // way to take the fence down. Asserted on the GRANTs rather than on the exit code, as the r24
+  // release drive above is, because the code's last arm probes a live DATABASE_URL.
+  const releaser = new FakeAdminClient({ stateFile, releasedDatacl: '{owner=CTc/owner,=Tc/owner,imsapp=c/owner}' })
+  await withAdminUrl(() => doRelease(releaser as never, { stateFile, appRole: 'imsapp', ...suppliedIdentity({ appDatabase: 'imsdb' }) }))
+  assert.deepEqual(releaser.grants, [
+    'GRANT CONNECT ON DATABASE "imsdb" TO PUBLIC;',
+    'GRANT CONNECT ON DATABASE "imsdb" TO "owner";',
+    'GRANT CONNECT ON DATABASE "imsdb" TO "imsapp";',
+  ], `a fence raised before the stamp must still be releasable from its own record:\n${releaser.log.join(' | ')}`)
+
+  // MEASURED BY MUTATION, AGAINST THE SHIPPED PROGRAM TEXT: treat an absent key the way a present
+  // 0 is treated, and the legacy record is stamped INITIAL — which is the fence being stranded,
+  // because the strict rule can never accept a standing fence's own grantee list.
+  const LEGACY_RULE = '!Object.prototype.hasOwnProperty.call(prior, "fence_applied")'
+  assert.ok(AUTHORISE_PLAN_PROGRAM.includes(LEGACY_RULE),
+    `the shipped validator must discriminate on the KEY, not on its value:\n${AUTHORISE_PLAN_PROGRAM}`)
+  const noLegacy = AUTHORISE_PLAN_PROGRAM.replace(LEGACY_RULE, 'false')
+  assert.notEqual(noLegacy, AUTHORISE_PLAN_PROGRAM, 'the mutation must have changed something')
+  const stranded = join(dir, 'stranded.json')
+  writeFileSync(stranded, `${JSON.stringify(published, null, 2)}\n`)
+  const run = spawnSync('node', ['-e', noLegacy, '--', 'imsdb', 'imsapp', stranded], {
+    input: `${JSON.stringify(record)}\n`,
+    encoding: 'utf8',
+  })
+  assert.equal(run.status, 0, `${run.stdout}${run.stderr}`)
+  assert.equal(JSON.parse(readFileSync(stranded, 'utf8')).fence_mode, FENCE_MODE_INITIAL,
+    'without the legacy branch a fence raised before this upgrade is held to a rule it cannot satisfy')
+  const strandedClient = new FakeAdminClient({ stateFile: stranded, datacl: '{owner=CTc/owner}', stillConnectsBefore: false })
+  const strandedCode = await withAdminUrl(() => doFence(strandedClient as never, { stateFile: stranded, appRole: 'imsapp', timeoutSeconds: 1, ...suppliedIdentity({ appDatabase: 'imsdb' }) }))
+  assert.equal(strandedCode, EXIT_NOT_FENCEABLE,
+    'and refused, which is the stranding the presence branch exists to prevent')
+})
+
+/**
+ * WHO RAISES THE STAMP, AND OFF WHICH STATUSES (o3d-secops r25).
+ *
+ * The stamp is the only write that ever happens AFTER a REVOKE, so which exit codes earn it is the
+ * whole of what "the fence was applied" means. 0 is a fence this run watched go up; 5 is
+ * EXIT_FENCE_STANDING, where the COMMIT was issued and the acknowledgement may have been lost, and
+ * the only safe reading of unknown is that CONNECT may be revoked. 1 is the helper's catch-all —
+ * it covers a connection that never opened AND a `client.end()` that threw after a successful
+ * fence — so it may not declare anything applied, and the run says so out loud instead.
+ *
+ * ROUTE: the shipped db_fence_raise() with the shipped validator, publisher and stamp; the
+ * privilege drop stubbed to return the status under test.
+ */
+test('only a status that means the revokes may be on the medium stamps the record applied (o3d-secops r25)', (t) => {
+  const dir = stateDir(t)
+  const PLAN = '{"database":"imsdb","owner_role":"owner","app_role":"imsapp","admin_role":"admin","revoked":["PUBLIC","imsapp"],"datacl_before":null,"fenced_at":"2026-01-01T00:00:00.000Z"}'
+
+  const raise = (name: string, fenceRc: number, mutate: (body: string) => string = (b) => b) => {
+    const stateFile = join(dir, `${name}.json`)
+    const program = [
+      'set -uo pipefail',
+      shellFunction(CUTOVER_NS_LIB_SOURCE, 'dir_is_private_to_this_run'),
+      `db_fence_authorise_plan_program() {\n  cat <<'AUTHORISE_PLAN_EOF'\n${AUTHORISE_PLAN_PROGRAM}AUTHORISE_PLAN_EOF\n}`,
+      `db_fence_mark_applied_program() {\n  cat <<'MARK_APPLIED_EOF'\n${MARK_APPLIED_PROGRAM}MARK_APPLIED_EOF\n}`,
+      shellFunction(FENCE_LIBRARY, 'db_fence_authorise_plan'),
+      shellFunction(FENCE_LIBRARY, 'db_fence_mark_authority_applied'),
+      shellFunction(FENCE_LIBRARY, 'db_fence_publish_authority'),
+      shellFunction(FENCE_LIBRARY, 'db_fence_clear_authority'),
+      mutate(shellFunction(FENCE_LIBRARY, 'db_fence_raise')),
+      `state=${JSON.stringify(stateFile)}`,
+      `fence_rc=${fenceRc}`,
+      `db_fence_helper() { shift; case "$*" in *--plan*) printf '%s\\n' ${JSON.stringify(PLAN)}; return 0 ;; *--fence*) return "\${fence_rc}" ;; esac; return 0; }`,
+      'db_fence_raise "/nonexistent/fence.mjs" "${state}" --app-database=imsdb --app-user=imsapp; echo "RC=$?"',
+      '[[ -e "${state}" ]] && echo "AUTHORITY=PRESENT" || echo "AUTHORITY=GONE"',
+      '[[ -e "${state}" ]] && echo "APPLIED=$(node -e \'process.stdout.write(String(JSON.parse(require("fs").readFileSync(process.argv[1],"utf8")).fence_applied))\' "${state}")"',
+    ].join('\n')
+    const run = spawnSync('bash', ['-c', program], { encoding: 'utf8' })
+    return `${run.stdout ?? ''}${run.stderr ?? ''}`
+  }
+
+  const up = raise('up', 0)
+  assert.match(up, /^APPLIED=1$/m, `a fence that went up is recorded as having gone up:\n${up}`)
+  assert.match(up, /stamped APPLIED/, `and the stamp announces itself:\n${up}`)
+
+  const maybe = raise('maybe', 5)
+  assert.match(maybe, /^AUTHORITY=PRESENT$/m, maybe)
+  assert.match(maybe, /^APPLIED=1$/m,
+    `a COMMIT whose acknowledgement was lost may be standing, and must be readable as standing:\n${maybe}`)
+
+  // THE ONE THAT DELIBERATELY DOES NOT. Exit 1 cannot tell a connection that never opened from a
+  // teardown that threw after a successful fence, so it declares nothing — and the run says what
+  // that costs rather than leaving it to be discovered.
+  const ambiguous = raise('ambiguous', 1)
+  assert.match(ambiguous, /^AUTHORITY=PRESENT$/m,
+    `an ambiguous status keeps the record, because the revokes MIGHT be on the medium:\n${ambiguous}`)
+  assert.match(ambiguous, /^APPLIED=0$/m,
+    `and does not claim a fence was applied, because it cannot show one was:\n${ambiguous}`)
+  // AND THE CONSEQUENCE, RUN RATHER THAN DESCRIBED: the next publication over that record is
+  // INITIAL, so the next cutover is held to the strict rule and REFUSES rather than tolerating
+  // drift on a fence nobody can show exists. That is the direction this fails in.
+  const next = raise('ambiguous', 3)
+  assert.match(next, /published at .*\(initial\)/,
+    `a record no status proved applied may not buy the recovery rule:\n${next}`)
+
+  // MEASURED BY MUTATION, ROUTE STATED, UNDER A REAL SHELL: widen the stamp to "anything that is
+  // not the refusal" and exit 1 declares a fence applied that may never have been raised.
+  const RAISE = shellFunction(FENCE_LIBRARY, 'db_fence_raise')
+  const GUARD = '  if [[ "${rc}" -eq 0 || "${rc}" -eq 5 ]]; then'
+  assert.ok(RAISE.includes(GUARD), `the shipped orchestration must enumerate the statuses it stamps for:\n${RAISE}`)
+  const widened = raise('widened', 1, (body) => body.replace(GUARD, '  if [[ "${rc}" -ne 3 ]]; then'))
+  assert.match(widened, /^APPLIED=1$/m,
+    `widened, a catch-all failure declares a fence standing and buys the next run the lax rule:\n${widened}`)
 })
 
 test('a record this account could have written is never a record (o3d-secops r23)', async (t) => {
@@ -1447,10 +1805,12 @@ test('the privileged validator rebuilds the record and refuses what it cannot ch
   assert.equal(extra.status, 0, `a valid plan must publish:\n${extra.output}`)
   const published = JSON.parse(readFileSync(stateFile, 'utf8'))
   // `fence_mode` joined the template in o3d-secops r24: root stamps which rule the executor runs
-  // the record under, and it is stamped from what root can SEE — whether an authority was already
-  // at the destination — rather than taken from the request. The sentinel stays last.
-  assert.deepEqual(Object.keys(published), ['database', 'owner_role', 'app_role', 'admin_role', 'revoked', 'datacl_before', 'fenced_at', 'fence_mode', 'state_complete'],
+  // the record under, rather than taking it from the request. `fence_applied` joined it in r25 and
+  // is what `fence_mode` is now computed FROM — a publication is not a standing fence, and only a
+  // record root stamped after the revoke may buy the recovery rule. The sentinel stays last.
+  assert.deepEqual(Object.keys(published), ['database', 'owner_role', 'app_role', 'admin_role', 'revoked', 'datacl_before', 'fenced_at', 'fence_mode', 'fence_applied', 'state_complete'],
     'the published record is root\'s template, not the request')
+  assert.equal(published.fence_applied, 0, 'and a freshly published authority has not been applied to anything yet')
   assert.equal(published.state_complete, STATE_COMPLETE_SENTINEL, 'and it ends with the sentinel the reader requires')
 
   // AND IT IS CHECKED AGAINST WHAT ROOT SUPPLIED, not against itself.
