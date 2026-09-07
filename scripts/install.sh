@@ -6518,9 +6518,24 @@ db_fence_migration_helper() {
 # db_fence_migration_bind() in lib/db-fence-protected.sh; what belongs here is what an operator
 # sees for each answer.
 bind_migration_to_fenced_server() {
-  local bind_rc=0 bind_script
-  bind_script="$(resolve_fence_script)" || die \
+  # THE EXIT TRAP'S RE-FENCE CALLS THIS TOO, AND A TRAP MAY NOT `die` (o3d-secops r32).
+  # `${1}` is `advisory` on that path and empty on the cutover's own. The DIFFERENCE IS ONLY WHAT
+  # HAPPENS TO THIS RUN, never what happens to the migration: an advisory refusal EMPTIES
+  # ${MIGRATION_DATABASE_URL}, which is the same thing the composer's own refusal does, so nothing
+  # downstream can migrate on a string this run could not place. A `die` inside the trap would
+  # abandon the rest of the unwind -- the crontab, the reboot fence, the marker -- to protect
+  # against a redirect, which is a worse trade than the one it is protecting against.
+  local mode="${1:-fatal}" bind_rc=0 bind_script
+  if ! bind_script="$(resolve_fence_script)"; then
+    if [[ "${mode}" == "advisory" ]]; then
+      MIGRATION_DATABASE_URL=""
+      warn "The re-fence has no fence script it is willing to execute, so nothing can show that a migration"
+      warn "connection would reach the server it fenced. The migration URL has been discarded."
+      return 0
+    fi
+    die \
     "The connection fence is up and this run has no fence script it is willing to execute, so it cannot show that the migration connection reaches the server it fenced. Nothing has been migrated; release the fence with: ${DB_FENCE_RELEASE_CMD}"
+  fi
   db_fence_migration_bind "${bind_script}" "${MIGRATION_DATABASE_URL}" "${DB_FENCE_IDENTITY_ARGS[@]:-}" || bind_rc=$?
   case "${bind_rc}" in
     0)
@@ -6532,9 +6547,21 @@ bind_migration_to_fenced_server() {
       warn "every host with a pooler -- and the fence record will be KEPT at the end for you to end."
       ;;
     2)
+      if [[ "${mode}" == "advisory" ]]; then
+        MIGRATION_DATABASE_URL=""
+        warn "The re-fence composed a migration URL carrying no binding stamp; it has been discarded."
+        return 0
+      fi
       die "The connection fence is up and the migration URL carries no binding stamp, so nothing can show which server the migration would reach. Refusing to migrate. Nothing has been migrated; release the fence with: ${DB_FENCE_RELEASE_CMD}"
       ;;
     *)
+      if [[ "${mode}" == "advisory" ]]; then
+        MIGRATION_DATABASE_URL=""
+        warn "The re-fence could not show that a migration connection would reach the server it fenced"
+        warn "(the reason is printed above). The migration URL has been discarded, so nothing can migrate"
+        warn "on it; the fence itself is up and its record is kept."
+        return 0
+      fi
       die "THE MIGRATION WOULD NOT HAVE LANDED ON THE SERVER THIS RUN FENCED (the reason is printed above). A connection opened with the exact string prisma is about to be handed either could not see the connection witness or did not carry this run's stamp — so a DNS change, a proxy, a failover or a pooler is putting the migration somewhere the fence never reached. NOTHING HAS BEEN MIGRATED and the schema is untouched. Release the fence with: ${DB_FENCE_RELEASE_CMD}"
       ;;
   esac
@@ -6925,7 +6952,7 @@ refence_db_connections() {
     warn "--print-migration-url refused to compose a migration URL (exit ${url_rc}); NOT falling back to DEPLOY_ADMIN_DATABASE_URL. The fence is up."
     return 0
   fi
-  bind_migration_to_fenced_server
+  bind_migration_to_fenced_server advisory
   return 0
 }
 

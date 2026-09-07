@@ -13058,7 +13058,10 @@ function witnessProtocolCheckout(
     extraStdout?: string[]
     confirmChallenge?: boolean
     sightings?: number
-    binding?: 'colocated' | 'absent'
+    // ONE ANSWER, OR ONE PER CALL. The re-fence case needs the FIRST `--bind-migration` to bind --
+    // the cutover's own gate refuses otherwise and the run never reaches its trap -- and the
+    // SECOND, the trap's own, to fail. A single value repeats for every call.
+    binding?: 'colocated' | 'absent' | ReadonlyArray<'colocated' | 'absent'>
     samplerStuck?: boolean
   } = {},
 ): void {
@@ -13074,6 +13077,8 @@ function witnessProtocolCheckout(
   // file is the SHELL: that it runs the probe, asks the sampler on both sides of it, and refuses
   // when the count did not move.
   const held = JSON.stringify(join(dir, 'hold-stamp-probe'))
+  const bindings = Array.isArray(binding) ? binding : [binding as 'colocated' | 'absent']
+  const bindSeq = JSON.stringify(join(dir, 'bind-call-count'))
   writeFileSync(helper, [
     "import { appendFileSync, existsSync, readFileSync, writeFileSync } from 'node:fs'",
     `appendFileSync(${JSON.stringify(join(dir, 'calls.log'))}, process.argv.slice(2).join(' ') + '\\n')`,
@@ -13116,8 +13121,12 @@ function witnessProtocolCheckout(
     "const migrationArg = process.argv.find((a) => a.startsWith('--migration-nonce='))?.slice('--migration-nonce='.length) ?? ''",
     "if (process.argv.includes('--bind-migration')) {",
     `  if (process.argv.includes('--hold-stamp')) writeFileSync(${held}, 'held')`,
-    `  process.stdout.write(\`MIGRATION_BINDING \${migrationArg} ${binding}\\n\`)`,
-    `  process.exit(${binding === 'colocated' ? 0 : 1})`,
+    `  const answers = ${JSON.stringify(bindings)}`,
+    `  const seen = existsSync(${bindSeq}) ? Number(readFileSync(${bindSeq}, 'utf8')) : 0`,
+    `  writeFileSync(${bindSeq}, String(seen + 1))`,
+    '  const answer = answers[Math.min(seen, answers.length - 1)]',
+    '  process.stdout.write(`MIGRATION_BINDING ${migrationArg} ${answer}\\n`)',
+    "  process.exit(answer === 'colocated' ? 0 : 1)",
     "}",
     "if (process.argv.includes('--fence') && lockArg) process.stdout.write(`FENCE_WITNESS ${lockArg} colocated\\n`)",
     // THE NONCE THE WITNESS WAS CHALLENGED WITH, whether or not this run was told it on argv. That
@@ -13613,3 +13622,69 @@ test('[o3d-secops r32] the recovery wrappers read their machine lines the same w
   assert.match(run(['legacy_fence_verdict=stands', 'legacy_fence_verdict=absent'], 'legacy_fence_verdict', VERDICT).output, /^REFUSED$/m,
     'and a stream that says both is not evidence for either')
 })
+
+// ---------------------------------------------------------------------------
+// o3d-secops r32 — AND THE EXIT TRAP'S RE-FENCE STILL CANNOT DIE.
+//
+// r13's rule, which every round since has had to keep: `refence_db_connections()` runs INSIDE the
+// exit trap, where a `die` abandons the rest of the unwind — the crontab, the reboot fence, the
+// marker that tells the next run what this one reached. r32 gave the re-fence a new gate that
+// refuses, and a refusal reached from a trap is exactly that abandonment.
+//
+// So the gate takes a MODE, and the difference is only what happens to THIS RUN: on the trap path
+// it empties ${MIGRATION_DATABASE_URL} — the same thing the composer's own refusal already does —
+// so nothing downstream can migrate on a string this run could not place, and the unwind carries
+// on. The existing r13 assertion is a TEXT check (`refence_db_connections` must not contain the
+// word `die`), and it passed the whole time this defect was in: the `die` was one call away.
+// ---------------------------------------------------------------------------
+
+for (const entry of FENCE_HARNESS) {
+  // MUTATION ROUTE (made against the shipped file and reverted): change the re-fence's call back to
+  // a bare `bind_migration_to_fenced_server` -- the trap dies, UNWIND CONTINUED is not printed, and
+  // the run exits non-zero from inside its own cleanup.
+  test(`${entry.name}: a re-fence that cannot place the migration does not kill the exit trap (o3d-secops r32)`, () => {
+    const dir = mkdtempSync(join(tmpdir(), 'ims-r32trap-'))
+    try {
+      // The cutover's own gate binds; the TRAP's re-fence does not. Both go through the same
+      // shipped function, and only the mode differs.
+      witnessProtocolCheckout(dir, { verdict: 'yes', binding: ['colocated', 'absent'] })
+      const result = runShell([
+        'set -uo pipefail',
+        'exec 2>&1',
+        entry.preamble(dir),
+        'error() { echo "ERROR: $*" >&2; }',
+        'DB_FENCE_RAISED=false',
+        CUTOVER_DIR_PRIMITIVES,
+        shellFunction(entry.source, 'fence_db_connections'),
+        shellFunction(entry.source, 'refence_db_connections'),
+        // THE STATE THE TRAP ACTUALLY RUNS IN: the cutover fenced, migrated and RELEASED, and the
+        // start or the health check then failed. `refence_db_connections()` returns immediately
+        // while ${DB_FENCE_UP} is true, so a rig that skipped the release would exercise nothing.
+        'fence_db_connections',
+        'DB_FENCE_UP=false',
+        'MIGRATION_DATABASE_URL=""',
+        // The two names the shipped re-fence reads that this rig does not otherwise set. Both are
+        // true of the moment it runs: the schema HAS moved (the start failed after the migration)
+        // and no adoption is in progress.
+        'SCHEMA_TOUCHED=true',
+        'DB_FENCE_ADOPTING=false',
+        // The trap's shape, reduced to the two facts that matter: the re-fence runs, and the
+        // unwind has more to do afterwards.
+        'on_exit() { refence_db_connections || true; echo "UNWIND CONTINUED"; }',
+        'trap on_exit EXIT',
+        'echo "THE RUN FAILED SOMEWHERE"',
+      ].join('\n'))
+
+      assert.match(calls(dir), /^--bind-migration /m,
+        `precondition: the re-fence must have tried to place the migration:\n${calls(dir)}`)
+      assert.match(result.output, /^UNWIND CONTINUED$/m,
+        `a gate that refuses inside the exit trap must not abandon the rest of the unwind:\n${result.output}`)
+      assert.doesNotMatch(result.output, /^DIE:/m,
+        `and must not die from inside it:\n${result.output}`)
+      assert.match(result.output, /discarded/,
+        `while still emptying the migration URL, so nothing can migrate on a string it could not place:\n${result.output}`)
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+}
