@@ -704,21 +704,37 @@ export async function probeLedgerSettlement(
   connector: 'xero' | 'quickbooks',
   target: SettlementProbeTarget,
 ): Promise<LedgerSettlementProbe> {
+  // o3d-r948 r5 (Codex HIGH) — WHICH ORGANISATION IS ANSWERING, READ EITHER SIDE OF THE READ.
+  //
+  // The records this returns are ids in one ledger's namespace, and the caller's exclusion set is
+  // only sound if it is comparing against the SAME organisation (see `LedgerSettlementProbe`).
+  // There is no way to ask the connectors' fetchers which tenant they used, so this reads the
+  // active token instead — and reads it TWICE, because a single read is a claim about a moment and
+  // the fetch is a different moment. An operator disconnecting and reconnecting to another company
+  // across this call would otherwise have us label realm A's records with realm B's name, which is
+  // the failure this whole change exists to stop, arriving one layer up.
+  //
+  // Disagreement answers NULL rather than either value: "the connection moved while I was reading
+  // it" is precisely a state in which nothing may be excluded, and null is what withholds.
+  //
+  // ITS OWN try/catch, AND THAT IS THE WHOLE POINT OF IT BEING SEPARATE. This is
+  // EVIDENCE-GATHERING ABOUT the probe, not part of the probe's answer. Inside the outer catch, a
+  // database hiccup on the token row — the row this reads is not the ledger and not on the ledger's
+  // path — turned a perfectly good reading of the document into `ok: false`, i.e. "the accounting
+  // connector could not be asked what it already holds", which REFUSES every money post behind it.
+  // A guard that converts an unrelated fault into a blanket refusal of an unrelated question is a
+  // new failure mode, not a stricter version of an old one. Failing to learn the organisation
+  // degrades to NULL, which excludes nothing and leaves the records intact.
+  const readConnection = async (): Promise<string | null> => {
+    try {
+      const { activeAccountingIdProvenance } = await import('./accounting-id-provenance')
+      return await activeAccountingIdProvenance(connector)
+    } catch {
+      return null
+    }
+  }
   try {
-    const { activeAccountingIdProvenance } = await import('./accounting-id-provenance')
-    // o3d-r948 r5 (Codex HIGH) — WHICH ORGANISATION IS ANSWERING, READ EITHER SIDE OF THE READ.
-    //
-    // The records this returns are ids in one ledger's namespace, and the caller's exclusion set is
-    // only sound if it is comparing against the SAME organisation (see `LedgerSettlementProbe`).
-    // There is no way to ask the connectors' fetchers which tenant they used, so this reads the
-    // active token instead — and reads it TWICE, because a single read is a claim about a moment
-    // and the fetch is a different moment. An operator disconnecting and reconnecting to another
-    // company across this call would otherwise have us label realm A's records with realm B's name,
-    // which is the failure this whole change exists to stop, arriving one layer up.
-    //
-    // Disagreement answers NULL rather than either value: "the connection moved while I was reading
-    // it" is precisely a state in which nothing may be excluded, and null is what withholds.
-    const before = await activeAccountingIdProvenance(connector)
+    const before = await readConnection()
     const probe = connector === 'xero'
       ? await (async () => {
         const { xeroGet } = await import('./xero/api')
@@ -729,7 +745,7 @@ export async function probeLedgerSettlement(
         return await probeQuickBooksSettlement(target, qboGet as QboFetcher)
       })()
     if (!probe.ok) return probe
-    const after = await activeAccountingIdProvenance(connector)
+    const after = await readConnection()
     // Two NULLS agree, and the answer is still null: "nothing is connected" cannot vouch for an id,
     // so no `before !== null` guard is needed here — it would be dead. What the null must not do is
     // MATCH a row that also records nothing, and that is guaranteed on the decision side, where

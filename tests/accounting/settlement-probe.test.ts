@@ -587,6 +587,8 @@ test('the probe key is not split by an anchor the TYPE does not have (o3d-0m56 r
 
 /** Successive answers to "which tenant is connected now", so a reconnect mid-call can be staged. */
 let tenantReads: Array<string | null> = []
+/** Set to make the token read FAIL, which is a fact about our database and not about the ledger. */
+let tenantReadThrows = false
 const tenantsRead = () => TENANT_CALLS.length
 const TENANT_CALLS: string[] = []
 
@@ -596,6 +598,7 @@ mock.module('@/lib/db', {
       accountingToken: {
         findUnique: async ({ where }: { where: { connector: string } }) => {
           TENANT_CALLS.push(where.connector)
+          if (tenantReadThrows) throw new Error('SASL: SCRAM-SERVER-FIRST-MESSAGE: client password must be a string')
           const next = tenantReads.shift()
           return next == null ? null : { tenantId: next }
         },
@@ -674,4 +677,38 @@ test('[o3d-r948 r5] no connected organisation at all is unknown too, not an empt
   assert.equal(probe.ok, true)
   assert.equal(probe.ok && probe.records.length, 1, 'the read itself still succeeded')
   assert.equal(probe.ok && probe.connectionProvenance, null)
+})
+
+test('[o3d-r948 r5] a token read that FAILS does not destroy the reading of the ledger', async () => {
+  // THE FAILURE MODE THIS GUARD ALMOST INTRODUCED, caught by the suite before it shipped. The
+  // provenance read touches the LOCAL `accounting_tokens` row — our database, not the ledger and
+  // not on the ledger's path. Gathered inside the outer try/catch, a database hiccup there became
+  // `ok: false`, which reads as "the accounting connector could not be asked what it already
+  // holds" — and THAT refuses every money post behind it. `authoriseMoneyPost` and
+  // `ledgerClearsFollowUpRevival` both said so, in 43 failures.
+  //
+  // A guard that turns an unrelated fault into a blanket refusal of an unrelated question is a new
+  // failure mode, not a stricter old one. So the read has its own try/catch and degrades to NULL:
+  // the records survive, and "which organisation" is simply unknown — which excludes nothing.
+  //
+  // ROUTE: probeLedgerSettlement's `readConnection` helper and its own try/catch.
+  // MUTATION: remove that inner catch, letting the throw reach the outer one, and this fails with
+  //        `ok: false` and the SASL message in `reason` (verified).
+  TENANT_CALLS.length = 0
+  tenantReads = []
+  tenantReadThrows = true
+  try {
+    const probe = await probeLedgerSettlement('xero', XERO_TARGET)
+
+    // THE PRECONDITION: the read really was attempted and really did throw, so this is the failing
+    // path and not a case where the provenance was never asked for.
+    assert.equal(tenantsRead(), 2, 'the token read must have been attempted either side of the fetch')
+
+    assert.equal(probe.ok, true, 'a failed token read is not a failed ledger reading')
+    assert.equal(probe.ok && probe.records.length, 1, 'and the records the ledger DID give must survive')
+    assert.equal(probe.ok && probe.records[0].id, 'PAY-9')
+    assert.equal(probe.ok && probe.connectionProvenance, null, 'only the organisation is unknown')
+  } finally {
+    tenantReadThrows = false
+  }
 })
