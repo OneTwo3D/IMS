@@ -6497,9 +6497,13 @@ fence_db_connections() {
   # own yet, and a fence over an unnamed connection is exactly what this round removed.
   require_db_identity || die \
     "The application's database has not been set up yet in this run, so there is no host, port, role and database to tell the connection fence about. The fence is TOLD which connection it closes — it no longer works that out from the environment. Nothing has been migrated."
-  mkdir -p "${DB_FENCE_DIR}"
-  chown "${APP_USER}:${APP_USER}" "${DB_FENCE_DIR}"
-  chmod 700 "${DB_FENCE_DIR}"
+  # THE SAME NAMESPACE, THROUGH THE SAME WALK (o3d-secops r22, Codex CRITICAL). This used to be a
+  # second, unguarded copy of the trio ensure_cutover_state_dirs() carried — `mkdir -p`, which
+  # ACCEPTS a symlink-to-directory at the final component, and then a `chown` and a `chmod` that both
+  # dereference. Fixing one of the two copies and leaving the other is how this class survives a
+  # round, so there is one caller and no second spelling.
+  ensure_cutover_state_dirs || die \
+    "The connection-fence directory ${DB_FENCE_DIR} could not be created beneath ${CUTOVER_ROOT_DIR} owned by ${APP_USER} and private to it, so the fence about to be raised would have nowhere it could record what it revoked. NO FENCE HAS BEEN RAISED and nothing has been migrated."
 
   # THE ONLY FILE THIS FUNCTION RUNS IS THE ROOT-OWNED ONE (o3d-2sm1.5 r31, Codex CRITICAL).
   local rc=0 fence_script

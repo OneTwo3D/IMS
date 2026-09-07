@@ -3519,9 +3519,13 @@ fence_db_connections() {
       "The connection identity this run pinned is no longer the one ${APP_DIR}/.env gives the service: ${DB_IDENTITY_DRIFT_REASON}. DATABASE_URL was read once, in the preflight, and systemd does not read the environment file until it execs the service — so fencing on the pinned identity now would fence and migrate one database while the application starts on another. NO FENCE HAS BEEN RAISED and nothing has been migrated. Put the file back the way this run found it, or re-run so the identity is pinned from what the file says now."
   fi
 
-  mkdir -p "${DB_FENCE_DIR}"
-  chown "${APP_USER}:${APP_USER}" "${DB_FENCE_DIR}"
-  chmod 700 "${DB_FENCE_DIR}"
+  # THE SAME NAMESPACE, THROUGH THE SAME WALK (o3d-secops r22, Codex CRITICAL). This used to be a
+  # second, unguarded copy of the trio ensure_cutover_state_dirs() carried — `mkdir -p`, which
+  # ACCEPTS a symlink-to-directory at the final component, and then a `chown` and a `chmod` that both
+  # dereference. Fixing one of the two copies and leaving the other is how this class survives a
+  # round, so there is one caller and no second spelling.
+  ensure_cutover_state_dirs || die \
+    "The connection-fence directory ${DB_FENCE_DIR} could not be created beneath ${CUTOVER_ROOT_DIR} owned by ${APP_USER} and private to it, so the fence about to be raised would have nowhere it could record what it revoked. NO FENCE HAS BEEN RAISED and nothing has been migrated."
 
   # THE RECORD IS WRITTEN BEFORE THE REVOKE. A fence raised with no record of what it was aimed
   # at is the state that made r28's recovery impossible, and a record published afterwards is

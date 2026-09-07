@@ -1254,8 +1254,10 @@ STATE_DIR='${dir}'
 CUTOVER_STATE_DIR='${dir}'
 # o3d-secops r22: the connection-fence directory is walked to beneath a root-owned parent
 # now, so a rig that names it must name the parent it hangs off as well.
+CUTOVER_STATE_DIR="${'${CUTOVER_STATE_DIR:-'}${dir}}"
 CUTOVER_ROOT_DIR='${dir}'
 DB_FENCE_DIR='${dir}/fence'
+LEGACY_STATE_DIR_DB_FENCE_STATE="${'${CUTOVER_STATE_DIR}'}/deploy/db-connect-fence.json"
 DB_FENCE_SCRIPT='${dir}/app/scripts/fence-db-connections.mjs'
 DB_FENCE_STATE='${dir}/db-connect-fence.json'
 DEPLOY_ADMIN_DATABASE_URL='postgres://admin@127.0.0.1/nowhere'
@@ -1316,8 +1318,10 @@ BLUE=''; GREEN=''; YELLOW=''; RED=''; BOLD=''; RESET=''
 APP_USER="$(id -un)"
 # o3d-secops r22: the connection-fence directory is walked to beneath a root-owned parent
 # now, so a rig that names it must name the parent it hangs off as well.
+CUTOVER_STATE_DIR="${'${CUTOVER_STATE_DIR:-'}${dir}}"
 CUTOVER_ROOT_DIR='${dir}'
 DB_FENCE_DIR='${dir}/fence'
+LEGACY_STATE_DIR_DB_FENCE_STATE="${'${CUTOVER_STATE_DIR}'}/deploy/db-connect-fence.json"
 DB_FENCE_SCRIPT='${dir}/app/scripts/fence-db-connections.mjs'
 DB_FENCE_STATE='${dir}/db-connect-fence.json'
 DATABASE_URL='postgres://app@127.0.0.1/nowhere'
@@ -1400,8 +1404,10 @@ APP_USER="$(id -un)"
 APP_DIR='${dir}'
 # o3d-secops r22: the connection-fence directory is walked to beneath a root-owned parent
 # now, so a rig that names it must name the parent it hangs off as well.
+CUTOVER_STATE_DIR="${'${CUTOVER_STATE_DIR:-'}${dir}}"
 CUTOVER_ROOT_DIR='${dir}'
 DB_FENCE_DIR='${dir}/fence'
+LEGACY_STATE_DIR_DB_FENCE_STATE="${'${CUTOVER_STATE_DIR}'}/deploy/db-connect-fence.json"
 DB_FENCE_SCRIPT='${dir}/app/scripts/fence-db-connections.mjs'
 DB_FENCE_STATE='${dir}/db-connect-fence.json'
 DATABASE_URL='postgres://app@127.0.0.1/nowhere'
@@ -6593,8 +6599,13 @@ function fenceRecoveryHarness(dirs: { app: string; state: string; recovery: stri
     `APP_DIR=${JSON.stringify(dirs.app)}`,
     `LOG=${JSON.stringify(join(dirs.state, 'calls.log'))}`,
     ': > "${LOG}"',
+    // o3d-secops r22: the connection-fence directory is created by the namespace library's walk
+    // now, beneath a root-owned parent, and fence_db_connections() calls it rather than carrying a
+    // second copy of the `mkdir -p`/`chown`/`chmod` trio. Lifted, so this rig runs the shipped one.
+    `CUTOVER_STATE_DIR=${JSON.stringify(dirs.state)}`,
     `CUTOVER_ROOT_DIR=${JSON.stringify(dirs.state)}`,
     `DB_FENCE_DIR=${JSON.stringify(join(dirs.state, 'deploy'))}`,
+    CUTOVER_DIR_PRIMITIVES,
     `DB_FENCE_STATE=${JSON.stringify(join(dirs.state, 'deploy', 'db-connect-fence.json'))}`,
     `DB_FENCE_SCRIPT=${JSON.stringify(join(dirs.app, 'scripts', 'fence-db-connections.mjs'))}`,
     // THE SHARED LIBRARY, SOURCED FOR REAL (o3d-2sm1.5 r31), then pointed at the harness

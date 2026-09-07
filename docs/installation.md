@@ -998,7 +998,7 @@ Both inputs are now written to **separately created temporary files**, each `mkt
 
 **And that primitive was not confined to the lock** (o3d-czpy). The lock file was one instance of a class: `scripts/install.sh` runs as root and writes into `${DATA_DIR}` and `${APP_DIR}`, both of which *it* hands to `imsapp` with a recursive `chown` — so on the next run every path it resolves inside them is a name the service account can have replaced with a symlink. Eight further sites were converted, and they now share three primitives with `prepare_crontab_lock`:
 
-* **Every publication is staged in a root-owned directory.** `publish_durable_file()` — the writer behind `${APP_DIR}/.env`, `${APP_DIR}/.deploy-meta`, `${DATA_DIR}/git-ssh/known_hosts`, `/etc/ims-cutover/DEPLOY-FENCED` and the crontab backup — creates `.ims-publish` beside the target as `root:root` 0700, `cd`s into it (so the shell holds the *inode*, which no rename can move), makes its temporary there, applies **owner and mode before the content**, and publishes with `mv -T`. `rename(2)` replaces a symlink entry instead of following it. **And the rename names the destination RELATIVELY** (`../known_hosts`, never the absolute path): a pinned inode does not pin the path used afterwards, and `${DATA_DIR}/git-ssh` is a directory `imsapp` can rename aside between the pin and the publication, which would have sent a root-written `known_hosts` to a directory of their choosing. **And the destination itself is reached by walking down from a directory `imsapp` cannot replace**, one component at a time, rather than by `stat`ing its pathname: a pin taken from a name proves the directory did not *move*, and says nothing about *which* directory was pinned, so `git-ssh` replaced by a symlink to `/root/.ssh` **before** the installer ran would have been pinned as `/root/.ssh` and passed every later check. The walk starts at the nearest of `/opt/one-two-inventory`, `/var/lib/one-two-inventory`, the cutover state directory, `/etc/ims-cutover`, `/etc/ims-db-ca` and `/etc/ims-cutover-recovery` — each of which has a **root-owned parent** (`/opt`, `/var/lib`, `/etc`), so its own name cannot be renamed aside or forged — and refuses a publication whose destination lies under none of them. `deploy.sh` and `update.sh` carry the same publisher and the same table, byte for byte. From the moment the walk ends, the destination exists only as **a descriptor opened on it**, and is **never spelled again**: the staging directory, its `chown -h` and its `lstat` are all single relative components resolved from the working directory, and the publication and the final fsync go through `/proc/self/fd/N` — which the kernel resolves to the open directory, so `mv -T … /proc/self/fd/N/known_hosts` *is* `renameat(N, "known_hosts", …)`. It used to be `../known_hosts` and `fsync ..`. `..` is the kernel's own parent link, so no rename of any *name* above the staging directory can redirect it — but it is a property of **where the staging directory is**, re-read at every syscall, and a staging directory moved *wholesale* into another parent takes `../known_hosts` with it. What actually prevented that move was never written down: renaming a directory into a **different** parent requires write permission on the directory being moved, and the staging directory is `root:root` 0700, so `imsapp` gets `EACCES`. The publication's safety rested on the staging directory's *mode*, one inference away. It now rests on the descriptor, which is a fact about the destination and not about the staging directory at all (o3d-secops r19). The `..` checks are kept: they now **refuse** a moved staging directory instead of following it. **You will see a `.ims-publish` directory inside `/var/lib/one-two-inventory` and in `/opt/one-two-inventory`; leave it, and do not `chown` it to `imsapp`.** The installer's recursive chown over the state directory prunes it, at any depth, for the same reason it prunes `locks/` — and that walk is **no longer `find -exec chown`** (o3d-n8xx). `find -exec` enumerates *pathnames* and hands them to a `chown` that resolves them again afterwards, and `chown -h` protects only the final component; on an upgrade the service account owns this tree and the service is still running, so a descendant directory renamed into a symlink between the enumeration and the execution redirected a root-side ownership change through it (GNU find's own documentation calls `-exec` insecure for exactly this). `scripts/lib/chown-tree.mjs` now walks it **by descriptor**: every entry — directory, file, symlink, fifo, socket, device — is opened ONCE with `O_PATH|O_NOFOLLOW` relative to its parent's descriptor, `fstat` on that descriptor answers what it is and which inode it is, and the ownership change goes through `/proc/self/fd/N`, which the kernel resolves to the open file. There is no pathname left for anyone to re-resolve. **A name is never looked up twice** (o3d-secops r20): it used to `lstat` the name to decide the entry was not a directory and `lchown` the same name afterwards, so `imsapp` — who owns the parent and is still running — could plant a sacrificial regular file, wait for the walk to reach it, and rename the staging directory onto that name in the gap. The prune is only consulted for directories, so it never ran, and `lchown` on a directory is exactly `chown`: the debris of an interrupted publication was handed to the account that planted the swap. The directory branch had the same gap one step further along, in its fallback for an `O_DIRECTORY` open answered `ENOTDIR` or `ELOOP`. `O_PATH` is what lets one open cover every type: it needs no read permission, does not block on a fifo, and with `O_NOFOLLOW` opens a *symlink itself* instead of failing `ELOOP` — and a chown through the descriptor's own `/proc` name changes the link and not its target, exactly as `chown -h` promised. Because `open(2)` silently ignores flag bits it does not know, the walk proves it has `O_PATH` before using it: `fchown` on such a descriptor is `EBADF`, and anything else — a success included — is a refusal. `locks/` is pruned by **verified identity** — its `dev:ino` is taken once from the root's own descriptor, so renaming it mid-walk cannot get it chowned under another name. Staging directories are pruned by **shape**, not by name (o3d-secops r19): a directory owned by the uid running the walk whose mode is exactly `0700` is not handed over, wherever it is and whatever it is called. It used to be pruned by the name `.ims-publish`, and a name is not a boundary — `imsapp` owns the containing directory, so renaming `.ims-publish` to an ordinary name costs it nothing (a rename *within* one parent needs no permission on the directory being moved), and the walk then handed the directory over. That matters because a `SIGKILL` or a power loss between the fill and the rename cannot run a failure path, so the staging directory is left holding a **complete, root-owned copy of whatever was being published**. The shape is one `imsapp` can neither manufacture (it cannot `chown` to root) nor alter (it does not own it, so `chmod` is `EPERM`), so it survives every rename `imsapp` can perform. Everything the installer creates *for* `imsapp` it creates under `umask 022`, so `0755`; a `0700` root-owned directory is one `imsapp` cannot enter today, so withholding it takes away nothing that worked. `LOG_DIR`'s equivalent is `chown -Rh .` inside a root entered by descriptor, which coreutils walks with `fchownat` relative to descriptors it holds; the one over the application directory runs in section 9, before section 10 has created it, and the publisher re-takes root ownership with `chown -h` on every run and **refuses** — rather than correcting — anything at that path it does not end up inside.
+* **Every publication is staged in a root-owned directory.** `publish_durable_file()` — the writer behind `${APP_DIR}/.env`, `${APP_DIR}/.deploy-meta`, `${DATA_DIR}/git-ssh/known_hosts`, `/etc/ims-cutover/DEPLOY-FENCED` and the crontab backup — creates `.ims-publish` beside the target as `root:root` 0700, `cd`s into it (so the shell holds the *inode*, which no rename can move), makes its temporary there, applies **owner and mode before the content**, and publishes with `mv -T`. `rename(2)` replaces a symlink entry instead of following it. **And the rename names the destination RELATIVELY** (`../known_hosts`, never the absolute path): a pinned inode does not pin the path used afterwards, and `${DATA_DIR}/git-ssh` is a directory `imsapp` can rename aside between the pin and the publication, which would have sent a root-written `known_hosts` to a directory of their choosing. **And the destination itself is reached by walking down from a directory `imsapp` cannot replace**, one component at a time, rather than by `stat`ing its pathname: a pin taken from a name proves the directory did not *move*, and says nothing about *which* directory was pinned, so `git-ssh` replaced by a symlink to `/root/.ssh` **before** the installer ran would have been pinned as `/root/.ssh` and passed every later check. The walk starts at the nearest of `/opt/one-two-inventory`, `/var/lib/one-two-inventory`, the cutover state directory, `/etc/ims-cutover`, `/etc/ims-cutover-state`, `/etc/ims-db-ca` and `/etc/ims-cutover-recovery` — each of which has a **root-owned parent** (`/opt`, `/var/lib`, `/etc`), so its own name cannot be renamed aside or forged — and refuses a publication whose destination lies under none of them. `deploy.sh` and `update.sh` carry the same publisher and the same table, byte for byte. From the moment the walk ends, the destination exists only as **a descriptor opened on it**, and is **never spelled again**: the staging directory, its `chown -h` and its `lstat` are all single relative components resolved from the working directory, and the publication and the final fsync go through `/proc/self/fd/N` — which the kernel resolves to the open directory, so `mv -T … /proc/self/fd/N/known_hosts` *is* `renameat(N, "known_hosts", …)`. It used to be `../known_hosts` and `fsync ..`. `..` is the kernel's own parent link, so no rename of any *name* above the staging directory can redirect it — but it is a property of **where the staging directory is**, re-read at every syscall, and a staging directory moved *wholesale* into another parent takes `../known_hosts` with it. What actually prevented that move was never written down: renaming a directory into a **different** parent requires write permission on the directory being moved, and the staging directory is `root:root` 0700, so `imsapp` gets `EACCES`. The publication's safety rested on the staging directory's *mode*, one inference away. It now rests on the descriptor, which is a fact about the destination and not about the staging directory at all (o3d-secops r19). The `..` checks are kept: they now **refuse** a moved staging directory instead of following it. **You will see a `.ims-publish` directory inside `/var/lib/one-two-inventory` and in `/opt/one-two-inventory`; leave it, and do not `chown` it to `imsapp`.** The installer's recursive chown over the state directory prunes it, at any depth, for the same reason it prunes `locks/` — and that walk is **no longer `find -exec chown`** (o3d-n8xx). `find -exec` enumerates *pathnames* and hands them to a `chown` that resolves them again afterwards, and `chown -h` protects only the final component; on an upgrade the service account owns this tree and the service is still running, so a descendant directory renamed into a symlink between the enumeration and the execution redirected a root-side ownership change through it (GNU find's own documentation calls `-exec` insecure for exactly this). `scripts/lib/chown-tree.mjs` now walks it **by descriptor**: every entry — directory, file, symlink, fifo, socket, device — is opened ONCE with `O_PATH|O_NOFOLLOW` relative to its parent's descriptor, `fstat` on that descriptor answers what it is and which inode it is, and the ownership change goes through `/proc/self/fd/N`, which the kernel resolves to the open file. There is no pathname left for anyone to re-resolve. **A name is never looked up twice** (o3d-secops r20): it used to `lstat` the name to decide the entry was not a directory and `lchown` the same name afterwards, so `imsapp` — who owns the parent and is still running — could plant a sacrificial regular file, wait for the walk to reach it, and rename the staging directory onto that name in the gap. The prune is only consulted for directories, so it never ran, and `lchown` on a directory is exactly `chown`: the debris of an interrupted publication was handed to the account that planted the swap. The directory branch had the same gap one step further along, in its fallback for an `O_DIRECTORY` open answered `ENOTDIR` or `ELOOP`. `O_PATH` is what lets one open cover every type: it needs no read permission, does not block on a fifo, and with `O_NOFOLLOW` opens a *symlink itself* instead of failing `ELOOP` — and a chown through the descriptor's own `/proc` name changes the link and not its target, exactly as `chown -h` promised. Because `open(2)` silently ignores flag bits it does not know, the walk proves it has `O_PATH` before using it: `fchown` on such a descriptor is `EBADF`, and anything else — a success included — is a refusal. `locks/` is pruned by **verified identity** — its `dev:ino` is taken once from the root's own descriptor, so renaming it mid-walk cannot get it chowned under another name. Staging directories are pruned by **shape**, not by name (o3d-secops r19): a directory owned by the uid running the walk whose mode is exactly `0700` is not handed over, wherever it is and whatever it is called. It used to be pruned by the name `.ims-publish`, and a name is not a boundary — `imsapp` owns the containing directory, so renaming `.ims-publish` to an ordinary name costs it nothing (a rename *within* one parent needs no permission on the directory being moved), and the walk then handed the directory over. That matters because a `SIGKILL` or a power loss between the fill and the rename cannot run a failure path, so the staging directory is left holding a **complete, root-owned copy of whatever was being published**. The shape is one `imsapp` can neither manufacture (it cannot `chown` to root) nor alter (it does not own it, so `chmod` is `EPERM`), so it survives every rename `imsapp` can perform. Everything the installer creates *for* `imsapp` it creates under `umask 022`, so `0755`; a `0700` root-owned directory is one `imsapp` cannot enter today, so withholding it takes away nothing that worked. `LOG_DIR`'s equivalent is `chown -Rh .` inside a root entered by descriptor, which coreutils walks with `fchownat` relative to descriptors it holds; the one over the application directory runs in section 9, before section 10 has created it, and the publisher re-takes root ownership with `chown -h` on every run and **refuses** — rather than correcting — anything at that path it does not end up inside.
 * **Every directory below one of those roots is created with a plain `mkdir`, one component at a time, by a walk that never names an ancestor twice.** `mkdir -p a/b` succeeds *silently* when `a` is a symlink to a directory; a plain `mkdir` fails with `EEXIST` and the installer then `lstat`s the path and **refuses the run**, naming it. That covers the component being created and says nothing about the ones already accepted, so the walk `cd`s into each component as it goes and creates the next one **relative to the directory it is inside** — an ancestor that is renamed after it was checked cannot redirect anything, because the shell holds its inode. The one remaining window, between the `stat` that says "directory" and the `cd` into it, is closed by taking the component's **inode** in the same `lstat` that took its type and requiring the directory the walk lands in to be that exact inode — and by checking `..` after the step as well. The two catch different things and both are needed: the inode refuses a component swapped for a symlink to a **sibling under the same parent**, which `..` cannot tell apart from the real destination; `..` refuses a destination **moved wholesale into another parent**, which keeps its inode. Together they close the class in shell — no descriptor-relative `openat2` helper is needed, because an `lstat` names an inode and a `cd` lands in one, and a rename between them can only make the two differ. The same check protects `${APP_DIR}/.git`, where the previous version asked only whether the directory it had entered was root-owned — which a symlink to *any other* root-owned directory satisfies. The state roots themselves (`/var/lib/one-two-inventory`, `/var/log/one-two-inventory`) still use `mkdir -p`, because their parents are root-owned. **The root used to be the one hop that was not proved** (o3d-rn10 r5): it was entered with a `cd -P` that followed a symlink *deliberately*, so a state root symlinked onto a second disk kept working. Only the link's **name** is protected by its root-owned parent, though — the path its **target** resolves through is proved by nothing, so a target under a directory the application account owns can be renamed aside and rebound to `/root/.ssh`, and the unchanged root entry passes every check while the publication lands there as root. The root is therefore now created, `lstat`ed, entered and inode/`..` checked exactly like every component below it, and **a symlinked root is refused** — naming the bind mount that replaces it and pointing at the procedure under “Putting a state root on another disk” below. Put a state root on another disk with a **bind mount**, never a symlink.
 * **No `chmod`, anywhere on these paths.** `chmod` has no `--no-dereference` on Linux, so a raced one is the same escalation with a different verb. `${DATA_DIR}/git-ssh` is now created at 0700 by `umask` and a wrong mode is **refused** rather than corrected — set it back to 0700 by hand if you ever changed it.
 
@@ -1230,15 +1230,65 @@ All three entrypoints read and write the same four paths, so a fence left standi
 of them is adopted by any other — which is what the failure banners have always told operators
 to do:
 
-| what | path |
-| --- | --- |
-| cutover marker | `/etc/ims-cutover/DEPLOY-FENCED` |
-| crontab backup | `/var/lib/one-two-inventory/crontab-<service user>.bak` |
-| connection-fence state | `/var/lib/one-two-inventory/deploy/db-connect-fence.json` |
-| cutover lock | `/var/lib/one-two-inventory/cutover.lock` |
+| what | path | owner, mode |
+| --- | --- | --- |
+| cutover marker | `/etc/ims-cutover/DEPLOY-FENCED` | `root:root` 0600, in a `root:root` **0700** directory |
+| cutover lock | `/etc/ims-cutover-state/cutover.lock` | `root:root`, in a `root:root` **0755** directory |
+| connection-fence state | `/etc/ims-cutover-state/db-fence/db-connect-fence.json` | the **service user**, in a directory owned by it at **0700** |
+| crontab backup | `/var/lib/one-two-inventory/crontab-<service user>.bak` | `root:root` 0600 |
 
-Set `IMS_CUTOVER_STATE_DIR` **in the environment of the root invocation** to move the last three
-together; `IMS_DEPLOY_STATE_DIR` and `IMS_DATA_DIR` are still honoured.
+Set `IMS_CUTOVER_STATE_DIR` **in the environment of the root invocation** to move the crontab
+backup and the crontab lock directory; `IMS_DEPLOY_STATE_DIR` and `IMS_DATA_DIR` are still honoured.
+**No variable moves the first three.**
+
+**The lock and the connection-fence directory left the state directory in o3d-secops r22, for the
+reason the marker left it in r20.** `/var/lib/one-two-inventory` is handed to `imsapp` on every run,
+so every name directly beneath it is that account's to create, replace and unlink — and two of the
+things that lived there were opened or created **by root**:
+
+* the lock was `exec 9>"$LOCK_FILE"`, which is `open(O_WRONLY|O_CREAT|O_TRUNC)`. A symlink at that
+  name **truncated the target to zero** before `flock` was reached — any file root can write, a unit
+  file or the fence marker included — and the `flock` that followed proved only that *a* lock had
+  been taken, never that it had been taken on *this* file;
+* the connection-fence directory was `mkdir -p`, which **accepts a symlink-to-directory** at the
+  final component and returns success, followed by a `chown` and a `chmod` that both dereference. A
+  link there pointing at `/etc`, at `/root`, or at any directory on the box handed that directory to
+  `imsapp` at mode 0700.
+
+They now live under **`/etc/ims-cutover-state`**, root-owned and 0755: nobody else can create,
+replace or unlink a name inside it, so there is no symlink left to plant at either. It is a
+**literal** in all three scripts, for the same reason the marker's directory and the
+database-identity snapshot's are. `/etc/ims-cutover` was not reused and was not touched: it is 0700
+because it holds the database password and the boot authority, the connection-fence directory has to
+be **writable by the service user** (the fence script runs as that account), and relaxing the one
+directory that exists to be private, so that an app-writable child could be traversed to, is not a
+trade worth making.
+
+**And nothing in that namespace is aimed at a pathname.** The directory is created one component at
+a time by the same symlink-proof walk `install.sh` has always used for `${DATA_DIR}` — plain `mkdir`
+(EEXIST on a planted symlink, where `mkdir -p` silently works *inside* its target), `lstat`, `cd -P`,
+and the inode it landed on proved against the entry — and its owner and mode are then applied to
+`.`, the directory the shell is standing in, which is `fchown(2)`/`fchmod(2)` in the only spelling a
+shell has. The lock is opened **read-only** (`flock(2)` locks the open file description whatever its
+access mode, which is what `lib/crontab-lock.sh` already relies on), so there is no `O_CREAT` and no
+`O_TRUNC` left to aim; the descriptor is then `fstat`ed through `/proc/self/fd/N` and required to be
+a regular file owned by the account running the cutover **and** to be that name's own inode by
+`lstat` — which is `O_NOFOLLOW` proven rather than assumed — and `flock` is taken on **that same
+descriptor**, which is never reopened. The walk, the lock and the directory now have exactly one
+definition each, in `scripts/lib/cutover-namespace.sh`, sourced by all three entrypoints: the walk
+used to exist in `install.sh` alone while the two paths that most needed it were in the other two.
+
+**Upgrading a host that used the old paths.** The lock at `/var/lib/one-two-inventory/cutover.lock`
+is **still taken**, so a cutover already running from a pre-r22 checkout is still excluded. It is
+never created, it is opened read-only, and it is refused unless the descriptor is that name's own
+inode — but a refusal there is a **warning and not a death**, because dying would let `imsapp` stop
+every future cutover on the box with a single symlink it is entitled to create. The warning names
+exactly what is not excluded. A connection-fence record left at
+`/var/lib/one-two-inventory/deploy/db-connect-fence.json` is **named and not imported**: it lists the
+grantees a fence revoked `CONNECT` from, and root does not take `GRANT` statements out of the service
+account's own directory. A fence that really is standing is still found — from the database, which
+is where the release path already asks, and which already refuses with the grantees named when the
+record is gone.
 
 **The cutover marker is NOT one of them, and no variable moves it** (o3d-secops r20). It used to
 live at `/var/lib/one-two-inventory/DEPLOY-FENCED`, root-owned and `0600` — and that protects its
@@ -1249,7 +1299,7 @@ directory** and ask nothing whatever about the file, and `/var/lib/one-two-inven
 interrupted cutover left it — or move it aside and leave one of its own at the name, which the next
 run reads as an account of what the interrupted *privileged* run did and acts on line by line. The
 marker now lives under `/etc/ims-cutover`, created root-owned and `0700`, which is the same
-directory the database-identity snapshot already uses and one of the six publication trust roots.
+directory the database-identity snapshot already uses and one of the publication trust roots.
 Its path is a **literal** in all three scripts for the reason the snapshot's is: an override only a
 root-owned source may set is indistinguishable from no override, and a privileged path resolved
 from a variable the application can set is not a privileged path. A deployment that must move it
@@ -1271,36 +1321,71 @@ between leaves both, which is the safe direction — whichever drop-in is loaded
 on is there — and the next run says so and adopts the one under `/etc`. Lifting the fence removes
 both. **Nothing is silently released:** there is no state in which the marker stops being seen.
 
-**And the marker at the old path is read through a descriptor, never through its name**
-(o3d-secops r21). Relocating it meant reaching back into the directory the relocation exists to
-escape, and the first version did that with `[[ -f ]]` — which *follows a symlink* and says nothing
-about who wrote what it found — followed by a redirection that resolved the same name a second
-time, as root, straight into the publisher. `imsapp` could therefore leave a marker of its own at
-`/var/lib/one-two-inventory/DEPLOY-FENCED`, or a link to any file root can read, and the relocation
-would have laundered it into root-owned state at `/etc/ims-cutover/DEPLOY-FENCED` — where every
-provenance check in the paragraph above passes, *because the publication is what made them pass*.
-Validating the copy proves the copy is well-formed; it says nothing about where the bytes came
-from. The source's parent cannot be part of the answer here, unlike the destination's: the old path
-is inside the service account's own directory by definition. So `scripts/lib/pin-source-file.mjs`
-opens that name **once** with `O_NOFOLLOW` (a symlink is `ELOOP`, refused by the kernel before this
-process holds anything) and `O_NONBLOCK` (a fifo at that name returns instead of parking the
-cutover for ever), then judges the **descriptor** — regular file, owned by the uid running the
-cutover, no group or other write bit, and exactly **one link**, because a hard link is the one way
-to make a root-owned inode appear at a name in a directory `imsapp` controls — proves the
-descriptor is that name's own inode, and copies the bytes from the descriptor. The name is never
-resolved twice. This is the same move `chown-tree.mjs` makes, applied to a *source* instead of a
-destination.
+**And the marker at the old path is NOT READ AT ALL** (o3d-secops r22). Relocating it meant reaching
+back into the directory the relocation exists to escape, and r20 did that with `[[ -f ]]` — which
+*follows a symlink* and says nothing about who wrote what it found — followed by a redirection that
+resolved the same name a second time, as root, straight into the publisher. r21 replaced that pair
+with a descriptor helper: one `open(2)` with `O_NOFOLLOW`, then every fact taken from the `fstat` of
+that descriptor — a regular file, owned by the uid running the cutover, no group or other write bit,
+and exactly **one link** — the descriptor proved to be that name's own inode, and the bytes copied
+from the descriptor rather than from the name.
 
-**If that check refuses, the run stops and nothing is touched.** Skipping the relocation and
-carrying on is the one answer that cannot be given: while *anything* exists at the old path, an
-`AssertPathExists=!` installed by an earlier checkout is satisfied by it, so the host **is** fenced
-— whoever put it there. Carrying on would re-point the drop-in at a marker that does not exist and
-then clear the old entry once that was "verified", releasing in silence a fence that may be
-standing over a half-migrated schema; deleting the entry instead does the same thing and destroys
-the only evidence. So the entrypoint dies having stopped nothing, migrated nothing and named no new
-drop-in — the host keeps exactly the fence it had — and the message tells you to ask systemd what
-is actually asserted (`systemctl show -p DropInPaths` on the unit, then read the drop-in it names)
-before removing anything by hand.
+Every one of those checks is sound. Together they still do not establish what the relocation needed,
+and the link count is where that becomes visible. **`st_nlink` is a fact about the present, not about
+the past.** It says no second name exists *at the moment of the `fstat`*; it cannot say none ever
+did. The service account can hard-link a root-owned 0600 inode **whose content it influenced** into a
+directory it controls, drop the other name, and leave exactly one link at a path of its choosing —
+and these scripts create root-owned 0600 files out of that account's own content on every run: the
+crontab backup *is* its crontab, written by root, in its own directory. r21 named
+`fs.protected_hardlinks` as what normally forbids the link, and then rested on it — which is resting
+a privilege boundary on a sysctl these scripts neither set nor read back.
+
+There is no seventh check that fixes that. When the adversary owns the directory a file is named in,
+no sequence of questions about the file establishes provenance: whatever the check, the account can
+arrange for a file that passes it. So the answer stopped being a better inspection and became a
+different use of the answer.
+
+**The PRESENCE is the signal; the content is not evidence of anything.** While *anything* exists at
+`/var/lib/one-two-inventory/DEPLOY-FENCED`, an `AssertPathExists=!` installed by an earlier checkout
+is satisfied by it, so the host **is** fenced — whoever put it there, and whatever is inside it. That
+is a fact about the **name**, which is the one thing that cannot be forged away: the account can
+create that name, and cannot make the running system ignore it. It is also everything the relocation
+needs.
+
+So nothing is opened and nothing is read. `scripts/lib/pin-source-file.mjs` is **gone**, with its
+regressions: it existed to authenticate those bytes, and an unused apparatus whose premise has been
+rejected is an invitation to wire it back up. The marker published at `/etc/ims-cutover/DEPLOY-FENCED`
+is composed by the run itself, out of its own facts, and records **the most conservative fence state
+there is**:
+
+| line | what it means |
+| --- | --- |
+| `phase=stopping` | assume the predecessor had begun stopping |
+| `migration_attempted=true` | assume the reboot fence was meant |
+| `schema_touched=true` | assume the schema may be half migrated |
+| `legacy_marker_unauthenticated=1` | and say that those three are a **policy**, not a reading |
+| `legacy_marker_path=…` | the old path it came from, so an operator can go and look at it |
+
+Those are the same three values adoption already derives for a marker that fails its completeness
+sentinel — *missing is not false, it is unknown, and unknown is read the expensive way* — reached
+here by a different route for the same reason. **Not one line of the old file is carried forward**,
+including its own `marker_complete=`: a truncated predecessor cannot be told from a forged one, and
+neither may be republished as this host's record of what a privileged run did. In practice the run
+therefore re-migrates, re-checks drift and re-verifies before anything gets `CONNECT` back, and it
+does not resume an "interrupted arming" over a service it would otherwise have left running.
+
+**The old entry is still left exactly where it is**, and the run still does not delete it: the
+drop-in on disk asserts on that name, so removing it is a release. Adoption prints the marker
+verbatim, so an operator sees `legacy_marker_unauthenticated=1`, and the run names the two things
+that **can** be established without trusting that file — ask systemd what is actually asserted
+(`systemctl show -p DropInPaths` on the unit, then read the drop-in it names), and ask the database
+whether the application role still has `CONNECT`. Settle those, clear the entry by hand, and a later
+run has nothing to adopt.
+
+**This gives `imsapp` nothing it did not already have.** It can now make every subsequent cutover
+adopt a conservative fence by touching one name — and it could already do strictly more with that
+same name, because a drop-in asserting on it stops the unit from booting. The outcome is fail-closed
+either way.
 
 **An override has to be ANCHORED, and an unanchored one stops the run rather than being trusted.**
 Every path above is published by a walk that starts at a directory the scripts take on trust, so
@@ -1393,7 +1478,7 @@ to apply before it would print anything; they are the operator's now.
    deletes and chowns. `/srv`, `/mnt`, `/media`, `/opt`, `/var` and `/home` stay available.
 4. **The target may not be the root, an ancestor of it, anything under it, or any other root these
    scripts write into.** Those are `APP_DIR`, `DATA_DIR`, `LOG_DIR`, the cutover state directory,
-   `/etc/ims-cutover`, `/etc/ims-db-ca` and `/etc/ims-cutover-recovery`.
+   `/etc/ims-cutover`, `/etc/ims-cutover-state`, `/etc/ims-db-ca` and `/etc/ims-cutover-recovery`.
    `/opt/one-two-inventory -> /opt` passes every other question — `/opt`'s name cannot be rebound by
    anybody but root — and binding `/opt` onto `/opt/one-two-inventory` hands the next run the whole
    of `/opt` to `rsync --delete` into and `chown -R`. The same shape gives `/var/lib` for `DATA_DIR`
