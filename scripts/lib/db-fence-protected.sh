@@ -1181,10 +1181,55 @@ db_fence_script_in_use() {
 #
 # WHY THE STAMP IS ROOT'S AND NOT THE PLAN'S. It is the difference between the two rules, so it is
 # the thing worth forging: a plan that could declare itself a recovery would buy the lax rule. It
-# is computed by the validator, in the process that does the rename, from the presence of a file in
-# a directory root owns and ${APP_USER} cannot write -- so that account can neither create a record
-# to obtain the tolerance nor unlink one to escape it -- and a `fence_mode` carried in the plan is
-# dropped by the template like every other field root does not compute for itself.
+# is computed by the validator, in the process that does the rename, in a directory root owns and
+# ${APP_USER} cannot write -- so that account can neither create a record to obtain the tolerance
+# nor unlink one to escape it -- and a `fence_mode` carried in the plan is dropped by the template
+# like every other field root does not compute for itself.
+#
+# AND IT IS NOT COMPUTED FROM THE PRESENCE OF A FILE (o3d-secops r25, Codex HIGH).
+#
+# DO NOT INFER A STANDING FENCE SOLELY FROM RECORD PRESENCE. r24 stamped `recovery` whenever
+# anything was at ${DB_FENCE_STATE}, and presence conflates two different states: ROOT PUBLISHED AN
+# AUTHORITY and THE FENCE WAS ACTUALLY APPLIED. Only the second is a standing fence, and only the
+# second may buy the recovery tolerance. Every way the first can happen without the second leaves
+# the same file at the same name:
+#
+#   * the publication itself failing AFTER the rename -- the directory fsync below is the last
+#     barrier, it explicitly leaves the authority visible when it fails, and r24's cleanup was
+#     hung off the EXECUTION's exit 3 rather than off the publication (that is this round's HIGH);
+#   * `--fence` failing with any status r24 did not enumerate, or the whole cutover being killed,
+#     between the rename and `BEGIN`;
+#   * SIGKILL or power loss at the same point, where no cleanup runs at all because no process is
+#     left to run one.
+#
+# So the record carries `fence_applied`, written 0 by this validator and raised to 1 BY ROOT, from
+# db_fence_raise(), only after `--fence` reports that the REVOKEs are (or may be) on the medium.
+# `standing` is that stamp and not the pathname. A record left behind by any publication or
+# execution failure -- this one, the next one, or one nobody has thought of -- is then INERT BY
+# CONSTRUCTION: it can only ever produce another INITIAL fence, held to the strict rule.
+#
+# THE UNSTAMPED RECORD, AND HOW IT IS TOLD APART. A fence raised BEFORE this round is standing and
+# its record has no `fence_applied` key at all; refusing it recovery would strand it, with neither
+# a re-apply nor a release. A half-published record from this round always HAS the key, holding 0,
+# because this validator writes it in the same template that writes every other field. So the
+# discriminator is the key's PRESENCE, not its value:
+#
+#   key absent            a validator that predates the stamp wrote it -> a fence raised before
+#                         this upgrade, therefore standing -> RECOVERY.
+#   key present, === 1    root saw `--fence` succeed -> standing -> RECOVERY.
+#   key present, anything published, never applied -> NOT standing -> INITIAL, strict rule.
+#   else
+#
+# That discriminator holds because ${DB_FENCE_DIR} is root-owned and unwritable by anything else:
+# the key is absent only in records root itself wrote before this upgrade, and ${APP_USER} can
+# neither add it nor strip it. It is the same argument `fence_mode` already rests on.
+#
+# AND WHERE IT FAILS, SAID PLAINLY. If the process dies between a successful REVOKE and root
+# raising the stamp, the record says 0 and a fence IS standing. The next run reads INITIAL, the
+# strict both-directions rule sees the recorded grantees missing from the ACL, and it REFUSES.
+# That is the direction this fails in and it is the deliberate one: a refusal that names the
+# record is recoverable by the release wrapper, which reads the record and grants back regardless
+# of the stamp, while the other direction hands drift tolerance to a fence nobody can show exists.
 #
 # WHAT IS LEFT ON THE APPLICATION SIDE: NOTHING. There is no request file, no progress note and no
 # app-writable directory in the cutover namespace any more -- the plan travels on a pipe, and
@@ -1253,11 +1298,32 @@ try { meta = fs.lstatSync(directory); } catch (e) { fail(directory + " could not
 if (!meta.isDirectory()) fail(directory + " is not a directory");
 if (meta.uid !== process.getuid()) fail(directory + " is owned by uid " + meta.uid + " and this run is uid " + process.getuid() + ", so what it publishes there could be replaced by somebody else");
 if ((meta.mode & 18) !== 0) fail(directory + " is writable by group or other, so any name in it can be renamed or unlinked by another account");
-var standing = true;
+var standing = false;
+var priorMeta = null;
 try {
-  fs.lstatSync(destination);
+  priorMeta = fs.lstatSync(destination);
 } catch (e) {
-  if (e && e.code === "ENOENT") { standing = false; } else { fail(destination + " could not be examined (" + e.message + ")"); }
+  if (!(e && e.code === "ENOENT")) fail(destination + " could not be examined (" + e.message + ")");
+}
+if (priorMeta !== null) {
+  if (!priorMeta.isFile()) {
+    process.stderr.write("There is no fence record at " + destination + ", only a " + (priorMeta.isSymbolicLink() ? "symbolic link" : "non-regular file") + ", so nothing there says a fence was ever applied. Publishing an INITIAL authority.\n");
+  } else {
+    var priorRaw = "";
+    try { priorRaw = fs.readFileSync(destination, "utf8"); } catch (e) { fail(destination + " could not be read (" + e.message + "), so this run cannot tell whether the fence it records was ever applied. Nothing has been published."); }
+    var prior = null;
+    try { prior = JSON.parse(priorRaw); } catch (ignored) { void ignored; prior = null; }
+    if (prior === null || typeof prior !== "object" || Array.isArray(prior)) {
+      process.stderr.write("The record at " + destination + " is not a usable JSON object, so it cannot show that a fence was applied. Publishing an INITIAL authority.\n");
+    } else if (!Object.prototype.hasOwnProperty.call(prior, "fence_applied")) {
+      standing = true;
+      process.stderr.write("The record at " + destination + " carries no applied stamp at all, so it was published by a validator that predates the stamp and can only be a fence raised before this upgrade. Publishing a RECOVERY authority.\n");
+    } else if (prior.fence_applied === 1) {
+      standing = true;
+    } else {
+      process.stderr.write("The record at " + destination + " was published and never stamped applied (fence_applied " + JSON.stringify(prior.fence_applied) + "), so no fence stands behind it: it is what a publication or an execution that failed before REVOKE leaves. Publishing an INITIAL authority.\n");
+    }
+  }
 }
 var record = {
   database: plan.database,
@@ -1268,6 +1334,7 @@ var record = {
   datacl_before: acl,
   fenced_at: plan.fenced_at,
   fence_mode: standing ? "recovery" : "initial",
+  fence_applied: 0,
   state_complete: 1
 };
 var temporary = destination + ".authority." + process.pid + ".tmp";
@@ -1315,6 +1382,98 @@ db_fence_authorise_plan() {
   # ${APP_USER}, which is why this is a hardening and not the finding; it costs one word.
   env -u NODE_OPTIONS -u NODE_PATH -u NODE_REPL_EXTERNAL_MODULE \
     node -e "${program}" -- "${expected_database}" "${expected_app_role}" "${destination}"
+}
+
+# ---------------------------------------------------------------------------
+# THE APPLIED STAMP (o3d-secops r25, Codex HIGH)
+#
+# The other half of "do not infer a standing fence solely from record presence": the validator
+# writes `fence_applied: 0` and this raises it to 1, so that the two states presence conflated --
+# root published an authority, and the fence was actually applied -- are two different bytes on the
+# medium. Only this one is ever written after a REVOKE, and only this one buys recovery tolerance.
+#
+# ROOT ONLY, for exactly the reason the publication is root only: a stamp ${APP_USER} could write
+# is a way for that account to declare a fence standing and obtain the lax rule. It is a SEPARATE
+# program from the validator rather than a mode of it, because the validator's whole contract is
+# "rebuild the record from root's own template out of a plan", and this one rebuilds nothing: it
+# reads what root already published, changes one field, and re-publishes it through the same
+# barriers -- temporary in the destination directory, fsync, atomic rename, directory fsync.
+#
+# WHAT ITS OWN FAILURES COST. A stamp that never lands leaves `fence_applied: 0` behind a fence
+# that IS standing, and the next run reads that as INITIAL and refuses. That is the fail-closed
+# direction, it is announced by db_fence_raise() at the moment it happens, and the release wrapper
+# -- which reads the record and grants back regardless of the stamp -- still takes the fence down.
+# A post-rename directory-fsync failure here is the benign case of the same thing: the stamp is
+# truthful while it is visible, and if the rename is lost to a power cut the record reverts to 0,
+# which is the safe reading.
+#
+# Argument: <destination>. It is a FUNCTION for the same reason the validator is -- the script-scope
+# census in tests/scripts/install-root-safe-writes.test.ts reads declarations one line at a time
+# and cannot carry a fifty-line quoted value; a function body is the shell's own way to hold a
+# program, and the function census covers it.
+db_fence_mark_applied_program() {
+  cat <<'MARK_APPLIED_EOF'
+
+var fs = require("fs");
+var path = require("path");
+function fail(m) { process.stderr.write("NOT STAMPED: " + m + "\n"); process.exit(1); }
+var destination = process.argv[1] || "";
+if (!destination) fail("the stamp was not told which authority it is marking applied");
+var directory = path.dirname(destination);
+var meta = null;
+try { meta = fs.lstatSync(directory); } catch (e) { fail(directory + " could not be examined (" + e.message + ")"); }
+if (!meta.isDirectory()) fail(directory + " is not a directory");
+if (meta.uid !== process.getuid()) fail(directory + " is owned by uid " + meta.uid + " and this run is uid " + process.getuid() + ", so a stamp written there could be replaced by somebody else");
+if ((meta.mode & 18) !== 0) fail(directory + " is writable by group or other, so any name in it can be renamed or unlinked by another account");
+var fileMeta = null;
+try { fileMeta = fs.lstatSync(destination); } catch (e) { fail(destination + " could not be examined (" + e.message + "), so there is no authority to stamp"); }
+if (!fileMeta.isFile()) fail(destination + " is not a regular file");
+if (fileMeta.uid !== process.getuid()) fail(destination + " is owned by uid " + fileMeta.uid + " and this run is uid " + process.getuid() + ", so it was not published by this account");
+var raw = "";
+try { raw = fs.readFileSync(destination, "utf8"); } catch (e) { fail(destination + " could not be read (" + e.message + ")"); }
+var record = null;
+try { record = JSON.parse(raw); } catch (e) { fail(destination + " does not hold valid JSON (" + e.message + ")"); }
+if (record === null || typeof record !== "object" || Array.isArray(record)) fail(destination + " does not hold a JSON object");
+if (record.state_complete !== 1) fail(destination + " does not carry the completeness sentinel, so it is truncated or is not an authority record");
+if (record.fence_applied === 1) { process.stderr.write("The connection-fence authority at " + destination + " is already stamped applied.\n"); process.exit(0); }
+record.fence_applied = 1;
+var temporary = destination + ".applied." + process.pid + ".tmp";
+var fd = -1;
+try {
+  fd = fs.openSync(temporary, "wx", 384);
+  fs.writeFileSync(fd, JSON.stringify(record, null, 2) + "\n");
+  fs.fsyncSync(fd);
+  fs.closeSync(fd);
+  fd = -1;
+  fs.chmodSync(temporary, 420);
+  fs.renameSync(temporary, destination);
+} catch (e) {
+  if (fd !== -1) { try { fs.closeSync(fd); } catch (ignored) { void ignored; } }
+  try { fs.unlinkSync(temporary); } catch (ignored) { void ignored; }
+  fail("the applied stamp could not be written at " + destination + " (" + e.message + ")");
+}
+var dirFd = -1;
+try {
+  dirFd = fs.openSync(directory, "r");
+  fs.fsyncSync(dirFd);
+  fs.closeSync(dirFd);
+} catch (e) {
+  if (dirFd !== -1) { try { fs.closeSync(dirFd); } catch (ignored) { void ignored; } }
+  fail("the applied stamp is in place at " + destination + " and its NAME is not durable (" + e.message + "), so a power cut can restore the unstamped record");
+}
+process.stderr.write("The connection-fence authority at " + destination + " is stamped APPLIED: the fence it records is standing, and a later re-fence over it may use the recovery rule.\n");
+MARK_APPLIED_EOF
+}
+
+# Raise this run's published authority to "applied". ROOT ONLY. Same capture-with-status and same
+# stripped interpreter environment as db_fence_authorise_plan(), for the same two reasons.
+db_fence_mark_authority_applied() {
+  local destination="$1" program
+  [[ -n "${destination}" ]] || return 1
+  program="$(db_fence_mark_applied_program)" || return 1
+  [[ -n "${program}" ]] || return 1
+  env -u NODE_OPTIONS -u NODE_PATH -u NODE_REPL_EXTERNAL_MODULE \
+    node -e "${program}" -- "${destination}"
 }
 
 # The whole privileged step, from the plan text a caller captured to a published authority.
@@ -1412,6 +1571,24 @@ db_fence_raise() {
   # STEP 2, PRIVILEGED: validated field by field, rebuilt from root own template, and published
   # durably. A failure here is the refusal that keeps the asymmetry closed.
   if ! db_fence_publish_authority "${plan}" "${state_file}" "${database}" "${app_role}"; then
+    # A PUBLICATION FAILS WITH THE RECORD ALREADY VISIBLE MORE OFTEN THAN IT LOOKS (o3d-secops r25,
+    # Codex HIGH). The validator's LAST barrier is the directory fsync, which runs AFTER the atomic
+    # rename: when it fails it says so and deliberately leaves the authority in place, because the
+    # file is genuinely there and pretending otherwise would be the worse lie. Anything else that
+    # can go wrong between that rename and this line -- an OOM kill of `node`, a signal -- ends the
+    # same way. r24 hung its cleanup off the EXECUTION's exit 3 and this route never reaches it, so
+    # the leftover record was left for the next run to read.
+    #
+    # It is inert either way now: it carries `fence_applied: 0`, so the next publication stamps
+    # INITIAL and the strict rule applies. This is the defence in depth on top of that -- the same
+    # removal, on the sibling path -- and it is bounded by ${had_authority} for the same reason it
+    # is there: where a fence WAS standing when this run arrived, that record is somebody else's
+    # account of what was revoked and is never this run's to remove.
+    if [[ "${had_authority}" -eq 0 ]]; then
+      if ! db_fence_clear_authority "${state_file}"; then
+        echo "The connection-fence authority could not be published AND the partial record at ${state_file} could not be removed. It carries no applied stamp, so no later run can read it as a standing fence and it cannot buy the recovery rule; it is still litter at the authoritative path. Remove it by hand." >&2
+      fi
+    fi
     echo "NOT FENCED: the connection-fence authority could not be published at ${state_file} (the reason is printed above)." >&2
     echo "Refusing to revoke CONNECT. A REVOKE is a committed transaction that survives a power cut;" >&2
     echo "this record is the only thing that undoes it, and a revoke whose undo record may not survive" >&2
@@ -1423,6 +1600,28 @@ db_fence_raise() {
   # STEP 3, UNPRIVILEGED AGAIN: execute exactly what step 2 recorded.
   rc=0
   db_fence_helper "${fence_script}" --fence --state-file="${state_file}" --state-owner="$(id -u)" "$@" || rc=$?
+
+  # STEP 4, PRIVILEGED AGAIN: THE RECORD IS TOLD THAT THE FENCE WAS APPLIED (o3d-secops r25, Codex
+  # HIGH). This is the only write that ever happens AFTER a REVOKE, and it is what a later run's
+  # `recovery` is read from -- rather than from the record simply being there, which says only that
+  # root published something.
+  #
+  # THE TWO STATUSES IT IS WRITTEN FOR. 0 is a fence this run watched go up. 5 is
+  # EXIT_FENCE_STANDING -- the COMMIT was issued and the acknowledgement may have been lost -- and
+  # a fence that MAY be standing has to be stamped for the same reason its record is kept: the only
+  # safe reading of unknown is that CONNECT may be revoked. Every other status is left unstamped,
+  # and 1 in particular is NOT enumerated here on purpose: it is the helper's catch-all, it covers
+  # a connection that never opened as well as a `client.end()` that threw after a successful fence,
+  # and a status that cannot tell those apart may not be allowed to declare a fence applied.
+  #
+  # A FAILURE HERE DOES NOT FAIL THE FENCE. The fence is up; the stamp only decides what a LATER
+  # run may assume, and on the ordinary path there is no later run -- the release removes the whole
+  # record. So it is announced and the raise's own status is returned unchanged.
+  if [[ "${rc}" -eq 0 || "${rc}" -eq 5 ]]; then
+    if ! db_fence_mark_authority_applied "${state_file}"; then
+      echo "The fence is up, and the authority at ${state_file} could not be stamped as applied (the reason is printed above). This costs nothing if this cutover finishes: the release removes that record. If this run DIES before the release, the next cutover reads an unstamped-in-this-round record as an INITIAL fence and REFUSES rather than re-applying, because it cannot show the fence ever stood. Take the fence down with the release wrapper printed above rather than re-running the fence." >&2
+    fi
+  fi
 
   # AND A REFUSED INITIAL FENCE LEAVES NO AUTHORITY BEHIND (o3d-secops r24, Codex HIGH).
   #
@@ -1503,11 +1702,18 @@ db_fence_publish_operator_wrappers() {
   _fence_protected_dir_ready || return 1
   artefact_digest="$(fence_record_artefact_digest)" || return 1
 
-  local identity="" arg expected_database="" expected_app_role="" expected_app_user="" baked_program
+  local identity="" arg expected_database="" expected_app_role="" expected_app_user="" baked_program baked_stamp
   # The validator these wrappers carry is the library's own, captured with its status taken: a
   # wrapper baked around an empty program would validate nothing and publish nothing, silently.
   baked_program="$(db_fence_authorise_plan_program)" || return 1
   [[ -n "${baked_program}" ]] || return 1
+  # AND SO IS THE APPLIED STAMP (o3d-secops r25). A re-fence wrapper that raised a fence and did not
+  # stamp it would leave the record saying "published, never applied" behind a fence that IS
+  # standing, and the next cutover would refuse it. The two programs are baked the same way, from
+  # the same single copy, for the same reason: a wrapper carries a generated copy rather than a
+  # second one somebody wrote.
+  baked_stamp="$(db_fence_mark_applied_program)" || return 1
+  [[ -n "${baked_stamp}" ]] || return 1
   for arg in "$@"; do
     [[ -n "${arg}" ]] || continue
     identity+=" $(printf '%q' "${arg}")"
@@ -1553,6 +1759,7 @@ db_fence_publish_operator_wrappers() {
       printf 'expected_database=%q\n' "${expected_database}"
       printf 'expected_app_role=%q\n' "${expected_app_role}"
       printf 'authorise_plan=%q\n' "${baked_program}"
+      printf 'mark_applied=%q\n' "${baked_stamp}"
       # ITS OWN ABSOLUTE PATH, baked rather than taken from $0: an instruction this file prints
       # about itself has to be one that runs from anywhere, and $0 is whatever the caller typed.
       printf 'self=%q\n' "${target}"
@@ -1638,9 +1845,28 @@ raise_the_fence() {
   # own and therefore the only one this run may remove.
   if [[ -e "${state_file}" || -L "${state_file}" ]]; then had_authority=1; fi
   plan="$(run_helper DEPLOY_ADMIN_DATABASE_URL="${DEPLOY_ADMIN_DATABASE_URL}" node "${helper}" --plan --state-file="${state_file}" --state-owner="$(id -u)" "${identity_argv[@]}")" || return 1
-  printf '%s\n' "${plan}" | env -u NODE_OPTIONS -u NODE_PATH -u NODE_REPL_EXTERNAL_MODULE \
-    node -e "${authorise_plan}" -- "${expected_database}" "${expected_app_role}" "${state_file}" || return 1
+  # o3d-secops r25: the publication's own failures are the sibling r24 missed. The validator's last
+  # barrier is the directory fsync, which runs after the rename and leaves the record visible when
+  # it fails, so a failed publication is a publication that may well have published.
+  if ! printf '%s\n' "${plan}" | env -u NODE_OPTIONS -u NODE_PATH -u NODE_REPL_EXTERNAL_MODULE \
+    node -e "${authorise_plan}" -- "${expected_database}" "${expected_app_role}" "${state_file}"; then
+    if [[ "${had_authority}" -eq 0 ]]; then
+      rm -f "${state_file}" 2>/dev/null || true
+      if [[ -e "${state_file}" ]]; then
+        echo "The authority could not be published AND the partial record at ${state_file} could not be removed. It carries no applied stamp, so no later run can read it as a standing fence, but it is litter at the authoritative path. Remove it by hand." >&2
+      fi
+    fi
+    return 1
+  fi
   run_helper DEPLOY_ADMIN_DATABASE_URL="${DEPLOY_ADMIN_DATABASE_URL}" node "${helper}" --fence --state-file="${state_file}" --state-owner="$(id -u)" "${identity_argv[@]}" || rc=$?
+  # o3d-secops r25: and the record is told the fence went up. Exit 0 is a fence this run watched
+  # rise, exit 5 is one that may be standing with a lost acknowledgement; both mean CONNECT may be
+  # revoked, and both must therefore be readable as a standing fence by whatever runs next.
+  if [[ "${rc}" -eq 0 || "${rc}" -eq 5 ]]; then
+    env -u NODE_OPTIONS -u NODE_PATH -u NODE_REPL_EXTERNAL_MODULE \
+      node -e "${mark_applied}" -- "${state_file}" \
+      || echo "The fence is up and ${state_file} could not be stamped as applied. Take it down with the release wrapper rather than re-running this one: a re-fence over an unstamped record is held to the strict rule and will refuse." >&2
+  fi
   # Exit 3 is EXIT_NOT_FENCEABLE, which the helper returns only before BEGIN: nothing was revoked,
   # so an authority this run itself published describes a fence that does not exist, and leaving it
   # would make the next attempt a "recovery" and hand it the tolerance this refusal withheld.
