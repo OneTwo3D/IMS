@@ -1839,8 +1839,16 @@ test('an unstamped record is refused by the validator and still releasable from 
     `it must name the record's own defect:\n${republished.output}`)
   assert.match(republished.output, /says nothing about whether that writer's REVOKE ever committed/,
     `and say why the two cases are indistinguishable rather than picking one:\n${republished.output}`)
-  assert.match(republished.output, /Only the live ACL can/,
-    `and point at the only evidence that settles it:\n${republished.output}`)
+  // AND POINT AT THE EVIDENCE, SAYING HOW FAR IT GOES (o3d-secops r27, Codex HIGH). r26 asserted
+  // the wording "Only the live ACL can", which claimed more than the ACL delivers: it settles a
+  // record every recorded grantee STILL HOLDS CONNECT against, and it cannot say WHOSE revoke took
+  // CONNECT from roles that have all lost it. The refusal states both halves now, so both are
+  // asserted here — a refusal that promised a settling the audit will not perform is a refusal
+  // that sends the operator to a wrapper expecting it to decide.
+  assert.match(republished.output, /the live ACL settles only half of it/,
+    `and point at the evidence that settles the half it settles:\n${republished.output}`)
+  assert.match(republished.output, /never what made them so/,
+    `and not promise the half it cannot:\n${republished.output}`)
 
   // AND IT IS NOT SILENT ABOUT WHICH RECORD, which is what makes the refusal actionable.
   assert.ok(republished.output.includes(stateFile), `the refusal must name the record:\n${republished.output}`)
