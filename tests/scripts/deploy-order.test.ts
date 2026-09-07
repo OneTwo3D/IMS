@@ -13674,6 +13674,10 @@ for (const entry of FENCE_HARNESS) {
     'trap \'[[ -e "${DB_FENCE_STATE}" ]] && echo AUTHORITY_REMAINS || echo AUTHORITY_CLEARED\' EXIT',
     'fence_db_connections',
     'echo "FENCE UP=${DB_FENCE_UP}"',
+    // A CONSUMER AND ITS PIN, so the pin's own degraded arm is exercised to the end of the run as
+    // well: with no witness db_fence_migration_pinned() returns 3, and THAT claim -- "not a
+    // refusal" -- is the same shape as the two below it.
+    'pin_migration_window "The migration"',
     'require_migration_landed_on_fenced_server',
     // AND THEN THE REST OF THE RUN, in the order every entrypoint has it: the database fence comes
     // down, and only a release that succeeded lets anything start.
