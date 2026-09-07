@@ -9678,7 +9678,12 @@ function auditingHelper(dir: string, aclFile: string): string {
     // o3d-secops r27: the audit binds its identity before it decides, so the fixture reports the
     // two role halves as well. `admin` is the role the .env admin URL names; the phases that mean
     // to fail the gate move the HOST, so that a refusal there cannot be the role check firing.
-    "        return { rows: [{ audited_database: 'imsdb', audited_login_role: 'admin', audited_effective_role: 'admin', audited_owner_role: 'owner', audited_datacl: fixture === 'NULL' ? null : fixture }] }",
+    //
+    // AND EACH COLUMN IS SUPPLIED ONLY IF THE SELECT ASKED FOR IT. A fixture that answers a shape
+    // rather than a query cannot notice a column being dropped, and these two are exactly what the
+    // gate consumes — so an audit that quietly stopped asking would still bind and still decide.
+    "        const askedFor = (alias, value) => (String(sql).includes('AS ' + alias) ? { [alias]: value } : {})",
+    "        return { rows: [{ audited_database: 'imsdb', ...askedFor('audited_login_role', 'admin'), ...askedFor('audited_effective_role', 'admin'), audited_owner_role: 'owner', audited_datacl: fixture === 'NULL' ? null : fixture }] }",
     '      }',
     "      throw new Error('the audit asked something this fixture does not answer: ' + sql)",
     '    },',
@@ -9751,6 +9756,16 @@ function auditingHelper(dir: string, aclFile: string): string {
  *      requireBoundDatabaseIdentity() call from doAuditAuthority(): PHASE 6's `unfenced` arm
  *      removes the record — the wrapper deleting a standing fence's only authority on the word of
  *      a cluster that merely shares its database name.
+ *   7. (r27) add a `[[ "${confirmed}" -eq 1 ]]` stamp in front of the final refusal, which is what
+ *      "the confirmation is a bypass" looks like when somebody writes it by hand: PHASE 4b's
+ *      confirmed run stamps a MIXED reading. Route 4 does NOT cover this — it stops the run at
+ *      PHASE 3a, so the two arms needed two mutations.
+ *   8. (r27, against scripts/fence-db-connections.mjs) put r26's `A FENCE IS STANDING` prose back
+ *      in doAuditAuthority(): PHASE 3a's assertion on the history that is NOT a fence fails.
+ *   9. (r27, against scripts/fence-db-connections.mjs) drop `session_user AS audited_login_role`
+ *      from the audit's read: PHASE 3a and PHASE 6 both fail. Only because the fixture answers the
+ *      QUERY — run first against one that returned both role columns whatever the SELECT asked
+ *      for, this mutation changed nothing anywhere in the suite.
  */
 test('r26/r27: the operator resolution clears a spent legacy record automatically and stamps a standing one only on explicit confirmation', () => {
   const dir = mkdtempSync(join(tmpdir(), 'ims-r26-resolve-'))

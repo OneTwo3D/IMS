@@ -841,16 +841,22 @@ class FakeAdminClient {
     // o3d-secops r26: the one read `--audit-authority` makes. Its aliases are its own, so this
     // branch cannot be reached by any other mode's question and vice versa.
     if (sql.includes('AS audited_database')) {
+      // o3d-secops r27: the audit binds its own identity now, so it asks this connection the same
+      // two-part role question every other mode asks — session_user and current_user — and the
+      // values come from the SAME options the other branches read, so a test can land this
+      // connection as the wrong role here exactly as it can there.
+      //
+      // AND THE FIXTURE ANSWERS THE QUERY THAT WAS ASKED, not a shape. A fake that returns every
+      // column whichever ones the SELECT names cannot notice one being dropped — and these two are
+      // precisely what the identity gate consumes, so a read that quietly stopped asking for them
+      // would go on passing every test in this file. Each is supplied only if its alias appears.
+      const asked = (alias: string, value: string) => (sql.includes(`AS ${alias}`) ? { [alias]: value } : {})
       return {
         rows: [
           {
             audited_database: this.options.connectedDatabase ?? 'imsdb',
-            // o3d-secops r27: the audit binds its own identity now, so it asks this connection the
-            // same two-part role question every other mode asks — session_user and current_user.
-            // Read from the SAME options the other branches read, so a test can land this
-            // connection as the wrong role here exactly as it can there.
-            audited_login_role: this.options.loginRole ?? 'deployadmin',
-            audited_effective_role: this.options.effectiveRole ?? 'deployadmin',
+            ...asked('audited_login_role', this.options.loginRole ?? 'deployadmin'),
+            ...asked('audited_effective_role', this.options.effectiveRole ?? 'deployadmin'),
             audited_owner_role: 'owner',
             audited_datacl: this.options.datacl === undefined ? '{owner=CTc/owner,=Tc/owner,imsapp=c/owner}' : this.options.datacl,
           },
@@ -1719,9 +1725,12 @@ test('--audit-authority reads the live ACL, decides, and touches nothing (o3d-se
  *   1. delete the requireBoundDatabaseIdentity() call from doAuditAuthority(): the same-name/
  *      different-host case prints `legacy_fence_verdict=absent` and exits 0 — the wrapper deleting
  *      a standing fence's only record.
- *   2. drop `session_user AS audited_login_role` from the audit's read: the gate then refuses
- *      EVERY case including the bound one, which the first assertion here catches — so a gate that
- *      refuses everything cannot pass this test either.
+ *   2. drop `session_user AS audited_login_role` from the audit's read: the gate then refuses EVERY
+ *      case including the bound one, which the first assertion here catches — so a gate that
+ *      refuses everything cannot pass this test either. THIS ROUTE ONLY WORKS BECAUSE THE FIXTURE
+ *      ANSWERS THE QUERY: it was run first against a fake that returned both role columns whatever
+ *      the SELECT asked for, and every test in this file still passed with the column deleted. The
+ *      `asked()` helper in FakeAdminClient exists for that, and nothing else here would cover it.
  */
 test('--audit-authority refuses a same-named database on another cluster (o3d-secops r27)', async (t) => {
   const dir = stateDir(t)
