@@ -79,7 +79,7 @@ import { INTERNAL_STATUS_TRANSITION_BYPASS, INTERNAL_STATUS_TRANSITION_AUTH_ONLY
 import { getSalesOrderReference } from '@/lib/sales-order-display'
 import { getBaseCurrencyCode } from '@/lib/base-currency'
 import { decimalToNumber } from '@/lib/decimal'
-import { addMoney, ledgerAmountEpsilon, multiplyMoney, roundQuantity, subtractMoney, toDecimal, type Decimal, type DecimalInput } from '@/lib/domain/math/decimal'
+import { addMoney, compareDecimal, ledgerAmountEpsilon, multiplyMoney, roundQuantity, subtractMoney, toDecimal, type Decimal, type DecimalInput } from '@/lib/domain/math/decimal'
 import { validateManualSalesOrderStatusTransition } from '@/lib/domain/workflows/action-guards'
 import {
   buildRealisedFxJournal,
@@ -748,18 +748,37 @@ export async function getSalesOrders(
  * full is perfectly consistent. Refund payments are excluded — they settle a credit note, not this
  * invoice — as are payments in some other currency, which cannot be summed with these.
  */
+/** `Math.min` for two money figures, without the conversion `Math.min` would force (o3d-4ozd). */
+function lesserOf(a: Decimal, b: Decimal): Decimal {
+  return compareDecimal(a, b) <= 0 ? a : b
+}
+
+/**
+ * WHAT IMS CLAIMS IT RECEIVED, EXACTLY (o3d-4ozd, Codex HIGH).
+ *
+ * This figure is one of the two operands of the settlement comparison — `settlementStatus` measures
+ * the ledger's registrations against it, through a band derived from the order's own minor unit —
+ * and it was built by summing `Payment.amount` as doubles and taking `Math.max` against a `Number`
+ * of the stored total. `Payment.amount` and `SalesOrder.totalForeign` are both `Decimal(18, 4)`, and
+ * above about 4.5e13 the spacing between neighbouring doubles exceeds the band: two figures a whole
+ * minor unit apart arrive as one, and the exactness of the band decides nothing.
+ *
+ * So the sum stays in `Decimal` from the column to the comparison, and the caller converts nothing.
+ */
 function claimedReceivedForeign(so: {
   currency: string
-  totalForeign: unknown
+  totalForeign: DecimalInput
   paidAt: Date | null
-  payments: { refundId: string | null; amount: unknown; currency: string }[]
-}): number {
+  payments: { refundId: string | null; amount: DecimalInput; currency: string }[]
+}): Decimal {
   const local = so.payments
     .filter((p) => !p.refundId && p.currency === so.currency)
-    .reduce((sum, p) => sum + Number(p.amount), 0)
+    .reduce<Decimal>((sum, p) => addMoney(sum, p.amount), toDecimal(0))
   // An imported paid order (WooCommerce) has paidAt but NO local payment rows — its receipt was never
   // recorded as a Payment. Paid-in-full is then the claim, and the order total is its size.
-  return so.paidAt ? Math.max(local, Number(so.totalForeign)) : local
+  if (!so.paidAt) return local
+  const stated = toDecimal(so.totalForeign)
+  return compareDecimal(local, stated) >= 0 ? local : stated
 }
 
 export async function getSalesOrder(id: string): Promise<SoDetail | null> {
@@ -816,7 +835,7 @@ export async function getSalesOrder(id: string): Promise<SoDetail | null> {
   ])
   const claimedForeign = claimedReceivedForeign(so)
   const settlement = settlementStatus({
-    paidLocally: !!so.paidAt || claimedForeign > 0,
+    paidLocally: !!so.paidAt || claimedForeign.gt(0),
     syncEnabled: paymentSyncEnabled,
     documentPosted: !!so.accountingInvoiceId,
     // History first: a registration whose receipt was deleted, or one a later success overtook, describes
@@ -828,18 +847,18 @@ export async function getSalesOrder(id: string): Promise<SoDetail | null> {
     ),
     // Compared against what the ledger's copy of the invoice was built at, capped by what IMS actually
     // claims to have received — a part payment fully registered is settled for its size.
-    totalForeign: Math.min(
+    // o3d-4ozd: BOTH OPERANDS OF THE CAP ARE `Decimal`, and so is what leaves it.
+    // `ledgerSalesInvoiceTotalForeign` has answered a `Decimal` since o3d-6abj and this call site was
+    // still spending it on a `.toNumber()` so it could meet `claimedReceivedForeign` in `Math.min` —
+    // which put the whole comparison back on doubles one line before the classifier's exact band.
+    totalForeign: lesserOf(
       claimedForeign,
-      // o3d-6abj: `ledgerSalesInvoiceTotalForeign` answers a `Decimal` now, and this comparison — a
-      // DISPLAY verdict against `claimedReceivedForeign`, which is a number — takes the number
-      // reading explicitly rather than by an implicit conversion at the boundary.
-      // decimal-boundary-ok: display-only
       ledgerSalesInvoiceTotalForeign({
         totalForeign: so.totalForeign,
         taxForeign: so.taxForeign,
         pricesIncludeVat: so.pricesIncludeVat,
         importedFromShop: so.shoppingLinks.length > 0,
-      }).toNumber(),
+      }),
     ),
     // o3d-6yho (3 of 3): the band that separates a part settlement from a full one is half one
     // minor unit of THIS order's currency, not a hard-coded half-penny.

@@ -27,6 +27,7 @@ import { resolvePurchaseOrderFxRateToBase } from '@/lib/domain/purchasing/purcha
 import { validateRecordSupplierCreditNote, buildSupplierCreditNoteSyncPayload, resolveSupplierCreditNoteTaxType, resolveSupplierCreditNoteTransitBase } from '@/lib/domain/purchasing/supplier-credit-note'
 import { recordTransitSubledgerMovement } from '@/lib/domain/accounting/transit-subledger-movement'
 import { settlementStatus, type PaymentSyncRow, type SettlementVerdict } from '@/lib/domain/accounting/settlement-status'
+import { payloadRegisteredAmount } from '@/lib/domain/accounting/registered-amount'
 import {
   BILL_PAYMENT_ENQUEUE_DECLINED_MESSAGE,
   billPaymentRefusalMessage,
@@ -576,6 +577,13 @@ export async function getPurchaseOrders(limit = 200): Promise<PoRow[]> {
 async function latestBillPaymentSyncRows(
   invoiceIds: string[],
   connector: string | null,
+  /**
+   * o3d-4ozd — THE CURRENCY THE ROWS' AMOUNTS ARE TO BE READ IN: the PO's, which is the currency its
+   * bills are stated in. Required for the same reason `loadInvoicePaymentSyncRows` requires it —
+   * `payloadRegisteredAmount` will not read an amount without knowing what unit it is in, and a
+   * registration raised in another currency settles none of this bill.
+   */
+  documentCurrency: string,
 ): Promise<Map<string, PaymentSyncRow>> {
   const out = new Map<string, PaymentSyncRow>()
   if (!invoiceIds.length || !connector) return out
@@ -598,6 +606,11 @@ async function latestBillPaymentSyncRows(
       errorMessage: r.errorMessage,
       retryCount: r.retryCount,
       amount: typeof payload.amount === 'number' ? payload.amount : null,
+      // o3d-4ozd: and the EXACT figure, through the one reader, for the comparison the verdict is
+      // taken on. The BILL_PAYMENT enqueue writes no `amountDecimal` beside the number yet, so today
+      // this is the double's own exact decimal reading — identical to what the comparison made of it
+      // before — and it becomes exact for nothing but free the moment that writer carries one.
+      registeredAmount: payloadRegisteredAmount(r.payload, documentCurrency),
       settlementBasis: r.settlementBasis,
     })
   }
@@ -801,7 +814,7 @@ export async function getPurchaseOrder(id: string): Promise<PoDetail | null> {
     // switched off expects no payment to post, and calling that a discrepancy would paint every paid
     // bill permanently red for a setting someone chose on purpose.
     isAccountingSyncTypeEnabled('BILL_PAYMENT').catch(() => false),
-    latestBillPaymentSyncRows(po.invoices.map((inv) => inv.id), activeConnector?.id ?? null),
+    latestBillPaymentSyncRows(po.invoices.map((inv) => inv.id), activeConnector?.id ?? null, po.currency),
   ])
 
   const row = mapPoRow(po)
@@ -863,7 +876,10 @@ export async function getPurchaseOrder(id: string): Promise<PoDetail | null> {
         syncEnabled: accountingSyncEnabled,
         documentPosted: !!inv.accountingInvoiceId,
         payment: billPaymentByInvoice.get(inv.id) ?? null,
-        totalForeign: Number(inv.totalForeign),
+        // o3d-4ozd: the STORED total, not a `Number` of it. `PurchaseInvoice.totalForeign` is
+        // `Decimal(18, 4)`, and converting it here collapsed the very difference the band below is
+        // meant to measure — an exact tolerance over two doubles that already agree decides nothing.
+        totalForeign: inv.totalForeign,
         // o3d-6yho (3 of 3): the part/over settlement band is half one minor unit of the PO's own
         // currency — a bill stated in a three- or four-decimal currency was being judged against a
         // half-penny, which reads several whole minor units of shortfall as fully settled.
