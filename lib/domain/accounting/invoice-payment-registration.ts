@@ -488,6 +488,21 @@ export function decideInvoicePaymentRegistration(input: {
         // record the organisation the probe answered from, and the probe must positively say which
         // that was. Unknown on either side excludes nothing — see that function for why each flavour
         // of unknown refuses, and for the rollout cost, which falls on the refusing side.
+        //
+        // AND NOTHING ELSE ON THIS PATH RESTED ON THE PREMISE — re-checked, not assumed, because a
+        // false premise cleared one site and may have quietly cleared others. Every OTHER consumer
+        // of `input.existing` uses a row to ADD a refusal or to CONSUME capacity, so a row from a
+        // former realm can only ever withhold: `unresolvedInvoicePaymentAttempts` turns one into a
+        // probe and a possible refusal; `retiredDocumentInvoicePaymentAttempts` refuses on it; the
+        // `asserted` and `registeredAmount` gates refuse on it; the capacity sum counts it, and a
+        // QuickBooks id collision on `accountingInvoiceId` makes it count MORE, not less. The one
+        // other place a row is DROPPED is the `live` document filter, and that drop is o3d-hbgo's
+        // arithmetic rule about a retired document — realm-independent, and guarded ahead of it by
+        // the retired-document refusal. `selectReceiptsAwaitingRegistration` is the same shape: a
+        // foreign-realm row can only mark a receipt as spoken for, which withholds a re-drive. The
+        // post-site guard (`invoice-payment-capacity.ts`) reads no ledger and holds no exclusion set
+        // at all. This remains the ONLY permissive use of these rows, which is why it is the only
+        // one that has to prove where a row came from.
         {
           settlementsOfOtherAttempts: input.existing
             .filter((row) => row !== attempt
