@@ -11,6 +11,10 @@ import {
 } from '@/lib/domain/accounting/invoice-payment-registration'
 import type { LedgerSettlementRecord } from '@/lib/domain/accounting/ledger-settlement-evidence'
 import { describeInvoicePaymentRefusal } from '@/lib/domain/accounting/invoice-payment-enqueue'
+import {
+  OPERATOR_ASSERTION_SETTLEMENT_BASIS,
+  OPERATOR_RELEASE_SETTLEMENT_BASIS,
+} from '@/lib/domain/accounting/sync-row-settlement'
 import { toDecimal } from '@/lib/domain/math/decimal'
 
 /**
@@ -331,6 +335,107 @@ test('[o3d-r948 r3] an attempt s OWN recorded settlement is never excluded from 
   })
   assert.equal(d.register, false)
   assert.equal(d.register === false && d.refusal, 'UNRESOLVED_PAYMENT_ATTEMPT')
+})
+
+/* ------------------------------------------------------------------------------------------- *
+ * o3d-r948 r4 (Codex HIGH) — AND OUR OWN RECORD IS NOT ALWAYS EVIDENCE.
+ *
+ * r3's exclusion is right that the LEDGER cannot re-assign an id. It also took "IMS recorded that
+ * id against that row" as proof the row created the settlement, and on an OPERATOR_ASSERTION row
+ * that is a human typing a document id into a form: no call made, no document read. The chain of
+ * custody has to run back to CONNECTOR evidence, not merely to a row in our table.
+ * ------------------------------------------------------------------------------------------- */
+
+test('[o3d-r948 r4] a RETIRED operator-asserted row s typed id does not exclude the attempt s own settlement', () => {
+  // THE SHAPE, and it is reachable precisely because every other gate lets it past. The invoice was
+  // deleted and re-posted as INV-2. An asserted SYNCED row names the RETIRED INV-1 and a DIFFERENT
+  // receipt, so `retiredDocumentInvoicePaymentAttempts` skips it (its paymentId is neither null nor
+  // this receipt's), the `live` document filter drops it, and the LEDGER_AMOUNT_ASSERTED gate reads
+  // that filter's output and so never sees it. The exclusion set was the one place it still spoke —
+  // and there its typed id suppressed the unresolved attempt's OWN unmeasurable settlement, which
+  // returns `clear` and posts a second payment.
+  //
+  // ROUTE: decideInvoicePaymentRegistration's unresolved-attempt loop → the
+  //        `settlementsOfOtherAttempts` filter → `!isOperatorAssertedSettlement(row.settlementBasis)`.
+  // MUTATION: drop that clause from the filter and this registers instead of refusing.
+  const assertedRow = {
+    status: 'SYNCED' as const,
+    amount: 40,
+    paymentId: 'pay-other',
+    // The RETIRED document, which is what makes this row invisible to every other gate.
+    accountingInvoiceId: 'INV-1',
+    // The id a human typed in. It happens to be the id of the settlement below.
+    externalTransactionId: 'PAY-X',
+  }
+  const input = {
+    ...base,
+    accountingInvoiceId: 'INV-2',
+    paymentAmount: toDecimal(60),
+    ledgerSettlements: [
+      // The unresolved attempt's OWN settlement, stated in a form IMS will not read — a call that
+      // committed before its response was lost. Nothing but the exclusion can skip it.
+      { amount: null, unreadableAmount: '100.005', date: null, id: 'PAY-X', reference: null },
+    ] as LedgerSettlementRecord[],
+  }
+  const attempt = unresolved({ amount: 100, paymentDate: '2026-08-01' })
+
+  // THE PRECONDITION, and it is what makes the assertion below load-bearing: with the SAME row
+  // CONNECTOR-CONFIRMED, its id is in the exclusion set, the record is skipped and the receipt
+  // registers. So this row's id really does reach the set, and the basis is the only thing that
+  // changes the answer.
+  const connectorBacked = decideInvoicePaymentRegistration({
+    ...input,
+    existing: [live({ ...assertedRow, settlementBasis: null }), attempt],
+  })
+  assert.equal(connectorBacked.register, true)
+
+  const d = decideInvoicePaymentRegistration({
+    ...input,
+    existing: [live({ ...assertedRow, settlementBasis: OPERATOR_ASSERTION_SETTLEMENT_BASIS }), attempt],
+  })
+  assert.equal(d.register, false)
+  assert.equal(d.register === false && d.refusal, 'UNRESOLVED_PAYMENT_ATTEMPT')
+})
+
+test('[o3d-r948 r4] an OPERATOR_RELEASE row s id is the connector s own and still excludes', () => {
+  // THE CONNECTION PROVENANCE THE FILTER HAS TO PRESERVE. `OPERATOR_RELEASE` records that a row's
+  // STATUS was reached by a human; its DOCUMENT ID is the connector's, because
+  // `describeCancelledSaleRelease` refuses an asserted row outright. Filtering on "the basis is not
+  // null" instead of on the module's own predicate would strand every released row's siblings — the
+  // permanent hold r3 exists to lift, re-introduced one column over.
+  //
+  // ROUTE: the same filter, through `isOperatorAssertedSettlement`, which is FALSE for this basis.
+  // MUTATION: widen the clause to `row.settlementBasis == null` and this refuses instead of
+  //        registering — which is exactly what the precondition below asserts the ASSERTED row does.
+  const releasedRow = {
+    status: 'SYNCED' as const,
+    amount: 40,
+    paymentId: 'pay-other',
+    accountingInvoiceId: 'INV-1',
+    externalTransactionId: 'PAY-X',
+  }
+  const input = {
+    ...base,
+    accountingInvoiceId: 'INV-2',
+    paymentAmount: toDecimal(60),
+    ledgerSettlements: [
+      { amount: null, unreadableAmount: '100.005', date: null, id: 'PAY-X', reference: null },
+    ] as LedgerSettlementRecord[],
+  }
+  const attempt = unresolved({ amount: 100, paymentDate: '2026-08-01' })
+
+  // THE PRECONDITION: the filter is reached and it does discriminate — the SAME row asserted refuses.
+  const asserted = decideInvoicePaymentRegistration({
+    ...input,
+    existing: [live({ ...releasedRow, settlementBasis: OPERATOR_ASSERTION_SETTLEMENT_BASIS }), attempt],
+  })
+  assert.equal(asserted.register === false && asserted.refusal, 'UNRESOLVED_PAYMENT_ATTEMPT')
+
+  const d = decideInvoicePaymentRegistration({
+    ...input,
+    existing: [live({ ...releasedRow, settlementBasis: OPERATOR_RELEASE_SETTLEMENT_BASIS }), attempt],
+  })
+  assert.equal(d.register, true)
 })
 
 // ---------------------------------------------------------------------------
