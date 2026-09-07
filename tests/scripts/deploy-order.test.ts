@@ -12868,7 +12868,10 @@ function witnessCycleCheckout(dir: string, verdict: 'yes' | 'no'): void {
 for (const entry of FENCE_HARNESS) {
   for (const verdict of ['yes', 'no'] as const) {
     const cleared = verdict === 'yes'
-    test(`${entry.name} removes its own record only when the release saw the witness (witness_colocated=${verdict}) (o3d-secops r31, Codex HIGH 1)`, () => {
+    // The label is the r32 grammar, because the r31 one no longer exists: the verdict is a whole
+    // line naming this run's own nonce, and a test named after the token it used to be a substring
+    // of is a name that tells the next reader something untrue about what it exercises.
+    test(`${entry.name} removes its own record only when the release saw the witness (RELEASE_WITNESS ${verdict === 'yes' ? 'colocated' : 'absent'}) (o3d-secops r31, Codex HIGH 1)`, () => {
       const dir = mkdtempSync(join(tmpdir(), `ims-r31verdict-${verdict}-`))
       try {
         witnessCycleCheckout(dir, verdict)
@@ -12904,7 +12907,7 @@ for (const entry of FENCE_HARNESS) {
         assert.notEqual(fenceNonce, challenge, 'the release challenge must be fresh, not the fence own nonce')
 
         // MUTATION ROUTE (all made against the shipped files and reverted): in the entrypoint's
-        // release, assign clear_server unconditionally instead of from `witness_colocated=yes` --
+        // release, assign clear_server unconditionally instead of from the release's own verdict --
         // the 'no' case then prints AUTHORITY_CLEARED. Drop the third argument from the
         // db_fence_clear_authority call -- the 'yes' case prints AUTHORITY_REMAINS, and the
         // ordinary cutover starts asking a human on every deploy. Make db_fence_witness_nonce()
