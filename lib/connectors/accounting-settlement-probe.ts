@@ -1503,28 +1503,30 @@ export async function authoriseMoneyPost(
       // Undescribable AND the ledger is not empty: this row cannot say what it would create, so it
       // cannot rule itself out against what is already there. Refuse on what is visible.
       //
-      // o3d-obyd r31 — AND `!probe.provedComplete` IS THE THIRD ARM OF THE SAME TEST. This gate is
-      // the one place outside `classifyLedgerSettlement` that reads a conclusion out of a record list
-      // DIRECTLY, and it reads the strongest one: an empty list is taken as "there is nothing here to
-      // confuse this attempt with", and the row proceeds to POST. That inference has exactly the
-      // premise Codex's HIGH 1 is about — it holds only if the empty list is the whole collection.
-      // An unproved answer cannot support it, so it is refused here as it is there. No production
-      // response reaches this shape today (`settlementAnswer` refuses a figureless EMPTY answer
-      // outright, so unproved implies non-empty and the length test already catches it), and the
-      // check is written anyway rather than resting on that coincidence: this branch AUTHORISES A
-      // POST, and its premise should be stated where it is used, not inferred from another
-      // function's current refusal.
-      if (!probe.ok || probe.records.length > 0 || !probe.provedComplete) {
+      // o3d-obyd r31 — AND THIS IS THE ONE PLACE OUTSIDE `classifyLedgerSettlement` THAT READS A
+      // CONCLUSION STRAIGHT OUT OF A RECORD LIST. It reads the strongest one: an empty list is taken
+      // as "there is nothing here that could be confused with this attempt", and the row PROCEEDS TO
+      // POST. That inference has exactly the premise Codex's HIGH 1 is about — it is sound only if
+      // the empty list is the whole collection.
+      //
+      // IT IS SOUND HERE, AND NOT BY ACCIDENT OF THIS LINE. `settlementAnswer` refuses a response
+      // that states no settled figure AND carries no record, so an UNPROVED probe always has at
+      // least one record and `records.length > 0` already catches every one of them. Adding
+      // `|| !probe.provedComplete` here would be a guard that cannot fire — no input reaches it, so
+      // nothing could ever show it working, and a check nobody can break reads as protection while
+      // being decoration. r31 wrote it, could not kill it with a mutant, and removed it again.
+      //
+      // WHAT CARRIES THE PREMISE INSTEAD IS A TEST, not a comment: `settlement-probe-string-amounts`
+      // pins the invariant this gate depends on — across all three arms, `ok && !provedComplete`
+      // implies a non-empty record list — so if a future arm ever answers an unproved EMPTY probe,
+      // that test fails and names this gate as what it breaks.
+      if (!probe.ok || probe.records.length > 0) {
         return {
           proceed: false,
           error: 'Not sent: this entry does not record the amount its attempt would send, and the '
-            + (probe.ok && probe.records.length === 0
-              ? 'accounting connector did not state how much has settled this document, so IMS cannot '
-                + 'tell whether it was shown every settlement of it'
-              : `accounting connector already holds ${probe.ok ? probe.records.length : 'a'} settlement`
-                + `${probe.ok && probe.records.length === 1 ? '' : 's'} against this document. IMS cannot `
-                + 'tell them apart')
-            + ', so sending could pay it twice. Resolve this entry by hand.',
+            + `accounting connector already holds ${probe.ok ? probe.records.length : 'a'} settlement`
+            + `${probe.ok && probe.records.length === 1 ? '' : 's'} against this document. IMS cannot `
+            + 'tell them apart, so sending could pay it twice. Resolve this entry by hand.',
         }
       }
     }

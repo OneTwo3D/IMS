@@ -1180,3 +1180,51 @@ test('[o3d-obyd r31] contradictory settled figures refuse, rather than the zero 
   assert.equal(componentsOnly.ok === true ? componentsOnly.provedComplete : null, true,
     'and it proves the collection just as the totals pair does')
 })
+
+test('[o3d-obyd r31] an UNPROVED answer always carries records — the invariant a post gate depends on', async () => {
+  // WHY THIS EXISTS. `authoriseMoneyPost`'s undescribable-attempt branch is the one place outside
+  // `classifyLedgerSettlement` that draws a conclusion from a record list directly, and it draws the
+  // strongest one: an empty list means "nothing here could be confused with this attempt", and the
+  // row POSTS. That is sound only because an unproved probe can never be empty — `settlementAnswer`
+  // refuses a response that states no settled figure AND carries no record. The gate tests
+  // `records.length > 0`, which catches every unproved probe precisely because of this invariant.
+  //
+  // A `|| !probe.provedComplete` arm on that gate would be unfalsifiable: no input can reach it, so
+  // no mutation can show it working. The premise is pinned HERE, where it can fail, instead.
+  //
+  // ROUTE: `settlementAnswer(settled, records, ...)` -> `settled === null && records.length === 0`
+  //        -> ok:false. So `ok && !provedComplete` implies `records.length > 0`.
+  // MUTATION: drop the `records.length === 0` half of that condition (return the ok answer whenever
+  //        `settled === null`). Every arm below then produces `ok: true, provedComplete: false` with
+  //        an EMPTY list — and the post gate above would authorise the post on it.
+
+  // Each arm, driven with a document that states NO settled figure and holds NO settlement.
+  const figurelessAndEmpty = {
+    'Xero invoice': () => probeInvoice({ CurrencyCode: 'GBP', Payments: [] }),
+    'Xero credit note': () => probeNote({ CurrencyCode: 'GBP', Allocations: [] }),
+    'QuickBooks bill': () => probeBill({ LinkedTxn: [] }),
+  }
+  for (const [label, run] of Object.entries(figurelessAndEmpty)) {
+    const probe = await run()
+    // THE PRECONDITION this test would be worthless without: the document really does state no
+    // settled figure. If it stated one the answer would be proved and the invariant untested.
+    assert.equal(probe.ok, false, `${label}: a figureless EMPTY answer is refused, never reported`)
+    assert.match(reasonOf(probe), /it has nothing to tell from/, `${label}: and for that reason`)
+  }
+
+  // AND THE INVARIANT ITSELF, stated over the answers the arms DO give: every probe that answers
+  // without proving its collection carries at least one record.
+  const answers = [
+    await TRUNCATED.invoice(), await TRUNCATED.note(), await TRUNCATED.bill(),
+    await probeInvoice({ CurrencyCode: 'GBP', Total: 40, AmountDue: 40, AmountPaid: 0, AmountCredited: 0, Payments: [] }),
+  ]
+  // PRECONDITION: the sample is not vacuous — at least one of these really is an unproved answer, so
+  // the loop below has something to check rather than passing over an empty set.
+  const unproved = answers.filter((p) => p.ok === true && !p.provedComplete)
+  assert.equal(unproved.length, 3, 'all three truncated arms answered, and answered unproved')
+  for (const probe of unproved) {
+    assert.ok(probe.ok === true && probe.records.length > 0,
+      'an unproved answer always has a record — which is what makes the post gate\'s length test '
+      + 'sufficient, and what a future arm answering an unproved EMPTY probe would break')
+  }
+})
