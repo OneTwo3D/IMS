@@ -9933,11 +9933,31 @@ test('r26/r27/r28: the operator resolution acts only on a reading it can attribu
     // PHASE 2 — AND THE RELEASE STILL WORKS OVER IT, WHICH IS THE ESCAPE HATCH. Nothing in the
     // release path consults the stamp or the fingerprint's absence, so an operator holding a record
     // no automatic path will touch can still take a standing fence down.
+    //
+    // WHAT r30 CHANGED HERE, AND WHY (Codex HIGH 1). The GRANTs are still automatic -- that is the
+    // escape hatch, and restoring privilege is the recoverable direction -- but ROOT NO LONGER
+    // REMOVES THE RECORD on the strength of the helper's exit status. r29 measured that a physical
+    // copy of a fenced cluster answers a release exactly as the original does, so an exit 0 here
+    // cannot show WHICH server was released, and removing the record on it would destroy the only
+    // account of a fence possibly still standing on the original. This wrapper is the case that
+    // matters: it is run against records EARLIER runs published, so it has nothing to attest with.
+    // It therefore offers the removal and asks at the terminal -- and this fixture has none, which
+    // is exactly the refusal asserted below. The record surviving is the finding being closed, not
+    // a regression: the ordinary in-cutover release still clears its own record automatically,
+    // which is what tests/scripts/db-connection-fence.test.ts measures against real clusters.
     writeFileSync(calls, '')
     const released = run(paths.releaseWrapper)
-    assert.equal(released.status, 0, `the release must work over an unstamped record:\n${released.stdout}${released.stderr}`)
     assert.match(readFileSync(calls, 'utf8'), /^--release /m, 'reaching the helper with the record it names')
-    assert.equal(existsSync(state), false, 'and root removes the record once the release is verified')
+    assert.match(released.stderr, /ABOUT TO REMOVE the connection-fence authority/,
+      `the release must still run and then OFFER the removal:\n${released.stdout}${released.stderr}`)
+    assert.match(released.stderr, /record digest:\s+[0-9a-f]{64}/,
+      `bound to the record's exact bytes:\n${released.stderr}`)
+    assert.equal(released.status, 1,
+      `and with no terminal to confirm at, it must not remove anything:\n${released.stdout}${released.stderr}`)
+    assert.match(released.stderr, /no controlling terminal/, released.stderr)
+    assert.equal(existsSync(state), true,
+      'so the record survives -- it is the only thing a release of the REAL fence could be built from')
+    assert.equal(readFileSync(state, 'utf8'), LEGACY, 'byte for byte as it was found')
 
     // PHASE 3a — A FULLY-WITHDRAWN ACL IS REPORTED AND NOT STAMPED (o3d-secops r27, Codex HIGH).
     plantLegacy()
@@ -12307,4 +12327,182 @@ test('[o3d-secops r22] the library aims every privileged operation at a descript
     `each component must be created with a PLAIN mkdir, which fails with EEXIST on a planted symlink:\n${walk}`)
   assert.match(walk, /stat -c '%F\|%d:%i' "\$\{comp\}"/, `lstat-ed, not stat -L:\n${walk}`)
   assert.match(walk, /cd -P "\$\{comp\}"/, `and entered, so the descriptor is the pin:\n${walk}`)
+})
+
+/**
+ * EVERY RELEASE THAT REMOVES THE RECORD SAYS WHY IT MAY (o3d-secops r30, Codex HIGH 1).
+ *
+ * db_fence_clear_authority() is where the deletion happens on all three entrypoints, and since
+ * r30 it refuses without an attestation that this run RAISED the fence it just released. That
+ * fact is not in any database -- which is the point, because r29 measured that a physical copy of
+ * a fenced cluster answers a release exactly as the original does -- so the only thing that can
+ * supply it is the caller's own memory of its own act.
+ *
+ * THIS TEST IS ABOUT THE CALLERS, and it is a census rather than a spot check: a rule enforced in
+ * the function and then bypassed by one of six call sites passing a constant would leave the
+ * finding open on that path with the guard looking green. So every call in the three entrypoints
+ * and the library is enumerated, and each is required to be one of exactly two shapes -- the
+ * literal attestation, which only a run that published the record itself may use, or a variable
+ * whose assignment is guarded by ${DB_FENCE_RAISED}.
+ *
+ * MUTATION ROUTE (made against the shipped files and reverted): change any call site to pass the
+ * literal unconditionally -- which is what an ordinary "fix the argument" edit looks like -- and
+ * the census names that file and line.
+ */
+test('[o3d-secops r30] every caller of db_fence_clear_authority attests, or passes nothing', () => {
+  const FILES: ReadonlyArray<readonly [string, string]> = [
+    ['scripts/lib/db-fence-protected.sh', readFileSync(join(process.cwd(), 'scripts/lib/db-fence-protected.sh'), 'utf8')],
+    ['scripts/deploy.sh', readFileSync(join(process.cwd(), 'scripts/deploy.sh'), 'utf8')],
+    ['scripts/update.sh', readFileSync(join(process.cwd(), 'scripts/update.sh'), 'utf8')],
+    ['scripts/install.sh', readFileSync(join(process.cwd(), 'scripts/install.sh'), 'utf8')],
+  ]
+
+  const sites: { where: string; line: string }[] = []
+  for (const [name, source] of FILES) {
+    source.split(/\r?\n/).forEach((line, index) => {
+      // The definition itself is not a call site.
+      if (/^\s*db_fence_clear_authority\s*\(\s*\)/.test(line)) return
+      if (!/db_fence_clear_authority\s+/.test(line)) return
+      if (/^\s*#/.test(line)) return
+      sites.push({ where: `${name}:${index + 1}`, line: line.trim() })
+    })
+  }
+
+  // THE WALK REACHED THE FILES, stated as a number: a census that enumerated nothing would satisfy
+  // every rule below vacuously, which is exactly how a guard comes to be green about nothing.
+  assert.ok(sites.length >= 5,
+    `the census must find the shipped call sites; it found ${sites.length}: ${sites.map((s) => s.where).join(', ')}`)
+
+  const UNATTESTED = sites.filter(({ line }) => !/db_fence_clear_authority\s+\S+\s+\S/.test(line))
+  assert.deepEqual(UNATTESTED, [],
+    'a call with no second argument removes nothing since r30, so this is a path that silently stopped clearing its record rather than one that clears it safely')
+
+  // WHERE THE LITERAL IS PERMITTED IS THE WHOLE RULE, and writing the census without that part is
+  // how it comes to establish an adjacent property: a first draft of this test accepted the
+  // literal at ANY site, so changing an entrypoint to pass it unconditionally -- exactly the
+  // "fix the argument" edit somebody would make -- left the census green while reopening the
+  // finding on that path. The literal is a claim that THIS RUN published the record it is
+  // removing, and only db_fence_raise() is in a position to make it: it read ${had_authority}
+  // before publishing and both of its calls are bounded by that. Every entrypoint's release is
+  // releasing a fence it may not have raised, so there the attestation must be a value the flag
+  // decided.
+  const RAISE = shellFunction(readFileSync(join(process.cwd(), 'scripts/lib/db-fence-protected.sh'), 'utf8'), 'db_fence_raise')
+  for (const site of sites) {
+    const literal = /db_fence_clear_authority\s+\S+\s+"?raised-by-this-run"?/.test(site.line)
+    const variable = /db_fence_clear_authority\s+\S+\s+"\$\{?clear_attestation\}?"/.test(site.line)
+    assert.ok(literal || variable,
+      `${site.where} passes something this census does not recognise as an attestation:\n  ${site.line}`)
+    if (!literal) continue
+    assert.ok(site.where.startsWith('scripts/lib/db-fence-protected.sh:'),
+      `${site.where} claims outright that this run raised the fence it is clearing. Only db_fence_raise() may: an entrypoint's release runs against records earlier runs published too, and there the attestation must come from \${DB_FENCE_RAISED}.\n  ${site.line}`)
+    assert.ok(RAISE.includes(site.line),
+      `${site.where} makes that claim from outside db_fence_raise(), which is the only function that read whether an authority was already standing before it published one:\n  ${site.line}`)
+  }
+
+  // AND THE VARIABLE IS NEVER SET WITHOUT THE FLAG. Without this the shape check above is
+  // satisfied by a caller that assigns the attestation unconditionally, which is the same defect
+  // wearing a name.
+  for (const [name, source] of FILES) {
+    source.split(/\r?\n/).forEach((line, index) => {
+      if (!/clear_attestation="raised-by-this-run"/.test(line)) return
+      assert.match(line, /DB_FENCE_RAISED/,
+        `${name}:${index + 1} assigns the attestation without asking whether this run raised the fence:\n  ${line.trim()}`)
+    })
+  }
+
+  // THE FUNCTION ITSELF REFUSES, EXERCISED UNDER A REAL SHELL rather than read. Both directions,
+  // so a passing test cannot be a function that never removes anything.
+  const dir = mkdtempSync(join(tmpdir(), 'ims-clear-'))
+  try {
+    const record = join(dir, 'db-connect-fence.json')
+    const CLEAR = shellFunction(readFileSync(join(process.cwd(), 'scripts/lib/db-fence-protected.sh'), 'utf8'), 'db_fence_clear_authority')
+    const ask = (attestation: string) => {
+      writeFileSync(record, '{"state_complete":1}\n')
+      const run = runShell([
+        'set -uo pipefail',
+        'exec 2>&1',
+        'DB_FENCE_SUDO_PREFIX=""',
+        'DB_FENCE_RELEASE_WRAPPER="/opt/cutover/release-db-fence"',
+        CLEAR,
+        `db_fence_clear_authority ${JSON.stringify(record)} ${JSON.stringify(attestation)}`,
+        'echo "RC=$?"',
+      ].join('\n'))
+      return { output: run.output, survived: existsSync(record) }
+    }
+
+    for (const wrong of ['', 'true', 'yes', 'raised-by-this-run ', 'RAISED-BY-THIS-RUN']) {
+      const refused = ask(wrong)
+      assert.match(refused.output, /^RC=2$/m, `${JSON.stringify(wrong)} must not license an unlink:\n${refused.output}`)
+      assert.equal(refused.survived, true, `and ${JSON.stringify(wrong)} must leave the record where it was`)
+    }
+
+    const allowed = ask('raised-by-this-run')
+    assert.match(allowed.output, /^RC=0$/m, `an attested removal must still happen:\n${allowed.output}`)
+    assert.equal(allowed.survived, false, 'and the record must be gone')
+
+    // AND AN ABSENT RECORD IS NOT A REFUSAL: the recovery paths reach this after a release that
+    // found no record at all, and turning that into a refusal would stop the one state that needs
+    // no decision.
+    const nothing = runShell([
+      'set -uo pipefail',
+      'exec 2>&1',
+      'DB_FENCE_SUDO_PREFIX=""',
+      'DB_FENCE_RELEASE_WRAPPER="/opt/cutover/release-db-fence"',
+      CLEAR,
+      `db_fence_clear_authority ${JSON.stringify(join(dir, 'not-there.json'))} ""`,
+      'echo "RC=$?"',
+    ].join('\n'))
+    assert.match(nothing.output, /^RC=0$/m, `nothing to remove is not something to refuse:\n${nothing.output}`)
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+/**
+ * AND THE BAKED RELEASE WRAPPER NEVER UNLINKS ON ITS OWN (o3d-secops r30, Codex HIGH 1 + MEDIUM).
+ *
+ * The wrapper root writes into the cutover recovery directory is the case the finding is really
+ * about: it is run by a person, days later, against a record an earlier run published, so it has
+ * no memory to attest with and the copy it may be pointed at is not a thought experiment. It used
+ * to `rm -f` the record on the helper's exit 0.
+ *
+ * MUTATION ROUTE: put `rm -f "${state_file}"` back into release_the_fence() and the first
+ * assertion fails; delete the `-ne 6` half of its status test and the retry assertion fails.
+ */
+test('[o3d-secops r30] the release wrapper asks before it removes, and completes a retry', () => {
+  const LIBRARY = readFileSync(join(process.cwd(), 'scripts/lib/db-fence-protected.sh'), 'utf8')
+  // release_the_fence() lives INSIDE the quoted WRAPPER_EOF heredoc that
+  // db_fence_publish_operator_wrappers() writes into the cutover recovery directory, so it has to
+  // be lifted out of the heredoc before it can be read as shell.
+  const OPEN = "cat <<'WRAPPER_EOF'\n"
+  const CLOSE = '\nWRAPPER_EOF\n'
+  const opened = LIBRARY.indexOf(OPEN)
+  const closed = LIBRARY.indexOf(CLOSE, opened)
+  assert.ok(opened >= 0 && closed > opened, 'the wrapper body must still be a quoted heredoc in the library')
+  const WRAPPER_BODY = LIBRARY.slice(opened + OPEN.length, closed)
+  const RELEASE = shellFunction(WRAPPER_BODY, 'release_the_fence')
+
+  // THE PRECONDITION: this is the function that runs the release, or the assertions below are
+  // about some other text entirely.
+  assert.match(RELEASE, /--release/, `the subject must be the release arm:\n${RELEASE}`)
+
+  assert.doesNotMatch(RELEASE, /\brm -f\b/,
+    `the standalone release wrapper may not unlink the record on its own -- it cannot show which server answered:\n${RELEASE}`)
+  assert.match(RELEASE, /operator_confirms clear/,
+    `and the removal must be confirmed at the terminal:\n${RELEASE}`)
+  assert.match(RELEASE, /decision_token clear "\$\{digest\}" "\$\{identity\}"/,
+    `bound to the record's exact bytes AND the cluster that answered, so the token cannot be reused:\n${RELEASE}`)
+  assert.match(RELEASE, /node -e "\$\{clear_authority\}" -- "\$\{state_file\}" "\$\{digest\}"/,
+    `and the removal itself is the compare-and-swap, not a name:\n${RELEASE}`)
+
+  // THE RETRY: exit 6 is EXIT_ALREADY_RELEASED and must be accepted exactly as 0 is, or the loop
+  // r30 exists to break is still there.
+  assert.match(RELEASE, /"\$\{rc\}" -ne 0 && "\$\{rc\}" -ne 6/,
+    `a release that finds its grants already restored must still reach the removal offer:\n${RELEASE}`)
+
+  // AND THE HELPER REALLY DOES PRODUCE THAT STATUS AND THAT LINE, so the wrapper is not reading
+  // for something nothing emits.
+  const HELPER = readFileSync(join(process.cwd(), 'scripts/fence-db-connections.mjs'), 'utf8')
+  assert.match(HELPER, /export const EXIT_ALREADY_RELEASED = 6/, 'the helper must define that status')
+  assert.match(HELPER, /release_cluster_identity=/, 'and print the cluster line the token binds')
 })
