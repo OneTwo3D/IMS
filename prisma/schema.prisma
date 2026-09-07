@@ -2469,8 +2469,16 @@ model AccountingSyncLog {
   // (connector, type, status, referenceType, referenceId, externalTransactionId) evidence that stops
   // an ambiguity silently becoming a certainty, but drop the payload and errorMessage, which are
   // where the customer names, emails, addresses and financial lines live. (An earlier revision of
-  // this comment listed a `provenance` column: that was part of the per-realm namespacing work,
-  // which was tried and REVERTED — this model has no such column. See o3d-gt8r / o3d-s36z.)
+  // this comment listed a `provenance` column: that exact column was part of the per-realm
+  // namespacing work, which was tried and REVERTED — see o3d-gt8r / o3d-s36z. It is NOT a statement
+  // that this model records no realm: `connectionProvenance` below does, and o3d-r948 r5 misread
+  // this parenthesis as saying otherwise and left a money guard scoped to the connector TYPE. A
+  // reverted design is not an absent capability; read the column list, not the history.)
+  //
+  // AND THIS COLUMN IS HALF OF THAT READING. `readAccountingOriginRecord` will let
+  // `connectionProvenance` speak for an empty payload ONLY where this instant proves retention
+  // emptied it — a payload rewritten by anything else lacks the stamp for a different reason, and
+  // the column cannot vouch for content it never saw.
   //
   // r4 finding 3: a tombstone IS still a sweep candidate. The columns the id write reads
   // all survive compaction, so an ambiguity that clears after the retention horizon — or a

@@ -705,12 +705,32 @@ export async function probeLedgerSettlement(
   target: SettlementProbeTarget,
 ): Promise<LedgerSettlementProbe> {
   try {
-    if (connector === 'xero') {
-      const { xeroGet } = await import('./xero/api')
-      return await probeXeroSettlement(target, xeroGet as XeroFetcher)
-    }
-    const { qboGet } = await import('./quickbooks/api')
-    return await probeQuickBooksSettlement(target, qboGet as QboFetcher)
+    const { activeAccountingIdProvenance } = await import('./accounting-id-provenance')
+    // o3d-r948 r5 (Codex HIGH) — WHICH ORGANISATION IS ANSWERING, READ EITHER SIDE OF THE READ.
+    //
+    // The records this returns are ids in one ledger's namespace, and the caller's exclusion set is
+    // only sound if it is comparing against the SAME organisation (see `LedgerSettlementProbe`).
+    // There is no way to ask the connectors' fetchers which tenant they used, so this reads the
+    // active token instead — and reads it TWICE, because a single read is a claim about a moment
+    // and the fetch is a different moment. An operator disconnecting and reconnecting to another
+    // company across this call would otherwise have us label realm A's records with realm B's name,
+    // which is the failure this whole change exists to stop, arriving one layer up.
+    //
+    // Disagreement answers NULL rather than either value: "the connection moved while I was reading
+    // it" is precisely a state in which nothing may be excluded, and null is what withholds.
+    const before = await activeAccountingIdProvenance(connector)
+    const probe = connector === 'xero'
+      ? await (async () => {
+        const { xeroGet } = await import('./xero/api')
+        return await probeXeroSettlement(target, xeroGet as XeroFetcher)
+      })()
+      : await (async () => {
+        const { qboGet } = await import('./quickbooks/api')
+        return await probeQuickBooksSettlement(target, qboGet as QboFetcher)
+      })()
+    if (!probe.ok) return probe
+    const after = await activeAccountingIdProvenance(connector)
+    return { ...probe, connectionProvenance: before !== null && before === after ? before : null }
   } catch (e) {
     return { ok: false, reason: e instanceof Error ? e.message : String(e) }
   }

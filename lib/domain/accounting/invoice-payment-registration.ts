@@ -23,6 +23,8 @@ import {
   type ExactAmountReading,
 } from '@/lib/domain/accounting/registered-amount'
 import { isOperatorAssertedSettlement } from './sync-row-settlement'
+import { accountingIdProvenanceMatches } from '@/lib/connectors/accounting-id-provenance'
+import type { AccountingConnectionStamp } from '@/lib/connectors/accounting-connection-provenance'
 import {
   addMoney,
   compareDecimal,
@@ -141,6 +143,61 @@ export type ExistingInvoicePaymentSync = {
    * the payment an operator has to go and read (o3d-anu8).
    */
   externalTransactionId?: string | null
+  /**
+   * o3d-r948 r5 (Codex HIGH) — WHICH ACCOUNTING ORGANISATION THIS ROW WAS RAISED AGAINST, as
+   * `readAccountingOriginRecord` reads it from the row's durable column AND its payload stamp.
+   *
+   * `loadInvoicePaymentSyncRows` fills it on every row. It is OPTIONAL here for the same reason
+   * every other field on this type is: a caller that cannot supply it passes nothing, and absent
+   * is UNKNOWN — which grants no exclusion below. The cost of an unplumbed caller is therefore a
+   * refusal, not a permission, which is the only direction a money guard may default in.
+   *
+   * The four-state stamp is kept whole rather than flattened to a string, because "raised while
+   * nothing was connected", "queued before the stamp shipped" and "the two halves disagree" are
+   * three different sentences to an operator, and collapsing them is the defect
+   * `readAccountingOriginRecord` was written to remove. Only `stamped` can ever match.
+   */
+  origin?: AccountingConnectionStamp
+}
+
+/**
+ * o3d-r948 r5 (Codex HIGH) — IS THIS ROW'S RECORDED ID AN ID IN THE LEDGER THE PROBE JUST READ?
+ *
+ * BOTH SIDES, OR NEITHER. Excluding a probe record because some row of ours names its id is only
+ * sound when that row was raised against the SAME organisation the probe answered from — so this
+ * takes both, and a missing answer on EITHER side excludes nothing. Scoping only the row would
+ * compare a realm-stamped id against records of unknown origin, which is a different unproved
+ * claim, not half of a proof.
+ *
+ * `accountingIdProvenanceMatches` is the repository's one comparison of two provenance strings, not
+ * a second spelling of it here — the same reason `isOperatorAssertedSettlement` is used above rather
+ * than a fresh basis test. It requires an exact match and treats null on either side as no match.
+ *
+ * WHAT COUNTS AS UNKNOWN, and every one of them refuses:
+ *
+ *   • `absent`   — the row predates the stamp, or the probe's caller does not plumb the provenance.
+ *   • `unreadable` — the payload and the column describe two different moments, or something we do
+ *     not recognise wrote one of them. "I cannot tell" is never "the same" (the rule
+ *     `accountingOriginRecordsMatch` already states).
+ *   • `raised-disconnected` — the row was raised while nothing was connected, so nothing can vouch
+ *     for the id it carries at all. Flattened to a sentinel that cannot equal any real provenance.
+ *
+ * THE COST IS PAID IN THE SAFE DIRECTION AND IT IS REAL. Every INVOICE_PAYMENT row queued before
+ * `_connectionProvenance` shipped answers `absent`, so it can no longer release a sibling's
+ * unmeasurable settlement, and a receipt behind one is refused with UNRESOLVED_PAYMENT_ATTEMPT —
+ * visibly, with a nameable remedy. That is the same trade `classifyLedgerSettlement` already states
+ * for a caller that can supply no set at all: "the cost of holding a genuine payment back is a
+ * visible refusal, and the cost of the alternative is a second payment."
+ */
+export function excludingRowIsFromTheProbedLedger(
+  origin: AccountingConnectionStamp | undefined,
+  probedConnectionProvenance: string | null | undefined,
+): boolean {
+  const probed = typeof probedConnectionProvenance === 'string' ? probedConnectionProvenance.trim() : ''
+  return accountingIdProvenanceMatches(
+    origin?.state === 'stamped' ? origin.provenance : null,
+    probed === '' ? null : probed,
+  )
 }
 
 /**
@@ -250,6 +307,20 @@ export function decideInvoicePaymentRegistration(input: {
    * more. Callers with no unresolved attempts may pass null freely.
    */
   ledgerSettlements: LedgerSettlementRecord[] | null
+  /**
+   * o3d-r948 r5 (Codex HIGH) — THE ORGANISATION THOSE SETTLEMENTS CAME FROM, as
+   * `"<connector>:<tenantId>"`, straight off the probe (`LedgerSettlementProbe.connectionProvenance`).
+   *
+   * The OTHER half of the scoping, and it is not optional to the argument even though it is optional
+   * to the type. `ledgerSettlements` is a list of ids in ONE ledger's namespace and says nowhere
+   * which; without knowing that, "a row of ours records this id" cannot establish that the row and
+   * the record are the same object, only that two namespaces used the same string.
+   *
+   * NULL / ABSENT = the probe could not say which organisation answered — including the case where
+   * the connection MOVED across the read, which `probeLedgerSettlement` deliberately reports as
+   * null. Nothing is then excluded, and every unmeasurable record withholds.
+   */
+  ledgerConnectionProvenance?: string | null
   /**
    * What the ledger's copy of the invoice was built at (see ledgerSalesInvoiceTotalForeign), as the
    * stored `Decimal` (o3d-6abj). `Number(order.totalForeign)` is one of the two operands Codex's
@@ -385,15 +456,43 @@ export function decideInvoicePaymentRegistration(input: {
         //     so that basis can only ever sit on connector-issued evidence. `isOperatorAssertedSettlement`
         //     is FALSE for it by design, and using the predicate rather than "basis is not null" is
         //     what preserves it. Folding it in would re-strand every released row's siblings.
-        //   • THE CONNECTOR ITSELF is already pinned upstream, not re-checked here.
-        //     `loadInvoicePaymentSyncRows` selects `where: { connector, type: 'INVOICE_PAYMENT', … }`,
-        //     so every row in `input.existing` was written for the same ledger the probe read — the
-        //     ids cannot come from another connector's namespace. There is no per-realm `provenance`
-        //     column to check beyond that: that work was tried and REVERTED (o3d-gt8r / o3d-s36z),
-        //     and the schema comment on `backReferenceEvidenceCompactedAt` records it.
+        // o3d-r948 r5 (Codex HIGH) — AND A CONNECTOR IS NOT A NAMESPACE.
+        //
+        // r4's note ended by clearing the last question with the wrong answer, and the answer was
+        // wrong in the permissive direction:
+        //
+        //     "THE CONNECTOR ITSELF is already pinned upstream... every row in `input.existing` was
+        //      written for the same ledger the probe read — the ids cannot come from another
+        //      connector's namespace. There is no per-realm `provenance` column to check beyond
+        //      that: that work was tried and REVERTED (o3d-gt8r / o3d-s36z), and the schema comment
+        //      on `backReferenceEvidenceCompactedAt` records it."
+        //
+        // BOTH SENTENCES ARE FALSE, and the second is the reason the first went unchecked.
+        // `loadInvoicePaymentSyncRows` filters on `connector`, which is `'quickbooks'` — a ledger
+        // TYPE. An operator can disconnect from realm A and reconnect to realm B, and every row
+        // raised against A stays in this table under that same string. QuickBooks mints short
+        // numeric payment ids, so A's `123` and B's `123` are two different payments spelt the same.
+        // A confirmed A row recording `123`, against a receipt and a document that make it invisible
+        // to the retired-document gate and the `live` filter alike, then excludes B's OWN record
+        // `123` — the unresolved attempt's unmeasurable settlement is skipped, the verdict is
+        // `clear`, and a second payment posts. That is precisely the route r4's own test walks.
+        //
+        // AND THE COLUMN EXISTS. `AccountingSyncLog.connectionProvenance` (o3d-dzip) holds
+        // `"<connector>:<tenantId>"` in a place retention cannot reach, beside the payload stamp
+        // o3d-s36z writes, and `readAccountingOriginRecord` is the reader that weighs the two. What
+        // o3d-gt8r / o3d-s36z reverted was ONE DESIGN for per-realm namespacing, not the capability
+        // — a reverted attempt is not an absence, and the schema comment recording the revert sits
+        // directly above the column that shipped instead.
+        //
+        // SO BOTH SIDES ARE SCOPED, by `excludingRowIsFromTheProbedLedger`: the row must positively
+        // record the organisation the probe answered from, and the probe must positively say which
+        // that was. Unknown on either side excludes nothing — see that function for why each flavour
+        // of unknown refuses, and for the rollout cost, which falls on the refusing side.
         {
           settlementsOfOtherAttempts: input.existing
-            .filter((row) => row !== attempt && !isOperatorAssertedSettlement(row.settlementBasis))
+            .filter((row) => row !== attempt
+              && !isOperatorAssertedSettlement(row.settlementBasis)
+              && excludingRowIsFromTheProbedLedger(row.origin, input.ledgerConnectionProvenance))
             .map((row) => row.externalTransactionId),
         },
       )

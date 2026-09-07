@@ -87,7 +87,26 @@ export type LedgerSettlementRecord = {
 }
 
 export type LedgerSettlementProbe =
-  | { ok: true; records: LedgerSettlementRecord[] }
+  | {
+      ok: true
+      records: LedgerSettlementRecord[]
+      /**
+       * o3d-r948 r5 (Codex HIGH) — WHICH ORGANISATION ANSWERED, as `"<connector>:<tenantId>"`.
+       *
+       * The records above are ids in ONE ledger's namespace, and nothing in a record says which.
+       * `settlementsOfOtherAttempts` below is the one input that can REMOVE a record from a match,
+       * and a caller can only show that an id it holds names one of THESE records if it knows what
+       * organisation these came from — so the probe has to say. Without it "connector" is the only
+       * shared fact between the two sides, and a connector name is a TYPE, not a tenant: after a
+       * reconnect to a different company an id minted in the old one is still a `quickbooks:` id.
+       *
+       * OPTIONAL, and the option is not laziness. Every construction of this type that does not go
+       * through `probeLedgerSettlement` — every test fixture, every future caller — leaves it
+       * undefined, and undefined means UNKNOWN, which grants no exclusion at all. So the cost of
+       * forgetting it is a refusal, never a permission.
+       */
+      connectionProvenance?: string | null
+    }
   | { ok: false; reason: string }
 
 /** What a row's stored payload says its attempt sent. */
