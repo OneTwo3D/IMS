@@ -13,7 +13,35 @@
  */
 
 import type { AccountingSyncType } from '@/app/generated/prisma/client'
+// o3d-78rq: the SAME reader both connectors' amount readings already go through, answering with the
+// Decimal rather than the double. It lives beside `parseLedgerAmount` in the Xero module because that
+// is where `ledgerAmountMagnitudeBound` is, and this is the import direction QuickBooks' own payment
+// poller already takes for exactly the same rule.
+// o3d-obyd: and `decodeLedgerAmountText` is the string arm of that same reader, which is how the
+// completeness arithmetic below reads a numeric STRING without also inheriting the currency and
+// magnitude judgements that belong to a decision which withholds. One decode, two callers.
+// o3d-mm51: and `ledgerDifferenceMagnitudeBound` is the OTHER rule that reader applies to a decoded
+// JSON number -- the one about whether the number can be READ AT ALL rather than about whether the
+// figure may be trusted. See `wireAmount`, which inherits it and still does not inherit the scale.
+import {
+  decodeLedgerAmountText,
+  ledgerCurrencyCode,
+  ledgerDifferenceMagnitudeBound,
+  readLedgerStatedAmount,
+} from '@/lib/connectors/xero/invoice-delta'
+// o3d-r948: the completeness refusals print figures, and a KWD shortfall of one fil is `0.00` at two
+// places. The rule for showing a money figure without rounding away what the verdict turned on is
+// already written down for the classifier's own sentences, so it is the same function.
+import { formatLedgerMoney } from '@/lib/domain/accounting/ledger-settlement-evidence'
 import type { LedgerSettlementProbe, LedgerSettlementRecord } from '@/lib/domain/accounting/ledger-settlement-evidence'
+import {
+  addMoney,
+  compareDecimal,
+  ledgerAmountEpsilon,
+  subtractMoney,
+  toDecimal,
+  type Decimal,
+} from '@/lib/domain/math/decimal'
 import { settlementDocumentAnchorFilters, settlementDocumentKey } from '@/lib/domain/accounting/money-post-document'
 import type { MoneyPostLock } from '@/lib/domain/accounting/money-post-lock'
 
@@ -34,6 +62,372 @@ function str(value: unknown): string {
 
 function num(value: unknown): number | null {
   return typeof value === 'number' && Number.isFinite(value) ? value : null
+}
+
+/* ------------------------------------------------------------------------------------------- *
+ * o3d-r948 — THE COMPLETENESS CROSS-CHECKS, IN DECIMAL, AT THIS DOCUMENT'S OWN MINOR UNIT.
+ * ------------------------------------------------------------------------------------------- */
+
+/**
+ * HOW FAR A LEDGER'S OWN TOTAL MAY EXCEED THE COLLECTION IT SENT BEFORE THE PICTURE IS INCOMPLETE.
+ *
+ * THE DEFECT (o3d-78rq's ninth site, filed rather than folded in; Codex HIGH 1). All four checks
+ * below carried a flat `0.005` and did their arithmetic in `number`, while o3d-6yho had already made
+ * the classifier's band a fraction of the document's own minor unit and o3d-78rq had made both of the
+ * classifier's operands exact. A flat half-penny is FIVE whole minor units in a Gulf dinar and fifty
+ * in CLF. So a KWD invoice reporting `AmountPaid` 0.001 — one fil, a real payment — with an omitted
+ * `Payments` collection had its whole shortfall swallowed: the completeness question answers
+ * "everything is accounted for", the probe returns `ok: true` with an EMPTY record list, and
+ * `classifyLedgerSettlement` builds `clear` out of it. `clear` is what authorises a money post, so
+ * the cost of the swallowed fil is a SECOND payment.
+ *
+ * THE BAND IS `ledgerAmountEpsilon` — HALF ONE MINOR UNIT OF THE DOCUMENT'S OWN CURRENCY.
+ *
+ * Codex asked for a tolerance "strictly below one minor unit", not for half of one, and half of one
+ * is the value chosen anyway. The reason is what a band is FOR: it absorbs representation noise in
+ * figures the ledger has already quantized to its own minor unit, and it must never absorb a real
+ * omission. Every genuine settlement is a whole multiple of that unit, so the smallest shortfall that
+ * can exist is ONE unit and any band strictly below one unit refuses it. Within that constraint the
+ * choice is between two failure directions, and they are not symmetric here:
+ *
+ *   TOO WIDE    a real omission is swallowed, the record list is short, and a `clear` is built from
+ *               it. That is a duplicate payment — irreversible.
+ *   TOO NARROW  a document whose figures differ by a sliver refuses, the row fails visibly, and a
+ *               human resolves it. A workflow cost.
+ *
+ * So the narrower of the two available answers is taken, and `ledgerAmountEpsilon` — "how small an
+ * amount counts as NOTHING", which is the same question this asks of a shortfall — is that answer,
+ * already written down for both connectors. It is 0.005 exactly in every two-decimal currency, so
+ * nothing about the ordinary Xero or QuickBooks document moves; it is 0.0005 in a Gulf dinar, where
+ * the fil that was being swallowed now refuses.
+ *
+ * AN UNSTATED CURRENCY TAKES THE STRICTEST BAND, which is `ledgerAmountEpsilon`'s documented
+ * direction and the right one here for the same reason: too large a band hides an omission behind a
+ * clear. This is NOT `ledgerMatchEpsilon`, whose null arm deliberately widens — that rule's danger is
+ * failing to RECOGNISE our own payment, and this one's is failing to notice a missing one.
+ */
+function completenessBand(currency: string | null): Decimal {
+  return ledgerAmountEpsilon(currency)
+}
+
+/**
+ * o3d-obyd — A WIRE FIGURE, AND WHICH OF THE TWO KINDS OF NOTHING IT IS WHEN IT IS NOT ONE.
+ *
+ * `null` used to be the whole answer here and it was answering two different questions at once: the
+ * ledger stated NO figure, and the ledger stated a figure THIS CODE COULD NOT READ. The completeness
+ * checks below skip on the first — correctly, an omitted total is nothing to compare against — and
+ * they were therefore skipping on the second too, which is the defect (see the header on
+ * `completenessCannotRun`). So the reading is a triple, and the two nothings are told apart:
+ *
+ *   `{ value: Decimal }`   the ledger stated this figure.
+ *   `{ value: null, unreadable: null }`   the ledger stated nothing here — the field is absent.
+ *   `{ value: null, unreadable: <text> }`   the ledger stated something that is not a decimal
+ *                                            amount. Naming it is what makes the refusal below
+ *                                            actionable rather than mysterious.
+ *
+ * WHAT COUNTS AS STATED. A finite JSON number, or TEXT that `decodeLedgerAmountText` — the very
+ * function the QuickBooks poller's own `parseLedgerAmount` reading is built out of — admits.
+ * QuickBooks serialises `TotalAmt` and `Balance` as strings (o3d-psrx r10, which moved the poller and
+ * left this module behind), so a string here is the ordinary case and not an exotic one.
+ *
+ * DELIBERATELY NOT `readLedgerStatedAmount` ITSELF. That reader additionally refuses a figure finer
+ * than its currency or above the magnitude bound, and those refusals belong to a decision that
+ * WITHHOLDS a payment. The question these checks ask is "does the ledger's own total agree with the
+ * collection it sent me?", and its answer must not change because a figure was too finely stated to
+ * compare — a KWD `AmountPaid` of one fil is precisely the figure the whole o3d-r948 band exists to
+ * measure, and refusing to read it would put the check back where it started. So the DECODE is
+ * shared and the JUDGEMENT is not, which is the split `decodeLedgerAmountText` is documented for.
+ * What the exact reading buys the arithmetic is unchanged: each figure is taken at its own exact
+ * decimal value and added without rounding, so the sum contributes no error on top of the terms.
+ *
+ * o3d-mm51 (Codex HIGH 1) -- AND THE HALF OF THAT JUDGEMENT WHICH IS NOT A JUDGEMENT AT ALL.
+ *
+ * The paragraph above splits DECODE from JUDGEMENT correctly and then excludes
+ * `readLedgerStatedAmount`'s two extra rules TOGETHER, as though the judgement were one thing. It is
+ * two, their premises differ, and only one of them was rightly excluded:
+ *
+ *   THE SCALE RULE -- "is this figure quantized to its currency's minor unit?" -- STAYS EXCLUDED, for
+ *   exactly the reason given above. It asks whether a figure may be TRUSTED, and this check must read
+ *   a figure stated more finely than the document's own currency: a KWD `AmountPaid` of one fil, or a
+ *   GBP `AmountCredited` of `0.001`, is precisely the shortfall `completenessBand` exists to measure,
+ *   and refusing to read it puts the check back where o3d-r948 found it.
+ *
+ *   THE MAGNITUDE RULE -- "can a double even hold two figures this large one minor unit apart?" -- IS
+ *   INHERITED. That is not a question about the figure at all. It is the statement that
+ *   `Response.json()` has ALREADY destroyed the token and that no test applied to the double
+ *   afterwards can see the loss (see `ledgerAmountMagnitudeBound`), and its premise -- the evidence is
+ *   gone -- holds for EVERY reader of a decoded JSON number, including one that withholds nothing.
+ *   Codex's pair is the demonstration: GBP `TotalAmt 70368744177664.02` with `Balance
+ *   70368744177664.01` is ONE double twice over, `TotalAmt - Balance` is an exact zero, and the probe
+ *   answered `ok: true` over an EMPTY record list -- a real one-penny settlement read as no
+ *   settlement, which `classifyLedgerSettlement` reads as `clear`, and `clear` authorises a SECOND
+ *   payment.
+ *
+ * AND IT IS THE DIFFERENCE BOUND, NOT THE AMOUNT ONE. `ledgerAmountMagnitudeBound` guarantees that
+ * ONE WHOLE MINOR UNIT survives the decode; every decision these figures feed turns on HALF of one,
+ * because `completenessBand` is `ledgerAmountEpsilon`. That is the same gap o3d-psrx r16 derived
+ * `ledgerDifferenceMagnitudeBound` for, and it is measured rather than argued: in GBP at 2^45 --
+ * BELOW the amount bound -- `35184372088832.0117` and `35184372088832.0040` are 0.0077 apart, which
+ * is above the band, and they are one double. So the halved bound is REUSED here rather than
+ * re-derived, and it applies to every figure this reader answers, because there is no figure here
+ * that is read alone: `Total - RemainingCredit`, `AmountPaid` against its collection, `Total -
+ * AmountDue`, `TotalAmt - Balance`, and every `shortBy` and `statesAnything` besides, are all decided
+ * at one half of a minor unit.
+ *
+ * THE STRING ARM TAKES NO BOUND, which is o3d-psrx r15 and is deliberately unchanged. A string still
+ * carries its own digits, so nothing was destroyed and there is nothing for a size rule to stand in
+ * for. That is also why this does not undo o3d-obyd: QuickBooks states `TotalAmt` and `Balance` as
+ * TEXT, and text is read exactly as it was.
+ *
+ * A REFUSED NUMBER IS UNREADABLE, NOT ABSENT. It is a figure the ledger STATED, so it takes the
+ * direction the triple exists for -- `completenessCannotRun` refuses the probe rather than excusing
+ * the check that would have used it.
+ */
+type WireAmount = { value: Decimal | null; unreadable: string | null }
+
+function wireAmount(value: unknown, currency: string | null): WireAmount {
+  // The ledger stated nothing. Not a refusal: an omitted collection or total is a shape both ledgers
+  // send routinely, and the checks below already treat "no figure to compare against" as no check.
+  if (value === undefined || value === null) return { value: null, unreadable: null }
+  if (typeof value === 'number') {
+    if (!Number.isFinite(value)) return { value: null, unreadable: String(value) }
+    // o3d-mm51: the token is already gone, so the only question left is one about its SIZE. At or
+    // above this bound the decode can no longer keep two figures HALF a minor unit apart, which is
+    // the granularity every check below decides at, so the number is refused rather than read.
+    if (Math.abs(value) >= ledgerDifferenceMagnitudeBound(currency)) {
+      return { value: null, unreadable: String(value) }
+    }
+    return { value: toDecimal(value), unreadable: null }
+  }
+  if (typeof value === 'string') {
+    const decoded = decodeLedgerAmountText(value)
+    if (decoded !== null) return { value: decoded, unreadable: null }
+    // `''` is reported as a blank rather than as an empty quotation, so the sentence still names
+    // something. It is NOT read as absent: a field that is present and empty is a field whose figure
+    // this code cannot account for, and the fail-closed direction is the whole point of the triple.
+    return { value: null, unreadable: value.trim() === '' ? '(blank)' : value.trim() }
+  }
+  return { value: null, unreadable: typeof value }
+}
+
+/**
+ * The same reading, for the COLLECTION terms, where the two nothings already fail the same way.
+ *
+ * An allocation, payment or applied amount that is absent and one that is unreadable both make their
+ * `sumExact` null, and a null sum is already refused everywhere it can explain anything — so these
+ * terms need no triple. The DOCUMENT's own totals do, because a null there decided whether the check
+ * ran at all.
+ */
+function wireDecimal(value: unknown, currency: string | null): Decimal | null {
+  return wireAmount(value, currency).value
+}
+
+/**
+ * o3d-obyd — A COMPLETENESS CHECK THAT CANNOT BE RUN MUST NOT READ AS ONE THAT PASSED.
+ *
+ * THE DEFECT. Every completeness cross-check in this file is guarded by `figure !== null`, and every
+ * figure came from a reader that answered `null` to a numeric STRING. QuickBooks sends `TotalAmt` and
+ * `Balance` as strings. So on the ordinary QuickBooks bill the guard was false, the check did not
+ * run, control fell through to `return { ok: true, records }` — and with nothing uncovered linked,
+ * `records` is EMPTY. `classifyLedgerSettlement` reads an ok probe with an empty record list as
+ * `clear`, `clear` is what authorises a money post, and the money post is a SECOND payment against a
+ * bill QuickBooks is reporting as fully settled. The refusal was being spent as permission.
+ *
+ * Reading the string (above) removes the reachable cause. This removes the SHAPE, which is the part
+ * that can come back: a figure the ledger stated and this code cannot read now REFUSES the probe
+ * instead of quietly excusing the check that would have used it. That is the direction every other
+ * unreadable thing in this module already takes — `statedAmount` withholds, a null `explained`
+ * refuses, an unclassified link type refuses — and the one place it was inverted is the one place a
+ * `clear` could be built out of not having looked.
+ *
+ * AN ABSENT FIELD IS STILL NOT A REFUSAL. "Xero omitted `Total` and `AmountDue`" is a response shape
+ * this module already has a documented fallback for, and turning it into a refusal would fail the
+ * ordinary unsettled document rather than the malformed one. The rule is about what the ledger SAID,
+ * not about what it left out: it is exactly the distinction `statedAmount` has always drawn between
+ * `amount: null` and `unreadableAmount`, now drawn on the document's own figures too.
+ */
+function completenessCannotRun(figures: Array<readonly [string, WireAmount]>): string | null {
+  for (const [name, reading] of figures) {
+    if (reading.unreadable !== null) return `${name} ${reading.unreadable}`
+  }
+  return null
+}
+
+/** Does the ledger claim anything at all here — more than one band above zero? */
+function statesAnything(value: Decimal, currency: string | null): boolean {
+  return compareDecimal(value, completenessBand(currency)) > 0
+}
+
+/** Is `stated` more than one band above what `accounted` explains? Exact on both operands. */
+function shortBy(stated: Decimal, accounted: Decimal, currency: string | null): boolean {
+  return compareDecimal(subtractMoney(stated, accounted), completenessBand(currency)) > 0
+}
+
+/**
+ * o3d-zo4j — THE OTHER DIRECTION OF THE SAME COMPARISON, ON THE SAME BAND.
+ *
+ * `shortBy` asks whether the certifying figure is bigger than the collection it certifies; this asks
+ * whether the COLLECTION is bigger than the figure. It is literally `shortBy` with the operands
+ * swapped, and it is written that way ON PURPOSE: the band is `completenessBand` because it is the
+ * SAME comparison, and reusing the function is the only spelling that cannot drift from it. An excess
+ * WITHIN the band is two exact decimals agreeing to the document's own minor unit — noise, which is
+ * the whole reason the shortfall direction is not a bare `<` either.
+ */
+function exceeds(accounted: Decimal, stated: Decimal, currency: string | null): boolean {
+  return shortBy(accounted, stated, currency)
+}
+
+/**
+ * o3d-nk5n — AN EMPTY RECORD LIST IS A POSITIVE CLAIM ABOUT MONEY, SO IT NEEDS A FIGURE BEHIND IT.
+ *
+ * THE RULE, IN ONE PLACE, FOR BOTH CONNECTORS AND ALL THREE DOCUMENT ARMS.
+ *
+ * `{ ok: true, records: [] }` is not "I could not tell". `classifyLedgerSettlement` reads it as
+ * `clear`, and `clear` is what AUTHORISES a money post — so the empty answer asserts "nothing has
+ * settled this document", which is the strongest claim this probe can make and the one that spends a
+ * second payment when it is wrong. Every completeness cross-check in this file is guarded on a figure
+ * being present, so a response that states NO usable figure runs no check at all and falls through to
+ * that assertion having looked at nothing.
+ *
+ * THE ASYMMETRY IS THE WHOLE POINT, AND IT IS BETWEEN TWO KINDS OF EMPTY:
+ *
+ *   PROVED EMPTY     the document states the figures its own settlement arithmetic is made of, and
+ *                    that arithmetic comes out at nothing. An unpaid Xero invoice states `Total` and
+ *                    `AmountDue` EQUAL, so `Total - AmountDue` is exactly zero: the ledger has said,
+ *                    in its own numbers, that nothing has come off this document. The ordinary first
+ *                    payment is this shape, and it still posts.
+ *   ASSUMED EMPTY    the document states none of them. `settled` is null, no check ran, and the empty
+ *                    record list is a conclusion drawn from having nothing to read. It refuses.
+ *
+ * This is the QuickBooks arm's rule, not a second spelling of it: `probeQuickBooksSettlement` has
+ * required exactly this since o3d-mm51 — emptiness PROVED by two stated figures rather than assumed
+ * from two missing ones — and the function is shared so the two can never drift. What each arm passes
+ * as `settled` is its own ledger's account of how much has come off the document by ANY means:
+ * `Total - AmountDue` (or the `AmountPaid + AmountCredited` fallback) on a Xero invoice,
+ * `Total - RemainingCredit` on a Xero credit note, `TotalAmt - Balance` on a QuickBooks document. In
+ * every case it is null exactly when the ledger stated too little for the figure to be computed.
+ *
+ * A NON-EMPTY RECORD LIST STILL ANSWERS — AND o3d-obyd r31 IS WHAT "ANSWERS" MEANS. This paragraph
+ * used to say records are evidence in their own right and stop there, and Codex found the half of
+ * that sentence which is false. It is TRUE OF A MATCH and FALSE OF A NON-MATCH. A record that matches
+ * the attempt proves the attempt settled, whatever else the response left out. A record that does not
+ * match is a statement about ONE OTHER settlement and says nothing about whether the attempted one is
+ * also in the collection — so a truncated response that omits the document figures, returns one
+ * unrelated settlement and omits ours cleared all three arms. The list is therefore no longer
+ * reported as a bare answer: it is reported WITH whether it is proved complete, and the classifier
+ * spends that on the non-match alone (see `LedgerSettlementProbe.provedComplete`).
+ *
+ * AND AN UNREADABLE FIGURE IS ALREADY HANDLED ELSEWHERE — `completenessCannotRun` refuses before this
+ * is reached. What is left here is ABSENCE, which correctly skips arithmetic it cannot do and must
+ * not also be allowed to contribute a conclusion.
+ *
+ * o3d-zo4j — AND THE FIGURE IS NOT PROOF OF A COLLECTION THAT CONTRADICTS IT.
+ *
+ * THE DEFECT. `provedComplete` was `settled !== null`: the figure being STATED was taken as the
+ * figure being BORNE OUT. Every check above it rejects a SHORTFALL — the collection explaining less
+ * than the figure — and that is one of the two ways a collection can fail to agree with the figure
+ * certifying it. The other is an EXCESS, and it went unmeasured, so a response could state a figure
+ * its own collection refutes and still have that figure believed. Codex's shape and the one filed on
+ * this issue are the same: a credit note stating `Total 40 / RemainingCredit 40` — a PROVED ZERO,
+ * `statesAnything` false, the shortfall check passing over nothing — whose `Allocations` show 40
+ * already used. The note says none of the credit has been applied and simultaneously shows all of it
+ * applied. The zero was believed, an allocation to some OTHER invoice left this bill's filtered record
+ * list empty, and `classifyLedgerSettlement` read that as `clear` — which authorises a second
+ * allocation of a credit that is already spent.
+ *
+ * WHY IT WITHHOLDS RATHER THAN REFUSES, WHICH IS THE WHOLE SHAPE OF THE FIX. Refusing would require
+ * knowing whether THIS excess is legitimate — is a listed-but-reversed payment, or a draft credit
+ * note, a real overrun? — and that is a question about live ledger shapes nobody here has settled. It
+ * does not have to be answered. A collection that exceeds the figure certifying it has CONTRADICTED
+ * that figure whatever the reason, and the only thing this code needs from that is to stop treating
+ * the figure as PROOF. So `provedComplete` becomes false and nothing else changes: the effect is
+ * confined to `clear` -> `unknown` on a NON-match, a match still yields `present` through the passes
+ * that run before the classifier's terminal gate, and a shortfall still escalates to `ok: false`
+ * exactly as it does today. The ordinary first payment — `Total 40, AmountDue 40, Payments: []`,
+ * `TotalAmt "1200.00"` with `Balance "1200.00"` — has an excess of exactly zero and still posts.
+ *
+ * THE BAND IS THE SHORTFALL'S BAND, not a bare `>`. See `exceeds`, which IS `shortBy` with its
+ * operands swapped so that the two directions cannot come to be measured differently. Both operands
+ * are exact decimals read from what the ledger stated, so a real document agrees to its own minor
+ * unit and only a genuine overrun clears the band.
+ *
+ * WHY IT IS ONE FUNCTION THAT BUILDS THE WHOLE ANSWER. `emptyAnswerIsUnproved` was a PREDICATE each
+ * arm called before its own `return { ok: true, records }`, so the two halves of the rule — refuse
+ * the figureless empty answer, and mark the figureless non-empty one unproved — could be applied in
+ * one arm and forgotten in another. They cannot drift now: there is no way to build a successful
+ * answer without handing over the document's own settled figure, and what that figure is null-or-not
+ * decides both halves in one place.
+ */
+function settlementAnswer(
+  /** The ledger's OWN account of how much has come off this document, or null when it stated too
+   * little to compute one. This is the sole evidence of completeness — never the records. */
+  settled: Decimal | null,
+  /**
+   * o3d-zo4j — AND WHETHER THE COLLECTION THAT FIGURE CERTIFIES FAILS TO BEAR IT OUT.
+   *
+   * TWO WAYS, and both mean the figure was not established against the collection: the collection
+   * EXCEEDS it (see `exceeds`), or the collection could not be measured at all because one of its
+   * terms is unreadable. The second is not a separate rule — a comparison that did not happen is not
+   * a comparison that agreed, which is the same sentence `completenessCannotRun` carries about the
+   * document's own figures.
+   *
+   * Required rather than optional, and for the same reason `provedComplete` is: a permissive DEFAULT
+   * reached by an arm that forgot to compute it is how every fail-open in this module arrived. An arm
+   * that does not say whether its collection bears out its figure does not compile.
+   */
+  collectionDoesNotBearOut: boolean,
+  records: LedgerSettlementRecord[],
+  /** What to say when the document states no figure AND this probe read no settlement of it. */
+  figurelessAndEmpty: string,
+): LedgerSettlementProbe {
+  if (settled === null && records.length === 0) return { ok: false, reason: figurelessAndEmpty }
+  return { ok: true, records, provedComplete: settled !== null && !collectionDoesNotBearOut }
+}
+
+/** Sum exact readings, or null the moment one of them is unreadable. */
+function sumExact(values: Array<Decimal | null>, seed: Decimal | null = toDecimal(0)): Decimal | null {
+  return values.reduce<Decimal | null>(
+    (sum, value) => (sum === null || value === null ? null : sum.add(value)),
+    seed,
+  )
+}
+
+/**
+ * o3d-78rq — A SETTLEMENT'S AMOUNT, AS THE FIGURE THE LEDGER STATED OR NOT AT ALL.
+ *
+ * The record list this builds is the ledger operand of `classifyLedgerSettlement`, which decides
+ * whether a money row that has already been attempted may be sent again. It used to be `num()` — the
+ * wire double, unbounded and unquantized — measured against our payload's double with `-`, so at a
+ * magnitude where the double spacing exceeds the match band the comparison decided nothing the band
+ * said, in the direction that posts a SECOND payment.
+ *
+ * `readLedgerStatedAmount` is the rule `parseLedgerAmount` already applies to every other ledger
+ * amount either connector reads: a magnitude bound, and the currency's own minor-unit scale. What it
+ * returns is a Decimal that is PROVABLY the figure the ledger stated. What it refuses is a figure this
+ * code cannot say that about — and a refusal here WITHHOLDS the payment rather than clearing it,
+ * which is the direction this rule's asymmetry demands.
+ *
+ * THIS READER IS DELIBERATELY NOT USED BY THE COMPLETENESS ARITHMETIC BELOW, AND o3d-r948 DID NOT
+ * CHANGE THAT. The cross-check asks a different question — "does Xero's own total of what settles this
+ * document agree with the collection it sent me?" — and its answer must not change because a figure
+ * was too finely stated to compare. A refusal there would SKIP the check, which is the lenient
+ * direction and the opposite of what that rule's asymmetry demands. So the completeness terms go
+ * through `wireDecimal`, which reads every stated number at its own exact decimal value and refuses
+ * nothing; what o3d-r948 changed is the ARITHMETIC (exact, not `+`) and the BAND (the document's own
+ * minor unit, not a flat half-penny). See `completenessBand`.
+ */
+function statedAmount(raw: unknown, currency: string | null): Pick<LedgerSettlementRecord, 'amount' | 'unreadableAmount'> {
+  const amount = readLedgerStatedAmount(raw, currency)
+  if (amount !== null) return { amount }
+  // The ledger stating NOTHING and the ledger stating something unreadable are both `null` and both
+  // withhold; only the second can name a figure, and naming it is what stops an operator reading the
+  // hold as "this document is unpaid". A non-number, non-string is reported by its type — there is no
+  // figure to quote.
+  if (raw === undefined || raw === null) return { amount: null }
+  return {
+    amount: null,
+    unreadableAmount: typeof raw === 'number' || typeof raw === 'string' ? String(raw) : typeof raw,
+  }
 }
 
 /**
@@ -64,10 +458,125 @@ export function normaliseXeroSettlementDate(value: unknown): string | null {
  */
 type XeroAppliedCollection = Array<{ AppliedAmount?: number }>
 
+/**
+ * o3d-jfhi — AND THE INVOICE ARM, CHECKED AGAINST THE CONTRACT RATHER THAN AGAINST WHAT WAS RECALLED.
+ *
+ * The invoice identity was corrected earlier on this branch by INFERENCE from a single missing term.
+ * This is the same identity re-derived from the same published schema the credit-note block cites,
+ * and the outcome is recorded whether or not it changed anything — a re-read that finds nothing is
+ * only worth having if the FINDING NOTHING is written down.
+ *
+ * SOURCE: XeroAPI/Xero-OpenAPI `xero_accounting.yaml`, `components.schemas.Invoice`.
+ *
+ *   AmountDue        "Amount remaining to be paid on invoice"
+ *   AmountPaid       "Sum of payments received for invoice"
+ *   AmountCredited   "Sum of all credit notes, over-payments and pre-payments applied to invoice"
+ *   CISDeduction     "CIS deduction for UK contractors"
+ *   Total            the face value; Payments / Prepayments / Overpayments / CreditNotes the four
+ *                    collections this arm reads.
+ *
+ * WHAT THE RE-READ CONFIRMED. `AmountCredited`'s own description names EXACTLY the three collections
+ * `applied` sums — credit notes, overpayments, prepayments — so pair 3's composition is the
+ * contract's, not an inference from field names. The four-term identity
+ * `AmountDue = Total - CISDeduction - AmountPaid - AmountCredited` is complete against the documented
+ * money fields.
+ *
+ * WHAT THE RE-READ ADDED, AND IT IS THE PART INFERENCE WOULD NOT HAVE REACHED — THREE DOCUMENTED
+ * FIELDS THAT ARE NOT TERMS, AND WHY:
+ *
+ *   TotalDiscount    "Total of discounts applied on the invoice line items". Inside `SubTotal`, hence
+ *                    inside `Total`. Subtracting it would take the discount off twice.
+ *   RoundingAmount   "An optional rounding adjustment added to SubTotal + TotalTax to give Total
+ *                    (i.e. Total = SubTotal + TotalTax + RoundingAmount)". The contract states the
+ *                    arithmetic outright: it is a component OF `Total`, not a reduction of
+ *                    `AmountDue`. It is also documented as returned only on POST/PUT and on GET BY
+ *                    ID — which is the call this arm makes — so it will appear here, and the reason
+ *                    it changes nothing is worth having written down before someone meets it.
+ *   EnteredTotal     the pre-rounding total; "once the invoice is no longer DRAFT this reflects
+ *                    Total". Not a second settlement figure.
+ *   CISRate          a rate, not an amount.
+ *
+ * AND THE ANSWER TO "CAN `Payments` ON AN INVOICE CARRY SOMETHING THE IDENTITY DOES NOT ACCOUNT FOR?"
+ * — YES, ONE THING, AND IT IS ALREADY HANDLED IN THE RIGHT DIRECTION.
+ *
+ * The `Payment` schema documents `Status` as an enum of `AUTHORISED` and `DELETED`. `AmountPaid` is
+ * "Sum of payments RECEIVED", and a deleted payment has not been received. So IF a GET returns a
+ * `DELETED` payment inside `Payments` — which the contract neither promises nor rules out — the
+ * collection sums HIGHER than `AmountPaid`, and that is pair 2's excess: `paymentsExceedTotal`
+ * withholds proof and the classifier answers `unknown` rather than `clear`. The failure is already
+ * in the visible direction, so nothing is changed for it. What is deliberately NOT done is FILTERING
+ * on `Status`: excluding a payment Xero did in fact count would make `seen` short of `AmountPaid` and
+ * hard-refuse an ordinary invoice, which is the irreversible-workflow direction and a guess besides.
+ *
+ * AND THE SAME FIELD ON A CREDIT NOTE *IS* FILTERED, WHICH IS THIS RULE READ AT THE OPPOSITE SIGN
+ * RATHER THAN A CONTRADICTION OF IT (o3d-acctmoney r2, Codex HIGH). Read the two together, because
+ * the asymmetry is load-bearing and neither half is decidable from the field alone:
+ *
+ *   HERE, ON THE INVOICE, `Payments` is an ADDED term in both places it appears — it sums into
+ *   `seen`, measured against `AmountPaid`, and into `explained`, measured against `settled`. Counting
+ *   a reversed payment makes the COLLECTION exceed the figure that certifies it, which is `exceeds`:
+ *   `provedComplete: false`, `unknown`, never `clear`. The mistake is already visible, so nothing is
+ *   filtered and an ordinary invoice is never hard-refused.
+ *
+ *   ON THE CREDIT NOTE, `SUM(Payments.Amount)` is SUBTRACTED from the note's allocation usage.
+ *   Counting a reversed payment UNDERSTATES how much of the credit has been allocated, and an
+ *   understatement that reaches zero over an EMPTY `Allocations` collection is a proved-empty
+ *   allocation list forged out of an incomplete one — the exact false `clear` this probe exists to
+ *   prevent. So there the DELETED payment is excluded at the source. See
+ *   `creditNoteRefundInclusion`, which carries the full argument.
+ *
+ * Filter where the term is subtracted; do not filter where it is added. The rule is about the SIGN,
+ * not about the field — and it was written for one sign and applied to both once already.
+ *
+ * THE CENSUS, SO THE NEXT RULE IS STATED FOR THE SIGN IT IS APPLIED TO. This is twice now that a rule
+ * correct in one arm was wrong in another because the term changes sign between them, so every term
+ * of both identities is listed here with its sign and what stands behind it. Measured, not argued:
+ * each SUBTRACTED row was driven over an EMPTY collection and answers `clear`; each ADDED row was
+ * over-counted and answers `unknown`.
+ *
+ *   SUBTRACTED — an over-subtraction UNDERSTATES the usage, reaches a proved zero over an empty
+ *   collection, and CLEARS. Nothing catches it there; `exceeds` needs a non-empty collection.
+ *     credit note  RemainingCredit   document figure, no per-member flag. Believed as stated.
+ *     credit note  CISDeduction      document figure, no per-member flag. Absent = 0, unreadable
+ *                                    refuses. NOTE: this arm has no second derivation of its usage,
+ *                                    so unlike the invoice's CIS term nothing cross-checks it when
+ *                                    the allocation collection is empty (o3d-acctmoney r2 follow-up).
+ *     credit note  SUM(Payments)     THE ONE TERM WITH A CONTRACT-ENUMERATED MEMBER FLAG —
+ *                                    `Payment.Status` — and it is now read. This block's subject.
+ *     invoice      AmountDue         document figure, no per-member flag. Believed as stated.
+ *     invoice      CISDeduction      document figure; cross-checked TWO-SIDED against
+ *                                    `AmountPaid + AmountCredited`, which catches an over-subtraction
+ *                                    whenever that fallback pair is stated (it is, on every real GET).
+ *     QuickBooks   Balance           document figure, no per-member flag. Believed as stated.
+ *
+ *   ADDED or COMPARED — an over-count makes the collection EXCEED the figure certifying it, which
+ *   withholds proof: `unknown`, never `clear`. No member filter is needed on any of them, and adding
+ *   one would hard-refuse an ordinary document.
+ *     credit note  Total, SUM(Allocations)
+ *     invoice      Total, AmountPaid, AmountCredited, SUM(Payments), and the three applied
+ *                  collections (`CreditNotes` / `Prepayments` / `Overpayments`)
+ *     QuickBooks   TotalAmt, SUM(applied linked settlements)
+ *
+ * So: exactly one term in either identity carries a member-level flag that decides whether the member
+ * is netted at all, and a rule about excluding members belongs only to it. Every other term is a
+ * document-level figure with nothing to exclude, and "believe what the ledger stated, refuse what it
+ * stated unreadably, read absence as zero" is one rule that holds at both signs.
+ *
+ * The other thing that collection carries is `BankAmount` — "The amount of the payment in the
+ * currency of the bank account". This arm reads `Amount`, which is stated in the document's own
+ * currency, and that is the only one comparable with `AmountPaid` and `Total`. Named because the two
+ * fields are adjacent, similarly spelled, and differ silently by an FX rate.
+ */
 /** The document a settlement probe reads, per money-moving type. */
 type XeroPaymentsResponse = {
   Invoices?: Array<{
     InvoiceID?: string
+    /**
+     * The currency every amount on this document is stated in (o3d-78rq). It sizes the minor-unit
+     * scale rule and the magnitude bound the settlement amounts are admitted by; absent, both
+     * resolve through `ledgerMinorUnits(null)` exactly as they do everywhere else in this repository.
+     */
+    CurrencyCode?: string
     /**
      * Xero's own total of the payments applied to this document. Read as a CROSS-CHECK on the
      * collection below, never as a record in its own right — see the completeness note in
@@ -84,19 +593,138 @@ type XeroPaymentsResponse = {
     /** The document's face value and what is still owed on it — the shape-independent cross-check. */
     Total?: number
     AmountDue?: number
+    /**
+     * o3d-acctmoney (Codex HIGH) — THE THIRD TERM OF `AmountDue`, AND WITHOUT IT THE IDENTITY IS
+     * WRONG ON EVERY UK CONSTRUCTION INVOICE.
+     *
+     * Xero's own arithmetic is `AmountDue = Total - CISDeduction - AmountPaid - AmountCredited`,
+     * not the three-term version the checks below were written against. `CISDeduction` is the
+     * amount a UK contractor withholds from a subcontractor under the Construction Industry
+     * Scheme and pays to HMRC instead of to the subcontractor. It comes off `AmountDue` and it is
+     * in NEITHER `AmountPaid` NOR `AmountCredited` NOR any collection this probe reads — there is
+     * no payment, no credit note, no prepayment and no overpayment behind it.
+     *
+     * ABSENT IS THE ORDINARY CASE and reads as ZERO: every invoice outside the scheme states no
+     * deduction, and it is a subtraction rather than a check, so nothing is skipped by its
+     * absence. An UNREADABLE one is a different thing entirely and refuses through
+     * `completenessCannotRun`, exactly as the four figures above it do — it is a figure Xero
+     * STATED that IMS cannot account for, and every identity below is built on it.
+     *
+     * `number | string` for the same reason `TotalAmt` below carries both: the decode is shared
+     * with every other money figure this file reads, so a numeric string is admitted here or the
+     * discipline is not the same discipline.
+     */
+    CISDeduction?: number | string
     Payments?: Array<{ PaymentID?: string; Date?: string; Amount?: number; Reference?: string }>
     CreditNotes?: XeroAppliedCollection
     Prepayments?: XeroAppliedCollection
     Overpayments?: XeroAppliedCollection
   }>
 }
+/**
+ * o3d-jfhi — THE CREDIT NOTE, AS THE PUBLISHED CONTRACT DESCRIBES IT, WITH EVERY TERM'S SOURCE NAMED.
+ *
+ * WHY THE SOURCE IS WRITTEN DOWN AND NOT JUST THE ARITHMETIC. Two identities on this branch were
+ * written from a PARTIAL reading of what a Xero document carries — the invoice's, which was missing
+ * `CISDeduction`, and this one, which was missing `CISDeduction` AND `Payments` — and each was then
+ * defended with careful arithmetic ABOUT THE TERMS IT KNEW. Careful arithmetic over an incomplete
+ * term list is exactly what a missing term hides behind: the sums balance, the reasoning reads as
+ * rigorous, and the gap is invisible because nothing in the file ever said where the term list came
+ * from. So the list is now sourced. A term missing from the citation below is a GAP anyone can see by
+ * comparing this block against the schema; a term missing from the arithmetic alone can only be found
+ * as a contradiction, which is how both of these were found and is two rounds too late.
+ *
+ * AND THE SOURCE IS DOCUMENTATION, NOT A CALL. The previous round declined to settle this and said
+ * so, on the grounds that it "cannot read without a live CIS tenant" and that API calls are
+ * forbidden. The second half is true and the first was wrong: the published `CreditNote` schema
+ * STATES which fields a credit note carries, and reading a vendor's schema is not exercising a
+ * vendor's endpoint. The citations below are from that schema.
+ *
+ * SOURCE: XeroAPI/Xero-OpenAPI `xero_accounting.yaml`, `components.schemas.CreditNote` — the
+ * machine-readable form of https://developer.xero.com/documentation/api/accounting/creditnotes.
+ *
+ *   Total            "The total of the Credit Note(subtotal + total tax)"       number, x-is-money
+ *   RemainingCredit  "The remaining credit balance on the Credit Note"          number, x-is-money
+ *   CISDeduction     "CIS deduction for UK contractors"                         number, x-is-money,
+ *                                                                              readOnly
+ *   Allocations      "See Allocations" -> array of `Allocation`, each carrying an `Amount` and the
+ *                    `Invoice` it was applied to
+ *   Payments         "See Payments" -> array of `Payment`, each carrying an `Amount`, a `Status`
+ *                    (enumerated `AUTHORISED` / `DELETED`) and a `PaymentType` (whose
+ *                    `ARCREDITPAYMENT` / `APCREDITPAYMENT` spellings name a refund OF a credit note)
+ *
+ * THE FIELDS THAT ARE DOCUMENTED AND DELIBERATELY NOT TERMS, so that "not modelled" is a decision
+ * rather than another gap:
+ *
+ *   AppliedAmount    "The amount of applied to an invoice" — SINGULAR, one invoice's share, which is
+ *                    not the note's total usage and is the shape this file already reads under
+ *                    `XeroAppliedCollection` when a note appears INSIDE an invoice. The contract does
+ *                    not say what it means at the top level of a credit-note GET, so it is not used:
+ *                    a second derivation built on an ambiguous field would manufacture contradiction
+ *                    refusals out of the ambiguity, which is worse than having only one derivation.
+ *   CISRate          a RATE, not an amount. `CISDeduction` is the money.
+ *   SubTotal,        components of `Total` by the contract's own description of `Total`, so counting
+ *   TotalTax         them alongside it would double the face value.
+ *   Status, Type     not money. A DELETED or VOIDED note is a question about whether to allocate at
+ *                    all, which is not this probe's question and is not silently folded in here.
+ */
 type XeroCreditNoteResponse = {
   CreditNotes?: Array<{
     CreditNoteID?: string
+    /** o3d-78rq: as on an invoice — what the allocation amounts below are stated in. */
+    CurrencyCode?: string
     /** The credit's face value and what is left of it — how much of it has been allocated. */
     Total?: number
     RemainingCredit?: number
+    /**
+     * o3d-jfhi (Codex HIGH) — THE CREDIT NOTE CARRIES A CIS DEDUCTION TOO, AND THE LAST ROUND SAID
+     * IT COULD NOT KNOW THAT.
+     *
+     * It is the same field the invoice arm above already models, with the same contract description
+     * ("CIS deduction for UK contractors"), on the same schema. The previous round subtracted it on
+     * the invoice and declined to on the credit note, reasoning that nothing it could read said a
+     * credit note carries a deduction AT ALL. The schema says so, in the `CreditNote` definition,
+     * beside `RemainingCredit`.
+     *
+     * `number | string` for the reason the invoice's carries both: one decode for every money figure
+     * this file reads, or the magnitude discipline is not the same discipline.
+     */
+    CISDeduction?: number | string
     Allocations?: Array<{ Amount?: number; Date?: string; Invoice?: { InvoiceID?: string } }>
+    /**
+     * o3d-jfhi (Codex HIGH) — AND A REFUND IS A `Payment` ON THE CREDIT NOTE ITSELF.
+     *
+     * Xero records a refund of a credit note through the payments endpoint, and the `Payment`
+     * schema's own `PaymentType` enum carries the two spellings that exist for nothing else —
+     * `ARCREDITPAYMENT` and `APCREDITPAYMENT`. So a refunded credit note reduces `RemainingCredit`
+     * by money that appears in NEITHER `Allocations` nor any figure this arm was reading.
+     *
+     * `Amount` is the term, not `BankAmount`: the contract describes `BankAmount` as "the amount of
+     * the payment in the currency of the bank account", which is a DIFFERENT currency from the one
+     * `Total` and `RemainingCredit` are stated in whenever the note is not in the base currency.
+     * Summing it into this identity would be a silent cross-currency subtraction.
+     *
+     * o3d-acctmoney r2 (Codex HIGH) — AND `Status` AND `PaymentType` ARE MODELLED, BECAUSE ON THIS
+     * ARM THEY DECIDE WHETHER THE `Amount` IS A TERM AT ALL. The shared `Payment` schema enumerates
+     * `Status` as `AUTHORISED` / `DELETED`, and a DELETED payment has been reversed — Xero has put
+     * its money back into `RemainingCredit`, so it is not something `RemainingCredit` is net of.
+     * Subtracting it anyway understates the allocation usage, and an understatement that reaches
+     * zero over an empty `Allocations` collection is a false `clear`. `PaymentType` is modelled for
+     * the same decision from the other side: the identity's `Payments` term is refunds OF this note,
+     * and a payment of some other type is one whose relation to `RemainingCredit` this code does not
+     * know. Both are declared `string` rather than a union so that an UNRECOGNISED value is a value
+     * this code must refuse on rather than one the type system pretends cannot arrive — see
+     * `creditNoteRefundInclusion`.
+     *
+     * o3d-acctmoney r3 — BOTH ARE OPTIONAL BECAUSE THE PROJECTION MAY NOT CARRY THEM, AND THAT IS NOT
+     * A DETAIL THE ARM MAY SHRUG AT. The schema `$ref`s the full `Payment` here, so they MAY arrive;
+     * this repository's live-tenant scripts type the same nested element as `{ PaymentID, Amount }`,
+     * so they may not; nothing captured settles it. An absent `Status` therefore does NOT mean an
+     * authorised refund — it means the discriminator has to be fetched from `Payments/{id}` before
+     * the `Amount` beside it may be subtracted. `PaymentID` is what makes that possible, which is why
+     * it is modelled even though no arithmetic reads it.
+     */
+    Payments?: Array<{ PaymentID?: string; Amount?: number; Status?: string; PaymentType?: string }>
   }>
 }
 
@@ -109,11 +737,504 @@ type XeroCreditNoteResponse = {
  * nothing, so an `AmountCredited` it should have accounted for shows up as an unexplained
  * shortfall and refuses.
  */
-function sumApplied(collection: XeroAppliedCollection | undefined): number | null {
-  return (collection ?? []).reduce<number | null>(
-    (sum, entry) => (sum === null || num(entry.AppliedAmount) === null ? null : sum + (entry.AppliedAmount as number)),
-    0,
-  )
+function sumApplied(collection: XeroAppliedCollection | undefined, currency: string | null): Decimal | null {
+  // o3d-r948: exact, like every other term of the completeness arithmetic.
+  // o3d-mm51: and sized by the document's own currency, like every other term of it.
+  return sumExact((collection ?? []).map((entry) => wireDecimal(entry.AppliedAmount, currency)))
+}
+
+/**
+ * o3d-acctmoney r2 (Codex HIGH) — WHICH PAYMENTS ON A CREDIT NOTE ARE TERMS OF ITS IDENTITY.
+ *
+ * THE DEFECT. `SUM(Payments.Amount)` is SUBTRACTED from the credit note's allocation usage
+ * (`applied = Total - RemainingCredit - CISDeduction - SUM(Payments.Amount)`), and every payment in
+ * the collection was summed into it without inspecting `Payment.Status`. The shared `Payment` schema
+ * enumerates that field as `AUTHORISED` / `DELETED`, and DELETION REVERSES THE PAYMENT: Xero puts the
+ * money back into `RemainingCredit`, so a deleted refund is not one of the things `RemainingCredit`
+ * is net of and is not a term of this identity.
+ *
+ * Codex's shape, reproduced: `Total 400, RemainingCredit 300` — a real 100 allocated — with
+ * `Allocations` absent or stale-empty and a DELETED 100 in `Payments`. Counting the deleted refund
+ * gives `applied = 400 - 300 - 0 - 100 = 0` against `allocated = 0`; `statesAnything(0)` is false so
+ * no shortfall check runs, `exceeds(0, 0)` is false, and the probe answers `provedComplete: true`
+ * over an EMPTY record list — `clear`, which is what authorises allocating the missing 100 a SECOND
+ * time. The reversed payment forged a proved-empty allocation list out of the incomplete one being
+ * checked, which is the precise failure this probe exists to prevent.
+ *
+ * WHY THE STANDING SAFETY ARGUMENT DID NOT REACH IT is written out in the identity block in
+ * `probeXeroSettlement`: an over-subtraction is caught by the collection it over-subtracted past only
+ * when that collection has something in it, and here it comes back empty.
+ *
+ * WHY THE INVOICE ARM STILL DOES NOT FILTER on the same field of the same contract is written out on
+ * `XeroPaymentsResponse`: there `Payments` is an ADDED term, counting a deleted payment makes the
+ * collection EXCEED `AmountPaid`, and an excess withholds proof — so the mistake is already in the
+ * visible direction, while filtering would make `seen` short of an `AmountPaid` Xero did in fact
+ * count and hard-refuse an ordinary invoice. Same field, opposite sign, opposite consequence. The two
+ * paragraphs cite each other on purpose: the asymmetry is the reasoning, and a reader who finds only
+ * one half will "fix" the other into a defect.
+ *
+ * FAIL CLOSED ON WHAT THE CONTRACT DOES NOT ENUMERATE. A `Status` that is neither documented value,
+ * or a `PaymentType` that is neither of the two spellings naming a refund OF a credit note, is a
+ * payment whose relationship to `RemainingCredit` this code does not know. COUNTING it is an unbacked
+ * subtraction in the direction that forges a `clear`; DROPPING it is an unbacked exclusion. Both are
+ * guesses about money, so neither is made — the probe refuses and a human reads the response.
+ *
+ * AN UNSTATED FIELD IS NOT AN UNKNOWN ONE — AND THE ROUND THAT SAID SO MADE THIS GUARD INERT
+ * (o3d-acctmoney r3, Codex HIGH). The rule here was "an absent `Status` counts", justified by "Xero
+ * states neither field on the nested payment stubs a credit-note GET returns". THE TWO HALVES CANNOT
+ * BOTH BE TRUE: if Xero never states `Status` there, the DELETED branch never runs, a reversed refund
+ * and an authorised one are the SAME OBJECT on the wire, and both are subtracted — which is the
+ * defect this filter was added to close, now wearing the filter as a costume. A guard that reads as
+ * protection while being decoration is the thing the round before this one removed a guard FOR.
+ *
+ * WHAT THE SOURCES ACTUALLY SAY, since the premise was asserted and never checked:
+ *
+ *   THE PUBLISHED SCHEMA PERMITS BOTH FIELDS. `components.schemas.CreditNote.Payments` is
+ *   `items: $ref: '#/components/schemas/Payment'` — the FULL `Payment`, `Status` (AUTHORISED /
+ *   DELETED) and `PaymentType` included. A `$ref` is a NOMINAL type: it settles what may arrive and
+ *   says nothing about which members an endpoint in fact populates.
+ *   THIS REPO'S LIVE-TENANT MODELS OMIT BOTH. `scripts/audit-xero-live-contamination.ts` and
+ *   `scripts/remove-xero-live-e2e-footprint.ts` each type a nested credit-note payment as
+ *   `{ PaymentID, Amount }`, and both were written against the live tenant. The only nested-stub
+ *   claim in this tree with a live test behind it — the full-chain specs' "the invoice's own
+ *   Payments sub-resource omits the account" — also says the nested projection is NARROWER than
+ *   `Payment`.
+ *   NOTHING IN THIS REPOSITORY RECORDS AN ACTUAL RESPONSE. There is no captured `CreditNotes/{id}`
+ *   body anywhere in it, so no fixture can decide between them either, and a hand-written literal
+ *   asserting one shape would only be this paragraph again in a different file.
+ *   BUT `Payments/{id}` DOES STATE THEM. `audit-xero-live-contamination.ts` reads `Status` and
+ *   `PaymentType` off that endpoint against the live tenant, and Xero's own reversal is a POST of
+ *   `Status: 'DELETED'` to it — see `remove-xero-live-e2e-footprint.ts`.
+ *
+ * A SCHEMA THAT PERMITS A FIELD IS NOT AN ENDPOINT THAT RETURNS IT, so the sources DISAGREE and the
+ * disagreement cannot be settled from here. THAT IS NOT A GAP TO BE FILLED WITH A DEFAULT, because
+ * the two defaults are not each other's mirror:
+ *
+ *   COUNTING an unverified refund over-subtracts; an over-subtraction that reaches zero over an empty
+ *   `Allocations` collection is a false `clear`, which is a second payment and IRREVERSIBLE.
+ *   NOT COUNTING one overstates the usage; the note then refuses as a shortfall — visible and
+ *   recoverable, but on EVERY ordinary refunded credit note, which is the whole-class harm o3d-jfhi's
+ *   round removed at the most ordinary operation there is.
+ *
+ * SO THE DISCRIMINATOR IS FETCHED RATHER THAN GUESSED (`resolveCreditNoteRefunds`). When the stub
+ * does not state `Status`, this code asks `Payments/{PaymentID}` — the endpoint that does state it
+ * — and decides on THAT record, through this same function. When the stub states it, nothing is
+ * fetched, so a projection that turns out to be fully populated costs nothing at all. What that buys
+ * is the one outcome neither default can have: a reversed refund cannot forge a `clear`, AND an
+ * ordinary refunded credit note still authorises the balance it has left.
+ *
+ * FAIL CLOSED WHEN THE LOOKUP DOES NOT COMPLETE, and note what that costs. A transport failure
+ * refuses visibly and clears itself on the retry. The one non-transient case is a connection
+ * authorised without `accounting.payments` — PURCHASE_CREDIT_NOTE_ALLOCATION rides on the baseline
+ * grant and has never needed it — which arrives as Xero's own error inside the refusal sentence,
+ * which is how every other scope gap on this connector is surfaced and reconnected out of. It is NOT
+ * added to `SCOPE_BY_SYNC_TYPE`: that would block the whole sync type up front, including the notes
+ * with no refunds at all, trading a rare conditional refusal for an unconditional one.
+ *
+ * WHAT IS STILL DECIDED FROM THE STUB ALONE, and why it is a different question: a value Xero HAS
+ * stated and this code cannot account for. That is answered before any request — there is nothing
+ * to resolve when the ledger has already spoken and the answer is unreadable — and it is
+ * `wireAmount`'s distinction carried onto the enumerated fields.
+ */
+const XERO_PAYMENT_STATUS_AUTHORISED = 'AUTHORISED'
+const XERO_PAYMENT_STATUS_DELETED = 'DELETED'
+/** `Payment.PaymentType`: the two spellings that exist for a refund OF a credit note and nothing else. */
+const XERO_CREDIT_NOTE_REFUND_TYPES = new Set(['ARCREDITPAYMENT', 'APCREDITPAYMENT'])
+
+/**
+ * An ENUMERATED wire token, read the way `wireAmount` reads a money one: absent, a normalised token,
+ * or something the ledger stated that this code cannot read as one.
+ *
+ * Case is normalised because Xero states these upper-case and a differently-cased spelling of a
+ * DOCUMENTED value is the same value, not an unknown one. A non-string is reported by its type, and
+ * a present-but-blank field is reported as `(blank)` rather than as an empty quotation, so the
+ * refusal sentence still names something.
+ */
+function wireEnum(value: unknown): { token: string | null; unreadable: string | null } {
+  if (value === undefined || value === null) return { token: null, unreadable: null }
+  if (typeof value !== 'string') return { token: null, unreadable: typeof value }
+  const trimmed = value.trim()
+  if (trimmed === '') return { token: null, unreadable: '(blank)' }
+  return { token: trimmed.toUpperCase(), unreadable: null }
+}
+
+/**
+ * Is this payment RECORD a term of the identity above — and when this code cannot tell, WHY.
+ *
+ * The three answers are distinct on purpose. `counts: false` with a null `unaccountable` is the case
+ * this code positively knows is not a term: an explicitly DELETED payment, whose money Xero has
+ * already returned to `RemainingCredit`. A non-null `unaccountable` is a status or type the contract
+ * does not enumerate, and it refuses rather than being silently counted in either direction.
+ * `counts: true` is an authorised refund.
+ *
+ * AND THE FOURTH ANSWER IS NOT THIS FUNCTION'S TO GIVE (o3d-acctmoney r3). A record that states NO
+ * `Status` also returns `counts: true` here, and that is deliberately NOT the final word on it: the
+ * caller resolves such a payment through `Payments/{id}` first and asks this same question of the
+ * record that comes back. The reason is written out on the constants above — an unstated `Status`
+ * counted as authorised is what made the DELETED branch unreachable on the very projection this
+ * filter exists to read. So the rule lives in one place and is applied to whichever record actually
+ * states something; what changed is WHICH RECORD is allowed to be silent.
+ *
+ * It takes an `unknown`-ish structural shape rather than a named response type because it is asked of
+ * both: the nested stub inside a credit note, and the full payment `Payments/{id}` returns.
+ */
+function creditNoteRefundInclusion(
+  payment: { Status?: string; PaymentType?: string },
+): { counts: boolean; unaccountable: string | null } {
+  const status = wireEnum(payment.Status)
+  if (status.unreadable !== null) {
+    return { counts: false, unaccountable: `a payment status of ${status.unreadable}` }
+  }
+  if (status.token !== null
+    && status.token !== XERO_PAYMENT_STATUS_AUTHORISED
+    && status.token !== XERO_PAYMENT_STATUS_DELETED) {
+    return { counts: false, unaccountable: `a payment status of ${status.token}` }
+  }
+  const type = wireEnum(payment.PaymentType)
+  if (type.unreadable !== null) {
+    return { counts: false, unaccountable: `a payment type of ${type.unreadable}` }
+  }
+  if (type.token !== null && !XERO_CREDIT_NOTE_REFUND_TYPES.has(type.token)) {
+    return { counts: false, unaccountable: `a payment type of ${type.token}` }
+  }
+  return { counts: status.token !== XERO_PAYMENT_STATUS_DELETED, unaccountable: null }
+}
+
+/**
+ * What `Payments/{id}` answers with — the fields this arm DECIDES on, and the fields that BIND the
+ * answer to the question it was asked (o3d-acctmoney r4, Codex HIGH 2).
+ *
+ * r3 modelled `Status` and `PaymentType` and nothing else, then read them off `Payments[0]` of
+ * whatever came back. ASKING ABOUT X AND BELIEVING WHATEVER ARRIVES IS NOT A LOOKUP: a response
+ * carrying an AUTHORISED payment for some OTHER id satisfied the resolution, and if the payment
+ * actually asked about had been DELETED that is the false `clear` the whole pass exists to prevent.
+ * So the three fields that tie a response to its request are modelled too, and `resolveCreditNoteRefunds`
+ * says which of them may be REQUIRED and which may only ever CONTRADICT — see it, because the two
+ * lists are not the same list and the difference is the difference between a binding and a decoration.
+ */
+type XeroPaymentLookupResponse = {
+  Payments?: Array<{
+    PaymentID?: string
+    Status?: string
+    PaymentType?: string
+    /** The document this payment is against. `Payment.CreditNote` on the published schema. */
+    CreditNote?: { CreditNoteID?: string }
+    /** `number | string` for `wireAmount`'s reason: one decode for every money figure this file reads. */
+    Amount?: number | string
+  }>
+}
+
+/**
+ * How many `Payments/{id}` lookups ONE credit note may spend — and, since o3d-acctmoney r4, what
+ * running out COSTS, which is the half r3 got wrong.
+ *
+ * WHY THERE IS A BOUND AT ALL. The resolve loop is over a VENDOR-CONTROLLED array length inside the
+ * authorisation path of a money post. Xero allows 60 calls per minute per tenant — the same documented
+ * figure `MAX_PER_RUN` in `lib/connectors/xero/sync-processor.ts` sizes a whole sweep run against — so
+ * an unbounded resolve would let one pathological document spend a minute's budget and starve every
+ * other row in the sweep.
+ *
+ * WHERE THE NUMBER COMES FROM, which r3's did not (Codex MEDIUM). Half that documented per-minute
+ * allowance: the worst document in a run may take at most half of it, and the rest of the sweep still
+ * moves. It is a COST derivation and that is the only kind available here — nothing in the schema and
+ * nothing in this code establishes a maximum number of refunds a credit note may have, and r3's 25
+ * quietly asserted one.
+ *
+ * AND WHAT EXCEEDING IT MUST NOT DO. r3 refused TERMINALLY on the twenty-sixth distinct silent
+ * payment. A legitimately long-lived credit note refunded in more tranches than that then had no path
+ * at all: every retry reads the same stable shape, refuses again, and the row ends FAILED — the
+ * permanent-hold class this branch rejected the cheap option to avoid, reintroduced by the guard
+ * against unbounded work. So the budget no longer decides the ANSWER, only how much of it is PROVED:
+ * past the budget the remaining payments go UNRESOLVED, `applied` stops being a figure and becomes an
+ * INTERVAL, and the arm answers `provedComplete: false` instead of refusing. See the arithmetic block
+ * below for what that interval is and which end of it each check is entitled to.
+ */
+const XERO_CREDIT_NOTE_REFUND_LOOKUP_BUDGET = 30
+
+/**
+ * One sentence-ending for every way a refund cannot be accounted for, so the refusals read as one rule
+ * rather than as a handful of unrelated errors that happen to share a code path.
+ */
+const cannotTellAboutRefund = (what: string): string =>
+  `${what}, so IMS cannot tell whether that refund was reversed and cannot tell how much of the `
+  + 'credit is already allocated'
+
+/** Are two readings of the same wire field the same reading — including two that are both silent? */
+function sameReading(a: WireAmount, b: WireAmount): boolean {
+  if (a.unreadable !== b.unreadable) return false
+  if (a.value === null || b.value === null) return a.value === b.value
+  return compareDecimal(a.value, b.value) === 0
+}
+
+/** One payment of a credit note, and every entry of the collection that claimed to be it. */
+type CreditNoteRefundEntry = {
+  /** As Xero stated it, for the refusal sentences. */
+  id: string
+  /** The first entry carrying this id — every other one has been proved to state the same things. */
+  payment: { PaymentID?: string; Amount?: number | string; Status?: string; PaymentType?: string }
+  /** Every entry's `Amount` reading, in the order Xero listed them. Length > 1 means duplicates. */
+  amounts: WireAmount[]
+}
+
+/**
+ * o3d-acctmoney r4 (Codex HIGH 1) — A PAYMENT IS ONE TERM OF THE IDENTITY, HOWEVER MANY TIMES THE
+ * COLLECTION NAMES IT.
+ *
+ * THE DEFECT. r3 made repeated ids cost ONE LOOKUP and left them costing SEVERAL SUBTRACTIONS: the
+ * cache deduplicated the REQUESTS while the arithmetic still summed every array entry whose inclusion
+ * was true. Codex's shape: `Total 400`, `RemainingCredit 200`, an empty `Allocations` collection, and
+ * ONE authorised 100 refund listed TWICE. The 100 came off twice, `applied` landed on a proved zero
+ * over an empty collection, and the arm answered `clear` — masking a real 100 allocation and
+ * authorising it a second time. r3's own cost test asserted that both entries were counted, so no
+ * uniqueness invariant stood anywhere near this path.
+ *
+ * WHY THE STRICTER OF THE TWO AVAILABLE RULES. Deduplicating alone would answer the arithmetic; it
+ * would also have to PICK one of two entries when they disagree, and this branch has consistently
+ * refused a contradictory response rather than choosing a reading of it. So a repeated id is counted
+ * once only after the entries carrying it have been proved to be the same payment.
+ *
+ * WHAT "THE SAME PAYMENT" MEANS, AND IN WHICH ORDER IT IS ESTABLISHED:
+ *
+ *   STATUS AND TYPE, HERE. They decide whether the payment is a term AT ALL, so two entries that state
+ *   different ones are not two listings of one payment — they are a response that cannot be read. This
+ *   is checked before any lookup, on what the collection itself stated.
+ *   AMOUNT, AFTER RESOLUTION, and only for a payment that turns out to COUNT. An excluded payment's
+ *   `Amount` is never read anywhere in this arm (dropping a term from a SUBTRACTED sum can only make
+ *   the usage LARGER, which refuses visibly), so there is nothing to choose between for one — and
+ *   demanding agreement about a figure this code will not use would be a refusal with no harm behind
+ *   it. See `creditNoteRefundAmountDisagreement`.
+ *
+ * AND EVERY ENTRY MUST STATE A `PaymentID`. Without one an entry can be neither deduplicated nor bound
+ * to a lookup, which are the two things this round establishes; a subtracted refund with no identity is
+ * exactly the term that could be a repeat of another and could not be shown not to be. That is not a
+ * shape any source describes either — the schema `$ref`s the full `Payment`, whose `PaymentID` Xero
+ * mints, and this repository's two live-tenant scripts type the nested element as `{ PaymentID, Amount }`,
+ * so `PaymentID` is the ONE member every source agrees the projection carries.
+ */
+function distinctCreditNoteRefunds(
+  payments: ReadonlyArray<{ PaymentID?: string; Amount?: number | string; Status?: string; PaymentType?: string }>,
+  currency: string | null,
+): { entries: CreditNoteRefundEntry[]; refusal: string | null } {
+  const byId = new Map<string, CreditNoteRefundEntry>()
+  const entries: CreditNoteRefundEntry[] = []
+
+  for (const payment of payments) {
+    const id = str(payment.PaymentID)
+    if (id === '') {
+      return {
+        entries,
+        // The first spelling is r3's, kept verbatim: a payment that states neither a status nor an id
+        // is the one shape where the request cannot even be made, and it reads as its own sentence.
+        refusal: cannotTellAboutRefund(wireEnum(payment.Status).token === null
+          ? 'Xero returned a payment against this credit note with neither a status nor an id to '
+            + 'resolve one by'
+          : 'Xero returned a payment against this credit note with no id to tell it apart from the '
+            + 'others it listed'),
+      }
+    }
+    const key = id.toLowerCase()
+    const amount = wireAmount(payment.Amount, currency)
+    const already = byId.get(key)
+    if (already === undefined) {
+      const entry: CreditNoteRefundEntry = { id, payment, amounts: [amount] }
+      byId.set(key, entry)
+      entries.push(entry)
+      continue
+    }
+    for (const [field, a, b] of [
+      ['status', wireEnum(already.payment.Status), wireEnum(payment.Status)],
+      ['type', wireEnum(already.payment.PaymentType), wireEnum(payment.PaymentType)],
+    ] as const) {
+      if (a.token !== b.token || a.unreadable !== b.unreadable) {
+        return {
+          entries,
+          refusal: cannotTellAboutRefund(`Xero lists payment ${already.id} against this credit note `
+            + `more than once, stating a different ${field} each time`),
+        }
+      }
+    }
+    already.amounts.push(amount)
+  }
+
+  return { entries, refusal: null }
+}
+
+/**
+ * The second half of the uniqueness rule, deferred until resolution has said whether the payment is a
+ * term: duplicate entries of a COUNTED payment must state the same amount, or the collection is a
+ * contradiction rather than a subtraction this code may pick a size for.
+ */
+function creditNoteRefundAmountDisagreement(entry: CreditNoteRefundEntry): string | null {
+  const first = entry.amounts[0]!
+  if (entry.amounts.every((amount) => sameReading(first, amount))) return null
+  return cannotTellAboutRefund(`Xero lists payment ${entry.id} against this credit note more than `
+    + 'once without stating the same amount each time')
+}
+
+/**
+ * Resolve the refunds whose `Status` the credit note's own projection did not state, say so when one
+ * cannot be resolved, and name the ones the lookup budget did not reach.
+ *
+ * WHY THIS IS A SEPARATE PASS FROM THE STUB READING. A value Xero STATED and this code cannot account
+ * for is already an answer — there is nothing to go and ask about — so the caller refuses on those
+ * BEFORE this runs and no request is spent on a note that was going to refuse anyway.
+ *
+ * ONLY SILENCE IS RESOLVED. A stub that states a readable `Status` is decided from the stub; if Xero
+ * does populate the nested projection, this makes exactly zero requests. That is also what keeps the
+ * cost proportional to the thing being fixed rather than to the number of credit notes.
+ *
+ * IT IS GIVEN DISTINCT PAYMENTS, so a collection that lists one payment many times cannot be turned
+ * into many calls, and — since r4 — cannot be turned into many subtractions either. See
+ * `distinctCreditNoteRefunds`.
+ *
+ * EVERY INCOMPLETE OUTCOME IS A REFUSAL, in the direction this arm's asymmetry demands: not the
+ * transport failure, not a response with no payment in it, not a response that is not ABOUT the payment
+ * that was asked for, not a resolved record that STILL states no status. Each would otherwise leave an
+ * unverified refund to be subtracted, which is the direction that forges a `clear`. The refusal names
+ * the payment so an operator has something to open.
+ *
+ * WHAT A RESPONSE HAS TO ESTABLISH BEFORE IT IS ALLOWED TO DECIDE ANYTHING (Codex HIGH 2), and the
+ * evidence behind each requirement, because the difference between a binding and a decoration is
+ * whether the field is one this endpoint actually sends:
+ *
+ *   EXACTLY ONE PAYMENT. `Payments/{id}` addresses ONE payment. A body carrying several is not an
+ *   answer to it, and reading `[0]` out of one is choosing. REQUIRED.
+ *   THE `PaymentID` ECHOES THE REQUEST. This is what binds the answer to the question, and it is
+ *   established: `scripts/audit-xero-live-contamination.ts` reads `PaymentID` off this very endpoint
+ *   against the live tenant and types it NON-OPTIONAL. REQUIRED, case-insensitively as Xero's GUIDs
+ *   are compared everywhere else here.
+ *   THE `Amount` AGREES WITH THE ONE THE CREDIT NOTE STATED. A resolved payment whose size contradicts
+ *   the figure about to be subtracted for it is a contradictory response of the kind this branch
+ *   refuses elsewhere. CONTRADICTION ONLY: compared when BOTH sides state something, because a
+ *   response that omits `Amount` still answers the question that was asked (what is this payment's
+ *   status?) and the stub's own missing or unreadable amount already refuses downstream.
+ *   THE `CreditNote.CreditNoteID` IS THIS NOTE. CONTRADICTION ONLY, and this one is worth being honest
+ *   about: the schema carries `Payment.CreditNote`, but NOTHING in this repository records that
+ *   `Payments/{id}` populates it — the live audit script models `Payment.Invoice` and never had reason
+ *   to look at the other side. "A schema that permits a field is not an endpoint that returns it" is
+ *   this file's own rule (see `creditNoteRefundInclusion`), and requiring an unestablished field would
+ *   refuse every refunded credit note if the projection omits it — the whole-class harm this arm has
+ *   twice been told not to reintroduce. SO IT MAY ONLY REFUSE, NEVER PERMIT, and the binding does not
+ *   rest on it: the id echo above carries that weight, and the credit note's own `Payments` collection
+ *   is what asserted the association in the first place. If Xero does send it, a payment that belongs
+ *   to another document is caught; if it does not, nothing is worse than the line above.
+ */
+async function resolveCreditNoteRefunds(
+  entries: ReadonlyArray<CreditNoteRefundEntry>,
+  stated: ReadonlyArray<{ counts: boolean; unaccountable: string | null }>,
+  xeroGet: XeroFetcher,
+  creditNoteId: string,
+  currency: string | null,
+): Promise<{
+  inclusions: Array<{ counts: boolean; unaccountable: string | null }>
+  /** Indices the budget did not reach: their status is still unknown, and the caller must say so. */
+  unresolved: number[]
+  refusal: string | null
+}> {
+  const inclusions = [...stated]
+  const unresolved: number[] = []
+  let lookups = 0
+
+  for (let index = 0; index < entries.length; index++) {
+    const entry = entries[index]!
+    const payment = entry.payment
+    // A STATED status is decided from the stub. An UNREADABLE one never reaches here — the caller has
+    // already refused on it — so `token === null` here means the field is absent, and nothing else.
+    if (wireEnum(payment.Status).token !== null) continue
+
+    const paymentId = entry.id
+    if (lookups >= XERO_CREDIT_NOTE_REFUND_LOOKUP_BUDGET) {
+      // NOT A REFUSAL, and that is the whole of the Codex MEDIUM fix. No request is made and no answer
+      // is invented: the payment is reported unresolved, and the caller widens `applied` into an
+      // interval and withholds the PROOF rather than stranding the document. See the budget constant.
+      unresolved.push(index)
+      continue
+    }
+
+    lookups++
+    const res = await xeroGet<XeroPaymentLookupResponse>(`Payments/${encodeURIComponent(paymentId)}`)
+    if (!res.ok) {
+      // Xero's own words, verbatim: a connection authorised without `accounting.payments` says so
+      // here, and that is the difference between an operator reconnecting and an operator guessing.
+      return {
+        inclusions,
+        unresolved,
+        refusal: cannotTellAboutRefund(`IMS could not read payment ${paymentId} against this credit `
+          + `note from Xero (${res.error ?? `HTTP ${res.status}`})`),
+      }
+    }
+    const returned = res.data?.Payments ?? []
+    if (returned.length === 0) {
+      return {
+        inclusions,
+        unresolved,
+        refusal: cannotTellAboutRefund(`Xero returned no payment for ${paymentId} against this credit note`),
+      }
+    }
+    if (returned.length > 1) {
+      return {
+        inclusions,
+        unresolved,
+        refusal: cannotTellAboutRefund(`Xero answered the request for payment ${paymentId} against this `
+          + `credit note with ${returned.length} payments`),
+      }
+    }
+    const full = returned[0]!
+    const returnedId = str(full.PaymentID)
+    if (returnedId.toLowerCase() !== paymentId.toLowerCase()) {
+      return {
+        inclusions,
+        unresolved,
+        refusal: cannotTellAboutRefund(`Xero answered the request for payment ${paymentId} against this `
+          + `credit note with ${returnedId === '' ? 'a payment it did not identify' : `payment ${returnedId}`}`),
+      }
+    }
+    const association = str(full.CreditNote?.CreditNoteID)
+    if (association !== '' && association.toLowerCase() !== creditNoteId.toLowerCase()) {
+      return {
+        inclusions,
+        unresolved,
+        refusal: cannotTellAboutRefund(`Xero states payment ${paymentId} is against credit note `
+          + `${association} and not ${creditNoteId}`),
+      }
+    }
+    const statedAmountOnNote = entry.amounts[0]!
+    const resolvedAmount = wireAmount(full.Amount, currency)
+    if (statedAmountOnNote.value !== null
+      && (resolvedAmount.unreadable !== null
+        || (resolvedAmount.value !== null && compareDecimal(statedAmountOnNote.value, resolvedAmount.value) !== 0))) {
+      return {
+        inclusions,
+        unresolved,
+        refusal: cannotTellAboutRefund(`Xero states payment ${paymentId} as `
+          + `${formatLedgerMoney(statedAmountOnNote.value)} on this credit note and `
+          + `${resolvedAmount.unreadable ?? formatLedgerMoney(resolvedAmount.value!)} on the payment itself`),
+      }
+    }
+    const inclusion = creditNoteRefundInclusion(full)
+    if (inclusion.unaccountable !== null) {
+      return {
+        inclusions,
+        unresolved,
+        refusal: `Xero states ${inclusion.unaccountable} on payment ${paymentId} against this credit `
+          + 'note, which IMS cannot account for, so it cannot tell how much of the credit is already '
+          + 'allocated',
+      }
+    }
+    // THE INERTNESS CHECK, MADE EXPLICIT. If the resolved record is silent too, `creditNoteRefundInclusion`
+    // would answer `counts: true` and this whole pass would have bought nothing. Refuse instead: the
+    // one thing that must not happen is an unverified refund being subtracted.
+    if (wireEnum(full.Status).token === null) {
+      return {
+        inclusions,
+        unresolved,
+        refusal: cannotTellAboutRefund(`Xero states no status on payment ${paymentId} against this credit note`),
+      }
+    }
+    inclusions[index] = inclusion
+  }
+
+  return { inclusions, unresolved, refusal: null }
 }
 
 /** The shape of the connector read each probe needs, so both can be driven without a network. */
@@ -134,16 +1255,60 @@ export async function probeXeroSettlement(
     }
     const res = await xeroGet<XeroCreditNoteResponse>(`CreditNotes/${encodeURIComponent(creditNoteId)}`)
     if (!res.ok) return { ok: false, reason: res.error ?? `HTTP ${res.status}` }
-    const note = res.data?.CreditNotes?.[0]
-    if (!note) return { ok: false, reason: 'Xero returned no credit note for that id' }
+    /*
+     * o3d-acctmoney r4 — THE SAME BINDING AS THE PAYMENT LOOKUP, ONE LEVEL UP, FOUND BY ASKING WHAT
+     * ELSE THIS ARM TRUSTS WITHOUT HAVING ESTABLISHED IT.
+     *
+     * Codex's HIGH 2 was `Payments/{id}` followed by `Payments[0]`. This line was `CreditNotes/{id}`
+     * followed by `CreditNotes[0]`, with `CreditNoteID` modelled on the response type since o3d-obyd
+     * and compared with nothing. A response carrying a DIFFERENT, wholly unallocated credit note —
+     * `Total 40, RemainingCredit 40, Allocations []` — would answer `provedComplete: true` over an
+     * empty record list, which is `clear`, which allocates OUR credit note a second time.
+     *
+     * AND IT IS NOT HYPOTHETICAL ON THIS ENDPOINT FAMILY. `scripts/audit-xero-live-contamination.ts`
+     * carries a live-tenant guard for precisely this — "CreditNotes ignored the IDs filter (returned
+     * unrequested ids)" — written because Xero did it. The same script types `CreditNoteID` as
+     * NON-OPTIONAL off this endpoint, so requiring the echo is established rather than hoped for,
+     * which is the test `resolveCreditNoteRefunds` applies to every field it binds on.
+     *
+     * The two arms beside this one (`Invoices/{id}` here, `bill/{id}` in the QuickBooks probe) read
+     * their documents the same unbound way. That is one change about all three rather than a rider on
+     * this one, and it is filed rather than smuggled in — see the round's bd issue.
+     */
+    const returnedNotes = res.data?.CreditNotes ?? []
+    if (returnedNotes.length === 0) return { ok: false, reason: 'Xero returned no credit note for that id' }
+    if (returnedNotes.length > 1) {
+      return {
+        ok: false,
+        reason: `Xero answered the request for credit note ${creditNoteId} with ${returnedNotes.length} `
+          + 'credit notes, so IMS cannot tell how much of the credit is already allocated',
+      }
+    }
+    const note = returnedNotes[0]!
+    const notedId = str(note.CreditNoteID)
+    if (notedId.toLowerCase() !== creditNoteId.toLowerCase()) {
+      return {
+        ok: false,
+        reason: `Xero answered the request for credit note ${creditNoteId} with `
+          + `${notedId === '' ? 'a credit note it did not identify' : `credit note ${notedId}`}, so IMS `
+          + 'cannot tell how much of the credit is already allocated',
+      }
+    }
     const allocations = note.Allocations ?? []
+    // o3d-r948: hoisted, because the completeness arithmetic below is sized by it too — the note's
+    // OWN currency, which is what its allocation amounts are stated in.
+    const noteCurrency = ledgerCurrencyCode(note.CurrencyCode)
     // Only allocations against THIS bill: the same credit note legitimately offsets others.
     const records: LedgerSettlementRecord[] = allocations
       .filter((a) => str(a.Invoice?.InvoiceID).toLowerCase() === invoiceId.toLowerCase())
       // No reference field exists on a Xero credit-note allocation, so this type has no mark to
       // match and falls back to amount and date alone. Stated rather than left to be inferred from
       // a missing property.
-      .map((a) => ({ amount: num(a.Amount), date: normaliseXeroSettlementDate(a.Date), reference: null }))
+      .map((a) => ({
+        ...statedAmount(a.Amount, noteCurrency),
+        date: normaliseXeroSettlementDate(a.Date),
+        reference: null,
+      }))
 
     // COMPLETENESS, CHECKED RATHER THAN ASSUMED (Codex round 6, finding 3). This branch had NO
     // cross-check at all, so `Allocations` absent and `Allocations` empty were the same value —
@@ -155,26 +1320,498 @@ export async function probeXeroSettlement(
     // any means, so it is the thing the returned collection has to add up to. ALL allocations
     // count here, not only this bill's: the credit legitimately offsets other documents, and it is
     // the COLLECTION's completeness being tested, not this bill's share of it.
-    const creditTotal = num(note.Total)
-    const remaining = num(note.RemainingCredit)
-    const applied = creditTotal !== null && remaining !== null ? creditTotal - remaining : null
-    const allocated = allocations.reduce<number | null>(
-      (sum, a) => (sum === null || num(a.Amount) === null ? null : sum + (a.Amount as number)),
-      0,
-    )
-    if (applied !== null && applied > XERO_AMOUNT_EPSILON
-      && (allocated === null || applied - allocated > XERO_AMOUNT_EPSILON)) {
+    //
+    // o3d-obyd — ARM 1 OF 3. An unreadable `Total` or `RemainingCredit` used to make `applied` null,
+    // which skipped this check entirely; an absent `Allocations` collection then gave `records: []`,
+    // and that is a `clear` over the credit note this check was added to protect.
+    const creditTotal = wireAmount(note.Total, noteCurrency)
+    const remaining = wireAmount(note.RemainingCredit, noteCurrency)
+    // o3d-jfhi: read HERE, with the other two and through the SAME reader, because it is the same
+    // kind of thing they are — a money figure on the wire under the same magnitude discipline, whose
+    // ABSENCE skips nothing (it is a subtraction, and the ordinary non-CIS note states none) and
+    // whose UNREADABILITY must not be spent as permission. That is the invoice arm's treatment of
+    // this exact field, and it is the same treatment because it is the same field.
+    const noteCisRead = wireAmount(note.CISDeduction, noteCurrency)
+    const cannotRun = completenessCannotRun([
+      ['Total', creditTotal],
+      ['RemainingCredit', remaining],
+      ['CISDeduction', noteCisRead],
+    ])
+    if (cannotRun !== null) {
       return {
         ok: false,
-        reason: `Xero reports ${applied.toFixed(2)} of this credit note already applied but returned `
+        reason: `Xero states ${cannotRun} on this credit note, which IMS cannot read as an amount, so it `
+          + 'cannot tell how much of the credit is already allocated',
+      }
+    }
+    /*
+     * o3d-jfhi (Codex HIGH) — THE CREDIT-NOTE IDENTITY, DERIVED FROM THE CONTRACT RATHER THAN FROM
+     * THE FIELDS THIS FILE HAPPENED TO KNOW.
+     *
+     * THE DEFECT. This arm computed `applied` as `Total - RemainingCredit` and measured it against
+     * `Allocations` alone, which asserts that ALLOCATION IS THE ONLY THING THAT REDUCES A CREDIT
+     * NOTE. The published `CreditNote` schema says otherwise twice over — see the citation block on
+     * `XeroCreditNoteResponse`. So:
+     *
+     *   A REFUNDED NOTE.  `Total 400, RemainingCredit 300, Payments [100], Allocations []` gave
+     *   `applied` 100 against an allocated 0, and the probe refused with "100.00 of this credit note
+     *   already applied but returned no allocations" — over a note with 300 legitimately left to
+     *   allocate.
+     *   A CIS NOTE.  `Total 400, CISDeduction 80, RemainingCredit 320, Allocations []` gave `applied`
+     *   80 against 0 and refused the FIRST allocation against a perfectly coherent supplier credit.
+     *
+     * Both are the invoice arm's harm on the arm the previous round left: a cross-check refusing
+     * documents that are exactly right, on a whole class, at the most ordinary operation there is.
+     *
+     * THE IDENTITY, TERM BY TERM, AND WHERE EACH COMES FROM.
+     *
+     *     RemainingCredit = Total - CISDeduction - SUM(Allocations.Amount) - SUM(Payments.Amount)
+     *
+     *   so what this arm needs — how much of the credit has been spent ON ALLOCATIONS — is
+     *
+     *     allocationUsage = Total - RemainingCredit - CISDeduction - SUM(Payments.Amount)
+     *
+     *   `Total`            the note's face value. Contract: "The total of the Credit Note(subtotal +
+     *                      total tax)".
+     *   `RemainingCredit`  what is left of it. Contract: "The remaining credit balance on the Credit
+     *                      Note" — a BALANCE, i.e. net of everything that has come off, which is why
+     *                      each further term below is SUBTRACTED from the difference rather than
+     *                      added to it.
+     *   `CISDeduction`     contract: "CIS deduction for UK contractors". Withheld and paid to HMRC;
+     *                      no allocation and no payment stands behind it, so it is in no collection.
+     *   `Payments`         contract: "See Payments", an array of `Payment`. Xero records a refund of
+     *                      a credit note through the payments endpoint, and `Payment.PaymentType`
+     *                      enumerates `ARCREDITPAYMENT`/`APCREDITPAYMENT` for exactly this. Cash
+     *                      that has left the credit note without being allocated to anything.
+     *
+     * WHY THIS CAN BE SUBTRACTED WITHOUT A LIVE TENANT, WHICH IS THE QUESTION THE LAST ROUND COULD
+     * NOT ANSWER AND ANSWERED BY DECLINING. Its reasoning was that over-subtraction UNDERSTATES
+     * `applied`, an understatement can reach a proved zero, a proved zero is `clear`, and `clear`
+     * authorises the money post — irreversible, so do not guess. That reasoning is sound about a
+     * SUBTRACTION WITH NOTHING WATCHING IT. It is not sound here, because the result of this identity
+     * is a COUNT OF MONEY ALLOCATED and the collection that money is in was sent with it:
+     *
+     *   Write the true usage as A = SUM(Allocations.Amount), and suppose this subtraction takes off X
+     *   more than Xero in fact netted out of `RemainingCredit`. Then `applied` = A - X while
+     *   `allocated` still sums to A, so the COLLECTION EXCEEDS THE FIGURE by exactly X — and
+     *   `exceeds` below turns that into `provedComplete: false`, which is `unknown`, not `clear`.
+     *   Every over-subtraction PAST A NON-EMPTY COLLECTION is caught by that collection, at the same
+     *   band.
+     *
+     * So the wrong branch of this guess costs a visible hold, not a second allocation, and that is
+     * the asymmetry test the previous round applied and could not pass — it could not pass it because
+     * it was weighing the subtraction ALONE, without the check standing behind it.
+     *
+     * AND THE CONDITION THAT ARGUMENT NEEDS, WHICH IT DID NOT STATE (o3d-acctmoney r2, Codex HIGH).
+     * "The collection exceeds the figure by X" needs a collection with something in it to exceed
+     * WITH. When `Allocations` comes back empty — which is the very shape this check was added to
+     * distrust — A is zero, `applied` is `0 - X`, `statesAnything` is false so no shortfall check
+     * runs, and `exceeds(0, applied)` is false because the excess is on the wrong side. The
+     * over-subtraction lands on the PROVED-ZERO path, not the excess path, and a proved zero over an
+     * empty record list is `clear`. So the paragraph above covers exactly one case and is now written
+     * that way; a term the CONTRACT ITSELF flags as not-netted has to be excluded at the source
+     * rather than left to a check that an empty collection switches off.
+     *
+     * THE TWO SUBTRACTED TERMS ARE COVERED DIFFERENTLY, AND IT IS WORTH SAYING WHICH IS WHICH:
+     *
+     *   `CISDeduction`  carries no such flag. The contract says Xero nets it out of `RemainingCredit`
+     *                   and says nothing that distinguishes one deduction from another; an absent one
+     *                   reads as zero (there is no deduction to net) and an unreadable one refuses
+     *                   through `completenessCannotRun`. There is no member to exclude and no
+     *                   enumeration to fail closed on, so this term takes no filter.
+     *   `Payments`      DOES carry one — `Payment.Status`, enumerated `AUTHORISED` / `DELETED` — and
+     *                   it is now read. See `creditNoteRefundInclusion`.
+     *
+     * AND THE EXTREME OF THAT SAME CASE IS NAMED RATHER THAN LEFT TO `exceeds`, immediately below: a
+     * usage BELOW ZERO. `allocationUsage` counts money that has been allocated, so under the identity
+     * it is `SUM(Allocations.Amount)` and cannot be negative. A negative one is the identity itself
+     * failing on this document — a strictly stronger statement than "the collection disagrees" — and
+     * it earns its own refusal so that an operator is told the response is incoherent rather than
+     * being told nothing while the row quietly holds.
+     */
+    const notePayments = note.Payments ?? []
+    // An ABSENT `Payments` collection sums to ZERO, for `sumApplied`'s reason and in its direction:
+    // "Xero sent no payments" has to be able to mean "there are none", or every ordinary credit note
+    // refuses — and the mistake it can cause is DIRECTIONAL. An omitted refund leaves `applied`
+    // OVERSTATED, which the shortfall check below turns into a visible refusal, never into a clear.
+    //
+    // A payment ENTRY whose amount cannot be read is the opposite case and refuses, because a refund
+    // is never a RECORD of this bill's allocations — nothing is left behind to make the classifier
+    // withhold on its own account. That is o3d-zo4j's unreadable-allocation lesson applied to the
+    // collection this round added, rather than learned again later.
+    //
+    // o3d-acctmoney r2 (Codex HIGH) — AND WHICH ENTRIES OF IT ARE TERMS AT ALL IS DECIDED FIRST.
+    // `creditNoteRefundInclusion` carries the argument; what it decides here is that an explicitly
+    // DELETED payment is dropped before it can be subtracted, and that a status or payment type the
+    // contract does not enumerate refuses instead of being counted either way.
+    //
+    // AN EXCLUDED PAYMENT'S `Amount` IS NEVER READ, so an unreadable amount on a DELETED payment does
+    // not refuse — there is nothing this code was going to do with the figure. That direction is
+    // safe for the reason every other exclusion here is: dropping a term from a SUBTRACTED sum can
+    // only make `applied` LARGER, which is the shortfall direction and a VISIBLE refusal, never the
+    // proved zero. The amount refusal below exists for the terms that ARE subtracted and still covers
+    // every one of them.
+    // o3d-acctmoney r4 (Codex HIGH 1) — AND THE COLLECTION IS REDUCED TO DISTINCT PAYMENTS FIRST, so
+    // everything below counts each payment once. r3 deduplicated the LOOKUPS and left the ARITHMETIC
+    // summing every array entry, which is a false `clear` one repeated id away. See
+    // `distinctCreditNoteRefunds` for the rule and for why a disagreement refuses instead of choosing.
+    const distinctRefunds = distinctCreditNoteRefunds(notePayments, noteCurrency)
+    if (distinctRefunds.refusal !== null) {
+      return { ok: false, reason: distinctRefunds.refusal }
+    }
+    const refundEntries = distinctRefunds.entries
+    const statedInclusions = refundEntries.map((entry) => creditNoteRefundInclusion(entry.payment))
+    const unaccountableRefund = statedInclusions.find((i) => i.unaccountable !== null)?.unaccountable ?? null
+    if (unaccountableRefund !== null) {
+      return {
+        ok: false,
+        reason: `Xero states ${unaccountableRefund} on a payment against this credit note, which IMS `
+          + 'cannot account for, so it cannot tell how much of the credit is already allocated',
+      }
+    }
+    // o3d-acctmoney r3 (Codex HIGH) — AND THE ONES IT STATED NOTHING ABOUT ARE ASKED ABOUT, NOT
+    // ASSUMED. The round before this one read the status off the nested stub and counted an absent
+    // one as authorised, which — on a projection this repository's own live-tenant models describe as
+    // carrying `PaymentID` and `Amount` and nothing else — is a filter that never fires. The argument
+    // and the sources are on `creditNoteRefundInclusion`; what happens here is that a refund whose
+    // status the credit note withheld is resolved through the endpoint that states it, and anything
+    // short of a complete answer refuses rather than being subtracted on trust.
+    //
+    // o3d-acctmoney r4 (Codex HIGH 2): the credit note's own id goes with the question, because a
+    // response that is not about what was asked is not an answer to it.
+    const refundResolution = await resolveCreditNoteRefunds(
+      refundEntries, statedInclusions, xeroGet, creditNoteId, noteCurrency,
+    )
+    if (refundResolution.refusal !== null) {
+      return { ok: false, reason: refundResolution.refusal }
+    }
+    const refundInclusions = refundResolution.inclusions
+    const unresolvedRefunds = new Set(refundResolution.unresolved)
+    // THE AMOUNT HALF OF THE UNIQUENESS RULE, now that resolution has said which payments are terms.
+    const countedEntries = refundEntries.filter((_entry, index) => refundInclusions[index]!.counts)
+    const disagreement = countedEntries
+      .map((entry) => creditNoteRefundAmountDisagreement(entry))
+      .find((reason) => reason !== null) ?? null
+    if (disagreement !== null) {
+      return { ok: false, reason: disagreement }
+    }
+    const refundReadings = countedEntries.map((entry) => entry.amounts[0]!)
+    const refunded = sumExact(refundReadings.map((r) => r.value))
+    if (refunded === null) {
+      const unreadable = refundReadings.find((r) => r.unreadable !== null)?.unreadable ?? null
+      return {
+        ok: false,
+        reason: unreadable !== null
+          ? `Xero states ${unreadable} on a payment against this credit note, which IMS cannot read `
+            + 'as an amount, so it cannot tell how much of the credit is already allocated'
+          : 'Xero returned a payment against this credit note with no amount, so IMS cannot tell how '
+            + 'much of the credit is already allocated',
+      }
+    }
+    /*
+     * o3d-acctmoney r5 (Codex HIGH, the hardening half) — AND EVERY COUNTED REFUND AMOUNT IS PROVED
+     * NON-NEGATIVE, BECAUSE ALL THE ARITHMETIC BELOW ASSUMES IT AND NOTHING CHECKED IT.
+     *
+     * WHAT ASSUMES IT. Two things, and the second is the one the finding turned on:
+     *
+     *   THE SUBTRACTION. `refunded` comes off `applied` as money that has already left the credit
+     *                    note. A NEGATIVE term there is money going back ON, which under this
+     *                    identity is not a refund at all.
+     *   THE INTERVAL.    `unprovedRefunded` is a WIDTH — `applied` is its bottom and
+     *                    `applied + unprovedRefunded` its top — and a width is a distance, which is
+     *                    non-negative by construction. With a negative term the two ends SWAP, and
+     *                    the incoherence check below, which is deliberately asked of the most
+     *                    generous reading, would then be asked of the least generous one.
+     *
+     * WHAT A NEGATIVE AMOUNT IS ON THIS ENDPOINT, decided before choosing what to do with it — which
+     * is the order this branch keeps being told to work in, and the answer is settled from what the
+     * repository records rather than from what feels safe:
+     *
+     *   XERO REVERSES A PAYMENT BY STATUS, NOT BY SIGN. `Payment.Status` is enumerated
+     *   `AUTHORISED` / `DELETED`, and Xero's own reversal is a POST of `Status: 'DELETED'` to
+     *   `Payments/{id}` — see `remove-xero-live-e2e-footprint.ts`, and `creditNoteRefundInclusion`,
+     *   which already drops such a payment as not a term. The same sentence is written one level up
+     *   about allocations: a deleted one LEAVES the collection rather than staying in it with a
+     *   reversing sign. So the contract has a channel for "this refund came back", it is not the
+     *   sign, and a negative `Amount` is not that channel spelled differently.
+     *   NOTHING IN THIS REPOSITORY RECORDS ONE. `audit-xero-live-contamination.ts` types the nested
+     *   element `{ PaymentID: string; Amount: number }` off the live tenant and no captured body
+     *   anywhere carries a negative payment amount; IMS never posts one either — every money post
+     *   short-circuits on `amount <= 0` before it reaches the wire. So a negative here is an
+     *   UNESTABLISHED shape, which is this arm's standing category for "the ledger stated something
+     *   this code cannot account for", not a shape whose meaning is known and merely inconvenient.
+     *
+     * SO IT REFUSES, AND AS AN UNACCOUNTABLE VALUE RATHER THAN AS A CONTRADICTION. The distinction is
+     * real in this file and worth keeping: a CONTRADICTION is two figures the ledger stated that
+     * cannot both be true — `RemainingCredit` against the note's own allocation collection — and it
+     * names the DOCUMENT, because the document is what disagrees with itself. A negative refund
+     * contradicts nothing on its own; the note's arithmetic may balance perfectly with it in. What it
+     * does is state a TERM this identity has no meaning for, which is exactly what an unenumerated
+     * `Status` or `PaymentType` does, and those refuse by naming the PAYMENT so an operator has one
+     * thing to open. This takes that route and that sentence-shape for the same reason.
+     *
+     * AND IT IS MEASURED AT THE FILE'S OWN BAND, not at a bare `< 0`. `shortBy(0, value)` is "the
+     * value is more than one band BELOW zero" — the same function and the same `completenessBand`
+     * every other comparison in this file decides at. A negative smaller than the band is two exact
+     * decimals agreeing to the document's minor unit, which is noise below the granularity of every
+     * decision here, and refusing on it would refuse an ordinary note for a rounding artefact.
+     *
+     * THE COUNTED ENTRIES ARE THE WHOLE OF WHAT IS CHECKED, and that is wider than the width alone on
+     * purpose: the width's readings are a SUBSET of these, so checking the superset establishes the
+     * invariant for `refunded` too, and an EXCLUDED payment's `Amount` is never read anywhere in this
+     * arm — demanding a sign of a figure this code will not use would be a refusal with no harm
+     * behind it, which is the rule `creditNoteRefundAmountDisagreement` already follows.
+     */
+    const negativeRefund = refundReadings.findIndex(
+      (reading) => reading.value !== null && shortBy(toDecimal(0), reading.value, noteCurrency),
+    )
+    if (negativeRefund !== -1) {
+      return {
+        ok: false,
+        reason: `Xero states payment ${countedEntries[negativeRefund]!.id} against this credit note as `
+          + `${formatLedgerMoney(refundReadings[negativeRefund]!.value!)}, which is not an amount that `
+          + 'can have come off the credit, so IMS cannot tell how much of the credit is already allocated',
+      }
+    }
+    /*
+     * o3d-acctmoney r6 (Codex HIGH) - A BAND IS A STATEMENT ABOUT ONE READING, SO THE SUM OF THE
+     * READINGS IT ADMITS NEEDS ONE OF ITS OWN.
+     *
+     * THE DEFECT, AND IT IS IN THE PARAGRAPH ABOVE RATHER THAN BESIDE IT. That paragraph ends "a
+     * negative smaller than the band is two exact decimals agreeing to the document's minor unit,
+     * which is noise below the granularity of every decision here". That sentence is true of ONE
+     * value and false of a collection of them. The test was applied to each entry INDEPENDENTLY and
+     * the values it admitted were then SUMMED into `refunded`, so any number of sub-band negatives
+     * could be added together and nothing whatsoever measured the total.
+     *
+     * Codex's shape, reproduced: three resolved GBP refunds of `-0.004` each, with `Total 400`,
+     * `RemainingCredit 400.012` and an empty `Allocations` collection. Every one of them passes the
+     * per-entry band; `refunded` is `-0.012`; `applied` is `400 - 400.012 - 0 - (-0.012)`, which is
+     * EXACTLY ZERO - a proved zero over an empty collection, which is `clear`, which authorises an
+     * allocation against a note whose own `RemainingCredit` is larger than its `Total`.
+     *
+     * WHAT THE NEGATIVES ARE ACTUALLY BUYING, because "the sum came out too big" is not the harm and
+     * saying so would leave the next reader looking in the wrong place. `refunded` is SUBTRACTED, so
+     * a negative term makes `applied` LARGER, and larger is the shortfall direction - visible, and
+     * never a `clear` on its own. The harm is one comparison further on: `shortBy(0, applied +
+     * unprovedRefunded)` is the incoherence check, it decides at ONE band, and a negative refund
+     * cancels EXACTLY the incoherence it introduces. So a note whose figures contradict each other by
+     * any amount at all can be presented as coherent by shipping that amount back as sub-band
+     * negative refunds, and the concealment is unbounded precisely because the tolerance was only
+     * ever asked about one term of the sum.
+     *
+     * WHICH OF THE TWO REMEDIES, AND WHY THIS ONE. Refusing every exact negative answers the finding
+     * in one line and throws away the property the band was there to protect: a SINGLE rounding
+     * artefact - two exact decimals agreeing to the document's own minor unit - would then hold an
+     * ordinary note, which is the whole-class harm this arm has repeatedly been told not to
+     * reintroduce. That property is worth keeping, and it is only ever a claim about ONE reading. So
+     * the per-entry tolerance stays exactly where it was and the AGGREGATE is measured separately,
+     * which is the only spelling of the rule that cannot be accumulated past.
+     *
+     * WHAT THE BOUND GUARANTEES, WRITTEN AS A CEILING RATHER THAN AS A REASSURANCE. The combined
+     * magnitude of every negative this arm admits is at most one `completenessBand`, so the most that
+     * can ever be hidden from the incoherence check is one band - the granularity every decision in
+     * this file already makes, and the same quantity a single artefact was always allowed to move.
+     * That is a property the arithmetic below can be read against; "negatives are rare" is not.
+     *
+     * THE SIGN TEST THAT COLLECTS THE CONTRIBUTIONS IS BARE, AND THAT IS THE POINT. Collecting a term
+     * is not deciding about it. The band has MOVED off the entry and onto the sum, and asking it again
+     * on the way in would put the hole straight back - three readings under the band would contribute
+     * nothing and the total would be zero however many of them there were.
+     *
+     * AND THE WIDTH NEEDS NO SECOND CHECK OF ITS OWN. `unresolvedReadings` below is a SUBSET of these
+     * readings, and a subset's negative contributions cannot total more than the whole set's, so
+     * `unprovedRefunded` INHERITS this ceiling rather than repeating it.
+     *
+     * THE PER-ENTRY ARM IS KEPT AND STILL RUNS FIRST, so a single unmistakable negative refuses by
+     * naming the ONE payment an operator has to open. This arm names all of the contributors, because
+     * no one of them is the reason on its own - which is the same fact the finding is about.
+     */
+    const negativeRefunds = refundReadings
+      .map((reading, index) => ({ value: reading.value, id: countedEntries[index]!.id }))
+      .filter((entry): entry is { value: Decimal; id: string } =>
+        entry.value !== null && compareDecimal(entry.value, toDecimal(0)) < 0)
+    const negativeRefundTotal = negativeRefunds.reduce<Decimal>(
+      (sum, entry) => addMoney(sum, entry.value), toDecimal(0),
+    )
+    if (shortBy(toDecimal(0), negativeRefundTotal, noteCurrency)) {
+      return {
+        ok: false,
+        reason: `Xero states payments ${negativeRefunds.map((entry) => entry.id).join(', ')} against `
+          + `this credit note as amounts totalling ${formatLedgerMoney(negativeRefundTotal)}, which `
+          + 'together are not an amount that can have come off the credit, so IMS cannot tell how '
+          + 'much of the credit is already allocated',
+      }
+    }
+    // o3d-acctmoney r4 (Codex MEDIUM) — HOW MUCH OF THE SUBTRACTED REFUND TERM IS UNPROVED.
+    //
+    // A payment the lookup budget did not reach is still SUBTRACTED above — its stub says nothing, and
+    // `creditNoteRefundInclusion` reads silence as a refund — but its status was never established, so
+    // it might have been reversed and its `Amount` might be no term at all. That makes `applied` an
+    // INTERVAL of exactly this width rather than a figure, and every check below is entitled to one
+    // end of it. Nothing is unresolved on the ordinary note, so this is zero and every bound collapses
+    // to the single value r3 computed.
+    //
+    // o3d-acctmoney r5 (Codex HIGH) — AND THE TWO JOBS THIS SUM WAS DOING ARE NOW TWO VALUES.
+    //
+    // THE DEFECT. `unprovedRefunded` was the interval's WIDTH and, through `statesAnything`, the only
+    // marker that resolution had been INCOMPLETE. Those are not the same fact. Whether anything is
+    // unresolved is a fact about a COUNT — did the budget leave a payment unasked-about — and the sum
+    // is a derived quantity that reaches zero for reasons of its own. Codex's shape: a 32-payment
+    // response whose first 30 resolve and whose two budget-excluded amounts are +100 and -100. Their
+    // sum is exactly zero, so the marker read false, `provedComplete` came out TRUE over an empty
+    // record list, and the classifier said `clear` — with two refunds still unverified, which is the
+    // second allocation this whole arm exists to withhold.
+    //
+    // SO THE MARKER IS READ FROM THE THING IT DESCRIBES. `resolveCreditNoteRefunds` already returns
+    // the indices it did not reach; whether that list is EMPTY is the whole question, and no
+    // arithmetic can cancel a non-empty list into an empty one. The width keeps its own name and its
+    // own job below, and neither value can be spent as the other.
+    const somethingUnresolved = refundResolution.unresolved.length > 0
+    const unresolvedReadings = refundEntries
+      .filter((_entry, index) => refundInclusions[index]!.counts && unresolvedRefunds.has(index))
+      .map((entry) => entry.amounts[0]!)
+    const unprovedRefunded = sumExact(unresolvedReadings.map((r) => r.value))
+    if (unprovedRefunded === null) {
+      // Unreachable while these readings remain a SUBSET of the ones `refunded` just summed. Written as
+      // a refusal rather than as a `?? 0` so that a change which breaks that relation fails closed
+      // instead of quietly narrowing the interval to nothing.
+      return {
+        ok: false,
+        reason: 'Xero returned a payment against this credit note whose amount IMS cannot read, so it '
+          + 'cannot tell how much of the credit is already allocated',
+      }
+    }
+    // ABSENT IS ZERO, and it is the ordinary credit note. An unreadable one never reaches here —
+    // `completenessCannotRun` above has already refused it — so the only two states left are "Xero
+    // stated a deduction" and "Xero stated none", and the second is arithmetically the first with a
+    // zero in it. A `!== null` guard here would put the identity back where the finding found it:
+    // correct on the notes that state the field and silently short a term on the ones that do not.
+    const noteCisDeduction = noteCisRead.value ?? toDecimal(0)
+    let applied: Decimal | null = null
+    if (creditTotal.value !== null && remaining.value !== null) {
+      applied = subtractMoney(
+        subtractMoney(subtractMoney(creditTotal.value, remaining.value), noteCisDeduction),
+        refunded,
+      )
+      // THE IDENTITY'S OWN SANITY, and the reason the two terms above could be added on a reading of
+      // the contract rather than on a live tenant. `shortBy(0, applied)` is "applied is more than one
+      // band BELOW zero" — written with the same function and therefore the same band as every other
+      // completeness comparison in this file.
+      //
+      // o3d-acctmoney r4 — AND IT IS ASKED OF THE INTERVAL'S UPPER END. `applied` above subtracts every
+      // unresolved refund, so it is the LOWEST the usage can be; adding them back gives the HIGHEST.
+      // Declaring the ledger's own response incoherent is a strong claim, and it is only warranted when
+      // even the most generous reading of the unresolved payments is still below zero. With nothing
+      // unresolved this IS `applied`, so the ordinary note is checked exactly as r3 checked it.
+      if (shortBy(toDecimal(0), addMoney(applied, unprovedRefunded), noteCurrency)) {
+        return {
+          ok: false,
+          reason: 'Xero states a credit note whose remaining credit is larger than its own total less '
+            + `what has been taken off it — ${formatLedgerMoney(creditTotal.value)} total, `
+            + `${formatLedgerMoney(remaining.value)} remaining`
+            + (statesAnything(noteCisDeduction, noteCurrency)
+              ? `, ${formatLedgerMoney(noteCisDeduction)} CIS deduction`
+              : '')
+            + (statesAnything(refunded, noteCurrency)
+              ? `, ${formatLedgerMoney(refunded)} refunded`
+              : '')
+            + ', so the response is inconsistent and IMS cannot tell how much of the credit is '
+            + 'already allocated',
+        }
+      }
+    }
+    const allocated = sumExact(allocations.map((a) => wireDecimal(a.Amount, noteCurrency)))
+    // o3d-acctmoney r4 — AND THIS ONE IS ASKED OF THE INTERVAL'S LOWER END, which is `applied` itself.
+    // It refuses when the collection cannot account for the usage, so it must only fire when a refusal
+    // is certain: the lower bound exceeding the collection means the TRUE usage does too, whatever the
+    // unresolved payments turn out to be. The upper end would refuse notes that are merely unproved,
+    // which is the hold this round exists to stop handing out.
+    if (applied !== null && statesAnything(applied, noteCurrency)
+      && (allocated === null || shortBy(applied, allocated, noteCurrency))) {
+      return {
+        ok: false,
+        reason: `Xero reports ${formatLedgerMoney(applied)} of this credit note already applied but returned `
           + (allocated === null
             ? 'an allocation whose amount could not be read'
             : allocations.length === 0
               ? 'no allocations'
-              : `allocations totalling ${allocated.toFixed(2)}`),
+              : `allocations totalling ${formatLedgerMoney(allocated)}`),
       }
     }
-    return { ok: true, records }
+    // o3d-nk5n — AND HERE IT IS CLOSED. o3d-mm51 filed this instance rather than fixing it because
+    // the fixtures modelled the figureless stub as an ordinary credit note; they now state what Xero
+    // states, so the rule can be the same one on both connectors.
+    //
+    // `applied` is this arm's `settled`: how much of the credit has been used ON ALLOCATIONS, which
+    // is `Total - RemainingCredit` less the two terms that come off a credit note without being one
+    // (o3d-jfhi). Null means the note stated neither of the first two figures, so nothing was checked
+    // — and with no allocation to THIS bill, the empty record list would assert "none of this credit
+    // has been applied to this bill" on the strength of not having looked. A note that DOES state
+    // them proves its own emptiness: a wholly unapplied credit reads `Total 40, RemainingCredit 40`,
+    // `applied` is exactly zero, and the empty answer is the ledger's, not this code's.
+    //
+    // o3d-obyd r31: and `applied` is also what proves the ALLOCATION LIST COMPLETE, which is the same
+    // fact used for a different conclusion. When it is stated, the shortfall check above has measured
+    // the collection against a figure outside it; when it is null, the allocations went unmeasured,
+    // and a non-matching allocation must not be allowed to say this credit was never applied to us.
+    // o3d-zo4j — PAIR 1 OF 4, AND IT IS AN IDENTITY.
+    //
+    // o3d-jfhi CORRECTED THE IDENTITY THIS PAIR IS BUILT ON, and left the pair doing MORE work than
+    // it was doing before. It used to be cited as `RemainingCredit = Total - SUM(Allocations)`, which
+    // is the contract's construction with two of its terms missing; it is
+    // `RemainingCredit = Total - CISDeduction - SUM(Allocations) - SUM(Payments)`, and `applied` is
+    // now that rearranged. So `applied` and `allocated` are still ONE quantity written two ways —
+    // which is what makes this pair an identity rather than a bound — and an excess still means the
+    // note's `RemainingCredit` and its own allocation list cannot both be true.
+    //
+    // AND IT IS ALSO THE CHECK THAT MAKES THE TWO NEW TERMS SAFE TO SUBTRACT WITHOUT A LIVE TENANT.
+    // If Xero does not in fact net a term out of `RemainingCredit`, `applied` comes out exactly that
+    // much BELOW `allocated`, and this comparison converts the over-subtraction into
+    // `provedComplete: false` — `unknown` — rather than into the proved zero the previous round was
+    // afraid of. See the identity block above the arithmetic.
+    //
+    // There is no shape of a live Xero credit note in which the two legitimately differ — a deleted
+    // allocation LEAVES the collection rather than staying in it with a reversing sign, and a
+    // reversing sign would push this into the shortfall direction anyway.
+    //
+    // AND AN UNREADABLE ALLOCATION AMOUNT IS NOT AGREEMENT EITHER, which is this arm's half of the
+    // closing audit. `allocated` is null the moment one allocation states an amount this code cannot
+    // read, and the shortfall check above excuses that case whenever `applied` is a PROVED ZERO —
+    // `statesAnything(0)` is false, so it never runs. Measured before it was closed: `Total 40 /
+    // RemainingCredit 40` with a single `{ Invoice: { InvoiceID: 'other-inv' } }` carrying NO `Amount`
+    // answered `ok: true, provedComplete: true, records: []` and the classifier said `clear`. The
+    // unreadable allocation belongs to another invoice, so it leaves no record behind to make the
+    // classifier withhold on its own account — the collection was measured in NEITHER direction and
+    // the zero was believed anyway.
+    //
+    // o3d-acctmoney r4 (Codex MEDIUM) — AND AN UNRESOLVED REFUND IS A THIRD WAY THE FIGURE FAILS TO BE
+    // ESTABLISHED, which is what replaced r3's terminal refusal past the lookup budget. `applied` is
+    // then the BOTTOM of an interval `unprovedRefunded` wide rather than a figure, and an interval
+    // cannot certify a collection: a proved ZERO over an empty collection is exactly what `clear` is
+    // built out of, and the bottom of an interval reaching zero proves nothing about the top of it. So
+    // the arm still ANSWERS — the allocations it read are returned, and one matching this attempt still
+    // proves the attempt settled — but it withholds the proof, which is `unknown` and never `clear`.
+    // What a credit note with more refunds than the budget therefore loses is the ability to have a
+    // FIRST allocation authorised automatically; what it keeps is every protection against a second
+    // one, and it is no longer stranded as a hard failure that no retry can clear.
+    //
+    // o3d-acctmoney r5 (Codex HIGH) — AND THE UNRESOLVED TERM IS READ OFF THE COUNT, OUTSIDE THE
+    // `applied !== null` GATE. "Something was left unasked-about" is true or false whatever the
+    // document's own figures say, so it is not a term of a conjunction about them; hoisting it makes
+    // `unresolved.length > 0` force `provedComplete: false` literally rather than by argument. The
+    // shape is the same one behind every finding on this branch — a fact taken from a proxy that
+    // merely correlates with it — and the correction is the same: read the fact from the thing it is
+    // about. See `somethingUnresolved`, and note that `unprovedRefunded` is still the interval WIDTH
+    // above and is no longer asked any question about whether the interval exists.
+    const allocationsDoNotProve = somethingUnresolved
+      || (applied !== null
+        && (allocated === null
+          || exceeds(allocated, applied, noteCurrency)))
+    return settlementAnswer(applied, allocationsDoNotProve, records,
+      'Xero states no total or remaining credit on this credit note and IMS read no allocation '
+      + 'of it to this bill, so it has nothing to tell from — an empty answer here would say that '
+      + 'none of the credit has been allocated rather than report what has')
   }
 
   if (!invoiceId) return { ok: false, reason: 'the row records no document id to check' }
@@ -185,8 +1822,14 @@ export async function probeXeroSettlement(
   if (!res.ok) return { ok: false, reason: res.error ?? `HTTP ${res.status}` }
   const invoice = res.data?.Invoices?.[0]
   if (!invoice) return { ok: false, reason: 'Xero returned no document for that id' }
+  const invoiceCurrency = ledgerCurrencyCode(invoice.CurrencyCode)
+  // o3d-78rq: the wire figures, kept for the completeness arithmetic below and for NOTHING ELSE. That
+  // cross-check asks whether the COLLECTION is complete, not whether a figure in it can be compared
+  // exactly, so it goes on ADMITTING exactly what it admitted before — see `statedAmount`.
+  // o3d-r948: read as exact decimals rather than doubles, and summed without rounding.
+  const wireAmounts = (invoice.Payments ?? []).map((p) => wireDecimal(p.Amount, invoiceCurrency))
   const records: LedgerSettlementRecord[] = (invoice.Payments ?? []).map((p) => ({
-    amount: num(p.Amount),
+    ...statedAmount(p.Amount, invoiceCurrency),
     date: normaliseXeroSettlementDate(p.Date),
     id: str(p.PaymentID) || null,
     // Where IMS writes its own mark; matching it identifies the attempt whatever has since been
@@ -203,17 +1846,97 @@ export async function probeXeroSettlement(
   // Directional on purpose — only a SHORTFALL escalates. A record whose amount is unreadable
   // already yields `unknown` in the classifier, so it is excluded here rather than counted as
   // zero (which would fake a shortfall).
-  const amountPaid = num(invoice.AmountPaid)
-  if (amountPaid !== null && records.every((r) => r.amount !== null)) {
-    const seen = records.reduce((total, r) => total + (r.amount ?? 0), 0)
-    if (amountPaid - seen > XERO_AMOUNT_EPSILON) {
-      return {
-        ok: false,
-        reason: `Xero reports ${amountPaid.toFixed(2)} paid against this document but returned `
-          + `${records.length === 0 ? 'no payments' : `payments totalling ${seen.toFixed(2)}`}`,
-      }
+  //
+  // o3d-obyd — ARM 2 OF 3, AND ITS SECOND CHECK IS ARM 3's SIBLING. All four of this arm's document
+  // figures are read HERE, before either check, and a figure Xero STATED that IMS cannot read as an
+  // amount refuses the probe rather than excusing the check that would have used it. Both checks are
+  // guarded on `!== null`, so an unreadable `AmountPaid` skipped the first and an unreadable `Total`
+  // or `AmountDue` skipped the second — and a skipped check over a `Payments` collection Xero did not
+  // send is `ok: true` with an empty record list, which is a `clear`.
+  //
+  // Absent stays a skip on purpose: the `settled` fallback below EXISTS for a response that omits
+  // `Total` and `AmountDue`, and an ordinary unsettled invoice that states no `AmountCredited` must
+  // keep reading as the positive, empty answer it is.
+  //
+  // o3d-acctmoney: `CISDeduction` is read HERE, with the other four and through the same decoder,
+  // because it is the same kind of thing they are — a money figure on the wire, subject to the same
+  // magnitude discipline, whose absence skips nothing and whose UNREADABILITY must not be spent as
+  // permission. It is listed last only because it is the term that was missing; it is not optional
+  // to the arithmetic.
+  const amountPaidRead = wireAmount(invoice.AmountPaid, invoiceCurrency)
+  const totalRead = wireAmount(invoice.Total, invoiceCurrency)
+  const amountDueRead = wireAmount(invoice.AmountDue, invoiceCurrency)
+  const amountCreditedRead = wireAmount(invoice.AmountCredited, invoiceCurrency)
+  const cisDeductionRead = wireAmount(invoice.CISDeduction, invoiceCurrency)
+  const cannotRun = completenessCannotRun([
+    ['AmountPaid', amountPaidRead],
+    ['Total', totalRead],
+    ['AmountDue', amountDueRead],
+    ['AmountCredited', amountCreditedRead],
+    ['CISDeduction', cisDeductionRead],
+  ])
+  if (cannotRun !== null) {
+    return {
+      ok: false,
+      reason: `Xero states ${cannotRun} on this document, which IMS cannot read as an amount, so it `
+        + 'cannot tell how much of it is already settled',
     }
   }
+  const amountPaid = amountPaidRead.value
+  // The `every` gate is kept EXACTLY as it was: an unreadable payment amount excludes this check
+  // rather than refusing it, because such a record already yields `unknown` in the classifier and
+  // counting it as zero here would fake a shortfall. Only the arithmetic and the band have changed.
+  const seen = wireAmounts.every((a) => a !== null) ? sumExact(wireAmounts) : null
+  // o3d-mm51 — THE GATE'S PREMISE IS NOW CHECKED INSTEAD OF ASSUMED, because this round is what made
+  // it stop being true. The gate EXCLUDES this check rather than refusing it, and the whole
+  // justification for that direction is the sentence above: "such a record already yields `unknown`
+  // in the classifier", so nothing is lost by not running it.
+  //
+  // That held while `wireDecimal` refused strictly less than `readLedgerStatedAmount` did — every
+  // figure the completeness reader could not read was one the RECORD reader could not read either.
+  // The magnitude bound broke it: the completeness reader takes the HALVED bound and the record
+  // reader takes the full one, so a GBP payment amount in [2^45, 2^46) is refused HERE and ADMITTED
+  // there. The check is then excluded, the record is perfectly measurable, and a document whose
+  // records simply do not match the attempt answers `clear` — measured end to end before this was
+  // added.
+  //
+  // So the exclusion is kept exactly as wide as its justification: if every record IS measurable, the
+  // classifier can reach `clear` and the skipped check is a hole rather than a saving, and the probe
+  // refuses instead. Naming the figure is what stops the refusal reading as "this document is unpaid".
+  const unusablePaymentAt = wireAmounts.findIndex((a) => a === null)
+  if (unusablePaymentAt !== -1 && records.every((r) => r.amount !== null)) {
+    return {
+      ok: false,
+      reason: `Xero states ${String((invoice.Payments ?? [])[unusablePaymentAt]?.Amount)} on a payment against `
+        + 'this document, which IMS cannot use to check the collection against the total Xero reports '
+        + 'paid, so it cannot tell how much of the document is already settled',
+    }
+  }
+  if (amountPaid !== null && seen !== null && shortBy(amountPaid, seen, invoiceCurrency)) {
+    return {
+      ok: false,
+      reason: `Xero reports ${formatLedgerMoney(amountPaid)} paid against this document but returned `
+        + `${records.length === 0 ? 'no payments' : `payments totalling ${formatLedgerMoney(seen)}`}`,
+    }
+  }
+  // o3d-zo4j — PAIR 2 OF 4, AND IT IS THE OTHER IDENTITY. `AmountPaid` is Xero's own total of THIS
+  // collection — the comment above says so, and the shortfall check is built on it — so the two are
+  // one quantity and an excess is the collection refuting the total that summarises it.
+  //
+  // IT NEEDS ITS OWN MEASUREMENT rather than being left to pair 3, which straddles it. `AmountPaid 10`
+  // with `Payments` totalling 30, `AmountCredited 20` and an unsent `CreditNotes` collection makes
+  // `settled` 30 and `explained` 30: pair 3 agrees exactly while the payment list overruns the
+  // payment total by 20. One pair per identity, or an excess hides inside a matching sum.
+  //
+  // AND THIS PAIR TAKES THE EXCESS ARM ONLY, NOT THE UNMEASURABLE ONE — deliberately, and it is r31's
+  // lesson rather than an omission. `seen` is null only when a payment's wire amount is unreadable,
+  // and the guard immediately above already refuses that response unless a RECORD is unreadable too —
+  // in which case `classifyLedgerSettlement` answers `record-unmeasurable` before the completeness
+  // gate is reached. Measured: absent, blank and over-bound payment amounts all yield `unknown`
+  // today. So `|| seen === null` here would be a guard no input can reach, which reads as protection
+  // while being decoration. The credit-note and `explained` arms DO take it because there the
+  // unmeasurable term leaves no record behind — see both.
+  const paymentsExceedTotal = amountPaid !== null && seen !== null && exceeds(seen, amountPaid, invoiceCurrency)
 
   // THE SHAPE-INDEPENDENT SETTLEMENT ACCOUNTING (Codex round 6, finding 3) — the same arithmetic
   // the QuickBooks probe already does, for the same reason, because `AmountPaid` is not the whole
@@ -237,48 +1960,213 @@ export async function probeXeroSettlement(
   // fails visibly and a human resolves it. A credit that IS itemised explains itself and changes
   // no verdict, so the ordinary part-credited invoice still pays automatically — which is the
   // difference between reading the collections and simply refusing on `AmountCredited > 0`.
-  const total = num(invoice.Total)
-  const amountDue = num(invoice.AmountDue)
-  const amountCredited = num(invoice.AmountCredited)
-  const settled = total !== null && amountDue !== null
-    ? total - amountDue
-    // Fallback for a response that omits the totals: the two component fields, which is still
-    // strictly more than `AmountPaid` alone was.
-    : amountPaid !== null && amountCredited !== null ? amountPaid + amountCredited : null
-  const applied = [sumApplied(invoice.CreditNotes), sumApplied(invoice.Prepayments), sumApplied(invoice.Overpayments)]
-    .reduce<number | null>((sum, part) => (sum === null || part === null ? null : sum + part), 0)
-  // Null the moment any read settlement is unmeasurable: an unknown addend makes the whole sum
-  // unknown, and an unknown sum must not be allowed to "explain" anything.
-  const explained = records.reduce<number | null>(
-    (sum, record) => (sum === null || record.amount === null ? null : sum + record.amount),
-    applied,
-  )
-  if (settled !== null && settled > XERO_AMOUNT_EPSILON
-    && (explained === null || settled - explained > XERO_AMOUNT_EPSILON)) {
+  // o3d-obyd: read at the top of this arm, with the refusal that a stated-but-unreadable one now
+  // takes. What is left here is only which of them this check uses.
+  const total = totalRead.value
+  const amountDue = amountDueRead.value
+  const amountCredited = amountCreditedRead.value
+  // o3d-acctmoney — ABSENT IS ZERO, AND IT IS THE ORDINARY INVOICE. An unreadable one never reaches
+  // here: `completenessCannotRun` above has already refused it. So the only two states left are
+  // "Xero stated a deduction" and "Xero stated none", and the second is arithmetically the first
+  // with a zero in it — which is why this is a `?? 0` and NOT another `!== null` guard. A guard here
+  // would put the identity back in the state the finding is about: correct on the documents that
+  // state the field and silently three-termed on the ones that do not.
+  const cisDeduction = cisDeductionRead.value ?? toDecimal(0)
+  // o3d-obyd r31 (Codex HIGH 2) — TWO FORMS OF ONE FIGURE, AND THEY MUST AGREE OR NEITHER IS BELIEVED.
+  //
+  // THEY ARE ONE FIGURE, BY XERO'S OWN DEFINITION. `AmountDue = Total - AmountPaid - AmountCredited`,
+  // so `Total - AmountDue` and `AmountPaid + AmountCredited` are the SAME quantity — how much has
+  // come off this document — rearranged. The fallback exists because a response may omit the totals,
+  // not because the two are different questions.
+  //
+  // THE DEFECT. The code took `Total - AmountDue` unconditionally whenever the pair was present and
+  // never looked at the other. So `Total 100, AmountDue 100, AmountPaid 0, AmountCredited 10,
+  // Payments: []` produced a settled value of EXACTLY ZERO — `statesAnything` false, the shortfall
+  // check passes on nothing, the empty list is "proved", and the classifier answers `clear` — while
+  // the same response simultaneously states that 10 was credited. A proved zero forged out of two
+  // figures that contradict each other, and `clear` is what authorises a second payment.
+  //
+  // THE PREVIOUS ROUND MET THIS EXACT SHAPE AND ONLY CORRECTED THE FIXTURE — a test invoice whose
+  // `Total - AmountDue` said 60 had settled while `AmountPaid + AmountCredited` said 50. Removing the
+  // contradiction from the test data left production still accepting it, which is why it is a code
+  // path now and not a comment.
+  //
+  // WHY REFUSE RATHER THAN PREFER THE LARGER. Taking whichever figure is safer would be picking a
+  // winner between two statements that cannot both be true, which is a guess about WHICH ONE Xero
+  // meant. When two derivations of one quantity disagree, the RESPONSE is incoherent — stale, partial
+  // or malformed — and nothing else read out of it is trustworthy either, including the collections
+  // the shortfall check is about to measure. So the probe refuses, the row holds visibly, and a human
+  // looks at a document Xero is describing inconsistently.
+  //
+  // THE BAND IS `completenessBand`, the same fraction of the document's own minor unit every other
+  // completeness comparison in this file uses — not equality, because both sides are read from stated
+  // decimals and the ordinary document agrees to the penny.
+  //
+  // o3d-acctmoney (Codex HIGH) — AND THE IDENTITY HAS A THIRD TERM, WHICH IS THE FIRST TIME THIS
+  // BRANCH'S TIGHTENING REFUSED A DOCUMENT XERO CAN LEGITIMATELY SEND.
+  //
+  // THE DEFECT. `AmountDue = Total - AmountPaid - AmountCredited` is only Xero's arithmetic OUTSIDE
+  // the UK Construction Industry Scheme. Inside it Xero also takes `CISDeduction` off `AmountDue` —
+  // money the contractor withholds and pays to HMRC rather than to the subcontractor. Codex's shape,
+  // reproduced: `Total 400, CISDeduction 80, AmountDue 320, AmountPaid 0, AmountCredited 0`. The
+  // check above then compared 80 against 0 and refused a WHOLLY UNPAID, PERFECTLY COHERENT invoice
+  // as self-contradictory, so the first payment against every CIS invoice — and every retry of it —
+  // was sent to manual resolution.
+  //
+  // WHY THAT MATTERS MORE THAN THE ARITHMETIC. Every other refusal in this file costs a document
+  // that IS malformed, or one whose collections IMS genuinely cannot measure. This one cost a
+  // document that is exactly right, on a whole class of UK invoice, on the FIRST payment — the most
+  // ordinary operation there is. A cross-check that refuses correct documents does not survive
+  // contact with the people who have to clear the queue; it gets deleted, and the duplicate-payment
+  // class it was protecting goes out with it.
+  //
+  // WHY THE TERM BELONGS TO `settled` AND NOT ONLY TO THE AGREEMENT CHECK BELOW. `settled` is spent
+  // twice — once against `settledFromComponents`, and once against `explained`, the sum of the
+  // payments and applied credit/prepayment/overpayment amounts. A CIS deduction appears in NONE of
+  // those collections, because there is no settlement behind it. Subtracting it only in the
+  // agreement check would have moved the same refusal one comparison later: `settled` 80,
+  // `explained` 0, and "80 already settled but only 0 of it is accounted for". So it is subtracted
+  // where the figure is CONSTRUCTED, and both identities inherit it.
+  //
+  // THE FALLBACK PAIR NEEDS NO SUCH TERM. `AmountPaid + AmountCredited` counts settlements, and the
+  // deduction is not one — it is the reason a subcontractor is owed less, not a thing that has been
+  // paid. The two derivations agree at `Total - AmountDue - CISDeduction` precisely because the
+  // deduction is what the four-term identity says it is.
+  const settledFromTotals = total !== null && amountDue !== null
+    ? subtractMoney(subtractMoney(total, amountDue), cisDeduction)
+    : null
+  // Fallback for a response that omits the totals: the two component fields, which is still
+  // strictly more than `AmountPaid` alone was.
+  const settledFromComponents = amountPaid !== null && amountCredited !== null
+    ? addMoney(amountPaid, amountCredited)
+    : null
+  if (settledFromTotals !== null && settledFromComponents !== null
+    && compareDecimal(subtractMoney(settledFromTotals, settledFromComponents).abs(),
+      completenessBand(invoiceCurrency)) > 0) {
     return {
       ok: false,
-      reason: `Xero reports ${settled.toFixed(2)} already settled against this document but `
+      reason: `Xero states two amounts settled against this document that do not agree — `
+        + `${formatLedgerMoney(settledFromTotals)} by Total less AmountDue`
+        // o3d-acctmoney: named only when there IS one, so the ordinary invoice's sentence is
+        // unchanged and a CIS invoice that still disagrees says which third term was taken off.
+        + (statesAnything(cisDeduction, invoiceCurrency)
+          ? ` less the ${formatLedgerMoney(cisDeduction)} CIS deduction`
+          : '')
+        + ` and `
+        + `${formatLedgerMoney(settledFromComponents)} by AmountPaid plus AmountCredited. These are `
+        + 'the same figure in Xero\'s own arithmetic, so the response is inconsistent and IMS cannot '
+        + 'tell how much of the document is already settled from either of them',
+    }
+  }
+  const settled = settledFromTotals ?? settledFromComponents
+  const applied = sumExact([
+    sumApplied(invoice.CreditNotes, invoiceCurrency),
+    sumApplied(invoice.Prepayments, invoiceCurrency),
+    sumApplied(invoice.Overpayments, invoiceCurrency),
+  ])
+  // Null the moment any read settlement is unmeasurable: an unknown addend makes the whole sum
+  // unknown, and an unknown sum must not be allowed to "explain" anything.
+  const explained = sumExact(wireAmounts, applied)
+  if (settled !== null && statesAnything(settled, invoiceCurrency)
+    && (explained === null || shortBy(settled, explained, invoiceCurrency))) {
+    return {
+      ok: false,
+      reason: `Xero reports ${formatLedgerMoney(settled)} already settled against this document but `
         + (explained === null
           ? 'IMS could not measure what it holds against it'
-          : `only ${explained.toFixed(2)} of it is accounted for by settlements IMS can read`)
-        + (amountCredited !== null && amountCredited > XERO_AMOUNT_EPSILON
-          ? ` (${amountCredited.toFixed(2)} of it credited, not paid)`
+          : `only ${formatLedgerMoney(explained)} of it is accounted for by settlements IMS can read`)
+        + (amountCredited !== null && statesAnything(amountCredited, invoiceCurrency)
+          ? ` (${formatLedgerMoney(amountCredited)} of it credited, not paid)`
           : ''),
     }
   }
-  return { ok: true, records }
+
+  // o3d-nk5n — AND HERE IT IS CLOSED, WHERE o3d-mm51 FILED IT.
+  //
+  // THE DEFECT, AS IT STOOD. An invoice that states NO usable figure — no `Total`/`AmountDue` pair
+  // and no `AmountPaid`/`AmountCredited` fallback pair — runs NEITHER check above and fell through to
+  // `ok: true` over whatever `records` holds. With an absent or empty `Payments` collection that is
+  // an EMPTY list, which `classifyLedgerSettlement` reads as `clear`: the same positive claim on no
+  // evidence the QuickBooks arm was refused for. The exclusion the paragraphs above justify is about
+  // two shapes — a response that omits `Total`/`AmountDue` (the `settled` fallback exists for it) and
+  // an unsettled invoice that states no `AmountCredited` — and in BOTH of those the fallback's OTHER
+  // operand is stated, so `settled` is computable and the check runs. Stating too little for EITHER
+  // form was wider than that justification, and the width was the whole finding.
+  //
+  // WHY THE PREVIOUS ROUND FILED IT INSTEAD. Not the code: 25 fixtures across
+  // `money-post-authorisation.test.ts` and `settlement-probe.test.ts` modelled an ordinary FIRST
+  // payment as the figureless stub `{ InvoiceID: 'inv-1', Payments: [] }`, so closing it failed six
+  // money-post fence tests whose subject is that a first payment proceeds. That is a false model of
+  // Xero, not a cost of the rule — `XeroInvoice` in `xero/invoice-delta.ts` records that Xero returns
+  // these figures "on every invoice", and says in as many words that their optionality exists only
+  // "because the fixtures predate them". The fixtures now state what Xero states, and the ordinary
+  // first payment proves its own emptiness instead of being excused from having to.
+  //
+  // WHAT THE ORDINARY FIRST PAYMENT DOES NOW. An unpaid invoice states `Total` and `AmountDue` EQUAL,
+  // so `settled` is exactly zero, `statesAnything` is false, the check above PASSES, and the probe
+  // answers `ok: true` with an empty record list — `clear`, and the payment posts. Emptiness proved
+  // by two stated figures rather than assumed from four missing ones, which is the same sentence the
+  // QuickBooks arm has carried since o3d-mm51 and now the same FUNCTION.
+  //
+  // o3d-obyd r31: and the SECOND thing `settled` decides here is whether the `Payments` list is
+  // proved whole. It is the identical fact — a stated figure the collection was measured against —
+  // spent on the other half of Codex's asymmetry, so both leave through one function.
+  // o3d-zo4j — PAIR 3 OF 4, AND IT IS THE COMPOSED IDENTITY. `settled` is `Total - AmountDue`, which
+  // is `AmountPaid + AmountCredited` by Xero's own definition; `explained` is `SUM(Payments) +
+  // SUM(applied credit notes, prepayments, overpayments)`, and those two sums are what `AmountPaid`
+  // and `AmountCredited` respectively total. So the pair is one quantity again, by two of Xero's
+  // identities composed rather than one.
+  //
+  // THE ONE PAIR WHERE AN EXCESS COULD CONCEIVABLY BE INNOCENT, stated rather than glossed: it
+  // requires a settlement to be reported in BOTH `Payments` and one of the applied collections, and
+  // nothing observed says Xero does that. If it ever did, the cost is bounded to exactly what this
+  // rule spends — a non-matching probe holds visibly instead of clearing, a matching one is still
+  // `present`, and no money post is refused outright — which is why the rule withholds proof rather
+  // than refusing the probe. The reverse mistake is a second payment.
+  //
+  // AND AN UNMEASURABLE `explained` IS THE OTHER HALF OF THE CLOSING AUDIT, for the same reason and by
+  // the same route: `sumApplied` is null the moment a `CreditNotes`, `Prepayments` or `Overpayments`
+  // entry states an `AppliedAmount` this code cannot read, the shortfall check excuses that whenever
+  // `settled` is a PROVED ZERO, and an applied credit note is never a RECORD, so nothing else makes
+  // the classifier withhold. Measured before it was closed: `Total 100 / AmountDue 100` with
+  // `CreditNotes: [{}]` and no payments answered `provedComplete: true` over an empty list -> `clear`.
+  const settlementsDoNotProve = settled !== null
+    && (explained === null || exceeds(explained, settled, invoiceCurrency))
+  return settlementAnswer(settled, paymentsExceedTotal || settlementsDoNotProve, records,
+    'Xero states no total, amount due, amount paid or amount credited on this document and IMS '
+    + 'read no payment against it, so it has nothing to tell from — an empty answer here would say '
+    + 'that nothing has settled the document rather than report what does')
 }
 
-/** Money compares to the half-penny here too — the same tolerance the classifier uses. */
-const XERO_AMOUNT_EPSILON = 0.005
+// o3d-r948 — `XERO_AMOUNT_EPSILON` AND `QBO_AMOUNT_EPSILON` WERE HERE, BOTH `0.005`, AND BOTH ARE
+// GONE. They were the ninth site of o3d-78rq's enumeration: two flat half-pennies measuring wire
+// doubles, in a file whose classifier operand had already become exact and whose band had already
+// become a fraction of the document's own minor unit. The direction they failed in was TOO WIDE,
+// which is the direction that lets a `clear` be built from an incomplete list — see
+// `completenessBand`, which is now the single answer for all four checks and both connectors.
 
 type QboLinkedTxn = { TxnId?: string; TxnType?: string }
 type QboPaymentLine = { Amount?: number; LinkedTxn?: QboLinkedTxn[] }
 type QboDocumentBody = {
   LinkedTxn?: QboLinkedTxn[]
-  /** The document's face value and what is still owed on it — the shape-independent cross-check. */
-  TotalAmt?: number
-  Balance?: number
+  /**
+   * The document's face value and what is still owed on it — the shape-independent cross-check.
+   *
+   * o3d-obyd: `number | string`, and the string is not a defensive maybe. QuickBooks serialises these
+   * as JSON STRINGS — `"1200.00"`, `"0.00"` — which is o3d-psrx r10's finding on this same connector,
+   * where `typeof row.Balance === 'number'` failed on a real `Balance` and the payment poller moved to
+   * `parseLedgerAmount`. Declaring them as `number` is what made a reader that only accepted numbers
+   * look correct beside them; the type now says what the wire says.
+   */
+  TotalAmt?: number | string
+  Balance?: number | string
+  /**
+   * o3d-78rq — the currency the applied amounts below are stated in. QuickBooks OMITS this whenever
+   * multicurrency is off, which is the ordinary single-currency company, so `null` is the common case
+   * and not an error: `ledgerMinorUnits(null)` answers it exactly as it answers every other unstated
+   * currency in this repository.
+   */
+  CurrencyRef?: { value?: string }
 }
 
 /**
@@ -346,9 +2234,6 @@ const QBO_NON_SETTLING_LINK_TYPES: ReadonlySet<string> = new Set([
   'Invoice', 'Bill', 'InventoryQuantityAdjustment',
 ])
 
-/** Money compares to the half-penny, as everywhere else on this path. */
-const QBO_AMOUNT_EPSILON = 0.005
-
 /**
  * The amount a QuickBooks payment applied to ONE document.
  *
@@ -356,19 +2241,43 @@ const QBO_AMOUNT_EPSILON = 0.005
  * line for a single document. Summing the lines linked to this document is what compares like with
  * like. A payment with no readable line for it yields null, which reads as `unknown`.
  */
-function qboAmountAppliedTo(lines: QboPaymentLine[] | undefined, documentId: string, txnType: string): number | null {
-  if (!lines) return null
-  let total: number | null = null
+function qboAmountAppliedTo(
+  lines: QboPaymentLine[] | undefined,
+  documentId: string,
+  txnType: string,
+  currency: string | null,
+): { wire: number | null; exact: Decimal | null } {
+  if (!lines) return { wire: null, exact: null }
+  let wire: number | null = null
+  let exact: Decimal | null = null
   for (const line of lines) {
     const linked = (line.LinkedTxn ?? []).some(
       (t) => str(t.TxnId) === documentId && str(t.TxnType) === txnType,
     )
     if (!linked) continue
     const amount = num(line.Amount)
-    if (amount === null) return null
-    total = (total ?? 0) + amount
+    if (amount === null) return { wire: null, exact: null }
+    // o3d-mm51: the EXACT term takes the same magnitude reading the document's own figures now do.
+    // `explained` is the side of `shortBy` that ACCOUNTS for money, so a decode that can no longer
+    // hold half a minor unit inflates it and swallows the very shortfall it was measuring. The `wire`
+    // term is deliberately left as the untouched double: `statedAmount` judges THAT one with the rule
+    // its own decision needs (`readLedgerStatedAmount`, the full amount bound plus the scale), and a
+    // line this reading refuses makes the whole payment unmeasurable, which withholds.
+    const reading = wireAmount(amount, currency)
+    if (reading.value === null) return { wire: null, exact: null }
+    // TWO READINGS OF THE SAME LINES, FROM ONE WALK (o3d-r948).
+    //
+    // `wire` is the double sum, UNCHANGED, and it is what `statedAmount` is asked about — the record's
+    // amount must be a figure `readLedgerStatedAmount` can prove the ledger stated, and a summed
+    // double is exactly the shape that rule exists to judge (o3d-78rq).
+    //
+    // `exact` is the same lines added as decimals, for the completeness arithmetic, which asks a
+    // different question and must not lose a minor unit in its own addition. They are returned
+    // together so nothing can ever sum a DIFFERENT set of lines for the two answers.
+    wire = (wire ?? 0) + amount
+    exact = (exact ?? toDecimal(0)).add(reading.value)
   }
-  return total
+  return { wire, exact }
 }
 
 export async function probeQuickBooksSettlement(
@@ -435,7 +2344,15 @@ export async function probeQuickBooksSettlement(
   }
   const settlementIds = paymentLinks.map((t) => str(t.TxnId))
 
+  const documentCurrency = ledgerCurrencyCode(body.CurrencyRef?.value)
   const records: LedgerSettlementRecord[] = []
+  // o3d-78rq: as on the Xero side, the applied figures are kept for the completeness arithmetic and
+  // the records carry the ones `readLedgerStatedAmount` will vouch for. `qboAmountAppliedTo` SUMS a
+  // payment's lines, and a sum of doubles is exactly where a figure stops being the one the ledger
+  // stated — which is why the record's reading is asked of that sum rather than assumed of it.
+  //
+  // o3d-r948: and the completeness term is the SAME lines added exactly. Two readings, one walk.
+  const wireApplied: Array<Decimal | null> = []
   for (const id of settlementIds) {
     const res = await qboGet<Record<string, { TxnDate?: string; PrivateNote?: string; Line?: QboPaymentLine[] } | undefined>>(
       `${settlementPath}/${encodeURIComponent(id)}`,
@@ -446,8 +2363,10 @@ export async function probeQuickBooksSettlement(
     const settlement = res.data?.[settlementKey]
     if (!settlement) return { ok: false, reason: `QuickBooks returned no ${settlementKey} ${id}` }
     const date = str(settlement.TxnDate)
+    const applied = qboAmountAppliedTo(settlement.Line, documentId, linkedType, documentCurrency)
+    wireApplied.push(applied.exact)
     records.push({
-      amount: qboAmountAppliedTo(settlement.Line, documentId, linkedType),
+      ...statedAmount(applied.wire, documentCurrency),
       date: date.length >= 10 ? date.slice(0, 10) : null,
       id,
       // PrivateNote is where IMS writes its mark on this connector.
@@ -455,6 +2374,51 @@ export async function probeQuickBooksSettlement(
     })
   }
 
+  // o3d-acctmoney — AND THE THIRD IDENTITY WAS AUDITED FOR THE SAME OMISSION. `Balance` has no CIS
+  // term: the Construction Industry Scheme is a UK payroll deduction Xero models on the document and
+  // QuickBooks Online does not model at all. What DOES come off a QuickBooks `Balance` without being
+  // a payment — a deposit, a vendor credit, a credit memo, a journal entry — is money genuinely OFF
+  // the document, so `TotalAmt - Balance` counting it is CORRECT and it surfaces here as an
+  // unexplained amount rather than as a false agreement. That is the opposite of the CIS case, where
+  // the figure was never a settlement at all, and it is why this arm needs no change.
+  //
+  // o3d-jfhi — AND THAT AUDIT WAS RE-RUN AGAINST THE PUBLISHED CONTRACT RATHER THAN AGAINST THE
+  // FIELD NAMES ANYONE COULD THINK OF, BECAUSE THAT IS THE DIFFERENCE THE FINDING WAS ABOUT.
+  //
+  // SOURCE: Intuit's QuickBooks Online entity reference for `Invoice` and `Bill`.
+  //
+  //   Balance        "The balance reflecting any payments made against the transaction. Initially
+  //                  this will be equal to the TotalAmt."
+  //   TotalAmt       "Indicates the total amount of the transaction. This includes the total of all
+  //                  the charges, allowances and taxes."
+  //   Deposit        "Amount in deposit against the Invoice. Supported for Invoice only."
+  //   HomeBalance,   the same two figures in the company's HOME currency.
+  //   HomeTotalAmt
+  //   DiscountAmt    "Indicates the discount amount that is applied on the transaction as a whole."
+  //
+  // WHAT THE RE-READ FOUND THAT THE INFERRED LIST DID NOT. `Deposit` is a documented FIELD on the
+  // Invoice entity, and the paragraph above knew "deposit" only as a `LinkedTxn` TYPE. They are not
+  // the same thing: a deposit recorded in the field can reduce `Balance` while linking NOTHING, so
+  // the `uncovered` list stays empty and the refusal's sentence falls to "links no transaction that
+  // accounts for it" — which is, as it happens, exactly the right sentence.
+  //
+  // AND IT IS STILL NOT A TERM, WHICH IS THE OPPOSITE CONCLUSION TO THE CIS ONE AND FOR THE REASON
+  // THAT DISTINGUISHES THEM: A DEPOSIT IS MONEY THAT MOVED. A customer paid it. `TotalAmt - Balance`
+  // counting it is the truth, and IMS genuinely cannot see it, so the honest answer is the
+  // unexplained-shortfall refusal this arm already gives — not a subtraction. Subtracting it would
+  // UNDERSTATE what has come off the document, which is the direction that forges a proved zero and
+  // authorises a second payment. `CISDeduction` is subtracted precisely because NO money moved: it is
+  // the reason a subcontractor is owed less, not a settlement anyone made.
+  //
+  // `Bill` carries no `Deposit` at all — the contract says "Supported for Invoice only" — so the bill
+  // arm's identity is `TotalAmt - Balance` with nothing else documented against it.
+  //
+  // AND THE PAIR READ IS THE TRANSACTION-CURRENCY ONE ON PURPOSE. `HomeTotalAmt`/`HomeBalance` are
+  // the same two figures converted, and this arm sizes its band with `CurrencyRef` — the transaction
+  // currency. Mixing one of each would compare a converted figure against an unconverted collection
+  // at the wrong minor unit. Named for the reason the Xero arm names `BankAmount`: adjacent field,
+  // similar spelling, silent FX difference.
+  //
   // THE SHAPE-INDEPENDENT SETTLEMENT ACCOUNTING. Everything above depends on a list of type names
   // being right, and the bug this replaces was a list of type names being wrong. `TotalAmt` and
   // `Balance` are not names — they are the document's own account of how much of it has been
@@ -473,15 +2437,29 @@ export async function probeQuickBooksSettlement(
   // alternative is the fence being told the document is clear when an operator has already
   // settled it. Restoring automatic coverage means READING those entities (each has its own line
   // and link shape), which is a bigger change than this fence should carry — tracked separately.
-  const total = num(body.TotalAmt)
-  const balance = num(body.Balance)
-  const applied = total !== null && balance !== null ? total - balance : null
+  //
+  // o3d-obyd — ARM 3 OF 3, AND THE ONE THE FINDING IS ABOUT. QuickBooks sends these two as STRINGS —
+  // that is o3d-psrx r10, recorded in this connector's own payment poller, which is why the poller
+  // reads them through `parseLedgerAmount`. This probe was not moved with it, so `TotalAmt: "1200.00"`
+  // with `Balance: "0.00"` read as no figures at all, `applied` was null, and with nothing uncovered
+  // linked the check below did not run: `ok: true` over an EMPTY record list, `clear`, and a second
+  // payment against a bill QuickBooks reports as fully settled.
+  const totalRead = wireAmount(body.TotalAmt, documentCurrency)
+  const balanceRead = wireAmount(body.Balance, documentCurrency)
+  const cannotRun = completenessCannotRun([['TotalAmt', totalRead], ['Balance', balanceRead]])
+  if (cannotRun !== null) {
+    return {
+      ok: false,
+      reason: `QuickBooks states ${cannotRun} on this ${documentKey.toLowerCase()}, which IMS cannot read `
+        + 'as an amount, so it cannot tell how much of it is already settled',
+    }
+  }
+  const total = totalRead.value
+  const balance = balanceRead.value
+  const applied = total !== null && balance !== null ? subtractMoney(total, balance) : null
   // Null the moment any read settlement's applied amount is unreadable: an unknown addend makes
   // the whole sum unknown, and an unknown sum must not be allowed to "explain" anything.
-  const explained = records.reduce<number | null>(
-    (sum, record) => (sum === null || record.amount === null ? null : sum + record.amount),
-    0,
-  )
+  const explained = sumExact(wireApplied)
   // `Payment` and the bill-payment spellings appear in BOTH tables — they are the covered shape on
   // one document kind and an uncovered one on the other — so the payment table wins first, or a
   // settlement this probe has just READ would be counted as one it cannot account for.
@@ -499,19 +2477,83 @@ export async function probeQuickBooksSettlement(
           + 'total or balance, so IMS cannot tell how much of it is already settled',
       }
     }
-  } else if (applied > QBO_AMOUNT_EPSILON && (explained === null || applied - explained > QBO_AMOUNT_EPSILON)) {
+    // o3d-mm51 (Codex HIGH 2) — AND ABSENCE MUST NOT DO MORE THAN SKIP.
+    //
+    // THE DEFECT. o3d-obyd drew ABSENT apart from UNREADABLE and was right to: a check that cannot be
+    // run must not FAIL, or every ordinary document would refuse. What it then let absence do is more
+    // than skip. With no `TotalAmt` and no `Balance`, `applied` is null, the arithmetic above is
+    // skipped, and control fell through to `return { ok: true, records }` — over an EMPTY record
+    // list, which `classifyLedgerSettlement` reads as `clear`. That is not the ABSENCE of a
+    // conclusion, it is the POSITIVE conclusion "nothing has settled this document" drawn from having
+    // no figure to read, and `clear` is what authorises a money post. A sparse or schema-degraded
+    // `{ Bill: {} }` could buy a second payment with it.
+    //
+    // SO THE TWO ARE SEPARATED. Skipping arithmetic that cannot be done stays — that part was right.
+    // CONTRIBUTING A CONCLUSION does not: when the document states neither figure AND this probe read
+    // no settlement of its own, it has nothing to answer from in EITHER direction, and it says so
+    // rather than answering in the permissive one.
+    //
+    // WHAT AN ORDINARY FIRST PAYMENT DOES — which is what absence was kept permissive FOR, and it
+    // still works. QuickBooks states `TotalAmt` and `Balance` on every bill and invoice that exists,
+    // and an unpaid one states them EQUAL. So the ordinary first payment reads `TotalAmt "1200.00"`
+    // with `Balance "1200.00"`, `applied` is exactly 0, `statesAnything` is false, the check PASSES,
+    // and the probe answers `ok: true` with an empty record list — `clear`, and the payment posts.
+    // That is emptiness PROVED by two stated figures rather than assumed from two missing ones, which
+    // is the whole difference. The refusal below is reachable only by a document that states neither,
+    // and that is not a shape QuickBooks sends for a document that is there.
+    //
+    // AND A DOCUMENT WITH NO FIGURES WHOSE SETTLEMENTS THIS PROBE DID READ still answers — but
+    // o3d-obyd r31 corrected WHAT it answers. This paragraph used to end "`records` is then evidence
+    // in its own right and the verdict is decided by comparing it", and that is true only of a
+    // COMPARISON THAT MATCHES. With no `TotalAmt` and no `Balance` nothing measured the link list, so
+    // a linked payment that is not ours does not show that ours is absent — QuickBooks may simply not
+    // have sent it. Such an answer is now marked unproved and a non-match yields `unknown`; a match
+    // still yields `present`. See `settlementAnswer` and `LedgerSettlementProbe.provedComplete`.
+    //
+    // o3d-nk5n: and this rule is the SHARED one rather than this arm's own. Both Xero arms reached
+    // the same fall-through and were closed by routing through the same function — `applied` is this
+    // arm's `settled`. Shared rather than re-spelled so that a change to the rule cannot reach one
+    // connector and miss the other; r31 is that guarantee being cashed, since it changed the rule for
+    // all three arms by changing one function.
+  } else if (statesAnything(applied, documentCurrency)
+    && (explained === null || shortBy(applied, explained, documentCurrency))) {
     return {
       ok: false,
-      reason: `QuickBooks reports ${applied.toFixed(2)} already applied to this ${documentKey.toLowerCase()} but `
+      reason: `QuickBooks reports ${formatLedgerMoney(applied)} already applied to this ${documentKey.toLowerCase()} but `
         + (explained === null
           ? 'IMS could not measure what the payments it links applied to it'
-          : `only ${explained.toFixed(2)} of it is accounted for by payments IMS can read`)
+          : `only ${formatLedgerMoney(explained)} of it is accounted for by payments IMS can read`)
         + (uncovered.length > 0
           ? ` (${uncovered.join(', ')} linked)`
           : links.length === 0 ? ' and links no transaction that accounts for it' : ''),
     }
   }
-  return { ok: true, records }
+  // o3d-zo4j — PAIR 4 OF 4, AND IT IS THE ONE THAT IS A BOUND RATHER THAN AN IDENTITY — WHICH IS WHY
+  // IT TAKES THE EXCESS RULE AND NOT THE MIRROR OF THE SHORTFALL ONE.
+  //
+  // `TotalAmt - Balance` counts money off this document by ANY means, including the vendor credits,
+  // deposits and journals this probe does not read; `explained` counts only the payment lines it did.
+  // So the honest relation is `explained <= applied`, not equality — that inequality is exactly why
+  // the shortfall check above is a real check and not a tautology. It also makes an EXCESS a
+  // contradiction outright: every payment line linked to this document reduces its `Balance` by the
+  // amount of that line, so the read payments can never account for MORE than the document says has
+  // come off it. A voided QuickBooks payment states a zero line and an unapplied one is not linked,
+  // so neither reaches this sum; the one shape that could produce an excess innocently is a payment
+  // AMENDED between the document read and the payment read, and a picture assembled across an edit is
+  // not one to certify a collection from either.
+  //
+  // THE EXCESS ARM ONLY, for the same reason the invoice's payment pair takes only that one.
+  // `qboAmountAppliedTo` sets its two readings in ONE walk, so `exact` is null exactly when `wire` is
+  // — and `wire` is what the record's amount is read from, so every unmeasurable term here leaves a
+  // record with a null amount and `classifyLedgerSettlement` withholds on that record before it
+  // reaches the completeness gate. Measured: a linked BillPayment whose lines name a DIFFERENT bill
+  // yields `unknown` today. A `|| explained === null` arm would be unfalsifiable.
+  const paymentsExceedApplied = applied !== null && explained !== null
+    && exceeds(explained, applied, documentCurrency)
+  return settlementAnswer(applied, paymentsExceedApplied, records,
+    `QuickBooks states no total or balance on this ${documentKey.toLowerCase()} and IMS read no `
+    + 'settlement against it, so it has nothing to tell from — an empty answer here would say '
+    + 'that nothing has settled the document rather than report what does')
 }
 
 /**
@@ -524,13 +2566,28 @@ export async function probeLedgerSettlement(
   connector: 'xero' | 'quickbooks',
   target: SettlementProbeTarget,
 ): Promise<LedgerSettlementProbe> {
+  // o3d-r948 r6 — THE TWO-SNAPSHOT PROVENANCE READ WAS HERE, AND IS GONE.
+  //
+  // r5 read the active token before and after the fetch and reported the value when the two agreed,
+  // so a caller could tell whether the ids it held belonged to the organisation that answered. Two
+  // reads of one value prove nothing about the interval between them: an A→B→A reconnect across the
+  // remote call makes both say A while B served it, and the records would then be labelled A.
+  //
+  // Nothing consumes the answer now — `classifyLedgerSettlement` excludes no record on any identity
+  // — so the unsound reading is removed rather than left standing beside a caller that might trust
+  // it. A sound version is REQUEST-BOUND, not snapshot-bound: propagate the `tenantId` `XeroResponse`
+  // already carries and the `realmId` `qboFetch` resolves and drops, and refuse a multi-fetch probe
+  // whose responses disagree. bd o3d-llyw has the estimate.
   try {
-    if (connector === 'xero') {
-      const { xeroGet } = await import('./xero/api')
-      return await probeXeroSettlement(target, xeroGet as XeroFetcher)
-    }
-    const { qboGet } = await import('./quickbooks/api')
-    return await probeQuickBooksSettlement(target, qboGet as QboFetcher)
+    return connector === 'xero'
+      ? await (async () => {
+        const { xeroGet } = await import('./xero/api')
+        return await probeXeroSettlement(target, xeroGet as XeroFetcher)
+      })()
+      : await (async () => {
+        const { qboGet } = await import('./quickbooks/api')
+        return await probeQuickBooksSettlement(target, qboGet as QboFetcher)
+      })()
   } catch (e) {
     return { ok: false, reason: e instanceof Error ? e.message : String(e) }
   }
@@ -540,7 +2597,7 @@ export async function probeLedgerSettlement(
  * The document a probe answers about, so several rows targeting the same one share a single read.
  *
  * Delegates to the SAME key the money-post lock is taken on (round 6, Codex CRITICAL #2): the
- * document the exclusion covers and the document the probe reads must not be able to be two
+ * document the verdict covers and the document the probe reads must not be able to be two
  * different things.
  */
 export function settlementProbeKey(target: SettlementProbeTarget): string {
@@ -574,6 +2631,14 @@ export async function ledgerClearsFollowUpRevival(params: {
   const { classifyLedgerSettlement, describeAttempt, settlementMarkerFor } = await import('@/lib/domain/accounting/ledger-settlement-evidence')
   const probe = await probeLedgerSettlement(params.connector, { type: params.type, payload: params.payload })
   const marker = settlementMarkerFor(effectiveTokenFor(params.connector, { id: params.syncLogId ?? '', payload: params.payload }))
+  // o3d-r948 r6 — AN UNMEASURABLE SETTLEMENT HOLDS THIS REVIVAL BACK, AND NOW THAT IS THE ONLY RULE.
+  //
+  // r3 to r5 this gate carried a note explaining why it passed no `settlementsOfOtherAttempts`: it
+  // is handed ONE row and no siblings, so it held no ids to exclude with, and it accepted the
+  // resulting hold as the cost of the rule rather than a gap in it. r6 removed the option outright
+  // (see `classifyLedgerSettlement`), so every caller is now in the position this one was always in
+  // — and the note is kept only so the next reader knows the omission here was deliberate before it
+  // was mandatory.
   const verdict = classifyLedgerSettlement(describeAttempt(params.type, params.payload, marker), probe)
   if (verdict.outcome === 'clear') return { clear: true }
   return {
@@ -855,6 +2920,44 @@ export async function authoriseMoneyPost(
       }
       // Undescribable AND the ledger is not empty: this row cannot say what it would create, so it
       // cannot rule itself out against what is already there. Refuse on what is visible.
+      //
+      // o3d-obyd r31 — AND THIS IS THE ONE PLACE OUTSIDE `classifyLedgerSettlement` THAT READS A
+      // CONCLUSION STRAIGHT OUT OF A RECORD LIST. It reads the strongest one: an empty list is taken
+      // as "there is nothing here that could be confused with this attempt", and the row PROCEEDS TO
+      // POST. That inference has exactly the premise Codex's HIGH 1 is about — it is sound only if
+      // the empty list is the whole collection.
+      //
+      // IT IS SOUND HERE, AND NOT BY ACCIDENT OF THIS LINE. `settlementAnswer` refuses a response
+      // that states no settled figure AND carries no record, so an UNPROVED probe always has at
+      // least one record and `records.length > 0` already catches every one of them. Adding
+      // `|| !probe.provedComplete` here would be a guard that cannot fire — no input reaches it, so
+      // nothing could ever show it working, and a check nobody can break reads as protection while
+      // being decoration. r31 wrote it, could not kill it with a mutant, and removed it again.
+      //
+      // o3d-zo4j — AND THE FUTURE ARM ARRIVED, SO THE GUARD IS BACK AND IT HAS INPUTS.
+      //
+      // r31's premise was that `settlementAnswer` refuses the ONLY unproved shape there was — no
+      // settled figure AND no record — so `ok && !provedComplete` implied `records.length > 0`. This
+      // round adds a SECOND way to be unproved: a collection that EXCEEDS the figure certifying it.
+      // That one is reached with the figure stated, so nothing refuses it, and it can carry an EMPTY
+      // record list — a credit note whose allocations all belong to OTHER invoices contradicts its own
+      // `RemainingCredit` while this bill's filtered list has nothing in it. The length test would then
+      // read that empty list as "nothing here could be confused with this attempt" and POST, on a
+      // collection the probe has just said is not to be trusted as whole.
+      //
+      // So it is its own arm rather than a widened condition: the sentence below counts settlements,
+      // and this shape has none to count. It is falsifiable — delete it and the credit-note excess
+      // authorises the post.
+      if (probe.ok && !probe.provedComplete && probe.records.length === 0) {
+        return {
+          proceed: false,
+          error: 'Not sent: this entry does not record the amount its attempt would send, and the '
+            + 'accounting connector contradicted its own account of what has settled this document, '
+            + 'so what it returned is not proof of what it holds. An empty list from a reading like '
+            + 'that is not evidence there is nothing here, and sending could pay it twice. Resolve '
+            + 'this entry by hand.',
+        }
+      }
       if (!probe.ok || probe.records.length > 0) {
         return {
           proceed: false,
@@ -870,6 +2973,24 @@ export async function authoriseMoneyPost(
 
   for (const contender of contenders) {
     const marker = settlementMarkerFor(effectiveTokenFor(params.connector, contender))
+    // o3d-r948 r6 — THIS LOOP NEVER NEEDED THE EXCLUSION, AND NOW NOBODY HAS IT.
+    //
+    // r3 recorded here why omitting `settlementsOfOtherAttempts` cost this site nothing, and the
+    // argument survives the option's removal intact — it is worth keeping, because it is the one
+    // place in the codebase where the exclusion would provably have changed no verdict:
+    //
+    //   Every attempt that could have recorded an id on this document is IN `contenders` — that is
+    //   what the sibling query selects — so a record the exclusion would skip is one this very loop
+    //   judges on its own turn. That turn cannot answer `clear` for it either: the record is
+    //   unmeasurable (the only case the exclusion ever changed), so its owner's turn returns
+    //   `record-unmeasurable`. The verdict is the same refusal either way; only the sentence differs.
+    //
+    //   The contenders this loop drops are dropped for reasons that also disqualify their recorded
+    //   ids: `attemptCouldHaveReachedTheLedger` false PROVES no call was made, so the row owns no
+    //   settlement, and `attemptCouldBeTheSameDocument` false means whatever it owns settles another
+    //   document.
+    //
+    // What changed in r6 is only that there is no option to omit. See `classifyLedgerSettlement`.
     const verdict = classifyLedgerSettlement(describeAttempt(params.type, contender.payload, marker), probe)
     if (verdict.outcome === 'clear') continue
     if (verdict.outcome === 'present') {

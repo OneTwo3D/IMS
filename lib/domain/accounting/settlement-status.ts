@@ -20,6 +20,20 @@ import {
   OPERATOR_ASSERTION_SETTLEMENT_BASIS,
   isOperatorAssertedSettlement,
 } from '@/lib/domain/accounting/sync-row-settlement'
+import {
+  exactAmountReadingOrLegacy,
+  statedAmountOnly,
+  type ExactAmountReading,
+  type ExactAmountRefusal,
+} from '@/lib/domain/accounting/registered-amount'
+import {
+  addMoney,
+  compareDecimal,
+  ledgerAmountEpsilon,
+  toDecimal,
+  type Decimal,
+  type DecimalInput,
+} from '@/lib/domain/math/decimal'
 import { hasPostEvidence, registrationLedgerStanding } from './payment-ledger-hold'
 
 /** The payment sync row for one invoice/bill, reduced to what the verdict depends on. */
@@ -28,8 +42,29 @@ export type PaymentSyncRow = {
   externalTransactionId?: string | null
   errorMessage?: string | null
   retryCount?: number
-  /** What was actually sent to the ledger, in the document's currency. */
+  /** What was actually sent to the ledger, in the document's currency. As a JSON number, on the wire. */
   amount?: number | null
+  /**
+   * o3d-4ozd — THE SAME FIGURE, EXACTLY, FOR THE ARITHMETIC THAT DECIDES THE VERDICT.
+   *
+   * `amount` above is what went on the wire and stays what it has always been. This is the figure
+   * the part/over-settlement comparison is taken on: `payloadRegisteredAmount`, which prefers the
+   * exact decimal string o3d-1xq8 writes beside the number, carried through `loadInvoicePaymentSyncRows`
+   * and through the aggregate below without a hop through a double.
+   *
+   * o3d-r948 r2 (Codex HIGH 2) — AND IT IS A READING, NOT A FIGURE-OR-NULL.
+   *
+   * ABSENT, or `not-stated`, IS NOT ZERO AND NOT A REFUSAL — it is "this row states no exact
+   * figure", and `syncRowSettledAmount` then reads the number's own exact decimal value, which is
+   * precisely what this comparison made of it before the field existed. A historical row is read
+   * exactly as it is today; only rows that CAN be exact become so.
+   *
+   * `refused` IS A DIFFERENT FACT AND WAS INDISTINGUISHABLE FROM IT. `payloadRegisteredAmount`
+   * answers null for a payload whose exact decimal string will not parse and for one stating another
+   * currency; both arrived here as the same null the absent field arrives as, and both then got the
+   * lossy number beside them — the number the refusal is ABOUT. See {@link ExactAmountReading}.
+   */
+  registeredAmount?: ExactAmountReading
   /** The local Payment row it was queued for; null on rows the order's own invoice follow-up queued. */
   paymentId?: string | null
   /**
@@ -39,6 +74,69 @@ export type PaymentSyncRow = {
    * which must not turn that into a SETTLED verdict however well the numbers line up.
    */
   settlementBasis?: string | null
+}
+
+/**
+ * HOW MUCH THIS ROW SETTLED, AS AN EXACT DECIMAL — the one reading of it (o3d-4ozd, Codex HIGH).
+ *
+ * THE DEFECT. o3d-6yho gave the two settlement comparisons a currency-derived band and left both
+ * OPERANDS as doubles: the row's wire `amount`, and the caller's `.toNumber()` of the stored
+ * document total. An exact tolerance over collapsed operands is still a lossy comparison — if the
+ * two figures already agree as doubles, the precision of the band decides nothing. Codex's own
+ * figures reach it: a stored total of `35184372088832.0040` and a registration of
+ * `35184372088832.01` are 0.006 apart, which is OVER-settled against a 0.005 band, and they convert
+ * to the SAME double. The comparison then reads `x > x + band`, and a ledger holding six thousandths
+ * more than IMS claims was received got a green SETTLED with `discrepancy: false`.
+ *
+ * That is the third time on this branch with this shape — `paid-coverage.ts` (epsilon derived,
+ * `Number` arithmetic left), the capacity guard (`amountDecimal` added, the reader left on the lossy
+ * field), and here. So the rule is written down once, in a reader both the aggregate and the
+ * classifier go through, rather than at each comparison.
+ *
+ * NULL IS "CANNOT BE COMPARED", exactly as an absent `amount` has always been: the classifier skips
+ * both comparisons and the verdict falls through to SETTLED rather than manufacturing a shortfall
+ * out of a figure nobody stated.
+ */
+export function syncRowSettledAmount(row: PaymentSyncRow): Decimal | null {
+  return statedAmountOnly(syncRowAmountReading(row))
+}
+
+/**
+ * o3d-r948 r2 (Codex HIGH 2) — THE SAME READING, SAYING WHICH OF THE THREE FACTS IT IS.
+ *
+ * THE DEFECT. `syncRowSettledAmount` was `row.registeredAmount ?? toDecimal(row.amount)`, and this
+ * repository's own rule — written for `exactPayloadDecimal` and quoted at
+ * {@link ExactAmountReading} — is that a present-but-unreadable exact figure is a refusal, never a
+ * fallback to the lossy number beside it. Three outcomes arrived as one null (no exact figure was
+ * ever written; one was and will not parse; one was, in another currency) and the last two took the
+ * wire number. That is the rule broken in the code that states it.
+ *
+ * The fallback now belongs to `exactAmountReadingOrLegacy`, which is the one place in this
+ * repository allowed to substitute a number for a figure, and it substitutes for NOT-STATED only.
+ *
+ * A non-finite `amount` answers NOT-STATED rather than throwing: today it fails both comparisons and
+ * the row reads SETTLED, and an unreadable figure must not become a page that will not render.
+ */
+export function syncRowAmountReading(row: PaymentSyncRow): ExactAmountReading {
+  return exactAmountReadingOrLegacy(row.registeredAmount, row.amount)
+}
+
+/**
+ * The document total the comparison is taken against, exactly (o3d-4ozd).
+ *
+ * `DecimalInput`, so a caller that HOLDS the stored `Decimal` can hand it over without a conversion
+ * it has no business making — which is what `app/actions/sales.ts` and `app/actions/purchase-orders.ts`
+ * were both doing. A total that cannot be read as a decimal answers NULL, which is the same
+ * "cannot be compared" an absent total has always meant.
+ */
+function documentTotalDecimal(total: DecimalInput): Decimal | null {
+  if (total == null) return null
+  if (typeof total === 'number' && !Number.isFinite(total)) return null
+  try {
+    return toDecimal(total)
+  } catch {
+    return null
+  }
 }
 
 export type SettlementStatus =
@@ -70,6 +168,22 @@ export type SettlementStatus =
    * amount. Not a settlement and not a rejection: a claim with a weaker basis than either.
    */
   | 'ASSERTED_UNVERIFIED'
+  /**
+   * o3d-r948 r2 — THE ROW STATES A SETTLED FIGURE AND IMS WILL NOT READ IT.
+   *
+   * Its exact decimal string does not parse, or it is stated in a currency that is not this
+   * document's. Either way the amount comparison below CANNOT be taken, and the two verdicts it
+   * would have produced are both unavailable.
+   *
+   * IT EXISTS SO THAT THE REFUSAL IS NOT A GREEN BADGE. A `null` amount falls through to SETTLED —
+   * that is the module's long-standing reading of "nobody stated a figure", and it is defensible
+   * for a row that states none. It is NOT defensible for a row that states one this code declined
+   * to read: nothing has been compared, so "Settled in the ledger" is a claim with no basis at all,
+   * and it is exactly the green-over-an-outstanding-balance this module exists to prevent. So the
+   * refusal gets its own status and its own `discrepancy: true`, which is the difference between a
+   * silence and a refusal being visible to whoever has to fix it.
+   */
+  | 'SETTLEMENT_AMOUNT_UNREADABLE'
 
 /**
  * WHAT THE VERDICT RESTS ON — the answer's basis, returned alongside the answer (o3d-nf9i r3).
@@ -102,6 +216,27 @@ export type SettlementVerdict = {
   basis: SettlementEvidenceBasis
 }
 
+/**
+ * The refusal, in words an operator can act on — never the enum name.
+ *
+ * Each sentence names the FIGURE or the UNIT as the thing that failed, because that is where the
+ * person reading it has to go: a malformed decimal string is IMS's own record being wrong, while a
+ * currency mismatch is a registration that belongs to another document's money entirely.
+ */
+function describeAmountRefusal(reason: ExactAmountRefusal): string {
+  switch (reason) {
+    case 'exact-decimal-malformed':
+    case 'exact-decimal-not-a-string':
+      return 'the exact amount recorded with it is not a figure IMS can read'
+    case 'currency-not-stated':
+      return 'it does not record which currency its amount is in'
+    case 'currency-mismatch':
+      return 'it records an amount in a different currency from this document'
+    case 'sum-term-unreadable':
+      return 'one of the registrations it sums states an amount IMS cannot read'
+  }
+}
+
 export function settlementStatus(input: {
   /** Has the document been marked paid in IMS? */
   paidLocally: boolean
@@ -115,8 +250,32 @@ export function settlementStatus(input: {
   documentPosted: boolean
   /** The latest payment sync row for this document, if any was ever queued. */
   payment: PaymentSyncRow | null
-  /** The document total in its own currency, to tell a full settlement from a part payment. */
-  totalForeign?: number | null
+  /**
+   * The document total in its own currency, to tell a full settlement from a part payment.
+   *
+   * o3d-4ozd — IT TAKES THE STORED VALUE. `SalesOrder.totalForeign` and `PurchaseInvoice.totalForeign`
+   * are `Decimal(18, 4)` and both callers used to write `Number(...)` on the way in; above about
+   * 4.5e13 the spacing between neighbouring doubles exceeds the band this comparison allows, so a
+   * total and a registration that differ by more than the band arrive as the SAME figure. The
+   * conversion is not the caller's business to get right, so it is no longer asked for.
+   */
+  totalForeign?: DecimalInput
+  /**
+   * o3d-6yho (3 of 3) — THE DOCUMENT'S CURRENCY, because the two comparisons below turn on how small
+   * an amount counts as nothing and that answer is not the same in every currency.
+   *
+   * Both tests used to band a bare `0.005`, which is half a penny in GBP and FIVE whole minor units
+   * in a Gulf dinar, fifty in CLF. A document short by four fils then read as fully SETTLED: a green
+   * badge over a balance the ledger is still accounting for, which is the direction that stops
+   * anyone looking. The band is now `ledgerAmountEpsilon` — half one minor unit of THIS document's
+   * currency — the same rule the reversal readers and the capacity guards derive from.
+   *
+   * Absent or null takes the STRICTEST band, exactly as `ledgerAmountEpsilon` documents: too large a
+   * band hides a real shortfall behind a clean verdict, while too small a one can only move a
+   * document from SETTLED into PARTIALLY_SETTLED or OVER_SETTLED — a verdict that makes someone
+   * look. Optional so a caller that has no currency to state cannot state a wrong one.
+   */
+  currency?: string | null
 }): SettlementVerdict {
   if (!input.paidLocally) {
     // THE DISAGREEMENT POINTING THE OTHER WAY. Deleting a receipt whose registration already reached the
@@ -254,7 +413,7 @@ export function settlementStatus(input: {
           detail:
             `An operator recorded this as paid in the ledger (payment ${p.externalTransactionId}) on their own ` +
             `assertion — IMS never made the call, never read the document and never compared the amount. The ` +
-            `figure shown here (${typeof p.amount === 'number' ? p.amount : 'unknown'}) is what IMS meant to send, ` +
+            `figure shown here (${syncRowSettledAmount(p)?.toFixed() ?? 'unknown'}) is what IMS meant to send, ` +
             `not what the ledger recorded, so a part payment against this invoice would look identical. Open ` +
             `payment ${p.externalTransactionId} in the accounting system and confirm its amount against the ` +
             `document total.`,
@@ -263,32 +422,69 @@ export function settlementStatus(input: {
       // PART PAYMENT IS NOT SETTLEMENT. markBillPaid accepts an explicit amountForeign and queues only
       // that, so a GBP1 payment against a GBP1,000 bill posted a SYNCED row with an id — and a green
       // "Paid" badge over the GBP999 the ledger still shows outstanding (Codex, PR #570 round 2).
-      const total = input.totalForeign
-      const paid = p.amount
-      if (typeof total === 'number' && typeof paid === 'number' && total > 0 && paid + 0.005 < total) {
+      //
+      // o3d-4ozd (Codex HIGH) — BOTH OPERANDS ARE `Decimal`, NOT ONLY THE BAND.
+      //
+      // The band became the document's own minor unit in o3d-6yho and the two figures it measures
+      // stayed doubles, which is the same defect one layer out: an exact tolerance over collapsed
+      // operands decides nothing, because the operands agreed before the band was consulted. Both
+      // sides now arrive exact — the total from storage, the payment through `syncRowSettledAmount`
+      // — and the comparison is taken with `compareDecimal`. The SENTENCES print `toFixed`, not
+      // `toNumber`: at the magnitudes this finding is about a `toNumber` would print the two figures
+      // as the SAME number, and "recorded 35184372088832.01 against a settlement of
+      // 35184372088832.01, so it is OVER-paid" is a sentence no operator can act on.
+      const total = documentTotalDecimal(input.totalForeign)
+      // o3d-r948 r2 (Codex HIGH 2) — A REFUSED FIGURE IS NOT A MISSING ONE, AND MUST NOT READ GREEN.
+      //
+      // `syncRowAmountReading` now says which of the three facts the row holds. `not-stated` keeps
+      // its old behaviour exactly — no comparison, and the verdict falls through to SETTLED — because
+      // that is what this module has always made of a row that names no figure. `refused` is the case
+      // that used to be indistinguishable from it AND used to be handed the wire number instead; it
+      // can be neither, so it is named.
+      const reading = syncRowAmountReading(p)
+      if (reading.kind === 'refused') {
         return {
-          status: 'PARTIALLY_SETTLED',
+          status: 'SETTLEMENT_AMOUNT_UNREADABLE',
           discrepancy: true,
-          detail:
-            `The ledger recorded a PART payment of ${paid} against a total of ${total} (payment ` +
-            `${p.externalTransactionId}), so a balance is still outstanding there while IMS shows this ` +
-            `as paid in full.`,
           basis: 'LEDGER_CONFIRMED',
+          detail:
+            `The ledger accepted payment ${p.externalTransactionId}, but IMS cannot read what this ` +
+            `registration says it settled (${describeAmountRefusal(reading.reason)}), so the amount has ` +
+            `NOT been compared against the document total. This does NOT say the document is unpaid — ` +
+            `it says nothing here has checked how much of it was paid. Open payment ` +
+            `${p.externalTransactionId} in the accounting system and confirm its amount against the total.`,
         }
       }
-      // OVER-PAYMENT IS ALSO A DISAGREEMENT, and only the shortfall was being checked (Codex, PR #582
-      // round 6). Reachable after a synced receipt is deleted and a SMALLER correction recorded: the
-      // ledger keeps the larger payment, the correction is refused as a second live registration, and
-      // comparing "ledger 100" against "claimed 40" one way round returned a green Settled over an
-      // invoice the ledger has been over-paid on.
-      if (typeof total === 'number' && typeof paid === 'number' && total > 0 && paid > total + 0.005) {
-        return {
-          status: 'OVER_SETTLED',
-          discrepancy: true,
-          detail:
-            `The ledger recorded ${paid} against a settlement of ${total} (payment ` +
-            `${p.externalTransactionId}), so it is OVER-paid there — reverse or adjust the payment in the ledger.`,
-          basis: 'LEDGER_CONFIRMED',
+      const paid = statedAmountOnly(reading)
+      // o3d-6yho: half one minor unit of THIS document's currency, not a hard-coded half-penny.
+      const settlementBand = ledgerAmountEpsilon(input.currency ?? null)
+      if (total !== null && paid !== null && total.gt(0)) {
+        if (compareDecimal(addMoney(paid, settlementBand), total) < 0) {
+          return {
+            status: 'PARTIALLY_SETTLED',
+            discrepancy: true,
+            detail:
+              `The ledger recorded a PART payment of ${paid.toFixed()} against a total of ` +
+              `${total.toFixed()} (payment ${p.externalTransactionId}), so a balance is still ` +
+              `outstanding there while IMS shows this as paid in full.`,
+            basis: 'LEDGER_CONFIRMED',
+          }
+        }
+        // OVER-PAYMENT IS ALSO A DISAGREEMENT, and only the shortfall was being checked (Codex, PR #582
+        // round 6). Reachable after a synced receipt is deleted and a SMALLER correction recorded: the
+        // ledger keeps the larger payment, the correction is refused as a second live registration, and
+        // comparing "ledger 100" against "claimed 40" one way round returned a green Settled over an
+        // invoice the ledger has been over-paid on.
+        if (compareDecimal(paid, addMoney(total, settlementBand)) > 0) {
+          return {
+            status: 'OVER_SETTLED',
+            discrepancy: true,
+            detail:
+              `The ledger recorded ${paid.toFixed()} against a settlement of ${total.toFixed()} ` +
+              `(payment ${p.externalTransactionId}), so it is OVER-paid there — reverse or adjust the ` +
+              `payment in the ledger.`,
+            basis: 'LEDGER_CONFIRMED',
+          }
         }
       }
       return {
@@ -434,8 +630,38 @@ export function aggregatePaymentSyncRows(rows: PaymentSyncRow[]): PaymentSyncRow
   // A SYNCED row whose payload carries no amount makes the SUM unknowable, not zero — and a wrong sum
   // is what decides full settlement from part settlement. Unknown propagates as null, which
   // settlementStatus reads as "cannot compare" rather than as a shortfall.
-  const amountUnknown = synced.some((r) => typeof r.amount !== 'number')
-  const syncedAmount = amountUnknown ? null : synced.reduce((sum, r) => sum + (r.amount as number), 0)
+  //
+  // o3d-4ozd (Codex HIGH) — AND IT IS SUMMED AS `Decimal`, FROM EACH ROW'S EXACT FIGURE.
+  //
+  // This sum is one side of the comparison the classifier takes against the document total, so every
+  // argument `sumRegisteredAmounts` makes in `xero/invoice-delta.ts` applies here unchanged: adding
+  // the payload doubles let two four-decimal registrations against a large order total to a figure a
+  // whole minor unit away from their true sum, and the band the classifier then applies cannot see a
+  // difference that was destroyed before it was consulted. Each term is read through
+  // `syncRowSettledAmount` — the exact decimal string where the row states one, and the double's own
+  // exact decimal reading where it does not, which is precisely what this reduce made of it before.
+  //
+  // o3d-r948 r2: and the SUM carries the same tri-state its terms do. A term that was REFUSED makes
+  // the sum a refusal — the aggregate is then a row stating a figure IMS will not read, which is
+  // exactly what the term was — while a term that merely states nothing makes the sum state nothing,
+  // which is what this reduce has always answered for such a row. Collapsing the two here would have
+  // reinstated the finding one function further along.
+  const readings = synced.map((r) => syncRowAmountReading(r))
+  const refusedTerm = readings.find((a) => a.kind === 'refused')
+  const syncedRegistered: ExactAmountReading = refusedTerm
+    ? { kind: 'refused', reason: 'sum-term-unreadable' }
+    : readings.some((a) => a.kind !== 'stated')
+      ? { kind: 'not-stated' }
+      : {
+          kind: 'stated',
+          amount: readings.reduce<Decimal>(
+            (sum, a) => addMoney(sum, (a as { kind: 'stated'; amount: Decimal }).amount),
+            toDecimal(0),
+          ),
+        }
+  // THE NUMBER IS NOW A CONVERSION OF THE EXACT SUM, not a sum of conversions. It stays on the row
+  // because every reader that only DISPLAYS the figure reads `amount`; nothing decides on it.
+  const syncedAmount = syncedRegistered.kind === 'stated' ? syncedRegistered.amount.toNumber() : null
   // THE BASIS AGGREGATES WORST-FIRST, exactly as the status does (o3d-nf9i r3). One asserted leg
   // among several makes the WHOLE settlement unverified: the sum being compared against the document
   // total now contains a number nothing checked, so the comparison cannot be trusted for any of it.
@@ -447,11 +673,24 @@ export function aggregatePaymentSyncRows(rows: PaymentSyncRow[]): PaymentSyncRow
 
   const failed = rows.find((r) => r.status === 'FAILED')
   if (failed) {
-    return { ...failed, amount: syncedAmount, settlementBasis: failed.settlementBasis ?? syncedBasis }
+    // `registeredAmount` is OVERRIDDEN, not inherited from the spread: the terminal row carries its
+    // OWN exact figure, and the aggregate's amount is the SYNCED sum. Letting the spread through
+    // would have handed the classifier one row's amount beside every row's number.
+    return {
+      ...failed,
+      amount: syncedAmount,
+      registeredAmount: syncedRegistered,
+      settlementBasis: failed.settlementBasis ?? syncedBasis,
+    }
   }
   const cancelled = rows.find((r) => r.status === 'CANCELLED')
   if (cancelled) {
-    return { ...cancelled, amount: syncedAmount, settlementBasis: cancelled.settlementBasis ?? syncedBasis }
+    return {
+      ...cancelled,
+      amount: syncedAmount,
+      registeredAmount: syncedRegistered,
+      settlementBasis: cancelled.settlementBasis ?? syncedBasis,
+    }
   }
   const inFlight = rows.filter((r) => r.status === 'PENDING' || r.status === 'PROCESSING')
   if (inFlight.length > 0) {
@@ -461,6 +700,7 @@ export function aggregatePaymentSyncRows(rows: PaymentSyncRow[]): PaymentSyncRow
       errorMessage: inFlight.find((r) => r.errorMessage)?.errorMessage ?? null,
       retryCount: inFlight.reduce((max, r) => Math.max(max, r.retryCount ?? 0), 0),
       amount: syncedAmount,
+      registeredAmount: syncedRegistered,
       settlementBasis: syncedBasis,
     }
   }
@@ -474,6 +714,7 @@ export function aggregatePaymentSyncRows(rows: PaymentSyncRow[]): PaymentSyncRow
     errorMessage: null,
     retryCount: synced.reduce((max, r) => Math.max(max, r.retryCount ?? 0), 0),
     amount: syncedAmount,
+    registeredAmount: syncedRegistered,
     settlementBasis: syncedBasis,
   }
 }
@@ -507,13 +748,22 @@ export function aggregatePaymentSyncRows(rows: PaymentSyncRow[]): PaymentSyncRow
  * and they are the seam a per-order marker would attach to if the historical invoices are ever
  * distinguished properly (the posted SALES_INVOICE payload's own `lineAmountsIncludeTax` is the exact
  * signal); reading either of them again would re-introduce the defect this collapse removes.
+ *
+ * o3d-6abj — IT ANSWERS A `Decimal`, AND IT TAKES ONE. `SalesOrder.totalForeign` is `Decimal(18, 4)`
+ * and the capacity guards subtract this figure from a receipt to decide whether money may move. Both
+ * of them used to write `Number(order.totalForeign)` at the call site, and above ~4.5e13 the double
+ * spacing exceeds the band those guards allow: a stored total of `35184372088832.0040` and a receipt
+ * of `35184372088832.01` — 0.006 apart, which MUST refuse — convert to the SAME double, and the
+ * guard approves an over-settlement (Codex, o3d-acctmoney r20 HIGH). The conversion is not the
+ * caller's business to get right, so this function no longer offers one: it takes the stored value
+ * and hands back the exact figure. A caller that genuinely needs a number asks for it explicitly.
  */
 export function ledgerSalesInvoiceTotalForeign(input: {
-  totalForeign: number
-  taxForeign: number
+  totalForeign: DecimalInput
+  taxForeign: DecimalInput
   pricesIncludeVat: boolean
   /** Did this order arrive from a shop connector (WooCommerce), rather than being raised in IMS? */
   importedFromShop: boolean
-}): number {
-  return input.totalForeign
+}): Decimal {
+  return toDecimal(input.totalForeign)
 }

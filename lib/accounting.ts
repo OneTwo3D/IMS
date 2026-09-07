@@ -8,6 +8,14 @@ import { resolveAccountingEnqueueOrderScope } from '@/lib/domain/accounting/enqu
 import { hasLockedSalesOrder } from '@/lib/domain/sales/allocation-service'
 import { lockFollowUpScope } from '@/lib/domain/accounting/followup-scope-lock'
 import { stampingCustodyOnCreate } from '@/lib/domain/accounting/money-attempt-provenance'
+import { withSavepoint } from '@/lib/db/savepoint'
+import {
+  classifyPriorAttempts,
+  describeUnresolvedPriorAttempt,
+  isIdempotencyKeyIndexCollision,
+  PRIOR_ATTEMPT_SELECT,
+  priorAttemptsWhere,
+} from '@/lib/domain/accounting/prior-posting-evidence'
 
 export type AccountingSettings = {
   syncEnabled: boolean
@@ -443,20 +451,45 @@ export async function queueAccountingSyncTx(
   })
 
   if (params.idempotencyKey) {
-    const existing = await tx.accountingSyncLog.findFirst({
-      where: {
+    // o3d-d0pd: EVERY prior attempt for this key, in ANY status. Read through `tx`, so this runs
+    // behind the follow-up scope lock taken immediately above and a concurrent enqueue for the same
+    // key cannot slip its row in between this read and the create below. The three-status predicate
+    // this replaced was blind to a FAILED attempt, and so is the partial unique index that would
+    // otherwise have been the backstop. See prior-posting-evidence.ts.
+    const priorAttempts = await tx.accountingSyncLog.findMany({
+      where: priorAttemptsWhere({
+        ...params,
         connector: context.connector,
-        type: params.type,
-        referenceType: params.referenceType,
-        referenceId: params.referenceId,
-        status: { in: ['PENDING', 'PROCESSING', 'SYNCED'] },
-        payload: { path: ['_idempotencyKey'], equals: params.idempotencyKey },
-      },
-      select: { id: true },
+        idempotencyKey: params.idempotencyKey,
+      }),
+      select: PRIOR_ATTEMPT_SELECT,
     })
+    const verdict = classifyPriorAttempts(priorAttempts)
     // NOTHING IS WRITTEN HERE. `queued: true` means "the work is on the queue", not "this call put
     // it there" — see ConnectorEnqueueOutcome.reason (o3d-ekn8 r4).
-    if (existing) return answer({ queued: true, reason: 'already-queued' }, context.connector)
+    if (verdict.kind === 'live' || verdict.kind === 'posted') {
+      return answer({ queued: true, reason: 'already-queued' }, context.connector)
+    }
+    if (verdict.kind === 'unresolved') {
+      // REFUSED, not decided — the posting is still owed. Written through `tx` so it shares the
+      // caller's fate: a refusal recorded against a transaction that then rolls back would be a
+      // warning about something that did not happen.
+      //
+      // NOT swallowed, unlike the two connector queues' own logs. Those open their own transaction
+      // and a failed log there costs nothing; here a failed statement has already aborted the
+      // CALLER's transaction, and continuing on an aborted transaction turns a refusal the caller
+      // could act on into a commit failure it cannot explain. Let it throw.
+      await tx.activityLog.create({
+        data: {
+          entityType: 'SYSTEM',
+          action: 'accounting_enqueue_refused_unresolved_attempt',
+          tag: 'accounting',
+          level: 'WARNING',
+          description: describeUnresolvedPriorAttempt({ ...params, syncLogId: verdict.syncLogId }),
+        },
+      })
+      return answer({ queued: false, reason: 'refused' }, context.connector)
+    }
   }
 
   try {
@@ -465,7 +498,26 @@ export async function queueAccountingSyncTx(
       import('@/lib/domain/accounting/accounting-event-mirror'),
     ])
     const baseCurrency = await getBaseCurrencyCode()
-    const log = await tx.accountingSyncLog.create({
+    // o3d-d0pd r2 (Codex MEDIUM) — THE ONLY STATEMENT HERE THAT MAY RAISE A HANDLED ERROR, AND SO
+    // THE ONLY ONE THAT NEEDS ISOLATING.
+    //
+    // The catch below detects `accounting_sync_logs_idempotency_key_uq` and answers `queued: true`.
+    // That detection was dead code until this round fixed it (o3d-5od: `String(error)` never
+    // contains the index name under `@prisma/adapter-pg`), which means the path it guards is NEWLY
+    // REACHABLE — and reaching it was worse than throwing. `tx` is the CALLER's interactive
+    // transaction; PostgreSQL aborts the whole transaction on the 23505, Prisma wraps no savepoint
+    // around individual statements, and so every statement the caller issues after this function
+    // returns — and the COMMIT itself — fails with 25P02. Callers that immediately write COGS or
+    // transit subledger rows are exactly the ones that would have hit it. "Detected, reported, and
+    // then the caller's transaction cannot commit" is not a handled collision.
+    //
+    // The savepoint is what makes the catch genuinely recoverable: rolling back to it clears the
+    // aborted state and leaves the rest of the transaction intact and committable.
+    //
+    // WRAPPED AROUND THE CREATE ALONE, not the whole block. The outbox schedule and the event mirror
+    // that follow are ordinary work whose failure is NOT handled here — isolating them would only
+    // hide it. The collision can come from nothing but this INSERT.
+    const log = await withSavepoint(tx, () => tx.accountingSyncLog.create({
       data: {
         connector: context.connector,
         type: params.type,
@@ -484,7 +536,7 @@ export async function queueAccountingSyncTx(
         // money-attempt-provenance.ts. A row created without it is never recycled again.
         ...stampingCustodyOnCreate(),
       },
-    })
+    }))
     if (context.connector === 'xero') {
       const { scheduleXeroAccountingOutbox } = await import('@/lib/connectors/xero/outbox')
       await scheduleXeroAccountingOutbox(tx, {
@@ -513,8 +565,17 @@ export async function queueAccountingSyncTx(
   } catch (error) {
     // A unique-key collision means a concurrent insert already queued this posting,
     // so the GL counterpart exists — treat as queued.
-    if (params.idempotencyKey && String(error).includes('accounting_sync_logs_idempotency_key_uq')) {
-      return answer({ queued: true }, context.connector)
+    //
+    // o3d-d0pd: detected through the shared reader rather than a substring of the error text, which
+    // the driver adapter never contains (o3d-5od).
+    //
+    // o3d-d0pd r2: AND THE TRANSACTION IS USABLE WHEN THIS RETURNS. The create above runs inside a
+    // savepoint, so the 23505 that brought us here has already been rolled back to it and the
+    // caller's interactive transaction is committable — which is the whole difference between
+    // reporting a handled collision and reporting one the caller then cannot act on. See the note on
+    // the create.
+    if (params.idempotencyKey && isIdempotencyKeyIndexCollision(error)) {
+      return answer({ queued: true, reason: 'already-queued' }, context.connector)
     }
     throw error
   }

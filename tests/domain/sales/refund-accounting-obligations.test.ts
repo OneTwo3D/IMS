@@ -335,15 +335,27 @@ test('o3d-2sm1 r8: the transactional enqueue names the connector it resolved, on
     )
   }
 
-  // o3d-ekn8 r4: and the ONE of the three that writes nothing says so. `queued: true` from the
-  // idempotency short-circuit means "the work is on the queue", not "this call put it there" — a
-  // caller that rolls its write back on that answer rolls back an empty transaction while a live row
-  // is still going to post. Executed against the real enqueue in
+  // o3d-ekn8 r4: and every one of the three that writes nothing says so. `queued: true` without a
+  // write means "the work is on the queue", not "this call put it there" — a caller that rolls its
+  // write back on that answer rolls back an empty transaction while a live row is still going to
+  // post. Executed against the real enqueue in
   // tests/accounting/enqueue-idempotency-short-circuit.test.ts; pinned here beside its siblings.
+  //
+  // ASSERTED AS THE PROPERTY, NOT AS A COUNT OF ONE (o3d-d0pd). r4 wrote "exactly one", which was
+  // true of the code in front of it and not of the rule: there are two exits that report a
+  // counterpart without writing — the prior-attempt short-circuit and the unique-key collision — and
+  // a count pinned at one would have had to be relaxed to let either of them be correct. What
+  // separates the exits is whether a row was written, so that is what is asserted.
   assert.equal(
     queuedAnswers.filter((answer) => answer[0].includes("reason: 'already-queued'")).length,
+    2,
+    'both queued exits that WRITE NOTHING — the prior-attempt short-circuit and the unique-key '
+    + 'collision — must say so',
+  )
+  assert.equal(
+    queuedAnswers.filter((answer) => !answer[0].includes('reason:')).length,
     1,
-    'exactly one queued exit — the short-circuit — reports that it wrote nothing',
+    'and exactly one — the create — reports a queued row it actually wrote',
   )
   assert.match(body, /return answer\(\{ queued: false, reason: 'refused' \}\)/, 'a deleted order scope is REFUSED, not decided')
 

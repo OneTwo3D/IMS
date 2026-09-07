@@ -260,7 +260,10 @@ export async function reconcileXeroPayments(opts: { apply: boolean }): Promise<R
         // refuses a full refund that committed since selection.
         const paid = await db.salesOrder.updateMany({
           where: { id: doc.id, paidAt: null, refundStatus: { not: 'FULL' } },
-          data: { paidAt: settled },
+          // o3d-psrx r2: NULL — a LEDGER-sourced paid flag (Xero re-read as PAID, moments ago). See
+          // SalesOrder.unregisteredPaidAt: this is the provenance for which a later ledger zero really
+          // does mean the payment was taken away.
+          data: { paidAt: settled, unregisteredPaidAt: null },
         })
         if (paid.count === 0) {
           return { applied: false, reason: 'already paid concurrently, or fully refunded since selection' }

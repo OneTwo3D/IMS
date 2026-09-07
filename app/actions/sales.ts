@@ -79,7 +79,7 @@ import { INTERNAL_STATUS_TRANSITION_BYPASS, INTERNAL_STATUS_TRANSITION_AUTH_ONLY
 import { getSalesOrderReference } from '@/lib/sales-order-display'
 import { getBaseCurrencyCode } from '@/lib/base-currency'
 import { decimalToNumber } from '@/lib/decimal'
-import { multiplyMoney, roundQuantity, toDecimal, type DecimalInput } from '@/lib/domain/math/decimal'
+import { addMoney, compareDecimal, ledgerAmountEpsilon, multiplyMoney, roundQuantity, subtractMoney, toDecimal, type Decimal, type DecimalInput } from '@/lib/domain/math/decimal'
 import { validateManualSalesOrderStatusTransition } from '@/lib/domain/workflows/action-guards'
 import {
   buildRealisedFxJournal,
@@ -103,6 +103,7 @@ import {
   expectedSalesOrderLineTaxForeign,
   validateSalesOrderLineTaxInputs,
 } from '@/lib/domain/sales/sales-order-tax-validation'
+import { coversDocumentTotal } from '@/lib/domain/accounting/paid-coverage'
 import { decideChargebackOrderDiscount, resolvePostedOrderDiscount } from '@/lib/domain/accounting/posted-order-discount'
 import { invoiceNumberIsExternallySupplied, resolveSalesInvoiceNumberForPost } from '@/lib/domain/accounting/sales-invoice-number'
 import { decideChargebackDiscountLine, readPostedSalesInvoiceDiscountForOrder } from '@/lib/domain/accounting/posted-document-discount'
@@ -747,18 +748,37 @@ export async function getSalesOrders(
  * full is perfectly consistent. Refund payments are excluded — they settle a credit note, not this
  * invoice — as are payments in some other currency, which cannot be summed with these.
  */
+/** `Math.min` for two money figures, without the conversion `Math.min` would force (o3d-4ozd). */
+function lesserOf(a: Decimal, b: Decimal): Decimal {
+  return compareDecimal(a, b) <= 0 ? a : b
+}
+
+/**
+ * WHAT IMS CLAIMS IT RECEIVED, EXACTLY (o3d-4ozd, Codex HIGH).
+ *
+ * This figure is one of the two operands of the settlement comparison — `settlementStatus` measures
+ * the ledger's registrations against it, through a band derived from the order's own minor unit —
+ * and it was built by summing `Payment.amount` as doubles and taking `Math.max` against a `Number`
+ * of the stored total. `Payment.amount` and `SalesOrder.totalForeign` are both `Decimal(18, 4)`, and
+ * above about 4.5e13 the spacing between neighbouring doubles exceeds the band: two figures a whole
+ * minor unit apart arrive as one, and the exactness of the band decides nothing.
+ *
+ * So the sum stays in `Decimal` from the column to the comparison, and the caller converts nothing.
+ */
 function claimedReceivedForeign(so: {
   currency: string
-  totalForeign: unknown
+  totalForeign: DecimalInput
   paidAt: Date | null
-  payments: { refundId: string | null; amount: unknown; currency: string }[]
-}): number {
+  payments: { refundId: string | null; amount: DecimalInput; currency: string }[]
+}): Decimal {
   const local = so.payments
     .filter((p) => !p.refundId && p.currency === so.currency)
-    .reduce((sum, p) => sum + Number(p.amount), 0)
+    .reduce<Decimal>((sum, p) => addMoney(sum, p.amount), toDecimal(0))
   // An imported paid order (WooCommerce) has paidAt but NO local payment rows — its receipt was never
   // recorded as a Payment. Paid-in-full is then the claim, and the order total is its size.
-  return so.paidAt ? Math.max(local, Number(so.totalForeign)) : local
+  if (!so.paidAt) return local
+  const stated = toDecimal(so.totalForeign)
+  return compareDecimal(local, stated) >= 0 ? local : stated
 }
 
 export async function getSalesOrder(id: string): Promise<SoDetail | null> {
@@ -811,11 +831,11 @@ export async function getSalesOrder(id: string): Promise<SoDetail | null> {
     // switched off expects no payment to post, and calling that a discrepancy would paint every paid
     // order permanently red for a setting someone chose on purpose.
     isAccountingSyncTypeEnabled('INVOICE_PAYMENT').catch(() => false),
-    loadInvoicePaymentSyncRows(so.id, activeConnector?.id ?? null),
+    loadInvoicePaymentSyncRows(so.id, activeConnector?.id ?? null, so.currency),
   ])
   const claimedForeign = claimedReceivedForeign(so)
   const settlement = settlementStatus({
-    paidLocally: !!so.paidAt || claimedForeign > 0,
+    paidLocally: !!so.paidAt || claimedForeign.gt(0),
     syncEnabled: paymentSyncEnabled,
     documentPosted: !!so.accountingInvoiceId,
     // History first: a registration whose receipt was deleted, or one a later success overtook, describes
@@ -827,15 +847,22 @@ export async function getSalesOrder(id: string): Promise<SoDetail | null> {
     ),
     // Compared against what the ledger's copy of the invoice was built at, capped by what IMS actually
     // claims to have received — a part payment fully registered is settled for its size.
-    totalForeign: Math.min(
+    // o3d-4ozd: BOTH OPERANDS OF THE CAP ARE `Decimal`, and so is what leaves it.
+    // `ledgerSalesInvoiceTotalForeign` has answered a `Decimal` since o3d-6abj and this call site was
+    // still spending it on a `.toNumber()` so it could meet `claimedReceivedForeign` in `Math.min` —
+    // which put the whole comparison back on doubles one line before the classifier's exact band.
+    totalForeign: lesserOf(
       claimedForeign,
       ledgerSalesInvoiceTotalForeign({
-        totalForeign: Number(so.totalForeign),
-        taxForeign: Number(so.taxForeign),
+        totalForeign: so.totalForeign,
+        taxForeign: so.taxForeign,
         pricesIncludeVat: so.pricesIncludeVat,
         importedFromShop: so.shoppingLinks.length > 0,
       }),
     ),
+    // o3d-6yho (3 of 3): the band that separates a part settlement from a full one is half one
+    // minor unit of THIS order's currency, not a hard-coded half-penny.
+    currency: so.currency,
   })
 
   return {
@@ -3183,9 +3210,21 @@ export async function markSalesOrderPaid(id: string): Promise<{ success: boolean
       const row = await tx.salesOrder.findUnique({ where: { id }, select: { orderNumber: true, externalOrderNumber: true, paidAt: true, invoiceNumber: true } })
       if (!row) return null
       const markingAsPaid = !row.paidAt // transitioning from unpaid to paid
+      const paidAt = markingAsPaid ? new Date() : null
       await tx.salesOrder.update({
         where: { id },
-        data: { paidAt: markingAsPaid ? new Date() : null },
+        data: {
+          paidAt,
+          // o3d-psrx r2 — A HUMAN SAYING SO IS NOT A REGISTRATION EITHER.
+          //
+          // This control records no `Payment` row and queues no INVOICE_PAYMENT: it sets the flag and
+          // (at most) generates an invoice number. So an order marked paid here is held as paid with
+          // nothing whatever in the ledger about a payment, and the poller's reversal pass would read
+          // the ledger's zero as a removal and raise a chargeback against it. The SAME statement that
+          // sets the flag records where it came from; toggling OFF clears both together, which is what
+          // stops a later ledger-sourced paid transition inheriting a stale marker.
+          unregisteredPaidAt: paidAt,
+        },
       })
       return { so: row, markingAsPaid }
     }, STOCK_TX_OPTIONS)
@@ -3408,26 +3447,46 @@ export async function addPayment(input: {
       }
 
       const refundId = input.refundId || null
-      let payableTotal = Number(so.totalForeign)
+      // o3d-psrx r18 (Codex HIGH 2) — EVERY FIGURE BELOW IS THE STORED `Decimal`, NOT A `Number()` OF
+      // IT. `totalForeign` and `Payment.amount` are `Decimal(18, 4)` columns whose range a double
+      // cannot hold at four decimals: above 2^39 the spacing between neighbouring doubles is wider
+      // than one four-decimal minor unit, so two stored figures a whole unit apart converge on one
+      // number. That collapse decided BOTH tests in this block — the over-payment refusal and the
+      // coverage test that clears the off-ledger provenance marker — and neither can be recovered
+      // afterwards. Prisma hands these over as `Decimal`s already; this is simply not discarding them.
+      let payableTotal = toDecimal(so.totalForeign)
       if (refundId) {
         const refund = await tx.salesOrderRefund.findFirst({
           where: { id: refundId, orderId: input.orderId },
           select: { totalForeign: true },
         })
         if (!refund) return { error: 'Refund not found for this order' }
-        payableTotal = Number(refund.totalForeign)
+        payableTotal = toDecimal(refund.totalForeign)
       }
 
       const existingPayments = await tx.payment.findMany({
         where: { orderId: input.orderId, refundId },
         select: { amount: true, currency: true },
       })
-      const totalPaid = existingPayments.reduce((sum, payment) => {
+      const totalPaid = existingPayments.reduce<Decimal>((sum, payment) => {
         if (payment.currency !== so.currency) return sum
-        return sum + Number(payment.amount)
-      }, 0)
-      if (totalPaid + input.amount > payableTotal + 0.0001) {
-        return { error: `Payment exceeds remaining balance (${so.currency} ${(payableTotal - totalPaid).toFixed(2)})` }
+        return addMoney(sum, payment.amount)
+      }, toDecimal(0))
+      // `input.amount` is the one operand that is NOT a stored decimal — it is a `number` off the
+      // client — so it is read at its own exact decimal value and added exactly, rather than the sum
+      // being carried out in the arithmetic that loses the column's precision.
+      const requestedAmount = toDecimal(input.amount)
+      const totalAfter = addMoney(totalPaid, requestedAmount)
+      // AND THE BAND IS DERIVED RATHER THAN A LITERAL, for the reason r17 gave one module over
+      // (lib/domain/accounting/paid-coverage.ts). It was `0.0001`, which is EXACTLY one whole minor
+      // unit in the two four-decimal currencies `currencyMinorUnits` supports (CLF, UYW) — so in those
+      // an over-payment of a full minor unit was admitted by a band that was only ever meant to absorb
+      // arithmetic dust. `ledgerAmountEpsilon(null)` is half the FINEST supported minor unit, strictly
+      // below one unit in every currency and strictly below the old literal in every currency, so this
+      // moves only in the refusing direction — and the dust it was absorbing is gone anyway now that
+      // the sum above is exact.
+      if (totalAfter.gt(addMoney(payableTotal, ledgerAmountEpsilon(null)))) {
+        return { error: `Payment exceeds remaining balance (${so.currency} ${subtractMoney(payableTotal, totalPaid).toFixed(2)})` }
       }
 
       const paidAt = input.paidAt ? new Date(input.paidAt) : new Date()
@@ -3442,12 +3501,101 @@ export async function addPayment(input: {
           notes: input.notes || null,
           paidAt,
         },
-        select: { id: true, paidAt: true },
+        // o3d-1xq8: `amount` is selected because the ledger registration below is enqueued from the
+        // STORED `Decimal` and not from `input.amount`. The two are normally the same figure, and
+        // when they are not it is the stored one that is the receipt.
+        select: { id: true, paidAt: true, amount: true },
       })
 
-      const becamePaid = !refundId && !so.paidAt && totalPaid + input.amount >= Number(so.totalForeign) - 0.0001
+      // o3d-psrx — THE RECEIPT AND `paidAt` COMMIT TOGETHER, AND SOMETHING NOW DEPENDS ON THAT.
+      //
+      // The ledger registration is queued AFTER this transaction commits
+      // (`registerInvoicePaymentWithLedger` below), because a receipt is a FACT an operator recorded
+      // and must never be rolled back by a queue that declines — the opposite of `markBillPaid`,
+      // where the paid transition is an INSTRUCTION and rolling it back is the honest answer
+      // (o3d-a3wx). So there IS a window in which IMS holds this order as paid with no registration
+      // raised, and the payment poller used to read that as "IMS never told the ledger about a
+      // payment here", clear `paidAt`, and raise a chargeback credit note against a sale nobody
+      // reversed.
+      //
+      // The witness that closes it is the `Payment` row this transaction has already written: there
+      // is no instant at which a reader can see `paidAt` set and not see the receipt that set it.
+      // `unregisteredLocalReceipts` in lib/connectors/xero/invoice-delta.ts is that reader. SPLITTING
+      // these two writes across transactions — in either order — reopens the defect.
+      //
+      // AND THE MARKER IS CLEARED BY COVERAGE, NOT BY THE EXISTENCE OF A RECEIPT (r6, Codex HIGH 2).
+      //
+      // `unregisteredPaidAt` asserts something about the WHOLE paid balance: "no ledger receipt
+      // covers this flag". A £1 receipt on a £100 order hand-marked paid does not make that false —
+      // £99 of it is still settled by nothing IMS ever told the ledger about — and this action
+      // explicitly permits partial receipts (the guard above rejects only an OVER-payment). Round 5
+      // cleared the marker on ANY non-refund receipt, which erased the provenance of the whole
+      // balance on the strength of a penny of it, leaving the order with exactly one thing the
+      // classifier can see: a single registration for £1. Retire that registration and the order
+      // reads NOTHING_REGISTERED — an ADMITTED reversal — and a chargeback credit note is raised
+      // against £100 the customer paid.
+      //
+      // So the same test decides both writes: do the non-refund receipts on this order, THIS ONE
+      // INCLUDED, cover its total? That is already the test `becamePaid` applies; it is simply not
+      // the only branch that needs it.
+      //
+      // r7 (Codex HIGH 1): and it is now the test the REVERSAL READER applies too, spelt once in
+      // `coversDocumentTotal`. The reader refuses to treat a part-covering registration's absence as a
+      // reversal of the whole order while this marker stands, which is only sound while its comparison
+      // and this one are the same comparison. See lib/domain/accounting/paid-coverage.ts.
+      //
+      // r18: `so.totalForeign` and not `payableTotal` — the two differ for a refund receipt, and this
+      // question is about the ORDER. Both sides are the stored decimals.
+      const coversOrderTotal = !refundId && coversDocumentTotal(totalAfter, toDecimal(so.totalForeign))
+      const becamePaid = !so.paidAt && coversOrderTotal
       if (becamePaid) {
-        await tx.salesOrder.update({ where: { id: input.orderId }, data: { paidAt: new Date() } })
+        await tx.salesOrder.update({
+          where: { id: input.orderId },
+          // o3d-psrx r2: NULL — this order is paid on a `Payment` row, which is a receipt the witness
+          // above already reads. `unregisteredPaidAt` marks the paid flags that have NO receipt to be
+          // read (WooCommerce's `date_paid_gmt`, `markSalesOrderPaid`), and stamping it here would
+          // withhold reversals for the one population that is already witnessed. Written explicitly,
+          // not omitted: an order marked paid by hand and THEN given a receipt must lose the marker.
+          data: { paidAt: new Date(), unregisteredPaidAt: null },
+        })
+      } else if (coversOrderTotal) {
+        // o3d-psrx r5 (Codex HIGH 1) — AND THE ORDER THAT WAS ALREADY PAID LOSES IT TOO.
+        //
+        // The comment above says "an order marked paid by hand and THEN given a receipt must lose the
+        // marker", and the branch it sat in could not do that: `becamePaid` requires `!so.paidAt`, so
+        // the one order that is ALREADY paid off-ledger and is now being given a receipt took the
+        // other path and kept its marker for ever. That is not a cosmetic leftover. The receipt gets
+        // an INVOICE_PAYMENT registration moments later, and the marker it left behind is what the
+        // paid-episode fence weighs that registration against — so a paid flag with a real, posted,
+        // ledger-visible receipt behind it still answered PAID_WITHOUT_LEDGER_RECEIPT, and a genuine
+        // chargeback on it was never recognised. The provenance has to be REPLACED when a receipt is
+        // recorded, not only when the receipt is what made the order paid.
+        //
+        // IN THIS TRANSACTION, beside the `Payment` row, for the reason the note above gives: the
+        // receipt and the state that describes it must not be separable by a reader.
+        //
+        // `updateMany` with the guard rather than `update`: the overwhelming majority of receipts land
+        // on orders with no marker at all, and this way those pay a predicate instead of a row write.
+        //
+        // WHAT A PERMANENTLY PART-COVERED ORDER READS AS, since a rule that withholds needs its
+        // steady state stated (r6, corrected in r7). It keeps the marker: while the £1 receipt is
+        // unregistered the verdict is RECEIPT_NOT_REGISTERED; while its registration is in flight,
+        // REGISTRATION_UNDECIDED; and once that registration posts and binds, the LEDGER decides
+        // ABOUT THE PART IT COVERS — its absence is PART_COVERED_OFF_LEDGER and its presence is
+        // STILL_HELD, both of which withhold.
+        //
+        // r6 wrote this paragraph as "the LEDGER decides" full stop, on the strength of the reader
+        // consulting the marker only when nothing had posted. That was the r7 finding: the penny's
+        // registration posting is exactly what silenced the marker, and a GBP 100 order was charged
+        // back when that registration went missing. The withholding is not permanent — the receipt
+        // that completes the cover clears the marker here, in this very branch, and the reader's
+        // guard stops running.
+        await tx.salesOrder.updateMany({
+          where: { id: input.orderId, unregisteredPaidAt: { not: null } },
+          // `paidAt` is deliberately NOT written here — this order is already paid and re-stamping it
+          // would move a settlement date an operator can see. Only the provenance changes.
+          data: { unregisteredPaidAt: null },
+        })
       }
       const settlementRateToBase = await resolveSettlementFxRateToBase(tx, {
         currency: so.currency,
@@ -3457,7 +3605,7 @@ export async function addPayment(input: {
         referenceType: 'Payment',
         referenceId: payment.id,
       })
-      return { so, becamePaid, paymentId: payment.id, paidAt: payment.paidAt, settlementRateToBase, baseCurrency }
+      return { so, becamePaid, paymentId: payment.id, paidAt: payment.paidAt, paymentAmount: payment.amount, settlementRateToBase, baseCurrency }
     }, STOCK_TX_OPTIONS)
     if ('error' in txResult) return { success: false, error: txResult.error }
 
@@ -3501,7 +3649,10 @@ export async function addPayment(input: {
         orderId: input.orderId,
         orderReference: getSalesOrderReference(txResult.so),
         paymentId: txResult.paymentId,
-        amount: input.amount,
+        // o3d-1xq8 (Codex HIGH): the receipt AS STORED, carried through as a `Decimal`. `input.amount`
+        // is the double the form sent; `Payment.amount` is the `Decimal(18, 4)` the ledger
+        // registration is a record of, and the enqueue is the one place that may convert it.
+        amount: toDecimal(txResult.paymentAmount),
         currency: input.currency,
         method: input.method || null,
         reference: input.reference || null,
@@ -3649,7 +3800,9 @@ async function removePaymentAndSettlePaidAt(
     orderId: string
     refundId: string | null
     currency: string
-    totalForeign: unknown
+    // r18: the stored `Decimal`, declared as one. It was `unknown`, which is what let a `Number(...)`
+    // of it look like a reading rather than a conversion.
+    totalForeign: DecimalInput
     paidAt: Date | null
   },
 ): Promise<boolean> {
@@ -3659,17 +3812,28 @@ async function removePaymentAndSettlePaidAt(
     where: { orderId: input.orderId, refundId: null },
     select: { amount: true, currency: true },
   })
-  const totalPaid = remainingPayments.reduce((sum, p) => {
+  // r18 (Codex HIGH 2): summed as `Decimal`s straight off the `Decimal(18, 4)` column, for the reason
+  // stated at `addPayment`'s own summation — a `Number()` here collapses two stored amounts a whole
+  // minor unit apart, and this sum decides whether `paidAt` survives the removal.
+  const totalPaid = remainingPayments.reduce<Decimal>((sum, p) => {
     if (p.currency !== input.currency) return sum
-    return sum + Number(p.amount)
-  }, 0)
-  const stillFullyPaid = totalPaid >= Number(input.totalForeign) - 0.0001
+    return addMoney(sum, p.amount)
+  }, toDecimal(0))
+  // r7 (Codex HIGH 1): the same spelling `addPayment` clears the marker on and the same spelling the
+  // reversal reader's coverage guard asks. See lib/domain/accounting/paid-coverage.ts.
+  const stillFullyPaid = coversDocumentTotal(totalPaid, toDecimal(input.totalForeign))
   // Only a genuine paid → not-paid transition is a mismatch. An order that was never fully paid
   // (e.g. shipped on credit terms) isn't flagged just because a partial payment was removed.
   const becameUnpaid = input.paidAt !== null && !stillFullyPaid
   await tx.salesOrder.update({
     where: { id: input.orderId },
-    data: { paidAt: stillFullyPaid ? undefined : null },
+    data: {
+      paidAt: stillFullyPaid ? undefined : null,
+      // o3d-psrx r2: the provenance follows `paidAt` exactly — cleared when the flag is cleared, left
+      // alone when the remaining receipts still settle the order. A marker outliving the flag it
+      // describes would withhold the next reversal on evidence that no longer exists.
+      unregisteredPaidAt: stillFullyPaid ? undefined : null,
+    },
   })
   return becameUnpaid
 }

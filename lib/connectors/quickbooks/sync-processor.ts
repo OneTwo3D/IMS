@@ -1457,6 +1457,9 @@ async function processEntry(
         referenceId,
         accountingInvoiceId,
         amount,
+        // o3d-6abj: the payload this case is building the request from, so the guard measures the
+        // exact figure that is about to go on the wire rather than a re-read of the row.
+        payload,
       })
       if (!capacity.post) {
         if (capacity.kind === 'unmeasurable') return { success: false, error: capacity.message }
@@ -1482,8 +1485,11 @@ async function processEntry(
             accountingInvoiceId,
             amount,
             refusal: capacity.refusal,
-            alreadyPosted: capacity.alreadyPosted,
-            ledgerTotal: capacity.ledgerTotal,
+            // o3d-6abj: `Decimal`s, stated as their own exact digits. This is the record an operator
+            // reconciles against the ledger from, and the whole reason the refusal fires can be a
+            // difference a rounded rendering would not show.
+            alreadyPosted: capacity.alreadyPosted?.toFixed() ?? null,
+            ledgerTotal: capacity.ledgerTotal.toFixed(),
             ambiguousSyncLogIds: capacity.ambiguousIds,
             retired,
           },

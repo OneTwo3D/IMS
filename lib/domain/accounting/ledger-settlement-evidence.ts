@@ -29,6 +29,9 @@
 
 import { createHash } from 'node:crypto'
 
+import { payloadExactAmount } from '@/lib/domain/accounting/registered-amount'
+import { compareDecimal, ledgerMatchEpsilon, subtractMoney, type Decimal } from '@/lib/domain/math/decimal'
+
 /**
  * The mark IMS writes into the settlement it creates, so it can recognise its own work later.
  *
@@ -48,8 +51,30 @@ export function settlementMarkerFor(effectiveToken: string): string {
 
 /** One settlement already recorded against the target document, as the ledger reports it. */
 export type LedgerSettlementRecord = {
-  /** In the document's currency, as posted. Null when the ledger did not report one. */
-  amount: number | null
+  /**
+   * In the document's currency, as posted — the EXACT figure, or null when there is not one this
+   * module may compare (o3d-78rq).
+   *
+   * A `Decimal`, and never the connector's wire number. The probes read it through
+   * `readLedgerStatedAmount`, which admits a value only when its decimal reading is PROVABLY the
+   * figure the ledger stated: below `ledgerAmountMagnitudeBound` two amounts one minor unit apart
+   * land on different doubles, and the reading is quantized to the currency's own minor unit, so
+   * exactly one stateable token names it. Null therefore covers two different facts and
+   * `unreadableAmount` below says which — see it for why the difference is the operator's.
+   */
+  amount: Decimal | null
+  /**
+   * o3d-78rq — THE LEDGER DID STATE AN AMOUNT AND THIS CONNECTOR WOULD NOT READ IT, as received.
+   *
+   * Set only when `amount` is null BECAUSE the figure was refused, never when the ledger reported no
+   * amount at all. Both are `record-unmeasurable` and both WITHHOLD, and that is deliberate: the
+   * refusal direction is the safe one here, because an unrecognised record of our own payment posts a
+   * second one. But they are not the same sentence to a human. "Xero did not state an amount on this
+   * payment" sends an operator to Xero; "Xero stated 35184372088832.055, which IMS cannot read as an
+   * exact GBP amount" tells them the figure is the problem and stops them reading the hold as
+   * evidence the document is unpaid. So the figure is carried, verbatim, for that sentence alone.
+   */
+  unreadableAmount?: string | null
   /** `YYYY-MM-DD`, normalised by the connector-specific probe. Null when unreadable. */
   date: string | null
   /** The remote id, carried only so a refusal can name it. */
@@ -62,12 +87,95 @@ export type LedgerSettlementRecord = {
 }
 
 export type LedgerSettlementProbe =
-  | { ok: true; records: LedgerSettlementRecord[] }
+  | {
+      ok: true
+      records: LedgerSettlementRecord[]
+      /**
+       * o3d-obyd r31 (Codex HIGH 1) — IS THIS RECORD LIST PROVED TO BE THE WHOLE COLLECTION?
+       *
+       * THE TWO CONCLUSIONS A RECORD LIST SUPPORTS ARE NOT SYMMETRIC, AND THAT IS THE WHOLE FIELD.
+       * A record that MATCHES the attempt proves the attempt settled: the record is there, this code
+       * read it, and no amount of truncation elsewhere can unmake it. A record that does NOT match
+       * proves nothing about the attempt — it is a statement about ONE OTHER settlement, and the
+       * question `clear` answers is about the COLLECTION ("the ledger holds no settlement matching
+       * this attempt"). Reaching that answer by walking the list requires the list to be the whole
+       * list, which a returned record is not evidence of.
+       *
+       * WHAT IT COST WHILE IT WAS UNTRACKED. `emptyAnswerIsUnproved` in the settlement probe refused
+       * a figureless response only when its record list was EMPTY, on the reasoning that "a non-empty
+       * record list still answers, records are evidence in their own right". True of a match, false
+       * of a non-match: a truncated response that omits the document's own settled figure, returns
+       * one UNRELATED settlement and omits the attempted one satisfied that predicate, answered
+       * `ok: true`, matched nothing, and reached `clear` — which authorises a second payment. Codex
+       * executed the shape against all three probe arms (Xero invoice, Xero credit note, QuickBooks
+       * bill) and got `clear` from each.
+       *
+       * SO WHAT PROVES COMPLETENESS. Not the records: the DOCUMENT'S OWN settled figure, which every
+       * arm already computes for its shortfall cross-check — `Total - AmountDue` on a Xero invoice,
+       * `Total - RemainingCredit` on a Xero credit note, `TotalAmt - Balance` on a QuickBooks
+       * document. When that figure is stated, the cross-check has run: either the ledger says nothing
+       * has settled the document (so an empty or non-matching list is the ledger's own answer), or it
+       * names an amount that the records this probe read must account for and do. Either way the
+       * collection is measured against a figure OUTSIDE it. When the figure is absent, nothing
+       * measured the list at all, and a non-match is `unknown` — see `classifyLedgerSettlement`.
+       *
+       * o3d-zo4j — AND A FIGURE THE COLLECTION CONTRADICTS PROVES NOTHING EITHER. The paragraph above
+       * says "when that figure is stated, the cross-check has run", and the cross-check ran in ONE
+       * direction: it rejects a collection that explains LESS than the figure. A collection that
+       * explains MORE was not rejected and was not even looked at, so a response could state a figure
+       * its own collection refutes — a Xero credit note reading `Total 40 / RemainingCredit 40`, a
+       * proved zero, whose `Allocations` show 40 already used — and have that figure believed. The
+       * probe now measures both directions against the same band, and an excess makes this false. It
+       * does not make the probe REFUSE: whether a particular excess is legitimate is a question about
+       * live ledger shapes, and it does not have to be answered to stop treating a contradicted figure
+       * as proof. So the cost is confined to this field's own effect — a NON-match becomes `unknown`
+       * instead of `clear`, while a match is still `present` and a shortfall still refuses outright.
+       *
+       * REQUIRED, NOT OPTIONAL, AND THAT IS DELIBERATE. Every fail-open this module has been through
+       * arrived as a permissive DEFAULT reached by a response shape nobody enumerated. A probe arm
+       * that does not state whether its collection is proved does not compile.
+       */
+      provedComplete: boolean
+      /**
+       * o3d-r948 r6 — `connectionProvenance` WAS HERE, AND IS GONE WITH THE EXCLUSION IT SCOPED.
+       *
+       * r5 added it so a caller could show that an id it held named one of THESE records rather
+       * than an identically-spelt id in another organisation. It was derived by reading the active
+       * token either side of the remote call and answering null when the two disagreed — which
+       * cannot see an A→B→A reconnect ACROSS the call, because reading one value twice says nothing
+       * about the interval between. Nothing excludes a record any more, so no caller needs the
+       * answer, and leaving an unsound provenance on a probe result is an invitation to reuse it.
+       *
+       * A sound replacement is request-bound, not snapshot-bound: `XeroResponse` already carries the
+       * `tenantId` its request went out under, and QuickBooks resolves a `realmId` per request that
+       * `QboResponse` currently discards. bd o3d-llyw carries that design.
+       */
+    }
   | { ok: false; reason: string }
 
 /** What a row's stored payload says its attempt sent. */
 export type AttemptDescription = {
-  amount: number | null
+  /**
+   * WHAT THIS ATTEMPT SENT, EXACTLY (o3d-78rq) — a `Decimal`, read by `payloadExactAmount`.
+   *
+   * It was the payload's JSON number, and the band it is measured against became exact and
+   * currency-derived in o3d-6yho without either operand following it. An exact tolerance over two
+   * doubles decides nothing the tolerance says: our own attempt of `1073741824.0050` against a ledger
+   * that holds `1073741824.00` is EXACTLY the band apart and therefore the same payment, and the two
+   * doubles are 0.005000114440917969 apart — over it, `clear`, and a second payment posts.
+   *
+   * The exact figure is the payload's `amountDecimal` where the enqueue wrote one (o3d-1xq8), and
+   * otherwise the number's OWN decimal reading, which is exact where the subtraction was not.
+   */
+  amount: Decimal | null
+  /**
+   * o3d-6yho (2 of 3) — THE CURRENCY THAT AMOUNT IS IN, which sizes the band the match below runs
+   * on. Read from the payload (every money payload states one) or supplied by a caller that holds
+   * the document's own. `null` = not stated, and `ledgerMatchEpsilon` resolves that in the direction
+   * that WITHHOLDS a post rather than the one that sends a second — see its docblock, which is the
+   * only rule in this repository where the finest unit is the wrong default.
+   */
+  currency: string | null
   /** `YYYY-MM-DD` as the processor would have sent it, or null when the row does not pin one. */
   date: string | null
   /**
@@ -84,8 +192,18 @@ export type AttemptDescription = {
  *  - `record-unmeasurable`   the ledger reported a settlement whose amount or date is unreadable,
  *                            so it cannot be ruled out as this attempt.
  *  - `attempt-undescribable` OUR row does not record what its attempt sent.
+ *  - `collection-unproved`   the connector answered, every record it sent was measured, and none is
+ *                            this attempt — but nothing established that the list is the whole
+ *                            collection, so "not among these" is not "not in the ledger". Either the
+ *                            document stated no figure to measure the list against, or it stated one
+ *                            the list CONTRADICTS by exceeding it (o3d-zo4j).
+ *                            See `LedgerSettlementProbe.provedComplete`.
  */
-export type SettlementUnknownCause = 'probe-unreadable' | 'record-unmeasurable' | 'attempt-undescribable'
+export type SettlementUnknownCause =
+  | 'probe-unreadable'
+  | 'record-unmeasurable'
+  | 'attempt-undescribable'
+  | 'collection-unproved'
 
 export type SettlementVerdict =
   /** Positively established: the ledger holds no settlement matching this attempt. */
@@ -111,8 +229,18 @@ export type SettlementVerdict =
    */
   | { outcome: 'unknown'; reason: string; cause: SettlementUnknownCause }
 
-/** Money compares to the half-penny, the same tolerance the registration guard uses. */
-const AMOUNT_EPSILON = 0.005
+/**
+ * `AMOUNT_EPSILON` WAS HERE, AND IS GONE (o3d-6yho, 2 of 3).
+ *
+ * It was a flat `0.005` — "the half-penny, the same tolerance the registration guard uses" — and both
+ * halves of that sentence stopped being true. The registration guard now derives its band from the
+ * document's minor unit, and a half-penny is FIVE whole minor units in a Gulf dinar and fifty in CLF,
+ * so this test read two payments a ledger states as different amounts as the same one.
+ *
+ * The replacement is `ledgerMatchEpsilon(attempt.currency)`, which is 0.005 exactly in every
+ * two-decimal currency. See its docblock for why this rule, alone in the repository, must not take
+ * the finest unit for an unstated currency.
+ */
 
 function asRecord(payload: unknown): Record<string, unknown> {
   return typeof payload === 'object' && payload !== null && !Array.isArray(payload)
@@ -268,17 +396,115 @@ export function describeAttempt(
   options?: { postingOn?: string | null },
 ): AttemptDescription {
   const record = asRecord(payload)
-  const amount = record.amount
+  const currency = record.currency
   return {
-    amount: typeof amount === 'number' && Number.isFinite(amount) ? amount : null,
+    // o3d-78rq: the payload's exact decimal, through the one reader that knows how a money payload
+    // states its amount. `payloadExactAmount` prefers the `amountDecimal` string the enqueue writes
+    // beside the number and falls back to the number's own decimal reading, so a historical row is
+    // described exactly as its number always read and a row written since is described as the figure
+    // that was actually registered.
+    amount: payloadExactAmount(payload),
+    // o3d-6yho: from the payload the attempt was built from — every money payload writer states it
+    // (both connectors' INVOICE_PAYMENT follow-ups, the receipt enqueue, and markBillPaid's
+    // BILL_PAYMENT), so the ordinary row names its own currency and nothing has to be inferred.
+    currency: typeof currency === 'string' && currency ? currency : null,
     date: pinnedAttemptDate(type, payload) ?? options?.postingOn ?? null,
     marker: marker ?? null,
   }
 }
 
-function money(value: number): string {
-  return value.toFixed(2)
+/**
+ * A money figure for an operator sentence — NEVER ROUNDED, and money-shaped where it can be.
+ *
+ * o3d-78rq. It was `value.toFixed(2)` over a `number`, and o3d-4ozd's finding is that a presentation
+ * which rounds can print two figures this verdict tells apart as the same text: a settlement of
+ * `1073741824.005` and one of `1073741824.01` are a DIFFERENT payment here, and "the ledger already
+ * holds 1073741824.01" would be the wrong figure to go looking for in Xero.
+ *
+ * So the places are `max(2, the figure's own)`: two is what every operator sentence on this path has
+ * always shown and it keeps a whole ten pounds reading as `10.00`, while a figure carrying more than
+ * two decimals is shown at ITS OWN scale rather than rounded to fit. `Decimal.toFixed` never uses
+ * exponential notation, so a large amount stays readable as digits at either width.
+ */
+/**
+ * o3d-r948 r2 — EXPORTED, because the settlement PROBES print figures too and were rounding them.
+ *
+ * Their completeness refusals said `applied.toFixed(2)`, which was harmless while their band was a
+ * flat half-penny and is not once the band is a fraction of the document's own minor unit: a KWD
+ * invoice one fil short produced "Xero reports 0.00 paid against this document but returned no
+ * payments" — a sentence that reads as an arithmetic error rather than as the shortfall it is. The
+ * rule is the same rule, so it is the same function.
+ */
+export function formatLedgerMoney(value: Decimal): string {
+  return value.toFixed(Math.max(2, value.decimalPlaces()))
 }
+
+const money = formatLedgerMoney
+
+/**
+ * o3d-r948 r6 — `LedgerSettlementOptions` / `settlementsOfOtherAttempts` WAS HERE, AND IS GONE.
+ *
+ * Four rounds built it and a fifth removed it. It is recorded here rather than deleted silently
+ * because the hole it was filling is still open (bd o3d-llyw), and the next person to meet that
+ * hole will reach for exactly this shape again.
+ *
+ * WHAT IT WAS. `classifyLedgerSettlement` withholds on a settlement it cannot measure — an amount it
+ * will not read, or a date it cannot normalise — because an unmeasurable record cannot be ruled out
+ * as this attempt by anything the record itself says. When that record belongs to a DIFFERENT row
+ * that already posted, the withhold is PERMANENT: no later event can make the ledger's figure
+ * readable, so every future receipt on that order is refused for good. The option let a caller hand
+ * over the ledger ids IMS had already recorded against its OTHER rows, and a record carrying one of
+ * them was skipped — a record created by another attempt is not this one, whatever has since been
+ * done to its amount or its date.
+ *
+ * THE ARGUMENT WAS SOUND ABOUT THE LEDGER'S HALF AND NEVER BECAME SOUND ABOUT OURS. The ledger
+ * assigns the id and cannot re-assign it; that half held up under every round. The other half —
+ * "and OUR row is the one that obtained it" — is a claim this system makes about itself, and each
+ * round found another way for it to be false:
+ *
+ *   r3  the option is introduced: only an IMMUTABLE id may exclude, never a mutable amount or date.
+ *   r4  an `OPERATOR_ASSERTION` row's id is a human typing into a form with no call made, so the
+ *       caller must filter on `isOperatorAssertedSettlement`.
+ *   r5  `connector` scopes a query to a ledger TYPE, not a NAMESPACE: after a QuickBooks reconnect,
+ *       realm A's `123` and realm B's `123` are two payments spelt the same. The caller must
+ *       compare the row's recorded origin against the organisation the probe answered from.
+ *   r6  BOTH REMAINING GAPS ARE MISSING EVIDENCE, NOT LOOSE REASONING, and neither can be recorded
+ *       from inside this branch:
+ *
+ *       • THE ORIGIN IS STAMPED AT ENQUEUE AND THE ID IS MINTED AT POST. A row queued against realm
+ *         A can post after a reconnect to B, take B's id, and keep its A origin. QuickBooks has no
+ *         post-time realm enforcement at all (o3d-8prh, OPEN — see the block at
+ *         lib/connectors/quickbooks/sync-processor.ts, which says in terms that nothing downstream
+ *         of it is safe first), and `QboResponse` does not even carry the `realmId` it resolved, so
+ *         there is no issuer to record on that path today.
+ *       • TWO TOKEN SNAPSHOTS EITHER SIDE OF A REMOTE CALL CANNOT DEFEAT ABA. An A→B→A reconnect
+ *         across the fetch makes both reads say A while B served it. Reading one value twice says
+ *         nothing about the interval between.
+ *
+ * WHY IT WAS NOT NARROWED A FIFTH TIME. Closing either gap means RECORDING A FACT NOTHING RECORDS
+ * TODAY — the issuer of each `externalTransactionId`, and a connection epoch read with the fetch —
+ * and the repository's own rules make both unbackfillable: an origin "there is no in-database way to
+ * recover ... so nothing may be back-filled" (see 20260822090000's migration note and
+ * `readAccountingOriginRecord`). Every row that already carries an id would answer "issuer unknown"
+ * for ever, so the exclusion would grant nothing at all to the population it was built to release —
+ * while remaining a live duplicate-payment surface for everything posted after it.
+ *
+ * ITS FAILURE MODE DECIDED IT. A withheld payment is visible and remediable; a duplicate payment on
+ * a customer's or supplier's ledger is neither.
+ *
+ * SO EVERY CALLER NOW WITHHOLDS, and there is no parameter to pass. That is what the three callers
+ * that never had a set to give already did (`followup-retry-guard`, the probe's revival gate,
+ * `resolveSettledRow`), and the note that used to sit at the revival gate — "it excludes nothing,
+ * and that is the cost of the rule rather than a gap in it" — is now simply the rule.
+ *
+ * WHAT A SOUND VERSION WOULD REQUIRE, if anyone comes back to it: bd o3d-llyw carries the whole
+ * estimate. It is a new write-once-on-post column plus its own trigger (the existing
+ * `connection_provenance` trigger CLEARS on UPDATE, and an issuer is written by the post-time
+ * UPDATE, so that shape cannot be reused), issuer capture at every id-writing path in both
+ * connectors, a `QboResponse` that carries its realm, o3d-8prh landed first, and a per-connector
+ * reconnect epoch — `AccountingToken.connectionGeneration` exists but is minted by Xero's OAuth
+ * callback only and is NULL for every QuickBooks row.
+ */
 
 /**
  * Decide what the ledger says about ONE attempt. Pure: the probe's I/O is the caller's problem, so
@@ -321,22 +547,140 @@ export function classifyLedgerSettlement(
     }
   }
 
+  // o3d-r948 r3 (Codex HIGH) — A RECORD LEAVES THIS LOOP ONLY ON AN IMMUTABLE IDENTITY.
+  //
+  // WHAT r2 DID AND WHY IT WAS WRONG. r2 skipped a record whose READABLE half already differed from
+  // the attempt — a different date, or an amount outside the band — on the reasoning that the match
+  // rule is a conjunction, so either half failing rules the record out. The conjunction is right and
+  // the conclusion does not follow, because this module's whole model is that AMOUNTS AND DATES ARE
+  // MUTABLE: both are editable in both ledgers, which is the reason the mark exists (see
+  // `settlementMarkerFor`) and the reason an unreadable figure withholds at all. A record whose date
+  // is not this attempt's is therefore NOT proof it is somebody else's — it is equally consistent
+  // with OUR OWN payment, edited in the ledger after we made it. r2 turned that ambiguity into
+  // permission to post again: skip the only record on the document, fall out of the loop, `clear`,
+  // and the retry/re-enqueue caller pays it twice. A discriminator that the ledger can rewrite can
+  // never CLEAR; it can only ever match.
+  //
+  // WHAT AN IDENTITY HAS TO BE TO RULE A RECORD OUT. Assigned by the ledger, and unchangeable there
+  // afterwards. Here is what each connector actually puts on a settlement record, and which side of
+  // that line it falls:
+  //
+  //   Xero INVOICE_PAYMENT / BILL_PAYMENT
+  //       `Payment.PaymentID`  — IMMUTABLE. Xero mints it and never re-assigns it; a payment can be
+  //                              deleted but not renumbered.
+  //       `Payment.Reference`  — MUTABLE. It is the operator-visible reference field, editable in
+  //                              the Xero UI, and it is where IMS writes its own mark.
+  //   QuickBooks INVOICE_PAYMENT / BILL_PAYMENT
+  //       `Payment.Id` / `BillPayment.Id` — IMMUTABLE, and read here off the DOCUMENT's own
+  //                              `LinkedTxn.TxnId`, so it is QuickBooks' statement about what settles
+  //                              this document rather than ours.
+  //       `PrivateNote`        — MUTABLE. Editable on the transaction; IMS's mark lives in it.
+  //   Xero PURCHASE_CREDIT_NOTE_ALLOCATION
+  //       NOTHING. The allocation carries no id this probe reads and no reference field exists on it
+  //       at all. This type has no identity, so it can never be ruled out — see below.
+  //   QuickBooks PURCHASE_CREDIT_NOTE_ALLOCATION
+  //       Never reaches here: `probeQuickBooksSettlement` refuses the type outright.
+  //
+  // NEITHER CONNECTOR ECHOES OUR REQUEST ID. Xero's `Idempotency-Key` and QuickBooks' `requestid` are
+  // request headers/params; neither is stored on, or returned with, the settlement entity. So the
+  // only thing IMS can recognise on a record it did not just create is the MARK it wrote into the
+  // mutable reference — which is why the mark pass above returns `present` and nothing here uses a
+  // reference to return `clear`. The asymmetry is deliberate and it is the whole rule: a mutable
+  // field may only ever move a verdict TOWARDS withholding.
+  //
+  // SO THE ONE EXCLUSION IS: this record's immutable id is one IMS has ALREADY RECORDED as a
+  // DIFFERENT attempt's settlement. `AccountingSyncLog.externalTransactionId` holds exactly that for
+  // these types — the Xero money branch stores `Payments[0].PaymentID` and the QuickBooks ones store
+  // `Payment.Id` / `BillPayment.Id` — so a caller holding the other rows for this document can hand
+  // their recorded ids over. A record whose id is in that set was created by an attempt that is not
+  // this one, and no edit to its amount, its date or its reference can make it this one.
+  //
+  // A CALLER THAT CANNOT SUPPLY THE SET PASSES NOTHING, and then nothing is excluded and every
+  // unmeasurable record withholds. That is the honest answer rather than a degraded one: the cost of
+  // holding a genuine payment back is a visible refusal, and the cost of the alternative is a second
+  // payment.
+  // o3d-r948 r6 — NOTHING SKIPS A RECORD ANY MORE. Every record the probe returned is measured,
+  // and one this code cannot measure withholds. The identity exclusion that used to `continue` here
+  // is gone; see the note above `classifyLedgerSettlement` for the four rounds that narrowed it and
+  // the two pieces of evidence it turned out to need and never had.
   for (const record of probe.records) {
     if (record.amount === null || record.date === null) {
       return {
         outcome: 'unknown',
         cause: 'record-unmeasurable',
-        reason: 'the accounting connector returned a settlement whose amount or date could not be '
-          + 'read, so it cannot be ruled out as this attempt',
+        // o3d-78rq — AND IT SAYS WHICH, because the two facts send an operator to different places.
+        // A figure this connector REFUSED is a statement about the reading, not about the document:
+        // the hold is not evidence that nothing has been paid, and the sentence must not let anyone
+        // read it that way. See `LedgerSettlementRecord.unreadableAmount`.
+        reason: record.unreadableAmount
+          ? `the accounting connector reported a settlement${record.id ? ` (${record.id})` : ''} `
+            + `stating ${record.unreadableAmount}, which IMS cannot read as an exact amount`
+            + `${attempt.currency ? ` in ${attempt.currency}` : ''} — so this attempt cannot be ruled `
+            + 'out against it. This says the LEDGER\'S FIGURE is unreadable, NOT that the document '
+            + 'is unpaid.'
+          : 'the accounting connector returned a settlement whose amount or date could not be '
+            + 'read, so it cannot be ruled out as this attempt',
       }
     }
-    if (Math.abs(record.amount - attempt.amount) <= AMOUNT_EPSILON && record.date === attempt.date) {
+    // o3d-6yho: half one minor unit of the attempt's OWN currency.
+    //
+    // o3d-78rq — AND BOTH OPERANDS ARE NOW DECIMALS, so the band decides what the band says. It was
+    // `Math.abs(record.amount - attempt.amount) <= ledgerMatchEpsilon(...).toNumber()`: an exact,
+    // currency-derived tolerance spent back to a double to meet two doubles. Two figures ONE
+    // THOUSANDTH apart can decode to doubles a whole ulp apart once the ulp exceeds the band —
+    // `35184372088832.0035` decodes to `35184372088832` and `35184372088832.0045` to
+    // `35184372088832.0078125`, 0.0078 apart against a 0.005 band — and the failure direction of THIS
+    // rule is the one that posts a second payment. Nothing is converted now: the attempt carries its
+    // payload's exact decimal, the record carries the ledger's stated figure, and the band stays a
+    // `Decimal` all the way into the comparison.
+    if (compareDecimal(subtractMoney(record.amount, attempt.amount).abs(), ledgerMatchEpsilon(attempt.currency)) <= 0
+      && record.date === attempt.date) {
       return {
         outcome: 'present',
         matchedId: record.id ?? null,
         detail: `${money(record.amount)} dated ${record.date}`
           + (record.id ? ` (${record.id})` : ''),
       }
+    }
+  }
+
+  // o3d-obyd r31 (Codex HIGH 1) — AND FALLING OUT OF THAT LOOP IS ONLY AN ANSWER IF THE LIST WAS ALL
+  // OF THEM.
+  //
+  // EVERY `present` ABOVE STANDS WITHOUT THIS. The mark pass and the amount/date pass each return on
+  // a record they FOUND, and a found record is evidence in its own right: it exists, this code read
+  // it, and a truncated response cannot un-find it. That is why this gate is HERE, after both, rather
+  // than at the top of the function — a probe whose collection is unproved must still be allowed to
+  // recognise our own payment and say `present`, because `present` is what resolves the row and
+  // writes the matched id back. Refusing at the top would throw that away and hold the row on a
+  // question the ledger had in fact answered.
+  //
+  // ARRIVING HERE IS THE OTHER HALF, AND IT IS NOT SYMMETRIC. Nothing was found. That is a claim
+  // about the COLLECTION — "the ledger holds no settlement matching this attempt" — built by
+  // exhausting a list, and it is only sound if the list could not have omitted the settlement being
+  // looked for. `provedComplete` is exactly that fact, established by the probe against the
+  // document's OWN settled figure rather than against the records (see the field's docblock). Without
+  // it, "not among these" is not "not in the ledger", and `clear` is what authorises a second
+  // payment.
+  //
+  // o3d-zo4j: and `provedComplete` is now false for TWO shapes rather than one — a document that
+  // stated no settled figure, and one whose collection EXCEEDS the figure it did state. Both are the
+  // same fact about this gate: nothing outside the list has vouched for the list.
+  //
+  // WHAT THIS COSTS, STATED. A response that omits the document totals but returns settlements can no
+  // longer clear a row automatically; it holds visibly and a human resolves it. It costs the ordinary
+  // first payment NOTHING — an unsettled document states its totals, so `provedComplete` is true and
+  // the empty list clears, which is the same sentence `emptyAnswerIsUnproved` has carried since
+  // o3d-nk5n, now applied to the non-empty list it always should have covered.
+  if (!probe.provedComplete) {
+    return {
+      outcome: 'unknown',
+      cause: 'collection-unproved',
+      reason: 'the accounting connector did not establish that what it returned against this document '
+        + 'is all of it — it either stated no total of what has settled the document or returned '
+        + 'settlements exceeding the total it did state, so IMS cannot tell whether it was sent all of '
+        + 'them. None of the ones it did read is this attempt, which is not the same as this attempt '
+        + 'not being there',
     }
   }
   return { outcome: 'clear' }

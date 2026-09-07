@@ -10,6 +10,7 @@ import {
   retireOverSettlingInvoicePayment,
 } from '@/lib/domain/accounting/invoice-payment-capacity'
 import { claimHeldFrom } from '@/lib/domain/accounting/sync-claim-fence'
+import { toDecimal, type DecimalInput } from '@/lib/domain/math/decimal'
 
 /**
  * o3d-cjt8, round 2 #2. Rescoping accounting_sync_logs_followup_live_unique to
@@ -35,10 +36,17 @@ const ENTRY = 'entry-under-test'
  */
 type RegDefaults = 'bodyCouldHavePosted' | 'settlementBasis' | 'provenNeverAttempted' | 'paymentId'
 
+/**
+ * o3d-6abj: the row's amount is a `Decimal` now (`registeredAmount`), and these fixtures state it as
+ * a plain figure. Written as a STRING wherever the digits matter — a fixture that says `0.1 + 0.2`
+ * worth of decimal places through a JS number literal has already lost the thing under test.
+ */
 function reg(
-  row: Omit<PostedInvoicePaymentRegistration, RegDefaults>
-    & Partial<Pick<PostedInvoicePaymentRegistration, RegDefaults>>,
+  row: Omit<PostedInvoicePaymentRegistration, RegDefaults | 'registeredAmount'>
+    & Partial<Pick<PostedInvoicePaymentRegistration, RegDefaults>>
+    & { amount: DecimalInput },
 ): PostedInvoicePaymentRegistration {
+  const { amount, ...rest } = row
   // o3d-anu8: `settlementBasis: null` is the connector's own writeback, i.e. the ordinary case, for
   // the same reason `bodyCouldHavePosted: true` is the default. A test that wants an
   // OPERATOR-ASSERTED row has to say so.
@@ -49,18 +57,38 @@ function reg(
   // o3d-ekn8 r4: `paymentId: null` is the un-attributed row — the shape of everything queued before
   // the payload recorded which receipt it was for. It is the ordinary case and the one that has to
   // read as "possibly this one", so a test about a SPECIFIC receipt has to name it.
-  return { bodyCouldHavePosted: true, settlementBasis: null, provenNeverAttempted: false, paymentId: null, ...row }
+  return {
+    bodyCouldHavePosted: true,
+    settlementBasis: null,
+    provenNeverAttempted: false,
+    paymentId: null,
+    ...rest,
+    registeredAmount: amount == null ? null : toDecimal(amount),
+  }
 }
 
-function decide(overrides: Partial<Parameters<typeof decideInvoicePaymentPost>[0]> = {}) {
+type DecideOverrides =
+  Partial<Omit<Parameters<typeof decideInvoicePaymentPost>[0], 'amount' | 'ledgerTotal'>>
+  & { amount?: DecimalInput; ledgerTotal?: DecimalInput }
+
+function decide(overrides: DecideOverrides = {}) {
+  const { amount, ledgerTotal, ...rest } = overrides
   return decideInvoicePaymentPost({
     entryId: ENTRY,
     accountingInvoiceId: 'INV-1',
-    amount: 60,
-    ledgerTotal: 100,
+    // o3d-6yho: the band is derived from THIS currency, so every fixture has to name one. GBP keeps
+    // the existing cases at the half-penny they were written against.
+    currency: 'GBP',
+    amount: toDecimal(amount ?? 60),
+    ledgerTotal: toDecimal(ledgerTotal ?? 100),
     registrations: [],
-    ...overrides,
+    ...rest,
   })
+}
+
+/** A `Decimal | null` verdict field, as digits, so an assertion can state the figure it means. */
+function digits(value: { toFixed(): string } | null | undefined): string | null {
+  return value == null ? null : value.toFixed()
 }
 
 test('a payment that would take the invoice past its total is refused with WOULD_OVERPAY', () => {
@@ -69,8 +97,8 @@ test('a payment that would take the invoice past its total is refused with WOULD
   })
   assert.equal(verdict.post, false)
   assert.equal(verdict.post === false && verdict.refusal, 'WOULD_OVERPAY')
-  assert.equal(verdict.post === false && verdict.alreadyPosted, 60)
-  assert.equal(verdict.ledgerTotal, 100)
+  assert.equal(verdict.post === false && digits(verdict.alreadyPosted), '60')
+  assert.equal(digits(verdict.ledgerTotal), '100')
 })
 
 test('a payment that exactly settles what is left still posts', () => {
@@ -126,7 +154,7 @@ test('a FAILED registration whose body could have been sent refuses with AMBIGUO
   assert.equal(verdict.post, false)
   assert.equal(verdict.post === false && verdict.refusal, 'AMBIGUOUS_FAILED_REGISTRATION')
   // NOT a number: there is no "already posted" figure, because whether it posted is the unknown.
-  assert.equal(verdict.post === false && verdict.alreadyPosted, null)
+  assert.equal(verdict.post === false && digits(verdict.alreadyPosted), null)
   assert.deepEqual(verdict.post === false && verdict.ambiguousIds, ['other'])
 })
 
@@ -339,7 +367,7 @@ test('an unreadable amount on a posted registration fails CLOSED with LEDGER_AMO
   })
   assert.equal(verdict.post, false)
   assert.equal(verdict.post === false && verdict.refusal, 'LEDGER_AMOUNT_UNKNOWN')
-  assert.equal(verdict.post === false && verdict.alreadyPosted, null)
+  assert.equal(verdict.post === false && digits(verdict.alreadyPosted), null)
 })
 
 // ---------------------------------------------------------------------------
@@ -360,7 +388,14 @@ type LogRow = {
 }
 
 function mockClient(options: {
-  order?: { totalForeign: number; taxForeign: number; pricesIncludeVat: boolean; imported: boolean } | null
+  order?: {
+    totalForeign: number | string
+    taxForeign: number | string
+    pricesIncludeVat: boolean
+    imported: boolean
+    /** o3d-6yho: the currency the band is derived from. GBP unless a case is about another one. */
+    currency?: string
+  } | null
   orderThrows?: boolean
   logs?: LogRow[]
 }) {
@@ -371,8 +406,11 @@ function mockClient(options: {
         if (options.orderThrows) throw new Error('connection terminated')
         if (options.order === null || options.order === undefined) return null
         return {
-          totalForeign: options.order.totalForeign,
-          taxForeign: options.order.taxForeign,
+          currency: options.order.currency ?? 'GBP',
+          // o3d-6abj: the guard takes the STORED `Decimal`, so the fixture hands it one. A number
+          // literal here would re-introduce at the fixture the conversion the guard stopped doing.
+          totalForeign: toDecimal(options.order.totalForeign),
+          taxForeign: toDecimal(options.order.taxForeign),
           pricesIncludeVat: options.order.pricesIncludeVat,
           shoppingLinks: options.order.imported ? [{ connector: 'woocommerce' }] : [],
         }
@@ -385,6 +423,13 @@ function mockClient(options: {
           remoteAttemptedAt: null,
           attemptStampingCustodyAt: null,
           ...row,
+          // o3d-6abj: every INVOICE_PAYMENT payload has carried `currency` since the first commit of
+          // this feature (o3d-lgo.15), and `payloadRegisteredAmount` will not read an amount without
+          // it. Defaulted so each fixture states only what its case is about; a fixture about a
+          // payload that names NO currency says so by declaring one of its own.
+          payload: row.payload && typeof row.payload === 'object' && !('currency' in row.payload)
+            ? { currency: 'GBP', ...row.payload }
+            : row.payload,
         }))
       },
     },
@@ -392,14 +437,26 @@ function mockClient(options: {
   return { client, calls }
 }
 
-const GUARD_PARAMS = {
-  connector: 'xero',
-  entryId: ENTRY,
-  referenceType: 'SalesOrder',
-  referenceId: 'order-1',
-  accountingInvoiceId: 'INV-1',
-  amount: 100,
+/**
+ * o3d-6abj: the guard takes the PAYLOAD the connector is building its request from, not just the
+ * number, and refuses unless the payload's own exact figure IS that number. So a fixture states one
+ * amount and both forms are derived from it — an override that changed only `amount` would be
+ * describing a request no connector can make.
+ */
+function guardParams(overrides: { amount?: number; payload?: unknown } = {}) {
+  const amount = overrides.amount ?? 100
+  return {
+    connector: 'xero',
+    entryId: ENTRY,
+    referenceType: 'SalesOrder',
+    referenceId: 'order-1',
+    accountingInvoiceId: 'INV-1',
+    amount,
+    payload: 'payload' in overrides ? overrides.payload : { amount, currency: 'GBP' },
+  }
 }
+
+const GUARD_PARAMS = guardParams()
 
 test('the IMPORTED-ORDER enqueue path is measured too, even though it never took the order lock', async () => {
   // THE ROUND-2 REGRESSION, END TO END. `_registerPayment` enqueued this row with no lock and no
@@ -518,8 +575,8 @@ test('a tax-inclusive invoice is measured at GROSS however the order arrived, so
     logs: [],
   })
 
-  const importedResult = await guardInvoicePaymentCapacity(imported.client as never, { ...GUARD_PARAMS, amount: 120 })
-  const imsResult = await guardInvoicePaymentCapacity(raisedInIms.client as never, { ...GUARD_PARAMS, amount: 120 })
+  const importedResult = await guardInvoicePaymentCapacity(imported.client as never, guardParams({ amount: 120 }))
+  const imsResult = await guardInvoicePaymentCapacity(raisedInIms.client as never, guardParams({ amount: 120 }))
 
   assert.equal(importedResult.post, true)
   assert.equal(imsResult.post, true, 'and the two agree — provenance no longer changes the ledger total')
@@ -533,10 +590,10 @@ test('a receipt that exceeds the gross invoice is still refused, and the refusal
     logs: [],
   })
 
-  const result = await guardInvoicePaymentCapacity(client as never, { ...GUARD_PARAMS, amount: 120.02 })
+  const result = await guardInvoicePaymentCapacity(client as never, guardParams({ amount: 120.02 }))
 
   assert.equal(result.post, false)
-  assert.equal(result.post === false && result.kind === 'refused' && result.ledgerTotal, 120)
+  assert.equal(result.post === false && result.kind === 'refused' && digits(result.ledgerTotal), '120')
 })
 
 test('the capacity read is scoped to this connector, this type and this order', async () => {
@@ -692,7 +749,7 @@ test('[o3d-anu8] an OPERATOR-ASSERTED SYNCED registration makes the capacity unm
   })
   assert.equal(verdict.post, false)
   assert.equal(verdict.post === false && verdict.refusal, 'ASSERTED_REGISTRATION')
-  assert.equal(verdict.post === false && verdict.alreadyPosted, null,
+  assert.equal(verdict.post === false && digits(verdict.alreadyPosted), null,
     'no figure is stated, because none is known')
   assert.deepEqual(verdict.post === false && verdict.ambiguousIds, ['asserted'],
     'and the row to go and read is named')

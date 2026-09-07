@@ -45,7 +45,14 @@ mock.module('@/lib/db', {
         },
       },
       accountingSyncLog: {
-        async findFirst() { return state.existingIdempotent ? { id: 'already-queued' } : null },
+        // o3d-d0pd: the already-present check reads EVERY row for the key, in any status, and
+        // decides from the row's own evidence — see prior-posting-evidence.ts. A live row is the
+        // case this fixture models.
+        async findMany() {
+          return state.existingIdempotent
+            ? [{ id: 'already-queued', status: 'PENDING', externalTransactionId: null }]
+            : []
+        },
       },
       async $transaction(fn: (client: unknown) => Promise<unknown>) { return fn(tx) },
     },

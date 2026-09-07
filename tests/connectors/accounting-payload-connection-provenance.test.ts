@@ -488,12 +488,27 @@ mock.module('@/lib/security/connector-fetch', {
       // Answered as a real, UNPAID invoice: the fence is satisfied on evidence rather than bypassed,
       // so the guard is what decides these cases and "nothing was sent" still means what it says.
       // Settled-document behaviour is pinned in settlement-probe.test.ts, not here.
+      //
+      // o3d-nk5n: and it now IS one. `AmountPaid: 0` with nothing else stated is not a response Xero
+      // sends, and since an empty record list must be PROVED rather than assumed it no longer reads
+      // as an unpaid invoice at all — the probe refuses it. A real unpaid invoice states `Total` and
+      // `AmountDue` EQUAL, at the amount the payload is for, and that is what makes the fence pass on
+      // evidence, which is what the paragraph above always claimed this stub did.
       if (/^Invoices\//.test(path) && (init?.method ?? 'GET') === 'GET') {
         return {
           ok: true,
           status: 200,
           headers: { get: () => null },
-          json: async () => ({ Invoices: [{ InvoiceID: 'XBILL-ISSUED-BY-A', AmountPaid: 0, Payments: [] }] }),
+          json: async () => ({
+            Invoices: [{
+              InvoiceID: 'XBILL-ISSUED-BY-A',
+              CurrencyCode: 'GBP',
+              Total: 250,
+              AmountDue: 250,
+              AmountPaid: 0,
+              Payments: [],
+            }],
+          }),
           text: async () => '',
         }
       }

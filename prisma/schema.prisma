@@ -1749,6 +1749,70 @@ model SalesOrder {
   // not equal in Postgres, so any number of orders may be unlinked.
   accountingInvoiceId     String?    @unique @map("accounting_invoice_id") // Accounting invoice ID after sync
   paidAt            DateTime?
+  /// o3d-psrx r2 — THE PAID FLAG BESIDE IT WAS SET FROM EVIDENCE THE LEDGER WAS NEVER GIVEN.
+  ///
+  /// `paidAt` records THAT this order is held as paid. It does not record WHERE that belief came
+  /// from, and the payment poller's reversal pass turns on exactly that distinction:
+  ///
+  ///   the LEDGER said so       the Xero/QuickBooks forward pass and the backlog reconcile stamp
+  ///                            `paidAt` from an invoice the ledger itself reported PAID. If the
+  ///                            ledger later reports zero, the payment really has been taken away
+  ///                            and clearing `paidAt` is the whole point of the pass.
+  ///   A CHANNEL OR AN OPERATOR said so
+  ///                            the WooCommerce importer stamps `paidAt` from `date_paid_gmt`, and
+  ///                            `markSalesOrderPaid` stamps it because a human said so. NEITHER puts
+  ///                            anything into the ledger. A ledger reading zero against such an
+  ///                            order is IMS's OWN SILENCE, not a removal — and reading it as a
+  ///                            removal clears `paidAt` and raises a chargeback credit note against
+  ///                            a sale the customer genuinely paid for.
+  ///
+  /// The two are INDISTINGUISHABLE from the row alone: neither has a local `Payment`, so the receipt
+  /// witness (o3d-psrx r1) cannot separate them, and "has a shopping link" cannot either — every
+  /// ledger-sourced writer already excludes shopping-linked orders, but `markSalesOrderPaid` does not.
+  /// So the provenance is RECORDED rather than inferred, by the same UPDATE statement that writes
+  /// `paidAt`. There is no instant at which a reader can see one without the other.
+  ///
+  /// SET to a non-null instant by the non-ledger writers; NULL by every ledger-sourced writer and by
+  /// every writer that clears `paidAt`. `tests/accounting/paid-provenance-writers.test.ts` requires
+  /// every `paidAt` write in app/ and lib/ to name this field in the same `data` object, which is
+  /// what stops the next writer inheriting a stale value by omission.
+  ///
+  /// AND THE SECOND HALF OF THAT IS THE DATABASE'S, NOT A CENSUS'S (o3d-psrx r7, Codex HIGH 2). The
+  /// census walks app/ and lib/; a repair script, a seed, `psql` or a previous release serving across
+  /// a deploy is not in either. The trigger in migration 20260901090000 therefore fires on `paidAt`
+  /// as well and forces this column to NULL whenever `paidAt` is NULL, and the CHECK constraint
+  /// `sales_orders_paid_episode_marker_needs_paid_at` states the same thing as a table invariant. A
+  /// marker outliving its paid flag is not a legal state: the next paid transition would find it
+  /// non-null, preserve the DEAD fence, and hand the previous episode's registrations to the new one.
+  ///
+  /// THE VALUE IS THE DATABASE'S, NOT THE WRITER'S (o3d-psrx r5, Codex HIGH 1). Whatever instant a
+  /// caller supplies, the trigger in migration 20260901090000 stores `clock_timestamp()` instead.
+  /// This column is one END OF A FENCE — a registration may speak for the current paid flag only if
+  /// it completed AFTER the episode began (`registrationBindsToPaidState`) — and the other end is
+  /// database-minted. An application host's `new Date()` (markSalesOrderPaid) or a shop's
+  /// `date_paid_gmt` (the WooCommerce importer) on this side made that an ordering across two
+  /// machines, and a host running ahead unbinds a real, posted receipt for ever. The instant an
+  /// operator sees is `paidAt`; this one is a fence, and a fence has to be measured by one clock.
+  ///
+  /// AND A RECEIPT THAT COVERS THE ORDER REPLACES IT. `addPayment` clears this column when the
+  /// non-refund receipts on the order — the new one included — cover its total, including on an order
+  /// that was ALREADY marked paid by hand, which was the r4 hole: such an order kept a marker saying
+  /// "no ledger receipt is coming" while a real INVOICE_PAYMENT was registered moments later. COVER,
+  /// not merely EXIST (r6): this column asserts something about the WHOLE paid balance, and a GBP 1
+  /// receipt on a GBP 100 hand-marked order leaves GBP 99 of it settled by nothing any ledger was
+  /// told about.
+  ///
+  /// DISCHARGED BY THE LEDGER, NOT BY A SWEEP — TO THE EXTENT THE LEDGER WAS TOLD (r7, Codex HIGH 1).
+  /// Once an INVOICE_PAYMENT registration that COVERS the order is shown to have posted before the
+  /// ledger read, `classifyRegisteredPayment` stops consulting this at all and a genuine WooCommerce
+  /// chargeback still reverses. A registration covering only PART of it discharges nothing: the
+  /// ledger's account of that part is not an account of the rest, and reading it as one reverses the
+  /// whole order (`PART_COVERED_OFF_LEDGER`). Nothing has to CLEAR this column, which is why no
+  /// writer sweeps it; it is a fact about how the flag was set, and that fact does not expire.
+  ///
+  /// NULL on rows written before this column existed. The migration backfills the population it can
+  /// prove — shopping-linked, paid, no local receipt — and leaves the rest honest.
+  unregisteredPaidAt DateTime? @map("unregistered_paid_at")
   orderNumber       String?    // IMS order number (prefix + WC number, or manual)
   paymentMethod     String?    // e.g. "stripe", "paypal", "bacs" — populated by any shopping channel
   paymentMethodTitle String?   // e.g. "Credit card", "PayPal"
@@ -2405,8 +2469,16 @@ model AccountingSyncLog {
   // (connector, type, status, referenceType, referenceId, externalTransactionId) evidence that stops
   // an ambiguity silently becoming a certainty, but drop the payload and errorMessage, which are
   // where the customer names, emails, addresses and financial lines live. (An earlier revision of
-  // this comment listed a `provenance` column: that was part of the per-realm namespacing work,
-  // which was tried and REVERTED — this model has no such column. See o3d-gt8r / o3d-s36z.)
+  // this comment listed a `provenance` column: that exact column was part of the per-realm
+  // namespacing work, which was tried and REVERTED — see o3d-gt8r / o3d-s36z. It is NOT a statement
+  // that this model records no realm: `connectionProvenance` below does, and o3d-r948 r5 misread
+  // this parenthesis as saying otherwise and left a money guard scoped to the connector TYPE. A
+  // reverted design is not an absent capability; read the column list, not the history.)
+  //
+  // AND THIS COLUMN IS HALF OF THAT READING. `readAccountingOriginRecord` will let
+  // `connectionProvenance` speak for an empty payload ONLY where this instant proves retention
+  // emptied it — a payload rewritten by anything else lacks the stamp for a different reason, and
+  // the column cannot vouch for content it never saw.
   //
   // r4 finding 3: a tombstone IS still a sweep candidate. The columns the id write reads
   // all survive compaction, so an ambiguity that clears after the retention horizon — or a
@@ -3787,6 +3859,13 @@ model ActivityLog {
   @@index([tag])
   @@index([level])
   @@index([level, createdAt])
+  /// o3d-psrx r5 (Codex HIGH 2): the withheld-reversal marker scan
+  /// (lib/domain/accounting/withheld-reversal-markers.ts) groups the six marker actions per document
+  /// and takes each document's newest of each kind, with NO age bound — an age bound is what let an
+  /// unresolved reversal be abandoned by a poll outage. The retention sweep asks the same question
+  /// per row. `action` leads because it is the selective predicate; (entityType, entityId) is the
+  /// grouping; `createdAt` supplies the MAX and the oldest-first order without a sort.
+  @@index([action, entityType, entityId, createdAt], map: "activity_logs_action_entity_created_idx")
   @@map("activity_logs")
 }
 

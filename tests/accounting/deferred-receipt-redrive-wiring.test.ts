@@ -230,7 +230,9 @@ test('each receipt is measured against what the PREVIOUS one already consumed', 
   assert.equal(refusals.length, 1)
   assert.equal(refusals[0].metadata.refusal, 'WOULD_OVERPAY')
   assert.equal(refusals[0].metadata.paymentId, 'pay-2')
-  assert.equal(refusals[0].metadata.alreadyRegistered, 100)
+  // o3d-6abj: a `Decimal` recorded as its own exact digits, so the metadata cannot depend on
+  // whatever a serialiser makes of the object.
+  assert.equal(refusals[0].metadata.alreadyRegistered, '100')
 })
 
 test('a deposit and a balance that together fit are BOTH registered', async () => {
