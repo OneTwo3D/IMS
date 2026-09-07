@@ -326,6 +326,32 @@ export function decideInvoicePaymentRegistration(input: {
           marker: attempt.settlementMarker ?? null,
         },
         { ok: true, records: input.ledgerSettlements },
+        // o3d-r948 r3 (Codex HIGH) — THE ONE EXCLUSION THAT IS NOT A MUTABLE FIELD.
+        //
+        // A settlement the ledger holds may be unmeasurable — an amount this code will not read, or a
+        // date it cannot normalise — and `classifyLedgerSettlement` then withholds on it, correctly,
+        // because an unmeasurable record cannot be ruled out as this attempt by anything the record
+        // itself says. That is a permanent hold when the record belongs to a DIFFERENT row that
+        // already posted: `unresolvedInvoicePaymentAttempts` only judges FAILED and CANCELLED rows,
+        // so a SYNCED row's payment is never matched to its own attempt here — it can only ever
+        // block, and it blocks every future receipt on this order for good.
+        //
+        // What clears it is the only fact strong enough to: IMS RECORDED that settlement's own id
+        // when that other row posted it. `externalTransactionId` is the ledger's `PaymentID` /
+        // `Payment.Id`, which the ledger assigns and cannot re-assign, so a record carrying it was
+        // created by that row and not by this attempt — whatever has since been done to its amount,
+        // its date or its reference.
+        //
+        // BY REFERENCE, NOT BY A FIELD. `unresolved` is a filtered view of `input.existing`, so the
+        // row under judgement is the same object; removing it by identity is what guarantees this
+        // attempt's OWN recorded settlement is never excluded from its own match. Excluding that one
+        // would skip the record that proves this attempt already posted, which is precisely the
+        // `clear` this module exists to prevent.
+        {
+          settlementsOfOtherAttempts: input.existing
+            .filter((row) => row !== attempt)
+            .map((row) => row.externalTransactionId),
+        },
       )
       if (verdict.outcome === 'clear') continue
       return {

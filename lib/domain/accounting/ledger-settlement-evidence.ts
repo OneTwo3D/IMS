@@ -369,12 +369,49 @@ export function formatLedgerMoney(value: Decimal): string {
 const money = formatLedgerMoney
 
 /**
+ * o3d-r948 r3 (Codex HIGH) — WHAT THE CALLER KNOWS THAT THE RECORD ITSELF CANNOT SAY.
+ *
+ * A settlement record carries an id the ledger assigned and cannot change, and that id says nothing
+ * about WHOSE attempt made it. The fact that turns it into an identity is held by IMS, not by the
+ * connector: `AccountingSyncLog.externalTransactionId` is the settlement id a completed money post
+ * returned, so the rows for a document name the settlements those rows created.
+ *
+ * A caller that holds those rows may hand over the ids belonging to attempts OTHER THAN the one
+ * being judged, and a record carrying one of them is excluded from the match — see the loop in
+ * `classifyLedgerSettlement` for why nothing weaker may exclude anything.
+ *
+ * THE ATTEMPT'S OWN RECORDED ID MUST NEVER BE IN HERE. It names the settlement this very attempt
+ * created; excluding it would skip the one record that proves the post already happened, which is
+ * the exact `clear` this whole module exists to prevent. Callers build the set by removing the
+ * attempt under judgement from the rows they hold, by identity, not by any field.
+ */
+export type LedgerSettlementOptions = {
+  /**
+   * Ledger settlement ids IMS has already recorded against attempts that are NOT the one being
+   * judged. Nulls and blanks are ignored, and the comparison is case-folded because a ledger GUID
+   * is returned in whatever case the connector feels like.
+   */
+  settlementsOfOtherAttempts?: Iterable<string | null | undefined>
+}
+
+function foldedIdentitySet(ids: Iterable<string | null | undefined> | undefined): ReadonlySet<string> {
+  const folded = new Set<string>()
+  for (const id of ids ?? []) {
+    if (typeof id !== 'string') continue
+    const key = id.trim().toLowerCase()
+    if (key) folded.add(key)
+  }
+  return folded
+}
+
+/**
  * Decide what the ledger says about ONE attempt. Pure: the probe's I/O is the caller's problem, so
  * the rule that decides whether money may move again is unit-testable without a network.
  */
 export function classifyLedgerSettlement(
   attempt: AttemptDescription,
   probe: LedgerSettlementProbe,
+  options?: LedgerSettlementOptions,
 ): SettlementVerdict {
   if (!probe.ok) {
     return {
@@ -409,27 +446,64 @@ export function classifyLedgerSettlement(
     }
   }
 
-  // o3d-r948 r2 (Codex MEDIUM) — REFUSE ONLY WHILE THE RECORD IS STILL A CANDIDATE.
+  // o3d-r948 r3 (Codex HIGH) — A RECORD LEAVES THIS LOOP ONLY ON AN IMMUTABLE IDENTITY.
   //
-  // The band this loop matches on, hoisted so the "is this record already ruled out?" test below can
-  // ask it of a record whose OTHER discriminator is unreadable.
-  const band = ledgerMatchEpsilon(attempt.currency)
+  // WHAT r2 DID AND WHY IT WAS WRONG. r2 skipped a record whose READABLE half already differed from
+  // the attempt — a different date, or an amount outside the band — on the reasoning that the match
+  // rule is a conjunction, so either half failing rules the record out. The conjunction is right and
+  // the conclusion does not follow, because this module's whole model is that AMOUNTS AND DATES ARE
+  // MUTABLE: both are editable in both ledgers, which is the reason the mark exists (see
+  // `settlementMarkerFor`) and the reason an unreadable figure withholds at all. A record whose date
+  // is not this attempt's is therefore NOT proof it is somebody else's — it is equally consistent
+  // with OUR OWN payment, edited in the ledger after we made it. r2 turned that ambiguity into
+  // permission to post again: skip the only record on the document, fall out of the loop, `clear`,
+  // and the retry/re-enqueue caller pays it twice. A discriminator that the ledger can rewrite can
+  // never CLEAR; it can only ever match.
+  //
+  // WHAT AN IDENTITY HAS TO BE TO RULE A RECORD OUT. Assigned by the ledger, and unchangeable there
+  // afterwards. Here is what each connector actually puts on a settlement record, and which side of
+  // that line it falls:
+  //
+  //   Xero INVOICE_PAYMENT / BILL_PAYMENT
+  //       `Payment.PaymentID`  — IMMUTABLE. Xero mints it and never re-assigns it; a payment can be
+  //                              deleted but not renumbered.
+  //       `Payment.Reference`  — MUTABLE. It is the operator-visible reference field, editable in
+  //                              the Xero UI, and it is where IMS writes its own mark.
+  //   QuickBooks INVOICE_PAYMENT / BILL_PAYMENT
+  //       `Payment.Id` / `BillPayment.Id` — IMMUTABLE, and read here off the DOCUMENT's own
+  //                              `LinkedTxn.TxnId`, so it is QuickBooks' statement about what settles
+  //                              this document rather than ours.
+  //       `PrivateNote`        — MUTABLE. Editable on the transaction; IMS's mark lives in it.
+  //   Xero PURCHASE_CREDIT_NOTE_ALLOCATION
+  //       NOTHING. The allocation carries no id this probe reads and no reference field exists on it
+  //       at all. This type has no identity, so it can never be ruled out — see below.
+  //   QuickBooks PURCHASE_CREDIT_NOTE_ALLOCATION
+  //       Never reaches here: `probeQuickBooksSettlement` refuses the type outright.
+  //
+  // NEITHER CONNECTOR ECHOES OUR REQUEST ID. Xero's `Idempotency-Key` and QuickBooks' `requestid` are
+  // request headers/params; neither is stored on, or returned with, the settlement entity. So the
+  // only thing IMS can recognise on a record it did not just create is the MARK it wrote into the
+  // mutable reference — which is why the mark pass above returns `present` and nothing here uses a
+  // reference to return `clear`. The asymmetry is deliberate and it is the whole rule: a mutable
+  // field may only ever move a verdict TOWARDS withholding.
+  //
+  // SO THE ONE EXCLUSION IS: this record's immutable id is one IMS has ALREADY RECORDED as a
+  // DIFFERENT attempt's settlement. `AccountingSyncLog.externalTransactionId` holds exactly that for
+  // these types — the Xero money branch stores `Payments[0].PaymentID` and the QuickBooks ones store
+  // `Payment.Id` / `BillPayment.Id` — so a caller holding the other rows for this document can hand
+  // their recorded ids over. A record whose id is in that set was created by an attempt that is not
+  // this one, and no edit to its amount, its date or its reference can make it this one.
+  //
+  // A CALLER THAT CANNOT SUPPLY THE SET PASSES NOTHING, and then nothing is excluded and every
+  // unmeasurable record withholds. That is the honest answer rather than a degraded one: the cost of
+  // holding a genuine payment back is a visible refusal, and the cost of the alternative is a second
+  // payment.
+  const excluded = foldedIdentitySet(options?.settlementsOfOtherAttempts)
   for (const record of probe.records) {
-    // WHAT AN AVAILABLE DISCRIMINATOR ALREADY SETTLES. The match rule is a CONJUNCTION — the amounts
-    // within the band AND the same date — so either half failing means this record cannot be the
-    // attempt, whatever the other half says. Withholding was the safe direction while the record
-    // might have been ours; a record whose readable date is not this attempt's is somebody else's,
-    // its unreadable amount decides nothing, and holding a genuine FIRST payment back over it is
-    // pure cost with no risk retired.
-    //
-    // IT IS EXACTLY AS SAFE AS WHAT THIS LOOP ALREADY DOES. A record with BOTH halves readable and a
-    // different date is skipped today and can lead to `clear`; the residual risk — a settlement of
-    // ours whose date was edited in the ledger — is the one the MARK exists for and was checked
-    // before this loop was entered. Nothing here weakens that.
-    const amountRulesItOut = record.amount !== null
-      && compareDecimal(subtractMoney(record.amount, attempt.amount).abs(), band) > 0
-    const dateRulesItOut = record.date !== null && record.date !== attempt.date
-    if (amountRulesItOut || dateRulesItOut) continue
+    // The identity test, and the ONLY thing in this loop allowed to reach `continue` before the
+    // record has been measured. Folded, because a ledger GUID comes back in whatever case it feels
+    // like and `4D8A…` is the same payment as `4d8a…`.
+    if (typeof record.id === 'string' && excluded.has(record.id.trim().toLowerCase())) continue
     if (record.amount === null || record.date === null) {
       return {
         outcome: 'unknown',
@@ -448,8 +522,6 @@ export function classifyLedgerSettlement(
             + 'read, so it cannot be ruled out as this attempt',
       }
     }
-    // Both halves are readable and neither ruled the record out, so it IS this attempt.
-    //
     // o3d-6yho: half one minor unit of the attempt's OWN currency.
     //
     // o3d-78rq — AND BOTH OPERANDS ARE NOW DECIMALS, so the band decides what the band says. It was
@@ -461,11 +533,14 @@ export function classifyLedgerSettlement(
     // rule is the one that posts a second payment. Nothing is converted now: the attempt carries its
     // payload's exact decimal, the record carries the ledger's stated figure, and the band stays a
     // `Decimal` all the way into the comparison.
-    return {
-      outcome: 'present',
-      matchedId: record.id ?? null,
-      detail: `${money(record.amount)} dated ${record.date}`
-        + (record.id ? ` (${record.id})` : ''),
+    if (compareDecimal(subtractMoney(record.amount, attempt.amount).abs(), ledgerMatchEpsilon(attempt.currency)) <= 0
+      && record.date === attempt.date) {
+      return {
+        outcome: 'present',
+        matchedId: record.id ?? null,
+        detail: `${money(record.amount)} dated ${record.date}`
+          + (record.id ? ` (${record.id})` : ''),
+      }
     }
   }
   return { outcome: 'clear' }
