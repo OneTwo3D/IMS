@@ -9642,6 +9642,220 @@ test('r32: the recovery wrapper an operator is given runs, as pasted, with nothi
   }
 })
 
+
+/**
+ * A HELPER THAT ANSWERS `--audit-authority` OUT OF THE SHIPPED MODE (o3d-secops r26).
+ *
+ * Not a stub of the verdict: it IMPORTS doAuditAuthority() from the repository's own
+ * scripts/fence-db-connections.mjs and hands it a client whose one answer is a `datacl` string
+ * read from a fixture file the test rewrites between phases. So the record read, the provenance
+ * gate, the ACL parse, the three-way rule, the verdict line and the exit status are all the
+ * shipped ones, and what the fixture supplies is the database's answer and nothing else.
+ *
+ * A rig that computed the verdict itself would be asserting that its author can compare two
+ * lists, and would go on passing if the rule the wrapper acts on changed underneath it.
+ */
+function auditingHelper(dir: string, aclFile: string): string {
+  const shipped = `file://${join(process.cwd(), 'scripts', 'fence-db-connections.mjs')}`
+  return [
+    "import { appendFileSync, readFileSync } from 'node:fs'",
+    `import { doAuditAuthority } from ${JSON.stringify(shipped)}`,
+    `appendFileSync(${JSON.stringify(join(dir, 'calls.log'))}, process.argv.slice(2).join(' ') + '\\n')`,
+    'const arg = (name) => {',
+    '  const hit = process.argv.find((a) => a.startsWith(`--${name}=`))',
+    '  return hit ? hit.slice(name.length + 3) : \'\'',
+    '}',
+    "if (process.argv.includes('--audit-authority')) {",
+    `  const raw = readFileSync(${JSON.stringify(aclFile)}, 'utf8').trim()`,
+    // A HELPER THAT DECIDED AND THEN DIED ON THE WAY OUT. The verdict is on stdout and the exit
+    // status is a failure: two channels that disagree, which is the case the wrapper's `&&` is
+    // there for and which a fixture where they always agree cannot exhibit.
+    "  const crash = raw.startsWith('CRASH:')",
+    "  const fixture = crash ? raw.slice('CRASH:'.length) : raw",
+    '  const client = {',
+    '    query: async (sql) => {',
+    "      if (String(sql).includes('AS audited_database')) {",
+    "        return { rows: [{ audited_database: 'imsdb', audited_owner_role: 'owner', audited_datacl: fixture === 'NULL' ? null : fixture }] }",
+    '      }',
+    "      throw new Error('the audit asked something this fixture does not answer: ' + sql)",
+    '    },',
+    '  }',
+    '  const decided = await doAuditAuthority(client, {',
+    "    stateFile: arg('state-file'),",
+    "    stateOwnerUid: Number(arg('state-owner')),",
+    "    appRole: arg('app-role') || arg('app-user'),",
+    '  })',
+    '  process.exit(crash ? 1 : decided)',
+    '}',
+    'process.exit(0)',
+    '',
+  ].join('\n')
+}
+
+/**
+ * THE ONE-TIME OPERATOR RESOLUTION, END TO END (o3d-secops r26, Codex HIGH).
+ *
+ * WHAT IS BEING PROVED, in the order it matters:
+ *   1. the automatic re-fence REFUSES over an unstamped record, and says which record and where to
+ *      go — it does not silently pick a state, which is what r25 did;
+ *   2. the RELEASE wrapper still works over that same record, unchanged, which is the escape hatch
+ *      that makes the refusal survivable;
+ *   3. the resolution STAMPS a fence the ACL shows is standing, and CLEARS a record the ACL shows
+ *      nothing stands behind;
+ *   4. a MIXED reading changes nothing at all;
+ *   5. and it refuses every record that is not the ambiguous one, so it cannot be used as a
+ *      general-purpose "make this record say what I want" tool.
+ *
+ * ROUTE: real processes. The wrappers are the ones db_fence_publish_operator_wrappers() writes,
+ * run as an operator would with nothing supplied; the record is published by the shipped
+ * validator through the shipped re-fence wrapper and then stripped of the two fields an older
+ * validator never wrote; the verdict comes from the shipped `--audit-authority` over a `datacl`
+ * fixture.
+ *
+ * MUTATION ROUTE (each made against scripts/lib/db-fence-protected.sh and reverted):
+ *   1. put r25's rule back in the validator (`standing = true` where the refusal now is): PHASE 1
+ *      stops refusing — the re-fence publishes `recovery` over a record nothing can show a fence
+ *      behind.
+ *   2. drop the `"${rc}" -eq 0 &&` half of the clearing arm in resolve_legacy_fence(): PHASE 4c —
+ *      a helper that printed `absent` and then failed on its way out — clears the record on the
+ *      word of a run that did not finish.
+ *   3. remove the `fence_applied` check from db_fence_legacy_inspect_program(): PHASE 5 stops
+ *      refusing and the resolution re-stamps a record that was never ambiguous.
+ */
+test('r26: the operator resolution stamps a standing legacy fence and clears one that never went up', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'ims-r26-resolve-'))
+  try {
+    const acl = join(dir, 'datacl.txt')
+    const state = join(dir, 'state.json')
+    const calls = join(dir, 'calls.log')
+    // THE THREE ACLs, in the shape PostgreSQL prints them. The record below names PUBLIC and
+    // imsapp, which is what FENCE_PLAN_STUB plans; the owner keeps its own entry in all three,
+    // because a fence never takes the owner's.
+    const UNFENCED = '{owner=CTc/owner,=Tc/owner,imsapp=c/owner}'
+    const FENCED = '{owner=CTc/owner}'
+    const MIXED = '{owner=CTc/owner,imsapp=c/owner}'
+
+    writeFileSync(acl, `${UNFENCED}\n`)
+    writeFenceCheckout(dir, auditingHelper(dir, acl))
+    writeFileSync(join(dir, 'app', '.env'), 'DEPLOY_ADMIN_DATABASE_URL="postgresql://admin:pw@127.0.0.1:5432/imsdb"\n')
+    const paths = protectedPaths(dir)
+    const wrapperEnv = { PATH: process.env.PATH ?? '' } as unknown as NodeJS.ProcessEnv
+    const run = (wrapper: string) => spawnSync(wrapper, [], { encoding: 'utf8', env: wrapperEnv })
+
+    const publish = runShell(
+      artefactHarness(dir, [
+        'db_fence_script_in_use >/dev/null || exit 1',
+        `db_fence_publish_operator_wrappers "$(id -un)" ${JSON.stringify(join(dir, 'app', '.env'))} ${JSON.stringify(state)} --app-host=db.internal --app-port=6432 --app-user=imsapp --app-database=imsdb || exit 1`,
+      ]),
+    )
+    assert.equal(publish.status, 0, `the wrappers must be published:\n${publish.output}`)
+    assert.ok(existsSync(paths.resolveWrapper), `the resolution wrapper must be published too:\n${publish.output}`)
+    assert.equal(spawnSync('bash', ['-n', paths.resolveWrapper], { encoding: 'utf8' }).status, 0, 'and must parse')
+
+    // THE LEGACY RECORD, MADE THE ONLY HONEST WAY: published by the shipped validator through the
+    // shipped wrapper, then stripped of the two fields a validator that predates them never wrote.
+    const raised = run(paths.refenceWrapper)
+    assert.equal(raised.status, 0, `${raised.stdout}${raised.stderr}`)
+    const modern = JSON.parse(readFileSync(state, 'utf8'))
+    assert.equal(modern.fence_applied, 1, 'precondition: an ordinary re-fence stamps its record applied')
+    delete modern.fence_applied
+    delete modern.fence_mode
+    const LEGACY = `${JSON.stringify(modern, null, 2)}\n`
+    const plantLegacy = () => writeFileSync(state, LEGACY)
+
+    // PHASE 1 — THE AUTOMATIC PATH REFUSES, AND SAYS WHERE TO GO.
+    plantLegacy()
+    const refused = run(paths.refenceWrapper)
+    assert.equal(refused.status, 1, `a re-fence over an unstamped record must refuse:\n${refused.stdout}${refused.stderr}`)
+    assert.equal(readFileSync(state, 'utf8'), LEGACY, 'and publish nothing over it')
+    assert.match(refused.stderr, /carries no applied stamp at all/, refused.stderr)
+    assert.ok(refused.stderr.includes(paths.resolveWrapper),
+      `the refusal must name the wrapper that resolves it:\n${refused.stderr}`)
+    assert.ok(!/--fence/.test(readFileSync(calls, 'utf8').split('\n').slice(-1)[0] ?? ''),
+      `and must never reach the executor:\n${readFileSync(calls, 'utf8')}`)
+
+    // PHASE 2 — AND THE RELEASE STILL WORKS OVER IT, WHICH IS THE ESCAPE HATCH. Nothing in the
+    // release path consults either field, so an operator holding a record no automatic path will
+    // touch can still take a standing fence down.
+    writeFileSync(calls, '')
+    const released = run(paths.releaseWrapper)
+    assert.equal(released.status, 0, `the release must work over an unstamped record:\n${released.stdout}${released.stderr}`)
+    assert.match(readFileSync(calls, 'utf8'), /^--release /m, 'reaching the helper with the record it names')
+    assert.equal(existsSync(state), false, 'and root removes the record once the release is verified')
+
+    // PHASE 3 — THE RESOLUTION, WITH A FENCE THE ACL SHOWS IS STANDING.
+    plantLegacy()
+    writeFileSync(acl, `${FENCED}\n`)
+    const stamped = run(paths.resolveWrapper)
+    assert.equal(stamped.status, 0, `a standing fence must resolve:\n${stamped.stdout}${stamped.stderr}`)
+    const afterStamp = JSON.parse(readFileSync(state, 'utf8'))
+    assert.equal(afterStamp.fence_applied, 1, 'the record now says the fence it describes is standing')
+    assert.deepEqual(afterStamp.revoked, modern.revoked, 'and nothing else about it moved')
+    assert.match(stamped.stderr, /is stamped APPLIED/, stamped.stderr)
+    // AND THE AUTOMATIC PATH IS UNBLOCKED, under the rule the evidence earned: a fence that stands
+    // is re-fenced as a RECOVERY.
+    const afterResolve = run(paths.refenceWrapper)
+    assert.equal(afterResolve.status, 0, `${afterResolve.stdout}${afterResolve.stderr}`)
+    assert.equal(JSON.parse(readFileSync(state, 'utf8')).fence_mode, 'recovery',
+      `a resolved standing fence re-fences under the recovery rule:\n${afterResolve.stderr}`)
+
+    // PHASE 4a — AND WITH A RECORD NOTHING STANDS BEHIND, IT GOES.
+    plantLegacy()
+    writeFileSync(acl, `${UNFENCED}\n`)
+    const cleared = run(paths.resolveWrapper)
+    assert.equal(cleared.status, 0, `a spent record must resolve:\n${cleared.stdout}${cleared.stderr}`)
+    assert.equal(existsSync(state), false, 'by being removed, so the next cutover plans afresh')
+
+    // PHASE 4b — THE MIXED READING CHANGES NOTHING. Some recorded grantees hold CONNECT and some
+    // do not, which a half-applied fence and an administrator's own revoke both produce.
+    plantLegacy()
+    writeFileSync(acl, `${MIXED}\n`)
+    const undecided = run(paths.resolveWrapper)
+    assert.equal(undecided.status, 1, `a mixed reading must refuse:\n${undecided.stdout}${undecided.stderr}`)
+    assert.equal(readFileSync(state, 'utf8'), LEGACY, 'and leave the record byte for byte as it was found')
+    assert.match(undecided.stderr, /NOT RESOLVED/, undecided.stderr)
+    assert.match(undecided.stderr, /A MIXED reading/, `naming what it could not settle:\n${undecided.stderr}`)
+
+    // PHASE 4c — AND THE TWO CHANNELS MUST AGREE. The audit decided `absent` and then failed on
+    // its way out; the verdict line says one thing and the exit status says the run did not
+    // finish. A status can be produced by a shell that never ran the helper and a line by a helper
+    // that could not decide, so neither alone may move a record.
+    plantLegacy()
+    writeFileSync(acl, `CRASH:${UNFENCED}\n`)
+    const halfAnswered = run(paths.resolveWrapper)
+    assert.equal(halfAnswered.status, 1, `a verdict from a run that failed must not be acted on:\n${halfAnswered.stdout}${halfAnswered.stderr}`)
+    assert.equal(readFileSync(state, 'utf8'), LEGACY, 'and the record must be exactly as it was found')
+    assert.match(halfAnswered.stderr, /NOT RESOLVED/, halfAnswered.stderr)
+
+    // PHASE 5 — AND IT IS NOT A GENERAL-PURPOSE STAMP. Every record that is not the ambiguous one
+    // is refused by name, so this cannot be used to declare an arbitrary fence standing.
+    writeFileSync(acl, `${FENCED}\n`)
+    const notAmbiguous: [string, string, RegExp][] = [
+      ['already stamped', JSON.stringify({ ...modern, fence_mode: 'initial', fence_applied: 1 }, null, 2), /already stamped applied/],
+      ['published, never applied', JSON.stringify({ ...modern, fence_mode: 'initial', fence_applied: 0 }, null, 2), /PUBLISHED, NEVER APPLIED/],
+      ['truncated', JSON.stringify({ ...modern, state_complete: undefined }, null, 2), /completeness sentinel/],
+      ['not JSON', 'this is not a record', /does not hold valid JSON/],
+    ]
+    for (const [label, body, says] of notAmbiguous) {
+      writeFileSync(state, `${body}\n`)
+      const before = readFileSync(state, 'utf8')
+      const refusal = run(paths.resolveWrapper)
+      assert.equal(refusal.status, 1, `${label}: must refuse:\n${refusal.stdout}${refusal.stderr}`)
+      assert.match(refusal.stderr, says, `${label}: naming why:\n${refusal.stderr}`)
+      assert.equal(readFileSync(state, 'utf8'), before, `${label}: and changing nothing`)
+    }
+
+    // AND WITH NO RECORD AT ALL, which is not a fence it may declare resolved either.
+    rmSync(state)
+    const nothing = run(paths.resolveWrapper)
+    assert.equal(nothing.status, 1, `${nothing.stdout}${nothing.stderr}`)
+    assert.match(nothing.stderr, /NOT RESOLVABLE/, nothing.stderr)
+    assert.equal(existsSync(state), false, 'and it creates nothing')
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
 // ---------------------------------------------------------------------------
 // r33: WHAT A SCRIPT-ONLY PIN AUTHENTICATES, AND WHAT IT DOES NOT
 // (o3d-2sm1.5, Codex CRITICAL)
