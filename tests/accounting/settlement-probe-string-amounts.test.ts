@@ -2598,10 +2598,10 @@ test('[o3d-acctmoney r3] the guard is NOT inert: a DELETED refund is caught on t
   //        the resolved record states DELETED -> `counts:false` -> the 100 is NOT subtracted ->
   //        `applied` = 100 against an empty collection -> the shortfall refusal -> ok:false.
   // MUTATION: delete the `resolveCreditNoteRefunds` call in the arm and use `statedInclusions`
-  //        directly — i.e. r2's code exactly. Measured: `deleted` below answers ok:true with
-  //        provedComplete:true and the classifier says `clear`, which is the second allocation of the
-  //        missing 100. That is the finding, reproduced on the stub shape rather than on a synthetic
-  //        nested `Status` the live models say Xero does not send.
+  //        directly — i.e. r2's code exactly. Measured: this assertion fails as `true !== false` —
+  //        `deleted` answers ok:true — and the classifier says `clear`, which is the second
+  //        allocation of the missing 100. That is the finding, reproduced on the stub shape rather
+  //        than on a synthetic nested `Status` the live models say Xero does not send.
   // MUTATION 2: make the post-resolution silence check accept a resolved record with no `Status`
   //        (drop the `wireEnum(full.Status).token === null` refusal). Measured: `silentAfterLookup`
   //        below clears — the inert guard again, one indirection further away.
@@ -2666,8 +2666,10 @@ test('[o3d-acctmoney r3] a refunded credit note CAN still authorise, which is wh
   //        resolved AUTHORISED payment (the "never subtract what you had to ask about" rule).
   //        Measured: ok:false, "100.00 of this credit note already applied but returned no
   //        allocations" — the whole-class refusal, on the most ordinary operation there is.
-  // MUTATION 2: return a refusal instead of an inclusion whenever a lookup was needed (the
-  //        withhold-everything rule). Measured: the same note stops clearing and holds for ever.
+  // MUTATION 2: return a refusal as soon as a lookup is needed, before making it (the
+  //        withhold-everything rule). Measured: this test fails, along with 41, 43, 44, 45, 46, 49,
+  //        51 and 52 — every refunded credit note in the file stops clearing, which is the shape of
+  //        the permanent hold the prose above rejects.
 
   const refunded = await probeNote(
     { ...AMBIGUOUS_NOTE, Payments: [PRODUCTION_STUB] }, { 'PAY-R1': AUTHORISED_REFUND },
@@ -2699,10 +2701,11 @@ test('[o3d-acctmoney r3] a refunded credit note CAN still authorise, which is wh
 test('[o3d-acctmoney r3] a refund that cannot be resolved REFUSES rather than being subtracted', async () => {
   // ROUTE: `resolveCreditNoteRefunds` -> each failure below -> a `refusal` sentence -> ok:false,
   //        which the classifier cannot turn into `clear`.
-  // MUTATION: replace each refusal with `continue` — i.e. leave the stub's own `counts: true` in
-  //        place, which is r2's answer for an unresolvable payment. Measured: every case below
-  //        answers ok:true with provedComplete:true and classifies as `clear`, over the exact note
-  //        the finding is about. Fail-open here is the whole defect wearing a lookup.
+  // MUTATION: ignore the resolution's refusal in the arm (`refundResolution.refusal !== null &&
+  //        false`), leaving the stub's own `counts: true` in place — which is r2's answer for an
+  //        unresolvable payment. Measured: this test fails, and so do tests 49 and 52; every case
+  //        below answers ok:true and classifies as `clear`, over the exact note the finding is
+  //        about. Fail-open here is the whole defect wearing a lookup.
 
   const NOTE = { ...AMBIGUOUS_NOTE, Payments: [PRODUCTION_STUB] }
   // PRECONDITION — resolved AUTHORISED this note clears, so every refusal below is taking a `clear`
@@ -2756,9 +2759,11 @@ test('[o3d-acctmoney r3] what the resolution COSTS: nothing when the status is s
   // ambiguity rather than to the number of credit notes, so the call log is asserted rather than
   // described.
   // ROUTE: `resolveCreditNoteRefunds` -> `wireEnum(payment.Status).token !== null` -> `continue`.
-  // MUTATION: drop that early `continue` and resolve every payment. Measured: case (1) and case (2)
-  //        below both gain a `Payments/PAY-R1` call, and the first assertion fails — every credit
-  //        note with any payment on it would then cost a request per payment, forever.
+  // MUTATION: drop that early `continue` and resolve every payment. Measured: case (1) is unchanged
+  //        (it has no payments to resolve), and case (2) fails at `stated.probe.ok` — the arm goes
+  //        and looks up a payment whose status it was already told, and a credit note whose refunds
+  //        state their own status would cost a request per payment forever. Tests 45, 46 and 47 fail
+  //        with it, which is the same cost charged to the r2 fixtures.
 
   // (1) NO PAYMENTS AT ALL — the ordinary credit note. One request, as before this change.
   const plain = await probeNoteWithCalls({ CurrencyCode: 'GBP', Total: 40, RemainingCredit: 40, Allocations: [] })

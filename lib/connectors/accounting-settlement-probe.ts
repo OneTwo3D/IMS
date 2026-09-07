@@ -715,6 +715,14 @@ type XeroCreditNoteResponse = {
      * know. Both are declared `string` rather than a union so that an UNRECOGNISED value is a value
      * this code must refuse on rather than one the type system pretends cannot arrive — see
      * `creditNoteRefundInclusion`.
+     *
+     * o3d-acctmoney r3 — BOTH ARE OPTIONAL BECAUSE THE PROJECTION MAY NOT CARRY THEM, AND THAT IS NOT
+     * A DETAIL THE ARM MAY SHRUG AT. The schema `$ref`s the full `Payment` here, so they MAY arrive;
+     * this repository's live-tenant scripts type the same nested element as `{ PaymentID, Amount }`,
+     * so they may not; nothing captured settles it. An absent `Status` therefore does NOT mean an
+     * authorised refund — it means the discriminator has to be fetched from `Payments/{id}` before
+     * the `Amount` beside it may be subtracted. `PaymentID` is what makes that possible, which is why
+     * it is modelled even though no arithmetic reads it.
      */
     Payments?: Array<{ PaymentID?: string; Amount?: number; Status?: string; PaymentType?: string }>
   }>
