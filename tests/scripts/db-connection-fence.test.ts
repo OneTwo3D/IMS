@@ -648,6 +648,30 @@ function stateDir(t: TestContext) {
 const FENCE_LIBRARY = readFileSync(join(process.cwd(), 'scripts/lib/db-fence-protected.sh'), 'utf8')
 /** The cutover namespace library, for the one predicate the fence library reaches back for. */
 const CUTOVER_NS_LIB_SOURCE = readFileSync(join(process.cwd(), 'scripts/lib/cutover-namespace.sh'), 'utf8')
+
+/**
+ * THE NAMES db_fence_authorise_plan() COMPOSES ITS FOURTH ARGUMENT FROM (o3d-secops r26).
+ *
+ * That argument is DISPLAY TEXT — the path of the resolution wrapper, printed in the refusal an
+ * unstamped record produces and never executed — but the harnesses below lift ONE function at a
+ * time rather than sourcing the library, and under `set -u` an unset name aborts the function
+ * before it reaches `node`. So the declarations are carried, LIFTED FROM THE SHIPPED LINES rather
+ * than typed here: a harness that invented a path would be exercising a message the library does
+ * not print.
+ *
+ * ${DB_FENCE_SUDO_PREFIX} is the one that is not `readonly` and not a path — it is resolved from
+ * PATH at load time — so it is declared empty, which is what the library leaves it as on a box
+ * with no sudo.
+ */
+const FENCE_DISPLAY_DECLARATIONS = (() => {
+  const lines = FENCE_LIBRARY.split('\n')
+  const lifted = ['DB_FENCE_RECOVERY_DIR', 'DB_FENCE_RESOLVE_WRAPPER'].map((name) => {
+    const declaration = lines.find((line) => line.startsWith(`readonly ${name}=`))
+    assert.ok(declaration, `the shipped library must declare ${name} once, as a readonly`)
+    return declaration.replace(/^readonly /, '')
+  })
+  return ["DB_FENCE_SUDO_PREFIX=''", ...lifted].join('\n')
+})()
 const AUTHORISE_PLAN_PROGRAM = (() => {
   // Read out of the library's own text between the heredoc markers. `shellFunction` would answer
   // for the function, and what is wanted is the PROGRAM the function emits — the same bytes
@@ -1075,12 +1099,32 @@ test('assessAuthorityDrift reports both set differences, and each mode says what
     assert.equal(drift.accepted, false, `${mode}: and refused`)
   }
 
-  // AN UNSTAMPED RECORD IS A RECOVERY. It can only be a fence raised before this round and still
-  // standing; refusing it would strand that fence with neither a re-apply nor a release.
-  assert.equal(authorityFenceMode({ revoked: ['PUBLIC'] }), FENCE_MODE_RECOVERY)
+  // AN UNRECOGNISED MODE IS THE STRICT RULE, AND r26 REVERSED r24 TO GET HERE (Codex HIGH).
+  //
+  // r24 asserted the opposite of the first line below: a record with no `fence_mode` resolved to
+  // RECOVERY, on the argument that it could only be a fence raised before that field existed and
+  // therefore standing. The predecessor published its record BEFORE running the fence, so a record
+  // of that vintage is equally what a publication killed before `BEGIN` left — the reading dates
+  // the writer and not the fence. `recovery` is the rule with the privilege in it (it accepts
+  // recorded grantees missing from the ACL, and `--release` then GRANTs CONNECT back to them), so
+  // it is given only to a record that actually says `recovery`.
+  //
+  // MUTATION ROUTE (made against the shipped file and reverted): put the comparison back the way
+  // r24 had it — `record.fence_mode === FENCE_MODE_INITIAL ? INITIAL : RECOVERY` — and the first
+  // and third lines below both report `recovery`.
+  assert.equal(authorityFenceMode({ revoked: ['PUBLIC'] }), FENCE_MODE_INITIAL,
+    'a record carrying no mode at all cannot show a fence stands, so it gets the rule that assumes none does')
+  assert.equal(authorityFenceMode({ fence_mode: FENCE_MODE_RECOVERY }), FENCE_MODE_RECOVERY)
   assert.equal(authorityFenceMode({ fence_mode: FENCE_MODE_INITIAL }), FENCE_MODE_INITIAL)
-  // AND A RECORD CANNOT TALK ITS WAY INTO THE STRICT RULE BY MISSPELLING THE LAX ONE.
-  assert.equal(authorityFenceMode({ fence_mode: 'INITIAL' }), FENCE_MODE_RECOVERY)
+  // AND A RECORD CANNOT TALK ITS WAY INTO THE LAX RULE BY MISSPELLING IT EITHER.
+  assert.equal(authorityFenceMode({ fence_mode: 'RECOVERY' }), FENCE_MODE_INITIAL)
+  assert.equal(authorityFenceMode(null), FENCE_MODE_INITIAL)
+
+  // AND assessAuthorityDrift() RESOLVES THE UNKNOWN THE SAME WAY, since it is the function that
+  // acts on the mode: a caller that passed nothing must not be handed the tolerance.
+  const unknownMode = assessAuthorityDrift({ ...lost, mode: undefined })
+  assert.equal(unknownMode.mode, FENCE_MODE_INITIAL, 'an unrecognised mode resolves strict')
+  assert.equal(unknownMode.accepted, false, 'and a withdrawn grantee under it is drift, not a standing fence')
 })
 
 test('a grantee REMOVED between the plan and an initial fence aborts it (o3d-secops r24)', async (t) => {
@@ -1241,6 +1285,7 @@ test('a refused INITIAL fence leaves no authority behind, and a standing one is 
       // is still the shipped validator and not a re-typed one.
       `db_fence_authorise_plan_program() {\n  cat <<'AUTHORISE_PLAN_EOF'\n${AUTHORISE_PLAN_PROGRAM}AUTHORISE_PLAN_EOF\n}`,
       `db_fence_mark_applied_program() {\n  cat <<'MARK_APPLIED_EOF'\n${MARK_APPLIED_PROGRAM}MARK_APPLIED_EOF\n}`,
+      FENCE_DISPLAY_DECLARATIONS,
       shellFunction(FENCE_LIBRARY, 'db_fence_authorise_plan'),
       shellFunction(FENCE_LIBRARY, 'db_fence_mark_authority_applied'),
       shellFunction(FENCE_LIBRARY, 'db_fence_publish_authority'),
@@ -1440,6 +1485,7 @@ test('db_fence_raise clears the authority a FAILED PUBLICATION left behind (o3d-
       shellFunction(CUTOVER_NS_LIB_SOURCE, 'dir_is_private_to_this_run'),
       `db_fence_authorise_plan_program() {\n  cat <<'AUTHORISE_PLAN_EOF'\n${AUTHORISE_PLAN_PROGRAM}AUTHORISE_PLAN_EOF\n}`,
       `db_fence_mark_applied_program() {\n  cat <<'MARK_APPLIED_EOF'\n${MARK_APPLIED_PROGRAM}MARK_APPLIED_EOF\n}`,
+      FENCE_DISPLAY_DECLARATIONS,
       shellFunction(FENCE_LIBRARY, 'db_fence_authorise_plan'),
       shellFunction(FENCE_LIBRARY, 'db_fence_mark_authority_applied'),
       shellFunction(FENCE_LIBRARY, 'db_fence_publish_authority'),
@@ -1494,7 +1540,24 @@ test('db_fence_raise clears the authority a FAILED PUBLICATION left behind (o3d-
  * The discriminator is the key's presence, not its value, and it holds because the directory is
  * root-owned and unwritable by anything else — the same argument `fence_mode` already rests on.
  */
-test('a fence raised before the applied stamp still re-applies and releases (o3d-secops r25)', async (t) => {
+/**
+ * AN UNSTAMPED RECORD BUYS NOTHING, AND THE RELEASE STILL WORKS OVER IT
+ * (o3d-secops r26, Codex HIGH — this test REPLACES r25's `a fence raised before the applied stamp
+ * still re-applies and releases`, which asserted the behaviour this round removed).
+ *
+ * WHAT r25 GOT WRONG, since the test that asserted it is the one being rewritten. It read an
+ * absent `fence_applied` key as a fence RAISED before the stamp existed, and therefore standing,
+ * and published a RECOVERY authority over it. The premise is sound — the key is absent only in
+ * records an older validator wrote — and the conclusion does not follow from it: that older
+ * validator published its record BEFORE invoking `--fence`, so its own documented SIGKILL window
+ * between the rename and `BEGIN` leaves exactly this record with no fence behind it. An absent
+ * stamp dates the WRITER. Reading it as standing hands the lax rule — recorded grantees missing
+ * from the ACL are accepted, and `--release` afterwards GRANTs CONNECT back to every one of them —
+ * to a fence nobody can show exists, which is the direction refused everywhere else on this branch.
+ *
+ * SO: the automatic path REFUSES, and the two things that must still work do.
+ */
+test('an unstamped record is refused by the validator and still releasable from (o3d-secops r26)', async (t) => {
   const dir = stateDir(t)
   const stateFile = join(dir, 'db-connect-fence.json')
   const record = { ...SAMPLE_STATE, revoked: ['PUBLIC', 'owner', 'imsapp'] }
@@ -1506,60 +1569,68 @@ test('a fence raised before the applied stamp still re-applies and releases (o3d
   delete published.fence_applied
   delete published.fence_mode
   writeFileSync(stateFile, `${JSON.stringify(published, null, 2)}\n`)
+  const before = readFileSync(stateFile, 'utf8')
 
+  // 1. THE AUTOMATIC PATH REFUSES, AND PUBLISHES NOTHING.
   const republished = authorisePlan(record, stateFile, 'imsdb', 'imsapp')
-  assert.equal(republished.status, 0, `a re-fence over a legacy record must publish:\n${republished.output}`)
-  assert.equal(JSON.parse(readFileSync(stateFile, 'utf8')).fence_mode, FENCE_MODE_RECOVERY,
-    'a record with no applied stamp at all predates the stamp, so it is a fence that was raised and never released')
+  assert.equal(republished.status, 1, `a re-fence over an unstamped record must refuse:\n${republished.output}`)
+  assert.equal(readFileSync(stateFile, 'utf8'), before,
+    'and the record it refused must be exactly as it was found — a refusal is not a publication')
   assert.match(republished.output, /carries no applied stamp at all/,
-    `and it says which of the two unstamped cases it decided this was:\n${republished.output}`)
+    `it must name the record's own defect:\n${republished.output}`)
+  assert.match(republished.output, /says nothing about whether that writer's REVOKE ever committed/,
+    `and say why the two cases are indistinguishable rather than picking one:\n${republished.output}`)
+  assert.match(republished.output, /Only the live ACL can/,
+    `and point at the only evidence that settles it:\n${republished.output}`)
 
-  // AND IT IS RE-APPLICABLE, WHICH IS WHAT "NOT STRANDED" MEANS. The ACL of a fenced database: the
-  // owner keeps its own entry and nobody else holds CONNECT, so every recorded grantee is
-  // `withdrawn` — fatal under the strict rule, expected under the one this record just earned.
+  // AND IT IS NOT SILENT ABOUT WHICH RECORD, which is what makes the refusal actionable.
+  assert.ok(republished.output.includes(stateFile), `the refusal must name the record:\n${republished.output}`)
+
+  // 2. NOR DOES THE EXECUTOR HAND IT THE LAX RULE IF ONE REACHES IT ANOTHER WAY. The ACL of a
+  //    fenced database: the owner keeps its own entry and nobody else holds CONNECT, so every
+  //    recorded grantee is `withdrawn` — which the strict rule refuses and the lax one accepts.
+  //    r25 accepted this. It is the drift tolerance being withheld.
   const client = new FakeAdminClient({ stateFile, datacl: '{owner=CTc/owner}', stillConnectsBefore: false })
   const code = await withAdminUrl(() => doFence(client as never, { stateFile, appRole: 'imsapp', timeoutSeconds: 1, ...suppliedIdentity({ appDatabase: 'imsdb' }) }))
-  assert.equal(code, EXIT_OK, `a fence raised before the stamp must still be re-applicable:\n${client.log.join(' | ')}`)
-  assert.deepEqual(client.revokes, [
-    'REVOKE CONNECT ON DATABASE "imsdb" FROM PUBLIC;',
-    'REVOKE CONNECT ON DATABASE "imsdb" FROM "owner";',
-    'REVOKE CONNECT ON DATABASE "imsdb" FROM "imsapp";',
-  ], 'over the whole recorded list, so the release still restores all of it')
+  assert.equal(code, EXIT_NOT_FENCEABLE, `an unstamped record must not license a re-fence:\n${client.log.join(' | ')}`)
+  assert.deepEqual(client.revokes, [], 'and NOTHING may be revoked over it')
 
-  // AND RELEASES. The release reads the record and grants back every role it names, and it does not
-  // consult the stamp at all — which is what makes the fail-closed direction of this design
-  // recoverable: an operator whose run died between the REVOKE and the stamp still has a working
-  // way to take the fence down. Asserted on the GRANTs rather than on the exit code, as the r24
-  // release drive above is, because the code's last arm probes a live DATABASE_URL.
+  // 3. AND THE RELEASE STILL WORKS, WHICH IS THE ESCAPE HATCH IN BOTH DIRECTIONS. It reads the
+  //    record and grants back every role it names, consulting neither `fence_applied` nor
+  //    `fence_mode` — so an operator holding a record no automatic path will touch can still take
+  //    a standing fence down. Asserted on the GRANTs rather than the exit code, as the r24 release
+  //    drive is, because the code's last arm probes a live DATABASE_URL.
   const releaser = new FakeAdminClient({ stateFile, releasedDatacl: '{owner=CTc/owner,=Tc/owner,imsapp=c/owner}' })
   await withAdminUrl(() => doRelease(releaser as never, { stateFile, appRole: 'imsapp', ...suppliedIdentity({ appDatabase: 'imsdb' }) }))
   assert.deepEqual(releaser.grants, [
     'GRANT CONNECT ON DATABASE "imsdb" TO PUBLIC;',
     'GRANT CONNECT ON DATABASE "imsdb" TO "owner";',
     'GRANT CONNECT ON DATABASE "imsdb" TO "imsapp";',
-  ], `a fence raised before the stamp must still be releasable from its own record:\n${releaser.log.join(' | ')}`)
+  ], `an unstamped record must still be releasable from:\n${releaser.log.join(' | ')}`)
 
-  // MEASURED BY MUTATION, AGAINST THE SHIPPED PROGRAM TEXT: treat an absent key the way a present
-  // 0 is treated, and the legacy record is stamped INITIAL — which is the fence being stranded,
-  // because the strict rule can never accept a standing fence's own grantee list.
-  const LEGACY_RULE = '!Object.prototype.hasOwnProperty.call(prior, "fence_applied")'
-  assert.ok(AUTHORISE_PLAN_PROGRAM.includes(LEGACY_RULE),
-    `the shipped validator must discriminate on the KEY, not on its value:\n${AUTHORISE_PLAN_PROGRAM}`)
-  const noLegacy = AUTHORISE_PLAN_PROGRAM.replace(LEGACY_RULE, 'false')
-  assert.notEqual(noLegacy, AUTHORISE_PLAN_PROGRAM, 'the mutation must have changed something')
-  const stranded = join(dir, 'stranded.json')
-  writeFileSync(stranded, `${JSON.stringify(published, null, 2)}\n`)
-  const run = spawnSync('node', ['-e', noLegacy, '--', 'imsdb', 'imsapp', stranded], {
+  // MEASURED BY MUTATION, AGAINST THE SHIPPED PROGRAM TEXT. The refusal is one branch, and putting
+  // r25's rule back in its place — `standing = true` — is exactly the finding: the legacy record
+  // publishes, is stamped RECOVERY, and the same doFence() that refused above proceeds to revoke
+  // the whole recorded list. Both halves are asserted, because a mutation that only stopped the
+  // refusal would not show what the refusal is FOR.
+  const REFUSAL = 'fail("an authority that cannot be shown to be either standing or spent'
+  assert.ok(AUTHORISE_PLAN_PROGRAM.includes(REFUSAL),
+    `the shipped validator must refuse an unstamped record:\n${AUTHORISE_PLAN_PROGRAM}`)
+  const r25Rule = AUTHORISE_PLAN_PROGRAM.replace(REFUSAL, 'standing = true; void ("')
+  assert.notEqual(r25Rule, AUTHORISE_PLAN_PROGRAM, 'the mutation must have changed something')
+  const lax = join(dir, 'lax.json')
+  writeFileSync(lax, `${JSON.stringify(published, null, 2)}\n`)
+  const run = spawnSync('node', ['-e', r25Rule, '--', 'imsdb', 'imsapp', lax], {
     input: `${JSON.stringify(record)}\n`,
     encoding: 'utf8',
   })
-  assert.equal(run.status, 0, `${run.stdout}${run.stderr}`)
-  assert.equal(JSON.parse(readFileSync(stranded, 'utf8')).fence_mode, FENCE_MODE_INITIAL,
-    'without the legacy branch a fence raised before this upgrade is held to a rule it cannot satisfy')
-  const strandedClient = new FakeAdminClient({ stateFile: stranded, datacl: '{owner=CTc/owner}', stillConnectsBefore: false })
-  const strandedCode = await withAdminUrl(() => doFence(strandedClient as never, { stateFile: stranded, appRole: 'imsapp', timeoutSeconds: 1, ...suppliedIdentity({ appDatabase: 'imsdb' }) }))
-  assert.equal(strandedCode, EXIT_NOT_FENCEABLE,
-    'and refused, which is the stranding the presence branch exists to prevent')
+  assert.equal(run.status, 0, `the r25 rule publishes where this one refuses:\n${run.stdout}${run.stderr}`)
+  assert.equal(JSON.parse(readFileSync(lax, 'utf8')).fence_mode, FENCE_MODE_RECOVERY,
+    'and it publishes the RECOVERY mode, which is the tolerance being handed out')
+  const laxClient = new FakeAdminClient({ stateFile: lax, datacl: '{owner=CTc/owner}', stillConnectsBefore: false })
+  const laxCode = await withAdminUrl(() => doFence(laxClient as never, { stateFile: lax, appRole: 'imsapp', timeoutSeconds: 1, ...suppliedIdentity({ appDatabase: 'imsdb' }) }))
+  assert.equal(laxCode, EXIT_OK, 'under r25 the re-fence proceeds over a fence nothing can show exists')
+  assert.equal(laxClient.revokes.length, 3, 'revoking the whole recorded list, which the release then grants back')
 })
 
 /**
@@ -1586,6 +1657,7 @@ test('only a status that means the revokes may be on the medium stamps the recor
       shellFunction(CUTOVER_NS_LIB_SOURCE, 'dir_is_private_to_this_run'),
       `db_fence_authorise_plan_program() {\n  cat <<'AUTHORISE_PLAN_EOF'\n${AUTHORISE_PLAN_PROGRAM}AUTHORISE_PLAN_EOF\n}`,
       `db_fence_mark_applied_program() {\n  cat <<'MARK_APPLIED_EOF'\n${MARK_APPLIED_PROGRAM}MARK_APPLIED_EOF\n}`,
+      FENCE_DISPLAY_DECLARATIONS,
       shellFunction(FENCE_LIBRARY, 'db_fence_authorise_plan'),
       shellFunction(FENCE_LIBRARY, 'db_fence_mark_authority_applied'),
       shellFunction(FENCE_LIBRARY, 'db_fence_publish_authority'),
@@ -1679,6 +1751,12 @@ test('a record this account could have written is never a record (o3d-secops r23
 
   // THE PRECONDITION, PROVED RATHER THAN ASSUMED: the same record, with its provenance intact,
   // IS acted on. Without this the three refusals above could be refusals for any other reason.
+  //
+  // THE PLANT IS CLEARED FIRST, and the reason is r26 rather than tidiness: the validator refuses
+  // to publish over a record carrying no `fence_applied` key, and the hand-rolled plant above
+  // carries none. On a real host that destination is in a root-only directory and a plant cannot
+  // be there at all, so an empty destination is what this precondition is about.
+  rmSync(stateFile, { force: true })
   publishAuthority(stateFile, SAMPLE_STATE)
   const genuine = new FakeAdminClient({ stateFile, releasedDatacl: '{owner=CTc/owner,=Tc/owner,imsapp=c/owner}' })
   const genuineCode = await withAdminUrl(() => doRelease(genuine as never, { stateFile, appRole: 'imsapp', ...suppliedIdentity({ appDatabase: 'imsdb' }) }))

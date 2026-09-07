@@ -1355,7 +1355,7 @@ if (priorMeta !== null) {
       process.stderr.write("The record at " + destination + " carries no applied stamp at all (no `fence_applied` key), so it was published by a validator that predates the stamp. That dates its WRITER and says nothing about whether that writer's REVOKE ever committed: the predecessor published its record BEFORE running the fence, so this is equally what a fence raised then leaves and what a publication killed before BEGIN leaves.\n");
       process.stderr.write("Nothing on the filesystem can tell those apart. Only the live ACL can: a fence is standing exactly when the grantees this record names have lost CONNECT.\n");
       if (resolveWrapper) {
-        process.stderr.write("Resolve it once, deliberately, with " + resolveWrapper + " -- it reads the ACL and either clears a record no fence stands behind or stamps one that a fence does, and refuses on a mixed reading. If a fence IS standing and you would rather simply take it down, the release wrapper restores from this record without needing the stamp.\n");
+        process.stderr.write("Resolve it once, deliberately, by running " + resolveWrapper + " AS ROOT (prefix it with `sudo` if the shell reading this is not root's) -- it reads the ACL and either clears a record no fence stands behind or stamps one that a fence does, and refuses on a mixed reading. If a fence IS standing and you would rather simply take it down, the release wrapper restores from this record without needing the stamp.\n");
       } else {
         process.stderr.write("Resolve it once, deliberately, with the operator resolution wrapper in the cutover recovery directory -- it reads the ACL and either clears a record no fence stands behind or stamps one that a fence does. If a fence IS standing and you would rather simply take it down, the release wrapper restores from this record without needing the stamp.\n");
       }
@@ -1424,10 +1424,16 @@ db_fence_authorise_plan() {
   # ${APP_USER}, which is why this is a hardening and not the finding; it costs one word.
   # THE FOURTH ARGUMENT IS TEXT FOR A MESSAGE (o3d-secops r26). An unstamped record is refused, and
   # a refusal an operator cannot act on is a refusal that gets worked around; this hands the
-  # validator the path of the wrapper that resolves it. It is root's own constant, it is never
-  # executed by the program it is passed to, and the refusal happens with or without it.
+  # validator the path of the wrapper that resolves it. It is root's own `readonly` constant, it is
+  # never executed by the program it is passed to, and the refusal happens with or without it.
+  #
+  # BARE, AND THE PRIVILEGE TRANSITION IS IN THE SENTENCE INSTEAD. ${DB_FENCE_SUDO_PREFIX} is the
+  # one name here bash assigns twice by construction, so it is a report rather than a protected
+  # constant -- and a report may not reach an execution, which is a rule this file is held to by
+  # the sink census in tests/scripts/install-root-safe-writes.test.ts. r33's point stands and is
+  # made in words: the message says to run the wrapper AS ROOT.
   env -u NODE_OPTIONS -u NODE_PATH -u NODE_REPL_EXTERNAL_MODULE \
-    node -e "${program}" -- "${expected_database}" "${expected_app_role}" "${destination}" "${DB_FENCE_SUDO_PREFIX}${DB_FENCE_RESOLVE_WRAPPER}"
+    node -e "${program}" -- "${expected_database}" "${expected_app_role}" "${destination}" "${DB_FENCE_RESOLVE_WRAPPER}"
 }
 
 # ---------------------------------------------------------------------------
@@ -1992,7 +1998,7 @@ raise_the_fence() {
   # barrier is the directory fsync, which runs after the rename and leaves the record visible when
   # it fails, so a failed publication is a publication that may well have published.
   if ! printf '%s\n' "${plan}" | env -u NODE_OPTIONS -u NODE_PATH -u NODE_REPL_EXTERNAL_MODULE \
-    node -e "${authorise_plan}" -- "${expected_database}" "${expected_app_role}" "${state_file}" "${sudo_prefix}${resolve_wrapper}"; then
+    node -e "${authorise_plan}" -- "${expected_database}" "${expected_app_role}" "${state_file}" "${resolve_wrapper}"; then
     if [[ "${had_authority}" -eq 0 ]]; then
       rm -f "${state_file}" 2>/dev/null || true
       if [[ -e "${state_file}" ]]; then

@@ -8444,16 +8444,24 @@ test('the entrypoints no longer claim an atomicity that only covered explicit re
 // the filesystem rather than by reading the source.
 // ---------------------------------------------------------------------------
 
-/** A fence helper that records every invocation, and answers the two modes the callers read. */
+/**
+ * A fence helper that records every invocation, and answers the two modes the callers read.
+ *
+ * IT DOES NOT WRITE THE AUTHORITY RECORD, and since o3d-secops r26 that matters rather than merely
+ * being tidier. It used to drop `{}` at ${DB_FENCE_STATE} on `--fence`, which is what the helper
+ * did before r23 moved the publication to root — so the stub was OVERWRITING root's own record
+ * with a shapeless one, and the second phase of the test below was then re-fencing over an object
+ * with no `fence_applied` key. r25 read that as a standing fence and published `recovery`; r26
+ * refuses it, correctly, and the refusal was the stub's leftover rather than the code's. The
+ * shipped `--fence` writes no file at all — it runs as ${APP_USER} and cannot — so neither does
+ * this.
+ */
 function shippedHelper(dir: string): string {
   return [
     "import { appendFileSync, writeFileSync } from 'node:fs'",
     `appendFileSync(${JSON.stringify(join(dir, 'calls.log'))}, 'SHIPPED ' + process.argv.slice(2).join(' ') + '\\n')`,
     "if (process.argv.includes('--print-migration-url')) {",
     "  process.stdout.write('postgres://admin@127.0.0.1/nowhere?options=-c%20role%3Dimsapp\\n')",
-    '}',
-    "if (process.argv.includes('--fence')) {",
-    `  writeFileSync(${JSON.stringify(join(dir, 'db-connect-fence.json'))}, '{}')`,
     '}',
     'process.exit(0)',
     '',
@@ -8472,9 +8480,6 @@ function substitutedHelper(dir: string): string {
     `writeFileSync(${JSON.stringify(join(dir, 'STOLEN'))}, String(process.env.DEPLOY_ADMIN_DATABASE_URL ?? ''))`,
     "if (process.argv.includes('--print-migration-url')) {",
     "  process.stdout.write('postgres://attacker@127.0.0.1/nowhere?options=-c%20role%3Dimsapp\\n')",
-    '}',
-    "if (process.argv.includes('--fence')) {",
-    `  writeFileSync(${JSON.stringify(join(dir, 'db-connect-fence.json'))}, '{}')`,
     '}',
     'process.exit(0)',
     '',

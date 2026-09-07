@@ -1668,14 +1668,18 @@ const FENCE_LIB = readFileSync(join(REPO, FENCE_LIBRARY), 'utf8')
  * does exactly that, from bash's own reading) and each was asked one question: does the mechanism
  * ACT on this value without checking it again?
  *
- *   ten PATHS      it reads, writes, seals, renames through or EXECUTES every one of them. Re-aim
+ *   eleven PATHS   it reads, writes, seals, renames through or EXECUTES every one of them. Re-aim
  *                  ${DB_FENCE_SCRIPT_COPY} and root runs a file of the application account's
  *                  choosing with DEPLOY_ADMIN_DATABASE_URL beside it; re-aim
  *                  ${DB_FENCE_ARTEFACT_FILE} and the digest is compared against a record somebody
  *                  else wrote. ${DB_FENCE_RETIRED_APP_DIR} is on the list though the finding's
  *                  seven kinds do not name it: it is the destination a publication renames the
  *                  STANDING artefact to, so it is a write, and it was found by enumerating rather
- *                  than by transcribing.
+ *                  than by transcribing. ${DB_FENCE_RESOLVE_WRAPPER} joined them in o3d-secops
+ *                  r26: it is a root-owned 0700 file this library WRITES, and the path the
+ *                  validator's refusal sends an operator to — re-aim it and the one command
+ *                  offered for resolving an ambiguous authority is a file of somebody else's
+ *                  choosing, run as root with the admin credential beside it.
  *   two DIGESTS    ${DB_FENCE_EXPECTED_SHA256} and ${DB_FENCE_EXPECTED_ARTEFACT_SHA256} are what
  *                  AUTHENTICATES a rotation. A write to either is a forged authentication, which
  *                  is the same hole as a re-aimed path and not a smaller one.
@@ -1691,7 +1695,8 @@ const PROTECTED_LIBRARY_CONSTANTS = [
   'DB_FENCE_RECOVERY_DIR', 'DB_FENCE_IDENTITY_FILE', 'DB_FENCE_PROTECTED_APP_DIR',
   'DB_FENCE_SCRIPT_COPY', 'DB_FENCE_STAGED_APP_DIR', 'DB_FENCE_RETIRED_APP_DIR',
   'DB_FENCE_ARTEFACT_FILE', 'DB_FENCE_MANIFEST_FILE', 'DB_FENCE_RELEASE_WRAPPER',
-  'DB_FENCE_REFENCE_WRAPPER', 'DB_FENCE_VENDOR_ROOTS', 'DB_FENCE_VENDOR_MAX_FILES',
+  'DB_FENCE_REFENCE_WRAPPER', 'DB_FENCE_RESOLVE_WRAPPER',
+  'DB_FENCE_VENDOR_ROOTS', 'DB_FENCE_VENDOR_MAX_FILES',
   'DB_FENCE_ARTEFACT_RECIPE', 'DB_FENCE_ARTEFACT_SOURCE_TEXT', 'DB_FENCE_EXPECTED_SHA256',
   'DB_FENCE_EXPECTED_ARTEFACT_SHA256',
 ] as const
