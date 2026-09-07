@@ -6503,7 +6503,11 @@ test('--bind-migration says colocated on the witness instance and absent on a by
         const probing = capturingFenceOutput(() => doBindMigration(client as never, {
           migrationNonce: nonce, witnessLock: lock, holdStamp: true, ...suppliedIdentity({ appDatabase: 'imsdb' }),
         }))
-        while (sightings.length === 0) {
+        // BOUNDED, and that is not tidiness: an unbounded wait for a sighting that will never come
+        // is a test that HANGS instead of failing, which is worse than one that passes wrongly --
+        // it takes the whole file's budget with it. The probe holds its stamp for twelve sampler
+        // ticks by construction, so twenty attempts is generous and finite.
+        for (let attempt = 0; attempt < 20 && sightings.length === 0; attempt += 1) {
           const { rows } = await observer.query(
             'SELECT application_name FROM pg_stat_activity WHERE application_name = $1',
             [migrationApplicationName(nonce)],
