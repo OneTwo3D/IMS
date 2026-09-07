@@ -2173,9 +2173,13 @@ db_fence_witness_exchange() {
 db_fence_migration_bind() {
   local fence_script="$1" migration_url="$2"
   shift 2
+  # THE WITNESS IS ASKED ABOUT FIRST, AND THE ORDER IS THE ARGUMENT. With no witness there is
+  # nothing a stamp could be checked against, so "this URL carries no stamp" is not a finding about
+  # this run -- it is the same absence, reported twice. With a witness, an unstamped URL IS a
+  # finding: something composed a migration connection this run cannot place, and that refuses.
+  [[ "${DB_FENCE_WITNESS_BOUND:-0}" -eq 1 ]] || return 3
   local migration_nonce=""
   migration_nonce="$(db_fence_migration_nonce_in_url "${migration_url}")" || return 2
-  [[ "${DB_FENCE_WITNESS_BOUND:-0}" -eq 1 ]] || return 3
 
   # A FRESH LOCK FOR THE MIGRATION WINDOW, minted here and spent here, exactly as the release's
   # challenge is. The fence's own nonce is minutes old by now and lives in a frame that has
@@ -2210,8 +2214,8 @@ db_fence_migration_bind() {
 db_fence_migration_witnessed() {
   local migration_url="$1"
   local migration_nonce="" reply="" seen=""
-  migration_nonce="$(db_fence_migration_nonce_in_url "${migration_url}")" || return 2
   [[ "${DB_FENCE_WITNESS_BOUND:-0}" -eq 1 ]] || return 3
+  migration_nonce="$(db_fence_migration_nonce_in_url "${migration_url}")" || return 2
   reply="$(db_fence_witness_exchange "sightings ${migration_nonce}" "WITNESS_SIGHTINGS ${migration_nonce} " prefix)" || return 3
   seen="${reply##"WITNESS_SIGHTINGS ${migration_nonce} "}"
   # A COUNT THIS RUN CANNOT READ IS NOT A COUNT. Anything but digits -- a truncated line, a reply

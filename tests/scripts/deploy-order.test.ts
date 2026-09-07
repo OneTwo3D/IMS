@@ -1310,6 +1310,14 @@ ${shellFunction(DEPLOY_LINES.join('\n'), 'resolve_fence_script')}
 # everything else here is: a rig that supplied its own would stop measuring the shipped ordering.
 ${shellFunction(CUTOVER_NS_LIB, 'dir_is_private_to_this_run')}
 ${shellFunction(DEPLOY_LINES.join('\n'), 'db_fence_helper')}
+# o3d-secops r32: and the three the migration binding is made of -- the drop to the application
+# account carrying MIGRATION_DATABASE_URL, and the two gates that read db_fence_migration_bind() and
+# db_fence_migration_witnessed(). Lifted rather than stubbed for the reason everything else
+# here is: fence_db_connections() CALLS the first of them, so a rig without it would measure
+# an ordering the shipped script does not have.
+${shellFunction(DEPLOY_LINES.join('\n'), 'db_fence_migration_helper')}
+${shellFunction(DEPLOY_LINES.join('\n'), 'bind_migration_to_fenced_server')}
+${shellFunction(DEPLOY_LINES.join('\n'), 'require_migration_landed_on_fenced_server')}
 DB_FENCE_REFENCE_CMD="\${DB_FENCE_REFENCE_WRAPPER}"
 : "\${APP_DIR_REAL:=/opt/app}"
 : "\${APP_DIR:=/opt/app}"
@@ -1384,6 +1392,14 @@ ${fenceProtectedLibrary(dir)}
 ${shellFunction(UPDATE_LINES.join('\n'), 'resolve_fence_script')}
 ${shellFunction(CUTOVER_NS_LIB, 'dir_is_private_to_this_run')}
 ${shellFunction(UPDATE_LINES.join('\n'), 'db_fence_helper')}
+# o3d-secops r32: and the three the migration binding is made of -- the drop to the application
+# account carrying MIGRATION_DATABASE_URL, and the two gates that read db_fence_migration_bind() and
+# db_fence_migration_witnessed(). Lifted rather than stubbed for the reason everything else
+# here is: fence_db_connections() CALLS the first of them, so a rig without it would measure
+# an ordering the shipped script does not have.
+${shellFunction(UPDATE_LINES.join('\n'), 'db_fence_migration_helper')}
+${shellFunction(UPDATE_LINES.join('\n'), 'bind_migration_to_fenced_server')}
+${shellFunction(UPDATE_LINES.join('\n'), 'require_migration_landed_on_fenced_server')}
 DB_FENCE_REFENCE_CMD="\${DB_FENCE_REFENCE_WRAPPER}"
 DB_FENCE_IDENTITY_FROM_RECORD=false
 DB_FENCE_ADOPTING=false
@@ -1473,6 +1489,14 @@ ${fenceProtectedLibrary(dir)}
 ${shellFunction(INSTALL_SOURCE, 'resolve_fence_script')}
 ${shellFunction(CUTOVER_NS_LIB, 'dir_is_private_to_this_run')}
 ${shellFunction(INSTALL_SOURCE, 'db_fence_helper')}
+# o3d-secops r32: and the three the migration binding is made of -- the drop to the application
+# account carrying MIGRATION_DATABASE_URL, and the two gates that read db_fence_migration_bind() and
+# db_fence_migration_witnessed(). Lifted rather than stubbed for the reason everything else
+# here is: fence_db_connections() CALLS the first of them, so a rig without it would measure
+# an ordering the shipped script does not have.
+${shellFunction(INSTALL_SOURCE, 'db_fence_migration_helper')}
+${shellFunction(INSTALL_SOURCE, 'bind_migration_to_fenced_server')}
+${shellFunction(INSTALL_SOURCE, 'require_migration_landed_on_fenced_server')}
 # o3d-2sm1.5 r35: install.sh's resolver refuses outright on a FIRST INSTALL, which performs no
 # credentialed fence execution. Every harness below is an UPGRADE cutover — that is what they are
 # for — so the flag is named here with the value the upgrade branch runs under. Named rather than
@@ -1561,7 +1585,11 @@ for (const entry of FENCE_HARNESS) {
         "    revoked: ['PUBLIC', 'imsapp'], datacl_before: null, fenced_at: '2026-01-01T00:00:00.000Z',",
         "  }) + '\\n')",
         '}',
-        "if (process.argv.includes('--print-migration-url')) process.stdout.write('postgres://admin@127.0.0.1/nowhere\\n')",
+        // o3d-secops r32: STAMPED, because the shipped `--print-migration-url` stamps. Root reads the
+        // nonce back out of this URL and asks the witness about that value, so a stub that emitted a
+        // bare URL would exercise the "this run composed a migration it cannot place" refusal on every
+        // ordinary cutover instead of the cutover.
+        "if (process.argv.includes('--print-migration-url')) process.stdout.write(`postgres://admin@127.0.0.1/nowhere?application_name=ims-migration-${process.argv.find((a) => a.startsWith('--migration-nonce='))?.slice('--migration-nonce='.length) ?? ''}\\n`)",
         // THE WITNESS PROTOCOL, EMULATED (o3d-secops r31). The ordinary cutover now holds a session
         // across the fence and the release and asks BOTH connections whether they can see it, so a
         // stub that answered nothing here would be measuring a cutover the shipped scripts do not
@@ -1794,7 +1822,11 @@ function fenceStub(dir: string, exitCode: number): void {
  * `verdict` is what `--release` reports. 'yes' is the ordinary cutover; 'no' is a release that
  * landed somewhere the witness is not, which is the whole finding.
  */
-function WITNESS_STUB_LINES(verdict: 'yes' | 'no' = 'yes'): string[] {
+function WITNESS_STUB_LINES(
+  verdict: 'yes' | 'no' = 'yes',
+  extraStdout: string[] = [],
+  { sightings = 1, binding = 'colocated' }: { sightings?: number; binding?: 'colocated' | 'absent' } = {},
+): string[] {
   return [
     "if (process.argv.includes('--witness')) {",
     "  const nonce = process.argv.find((a) => a.startsWith('--witness-nonce='))?.slice('--witness-nonce='.length) ?? ''",
@@ -1808,6 +1840,13 @@ function WITNESS_STUB_LINES(verdict: 'yes' | 'no' = 'yes'): string[] {
     "      buffer = buffer.slice(index + 1)",
     "      const hit = /^challenge ([0-9a-f]+)$/.exec(line)",
     "      if (hit) process.stdout.write(`WITNESS_HELD ${hit[1]}\\n`)",
+    // o3d-secops r32: the migration binding's two commands. `watch` arms the sampler; `sightings`
+    // reports how many distinct backends carrying the migration's stamp it has seen since. The
+    // count is a parameter so a test can exhibit the case where the migration went elsewhere.
+    "      const w = /^watch ([0-9a-f]+)$/.exec(line)",
+    "      if (w) process.stdout.write(`WITNESS_WATCHING ${w[1]}\\n`)",
+    "      const g = /^sightings ([0-9a-f]+)$/.exec(line)",
+    `      if (g) process.stdout.write(\`WITNESS_SIGHTINGS \${g[1]} ${sightings}\\n\`)`,
     "    }",
     "  })",
     // TOP-LEVEL AWAIT RATHER THAN `return`: this stub is an .mjs, so `return` at module scope is a
@@ -1815,8 +1854,25 @@ function WITNESS_STUB_LINES(verdict: 'yes' | 'no' = 'yes'): string[] {
     "  await new Promise((resolve) => process.stdin.on('end', resolve))",
     "  process.exit(0)",
     "}",
-    "if (process.argv.includes('--fence') && process.argv.some((a) => a.startsWith('--witness-lock='))) process.stdout.write('fence_witness=colocated\\n')",
-    `if (process.argv.includes('--release') && process.argv.some((a) => a.startsWith('--witness-challenge='))) process.stdout.write('witness_colocated=${verdict}\\n')`,
+    // THE r32 GRAMMAR: a whole line, naming the exact nonce the caller passed. The stub reads the
+    // nonce off its own argv rather than being told one, so a shell that passed a DIFFERENT nonce
+    // to `--release` than it later looked for would be caught here rather than papered over.
+    "const lockArg = process.argv.find((a) => a.startsWith('--witness-lock='))?.slice('--witness-lock='.length) ?? ''",
+    "const challengeArg = process.argv.find((a) => a.startsWith('--witness-challenge='))?.slice('--witness-challenge='.length) ?? ''",
+    // o3d-secops r32: the pre-DDL probe. It reports on the same machine channel, in the same
+    // grammar, naming the migration nonce root read back out of the URL it composed -- so a shell
+    // that asked about a different nonce than it stamped would fail here rather than pass quietly.
+    "const migrationArg = process.argv.find((a) => a.startsWith('--migration-nonce='))?.slice('--migration-nonce='.length) ?? ''",
+    `if (process.argv.includes('--bind-migration')) {`,
+    `  process.stdout.write(\`MIGRATION_BINDING \${migrationArg} ${binding}\\n\`)`,
+    `  process.exit(${'colocated' === binding ? 0 : 1})`,
+    `}`,
+    "if (process.argv.includes('--fence') && lockArg) process.stdout.write(`FENCE_WITNESS ${lockArg} colocated\\n`)",
+    `if (process.argv.includes('--release') && challengeArg) process.stdout.write(\`RELEASE_WITNESS \${challengeArg} ${verdict === 'yes' ? 'colocated' : 'absent'}\\n\`)`,
+    // AND WHATEVER ELSE THE CALLER WANTS ON THE CHANNEL. This is how the hostile-identifier and
+    // conflicting-verdict cases below put text on stdout that a substring reader would have taken
+    // for a verdict; an empty list is the ordinary cutover and changes nothing.
+    ...extraStdout,
   ]
 }
 
@@ -6862,6 +6918,12 @@ function fenceRecoveryHarness(dirs: { app: string; state: string; recovery: stri
     // resolver is: a stub would drop the privilege drop the shipped ordering is built on.
     shellFunction(CUTOVER_NS_LIB, 'dir_is_private_to_this_run'),
     shellFunction(source, 'db_fence_helper'),
+    // o3d-secops r32: and the three the migration binding is made of. fence_db_connections() CALLS
+    // bind_migration_to_fenced_server(), so a rig without it would measure an ordering the shipped
+    // script does not have -- which is what it did for one round, as a `command not found`.
+    shellFunction(source, 'db_fence_migration_helper'),
+    shellFunction(source, 'bind_migration_to_fenced_server'),
+    shellFunction(source, 'require_migration_landed_on_fenced_server'),
     // The two recovery commands, exactly as update.sh sets them: the PATHS of the root-owned
     // wrappers, not a command line (o3d-2sm1.5 r32). Setting them empty here would let a banner
     // that prints nothing pass every assertion about what it names.
@@ -12481,15 +12543,48 @@ test('[o3d-secops r30] every caller of db_fence_clear_authority attests, or pass
       `${site.where} must take its answer about the server from a value the release's own output decided, not from a literal:\n  ${site.line}`)
   }
 
-  // AND THAT VALUE IS ONLY EVER SET FROM THE RELEASE'S OWN REPORT. A caller that assigned it from a
-  // shell flag would be back to a process-shaped memory wearing a new name, which is the finding.
+  // AND THAT VALUE IS ONLY EVER SET FROM THE RELEASE'S OWN REPORT, UNDER A GUARD THAT ALSO PROVES
+  // THE QUESTION WAS ASKED (o3d-secops r31, extended r32 for Codex HIGH 1).
+  //
+  // r31 wrote this as a SAME-LINE rule -- the assignment had to carry `witness_colocated=yes` on
+  // its own line -- and that is the vacuous shape this branch keeps rediscovering: it holds only
+  // while the guard happens to fit on one line, and it says nothing about what the guard ASKS. r32
+  // splits the guard across three lines (it now takes two conditions), so the same-line rule would
+  // have had to be deleted to make the file pass, which is a rule deleting itself.
+  //
+  // SO IT IS ASKED OF THE ENCLOSING CONDITIONAL INSTEAD. From the assignment, walk UP to the `if`
+  // that governs it, and require that conditional to contain BOTH halves: the strict whole-line
+  // reader over the release's own output, AND the proof that a challenge was issued at all. Either
+  // one alone is a defect this branch has already shipped once.
+  //
+  // MUTATION ROUTE (made against the shipped files and reverted): drop `${#witness_argv[@]}` from
+  // deploy.sh's guard, leaving only the verdict read, and this names deploy.sh; replace the whole
+  // guard with `if true; then` and it names it again. Delete the `if` and the walk below finds
+  // none, which is its own failure rather than a silent pass.
+  let guardedAssignments = 0
   for (const [name, source] of FILES) {
-    source.split(/\r?\n/).forEach((line, index) => {
+    const lines = source.split(/\r?\n/)
+    lines.forEach((line, index) => {
       if (!/clear_server="same-server-as-the-fence"/.test(line)) return
-      assert.match(line, /witness_colocated=yes/,
-        `${name}:${index + 1} decides which server was released without reading what the release itself reported:\n  ${line.trim()}`)
+      guardedAssignments += 1
+      let open = -1
+      for (let back = index; back >= 0; back -= 1) {
+        if (/^\s*if\s/.test(lines[back])) { open = back; break }
+        if (/^\s*(fi|esac|\})\s*$/.test(lines[back])) break
+      }
+      assert.notEqual(open, -1,
+        `${name}:${index + 1} sets which server was released with no conditional governing it at all:\n  ${line.trim()}`)
+      const guard = lines.slice(open, index + 1).join('\n')
+      assert.match(guard, /db_fence_machine_verdict "[^"]*" "RELEASE_WITNESS"/,
+        `${name}:${index + 1} decides which server was released without reading, as a whole line and against this run's own nonce, what the release itself reported:\n${guard}`)
+      assert.match(guard, /\$\{#witness_argv\[@\]\}/,
+        `${name}:${index + 1} acts on a witness verdict without first showing that a challenge was ISSUED. A stream that answers a question nobody asked must not license a deletion:\n${guard}`)
     })
   }
+  // THE WALK REACHED THEM, stated as a number: three entrypoints, one assignment each. A loop that
+  // matched nothing would otherwise pass exactly as one that matched everything and found it sound.
+  assert.equal(guardedAssignments, 3,
+    `the census must reach one guarded assignment per entrypoint; it reached ${guardedAssignments}`)
 
   // THE FUNCTION ITSELF REFUSES, EXERCISED UNDER A REAL SHELL rather than read. Both directions,
   // so a passing test cannot be a function that never removes anything.
@@ -12759,7 +12854,11 @@ function witnessCycleCheckout(dir: string, verdict: 'yes' | 'no'): void {
     "    revoked: ['PUBLIC', 'imsapp'], datacl_before: null, fenced_at: '2026-01-01T00:00:00.000Z',",
     "  }) + '\\n')",
     '}',
-    "if (process.argv.includes('--print-migration-url')) process.stdout.write('postgres://admin@127.0.0.1/nowhere\\n')",
+    // o3d-secops r32: STAMPED, because the shipped `--print-migration-url` stamps. Root reads the
+        // nonce back out of this URL and asks the witness about that value, so a stub that emitted a
+        // bare URL would exercise the "this run composed a migration it cannot place" refusal on every
+        // ordinary cutover instead of the cutover.
+        "if (process.argv.includes('--print-migration-url')) process.stdout.write(`postgres://admin@127.0.0.1/nowhere?application_name=ims-migration-${process.argv.find((a) => a.startsWith('--migration-nonce='))?.slice('--migration-nonce='.length) ?? ''}\\n`)",
     ...WITNESS_STUB_LINES(verdict),
     'process.exit(0)',
     '',

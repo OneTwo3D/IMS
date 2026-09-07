@@ -3829,8 +3829,10 @@ test('o3d-2sm1.5 r19/r32: the four options are parsed, and no file is read from 
     // unprivileged harness can exhibit the mechanism.
     // o3d-secops r31: and the three witness nonces, which every mode defaults to '' and every
     // mode given '' behaves on exactly as it did before that round.
+    // o3d-secops r32: and the migration nonce, on the same terms -- `--print-migration-url` given
+    // '' composes exactly the URL it composed before that round, with no `application_name` at all.
     { mode: 'release', stateFile: '/x', stateOwnerUid: 0, appRole: '', timeoutSeconds: 30, appHost: 'db.internal', appPort: '6432', appUser: 'imsapp', appDatabase: 'imsdb',
-      witnessNonce: '', witnessLock: '', witnessChallenge: '' },
+      witnessNonce: '', witnessLock: '', witnessChallenge: '', migrationNonce: '' },
   )
   // AND THE THREE ARE READ WHEN THEY ARE GIVEN (o3d-secops r31). MUTATION ROUTE: drop any of the
   // three `--witness-*` arms from parseArgs() and the matching field stays '' here.
