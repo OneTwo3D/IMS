@@ -1278,7 +1278,13 @@ db_fence_authorise_plan() {
   # roster) is that a command substitution's status is taken or its failure is already a refusal.
   program="$(db_fence_authorise_plan_program)" || return 1
   [[ -n "${program}" ]] || return 1
-  node -e "${program}" -- "${expected_database}" "${expected_app_role}" "${destination}"
+  # AND THE INTERPRETER IS GIVEN NOTHING TO LOAD. `node -e` resolves no module and reads no path
+  # from the program -- but NODE_OPTIONS carries `--require`, and NODE_PATH decides where a
+  # `require` would look, so an environment variable is a way to make this root-side run execute a
+  # file nobody here named. They belong to whatever shell launched the cutover rather than to
+  # ${APP_USER}, which is why this is a hardening and not the finding; it costs one word.
+  env -u NODE_OPTIONS -u NODE_PATH -u NODE_REPL_EXTERNAL_MODULE \
+    node -e "${program}" -- "${expected_database}" "${expected_app_role}" "${destination}"
 }
 
 # The whole privileged step, from the plan text a caller captured to a published authority.
@@ -1566,7 +1572,8 @@ run_helper() {
 raise_the_fence() {
   local plan
   plan="$(run_helper DEPLOY_ADMIN_DATABASE_URL="${DEPLOY_ADMIN_DATABASE_URL}" node "${helper}" --plan --state-file="${state_file}" --state-owner="$(id -u)" "${identity_argv[@]}")" || return 1
-  printf '%s\n' "${plan}" | node -e "${authorise_plan}" -- "${expected_database}" "${expected_app_role}" "${state_file}" || return 1
+  printf '%s\n' "${plan}" | env -u NODE_OPTIONS -u NODE_PATH -u NODE_REPL_EXTERNAL_MODULE \
+    node -e "${authorise_plan}" -- "${expected_database}" "${expected_app_role}" "${state_file}" || return 1
   run_helper DEPLOY_ADMIN_DATABASE_URL="${DEPLOY_ADMIN_DATABASE_URL}" node "${helper}" --fence --state-file="${state_file}" --state-owner="$(id -u)" "${identity_argv[@]}"
 }
 release_the_fence() {

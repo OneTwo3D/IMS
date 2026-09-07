@@ -1055,6 +1055,56 @@ test('a record this account could have written is never a record (o3d-secops r23
   ], 'restoring exactly what it names')
 })
 
+test('the privileged validator is run with nothing the environment could make it load', () => {
+  // ROOT RUNS THIS. `node -e` resolves no module and reads no path out of the program — but
+  // NODE_OPTIONS carries `--require`, and NODE_PATH decides where a `require` would look, so an
+  // environment variable is a way to make a root-side `node` execute a file nobody named. The
+  // variables belong to whatever shell launched the cutover rather than to ${APP_USER}, which is
+  // why this is a hardening rather than the finding — and why it is asserted rather than argued.
+  //
+  // EVERY CALLER IN THE LIBRARY, and the scan is over the FILE rather than over a lifted function:
+  // one of the two lives inside the quoted heredoc the operator wrappers are generated from, and a
+  // function-shaped lift stops at the first `}` in that heredoc. A rule with one caller exempted
+  // is a rule with an exception.
+  const code = FENCE_LIBRARY.split('\n').filter((line) => !/^\s*#/.test(line)).join('\n')
+  const invocations = [...code.matchAll(/node -e/g)]
+  assert.ok(invocations.length >= 2,
+    `both the library's own validator call and the copy baked into the wrappers must be here:\n${invocations.length}`)
+  for (const at of invocations) {
+    assert.match(code.slice(Math.max(0, (at.index ?? 0) - 120), at.index),
+      /env -u NODE_OPTIONS -u NODE_PATH -u NODE_REPL_EXTERNAL_MODULE/,
+      'every root-side `node -e` in the fence library must strip what the environment could make node load')
+  }
+
+  // AND IT IS NOT THEATRE: with the scrub removed, NODE_OPTIONS runs a file of somebody's
+  // choosing before the validator's first line. ROUTE: the shipped program, invoked both ways.
+  const dir = mkdtempSync(join(tmpdir(), 'ims-node-options-'))
+  try {
+    const planted = join(dir, 'planted.js')
+    writeFileSync(planted, "require('node:fs').writeFileSync(process.env.IMS_TEST_WITNESS, 'ran')\n")
+    const witness = join(dir, 'witness')
+    const plan = JSON.stringify({ ...SAMPLE_STATE, revoked: ['PUBLIC'] })
+    const environment = { ...process.env, NODE_OPTIONS: `--require ${planted}`, IMS_TEST_WITNESS: witness }
+
+    const unscrubbed = spawnSync('node', ['-e', AUTHORISE_PLAN_PROGRAM, '--', 'imsdb', 'imsapp', join(dir, 'rec.json')], {
+      input: `${plan}\n`, encoding: 'utf8', env: environment,
+    })
+    assert.equal(existsSync(witness), true,
+      `precondition: NODE_OPTIONS must be able to run a file at all, or this measures nothing:\n${unscrubbed.stderr}`)
+    rmSync(witness, { force: true })
+
+    const scrubbed = spawnSync('env', ['-u', 'NODE_OPTIONS', '-u', 'NODE_PATH', '-u', 'NODE_REPL_EXTERNAL_MODULE',
+      'node', '-e', AUTHORISE_PLAN_PROGRAM, '--', 'imsdb', 'imsapp', join(dir, 'rec.json')], {
+      input: `${plan}\n`, encoding: 'utf8', env: environment,
+    })
+    assert.equal(existsSync(witness), false,
+      `and the shipped invocation must load nothing of the sort:\n${scrubbed.stderr}`)
+    assert.equal(scrubbed.status, 0, `while still publishing the authority:\n${scrubbed.stderr}`)
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
 test('the privileged validator publishes atomically, and leaves the last record alone when it cannot', (t) => {
   // THE DURABILITY ORDERING, WHICH MOVED WITH THE PUBLISHER (o3d-secops r23).
   //
