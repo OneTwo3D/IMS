@@ -9549,6 +9549,57 @@ test('r32: the recovery wrapper an operator is given runs, as pasted, with nothi
     const refence = spawnSync(paths.refenceWrapper, [], { encoding: 'utf8', env: { PATH: process.env.PATH ?? '' } as unknown as NodeJS.ProcessEnv })
     assert.equal(refence.status, 0, `${refence.stdout}${refence.stderr}`)
     assert.equal(JSON.parse(readFileSync(log, 'utf8')).argv[0], '--fence', 'the re-fence wrapper raises the fence')
+    // AND IT LEAVES A RECORD THAT SAYS THE FENCE WENT UP (o3d-secops r25). The wrapper bakes the
+    // applied stamp beside the validator and runs it after `--fence`, for the same reason
+    // db_fence_raise() does: `fence_mode` is computed from that stamp and not from the pathname, so
+    // a re-fence that raised a fence and did not stamp it would leave the NEXT cutover reading an
+    // unapplied record and refusing. Asserted on the artefact and on the wrapper's own words —
+    // delete either half of the wrapper's stamp and this fails.
+    const raisedRecord = JSON.parse(readFileSync(join(dir, 'state.json'), 'utf8'))
+    assert.equal(raisedRecord.fence_mode, 'initial', 'nothing was standing, so the wrapper published an initial authority')
+    assert.equal(raisedRecord.fence_applied, 1,
+      `and the fence it raised must be recorded as applied:\n${refence.stderr}`)
+    assert.match(refence.stderr, /is stamped APPLIED/, `announced by the stamp itself:\n${refence.stderr}`)
+
+    // PHASE 1b — A PUBLICATION THAT FAILS AFTER ITS RENAME (o3d-secops r25, Codex HIGH). The
+    // validator's last barrier is the directory fsync, and it runs AFTER the atomic rename: when it
+    // fails it says so and leaves the record visible. o3d-secops r24 hung the wrapper's cleanup off
+    // the EXECUTION's exit 3, and this route never reaches an execution, so the record survived for
+    // the next cutover to find. The wrapper now removes its own half-published record here too.
+    //
+    // ROUTE, AND IT IS THE REAL ONE: the authority's directory is made mode 0300 — searchable and
+    // writable, so `stat`, the temporary, the rename and the `rm -f` all work, and not readable, so
+    // `open(directory, 'r')` for the fsync returns EACCES. Root has no such denial, hence the skip.
+    if ((process.getuid?.() ?? 0) !== 0) {
+      const tornPublication = () => {
+        rmSync(log, { force: true })
+        chmodSync(dir, 0o300)
+        const run = spawnSync(paths.refenceWrapper, [], { encoding: 'utf8', env: { PATH: process.env.PATH ?? '' } as unknown as NodeJS.ProcessEnv })
+        chmodSync(dir, 0o700)
+        assert.match(run.stderr, /NAME is not durable/,
+          `precondition: the publication must fail at the post-rename barrier:\n${run.stdout}${run.stderr}`)
+        assert.equal(run.status, 1, `and the re-fence must refuse:\n${run.stdout}${run.stderr}`)
+        assert.ok(!existsSync(log), 'and must never reach the helper with an authority it could not publish')
+        return run
+      }
+
+      // FIRST, THE HALF THAT MUST NOT FIRE. The fence raised above is still standing and its record
+      // is still there, so the record this refusal is looking at is NOT this run's own — it is the
+      // only account of what the earlier run revoked, and every grantee it names depends on it.
+      const overStanding = tornPublication()
+      assert.equal(existsSync(join(dir, 'state.json')), true,
+        `a standing fence's record is never removed by a refusal:\n${overStanding.stdout}${overStanding.stderr}`)
+
+      // AND THEN THE ONE THAT MUST. With nothing at the path when the wrapper starts, the record a
+      // failed publication leaves is this run's own and describes a fence that does not exist.
+      rmSync(join(dir, 'state.json'))
+      const torn = tornPublication()
+      assert.equal(existsSync(join(dir, 'state.json')), false,
+        `and must not leave its half-published record at the authoritative path:\n${torn.stdout}${torn.stderr}`)
+      // The invocation log is what the phases below remove and then assert the absence of; this
+      // phase consumed it proving the helper was never reached, so it is put back.
+      writeFileSync(log, '{}')
+    }
 
     // PHASE 2 — NO CREDENTIAL ANYWHERE. It refuses, names the variable, and prints its OWN path
     // in the command that would supply it, so the next paste works too.
