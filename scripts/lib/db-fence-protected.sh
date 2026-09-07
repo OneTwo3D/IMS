@@ -1440,7 +1440,7 @@ db_fence_raise() {
   # intact, exactly as before.
   if [[ "${rc}" -eq 3 && "${had_authority}" -eq 0 ]]; then
     if ! db_fence_clear_authority "${state_file}"; then
-      echo "The connection fence was REFUSED before anything was revoked, and the authority this run published at ${state_file} could not be removed. Nothing is fenced and nothing has been migrated, but that file now describes a fence that does not exist: the next cutover will read it as a standing one. Remove it by hand before re-running." >&2
+      echo "The connection fence was REFUSED before anything was revoked, and the authority this run published at ${state_file} could not be removed. Nothing is fenced and nothing has been migrated, but that file now describes a fence that does not exist: the next cutover will treat it as a standing one. Remove it by hand before re-running." >&2
     fi
   fi
   return "${rc}"
