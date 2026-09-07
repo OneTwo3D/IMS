@@ -458,6 +458,61 @@ export function normaliseXeroSettlementDate(value: unknown): string | null {
  */
 type XeroAppliedCollection = Array<{ AppliedAmount?: number }>
 
+/**
+ * o3d-jfhi — AND THE INVOICE ARM, CHECKED AGAINST THE CONTRACT RATHER THAN AGAINST WHAT WAS RECALLED.
+ *
+ * The invoice identity was corrected earlier on this branch by INFERENCE from a single missing term.
+ * This is the same identity re-derived from the same published schema the credit-note block cites,
+ * and the outcome is recorded whether or not it changed anything — a re-read that finds nothing is
+ * only worth having if the FINDING NOTHING is written down.
+ *
+ * SOURCE: XeroAPI/Xero-OpenAPI `xero_accounting.yaml`, `components.schemas.Invoice`.
+ *
+ *   AmountDue        "Amount remaining to be paid on invoice"
+ *   AmountPaid       "Sum of payments received for invoice"
+ *   AmountCredited   "Sum of all credit notes, over-payments and pre-payments applied to invoice"
+ *   CISDeduction     "CIS deduction for UK contractors"
+ *   Total            the face value; Payments / Prepayments / Overpayments / CreditNotes the four
+ *                    collections this arm reads.
+ *
+ * WHAT THE RE-READ CONFIRMED. `AmountCredited`'s own description names EXACTLY the three collections
+ * `applied` sums — credit notes, overpayments, prepayments — so pair 3's composition is the
+ * contract's, not an inference from field names. The four-term identity
+ * `AmountDue = Total - CISDeduction - AmountPaid - AmountCredited` is complete against the documented
+ * money fields.
+ *
+ * WHAT THE RE-READ ADDED, AND IT IS THE PART INFERENCE WOULD NOT HAVE REACHED — THREE DOCUMENTED
+ * FIELDS THAT ARE NOT TERMS, AND WHY:
+ *
+ *   TotalDiscount    "Total of discounts applied on the invoice line items". Inside `SubTotal`, hence
+ *                    inside `Total`. Subtracting it would take the discount off twice.
+ *   RoundingAmount   "An optional rounding adjustment added to SubTotal + TotalTax to give Total
+ *                    (i.e. Total = SubTotal + TotalTax + RoundingAmount)". The contract states the
+ *                    arithmetic outright: it is a component OF `Total`, not a reduction of
+ *                    `AmountDue`. It is also documented as returned only on POST/PUT and on GET BY
+ *                    ID — which is the call this arm makes — so it will appear here, and the reason
+ *                    it changes nothing is worth having written down before someone meets it.
+ *   EnteredTotal     the pre-rounding total; "once the invoice is no longer DRAFT this reflects
+ *                    Total". Not a second settlement figure.
+ *   CISRate          a rate, not an amount.
+ *
+ * AND THE ANSWER TO "CAN `Payments` ON AN INVOICE CARRY SOMETHING THE IDENTITY DOES NOT ACCOUNT FOR?"
+ * — YES, ONE THING, AND IT IS ALREADY HANDLED IN THE RIGHT DIRECTION.
+ *
+ * The `Payment` schema documents `Status` as an enum of `AUTHORISED` and `DELETED`. `AmountPaid` is
+ * "Sum of payments RECEIVED", and a deleted payment has not been received. So IF a GET returns a
+ * `DELETED` payment inside `Payments` — which the contract neither promises nor rules out — the
+ * collection sums HIGHER than `AmountPaid`, and that is pair 2's excess: `paymentsExceedTotal`
+ * withholds proof and the classifier answers `unknown` rather than `clear`. The failure is already
+ * in the visible direction, so nothing is changed for it. What is deliberately NOT done is FILTERING
+ * on `Status`: excluding a payment Xero did in fact count would make `seen` short of `AmountPaid` and
+ * hard-refuse an ordinary invoice, which is the irreversible-workflow direction and a guess besides.
+ *
+ * The other thing that collection carries is `BankAmount` — "The amount of the payment in the
+ * currency of the bank account". This arm reads `Amount`, which is stated in the document's own
+ * currency, and that is the only one comparable with `AmountPaid` and `Total`. Named because the two
+ * fields are adjacent, similarly spelled, and differ silently by an FX rate.
+ */
 /** The document a settlement probe reads, per money-moving type. */
 type XeroPaymentsResponse = {
   Invoices?: Array<{
@@ -512,6 +567,51 @@ type XeroPaymentsResponse = {
     Overpayments?: XeroAppliedCollection
   }>
 }
+/**
+ * o3d-jfhi — THE CREDIT NOTE, AS THE PUBLISHED CONTRACT DESCRIBES IT, WITH EVERY TERM'S SOURCE NAMED.
+ *
+ * WHY THE SOURCE IS WRITTEN DOWN AND NOT JUST THE ARITHMETIC. Two identities on this branch were
+ * written from a PARTIAL reading of what a Xero document carries — the invoice's, which was missing
+ * `CISDeduction`, and this one, which was missing `CISDeduction` AND `Payments` — and each was then
+ * defended with careful arithmetic ABOUT THE TERMS IT KNEW. Careful arithmetic over an incomplete
+ * term list is exactly what a missing term hides behind: the sums balance, the reasoning reads as
+ * rigorous, and the gap is invisible because nothing in the file ever said where the term list came
+ * from. So the list is now sourced. A term missing from the citation below is a GAP anyone can see by
+ * comparing this block against the schema; a term missing from the arithmetic alone can only be found
+ * as a contradiction, which is how both of these were found and is two rounds too late.
+ *
+ * AND THE SOURCE IS DOCUMENTATION, NOT A CALL. The previous round declined to settle this and said
+ * so, on the grounds that it "cannot read without a live CIS tenant" and that API calls are
+ * forbidden. The second half is true and the first was wrong: the published `CreditNote` schema
+ * STATES which fields a credit note carries, and reading a vendor's schema is not exercising a
+ * vendor's endpoint. The citations below are from that schema.
+ *
+ * SOURCE: XeroAPI/Xero-OpenAPI `xero_accounting.yaml`, `components.schemas.CreditNote` — the
+ * machine-readable form of https://developer.xero.com/documentation/api/accounting/creditnotes.
+ *
+ *   Total            "The total of the Credit Note(subtotal + total tax)"       number, x-is-money
+ *   RemainingCredit  "The remaining credit balance on the Credit Note"          number, x-is-money
+ *   CISDeduction     "CIS deduction for UK contractors"                         number, x-is-money,
+ *                                                                              readOnly
+ *   Allocations      "See Allocations" -> array of `Allocation`, each carrying an `Amount` and the
+ *                    `Invoice` it was applied to
+ *   Payments         "See Payments" -> array of `Payment`, each carrying an `Amount`
+ *
+ * THE FIELDS THAT ARE DOCUMENTED AND DELIBERATELY NOT TERMS, so that "not modelled" is a decision
+ * rather than another gap:
+ *
+ *   AppliedAmount    "The amount of applied to an invoice" — SINGULAR, one invoice's share, which is
+ *                    not the note's total usage and is the shape this file already reads under
+ *                    `XeroAppliedCollection` when a note appears INSIDE an invoice. The contract does
+ *                    not say what it means at the top level of a credit-note GET, so it is not used:
+ *                    a second derivation built on an ambiguous field would manufacture contradiction
+ *                    refusals out of the ambiguity, which is worse than having only one derivation.
+ *   CISRate          a RATE, not an amount. `CISDeduction` is the money.
+ *   SubTotal,        components of `Total` by the contract's own description of `Total`, so counting
+ *   TotalTax         them alongside it would double the face value.
+ *   Status, Type     not money. A DELETED or VOIDED note is a question about whether to allocate at
+ *                    all, which is not this probe's question and is not silently folded in here.
+ */
 type XeroCreditNoteResponse = {
   CreditNotes?: Array<{
     CreditNoteID?: string
@@ -520,7 +620,35 @@ type XeroCreditNoteResponse = {
     /** The credit's face value and what is left of it — how much of it has been allocated. */
     Total?: number
     RemainingCredit?: number
+    /**
+     * o3d-jfhi (Codex HIGH) — THE CREDIT NOTE CARRIES A CIS DEDUCTION TOO, AND THE LAST ROUND SAID
+     * IT COULD NOT KNOW THAT.
+     *
+     * It is the same field the invoice arm above already models, with the same contract description
+     * ("CIS deduction for UK contractors"), on the same schema. The previous round subtracted it on
+     * the invoice and declined to on the credit note, reasoning that nothing it could read said a
+     * credit note carries a deduction AT ALL. The schema says so, in the `CreditNote` definition,
+     * beside `RemainingCredit`.
+     *
+     * `number | string` for the reason the invoice's carries both: one decode for every money figure
+     * this file reads, or the magnitude discipline is not the same discipline.
+     */
+    CISDeduction?: number | string
     Allocations?: Array<{ Amount?: number; Date?: string; Invoice?: { InvoiceID?: string } }>
+    /**
+     * o3d-jfhi (Codex HIGH) — AND A REFUND IS A `Payment` ON THE CREDIT NOTE ITSELF.
+     *
+     * Xero records a refund of a credit note through the payments endpoint, and the `Payment`
+     * schema's own `PaymentType` enum carries the two spellings that exist for nothing else —
+     * `ARCREDITPAYMENT` and `APCREDITPAYMENT`. So a refunded credit note reduces `RemainingCredit`
+     * by money that appears in NEITHER `Allocations` nor any figure this arm was reading.
+     *
+     * `Amount` is the term, not `BankAmount`: the contract describes `BankAmount` as "the amount of
+     * the payment in the currency of the bank account", which is a DIFFERENT currency from the one
+     * `Total` and `RemainingCredit` are stated in whenever the note is not in the base currency.
+     * Summing it into this identity would be a silent cross-currency subtraction.
+     */
+    Payments?: Array<{ PaymentID?: string; Amount?: number }>
   }>
 }
 
@@ -591,7 +719,17 @@ export async function probeXeroSettlement(
     // and that is a `clear` over the credit note this check was added to protect.
     const creditTotal = wireAmount(note.Total, noteCurrency)
     const remaining = wireAmount(note.RemainingCredit, noteCurrency)
-    const cannotRun = completenessCannotRun([['Total', creditTotal], ['RemainingCredit', remaining]])
+    // o3d-jfhi: read HERE, with the other two and through the SAME reader, because it is the same
+    // kind of thing they are — a money figure on the wire under the same magnitude discipline, whose
+    // ABSENCE skips nothing (it is a subtraction, and the ordinary non-CIS note states none) and
+    // whose UNREADABILITY must not be spent as permission. That is the invoice arm's treatment of
+    // this exact field, and it is the same treatment because it is the same field.
+    const noteCisRead = wireAmount(note.CISDeduction, noteCurrency)
+    const cannotRun = completenessCannotRun([
+      ['Total', creditTotal],
+      ['RemainingCredit', remaining],
+      ['CISDeduction', noteCisRead],
+    ])
     if (cannotRun !== null) {
       return {
         ok: false,
@@ -599,30 +737,126 @@ export async function probeXeroSettlement(
           + 'cannot tell how much of the credit is already allocated',
       }
     }
-    // o3d-acctmoney — THE SAME QUESTION ASKED OF THIS ARM, AND THE ANSWER IS "NOT HERE", WITH A
-    // REASON RATHER THAN A SHRUG.
+    /*
+     * o3d-jfhi (Codex HIGH) — THE CREDIT-NOTE IDENTITY, DERIVED FROM THE CONTRACT RATHER THAN FROM
+     * THE FIELDS THIS FILE HAPPENED TO KNOW.
+     *
+     * THE DEFECT. This arm computed `applied` as `Total - RemainingCredit` and measured it against
+     * `Allocations` alone, which asserts that ALLOCATION IS THE ONLY THING THAT REDUCES A CREDIT
+     * NOTE. The published `CreditNote` schema says otherwise twice over — see the citation block on
+     * `XeroCreditNoteResponse`. So:
+     *
+     *   A REFUNDED NOTE.  `Total 400, RemainingCredit 300, Payments [100], Allocations []` gave
+     *   `applied` 100 against an allocated 0, and the probe refused with "100.00 of this credit note
+     *   already applied but returned no allocations" — over a note with 300 legitimately left to
+     *   allocate.
+     *   A CIS NOTE.  `Total 400, CISDeduction 80, RemainingCredit 320, Allocations []` gave `applied`
+     *   80 against 0 and refused the FIRST allocation against a perfectly coherent supplier credit.
+     *
+     * Both are the invoice arm's harm on the arm the previous round left: a cross-check refusing
+     * documents that are exactly right, on a whole class, at the most ordinary operation there is.
+     *
+     * THE IDENTITY, TERM BY TERM, AND WHERE EACH COMES FROM.
+     *
+     *     RemainingCredit = Total - CISDeduction - SUM(Allocations.Amount) - SUM(Payments.Amount)
+     *
+     *   so what this arm needs — how much of the credit has been spent ON ALLOCATIONS — is
+     *
+     *     allocationUsage = Total - RemainingCredit - CISDeduction - SUM(Payments.Amount)
+     *
+     *   `Total`            the note's face value. Contract: "The total of the Credit Note(subtotal +
+     *                      total tax)".
+     *   `RemainingCredit`  what is left of it. Contract: "The remaining credit balance on the Credit
+     *                      Note" — a BALANCE, i.e. net of everything that has come off, which is why
+     *                      each further term below is SUBTRACTED from the difference rather than
+     *                      added to it.
+     *   `CISDeduction`     contract: "CIS deduction for UK contractors". Withheld and paid to HMRC;
+     *                      no allocation and no payment stands behind it, so it is in no collection.
+     *   `Payments`         contract: "See Payments", an array of `Payment`. Xero records a refund of
+     *                      a credit note through the payments endpoint, and `Payment.PaymentType`
+     *                      enumerates `ARCREDITPAYMENT`/`APCREDITPAYMENT` for exactly this. Cash
+     *                      that has left the credit note without being allocated to anything.
+     *
+     * WHY THIS CAN BE SUBTRACTED WITHOUT A LIVE TENANT, WHICH IS THE QUESTION THE LAST ROUND COULD
+     * NOT ANSWER AND ANSWERED BY DECLINING. Its reasoning was that over-subtraction UNDERSTATES
+     * `applied`, an understatement can reach a proved zero, a proved zero is `clear`, and `clear`
+     * authorises the money post — irreversible, so do not guess. That reasoning is sound about a
+     * SUBTRACTION WITH NOTHING WATCHING IT. It is not sound here, because the result of this identity
+     * is a COUNT OF MONEY ALLOCATED and the collection that money is in was sent with it:
+     *
+     *   Write the true usage as A = SUM(Allocations.Amount), and suppose this subtraction takes off X
+     *   more than Xero in fact netted out of `RemainingCredit`. Then `applied` = A - X while
+     *   `allocated` still sums to A, so the COLLECTION EXCEEDS THE FIGURE by exactly X — and
+     *   `exceeds` below turns that into `provedComplete: false`, which is `unknown`, not `clear`.
+     *   Every over-subtraction is caught by the collection it over-subtracted past, at the same band.
+     *
+     * So the wrong branch of this guess costs a visible hold, not a second allocation, and that is
+     * the asymmetry test the previous round applied and could not pass — it could not pass it because
+     * it was weighing the subtraction ALONE, without the check standing behind it.
+     *
+     * AND THE EXTREME OF THAT SAME CASE IS NAMED RATHER THAN LEFT TO `exceeds`, immediately below: a
+     * usage BELOW ZERO. `allocationUsage` counts money that has been allocated, so under the identity
+     * it is `SUM(Allocations.Amount)` and cannot be negative. A negative one is the identity itself
+     * failing on this document — a strictly stronger statement than "the collection disagrees" — and
+     * it earns its own refusal so that an operator is told the response is incoherent rather than
+     * being told nothing while the row quietly holds.
+     */
+    const notePayments = note.Payments ?? []
+    // An ABSENT `Payments` collection sums to ZERO, for `sumApplied`'s reason and in its direction:
+    // "Xero sent no payments" has to be able to mean "there are none", or every ordinary credit note
+    // refuses — and the mistake it can cause is DIRECTIONAL. An omitted refund leaves `applied`
+    // OVERSTATED, which the shortfall check below turns into a visible refusal, never into a clear.
     //
-    // The invoice arm above was wrong because `AmountDue` has a term this file did not know about.
-    // The obvious next move is to subtract a `CISDeduction` from `Total - RemainingCredit` too, and
-    // it is NOT taken, because the two arms are not symmetric in the direction they fail:
-    //
-    //   IF Xero reduces `RemainingCredit` by a deduction and this does not,   `applied` OVERSTATES,
-    //   the allocations fall short of it, and the probe REFUSES. A legitimate credit note holds
-    //   visibly and a human clears it — the same cost the invoice bug had, and a recoverable one.
-    //
-    //   IF Xero does NOT and this subtracts anyway,   `applied` UNDERSTATES. Take it to zero and
-    //   `statesAnything` is false, the shortfall check never runs, the empty allocation list is
-    //   "proved", and `classifyLedgerSettlement` answers `clear` — which authorises the money post.
-    //   That is the irreversible one, and it is the whole reason this module exists.
-    //
-    // `RemainingCredit = Total - SUM(Allocations)` is the construction this arm is written against
-    // and the one the comments below cite. Nothing in this repository, and nothing this branch can
-    // read without a live CIS tenant, says a credit note carries a deduction at all — and a probe
-    // is not the place to guess which way an unverified identity runs when one of the two guesses
-    // ends in a second payment. Filed rather than folded in; see the bd note on o3d-acctmoney.
-    const applied = creditTotal.value !== null && remaining.value !== null
-      ? subtractMoney(creditTotal.value, remaining.value)
-      : null
+    // A payment ENTRY whose amount cannot be read is the opposite case and refuses, because a refund
+    // is never a RECORD of this bill's allocations — nothing is left behind to make the classifier
+    // withhold on its own account. That is o3d-zo4j's unreadable-allocation lesson applied to the
+    // collection this round added, rather than learned again later.
+    const refundReadings = notePayments.map((pmt) => wireAmount(pmt.Amount, noteCurrency))
+    const refunded = sumExact(refundReadings.map((r) => r.value))
+    if (refunded === null) {
+      const unreadable = refundReadings.find((r) => r.unreadable !== null)?.unreadable ?? null
+      return {
+        ok: false,
+        reason: unreadable !== null
+          ? `Xero states ${unreadable} on a payment against this credit note, which IMS cannot read `
+            + 'as an amount, so it cannot tell how much of the credit is already allocated'
+          : 'Xero returned a payment against this credit note with no amount, so IMS cannot tell how '
+            + 'much of the credit is already allocated',
+      }
+    }
+    // ABSENT IS ZERO, and it is the ordinary credit note. An unreadable one never reaches here —
+    // `completenessCannotRun` above has already refused it — so the only two states left are "Xero
+    // stated a deduction" and "Xero stated none", and the second is arithmetically the first with a
+    // zero in it. A `!== null` guard here would put the identity back where the finding found it:
+    // correct on the notes that state the field and silently short a term on the ones that do not.
+    const noteCisDeduction = noteCisRead.value ?? toDecimal(0)
+    let applied: Decimal | null = null
+    if (creditTotal.value !== null && remaining.value !== null) {
+      applied = subtractMoney(
+        subtractMoney(subtractMoney(creditTotal.value, remaining.value), noteCisDeduction),
+        refunded,
+      )
+      // THE IDENTITY'S OWN SANITY, and the reason the two terms above could be added on a reading of
+      // the contract rather than on a live tenant. `shortBy(0, applied)` is "applied is more than one
+      // band BELOW zero" — written with the same function and therefore the same band as every other
+      // completeness comparison in this file.
+      if (shortBy(toDecimal(0), applied, noteCurrency)) {
+        return {
+          ok: false,
+          reason: 'Xero states a credit note whose remaining credit is larger than its own total less '
+            + `what has been taken off it — ${formatLedgerMoney(creditTotal.value)} total, `
+            + `${formatLedgerMoney(remaining.value)} remaining`
+            + (statesAnything(noteCisDeduction, noteCurrency)
+              ? `, ${formatLedgerMoney(noteCisDeduction)} CIS deduction`
+              : '')
+            + (statesAnything(refunded, noteCurrency)
+              ? `, ${formatLedgerMoney(refunded)} refunded`
+              : '')
+            + ', so the response is inconsistent and IMS cannot tell how much of the credit is '
+            + 'already allocated',
+        }
+      }
+    }
     const allocated = sumExact(allocations.map((a) => wireDecimal(a.Amount, noteCurrency)))
     if (applied !== null && statesAnything(applied, noteCurrency)
       && (allocated === null || shortBy(applied, allocated, noteCurrency))) {
@@ -640,8 +874,9 @@ export async function probeXeroSettlement(
     // the fixtures modelled the figureless stub as an ordinary credit note; they now state what Xero
     // states, so the rule can be the same one on both connectors.
     //
-    // `applied` is this arm's `settled`: `Total - RemainingCredit` is Xero's own account of how much
-    // of the credit has been used. Null means the note stated neither figure, so nothing was checked
+    // `applied` is this arm's `settled`: how much of the credit has been used ON ALLOCATIONS, which
+    // is `Total - RemainingCredit` less the two terms that come off a credit note without being one
+    // (o3d-jfhi). Null means the note stated neither of the first two figures, so nothing was checked
     // — and with no allocation to THIS bill, the empty record list would assert "none of this credit
     // has been applied to this bill" on the strength of not having looked. A note that DOES state
     // them proves its own emptiness: a wholly unapplied credit reads `Total 40, RemainingCredit 40`,
@@ -651,13 +886,25 @@ export async function probeXeroSettlement(
     // fact used for a different conclusion. When it is stated, the shortfall check above has measured
     // the collection against a figure outside it; when it is null, the allocations went unmeasured,
     // and a non-matching allocation must not be allowed to say this credit was never applied to us.
-    // o3d-zo4j — PAIR 1 OF 4, AND IT IS AN IDENTITY. `RemainingCredit = Total - SUM(Allocations)` is
-    // Xero's own construction of the field, so `applied` and `allocated` are ONE quantity written two
-    // ways. The shortfall check above already reads them that way; measuring the other direction adds
-    // no assumption it does not already make. An excess means the note's `RemainingCredit` and its own
-    // allocation list cannot both be true, and there is no shape of a live Xero credit note in which
-    // they legitimately differ — a deleted allocation LEAVES the collection rather than staying in it
-    // with a reversing sign, and a reversing sign would push this into the shortfall direction anyway.
+    // o3d-zo4j — PAIR 1 OF 4, AND IT IS AN IDENTITY.
+    //
+    // o3d-jfhi CORRECTED THE IDENTITY THIS PAIR IS BUILT ON, and left the pair doing MORE work than
+    // it was doing before. It used to be cited as `RemainingCredit = Total - SUM(Allocations)`, which
+    // is the contract's construction with two of its terms missing; it is
+    // `RemainingCredit = Total - CISDeduction - SUM(Allocations) - SUM(Payments)`, and `applied` is
+    // now that rearranged. So `applied` and `allocated` are still ONE quantity written two ways —
+    // which is what makes this pair an identity rather than a bound — and an excess still means the
+    // note's `RemainingCredit` and its own allocation list cannot both be true.
+    //
+    // AND IT IS ALSO THE CHECK THAT MAKES THE TWO NEW TERMS SAFE TO SUBTRACT WITHOUT A LIVE TENANT.
+    // If Xero does not in fact net a term out of `RemainingCredit`, `applied` comes out exactly that
+    // much BELOW `allocated`, and this comparison converts the over-subtraction into
+    // `provedComplete: false` — `unknown` — rather than into the proved zero the previous round was
+    // afraid of. See the identity block above the arithmetic.
+    //
+    // There is no shape of a live Xero credit note in which the two legitimately differ — a deleted
+    // allocation LEAVES the collection rather than staying in it with a reversing sign, and a
+    // reversing sign would push this into the shortfall direction anyway.
     //
     // AND AN UNREADABLE ALLOCATION AMOUNT IS NOT AGREEMENT EITHER, which is this arm's half of the
     // closing audit. `allocated` is null the moment one allocation states an amount this code cannot
@@ -1243,6 +1490,43 @@ export async function probeQuickBooksSettlement(
   // the document, so `TotalAmt - Balance` counting it is CORRECT and it surfaces here as an
   // unexplained amount rather than as a false agreement. That is the opposite of the CIS case, where
   // the figure was never a settlement at all, and it is why this arm needs no change.
+  //
+  // o3d-jfhi — AND THAT AUDIT WAS RE-RUN AGAINST THE PUBLISHED CONTRACT RATHER THAN AGAINST THE
+  // FIELD NAMES ANYONE COULD THINK OF, BECAUSE THAT IS THE DIFFERENCE THE FINDING WAS ABOUT.
+  //
+  // SOURCE: Intuit's QuickBooks Online entity reference for `Invoice` and `Bill`.
+  //
+  //   Balance        "The balance reflecting any payments made against the transaction. Initially
+  //                  this will be equal to the TotalAmt."
+  //   TotalAmt       "Indicates the total amount of the transaction. This includes the total of all
+  //                  the charges, allowances and taxes."
+  //   Deposit        "Amount in deposit against the Invoice. Supported for Invoice only."
+  //   HomeBalance,   the same two figures in the company's HOME currency.
+  //   HomeTotalAmt
+  //   DiscountAmt    "Indicates the discount amount that is applied on the transaction as a whole."
+  //
+  // WHAT THE RE-READ FOUND THAT THE INFERRED LIST DID NOT. `Deposit` is a documented FIELD on the
+  // Invoice entity, and the paragraph above knew "deposit" only as a `LinkedTxn` TYPE. They are not
+  // the same thing: a deposit recorded in the field can reduce `Balance` while linking NOTHING, so
+  // the `uncovered` list stays empty and the refusal's sentence falls to "links no transaction that
+  // accounts for it" — which is, as it happens, exactly the right sentence.
+  //
+  // AND IT IS STILL NOT A TERM, WHICH IS THE OPPOSITE CONCLUSION TO THE CIS ONE AND FOR THE REASON
+  // THAT DISTINGUISHES THEM: A DEPOSIT IS MONEY THAT MOVED. A customer paid it. `TotalAmt - Balance`
+  // counting it is the truth, and IMS genuinely cannot see it, so the honest answer is the
+  // unexplained-shortfall refusal this arm already gives — not a subtraction. Subtracting it would
+  // UNDERSTATE what has come off the document, which is the direction that forges a proved zero and
+  // authorises a second payment. `CISDeduction` is subtracted precisely because NO money moved: it is
+  // the reason a subcontractor is owed less, not a settlement anyone made.
+  //
+  // `Bill` carries no `Deposit` at all — the contract says "Supported for Invoice only" — so the bill
+  // arm's identity is `TotalAmt - Balance` with nothing else documented against it.
+  //
+  // AND THE PAIR READ IS THE TRANSACTION-CURRENCY ONE ON PURPOSE. `HomeTotalAmt`/`HomeBalance` are
+  // the same two figures converted, and this arm sizes its band with `CurrencyRef` — the transaction
+  // currency. Mixing one of each would compare a converted figure against an unconverted collection
+  // at the wrong minor unit. Named for the reason the Xero arm names `BankAmount`: adjacent field,
+  // similar spelling, silent FX difference.
   //
   // THE SHAPE-INDEPENDENT SETTLEMENT ACCOUNTING. Everything above depends on a list of type names
   // being right, and the bug this replaces was a list of type names being wrong. `TotalAmt` and
