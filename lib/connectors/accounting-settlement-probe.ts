@@ -528,6 +528,40 @@ type XeroAppliedCollection = Array<{ AppliedAmount?: number }>
  * Filter where the term is subtracted; do not filter where it is added. The rule is about the SIGN,
  * not about the field — and it was written for one sign and applied to both once already.
  *
+ * THE CENSUS, SO THE NEXT RULE IS STATED FOR THE SIGN IT IS APPLIED TO. This is twice now that a rule
+ * correct in one arm was wrong in another because the term changes sign between them, so every term
+ * of both identities is listed here with its sign and what stands behind it. Measured, not argued:
+ * each SUBTRACTED row was driven over an EMPTY collection and answers `clear`; each ADDED row was
+ * over-counted and answers `unknown`.
+ *
+ *   SUBTRACTED — an over-subtraction UNDERSTATES the usage, reaches a proved zero over an empty
+ *   collection, and CLEARS. Nothing catches it there; `exceeds` needs a non-empty collection.
+ *     credit note  RemainingCredit   document figure, no per-member flag. Believed as stated.
+ *     credit note  CISDeduction      document figure, no per-member flag. Absent = 0, unreadable
+ *                                    refuses. NOTE: this arm has no second derivation of its usage,
+ *                                    so unlike the invoice's CIS term nothing cross-checks it when
+ *                                    the allocation collection is empty (o3d-acctmoney r2 follow-up).
+ *     credit note  SUM(Payments)     THE ONE TERM WITH A CONTRACT-ENUMERATED MEMBER FLAG —
+ *                                    `Payment.Status` — and it is now read. This block's subject.
+ *     invoice      AmountDue         document figure, no per-member flag. Believed as stated.
+ *     invoice      CISDeduction      document figure; cross-checked TWO-SIDED against
+ *                                    `AmountPaid + AmountCredited`, which catches an over-subtraction
+ *                                    whenever that fallback pair is stated (it is, on every real GET).
+ *     QuickBooks   Balance           document figure, no per-member flag. Believed as stated.
+ *
+ *   ADDED or COMPARED — an over-count makes the collection EXCEED the figure certifying it, which
+ *   withholds proof: `unknown`, never `clear`. No member filter is needed on any of them, and adding
+ *   one would hard-refuse an ordinary document.
+ *     credit note  Total, SUM(Allocations)
+ *     invoice      Total, AmountPaid, AmountCredited, SUM(Payments), and the three applied
+ *                  collections (`CreditNotes` / `Prepayments` / `Overpayments`)
+ *     QuickBooks   TotalAmt, SUM(applied linked settlements)
+ *
+ * So: exactly one term in either identity carries a member-level flag that decides whether the member
+ * is netted at all, and a rule about excluding members belongs only to it. Every other term is a
+ * document-level figure with nothing to exclude, and "believe what the ledger stated, refuse what it
+ * stated unreadably, read absence as zero" is one rule that holds at both signs.
+ *
  * The other thing that collection carries is `BankAmount` — "The amount of the payment in the
  * currency of the bank account". This arm reads `Amount`, which is stated in the document's own
  * currency, and that is the only one comparable with `AmountPaid` and `Total`. Named because the two
