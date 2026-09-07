@@ -1562,6 +1562,12 @@ for (const entry of FENCE_HARNESS) {
         "  }) + '\\n')",
         '}',
         "if (process.argv.includes('--print-migration-url')) process.stdout.write('postgres://admin@127.0.0.1/nowhere\\n')",
+        // THE WITNESS PROTOCOL, EMULATED (o3d-secops r31). The ordinary cutover now holds a session
+        // across the fence and the release and asks BOTH connections whether they can see it, so a
+        // stub that answered nothing here would be measuring a cutover the shipped scripts do not
+        // perform -- and this test's subject is precisely that the ordinary one still ends its own
+        // record with nobody at a terminal.
+        ...WITNESS_STUB_LINES(),
         'process.exit(0)',
         '',
       ].join('\n'))
@@ -1774,6 +1780,44 @@ function fenceStub(dir: string, exitCode: number): void {
       '',
     ].join('\n'),
   )
+}
+
+/**
+ * A STUB THAT SPEAKS THE r31 WITNESS PROTOCOL (o3d-secops r31, Codex HIGH 1).
+ *
+ * The shipped helper holds a session across the fence and the release and reports, on each of its
+ * OWN connections, whether it can see that session. There is no PostgreSQL in these harnesses, so
+ * the three lines root reads are produced directly -- what is under test here is the SHELL: that
+ * root issues a challenge, passes it to `--release`, reads the verdict out of the release's own
+ * output, and lets that decide whether the record is removed.
+ *
+ * `verdict` is what `--release` reports. 'yes' is the ordinary cutover; 'no' is a release that
+ * landed somewhere the witness is not, which is the whole finding.
+ */
+function WITNESS_STUB_LINES(verdict: 'yes' | 'no' = 'yes'): string[] {
+  return [
+    "if (process.argv.includes('--witness')) {",
+    "  const nonce = process.argv.find((a) => a.startsWith('--witness-nonce='))?.slice('--witness-nonce='.length) ?? ''",
+    "  process.stdout.write(`WITNESS_READY ${nonce}\\n`)",
+    "  let buffer = ''",
+    "  process.stdin.on('data', (chunk) => {",
+    "    buffer += chunk.toString('utf8')",
+    "    let index",
+    "    while ((index = buffer.indexOf('\\n')) >= 0) {",
+    "      const line = buffer.slice(0, index).trim()",
+    "      buffer = buffer.slice(index + 1)",
+    "      const hit = /^challenge ([0-9a-f]+)$/.exec(line)",
+    "      if (hit) process.stdout.write(`WITNESS_HELD ${hit[1]}\\n`)",
+    "    }",
+    "  })",
+    // TOP-LEVEL AWAIT RATHER THAN `return`: this stub is an .mjs, so `return` at module scope is a
+    // syntax error, and the witness must not fall through to the `process.exit(0)` below it.
+    "  await new Promise((resolve) => process.stdin.on('end', resolve))",
+    "  process.exit(0)",
+    "}",
+    "if (process.argv.includes('--fence') && process.argv.some((a) => a.startsWith('--witness-lock='))) process.stdout.write('fence_witness=colocated\\n')",
+    `if (process.argv.includes('--release') && process.argv.some((a) => a.startsWith('--witness-challenge='))) process.stdout.write('witness_colocated=${verdict}\\n')`,
+  ]
 }
 
 function runShell(program: string): { status: number; output: string } {
@@ -12410,13 +12454,52 @@ test('[o3d-secops r30] every caller of db_fence_clear_authority attests, or pass
     })
   }
 
+  // AND SINCE r31, EVERY CALL SAYS WHICH SERVER TOO (o3d-secops r31, Codex HIGH 1). "This run
+  // raised the fence" is a fact about a PROCESS, and a process spans the two connections a proxy or
+  // a failover can separate; the removal therefore takes a second literal saying which server was
+  // released. The same census shape, for the same reason: a rule enforced in the function and
+  // bypassed by one call site passing the literal unconditionally would leave the finding open on
+  // that path with the guard green.
+  //
+  // MUTATION ROUTE (made against the shipped files and reverted): change an entrypoint's release to
+  // pass `"same-server-as-the-fence"` outright instead of ${clear_server}, and the census names it.
+  for (const site of sites) {
+    // The third argument as it is WRITTEN, quotes and all, and stopping at the closing quote --
+    // these calls sit inside `if ! ... ; then`, so a greedy \\S+ swallows the `;` and every
+    // comparison below then fails against a token nobody wrote.
+    const third = /db_fence_clear_authority\s+\S+\s+\S+\s+("[^"]*")/.exec(site.line)
+    assert.ok(third, `${site.where} passes no answer about WHICH SERVER it released, so since r31 it removes nothing:\n  ${site.line}`)
+    const literal = third![1].replace(/"/g, '')
+    if (literal === 'nothing-was-revoked') {
+      // The only place that may say it: db_fence_raise() removing its OWN publication after a
+      // failure that is strictly BEFORE any REVOKE, where there is no server to be wrong about.
+      assert.ok(site.where.startsWith('scripts/lib/db-fence-protected.sh:') && RAISE.includes(site.line),
+        `${site.where} claims nothing was revoked, which only db_fence_raise()'s two removals of its own never-executed publication may:\n  ${site.line}`)
+      continue
+    }
+    assert.match(third![1], /^"\$\{?clear_server\}?"$/,
+      `${site.where} must take its answer about the server from a value the release's own output decided, not from a literal:\n  ${site.line}`)
+  }
+
+  // AND THAT VALUE IS ONLY EVER SET FROM THE RELEASE'S OWN REPORT. A caller that assigned it from a
+  // shell flag would be back to a process-shaped memory wearing a new name, which is the finding.
+  for (const [name, source] of FILES) {
+    source.split(/\r?\n/).forEach((line, index) => {
+      if (!/clear_server="same-server-as-the-fence"/.test(line)) return
+      assert.match(line, /witness_colocated=yes/,
+        `${name}:${index + 1} decides which server was released without reading what the release itself reported:\n  ${line.trim()}`)
+    })
+  }
+
   // THE FUNCTION ITSELF REFUSES, EXERCISED UNDER A REAL SHELL rather than read. Both directions,
   // so a passing test cannot be a function that never removes anything.
   const dir = mkdtempSync(join(tmpdir(), 'ims-clear-'))
   try {
     const record = join(dir, 'db-connect-fence.json')
     const CLEAR = shellFunction(readFileSync(join(process.cwd(), 'scripts/lib/db-fence-protected.sh'), 'utf8'), 'db_fence_clear_authority')
-    const ask = (attestation: string) => {
+    // o3d-secops r31: two answers, WHO and WHICH SERVER, so this takes both and each loop below
+    // holds one of them right and varies the other.
+    const ask = (attestation: string, server = 'same-server-as-the-fence') => {
       writeFileSync(record, '{"state_complete":1}\n')
       const run = runShell([
         'set -uo pipefail',
@@ -12424,7 +12507,7 @@ test('[o3d-secops r30] every caller of db_fence_clear_authority attests, or pass
         'DB_FENCE_SUDO_PREFIX=""',
         'DB_FENCE_RELEASE_WRAPPER="/opt/cutover/release-db-fence"',
         CLEAR,
-        `db_fence_clear_authority ${JSON.stringify(record)} ${JSON.stringify(attestation)}`,
+        `db_fence_clear_authority ${JSON.stringify(record)} ${JSON.stringify(attestation)} ${JSON.stringify(server)}`,
         'echo "RC=$?"',
       ].join('\n'))
       return { output: run.output, survived: existsSync(record) }
@@ -12436,9 +12519,24 @@ test('[o3d-secops r30] every caller of db_fence_clear_authority attests, or pass
       assert.equal(refused.survived, true, `and ${JSON.stringify(wrong)} must leave the record where it was`)
     }
 
+    // AND THE SAME CENSUS OF NEAR-MISSES ON THE SECOND ANSWER (o3d-secops r31, Codex HIGH 1). The
+    // WHO is correct in every one of these, which is the point: r30's attestation on its own is
+    // satisfied by a run whose release was re-pointed to a copy of the fenced cluster.
+    for (const wrong of ['', 'true', 'yes', 'same-server-as-the-fence ', 'SAME-SERVER-AS-THE-FENCE', 'nothing-was-revoked-x']) {
+      const refused = ask('raised-by-this-run', wrong)
+      assert.match(refused.output, /^RC=2$/m, `${JSON.stringify(wrong)} must not license an unlink either:\n${refused.output}`)
+      assert.equal(refused.survived, true, `and ${JSON.stringify(wrong)} must leave the record where it was`)
+    }
+
     const allowed = ask('raised-by-this-run')
     assert.match(allowed.output, /^RC=0$/m, `an attested removal must still happen:\n${allowed.output}`)
     assert.equal(allowed.survived, false, 'and the record must be gone')
+
+    // AND THE OTHER PERMITTED SECOND ANSWER REMOVES TOO, or db_fence_raise() could never clear its
+    // own never-executed publication and every refused initial fence would leave litter behind.
+    const nothingRevoked = ask('raised-by-this-run', 'nothing-was-revoked')
+    assert.match(nothingRevoked.output, /^RC=0$/m, `a record nothing revoked from must still be removable:\n${nothingRevoked.output}`)
+    assert.equal(nothingRevoked.survived, false, 'and that record must be gone as well')
 
     // AND AN ABSENT RECORD IS NOT A REFUSAL: the recovery paths reach this after a release that
     // found no record at all, and turning that into a refusal would stop the one state that needs
@@ -12449,7 +12547,7 @@ test('[o3d-secops r30] every caller of db_fence_clear_authority attests, or pass
       'DB_FENCE_SUDO_PREFIX=""',
       'DB_FENCE_RELEASE_WRAPPER="/opt/cutover/release-db-fence"',
       CLEAR,
-      `db_fence_clear_authority ${JSON.stringify(join(dir, 'not-there.json'))} ""`,
+      `db_fence_clear_authority ${JSON.stringify(join(dir, 'not-there.json'))} "" ""`,
       'echo "RC=$?"',
     ].join('\n'))
     assert.match(nothing.output, /^RC=0$/m, `nothing to remove is not something to refuse:\n${nothing.output}`)
@@ -12505,4 +12603,269 @@ test('[o3d-secops r30] the release wrapper asks before it removes, and completes
   const HELPER = readFileSync(join(process.cwd(), 'scripts/fence-db-connections.mjs'), 'utf8')
   assert.match(HELPER, /export const EXIT_ALREADY_RELEASED = 6/, 'the helper must define that status')
   assert.match(HELPER, /release_cluster_identity=/, 'and print the cluster line the token binds')
+})
+
+// ---------------------------------------------------------------------------
+// o3d-secops r31, Codex HIGH 2 — A FENCE THAT WENT UP LOST ITS OWN RECORD OF STANDING.
+//
+// `DB_FENCE_UP` and `DB_FENCE_RAISED` used to be assigned AFTER `--print-migration-url` had run
+// and its output had been validated. So a fence that had genuinely gone up — REVOKEs committed,
+// authority stamped — lost both flags to a failure that had nothing to do with it: an OOM kill of
+// `node`, a signal, a URL this run could not compose. The exit trap then released the grants and
+// the r30 removal gate, seeing no attestation, kept the record; the next unattended run read a
+// stamped, already-released authority and stopped for a terminal confirmation nobody was there to
+// give.
+//
+// The flags are the fact that `db_fence_raise()` returned 0, and nothing between that return and
+// their assignment may be able to make it untrue. These run the shipped functions, in all three
+// entrypoints, with a helper that fences and then refuses to compose a URL.
+// ---------------------------------------------------------------------------
+
+/** Fences successfully, refuses `--print-migration-url`, and answers a release with exit 4. */
+function fenceStubUrlFails(dir: string): void {
+  writeFenceCheckout(
+    dir,
+    [
+      "import { appendFileSync } from 'node:fs'",
+      `appendFileSync(${JSON.stringify(join(dir, 'calls.log'))}, process.argv.slice(2).join(' ') + '\\n')`,
+      // THE FALLIBLE STEP THAT IS NOT THE FENCE. It runs after the REVOKEs are committed and it
+      // knows nothing about them, which is the whole shape of the finding.
+      "if (process.argv.includes('--print-migration-url')) process.exit(7)",
+      "if (process.argv.includes('--release')) process.exit(4)",
+      'process.exit(0)',
+      '',
+    ].join('\n'),
+  )
+}
+
+for (const entry of FENCE_HARNESS) {
+  test(`${entry.name} keeps the attestation for a fence that went up when a later step fails (o3d-secops r31, Codex HIGH 2)`, () => {
+    const dir = mkdtempSync(join(tmpdir(), 'ims-r31urlfail-'))
+    try {
+      fenceStubUrlFails(dir)
+      const program = [
+        'set -uo pipefail',
+        entry.preamble(dir),
+        'error() { echo "ERROR: $*" >&2; }',
+        'DB_FENCE_RAISED=false',
+        CUTOVER_DIR_PRIMITIVES,
+        shellFunction(entry.source, 'fence_db_connections'),
+        shellFunction(entry.source, 'release_db_connections'),
+        'on_exit() { if release_db_connections; then echo "TRAP RELEASE SAID OK"; else echo "TRAP RELEASE REFUSED"; fi; }',
+        'trap on_exit EXIT',
+        'fence_db_connections',
+        'echo "REACHED THE MIGRATION"',
+      ].join('\n')
+      const result = runShell(program)
+
+      // MUTATION ROUTE: move the `DB_FENCE_UP=true` / `DB_FENCE_RAISED=true` pair back below the
+      // `[[ -n "$MIGRATION_DATABASE_URL" ]] || die` line — which is exactly where they were before
+      // this round — and 'TRAP RELEASE SAID OK' is printed instead, over a fence that is standing.
+      assert.match(calls(dir), /^--fence /m, 'precondition: the fence itself was reached and executed')
+      assert.match(calls(dir), /^--print-migration-url /m, 'precondition: and the step that fails ran after it')
+      assert.ok(!result.output.includes('REACHED THE MIGRATION'),
+        `a run that cannot compose a migration URL must still not migrate:\n${result.output}`)
+      assert.match(result.output, /TRAP RELEASE REFUSED/,
+        `the fence went up, so a release that can prove nothing about the record must refuse:\n${result.output}`)
+      assert.ok(!result.output.includes('TRAP RELEASE SAID OK'),
+        `which is the branch a lost DB_FENCE_RAISED takes -- and the one this finding is about:\n${result.output}`)
+      assert.match(result.output, /RECORD IS GONE/,
+        `and it must say that THIS RUN raised the fence whose record it can no longer find:\n${result.output}`)
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  // -------------------------------------------------------------------------
+  // o3d-secops r31 — THE WITNESS MAY COST THE AUTOMATION AND NOTHING ELSE.
+  //
+  // This is the safety property the whole of HIGH 1's fix rests on, and it was NOT true when it was
+  // first written: db_fence_witness_stop() sent a `close` line down the co-process's pipe, the
+  // reader was already gone on the ordinary "no witness here" path, and bash does not ignore
+  // SIGPIPE — so a witness that could not start KILLED THE ENTRYPOINT with a signal. An existing
+  // r23 test caught it, failing with a null exit status. The stop path now closes the pipe instead
+  // of writing down it, and the one remaining write ignores PIPE across itself.
+  //
+  // MUTATION ROUTE (made against the shipped file and reverted): put
+  // `printf 'close\n' >&"${DB_FENCE_WITNESS[1]}"` back at the top of db_fence_witness_stop() and
+  // this run dies on a signal with 'REACHED THE MIGRATION' unprinted.
+  // -------------------------------------------------------------------------
+  test(`${entry.name} fences and migrates normally when no witness can be held (o3d-secops r31)`, () => {
+    const dir = mkdtempSync(join(tmpdir(), 'ims-r31nowitness-'))
+    try {
+      // Everything succeeds except `--witness`, which refuses outright — a cluster with no second
+      // database, a pooler that will not give out a stable backend, a helper too old to know the
+      // mode. The fence must be completely unaffected.
+      writeFenceCheckout(
+        dir,
+        [
+          "import { appendFileSync } from 'node:fs'",
+          `appendFileSync(${JSON.stringify(join(dir, 'calls.log'))}, process.argv.slice(2).join(' ') + '\\n')`,
+          "if (process.argv.includes('--witness')) process.exit(9)",
+          "if (process.argv.includes('--print-migration-url')) { process.stdout.write('postgres://admin@127.0.0.1/main?options=-c%20role%3Dimsapp\\n'); process.exit(0) }",
+          'process.exit(0)',
+          '',
+        ].join('\n'),
+      )
+      const program = [
+        'set -uo pipefail',
+        entry.preamble(dir),
+        'error() { echo "ERROR: $*" >&2; }',
+        'DB_FENCE_RAISED=false',
+        CUTOVER_DIR_PRIMITIVES,
+        shellFunction(entry.source, 'fence_db_connections'),
+        'fence_db_connections',
+        'echo "REACHED THE MIGRATION"',
+      ].join('\n')
+      const result = runShell(program)
+
+      assert.match(calls(dir), /^--witness /m, 'precondition: a witness was attempted, or this measures nothing')
+      assert.match(calls(dir), /^--fence /m, 'and the fence itself still ran')
+      assert.match(result.output, /REACHED THE MIGRATION/,
+        `a witness that cannot be held must cost the automatic removal of the record and NOTHING else:\n${result.output}`)
+      assert.notEqual(result.status, -1,
+        `and the run must not die on a signal, which is what writing down a dead co-process's pipe did:\n${result.output}`)
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+}
+
+// ---------------------------------------------------------------------------
+// o3d-secops r31, Codex HIGH 1 — THE ENTRYPOINT SIDE OF THE BINDING.
+//
+// The library refuses without the second attestation and the helper decides what that attestation
+// is; what is left, and what these measure, is the SHELL BETWEEN THEM. An entrypoint that issued
+// the challenge, ran the release and then removed the record from its own DB_FENCE_RAISED flag
+// regardless of what the release reported would leave the finding entirely open with every other
+// test in this round green.
+//
+// Both directions, in all three entrypoints, with the SAME stub differing only in the one line the
+// release reports — so a passing negative cannot be a path that never removes anything.
+// ---------------------------------------------------------------------------
+
+/** The full cycle stub of the r23 ordering test, with the release's verdict as a parameter. */
+function witnessCycleCheckout(dir: string, verdict: 'yes' | 'no'): void {
+  const helper = writeFenceCheckout(dir, '')
+  writeFileSync(helper, [
+    "import { appendFileSync } from 'node:fs'",
+    `appendFileSync(${JSON.stringify(join(dir, 'calls.log'))}, process.argv.slice(2).join(' ') + '\\n')`,
+    "if (process.argv.includes('--plan')) {",
+    "  process.stdout.write(JSON.stringify({",
+    "    database: 'imsdb', owner_role: 'imsapp', app_role: 'imsapp', admin_role: 'deployadmin',",
+    "    revoked: ['PUBLIC', 'imsapp'], datacl_before: null, fenced_at: '2026-01-01T00:00:00.000Z',",
+    "  }) + '\\n')",
+    '}',
+    "if (process.argv.includes('--print-migration-url')) process.stdout.write('postgres://admin@127.0.0.1/nowhere\\n')",
+    ...WITNESS_STUB_LINES(verdict),
+    'process.exit(0)',
+    '',
+  ].join('\n'))
+}
+
+for (const entry of FENCE_HARNESS) {
+  for (const verdict of ['yes', 'no'] as const) {
+    const cleared = verdict === 'yes'
+    test(`${entry.name} removes its own record only when the release saw the witness (witness_colocated=${verdict}) (o3d-secops r31, Codex HIGH 1)`, () => {
+      const dir = mkdtempSync(join(tmpdir(), `ims-r31verdict-${verdict}-`))
+      try {
+        witnessCycleCheckout(dir, verdict)
+        const program = [
+          'set -uo pipefail',
+          // The refusal an operator has to read is on stderr, and this run is expected to SUCCEED,
+          // so runShell() would return stdout alone and the assertion would be about nothing.
+          'exec 2>&1',
+          entry.preamble(dir),
+          'error() { echo "ERROR: $*" >&2; }',
+          'DB_FENCE_RAISED=false',
+          CUTOVER_DIR_PRIMITIVES,
+          shellFunction(entry.source, 'fence_db_connections'),
+          shellFunction(entry.source, 'release_db_connections'),
+          'fence_db_connections',
+          'release_db_connections || echo "RELEASE REPORTED FAILURE"',
+          '[[ -e "${DB_FENCE_STATE}" ]] && echo AUTHORITY_REMAINS || echo AUTHORITY_CLEARED',
+        ].join('\n')
+        const result = runShell(program)
+
+        // THE PRECONDITIONS, so neither direction can pass on a run that did none of this.
+        assert.match(calls(dir), /^--witness --witness-nonce=[0-9a-f]{32} /m,
+          `the fence must open a witness before it revokes:\n${result.output}`)
+        assert.match(calls(dir), /^--fence .*--witness-lock=[0-9a-f]{32}/m,
+          `and tell --fence which lock to look for:\n${result.output}`)
+        assert.match(calls(dir), /^--release .*--witness-challenge=[0-9a-f]{32}/m,
+          `and the release must be given a challenge minted at release time:\n${result.output}`)
+        // AND THE CHALLENGE IS NOT THE FENCE'S OWN NONCE. A reused one would be a lock some earlier
+        // snapshot of the cluster could already contain, which is the property being bought here.
+        const fenceNonce = /--witness-lock=([0-9a-f]{32})/.exec(calls(dir))?.[1]
+        const challenge = /--witness-challenge=([0-9a-f]{32})/.exec(calls(dir))?.[1]
+        assert.ok(fenceNonce && challenge, `both nonces must reach the helper:\n${calls(dir)}`)
+        assert.notEqual(fenceNonce, challenge, 'the release challenge must be fresh, not the fence own nonce')
+
+        // MUTATION ROUTE: in the entrypoint's release, assign clear_server unconditionally instead
+        // of from `witness_colocated=yes` -- the 'no' case then prints AUTHORITY_CLEARED. Drop the
+        // third argument from the db_fence_clear_authority call -- the 'yes' case prints
+        // AUTHORITY_REMAINS, and the ordinary cutover starts asking a human on every deploy.
+        if (cleared) {
+          assert.match(result.output, /^AUTHORITY_CLEARED$/m,
+            `a release whose own connection saw the witness must end its own record with nobody at a terminal:\n${result.output}`)
+          assert.ok(!/RELEASE REPORTED FAILURE/.test(result.output),
+            `and the ordinary cutover must not report a failure:\n${result.output}`)
+        } else {
+          assert.match(result.output, /^AUTHORITY_REMAINS$/m,
+            `a release that could not see the witness may have landed on a copy, so the record must survive:\n${result.output}`)
+          assert.match(result.output, /RELEASE REPORTED FAILURE/,
+            `and the entrypoint must say so rather than reporting a clean release:\n${result.output}`)
+          assert.match(result.output, /deliberately NOT removed/,
+            `naming the record it kept and how to end it:\n${result.output}`)
+        }
+      } finally {
+        rmSync(dir, { recursive: true, force: true })
+      }
+    })
+  }
+}
+
+/**
+ * TAKING THE WITNESS DOWN MUST NOT TAKE THE ENTRYPOINT'S STDERR WITH IT (o3d-secops r31).
+ *
+ * This is a regression test for a defect this round INTRODUCED and then removed, and it is here
+ * because the defect was invisible in exactly the way that matters: `exec {fd}>&- 2>/dev/null` is a
+ * BARE `exec` with a redirection, so bash applies the `2>/dev/null` TO THE SHELL and keeps it. Every
+ * warning, refusal and `die` the entrypoint printed after its first witness teardown then went to
+ * /dev/null -- and a cutover's stderr is the only account an operator has of a fence that is
+ * standing, a record that was kept, or a migration that was refused. It surfaced as eight
+ * intermittent failures in this file, every one of them on a message about a FENCE, and not one of
+ * them naming the witness at all.
+ *
+ * MUTATION ROUTE (made against the shipped file and reverted): un-group either close in
+ * db_fence_witness_stop() -- `{ exec {fd}>&-; } 2>/dev/null` back to `exec {fd}>&- 2>/dev/null` --
+ * and the line after the teardown is not printed.
+ */
+test('[o3d-secops r31] taking the connection witness down leaves the shell able to speak', () => {
+  const FENCE_LIB = readFileSync(join(process.cwd(), 'scripts/lib/db-fence-protected.sh'), 'utf8')
+  const result = runShell([
+    'set -uo pipefail',
+    'exec 2>&1',
+    'db_fence_helper() { cat; }',
+    shellFunction(FENCE_LIB, 'db_fence_witness_nonce'),
+    shellFunction(FENCE_LIB, 'db_fence_witness_stop'),
+    'DB_FENCE_WITNESS_PID=""; DB_FENCE_WITNESS_NONCE=""; DB_FENCE_WITNESS_BOUND=0; DB_FENCE_WITNESS_CHALLENGE=""',
+    'echo "BEFORE" >&2',
+    // A REAL CO-PROCESS, so the fds are real and the teardown is the one that runs on every cutover.
+    'coproc DB_FENCE_WITNESS { db_fence_helper; }',
+    'db_fence_witness_stop',
+    'echo "AFTER ONE TEARDOWN" >&2',
+    // AND AGAIN WITH NOTHING THERE, which is the ordinary path: the fence calls it once on the way
+    // in and the release calls it again on the way out.
+    'db_fence_witness_stop',
+    'echo "AFTER A SECOND TEARDOWN" >&2',
+    'echo "AND STDOUT TOO"',
+  ].join('\n'))
+
+  assert.match(result.output, /^BEFORE$/m, `precondition: stderr reached the caller before any teardown:\n${result.output}`)
+  assert.match(result.output, /^AFTER ONE TEARDOWN$/m,
+    `a witness teardown must not silence the shell that performed it:\n${result.output}`)
+  assert.match(result.output, /^AFTER A SECOND TEARDOWN$/m,
+    `nor may the second one, which every release performs:\n${result.output}`)
+  assert.match(result.output, /^AND STDOUT TOO$/m, `and stdout must survive it as well:\n${result.output}`)
 })

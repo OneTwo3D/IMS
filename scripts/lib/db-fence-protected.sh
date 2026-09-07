@@ -1932,14 +1932,27 @@ db_fence_witness_nonce() {
 # a teardown that turns a lost witness into a lost deploy.
 db_fence_witness_stop() {
   local fd
-  if [[ -n "${DB_FENCE_WITNESS[1]:-}" ]]; then
-    printf 'close\n' >&"${DB_FENCE_WITNESS[1]}" 2>/dev/null || true
+  # IT CLOSES THE PIPE, IT DOES NOT WRITE DOWN IT (o3d-secops r31). Closing the write end is what
+  # the witness's stdin loop already ends on, and it CANNOT RAISE SIGPIPE. A `close` command sent
+  # here could: the reader is very often already gone by the time this runs -- a witness that
+  # refused to start is the ordinary case -- and bash does not ignore SIGPIPE, so the write killed
+  # the ENTIRE ENTRYPOINT with a signal. That was measured, by an existing r23 test failing with a
+  # null exit status the moment a witness could not start, and it is the worst possible shape for
+  # this mechanism: a deploy lost to a witness that was never load-bearing.
+  # THE CLOSES ARE GROUPED, AND THAT IS NOT COSMETIC (o3d-secops r31). `exec {fd}>&- 2>/dev/null`
+  # is a BARE `exec` WITH A REDIRECTION, so bash applies the `2>/dev/null` TO THE SHELL, PERMANENTLY:
+  # every warning, refusal and `die` the entrypoint printed after its first witness teardown went to
+  # /dev/null. It was measured -- eight tests in tests/scripts/deploy-order.test.ts failed
+  # intermittently, each of them on a message that had simply stopped existing, and each of them
+  # about a fence rather than about a witness. Wrapped in `{ ...; }` the suppression belongs to the
+  # group and is taken back at its closing brace, while the close itself is still the shell's.
+  if [[ "${DB_FENCE_WITNESS[1]:-}" =~ ^[0-9]+$ ]]; then
     fd="${DB_FENCE_WITNESS[1]}"
-    exec {fd}>&- 2>/dev/null || true
+    { exec {fd}>&-; } 2>/dev/null || true
   fi
-  if [[ -n "${DB_FENCE_WITNESS[0]:-}" ]]; then
+  if [[ "${DB_FENCE_WITNESS[0]:-}" =~ ^[0-9]+$ ]]; then
     fd="${DB_FENCE_WITNESS[0]}"
-    exec {fd}<&- 2>/dev/null || true
+    { exec {fd}<&-; } 2>/dev/null || true
   fi
   if [[ -n "${DB_FENCE_WITNESS_PID:-}" ]]; then
     kill "${DB_FENCE_WITNESS_PID}" 2>/dev/null || true
@@ -1973,7 +1986,17 @@ db_fence_witness_start() {
   coproc DB_FENCE_WITNESS { db_fence_helper "${fence_script}" --witness --witness-nonce="${nonce}" "$@"; }
   # `read` is given a deadline on every use here. A witness that never answers must cost this run
   # its automatic removal and nothing else; a blocking read would cost it the deploy.
-  while read -r -t 60 line <&"${DB_FENCE_WITNESS[0]:-0}" 2>/dev/null; do
+  # THE FALLBACK IS A REFUSAL, NOT A FILE DESCRIPTOR (o3d-secops r31). Bash UNSETS the coproc array
+  # the moment the co-process is reaped, so this name is routinely absent -- and a `:-0` default
+  # here would have this loop read THE ENTRYPOINT'S OWN STDIN, consuming whatever an operator was
+  # about to type at a confirmation prompt.
+  local ready_fd="${DB_FENCE_WITNESS[0]:-}"
+  if [[ ! "${ready_fd}" =~ ^[0-9]+$ ]]; then
+    echo "No connection witness for this run: the witness process could not be started at all. The fence is unaffected; its record will be kept at the end of the run for a person to end." >&2
+    db_fence_witness_stop
+    return 1
+  fi
+  while read -r -t 60 line <&"${ready_fd}" 2>/dev/null; do
     if [[ "${line}" == "WITNESS_READY ${nonce}" ]]; then
       DB_FENCE_WITNESS_NONCE="${nonce}"
       return 0
@@ -1994,12 +2017,24 @@ db_fence_witness_start() {
 db_fence_witness_challenge() {
   DB_FENCE_WITNESS_CHALLENGE=""
   [[ "${DB_FENCE_WITNESS_BOUND:-0}" -eq 1 ]] || return 1
-  [[ -n "${DB_FENCE_WITNESS[0]:-}" && -n "${DB_FENCE_WITNESS[1]:-}" ]] || return 1
+  # READ INTO PLAIN NAMES AND VALIDATED AS NUMBERS FIRST (o3d-secops r31). Bash unsets the coproc
+  # array when the co-process is reaped, and `set -u` is in force in all three entrypoints: a bare
+  # ${DB_FENCE_WITNESS[1]} between the guard and the write is a fatal shell error rather than a
+  # missing witness, which would turn "no automatic removal" into "no deploy".
+  local read_fd="${DB_FENCE_WITNESS[0]:-}" write_fd="${DB_FENCE_WITNESS[1]:-}"
+  [[ "${read_fd}" =~ ^[0-9]+$ && "${write_fd}" =~ ^[0-9]+$ ]] || return 1
   [[ -n "${DB_FENCE_WITNESS_PID:-}" ]] && kill -0 "${DB_FENCE_WITNESS_PID}" 2>/dev/null || return 1
-  local nonce line
+  local nonce line wrote=0
   nonce="$(db_fence_witness_nonce)" || return 1
-  printf 'challenge %s\n' "${nonce}" >&"${DB_FENCE_WITNESS[1]}" 2>/dev/null || return 1
-  while read -r -t 60 line <&"${DB_FENCE_WITNESS[0]}" 2>/dev/null; do
+  # AND SIGPIPE IS IGNORED ACROSS THE WRITE. `kill -0` above narrows the window and does not close
+  # it: the witness can die between that test and this line, and an unignored SIGPIPE would then
+  # kill the entrypoint outright. Nothing in these scripts traps PIPE, so this saves and restores
+  # nothing -- it turns the signal into the EPIPE that `|| wrote=1` is written for.
+  trap '' PIPE
+  printf 'challenge %s\n' "${nonce}" >&"${write_fd}" 2>/dev/null || wrote=1
+  trap - PIPE
+  [[ "${wrote}" -eq 0 ]] || return 1
+  while read -r -t 60 line <&"${read_fd}" 2>/dev/null; do
     if [[ "${line}" == "WITNESS_HELD ${nonce}" ]]; then
       DB_FENCE_WITNESS_CHALLENGE="${nonce}"
       return 0
