@@ -41,10 +41,6 @@ import { lockFollowUpScope } from '@/lib/domain/accounting/followup-scope-lock'
 import { attemptCouldHaveReachedTheLedger, effectiveTokenFor } from '@/lib/domain/accounting/followup-retry-guard'
 import { pinnedAttemptDate, settlementMarkerFor } from '@/lib/domain/accounting/ledger-settlement-evidence'
 import { probeLedgerSettlement } from '@/lib/connectors/accounting-settlement-probe'
-import {
-  readAccountingOriginRecord,
-  type AccountingConnectionStamp,
-} from '@/lib/connectors/accounting-connection-provenance'
 import { toDecimal, type Decimal } from '@/lib/domain/math/decimal'
 import {
   REGISTERED_AMOUNT_DECIMAL_FIELD,
@@ -85,23 +81,6 @@ export type InvoicePaymentSyncRow = PaymentSyncRow & {
   paymentDate: string | null
   /** False when the stored body was too incomplete for the connector to have made the call. */
   couldHaveReachedLedger: boolean
-  /**
-   * o3d-r948 r5 (Codex HIGH) — WHICH ACCOUNTING ORGANISATION THIS ROW WAS RAISED AGAINST.
-   *
-   * `connector` scopes the query to a ledger TYPE, and r4's exclusion-set note read that as
-   * scoping it to a ledger NAMESPACE. It does not. An operator can disconnect QuickBooks from
-   * realm A and reconnect to realm B, and every row raised against A stays in this table under the
-   * same `connector: 'quickbooks'` — so an `externalTransactionId` minted in A arrives here beside
-   * the rows of B, in a namespace where QuickBooks hands out short numeric ids that collide.
-   *
-   * Read through `readAccountingOriginRecord`, the one reader, which weighs the durable
-   * `connectionProvenance` column and the payload's `_connectionProvenance` stamp TOGETHER: the
-   * column alone would refuse every row queued before it shipped, the payload alone would answer
-   * nothing for a retention-compacted tombstone, and a disagreement between the two is undecidable.
-   * Four states, never flattened here — the decision that reads this is the one entitled to say
-   * what each of them permits.
-   */
-  origin: AccountingConnectionStamp
 }
 
 export async function loadInvoicePaymentSyncRows(
@@ -139,13 +118,11 @@ export async function loadInvoicePaymentSyncRows(
       // PaymentSyncRow, so dropping it in this move would have been a silent regression rather than
       // a type error.
       settlementBasis: true,
-      // o3d-r948 r5: the two durable halves of this row's ORIGIN. BOTH, never one — see
-      // `readAccountingOriginRecord`, and see `InvoicePaymentSyncRow.origin` for what the exclusion
-      // set does with the answer. `backReferenceEvidenceCompactedAt` is not decoration here: it is
-      // the only fact separating "retention emptied this payload" from "somebody rewrote it", and
-      // only the first of those lets the column speak for a payload it can no longer be checked against.
-      connectionProvenance: true,
-      backReferenceEvidenceCompactedAt: true,
+      // o3d-r948 r6: `connectionProvenance` and `backReferenceEvidenceCompactedAt` were selected
+      // here for r5's exclusion scoping and are not any more — nothing excludes a settlement record
+      // on any identity now, so no consumer of these rows needs to know which organisation each was
+      // raised against. See the note at the `classifyLedgerSettlement` call in
+      // invoice-payment-registration.ts, and bd o3d-hold1 for what a sound version would need.
     },
     orderBy: { createdAt: 'desc' },
   })
@@ -179,13 +156,6 @@ export async function loadInvoicePaymentSyncRows(
       settlementMarker: connector === 'xero' || connector === 'quickbooks'
         ? settlementMarkerFor(effectiveTokenFor(connector, { id: r.id, payload: r.payload }))
         : null,
-      // o3d-r948 r5 (Codex HIGH): ...and WHICH ORGANISATION it was raised against, through the one
-      // reader that weighs the column and the payload together. See `InvoicePaymentSyncRow.origin`.
-      origin: readAccountingOriginRecord({
-        payload: r.payload,
-        connectionProvenance: r.connectionProvenance,
-        backReferenceEvidenceCompactedAt: r.backReferenceEvidenceCompactedAt,
-      }),
     }
   })
 }
@@ -1355,11 +1325,12 @@ export async function registerInvoicePaymentWithLedger(params: {
     //
     // Conditional on purpose: this is a network read, and the ordinary receipt has no history to check.
     const probeConnector = connectorId
-    // o3d-r948 r5 (Codex HIGH): the records AND the organisation that produced them, carried
-    // together because the decision's exclusion set is only sound when the two sides name the same
-    // realm. Read as one value so they cannot be plumbed apart — a caller holding records with the
-    // provenance dropped would silently be back to comparing across namespaces.
-    const ledgerProbe = accountingInvoiceId
+    // o3d-r948 r6: the records, and nothing beside them. r5 carried the probe's organisation here
+    // too, so the decision's exclusion set could be scoped to the realm that answered; that
+    // exclusion is gone (see invoice-payment-registration.ts), and the provenance it needed was
+    // itself unsound — two token snapshots either side of the fetch cannot see a reconnect across
+    // it.
+    const ledgerSettlements = accountingInvoiceId
       && probeConnector
       && unresolvedInvoicePaymentAttempts(existing, params.paymentId).length > 0
       ? await (async () => {
@@ -1368,12 +1339,9 @@ export async function registerInvoicePaymentWithLedger(params: {
           payload: { accountingInvoiceId },
         })
         // A probe that could not answer stays null, which the decision reads as "refuse".
-        return probe.ok
-          ? { records: probe.records, connectionProvenance: probe.connectionProvenance ?? null }
-          : null
+        return probe.ok ? probe.records : null
       })()
       : null
-    const ledgerSettlements = ledgerProbe?.records ?? null
 
     // Hoisted so the re-check under the order lock re-runs the IDENTICAL decision with only `existing`
     // refreshed — anything else diverging between the two would make the second a different guard.
@@ -1396,11 +1364,6 @@ export async function registerInvoicePaymentWithLedger(params: {
         : null,
       existing,
       ledgerSettlements,
-      // o3d-r948 r5: hoisted with the rest, so the re-check under the order lock scopes the
-      // exclusion to the SAME realm this probe answered from. Re-reading it there would be a second
-      // network call inside the lock, and a second answer that could disagree with the records it
-      // is supposed to describe.
-      ledgerConnectionProvenance: ledgerProbe?.connectionProvenance ?? null,
       ledgerTotal: ledgerSalesInvoiceTotalForeign({
         // o3d-6abj: the stored `Decimal`s. `Number(so.totalForeign)` was the enqueue half of the
         // same collapse Codex found at the post site.

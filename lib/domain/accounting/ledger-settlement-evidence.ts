@@ -91,21 +91,19 @@ export type LedgerSettlementProbe =
       ok: true
       records: LedgerSettlementRecord[]
       /**
-       * o3d-r948 r5 (Codex HIGH) — WHICH ORGANISATION ANSWERED, as `"<connector>:<tenantId>"`.
+       * o3d-r948 r6 — `connectionProvenance` WAS HERE, AND IS GONE WITH THE EXCLUSION IT SCOPED.
        *
-       * The records above are ids in ONE ledger's namespace, and nothing in a record says which.
-       * `settlementsOfOtherAttempts` below is the one input that can REMOVE a record from a match,
-       * and a caller can only show that an id it holds names one of THESE records if it knows what
-       * organisation these came from — so the probe has to say. Without it "connector" is the only
-       * shared fact between the two sides, and a connector name is a TYPE, not a tenant: after a
-       * reconnect to a different company an id minted in the old one is still a `quickbooks:` id.
+       * r5 added it so a caller could show that an id it held named one of THESE records rather
+       * than an identically-spelt id in another organisation. It was derived by reading the active
+       * token either side of the remote call and answering null when the two disagreed — which
+       * cannot see an A→B→A reconnect ACROSS the call, because reading one value twice says nothing
+       * about the interval between. Nothing excludes a record any more, so no caller needs the
+       * answer, and leaving an unsound provenance on a probe result is an invitation to reuse it.
        *
-       * OPTIONAL, and the option is not laziness. Every construction of this type that does not go
-       * through `probeLedgerSettlement` — every test fixture, every future caller — leaves it
-       * undefined, and undefined means UNKNOWN, which grants no exclusion at all. So the cost of
-       * forgetting it is a refusal, never a permission.
+       * A sound replacement is request-bound, not snapshot-bound: `XeroResponse` already carries the
+       * `tenantId` its request went out under, and QuickBooks resolves a `realmId` per request that
+       * `QboResponse` currently discards. bd o3d-hold1 carries that design.
        */
-      connectionProvenance?: string | null
     }
   | { ok: false; reason: string }
 
@@ -388,56 +386,69 @@ export function formatLedgerMoney(value: Decimal): string {
 const money = formatLedgerMoney
 
 /**
- * o3d-r948 r3 (Codex HIGH) — WHAT THE CALLER KNOWS THAT THE RECORD ITSELF CANNOT SAY.
+ * o3d-r948 r6 — `LedgerSettlementOptions` / `settlementsOfOtherAttempts` WAS HERE, AND IS GONE.
  *
- * A settlement record carries an id the ledger assigned and cannot change, and that id says nothing
- * about WHOSE attempt made it. The fact that turns it into an identity is held by IMS, not by the
- * connector: `AccountingSyncLog.externalTransactionId` is the settlement id a completed money post
- * returned, so the rows for a document name the settlements those rows created.
+ * Four rounds built it and a fifth removed it. It is recorded here rather than deleted silently
+ * because the hole it was filling is still open (bd o3d-hold1), and the next person to meet that
+ * hole will reach for exactly this shape again.
  *
- * A caller that holds those rows may hand over the ids belonging to attempts OTHER THAN the one
- * being judged, and a record carrying one of them is excluded from the match — see the loop in
- * `classifyLedgerSettlement` for why nothing weaker may exclude anything.
+ * WHAT IT WAS. `classifyLedgerSettlement` withholds on a settlement it cannot measure — an amount it
+ * will not read, or a date it cannot normalise — because an unmeasurable record cannot be ruled out
+ * as this attempt by anything the record itself says. When that record belongs to a DIFFERENT row
+ * that already posted, the withhold is PERMANENT: no later event can make the ledger's figure
+ * readable, so every future receipt on that order is refused for good. The option let a caller hand
+ * over the ledger ids IMS had already recorded against its OTHER rows, and a record carrying one of
+ * them was skipped — a record created by another attempt is not this one, whatever has since been
+ * done to its amount or its date.
  *
- * THE ATTEMPT'S OWN RECORDED ID MUST NEVER BE IN HERE. It names the settlement this very attempt
- * created; excluding it would skip the one record that proves the post already happened, which is
- * the exact `clear` this whole module exists to prevent. Callers build the set by removing the
- * attempt under judgement from the rows they hold, by identity, not by any field.
+ * THE ARGUMENT WAS SOUND ABOUT THE LEDGER'S HALF AND NEVER BECAME SOUND ABOUT OURS. The ledger
+ * assigns the id and cannot re-assign it; that half held up under every round. The other half —
+ * "and OUR row is the one that obtained it" — is a claim this system makes about itself, and each
+ * round found another way for it to be false:
  *
- * o3d-r948 r4 (Codex HIGH) — AND NEITHER MAY AN ID THIS SYSTEM ONLY ASSERTS.
+ *   r3  the option is introduced: only an IMMUTABLE id may exclude, never a mutable amount or date.
+ *   r4  an `OPERATOR_ASSERTION` row's id is a human typing into a form with no call made, so the
+ *       caller must filter on `isOperatorAssertedSettlement`.
+ *   r5  `connector` scopes a query to a ledger TYPE, not a NAMESPACE: after a QuickBooks reconnect,
+ *       realm A's `123` and realm B's `123` are two payments spelt the same. The caller must
+ *       compare the row's recorded origin against the organisation the probe answered from.
+ *   r6  BOTH REMAINING GAPS ARE MISSING EVIDENCE, NOT LOOSE REASONING, and neither can be recorded
+ *       from inside this branch:
  *
- * The paragraphs above establish that the LEDGER cannot re-assign an id, and stop one step short:
- * the sentence "the rows for a document name the settlements those rows created" is a claim OUR
- * table makes, and it is not evidence on every row. A row whose `settlementBasis` is
- * `OPERATOR_ASSERTION` holds an id a human typed into a form — no call made, no document read (see
- * lib/domain/accounting/sync-row-settlement.ts) — so it can name a payment it never created,
- * including the one the attempt under judgement is being matched against.
+ *       • THE ORIGIN IS STAMPED AT ENQUEUE AND THE ID IS MINTED AT POST. A row queued against realm
+ *         A can post after a reconnect to B, take B's id, and keep its A origin. QuickBooks has no
+ *         post-time realm enforcement at all (o3d-8prh, OPEN — see the block at
+ *         lib/connectors/quickbooks/sync-processor.ts, which says in terms that nothing downstream
+ *         of it is safe first), and `QboResponse` does not even carry the `realmId` it resolved, so
+ *         there is no issuer to record on that path today.
+ *       • TWO TOKEN SNAPSHOTS EITHER SIDE OF A REMOTE CALL CANNOT DEFEAT ABA. An A→B→A reconnect
+ *         across the fetch makes both reads say A while B served it. Reading one value twice says
+ *         nothing about the interval between.
  *
- * This option is the only input to this module that REMOVES evidence, so every id in it must trace
- * back to connector evidence and not merely to a row: a caller filters out
- * `isOperatorAssertedSettlement(row.settlementBasis)` as well as the attempt itself. `OPERATOR_RELEASE`
- * is NOT filtered — that basis records an operator-reached STATUS over a connector-issued id, and
- * the predicate is false for it by design.
+ * WHY IT WAS NOT NARROWED A FIFTH TIME. Closing either gap means RECORDING A FACT NOTHING RECORDS
+ * TODAY — the issuer of each `externalTransactionId`, and a connection epoch read with the fetch —
+ * and the repository's own rules make both unbackfillable: an origin "there is no in-database way to
+ * recover ... so nothing may be back-filled" (see 20260822090000's migration note and
+ * `readAccountingOriginRecord`). Every row that already carries an id would answer "issuer unknown"
+ * for ever, so the exclusion would grant nothing at all to the population it was built to release —
+ * while remaining a live duplicate-payment surface for everything posted after it.
+ *
+ * ITS FAILURE MODE DECIDED IT. A withheld payment is visible and remediable; a duplicate payment on
+ * a customer's or supplier's ledger is neither.
+ *
+ * SO EVERY CALLER NOW WITHHOLDS, and there is no parameter to pass. That is what the three callers
+ * that never had a set to give already did (`followup-retry-guard`, the probe's revival gate,
+ * `resolveSettledRow`), and the note that used to sit at the revival gate — "it excludes nothing,
+ * and that is the cost of the rule rather than a gap in it" — is now simply the rule.
+ *
+ * WHAT A SOUND VERSION WOULD REQUIRE, if anyone comes back to it: bd o3d-hold1 carries the whole
+ * estimate. It is a new write-once-on-post column plus its own trigger (the existing
+ * `connection_provenance` trigger CLEARS on UPDATE, and an issuer is written by the post-time
+ * UPDATE, so that shape cannot be reused), issuer capture at every id-writing path in both
+ * connectors, a `QboResponse` that carries its realm, o3d-8prh landed first, and a per-connector
+ * reconnect epoch — `AccountingToken.connectionGeneration` exists but is minted by Xero's OAuth
+ * callback only and is NULL for every QuickBooks row.
  */
-export type LedgerSettlementOptions = {
-  /**
-   * Ledger settlement ids IMS has already recorded against attempts that are NOT the one being
-   * judged, AND that the connector itself issued — never one an operator asserted. Nulls and blanks
-   * are ignored, and the comparison is case-folded because a ledger GUID is returned in whatever
-   * case the connector feels like.
-   */
-  settlementsOfOtherAttempts?: Iterable<string | null | undefined>
-}
-
-function foldedIdentitySet(ids: Iterable<string | null | undefined> | undefined): ReadonlySet<string> {
-  const folded = new Set<string>()
-  for (const id of ids ?? []) {
-    if (typeof id !== 'string') continue
-    const key = id.trim().toLowerCase()
-    if (key) folded.add(key)
-  }
-  return folded
-}
 
 /**
  * Decide what the ledger says about ONE attempt. Pure: the probe's I/O is the caller's problem, so
@@ -446,7 +457,6 @@ function foldedIdentitySet(ids: Iterable<string | null | undefined> | undefined)
 export function classifyLedgerSettlement(
   attempt: AttemptDescription,
   probe: LedgerSettlementProbe,
-  options?: LedgerSettlementOptions,
 ): SettlementVerdict {
   if (!probe.ok) {
     return {
@@ -533,12 +543,11 @@ export function classifyLedgerSettlement(
   // unmeasurable record withholds. That is the honest answer rather than a degraded one: the cost of
   // holding a genuine payment back is a visible refusal, and the cost of the alternative is a second
   // payment.
-  const excluded = foldedIdentitySet(options?.settlementsOfOtherAttempts)
+  // o3d-r948 r6 — NOTHING SKIPS A RECORD ANY MORE. Every record the probe returned is measured,
+  // and one this code cannot measure withholds. The identity exclusion that used to `continue` here
+  // is gone; see the note above `classifyLedgerSettlement` for the four rounds that narrowed it and
+  // the two pieces of evidence it turned out to need and never had.
   for (const record of probe.records) {
-    // The identity test, and the ONLY thing in this loop allowed to reach `continue` before the
-    // record has been measured. Folded, because a ledger GUID comes back in whatever case it feels
-    // like and `4D8A…` is the same payment as `4d8a…`.
-    if (typeof record.id === 'string' && excluded.has(record.id.trim().toLowerCase())) continue
     if (record.amount === null || record.date === null) {
       return {
         outcome: 'unknown',

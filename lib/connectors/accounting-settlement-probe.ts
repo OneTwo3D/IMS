@@ -704,38 +704,20 @@ export async function probeLedgerSettlement(
   connector: 'xero' | 'quickbooks',
   target: SettlementProbeTarget,
 ): Promise<LedgerSettlementProbe> {
-  // o3d-r948 r5 (Codex HIGH) — WHICH ORGANISATION IS ANSWERING, READ EITHER SIDE OF THE READ.
+  // o3d-r948 r6 — THE TWO-SNAPSHOT PROVENANCE READ WAS HERE, AND IS GONE.
   //
-  // The records this returns are ids in one ledger's namespace, and the caller's exclusion set is
-  // only sound if it is comparing against the SAME organisation (see `LedgerSettlementProbe`).
-  // There is no way to ask the connectors' fetchers which tenant they used, so this reads the
-  // active token instead — and reads it TWICE, because a single read is a claim about a moment and
-  // the fetch is a different moment. An operator disconnecting and reconnecting to another company
-  // across this call would otherwise have us label realm A's records with realm B's name, which is
-  // the failure this whole change exists to stop, arriving one layer up.
+  // r5 read the active token before and after the fetch and reported the value when the two agreed,
+  // so a caller could tell whether the ids it held belonged to the organisation that answered. Two
+  // reads of one value prove nothing about the interval between them: an A→B→A reconnect across the
+  // remote call makes both say A while B served it, and the records would then be labelled A.
   //
-  // Disagreement answers NULL rather than either value: "the connection moved while I was reading
-  // it" is precisely a state in which nothing may be excluded, and null is what withholds.
-  //
-  // ITS OWN try/catch, AND THAT IS THE WHOLE POINT OF IT BEING SEPARATE. This is
-  // EVIDENCE-GATHERING ABOUT the probe, not part of the probe's answer. Inside the outer catch, a
-  // database hiccup on the token row — the row this reads is not the ledger and not on the ledger's
-  // path — turned a perfectly good reading of the document into `ok: false`, i.e. "the accounting
-  // connector could not be asked what it already holds", which REFUSES every money post behind it.
-  // A guard that converts an unrelated fault into a blanket refusal of an unrelated question is a
-  // new failure mode, not a stricter version of an old one. Failing to learn the organisation
-  // degrades to NULL, which excludes nothing and leaves the records intact.
-  const readConnection = async (): Promise<string | null> => {
-    try {
-      const { activeAccountingIdProvenance } = await import('./accounting-id-provenance')
-      return await activeAccountingIdProvenance(connector)
-    } catch {
-      return null
-    }
-  }
+  // Nothing consumes the answer now — `classifyLedgerSettlement` excludes no record on any identity
+  // — so the unsound reading is removed rather than left standing beside a caller that might trust
+  // it. A sound version is REQUEST-BOUND, not snapshot-bound: propagate the `tenantId` `XeroResponse`
+  // already carries and the `realmId` `qboFetch` resolves and drops, and refuse a multi-fetch probe
+  // whose responses disagree. bd o3d-hold1 has the estimate.
   try {
-    const before = await readConnection()
-    const probe = connector === 'xero'
+    return connector === 'xero'
       ? await (async () => {
         const { xeroGet } = await import('./xero/api')
         return await probeXeroSettlement(target, xeroGet as XeroFetcher)
@@ -744,13 +726,6 @@ export async function probeLedgerSettlement(
         const { qboGet } = await import('./quickbooks/api')
         return await probeQuickBooksSettlement(target, qboGet as QboFetcher)
       })()
-    if (!probe.ok) return probe
-    const after = await readConnection()
-    // Two NULLS agree, and the answer is still null: "nothing is connected" cannot vouch for an id,
-    // so no `before !== null` guard is needed here — it would be dead. What the null must not do is
-    // MATCH a row that also records nothing, and that is guaranteed on the decision side, where
-    // `accountingIdProvenanceMatches` is false whenever the active provenance is null.
-    return { ...probe, connectionProvenance: before === after ? before : null }
   } catch (e) {
     return { ok: false, reason: e instanceof Error ? e.message : String(e) }
   }
@@ -760,7 +735,7 @@ export async function probeLedgerSettlement(
  * The document a probe answers about, so several rows targeting the same one share a single read.
  *
  * Delegates to the SAME key the money-post lock is taken on (round 6, Codex CRITICAL #2): the
- * document the exclusion covers and the document the probe reads must not be able to be two
+ * document the verdict covers and the document the probe reads must not be able to be two
  * different things.
  */
 export function settlementProbeKey(target: SettlementProbeTarget): string {
@@ -794,16 +769,14 @@ export async function ledgerClearsFollowUpRevival(params: {
   const { classifyLedgerSettlement, describeAttempt, settlementMarkerFor } = await import('@/lib/domain/accounting/ledger-settlement-evidence')
   const probe = await probeLedgerSettlement(params.connector, { type: params.type, payload: params.payload })
   const marker = settlementMarkerFor(effectiveTokenFor(params.connector, { id: params.syncLogId ?? '', payload: params.payload }))
-  // o3d-r948 r3 — AND NO `settlementsOfOtherAttempts`, STATED RATHER THAN OMITTED.
+  // o3d-r948 r6 — AN UNMEASURABLE SETTLEMENT HOLDS THIS REVIVAL BACK, AND NOW THAT IS THE ONLY RULE.
   //
-  // `classifyLedgerSettlement` will exclude a record whose IMMUTABLE ledger id IMS has already
-  // recorded against a different attempt, and that is the only exclusion it accepts: an amount or a
-  // date that differs is editable in both ledgers and so proves nothing (see the loop's own note).
-  // This function is handed ONE row and no siblings, so it holds no such ids — it would have to run
-  // its own query for them, and it has no database. It therefore excludes nothing, and an
-  // unmeasurable settlement on the document holds this revival back. That is the cost of the rule
-  // rather than a gap in it: the alternative available here is a mutable field, and a mutable field
-  // may only ever move a verdict towards withholding.
+  // r3 to r5 this gate carried a note explaining why it passed no `settlementsOfOtherAttempts`: it
+  // is handed ONE row and no siblings, so it held no ids to exclude with, and it accepted the
+  // resulting hold as the cost of the rule rather than a gap in it. r6 removed the option outright
+  // (see `classifyLedgerSettlement`), so every caller is now in the position this one was always in
+  // — and the note is kept only so the next reader knows the omission here was deliberate before it
+  // was mandatory.
   const verdict = classifyLedgerSettlement(describeAttempt(params.type, params.payload, marker), probe)
   if (verdict.outcome === 'clear') return { clear: true }
   return {

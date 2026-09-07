@@ -23,8 +23,6 @@ import {
   type ExactAmountReading,
 } from '@/lib/domain/accounting/registered-amount'
 import { isOperatorAssertedSettlement } from './sync-row-settlement'
-import { accountingIdProvenanceMatches } from '@/lib/connectors/accounting-id-provenance'
-import type { AccountingConnectionStamp } from '@/lib/connectors/accounting-connection-provenance'
 import {
   addMoney,
   compareDecimal,
@@ -143,61 +141,6 @@ export type ExistingInvoicePaymentSync = {
    * the payment an operator has to go and read (o3d-anu8).
    */
   externalTransactionId?: string | null
-  /**
-   * o3d-r948 r5 (Codex HIGH) — WHICH ACCOUNTING ORGANISATION THIS ROW WAS RAISED AGAINST, as
-   * `readAccountingOriginRecord` reads it from the row's durable column AND its payload stamp.
-   *
-   * `loadInvoicePaymentSyncRows` fills it on every row. It is OPTIONAL here for the same reason
-   * every other field on this type is: a caller that cannot supply it passes nothing, and absent
-   * is UNKNOWN — which grants no exclusion below. The cost of an unplumbed caller is therefore a
-   * refusal, not a permission, which is the only direction a money guard may default in.
-   *
-   * The four-state stamp is kept whole rather than flattened to a string, because "raised while
-   * nothing was connected", "queued before the stamp shipped" and "the two halves disagree" are
-   * three different sentences to an operator, and collapsing them is the defect
-   * `readAccountingOriginRecord` was written to remove. Only `stamped` can ever match.
-   */
-  origin?: AccountingConnectionStamp
-}
-
-/**
- * o3d-r948 r5 (Codex HIGH) — IS THIS ROW'S RECORDED ID AN ID IN THE LEDGER THE PROBE JUST READ?
- *
- * BOTH SIDES, OR NEITHER. Excluding a probe record because some row of ours names its id is only
- * sound when that row was raised against the SAME organisation the probe answered from — so this
- * takes both, and a missing answer on EITHER side excludes nothing. Scoping only the row would
- * compare a realm-stamped id against records of unknown origin, which is a different unproved
- * claim, not half of a proof.
- *
- * `accountingIdProvenanceMatches` is the repository's one comparison of two provenance strings, not
- * a second spelling of it here — the same reason `isOperatorAssertedSettlement` is used above rather
- * than a fresh basis test. It requires an exact match and treats null on either side as no match.
- *
- * WHAT COUNTS AS UNKNOWN, and every one of them refuses:
- *
- *   • `absent`   — the row predates the stamp, or the probe's caller does not plumb the provenance.
- *   • `unreadable` — the payload and the column describe two different moments, or something we do
- *     not recognise wrote one of them. "I cannot tell" is never "the same" (the rule
- *     `accountingOriginRecordsMatch` already states).
- *   • `raised-disconnected` — the row was raised while nothing was connected, so nothing can vouch
- *     for the id it carries at all. Flattened to a sentinel that cannot equal any real provenance.
- *
- * THE COST IS PAID IN THE SAFE DIRECTION AND IT IS REAL. Every INVOICE_PAYMENT row queued before
- * `_connectionProvenance` shipped answers `absent`, so it can no longer release a sibling's
- * unmeasurable settlement, and a receipt behind one is refused with UNRESOLVED_PAYMENT_ATTEMPT —
- * visibly, with a nameable remedy. That is the same trade `classifyLedgerSettlement` already states
- * for a caller that can supply no set at all: "the cost of holding a genuine payment back is a
- * visible refusal, and the cost of the alternative is a second payment."
- */
-export function excludingRowIsFromTheProbedLedger(
-  origin: AccountingConnectionStamp | undefined,
-  probedConnectionProvenance: string | null | undefined,
-): boolean {
-  const probed = typeof probedConnectionProvenance === 'string' ? probedConnectionProvenance.trim() : ''
-  return accountingIdProvenanceMatches(
-    origin?.state === 'stamped' ? origin.provenance : null,
-    probed === '' ? null : probed,
-  )
 }
 
 /**
@@ -308,20 +251,6 @@ export function decideInvoicePaymentRegistration(input: {
    */
   ledgerSettlements: LedgerSettlementRecord[] | null
   /**
-   * o3d-r948 r5 (Codex HIGH) — THE ORGANISATION THOSE SETTLEMENTS CAME FROM, as
-   * `"<connector>:<tenantId>"`, straight off the probe (`LedgerSettlementProbe.connectionProvenance`).
-   *
-   * The OTHER half of the scoping, and it is not optional to the argument even though it is optional
-   * to the type. `ledgerSettlements` is a list of ids in ONE ledger's namespace and says nowhere
-   * which; without knowing that, "a row of ours records this id" cannot establish that the row and
-   * the record are the same object, only that two namespaces used the same string.
-   *
-   * NULL / ABSENT = the probe could not say which organisation answered — including the case where
-   * the connection MOVED across the read, which `probeLedgerSettlement` deliberately reports as
-   * null. Nothing is then excluded, and every unmeasurable record withholds.
-   */
-  ledgerConnectionProvenance?: string | null
-  /**
    * What the ledger's copy of the invoice was built at (see ledgerSalesInvoiceTotalForeign), as the
    * stored `Decimal` (o3d-6abj). `Number(order.totalForeign)` is one of the two operands Codex's
    * reproduction collapses; the other is the sum below.
@@ -397,119 +326,43 @@ export function decideInvoicePaymentRegistration(input: {
           marker: attempt.settlementMarker ?? null,
         },
         { ok: true, records: input.ledgerSettlements },
-        // o3d-r948 r3 (Codex HIGH) — THE ONE EXCLUSION THAT IS NOT A MUTABLE FIELD.
+        // o3d-r948 r6 — THE EXCLUSION SET WAS THE THIRD ARGUMENT HERE, AND IS GONE.
         //
-        // A settlement the ledger holds may be unmeasurable — an amount this code will not read, or a
-        // date it cannot normalise — and `classifyLedgerSettlement` then withholds on it, correctly,
-        // because an unmeasurable record cannot be ruled out as this attempt by anything the record
-        // itself says. That is a permanent hold when the record belongs to a DIFFERENT row that
-        // already posted: `unresolvedInvoicePaymentAttempts` only judges FAILED and CANCELLED rows,
-        // so a SYNCED row's payment is never matched to its own attempt here — it can only ever
-        // block, and it blocks every future receipt on this order for good.
+        // WHAT IT DID AND WHY IT WAS BUILT. `classifyLedgerSettlement` withholds on a settlement it
+        // cannot measure, and when that settlement belongs to a DIFFERENT row that already posted
+        // the withhold is PERMANENT: `unresolvedInvoicePaymentAttempts` judges only FAILED and
+        // CANCELLED rows, so a SYNCED row's payment is never matched to its own attempt here — it
+        // can only block, and it blocks every future receipt on the order for good. The set handed
+        // over the ledger ids IMS had recorded against this order's OTHER rows so those records
+        // could be skipped, and the permanent hold lifted.
         //
-        // What clears it is the only fact strong enough to: IMS RECORDED that settlement's own id
-        // when that other row posted it. `externalTransactionId` is the ledger's `PaymentID` /
-        // `Payment.Id`, which the ledger assigns and cannot re-assign, so a record carrying it was
-        // created by that row and not by this attempt — whatever has since been done to its amount,
-        // its date or its reference.
+        // WHY IT IS NOT HERE ANY MORE. Four rounds narrowed it — immutable ids only (r3), never an
+        // operator-asserted id (r4), and only from a row raised against the organisation the probe
+        // answered from (r5) — and the fifth found two gaps that are not looseness in the reasoning
+        // but FACTS NOTHING IN THIS SYSTEM RECORDS:
         //
-        // BY REFERENCE, NOT BY A FIELD. `unresolved` is a filtered view of `input.existing`, so the
-        // row under judgement is the same object; removing it by identity is what guarantees this
-        // attempt's OWN recorded settlement is never excluded from its own match. Excluding that one
-        // would skip the record that proves this attempt already posted, which is precisely the
-        // `clear` this module exists to prevent.
+        //   • `row.origin` is stamped at ENQUEUE and `externalTransactionId` is minted at POST. A
+        //     reconnect between them detaches one from the other, and on QuickBooks nothing stops
+        //     it: that connector has no post-time realm enforcement at all (o3d-8prh, OPEN), and
+        //     `QboResponse` discards the `realmId` its own request resolved, so there is no issuer
+        //     to record even if this branch wanted to.
+        //   • The probe's organisation was read from two token snapshots either side of the fetch,
+        //     which cannot see an A→B→A reconnect across it.
         //
-        // o3d-r948 r4 (Codex HIGH) — AND OUR OWN RECORD IS NOT ALWAYS EVIDENCE.
+        // AND A THIRD, FOUND WHILE WEIGHING THOSE TWO, WHICH SHOWS THE SHAPE IS NOT QUICKBOOKS-ONLY:
+        // `buildAssertedReversalData` (payment-ledger-hold.ts, called from app/actions/sales.ts)
+        // writes an operator-supplied `externalTransactionId` onto an undecided row and leaves
+        // `settlementBasis` NULL — so r4's `isOperatorAssertedSettlement` filter reads it as
+        // connector-backed. That id IS verified against the ledger by a live read, but against
+        // whatever tenant is connected at VERIFICATION time, while the row's origin still names
+        // enqueue time. Same detachment, a Xero door, and one that landing o3d-8prh would not shut.
         //
-        // The paragraph above is right about the LEDGER's half and stopped one step short on OURS.
-        // The id is immutable and the ledger cannot re-assign it, so a record carrying it was made
-        // by whoever really obtained it — but "that row obtained it" is a claim this table makes,
-        // and on an `OPERATOR_ASSERTION` row that claim is a human typing a document id into a form
-        // with no call made and no document read (see sync-row-settlement.ts, which defines the
-        // basis as exactly that). An asserted row can therefore name a payment it never created,
-        // and this is the one site on the branch where naming one REMOVES evidence rather than
-        // adding a refusal. So the chain of custody has to run back to CONNECTOR EVIDENCE, not
-        // merely to a row in our own table.
-        //
-        // THE REACHABLE SHAPE, and it is reachable precisely because every other gate lets it past.
-        // An asserted SYNCED row that names the RETIRED invoice and a DIFFERENT receipt is dropped
-        // by `retiredDocumentInvoicePaymentAttempts` (its `paymentId` is neither null nor this
-        // receipt's), dropped by the `live` document filter (it names another document) and so never
-        // reaches the LEDGER_AMOUNT_ASSERTED gate that reads that filter's output. The exclusion set
-        // was the only place it was still consulted — and there it did the one thing an unverified
-        // claim must never do: if the typed id happens to equal the id of the unresolved attempt's
-        // OWN unmeasurable settlement, the record proving that attempt posted is skipped, the verdict
-        // is `clear`, and the receipt registers a second payment.
-        //
-        // FILTERED THROUGH THE MODULE'S OWN PREDICATE, not a second spelling of it:
-        // `isOperatorAssertedSettlement` is the same reader `settlement-status.ts`, the delete guard
-        // and the capacity guard below already fail closed on, and reconciliation.ts already uses to
-        // deny an asserted row the standing of evidence.
-        //
-        // WHAT STILL COUNTS AS CONNECTOR-BACKED, deliberately, because narrowing this further would
-        // strand the receipts the exclusion exists to release:
-        //
-        //   • `CONNECTOR_CONFIRMED` (the NULL basis) — the processor's own writeback, made after the
-        //     ledger answered with the id. This is the ordinary case and the whole point.
-        //   • `OPERATOR_RELEASE` — the row's STATUS was reached by a human, but its DOCUMENT ID is
-        //     the connector's own: `describeCancelledSaleRelease` refuses an asserted row outright,
-        //     so that basis can only ever sit on connector-issued evidence. `isOperatorAssertedSettlement`
-        //     is FALSE for it by design, and using the predicate rather than "basis is not null" is
-        //     what preserves it. Folding it in would re-strand every released row's siblings.
-        // o3d-r948 r5 (Codex HIGH) — AND A CONNECTOR IS NOT A NAMESPACE.
-        //
-        // r4's note ended by clearing the last question with the wrong answer, and the answer was
-        // wrong in the permissive direction:
-        //
-        //     "THE CONNECTOR ITSELF is already pinned upstream... every row in `input.existing` was
-        //      written for the same ledger the probe read — the ids cannot come from another
-        //      connector's namespace. There is no per-realm `provenance` column to check beyond
-        //      that: that work was tried and REVERTED (o3d-gt8r / o3d-s36z), and the schema comment
-        //      on `backReferenceEvidenceCompactedAt` records it."
-        //
-        // BOTH SENTENCES ARE FALSE, and the second is the reason the first went unchecked.
-        // `loadInvoicePaymentSyncRows` filters on `connector`, which is `'quickbooks'` — a ledger
-        // TYPE. An operator can disconnect from realm A and reconnect to realm B, and every row
-        // raised against A stays in this table under that same string. QuickBooks mints short
-        // numeric payment ids, so A's `123` and B's `123` are two different payments spelt the same.
-        // A confirmed A row recording `123`, against a receipt and a document that make it invisible
-        // to the retired-document gate and the `live` filter alike, then excludes B's OWN record
-        // `123` — the unresolved attempt's unmeasurable settlement is skipped, the verdict is
-        // `clear`, and a second payment posts. That is precisely the route r4's own test walks.
-        //
-        // AND THE COLUMN EXISTS. `AccountingSyncLog.connectionProvenance` (o3d-dzip) holds
-        // `"<connector>:<tenantId>"` in a place retention cannot reach, beside the payload stamp
-        // o3d-s36z writes, and `readAccountingOriginRecord` is the reader that weighs the two. What
-        // o3d-gt8r / o3d-s36z reverted was ONE DESIGN for per-realm namespacing, not the capability
-        // — a reverted attempt is not an absence, and the schema comment recording the revert sits
-        // directly above the column that shipped instead.
-        //
-        // SO BOTH SIDES ARE SCOPED, by `excludingRowIsFromTheProbedLedger`: the row must positively
-        // record the organisation the probe answered from, and the probe must positively say which
-        // that was. Unknown on either side excludes nothing — see that function for why each flavour
-        // of unknown refuses, and for the rollout cost, which falls on the refusing side.
-        //
-        // AND NOTHING ELSE ON THIS PATH RESTED ON THE PREMISE — re-checked, not assumed, because a
-        // false premise cleared one site and may have quietly cleared others. Every OTHER consumer
-        // of `input.existing` uses a row to ADD a refusal or to CONSUME capacity, so a row from a
-        // former realm can only ever withhold: `unresolvedInvoicePaymentAttempts` turns one into a
-        // probe and a possible refusal; `retiredDocumentInvoicePaymentAttempts` refuses on it; the
-        // `asserted` and `registeredAmount` gates refuse on it; the capacity sum counts it, and a
-        // QuickBooks id collision on `accountingInvoiceId` makes it count MORE, not less. The one
-        // other place a row is DROPPED is the `live` document filter, and that drop is o3d-hbgo's
-        // arithmetic rule about a retired document — realm-independent, and guarded ahead of it by
-        // the retired-document refusal. `selectReceiptsAwaitingRegistration` is the same shape: a
-        // foreign-realm row can only mark a receipt as spoken for, which withholds a re-drive. The
-        // post-site guard (`invoice-payment-capacity.ts`) reads no ledger and holds no exclusion set
-        // at all. This remains the ONLY permissive use of these rows, which is why it is the only
-        // one that has to prove where a row came from.
-        {
-          settlementsOfOtherAttempts: input.existing
-            .filter((row) => row !== attempt
-              && !isOperatorAssertedSettlement(row.settlementBasis)
-              && excludingRowIsFromTheProbedLedger(row.origin, input.ledgerConnectionProvenance))
-            .map((row) => row.externalTransactionId),
-        },
+        // SO THE ROUND-2 BEHAVIOUR IS RESTORED: AN UNMEASURABLE SETTLEMENT WITHHOLDS, WHATEVER ID
+        // ANY ROW OF OURS RECORDS. The permanent hold is real and is now tracked as its own problem
+        // (bd o3d-hold1) with the full cost of a sound exclusion written down. The trade is the one
+        // `classifyLedgerSettlement` has always stated: the cost of holding a genuine payment back
+        // is a visible refusal with a nameable remedy, and the cost of the alternative is a second
+        // payment on somebody's ledger, which is neither visible nor remediable.
       )
       if (verdict.outcome === 'clear') continue
       return {
