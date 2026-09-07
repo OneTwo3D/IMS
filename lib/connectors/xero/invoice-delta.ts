@@ -1251,14 +1251,48 @@ export function readLedgerStatedAmount(value: unknown, currency: string | null):
     return isLedgerMinorUnitQuantized(reading, currency) ? reading : null
   }
   if (typeof value === 'string') {
-    const trimmed = value.trim()
-    if (!LEDGER_AMOUNT_GRAMMAR.test(trimmed)) return null
-    // Read through the repository's decimal reader rather than `Number()`: the shape is already
-    // established, and this reads the digits it was given instead of re-deriving them.
-    const parsed = toDecimal(trimmed)
+    const parsed = decodeLedgerAmountText(value)
+    if (parsed === null) return null
     return isLedgerMinorUnitQuantized(parsed, currency) ? parsed : null
   }
   return null
+}
+
+/**
+ * o3d-obyd — WHAT A LEDGER AMOUNT THAT ARRIVED AS *TEXT* SAYS, AS ONE FUNCTION, FOR EVERY READER.
+ *
+ * This is the string arm of `readLedgerStatedAmount` lifted out of it verbatim — the grammar above,
+ * then the repository's decimal reader on the digits it was given — and it is lifted out for one
+ * reason: it now has a SECOND caller, and the last time a reader of these fields had two spellings
+ * the two diverged and the divergence moved money.
+ *
+ * THE DIVERGENCE THIS EXISTS TO PREVENT, twice over. o3d-psrx r10 found `typeof row.Balance ===
+ * 'number'` failing on a QuickBooks `Balance` of `"50.00"` and moved the QuickBooks payment POLLER
+ * onto `parseLedgerAmount`, which is this reader plus a conversion. o3d-obyd then found the
+ * settlement PROBE still holding the r10 shape — `typeof value === 'number'` — over the same fields
+ * of the same documents from the same connector. One rule, two readers, one of them fixed. So the
+ * probe does not get a third spelling of "is this text a money figure": it calls THIS, which is the
+ * function the poller's own reading is built out of, and a change to what a ledger amount may look
+ * like now lands on both by construction.
+ *
+ * WHAT IT DELIBERATELY DOES NOT DO IS JUDGE. There is no currency parameter here and no
+ * quantization or magnitude rule, because its two callers disagree about those and are RIGHT to:
+ * `readLedgerStatedAmount` must refuse a figure it cannot prove the ledger stated, because its
+ * refusal WITHHOLDS a payment; the probe's completeness arithmetic must read every stated figure it
+ * can, because its business is comparing a ledger's own total against the collection beside it and
+ * that comparison must not be dropped merely because a figure is finely stated. What both need,
+ * identically, is the decode: which text is a decimal amount at all, and which Decimal it names.
+ *
+ * NULL MEANS "THIS IS NOT A DECIMAL AMOUNT" — never zero, and never "there was no figure". A caller
+ * that must tell an absent field from an unreadable one asks that question of the field, before it
+ * gets here (see `wireAmount` in the settlement probe).
+ */
+export function decodeLedgerAmountText(value: string): Decimal | null {
+  const trimmed = value.trim()
+  if (!LEDGER_AMOUNT_GRAMMAR.test(trimmed)) return null
+  // Read through the repository's decimal reader rather than `Number()`: the shape is already
+  // established, and this reads the digits it was given instead of re-deriving them.
+  return toDecimal(trimmed)
 }
 
 /**

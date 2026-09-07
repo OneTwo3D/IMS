@@ -17,7 +17,10 @@ import type { AccountingSyncType } from '@/app/generated/prisma/client'
 // Decimal rather than the double. It lives beside `parseLedgerAmount` in the Xero module because that
 // is where `ledgerAmountMagnitudeBound` is, and this is the import direction QuickBooks' own payment
 // poller already takes for exactly the same rule.
-import { ledgerCurrencyCode, readLedgerStatedAmount } from '@/lib/connectors/xero/invoice-delta'
+// o3d-obyd: and `decodeLedgerAmountText` is the string arm of that same reader, which is how the
+// completeness arithmetic below reads a numeric STRING without also inheriting the currency and
+// magnitude judgements that belong to a decision which withholds. One decode, two callers.
+import { decodeLedgerAmountText, ledgerCurrencyCode, readLedgerStatedAmount } from '@/lib/connectors/xero/invoice-delta'
 // o3d-r948: the completeness refusals print figures, and a KWD shortfall of one fil is `0.00` at two
 // places. The rule for showing a money figure without rounding away what the verdict turned on is
 // already written down for the classifier's own sentences, so it is the same function.
@@ -99,19 +102,98 @@ function completenessBand(currency: string | null): Decimal {
 }
 
 /**
- * A wire figure as its OWN exact decimal reading, or null when the ledger stated no number.
+ * o3d-obyd — A WIRE FIGURE, AND WHICH OF THE TWO KINDS OF NOTHING IT IS WHEN IT IS NOT ONE.
  *
- * DELIBERATELY NOT `readLedgerStatedAmount`. That reader refuses a figure finer than its currency or
- * above the magnitude bound, and a refusal HERE would SKIP the completeness check — the lenient
- * direction, and the exact opposite of this rule's asymmetry. The question these checks ask is "does
- * the ledger's own total agree with the collection it sent me?", and its answer must not change
- * because a figure was too finely stated to compare. What changes is only the ARITHMETIC: each
- * double is read at its own exact decimal value and added without rounding, so the sum contributes no
- * error of its own on top of the terms.
+ * `null` used to be the whole answer here and it was answering two different questions at once: the
+ * ledger stated NO figure, and the ledger stated a figure THIS CODE COULD NOT READ. The completeness
+ * checks below skip on the first — correctly, an omitted total is nothing to compare against — and
+ * they were therefore skipping on the second too, which is the defect (see the header on
+ * `completenessCannotRun`). So the reading is a triple, and the two nothings are told apart:
+ *
+ *   `{ value: Decimal }`   the ledger stated this figure.
+ *   `{ value: null, unreadable: null }`   the ledger stated nothing here — the field is absent.
+ *   `{ value: null, unreadable: <text> }`   the ledger stated something that is not a decimal
+ *                                            amount. Naming it is what makes the refusal below
+ *                                            actionable rather than mysterious.
+ *
+ * WHAT COUNTS AS STATED. A finite JSON number, or TEXT that `decodeLedgerAmountText` — the very
+ * function the QuickBooks poller's own `parseLedgerAmount` reading is built out of — admits.
+ * QuickBooks serialises `TotalAmt` and `Balance` as strings (o3d-psrx r10, which moved the poller and
+ * left this module behind), so a string here is the ordinary case and not an exotic one.
+ *
+ * DELIBERATELY NOT `readLedgerStatedAmount` ITSELF. That reader additionally refuses a figure finer
+ * than its currency or above the magnitude bound, and those refusals belong to a decision that
+ * WITHHOLDS a payment. The question these checks ask is "does the ledger's own total agree with the
+ * collection it sent me?", and its answer must not change because a figure was too finely stated to
+ * compare — a KWD `AmountPaid` of one fil is precisely the figure the whole o3d-r948 band exists to
+ * measure, and refusing to read it would put the check back where it started. So the DECODE is
+ * shared and the JUDGEMENT is not, which is the split `decodeLedgerAmountText` is documented for.
+ * What the exact reading buys the arithmetic is unchanged: each figure is taken at its own exact
+ * decimal value and added without rounding, so the sum contributes no error on top of the terms.
+ */
+type WireAmount = { value: Decimal | null; unreadable: string | null }
+
+function wireAmount(value: unknown): WireAmount {
+  // The ledger stated nothing. Not a refusal: an omitted collection or total is a shape both ledgers
+  // send routinely, and the checks below already treat "no figure to compare against" as no check.
+  if (value === undefined || value === null) return { value: null, unreadable: null }
+  if (typeof value === 'number') {
+    return Number.isFinite(value)
+      ? { value: toDecimal(value), unreadable: null }
+      : { value: null, unreadable: String(value) }
+  }
+  if (typeof value === 'string') {
+    const decoded = decodeLedgerAmountText(value)
+    if (decoded !== null) return { value: decoded, unreadable: null }
+    // `''` is reported as a blank rather than as an empty quotation, so the sentence still names
+    // something. It is NOT read as absent: a field that is present and empty is a field whose figure
+    // this code cannot account for, and the fail-closed direction is the whole point of the triple.
+    return { value: null, unreadable: value.trim() === '' ? '(blank)' : value.trim() }
+  }
+  return { value: null, unreadable: typeof value }
+}
+
+/**
+ * The same reading, for the COLLECTION terms, where the two nothings already fail the same way.
+ *
+ * An allocation, payment or applied amount that is absent and one that is unreadable both make their
+ * `sumExact` null, and a null sum is already refused everywhere it can explain anything — so these
+ * terms need no triple. The DOCUMENT's own totals do, because a null there decided whether the check
+ * ran at all.
  */
 function wireDecimal(value: unknown): Decimal | null {
-  const n = num(value)
-  return n === null ? null : toDecimal(n)
+  return wireAmount(value).value
+}
+
+/**
+ * o3d-obyd — A COMPLETENESS CHECK THAT CANNOT BE RUN MUST NOT READ AS ONE THAT PASSED.
+ *
+ * THE DEFECT. Every completeness cross-check in this file is guarded by `figure !== null`, and every
+ * figure came from a reader that answered `null` to a numeric STRING. QuickBooks sends `TotalAmt` and
+ * `Balance` as strings. So on the ordinary QuickBooks bill the guard was false, the check did not
+ * run, control fell through to `return { ok: true, records }` — and with nothing uncovered linked,
+ * `records` is EMPTY. `classifyLedgerSettlement` reads an ok probe with an empty record list as
+ * `clear`, `clear` is what authorises a money post, and the money post is a SECOND payment against a
+ * bill QuickBooks is reporting as fully settled. The refusal was being spent as permission.
+ *
+ * Reading the string (above) removes the reachable cause. This removes the SHAPE, which is the part
+ * that can come back: a figure the ledger stated and this code cannot read now REFUSES the probe
+ * instead of quietly excusing the check that would have used it. That is the direction every other
+ * unreadable thing in this module already takes — `statedAmount` withholds, a null `explained`
+ * refuses, an unclassified link type refuses — and the one place it was inverted is the one place a
+ * `clear` could be built out of not having looked.
+ *
+ * AN ABSENT FIELD IS STILL NOT A REFUSAL. "Xero omitted `Total` and `AmountDue`" is a response shape
+ * this module already has a documented fallback for, and turning it into a refusal would fail the
+ * ordinary unsettled document rather than the malformed one. The rule is about what the ledger SAID,
+ * not about what it left out: it is exactly the distinction `statedAmount` has always drawn between
+ * `amount: null` and `unreadableAmount`, now drawn on the document's own figures too.
+ */
+function completenessCannotRun(figures: Array<readonly [string, WireAmount]>): string | null {
+  for (const [name, reading] of figures) {
+    if (reading.unreadable !== null) return `${name} ${reading.unreadable}`
+  }
+  return null
 }
 
 /** Does the ledger claim anything at all here — more than one band above zero? */
@@ -302,9 +384,23 @@ export async function probeXeroSettlement(
     // any means, so it is the thing the returned collection has to add up to. ALL allocations
     // count here, not only this bill's: the credit legitimately offsets other documents, and it is
     // the COLLECTION's completeness being tested, not this bill's share of it.
-    const creditTotal = wireDecimal(note.Total)
-    const remaining = wireDecimal(note.RemainingCredit)
-    const applied = creditTotal !== null && remaining !== null ? subtractMoney(creditTotal, remaining) : null
+    //
+    // o3d-obyd — ARM 1 OF 3. An unreadable `Total` or `RemainingCredit` used to make `applied` null,
+    // which skipped this check entirely; an absent `Allocations` collection then gave `records: []`,
+    // and that is a `clear` over the credit note this check was added to protect.
+    const creditTotal = wireAmount(note.Total)
+    const remaining = wireAmount(note.RemainingCredit)
+    const cannotRun = completenessCannotRun([['Total', creditTotal], ['RemainingCredit', remaining]])
+    if (cannotRun !== null) {
+      return {
+        ok: false,
+        reason: `Xero states ${cannotRun} on this credit note, which IMS cannot read as an amount, so it `
+          + 'cannot tell how much of the credit is already allocated',
+      }
+    }
+    const applied = creditTotal.value !== null && remaining.value !== null
+      ? subtractMoney(creditTotal.value, remaining.value)
+      : null
     const allocated = sumExact(allocations.map((a) => wireDecimal(a.Amount)))
     if (applied !== null && statesAnything(applied, noteCurrency)
       && (allocated === null || shortBy(applied, allocated, noteCurrency))) {
@@ -353,7 +449,35 @@ export async function probeXeroSettlement(
   // Directional on purpose — only a SHORTFALL escalates. A record whose amount is unreadable
   // already yields `unknown` in the classifier, so it is excluded here rather than counted as
   // zero (which would fake a shortfall).
-  const amountPaid = wireDecimal(invoice.AmountPaid)
+  //
+  // o3d-obyd — ARM 2 OF 3, AND ITS SECOND CHECK IS ARM 3's SIBLING. All four of this arm's document
+  // figures are read HERE, before either check, and a figure Xero STATED that IMS cannot read as an
+  // amount refuses the probe rather than excusing the check that would have used it. Both checks are
+  // guarded on `!== null`, so an unreadable `AmountPaid` skipped the first and an unreadable `Total`
+  // or `AmountDue` skipped the second — and a skipped check over a `Payments` collection Xero did not
+  // send is `ok: true` with an empty record list, which is a `clear`.
+  //
+  // Absent stays a skip on purpose: the `settled` fallback below EXISTS for a response that omits
+  // `Total` and `AmountDue`, and an ordinary unsettled invoice that states no `AmountCredited` must
+  // keep reading as the positive, empty answer it is.
+  const amountPaidRead = wireAmount(invoice.AmountPaid)
+  const totalRead = wireAmount(invoice.Total)
+  const amountDueRead = wireAmount(invoice.AmountDue)
+  const amountCreditedRead = wireAmount(invoice.AmountCredited)
+  const cannotRun = completenessCannotRun([
+    ['AmountPaid', amountPaidRead],
+    ['Total', totalRead],
+    ['AmountDue', amountDueRead],
+    ['AmountCredited', amountCreditedRead],
+  ])
+  if (cannotRun !== null) {
+    return {
+      ok: false,
+      reason: `Xero states ${cannotRun} on this document, which IMS cannot read as an amount, so it `
+        + 'cannot tell how much of it is already settled',
+    }
+  }
+  const amountPaid = amountPaidRead.value
   // The `every` gate is kept EXACTLY as it was: an unreadable payment amount excludes this check
   // rather than refusing it, because such a record already yields `unknown` in the classifier and
   // counting it as zero here would fake a shortfall. Only the arithmetic and the band have changed.
@@ -388,9 +512,11 @@ export async function probeXeroSettlement(
   // fails visibly and a human resolves it. A credit that IS itemised explains itself and changes
   // no verdict, so the ordinary part-credited invoice still pays automatically — which is the
   // difference between reading the collections and simply refusing on `AmountCredited > 0`.
-  const total = wireDecimal(invoice.Total)
-  const amountDue = wireDecimal(invoice.AmountDue)
-  const amountCredited = wireDecimal(invoice.AmountCredited)
+  // o3d-obyd: read at the top of this arm, with the refusal that a stated-but-unreadable one now
+  // takes. What is left here is only which of them this check uses.
+  const total = totalRead.value
+  const amountDue = amountDueRead.value
+  const amountCredited = amountCreditedRead.value
   const settled = total !== null && amountDue !== null
     ? subtractMoney(total, amountDue)
     // Fallback for a response that omits the totals: the two component fields, which is still
@@ -429,9 +555,17 @@ type QboLinkedTxn = { TxnId?: string; TxnType?: string }
 type QboPaymentLine = { Amount?: number; LinkedTxn?: QboLinkedTxn[] }
 type QboDocumentBody = {
   LinkedTxn?: QboLinkedTxn[]
-  /** The document's face value and what is still owed on it — the shape-independent cross-check. */
-  TotalAmt?: number
-  Balance?: number
+  /**
+   * The document's face value and what is still owed on it — the shape-independent cross-check.
+   *
+   * o3d-obyd: `number | string`, and the string is not a defensive maybe. QuickBooks serialises these
+   * as JSON STRINGS — `"1200.00"`, `"0.00"` — which is o3d-psrx r10's finding on this same connector,
+   * where `typeof row.Balance === 'number'` failed on a real `Balance` and the payment poller moved to
+   * `parseLedgerAmount`. Declaring them as `number` is what made a reader that only accepted numbers
+   * look correct beside them; the type now says what the wire says.
+   */
+  TotalAmt?: number | string
+  Balance?: number | string
   /**
    * o3d-78rq — the currency the applied amounts below are stated in. QuickBooks OMITS this whenever
    * multicurrency is off, which is the ordinary single-currency company, so `null` is the common case
@@ -655,8 +789,25 @@ export async function probeQuickBooksSettlement(
   // alternative is the fence being told the document is clear when an operator has already
   // settled it. Restoring automatic coverage means READING those entities (each has its own line
   // and link shape), which is a bigger change than this fence should carry — tracked separately.
-  const total = wireDecimal(body.TotalAmt)
-  const balance = wireDecimal(body.Balance)
+  //
+  // o3d-obyd — ARM 3 OF 3, AND THE ONE THE FINDING IS ABOUT. QuickBooks sends these two as STRINGS —
+  // that is o3d-psrx r10, recorded in this connector's own payment poller, which is why the poller
+  // reads them through `parseLedgerAmount`. This probe was not moved with it, so `TotalAmt: "1200.00"`
+  // with `Balance: "0.00"` read as no figures at all, `applied` was null, and with nothing uncovered
+  // linked the check below did not run: `ok: true` over an EMPTY record list, `clear`, and a second
+  // payment against a bill QuickBooks reports as fully settled.
+  const totalRead = wireAmount(body.TotalAmt)
+  const balanceRead = wireAmount(body.Balance)
+  const cannotRun = completenessCannotRun([['TotalAmt', totalRead], ['Balance', balanceRead]])
+  if (cannotRun !== null) {
+    return {
+      ok: false,
+      reason: `QuickBooks states ${cannotRun} on this ${documentKey.toLowerCase()}, which IMS cannot read `
+        + 'as an amount, so it cannot tell how much of it is already settled',
+    }
+  }
+  const total = totalRead.value
+  const balance = balanceRead.value
   const applied = total !== null && balance !== null ? subtractMoney(total, balance) : null
   // Null the moment any read settlement's applied amount is unreadable: an unknown addend makes
   // the whole sum unknown, and an unknown sum must not be allowed to "explain" anything.
