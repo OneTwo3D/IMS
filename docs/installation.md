@@ -1234,7 +1234,7 @@ to do:
 | --- | --- | --- |
 | cutover marker | `/etc/ims-cutover/DEPLOY-FENCED` | `root:root` 0600, in a `root:root` **0700** directory |
 | cutover lock | `/etc/ims-cutover-state/cutover.lock` | `root:root` **0600**, in a `root:root` **0711** directory |
-| connection-fence authority | `/etc/ims-cutover-state/db-fence/db-connect-fence.json` | `root:root` **0644**, in a `root:root` **0755** directory. Carries `fence_mode` (`initial` or `recovery`) since o3d-secops r24 and `fence_applied` (`0`, raised to `1` by root after the revoke) since r25 — see *Two kinds of fence* |
+| connection-fence authority | `/etc/ims-cutover-state/db-fence/db-connect-fence.json` | `root:root` **0644**, in a `root:root` **0755** directory. Carries `fence_mode` (`initial` or `recovery`) since o3d-secops r24 and `fence_applied` (`0`, raised to `1` by root after the revoke) since r25. A record carrying **no** `fence_applied` key is refused by every automatic path since r26 — see *Two kinds of fence* |
 | crontab backup | `/var/lib/one-two-inventory/crontab-<service user>.bak` | `root:root` 0600 |
 
 Set `IMS_CUTOVER_STATE_DIR` **in the environment of the root invocation** to move the crontab
@@ -2463,6 +2463,7 @@ exactly, and it is **copied**, root-owned, into the mirror:
 | `/etc/ims-cutover-recovery/db-fence-artefact.manifest` | per-file digests, so a mismatch can name the file |
 | `/etc/ims-cutover-recovery/release-db-fence` | the root-owned recovery wrapper (below) |
 | `/etc/ims-cutover-recovery/refence-db` | the same, for raising the fence again |
+| `/etc/ims-cutover-recovery/resolve-legacy-db-fence` | the one-time operator resolution for an authority that carries no applied stamp (o3d-secops r26). No banner prints it and no cutover runs it — the validator's refusal is the only thing that names it |
 
 Three refusals make that a boundary rather than a copy:
 
@@ -2589,7 +2590,7 @@ under it, before copying:
   Either answer coming back wrong is a refusal with nothing published.
 
 
-#### The two commands an operator is ever given
+#### The two commands an operator is ever given (and the third nobody is)
 
 r31 fixed which bytes the scripts execute and left every printed instruction describing the world
 before it. Two separate defects of one kind:
@@ -2602,12 +2603,17 @@ before it. Two separate defects of one kind:
 * the re-fence banner — printed at the single highest-pressure moment in the script, schema moved
   and fence down — still said `node ${DB_FENCE_SCRIPT} --fence`, the **application-owned** path.
 
-So nothing prints a command line any more. Root writes two wrappers at fence time:
+So nothing prints a command line any more. Root writes two wrappers at fence time, and both of
+them are printed:
 
 ```bash
 sudo /etc/ims-cutover-recovery/release-db-fence      # release the standing fence
 sudo /etc/ims-cutover-recovery/refence-db            # raise it again
 ```
+
+A third is written beside them and is **not** one of these: `resolve-legacy-db-fence` is run by an
+operator, once, only when an automatic path has refused an authority carrying no applied stamp, and
+by no banner and no cutover — see *An unstamped record is ambiguous* below.
 
 Each one is root-owned and `0700`, **never sources anything from the checkout**, carries this run's
 state file and four identity values baked in, re-verifies the artefact digest before `exec`, takes
@@ -2657,9 +2663,8 @@ The stamp is the difference between the two rules, so it is the field worth forg
 computed by root, in the process that does the rename, in a directory the service account cannot
 write. That account can neither create a record to obtain the tolerance nor unlink one to escape it,
 and a `fence_mode` carried **in** the plan is dropped by the template like every other field root
-does not compute for itself. A record with **no** `fence_mode` is read as `recovery`: it can only be
-a fence raised before this round and still standing, and refusing it would strand that fence with
-neither a re-apply nor a release.
+does not compute for itself. A record with **no** `fence_mode` is read as **`initial`**, the strict
+rule — see *An unstamped record is ambiguous* below, which reversed r24's reading of that case.
 
 ##### Do not infer a standing fence solely from record presence (o3d-secops r25)
 
@@ -2685,14 +2690,12 @@ rule.
 | nothing | `initial` | no fence, no record |
 | `fence_applied: 1` | `recovery` | root saw `--fence` succeed, so a fence stands |
 | `fence_applied: 0` | `initial` | published, never applied — what a failed publication or a pre-`BEGIN` refusal leaves |
-| **no `fence_applied` key at all** | `recovery` | written by a validator that predates the stamp, so it can only be a fence raised before this upgrade and still standing |
+| **no `fence_applied` key at all** | **REFUSED** | ambiguous — see *An unstamped record is ambiguous* below |
 | not a regular file, or not usable JSON | `initial` | nothing there can show a fence was applied |
 
-The last two rows are how an **unstamped legacy record** is told apart from a **half-published**
-one: a record from this round *always* has the key, holding `0`, because the validator writes it in
-the same template as every other field, so the discriminator is the key's **presence**, not its
-value. That holds for the same reason `fence_mode` itself does — the directory is `root:root` and
-unwritable by anything else, so the service account can neither add the key nor strip it.
+The two stamped rows hold for the same reason `fence_mode` itself does — the directory is
+`root:root` and unwritable by anything else, so the service account can neither raise the key to buy
+the lax rule nor strip it.
 
 **Where this fails, said plainly.** If a run dies between a successful `REVOKE` and root raising the
 stamp, the record says `0` while a fence *is* standing. The next cutover reads `initial`, the strict
@@ -2706,6 +2709,52 @@ issued and its acknowledgement may have been lost — the only safe reading of u
 `CONNECT` may be revoked) and for **no other status**. Exit `1` in particular is the helper's
 catch-all: it covers a connection that never opened as well as a teardown that threw after a
 successful fence, and a status that cannot tell those apart may not declare a fence applied.
+
+##### An unstamped record is ambiguous, and only the ACL can settle it (o3d-secops r26)
+
+r25 read a record carrying **no `fence_applied` key** as a fence raised before the stamp existed,
+and therefore standing. The premise is right — that key is absent only in records an older validator
+wrote — and the conclusion does not follow from it. **That older validator published its record
+before invoking `--fence`**, so its own `SIGKILL`/power-loss window between the rename and `BEGIN`
+leaves exactly this record with no fence behind it. An absent stamp dates the *writer*; it says
+nothing about which phase the writer reached, and reading it as standing hands the lax rule to a
+fence nobody can show exists.
+
+So **every automatic path refuses it**:
+
+* the **validator** refuses to publish over it. Nothing is published, nothing is revoked, and the
+  refusal names the record, says why the two cases cannot be told apart from the filesystem, and
+  names the wrapper below;
+* the **executor** resolves an unrecognised `fence_mode` to `initial` as well, as defence in depth.
+
+**Nothing on the filesystem can settle it — the ACL can.** The fence's whole effect is that the
+recorded grantees lose `CONNECT`, so asking whether they still hold it asks whether the fence is
+standing. That question is asked by a read-only mode, `--audit-authority` (no `BEGIN`, no `GRANT`,
+no `REVOKE`, no write), and acted on by a third root-owned wrapper an operator runs **once**,
+deliberately, and no cutover ever runs:
+
+```
+sudo /etc/ims-cutover-recovery/resolve-legacy-db-fence
+```
+
+| what the ACL says about the recorded grantees | what it means | what the wrapper does |
+| --- | --- | --- |
+| every one of them still holds `CONNECT` | the `REVOKE` names exactly those roles, so it cannot have run | **clears** the record; the next cutover plans an `initial` fence as on any other host |
+| not one of them holds `CONNECT` | that is the fence's own signature | **stamps** it `fence_applied: 1`; the fence is still up, and a re-fence over it now uses `recovery` |
+| some do and some do not, or the record names nobody | a half-applied fence and an administrator's own revoke read identically | **refuses**, changes nothing, and prints both lists |
+
+**Partial results fail toward refusing, at every step.** An audit that cannot connect, cannot read
+the record, is pointed at another database, exits with a status the wrapper does not enumerate, or
+prints a verdict line that does not agree with that status leaves the record exactly as it was
+found — which keeps every automatic path refusing, the state this procedure exists to leave when it
+cannot do better. The wrapper also refuses any record that is *not* the ambiguous one: one already
+stamped applied, one carrying `fence_applied: 0` (which is this round's own "published, never
+applied" and is already handled by the strict rule), a truncated one, and one nobody published.
+
+**The release wrapper works throughout, stamp or no stamp.** It restores from the record's own
+grantee list and consults neither `fence_applied` nor `fence_mode`, so an operator holding a record
+no automatic path will touch can still take a standing fence down — that is what makes refusing the
+safe direction rather than a dead end.
 
 What `recovery` accepts that `initial` does not, said plainly: on a re-fence a grantee an
 administrator removed by hand is indistinguishable from one the standing fence removed — both are
