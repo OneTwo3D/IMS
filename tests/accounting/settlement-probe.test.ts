@@ -1,8 +1,9 @@
 import assert from 'node:assert/strict'
-import test from 'node:test'
+import test, { mock } from 'node:test'
 
 import {
   normaliseXeroSettlementDate,
+  probeLedgerSettlement,
   probeQuickBooksSettlement,
   probeXeroSettlement,
   settlementProbeKey,
@@ -572,4 +573,105 @@ test('the probe key is not split by an anchor the TYPE does not have (o3d-0m56 r
     key('PURCHASE_CREDIT_NOTE_ALLOCATION', { accountingInvoiceId: 'a', creditNoteId: 'c1' }),
     key('PURCHASE_CREDIT_NOTE_ALLOCATION', { accountingInvoiceId: 'a', creditNoteId: 'c2' }),
   )
+})
+
+/* ------------------------------------------------------------------------------------------- *
+ * o3d-r948 r5 (Codex HIGH) — AND THE PROBE HAS TO SAY WHOSE LEDGER ANSWERED.
+ *
+ * The records above are ids in ONE organisation's namespace and none of them says which. The
+ * registration decision's exclusion set is the one input that can REMOVE a record from a match, and
+ * it is only sound when the row supplying the id and the record being matched are from the SAME
+ * organisation — so the caller needs both halves, and only this function is in a position to
+ * supply the ledger's.
+ * ------------------------------------------------------------------------------------------- */
+
+/** Successive answers to "which tenant is connected now", so a reconnect mid-call can be staged. */
+let tenantReads: Array<string | null> = []
+const tenantsRead = () => TENANT_CALLS.length
+const TENANT_CALLS: string[] = []
+
+mock.module('@/lib/db', {
+  namedExports: {
+    db: {
+      accountingToken: {
+        findUnique: async ({ where }: { where: { connector: string } }) => {
+          TENANT_CALLS.push(where.connector)
+          const next = tenantReads.shift()
+          return next == null ? null : { tenantId: next }
+        },
+      },
+    },
+  },
+})
+
+mock.module('@/lib/connectors/xero/api', {
+  namedExports: {
+    xeroGet: async () => ({
+      ok: true,
+      status: 200,
+      data: { Invoices: [{ InvoiceID: 'inv-9', Payments: [{ PaymentID: 'PAY-9', Date: '2026-08-01T00:00:00', Amount: 10 }] }] },
+    }),
+  },
+})
+
+const XERO_TARGET = { type: 'INVOICE_PAYMENT', payload: { accountingInvoiceId: 'inv-9' } }
+
+test('[o3d-r948 r5] a settled probe names the organisation that answered', async () => {
+  // ROUTE: probeLedgerSettlement reads `activeAccountingIdProvenance(connector)` and returns it on
+  //        the `ok: true` arm as `connectionProvenance`.
+  // MUTATION: return `probe` unchanged (drop the spread that adds the field) and this fails —
+  //        `connectionProvenance` is undefined, which the decision reads as "cannot say" and which
+  //        excludes nothing (verified).
+  TENANT_CALLS.length = 0
+  tenantReads = ['tenant-b', 'tenant-b']
+  const probe = await probeLedgerSettlement('xero', XERO_TARGET)
+
+  // THE PRECONDITION: this really is the ordinary success path, with the records the caller needs.
+  assert.equal(probe.ok, true)
+  assert.equal(probe.ok && probe.records.length, 1, 'the records must still come back')
+  assert.equal(probe.ok && probe.records[0].id, 'PAY-9')
+
+  assert.equal(probe.ok && probe.connectionProvenance, 'xero:tenant-b')
+})
+
+test('[o3d-r948 r5] a connection that MOVES across the read is reported as unknown, not mislabelled', async () => {
+  // THE WINDOW A SINGLE READ CANNOT SEE. Reading the active tenant once is a claim about one moment
+  // and the fetch is a different moment; an operator disconnecting and reconnecting to another
+  // company in between would have us stamp realm A's records with realm B's name, which is the
+  // cross-namespace exclusion this whole round exists to stop, arriving one layer up. So the tenant
+  // is read either side of the fetch and a disagreement answers NULL — the value that excludes
+  // nothing — rather than either of the two names, neither of which is known to be right.
+  //
+  // ROUTE: probeLedgerSettlement's `before !== null && before === after ? before : null`.
+  // MUTATION: replace it with `before` and this fails, reporting `xero:tenant-a` for records that
+  //        may have come from tenant-b (verified).
+  TENANT_CALLS.length = 0
+  tenantReads = ['tenant-a', 'tenant-b']
+  const moved = await probeLedgerSettlement('xero', XERO_TARGET)
+
+  // THE PRECONDITION, and it is what proves the guard was REACHED rather than short-circuited: the
+  // probe still succeeded and still carries its records, and the tenant really was read twice.
+  assert.equal(moved.ok, true)
+  assert.equal(moved.ok && moved.records.length, 1)
+  assert.equal(tenantsRead(), 2, 'the active connection must be read either side of the fetch')
+
+  assert.equal(moved.ok && moved.connectionProvenance, null)
+})
+
+test('[o3d-r948 r5] no connected organisation at all is unknown too, not an empty name', async () => {
+  // `activeAccountingIdProvenance` answers null when there is no token row, so both reads agree —
+  // and agreeing on NOTHING is still not evidence of anything. The value must stay null rather than
+  // becoming a name like `xero:null`, because the decision side's rule is that null matches nothing,
+  // including another null (`accountingIdProvenanceMatches`, reused there for exactly that reason).
+  //
+  // ROUTE: probeLedgerSettlement's `before === after ? before : null`, on the agreeing-null path.
+  // MUTATION: build the provenance unconditionally as `` `${connector}:${before}` `` and this fails
+  //        with 'xero:null' — a string that is not any organisation but is not null either
+  //        (verified).
+  TENANT_CALLS.length = 0
+  tenantReads = [null, null]
+  const probe = await probeLedgerSettlement('xero', XERO_TARGET)
+  assert.equal(probe.ok, true)
+  assert.equal(probe.ok && probe.records.length, 1, 'the read itself still succeeded')
+  assert.equal(probe.ok && probe.connectionProvenance, null)
 })

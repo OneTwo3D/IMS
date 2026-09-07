@@ -730,7 +730,11 @@ export async function probeLedgerSettlement(
       })()
     if (!probe.ok) return probe
     const after = await activeAccountingIdProvenance(connector)
-    return { ...probe, connectionProvenance: before !== null && before === after ? before : null }
+    // Two NULLS agree, and the answer is still null: "nothing is connected" cannot vouch for an id,
+    // so no `before !== null` guard is needed here — it would be dead. What the null must not do is
+    // MATCH a row that also records nothing, and that is guaranteed on the decision side, where
+    // `accountingIdProvenanceMatches` is false whenever the active provenance is null.
+    return { ...probe, connectionProvenance: before === after ? before : null }
   } catch (e) {
     return { ok: false, reason: e instanceof Error ? e.message : String(e) }
   }
