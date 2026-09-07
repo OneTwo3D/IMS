@@ -508,6 +508,26 @@ type XeroAppliedCollection = Array<{ AppliedAmount?: number }>
  * on `Status`: excluding a payment Xero did in fact count would make `seen` short of `AmountPaid` and
  * hard-refuse an ordinary invoice, which is the irreversible-workflow direction and a guess besides.
  *
+ * AND THE SAME FIELD ON A CREDIT NOTE *IS* FILTERED, WHICH IS THIS RULE READ AT THE OPPOSITE SIGN
+ * RATHER THAN A CONTRADICTION OF IT (o3d-acctmoney r2, Codex HIGH). Read the two together, because
+ * the asymmetry is load-bearing and neither half is decidable from the field alone:
+ *
+ *   HERE, ON THE INVOICE, `Payments` is an ADDED term in both places it appears — it sums into
+ *   `seen`, measured against `AmountPaid`, and into `explained`, measured against `settled`. Counting
+ *   a reversed payment makes the COLLECTION exceed the figure that certifies it, which is `exceeds`:
+ *   `provedComplete: false`, `unknown`, never `clear`. The mistake is already visible, so nothing is
+ *   filtered and an ordinary invoice is never hard-refused.
+ *
+ *   ON THE CREDIT NOTE, `SUM(Payments.Amount)` is SUBTRACTED from the note's allocation usage.
+ *   Counting a reversed payment UNDERSTATES how much of the credit has been allocated, and an
+ *   understatement that reaches zero over an EMPTY `Allocations` collection is a proved-empty
+ *   allocation list forged out of an incomplete one — the exact false `clear` this probe exists to
+ *   prevent. So there the DELETED payment is excluded at the source. See
+ *   `creditNoteRefundInclusion`, which carries the full argument.
+ *
+ * Filter where the term is subtracted; do not filter where it is added. The rule is about the SIGN,
+ * not about the field — and it was written for one sign and applied to both once already.
+ *
  * The other thing that collection carries is `BankAmount` — "The amount of the payment in the
  * currency of the bank account". This arm reads `Amount`, which is stated in the document's own
  * currency, and that is the only one comparable with `AmountPaid` and `Total`. Named because the two
@@ -595,7 +615,9 @@ type XeroPaymentsResponse = {
  *                                                                              readOnly
  *   Allocations      "See Allocations" -> array of `Allocation`, each carrying an `Amount` and the
  *                    `Invoice` it was applied to
- *   Payments         "See Payments" -> array of `Payment`, each carrying an `Amount`
+ *   Payments         "See Payments" -> array of `Payment`, each carrying an `Amount`, a `Status`
+ *                    (enumerated `AUTHORISED` / `DELETED`) and a `PaymentType` (whose
+ *                    `ARCREDITPAYMENT` / `APCREDITPAYMENT` spellings name a refund OF a credit note)
  *
  * THE FIELDS THAT ARE DOCUMENTED AND DELIBERATELY NOT TERMS, so that "not modelled" is a decision
  * rather than another gap:
@@ -647,8 +669,20 @@ type XeroCreditNoteResponse = {
      * the payment in the currency of the bank account", which is a DIFFERENT currency from the one
      * `Total` and `RemainingCredit` are stated in whenever the note is not in the base currency.
      * Summing it into this identity would be a silent cross-currency subtraction.
+     *
+     * o3d-acctmoney r2 (Codex HIGH) — AND `Status` AND `PaymentType` ARE MODELLED, BECAUSE ON THIS
+     * ARM THEY DECIDE WHETHER THE `Amount` IS A TERM AT ALL. The shared `Payment` schema enumerates
+     * `Status` as `AUTHORISED` / `DELETED`, and a DELETED payment has been reversed — Xero has put
+     * its money back into `RemainingCredit`, so it is not something `RemainingCredit` is net of.
+     * Subtracting it anyway understates the allocation usage, and an understatement that reaches
+     * zero over an empty `Allocations` collection is a false `clear`. `PaymentType` is modelled for
+     * the same decision from the other side: the identity's `Payments` term is refunds OF this note,
+     * and a payment of some other type is one whose relation to `RemainingCredit` this code does not
+     * know. Both are declared `string` rather than a union so that an UNRECOGNISED value is a value
+     * this code must refuse on rather than one the type system pretends cannot arrive — see
+     * `creditNoteRefundInclusion`.
      */
-    Payments?: Array<{ PaymentID?: string; Amount?: number }>
+    Payments?: Array<{ PaymentID?: string; Amount?: number; Status?: string; PaymentType?: string }>
   }>
 }
 
@@ -665,6 +699,102 @@ function sumApplied(collection: XeroAppliedCollection | undefined, currency: str
   // o3d-r948: exact, like every other term of the completeness arithmetic.
   // o3d-mm51: and sized by the document's own currency, like every other term of it.
   return sumExact((collection ?? []).map((entry) => wireDecimal(entry.AppliedAmount, currency)))
+}
+
+/**
+ * o3d-acctmoney r2 (Codex HIGH) — WHICH PAYMENTS ON A CREDIT NOTE ARE TERMS OF ITS IDENTITY.
+ *
+ * THE DEFECT. `SUM(Payments.Amount)` is SUBTRACTED from the credit note's allocation usage
+ * (`applied = Total - RemainingCredit - CISDeduction - SUM(Payments.Amount)`), and every payment in
+ * the collection was summed into it without inspecting `Payment.Status`. The shared `Payment` schema
+ * enumerates that field as `AUTHORISED` / `DELETED`, and DELETION REVERSES THE PAYMENT: Xero puts the
+ * money back into `RemainingCredit`, so a deleted refund is not one of the things `RemainingCredit`
+ * is net of and is not a term of this identity.
+ *
+ * Codex's shape, reproduced: `Total 400, RemainingCredit 300` — a real 100 allocated — with
+ * `Allocations` absent or stale-empty and a DELETED 100 in `Payments`. Counting the deleted refund
+ * gives `applied = 400 - 300 - 0 - 100 = 0` against `allocated = 0`; `statesAnything(0)` is false so
+ * no shortfall check runs, `exceeds(0, 0)` is false, and the probe answers `provedComplete: true`
+ * over an EMPTY record list — `clear`, which is what authorises allocating the missing 100 a SECOND
+ * time. The reversed payment forged a proved-empty allocation list out of the incomplete one being
+ * checked, which is the precise failure this probe exists to prevent.
+ *
+ * WHY THE STANDING SAFETY ARGUMENT DID NOT REACH IT is written out in the identity block in
+ * `probeXeroSettlement`: an over-subtraction is caught by the collection it over-subtracted past only
+ * when that collection has something in it, and here it comes back empty.
+ *
+ * WHY THE INVOICE ARM STILL DOES NOT FILTER on the same field of the same contract is written out on
+ * `XeroPaymentsResponse`: there `Payments` is an ADDED term, counting a deleted payment makes the
+ * collection EXCEED `AmountPaid`, and an excess withholds proof — so the mistake is already in the
+ * visible direction, while filtering would make `seen` short of an `AmountPaid` Xero did in fact
+ * count and hard-refuse an ordinary invoice. Same field, opposite sign, opposite consequence. The two
+ * paragraphs cite each other on purpose: the asymmetry is the reasoning, and a reader who finds only
+ * one half will "fix" the other into a defect.
+ *
+ * FAIL CLOSED ON WHAT THE CONTRACT DOES NOT ENUMERATE. A `Status` that is neither documented value,
+ * or a `PaymentType` that is neither of the two spellings naming a refund OF a credit note, is a
+ * payment whose relationship to `RemainingCredit` this code does not know. COUNTING it is an unbacked
+ * subtraction in the direction that forges a `clear`; DROPPING it is an unbacked exclusion. Both are
+ * guesses about money, so neither is made — the probe refuses and a human reads the response.
+ *
+ * AN UNSTATED FIELD IS NOT AN UNKNOWN ONE, AND IT COUNTS. Xero states neither field on the nested
+ * payment stubs a credit-note GET returns, and refusing on absence would refuse EVERY ordinary
+ * refunded credit note — the exact harm the round before this one removed, on the most ordinary
+ * operation there is. There is nothing to act on when the ledger says nothing, and the ordinary
+ * refund is the authorised one. What is refused is what Xero STATED and this code cannot account
+ * for, which is `wireAmount`'s distinction carried onto the enumerated fields.
+ */
+const XERO_PAYMENT_STATUS_AUTHORISED = 'AUTHORISED'
+const XERO_PAYMENT_STATUS_DELETED = 'DELETED'
+/** `Payment.PaymentType`: the two spellings that exist for a refund OF a credit note and nothing else. */
+const XERO_CREDIT_NOTE_REFUND_TYPES = new Set(['ARCREDITPAYMENT', 'APCREDITPAYMENT'])
+
+/**
+ * An ENUMERATED wire token, read the way `wireAmount` reads a money one: absent, a normalised token,
+ * or something the ledger stated that this code cannot read as one.
+ *
+ * Case is normalised because Xero states these upper-case and a differently-cased spelling of a
+ * DOCUMENTED value is the same value, not an unknown one. A non-string is reported by its type, and
+ * a present-but-blank field is reported as `(blank)` rather than as an empty quotation, so the
+ * refusal sentence still names something.
+ */
+function wireEnum(value: unknown): { token: string | null; unreadable: string | null } {
+  if (value === undefined || value === null) return { token: null, unreadable: null }
+  if (typeof value !== 'string') return { token: null, unreadable: typeof value }
+  const trimmed = value.trim()
+  if (trimmed === '') return { token: null, unreadable: '(blank)' }
+  return { token: trimmed.toUpperCase(), unreadable: null }
+}
+
+/**
+ * Is this credit-note payment a term of the identity above — and when this code cannot tell, WHY.
+ *
+ * The three answers are distinct on purpose. `counts: true` is an authorised or unstated refund, the
+ * ordinary case. `counts: false` with a null `unaccountable` is the ONE case this code positively
+ * knows is not a term: an explicitly DELETED payment, whose money Xero has already returned to
+ * `RemainingCredit`. A non-null `unaccountable` is a status or type the contract does not enumerate,
+ * and it refuses rather than being silently counted in either direction.
+ */
+function creditNoteRefundInclusion(
+  payment: { Status?: string; PaymentType?: string },
+): { counts: boolean; unaccountable: string | null } {
+  const status = wireEnum(payment.Status)
+  if (status.unreadable !== null) {
+    return { counts: false, unaccountable: `a payment status of ${status.unreadable}` }
+  }
+  if (status.token !== null
+    && status.token !== XERO_PAYMENT_STATUS_AUTHORISED
+    && status.token !== XERO_PAYMENT_STATUS_DELETED) {
+    return { counts: false, unaccountable: `a payment status of ${status.token}` }
+  }
+  const type = wireEnum(payment.PaymentType)
+  if (type.unreadable !== null) {
+    return { counts: false, unaccountable: `a payment type of ${type.unreadable}` }
+  }
+  if (type.token !== null && !XERO_CREDIT_NOTE_REFUND_TYPES.has(type.token)) {
+    return { counts: false, unaccountable: `a payment type of ${type.token}` }
+  }
+  return { counts: status.token !== XERO_PAYMENT_STATUS_DELETED, unaccountable: null }
 }
 
 /** The shape of the connector read each probe needs, so both can be driven without a network. */
@@ -788,11 +918,32 @@ export async function probeXeroSettlement(
      *   more than Xero in fact netted out of `RemainingCredit`. Then `applied` = A - X while
      *   `allocated` still sums to A, so the COLLECTION EXCEEDS THE FIGURE by exactly X — and
      *   `exceeds` below turns that into `provedComplete: false`, which is `unknown`, not `clear`.
-     *   Every over-subtraction is caught by the collection it over-subtracted past, at the same band.
+     *   Every over-subtraction PAST A NON-EMPTY COLLECTION is caught by that collection, at the same
+     *   band.
      *
      * So the wrong branch of this guess costs a visible hold, not a second allocation, and that is
      * the asymmetry test the previous round applied and could not pass — it could not pass it because
      * it was weighing the subtraction ALONE, without the check standing behind it.
+     *
+     * AND THE CONDITION THAT ARGUMENT NEEDS, WHICH IT DID NOT STATE (o3d-acctmoney r2, Codex HIGH).
+     * "The collection exceeds the figure by X" needs a collection with something in it to exceed
+     * WITH. When `Allocations` comes back empty — which is the very shape this check was added to
+     * distrust — A is zero, `applied` is `0 - X`, `statesAnything` is false so no shortfall check
+     * runs, and `exceeds(0, applied)` is false because the excess is on the wrong side. The
+     * over-subtraction lands on the PROVED-ZERO path, not the excess path, and a proved zero over an
+     * empty record list is `clear`. So the paragraph above covers exactly one case and is now written
+     * that way; a term the CONTRACT ITSELF flags as not-netted has to be excluded at the source
+     * rather than left to a check that an empty collection switches off.
+     *
+     * THE TWO SUBTRACTED TERMS ARE COVERED DIFFERENTLY, AND IT IS WORTH SAYING WHICH IS WHICH:
+     *
+     *   `CISDeduction`  carries no such flag. The contract says Xero nets it out of `RemainingCredit`
+     *                   and says nothing that distinguishes one deduction from another; an absent one
+     *                   reads as zero (there is no deduction to net) and an unreadable one refuses
+     *                   through `completenessCannotRun`. There is no member to exclude and no
+     *                   enumeration to fail closed on, so this term takes no filter.
+     *   `Payments`      DOES carry one — `Payment.Status`, enumerated `AUTHORISED` / `DELETED` — and
+     *                   it is now read. See `creditNoteRefundInclusion`.
      *
      * AND THE EXTREME OF THAT SAME CASE IS NAMED RATHER THAN LEFT TO `exceeds`, immediately below: a
      * usage BELOW ZERO. `allocationUsage` counts money that has been allocated, so under the identity
@@ -811,7 +962,30 @@ export async function probeXeroSettlement(
     // is never a RECORD of this bill's allocations — nothing is left behind to make the classifier
     // withhold on its own account. That is o3d-zo4j's unreadable-allocation lesson applied to the
     // collection this round added, rather than learned again later.
-    const refundReadings = notePayments.map((pmt) => wireAmount(pmt.Amount, noteCurrency))
+    //
+    // o3d-acctmoney r2 (Codex HIGH) — AND WHICH ENTRIES OF IT ARE TERMS AT ALL IS DECIDED FIRST.
+    // `creditNoteRefundInclusion` carries the argument; what it decides here is that an explicitly
+    // DELETED payment is dropped before it can be subtracted, and that a status or payment type the
+    // contract does not enumerate refuses instead of being counted either way.
+    //
+    // AN EXCLUDED PAYMENT'S `Amount` IS NEVER READ, so an unreadable amount on a DELETED payment does
+    // not refuse — there is nothing this code was going to do with the figure. That direction is
+    // safe for the reason every other exclusion here is: dropping a term from a SUBTRACTED sum can
+    // only make `applied` LARGER, which is the shortfall direction and a VISIBLE refusal, never the
+    // proved zero. The amount refusal below exists for the terms that ARE subtracted and still covers
+    // every one of them.
+    const refundInclusions = notePayments.map((pmt) => creditNoteRefundInclusion(pmt))
+    const unaccountableRefund = refundInclusions.find((i) => i.unaccountable !== null)?.unaccountable ?? null
+    if (unaccountableRefund !== null) {
+      return {
+        ok: false,
+        reason: `Xero states ${unaccountableRefund} on a payment against this credit note, which IMS `
+          + 'cannot account for, so it cannot tell how much of the credit is already allocated',
+      }
+    }
+    const refundReadings = notePayments
+      .filter((_pmt, index) => refundInclusions[index]!.counts)
+      .map((pmt) => wireAmount(pmt.Amount, noteCurrency))
     const refunded = sumExact(refundReadings.map((r) => r.value))
     if (refunded === null) {
       const unreadable = refundReadings.find((r) => r.unreadable !== null)?.unreadable ?? null
