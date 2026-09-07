@@ -294,7 +294,16 @@ export function decideInvoicePaymentRegistration(input: {
       const verdict = classifyLedgerSettlement(
         // `amount`, not `registeredAmount`: this compares against a figure the LEDGER reported, which
         // is the JSON number that went on the wire (o3d-6abj).
-        { amount: attempt.amount ?? null, date: attempt.paymentDate ?? null, marker: attempt.settlementMarker ?? null },
+        //
+        // o3d-6yho: and the ORDER's currency, which is the currency this attempt was raised in — the
+        // decision has already refused a receipt whose currency differs from the order's, so there is
+        // no second answer to give here.
+        {
+          amount: attempt.amount ?? null,
+          currency: input.orderCurrency,
+          date: attempt.paymentDate ?? null,
+          marker: attempt.settlementMarker ?? null,
+        },
         { ok: true, records: input.ledgerSettlements },
       )
       if (verdict.outcome === 'clear') continue

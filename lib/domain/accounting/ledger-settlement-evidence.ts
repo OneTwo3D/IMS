@@ -29,6 +29,8 @@
 
 import { createHash } from 'node:crypto'
 
+import { ledgerMatchEpsilon } from '@/lib/domain/math/decimal'
+
 /**
  * The mark IMS writes into the settlement it creates, so it can recognise its own work later.
  *
@@ -68,6 +70,14 @@ export type LedgerSettlementProbe =
 /** What a row's stored payload says its attempt sent. */
 export type AttemptDescription = {
   amount: number | null
+  /**
+   * o3d-6yho (2 of 3) — THE CURRENCY THAT AMOUNT IS IN, which sizes the band the match below runs
+   * on. Read from the payload (every money payload states one) or supplied by a caller that holds
+   * the document's own. `null` = not stated, and `ledgerMatchEpsilon` resolves that in the direction
+   * that WITHHOLDS a post rather than the one that sends a second — see its docblock, which is the
+   * only rule in this repository where the finest unit is the wrong default.
+   */
+  currency: string | null
   /** `YYYY-MM-DD` as the processor would have sent it, or null when the row does not pin one. */
   date: string | null
   /**
@@ -111,8 +121,18 @@ export type SettlementVerdict =
    */
   | { outcome: 'unknown'; reason: string; cause: SettlementUnknownCause }
 
-/** Money compares to the half-penny, the same tolerance the registration guard uses. */
-const AMOUNT_EPSILON = 0.005
+/**
+ * `AMOUNT_EPSILON` WAS HERE, AND IS GONE (o3d-6yho, 2 of 3).
+ *
+ * It was a flat `0.005` — "the half-penny, the same tolerance the registration guard uses" — and both
+ * halves of that sentence stopped being true. The registration guard now derives its band from the
+ * document's minor unit, and a half-penny is FIVE whole minor units in a Gulf dinar and fifty in CLF,
+ * so this test read two payments a ledger states as different amounts as the same one.
+ *
+ * The replacement is `ledgerMatchEpsilon(attempt.currency)`, which is 0.005 exactly in every
+ * two-decimal currency. See its docblock for why this rule, alone in the repository, must not take
+ * the finest unit for an unstated currency.
+ */
 
 function asRecord(payload: unknown): Record<string, unknown> {
   return typeof payload === 'object' && payload !== null && !Array.isArray(payload)
@@ -269,8 +289,13 @@ export function describeAttempt(
 ): AttemptDescription {
   const record = asRecord(payload)
   const amount = record.amount
+  const currency = record.currency
   return {
     amount: typeof amount === 'number' && Number.isFinite(amount) ? amount : null,
+    // o3d-6yho: from the payload the attempt was built from — every money payload writer states it
+    // (both connectors' INVOICE_PAYMENT follow-ups, the receipt enqueue, and markBillPaid's
+    // BILL_PAYMENT), so the ordinary row names its own currency and nothing has to be inferred.
+    currency: typeof currency === 'string' && currency ? currency : null,
     date: pinnedAttemptDate(type, payload) ?? options?.postingOn ?? null,
     marker: marker ?? null,
   }
@@ -330,7 +355,11 @@ export function classifyLedgerSettlement(
           + 'read, so it cannot be ruled out as this attempt',
       }
     }
-    if (Math.abs(record.amount - attempt.amount) <= AMOUNT_EPSILON && record.date === attempt.date) {
+    // o3d-6yho: half one minor unit of the attempt's OWN currency. Compared as numbers because both
+    // sides are numbers the ledger and the wire already agreed on; what changed is only the size of
+    // the band, which is now derived rather than assumed.
+    if (Math.abs(record.amount - attempt.amount) <= ledgerMatchEpsilon(attempt.currency).toNumber()
+      && record.date === attempt.date) {
       return {
         outcome: 'present',
         matchedId: record.id ?? null,

@@ -137,9 +137,49 @@ export function ledgerMinorUnits(currency: string | null): number {
 export function ledgerAmountEpsilon(currency: string | null): Decimal {
   // r16: through the shared resolver, so this rule and the two magnitude rules cannot drift apart on
   // what an unstated currency means.
-  const digits = ledgerMinorUnits(currency)
-  // Half of 10^-digits, written exactly rather than computed in binary floating point.
+  return halfMinorUnit(ledgerMinorUnits(currency))
+}
+
+/** Half of 10^-digits, written exactly rather than computed in binary floating point. */
+function halfMinorUnit(digits: number): Decimal {
   return toDecimal(`0.${'0'.repeat(digits)}5`)
+}
+
+/**
+ * The COARSEST minor-unit precision this repository's currencies use — two decimals, which is every
+ * currency except the seven three-decimal ones and CLF/UYW.
+ *
+ * IT EXISTS FOR EXACTLY ONE RULE, AND THE RULE IS THE REASON (o3d-6yho, 2 of 3). See
+ * `ledgerMatchEpsilon`.
+ */
+export const COARSEST_SUPPORTED_MINOR_UNITS = 2
+
+/**
+ * o3d-6yho (2 of 3) — HOW CLOSE TWO FIGURES HAVE TO BE TO BE THE SAME PAYMENT, AND THE ONE PLACE
+ * WHERE A NARROWER BAND IS THE DANGEROUS DIRECTION.
+ *
+ * `ledgerAmountEpsilon` above answers "how small an amount counts as NOTHING", and every rule built
+ * on it gets safer as it shrinks: a smaller band can only move a document out of "holds nothing" and
+ * into a verdict that withholds. `classifyLedgerSettlement` asks a different question — "is this
+ * ledger record the attempt IMS already made?" — and its two errors do not point the same way:
+ *
+ *   TOO WIDE   a DIFFERENT payment is mistaken for ours, the verdict is `present`, and a payment
+ *              that is genuinely owed is refused. A workflow cost, visible, remediable by hand.
+ *   TOO NARROW our OWN payment's record is not recognised, the verdict is `clear`, and a SECOND
+ *              payment is posted for a receipt the ledger already holds. Irreversible.
+ *
+ * So this rule must not inherit the finest-unit resolution: giving an unstated currency 0.00005 here
+ * would be choosing the duplicate-payment direction on purpose. A STATED currency takes half its own
+ * minor unit — which is 0.005 in every two-decimal currency, so nothing about the ordinary case
+ * moves, and 0.0005 in a Gulf dinar rather than the five whole minor units a flat 0.005 was
+ * conflating. An UNSTATED one takes the widest band the supported currencies produce, which is that
+ * same 0.005: the value this rule has always used, kept deliberately rather than by omission.
+ *
+ * The band is still strictly below one minor unit in every currency, so it can never merge two
+ * figures that a ledger stating that currency could tell apart.
+ */
+export function ledgerMatchEpsilon(currency: string | null): Decimal {
+  return halfMinorUnit(currency == null ? COARSEST_SUPPORTED_MINOR_UNITS : currencyMinorUnits(currency))
 }
 
 /**
