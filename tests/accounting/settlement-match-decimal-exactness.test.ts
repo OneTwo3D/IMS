@@ -8,9 +8,10 @@ import {
   describeAttempt,
   type AttemptDescription,
   type LedgerSettlementProbe,
+  type LedgerSettlementRecord,
 } from '@/lib/domain/accounting/ledger-settlement-evidence'
 import { payloadExactAmount, REGISTERED_AMOUNT_DECIMAL_FIELD } from '@/lib/domain/accounting/registered-amount'
-import { ledgerMatchEpsilon, toDecimal } from '@/lib/domain/math/decimal'
+import { ledgerAmountEpsilon, ledgerMatchEpsilon, toDecimal } from '@/lib/domain/math/decimal'
 
 /**
  * o3d-78rq — THE RULE THAT DECIDES WHETHER MONEY MAY MOVE A SECOND TIME MEASURES BOTH ITS OPERANDS
@@ -496,4 +497,294 @@ test('[o3d-78rq] parseLedgerAmount and readLedgerStatedAmount admit exactly the 
     'it has no honest number — `toNumber()` reads it as ...992')
   assert.equal(readLedgerStatedAmount(beyondTheSignificand, null)?.toFixed(), beyondTheSignificand,
     'but it is a figure, and the figure is exactly what it says')
+})
+
+/**
+ * o3d-r948 — THE NINTH SITE, AND THE REFUSAL THAT HAD BECOME A FALLBACK.
+ *
+ * Three findings from the Codex pass on o3d-78rq, all of the same family: a rule this branch wrote
+ * down and then broke one layer away from where it is stated.
+ *
+ *   HIGH 1  the four COMPLETENESS cross-checks in the settlement probes carried a flat `0.005` over
+ *           wire doubles. o3d-78rq named this as the ninth site and filed it rather than folding it
+ *           in. It is reachable at ONE MINOR UNIT: a KWD invoice reporting `AmountPaid` 0.001 with an
+ *           omitted `Payments` collection had the whole fil swallowed, answered "everything is
+ *           accounted for", and the classifier built `clear` out of an EMPTY record list — which is
+ *           what authorises a second payment.
+ *   HIGH 2  `payloadRegisteredAmount` answers null for three different facts and the two callers
+ *           holding a lossy number beside it took that number for two of them.
+ *   MEDIUM  `classifyLedgerSettlement` refused on an unreadable half of a record without asking
+ *           whether the OTHER half had already proved the record unrelated.
+ *
+ * Every test states the PRECONDITION it turns on, so none of them can pass by the property under
+ * test quietly ceasing to hold.
+ */
+
+/* --- o3d-r948 helpers, for the completeness and unrelated-record sections below. --- */
+
+const xeroInvoice = (body: Record<string, unknown>) =>
+  ledgerDouble({ 'Invoices/inv-1': { Invoices: [{ InvoiceID: 'inv-1', ...body }] } }).get
+
+const probeInvoice = (get: ReturnType<typeof xeroInvoice>) =>
+  probeXeroSettlement({ type: 'INVOICE_PAYMENT', payload: { accountingInvoiceId: 'inv-1' } }, get)
+
+const reasonOf = (probe: LedgerSettlementProbe) => (probe.ok === false ? probe.reason : '')
+
+const attemptFor = (amount: string, marker: string | null = null): AttemptDescription =>
+  ({ amount: toDecimal(amount), currency: 'GBP', date: DATE, marker })
+
+const holding = (records: LedgerSettlementRecord[]): LedgerSettlementProbe => ({ ok: true, records })
+
+/* ------------------------------------------------------------------------------------------- *
+ * 1. THE COMPLETENESS BAND IS THE DOCUMENT'S OWN MINOR UNIT (Codex HIGH 1).
+ * ------------------------------------------------------------------------------------------- */
+
+test('[o3d-r948] a KWD invoice ONE FIL short of its stated settlement does not read as complete', async () => {
+  // THE LOAD-BEARING CASE, END TO END: the ledger states 0.001 paid and returns no payment for it.
+  //
+  // ROUTE: probeXeroSettlement's `AmountPaid` cross-check, banded by completenessBand('KWD'),
+  //        then classifyLedgerSettlement over the probe it returns.
+  // MUTATION: return a flat `toDecimal('0.005')` from `completenessBand` and the fil is swallowed —
+  //        the probe answers ok:true with an EMPTY record list and the classifier answers `clear`.
+
+  // THE PRECONDITION, both halves. One fil is a whole minor unit in KWD, and it is INSIDE the flat
+  // half-penny these checks used to carry — so nothing below can pass on the old band.
+  assert.equal(ledgerAmountEpsilon('KWD').toFixed(), '0.0005', 'half one fil is the KWD band')
+  assert.ok(toDecimal('0.001').lt(toDecimal('0.005')), 'and a whole fil sits inside the band that was there')
+
+  const short = await probeInvoice(xeroInvoice({ CurrencyCode: 'KWD', AmountPaid: 0.001 }))
+  assert.equal(short.ok, false, 'the shortfall is a whole minor unit and the picture is incomplete')
+  assert.match(reasonOf(short), /0\.001 paid against this document but returned no payments/)
+
+  // ...and no `clear` can be built from it. This is the end the finding is about: `clear` is what
+  // authorises a money post, and it was being manufactured out of a collection Xero never sent.
+  const verdict = classifyLedgerSettlement(
+    describeAttempt('INVOICE_PAYMENT', { amount: 0.001, currency: 'KWD', paymentDate: DATE }),
+    short,
+  )
+  assert.equal(verdict.outcome, 'unknown')
+  assert.equal(verdict.outcome === 'unknown' && verdict.cause, 'probe-unreadable')
+
+  // THE DISCRIMINATING HALF. The identical figures in GBP are a tenth of a penny — genuinely noise —
+  // and still read as complete. The band is derived from the document, not tightened for everyone.
+  const gbp = await probeInvoice(xeroInvoice({ CurrencyCode: 'GBP', AmountPaid: 0.001 }))
+  assert.deepEqual(gbp, { ok: true, records: [] })
+  assert.equal(
+    classifyLedgerSettlement(
+      describeAttempt('INVOICE_PAYMENT', { amount: 40, currency: 'GBP', paymentDate: DATE }),
+      gbp,
+    ).outcome,
+    'clear',
+    'and a first post against an ordinary GBP document is NOT withheld',
+  )
+})
+
+test('[o3d-r948] all four completeness checks, on both connectors, are banded by the document currency', async () => {
+  // The finding is about the RULE, not about one branch of it: a flat band left in any of the four
+  // leaves the same false `clear` reachable through a different document shape.
+  //
+  // Each pair below states the same figures twice — once in KWD, where the gap is a whole minor unit,
+  // and once in GBP, where it is noise. The GBP arm is the precondition: it proves the gap is inside
+  // the old flat band, so the KWD arm can only be refusing on the currency-derived one.
+  // MUTATION (any one of them): restore `0.005` at that branch and its KWD arm answers ok:true.
+
+  // (1) ROUTE: the credit-note branch — `Total - RemainingCredit` against the Allocations collection.
+  const creditNote = (currency: string) => ledgerDouble({
+    'CreditNotes/cn-1': {
+      CreditNotes: [{
+        CreditNoteID: 'cn-1',
+        CurrencyCode: currency,
+        Total: 10,
+        RemainingCredit: 9.998,
+        Allocations: [{ Amount: 0.001, Date: DATE, Invoice: { InvoiceID: 'inv-1' } }],
+      }],
+    },
+  }).get
+  const probeNote = (currency: string) => probeXeroSettlement(
+    { type: 'PURCHASE_CREDIT_NOTE_ALLOCATION', payload: { accountingInvoiceId: 'inv-1', creditNoteId: 'cn-1' } },
+    creditNote(currency),
+  )
+  assert.equal((await probeNote('GBP')).ok, true, 'the precondition: two fils of GBP is noise')
+  const noteShort = await probeNote('KWD')
+  assert.equal(noteShort.ok, false)
+  assert.match(reasonOf(noteShort), /0\.002 of this credit note already applied but returned allocations totalling 0\.001/)
+
+  // (2) ROUTE: the invoice `AmountPaid` cross-check — covered end to end above, and re-stated here
+  //     with a NON-EMPTY collection so it is the arithmetic, not the empty list, that refuses.
+  const paidVsList = (currency: string) => probeInvoice(xeroInvoice({
+    CurrencyCode: currency,
+    AmountPaid: 0.002,
+    Payments: [{ PaymentID: 'PAY-1', Date: DATE, Amount: 0.001 }],
+  }))
+  assert.equal((await paidVsList('GBP')).ok, true, 'the precondition')
+  const paidShort = await paidVsList('KWD')
+  assert.equal(paidShort.ok, false)
+  assert.match(reasonOf(paidShort), /0\.002 paid against this document but returned payments totalling 0\.001/)
+
+  // (3) ROUTE: the shape-independent settlement accounting — `Total - AmountDue` against everything
+  //     the probe actually read. `AmountPaid` agrees with the collection here, so ONLY this check can
+  //     be the one that fires.
+  const settledVsExplained = (currency: string) => probeInvoice(xeroInvoice({
+    CurrencyCode: currency,
+    Total: 10.002,
+    AmountDue: 10,
+    AmountPaid: 0.001,
+    AmountCredited: 0,
+    Payments: [{ PaymentID: 'PAY-1', Date: DATE, Amount: 0.001 }],
+  }))
+  assert.equal((await settledVsExplained('GBP')).ok, true, 'the precondition')
+  const settledShort = await settledVsExplained('KWD')
+  assert.equal(settledShort.ok, false)
+  assert.match(reasonOf(settledShort), /0\.002 already settled against this document but only 0\.001 of it is accounted for/)
+
+  // (4) ROUTE: the QuickBooks settlement accounting — `TotalAmt - Balance` against the payment lines
+  //     this probe read, with the currency out of the document's own `CurrencyRef`.
+  const qbo = (currency: string) => ledgerDouble({
+    'bill/bill-1': {
+      Bill: {
+        LinkedTxn: [{ TxnId: '9', TxnType: 'BillPaymentCheck' }],
+        CurrencyRef: { value: currency },
+        TotalAmt: 10.002,
+        Balance: 10,
+      },
+    },
+    'billpayment/9': {
+      BillPayment: { TxnDate: DATE, Line: [{ Amount: 0.001, LinkedTxn: [{ TxnId: 'bill-1', TxnType: 'Bill' }] }] },
+    },
+  }).get
+  const probeBill = (currency: string) => probeQuickBooksSettlement(
+    { type: 'BILL_PAYMENT', payload: { accountingInvoiceId: 'bill-1' } },
+    qbo(currency),
+  )
+  assert.equal((await probeBill('GBP')).ok, true, 'the precondition')
+  const billShort = await probeBill('KWD')
+  assert.equal(billShort.ok, false)
+  assert.match(reasonOf(billShort), /0\.002 already applied to this bill but only 0\.001 of it is accounted for/)
+})
+
+test('[o3d-r948] the ordinary two-decimal document is unmoved, and an UNSTATED currency is stricter', async () => {
+  // The band is HALF one minor unit, which is 0.005 exactly in every two-decimal currency — so the
+  // ordinary Xero and QuickBooks document reads exactly as it always has. It is not "strictly below
+  // one minor unit" taken as loosely as possible: a shortfall of four thousandths of a pound is still
+  // inside the band, and six thousandths is still outside it.
+  //
+  // ROUTE: the `AmountPaid` cross-check, banded by completenessBand.
+  // MUTATION: band at `ledgerAmountEpsilon(null)` regardless of currency and the 0.004 GBP arm
+  //        refuses, which would refuse ordinary documents nothing is wrong with.
+  assert.equal(ledgerAmountEpsilon('GBP').toFixed(), '0.005', 'the precondition: GBP is unchanged')
+  const gbp = (paid: number) => probeInvoice(xeroInvoice({
+    CurrencyCode: 'GBP',
+    AmountPaid: paid,
+    Payments: [{ PaymentID: 'PAY-1', Date: DATE, Amount: 100 }],
+  }))
+  assert.equal((await gbp(100.004)).ok, true, 'four thousandths of a pound is inside the band, as it always was')
+  assert.equal((await gbp(100.006)).ok, false, 'and six thousandths is outside it, as it always was')
+
+  // AN UNSTATED CURRENCY TAKES THE STRICTEST BAND, which is `ledgerAmountEpsilon`'s documented
+  // direction. Too WIDE a band here hides an omission behind a `clear`, so the null arm must not
+  // widen the way `ledgerMatchEpsilon`'s deliberately does.
+  //
+  // ROUTE: ledgerCurrencyCode(undefined) -> completenessBand(null).
+  // MUTATION: resolve a null currency through `ledgerMatchEpsilon` (0.005) and this reads complete.
+  assert.equal(ledgerAmountEpsilon(null).toFixed(), '0.00005', 'the precondition: the null band is the finest')
+  const unstated = await probeInvoice(xeroInvoice({
+    AmountPaid: 100.004,
+    Payments: [{ PaymentID: 'PAY-1', Date: DATE, Amount: 100 }],
+  }))
+  assert.equal(unstated.ok, false, 'a document that does not say what it is stated in is read strictly')
+})
+
+test('[o3d-r948] the completeness arithmetic is exact: a sum of wire doubles no longer decides it', async () => {
+  // The band is only half the finding. The four checks added their terms with `+`, and at magnitude a
+  // double addition can round UPWARD past the shortfall it is meant to expose — the sum then
+  // "explains" money the collection does not contain.
+  //
+  // ROUTE: probeXeroSettlement's `AmountPaid` cross-check, over `sumExact` rather than a `+` reduce.
+  // MUTATION: sum `wireAmounts` with `.reduce((t, a) => t + a.toNumber(), 0)` and this reads complete.
+  //
+  // The magnitude is 2^46, where neighbouring doubles are 0.015625 apart — so adding a penny to it
+  // rounds UP by more than half of that, four times over.
+  const PAYMENTS = [70368744177664, 0.01, 0.01, 0.01, 0.01]
+  const AMOUNT_PAID = 70368744177664.0625
+
+  // THE PRECONDITION, and it is the whole test: added as DOUBLES these five payments reach exactly
+  // the figure Xero states as paid, so the old arithmetic saw no shortfall whatsoever. Added exactly
+  // they are two pence short of it, which is four times the GBP band.
+  const asDoubles = PAYMENTS.reduce((total, a) => total + a, 0)
+  assert.equal(asDoubles, AMOUNT_PAID, 'as doubles, the collection accounts for the stated total EXACTLY')
+  const asDecimals = PAYMENTS.reduce((total, a) => total.add(toDecimal(a)), toDecimal(0))
+  assert.equal(asDecimals.toFixed(), '70368744177664.04', 'exactly, they are two pence short of it')
+  assert.ok(toDecimal(AMOUNT_PAID).sub(asDecimals).gt(ledgerAmountEpsilon('GBP')), 'and that is outside the band')
+
+  const probe = await probeInvoice(xeroInvoice({
+    CurrencyCode: 'GBP',
+    AmountPaid: AMOUNT_PAID,
+    Payments: PAYMENTS.map((Amount, i) => ({ PaymentID: `PAY-${i + 1}`, Date: DATE, Amount })),
+  }))
+  assert.equal(probe.ok, false, 'the shortfall the double addition rounded away is now visible')
+  assert.match(reasonOf(probe), /70368744177664\.06 paid against this document but returned payments totalling 70368744177664\.04/)
+})
+
+test('[o3d-r948] a refusal names the figure at its OWN scale — a fil is not 0.00', () => {
+  // A completeness refusal that rounds to two places prints the shortfall it is about as `0.00`,
+  // which reads to an operator as an arithmetic fault rather than as the missing payment it is.
+  //
+  // ROUTE: the probe refusals, through `formatLedgerMoney`.
+  // MUTATION: restore `.toFixed(2)` at any of them and the sentence says `0.00`.
+  //
+  // Asserted on the reason built above rather than re-fetched: this is the same string, and stating
+  // it here is what pins the RULE rather than one branch's wording.
+  return probeInvoice(xeroInvoice({ CurrencyCode: 'KWD', AmountPaid: 0.001 })).then((probe) => {
+    assert.match(reasonOf(probe), /reports 0\.001 paid/)
+    assert.doesNotMatch(reasonOf(probe), /reports 0\.00 paid/)
+  })
+})
+
+/* ------------------------------------------------------------------------------------------- *
+ * 3. WITHHOLD ONLY WHILE THE RECORD IS STILL A CANDIDATE (Codex MEDIUM).
+ * ------------------------------------------------------------------------------------------- */
+
+test('[o3d-r948] a record proved unrelated by the half that IS readable does not withhold a first payment', () => {
+  // Withholding is the safe direction only while the record could actually be ours. The match rule is
+  // a CONJUNCTION — amount within the band AND the same date — so either readable half failing means
+  // this record is somebody else's, and its unreadable half decides nothing.
+  //
+  // ROUTE: classifyLedgerSettlement's record loop, the `amountRulesItOut || dateRulesItOut` skip.
+  // MUTATION: delete that `continue` and both `clear` assertions below read `unknown`.
+
+  // Unreadable amount, and a date that is not this attempt's.
+  const otherDay = holding([{ amount: null, unreadableAmount: '10.005', date: '2026-01-01', id: 'PAY-9', reference: null }])
+  assert.equal(classifyLedgerSettlement(attemptFor('10.00'), otherDay).outcome, 'clear')
+
+  // Unreadable date, and an amount nothing near this attempt's.
+  const otherAmount = holding([{ amount: toDecimal('999.00'), date: null, id: 'PAY-8', reference: null }])
+  assert.equal(classifyLedgerSettlement(attemptFor('10.00'), otherAmount).outcome, 'clear')
+
+  // THE DISCRIMINATING HALF, and it is what stops this being a loosening: the SAME unreadable record
+  // on the attempt's OWN date is still a candidate, and still withholds.
+  const sameDay = holding([{ amount: null, unreadableAmount: '10.005', date: DATE, id: 'PAY-9', reference: null }])
+  const held = classifyLedgerSettlement(attemptFor('10.00'), sameDay)
+  assert.equal(held.outcome, 'unknown')
+  assert.equal(held.outcome === 'unknown' && held.cause, 'record-unmeasurable')
+
+  // ...and an unreadable date beside an amount that IS within the band withholds too.
+  const nearAmount = holding([{ amount: toDecimal('10.00'), date: null, id: 'PAY-7', reference: null }])
+  assert.equal(classifyLedgerSettlement(attemptFor('10.00'), nearAmount).outcome, 'unknown')
+})
+
+test('[o3d-r948] the MARK still identifies our own settlement whatever its date says', () => {
+  // The residual risk of the refinement is a settlement of OURS whose date was edited in the ledger.
+  // That risk is not new — a record with both halves readable and a different date is skipped today —
+  // and it is the risk the mark exists to retire. The mark is checked before the loop, so the
+  // refinement cannot skip past a record that carries it.
+  //
+  // ROUTE: classifyLedgerSettlement's marker pass, ahead of the record loop.
+  // MUTATION: add the `record.date !== attempt.date` skip to the MARKER loop as well and this reads
+  //        `clear` — the record is skipped by its date before its reference is ever looked at.
+  const marked = holding([{
+    amount: null, unreadableAmount: '10.005', date: '2026-01-01', id: 'PAY-9', reference: 'IMS-abc123abc123',
+  }])
+  const verdict = classifyLedgerSettlement(attemptFor('10.00', 'IMS-abc123abc123'), marked)
+  assert.equal(verdict.outcome, 'present')
+  assert.equal(verdict.outcome === 'present' && verdict.matchedId, 'PAY-9')
 })
