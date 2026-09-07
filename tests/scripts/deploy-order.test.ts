@@ -10135,8 +10135,20 @@ test('r26/r27/r28: the operator resolution acts only on a reading it can attribu
     plantFingerprinted()
     const replacement = `${JSON.stringify({ ...withoutStamp, revoked: ['PUBLIC'] }, null, 2)}\n`
     fixture({ privileges: FENCED, rewriteStateTo: replacement })
-    const moved = runOnTty(paths.resolveWrapper, ['--this-fence-revoked-them'], 'stamp-000000000000')
+    // THE CONFIRMATION IS REACHED FIRST, SO IT HAS TO BE SATISFIED OR THE COMPARE-AND-SWAP IS
+    // NEVER EXERCISED AT ALL. Measured: with a wrong answer here, deleting the digest from the
+    // stamp changed nothing anywhere in this file — the run aborted at the terminal and the write
+    // was never attempted. So the token this record displays is read off a probe run, the record
+    // is put back to the bytes that token belongs to, and the real run types it: the operator
+    // confirms the record they were shown, and the record changes underneath them anyway.
+    const probe = runOnTty(paths.resolveWrapper, ['--this-fence-revoked-them'], 'stamp-000000000000')
+    assert.equal(probe.status, 1, `the probe run must abort at the terminal:\n${probe.output}`)
+    const movedToken = tokenFrom(probe.output, 'stamp')
+    plantFingerprinted()
+    const moved = runOnTty(paths.resolveWrapper, ['--this-fence-revoked-them'], movedToken)
     assert.equal(moved.status, 1, `a record that moved under the audit must not be stamped:\n${moved.output}`)
+    assert.match(moved.output, /NOT STAMPED/, `and must say so:\n${moved.output}`)
+    assert.match(moved.output, /read and audited/, `naming the bytes it was held to:\n${moved.output}`)
     assert.equal(readFileSync(state, 'utf8'), replacement, 'and what is there is what the other writer left')
     assert.equal(JSON.parse(readFileSync(state, 'utf8')).fence_applied, undefined, 'unstamped')
     // AND THE SAME FOR THE REMOVAL, which is the more expensive of the two: a record deleted in
