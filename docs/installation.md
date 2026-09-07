@@ -1233,8 +1233,8 @@ to do:
 | what | path | owner, mode |
 | --- | --- | --- |
 | cutover marker | `/etc/ims-cutover/DEPLOY-FENCED` | `root:root` 0600, in a `root:root` **0700** directory |
-| cutover lock | `/etc/ims-cutover-state/cutover.lock` | `root:root`, in a `root:root` **0755** directory |
-| connection-fence state | `/etc/ims-cutover-state/db-fence/db-connect-fence.json` | the **service user**, in a directory owned by it at **0700** |
+| cutover lock | `/etc/ims-cutover-state/cutover.lock` | `root:root` **0600**, in a `root:root` **0711** directory |
+| connection-fence authority | `/etc/ims-cutover-state/db-fence/db-connect-fence.json` | `root:root` **0644**, in a `root:root` **0755** directory |
 | crontab backup | `/var/lib/one-two-inventory/crontab-<service user>.bak` | `root:root` 0600 |
 
 Set `IMS_CUTOVER_STATE_DIR` **in the environment of the root invocation** to move the crontab
@@ -1255,14 +1255,25 @@ things that lived there were opened or created **by root**:
   link there pointing at `/etc`, at `/root`, or at any directory on the box handed that directory to
   `imsapp` at mode 0700.
 
-They now live under **`/etc/ims-cutover-state`**, root-owned and 0755: nobody else can create,
+They now live under **`/etc/ims-cutover-state`**, root-owned and **0711**: nobody else can create,
 replace or unlink a name inside it, so there is no symlink left to plant at either. It is a
 **literal** in all three scripts, for the same reason the marker's directory and the
 database-identity snapshot's are. `/etc/ims-cutover` was not reused and was not touched: it is 0700
-because it holds the database password and the boot authority, the connection-fence directory has to
-be **writable by the service user** (the fence script runs as that account), and relaxing the one
-directory that exists to be private, so that an app-writable child could be traversed to, is not a
-trade worth making.
+because it holds the database password and the boot authority, the connection-fence record has to be
+**readable by the service user** (the helper that executes a fence and a release runs as that
+account), and relaxing the one directory that exists to be private, so that a readable child could
+be traversed to, is not a trade worth making.
+
+**0711 and not 0755, and the lock is 0600** (o3d-secops r23). r22 justified only the `x` bit on the
+parent and the `r` bit came with it; nothing in there needs to be *listed* by the service account,
+which reaches `db-fence/` by a name compiled into the scripts. And the lock's mode is load-bearing
+after all: `flock(2)` needs nothing but an open descriptor, so **read permission on the lock file is
+permission to hold the cutover exclusion** — at 0644 the service account could open it, take it, and
+freeze every deploy, update and install on the box for as long as it liked. r22 dropped the mode
+*assertion* because an ambient umask would then refuse a cutover for a property nothing repaired; it
+is now **set** instead — created under a stated `umask 077`, and narrowed on the descriptor
+`verify_held_lock()` has just identified (`chmod` of `/proc/self/fd/N`, which is an `fchmod`) with
+the result read back off that same descriptor before `flock` is taken.
 
 **And nothing in that namespace is aimed at a pathname.** The directory is created one component at
 a time by the same symlink-proof walk `install.sh` has always used for `${DATA_DIR}` — plain `mkdir`
@@ -1278,17 +1289,44 @@ descriptor**, which is never reopened. The walk, the lock and the directory now 
 definition each, in `scripts/lib/cutover-namespace.sh`, sourced by all three entrypoints: the walk
 used to exist in `install.sh` alone while the two paths that most needed it were in the other two.
 
-**Upgrading a host that used the old paths.** The lock at `/var/lib/one-two-inventory/cutover.lock`
-is **still taken**, so a cutover already running from a pre-r22 checkout is still excluded. It is
-never created, it is opened read-only, and it is refused unless the descriptor is that name's own
-inode — but a refusal there is a **warning and not a death**, because dying would let `imsapp` stop
-every future cutover on the box with a single symlink it is entitled to create. The warning names
-exactly what is not excluded. A connection-fence record left at
-`/var/lib/one-two-inventory/deploy/db-connect-fence.json` is **named and not imported**: it lists the
-grantees a fence revoked `CONNECT` from, and root does not take `GRANT` statements out of the service
-account's own directory. A fence that really is standing is still found — from the database, which
-is where the release path already asks, and which already refuses with the grantees named when the
-record is gone.
+### Before a cutover: no other cutover
+
+**One lock excludes one population, and it is not everything that can run a cutover on this host.**
+`/etc/ims-cutover-state/cutover.lock` excludes every `deploy.sh`, `update.sh` and `install.sh` that
+takes *that* lock. A cutover launched from a **checkout that predates o3d-secops r22** takes a lock
+under `/var/lib/one-two-inventory`, which the service account may rename between that run's `open`
+and this one's — so **nothing in the code can exclude it**, and since r23 nothing pretends to. Every
+non-dry run says so out loud at the moment it takes its own lock.
+
+r22 shipped a bridge that also locked the old name. It could not do what it claimed: a predecessor
+holds an **inode**, the bridge opened a **name**, and the account that owns that directory can move
+the name out from under the inode and leave a fresh regular file at it — on which every check the
+bridge made passes. The two honest ways out are a **transitional predecessor** that also takes the
+protected lock, and **operator-controlled quiescence**. The first is not available: a transitional
+release would have to reach a host *before* the checkout that moved the lock, and every host with a
+pre-r22 checkout has it already. So it is the second, and this is where the requirement lives:
+
+> **Before starting a cutover, establish that no other one is running.** `fuser -v
+> /etc/ims-cutover-state/cutover.lock` names anything holding the shared lock. For a checkout that
+> predates it, look for a running `deploy.sh`, `update.sh` or `install.sh` from **any** directory
+> (`pgrep -af 'install\.sh|deploy\.sh|update\.sh'`), and prefer removing or upgrading stale
+> checkouts to remembering this step. Two concurrent cutovers migrate one schema twice.
+
+One claim survives in code, with its precondition **proved rather than assumed**: the lock at
+`/var/lib/ims-deploy/deploy.lock` is still taken, but **only** where `stat` says that directory is
+owned by the account running the cutover and is writable by nobody else. Where it is not — including
+where it does not exist — nothing is opened, created or locked there, and what is not excluded is
+named.
+
+**Connection-fence records at the old paths are named and not imported.** Both
+`/var/lib/one-two-inventory/deploy/db-connect-fence.json` (pre-r22) and
+`/var/lib/ims-deploy/db-connect-fence.json` (the namespace `deploy.sh` used before the shared one)
+list the grantees a fence revoked `CONNECT` from, and both were written by the fence helper running
+as the service account. Earlier checkouts **republished** the second one into the shared namespace;
+that made root act on the application's own choice of who gets database access, which is the
+r23 CRITICAL with an older file in it. A fence that really is standing is still found — from the
+database, which is where the release path already asks, and which already refuses with the grantees
+named when the record is gone.
 
 **The cutover marker is NOT one of them, and no variable moves it** (o3d-secops r20). It used to
 live at `/var/lib/one-two-inventory/DEPLOY-FENCED`, root-owned and `0600` — and that protects its
@@ -2550,7 +2588,47 @@ Each one is root-owned and `0700`, **never sources anything from the checkout**,
 state file and four identity values baked in, re-verifies the artefact digest before `exec`, takes
 `DEPLOY_ADMIN_DATABASE_URL` from its own environment or from `APP_DIR/.env` with the same one-key
 reader the entrypoints use, and runs the helper **as the application user**. There is nothing to
-fill in.
+fill in. Since **o3d-secops r23** they must be run **as root** and no longer accept being run by
+the application account: they publish and remove the connection-fence authority, which lives in a
+root-owned directory — see below.
+
+#### Who decides what a release grants (o3d-secops r23)
+
+`/etc/ims-cutover-state/db-fence/db-connect-fence.json` names the roles a `--release` hands
+`GRANT CONNECT` back to. It used to be **published by the helper**, which runs as the service
+account, into a directory owned by that account for exactly that reason — so the account being
+defended against could pre-create or replace the file that decides who gets database access, at any
+time, and the reader authenticated its **shape**. A well-formed JSON object proves the file is
+well-formed JSON; it says nothing about who wrote it. That is the same defect as the legacy fence
+marker one round earlier, with another file in it.
+
+Raising a fence is now **three steps**, and the privileged one is in the middle:
+
+| step | who | what |
+| --- | --- | --- |
+| `--plan` | service account | opens the admin connection, reads the ACL, computes the grantee list, **prints** it as one line of JSON. Revokes nothing and writes nothing. |
+| authorise | **root** | validates that request field by field against the database and role **root itself supplied**, rebuilds the record from its own template (anything the request carried that is not in the template is dropped), and publishes it durably — temporary in the destination directory, `fsync`, atomic rename, directory `fsync`. |
+| `--fence` | service account | **executes** the authority. It cannot write it; an absent or unauthenticated record is a refusal, not a fresh fence. |
+
+`--release` reads that record through the same provenance gate — the **directory** first, because
+`unlink(2)` and `rename(2)` ask for write permission on the parent and nothing about the file — and
+**root** removes it afterwards, once the release is verified and never before. The validator is an
+inline program held in one constant in `scripts/lib/db-fence-protected.sh`; the operator wrappers
+bake in that same text at publication, so there is one program and two callers. It runs as root, so
+it may not be a file out of the checkout, and `node -e` resolves no module and reads no path.
+
+**What is left on the application side: nothing.** There is no request file and no app-writable
+directory in the cutover namespace any more — the plan travels on a pipe. The record stays
+world-**readable** because the executor is unprivileged and must obey it; readable is not writable,
+and it holds role names, not secrets.
+
+**What this does not close, said plainly.** The helper runs with `DEPLOY_ADMIN_DATABASE_URL` in its
+environment for the length of a cutover, so during that window the application account can issue any
+SQL the admin can — this record included. What the split closes is the **persistent** half, which is
+the half that matters: a file planted at any time, by an account holding no credential at all, that
+makes some later privileged release grant `CONNECT` to roles of its choosing. Closing the window
+itself means not handing that account the credential, which is a larger change to how the fence is
+executed than this round makes.
 
 **r33: the banners print the `sudo`, and that is not decoration.** r32 asked of every printed line
 "would it run if pasted?" and answered yes for these — correctly for root, and wrongly for the

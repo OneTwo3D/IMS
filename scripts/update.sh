@@ -3540,7 +3540,7 @@ fence_db_connections() {
   # dereference. Fixing one of the two copies and leaving the other is how this class survives a
   # round, so there is one caller and no second spelling.
   ensure_cutover_state_dirs || die \
-    "The connection-fence directory ${DB_FENCE_DIR} could not be created beneath ${CUTOVER_ROOT_DIR} owned by ${APP_USER} and private to it, so the fence about to be raised would have nowhere it could record what it revoked. NO FENCE HAS BEEN RAISED and nothing has been migrated."
+    "The connection-fence directory ${DB_FENCE_DIR} could not be created beneath ${CUTOVER_ROOT_DIR} owned by this run and writable by nobody else, so the fence about to be raised would have nowhere it could record what it revoked — and nowhere a record could be published that the application account cannot replace. NO FENCE HAS BEEN RAISED and nothing has been migrated."
 
   # THE RECORD IS WRITTEN BEFORE THE REVOKE. A fence raised with no record of what it was aimed
   # at is the state that made r28's recovery impossible, and a record published afterwards is

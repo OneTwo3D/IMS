@@ -6518,7 +6518,7 @@ fence_db_connections() {
   # dereference. Fixing one of the two copies and leaving the other is how this class survives a
   # round, so there is one caller and no second spelling.
   ensure_cutover_state_dirs || die \
-    "The connection-fence directory ${DB_FENCE_DIR} could not be created beneath ${CUTOVER_ROOT_DIR} owned by ${APP_USER} and private to it, so the fence about to be raised would have nowhere it could record what it revoked. NO FENCE HAS BEEN RAISED and nothing has been migrated."
+    "The connection-fence directory ${DB_FENCE_DIR} could not be created beneath ${CUTOVER_ROOT_DIR} owned by this run and writable by nobody else, so the fence about to be raised would have nowhere it could record what it revoked — and nowhere a record could be published that the application account cannot replace. NO FENCE HAS BEEN RAISED and nothing has been migrated."
 
   # THE ONLY FILE THIS FUNCTION RUNS IS THE ROOT-OWNED ONE (o3d-2sm1.5 r31, Codex CRITICAL).
   local rc=0 fence_script
