@@ -4649,7 +4649,7 @@ if $DRY_RUN; then
     echo -e "${YELLOW}[DRY]${RESET}   would import the cutover state under ${LEGACY_CUTOVER_STATE_DIR} into ${CUTOVER_STATE_DIR} before adopting it"
   fi
   if [[ -e "${LEGACY_STATE_DIR_FENCE_FILE}" && ! -e "${FENCE_FILE}" ]]; then
-    echo -e "${YELLOW}[DRY]${RESET}   would move the cutover marker ${LEGACY_STATE_DIR_FENCE_FILE} -> ${FENCE_FILE} before adopting it, and clear the old one once the drop-in names the new one"
+    echo -e "${YELLOW}[DRY]${RESET}   would judge the entry at ${LEGACY_STATE_DIR_FENCE_FILE} through a descriptor and, only if it is a record this run may believe, move it to ${FENCE_FILE} before adopting it, clearing the old one once the drop-in names the new one"
   fi
 else
   import_legacy_cutover_state
