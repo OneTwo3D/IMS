@@ -46,6 +46,8 @@ import {
   REGISTERED_AMOUNT_DECIMAL_FIELD,
   invoicePaymentAmountRoundTrips,
   payloadRegisteredAmount,
+  readPayloadRegisteredAmount,
+  type ExactAmountReading,
 } from '@/lib/domain/accounting/registered-amount'
 
 const STOCK_TX_OPTIONS = { maxWait: 5000, timeout: 20000 }
@@ -62,11 +64,14 @@ export type InvoicePaymentSyncRow = PaymentSyncRow & {
    *
    * `PaymentSyncRow.amount` above stays what it has always been: the JSON number that went on the
    * wire, which is the right figure to compare against a reply from the LEDGER. This is the figure
-   * for ARITHMETIC — `payloadRegisteredAmount`, which prefers the exact decimal string o3d-1xq8
-   * writes beside the number — and it is the only one the capacity sums read. `null` = this payload
-   * will not say, and every reader must take that as unknowable rather than as zero.
+   * for ARITHMETIC — `readPayloadRegisteredAmount`, which prefers the exact decimal string o3d-1xq8
+   * writes beside the number — and it is the only one the capacity sums read. Anything but `stated`
+   * is unknowable rather than zero.
+   *
+   * o3d-r948 r2 (Codex HIGH 2): a READING, so `not-stated` and `refused` stay apart all the way to
+   * the two sites that hold a lossy number beside it. See {@link ExactAmountReading}.
    */
-  registeredAmount: Decimal | null
+  registeredAmount: ExactAmountReading
   paymentId: string | null
   /** The ledger document this row settles — null on rows queued before the payload carried it. */
   accountingInvoiceId: string | null
@@ -127,7 +132,7 @@ export async function loadInvoicePaymentSyncRows(
       amount: typeof payload.amount === 'number' ? payload.amount : null,
       // o3d-6abj: and the EXACT figure beside it, through the one reader, for the arithmetic that
       // decides whether more money may move. See `InvoicePaymentSyncRow.registeredAmount`.
-      registeredAmount: payloadRegisteredAmount(r.payload, documentCurrency),
+      registeredAmount: readPayloadRegisteredAmount(r.payload, documentCurrency),
       settlementBasis: r.settlementBasis,
       paymentId: payloadPaymentId(r.payload),
       // o3d-hbgo: WHICH ledger invoice this settled. A row against a document the order no longer has
@@ -164,6 +169,7 @@ export function payloadPaymentId(payload: unknown): string | null {
 export {
   REGISTERED_AMOUNT_DECIMAL_FIELD,
   payloadRegisteredAmount,
+  readPayloadRegisteredAmount,
   invoicePaymentAmountRoundTrips,
 } from '@/lib/domain/accounting/registered-amount'
 

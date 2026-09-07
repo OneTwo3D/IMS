@@ -91,9 +91,113 @@ function exactPayloadDecimal(value: string): Decimal | null {
  * it is today — no row is rewritten and no row gets worse.
  */
 export function payloadRegisteredAmount(payload: unknown, currency: string): Decimal | null {
+  return statedAmountOnly(readPayloadRegisteredAmount(payload, currency))
+}
+
+/* ------------------------------------------------------------------------------------------- *
+ * o3d-r948 r2 (Codex HIGH 2) — THE TRI-STATE, AS A TYPE THAT CANNOT LOSE IT AGAIN.
+ * ------------------------------------------------------------------------------------------- */
+
+/**
+ * WHY A `Decimal | null` WAS NOT ENOUGH, STATED ONCE.
+ *
+ * The readers below answer three DIFFERENT facts and the old signature had two values for them:
+ *
+ *   STATED       the payload names a figure and this code will spend it.
+ *   NOT-STATED   the payload names none. There is nothing to refuse: a legacy row that predates
+ *                every exact field, or a body compacted to `{}`. A caller holding a lossy number
+ *                beside it may read THAT, because doing so is exactly what this code did before the
+ *                exact fields existed, and no such row is made worse.
+ *   REFUSED      the payload DOES name one and this code will not read it — a present
+ *                `amountDecimal` that is not a string or does not parse, or a figure stated in a
+ *                currency that is not the one asked about. `exactPayloadDecimal` already says why
+ *                that must never fall back: "a payload that carries this field is a payload written
+ *                by a build that promised it is exact; if the string is unreadable, that promise is
+ *                broken". A currency the caller did not ask for is the same claim about the UNIT —
+ *                the number beside it is money in some other denomination, and spending it is
+ *                arithmetic across two units wearing a plausible figure.
+ *
+ * Both fallback sites in this repository collapsed REFUSED into NOT-STATED and spent the lossy
+ * number: `syncRowSettledAmount` and the unresolved-attempt description in
+ * `invoice-payment-registration.ts`. Neither could have done otherwise — the value they were handed
+ * did not carry the distinction. So the distinction is now IN THE TYPE, and the one rule that is
+ * allowed to fall back is written once, in {@link exactAmountReadingOrLegacy}.
+ */
+export type ExactAmountRefusal =
+  /** `amountDecimal` is present and is not a string at all. */
+  | 'exact-decimal-not-a-string'
+  /** `amountDecimal` is present, is a string, and is not a decimal numeral this code will read. */
+  | 'exact-decimal-malformed'
+  /** The payload names no currency, so nothing it states can be known to be in the caller's unit. */
+  | 'currency-not-stated'
+  /** It names one, and it is not the caller's. */
+  | 'currency-mismatch'
+  /** A SUM of readings, one of whose terms was itself refused or unreadable. */
+  | 'sum-term-unreadable'
+
+export type ExactAmountReading =
+  | { kind: 'stated'; amount: Decimal }
+  | { kind: 'not-stated' }
+  | { kind: 'refused'; reason: ExactAmountRefusal }
+
+/** The one NOT-STATED value, so the absence of a reading and a stated absence are the same object. */
+export const EXACT_AMOUNT_NOT_STATED: ExactAmountReading = { kind: 'not-stated' }
+
+/**
+ * THE COLLAPSE, NAMED — for the callers where `null` ALREADY withholds.
+ *
+ * `invoice-payment-capacity.ts`, `invoice-payment-registration.ts`'s live-registration sum,
+ * `payment-reversal.ts` and `xero/invoice-delta.ts`'s `sumRegisteredAmounts` all refuse outright on a
+ * null: NOT-STATED and REFUSED both mean "this sum cannot be taken", and neither reaches a fallback.
+ * For those the two facts are genuinely interchangeable, and collapsing them is correct rather than
+ * merely convenient. It is a named function so the collapse is greppable, and so that the next caller
+ * that wants a fallback has to reach for the reading instead.
+ */
+export function statedAmountOnly(reading: ExactAmountReading): Decimal | null {
+  return reading.kind === 'stated' ? reading.amount : null
+}
+
+/**
+ * THE ONLY PLACE A LEGACY NUMBER MAY STAND IN FOR AN EXACT ONE.
+ *
+ * A caller that holds both an exact reading and the lossy wire number beside it asks this, and it
+ * answers a reading rather than a figure so that the caller can still tell a refusal from a silence.
+ * The rule, whole:
+ *
+ *   STATED      the exact figure, as read.
+ *   REFUSED     STAYS REFUSED. The number beside it is the very figure the refusal is about.
+ *   NOT-STATED  the number's OWN exact decimal reading — which is precisely what every reader made
+ *               of such a row before the exact fields existed — or NOT-STATED again when there is no
+ *               finite number either.
+ */
+export function exactAmountReadingOrLegacy(
+  reading: ExactAmountReading | undefined,
+  legacy: number | null | undefined,
+): ExactAmountReading {
+  const stated = reading ?? EXACT_AMOUNT_NOT_STATED
+  if (stated.kind !== 'not-stated') return stated
+  if (typeof legacy !== 'number' || !Number.isFinite(legacy)) return EXACT_AMOUNT_NOT_STATED
+  return { kind: 'stated', amount: toDecimal(legacy) }
+}
+
+/**
+ * {@link payloadRegisteredAmount}, answering WHICH of the three facts it found.
+ *
+ * The currency gate is asked FIRST and on its own terms: a payload stating another currency has an
+ * amount, and the fact worth carrying is that it is not this document's — not that no figure exists.
+ */
+export function readPayloadRegisteredAmount(payload: unknown, currency: string): ExactAmountReading {
   const p = (payload && typeof payload === 'object' ? payload : {}) as Record<string, unknown>
-  if (typeof p.currency !== 'string' || p.currency !== currency) return null
-  return payloadExactAmount(payload)
+  if (typeof p.currency !== 'string') {
+    // A payload with NOTHING in it names no amount either, and calling that a refusal would turn
+    // every retention-compacted row into a stated-but-unreadable figure. So the empty body keeps its
+    // old meaning — there is nothing here — and only a body that carries a figure can refuse.
+    return p[REGISTERED_AMOUNT_DECIMAL_FIELD] === undefined && typeof p.amount !== 'number'
+      ? EXACT_AMOUNT_NOT_STATED
+      : { kind: 'refused', reason: 'currency-not-stated' }
+  }
+  if (p.currency !== currency) return { kind: 'refused', reason: 'currency-mismatch' }
+  return readPayloadExactAmount(payload)
 }
 
 /**
@@ -115,14 +219,29 @@ export function payloadRegisteredAmount(payload: unknown, currency: string): Dec
  * made of a historical row before that field existed, so no row is rewritten and no row gets worse.
  */
 export function payloadExactAmount(payload: unknown): Decimal | null {
+  return statedAmountOnly(readPayloadExactAmount(payload))
+}
+
+/**
+ * {@link payloadExactAmount}, answering WHICH of the three facts it found — see
+ * {@link ExactAmountReading}.
+ */
+export function readPayloadExactAmount(payload: unknown): ExactAmountReading {
   const p = (payload && typeof payload === 'object' ? payload : {}) as Record<string, unknown>
   const exact = p[REGISTERED_AMOUNT_DECIMAL_FIELD]
-  // PRESENT DECIDES, readable or not — see `exactPayloadDecimal`.
-  if (exact !== undefined) return typeof exact === 'string' ? exactPayloadDecimal(exact) : null
-  if (typeof p.amount !== 'number' || !Number.isFinite(p.amount)) return null
+  // PRESENT DECIDES, readable or not — see `exactPayloadDecimal`. And now it decides in words: the
+  // field being there is what makes an unreadable value a REFUSAL rather than a silence.
+  if (exact !== undefined) {
+    if (typeof exact !== 'string') return { kind: 'refused', reason: 'exact-decimal-not-a-string' }
+    const parsed = exactPayloadDecimal(exact)
+    return parsed === null
+      ? { kind: 'refused', reason: 'exact-decimal-malformed' }
+      : { kind: 'stated', amount: parsed }
+  }
+  if (typeof p.amount !== 'number' || !Number.isFinite(p.amount)) return EXACT_AMOUNT_NOT_STATED
   // The double's own exact decimal reading, which is what the caller's summation made of it before
   // this field existed. Unchanged for every historical row.
-  return toDecimal(p.amount)
+  return { kind: 'stated', amount: toDecimal(p.amount) }
 }
 
 /**

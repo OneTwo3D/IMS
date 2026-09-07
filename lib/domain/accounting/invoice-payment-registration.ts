@@ -17,6 +17,11 @@ import {
   classifyLedgerSettlement,
   type LedgerSettlementRecord,
 } from './ledger-settlement-evidence'
+import {
+  exactAmountReadingOrLegacy,
+  statedAmountOnly,
+  type ExactAmountReading,
+} from '@/lib/domain/accounting/registered-amount'
 import { isOperatorAssertedSettlement } from './sync-row-settlement'
 import {
   addMoney,
@@ -91,11 +96,14 @@ export type ExistingInvoicePaymentSync = {
    * WHAT WAS REGISTERED, EXACTLY, in the ORDER's currency — `payloadRegisteredAmount`'s answer, and
    * the only field the capacity sum below reads (o3d-6abj).
    *
-   * `null` / absent = this payload will not say, which the sum must read as UNKNOWABLE and never as
-   * zero. It covers a payload with no amount, one whose exact decimal string does not parse, and one
-   * stating a different currency — all three refuse rather than fall back to the double.
+   * Anything but `stated` = this payload will not say, which the sum must read as UNKNOWABLE and
+   * never as zero. It covers a payload with no amount, one whose exact decimal string does not parse,
+   * and one stating a different currency — all three refuse rather than fall back to the double.
+   *
+   * o3d-r948 r2 (Codex HIGH 2): and it is a READING, because the unresolved-attempt description
+   * below DOES hold a lossy number beside it and was falling back to it for the last two.
    */
-  registeredAmount?: Decimal | null
+  registeredAmount?: ExactAmountReading
   /** The date that attempt sent, `YYYY-MM-DD`. Null when the payload did not pin one. */
   paymentDate?: string | null
   /** The local Payment row it was queued for; null on rows queued before that was recorded. */
@@ -307,7 +315,12 @@ export function decideInvoicePaymentRegistration(input: {
         // decision has already refused a receipt whose currency differs from the order's, so there is
         // no second answer to give here.
         {
-          amount: attempt.registeredAmount ?? (attempt.amount == null ? null : toDecimal(attempt.amount)),
+          // o3d-r948 r2 (Codex HIGH 2) — AND THE FALLBACK IS THE TRI-STATE'S, NOT `??`'s. `??` reads
+          // "no exact figure was stated" out of a value that also means "one was and IMS refused it",
+          // and then spends the very number the refusal is about. `exactAmountReadingOrLegacy` is the
+          // one place allowed to substitute the number, and it substitutes for a silence only — a
+          // refused attempt describes itself as undescribable, which withholds.
+          amount: statedAmountOnly(exactAmountReadingOrLegacy(attempt.registeredAmount, attempt.amount)),
           currency: input.orderCurrency,
           date: attempt.paymentDate ?? null,
           marker: attempt.settlementMarker ?? null,
@@ -398,12 +411,13 @@ export function decideInvoicePaymentRegistration(input: {
   // o3d-6abj: asked of `registeredAmount`, so a row whose exact decimal string is present but will
   // not parse, or which states a currency that is not this order's, refuses here rather than being
   // read from the lossy JSON number beside it.
-  if (live.some((r) => r.registeredAmount == null)) {
+  // o3d-r948 r2: anything but `stated` — the same two facts the null covered, and both still refuse.
+  if (live.some((r) => r.registeredAmount?.kind !== 'stated')) {
     return { register: false, refusal: 'LEDGER_AMOUNT_UNKNOWN', ledgerTotal: input.ledgerTotal }
   }
 
   const alreadyRegistered = live.reduce(
-    (sum, r) => addMoney(sum, r.registeredAmount as Decimal),
+    (sum, r) => addMoney(sum, (r.registeredAmount as { kind: 'stated'; amount: Decimal }).amount),
     toDecimal(0),
   )
   // What is LEFT of the invoice. With no live rows this is the whole invoice, which is exactly the

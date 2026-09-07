@@ -27,7 +27,7 @@ import { resolvePurchaseOrderFxRateToBase } from '@/lib/domain/purchasing/purcha
 import { validateRecordSupplierCreditNote, buildSupplierCreditNoteSyncPayload, resolveSupplierCreditNoteTaxType, resolveSupplierCreditNoteTransitBase } from '@/lib/domain/purchasing/supplier-credit-note'
 import { recordTransitSubledgerMovement } from '@/lib/domain/accounting/transit-subledger-movement'
 import { settlementStatus, type PaymentSyncRow, type SettlementVerdict } from '@/lib/domain/accounting/settlement-status'
-import { payloadRegisteredAmount } from '@/lib/domain/accounting/registered-amount'
+import { readPayloadRegisteredAmount } from '@/lib/domain/accounting/registered-amount'
 import {
   BILL_PAYMENT_ENQUEUE_DECLINED_MESSAGE,
   billPaymentRefusalMessage,
@@ -580,7 +580,7 @@ async function latestBillPaymentSyncRows(
   /**
    * o3d-4ozd — THE CURRENCY THE ROWS' AMOUNTS ARE TO BE READ IN: the PO's, which is the currency its
    * bills are stated in. Required for the same reason `loadInvoicePaymentSyncRows` requires it —
-   * `payloadRegisteredAmount` will not read an amount without knowing what unit it is in, and a
+   * `readPayloadRegisteredAmount` will not read an amount without knowing what unit it is in, and a
    * registration raised in another currency settles none of this bill.
    */
   documentCurrency: string,
@@ -610,7 +610,7 @@ async function latestBillPaymentSyncRows(
       // taken on. The BILL_PAYMENT enqueue writes no `amountDecimal` beside the number yet, so today
       // this is the double's own exact decimal reading — identical to what the comparison made of it
       // before — and it becomes exact for nothing but free the moment that writer carries one.
-      registeredAmount: payloadRegisteredAmount(r.payload, documentCurrency),
+      registeredAmount: readPayloadRegisteredAmount(r.payload, documentCurrency),
       settlementBasis: r.settlementBasis,
     })
   }

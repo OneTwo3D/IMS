@@ -21,6 +21,12 @@ import {
   isOperatorAssertedSettlement,
 } from '@/lib/domain/accounting/sync-row-settlement'
 import {
+  exactAmountReadingOrLegacy,
+  statedAmountOnly,
+  type ExactAmountReading,
+  type ExactAmountRefusal,
+} from '@/lib/domain/accounting/registered-amount'
+import {
   addMoney,
   compareDecimal,
   ledgerAmountEpsilon,
@@ -46,12 +52,19 @@ export type PaymentSyncRow = {
    * exact decimal string o3d-1xq8 writes beside the number, carried through `loadInvoicePaymentSyncRows`
    * and through the aggregate below without a hop through a double.
    *
-   * ABSENT OR NULL IS NOT ZERO AND NOT A REFUSAL — it is "this row states no exact figure", and
-   * `syncRowSettledAmount` then reads the number's own exact decimal value, which is precisely what
-   * this comparison made of it before the field existed. A historical row is read exactly as it is
-   * today; only rows that CAN be exact become so.
+   * o3d-r948 r2 (Codex HIGH 2) — AND IT IS A READING, NOT A FIGURE-OR-NULL.
+   *
+   * ABSENT, or `not-stated`, IS NOT ZERO AND NOT A REFUSAL — it is "this row states no exact
+   * figure", and `syncRowSettledAmount` then reads the number's own exact decimal value, which is
+   * precisely what this comparison made of it before the field existed. A historical row is read
+   * exactly as it is today; only rows that CAN be exact become so.
+   *
+   * `refused` IS A DIFFERENT FACT AND WAS INDISTINGUISHABLE FROM IT. `payloadRegisteredAmount`
+   * answers null for a payload whose exact decimal string will not parse and for one stating another
+   * currency; both arrived here as the same null the absent field arrives as, and both then got the
+   * lossy number beside them — the number the refusal is ABOUT. See {@link ExactAmountReading}.
    */
-  registeredAmount?: Decimal | null
+  registeredAmount?: ExactAmountReading
   /** The local Payment row it was queued for; null on rows the order's own invoice follow-up queued. */
   paymentId?: string | null
   /**
@@ -85,11 +98,27 @@ export type PaymentSyncRow = {
  * out of a figure nobody stated.
  */
 export function syncRowSettledAmount(row: PaymentSyncRow): Decimal | null {
-  if (row.registeredAmount != null) return row.registeredAmount
-  // A non-finite `amount` answers NULL rather than throwing: today it fails both comparisons and the
-  // row reads SETTLED, and an unreadable figure must not become a page that will not render.
-  if (typeof row.amount !== 'number' || !Number.isFinite(row.amount)) return null
-  return toDecimal(row.amount)
+  return statedAmountOnly(syncRowAmountReading(row))
+}
+
+/**
+ * o3d-r948 r2 (Codex HIGH 2) — THE SAME READING, SAYING WHICH OF THE THREE FACTS IT IS.
+ *
+ * THE DEFECT. `syncRowSettledAmount` was `row.registeredAmount ?? toDecimal(row.amount)`, and this
+ * repository's own rule — written for `exactPayloadDecimal` and quoted at
+ * {@link ExactAmountReading} — is that a present-but-unreadable exact figure is a refusal, never a
+ * fallback to the lossy number beside it. Three outcomes arrived as one null (no exact figure was
+ * ever written; one was and will not parse; one was, in another currency) and the last two took the
+ * wire number. That is the rule broken in the code that states it.
+ *
+ * The fallback now belongs to `exactAmountReadingOrLegacy`, which is the one place in this
+ * repository allowed to substitute a number for a figure, and it substitutes for NOT-STATED only.
+ *
+ * A non-finite `amount` answers NOT-STATED rather than throwing: today it fails both comparisons and
+ * the row reads SETTLED, and an unreadable figure must not become a page that will not render.
+ */
+export function syncRowAmountReading(row: PaymentSyncRow): ExactAmountReading {
+  return exactAmountReadingOrLegacy(row.registeredAmount, row.amount)
 }
 
 /**
@@ -139,6 +168,22 @@ export type SettlementStatus =
    * amount. Not a settlement and not a rejection: a claim with a weaker basis than either.
    */
   | 'ASSERTED_UNVERIFIED'
+  /**
+   * o3d-r948 r2 — THE ROW STATES A SETTLED FIGURE AND IMS WILL NOT READ IT.
+   *
+   * Its exact decimal string does not parse, or it is stated in a currency that is not this
+   * document's. Either way the amount comparison below CANNOT be taken, and the two verdicts it
+   * would have produced are both unavailable.
+   *
+   * IT EXISTS SO THAT THE REFUSAL IS NOT A GREEN BADGE. A `null` amount falls through to SETTLED —
+   * that is the module's long-standing reading of "nobody stated a figure", and it is defensible
+   * for a row that states none. It is NOT defensible for a row that states one this code declined
+   * to read: nothing has been compared, so "Settled in the ledger" is a claim with no basis at all,
+   * and it is exactly the green-over-an-outstanding-balance this module exists to prevent. So the
+   * refusal gets its own status and its own `discrepancy: true`, which is the difference between a
+   * silence and a refusal being visible to whoever has to fix it.
+   */
+  | 'SETTLEMENT_AMOUNT_UNREADABLE'
 
 /**
  * WHAT THE VERDICT RESTS ON — the answer's basis, returned alongside the answer (o3d-nf9i r3).
@@ -169,6 +214,27 @@ export type SettlementVerdict = {
   detail: string
   /** What the verdict rests on. Never inferred by the caller — see SettlementEvidenceBasis. */
   basis: SettlementEvidenceBasis
+}
+
+/**
+ * The refusal, in words an operator can act on — never the enum name.
+ *
+ * Each sentence names the FIGURE or the UNIT as the thing that failed, because that is where the
+ * person reading it has to go: a malformed decimal string is IMS's own record being wrong, while a
+ * currency mismatch is a registration that belongs to another document's money entirely.
+ */
+function describeAmountRefusal(reason: ExactAmountRefusal): string {
+  switch (reason) {
+    case 'exact-decimal-malformed':
+    case 'exact-decimal-not-a-string':
+      return 'the exact amount recorded with it is not a figure IMS can read'
+    case 'currency-not-stated':
+      return 'it does not record which currency its amount is in'
+    case 'currency-mismatch':
+      return 'it records an amount in a different currency from this document'
+    case 'sum-term-unreadable':
+      return 'one of the registrations it sums states an amount IMS cannot read'
+  }
 }
 
 export function settlementStatus(input: {
@@ -368,7 +434,28 @@ export function settlementStatus(input: {
       // as the SAME number, and "recorded 35184372088832.01 against a settlement of
       // 35184372088832.01, so it is OVER-paid" is a sentence no operator can act on.
       const total = documentTotalDecimal(input.totalForeign)
-      const paid = syncRowSettledAmount(p)
+      // o3d-r948 r2 (Codex HIGH 2) — A REFUSED FIGURE IS NOT A MISSING ONE, AND MUST NOT READ GREEN.
+      //
+      // `syncRowAmountReading` now says which of the three facts the row holds. `not-stated` keeps
+      // its old behaviour exactly — no comparison, and the verdict falls through to SETTLED — because
+      // that is what this module has always made of a row that names no figure. `refused` is the case
+      // that used to be indistinguishable from it AND used to be handed the wire number instead; it
+      // can be neither, so it is named.
+      const reading = syncRowAmountReading(p)
+      if (reading.kind === 'refused') {
+        return {
+          status: 'SETTLEMENT_AMOUNT_UNREADABLE',
+          discrepancy: true,
+          basis: 'LEDGER_CONFIRMED',
+          detail:
+            `The ledger accepted payment ${p.externalTransactionId}, but IMS cannot read what this ` +
+            `registration says it settled (${describeAmountRefusal(reading.reason)}), so the amount has ` +
+            `NOT been compared against the document total. This does NOT say the document is unpaid — ` +
+            `it says nothing here has checked how much of it was paid. Open payment ` +
+            `${p.externalTransactionId} in the accounting system and confirm its amount against the total.`,
+        }
+      }
+      const paid = statedAmountOnly(reading)
       // o3d-6yho: half one minor unit of THIS document's currency, not a hard-coded half-penny.
       const settlementBand = ledgerAmountEpsilon(input.currency ?? null)
       if (total !== null && paid !== null && total.gt(0)) {
@@ -553,14 +640,28 @@ export function aggregatePaymentSyncRows(rows: PaymentSyncRow[]): PaymentSyncRow
   // difference that was destroyed before it was consulted. Each term is read through
   // `syncRowSettledAmount` — the exact decimal string where the row states one, and the double's own
   // exact decimal reading where it does not, which is precisely what this reduce made of it before.
-  const exactAmounts = synced.map((r) => syncRowSettledAmount(r))
-  const amountUnknown = exactAmounts.some((a) => a === null)
-  const syncedRegistered = amountUnknown
-    ? null
-    : exactAmounts.reduce<Decimal>((sum, a) => addMoney(sum, a as Decimal), toDecimal(0))
+  //
+  // o3d-r948 r2: and the SUM carries the same tri-state its terms do. A term that was REFUSED makes
+  // the sum a refusal — the aggregate is then a row stating a figure IMS will not read, which is
+  // exactly what the term was — while a term that merely states nothing makes the sum state nothing,
+  // which is what this reduce has always answered for such a row. Collapsing the two here would have
+  // reinstated the finding one function further along.
+  const readings = synced.map((r) => syncRowAmountReading(r))
+  const refusedTerm = readings.find((a) => a.kind === 'refused')
+  const syncedRegistered: ExactAmountReading = refusedTerm
+    ? { kind: 'refused', reason: 'sum-term-unreadable' }
+    : readings.some((a) => a.kind !== 'stated')
+      ? { kind: 'not-stated' }
+      : {
+          kind: 'stated',
+          amount: readings.reduce<Decimal>(
+            (sum, a) => addMoney(sum, (a as { kind: 'stated'; amount: Decimal }).amount),
+            toDecimal(0),
+          ),
+        }
   // THE NUMBER IS NOW A CONVERSION OF THE EXACT SUM, not a sum of conversions. It stays on the row
   // because every reader that only DISPLAYS the figure reads `amount`; nothing decides on it.
-  const syncedAmount = syncedRegistered === null ? null : syncedRegistered.toNumber()
+  const syncedAmount = syncedRegistered.kind === 'stated' ? syncedRegistered.amount.toNumber() : null
   // THE BASIS AGGREGATES WORST-FIRST, exactly as the status does (o3d-nf9i r3). One asserted leg
   // among several makes the WHOLE settlement unverified: the sum being compared against the document
   // total now contains a number nothing checked, so the comparison cannot be trusted for any of it.

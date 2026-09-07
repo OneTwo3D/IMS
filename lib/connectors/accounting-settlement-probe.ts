@@ -18,7 +18,18 @@ import type { AccountingSyncType } from '@/app/generated/prisma/client'
 // is where `ledgerAmountMagnitudeBound` is, and this is the import direction QuickBooks' own payment
 // poller already takes for exactly the same rule.
 import { ledgerCurrencyCode, readLedgerStatedAmount } from '@/lib/connectors/xero/invoice-delta'
+// o3d-r948: the completeness refusals print figures, and a KWD shortfall of one fil is `0.00` at two
+// places. The rule for showing a money figure without rounding away what the verdict turned on is
+// already written down for the classifier's own sentences, so it is the same function.
+import { formatLedgerMoney } from '@/lib/domain/accounting/ledger-settlement-evidence'
 import type { LedgerSettlementProbe, LedgerSettlementRecord } from '@/lib/domain/accounting/ledger-settlement-evidence'
+import {
+  compareDecimal,
+  ledgerAmountEpsilon,
+  subtractMoney,
+  toDecimal,
+  type Decimal,
+} from '@/lib/domain/math/decimal'
 import { settlementDocumentAnchorFilters, settlementDocumentKey } from '@/lib/domain/accounting/money-post-document'
 import type { MoneyPostLock } from '@/lib/domain/accounting/money-post-lock'
 
@@ -39,6 +50,86 @@ function str(value: unknown): string {
 
 function num(value: unknown): number | null {
   return typeof value === 'number' && Number.isFinite(value) ? value : null
+}
+
+/* ------------------------------------------------------------------------------------------- *
+ * o3d-r948 — THE COMPLETENESS CROSS-CHECKS, IN DECIMAL, AT THIS DOCUMENT'S OWN MINOR UNIT.
+ * ------------------------------------------------------------------------------------------- */
+
+/**
+ * HOW FAR A LEDGER'S OWN TOTAL MAY EXCEED THE COLLECTION IT SENT BEFORE THE PICTURE IS INCOMPLETE.
+ *
+ * THE DEFECT (o3d-78rq's ninth site, filed rather than folded in; Codex HIGH 1). All four checks
+ * below carried a flat `0.005` and did their arithmetic in `number`, while o3d-6yho had already made
+ * the classifier's band a fraction of the document's own minor unit and o3d-78rq had made both of the
+ * classifier's operands exact. A flat half-penny is FIVE whole minor units in a Gulf dinar and fifty
+ * in CLF. So a KWD invoice reporting `AmountPaid` 0.001 — one fil, a real payment — with an omitted
+ * `Payments` collection had its whole shortfall swallowed: the completeness question answers
+ * "everything is accounted for", the probe returns `ok: true` with an EMPTY record list, and
+ * `classifyLedgerSettlement` builds `clear` out of it. `clear` is what authorises a money post, so
+ * the cost of the swallowed fil is a SECOND payment.
+ *
+ * THE BAND IS `ledgerAmountEpsilon` — HALF ONE MINOR UNIT OF THE DOCUMENT'S OWN CURRENCY.
+ *
+ * Codex asked for a tolerance "strictly below one minor unit", not for half of one, and half of one
+ * is the value chosen anyway. The reason is what a band is FOR: it absorbs representation noise in
+ * figures the ledger has already quantized to its own minor unit, and it must never absorb a real
+ * omission. Every genuine settlement is a whole multiple of that unit, so the smallest shortfall that
+ * can exist is ONE unit and any band strictly below one unit refuses it. Within that constraint the
+ * choice is between two failure directions, and they are not symmetric here:
+ *
+ *   TOO WIDE    a real omission is swallowed, the record list is short, and a `clear` is built from
+ *               it. That is a duplicate payment — irreversible.
+ *   TOO NARROW  a document whose figures differ by a sliver refuses, the row fails visibly, and a
+ *               human resolves it. A workflow cost.
+ *
+ * So the narrower of the two available answers is taken, and `ledgerAmountEpsilon` — "how small an
+ * amount counts as NOTHING", which is the same question this asks of a shortfall — is that answer,
+ * already written down for both connectors. It is 0.005 exactly in every two-decimal currency, so
+ * nothing about the ordinary Xero or QuickBooks document moves; it is 0.0005 in a Gulf dinar, where
+ * the fil that was being swallowed now refuses.
+ *
+ * AN UNSTATED CURRENCY TAKES THE STRICTEST BAND, which is `ledgerAmountEpsilon`'s documented
+ * direction and the right one here for the same reason: too large a band hides an omission behind a
+ * clear. This is NOT `ledgerMatchEpsilon`, whose null arm deliberately widens — that rule's danger is
+ * failing to RECOGNISE our own payment, and this one's is failing to notice a missing one.
+ */
+function completenessBand(currency: string | null): Decimal {
+  return ledgerAmountEpsilon(currency)
+}
+
+/**
+ * A wire figure as its OWN exact decimal reading, or null when the ledger stated no number.
+ *
+ * DELIBERATELY NOT `readLedgerStatedAmount`. That reader refuses a figure finer than its currency or
+ * above the magnitude bound, and a refusal HERE would SKIP the completeness check — the lenient
+ * direction, and the exact opposite of this rule's asymmetry. The question these checks ask is "does
+ * the ledger's own total agree with the collection it sent me?", and its answer must not change
+ * because a figure was too finely stated to compare. What changes is only the ARITHMETIC: each
+ * double is read at its own exact decimal value and added without rounding, so the sum contributes no
+ * error of its own on top of the terms.
+ */
+function wireDecimal(value: unknown): Decimal | null {
+  const n = num(value)
+  return n === null ? null : toDecimal(n)
+}
+
+/** Does the ledger claim anything at all here — more than one band above zero? */
+function statesAnything(value: Decimal, currency: string | null): boolean {
+  return compareDecimal(value, completenessBand(currency)) > 0
+}
+
+/** Is `stated` more than one band above what `accounted` explains? Exact on both operands. */
+function shortBy(stated: Decimal, accounted: Decimal, currency: string | null): boolean {
+  return compareDecimal(subtractMoney(stated, accounted), completenessBand(currency)) > 0
+}
+
+/** Sum exact readings, or null the moment one of them is unreadable. */
+function sumExact(values: Array<Decimal | null>, seed: Decimal | null = toDecimal(0)): Decimal | null {
+  return values.reduce<Decimal | null>(
+    (sum, value) => (sum === null || value === null ? null : sum.add(value)),
+    seed,
+  )
 }
 
 /**
@@ -158,11 +249,9 @@ type XeroCreditNoteResponse = {
  * nothing, so an `AmountCredited` it should have accounted for shows up as an unexplained
  * shortfall and refuses.
  */
-function sumApplied(collection: XeroAppliedCollection | undefined): number | null {
-  return (collection ?? []).reduce<number | null>(
-    (sum, entry) => (sum === null || num(entry.AppliedAmount) === null ? null : sum + (entry.AppliedAmount as number)),
-    0,
-  )
+function sumApplied(collection: XeroAppliedCollection | undefined): Decimal | null {
+  // o3d-r948: exact, like every other term of the completeness arithmetic.
+  return sumExact((collection ?? []).map((entry) => wireDecimal(entry.AppliedAmount)))
 }
 
 /** The shape of the connector read each probe needs, so both can be driven without a network. */
@@ -186,6 +275,9 @@ export async function probeXeroSettlement(
     const note = res.data?.CreditNotes?.[0]
     if (!note) return { ok: false, reason: 'Xero returned no credit note for that id' }
     const allocations = note.Allocations ?? []
+    // o3d-r948: hoisted, because the completeness arithmetic below is sized by it too — the note's
+    // OWN currency, which is what its allocation amounts are stated in.
+    const noteCurrency = ledgerCurrencyCode(note.CurrencyCode)
     // Only allocations against THIS bill: the same credit note legitimately offsets others.
     const records: LedgerSettlementRecord[] = allocations
       .filter((a) => str(a.Invoice?.InvoiceID).toLowerCase() === invoiceId.toLowerCase())
@@ -193,7 +285,7 @@ export async function probeXeroSettlement(
       // match and falls back to amount and date alone. Stated rather than left to be inferred from
       // a missing property.
       .map((a) => ({
-        ...statedAmount(a.Amount, ledgerCurrencyCode(note.CurrencyCode)),
+        ...statedAmount(a.Amount, noteCurrency),
         date: normaliseXeroSettlementDate(a.Date),
         reference: null,
       }))
@@ -208,23 +300,20 @@ export async function probeXeroSettlement(
     // any means, so it is the thing the returned collection has to add up to. ALL allocations
     // count here, not only this bill's: the credit legitimately offsets other documents, and it is
     // the COLLECTION's completeness being tested, not this bill's share of it.
-    const creditTotal = num(note.Total)
-    const remaining = num(note.RemainingCredit)
-    const applied = creditTotal !== null && remaining !== null ? creditTotal - remaining : null
-    const allocated = allocations.reduce<number | null>(
-      (sum, a) => (sum === null || num(a.Amount) === null ? null : sum + (a.Amount as number)),
-      0,
-    )
-    if (applied !== null && applied > XERO_AMOUNT_EPSILON
-      && (allocated === null || applied - allocated > XERO_AMOUNT_EPSILON)) {
+    const creditTotal = wireDecimal(note.Total)
+    const remaining = wireDecimal(note.RemainingCredit)
+    const applied = creditTotal !== null && remaining !== null ? subtractMoney(creditTotal, remaining) : null
+    const allocated = sumExact(allocations.map((a) => wireDecimal(a.Amount)))
+    if (applied !== null && statesAnything(applied, noteCurrency)
+      && (allocated === null || shortBy(applied, allocated, noteCurrency))) {
       return {
         ok: false,
-        reason: `Xero reports ${applied.toFixed(2)} of this credit note already applied but returned `
+        reason: `Xero reports ${formatLedgerMoney(applied)} of this credit note already applied but returned `
           + (allocated === null
             ? 'an allocation whose amount could not be read'
             : allocations.length === 0
               ? 'no allocations'
-              : `allocations totalling ${allocated.toFixed(2)}`),
+              : `allocations totalling ${formatLedgerMoney(allocated)}`),
       }
     }
     return { ok: true, records }
@@ -243,7 +332,7 @@ export async function probeXeroSettlement(
   // cross-check asks whether the COLLECTION is complete, not whether a figure in it can be compared
   // exactly, so it must go on reading exactly what it read before — see `statedAmount`.
   // (Their own exactness is o3d-r948; it is stated at `XERO_AMOUNT_EPSILON` rather than fixed here.)
-  const wireAmounts = (invoice.Payments ?? []).map((p) => num(p.Amount))
+  const wireAmounts = (invoice.Payments ?? []).map((p) => wireDecimal(p.Amount))
   const records: LedgerSettlementRecord[] = (invoice.Payments ?? []).map((p) => ({
     ...statedAmount(p.Amount, invoiceCurrency),
     date: normaliseXeroSettlementDate(p.Date),
@@ -262,15 +351,16 @@ export async function probeXeroSettlement(
   // Directional on purpose — only a SHORTFALL escalates. A record whose amount is unreadable
   // already yields `unknown` in the classifier, so it is excluded here rather than counted as
   // zero (which would fake a shortfall).
-  const amountPaid = num(invoice.AmountPaid)
-  if (amountPaid !== null && wireAmounts.every((a) => a !== null)) {
-    const seen = wireAmounts.reduce((total, a) => total + (a ?? 0), 0)
-    if (amountPaid - seen > XERO_AMOUNT_EPSILON) {
-      return {
-        ok: false,
-        reason: `Xero reports ${amountPaid.toFixed(2)} paid against this document but returned `
-          + `${records.length === 0 ? 'no payments' : `payments totalling ${seen.toFixed(2)}`}`,
-      }
+  const amountPaid = wireDecimal(invoice.AmountPaid)
+  // The `every` gate is kept EXACTLY as it was: an unreadable payment amount excludes this check
+  // rather than refusing it, because such a record already yields `unknown` in the classifier and
+  // counting it as zero here would fake a shortfall. Only the arithmetic and the band have changed.
+  const seen = wireAmounts.every((a) => a !== null) ? sumExact(wireAmounts) : null
+  if (amountPaid !== null && seen !== null && shortBy(amountPaid, seen, invoiceCurrency)) {
+    return {
+      ok: false,
+      reason: `Xero reports ${formatLedgerMoney(amountPaid)} paid against this document but returned `
+        + `${records.length === 0 ? 'no payments' : `payments totalling ${formatLedgerMoney(seen)}`}`,
     }
   }
 
@@ -296,51 +386,42 @@ export async function probeXeroSettlement(
   // fails visibly and a human resolves it. A credit that IS itemised explains itself and changes
   // no verdict, so the ordinary part-credited invoice still pays automatically — which is the
   // difference between reading the collections and simply refusing on `AmountCredited > 0`.
-  const total = num(invoice.Total)
-  const amountDue = num(invoice.AmountDue)
-  const amountCredited = num(invoice.AmountCredited)
+  const total = wireDecimal(invoice.Total)
+  const amountDue = wireDecimal(invoice.AmountDue)
+  const amountCredited = wireDecimal(invoice.AmountCredited)
   const settled = total !== null && amountDue !== null
-    ? total - amountDue
+    ? subtractMoney(total, amountDue)
     // Fallback for a response that omits the totals: the two component fields, which is still
     // strictly more than `AmountPaid` alone was.
-    : amountPaid !== null && amountCredited !== null ? amountPaid + amountCredited : null
-  const applied = [sumApplied(invoice.CreditNotes), sumApplied(invoice.Prepayments), sumApplied(invoice.Overpayments)]
-    .reduce<number | null>((sum, part) => (sum === null || part === null ? null : sum + part), 0)
+    : amountPaid !== null && amountCredited !== null ? amountPaid.add(amountCredited) : null
+  const applied = sumExact([
+    sumApplied(invoice.CreditNotes), sumApplied(invoice.Prepayments), sumApplied(invoice.Overpayments),
+  ])
   // Null the moment any read settlement is unmeasurable: an unknown addend makes the whole sum
   // unknown, and an unknown sum must not be allowed to "explain" anything.
-  const explained = wireAmounts.reduce<number | null>(
-    (sum, amount) => (sum === null || amount === null ? null : sum + amount),
-    applied,
-  )
-  if (settled !== null && settled > XERO_AMOUNT_EPSILON
-    && (explained === null || settled - explained > XERO_AMOUNT_EPSILON)) {
+  const explained = sumExact(wireAmounts, applied)
+  if (settled !== null && statesAnything(settled, invoiceCurrency)
+    && (explained === null || shortBy(settled, explained, invoiceCurrency))) {
     return {
       ok: false,
-      reason: `Xero reports ${settled.toFixed(2)} already settled against this document but `
+      reason: `Xero reports ${formatLedgerMoney(settled)} already settled against this document but `
         + (explained === null
           ? 'IMS could not measure what it holds against it'
-          : `only ${explained.toFixed(2)} of it is accounted for by settlements IMS can read`)
-        + (amountCredited !== null && amountCredited > XERO_AMOUNT_EPSILON
-          ? ` (${amountCredited.toFixed(2)} of it credited, not paid)`
+          : `only ${formatLedgerMoney(explained)} of it is accounted for by settlements IMS can read`)
+        + (amountCredited !== null && statesAnything(amountCredited, invoiceCurrency)
+          ? ` (${formatLedgerMoney(amountCredited)} of it credited, not paid)`
           : ''),
     }
   }
   return { ok: true, records }
 }
 
-/**
- * Money compares to the half-penny in the COMPLETENESS cross-checks above.
- *
- * o3d-78rq — AND THIS IS NO LONGER "the same tolerance the classifier uses", WHICH IS WHAT THIS
- * COMMENT USED TO SAY. o3d-6yho gave the classifier a band derived from the document's own minor
- * unit and o3d-78rq made both of its operands `Decimal`s; these four checks kept the flat constant
- * and the wire doubles. That is a real gap and it is tracked as o3d-r948, not fixed here: the
- * completeness question — "does the ledger's own total of what settles this document agree with the
- * collection it sent me?" — is a different question from "is this record the payment IMS made", and
- * changing both in one commit would have made neither reviewable. Its dangerous direction is TOO
- * WIDE, since a swallowed shortfall lets a `clear` be built from an incomplete list.
- */
-const XERO_AMOUNT_EPSILON = 0.005
+// o3d-r948 — `XERO_AMOUNT_EPSILON` AND `QBO_AMOUNT_EPSILON` WERE HERE, BOTH `0.005`, AND BOTH ARE
+// GONE. They were the ninth site of o3d-78rq's enumeration: two flat half-pennies measuring wire
+// doubles, in a file whose classifier operand had already become exact and whose band had already
+// become a fraction of the document's own minor unit. The direction they failed in was TOO WIDE,
+// which is the direction that lets a `clear` be built from an incomplete list — see
+// `completenessBand`, which is now the single answer for all four checks and both connectors.
 
 type QboLinkedTxn = { TxnId?: string; TxnType?: string }
 type QboPaymentLine = { Amount?: number; LinkedTxn?: QboLinkedTxn[] }
@@ -423,9 +504,6 @@ const QBO_NON_SETTLING_LINK_TYPES: ReadonlySet<string> = new Set([
   'Invoice', 'Bill', 'InventoryQuantityAdjustment',
 ])
 
-/** The same flat half-penny, in the same completeness role, with the same gap — see o3d-r948. */
-const QBO_AMOUNT_EPSILON = 0.005
-
 /**
  * The amount a QuickBooks payment applied to ONE document.
  *
@@ -433,19 +511,34 @@ const QBO_AMOUNT_EPSILON = 0.005
  * line for a single document. Summing the lines linked to this document is what compares like with
  * like. A payment with no readable line for it yields null, which reads as `unknown`.
  */
-function qboAmountAppliedTo(lines: QboPaymentLine[] | undefined, documentId: string, txnType: string): number | null {
-  if (!lines) return null
-  let total: number | null = null
+function qboAmountAppliedTo(
+  lines: QboPaymentLine[] | undefined,
+  documentId: string,
+  txnType: string,
+): { wire: number | null; exact: Decimal | null } {
+  if (!lines) return { wire: null, exact: null }
+  let wire: number | null = null
+  let exact: Decimal | null = null
   for (const line of lines) {
     const linked = (line.LinkedTxn ?? []).some(
       (t) => str(t.TxnId) === documentId && str(t.TxnType) === txnType,
     )
     if (!linked) continue
     const amount = num(line.Amount)
-    if (amount === null) return null
-    total = (total ?? 0) + amount
+    if (amount === null) return { wire: null, exact: null }
+    // TWO READINGS OF THE SAME LINES, FROM ONE WALK (o3d-r948).
+    //
+    // `wire` is the double sum, UNCHANGED, and it is what `statedAmount` is asked about — the record's
+    // amount must be a figure `readLedgerStatedAmount` can prove the ledger stated, and a summed
+    // double is exactly the shape that rule exists to judge (o3d-78rq).
+    //
+    // `exact` is the same lines added as decimals, for the completeness arithmetic, which asks a
+    // different question and must not lose a minor unit in its own addition. They are returned
+    // together so nothing can ever sum a DIFFERENT set of lines for the two answers.
+    wire = (wire ?? 0) + amount
+    exact = (exact ?? toDecimal(0)).add(toDecimal(amount))
   }
-  return total
+  return { wire, exact }
 }
 
 export async function probeQuickBooksSettlement(
@@ -518,7 +611,7 @@ export async function probeQuickBooksSettlement(
   // records carry the exact ones. `qboAmountAppliedTo` SUMS a payment's lines, and a sum of doubles is
   // exactly where a figure stops being the one the ledger stated — which is why the reading below is
   // asked of the sum rather than assumed of it.
-  const wireApplied: Array<number | null> = []
+  const wireApplied: Array<Decimal | null> = []
   for (const id of settlementIds) {
     const res = await qboGet<Record<string, { TxnDate?: string; PrivateNote?: string; Line?: QboPaymentLine[] } | undefined>>(
       `${settlementPath}/${encodeURIComponent(id)}`,
@@ -530,9 +623,9 @@ export async function probeQuickBooksSettlement(
     if (!settlement) return { ok: false, reason: `QuickBooks returned no ${settlementKey} ${id}` }
     const date = str(settlement.TxnDate)
     const applied = qboAmountAppliedTo(settlement.Line, documentId, linkedType)
-    wireApplied.push(applied)
+    wireApplied.push(applied.exact)
     records.push({
-      ...statedAmount(applied, documentCurrency),
+      ...statedAmount(applied.wire, documentCurrency),
       date: date.length >= 10 ? date.slice(0, 10) : null,
       id,
       // PrivateNote is where IMS writes its mark on this connector.
@@ -558,15 +651,12 @@ export async function probeQuickBooksSettlement(
   // alternative is the fence being told the document is clear when an operator has already
   // settled it. Restoring automatic coverage means READING those entities (each has its own line
   // and link shape), which is a bigger change than this fence should carry — tracked separately.
-  const total = num(body.TotalAmt)
-  const balance = num(body.Balance)
-  const applied = total !== null && balance !== null ? total - balance : null
+  const total = wireDecimal(body.TotalAmt)
+  const balance = wireDecimal(body.Balance)
+  const applied = total !== null && balance !== null ? subtractMoney(total, balance) : null
   // Null the moment any read settlement's applied amount is unreadable: an unknown addend makes
   // the whole sum unknown, and an unknown sum must not be allowed to "explain" anything.
-  const explained = wireApplied.reduce<number | null>(
-    (sum, amount) => (sum === null || amount === null ? null : sum + amount),
-    0,
-  )
+  const explained = sumExact(wireApplied)
   // `Payment` and the bill-payment spellings appear in BOTH tables — they are the covered shape on
   // one document kind and an uncovered one on the other — so the payment table wins first, or a
   // settlement this probe has just READ would be counted as one it cannot account for.
@@ -584,13 +674,14 @@ export async function probeQuickBooksSettlement(
           + 'total or balance, so IMS cannot tell how much of it is already settled',
       }
     }
-  } else if (applied > QBO_AMOUNT_EPSILON && (explained === null || applied - explained > QBO_AMOUNT_EPSILON)) {
+  } else if (statesAnything(applied, documentCurrency)
+    && (explained === null || shortBy(applied, explained, documentCurrency))) {
     return {
       ok: false,
-      reason: `QuickBooks reports ${applied.toFixed(2)} already applied to this ${documentKey.toLowerCase()} but `
+      reason: `QuickBooks reports ${formatLedgerMoney(applied)} already applied to this ${documentKey.toLowerCase()} but `
         + (explained === null
           ? 'IMS could not measure what the payments it links applied to it'
-          : `only ${explained.toFixed(2)} of it is accounted for by payments IMS can read`)
+          : `only ${formatLedgerMoney(explained)} of it is accounted for by payments IMS can read`)
         + (uncovered.length > 0
           ? ` (${uncovered.join(', ')} linked)`
           : links.length === 0 ? ' and links no transaction that accounts for it' : ''),

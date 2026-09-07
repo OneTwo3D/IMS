@@ -353,9 +353,20 @@ export function describeAttempt(
  * two decimals is shown at ITS OWN scale rather than rounded to fit. `Decimal.toFixed` never uses
  * exponential notation, so a large amount stays readable as digits at either width.
  */
-function money(value: Decimal): string {
+/**
+ * o3d-r948 r2 — EXPORTED, because the settlement PROBES print figures too and were rounding them.
+ *
+ * Their completeness refusals said `applied.toFixed(2)`, which was harmless while their band was a
+ * flat half-penny and is not once the band is a fraction of the document's own minor unit: a KWD
+ * invoice one fil short produced "Xero reports 0.00 paid against this document but returned no
+ * payments" — a sentence that reads as an arithmetic error rather than as the shortfall it is. The
+ * rule is the same rule, so it is the same function.
+ */
+export function formatLedgerMoney(value: Decimal): string {
   return value.toFixed(Math.max(2, value.decimalPlaces()))
 }
+
+const money = formatLedgerMoney
 
 /**
  * Decide what the ledger says about ONE attempt. Pure: the probe's I/O is the caller's problem, so
@@ -398,7 +409,27 @@ export function classifyLedgerSettlement(
     }
   }
 
+  // o3d-r948 r2 (Codex MEDIUM) — REFUSE ONLY WHILE THE RECORD IS STILL A CANDIDATE.
+  //
+  // The band this loop matches on, hoisted so the "is this record already ruled out?" test below can
+  // ask it of a record whose OTHER discriminator is unreadable.
+  const band = ledgerMatchEpsilon(attempt.currency)
   for (const record of probe.records) {
+    // WHAT AN AVAILABLE DISCRIMINATOR ALREADY SETTLES. The match rule is a CONJUNCTION — the amounts
+    // within the band AND the same date — so either half failing means this record cannot be the
+    // attempt, whatever the other half says. Withholding was the safe direction while the record
+    // might have been ours; a record whose readable date is not this attempt's is somebody else's,
+    // its unreadable amount decides nothing, and holding a genuine FIRST payment back over it is
+    // pure cost with no risk retired.
+    //
+    // IT IS EXACTLY AS SAFE AS WHAT THIS LOOP ALREADY DOES. A record with BOTH halves readable and a
+    // different date is skipped today and can lead to `clear`; the residual risk — a settlement of
+    // ours whose date was edited in the ledger — is the one the MARK exists for and was checked
+    // before this loop was entered. Nothing here weakens that.
+    const amountRulesItOut = record.amount !== null
+      && compareDecimal(subtractMoney(record.amount, attempt.amount).abs(), band) > 0
+    const dateRulesItOut = record.date !== null && record.date !== attempt.date
+    if (amountRulesItOut || dateRulesItOut) continue
     if (record.amount === null || record.date === null) {
       return {
         outcome: 'unknown',
@@ -417,6 +448,8 @@ export function classifyLedgerSettlement(
             + 'read, so it cannot be ruled out as this attempt',
       }
     }
+    // Both halves are readable and neither ruled the record out, so it IS this attempt.
+    //
     // o3d-6yho: half one minor unit of the attempt's OWN currency.
     //
     // o3d-78rq — AND BOTH OPERANDS ARE NOW DECIMALS, so the band decides what the band says. It was
@@ -428,14 +461,11 @@ export function classifyLedgerSettlement(
     // rule is the one that posts a second payment. Nothing is converted now: the attempt carries its
     // payload's exact decimal, the record carries the ledger's stated figure, and the band stays a
     // `Decimal` all the way into the comparison.
-    if (compareDecimal(subtractMoney(record.amount, attempt.amount).abs(), ledgerMatchEpsilon(attempt.currency)) <= 0
-      && record.date === attempt.date) {
-      return {
-        outcome: 'present',
-        matchedId: record.id ?? null,
-        detail: `${money(record.amount)} dated ${record.date}`
-          + (record.id ? ` (${record.id})` : ''),
-      }
+    return {
+      outcome: 'present',
+      matchedId: record.id ?? null,
+      detail: `${money(record.amount)} dated ${record.date}`
+        + (record.id ? ` (${record.id})` : ''),
     }
   }
   return { outcome: 'clear' }
