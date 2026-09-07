@@ -314,6 +314,14 @@ readonly DB_FENCE_MANIFEST_FILE="${DB_FENCE_RECOVERY_DIR}/db-fence-artefact.mani
 # exists and runs — see db_fence_publish_operator_wrappers().
 readonly DB_FENCE_RELEASE_WRAPPER="${DB_FENCE_RECOVERY_DIR}/release-db-fence"
 readonly DB_FENCE_REFENCE_WRAPPER="${DB_FENCE_RECOVERY_DIR}/refence-db"
+# AND THE THIRD, WHICH NO CUTOVER EVER RUNS (o3d-secops r26, Codex HIGH). A record published before
+# the applied stamp existed cannot be shown to be either a standing fence or a spent publication,
+# so every automatic path refuses it. This is the one-time, operator-driven way OUT of that
+# refusal: it asks the live ACL -- the only evidence there is -- and then either clears a record no
+# fence stands behind or stamps one that a fence does. It is published alongside the other two so
+# that the refusal can name a path that exists, and it is separate from them because resolving an
+# ambiguity is a decision an operator takes and not a step a deploy performs.
+readonly DB_FENCE_RESOLVE_WRAPPER="${DB_FENCE_RECOVERY_DIR}/resolve-legacy-db-fence"
 
 # The bare specifiers the entry file imports. The transitive closure is resolved from these; a
 # test asserts this list is exactly the set of bare imports in scripts/fence-db-connections.mjs,
@@ -1208,21 +1216,37 @@ db_fence_script_in_use() {
 # execution failure -- this one, the next one, or one nobody has thought of -- is then INERT BY
 # CONSTRUCTION: it can only ever produce another INITIAL fence, held to the strict rule.
 #
-# THE UNSTAMPED RECORD, AND HOW IT IS TOLD APART. A fence raised BEFORE this round is standing and
-# its record has no `fence_applied` key at all; refusing it recovery would strand it, with neither
-# a re-apply nor a release. A half-published record from this round always HAS the key, holding 0,
-# because this validator writes it in the same template that writes every other field. So the
-# discriminator is the key's PRESENCE, not its value:
+# THE UNSTAMPED RECORD IS AMBIGUOUS, AND IT IS REFUSED (o3d-secops r26, Codex HIGH).
 #
-#   key absent            a validator that predates the stamp wrote it -> a fence raised before
-#                         this upgrade, therefore standing -> RECOVERY.
+# r25 read an absent `fence_applied` key as RECOVERY, and the argument for it was: the key is
+# absent only in records a validator predating the stamp wrote, so the record can only be a fence
+# raised before this upgrade, therefore standing. THE FIRST HALF IS TRUE AND THE SECOND DOES NOT
+# FOLLOW. The predecessor published its record BEFORE invoking `--fence`, so its own documented
+# SIGKILL/power-loss window between the rename and `BEGIN` leaves exactly this record with no fence
+# behind it. An absent key dates the WRITER; it says nothing about which phase that writer reached.
+# So an unstamped record is exactly as ambiguous as a present-but-zero one -- and reading it as
+# recovery grants drift tolerance to a fence nobody can show exists, which is the failure direction
+# this file refuses everywhere else.
+#
+#   key absent            AMBIGUOUS. Nothing on the filesystem can settle it -> REFUSE. Nothing is
+#                         published, nothing is revoked, and the refusal names the record and the
+#                         wrapper that resolves it.
 #   key present, === 1    root saw `--fence` succeed -> standing -> RECOVERY.
 #   key present, anything published, never applied -> NOT standing -> INITIAL, strict rule.
 #   else
 #
-# That discriminator holds because ${DB_FENCE_DIR} is root-owned and unwritable by anything else:
-# the key is absent only in records root itself wrote before this upgrade, and ${APP_USER} can
-# neither add it nor strip it. It is the same argument `fence_mode` already rests on.
+# The two present-key readings hold because ${DB_FENCE_DIR} is root-owned and unwritable by
+# anything else: ${APP_USER} can neither raise the stamp to buy the lax rule nor strip it. It is
+# the same argument `fence_mode` rests on. What that argument never established -- and what r25
+# borrowed it for -- is what an ABSENT key means, and the answer is that it means two things.
+#
+# AND ONLY THE ACL CAN SETTLE IT, WHICH IS WHY THE RESOLUTION IS AN OPERATOR STEP AND NOT A
+# HEURISTIC HERE. The mtime, the owner, the mode and the fields of that file all describe its
+# writer. Whether the recorded grantees have actually lost CONNECT does not, and it is the fence's
+# entire effect. ${DB_FENCE_RESOLVE_WRAPPER} -- root-owned, published beside the other two, run BY
+# AN OPERATOR and never by a cutover -- drives `--audit-authority` against the live database and
+# then either clears a record no fence stands behind or stamps one that a fence does. It refuses on
+# a mixed reading. This branch reads no database at all.
 #
 # AND WHERE IT FAILS, SAID PLAINLY. If the process dies between a successful REVOKE and root
 # raising the stamp, the record says 0 and a fence IS standing. The next run reads INITIAL, the
@@ -1270,6 +1294,11 @@ function text(v, max) {
 var wantDatabase = process.argv[1] || "";
 var wantAppRole = process.argv[2] || "";
 var destination = process.argv[3] || "";
+// ADVISORY ONLY, AND DELIBERATELY NOT REQUIRED (o3d-secops r26). The fourth argument is the path
+// of the operator resolution wrapper, named in the refusal an unstamped record produces so that
+// the message carries a command instead of a description of one. It licenses nothing and is never
+// executed here; a run that omits it gets the same refusal with one sentence fewer.
+var resolveWrapper = process.argv[4] || "";
 if (!wantDatabase || !wantAppRole || !destination) fail("the validator was not told which database, role and destination this run is fencing");
 var raw = "";
 try { raw = fs.readFileSync(0, "utf8"); } catch (e) { fail("the plan could not be read: " + e.message); }
@@ -1316,8 +1345,21 @@ if (priorMeta !== null) {
     if (prior === null || typeof prior !== "object" || Array.isArray(prior)) {
       process.stderr.write("The record at " + destination + " is not a usable JSON object, so it cannot show that a fence was applied. Publishing an INITIAL authority.\n");
     } else if (!Object.prototype.hasOwnProperty.call(prior, "fence_applied")) {
-      standing = true;
-      process.stderr.write("The record at " + destination + " carries no applied stamp at all, so it was published by a validator that predates the stamp and can only be a fence raised before this upgrade. Publishing a RECOVERY authority.\n");
+      // THE AMBIGUOUS RECORD, REFUSED (o3d-secops r26, Codex HIGH). See the section above this
+      // program: an absent stamp dates the writer and does not say whether that writer's REVOKE
+      // committed, so this record is both "a fence raised before the stamp existed" and "a
+      // publication by that same predecessor that never reached BEGIN". Publishing either mode
+      // over it would be a guess -- and the recovery guess is the one that hands drift tolerance
+      // to a fence nobody can show exists, which is how a later --release comes to GRANT CONNECT
+      // back to a role an administrator deliberately removed.
+      process.stderr.write("The record at " + destination + " carries no applied stamp at all (no `fence_applied` key), so it was published by a validator that predates the stamp. That dates its WRITER and says nothing about whether that writer's REVOKE ever committed: the predecessor published its record BEFORE running the fence, so this is equally what a fence raised then leaves and what a publication killed before BEGIN leaves.\n");
+      process.stderr.write("Nothing on the filesystem can tell those apart. Only the live ACL can: a fence is standing exactly when the grantees this record names have lost CONNECT.\n");
+      if (resolveWrapper) {
+        process.stderr.write("Resolve it once, deliberately, with " + resolveWrapper + " -- it reads the ACL and either clears a record no fence stands behind or stamps one that a fence does, and refuses on a mixed reading. If a fence IS standing and you would rather simply take it down, the release wrapper restores from this record without needing the stamp.\n");
+      } else {
+        process.stderr.write("Resolve it once, deliberately, with the operator resolution wrapper in the cutover recovery directory -- it reads the ACL and either clears a record no fence stands behind or stamps one that a fence does. If a fence IS standing and you would rather simply take it down, the release wrapper restores from this record without needing the stamp.\n");
+      }
+      fail("an authority that cannot be shown to be either standing or spent may not be re-fenced automatically. Nothing has been published and nothing has been revoked.");
     } else if (prior.fence_applied === 1) {
       standing = true;
     } else {
@@ -1380,8 +1422,12 @@ db_fence_authorise_plan() {
   # `require` would look, so an environment variable is a way to make this root-side run execute a
   # file nobody here named. They belong to whatever shell launched the cutover rather than to
   # ${APP_USER}, which is why this is a hardening and not the finding; it costs one word.
+  # THE FOURTH ARGUMENT IS TEXT FOR A MESSAGE (o3d-secops r26). An unstamped record is refused, and
+  # a refusal an operator cannot act on is a refusal that gets worked around; this hands the
+  # validator the path of the wrapper that resolves it. It is root's own constant, it is never
+  # executed by the program it is passed to, and the refusal happens with or without it.
   env -u NODE_OPTIONS -u NODE_PATH -u NODE_REPL_EXTERNAL_MODULE \
-    node -e "${program}" -- "${expected_database}" "${expected_app_role}" "${destination}"
+    node -e "${program}" -- "${expected_database}" "${expected_app_role}" "${destination}" "${DB_FENCE_SUDO_PREFIX}${DB_FENCE_RESOLVE_WRAPPER}"
 }
 
 # ---------------------------------------------------------------------------
@@ -1471,6 +1517,83 @@ db_fence_mark_authority_applied() {
   local destination="$1" program
   [[ -n "${destination}" ]] || return 1
   program="$(db_fence_mark_applied_program)" || return 1
+  [[ -n "${program}" ]] || return 1
+  env -u NODE_OPTIONS -u NODE_PATH -u NODE_REPL_EXTERNAL_MODULE \
+    node -e "${program}" -- "${destination}"
+}
+
+# ---------------------------------------------------------------------------
+# IS THIS THE AMBIGUOUS RECORD, AND NOTHING ELSE? (o3d-secops r26, Codex HIGH)
+#
+# The first step of the operator resolution, and it is a GATE rather than a reading: the wrapper
+# that follows it is allowed to CLEAR a record or STAMP one applied, so before it asks the database
+# anything it has to establish that the record in front of it is the one narrow thing the whole
+# procedure is for -- an authority a validator predating the stamp published, carrying no
+# `fence_applied` key at all.
+#
+# EVERYTHING ELSE IS REFUSED BY NAME, and each refusal is a different mistake:
+#   * no record          nothing to resolve; if a fence is standing it is standing behind no
+#                        account of what it revoked, which this cannot fix and must not paper over.
+#   * `fence_applied` 1  already resolved, or raised by this round. There is no ambiguity to
+#                        settle and stamping it again would say a decision was taken that was not.
+#   * `fence_applied` 0  NOT ambiguous either: this round's own validator wrote it, and it means
+#                        published-never-applied. The ordinary path already reads it as INITIAL and
+#                        re-fences it under the strict rule; there is nothing for an operator here.
+#   * not an authority   truncated, not JSON, not root's. A record that cannot be read is not a
+#                        record whose grantee list may be handed to an ACL comparison.
+#
+# ROOT ONLY, and READ-ONLY: it opens nothing, writes nothing and removes nothing. It prints the
+# grantee list so the operator sees what the ACL is about to be asked about, and its EXIT STATUS is
+# the whole of what the wrapper acts on.
+#
+# It is a FUNCTION for the reason the other two programs are: the script-scope census in
+# tests/scripts/install-root-safe-writes.test.ts reads declarations one line at a time and cannot
+# carry a fifty-line quoted value.
+db_fence_legacy_inspect_program() {
+  cat <<'LEGACY_INSPECT_EOF'
+
+var fs = require("fs");
+var path = require("path");
+function fail(m) { process.stderr.write("NOT RESOLVABLE: " + m + "\n"); process.exit(1); }
+var destination = process.argv[1] || "";
+if (!destination) fail("the inspection was not told which authority it is examining");
+var directory = path.dirname(destination);
+var meta = null;
+try { meta = fs.lstatSync(directory); } catch (e) { fail(directory + " could not be examined (" + e.message + ")"); }
+if (!meta.isDirectory()) fail(directory + " is not a directory");
+if (meta.uid !== process.getuid()) fail(directory + " is owned by uid " + meta.uid + " and this run is uid " + process.getuid() + ", so what it holds could have been put there by somebody else");
+if ((meta.mode & 18) !== 0) fail(directory + " is writable by group or other, so any name in it can be renamed or unlinked by another account");
+var fileMeta = null;
+try { fileMeta = fs.lstatSync(destination); } catch (e) { fail("there is no connection-fence authority at " + destination + " to resolve (" + e.message + "). Nothing has been changed."); }
+if (!fileMeta.isFile()) fail(destination + " is not a regular file");
+if (fileMeta.uid !== process.getuid()) fail(destination + " is owned by uid " + fileMeta.uid + " and this run is uid " + process.getuid() + ", so it was not published by this account and its grantee list is somebody else's");
+var raw = "";
+try { raw = fs.readFileSync(destination, "utf8"); } catch (e) { fail(destination + " could not be opened (" + e.message + ")"); }
+var record = null;
+try { record = JSON.parse(raw); } catch (e) { fail(destination + " does not hold valid JSON (" + e.message + ")"); }
+if (record === null || typeof record !== "object" || Array.isArray(record)) fail(destination + " does not hold a JSON object");
+if (record.state_complete !== 1) fail(destination + " does not carry the completeness sentinel, so it is truncated or is not an authority record. Nothing may be concluded from a record that is not whole.");
+if (Object.prototype.hasOwnProperty.call(record, "fence_applied")) {
+  if (record.fence_applied === 1) fail(destination + " is already stamped applied, so it records a fence that is known to stand and there is nothing ambiguous about it. To take that fence down, use the release wrapper.");
+  fail(destination + " carries `fence_applied` at " + JSON.stringify(record.fence_applied) + ", which this round's own validator writes and which means PUBLISHED, NEVER APPLIED. That is not ambiguous either: the ordinary cutover already reads it as an INITIAL fence and re-fences under the strict rule. There is nothing here for an operator to resolve.");
+}
+if (!Array.isArray(record.revoked) || record.revoked.length < 1) fail(destination + " names no grantees, so there is nothing whose CONNECT could show whether a fence stands. Nothing may be concluded from it.");
+for (var i = 0; i < record.revoked.length; i++) {
+  if (typeof record.revoked[i] !== "string" || record.revoked[i].length === 0) fail("grantee " + i + " in " + destination + " is not a usable role name");
+}
+process.stderr.write("The authority at " + destination + " carries no applied stamp: it was published by a validator that predates the stamp, and it is ambiguous between a fence raised then and a publication that never reached BEGIN. It names " + record.revoked.length + " grantee(s) on " + JSON.stringify(record.database) + ": " + record.revoked.join(", ") + ".\n");
+process.stderr.write("Asking the live ACL which of the two it is. Nothing has been changed yet.\n");
+LEGACY_INSPECT_EOF
+}
+
+# Establish that ${1} is the ambiguous legacy record and nothing else. ROOT ONLY, READ-ONLY. Same
+# capture-with-status and same stripped interpreter environment as the other two, for the same two
+# reasons: an empty program would exit 0 having examined nothing, and an environment variable is a
+# way to make a root-side `node` load a file nobody here named.
+db_fence_inspect_legacy_authority() {
+  local destination="$1" program
+  [[ -n "${destination}" ]] || return 1
+  program="$(db_fence_legacy_inspect_program)" || return 1
   [[ -n "${program}" ]] || return 1
   env -u NODE_OPTIONS -u NODE_PATH -u NODE_REPL_EXTERNAL_MODULE \
     node -e "${program}" -- "${destination}"
@@ -1662,6 +1785,14 @@ db_fence_raise() {
 #   ${DB_FENCE_SUDO_PREFIX}${DB_FENCE_RELEASE_WRAPPER}   release the standing fence
 #   ${DB_FENCE_SUDO_PREFIX}${DB_FENCE_REFENCE_WRAPPER}   raise it again
 #
+# AND A THIRD THAT IS NOT ONE OF THEM (o3d-secops r26, Codex HIGH). ${DB_FENCE_RESOLVE_WRAPPER} is
+# not printed by any banner and is named by exactly one thing: the refusal an authority with no
+# applied stamp produces. It is the one-time way out of an ambiguity nothing on the filesystem can
+# settle, it is driven BY AN OPERATOR rather than by a cutover, and it is published here with the
+# other two so that the refusal names a path that already exists on the host reading it. It is
+# generated in the same loop, from the same body, and differs only in which of the three functions
+# at the bottom the dispatch line calls.
+#
 # THE PREFIX IS NOT DECORATION (o3d-2sm1.5 r33, Codex HIGH). r32 asked of every printed line
 # "would it run if pasted?" and answered yes for these — correctly for root, and wrongly for the
 # person most likely to be reading them. The wrappers are root-owned and 0700; an operator who
@@ -1702,7 +1833,7 @@ db_fence_publish_operator_wrappers() {
   _fence_protected_dir_ready || return 1
   artefact_digest="$(fence_record_artefact_digest)" || return 1
 
-  local identity="" arg expected_database="" expected_app_role="" expected_app_user="" baked_program baked_stamp
+  local identity="" arg expected_database="" expected_app_role="" expected_app_user="" baked_program baked_stamp baked_inspect
   # The validator these wrappers carry is the library's own, captured with its status taken: a
   # wrapper baked around an empty program would validate nothing and publish nothing, silently.
   baked_program="$(db_fence_authorise_plan_program)" || return 1
@@ -1714,6 +1845,12 @@ db_fence_publish_operator_wrappers() {
   # second one somebody wrote.
   baked_stamp="$(db_fence_mark_applied_program)" || return 1
   [[ -n "${baked_stamp}" ]] || return 1
+  # AND THE LEGACY GATE (o3d-secops r26). The resolution wrapper may CLEAR a record or STAMP one
+  # applied, so the check that the record in front of it is the ambiguous legacy one is baked from
+  # the library's single copy exactly like the other two -- a gate a wrapper carried its own
+  # version of is a gate that can come to disagree with the refusal that sent the operator to it.
+  baked_inspect="$(db_fence_legacy_inspect_program)" || return 1
+  [[ -n "${baked_inspect}" ]] || return 1
   for arg in "$@"; do
     [[ -n "${arg}" ]] || continue
     identity+=" $(printf '%q' "${arg}")"
@@ -1733,9 +1870,10 @@ db_fence_publish_operator_wrappers() {
   # off. The one capitalised name in the wrapper is DEPLOY_ADMIN_DATABASE_URL, which is a real
   # environment variable in both scripts.
   local mode
-  for mode in release fence; do
+  for mode in release fence resolve; do
     local target="${DB_FENCE_RELEASE_WRAPPER}"
     [[ "${mode}" == "fence" ]] && target="${DB_FENCE_REFENCE_WRAPPER}"
+    [[ "${mode}" == "resolve" ]] && target="${DB_FENCE_RESOLVE_WRAPPER}"
     {
       printf '#!/bin/bash\n'
       printf '# GENERATED BY scripts/lib/db-fence-protected.sh. Root-owned, and deliberately\n'
@@ -1760,6 +1898,11 @@ db_fence_publish_operator_wrappers() {
       printf 'expected_app_role=%q\n' "${expected_app_role}"
       printf 'authorise_plan=%q\n' "${baked_program}"
       printf 'mark_applied=%q\n' "${baked_stamp}"
+      printf 'legacy_inspect=%q\n' "${baked_inspect}"
+      # The path the validator names in its refusal, so the wrapper the operator lands on and the
+      # message that sent them there are the same string composed once.
+      printf 'resolve_wrapper=%q\n' "${DB_FENCE_RESOLVE_WRAPPER}"
+      printf 'release_wrapper=%q\n' "${DB_FENCE_RELEASE_WRAPPER}"
       # ITS OWN ABSOLUTE PATH, baked rather than taken from $0: an instruction this file prints
       # about itself has to be one that runs from anywhere, and $0 is whatever the caller typed.
       printf 'self=%q\n' "${target}"
@@ -1849,7 +1992,7 @@ raise_the_fence() {
   # barrier is the directory fsync, which runs after the rename and leaves the record visible when
   # it fails, so a failed publication is a publication that may well have published.
   if ! printf '%s\n' "${plan}" | env -u NODE_OPTIONS -u NODE_PATH -u NODE_REPL_EXTERNAL_MODULE \
-    node -e "${authorise_plan}" -- "${expected_database}" "${expected_app_role}" "${state_file}"; then
+    node -e "${authorise_plan}" -- "${expected_database}" "${expected_app_role}" "${state_file}" "${sudo_prefix}${resolve_wrapper}"; then
     if [[ "${had_authority}" -eq 0 ]]; then
       rm -f "${state_file}" 2>/dev/null || true
       if [[ -e "${state_file}" ]]; then
@@ -1890,8 +2033,73 @@ release_the_fence() {
   fi
   return 0
 }
+# THE ONE-TIME OPERATOR RESOLUTION (o3d-secops r26, Codex HIGH). Run BY A PERSON, never by a
+# cutover, and only when an automatic path has refused an authority that carries no applied stamp.
+#
+# THREE STEPS, AND THE MIDDLE ONE IS THE ONLY EVIDENCE THERE IS. Root establishes that the record
+# really is the ambiguous legacy one and nothing else; the unprivileged helper asks the live ACL
+# whether the grantees it names still hold CONNECT; root then acts on that answer and on nothing
+# else. Both directions are writes, so both are root's, and neither happens without an unambiguous
+# reading:
+#
+#   every recorded grantee still holds CONNECT   the REVOKE cannot have run -> the record is what a
+#                                                publication killed before BEGIN left -> CLEAR it.
+#   not one of them holds CONNECT                that is the fence's own signature -> a fence
+#                                                stands -> STAMP it applied.
+#   anything else                                REFUSE. A half-applied fence and an administrator
+#                                                who removed one of these roles by hand read
+#                                                identically here, and guessing between them is the
+#                                                whole defect this round removed.
+#
+# AND A PARTIAL RESULT FAILS TOWARD REFUSING, at every step and not only at the verdict: an audit
+# that cannot connect, cannot read the record, is pointed at another database, exits with a status
+# this does not enumerate, or prints a verdict line that does not agree with that status, changes
+# NOTHING. The record is left exactly as it was found, which keeps every automatic path refusing --
+# the state this procedure exists to leave when it cannot do better.
+resolve_legacy_fence() {
+  local verdict rc=0
+  # 1. ROOT: is this the ambiguous record at all? It refuses a stamped one, a
+  #    published-never-applied one, a truncated one and one nobody published.
+  env -u NODE_OPTIONS -u NODE_PATH -u NODE_REPL_EXTERNAL_MODULE \
+    node -e "${legacy_inspect}" -- "${state_file}" || return 1
+  # 2. UNPRIVILEGED: the live ACL, read through the protected helper as the application account.
+  #    Read-only -- it issues no REVOKE, no GRANT and no BEGIN, and writes no file. Its stdout is
+  #    the verdict line and its stderr is the prose, so the capture below takes the one and the
+  #    operator reads the other.
+  verdict="$(run_helper DEPLOY_ADMIN_DATABASE_URL="${DEPLOY_ADMIN_DATABASE_URL}" node "${helper}" --audit-authority --state-file="${state_file}" --state-owner="$(id -u)" "${identity_argv[@]}")" || rc=$?
+  # 3. ROOT: act, and only on a status and a verdict line that agree. Two channels for one fact is
+  #    deliberate -- an exit status can be produced by a shell that never ran the helper, and a
+  #    line of stdout can be produced by a helper that could not decide.
+  if [[ "${rc}" -eq 0 && "${verdict}" == "legacy_fence_verdict=absent" ]]; then
+    echo "Every grantee the record names still holds CONNECT, so no fence stands behind it. Removing it." >&2
+    rm -f "${state_file}" 2>/dev/null || true
+    if [[ -e "${state_file}" ]]; then
+      echo "The record at ${state_file} describes a fence that was never applied and it could not be removed. Nothing else has changed. Remove it by hand; until it is gone every cutover will refuse." >&2
+      return 1
+    fi
+    echo "RESOLVED: ${state_file} is gone. Nothing was fenced and nothing was released; the next cutover plans and publishes an INITIAL authority as it would on any other host." >&2
+    return 0
+  fi
+  if [[ "${rc}" -eq 5 && "${verdict}" == "legacy_fence_verdict=stands" ]]; then
+    echo "Not one grantee the record names holds CONNECT, so the fence it records IS standing. Stamping it applied." >&2
+    if ! env -u NODE_OPTIONS -u NODE_PATH -u NODE_REPL_EXTERNAL_MODULE \
+      node -e "${mark_applied}" -- "${state_file}"; then
+      echo "The fence is standing and ${state_file} could not be stamped (the reason is above). Nothing has changed: the record still carries no stamp and every cutover still refuses it. Fix the filesystem and re-run this, or take the fence down with ${sudo_prefix}${release_wrapper}, which restores from the record without needing the stamp." >&2
+      return 1
+    fi
+    echo "RESOLVED: ${state_file} is stamped applied. The fence is still standing -- this changed a record and not a database. Take it down with ${sudo_prefix}${release_wrapper}, or re-fence over it, which now uses the recovery rule." >&2
+    return 0
+  fi
+  echo "NOT RESOLVED: the live ACL does not settle what this record means (helper exit ${rc}, verdict '${verdict:-<none>}')." >&2
+  echo "Nothing has been changed: the record is exactly as it was found, and every automatic path will go on refusing it." >&2
+  echo "A MIXED reading -- some recorded grantees hold CONNECT and some do not -- is not a half-answer this may round off:" >&2
+  echo "a fence applied halfway and an administrator who removed one of those roles by hand look identical from here." >&2
+  echo "Read the grantee list printed above against the database's ACL yourself and decide. The record's own list is what" >&2
+  echo "${sudo_prefix}${release_wrapper} would GRANT CONNECT back to, and it works on this record as it stands, stamp or no stamp." >&2
+  return 1
+}
 WRAPPER_EOF
-      printf '%s\n' 'if [[ "${mode}" == "fence" ]]; then raise_the_fence; else release_the_fence; fi'
+      printf '%s\n' 'if [[ "${mode}" == "fence" ]]; then raise_the_fence; elif [[ "${mode}" == "resolve" ]]; then resolve_legacy_fence; else release_the_fence; fi'
     } | _fence_publish_file "${target}" 700 || return 1
     chown root:root "${target}" 2>/dev/null || true
   done

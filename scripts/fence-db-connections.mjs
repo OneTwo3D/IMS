@@ -1034,7 +1034,10 @@ export function parseArgs(argv) {
   // publish_durable_file() asks `id -u` instead of comparing against a literal 0.
   const options = { mode: '', stateFile: '', stateOwnerUid: 0, appRole: '', timeoutSeconds: 30, appHost: '', appPort: '', appUser: '', appDatabase: '' }
   for (const arg of argv) {
-    if (arg === '--fence' || arg === '--release' || arg === '--preflight' || arg === '--print-migration-url' || arg === '--plan') options.mode = arg.slice(2)
+    // `--audit-authority` (o3d-secops r26) is here with the rest and not behind a flag of its own:
+    // it is a MODE, it is read-only, and a mode that is spelled differently from its siblings is a
+    // mode somebody forgets to hold to the same identity requirements.
+    if (arg === '--fence' || arg === '--release' || arg === '--preflight' || arg === '--print-migration-url' || arg === '--plan' || arg === '--audit-authority') options.mode = arg.slice(2)
     else if (arg.startsWith('--state-file=')) options.stateFile = arg.slice('--state-file='.length)
     else if (arg.startsWith('--state-owner=')) options.stateOwnerUid = Number(arg.slice('--state-owner='.length))
     else if (arg.startsWith('--app-role=')) options.appRole = arg.slice('--app-role='.length)
@@ -1280,21 +1283,31 @@ export const FENCE_MODE_RECOVERY = 'recovery'
 /**
  * Which rule a record is executed under.
  *
- * AN UNSTAMPED RECORD IS TREATED AS RECOVERY, and that is a decision rather than an oversight. A
- * record with no `fence_mode` was published by a validator that predates this round, which can
- * only be a fence RAISED BEFORE THIS UPGRADE and therefore still standing; refusing it would
- * strand that fence with neither a re-apply nor a release. It is not a hole an unprivileged
- * account can reach through either: the field is absent only in records root itself wrote, in a
- * directory nothing else may write, and every authority published from this round on carries it.
+ * AN UNRECOGNISED MODE IS THE STRICT RULE, AND THAT REVERSES r24 (o3d-secops r26, Codex HIGH).
  *
- * o3d-secops r25 applies the SAME argument one level down, to the `fence_applied` stamp the
- * validator now computes `fence_mode` from: a record with no stamp at all predates the stamp and is
- * read as standing, while one carrying the stamp at 0 was published and never applied and is read
- * as an initial fence. That discrimination is root's and is made in the validator; by the time a
- * record reaches this function the answer is already in `fence_mode`.
+ * r24 wrote this the other way up: anything that was not the literal `initial` resolved to
+ * `recovery`, and the reason given was that a record with no `fence_mode` at all was published by
+ * a validator predating the field, so it could only be a fence RAISED BEFORE THAT UPGRADE and
+ * therefore standing. The first half is true and the second does not follow. The predecessor
+ * published its record BEFORE invoking the executor, so a record from that era is left behind by a
+ * fence that went up AND by a publication that was killed before `BEGIN` — the two states this
+ * whole round exists to stop conflating. Absence of the field dates the writer; it does not say
+ * which phase the writer reached.
+ *
+ * So the unknown reading is the STRICT one. `recovery` grants drift tolerance — recorded grantees
+ * missing from the ACL are accepted as the standing fence's own work — and handing that to a fence
+ * nobody can show exists is how `--release` comes to GRANT CONNECT back to a role an administrator
+ * deliberately removed. Refusing costs a refusal that names the record, and there are two ways out
+ * of it: the release wrapper, which restores from the record without consulting either field, and
+ * the operator resolution wrapper, which asks the LIVE ACL which of the two states holds.
+ *
+ * IT IS ALSO DEFENCE IN DEPTH RATHER THAN THE GATE. The gate is root's, in the validator in
+ * scripts/lib/db-fence-protected.sh, which refuses to publish over an unstamped record at all — so
+ * on the ordinary paths a record reaching this function was published by this round and carries
+ * the field. This is what holds if one ever arrives another way.
  */
 export function authorityFenceMode(record) {
-  return record && record.fence_mode === FENCE_MODE_INITIAL ? FENCE_MODE_INITIAL : FENCE_MODE_RECOVERY
+  return record && record.fence_mode === FENCE_MODE_RECOVERY ? FENCE_MODE_RECOVERY : FENCE_MODE_INITIAL
 }
 
 /**
@@ -1308,15 +1321,79 @@ export function authorityFenceMode(record) {
  *   withdrawn  named by the authority, holds no CONNECT now. FATAL ON AN INITIAL FENCE, where the
  *              record is supposed to be the ACL; EXPECTED ON A RECOVERY, where the standing fence
  *              is what removed them.
+ *
+ * AND AN UNRECOGNISED MODE RESOLVES TO `initial` (o3d-secops r26), for the reason
+ * authorityFenceMode() gives above: the lax rule is the one with the privilege in it, so it is
+ * given only to a mode that actually says `recovery`. r24 resolved the unknown the other way and
+ * that is the same "absent means standing" inference this round removed one level up.
  */
 export function assessAuthorityDrift({ authorised, current, mode }) {
   const named = Array.isArray(authorised) ? authorised : []
   const live = Array.isArray(current) ? current : []
   const appeared = live.filter((grantee) => !named.includes(grantee))
   const withdrawn = named.filter((grantee) => !live.includes(grantee))
-  const resolved = mode === FENCE_MODE_INITIAL ? FENCE_MODE_INITIAL : FENCE_MODE_RECOVERY
+  const resolved = mode === FENCE_MODE_RECOVERY ? FENCE_MODE_RECOVERY : FENCE_MODE_INITIAL
   const accepted = appeared.length === 0 && (resolved === FENCE_MODE_RECOVERY || withdrawn.length === 0)
   return { appeared, withdrawn, mode: resolved, accepted }
+}
+
+// ---------------------------------------------------------------------------
+// THE ONE THING THAT CAN SETTLE AN UNSTAMPED RECORD: THE LIVE ACL
+// (o3d-secops r26, Codex HIGH)
+//
+// A record carrying no `fence_applied` key is ambiguous on the filesystem and stays ambiguous
+// however hard it is read: its mtime, its owner, its shape and its fields all describe the
+// validator that WROTE it and none of them describes whether that validator's REVOKE reached the
+// medium. Nothing beside the file answers the question. The database does: the fence's whole
+// effect is that the recorded grantees lose CONNECT, so asking whether they still hold it asks
+// whether the fence is standing.
+//
+// THREE ANSWERS AND NOT TWO, and the third is the one the caller must not collapse:
+//
+//   absent      every recorded grantee still holds CONNECT. The REVOKE cannot have run — it names
+//               exactly these roles — so the record is what a publication that never reached
+//               `BEGIN` left behind. It is litter, and clearing it is safe.
+//   stands      not one recorded grantee holds CONNECT. That is the fence's own signature, and
+//               nothing else on an ordinary host takes CONNECT from every one of them at once.
+//               The record may be stamped applied.
+//   ambiguous   anything else — some hold it and some do not, or the record names nobody at all.
+//               A half-applied fence and an administrator who removed one of these roles by hand
+//               produce the SAME reading here, and this function does not pretend to tell them
+//               apart. It refuses, and the operator is given both lists.
+//
+// PURE, so the rule can be read as a rule and tested without a database, and so the two places
+// that need it — the audit mode below and its documentation — cannot come to disagree.
+// ---------------------------------------------------------------------------
+
+/** Every recorded grantee still holds CONNECT: no fence took it away, so none is standing. */
+export const LEGACY_FENCE_ABSENT = 'absent'
+/** Not one recorded grantee holds CONNECT: that is what a standing fence looks like. */
+export const LEGACY_FENCE_STANDS = 'stands'
+/** A mixed reading, or nothing to read. Never resolved automatically in either direction. */
+export const LEGACY_FENCE_AMBIGUOUS = 'ambiguous'
+
+/**
+ * Pure: what the live ACL says about a record that carries no applied stamp.
+ *
+ * `recorded` is the record's own `revoked` list; `holding` is the subset of it that holds CONNECT
+ * on the database RIGHT NOW, read from `datacl` by the caller through granteeHasConnect() — the
+ * exact inverse of the statement the fence issues, so that this compares like with like rather
+ * than asking a different question of the database than the fence asked of it.
+ */
+export function assessLegacyFenceEvidence({ recorded, holding }) {
+  const named = Array.isArray(recorded) ? recorded.filter((grantee) => typeof grantee === 'string' && grantee.length > 0) : []
+  const live = Array.isArray(holding) ? holding : []
+  const stillHolding = named.filter((grantee) => live.includes(grantee))
+  const lost = named.filter((grantee) => !live.includes(grantee))
+  // NOTHING RECORDED IS NOT AN ANSWER. An empty list makes both other branches vacuously true —
+  // every grantee holds CONNECT and no grantee holds CONNECT — so it is refused rather than
+  // resolved. This is the direction the whole finding is about.
+  if (named.length === 0) {
+    return { verdict: LEGACY_FENCE_AMBIGUOUS, holding: [], lost: [], recorded: named }
+  }
+  if (lost.length === 0) return { verdict: LEGACY_FENCE_ABSENT, holding: stillHolding, lost, recorded: named }
+  if (stillHolding.length === 0) return { verdict: LEGACY_FENCE_STANDS, holding: stillHolding, lost, recorded: named }
+  return { verdict: LEGACY_FENCE_AMBIGUOUS, holding: stillHolding, lost, recorded: named }
 }
 
 async function readFacts(client, appRole) {
@@ -2174,6 +2251,87 @@ export async function doRelease(client, options) {
   return EXIT_OK
 }
 
+/**
+ * `--audit-authority`: ASK THE DATABASE WHETHER THE RECORDED FENCE IS ACTUALLY STANDING
+ * (o3d-secops r26, Codex HIGH).
+ *
+ * READ-ONLY, ABSOLUTELY. It issues no REVOKE, no GRANT and no BEGIN, it writes no file — it
+ * cannot, it runs as ${APP_USER} — and it removes nothing. It answers one question and prints the
+ * answer; every ACT on that answer is root's, in the operator resolution wrapper that drives this.
+ *
+ * WHY IT EXISTS. A record with no `fence_applied` key is refused by the validator now, because
+ * nothing on the filesystem can tell "a fence raised before the stamp existed" from "a publication
+ * by that same predecessor that was killed before `BEGIN`". The refusal is right and it is not an
+ * answer, so there has to be a path that GETS one, and the only evidence there is lives in the
+ * ACL. This is that path, split from the acting the way `--plan` is split from `--fence`: the
+ * unprivileged side reads and reports, the privileged side decides and writes.
+ *
+ * THE VERDICT GOES TO STDOUT AS ONE PARSEABLE LINE and everything else to stderr, for the reason
+ * `--print-migration-url` does the same: the caller captures it.
+ */
+export async function doAuditAuthority(client, options) {
+  const { rows: attachment } = await client.query(
+    `SELECT current_database()                        AS connected_database,
+            pg_catalog.pg_get_userbyid(d.datdba)      AS owner_role,
+            d.datacl::text                            AS datacl
+       FROM pg_database d
+      WHERE d.datname = current_database()`,
+  )
+  const connectedDatabase = attachment[0]?.connected_database ?? ''
+  const ownerRole = attachment[0]?.owner_role ?? ''
+  const datacl = attachment[0]?.datacl ?? null
+
+  // THE SAME PROVENANCE GATE AS EVERY OTHER READER OF THIS RECORD. The verdict this prints decides
+  // whether root stamps a fence applied — which buys the recovery rule, which is the tolerance the
+  // whole round is about — so a record anything else could have written must not reach it.
+  const read = readAuthorityRecord(options.stateFile, options.stateOwnerUid ?? 0)
+  if (read.status !== STATE_PRESENT) {
+    console.error(`NOT AUDITED: there is no usable connection-fence authority at ${options.stateFile || '<no --state-file was given>'} (${read.status}: ${read.detail}).`)
+    console.error('This mode reads a record and asks the ACL about the grantees it names; with no record there is')
+    console.error('nothing to ask about. Nothing has been read from the database and nothing has been changed.')
+    return EXIT_ERROR
+  }
+  const state = read.state
+
+  if (connectedDatabase && state.database !== connectedDatabase) {
+    console.error(`NOT AUDITED: the fence record at ${options.stateFile} was written for the database "${state.database}",`)
+    console.error(`and this connection is attached to "${connectedDatabase}". The ACL read here would be the wrong`)
+    console.error('database\'s. Point DEPLOY_ADMIN_DATABASE_URL at the database the record names and re-run.')
+    return EXIT_ERROR
+  }
+
+  // WHICH OF THE RECORDED GRANTEES STILL HOLD CONNECT, asked as the inverse of the statement the
+  // fence issues: `REVOKE CONNECT ON DATABASE <db> FROM <grantee>` takes the DIRECT grant, so the
+  // direct grant is what is looked for. has_database_privilege() would answer a different question
+  // — it counts membership and the superuser bit, neither of which a fence removes — and a role
+  // that keeps CONNECT that way would be read as "the fence did not run".
+  const recorded = Array.isArray(state.revoked) ? state.revoked : []
+  const holding = recorded.filter((grantee) => granteeHasConnect(datacl, ownerRole, grantee))
+  const evidence = assessLegacyFenceEvidence({ recorded, holding })
+
+  console.error(`The authority at ${options.stateFile} names ${evidence.recorded.length} grantee${evidence.recorded.length === 1 ? '' : 's'} on ${state.database}: ${evidence.recorded.join(', ') || '<none>'}.`)
+  console.error(`  still holding CONNECT: ${evidence.holding.join(', ') || '<none>'}`)
+  console.error(`  no longer holding it:  ${evidence.lost.join(', ') || '<none>'}`)
+  if (evidence.verdict === LEGACY_FENCE_ABSENT) {
+    console.error('EVERY recorded grantee still holds CONNECT, so the REVOKE this record describes cannot have run:')
+    console.error('it names exactly these roles. NO FENCE IS STANDING behind this record.')
+  } else if (evidence.verdict === LEGACY_FENCE_STANDS) {
+    console.error('NOT ONE recorded grantee holds CONNECT. That is the signature of the fence this record describes,')
+    console.error('and A FENCE IS STANDING behind it.')
+  } else if (evidence.recorded.length === 0) {
+    console.error('The record names NO grantees, so there is nothing whose CONNECT could answer the question either')
+    console.error('way. This is not a reading of the ACL; it is the absence of one. NOTHING may be concluded.')
+  } else {
+    console.error('A MIXED READING: some of the recorded grantees hold CONNECT and some do not. A fence that was')
+    console.error('half applied and an administrator who removed one of these roles by hand look identical from')
+    console.error('here, and this mode does not guess between them. NOTHING may be concluded.')
+  }
+  process.stdout.write(`legacy_fence_verdict=${evidence.verdict}\n`)
+  if (evidence.verdict === LEGACY_FENCE_ABSENT) return EXIT_OK
+  if (evidence.verdict === LEGACY_FENCE_STANDS) return EXIT_FENCE_STANDING
+  return EXIT_FENCE_UNPROVEN
+}
+
 async function main() {
   // THIS RUN READS NO FILE OUT OF THE APPLICATION DIRECTORY (o3d-2sm1.5 r32, Codex CRITICAL).
   //
@@ -2195,9 +2353,9 @@ async function main() {
   // opened is proven against the connection itself (assessDatabaseIdentity, and the postmaster
   // stamp in --release).
   const options = parseArgs(process.argv.slice(2))
-  const modes = ['plan', 'fence', 'release', 'preflight', 'print-migration-url']
+  const modes = ['plan', 'fence', 'release', 'preflight', 'print-migration-url', 'audit-authority']
   if (!modes.includes(options.mode)) {
-    console.error('Usage: node scripts/fence-db-connections.mjs (--preflight|--plan|--fence|--release|--print-migration-url) --app-host=HOST --app-port=PORT --app-user=ROLE --app-database=NAME [--state-file=PATH] [--state-owner=UID] [--app-role=ROLE] [--timeout-seconds=N]')
+    console.error('Usage: node scripts/fence-db-connections.mjs (--preflight|--plan|--fence|--release|--audit-authority|--print-migration-url) --app-host=HOST --app-port=PORT --app-user=ROLE --app-database=NAME [--state-file=PATH] [--state-owner=UID] [--app-role=ROLE] [--timeout-seconds=N]')
     process.exit(EXIT_ERROR)
   }
 
@@ -2240,14 +2398,27 @@ async function main() {
   // --preflight and --fence must BOTH be the admin connection or neither is meaningful: a
   // preflight that connected as the application role would prove nothing about the connection
   // the migration actually uses.
+  //
+  // AND `--audit-authority` IS IN THE ADMIN-ONLY GROUP (o3d-secops r26). It is asked precisely
+  // when a fence may be standing, and a fence is exactly the condition under which the
+  // application's own DATABASE_URL cannot open a connection: falling back to it would turn "the
+  // fence is up" into "the audit could not run", which is the one reading that must not be
+  // produced by the situation it is there to diagnose.
   const connectionString =
-    options.mode === 'preflight' || options.mode === 'plan'
+    options.mode === 'preflight' || options.mode === 'plan' || options.mode === 'audit-authority'
       ? process.env.DEPLOY_ADMIN_DATABASE_URL
       : process.env.DEPLOY_ADMIN_DATABASE_URL || process.env.DIRECT_URL || process.env.DATABASE_URL
   if (!connectionString) {
     if (options.mode === 'preflight' || options.mode === 'plan') {
       requireAdminUrl('this deploy')
       process.exit(EXIT_NOT_FENCEABLE)
+    }
+    if (options.mode === 'audit-authority') {
+      requireAdminUrl('this audit')
+      console.error('An audit run without one would have to fall back to the application\'s own connection, which is')
+      console.error('the connection a standing fence closes — so its failure would say "no answer" for the very')
+      console.error('reason the answer is "a fence is standing". Nothing has been read and nothing has been changed.')
+      process.exit(EXIT_ERROR)
     }
     console.error('Neither DEPLOY_ADMIN_DATABASE_URL nor DATABASE_URL is set — cannot fence or release anything.')
     process.exit(EXIT_ERROR)
@@ -2259,6 +2430,9 @@ async function main() {
     if (options.mode === 'preflight') process.exitCode = await doPreflight(client, options)
     else if (options.mode === 'plan') process.exitCode = await doPlan(client, options)
     else if (options.mode === 'fence') process.exitCode = await doFence(client, options)
+    // READ-ONLY, and it is the one mode that neither fences nor releases: it reports what the ACL
+    // says about a record nothing on the filesystem can settle. See doAuditAuthority().
+    else if (options.mode === 'audit-authority') process.exitCode = await doAuditAuthority(client, options)
     else process.exitCode = await doRelease(client, options)
   } finally {
     await client.end()
