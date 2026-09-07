@@ -1912,10 +1912,23 @@ db_fence_clear_authority() {
 
 # `set -u` is in force in every entrypoint, and the coproc array does not exist until one is
 # started, so all four names are initialised here and never merely declared.
-DB_FENCE_WITNESS_PID="${DB_FENCE_WITNESS_PID:-}"
-DB_FENCE_WITNESS_NONCE=""
+# THE TWO NONCES ARE NOT AMONG THEM, DELIBERATELY (o3d-secops r31). A nonce is minted by the
+# function that is about to spend it and handed to the witness as an ARGUMENT, so it lives in one
+# `local` in one frame and there is no script-scope name any later path could write. That is the
+# remedy the sink census in tests/scripts/install-root-safe-writes.test.ts asks for by name, and it
+# is the right shape here for its own sake: a value that steers what a privileged run will accept as
+# proof should not be reachable from anywhere but the two lines that use it.
+#
+# AND NEITHER IS THE CO-PROCESS'S PID. Nothing here kills the witness or waits on it: closing the
+# write end of its pipe is what ends it, the witness's own stdin loop ends on EOF, and bash reaps it
+# before the next `coproc` -- measured over forty same-name restarts with no "coproc still exists"
+# warning between them. A pid is the operand of `kill`, which is a DESTRUCTIVE COMMAND POSITION, and
+# the census in tests/scripts/install-root-safe-writes.test.ts is right to refuse a script-scope name
+# that reaches one. There is no reaping to be done that closing the pipe does not already do.
+#
+# SO EXACTLY ONE NAME IS LEFT: a 0/1 flag this file sets from `--fence`'s own report and reads in
+# one `[[ ]]`. It can only ever WITHHOLD the automatic removal of the record.
 DB_FENCE_WITNESS_BOUND=0
-DB_FENCE_WITNESS_CHALLENGE=""
 
 # 128 bits of kernel randomness as lower-case hex. It is a NONCE and not a secret: what it has to
 # be is unguessable-in-advance and never reused, so that a lock on it cannot be a fact some earlier
@@ -1954,15 +1967,8 @@ db_fence_witness_stop() {
     fd="${DB_FENCE_WITNESS[0]}"
     { exec {fd}<&-; } 2>/dev/null || true
   fi
-  if [[ -n "${DB_FENCE_WITNESS_PID:-}" ]]; then
-    kill "${DB_FENCE_WITNESS_PID}" 2>/dev/null || true
-    wait "${DB_FENCE_WITNESS_PID}" 2>/dev/null || true
-  fi
   unset DB_FENCE_WITNESS 2>/dev/null || true
-  DB_FENCE_WITNESS_PID=""
-  DB_FENCE_WITNESS_NONCE=""
   DB_FENCE_WITNESS_BOUND=0
-  DB_FENCE_WITNESS_CHALLENGE=""
   return 0
 }
 
@@ -1973,12 +1979,12 @@ db_fence_witness_stop() {
 # the same shell and bash keeps exactly one co-process. Without this the second `coproc` warns and
 # the run would go on holding a witness bound to a fence that is no longer the one being released.
 db_fence_witness_start() {
-  local fence_script="$1"
-  shift
+  local fence_script="$1" nonce="$2"
+  shift 2
   db_fence_witness_stop
-  local nonce line
-  nonce="$(db_fence_witness_nonce)" || {
-    echo "No connection witness for this run: this host would not produce 16 random bytes. The fence is unaffected; its record will be kept at the end of the run for a person to end." >&2
+  local line
+  [[ "${nonce}" =~ ^[0-9a-f]{32,64}$ ]] || {
+    echo "No connection witness for this run: it was given no usable nonce to hold. The fence is unaffected; its record will be kept at the end of the run for a person to end." >&2
     return 1
   }
   # The co-process inherits this shell's stderr, so everything the helper says to an operator is
@@ -1996,9 +2002,8 @@ db_fence_witness_start() {
     db_fence_witness_stop
     return 1
   fi
-  while read -r -t 60 line <&"${ready_fd}" 2>/dev/null; do
+  while read -r -t60 line <&"${ready_fd}" 2>/dev/null; do
     if [[ "${line}" == "WITNESS_READY ${nonce}" ]]; then
-      DB_FENCE_WITNESS_NONCE="${nonce}"
       return 0
     fi
   done
@@ -2007,15 +2012,18 @@ db_fence_witness_start() {
   return 1
 }
 
-# Ask the witness to take a lock on a nonce generated RIGHT NOW, and publish that nonce in
-# ${DB_FENCE_WITNESS_CHALLENGE} for `--release` to look for.
+# Ask the witness to take a lock on the nonce the CALLER minted a moment ago and is about to hand
+# to `--release` to look for. The nonce is an argument rather than a script-scope name: it lives in
+# one `local` in the frame that spends it, so there is nothing here a later path could write to
+# change what a privileged run will accept as proof.
 #
 # THE FRESHNESS IS THE WHOLE MECHANISM. A lock on a number that did not exist when a copy of a
 # cluster was taken cannot be in that copy, however the copy was made and whatever else it carries.
 # It is generated here rather than reused from the fence for exactly that reason: the fence's nonce
 # is minutes old by now, and minutes is long enough for the snapshot this is about.
 db_fence_witness_challenge() {
-  DB_FENCE_WITNESS_CHALLENGE=""
+  local nonce="$1"
+  [[ "${nonce}" =~ ^[0-9a-f]{32,64}$ ]] || return 1
   [[ "${DB_FENCE_WITNESS_BOUND:-0}" -eq 1 ]] || return 1
   # READ INTO PLAIN NAMES AND VALIDATED AS NUMBERS FIRST (o3d-secops r31). Bash unsets the coproc
   # array when the co-process is reaped, and `set -u` is in force in all three entrypoints: a bare
@@ -2023,9 +2031,12 @@ db_fence_witness_challenge() {
   # missing witness, which would turn "no automatic removal" into "no deploy".
   local read_fd="${DB_FENCE_WITNESS[0]:-}" write_fd="${DB_FENCE_WITNESS[1]:-}"
   [[ "${read_fd}" =~ ^[0-9]+$ && "${write_fd}" =~ ^[0-9]+$ ]] || return 1
-  [[ -n "${DB_FENCE_WITNESS_PID:-}" ]] && kill -0 "${DB_FENCE_WITNESS_PID}" 2>/dev/null || return 1
-  local nonce line wrote=0
-  nonce="$(db_fence_witness_nonce)" || return 1
+  # THERE IS NO LIVENESS TEST HERE, and there does not need to be one: `kill -0` on the co-process
+  # would narrow a window it cannot close -- the witness can die between the test and the write --
+  # and everything below already survives a dead witness. The write ignores PIPE and reports EPIPE,
+  # and the read has a deadline. A pid would also be a script-scope name reaching `kill`, which the
+  # sink census refuses and is right to.
+  local line wrote=0
   # AND SIGPIPE IS IGNORED ACROSS THE WRITE. `kill -0` above narrows the window and does not close
   # it: the witness can die between that test and this line, and an unignored SIGPIPE would then
   # kill the entrypoint outright. Nothing in these scripts traps PIPE, so this saves and restores
@@ -2034,9 +2045,8 @@ db_fence_witness_challenge() {
   printf 'challenge %s\n' "${nonce}" >&"${write_fd}" 2>/dev/null || wrote=1
   trap - PIPE
   [[ "${wrote}" -eq 0 ]] || return 1
-  while read -r -t 60 line <&"${read_fd}" 2>/dev/null; do
+  while read -r -t60 line <&"${read_fd}" 2>/dev/null; do
     if [[ "${line}" == "WITNESS_HELD ${nonce}" ]]; then
-      DB_FENCE_WITNESS_CHALLENGE="${nonce}"
       return 0
     fi
   done
@@ -2123,9 +2133,10 @@ db_fence_raise() {
   # ITS FAILURE IS NOT A FAILURE. The status is deliberately discarded: what a missing witness costs
   # is the automatic removal of the record at the end of this run, and nothing in this function's
   # contract, its return value or the caller's next step changes because of it.
-  local witness_argv=()
-  if db_fence_witness_start "${fence_script}" "$@"; then
-    witness_argv=(--witness-lock="${DB_FENCE_WITNESS_NONCE}")
+  local witness_argv=() witness_nonce=""
+  witness_nonce="$(db_fence_witness_nonce)" || witness_nonce=""
+  if [[ -n "${witness_nonce}" ]] && db_fence_witness_start "${fence_script}" "${witness_nonce}" "$@"; then
+    witness_argv=(--witness-lock="${witness_nonce}")
   fi
 
   # STEP 3, UNPRIVILEGED AGAIN: execute exactly what step 2 recorded.

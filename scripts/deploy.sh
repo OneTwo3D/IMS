@@ -3006,9 +3006,13 @@ release_db_connections() {
   # stable backend: the challenge is simply absent, `--release` is invoked exactly as it was before
   # this round, the fence is released exactly as before, and the ONE thing that changes is that the
   # record is kept for a person to end rather than removed automatically.
-  local witness_argv=()
-  if db_fence_witness_challenge; then
-    witness_argv=(--witness-challenge="${DB_FENCE_WITNESS_CHALLENGE}")
+  # THE NONCE IS MINTED HERE AND LIVES IN THIS FRAME (o3d-secops r31). It is handed to the witness
+  # as an argument and to `--release` as an argument, and there is no script-scope name for it: a
+  # value that decides what a privileged run accepts as proof is not one a later path may write.
+  local witness_argv=() witness_nonce=""
+  witness_nonce="$(db_fence_witness_nonce)" || witness_nonce=""
+  if [[ -n "${witness_nonce}" ]] && db_fence_witness_challenge "${witness_nonce}"; then
+    witness_argv=(--witness-challenge="${witness_nonce}")
   fi
   # Captured and printed back, like release_the_fence() in the library: the verdict is a machine
   # line on stdout, and every word an operator reads is on stderr and still streams live.

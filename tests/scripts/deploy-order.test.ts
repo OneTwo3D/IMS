@@ -12852,7 +12852,7 @@ test('[o3d-secops r31] taking the connection witness down leaves the shell able 
     'db_fence_helper() { cat; }',
     shellFunction(FENCE_LIB, 'db_fence_witness_nonce'),
     shellFunction(FENCE_LIB, 'db_fence_witness_stop'),
-    'DB_FENCE_WITNESS_PID=""; DB_FENCE_WITNESS_NONCE=""; DB_FENCE_WITNESS_BOUND=0; DB_FENCE_WITNESS_CHALLENGE=""',
+    'DB_FENCE_WITNESS_BOUND=0',
     'echo "BEFORE" >&2',
     // A REAL CO-PROCESS, so the fds are real and the teardown is the one that runs on every cutover.
     'coproc DB_FENCE_WITNESS { db_fence_helper; }',
@@ -12898,7 +12898,7 @@ test('[o3d-secops r31] taking down a witness whose reader has gone does not kill
     'exec 2>&1',
     shellFunction(FENCE_LIB, 'db_fence_witness_nonce'),
     shellFunction(FENCE_LIB, 'db_fence_witness_stop'),
-    'DB_FENCE_WITNESS_PID=""; DB_FENCE_WITNESS_NONCE=""; DB_FENCE_WITNESS_BOUND=0; DB_FENCE_WITNESS_CHALLENGE=""',
+    'DB_FENCE_WITNESS_BOUND=0',
     // ALIVE, WITH NO READER. `exec 0<&-` closes the co-process's own stdin; the sleep keeps the
     // process (and so bash's record of its descriptors) in place while the teardown runs.
     'coproc DB_FENCE_WITNESS { exec 0<&-; sleep 3; }',

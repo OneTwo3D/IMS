@@ -1718,6 +1718,14 @@ const MUTABLE_LIBRARY_NAMES: Readonly<Record<string, string>> = {
   DB_FENCE_SUDO_PREFIX:
     'not a path and not a decision: a display prefix resolved from PATH, and the one name here bash '
     + 'assigns twice by construction (a default, then a conditional)',
+  // o3d-secops r31. The connection witness leaves exactly ONE name behind. The two nonces are minted
+  // as `local`s in the frames that spend them and passed as arguments -- this file's own stated
+  // remedy -- and the co-process's pid is not named at all, because a pid is the operand of `kill`
+  // and closing the pipe ends the witness without one.
+  DB_FENCE_WITNESS_BOUND:
+    'a report: 0 or 1, set from what `--fence` said on its OWN connection about seeing the witness. '
+    + 'It can only ever WITHHOLD the automatic removal of the fence record -- the removal itself is '
+    + 'licensed by what `--release` reports out of the database, never by this flag',
 }
 
 /**
