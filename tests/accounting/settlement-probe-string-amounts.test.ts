@@ -3053,9 +3053,10 @@ test('[o3d-acctmoney r4] past the lookup budget a credit note is UNPROVED, never
   //        `unresolved`). Measured: the 100-refund case answers ok:false and the `present` assertion
   //        below fails — an allocation that DID land stops being recognised, which is the probe's
   //        whole purpose.
-  // MUTATION 2: drop `statesAnything(unprovedRefunded, …)` from `allocationsDoNotProve`. Measured: the
-  //        100-refund case answers `provedComplete: true` and classifies `clear` — 70 refunds this
-  //        code never established would be certifying an empty collection.
+  // MUTATION 2: drop `somethingUnresolved` from `allocationsDoNotProve` (r4 spelled this arm
+  //        `statesAnything(unprovedRefunded, …)`; r5 replaced it with the COUNT — see section 10).
+  //        Measured: the 100-refund case answers `provedComplete: true` and classifies `clear` — 70
+  //        refunds this code never established would be certifying an empty collection.
   const refundsOf = (n: number) => Array.from({ length: n }, (_unused, i) => ({ PaymentID: `PAY-${i}`, Amount: 1 }))
   const stubsFor = (many: ReadonlyArray<{ PaymentID: string }>) =>
     Object.fromEntries(many.map((pmt) => [pmt.PaymentID, AUTHORISED_REFUND]))
@@ -3215,4 +3216,278 @@ test('[o3d-acctmoney r4] an unresolved refund cannot make IMS call a coherent re
   assert.match(reasonOf(incoherent),
     /remaining credit is larger than its own total less what has been taken off it/)
   assert.notEqual(classifyLedgerSettlement(attemptFor('10.00'), incoherent).outcome, 'clear')
+})
+
+/* ------------------------------------------------------------------------------------------- *
+ * 10. o3d-acctmoney r5 (Codex HIGH) — ONE VALUE WAS DOING TWO JOBS: THE INTERVAL'S WIDTH AND THE
+ *     MARKER THAT ANYTHING WAS UNRESOLVED AT ALL.
+ *
+ *     WHETHER ANYTHING IS UNRESOLVED IS A FACT ABOUT A COUNT. `unprovedRefunded` is a SUM, and a
+ *     sum reaches zero for reasons that have nothing to do with how many terms went into it — two
+ *     opposite-signed unresolved refunds, or two of nothing at all. While the marker was read off
+ *     that sum, either shape said "everything was resolved" over refunds this code never asked
+ *     about, and an empty allocation collection certified by that is `clear` — a second allocation
+ *     of a credit that may already be spent.
+ *
+ *     THE TWO ROLES ARE NOW TWO VALUES, and this section tests them separately, because a test
+ *     that only ever exercised them together could not tell which one was carrying it:
+ *       `somethingUnresolved`  `refundResolution.unresolved.length > 0` — the marker, read off the
+ *                              list the resolver already returns.
+ *       `unprovedRefunded`     the interval's WIDTH, and nothing else. Still asked the upper-end
+ *                              question about coherence; no longer asked whether the interval is
+ *                              there.
+ *     And the sign invariant the width's arithmetic always assumed is now established rather than
+ *     assumed — see the negative-amount test for what a negative IS on this endpoint and why it
+ *     refuses by naming the payment.
+ * ------------------------------------------------------------------------------------------- */
+
+/** 30 resolvable refunds of 1 — exactly the lookup budget — plus the unresolved tail under test. */
+const budgetOfRefunds = () => Array.from({ length: 30 }, (_unused, i) => ({ PaymentID: `PAY-${i}`, Amount: 1 }))
+const resolvedStubs = (many: ReadonlyArray<{ PaymentID: string }>) =>
+  Object.fromEntries(many.map((pmt) => [pmt.PaymentID, AUTHORISED_REFUND]))
+
+/**
+ * The skeleton every case below varies ONE thing in: `Total 400`, `RemainingCredit 370`, an EMPTY
+ * allocation collection, and 30 refunds of 1 that all resolve. `applied` is `400 - 370 - 30 = 0` — a
+ * PROVED ZERO over an empty collection, which is precisely what `clear` is built out of. So each
+ * case below is taking a `clear` away from a note that would otherwise have had one, which is what
+ * makes the assertions load-bearing rather than agreements with a refusal already happening.
+ */
+const noteWithTail = (tail: ReadonlyArray<Record<string, unknown>>) => ({
+  CurrencyCode: 'GBP', Total: 400, RemainingCredit: 370, Allocations: [],
+  Payments: [...budgetOfRefunds(), ...tail],
+})
+
+test('[o3d-acctmoney r5] PRECONDITION: the skeleton these cases vary IS a clear', async () => {
+  // Stated as its own test so that every case below is measured against a `clear` this file has
+  // actually observed, not against one it assumes. Without it a bug that refused this whole SHAPE
+  // would make all of section 10 pass while proving nothing.
+  const plain = await probeNoteWithCalls(noteWithTail([]), resolvedStubs(budgetOfRefunds()))
+  assert.equal(plain.probe.ok, true)
+  assert.equal(plain.paths.filter((path) => path.startsWith('Payments/')).length, 30,
+    'all thirty are within the budget, so nothing is unresolved')
+  assert.equal(plain.probe.ok === true ? plain.probe.provedComplete : null, true)
+  assert.equal(plain.probe.ok === true ? plain.probe.records.length : -1, 0)
+  assert.equal(classifyLedgerSettlement(attemptFor('370.00'), plain.probe).outcome, 'clear',
+    'PRECONDITION: 30 proved refunds over an empty collection is a proved zero, and it clears')
+})
+
+test('[o3d-acctmoney r5] two unresolved refunds that cancel to zero do not yield `clear`', async () => {
+  // CODEX'S REPRODUCTION, VERBATIM: a 32-payment response whose first 30 resolve and whose two
+  // budget-excluded amounts are +100 and -100. Their sum is exactly zero, so the r4 marker
+  // `statesAnything(unprovedRefunded)` read FALSE, `provedComplete` came out TRUE over an empty
+  // record list, and the classifier said `clear` — with two refunds still unverified.
+  //
+  // ROUTE: the counted-amount sign invariant -> `shortBy(0, -100)` -> ok:false naming the payment.
+  //        A negative `Amount` is not a shape Xero's contract has: it reverses a payment by
+  //        `Status: DELETED`, and a value this identity has no meaning for is refused rather than
+  //        subtracted. The MARKER is tested separately below on a tail with no negative in it, so
+  //        neither fix is resting on the other.
+  // MUTATION: delete the `negativeRefund` block from the credit-note arm. Measured: this case
+  //        answers ok:true with `provedComplete: false` and `unknown` — the marker catches it, so
+  //        the `ok === false` and message assertions below both fail.
+  const cancelling = await probeNoteWithCalls(
+    noteWithTail([{ PaymentID: 'PAY-PLUS', Amount: 100 }, { PaymentID: 'PAY-MINUS', Amount: -100 }]),
+    resolvedStubs(budgetOfRefunds()),
+  )
+  assert.equal(cancelling.paths.filter((path) => path.startsWith('Payments/')).length, 30,
+    'PRECONDITION: the two are past the budget, so they are UNRESOLVED and not merely unstubbed')
+  assert.equal(cancelling.probe.ok, false,
+    'a refund amount that cannot have come off the credit is not a term this arm may subtract')
+  assert.match(reasonOf(cancelling.probe),
+    /Xero states payment PAY-MINUS against this credit note as -100\.00, which is not an amount that can have come off the credit/)
+  assert.notEqual(classifyLedgerSettlement(attemptFor('370.00'), cancelling.probe).outcome, 'clear',
+    'and whatever else is true of the response, it does not authorise an allocation')
+})
+
+test('[o3d-acctmoney r5] an unresolved refund of any shape forces `provedComplete: false`', async () => {
+  // THE FIX ITSELF, ISOLATED FROM THE SIGN GUARD. Every tail here is NON-NEGATIVE, so the sign
+  // invariant cannot fire and the only thing between each case and a `clear` is whether
+  // unresolvedness is read from the COUNT or inferred from the SUM. A sum of non-negative terms
+  // reaches zero when the terms are zero, which needs no malformed response at all.
+  //
+  // ROUTE: `resolveCreditNoteRefunds` reports the index past the budget -> `somethingUnresolved` is
+  //        `unresolved.length > 0` -> `allocationsDoNotProve` -> `provedComplete: false` -> the
+  //        classifier's `unknown`/`collection-unproved`.
+  // MUTATION: put r4's spelling back — `statesAnything(unprovedRefunded, noteCurrency)` in place of
+  //        `somethingUnresolved`. Measured: cases (1), (2) and (3) all answer `provedComplete: true`
+  //        over an empty record list and classify `clear`, which is the finding.
+  // MUTATION 2: hoist nothing and leave `somethingUnresolved` inside the `applied !== null` arm.
+  //        Measured: these cases still pass — the gate is not what carries them — which is why the
+  //        hoist is documented as making the predicate literal rather than as a second fix.
+
+  // (1) ONE UNRESOLVED REFUND OF ZERO. A zero-amount payment is a perfectly ordinary wire value, and
+  // it contributes nothing to the width — while the width WAS the marker, one of these was enough.
+  const zeroTail = await probeNoteWithCalls(
+    noteWithTail([{ PaymentID: 'PAY-ZERO', Amount: 0 }]),
+    resolvedStubs(budgetOfRefunds()),
+  )
+  assert.equal(zeroTail.probe.ok, true, 'nothing here is unreadable, so the arm still ANSWERS')
+  assert.equal(zeroTail.paths.filter((path) => path.startsWith('Payments/')).length, 30,
+    'PRECONDITION: PAY-ZERO was never asked about — it is unresolved, not resolved-as-authorised')
+  assert.equal(zeroTail.probe.ok === true ? zeroTail.probe.provedComplete : null, false,
+    'a refund this code never established cannot be part of a proof, whatever its size')
+  const zeroVerdict = classifyLedgerSettlement(attemptFor('370.00'), zeroTail.probe)
+  assert.equal(zeroVerdict.outcome, 'unknown')
+  assert.equal(zeroVerdict.outcome === 'unknown' ? zeroVerdict.cause : null, 'collection-unproved')
+
+  // (2) TWO OF THEM, so the case is not an accident of there being exactly one.
+  const twoZeros = await probeNote(
+    noteWithTail([{ PaymentID: 'PAY-ZERO-A', Amount: 0 }, { PaymentID: 'PAY-ZERO-B', Amount: 0 }]),
+    resolvedStubs(budgetOfRefunds()),
+  )
+  assert.equal(twoZeros.ok, true)
+  assert.equal(twoZeros.ok === true ? twoZeros.provedComplete : null, false)
+  assert.notEqual(classifyLedgerSettlement(attemptFor('370.00'), twoZeros).outcome, 'clear')
+
+  // (3) AND ONE BELOW THE BAND, which is the same hole reached without a zero: `statesAnything` is
+  // "more than one band above zero", and a GBP band is 0.005, so a 0.001 refund was invisible to the
+  // marker while being a perfectly real unresolved payment.
+  const subBand = await probeNote(
+    noteWithTail([{ PaymentID: 'PAY-TINY', Amount: 0.001 }]),
+    resolvedStubs(budgetOfRefunds()),
+  )
+  assert.equal(subBand.ok, true)
+  assert.equal(subBand.ok === true ? subBand.provedComplete : null, false,
+    'the marker is a count, so a width below the decision band does not cancel it')
+  assert.notEqual(classifyLedgerSettlement(attemptFor('370.00'), subBand).outcome, 'clear')
+
+  // (4) A MATCHING ALLOCATION IS STILL RECOGNISED. The marker withholds the PROOF, not the answer —
+  // the r4 trade that replaced a terminal refusal, and it must survive the marker changing.
+  const landed = await probeNote({
+    CurrencyCode: 'GBP',
+    Total: 400,
+    RemainingCredit: 70,
+    Allocations: [{ Amount: 300, Date: `${DATE}T00:00:00`, Invoice: { InvoiceID: 'inv-1' } }],
+    Payments: [...budgetOfRefunds(), { PaymentID: 'PAY-ZERO', Amount: 0 }],
+  }, resolvedStubs(budgetOfRefunds()))
+  assert.equal(landed.ok, true)
+  assert.equal(landed.ok === true ? landed.records.length : -1, 1,
+    'the allocation to THIS bill is read even though a refund went unresolved')
+  assert.equal(classifyLedgerSettlement(attemptFor('300.00'), landed).outcome, 'present',
+    'so an allocation that DID land is still recognised and the row can be closed')
+})
+
+test('[o3d-acctmoney r5] a negative counted refund amount refuses, at the file\'s own band', async () => {
+  // WHAT A NEGATIVE AMOUNT IS ON THIS ENDPOINT, ASSERTED RATHER THAN LEFT TO THE COMMENT. Xero
+  // reverses a payment by `Status: DELETED` — `creditNoteRefundInclusion` already drops such a
+  // payment — and nothing in this repository records a negative payment amount from any endpoint.
+  // So a negative is an UNESTABLISHED value this identity has no meaning for, which is the same
+  // category as an unenumerated status, and it takes that category's route: refuse, naming the
+  // PAYMENT, rather than accuse the DOCUMENT of contradicting itself.
+  //
+  // ROUTE: `negativeRefund` over the COUNTED readings -> `shortBy(0, value)` -> ok:false.
+  // MUTATION: narrow the check to `unresolvedReadings` (the width alone). Measured: case (1) — a
+  //        RESOLVED negative refund — answers ok:true, `provedComplete: true` and classifies
+  //        `clear`, because `refunded` shrinks by 100 and the note lands on a proved zero.
+  // MUTATION 2: write it as a bare `compareDecimal(value, toDecimal(0)) < 0`. Measured: case (3)
+  //        refuses over a rounding artefact four ten-thousandths below zero.
+  // MUTATION 3: check every entry rather than the COUNTED ones. Measured: case (4) refuses over a
+  //        DELETED payment whose amount this arm never reads.
+
+  // (1) A RESOLVED, AUTHORISED REFUND STATING A NEGATIVE AMOUNT. Nothing is unresolved here, so the
+  // marker cannot be what refuses it — this is the sign invariant alone, and it is why the check
+  // covers every counted amount rather than only the ones in the width.
+  const resolvedNegative = await probeNote({
+    CurrencyCode: 'GBP', Total: 400, RemainingCredit: 370, Allocations: [],
+    Payments: [...budgetOfRefunds(), { PaymentID: 'PAY-NEG', Amount: -100 }],
+  }, { ...resolvedStubs(budgetOfRefunds()), 'PAY-NEG': { ...AUTHORISED_REFUND, Amount: -100 } })
+  assert.equal(resolvedNegative.ok, false,
+    'money going back ON to a credit note is not a refund coming off it')
+  assert.match(reasonOf(resolvedNegative),
+    /Xero states payment PAY-NEG against this credit note as -100\.00, which is not an amount that can have come off the credit, so IMS cannot tell how much of the credit is already allocated/)
+  assert.notEqual(classifyLedgerSettlement(attemptFor('370.00'), resolvedNegative).outcome, 'clear')
+
+  // (2) AND ONE BAND-AND-A-BIT BELOW ZERO STILL REFUSES, so the rule is about the sign and not about
+  // the size of the example above.
+  const smallNegative = await probeNote({
+    CurrencyCode: 'GBP', Total: 400, RemainingCredit: 400, Allocations: [],
+    Payments: [{ PaymentID: 'PAY-NEG', Amount: -0.01 }],
+  }, { 'PAY-NEG': { ...AUTHORISED_REFUND, Amount: -0.01 } })
+  assert.equal(smallNegative.ok, false)
+  assert.match(reasonOf(smallNegative), /payment PAY-NEG against this credit note as -0\.01/)
+
+  // (3) BELOW THE BAND IS NOISE, NOT A NEGATIVE. `completenessBand` is half a minor unit — 0.005 in
+  // GBP — and every comparison in this file decides at it. A figure four ten-thousandths under zero
+  // is two exact decimals agreeing to the document's own minor unit, and refusing on it would hold
+  // an ordinary note for a rounding artefact.
+  const withinBand = await probeNote({
+    CurrencyCode: 'GBP', Total: 400, RemainingCredit: 400, Allocations: [],
+    Payments: [{ PaymentID: 'PAY-NOISE', Amount: -0.004 }],
+  }, { 'PAY-NOISE': { ...AUTHORISED_REFUND, Amount: -0.004 } })
+  assert.equal(withinBand.ok, true, 'a sub-band negative is noise, and noise is not a refusal')
+  assert.equal(withinBand.ok === true ? withinBand.provedComplete : null, true,
+    'and nothing is unresolved either, so the note is still proved')
+  assert.equal(classifyLedgerSettlement(attemptFor('400.00'), withinBand).outcome, 'clear')
+
+  // (4) AN EXCLUDED PAYMENT'S AMOUNT IS STILL NEVER READ. A DELETED refund is not a term of this
+  // identity, so demanding a sign of a figure this arm will not use would be a refusal with no harm
+  // behind it — the same rule `creditNoteRefundAmountDisagreement` follows for duplicate readings.
+  const deletedNegative = await probeNote({
+    CurrencyCode: 'GBP', Total: 400, RemainingCredit: 400, Allocations: [],
+    Payments: [{ PaymentID: 'PAY-GONE', Amount: -100 }],
+  }, { 'PAY-GONE': { ...DELETED_REFUND, Amount: -100 } })
+  assert.equal(deletedNegative.ok, true,
+    'the payment is not a term, so its amount is not one either')
+  assert.equal(deletedNegative.ok === true ? deletedNegative.provedComplete : null, true)
+  assert.equal(classifyLedgerSettlement(attemptFor('400.00'), deletedNegative).outcome, 'clear',
+    'a wholly unallocated credit note whose only refund was reversed still allocates')
+})
+
+test('[o3d-acctmoney r5] the interval behaviour from r4 is unchanged for ordinary notes', async () => {
+  // THE COST OF THE FIX, MEASURED. A marker read from a COUNT is strictly harder to cancel than one
+  // read from a sum, so the thing to prove is that it did not become harder to SATISFY: an ordinary
+  // note, with every refund resolved, must still prove itself and still clear. The r4 tests above
+  // assert the same properties from the other side and none of them was touched.
+  //
+  // ROUTE: `refundResolution.unresolved` is EMPTY -> `somethingUnresolved` false -> the arm is
+  //        decided by `applied` and `allocated` exactly as r3 and r4 decided it.
+  // MUTATION: make `somethingUnresolved` unconditionally true. Measured: cases (1) and (2) answer
+  //        `provedComplete: false` and stop clearing — every ordinary refunded credit note held.
+
+  // (1) THE ORDINARY REFUNDED NOTE. One authorised refund, stated status, no lookup at all.
+  const ordinary = await probeNoteWithCalls({
+    CurrencyCode: 'GBP', Total: 400, RemainingCredit: 300, Allocations: [], Payments: [
+      { PaymentID: 'PAY-1', Amount: 100, ...AUTHORISED_REFUND },
+    ],
+  })
+  assert.equal(ordinary.paths.filter((path) => path.startsWith('Payments/')).length, 0,
+    'PRECONDITION: a stated status is decided from the stub, so nothing is unresolved')
+  assert.equal(ordinary.probe.ok === true ? ordinary.probe.provedComplete : null, true)
+  assert.equal(classifyLedgerSettlement(attemptFor('300.00'), ordinary.probe).outcome, 'clear',
+    'and the 300 it has left is allocatable on the first attempt')
+
+  // (2) AND THE SILENT-STUB NOTE THAT RESOLVES. The lookup runs, the answer comes back, nothing is
+  // left unresolved — so the marker is false even though the resolver did work.
+  const resolved = await probeNoteWithCalls({
+    CurrencyCode: 'GBP', Total: 400, RemainingCredit: 300, Allocations: [], Payments: [
+      { PaymentID: 'PAY-1', Amount: 100 },
+    ],
+  }, { 'PAY-1': AUTHORISED_REFUND })
+  assert.equal(resolved.paths.filter((path) => path.startsWith('Payments/')).length, 1,
+    'PRECONDITION: it WAS resolved through the endpoint that states the status')
+  assert.equal(resolved.probe.ok === true ? resolved.probe.provedComplete : null, true)
+  assert.equal(classifyLedgerSettlement(attemptFor('300.00'), resolved.probe).outcome, 'clear')
+
+  // (3) THE WIDTH STILL DOES THE WIDTH'S JOB. r4's upper-end coherence check is asked of
+  // `applied + unprovedRefunded`, and separating the marker off must not have taken the width with
+  // it: a note whose usage is below zero only when every unreached refund is counted is still NOT
+  // called incoherent, and one that is below zero even at its most generous still is.
+  const hundred = Array.from({ length: 100 }, (_unused, i) => ({ PaymentID: `PAY-${i}`, Amount: 1 }))
+  const coherent = await probeNote(
+    { CurrencyCode: 'GBP', Total: 400, RemainingCredit: 340, Allocations: [], Payments: hundred },
+    resolvedStubs(hundred),
+  )
+  assert.equal(coherent.ok, true, 'the upper end is still what answers the incoherence question')
+  assert.equal(coherent.ok === true ? coherent.provedComplete : null, false,
+    'and the answer is still a withheld proof rather than an accusation')
+
+  const bigger = Array.from({ length: 100 }, (_unused, i) => ({ PaymentID: `PAY-${i}`, Amount: 5 }))
+  const incoherent = await probeNote(
+    { CurrencyCode: 'GBP', Total: 400, RemainingCredit: 390, Allocations: [], Payments: bigger },
+    resolvedStubs(bigger),
+  )
+  assert.equal(incoherent.ok, false, 'and a response that is incoherent however the 70 read still says so')
+  assert.match(reasonOf(incoherent),
+    /remaining credit is larger than its own total less what has been taken off it/)
 })
