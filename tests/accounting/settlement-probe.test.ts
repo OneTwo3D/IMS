@@ -576,20 +576,28 @@ test('the probe key is not split by an anchor the TYPE does not have (o3d-0m56 r
 })
 
 /* ------------------------------------------------------------------------------------------- *
- * o3d-r948 r5 (Codex HIGH) — AND THE PROBE HAS TO SAY WHOSE LEDGER ANSWERED.
+ * o3d-r948 r6 — THE PROBE NO LONGER SAYS WHOSE LEDGER ANSWERED, BECAUSE IT COULD NOT SAY SOUNDLY.
  *
- * The records above are ids in ONE organisation's namespace and none of them says which. The
- * registration decision's exclusion set is the one input that can REMOVE a record from a match, and
- * it is only sound when the row supplying the id and the record being matched are from the SAME
- * organisation — so the caller needs both halves, and only this function is in a position to
- * supply the ledger's.
+ * RETIRED HERE, NAMED. Four tests pinned r5's `connectionProvenance`:
+ *
+ *   [o3d-r948 r5] a settled probe names the organisation that answered
+ *   [o3d-r948 r5] a connection that MOVES across the read is reported as unknown, not mislabelled
+ *   [o3d-r948 r5] no connected organisation at all is unknown too, not an empty name
+ *   [o3d-r948 r5] a token read that FAILS does not destroy the reading of the ledger
+ *
+ * They were true of what they tested. What they could not test is the interval BETWEEN the two
+ * reads: an A→B→A reconnect across the remote call leaves both snapshots saying A while B served
+ * the fetch, so the records would be labelled A and could then activate the registration decision's
+ * exclusion. Reading one value twice proves nothing about the time between the reads.
+ *
+ * The exclusion those labels fed is gone (see `classifyLedgerSettlement`), so the unsound label goes
+ * with it rather than sitting on the probe result inviting reuse. A sound version is REQUEST-BOUND:
+ * `XeroResponse` already carries the `tenantId` its request went out under, and `qboFetch` resolves
+ * a `realmId` per request that `QboResponse` discards — and a QuickBooks probe makes 1 + N fetches,
+ * so every one of those responses would have to be proven to belong to one realm. bd o3d-hold1.
  * ------------------------------------------------------------------------------------------- */
 
-/** Successive answers to "which tenant is connected now", so a reconnect mid-call can be staged. */
-let tenantReads: Array<string | null> = []
-/** Set to make the token read FAIL, which is a fact about our database and not about the ledger. */
-let tenantReadThrows = false
-const tenantsRead = () => TENANT_CALLS.length
+/** Counts reads of the local `accounting_tokens` row, so "it does not read it" can be asserted. */
 const TENANT_CALLS: string[] = []
 
 mock.module('@/lib/db', {
@@ -598,9 +606,7 @@ mock.module('@/lib/db', {
       accountingToken: {
         findUnique: async ({ where }: { where: { connector: string } }) => {
           TENANT_CALLS.push(where.connector)
-          if (tenantReadThrows) throw new Error('SASL: SCRAM-SERVER-FIRST-MESSAGE: client password must be a string')
-          const next = tenantReads.shift()
-          return next == null ? null : { tenantId: next }
+          return { tenantId: 'tenant-b' }
         },
       },
     },
@@ -619,96 +625,46 @@ mock.module('@/lib/connectors/xero/api', {
 
 const XERO_TARGET = { type: 'INVOICE_PAYMENT', payload: { accountingInvoiceId: 'inv-9' } }
 
-test('[o3d-r948 r5] a settled probe names the organisation that answered', async () => {
-  // ROUTE: probeLedgerSettlement reads `activeAccountingIdProvenance(connector)` and returns it on
-  //        the `ok: true` arm as `connectionProvenance`.
-  // MUTATION: return `probe` unchanged (drop the spread that adds the field) and this fails —
-  //        `connectionProvenance` is undefined, which the decision reads as "cannot say" and which
-  //        excludes nothing (verified).
+test('[o3d-r948 r6] the probe reads the ledger and NOT the token row, and labels nothing', async () => {
+  // Asserted as an ABSENCE with a witness, not as a missing property. `assert.equal(probe.x,
+  // undefined)` passes for a field that was never spelt correctly; counting the token reads proves
+  // the removed code is not merely renamed, and the record assertions prove the probe still did its
+  // actual job — so this cannot pass by the probe having failed.
+  //
+  // ROUTE: probeLedgerSettlement, which now dispatches straight to the connector's own reader.
+  // MUTATION (run): restore the `readConnection` helper and the before/after reads and spread
+  //        `connectionProvenance` onto the result. The TENANT_CALLS assertion then fails with 2, and
+  //        the `'connectionProvenance' in probe` assertion fails too. Reverted after running.
   TENANT_CALLS.length = 0
-  tenantReads = ['tenant-b', 'tenant-b']
   const probe = await probeLedgerSettlement('xero', XERO_TARGET)
 
-  // THE PRECONDITION: this really is the ordinary success path, with the records the caller needs.
+  // THE PRECONDITION: this is the ordinary success path, with the records the caller needs — so the
+  // zero below is "it never asked", not "it never got that far".
   assert.equal(probe.ok, true)
   assert.equal(probe.ok && probe.records.length, 1, 'the records must still come back')
   assert.equal(probe.ok && probe.records[0].id, 'PAY-9')
 
-  assert.equal(probe.ok && probe.connectionProvenance, 'xero:tenant-b')
+  assert.equal(TENANT_CALLS.length, 0, 'the probe must not read the active connection at all')
+  assert.equal('connectionProvenance' in probe, false, 'and must attach no organisation label')
 })
 
-test('[o3d-r948 r5] a connection that MOVES across the read is reported as unknown, not mislabelled', async () => {
-  // THE WINDOW A SINGLE READ CANNOT SEE. Reading the active tenant once is a claim about one moment
-  // and the fetch is a different moment; an operator disconnecting and reconnecting to another
-  // company in between would have us stamp realm A's records with realm B's name, which is the
-  // cross-namespace exclusion this whole round exists to stop, arriving one layer up. So the tenant
-  // is read either side of the fetch and a disagreement answers NULL — the value that excludes
-  // nothing — rather than either of the two names, neither of which is known to be right.
-  //
-  // ROUTE: probeLedgerSettlement's `before !== null && before === after ? before : null`.
-  // MUTATION: replace it with `before` and this fails, reporting `xero:tenant-a` for records that
-  //        may have come from tenant-b (verified).
-  TENANT_CALLS.length = 0
-  tenantReads = ['tenant-a', 'tenant-b']
-  const moved = await probeLedgerSettlement('xero', XERO_TARGET)
+test('[o3d-r948 r6] no caller can ask the probe which organisation answered', async () => {
+  // The field is gone from the TYPE as well as from the value, so a caller cannot read it and a
+  // future contributor cannot re-add half of it. Asserted on the source because a removed optional
+  // property is invisible at runtime on every construction that never set it.
+  const { readFile } = await import('node:fs/promises')
+  const path = await import('node:path')
+  const source = await readFile(
+    path.join(process.cwd(), 'lib/domain/accounting/ledger-settlement-evidence.ts'), 'utf8',
+  )
+  const at = source.indexOf('export type LedgerSettlementProbe =')
+  assert.notEqual(at, -1, 'the probe result type must still be declared here')
+  const decl = source.slice(at, source.indexOf('/** What a row', at))
+  assert.doesNotMatch(decl, /connectionProvenance\?:/, 'no organisation label on the probe result type')
 
-  // THE PRECONDITION, and it is what proves the guard was REACHED rather than short-circuited: the
-  // probe still succeeded and still carries its records, and the tenant really was read twice.
-  assert.equal(moved.ok, true)
-  assert.equal(moved.ok && moved.records.length, 1)
-  assert.equal(tenantsRead(), 2, 'the active connection must be read either side of the fetch')
-
-  assert.equal(moved.ok && moved.connectionProvenance, null)
-})
-
-test('[o3d-r948 r5] no connected organisation at all is unknown too, not an empty name', async () => {
-  // `activeAccountingIdProvenance` answers null when there is no token row, so both reads agree —
-  // and agreeing on NOTHING is still not evidence of anything. The value must stay null rather than
-  // becoming a name like `xero:null`, because the decision side's rule is that null matches nothing,
-  // including another null (`accountingIdProvenanceMatches`, reused there for exactly that reason).
-  //
-  // ROUTE: probeLedgerSettlement's `before === after ? before : null`, on the agreeing-null path.
-  // MUTATION: build the provenance unconditionally as `` `${connector}:${before}` `` and this fails
-  //        with 'xero:null' — a string that is not any organisation but is not null either
-  //        (verified).
-  TENANT_CALLS.length = 0
-  tenantReads = [null, null]
-  const probe = await probeLedgerSettlement('xero', XERO_TARGET)
-  assert.equal(probe.ok, true)
-  assert.equal(probe.ok && probe.records.length, 1, 'the read itself still succeeded')
-  assert.equal(probe.ok && probe.connectionProvenance, null)
-})
-
-test('[o3d-r948 r5] a token read that FAILS does not destroy the reading of the ledger', async () => {
-  // THE FAILURE MODE THIS GUARD ALMOST INTRODUCED, caught by the suite before it shipped. The
-  // provenance read touches the LOCAL `accounting_tokens` row — our database, not the ledger and
-  // not on the ledger's path. Gathered inside the outer try/catch, a database hiccup there became
-  // `ok: false`, which reads as "the accounting connector could not be asked what it already
-  // holds" — and THAT refuses every money post behind it. `authoriseMoneyPost` and
-  // `ledgerClearsFollowUpRevival` both said so, in 43 failures.
-  //
-  // A guard that turns an unrelated fault into a blanket refusal of an unrelated question is a new
-  // failure mode, not a stricter old one. So the read has its own try/catch and degrades to NULL:
-  // the records survive, and "which organisation" is simply unknown — which excludes nothing.
-  //
-  // ROUTE: probeLedgerSettlement's `readConnection` helper and its own try/catch.
-  // MUTATION: remove that inner catch, letting the throw reach the outer one, and this fails with
-  //        `ok: false` and the SASL message in `reason` (verified).
-  TENANT_CALLS.length = 0
-  tenantReads = []
-  tenantReadThrows = true
-  try {
-    const probe = await probeLedgerSettlement('xero', XERO_TARGET)
-
-    // THE PRECONDITION: the read really was attempted and really did throw, so this is the failing
-    // path and not a case where the provenance was never asked for.
-    assert.equal(tenantsRead(), 2, 'the token read must have been attempted either side of the fetch')
-
-    assert.equal(probe.ok, true, 'a failed token read is not a failed ledger reading')
-    assert.equal(probe.ok && probe.records.length, 1, 'and the records the ledger DID give must survive')
-    assert.equal(probe.ok && probe.records[0].id, 'PAY-9')
-    assert.equal(probe.ok && probe.connectionProvenance, null, 'only the organisation is unknown')
-  } finally {
-    tenantReadThrows = false
-  }
+  const impl = await readFile(
+    path.join(process.cwd(), 'lib/connectors/accounting-settlement-probe.ts'), 'utf8',
+  )
+  assert.doesNotMatch(impl, /activeAccountingIdProvenance/,
+    'and the probe must not resurrect a token-snapshot reading — see bd o3d-hold1 for what a sound one needs')
 })

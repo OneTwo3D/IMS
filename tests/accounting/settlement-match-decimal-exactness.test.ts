@@ -1,4 +1,6 @@
 import assert from 'node:assert/strict'
+import { readFile } from 'node:fs/promises'
+import path from 'node:path'
 import test from 'node:test'
 
 import { probeQuickBooksSettlement, probeXeroSettlement } from '@/lib/connectors/accounting-settlement-probe'
@@ -782,54 +784,65 @@ test('[o3d-r948 r3] a differing but UNREADABLE half does not clear the record it
     'and the record\'s readable amount really is outside the band, so r2\'s skip would have fired')
 })
 
-test('[o3d-r948 r3] a record the ledger IDENTIFIES as another attempt\'s does not withhold', () => {
-  // The exclusion that survives: `AccountingSyncLog.externalTransactionId` is the id the ledger
-  // assigned to the settlement a DIFFERENT row posted, and the ledger cannot re-assign it. A record
-  // carrying it was made by that row, whatever has since happened to its amount or its date -- so it
-  // is not this attempt, and holding this attempt back over a figure it cannot read retires nothing.
+/* -------------------------------------------------------------------------------------------- *
+ * o3d-r948 r6 — RETIRED: `[o3d-r948 r3] a record the ledger IDENTIFIES as another attempt's does
+ * not withhold`.
+ *
+ * It asserted that `settlementsOfOtherAttempts` skipped a record whose immutable ledger id IMS had
+ * already recorded against a different row, case-folded, and excluded nothing else. The option is
+ * gone: `classifyLedgerSettlement` takes two arguments and measures every record the probe returned.
+ * See the note above that function for the four rounds of narrowing and the two facts nothing in
+ * this system records, and bd o3d-hold1 for the permanent hold that leaves standing.
+ *
+ * The test below replaces it, on the opposite property.
+ * -------------------------------------------------------------------------------------------- */
+
+test('[o3d-r948 r6] a record the ledger identifies as ANOTHER attempt\'s still withholds', () => {
+  // The exact input r3's exclusion cleared, now asserted to withhold. `PAY-OTHER` is the id IMS
+  // recorded when a different row posted; the ledger reports a settlement carrying it and an amount
+  // this code will not read. There is no longer any argument by which that record can be skipped —
+  // "our row obtained that id" is a claim this system makes about itself, and five rounds could not
+  // make it evidence (see the retirement note above).
   //
-  // ROUTE: classifyLedgerSettlement's `settlementsOfOtherAttempts` skip, supplied in production by
-  //        decideInvoicePaymentRegistration (see the registration test of the same round).
-  // MUTATION: delete the `excluded.has(...)` continue and the first assertion reads `unknown`.
+  // ROUTE: classifyLedgerSettlement's record loop -> the `record-unmeasurable` arm.
+  // MUTATION (run): re-add the `options` parameter, `foldedIdentitySet` and the
+  //        `excluded.has(record.id...)` continue, then call this with
+  //        `{ settlementsOfOtherAttempts: ['PAY-OTHER'] }`. Every assertion below then reads
+  //        `clear` and fails. Reverted after running.
   const unmeasurable: LedgerSettlementRecord[] = [
     { amount: null, unreadableAmount: '10.005', date: null, id: 'PAY-OTHER', reference: null },
   ]
+  const verdict = classifyLedgerSettlement(attemptFor('10.00'), holding(unmeasurable))
+  assert.equal(verdict.outcome, 'unknown')
+  assert.equal(verdict.outcome === 'unknown' && verdict.cause, 'record-unmeasurable')
 
-  // THE PRECONDITION: this very record withholds when nothing identifies it, which is what makes the
-  // exclusion below the thing under test rather than the record being harmless all along.
-  assert.equal(classifyLedgerSettlement(attemptFor('10.00'), holding(unmeasurable)).outcome, 'unknown')
-
+  // And the case-folding that used to matter cannot: nothing compares the id to anything.
   assert.equal(
-    classifyLedgerSettlement(attemptFor('10.00'), holding(unmeasurable), {
-      settlementsOfOtherAttempts: ['PAY-OTHER'],
-    }).outcome,
-    'clear',
-  )
-
-  // Case-folded, because a ledger GUID comes back in whatever case the connector feels like.
-  // MUTATION: drop the `.toLowerCase()` in `foldedIdentitySet` or at the record and this reads
-  //        `unknown`.
-  assert.equal(
-    classifyLedgerSettlement(attemptFor('10.00'), holding([{ ...unmeasurable[0], id: 'Pay-Other' }]), {
-      settlementsOfOtherAttempts: [' PAY-OTHER '],
-    }).outcome,
-    'clear',
-  )
-
-  // AND IT EXCLUDES NOTHING ELSE. A different id is still this attempt's problem, and a record with
-  // no id at all -- every Xero credit-note allocation -- can never be excluded by anything.
-  assert.equal(
-    classifyLedgerSettlement(attemptFor('10.00'), holding(unmeasurable), {
-      settlementsOfOtherAttempts: ['PAY-SOMEONE-ELSE', null, undefined, '  '],
-    }).outcome,
+    classifyLedgerSettlement(attemptFor('10.00'), holding([{ ...unmeasurable[0], id: 'Pay-Other' }])).outcome,
     'unknown',
   )
+  // A record with NO id at all -- every Xero credit-note allocation -- reads the same. It always did;
+  // now so does every other record, which is the whole of the change.
   assert.equal(
-    classifyLedgerSettlement(attemptFor('10.00'), holding([{ amount: null, unreadableAmount: '10.005', date: null, reference: null }]), {
-      settlementsOfOtherAttempts: ['PAY-OTHER'],
-    }).outcome,
+    classifyLedgerSettlement(attemptFor('10.00'),
+      holding([{ amount: null, unreadableAmount: '10.005', date: null, reference: null }])).outcome,
     'unknown',
   )
+})
+
+// o3d-r948 r6: and the third argument is not merely unused — it does not exist. Asserted on the
+// SOURCE because a caller in another file passing an object literal to a two-parameter function is a
+// compile error there, not here, and a future overload could quietly re-open it.
+test('[o3d-r948 r6] classifyLedgerSettlement accepts no exclusion argument at all', async () => {
+  const source = await readFile(
+    path.join(process.cwd(), 'lib/domain/accounting/ledger-settlement-evidence.ts'), 'utf8',
+  )
+  const at = source.indexOf('export function classifyLedgerSettlement(')
+  assert.notEqual(at, -1, 'the classifier must still be exported from this module')
+  const signature = source.slice(at, source.indexOf('{', source.indexOf('): SettlementVerdict', at)))
+  assert.doesNotMatch(signature, /options/, 'no options parameter')
+  assert.doesNotMatch(source, /settlementsOfOtherAttempts\?:/, 'and no option type declaring one')
+  assert.doesNotMatch(source, /foldedIdentitySet/, 'and no folded-id set left to compare against')
 })
 
 test('[o3d-r948 r3] an ordinary first payment still posts, and the ordinary match still matches', () => {
