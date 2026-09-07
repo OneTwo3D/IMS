@@ -2429,7 +2429,7 @@ resolve_fence_script() {
     return 1
   fi
   script="$(db_fence_script_in_use)" || return 1
-  db_fence_publish_operator_wrappers "${APP_USER}" "${APP_DIR}/.env" "${DB_FENCE_STATE}" \
+  db_fence_publish_operator_wrappers "${APP_USER}" "${APP_DIR}/.env" "${DB_FENCE_STATE}" "${LOCK_FILE}" \
     "${DB_FENCE_IDENTITY_ARGS[@]:-}" \
     || echo "The recovery wrappers at ${DB_FENCE_RELEASE_WRAPPER} and ${DB_FENCE_REFENCE_WRAPPER} could not be refreshed for this run. Anything printed below that names them may be a previous run's copy; check it before running it." >&2
   printf '%s' "$script"

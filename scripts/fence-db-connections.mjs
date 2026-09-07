@@ -2696,6 +2696,11 @@ export async function doAuditAuthority(client, options) {
     console.error('show that it is the one this record was written against.')
   }
   process.stdout.write(`legacy_fence_cluster=${clusterIdentity.status}\n`)
+  // AND WHICH CLUSTER ACTUALLY ANSWERED, verbatim. The operator resolution binds its interactive
+  // confirmation token to this, so that a decision confirmed about one server cannot be replayed
+  // against another; and an operator reading the transcript can compare it with the server they
+  // believe they are pointed at.
+  process.stdout.write(`legacy_fence_cluster_identity=${liveCluster.systemIdentifier || '<unavailable>'}/${audited[0]?.audited_database_oid ?? '<unavailable>'}\n`)
   process.stdout.write(`legacy_fence_verdict=${evidence.verdict}\n`)
   if (evidence.verdict === LEGACY_FENCE_ABSENT) return EXIT_OK
   if (evidence.verdict === LEGACY_FENCE_STANDS) return EXIT_FENCE_STANDING

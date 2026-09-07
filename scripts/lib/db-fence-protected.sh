@@ -1320,6 +1320,16 @@ for (var i = 0; i < plan.revoked.length; i++) {
 }
 var acl = plan.datacl_before === undefined ? null : plan.datacl_before;
 if (acl !== null && !(typeof acl === "string" && acl.length <= 8192 && !CONTROL.test(acl))) fail("the recorded prior ACL is not a usable string");
+// THE CLUSTER FINGERPRINT, VALIDATED LIKE EVERY OTHER FIELD (o3d-secops r28, Codex HIGH 1). Two
+// values and nothing else: the system identifier initdb stamps into pg_control, and the database
+// OID. Both are unsigned integers in their text form, so the shape is checkable rather than
+// merely bounded, and anything that is not one is a refusal rather than a field carried through.
+// NULL is ALLOWED and means "this server would not say", which is not the same as a value and is
+// never compared as one -- see compareClusterIdentity() in the helper.
+var systemIdentifier = plan.cluster_system_identifier === undefined ? null : plan.cluster_system_identifier;
+if (systemIdentifier !== null && !(typeof systemIdentifier === "string" && /^[0-9]{1,20}$/.test(systemIdentifier))) fail("the plan's cluster system identifier is not a usable value");
+var databaseOid = plan.cluster_database_oid === undefined ? null : plan.cluster_database_oid;
+if (databaseOid !== null && !(typeof databaseOid === "string" && /^[0-9]{1,10}$/.test(databaseOid))) fail("the plan's database OID is not a usable value");
 if (!(typeof plan.fenced_at === "string" && /^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}([.][0-9]{1,6})?Z$/.test(plan.fenced_at))) fail("the plan carries no usable timestamp");
 var directory = path.dirname(destination);
 var meta = null;
@@ -1355,9 +1365,9 @@ if (priorMeta !== null) {
       process.stderr.write("The record at " + destination + " carries no applied stamp at all (no `fence_applied` key), so it was published by a validator that predates the stamp. That dates its WRITER and says nothing about whether that writer's REVOKE ever committed: the predecessor published its record BEFORE running the fence, so this is equally what a fence raised then leaves and what a publication killed before BEGIN leaves.\n");
       process.stderr.write("Nothing on the filesystem can tell those apart, and the live ACL settles only half of it: a grantee that STILL HOLDS CONNECT proves no revoke took it, so a record every grantee still holds against is one no fence stands behind. The other half it cannot settle -- the ACL records what the grants ARE and never what made them so, and roles that have all lost CONNECT look the same whether this fence took it or an administrator did.\n");
       if (resolveWrapper) {
-        process.stderr.write("Resolve it once, deliberately, by running " + resolveWrapper + " AS ROOT (prefix it with `sudo` if the shell reading this is not root's). It READS and REPORTS: it clears a record every grantee still holds CONNECT against, it refuses a mixed reading, and where NO recorded grantee holds CONNECT it prints both histories that is consistent with and changes nothing -- stamping that record takes a second run with --this-fence-revoked-them, because the stamp is what later grants CONNECT back to every role it names. If a fence IS standing and you would rather simply take it down, the release wrapper restores from this record without needing the stamp.\n");
+        process.stderr.write("Resolve it once, deliberately, by running " + resolveWrapper + " AS ROOT (prefix it with `sudo` if the shell reading this is not root's). It READS and REPORTS, and on its own it changes NOTHING: it prints the grantee list, says which of those roles still hold CONNECT, and says whether the server that answered can be shown to be the one this record was written against. Acting on that reading takes a second run naming the decision -- --no-fence-stands-here to REMOVE the record, --this-fence-revoked-them to STAMP it -- and then a confirmation typed at your terminal, because both directions are irreversible in one way or another. If a fence IS standing and you would rather simply take it down, the release wrapper restores from this record without needing the stamp.\n");
       } else {
-        process.stderr.write("Resolve it once, deliberately, with the operator resolution wrapper in the cutover recovery directory. It READS and REPORTS: it clears a record every grantee still holds CONNECT against, it refuses a mixed reading, and where NO recorded grantee holds CONNECT it prints both histories that is consistent with and changes nothing -- stamping that record takes a second run with --this-fence-revoked-them. If a fence IS standing and you would rather simply take it down, the release wrapper restores from this record without needing the stamp.\n");
+        process.stderr.write("Resolve it once, deliberately, with the operator resolution wrapper in the cutover recovery directory. It READS and REPORTS, and on its own it changes NOTHING: acting on that reading takes a second run naming the decision (--no-fence-stands-here to REMOVE, --this-fence-revoked-them to STAMP) and a confirmation typed at your terminal. If a fence IS standing and you would rather simply take it down, the release wrapper restores from this record without needing the stamp.\n");
       }
       fail("an authority that cannot be shown to be either standing or spent may not be re-fenced automatically. Nothing has been published and nothing has been revoked.");
     } else if (prior.fence_applied === 1) {
@@ -1374,16 +1384,19 @@ var record = {
   admin_role: plan.admin_role,
   revoked: plan.revoked.slice(),
   datacl_before: acl,
+  cluster_system_identifier: systemIdentifier,
+  cluster_database_oid: databaseOid,
   fenced_at: plan.fenced_at,
   fence_mode: standing ? "recovery" : "initial",
   fence_applied: 0,
   state_complete: 1
 };
+var body = Buffer.from(JSON.stringify(record, null, 2) + "\n", "utf8");
 var temporary = destination + ".authority." + process.pid + ".tmp";
 var fd = -1;
 try {
   fd = fs.openSync(temporary, "wx", 384);
-  fs.writeFileSync(fd, JSON.stringify(record, null, 2) + "\n");
+  fs.writeFileSync(fd, body);
   fs.fsyncSync(fd);
   fs.closeSync(fd);
   fd = -1;
@@ -1404,6 +1417,12 @@ try {
   fail("the authority is visible at " + destination + " and its NAME is not durable (" + e.message + "), so a power cut can restore the previous directory entry");
 }
 process.stderr.write("Connection-fence authority published at " + destination + " (" + record.fence_mode + "): CONNECT will be revoked from " + record.revoked.join(", ") + " on " + record.database + ".\n");
+// THE DIGEST OF WHAT WAS ACTUALLY WRITTEN, ON THE MACHINE CHANNEL (o3d-secops r28, Codex HIGH 3).
+// The caller stamps this record a moment later, and the stamp must be conditional on the exact
+// bytes it is stamping rather than on the path. This is where those bytes are known for certain:
+// the buffer that was fsynced and renamed. Taken over the BUFFER and not by re-reading the file,
+// because re-reading is the very window the stamp's compare-and-swap exists to close.
+process.stdout.write("authority_sha256=" + require("crypto").createHash("sha256").update(body).digest("hex") + "\n");
 AUTHORISE_PLAN_EOF
 }
 
@@ -1470,6 +1489,25 @@ var fs = require("fs");
 var path = require("path");
 function fail(m) { process.stderr.write("NOT STAMPED: " + m + "\n"); process.exit(1); }
 var destination = process.argv[1] || "";
+// THE DIGEST OF THE RECORD THE CALLER READ AND AUDITED (o3d-secops r28, Codex HIGH 3).
+//
+// WHAT IT CLOSES. This program used to read the record and, some lines later, rename a modified
+// copy over the path -- with no lock and nothing tying the write to the read. Between them a
+// concurrent release can restore CONNECT and remove the record; the rename then RESURRECTS it,
+// stamped, claiming a fence that is not standing. That stamped record buys the recovery rule and
+// licenses a later GRANT CONNECT back to every role it names.
+//
+// The caller now holds the cutover lock across its whole read/audit/action sequence, which is
+// what actually serialises this. The digest is the second half of the same answer and is worth
+// having on its own: it makes the write conditional on the exact bytes that were audited, so even
+// unserialised the stamp cannot land on a record that changed underneath it.
+//
+// REQUIRED WHEN SUPPLIED, and never quietly skipped: a caller that has a digest and passes an
+// empty string would otherwise get the old unconditional behaviour with the appearance of the new
+// one. Omitted entirely it is the pre-r28 contract, which is what db_fence_raise() uses on the
+// path where publication and stamp are one privileged step under one lock.
+var expectedDigest = process.argv[2] === undefined ? null : String(process.argv[2]);
+if (expectedDigest !== null && !/^[0-9a-f]{64}$/.test(expectedDigest)) fail("the stamp was given something that is not a sha256 digest to hold the record to");
 if (!destination) fail("the stamp was not told which authority it is marking applied");
 var directory = path.dirname(destination);
 var meta = null;
@@ -1482,7 +1520,18 @@ try { fileMeta = fs.lstatSync(destination); } catch (e) { fail(destination + " c
 if (!fileMeta.isFile()) fail(destination + " is not a regular file");
 if (fileMeta.uid !== process.getuid()) fail(destination + " is owned by uid " + fileMeta.uid + " and this run is uid " + process.getuid() + ", so it was not published by this account");
 var raw = "";
-try { raw = fs.readFileSync(destination, "utf8"); } catch (e) { fail(destination + " could not be opened (" + e.message + ")"); }
+var rawBytes = null;
+try { rawBytes = fs.readFileSync(destination); } catch (e) { fail(destination + " could not be opened (" + e.message + ")"); }
+raw = rawBytes.toString("utf8");
+// THE COMPARE, BEFORE ANYTHING IS DECIDED ABOUT THE CONTENT. A record that changed between the
+// caller's audit and this read is not a record whose "already stamped" is reassuring either: it
+// is a DIFFERENT record, and the only safe thing to do with it is refuse and say so.
+if (expectedDigest !== null) {
+  var actualDigest = require("crypto").createHash("sha256").update(rawBytes).digest("hex");
+  if (actualDigest !== expectedDigest) {
+    fail(destination + " is not the record that was read and audited: it hashed to " + expectedDigest + " then and hashes to " + actualDigest + " now, so something rewrote or replaced it in between. Stamping it would attach a decision taken about one record to a different one. NOTHING HAS BEEN CHANGED; read it again and decide again.");
+  }
+}
 var record = null;
 try { record = JSON.parse(raw); } catch (e) { fail(destination + " does not hold valid JSON (" + e.message + ")"); }
 if (record === null || typeof record !== "object" || Array.isArray(record)) fail(destination + " does not hold a JSON object");
@@ -1520,12 +1569,12 @@ MARK_APPLIED_EOF
 # Raise this run's published authority to "applied". ROOT ONLY. Same capture-with-status and same
 # stripped interpreter environment as db_fence_authorise_plan(), for the same two reasons.
 db_fence_mark_authority_applied() {
-  local destination="$1" program
+  local destination="$1" expected_digest="${2:-}" program
   [[ -n "${destination}" ]] || return 1
   program="$(db_fence_mark_applied_program)" || return 1
   [[ -n "${program}" ]] || return 1
   env -u NODE_OPTIONS -u NODE_PATH -u NODE_REPL_EXTERNAL_MODULE \
-    node -e "${program}" -- "${destination}"
+    node -e "${program}" -- "${destination}" "${expected_digest}"
 }
 
 # ---------------------------------------------------------------------------
@@ -1574,7 +1623,9 @@ try { fileMeta = fs.lstatSync(destination); } catch (e) { fail("there is no conn
 if (!fileMeta.isFile()) fail(destination + " is not a regular file");
 if (fileMeta.uid !== process.getuid()) fail(destination + " is owned by uid " + fileMeta.uid + " and this run is uid " + process.getuid() + ", so it was not published by this account and its grantee list is somebody else's");
 var raw = "";
-try { raw = fs.readFileSync(destination, "utf8"); } catch (e) { fail(destination + " could not be opened (" + e.message + ")"); }
+var rawBytes = null;
+try { rawBytes = fs.readFileSync(destination); } catch (e) { fail(destination + " could not be opened (" + e.message + ")"); }
+raw = rawBytes.toString("utf8");
 var record = null;
 try { record = JSON.parse(raw); } catch (e) { fail(destination + " does not hold valid JSON (" + e.message + ")"); }
 if (record === null || typeof record !== "object" || Array.isArray(record)) fail(destination + " does not hold a JSON object");
@@ -1589,7 +1640,60 @@ for (var i = 0; i < record.revoked.length; i++) {
 }
 process.stderr.write("The authority at " + destination + " carries no applied stamp: it was published by a validator that predates the stamp, and it is ambiguous between a fence raised then and a publication that never reached BEGIN. It names " + record.revoked.length + " grantee(s) on " + JSON.stringify(record.database) + ": " + record.revoked.join(", ") + ".\n");
 process.stderr.write("Asking the live ACL which of the two it is. Nothing has been changed yet.\n");
+// THE DIGEST OF THE RECORD THIS INSPECTION PASSED, ON THE MACHINE CHANNEL (o3d-secops r28, Codex
+// HIGH 3). Everything the wrapper does after this -- an audit in another process, then a stamp or
+// a removal -- is a decision about THIS record, and the caller binds the action to it with this
+// value. Printed at the very end so that a refusal above emits nothing for a caller to act on.
+process.stdout.write("authority_sha256=" + require("crypto").createHash("sha256").update(rawBytes).digest("hex") + "\n");
 LEGACY_INSPECT_EOF
+}
+
+# ---------------------------------------------------------------------------
+# REMOVING A RECORD, CONDITIONALLY ON ITS BEING THE ONE THAT WAS READ (o3d-secops r28, Codex HIGH 3)
+#
+# The other side of the stamp's compare-and-swap, and it is the more expensive mistake of the two:
+# a record removed in error destroys the only account of what a standing fence revoked, and the
+# release wrapper then has nothing to restore from. `rm -f` cannot ask the question -- it acts on
+# a NAME, and between the audit that decided and the unlink that acts, a concurrent release can
+# have removed the record and a concurrent fence published a new one at the same path.
+#
+# ROOT ONLY, for the reason every other write here is: the directory is root-owned.
+db_fence_clear_authority_program() {
+  cat <<'CLEAR_AUTHORITY_EOF'
+
+var fs = require("fs");
+var path = require("path");
+function fail(m) { process.stderr.write("NOT CLEARED: " + m + "\n"); process.exit(1); }
+var destination = process.argv[1] || "";
+var expectedDigest = String(process.argv[2] || "");
+if (!destination) fail("the removal was not told which authority it is clearing");
+if (!/^[0-9a-f]{64}$/.test(expectedDigest)) fail("the removal was not given the digest of the record that was read and audited, so it cannot show that the record it is about to destroy is that one");
+var directory = path.dirname(destination);
+var meta = null;
+try { meta = fs.lstatSync(directory); } catch (e) { fail(directory + " could not be examined (" + e.message + ")"); }
+if (!meta.isDirectory()) fail(directory + " is not a directory");
+if (meta.uid !== process.getuid()) fail(directory + " is owned by uid " + meta.uid + " and this run is uid " + process.getuid() + ", so what it holds could have been put there by somebody else");
+if ((meta.mode & 18) !== 0) fail(directory + " is writable by group or other, so any name in it can be renamed or unlinked by another account");
+var fileMeta = null;
+try { fileMeta = fs.lstatSync(destination); } catch (e) { fail("there is no authority at " + destination + " to clear (" + e.message + ")"); }
+if (!fileMeta.isFile()) fail(destination + " is not a regular file");
+if (fileMeta.uid !== process.getuid()) fail(destination + " is owned by uid " + fileMeta.uid + " and this run is uid " + process.getuid() + ", so it was not published by this account");
+var rawBytes = null;
+try { rawBytes = fs.readFileSync(destination); } catch (e) { fail(destination + " could not be opened (" + e.message + ")"); }
+var actualDigest = require("crypto").createHash("sha256").update(rawBytes).digest("hex");
+if (actualDigest !== expectedDigest) fail(destination + " is not the record that was read and audited: it hashed to " + expectedDigest + " then and hashes to " + actualDigest + " now, so something rewrote or replaced it in between. Removing it would destroy an account of a fence nobody here has looked at. NOTHING HAS BEEN CHANGED; read it again and decide again.");
+try { fs.unlinkSync(destination); } catch (e) { fail(destination + " could not be removed (" + e.message + ")"); }
+var dirFd = -1;
+try {
+  dirFd = fs.openSync(directory, "r");
+  fs.fsyncSync(dirFd);
+  fs.closeSync(dirFd);
+} catch (e) {
+  if (dirFd !== -1) { try { fs.closeSync(dirFd); } catch (ignored) { void ignored; } }
+  fail("the authority at " + destination + " is gone and its REMOVAL is not durable (" + e.message + "), so a power cut can bring the record back. It describes a fence that is not standing; if it returns, resolve it again.");
+}
+process.stderr.write("The connection-fence authority at " + destination + " has been removed.\n");
+CLEAR_AUTHORITY_EOF
 }
 
 # Establish that ${1} is the ambiguous legacy record and nothing else. ROOT ONLY, READ-ONLY. Same
@@ -1624,7 +1728,17 @@ db_fence_publish_authority() {
     return 1
   fi
   [[ -n "${plan}" ]] || { echo "The fence plan is empty, so there is nothing to authorise and nothing has been published." >&2; return 1; }
-  printf '%s\n' "${plan}" | db_fence_authorise_plan "${expected_database}" "${expected_app_role}" "${destination}" || return 1
+  # THE DIGEST OF WHAT WAS PUBLISHED, HANDED BACK IN THE CALLER'S OWN FRAME (o3d-secops r28, Codex
+  # HIGH 3). The validator prints it on stdout; the caller stamps the record a moment later and
+  # holds the stamp to these exact bytes. It is a name the CALLER declares `local` -- the idiom
+  # _fence_probe_assemble() uses and for the same reason -- so a value that steers a privileged
+  # write lives only in the frame that consumes it and there is no script-scope name for another
+  # path to write. A command substitution cannot be used instead: it would take the validator's
+  # stderr with the subshell, and that stderr is what tells an operator what was published.
+  _fence_published_digest=""
+  local authorised
+  authorised="$(printf '%s\n' "${plan}" | db_fence_authorise_plan "${expected_database}" "${expected_app_role}" "${destination}")" || return 1
+  _fence_published_digest="$(printf '%s\n' "${authorised}" | sed -n 's/^authority_sha256=\([0-9a-f]\{64\}\)$/\1/p' | tail -1)"
   return 0
 }
 
@@ -1667,6 +1781,9 @@ db_fence_raise() {
   local fence_script="$1" state_file="$2"
   shift 2
   local plan rc=0 argument database="" app_role="" app_user="" had_authority=0
+  # Declared here so db_fence_publish_authority()'s answer lands in a frame that dies with this
+  # call. Initialised, not merely declared: these scripts run under `set -u`.
+  local _fence_published_digest=""
   for argument in "$@"; do
     case "${argument}" in
       --app-database=*) database="${argument#--app-database=}" ;;
@@ -1746,8 +1863,14 @@ db_fence_raise() {
   # A FAILURE HERE DOES NOT FAIL THE FENCE. The fence is up; the stamp only decides what a LATER
   # run may assume, and on the ordinary path there is no later run -- the release removes the whole
   # record. So it is announced and the raise's own status is returned unchanged.
+  #
+  # AND IT IS HELD TO THE BYTES STEP 2 WROTE (o3d-secops r28, Codex HIGH 3). Nothing reads or
+  # decides anything about this record between the publication and this line, and the whole
+  # sequence runs under the cutover lock the entrypoint holds -- so the window here is narrow. It
+  # is bound anyway, because binding it is one argument and because "narrow" is not a property
+  # this file lets itself assert about a write that follows a read.
   if [[ "${rc}" -eq 0 || "${rc}" -eq 5 ]]; then
-    if ! db_fence_mark_authority_applied "${state_file}"; then
+    if ! db_fence_mark_authority_applied "${state_file}" "${_fence_published_digest}"; then
       echo "The fence is up, and the authority at ${state_file} could not be stamped as applied (the reason is printed above). This costs nothing if this cutover finishes: the release removes that record. If this run DIES before the release, the next cutover reads an unstamped-in-this-round record as an INITIAL fence and REFUSES rather than re-applying, because it cannot show the fence ever stood. Take the fence down with the release wrapper printed above rather than re-running the fence." >&2
     fi
   fi
@@ -1834,12 +1957,21 @@ db_fence_raise() {
 #     removes the record.
 # ---------------------------------------------------------------------------
 db_fence_publish_operator_wrappers() {
-  local app_user="$1" env_file="$2" state_file="$3" artefact_digest
-  shift 3
+  # THE CUTOVER LOCK IS PASSED IN, NOT RE-SPELT (o3d-secops r28, Codex HIGH 3). It is the
+  # entrypoint's own ${LOCK_FILE}; a second literal in this library is a second thing to keep in
+  # step with /etc/ims-cutover-state, and a wrapper locking a DIFFERENT file from the one deploy.sh
+  # locks would report an exclusion it does not have -- which is the shape of the finding, not a
+  # fix for it.
+  local app_user="$1" env_file="$2" state_file="$3" cutover_lock="$4" artefact_digest
+  shift 4
+  if [[ -z "${cutover_lock}" ]]; then
+    echo "The operator wrappers were not told which file the shared cutover lock lives at. They read a fence record, ask the database about it and then write or remove it, and a sequence that is not serialised against a running cutover can act on a record that changed underneath it. Refusing to publish them." >&2
+    return 1
+  fi
   _fence_protected_dir_ready || return 1
   artefact_digest="$(fence_record_artefact_digest)" || return 1
 
-  local identity="" arg expected_database="" expected_app_role="" expected_app_user="" baked_program baked_stamp baked_inspect
+  local identity="" arg expected_database="" expected_app_role="" expected_app_user="" baked_program baked_stamp baked_inspect baked_clear
   # The validator these wrappers carry is the library's own, captured with its status taken: a
   # wrapper baked around an empty program would validate nothing and publish nothing, silently.
   baked_program="$(db_fence_authorise_plan_program)" || return 1
@@ -1857,6 +1989,11 @@ db_fence_publish_operator_wrappers() {
   # version of is a gate that can come to disagree with the refusal that sent the operator to it.
   baked_inspect="$(db_fence_legacy_inspect_program)" || return 1
   [[ -n "${baked_inspect}" ]] || return 1
+  # AND THE CONDITIONAL REMOVAL (o3d-secops r28). The resolution may DESTROY the only account of
+  # what a fence revoked, so the removal is held to the digest of the record that was audited
+  # exactly as the stamp is -- and it is baked from the library's single copy like the other three.
+  baked_clear="$(db_fence_clear_authority_program)" || return 1
+  [[ -n "${baked_clear}" ]] || return 1
   for arg in "$@"; do
     [[ -n "${arg}" ]] || continue
     identity+=" $(printf '%q' "${arg}")"
@@ -1905,6 +2042,8 @@ db_fence_publish_operator_wrappers() {
       printf 'authorise_plan=%q\n' "${baked_program}"
       printf 'mark_applied=%q\n' "${baked_stamp}"
       printf 'legacy_inspect=%q\n' "${baked_inspect}"
+      printf 'clear_authority=%q\n' "${baked_clear}"
+      printf 'cutover_lock=%q\n' "${cutover_lock}"
       # The path the validator names in its refusal, so the wrapper the operator lands on and the
       # message that sent them there are the same string composed once.
       printf 'resolve_wrapper=%q\n' "${DB_FENCE_RESOLVE_WRAPPER}"
@@ -1983,12 +2122,127 @@ fi
 run_helper() {
   if [[ "$(id -un)" == "${app_account}" ]]; then env "$@"; else runuser -u "${app_account}" -- env "$@"; fi
 }
+# THE SHARED CUTOVER LOCK, TAKEN FOR THE WHOLE SEQUENCE (o3d-secops r28, Codex HIGH 3).
+#
+# WHAT WAS WRONG. Each of these three wrappers READS the authority, asks something about it, and
+# then WRITES or REMOVES it -- and none of them excluded anything for the duration. A release
+# running beside a resolution can restore CONNECT and delete the record between the resolution's
+# read and its rename, and the rename then resurrects that record STAMPED, claiming a fence that
+# is not standing; the next re-fence reads it as recovery and a later release grants CONNECT back
+# to every role it names. deploy.sh, update.sh and install.sh have excluded each other on this
+# exact file since r22. The wrappers, which do the same reads and the same writes with no cutover
+# around them, were simply outside it.
+#
+# IT IS THE ENTRYPOINTS' OWN LOCK FILE, baked in at publication, so "another cutover is running"
+# and "another wrapper is running" are the same exclusion and not two that pass through each other.
+#
+# READ-ONLY, AND JUDGED AS A DESCRIPTOR, for the reasons lib/cutover-namespace.sh gives at length:
+# flock(2) locks the open file description whatever its access mode, so nothing here needs write
+# permission -- and permission to OPEN this file is permission to hold this lock forever, which is
+# why the mode is narrowed and then proved off the same descriptor that will be locked. The parent
+# is asked about first: a lock taken on a name inside a directory somebody else may write proves
+# nothing, because the entry can be renamed out from under it.
+#
+# fd 9 is the entrypoints' allocation for this same file. These are separate processes, so there is
+# no clash; using the same number keeps `fuser -v` and every runbook line about it true here too.
+take_cutover_lock() {
+  local dir="${cutover_lock%/*}" dir_mode fd_meta fd_kind fd_owner fd_mode fd_inode path_inode
+  if [[ -z "${dir}" || ! -d "${dir}" || ! -O "${dir}" ]]; then
+    echo "REFUSING: ${dir:-the cutover lock's directory} is not a directory this account owns, so a lock taken inside it excludes nobody -- the entry can be renamed between one run's open and another's. ${self} has read nothing and changed nothing." >&2
+    return 1
+  fi
+  dir_mode="$(LC_ALL=C stat -c '%a' "${dir}" 2>/dev/null || true)"
+  if [[ -z "${dir_mode}" ]] || (( (8#${dir_mode} & 0022) != 0 )); then
+    echo "REFUSING: ${dir} is writable by group or other (mode ${dir_mode:-unreadable}), so the lock file inside it can be replaced under this run and the exclusion would be one this run does not hold. ${self} has read nothing and changed nothing." >&2
+    return 1
+  fi
+  if [[ ! -e "${cutover_lock}" && ! -L "${cutover_lock}" ]]; then
+    # O_EXCL through the shell's own noclobber, in a subshell so the setting does not survive.
+    ( set -C; : > "${cutover_lock}" ) 2>/dev/null || true
+  fi
+  # Narrowed BEFORE it is opened and proved AFTER, which is the order that matters: `chmod` cannot
+  # reach a descriptor another account already holds, so this closes the door to new opens and the
+  # proof below is about the inode this run is actually locking.
+  chmod 600 "${cutover_lock}" 2>/dev/null || true
+  if ! exec 9<"${cutover_lock}"; then
+    echo "REFUSING: ${cutover_lock} could not be opened, so this run cannot take the exclusion every cutover on this host takes. ${self} has read nothing and changed nothing." >&2
+    return 1
+  fi
+  fd_meta="$(LC_ALL=C stat -L -c '%F|%u|%a|%i' /dev/fd/9 2>/dev/null || true)"
+  IFS='|' read -r fd_kind fd_owner fd_mode fd_inode <<< "${fd_meta}"
+  path_inode="$(LC_ALL=C stat -c '%i' "${cutover_lock}" 2>/dev/null || true)"
+  if [[ "${fd_kind}" != "regular file" || "${fd_owner}" != "$(id -u)" || -z "${fd_mode}" || -z "${fd_inode}" || "${fd_inode}" != "${path_inode}" ]] || (( (8#${fd_mode} & 0077) != 0 )); then
+    echo "REFUSING: the descriptor this run opened on ${cutover_lock} is not that name's own inode, or is not a regular file owned by this account and unreadable by everyone else (${fd_meta:-unreadable}). Either something followed a link at that name, the name was replaced between the open and the check, or the file is one another account can open and therefore lock indefinitely. ${self} has read nothing and changed nothing." >&2
+    exec 9<&-
+    return 1
+  fi
+  if ! flock -n 9; then
+    echo "REFUSING: ${cutover_lock} is held by another run -- a cutover (deploy.sh, update.sh or install.sh) or another of these wrappers. This one reads the fence authority, asks the database about it and then writes or removes it, and two of those sequences interleaved can stamp a record that the other has already released. If nothing is running, \`fuser -v ${cutover_lock}\` names what holds it. ${self} has read nothing and changed nothing." >&2
+    exec 9<&-
+    return 1
+  fi
+  return 0
+}
+# A CONFIRMATION THAT A SCRIPT CANNOT GIVE (o3d-secops r28, Codex MEDIUM).
+#
+# WHAT WAS WRONG. The confirmation was a command-line flag. Any root-running process could supply
+# it, on the FIRST invocation, without a terminal and without ever having seen the roles it was
+# authorising a later GRANT for -- so the "two-step" was a convention and the "human evidentiary
+# bar" was a string in argv. A flag in a runbook gets copy-pasted with the command it sits next to.
+#
+# WHAT IT IS NOW. The answer is read from ${self}'s CONTROLLING TERMINAL, /dev/tty, and never from
+# stdin: a heredoc, a pipe and a `< /dev/null` cron job all fail to open it and are refused. And
+# the thing that has to be typed is a TOKEN DERIVED FROM THIS DECISION -- the sha256 of the action,
+# the exact bytes of the record that was inspected, and the cluster identity that answered the
+# audit -- so it cannot exist in a runbook, cannot be reused on a second host, and cannot be typed
+# by anybody who has not just been shown the grantee list this run printed. Change any of the
+# three and the token changes.
+#
+# WHAT IT IS NOT, said plainly so nobody mistakes it for more. It is not authentication. A person
+# who is already root and who runs this under `expect` or a pty can read the token back. The bar is
+# that the decision is taken ONCE, DELIBERATELY, ABOUT THIS RECORD, by somebody looking at it --
+# not that root is prevented from doing what root can do. There is deliberately NO non-interactive
+# escape hatch: automation that needs to resolve these records is a different interface, and it
+# would have to be designed and audited as one rather than borrowing the word "confirmation".
+tty_answer() {
+  local reply=""
+  {
+    printf '%s' "$1" >&3
+    IFS= read -r reply <&3
+  } 3<>/dev/tty 2>/dev/null || return 1
+  printf '%s' "${reply}"
+}
+operator_confirms() {
+  local action="$1" token="$2" answer="" want
+  want="${action}-${token}"
+  answer="$(tty_answer "Type ${want} to proceed, or anything else to abort: ")" || {
+    echo "" >&2
+    echo "NOT CONFIRMED: this run has no controlling terminal, so there is nobody here to confirm to." >&2
+    echo "This step is deliberately interactive and has no flag that replaces it: it authorises a change to the record that decides which roles a later ${sudo_prefix}${release_wrapper} hands CONNECT back to, and that decision is a person's. Re-run it from a terminal." >&2
+    echo "Nothing has been changed." >&2
+    return 1
+  }
+  if [[ "${answer}" != "${want}" ]]; then
+    echo "" >&2
+    echo "NOT CONFIRMED: '${answer}' is not '${want}'. Nothing has been changed and the record is exactly as it was found." >&2
+    return 1
+  fi
+  return 0
+}
+# The token itself: this action, these exact record bytes, this cluster. `sha256sum` is already
+# required by the artefact check at the top of this wrapper, so it is not a new dependency.
+decision_token() {
+  printf '%s|%s|%s' "$1" "$2" "$3" | sha256sum | cut -c1-12
+}
 # THE THREE STEPS, BAKED (o3d-secops r23, Codex CRITICAL). The authority this wrapper acts on is
 # published by ROOT out of a plan the unprivileged helper prints, validated field by field and
 # rebuilt from the validator own template. The validator is the SAME program lib/db-fence-protected.sh
 # runs, written in here at publication rather than re-typed, so there is one text and two callers.
 raise_the_fence() {
-  local plan rc=0 had_authority=0
+  local plan rc=0 had_authority=0 published_digest=""
+  # o3d-secops r28: held across the whole publish/fence/stamp sequence, so a release or a
+  # resolution cannot move the record between this run's steps. See take_cutover_lock().
+  take_cutover_lock || return 1
   # o3d-secops r24: the same question db_fence_raise() asks, for the same two reasons -- it is what
   # root stamps into fence_mode, and it says whether the authority published below is this run's
   # own and therefore the only one this run may remove.
@@ -1997,8 +2251,8 @@ raise_the_fence() {
   # o3d-secops r25: the publication's own failures are the sibling r24 missed. The validator's last
   # barrier is the directory fsync, which runs after the rename and leaves the record visible when
   # it fails, so a failed publication is a publication that may well have published.
-  if ! printf '%s\n' "${plan}" | env -u NODE_OPTIONS -u NODE_PATH -u NODE_REPL_EXTERNAL_MODULE \
-    node -e "${authorise_plan}" -- "${expected_database}" "${expected_app_role}" "${state_file}" "${resolve_wrapper}"; then
+  if ! published_digest="$(printf '%s\n' "${plan}" | env -u NODE_OPTIONS -u NODE_PATH -u NODE_REPL_EXTERNAL_MODULE \
+    node -e "${authorise_plan}" -- "${expected_database}" "${expected_app_role}" "${state_file}" "${resolve_wrapper}")"; then
     if [[ "${had_authority}" -eq 0 ]]; then
       rm -f "${state_file}" 2>/dev/null || true
       if [[ -e "${state_file}" ]]; then
@@ -2012,8 +2266,12 @@ raise_the_fence() {
   # rise, exit 5 is one that may be standing with a lost acknowledgement; both mean CONNECT may be
   # revoked, and both must therefore be readable as a standing fence by whatever runs next.
   if [[ "${rc}" -eq 0 || "${rc}" -eq 5 ]]; then
+    # o3d-secops r28: bound to the bytes the validator just wrote, so the stamp cannot land on a
+    # record something else replaced in between. Under the lock above that window is already shut;
+    # this is the second answer to the same question and it costs one argument.
+    published_digest="$(printf '%s\n' "${published_digest}" | sed -n 's/^authority_sha256=\([0-9a-f]\{64\}\)$/\1/p' | tail -1)"
     env -u NODE_OPTIONS -u NODE_PATH -u NODE_REPL_EXTERNAL_MODULE \
-      node -e "${mark_applied}" -- "${state_file}" \
+      node -e "${mark_applied}" -- "${state_file}" "${published_digest}" \
       || echo "The fence is up and ${state_file} could not be stamped as applied. Take it down with the release wrapper rather than re-running this one: a re-fence over an unstamped record is held to the strict rule and will refuse." >&2
   fi
   # Exit 3 is EXIT_NOT_FENCEABLE, which the helper returns only before BEGIN: nothing was revoked,
@@ -2029,6 +2287,9 @@ raise_the_fence() {
   return "${rc}"
 }
 release_the_fence() {
+  # o3d-secops r28: the release READS the record, GRANTs from it and then REMOVES it. Held across
+  # all three, so a re-fence or a resolution cannot publish or stamp between them.
+  take_cutover_lock || return 1
   run_helper DEPLOY_ADMIN_DATABASE_URL="${DEPLOY_ADMIN_DATABASE_URL}" node "${helper}" --release --state-file="${state_file}" --state-owner="$(id -u)" "${identity_argv[@]}" || return 1
   # Root removes the record, after the release is verified and never before: see
   # db_fence_clear_authority() in lib/db-fence-protected.sh for why that order and not the other.
@@ -2039,95 +2300,150 @@ release_the_fence() {
   fi
   return 0
 }
-# THE ONE-TIME OPERATOR RESOLUTION (o3d-secops r26, Codex HIGH). Run BY A PERSON, never by a
-# cutover, and only when an automatic path has refused an authority that carries no applied stamp.
+# THE ONE-TIME OPERATOR RESOLUTION (o3d-secops r26, Codex HIGH; reworked r28, Codex HIGH 1 + 3
+# and MEDIUM). Run BY A PERSON, never by a cutover, and only when an automatic path has refused an
+# authority that carries no applied stamp.
 #
-# THREE STEPS, AND THE MIDDLE ONE IS THE ONLY EVIDENCE THERE IS. Root establishes that the record
-# really is the ambiguous legacy one and nothing else; the unprivileged helper asks the live ACL
-# whether the grantees it names still hold CONNECT; root then acts on that answer and on nothing
-# else. Both directions are writes, so both are root's, and neither happens without an unambiguous
-# reading:
+# FOUR STEPS NOW, AND ALL FOUR UNDER ONE LOCK. This run takes the shared cutover lock before it
+# reads anything and holds it until it has acted, so no release, re-fence or second resolution can
+# move the record between the reading and the writing (r28, Codex HIGH 3). Root establishes that
+# the record really is the ambiguous legacy one AND REPORTS THE DIGEST OF THE EXACT BYTES it read;
+# the unprivileged helper asks the live ACL whether the grantees it names still hold CONNECT, and
+# reports which cluster answered; root then acts on that answer and on nothing else, holding the
+# write to the digest so that even unserialised it cannot land on a record that changed.
 #
 #   every recorded grantee still holds CONNECT   the REVOKE cannot have run -> the record is what a
-#                                                publication killed before BEGIN left -> CLEAR it,
-#                                                automatically.
-#   not one of them holds CONNECT                EVIDENCE, NOT A CAUSE (o3d-secops r27, Codex
-#                                                HIGH). The fence this record describes produces
-#                                                this reading, and so does an administrator who
-#                                                revoked those same roles independently; the ACL
-#                                                records the STATE of the grants and never what
-#                                                made them that way. REPORT it and STOP, unless the
-#                                                operator has explicitly confirmed that this fence
-#                                                is theirs -- see the asymmetry below.
+#                                                publication killed before BEGIN left -> CLEAR it.
+#                                                AUTOMATICALLY ONLY IF THE CLUSTER IS PROVEN --
+#                                                see the asymmetry below, which r28 rewrote.
+#   not one of them holds CONNECT                EVIDENCE, NOT A CAUSE (o3d-secops r27). The fence
+#                                                this record describes produces this reading, and
+#                                                so does an administrator who revoked those same
+#                                                roles independently; the ACL records the STATE of
+#                                                the grants and never what made them that way.
+#                                                REPORT it and STOP, unless the operator confirms.
 #   anything else                                REFUSE. A half-applied fence and an administrator
 #                                                who removed one of these roles by hand read
 #                                                identically here, and guessing between them is the
 #                                                whole defect r26 removed.
 #
-# AND THE TWO OUTCOMES ARE NOT SYMMETRIC, WHICH IS WHY THEY DO NOT SHARE AN EVIDENTIAL BAR
-# (o3d-secops r27, Codex HIGH). Clearing a record no fence stands behind restores nobody's
-# privilege: it is inert whichever history produced the reading, so it stays automatic. STAMPING is
-# the direction that LATER RESTORES PRIVILEGE -- a stamped record is one ${release_wrapper}
-# and a recovery re-fence will GRANT CONNECT back from, to every role it names -- so on the reading
-# that cannot distinguish "this fence revoked them" from "an administrator revoked them", stamping
-# would be the first step of handing access back to roles somebody deliberately removed. It
-# therefore requires the operator to say, in as many words, that the fence is theirs:
+# WHAT r28 CHANGED, AND WHY THE CLEAR IS NO LONGER FREE (Codex HIGH 1).
 #
-#   ${self} --this-fence-revoked-them
+# r27 said the two outcomes are not symmetric: stamping later restores privilege and clearing is
+# inert, so only stamping needed the operator. That reasoning holds only if the reading is a
+# reading of THIS cluster, and r27 also said, in as many words, that nothing here can show that.
+# Both were true and the conclusion drawn from them was wrong. A same-named database on another
+# server -- DNS, a proxy, a failover that re-pointed a name -- has never been fenced, so every
+# recorded grantee holds CONNECT there, the verdict is `absent`, and the automatic arm DELETES the
+# sole authority for a fence standing on the real cluster. Clearing is inert about the cluster it
+# read; it is not inert about the record, and the record is the only thing the release wrapper can
+# restore from. THE ARM JUDGED SAFE WAS THE ARM THAT DELETES.
 #
-# Run WITHOUT that argument the resolution still does its whole read -- the record is inspected,
-# the ACL is audited, the grantee lists and both possible histories are printed -- and then changes
-# nothing. That is the two-step on purpose: the first run is what shows the operator the roles they
-# are about to authorise a later GRANT for.
+# So the helper now reports a cluster verdict beside the ACL verdict, and this wrapper reads both:
 #
-# AND THE ARGUMENT AUTHORISES NOTHING BY ITSELF. It is read after the audit, never before, and it
-# is consulted on ONE reading: a `stands` verdict from a helper that exited 5. A mixed reading, an
-# audit that could not connect or could not bind its identity, and a record that is not the
-# ambiguous one are refused with it exactly as they are without it.
+#   mismatch   the helper refuses outright and prints no verdict line. Nothing reaches here.
+#   proven     the record's fingerprint and the answering cluster's agree. `absent` clears
+#              automatically, exactly as r26 and r27 had it -- the evidence is now attributable.
+#   unproven   THE ABSENCE OF EVIDENCE, AND EVERY LEGACY RECORD IS THIS BY DEFINITION: a validator
+#              that predates the applied stamp predates the fingerprint too, so there is nothing in
+#              it to compare. The clear then needs the operator, exactly as the stamp does. Between
+#              refusing and deleting, this refuses: a record left alone keeps every automatic path
+#              refusing, which is annoying and recoverable, and a record deleted in error cannot be
+#              got back.
+#
+# AND THE CONFIRMATION IS NO LONGER A FLAG (o3d-secops r28, Codex MEDIUM). The two arguments below
+# say WHICH decision is being taken; neither authorises it. What authorises it is a token typed at
+# ${self}'s controlling terminal, derived from the action, the exact bytes of the record that was
+# inspected and the cluster that answered -- so it cannot be written into a runbook, cannot be
+# reused on another host or another record, and cannot be given by a process with no terminal. See
+# operator_confirms(), which also says plainly what that bar is not.
+#
+# Run with NO argument the resolution still does its whole read -- the record is inspected, the ACL
+# is audited, the grantee lists, the cluster verdict and both possible histories are printed -- and
+# then changes nothing. That is the first step of the two on purpose: it is what shows the operator
+# the roles and the evidence they are about to decide about.
 #
 # AND A PARTIAL RESULT FAILS TOWARD REFUSING, at every step and not only at the verdict: an audit
-# that cannot connect, cannot read the record, is pointed at another database, exits with a status
-# this does not enumerate, or prints a verdict line that does not agree with that status, changes
-# NOTHING. The record is left exactly as it was found, which keeps every automatic path refusing --
-# the state this procedure exists to leave when it cannot do better.
+# that cannot connect, cannot read the record, is pointed at another database or another cluster,
+# exits with a status this does not enumerate, or prints a verdict line that does not agree with
+# that status, changes NOTHING. The record is left exactly as it was found, which keeps every
+# automatic path refusing -- the state this procedure exists to leave when it cannot do better.
 resolve_legacy_fence() {
-  local verdict rc=0 confirmed=0
-  # 0. THE OPERATOR'S OWN ARGUMENT, AND THE ONLY ONE THIS ACCEPTS. An unrecognised argument is a
+  local audited verdict="" cluster="" identity="" rc=0 confirmed_stamp=0 confirmed_clear=0 inspected digest token
+  # 0. THE OPERATOR'S OWN ARGUMENTS, AND THE ONLY ONES THIS ACCEPTS. An unrecognised argument is a
   #    REFUSAL rather than something ignored: a mistyped confirmation that is silently dropped
   #    reads to the operator as "it refused for no reason", and a mistyped ANYTHING that is
   #    silently dropped is how a flag comes to mean something nobody typed. Nothing is read from
-  #    the database or the filesystem before this returns.
+  #    the database or the filesystem before this returns, and no lock is taken.
   while [[ $# -gt 0 ]]; do
     case "$1" in
-      --this-fence-revoked-them) confirmed=1 ;;
+      --this-fence-revoked-them) confirmed_stamp=1 ;;
+      --no-fence-stands-here) confirmed_clear=1 ;;
       *)
-        echo "${self}: unrecognised argument '$1'. This wrapper takes one optional argument and no others:" >&2
+        echo "${self}: unrecognised argument '$1'. This wrapper takes these arguments and no others:" >&2
         echo "" >&2
         echo "  ${sudo_prefix}${self}                             inspect the record, audit the ACL, print what they say, change NOTHING" >&2
-        echo "  ${sudo_prefix}${self} --this-fence-revoked-them   the same, and stamp the record IF the ACL shows every recorded grantee has lost CONNECT" >&2
+        echo "  ${sudo_prefix}${self} --this-fence-revoked-them   the same, and offer to STAMP if the ACL shows every recorded grantee has lost CONNECT" >&2
+        echo "  ${sudo_prefix}${self} --no-fence-stands-here      the same, and offer to REMOVE if the ACL shows every recorded grantee still holds CONNECT" >&2
         echo "" >&2
+        echo "Neither argument authorises anything by itself: each selects a decision, and the decision is then confirmed at this terminal." >&2
         echo "Nothing has been examined and nothing has been changed." >&2
         return 1 ;;
     esac
     shift
   done
-  # 1. ROOT: is this the ambiguous record at all? It refuses a stamped one, a
-  #    published-never-applied one, a truncated one and one nobody published.
-  env -u NODE_OPTIONS -u NODE_PATH -u NODE_REPL_EXTERNAL_MODULE \
-    node -e "${legacy_inspect}" -- "${state_file}" || return 1
-  # 2. UNPRIVILEGED: the live ACL, read through the protected helper as the application account.
+  # 1. THE LOCK, BEFORE THE FIRST READ. Everything below is one read/audit/act sequence and it is
+  #    excluded against every cutover and every other wrapper for the whole of it.
+  take_cutover_lock || return 1
+  # 2. ROOT: is this the ambiguous record at all? It refuses a stamped one, a
+  #    published-never-applied one, a truncated one and one nobody published. Its stdout is the
+  #    digest of the exact bytes it passed; its stderr is the prose the operator reads.
+  inspected="$(env -u NODE_OPTIONS -u NODE_PATH -u NODE_REPL_EXTERNAL_MODULE \
+    node -e "${legacy_inspect}" -- "${state_file}")" || return 1
+  digest="$(printf '%s\n' "${inspected}" | sed -n 's/^authority_sha256=\([0-9a-f]\{64\}\)$/\1/p' | tail -1)"
+  if [[ -z "${digest}" ]]; then
+    echo "NOT RESOLVED: the inspection passed the record at ${state_file} and did not report the digest of the bytes it read." >&2
+    echo "Every write below is held to those exact bytes -- that is what stops a decision taken about one record landing on another -- so without the digest there is nothing to hold it to. Nothing has been changed." >&2
+    return 1
+  fi
+  # 3. UNPRIVILEGED: the live ACL, read through the protected helper as the application account.
   #    Read-only -- it issues no REVOKE, no GRANT and no BEGIN, and writes no file. Its stdout is
-  #    the verdict line and its stderr is the prose, so the capture below takes the one and the
-  #    operator reads the other.
-  verdict="$(run_helper DEPLOY_ADMIN_DATABASE_URL="${DEPLOY_ADMIN_DATABASE_URL}" node "${helper}" --audit-authority --state-file="${state_file}" --state-owner="$(id -u)" "${identity_argv[@]}")" || rc=$?
-  # 3. ROOT: act, and only on a status and a verdict line that agree. Two channels for one fact is
+  #    the verdict, the cluster verdict and the cluster identity; its stderr is the prose.
+  audited="$(run_helper DEPLOY_ADMIN_DATABASE_URL="${DEPLOY_ADMIN_DATABASE_URL}" node "${helper}" --audit-authority --state-file="${state_file}" --state-owner="$(id -u)" "${identity_argv[@]}")" || rc=$?
+  verdict="$(printf '%s\n' "${audited}" | sed -n 's/^\(legacy_fence_verdict=.*\)$/\1/p' | tail -1)"
+  cluster="$(printf '%s\n' "${audited}" | sed -n 's/^legacy_fence_cluster=\(.*\)$/\1/p' | tail -1)"
+  identity="$(printf '%s\n' "${audited}" | sed -n 's/^legacy_fence_cluster_identity=\(.*\)$/\1/p' | tail -1)"
+  # 4. ROOT: act, and only on a status and a verdict line that agree. Two channels for one fact is
   #    deliberate -- an exit status can be produced by a shell that never ran the helper, and a
   #    line of stdout can be produced by a helper that could not decide.
   if [[ "${rc}" -eq 0 && "${verdict}" == "legacy_fence_verdict=absent" ]]; then
-    echo "Every grantee the record names still holds CONNECT, so no fence stands behind it. Removing it." >&2
-    rm -f "${state_file}" 2>/dev/null || true
-    if [[ -e "${state_file}" ]]; then
-      echo "The record at ${state_file} describes a fence that was never applied and it could not be removed. Nothing else has changed. Remove it by hand; until it is gone every cutover will refuse." >&2
+    echo "Every grantee the record names still holds CONNECT on the database that answered, so the REVOKE this record describes cannot have run there." >&2
+    if [[ "${cluster}" != "proven" ]]; then
+      echo "" >&2
+      echo "AND THAT READING CANNOT BE ATTRIBUTED TO THE CLUSTER THIS RECORD WAS WRITTEN AGAINST." >&2
+      echo "The host, port, database name and role all match; two servers can satisfy all four at once, and this record carries no cluster fingerprint to settle it -- which is what every record published before this round looks like." >&2
+      echo "An unfenced bystander cluster reachable at the same name produces EXACTLY the reading above. Removing the record on it would destroy the only account of what a fence still standing on the real cluster revoked, and ${sudo_prefix}${release_wrapper} would then have no grantee list to restore from." >&2
+      if [[ "${confirmed_clear}" -ne 1 ]]; then
+        echo "" >&2
+        echo "NOT RESOLVED, and deliberately: nothing has been changed and the record is exactly as it was found." >&2
+        echo "IF YOU ARE SATISFIED that the database audited above is the one this record was written against -- check the host in DEPLOY_ADMIN_DATABASE_URL, and check it is not a replica, a proxy or a staging server reached through the same name -- say so and re-run:" >&2
+        echo "" >&2
+        echo "  ${sudo_prefix}${self} --no-fence-stands-here" >&2
+        echo "" >&2
+        echo "IF YOU ARE NOT SURE, leave it alone. Every automatic path goes on refusing this record, which stops nothing you cannot restart, and the record itself is what a release restores from." >&2
+        return 1
+      fi
+      echo "" >&2
+      echo "ABOUT TO REMOVE the connection-fence authority at ${state_file}." >&2
+      echo "  record digest:   ${digest}" >&2
+      echo "  cluster audited: ${identity:-<this server would not say>}" >&2
+      echo "This destroys the record. It cannot be undone and nothing else holds the grantee list it names." >&2
+      operator_confirms clear "$(decision_token clear "${digest}" "${identity}")" || return 1
+    fi
+    echo "Removing it." >&2
+    if ! env -u NODE_OPTIONS -u NODE_PATH -u NODE_REPL_EXTERNAL_MODULE \
+      node -e "${clear_authority}" -- "${state_file}" "${digest}"; then
+      echo "The record at ${state_file} describes a fence that was never applied and it could not be removed (the reason is above). Nothing else has changed. Until it is gone every cutover will refuse." >&2
       return 1
     fi
     echo "RESOLVED: ${state_file} is gone. Nothing was fenced and nothing was released; the next cutover plans and publishes an INITIAL authority as it would on any other host." >&2
@@ -2136,7 +2452,7 @@ resolve_legacy_fence() {
   if [[ "${rc}" -eq 5 && "${verdict}" == "legacy_fence_verdict=stands" ]]; then
     echo "Not one grantee the record names holds CONNECT. THAT IS THE EVIDENCE, and it is all of it: the list above is what the record names, and none of those roles holds CONNECT on ${expected_database} now." >&2
     echo "It is consistent with TWO HISTORIES -- the fence this record describes revoked those roles, or an administrator revoked them independently of it -- and the ACL cannot tell you which. It records what the grants ARE, never what made them so." >&2
-    if [[ "${confirmed}" -ne 1 ]]; then
+    if [[ "${confirmed_stamp}" -ne 1 ]]; then
       echo "" >&2
       echo "NOT RESOLVED, and deliberately: nothing has been changed and the record is exactly as it was found." >&2
       echo "Stamping it applied is what later lets ${sudo_prefix}${release_wrapper} GRANT CONNECT back to EVERY role listed above, and a recovery re-fence do the same, so it must not follow from a reading that cannot rule out an administrator's own revoke. You know whether you revoked those roles; this does not." >&2
@@ -2148,19 +2464,25 @@ resolve_legacy_fence() {
       echo "IF ANY OF THOSE ROLES WAS REVOKED DELIBERATELY and must stay revoked, do not stamp. Either leave the record alone -- every automatic path goes on refusing it, which is safe -- or take the fence down with ${sudo_prefix}${release_wrapper}, which restores from this record without needing the stamp AND will grant those roles back too, so re-revoke them by hand afterwards." >&2
       return 1
     fi
-    echo "CONFIRMED BY THE OPERATOR (--this-fence-revoked-them): the fence this record describes is what took CONNECT from those roles. Stamping it applied." >&2
+    echo "" >&2
+    echo "ABOUT TO STAMP the connection-fence authority at ${state_file} as APPLIED." >&2
+    echo "  record digest:   ${digest}" >&2
+    echo "  cluster audited: ${identity:-<this server would not say>}" >&2
+    echo "This licenses a later ${sudo_prefix}${release_wrapper} to GRANT CONNECT back to every role printed above." >&2
+    operator_confirms stamp "$(decision_token stamp "${digest}" "${identity}")" || return 1
+    echo "CONFIRMED BY THE OPERATOR: the fence this record describes is what took CONNECT from those roles. Stamping it applied." >&2
     if ! env -u NODE_OPTIONS -u NODE_PATH -u NODE_REPL_EXTERNAL_MODULE \
-      node -e "${mark_applied}" -- "${state_file}"; then
+      node -e "${mark_applied}" -- "${state_file}" "${digest}"; then
       echo "The fence is standing and ${state_file} could not be stamped (the reason is above). Nothing has changed: the record still carries no stamp and every cutover still refuses it. Fix the filesystem and re-run this, or take the fence down with ${sudo_prefix}${release_wrapper}, which restores from the record without needing the stamp." >&2
       return 1
     fi
     echo "RESOLVED: ${state_file} is stamped applied. The fence is still standing -- this changed a record and not a database. Take it down with ${sudo_prefix}${release_wrapper}, or re-fence over it, which now uses the recovery rule." >&2
     return 0
   fi
-  echo "NOT RESOLVED: the live ACL does not settle what this record means (helper exit ${rc}, verdict '${verdict:-<none>}')." >&2
+  echo "NOT RESOLVED: the live ACL does not settle what this record means (helper exit ${rc}, verdict '${verdict:-<none>}', cluster '${cluster:-<none>}')." >&2
   echo "Nothing has been changed: the record is exactly as it was found, and every automatic path will go on refusing it." >&2
-  if [[ "${confirmed}" -eq 1 ]]; then
-    echo "--this-fence-revoked-them was supplied and is NOT what decided this. It is consulted on one reading only -- every recorded grantee having lost CONNECT -- and this is not that reading, so it authorised nothing." >&2
+  if [[ "${confirmed_stamp}" -eq 1 || "${confirmed_clear}" -eq 1 ]]; then
+    echo "The argument you supplied is NOT what decided this. Each is consulted on ONE reading -- --this-fence-revoked-them on every recorded grantee having lost CONNECT, --no-fence-stands-here on every one of them still holding it -- and this is neither, so it authorised nothing." >&2
   fi
   echo "A MIXED reading -- some recorded grantees hold CONNECT and some do not -- is not a half-answer this may round off:" >&2
   echo "a fence applied halfway and an administrator who removed one of those roles by hand look identical from here." >&2
