@@ -3216,6 +3216,29 @@ release_db_connections() {
       && db_fence_machine_verdict "$released" "RELEASE_WITNESS" "$witness_nonce" "colocated"; then
       clear_server="same-server-as-the-fence"
     fi
+    # AND AN ISSUED CHALLENGE IS ANSWERED BEFORE ANY FAST PATH READS A FLAG (o3d-secops r34,
+    # Codex HIGH 1). r33 put the keep-record fast path BELOW the assignment above and ABOVE the
+    # reading that acted on it, so the one case the witness exists to catch was RETURNED PAST. The
+    # closing gate sets ${DB_FENCE_KEEP_RECORD} on a sampling miss -- and a sampling miss is
+    # precisely the run on which routing may have moved between the gate and this release. A
+    # challenge went out, `--release` answered `RELEASE_WITNESS <nonce> absent`, and this function
+    # returned 0: the application then started against a copy while the fenced server stayed shut.
+    #
+    # THE READING IS STILL EXACTLY r31'S AND NOTHING WIDER: a challenge WAS put to a live witness
+    # AND the answer was not "same-server-as-the-fence". db_fence_machine_verdict() is false for
+    # all three ways that can happen -- no line carrying this nonce, a line for this nonce saying
+    # something other than `colocated`, and a stream answering the same nonce twice -- so missing,
+    # conflicting and non-colocated are ONE refusal here. A run that could put no challenge at all
+    # never reaches it, which is the degraded mode r33 was fixing and which still completes.
+    #
+    # IT IS EVALUATED ONCE, HERE, AND THE clear_rc==2 ARM BELOW NO LONGER REPEATS IT: past this
+    # line a run that issued a challenge HAS a colocated verdict, so a second copy of the test
+    # would be a guard that can never fire -- and this branch has spent two rounds on exactly that
+    # shape of thing.
+    if [[ "${#witness_argv[@]}" -gt 0 && -z "$clear_server" ]]; then
+      echo -e "${RED}[ERROR]${RESET} The connection fence WAS released -- CONNECT is restored -- and its record at $DB_FENCE_STATE has NOT been removed. A challenge WAS put to this run's witness and the release's own connection could not see it, so nothing here can show that the server just released is the server that was fenced. The next run reads that file as a STANDING FENCE. End it with ${DB_FENCE_RELEASE_CMD}, which asks you to confirm at your terminal." >&2
+      return 1
+    fi
     # AND A RUN THAT ALREADY KNOWS THE RECORD IS BEING KEPT DOES NOT ASK (o3d-secops r33, Codex
     # MEDIUM). ${DB_FENCE_KEEP_RECORD} is set by the closing gate when the sampler never saw the
     # migration's own backends; the removal is withheld HERE rather than by taking the witness away
@@ -3234,17 +3257,15 @@ release_db_connections() {
       # degraded mode this whole subsystem promises not to refuse, died at
       # `release_db_connections || die` with the schema migrated and nothing started.
       #
-      # THE ONE READING THAT IS STILL FATAL is the one r31 bought, and it is stated as exactly that
-      # and nothing wider: a challenge WAS put to a live witness AND the answer was not
-      # "same-server-as-the-fence", so that release may have landed on a copy while the real
-      # server is still fenced. A record this run did not RAISE is a different fact and is not
-      # fatal: the grants are back either way, and nothing about it says the release landed
-      # somewhere else.
-      if [[ "${#witness_argv[@]}" -gt 0 && -z "$clear_server" ]]; then
-        echo -e "${RED}[ERROR]${RESET} The connection fence WAS released -- CONNECT is restored -- and its record at $DB_FENCE_STATE was deliberately NOT removed (the reason is printed above). A challenge WAS put to this run's witness and the release's own connection could not see it, so nothing here can show that the server just released is the server that was fenced. The next run reads that file as a STANDING FENCE. End it with ${DB_FENCE_RELEASE_CMD}, which asks you to confirm at your terminal." >&2
-        return 1
-      fi
-      warn "The connection fence WAS released -- CONNECT is restored -- and its record at $DB_FENCE_STATE is being KEPT (the reason is printed above). No challenge could be put to a witness on this run, so the removal has nothing to rest on; the release itself is unaffected. The next run reads that file as a STANDING FENCE and adopts it. End it with ${DB_FENCE_RELEASE_CMD}, which asks you to confirm at your terminal."
+      # AND THE READING THAT IS FATAL IS NO LONGER TESTED HERE (o3d-secops r34, Codex HIGH 1).
+      # r33 asked, under this arm, whether a challenge had been issued and left unanswered -- but
+      # the keep-record fast path above returned before the arm could be reached at all. The test
+      # has moved to the one place every path through this function passes, above that fast path,
+      # so by here a run that issued a challenge already has its colocated verdict. What is left
+      # under status 2 is the pair that was never fatal: no challenge could be put at all, or the
+      # record describes a fence this run did not RAISE. The grants are back either way, and
+      # nothing about either says the release landed somewhere else.
+      warn "The connection fence WAS released -- CONNECT is restored -- and its record at $DB_FENCE_STATE is being KEPT (the reason is printed above). Either no challenge could be put to a witness on this run, or the record describes a fence this run did not raise; either way the removal has nothing to rest on, and the release itself is unaffected. The next run reads that file as a STANDING FENCE and adopts it. End it with ${DB_FENCE_RELEASE_CMD}, which asks you to confirm at your terminal."
       db_fence_witness_stop
       ok "Connection fence released; its record is kept for you to end."
       return 0
