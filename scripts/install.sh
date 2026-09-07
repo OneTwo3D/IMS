@@ -8873,6 +8873,11 @@ cd "${APP_DIR}"
 run_as_user "${APP_USER}" env DATABASE_URL="${MIGRATION_DATABASE_URL}" \
   npx prisma generate --schema prisma/schema.prisma
 success "Prisma client generated."
+# A BUILD IS A DATABASE CONSUMER TOO, ON THE RECOVERY PATH (o3d-secops r33, Codex HIGH 1). On an
+# ordinary run this is a no-op: no fence is standing yet, so pin_migration_window() returns at once.
+# On a run that ADOPTED a standing fence it is not -- the migration URL is live by then, the sampler
+# is armed, and this step reaches the database through the same movable string as everything below.
+pin_migration_window "The Prisma client generation"
 
 header "Building Next.js application (existing installation still serving)"
 
@@ -8885,6 +8890,7 @@ header "Building Next.js application (existing installation still serving)"
 run_as_user "${APP_USER}" env DATABASE_URL="${MIGRATION_DATABASE_URL}" \
   npm run build --prefix "${APP_DIR}"
 success "Build complete."
+pin_migration_window "The build"
 
 CUTOVER_STEP="validate"
 [[ -f "${APP_DIR}/.next/BUILD_ID" ]] || die \

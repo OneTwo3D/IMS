@@ -4506,6 +4506,12 @@ if ! $SKIP_BUILD; then
     fi
     tail -5 "$BUILD_LOG"
     ok "Build complete."
+    # A BUILD IS A DATABASE CONSUMER TOO, ON THE RECOVERY PATH (o3d-secops r33, Codex HIGH 1). On
+    # an ordinary run this is a no-op: no fence is standing yet, so pin_migration_window() returns
+    # at once. On a run that ADOPTED a standing fence it is not -- the migration URL is live by
+    # then, the sampler is armed, and this step reaches the database through the same movable
+    # string as everything below.
+    pin_migration_window "The build"
   fi
 fi
 
@@ -4605,6 +4611,7 @@ elif ! $RESTART_ONLY; then
     as_app_user_db node scripts/check-wms-push-state-enum.mjs \
       || die "This database does not have the WMS push-state vocabulary this build writes, and ${SKIP_MIGRATE_FLAG} applies no migration that would give it one. Re-run without ${SKIP_MIGRATE_FLAG} (add --skip-build if the build on disk is the one you want). Nothing has been stopped."
     ok "WMS push-state vocabulary present."
+    pin_migration_window "The WMS push-state vocabulary check"
   fi
 fi
 ok "Artefact validated."

@@ -1318,6 +1318,7 @@ ${shellFunction(DEPLOY_LINES.join('\n'), 'db_fence_helper')}
 ${shellFunction(DEPLOY_LINES.join('\n'), 'db_fence_migration_helper')}
 ${shellFunction(DEPLOY_LINES.join('\n'), 'bind_migration_to_fenced_server')}
 ${shellFunction(DEPLOY_LINES.join('\n'), 'require_migration_landed_on_fenced_server')}
+${shellFunction(DEPLOY_LINES.join('\n'), 'pin_migration_window')}
 DB_FENCE_REFENCE_CMD="\${DB_FENCE_REFENCE_WRAPPER}"
 : "\${APP_DIR_REAL:=/opt/app}"
 : "\${APP_DIR:=/opt/app}"
@@ -1400,6 +1401,7 @@ ${shellFunction(UPDATE_LINES.join('\n'), 'db_fence_helper')}
 ${shellFunction(UPDATE_LINES.join('\n'), 'db_fence_migration_helper')}
 ${shellFunction(UPDATE_LINES.join('\n'), 'bind_migration_to_fenced_server')}
 ${shellFunction(UPDATE_LINES.join('\n'), 'require_migration_landed_on_fenced_server')}
+${shellFunction(UPDATE_LINES.join('\n'), 'pin_migration_window')}
 DB_FENCE_REFENCE_CMD="\${DB_FENCE_REFENCE_WRAPPER}"
 DB_FENCE_IDENTITY_FROM_RECORD=false
 DB_FENCE_ADOPTING=false
@@ -1497,6 +1499,7 @@ ${shellFunction(INSTALL_SOURCE, 'db_fence_helper')}
 ${shellFunction(INSTALL_SOURCE, 'db_fence_migration_helper')}
 ${shellFunction(INSTALL_SOURCE, 'bind_migration_to_fenced_server')}
 ${shellFunction(INSTALL_SOURCE, 'require_migration_landed_on_fenced_server')}
+${shellFunction(INSTALL_SOURCE, 'pin_migration_window')}
 # o3d-2sm1.5 r35: install.sh's resolver refuses outright on a FIRST INSTALL, which performs no
 # credentialed fence execution. Every harness below is an UPGRADE cutover — that is what they are
 # for — so the flag is named here with the value the upgrade branch runs under. Named rather than
@@ -13414,7 +13417,11 @@ for (const entry of FENCE_HARNESS) {
     // early return rather than the gate.
     'echo "FENCE UP=${DB_FENCE_UP}"',
     'require_migration_landed_on_fenced_server',
+    // BOTH FLAGS, because r33 separated them and the difference is the finding: "keep the record"
+    // and "there is no witness" used to be the same bit, so a sampling miss took the release's own
+    // challenge away with it and the run died two steps later.
     'echo "BOUND AT THE END=${DB_FENCE_WITNESS_BOUND}"',
+    'echo "KEEP RECORD=${DB_FENCE_KEEP_RECORD}"',
     'echo "STARTED THE NEW BUILD"',
   ].join('\n')
 
@@ -13454,10 +13461,19 @@ for (const entry of FENCE_HARNESS) {
     }
   })
 
-  // MUTATION ROUTE (made against the shipped file and reverted): delete `DB_FENCE_WITNESS_BOUND=0`
-  // from the `4)` arm -- the flag stays 1, the release goes on to remove the record automatically,
-  // and a window in which the migration's own backends were never observed ends with no trace for
-  // anybody to look at.
+  // MUTATION ROUTE (made against the shipped file and reverted): delete `DB_FENCE_KEEP_RECORD=true`
+  // from the `4)` arm -- the flag stays false, the release goes on to remove the record
+  // automatically, and a window in which the migration's own backends were never observed ends with
+  // no trace for anybody to look at.
+  //
+  // AND WHAT IT WITHHOLDS CHANGED IN r33 (Codex MEDIUM). This arm used to lower
+  // ${DB_FENCE_WITNESS_BOUND}, which is the flag that means THERE IS NO WITNESS -- so the release
+  // issued no challenge, could not set `clear_server` and returned FAILURE, and this purportedly
+  // non-refusing status ended the run with the schema migrated and nothing started. The assertion
+  // below therefore holds BOTH directions: the record is withheld, AND the witness survives to
+  // answer the release. The outcome at the END of the run is measured separately, in the r33 test
+  // named "a sampling miss keeps the record and still finishes the run" -- which is the gap this
+  // test had: it asserted the behaviour at the gate and the claim is about the outcome.
   test(`${entry.name}: a window whose own backends were never seen keeps the record instead of refusing (o3d-secops r32, Codex HIGH 2)`, () => {
     const dir = mkdtempSync(join(tmpdir(), 'ims-r32unseen-'))
     try {
@@ -13474,8 +13490,10 @@ for (const entry of FENCE_HARNESS) {
         `precondition: the closing probe must have run:\n${calls(dir)}`)
       assert.match(result.output, /^STARTED THE NEW BUILD$/m,
         `a missed sample is a property of polling, not of the deploy, so the cutover must go on:\n${result.output}`)
-      assert.match(result.output, /^BOUND AT THE END=0$/m,
-        `but the attestation must be withheld, which is what keeps the record for a person:\n${result.output}`)
+      assert.match(result.output, /^KEEP RECORD=true$/m,
+        `but the record must be withheld, which is what keeps it for a person:\n${result.output}`)
+      assert.match(result.output, /^BOUND AT THE END=1$/m,
+        `and the witness must SURVIVE, or the release issues no challenge and this "non-refusing" status refuses two steps later:\n${result.output}`)
       assert.match(result.output, /KEPT/,
         `and the operator must be told that is what happened:\n${result.output}`)
     } finally {
@@ -13529,6 +13547,367 @@ for (const entry of FENCE_HARNESS) {
     } finally {
       rmSync(dir, { recursive: true, force: true })
     }
+  })
+
+  // ---------------------------------------------------------------------------
+  // o3d-secops r33, Codex HIGH 2 — ONE BOUND CONSUMER DOES NOT CERTIFY AN UNBOUND ONE.
+  //
+  // THE FINDING. Every consumer of the migration URL wears the SAME stamp, the witness accumulates
+  // every backend that wore it into ONE set, and the closing gate asked only whether that set was
+  // non-empty. So a history in which `pg_dump` reached another cluster and prisma reached the
+  // fenced one satisfied the gate: the count was positive, and both deterministic endpoint probes
+  // -- the opening bind and the closing hold-stamp -- happened at moments when nothing was
+  // redirected. update.sh then recorded a dump of the WRONG DATABASE as this run's restore point
+  // with every gate green.
+  //
+  // WHAT THIS MEASURES, AND WHY IT IS TWO HALVES. Half (a) runs the r32 shape -- the opening bind
+  // and the closing gate, with nothing in between -- against exactly this history, and it must
+  // START. That is not decoration: without it the second half would be asserting that a refusal
+  // happens, with no evidence that the mechanism it names is what refuses, and the aggregate gate
+  // would still be the thing under test. Half (b) runs the SHIPPED shape, whose pins bracket each
+  // consumer, against the same stub and the same history, and it must refuse and NAME THE CONSUMER.
+  //
+  // MUTATION ROUTE (made against the shipped file and reverted): change the `*)` arm of
+  // pin_migration_window() from `die` to `warn` in this entrypoint -- half (b) then prints STARTED
+  // THE NEW BUILD, which is the aggregate gate certifying a consumer that landed somewhere else.
+  // Deleting the `pin_migration_window` call after that consumer does the same thing.
+  test(`${entry.name}: a consumer that landed on another server is refused, though another consumer was seen on the fenced one (o3d-secops r33, Codex HIGH 2)`, () => {
+    // (a) THE r32 SHAPE. Two probes, both taken while nothing is redirected, and a positive
+    // sighting count contributed by the consumer that DID land correctly.
+    const aggregate = mkdtempSync(join(tmpdir(), 'ims-r33agg-'))
+    try {
+      witnessProtocolCheckout(aggregate, { verdict: 'yes', binding: ['colocated', 'colocated'], sightings: 2 })
+      const before = runShell([
+        'set -uo pipefail',
+        'exec 2>&1',
+        entry.preamble(aggregate),
+        'error() { echo "ERROR: $*" >&2; }',
+        'DB_FENCE_RAISED=false',
+        CUTOVER_DIR_PRIMITIVES,
+        shellFunction(entry.source, 'fence_db_connections'),
+        'fence_db_connections',
+        // The consumers run HERE, and one of them is on another cluster. Nothing looks.
+        'require_migration_landed_on_fenced_server',
+        'echo "STARTED THE NEW BUILD"',
+      ].join('\n'))
+
+      assert.match(before.output, /^STARTED THE NEW BUILD$/m,
+        `precondition: the aggregate gate must ACCEPT this history, or the pins below are not what refuses it:\n${before.output}`)
+    } finally {
+      rmSync(aggregate, { recursive: true, force: true })
+    }
+
+    // (b) THE SHIPPED SHAPE. The same history, with a pin between each pair of consumers: the
+    // probe that follows the redirected consumer cannot see the witness, and that is the one
+    // answer no other consumer's evidence can supply.
+    const dir = mkdtempSync(join(tmpdir(), 'ims-r33pin-'))
+    try {
+      // 1: the opening bind. 2: the pin after the first consumer. 3: the pin after the SECOND --
+      // the redirected one. 4: the closing hold-stamp probe, which says colocated and is never
+      // reached, exactly as it would not be reached in the shipped script.
+      witnessProtocolCheckout(dir, {
+        verdict: 'yes',
+        binding: ['colocated', 'colocated', 'absent', 'colocated'],
+        sightings: 2,
+      })
+      const result = runShell([
+        'set -uo pipefail',
+        'exec 2>&1',
+        entry.preamble(dir),
+        'error() { echo "ERROR: $*" >&2; }',
+        'DB_FENCE_RAISED=false',
+        CUTOVER_DIR_PRIMITIVES,
+        shellFunction(entry.source, 'fence_db_connections'),
+        'fence_db_connections',
+        'pin_migration_window "The drain probe"',
+        'pin_migration_window "The pre-migration backup"',
+        'require_migration_landed_on_fenced_server',
+        'echo "STARTED THE NEW BUILD"',
+      ].join('\n'))
+
+      const bindCalls = calls(dir).split('\n').filter((line) => /^--bind-migration /.test(line))
+      assert.ok(bindCalls.length >= 3,
+        `precondition: the pins must actually open probes of their own, not be skipped:\n${calls(dir)}`)
+      assert.ok(bindCalls.every((line) => !/--hold-stamp/.test(line)),
+        `precondition: a pin must DROP the stamp, or it would be counted as one of the consumers it separates:\n${calls(dir)}`)
+      assert.doesNotMatch(result.output, /^STARTED THE NEW BUILD$/m,
+        `a consumer that ran against another server must stop the run, whatever the sampler saw of the others:\n${result.output}`)
+      assert.match(result.output, /The pre-migration backup DID NOT RUN AGAINST THE SERVER THIS RUN FENCED/,
+        `and the refusal must name the step whose connection moved, not the window as a whole:\n${result.output}`)
+      assert.match(result.output, /STILL UP/,
+        `and say the fence is being held rather than released:\n${result.output}`)
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  // ---------------------------------------------------------------------------
+  // o3d-secops r33, Codex MEDIUM — A NON-REFUSING STATUS IS TESTED AT THE END OF THE RUN.
+  //
+  // r32 asserted status 4's behaviour AT THE GATE: the cutover went on and the flag came down.
+  // The claim, though, is about the OUTCOME -- "this does not refuse" -- and two steps later the
+  // release read the flag it had lowered, issued no challenge, could not set `clear_server`, took
+  // status 2 out of db_fence_clear_authority() and returned FAILURE into
+  // `release_db_connections || die`. An admitted polling miss therefore ended with the schema
+  // migrated, the application stopped, and CONNECT briefly restored before the exit trap
+  // re-fenced it.
+  //
+  // MEASURED, NOT REASONED ABOUT: the same shape killed the NO-WITNESS run as well, which is the
+  // degraded mode this subsystem promises never to refuse -- every host behind a transaction-mode
+  // pooler and every single-database cluster. Both are exercised below, to the end of the run.
+  //
+  // MUTATION ROUTE (all made against the shipped files and reverted): restore
+  // `DB_FENCE_WITNESS_BOUND=0` in place of `DB_FENCE_KEEP_RECORD=true` in the `4)` arm -- the
+  // status-4 case stops printing STARTED THE NEW BUILD. Restore the unconditional `return 1` under
+  // `clear_rc -eq 2` in this entrypoint's release -- the no-witness case stops printing it.
+  const runToTheEnd = (dir: string) => [
+    'set -uo pipefail',
+    'exec 2>&1',
+    entry.preamble(dir),
+    'error() { echo "ERROR: $*" >&2; }',
+    'DB_FENCE_RAISED=false',
+    CUTOVER_DIR_PRIMITIVES,
+    shellFunction(entry.source, 'fence_db_connections'),
+    shellFunction(entry.source, 'release_db_connections'),
+    // The record's fate is read from an EXIT trap, so it is reported on the path where the run
+    // dies as well as on the path where it completes.
+    'trap \'[[ -e "${DB_FENCE_STATE}" ]] && echo AUTHORITY_REMAINS || echo AUTHORITY_CLEARED\' EXIT',
+    'fence_db_connections',
+    'echo "FENCE UP=${DB_FENCE_UP}"',
+    'require_migration_landed_on_fenced_server',
+    // AND THEN THE REST OF THE RUN, in the order every entrypoint has it: the database fence comes
+    // down, and only a release that succeeded lets anything start.
+    'release_db_connections || die "Refusing to start the application while it has no CONNECT on its own database."',
+    'echo "STARTED THE NEW BUILD"',
+  ].join('\n')
+
+  test(`${entry.name}: a sampling miss keeps the record and still finishes the run (o3d-secops r33, Codex MEDIUM)`, () => {
+    const dir = mkdtempSync(join(tmpdir(), 'ims-r33miss-'))
+    try {
+      // The closing probe binds and IS seen, so the string is where it should be and the sampler
+      // works; what was never seen is a backend carrying the stamp while the migration ran.
+      witnessProtocolCheckout(dir, { verdict: 'yes', binding: 'colocated', sightings: 0 })
+      const result = runShell(runToTheEnd(dir))
+
+      assert.match(result.output, /^FENCE UP=true$/m,
+        `precondition: the gate returns at once without a fence, so one must be standing:\n${result.output}`)
+      assert.match(calls(dir), /^--bind-migration --hold-stamp /m,
+        `precondition: the closing probe must have run, or this is not the status-4 path:\n${calls(dir)}`)
+      assert.match(calls(dir), /^--release .*--witness-challenge=[0-9a-f]{32}/m,
+        `and the witness must still be bound at release time -- "keep the record" is not "there is no witness":\n${calls(dir)}`)
+      assert.match(result.output, /^STARTED THE NEW BUILD$/m,
+        `a miss is a property of polling, so it must cost the record and not the cutover:\n${result.output}`)
+      assert.match(result.output, /^AUTHORITY_REMAINS$/m,
+        `and the record must be the thing it costs:\n${result.output}`)
+      assert.match(result.output, /KEPT/,
+        `and the operator must be told that is what happened:\n${result.output}`)
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  test(`${entry.name}: a cutover that could hold no witness finishes the run rather than dying at the release (o3d-secops r33, Codex MEDIUM)`, () => {
+    const dir = mkdtempSync(join(tmpdir(), 'ims-r33nowitness-'))
+    try {
+      const helper = writeFenceCheckout(dir, '')
+      writeFileSync(helper, [
+        "import { appendFileSync } from 'node:fs'",
+        `appendFileSync(${JSON.stringify(join(dir, 'calls.log'))}, process.argv.slice(2).join(' ') + '\\n')`,
+        "if (process.argv.includes('--witness')) process.exit(1)",
+        "if (process.argv.includes('--plan')) {",
+        "  process.stdout.write(JSON.stringify({",
+        "    database: 'imsdb', owner_role: 'imsapp', app_role: 'imsapp', admin_role: 'deployadmin',",
+        "    revoked: ['PUBLIC', 'imsapp'], datacl_before: null, fenced_at: '2026-01-01T00:00:00.000Z',",
+        "  }) + '\\n')",
+        '}',
+        "if (process.argv.includes('--print-migration-url')) process.stdout.write(`postgres://admin@127.0.0.1/nowhere?application_name=ims-migration-${process.argv.find((a) => a.startsWith('--migration-nonce='))?.slice('--migration-nonce='.length) ?? ''}\\n`)",
+        'process.exit(0)',
+        '',
+      ].join('\n'))
+      const result = runShell(runToTheEnd(dir))
+
+      assert.match(result.output, /^FENCE UP=true$/m,
+        `precondition: a fence must be standing, or nothing here is about a release:\n${result.output}`)
+      assert.doesNotMatch(calls(dir), /^--release .*--witness-challenge=/m,
+        `precondition: with no witness there is no challenge to put, which is the state under test:\n${calls(dir)}`)
+      assert.match(result.output, /^STARTED THE NEW BUILD$/m,
+        `a host that can hold no witness must be able to complete a cutover, not merely reach the migration:\n${result.output}`)
+      assert.match(result.output, /^AUTHORITY_REMAINS$/m,
+        `with the record kept for a person, which is the whole of what the degraded mode costs:\n${result.output}`)
+      assert.match(result.output, /KEPT/,
+        `and the operator told so:\n${result.output}`)
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  // AND THE ORDINARY CUTOVER IS STILL UNATTENDED. Both fixes above make a run CONTINUE where it
+  // used to stop, so the direction that has to be held is the other one: a run whose witness saw
+  // everything must still end its own record with nobody at a terminal.
+  // MUTATION ROUTE (made against the shipped file and reverted): set DB_FENCE_KEEP_RECORD=true
+  // unconditionally in this entrypoint's release -- AUTHORITY_CLEARED becomes AUTHORITY_REMAINS
+  // and every deploy starts asking a human.
+  test(`${entry.name}: an ordinary cutover still ends its own record with nobody at a terminal (o3d-secops r33 control)`, () => {
+    const dir = mkdtempSync(join(tmpdir(), 'ims-r33ordinary-'))
+    try {
+      witnessProtocolCheckout(dir, { verdict: 'yes', binding: 'colocated', sightings: 2 })
+      const result = runShell(runToTheEnd(dir))
+
+      assert.match(calls(dir), /^--bind-migration --hold-stamp /m,
+        `precondition: the closing probe must have run:\n${calls(dir)}`)
+      assert.match(result.output, /^STARTED THE NEW BUILD$/m,
+        `an ordinary cutover must complete:\n${result.output}`)
+      assert.match(result.output, /^AUTHORITY_CLEARED$/m,
+        `and remove its own record without a person:\n${result.output}`)
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+}
+
+// ---------------------------------------------------------------------------
+// o3d-secops r33, Codex HIGH 1 — THE CENSUS OF DATABASE CONSUMERS, TAKEN FROM THE ENTRYPOINTS.
+//
+// THE FINDING. The closing gate was placed after what a COMMENT called "every consumer", and the
+// comment was written from the author's own list rather than from the file. install.sh had SEVEN
+// consumers inside the fenced window and the list named five: `npm run db:seed` and
+// `provision-instance.mjs` both ran AFTER the window had been declared closed, on the same movable
+// ${MIGRATION_DATABASE_URL}, so a DNS change, a proxy or a failover taking effect after the gate
+// sent the seed, the default administrator, the SMTP configuration and the WooCommerce credentials
+// to another cluster and returned. Nothing looked afterwards, and the run then attested against
+// the original server and started the application there.
+//
+// SO THE LIST IS NOT WRITTEN DOWN IN A COMMENT ANY MORE. This walks each shipped entrypoint,
+// finds every TOP-LEVEL step that hands a process the migration connection string, and requires
+// each one to be followed by a placement -- a pin, or the closing gate -- before the next one
+// begins. A consumer added below the gate in some future round fails here rather than being
+// discovered by a reviewer reading a stale list.
+//
+// THE EXPECTED SET IS SPELLED OUT AS WELL AS THE RULE, because a walk that found nothing would
+// satisfy "every consumer is placed" perfectly. The count is asserted, the labels are asserted,
+// and the two facts are read out of the same scan.
+//
+// MUTATION ROUTE (all made against the shipped files and reverted): move
+// `require_migration_landed_on_fenced_server` in install.sh back above `header "Seeding
+// database"` -- the seed and the bootstrap then trail the last placement and this fails naming
+// both. Delete any single `pin_migration_window` line -- the consumer above it becomes unplaced.
+// Add a new `DATABASE_URL="${MIGRATION_DATABASE_URL}"` step after the gate -- the expected-set
+// assertion fails until it is placed.
+// ---------------------------------------------------------------------------
+
+/**
+ * The steps in one entrypoint that hand a process the migration connection string, in file order,
+ * with the placement that follows each one.
+ *
+ * TOP LEVEL ONLY, and that exclusion is the interesting half. `db_fence_migration_helper()`,
+ * `as_app_user_db()` and the fence's own probes all name ${MIGRATION_DATABASE_URL} too -- they are
+ * the MECHANISM that hands it over and the mechanism that places it, not steps that consume it.
+ * Function bodies are skipped by tracking the `name() {` ... `}` blocks these scripts are written
+ * in, so a consumer moved INTO a helper would leave the census rather than silently passing it.
+ */
+function migrationConsumerCensus(source: string): Array<{ step: string; placedBy: string | null }> {
+  // ONE ENTRY PER LOGICAL STATEMENT, not per physical line. Every one of these steps is written as
+  // `run_as_user ... env \` / `DATABASE_URL=... \` / `node <script>`, so a scan that read physical
+  // lines would find the string on one line and the script's name on another -- and a label taken
+  // from "the next few lines" reads the COMMENT ABOVE THE NEXT STEP, which is how the first draft
+  // of this census reported a pg_dump in deploy.sh, which has none.
+  const logical: Array<{ text: string; raw: string }> = []
+  let buffer = ''
+  let opener = ''
+  for (const raw of source.split('\n')) {
+    const line = raw.trim()
+    if (buffer === '') opener = raw
+    buffer = buffer === '' ? line : `${buffer} ${line}`
+    if (/\\$/.test(line)) { buffer = buffer.replace(/\\$/, '') ; continue }
+    logical.push({ text: buffer, raw: opener })
+    buffer = ''
+  }
+  if (buffer !== '') logical.push({ text: buffer, raw: opener })
+
+  const out: Array<{ step: string; placedBy: string | null }> = []
+  let depth = 0
+  let pending: string | null = null
+  const push = (placedBy: string | null) => {
+    if (pending !== null) { out.push({ step: pending, placedBy }); pending = null }
+  }
+  for (const { text, raw } of logical) {
+    // The brace convention these scripts are written in, matched on the RAW line so that a `}`
+    // inside a heredoc cannot close a function this walk thinks it is inside.
+    if (/^[a-z_][a-z0-9_]*\(\)\s*\{$/.test(raw)) { depth += 1; continue }
+    if (depth > 0) { if (raw === '}') depth -= 1; continue }
+    if (text.startsWith('#')) continue
+    if (/^pin_migration_window /.test(text)) { push('pin'); continue }
+    if (/^require_migration_landed_on_fenced_server$/.test(text)) { push('gate'); continue }
+    const hands = /DATABASE_URL="\$\{?MIGRATION_DATABASE_URL\}?"/.test(text)
+      || /(^|[!\s])pg_dump "\$\{MIGRATION_DATABASE_URL\}"/.test(text)
+      || /(^|[!\s])as_app_user_db /.test(text)
+    if (!hands) continue
+    push(null)
+    pending = text
+  }
+  push(null)
+  return out
+}
+
+/** What each census entry is called in the assertions below, so a failure names a step. */
+const CONSUMER_LABELS: ReadonlyArray<[RegExp, string]> = [
+  [/prisma generate/, 'prisma generate'],
+  [/npm run build/, 'npm run build'],
+  [/check-wms-push-state-enum/, 'check-wms-push-state-enum.mjs'],
+  [/check-db-writers/, 'check-db-writers.mjs'],
+  [/pg_dump/, 'pg_dump'],
+  [/prisma migrate deploy/, 'prisma migrate deploy'],
+  [/check-prisma-drift/, 'check-prisma-drift.mjs'],
+  [/DB_OBJECT_ACCESS_SCRIPT|check-app-db-object-access/, 'check-app-db-object-access.mjs'],
+  [/run-migration-verifications/, 'run-migration-verifications.mjs'],
+  [/db:seed/, 'db:seed'],
+  [/BOOTSTRAP_SCRIPT|provision-instance/, 'provision-instance.mjs'],
+]
+
+/** The step's own text, and nothing else: the whole statement is already in `step`. */
+const labelFor = (step: string): string => {
+  for (const [pattern, label] of CONSUMER_LABELS) if (pattern.test(step)) return label
+  return step
+}
+
+for (const [name, source, expected] of [
+  ['install.sh', INSTALL_SOURCE, [
+    'prisma generate', 'npm run build',
+    'check-db-writers.mjs', 'prisma migrate deploy', 'check-prisma-drift.mjs',
+    'check-app-db-object-access.mjs', 'run-migration-verifications.mjs',
+    'db:seed', 'provision-instance.mjs',
+  ]],
+  ['update.sh', UPDATE_LINES.join('\n'), [
+    'prisma generate', 'npm run build',
+    'check-db-writers.mjs', 'pg_dump', 'prisma migrate deploy', 'check-prisma-drift.mjs',
+    'check-app-db-object-access.mjs', 'run-migration-verifications.mjs',
+  ]],
+  ['deploy.sh', DEPLOY_LINES.join('\n'), [
+    'npm run build', 'check-wms-push-state-enum.mjs',
+    'check-db-writers.mjs', 'prisma migrate deploy', 'check-prisma-drift.mjs',
+    'check-app-db-object-access.mjs', 'run-migration-verifications.mjs',
+  ]],
+] as ReadonlyArray<[string, string, string[]]>) {
+  test(`${name}: every step handed the migration URL is placed, and the closing gate is below the last of them (o3d-secops r33, Codex HIGH 1)`, () => {
+    const census = migrationConsumerCensus(source)
+    const labelled = census.map((entry) => ({ ...entry, label: labelFor(entry.step) }))
+
+    // THE WALK REACHED THE FILE. A census that found nothing would pass every rule below.
+    assert.ok(labelled.length >= 7,
+      `precondition: the walk must find the entrypoint's consumers, not an empty file:\n${JSON.stringify(labelled, null, 2)}`)
+    assert.deepEqual(labelled.map((entry) => entry.label), expected,
+      `the consumers of the migration URL, in file order, are not what this entrypoint was last read to have:\n${JSON.stringify(labelled, null, 2)}`)
+
+    const unplaced = labelled.filter((entry) => entry.placedBy === null)
+    assert.deepEqual(unplaced.map((entry) => entry.label), [],
+      `every step handed the migration URL must be followed by a pin or by the closing gate before the next one begins; these are not:\n${JSON.stringify(unplaced, null, 2)}`)
+
+    // AND THE GATE IS THE LAST PLACEMENT, not one in the middle with consumers trailing it. This
+    // is the r32 defect stated as a rule: the seed and the bootstrap sat below it.
+    const gateIndex = labelled.findIndex((entry) => entry.placedBy === 'gate')
+    assert.notEqual(gateIndex, -1, `the closing gate must place one of them:\n${JSON.stringify(labelled, null, 2)}`)
+    assert.equal(gateIndex, labelled.length - 1,
+      `the closing gate must place the LAST consumer; these run after it with nothing watching: ${labelled.slice(gateIndex + 1).map((entry) => entry.label).join(', ')}`)
   })
 }
 

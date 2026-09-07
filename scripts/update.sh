@@ -5273,6 +5273,11 @@ header "Generating Prisma client"
 run run_as_user "${APP_USER}" env DATABASE_URL="${MIGRATION_DATABASE_URL}" \
   npx prisma generate --schema "${APP_DIR}/prisma/schema.prisma"
 success "Prisma client generated."
+# A BUILD IS A DATABASE CONSUMER TOO, ON THE RECOVERY PATH (o3d-secops r33, Codex HIGH 1). On an
+# ordinary run this is a no-op: no fence is standing yet, so pin_migration_window() returns at once.
+# On a run that ADOPTED a standing fence it is not -- the migration URL is live by then, the sampler
+# is armed, and this step reaches the database through the same movable string as everything below.
+pin_migration_window "The Prisma client generation"
 
 if ! $SKIP_BUILD; then
   header "Building the application"
@@ -5285,6 +5290,7 @@ if ! $SKIP_BUILD; then
   run run_as_user "${APP_USER}" env DATABASE_URL="${MIGRATION_DATABASE_URL}" \
     npm run build --prefix "${APP_DIR}"
   success "Build complete."
+  pin_migration_window "The build"
 fi
 
 # ---------------------------------------------------------------------------
