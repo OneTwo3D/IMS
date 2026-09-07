@@ -449,7 +449,18 @@ export async function guardInvoicePaymentCapacity(
     referenceType: string
     referenceId: string
     accountingInvoiceId: string
+    /** The JSON number the connector is about to put in the request body. */
     amount: number
+    /**
+     * THE STORED PAYLOAD THE CONNECTOR IS BUILDING THAT REQUEST FROM (o3d-6abj).
+     *
+     * Passed in rather than re-read here, and that is the point: the figure this guard measures has
+     * to be the figure that goes on the wire, and the only object that can establish that is the one
+     * the caller is reading `amount` out of. A re-read could hand back a row someone has since
+     * rewritten, and the guard would then have measured a different payment from the one it
+     * authorises.
+     */
+    payload: unknown
   },
 ): Promise<InvoicePaymentPostGuardResult> {
   // An INVOICE_PAYMENT is always order-scoped today. If one ever is not, its capacity cannot be
@@ -562,10 +573,12 @@ export async function guardInvoicePaymentCapacity(
   // WHAT THIS ENTRY IS ABOUT TO SEND, EXACTLY — AND A PROOF THAT IT IS WHAT WILL GO ON THE WIRE
   // (o3d-6abj).
   //
-  // `params.amount` is the JSON number the connector read out of this row's payload and will put in
-  // the request body. The exact figure is in the SAME payload, in the field o3d-1xq8 added, and this
+  // `params.amount` is the JSON number the connector read out of `params.payload` and will put in the
+  // request body. The exact figure is in the SAME payload, in the field o3d-1xq8 added, and this
   // guard reads it through the one reader every other consumer of that field uses — so a
   // present-but-unreadable string refuses HERE too rather than quietly falling back to the double.
+  // A payload that names no currency, or names another one, also refuses: an amount whose unit is
+  // unknown cannot be subtracted from a total stated in the order's.
   //
   // The equality test is not ceremony. A guard that measures one figure while the connector sends
   // another has measured nothing, and the two payload fields are only guaranteed to agree by the
@@ -573,8 +586,7 @@ export async function guardInvoicePaymentCapacity(
   // something else, edited by hand, or produced by a build that predates the guarantee. If they
   // disagree, the honest answer is that this entry's size is not established, which is the existing
   // `unmeasurable` arm: retryable, and nothing is sent.
-  const ownRow = registrations.find((row) => row.id === params.entryId)
-  const amount = ownRow ? payloadRegisteredAmount(ownRow.payload, order.currency) : null
+  const amount = payloadRegisteredAmount(params.payload, order.currency)
   if (amount == null || !amount.eq(toDecimal(params.amount))) {
     return {
       post: false,

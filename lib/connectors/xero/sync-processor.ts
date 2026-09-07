@@ -5925,6 +5925,9 @@ async function processClaimedEntry(
         referenceId,
         accountingInvoiceId,
         amount,
+        // o3d-6abj: the payload this case is building the request from, so the guard measures the
+        // exact figure that is about to go on the wire rather than a re-read of the row.
+        payload,
       })
       if (!capacity.post) {
         if (capacity.kind === 'unmeasurable') return { success: false, error: capacity.message }

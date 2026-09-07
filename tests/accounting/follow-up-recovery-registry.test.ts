@@ -32,6 +32,7 @@ import {
   unreadablePaymentPayloadRefusalMessage,
 } from '@/lib/domain/accounting/followup-enqueue-outcome'
 import { ACCOUNTING_CONNECTORS } from '@/lib/connectors/accounting-registry'
+import { toDecimal } from '@/lib/domain/math/decimal'
 import {
   ACCOUNTING_FOLLOW_UP_RECOVERY,
   CONNECTORS_WITHOUT_FOLLOW_UP_CONSUMER,
@@ -2800,7 +2801,7 @@ function deferredEnqueueProducers(): Array<{ what: string; text: string }> {
     // SYNC_DISABLED produces no notice at all, which is asserted rather than skipped.
     for (const refusal of INVOICE_PAYMENT_REFUSALS) {
       const notice = describeInvoicePaymentRefusal({
-        refused: { register: false, refusal, alreadyRegistered: 40, ledgerTotal: 120, detail: 'INV-OLD' },
+        refused: { register: false, refusal, alreadyRegistered: toDecimal(40), ledgerTotal: toDecimal(120), detail: 'INV-OLD' },
         orderCurrency: 'EUR',
         method: 'card',
         redrive,
@@ -2945,7 +2946,7 @@ test('[o3d-0bfh r13] the UNPINNED refusal deliberately KEEPS its hand remedy, be
   assert.doesNotMatch(alone, /HAND SETTLEMENT IS REFUSED/)
 
   const notice = describeInvoicePaymentRefusal({
-    refused: { register: false, refusal: 'WOULD_OVERPAY', alreadyRegistered: 40, ledgerTotal: 120 },
+    refused: { register: false, refusal: 'WOULD_OVERPAY', alreadyRegistered: toDecimal(40), ledgerTotal: toDecimal(120) },
     orderReference: 'SO-1',
     amount: 100,
     currency: 'GBP',
