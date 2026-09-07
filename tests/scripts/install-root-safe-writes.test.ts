@@ -33,6 +33,34 @@ import { createTempDirSync } from './temp-dir.ts'
 const REPO = process.cwd()
 const INSTALL_SH = readFileSync(join(REPO, 'scripts/install.sh'), 'utf8')
 
+/**
+ * THE CUTOVER NAMESPACE LIBRARY (o3d-secops r22, Codex CRITICAL x2). The symlink-proof walk this
+ * file has always measured — enter_service_subdir()/mkdir_service_subdir() — lives here now, with
+ * the two paths that most needed it and never had it: the shared cutover lock and the app-writable
+ * connection-fence directory, both of which deploy.sh and update.sh created inside a directory
+ * ${APP_USER} owns. A harness lifts a function out of the file that DEFINES it; nothing else about
+ * these tests changes, because the walk itself came across byte for byte.
+ */
+const CUTOVER_NS_LIB = readFileSync(join(REPO, 'scripts/lib/cutover-namespace.sh'), 'utf8')
+const CUTOVER_NS_FUNCTIONS = new Set([
+  'enter_service_subdir',
+  'mkdir_service_subdir',
+  'own_service_subdir',
+  'ensure_cutover_root_dir',
+  'ensure_cutover_state_dirs',
+  'verify_held_lock',
+  'prepare_cutover_lock_file',
+  'acquire_cutover_lock',
+  'acquire_pre_r22_cutover_lock',
+  'warn_pre_r22_db_fence_state',
+])
+/** Lift `name` from whichever shipped file defines it. */
+function shippedFrom(name: string): { source: string; where: string } {
+  return CUTOVER_NS_FUNCTIONS.has(name)
+    ? { source: CUTOVER_NS_LIB, where: 'scripts/lib/cutover-namespace.sh' }
+    : { source: INSTALL_SH, where: 'scripts/install.sh' }
+}
+
 
 /**
  * The rig. `die` is a STUB and not the subject: install.sh's own is `die() { error "$*"; exit 1; }`
@@ -53,7 +81,7 @@ function rig(functions: string[], body: string, extra = ''): string {
     'die() { error "$*"; exit 1; }',
     'info() { printf "INFO: %s\\n" "$*"; }',
     shellConstant(INSTALL_SH, 'PUBLISH_STAGE_DIRNAME'),
-    ...functions.map((name) => shellFunction(INSTALL_SH, name)),
+    ...functions.map((name) => { const { source, where } = shippedFrom(name); return shellFunction(source, name, where) }),
     extra,
     body,
   ].join('\n')
@@ -1566,12 +1594,16 @@ const SHIPPED_PUBLICATIONS: Readonly<Record<string, { readonly callSites: number
 const PUBLICATION_CONSTANTS = [
   'APP_NAME', 'APP_DIR', 'DATA_DIR', 'DEPLOY_SSH_DIR', 'DEPLOY_SSH_KNOWN_HOSTS',
   'CUTOVER_STATE_DIR',
+  // o3d-secops r22: the root-owned parent the shared lock and the connection-fence directory moved
+  // under. BEFORE ${DB_FENCE_DIR}, which is composed from it, for the same ordering reason as the
+  // marker's directory below.
+  'CUTOVER_ROOT_DIR',
   // o3d-secops r20: the marker's own root-owned directory, and the path it was moved out of. Both
   // are read by the privileged mechanism without being re-derived, so both are held to the same
   // rule as everything beside them. AFTER ${CUTOVER_STATE_DIR}, because these declarations are
   // evaluated in this order and the second of them is composed from it.
   'FENCE_MARKER_DIR', 'LEGACY_STATE_DIR_FENCE_FILE',
-  'FENCE_FILE', 'CRON_BACKUP', 'DB_FENCE_DIR', 'DB_FENCE_STATE',
+  'FENCE_FILE', 'CRON_BACKUP', 'DB_FENCE_DIR', 'DB_FENCE_STATE', 'LEGACY_STATE_DIR_DB_FENCE_STATE',
   'DB_ENV_SNAPSHOT_DIR', 'DB_ENV_SNAPSHOT_FILE', 'DB_CA_PUBLISH_DIR',
   'DB_CA_GENERATION_PREFIX', 'DB_CA_GENERATION_SUFFIX', 'DB_ROLE_ROTATION_JOURNAL',
   'DEPLOY_META_FILE', 'DB_FENCE_RECOVERY_DIR', 'DB_FENCE_IDENTITY_FILE',
@@ -1580,11 +1612,15 @@ const PUBLICATION_CONSTANTS = [
 /** The same set plus the staging directory every publication is written through. */
 const PROTECTED_CONSTANTS = [...PUBLICATION_CONSTANTS, 'PUBLISH_STAGE_DIRNAME']
 
-/** The five roots publish_trust_root_candidates() can name, at their shipped values. A resolution
- *  to anything else means the table has grown a directory nobody argued for. */
+/** The roots publish_trust_root_candidates() can name, at their shipped values. A resolution to
+ *  anything else means the table has grown a directory nobody argued for.
+ *
+ *  /etc/ims-cutover-state joined them in o3d-secops r22: the connection-fence record is IMPORTED
+ *  into it by publish_durable_file(), so a table that did not name it would refuse that import —
+ *  which is the failure mode this list exists to catch, arriving from the other direction. */
 const SHIPPED_ROOTS = new Set([
   '/opt/one-two-inventory', '/var/lib/one-two-inventory', '/root/ims/onetwo3d-ims',
-  '/etc/ims-cutover', '/etc/ims-db-ca', '/etc/ims-cutover-recovery',
+  '/etc/ims-cutover', '/etc/ims-cutover-state', '/etc/ims-db-ca', '/etc/ims-cutover-recovery',
 ])
 
 const FENCE_LIBRARY = 'scripts/lib/db-fence-protected.sh'
@@ -2567,9 +2603,12 @@ test('[o3d-secops] every protected constant an entrypoint or the shared library 
     + `${counted.get(FENCE_LIBRARY)}. A declaration that disappears takes its regression above with it.`)
   // 41 before o3d-secops r20, plus ${FENCE_MARKER_DIR} and ${LEGACY_STATE_DIR_FENCE_FILE} in each
   // of the three: the marker's root-owned directory, and the path inside the application's own data
-  // directory it was moved out of.
-  assert.equal(declared, 47 + PROTECTED_LIBRARY_CONSTANTS.length,
-    `the three entrypoints declared 47 protected publication constants between them when this was written, and the `
+  // directory it was moved out of. r22 adds two more per entrypoint for the same reason —
+  // ${CUTOVER_ROOT_DIR}, the root-owned parent the lock and the connection-fence directory moved
+  // under, and ${LEGACY_STATE_DIR_DB_FENCE_STATE}, the path they moved out of, whose NAME a
+  // privileged run reads to decide whether to warn.
+  assert.equal(declared, 53 + PROTECTED_LIBRARY_CONSTANTS.length,
+    `the three entrypoints declared 53 protected publication constants between them when this was written, and the `
     + `shared library ${PROTECTED_LIBRARY_CONSTANTS.length} of its own; this walk found ${declared}. `
     + 'A declaration that disappears takes its regression above with it, so the count is asserted rather than the floor.')
 })
