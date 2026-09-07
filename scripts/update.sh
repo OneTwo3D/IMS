@@ -3567,6 +3567,22 @@ fence_db_connections() {
 
   case "${rc}" in
     0)
+      # A FENCE THAT WENT UP IS RECORDED AS UP BEFORE ANYTHING ELSE CAN FAIL (o3d-secops r31,
+      # Codex HIGH 2). These two lines used to sit AFTER `--print-migration-url` had been run and
+      # its output validated, so a fence that was genuinely standing could lose its own record of
+      # standing to a failure that had nothing to do with it: an OOM kill of `node`, a signal, a
+      # URL this run could not compose. The exit trap then ran with the REVOKEs COMMITTED and a
+      # stamped authority on disk and BOTH FLAGS FALSE -- so cleanup restored the grants and the
+      # attested-removal gate refused to remove the record of a fence this run had in fact raised,
+      # leaving the next unattended run to read a stamped, already-released authority, take the
+      # refusal, and stop for a terminal confirmation nobody is there to give.
+      #
+      # EXIT 0 IS THE FACT THESE FLAGS STATE, and it is already known at this line. Nothing between
+      # db_fence_raise() returning and here can make it less true, so nothing is allowed to sit in
+      # front of it. The re-fence path has had this order since r13 (see refence_db_connections);
+      # this is that order on the path the ordinary cutover takes.
+      DB_FENCE_UP=true
+      DB_FENCE_RAISED=true
       # THE MIGRATION CONNECTS AS THE ADMIN AND RUNS AS THE APPLICATION ROLE (o3d-2sm1.5).
       # The bare admin URL is what made every object a migration created owned by the deploy
       # superuser with no grant to the application: the drift check, the verification hook and
@@ -3579,8 +3595,6 @@ fence_db_connections() {
         "The connection fence is up but the migration URL could not be composed, so the migration would run as the deploy admin and create objects the application cannot use. Nothing has been migrated; release the fence with: ${DB_FENCE_RELEASE_CMD}"
       [[ -n "${MIGRATION_DATABASE_URL}" ]] || die \
         "The connection fence is up but --print-migration-url produced nothing. Nothing has been migrated; release the fence with: ${DB_FENCE_RELEASE_CMD}"
-      DB_FENCE_UP=true
-      DB_FENCE_RAISED=true
       success "Connection fence up: new application connections are refused for the window."
       success "The migration will connect as the deploy admin and RUN AS the application role, so what it creates is owned by the application."
       ;;
@@ -3777,7 +3791,26 @@ release_db_connections() {
     return 1
   }
 
-  db_fence_helper "${fence_script}" --release --state-file="${DB_FENCE_STATE}" --state-owner="$(id -u)" "${DB_FENCE_IDENTITY_ARGS[@]:-}" || rc=$?
+  # THE CHALLENGE, ISSUED BEFORE THE RELEASE RUNS (o3d-secops r31, Codex HIGH 1).
+  #
+  # The witness is asked to take a lock on a nonce generated a moment ago; `--release` then looks
+  # for that lock ON ITS OWN CONNECTION, after it has granted. An affirmative answer is the one
+  # thing that can show that the server just released is the server that was fenced -- a lock on a
+  # number that did not exist when a copy of a cluster was taken cannot be in that copy.
+  #
+  # A FAILURE HERE IS NOT A FAILURE. No witness, a dropped session, a pooler that hands out no
+  # stable backend: the challenge is simply absent, `--release` is invoked exactly as it was before
+  # this round, the fence is released exactly as before, and the ONE thing that changes is that the
+  # record is kept for a person to end rather than removed automatically.
+  local witness_argv=()
+  if db_fence_witness_challenge; then
+    witness_argv=(--witness-challenge="${DB_FENCE_WITNESS_CHALLENGE}")
+  fi
+  # Captured and printed back, like release_the_fence() in the library: the verdict is a machine
+  # line on stdout, and every word an operator reads is on stderr and still streams live.
+  local released=""
+  released="$(db_fence_helper "${fence_script}" --release --state-file="${DB_FENCE_STATE}" --state-owner="$(id -u)" "${witness_argv[@]}" "${DB_FENCE_IDENTITY_ARGS[@]:-}")" || rc=$?
+  [[ -z "${released}" ]] || printf '%s\n' "${released}"
 
   if [[ "${rc}" -eq 0 ]]; then
     MIGRATION_DATABASE_URL="${DATABASE_URL}"
@@ -3788,16 +3821,23 @@ release_db_connections() {
     # revoked, and a record describing a released fence is the safe way round -- a re-fence
     # re-applies the same list, a second release re-grants what is already granted. A failure to
     # remove it would make the NEXT run believe a fence is standing, so it is a failure here.
-    # AND THE REMOVAL IS ATTESTED, OR IT DOES NOT HAPPEN (o3d-secops r30, Codex HIGH 1). The
-    # attestation is not a fact about the database -- r29 measured that a physical copy of a fenced
-    # cluster answers a release exactly as the original does, and always will -- it is this run's own
-    # memory of having raised the fence it just released, minutes ago, over this same connection
-    # string. Where that is absent the record belongs to an EARLIER run and is left alone: the
-    # grants above are done and are safe to repeat, and a person ends the record. See
-    # db_fence_clear_authority() in lib/db-fence-protected.sh.
-    local clear_attestation="" clear_rc=0
+    # AND THE REMOVAL IS ATTESTED, OR IT DOES NOT HAPPEN (o3d-secops r30 + r31, Codex HIGH 1).
+    # It takes TWO answers, because r30's one answer was half of the question. WHO: this run's own
+    # memory of having raised the fence it just released, which no copy of any cluster can produce
+    # because it is not in any cluster. WHERE: that the server just released is the server that was
+    # fenced -- r30 said "over this same connection string", and a connection string is exactly what
+    # a proxy, a DNS change or a failover re-points between two processes, so it is now MEASURED
+    # rather than assumed, by a witness session both connections had to be able to see. Either
+    # answer missing and the record is left alone: the grants above are done and are safe to repeat,
+    # and a person ends the record. See db_fence_clear_authority() in lib/db-fence-protected.sh.
+    local clear_attestation="" clear_server="" clear_rc=0
     if ${DB_FENCE_RAISED:-false}; then clear_attestation="raised-by-this-run"; fi
-    db_fence_clear_authority "${DB_FENCE_STATE}" "${clear_attestation}" || clear_rc=$?
+    # AND WHICH SERVER IT IS SPEAKING ABOUT (o3d-secops r31, Codex HIGH 1). Read out of THIS
+    # release's own output, which reports what its own database connection could see; it is not
+    # read from a flag this shell set, because a flag is the process-shaped memory whose reach
+    # across two connections is the finding. No line, no removal.
+    if [[ "${released}" == *"witness_colocated=yes"* ]]; then clear_server="same-server-as-the-fence"; fi
+    db_fence_clear_authority "${DB_FENCE_STATE}" "${clear_attestation}" "${clear_server}" || clear_rc=$?
     if [[ "${clear_rc}" -eq 2 ]]; then
       error "The connection fence WAS released -- CONNECT is restored -- and its record at ${DB_FENCE_STATE} was deliberately NOT removed (the reason is printed above). The next run reads that file as a STANDING FENCE. End it with ${DB_FENCE_RELEASE_CMD}, which asks you to confirm at your terminal."
       return 1
@@ -3806,6 +3846,10 @@ release_db_connections() {
       error "The connection fence was released and its record at ${DB_FENCE_STATE} could not be removed. The next run reads that file as a STANDING FENCE and will refuse to start the application. Remove it by hand once you have confirmed CONNECT is back."
       return 1
     fi
+    # THE WITNESS HAS NOTHING LEFT TO ATTEST (o3d-secops r31). The fence is down and its record is
+    # gone, so the session closes here rather than at the end of the script; a re-fence later in
+    # this same run opens a new one, bound to the fence it actually raises.
+    db_fence_witness_stop
     success "Connection fence released."
     return 0
   fi

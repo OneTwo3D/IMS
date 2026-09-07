@@ -153,6 +153,7 @@
 // than the fenced snapshot.
 // =============================================================================
 
+import { createHash } from 'node:crypto'
 import { lstatSync, readFileSync } from 'node:fs'
 import { dirname } from 'node:path'
 import { pathToFileURL } from 'node:url'
@@ -1103,12 +1104,16 @@ export function parseArgs(argv) {
   // every invocation of this file is composed by a root-owned script or a root-owned wrapper.
   // It exists so an unprivileged harness can exhibit the mechanism, for the same reason
   // publish_durable_file() asks `id -u` instead of comparing against a literal 0.
-  const options = { mode: '', stateFile: '', stateOwnerUid: 0, appRole: '', timeoutSeconds: 30, appHost: '', appPort: '', appUser: '', appDatabase: '' }
+  const options = { mode: '', stateFile: '', stateOwnerUid: 0, appRole: '', timeoutSeconds: 30, appHost: '', appPort: '', appUser: '', appDatabase: '',
+    // THE THREE THE WITNESS SESSION IS DRIVEN BY (o3d-secops r31, Codex HIGH 1). All three are
+    // nonces root generates; none of them is a credential, a path or an identity, and a mode
+    // given none of them behaves exactly as it did before this round.
+    witnessNonce: '', witnessLock: '', witnessChallenge: '' }
   for (const arg of argv) {
     // `--audit-authority` (o3d-secops r26) is here with the rest and not behind a flag of its own:
     // it is a MODE, it is read-only, and a mode that is spelled differently from its siblings is a
     // mode somebody forgets to hold to the same identity requirements.
-    if (arg === '--fence' || arg === '--release' || arg === '--preflight' || arg === '--print-migration-url' || arg === '--plan' || arg === '--audit-authority') options.mode = arg.slice(2)
+    if (arg === '--fence' || arg === '--release' || arg === '--preflight' || arg === '--print-migration-url' || arg === '--plan' || arg === '--audit-authority' || arg === '--witness') options.mode = arg.slice(2)
     else if (arg.startsWith('--state-file=')) options.stateFile = arg.slice('--state-file='.length)
     else if (arg.startsWith('--state-owner=')) options.stateOwnerUid = Number(arg.slice('--state-owner='.length))
     else if (arg.startsWith('--app-role=')) options.appRole = arg.slice('--app-role='.length)
@@ -1119,6 +1124,11 @@ export function parseArgs(argv) {
     else if (arg.startsWith('--app-port=')) options.appPort = arg.slice('--app-port='.length)
     else if (arg.startsWith('--app-user=')) options.appUser = arg.slice('--app-user='.length)
     else if (arg.startsWith('--app-database=')) options.appDatabase = arg.slice('--app-database='.length)
+    // o3d-secops r31: the witness nonce it must hold (--witness), the one --fence looks for, and
+    // the fresh one --release is asked to find. Read as opaque text and validated where used.
+    else if (arg.startsWith('--witness-nonce=')) options.witnessNonce = arg.slice('--witness-nonce='.length)
+    else if (arg.startsWith('--witness-lock=')) options.witnessLock = arg.slice('--witness-lock='.length)
+    else if (arg.startsWith('--witness-challenge=')) options.witnessChallenge = arg.slice('--witness-challenge='.length)
   }
   return options
 }
@@ -2123,10 +2133,222 @@ export async function doPlan(client, options) {
   return EXIT_OK
 }
 
+// ---------------------------------------------------------------------------
+// THE ATTESTATION IS BOUND TO A CONNECTION, NOT TO A PROCESS (o3d-secops r31, Codex HIGH 1)
+//
+// THE FINDING. r30 made root's automatic removal of the fence record conditional on this run's own
+// memory of having raised the fence -- a shell Boolean, `DB_FENCE_RAISED`. That memory is a fact
+// about a PROCESS, and `--fence` and `--release` are two processes with two PostgreSQL
+// connections. The Boolean survives between them; the connection is exactly what DNS, a
+// connection proxy or a failover can re-point in the meantime. So the attestation could be spent
+// against a backend that never saw the fence: release succeeds on a post-fence physical copy --
+// r29 measured that it always will, the copy carries the fingerprint and the revoked ACL -- and
+// the still-true Boolean then licenses root to destroy the only account of the fence still
+// standing on the original. It proved that A fence went up, not that it went up HERE.
+//
+// WHAT WAS TRIED AND REJECTED, so the next round does not re-derive it. Nothing that lives in the
+// data directory can separate an origin from a copy of it: r29 measured system identifier,
+// database OID, timeline, ACL, xmin and ctid all identical. Two connection-level candidates were
+// considered and both are already refused a few hundred lines up, for reasons this round does not
+// improve on -- `inet_server_addr()`/`inet_server_port()` are perfectly stable across precisely
+// the proxy and failover routing at issue, and `pg_postmaster_start_time()` changes on an ordinary
+// `systemctl restart postgresql`, so binding to it would refuse a genuine release for a reason
+// that is not true. Both would shrink the residual rather than close it, and trading a total rule
+// for a smaller residual in a destructive path is how this defect returns in a later round with a
+// longer comment attached.
+//
+// SO THE ONLY THING THAT BINDS TO A CONNECTION IS A CONNECTION THAT STAYS OPEN. PostgreSQL keeps
+// exactly one kind of state that a live session owns, that is cluster-instance-local, and that no
+// file-level copy carries: a SESSION-SCOPED ADVISORY LOCK. It lives in shared memory. It is not in
+// the data directory, so it is not in a base backup, a restored snapshot or a staging clone --
+// measured, on real clusters, in the tests named below.
+//
+// THE CHAIN, AND WHY IT HAS THREE LINKS RATHER THAN ONE. Codex asked for a long-lived session that
+// both raises and releases the fence. That is one link, and it is the largest possible change:
+// `--fence` would have to stop exiting, so `db_fence_raise()` could no longer take its status from
+// a process, and the three entrypoints would each have to keep a co-process alive across the
+// migration and still keep the one-shot release for every path that has no such process. The same
+// property is available for far less by MEASURING each link instead of assuming it:
+//
+//   W   a witness session opens before anything is revoked and takes an advisory lock on a nonce
+//       root generated. It never reconnects: a dropped connection ends it.
+//   F   `--fence`, on its OWN connection, ASKS pg_locks whether that lock is held. If it is, F and
+//       W are on the same live instance -- measured, not assumed. Reported, never enforced.
+//   R   `--release`, on its OWN connection, asks the same question of a FRESH nonce that root gave
+//       the witness moments earlier. Only a live session can answer that, and only on the instance
+//       it is attached to, so a copy frozen at any earlier moment cannot.
+//
+// W's session is continuous across F and R, so F-with-W and R-with-W give R-with-F. That is the
+// property the record's removal now rests on.
+//
+// WHY THE WITNESS IS NOT ON THE FENCED DATABASE. completeFence() TERMINATES every other client
+// backend on `current_database()` and then requires the room to be empty -- and it must keep
+// requiring that, because a session attached across the migration window is the exact thing the
+// fence exists to prevent. A witness there would be killed by the drain, or would break it. So the
+// witness attaches to another database in the same cluster (`postgres`, else `template1`), where
+// the drain does not reach; `pg_locks` is CLUSTER-WIDE VISIBLE, so the fenced database can still
+// see the lock even though it could take the same key itself. Both halves of that are measured in
+// the tests rather than taken from the manual.
+//
+// AND NOTHING HERE CAN COST A DEPLOY ITS FENCE. Every failure of the witness -- it would not
+// start, the cluster has no second database, the session was dropped by an idle timeout, a
+// connection pooler in transaction mode never gave it a stable backend -- reads as "absent", and
+// absent costs the automatic removal of the record and nothing else: the grants are done, the
+// record is kept, and a person ends it with the release wrapper. A fence is never refused for it.
+
+/**
+ * The advisory-lock key a nonce names.
+ *
+ * POSITIVE, ALWAYS, and the top bit is masked rather than wrapped: `pg_locks` splits a bigint key
+ * into `classid` (high 32 bits) and `objid` (low 32), and a negative key makes that arithmetic a
+ * sign-extension argument nobody should have to have. 63 bits of SHA-256 is not a collision
+ * anybody arranges by accident, and an attacker who could arrange one already holds the admin
+ * credential this process runs with.
+ */
+export function advisoryKeyForWitnessNonce(nonce) {
+  return ((createHash('sha256').update(String(nonce), 'utf8').digest().readBigUInt64BE(0)) & 0x7fffffffffffffffn).toString()
+}
+
+/** A nonce is opaque, but it is not arbitrary: hex only, and long enough not to be guessed. */
+export function isWitnessNonce(value) {
+  return /^[0-9a-f]{32,64}$/.test(String(value ?? ''))
+}
+
+/**
+ * IS A LIVE SESSION ON THIS INSTANCE HOLDING THE LOCK THIS NONCE NAMES?
+ *
+ * READ-ONLY, AND IT IS A READ RATHER THAN AN ATTEMPT ON PURPOSE. `pg_try_advisory_lock()` would
+ * answer the same question for a witness on the SAME database and the wrong question for one on
+ * another -- advisory locks are acquired per-database, so a key held on `postgres` is free to take
+ * from `imsdb` and an attempt there returns "nobody holds it" about a lock that is plainly held.
+ * `pg_locks` is the cluster-wide view and is readable by any role, so this asks it directly and
+ * takes nothing.
+ */
+export async function witnessLockIsHeld(client, nonce) {
+  if (!isWitnessNonce(nonce)) return false
+  const { rows } = await client.query(
+    `SELECT count(*)::int AS held
+       FROM pg_locks
+      WHERE locktype = 'advisory'
+        AND granted
+        AND objsubid = 1
+        AND classid::bigint = (($1::bigint >> 32) & 4294967295::bigint)
+        AND objid::bigint   = ($1::bigint & 4294967295::bigint)`,
+    [advisoryKeyForWitnessNonce(nonce)],
+  )
+  return (rows[0]?.held ?? 0) > 0
+}
+
+/**
+ * `--witness`: TAKE THE LOCK, SAY SO, AND STAY.
+ *
+ * It revokes nothing, grants nothing, writes no file and reads no record. Its whole contribution
+ * is that its session exists continuously between the fence and the release, and it ends the
+ * moment its stdin closes -- which is what the entrypoint exiting does to it, by any route
+ * including a kill.
+ *
+ * IT NEVER RECONNECTS. A witness that re-opened its connection after a drop would be a NEW session,
+ * possibly on a different backend, silently re-establishing a chain that had been broken -- which
+ * is the defect this mode exists to close, rebuilt inside the fix. A lost connection ends the
+ * process instead, and root then finds no lock and keeps the record.
+ */
+export async function doWitness(client, options, input = process.stdin) {
+  if (!isWitnessNonce(options.witnessNonce)) {
+    console.error('--witness was not given a usable nonce (--witness-nonce=, 32-64 hex characters), so there is nothing for it to hold.')
+    return EXIT_ERROR
+  }
+  await client.query('SELECT pg_advisory_lock($1::bigint)', [advisoryKeyForWitnessNonce(options.witnessNonce)])
+  const { rows } = await client.query('SELECT pg_backend_pid() AS pid, current_database() AS database')
+  console.error(`Connection witness attached to ${rows[0]?.database} as backend ${rows[0]?.pid}; it holds one advisory lock and touches nothing else.`)
+  MACHINE_CHANNEL.write(`WITNESS_READY ${options.witnessNonce}\n`)
+
+  // THE SESSION IS KEPT AWAKE (o3d-secops r31). An installation with `idle_session_timeout` set
+  // would otherwise have its witness dropped mid-migration, and every such deploy would lose the
+  // automatic removal it has today -- a real regression, arriving as a mysterious confirmation
+  // prompt. The timer is unref'd so it can never be the reason this process outlives its stdin.
+  const keepalive = setInterval(() => { client.query('SELECT 1').catch(() => {}) }, 20_000)
+  keepalive.unref?.()
+  try {
+    let buffer = ''
+    for await (const chunk of input) {
+      buffer += chunk.toString('utf8')
+      let index
+      while ((index = buffer.indexOf('\n')) >= 0) {
+        const line = buffer.slice(0, index).trim()
+        buffer = buffer.slice(index + 1)
+        if (line === '') continue
+        if (line === 'close') return EXIT_OK
+        const challenge = /^challenge ([0-9a-f]{32,64})$/.exec(line)
+        if (!challenge) {
+          MACHINE_CHANNEL.write('WITNESS_REFUSED\n')
+          continue
+        }
+        await client.query('SELECT pg_advisory_lock($1::bigint)', [advisoryKeyForWitnessNonce(challenge[1])])
+        MACHINE_CHANNEL.write(`WITNESS_HELD ${challenge[1]}\n`)
+      }
+    }
+    return EXIT_OK
+  } finally {
+    clearInterval(keepalive)
+  }
+}
+
+/**
+ * The database a witness attaches to, given the connection string the fence would use.
+ *
+ * NOT THE APPLICATION'S DATABASE, for the reason set out above: the drain clears that one. The
+ * candidates are the two every PostgreSQL cluster is initialised with, and a cluster that has
+ * neither simply gets no witness.
+ *
+ * BOTH `dbname` FORMS ARE REMOVED, not just the path. libpq accepts the database as a query
+ * parameter as well as a path segment, and a rewrite that set one while leaving the other would
+ * silently attach the witness to the fenced database after all -- which is the one place this
+ * whole mechanism must not be.
+ */
+export function witnessConnectionStrings(connectionString) {
+  const out = []
+  for (const candidate of ['postgres', 'template1']) {
+    try {
+      const url = new URL(connectionString)
+      url.searchParams.delete('dbname')
+      url.searchParams.delete('database')
+      url.pathname = `/${encodeURIComponent(candidate)}`
+      out.push(url.toString())
+    } catch {
+      return []
+    }
+  }
+  return out
+}
+
 export async function doFence(client, options) {
   const assessed = await assessFenceRequest(client, options, 'NOT FENCED')
   if (assessed.exitCode !== undefined) return assessed.exitCode
   const { facts, appRole, freshPlan, existing } = assessed
+
+  // LINK F OF THE CHAIN: IS THE WITNESS ON THE INSTANCE THIS FENCE IS ABOUT TO REVOKE ON?
+  // (o3d-secops r31, Codex HIGH 1 -- see the section above doWitness().)
+  //
+  // ASKED ON THIS CONNECTION, which is the whole point: the answer is about the backend that is
+  // one statement away from issuing the REVOKEs, not about a connection string, a hostname or a
+  // process. It is asked BEFORE `BEGIN` so it costs nothing, and it is REPORTED RATHER THAN
+  // ENFORCED so it can cost nothing: a fence is never refused because a witness is missing. What
+  // an absent witness costs is root's automatic removal of the record at the end of the run, and
+  // that is the whole of it -- the fence still goes up, the migration still runs, and the record
+  // is ended by a person instead.
+  if (options.witnessLock) {
+    const colocated = await witnessLockIsHeld(client, options.witnessLock)
+    MACHINE_CHANNEL.write(`fence_witness=${colocated ? 'colocated' : 'absent'}\n`)
+    if (colocated) {
+      console.error('The connection witness is on this same instance: the session that will answer for this fence at release time is attached to the backend about to be fenced.')
+    } else {
+      console.error('NO CONNECTION WITNESS IS VISIBLE FROM THIS BACKEND. The fence itself is unaffected and proceeds.')
+      console.error('What it costs is the automatic removal of the fence record at the end of this run: nothing will be')
+      console.error('able to show that the server released is the server fenced, so the record is kept and a person ends')
+      console.error('it with the release wrapper. A pooler in transaction mode, a cluster with no second database, or a')
+      console.error('connection that is not landing where the witness landed all read this way.')
+    }
+  }
 
   // THE AUTHORITY IS AN INPUT NOW, NOT AN OUTPUT (o3d-secops r23, Codex CRITICAL).
   //
@@ -2811,6 +3033,31 @@ export async function doRelease(client, options) {
   // the record describes a fence that has been released, which is the safe direction: a `--fence`
   // over it re-applies the same grantee list, and a second `--release` re-grants what is already
   // granted. The other order loses the only account of what was revoked.
+  // LINK R OF THE CHAIN: IS THE WITNESS ON THE INSTANCE THIS RELEASE JUST GRANTED ON?
+  // (o3d-secops r31, Codex HIGH 1 -- see the section above doWitness().)
+  //
+  // THE NONCE IS FRESH, generated by root at this moment and handed to the witness seconds ago, so
+  // an affirmative answer cannot be a fact that was copied: no snapshot, base backup or restored
+  // image taken at any earlier moment can contain a lock on a number that did not exist when it
+  // was taken. A live session had to take it, and it could only take it here.
+  //
+  // AFTER THE GRANTS AND AFTER THE VERIFICATION, deliberately. This decides whether root may
+  // REMOVE THE RECORD, and nothing else; the release itself is already done and is safe to repeat
+  // on any server. Reporting rather than refusing keeps it that way -- a release must never fail
+  // because a witness is gone, or the mechanism that protects the record would start stranding
+  // fences.
+  if (options.witnessChallenge) {
+    const colocated = await witnessLockIsHeld(client, options.witnessChallenge)
+    MACHINE_CHANNEL.write(`witness_colocated=${colocated ? 'yes' : 'no'}\n`)
+    if (!colocated) {
+      console.error('THE CONNECTION WITNESS IS NOT ON THE SERVER THIS RELEASE JUST GRANTED ON.')
+      console.error('CONNECT has been restored here and that is done. What cannot be shown is that "here" is the server')
+      console.error('this record was written against: a physical copy of a fenced cluster answers a release exactly as')
+      console.error('the original does, so the record is KEPT rather than removed. End it with the release wrapper once')
+      console.error('you know which server you are talking to.')
+    }
+  }
+
   console.log(`Connection fence released: CONNECT restored to ${state.revoked.join(', ')} on ${state.database}.`)
   return EXIT_OK
 }
@@ -3060,9 +3307,9 @@ async function main() {
   // opened is proven against the connection itself (assessDatabaseIdentity, and the postmaster
   // stamp in --release).
   const options = parseArgs(process.argv.slice(2))
-  const modes = ['plan', 'fence', 'release', 'preflight', 'print-migration-url', 'audit-authority']
+  const modes = ['plan', 'fence', 'release', 'preflight', 'print-migration-url', 'audit-authority', 'witness']
   if (!modes.includes(options.mode)) {
-    console.error('Usage: node scripts/fence-db-connections.mjs (--preflight|--plan|--fence|--release|--audit-authority|--print-migration-url) --app-host=HOST --app-port=PORT --app-user=ROLE --app-database=NAME [--state-file=PATH] [--state-owner=UID] [--app-role=ROLE] [--timeout-seconds=N]')
+    console.error('Usage: node scripts/fence-db-connections.mjs (--preflight|--plan|--fence|--release|--audit-authority|--witness|--print-migration-url) --app-host=HOST --app-port=PORT --app-user=ROLE --app-database=NAME [--state-file=PATH] [--state-owner=UID] [--app-role=ROLE] [--timeout-seconds=N] [--witness-nonce=HEX] [--witness-lock=HEX] [--witness-challenge=HEX]')
     process.exit(EXIT_ERROR)
   }
 
@@ -3112,13 +3359,21 @@ async function main() {
   // fence is up" into "the audit could not run", which is the one reading that must not be
   // produced by the situation it is there to diagnose.
   const connectionString =
-    options.mode === 'preflight' || options.mode === 'plan' || options.mode === 'audit-authority'
+    options.mode === 'preflight' || options.mode === 'plan' || options.mode === 'audit-authority' || options.mode === 'witness'
       ? process.env.DEPLOY_ADMIN_DATABASE_URL
       : process.env.DEPLOY_ADMIN_DATABASE_URL || process.env.DIRECT_URL || process.env.DATABASE_URL
   if (!connectionString) {
     if (options.mode === 'preflight' || options.mode === 'plan') {
       requireAdminUrl('this deploy')
       process.exit(EXIT_NOT_FENCEABLE)
+    }
+    // o3d-secops r31: a witness with no admin URL is simply no witness. It refuses rather than
+    // falling back to the application's own connection, because the connection a fence closes is
+    // exactly the one that would die the moment the fence went up -- and a witness that vanishes at
+    // the fence is worse than none, since the run would have reported a chain it no longer has.
+    if (options.mode === 'witness') {
+      requireAdminUrl('this connection witness')
+      process.exit(EXIT_ERROR)
     }
     if (options.mode === 'audit-authority') {
       requireAdminUrl('this audit')
@@ -3128,6 +3383,34 @@ async function main() {
       process.exit(EXIT_ERROR)
     }
     console.error('Neither DEPLOY_ADMIN_DATABASE_URL nor DATABASE_URL is set — cannot fence or release anything.')
+    process.exit(EXIT_ERROR)
+  }
+
+  // THE WITNESS DOES NOT ATTACH TO THE DATABASE THAT IS ABOUT TO BE FENCED (o3d-secops r31).
+  // completeFence() terminates every other client backend on it and then requires the room to be
+  // empty, and it has to keep requiring that. So the witness is given the same cluster by another
+  // door; `pg_locks` is cluster-wide, so `--fence` and `--release` can still see what it holds.
+  if (options.mode === 'witness') {
+    const candidates = witnessConnectionStrings(connectionString)
+    if (candidates.length === 0) {
+      console.error('The admin connection string could not be re-pointed at another database, so this run can hold no witness. Nothing has been changed.')
+      process.exit(EXIT_ERROR)
+    }
+    for (const candidate of candidates) {
+      const witness = new pg.Client({ connectionString: candidate, application_name: 'ims-deploy-fence-witness' })
+      try {
+        await witness.connect()
+      } catch {
+        continue
+      }
+      try {
+        process.exitCode = await doWitness(witness, options)
+      } finally {
+        await witness.end().catch(() => {})
+      }
+      return
+    }
+    console.error('No second database in this cluster would accept a witness connection (tried postgres and template1), so this run holds none. The fence is unaffected; what is lost is the automatic removal of its record.')
     process.exit(EXIT_ERROR)
   }
 

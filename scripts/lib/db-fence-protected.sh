@@ -1791,6 +1791,25 @@ db_fence_publish_authority() {
 # any cluster can produce, because it is not in any cluster. The ordinary deploy, update and
 # install therefore stay exactly as automatic as they were, which is what the arm exists for.
 #
+# AND THAT WAS HALF OF THE QUESTION (o3d-secops r31, Codex HIGH 1). "This run raised the fence it is
+# now releasing" is a fact about a PROCESS, and the paragraph above rests it on "over the same
+# connection string" -- which is precisely the thing a DNS change, a connection pooler or a failover
+# re-points between the two processes that do the raising and the releasing. The memory stays true
+# across such a redirect, so it could license the removal of the record of a fence still standing on
+# a server this run is no longer talking to: the residual the paragraph above claims to have escaped,
+# re-entered one layer up.
+#
+# NOTE WHAT r29's REASONING RULES OUT, because it rules out the cheap answers here too. Nothing in a
+# data directory separates an origin from a copy, and the two connection-level candidates -- the
+# server address, and the postmaster's start time -- are refused a few hundred lines up in
+# fence-db-connections.mjs for reasons this round does not improve on. Each would shrink the
+# residual and not close it, and the paragraph above says what that is worth.
+#
+# So the removal now takes a SECOND answer, about WHERE rather than WHO, and it is measured rather
+# than remembered: a witness session, opened before anything was revoked and still holding a lock on
+# a nonce generated seconds ago, that BOTH the fencing connection and the releasing connection could
+# see for themselves. See the section above db_fence_witness_start(), and ${3} below.
+#
 # WHERE THAT MEMORY IS ABSENT, NOTHING HERE DELETES. A release of a record some EARLIER run
 # published -- the standalone release wrapper an operator runs days later, or the start path
 # checking whether a previous cutover left a fence standing -- is precisely the case in which the
@@ -1804,12 +1823,37 @@ db_fence_publish_authority() {
 # nothing to write. Nothing else is accepted -- not an empty argument, not `true`, and not a value
 # the shell might produce by accident from an unset name under `set -u`.
 db_fence_clear_authority() {
-  local destination="$1" attestation="${2:-}"
+  local destination="$1" attestation="${2:-}" server="${3:-}"
   [[ -n "${destination}" ]] || return 0
   # NOTHING THERE IS NOTHING TO REFUSE. Callers reach this after a release that found no record at
   # all -- adopt_db_connections() takes that path deliberately -- and a gate that turned an absent
   # file into a refusal would stop a recovery on the one state that needs no decision at all.
   [[ -e "${destination}" || -L "${destination}" ]] || return 0
+  # AND THE SECOND HALF OF THE ATTESTATION: WHICH SERVER (o3d-secops r31, Codex HIGH 1).
+  #
+  # r30 asked only whether THIS RUN raised the fence, which is a fact about this PROCESS. A process
+  # spans two connections and a connection is what a proxy or a failover re-points, so that answer
+  # could be true of a run whose release landed on a copy of the fenced cluster -- and the removal
+  # would then destroy the only account of the fence still standing on the original. So the caller
+  # must also say WHICH SERVER it is speaking about, and there are exactly two things it may say:
+  #
+  #   same-server-as-the-fence   the release's OWN connection saw the witness session that
+  #                              `--fence` saw from the backend it revoked on. See
+  #                              db_fence_witness_challenge() and the section above it.
+  #   nothing-was-revoked        no REVOKE was ever issued from this record, so there is no server
+  #                              to be wrong about. db_fence_raise()'s two removals of its own
+  #                              never-executed publication, and only those.
+  #
+  # BOTH ARE LITERALS COMPARED IN PLACE, for the reason the first attestation is: a name holding the
+  # value that licenses an unlink is a name some later path can assign to, which is the subject of
+  # the sink census in tests/scripts/install-root-safe-writes.test.ts. Nothing else is accepted --
+  # not an empty argument, and not a value `set -u` might produce from an unset name.
+  if [[ "${server}" != "same-server-as-the-fence" && "${server}" != "nothing-was-revoked" ]]; then
+    echo "NOT REMOVING ${destination}: nothing here can show that the server this run released is the server the record was written against, so the record is kept." >&2
+    echo "A release runs on a connection, and a connection is what DNS, a pooler or a failover re-points; the fence and the release are two of them. This run held no connection witness across the pair, or the release's own connection could not see one -- so \"this run raised a fence\" is all that is known, and that is a fact about this process rather than about a server." >&2
+    echo "The grants this run issued are unaffected and are safe to repeat. What is left is the record, and it is ended by a person: run ${DB_FENCE_SUDO_PREFIX}${DB_FENCE_RELEASE_WRAPPER} as root, which reaches the same answer and then offers to remove it once, after a token derived from that record's exact bytes is typed at your terminal." >&2
+    return 2
+  fi
   if [[ "${attestation}" != "raised-by-this-run" ]]; then
     echo "NOT REMOVING ${destination}: this run did not raise the fence that record describes, so it cannot show that the server it just released is the server the record was written against." >&2
     echo "A copy of a fenced cluster -- a base backup, a restored snapshot, a staging clone reachable at the same name -- carries the fence with it and answers a release exactly as the original does; nothing readable separates the two. Removing the record here would destroy the only account of what a fence still standing on the real server revoked." >&2
@@ -1839,6 +1883,130 @@ db_fence_clear_authority() {
 # db_fence_helper() is the one thing each entrypoint supplies for itself -- the three of them drop
 # to ${APP_USER} in three different ways, with three different environments -- and it is the only
 # part of raising a fence that is not written down once.
+# ---------------------------------------------------------------------------
+# THE CONNECTION WITNESS (o3d-secops r31, Codex HIGH 1)
+#
+# WHY IT EXISTS, in one paragraph; the argument in full is above doWitness() in
+# fence-db-connections.mjs. r30 made root's automatic removal of the fence record conditional on
+# ${DB_FENCE_RAISED} -- this run's memory of having raised the fence. That is a fact about a
+# PROCESS, and `--fence` and `--release` are two processes on two connections; a proxy, a DNS
+# change or a failover between them re-points the connection while the Boolean stays true, so the
+# attestation could be spent against a backend that never saw the fence. What binds to a
+# CONNECTION is a connection that stays open, so one does: a witness session takes a session-scoped
+# advisory lock -- shared memory, carried by no file-level copy of a cluster -- and `--fence` and
+# `--release` each ASK THEIR OWN CONNECTION whether it is visible.
+#
+# ROOT DOES NOT BELIEVE THE WITNESS, WHICH IS WHY THE CHANNEL BELOW MAY BE A PIPE. Nothing this
+# co-process says is evidence of anything. The nonce is root's; the only party told it is the
+# witness; and the answer root acts on comes from `--release` reporting what ITS OWN DATABASE
+# CONNECTION could see. A co-process that lied about holding a lock would produce a `--release`
+# that reports `witness_colocated=no`, and the record would be kept.
+#
+# AND IT CAN NEVER COST A DEPLOY ITS FENCE. Every failure here -- no coproc, no second database in
+# the cluster, a session dropped by an idle timeout, a pooler that gives out no stable backend --
+# leaves ${DB_FENCE_WITNESS_BOUND} at 0, and that costs exactly one thing: the record is kept at
+# the end of the run and a person ends it with the release wrapper. No path here refuses a fence,
+# fails a release, or returns non-zero into anything that decides whether a migration may run.
+# ---------------------------------------------------------------------------
+
+# `set -u` is in force in every entrypoint, and the coproc array does not exist until one is
+# started, so all four names are initialised here and never merely declared.
+DB_FENCE_WITNESS_PID="${DB_FENCE_WITNESS_PID:-}"
+DB_FENCE_WITNESS_NONCE=""
+DB_FENCE_WITNESS_BOUND=0
+DB_FENCE_WITNESS_CHALLENGE=""
+
+# 128 bits of kernel randomness as lower-case hex. It is a NONCE and not a secret: what it has to
+# be is unguessable-in-advance and never reused, so that a lock on it cannot be a fact some earlier
+# snapshot of a cluster happens to contain.
+db_fence_witness_nonce() {
+  local hex
+  hex="$(od -An -tx1 -N16 /dev/urandom 2>/dev/null | tr -d ' \n')" || return 1
+  [[ "${hex}" =~ ^[0-9a-f]{32}$ ]] || return 1
+  printf '%s\n' "${hex}"
+}
+
+# Take the witness down. Idempotent, silent, and it returns 0 from every path: it is called on the
+# way out of a run that may already be failing, and a teardown that could fail the caller would be
+# a teardown that turns a lost witness into a lost deploy.
+db_fence_witness_stop() {
+  local fd
+  if [[ -n "${DB_FENCE_WITNESS[1]:-}" ]]; then
+    printf 'close\n' >&"${DB_FENCE_WITNESS[1]}" 2>/dev/null || true
+    fd="${DB_FENCE_WITNESS[1]}"
+    exec {fd}>&- 2>/dev/null || true
+  fi
+  if [[ -n "${DB_FENCE_WITNESS[0]:-}" ]]; then
+    fd="${DB_FENCE_WITNESS[0]}"
+    exec {fd}<&- 2>/dev/null || true
+  fi
+  if [[ -n "${DB_FENCE_WITNESS_PID:-}" ]]; then
+    kill "${DB_FENCE_WITNESS_PID}" 2>/dev/null || true
+    wait "${DB_FENCE_WITNESS_PID}" 2>/dev/null || true
+  fi
+  unset DB_FENCE_WITNESS 2>/dev/null || true
+  DB_FENCE_WITNESS_PID=""
+  DB_FENCE_WITNESS_NONCE=""
+  DB_FENCE_WITNESS_BOUND=0
+  DB_FENCE_WITNESS_CHALLENGE=""
+  return 0
+}
+
+# Open the witness session. Returns 0 when it is holding its lock and has said so, 1 otherwise —
+# and every caller treats 1 as "carry on without one".
+#
+# THE PREVIOUS ONE IS TAKEN DOWN FIRST, because the exit trap's re-fence raises a second fence in
+# the same shell and bash keeps exactly one co-process. Without this the second `coproc` warns and
+# the run would go on holding a witness bound to a fence that is no longer the one being released.
+db_fence_witness_start() {
+  local fence_script="$1"
+  shift
+  db_fence_witness_stop
+  local nonce line
+  nonce="$(db_fence_witness_nonce)" || {
+    echo "No connection witness for this run: this host would not produce 16 random bytes. The fence is unaffected; its record will be kept at the end of the run for a person to end." >&2
+    return 1
+  }
+  # The co-process inherits this shell's stderr, so everything the helper says to an operator is
+  # printed live exactly as every other invocation's is. Only stdout — the protocol — is a pipe.
+  coproc DB_FENCE_WITNESS { db_fence_helper "${fence_script}" --witness --witness-nonce="${nonce}" "$@"; }
+  # `read` is given a deadline on every use here. A witness that never answers must cost this run
+  # its automatic removal and nothing else; a blocking read would cost it the deploy.
+  while read -r -t 60 line <&"${DB_FENCE_WITNESS[0]:-0}" 2>/dev/null; do
+    if [[ "${line}" == "WITNESS_READY ${nonce}" ]]; then
+      DB_FENCE_WITNESS_NONCE="${nonce}"
+      return 0
+    fi
+  done
+  echo "No connection witness for this run: the witness session did not report holding its lock (the reason, if it gave one, is printed above). The fence is unaffected; its record will be kept at the end of the run for a person to end." >&2
+  db_fence_witness_stop
+  return 1
+}
+
+# Ask the witness to take a lock on a nonce generated RIGHT NOW, and publish that nonce in
+# ${DB_FENCE_WITNESS_CHALLENGE} for `--release` to look for.
+#
+# THE FRESHNESS IS THE WHOLE MECHANISM. A lock on a number that did not exist when a copy of a
+# cluster was taken cannot be in that copy, however the copy was made and whatever else it carries.
+# It is generated here rather than reused from the fence for exactly that reason: the fence's nonce
+# is minutes old by now, and minutes is long enough for the snapshot this is about.
+db_fence_witness_challenge() {
+  DB_FENCE_WITNESS_CHALLENGE=""
+  [[ "${DB_FENCE_WITNESS_BOUND:-0}" -eq 1 ]] || return 1
+  [[ -n "${DB_FENCE_WITNESS[0]:-}" && -n "${DB_FENCE_WITNESS[1]:-}" ]] || return 1
+  [[ -n "${DB_FENCE_WITNESS_PID:-}" ]] && kill -0 "${DB_FENCE_WITNESS_PID}" 2>/dev/null || return 1
+  local nonce line
+  nonce="$(db_fence_witness_nonce)" || return 1
+  printf 'challenge %s\n' "${nonce}" >&"${DB_FENCE_WITNESS[1]}" 2>/dev/null || return 1
+  while read -r -t 60 line <&"${DB_FENCE_WITNESS[0]}" 2>/dev/null; do
+    if [[ "${line}" == "WITNESS_HELD ${nonce}" ]]; then
+      DB_FENCE_WITNESS_CHALLENGE="${nonce}"
+      return 0
+    fi
+  done
+  return 1
+}
+
 db_fence_raise() {
   local fence_script="$1" state_file="$2"
   shift 2
@@ -1896,7 +2064,7 @@ db_fence_raise() {
       # THIS RUN'S OWN PUBLICATION, seconds old and never revoked from: ${had_authority} was read
       # before step 2 precisely so this branch can say so. That is the attestation, and it is why
       # this removal is still automatic while the release's is not.
-      if ! db_fence_clear_authority "${state_file}" "raised-by-this-run"; then
+      if ! db_fence_clear_authority "${state_file}" "raised-by-this-run" "nothing-was-revoked"; then
         echo "The connection-fence authority could not be published AND the partial record at ${state_file} could not be removed. It carries no applied stamp, so no later run can treat it as a standing fence and it cannot buy the recovery rule; it is still litter at the authoritative path. Remove it by hand." >&2
       fi
     fi
@@ -1908,9 +2076,41 @@ db_fence_raise() {
     return 3
   fi
 
+  # STEP 2b: OPEN THE WITNESS SESSION, BEFORE ANYTHING IS REVOKED (o3d-secops r31, Codex HIGH 1).
+  #
+  # HERE AND NOT EARLIER, and here and not later. Not later, because the connection it has to be
+  # measured against is the one `--fence` is about to revoke on, and a witness that appeared
+  # afterwards would have proved nothing about the session that issued the REVOKEs. Not earlier,
+  # because a fence refused at step 1 or step 2 has no server to be right or wrong about and should
+  # open no connections at all.
+  #
+  # ITS FAILURE IS NOT A FAILURE. The status is deliberately discarded: what a missing witness costs
+  # is the automatic removal of the record at the end of this run, and nothing in this function's
+  # contract, its return value or the caller's next step changes because of it.
+  local witness_argv=()
+  if db_fence_witness_start "${fence_script}" "$@"; then
+    witness_argv=(--witness-lock="${DB_FENCE_WITNESS_NONCE}")
+  fi
+
   # STEP 3, UNPRIVILEGED AGAIN: execute exactly what step 2 recorded.
+  #
+  # ITS STDOUT IS CAPTURED AND PRINTED BACK, the way release_the_fence() has captured `--release`
+  # since r28 and for the same reason: the one machine-readable line this run needs -- whether the
+  # witness is on the backend that was fenced -- arrives there, while every word an operator reads
+  # is on stderr and is never captured, so refusals, drains and reasons all still stream live.
   rc=0
-  db_fence_helper "${fence_script}" --fence --state-file="${state_file}" --state-owner="$(id -u)" "$@" || rc=$?
+  local fenced=""
+  fenced="$(db_fence_helper "${fence_script}" --fence --state-file="${state_file}" --state-owner="$(id -u)" "${witness_argv[@]}" "$@")" || rc=$?
+  [[ -z "${fenced}" ]] || printf '%s\n' "${fenced}"
+  # THE ONLY THING THAT MAY RAISE THE BOUND FLAG is `--fence` saying, on the connection it fenced,
+  # that it could see the witness. It is re-derived from this run's own output every time rather
+  # than left standing from a previous fence in the same shell -- the exit trap's re-fence goes
+  # through here too, and a flag left true across it would attest a link the new fence never made.
+  if [[ "${fenced}" == *"fence_witness=colocated"* ]]; then
+    DB_FENCE_WITNESS_BOUND=1
+  else
+    DB_FENCE_WITNESS_BOUND=0
+  fi
 
   # STEP 4, PRIVILEGED AGAIN: THE RECORD IS TOLD THAT THE FENCE WAS APPLIED (o3d-secops r25, Codex
   # HIGH). This is the only write that ever happens AFTER a REVOKE, and it is what a later run's
@@ -1958,7 +2158,7 @@ db_fence_raise() {
   # intact, exactly as before.
   if [[ "${rc}" -eq 3 && "${had_authority}" -eq 0 ]]; then
     # Again this run's own publication and nothing else: ${had_authority} bounds it.
-    if ! db_fence_clear_authority "${state_file}" "raised-by-this-run"; then
+    if ! db_fence_clear_authority "${state_file}" "raised-by-this-run" "nothing-was-revoked"; then
       echo "The connection fence was REFUSED before anything was revoked, and the authority this run published at ${state_file} could not be removed. Nothing is fenced and nothing has been migrated, but that file now describes a fence that does not exist: the next cutover will treat it as a standing one. Remove it by hand before re-running." >&2
     fi
   fi
