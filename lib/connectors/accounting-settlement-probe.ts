@@ -20,7 +20,15 @@ import type { AccountingSyncType } from '@/app/generated/prisma/client'
 // o3d-obyd: and `decodeLedgerAmountText` is the string arm of that same reader, which is how the
 // completeness arithmetic below reads a numeric STRING without also inheriting the currency and
 // magnitude judgements that belong to a decision which withholds. One decode, two callers.
-import { decodeLedgerAmountText, ledgerCurrencyCode, readLedgerStatedAmount } from '@/lib/connectors/xero/invoice-delta'
+// o3d-mm51: and `ledgerDifferenceMagnitudeBound` is the OTHER rule that reader applies to a decoded
+// JSON number -- the one about whether the number can be READ AT ALL rather than about whether the
+// figure may be trusted. See `wireAmount`, which inherits it and still does not inherit the scale.
+import {
+  decodeLedgerAmountText,
+  ledgerCurrencyCode,
+  ledgerDifferenceMagnitudeBound,
+  readLedgerStatedAmount,
+} from '@/lib/connectors/xero/invoice-delta'
 // o3d-r948: the completeness refusals print figures, and a KWD shortfall of one fil is `0.00` at two
 // places. The rule for showing a money figure without rounding away what the verdict turned on is
 // already written down for the classifier's own sentences, so it is the same function.
@@ -130,17 +138,65 @@ function completenessBand(currency: string | null): Decimal {
  * shared and the JUDGEMENT is not, which is the split `decodeLedgerAmountText` is documented for.
  * What the exact reading buys the arithmetic is unchanged: each figure is taken at its own exact
  * decimal value and added without rounding, so the sum contributes no error on top of the terms.
+ *
+ * o3d-mm51 (Codex HIGH 1) -- AND THE HALF OF THAT JUDGEMENT WHICH IS NOT A JUDGEMENT AT ALL.
+ *
+ * The paragraph above splits DECODE from JUDGEMENT correctly and then excludes
+ * `readLedgerStatedAmount`'s two extra rules TOGETHER, as though the judgement were one thing. It is
+ * two, their premises differ, and only one of them was rightly excluded:
+ *
+ *   THE SCALE RULE -- "is this figure quantized to its currency's minor unit?" -- STAYS EXCLUDED, for
+ *   exactly the reason given above. It asks whether a figure may be TRUSTED, and this check must read
+ *   a figure stated more finely than the document's own currency: a KWD `AmountPaid` of one fil, or a
+ *   GBP `AmountCredited` of `0.001`, is precisely the shortfall `completenessBand` exists to measure,
+ *   and refusing to read it puts the check back where o3d-r948 found it.
+ *
+ *   THE MAGNITUDE RULE -- "can a double even hold two figures this large one minor unit apart?" -- IS
+ *   INHERITED. That is not a question about the figure at all. It is the statement that
+ *   `Response.json()` has ALREADY destroyed the token and that no test applied to the double
+ *   afterwards can see the loss (see `ledgerAmountMagnitudeBound`), and its premise -- the evidence is
+ *   gone -- holds for EVERY reader of a decoded JSON number, including one that withholds nothing.
+ *   Codex's pair is the demonstration: GBP `TotalAmt 70368744177664.02` with `Balance
+ *   70368744177664.01` is ONE double twice over, `TotalAmt - Balance` is an exact zero, and the probe
+ *   answered `ok: true` over an EMPTY record list -- a real one-penny settlement read as no
+ *   settlement, which `classifyLedgerSettlement` reads as `clear`, and `clear` authorises a SECOND
+ *   payment.
+ *
+ * AND IT IS THE DIFFERENCE BOUND, NOT THE AMOUNT ONE. `ledgerAmountMagnitudeBound` guarantees that
+ * ONE WHOLE MINOR UNIT survives the decode; every decision these figures feed turns on HALF of one,
+ * because `completenessBand` is `ledgerAmountEpsilon`. That is the same gap o3d-psrx r16 derived
+ * `ledgerDifferenceMagnitudeBound` for, and it is measured rather than argued: in GBP at 2^45 --
+ * BELOW the amount bound -- `35184372088832.0117` and `35184372088832.0040` are 0.0077 apart, which
+ * is above the band, and they are one double. So the halved bound is REUSED here rather than
+ * re-derived, and it applies to every figure this reader answers, because there is no figure here
+ * that is read alone: `Total - RemainingCredit`, `AmountPaid` against its collection, `Total -
+ * AmountDue`, `TotalAmt - Balance`, and every `shortBy` and `statesAnything` besides, are all decided
+ * at one half of a minor unit.
+ *
+ * THE STRING ARM TAKES NO BOUND, which is o3d-psrx r15 and is deliberately unchanged. A string still
+ * carries its own digits, so nothing was destroyed and there is nothing for a size rule to stand in
+ * for. That is also why this does not undo o3d-obyd: QuickBooks states `TotalAmt` and `Balance` as
+ * TEXT, and text is read exactly as it was.
+ *
+ * A REFUSED NUMBER IS UNREADABLE, NOT ABSENT. It is a figure the ledger STATED, so it takes the
+ * direction the triple exists for -- `completenessCannotRun` refuses the probe rather than excusing
+ * the check that would have used it.
  */
 type WireAmount = { value: Decimal | null; unreadable: string | null }
 
-function wireAmount(value: unknown): WireAmount {
+function wireAmount(value: unknown, currency: string | null): WireAmount {
   // The ledger stated nothing. Not a refusal: an omitted collection or total is a shape both ledgers
   // send routinely, and the checks below already treat "no figure to compare against" as no check.
   if (value === undefined || value === null) return { value: null, unreadable: null }
   if (typeof value === 'number') {
-    return Number.isFinite(value)
-      ? { value: toDecimal(value), unreadable: null }
-      : { value: null, unreadable: String(value) }
+    if (!Number.isFinite(value)) return { value: null, unreadable: String(value) }
+    // o3d-mm51: the token is already gone, so the only question left is one about its SIZE. At or
+    // above this bound the decode can no longer keep two figures HALF a minor unit apart, which is
+    // the granularity every check below decides at, so the number is refused rather than read.
+    if (Math.abs(value) >= ledgerDifferenceMagnitudeBound(currency)) {
+      return { value: null, unreadable: String(value) }
+    }
+    return { value: toDecimal(value), unreadable: null }
   }
   if (typeof value === 'string') {
     const decoded = decodeLedgerAmountText(value)
@@ -161,8 +217,8 @@ function wireAmount(value: unknown): WireAmount {
  * terms need no triple. The DOCUMENT's own totals do, because a null there decided whether the check
  * ran at all.
  */
-function wireDecimal(value: unknown): Decimal | null {
-  return wireAmount(value).value
+function wireDecimal(value: unknown, currency: string | null): Decimal | null {
+  return wireAmount(value, currency).value
 }
 
 /**
@@ -333,9 +389,10 @@ type XeroCreditNoteResponse = {
  * nothing, so an `AmountCredited` it should have accounted for shows up as an unexplained
  * shortfall and refuses.
  */
-function sumApplied(collection: XeroAppliedCollection | undefined): Decimal | null {
+function sumApplied(collection: XeroAppliedCollection | undefined, currency: string | null): Decimal | null {
   // o3d-r948: exact, like every other term of the completeness arithmetic.
-  return sumExact((collection ?? []).map((entry) => wireDecimal(entry.AppliedAmount)))
+  // o3d-mm51: and sized by the document's own currency, like every other term of it.
+  return sumExact((collection ?? []).map((entry) => wireDecimal(entry.AppliedAmount, currency)))
 }
 
 /** The shape of the connector read each probe needs, so both can be driven without a network. */
@@ -388,8 +445,8 @@ export async function probeXeroSettlement(
     // o3d-obyd — ARM 1 OF 3. An unreadable `Total` or `RemainingCredit` used to make `applied` null,
     // which skipped this check entirely; an absent `Allocations` collection then gave `records: []`,
     // and that is a `clear` over the credit note this check was added to protect.
-    const creditTotal = wireAmount(note.Total)
-    const remaining = wireAmount(note.RemainingCredit)
+    const creditTotal = wireAmount(note.Total, noteCurrency)
+    const remaining = wireAmount(note.RemainingCredit, noteCurrency)
     const cannotRun = completenessCannotRun([['Total', creditTotal], ['RemainingCredit', remaining]])
     if (cannotRun !== null) {
       return {
@@ -401,7 +458,7 @@ export async function probeXeroSettlement(
     const applied = creditTotal.value !== null && remaining.value !== null
       ? subtractMoney(creditTotal.value, remaining.value)
       : null
-    const allocated = sumExact(allocations.map((a) => wireDecimal(a.Amount)))
+    const allocated = sumExact(allocations.map((a) => wireDecimal(a.Amount, noteCurrency)))
     if (applied !== null && statesAnything(applied, noteCurrency)
       && (allocated === null || shortBy(applied, allocated, noteCurrency))) {
       return {
@@ -414,6 +471,10 @@ export async function probeXeroSettlement(
               : `allocations totalling ${formatLedgerMoney(allocated)}`),
       }
     }
+    // o3d-mm51 — and the third instance of Codex's HIGH 2 shape, filed with the second. A credit
+    // note stating neither `Total` nor `RemainingCredit` runs no check here either, and an absent
+    // `Allocations` collection then makes `records` empty, which is `clear`. Same reachability
+    // (Xero states both on every credit note that exists), same fixtures, same issue: o3d-nk5n.
     return { ok: true, records }
   }
 
@@ -430,7 +491,7 @@ export async function probeXeroSettlement(
   // cross-check asks whether the COLLECTION is complete, not whether a figure in it can be compared
   // exactly, so it goes on ADMITTING exactly what it admitted before — see `statedAmount`.
   // o3d-r948: read as exact decimals rather than doubles, and summed without rounding.
-  const wireAmounts = (invoice.Payments ?? []).map((p) => wireDecimal(p.Amount))
+  const wireAmounts = (invoice.Payments ?? []).map((p) => wireDecimal(p.Amount, invoiceCurrency))
   const records: LedgerSettlementRecord[] = (invoice.Payments ?? []).map((p) => ({
     ...statedAmount(p.Amount, invoiceCurrency),
     date: normaliseXeroSettlementDate(p.Date),
@@ -460,10 +521,10 @@ export async function probeXeroSettlement(
   // Absent stays a skip on purpose: the `settled` fallback below EXISTS for a response that omits
   // `Total` and `AmountDue`, and an ordinary unsettled invoice that states no `AmountCredited` must
   // keep reading as the positive, empty answer it is.
-  const amountPaidRead = wireAmount(invoice.AmountPaid)
-  const totalRead = wireAmount(invoice.Total)
-  const amountDueRead = wireAmount(invoice.AmountDue)
-  const amountCreditedRead = wireAmount(invoice.AmountCredited)
+  const amountPaidRead = wireAmount(invoice.AmountPaid, invoiceCurrency)
+  const totalRead = wireAmount(invoice.Total, invoiceCurrency)
+  const amountDueRead = wireAmount(invoice.AmountDue, invoiceCurrency)
+  const amountCreditedRead = wireAmount(invoice.AmountCredited, invoiceCurrency)
   const cannotRun = completenessCannotRun([
     ['AmountPaid', amountPaidRead],
     ['Total', totalRead],
@@ -523,7 +584,9 @@ export async function probeXeroSettlement(
     // strictly more than `AmountPaid` alone was.
     : amountPaid !== null && amountCredited !== null ? amountPaid.add(amountCredited) : null
   const applied = sumExact([
-    sumApplied(invoice.CreditNotes), sumApplied(invoice.Prepayments), sumApplied(invoice.Overpayments),
+    sumApplied(invoice.CreditNotes, invoiceCurrency),
+    sumApplied(invoice.Prepayments, invoiceCurrency),
+    sumApplied(invoice.Overpayments, invoiceCurrency),
   ])
   // Null the moment any read settlement is unmeasurable: an unknown addend makes the whole sum
   // unknown, and an unknown sum must not be allowed to "explain" anything.
@@ -541,6 +604,25 @@ export async function probeXeroSettlement(
           : ''),
     }
   }
+
+  // o3d-mm51 — THE SAME SHAPE AS CODEX'S HIGH 2 IS HERE TOO, AND IT IS FILED RATHER THAN CLOSED.
+  //
+  // An invoice that states NO figure at all — no `AmountPaid`, no `Total`, no `AmountDue`, no
+  // `AmountCredited` — runs NEITHER check above and falls through to `ok: true` over whatever
+  // `records` holds. With an absent or empty `Payments` collection that is an EMPTY list, which
+  // `classifyLedgerSettlement` reads as `clear`: the same positive claim on no evidence the
+  // QuickBooks arm was refused for. The exclusion documented above is justified by two shapes —
+  // a response that omits `Total`/`AmountDue` (the `settled` fallback exists for it) and an
+  // unsettled invoice that states no `AmountCredited` — and in BOTH of those Xero has still stated
+  // `AmountPaid`, which IS checked. Stating nothing at all is wider than that justification.
+  //
+  // WHY IT IS NOT CLOSED IN THIS ROUND. It is not reachable the way the QuickBooks one is: Xero's
+  // single-invoice GET states all four figures on every document that exists, so only a stub can
+  // produce the shape. What DOES exist is 25 fixtures across `money-post-authorisation.test.ts`
+  // and `settlement-probe.test.ts` that model an ordinary FIRST payment as exactly this stub —
+  // `{ InvoiceID: 'inv-1', Payments: [] }` — so closing it here fails six money-post fence tests
+  // whose subject is that a first payment proceeds. Making those fixtures state what Xero states
+  // is the fix, and it is a change to the fence's own contract rather than to this reader. o3d-nk5n.
   return { ok: true, records }
 }
 
@@ -651,6 +733,7 @@ function qboAmountAppliedTo(
   lines: QboPaymentLine[] | undefined,
   documentId: string,
   txnType: string,
+  currency: string | null,
 ): { wire: number | null; exact: Decimal | null } {
   if (!lines) return { wire: null, exact: null }
   let wire: number | null = null
@@ -662,6 +745,14 @@ function qboAmountAppliedTo(
     if (!linked) continue
     const amount = num(line.Amount)
     if (amount === null) return { wire: null, exact: null }
+    // o3d-mm51: the EXACT term takes the same magnitude reading the document's own figures now do.
+    // `explained` is the side of `shortBy` that ACCOUNTS for money, so a decode that can no longer
+    // hold half a minor unit inflates it and swallows the very shortfall it was measuring. The `wire`
+    // term is deliberately left as the untouched double: `statedAmount` judges THAT one with the rule
+    // its own decision needs (`readLedgerStatedAmount`, the full amount bound plus the scale), and a
+    // line this reading refuses makes the whole payment unmeasurable, which withholds.
+    const reading = wireAmount(amount, currency)
+    if (reading.value === null) return { wire: null, exact: null }
     // TWO READINGS OF THE SAME LINES, FROM ONE WALK (o3d-r948).
     //
     // `wire` is the double sum, UNCHANGED, and it is what `statedAmount` is asked about — the record's
@@ -672,7 +763,7 @@ function qboAmountAppliedTo(
     // different question and must not lose a minor unit in its own addition. They are returned
     // together so nothing can ever sum a DIFFERENT set of lines for the two answers.
     wire = (wire ?? 0) + amount
-    exact = (exact ?? toDecimal(0)).add(toDecimal(amount))
+    exact = (exact ?? toDecimal(0)).add(reading.value)
   }
   return { wire, exact }
 }
@@ -760,7 +851,7 @@ export async function probeQuickBooksSettlement(
     const settlement = res.data?.[settlementKey]
     if (!settlement) return { ok: false, reason: `QuickBooks returned no ${settlementKey} ${id}` }
     const date = str(settlement.TxnDate)
-    const applied = qboAmountAppliedTo(settlement.Line, documentId, linkedType)
+    const applied = qboAmountAppliedTo(settlement.Line, documentId, linkedType, documentCurrency)
     wireApplied.push(applied.exact)
     records.push({
       ...statedAmount(applied.wire, documentCurrency),
@@ -796,8 +887,8 @@ export async function probeQuickBooksSettlement(
   // with `Balance: "0.00"` read as no figures at all, `applied` was null, and with nothing uncovered
   // linked the check below did not run: `ok: true` over an EMPTY record list, `clear`, and a second
   // payment against a bill QuickBooks reports as fully settled.
-  const totalRead = wireAmount(body.TotalAmt)
-  const balanceRead = wireAmount(body.Balance)
+  const totalRead = wireAmount(body.TotalAmt, documentCurrency)
+  const balanceRead = wireAmount(body.Balance, documentCurrency)
   const cannotRun = completenessCannotRun([['TotalAmt', totalRead], ['Balance', balanceRead]])
   if (cannotRun !== null) {
     return {
@@ -827,6 +918,42 @@ export async function probeQuickBooksSettlement(
         ok: false,
         reason: `QuickBooks links ${uncovered.join(', ')} to this ${documentKey.toLowerCase()} and reports no `
           + 'total or balance, so IMS cannot tell how much of it is already settled',
+      }
+    }
+    // o3d-mm51 (Codex HIGH 2) — AND ABSENCE MUST NOT DO MORE THAN SKIP.
+    //
+    // THE DEFECT. o3d-obyd drew ABSENT apart from UNREADABLE and was right to: a check that cannot be
+    // run must not FAIL, or every ordinary document would refuse. What it then let absence do is more
+    // than skip. With no `TotalAmt` and no `Balance`, `applied` is null, the arithmetic above is
+    // skipped, and control fell through to `return { ok: true, records }` — over an EMPTY record
+    // list, which `classifyLedgerSettlement` reads as `clear`. That is not the ABSENCE of a
+    // conclusion, it is the POSITIVE conclusion "nothing has settled this document" drawn from having
+    // no figure to read, and `clear` is what authorises a money post. A sparse or schema-degraded
+    // `{ Bill: {} }` could buy a second payment with it.
+    //
+    // SO THE TWO ARE SEPARATED. Skipping arithmetic that cannot be done stays — that part was right.
+    // CONTRIBUTING A CONCLUSION does not: when the document states neither figure AND this probe read
+    // no settlement of its own, it has nothing to answer from in EITHER direction, and it says so
+    // rather than answering in the permissive one.
+    //
+    // WHAT AN ORDINARY FIRST PAYMENT DOES — which is what absence was kept permissive FOR, and it
+    // still works. QuickBooks states `TotalAmt` and `Balance` on every bill and invoice that exists,
+    // and an unpaid one states them EQUAL. So the ordinary first payment reads `TotalAmt "1200.00"`
+    // with `Balance "1200.00"`, `applied` is exactly 0, `statesAnything` is false, the check PASSES,
+    // and the probe answers `ok: true` with an empty record list — `clear`, and the payment posts.
+    // That is emptiness PROVED by two stated figures rather than assumed from two missing ones, which
+    // is the whole difference. The refusal below is reachable only by a document that states neither,
+    // and that is not a shape QuickBooks sends for a document that is there.
+    //
+    // AND A DOCUMENT WITH NO FIGURES WHOSE SETTLEMENTS THIS PROBE DID READ still answers: `records`
+    // is then evidence in its own right and the verdict is decided by comparing it, not by the
+    // absence. Only the empty case turns "I could not look" into "there is nothing there".
+    if (records.length === 0) {
+      return {
+        ok: false,
+        reason: `QuickBooks states no total or balance on this ${documentKey.toLowerCase()} and IMS read no `
+          + 'settlement against it, so it has nothing to tell from — an empty answer here would say '
+          + 'that nothing has settled the document rather than report what does',
       }
     }
   } else if (statesAnything(applied, documentCurrency)
