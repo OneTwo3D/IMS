@@ -458,8 +458,8 @@ test('[o3d-r948] the MARK still identifies our own settlement whatever its date 
   // refinement cannot skip past a record that carries it.
   //
   // ROUTE: classifyLedgerSettlement's marker pass, ahead of the record loop.
-  // MUTATION: move the marker pass below the loop and this reads `clear` — the record is skipped by
-  //        its date before its reference is ever looked at.
+  // MUTATION: add the `record.date !== attempt.date` skip to the MARKER loop as well and this reads
+  //        `clear` — the record is skipped by its date before its reference is ever looked at.
   const marked = holding([{
     amount: null, unreadableAmount: '10.005', date: '2026-01-01', id: 'PAY-9', reference: 'IMS-abc123abc123',
   }])
