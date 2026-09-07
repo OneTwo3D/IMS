@@ -1416,12 +1416,36 @@ export function assessAuthorityDrift({ authorised, current, mode }) {
 
 /** Every recorded grantee still holds CONNECT: no fence took it away, so none is standing. */
 /**
- * o3d-secops r28: the three answers compareClusterIdentity() gives. `unproven` is deliberately
- * not spelt the same as `mismatch` anywhere a caller branches on it.
+ * THE FOUR ANSWERS compareClusterIdentity() GIVES (o3d-secops r29, Codex HIGH 1).
+ *
+ * r28 gave it three and one of them was two facts under one spelling. `unproven` meant BOTH "this
+ * record states no fingerprint at all" AND "this record states one and the cluster would not
+ * answer", and every caller that branched on it granted the second the tolerance only the first
+ * has any claim on. They are split here so that the two kinds of nothing stop being one value:
+ *
+ *   proven                    both halves recorded, both halves live, both agree.
+ *   mismatch                  POSITIVE EVIDENCE of the wrong cluster. Refused by every caller.
+ *   no-fingerprint-recorded   THE RECORD STATES NOTHING, which is what every record published
+ *                             before r28 looks like. Tolerating it is the entire reason the
+ *                             legacy path exists -- refusing it strands a real fence on every
+ *                             installation that predates the field -- so this one, and only this
+ *                             one, inherits that tolerance.
+ *   fingerprint-unverifiable  THE RECORD STATES SOMETHING AND IT CANNOT BE CHECKED: this
+ *                             connection would not report its own identity (EXECUTE on
+ *                             pg_control_system() is revocable, and an installation may have
+ *                             revoked it), or the record carries only one half of a fingerprint.
+ *                             A record that CAN be checked, against a cluster that WON'T answer,
+ *                             is not a legacy record and does not get what legacy needs. Refused
+ *                             by every arm that restores privilege or destroys the record.
+ *
+ * There is no value here that means "close enough". A caller that reads three of these four is
+ * the defect this round is about, so each one is spelt differently from all the others and none
+ * of them is the empty string.
  */
 export const CLUSTER_IDENTITY_PROVEN = 'proven'
-export const CLUSTER_IDENTITY_UNPROVEN = 'unproven'
 export const CLUSTER_IDENTITY_MISMATCH = 'mismatch'
+export const CLUSTER_IDENTITY_NO_FINGERPRINT = 'no-fingerprint-recorded'
+export const CLUSTER_IDENTITY_UNVERIFIABLE = 'fingerprint-unverifiable'
 
 export const LEGACY_FENCE_ABSENT = 'absent'
 /**
@@ -1523,10 +1547,12 @@ export async function readClusterIdentity(client) {
 /**
  * Pure: may the record in hand and the connection in hand be shown to be the same cluster?
  *
- * Three answers and they are not two. `mismatch` is POSITIVE evidence of the wrong cluster and
- * every caller refuses on it. `unproven` is the absence of evidence — a record written before
- * this round, or a server that would not report its identity — and callers must not act on it
- * as though it were `proven`; that distinction is the whole finding.
+ * FOUR ANSWERS AND THEY ARE NOT TWO, and they are not three either (o3d-secops r29, Codex HIGH 1).
+ * `mismatch` is POSITIVE evidence of the wrong cluster. `proven` is positive evidence of the
+ * right one. The remaining two are both the absence of evidence AND THEY ARE DIFFERENT ABSENCES:
+ * a record that states no fingerprint is a record from before the field existed, and a record
+ * that states one this connection cannot check is a record whose cluster simply would not answer.
+ * See the constants above for which arms tolerate which.
  */
 export function compareClusterIdentity(recorded, live) {
   const recordedSystem = typeof recorded?.cluster_system_identifier === 'string' ? recorded.cluster_system_identifier : ''
@@ -1548,15 +1574,38 @@ export function compareClusterIdentity(recorded, live) {
   if (recordedSystem && liveSystem && recordedOid && liveOid) {
     return { status: CLUSTER_IDENTITY_PROVEN, reason: `system identifier ${liveSystem}, database OID ${liveOid}` }
   }
-  if (!recordedSystem || !recordedOid) {
+  // THE RECORD STATES NOTHING. Not one half of a fingerprint is written down, which is what a
+  // validator that predates the field produces and is the ONLY case the legacy tolerance is for.
+  if (!recordedSystem && !recordedOid) {
     return {
-      status: CLUSTER_IDENTITY_UNPROVEN,
-      reason: 'the record carries no cluster fingerprint at all. It was published by a validator that predates one, so nothing in it can be compared with the cluster that just answered.',
+      status: CLUSTER_IDENTITY_NO_FINGERPRINT,
+      reason: 'the record carries no cluster fingerprint at all. It was published by a validator that predates one, so there is nothing in it to compare with the cluster that just answered.',
+    }
+  }
+  // THE RECORD STATES SOMETHING AND THE COMPARISON CANNOT BE COMPLETED. Two shapes reach here and
+  // both are refused by the arms that act, because both describe a record that COULD be checked
+  // against something that did not answer -- which is not the same as a record with nothing in it.
+  if (recordedSystem && !liveSystem) {
+    return {
+      status: CLUSTER_IDENTITY_UNVERIFIABLE,
+      reason: `the record names the cluster whose system identifier is ${recordedSystem}, and this connection would not report its own${live?.unavailable ? ` (${live.unavailable})` : ''}. The fingerprint it carries therefore has nothing to be compared against, and an identity that cannot be read is not an identity that matches.`,
+    }
+  }
+  if (!recordedSystem) {
+    return {
+      status: CLUSTER_IDENTITY_UNVERIFIABLE,
+      reason: `the record carries only the database OID (${recordedOid}) and no system identifier, so it names a database and not a cluster. An OID is unique WITHIN a cluster and says nothing BETWEEN two of them, which is exactly the case this comparison exists for.`,
+    }
+  }
+  if (!recordedOid) {
+    return {
+      status: CLUSTER_IDENTITY_UNVERIFIABLE,
+      reason: `the record names the cluster whose system identifier is ${recordedSystem} and carries no database OID beside it. Half a fingerprint is not one: the system identifier cannot see a same-named database dropped and recreated inside the cluster it names, which is the half the OID exists to supply.`,
     }
   }
   return {
-    status: CLUSTER_IDENTITY_UNPROVEN,
-    reason: `this connection would not report its own cluster identity${live?.unavailable ? ` (${live.unavailable})` : ''}, so the fingerprint the record carries has nothing to be compared against.`,
+    status: CLUSTER_IDENTITY_UNVERIFIABLE,
+    reason: `the record carries both halves of a fingerprint (system identifier ${recordedSystem}, database OID ${recordedOid}) and this connection did not report its own database OID, so the comparison cannot be completed.`,
   }
 }
 
@@ -1901,11 +1950,23 @@ async function assessFenceRequest(client, options, prefix) {
   // list here would revoke CONNECT on a cluster its fence was never raised on, and would then
   // republish over the only account of the fence still standing on the other one.
   //
-  // ABSENCE IS NOT DISAGREEMENT and is deliberately not refused here. Every record written before
-  // this round carries no fingerprint, and refusing those would break the re-fence path for every
-  // existing installation on the strength of no evidence at all. What absence costs is spelt out
-  // where it is actually dangerous -- doAuditAuthority(), where the action on the reading is a
-  // DELETE -- and there it withholds the automatic path instead.
+  // AND THERE ARE TWO KINDS OF ABSENCE, NOT ONE (o3d-secops r29, Codex HIGH 1). r28 refused only
+  // `mismatch` here and let everything else through under the name `unproven`, which handed the
+  // legacy tolerance to a case that has no claim on it:
+  //
+  //   NO FINGERPRINT RECORDED is tolerated, and that tolerance is the whole reason this branch is
+  //   soft. Every record written before r28 carries nothing to compare, and refusing those would
+  //   break the re-fence path for every existing installation on the strength of no evidence at
+  //   all. What that absence costs is spelt out in doAuditAuthority(), where the action on the
+  //   reading is a DELETE, and there it withholds the AUTOMATIC path instead of refusing.
+  //
+  //   A FINGERPRINT THAT CANNOT BE CHECKED IS REFUSED. The record states which cluster its fence
+  //   was raised on and this connection would not say which cluster it reached; that is a record
+  //   that CAN be checked against a server that WON'T answer, and it is not a legacy record. A
+  //   re-fence on that reading revokes CONNECT using a grantee list chosen for an ACL nobody can
+  //   show this is -- and then republishes over the only account of the fence possibly still
+  //   standing on the cluster the record actually names. Refusing costs a deploy; the other
+  //   direction costs the record.
   if (existing) {
     const sameCluster = compareClusterIdentity(existing, {
       systemIdentifier: facts.cluster_system_identifier,
@@ -1919,6 +1980,19 @@ async function assessFenceRequest(client, options, prefix) {
       console.error('that record here would revoke CONNECT on a cluster its fence was never raised on, and would')
       console.error('overwrite the only account of the fence that may still be standing on the other one.')
       console.error('Nothing has been revoked. Point DEPLOY_ADMIN_DATABASE_URL at the cluster the record names.')
+      return { exitCode: EXIT_NOT_FENCEABLE }
+    }
+    if (sameCluster.status === CLUSTER_IDENTITY_UNVERIFIABLE) {
+      console.error(`${prefix}: the fence record at ${options.stateFile} NAMES the cluster it was written against, and this run cannot show that this connection reached it.`)
+      console.error(`  ${sameCluster.reason}`)
+      console.error('That is NOT the legacy case. A record with no fingerprint at all is one this path still re-fences,')
+      console.error('because there is nothing in it to check; this record has something in it and the check could not be')
+      console.error('completed. Re-applying it here would revoke CONNECT from a grantee list chosen for an ACL nothing')
+      console.error('can show this is, and would then republish over the only account of the fence that may still be')
+      console.error('standing on the cluster the record names.')
+      console.error('Nothing has been revoked. Either point DEPLOY_ADMIN_DATABASE_URL at a server that will report its')
+      console.error('own identity -- GRANT EXECUTE ON FUNCTION pg_catalog.pg_control_system() TO the admin role, which')
+      console.error('is what an installation that revoked it has to restore -- or release this fence first.')
       return { exitCode: EXIT_NOT_FENCEABLE }
     }
   }
@@ -1972,12 +2046,26 @@ export async function doPlan(client, options) {
     admin_role: facts.admin_role,
     revoked,
     datacl_before: (existing ? existing.datacl_before : facts.datacl) ?? null,
-    // THE CLUSTER THIS FENCE IS BEING RAISED ON, WRITTEN DOWN (o3d-secops r28, Codex HIGH). Taken
-    // LIVE and not carried over from `existing`: the fence about to be applied is applied to the
-    // cluster this connection is attached to, and assessFenceRequest() has already refused the
-    // case where a record disagrees with it. An empty string becomes null rather than "" so that
-    // "this server would not say" and "a validator that predates the field" read identically to
-    // every consumer -- both are the absence of evidence and neither may be compared as a match.
+    // THE CLUSTER THIS FENCE IS BEING RAISED ON, WRITTEN DOWN (o3d-secops r28, Codex HIGH), AND
+    // AN EXISTING FINGERPRINT IS NEVER OVERWRITTEN WITH NOTHING (r29, Codex HIGH 1).
+    //
+    // The LIVE reading wins, and assessFenceRequest() has already refused every case where a
+    // record's fingerprint disagrees with it or cannot be checked against it -- so by the time
+    // this runs, a live value is a value proven to belong to the cluster the record names.
+    //
+    // WHAT r28 DID WITH AN EMPTY ONE WAS THE DEFECT, AND IT IS FIXED ABOVE RATHER THAN HERE.
+    // `facts.cluster_system_identifier || null` wrote null over a fingerprint the record already
+    // carried whenever this server would not report its own -- a re-fence DESTROYING the evidence
+    // that would later refuse a release on the wrong cluster, so the record came in checkable and
+    // went out legacy (Codex HIGH 1's third defect).
+    //
+    // THE FIX IS THAT THE CASE NO LONGER REACHES THIS LINE. `fingerprint-unverifiable` is refused
+    // in assessFenceRequest(), before a plan is built or a byte is written, so a record carrying a
+    // fingerprint this connection cannot confirm is not rewritten AT ALL -- which is a stronger
+    // guarantee than rewriting it carefully would be, and one a test can actually reach. Carrying
+    // `existing`'s value forward here instead would be a guard nothing can execute: every path
+    // that would use it has already returned. The null is therefore reachable only when there was
+    // never anything to keep, and it is deliberately still spelt null and not "".
     cluster_system_identifier: facts.cluster_system_identifier || null,
     cluster_database_oid: facts.database_oid || null,
     fenced_at: existing?.fenced_at || new Date().toISOString(),
@@ -2448,9 +2536,15 @@ export async function doRelease(client, options) {
   // CONNECT back to a list of roles chosen for somebody else's ACL is how a role an
   // administrator deliberately revoked here gets it back.
   //
-  // ONLY ON A MISMATCH. A record with no fingerprint is every record written before this round,
-  // and the release is the escape hatch every refusal in this file points an operator at -- a
-  // gate that closed it on the absence of evidence would strand them.
+  // AND THE ABSENCE OF EVIDENCE IS TWO DIFFERENT ABSENCES (o3d-secops r29, Codex HIGH 1). r28
+  // refused only `mismatch` here. A record with NO FINGERPRINT AT ALL is every record written
+  // before that round, and the release is the escape hatch every refusal in this file points an
+  // operator at -- a gate that closed it on nothing would strand them, so that one is still
+  // tolerated. A record that NAMES a cluster this connection will not identify is a different
+  // thing entirely: it is checkable evidence against a server that would not answer, it is not
+  // legacy, and every GRANT below would be handing database access to a list of roles chosen for
+  // an ACL nothing can show this is. That one is refused, and the refusal prints the statements
+  // an operator can run by hand, because the record is not touched and nothing is lost by it.
   const releaseCluster = await readClusterIdentity(client)
   // AN ALIAS OF ITS OWN, like every other mode's (o3d-secops r28). Two modes that ask different
   // questions must not be answerable by the same branch of anything, a test rig included -- and
@@ -2472,8 +2566,89 @@ export async function doRelease(client, options) {
     console.error('Nothing has been granted. Point DEPLOY_ADMIN_DATABASE_URL at the cluster the record names.')
     return EXIT_ERROR
   }
-
   const grants = buildGrantStatements(state.database, state.revoked)
+  if (releaseIdentity.status === CLUSTER_IDENTITY_UNVERIFIABLE) {
+    console.error(`NOT RELEASED: the fence record at ${options.stateFile} NAMES the cluster it was written against, and this run cannot show that this connection reached it.`)
+    console.error(`  ${releaseIdentity.reason}`)
+    console.error('That is NOT the legacy case, and it is the distinction this gate exists for. A record carrying no')
+    console.error('fingerprint at all is still released from here, because there is nothing in it to check. This record')
+    console.error('has something in it and the check could not be completed, so a GRANT below would hand CONNECT to a')
+    console.error('list of roles chosen for an ACL nothing can show belongs to this server.')
+    console.error('NOTHING HAS BEEN GRANTED AND THE RECORD IS UNTOUCHED, so nothing is lost by this refusal. Either:')
+    console.error('  * let the server report its own identity and re-run --')
+    console.error('    GRANT EXECUTE ON FUNCTION pg_catalog.pg_control_system() TO the admin role this connects as,')
+    console.error('    which is what an installation that revoked it from PUBLIC has to restore; or')
+    console.error('  * take the fence down by hand, as a superuser on the server you know is the fenced one:')
+    for (const statement of grants) console.error(`      ${statement}`)
+    return EXIT_ERROR
+  }
+
+  // AND IS THE FENCE THIS RECORD DESCRIBES ACTUALLY STANDING HERE (o3d-secops r29, Codex HIGH 2).
+  //
+  // THE FINDING. A PHYSICAL CLONE -- pg_basebackup, a restored snapshot, a copied data directory
+  // started as its own primary -- INHERITS BOTH HALVES OF THE FINGERPRINT. Measured on PostgreSQL
+  // 17: a clone taken before the fence reports the SAME system_identifier and the SAME database
+  // OID as the cluster it was copied from, so it reads `proven` here, while its ACL never saw the
+  // REVOKE. Releasing on it grants what is already granted, verifies happily, exits 0 -- and the
+  // wrapper then DELETES the only account of the fence still standing on the real server.
+  //
+  // AND THE TIMELINE DOES NOT SEPARATE THEM, WHICH WAS THE OBVIOUS CANDIDATE AND IS THE WRONG WAY
+  // ROUND. Measured on the same clusters: promoting a standby moves pg_control_checkpoint()'s
+  // timeline_id from 1 to 2, while a clone started directly as a primary stays on 1. Comparing it
+  // would refuse the promoted standby -- which IS the same cluster's data continuing and whose
+  // ACL the record does describe -- and pass the clone. Nothing in pg_control_system() separates
+  // them either: the whole struct is copied.
+  //
+  // WHAT DOES SEPARATE THEM IS THE FENCE'S OWN EFFECT, and it needs no new recorded field. On the
+  // cluster the fence was raised on, the roles the record names have LOST CONNECT. On a copy that
+  // never replayed that transaction they still hold it. --audit-authority has asked exactly this
+  // question since r26 and --release never did: it granted first and verified afterwards, so the
+  // one reading that could have told the two servers apart was taken only after the grants had
+  // already destroyed it.
+  //
+  // SO IT IS ASKED BEFORE THE FIRST GRANT, and `absent` -- not one recorded grantee has lost
+  // CONNECT -- is refused. WHICH WAY THIS FAILS, DELIBERATELY: on that reading there is provably
+  // nothing to restore, because every role the record names already holds CONNECT here and the
+  // GRANTs would be a no-op; the only consequential act left is root's removal of the record.
+  // Refusing therefore locks nobody out of anything, and it keeps the record -- which is the only
+  // thing a release can be built from. The reading it refuses on is also what a fence that never
+  // committed leaves, and those two are not distinguishable from here either; both want the same
+  // answer, which is that a person looks before the record is destroyed.
+  //
+  // WHAT IT DOES NOT CATCH, SAID PLAINLY: a clone taken AFTER the fence carries the fence too.
+  // Measured, again on real clusters: system identifier, database OID, timeline, the ACL itself,
+  // and even pg_database's xmin and ctid are identical to the origin's. Nothing readable
+  // separates them, no fact the fence could record at raise time would either, and this gate lets
+  // that one through. It is named here rather than left for the next round to find.
+  const { rows: standing } = await client.query(
+    `SELECT ${DATACL_PRIVILEGES_SQL} AS standing_fence_privileges FROM pg_database d WHERE d.datname = $1`,
+    [state.database],
+  )
+  const recordedGrantees = Array.isArray(state.revoked) ? state.revoked : []
+  const fenceEvidence = assessLegacyFenceEvidence({
+    recorded: recordedGrantees,
+    holding: recordedGrantees.filter((grantee) => granteeHasConnect(standing[0]?.standing_fence_privileges, grantee)),
+  })
+  if (fenceEvidence.verdict === LEGACY_FENCE_ABSENT) {
+    console.error(`NOT RELEASED: EVERY role the record at ${options.stateFile} names already holds CONNECT on "${state.database}" here.`)
+    console.error(`  the record names:      ${fenceEvidence.recorded.join(', ')}`)
+    console.error(`  all of them hold it:   ${fenceEvidence.holding.join(', ')}`)
+    console.error('The REVOKE this record describes cannot have run on the server that just answered: it names exactly')
+    console.error('these roles and not one of them has lost anything. So there is NOTHING HERE TO RELEASE -- the grants')
+    console.error('would restore what is already in place -- and the only act left would be removing the record.')
+    console.error('TWO HISTORIES END AT THIS READING and nothing here tells them apart:')
+    console.error('  * this connection reached a COPY of the fenced cluster -- a base backup, a restored snapshot, a')
+    console.error('    staging clone -- which inherits the system identifier and the database OID and so passes every')
+    console.error('    identity check above, while its ACL never saw the fence; or')
+    console.error('  * the fence this record describes never committed, and the record outlived the attempt.')
+    console.error('Both want the same answer: not this run. Nothing has been granted and the record is exactly as it')
+    console.error(`was found, so the fence it describes -- wherever it is standing -- can still be released from it.`)
+    console.error('Point DEPLOY_ADMIN_DATABASE_URL at the server you believe is fenced and re-run; if this IS that')
+    console.error('server, the fence is not standing on it and the record is resolved by the operator resolution')
+    console.error('wrapper, which removes it only after a person confirms that at the terminal.')
+    return EXIT_ERROR
+  }
+
   for (const statement of grants) {
     await client.query(statement)
     console.log(`  ${statement}`)
@@ -2614,22 +2789,28 @@ export async function doAuditAuthority(client, options) {
   // release wrapper has no grantee list to restore from and nothing can take that fence down
   // automatically. Documenting the limitation did not make the clear safe.
   //
-  // SO THE IDENTITY IS ASKED OF THE SERVER, AND THE ANSWER IS ONE OF THREE.
+  // SO THE IDENTITY IS ASKED OF THE SERVER, AND THE ANSWER IS ONE OF FOUR (o3d-secops r29).
   //
-  //   mismatch   POSITIVE EVIDENCE of the wrong cluster. Refused here, with no verdict line at
-  //              all, so the wrapper -- which acts only on a status and a verdict that agree --
-  //              leaves the record byte for byte as it found it.
-  //   proven     the record's fingerprint and this connection's agree on both halves. The
-  //              reading below is a reading of the cluster the record was written against.
-  //   unproven   THE ABSENCE OF EVIDENCE, and it is not spelt the same as `proven` anywhere.
-  //              A LEGACY RECORD IS ALWAYS THIS, by definition: it was published by a validator
-  //              that predates the field, so there is nothing in it to compare. This mode still
-  //              does its whole read and still prints its verdict -- the evidence is worth
-  //              having and an operator can act on it -- but it says `unproven` on stdout beside
-  //              the verdict, and the wrapper will not DELETE on an unproven reading without an
-  //              operator saying so. Refusing beats deleting: a record left alone keeps every
-  //              automatic path refusing, which is recoverable, and a record deleted in error
-  //              destroys the only thing the release wrapper can restore from.
+  //   mismatch                  POSITIVE EVIDENCE of the wrong cluster. Refused here, with no
+  //                             verdict line at all, so the wrapper -- which acts only on a
+  //                             status and a verdict that agree -- leaves the record byte for
+  //                             byte as it found it.
+  //   proven                    the record's fingerprint and this connection's agree on both
+  //                             halves. The reading below is a reading of the cluster the record
+  //                             was written against.
+  //   no-fingerprint-recorded   A LEGACY RECORD, by definition: published by a validator that
+  //                             predates the field, so there is nothing in it to compare.
+  //   fingerprint-unverifiable  The record names a cluster and this connection would not say
+  //                             which one it is. NOT the same fact as the line above it, and r28
+  //                             spelt them both `unproven` -- which is what let the acting arms
+  //                             treat the second as the first (Codex HIGH 1).
+  //
+  // THIS MODE REFUSES ONLY ON `mismatch` AND THAT IS DELIBERATE: it is READ-ONLY, its whole value
+  // is producing evidence a person can act on, and both kinds of absence are worth reading. What
+  // changes with the answer is what may then be done AUTOMATICALLY: the status goes to stdout
+  // beside the verdict, and the wrapper deletes without asking only on `proven`. Refusing beats
+  // deleting -- a record left alone keeps every automatic path refusing, which is recoverable,
+  // and a record deleted in error destroys the only thing the release wrapper can restore from.
   const liveCluster = await readClusterIdentity(client)
   const clusterIdentity = compareClusterIdentity(state, {
     systemIdentifier: liveCluster.systemIdentifier,
@@ -2697,6 +2878,16 @@ export async function doAuditAuthority(client, options) {
     console.error('The host, port, database name and role all match, and two servers can satisfy all four at once.')
     console.error('The reading above is therefore evidence about whatever server answered, and nothing here can')
     console.error('show that it is the one this record was written against.')
+    // AND WHICH KIND OF "NOT PROVEN" IT IS (o3d-secops r29, Codex HIGH 1). The two read the same
+    // to a wrapper that only asks whether the answer was `proven`, and they are not the same
+    // thing to the person deciding: one is a record from before the field existed, and the other
+    // is a server that has been asked and would not say -- which is fixable, in one statement.
+    if (clusterIdentity.status === CLUSTER_IDENTITY_UNVERIFIABLE) {
+      console.error('THIS IS NOT THE LEGACY CASE. The record NAMES a cluster; the check could not be completed. If this')
+      console.error('server refused to report its identity, that is recoverable without touching this record:')
+      console.error('  GRANT EXECUTE ON FUNCTION pg_catalog.pg_control_system() TO the admin role this connects as')
+      console.error('and run this again, and the answer becomes evidence instead of the absence of it.')
+    }
   }
   process.stdout.write(`legacy_fence_cluster=${clusterIdentity.status}\n`)
   // AND WHICH CLUSTER ACTUALLY ANSWERED, verbatim. The operator resolution binds its interactive

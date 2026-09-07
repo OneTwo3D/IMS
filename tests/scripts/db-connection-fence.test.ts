@@ -87,8 +87,9 @@ import {
   DATACL_PRIVILEGES_SQL,
   compareClusterIdentity,
   CLUSTER_IDENTITY_PROVEN,
-  CLUSTER_IDENTITY_UNPROVEN,
   CLUSTER_IDENTITY_MISMATCH,
+  CLUSTER_IDENTITY_NO_FINGERPRINT,
+  CLUSTER_IDENTITY_UNVERIFIABLE,
   parseRoleFromConnectionString,
   planConnectionFence,
   quoteIdent,
@@ -97,7 +98,7 @@ import {
 import { protectedLibraryLines, writeFenceCheckout } from './fence-artefact-harness.ts'
 import { Client } from 'pg'
 
-import { currentUser, freePort, startCluster } from './real-postgres-cluster.ts'
+import { cloneCluster, currentUser, freePort, startCluster } from './real-postgres-cluster.ts'
 import { shellConstant, shellFunction } from './shell-symbol.ts'
 
 /**
@@ -843,6 +844,16 @@ class FakeAdminClient {
       datacl?: ReturnType<typeof aclRows> | null
       releasedDatacl?: ReturnType<typeof aclRows> | null
       /**
+       * The ACL --release reads BEFORE its first GRANT (o3d-secops r29, Codex HIGH 2): is the
+       * fence this record describes actually standing on the server that answered?
+       *
+       * IT DEFAULTS TO THE FENCED ACL because that is what a release is FOR -- every existing
+       * release test in this file drives a record whose grantees have lost CONNECT, and a default
+       * that said otherwise would be describing a different scenario from the one those tests
+       * were written about. A test that wants the clone reading passes ACL_UNFENCED here.
+       */
+      standingDatacl?: ReturnType<typeof aclRows> | null
+      /**
        * pg_control_system().system_identifier, and pg_database.oid (o3d-secops r28). The cluster
        * fingerprint: what a record carries and what the audit compares it with. `''` is a server
        * that would not say -- which is what an installation that has not granted EXECUTE on
@@ -967,6 +978,15 @@ class FakeAdminClient {
           },
         ],
       }
+    }
+    // o3d-secops r29: --release's PRE-GRANT read, on an alias of its own so that it cannot be
+    // answered by the post-grant verification's branch below and vice versa. It is answered here
+    // rather than left to fall through to `{ rows: [] }`, because a fixture that returns nothing
+    // would make the gate that consumes it read "no grantee holds CONNECT" whatever the test set
+    // up -- the fence would look standing in every test in this file, including the ones written
+    // to prove it is not.
+    if (sql.includes('AS standing_fence_privileges')) {
+      return { rows: [{ standing_fence_privileges: this.options.standingDatacl === undefined ? ACL_FENCED : this.options.standingDatacl }] }
     }
     if (sql.includes('FROM pg_database d WHERE d.datname = $1')) {
       return { rows: [{ datacl_privileges: this.options.releasedDatacl ?? null, owner_role: 'owner' }] }
@@ -4894,6 +4914,268 @@ test('the shipped ACL query reads role names PostgreSQL has to quote, and a NULL
   }
 })
 
+// ---------------------------------------------------------------------------
+// THE TWO KINDS OF NOTHING (o3d-secops r29, Codex HIGH 1)
+//
+// r28 gave compareClusterIdentity() three answers and one of them was two facts. `unproven` meant
+// BOTH "this record states no fingerprint" AND "this record states one and the cluster would not
+// answer", and doRelease() and assessFenceRequest() both refused `mismatch` and nothing else --
+// so the second case inherited the tolerance that exists only for the first.
+// ---------------------------------------------------------------------------
+
+test('compareClusterIdentity tells a record with no fingerprint from one whose cluster would not answer (o3d-secops r29, Codex HIGH 1)', () => {
+  const FINGERPRINT = { cluster_system_identifier: '7401111111111111111', cluster_database_oid: '16400' }
+  const LIVE = { systemIdentifier: '7401111111111111111', databaseOid: '16400' }
+
+  // THE TWO ANSWERS THAT ARE EVIDENCE, so that the four below are not four spellings of "no".
+  assert.equal(compareClusterIdentity(FINGERPRINT, LIVE).status, CLUSTER_IDENTITY_PROVEN)
+  assert.equal(
+    compareClusterIdentity(FINGERPRINT, { ...LIVE, systemIdentifier: '7409999999999999999' }).status,
+    CLUSTER_IDENTITY_MISMATCH,
+    'a different cluster is positive evidence and not an absence',
+  )
+  assert.equal(
+    compareClusterIdentity(FINGERPRINT, { ...LIVE, databaseOid: '16401' }).status,
+    CLUSTER_IDENTITY_MISMATCH,
+    'and so is a same-named database dropped and recreated',
+  )
+
+  // THE FINDING. Both of these were `unproven` in r28 and they are not the same fact.
+  const legacy = compareClusterIdentity(
+    { cluster_system_identifier: null, cluster_database_oid: null },
+    LIVE,
+  )
+  assert.equal(legacy.status, CLUSTER_IDENTITY_NO_FINGERPRINT,
+    'a record published before the field existed states nothing, and that is the case the legacy path is for')
+  const denied = compareClusterIdentity(FINGERPRINT, {
+    systemIdentifier: '',
+    databaseOid: '16400',
+    unavailable: 'permission denied for function pg_control_system',
+  })
+  assert.equal(denied.status, CLUSTER_IDENTITY_UNVERIFIABLE,
+    'a record that NAMES a cluster, against a server that would not say which it is, is a different fact entirely')
+  assert.notEqual(legacy.status, denied.status,
+    'and the whole finding is that these two must not be one value')
+  assert.match(denied.reason, /would not report its own/, denied.reason)
+  assert.match(legacy.reason, /no cluster fingerprint at all/, legacy.reason)
+
+  // HALF A FINGERPRINT IS NOT A LEGACY RECORD EITHER. An OID is unique inside a cluster and says
+  // nothing between two of them, which is the case this comparison exists for -- so a record
+  // carrying one half is `unverifiable` and not `no-fingerprint-recorded`.
+  assert.equal(
+    compareClusterIdentity({ cluster_system_identifier: null, cluster_database_oid: '16400' }, LIVE).status,
+    CLUSTER_IDENTITY_UNVERIFIABLE,
+    'the OID alone names a database and not a cluster',
+  )
+  assert.equal(
+    compareClusterIdentity({ cluster_system_identifier: '7401111111111111111', cluster_database_oid: null }, LIVE).status,
+    CLUSTER_IDENTITY_UNVERIFIABLE,
+    'and the system identifier alone cannot see a database dropped and recreated inside the cluster it names',
+  )
+
+  // AND NO TWO OF THE FOUR ARE SPELT THE SAME, which is what stops a caller comparing against one
+  // of them and silently catching another.
+  assert.equal(
+    new Set([CLUSTER_IDENTITY_PROVEN, CLUSTER_IDENTITY_MISMATCH, CLUSTER_IDENTITY_NO_FINGERPRINT, CLUSTER_IDENTITY_UNVERIFIABLE]).size,
+    4,
+    'four answers, four spellings',
+  )
+})
+
+test('--release refuses a fingerprinted record whose cluster will not identify itself, and grants nothing (o3d-secops r29, Codex HIGH 1)', async (t) => {
+  const dir = stateDir(t)
+  try {
+    const stateFile = join(dir, 'db-connect-fence.json')
+    // THE RECORD NAMES ITS CLUSTER. This is not a legacy record: it went through the validator
+    // with a fingerprint, which is what every record published since r28 carries.
+    publishStandingAuthority(stateFile, {
+      ...SAMPLE_STATE,
+      cluster_system_identifier: '7401111111111111111',
+      cluster_database_oid: '16400',
+    })
+    const before = readFileSync(stateFile, 'utf8')
+    // AND THE SERVER WILL NOT SAY WHICH CLUSTER IT IS. EXECUTE on pg_control_system() is
+    // revocable, so this is a real configuration and not a contrived one -- and it is precisely
+    // the reading r28 spelt `unproven` and then released on.
+    const client = new FakeAdminClient({
+      stateFile,
+      systemIdentifierError: 'permission denied for function pg_control_system',
+      databaseOid: '16400',
+      releasedDatacl: ACL_UNFENCED,
+    })
+    const code = await withAdminUrl(() =>
+      doRelease(client as never, { stateFile, appRole: 'imsapp', ...suppliedIdentity({ appDatabase: 'imsdb' }) }),
+    )
+
+    // MUTATION ROUTE: delete the `releaseIdentity.status === CLUSTER_IDENTITY_UNVERIFIABLE` arm
+    // from doRelease() -- which is r28's code exactly -- and this exits 0 with two GRANTs sent.
+    assert.equal(code, EXIT_ERROR, 'an identity that cannot be read is not an identity that matches')
+    assert.deepEqual(client.grants, [],
+      'and NOT ONE GRANT may reach a server that would not say whether it is the fenced one')
+    assert.equal(readFileSync(stateFile, 'utf8'), before,
+      'and the record -- the only thing a release can be built from -- must be untouched')
+    assert.ok(client.log.some((sql) => sql.includes('FROM pg_catalog.pg_control_system()')),
+      'it must have ASKED, rather than assuming the answer was unavailable')
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('--release still releases a genuinely legacy record on that same silent server (o3d-secops r29, Codex HIGH 1)', async (t) => {
+  const dir = stateDir(t)
+  try {
+    const stateFile = join(dir, 'db-connect-fence.json')
+    // NO FINGERPRINT AT ALL: what every record published before r28 looks like. The server is the
+    // SAME one as the test above -- it still will not report its identity -- so the only thing
+    // that differs between the two is which kind of nothing the record carries. Without this the
+    // gate above could be a gate that refuses everything.
+    publishStandingAuthority(stateFile, SAMPLE_STATE)
+    assert.equal(JSON.parse(readFileSync(stateFile, 'utf8')).cluster_system_identifier, null,
+      'precondition: a legacy record states no cluster')
+    const client = new FakeAdminClient({
+      stateFile,
+      systemIdentifierError: 'permission denied for function pg_control_system',
+      releasedDatacl: ACL_UNFENCED,
+    })
+    const code = await withAdminUrl(() =>
+      doRelease(client as never, { stateFile, appRole: 'imsapp', ...suppliedIdentity({ appDatabase: 'imsdb' }) }),
+    )
+
+    // MUTATION ROUTE: make compareClusterIdentity() return CLUSTER_IDENTITY_UNVERIFIABLE where it
+    // returns CLUSTER_IDENTITY_NO_FINGERPRINT -- i.e. collapse the two absences the other way --
+    // and this refuses, stranding every installation that predates the fingerprint.
+    assert.equal(code, EXIT_OK, 'the legacy path is the whole reason the tolerance exists')
+    assert.deepEqual(client.grants, [
+      'GRANT CONNECT ON DATABASE "imsdb" TO PUBLIC;',
+      'GRANT CONNECT ON DATABASE "imsdb" TO "imsapp";',
+    ], 'and it must restore exactly the recorded grantees')
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('--release on a proven cluster with the fence standing still works (o3d-secops r29 control)', async (t) => {
+  const dir = stateDir(t)
+  try {
+    const stateFile = join(dir, 'db-connect-fence.json')
+    publishStandingAuthority(stateFile, {
+      ...SAMPLE_STATE,
+      cluster_system_identifier: '7401111111111111111',
+      cluster_database_oid: '16400',
+    })
+    // EVERYTHING AGREES: the record names this cluster, this cluster says so, and the fence it
+    // describes is standing on it. This is the ordinary release, and neither gate added this
+    // round may touch it.
+    const client = new FakeAdminClient({
+      stateFile,
+      systemIdentifier: '7401111111111111111',
+      databaseOid: '16400',
+      standingDatacl: ACL_FENCED,
+      releasedDatacl: ACL_UNFENCED,
+    })
+    const code = await withAdminUrl(() =>
+      doRelease(client as never, { stateFile, appRole: 'imsapp', ...suppliedIdentity({ appDatabase: 'imsdb' }) }),
+    )
+
+    assert.equal(code, EXIT_OK, 'an ordinary release must still be an ordinary release')
+    assert.deepEqual(client.grants, [
+      'GRANT CONNECT ON DATABASE "imsdb" TO PUBLIC;',
+      'GRANT CONNECT ON DATABASE "imsdb" TO "imsapp";',
+    ])
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('a re-fence over a fingerprinted record refuses when the cluster will not identify itself, and still re-fences a legacy one (o3d-secops r29, Codex HIGH 1)', async (t) => {
+  const dir = stateDir(t)
+  // BOTH HALVES ARE DRIVEN AS A RECOVERY RE-FENCE -- stamped applied, then published over, so
+  // root marks the record `recovery` and the drift rule accepts an ACL whose grantees have
+  // already lost CONNECT. That shape matters: a re-fence refused by the DRIFT rule would satisfy
+  // "nothing was revoked" just as well as one refused by the cluster gate, and the test would be
+  // measuring a refusal it did not cause. The refusal is therefore read as well as counted.
+  const recovery = (stateFile: string, record: Record<string, unknown>) => {
+    publishStandingAuthority(stateFile, record)
+    publishAuthority(stateFile, record)
+    assert.equal(JSON.parse(readFileSync(stateFile, 'utf8')).fence_mode, FENCE_MODE_RECOVERY,
+      'precondition: this must be the recovery rule, or the drift rule is what refuses below')
+  }
+  // STDERR ONLY, DELIBERATELY. Every refusal below is console.error, and stdout is where the test
+  // runner writes its own results -- a capture that swallowed those would silently delete other
+  // tests' output from the report rather than failing.
+  const said = async (run: () => Promise<number>) => {
+    const lines: string[] = []
+    const stderr = process.stderr.write.bind(process.stderr)
+    process.stderr.write = ((chunk: string) => { lines.push(String(chunk)); return true }) as typeof process.stderr.write
+    try {
+      return { code: await run(), output: lines.join('') }
+    } finally {
+      process.stderr.write = stderr
+    }
+  }
+  try {
+    // 1. THE RECORD NAMES A CLUSTER AND THE SERVER WILL NOT. r28 refused only `mismatch` here too,
+    //    so this re-applied the record's grantee list to an ACL nothing could show it belonged to
+    //    -- and then republished over the only account of a fence possibly standing elsewhere.
+    const fingerprinted = join(dir, 'fingerprinted.json')
+    // THE OWNER IS IN THE RECORDED LIST because ACL_FENCED leaves the owner holding CONNECT, and
+    // a grantee holding CONNECT that the record does not name is DRIFT -- a refusal from a
+    // different rule, which would make this test measure that one instead.
+    const RECOVERABLE = { ...SAMPLE_STATE, revoked: ['PUBLIC', 'owner', 'imsapp'] }
+    recovery(fingerprinted, {
+      ...RECOVERABLE,
+      cluster_system_identifier: '7401111111111111111',
+      cluster_database_oid: '16400',
+    })
+    const before = readFileSync(fingerprinted, 'utf8')
+    const silent = new FakeAdminClient({
+      stateFile: fingerprinted,
+      systemIdentifierError: 'permission denied for function pg_control_system',
+      databaseOid: '16400',
+      datacl: ACL_FENCED,
+      stillConnectsBefore: false,
+    })
+    const refused = await said(() => withAdminUrl(() =>
+      doFence(silent as never, { stateFile: fingerprinted, appRole: 'imsapp', timeoutSeconds: 1, ...suppliedIdentity({ appDatabase: 'imsdb' }) }),
+    ))
+
+    // MUTATION ROUTE: delete the CLUSTER_IDENTITY_UNVERIFIABLE arm from assessFenceRequest() --
+    // which leaves r28's code exactly -- and this exits 0 with three REVOKEs sent.
+    assert.equal(refused.code, EXIT_NOT_FENCEABLE, `a record that names a cluster may not be re-applied to an unnamed one:\n${refused.output}`)
+    assert.deepEqual(silent.revokes, [], 'and nothing may be revoked on the strength of it')
+    // AND IT MUST BE THIS GATE THAT REFUSED, not the drift rule and not the mode rule.
+    assert.match(refused.output, /NAMES the cluster it was written against/, refused.output)
+    assert.match(refused.output, /NOT the legacy case/, `it must say which of the two absences this is:\n${refused.output}`)
+    assert.equal(readFileSync(fingerprinted, 'utf8'), before,
+      'and the fingerprint it carries must NOT be overwritten with the null this server would have supplied')
+
+    // 2. AND THE LEGACY RECORD STILL RE-FENCES ON THE SAME SILENT SERVER. Same connection, same
+    //    denial, same recovery shape; only the record differs. Without this the assertion above is
+    //    satisfied by a gate that refuses every re-fence.
+    const legacy = join(dir, 'legacy.json')
+    recovery(legacy, RECOVERABLE)
+    assert.equal(JSON.parse(readFileSync(legacy, 'utf8')).cluster_system_identifier, null,
+      'precondition: a legacy record states no cluster')
+    const legacyClient = new FakeAdminClient({
+      stateFile: legacy,
+      systemIdentifierError: 'permission denied for function pg_control_system',
+      datacl: ACL_FENCED,
+      stillConnectsBefore: false,
+    })
+    const applied = await said(() => withAdminUrl(() =>
+      doFence(legacyClient as never, { stateFile: legacy, appRole: 'imsapp', timeoutSeconds: 1, ...suppliedIdentity({ appDatabase: 'imsdb' }) }),
+    ))
+    assert.equal(applied.code, EXIT_OK, `the legacy re-fence path must survive this round intact:\n${applied.output}`)
+    assert.deepEqual(legacyClient.revokes, [
+      'REVOKE CONNECT ON DATABASE "imsdb" FROM PUBLIC;',
+      'REVOKE CONNECT ON DATABASE "imsdb" FROM "owner";',
+      'REVOKE CONNECT ON DATABASE "imsdb" FROM "imsapp";',
+    ], 'and it must actually revoke the recorded list')
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
 test('a same-named database on a DIFFERENT CLUSTER does not clear the record (o3d-secops r28, Codex HIGH 1)', async (t) => {
   const root = mkdtempSync(join(tmpdir(), 'ims-fence-two-'))
   const dir = stateDir(t)
@@ -5022,6 +5304,165 @@ test('a same-named database on a DIFFERENT CLUSTER does not clear the record (o3
     real?.stop()
     bystander?.stop()
     rmSync(root, { recursive: true, force: true })
+    if (previousAdmin === undefined) delete process.env.DEPLOY_ADMIN_DATABASE_URL
+    else process.env.DEPLOY_ADMIN_DATABASE_URL = previousAdmin
+    if (previousApp === undefined) delete process.env.DATABASE_URL
+    else process.env.DATABASE_URL = previousApp
+  }
+})
+
+test('a PHYSICAL CLONE carries the whole fingerprint, and a release on it is refused (o3d-secops r29, Codex HIGH 2)', async (t) => {
+  // WHAT THIS MEASURES, AND WHY IT NEEDS REAL SERVERS. The r28 fingerprint -- system identifier
+  // plus database OID -- was introduced to tell a DIFFERENT cluster apart from the fenced one. It
+  // cannot tell a COPY of the fenced cluster apart from it: pg_basebackup, a restored snapshot and
+  // a copied data directory all inherit both halves by construction. So the identity gate says
+  // `proven` on a staging clone whose ACL never saw the REVOKE, --release grants what is already
+  // granted, verifies happily, exits 0, and the wrapper deletes the only account of the fence
+  // still standing on the real server.
+  //
+  // AND THE CANDIDATE THAT LOOKS LIKE THE ANSWER IS THE WRONG WAY ROUND. The timeline id is
+  // asserted below precisely because it does NOT separate them: a clone started as its own
+  // primary keeps the source's timeline, while promoting a standby -- the case that IS the same
+  // cluster's data continuing, and whose ACL the record does describe -- moves it. Comparing it
+  // would refuse the legitimate failover and pass the clone.
+  const root = mkdtempSync(join(tmpdir(), 'ims-fence-clone-'))
+  const dir = stateDir(t)
+  const stateFile = join(dir, 'db-connect-fence.json')
+  const port = await freePort()
+  const me = currentUser()
+  let origin: ReturnType<typeof startCluster> | undefined
+  let staleClone: ReturnType<typeof startCluster> | undefined
+  let postFenceClone: ReturnType<typeof startCluster> | undefined
+  const previousAdmin = process.env.DEPLOY_ADMIN_DATABASE_URL
+  const previousApp = process.env.DATABASE_URL
+  try {
+    // ONE PORT, THREE CLUSTERS -- the origin binds TCP and the copies bind none, which is how the
+    // URL can name the right server while the connection lands on a copy. `local replication` is
+    // needed because a `local all` rule does not match a replication connection.
+    origin = startCluster(root, 'origin', port, '127.0.0.1', ['local replication all trust'])
+    origin.psql(['-c', 'CREATE ROLE owner_role LOGIN'])
+    origin.psql(['-c', 'CREATE ROLE imsapp LOGIN'])
+    origin.psql(['-c', 'CREATE DATABASE imsdb OWNER owner_role'])
+    origin.psql(['-c', 'GRANT CONNECT ON DATABASE imsdb TO imsapp'])
+
+    // THE COPY IS TAKEN BEFORE THE FENCE, which is the whole of the finding: it is a copy that
+    // never replayed the transaction the record describes.
+    staleClone = cloneCluster(root, origin, 'stale', port)
+
+    origin.psql(['-c', 'REVOKE CONNECT ON DATABASE imsdb FROM PUBLIC'])
+    origin.psql(['-c', 'REVOKE CONNECT ON DATABASE imsdb FROM imsapp'])
+    // AND A SECOND COPY AFTER IT, for the residual this gate does NOT close (below).
+    postFenceClone = cloneCluster(root, origin, 'after', port)
+
+    const identityOf = (cluster: ReturnType<typeof startCluster>) => ({
+      systemIdentifier: cluster.psql(['-c', 'SELECT system_identifier::text FROM pg_control_system()']),
+      databaseOid: cluster.psql(['-c', "SELECT oid::text FROM pg_database WHERE datname = 'imsdb'"]),
+      timeline: cluster.psql(['-c', 'SELECT timeline_id::text FROM pg_control_checkpoint()']),
+      appConnects: cluster.psql(['-c', "SELECT has_database_privilege('imsapp','imsdb','CONNECT')::text"]),
+    })
+    const originIdentity = identityOf(origin)
+    const cloneIdentity = identityOf(staleClone)
+
+    // THE MEASUREMENT. Every value the r28 gate compares is identical on the copy.
+    assert.equal(cloneIdentity.systemIdentifier, originIdentity.systemIdentifier,
+      'a physical clone inherits the system identifier initdb stamped into pg_control')
+    assert.equal(cloneIdentity.databaseOid, originIdentity.databaseOid,
+      'and the database OID, so BOTH halves of the fingerprint say the same thing')
+    assert.equal(cloneIdentity.timeline, originIdentity.timeline,
+      'and the timeline too, when it is started as its own primary rather than promoted -- which is why the timeline cannot be the discriminator')
+    assert.equal(cloneIdentity.appConnects, 'true',
+      'and its ACL never saw the REVOKE: this is the "proven" cluster that is not fenced')
+    assert.equal(originIdentity.appConnects, 'false', 'precondition: the origin IS fenced')
+
+    // THE RECORD, CARRYING THE ORIGIN'S FINGERPRINT AND STAMPED APPLIED: what a fence raised
+    // since r28 leaves behind.
+    publishStandingAuthority(stateFile, {
+      ...SAMPLE_STATE,
+      database: 'imsdb',
+      owner_role: 'owner_role',
+      app_role: 'imsapp',
+      revoked: [PUBLIC_GRANTEE, 'imsapp'],
+      cluster_system_identifier: originIdentity.systemIdentifier,
+      cluster_database_oid: originIdentity.databaseOid,
+    })
+    const untouched = readFileSync(stateFile, 'utf8')
+
+    // AND THE IDENTITY GATE ALONE WOULD LET IT THROUGH. Without this the test below could be
+    // passing because of the fingerprint rather than in spite of it.
+    assert.equal(
+      compareClusterIdentity(JSON.parse(untouched), cloneIdentity).status,
+      CLUSTER_IDENTITY_PROVEN,
+      'the clone satisfies the r28 fingerprint completely, which is the finding',
+    )
+
+    process.env.DEPLOY_ADMIN_DATABASE_URL = `postgres://${me}@127.0.0.1:${port}/imsdb`
+    process.env.DATABASE_URL = `postgres://imsapp@127.0.0.1:${port}/imsdb`
+    // EVERY STATEMENT THE RELEASE SENDS IS RECORDED. "The ACL did not change" would prove nothing
+    // here: the clone already grants what the release would grant, so its GRANTs are no-ops that
+    // leave the ACL text identical. What has to be shown is that they were never SENT.
+    const release = async (cluster: ReturnType<typeof startCluster>) => {
+      const client = new Client({ host: cluster.socket, port, database: 'imsdb', user: me })
+      await client.connect()
+      const sent: string[] = []
+      const query = client.query.bind(client)
+      ;(client as unknown as { query: (...args: unknown[]) => unknown }).query = (...args: unknown[]) => {
+        sent.push(String(args[0]))
+        return (query as (...a: unknown[]) => unknown)(...args)
+      }
+      const lines: string[] = []
+      const stderr = process.stderr.write.bind(process.stderr)
+      process.stderr.write = ((chunk: string) => { lines.push(String(chunk)); return true }) as typeof process.stderr.write
+      try {
+        const code = await doRelease(client as never, {
+          stateFile, appRole: 'imsapp',
+          ...suppliedIdentity({ appHost: '127.0.0.1', appPort: String(port), appUser: 'imsapp', appDatabase: 'imsdb' }),
+        })
+        return { code, said: lines.join(''), grants: sent.filter((sql) => sql.trim().startsWith('GRANT')) }
+      } finally {
+        process.stderr.write = stderr
+        await client.end()
+      }
+    }
+
+    // MUTATION ROUTE: delete the LEGACY_FENCE_ABSENT arm from doRelease() -- leaving r28's code --
+    // and this exits 0, grants on the clone, and reports the fence released.
+    const onTheClone = await release(staleClone)
+    assert.equal(onTheClone.code, EXIT_ERROR, `a copy that never saw the fence must not be released on:\n${onTheClone.said}`)
+    assert.match(onTheClone.said, /already holds CONNECT/, onTheClone.said)
+    assert.match(onTheClone.said, /COPY of the fenced cluster/, `and it must name what it may be looking at:\n${onTheClone.said}`)
+    assert.equal(readFileSync(stateFile, 'utf8'), untouched,
+      'and the record the real fence is released from must be byte for byte what it was')
+    assert.deepEqual(onTheClone.grants, [],
+      'and NOT ONE GRANT may be sent to it -- on this server they would be silent no-ops, which is why the statements and not the ACL are what is counted')
+    assert.equal(origin.psql(['-c', "SELECT has_database_privilege('imsapp','imsdb','CONNECT')::text"]), 'false',
+      'and the fence on the ORIGIN is untouched by a run that was pointed at the copy')
+
+    // AND THE ORIGIN STILL RELEASES, which is what makes the refusal above a discrimination rather
+    // than a gate that refuses everything.
+    const onTheOrigin = await release(origin)
+    assert.equal(onTheOrigin.code, EXIT_OK, `the cluster the fence IS standing on must still release:\n${onTheOrigin.said}`)
+    assert.deepEqual(onTheOrigin.grants, [
+      'GRANT CONNECT ON DATABASE "imsdb" TO PUBLIC;',
+      'GRANT CONNECT ON DATABASE "imsdb" TO "imsapp";',
+    ], 'sending exactly the recorded list')
+    assert.equal(origin.psql(['-c', "SELECT has_database_privilege('imsapp','imsdb','CONNECT')::text"]), 'true',
+      'and the application must actually get CONNECT back')
+
+    // THE RESIDUAL, ASSERTED RATHER THAN CLAIMED (o3d-secops r29). A copy taken AFTER the fence
+    // carries the fence too, so it agrees with the origin on the fingerprint AND on the ACL, and
+    // nothing readable separates the two. This gate does not close that case and nothing measured
+    // here could: the assertions below are the evidence for saying so.
+    const afterIdentity = identityOf(postFenceClone)
+    assert.equal(afterIdentity.systemIdentifier, originIdentity.systemIdentifier, 'same cluster identity')
+    assert.equal(afterIdentity.databaseOid, originIdentity.databaseOid, 'same database OID')
+    assert.equal(afterIdentity.appConnects, 'false',
+      'and the fence itself was copied with it, so the one fact that separates a STALE clone from the fenced cluster says nothing about this one')
+  } finally {
+    staleClone?.stop()
+    postFenceClone?.stop()
+    origin?.stop()
+    rmSync(root, { recursive: true, force: true })
+    rmSync(dir, { recursive: true, force: true })
     if (previousAdmin === undefined) delete process.env.DEPLOY_ADMIN_DATABASE_URL
     else process.env.DEPLOY_ADMIN_DATABASE_URL = previousAdmin
     if (previousApp === undefined) delete process.env.DATABASE_URL

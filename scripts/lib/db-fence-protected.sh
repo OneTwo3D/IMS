@@ -2445,7 +2445,20 @@ resolve_legacy_fence() {
     if [[ "${cluster}" != "proven" ]]; then
       echo "" >&2
       echo "AND THAT READING CANNOT BE ATTRIBUTED TO THE CLUSTER THIS RECORD WAS WRITTEN AGAINST." >&2
-      echo "The host, port, database name and role all match; two servers can satisfy all four at once, and this record carries no cluster fingerprint to settle it -- which is what every record published before this round looks like." >&2
+      echo "The host, port, database name and role all match, and two servers can satisfy all four at once." >&2
+      # WHICH KIND OF "not proven" (o3d-secops r29, Codex HIGH 1). r28 printed one sentence here
+      # and it described the LEGACY record -- "carries no cluster fingerprint" -- for both of the
+      # helper's two absences. The other one is a record that DOES name a cluster against a server
+      # that would not identify itself, and telling an operator that record carries no fingerprint
+      # is telling them something untrue about the evidence they are about to act on.
+      case "${cluster}" in
+        fingerprint-unverifiable)
+          echo "This record DOES name the cluster its fence was raised on. What is missing is the other half of the comparison: the server that answered would not report its own identity, so the fingerprint in the record had nothing to be checked against. THAT IS NOT THE LEGACY CASE, and it is usually one statement away from being settled -- GRANT EXECUTE ON FUNCTION pg_catalog.pg_control_system() TO the admin role in DEPLOY_ADMIN_DATABASE_URL, then run this again and read a proven answer instead of this one." >&2
+          ;;
+        *)
+          echo "This record carries no cluster fingerprint at all to settle it, which is what every record published before this round looks like." >&2
+          ;;
+      esac
       echo "An unfenced bystander cluster reachable at the same name produces EXACTLY the reading above. Removing the record on it would destroy the only account of what a fence still standing on the real cluster revoked, and ${sudo_prefix}${release_wrapper} would then have no grantee list to restore from." >&2
       if [[ "${confirmed_clear}" -ne 1 ]]; then
         echo "" >&2
@@ -2493,6 +2506,14 @@ resolve_legacy_fence() {
     echo "  record digest:   ${digest}" >&2
     echo "  cluster audited: ${identity:-<this server would not say>}" >&2
     echo "This licenses a later ${sudo_prefix}${release_wrapper} to GRANT CONNECT back to every role printed above." >&2
+    # AND THIS ARM READS THE CLUSTER VERDICT TOO (o3d-secops r29, Codex HIGH 1). r28 consulted it
+    # only on the clear arm. Stamping does not destroy the record, and it is never automatic --
+    # it takes the explicit argument above AND a token typed at this terminal that already binds
+    # the audited identity -- so the verdict does not GATE anything here. It is disclosed, because
+    # the operator is being asked to license a GRANT on a server this run could not name.
+    if [[ "${cluster}" != "proven" ]]; then
+      echo "  NOTE: which cluster that reading came from is NOT PROVEN (${cluster:-<none>}). The roles above were read from whatever server answered; confirm below only if you know it is the one this record was written against." >&2
+    fi
     operator_confirms stamp "$(decision_token stamp "${digest}" "${identity}")" || return 1
     echo "CONFIRMED BY THE OPERATOR: the fence this record describes is what took CONNECT from those roles. Stamping it applied." >&2
     if ! env -u NODE_OPTIONS -u NODE_PATH -u NODE_REPL_EXTERNAL_MODULE \
