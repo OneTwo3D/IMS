@@ -6907,13 +6907,14 @@ release_db_connections() {
       # `release_db_connections || die` with the schema migrated and nothing started. Measured on
       # all three entrypoints, not reasoned about.
       #
-      # THE ONE READING THAT IS STILL FATAL is the one r31 bought: a challenge WAS put to a live
-      # witness and the release's own connection could NOT see it. That release may have landed on
-      # a copy while the real server is still fenced, and starting the application on the strength
-      # of it is the thing the witness exists to prevent. Everything else -- no witness to
-      # challenge, or a record this run did not raise -- leaves the grants restored, the record
-      # standing and a person to end it, which is what every message on that path already says.
-      if [[ "${#witness_argv[@]}" -gt 0 ]]; then
+      # THE ONE READING THAT IS STILL FATAL is the one r31 bought, and it is stated as exactly that
+      # and nothing wider: a challenge WAS put to a live witness AND the answer was not
+      # "same-server-as-the-fence". That release may have landed on a copy while the real server is
+      # still fenced, and starting the application on the strength of it is the thing the witness
+      # exists to prevent. Everything else -- no witness to challenge, or a record this run did
+      # not RAISE -- leaves the grants restored, the record standing and a person to end it, which
+      # is what every message on that path already says.
+      if [[ "${#witness_argv[@]}" -gt 0 && -z "${clear_server}" ]]; then
         error "The connection fence WAS released -- CONNECT is restored -- and its record at ${DB_FENCE_STATE} was deliberately NOT removed (the reason is printed above). A challenge WAS put to this run's witness and the release's own connection could not see it, so nothing here can show that the server just released is the server that was fenced. The next run reads that file as a STANDING FENCE. End it with ${DB_FENCE_RELEASE_CMD}, which asks you to confirm at your terminal."
         return 1
       fi

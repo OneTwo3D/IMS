@@ -4027,10 +4027,13 @@ release_db_connections() {
       # degraded mode this whole subsystem promises not to refuse, died at
       # `release_db_connections || die` with the schema migrated and nothing started.
       #
-      # THE ONE READING THAT IS STILL FATAL is the one r31 bought: a challenge WAS put to a live
-      # witness and the release's own connection could NOT see it, so the release may have landed
-      # on a copy while the real server is still fenced.
-      if [[ "${#witness_argv[@]}" -gt 0 ]]; then
+      # THE ONE READING THAT IS STILL FATAL is the one r31 bought, and it is stated as exactly that
+      # and nothing wider: a challenge WAS put to a live witness AND the answer was not
+      # "same-server-as-the-fence", so that release may have landed on a copy while the real
+      # server is still fenced. A record this run did not RAISE is a different fact and is not
+      # fatal: the grants are back either way, and nothing about it says the release landed
+      # somewhere else.
+      if [[ "${#witness_argv[@]}" -gt 0 && -z "${clear_server}" ]]; then
         error "The connection fence WAS released -- CONNECT is restored -- and its record at ${DB_FENCE_STATE} was deliberately NOT removed (the reason is printed above). A challenge WAS put to this run's witness and the release's own connection could not see it, so nothing here can show that the server just released is the server that was fenced. The next run reads that file as a STANDING FENCE. End it with ${DB_FENCE_RELEASE_CMD}, which asks you to confirm at your terminal."
         return 1
       fi

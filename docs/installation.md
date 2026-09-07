@@ -3336,6 +3336,7 @@ Three questions are asked of it, each **on the asking process's own connection**
 | --- | --- | --- |
 | `--fence` | can this backend, one statement from issuing the `REVOKE`s, see the lock? | nothing. The fence goes up; the run loses only the **automatic removal** of its own fence record. |
 | `--bind-migration`, before any DDL | can a connection opened with the **migration's own URL** see it, and did that URL's stamp survive? | the cutover **refuses**. Nothing has been migrated and the schema is untouched. |
+| `--bind-migration`, after **each** consumer (a *pin*) | can a connection opened with that step's own URL still see it? | the cutover **refuses**, naming the step. The schema may have moved, so the fence is held and nothing starts. |
 | `--bind-migration --hold-stamp`, after the last consumer | the same, plus: can the witness's sampler **see** this connection? | the cutover **refuses** before the new build starts. The fence is held and its record kept. |
 | `--release` | can the backend that just granted see a lock taken *at release time*? | the fence is still released; the **record is kept** for a person to end with the release wrapper. |
 
@@ -3343,12 +3344,35 @@ Three questions are asked of it, each **on the asking process's own connection**
 `application_name=ims-migration-<nonce>` into the migration URL beside the existing
 `options=-c role=<app role>`, so every consumer of `MIGRATION_DATABASE_URL` carries it — `prisma
 migrate deploy`, `scripts/check-prisma-drift.mjs`, `pg_dump`, `scripts/check-app-db-object-access.mjs`
-and `scripts/run-migration-verifications.mjs`. It is a **connection parameter and not a third `-c`**:
+and `scripts/run-migration-verifications.mjs`, plus `npm run db:seed` and
+`scripts/provision-instance.mjs` on `install.sh`. It is a **connection parameter and not a third `-c`**:
 measured on PostgreSQL 17.11, libpq applies the GUCs in `options` *before* the startup packet's
 `application_name` (or the client's own `fallback_application_name`), so `options=-c
 application_name=…` is silently overridden and would have shipped a binding that never binds.
 PostgreSQL truncates `application_name` at 63 bytes; the composer **refuses** to emit a stamp that
 would be truncated, because a truncated stamp reads as *absent* and absent reads as a redirect.
+
+**Every consumer is placed, not just the window (o3d-secops r33).** Each of the steps above is
+followed by a **pin** — a `--bind-migration` opened on that step's own connection string,
+immediately after it — so the window reads
+
+```
+opening bind -> consumer -> pin -> consumer -> pin -> … -> consumer -> closing gate
+```
+
+and every consumer runs *between two connections that were proved to reach the fenced instance*.
+Before r33 the closing gate was the only question asked after the migration, and it asked whether
+the sampler had seen **any** backend wearing the shared stamp — so one correctly routed connection
+certified all the others, and `pg_dump` could take `update.sh`'s restore point from a different
+cluster with every gate green. A per-consumer *sighting* cannot replace the pin: polling is
+measured not to promise the observation of a 40 ms connection, so requiring one sighting per
+consumer would refuse ordinary cutovers. The pins cost one short-lived connection per step and are
+a no-op on any run with no fence standing.
+
+The residual, stated plainly: a redirect that begins **and** reverts inside a single consumer's own
+execution is still caught only by the sampler, so only probabilistically. Closing that completely
+needs the server to record every login — a login event trigger, a superuser DDL change to the
+customer's database, and a lockout risk if it ever fails.
 
 **What the witness's sampler is, and is not.** While the window is open the witness polls
 `pg_stat_activity` (cluster-wide, so it sees the fenced database from outside it) for that exact
@@ -3356,9 +3380,23 @@ stamp and accumulates the distinct backends it saw. That is *evidence about the 
 connections* — but it is **not** what the refusal rests on, and deliberately: measured, a warm
 `prisma migrate status` connects, reads and disconnects inside about 40 ms, and polling cannot
 promise to observe a connection somebody else opens and closes. A gate that refused on a missed
-sample would refuse ordinary cutovers. So the refusal rests on the `--hold-stamp` probe, whose
-lifetime the cutover controls; the sampler's count of the *migration's* own backends is reported,
-and when it is zero the run says so and **keeps the fence record** for a person, without failing.
+sample would refuse ordinary cutovers. So the refusal rests on the `--hold-stamp` probe and on the
+pins, whose lifetimes the cutover controls; the sampler's count is reported, and when it is zero
+the run says so and **keeps the fence record** for a person, without failing. A pin is deliberately
+*not countable* — it renames its own backend to `ims-deploy-fence-bind` the instant it connects —
+because otherwise the sixteen probes a run now opens would satisfy that evidence by observing
+themselves.
+
+**"The record is kept" never means "the run failed" (o3d-secops r33).** Both degraded readings —
+the sampler saw nothing, and there was no witness to ask — cost the **automatic removal of the
+fence record and nothing else**. The run finishes, the fence is released, the application starts,
+and the record is left for a person with the release wrapper; the next run adopts it. Until r33
+neither of them did that: the sampler-miss path lowered the same flag that means *there is no
+witness*, so the release issued no challenge and returned failure two steps later, and the
+no-witness path — every host behind a transaction-mode pooler — hit the same wall on all three
+entrypoints. The one reading that is still fatal is the one the witness exists for: a challenge
+**was** put to a live witness and the release's own connection could **not** see it, which is a
+release that may have landed on a copy while the real server is still fenced.
 
 **What an operator sees when the nonce cannot be seen.** A redirect and a lost witness are not
 distinguishable, and the message says so. Before any DDL the run stops with `THE MIGRATION WOULD
