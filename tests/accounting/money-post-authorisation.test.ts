@@ -719,6 +719,67 @@ test('an undescribable row still posts against a ledger that positively holds NO
   )
 })
 
+test('[o3d-zo4j] an undescribable row may not post on an EMPTY list from a contradicted reading', async () => {
+  // THE GATE r31 REMOVED, PUT BACK BECAUSE IT NOW HAS INPUTS.
+  //
+  // This branch is the one place outside `classifyLedgerSettlement` that reads a conclusion straight
+  // out of a record list, and it reads the strongest one: an empty list means "nothing here could be
+  // confused with this attempt", and the row POSTS. r31 showed `records.length > 0` caught every
+  // unproved probe, because the only unproved shape then was one `settlementAnswer` refuses outright.
+  //
+  // o3d-zo4j adds a second: a collection that EXCEEDS the figure certifying it. That one is reached
+  // with the figure STATED, so nothing refuses it, and its record list can be empty — this invoice
+  // says nothing has settled it (`Total 100 / AmountDue 100`) while itemising 30 of credit applied.
+  // The length test sees zero records and would authorise the post on a reading the probe has just
+  // said is not to be trusted as whole.
+  //
+  // ROUTE: authoriseMoneyPost -> no contenders -> `classifyLedgerSettlement` returns
+  //        `unknown` / `attempt-undescribable` (the payload states no amount), which falls through to
+  //        this branch -> `probe.ok && !probe.provedComplete && probe.records.length === 0`.
+  // MUTATION: delete that arm. The verdict below becomes `{ proceed: true }` and the money post goes
+  //        out — measured.
+  xeroCalls.length = 0
+  xeroResponse = {
+    Invoices: [{
+      InvoiceID: 'inv-1',
+      Total: 100, AmountDue: 100, AmountPaid: 0, AmountCredited: 0,
+      Payments: [],
+      CreditNotes: [{ AppliedAmount: 30 }],
+    }],
+  }
+  const noAmount = { accountingInvoiceId: 'inv-1', bankAccountId: 'bank-1', paymentDate: '2026-08-01' }
+  const { db } = dbDouble([{ id: 'log-1', remoteAttemptedAt: null, payload: noAmount }])
+  const verdict = await (await load())({ ...payment, entryId: 'log-1', payload: noAmount, postingDate: '2026-08-01', db, now: POSTING_TODAY })
+
+  // PRECONDITION — the probe really did ANSWER with an EMPTY list. If it had refused, or had carried
+  // a record, the existing `!probe.ok || probe.records.length > 0` arm would be what stopped this and
+  // the new one would be untested.
+  const { probeXeroSettlement } = await import('@/lib/connectors/accounting-settlement-probe')
+  const probe = await probeXeroSettlement(
+    { type: 'INVOICE_PAYMENT', payload: noAmount },
+    async <T,>(_p: string) => ({ ok: true, status: 200, data: xeroResponse as T }),
+  )
+  assert.equal(probe.ok, true, 'PRECONDITION: the probe answered rather than refusing')
+  assert.equal(probe.ok === true ? probe.records.length : -1, 0, 'PRECONDITION: over an EMPTY record list')
+  assert.equal(probe.ok === true ? probe.provedComplete : null, false, 'PRECONDITION: and it is unproved')
+
+  assert.equal(verdict.proceed, false, 'an empty list from a contradicted reading is not evidence')
+  assert.match(verdict.proceed === false ? verdict.error : '', /contradicted its own account/)
+  assert.match(verdict.proceed === false ? verdict.error : '', /Resolve this entry by hand/)
+
+  // THE DISCRIMINATING HALF: the SAME undescribable row against the same invoice with the credit
+  // removed still posts. Only the contradiction is new — the branch has not become "always refuse".
+  xeroResponse = {
+    Invoices: [{ InvoiceID: 'inv-1', Total: 100, AmountDue: 100, AmountPaid: 0, AmountCredited: 0, Payments: [], CreditNotes: [] }],
+  }
+  const { db: db2 } = dbDouble([{ id: 'log-2', remoteAttemptedAt: null, payload: noAmount }])
+  assert.deepEqual(
+    await (await load())({ ...payment, entryId: 'log-2', payload: noAmount, postingDate: '2026-08-01', db: db2, now: POSTING_TODAY }),
+    { proceed: true },
+    'a coherent ledger that positively holds nothing still lets an undescribable row through',
+  )
+})
+
 test('a first post is refused when a settlement it CANNOT MEASURE is present (o3d-0m56 r4)', async () => {
   // The third unknown, and it is a statement about the ledger, so it refuses like the first.
   xeroCalls.length = 0

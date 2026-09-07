@@ -16,7 +16,7 @@ import {
   type AttemptDescription,
   type LedgerSettlementProbe,
 } from '@/lib/domain/accounting/ledger-settlement-evidence'
-import { toDecimal } from '@/lib/domain/math/decimal'
+import { ledgerAmountEpsilon, toDecimal } from '@/lib/domain/math/decimal'
 
 /**
  * o3d-obyd — A STRING `TotalAmt` SKIPPED THE COMPLETENESS CROSS-CHECK, AND A SKIPPED CHECK WAS BEING
@@ -1181,22 +1181,28 @@ test('[o3d-obyd r31] contradictory settled figures refuse, rather than the zero 
     'and it proves the collection just as the totals pair does')
 })
 
-test('[o3d-obyd r31] an UNPROVED answer always carries records — the invariant a post gate depends on', async () => {
+test('[o3d-obyd r31 / o3d-zo4j] the FIGURELESS unproved answer carries records — and the EXCESS one does not', async () => {
   // WHY THIS EXISTS. `authoriseMoneyPost`'s undescribable-attempt branch is the one place outside
   // `classifyLedgerSettlement` that draws a conclusion from a record list directly, and it draws the
   // strongest one: an empty list means "nothing here could be confused with this attempt", and the
-  // row POSTS. That is sound only because an unproved probe can never be empty — `settlementAnswer`
-  // refuses a response that states no settled figure AND carries no record. The gate tests
-  // `records.length > 0`, which catches every unproved probe precisely because of this invariant.
+  // row POSTS.
   //
-  // A `|| !probe.provedComplete` arm on that gate would be unfalsifiable: no input can reach it, so
-  // no mutation can show it working. The premise is pinned HERE, where it can fail, instead.
+  // r31 SHOWED THAT WAS SOUND on the only unproved shape there then was: `settlementAnswer` refuses a
+  // response that states no settled figure AND carries no record, so `ok && !provedComplete` implied
+  // `records.length > 0` and the gate's length test caught every one. That half is still true and is
+  // still asserted below, unchanged — it is what keeps the figureless arm of the gate honest.
   //
-  // ROUTE: `settlementAnswer(settled, records, ...)` -> `settled === null && records.length === 0`
-  //        -> ok:false. So `ok && !provedComplete` implies `records.length > 0`.
+  // o3d-zo4j ENDED THE UNIVERSAL VERSION OF IT. A collection that EXCEEDS the figure certifying it is
+  // unproved too, and it is reached with the figure STATED — so nothing refuses it, and its record
+  // list can be empty. r31 removed `|| !probe.provedComplete` from the post gate as unfalsifiable;
+  // that arm is back, with inputs, and the counterexample is built here so this test names the gate
+  // it protects rather than pinning a premise that has stopped holding.
+  //
+  // ROUTE: `settlementAnswer(settled, exceeds, records, ...)` -> `settled === null &&
+  //        records.length === 0` -> ok:false, which is the figureless half; and `settled` stated with
+  //        an excess -> `ok: true, provedComplete: false, records: []`, which is the new half.
   // MUTATION: drop the `records.length === 0` half of that condition (return the ok answer whenever
-  //        `settled === null`). Every arm below then produces `ok: true, provedComplete: false` with
-  //        an EMPTY list — and the post gate above would authorise the post on it.
+  //        `settled === null`). The first loop below then reports answers instead of refusals.
 
   // Each arm, driven with a document that states NO settled figure and holds NO settlement.
   const figurelessAndEmpty = {
@@ -1227,4 +1233,384 @@ test('[o3d-obyd r31] an UNPROVED answer always carries records — the invariant
       'an unproved answer always has a record — which is what makes the post gate\'s length test '
       + 'sufficient, and what a future arm answering an unproved EMPTY probe would break')
   }
+
+  // o3d-zo4j — AND HERE IS THAT FUTURE ARM, WHICH IS WHY THE GATE NOW READS `provedComplete` TOO.
+  // Every assertion above stands: on the FIGURELESS route an unproved answer still always carries a
+  // record. What has changed is that the figureless route is no longer the only unproved one.
+  const excessAndEmpty = {
+    // A credit note contradicting its own RemainingCredit with an allocation to ANOTHER invoice.
+    'Xero credit note': () => probeNote({
+      CurrencyCode: 'GBP', Total: 40, RemainingCredit: 40,
+      Allocations: [{ Amount: 40, Date: '2026-06-01T00:00:00', Invoice: { InvoiceID: 'other-inv' } }],
+    }),
+    // An invoice stating nothing settled while itemising 30 of credit applied.
+    'Xero invoice': () => probeInvoice({
+      CurrencyCode: 'GBP', Total: 100, AmountDue: 100, AmountPaid: 0, AmountCredited: 0,
+      Payments: [], CreditNotes: [{ AppliedAmount: 30 }],
+    }),
+  }
+  for (const [label, run] of Object.entries(excessAndEmpty)) {
+    const probe = await run()
+    assert.equal(probe.ok, true, `${label}: the figure is stated, so nothing refuses it`)
+    assert.equal(probe.ok === true ? probe.provedComplete : null, false, `${label}: and it is unproved`)
+    assert.equal(probe.ok === true ? probe.records.length : -1, 0,
+      `${label}: with an EMPTY list — the exact input r31 argued could not exist, which is why the `
+      + 'post gate\'s length test is no longer sufficient on its own')
+  }
+})
+
+/* ------------------------------------------------------------------------------------------- *
+ * 7. o3d-zo4j (Codex HIGH) — A COLLECTION THAT EXCEEDS THE FIGURE CERTIFYING IT HAS CONTRADICTED
+ *    THAT FIGURE, SO THE FIGURE IS NO LONGER PROOF OF THE COLLECTION.
+ *
+ * `provedComplete` was `settled !== null`: the figure being STATED taken as the figure being BORNE
+ * OUT. Every check above it rejects a SHORTFALL — the collection explaining LESS than the figure —
+ * which is one of the two ways the two can fail to agree. The other went unmeasured.
+ *
+ * THE SHAPE, AND IT IS THE ONE FILED ON THIS ISSUE: a Xero credit note reading `Total 40 /
+ * RemainingCredit 40` — a PROVED ZERO, so `statesAnything` is false and the shortfall check passes
+ * over nothing — whose `Allocations` show 40 already used. The note says none of the credit has been
+ * applied and simultaneously shows all of it applied. The zero was believed.
+ *
+ * WHAT THE RULE IS, AND WHAT IT DELIBERATELY IS NOT. It WITHHOLDS the proof; it does not refuse the
+ * probe. Refusing would need this code to decide whether a particular excess is legitimate — a
+ * reversed-but-listed payment, a draft credit note — and that question does not have to be answered
+ * to stop treating a contradicted figure as proof. So the whole effect is `clear` -> `unknown` on a
+ * NON-match: a match is still `present`, a shortfall still escalates to `ok: false`, and the ordinary
+ * first payment still posts.
+ *
+ * FOUR PAIRS TAKE IT, and each test below names which:
+ *   1  Xero credit note   `Total - RemainingCredit`  vs  SUM(Allocations)          identity
+ *   2  Xero invoice       `AmountPaid`               vs  SUM(Payments)             identity
+ *   3  Xero invoice       `Total - AmountDue`        vs  SUM(Payments + applied)   composed identity
+ *   4  QuickBooks         `TotalAmt - Balance`       vs  SUM(payment lines)        one-sided bound
+ * ------------------------------------------------------------------------------------------- */
+
+/** The band both directions are measured on — `completenessBand` is `ledgerAmountEpsilon`. */
+const BAND_GBP = ledgerAmountEpsilon('GBP')
+
+test('[o3d-zo4j] PAIR 1: a credit note whose allocations exceed its own RemainingCredit does not clear', async () => {
+  // THE LOAD-BEARING CASE, verbatim: `Total 40 / RemainingCredit 40` with 40 already allocated.
+  //
+  // ROUTE: probeXeroSettlement's credit-note arm -> `applied` = 40 - 40 = 0 -> `statesAnything(0)`
+  //        is FALSE so the shortfall check passes without measuring -> `allocated` = 40 ->
+  //        `exceeds(40, 0)` -> `settlementAnswer(0, true, [], ...)` -> `provedComplete: false` ->
+  //        `classifyLedgerSettlement` walks an empty list and reaches its terminal gate -> `unknown`.
+  // MUTATION: in `settlementAnswer`, restore `provedComplete: settled !== null` (drop the
+  //        `&& !collectionExceedsFigure`). The verdict below becomes `clear`, which is what
+  //        authorises allocating a credit that is already spent — measured.
+  const OVER_ALLOCATED = {
+    CurrencyCode: 'GBP',
+    Total: 40,
+    RemainingCredit: 40,
+    // The credit legitimately offsets other documents, which is why the record list is filtered and
+    // why the COLLECTION's completeness is what has to be tested rather than this bill's share of it.
+    Allocations: [{ Amount: 40, Date: '2026-06-01T00:00:00', Invoice: { InvoiceID: 'other-inv' } }],
+  }
+
+  // PRECONDITION 1 — the certifying figure really is a PROVED ZERO. This is why no existing check
+  // could catch it: a zero settled figure makes `statesAnything` false, so the shortfall check
+  // passes over the collection without comparing anything to it.
+  assert.equal(OVER_ALLOCATED.Total - OVER_ALLOCATED.RemainingCredit, 0,
+    'Total less RemainingCredit says NONE of this credit has been applied')
+  // PRECONDITION 2 — and the collection says all of it has. The contradiction is the only evidence
+  // in the response that something is wrong.
+  assert.equal(OVER_ALLOCATED.Allocations.reduce((s, a) => s + a.Amount, 0), 40,
+    'while the allocations show the whole 40 already used')
+
+  const probe = await probeNote(OVER_ALLOCATED)
+
+  // PRECONDITION 3 — it WITHHELD rather than refusing. If this were `ok: false` the test would be
+  // about a refusal, which is explicitly not the shape of this rule.
+  assert.equal(probe.ok, true, 'an excess withholds the proof; it does not refuse the probe')
+  // PRECONDITION 4 — the record list really is empty, so nothing but `provedComplete` can stop the
+  // classifier reaching `clear`.
+  assert.equal(probe.ok === true ? probe.records.length : -1, 0,
+    'the allocation belongs to another invoice, so this bill\'s filtered list is empty')
+  assert.equal(probe.ok === true ? probe.provedComplete : null, false,
+    'and the figure that would have proved that emptiness has been contradicted by the collection')
+
+  const verdict = classifyLedgerSettlement(attemptFor('40.00'), probe)
+  assert.equal(verdict.outcome, 'unknown', 'so an empty list is not proof that nothing is there')
+  assert.equal(verdict.outcome === 'unknown' ? verdict.cause : null, 'collection-unproved')
+})
+
+test('[o3d-zo4j] PAIR 1: a MATCH on that same contradicted document still yields present', async () => {
+  // THE HALF THAT WITHHOLDING BUYS AND REFUSING WOULD THROW AWAY. `present` is what RESOLVES the row
+  // — a probe that refused on the excess would leave a row IMS can see its own allocation for stuck
+  // forever, which is strictly worse than the state before this rule.
+  //
+  // ROUTE: identical to the test above except that the allocation names THIS bill and matches the
+  //        attempt, so `classifyLedgerSettlement`'s amount-and-date pass returns `present` BEFORE
+  //        the terminal `provedComplete` gate is reached.
+  // MUTATION: make the credit-note arm REFUSE on the excess (`if (overAllocated) return { ok: false,
+  //        reason: ... }`) instead of routing it through `settlementAnswer`. The verdict below stops
+  //        being `present`, and the row can no longer be resolved by the settlement it can see.
+  const OVER_ALLOCATED_TO_US = {
+    CurrencyCode: 'GBP',
+    Total: 40,
+    RemainingCredit: 40,
+    Allocations: [{ Amount: 40, Date: `${DATE}T00:00:00`, Invoice: { InvoiceID: 'inv-1' } }],
+  }
+  const probe = await probeNote(OVER_ALLOCATED_TO_US)
+
+  // PRECONDITION — it is the SAME contradiction as the test above: still a proved zero, still
+  // unproved. Without this the test could be passing on an ordinary coherent document.
+  assert.equal(probe.ok, true)
+  assert.equal(probe.ok === true ? probe.provedComplete : null, false,
+    'PRECONDITION: the collection contradicts the figure here too — only the filter differs')
+  assert.equal(probe.ok === true ? probe.records.length : -1, 1,
+    'PRECONDITION: and this time the allocation IS against our bill, so there is a record to match')
+
+  assert.equal(classifyLedgerSettlement(attemptFor('40.00'), probe).outcome, 'present',
+    'a record that IS the attempt proves the attempt settled, whatever else the response contradicts')
+
+  // THE DISCRIMINATING HALF: the identical probe asked about an attempt it does NOT hold still
+  // withholds. Without this, `present` could be coming from a classifier that stopped comparing.
+  assert.equal(classifyLedgerSettlement(attemptFor('12.34'), probe).outcome, 'unknown',
+    'and the same contradicted document still refuses to clear an attempt it cannot find')
+})
+
+test('[o3d-zo4j] an excess WITHIN the agreement band is noise, not a contradiction', async () => {
+  // THE BAND IS THE SHORTFALL'S BAND. `exceeds` is `shortBy` with its operands swapped, so both
+  // directions are `completenessBand` — the document's own half-minor-unit — and neither is a bare
+  // comparison against zero. Two exact decimals read off a real ledger agree to the penny; a rule
+  // that treated any positive difference as a contradiction would unprove ordinary documents.
+  //
+  // ROUTE: the credit-note arm again -> `applied` 0, `allocated` at and then just over the band ->
+  //        `exceeds` false, then true -> `provedComplete` true, then false.
+  // MUTATION: in `exceeds`, compare the difference against zero instead of delegating to `shortBy`
+  //        (`compareDecimal(subtractMoney(accounted, stated), toDecimal(0)) > 0`). The within-band
+  //        case below flips to `unknown`, and with it every document whose figures round differently.
+
+  // PRECONDITION — the two fixtures really do straddle the band, stated here rather than taken on
+  // trust from the probe. 0.005 is exactly it; 0.006 is over.
+  assert.equal(BAND_GBP.toFixed(3), '0.005', 'the GBP completeness band')
+  assert.equal(BAND_GBP.cmp(toDecimal('0.005')), 0, 'the within-band fixture sits exactly ON it')
+  assert.equal(BAND_GBP.cmp(toDecimal('0.006')) < 0, true, 'and the other one sits above it')
+
+  const noteWithExcessOf = (amount: number) => probeNote({
+    CurrencyCode: 'GBP',
+    Total: 40,
+    RemainingCredit: 40,
+    Allocations: [{ Amount: amount, Date: '2026-06-01T00:00:00', Invoice: { InvoiceID: 'other-inv' } }],
+  })
+
+  const withinBand = await noteWithExcessOf(0.005)
+  assert.equal(withinBand.ok, true)
+  assert.equal(withinBand.ok === true ? withinBand.provedComplete : null, true,
+    'an excess of exactly one band is agreement, so the figure still proves the collection')
+  assert.equal(classifyLedgerSettlement(attemptFor('40.00'), withinBand).outcome, 'clear',
+    'and the post still goes out')
+
+  const beyondBand = await noteWithExcessOf(0.006)
+  assert.equal(beyondBand.ok, true)
+  assert.equal(beyondBand.ok === true ? beyondBand.provedComplete : null, false,
+    'one thousandth over the band is a contradiction, on the same band the shortfall uses')
+  assert.equal(classifyLedgerSettlement(attemptFor('40.00'), beyondBand).outcome, 'unknown')
+})
+
+test('[o3d-zo4j] a SHORTFALL still escalates to a refusal, on all three arms, unchanged', async () => {
+  // THE DIRECTION THAT ALREADY WORKED MUST KEEP WORKING, AND KEEP BEING A REFUSAL. A shortfall is
+  // money off the document that this probe cannot see at all, which is a different and worse fact
+  // than a collection that overruns: it says `ok: false` and the row fails visibly. Downgrading it
+  // to "unproved" would be a silent widening of what can still post.
+  //
+  // ROUTE: each arm's existing `shortBy` check -> `ok: false` before `settlementAnswer` is reached.
+  // MUTATION: swap the operands of the shortfall checks (`shortBy(allocated, applied, ...)`,
+  //        `shortBy(seen, amountPaid, ...)`, `shortBy(explained, applied, ...)`) so the shortfall is
+  //        measured in the excess direction. All three refusals below become answers.
+
+  // ARM 1 — a credit note reporting 40 applied and returning no allocations.
+  const note = await probeNote({ CurrencyCode: 'GBP', Total: 40, RemainingCredit: 0, Allocations: [] })
+  assert.equal(note.ok, false, 'the credit-note shortfall still refuses')
+  assert.match(reasonOf(note), /40\.00 of this credit note already applied but returned no allocations/)
+
+  // ARM 2 — an invoice reporting 60 paid and returning no payments.
+  const invoice = await probeInvoice({
+    CurrencyCode: 'GBP', Total: 100, AmountDue: 40, AmountPaid: 60, AmountCredited: 0, Payments: [],
+  })
+  assert.equal(invoice.ok, false, 'the invoice shortfall still refuses')
+  assert.match(reasonOf(invoice), /60\.00 paid against this document but returned no payments/)
+
+  // ARM 3 — a bill reporting 100 applied and linking nothing.
+  const bill = await probeBill({ CurrencyRef: { value: 'GBP' }, TotalAmt: '100.00', Balance: '0.00' })
+  assert.equal(bill.ok, false, 'the QuickBooks shortfall still refuses')
+  assert.match(reasonOf(bill), /100\.00 already applied to this bill/)
+
+  // AND A REFUSAL IS NOT A CLEAR, which is the end all three protect.
+  for (const [label, probe] of [['note', note], ['invoice', invoice], ['bill', bill]] as const) {
+    assert.notEqual(classifyLedgerSettlement(attemptFor('40.00'), probe).outcome, 'clear', label)
+  }
+})
+
+test('[o3d-zo4j] the ordinary first payment still posts, and the ordinary part-credited invoice still clears', async () => {
+  // WHAT THE RULE COSTS THE ORDINARY DOCUMENT: nothing. A real document's collection sums to exactly
+  // the figure that certifies it, so the excess is zero and zero is inside the band.
+  //
+  // ROUTE: each arm computes an excess of exactly 0 -> `exceeds` false -> `provedComplete` stays
+  //        `settled !== null` -> the classifier clears as it always did.
+  // MUTATION: invert the new term in `settlementAnswer` (`settled !== null && collectionExceedsFigure`).
+  //        Every assertion below flips to `unknown`, which is the visible cost of getting the
+  //        direction backwards.
+
+  const firstPayment = {
+    // ARM 2/3 — an unsettled invoice states Total and AmountDue EQUAL.
+    'Xero invoice': () => probeInvoice({
+      CurrencyCode: 'GBP', Total: 40, AmountDue: 40, AmountPaid: 0, AmountCredited: 0, Payments: [],
+    }),
+    // ARM 1 — a wholly unapplied credit note states Total and RemainingCredit EQUAL.
+    'Xero credit note': () => probeNote({ CurrencyCode: 'GBP', Total: 40, RemainingCredit: 40, Allocations: [] }),
+    // ARM 4 — an unpaid bill states TotalAmt and Balance EQUAL, as strings.
+    'QuickBooks bill': () => probeBill({ CurrencyRef: { value: 'GBP' }, TotalAmt: '1200.00', Balance: '1200.00' }),
+  }
+  for (const [label, run] of Object.entries(firstPayment)) {
+    const probe = await run()
+    assert.equal(probe.ok, true, `${label}: still an answer`)
+    assert.equal(probe.ok === true ? probe.provedComplete : null, true,
+      `${label}: PRECONDITION — emptiness proved by the document's own figures, and not contradicted`)
+    assert.equal(classifyLedgerSettlement(attemptFor('40.00'), probe).outcome, 'clear',
+      `${label}: the ordinary first payment still posts`)
+  }
+
+  // AND THE DOCUMENT THE `explained` SUM EXISTS FOR: a part-paid, part-credited invoice whose credit
+  // IS itemised. `settled` is 40 and `explained` is 10 + 30 = 40 — equal, so no excess — which is the
+  // documented promise that a credit which explains itself changes no verdict.
+  const partCredited = await probeInvoice({
+    CurrencyCode: 'GBP', Total: 100, AmountDue: 60, AmountPaid: 10, AmountCredited: 30,
+    Payments: [{ PaymentID: 'PAY-1', Date: '2026-06-01T00:00:00', Amount: 10 }],
+    CreditNotes: [{ AppliedAmount: 30 }],
+  })
+  assert.equal(partCredited.ok, true)
+  assert.equal(partCredited.ok === true ? partCredited.records.length : -1, 1,
+    'PRECONDITION: a real, non-matching settlement is on the document')
+  assert.equal(partCredited.ok === true ? partCredited.provedComplete : null, true,
+    'PRECONDITION: and the itemised credit accounts for the rest exactly, so nothing overruns')
+  assert.equal(classifyLedgerSettlement(attemptFor('40.00'), partCredited).outcome, 'clear',
+    'a further instalment against a part-credited invoice is still sendable')
+})
+
+test('[o3d-zo4j] PAIR 2: the payment total is measured separately, or an excess hides inside a matching sum', async () => {
+  // WHY PAIR 2 IS NOT LEFT TO PAIR 3. They straddle: `AmountPaid` vs `SUM(Payments)` is one identity,
+  // and `Total - AmountDue` vs `SUM(Payments) + SUM(applied)` is another that CONTAINS it. A response
+  // can satisfy the wider one exactly while the narrower one overruns, because the credit half
+  // absorbs the difference.
+  //
+  // ROUTE: the invoice arm -> `amountPaid` 10, `seen` 30 -> `shortBy(10, 30)` false ->
+  //        `exceeds(30, 10)` TRUE -> and separately `settled` 30, `explained` 30, so pair 3 agrees
+  //        exactly -> `settlementAnswer(30, true, records, ...)` -> `provedComplete: false`.
+  // MUTATION: pass only `settlementsExceedFigure` to `settlementAnswer` (drop `paymentsExceedTotal ||`).
+  //        The verdict below becomes `clear` — pair 3 alone cannot see this.
+  const STRADDLED = {
+    CurrencyCode: 'GBP', Total: 100, AmountDue: 70, AmountPaid: 10, AmountCredited: 20,
+    Payments: [
+      { PaymentID: 'PAY-1', Date: '2026-06-01T00:00:00', Amount: 20 },
+      { PaymentID: 'PAY-2', Date: '2026-06-02T00:00:00', Amount: 10 },
+    ],
+  }
+
+  // PRECONDITION 1 — the two derivations of the SETTLED figure agree, so the r31 contradiction check
+  // does not fire and this test really is about the payment pair.
+  assert.equal(STRADDLED.Total - STRADDLED.AmountDue, 30, 'Total less AmountDue')
+  assert.equal(STRADDLED.AmountPaid + STRADDLED.AmountCredited, 30, '...and the component pair agree')
+  // PRECONDITION 2 — pair 3 agrees EXACTLY: `explained` is the payments plus an absent credit
+  // collection, which sums to zero, so 30 against 30. Nothing overruns at that pair.
+  assert.equal(STRADDLED.Payments.reduce((s, p) => s + p.Amount, 0), 30,
+    'the payments alone already account for the whole settled figure')
+  // PRECONDITION 3 — and pair 2 overruns by 20, which is the only thing wrong with this response.
+  assert.equal(STRADDLED.Payments.reduce((s, p) => s + p.Amount, 0) - STRADDLED.AmountPaid, 20,
+    'while AmountPaid says only 10 of it was paid')
+
+  const probe = await probeInvoice(STRADDLED)
+  assert.equal(probe.ok, true, 'it withholds rather than refusing, as everywhere else')
+  assert.equal(probe.ok === true ? probe.records.length : -1, 2, 'both payments came back')
+  assert.equal(probe.ok === true ? probe.provedComplete : null, false,
+    'and the payment collection has contradicted the total that summarises it')
+  const verdict = classifyLedgerSettlement(attemptFor('40.00'), probe)
+  assert.equal(verdict.outcome, 'unknown')
+  assert.equal(verdict.outcome === 'unknown' ? verdict.cause : null, 'collection-unproved')
+})
+
+test('[o3d-zo4j] PAIR 4: a QuickBooks document reporting nothing settled while linking a payment of 20', async () => {
+  // CODEX'S QUICKBOOKS SHAPE. `TotalAmt 100 / Balance 100` is the proved zero — `statesAnything`
+  // false, shortfall check passing over nothing — and a linked BillPayment applied 20 to the very
+  // same bill. On this arm the honest relation is `explained <= applied` (the document's own figure
+  // also counts vendor credits and journals this probe cannot read), so an excess is a contradiction
+  // outright rather than merely a mismatch.
+  //
+  // ROUTE: probeQuickBooksSettlement -> `applied` = 100 - 100 = 0 -> `explained` = 20 ->
+  //        `exceeds(20, 0)` -> `provedComplete: false` -> the record does not match the attempt ->
+  //        the classifier's terminal gate -> `unknown`.
+  // MUTATION: in `settlementAnswer`, restore `provedComplete: settled !== null`. The verdict below
+  //        becomes `clear`, and a second payment goes out against a bill whose figures are incoherent.
+  const probe = await probeQuickBooksSettlement(
+    { type: 'BILL_PAYMENT', payload: { accountingInvoiceId: 'bill-1' } },
+    ledgerDouble({
+      'bill/bill-1': {
+        Bill: {
+          CurrencyRef: { value: 'GBP' },
+          TotalAmt: '100.00',
+          Balance: '100.00',
+          LinkedTxn: [{ TxnId: '77', TxnType: 'BillPaymentCheck' }],
+        },
+      },
+      'billpayment/77': {
+        BillPayment: { TxnDate: '2026-06-01', Line: [{ Amount: 20, LinkedTxn: [{ TxnId: 'bill-1', TxnType: 'Bill' }] }] },
+      },
+    }).get,
+  )
+
+  // PRECONDITION 1 — the certifying figure is a proved zero, which is why nothing else catches this.
+  // Asserted through the probe's own reading: a settled figure above the band would have made the
+  // shortfall check the thing under test instead.
+  assert.equal(probe.ok, true, 'PRECONDITION: it answered — this is not the shortfall refusal')
+  // PRECONDITION 2 — the payment really was read, and really is not the attempt.
+  assert.equal(probe.ok === true ? probe.records.length : -1, 1, 'PRECONDITION: one payment came back')
+  assert.equal(probe.ok === true ? probe.records[0]?.amount?.toFixed(2) : null, '20.00',
+    'PRECONDITION: applying 20 to a bill the document says nothing has come off')
+  assert.equal(probe.ok === true ? probe.records[0]?.date : null, '2026-06-01',
+    'PRECONDITION: on a different day from the attempt, so no match is available')
+
+  assert.equal(probe.ok === true ? probe.provedComplete : null, false,
+    'the linked payments account for more than the bill says has come off it')
+  const verdict = classifyLedgerSettlement(attemptFor('40.00'), probe)
+  assert.equal(verdict.outcome, 'unknown', '"not among these" is not "not in the ledger"')
+  assert.equal(verdict.outcome === 'unknown' ? verdict.cause : null, 'collection-unproved')
+})
+
+test('[o3d-zo4j] PAIR 3: an itemised credit that exceeds what the invoice says has come off it', async () => {
+  // THE COMPOSED IDENTITY. `Total - AmountDue` is `AmountPaid + AmountCredited` by Xero's own
+  // definition, and `AmountCredited` is what the applied credit-note / prepayment / overpayment
+  // collections total — so `settled` and `explained` are one quantity through two identities. This
+  // response states a settled figure of ZERO and simultaneously itemises 30 of credit applied.
+  //
+  // AND IT IS THE SHAPE THAT BREAKS THE OLD POST-GATE INVARIANT: unproved with an EMPTY record list.
+  //
+  // ROUTE: the invoice arm -> `settledFromTotals` 0 and `settledFromComponents` 0 AGREE, so the r31
+  //        contradiction check does not fire -> `amountPaid` 0 and `seen` 0, so pair 2 does not fire
+  //        -> `explained` = 0 payments + 30 applied -> `exceeds(30, 0)` -> `provedComplete: false`.
+  // MUTATION: pass only `paymentsExceedTotal` to `settlementAnswer` (drop `|| settlementsExceedFigure`).
+  //        The verdict below becomes `clear` — pair 2 alone cannot see this.
+  const CREDIT_BEYOND_THE_FIGURE = {
+    CurrencyCode: 'GBP', Total: 100, AmountDue: 100, AmountPaid: 0, AmountCredited: 0,
+    Payments: [],
+    CreditNotes: [{ AppliedAmount: 30 }],
+  }
+
+  // PRECONDITION 1 — the two derivations of the settled figure AGREE (both zero), so this is not the
+  // r31 contradiction being retested under a new name.
+  assert.equal(CREDIT_BEYOND_THE_FIGURE.Total - CREDIT_BEYOND_THE_FIGURE.AmountDue, 0)
+  assert.equal(CREDIT_BEYOND_THE_FIGURE.AmountPaid + CREDIT_BEYOND_THE_FIGURE.AmountCredited, 0)
+  // PRECONDITION 2 — and pair 2 agrees too: no payments, and AmountPaid says none.
+  assert.equal(CREDIT_BEYOND_THE_FIGURE.Payments.length, 0)
+  assert.equal(CREDIT_BEYOND_THE_FIGURE.AmountPaid, 0)
+  // PRECONDITION 3 — the only disagreement is the itemised credit, which is pair 3's operand.
+  assert.equal(CREDIT_BEYOND_THE_FIGURE.CreditNotes.reduce((s, c) => s + c.AppliedAmount, 0), 30)
+
+  const probe = await probeInvoice(CREDIT_BEYOND_THE_FIGURE)
+  assert.equal(probe.ok, true, 'it withholds rather than refusing')
+  assert.equal(probe.ok === true ? probe.records.length : -1, 0,
+    'PRECONDITION: and the record list is EMPTY, which is the shape the post gate must also handle')
+  assert.equal(probe.ok === true ? probe.provedComplete : null, false)
+  assert.equal(classifyLedgerSettlement(attemptFor('40.00'), probe).outcome, 'unknown')
 })
