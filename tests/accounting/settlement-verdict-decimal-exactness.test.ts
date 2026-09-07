@@ -8,7 +8,7 @@ import {
   type PaymentSyncRow,
 } from '@/lib/domain/accounting/settlement-status'
 import { loadInvoicePaymentSyncRows } from '@/lib/domain/accounting/invoice-payment-enqueue'
-import { REGISTERED_AMOUNT_DECIMAL_FIELD } from '@/lib/domain/accounting/registered-amount'
+import { REGISTERED_AMOUNT_DECIMAL_FIELD, statedAmountOnly } from '@/lib/domain/accounting/registered-amount'
 import { ledgerAmountEpsilon, toDecimal } from '@/lib/domain/math/decimal'
 
 /**
@@ -40,7 +40,7 @@ function syncedRow(over: Partial<PaymentSyncRow> = {}): PaymentSyncRow {
 
 /** A row exactly as `loadInvoicePaymentSyncRows` builds one: the wire number AND the exact decimal. */
 function registeredRow(amount: string, over: Partial<PaymentSyncRow> = {}): PaymentSyncRow {
-  return syncedRow({ amount: Number(amount), registeredAmount: toDecimal(amount), ...over })
+  return syncedRow({ amount: Number(amount), registeredAmount: { kind: 'stated', amount: toDecimal(amount) }, ...over })
 }
 
 /** A row from before o3d-1xq8: the wire number and nothing beside it. */
@@ -229,7 +229,7 @@ test('[o3d-4ozd] several registrations settle for their EXACT sum, not for the s
     registeredRow(LEG, { externalTransactionId: 'PAY-1' }),
     registeredRow(LEG, { externalTransactionId: 'PAY-2' }),
   ])!
-  assert.equal(agg.registeredAmount!.toFixed(), '35184372088832.004')
+  assert.equal(statedAmountOnly(agg.registeredAmount!)!.toFixed(), '35184372088832.004')
 
   const v = settlementStatus({ ...base, currency: 'KWD', totalForeign: toDecimal(TOTAL), payment: agg })
   assert.equal(v.status, 'PARTIALLY_SETTLED')
@@ -247,7 +247,7 @@ test('[o3d-4ozd] one leg that states no amount still makes the SUM unknown rathe
     syncedRow({ externalTransactionId: 'PAY-2', amount: null }),
   ])!
   assert.equal(agg.amount, null)
-  assert.equal(agg.registeredAmount, null)
+  assert.equal(agg.registeredAmount!.kind, 'not-stated', 'a term that states nothing makes the SUM state nothing')
   assert.equal(settlementStatus({ ...base, currency: 'GBP', totalForeign: toDecimal('100'), payment: agg }).status, 'SETTLED')
 })
 
@@ -278,7 +278,7 @@ test('[o3d-4ozd] the payload s exact decimal reaches the verdict through the rea
     syncLogClient([{ id: 'log-1', status: 'SYNCED', payload: invoicePaymentPayload(EXACT_RECEIPT, 'CLF') }]),
   )
   assert.equal(rows.length, 1)
-  assert.equal(rows[0].registeredAmount!.toFixed(), EXACT_RECEIPT)
+  assert.equal(statedAmountOnly(rows[0].registeredAmount)!.toFixed(), EXACT_RECEIPT)
   assert.equal(rows[0].amount, Number(EXACT_RECEIPT), 'the wire number is still on the row, untouched')
 
   assert.equal(
@@ -301,7 +301,7 @@ test('[o3d-4ozd] the payload s exact decimal reaches the verdict through the rea
     'CLF',
     syncLogClient([{ id: 'log-1', status: 'SYNCED', payload: invoicePaymentPayload(EXACT_RECEIPT, 'CLF', { exact: false }) }]),
   )
-  assert.equal(historical[0].registeredAmount!.toFixed(), '549755813888.0002')
+  assert.equal(statedAmountOnly(historical[0].registeredAmount)!.toFixed(), '549755813888.0002')
   assert.equal(
     settlementStatus({
       ...base,

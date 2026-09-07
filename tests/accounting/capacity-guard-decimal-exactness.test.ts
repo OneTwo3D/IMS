@@ -9,6 +9,7 @@ import { decideInvoicePaymentRegistration } from '@/lib/domain/accounting/invoic
 import {
   REGISTERED_AMOUNT_DECIMAL_FIELD,
   payloadRegisteredAmount,
+  readPayloadRegisteredAmount,
 } from '@/lib/domain/accounting/registered-amount'
 import { classifyLedgerSettlement } from '@/lib/domain/accounting/ledger-settlement-evidence'
 import { settlementStatus } from '@/lib/domain/accounting/settlement-status'
@@ -203,7 +204,7 @@ test('[o3d-6abj] the enqueue guard still registers an ordinary second receipt th
     ...registrationBase,
     paymentAmount: toDecimal('60.00'),
     ledgerTotal: toDecimal('100.00'),
-    existing: [{ status: 'SYNCED', amount: 40, registeredAmount: toDecimal('40.00'), paymentId: 'pay-old' }],
+    existing: [{ status: 'SYNCED', amount: 40, registeredAmount: { kind: 'stated', amount: toDecimal('40.00') }, paymentId: 'pay-old' }],
   })
   assert.equal(decision.register, true)
 })
@@ -258,7 +259,7 @@ test('[o3d-6abj] the ENQUEUE sum reads the exact string too, not the number besi
     existing: [{
       status: 'SYNCED',
       amount: 1,
-      registeredAmount: payloadRegisteredAmount(
+      registeredAmount: readPayloadRegisteredAmount(
         { amount: 1, [REGISTERED_AMOUNT_DECIMAL_FIELD]: '99.00', currency: 'GBP' }, 'GBP'),
       paymentId: 'pay-old',
     }],

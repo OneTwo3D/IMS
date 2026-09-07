@@ -33,7 +33,14 @@ import { toDecimal } from '@/lib/domain/math/decimal'
  * the arithmetic under test read a figure no writer ever puts there.
  */
 function live(row: Omit<ExistingInvoicePaymentSync, 'registeredAmount'>): ExistingInvoicePaymentSync {
-  return { ...row, registeredAmount: row.amount == null ? null : toDecimal(row.amount) }
+  // o3d-r948 r2: a READING now, and `loadInvoicePaymentSyncRows` builds exactly these two — a row
+  // with a number states its own decimal reading, a row without one states nothing.
+  return {
+    ...row,
+    registeredAmount: row.amount == null
+      ? { kind: 'not-stated' }
+      : { kind: 'stated', amount: toDecimal(row.amount) },
+  }
 }
 
 const base = {
