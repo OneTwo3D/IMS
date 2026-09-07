@@ -9675,15 +9675,24 @@ function auditingHelper(dir: string, aclFile: string): string {
     '  const client = {',
     '    query: async (sql) => {',
     "      if (String(sql).includes('AS audited_database')) {",
-    "        return { rows: [{ audited_database: 'imsdb', audited_owner_role: 'owner', audited_datacl: fixture === 'NULL' ? null : fixture }] }",
+    // o3d-secops r27: the audit binds its identity before it decides, so the fixture reports the
+    // two role halves as well. `admin` is the role the .env admin URL names; the phases that mean
+    // to fail the gate move the HOST, so that a refusal there cannot be the role check firing.
+    "        return { rows: [{ audited_database: 'imsdb', audited_login_role: 'admin', audited_effective_role: 'admin', audited_owner_role: 'owner', audited_datacl: fixture === 'NULL' ? null : fixture }] }",
     '      }',
     "      throw new Error('the audit asked something this fixture does not answer: ' + sql)",
     '    },',
     '  }',
+    // AND THE IDENTITY THE WRAPPER PASSES ON ARGV IS PASSED STRAIGHT THROUGH (o3d-secops r27). The
+    // gate is only exercised end to end if what reaches it is what the published wrapper baked in.
     '  const decided = await doAuditAuthority(client, {',
     "    stateFile: arg('state-file'),",
     "    stateOwnerUid: Number(arg('state-owner')),",
     "    appRole: arg('app-role') || arg('app-user'),",
+    "    appHost: arg('app-host'),",
+    "    appPort: arg('app-port'),",
+    "    appUser: arg('app-user'),",
+    "    appDatabase: arg('app-database'),",
     '  })',
     '  process.exit(crash ? 1 : decided)',
     '}',
@@ -9700,11 +9709,24 @@ function auditingHelper(dir: string, aclFile: string): string {
  *      go — it does not silently pick a state, which is what r25 did;
  *   2. the RELEASE wrapper still works over that same record, unchanged, which is the escape hatch
  *      that makes the refusal survivable;
- *   3. the resolution STAMPS a fence the ACL shows is standing, and CLEARS a record the ACL shows
- *      nothing stands behind;
- *   4. a MIXED reading changes nothing at all;
- *   5. and it refuses every record that is not the ambiguous one, so it cannot be used as a
- *      general-purpose "make this record say what I want" tool.
+ *   3. the resolution CLEARS a record the ACL shows nothing stands behind, automatically, and
+ *      REPORTS a fully-withdrawn ACL without stamping it until the operator says the fence is
+ *      theirs (o3d-secops r27, Codex HIGH — see below);
+ *   4. a MIXED reading changes nothing at all, with or without that confirmation;
+ *   5. it refuses every record that is not the ambiguous one, so it cannot be used as a
+ *      general-purpose "make this record say what I want" tool;
+ *   6. and an audit that reached a SAME-NAMED DATABASE ON ANOTHER HOST resolves nothing, because
+ *      the verdict it would otherwise print is about a cluster this record was not written for.
+ *
+ * WHAT r27 CHANGED IN THIS TEST, and why it is not the same assertion with a flag bolted on.
+ * PHASE 3 used to assert that a fully-withdrawn ACL STAMPS the record. That reading has two
+ * causes — this fence's REVOKE, or an administrator revoking the same roles independently — and
+ * the ACL records the state of the grants, never what made them so. Stamping is what later lets
+ * the release wrapper GRANT CONNECT back to every recorded grantee, so it is the direction that
+ * can restore access somebody deliberately removed; clearing on `absent` cannot cost anything
+ * either way. The two therefore no longer share an evidential bar: the clear stays automatic and
+ * the stamp waits for `--this-fence-revoked-them`. PHASE 6 is new and is the o3d-secops r27 HIGH 1
+ * end-to-end case.
  *
  * ROUTE: real processes. The wrappers are the ones db_fence_publish_operator_wrappers() writes,
  * run as an operator would with nothing supplied; the record is published by the shipped
@@ -9721,8 +9743,16 @@ function auditingHelper(dir: string, aclFile: string): string {
  *      word of a run that did not finish.
  *   3. remove the `fence_applied` check from db_fence_legacy_inspect_program(): PHASE 5 stops
  *      refusing and the resolution re-stamps a record that was never ambiguous.
+ *   4. (r27) drop the `[[ "${confirmed}" -ne 1 ]]` gate from the stamping arm of
+ *      resolve_legacy_fence(): PHASE 3a stamps without being asked.
+ *   5. (r27) drop the `case` arm's `*)` refusal so an unknown argument is ignored: PHASE 7 stops
+ *      refusing.
+ *   6. (r27, made against scripts/fence-db-connections.mjs) delete the
+ *      requireBoundDatabaseIdentity() call from doAuditAuthority(): PHASE 6's `unfenced` arm
+ *      removes the record — the wrapper deleting a standing fence's only authority on the word of
+ *      a cluster that merely shares its database name.
  */
-test('r26: the operator resolution stamps a standing legacy fence and clears one that never went up', () => {
+test('r26/r27: the operator resolution clears a spent legacy record automatically and stamps a standing one only on explicit confirmation', () => {
   const dir = mkdtempSync(join(tmpdir(), 'ims-r26-resolve-'))
   try {
     const acl = join(dir, 'datacl.txt')
@@ -9737,10 +9767,18 @@ test('r26: the operator resolution stamps a standing legacy fence and clears one
 
     writeFileSync(acl, `${UNFENCED}\n`)
     writeFenceCheckout(dir, auditingHelper(dir, acl))
-    writeFileSync(join(dir, 'app', '.env'), 'DEPLOY_ADMIN_DATABASE_URL="postgresql://admin:pw@127.0.0.1:5432/imsdb"\n')
+    // THE ADMIN URL NAMES THE SERVER THE IDENTITY ARGV NAMES (o3d-secops r27). It used to say
+    // 127.0.0.1:5432 while the wrappers were published for db.internal:6432, which nothing checked
+    // because the audit bound only the database NAME. It is checked now, on the same rule
+    // --preflight and --fence are held to, so the fixture has to be coherent — and PHASE 6 below
+    // moves it deliberately to prove the check is load-bearing.
+    const envFile = join(dir, 'app', '.env')
+    const adminUrlNaming = (server: string) =>
+      writeFileSync(envFile, `DEPLOY_ADMIN_DATABASE_URL="postgresql://admin:pw@${server}/imsdb"\n`)
+    adminUrlNaming('db.internal:6432')
     const paths = protectedPaths(dir)
     const wrapperEnv = { PATH: process.env.PATH ?? '' } as unknown as NodeJS.ProcessEnv
-    const run = (wrapper: string) => spawnSync(wrapper, [], { encoding: 'utf8', env: wrapperEnv })
+    const run = (wrapper: string, args: string[] = []) => spawnSync(wrapper, args, { encoding: 'utf8', env: wrapperEnv })
 
     const publish = runShell(
       artefactHarness(dir, [
@@ -9783,11 +9821,27 @@ test('r26: the operator resolution stamps a standing legacy fence and clears one
     assert.match(readFileSync(calls, 'utf8'), /^--release /m, 'reaching the helper with the record it names')
     assert.equal(existsSync(state), false, 'and root removes the record once the release is verified')
 
-    // PHASE 3 — THE RESOLUTION, WITH A FENCE THE ACL SHOWS IS STANDING.
+    // PHASE 3a — A FULLY-WITHDRAWN ACL IS REPORTED AND NOT STAMPED (o3d-secops r27, Codex HIGH).
+    // Every recorded grantee has lost CONNECT. That is what this fence's REVOKE leaves — and it is
+    // equally what an administrator who revoked those same roles leaves, and the ACL holds nothing
+    // that separates them. Stamping licenses a later GRANT CONNECT back to all of them, so the
+    // unconfirmed run reads everything, prints both histories, and changes NOTHING.
     plantLegacy()
     writeFileSync(acl, `${FENCED}\n`)
-    const stamped = run(paths.resolveWrapper)
-    assert.equal(stamped.status, 0, `a standing fence must resolve:\n${stamped.stdout}${stamped.stderr}`)
+    const reported = run(paths.resolveWrapper)
+    assert.equal(reported.status, 1, `an unconfirmed run must not stamp:\n${reported.stdout}${reported.stderr}`)
+    assert.equal(readFileSync(state, 'utf8'), LEGACY, 'and must leave the record byte for byte as it was found')
+    assert.match(reported.stderr, /TWO HISTORIES/, `naming both causes:\n${reported.stderr}`)
+    assert.match(reported.stderr, /ADMINISTRATOR took CONNECT/, `including the one that is not a fence:\n${reported.stderr}`)
+    assert.match(reported.stderr, /PUBLIC, imsapp/, `and printing the evidence itself:\n${reported.stderr}`)
+    assert.ok(reported.stderr.includes('--this-fence-revoked-them'),
+      `and telling the operator exactly what to re-run:\n${reported.stderr}`)
+
+    // PHASE 3b — AND WITH THE OPERATOR'S CONFIRMATION IT STAMPS. This is the fact only a person
+    // holds: they know whether they revoked those roles, and the database never will.
+    const stamped = run(paths.resolveWrapper, ['--this-fence-revoked-them'])
+    assert.equal(stamped.status, 0, `a confirmed standing fence must resolve:\n${stamped.stdout}${stamped.stderr}`)
+    assert.match(stamped.stderr, /CONFIRMED BY THE OPERATOR/, stamped.stderr)
     const afterStamp = JSON.parse(readFileSync(state, 'utf8'))
     assert.equal(afterStamp.fence_applied, 1, 'the record now says the fence it describes is standing')
     assert.deepEqual(afterStamp.revoked, modern.revoked, 'and nothing else about it moved')
@@ -9815,6 +9869,15 @@ test('r26: the operator resolution stamps a standing legacy fence and clears one
     assert.equal(readFileSync(state, 'utf8'), LEGACY, 'and leave the record byte for byte as it was found')
     assert.match(undecided.stderr, /NOT RESOLVED/, undecided.stderr)
     assert.match(undecided.stderr, /A MIXED reading/, `naming what it could not settle:\n${undecided.stderr}`)
+
+    // AND THE CONFIRMATION AUTHORISES NOTHING BY ITSELF (o3d-secops r27). It is consulted on ONE
+    // reading — every recorded grantee having lost CONNECT — and a mixed ACL is not that reading,
+    // so the flag must not turn a refusal into a stamp. Without this the gate would be a way to
+    // stamp any record at all, which is the defect it exists to close wearing a different hat.
+    const forced = run(paths.resolveWrapper, ['--this-fence-revoked-them'])
+    assert.equal(forced.status, 1, `the confirmation must not settle a mixed reading:\n${forced.stdout}${forced.stderr}`)
+    assert.equal(readFileSync(state, 'utf8'), LEGACY, 'and must change nothing')
+    assert.match(forced.stderr, /authorised nothing/, `saying so plainly:\n${forced.stderr}`)
 
     // PHASE 4c — AND THE TWO CHANNELS MUST AGREE. The audit decided `absent` and then failed on
     // its way out; the verdict line says one thing and the exit status says the run did not
@@ -9845,7 +9908,44 @@ test('r26: the operator resolution stamps a standing legacy fence and clears one
       assert.equal(readFileSync(state, 'utf8'), before, `${label}: and changing nothing`)
     }
 
+    // PHASE 6 — A SAME-NAMED DATABASE ON ANOTHER HOST RESOLVES NOTHING (o3d-secops r27, Codex
+    // HIGH 1). The admin URL is moved to a different server whose database is called `imsdb` too,
+    // and the ACL fixture is the UNFENCED one — which is what an unfenced bystander cluster shows,
+    // and is precisely the reading that made r26 DELETE the record. Both directions are checked,
+    // because the clearing arm is the one that destroys the only account of what was revoked.
+    adminUrlNaming('replica.internal:6432')
+    for (const [label, fixture] of [['unfenced', UNFENCED], ['fenced', FENCED]] as const) {
+      plantLegacy()
+      writeFileSync(acl, `${fixture}\n`)
+      const wrongCluster = run(paths.resolveWrapper)
+      assert.equal(wrongCluster.status, 1, `${label}: another cluster must resolve nothing:\n${wrongCluster.stdout}${wrongCluster.stderr}`)
+      assert.equal(readFileSync(state, 'utf8'), LEGACY, `${label}: and the authority must be byte for byte what it was`)
+      assert.match(wrongCluster.stderr, /NOT AUDITED/, `${label}: the audit itself must refuse:\n${wrongCluster.stderr}`)
+      assert.match(wrongCluster.stderr, /replica\.internal/, `${label}: naming the host it reached:\n${wrongCluster.stderr}`)
+      assert.ok(!/legacy_fence_verdict=/.test(wrongCluster.stdout),
+        `${label}: and no verdict may be printed for the wrapper to act on:\n${wrongCluster.stdout}`)
+      // AND NOT EVEN THE CONFIRMATION GETS PAST IT: the gate is about which cluster answered, and
+      // an operator vouching for their own fence cannot vouch for a reading of somebody else's.
+      const vouched = run(paths.resolveWrapper, ['--this-fence-revoked-them'])
+      assert.equal(vouched.status, 1, `${label}: confirmed, and still nothing:\n${vouched.stdout}${vouched.stderr}`)
+      assert.equal(readFileSync(state, 'utf8'), LEGACY, `${label}: still byte for byte what it was`)
+    }
+    adminUrlNaming('db.internal:6432')
+
+    // PHASE 7 — AND AN ARGUMENT IT DOES NOT RECOGNISE IS A REFUSAL, NOT SOMETHING IGNORED. A
+    // mistyped confirmation that is silently dropped reads as "it refused for no reason", and
+    // nothing is read from the record or the database before this returns.
+    plantLegacy()
+    writeFileSync(acl, `${FENCED}\n`)
+    writeFileSync(calls, '')
+    const mistyped = run(paths.resolveWrapper, ['--this-fence-revoked-tem'])
+    assert.equal(mistyped.status, 1, `an unrecognised argument must refuse:\n${mistyped.stdout}${mistyped.stderr}`)
+    assert.match(mistyped.stderr, /unrecognised argument/, mistyped.stderr)
+    assert.equal(readFileSync(state, 'utf8'), LEGACY, 'and change nothing')
+    assert.equal(readFileSync(calls, 'utf8'), '', 'and never reach the helper at all')
+
     // AND WITH NO RECORD AT ALL, which is not a fence it may declare resolved either.
+    plantLegacy()
     rmSync(state)
     const nothing = run(paths.resolveWrapper)
     assert.equal(nothing.status, 1, `${nothing.stdout}${nothing.stderr}`)

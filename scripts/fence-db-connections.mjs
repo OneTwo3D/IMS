@@ -1344,18 +1344,38 @@ export function assessAuthorityDrift({ authorised, current, mode }) {
 // A record carrying no `fence_applied` key is ambiguous on the filesystem and stays ambiguous
 // however hard it is read: its mtime, its owner, its shape and its fields all describe the
 // validator that WROTE it and none of them describes whether that validator's REVOKE reached the
-// medium. Nothing beside the file answers the question. The database does: the fence's whole
-// effect is that the recorded grantees lose CONNECT, so asking whether they still hold it asks
-// whether the fence is standing.
+// medium. Nothing beside the file answers the question. The database answers HALF of it, and only
+// half (o3d-secops r27, Codex HIGH). The fence's whole effect is that the recorded grantees lose
+// CONNECT, so a grantee that STILL HOLDS it proves no revoke took it away, and that half is
+// conclusive whoever was at the keyboard. The other half is not: the ACL is a statement of the
+// grants AS THEY ARE and carries no history at all, so absence of a grant is evidence of a revoke
+// and never evidence of WHOSE revoke. The two halves are therefore given two different evidential
+// bars, because the two ACTIONS they lead to are not symmetric -- see the table below.
 //
 // THREE ANSWERS AND NOT TWO, and the third is the one the caller must not collapse:
 //
 //   absent      every recorded grantee still holds CONNECT. The REVOKE cannot have run — it names
 //               exactly these roles — so the record is what a publication that never reached
 //               `BEGIN` left behind. It is litter, and clearing it is safe.
-//   stands      not one recorded grantee holds CONNECT. That is the fence's own signature, and
-//               nothing else on an ordinary host takes CONNECT from every one of them at once.
-//               The record may be stamped applied.
+//   stands      not one recorded grantee holds CONNECT. THIS IS EVIDENCE AND NOT A CAUSE
+//               (o3d-secops r27, Codex HIGH). The fence this record describes produces exactly
+//               this reading -- and so does an administrator who revoked those same roles
+//               independently of any fence, and the ACL holds nothing that separates them. It is
+//               REPORTED, with both histories named, and it does NOT authorise a stamp on its own:
+//               the operator confirms which history is theirs before root writes anything.
+//
+// AND THE ASYMMETRY IS THE WHOLE POINT, because the two outcomes are not equally dangerous:
+//
+//   clearing on `absent` is inert whichever cause produced it. Every recorded grantee still holds
+//   CONNECT, so no fence stands behind the record; removing it restores nobody's privilege and
+//   costs nothing if the guess were somehow wrong. It stays AUTOMATIC.
+//
+//   stamping on `stands` is what LATER RESTORES PRIVILEGE. A stamped record is a record the
+//   release wrapper -- and a re-fence under the recovery rule -- will GRANT CONNECT back from, to
+//   every role it names. If the roles lost CONNECT because an administrator took it from them,
+//   stamping is the first step of handing it back. So it is gated behind an EXPLICIT OPERATOR
+//   CONFIRMATION, in the wrapper that does the writing: the operator knows whether they revoked
+//   those roles, and the ACL never will.
 //   ambiguous   anything else — some hold it and some do not, or the record names nobody at all.
 //               A half-applied fence and an administrator who removed one of these roles by hand
 //               produce the SAME reading here, and this function does not pretend to tell them
@@ -1367,7 +1387,12 @@ export function assessAuthorityDrift({ authorised, current, mode }) {
 
 /** Every recorded grantee still holds CONNECT: no fence took it away, so none is standing. */
 export const LEGACY_FENCE_ABSENT = 'absent'
-/** Not one recorded grantee holds CONNECT: that is what a standing fence looks like. */
+/**
+ * Not one recorded grantee holds CONNECT. What a standing fence looks like -- and equally what an
+ * administrator's own revoke of those same roles looks like, which the ACL cannot distinguish from
+ * it (o3d-secops r27). Reported with both histories named; never stamped without an operator
+ * confirming which of them is theirs.
+ */
 export const LEGACY_FENCE_STANDS = 'stands'
 /** A mixed reading, or nothing to read. Never resolved automatically in either direction. */
 export const LEGACY_FENCE_AMBIGUOUS = 'ambiguous'
@@ -2275,14 +2300,57 @@ export async function doAuditAuthority(client, options) {
   // branch of anything, a rig included.
   const { rows: audited } = await client.query(
     `SELECT current_database()                        AS audited_database,
+            -- THE ROLE HALF OF THE SAME QUESTION (o3d-secops r27, Codex HIGH). session_user is the
+            -- role this connection LOGGED IN as and current_user the role it is RUNNING as. The
+            -- identity gate below wants both, for the reason --preflight, --fence and --release
+            -- read them: CONNECT belongs to the login role, and an ACL answer given under a
+            -- SET ROLE is an answer about a different role from the one whose CONNECT is at issue.
+            session_user                              AS audited_login_role,
+            current_user                              AS audited_effective_role,
             pg_catalog.pg_get_userbyid(d.datdba)      AS audited_owner_role,
             d.datacl::text                            AS audited_datacl
        FROM pg_database d
       WHERE d.datname = current_database()`,
   )
   const connectedDatabase = audited[0]?.audited_database ?? ''
+  const connectedLoginRole = audited[0]?.audited_login_role ?? ''
+  const connectedEffectiveRole = audited[0]?.audited_effective_role ?? ''
   const ownerRole = audited[0]?.audited_owner_role ?? ''
   const datacl = audited[0]?.audited_datacl ?? null
+
+  // THE IDENTITY GATE EVERY OTHER CONNECTING MODE PASSES THROUGH, AND IT WAS MISSING FROM THIS ONE
+  // (o3d-secops r27, Codex HIGH). This mode bound the DATABASE NAME and nothing else: it compared
+  // `current_database()` with the name the record carries, and two clusters can satisfy that at
+  // once. A DEPLOY_ADMIN_DATABASE_URL that has been changed -- or that was always pointing at
+  // staging -- reaches a DIFFERENT SERVER whose database happens to be called the same thing. That
+  // server is not fenced, so its ACL shows every recorded grantee holding CONNECT, the verdict is
+  // `absent`, and root DELETES the sole authority for a fence still standing on the real cluster;
+  // after which nothing can release that fence automatically and the release wrapper has no
+  // grantee list to restore from.
+  //
+  // requireBoundDatabaseIdentity() is the binding --preflight, --fence and --release already use,
+  // CALLED here rather than re-spelt: one rule with several readers stays one rule only while
+  // every reader calls it, and the reader that did not is how this round's defect got in. It
+  // refuses unless the admin URL names the same HOST and PORT as --app-host/--app-port and the
+  // same database as --app-database, the connection actually landed on that database, and the role
+  // it logged in as is both the role the URL names and the role it is running as.
+  //
+  // WHAT IT DOES NOT PROVE, said plainly. --release additionally opens the application's own
+  // DATABASE_URL and compares `pg_postmaster_start_time()` across the two connections, which
+  // catches a URL that NAMES the right host and RESOLVES somewhere else. That cross-check is not
+  // available here and cannot be made so: this mode is asked precisely when a fence may be
+  // standing, and a standing fence is exactly what closes the application's own connection, so its
+  // failure would report "no answer" for the very reason the answer is "a fence is standing". The
+  // bind here is the argv/URL/connection triple, which is the same bind --preflight and --fence
+  // are held to before anything is revoked.
+  //
+  // A REFUSAL HERE PRINTS NO VERDICT LINE AT ALL. The wrapper acts only on a status and a verdict
+  // that agree, so a mode that emits neither leaves the record byte for byte as it was found.
+  if (!requireBoundDatabaseIdentity(
+    { database: connectedDatabase, loginRole: connectedLoginRole, effectiveRole: connectedEffectiveRole },
+    'NOT AUDITED',
+    options,
+  )) return EXIT_ERROR
 
   // THE SAME PROVENANCE GATE AS EVERY OTHER READER OF THIS RECORD. The verdict this prints decides
   // whether root stamps a fence applied — which buys the recovery rule, which is the tolerance the
@@ -2319,8 +2387,20 @@ export async function doAuditAuthority(client, options) {
     console.error('EVERY recorded grantee still holds CONNECT, so the REVOKE this record describes cannot have run:')
     console.error('it names exactly these roles. NO FENCE IS STANDING behind this record.')
   } else if (evidence.verdict === LEGACY_FENCE_STANDS) {
-    console.error('NOT ONE recorded grantee holds CONNECT. That is the signature of the fence this record describes,')
-    console.error('and A FENCE IS STANDING behind it.')
+    // WHAT THIS READING IS, AND WHAT IT IS NOT (o3d-secops r27, Codex HIGH). It used to say "A
+    // FENCE IS STANDING", which is a claim about the CAUSE of an ACL that records only its STATE.
+    // Both histories below end at exactly this ACL, nothing in Postgres separates them after the
+    // fact, and the action this reading leads to -- stamping, and therefore a later GRANT CONNECT
+    // back to every role named -- is the dangerous one of the two. So the evidence is printed and
+    // the operator decides; see the section above assessLegacyFenceEvidence().
+    console.error('NOT ONE recorded grantee holds CONNECT. That is consistent with TWO DIFFERENT HISTORIES, and')
+    console.error('nothing readable from here tells them apart:')
+    console.error('  * the fence this record describes RAN, and took CONNECT from exactly these roles; or')
+    console.error('  * an ADMINISTRATOR took CONNECT from every one of these roles, independently of any fence.')
+    console.error('The ACL records what the grants ARE and never what made them that way, and Postgres keeps no')
+    console.error('after-the-fact account of either. STAMPING this record is what later lets the release wrapper')
+    console.error('GRANT CONNECT back to every role listed above, so it does not follow from this reading alone:')
+    console.error('the operator who knows which history is theirs must say so.')
   } else if (evidence.recorded.length === 0) {
     console.error('The record names NO grantees, so there is nothing whose CONNECT could answer the question either')
     console.error('way. This is not a reading of the ACL; it is the absence of one. NOTHING may be concluded.')

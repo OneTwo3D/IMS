@@ -2727,11 +2727,13 @@ So **every automatic path refuses it**:
   names the wrapper below;
 * the **executor** resolves an unrecognised `fence_mode` to `initial` as well, as defence in depth.
 
-**Nothing on the filesystem can settle it — the ACL can.** The fence's whole effect is that the
-recorded grantees lose `CONNECT`, so asking whether they still hold it asks whether the fence is
-standing. That question is asked by a read-only mode, `--audit-authority` (no `BEGIN`, no `GRANT`,
-no `REVOKE`, no write), and acted on by a third root-owned wrapper an operator runs **once**,
-deliberately, and no cutover ever runs:
+**Nothing on the filesystem can settle it — the ACL settles half of it.** The fence's whole effect
+is that the recorded grantees lose `CONNECT`, so a grantee that **still holds** it proves no revoke
+took it away, and that half is conclusive whoever was at the keyboard. The other half is not: the
+ACL is a statement of the grants **as they are** and carries no history, so the absence of a grant
+is evidence of a revoke and never evidence of *whose*. The question is asked by a read-only mode,
+`--audit-authority` (no `BEGIN`, no `GRANT`, no `REVOKE`, no write), and acted on by a third
+root-owned wrapper an operator runs **once**, deliberately, and no cutover ever runs:
 
 ```
 sudo /etc/ims-cutover-recovery/resolve-legacy-db-fence
@@ -2739,9 +2741,68 @@ sudo /etc/ims-cutover-recovery/resolve-legacy-db-fence
 
 | what the ACL says about the recorded grantees | what it means | what the wrapper does |
 | --- | --- | --- |
-| every one of them still holds `CONNECT` | the `REVOKE` names exactly those roles, so it cannot have run | **clears** the record; the next cutover plans an `initial` fence as on any other host |
-| not one of them holds `CONNECT` | that is the fence's own signature | **stamps** it `fence_applied: 1`; the fence is still up, and a re-fence over it now uses `recovery` |
+| every one of them still holds `CONNECT` | the `REVOKE` names exactly those roles, so it cannot have run | **clears** the record, automatically; the next cutover plans an `initial` fence as on any other host |
+| not one of them holds `CONNECT` | **two histories, and the ACL cannot tell them apart**: this fence revoked them, or an administrator revoked the same roles independently | **reports** it — the recorded grantees, that none holds `CONNECT`, and both histories — and **changes nothing** until the operator confirms (below) |
 | some do and some do not, or the record names nobody | a half-applied fence and an administrator's own revoke read identically | **refuses**, changes nothing, and prints both lists |
+
+##### Why the clear is automatic and the stamp is not (o3d-secops r27)
+
+**The two outcomes are not symmetric, so they do not share an evidential bar.** Clearing a record
+nothing stands behind restores nobody's privilege — it is inert whichever history produced the
+reading. **Stamping is what later restores privilege:** a stamped record is one the release wrapper,
+and a `recovery` re-fence, will `GRANT CONNECT` back from, *to every role it names*. If those roles
+lost `CONNECT` because an administrator deliberately took it from them, stamping is the first step
+of handing it back — on evidence that cannot rule that history out.
+
+So the stamp requires the operator to say, in as many words, that the fence is theirs:
+
+```
+sudo /etc/ims-cutover-recovery/resolve-legacy-db-fence --this-fence-revoked-them
+```
+
+Run **without** it, the resolution still does its whole read — the record is inspected, the ACL is
+audited, the grantee list and both possible histories are printed — and then changes nothing. That
+is the two-step on purpose: the first run is what shows you the roles you are about to authorise a
+later `GRANT` for. **The argument authorises nothing by itself.** It is read after the audit, never
+before, and it is consulted on one reading only; a mixed ACL, an audit that could not bind its
+identity, and a record that is not the ambiguous one are refused with it exactly as without it.
+
+If any of those roles was revoked deliberately and must stay revoked, **do not stamp**. Either leave
+the record alone — every automatic path goes on refusing it, which is the safe state — or take the
+fence down with the release wrapper, which restores from the record without needing the stamp and
+will grant those roles back too, so re-revoke them by hand afterwards.
+
+**Is there better evidence anywhere?** No, and it was looked for rather than assumed. Postgres event
+triggers do not fire for DDL targeting **shared objects**, which is what a database is, so
+`REVOKE ... ON DATABASE` cannot be captured by one. `track_commit_timestamp` is `off` by default and
+"can only be set at server start", so it is never retroactive for a record already on disk — and at
+best it would date the last change to the `pg_database` row, not attribute it. `pgaudit` or
+`log_statement = 'ddl'` would record the statement and its session role, but they are opt-in, equally
+non-retroactive, and write to the server's own log, which the audit — deliberately unprivileged —
+cannot read. For fences raised **from this round onward** the question does not arise: `fence_applied`
+is written by root the moment the fence goes up, and this whole procedure exists only for records
+that predate it.
+
+##### The audit binds the cluster, not just the database name (o3d-secops r27)
+
+`--audit-authority` is held to the same identity gate as `--preflight`, `--fence` and `--release`:
+`DEPLOY_ADMIN_DATABASE_URL` must name the same host, port and database as `--app-host/--app-port/
+--app-database`, the connection must have landed on that database, and the role it logged in as
+(`session_user`) must be the role the URL names and the role it is running as (`current_user`).
+
+It bound only the **database name** when it shipped, and a name is not a cluster. An admin URL
+pointing at a different server whose database happens to be called the same thing reaches an
+**unfenced** host: every recorded grantee holds `CONNECT` there, the verdict is `absent`, and the
+wrapper deletes the sole authority for a fence still standing on the real cluster — after which
+nothing can release it automatically. A refusal here prints **no verdict line at all**, so neither of
+the wrapper's two channels can be acted on and the record is left byte for byte as it was found.
+
+One thing the gate cannot do here, said plainly: `--release` additionally opens the application's own
+`DATABASE_URL` and compares `pg_postmaster_start_time()` across both connections, which catches a URL
+that *names* the right host and *resolves* elsewhere. That cross-check is unavailable to the audit and
+cannot be made available — the audit is asked precisely when a fence may be standing, and a standing
+fence is exactly what closes the application's connection, so its failure would report "no answer" for
+the very reason the answer is "a fence is standing".
 
 **Partial results fail toward refusing, at every step.** An audit that cannot connect, cannot read
 the record, is pointed at another database, exits with a status the wrapper does not enumerate, or

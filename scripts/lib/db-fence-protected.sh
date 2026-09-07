@@ -1353,11 +1353,11 @@ if (priorMeta !== null) {
       // to a fence nobody can show exists, which is how a later --release comes to GRANT CONNECT
       // back to a role an administrator deliberately removed.
       process.stderr.write("The record at " + destination + " carries no applied stamp at all (no `fence_applied` key), so it was published by a validator that predates the stamp. That dates its WRITER and says nothing about whether that writer's REVOKE ever committed: the predecessor published its record BEFORE running the fence, so this is equally what a fence raised then leaves and what a publication killed before BEGIN leaves.\n");
-      process.stderr.write("Nothing on the filesystem can tell those apart. Only the live ACL can: a fence is standing exactly when the grantees this record names have lost CONNECT.\n");
+      process.stderr.write("Nothing on the filesystem can tell those apart, and the live ACL settles only half of it: a grantee that STILL HOLDS CONNECT proves no revoke took it, so a record every grantee still holds against is one no fence stands behind. The other half it cannot settle -- the ACL records what the grants ARE and never what made them so, and roles that have all lost CONNECT look the same whether this fence took it or an administrator did.\n");
       if (resolveWrapper) {
-        process.stderr.write("Resolve it once, deliberately, by running " + resolveWrapper + " AS ROOT (prefix it with `sudo` if the shell reading this is not root's) -- it reads the ACL and either clears a record no fence stands behind or stamps one that a fence does, and refuses on a mixed reading. If a fence IS standing and you would rather simply take it down, the release wrapper restores from this record without needing the stamp.\n");
+        process.stderr.write("Resolve it once, deliberately, by running " + resolveWrapper + " AS ROOT (prefix it with `sudo` if the shell reading this is not root's). It READS and REPORTS: it clears a record every grantee still holds CONNECT against, it refuses a mixed reading, and where NO recorded grantee holds CONNECT it prints both histories that is consistent with and changes nothing -- stamping that record takes a second run with --this-fence-revoked-them, because the stamp is what later grants CONNECT back to every role it names. If a fence IS standing and you would rather simply take it down, the release wrapper restores from this record without needing the stamp.\n");
       } else {
-        process.stderr.write("Resolve it once, deliberately, with the operator resolution wrapper in the cutover recovery directory -- it reads the ACL and either clears a record no fence stands behind or stamps one that a fence does. If a fence IS standing and you would rather simply take it down, the release wrapper restores from this record without needing the stamp.\n");
+        process.stderr.write("Resolve it once, deliberately, with the operator resolution wrapper in the cutover recovery directory. It READS and REPORTS: it clears a record every grantee still holds CONNECT against, it refuses a mixed reading, and where NO recorded grantee holds CONNECT it prints both histories that is consistent with and changes nothing -- stamping that record takes a second run with --this-fence-revoked-them. If a fence IS standing and you would rather simply take it down, the release wrapper restores from this record without needing the stamp.\n");
       }
       fail("an authority that cannot be shown to be either standing or spent may not be re-fenced automatically. Nothing has been published and nothing has been revoked.");
     } else if (prior.fence_applied === 1) {
@@ -2049,13 +2049,41 @@ release_the_fence() {
 # reading:
 #
 #   every recorded grantee still holds CONNECT   the REVOKE cannot have run -> the record is what a
-#                                                publication killed before BEGIN left -> CLEAR it.
-#   not one of them holds CONNECT                that is the fence's own signature -> a fence
-#                                                stands -> STAMP it applied.
+#                                                publication killed before BEGIN left -> CLEAR it,
+#                                                automatically.
+#   not one of them holds CONNECT                EVIDENCE, NOT A CAUSE (o3d-secops r27, Codex
+#                                                HIGH). The fence this record describes produces
+#                                                this reading, and so does an administrator who
+#                                                revoked those same roles independently; the ACL
+#                                                records the STATE of the grants and never what
+#                                                made them that way. REPORT it and STOP, unless the
+#                                                operator has explicitly confirmed that this fence
+#                                                is theirs -- see the asymmetry below.
 #   anything else                                REFUSE. A half-applied fence and an administrator
 #                                                who removed one of these roles by hand read
 #                                                identically here, and guessing between them is the
-#                                                whole defect this round removed.
+#                                                whole defect r26 removed.
+#
+# AND THE TWO OUTCOMES ARE NOT SYMMETRIC, WHICH IS WHY THEY DO NOT SHARE AN EVIDENTIAL BAR
+# (o3d-secops r27, Codex HIGH). Clearing a record no fence stands behind restores nobody's
+# privilege: it is inert whichever history produced the reading, so it stays automatic. STAMPING is
+# the direction that LATER RESTORES PRIVILEGE -- a stamped record is one ${release_wrapper}
+# and a recovery re-fence will GRANT CONNECT back from, to every role it names -- so on the reading
+# that cannot distinguish "this fence revoked them" from "an administrator revoked them", stamping
+# would be the first step of handing access back to roles somebody deliberately removed. It
+# therefore requires the operator to say, in as many words, that the fence is theirs:
+#
+#   ${self} --this-fence-revoked-them
+#
+# Run WITHOUT that argument the resolution still does its whole read -- the record is inspected,
+# the ACL is audited, the grantee lists and both possible histories are printed -- and then changes
+# nothing. That is the two-step on purpose: the first run is what shows the operator the roles they
+# are about to authorise a later GRANT for.
+#
+# AND THE ARGUMENT AUTHORISES NOTHING BY ITSELF. It is read after the audit, never before, and it
+# is consulted on ONE reading: a `stands` verdict from a helper that exited 5. A mixed reading, an
+# audit that could not connect or could not bind its identity, and a record that is not the
+# ambiguous one are refused with it exactly as they are without it.
 #
 # AND A PARTIAL RESULT FAILS TOWARD REFUSING, at every step and not only at the verdict: an audit
 # that cannot connect, cannot read the record, is pointed at another database, exits with a status
@@ -2063,7 +2091,26 @@ release_the_fence() {
 # NOTHING. The record is left exactly as it was found, which keeps every automatic path refusing --
 # the state this procedure exists to leave when it cannot do better.
 resolve_legacy_fence() {
-  local verdict rc=0
+  local verdict rc=0 confirmed=0
+  # 0. THE OPERATOR'S OWN ARGUMENT, AND THE ONLY ONE THIS ACCEPTS. An unrecognised argument is a
+  #    REFUSAL rather than something ignored: a mistyped confirmation that is silently dropped
+  #    reads to the operator as "it refused for no reason", and a mistyped ANYTHING that is
+  #    silently dropped is how a flag comes to mean something nobody typed. Nothing is read from
+  #    the database or the filesystem before this returns.
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --this-fence-revoked-them) confirmed=1 ;;
+      *)
+        echo "${self}: unrecognised argument '$1'. This wrapper takes one optional argument and no others:" >&2
+        echo "" >&2
+        echo "  ${sudo_prefix}${self}                             read the record and the ACL, print what they say, change NOTHING" >&2
+        echo "  ${sudo_prefix}${self} --this-fence-revoked-them   the same, and stamp the record IF the ACL shows every recorded grantee has lost CONNECT" >&2
+        echo "" >&2
+        echo "Nothing has been read and nothing has been changed." >&2
+        return 1 ;;
+    esac
+    shift
+  done
   # 1. ROOT: is this the ambiguous record at all? It refuses a stamped one, a
   #    published-never-applied one, a truncated one and one nobody published.
   env -u NODE_OPTIONS -u NODE_PATH -u NODE_REPL_EXTERNAL_MODULE \
@@ -2087,7 +2134,21 @@ resolve_legacy_fence() {
     return 0
   fi
   if [[ "${rc}" -eq 5 && "${verdict}" == "legacy_fence_verdict=stands" ]]; then
-    echo "Not one grantee the record names holds CONNECT, so the fence it records IS standing. Stamping it applied." >&2
+    echo "Not one grantee the record names holds CONNECT. THAT IS THE EVIDENCE, and it is all of it: the list above is what the record names, and none of those roles holds CONNECT on ${expected_database} now." >&2
+    echo "It is consistent with TWO HISTORIES -- the fence this record describes revoked those roles, or an administrator revoked them independently of it -- and the ACL cannot tell you which. It records what the grants ARE, never what made them so." >&2
+    if [[ "${confirmed}" -ne 1 ]]; then
+      echo "" >&2
+      echo "NOT RESOLVED, and deliberately: nothing has been changed and the record is exactly as it was found." >&2
+      echo "Stamping it applied is what later lets ${sudo_prefix}${release_wrapper} GRANT CONNECT back to EVERY role listed above, and a recovery re-fence do the same, so it must not follow from a reading that cannot rule out an administrator's own revoke. You know whether you revoked those roles; this does not." >&2
+      echo "" >&2
+      echo "IF THIS FENCE IS YOURS -- those roles lost CONNECT to the cutover this record describes, and not to anything you or another administrator did -- say so and re-run:" >&2
+      echo "" >&2
+      echo "  ${sudo_prefix}${self} --this-fence-revoked-them" >&2
+      echo "" >&2
+      echo "IF ANY OF THOSE ROLES WAS REVOKED DELIBERATELY and must stay revoked, do not stamp. Either leave the record alone -- every automatic path goes on refusing it, which is safe -- or take the fence down with ${sudo_prefix}${release_wrapper}, which restores from this record without needing the stamp AND will grant those roles back too, so re-revoke them by hand afterwards." >&2
+      return 1
+    fi
+    echo "CONFIRMED BY THE OPERATOR (--this-fence-revoked-them): the fence this record describes is what took CONNECT from those roles. Stamping it applied." >&2
     if ! env -u NODE_OPTIONS -u NODE_PATH -u NODE_REPL_EXTERNAL_MODULE \
       node -e "${mark_applied}" -- "${state_file}"; then
       echo "The fence is standing and ${state_file} could not be stamped (the reason is above). Nothing has changed: the record still carries no stamp and every cutover still refuses it. Fix the filesystem and re-run this, or take the fence down with ${sudo_prefix}${release_wrapper}, which restores from the record without needing the stamp." >&2
@@ -2098,6 +2159,9 @@ resolve_legacy_fence() {
   fi
   echo "NOT RESOLVED: the live ACL does not settle what this record means (helper exit ${rc}, verdict '${verdict:-<none>}')." >&2
   echo "Nothing has been changed: the record is exactly as it was found, and every automatic path will go on refusing it." >&2
+  if [[ "${confirmed}" -eq 1 ]]; then
+    echo "--this-fence-revoked-them was supplied and is NOT what decided this. It is consulted on one reading only -- every recorded grantee having lost CONNECT -- and this is not that reading, so it authorised nothing." >&2
+  fi
   echo "A MIXED reading -- some recorded grantees hold CONNECT and some do not -- is not a half-answer this may round off:" >&2
   echo "a fence applied halfway and an administrator who removed one of those roles by hand look identical from here." >&2
   echo "Read the grantee list printed above against the database's ACL yourself and decide. The record's own list is what" >&2
@@ -2105,7 +2169,10 @@ resolve_legacy_fence() {
   return 1
 }
 WRAPPER_EOF
-      printf '%s\n' 'if [[ "${mode}" == "fence" ]]; then raise_the_fence; elif [[ "${mode}" == "resolve" ]]; then resolve_legacy_fence; else release_the_fence; fi'
+      # THE OPERATOR'S ARGUMENTS REACH resolve_legacy_fence AND NOTHING ELSE. The other two modes
+      # are run by automatic paths with no arguments at all, and a confirmation that could be
+      # passed to a re-fence or a release would be a flag with two meanings.
+      printf '%s\n' 'if [[ "${mode}" == "fence" ]]; then raise_the_fence; elif [[ "${mode}" == "resolve" ]]; then resolve_legacy_fence "$@"; else release_the_fence; fi'
     } | _fence_publish_file "${target}" 700 || return 1
     chown root:root "${target}" 2>/dev/null || true
   done

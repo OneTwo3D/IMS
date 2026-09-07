@@ -845,6 +845,12 @@ class FakeAdminClient {
         rows: [
           {
             audited_database: this.options.connectedDatabase ?? 'imsdb',
+            // o3d-secops r27: the audit binds its own identity now, so it asks this connection the
+            // same two-part role question every other mode asks — session_user and current_user.
+            // Read from the SAME options the other branches read, so a test can land this
+            // connection as the wrong role here exactly as it can there.
+            audited_login_role: this.options.loginRole ?? 'deployadmin',
+            audited_effective_role: this.options.effectiveRole ?? 'deployadmin',
             audited_owner_role: 'owner',
             audited_datacl: this.options.datacl === undefined ? '{owner=CTc/owner,=Tc/owner,imsapp=c/owner}' : this.options.datacl,
           },
@@ -1688,6 +1694,109 @@ test('--audit-authority reads the live ACL, decides, and touches nothing (o3d-se
     stateOwnerUid: (process.getuid?.() ?? 0) + 4242,
   }))
   assert.equal(foreignCode, EXIT_ERROR, 'a record this run does not act for may not drive a stamp')
+})
+
+/**
+ * THE AUDIT BINDS THE WHOLE IDENTITY, NOT JUST THE DATABASE NAME (o3d-secops r27, Codex HIGH).
+ *
+ * WHAT r26 GOT WRONG, in the code r26 itself added. `--audit-authority` validated exactly one
+ * thing about the cluster it had reached: that `current_database()` matched the name the record
+ * carries. TWO SERVERS CAN BOTH SATISFY THAT AT ONCE. A `DEPLOY_ADMIN_DATABASE_URL` that has been
+ * changed — or that was always pointing at staging — reaches a different host whose database
+ * happens to be called the same thing; that cluster is not fenced, so every recorded grantee holds
+ * CONNECT there, the verdict is `absent`, and the wrapper DELETES the sole authority for a fence
+ * still standing on the real cluster. `--fence` and `--release` were never exposed to this: both
+ * call requireBoundDatabaseIdentity() first. One rule, several readers, and the reader that did
+ * not call it is the one that shipped the hole.
+ *
+ * ROUTE: the shipped doAuditAuthority() over the shipped requireBoundDatabaseIdentity(), against a
+ * record the shipped validator published. The admin URL and the `--app-*` identity are moved apart
+ * one axis at a time, and what is asserted is what does NOT come out — no verdict line at all, so
+ * neither of the wrapper's two channels can be acted on — and that the authority is byte-identical
+ * afterwards.
+ *
+ * MUTATION ROUTES (each made against scripts/fence-db-connections.mjs and reverted):
+ *   1. delete the requireBoundDatabaseIdentity() call from doAuditAuthority(): the same-name/
+ *      different-host case prints `legacy_fence_verdict=absent` and exits 0 — the wrapper deleting
+ *      a standing fence's only record.
+ *   2. drop `session_user AS audited_login_role` from the audit's read: the gate then refuses
+ *      EVERY case including the bound one, which the first assertion here catches — so a gate that
+ *      refuses everything cannot pass this test either.
+ */
+test('--audit-authority refuses a same-named database on another cluster (o3d-secops r27)', async (t) => {
+  const dir = stateDir(t)
+  const stateFile = join(dir, 'db-connect-fence.json')
+  publishAuthority(stateFile, { ...SAMPLE_STATE, database: 'imsdb', revoked: ['PUBLIC', 'imsapp'] })
+  const legacy = JSON.parse(readFileSync(stateFile, 'utf8'))
+  delete legacy.fence_applied
+  delete legacy.fence_mode
+  writeFileSync(stateFile, `${JSON.stringify(legacy, null, 2)}\n`)
+  const untouched = readFileSync(stateFile, 'utf8')
+
+  // THE APPLICATION'S OWN SERVER, as the caller states it on argv and never derives it.
+  const APP = { appHost: 'db.internal', appPort: '6432', appUser: 'imsapp', appDatabase: 'imsdb' }
+  const UNFENCED = '{owner=CTc/owner,=Tc/owner,imsapp=c/owner}'
+
+  const audit = async (adminUrl: string, options: Record<string, unknown> = {}, client: Record<string, unknown> = {}) => {
+    const fake = new FakeAdminClient({ stateFile, datacl: UNFENCED, connectedDatabase: 'imsdb', ...client })
+    const out: string[] = []
+    const err: string[] = []
+    const stdout = process.stdout.write.bind(process.stdout)
+    const stderr = process.stderr.write.bind(process.stderr)
+    const previous = process.env.DEPLOY_ADMIN_DATABASE_URL
+    process.env.DEPLOY_ADMIN_DATABASE_URL = adminUrl
+    process.stdout.write = ((chunk: string) => { out.push(String(chunk)); return true }) as typeof process.stdout.write
+    process.stderr.write = ((chunk: string) => { err.push(String(chunk)); return true }) as typeof process.stderr.write
+    try {
+      const code = await doAuditAuthority(fake as never, {
+        stateFile, appRole: 'imsapp', ...suppliedIdentity(APP), ...options,
+      })
+      return { code, verdict: out.join('').trim(), said: err.join(''), log: fake.log }
+    } finally {
+      process.stdout.write = stdout
+      process.stderr.write = stderr
+      if (previous === undefined) delete process.env.DEPLOY_ADMIN_DATABASE_URL
+      else process.env.DEPLOY_ADMIN_DATABASE_URL = previous
+    }
+  }
+
+  // 0. THE BOUND CASE STILL DECIDES. Without this the rest is satisfied by a gate that refuses
+  //    everything, which would be a regression wearing the shape of a fix.
+  const bound = await audit('postgres://deployadmin@db.internal:6432/imsdb')
+  assert.equal(bound.verdict, `legacy_fence_verdict=${LEGACY_FENCE_ABSENT}`, bound.said)
+  assert.equal(bound.code, EXIT_OK, bound.said)
+
+  // 1. THE FINDING ITSELF: THE SAME DATABASE NAME, ON ANOTHER HOST. The ACL supplied is the
+  //    UNFENCED one, which is what an unfenced bystander cluster shows and is exactly the reading
+  //    that made r26 delete the record.
+  const elsewhere = await audit('postgres://deployadmin@replica.internal:6432/imsdb')
+  assert.equal(elsewhere.code, EXIT_ERROR, `another cluster settles nothing:\n${elsewhere.said}`)
+  assert.equal(elsewhere.verdict, '', `and must print NO verdict line:\n${elsewhere.verdict}`)
+  assert.match(elsewhere.said, /NOT AUDITED/, elsewhere.said)
+  assert.match(elsewhere.said, /replica\.internal/, `naming the host it actually reached:\n${elsewhere.said}`)
+
+  // 2. AND THE REST OF THE SAME AXIS, because a host check that ignores the port, the role it
+  //    logged in as, or a SET ROLE is a host check with three ways round it.
+  const apart: [string, string, Record<string, unknown>, Record<string, unknown>][] = [
+    ['a different port on the right host', 'postgres://deployadmin@db.internal:5432/imsdb', {}, {}],
+    ['a different database in the URL', 'postgres://deployadmin@db.internal:6432/otherdb', {}, {}],
+    ['a login role the URL does not name', 'postgres://deployadmin@db.internal:6432/imsdb', {}, { loginRole: 'someoneelse', effectiveRole: 'someoneelse' }],
+    ['a connection running under SET ROLE', 'postgres://deployadmin@db.internal:6432/imsdb', {}, { loginRole: 'deployadmin', effectiveRole: 'postgres' }],
+    ['a connection landed on another database', 'postgres://deployadmin@db.internal:6432/imsdb', {}, { connectedDatabase: 'otherdb' }],
+    ['no --app-host supplied at all', 'postgres://deployadmin@db.internal:6432/imsdb', { appHost: '' }, {}],
+  ]
+  for (const [label, adminUrl, options, client] of apart) {
+    const run = await audit(adminUrl, options, client)
+    assert.equal(run.code, EXIT_ERROR, `${label}: must refuse:\n${run.said}`)
+    assert.equal(run.verdict, '', `${label}: and print no verdict:\n${run.verdict}`)
+    assert.deepEqual(run.log.filter((sql) => /^(BEGIN|COMMIT|ROLLBACK|GRANT|REVOKE)/.test(sql)), [],
+      `${label}: and issue nothing:\n${run.log.join(' | ')}`)
+  }
+
+  // 3. AND THE AUTHORITY IS BYTE FOR BYTE WHAT IT WAS, through all of it. This is the property the
+  //    finding is about: the record is the only account of what the real cluster's fence revoked,
+  //    and an audit that reached the wrong cluster must not be able to cost anything at all.
+  assert.equal(readFileSync(stateFile, 'utf8'), untouched, 'the record must be untouched')
 })
 
 /**
