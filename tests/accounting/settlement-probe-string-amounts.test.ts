@@ -89,11 +89,29 @@ const probeInvoice = (body: Record<string, unknown>) => probeXeroSettlement(
   ledgerDouble({ 'Invoices/inv-1': { Invoices: [{ InvoiceID: 'inv-1', ...body }] } }).get,
 )
 
-/** ARM 1: the Xero credit note's `Total - RemainingCredit` against its Allocations collection. */
-const probeNote = (body: Record<string, unknown>) => probeXeroSettlement(
+/**
+ * ARM 1: the Xero credit note's `Total - RemainingCredit` against its Allocations collection.
+ *
+ * `refunds` STUBS `Payments/{id}` (o3d-acctmoney r3), and it is deliberately NOT defaulted. The arm
+ * resolves any nested payment whose `Status` the credit note withheld, and what that resolution says
+ * is the whole subject of this section — a helper that quietly answered AUTHORISED for every id would
+ * make the DELETED case unreachable from a test, which is the shape of the defect being fixed. So a
+ * note whose payments state no status must say here what those payments ARE, or the lookup 404s and
+ * the arm refuses, loudly.
+ */
+const probeNote = (body: Record<string, unknown>, refunds: Record<string, unknown> = {}) => probeXeroSettlement(
   { type: 'PURCHASE_CREDIT_NOTE_ALLOCATION', payload: { accountingInvoiceId: 'inv-1', creditNoteId: 'cn-1' } },
-  ledgerDouble({ 'CreditNotes/cn-1': { CreditNotes: [{ CreditNoteID: 'cn-1', ...body }] } }).get,
+  ledgerDouble({
+    'CreditNotes/cn-1': { CreditNotes: [{ CreditNoteID: 'cn-1', ...body }] },
+    ...Object.fromEntries(Object.entries(refunds).map(([id, payment]) => [
+      `Payments/${id}`,
+      { Payments: [{ PaymentID: id, ...(payment as Record<string, unknown>) }] },
+    ])),
+  }).get,
 )
+
+/** The commonest resolution there is: the refund Xero has not reversed. */
+const AUTHORISED_REFUND = { Status: 'AUTHORISED', PaymentType: 'APCREDITPAYMENT' }
 
 /* ------------------------------------------------------------------------------------------- *
  * 1. THE FINDING, END TO END: A STRING `TotalAmt` IS READ, THE CHECK RUNS ON IT, AND THE `clear`
@@ -2060,7 +2078,9 @@ test('[o3d-jfhi] a partially REFUNDED credit note classifies normally, and the r
   assert.equal(REFUNDED_NOTE.Payments.reduce((sum, pay) => sum + pay.Amount, 0), 100,
     'while the payments collection accounts for every penny of it')
 
-  const probe = await probeNote(REFUNDED_NOTE)
+  // o3d-acctmoney r3: the note states no status on its refund, so the arm resolves the payment. It
+  // is AUTHORISED, which is what makes this an ordinary refunded credit note rather than Codex's.
+  const probe = await probeNote(REFUNDED_NOTE, { 'PAY-R1': AUTHORISED_REFUND })
   assert.equal(probe.ok, true, 'a refunded credit note is not an incoherent response')
   assert.equal(probe.ok === true ? probe.provedComplete : null, true)
   assert.equal(classifyLedgerSettlement(attemptFor('300.00'), probe).outcome, 'clear',
@@ -2080,7 +2100,7 @@ test('[o3d-jfhi] a partially REFUNDED credit note classifies normally, and the r
   assert.equal(MIXED.Total - MIXED.RemainingCredit, 200, 'PRECONDITION: the two-term figure is 200...')
   assert.equal(MIXED.Allocations[0]!.Amount, 100, '...against allocations of only 100')
 
-  const mixed = await probeNote(MIXED)
+  const mixed = await probeNote(MIXED, { 'PAY-R1': AUTHORISED_REFUND })
   assert.equal(mixed.ok, true, 'once the refund is a term, the figure and the collection agree at 100')
   assert.equal(mixed.ok === true ? mixed.provedComplete : null, true,
     'so the collection is proved complete rather than contradicted')
@@ -2163,14 +2183,16 @@ test('[o3d-jfhi] an UNREADABLE new term refuses rather than passing, and names w
   // A REFUND WHOSE AMOUNT CANNOT BE READ.
   const badRefund = await probeNote({
     ...COHERENT_IF_ZERO, Payments: [{ PaymentID: 'PAY-R1', Amount: 'a hundred' }],
-  })
+  }, { 'PAY-R1': AUTHORISED_REFUND })
   assert.equal(badRefund.ok, false, 'a stated refund IMS cannot measure is not the same as no refund')
   assert.match(reasonOf(badRefund), /a hundred on a payment against this credit note/)
   assert.notEqual(classifyLedgerSettlement(attemptFor('400.00'), badRefund).outcome, 'clear')
 
   // A REFUND ENTRY WITH NO AMOUNT AT ALL. Not the same as an ABSENT COLLECTION: the ledger has said
   // a payment exists, so "there are none" is not available as a reading of it.
-  const amountlessRefund = await probeNote({ ...COHERENT_IF_ZERO, Payments: [{ PaymentID: 'PAY-R1' }] })
+  const amountlessRefund = await probeNote(
+    { ...COHERENT_IF_ZERO, Payments: [{ PaymentID: 'PAY-R1' }] }, { 'PAY-R1': AUTHORISED_REFUND },
+  )
   assert.equal(amountlessRefund.ok, false,
     'a payment the ledger listed without an amount is a refund IMS cannot account for')
   assert.match(reasonOf(amountlessRefund), /payment against this credit note with no amount/)
@@ -2185,7 +2207,7 @@ test('[o3d-jfhi] an UNREADABLE new term refuses rather than passing, and names w
   assert.equal(overBoundCis.ok, false, 'a deduction at the difference bound cannot be subtracted to half a penny')
   const overBoundRefund = await probeNote({
     ...COHERENT_IF_ZERO, Payments: [{ PaymentID: 'PAY-R1', Amount: ledgerDifferenceMagnitudeBound('GBP') }],
-  })
+  }, { 'PAY-R1': AUTHORISED_REFUND })
   assert.equal(overBoundRefund.ok, false, 'and neither can a refund at it')
 })
 
@@ -2236,7 +2258,7 @@ test('[o3d-jfhi] the contradiction checks still catch a genuine contradiction, b
   }
   assert.equal(IMPOSSIBLE.Total - IMPOSSIBLE.RemainingCredit - IMPOSSIBLE.Payments[0]!.Amount, -100,
     'PRECONDITION: the identity yields a NEGATIVE allocation usage, which cannot be a count of money')
-  const impossible = await probeNote(IMPOSSIBLE)
+  const impossible = await probeNote(IMPOSSIBLE, { 'PAY-R1': AUTHORISED_REFUND })
   assert.equal(impossible.ok, false, 'a response that refutes the identity is not one to certify a collection from')
   assert.match(reasonOf(impossible), /remaining credit is larger than its own total less what has been taken off it/)
   assert.match(reasonOf(impossible), /100\.00 refunded/,
@@ -2330,7 +2352,7 @@ test('[o3d-acctmoney r2] Codex\'s exact shape cannot clear: a DELETED refund is 
   const ordinary = await probeNote({
     CurrencyCode: 'GBP', Total: 400, RemainingCredit: 300, Allocations: [],
     Payments: [{ PaymentID: 'PAY-R1', Amount: 100 }],
-  })
+  }, { 'PAY-R1': AUTHORISED_REFUND })
   assert.equal(ordinary.ok, true, 'an ordinary refunded credit note is not an incoherent response')
   assert.equal(ordinary.ok === true ? ordinary.provedComplete : null, true,
     'its emptiness is still proved by the identity, exactly as o3d-jfhi left it')
@@ -2349,7 +2371,7 @@ test('[o3d-acctmoney r2] Codex\'s exact shape cannot clear: a DELETED refund is 
   assert.equal(classifyLedgerSettlement(attemptFor('400.00'), deletedUnreadable).outcome, 'clear')
   const countedUnreadable = await probeNote({
     ...COHERENT, Payments: [{ PaymentID: 'PAY-R1', Amount: 'a hundred' }],
-  })
+  }, { 'PAY-R1': AUTHORISED_REFUND })
   assert.equal(countedUnreadable.ok, false,
     'PRECONDITION: the identical unreadable amount on a COUNTED payment still refuses (o3d-jfhi), so '
     + 'the case above turns on the exclusion and not on the reader having gone soft')
@@ -2383,7 +2405,10 @@ test('[o3d-acctmoney r2] an ordinary refunded credit note still classifies norma
     ['an APCREDITPAYMENT', { PaymentID: 'PAY-R1', Amount: 100, PaymentType: 'APCREDITPAYMENT' }],
     ['both fields stated', { PaymentID: 'PAY-R1', Amount: 100, Status: 'AUTHORISED', PaymentType: 'APCREDITPAYMENT' }],
   ] as const) {
-    const probe = await probeNote({ ...REFUNDED, Payments: [payment] })
+    // o3d-acctmoney r3: the first case states no status, so it is resolved through `Payments/{id}`;
+    // the rest state one and never reach the lookup. The stub is supplied for all of them so the loop
+    // stays one loop, and the case that does not use it is not made a different kind of test by it.
+    const probe = await probeNote({ ...REFUNDED, Payments: [payment] }, { 'PAY-R1': AUTHORISED_REFUND })
     assert.equal(probe.ok, true, `${label}: a refund Xero has not reversed is still a term`)
     assert.equal(probe.ok === true ? probe.provedComplete : null, true,
       `${label}: so the empty allocation collection is proved by the identity, not assumed`)
