@@ -1512,6 +1512,141 @@ for (const entry of FENCE_HARNESS) {
     }
   })
 
+  test(`${entry.name} publishes the authority before it revokes, and root clears it after the release`, () => {
+    /**
+     * o3d-secops r23, Codex CRITICAL — THE WHOLE CYCLE, THROUGH THE SHIPPED SHELL.
+     *
+     * The ordering property the helper used to own is now the caller's: a REVOKE is a committed
+     * transaction that outlives a power cut, this record is the only thing that undoes it, and so
+     * the record has to be DURABLE BEFORE the revoke is issued. db_fence_raise() plans, hands the
+     * plan to the privileged validator, and only then invokes `--fence`.
+     *
+     * OBSERVED AT THE HELPER, not asserted from the source: the stub records, for each mode, what
+     * was at the authority path at the moment it ran. A publication ordered after the revoke would
+     * show `--fence` running with nothing there.
+     */
+    const dir = mkdtempSync(join(tmpdir(), 'ims-fence-cycle-'))
+    try {
+      const log = join(dir, 'modes.json')
+      // THE STUB IS WRITTEN OVER writeFenceCheckout()'s, not appended to it: the shared plan
+      // responder exits on `--plan` before anything else runs, and what this test is measuring is
+      // the ORDER of the three invocations, so it has to see that one too.
+      const helper = writeFenceCheckout(dir, '')
+      writeFileSync(helper, [
+        "import { appendFileSync, existsSync, readFileSync } from 'node:fs'",
+        "const state = process.argv.find((a) => a.startsWith('--state-file='))?.slice('--state-file='.length) ?? ''",
+        `appendFileSync(${JSON.stringify(log)}, JSON.stringify({`,
+        "  mode: process.argv.find((a) => a.startsWith('--') && !a.includes('=')),",
+        '  authority: existsSync(state) ? JSON.parse(readFileSync(state, "utf8")) : null,',
+        "}) + '\\n')",
+        "if (process.argv.includes('--plan')) {",
+        "  process.stdout.write(JSON.stringify({",
+        "    database: 'imsdb', owner_role: 'imsapp', app_role: 'imsapp', admin_role: 'deployadmin',",
+        "    revoked: ['PUBLIC', 'imsapp'], datacl_before: null, fenced_at: '2026-01-01T00:00:00.000Z',",
+        "  }) + '\\n')",
+        '}',
+        "if (process.argv.includes('--print-migration-url')) process.stdout.write('postgres://admin@127.0.0.1/nowhere\\n')",
+        'process.exit(0)',
+        '',
+      ].join('\n'))
+      const program = [
+        'set -euo pipefail',
+        entry.preamble(dir),
+        CUTOVER_DIR_PRIMITIVES,
+        shellFunction(entry.source, 'fence_db_connections'),
+        shellFunction(entry.source, 'release_db_connections'),
+        'fence_db_connections',
+        'echo "AUTHORITY=$(LC_ALL=C stat -c "%a %u" "${DB_FENCE_STATE}" 2>/dev/null || echo missing)"',
+        'release_db_connections || echo "RELEASE_FAILED"',
+        '[[ -e "${DB_FENCE_STATE}" ]] && echo AUTHORITY_REMAINS || echo AUTHORITY_CLEARED',
+      ].join('\n')
+      const output = execFileSync('bash', ['-c', program], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] })
+
+      const calls = readFileSync(log, 'utf8').split('\n').filter(Boolean).map((line) => JSON.parse(line) as { mode: string; authority: { revoked: string[] } | null })
+      const plan = calls.find((call) => call.mode === '--plan')
+      const fence = calls.find((call) => call.mode === '--fence')
+      const release = calls.find((call) => call.mode === '--release')
+      assert.ok(plan, `the helper must be asked for a plan first:\n${output}`)
+      assert.equal(plan?.authority, null, 'and it must run before anything is recorded — it is a REQUEST, not a publication')
+      assert.ok(fence, `and then asked to fence:\n${output}`)
+      assert.deepEqual(fence?.authority?.revoked, ['PUBLIC', 'imsapp'],
+        `with the authority already complete on the medium at the moment it revokes:\n${output}`)
+      assert.match(output, new RegExp(`^AUTHORITY=644 ${harnessUid()}$`, 'm'),
+        `published root-owned and unwritable by the account that executes it:\n${output}`)
+      assert.ok(release, `and the release must reach the helper:\n${output}`)
+      assert.match(output, /^AUTHORITY_CLEARED$/m,
+        `and ROOT removes the record afterwards — the helper cannot, because an unlink is a write to that directory:\n${output}`)
+      assert.ok(!/RELEASE_FAILED/.test(output), `and the release must succeed:\n${output}`)
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  test(`${entry.name} revokes nothing when the authority cannot be published`, () => {
+    /**
+     * THE REFUSAL THAT KEEPS THE ASYMMETRY CLOSED, at the layer that now owns it. The plan is
+     * computed; the publication cannot be made; and NOTHING is revoked — the helper is never
+     * invoked with `--fence` at all.
+     *
+     * ROUTE: the shipped db_fence_raise() -> db_fence_publish_authority(), refused because the
+     * destination directory is not one only this run may write. That is the same question the
+     * validator asks in the process that does the rename; this one refuses before `node` starts,
+     * so the message names the namespace.
+     */
+    const dir = mkdtempSync(join(tmpdir(), 'ims-fence-unrecordable-'))
+    try {
+      const log = join(dir, 'modes.log')
+      // Written OVER the shared stub, which answers `--plan` and exits before anything else can
+      // record that it was asked — and what this test is measuring is which modes ran at all.
+      const helper = writeFenceCheckout(dir, '')
+      writeFileSync(helper, [
+        "import { appendFileSync } from 'node:fs'",
+        `appendFileSync(${JSON.stringify(log)}, process.argv.slice(2).join(' ') + '\\n')`,
+        "if (process.argv.includes('--plan')) {",
+        "  process.stdout.write(JSON.stringify({",
+        "    database: 'imsdb', owner_role: 'imsapp', app_role: 'imsapp', admin_role: 'deployadmin',",
+        "    revoked: ['PUBLIC', 'imsapp'], datacl_before: null, fenced_at: '2026-01-01T00:00:00.000Z',",
+        "  }) + '\\n')",
+        '}',
+        'process.exit(0)',
+        '',
+      ].join('\n'))
+      const program = [
+        'set -euo pipefail',
+        entry.preamble(dir),
+        CUTOVER_DIR_PRIMITIVES,
+        shellFunction(entry.source, 'fence_db_connections'),
+        // The authority's directory, opened to everybody. On a real host this cannot happen —
+        // ${CUTOVER_ROOT_DIR} is created and proved by the namespace library — which is why the
+        // refusal has to be exhibited rather than argued: the mechanism must not rest on the mode
+        // of a directory being what the previous function left it.
+        // Its OWN directory: ensure_cutover_root_dir() re-asserts the mode of ${CUTOVER_ROOT_DIR}
+        // on every run, so a mode planted on that one would be corrected before this could
+        // measure anything.
+        'DB_FENCE_STATE="${CUTOVER_ROOT_DIR}/exposed/db-connect-fence.json"',
+        'mkdir -p "${CUTOVER_ROOT_DIR}/exposed"',
+        'chmod 777 "${CUTOVER_ROOT_DIR}/exposed"',
+        // A SUBSHELL, because `die` is `exit`: without it the refusal ends this rig and the
+        // post-conditions below it are never observed.
+        '( fence_db_connections ) || echo "FENCE_REFUSED"',
+        'echo "CALLS=$(tr "\\n" ";" < ' + JSON.stringify(log) + ' 2>/dev/null || true)"',
+      ].join('\n')
+      // BOTH STREAMS: the refusal is on stderr, which is where a refusal belongs and where a
+      // stdout-only capture would silently stop seeing it.
+      const run = spawnSync('bash', ['-c', program], { encoding: 'utf8' })
+      const output = `${run.stdout ?? ''}${run.stderr ?? ''}`
+      assert.match(output, /--plan/, `the plan must have been computed, or this test measures nothing:\n${output}`)
+      assert.ok(!/CALLS=[^\n]*--fence/.test(output),
+        `and NOTHING may be revoked when the record that undoes it could not be published:\n${output}`)
+      assert.match(output, /not a directory only this run may write/,
+        `and the refusal must name what it could not establish:\n${output}`)
+      assert.match(output, /Refusing to revoke CONNECT/,
+        `and say that this is why nothing was revoked:\n${output}`)
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
   test(`${entry.name} treats a successful fence as the only way past the drain`, () => {
     const dir = mkdtempSync(join(tmpdir(), 'ims-fence0-'))
     try {
@@ -11090,6 +11225,97 @@ for (const entry of R9_SCRIPTS) {
       `\`mkdir -p\` sees a directory and returns 0 — that is the half of the finding nobody looks at:\n${mutated.stdout}`)
     assert.match(mutated.stdout, /^MUTANT_AFTER=700$/m,
       `and the chmod then dereferences it as root — that is the other half:\n${mutated.stdout}`)
+  })
+
+  test(`${entry.name} takes a lock no other account can open, and narrows one an older run left wide`, () => {
+    /**
+     * o3d-secops r23, Codex HIGH. THE LOCK'S MODE IS LOAD-BEARING AND r22 DROPPED THE ASSERTION.
+     *
+     * `flock(2)` applies to the OPEN FILE DESCRIPTION whatever its access mode — which is why the
+     * lock is opened O_RDONLY in the first place — so READ permission on this file is permission
+     * to hold the cutover exclusion. ${CUTOVER_ROOT_DIR} has to be traversable by ${APP_USER}
+     * because ${DB_FENCE_DIR} lives under it; at 0644 that account could open this file, take
+     * `flock -n`, and refuse every deploy, update and install on the box for as long as it liked.
+     *
+     * r22's objection was right and is answered rather than overruled: the mode is SET, not
+     * asserted. Four cases, and the middle two are what "set rather than asserted" means.
+     */
+    const shipped = runR9(entry, ['acquire_cutover_lock'], [
+      ...NAMESPACE_OUTCOME_INLINE,
+      // The bits that matter, spelled out: nothing outside the owner may read it, so nothing
+      // outside the owner may open it, so nothing outside the owner may hold this lock.
+      'echo "GROUPOTHER=$(( $(LC_ALL=C stat -c "0%a" "${LOCK_FILE}") & 0077 ))"',
+    ].join('\n'), FENCE_RELOCATION_EXTRA('$CUTOVER_STATE_DIR'))
+    assert.match(shipped.stdout, /^RC=0$/m, shipped.stdout)
+    assert.match(shipped.stdout, /^LOCK=regular (empty )?file 600$/m, `the lock this run creates must be 0600:\n${shipped.stdout}`)
+    assert.match(shipped.stdout, /^GROUPOTHER=0$/m,
+      `with no bit set for group or other — that, and not the parent's mode, is what stops another account taking this lock:\n${shipped.stdout}`)
+
+    // AN AMBIENT UMASK CANNOT PRODUCE A WIDE LOCK. The creation runs under a STATED umask, so a
+    // host whose umask is 022 gets the same 0600. This is the case r22 said an assertion would
+    // turn into a refused cutover; setting the mode means there is nothing left to refuse.
+    const ambient = runR9(entry, ['acquire_cutover_lock'], [
+      'umask 000',
+      ...NAMESPACE_OUTCOME_INLINE,
+    ].join('\n'), FENCE_RELOCATION_EXTRA('$CUTOVER_STATE_DIR'))
+    assert.match(ambient.stdout, /^RC=0$/m,
+      `an ambient umask may not refuse a cutover — that was the objection to asserting the mode:\n${ambient.stdout}`)
+    assert.match(ambient.stdout, /^LOCK=regular (empty )?file 600$/m,
+      `and it may not produce a wide lock either:\n${ambient.stdout}`)
+
+    // AND A HOST UPGRADING FROM r22 HAS ONE ALREADY, AT 0644. It is narrowed rather than refused.
+    const upgraded = runR9(entry, ['acquire_cutover_lock'], [
+      'mkdir -p "${CUTOVER_ROOT_DIR}"',
+      '( umask 022; : > "${LOCK_FILE}" )',
+      'echo "BEFORE=$(LC_ALL=C stat -c "%a" "${LOCK_FILE}")"',
+      ...NAMESPACE_OUTCOME_INLINE,
+    ].join('\n'), FENCE_RELOCATION_EXTRA('$CUTOVER_STATE_DIR'))
+    assert.match(upgraded.stdout, /^BEFORE=644$/m, `the fixture must start wide, or this measures nothing:\n${upgraded.stdout}`)
+    assert.match(upgraded.stdout, /^RC=0$/m, `and the cutover must still run:\n${upgraded.stdout}`)
+    assert.match(upgraded.stdout, /^LOCK=regular (empty )?file 600$/m,
+      `and the lock left behind by the previous checkout must be narrowed, not merely complained about:\n${upgraded.stdout}`)
+
+    // MUTATION A, ROUTE STATED: the stated umask put back to r22's, with narrow_held_lock intact.
+    // The file is created 0644 and the narrowing repairs it — which is the whole claim that the
+    // property is a FACT and not an assertion about the environment.
+    const PREPARE = shellFunction(CUTOVER_NS_LIB, 'prepare_cutover_lock_file')
+    const STATED_UMASK = '( umask 077; set -C; : > "${path}" )'
+    assert.ok(PREPARE.includes(STATED_UMASK), `the shipped creation must state its own umask:\n${PREPARE}`)
+    const wideCreate = runR9(entry, ['acquire_cutover_lock'], [
+      PREPARE.replace(STATED_UMASK, '( umask 022; set -C; : > "${path}" )'),
+      ...NAMESPACE_OUTCOME_INLINE,
+    ].join('\n'), FENCE_RELOCATION_EXTRA('$CUTOVER_STATE_DIR'))
+    assert.match(wideCreate.stdout, /^LOCK=regular (empty )?file 600$/m,
+      `the narrowing must be what makes the mode true, so that no umask anywhere decides it:\n${wideCreate.stdout}`)
+
+    // MUTATION B, ROUTE STATED: and with BOTH gone, which is r22 exactly. 0644, and the run
+    // reports an exclusion any account able to open that file could have taken first.
+    const ACQUIRE = shellFunction(CUTOVER_NS_LIB, 'acquire_cutover_lock')
+    const NARROW = '  narrow_held_lock 9 || die'
+    assert.ok(ACQUIRE.includes(NARROW), `the shipped acquisition must narrow the descriptor it locks:\n${ACQUIRE}`)
+    const pre23 = runR9(entry, ['acquire_cutover_lock'], [
+      PREPARE.replace(STATED_UMASK, '( umask 022; set -C; : > "${path}" )'),
+      'narrow_held_lock() { return 0; }',
+      ...NAMESPACE_OUTCOME_INLINE,
+      'echo "MUTANT_GROUPOTHER=$(( $(LC_ALL=C stat -c "0%a" "${LOCK_FILE}") & 0077 ))"',
+    ].join('\n'), FENCE_RELOCATION_EXTRA('$CUTOVER_STATE_DIR'))
+    assert.match(pre23.stdout, /^RC=0$/m, pre23.stdout)
+    assert.match(pre23.stdout, /^LOCK=regular (empty )?file 644$/m,
+      `r22 left a world-readable lock — that is the finding:\n${pre23.stdout}`)
+    assert.match(pre23.stdout, /^MUTANT_GROUPOTHER=36$/m,
+      `readable by group and other, and readable is holdable:\n${pre23.stdout}`)
+
+    // AND THE READ-BACK IS NOT VACUOUS. With the chmod neutered — a read-only mount, an immutable
+    // attribute — narrow_held_lock() must REFUSE rather than report a mode it did not set.
+    const refused = runR9(entry, ['acquire_cutover_lock'], [
+      PREPARE.replace(STATED_UMASK, '( umask 022; set -C; : > "${path}" )'),
+      'chmod() { return 0; }',
+      ...NAMESPACE_OUTCOME,
+    ].join('\n'), FENCE_RELOCATION_EXTRA('$CUTOVER_STATE_DIR'))
+    assert.match(refused.stdout, /^RC=1$/m,
+      `a mode this run could not set must end the run, not be assumed:\n${refused.stdout}`)
+    assert.match(refused.stdout, /could not be narrowed to 0600/,
+      `and say what it could not establish:\n${refused.stdout}`)
   })
 
   test(`${entry.name} claims no exclusion over the pre-r22 lock, and says so on every run`, () => {

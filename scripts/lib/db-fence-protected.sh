@@ -1183,7 +1183,15 @@ db_fence_script_in_use() {
 # path: the whole of what root executes here is the text below.
 #
 # Arguments: <expected database> <expected app role> <destination>. The plan arrives on stdin.
-readonly DB_FENCE_AUTHORISE_PLAN_PROGRAM='
+# IT IS A FUNCTION AND NOT A CONSTANT, and the reason is the census in
+# tests/scripts/install-root-safe-writes.test.ts rather than taste: every script-scope name this
+# library declares is read, mutated and re-read one declaration at a time, and a scanner that
+# reads a declaration as a LINE cannot carry a fifty-line quoted value. A function body is the
+# shell's own way to hold a program; the function census covers it, so it still cannot come to
+# have two definitions.
+db_fence_authorise_plan_program() {
+  cat <<'AUTHORISE_PLAN_EOF'
+
 var fs = require("fs");
 var path = require("path");
 function fail(m) { process.stderr.write("NOT AUTHORISED: " + m + "\n"); process.exit(1); }
@@ -1257,13 +1265,20 @@ try {
   fail("the authority is visible at " + destination + " and its NAME is not durable (" + e.message + "), so a power cut can restore the previous directory entry");
 }
 process.stderr.write("Connection-fence authority published at " + destination + ": CONNECT will be revoked from " + record.revoked.join(", ") + " on " + record.database + ".\n");
-'
+AUTHORISE_PLAN_EOF
+}
 
 # Validate a plan on stdin and publish the authority it authorises. ROOT ONLY -- that is the whole
 # point of the function. Returns non-zero, having published nothing, on anything it cannot prove.
 db_fence_authorise_plan() {
-  local expected_database="$1" expected_app_role="$2" destination="$3"
-  node -e "${DB_FENCE_AUTHORISE_PLAN_PROGRAM}" -- "${expected_database}" "${expected_app_role}" "${destination}"
+  local expected_database="$1" expected_app_role="$2" destination="$3" program
+  # CAPTURED, WITH ITS STATUS TAKEN. `node -e "$(...)"` inline would hand node an EMPTY program on
+  # any failure of the substitution -- and node exits 0 having done nothing, which here means a
+  # revoke with no record. The rule this file is held to (docs/installation.md, the producer
+  # roster) is that a command substitution's status is taken or its failure is already a refusal.
+  program="$(db_fence_authorise_plan_program)" || return 1
+  [[ -n "${program}" ]] || return 1
+  node -e "${program}" -- "${expected_database}" "${expected_app_role}" "${destination}"
 }
 
 # The whole privileged step, from the plan text a caller captured to a published authority.
@@ -1420,7 +1435,11 @@ db_fence_publish_operator_wrappers() {
   _fence_protected_dir_ready || return 1
   artefact_digest="$(fence_record_artefact_digest)" || return 1
 
-  local identity="" arg expected_database="" expected_app_role="" expected_app_user=""
+  local identity="" arg expected_database="" expected_app_role="" expected_app_user="" baked_program
+  # The validator these wrappers carry is the library's own, captured with its status taken: a
+  # wrapper baked around an empty program would validate nothing and publish nothing, silently.
+  baked_program="$(db_fence_authorise_plan_program)" || return 1
+  [[ -n "${baked_program}" ]] || return 1
   for arg in "$@"; do
     [[ -n "${arg}" ]] || continue
     identity+=" $(printf '%q' "${arg}")"
@@ -1465,7 +1484,7 @@ db_fence_publish_operator_wrappers() {
       # can drift from the one the helper was actually told.
       printf 'expected_database=%q\n' "${expected_database}"
       printf 'expected_app_role=%q\n' "${expected_app_role}"
-      printf 'authorise_plan=%q\n' "${DB_FENCE_AUTHORISE_PLAN_PROGRAM}"
+      printf 'authorise_plan=%q\n' "${baked_program}"
       # ITS OWN ABSOLUTE PATH, baked rather than taken from $0: an instruction this file prints
       # about itself has to be one that runs from anywhere, and $0 is whatever the caller typed.
       printf 'self=%q\n' "${target}"

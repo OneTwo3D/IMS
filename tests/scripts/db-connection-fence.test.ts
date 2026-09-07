@@ -645,11 +645,14 @@ const FENCE_LIBRARY = readFileSync(join(process.cwd(), 'scripts/lib/db-fence-pro
 /** The cutover namespace library, for the one predicate the fence library reaches back for. */
 const CUTOVER_NS_LIB_SOURCE = readFileSync(join(process.cwd(), 'scripts/lib/cutover-namespace.sh'), 'utf8')
 const AUTHORISE_PLAN_PROGRAM = (() => {
-  const opener = "readonly DB_FENCE_AUTHORISE_PLAN_PROGRAM='"
+  // Read out of the library's own text between the heredoc markers. `shellFunction` would answer
+  // for the function, and what is wanted is the PROGRAM the function emits — the same bytes
+  // `node -e` is handed, so that a test over it is a test over what root runs.
+  const opener = "  cat <<'AUTHORISE_PLAN_EOF'\n"
   const from = FENCE_LIBRARY.indexOf(opener)
-  assert.notEqual(from, -1, 'the shipped library must hold the plan validator in one constant')
-  const to = FENCE_LIBRARY.indexOf("\n'\n", from)
-  assert.notEqual(to, -1, 'and that constant must be terminated')
+  assert.notEqual(from, -1, 'the shipped library must emit the plan validator from one heredoc')
+  const to = FENCE_LIBRARY.indexOf('\nAUTHORISE_PLAN_EOF\n', from)
+  assert.notEqual(to, -1, 'and that heredoc must be terminated')
   return FENCE_LIBRARY.slice(from + opener.length, to + 1)
 })()
 
@@ -1053,7 +1056,7 @@ test('a record this account could have written is never a record (o3d-secops r23
 })
 
 test('the privileged validator rebuilds the record and refuses what it cannot check', (t) => {
-  // ROUTE: the shipped DB_FENCE_AUTHORISE_PLAN_PROGRAM, run exactly as db_fence_authorise_plan()
+  // ROUTE: the shipped db_fence_authorise_plan_program(), run exactly as db_fence_authorise_plan()
   // runs it. It is the only thing that writes the authority, so what it will not accept is the
   // whole of what can ever be in one.
   const dir = stateDir(t)
