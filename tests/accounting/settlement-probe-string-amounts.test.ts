@@ -1965,3 +1965,281 @@ test('[o3d-zo4j] the arms whose unmeasurable term IS a record are left alone, be
       `${label}: BEFORE the completeness gate is reached — which is why no gate is needed here`)
   }
 })
+
+
+/* ------------------------------------------------------------------------------------------- *
+ * o3d-jfhi — THE CREDIT-NOTE IDENTITY HAD TWO MISSING TERMS, NOT ONE, AND BOTH WERE IN THE
+ * PUBLISHED CONTRACT ALL ALONG.
+ *
+ * THE DEFECT. The credit-note arm computed `applied = Total - RemainingCredit` and measured it
+ * against `Allocations` alone. That asserts ALLOCATION IS THE ONLY THING THAT REDUCES A CREDIT NOTE.
+ * The `CreditNote` schema says otherwise twice — `CISDeduction` ("CIS deduction for UK contractors")
+ * and `Payments` (Xero records a refund of a credit note through the payments endpoint;
+ * `Payment.PaymentType` enumerates `ARCREDITPAYMENT`/`APCREDITPAYMENT` for exactly that). So every
+ * CIS credit note and every refunded credit note was REFUSED — the invoice arm's harm, on the arm
+ * the previous round left, and on the FIRST allocation.
+ *
+ * The previous round declined to fix it, reasoning that it could not know whether a credit note
+ * carries a deduction without a live CIS tenant. It could: a vendor's published schema is
+ * documentation, not an API call. That is the finding underneath the finding, and it is why these
+ * tests exist rather than a bd note.
+ *
+ * THE IDENTITY, and every test below turns on it:
+ *
+ *   RemainingCredit = Total - CISDeduction - SUM(Allocations.Amount) - SUM(Payments.Amount)
+ *   allocationUsage = Total - RemainingCredit - CISDeduction - SUM(Payments.Amount)
+ *
+ * Every test states the PRECONDITION it turns on, so none can pass by the property under test
+ * quietly ceasing to hold, and every one names the mutation that was measured to make it fail.
+ * ------------------------------------------------------------------------------------------- */
+
+/** Codex's CIS credit note: a supplier credit with 80 withheld under the scheme, nothing allocated. */
+const CIS_NOTE = {
+  CurrencyCode: 'GBP', Total: 400, CISDeduction: 80, RemainingCredit: 320, Allocations: [],
+} as const
+
+/** Codex's refunded credit note: 100 of the 400 taken in cash, 300 still allocatable. */
+const REFUNDED_NOTE = {
+  CurrencyCode: 'GBP',
+  Total: 400,
+  RemainingCredit: 300,
+  Allocations: [],
+  Payments: [{ PaymentID: 'PAY-R1', Amount: 100 }],
+} as const
+
+test('[o3d-jfhi] a CIS credit note classifies normally, and the first allocation still posts', async () => {
+  // ROUTE: probeXeroSettlement's credit-note arm -> wireAmount(note.CISDeduction) ->
+  //        completenessCannotRun (passes, it is readable) -> `applied` = Total - RemainingCredit -
+  //        CISDeduction - SUM(Payments) = 0 -> statesAnything(0) false -> allocated = 0 ->
+  //        exceeds(0, 0) false -> settlementAnswer(0, false, []) -> provedComplete:true ->
+  //        classifyLedgerSettlement's terminal gate -> `clear`.
+  // MUTATION: drop `noteCisDeduction` from the `applied` chain — i.e. restore
+  //        `subtractMoney(creditTotal.value, remaining.value)`, which is what stood before this
+  //        commit. Measured: ok:false, "Xero reports 80.00 of this credit note already applied but
+  //        returned no allocations" — Codex's second shape, exactly.
+
+  // PRECONDITION 1 — the TWO-term reading really does accuse this note, so there is something to
+  // fail. If Xero ever stopped reducing RemainingCredit by the deduction this would be 0 and the
+  // test would be examining nothing.
+  assert.equal(CIS_NOTE.Total - CIS_NOTE.RemainingCredit, 80,
+    'PRECONDITION: Total less RemainingCredit alone says 80 of the credit has been used...')
+  assert.equal(CIS_NOTE.Allocations.length, 0,
+    '...while the collection it would be measured against is empty, which is the refusal')
+  // PRECONDITION 2 — and the FOUR-term identity is the one that holds on this document.
+  assert.equal(CIS_NOTE.Total - CIS_NOTE.RemainingCredit - CIS_NOTE.CISDeduction, 0,
+    'PRECONDITION: with the deduction taken off, nothing has been allocated and the note is coherent')
+
+  const probe = await probeNote(CIS_NOTE)
+  assert.equal(probe.ok, true, 'a correct UK construction credit note is not an incoherent response')
+  assert.equal(probe.ok === true ? probe.records.length : -1, 0,
+    'none of it has been allocated to this bill, and the ledger says so in its own numbers')
+  assert.equal(probe.ok === true ? probe.provedComplete : null, true,
+    'the emptiness is PROVED by the four-term identity, not assumed from a missing figure')
+
+  // THE END THIS PROTECTS: `clear` is what authorises the allocation, and this is the FIRST one.
+  assert.equal(classifyLedgerSettlement(attemptFor('320.00'), probe).outcome, 'clear',
+    'the first allocation of a CIS supplier credit must post, not queue for a human')
+
+  // AND THE SAME NOTE STATED AS TEXT reads identically — one decoder for every money figure here.
+  const asText = await probeNote({ ...CIS_NOTE, CISDeduction: '80.00' })
+  assert.equal(classifyLedgerSettlement(attemptFor('320.00'), asText).outcome, 'clear')
+})
+
+test('[o3d-jfhi] a partially REFUNDED credit note classifies normally, and the rest stays allocatable', async () => {
+  // ROUTE: as above, through `refundReadings` -> `refunded` = 100 -> `applied` = 400 - 300 - 0 -
+  //        100 = 0 -> the same proved-zero path -> `clear`.
+  // MUTATION: drop `refunded` from the `applied` chain. Measured: ok:false, "Xero reports 100.00 of
+  //        this credit note already applied but returned no allocations" — Codex's first shape,
+  //        verbatim, over a note with 300 legitimately left to allocate.
+
+  // PRECONDITION 1 — the refund is the ONLY thing that could explain the difference; there is no
+  // allocation in the response to be measured instead.
+  assert.equal(REFUNDED_NOTE.Total - REFUNDED_NOTE.RemainingCredit, 100,
+    'PRECONDITION: Total less RemainingCredit says 100 has come off...')
+  assert.equal(REFUNDED_NOTE.Allocations.length, 0, '...and the allocation collection is empty')
+  assert.equal(REFUNDED_NOTE.Payments.reduce((sum, pay) => sum + pay.Amount, 0), 100,
+    'while the payments collection accounts for every penny of it')
+
+  const probe = await probeNote(REFUNDED_NOTE)
+  assert.equal(probe.ok, true, 'a refunded credit note is not an incoherent response')
+  assert.equal(probe.ok === true ? probe.provedComplete : null, true)
+  assert.equal(classifyLedgerSettlement(attemptFor('300.00'), probe).outcome, 'clear',
+    'the 300 that remains is allocatable, and this is the first allocation of it')
+
+  // AND A NOTE THAT IS BOTH REFUNDED AND PART-ALLOCATED ELSEWHERE, because the two terms must add
+  // rather than one masking the other: 400 face, 100 refunded, 100 allocated to another document.
+  const MIXED = {
+    CurrencyCode: 'GBP',
+    Total: 400,
+    RemainingCredit: 200,
+    Allocations: [{ Amount: 100, Date: '2026-06-01T00:00:00', Invoice: { InvoiceID: 'other-inv' } }],
+    Payments: [{ PaymentID: 'PAY-R1', Amount: 100 }],
+  }
+  // PRECONDITION 2 — the usage figure and the allocation collection agree ONLY once the refund is
+  // taken off. Without it the figure is 200 against a collection of 100, which is a shortfall.
+  assert.equal(MIXED.Total - MIXED.RemainingCredit, 200, 'PRECONDITION: the two-term figure is 200...')
+  assert.equal(MIXED.Allocations[0]!.Amount, 100, '...against allocations of only 100')
+
+  const mixed = await probeNote(MIXED)
+  assert.equal(mixed.ok, true, 'once the refund is a term, the figure and the collection agree at 100')
+  assert.equal(mixed.ok === true ? mixed.provedComplete : null, true,
+    'so the collection is proved complete rather than contradicted')
+  assert.equal(classifyLedgerSettlement(attemptFor('200.00'), mixed).outcome, 'clear')
+})
+
+test('[o3d-jfhi] an ORDINARY credit note is unaffected, in all three of its shapes', async () => {
+  // ROUTE: the same arm with both new terms ABSENT -> `noteCisRead.value` null -> `?? toDecimal(0)`;
+  //        `note.Payments` undefined -> `sumExact([])` = 0. The identity collapses to what it was.
+  // MUTATION: turn either absence into a refusal — e.g. make `noteCisDeduction` require
+  //        `noteCisRead.value !== null`, or make an absent `Payments` collection sum to null.
+  //        Measured: the wholly-unapplied note below stops clearing, which is every ordinary first
+  //        allocation in the system.
+
+  // 1. WHOLLY UNAPPLIED. The proved-zero shape the whole rule is built to let through.
+  const UNAPPLIED = { CurrencyCode: 'GBP', Total: 40, RemainingCredit: 40, Allocations: [] }
+  // PRECONDITION — neither new field is stated, so this test is genuinely about the ABSENT path.
+  assert.equal('CISDeduction' in UNAPPLIED, false, 'PRECONDITION: no deduction is stated')
+  assert.equal('Payments' in UNAPPLIED, false, 'PRECONDITION: and no payments collection is sent')
+  const unapplied = await probeNote(UNAPPLIED)
+  assert.equal(unapplied.ok === true ? unapplied.provedComplete : null, true)
+  assert.equal(classifyLedgerSettlement(attemptFor('40.00'), unapplied).outcome, 'clear',
+    'an ordinary unapplied credit note still clears, exactly as before this commit')
+
+  // 2. FULLY ALLOCATED TO THIS BILL. The record is found and the row resolves.
+  const ALLOCATED = {
+    CurrencyCode: 'GBP',
+    Total: 40,
+    RemainingCredit: 0,
+    Allocations: [{ Amount: 40, Date: `${DATE}T00:00:00`, Invoice: { InvoiceID: 'inv-1' } }],
+  }
+  const allocated = await probeNote(ALLOCATED)
+  assert.equal(allocated.ok === true ? allocated.records.length : -1, 1,
+    'PRECONDITION: the allocation names THIS bill, so it survives the filter')
+  assert.equal(classifyLedgerSettlement(attemptFor('40.00'), allocated).outcome, 'present',
+    'an allocation IMS can see is still recognised as its own attempt')
+
+  // 3. A GENUINE SHORTFALL STILL REFUSES. Widening the identity must not widen what it lets through:
+  // 30 has been used by something and the response itemises none of it.
+  const SHORT = { CurrencyCode: 'GBP', Total: 40, RemainingCredit: 10, Allocations: [] }
+  assert.equal(SHORT.Total - SHORT.RemainingCredit, 30,
+    'PRECONDITION: 30 of the credit is gone and no term of the identity explains it')
+  const short = await probeNote(SHORT)
+  assert.equal(short.ok, false, 'an unexplained shortfall is still a refusal, deduction and refunds and all')
+  assert.match(reasonOf(short), /30\.00 of this credit note already applied but returned no allocations/)
+})
+
+test('[o3d-jfhi] an UNREADABLE new term refuses rather than passing, and names which one', async () => {
+  // ROUTE (deduction): wireAmount -> `unreadable` -> completenessCannotRun -> ok:false, before any
+  //        arithmetic runs.
+  // ROUTE (refund):    wireAmount per payment -> `sumExact` null -> the explicit refusal, which
+  //        exists because a refund is never a RECORD of this bill and so leaves nothing behind to
+  //        make the classifier withhold on its own account (o3d-zo4j's lesson, applied forward).
+  // MUTATION 1: remove `['CISDeduction', noteCisRead]` from the completenessCannotRun list. The
+  //        reading falls through `?? toDecimal(0)`, the note below is coherent at zero, and the
+  //        probe answers ok:true with provedComplete — `clear`. Measured.
+  // MUTATION 2: replace the `refunded === null` refusal with `refunded ?? toDecimal(0)`. An
+  //        unreadable refund is then treated as no refund, the figure and the empty collection
+  //        agree at zero, and the probe clears. Measured.
+
+  // The base shape is chosen so that reading the new term as ZERO is SILENT — the remaining figures
+  // are coherent — which is what makes each mutation a false clear rather than a differently-worded
+  // refusal.
+  const COHERENT_IF_ZERO = { CurrencyCode: 'GBP', Total: 400, RemainingCredit: 400, Allocations: [] }
+  const control = await probeNote(COHERENT_IF_ZERO)
+  assert.equal(control.ok, true,
+    'PRECONDITION: with neither new field stated this note is accepted, so nothing else does the refusing')
+  assert.equal(classifyLedgerSettlement(attemptFor('400.00'), control).outcome, 'clear',
+    'PRECONDITION: and it reaches clear, which is what the refusals below have to take away')
+
+  for (const [stated, named] of [['eighty', 'eighty'], ['', '\\(blank\\)'], [{ Amount: 80 }, 'object']] as const) {
+    const probe = await probeNote({ ...COHERENT_IF_ZERO, CISDeduction: stated })
+    assert.equal(probe.ok, false, `a CISDeduction of ${JSON.stringify(stated)} is not a figure IMS may ignore`)
+    assert.match(reasonOf(probe), new RegExp(`CISDeduction ${named}`),
+      'and the refusal NAMES it, so an operator is told which figure could not be read')
+    assert.match(reasonOf(probe), /cannot read as an amount/)
+    assert.notEqual(classifyLedgerSettlement(attemptFor('400.00'), probe).outcome, 'clear')
+  }
+
+  // A REFUND WHOSE AMOUNT CANNOT BE READ.
+  const badRefund = await probeNote({
+    ...COHERENT_IF_ZERO, Payments: [{ PaymentID: 'PAY-R1', Amount: 'a hundred' }],
+  })
+  assert.equal(badRefund.ok, false, 'a stated refund IMS cannot measure is not the same as no refund')
+  assert.match(reasonOf(badRefund), /a hundred on a payment against this credit note/)
+  assert.notEqual(classifyLedgerSettlement(attemptFor('400.00'), badRefund).outcome, 'clear')
+
+  // A REFUND ENTRY WITH NO AMOUNT AT ALL. Not the same as an ABSENT COLLECTION: the ledger has said
+  // a payment exists, so "there are none" is not available as a reading of it.
+  const amountlessRefund = await probeNote({ ...COHERENT_IF_ZERO, Payments: [{ PaymentID: 'PAY-R1' }] })
+  assert.equal(amountlessRefund.ok, false,
+    'a payment the ledger listed without an amount is a refund IMS cannot account for')
+  assert.match(reasonOf(amountlessRefund), /payment against this credit note with no amount/)
+  assert.notEqual(classifyLedgerSettlement(attemptFor('400.00'), amountlessRefund).outcome, 'clear')
+
+  // AND THE MAGNITUDE RULE IS INHERITED BY BOTH NEW TERMS, like every other figure in this file: a
+  // JSON number too large to hold half a minor unit is one whose token `Response.json()` has already
+  // destroyed, and it is refused rather than read.
+  const overBoundCis = await probeNote({
+    ...COHERENT_IF_ZERO, CISDeduction: ledgerDifferenceMagnitudeBound('GBP'),
+  })
+  assert.equal(overBoundCis.ok, false, 'a deduction at the difference bound cannot be subtracted to half a penny')
+  const overBoundRefund = await probeNote({
+    ...COHERENT_IF_ZERO, Payments: [{ PaymentID: 'PAY-R1', Amount: ledgerDifferenceMagnitudeBound('GBP') }],
+  })
+  assert.equal(overBoundRefund.ok, false, 'and neither can a refund at it')
+})
+
+test('[o3d-jfhi] the contradiction checks still catch a genuine contradiction, both new terms and all', async () => {
+  // TWO CONTRADICTIONS, and the second is what makes the two new terms safe to subtract on a reading
+  // of the contract rather than on a live tenant.
+  //
+  // ROUTE (A): o3d-zo4j PAIR 1, unchanged — `applied` is a proved ZERO while the allocation
+  //        collection shows the whole credit used -> `exceeds` -> provedComplete:false -> `unknown`.
+  // ROUTE (B): `applied` comes out BELOW zero, which under the identity is impossible because it
+  //        counts money allocated -> the explicit refusal beside the arithmetic.
+  // MUTATION A: in `settlementAnswer`, restore `provedComplete: settled !== null`. Verdict A becomes
+  //        `clear`, which authorises allocating a credit that is already spent. Measured.
+  // MUTATION B: delete the `shortBy(toDecimal(0), applied, …)` guard. The probe then answers
+  //        ok:true over an empty record list with `applied` of -100; `statesAnything(-100)` is
+  //        false so no shortfall check runs, and only `exceeds(0, -100)` is left holding it —
+  //        measured as `unknown`, i.e. still not a clear, but with no sentence naming the
+  //        incoherence. The guard is what turns a silent hold into an answerable one.
+
+  // A. THE GENUINE CONTRADICTION, on a document that now passes through both new terms as zeros.
+  const OVER_ALLOCATED = {
+    CurrencyCode: 'GBP',
+    Total: 40,
+    RemainingCredit: 40,
+    Allocations: [{ Amount: 40, Date: '2026-06-01T00:00:00', Invoice: { InvoiceID: 'other-inv' } }],
+  }
+  assert.equal(OVER_ALLOCATED.Total - OVER_ALLOCATED.RemainingCredit, 0,
+    'PRECONDITION: the note says NONE of the credit has been applied...')
+  assert.equal(OVER_ALLOCATED.Allocations[0]!.Amount, 40, '...and its own collection says all of it has')
+  const contradicted = await probeNote(OVER_ALLOCATED)
+  assert.equal(contradicted.ok, true, 'an excess withholds the proof; it does not refuse the probe')
+  assert.equal(contradicted.ok === true ? contradicted.provedComplete : null, false,
+    'widening the identity did not widen the hole o3d-zo4j closed')
+  const verdictA = classifyLedgerSettlement(attemptFor('40.00'), contradicted)
+  assert.equal(verdictA.outcome, 'unknown')
+  assert.equal(verdictA.outcome === 'unknown' ? verdictA.cause : null, 'collection-unproved')
+
+  // B. THE IDENTITY REFUTED BY ITS OWN RESULT. This is the shape that would exist if Xero did NOT
+  // net a refund out of `RemainingCredit` — i.e. the world in which subtracting it is wrong. The
+  // subtraction is safe to make WITHOUT a live tenant precisely because that world is visible from
+  // the response alone, and it refuses rather than forging a zero.
+  const IMPOSSIBLE = {
+    CurrencyCode: 'GBP',
+    Total: 400,
+    RemainingCredit: 400,
+    Allocations: [],
+    Payments: [{ PaymentID: 'PAY-R1', Amount: 100 }],
+  }
+  assert.equal(IMPOSSIBLE.Total - IMPOSSIBLE.RemainingCredit - IMPOSSIBLE.Payments[0]!.Amount, -100,
+    'PRECONDITION: the identity yields a NEGATIVE allocation usage, which cannot be a count of money')
+  const impossible = await probeNote(IMPOSSIBLE)
+  assert.equal(impossible.ok, false, 'a response that refutes the identity is not one to certify a collection from')
+  assert.match(reasonOf(impossible), /remaining credit is larger than its own total less what has been taken off it/)
+  assert.match(reasonOf(impossible), /100\.00 refunded/,
+    'and the sentence names the term that made it impossible, so an operator can act on it')
+  assert.notEqual(classifyLedgerSettlement(attemptFor('400.00'), impossible).outcome, 'clear')
+})
