@@ -915,6 +915,13 @@ class FakeAdminClient {
       throwAfterCommit?: string
       /** COMMIT reaches the server and its acknowledgement never comes back. */
       failCommitAck?: string
+      /**
+       * ONE statement fails, and every other one is served normally (o3d-secops r30, Codex
+       * MEDIUM). What a release killed between two GRANTs looks like from the wire: the point is
+       * what the shipped code does NEXT, so the failure has to land mid-loop rather than at the
+       * connection.
+       */
+      failStatement?: string
     } = {},
   ) {}
 
@@ -923,6 +930,9 @@ class FakeAdminClient {
   async query(text: string) {
     const sql = String(text).trim()
     this.log.push(sql)
+    if (this.options.failStatement && sql === this.options.failStatement) {
+      throw new Error(`the server went away before ${sql}`)
+    }
     if (sql === 'COMMIT' && this.options.failCommitAck) {
       // THE COMMIT IS ON THE WIRE AND THE ANSWER NEVER ARRIVES. The revokes above are logged, so
       // the assertion can prove they were sent; what the caller never learns is whether they took.
@@ -5491,6 +5501,432 @@ test('a PHYSICAL CLONE carries the whole fingerprint, and a release on it is ref
   } finally {
     staleClone?.stop()
     postFenceClone?.stop()
+    origin?.stop()
+    rmSync(root, { recursive: true, force: true })
+    rmSync(dir, { recursive: true, force: true })
+    if (previousAdmin === undefined) delete process.env.DEPLOY_ADMIN_DATABASE_URL
+    else process.env.DEPLOY_ADMIN_DATABASE_URL = previousAdmin
+    if (previousApp === undefined) delete process.env.DATABASE_URL
+    else process.env.DATABASE_URL = previousApp
+  }
+})
+
+/**
+ * THE RETRY THAT WAS UNRUNNABLE (o3d-secops r30, Codex MEDIUM).
+ *
+ * THE FINDING. The helper cannot remove the record -- the directory is root's -- so the GRANTs and
+ * the unlink are two processes with an interval between them, and a crash, an OOM kill or a failed
+ * unlink in that interval leaves the grants restored and the record still at the authoritative
+ * path. Re-running the release then read EVERY recorded grantee holding CONNECT and REFUSED, while
+ * the operator resolution wrapper refuses a STAMPED record and points back at the release wrapper.
+ * A loop, with no way out but somebody deleting the file by hand.
+ *
+ * WHAT THE STAMP BUYS AND WHAT IT DOES NOT. `fence_applied: 1` is written by ROOT, after `--fence`
+ * reported the REVOKEs were on the medium, into a directory ${APP_USER} cannot write. So on a
+ * stamped record this reading means the fence DID commit and its grants are already back. It does
+ * NOT mean this connection reached the server that fence was raised on -- an unfenced copy reads
+ * identically -- which is why this exit authorises no destruction: it says only that there is
+ * nothing left to grant here, and the record is ended by a person at a terminal.
+ *
+ * MUTATION ROUTE (made against the shipped file and reverted): change the arm's condition from
+ * `state.fence_applied === 1` to `false` and the first half of this test fails at EXIT_ERROR --
+ * which is r29's code exactly, and is the state that cannot be retried.
+ */
+test('a release re-run after its grants have landed completes instead of refusing (o3d-secops r30, Codex MEDIUM)', async (t) => {
+  const dir = stateDir(t)
+  const stateFile = join(dir, 'db-connect-fence.json')
+  publishStandingAuthority(stateFile, { ...SAMPLE_STATE, revoked: ['PUBLIC', 'imsapp'] })
+  const untouched = readFileSync(stateFile, 'utf8')
+  assert.equal(JSON.parse(untouched).fence_applied, 1,
+    'precondition: this measures the STAMPED record, which is what a fence raised since r28 leaves')
+
+  // THE STATE A CRASH BETWEEN THE COMMIT AND THE UNLINK LEAVES: every role the record names holds
+  // CONNECT again, because this run's predecessor granted them back and then died.
+  const retry = new FakeAdminClient({ stateFile, standingDatacl: ACL_UNFENCED, releasedDatacl: ACL_UNFENCED })
+  const retried = await capturingFenceOutput(() => withAdminUrl(() => doRelease(retry as never, {
+    stateFile, appRole: 'imsapp', ...suppliedIdentity({ appDatabase: 'imsdb' }),
+  })))
+
+  assert.equal(retried.value, EXIT_ALREADY_RELEASED,
+    `a re-run after the grants landed must be completable, not refused:\n${retried.err}`)
+  assert.notEqual(retried.value, EXIT_ERROR, 'and in particular it must not be r29\'s flat refusal')
+  assert.match(retried.out, /^release_state=already-released$/m,
+    `and it must say so on the machine channel, which is what the wrapper acts on:\n${retried.out}`)
+  assert.deepEqual(retry.grants, [],
+    'NOTHING may be granted: there is nothing here to grant, and this exit is not a release this run performed')
+  assert.equal(readFileSync(stateFile, 'utf8'), untouched,
+    'and the record is untouched -- ending it is the operator\'s act, in the release wrapper')
+  assert.match(retried.err, /COPY of the/,
+    `and the other history that ends at this reading must be named, not hidden:\n${retried.err}`)
+
+  // AND THE DISCRIMINATION, WITHOUT WHICH THE ABOVE IS A GATE THAT ACCEPTS EVERYTHING. An
+  // UNSTAMPED record says nothing about whether the REVOKEs ever ran, so the same ACL reading on
+  // one of those is still the flat refusal r29 shipped: there is no evidence a fence ever stood.
+  const unstamped = join(dir, 'unstamped.json')
+  publishAuthority(unstamped, { ...SAMPLE_STATE, revoked: ['PUBLIC', 'imsapp'] })
+  const legacy = JSON.parse(readFileSync(unstamped, 'utf8'))
+  delete legacy.fence_applied
+  writeFileSync(unstamped, `${JSON.stringify(legacy, null, 2)}\n`)
+  const bare = new FakeAdminClient({ stateFile: unstamped, standingDatacl: ACL_UNFENCED, releasedDatacl: ACL_UNFENCED })
+  const refused = await capturingFenceOutput(() => withAdminUrl(() => doRelease(bare as never, {
+    stateFile: unstamped, appRole: 'imsapp', ...suppliedIdentity({ appDatabase: 'imsdb' }),
+  })))
+  assert.equal(refused.value, EXIT_ERROR,
+    `a record that never said a fence was applied must still be refused outright:\n${refused.err}`)
+  assert.deepEqual(bare.grants, [], 'and nothing may be granted on that one either')
+})
+
+/**
+ * A MIXED READING IS NOT OURS, AND THE RELEASE IS NOW A TRANSACTION SO IT CANNOT BECOME OURS
+ * (o3d-secops r30, Codex HIGH 2 and MEDIUM).
+ *
+ * r29 consumed a three-valued answer and proceeded on TWO of its values, refusing only `absent`.
+ * The reason it gave for letting `ambiguous` through was that a half-applied fence has something
+ * to restore -- and that is wrong on the facts of this file: doFence() issues every REVOKE inside
+ * ONE transaction and commits it as one, so there is no half-applied fence to restore. The GRANTs
+ * are one transaction here for the same reason, which is what this test measures second: without
+ * it, refusing `ambiguous` while being able to CAUSE it would make a legitimate retry unrunnable.
+ *
+ * MUTATION ROUTE (made against the shipped file and reverted): delete the LEGACY_FENCE_AMBIGUOUS
+ * arm from doRelease() -- leaving r29's code -- and the first half exits 0, granting CONNECT back
+ * to a role somebody revoked deliberately. Replace the BEGIN/COMMIT around the grant loop with the
+ * bare loop r29 shipped and the second half fails: no ROLLBACK is issued and the partial grant
+ * stands.
+ */
+test('a release refuses a MIXED reading, and cannot produce one by dying halfway (o3d-secops r30, Codex HIGH 2)', async (t) => {
+  const dir = stateDir(t)
+  const stateFile = join(dir, 'db-connect-fence.json')
+  publishStandingAuthority(stateFile, { ...SAMPLE_STATE, revoked: ['PUBLIC', 'imsapp'] })
+  const untouched = readFileSync(stateFile, 'utf8')
+
+  // PUBLIC has lost CONNECT and the application has not. No fence this program raises can leave
+  // that: the REVOKEs commit together or not at all.
+  const mixed = new FakeAdminClient({ stateFile, standingDatacl: ACL_MIXED, releasedDatacl: ACL_UNFENCED })
+  const refused = await capturingFenceOutput(() => withAdminUrl(() => doRelease(mixed as never, {
+    stateFile, appRole: 'imsapp', ...suppliedIdentity({ appDatabase: 'imsdb' }),
+  })))
+  assert.equal(refused.value, EXIT_ERROR, `a mixed ACL must not be released from:\n${refused.err}`)
+  assert.deepEqual(mixed.grants, [],
+    'and NOT ONE GRANT may be sent -- the roles that lost CONNECT lost it to somebody other than this record')
+  assert.ok(!mixed.log.includes('BEGIN'), 'the grant transaction must never be opened')
+  assert.equal(readFileSync(stateFile, 'utf8'), untouched, 'and the record is untouched')
+  assert.match(refused.err, /DISAGREE about CONNECT/, refused.err)
+  assert.match(refused.err, /ONE\s+transaction/, `and the refusal must say why a mixed reading cannot be ours:\n${refused.err}`)
+
+  // AND THE DISCRIMINATION: the fenced ACL over this record's own list is `stands`, and releases.
+  const standing = new FakeAdminClient({ stateFile, standingDatacl: ACL_FENCED, releasedDatacl: ACL_UNFENCED })
+  const released = await capturingFenceOutput(() => withAdminUrl(() => doRelease(standing as never, {
+    stateFile, appRole: 'imsapp', ...suppliedIdentity({ appDatabase: 'imsdb' }),
+  })))
+  assert.equal(released.value, EXIT_OK, `the reading a standing fence leaves must still release:\n${released.err}`)
+  assert.deepEqual(standing.grants, [
+    'GRANT CONNECT ON DATABASE "imsdb" TO PUBLIC;',
+    'GRANT CONNECT ON DATABASE "imsdb" TO "imsapp";',
+  ], 'sending exactly the recorded list')
+  assert.ok(standing.log.includes('BEGIN') && standing.log.includes('COMMIT'),
+    `and inside ONE transaction, which is what stops an interrupted release producing the reading refused above:\n${standing.log.join(' | ')}`)
+  assert.ok(standing.log.indexOf('BEGIN') < standing.log.indexOf(standing.grants[0]),
+    'opened before the first GRANT')
+
+  // THE INTERRUPTION ITSELF. A release killed between two GRANTs must leave the fenced ACL, not a
+  // mixed one -- so the statement that fails is followed by a ROLLBACK and never by a COMMIT.
+  const dying = new FakeAdminClient({
+    stateFile, standingDatacl: ACL_FENCED, releasedDatacl: ACL_UNFENCED,
+    failStatement: 'GRANT CONNECT ON DATABASE "imsdb" TO "imsapp";',
+  })
+  const died = await capturingFenceOutput(() => withAdminUrl(() => doRelease(dying as never, {
+    stateFile, appRole: 'imsapp', ...suppliedIdentity({ appDatabase: 'imsdb' }),
+  })))
+  assert.equal(died.value, EXIT_ERROR, `a release that could not finish must not report one:\n${died.err}`)
+  assert.ok(dying.log.includes('ROLLBACK'),
+    `the partial grant must be rolled back, or the next run reads the mixed ACL this refuses:\n${dying.log.join(' | ')}`)
+  assert.ok(!dying.log.includes('COMMIT'), 'and nothing may be committed')
+  assert.equal(readFileSync(stateFile, 'utf8'), untouched,
+    'and the record survives, because it is what the retry releases from')
+})
+
+/**
+ * NO HELPER IN THIS FILE MAY REPLACE THE RUNNER'S OWN STREAMS (o3d-secops r30, Codex LOW).
+ *
+ * This is a guard rather than a measurement, and it is here because the defect it guards against
+ * is INVISIBLE in a test report: a capture that replaces `process.stdout.write` across an `await`
+ * swallows whatever the runner writes inside the window, so the file reports fewer tests than it
+ * declared AND ZERO FAILURES. Nothing goes red. It happened -- 112 declared, 76 reported -- and
+ * the only reason it was noticed is that somebody counted.
+ *
+ * So the count is asserted too, from the file's own text: a walk that silently stopped visiting
+ * anything would satisfy the absence check vacuously.
+ *
+ * MUTATION ROUTE: put `process.stderr.write = (c: string) => true` back into any helper in this
+ * file and the first assertion fails, naming the line.
+ */
+test('no helper in this file replaces the test runner\'s own streams (o3d-secops r30, Codex LOW)', () => {
+  const source = readFileSync(join(process.cwd(), 'tests/scripts/db-connection-fence.test.ts'), 'utf8')
+  const lines = source.split(/\r?\n/)
+
+  // THE PRECONDITION: the scan reached this file and the pattern is able to match at all. Without
+  // both, "no line matched" is the answer an empty read and a broken regex give too.
+  assert.ok(lines.length > 4000, `the guard must be reading this file; it saw ${lines.length} lines`)
+  const PATCH = /process\.(?:stdout|stderr)\.write\s*=[^=]/
+  // Assembled rather than written out, so the calibration does not become the file's own first
+  // offender -- which is what it did on the first run of this guard, and is the tell that the scan
+  // really does read this text.
+  assert.ok(PATCH.test(`  ${'process.stdout'}${'.write'} = ((chunk: string) => true)`),
+    'the pattern must match the shape it exists to forbid, or this test passes on nothing')
+
+  const offenders = lines
+    .map((line, index) => ({ line, at: index + 1 }))
+    .filter(({ line }) => PATCH.test(line) && !line.trimStart().startsWith('*') && !line.trimStart().startsWith('//'))
+  assert.deepEqual(offenders, [],
+    `a capture that replaces a process stream can swallow the runner's own report of a test that finished inside its window, so the file silently under-reports its test count with zero failures. Use capturingFenceOutput().`)
+
+  // AND THE REPLACEMENT IS ACTUALLY IN USE, so this cannot be satisfied by deleting every capture.
+  assert.ok(source.includes('async function capturingFenceOutput'),
+    'the non-global capture helper must still be defined')
+  const uses = lines.filter((line) => line.includes('capturingFenceOutput(')).length
+  assert.ok(uses >= 6, `and it must be what the helpers use; it is called on ${uses} lines`)
+
+  // EVERY DECLARED TEST IS REPORTED, asked of the text rather than of the report -- which is the
+  // number the swallowed-output defect moved, and the one nobody was checking.
+  const declared = lines.filter((line) => /^test\(/.test(line)).length
+  assert.ok(declared >= 113, `the file must still declare its tests at top level; it declares ${declared}`)
+})
+
+/**
+ * THE RESIDUAL r29 MEASURED, AND WHAT NOW STANDS BETWEEN IT AND THE RECORD (o3d-secops r30,
+ * Codex HIGH 1).
+ *
+ * r29 proved on real clusters that a copy taken AFTER the fence is indistinguishable from the
+ * cluster it was copied from: same system identifier, same database OID, same timeline, the same
+ * revoked ACL. It disclosed that honestly and left root's unlink hanging off the release's exit
+ * status, which is the finding: the release SUCCEEDS on such a copy -- correctly, on the evidence
+ * it has -- and root then destroyed the only account of the fence still standing on the original.
+ *
+ * THIS TEST DOES NOT PRETEND THE HELPER CAN TELL THEM APART. It asserts the opposite, on real
+ * clusters, because that is the fact the design rests on: the release on the copy exits 0 and
+ * sends the recorded GRANTs. What it then asserts is that NOTHING FOLLOWS FROM THAT for the
+ * record -- the removal is refused, by a shell function asking a question no cluster can answer,
+ * namely whether THIS RUN raised the fence it is releasing.
+ *
+ * MUTATION ROUTE (made against the shipped file and reverted): delete the attestation comparison
+ * from db_fence_clear_authority() in scripts/lib/db-fence-protected.sh -- which is r29's shape --
+ * and the record is removed on the copy's release, leaving the origin fenced with nothing to
+ * release it from.
+ */
+test('a release against a copy taken AFTER the fence still cannot end the record (o3d-secops r30, Codex HIGH 1)', async (t) => {
+  const root = stateDir(t)
+  const dir = stateDir(t)
+  const stateFile = join(dir, 'db-connect-fence.json')
+  const port = await freePort()
+  const me = currentUser()
+  let origin: ReturnType<typeof startCluster> | undefined
+  let copy: ReturnType<typeof startCluster> | undefined
+  const previousAdmin = process.env.DEPLOY_ADMIN_DATABASE_URL
+  const previousApp = process.env.DATABASE_URL
+  try {
+    origin = startCluster(root, 'origin', port, '127.0.0.1', ['local replication all trust'])
+    origin.psql(['-c', 'CREATE ROLE owner_role LOGIN'])
+    origin.psql(['-c', 'CREATE ROLE imsapp LOGIN'])
+    origin.psql(['-c', 'CREATE DATABASE imsdb OWNER owner_role'])
+    origin.psql(['-c', 'GRANT CONNECT ON DATABASE imsdb TO imsapp'])
+    // THE FENCE, and only then the copy: this one carries the revoked ACL with it.
+    origin.psql(['-c', 'REVOKE CONNECT ON DATABASE imsdb FROM PUBLIC'])
+    origin.psql(['-c', 'REVOKE CONNECT ON DATABASE imsdb FROM imsapp'])
+    copy = cloneCluster(root, origin, 'after', port)
+
+    const fingerprint = (cluster: ReturnType<typeof startCluster>) => ({
+      systemIdentifier: cluster.psql(['-c', 'SELECT system_identifier::text FROM pg_control_system()']),
+      databaseOid: cluster.psql(['-c', "SELECT oid::text FROM pg_database WHERE datname = 'imsdb'"]),
+      appConnects: cluster.psql(['-c', "SELECT has_database_privilege('imsapp','imsdb','CONNECT')::text"]),
+    })
+    const originIdentity = fingerprint(origin)
+    const copyIdentity = fingerprint(copy)
+
+    // THE MEASUREMENT, RE-TAKEN HERE RATHER THAN CITED. Every fact the helper can reach agrees.
+    assert.equal(copyIdentity.systemIdentifier, originIdentity.systemIdentifier, 'the copy inherits the system identifier')
+    assert.equal(copyIdentity.databaseOid, originIdentity.databaseOid, 'and the database OID')
+    assert.equal(copyIdentity.appConnects, 'false', 'and the FENCE itself, which is what makes this copy the hard one')
+    assert.equal(originIdentity.appConnects, 'false', 'precondition: the origin is fenced')
+
+    publishStandingAuthority(stateFile, {
+      ...SAMPLE_STATE,
+      database: 'imsdb',
+      owner_role: 'owner_role',
+      app_role: 'imsapp',
+      revoked: [PUBLIC_GRANTEE, 'imsapp'],
+      cluster_system_identifier: originIdentity.systemIdentifier,
+      cluster_database_oid: originIdentity.databaseOid,
+    })
+    const untouched = readFileSync(stateFile, 'utf8')
+
+    process.env.DEPLOY_ADMIN_DATABASE_URL = `postgres://${me}@127.0.0.1:${port}/imsdb`
+    process.env.DATABASE_URL = `postgres://imsapp@127.0.0.1:${port}/imsdb`
+    const client = new Client({ host: copy.socket, port, database: 'imsdb', user: me })
+    await client.connect()
+    let released
+    try {
+      released = await capturingFenceOutput(() => doRelease(client as never, {
+        stateFile, appRole: 'imsapp',
+        ...suppliedIdentity({ appHost: '127.0.0.1', appPort: String(port), appUser: 'imsapp', appDatabase: 'imsdb' }),
+      }))
+    } finally {
+      await client.end()
+    }
+
+    // AND IT SUCCEEDS, WHICH IS THE POINT. Asserted rather than regretted: a design that assumed
+    // the helper could refuse here would be resting on something no measurement supports.
+    assert.equal(released.value, EXIT_OK,
+      `the copy is indistinguishable, so the release on it succeeds -- that is the residual this round works around rather than closes:\n${released.err}`)
+    assert.equal(copy.psql(['-c', "SELECT has_database_privilege('imsapp','imsdb','CONNECT')::text"]), 'true',
+      'and it really did grant, on the copy')
+    assert.equal(origin.psql(['-c', "SELECT has_database_privilege('imsapp','imsdb','CONNECT')::text"]), 'false',
+      'while the ORIGIN is still fenced: that is the fence whose record is about to be at risk')
+
+    // THE GATE. Root asks a question the database cannot answer -- did THIS RUN raise the fence it
+    // just released -- and without that answer it removes nothing.
+    const CLEAR = shellFunction(FENCE_LIBRARY, 'db_fence_clear_authority')
+    const clear = (attestation: string) => spawnSync('bash', ['-c', [
+      'set -uo pipefail',
+      'exec 2>&1',
+      'DB_FENCE_SUDO_PREFIX=""',
+      'DB_FENCE_RELEASE_WRAPPER="/opt/cutover/release-db-fence"',
+      CLEAR,
+      `db_fence_clear_authority ${JSON.stringify(stateFile)} ${JSON.stringify(attestation)}`,
+      'echo "RC=$?"',
+    ].join('\n')], { encoding: 'utf8' })
+
+    const unattested = clear('')
+    assert.match(unattested.stdout, /^RC=2$/m,
+      `a release this run did not raise must not end the record:\n${unattested.stdout}`)
+    assert.equal(existsSync(stateFile), true, 'and the record must still be there')
+    assert.equal(readFileSync(stateFile, 'utf8'), untouched, 'byte for byte, so the origin can still be released from it')
+    assert.match(unattested.stdout, /base backup|restored snapshot|staging clone/,
+      `and the refusal must say what it may be looking at:\n${unattested.stdout}`)
+
+    // AND THE GUARD IS NOT A BAN. With the attestation the removal happens, so a passing test
+    // above cannot be a function that refuses everything.
+    const attested = clear('raised-by-this-run')
+    assert.match(attested.stdout, /^RC=0$/m, `an attested removal must still happen:\n${attested.stdout}`)
+    assert.equal(existsSync(stateFile), false, 'and the record is gone')
+  } finally {
+    copy?.stop()
+    origin?.stop()
+    rmSync(root, { recursive: true, force: true })
+    rmSync(dir, { recursive: true, force: true })
+    if (previousAdmin === undefined) delete process.env.DEPLOY_ADMIN_DATABASE_URL
+    else process.env.DEPLOY_ADMIN_DATABASE_URL = previousAdmin
+    if (previousApp === undefined) delete process.env.DATABASE_URL
+    else process.env.DATABASE_URL = previousApp
+  }
+})
+
+/**
+ * THE MIXED READING, ON A REAL PRE-FENCE COPY (o3d-secops r30, Codex HIGH 2 -- its named test).
+ *
+ * r29's gate refused only `absent`, so a pre-fence copy bypassed it the moment ONE recorded
+ * grantee was independently revoked there: the fingerprint matches, the reading becomes mixed, and
+ * r29 proceeded on mixed deliberately. This is that copy, built for real, with one recorded
+ * grantee revoked on it by "an administrator" and the other left alone.
+ *
+ * MUTATION ROUTE (made against the shipped file and reverted): delete the LEGACY_FENCE_AMBIGUOUS
+ * arm from doRelease() -- which is r29's code exactly -- and this exits 0, granting CONNECT back
+ * to the role that was deliberately revoked, on a server that was never fenced.
+ */
+test('a pre-fence copy with one grantee independently revoked is refused (o3d-secops r30, Codex HIGH 2)', async (t) => {
+  const root = stateDir(t)
+  const dir = stateDir(t)
+  const stateFile = join(dir, 'db-connect-fence.json')
+  const port = await freePort()
+  const me = currentUser()
+  let origin: ReturnType<typeof startCluster> | undefined
+  let copy: ReturnType<typeof startCluster> | undefined
+  const previousAdmin = process.env.DEPLOY_ADMIN_DATABASE_URL
+  const previousApp = process.env.DATABASE_URL
+  try {
+    origin = startCluster(root, 'origin', port, '127.0.0.1', ['local replication all trust'])
+    origin.psql(['-c', 'CREATE ROLE owner_role LOGIN'])
+    origin.psql(['-c', 'CREATE ROLE imsapp LOGIN'])
+    origin.psql(['-c', 'CREATE DATABASE imsdb OWNER owner_role'])
+    origin.psql(['-c', 'GRANT CONNECT ON DATABASE imsdb TO imsapp'])
+    // THE COPY IS TAKEN BEFORE THE FENCE: it never replayed the transaction the record describes.
+    copy = cloneCluster(root, origin, 'stale', port)
+    origin.psql(['-c', 'REVOKE CONNECT ON DATABASE imsdb FROM PUBLIC'])
+    origin.psql(['-c', 'REVOKE CONNECT ON DATABASE imsdb FROM imsapp'])
+    // AND ON THE COPY, SOMEBODY ELSE TAKES CONNECT FROM ONE OF THE SAME ROLES. Not this record's
+    // fence -- an administrator's own revoke, which is the history the ACL cannot rule out.
+    copy.psql(['-c', 'REVOKE CONNECT ON DATABASE imsdb FROM imsapp'])
+
+    const originIdentity = {
+      systemIdentifier: origin.psql(['-c', 'SELECT system_identifier::text FROM pg_control_system()']),
+      databaseOid: origin.psql(['-c', "SELECT oid::text FROM pg_database WHERE datname = 'imsdb'"]),
+    }
+    assert.equal(copy.psql(['-c', 'SELECT system_identifier::text FROM pg_control_system()']), originIdentity.systemIdentifier,
+      'precondition: the copy satisfies the fingerprint gate completely, which is why this reading is the one that matters')
+    // THE ACL ITSELF, AND NOT has_database_privilege(). The gate reads DIRECT grantees out of
+    // datacl -- the exact inverse of the statement the fence issues -- and effective privilege
+    // answers a different question: with PUBLIC still holding CONNECT on this copy, imsapp
+    // "has" it through PUBLIC while its own entry is gone. A precondition asked the wrong way
+    // round would have measured nothing here.
+    const copyAcl = copy.psql(['-c', "SELECT datacl::text FROM pg_database WHERE datname = 'imsdb'"])
+    assert.doesNotMatch(copyAcl, /[{,]imsapp=/,
+      `precondition: one recorded grantee must have lost its DIRECT CONNECT on the copy:\n${copyAcl}`)
+    assert.match(copyAcl, /[{,]=[A-Za-z]*c\//,
+      `and the other must still hold it -- that is the MIXED reading r29 proceeded on:\n${copyAcl}`)
+
+    publishStandingAuthority(stateFile, {
+      ...SAMPLE_STATE,
+      database: 'imsdb',
+      owner_role: 'owner_role',
+      app_role: 'imsapp',
+      revoked: [PUBLIC_GRANTEE, 'imsapp'],
+      cluster_system_identifier: originIdentity.systemIdentifier,
+      cluster_database_oid: originIdentity.databaseOid,
+    })
+    const untouched = readFileSync(stateFile, 'utf8')
+
+    process.env.DEPLOY_ADMIN_DATABASE_URL = `postgres://${me}@127.0.0.1:${port}/imsdb`
+    process.env.DATABASE_URL = `postgres://imsapp@127.0.0.1:${port}/imsdb`
+    const release = async (cluster: ReturnType<typeof startCluster>) => {
+      const client = new Client({ host: cluster.socket, port, database: 'imsdb', user: me })
+      await client.connect()
+      const sent: string[] = []
+      const query = client.query.bind(client)
+      ;(client as unknown as { query: (...args: unknown[]) => unknown }).query = (...args: unknown[]) => {
+        sent.push(String(args[0]))
+        return (query as (...a: unknown[]) => unknown)(...args)
+      }
+      try {
+        const captured = await capturingFenceOutput(() => doRelease(client as never, {
+          stateFile, appRole: 'imsapp',
+          ...suppliedIdentity({ appHost: '127.0.0.1', appPort: String(port), appUser: 'imsapp', appDatabase: 'imsdb' }),
+        }))
+        return { code: captured.value, said: captured.err, grants: sent.filter((sql) => sql.trim().startsWith('GRANT')) }
+      } finally {
+        await client.end()
+      }
+    }
+
+    const onTheCopy = await release(copy)
+    assert.equal(onTheCopy.code, EXIT_ERROR, `a mixed reading on a copy must not be released from:\n${onTheCopy.said}`)
+    assert.deepEqual(onTheCopy.grants, [],
+      'and NOT ONE GRANT may be sent -- one of these roles was revoked deliberately and would get CONNECT back')
+    assert.doesNotMatch(copy.psql(['-c', "SELECT datacl::text FROM pg_database WHERE datname = 'imsdb'"]), /[{,]imsapp=/,
+      'so the administrator\'s own revoke on the copy stands')
+    assert.equal(readFileSync(stateFile, 'utf8'), untouched, 'and the record is untouched')
+    assert.match(onTheCopy.said, /DISAGREE about CONNECT/, onTheCopy.said)
+
+    // AND THE ORIGIN STILL RELEASES, so the refusal is a discrimination and not a gate that
+    // refuses everything.
+    const onTheOrigin = await release(origin)
+    assert.equal(onTheOrigin.code, EXIT_OK, `the cluster the fence IS standing on must still release:\n${onTheOrigin.said}`)
+    assert.deepEqual(onTheOrigin.grants, [
+      'GRANT CONNECT ON DATABASE "imsdb" TO PUBLIC;',
+      'GRANT CONNECT ON DATABASE "imsdb" TO "imsapp";',
+    ], 'sending exactly the recorded list')
+    assert.equal(origin.psql(['-c', "SELECT has_database_privilege('imsapp','imsdb','CONNECT')::text"]), 'true',
+      'and the application must actually get CONNECT back')
+  } finally {
+    copy?.stop()
     origin?.stop()
     rmSync(root, { recursive: true, force: true })
     rmSync(dir, { recursive: true, force: true })
