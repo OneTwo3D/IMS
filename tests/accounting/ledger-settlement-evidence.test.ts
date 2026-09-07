@@ -113,6 +113,38 @@ test('the attempt is described from the payload the connector actually sends (o3
   assert.deepEqual(describeAttempt('INVOICE_PAYMENT', null), { amount: null, currency: null, date: null, marker: null })
 })
 
+test('[o3d-6yho] the attempt takes its CURRENCY from the payload, and the currency sizes the band', () => {
+  // Every money payload states one — both connectors' INVOICE_PAYMENT follow-ups, the receipt
+  // enqueue and markBillPaid's BILL_PAYMENT — so the ordinary row names its own and nothing is
+  // inferred. The test above pins the honest `null` for a payload that states none; this pins that a
+  // payload which DOES state one is read, and what reading it changes.
+  //
+  // ROUTE: describeAttempt -> AttemptDescription.currency -> ledgerMatchEpsilon.
+  // MUTATION: return a flat `currency: null` and the KWD case below matches a payment a fil away.
+  assert.deepEqual(
+    describeAttempt('INVOICE_PAYMENT', { amount: 10, currency: 'KWD', paymentDate: '2026-08-01' }),
+    { amount: 10, currency: 'KWD', date: '2026-08-01', marker: null },
+  )
+
+  const oneThousandthAway = { ok: true as const, records: [{ amount: 10.001, date: '2026-08-01' }] }
+  assert.equal(
+    classifyLedgerSettlement(
+      describeAttempt('INVOICE_PAYMENT', { amount: 10, currency: 'KWD', paymentDate: '2026-08-01' }),
+      oneThousandthAway,
+    ).outcome,
+    'clear',
+    'one whole fil apart is a DIFFERENT payment in KWD — the flat half-penny called it the same one',
+  )
+  assert.equal(
+    classifyLedgerSettlement(
+      describeAttempt('INVOICE_PAYMENT', { amount: 10, currency: 'GBP', paymentDate: '2026-08-01' }),
+      oneThousandthAway,
+    ).outcome,
+    'present',
+    'and a tenth of a penny apart is still the same payment in GBP, so nothing ordinary moved',
+  )
+})
+
 /* --- round 6, finding 1: the date convention is PER TYPE, and there is only one of it --- */
 
 test('each money type dates itself from ITS OWN field, never the other one (o3d-0m56 r6, CRITICAL 1)', () => {
