@@ -2206,25 +2206,83 @@ db_fence_migration_bind() {
   return 0
 }
 
-# Did the witness actually SEE the migration's backends on the fenced instance?
-#   0  yes, at least one.
-#   1  no. A REFUSAL, and the schema may already have moved: see the callers.
+# THE GATE AFTER THE LAST CONSUMER, AND WHY IT IS NOT "DID YOU SEE PRISMA?" (o3d-secops r32).
+#
+# THE MEASUREMENT THAT DECIDED THE SHAPE. A warm `prisma migrate status` connects, reads
+# `_prisma_migrations` and disconnects inside about 40 MILLISECONDS. A sampler polling every 50ms
+# missed it in every run; at 10ms it saw it in every run. Neither number is a promise: POLLING
+# CANNOT GUARANTEE TO OBSERVE A CONNECTION SOMEBODY ELSE OPENS AND CLOSES, and a gate that refused
+# a deploy on a missed sample would refuse ordinary cutovers -- trading this finding for an outage.
+#
+# SO THE REFUSAL RESTS ON A CONNECTION THIS RUN CONTROLS. `--bind-migration --hold-stamp` opens the
+# migration's own string a second time, AFTER the last consumer, keeps the stamp, asks its own
+# backend whether the witness is visible, and stays put for several sampler ticks. Two things
+# follow, and both are needed:
+#
+#   THE STRING STILL REACHES THE WITNESS at the moment the window closes. A redirect that moved the
+#   migration and had not yet reverted is caught here, deterministically.
+#   THE SAMPLER IS WORKING. Its count MUST grow across this probe. A sampler that had died, or that
+#   was answering about the wrong value, would otherwise report "saw nothing" indistinguishably
+#   from a redirect -- and "the mechanism is broken" would read exactly like "nothing went wrong".
+#
+# AND WHAT THE SAMPLER SAW OF THE MIGRATION ITSELF IS REPORTED, NOT ENFORCED. Zero sightings of the
+# consumers' own backends is real evidence and it costs the automatic removal of the fence record
+# (status 4, and the caller drops ${DB_FENCE_WITNESS_BOUND}), which is this subsystem's standing
+# way of saying "a person looks at this". It does not refuse the deploy, because a miss is a
+# property of polling and not of the deploy.
+#
+# THE RESIDUAL, SAID PLAINLY: a redirect confined to prisma's own few hundred milliseconds, that
+# reverts before this probe, is caught only by the sampler -- so only probabilistically. Closing it
+# completely needs the server to record every login, which is a login event trigger, a superuser
+# DDL change to the customer's database and a lockout risk if it ever fails. That is not a trade
+# this script may make.
+#
+#   0  the string still reaches the witness, and the sampler is demonstrably working.
+#   1  IT DOES NOT, or the sampler could not be shown to work. A REFUSAL, and the schema may
+#      already have moved.
 #   2  the URL carries no stamp.
-#   3  no witness, or it never answered -- the degraded mode again.
+#   3  no witness -- the degraded mode.
+#   4  bound, but the migration's OWN backends were never seen. Not a refusal; the record is kept.
 db_fence_migration_witnessed() {
-  local migration_url="$1"
-  local migration_nonce="" reply="" seen=""
+  local fence_script="$1" migration_url="$2"
+  shift 2
+  local migration_nonce="" before="" after="" bind_nonce="" bound="" rc=0
   [[ "${DB_FENCE_WITNESS_BOUND:-0}" -eq 1 ]] || return 3
   migration_nonce="$(db_fence_migration_nonce_in_url "${migration_url}")" || return 2
-  reply="$(db_fence_witness_exchange "sightings ${migration_nonce}" "WITNESS_SIGHTINGS ${migration_nonce} " prefix)" || return 3
-  seen="${reply##"WITNESS_SIGHTINGS ${migration_nonce} "}"
-  # A COUNT THIS RUN CANNOT READ IS NOT A COUNT. Anything but digits -- a truncated line, a reply
-  # for another nonce that slipped the prefix, a witness answering something else entirely --
-  # refuses, because the alternative is arithmetic on text and `[[ x -gt 0 ]]` is TRUE for a
-  # non-numeric string in bash.
-  [[ "${seen}" =~ ^[0-9]+$ ]] || return 1
-  [[ "${seen}" -gt 0 ]] || return 1
+
+  before="$(db_fence_migration_sightings "${migration_nonce}")" || return 1
+
+  # THE SECOND PROBE, ON THE MIGRATION'S OWN STRING, KEEPING ITS STAMP. A fresh lock again: what
+  # this establishes is where the string reaches NOW, and a lock taken minutes ago would let a
+  # cached fact stand in for a live one.
+  bind_nonce="$(db_fence_witness_nonce)" || return 1
+  db_fence_witness_challenge "${bind_nonce}" || return 1
+  bound="$(db_fence_migration_helper "${fence_script}" --bind-migration --hold-stamp \
+    --migration-nonce="${migration_nonce}" --witness-lock="${bind_nonce}" "$@")" || rc=$?
+  [[ -z "${bound}" ]] || printf '%s\n' "${bound}"
+  if [[ "${rc}" -ne 0 ]] \
+    || ! db_fence_machine_verdict "${bound}" "MIGRATION_BINDING" "${migration_nonce}" "colocated"; then
+    return 1
+  fi
+
+  after="$(db_fence_migration_sightings "${migration_nonce}")" || return 1
+  # THE SAMPLER MUST HAVE SEEN THE PROBE IT WAS JUST HANDED. Equality here is a sampler that is not
+  # sampling, and a mechanism that cannot see a connection held open in front of it may not be
+  # allowed to report that it saw nothing.
+  [[ "${after}" -gt "${before}" ]] || return 1
+  # AND WHAT IT SAW OF THE MIGRATION ITSELF, which is everything counted BEFORE this probe.
+  [[ "${before}" -gt 0 ]] || return 4
   return 0
+}
+
+# The sampler's count for one nonce, or a failure. Never a bare string: `[[ x -gt 0 ]]` is TRUE for
+# a non-numeric value in bash, so a reply this cannot read as a number must not reach arithmetic.
+db_fence_migration_sightings() {
+  local nonce="$1" reply="" seen=""
+  reply="$(db_fence_witness_exchange "sightings ${nonce}" "WITNESS_SIGHTINGS ${nonce} " prefix)" || return 1
+  seen="${reply##"WITNESS_SIGHTINGS ${nonce} "}"
+  [[ "${seen}" =~ ^[0-9]+$ ]] || return 1
+  printf '%s\n' "${seen}"
 }
 
 db_fence_raise() {

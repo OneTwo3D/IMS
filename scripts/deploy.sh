@@ -2772,18 +2772,34 @@ bind_migration_to_fenced_server() {
 # this refusal holds the fence, leaves the record standing and does not start the new build --
 # which is the only safe direction when the question "on which server did it move?" has no answer.
 require_migration_landed_on_fenced_server() {
-  local seen_rc=0
-  db_fence_migration_witnessed "$MIGRATION_DATABASE_URL" || seen_rc=$?
-  case "$seen_rc" in
+  local seen_rc=0 seen_script
+  seen_script="$(resolve_fence_script)" || die \
+    "The migration has run and this run has no fence script it is willing to execute, so nothing can show which server it ran on. The connection fence is STILL UP and its record is kept. Release it with: ${DB_FENCE_RELEASE_CMD}"
+  db_fence_migration_witnessed "${seen_script}" "$MIGRATION_DATABASE_URL" "${DB_FENCE_IDENTITY_ARGS[@]:-}" || seen_rc=$?
+  case "${seen_rc}" in
     0)
-      ok "The connection witness saw the migration's own backends on the fenced server."
+      ok "The migration window closed on the server this run fenced, and the witness saw the migration's own backends there."
       ;;
     3)
       warn "This run holds no connection witness, so nothing observed which server the migration actually"
       warn "reached. The fence record will be KEPT at the end of this run for you to end."
       ;;
+    4)
+      # THE MIGRATION'S OWN BACKENDS WERE NEVER SEEN, while the string still reaches the witness and
+      # the sampler is demonstrably working. Not a refusal -- a connection somebody else opens and
+      # closes cannot be promised to a poller, and refusing here would refuse ordinary cutovers --
+      # but it IS the evidence this run was buying, so its absence costs the automatic removal of
+      # the record. Dropping the flag is what withholds it: the release's challenge then goes
+      # unissued and the record is left for a person.
+      DB_FENCE_WITNESS_BOUND=0
+      warn "The migration window closed on the server this run fenced -- a connection opened on the"
+      warn "migration's own string could still see the witness -- but the witness never saw a backend"
+      warn "carrying this run's stamp while the migration ran. Nothing here is wrong with the schema,"
+      warn "and nothing is being undone. What it costs is the AUTOMATIC removal of the fence record:"
+      warn "it will be KEPT at the end of this run and ${DB_FENCE_RELEASE_CMD} will ask you to end it."
+      ;;
     *)
-      die "THE MIGRATION'S OWN CONNECTIONS WERE NEVER SEEN ON THE SERVER THIS RUN FENCED. The witness session has been attached to the fenced instance throughout and watched for the stamp this run put on every migration connection; it saw none. TWO HISTORIES END HERE AND NOTHING CAN SEPARATE THEM: the migration was routed to another server — in which case THAT server now carries the schema change and this one does not — or the witness was lost mid-window. THE SCHEMA MAY HAVE MOVED. The new build has NOT been started, the connection fence is STILL UP and its record is kept. Find out which server ${DB_FENCE_STATE} names and which one the migration reached before you release anything: ${DB_FENCE_RELEASE_CMD}"
+      die "THE MIGRATION WINDOW DID NOT CLOSE ON THE SERVER THIS RUN FENCED. A connection opened with the migration's own connection string, after the last thing that used it, either could not see the connection witness or could not be seen by it. TWO HISTORIES END HERE AND NOTHING CAN SEPARATE THEM: the migration was routed to another server — in which case THAT server now carries the schema change and this one does not — or the witness was lost mid-window. THE SCHEMA MAY HAVE MOVED. The new build has NOT been started, the connection fence is STILL UP and its record is kept. Find out which server ${DB_FENCE_STATE} names and which one the migration reached before you release anything: ${DB_FENCE_RELEASE_CMD}"
       ;;
   esac
 }

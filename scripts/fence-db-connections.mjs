@@ -1194,7 +1194,7 @@ export function parseArgs(argv) {
     witnessNonce: '', witnessLock: '', witnessChallenge: '',
     // o3d-secops r32: the stamp `--print-migration-url` puts on every backend the migration window
     // opens, and that `--bind-migration` then reads back off its own connection.
-    migrationNonce: '' }
+    migrationNonce: '', holdStamp: false }
   for (const arg of argv) {
     // `--audit-authority` (o3d-secops r26) is here with the rest and not behind a flag of its own:
     // it is a MODE, it is read-only, and a mode that is spelled differently from its siblings is a
@@ -1216,6 +1216,9 @@ export function parseArgs(argv) {
     else if (arg.startsWith('--witness-lock=')) options.witnessLock = arg.slice('--witness-lock='.length)
     else if (arg.startsWith('--witness-challenge=')) options.witnessChallenge = arg.slice('--witness-challenge='.length)
     else if (arg.startsWith('--migration-nonce=')) options.migrationNonce = arg.slice('--migration-nonce='.length)
+    // o3d-secops r32: the post-migration probe keeps its stamp and stays, so the witness's sampler
+    // can see a connection whose lifetime this run controls. The pre-DDL probe drops it.
+    else if (arg === '--hold-stamp') options.holdStamp = true
   }
   return options
 }
@@ -2443,8 +2446,17 @@ export async function doWitness(client, options, input = process.stdin) {
   }
 }
 
-/** How often the witness looks for the migration's stamp. Measured against a real `prisma migrate deploy` below. */
-export const WITNESS_SAMPLE_INTERVAL_MS = 50
+/**
+ * How often the witness looks for the migration's stamp.
+ *
+ * MEASURED, AND THE FIRST NUMBER WAS WRONG. At 50ms this sampler MISSED a warm
+ * `prisma migrate status` entirely -- the schema engine connects, reads `_prisma_migrations` and
+ * disconnects inside about 40ms against a small database -- while at 10ms it saw it in every run.
+ * That measurement is why the post-migration gate below does NOT rest on the sampler catching a
+ * foreign short-lived backend: polling cannot promise to observe a connection somebody else opens
+ * and closes, and a gate that refuses on a miss would refuse ordinary cutovers.
+ */
+export const WITNESS_SAMPLE_INTERVAL_MS = 10
 
 /**
  * `--bind-migration`: DOES THE STRING THE MIGRATION WILL USE REACH THE INSTANCE THAT WAS FENCED?
@@ -2475,15 +2487,22 @@ export async function doBindMigration(client, options) {
   )
   const stamp = rows[0]?.stamp ?? ''
   const connectedDatabase = rows[0]?.connected_database ?? ''
-  // AND THIS BACKEND STOPS CARRYING THE MIGRATION'S STAMP, IMMEDIATELY (o3d-secops r32).
+  // AND WHETHER THIS BACKEND GOES ON CARRYING THE STAMP IS THE DIFFERENCE BETWEEN THE TWO GATES
+  // (o3d-secops r32).
   //
-  // The witness's sampler counts backends whose `application_name` EQUALS the stamp, and root
-  // starts it AFTER this probe precisely so that the only sightings it can accumulate are the
-  // migration's own. A probe that kept the stamp would leave a backend that could still be in
-  // `pg_stat_activity` when the sampler takes its first reading -- and the check would then be
-  // satisfied by the very connection it exists to distinguish itself from. So the stamp is read
-  // and then dropped, before anything below can take any time at all.
-  await client.query("SET application_name = 'ims-deploy-fence-bind'")
+  // The PRE-DDL probe drops it at once. The witness's sampler counts backends whose
+  // `application_name` EQUALS the stamp and root arms it AFTER this probe, so a probe that kept
+  // the stamp would leave a backend that could still be in `pg_stat_activity` at the sampler's
+  // first reading -- and the count would then be satisfied by the very connection it exists to be
+  // distinguished from.
+  //
+  // The POST-MIGRATION probe (`--hold-stamp`) keeps it, deliberately, and stays long enough to be
+  // seen. That is what makes the second gate DETERMINISTIC: it does not ask the sampler to have
+  // caught somebody else's short-lived backend -- measured, that cannot be promised -- it asks the
+  // sampler to see a connection whose lifetime THIS RUN CONTROLS, on the string the migration used.
+  // A sampler that answers about that connection is a sampler that is working, and a string that
+  // still reaches the witness is a string nothing re-pointed under the window.
+  if (!options.holdStamp) await client.query("SET application_name = 'ims-deploy-fence-bind'")
   let expected
   try {
     expected = migrationApplicationName(options.migrationNonce)
@@ -2520,6 +2539,9 @@ export async function doBindMigration(client, options) {
     console.error('a pooler has put the migration somewhere other than the fenced server. NOTHING HAS BEEN MIGRATED.')
     return EXIT_ERROR
   }
+  // LONG ENOUGH TO BE SEEN, and the number is derived from the sampler's own interval rather than
+  // guessed: whatever that becomes, this stays several ticks of it.
+  if (options.holdStamp) await new Promise((resolve) => setTimeout(resolve, WITNESS_SAMPLE_INTERVAL_MS * 12))
   console.error(`The migration connection is on the fenced instance: it carries this run's stamp and can see the witness. Effective role: ${rows[0]?.effective_role ?? '<unknown>'}.`)
   return EXIT_OK
 }

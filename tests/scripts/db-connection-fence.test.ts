@@ -1,8 +1,9 @@
 import assert from 'node:assert/strict'
-import { spawnSync } from 'node:child_process'
+import { execFileSync, spawn, spawnSync } from 'node:child_process'
 import { chmodSync, existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { PassThrough } from 'node:stream'
 import { type TestContext, test } from 'node:test'
 
 /**
@@ -97,6 +98,13 @@ import {
   // --release make on their own connections, and where a witness is sent so the drain misses it.
   advisoryKeyForWitnessNonce,
   witnessLockIsHeld,
+  // o3d-secops r32: the sealed machine channel, the migration stamp and the pre-DDL probe.
+  sealMachineChannel,
+  migrationApplicationName,
+  APPLICATION_NAME_LIMIT,
+  doBindMigration,
+  doWitness,
+  WITNESS_SAMPLE_INTERVAL_MS,
   witnessConnectionStrings,
   planConnectionFence,
   quoteIdent,
@@ -105,7 +113,7 @@ import {
 import { protectedLibraryLines, writeFenceCheckout } from './fence-artefact-harness.ts'
 import { Client } from 'pg'
 
-import { cloneCluster, currentUser, freePort, startCluster } from './real-postgres-cluster.ts'
+import { cloneCluster, currentUser, freePort, pgBinDir, startCluster } from './real-postgres-cluster.ts'
 import { shellConstant, shellFunction } from './shell-symbol.ts'
 
 /**
@@ -6202,6 +6210,403 @@ test('the witness co-process starts, answers fresh challenges, stops, and restar
     assert.match(run.stdout, /^DONE$/m, `and the whole sequence must complete:\n${said}`)
   } finally {
     origin?.stop()
+    rmSync(root, { recursive: true, force: true })
+  }
+})
+
+// ---------------------------------------------------------------------------
+// o3d-secops r32, Codex HIGH 1 — THE MACHINE CHANNEL CARRIES NO NAME ANYBODY ELSE CHOSE.
+//
+// r31's design said "every word an operator reads is on stderr". ELEVEN LINES IN THIS FILE WERE
+// NOT: `Connection fence released: CONNECT restored to <roles> on <database>.`, the REVOKE
+// statements, the "Verified:" line and the whole unrecorded-release verdict all went to stdout --
+// the same stream root captured and then read BY SUBSTRING for a one-word verdict. A database or
+// a role name is text somebody else chooses, so the attestation was choosable.
+// ---------------------------------------------------------------------------
+
+test('sealMachineChannel puts console.log on stderr, so a new line cannot reach the machine channel (o3d-secops r32, Codex HIGH 1)', () => {
+  // A stand-in for the global console, so this test cannot disturb the runner's own reporting --
+  // which is the defect the capture helper at the top of this file exists to avoid.
+  const said: Array<['log' | 'error', string]> = []
+  const fake = {
+    log: (...args: unknown[]) => { said.push(['log', args.map(String).join(' ')]) },
+    error: (...args: unknown[]) => { said.push(['error', args.map(String).join(' ')]) },
+  }
+  // PRECONDITION: unsealed, it goes where it was written. Without this the assertion below is
+  // satisfied by a `log` that never worked.
+  fake.log('before')
+  assert.deepEqual(said, [['log', 'before']], 'precondition: an unsealed console.log reaches the log sink')
+
+  const unseal = sealMachineChannel(fake as unknown as Console)
+  try {
+    fake.log('Connection fence released: CONNECT restored to PUBLIC on witness_colocated=yes.')
+  } finally {
+    unseal()
+  }
+  assert.deepEqual(said[1][0], 'error',
+    'a console.log written after the seal must land on stderr, where root captures nothing')
+
+  // AND THE SEAL IS LIFTABLE, so a test that seals cannot leak the change into the rest of a run.
+  fake.log('after')
+  assert.equal(said[2][0], 'log', 'and unsealing restores it')
+})
+
+test('the shipped helper writes nothing to stdout but its machine channel (o3d-secops r32, Codex HIGH 1)', () => {
+  const source = readFileSync(join(process.cwd(), 'scripts/fence-db-connections.mjs'), 'utf8')
+  // NOT A PROXIMITY RULE AND NOT A COUNT: the question is whether ANY line in this file can put
+  // text on stdout other than through MACHINE_CHANNEL. `console.log` and a bare
+  // `process.stdout.write` are the two ways, and the second appears exactly once -- inside
+  // MACHINE_CHANNEL itself, which is the definition of the channel.
+  //
+  // MUTATION ROUTE (made against the shipped file and reverted): put back any one of the eleven
+  // `console.log` calls this round moved to stderr and this names it; the seal above still catches
+  // it at run time, which is why there are two rules and not one.
+  const offenders = source.split(/\r?\n/).flatMap((line, index) => {
+    if (/^\s*(\/\/|\*)/.test(line)) return []
+    if (/\bconsole\.log\s*\(/.test(line)) return [`${index + 1}: ${line.trim()}`]
+    if (/process\.stdout\.write/.test(line) && !/write: \(text\) => process\.stdout\.write/.test(line)) {
+      return [`${index + 1}: ${line.trim()}`]
+    }
+    return []
+  })
+  assert.deepEqual(offenders, [],
+    `these lines can put text on the channel root reads for a verdict:\n${offenders.join('\n')}`)
+  // THE WALK REACHED THE FILE. A regex that matched nothing because the file failed to load would
+  // otherwise pass exactly as a clean file does.
+  assert.ok(source.includes('MACHINE_CHANNEL'), 'precondition: the file this examined must be the helper')
+  assert.ok(source.split(/\r?\n/).length > 3000, 'precondition: and all of it, not a truncated read')
+})
+
+// ---------------------------------------------------------------------------
+// o3d-secops r32, Codex HIGH 2 (o3d-mzcp) — THE MIGRATION'S OWN CONNECTION.
+// ---------------------------------------------------------------------------
+
+test('the migration URL carries a stamp beside the role, and refuses a nonce it cannot compose (o3d-secops r32, Codex HIGH 2)', () => {
+  const nonce = 'a'.repeat(32)
+  const composed = buildMigrationConnectionString('postgres://deployadmin:pw@db:5432/imsdb', 'imsapp', nonce)
+  const url = new URL(composed)
+  assert.equal(url.searchParams.get('options'), '-c role=imsapp',
+    'the role option this file has carried since r5 is untouched')
+  assert.equal(url.searchParams.get('application_name'), `ims-migration-${nonce}`,
+    'and the stamp rides beside it as a connection parameter')
+
+  // AND IT IS A CONNECTION PARAMETER RATHER THAN A THIRD `-c`, WHICH IS MEASURED AND NOT ASSUMED.
+  // See the real-cluster test below: `options=-c application_name=` is silently overridden by
+  // libpq's own fallback, so composing it that way would have shipped a binding that never binds.
+  assert.doesNotMatch(String(url.searchParams.get('options')), /application_name/,
+    'the stamp must NOT be smuggled into `options`, where libpq overrides it')
+
+  // BACKWARDS-COMPATIBLE WITH NO STAMP: every mode given '' composes exactly what it composed
+  // before this round, which is what lets `--print-migration-url` stay one function.
+  assert.equal(
+    buildMigrationConnectionString('postgres://deployadmin:pw@db:5432/imsdb', 'imsapp'),
+    buildMigrationConnectionString('postgres://deployadmin:pw@db:5432/imsdb', 'imsapp', ''),
+  )
+  assert.doesNotMatch(buildMigrationConnectionString('postgres://a@db/imsdb', 'imsapp'), /application_name/)
+
+  // A NONCE THAT IS NOT ONE IS A REFUSAL, not a stamp nothing can match. The witness matches the
+  // value EXACTLY, so a malformed stamp would read as absent -- which is the same reading a
+  // redirect produces, and would turn every such run into a refusal an operator cannot explain.
+  // MUTATION ROUTE (made against the shipped file and reverted): drop the `isWitnessNonce` guard
+  // from buildMigrationConnectionString() and these two stop throwing.
+  assert.throws(() => buildMigrationConnectionString('postgres://a@db/imsdb', 'imsapp', 'not-hex'), /nonce/)
+  assert.throws(() => buildMigrationConnectionString('postgres://a@db/imsdb', 'imsapp', 'abc'), /nonce/)
+
+  // AND AN EXISTING application_name IS REPLACED, NOT DUPLICATED. Two entries resolve to one of
+  // them by a rule that differs between drivers, and a binding that depends on which one a
+  // particular consumer picked is not a binding.
+  const overlaid = new URL(buildMigrationConnectionString('postgres://a@db/imsdb?application_name=someone-else', 'imsapp', nonce))
+  assert.deepEqual(overlaid.searchParams.getAll('application_name'), [`ims-migration-${nonce}`])
+})
+
+test('migrationApplicationName refuses a stamp PostgreSQL would truncate (o3d-secops r32, Codex HIGH 2)', () => {
+  // 32 hex is 46 bytes composed, comfortably inside the limit; the guard exists for the 64-hex
+  // upper bound isWitnessNonce() allows and for anything a later round widens it to.
+  assert.equal(migrationApplicationName('b'.repeat(32)).length, 46)
+  assert.ok(migrationApplicationName('b'.repeat(32)).length < APPLICATION_NAME_LIMIT)
+  // MUTATION ROUTE (made against the shipped file and reverted): delete the length check in
+  // migrationApplicationName() and this stops throwing -- and a 64-hex nonce then ships a stamp
+  // PostgreSQL cuts at 63, which the witness reads as ABSENT and root reads as a redirect.
+  assert.throws(() => migrationApplicationName('c'.repeat(64)), /truncat/i)
+  assert.throws(() => migrationApplicationName('d'.repeat(50)), /63/)
+})
+
+// ---------------------------------------------------------------------------
+// AGAINST REAL POSTGRESQL CLUSTERS (o3d-secops r32, Codex HIGH 2 / o3d-mzcp)
+//
+// Every fact this binding rests on is a fact about what a SERVER and a DRIVER do with a connection
+// string, and a fixture asserting any of them would be asserting this file's model of libpq -- the
+// thing the finding says was modelled wrongly. One of them was, in the first draft of this round:
+// the obvious `options=-c application_name=<nonce>` DOES NOT WIN, and only a real server said so.
+// ---------------------------------------------------------------------------
+
+test('libpq overrides `options=-c application_name` and does NOT override the connection parameter (o3d-secops r32, measured)', async (t) => {
+  const root = mkdtempSync(join(tmpdir(), 'ims-fence-appname-'))
+  const port = await freePort()
+  let cluster: ReturnType<typeof startCluster> | undefined
+  try {
+    // TRUST OVER TCP, because these two ask what a TCP connection string does and initdb's
+    // default is scram over host connections. The question is what libpq SENDS, not how it
+    // authenticates.
+    cluster = startCluster(root, 'appname', port, '127.0.0.1', ['host all all 127.0.0.1/32 trust', 'host all all ::1/128 trust'])
+    const me = currentUser()
+    cluster.psql(['-c', 'CREATE DATABASE imsdb'])
+    const base = `postgres://${me}@127.0.0.1:${port}/imsdb`
+    const stamp = `ims-migration-${'e'.repeat(32)}`
+
+    // 1. THE WAY THAT LOOKS RIGHT AND IS NOT. libpq sends `application_name` (or, when the caller
+    //    set none, its own `fallback_application_name`) as a STARTUP-PACKET parameter, and the
+    //    backend applies that AFTER the GUCs in `options`. psql's fallback is "psql", so the `-c`
+    //    is overwritten by the client's own name.
+    const viaOptions = execFileSync('psql', [
+      '-X', '-w', '-q', '-tA', `${base}?options=-c%20application_name%3D${encodeURIComponent(stamp)}`,
+      '-c', 'SHOW application_name',
+    ], { encoding: 'utf8' }).trim()
+    assert.notEqual(viaOptions, stamp,
+      'MEASURED: `options=-c application_name=` does NOT reach the backend as application_name. '
+      + 'A binding composed that way would never bind, and every cutover would refuse.')
+    assert.equal(viaOptions, 'psql', `and what wins is the client's own name:\n${viaOptions}`)
+
+    // 2. THE WAY THE SHIPPED COMPOSER USES. Composed by the shipped function, not by this test --
+    //    so what is measured is the bytes a deploy actually hands its consumers.
+    const composed = buildMigrationConnectionString(base, me, 'e'.repeat(32))
+    const viaParameter = execFileSync('psql', ['-X', '-w', '-q', '-tA', composed, '-c', 'SHOW application_name'], { encoding: 'utf8' }).trim()
+    assert.equal(viaParameter, stamp, `the connection parameter must survive to the backend:\n${viaParameter}`)
+
+    // 3. AND `-c role=` STILL WORKS BESIDE IT, which is the property r5 bought and this round must
+    //    not spend.
+    const bothApplied = execFileSync('psql', ['-X', '-w', '-q', '-tA', composed, '-c', "SELECT current_setting('application_name') || ' as ' || current_user"], { encoding: 'utf8' }).trim()
+    assert.equal(bothApplied, `${stamp} as ${me}`, `both startup settings must apply:\n${bothApplied}`)
+
+    // 4. WHERE POSTGRESQL TRUNCATES, asked of the server rather than taken from the manual --
+    //    because APPLICATION_NAME_LIMIT is what migrationApplicationName() refuses against.
+    const truncated = execFileSync('psql', [
+      '-X', '-w', '-q', '-tA', `${base}?application_name=${'f'.repeat(200)}`,
+      '-c', "SELECT length(current_setting('application_name'))",
+    ], { encoding: 'utf8' }).trim()
+    assert.equal(Number(truncated), APPLICATION_NAME_LIMIT,
+      `the constant the composer refuses against must be the server's real limit, not a guess:\n${truncated}`)
+
+    // 5. AND pg_dump -- which sets a `fallback_application_name` of its own, and would therefore
+    //    have overridden an `options=-c` stamp exactly as psql did above -- carries it too. It is
+    //    one of the five consumers handed this same URL.
+    //
+    //    ASYNCHRONOUSLY, AND THAT IS NOT INCIDENTAL: `execFileSync` blocks this process's event
+    //    loop, so a sampler running in it would take no reading at all while the child ran. That
+    //    is exactly how the first draft of this test measured nothing and passed.
+    const dumped = await new Promise<string>((resolve) => {
+      const child = spawn(join(pgBinDir(), 'pg_dump'), [composed, '-f', '/dev/null'], { stdio: 'pipe' })
+      let stderr = ''
+      child.stderr.on('data', (chunk) => { stderr += String(chunk) })
+      const observer = new Client({ connectionString: base })
+      const sightings: string[] = []
+      void observer.connect().then(async () => {
+        while (child.exitCode === null && child.signalCode === null) {
+          const { rows } = await observer.query('SELECT application_name FROM pg_stat_activity WHERE application_name = $1', [stamp])
+          for (const row of rows) sightings.push(String(row.application_name))
+          await new Promise((r) => setTimeout(r, 10))
+        }
+      }).catch(() => {})
+      child.on('close', () => {
+        void observer.end().catch(() => {}).then(() => resolve(`${sightings.join('\n')}\n--- pg_dump said: ${stderr}`))
+      })
+    })
+    assert.match(dumped, new RegExp(`^${stamp}$`, 'm'),
+      `pg_dump must carry the stamp too, or one of the five consumers is silently unbound:\n${dumped}`)
+  } finally {
+    cluster?.stop()
+    rmSync(root, { recursive: true, force: true })
+  }
+})
+
+test('--bind-migration says colocated on the witness instance and absent on a bystander reached through the same URL (o3d-secops r32, Codex HIGH 2)', async (t) => {
+  const root = mkdtempSync(join(tmpdir(), 'ims-fence-bind-'))
+  const port = await freePort()
+  const me = currentUser()
+  const nonce = '1'.repeat(32)
+  const lock = '2'.repeat(32)
+  let real: ReturnType<typeof startCluster> | undefined
+  let bystander: ReturnType<typeof startCluster> | undefined
+  let witness: InstanceType<typeof Client> | undefined
+  try {
+    // ONE PORT, TWO CLUSTERS, exactly as the r28 identity test does it: the real one binds
+    // 127.0.0.1 and the bystander binds no TCP address at all while claiming the same port. That
+    // is what makes "the URL names the right server and the connection lands on the wrong one"
+    // reachable -- which is what DNS, a proxy or a failover actually produces.
+    real = startCluster(root, 'real', port, '127.0.0.1')
+    bystander = startCluster(root, 'bystander', port, '')
+    for (const cluster of [real, bystander]) cluster.psql(['-c', 'CREATE DATABASE imsdb'])
+
+    // THE WITNESS: a session on ANOTHER database of the REAL cluster, holding the lock. Not on
+    // imsdb, for the reason the shipped code gives -- the drain clears that one.
+    witness = new Client({ host: real.socket, port, database: 'postgres', user: me })
+    await witness.connect()
+    await witness.query('SELECT pg_advisory_lock($1::bigint)', [advisoryKeyForWitnessNonce(lock)])
+
+    const probe = async (cluster: ReturnType<typeof startCluster>) => {
+      // THE STAMPED URL, COMPOSED BY THE SHIPPED FUNCTION, and reaching each cluster the way a
+      // redirect would: the two clusters CLAIM THE SAME PORT, and only one of them binds TCP, so
+      // the bystander is addressed by its own socket directory in the host position -- which libpq
+      // and node-postgres both read as a path. `application_name` is never set on the client
+      // object: the whole question --bind-migration asks is what the URL put there.
+      const composed = buildMigrationConnectionString(
+        `postgres://${me}@${encodeURIComponent(cluster.socket)}:${port}/imsdb`, me, nonce,
+      )
+      const client = new Client({ connectionString: composed })
+      await client.connect()
+      try {
+        return await capturingFenceOutput(() => doBindMigration(client as never, {
+          migrationNonce: nonce, witnessLock: lock, ...suppliedIdentity({ appDatabase: 'imsdb' }),
+        }))
+      } finally {
+        await client.end()
+      }
+    }
+
+    // 1. ON THE FENCED INSTANCE. Both halves must be true: the stamp survived the URL, and this
+    //    backend can see the witness. Without this the refusal below is satisfied by a probe that
+    //    refuses everything.
+    const onReal = await probe(real)
+    assert.equal(onReal.value, EXIT_OK, `the migration connection on the witness's own instance must bind:\n${onReal.err}`)
+    assert.match(onReal.out, new RegExp(`^MIGRATION_BINDING ${nonce} colocated$`, 'm'),
+      `and say so as a whole line naming this run's nonce:\n${onReal.out}`)
+
+    // 2. THE FINDING. Same URL, same database name, same role -- different SERVER. Nothing the
+    //    fence, the release or the identity gate compares can tell these two apart; the advisory
+    //    lock lives in one instance's shared memory and cannot be anywhere else.
+    // MUTATION ROUTE (made against the shipped file and reverted): make doBindMigration() report
+    // `colocated` unconditionally instead of from witnessLockIsHeld() and this assertion fails,
+    // which is the deploy applying DDL to a server the fence never reached.
+    const onBystander = await probe(bystander)
+    assert.equal(onBystander.value, EXIT_ERROR, `a migration connection that landed elsewhere must refuse:\n${onBystander.err}`)
+    assert.match(onBystander.out, new RegExp(`^MIGRATION_BINDING ${nonce} absent$`, 'm'), onBystander.out)
+    assert.match(onBystander.err, /NOT ON THE SERVER THIS RUN FENCED/,
+      `and tell the operator which question was answered:\n${onBystander.err}`)
+    assert.match(onBystander.err, /NOTHING HAS BEEN MIGRATED/, onBystander.err)
+
+    // 3. AND A STAMP THAT DID NOT SURVIVE IS ITS OWN REFUSAL, told apart from a redirect. This is
+    //    the case that would otherwise make every cutover refuse for a reason nobody could act on.
+    const unstamped = new Client({ host: real.socket, port, database: 'imsdb', user: me })
+    await unstamped.connect()
+    try {
+      const captured = await capturingFenceOutput(() => doBindMigration(unstamped as never, {
+        migrationNonce: nonce, witnessLock: lock, ...suppliedIdentity({ appDatabase: 'imsdb' }),
+      }))
+      assert.equal(captured.value, EXIT_ERROR, 'a connection carrying no stamp must refuse')
+      assert.match(captured.err, /did NOT arrive at the backend carrying the stamp/,
+        `and must not be reported as a redirect, which is a different fix:\n${captured.err}`)
+      assert.doesNotMatch(captured.out, /MIGRATION_BINDING/,
+        'and must emit no verdict at all, so no caller can read one')
+    } finally {
+      await unstamped.end()
+    }
+  } finally {
+    await witness?.end().catch(() => {})
+    real?.stop()
+    bystander?.stop()
+    rmSync(root, { recursive: true, force: true })
+  }
+})
+
+test("the witness's sampler counts the migration's own backends, and Prisma's connection is one of them (o3d-secops r32, Codex HIGH 2)", async (t) => {
+  const root = mkdtempSync(join(tmpdir(), 'ims-fence-sample-'))
+  const port = await freePort()
+  const me = currentUser()
+  const nonce = '3'.repeat(32)
+  let cluster: ReturnType<typeof startCluster> | undefined
+  let witnessClient: InstanceType<typeof Client> | undefined
+  try {
+    cluster = startCluster(root, 'sample', port, '127.0.0.1', ['host all all 127.0.0.1/32 trust', 'host all all ::1/128 trust'])
+    cluster.psql(['-c', 'CREATE DATABASE imsdb'])
+    const composed = buildMigrationConnectionString(`postgres://${me}@127.0.0.1:${port}/imsdb`, me, nonce)
+
+    // THE WITNESS, ON ANOTHER DATABASE OF THE SAME CLUSTER, driven through its real stdin protocol
+    // -- `watch`, then `sightings` -- because the protocol is the thing root reads.
+    witnessClient = new Client({ host: '127.0.0.1', port, database: 'postgres', user: me })
+    await witnessClient.connect()
+    const stdin = new PassThrough()
+    const machine: string[] = []
+    const restore = MACHINE_CHANNEL.write
+    MACHINE_CHANNEL.write = (text: string) => { machine.push(String(text)); return true }
+    const ran = doWitness(witnessClient as never, { witnessNonce: '4'.repeat(32) }, stdin as never)
+    const waitFor = async (pattern: RegExp, why: string) => {
+      for (let i = 0; i < 400; i += 1) {
+        if (pattern.test(machine.join(''))) return
+        await new Promise((resolve) => setTimeout(resolve, 25))
+      }
+      assert.fail(`${why}; the witness said:\n${machine.join('')}`)
+    }
+    try {
+      await waitFor(/^WITNESS_READY /m, 'the witness must report holding its lock')
+      stdin.write(`watch ${nonce}\n`)
+      await waitFor(new RegExp(`^WITNESS_WATCHING ${nonce}$`, 'm'), 'the sampler must arm')
+
+      // NOTHING HAS CARRIED THE STAMP YET. Without this the count below could be anything that was
+      // already attached, and "it grew" would be measuring the cluster's own noise.
+      stdin.write(`sightings ${nonce}\n`)
+      await waitFor(new RegExp(`^WITNESS_SIGHTINGS ${nonce} 0$`, 'm'),
+        'precondition: the sampler must start at zero')
+
+      // 1. AN ORDINARY STAMPED CONNECTION, held long enough for the sampler to take a reading.
+      const consumer = new Client({ connectionString: composed })
+      await consumer.connect()
+      await new Promise((resolve) => setTimeout(resolve, WITNESS_SAMPLE_INTERVAL_MS * 8))
+      await consumer.end()
+      machine.length = 0
+      stdin.write(`sightings ${nonce}\n`)
+      await waitFor(new RegExp(`^WITNESS_SIGHTINGS ${nonce} [1-9]`, 'm'),
+        'a backend carrying the migration stamp must be counted')
+
+      // 2. PRISMA'S OWN CONNECTION, which is the consumer whose URL parser is NOT libpq. If the
+      //    schema engine dropped the parameter the stamp would never reach the backend and every
+      //    real cutover would refuse -- so this is measured against the shipped schema rather than
+      //    reasoned about. `migrate status` connects, reads _prisma_migrations and exits; it moves
+      //    no schema, which is what makes it safe to run here.
+      const before = Number(/WITNESS_SIGHTINGS [0-9a-f]+ (\d+)/.exec(machine.join(''))?.[1] ?? '0')
+      // SPAWNED, NOT spawnSync. The sampler is a `setInterval` in THIS process, and a synchronous
+      // child blocks the event loop for its whole life -- so a `spawnSync` here would guarantee the
+      // sampler took no reading while Prisma was connected, and this test would fail for a reason
+      // that has nothing to do with Prisma. (It did, in the first draft.)
+      const prisma = await new Promise<{ code: number | null; said: string }>((resolve) => {
+        const child = spawn('npx', ['prisma', 'migrate', 'status', '--schema', 'prisma/schema.prisma'], {
+          cwd: process.cwd(),
+          env: { ...process.env, DATABASE_URL: composed },
+          stdio: 'pipe',
+        })
+        let said = ''
+        child.stdout.on('data', (chunk) => { said += String(chunk) })
+        child.stderr.on('data', (chunk) => { said += String(chunk) })
+        child.on('close', (code) => resolve({ code, said }))
+      })
+      // PRECONDITION: it actually reached the database. `migrate status` exits non-zero when
+      // migrations are pending, which is the ordinary answer against an empty database -- what may
+      // not have happened is a failure to CONNECT, and that is what would make the count below
+      // measure nothing.
+      assert.doesNotMatch(prisma.said, /P1001|Can't reach database server|ECONNREFUSED/,
+        `precondition: Prisma must have reached this cluster:\n${prisma.said}`)
+      machine.length = 0
+      stdin.write(`sightings ${nonce}\n`)
+      await waitFor(new RegExp(`^WITNESS_SIGHTINGS ${nonce} (\\d+)$`, 'm'), 'the sampler must answer')
+      const after = Number(/WITNESS_SIGHTINGS [0-9a-f]+ (\d+)/.exec(machine.join(''))?.[1] ?? '0')
+      assert.ok(after > before,
+        `Prisma's own connection must carry the stamp and be seen: ${before} -> ${after}. `
+        + 'If this fails the schema engine has stopped forwarding `application_name`, and the '
+        + `binding every cutover now depends on is silently absent.\nPrisma (exit ${prisma.code}) said:\n${prisma.said}`)
+
+      // 3. A NONCE NOBODY WATCHED IS NOT "SEEN NOTHING". Root refuses on both, and must be able to
+      //    tell an operator which one they are looking at.
+      machine.length = 0
+      stdin.write(`sightings ${'9'.repeat(32)}\n`)
+      await waitFor(new RegExp(`^WITNESS_UNWATCHED ${'9'.repeat(32)}$`, 'm'),
+        'an unwatched nonce must be reported as unwatched, not as zero sightings')
+    } finally {
+      stdin.end()
+      await ran.catch(() => {})
+      MACHINE_CHANNEL.write = restore
+    }
+  } finally {
+    await witnessClient?.end().catch(() => {})
+    cluster?.stop()
     rmSync(root, { recursive: true, force: true })
   }
 })
