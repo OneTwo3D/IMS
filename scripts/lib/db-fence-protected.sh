@@ -2453,7 +2453,7 @@ resolve_legacy_fence() {
       # is telling them something untrue about the evidence they are about to act on.
       case "${cluster}" in
         fingerprint-unverifiable)
-          echo "This record DOES name the cluster its fence was raised on. What is missing is the other half of the comparison: the server that answered would not report its own identity, so the fingerprint in the record had nothing to be checked against. THAT IS NOT THE LEGACY CASE, and it is usually one statement away from being settled -- GRANT EXECUTE ON FUNCTION pg_catalog.pg_control_system() TO the admin role in DEPLOY_ADMIN_DATABASE_URL, then run this again and read a proven answer instead of this one." >&2
+          echo "This record DOES name the cluster its fence was raised on. What is missing is the other half of the comparison: the server that answered would not report its own identity, so the fingerprint in the record had nothing to be checked against. THAT IS NOT THE LEGACY CASE, and it is usually one statement away from being settled -- GRANT EXECUTE ON FUNCTION pg_catalog.pg_control_system() TO the admin role in DEPLOY_ADMIN_DATABASE_URL, then run this again, and this answer becomes evidence instead of the absence of it." >&2
           ;;
         *)
           echo "This record carries no cluster fingerprint at all to settle it, which is what every record published before this round looks like." >&2
@@ -2512,7 +2512,7 @@ resolve_legacy_fence() {
     # the audited identity -- so the verdict does not GATE anything here. It is disclosed, because
     # the operator is being asked to license a GRANT on a server this run could not name.
     if [[ "${cluster}" != "proven" ]]; then
-      echo "  NOTE: which cluster that reading came from is NOT PROVEN (${cluster:-<none>}). The roles above were read from whatever server answered; confirm below only if you know it is the one this record was written against." >&2
+      echo "  NOTE: which cluster that reading came from is NOT PROVEN (${cluster:-<none>}). The roles above come from whatever server answered; confirm below only if you know it is the one this record was written against." >&2
     fi
     operator_confirms stamp "$(decision_token stamp "${digest}" "${identity}")" || return 1
     echo "CONFIRMED BY THE OPERATOR: the fence this record describes is what took CONNECT from those roles. Stamping it applied." >&2
