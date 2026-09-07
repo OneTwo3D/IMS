@@ -2615,6 +2615,15 @@ export async function doRelease(client, options) {
   // committed leaves, and those two are not distinguishable from here either; both want the same
   // answer, which is that a person looks before the record is destroyed.
   //
+  // AND WHAT THE OTHER TWO READINGS DO HERE, STATED SO IT IS NOT MISTAKEN FOR AN OVERSIGHT. This
+  // arm consumes a three-valued answer and acts on ONE of its values, deliberately. `stands` is
+  // the ordinary release and is exactly what the GRANTs below are for. `ambiguous` means SOME
+  // recorded grantee has lost CONNECT and some has not -- a half-applied fence and an
+  // administrator's own revoke look identical from here (assessLegacyFenceEvidence) -- and there
+  // IS something to restore, so it proceeds: restoring privilege is the recoverable direction and
+  // the record is what says what to restore. Only `absent`, where nothing was taken away at all,
+  // is refused.
+  //
   // WHAT IT DOES NOT CATCH, SAID PLAINLY: a clone taken AFTER the fence carries the fence too.
   // Measured, again on real clusters: system identifier, database OID, timeline, the ACL itself,
   // and even pg_database's xmin and ctid are identical to the origin's. Nothing readable
