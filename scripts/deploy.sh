@@ -2799,6 +2799,12 @@ bind_migration_to_fenced_server() {
 # this refusal holds the fence, leaves the record standing and does not start the new build --
 # which is the only safe direction when the question "on which server did it move?" has no answer.
 require_migration_landed_on_fenced_server() {
+  # NO FENCE, NO WINDOW TO PLACE (o3d-secops r32). This is not an absence read as an answer: a
+  # migration that ran with no connection fence has no fenced instance to be bound TO, and every
+  # path that expects one has already died if it could not raise it. The fresh-install path is the
+  # real case -- there is no predecessor to fence -- and warning there about a witness nothing
+  # asked for would be noise on the one run where it means nothing.
+  $DB_FENCE_UP || { info "No connection fence was raised for this run, so there is no migration window to place."; return 0; }
   local seen_rc=0 seen_script
   seen_script="$(resolve_fence_script)" || die \
     "The migration has run and this run has no fence script it is willing to execute, so nothing can show which server it ran on. The connection fence is STILL UP and its record is kept. Release it with: ${DB_FENCE_RELEASE_CMD}"

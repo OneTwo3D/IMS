@@ -13409,6 +13409,10 @@ for (const entry of FENCE_HARNESS) {
     CUTOVER_DIR_PRIMITIVES,
     shellFunction(entry.source, 'fence_db_connections'),
     'fence_db_connections',
+    // ${DB_FENCE_UP} is what fence_db_connections() sets on a fence that went up, and the gate
+    // returns immediately without it -- so a rig that stubbed the fence out would measure the
+    // early return rather than the gate.
+    'echo "FENCE UP=${DB_FENCE_UP}"',
     'require_migration_landed_on_fenced_server',
     'echo "BOUND AT THE END=${DB_FENCE_WITNESS_BOUND}"',
     'echo "STARTED THE NEW BUILD"',
@@ -13435,6 +13439,8 @@ for (const entry of FENCE_HARNESS) {
       witnessProtocolCheckout(dir, { verdict: 'yes', binding: 'colocated', sightings: 3, samplerStuck: true })
       const result = runShell(closeTheWindow(dir))
 
+      assert.match(result.output, /^FENCE UP=true$/m,
+        `precondition: the gate returns at once without a fence, so one must be standing:\n${result.output}`)
       assert.match(calls(dir), /^--bind-migration --hold-stamp /m,
         `precondition: the closing probe must have run, holding its stamp:\n${calls(dir)}`)
       assert.doesNotMatch(result.output, /^STARTED THE NEW BUILD$/m,
@@ -13462,6 +13468,8 @@ for (const entry of FENCE_HARNESS) {
       witnessProtocolCheckout(dir, { verdict: 'yes', binding: 'colocated', sightings: 0 })
       const result = runShell(closeTheWindow(dir))
 
+      assert.match(result.output, /^FENCE UP=true$/m,
+        `precondition: the gate returns at once without a fence, so one must be standing:\n${result.output}`)
       assert.match(calls(dir), /^--bind-migration --hold-stamp /m,
         `precondition: the closing probe must have run:\n${calls(dir)}`)
       assert.match(result.output, /^STARTED THE NEW BUILD$/m,
