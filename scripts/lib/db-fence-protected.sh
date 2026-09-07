@@ -1930,6 +1930,19 @@ db_fence_clear_authority() {
 # one `[[ ]]`. It can only ever WITHHOLD the automatic removal of the record.
 DB_FENCE_WITNESS_BOUND=0
 
+# AND A SECOND NAME, BECAUSE "KEEP THE RECORD" IS NOT "THERE IS NO WITNESS" (o3d-secops r33, Codex
+# MEDIUM). r32 withheld the automatic removal by setting ${DB_FENCE_WITNESS_BOUND} back to 0, which
+# is the state that means something else entirely: no witness exists. The release reads that flag
+# to decide whether it can put a challenge at all, so a run that had merely MISSED A SAMPLE went on
+# to issue no challenge, could not set `clear_server`, took status 2 out of
+# db_fence_clear_authority() and returned FAILURE -- and the caller of a purportedly non-refusing
+# outcome then died with the application stopped after the schema had moved.
+#
+# The two facts are now two names. This one says only "do not remove the record at the end of this
+# run"; the witness stays bound, the release still challenges it, and the run still completes. It
+# is the ONLY thing any degraded reading may cost.
+DB_FENCE_KEEP_RECORD=false
+
 # 128 bits of kernel randomness as lower-case hex. It is a NONCE and not a secret: what it has to
 # be is unguessable-in-advance and never reused, so that a lock on it cannot be a fact some earlier
 # snapshot of a cluster happens to contain.
@@ -2229,6 +2242,71 @@ db_fence_migration_bind() {
   return 0
 }
 
+# ONE PIN PER CONSUMER, AND WHY AN AGGREGATE SIGHTING COULD NOT DO THIS JOB
+# (o3d-secops r33, Codex HIGH 2).
+#
+# THE FINDING. Every consumer of the migration URL wears the SAME stamp, the sampler accumulates
+# every backend that wore it into ONE set, and the closing gate asked only whether that set was
+# non-empty. One correctly routed connection therefore certified all of them: `pg_dump` could be
+# redirected to another cluster while prisma reached the fenced one, the count was positive, both
+# deterministic endpoint probes passed, and update.sh recorded a backup OF THE WRONG DATABASE as
+# the restore point for the run. A count cannot answer a question about identity; that is the same
+# shape as the presence-versus-application defect this subsystem has closed twice already, one
+# level up.
+#
+# WHY NOT A DISTINCT STAMP PER CONSUMER, WHICH IS THE OBVIOUS FIX. It keeps the sampler and
+# multiplies what the sampler has to catch. MEASURED (see WITNESS_SAMPLE_INTERVAL_MS in
+# fence-db-connections.mjs): a warm `prisma migrate status` connects, reads and disconnects inside
+# about 40ms, and polling CANNOT PROMISE to observe a connection somebody else opens and closes.
+# One required sighting already cannot be enforced -- that is why a miss costs the record and not
+# the deploy. Requiring SEVEN would make an ordinary cutover fail on the most ordinary event in the
+# mechanism, so per-consumer sampling can only ever be ADVISORY, and an advisory answer leaves the
+# decision resting on exactly the aggregate that was found wanting. It is not answerable.
+#
+# SO THE DECISION RESTS ON CONNECTIONS THIS RUN CONTROLS, ONE BETWEEN EVERY PAIR OF CONSUMERS.
+# This function opens the migration's own string -- the very bytes the consumer that just finished
+# was handed -- takes a lock minted at this instant, and asks its own backend whether the witness
+# is visible. Chained with the opening bind and the closing gate it gives:
+#
+#     bind -> consumer 1 -> pin -> consumer 2 -> pin -> ... -> consumer N -> closing gate
+#
+# so EVERY consumer runs between two connections that were proved to reach the fenced instance,
+# and no consumer's evidence can stand in for another's. A redirect that moves `pg_dump` alone is
+# caught by the pin that follows it, whatever prisma did. The residual is stated plainly and is
+# the same one the closing gate names: a redirect that begins AND reverts inside a single
+# consumer's own execution is not caught deterministically, only by the sampler, and closing that
+# would need a login trigger -- a superuser DDL change to the customer's database, with a lockout
+# risk if it ever fails. That is not a trade this script may make.
+#
+# IT DELIBERATELY DOES NOT RE-ARM THE SAMPLER. `--bind-migration` without `--hold-stamp` drops the
+# stamp the instant it connects, so a pin can never be counted as one of the consumers it exists to
+# separate, and the `watch` set keeps accumulating across the whole window rather than being reset.
+#
+#   0  the string still reaches the fenced instance at this point in the window.
+#   1  IT DOES NOT, or the probe could not be run. A REFUSAL; the caller says what has moved by then.
+#   2  the URL carries no stamp.
+#   3  no witness -- the degraded mode, and not a refusal.
+db_fence_migration_pinned() {
+  local fence_script="$1" migration_url="$2"
+  shift 2
+  local migration_nonce="" bind_nonce="" bound="" rc=0
+  [[ "${DB_FENCE_WITNESS_BOUND:-0}" -eq 1 ]] || return 3
+  migration_nonce="$(db_fence_migration_nonce_in_url "${migration_url}")" || return 2
+  # A FRESH LOCK EVERY TIME, for the reason the bind and the closing gate mint theirs: a lock taken
+  # NOW cannot be a fact any copy of this cluster already contains, and a nonce minted earlier in
+  # this same window would let one affirmative answer be replayed for every pin after it.
+  bind_nonce="$(db_fence_witness_nonce)" || return 1
+  db_fence_witness_challenge "${bind_nonce}" || return 1
+  bound="$(db_fence_migration_helper "${fence_script}" --bind-migration \
+    --migration-nonce="${migration_nonce}" --witness-lock="${bind_nonce}" "$@")" || rc=$?
+  [[ -z "${bound}" ]] || printf '%s\n' "${bound}"
+  if [[ "${rc}" -ne 0 ]] \
+    || ! db_fence_machine_verdict "${bound}" "MIGRATION_BINDING" "${migration_nonce}" "colocated"; then
+    return 1
+  fi
+  return 0
+}
+
 # THE GATE AFTER THE LAST CONSUMER, AND WHY IT IS NOT "DID YOU SEE PRISMA?" (o3d-secops r32).
 #
 # THE MEASUREMENT THAT DECIDED THE SHAPE. A warm `prisma migrate status` connects, reads
@@ -2250,15 +2328,22 @@ db_fence_migration_bind() {
 #
 # AND WHAT THE SAMPLER SAW OF THE MIGRATION ITSELF IS REPORTED, NOT ENFORCED. Zero sightings of the
 # consumers' own backends is real evidence and it costs the automatic removal of the fence record
-# (status 4, and the caller drops ${DB_FENCE_WITNESS_BOUND}), which is this subsystem's standing
-# way of saying "a person looks at this". It does not refuse the deploy, because a miss is a
-# property of polling and not of the deploy.
+# (status 4, and the caller sets ${DB_FENCE_KEEP_RECORD} -- NOT ${DB_FENCE_WITNESS_BOUND}, which
+# means "there is no witness" and would take the release's own challenge away with it; see the
+# declaration of both). It does not refuse the deploy, because a miss is a property of polling and
+# not of the deploy.
 #
-# THE RESIDUAL, SAID PLAINLY: a redirect confined to prisma's own few hundred milliseconds, that
-# reverts before this probe, is caught only by the sampler -- so only probabilistically. Closing it
-# completely needs the server to record every login, which is a login event trigger, a superuser
-# DDL change to the customer's database and a lockout risk if it ever fails. That is not a trade
-# this script may make.
+# AND THE COUNT IS NOT READ AS A STATEMENT ABOUT EACH CONSUMER (o3d-secops r33, Codex HIGH 2).
+# Every consumer wears the same stamp and the sampler accumulates them into one set, so a positive
+# count says A consumer was on this instance and can never say EVERY consumer was. What places each
+# consumer individually is the chain of deterministic pins -- see db_fence_migration_pinned() --
+# and this count is now only the evidence that decides whether the record is kept.
+#
+# THE RESIDUAL, SAID PLAINLY: a redirect confined to one consumer's OWN execution, that begins
+# after the pin before it and reverts before the pin after it, is caught only by the sampler -- so
+# only probabilistically. Closing it completely needs the server to record every login, which is a
+# login event trigger, a superuser DDL change to the customer's database and a lockout risk if it
+# ever fails. That is not a trade this script may make.
 #
 #   0  the string still reaches the witness, and the sampler is demonstrably working.
 #   1  IT DOES NOT, or the sampler could not be shown to work. A REFUSAL, and the schema may

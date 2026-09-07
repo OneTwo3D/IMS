@@ -6594,9 +6594,18 @@ require_migration_landed_on_fenced_server() {
       # the sampler is demonstrably working. Not a refusal -- a connection somebody else opens and
       # closes cannot be promised to a poller, and refusing here would refuse ordinary cutovers --
       # but it IS the evidence this run was buying, so its absence costs the automatic removal of
-      # the record. Dropping the flag is what withholds it: the release's challenge then goes
-      # unissued and the record is left for a person.
-      DB_FENCE_WITNESS_BOUND=0
+      # the record.
+      #
+      # AND IT COSTS THAT AND NOTHING ELSE (o3d-secops r33, Codex MEDIUM). This arm used to
+      # withhold the removal by setting ${DB_FENCE_WITNESS_BOUND} back to 0 -- the flag that means
+      # THERE IS NO WITNESS. The release reads it to decide whether it can put a challenge at all,
+      # so a purportedly non-refusing sampling miss went on to issue no challenge, could not set
+      # `clear_server`, took status 2 out of db_fence_clear_authority() and returned FAILURE into
+      # `release_db_connections || die`. The run then ended with the schema migrated, the
+      # application stopped and CONNECT briefly restored before the exit trap re-fenced it -- the
+      # exact opposite of "this does not refuse". The witness is left bound; only the record is
+      # kept.
+      DB_FENCE_KEEP_RECORD=true
       warn "The migration window closed on the server this run fenced -- a connection opened on the"
       warn "migration's own string could still see the witness -- but the witness never saw a backend"
       warn "carrying this run's stamp while the migration ran. Nothing here is wrong with the schema,"
@@ -6605,6 +6614,44 @@ require_migration_landed_on_fenced_server() {
       ;;
     *)
       die "THE MIGRATION WINDOW DID NOT CLOSE ON THE SERVER THIS RUN FENCED. A connection opened with the migration's own connection string, after the last thing that used it, either could not see the connection witness or could not be seen by it. TWO HISTORIES END HERE AND NOTHING CAN SEPARATE THEM: the migration was routed to another server — in which case THAT server now carries the schema change and this one does not — or the witness was lost mid-window. THE SCHEMA MAY HAVE MOVED. The application has NOT been started, the connection fence is STILL UP and its record is kept. Find out which server ${DB_FENCE_STATE} names and which one the migration reached before you release anything: ${DB_FENCE_RELEASE_CMD}"
+      ;;
+  esac
+}
+
+# ONE PIN BETWEEN EVERY PAIR OF CONSUMERS (o3d-secops r33, Codex HIGH 2).
+#
+# The argument is in full above db_fence_migration_pinned() in lib/db-fence-protected.sh. In short:
+# the sampler's count is an AGGREGATE over one shared stamp, so one correctly routed connection
+# certified every other consumer of the same string -- `pg_dump` could reach another cluster while
+# prisma reached the fenced one and nothing could tell. A per-consumer SIGHTING cannot replace it,
+# because polling is measured not to promise the observation of a 40ms connection and seven
+# required sightings would refuse ordinary cutovers. So each consumer is placed by a connection
+# THIS RUN opens on the consumer's own string, immediately after it, and every consumer therefore
+# runs between two probes that were proved to reach the fenced instance.
+#
+# ${1} is what has just finished, and it is only ever used in a message.
+pin_migration_window() {
+  local what="$1" pin_rc=0 pin_script
+  # The same early return the closing gate takes, and for the same reason: with no fence there is
+  # no window to place, and the fresh-install path is the real case.
+  ${DB_FENCE_UP} || return 0
+  [[ -n "${MIGRATION_DATABASE_URL}" ]] || return 0
+  pin_script="$(resolve_fence_script)" || die \
+    "${what} has run and this run has no fence script it is willing to execute, so nothing can show which server it reached. The connection fence is STILL UP and its record is kept. Release it with: ${DB_FENCE_RELEASE_CMD}"
+  db_fence_migration_pinned "${pin_script}" "${MIGRATION_DATABASE_URL}" "${DB_FENCE_IDENTITY_ARGS[@]:-}" || pin_rc=$?
+  case "${pin_rc}" in
+    0)
+      info "${what}: still on the fenced server."
+      ;;
+    3)
+      # No witness. Already said once, loudly, by the opening bind; saying it again after each of
+      # seven consumers would bury the one message that matters.
+      ;;
+    2)
+      die "The connection fence is up and the migration URL carries no binding stamp, so nothing can show which server ${what} reached. THE SCHEMA MAY HAVE MOVED. The application has NOT been started, the connection fence is STILL UP and its record is kept: ${DB_FENCE_RELEASE_CMD}"
+      ;;
+    *)
+      die "${what} DID NOT RUN AGAINST THE SERVER THIS RUN FENCED, or nothing could show that it did. A connection opened with that step's own connection string, immediately after it, either could not see the connection witness or did not carry this run's stamp — so a DNS change, a proxy, a failover or a pooler moved the migration string across that step. WHATEVER ${what} WROTE OR READ MAY BE ON ANOTHER SERVER. The application has NOT been started, the connection fence is STILL UP and its record is kept. Find out which server ${DB_FENCE_STATE} names and which one that step reached before you release anything: ${DB_FENCE_RELEASE_CMD}"
       ;;
   esac
 }
@@ -6840,10 +6887,40 @@ release_db_connections() {
       && db_fence_machine_verdict "${released}" "RELEASE_WITNESS" "${witness_nonce}" "colocated"; then
       clear_server="same-server-as-the-fence"
     fi
+    # AND A RUN THAT ALREADY KNOWS THE RECORD IS BEING KEPT DOES NOT ASK (o3d-secops r33, Codex
+    # MEDIUM). ${DB_FENCE_KEEP_RECORD} is set by the closing gate when the sampler never saw the
+    # migration's own backends. The removal is withheld HERE, where the fence has just been
+    # released and the challenge has just been answered, rather than by taking the witness away
+    # upstream and letting the missing attestation surface as a failure two steps later.
+    if ${DB_FENCE_KEEP_RECORD:-false}; then
+      warn "The connection fence WAS released -- CONNECT is restored -- and its record at ${DB_FENCE_STATE} is being KEPT deliberately: the witness never saw a backend carrying this run's stamp while the migration ran. The next run reads that file as a STANDING FENCE and adopts it. End it with ${DB_FENCE_RELEASE_CMD}, which asks you to confirm at your terminal."
+      db_fence_witness_stop
+      success "Connection fence released; its record is kept for you to end."
+      return 0
+    fi
     db_fence_clear_authority "${DB_FENCE_STATE}" "${clear_attestation}" "${clear_server}" || clear_rc=$?
     if [[ "${clear_rc}" -eq 2 ]]; then
-      error "The connection fence WAS released -- CONNECT is restored -- and its record at ${DB_FENCE_STATE} was deliberately NOT removed (the reason is printed above). The next run reads that file as a STANDING FENCE. End it with ${DB_FENCE_RELEASE_CMD}, which asks you to confirm at your terminal."
-      return 1
+      # A KEPT RECORD IS NOT A FAILED RELEASE (o3d-secops r33, Codex MEDIUM). CONNECT is restored;
+      # what could not be established is the right to DELETE the record, and this branch used to
+      # return failure for that -- so every host that can hold no witness at all, which is the
+      # degraded mode this whole subsystem promises not to refuse, died at
+      # `release_db_connections || die` with the schema migrated and nothing started. Measured on
+      # all three entrypoints, not reasoned about.
+      #
+      # THE ONE READING THAT IS STILL FATAL is the one r31 bought: a challenge WAS put to a live
+      # witness and the release's own connection could NOT see it. That release may have landed on
+      # a copy while the real server is still fenced, and starting the application on the strength
+      # of it is the thing the witness exists to prevent. Everything else -- no witness to
+      # challenge, or a record this run did not raise -- leaves the grants restored, the record
+      # standing and a person to end it, which is what every message on that path already says.
+      if [[ "${#witness_argv[@]}" -gt 0 ]]; then
+        error "The connection fence WAS released -- CONNECT is restored -- and its record at ${DB_FENCE_STATE} was deliberately NOT removed (the reason is printed above). A challenge WAS put to this run's witness and the release's own connection could not see it, so nothing here can show that the server just released is the server that was fenced. The next run reads that file as a STANDING FENCE. End it with ${DB_FENCE_RELEASE_CMD}, which asks you to confirm at your terminal."
+        return 1
+      fi
+      warn "The connection fence WAS released -- CONNECT is restored -- and its record at ${DB_FENCE_STATE} is being KEPT (the reason is printed above). No challenge could be put to a witness on this run, so the removal has nothing to rest on; the release itself is unaffected. The next run reads that file as a STANDING FENCE and adopts it. End it with ${DB_FENCE_RELEASE_CMD}, which asks you to confirm at your terminal."
+      db_fence_witness_stop
+      success "Connection fence released; its record is kept for you to end."
+      return 0
     fi
     if [[ "${clear_rc}" -ne 0 ]]; then
       error "The connection fence was released and its record at ${DB_FENCE_STATE} could not be removed. The next run reads that file as a STANDING FENCE and will refuse to start the application. Remove it by hand once you have confirmed CONNECT is back."
@@ -8907,6 +8984,7 @@ if ${UPGRADE_EXISTING}; then
       node "${APP_DIR}/scripts/check-db-writers.mjs" ) \
     || die "Another client is still connected to the target database. Stop it and re-run; the migration has NOT been applied."
   success "No other client backends on the target database."
+  pin_migration_window "The drain probe"
 
   # AND ONLY NOW MAY A WORKING CREDENTIAL BE TAKEN AWAY (o3d-2sm1.5 r38, Codex HIGH). Nothing is
   # serving, the reboot fence is standing, the crontab is fenced, the port is free, the connection
@@ -8933,12 +9011,14 @@ mark_schema_touched
 run_as_user "${APP_USER}" env DATABASE_URL="${MIGRATION_DATABASE_URL}" \
   npx prisma migrate deploy --schema prisma/schema.prisma
 success "Database migrations applied."
+pin_migration_window "The migration"
 
 header "Validating database schema"
 
 run_as_user "${APP_USER}" env DATABASE_URL="${MIGRATION_DATABASE_URL}" \
   node "${APP_DIR}/scripts/check-prisma-drift.mjs"
 success "Database schema matches prisma/schema.prisma."
+pin_migration_window "The drift check"
 
 # AND THAT THE APPLICATION CAN ACTUALLY USE WHAT JUST LANDED (o3d-2sm1.5, Codex r4 CRITICAL).
 # Everything above — prisma, the drift check — runs on the ADMIN connection, which owns
@@ -8954,6 +9034,7 @@ run_as_user "${APP_USER}" env \
   node "${DB_OBJECT_ACCESS_SCRIPT}" --state-file="${DB_FENCE_STATE}" \
   || die "The migration left objects the application role cannot use — see above. Nothing has been started."
 success "The application role can use everything in the database."
+pin_migration_window "The object-access check"
 
 # ---------------------------------------------------------------------------
 # 10b. The migrations' own verification checks
@@ -8972,20 +9053,14 @@ run_as_user "${APP_USER}" env \
   node "${APP_DIR}/scripts/run-migration-verifications.mjs" \
   || die "A migration's verification check did not return zero. Nothing has been started."
 success "Every declared verification check returned zero (the coverage report above says what was NOT declared)."
-
-# AND ONLY NOW IS IT ASKED WHERE ALL OF THAT LANDED (o3d-secops r32, Codex HIGH 2 / o3d-mzcp).
-# Here rather than after `prisma migrate deploy`, because every consumer above -- prisma, the drift
-# check, the object-access check and this verification hook -- opens its own connection on the same
-# movable string, and the question is about all of them. Before the seed and before the application
-# is started, because either is the first thing that would write to, or serve, a schema this run
-# cannot place.
-require_migration_landed_on_fenced_server
+pin_migration_window "The verification hook"
 
 header "Seeding database"
 
 run_as_user "${APP_USER}" env DATABASE_URL="${MIGRATION_DATABASE_URL}" SEED_TEST_ADMIN="false" \
   npm run db:seed --prefix "${APP_DIR}"
 success "Database seed applied."
+pin_migration_window "The seed"
 
 if [[ -n "${DEFAULT_ADMIN_EMAIL}" || -n "${SMTP_HOST}" || -n "${SMTP_FROM_EMAIL}" || -n "${APP_DOMAIN}" || -n "${WC_STORE_URL}" ]]; then
   header "Bootstrapping default admin and seeded settings"
@@ -9014,6 +9089,25 @@ if [[ -n "${DEFAULT_ADMIN_EMAIL}" || -n "${SMTP_HOST}" || -n "${SMTP_FROM_EMAIL}
     node "${BOOTSTRAP_SCRIPT}"
   success "Bootstrap configuration complete."
 fi
+
+# AND ONLY NOW IS IT ASKED WHERE ALL OF THAT LANDED (o3d-secops r32, Codex HIGH 2 / o3d-mzcp;
+# moved below the seed and the bootstrap in r33, Codex HIGH 1).
+#
+# THE GATE HAS TO SIT AFTER THE LAST DATABASE CONSUMER, AND THERE ARE SEVEN OF THEM ON THIS
+# ENTRYPOINT, not the five the r32 comment counted. In order: the drain probe, `prisma migrate
+# deploy`, the drift check, the object-access check, the verification hook -- AND THEN `db:seed`
+# AND `provision-instance.mjs`, which are the two this gate used to run in front of. Both write,
+# both go through the same movable ${MIGRATION_DATABASE_URL}, and nothing looked at either of them
+# afterwards: a DNS change, a proxy or a failover taking effect after the old position sent the
+# seed, the default administrator, the SMTP configuration and the WooCommerce credentials to
+# another cluster and returned, and the run then attested against the original server and started
+# the application there.
+#
+# Each of the seven is also placed individually by pin_migration_window() as it finishes -- see the
+# section above that function -- so this is the last link of a chain rather than the only one.
+# Still before the application is started, because starting is the first thing that would SERVE a
+# schema this run cannot place.
+require_migration_landed_on_fenced_server
 
 # The build does NOT live here any more (o3d-2sm1.5, Codex r4 CRITICAL). It ran above,
 # before the stop, with the existing installation still serving the old schema — which is
