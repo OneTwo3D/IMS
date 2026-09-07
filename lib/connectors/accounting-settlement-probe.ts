@@ -363,19 +363,25 @@ function settlementAnswer(
    * little to compute one. This is the sole evidence of completeness — never the records. */
   settled: Decimal | null,
   /**
-   * o3d-zo4j — AND WHETHER THE COLLECTION THAT FIGURE CERTIFIES CONTRADICTS IT BY EXCEEDING IT.
+   * o3d-zo4j — AND WHETHER THE COLLECTION THAT FIGURE CERTIFIES FAILS TO BEAR IT OUT.
+   *
+   * TWO WAYS, and both mean the figure was not established against the collection: the collection
+   * EXCEEDS it (see `exceeds`), or the collection could not be measured at all because one of its
+   * terms is unreadable. The second is not a separate rule — a comparison that did not happen is not
+   * a comparison that agreed, which is the same sentence `completenessCannotRun` carries about the
+   * document's own figures.
    *
    * Required rather than optional, and for the same reason `provedComplete` is: a permissive DEFAULT
    * reached by an arm that forgot to compute it is how every fail-open in this module arrived. An arm
-   * that does not say whether its collection overran does not compile.
+   * that does not say whether its collection bears out its figure does not compile.
    */
-  collectionExceedsFigure: boolean,
+  collectionDoesNotBearOut: boolean,
   records: LedgerSettlementRecord[],
   /** What to say when the document states no figure AND this probe read no settlement of it. */
   figurelessAndEmpty: string,
 ): LedgerSettlementProbe {
   if (settled === null && records.length === 0) return { ok: false, reason: figurelessAndEmpty }
-  return { ok: true, records, provedComplete: settled !== null && !collectionExceedsFigure }
+  return { ok: true, records, provedComplete: settled !== null && !collectionDoesNotBearOut }
 }
 
 /** Sum exact readings, or null the moment one of them is unreadable. */
@@ -609,8 +615,19 @@ export async function probeXeroSettlement(
     // allocation list cannot both be true, and there is no shape of a live Xero credit note in which
     // they legitimately differ — a deleted allocation LEAVES the collection rather than staying in it
     // with a reversing sign, and a reversing sign would push this into the shortfall direction anyway.
-    const overAllocated = applied !== null && allocated !== null && exceeds(allocated, applied, noteCurrency)
-    return settlementAnswer(applied, overAllocated, records,
+    //
+    // AND AN UNREADABLE ALLOCATION AMOUNT IS NOT AGREEMENT EITHER, which is this arm's half of the
+    // closing audit. `allocated` is null the moment one allocation states an amount this code cannot
+    // read, and the shortfall check above excuses that case whenever `applied` is a PROVED ZERO —
+    // `statesAnything(0)` is false, so it never runs. Measured before it was closed: `Total 40 /
+    // RemainingCredit 40` with a single `{ Invoice: { InvoiceID: 'other-inv' } }` carrying NO `Amount`
+    // answered `ok: true, provedComplete: true, records: []` and the classifier said `clear`. The
+    // unreadable allocation belongs to another invoice, so it leaves no record behind to make the
+    // classifier withhold on its own account — the collection was measured in NEITHER direction and
+    // the zero was believed anyway.
+    const allocationsDoNotProve = applied !== null
+      && (allocated === null || exceeds(allocated, applied, noteCurrency))
+    return settlementAnswer(applied, allocationsDoNotProve, records,
       'Xero states no total or remaining credit on this credit note and IMS read no allocation '
       + 'of it to this bill, so it has nothing to tell from — an empty answer here would say that '
       + 'none of the credit has been allocated rather than report what has')
@@ -721,6 +738,15 @@ export async function probeXeroSettlement(
   // with `Payments` totalling 30, `AmountCredited 20` and an unsent `CreditNotes` collection makes
   // `settled` 30 and `explained` 30: pair 3 agrees exactly while the payment list overruns the
   // payment total by 20. One pair per identity, or an excess hides inside a matching sum.
+  //
+  // AND THIS PAIR TAKES THE EXCESS ARM ONLY, NOT THE UNMEASURABLE ONE — deliberately, and it is r31's
+  // lesson rather than an omission. `seen` is null only when a payment's wire amount is unreadable,
+  // and the guard immediately above already refuses that response unless a RECORD is unreadable too —
+  // in which case `classifyLedgerSettlement` answers `record-unmeasurable` before the completeness
+  // gate is reached. Measured: absent, blank and over-bound payment amounts all yield `unknown`
+  // today. So `|| seen === null` here would be a guard no input can reach, which reads as protection
+  // while being decoration. The credit-note and `explained` arms DO take it because there the
+  // unmeasurable term leaves no record behind — see both.
   const paymentsExceedTotal = amountPaid !== null && seen !== null && exceeds(seen, amountPaid, invoiceCurrency)
 
   // THE SHAPE-INDEPENDENT SETTLEMENT ACCOUNTING (Codex round 6, finding 3) — the same arithmetic
@@ -862,9 +888,16 @@ export async function probeXeroSettlement(
   // rule spends — a non-matching probe holds visibly instead of clearing, a matching one is still
   // `present`, and no money post is refused outright — which is why the rule withholds proof rather
   // than refusing the probe. The reverse mistake is a second payment.
-  const settlementsExceedFigure = settled !== null && explained !== null
-    && exceeds(explained, settled, invoiceCurrency)
-  return settlementAnswer(settled, paymentsExceedTotal || settlementsExceedFigure, records,
+  //
+  // AND AN UNMEASURABLE `explained` IS THE OTHER HALF OF THE CLOSING AUDIT, for the same reason and by
+  // the same route: `sumApplied` is null the moment a `CreditNotes`, `Prepayments` or `Overpayments`
+  // entry states an `AppliedAmount` this code cannot read, the shortfall check excuses that whenever
+  // `settled` is a PROVED ZERO, and an applied credit note is never a RECORD, so nothing else makes
+  // the classifier withhold. Measured before it was closed: `Total 100 / AmountDue 100` with
+  // `CreditNotes: [{}]` and no payments answered `provedComplete: true` over an empty list -> `clear`.
+  const settlementsDoNotProve = settled !== null
+    && (explained === null || exceeds(explained, settled, invoiceCurrency))
+  return settlementAnswer(settled, paymentsExceedTotal || settlementsDoNotProve, records,
     'Xero states no total, amount due, amount paid or amount credited on this document and IMS '
     + 'read no payment against it, so it has nothing to tell from — an empty answer here would say '
     + 'that nothing has settled the document rather than report what does')
@@ -1228,6 +1261,13 @@ export async function probeQuickBooksSettlement(
   // so neither reaches this sum; the one shape that could produce an excess innocently is a payment
   // AMENDED between the document read and the payment read, and a picture assembled across an edit is
   // not one to certify a collection from either.
+  //
+  // THE EXCESS ARM ONLY, for the same reason the invoice's payment pair takes only that one.
+  // `qboAmountAppliedTo` sets its two readings in ONE walk, so `exact` is null exactly when `wire` is
+  // — and `wire` is what the record's amount is read from, so every unmeasurable term here leaves a
+  // record with a null amount and `classifyLedgerSettlement` withholds on that record before it
+  // reaches the completeness gate. Measured: a linked BillPayment whose lines name a DIFFERENT bill
+  // yields `unknown` today. A `|| explained === null` arm would be unfalsifiable.
   const paymentsExceedApplied = applied !== null && explained !== null
     && exceeds(explained, applied, documentCurrency)
   return settlementAnswer(applied, paymentsExceedApplied, records,

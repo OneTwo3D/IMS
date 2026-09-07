@@ -1297,7 +1297,7 @@ test('[o3d-zo4j] PAIR 1: a credit note whose allocations exceed its own Remainin
   //        `exceeds(40, 0)` -> `settlementAnswer(0, true, [], ...)` -> `provedComplete: false` ->
   //        `classifyLedgerSettlement` walks an empty list and reaches its terminal gate -> `unknown`.
   // MUTATION: in `settlementAnswer`, restore `provedComplete: settled !== null` (drop the
-  //        `&& !collectionExceedsFigure`). The verdict below becomes `clear`, which is what
+  //        `&& !collectionDoesNotBearOut`). The verdict below becomes `clear`, which is what
   //        authorises allocating a credit that is already spent — measured.
   const OVER_ALLOCATED = {
     CurrencyCode: 'GBP',
@@ -1343,7 +1343,7 @@ test('[o3d-zo4j] PAIR 1: a MATCH on that same contradicted document still yields
   // ROUTE: identical to the test above except that the allocation names THIS bill and matches the
   //        attempt, so `classifyLedgerSettlement`'s amount-and-date pass returns `present` BEFORE
   //        the terminal `provedComplete` gate is reached.
-  // MUTATION: make the credit-note arm REFUSE on the excess (`if (overAllocated) return { ok: false,
+  // MUTATION: make the credit-note arm REFUSE on the excess (`if (allocationsDoNotProve) return { ok: false,
   //        reason: ... }`) instead of routing it through `settlementAnswer`. The verdict below stops
   //        being `present`, and the row can no longer be resolved by the settlement it can see.
   const OVER_ALLOCATED_TO_US = {
@@ -1450,7 +1450,7 @@ test('[o3d-zo4j] the ordinary first payment still posts, and the ordinary part-c
   //
   // ROUTE: each arm computes an excess of exactly 0 -> `exceeds` false -> `provedComplete` stays
   //        `settled !== null` -> the classifier clears as it always did.
-  // MUTATION: invert the new term in `settlementAnswer` (`settled !== null && collectionExceedsFigure`).
+  // MUTATION: invert the new term in `settlementAnswer` (`settled !== null && collectionDoesNotBearOut`).
   //        Every assertion below flips to `unknown`, which is the visible cost of getting the
   //        direction backwards.
 
@@ -1499,7 +1499,7 @@ test('[o3d-zo4j] PAIR 2: the payment total is measured separately, or an excess 
   // ROUTE: the invoice arm -> `amountPaid` 10, `seen` 30 -> `shortBy(10, 30)` false ->
   //        `exceeds(30, 10)` TRUE -> and separately `settled` 30, `explained` 30, so pair 3 agrees
   //        exactly -> `settlementAnswer(30, true, records, ...)` -> `provedComplete: false`.
-  // MUTATION: pass only `settlementsExceedFigure` to `settlementAnswer` (drop `paymentsExceedTotal ||`).
+  // MUTATION: pass only `settlementsDoNotProve` to `settlementAnswer` (drop `paymentsExceedTotal ||`).
   //        The verdict below becomes `clear` — pair 3 alone cannot see this.
   const STRADDLED = {
     CurrencyCode: 'GBP', Total: 100, AmountDue: 70, AmountPaid: 10, AmountCredited: 20,
@@ -1589,7 +1589,7 @@ test('[o3d-zo4j] PAIR 3: an itemised credit that exceeds what the invoice says h
   // ROUTE: the invoice arm -> `settledFromTotals` 0 and `settledFromComponents` 0 AGREE, so the r31
   //        contradiction check does not fire -> `amountPaid` 0 and `seen` 0, so pair 2 does not fire
   //        -> `explained` = 0 payments + 30 applied -> `exceeds(30, 0)` -> `provedComplete: false`.
-  // MUTATION: pass only `paymentsExceedTotal` to `settlementAnswer` (drop `|| settlementsExceedFigure`).
+  // MUTATION: pass only `paymentsExceedTotal` to `settlementAnswer` (drop `|| settlementsDoNotProve`).
   //        The verdict below becomes `clear` — pair 2 alone cannot see this.
   const CREDIT_BEYOND_THE_FIGURE = {
     CurrencyCode: 'GBP', Total: 100, AmountDue: 100, AmountPaid: 0, AmountCredited: 0,
@@ -1613,4 +1613,155 @@ test('[o3d-zo4j] PAIR 3: an itemised credit that exceeds what the invoice says h
     'PRECONDITION: and the record list is EMPTY, which is the shape the post gate must also handle')
   assert.equal(probe.ok === true ? probe.provedComplete : null, false)
   assert.equal(classifyLedgerSettlement(attemptFor('40.00'), probe).outcome, 'unknown')
+})
+
+/* ------------------------------------------------------------------------------------------- *
+ * 8. o3d-zo4j, THE CLOSING AUDIT — A COMPARISON THAT DID NOT HAPPEN IS NOT A COMPARISON THAT
+ *    AGREED.
+ *
+ * With the shortfall, the excess and the r31 contradiction all handled, one route to a wrong
+ * `provedComplete: true` was left: the ACCOUNTED side of a pair being unmeasurable. Both directions
+ * then decide nothing — the shortfall check because it is gated on `statesAnything`, which is false
+ * for the proved zero, and the excess check because it has no operand — and the figure is believed
+ * against a collection nothing measured.
+ *
+ * IT ONLY BITES WHERE THE UNMEASURABLE TERM LEAVES NO RECORD BEHIND. A payment IMS cannot read is
+ * itself a record with a null amount, and `classifyLedgerSettlement` withholds on that record before
+ * the completeness gate is reached — so the invoice's payment pair and the whole QuickBooks arm are
+ * already covered, and a null arm on either would be a guard no input can reach. An ALLOCATION to
+ * another invoice and an APPLIED CREDIT NOTE are not records here, and those two are the holes.
+ * ------------------------------------------------------------------------------------------- */
+
+test('[o3d-zo4j] an UNREADABLE allocation under a proved zero does not certify the credit note', async () => {
+  // ROUTE: the credit-note arm -> `applied` = 40 - 40 = 0 -> `statesAnything(0)` false, so the
+  //        shortfall check does not run -> the allocation states no `Amount`, so `allocated` is null
+  //        and the excess cannot be computed either -> `allocationsDoNotProve` -> `provedComplete:
+  //        false` -> the classifier's terminal gate -> `unknown`.
+  // MUTATION: restore `allocated !== null &&` in place of `allocated === null ||`. The verdict below
+  //        becomes `clear` over an empty list — measured before this was closed.
+  const UNREADABLE_ALLOCATION = {
+    CurrencyCode: 'GBP',
+    Total: 40,
+    RemainingCredit: 40,
+    // No `Amount` at all, and against ANOTHER invoice — so it contributes nothing to the sum AND
+    // leaves no record for the classifier to withhold on.
+    Allocations: [{ Date: '2026-06-01T00:00:00', Invoice: { InvoiceID: 'other-inv' } }],
+  }
+
+  // PRECONDITION 1 — the certifying figure is a proved zero, so the shortfall check is skipped.
+  assert.equal(UNREADABLE_ALLOCATION.Total - UNREADABLE_ALLOCATION.RemainingCredit, 0)
+  // PRECONDITION 2 — there IS an allocation, so this is not the ordinary unapplied credit note. The
+  // collection is non-empty and unmeasurable, which is the whole difference.
+  assert.equal(UNREADABLE_ALLOCATION.Allocations.length, 1)
+  assert.equal('Amount' in UNREADABLE_ALLOCATION.Allocations[0]!, false, 'and it states no amount')
+
+  const probe = await probeNote(UNREADABLE_ALLOCATION)
+  assert.equal(probe.ok, true, 'PRECONDITION: it answers — this is not a refusal path')
+  assert.equal(probe.ok === true ? probe.records.length : -1, 0,
+    'PRECONDITION: and leaves NO record, so nothing but provedComplete can stop a clear')
+  assert.equal(probe.ok === true ? probe.provedComplete : null, false,
+    'a collection that could not be measured has not borne out the figure certifying it')
+  assert.equal(classifyLedgerSettlement(attemptFor('40.00'), probe).outcome, 'unknown')
+
+  // THE DISCRIMINATING HALF: the SAME note with the amount readable and inside the band still
+  // clears. Nothing about a legible collection moved.
+  const readable = await probeNote({
+    ...UNREADABLE_ALLOCATION,
+    Allocations: [{ Amount: 0, Date: '2026-06-01T00:00:00', Invoice: { InvoiceID: 'other-inv' } }],
+  })
+  assert.equal(readable.ok === true ? readable.provedComplete : null, true)
+  assert.equal(classifyLedgerSettlement(attemptFor('40.00'), readable).outcome, 'clear')
+})
+
+test('[o3d-zo4j] an UNREADABLE applied credit under a proved zero does not certify the invoice', async () => {
+  // ROUTE: the invoice arm -> `settled` = 100 - 100 = 0 -> `statesAnything(0)` false, so the
+  //        shortfall check does not run -> `sumApplied(CreditNotes)` is null because the entry states
+  //        no `AppliedAmount`, so `explained` is null -> `settlementsDoNotProve` -> `provedComplete:
+  //        false`.
+  // MUTATION: restore `explained !== null &&` in place of `explained === null ||`. The verdict below
+  //        becomes `clear` over an empty list — measured before this was closed.
+  const UNREADABLE_CREDIT = {
+    CurrencyCode: 'GBP', Total: 100, AmountDue: 100, AmountPaid: 0, AmountCredited: 0,
+    Payments: [],
+    // An applied credit note is never a RECORD on this arm, so an unreadable one is invisible to the
+    // classifier — which is exactly why this needed closing and the payment pair did not.
+    CreditNotes: [{}],
+  }
+
+  // PRECONDITION 1 — both derivations of the settled figure agree at zero, so neither the r31
+  // contradiction check nor the shortfall check is what is being tested.
+  assert.equal(UNREADABLE_CREDIT.Total - UNREADABLE_CREDIT.AmountDue, 0)
+  assert.equal(UNREADABLE_CREDIT.AmountPaid + UNREADABLE_CREDIT.AmountCredited, 0)
+  // PRECONDITION 2 — the credit collection is non-empty and states no readable amount.
+  assert.equal(UNREADABLE_CREDIT.CreditNotes.length, 1)
+  assert.equal('AppliedAmount' in UNREADABLE_CREDIT.CreditNotes[0]!, false)
+
+  const probe = await probeInvoice(UNREADABLE_CREDIT)
+  assert.equal(probe.ok, true, 'PRECONDITION: it answers')
+  assert.equal(probe.ok === true ? probe.records.length : -1, 0, 'PRECONDITION: over an EMPTY list')
+  assert.equal(probe.ok === true ? probe.provedComplete : null, false)
+  assert.equal(classifyLedgerSettlement(attemptFor('40.00'), probe).outcome, 'unknown')
+
+  // THE DISCRIMINATING HALF: an ABSENT `CreditNotes` collection is not an unmeasurable one — it sums
+  // to zero, which is the documented reading that keeps every ordinary invoice clearing.
+  const noCollection = await probeInvoice({
+    CurrencyCode: 'GBP', Total: 100, AmountDue: 100, AmountPaid: 0, AmountCredited: 0, Payments: [],
+  })
+  assert.equal(noCollection.ok === true ? noCollection.provedComplete : null, true,
+    'an absent collection explains nothing and says so; it does not make the figure unmeasurable')
+  assert.equal(classifyLedgerSettlement(attemptFor('40.00'), noCollection).outcome, 'clear')
+})
+
+test('[o3d-zo4j] the arms whose unmeasurable term IS a record are left alone, because a guard there could not fire', async () => {
+  // THE OTHER HALF OF THE AUDIT, AND IT IS r31's LESSON APPLIED TO THIS ROUND'S OWN FIX. The two
+  // pairs above got a null arm; the invoice's payment pair and the QuickBooks arm did NOT. The
+  // difference is not taste: an unreadable PAYMENT is itself a record with a null amount, and the
+  // classifier answers `record-unmeasurable` on it before the completeness gate is reached. A
+  // `|| seen === null` there would be unfalsifiable — protection that reads as protection and cannot
+  // be shown working.
+  //
+  // ROUTE: each shape below -> a record with `amount: null` -> `classifyLedgerSettlement` returns
+  //        `unknown` / `record-unmeasurable` from the record loop.
+  // MUTATION: this test is the PREMISE for an omission, so its mutation is on the classifier: delete
+  //        the `record.amount === null` refusal in `classifyLedgerSettlement`. Every case below then
+  //        reaches the completeness gate, and the omission stops being safe — which is the condition
+  //        under which the null arm would have to be added to these arms too.
+  const unmeasurableRecord = {
+    'Xero invoice, absent payment amount': () => probeInvoice({
+      CurrencyCode: 'GBP', Total: 100, AmountDue: 100, AmountPaid: 0, AmountCredited: 0,
+      Payments: [{ PaymentID: 'P1', Date: '2026-06-01T00:00:00' }],
+    }),
+    'Xero invoice, blank payment amount': () => probeInvoice({
+      CurrencyCode: 'GBP', Total: 100, AmountDue: 100, AmountPaid: 0, AmountCredited: 0,
+      Payments: [{ PaymentID: 'P1', Date: '2026-06-01T00:00:00', Amount: '' }],
+    }),
+    'QuickBooks, a payment whose lines name another bill': () => probeQuickBooksSettlement(
+      { type: 'BILL_PAYMENT', payload: { accountingInvoiceId: 'bill-1' } },
+      ledgerDouble({
+        'bill/bill-1': {
+          Bill: {
+            CurrencyRef: { value: 'GBP' }, TotalAmt: '100.00', Balance: '100.00',
+            LinkedTxn: [{ TxnId: '77', TxnType: 'BillPaymentCheck' }],
+          },
+        },
+        'billpayment/77': {
+          BillPayment: { TxnDate: '2026-06-01', Line: [{ Amount: 20, LinkedTxn: [{ TxnId: 'other', TxnType: 'Bill' }] }] },
+        },
+      }).get,
+    ),
+  }
+  for (const [label, run] of Object.entries(unmeasurableRecord)) {
+    const probe = await run()
+    // PRECONDITION — the unmeasurable term really did leave a record, which is the entire reason
+    // these arms need no completeness arm of their own.
+    assert.equal(probe.ok, true, `${label}: it answers`)
+    assert.equal(probe.ok === true ? probe.records.length : -1, 1, `${label}: and carries one record`)
+    assert.equal(probe.ok === true ? probe.records[0]?.amount : undefined, null,
+      `${label}: whose amount is exactly what could not be measured`)
+
+    const verdict = classifyLedgerSettlement(attemptFor('40.00'), probe)
+    assert.equal(verdict.outcome, 'unknown', `${label}: so the classifier withholds on the record`)
+    assert.equal(verdict.outcome === 'unknown' ? verdict.cause : null, 'record-unmeasurable',
+      `${label}: BEFORE the completeness gate is reached — which is why no gate is needed here`)
+  }
 })
