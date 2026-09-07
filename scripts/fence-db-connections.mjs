@@ -2452,12 +2452,15 @@ export async function doRelease(client, options) {
   // and the release is the escape hatch every refusal in this file points an operator at -- a
   // gate that closed it on the absence of evidence would strand them.
   const releaseCluster = await readClusterIdentity(client)
+  // AN ALIAS OF ITS OWN, like every other mode's (o3d-secops r28). Two modes that ask different
+  // questions must not be answerable by the same branch of anything, a test rig included -- and
+  // `AS database_oid` would be answered by a fixture branch matching on `AS database`.
   const { rows: releaseDatabase } = await client.query(
-    'SELECT oid::text AS database_oid FROM pg_database WHERE datname = current_database()',
+    'SELECT oid::text AS released_database_oid FROM pg_database WHERE datname = current_database()',
   )
   const releaseIdentity = compareClusterIdentity(state, {
     systemIdentifier: releaseCluster.systemIdentifier,
-    databaseOid: releaseDatabase[0]?.database_oid ?? '',
+    databaseOid: releaseDatabase[0]?.released_database_oid ?? '',
     unavailable: releaseCluster.unavailable,
   })
   if (releaseIdentity.status === CLUSTER_IDENTITY_MISMATCH) {

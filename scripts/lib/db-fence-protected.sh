@@ -1573,8 +1573,19 @@ db_fence_mark_authority_applied() {
   [[ -n "${destination}" ]] || return 1
   program="$(db_fence_mark_applied_program)" || return 1
   [[ -n "${program}" ]] || return 1
-  env -u NODE_OPTIONS -u NODE_PATH -u NODE_REPL_EXTERNAL_MODULE \
-    node -e "${program}" -- "${destination}" "${expected_digest}"
+  # OMITTED MEANS OMITTED, AND EMPTY MEANS EMPTY (o3d-secops r28). The program refuses a second
+  # argument that is not a sha256, so passing "" would turn "this caller has no digest" into a
+  # refusal -- and passing it silently as though it were absent would turn "this caller's digest
+  # went missing" into an unconditional write wearing the appearance of a conditional one. Two
+  # branches, because they are two different facts. Every caller that HAS a digest is required to
+  # supply it; see db_fence_raise(), which refuses to stamp without one.
+  if [[ -n "${expected_digest}" ]]; then
+    env -u NODE_OPTIONS -u NODE_PATH -u NODE_REPL_EXTERNAL_MODULE \
+      node -e "${program}" -- "${destination}" "${expected_digest}"
+  else
+    env -u NODE_OPTIONS -u NODE_PATH -u NODE_REPL_EXTERNAL_MODULE \
+      node -e "${program}" -- "${destination}"
+  fi
 }
 
 # ---------------------------------------------------------------------------
@@ -1870,7 +1881,9 @@ db_fence_raise() {
   # is bound anyway, because binding it is one argument and because "narrow" is not a property
   # this file lets itself assert about a write that follows a read.
   if [[ "${rc}" -eq 0 || "${rc}" -eq 5 ]]; then
-    if ! db_fence_mark_authority_applied "${state_file}" "${_fence_published_digest}"; then
+    if [[ -z "${_fence_published_digest}" ]]; then
+      echo "The fence is up, and the publication did not report the digest of the record it wrote, so this run cannot show that the record it would stamp is the one it just published. NOT STAMPING. The fence itself is unaffected; take it down with the release wrapper printed above rather than re-running the fence, because a re-fence over an unstamped record is held to the strict rule and will refuse." >&2
+    elif ! db_fence_mark_authority_applied "${state_file}" "${_fence_published_digest}"; then
       echo "The fence is up, and the authority at ${state_file} could not be stamped as applied (the reason is printed above). This costs nothing if this cutover finishes: the release removes that record. If this run DIES before the release, the next cutover reads an unstamped-in-this-round record as an INITIAL fence and REFUSES rather than re-applying, because it cannot show the fence ever stood. Take the fence down with the release wrapper printed above rather than re-running the fence." >&2
     fi
   fi
@@ -2148,7 +2161,10 @@ run_helper() {
 take_cutover_lock() {
   local dir="${cutover_lock%/*}" dir_mode fd_meta fd_kind fd_owner fd_mode fd_inode path_inode
   if [[ -z "${dir}" || ! -d "${dir}" || ! -O "${dir}" ]]; then
-    echo "REFUSING: ${dir:-the cutover lock's directory} is not a directory this account owns, so a lock taken inside it excludes nobody -- the entry can be renamed between one run's open and another's. ${self} has read nothing and changed nothing." >&2
+    # NO APOSTROPHE IN A ${x:-default}: inside double quotes bash processes the default word, and
+    # a lone quote there opens a quoted string that never closes -- the whole wrapper then fails to
+    # parse, which the `bash -n` the publisher is held to is what catches.
+    echo "REFUSING: the directory holding the cutover lock (${dir:-unset}) is not one this account owns, so a lock taken inside it excludes nobody -- the entry can be renamed between one run's open and another's. ${self} has read nothing and changed nothing." >&2
     return 1
   fi
   dir_mode="$(LC_ALL=C stat -c '%a' "${dir}" 2>/dev/null || true)"
@@ -2171,7 +2187,11 @@ take_cutover_lock() {
   fd_meta="$(LC_ALL=C stat -L -c '%F|%u|%a|%i' /dev/fd/9 2>/dev/null || true)"
   IFS='|' read -r fd_kind fd_owner fd_mode fd_inode <<< "${fd_meta}"
   path_inode="$(LC_ALL=C stat -c '%i' "${cutover_lock}" 2>/dev/null || true)"
-  if [[ "${fd_kind}" != "regular file" || "${fd_owner}" != "$(id -u)" || -z "${fd_mode}" || -z "${fd_inode}" || "${fd_inode}" != "${path_inode}" ]] || (( (8#${fd_mode} & 0077) != 0 )); then
+  # BOTH SPELLINGS OF "REGULAR FILE": GNU stat says `regular empty file` for a zero-length one, and
+  # this lock file is zero-length by construction -- nothing ever writes it. lib/cutover-namespace.sh
+  # has accepted both since r22 for exactly this reason; a check that took only one of them would
+  # refuse every lock on the first run after it was created.
+  if [[ ( "${fd_kind}" != "regular file" && "${fd_kind}" != "regular empty file" ) || "${fd_owner}" != "$(id -u)" || -z "${fd_mode}" || -z "${fd_inode}" || "${fd_inode}" != "${path_inode}" ]] || (( (8#${fd_mode} & 0077) != 0 )); then
     echo "REFUSING: the descriptor this run opened on ${cutover_lock} is not that name's own inode, or is not a regular file owned by this account and unreadable by everyone else (${fd_meta:-unreadable}). Either something followed a link at that name, the name was replaced between the open and the check, or the file is one another account can open and therefore lock indefinitely. ${self} has read nothing and changed nothing." >&2
     exec 9<&-
     return 1
@@ -2270,9 +2290,13 @@ raise_the_fence() {
     # record something else replaced in between. Under the lock above that window is already shut;
     # this is the second answer to the same question and it costs one argument.
     published_digest="$(printf '%s\n' "${published_digest}" | sed -n 's/^authority_sha256=\([0-9a-f]\{64\}\)$/\1/p' | tail -1)"
-    env -u NODE_OPTIONS -u NODE_PATH -u NODE_REPL_EXTERNAL_MODULE \
-      node -e "${mark_applied}" -- "${state_file}" "${published_digest}" \
-      || echo "The fence is up and ${state_file} could not be stamped as applied. Take it down with the release wrapper rather than re-running this one: a re-fence over an unstamped record is held to the strict rule and will refuse." >&2
+    if [[ -z "${published_digest}" ]]; then
+      echo "The fence is up and the publication did not report the digest of the record it wrote, so this run cannot show that the record it would stamp is the one it just published. NOT STAMPING. Take the fence down with ${sudo_prefix}${release_wrapper} rather than re-running this one: a re-fence over an unstamped record is held to the strict rule and will refuse." >&2
+    else
+      env -u NODE_OPTIONS -u NODE_PATH -u NODE_REPL_EXTERNAL_MODULE \
+        node -e "${mark_applied}" -- "${state_file}" "${published_digest}" \
+        || echo "The fence is up and ${state_file} could not be stamped as applied. Take it down with the release wrapper rather than re-running this one: a re-fence over an unstamped record is held to the strict rule and will refuse." >&2
+    fi
   fi
   # Exit 3 is EXIT_NOT_FENCEABLE, which the helper returns only before BEGIN: nothing was revoked,
   # so an authority this run itself published describes a fence that does not exist, and leaving it

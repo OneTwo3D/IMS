@@ -55,6 +55,20 @@ export function pgPackage(body: string): { manifest: string; entry: string } {
  * to match and fail in the ones testing a mismatch, for a reason that has nothing to do with what
  * they are testing.
  */
+/**
+ * THE CLUSTER FINGERPRINT THE PLAN STUB REPORTS (o3d-secops r28, Codex HIGH 1).
+ *
+ * A record carries the identity of the cluster it was raised against -- the system identifier
+ * initdb stamps into pg_control and the database's own OID -- and `--audit-authority` compares
+ * what the record carries with what the connection reports. So the stub has to produce one, or
+ * every record every harness publishes would be a fingerprint-less LEGACY record and the branch
+ * that acts on a PROVEN one would be unreachable from any test.
+ *
+ * Exported so that a fixture answering the audit can report the SAME cluster (proven) or a
+ * different one (mismatch) deliberately, rather than by accident of which literal was typed where.
+ */
+export const FENCE_PLAN_CLUSTER = { systemIdentifier: '7401111111111111111', databaseOid: '16400' }
+
 export const FENCE_PLAN_STUB = [
   "const planArg = (name) => {",
   "  const hit = process.argv.find((a) => a.startsWith(`--${name}=`))",
@@ -68,6 +82,8 @@ export const FENCE_PLAN_STUB = [
   "    admin_role: 'deployadmin',",
   "    revoked: ['PUBLIC', planArg('app-user') || 'imsapp'],",
   "    datacl_before: null,",
+  `    cluster_system_identifier: ${JSON.stringify(FENCE_PLAN_CLUSTER.systemIdentifier)},`,
+  `    cluster_database_oid: ${JSON.stringify(FENCE_PLAN_CLUSTER.databaseOid)},`,
   "    fenced_at: '2026-01-01T00:00:00.000Z',",
   "  })}\n`)",
   "  process.exit(0)",

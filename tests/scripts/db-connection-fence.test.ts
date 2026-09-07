@@ -83,7 +83,11 @@ import {
   buildGrantStatements,
   buildRevokeStatements,
   granteeHasConnect,
-  parseAclEntries,
+  aclPrivilegeRows,
+  compareClusterIdentity,
+  CLUSTER_IDENTITY_PROVEN,
+  CLUSTER_IDENTITY_UNPROVEN,
+  CLUSTER_IDENTITY_MISMATCH,
   parseRoleFromConnectionString,
   planConnectionFence,
   quoteIdent,
@@ -187,6 +191,35 @@ function runFenceScript(
 // makes — whether a fence is even possible, and exactly what a release must restore —
 // are asserted here rather than discovered against a production database.
 
+/**
+ * THE ACL AS THE DATABASE NOW HANDS IT OVER (o3d-secops r28, Codex HIGH).
+ *
+ * Every fixture in this file used to be a `datacl::text` string, because the helper took one apart
+ * by hand. It does not any more: DATACL_PRIVILEGES_SQL asks aclexplode() for rows, so a fixture
+ * that is a string would be answering a question nobody asks.
+ *
+ * AND THIS IS NOT A PARSER. It takes the entries already spelt out -- a grantee (empty for PUBLIC)
+ * and the privilege letters -- and expands them. Writing the printed form here and taking it apart
+ * again would put the defect back inside the test, which is the one place it would never be found.
+ * What the REAL escaping does is measured against a REAL cluster; see the PostgreSQL test below.
+ */
+const PRIVILEGE_OF_LETTER: Record<string, string> = { C: 'CREATE', T: 'TEMPORARY', c: 'CONNECT' }
+function aclRows(entries: ReadonlyArray<readonly [string, string]>) {
+  return entries.flatMap(([grantee, letters], index) =>
+    [...letters].map((letter) => ({
+      // PUBLIC is grantee OID 0 and can never be a role; every named grantee gets an OID of its
+      // own so that a role somebody called "PUBLIC" would still not be it.
+      grantee_oid: grantee === '' ? '0' : String(16384 + index),
+      grantee,
+      privilege: PRIVILEGE_OF_LETTER[letter] ?? letter,
+    })),
+  )
+}
+/** The three readings every test in this file is about, named once. */
+const ACL_UNFENCED = aclRows([['owner', 'CTc'], ['', 'Tc'], ['imsapp', 'c']])
+const ACL_FENCED = aclRows([['owner', 'CTc']])
+const ACL_MIXED = aclRows([['owner', 'CTc'], ['imsapp', 'c']])
+
 function facts(overrides: Record<string, unknown> = {}) {
   return {
     appRole: 'imsapp',
@@ -201,24 +234,52 @@ function facts(overrides: Record<string, unknown> = {}) {
   }
 }
 
-test('a default database ACL grants CONNECT to PUBLIC, so a NULL datacl is not "no privileges"', () => {
-  // Reading NULL as an empty ACL is how a restore ends up granting nothing back.
-  assert.equal(granteeHasConnect(null, 'owner', PUBLIC_GRANTEE), true)
-  assert.equal(granteeHasConnect(null, 'owner', 'owner'), true)
-  assert.equal(granteeHasConnect(null, 'owner', 'imsapp'), false)
+test('an ACL that could not be read is never read as "no privileges" (o3d-secops r28)', () => {
+  // WHAT THIS REPLACES. Until r28 these functions took `datacl::text` and a NULL meant "the
+  // defaults", spelt out here in JavaScript. The SQL expands the defaults now -- COALESCE(datacl,
+  // acldefault('d', datdba)) -- so a null arriving HERE no longer means "the defaults": it means
+  // the row was not there to read. Reading that as "nobody holds CONNECT" is fail-closed for every
+  // caller (a release reports NOT restored, a fence plans nothing), where the old reading of the
+  // same value said the owner and PUBLIC were fine.
+  assert.deepEqual(aclPrivilegeRows(null), [])
+  assert.deepEqual(aclPrivilegeRows(undefined), [])
+  assert.equal(granteeHasConnect(null, PUBLIC_GRANTEE), false)
+  assert.equal(granteeHasConnect(undefined, 'owner'), false)
+  // AND A SHAPE IT CANNOT READ IS NOT SUMMARISED AS AN EMPTY ONE. A `datacl::text` string handed
+  // to this by mistake is exactly the substitution this round removed, so it throws rather than
+  // quietly answering a question about a value it did not understand.
+  assert.throws(() => aclPrivilegeRows('{owner=CTc/owner}'), /aclexplode/)
 })
 
-test('an explicit ACL is read entry by entry, and the PUBLIC entry has no grantee', () => {
-  const acl = '{owner=CTc/owner,=T/owner,imsapp=c/owner}'
-  assert.deepEqual(parseAclEntries(acl).map((entry) => entry.grantee), ['owner', '', 'imsapp'])
-  assert.equal(granteeHasConnect(acl, 'owner', PUBLIC_GRANTEE), false, 'PUBLIC has T but not c')
-  assert.equal(granteeHasConnect(acl, 'owner', 'imsapp'), true)
-  assert.equal(granteeHasConnect(acl, 'owner', 'nobody'), false)
+test('an explicit ACL is read row by row, and PUBLIC is grantee OID 0 rather than a name', () => {
+  const acl = aclRows([['owner', 'CTc'], ['', 'T'], ['imsapp', 'c']])
+  assert.deepEqual(aclPrivilegeRows(acl).map((row) => row.grantee), ['owner', 'owner', 'owner', '', 'imsapp'])
+  assert.equal(granteeHasConnect(acl, PUBLIC_GRANTEE), false, 'PUBLIC has TEMPORARY but not CONNECT')
+  assert.equal(granteeHasConnect(acl, 'imsapp'), true)
+  assert.equal(granteeHasConnect(acl, 'nobody'), false)
+
+  // PUBLIC IS NOT A NAME. A role somebody created and called "PUBLIC" holds its own grants and is
+  // not the pseudo-role the fence revokes from; only the OID separates them, which is why the OID
+  // is carried and not just the printed name.
+  const impostor = [{ grantee_oid: '16999', grantee: 'PUBLIC', privilege: 'CONNECT' }]
+  assert.equal(granteeHasConnect(impostor, PUBLIC_GRANTEE), false,
+    'a role NAMED "PUBLIC" is not the PUBLIC pseudo-role')
+  assert.deepEqual(listDirectConnectGrantees(impostor), ['PUBLIC'], 'it is a named grantee like any other')
 })
 
-test('a comma inside a quoted role name is not an ACL separator', () => {
-  const entries = parseAclEntries('{"role,with,commas"=c/owner,imsapp=c/owner}')
-  assert.deepEqual(entries.map((entry) => entry.grantee), ['role,with,commas', 'imsapp'])
+test('a role name PostgreSQL would have to quote is carried through untouched (o3d-secops r28)', () => {
+  // THE HIGH THIS ROUND ANSWERS, at the unit. The old parser toggled on every quote and ignored
+  // backslash escaping, so `we"ird`, `back\slash` and `comma,role` all came back as some other
+  // name -- and a REVOKE aimed at a name the database does not have either aborts the fence or
+  // hits the wrong role. There is nothing left to parse: the name arrives as a column value.
+  const odd = aclRows([['we"ird', 'c'], ['back\slash', 'c'], ['comma,role', 'c'], ['imsapp', 'c']])
+  assert.deepEqual(listDirectConnectGrantees(odd), ['we"ird', 'back\slash', 'comma,role', 'imsapp'])
+  for (const name of ['we"ird', 'back\slash', 'comma,role']) {
+    assert.equal(granteeHasConnect(odd, name), true, `${name} holds CONNECT and must be seen to`)
+  }
+  // AND THE STATEMENTS BUILT FROM THOSE NAMES QUOTE THEM PROPERLY, which is the other half of
+  // being able to act on them at all.
+  assert.deepEqual(buildRevokeStatements('imsdb', ['we"ird']), ['REVOKE CONNECT ON DATABASE "imsdb" FROM "we""ird";'])
 })
 
 test('the fence refuses when a revoke would fence nothing', () => {
@@ -281,12 +342,19 @@ test('identifiers are quoted, and an embedded quote cannot break out of one', ()
 test('a release is only released when the database says the grants are back', () => {
   // The restore has to be as robust as the fence: reporting success without re-reading
   // the ACL would leave an application that cannot connect at all.
-  const restored = verifyRelease('{owner=CTc/owner,=Tc/owner,imsapp=c/owner}', 'owner', [PUBLIC_GRANTEE, 'imsapp'])
+  const restored = verifyRelease(ACL_UNFENCED, [PUBLIC_GRANTEE, 'imsapp'])
   assert.equal(restored.released, true)
 
-  const partial = verifyRelease('{owner=CTc/owner,=T/owner,imsapp=c/owner}', 'owner', [PUBLIC_GRANTEE, 'imsapp'])
+  const partial = verifyRelease(aclRows([['owner', 'CTc'], ['', 'T'], ['imsapp', 'c']]), [PUBLIC_GRANTEE, 'imsapp'])
   assert.equal(partial.released, false)
   assert.deepEqual(partial.missing, [PUBLIC_GRANTEE])
+
+  // AND AN ANSWER THAT NEVER ARRIVED IS NOT A RESTORED ONE (o3d-secops r28). The verification
+  // query finding no row -- the database renamed or dropped under the release -- used to fall into
+  // the "NULL means the defaults" branch and report the owner and PUBLIC restored.
+  const noAnswer = verifyRelease(undefined, [PUBLIC_GRANTEE, 'imsapp'])
+  assert.equal(noAnswer.released, false, 'a release cannot be verified against an ACL nobody read')
+  assert.deepEqual(noAnswer.missing, [PUBLIC_GRANTEE, 'imsapp'])
 })
 
 test('the role to fence is the one the application connects as', () => {
@@ -366,12 +434,14 @@ test('the effective check is what the fence script actually asks the database', 
 // ---------------------------------------------------------------------------
 
 test('every named role holding CONNECT directly is listed, and PUBLIC is not one of them', () => {
-  const acl = '{owner=CTc/owner,=Tc/owner,imsapp=c/owner,metabase=c/owner,readonly=T/owner}'
-  assert.deepEqual(listDirectConnectGrantees(acl, 'owner'), ['owner', 'imsapp', 'metabase'])
-  assert.ok(!listDirectConnectGrantees(acl, 'owner').includes(''), 'PUBLIC is handled separately')
-  // A NULL datacl is the defaults: CONNECT to PUBLIC and everything to the owner.
-  assert.deepEqual(listDirectConnectGrantees(null, 'owner'), ['owner'])
-  assert.deepEqual(listDirectConnectGrantees('', 'owner'), ['owner'])
+  const acl = aclRows([['owner', 'CTc'], ['', 'Tc'], ['imsapp', 'c'], ['metabase', 'c'], ['readonly', 'T']])
+  assert.deepEqual(listDirectConnectGrantees(acl), ['owner', 'imsapp', 'metabase'])
+  assert.ok(!listDirectConnectGrantees(acl).includes(''), 'PUBLIC is handled separately')
+  // A DEFAULT ACL IS THE SQL'S PROBLEM NOW (o3d-secops r28): COALESCE(datacl, acldefault('d',
+  // datdba)) expands it server-side, so what arrives here is already the owner's own rows. What
+  // arrives as nothing is nothing -- see the r28 test above for why that direction is the safe one.
+  assert.deepEqual(listDirectConnectGrantees(aclRows([['owner', 'CTc'], ['', 'Tc']])), ['owner'])
+  assert.deepEqual(listDirectConnectGrantees(null), [])
 })
 
 test('the fence revokes from a third grantee, not only from PUBLIC and the application role', () => {
@@ -765,8 +835,19 @@ class FakeAdminClient {
       stateFile?: string
       stillConnectsBefore?: boolean
       stillConnectsAfter?: boolean
-      datacl?: string | null
-      releasedDatacl?: string | null
+      /** aclexplode()'s rows, as DATACL_PRIVILEGES_SQL returns them; see aclRows(). */
+      datacl?: ReturnType<typeof aclRows> | null
+      releasedDatacl?: ReturnType<typeof aclRows> | null
+      /**
+       * pg_control_system().system_identifier, and pg_database.oid (o3d-secops r28). The cluster
+       * fingerprint: what a record carries and what the audit compares it with. `''` is a server
+       * that would not say -- which is what an installation that has not granted EXECUTE on
+       * pg_control_system() gives back, and is never treated as a match.
+       */
+      systemIdentifier?: string
+      databaseOid?: string
+      /** pg_control_system() refused: the server's own message, not a value. */
+      systemIdentifierError?: string
       connectedDatabase?: string
       /** pg_postmaster_start_time() — the stamp that says WHICH CLUSTER this is (o3d-2sm1.5 r19). */
       postmaster?: string
@@ -805,7 +886,11 @@ class FakeAdminClient {
             admin_role: this.options.effectiveRole ?? 'deployadmin',
             admin_login_role: this.options.loginRole ?? 'deployadmin',
             owner_role: 'owner',
-            datacl: this.options.datacl ?? '{owner=CTc/owner,=Tc/owner,imsapp=c/owner}',
+            datacl: '{owner=CTc/owner,=Tc/owner,imsapp=c/owner}',
+            datacl_privileges: this.options.datacl ?? ACL_UNFENCED,
+            database_oid: this.options.databaseOid ?? '16400',
+            server_addr: '',
+            server_port: '',
             admin_is_superuser: true,
             app_role_is_superuser: false,
             app_role_exists: 1,
@@ -835,6 +920,15 @@ class FakeAdminClient {
         this.connectAsks === 1 ? (this.options.stillConnectsBefore ?? true) : (this.options.stillConnectsAfter ?? false)
       return { rows: [{ still_connects: answer }] }
     }
+    // o3d-secops r28: the cluster fingerprint's two halves, each asked in a query of its own so
+    // that a server which refuses the first still answers everything else.
+    if (sql.includes('FROM pg_catalog.pg_control_system()')) {
+      if (this.options.systemIdentifierError) throw new Error(this.options.systemIdentifierError)
+      return { rows: [{ system_identifier: this.options.systemIdentifier ?? '' }] }
+    }
+    if (sql.includes('AS released_database_oid')) {
+      return { rows: [{ released_database_oid: this.options.databaseOid ?? '16400' }] }
+    }
     if (sql.includes('FROM pg_roles r')) return { rows: [] }
     if (sql.includes('pg_terminate_backend')) return { rows: [] }
     if (sql.includes('FROM pg_stat_activity')) return { rows: this.options.attached ?? [] }
@@ -850,21 +944,28 @@ class FakeAdminClient {
       // column whichever ones the SELECT names cannot notice one being dropped — and these two are
       // precisely what the identity gate consumes, so a read that quietly stopped asking for them
       // would go on passing every test in this file. Each is supplied only if its alias appears.
-      const asked = (alias: string, value: string) => (sql.includes(`AS ${alias}`) ? { [alias]: value } : {})
+      // AND EVERY COLUMN GOES THROUGH IT, NOT ONLY THE TWO ROLE ONES (o3d-secops r28, Codex
+      // MEDIUM). r27 routed the role aliases through `asked()` and went on fabricating the
+      // database, the owner and -- the load-bearing one -- the ACL, whatever the SELECT named. A
+      // fixture that answers a SHAPE cannot notice a column being dropped, so deleting the ACL
+      // from the audit's read would have left every test here operating on an ACL the fixture
+      // invented. There is no column below that a mutation can remove without a test going red.
+      const asked = <T>(alias: string, value: T) => (sql.includes(`AS ${alias}`) ? { [alias]: value } : {})
       return {
         rows: [
           {
-            audited_database: this.options.connectedDatabase ?? 'imsdb',
+            ...asked('audited_database', this.options.connectedDatabase ?? 'imsdb'),
             ...asked('audited_login_role', this.options.loginRole ?? 'deployadmin'),
             ...asked('audited_effective_role', this.options.effectiveRole ?? 'deployadmin'),
-            audited_owner_role: 'owner',
-            audited_datacl: this.options.datacl === undefined ? '{owner=CTc/owner,=Tc/owner,imsapp=c/owner}' : this.options.datacl,
+            ...asked('audited_owner_role', 'owner'),
+            ...asked('audited_datacl_privileges', this.options.datacl === undefined ? ACL_UNFENCED : this.options.datacl),
+            ...asked('audited_database_oid', this.options.databaseOid ?? '16400'),
           },
         ],
       }
     }
     if (sql.includes('FROM pg_database d WHERE d.datname = $1')) {
-      return { rows: [{ datacl: this.options.releasedDatacl ?? null, owner_role: 'owner' }] }
+      return { rows: [{ datacl_privileges: this.options.releasedDatacl ?? null, owner_role: 'owner' }] }
     }
     return { rows: [] }
   }
@@ -1192,7 +1293,7 @@ test('a grantee REMOVED between the plan and an initial fence aborts it (o3d-sec
   // AND THE HARM IT AVERTS, EXHIBITED RATHER THAN DESCRIBED: had the fence gone ahead, the record
   // would have been the standing authority and the release builds GRANT CONNECT straight out of it
   // — including for the role somebody had just removed.
-  const releasing = new FakeAdminClient({ stateFile, releasedDatacl: '{owner=CTc/owner,=Tc/owner,imsapp=c/owner}' })
+  const releasing = new FakeAdminClient({ stateFile, releasedDatacl: ACL_UNFENCED })
   await withAdminUrl(() => doRelease(releasing as never, { stateFile, appRole: 'imsapp', ...suppliedIdentity({ appDatabase: 'imsdb' }) }))
   assert.ok(releasing.grants.includes('GRANT CONNECT ON DATABASE "imsdb" TO "analytics";'),
     `a release grants back everything the record names, which is why the record may not be stale:\n${releasing.grants.join(' | ')}`)
@@ -1221,7 +1322,7 @@ test('a recovery re-fence executes an authority whose grantees have already lost
     'a publication over a standing authority must be stamped as a recovery')
 
   // THE ACL OF A FENCED DATABASE: the owner keeps its own entry, and nobody else has CONNECT.
-  const client = new FakeAdminClient({ stateFile, datacl: '{owner=CTc/owner}', stillConnectsBefore: false })
+  const client = new FakeAdminClient({ stateFile, datacl: ACL_FENCED, stillConnectsBefore: false })
   const code = await withAdminUrl(() => doFence(client as never, { stateFile, appRole: 'imsapp', timeoutSeconds: 1, ...suppliedIdentity({ appDatabase: 'imsdb' }) }))
 
   assert.equal(code, EXIT_OK, `a standing fence must still be re-applicable:\n${client.log.join(' | ')}`)
@@ -1236,7 +1337,7 @@ test('a recovery re-fence executes an authority whose grantees have already lost
   const strict = join(dir, 'strict.json')
   publishAuthority(strict, record)
   assert.equal(JSON.parse(readFileSync(strict, 'utf8')).fence_mode, FENCE_MODE_INITIAL)
-  const strictClient = new FakeAdminClient({ stateFile: strict, datacl: '{owner=CTc/owner}', stillConnectsBefore: false })
+  const strictClient = new FakeAdminClient({ stateFile: strict, datacl: ACL_FENCED, stillConnectsBefore: false })
   const strictCode = await withAdminUrl(() => doFence(strictClient as never, { stateFile: strict, appRole: 'imsapp', timeoutSeconds: 1, ...suppliedIdentity({ appDatabase: 'imsdb' }) }))
   assert.equal(strictCode, EXIT_NOT_FENCEABLE, 'the identical grantee list under an INITIAL authority is drift')
   assert.deepEqual(strictClient.revokes, [], 'and revokes nothing')
@@ -1637,7 +1738,7 @@ test('--audit-authority reads the live ACL, decides, and touches nothing (o3d-se
   writeFileSync(stateFile, `${JSON.stringify(legacy, null, 2)}\n`)
   const untouched = readFileSync(stateFile, 'utf8')
 
-  const audit = async (datacl: string | null, connectedDatabase = 'imsdb') => {
+  const audit = async (datacl: ReturnType<typeof aclRows> | null, connectedDatabase = 'imsdb') => {
     const client = new FakeAdminClient({ stateFile, datacl, connectedDatabase })
     const written: string[] = []
     const stdout = process.stdout.write.bind(process.stdout)
@@ -1654,20 +1755,22 @@ test('--audit-authority reads the live ACL, decides, and touches nothing (o3d-se
 
   // 1. THE DATABASE IS NOT FENCED: PUBLIC and the application both still hold CONNECT directly,
   //    so the REVOKE this record describes never ran.
-  const spent = await audit('{owner=CTc/owner,=Tc/owner,imsapp=c/owner}')
-  assert.equal(spent.verdict, `legacy_fence_verdict=${LEGACY_FENCE_ABSENT}`)
+  const spent = await audit(ACL_UNFENCED)
+  // o3d-secops r28: stdout carries three lines now -- the cluster verdict and the identity that
+  // answered, beside the ACL verdict. The wrapper reads all three, so the test reads all three.
+  assert.match(spent.verdict, new RegExp(`^legacy_fence_verdict=${LEGACY_FENCE_ABSENT}$`, 'm'), spent.verdict)
   assert.equal(spent.code, EXIT_OK, 'exit 0 is the status the wrapper clears the record on')
 
   // 2. THE DATABASE IS FENCED: the owner keeps its own entry and nothing else holds CONNECT.
-  const standing = await audit('{owner=CTc/owner}')
-  assert.equal(standing.verdict, `legacy_fence_verdict=${LEGACY_FENCE_STANDS}`)
+  const standing = await audit(ACL_FENCED)
+  assert.match(standing.verdict, new RegExp(`^legacy_fence_verdict=${LEGACY_FENCE_STANDS}$`, 'm'), standing.verdict)
   assert.equal(standing.code, EXIT_FENCE_STANDING, 'exit 5 is the status the wrapper stamps on')
 
   // 3. AND THE MIXED ONE. PUBLIC lost CONNECT and the application kept it — which is what a fence
   //    interrupted between two REVOKEs leaves, and also what an administrator revoking PUBLIC by
   //    hand leaves. Neither action may follow from it.
-  const mixed = await audit('{owner=CTc/owner,imsapp=c/owner}')
-  assert.equal(mixed.verdict, `legacy_fence_verdict=${LEGACY_FENCE_AMBIGUOUS}`)
+  const mixed = await audit(ACL_MIXED)
+  assert.match(mixed.verdict, new RegExp(`^legacy_fence_verdict=${LEGACY_FENCE_AMBIGUOUS}$`, 'm'), mixed.verdict)
   assert.equal(mixed.code, EXIT_FENCE_UNPROVEN, 'exit 4 is the status that means the wrapper must not act')
 
   // NOTHING IN ANY OF THE THREE WROTE, OPENED A TRANSACTION OR CHANGED A GRANT. This is what makes
@@ -1680,12 +1783,12 @@ test('--audit-authority reads the live ACL, decides, and touches nothing (o3d-se
 
   // AND IT REFUSES RATHER THAN GUESSING WHEN IT IS POINTED SOMEWHERE ELSE — at another database,
   // where the ACL it would read is not the one this record was written against.
-  const elsewhere = await audit('{owner=CTc/owner}', 'otherdb')
+  const elsewhere = await audit(ACL_FENCED, 'otherdb')
   assert.equal(elsewhere.code, EXIT_ERROR, 'a connection attached elsewhere settles nothing')
   assert.equal(elsewhere.verdict, '', 'and prints no verdict at all, so nothing downstream can act on one')
 
   // NOR WITH NO RECORD TO AUDIT.
-  const absent = new FakeAdminClient({ datacl: '{owner=CTc/owner}' })
+  const absent = new FakeAdminClient({ datacl: ACL_FENCED })
   const missing = await withAdminUrl(() => doAuditAuthority(absent as never, {
     stateFile: join(dir, 'does-not-exist.json'), appRole: 'imsapp', ...suppliedIdentity({ appDatabase: 'imsdb' }),
   }))
@@ -1694,7 +1797,7 @@ test('--audit-authority reads the live ACL, decides, and touches nothing (o3d-se
   // AND A RECORD THE PUBLISHING ACCOUNT DID NOT WRITE IS NEVER READ — the audit's verdict decides
   // whether root stamps a fence applied, so it goes through the same provenance gate as everything
   // else that acts on this file.
-  const foreign = new FakeAdminClient({ stateFile, datacl: '{owner=CTc/owner}' })
+  const foreign = new FakeAdminClient({ stateFile, datacl: ACL_FENCED })
   const foreignCode = await withAdminUrl(() => doAuditAuthority(foreign as never, {
     stateFile, appRole: 'imsapp', ...suppliedIdentity({ appDatabase: 'imsdb' }),
     stateOwnerUid: (process.getuid?.() ?? 0) + 4242,
@@ -1744,7 +1847,7 @@ test('--audit-authority refuses a same-named database on another cluster (o3d-se
 
   // THE APPLICATION'S OWN SERVER, as the caller states it on argv and never derives it.
   const APP = { appHost: 'db.internal', appPort: '6432', appUser: 'imsapp', appDatabase: 'imsdb' }
-  const UNFENCED = '{owner=CTc/owner,=Tc/owner,imsapp=c/owner}'
+  const UNFENCED = ACL_UNFENCED
 
   const audit = async (adminUrl: string, options: Record<string, unknown> = {}, client: Record<string, unknown> = {}) => {
     const fake = new FakeAdminClient({ stateFile, datacl: UNFENCED, connectedDatabase: 'imsdb', ...client })
@@ -1772,7 +1875,7 @@ test('--audit-authority refuses a same-named database on another cluster (o3d-se
   // 0. THE BOUND CASE STILL DECIDES. Without this the rest is satisfied by a gate that refuses
   //    everything, which would be a regression wearing the shape of a fix.
   const bound = await audit('postgres://deployadmin@db.internal:6432/imsdb')
-  assert.equal(bound.verdict, `legacy_fence_verdict=${LEGACY_FENCE_ABSENT}`, bound.said)
+  assert.match(bound.verdict, new RegExp(`^legacy_fence_verdict=${LEGACY_FENCE_ABSENT}$`, 'm'), bound.said)
   assert.equal(bound.code, EXIT_OK, bound.said)
 
   // 1. THE FINDING ITSELF: THE SAME DATABASE NAME, ON ANOTHER HOST. The ACL supplied is the
@@ -1866,7 +1969,7 @@ test('an unstamped record is refused by the validator and still releasable from 
   //    fenced database: the owner keeps its own entry and nobody else holds CONNECT, so every
   //    recorded grantee is `withdrawn` — which the strict rule refuses and the lax one accepts.
   //    r25 accepted this. It is the drift tolerance being withheld.
-  const client = new FakeAdminClient({ stateFile, datacl: '{owner=CTc/owner}', stillConnectsBefore: false })
+  const client = new FakeAdminClient({ stateFile, datacl: ACL_FENCED, stillConnectsBefore: false })
   const code = await withAdminUrl(() => doFence(client as never, { stateFile, appRole: 'imsapp', timeoutSeconds: 1, ...suppliedIdentity({ appDatabase: 'imsdb' }) }))
   assert.equal(code, EXIT_NOT_FENCEABLE, `an unstamped record must not license a re-fence:\n${client.log.join(' | ')}`)
   assert.deepEqual(client.revokes, [], 'and NOTHING may be revoked over it')
@@ -1876,7 +1979,7 @@ test('an unstamped record is refused by the validator and still releasable from 
   //    `fence_mode` — so an operator holding a record no automatic path will touch can still take
   //    a standing fence down. Asserted on the GRANTs rather than the exit code, as the r24 release
   //    drive is, because the code's last arm probes a live DATABASE_URL.
-  const releaser = new FakeAdminClient({ stateFile, releasedDatacl: '{owner=CTc/owner,=Tc/owner,imsapp=c/owner}' })
+  const releaser = new FakeAdminClient({ stateFile, releasedDatacl: ACL_UNFENCED })
   await withAdminUrl(() => doRelease(releaser as never, { stateFile, appRole: 'imsapp', ...suppliedIdentity({ appDatabase: 'imsdb' }) }))
   assert.deepEqual(releaser.grants, [
     'GRANT CONNECT ON DATABASE "imsdb" TO PUBLIC;',
@@ -1903,7 +2006,7 @@ test('an unstamped record is refused by the validator and still releasable from 
   assert.equal(run.status, 0, `the r25 rule publishes where this one refuses:\n${run.stdout}${run.stderr}`)
   assert.equal(JSON.parse(readFileSync(lax, 'utf8')).fence_mode, FENCE_MODE_RECOVERY,
     'and it publishes the RECOVERY mode, which is the tolerance being handed out')
-  const laxClient = new FakeAdminClient({ stateFile: lax, datacl: '{owner=CTc/owner}', stillConnectsBefore: false })
+  const laxClient = new FakeAdminClient({ stateFile: lax, datacl: ACL_FENCED, stillConnectsBefore: false })
   const laxCode = await withAdminUrl(() => doFence(laxClient as never, { stateFile: lax, appRole: 'imsapp', timeoutSeconds: 1, ...suppliedIdentity({ appDatabase: 'imsdb' }) }))
   assert.equal(laxCode, EXIT_OK, 'under r25 the re-fence proceeds over a fence nothing can show exists')
   assert.equal(laxClient.revokes.length, 3, 'revoking the whole recorded list, which the release then grants back')
@@ -2034,7 +2137,7 @@ test('a record this account could have written is never a record (o3d-secops r23
   // be there at all, so an empty destination is what this precondition is about.
   rmSync(stateFile, { force: true })
   publishAuthority(stateFile, SAMPLE_STATE)
-  const genuine = new FakeAdminClient({ stateFile, releasedDatacl: '{owner=CTc/owner,=Tc/owner,imsapp=c/owner}' })
+  const genuine = new FakeAdminClient({ stateFile, releasedDatacl: ACL_UNFENCED })
   const genuineCode = await withAdminUrl(() => doRelease(genuine as never, { stateFile, appRole: 'imsapp', ...suppliedIdentity({ appDatabase: 'imsdb' }) }))
   assert.equal(genuineCode, EXIT_OK, `a record root published must still release:\n${genuine.log.join(' | ')}`)
   assert.deepEqual(genuine.grants, [
@@ -2162,7 +2265,10 @@ test('the privileged validator rebuilds the record and refuses what it cannot ch
   // the record under, rather than taking it from the request. `fence_applied` joined it in r25 and
   // is what `fence_mode` is now computed FROM — a publication is not a standing fence, and only a
   // record root stamped after the revoke may buy the recovery rule. The sentinel stays last.
-  assert.deepEqual(Object.keys(published), ['database', 'owner_role', 'app_role', 'admin_role', 'revoked', 'datacl_before', 'fenced_at', 'fence_mode', 'fence_applied', 'state_complete'],
+  // `cluster_system_identifier` and `cluster_database_oid` joined the template in o3d-secops r28:
+  // the fingerprint that says WHICH SERVER this record was written against, so an audit on another
+  // cluster with a database of the same name cannot be read as an audit of this one.
+  assert.deepEqual(Object.keys(published), ['database', 'owner_role', 'app_role', 'admin_role', 'revoked', 'datacl_before', 'cluster_system_identifier', 'cluster_database_oid', 'fenced_at', 'fence_mode', 'fence_applied', 'state_complete'],
     'the published record is root\'s template, not the request')
   assert.equal(published.fence_applied, 0, 'and a freshly published authority has not been applied to anything yet')
   assert.equal(published.state_complete, STATE_COMPLETE_SENTINEL, 'and it ends with the sentinel the reader requires')
@@ -2370,8 +2476,8 @@ test('--release over a lost record refuses even when the application connects, b
     const client = new FakeAdminClient({
       stateFile,
       stillConnectsBefore: true,
-      datacl: '{owner=CTc/owner,=T/owner,imsapp=c/owner}',
-      releasedDatacl: '{owner=CTc/owner,=T/owner,imsapp=c/owner}',
+      datacl: aclRows([['owner', 'CTc'], ['', 'T'], ['imsapp', 'c']]),
+      releasedDatacl: aclRows([['owner', 'CTc'], ['', 'T'], ['imsapp', 'c']]),
     })
     const code = await withAdminUrl(() =>
       doRelease(client as never, {
@@ -2405,7 +2511,7 @@ test('--release restores exactly the recorded grantees when the record survived'
     publishAuthority(stateFile, SAMPLE_STATE)
     const client = new FakeAdminClient({
       stateFile,
-      releasedDatacl: '{owner=CTc/owner,=Tc/owner,imsapp=c/owner}',
+      releasedDatacl: ACL_UNFENCED,
     })
     const code = await withAdminUrl(() => doRelease(client as never, { stateFile, appRole: 'imsapp', ...suppliedIdentity({ appDatabase: 'imsdb' }) }))
 
@@ -2615,7 +2721,7 @@ test('a release over an unbound connection restores nothing, however good its re
   try {
     const stateFile = join(dir, 'db-connect-fence.json')
     publishAuthority(stateFile, SAMPLE_STATE)
-    const client = new FakeAdminClient({ stateFile, releasedDatacl: '{owner=CTc/owner,=Tc/owner,imsapp=c/owner}' })
+    const client = new FakeAdminClient({ stateFile, releasedDatacl: ACL_UNFENCED })
     const code = await withMismatchedUrls(() => doRelease(client as never, { stateFile, appRole: 'imsapp', timeoutSeconds: 1, ...MISMATCHED_IDENTITY }))
 
     assert.equal(code, EXIT_ERROR, 'an unidentified database is a refusal, not a release')
@@ -4595,6 +4701,11 @@ test('o3d-2sm1.5 r23: the trap re-fences the database it migrated even when the 
         // write, and db_fence_publish_authority() REFUSES anywhere else — so the harness points it
         // at its own private temporary rather than at /tmp, which is 1777.
         `DB_FENCE_STATE=${JSON.stringify(join(fenceDir, 'state.json'))}`,
+        // o3d-secops r28: the recovery wrappers take the entrypoint's own cutover lock for their
+        // whole read/audit/act sequence, so the entrypoint hands them its path. The resolver
+        // lifted above is what publishes them, so the rig has to supply it exactly as deploy.sh
+        // and update.sh do -- and a rig that did not would be measuring an unpublishable wrapper.
+        `LOCK_FILE=${JSON.stringify(join(fenceDir, 'cutover.lock'))}`,
         'DB_FENCE_RELEASE_CMD="release"',
         'MIGRATION_DATABASE_URL=""',
         'DB_FENCE_IDENTITY_ARGS=(--app-host=127.0.0.1 --app-port=5432 --app-user=app --app-database=main)',

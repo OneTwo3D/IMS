@@ -8,6 +8,7 @@ import { test } from 'node:test'
 import {
   checkoutHelper,
   checkoutPgEntry,
+  FENCE_PLAN_CLUSTER,
   protectedLibraryLines,
   protectedLibraryLinesAt,
   sealCheckoutModes,
@@ -1267,6 +1268,10 @@ CUTOVER_STATE_DIR='${dir}'
 CUTOVER_STATE_DIR="${'${CUTOVER_STATE_DIR:-'}${dir}}"
 CUTOVER_ROOT_DIR='${dir}'
 DB_FENCE_DIR='${dir}/fence'
+# o3d-secops r28: the recovery wrappers this rig's resolver publishes now take the entrypoint's
+# own cutover lock for their whole read/audit/act sequence, so the entrypoint hands them its path
+# and a rig that omitted it would be measuring a publication the shipped script cannot perform.
+LOCK_FILE='${dir}/cutover.lock'
 LEGACY_STATE_DIR_DB_FENCE_STATE="${'${CUTOVER_STATE_DIR}'}/deploy/db-connect-fence.json"
 DB_FENCE_SCRIPT='${dir}/app/scripts/fence-db-connections.mjs'
 DB_FENCE_STATE='${dir}/db-connect-fence.json'
@@ -1337,6 +1342,10 @@ APP_USER="$(id -un)"
 CUTOVER_STATE_DIR="${'${CUTOVER_STATE_DIR:-'}${dir}}"
 CUTOVER_ROOT_DIR='${dir}'
 DB_FENCE_DIR='${dir}/fence'
+# o3d-secops r28: the recovery wrappers this rig's resolver publishes now take the entrypoint's
+# own cutover lock for their whole read/audit/act sequence, so the entrypoint hands them its path
+# and a rig that omitted it would be measuring a publication the shipped script cannot perform.
+LOCK_FILE='${dir}/cutover.lock'
 LEGACY_STATE_DIR_DB_FENCE_STATE="${'${CUTOVER_STATE_DIR}'}/deploy/db-connect-fence.json"
 DB_FENCE_SCRIPT='${dir}/app/scripts/fence-db-connections.mjs'
 DB_FENCE_STATE='${dir}/db-connect-fence.json'
@@ -1425,6 +1434,10 @@ APP_DIR='${dir}'
 CUTOVER_STATE_DIR="${'${CUTOVER_STATE_DIR:-'}${dir}}"
 CUTOVER_ROOT_DIR='${dir}'
 DB_FENCE_DIR='${dir}/fence'
+# o3d-secops r28: the recovery wrappers this rig's resolver publishes now take the entrypoint's
+# own cutover lock for their whole read/audit/act sequence, so the entrypoint hands them its path
+# and a rig that omitted it would be measuring a publication the shipped script cannot perform.
+LOCK_FILE='${dir}/cutover.lock'
 LEGACY_STATE_DIR_DB_FENCE_STATE="${'${CUTOVER_STATE_DIR}'}/deploy/db-connect-fence.json"
 DB_FENCE_SCRIPT='${dir}/app/scripts/fence-db-connections.mjs'
 DB_FENCE_STATE='${dir}/db-connect-fence.json'
@@ -6191,7 +6204,12 @@ const MENTION_SHAPES: ReadonlyArray<{ why: string; match: RegExp }> = (
       why: 'passed by path to db_fence_publish_operator_wrappers(), which writes it into a root-owned wrapper',
       match:
         `db_fence_publish_operator_wrappers "\\$\\{APP_USER\\}" "(${APP_OWNED_PATH})" ` +
-        '"\\$\\{DB_FENCE_STATE\\}" "\\$\\{DB_FENCE_IDENTITY_ARGS\\[@\\]:-\\}"' +
+        // o3d-secops r28: ${LOCK_FILE} joined the call, between the state file and the identity.
+        // The wrappers read the fence record, ask the database about it and then write or remove
+        // it, and that sequence is now excluded against every cutover and every other wrapper on
+        // the entrypoint's own lock. Spelt out here for the reason the rest of this shape is: a
+        // call that started passing something ELSE in that position is not covered by this.
+        '"\\$\\{DB_FENCE_STATE\\}" "\\$\\{LOCK_FILE\\}" "\\$\\{DB_FENCE_IDENTITY_ARGS\\[@\\]:-\\}"' +
         '( \\|\\| echo "[^"]*" >&2)?',
     },
     // install.sh OWNS these two files: it writes them, then locks them down.
@@ -6775,6 +6793,10 @@ function fenceRecoveryHarness(dirs: { app: string; state: string; recovery: stri
     `CUTOVER_STATE_DIR=${JSON.stringify(dirs.state)}`,
     `CUTOVER_ROOT_DIR=${JSON.stringify(dirs.state)}`,
     `DB_FENCE_DIR=${JSON.stringify(join(dirs.state, 'deploy'))}`,
+    // o3d-secops r28: the recovery wrappers take the entrypoint's own cutover lock for their whole
+    // read/audit/act sequence, so the entrypoint passes them its path -- and a rig that omitted it
+    // would measure a publication the shipped script refuses to perform.
+    `LOCK_FILE=${JSON.stringify(join(dirs.state, 'cutover.lock'))}`,
     CUTOVER_DIR_PRIMITIVES,
     `DB_FENCE_STATE=${JSON.stringify(join(dirs.state, 'deploy', 'db-connect-fence.json'))}`,
     `DB_FENCE_SCRIPT=${JSON.stringify(join(dirs.app, 'scripts', 'fence-db-connections.mjs'))}`,
@@ -9519,7 +9541,7 @@ test('r32: the recovery wrapper an operator is given runs, as pasted, with nothi
     const publish = runShell(
       artefactHarness(dir, [
         'db_fence_script_in_use >/dev/null || exit 1',
-        `db_fence_publish_operator_wrappers "$(id -un)" ${JSON.stringify(join(dir, 'app', '.env'))} ${JSON.stringify(join(dir, 'state.json'))} --app-host=db.internal --app-port=6432 --app-user=imsapp --app-database=imsdb || exit 1`,
+        `db_fence_publish_operator_wrappers "$(id -un)" ${JSON.stringify(join(dir, 'app', '.env'))} ${JSON.stringify(join(dir, 'state.json'))} ${JSON.stringify(join(dir, 'cutover.lock'))} --app-host=db.internal --app-port=6432 --app-user=imsapp --app-database=imsdb || exit 1`,
       ]),
     )
     assert.equal(publish.status, 0, `the wrappers must be published:\n${publish.output}`)
@@ -9655,10 +9677,10 @@ test('r32: the recovery wrapper an operator is given runs, as pasted, with nothi
  * A rig that computed the verdict itself would be asserting that its author can compare two
  * lists, and would go on passing if the rule the wrapper acts on changed underneath it.
  */
-function auditingHelper(dir: string, aclFile: string): string {
+function auditingHelper(dir: string, fixtureFile: string): string {
   const shipped = `file://${join(process.cwd(), 'scripts', 'fence-db-connections.mjs')}`
   return [
-    "import { appendFileSync, readFileSync } from 'node:fs'",
+    "import { appendFileSync, readFileSync, writeFileSync } from 'node:fs'",
     `import { doAuditAuthority } from ${JSON.stringify(shipped)}`,
     `appendFileSync(${JSON.stringify(join(dir, 'calls.log'))}, process.argv.slice(2).join(' ') + '\\n')`,
     'const arg = (name) => {',
@@ -9666,24 +9688,38 @@ function auditingHelper(dir: string, aclFile: string): string {
     '  return hit ? hit.slice(name.length + 3) : \'\'',
     '}',
     "if (process.argv.includes('--audit-authority')) {",
-    `  const raw = readFileSync(${JSON.stringify(aclFile)}, 'utf8').trim()`,
-    // A HELPER THAT DECIDED AND THEN DIED ON THE WAY OUT. The verdict is on stdout and the exit
-    // status is a failure: two channels that disagree, which is the case the wrapper's `&&` is
-    // there for and which a fixture where they always agree cannot exhibit.
-    "  const crash = raw.startsWith('CRASH:')",
-    "  const fixture = crash ? raw.slice('CRASH:'.length) : raw",
+    `  const fixture = JSON.parse(readFileSync(${JSON.stringify(fixtureFile)}, 'utf8'))`,
+    // A CONCURRENT WRITER, LANDING IN THE ONE WINDOW THE ROUND IS ABOUT (o3d-secops r28, Codex
+    // HIGH 3). The wrapper inspects the record, runs THIS process to audit it, and then stamps or
+    // removes it. `rewriteStateTo` makes the audit itself replace the record while the wrapper is
+    // between its read and its write — which is exactly what a release running beside a resolution
+    // does, and is not something a test can arrange from outside the wrapper at all.
+    "  if (fixture.rewriteStateTo !== undefined) {",
+    `    writeFileSync(arg('state-file'), fixture.rewriteStateTo)`,
+    '  }',
     '  const client = {',
     '    query: async (sql) => {',
-    "      if (String(sql).includes('AS audited_database')) {",
-    // o3d-secops r27: the audit binds its identity before it decides, so the fixture reports the
-    // two role halves as well. `admin` is the role the .env admin URL names; the phases that mean
-    // to fail the gate move the HOST, so that a refusal there cannot be the role check firing.
-    //
-    // AND EACH COLUMN IS SUPPLIED ONLY IF THE SELECT ASKED FOR IT. A fixture that answers a shape
-    // rather than a query cannot notice a column being dropped, and these two are exactly what the
-    // gate consumes — so an audit that quietly stopped asking would still bind and still decide.
-    "        const askedFor = (alias, value) => (String(sql).includes('AS ' + alias) ? { [alias]: value } : {})",
-    "        return { rows: [{ audited_database: 'imsdb', ...askedFor('audited_login_role', 'admin'), ...askedFor('audited_effective_role', 'admin'), audited_owner_role: 'owner', audited_datacl: fixture === 'NULL' ? null : fixture }] }",
+    '      const text = String(sql)',
+    // The cluster fingerprint's own query, kept its own because a server may refuse it.
+    "      if (text.includes('FROM pg_catalog.pg_control_system()')) {",
+    '        if (fixture.systemIdentifierError) throw new Error(fixture.systemIdentifierError)',
+    "        return { rows: [{ system_identifier: fixture.systemIdentifier ?? '' }] }",
+    '      }',
+    "      if (text.includes('AS audited_database')) {",
+    // EVERY COLUMN THROUGH THE ALIAS TEST, NOT ONLY THE TWO ROLE ONES (o3d-secops r28, Codex
+    // MEDIUM). r27 introduced this helper for the role halves and went on fabricating the
+    // database, the owner and — the load-bearing one — the ACL whatever the SELECT named. A
+    // fixture that answers a SHAPE cannot notice a column being dropped, so removing the ACL from
+    // the audit's read would have left every phase below deciding on an ACL this file invented.
+    "        const askedFor = (alias, value) => (text.includes('AS ' + alias) ? { [alias]: value } : {})",
+    '        return { rows: [{',
+    "          ...askedFor('audited_database', 'imsdb'),",
+    "          ...askedFor('audited_login_role', 'admin'),",
+    "          ...askedFor('audited_effective_role', 'admin'),",
+    "          ...askedFor('audited_owner_role', 'owner'),",
+    "          ...askedFor('audited_datacl_privileges', fixture.privileges),",
+    "          ...askedFor('audited_database_oid', fixture.databaseOid ?? ''),",
+    '        }] }',
     '      }',
     "      throw new Error('the audit asked something this fixture does not answer: ' + sql)",
     '    },',
@@ -9699,7 +9735,10 @@ function auditingHelper(dir: string, aclFile: string): string {
     "    appUser: arg('app-user'),",
     "    appDatabase: arg('app-database'),",
     '  })',
-    '  process.exit(crash ? 1 : decided)',
+    // A HELPER THAT DECIDED AND THEN DIED ON THE WAY OUT. The verdict is on stdout and the exit
+    // status is a failure: two channels that disagree, which is the case the wrapper's `&&` is
+    // there for and which a fixture where they always agree cannot exhibit.
+    '  process.exit(fixture.crash ? 1 : decided)',
     '}',
     'process.exit(0)',
     '',
@@ -9707,86 +9746,115 @@ function auditingHelper(dir: string, aclFile: string): string {
 }
 
 /**
- * THE ONE-TIME OPERATOR RESOLUTION, END TO END (o3d-secops r26, Codex HIGH).
+ * aclexplode()'s rows, written the way a fixture wants to state them (o3d-secops r28).
+ *
+ * NOT A PARSER, deliberately: the entries are spelt out and expanded. Writing PostgreSQL's printed
+ * `datacl::text` here and taking it apart again would put the very defect this round removed back
+ * inside the test. What the real escaping does is measured against a real cluster in
+ * tests/scripts/db-connection-fence.test.ts.
+ */
+function auditAclRows(entries: ReadonlyArray<readonly [string, string]>) {
+  const named: Record<string, string> = { C: 'CREATE', T: 'TEMPORARY', c: 'CONNECT' }
+  return entries.flatMap(([grantee, letters], index) =>
+    [...letters].map((letter) => ({
+      grantee_oid: grantee === '' ? '0' : String(16384 + index),
+      grantee,
+      privilege: named[letter] ?? letter,
+    })),
+  )
+}
+
+/**
+ * THE ONE-TIME OPERATOR RESOLUTION, END TO END (o3d-secops r26/r27, reworked r28).
  *
  * WHAT IS BEING PROVED, in the order it matters:
  *   1. the automatic re-fence REFUSES over an unstamped record, and says which record and where to
  *      go — it does not silently pick a state, which is what r25 did;
  *   2. the RELEASE wrapper still works over that same record, unchanged, which is the escape hatch
  *      that makes the refusal survivable;
- *   3. the resolution CLEARS a record the ACL shows nothing stands behind, automatically, and
- *      REPORTS a fully-withdrawn ACL without stamping it until the operator says the fence is
- *      theirs (o3d-secops r27, Codex HIGH — see below);
- *   4. a MIXED reading changes nothing at all, with or without that confirmation;
+ *   3. a fully-withdrawn ACL is REPORTED and not stamped until the operator says the fence is
+ *      theirs AND types a token bound to this record at a terminal (r27, then r28);
+ *   4. a MIXED reading changes nothing at all, with or without either argument;
  *   5. it refuses every record that is not the ambiguous one, so it cannot be used as a
  *      general-purpose "make this record say what I want" tool;
- *   6. and an audit that reached a SAME-NAMED DATABASE ON ANOTHER HOST resolves nothing, because
- *      the verdict it would otherwise print is about a cluster this record was not written for.
+ *   6. an audit that reached a SAME-NAMED DATABASE ON ANOTHER HOST resolves nothing;
+ *   7. (r28) and neither does one that reached a same-named database on ANOTHER CLUSTER at the
+ *      right host — which is the case r27 documented and went on deleting records on.
  *
- * WHAT r27 CHANGED IN THIS TEST, and why it is not the same assertion with a flag bolted on.
- * PHASE 3 used to assert that a fully-withdrawn ACL STAMPS the record. That reading has two
- * causes — this fence's REVOKE, or an administrator revoking the same roles independently — and
- * the ACL records the state of the grants, never what made them so. Stamping is what later lets
- * the release wrapper GRANT CONNECT back to every recorded grantee, so it is the direction that
- * can restore access somebody deliberately removed; clearing on `absent` cannot cost anything
- * either way. The two therefore no longer share an evidential bar: the clear stays automatic and
- * the stamp waits for `--this-fence-revoked-them`. PHASE 6 is new and is the o3d-secops r27 HIGH 1
- * end-to-end case.
+ * WHAT r28 CHANGED IN THIS TEST, and why the old assertions could not simply stay.
+ *
+ *   PHASE 4a USED TO ASSERT THAT A SPENT LEGACY RECORD IS CLEARED AUTOMATICALLY. It is not any
+ *   more, and that is the HIGH. `absent` on an unfenced BYSTANDER cluster reachable at the same
+ *   host, port and database name is the identical reading, and clearing on it destroys the only
+ *   account of a fence standing on the real one. The clear is automatic where the record's
+ *   fingerprint and the answering cluster's AGREE, and asks the operator where it cannot be shown
+ *   — which, for a record published before the fingerprint existed, is always. PHASE 4a now
+ *   asserts the refusal and PHASE 4d asserts the automatic clear on a fingerprinted record, so
+ *   both arms are measured rather than one being traded for the other.
+ *
+ *   PHASE 3b USED TO PASS `--this-fence-revoked-them` AND EXPECT A STAMP. The flag now selects the
+ *   decision and authorises nothing; what authorises it is a token typed at the wrapper's
+ *   controlling terminal, derived from the action, the exact bytes of the record and the cluster
+ *   that answered. So PHASE 3b runs the wrapper under a real pty and types it.
  *
  * ROUTE: real processes. The wrappers are the ones db_fence_publish_operator_wrappers() writes,
- * run as an operator would with nothing supplied; the record is published by the shipped
- * validator through the shipped re-fence wrapper and then stripped of the two fields an older
- * validator never wrote; the verdict comes from the shipped `--audit-authority` over a `datacl`
- * fixture.
+ * run as an operator would with nothing supplied; the record is published by the shipped validator
+ * through the shipped re-fence wrapper and then stripped of the fields an older validator never
+ * wrote; the verdict comes from the shipped `--audit-authority` over a fixture that answers the
+ * query it was actually asked. The terminal is a real pty, allocated by script(1).
  *
- * MUTATION ROUTE (each made against scripts/lib/db-fence-protected.sh and reverted):
+ * MUTATION ROUTE (each made against the shipped file and reverted):
  *   1. put r25's rule back in the validator (`standing = true` where the refusal now is): PHASE 1
- *      stops refusing — the re-fence publishes `recovery` over a record nothing can show a fence
- *      behind.
- *   2. drop the `"${rc}" -eq 0 &&` half of the clearing arm in resolve_legacy_fence(): PHASE 4c —
- *      a helper that printed `absent` and then failed on its way out — clears the record on the
- *      word of a run that did not finish.
+ *      stops refusing.
+ *   2. drop the `"${rc}" -eq 0 &&` half of the clearing arm in resolve_legacy_fence(): PHASE 4c
+ *      clears the record on the word of a run that did not finish.
  *   3. remove the `fence_applied` check from db_fence_legacy_inspect_program(): PHASE 5 stops
- *      refusing and the resolution re-stamps a record that was never ambiguous.
- *   4. (r27) drop the `[[ "${confirmed}" -ne 1 ]]` gate from the stamping arm of
- *      resolve_legacy_fence(): PHASE 3a stamps without being asked.
- *   5. (r27) drop the `case` arm's `*)` refusal so an unknown argument is ignored: PHASE 7 stops
  *      refusing.
- *   6. (r27, made against scripts/fence-db-connections.mjs) delete the
- *      requireBoundDatabaseIdentity() call from doAuditAuthority(): PHASE 6's `unfenced` arm
- *      removes the record — the wrapper deleting a standing fence's only authority on the word of
- *      a cluster that merely shares its database name.
- *   7. (r27) add a `[[ "${confirmed}" -eq 1 ]]` stamp in front of the final refusal, which is what
- *      "the confirmation is a bypass" looks like when somebody writes it by hand: PHASE 4b's
- *      confirmed run stamps a MIXED reading. Route 4 does NOT cover this — it stops the run at
- *      PHASE 3a, so the two arms needed two mutations.
- *   8. (r27, against scripts/fence-db-connections.mjs) put r26's `A FENCE IS STANDING` prose back
- *      in doAuditAuthority(): PHASE 3a's assertion on the history that is NOT a fence fails.
- *   9. (r27, against scripts/fence-db-connections.mjs) drop `session_user AS audited_login_role`
- *      from the audit's read: PHASE 3a and PHASE 6 both fail. Only because the fixture answers the
- *      QUERY — run first against one that returned both role columns whatever the SELECT asked
- *      for, this mutation changed nothing anywhere in the suite.
+ *   4. (r27) drop the `[[ "${confirmed_stamp}" -ne 1 ]]` gate from the stamping arm: PHASE 3a
+ *      stamps without being asked.
+ *   5. (r27) drop the `case` arm's `*)` refusal: PHASE 7 stops refusing.
+ *   6. (r27, against scripts/fence-db-connections.mjs) delete the requireBoundDatabaseIdentity()
+ *      call from doAuditAuthority(): PHASE 6's `unfenced` arm removes the record.
+ *   7. (r27) add a `[[ "${confirmed_stamp}" -eq 1 ]]` stamp in front of the final refusal: PHASE
+ *      4b's confirmed run stamps a MIXED reading.
+ *   8. (r28, against scripts/fence-db-connections.mjs) make compareClusterIdentity() return
+ *      CLUSTER_IDENTITY_PROVEN where it returns UNPROVEN: PHASE 4a stops refusing and clears a
+ *      legacy record with no fingerprint automatically — the finding, exactly.
+ *   9. (r28) delete the mismatch arm of compareClusterIdentity(): PHASE 8 clears the record of a
+ *      fence standing on another cluster.
+ *  10. (r28) drop `operator_confirms stamp ...` from the stamping arm: PHASE 3b-i, which types a
+ *      WRONG answer, stamps anyway.
+ *  11. (r28) pass no digest to the stamp (`node -e "${mark_applied}" -- "${state_file}"`): PHASE 9
+ *      stamps a record that was replaced while the audit was running.
+ *  12. (r28) delete `take_cutover_lock || return 1` from any of the three wrappers: PHASE 10's
+ *      corresponding arm runs instead of refusing.
  */
-test('r26/r27: the operator resolution clears a spent legacy record automatically and stamps a standing one only on explicit confirmation', () => {
+test('r26/r27/r28: the operator resolution acts only on a reading it can attribute, and only on a confirmation a script cannot give', () => {
   const dir = mkdtempSync(join(tmpdir(), 'ims-r26-resolve-'))
   try {
-    const acl = join(dir, 'datacl.txt')
+    const fixtureFile = join(dir, 'audit-fixture.json')
     const state = join(dir, 'state.json')
     const calls = join(dir, 'calls.log')
-    // THE THREE ACLs, in the shape PostgreSQL prints them. The record below names PUBLIC and
-    // imsapp, which is what FENCE_PLAN_STUB plans; the owner keeps its own entry in all three,
-    // because a fence never takes the owner's.
-    const UNFENCED = '{owner=CTc/owner,=Tc/owner,imsapp=c/owner}'
-    const FENCED = '{owner=CTc/owner}'
-    const MIXED = '{owner=CTc/owner,imsapp=c/owner}'
+    const cutoverLock = join(dir, 'cutover.lock')
+    // THE THREE READINGS. The record names PUBLIC and imsapp, which is what FENCE_PLAN_STUB plans;
+    // the owner keeps its own entry in all three, because a fence never takes the owner's.
+    const UNFENCED = auditAclRows([['owner', 'CTc'], ['', 'Tc'], ['imsapp', 'c']])
+    const FENCED = auditAclRows([['owner', 'CTc']])
+    const MIXED = auditAclRows([['owner', 'CTc'], ['imsapp', 'c']])
+    // THE CLUSTER THE FIXTURE SAYS ANSWERED. The default is the one FENCE_PLAN_STUB writes into
+    // every record it plans, so a fingerprinted record and this fixture agree unless a phase moves
+    // one of them on purpose.
+    const fixture = (extra: Record<string, unknown>) =>
+      writeFileSync(fixtureFile, `${JSON.stringify({
+        privileges: UNFENCED,
+        systemIdentifier: FENCE_PLAN_CLUSTER.systemIdentifier,
+        databaseOid: FENCE_PLAN_CLUSTER.databaseOid,
+        ...extra,
+      })}\n`)
 
-    writeFileSync(acl, `${UNFENCED}\n`)
-    writeFenceCheckout(dir, auditingHelper(dir, acl))
-    // THE ADMIN URL NAMES THE SERVER THE IDENTITY ARGV NAMES (o3d-secops r27). It used to say
-    // 127.0.0.1:5432 while the wrappers were published for db.internal:6432, which nothing checked
-    // because the audit bound only the database NAME. It is checked now, on the same rule
-    // --preflight and --fence are held to, so the fixture has to be coherent — and PHASE 6 below
-    // moves it deliberately to prove the check is load-bearing.
+    fixture({})
+    writeFenceCheckout(dir, auditingHelper(dir, fixtureFile))
+    // THE ADMIN URL NAMES THE SERVER THE IDENTITY ARGV NAMES (o3d-secops r27).
     const envFile = join(dir, 'app', '.env')
     const adminUrlNaming = (server: string) =>
       writeFileSync(envFile, `DEPLOY_ADMIN_DATABASE_URL="postgresql://admin:pw@${server}/imsdb"\n`)
@@ -9795,26 +9863,61 @@ test('r26/r27: the operator resolution clears a spent legacy record automaticall
     const wrapperEnv = { PATH: process.env.PATH ?? '' } as unknown as NodeJS.ProcessEnv
     const run = (wrapper: string, args: string[] = []) => spawnSync(wrapper, args, { encoding: 'utf8', env: wrapperEnv })
 
+    /**
+     * THE SAME WRAPPER, RUN AT A REAL TERMINAL (o3d-secops r28, Codex MEDIUM).
+     *
+     * script(1) allocates a pty and makes it the child's controlling terminal, so `/dev/tty` opens
+     * inside the wrapper exactly as it does for an operator — and `typed` is what that operator
+     * types. Piping into the wrapper's STDIN cannot substitute for this and is asserted not to:
+     * the wrapper reads its answer from the terminal and never from stdin.
+     */
+    const runOnTty = (wrapper: string, args: string[], typed: string) => {
+      const quoted = [wrapper, ...args].map((word) => `'${word.replace(/'/g, `'\\''`)}'`).join(' ')
+      const child = spawnSync('script', ['-q', '-e', '-c', quoted, '/dev/null'], {
+        encoding: 'utf8',
+        input: `${typed}\n`,
+        env: wrapperEnv,
+      })
+      // script(1) merges the streams through the pty and the tty turns \n into \r\n.
+      return { status: child.status, output: `${child.stdout ?? ''}${child.stderr ?? ''}`.replace(/\r/g, '') }
+    }
+    /** The token the wrapper displayed, read back out of what it printed. */
+    const tokenFrom = (output: string, action: string) => {
+      const match = new RegExp(`Type (${action}-[0-9a-f]{12}) to proceed`).exec(output)
+      assert.ok(match, `the wrapper must display the token it wants typed:\n${output}`)
+      return match[1]
+    }
+
     const publish = runShell(
       artefactHarness(dir, [
         'db_fence_script_in_use >/dev/null || exit 1',
-        `db_fence_publish_operator_wrappers "$(id -un)" ${JSON.stringify(join(dir, 'app', '.env'))} ${JSON.stringify(state)} --app-host=db.internal --app-port=6432 --app-user=imsapp --app-database=imsdb || exit 1`,
+        `db_fence_publish_operator_wrappers "$(id -un)" ${JSON.stringify(envFile)} ${JSON.stringify(state)} ${JSON.stringify(cutoverLock)} --app-host=db.internal --app-port=6432 --app-user=imsapp --app-database=imsdb || exit 1`,
       ]),
     )
     assert.equal(publish.status, 0, `the wrappers must be published:\n${publish.output}`)
     assert.ok(existsSync(paths.resolveWrapper), `the resolution wrapper must be published too:\n${publish.output}`)
     assert.equal(spawnSync('bash', ['-n', paths.resolveWrapper], { encoding: 'utf8' }).status, 0, 'and must parse')
 
-    // THE LEGACY RECORD, MADE THE ONLY HONEST WAY: published by the shipped validator through the
-    // shipped wrapper, then stripped of the two fields a validator that predates them never wrote.
+    // THE RECORDS, MADE THE ONLY HONEST WAY: published by the shipped validator through the
+    // shipped wrapper, then stripped of the fields a validator that predates them never wrote.
     const raised = run(paths.refenceWrapper)
     assert.equal(raised.status, 0, `${raised.stdout}${raised.stderr}`)
     const modern = JSON.parse(readFileSync(state, 'utf8'))
     assert.equal(modern.fence_applied, 1, 'precondition: an ordinary re-fence stamps its record applied')
-    delete modern.fence_applied
-    delete modern.fence_mode
-    const LEGACY = `${JSON.stringify(modern, null, 2)}\n`
+    assert.equal(modern.cluster_system_identifier, FENCE_PLAN_CLUSTER.systemIdentifier,
+      'precondition: and records which cluster it was raised against (o3d-secops r28)')
+    const withoutStamp = { ...modern }
+    delete withoutStamp.fence_applied
+    delete withoutStamp.fence_mode
+    // A RECORD FROM A VALIDATOR THAT PREDATES THE STAMP PREDATES THE FINGERPRINT TOO. That is what
+    // makes every legacy record UNPROVEN by construction and is the whole of r28's HIGH 1.
+    const legacyRecord = { ...withoutStamp }
+    delete legacyRecord.cluster_system_identifier
+    delete legacyRecord.cluster_database_oid
+    const LEGACY = `${JSON.stringify(legacyRecord, null, 2)}\n`
+    const FINGERPRINTED = `${JSON.stringify(withoutStamp, null, 2)}\n`
     const plantLegacy = () => writeFileSync(state, LEGACY)
+    const plantFingerprinted = () => writeFileSync(state, FINGERPRINTED)
 
     // PHASE 1 — THE AUTOMATIC PATH REFUSES, AND SAYS WHERE TO GO.
     plantLegacy()
@@ -9828,8 +9931,8 @@ test('r26/r27: the operator resolution clears a spent legacy record automaticall
       `and must never reach the executor:\n${readFileSync(calls, 'utf8')}`)
 
     // PHASE 2 — AND THE RELEASE STILL WORKS OVER IT, WHICH IS THE ESCAPE HATCH. Nothing in the
-    // release path consults either field, so an operator holding a record no automatic path will
-    // touch can still take a standing fence down.
+    // release path consults the stamp or the fingerprint's absence, so an operator holding a record
+    // no automatic path will touch can still take a standing fence down.
     writeFileSync(calls, '')
     const released = run(paths.releaseWrapper)
     assert.equal(released.status, 0, `the release must work over an unstamped record:\n${released.stdout}${released.stderr}`)
@@ -9837,12 +9940,8 @@ test('r26/r27: the operator resolution clears a spent legacy record automaticall
     assert.equal(existsSync(state), false, 'and root removes the record once the release is verified')
 
     // PHASE 3a — A FULLY-WITHDRAWN ACL IS REPORTED AND NOT STAMPED (o3d-secops r27, Codex HIGH).
-    // Every recorded grantee has lost CONNECT. That is what this fence's REVOKE leaves — and it is
-    // equally what an administrator who revoked those same roles leaves, and the ACL holds nothing
-    // that separates them. Stamping licenses a later GRANT CONNECT back to all of them, so the
-    // unconfirmed run reads everything, prints both histories, and changes NOTHING.
     plantLegacy()
-    writeFileSync(acl, `${FENCED}\n`)
+    fixture({ privileges: FENCED })
     const reported = run(paths.resolveWrapper)
     assert.equal(reported.status, 1, `an unconfirmed run must not stamp:\n${reported.stdout}${reported.stderr}`)
     assert.equal(readFileSync(state, 'utf8'), LEGACY, 'and must leave the record byte for byte as it was found')
@@ -9852,62 +9951,126 @@ test('r26/r27: the operator resolution clears a spent legacy record automaticall
     assert.ok(reported.stderr.includes('--this-fence-revoked-them'),
       `and telling the operator exactly what to re-run:\n${reported.stderr}`)
 
-    // PHASE 3b — AND WITH THE OPERATOR'S CONFIRMATION IT STAMPS. This is the fact only a person
-    // holds: they know whether they revoked those roles, and the database never will.
-    const stamped = run(paths.resolveWrapper, ['--this-fence-revoked-them'])
-    assert.equal(stamped.status, 0, `a confirmed standing fence must resolve:\n${stamped.stdout}${stamped.stderr}`)
-    assert.match(stamped.stderr, /CONFIRMED BY THE OPERATOR/, stamped.stderr)
+    // PHASE 3b — AND THE FLAG ALONE IS STILL NOT A CONFIRMATION (o3d-secops r28, Codex MEDIUM).
+    // With no terminal there is nobody to confirm to, so the run that used to stamp now refuses —
+    // and it refuses in the direction that changes nothing.
+    const flagOnly = run(paths.resolveWrapper, ['--this-fence-revoked-them'])
+    assert.equal(flagOnly.status, 1, `a flag is not a confirmation:\n${flagOnly.stdout}${flagOnly.stderr}`)
+    assert.equal(readFileSync(state, 'utf8'), LEGACY, 'and the record must be exactly as it was found')
+    assert.match(flagOnly.stderr, /NOT CONFIRMED/, flagOnly.stderr)
+    assert.match(flagOnly.stderr, /no controlling terminal/, `saying what is missing:\n${flagOnly.stderr}`)
+    // AND STDIN IS NOT THE TERMINAL. Piping the right shape of answer in is the copy-paste route
+    // the finding is about, and it must not work either.
+    const piped = spawnSync(paths.resolveWrapper, ['--this-fence-revoked-them'], {
+      encoding: 'utf8', env: wrapperEnv, input: 'stamp-000000000000\n',
+    })
+    assert.equal(piped.status, 1, `stdin is not a controlling terminal:\n${piped.stdout}${piped.stderr}`)
+    assert.equal(readFileSync(state, 'utf8'), LEGACY, 'and nothing was changed by it')
+
+    // PHASE 3b-i — AT A TERMINAL, WITH THE WRONG ANSWER. The token is displayed and something else
+    // is typed; the record must not move. This is what proves the comparison is load-bearing
+    // rather than the terminal merely being present.
+    const wrongAnswer = runOnTty(paths.resolveWrapper, ['--this-fence-revoked-them'], 'stamp-deadbeefcafe')
+    assert.equal(wrongAnswer.status, 1, `a wrong answer must abort:\n${wrongAnswer.output}`)
+    assert.equal(readFileSync(state, 'utf8'), LEGACY, 'and change nothing')
+    assert.match(wrongAnswer.output, /NOT CONFIRMED/, wrongAnswer.output)
+    const stampToken = tokenFrom(wrongAnswer.output, 'stamp')
+
+    // PHASE 3b-ii — AND WITH THE TOKEN IT DISPLAYED, TYPED BACK, IT STAMPS. This is the fact only a
+    // person holds: they know whether they revoked those roles, and the database never will.
+    const stamped = runOnTty(paths.resolveWrapper, ['--this-fence-revoked-them'], stampToken)
+    assert.equal(stamped.status, 0, `a confirmed standing fence must resolve:\n${stamped.output}`)
+    assert.match(stamped.output, /CONFIRMED BY THE OPERATOR/, stamped.output)
     const afterStamp = JSON.parse(readFileSync(state, 'utf8'))
     assert.equal(afterStamp.fence_applied, 1, 'the record now says the fence it describes is standing')
     assert.deepEqual(afterStamp.revoked, modern.revoked, 'and nothing else about it moved')
-    assert.match(stamped.stderr, /is stamped APPLIED/, stamped.stderr)
-    // AND THE AUTOMATIC PATH IS UNBLOCKED, under the rule the evidence earned: a fence that stands
-    // is re-fenced as a RECOVERY.
+    assert.match(stamped.output, /is stamped APPLIED/, stamped.output)
+    // AND THE AUTOMATIC PATH IS UNBLOCKED, under the rule the evidence earned.
     const afterResolve = run(paths.refenceWrapper)
     assert.equal(afterResolve.status, 0, `${afterResolve.stdout}${afterResolve.stderr}`)
     assert.equal(JSON.parse(readFileSync(state, 'utf8')).fence_mode, 'recovery',
       `a resolved standing fence re-fences under the recovery rule:\n${afterResolve.stderr}`)
 
-    // PHASE 4a — AND WITH A RECORD NOTHING STANDS BEHIND, IT GOES.
+    // PHASE 3b-iii — AND THE TOKEN IS BOUND TO THAT RECORD AND NOT TO THE ACTION (o3d-secops r28).
+    // The same operator, the same wrapper, the same decision — over a record whose bytes differ —
+    // must not accept the token the previous record displayed. Without this the token would be a
+    // password, and a password typed once is a flag with extra steps.
     plantLegacy()
-    writeFileSync(acl, `${UNFENCED}\n`)
-    const cleared = run(paths.resolveWrapper)
-    assert.equal(cleared.status, 0, `a spent record must resolve:\n${cleared.stdout}${cleared.stderr}`)
+    const otherRecord = JSON.parse(LEGACY)
+    otherRecord.revoked = ['PUBLIC', 'imsapp', 'metabase']
+    writeFileSync(state, `${JSON.stringify(otherRecord, null, 2)}\n`)
+    const staleToken = runOnTty(paths.resolveWrapper, ['--this-fence-revoked-them'], stampToken)
+    assert.equal(staleToken.status, 1, `a token bound to another record must not confirm this one:\n${staleToken.output}`)
+    assert.equal(JSON.parse(readFileSync(state, 'utf8')).fence_applied, undefined, 'and the record must be unstamped still')
+    assert.notEqual(tokenFrom(staleToken.output, 'stamp'), stampToken,
+      'and the token it asks for must differ, because the record does')
+
+    // PHASE 4a — A SPENT LEGACY RECORD IS NOT CLEARED AUTOMATICALLY (o3d-secops r28, Codex HIGH 1).
+    // Every recorded grantee still holds CONNECT, which is what a publication killed before BEGIN
+    // leaves — AND is what an unfenced bystander cluster with a database of the same name shows.
+    // The record carries no fingerprint, so the two cannot be told apart, and the arm that deletes
+    // is the one that must not guess.
+    plantLegacy()
+    fixture({ privileges: UNFENCED })
+    const notCleared = run(paths.resolveWrapper)
+    assert.equal(notCleared.status, 1, `an unattributable reading must not delete a record:\n${notCleared.stdout}${notCleared.stderr}`)
+    assert.equal(readFileSync(state, 'utf8'), LEGACY, 'and the record must be byte for byte what it was')
+    assert.match(notCleared.stderr, /CANNOT BE ATTRIBUTED/, notCleared.stderr)
+    assert.match(notCleared.stderr, /no cluster fingerprint/, `naming what is missing:\n${notCleared.stderr}`)
+    assert.ok(notCleared.stderr.includes('--no-fence-stands-here'),
+      `and telling the operator exactly what to re-run:\n${notCleared.stderr}`)
+
+    // PHASE 4a-i — AND WITH THE ARGUMENT AND THE TOKEN, IT GOES. The operator has looked at the
+    // host and vouched that this is the cluster the record was written against; that is the fact
+    // the fingerprint would have supplied and does not.
+    const clearRefused = runOnTty(paths.resolveWrapper, ['--no-fence-stands-here'], 'clear-000000000000')
+    assert.equal(clearRefused.status, 1, `a wrong answer must abort the removal too:\n${clearRefused.output}`)
+    assert.equal(readFileSync(state, 'utf8'), LEGACY, 'and the record must survive it')
+    const clearToken = tokenFrom(clearRefused.output, 'clear')
+    const cleared = runOnTty(paths.resolveWrapper, ['--no-fence-stands-here'], clearToken)
+    assert.equal(cleared.status, 0, `a confirmed removal must resolve:\n${cleared.output}`)
     assert.equal(existsSync(state), false, 'by being removed, so the next cutover plans afresh')
 
-    // PHASE 4b — THE MIXED READING CHANGES NOTHING. Some recorded grantees hold CONNECT and some
-    // do not, which a half-applied fence and an administrator's own revoke both produce.
+    // PHASE 4d — AND WHERE THE CLUSTER IS PROVEN IT IS AUTOMATIC AGAIN. The record carries the
+    // fingerprint of the cluster that just answered, so the reading is attributable and clearing
+    // costs nothing whichever history produced it. Without this arm the round would have traded
+    // one defect for a wrapper that can never finish anything on its own.
+    plantFingerprinted()
+    const autoCleared = run(paths.resolveWrapper)
+    assert.equal(autoCleared.status, 0, `an attributable spent record must clear automatically:\n${autoCleared.stdout}${autoCleared.stderr}`)
+    assert.equal(existsSync(state), false, 'and be gone')
+
+    // PHASE 4b — THE MIXED READING CHANGES NOTHING.
     plantLegacy()
-    writeFileSync(acl, `${MIXED}\n`)
+    fixture({ privileges: MIXED })
     const undecided = run(paths.resolveWrapper)
     assert.equal(undecided.status, 1, `a mixed reading must refuse:\n${undecided.stdout}${undecided.stderr}`)
     assert.equal(readFileSync(state, 'utf8'), LEGACY, 'and leave the record byte for byte as it was found')
     assert.match(undecided.stderr, /NOT RESOLVED/, undecided.stderr)
     assert.match(undecided.stderr, /A MIXED reading/, `naming what it could not settle:\n${undecided.stderr}`)
 
-    // AND THE CONFIRMATION AUTHORISES NOTHING BY ITSELF (o3d-secops r27). It is consulted on ONE
-    // reading — every recorded grantee having lost CONNECT — and a mixed ACL is not that reading,
-    // so the flag must not turn a refusal into a stamp. Without this the gate would be a way to
-    // stamp any record at all, which is the defect it exists to close wearing a different hat.
-    const forced = run(paths.resolveWrapper, ['--this-fence-revoked-them'])
-    assert.equal(forced.status, 1, `the confirmation must not settle a mixed reading:\n${forced.stdout}${forced.stderr}`)
-    assert.equal(readFileSync(state, 'utf8'), LEGACY, 'and must change nothing')
-    assert.match(forced.stderr, /authorised nothing/, `saying so plainly:\n${forced.stderr}`)
+    // AND NEITHER ARGUMENT AUTHORISES ANYTHING BY ITSELF (o3d-secops r27, extended r28). Each is
+    // consulted on ONE reading, and a mixed ACL is neither of them — so no terminal is even
+    // offered and nothing moves.
+    for (const flag of ['--this-fence-revoked-them', '--no-fence-stands-here']) {
+      const forced = runOnTty(paths.resolveWrapper, [flag], 'anything')
+      assert.equal(forced.status, 1, `${flag} must not settle a mixed reading:\n${forced.output}`)
+      assert.equal(readFileSync(state, 'utf8'), LEGACY, `${flag}: and must change nothing`)
+      assert.match(forced.output, /authorised nothing/, `${flag}: saying so plainly:\n${forced.output}`)
+    }
 
-    // PHASE 4c — AND THE TWO CHANNELS MUST AGREE. The audit decided `absent` and then failed on
-    // its way out; the verdict line says one thing and the exit status says the run did not
-    // finish. A status can be produced by a shell that never ran the helper and a line by a helper
+    // PHASE 4c — AND THE TWO CHANNELS MUST AGREE. The audit decided `absent` and then failed on its
+    // way out; a status can be produced by a shell that never ran the helper and a line by a helper
     // that could not decide, so neither alone may move a record.
-    plantLegacy()
-    writeFileSync(acl, `CRASH:${UNFENCED}\n`)
+    plantFingerprinted()
+    fixture({ privileges: UNFENCED, crash: true })
     const halfAnswered = run(paths.resolveWrapper)
     assert.equal(halfAnswered.status, 1, `a verdict from a run that failed must not be acted on:\n${halfAnswered.stdout}${halfAnswered.stderr}`)
-    assert.equal(readFileSync(state, 'utf8'), LEGACY, 'and the record must be exactly as it was found')
+    assert.equal(readFileSync(state, 'utf8'), FINGERPRINTED, 'and the record must be exactly as it was found')
     assert.match(halfAnswered.stderr, /NOT RESOLVED/, halfAnswered.stderr)
 
-    // PHASE 5 — AND IT IS NOT A GENERAL-PURPOSE STAMP. Every record that is not the ambiguous one
-    // is refused by name, so this cannot be used to declare an arbitrary fence standing.
-    writeFileSync(acl, `${FENCED}\n`)
+    // PHASE 5 — AND IT IS NOT A GENERAL-PURPOSE STAMP.
+    fixture({ privileges: FENCED })
     const notAmbiguous: [string, string, RegExp][] = [
       ['already stamped', JSON.stringify({ ...modern, fence_mode: 'initial', fence_applied: 1 }, null, 2), /already stamped applied/],
       ['published, never applied', JSON.stringify({ ...modern, fence_mode: 'initial', fence_applied: 0 }, null, 2), /PUBLISHED, NEVER APPLIED/],
@@ -9923,35 +10086,98 @@ test('r26/r27: the operator resolution clears a spent legacy record automaticall
       assert.equal(readFileSync(state, 'utf8'), before, `${label}: and changing nothing`)
     }
 
-    // PHASE 6 — A SAME-NAMED DATABASE ON ANOTHER HOST RESOLVES NOTHING (o3d-secops r27, Codex
-    // HIGH 1). The admin URL is moved to a different server whose database is called `imsdb` too,
-    // and the ACL fixture is the UNFENCED one — which is what an unfenced bystander cluster shows,
-    // and is precisely the reading that made r26 DELETE the record. Both directions are checked,
-    // because the clearing arm is the one that destroys the only account of what was revoked.
+    // PHASE 6 — A SAME-NAMED DATABASE ON ANOTHER HOST RESOLVES NOTHING (o3d-secops r27, HIGH 1).
     adminUrlNaming('replica.internal:6432')
-    for (const [label, fixture] of [['unfenced', UNFENCED], ['fenced', FENCED]] as const) {
+    for (const [label, privileges] of [['unfenced', UNFENCED], ['fenced', FENCED]] as const) {
       plantLegacy()
-      writeFileSync(acl, `${fixture}\n`)
+      fixture({ privileges })
       const wrongCluster = run(paths.resolveWrapper)
-      assert.equal(wrongCluster.status, 1, `${label}: another cluster must resolve nothing:\n${wrongCluster.stdout}${wrongCluster.stderr}`)
+      assert.equal(wrongCluster.status, 1, `${label}: another host must resolve nothing:\n${wrongCluster.stdout}${wrongCluster.stderr}`)
       assert.equal(readFileSync(state, 'utf8'), LEGACY, `${label}: and the authority must be byte for byte what it was`)
       assert.match(wrongCluster.stderr, /NOT AUDITED/, `${label}: the audit itself must refuse:\n${wrongCluster.stderr}`)
       assert.match(wrongCluster.stderr, /replica\.internal/, `${label}: naming the host it reached:\n${wrongCluster.stderr}`)
       assert.ok(!/legacy_fence_verdict=/.test(wrongCluster.stdout),
         `${label}: and no verdict may be printed for the wrapper to act on:\n${wrongCluster.stdout}`)
-      // AND NOT EVEN THE CONFIRMATION GETS PAST IT: the gate is about which cluster answered, and
-      // an operator vouching for their own fence cannot vouch for a reading of somebody else's.
-      const vouched = run(paths.resolveWrapper, ['--this-fence-revoked-them'])
-      assert.equal(vouched.status, 1, `${label}: confirmed, and still nothing:\n${vouched.stdout}${vouched.stderr}`)
-      assert.equal(readFileSync(state, 'utf8'), LEGACY, `${label}: still byte for byte what it was`)
     }
     adminUrlNaming('db.internal:6432')
 
-    // PHASE 7 — AND AN ARGUMENT IT DOES NOT RECOGNISE IS A REFUSAL, NOT SOMETHING IGNORED. A
-    // mistyped confirmation that is silently dropped reads as "it refused for no reason", and
-    // nothing is read from the record or the database before this returns.
+    // PHASE 8 — AND A SAME-NAMED DATABASE ON ANOTHER CLUSTER AT THE RIGHT HOST RESOLVES NOTHING
+    // EITHER (o3d-secops r28, Codex HIGH 1). THE LOAD-BEARING CASE. Every argv/URL check above
+    // passes: the host, the port, the database name and the role are all correct, and the server
+    // behind them is a different PostgreSQL cluster — which is what DNS, a proxy or a failover
+    // produces and what r27 said it could not detect. The ACL is the UNFENCED one, which is
+    // exactly the reading that made r26 and r27 DELETE the record.
+    plantFingerprinted()
+    for (const [label, privileges] of [['unfenced', UNFENCED], ['fenced', FENCED]] as const) {
+      writeFileSync(state, FINGERPRINTED)
+      fixture({ privileges, systemIdentifier: '7409999999999999999' })
+      const otherCluster = run(paths.resolveWrapper)
+      assert.equal(otherCluster.status, 1, `${label}: another cluster must resolve nothing:\n${otherCluster.stdout}${otherCluster.stderr}`)
+      assert.equal(readFileSync(state, 'utf8'), FINGERPRINTED, `${label}: and the authority must be byte for byte what it was`)
+      assert.match(otherCluster.stderr, /NOT AUDITED/, `${label}: the audit itself must refuse:\n${otherCluster.stderr}`)
+      assert.match(otherCluster.stderr, /7409999999999999999/, `${label}: naming the cluster that answered:\n${otherCluster.stderr}`)
+      assert.ok(!/legacy_fence_verdict=/.test(otherCluster.stdout),
+        `${label}: and no verdict may be printed:\n${otherCluster.stdout}`)
+    }
+    // AND THE DATABASE OID IS THE OTHER HALF: the same cluster, and a database of the same name
+    // that was dropped and recreated. The system identifier cannot see that at all.
+    writeFileSync(state, FINGERPRINTED)
+    fixture({ privileges: UNFENCED, databaseOid: '29999' })
+    const recreated = run(paths.resolveWrapper)
+    assert.equal(recreated.status, 1, `a recreated database is not the one the record names:\n${recreated.stdout}${recreated.stderr}`)
+    assert.equal(readFileSync(state, 'utf8'), FINGERPRINTED, 'and the record must survive it')
+    assert.match(recreated.stderr, /OID/, recreated.stderr)
+
+    // PHASE 9 — A RECORD THAT CHANGED BETWEEN THE AUDIT AND THE ACTION IS NOT ACTED ON
+    // (o3d-secops r28, Codex HIGH 3). The audit rewrites the record while it runs, which is what a
+    // concurrent release does in that window, and is not something this test could arrange from
+    // outside the wrapper. The stamp is held to the digest the inspection reported, so it refuses.
+    plantFingerprinted()
+    const replacement = `${JSON.stringify({ ...withoutStamp, revoked: ['PUBLIC'] }, null, 2)}\n`
+    fixture({ privileges: FENCED, rewriteStateTo: replacement })
+    const moved = runOnTty(paths.resolveWrapper, ['--this-fence-revoked-them'], 'stamp-000000000000')
+    assert.equal(moved.status, 1, `a record that moved under the audit must not be stamped:\n${moved.output}`)
+    assert.equal(readFileSync(state, 'utf8'), replacement, 'and what is there is what the other writer left')
+    assert.equal(JSON.parse(readFileSync(state, 'utf8')).fence_applied, undefined, 'unstamped')
+    // AND THE SAME FOR THE REMOVAL, which is the more expensive of the two: a record deleted in
+    // error is the only account of what a standing fence revoked.
+    plantFingerprinted()
+    fixture({ privileges: UNFENCED, rewriteStateTo: replacement })
+    const movedClear = run(paths.resolveWrapper)
+    assert.equal(movedClear.status, 1, `a record that moved under the audit must not be removed:\n${movedClear.stdout}${movedClear.stderr}`)
+    assert.equal(existsSync(state), true, 'and must still be there')
+    assert.match(movedClear.stderr, /NOT CLEARED/, movedClear.stderr)
+    assert.match(movedClear.stderr, /read and audited/, `saying that the bytes moved:\n${movedClear.stderr}`)
+
+    // PHASE 10 — AND ALL THREE WRAPPERS HOLD THE SHARED CUTOVER LOCK FOR THE WHOLE SEQUENCE
+    // (o3d-secops r28, Codex HIGH 3). A cutover, or another wrapper, holding it means this one
+    // reads nothing at all — which is the point: the interleaving the finding describes starts at
+    // the read.
+    plantFingerprinted()
+    fixture({ privileges: UNFENCED })
+    writeFileSync(calls, '')
+    const before = readFileSync(state, 'utf8')
+    for (const wrapper of [paths.resolveWrapper, paths.releaseWrapper, paths.refenceWrapper]) {
+      const held = spawnSync('bash', [
+        '-c',
+        'exec 9<"$1" || exit 90; flock -n 9 || exit 91; "$2"; printf "WRAPPER_RC=%s\\n" "$?"',
+        'holder', cutoverLock, wrapper,
+      ], { encoding: 'utf8', env: wrapperEnv })
+      const said = `${held.stdout ?? ''}${held.stderr ?? ''}`
+      assert.match(said, /^WRAPPER_RC=1$/m, `${wrapper} must refuse while the cutover lock is held:\n${said}`)
+      assert.match(said, /is held by another run/, `${wrapper} must say what holds it:\n${said}`)
+      assert.equal(readFileSync(state, 'utf8'), before, `${wrapper}: and must change nothing`)
+      assert.equal(readFileSync(calls, 'utf8'), '', `${wrapper}: and must not reach the helper at all`)
+    }
+    // AND THE LOCK IS RELEASED WITH THE PROCESS, so the very next run works. Without this the
+    // assertions above would be satisfied by a wrapper that refuses unconditionally.
+    const afterLock = run(paths.resolveWrapper)
+    assert.equal(afterLock.status, 0, `with nothing holding the lock the same run must proceed:\n${afterLock.stdout}${afterLock.stderr}`)
+    assert.equal(existsSync(state), false, 'and clear the attributable spent record it was given')
+
+    // PHASE 7 — AND AN ARGUMENT IT DOES NOT RECOGNISE IS A REFUSAL, NOT SOMETHING IGNORED.
     plantLegacy()
-    writeFileSync(acl, `${FENCED}\n`)
+    fixture({ privileges: FENCED })
     writeFileSync(calls, '')
     const mistyped = run(paths.resolveWrapper, ['--this-fence-revoked-tem'])
     assert.equal(mistyped.status, 1, `an unrecognised argument must refuse:\n${mistyped.stdout}${mistyped.stderr}`)
@@ -10376,7 +10602,7 @@ test('r33: every printed recovery instruction carries the privilege the account 
     const publish = runShell(
       artefactHarness(dir, [
         'db_fence_script_in_use >/dev/null || exit 1',
-        `db_fence_publish_operator_wrappers "$(id -un)" ${JSON.stringify(join(dir, 'app', '.env'))} ${JSON.stringify(join(dir, 'state.json'))} --app-user=imsapp || exit 1`,
+        `db_fence_publish_operator_wrappers "$(id -un)" ${JSON.stringify(join(dir, 'app', '.env'))} ${JSON.stringify(join(dir, 'state.json'))} ${JSON.stringify(join(dir, 'cutover.lock'))} --app-user=imsapp || exit 1`,
       ]),
     )
     assert.equal(publish.status, 0, `the wrappers must be published:\n${publish.output}`)
