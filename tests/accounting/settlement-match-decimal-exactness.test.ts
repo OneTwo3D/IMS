@@ -257,7 +257,7 @@ test('[o3d-78rq] a ledger figure this connector cannot read exactly WITHHOLDS ra
   const reason = verdict.outcome === 'unknown' ? verdict.reason : ''
   assert.match(reason, /35184372088832\.055/, 'the sentence names the figure the ledger stated')
   assert.match(reason, /PAY-1/, 'and which settlement it was, so it can be found')
-  assert.match(reason, /cannot read as an exact GBP amount/, 'and says the READING is what failed')
+  assert.match(reason, /cannot read as an exact amount in GBP/, 'and says the READING is what failed')
   assert.match(reason, /NOT that the document is unpaid/, 'and says plainly what it does not mean')
 })
 

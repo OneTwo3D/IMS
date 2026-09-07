@@ -409,9 +409,10 @@ export function classifyLedgerSettlement(
         // read it that way. See `LedgerSettlementRecord.unreadableAmount`.
         reason: record.unreadableAmount
           ? `the accounting connector reported a settlement${record.id ? ` (${record.id})` : ''} `
-            + `stating ${record.unreadableAmount}, which IMS cannot read as an exact `
-            + `${attempt.currency ?? 'document-currency'} amount — so this attempt cannot be ruled `
-            + 'out against it. This says the figure is unreadable, NOT that the document is unpaid.'
+            + `stating ${record.unreadableAmount}, which IMS cannot read as an exact amount`
+            + `${attempt.currency ? ` in ${attempt.currency}` : ''} — so this attempt cannot be ruled `
+            + 'out against it. This says the LEDGER\'S FIGURE is unreadable, NOT that the document '
+            + 'is unpaid.'
           : 'the accounting connector returned a settlement whose amount or date could not be '
             + 'read, so it cannot be ruled out as this attempt',
       }
