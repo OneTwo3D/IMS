@@ -1234,7 +1234,7 @@ to do:
 | --- | --- | --- |
 | cutover marker | `/etc/ims-cutover/DEPLOY-FENCED` | `root:root` 0600, in a `root:root` **0700** directory |
 | cutover lock | `/etc/ims-cutover-state/cutover.lock` | `root:root` **0600**, in a `root:root` **0711** directory |
-| connection-fence authority | `/etc/ims-cutover-state/db-fence/db-connect-fence.json` | `root:root` **0644**, in a `root:root` **0755** directory |
+| connection-fence authority | `/etc/ims-cutover-state/db-fence/db-connect-fence.json` | `root:root` **0644**, in a `root:root` **0755** directory. Carries `fence_mode` (`initial` or `recovery`) since o3d-secops r24 — see *Two kinds of fence* |
 | crontab backup | `/var/lib/one-two-inventory/crontab-<service user>.bak` | `root:root` 0600 |
 
 Set `IMS_CUTOVER_STATE_DIR` **in the environment of the root invocation** to move the crontab
@@ -1274,6 +1274,31 @@ freeze every deploy, update and install on the box for as long as it liked. r22 
 is now **set** instead — created under a stated `umask 077`, and narrowed on the descriptor
 `verify_held_lock()` has just identified (`chmod` of `/proc/self/fd/N`, which is an `fchmod`) with
 the result read back off that same descriptor before `flock` is taken.
+
+**And a lock that was ever wide is replaced, not repaired** (o3d-secops r24). Narrowing closes the
+door to new opens and does nothing whatever to a descriptor somebody already holds: **permission is
+checked at `open(2)` and never again**. On a host upgraded from a checkout that left this file at
+`0644`, the service account can have opened it *before* the cutover started, **without locking it**
+— an open is invisible where a lock is not, and `fuser` shows nothing — and then `flock` it the
+moment the cutover exits, freezing every deploy, update and install afterwards with nothing to point
+at. So where the lock is **inherited** at anything other than `0600`, the run creates a fresh `0600`
+inode in the same root-owned directory, opens it read-only, verifies it, narrows it, **locks it**,
+and only then renames it over `cutover.lock`. A descriptor opened while the old file was wide now
+refers to an inode with no name. It happens **once**: the gate is the mode the lock was inherited
+at, so the next cutover finds `0600` and replaces nothing.
+
+The trade, stated. Replacing an inode means giving up exclusion against anything still holding the
+old one — which is the point, and would be a disaster if a genuine concurrent cutover were the
+holder. It cannot be: the replacement is reached **only after this run holds `flock` on the
+inherited inode**, so at the instant of the rename nothing else holds that lock, and `fd 9` is then
+kept open on the retired inode for the rest of the run. A real predecessor therefore never loses —
+if it got there first, this run dies at `Refusing to run two cutovers at once` and **nothing is
+rotated**, so its inode is never swapped out from under it; a cutover arriving while `fd 9` is held
+is refused on the old inode, and one arriving after the rename is refused on the new one. The only
+process that can ever take the orphaned inode's lock is one that opened it and did not immediately
+try to lock it — and no cutover here is ever in that state, because `flock -n` is non-blocking,
+follows the open in the same function, and every failure ends the run. That state belongs to the
+holdout this exists to defeat and to nothing else.
 
 **And nothing in that namespace is aimed at a pathname.** The directory is created one component at
 a time by the same symlink-proof walk `install.sh` has always used for `${DATA_DIR}` — plain `mkdir`
@@ -2609,6 +2634,47 @@ Raising a fence is now **three steps**, and the privileged one is in the middle:
 | `--plan` | service account | opens the admin connection, reads the ACL, computes the grantee list, **prints** it as one line of JSON. Revokes nothing and writes nothing. |
 | authorise | **root** | validates that request field by field against the database and role **root itself supplied**, rebuilds the record from its own template (anything the request carried that is not in the template is dropped), and publishes it durably — temporary in the destination directory, `fsync`, atomic rename, directory `fsync`. |
 | `--fence` | service account | **executes** the authority. It cannot write it; an absent or unauthenticated record is a refusal, not a fresh fence. |
+
+#### Two kinds of fence, with two different rules (o3d-secops r24)
+
+`--fence` used to compare the published authority with the live ACL **in one direction only**: had a
+grantee *appeared* since the plan? A role that **loses** `CONNECT` between `--plan` and `--fence` —
+an administrator revoking it by hand, a role dropped, any other ACL edit — leaves that comparison
+empty, so the stale list was accepted whole, its `REVOKE` was a no-op nobody noticed, and
+`--release` afterwards issued `GRANT CONNECT` to **every** role the record named, handing database
+access back to one somebody had deliberately removed. Checking for additions is not checking for
+equality.
+
+Both differences are compared now, and which of them is fatal depends on a `fence_mode` field
+**root** stamps into the record:
+
+| `fence_mode` | when root stamps it | what `--fence` accepts |
+| --- | --- | --- |
+| `initial` | nothing was at `db-connect-fence.json` when root looked | the live grantee list must match the record **exactly**. Any difference either way aborts, and a re-run re-plans and re-publishes. |
+| `recovery` | an authority was already there — a previous cutover revoked and did not release, so its fence is still standing | recorded grantees that no longer hold `CONNECT` are **expected** (that fence is what took it from them). A grantee that has *appeared* is still fatal. |
+
+The stamp is the difference between the two rules, so it is the field worth forging — and it is
+computed by root, in the process that does the rename, from the presence of a file in a directory
+the service account cannot write. That account can neither create a record to obtain the tolerance
+nor unlink one to escape it, and a `fence_mode` carried **in** the plan is dropped by the template
+like every other field root does not compute for itself. A record with **no** `fence_mode` is read
+as `recovery`: it can only be a fence raised before this round and still standing, and refusing it
+would strand that fence with neither a re-apply nor a release.
+
+What `recovery` accepts that `initial` does not, said plainly: on a re-fence a grantee an
+administrator removed by hand is indistinguishable from one the standing fence removed — both are
+simply absent from the ACL — so that role is re-granted on release. That residue is bounded to hosts
+with an **interrupted cutover**, it is announced on stderr when it happens, and the alternative is a
+standing fence that can be neither re-applied nor released. On an `initial` fence — every ordinary
+deploy, update and install — there is no residue.
+
+**A refused initial fence leaves no authority behind.** Because the mode is stamped from whether a
+record is present, a refused run that left its own record would make the *next* attempt a
+"recovery", and one re-run would buy the tolerance the refusal existed to withhold. Exit `3`
+(`EXIT_NOT_FENCEABLE`) is returned only *before* `BEGIN`, so nothing was revoked and the record is
+this run's own: it is removed. Whether it **is** this run's own is read *before* the publication —
+where a fence was already standing, that record is the only account of what an earlier run revoked
+and it is left exactly where it is.
 
 `--release` reads that record through the same provenance gate — the **directory** first, because
 `unlink(2)` and `rename(2)` ask for write permission on the parent and nothing about the file — and
