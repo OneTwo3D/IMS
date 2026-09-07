@@ -4,7 +4,12 @@ import path from 'node:path'
 import test from 'node:test'
 
 import { probeQuickBooksSettlement, probeXeroSettlement } from '@/lib/connectors/accounting-settlement-probe'
-import { ledgerAmountMagnitudeBound, parseLedgerAmount, readLedgerStatedAmount } from '@/lib/connectors/xero/invoice-delta'
+import {
+  ledgerAmountMagnitudeBound,
+  ledgerDifferenceMagnitudeBound,
+  parseLedgerAmount,
+  readLedgerStatedAmount,
+} from '@/lib/connectors/xero/invoice-delta'
 import {
   classifyLedgerSettlement,
   describeAttempt,
@@ -228,21 +233,35 @@ test('[o3d-78rq] a ledger figure this connector cannot read exactly WITHHOLDS ra
     'while the FIGURES are exactly the band apart — so `clear` was wrong on the ledger\'s own reading too',
   )
 
+  // o3d-mm51 — WHY THE DOCUMENT'S OWN FIGURES ARE ZERO AND THE RECORD'S IS NOT, WHICH IS THE POINT
+  // THIS TEST IS ABOUT AND NOT A WEAKENING OF IT.
+  //
+  // The completeness reader now refuses a JSON NUMBER at or above `ledgerDifferenceMagnitudeBound`,
+  // and `ledgerWire` is above the GBP one (2^45) — so stating it as `Total`/`AmountPaid` would refuse
+  // the PROBE, and this test would then pass for a reason that has nothing to do with the scale rule
+  // it exists for. Stated as zero, the shape-independent check RUNS and PASSES (`settled` is exactly
+  // 0, so `statesAnything` is false), which is what makes the assertion below say what it says.
+  //
+  // The `AmountPaid` check is excluded for its own documented reason and not by anything new: the
+  // payment's amount is unreadable, so `seen` is null and an unreadable record cannot be counted as
+  // zero against a stated total.
+  assert.ok(Math.abs(ledgerWire) >= ledgerDifferenceMagnitudeBound('GBP'),
+    'the precondition for the zeros: this figure is one the completeness reader now refuses (o3d-mm51)')
   const { get } = ledgerDouble({
     'Invoices/inv-1': {
       Invoices: [{
         InvoiceID: 'inv-1',
         CurrencyCode: 'GBP',
-        Total: ledgerWire,
+        Total: 0,
         AmountDue: 0,
-        AmountPaid: ledgerWire,
+        AmountPaid: 0,
         AmountCredited: 0,
         Payments: [{ PaymentID: 'PAY-1', Date: '2026-08-01T00:00:00', Amount: ledgerWire }],
       }],
     },
   })
   const probe = await probeXeroSettlement({ type: 'INVOICE_PAYMENT', payload: { accountingInvoiceId: 'inv-1' } }, get)
-  assert.equal(probe.ok, true, 'the probe still ANSWERS — the completeness cross-check is untouched by this')
+  assert.equal(probe.ok, true, 'the probe still ANSWERS — the completeness cross-check ran and passed')
   assert.deepEqual(probe.ok ? probe.records : null, [{
     amount: null,
     unreadableAmount: '35184372088832.055',
@@ -296,9 +315,12 @@ test('[o3d-78rq] a ledger amount too large for its own minor unit to survive the
       Invoices: [{
         InvoiceID: 'inv-1',
         CurrencyCode: 'GBP',
-        Total: 70368744177664,
+        // o3d-mm51: zero for the same reason as the test above — this magnitude is now refused by the
+        // COMPLETENESS reader as well, and stating it here would refuse the probe before the record
+        // this test is about was ever built.
+        Total: 0,
         AmountDue: 0,
-        AmountPaid: 70368744177664,
+        AmountPaid: 0,
         AmountCredited: 0,
         Payments: [{ PaymentID: 'PAY-1', Date: '2026-08-01T00:00:00', Amount: 70368744177664 }],
       }],
@@ -307,6 +329,23 @@ test('[o3d-78rq] a ledger amount too large for its own minor unit to survive the
   const probe = await probeXeroSettlement({ type: 'INVOICE_PAYMENT', payload: { accountingInvoiceId: 'inv-1' } }, get)
   assert.equal(probe.ok && probe.records[0]?.amount, null)
   assert.equal(probe.ok && probe.records[0]?.unreadableAmount, '70368744177664')
+
+  // o3d-mm51 — AND THE SAME FIGURE STATED AS THE DOCUMENT'S OWN TOTAL NOW REFUSES THE PROBE, which
+  // is the half of this magnitude rule the completeness arithmetic did not used to inherit. Asserted
+  // HERE, beside the record arm, so the two readings of one figure cannot silently diverge again.
+  const asDocumentTotal = await probeXeroSettlement(
+    { type: 'INVOICE_PAYMENT', payload: { accountingInvoiceId: 'inv-1' } },
+    ledgerDouble({
+      'Invoices/inv-1': {
+        Invoices: [{ InvoiceID: 'inv-1', CurrencyCode: 'GBP', Total: 70368744177664, AmountDue: 0 }],
+      },
+    }).get,
+  )
+  assert.equal(asDocumentTotal.ok, false, 'the completeness reader refuses it too now')
+  assert.match(
+    asDocumentTotal.ok === false ? asDocumentTotal.reason : '',
+    /Xero states Total 70368744177664 on this document, which IMS cannot read as an amount/,
+  )
 })
 
 /* ------------------------------------------------------------------------------------------- *
@@ -704,10 +743,22 @@ test('[o3d-r948] the completeness arithmetic is exact: a sum of wire doubles no 
   // ROUTE: probeXeroSettlement's `AmountPaid` cross-check, over `sumExact` rather than a `+` reduce.
   // MUTATION: sum `wireAmounts` with `.reduce((t, a) => t + a.toNumber(), 0)` and this reads complete.
   //
-  // The magnitude is 2^46, where neighbouring doubles are 0.015625 apart — so adding a penny to it
-  // rounds UP by more than half of that, four times over.
-  const PAYMENTS = [70368744177664, 0.01, 0.01, 0.01, 0.01]
-  const AMOUNT_PAID = 70368744177664.0625
+  // The magnitude is 2^44, where neighbouring doubles are 0.00390625 apart — so adding a penny to it
+  // rounds UP by more than a third of that, four times over.
+  //
+  // o3d-mm51 — IT WAS 2^46, AND IT MOVED DOWN TWO BINADES RATHER THAN CHANGING SUBJECT. The
+  // completeness reader now refuses a JSON number at or above `ledgerDifferenceMagnitudeBound`, which
+  // is 2^45 in GBP, so the old fixture would have refused for a reason that is not this one and the
+  // exactness of the addition would have gone untested. 2^44 is inside the admitted range and the
+  // rounding is still there: the accumulated error is 0.0078125, which is above the GBP band, so this
+  // is the same demonstration at the largest magnitude where it is still the arithmetic that decides.
+  const PAYMENTS = [17592186044416, 0.01, 0.01, 0.01, 0.01]
+  const AMOUNT_PAID = 17592186044416.047
+
+  // THE PRECONDITION FOR THE MOVE: every figure here is one the reader admits, so nothing below is
+  // decided by the magnitude guard.
+  assert.ok(Math.abs(AMOUNT_PAID) < ledgerDifferenceMagnitudeBound('GBP'),
+    'the stated total is inside the admitted range, so the arithmetic is what decides')
 
   // THE PRECONDITION, and it is the whole test: added as DOUBLES these five payments reach exactly
   // the figure Xero states as paid, so the old arithmetic saw no shortfall whatsoever. Added exactly
@@ -715,7 +766,7 @@ test('[o3d-r948] the completeness arithmetic is exact: a sum of wire doubles no 
   const asDoubles = PAYMENTS.reduce((total, a) => total + a, 0)
   assert.equal(asDoubles, AMOUNT_PAID, 'as doubles, the collection accounts for the stated total EXACTLY')
   const asDecimals = PAYMENTS.reduce((total, a) => total.add(toDecimal(a)), toDecimal(0))
-  assert.equal(asDecimals.toFixed(), '70368744177664.04', 'exactly, they are two pence short of it')
+  assert.equal(asDecimals.toFixed(), '17592186044416.04', 'exactly, they are short of it by 0.0078125')
   assert.ok(toDecimal(AMOUNT_PAID).sub(asDecimals).gt(ledgerAmountEpsilon('GBP')), 'and that is outside the band')
 
   const probe = await probeInvoice(xeroInvoice({
@@ -724,7 +775,7 @@ test('[o3d-r948] the completeness arithmetic is exact: a sum of wire doubles no 
     Payments: PAYMENTS.map((Amount, i) => ({ PaymentID: `PAY-${i + 1}`, Date: DATE, Amount })),
   }))
   assert.equal(probe.ok, false, 'the shortfall the double addition rounded away is now visible')
-  assert.match(reasonOf(probe), /70368744177664\.06 paid against this document but returned payments totalling 70368744177664\.04/)
+  assert.match(reasonOf(probe), /17592186044416\.047 paid against this document but returned payments totalling 17592186044416\.04/)
 })
 
 test('[o3d-r948] a refusal names the figure at its OWN scale — a fil is not 0.00', () => {
