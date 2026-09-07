@@ -3477,6 +3477,21 @@ refuse_adoption_identity_mismatch() {
   die "THE STANDING FENCE AND ${APP_DIR}/.env DO NOT NAME THE SAME DATABASE. ${DB_FENCE_IDENTITY_MISMATCH}. The record is written before the revoke, so it is what that fence was aimed at; the file is application-owned and can be replaced. Re-fencing or releasing on the file's answer would revoke or restore CONNECT on a database this fence never touched, and leave the one it did fenced with nothing tracking it. Nothing has been re-fenced, released or migrated by this run: the service is stopped and both fences are standing. Put ${APP_DIR}/.env back to the database named in ${DB_FENCE_IDENTITY_FILE} and re-run, which adopts the same fence again; the grants to restore by hand are recorded in ${DB_FENCE_STATE}."
 }
 
+# HOW THIS ENTRYPOINT DROPS TO ${APP_USER} TO RUN THE FENCE HELPER (o3d-secops r23).
+#
+# db_fence_raise() in lib/db-fence-protected.sh owns the ORDER -- plan, authorise and publish as
+# root, then execute -- and this is the one part of it that cannot be written down once: the three
+# entrypoints drop privilege in three different ways with three different environments. It takes
+# the script to run and the helper own arguments, and nothing else.
+db_fence_helper() {
+  local fence_script="$1"
+  shift
+  run_as_user "${APP_USER}" env \
+    DATABASE_URL="${DATABASE_URL}" \
+    DEPLOY_ADMIN_DATABASE_URL="${DEPLOY_ADMIN_DATABASE_URL}" \
+    node "${fence_script}" "$@"
+}
+
 # ---------------------------------------------------------------------------
 # The connection fence. See scripts/fence-db-connections.mjs for what it can and
 # cannot promise; the important part here is that a failure to RELEASE it is an
@@ -3543,10 +3558,12 @@ fence_db_connections() {
   fence_script="$(resolve_fence_script)" || die \
     "This run has no fence script it is willing to execute (the reason is printed above), so it cannot hold the database closed for the migration window. A snapshot probe is not a fence. Restore ${DB_FENCE_SCRIPT} (it ships with the app) and re-run; nothing has been migrated."
 
-  run_as_user "${APP_USER}" env \
-    DATABASE_URL="${DATABASE_URL}" \
-    DEPLOY_ADMIN_DATABASE_URL="${DEPLOY_ADMIN_DATABASE_URL}" \
-    node "${fence_script}" --fence --state-file="${DB_FENCE_STATE}" "${DB_FENCE_IDENTITY_ARGS[@]:-}" || rc=$?
+  # PLAN, AUTHORISE, THEN EXECUTE (o3d-secops r23, Codex CRITICAL). This used to be one
+  # invocation, which computed the grantee list and PUBLISHED it into a directory owned by
+  # ${APP_USER} -- so the account being defended against chose what a later release would
+  # GRANT CONNECT to. db_fence_raise() runs the helper twice with a privileged validation and a
+  # durable publication in between; see lib/db-fence-protected.sh.
+  db_fence_raise "${fence_script}" "${DB_FENCE_STATE}" "${DB_FENCE_IDENTITY_ARGS[@]:-}" || rc=$?
 
   case "${rc}" in
     0)
@@ -3760,14 +3777,18 @@ release_db_connections() {
     return 1
   }
 
-  run_as_user "${APP_USER}" env \
-    DATABASE_URL="${DATABASE_URL}" \
-    DEPLOY_ADMIN_DATABASE_URL="${DEPLOY_ADMIN_DATABASE_URL}" \
-    node "${fence_script}" --release --state-file="${DB_FENCE_STATE}" "${DB_FENCE_IDENTITY_ARGS[@]:-}" || rc=$?
+  db_fence_helper "${fence_script}" --release --state-file="${DB_FENCE_STATE}" --state-owner="$(id -u)" "${DB_FENCE_IDENTITY_ARGS[@]:-}" || rc=$?
 
   if [[ "${rc}" -eq 0 ]]; then
     MIGRATION_DATABASE_URL="${DATABASE_URL}"
     DB_FENCE_UP=false
+    # AND ROOT CLEARS THE RECORD, BECAUSE THE HELPER CANNOT (o3d-secops r23). The authority lives
+    # in a directory only this account may write, so the unlink is this account own. It happens
+    # AFTER the release has been verified: until then the record is the only account of what was
+    # revoked, and a record describing a released fence is the safe way round -- a re-fence
+    # re-applies the same list, a second release re-grants what is already granted. A failure to
+    # remove it would make the NEXT run believe a fence is standing, so it is a failure here.
+    db_fence_clear_authority "${DB_FENCE_STATE}" || { error "The connection fence was released and its record at ${DB_FENCE_STATE} could not be removed. The next run reads that file as a STANDING FENCE and will refuse to start the application. Remove it by hand once you have confirmed CONNECT is back."; return 1; }
     success "Connection fence released."
     return 0
   fi
@@ -3858,10 +3879,12 @@ refence_db_connections() {
   fi
 
   local rc=0
-  run_as_user "${APP_USER}" env \
-    DATABASE_URL="${DATABASE_URL}" \
-    DEPLOY_ADMIN_DATABASE_URL="${DEPLOY_ADMIN_DATABASE_URL}" \
-    node "${fence_script}" --fence --state-file="${DB_FENCE_STATE}" "${DB_FENCE_IDENTITY_ARGS[@]:-}" || rc=$?
+  # PLAN, AUTHORISE, THEN EXECUTE (o3d-secops r23, Codex CRITICAL). This used to be one
+  # invocation, which computed the grantee list and PUBLISHED it into a directory owned by
+  # ${APP_USER} -- so the account being defended against chose what a later release would
+  # GRANT CONNECT to. db_fence_raise() runs the helper twice with a privileged validation and a
+  # durable publication in between; see lib/db-fence-protected.sh.
+  db_fence_raise "${fence_script}" "${DB_FENCE_STATE}" "${DB_FENCE_IDENTITY_ARGS[@]:-}" || rc=$?
   # EVERY POST-COMMIT RESULT RAISES THE STICKY FLAG (o3d-2sm1.5, Codex r13 HIGH). Exit 5 says
   # the REVOKEs are COMMITTED and standing: this call could not call the database fenced, but it
   # certainly fenced something, and DB_FENCE_RAISED is the flag that decides whether a later
@@ -4699,9 +4722,9 @@ import_legacy_cutover_state() {
   [[ -d "$LEGACY_CUTOVER_STATE_DIR" ]] || return 0
   ensure_cutover_state_dirs || die "Could not create ${CUTOVER_STATE_DIR}; the cutover namespace is unusable. Nothing has been stopped."
   local imported=false
-  # The connection-fence state goes back to ${APP_USER}: the fence script runs as the app
-  # user, and a root-owned copy is one it cannot release.
-  if import_legacy_file "$LEGACY_DB_FENCE_STATE" "$DB_FENCE_STATE" "connection-fence state" "$APP_USER"; then imported=true; fi
+  # THE CONNECTION-FENCE RECORD IS NOT IMPORTED (o3d-secops r23, Codex CRITICAL). It is reported
+  # and left where it is; see warn_legacy_namespace_db_fence_state() in lib/cutover-namespace.sh.
+  warn_legacy_namespace_db_fence_state
   if import_legacy_file "$LEGACY_CRON_BACKUP" "$CRON_BACKUP" "crontab backup"; then imported=true; fi
   # LAST, because the marker is what adoption keys on: until it is at the canonical path
   # nothing adopts anything, so a crash part-way through this import leaves a run that finds
@@ -4717,7 +4740,7 @@ import_legacy_cutover_state() {
 
 if $DRY_RUN; then
   if [[ -e "$LEGACY_FENCE_FILE" || -e "$LEGACY_CRON_BACKUP" || -e "$LEGACY_DB_FENCE_STATE" ]]; then
-    echo -e "${YELLOW}[DRY]${RESET}   would import the cutover state under ${LEGACY_CUTOVER_STATE_DIR} into ${CUTOVER_STATE_DIR} before adopting it"
+    echo -e "${YELLOW}[DRY]${RESET}   would import the crontab backup and the cutover marker under ${LEGACY_CUTOVER_STATE_DIR} into ${CUTOVER_STATE_DIR} before adopting them, and would REPORT rather than read any connection-fence record there (o3d-secops r23)"
   fi
   if [[ -e "${LEGACY_STATE_DIR_FENCE_FILE}" && ! -e "${FENCE_FILE}" ]]; then
     echo -e "${YELLOW}[DRY]${RESET}   would judge the entry at ${LEGACY_STATE_DIR_FENCE_FILE} through a descriptor and, only if it is a record this run may believe, move it to ${FENCE_FILE} before adopting it, clearing the old one once the drop-in names the new one"

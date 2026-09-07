@@ -32,7 +32,16 @@
 //                          discovered at drain-verify, AFTER the stop: an outage for a
 //                          missing import. This mode runs the same imports, opens the same
 //                          connection and asks the same questions.
+//   --plan                 what a fence WOULD revoke, printed as one line of JSON on stdout.
+//                          Revokes nothing, terminates nothing and WRITES NOTHING AT ALL. It is
+//                          the unprivileged half of raising a fence: this process runs as the
+//                          application account, so the record a `--release` builds GRANTs out of
+//                          cannot be authored here (o3d-secops r23, Codex CRITICAL). The caller
+//                          — root — validates this plan field by field and publishes the
+//                          authority itself, durably, before --fence is invoked.
 //   --fence                revoke CONNECT, drain the existing backends, prove it is quiet.
+//                          It EXECUTES the authority at --state-file and never writes it; an
+//                          absent or unauthenticated record is a refusal, not a fresh fence.
 //                          Exit 3 means NOTHING WAS REVOKED; exit 5 (EXIT_FENCE_STANDING) means
 //                          the REVOKEs may be in force — committed and standing, or issued to a
 //                          COMMIT whose acknowledgement was lost — and this run still cannot call
@@ -48,7 +57,9 @@
 //                          only that — the same fence may still hold PUBLIC, monitoring, BI or
 //                          a second application out, and doFence() leaves precisely that shape
 //                          standing on purpose (exit 4, EXIT_FENCE_UNPROVEN). Only a record can
-//                          license "released".
+//                          license "released" — and only one whose provenance holds: see
+//                          classifyStateProvenance(). The record is not removed from here; root
+//                          clears it, because the directory it lives in is root's.
 //   --print-migration-url  the admin URL with `options=-c role=<app role>` merged in — the
 //                          connection the migration must run through. See "WHO THE
 //                          MIGRATION RUNS AS" below. No database connection is opened.
@@ -142,8 +153,7 @@
 // than the fenced snapshot.
 // =============================================================================
 
-import { randomBytes } from 'node:crypto'
-import { closeSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync, rmSync, unlinkSync, writeFileSync } from 'node:fs'
+import { lstatSync, readFileSync } from 'node:fs'
 import { dirname } from 'node:path'
 import { pathToFileURL } from 'node:url'
 
@@ -1015,10 +1025,18 @@ export function verifyRelease(datacl, ownerRole, grantees) {
 // ---------------------------------------------------------------------------
 
 export function parseArgs(argv) {
-  const options = { mode: '', stateFile: '', appRole: '', timeoutSeconds: 30, appHost: '', appPort: '', appUser: '', appDatabase: '' }
+  // THE OWNER THE AUTHORITY RECORD MUST HAVE, AND WHY IT HAS A DEFAULT AT ALL (o3d-secops r23).
+  // This process runs as ${APP_USER}; the record it obeys is published by the privileged account
+  // that runs the cutover, which on every real host is uid 0. The default is therefore the safe
+  // one and a caller has to ASK for anything else — which only root's own argv can do, since
+  // every invocation of this file is composed by a root-owned script or a root-owned wrapper.
+  // It exists so an unprivileged harness can exhibit the mechanism, for the same reason
+  // publish_durable_file() asks `id -u` instead of comparing against a literal 0.
+  const options = { mode: '', stateFile: '', stateOwnerUid: 0, appRole: '', timeoutSeconds: 30, appHost: '', appPort: '', appUser: '', appDatabase: '' }
   for (const arg of argv) {
-    if (arg === '--fence' || arg === '--release' || arg === '--preflight' || arg === '--print-migration-url') options.mode = arg.slice(2)
+    if (arg === '--fence' || arg === '--release' || arg === '--preflight' || arg === '--print-migration-url' || arg === '--plan') options.mode = arg.slice(2)
     else if (arg.startsWith('--state-file=')) options.stateFile = arg.slice('--state-file='.length)
+    else if (arg.startsWith('--state-owner=')) options.stateOwnerUid = Number(arg.slice('--state-owner='.length))
     else if (arg.startsWith('--app-role=')) options.appRole = arg.slice('--app-role='.length)
     else if (arg.startsWith('--timeout-seconds=')) options.timeoutSeconds = Number(arg.slice('--timeout-seconds='.length))
     // THE FOUR THIS RUN IS TOLD RATHER THAN WORKS OUT. Every mode needs them and every mode
@@ -1065,6 +1083,17 @@ export const STATE_ABSENT = 'absent'
 export const STATE_UNREADABLE = 'unreadable'
 /** Something is at the path, it was read, and it is not a usable record of what to restore. */
 export const STATE_CORRUPT = 'corrupt'
+/**
+ * Something is at the path and NOTHING TRUSTWORTHY PUT IT THERE (o3d-secops r23, Codex CRITICAL).
+ *
+ * The other three ask what the bytes ARE. This one asks WHO WROTE THEM, which is the question
+ * every shape check skips: a well-formed JSON object proves the file is well-formed JSON, never
+ * that the account whose privileges act on it is the account that authored it. `--release` turns
+ * `revoked` into `GRANT CONNECT`, so a record this process could have written itself is a list of
+ * roles it chooses to hand database access to, at a time of its choosing, executed by whoever
+ * runs the release. See classifyStateProvenance().
+ */
+export const STATE_UNTRUSTED = 'untrusted'
 
 /**
  * Written LAST, so a record that parses without it was torn rather than finished.
@@ -1116,46 +1145,78 @@ export function readState(stateFile) {
 }
 
 /**
- * Publish the fence record so that a power cut leaves either the previous record or the
- * complete new one, and so that the bytes are on the medium before the caller is allowed to
- * revoke anything.
+ * WHO WROTE THIS RECORD — asked of the filesystem, before a byte of it is read.
  *
- * Throws on any failure — including the directory flush AFTER the rename, where the new
- * record is already visible and its NAME is not yet proven. The caller must abort there
- * rather than read the file back: a read-back is satisfied by the page cache, which is the
- * exact state a power cut undoes.
+ * o3d-secops r23, Codex CRITICAL. Until this round the record lived in ${DB_FENCE_DIR}, which was
+ * owned by ${APP_USER} SO THAT THIS PROCESS COULD PUBLISH IT — this file runs as that account.
+ * That made the authoritative list of who gets `GRANT CONNECT` a file the defended-against
+ * account could pre-create, replace or unlink at any time, and readState() authenticated its
+ * SHAPE. Shape is not provenance. It is the same defect as the legacy fence marker two rounds
+ * ago, with a different file in it.
+ *
+ * So this process no longer writes the record at all: it PRINTS a plan (--plan), root validates
+ * that plan field by field and publishes the authority itself through publish_durable_file(), and
+ * every mode that acts on the record proves first that only the publishing account could have
+ * produced it. THE DIRECTORY IS ASKED BEFORE THE FILE, and it is the more important of the two:
+ * `unlink(2)` and `rename(2)` ask for write permission on the PARENT and nothing about the file,
+ * so a record's own owner says nothing at all while its directory is writable by somebody else.
+ *
+ * `lstatSync` AND NOT `statSync`, on both. A symlink at either name is refused as what it is
+ * rather than described by its target — the rule every `stat` on the shell side follows. The read
+ * that comes afterwards does resolve the name a second time, and that window is closed by the
+ * ANSWER rather than by the read: a directory nobody else may write is one in which no name can
+ * be swapped.
+ *
+ * Returns '' when the provenance holds, or the sentence saying why it does not.
  */
-export function publishState(stateFile, state) {
+export function classifyStateProvenance(stateFile, expectedUid, stat = lstatSync) {
+  if (!stateFile) return ''
   const dir = dirname(stateFile)
-  mkdirSync(dir, { recursive: true })
-  const tmp = `${stateFile}.${process.pid}.${randomBytes(6).toString('hex')}.tmp`
-  const body = `${JSON.stringify({ ...state, state_complete: STATE_COMPLETE_SENTINEL }, null, 2)}\n`
+  let dirStat
   try {
-    const fd = openSync(tmp, 'wx', 0o600)
-    try {
-      writeFileSync(fd, body)
-      // BARRIER 1: the data, before any name points at it.
-      fsyncSync(fd)
-    } finally {
-      closeSync(fd)
-    }
-    renameSync(tmp, stateFile)
+    dirStat = stat(dir)
   } catch (error) {
-    try {
-      unlinkSync(tmp)
-    } catch {
-      /* the temporary may never have been created; the failure being reported is the one above */
-    }
-    throw error
+    return `${dir} could not be examined (${error instanceof Error ? error.message : String(error)})`
   }
-  // BARRIER 2: the directory entry the rename created. Without it the reboot can find the
-  // previous record, or neither, however well the data was written.
-  const dirFd = openSync(dir, 'r')
+  if (!dirStat.isDirectory()) return `${dir} is not a directory`
+  if (dirStat.uid !== expectedUid) {
+    return `${dir} is owned by uid ${dirStat.uid}, not by uid ${expectedUid}, so the record inside it can be replaced by an account this run does not act for`
+  }
+  if ((dirStat.mode & 0o022) !== 0) {
+    return `${dir} is writable by group or other (mode ${(dirStat.mode & 0o7777).toString(8)}), so any name inside it can be renamed or unlinked by another account`
+  }
+  let fileStat
   try {
-    fsyncSync(dirFd)
-  } finally {
-    closeSync(dirFd)
+    fileStat = stat(stateFile)
+  } catch (error) {
+    // ENOENT is not a provenance failure: there is nothing there to have been forged, and
+    // readState() answers for absence — which is never read as "no fence" anyway.
+    if (error && error.code === 'ENOENT') return ''
+    return `${stateFile} could not be examined (${error instanceof Error ? error.message : String(error)})`
   }
+  if (!fileStat.isFile()) return `${stateFile} is not a regular file`
+  if (fileStat.uid !== expectedUid) {
+    return `${stateFile} is owned by uid ${fileStat.uid}, not by uid ${expectedUid}, so it was not published by the account whose privileges this run would act on it with`
+  }
+  if ((fileStat.mode & 0o022) !== 0) {
+    return `${stateFile} is writable by group or other (mode ${(fileStat.mode & 0o7777).toString(8)})`
+  }
+  return ''
+}
+
+/**
+ * The record, read only once it has been shown to be the publishing account's own.
+ *
+ * Every path that builds a `GRANT` or a `REVOKE` out of the record goes through this and never
+ * through readState() directly. readState() stays what it was — a reader that says which kind of
+ * nothing it found — and is deliberately not given the provenance question too, because a reader
+ * that answered both would make it impossible to tell, at a call site, which one was asked.
+ */
+export function readAuthorityRecord(stateFile, expectedUid, stat = lstatSync) {
+  if (!stateFile) return { status: STATE_ABSENT, detail: 'no --state-file was given' }
+  const problem = classifyStateProvenance(stateFile, expectedUid, stat)
+  if (problem) return { status: STATE_UNTRUSTED, detail: problem }
+  return readState(stateFile)
 }
 
 async function readFacts(client, appRole) {
@@ -1383,23 +1444,16 @@ async function doPreflight(client, options) {
 }
 
 /**
- * The refusal that keeps the asymmetry from opening: the record could not be made durable, so
- * nothing is revoked. Nothing has changed in the database and nothing needs releasing.
+ * EVERYTHING --plan AND --fence BOTH HAVE TO ESTABLISH, ASKED ONCE (o3d-secops r23).
+ *
+ * The two modes are one decision split across two processes with a privileged publication in
+ * between, so they must agree about the database, the roles and the record; a second copy of
+ * these guards is how the two would come to disagree.
+ *
+ * Returns `{ exitCode }` when the request is refused — the caller returns it unchanged — or the
+ * facts both modes go on to use.
  */
-function refuseUnrecordedFence(stateFile, error, appeared = []) {
-  const message = error instanceof Error ? error.message : String(error)
-  console.error(`NOT FENCED: the fence record ${stateFile} could not be published durably (${message}).`)
-  console.error('Refusing to revoke CONNECT. A REVOKE is a committed transaction that survives a power cut;')
-  console.error('this file is the only thing that undoes it, and a revoke whose undo record may not survive')
-  console.error('locks the application out of its database with nothing left to say how to let it back in.')
-  if (appeared.length > 0) {
-    console.error(`The fence already recorded stays exactly as it is; ${appeared.join(', ')} was NOT revoked.`)
-  }
-  console.error('Nothing has been revoked by this run. Fix the filesystem (space, permissions, mount) and re-run.')
-  return EXIT_NOT_FENCEABLE
-}
-
-export async function doFence(client, options) {
+async function assessFenceRequest(client, options, prefix) {
   // The fence is only ever established through an EXPLICIT admin URL. Falling back to
   // DIRECT_URL here would let a fence engage while the caller has no idea which
   // connection survived it — and the caller has to run the migration through exactly
@@ -1407,7 +1461,7 @@ export async function doFence(client, options) {
   if (!requireAdminUrl('this deploy')) {
     console.error('The deploy may continue, but the database is NOT held closed for the migration')
     console.error('window: a client that connects between now and the end of the migration is not stopped.')
-    return EXIT_NOT_FENCEABLE
+    return { exitCode: EXIT_NOT_FENCEABLE }
   }
 
   const appRole = options.appRole || options.appUser
@@ -1417,19 +1471,19 @@ export async function doFence(client, options) {
   // that is not the application's locks other people's clients out of somewhere else while the
   // application keeps writing across the migration, and every verification below — the ACL read,
   // the effective-CONNECT check, the drain — would be a truthful report about the wrong database.
-  if (!requireBoundDatabaseIdentity(attachmentOf(facts), 'NOT FENCED', options)) return EXIT_NOT_FENCEABLE
+  if (!requireBoundDatabaseIdentity(attachmentOf(facts), prefix, options)) return { exitCode: EXIT_NOT_FENCEABLE }
 
   if (appRole && !facts.app_role_exists) {
-    console.error(`NOT FENCED: the role ${appRole} named by --app-user does not exist on this server.`)
-    return EXIT_NOT_FENCEABLE
+    console.error(`${prefix}: the role ${appRole} named by --app-user does not exist on this server.`)
+    return { exitCode: EXIT_NOT_FENCEABLE }
   }
 
   // Asked here as well as in --preflight, because a re-run may reach this with a state file
   // and never go through a preflight at all. An admin that cannot SET ROLE would migrate as
   // itself and leave every new object unusable by the application (o3d-2sm1.5).
   if (!role.usable) {
-    console.error(`NOT FENCED: ${role.reason}`)
-    return EXIT_NOT_FENCEABLE
+    console.error(`${prefix}: ${role.reason}`)
+    return { exitCode: EXIT_NOT_FENCEABLE }
   }
 
   // A RECORD THAT EXISTS AND CANNOT BE USED IS NOT "NO RECORD" (o3d-2sm1.5, Codex r11 HIGH).
@@ -1437,13 +1491,26 @@ export async function doFence(client, options) {
   // then took the "no existing fence" branch — which would publish a FRESH record over the
   // only surviving trace of what an earlier run revoked, and release would afterwards
   // restore the wrong set. Only a genuinely absent record starts a fresh fence.
-  const read = options.stateFile ? readState(options.stateFile) : { status: STATE_ABSENT, detail: 'no --state-file was given' }
+  //
+  // AND IT IS READ THROUGH THE PROVENANCE GATE (o3d-secops r23, Codex CRITICAL). A record whose
+  // directory or whose own inode does not belong to the publishing account is not a weak record,
+  // it is somebody else's; STATE_UNTRUSTED is refused here and never merged, re-applied or
+  // restored from.
+  const read = readAuthorityRecord(options.stateFile, options.stateOwnerUid ?? 0)
+  if (read.status === STATE_UNTRUSTED) {
+    console.error(`${prefix}: the connection-fence authority at ${options.stateFile} was not published by the account this run acts for (${read.detail}).`)
+    console.error('That file decides which roles a release hands CONNECT back to, so a copy anything else could')
+    console.error('have written is a list of roles somebody else chose. It has NOT been read.')
+    console.error('Nothing has been revoked. Fix the ownership of that path — it is published by root through')
+    console.error('publish_durable_file() and nothing else may write it — and re-run.')
+    return { exitCode: EXIT_NOT_FENCEABLE }
+  }
   if (read.status === STATE_UNREADABLE || read.status === STATE_CORRUPT) {
-    console.error(`NOT FENCED: ${options.stateFile} holds a fence record this run cannot use (${read.status}: ${read.detail}).`)
+    console.error(`${prefix}: ${options.stateFile} holds a fence record this run cannot use (${read.status}: ${read.detail}).`)
     console.error('Refusing to revoke CONNECT over it: that record may be the only account of what an earlier')
     console.error('fence took away, and overwriting it would leave those grantees with nothing to restore them.')
     console.error(`Inspect ${options.stateFile}, restore the grants it describes by hand if it describes any, remove it, and re-run.`)
-    return EXIT_NOT_FENCEABLE
+    return { exitCode: EXIT_NOT_FENCEABLE }
   }
   const existing = read.status === STATE_PRESENT ? read.state : null
 
@@ -1457,68 +1524,120 @@ export async function doFence(client, options) {
   // the shape a substituted DATABASE_URL produces, and it is refused here even when the caller
   // above was fooled.
   if (existing && existing.database && existing.database !== facts.database) {
-    console.error(`NOT FENCED: the fence record at ${options.stateFile} was written for the database "${existing.database}",`)
+    console.error(`${prefix}: the fence record at ${options.stateFile} was written for the database "${existing.database}",`)
     console.error(`but this connection is attached to "${facts.database}". The grantees it lists lost CONNECT on`)
     console.error(`"${existing.database}", and re-applying them here would revoke CONNECT on a database that fence was`)
     console.error(`never raised on while leaving "${existing.database}" fenced with nothing recording it.`)
     console.error('Nothing has been revoked. Point this run at the database the record names, or release that fence first.')
-    return EXIT_NOT_FENCEABLE
+    return { exitCode: EXIT_NOT_FENCEABLE }
   }
 
-  const plan = existing ? { fenceable: true, reason: '', revoke: existing.revoked } : freshPlan
+  return { facts, appRole, freshPlan, existing }
+}
 
-  if (!plan.fenceable) {
-    console.error(`NOT FENCED: ${plan.reason}`)
+/**
+ * --plan: WHAT A FENCE WOULD REVOKE, PRINTED AND NOT ACTED ON (o3d-secops r23, Codex CRITICAL).
+ *
+ * This is the unprivileged half of raising a fence. It opens the same admin connection, asks the
+ * same questions and computes the same grantee list --fence used to compute for itself — and then
+ * it REVOKES NOTHING, WRITES NOTHING, and prints one line of JSON on stdout.
+ *
+ * WHY IT PRINTS INSTEAD OF PUBLISHING. The record is the authority a later `--release` builds
+ * `GRANT CONNECT` out of. Written from here it would live in a directory this account can write,
+ * which is the finding: a planted file becomes a privileged grant. So this mode is a REQUEST. The
+ * caller — root — validates it field by field (db_fence_authorise_plan) and publishes the
+ * authority itself, durably, before this file is invoked again with `--fence`.
+ *
+ * STDOUT IS THE MACHINE CHANNEL AND STDERR IS THE HUMAN ONE, exactly as --print-migration-url
+ * already has it: the caller captures this with `$( )`, so a diagnostic line on stdout would be a
+ * corrupt record.
+ *
+ * COMPACT JSON, ON ONE LINE. Nothing about the bytes emitted here is authoritative — the
+ * validator re-emits the record field by field from its own template — but a single line is what
+ * a shell can capture without deciding what a blank line means.
+ */
+export async function doPlan(client, options) {
+  const assessed = await assessFenceRequest(client, options, 'NOT PLANNED')
+  if (assessed.exitCode !== undefined) return assessed.exitCode
+  const { facts, appRole, freshPlan, existing } = assessed
+
+  // A grantee that has acquired CONNECT since an earlier fence was recorded would otherwise be
+  // revoked by nothing: the record is the authority on what to RESTORE, not on what holds CONNECT
+  // now. The union is planned, so the release still puts everything back.
+  const appeared = existing ? freshPlan.revoke.filter((grantee) => !existing.revoked.includes(grantee)) : []
+  const revoked = existing ? [...existing.revoked, ...appeared] : freshPlan.revoke
+
+  if (!existing && !freshPlan.fenceable) {
+    console.error(`NOT PLANNED: ${freshPlan.reason}`)
     console.error('The deploy may continue, but the database is NOT held closed for the migration window:')
     console.error('a client that connects between now and the end of the migration will not be stopped.')
     return EXIT_NOT_FENCEABLE
   }
 
-  const revokes = buildRevokeStatements(facts.database, plan.revoke)
-  const grants = buildGrantStatements(facts.database, plan.revoke)
-
-  // PUBLISHED DURABLY, AND BEFORE THE TRANSACTION THAT MAKES IT NECESSARY.
-  //
-  // The comment below used to say "written BEFORE the revoke", which was true of the CALL and
-  // not of the BYTES: writeFileSync returns as soon as the kernel has the page, and the
-  // REVOKE that follows is a committed transaction that survives a power cut the file does
-  // not. So the ordering has to be a durability ordering, and a publication that cannot be
-  // proven aborts the fence rather than permitting a revoke nothing records.
-  if (options.stateFile && !existing) {
-    try {
-      publishState(options.stateFile, {
-        database: facts.database,
-        owner_role: facts.owner_role,
-        app_role: appRole,
-        admin_role: facts.admin_role,
-        revoked: plan.revoke,
-        datacl_before: facts.datacl ?? null,
-        fenced_at: new Date().toISOString(),
-        undo_sql: grants,
-      })
-    } catch (error) {
-      return refuseUnrecordedFence(options.stateFile, error)
-    }
-  } else if (existing) {
-    console.log(`Re-applying the fence recorded at ${existing.fenced_at} (grantees: ${existing.revoked.join(', ')}).`)
-    // A grantee that appeared SINCE the fence was recorded would otherwise be revoked by
-    // nothing: the state file is the authority on what to restore, not on what holds CONNECT
-    // now. Anything new is revoked too and appended, so the release still puts it back —
-    // and the appended record is published durably before those extra revokes run, for the
-    // same reason the first one is.
-    const appeared = freshPlan.revoke.filter((grantee) => !plan.revoke.includes(grantee))
+  const record = {
+    database: facts.database,
+    owner_role: facts.owner_role,
+    app_role: appRole,
+    admin_role: facts.admin_role,
+    revoked,
+    datacl_before: (existing ? existing.datacl_before : facts.datacl) ?? null,
+    fenced_at: existing?.fenced_at || new Date().toISOString(),
+  }
+  process.stdout.write(`${JSON.stringify(record)}\n`)
+  if (existing) {
+    console.error(`Re-applying the fence recorded at ${existing.fenced_at} (grantees: ${existing.revoked.join(', ')}).`)
     if (appeared.length > 0) {
-      console.log(`  and revoking from ${appeared.join(', ')}, which has acquired CONNECT since the fence was recorded.`)
-      plan.revoke.push(...appeared)
-      try {
-        publishState(options.stateFile, { ...existing, revoked: plan.revoke, undo_sql: buildGrantStatements(facts.database, plan.revoke) })
-      } catch (error) {
-        return refuseUnrecordedFence(options.stateFile, error, appeared)
-      }
-      revokes.push(...buildRevokeStatements(facts.database, appeared))
-      grants.push(...buildGrantStatements(facts.database, appeared))
+      console.error(`  and planning to revoke from ${appeared.join(', ')}, which has acquired CONNECT since the fence was recorded.`)
     }
   }
+  console.error(`Planned: CONNECT would be revoked on ${facts.database} from ${revoked.join(', ')}. NOTHING HAS BEEN REVOKED, and this run wrote no file.`)
+  return EXIT_OK
+}
+
+export async function doFence(client, options) {
+  const assessed = await assessFenceRequest(client, options, 'NOT FENCED')
+  if (assessed.exitCode !== undefined) return assessed.exitCode
+  const { facts, appRole, freshPlan, existing } = assessed
+
+  // THE AUTHORITY IS AN INPUT NOW, NOT AN OUTPUT (o3d-secops r23, Codex CRITICAL).
+  //
+  // This function used to publish the record itself and then revoke from what it had just
+  // written. It cannot: it runs as ${APP_USER}, so a record it can publish is a record that
+  // account can publish, and that record is what a later `--release` turns into `GRANT CONNECT`.
+  // The publication moved to root — `--plan`, then db_fence_authorise_plan(), then
+  // publish_durable_file() — and what is left here is an EXECUTOR that revokes exactly what a
+  // privileged process has already recorded, durably, before this process was started.
+  //
+  // SO AN ABSENT RECORD IS A REFUSAL, and it is the one that keeps the old asymmetry closed: a
+  // REVOKE is a committed transaction that survives a power cut, the record is the only thing
+  // that undoes it, and the record's durability is now established BEFORE this runs rather than
+  // by this run. Nothing here may revoke what nothing has recorded.
+  if (!existing) {
+    console.error(`NOT FENCED: there is no connection-fence authority at ${options.stateFile || '<no --state-file was given>'}, so nothing has recorded what this fence would revoke.`)
+    console.error('A REVOKE survives a power cut and this file is the only thing that undoes it, so the record is')
+    console.error('published — by root, durably — BEFORE any revoke is issued, and this mode executes what it says.')
+    console.error('It is not written from here: this process runs as the application account, and a record that')
+    console.error('account can write is a list of roles it chooses to hand CONNECT back to.')
+    console.error('Run the plan-and-publish step first; the entrypoints do it on every fence.')
+    return EXIT_NOT_FENCEABLE
+  }
+
+  // AND THE AUTHORITY MUST STILL COVER THE ACL. `--plan` computed the union of the recorded
+  // grantees and whatever held CONNECT then; if a grantee has appeared between that read and this
+  // one, revoking it would take CONNECT from a role no record restores. The old code appended to
+  // the record and carried on, which it could do because it was the record's author. This one is
+  // not, so it REFUSES and says what changed — a re-run re-plans and re-publishes.
+  const appeared = freshPlan.revoke.filter((grantee) => !existing.revoked.includes(grantee))
+  if (appeared.length > 0) {
+    console.error(`NOT FENCED: ${appeared.join(', ')} acquired CONNECT on ${facts.database} between the plan and this fence,`)
+    console.error(`and the authority at ${options.stateFile} does not record ${appeared.length === 1 ? 'it' : 'them'}. Revoking anyway would take CONNECT from a`)
+    console.error('role nothing would restore. Nothing has been revoked; re-run, which re-plans and re-publishes.')
+    return EXIT_NOT_FENCEABLE
+  }
+
+  const plan = { fenceable: true, reason: '', revoke: existing.revoked }
+  const revokes = buildRevokeStatements(facts.database, plan.revoke)
+  const grants = buildGrantStatements(facts.database, plan.revoke)
 
   // THE BOUNDARY IS THE COMMIT REQUEST, NOT ITS ACKNOWLEDGEMENT (o3d-2sm1.5, Codex r14 HIGH).
   //
@@ -1867,7 +1986,14 @@ export async function doRelease(client, options) {
   }
   if (!requireBoundDatabaseIdentity(released, 'NOT RELEASED', options)) return EXIT_ERROR
 
-  const read = options.stateFile ? readState(options.stateFile) : { status: STATE_ABSENT, detail: 'no --state-file was given' }
+  // THROUGH THE PROVENANCE GATE, AND THIS IS THE CALL SITE THE GATE EXISTS FOR (o3d-secops r23,
+  // Codex CRITICAL). Every statement below is a `GRANT CONNECT` built out of this record. A record
+  // whose directory or whose own inode belongs to anything but the publishing account is a list
+  // of roles somebody else chose to give database access to, executed here with an administrative
+  // connection — so it is never read as a record. STATE_UNTRUSTED falls through to
+  // releaseWithoutRecord(), which asks the DATABASE what is standing and refuses in both
+  // directions; it never reports "released" and never reports "nothing to release".
+  const read = readAuthorityRecord(options.stateFile, options.stateOwnerUid ?? 0)
   if (read.status !== STATE_PRESENT) {
     return releaseWithoutRecord(client, options, read, connectedDatabase, connectedPostmaster)
   }
@@ -1901,7 +2027,12 @@ export async function doRelease(client, options) {
     return EXIT_ERROR
   }
 
-  rmSync(options.stateFile, { force: true })
+  // THE RECORD IS NOT REMOVED FROM HERE (o3d-secops r23). It lives in a directory this account
+  // cannot write, which is the point of the round: an unlink is a write to that directory. The
+  // caller — root, which published it — clears it once this run has exited 0, and until it does
+  // the record describes a fence that has been released, which is the safe direction: a `--fence`
+  // over it re-applies the same grantee list, and a second `--release` re-grants what is already
+  // granted. The other order loses the only account of what was revoked.
   console.log(`Connection fence released: CONNECT restored to ${state.revoked.join(', ')} on ${state.database}.`)
   return EXIT_OK
 }
@@ -1927,9 +2058,9 @@ async function main() {
   // opened is proven against the connection itself (assessDatabaseIdentity, and the postmaster
   // stamp in --release).
   const options = parseArgs(process.argv.slice(2))
-  const modes = ['fence', 'release', 'preflight', 'print-migration-url']
+  const modes = ['plan', 'fence', 'release', 'preflight', 'print-migration-url']
   if (!modes.includes(options.mode)) {
-    console.error('Usage: node scripts/fence-db-connections.mjs (--preflight|--fence|--release|--print-migration-url) --app-host=HOST --app-port=PORT --app-user=ROLE --app-database=NAME [--state-file=PATH] [--app-role=ROLE] [--timeout-seconds=N]')
+    console.error('Usage: node scripts/fence-db-connections.mjs (--preflight|--plan|--fence|--release|--print-migration-url) --app-host=HOST --app-port=PORT --app-user=ROLE --app-database=NAME [--state-file=PATH] [--state-owner=UID] [--app-role=ROLE] [--timeout-seconds=N]')
     process.exit(EXIT_ERROR)
   }
 
@@ -1973,11 +2104,11 @@ async function main() {
   // preflight that connected as the application role would prove nothing about the connection
   // the migration actually uses.
   const connectionString =
-    options.mode === 'preflight'
+    options.mode === 'preflight' || options.mode === 'plan'
       ? process.env.DEPLOY_ADMIN_DATABASE_URL
       : process.env.DEPLOY_ADMIN_DATABASE_URL || process.env.DIRECT_URL || process.env.DATABASE_URL
   if (!connectionString) {
-    if (options.mode === 'preflight') {
+    if (options.mode === 'preflight' || options.mode === 'plan') {
       requireAdminUrl('this deploy')
       process.exit(EXIT_NOT_FENCEABLE)
     }
@@ -1989,6 +2120,7 @@ async function main() {
   await client.connect()
   try {
     if (options.mode === 'preflight') process.exitCode = await doPreflight(client, options)
+    else if (options.mode === 'plan') process.exitCode = await doPlan(client, options)
     else if (options.mode === 'fence') process.exitCode = await doFence(client, options)
     else process.exitCode = await doRelease(client, options)
   } finally {

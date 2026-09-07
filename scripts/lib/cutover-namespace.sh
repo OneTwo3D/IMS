@@ -632,3 +632,27 @@ warn_pre_r22_db_fence_state() {
   warn "If a connection fence really is standing from an interrupted run of the previous checkout, this run finds out from the DATABASE and refuses with the grantees named; nothing is decided from that file either way."
   return 0
 }
+
+# THE SAME RULE, FOR THE /var/lib/ims-deploy NAMESPACE (o3d-secops r23, Codex CRITICAL)
+#
+# import_legacy_cutover_state() used to REPUBLISH ${LEGACY_DB_FENCE_STATE} at ${DB_FENCE_STATE}
+# and chown the result to ${APP_USER}, so that "the fence script can release it". That is the
+# finding written as a feature: the legacy record was written BY the fence helper, running as
+# ${APP_USER}, so its contents are that account own -- and the import made root copy them into
+# the file a later `--release` builds `GRANT CONNECT` out of. An adoption is not a laundering
+# step; content does not become authoritative by being moved by a privileged process.
+#
+# So it is reported and left exactly where it is, which is what warn_pre_r22_db_fence_state()
+# already does for the other legacy path and for the same reason. NOTHING IS LOST BY REFUSING:
+# `release_db_connections` never concludes "no fence" from a missing record. It asks the DATABASE,
+# and a standing fence with no record it may believe is already a refusal that names what a
+# superuser has to restore by hand.
+warn_legacy_namespace_db_fence_state() {
+  [[ -n "${LEGACY_DB_FENCE_STATE:-}" ]] || return 0
+  [[ "${LEGACY_DB_FENCE_STATE}" != "${DB_FENCE_STATE:-}" ]] || return 0
+  [[ -e "${LEGACY_DB_FENCE_STATE}" || -L "${LEGACY_DB_FENCE_STATE}" ]] || return 0
+  warn "There is an entry at ${LEGACY_DB_FENCE_STATE} — the connection-fence record of the namespace deploy.sh used before the shared one."
+  warn "IT HAS NOT BEEN READ, COPIED OR IMPORTED, and it will not be: it was written by the fence helper running as ${APP_USER}, it lists the grantees a fence revoked CONNECT from, and root does not take GRANT statements out of a file that account authored. Earlier checkouts republished it into the shared namespace; that made root act on the application own choice of who gets database access."
+  warn "If a fence really is standing from an interrupted run of that checkout, this run finds out from the DATABASE and refuses with the grantees named. Nothing is decided from that file either way; read it by hand if you need to know what the interrupted run took."
+  return 0
+}

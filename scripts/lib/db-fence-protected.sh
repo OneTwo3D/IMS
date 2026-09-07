@@ -1135,6 +1135,235 @@ db_fence_script_in_use() {
 }
 
 # ---------------------------------------------------------------------------
+# THE CONNECTION-FENCE AUTHORITY, AND THE PRIVILEGED STEP THAT PUBLISHES IT
+# (o3d-secops r23, Codex CRITICAL)
+#
+# THE FINDING. ${DB_FENCE_STATE} names the roles a `--release` hands `GRANT CONNECT` back to. It
+# was published BY THE HELPER, which runs as ${APP_USER}, into a directory that was owned by
+# ${APP_USER} for exactly that reason -- so the account being defended against could pre-create or
+# replace the file that decides who gets database access, and readState() authenticated its SHAPE.
+# A well-formed JSON object proves the file is well-formed JSON. It says nothing about who wrote
+# it. That is the same defect as the legacy fence marker one round earlier, with another file in
+# it: AUTHENTICATING THE ARTEFACT INSTEAD OF ITS PROVENANCE.
+#
+# THE SPLIT. Raising a fence is now three steps and the privileged one is in the middle:
+#
+#   1. `--plan`, as ${APP_USER}.  Opens the admin connection, reads the ACL, computes the grantee
+#                                 list, PRINTS it as one line of JSON and writes nothing at all.
+#                                 It is a REQUEST.
+#   2. db_fence_authorise_plan(), as root.  Validates that request field by field against what
+#                                 THIS run supplied on the command line, REBUILDS the record from
+#                                 its own template -- nothing the request carried that is not in
+#                                 the template survives -- and publishes it durably: temporary in
+#                                 the destination directory, fsync, atomic rename, directory
+#                                 fsync. The same barriers in the same order the helper own
+#                                 publisher used to make, because the ordering property has not
+#                                 changed: a REVOKE is a committed transaction that outlives a
+#                                 power cut, and its undo record has to be on the medium first.
+#   3. `--fence`, as ${APP_USER}. EXECUTES the authority. It cannot write it, and an absent or
+#                                 unauthenticated record is a refusal rather than a fresh fence.
+#
+# WHAT IS LEFT ON THE APPLICATION SIDE: NOTHING. There is no request file, no progress note and no
+# app-writable directory in the cutover namespace any more -- the plan travels on a pipe, and
+# ${DB_FENCE_DIR} is root-owned. `--release` still READS the authority, and must, because the
+# executor is unprivileged. Readable is not writable, and the record holds role names, not secrets.
+#
+# WHAT THIS DOES NOT CLOSE, SAID PLAINLY. The helper runs with DEPLOY_ADMIN_DATABASE_URL in its
+# environment for the length of a cutover, so during that window the application account can issue
+# any SQL the admin can, this record included. What the split closes is the PERSISTENT half, which
+# is the half that matters: a file planted at any time, by an account holding no credential at
+# all, that makes some later privileged release grant CONNECT to roles of its choosing. Closing
+# the window itself means not handing that account the credential -- see docs/installation.md.
+#
+# WHY THE VALIDATOR IS AN INLINE PROGRAM. It runs AS ROOT, so it may not be a file out of the
+# application checkout -- that is the r31 CRITICAL, and it applies to a validator exactly as it
+# applies to the helper. It is held in ONE constant, which db_fence_authorise_plan() runs and
+# which the generated operator wrappers BAKE IN at publication, so a wrapper carries a copy that
+# was generated rather than a second one somebody wrote. `node -e` resolves no module and reads no
+# path: the whole of what root executes here is the text below.
+#
+# Arguments: <expected database> <expected app role> <destination>. The plan arrives on stdin.
+readonly DB_FENCE_AUTHORISE_PLAN_PROGRAM='
+var fs = require("fs");
+var path = require("path");
+function fail(m) { process.stderr.write("NOT AUTHORISED: " + m + "\n"); process.exit(1); }
+var CONTROL = new RegExp("[\\u0000-\\u001f\\u007f]");
+function text(v, max) {
+  return typeof v === "string" && v.length > 0 && v.length <= max && !CONTROL.test(v);
+}
+var wantDatabase = process.argv[1] || "";
+var wantAppRole = process.argv[2] || "";
+var destination = process.argv[3] || "";
+if (!wantDatabase || !wantAppRole || !destination) fail("the validator was not told which database, role and destination this run is fencing");
+var raw = "";
+try { raw = fs.readFileSync(0, "utf8"); } catch (e) { fail("the plan could not be read: " + e.message); }
+var plan = null;
+try { plan = JSON.parse(raw); } catch (e) { fail("the plan is not valid JSON (" + e.message + ")"); }
+if (plan === null || typeof plan !== "object" || Array.isArray(plan)) fail("the plan is not a JSON object");
+if (!text(plan.database, 128)) fail("the plan names no usable database");
+if (plan.database !== wantDatabase) fail("the plan names the database " + JSON.stringify(plan.database) + " and this run is fencing " + JSON.stringify(wantDatabase));
+if (!text(plan.app_role, 128)) fail("the plan names no usable application role");
+if (plan.app_role !== wantAppRole) fail("the plan names the application role " + JSON.stringify(plan.app_role) + " and this run supplied " + JSON.stringify(wantAppRole));
+if (!text(plan.owner_role, 128)) fail("the plan names no usable database owner");
+if (!text(plan.admin_role, 128)) fail("the plan names no usable admin role");
+if (!Array.isArray(plan.revoked) || plan.revoked.length < 1 || plan.revoked.length > 64) fail("the plan carries no usable list of grantees");
+var seen = Object.create(null);
+for (var i = 0; i < plan.revoked.length; i++) {
+  if (!text(plan.revoked[i], 128)) fail("grantee " + i + " is not a usable role name");
+  if (seen[plan.revoked[i]]) fail("the plan lists " + JSON.stringify(plan.revoked[i]) + " twice");
+  seen[plan.revoked[i]] = true;
+}
+var acl = plan.datacl_before === undefined ? null : plan.datacl_before;
+if (acl !== null && !(typeof acl === "string" && acl.length <= 8192 && !CONTROL.test(acl))) fail("the recorded prior ACL is not a usable string");
+if (!(typeof plan.fenced_at === "string" && /^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}([.][0-9]{1,6})?Z$/.test(plan.fenced_at))) fail("the plan carries no usable timestamp");
+var record = {
+  database: plan.database,
+  owner_role: plan.owner_role,
+  app_role: plan.app_role,
+  admin_role: plan.admin_role,
+  revoked: plan.revoked.slice(),
+  datacl_before: acl,
+  fenced_at: plan.fenced_at,
+  state_complete: 1
+};
+var directory = path.dirname(destination);
+var meta = null;
+try { meta = fs.lstatSync(directory); } catch (e) { fail(directory + " could not be examined (" + e.message + ")"); }
+if (!meta.isDirectory()) fail(directory + " is not a directory");
+if (meta.uid !== process.getuid()) fail(directory + " is owned by uid " + meta.uid + " and this run is uid " + process.getuid() + ", so what it publishes there could be replaced by somebody else");
+if ((meta.mode & 18) !== 0) fail(directory + " is writable by group or other, so any name in it can be renamed or unlinked by another account");
+var temporary = destination + ".authority." + process.pid + ".tmp";
+var fd = -1;
+try {
+  fd = fs.openSync(temporary, "wx", 384);
+  fs.writeFileSync(fd, JSON.stringify(record, null, 2) + "\n");
+  fs.fsyncSync(fd);
+  fs.closeSync(fd);
+  fd = -1;
+  fs.chmodSync(temporary, 420);
+  fs.renameSync(temporary, destination);
+} catch (e) {
+  if (fd !== -1) { try { fs.closeSync(fd); } catch (ignored) { void ignored; } }
+  try { fs.unlinkSync(temporary); } catch (ignored) { void ignored; }
+  fail("the authority could not be published at " + destination + " (" + e.message + ")");
+}
+var dirFd = -1;
+try {
+  dirFd = fs.openSync(directory, "r");
+  fs.fsyncSync(dirFd);
+  fs.closeSync(dirFd);
+} catch (e) {
+  if (dirFd !== -1) { try { fs.closeSync(dirFd); } catch (ignored) { void ignored; } }
+  fail("the authority is visible at " + destination + " and its NAME is not durable (" + e.message + "), so a power cut can restore the previous directory entry");
+}
+process.stderr.write("Connection-fence authority published at " + destination + ": CONNECT will be revoked from " + record.revoked.join(", ") + " on " + record.database + ".\n");
+'
+
+# Validate a plan on stdin and publish the authority it authorises. ROOT ONLY -- that is the whole
+# point of the function. Returns non-zero, having published nothing, on anything it cannot prove.
+db_fence_authorise_plan() {
+  local expected_database="$1" expected_app_role="$2" destination="$3"
+  node -e "${DB_FENCE_AUTHORISE_PLAN_PROGRAM}" -- "${expected_database}" "${expected_app_role}" "${destination}"
+}
+
+# The whole privileged step, from the plan text a caller captured to a published authority.
+#
+# THE DIRECTORY IS ASKED ABOUT TWICE, HERE AND INSIDE THE PROGRAM, and that is deliberate rather
+# than redundant: this one refuses BEFORE `node` is started, so the failure a caller sees names
+# the namespace; the one inside is made in the same process that does the rename, which is the
+# only one that cannot be raced. dir_is_private_to_this_run() is lib/cutover-namespace.sh own, and
+# every entrypoint sources both libraries before either of them runs.
+db_fence_publish_authority() {
+  local plan="$1" destination="$2" expected_database="$3" expected_app_role="$4" directory
+  directory="$(dirname "${destination}")"
+  if ! declare -F dir_is_private_to_this_run >/dev/null 2>&1; then
+    echo "The cutover namespace library is not loaded, so this run cannot establish that ${directory} is a directory only it may write. Refusing to publish a connection-fence authority into it." >&2
+    return 1
+  fi
+  if ! dir_is_private_to_this_run "${directory}"; then
+    echo "${directory} is not a directory only this run may write, so an authority published there could be replaced before anything acted on it. Refusing to publish a connection-fence authority into it." >&2
+    return 1
+  fi
+  [[ -n "${plan}" ]] || { echo "The fence plan is empty, so there is nothing to authorise and nothing has been published." >&2; return 1; }
+  printf '%s\n' "${plan}" | db_fence_authorise_plan "${expected_database}" "${expected_app_role}" "${destination}" || return 1
+  return 0
+}
+
+# WHOSE JOB IT IS TO REMOVE THE RECORD (o3d-secops r23). The helper cannot: an unlink is a write to
+# the directory, and that directory is root own. So a verified release is followed by this, and by
+# nothing else. The ORDER is deliberate: between the GRANTs landing and this call the record
+# describes a fence that has been released, which is the safe way round -- a `--fence` over it
+# re-applies the same grantee list and a second `--release` re-grants what is already granted,
+# where removing it first would lose the only account of what was revoked.
+db_fence_clear_authority() {
+  local destination="$1"
+  [[ -n "${destination}" ]] || return 0
+  rm -f "${destination}" 2>/dev/null || true
+  [[ ! -e "${destination}" ]] || return 1
+  return 0
+}
+
+
+# ---------------------------------------------------------------------------
+# RAISING A FENCE, END TO END, IN ONE PLACE (o3d-secops r23)
+#
+# Three steps, and the middle one is the privileged one. Every entrypoint calls this instead of
+# invoking the helper directly, because the ORDER is the property: the authority is on the medium
+# before a single REVOKE is issued, and a publication that cannot be proved aborts the fence
+# rather than permitting a revoke nothing records. Three copies of an ordering is how two of them
+# come to disagree.
+#
+# WHAT ROOT VALIDATES THE PLAN AGAINST IS WHAT ROOT TOLD THE HELPER. The database and the role are
+# read back out of the identity arguments this function is passing on, not taken from the plan and
+# not passed in separately: a second parameter could drift from the argument, and then root would
+# be checking the request against the request.
+#
+# db_fence_helper() is the one thing each entrypoint supplies for itself -- the three of them drop
+# to ${APP_USER} in three different ways, with three different environments -- and it is the only
+# part of raising a fence that is not written down once.
+db_fence_raise() {
+  local fence_script="$1" state_file="$2"
+  shift 2
+  local plan rc=0 argument database="" app_role="" app_user=""
+  for argument in "$@"; do
+    case "${argument}" in
+      --app-database=*) database="${argument#--app-database=}" ;;
+      --app-user=*) app_user="${argument#--app-user=}" ;;
+      --app-role=*) app_role="${argument#--app-role=}" ;;
+    esac
+  done
+  [[ -n "${app_role}" ]] || app_role="${app_user}"
+  if [[ -z "${database}" || -z "${app_role}" ]]; then
+    echo "NOT FENCED: this run was not told which database and role it is fencing, so nothing could validate what a fence would revoke. Nothing has been revoked." >&2
+    return 3
+  fi
+
+  # STEP 1, UNPRIVILEGED: what WOULD be revoked, printed. Nothing is written and nothing is
+  # revoked, so a failure here costs a message.
+  plan="$(db_fence_helper "${fence_script}" --plan --state-file="${state_file}" --state-owner="$(id -u)" "$@")" || rc=$?
+  if [[ "${rc}" -ne 0 ]]; then
+    echo "NOT FENCED: the connection fence could not be PLANNED (exit ${rc}); the reason is printed above. Nothing has been revoked, nothing has been recorded, and nothing has been migrated." >&2
+    return "${rc}"
+  fi
+
+  # STEP 2, PRIVILEGED: validated field by field, rebuilt from root own template, and published
+  # durably. A failure here is the refusal that keeps the asymmetry closed.
+  if ! db_fence_publish_authority "${plan}" "${state_file}" "${database}" "${app_role}"; then
+    echo "NOT FENCED: the connection-fence authority could not be published at ${state_file} (the reason is printed above)." >&2
+    echo "Refusing to revoke CONNECT. A REVOKE is a committed transaction that survives a power cut;" >&2
+    echo "this record is the only thing that undoes it, and a revoke whose undo record may not survive" >&2
+    echo "locks the application out of its database with nothing left to say how to let it back in." >&2
+    echo "Nothing has been revoked by this run. Fix the filesystem (space, permissions, mount) and re-run." >&2
+    return 3
+  fi
+
+  # STEP 3, UNPRIVILEGED AGAIN: execute exactly what step 2 recorded.
+  rc=0
+  db_fence_helper "${fence_script}" --fence --state-file="${state_file}" --state-owner="$(id -u)" "$@" || rc=$?
+  return "${rc}"
+}
+
+# ---------------------------------------------------------------------------
 # THE TWO COMMANDS AN OPERATOR IS EVER GIVEN (o3d-2sm1.5 r32, Codex HIGH x2)
 #
 # Both findings were the same defect: the code was fixed and the operator-facing text still
@@ -1162,7 +1391,8 @@ db_fence_script_in_use() {
 # whole point of the artefact is that the account being defended against does not get to choose
 # what runs with DEPLOY_ADMIN_DATABASE_URL beside it, and an executable-by-the-app-user wrapper is
 # a file that account can at least invoke at a moment of its choosing. The identity gate inside
-# stays too — a mode is not a proof, and the gate is what holds if one ever changes.
+# stays too — a mode is not a proof, and the gate is what holds if one ever changes — and since
+# r23 that gate is root-only, matching what the wrapper now has to do.
 #
 # Each one:
 #   * is root-owned and 0700, written by root, and NEVER sources this library from the checkout —
@@ -1174,8 +1404,15 @@ db_fence_script_in_use() {
 #     no arguments on a normal box, and says exactly what to set when it does not;
 #   * re-verifies the artefact digest before exec, with the digest inlined, so a wrapper left
 #     behind after the tree changed refuses instead of running something else;
-#   * execs as the application user, which is who the in-script paths run the helper as and who
-#     the state file has to be releasable by.
+#   * runs as ROOT and drops to the application user for the helper only. Until o3d-secops r23 it
+#     also accepted being run BY that account, because the state file was that account's to write.
+#     It is not any more: the authority is published, and removed, by root — so a wrapper the
+#     application account could usefully run is a wrapper that could write the authority, which is
+#     the finding this round closes.
+#   * carries the three steps of raising a fence, not one: `--plan` as the application user, the
+#     privileged validator (baked in from the library's single copy) which publishes the authority
+#     durably, and then `--fence`. Releasing is the same shape in reverse — release, then root
+#     removes the record.
 # ---------------------------------------------------------------------------
 db_fence_publish_operator_wrappers() {
   local app_user="$1" env_file="$2" state_file="$3" artefact_digest
@@ -1183,11 +1420,17 @@ db_fence_publish_operator_wrappers() {
   _fence_protected_dir_ready || return 1
   artefact_digest="$(fence_record_artefact_digest)" || return 1
 
-  local identity="" arg
+  local identity="" arg expected_database="" expected_app_role="" expected_app_user=""
   for arg in "$@"; do
     [[ -n "${arg}" ]] || continue
     identity+=" $(printf '%q' "${arg}")"
+    case "${arg}" in
+      --app-database=*) expected_database="${arg#--app-database=}" ;;
+      --app-user=*) expected_app_user="${arg#--app-user=}" ;;
+      --app-role=*) expected_app_role="${arg#--app-role=}" ;;
+    esac
   done
+  [[ -n "${expected_app_role}" ]] || expected_app_role="${expected_app_user}"
 
   # LOWERCASE NAMES INSIDE THE GENERATED SCRIPT, deliberately. The wrapper body below is a
   # QUOTED heredoc — bash writes it out, it does not expand it — but the repository's `set -u`
@@ -1213,6 +1456,16 @@ db_fence_publish_operator_wrappers() {
       printf 'state_file=%q\n' "${state_file}"
       printf 'expected_artefact=%q\n' "${artefact_digest}"
       printf 'mode=%q\n' "${mode}"
+      # THE IDENTITY AS AN ARRAY, not as a pre-quoted string: it is passed to two invocations now
+      # (--plan and --fence) and a string that was correct when it was spliced into one command
+      # line is a second thing to get right at the other.
+      printf 'identity_argv=(%s)\n' "${identity}"
+      # AND THE TWO VALUES ROOT VALIDATES THE PLAN AGAINST, read out of that same identity for the
+      # reason db_fence_raise() reads them out of its own arguments: a value carried separately
+      # can drift from the one the helper was actually told.
+      printf 'expected_database=%q\n' "${expected_database}"
+      printf 'expected_app_role=%q\n' "${expected_app_role}"
+      printf 'authorise_plan=%q\n' "${DB_FENCE_AUTHORISE_PLAN_PROGRAM}"
       # ITS OWN ABSOLUTE PATH, baked rather than taken from $0: an instruction this file prints
       # about itself has to be one that runs from anywhere, and $0 is whatever the caller typed.
       printf 'self=%q\n' "${target}"
@@ -1230,8 +1483,9 @@ db_fence_publish_operator_wrappers() {
 # line at all: they get EACCES from the kernel first, which is why every banner that names this
 # file prints a privilege transition in front of it. The gate is kept because the mode is not a
 # proof and this message is the better one if the mode ever changes.
-if [[ "$(id -u)" -ne 0 && "$(id -un)" != "${app_account}" ]]; then
-  echo "Run this as root — ${sudo_prefix}${self} — or as ${app_account}: it runs the protected fence helper as ${app_account}." >&2
+if [[ "$(id -u)" -ne 0 ]]; then
+  echo "Run this as root: ${sudo_prefix}${self}" >&2
+  echo "It publishes and removes the connection-fence authority in a root-owned directory, and drops to ${app_account} to run the protected helper. Since o3d-secops r23 the ${app_account} path is gone: that account cannot write the authority, which is the whole point of the round." >&2
   exit 1
 fi
 # The tree this is about to execute must still be the tree this wrapper was written for.
@@ -1273,11 +1527,31 @@ if [[ -z "${DEPLOY_ADMIN_DATABASE_URL:-}" ]]; then
   exit 1
 fi
 run_helper() {
-  if [[ "$(id -un)" == "${app_account}" ]]; then env "$@"; else runuser -u "${app_account}" -- env "$@"; fi
+  runuser -u "${app_account}" -- env "$@"
+}
+# THE THREE STEPS, BAKED (o3d-secops r23, Codex CRITICAL). The authority this wrapper acts on is
+# published by ROOT out of a plan the unprivileged helper prints, validated field by field and
+# rebuilt from the validator own template. The validator is the SAME program lib/db-fence-protected.sh
+# runs, written in here at publication rather than re-typed, so there is one text and two callers.
+raise_the_fence() {
+  local plan
+  plan="$(run_helper DEPLOY_ADMIN_DATABASE_URL="${DEPLOY_ADMIN_DATABASE_URL}" node "${helper}" --plan --state-file="${state_file}" --state-owner="$(id -u)" "${identity_argv[@]}")" || return 1
+  printf '%s\n' "${plan}" | node -e "${authorise_plan}" -- "${expected_database}" "${expected_app_role}" "${state_file}" || return 1
+  run_helper DEPLOY_ADMIN_DATABASE_URL="${DEPLOY_ADMIN_DATABASE_URL}" node "${helper}" --fence --state-file="${state_file}" --state-owner="$(id -u)" "${identity_argv[@]}"
+}
+release_the_fence() {
+  run_helper DEPLOY_ADMIN_DATABASE_URL="${DEPLOY_ADMIN_DATABASE_URL}" node "${helper}" --release --state-file="${state_file}" --state-owner="$(id -u)" "${identity_argv[@]}" || return 1
+  # Root removes the record, after the release is verified and never before: see
+  # db_fence_clear_authority() in lib/db-fence-protected.sh for why that order and not the other.
+  rm -f "${state_file}" 2>/dev/null || true
+  if [[ -e "${state_file}" ]]; then
+    echo "The fence was released and ${state_file} could not be removed. The next cutover reads that file as a STANDING FENCE. Remove it by hand." >&2
+    return 1
+  fi
+  return 0
 }
 WRAPPER_EOF
-      printf 'run_helper DEPLOY_ADMIN_DATABASE_URL="${DEPLOY_ADMIN_DATABASE_URL}" node "${helper}" --%s --state-file="${state_file}"%s\n' \
-        "${mode}" "${identity}"
+      printf '%s\n' 'if [[ "${mode}" == "fence" ]]; then raise_the_fence; else release_the_fence; fi'
     } | _fence_publish_file "${target}" 700 || return 1
     chown root:root "${target}" 2>/dev/null || true
   done
