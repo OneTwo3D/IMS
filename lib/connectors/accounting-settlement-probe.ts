@@ -264,6 +264,20 @@ function shortBy(stated: Decimal, accounted: Decimal, currency: string | null): 
 }
 
 /**
+ * o3d-zo4j — THE OTHER DIRECTION OF THE SAME COMPARISON, ON THE SAME BAND.
+ *
+ * `shortBy` asks whether the certifying figure is bigger than the collection it certifies; this asks
+ * whether the COLLECTION is bigger than the figure. It is literally `shortBy` with the operands
+ * swapped, and it is written that way ON PURPOSE: the band is `completenessBand` because it is the
+ * SAME comparison, and reusing the function is the only spelling that cannot drift from it. An excess
+ * WITHIN the band is two exact decimals agreeing to the document's own minor unit — noise, which is
+ * the whole reason the shortfall direction is not a bare `<` either.
+ */
+function exceeds(accounted: Decimal, stated: Decimal, currency: string | null): boolean {
+  return shortBy(accounted, stated, currency)
+}
+
+/**
  * o3d-nk5n — AN EMPTY RECORD LIST IS A POSITIVE CLAIM ABOUT MONEY, SO IT NEEDS A FIGURE BEHIND IT.
  *
  * THE RULE, IN ONE PLACE, FOR BOTH CONNECTORS AND ALL THREE DOCUMENT ARMS.
@@ -307,6 +321,36 @@ function shortBy(stated: Decimal, accounted: Decimal, currency: string | null): 
  * is reached. What is left here is ABSENCE, which correctly skips arithmetic it cannot do and must
  * not also be allowed to contribute a conclusion.
  *
+ * o3d-zo4j — AND THE FIGURE IS NOT PROOF OF A COLLECTION THAT CONTRADICTS IT.
+ *
+ * THE DEFECT. `provedComplete` was `settled !== null`: the figure being STATED was taken as the
+ * figure being BORNE OUT. Every check above it rejects a SHORTFALL — the collection explaining less
+ * than the figure — and that is one of the two ways a collection can fail to agree with the figure
+ * certifying it. The other is an EXCESS, and it went unmeasured, so a response could state a figure
+ * its own collection refutes and still have that figure believed. Codex's shape and the one filed on
+ * this issue are the same: a credit note stating `Total 40 / RemainingCredit 40` — a PROVED ZERO,
+ * `statesAnything` false, the shortfall check passing over nothing — whose `Allocations` show 40
+ * already used. The note says none of the credit has been applied and simultaneously shows all of it
+ * applied. The zero was believed, an allocation to some OTHER invoice left this bill's filtered record
+ * list empty, and `classifyLedgerSettlement` read that as `clear` — which authorises a second
+ * allocation of a credit that is already spent.
+ *
+ * WHY IT WITHHOLDS RATHER THAN REFUSES, WHICH IS THE WHOLE SHAPE OF THE FIX. Refusing would require
+ * knowing whether THIS excess is legitimate — is a listed-but-reversed payment, or a draft credit
+ * note, a real overrun? — and that is a question about live ledger shapes nobody here has settled. It
+ * does not have to be answered. A collection that exceeds the figure certifying it has CONTRADICTED
+ * that figure whatever the reason, and the only thing this code needs from that is to stop treating
+ * the figure as PROOF. So `provedComplete` becomes false and nothing else changes: the effect is
+ * confined to `clear` -> `unknown` on a NON-match, a match still yields `present` through the passes
+ * that run before the classifier's terminal gate, and a shortfall still escalates to `ok: false`
+ * exactly as it does today. The ordinary first payment — `Total 40, AmountDue 40, Payments: []`,
+ * `TotalAmt "1200.00"` with `Balance "1200.00"` — has an excess of exactly zero and still posts.
+ *
+ * THE BAND IS THE SHORTFALL'S BAND, not a bare `>`. See `exceeds`, which IS `shortBy` with its
+ * operands swapped so that the two directions cannot come to be measured differently. Both operands
+ * are exact decimals read from what the ledger stated, so a real document agrees to its own minor
+ * unit and only a genuine overrun clears the band.
+ *
  * WHY IT IS ONE FUNCTION THAT BUILDS THE WHOLE ANSWER. `emptyAnswerIsUnproved` was a PREDICATE each
  * arm called before its own `return { ok: true, records }`, so the two halves of the rule — refuse
  * the figureless empty answer, and mark the figureless non-empty one unproved — could be applied in
@@ -318,12 +362,20 @@ function settlementAnswer(
   /** The ledger's OWN account of how much has come off this document, or null when it stated too
    * little to compute one. This is the sole evidence of completeness — never the records. */
   settled: Decimal | null,
+  /**
+   * o3d-zo4j — AND WHETHER THE COLLECTION THAT FIGURE CERTIFIES CONTRADICTS IT BY EXCEEDING IT.
+   *
+   * Required rather than optional, and for the same reason `provedComplete` is: a permissive DEFAULT
+   * reached by an arm that forgot to compute it is how every fail-open in this module arrived. An arm
+   * that does not say whether its collection overran does not compile.
+   */
+  collectionExceedsFigure: boolean,
   records: LedgerSettlementRecord[],
   /** What to say when the document states no figure AND this probe read no settlement of it. */
   figurelessAndEmpty: string,
 ): LedgerSettlementProbe {
   if (settled === null && records.length === 0) return { ok: false, reason: figurelessAndEmpty }
-  return { ok: true, records, provedComplete: settled !== null }
+  return { ok: true, records, provedComplete: settled !== null && !collectionExceedsFigure }
 }
 
 /** Sum exact readings, or null the moment one of them is unreadable. */
@@ -550,7 +602,15 @@ export async function probeXeroSettlement(
     // fact used for a different conclusion. When it is stated, the shortfall check above has measured
     // the collection against a figure outside it; when it is null, the allocations went unmeasured,
     // and a non-matching allocation must not be allowed to say this credit was never applied to us.
-    return settlementAnswer(applied, records,
+    // o3d-zo4j — PAIR 1 OF 4, AND IT IS AN IDENTITY. `RemainingCredit = Total - SUM(Allocations)` is
+    // Xero's own construction of the field, so `applied` and `allocated` are ONE quantity written two
+    // ways. The shortfall check above already reads them that way; measuring the other direction adds
+    // no assumption it does not already make. An excess means the note's `RemainingCredit` and its own
+    // allocation list cannot both be true, and there is no shape of a live Xero credit note in which
+    // they legitimately differ — a deleted allocation LEAVES the collection rather than staying in it
+    // with a reversing sign, and a reversing sign would push this into the shortfall direction anyway.
+    const overAllocated = applied !== null && allocated !== null && exceeds(allocated, applied, noteCurrency)
+    return settlementAnswer(applied, overAllocated, records,
       'Xero states no total or remaining credit on this credit note and IMS read no allocation '
       + 'of it to this bill, so it has nothing to tell from — an empty answer here would say that '
       + 'none of the credit has been allocated rather than report what has')
@@ -653,6 +713,15 @@ export async function probeXeroSettlement(
         + `${records.length === 0 ? 'no payments' : `payments totalling ${formatLedgerMoney(seen)}`}`,
     }
   }
+  // o3d-zo4j — PAIR 2 OF 4, AND IT IS THE OTHER IDENTITY. `AmountPaid` is Xero's own total of THIS
+  // collection — the comment above says so, and the shortfall check is built on it — so the two are
+  // one quantity and an excess is the collection refuting the total that summarises it.
+  //
+  // IT NEEDS ITS OWN MEASUREMENT rather than being left to pair 3, which straddles it. `AmountPaid 10`
+  // with `Payments` totalling 30, `AmountCredited 20` and an unsent `CreditNotes` collection makes
+  // `settled` 30 and `explained` 30: pair 3 agrees exactly while the payment list overruns the
+  // payment total by 20. One pair per identity, or an excess hides inside a matching sum.
+  const paymentsExceedTotal = amountPaid !== null && seen !== null && exceeds(seen, amountPaid, invoiceCurrency)
 
   // THE SHAPE-INDEPENDENT SETTLEMENT ACCOUNTING (Codex round 6, finding 3) — the same arithmetic
   // the QuickBooks probe already does, for the same reason, because `AmountPaid` is not the whole
@@ -781,7 +850,21 @@ export async function probeXeroSettlement(
   // o3d-obyd r31: and the SECOND thing `settled` decides here is whether the `Payments` list is
   // proved whole. It is the identical fact — a stated figure the collection was measured against —
   // spent on the other half of Codex's asymmetry, so both leave through one function.
-  return settlementAnswer(settled, records,
+  // o3d-zo4j — PAIR 3 OF 4, AND IT IS THE COMPOSED IDENTITY. `settled` is `Total - AmountDue`, which
+  // is `AmountPaid + AmountCredited` by Xero's own definition; `explained` is `SUM(Payments) +
+  // SUM(applied credit notes, prepayments, overpayments)`, and those two sums are what `AmountPaid`
+  // and `AmountCredited` respectively total. So the pair is one quantity again, by two of Xero's
+  // identities composed rather than one.
+  //
+  // THE ONE PAIR WHERE AN EXCESS COULD CONCEIVABLY BE INNOCENT, stated rather than glossed: it
+  // requires a settlement to be reported in BOTH `Payments` and one of the applied collections, and
+  // nothing observed says Xero does that. If it ever did, the cost is bounded to exactly what this
+  // rule spends — a non-matching probe holds visibly instead of clearing, a matching one is still
+  // `present`, and no money post is refused outright — which is why the rule withholds proof rather
+  // than refusing the probe. The reverse mistake is a second payment.
+  const settlementsExceedFigure = settled !== null && explained !== null
+    && exceeds(explained, settled, invoiceCurrency)
+  return settlementAnswer(settled, paymentsExceedTotal || settlementsExceedFigure, records,
     'Xero states no total, amount due, amount paid or amount credited on this document and IMS '
     + 'read no payment against it, so it has nothing to tell from — an empty answer here would say '
     + 'that nothing has settled the document rather than report what does')
@@ -1132,7 +1215,22 @@ export async function probeQuickBooksSettlement(
           : links.length === 0 ? ' and links no transaction that accounts for it' : ''),
     }
   }
-  return settlementAnswer(applied, records,
+  // o3d-zo4j — PAIR 4 OF 4, AND IT IS THE ONE THAT IS A BOUND RATHER THAN AN IDENTITY — WHICH IS WHY
+  // IT TAKES THE EXCESS RULE AND NOT THE MIRROR OF THE SHORTFALL ONE.
+  //
+  // `TotalAmt - Balance` counts money off this document by ANY means, including the vendor credits,
+  // deposits and journals this probe does not read; `explained` counts only the payment lines it did.
+  // So the honest relation is `explained <= applied`, not equality — that inequality is exactly why
+  // the shortfall check above is a real check and not a tautology. It also makes an EXCESS a
+  // contradiction outright: every payment line linked to this document reduces its `Balance` by the
+  // amount of that line, so the read payments can never account for MORE than the document says has
+  // come off it. A voided QuickBooks payment states a zero line and an unapplied one is not linked,
+  // so neither reaches this sum; the one shape that could produce an excess innocently is a payment
+  // AMENDED between the document read and the payment read, and a picture assembled across an edit is
+  // not one to certify a collection from either.
+  const paymentsExceedApplied = applied !== null && explained !== null
+    && exceeds(explained, applied, documentCurrency)
+  return settlementAnswer(applied, paymentsExceedApplied, records,
     `QuickBooks states no total or balance on this ${documentKey.toLowerCase()} and IMS read no `
     + 'settlement against it, so it has nothing to tell from — an empty answer here would say '
     + 'that nothing has settled the document rather than report what does')
@@ -1516,10 +1614,30 @@ export async function authoriseMoneyPost(
       // nothing could ever show it working, and a check nobody can break reads as protection while
       // being decoration. r31 wrote it, could not kill it with a mutant, and removed it again.
       //
-      // WHAT CARRIES THE PREMISE INSTEAD IS A TEST, not a comment: `settlement-probe-string-amounts`
-      // pins the invariant this gate depends on — across all three arms, `ok && !provedComplete`
-      // implies a non-empty record list — so if a future arm ever answers an unproved EMPTY probe,
-      // that test fails and names this gate as what it breaks.
+      // o3d-zo4j — AND THE FUTURE ARM ARRIVED, SO THE GUARD IS BACK AND IT HAS INPUTS.
+      //
+      // r31's premise was that `settlementAnswer` refuses the ONLY unproved shape there was — no
+      // settled figure AND no record — so `ok && !provedComplete` implied `records.length > 0`. This
+      // round adds a SECOND way to be unproved: a collection that EXCEEDS the figure certifying it.
+      // That one is reached with the figure stated, so nothing refuses it, and it can carry an EMPTY
+      // record list — a credit note whose allocations all belong to OTHER invoices contradicts its own
+      // `RemainingCredit` while this bill's filtered list has nothing in it. The length test would then
+      // read that empty list as "nothing here could be confused with this attempt" and POST, on a
+      // collection the probe has just said is not to be trusted as whole.
+      //
+      // So it is its own arm rather than a widened condition: the sentence below counts settlements,
+      // and this shape has none to count. It is falsifiable — delete it and the credit-note excess
+      // authorises the post.
+      if (probe.ok && !probe.provedComplete && probe.records.length === 0) {
+        return {
+          proceed: false,
+          error: 'Not sent: this entry does not record the amount its attempt would send, and the '
+            + 'accounting connector contradicted its own account of what has settled this document, '
+            + 'so what it returned is not proof of what it holds. An empty list from a reading like '
+            + 'that is not evidence there is nothing here, and sending could pay it twice. Resolve '
+            + 'this entry by hand.',
+        }
+      }
       if (!probe.ok || probe.records.length > 0) {
         return {
           proceed: false,

@@ -119,6 +119,18 @@ export type LedgerSettlementProbe =
        * collection is measured against a figure OUTSIDE it. When the figure is absent, nothing
        * measured the list at all, and a non-match is `unknown` — see `classifyLedgerSettlement`.
        *
+       * o3d-zo4j — AND A FIGURE THE COLLECTION CONTRADICTS PROVES NOTHING EITHER. The paragraph above
+       * says "when that figure is stated, the cross-check has run", and the cross-check ran in ONE
+       * direction: it rejects a collection that explains LESS than the figure. A collection that
+       * explains MORE was not rejected and was not even looked at, so a response could state a figure
+       * its own collection refutes — a Xero credit note reading `Total 40 / RemainingCredit 40`, a
+       * proved zero, whose `Allocations` show 40 already used — and have that figure believed. The
+       * probe now measures both directions against the same band, and an excess makes this false. It
+       * does not make the probe REFUSE: whether a particular excess is legitimate is a question about
+       * live ledger shapes, and it does not have to be answered to stop treating a contradicted figure
+       * as proof. So the cost is confined to this field's own effect — a NON-match becomes `unknown`
+       * instead of `clear`, while a match is still `present` and a shortfall still refuses outright.
+       *
        * REQUIRED, NOT OPTIONAL, AND THAT IS DELIBERATE. Every fail-open this module has been through
        * arrived as a permissive DEFAULT reached by a response shape nobody enumerated. A probe arm
        * that does not state whether its collection is proved does not compile.
@@ -182,7 +194,9 @@ export type AttemptDescription = {
  *  - `attempt-undescribable` OUR row does not record what its attempt sent.
  *  - `collection-unproved`   the connector answered, every record it sent was measured, and none is
  *                            this attempt — but nothing established that the list is the whole
- *                            collection, so "not among these" is not "not in the ledger".
+ *                            collection, so "not among these" is not "not in the ledger". Either the
+ *                            document stated no figure to measure the list against, or it stated one
+ *                            the list CONTRADICTS by exceeding it (o3d-zo4j).
  *                            See `LedgerSettlementProbe.provedComplete`.
  */
 export type SettlementUnknownCause =
@@ -649,6 +663,10 @@ export function classifyLedgerSettlement(
   // it, "not among these" is not "not in the ledger", and `clear` is what authorises a second
   // payment.
   //
+  // o3d-zo4j: and `provedComplete` is now false for TWO shapes rather than one — a document that
+  // stated no settled figure, and one whose collection EXCEEDS the figure it did state. Both are the
+  // same fact about this gate: nothing outside the list has vouched for the list.
+  //
   // WHAT THIS COSTS, STATED. A response that omits the document totals but returns settlements can no
   // longer clear a row automatically; it holds visibly and a human resolves it. It costs the ordinary
   // first payment NOTHING — an unsettled document states its totals, so `provedComplete` is true and
@@ -658,9 +676,11 @@ export function classifyLedgerSettlement(
     return {
       outcome: 'unknown',
       cause: 'collection-unproved',
-      reason: 'the accounting connector returned settlements against this document but stated no total '
-        + 'of what has settled it, so IMS cannot tell whether it was sent all of them — none of the '
-        + 'ones it did read is this attempt, which is not the same as this attempt not being there',
+      reason: 'the accounting connector did not establish that what it returned against this document '
+        + 'is all of it — it either stated no total of what has settled the document or returned '
+        + 'settlements exceeding the total it did state, so IMS cannot tell whether it was sent all of '
+        + 'them. None of the ones it did read is this attempt, which is not the same as this attempt '
+        + 'not being there',
     }
   }
   return { outcome: 'clear' }
