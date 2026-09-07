@@ -3318,6 +3318,72 @@ file as one.
 Never run two versions of IMS against the same database at once — no rolling restart, no
 blue/green overlap, no second instance left running on another port.
 
+### The connection witness, and what binds the migration to the fenced server
+
+A fence, a migration and a release are **four or more separate connections**, opened minutes apart
+from the same connection string. A DNS change, a proxy, a failover or a pooler can re-point that
+string between any two of them, and every check the fence makes — host, port, database name, role,
+the cluster fingerprint, even the fenced ACL itself on a physical copy — is satisfied on both
+servers at once. So since o3d-secops r31 the cutover holds a **connection witness**: a session
+opened before the first `REVOKE`, on *another database of the same cluster* (`postgres`, else
+`template1`, so the drain cannot reach it), holding a session-scoped advisory lock on a nonce
+generated seconds earlier. An advisory lock lives in one instance's shared memory: no snapshot,
+base backup or restored image carries it, and no other server can answer for it.
+
+Three questions are asked of it, each **on the asking process's own connection**:
+
+| when | what is asked | what a "no" costs |
+| --- | --- | --- |
+| `--fence` | can this backend, one statement from issuing the `REVOKE`s, see the lock? | nothing. The fence goes up; the run loses only the **automatic removal** of its own fence record. |
+| `--bind-migration`, before any DDL | can a connection opened with the **migration's own URL** see it, and did that URL's stamp survive? | the cutover **refuses**. Nothing has been migrated and the schema is untouched. |
+| `--bind-migration --hold-stamp`, after the last consumer | the same, plus: can the witness's sampler **see** this connection? | the cutover **refuses** before the new build starts. The fence is held and its record kept. |
+| `--release` | can the backend that just granted see a lock taken *at release time*? | the fence is still released; the **record is kept** for a person to end with the release wrapper. |
+
+**How the migration's own connections are stamped.** `--print-migration-url` composes
+`application_name=ims-migration-<nonce>` into the migration URL beside the existing
+`options=-c role=<app role>`, so every consumer of `MIGRATION_DATABASE_URL` carries it — `prisma
+migrate deploy`, `scripts/check-prisma-drift.mjs`, `pg_dump`, `scripts/check-app-db-object-access.mjs`
+and `scripts/run-migration-verifications.mjs`. It is a **connection parameter and not a third `-c`**:
+measured on PostgreSQL 17.11, libpq applies the GUCs in `options` *before* the startup packet's
+`application_name` (or the client's own `fallback_application_name`), so `options=-c
+application_name=…` is silently overridden and would have shipped a binding that never binds.
+PostgreSQL truncates `application_name` at 63 bytes; the composer **refuses** to emit a stamp that
+would be truncated, because a truncated stamp reads as *absent* and absent reads as a redirect.
+
+**What the witness's sampler is, and is not.** While the window is open the witness polls
+`pg_stat_activity` (cluster-wide, so it sees the fenced database from outside it) for that exact
+stamp and accumulates the distinct backends it saw. That is *evidence about the migration's own
+connections* — but it is **not** what the refusal rests on, and deliberately: measured, a warm
+`prisma migrate status` connects, reads and disconnects inside about 40 ms, and polling cannot
+promise to observe a connection somebody else opens and closes. A gate that refused on a missed
+sample would refuse ordinary cutovers. So the refusal rests on the `--hold-stamp` probe, whose
+lifetime the cutover controls; the sampler's count of the *migration's* own backends is reported,
+and when it is zero the run says so and **keeps the fence record** for a person, without failing.
+
+**What an operator sees when the nonce cannot be seen.** A redirect and a lost witness are not
+distinguishable, and the message says so. Before any DDL the run stops with `THE MIGRATION WOULD
+NOT HAVE LANDED ON THE SERVER THIS RUN FENCED … NOTHING HAS BEEN MIGRATED`. After the migration it
+stops with `THE MIGRATION WINDOW DID NOT CLOSE ON THE SERVER THIS RUN FENCED … THE SCHEMA MAY HAVE
+MOVED`, the new build is not started, the fence stays up and its record is kept: find out which
+server `/etc/ims-cutover-state/db-fence/db-connect-fence.json` names and which one the migration
+reached before releasing anything.
+
+**A host that can hold no witness is not refused.** A transaction-mode pooler that gives out no
+stable backend, a cluster with neither `postgres` nor `template1`, an idle-session timeout: all of
+these read as *no witness*, the fence still goes up, the migration still runs, and the only cost is
+that the fence record is kept at the end of the run for you to end. Refusing every such deploy
+would trade one finding for an outage.
+
+**The verdicts are machine lines, and they are read as machine lines.** Everything an operator
+reads from `scripts/fence-db-connections.mjs` is on **stderr**; stdout carries only the structured
+lines root parses, and the script replaces `console.log` at start-up so a newly added line cannot
+reach that channel. Each verdict is a whole line carrying the run's own nonce
+(`RELEASE_WITNESS <nonce> colocated`), the shell matches the whole line rather than a substring, a
+stream that answers the same nonce twice is refused, and a verdict is consulted **only where the
+challenge was actually issued** — so the absence of the exchange can never read as success. Before
+r32 the verdict was a substring of a stream that also carried `Connection fence released: CONNECT
+restored to <roles> on <database>.`, and a database or role name containing the token forged it.
+
 ### Post-migration verification: `verify.sql`
 
 A migration can declare checks that must pass **after the schema has moved and before the new
