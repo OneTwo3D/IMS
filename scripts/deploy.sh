@@ -2098,18 +2098,85 @@ fence_marker_is_trustworthy() {
 # the authoritative one and the other is debris this run clears. The alternative — dying — would
 # strand the ordinary retry loop, because a cutover that adopts and fails again leaves exactly this
 # state. It is said out loud rather than passed over in silence.
+# AND THE SOURCE IS PINNED BEFORE A BYTE OF IT IS BELIEVED (o3d-secops r21, Codex HIGH).
+#
+# r20 moved the marker OUT of ${CUTOVER_STATE_DIR} and then had this function reach back into it BY
+# NAME: `[[ -f ]]`, which FOLLOWS A SYMLINK and asks nothing about who wrote what it found, and then
+# a redirection that resolves the same name a SECOND time, as root, straight into the privileged
+# publisher. So the account the fence exists to stop could leave a marker of its own at that name —
+# or a link to any file root can read — and the relocation would launder it into root-owned state at
+# ${FENCE_FILE}, where every destination check (regular file, owned by this run, 0600, private
+# parent) passes BECAUSE THE PUBLICATION MADE THEM PASS. Validating the copy proves the copy is
+# well-formed. It says nothing about where the bytes came from.
+#
+# The source's PARENT cannot be part of the answer here, which is what makes this different from
+# fence_marker_is_trustworthy(): the legacy path is inside the service account's own directory by
+# definition — that is why the marker was moved — so nothing about that directory is ever
+# reassuring. What is left is the file itself, and the only trustworthy way to ask about the file
+# itself is to HOLD it. scripts/lib/pin-source-file.mjs opens the name ONCE with `O_NOFOLLOW`,
+# judges the DESCRIPTOR (regular file, owned by this run's uid, not group- or other-writable, and
+# exactly one link), proves the descriptor is that name's own inode, and copies the bytes from the
+# descriptor. Same move as chown-tree.mjs, applied to a source instead of a destination: open once,
+# judge the descriptor, read the descriptor — never the name twice.
+#
+# AND A REFUSAL ENDS THE RUN. It is tempting to skip the relocation and carry on, and it is the one
+# answer that cannot be given: an entry at ${LEGACY_STATE_DIR_FENCE_FILE} is what an already
+# installed drop-in's `AssertPathExists=!` asserts on, so WHILE IT IS THERE THIS HOST IS FENCED,
+# whoever put it there. Carrying on would re-point the drop-in at a ${FENCE_FILE} that does not
+# exist and then clear the old entry once that was "verified" — releasing, in silence, a fence that
+# may be standing over a half-migrated schema. Deleting the entry instead does the same thing and
+# destroys the only evidence. So the run stops, having stopped nothing, changed nothing and named no
+# new drop-in: the host keeps exactly the fence it had, and a human decides what the entry is.
 import_relocated_fence_marker() {
+  local helper self staged rc=0
   [[ -n "${LEGACY_STATE_DIR_FENCE_FILE:-}" ]] || return 0
   [[ "${LEGACY_STATE_DIR_FENCE_FILE}" != "${FENCE_FILE}" ]] || return 0
-  [[ -f "${LEGACY_STATE_DIR_FENCE_FILE}" ]] || return 0
+  # THE ONLY QUESTION THE NAME IS ASKED, and it decides just one thing: whether to LOOK. `-e` on its
+  # own answers "no" for a DANGLING symlink — an entry that IS there, that `AssertPathExists=!`
+  # still refuses a boot over, and that this run must judge rather than walk past — so `-L` is asked
+  # beside it. Every accept and every refusal below is made on a descriptor.
+  [[ -e "${LEGACY_STATE_DIR_FENCE_FILE}" || -L "${LEGACY_STATE_DIR_FENCE_FILE}" ]] || return 0
   if [[ -e "${FENCE_FILE}" ]]; then
     warn "A cutover marker is present at BOTH ${LEGACY_STATE_DIR_FENCE_FILE} and ${FENCE_FILE}."
     warn "The one under $(dirname "${FENCE_FILE}") is the authoritative one and is what this run adopts; the other is cleared once the reboot fence names it."
     return 0
   fi
+  # AND THEIR STATUS IS TAKEN, as in fence_marker_is_trustworthy() and for the same reason: every
+  # caller reaches this through an `|| return`, so errexit is SUSPENDED here and a substitution that
+  # failed silently would hand an empty uid to the check that decides whether a privileged run wrote
+  # these bytes.
+  self="$(id -u)" || die "This run could not read its own uid, so it cannot say whether the cutover marker at ${LEGACY_STATE_DIR_FENCE_FILE} is a record a privileged run wrote. Nothing has been stopped and nothing has been migrated."
+  # WHERE THE HELPER LIVES: THIS SCRIPT'S OWN lib directory, resolved from BASH_SOURCE at startup —
+  # the release being run, not ${APP_DIR}. Same rule as db-fence-protected.sh, pg-auth-request.mjs
+  # and chown-tree.mjs. The override exists for the regressions, which run the shipped functions
+  # outside the shipped file and so have no BASH_SOURCE to resolve from; pointing it somewhere else
+  # produces a different program, not an exemption.
+  helper="${IMS_FENCE_SOURCE_HELPER:-${IMS_SCRIPT_LIB_DIR:-}/pin-source-file.mjs}"
+  [[ -f "${helper}" ]] || die "${helper} is missing, so this run cannot read the cutover marker at ${LEGACY_STATE_DIR_FENCE_FILE} without resolving a pathname ${APP_USER} can replace between the check and the read. It will not do that. Restore the checkout and run again; nothing has been stopped and nothing has been migrated."
+  # A HOST WITH A MARKER TO RELOCATE HAS HAD THIS APPLICATION INSTALLED ON IT, so it has node. One
+  # that somehow does not gets a refusal rather than a fallback to reading the name twice.
+  command -v node >/dev/null 2>&1 || die "node is not on PATH, so this run cannot pin the cutover marker at ${LEGACY_STATE_DIR_FENCE_FILE} to a descriptor before reading it, and it will not read that name twice instead. Nothing has been stopped and nothing has been migrated."
   ensure_fence_marker_dir || die "Could not create $(dirname "${FENCE_FILE}") owned by this run and private to it, so the cutover marker cannot be moved out of a directory ${APP_USER} can unlink it from. Nothing has been stopped."
-  publish_durable_file "${FENCE_FILE}" < "${LEGACY_STATE_DIR_FENCE_FILE}" || die \
-    "The cutover marker at ${LEGACY_STATE_DIR_FENCE_FILE} could not be published durably at ${FENCE_FILE}, so this run cannot adopt the fence a previous run left standing. Nothing has been stopped and nothing has been migrated."
+  # THE ONE HOP THAT IS STILL A PATHNAME, AND IT IS INSIDE THE BOUNDARY. publish_durable_file() takes
+  # its content on stdin, so the descriptor's bytes have to land somewhere first. They land in the
+  # marker's OWN directory — the root-owned 0700 one ensure_fence_marker_dir() just proved, and
+  # refused to create over a symlink — so this name is one only this run can write. The untrusted
+  # boundary was crossed exactly once, on a descriptor, above.
+  staged="$(mktemp "$(dirname "${FENCE_FILE}")/.legacy-marker.XXXXXX" 2>/dev/null)" || die "Could not stage the cutover marker inside $(dirname "${FENCE_FILE}"), so this run cannot adopt the fence a previous run left standing. Nothing has been stopped and nothing has been migrated."
+  node "${helper}" "${LEGACY_STATE_DIR_FENCE_FILE}" "${self}" > "${staged}" || rc=$?
+  # EXIT 2 IS "IT WENT AWAY", not "it was refused": the entry was there when the gate above looked
+  # and gone by the time the helper opened it. Nothing to relocate, and nothing to complain about.
+  if [[ "${rc}" -eq 2 ]]; then
+    rm -f "${staged}"
+    return 0
+  fi
+  if [[ "${rc}" -ne 0 ]]; then
+    rm -f "${staged}"
+    die "The entry at ${LEGACY_STATE_DIR_FENCE_FILE} is not a cutover marker this run may believe — the reason is printed above — and it sits in ${APP_USER}'s own data directory, where that account can create and replace names at will. NOTHING HAS BEEN STOPPED, nothing has been migrated, and no unit, drop-in or crontab has been touched, so this host is exactly as fenced as it was a moment ago. THE ENTRY HAS BEEN LEFT WHERE IT IS, DELIBERATELY: a reboot fence installed by an earlier checkout asserts on THAT NAME, so removing it may release a fence standing over a half-migrated schema. Do not delete it blind. Ask systemd what is actually asserted (systemctl show -p DropInPaths on the application's unit, then read the drop-in it names), decide from that whether a privileged run really was interrupted, and only then clear the entry by hand and re-run."
+  fi
+  publish_durable_file "${FENCE_FILE}" < "${staged}" || { rm -f "${staged}"; die \
+    "The cutover marker at ${LEGACY_STATE_DIR_FENCE_FILE} could not be published durably at ${FENCE_FILE}, so this run cannot adopt the fence a previous run left standing. Nothing has been stopped and nothing has been migrated."; }
+  rm -f "${staged}"
   warn "Moved the cutover marker out of the application's own data directory, where ${APP_USER} could have unlinked it:"
   warn "  ${LEGACY_STATE_DIR_FENCE_FILE} -> ${FENCE_FILE}"
   warn "The old marker stays where it is, and the installed drop-in still names it, until the reboot fence has been re-pointed — so this host is fenced throughout."

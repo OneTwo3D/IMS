@@ -1271,6 +1271,37 @@ between leaves both, which is the safe direction — whichever drop-in is loaded
 on is there — and the next run says so and adopts the one under `/etc`. Lifting the fence removes
 both. **Nothing is silently released:** there is no state in which the marker stops being seen.
 
+**And the marker at the old path is read through a descriptor, never through its name**
+(o3d-secops r21). Relocating it meant reaching back into the directory the relocation exists to
+escape, and the first version did that with `[[ -f ]]` — which *follows a symlink* and says nothing
+about who wrote what it found — followed by a redirection that resolved the same name a second
+time, as root, straight into the publisher. `imsapp` could therefore leave a marker of its own at
+`/var/lib/one-two-inventory/DEPLOY-FENCED`, or a link to any file root can read, and the relocation
+would have laundered it into root-owned state at `/etc/ims-cutover/DEPLOY-FENCED` — where every
+provenance check in the paragraph above passes, *because the publication is what made them pass*.
+Validating the copy proves the copy is well-formed; it says nothing about where the bytes came
+from. The source's parent cannot be part of the answer here, unlike the destination's: the old path
+is inside the service account's own directory by definition. So `scripts/lib/pin-source-file.mjs`
+opens that name **once** with `O_NOFOLLOW` (a symlink is `ELOOP`, refused by the kernel before this
+process holds anything) and `O_NONBLOCK` (a fifo at that name returns instead of parking the
+cutover for ever), then judges the **descriptor** — regular file, owned by the uid running the
+cutover, no group or other write bit, and exactly **one link**, because a hard link is the one way
+to make a root-owned inode appear at a name in a directory `imsapp` controls — proves the
+descriptor is that name's own inode, and copies the bytes from the descriptor. The name is never
+resolved twice. This is the same move `chown-tree.mjs` makes, applied to a *source* instead of a
+destination.
+
+**If that check refuses, the run stops and nothing is touched.** Skipping the relocation and
+carrying on is the one answer that cannot be given: while *anything* exists at the old path, an
+`AssertPathExists=!` installed by an earlier checkout is satisfied by it, so the host **is** fenced
+— whoever put it there. Carrying on would re-point the drop-in at a marker that does not exist and
+then clear the old entry once that was "verified", releasing in silence a fence that may be
+standing over a half-migrated schema; deleting the entry instead does the same thing and destroys
+the only evidence. So the entrypoint dies having stopped nothing, migrated nothing and named no new
+drop-in — the host keeps exactly the fence it had — and the message tells you to ask systemd what
+is actually asserted (`systemctl show -p DropInPaths` on the unit, then read the drop-in it names)
+before removing anything by hand.
+
 **An override has to be ANCHORED, and an unanchored one stops the run rather than being trusted.**
 Every path above is published by a walk that starts at a directory the scripts take on trust, so
 that directory's own name must be one the service user cannot replace. That is decided by walking
