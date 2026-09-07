@@ -347,9 +347,53 @@ export function decideInvoicePaymentRegistration(input: {
         // attempt's OWN recorded settlement is never excluded from its own match. Excluding that one
         // would skip the record that proves this attempt already posted, which is precisely the
         // `clear` this module exists to prevent.
+        //
+        // o3d-r948 r4 (Codex HIGH) — AND OUR OWN RECORD IS NOT ALWAYS EVIDENCE.
+        //
+        // The paragraph above is right about the LEDGER's half and stopped one step short on OURS.
+        // The id is immutable and the ledger cannot re-assign it, so a record carrying it was made
+        // by whoever really obtained it — but "that row obtained it" is a claim this table makes,
+        // and on an `OPERATOR_ASSERTION` row that claim is a human typing a document id into a form
+        // with no call made and no document read (see sync-row-settlement.ts, which defines the
+        // basis as exactly that). An asserted row can therefore name a payment it never created,
+        // and this is the one site on the branch where naming one REMOVES evidence rather than
+        // adding a refusal. So the chain of custody has to run back to CONNECTOR EVIDENCE, not
+        // merely to a row in our own table.
+        //
+        // THE REACHABLE SHAPE, and it is reachable precisely because every other gate lets it past.
+        // An asserted SYNCED row that names the RETIRED invoice and a DIFFERENT receipt is dropped
+        // by `retiredDocumentInvoicePaymentAttempts` (its `paymentId` is neither null nor this
+        // receipt's), dropped by the `live` document filter (it names another document) and so never
+        // reaches the LEDGER_AMOUNT_ASSERTED gate that reads that filter's output. The exclusion set
+        // was the only place it was still consulted — and there it did the one thing an unverified
+        // claim must never do: if the typed id happens to equal the id of the unresolved attempt's
+        // OWN unmeasurable settlement, the record proving that attempt posted is skipped, the verdict
+        // is `clear`, and the receipt registers a second payment.
+        //
+        // FILTERED THROUGH THE MODULE'S OWN PREDICATE, not a second spelling of it:
+        // `isOperatorAssertedSettlement` is the same reader `settlement-status.ts`, the delete guard
+        // and the capacity guard below already fail closed on, and reconciliation.ts already uses to
+        // deny an asserted row the standing of evidence.
+        //
+        // WHAT STILL COUNTS AS CONNECTOR-BACKED, deliberately, because narrowing this further would
+        // strand the receipts the exclusion exists to release:
+        //
+        //   • `CONNECTOR_CONFIRMED` (the NULL basis) — the processor's own writeback, made after the
+        //     ledger answered with the id. This is the ordinary case and the whole point.
+        //   • `OPERATOR_RELEASE` — the row's STATUS was reached by a human, but its DOCUMENT ID is
+        //     the connector's own: `describeCancelledSaleRelease` refuses an asserted row outright,
+        //     so that basis can only ever sit on connector-issued evidence. `isOperatorAssertedSettlement`
+        //     is FALSE for it by design, and using the predicate rather than "basis is not null" is
+        //     what preserves it. Folding it in would re-strand every released row's siblings.
+        //   • THE CONNECTOR ITSELF is already pinned upstream, not re-checked here.
+        //     `loadInvoicePaymentSyncRows` selects `where: { connector, type: 'INVOICE_PAYMENT', … }`,
+        //     so every row in `input.existing` was written for the same ledger the probe read — the
+        //     ids cannot come from another connector's namespace. There is no per-realm `provenance`
+        //     column to check beyond that: that work was tried and REVERTED (o3d-gt8r / o3d-s36z),
+        //     and the schema comment on `backReferenceEvidenceCompactedAt` records it.
         {
           settlementsOfOtherAttempts: input.existing
-            .filter((row) => row !== attempt)
+            .filter((row) => row !== attempt && !isOperatorAssertedSettlement(row.settlementBasis))
             .map((row) => row.externalTransactionId),
         },
       )

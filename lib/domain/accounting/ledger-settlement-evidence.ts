@@ -384,12 +384,28 @@ const money = formatLedgerMoney
  * created; excluding it would skip the one record that proves the post already happened, which is
  * the exact `clear` this whole module exists to prevent. Callers build the set by removing the
  * attempt under judgement from the rows they hold, by identity, not by any field.
+ *
+ * o3d-r948 r4 (Codex HIGH) — AND NEITHER MAY AN ID THIS SYSTEM ONLY ASSERTS.
+ *
+ * The paragraphs above establish that the LEDGER cannot re-assign an id, and stop one step short:
+ * the sentence "the rows for a document name the settlements those rows created" is a claim OUR
+ * table makes, and it is not evidence on every row. A row whose `settlementBasis` is
+ * `OPERATOR_ASSERTION` holds an id a human typed into a form — no call made, no document read (see
+ * lib/domain/accounting/sync-row-settlement.ts) — so it can name a payment it never created,
+ * including the one the attempt under judgement is being matched against.
+ *
+ * This option is the only input to this module that REMOVES evidence, so every id in it must trace
+ * back to connector evidence and not merely to a row: a caller filters out
+ * `isOperatorAssertedSettlement(row.settlementBasis)` as well as the attempt itself. `OPERATOR_RELEASE`
+ * is NOT filtered — that basis records an operator-reached STATUS over a connector-issued id, and
+ * the predicate is false for it by design.
  */
 export type LedgerSettlementOptions = {
   /**
    * Ledger settlement ids IMS has already recorded against attempts that are NOT the one being
-   * judged. Nulls and blanks are ignored, and the comparison is case-folded because a ledger GUID
-   * is returned in whatever case the connector feels like.
+   * judged, AND that the connector itself issued — never one an operator asserted. Nulls and blanks
+   * are ignored, and the comparison is case-folded because a ledger GUID is returned in whatever
+   * case the connector feels like.
    */
   settlementsOfOtherAttempts?: Iterable<string | null | undefined>
 }
