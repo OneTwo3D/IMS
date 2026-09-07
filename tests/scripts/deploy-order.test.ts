@@ -12679,16 +12679,19 @@ for (const entry of FENCE_HARNESS) {
   // -------------------------------------------------------------------------
   // o3d-secops r31 — THE WITNESS MAY COST THE AUTOMATION AND NOTHING ELSE.
   //
-  // This is the safety property the whole of HIGH 1's fix rests on, and it was NOT true when it was
-  // first written: db_fence_witness_stop() sent a `close` line down the co-process's pipe, the
-  // reader was already gone on the ordinary "no witness here" path, and bash does not ignore
-  // SIGPIPE — so a witness that could not start KILLED THE ENTRYPOINT with a signal. An existing
-  // r23 test caught it, failing with a null exit status. The stop path now closes the pipe instead
-  // of writing down it, and the one remaining write ignores PIPE across itself.
+  // This is the safety property the whole of HIGH 1's fix rests on: nothing about a witness may
+  // refuse a fence, fail a release, or stop a migration. A cluster with no second database, a
+  // pooler that hands out no stable backend, a helper too old to know the mode — each must cost the
+  // automatic removal of the record at the end of the run and NOTHING else.
   //
-  // MUTATION ROUTE (made against the shipped file and reverted): put
-  // `printf 'close\n' >&"${DB_FENCE_WITNESS[1]}"` back at the top of db_fence_witness_stop() and
-  // this run dies on a signal with 'REACHED THE MIGRATION' unprinted.
+  // MUTATION ROUTE (made against the shipped file and reverted): make the witness load-bearing in
+  // db_fence_raise() — `db_fence_witness_start ... || return 3` in place of the `if`, which is the
+  // shape somebody reaches for on being told the attestation matters — and this run refuses to
+  // fence at all, with 'REACHED THE MIGRATION' unprinted.
+  //
+  // (The SIGPIPE hazard the teardown ONCE had is guarded separately and deterministically at the
+  // end of this file: whether it fires here depends on when bash happens to reap the co-process,
+  // and a guard that rests on that is a guard that is green about nothing.)
   // -------------------------------------------------------------------------
   test(`${entry.name} fences and migrates normally when no witness can be held (o3d-secops r31)`, () => {
     const dir = mkdtempSync(join(tmpdir(), 'ims-r31nowitness-'))
@@ -12868,4 +12871,47 @@ test('[o3d-secops r31] taking the connection witness down leaves the shell able 
   assert.match(result.output, /^AFTER A SECOND TEARDOWN$/m,
     `nor may the second one, which every release performs:\n${result.output}`)
   assert.match(result.output, /^AND STDOUT TOO$/m, `and stdout must survive it as well:\n${result.output}`)
+})
+
+/**
+ * TAKING DOWN A WITNESS WHOSE READER HAS GONE MUST NOT KILL THE SHELL (o3d-secops r31).
+ *
+ * The companion to the stderr test above, and the other half of the same defect. The teardown used
+ * to send a `close` line down the co-process's pipe. On the ordinary "no witness here" path the
+ * reader is already gone, bash does NOT ignore SIGPIPE, and the write therefore killed the WHOLE
+ * ENTRYPOINT with a signal — mid-cutover, with a fence possibly standing. It is guarded here rather
+ * than through db_fence_raise() because there it fires only when bash has not yet reaped the
+ * co-process, and a guard that depends on that is a guard that is green about nothing.
+ *
+ * THE READER IS GONE WHILE THE FD IS STILL KNOWN, which is the state that makes it deterministic:
+ * the co-process closes its own stdin and stays alive, so ${DB_FENCE_WITNESS[1]} is still a real
+ * descriptor and the pipe behind it has no reader at all.
+ *
+ * MUTATION ROUTE (made against the shipped file and reverted): put
+ * `printf 'close\n' >&"${DB_FENCE_WITNESS[1]}" 2>/dev/null || true` back at the top of
+ * db_fence_witness_stop() and this run exits 141 with 'SURVIVED THE TEARDOWN' unprinted.
+ */
+test('[o3d-secops r31] taking down a witness whose reader has gone does not kill the shell', () => {
+  const FENCE_LIB = readFileSync(join(process.cwd(), 'scripts/lib/db-fence-protected.sh'), 'utf8')
+  const result = runShell([
+    'set -uo pipefail',
+    'exec 2>&1',
+    shellFunction(FENCE_LIB, 'db_fence_witness_nonce'),
+    shellFunction(FENCE_LIB, 'db_fence_witness_stop'),
+    'DB_FENCE_WITNESS_PID=""; DB_FENCE_WITNESS_NONCE=""; DB_FENCE_WITNESS_BOUND=0; DB_FENCE_WITNESS_CHALLENGE=""',
+    // ALIVE, WITH NO READER. `exec 0<&-` closes the co-process's own stdin; the sleep keeps the
+    // process (and so bash's record of its descriptors) in place while the teardown runs.
+    'coproc DB_FENCE_WITNESS { exec 0<&-; sleep 3; }',
+    'sleep 0.4',
+    'PRECONDITION="${DB_FENCE_WITNESS[1]:-none}"',
+    'echo "WRITE FD IS ${PRECONDITION}"',
+    'db_fence_witness_stop',
+    'echo "SURVIVED THE TEARDOWN"',
+  ].join('\n'))
+
+  assert.doesNotMatch(result.output, /^WRITE FD IS none$/m,
+    `precondition: the descriptor must still be known, or this exercises the easy case:\n${result.output}`)
+  assert.match(result.output, /^SURVIVED THE TEARDOWN$/m,
+    `taking down a witness whose reader has gone must not kill the cutover with a signal:\n${result.output}`)
+  assert.equal(result.status, 0, `and the shell must exit cleanly, not on SIGPIPE:\n${result.output}`)
 })
