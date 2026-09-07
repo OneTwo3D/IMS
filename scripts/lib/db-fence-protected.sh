@@ -1163,6 +1163,29 @@ db_fence_script_in_use() {
 #   3. `--fence`, as ${APP_USER}. EXECUTES the authority. It cannot write it, and an absent or
 #                                 unauthenticated record is a refusal rather than a fresh fence.
 #
+# AND ROOT STAMPS WHICH KIND OF FENCE THIS IS (o3d-secops r24, Codex HIGH). Step 2 records
+# `fence_mode` in the record it rebuilds: "initial" when nothing was at ${DB_FENCE_STATE} when it
+# looked, "recovery" when an authority was already there -- which can only mean a previous cutover
+# revoked and did not release, so its fence is still standing. Step 3 executes the two under
+# different rules: an INITIAL fence requires the live grantee list to match the record EXACTLY, in
+# both directions, because the record is supposed to BE the ACL `--plan` had just read; a RECOVERY
+# re-fence tolerates recorded grantees that no longer hold CONNECT, because the standing fence is
+# what took it from them, while still refusing any grantee that has APPEARED.
+#
+# THE FINDING THAT MADE IT NECESSARY. Step 3 compared the two lists in one direction only -- it
+# asked what had appeared -- so a role that LOST CONNECT between step 1 and step 3 left that
+# comparison empty and the stale record was accepted whole. `--release` then granted CONNECT to
+# every role the record named, including the one an administrator had just removed. Checking for
+# additions is not checking for equality, and the fix cannot be a bare equality either, because a
+# standing fence's own record can never satisfy one.
+#
+# WHY THE STAMP IS ROOT'S AND NOT THE PLAN'S. It is the difference between the two rules, so it is
+# the thing worth forging: a plan that could declare itself a recovery would buy the lax rule. It
+# is computed by the validator, in the process that does the rename, from the presence of a file in
+# a directory root owns and ${APP_USER} cannot write -- so that account can neither create a record
+# to obtain the tolerance nor unlink one to escape it -- and a `fence_mode` carried in the plan is
+# dropped by the template like every other field root does not compute for itself.
+#
 # WHAT IS LEFT ON THE APPLICATION SIDE: NOTHING. There is no request file, no progress note and no
 # app-writable directory in the cutover namespace any more -- the plan travels on a pipe, and
 # ${DB_FENCE_DIR} is root-owned. `--release` still READS the authority, and must, because the
@@ -1224,6 +1247,18 @@ for (var i = 0; i < plan.revoked.length; i++) {
 var acl = plan.datacl_before === undefined ? null : plan.datacl_before;
 if (acl !== null && !(typeof acl === "string" && acl.length <= 8192 && !CONTROL.test(acl))) fail("the recorded prior ACL is not a usable string");
 if (!(typeof plan.fenced_at === "string" && /^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}([.][0-9]{1,6})?Z$/.test(plan.fenced_at))) fail("the plan carries no usable timestamp");
+var directory = path.dirname(destination);
+var meta = null;
+try { meta = fs.lstatSync(directory); } catch (e) { fail(directory + " could not be examined (" + e.message + ")"); }
+if (!meta.isDirectory()) fail(directory + " is not a directory");
+if (meta.uid !== process.getuid()) fail(directory + " is owned by uid " + meta.uid + " and this run is uid " + process.getuid() + ", so what it publishes there could be replaced by somebody else");
+if ((meta.mode & 18) !== 0) fail(directory + " is writable by group or other, so any name in it can be renamed or unlinked by another account");
+var standing = true;
+try {
+  fs.lstatSync(destination);
+} catch (e) {
+  if (e && e.code === "ENOENT") { standing = false; } else { fail(destination + " could not be examined (" + e.message + ")"); }
+}
 var record = {
   database: plan.database,
   owner_role: plan.owner_role,
@@ -1232,14 +1267,9 @@ var record = {
   revoked: plan.revoked.slice(),
   datacl_before: acl,
   fenced_at: plan.fenced_at,
+  fence_mode: standing ? "recovery" : "initial",
   state_complete: 1
 };
-var directory = path.dirname(destination);
-var meta = null;
-try { meta = fs.lstatSync(directory); } catch (e) { fail(directory + " could not be examined (" + e.message + ")"); }
-if (!meta.isDirectory()) fail(directory + " is not a directory");
-if (meta.uid !== process.getuid()) fail(directory + " is owned by uid " + meta.uid + " and this run is uid " + process.getuid() + ", so what it publishes there could be replaced by somebody else");
-if ((meta.mode & 18) !== 0) fail(directory + " is writable by group or other, so any name in it can be renamed or unlinked by another account");
 var temporary = destination + ".authority." + process.pid + ".tmp";
 var fd = -1;
 try {
@@ -1264,7 +1294,7 @@ try {
   if (dirFd !== -1) { try { fs.closeSync(dirFd); } catch (ignored) { void ignored; } }
   fail("the authority is visible at " + destination + " and its NAME is not durable (" + e.message + "), so a power cut can restore the previous directory entry");
 }
-process.stderr.write("Connection-fence authority published at " + destination + ": CONNECT will be revoked from " + record.revoked.join(", ") + " on " + record.database + ".\n");
+process.stderr.write("Connection-fence authority published at " + destination + " (" + record.fence_mode + "): CONNECT will be revoked from " + record.revoked.join(", ") + " on " + record.database + ".\n");
 AUTHORISE_PLAN_EOF
 }
 

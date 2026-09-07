@@ -1219,6 +1219,90 @@ export function readAuthorityRecord(stateFile, expectedUid, stat = lstatSync) {
   return readState(stateFile)
 }
 
+// ---------------------------------------------------------------------------
+// TWO KINDS OF FENCE, WITH TWO DIFFERENT RULES (o3d-secops r24, Codex HIGH)
+//
+// THE FINDING. The executor compared the authority with the live ACL in ONE direction — it asked
+// whether a grantee had APPEARED — and read "nothing appeared" as "the authority still describes
+// the ACL". A role that LOSES CONNECT in the window between `--plan` and `--fence` produces
+// exactly that reading: the stale list is accepted, the REVOKE for the removed role is a no-op,
+// and `--release` later issues `GRANT CONNECT` to every role the record names, handing access back
+// to a role an administrator had deliberately taken it from. Checking for additions is not
+// checking for equality.
+//
+// AND WHY IT CANNOT SIMPLY BE MADE AN EQUALITY. The same executor serves two situations that want
+// opposite answers:
+//
+//   INITIAL   No fence is standing. Root published the authority out of a `--plan` that read the
+//             live ACL, so the record is SUPPOSED to be that ACL. Any difference at all, in either
+//             direction, means something moved underneath the plan, and the whole point of the
+//             plan/validate/execute split is that this process does not get to decide what to do
+//             about that. It refuses, and a re-run re-plans and re-publishes.
+//
+//   RECOVERY  A fence is ALREADY STANDING — a previous cutover revoked and did not release, and
+//             its record is still at the authoritative path. Then the recorded grantees have
+//             necessarily lost CONNECT, because that fence is what took it from them: `withdrawn`
+//             is not drift, it is the expected shape, and an equality rule here would make a
+//             standing fence impossible to re-apply. What must still hold is the other direction —
+//             nothing NEW may be revoked — so `appeared` stays fatal in both modes.
+//
+// WHO DECIDES WHICH. NOT THIS PROCESS AND NOT THE PLAN. `fence_mode` is stamped by ROOT, in the
+// validator, in the same process that renames the record into place, from a fact root can see and
+// the application account cannot forge: whether an authority was already present at the
+// destination. ${DB_FENCE_DIR} is root-owned and unwritable by anyone else, so that account can
+// neither create a record to obtain the lax rule nor remove one to obtain the strict rule. A
+// `fence_mode` carried IN the plan is dropped by the template like every other field root does not
+// compute for itself.
+//
+// WHAT RECOVERY ACCEPTS THAT INITIAL DOES NOT, SAID PLAINLY. On a recovery re-fence a grantee that
+// an administrator removed by hand is indistinguishable from one the standing fence removed — both
+// are simply absent from the ACL — so that role is re-granted on release. That residue is bounded
+// to hosts where a fence is already standing (an interrupted cutover), it is announced on stderr
+// when it happens, and the alternative is a standing fence that cannot be re-applied or released
+// at all. On an INITIAL fence, which is every ordinary deploy, update and install, there is no
+// residue: the sets must match exactly.
+
+/** No fence was standing when root published this authority: the record IS the live ACL. */
+export const FENCE_MODE_INITIAL = 'initial'
+/** A fence was already standing: its grantees have lost CONNECT to that fence, not to drift. */
+export const FENCE_MODE_RECOVERY = 'recovery'
+
+/**
+ * Which rule a record is executed under.
+ *
+ * AN UNSTAMPED RECORD IS TREATED AS RECOVERY, and that is a decision rather than an oversight. A
+ * record with no `fence_mode` was published by a validator that predates this round, which can
+ * only be a fence RAISED BEFORE THIS UPGRADE and therefore still standing; refusing it would
+ * strand that fence with neither a re-apply nor a release. It is not a hole an unprivileged
+ * account can reach through either: the field is absent only in records root itself wrote, in a
+ * directory nothing else may write, and every authority published from this round on carries it.
+ */
+export function authorityFenceMode(record) {
+  return record && record.fence_mode === FENCE_MODE_INITIAL ? FENCE_MODE_INITIAL : FENCE_MODE_RECOVERY
+}
+
+/**
+ * BOTH SET DIFFERENCES BETWEEN THE AUTHORITY AND THE LIVE ACL, and what each mode does with them.
+ *
+ * Pure, and separate from doFence(), so that the two rules can be read — and tested — as rules
+ * rather than inferred from the branches of a function that also opens transactions.
+ *
+ *   appeared   holds CONNECT now, not named by the authority. FATAL IN BOTH MODES: revoking it
+ *              would take CONNECT from a role no record restores.
+ *   withdrawn  named by the authority, holds no CONNECT now. FATAL ON AN INITIAL FENCE, where the
+ *              record is supposed to be the ACL; EXPECTED ON A RECOVERY, where the standing fence
+ *              is what removed them.
+ */
+export function assessAuthorityDrift({ authorised, current, mode }) {
+  const named = Array.isArray(authorised) ? authorised : []
+  const live = Array.isArray(current) ? current : []
+  const appeared = live.filter((grantee) => !named.includes(grantee))
+  const withdrawn = named.filter((grantee) => !live.includes(grantee))
+  const resolved = mode === FENCE_MODE_INITIAL ? FENCE_MODE_INITIAL : FENCE_MODE_RECOVERY
+  const accepted = appeared.length === 0 && (resolved === FENCE_MODE_RECOVERY || withdrawn.length === 0)
+  return { appeared, withdrawn, mode: resolved, accepted }
+}
+
 async function readFacts(client, appRole) {
   const { rows } = await client.query(
     `SELECT current_database()                                  AS database,
@@ -1625,17 +1709,51 @@ export async function doFence(client, options) {
     return EXIT_NOT_FENCEABLE
   }
 
-  // AND THE AUTHORITY MUST STILL COVER THE ACL. `--plan` computed the union of the recorded
-  // grantees and whatever held CONNECT then; if a grantee has appeared between that read and this
-  // one, revoking it would take CONNECT from a role no record restores. The old code appended to
-  // the record and carried on, which it could do because it was the record's author. This one is
-  // not, so it REFUSES and says what changed — a re-run re-plans and re-publishes.
-  const appeared = freshPlan.revoke.filter((grantee) => !existing.revoked.includes(grantee))
+  // AND THE AUTHORITY MUST STILL DESCRIBE THE ACL THIS RUN IS LOOKING AT.
+  //
+  // BOTH DIRECTIONS, AND THE MODE DECIDES WHICH OF THEM IS FATAL (o3d-secops r24, Codex HIGH).
+  // Until this round only ONE difference was asked for: had a grantee APPEARED since the plan?
+  // Checking for additions is not checking for equality, and the other direction is the one with
+  // the privilege in it. A role that LOSES CONNECT between `--plan` and `--fence` — an
+  // administrator revoking it by hand, a role dropped, an ACL edit by anything else — leaves
+  // `appeared` empty, so the stale authority was accepted whole; its REVOKE for that role is a
+  // no-op, nobody notices, and `--release` afterwards issues `GRANT CONNECT` to every role the
+  // record names. The deploy hands database access back to a role somebody had deliberately
+  // removed, and the only trace is a GRANT in the deploy log.
+  //
+  // See assessAuthorityDrift() for the two rules, written down once. What is decided here is only
+  // what to print.
+  const drift = assessAuthorityDrift({
+    authorised: existing.revoked,
+    current: freshPlan.revoke,
+    mode: authorityFenceMode(existing),
+  })
+  const { appeared, withdrawn } = drift
   if (appeared.length > 0) {
     console.error(`NOT FENCED: ${appeared.join(', ')} acquired CONNECT on ${facts.database} between the plan and this fence,`)
     console.error(`and the authority at ${options.stateFile} does not record ${appeared.length === 1 ? 'it' : 'them'}. Revoking anyway would take CONNECT from a`)
     console.error('role nothing would restore. Nothing has been revoked; re-run, which re-plans and re-publishes.')
     return EXIT_NOT_FENCEABLE
+  }
+  if (!drift.accepted) {
+    console.error(`NOT FENCED: ${withdrawn.join(', ')} no longer ${withdrawn.length === 1 ? 'holds' : 'hold'} CONNECT on ${facts.database}, and the authority at`)
+    console.error(`${options.stateFile} still ${withdrawn.length === 1 ? 'records it' : 'records them'}. This is an INITIAL fence — root published that record because no fence`)
+    console.error('was standing — so the list it carries is meant to BE the ACL as `--plan` read it a moment ago.')
+    console.error(`Something else took CONNECT from ${withdrawn.length === 1 ? 'that role' : 'those roles'} in between. The REVOKE here would do nothing, and`)
+    console.error('`--release` would afterwards GRANT CONNECT back to a role somebody deliberately removed.')
+    console.error('Nothing has been revoked; re-run, which re-plans and re-publishes against the ACL as it is now.')
+    console.error('(A fence that is ALREADY STANDING is re-applied through the recovery path instead, which is the')
+    console.error('one that expects its recorded grantees to have lost CONNECT — because its own earlier run is')
+    console.error('what took it from them.)')
+    return EXIT_NOT_FENCEABLE
+  }
+  if (drift.mode === FENCE_MODE_RECOVERY) {
+    console.error(`Re-applying a fence that is already standing (authority mode: ${FENCE_MODE_RECOVERY}).`)
+    if (withdrawn.length > 0) {
+      console.error(`  ${withdrawn.join(', ')} already ${withdrawn.length === 1 ? 'holds' : 'hold'} no CONNECT on ${facts.database}; the REVOKE for ${withdrawn.length === 1 ? 'it' : 'them'} is a no-op and`)
+      console.error('  the release still restores it. This path CANNOT tell that from a grantee an administrator')
+      console.error('  removed by hand, and does not claim to — see assessAuthorityDrift().')
+    }
   }
 
   const plan = { fenceable: true, reason: '', revoke: existing.revoked }
