@@ -363,7 +363,11 @@ test('[o3d-mm51] Codex\'s exact GBP pair is UNREADABLE, not a zero settlement', 
   assert.equal(total, balance, 'the two tokens are one double: the settlement between them is gone')
   assert.equal(total - balance, 0, 'so the completeness arithmetic would read a settled document as unsettled')
 
-  const probe = await probeBill({ TotalAmt: total, Balance: balance })
+  // AND THE DOCUMENT STATES THE CURRENCY THE FINDING NAMES. Without it the reader resolves through
+  // `ledgerMinorUnits(null)` — the FINEST supported precision and therefore a much smaller bound — so
+  // a test that asserted its precondition against GBP while the code used the null bound would be
+  // proving something adjacent to what it claims.
+  const probe = await probeBill({ CurrencyRef: { value: 'GBP' }, TotalAmt: total, Balance: balance })
   assert.equal(probe.ok, false, 'a figure IMS cannot read at this magnitude is not a clean, empty answer')
   assert.match(
     reasonOf(probe),
@@ -397,7 +401,14 @@ test('[o3d-mm51] the bound is the DIFFERENCE one: the amount bound alone still l
   assert.equal(total, balance, 'and they are one double, 0.0077 apart in truth')
   assert.ok(0.0077 > 0.005, 'which is above the GBP band, so the ledger really is holding a settlement')
 
-  const probe = await probeBill({ TotalAmt: total, Balance: balance })
+  // THE PRECONDITION THAT MAKES THE TWO ABOVE MEAN ANYTHING: the document STATES GBP, so the bound
+  // the reader applies is the one asserted against. An unstated currency resolves to the finest
+  // supported precision, whose bound is four orders of magnitude smaller — both spellings would then
+  // refuse this pair and the test would prove nothing about which one is load-bearing.
+  const BODY = { CurrencyRef: { value: 'GBP' }, TotalAmt: total, Balance: balance }
+  assert.equal(BODY.CurrencyRef.value, 'GBP', 'the document is stated in the currency the bounds are read for')
+
+  const probe = await probeBill(BODY)
   assert.equal(probe.ok, false)
   assert.match(reasonOf(probe), /which IMS cannot read as an amount/)
   assert.notEqual(classifyLedgerSettlement(attemptFor('1200.00'), probe).outcome, 'clear')
@@ -465,7 +476,9 @@ test('[o3d-mm51] the STRING arm takes no bound, so o3d-psrx r15 and o3d-obyd bot
   // only pass because the string arm read the digits it was given.
   assert.equal(JSON.parse('70368744177664.02'), JSON.parse('70368744177664.01'), 'as numbers they are one double')
 
-  const probe = await probeBill({ TotalAmt: '70368744177664.02', Balance: '70368744177664.01' })
+  const probe = await probeBill({
+    CurrencyRef: { value: 'GBP' }, TotalAmt: '70368744177664.02', Balance: '70368744177664.01',
+  })
   assert.equal(probe.ok, false, 'one penny applied and nothing accounts for it')
   assert.match(
     reasonOf(probe),
