@@ -262,6 +262,52 @@ function shortBy(stated: Decimal, accounted: Decimal, currency: string | null): 
   return compareDecimal(subtractMoney(stated, accounted), completenessBand(currency)) > 0
 }
 
+/**
+ * o3d-nk5n — AN EMPTY RECORD LIST IS A POSITIVE CLAIM ABOUT MONEY, SO IT NEEDS A FIGURE BEHIND IT.
+ *
+ * THE RULE, IN ONE PLACE, FOR BOTH CONNECTORS AND ALL THREE DOCUMENT ARMS.
+ *
+ * `{ ok: true, records: [] }` is not "I could not tell". `classifyLedgerSettlement` reads it as
+ * `clear`, and `clear` is what AUTHORISES a money post — so the empty answer asserts "nothing has
+ * settled this document", which is the strongest claim this probe can make and the one that spends a
+ * second payment when it is wrong. Every completeness cross-check in this file is guarded on a figure
+ * being present, so a response that states NO usable figure runs no check at all and falls through to
+ * that assertion having looked at nothing.
+ *
+ * THE ASYMMETRY IS THE WHOLE POINT, AND IT IS BETWEEN TWO KINDS OF EMPTY:
+ *
+ *   PROVED EMPTY     the document states the figures its own settlement arithmetic is made of, and
+ *                    that arithmetic comes out at nothing. An unpaid Xero invoice states `Total` and
+ *                    `AmountDue` EQUAL, so `Total - AmountDue` is exactly zero: the ledger has said,
+ *                    in its own numbers, that nothing has come off this document. The ordinary first
+ *                    payment is this shape, and it still posts.
+ *   ASSUMED EMPTY    the document states none of them. `settled` is null, no check ran, and the empty
+ *                    record list is a conclusion drawn from having nothing to read. It refuses.
+ *
+ * This is the QuickBooks arm's rule, not a second spelling of it: `probeQuickBooksSettlement` has
+ * required exactly this since o3d-mm51 — emptiness PROVED by two stated figures rather than assumed
+ * from two missing ones — and the function is shared so the two can never drift. What each arm passes
+ * as `settled` is its own ledger's account of how much has come off the document by ANY means:
+ * `Total - AmountDue` (or the `AmountPaid + AmountCredited` fallback) on a Xero invoice,
+ * `Total - RemainingCredit` on a Xero credit note, `TotalAmt - Balance` on a QuickBooks document. In
+ * every case it is null exactly when the ledger stated too little for the figure to be computed.
+ *
+ * A NON-EMPTY RECORD LIST STILL ANSWERS. Records are evidence in their own right: the classifier
+ * compares them against the attempt and reaches its own verdict, so a figureless document whose
+ * settlements this probe DID read is not refused. Only the empty case turns "I could not look" into
+ * "there is nothing there".
+ *
+ * AND AN UNREADABLE FIGURE IS ALREADY HANDLED ELSEWHERE — `completenessCannotRun` refuses before this
+ * is reached. What is left here is ABSENCE, which correctly skips arithmetic it cannot do and must
+ * not also be allowed to contribute a conclusion.
+ */
+function emptyAnswerIsUnproved(
+  settled: Decimal | null,
+  records: readonly LedgerSettlementRecord[],
+): boolean {
+  return settled === null && records.length === 0
+}
+
 /** Sum exact readings, or null the moment one of them is unreadable. */
 function sumExact(values: Array<Decimal | null>, seed: Decimal | null = toDecimal(0)): Decimal | null {
   return values.reduce<Decimal | null>(
@@ -471,10 +517,24 @@ export async function probeXeroSettlement(
               : `allocations totalling ${formatLedgerMoney(allocated)}`),
       }
     }
-    // o3d-mm51 — and the third instance of Codex's HIGH 2 shape, filed with the second. A credit
-    // note stating neither `Total` nor `RemainingCredit` runs no check here either, and an absent
-    // `Allocations` collection then makes `records` empty, which is `clear`. Same reachability
-    // (Xero states both on every credit note that exists), same fixtures, same issue: o3d-nk5n.
+    // o3d-nk5n — AND HERE IT IS CLOSED. o3d-mm51 filed this instance rather than fixing it because
+    // the fixtures modelled the figureless stub as an ordinary credit note; they now state what Xero
+    // states, so the rule can be the same one on both connectors.
+    //
+    // `applied` is this arm's `settled`: `Total - RemainingCredit` is Xero's own account of how much
+    // of the credit has been used. Null means the note stated neither figure, so nothing was checked
+    // — and with no allocation to THIS bill, the empty record list would assert "none of this credit
+    // has been applied to this bill" on the strength of not having looked. A note that DOES state
+    // them proves its own emptiness: a wholly unapplied credit reads `Total 40, RemainingCredit 40`,
+    // `applied` is exactly zero, and the empty answer is the ledger's, not this code's.
+    if (emptyAnswerIsUnproved(applied, records)) {
+      return {
+        ok: false,
+        reason: 'Xero states no total or remaining credit on this credit note and IMS read no allocation '
+          + 'of it to this bill, so it has nothing to tell from — an empty answer here would say that '
+          + 'none of the credit has been allocated rather than report what has',
+      }
+    }
     return { ok: true, records }
   }
 
@@ -630,24 +690,40 @@ export async function probeXeroSettlement(
     }
   }
 
-  // o3d-mm51 — THE SAME SHAPE AS CODEX'S HIGH 2 IS HERE TOO, AND IT IS FILED RATHER THAN CLOSED.
+  // o3d-nk5n — AND HERE IT IS CLOSED, WHERE o3d-mm51 FILED IT.
   //
-  // An invoice that states NO figure at all — no `AmountPaid`, no `Total`, no `AmountDue`, no
-  // `AmountCredited` — runs NEITHER check above and falls through to `ok: true` over whatever
-  // `records` holds. With an absent or empty `Payments` collection that is an EMPTY list, which
-  // `classifyLedgerSettlement` reads as `clear`: the same positive claim on no evidence the
-  // QuickBooks arm was refused for. The exclusion documented above is justified by two shapes —
-  // a response that omits `Total`/`AmountDue` (the `settled` fallback exists for it) and an
-  // unsettled invoice that states no `AmountCredited` — and in BOTH of those Xero has still stated
-  // `AmountPaid`, which IS checked. Stating nothing at all is wider than that justification.
+  // THE DEFECT, AS IT STOOD. An invoice that states NO usable figure — no `Total`/`AmountDue` pair
+  // and no `AmountPaid`/`AmountCredited` fallback pair — runs NEITHER check above and fell through to
+  // `ok: true` over whatever `records` holds. With an absent or empty `Payments` collection that is
+  // an EMPTY list, which `classifyLedgerSettlement` reads as `clear`: the same positive claim on no
+  // evidence the QuickBooks arm was refused for. The exclusion the paragraphs above justify is about
+  // two shapes — a response that omits `Total`/`AmountDue` (the `settled` fallback exists for it) and
+  // an unsettled invoice that states no `AmountCredited` — and in BOTH of those the fallback's OTHER
+  // operand is stated, so `settled` is computable and the check runs. Stating too little for EITHER
+  // form was wider than that justification, and the width was the whole finding.
   //
-  // WHY IT IS NOT CLOSED IN THIS ROUND. It is not reachable the way the QuickBooks one is: Xero's
-  // single-invoice GET states all four figures on every document that exists, so only a stub can
-  // produce the shape. What DOES exist is 25 fixtures across `money-post-authorisation.test.ts`
-  // and `settlement-probe.test.ts` that model an ordinary FIRST payment as exactly this stub —
-  // `{ InvoiceID: 'inv-1', Payments: [] }` — so closing it here fails six money-post fence tests
-  // whose subject is that a first payment proceeds. Making those fixtures state what Xero states
-  // is the fix, and it is a change to the fence's own contract rather than to this reader. o3d-nk5n.
+  // WHY THE PREVIOUS ROUND FILED IT INSTEAD. Not the code: 25 fixtures across
+  // `money-post-authorisation.test.ts` and `settlement-probe.test.ts` modelled an ordinary FIRST
+  // payment as the figureless stub `{ InvoiceID: 'inv-1', Payments: [] }`, so closing it failed six
+  // money-post fence tests whose subject is that a first payment proceeds. That is a false model of
+  // Xero, not a cost of the rule — `XeroInvoice` in `xero/invoice-delta.ts` records that Xero returns
+  // these figures "on every invoice", and says in as many words that their optionality exists only
+  // "because the fixtures predate them". The fixtures now state what Xero states, and the ordinary
+  // first payment proves its own emptiness instead of being excused from having to.
+  //
+  // WHAT THE ORDINARY FIRST PAYMENT DOES NOW. An unpaid invoice states `Total` and `AmountDue` EQUAL,
+  // so `settled` is exactly zero, `statesAnything` is false, the check above PASSES, and the probe
+  // answers `ok: true` with an empty record list — `clear`, and the payment posts. Emptiness proved
+  // by two stated figures rather than assumed from four missing ones, which is the same sentence the
+  // QuickBooks arm has carried since o3d-mm51 and now the same FUNCTION.
+  if (emptyAnswerIsUnproved(settled, records)) {
+    return {
+      ok: false,
+      reason: 'Xero states no total, amount due, amount paid or amount credited on this document and IMS '
+        + 'read no payment against it, so it has nothing to tell from — an empty answer here would say '
+        + 'that nothing has settled the document rather than report what does',
+    }
+  }
   return { ok: true, records }
 }
 
@@ -973,7 +1049,12 @@ export async function probeQuickBooksSettlement(
     // AND A DOCUMENT WITH NO FIGURES WHOSE SETTLEMENTS THIS PROBE DID READ still answers: `records`
     // is then evidence in its own right and the verdict is decided by comparing it, not by the
     // absence. Only the empty case turns "I could not look" into "there is nothing there".
-    if (records.length === 0) {
+    //
+    // o3d-nk5n: and this paragraph is now the SHARED rule rather than this arm's own. Both Xero arms
+    // reached the same fall-through and were closed by routing through `emptyAnswerIsUnproved`, which
+    // is this condition lifted out verbatim — `applied` is this arm's `settled`. Lifted rather than
+    // re-spelled so that a change to the rule cannot reach one connector and miss the other.
+    if (emptyAnswerIsUnproved(applied, records)) {
       return {
         ok: false,
         reason: `QuickBooks states no total or balance on this ${documentKey.toLowerCase()} and IMS read no `
