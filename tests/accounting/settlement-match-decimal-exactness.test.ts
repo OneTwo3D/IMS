@@ -356,6 +356,54 @@ test('[o3d-78rq] an ordinary settlement is read, matched, and an ordinary non-ma
   assert.equal(readLedgerStatedAmount(10.00001, null), null)
 })
 
+test('[o3d-78rq] each Xero document is read in ITS OWN currency, on both branches of the probe', async () => {
+  // The currency is not decoration: it is what decides whether a figure is stateable, and a fil is a
+  // real payment. Reading every document as GBP would refuse both settlements below and withhold two
+  // documents nothing has ever been sent to.
+  //
+  // ROUTE: probeXeroSettlement -> statedAmount(_, ledgerCurrencyCode(invoice.CurrencyCode)) on the
+  //        payments branch, and ledgerCurrencyCode(note.CurrencyCode) on the allocations branch.
+  // MUTATION: hard-code `'GBP'` in either `statedAmount(...)` call in the probe and that branch's
+  //        assertion below fails — the fil reads as a figure IMS will not measure.
+  assert.equal(readLedgerStatedAmount(10.001, 'GBP'), null,
+    'the precondition: this figure is refused in GBP, so the assertions below can only pass on KWD')
+
+  const payments = ledgerDouble({
+    'Invoices/inv-kwd': {
+      Invoices: [{
+        InvoiceID: 'inv-kwd',
+        CurrencyCode: 'KWD',
+        Total: 10.001,
+        AmountDue: 0,
+        AmountPaid: 10.001,
+        AmountCredited: 0,
+        Payments: [{ PaymentID: 'PAY-1', Date: '2026-08-01T00:00:00', Amount: 10.001 }],
+      }],
+    },
+  })
+  const paid = await probeXeroSettlement({ type: 'INVOICE_PAYMENT', payload: { accountingInvoiceId: 'inv-kwd' } }, payments.get)
+  assert.deepEqual(paid.ok ? paid.records.map((r) => r.amount?.toFixed() ?? null) : null, ['10.001'],
+    'one fil is a payment the ledger can state, and this probe reads it')
+
+  const allocations = ledgerDouble({
+    'CreditNotes/cn-1': {
+      CreditNotes: [{
+        CreditNoteID: 'cn-1',
+        CurrencyCode: 'KWD',
+        Total: 10.001,
+        RemainingCredit: 0,
+        Allocations: [{ Amount: 10.001, Date: '2026-08-01T00:00:00', Invoice: { InvoiceID: 'inv-kwd' } }],
+      }],
+    },
+  })
+  const allocated = await probeXeroSettlement(
+    { type: 'PURCHASE_CREDIT_NOTE_ALLOCATION', payload: { accountingInvoiceId: 'inv-kwd', creditNoteId: 'cn-1' } },
+    allocations.get,
+  )
+  assert.deepEqual(allocated.ok ? allocated.records.map((r) => r.amount?.toFixed() ?? null) : null, ['10.001'],
+    'and the credit-note branch reads the NOTE\'s currency, which is the one its allocations are in')
+})
+
 test('[o3d-78rq] the QuickBooks probe reads its applied amounts through the SAME rule', async () => {
   // Both connectors' probes needed it: the QuickBooks applied amount is a SUM of a payment's lines,
   // which is the one place a figure can stop being the one the ledger stated without any single
