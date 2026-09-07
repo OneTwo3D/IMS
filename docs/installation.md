@@ -1234,7 +1234,7 @@ to do:
 | --- | --- | --- |
 | cutover marker | `/etc/ims-cutover/DEPLOY-FENCED` | `root:root` 0600, in a `root:root` **0700** directory |
 | cutover lock | `/etc/ims-cutover-state/cutover.lock` | `root:root` **0600**, in a `root:root` **0711** directory |
-| connection-fence authority | `/etc/ims-cutover-state/db-fence/db-connect-fence.json` | `root:root` **0644**, in a `root:root` **0755** directory. Carries `fence_mode` (`initial` or `recovery`) since o3d-secops r24 — see *Two kinds of fence* |
+| connection-fence authority | `/etc/ims-cutover-state/db-fence/db-connect-fence.json` | `root:root` **0644**, in a `root:root` **0755** directory. Carries `fence_mode` (`initial` or `recovery`) since o3d-secops r24 and `fence_applied` (`0`, raised to `1` by root after the revoke) since r25 — see *Two kinds of fence* |
 | crontab backup | `/var/lib/one-two-inventory/crontab-<service user>.bak` | `root:root` 0600 |
 
 Set `IMS_CUTOVER_STATE_DIR` **in the environment of the root invocation** to move the crontab
@@ -2654,12 +2654,58 @@ Both differences are compared now, and which of them is fatal depends on a `fenc
 | `recovery` | an authority was already there — a previous cutover revoked and did not release, so its fence is still standing | recorded grantees that no longer hold `CONNECT` are **expected** (that fence is what took it from them). A grantee that has *appeared* is still fatal. |
 
 The stamp is the difference between the two rules, so it is the field worth forging — and it is
-computed by root, in the process that does the rename, from the presence of a file in a directory
-the service account cannot write. That account can neither create a record to obtain the tolerance
-nor unlink one to escape it, and a `fence_mode` carried **in** the plan is dropped by the template
-like every other field root does not compute for itself. A record with **no** `fence_mode` is read
-as `recovery`: it can only be a fence raised before this round and still standing, and refusing it
-would strand that fence with neither a re-apply nor a release.
+computed by root, in the process that does the rename, in a directory the service account cannot
+write. That account can neither create a record to obtain the tolerance nor unlink one to escape it,
+and a `fence_mode` carried **in** the plan is dropped by the template like every other field root
+does not compute for itself. A record with **no** `fence_mode` is read as `recovery`: it can only be
+a fence raised before this round and still standing, and refusing it would strand that fence with
+neither a re-apply nor a release.
+
+##### Do not infer a standing fence solely from record presence (o3d-secops r25)
+
+Until r25 root stamped `recovery` whenever **anything** was at `db-connect-fence.json`, and presence
+conflates two different states: *root published an authority* and *the fence was actually applied*.
+Only the second is a standing fence, and only the second may buy the recovery tolerance. Several
+things produce the first without the second, and all of them leave the same file at the same name:
+
+* the publication itself failing **after** the rename — the directory `fsync` is the validator's
+  last barrier, and when it fails it says so and deliberately leaves the record visible;
+* `--fence` failing with a status the orchestration does not enumerate, or the cutover being killed,
+  between the rename and `BEGIN`;
+* `SIGKILL` or power loss at the same point, where no cleanup runs because no process is left.
+
+So the record carries **`fence_applied`**, written `0` by the validator and raised to `1` **by
+root**, after `--fence` reports the revokes are (or may be) on the medium. `fence_mode` is computed
+from that stamp and not from the pathname, which makes a record left behind by *any* publication
+failure inert by construction: it can only ever produce another `initial` fence, held to the strict
+rule.
+
+| what is at the path | how it is read | why |
+| --- | --- | --- |
+| nothing | `initial` | no fence, no record |
+| `fence_applied: 1` | `recovery` | root saw `--fence` succeed, so a fence stands |
+| `fence_applied: 0` | `initial` | published, never applied — what a failed publication or a pre-`BEGIN` refusal leaves |
+| **no `fence_applied` key at all** | `recovery` | written by a validator that predates the stamp, so it can only be a fence raised before this upgrade and still standing |
+| not a regular file, or not usable JSON | `initial` | nothing there can show a fence was applied |
+
+The last two rows are how an **unstamped legacy record** is told apart from a **half-published**
+one: a record from this round *always* has the key, holding `0`, because the validator writes it in
+the same template as every other field, so the discriminator is the key's **presence**, not its
+value. That holds for the same reason `fence_mode` itself does — the directory is `root:root` and
+unwritable by anything else, so the service account can neither add the key nor strip it.
+
+**Where this fails, said plainly.** If a run dies between a successful `REVOKE` and root raising the
+stamp, the record says `0` while a fence *is* standing. The next cutover reads `initial`, the strict
+rule sees the recorded grantees missing from the ACL, and it **refuses**. That is the deliberate
+direction: a refusal that names the record is recoverable with the release wrapper, which reads the
+record and grants back regardless of the stamp, while the other direction would hand drift tolerance
+to a fence nobody can show exists. The run announces it at the moment it happens.
+
+Root stamps the record for exit `0` and exit `5` (`EXIT_FENCE_STANDING`, where the `COMMIT` was
+issued and its acknowledgement may have been lost — the only safe reading of unknown is that
+`CONNECT` may be revoked) and for **no other status**. Exit `1` in particular is the helper's
+catch-all: it covers a connection that never opened as well as a teardown that threw after a
+successful fence, and a status that cannot tell those apart may not declare a fence applied.
 
 What `recovery` accepts that `initial` does not, said plainly: on a re-fence a grantee an
 administrator removed by hand is indistinguishable from one the standing fence removed — both are
@@ -2668,13 +2714,15 @@ with an **interrupted cutover**, it is announced on stderr when it happens, and 
 standing fence that can be neither re-applied nor released. On an `initial` fence — every ordinary
 deploy, update and install — there is no residue.
 
-**A refused initial fence leaves no authority behind.** Because the mode is stamped from whether a
-record is present, a refused run that left its own record would make the *next* attempt a
-"recovery", and one re-run would buy the tolerance the refusal existed to withhold. Exit `3`
-(`EXIT_NOT_FENCEABLE`) is returned only *before* `BEGIN`, so nothing was revoked and the record is
-this run's own: it is removed. Whether it **is** this run's own is read *before* the publication —
-where a fence was already standing, that record is the only account of what an earlier run revoked
-and it is left exactly where it is.
+**And this run's own authority is cleaned up on every pre-`REVOKE` failure**, as defence in depth on
+top of the stamp. Exit `3` (`EXIT_NOT_FENCEABLE`) is returned only *before* `BEGIN`, so nothing was
+revoked and the record is this run's own: it is removed. A **failed publication** is removed for the
+same reason and was the route r24 missed — its cleanup hung off the execution's exit code, and a
+publication that fails after the rename never reaches an execution at all. Whether the record **is**
+this run's own is read *before* the publication: where a fence was already standing, that record is
+the only account of what an earlier run revoked and it is left exactly where it is. If a removal
+cannot be completed the run says so and names the file; the leftover is inert either way, because it
+carries no applied stamp.
 
 `--release` reads that record through the same provenance gate — the **directory** first, because
 `unlink(2)` and `rename(2)` ask for write permission on the parent and nothing about the file — and

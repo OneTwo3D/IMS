@@ -23,7 +23,8 @@
  */
 import assert from 'node:assert/strict'
 import { spawnSync } from 'node:child_process'
-import { chmodSync, existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, realpathSync, renameSync, statSync, symlinkSync, unlinkSync, writeFileSync } from 'node:fs'
+import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, renameSync, rmSync, statSync, symlinkSync, unlinkSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import test, { type TestContext } from 'node:test'
 
@@ -159,18 +160,39 @@ const RUN_BASH_MAX_OUTPUT_BYTES = 4 * 1024 * 1024
 
 class HarnessRunaway extends Error {}
 
+/**
+ * THE SCRIPT TRAVELS AS A FILE, NOT AS AN ARGUMENT (o3d-secops r25).
+ *
+ * `bash -c "${script}"` puts the whole script in ONE argv entry, and Linux caps a single argument at
+ * MAX_ARG_STRLEN — 128 KiB — regardless of how large ARG_MAX is. Several tests here splice an
+ * entire shell library into the script they run; db-fence-protected.sh alone reached 127 KiB, so
+ * the next few hundred bytes of anything turned every one of those into `spawnSync ... E2BIG`, a
+ * harness error with nothing to say about the code under test. An environment variable would hit
+ * the same cap. A file has no such limit, and `$0` and `BASH_SOURCE` are unused by every script
+ * this harness runs, so the two invocations are otherwise indistinguishable.
+ *
+ * `t.after` is NOT available here — runBash takes no TestContext and 109 call sites pass none — so
+ * the file is removed on the way out of this function, including when the deadline throws.
+ */
 function runBash(script: string, opts: { cwd?: string, env?: Record<string, string>, deadlineMs?: number } = {}): Run {
   const deadlineMs = opts.deadlineMs ?? RUN_BASH_DEADLINE_MS
   const seconds = Math.max(1, Math.ceil(deadlineMs / 1000))
-  const result = spawnSync(REAL.timeout, ['-k', '2', String(seconds), 'bash', '-c', script], {
-    cwd: opts.cwd ?? REPO,
-    encoding: 'utf8',
-    env: { ...process.env, ...(opts.env ?? {}) },
-    // An EMPTY stdin rather than this process's: a shim that reads stdin then gets EOF instead of
-    // blocking on a terminal that will never answer.
-    input: '',
-    maxBuffer: RUN_BASH_MAX_OUTPUT_BYTES,
-  })
+  const scriptFile = join(mkdtempSync(join(tmpdir(), 'ims-runbash-')), 'script.sh')
+  let result: { error?: Error, status: number | null, signal: NodeJS.Signals | null, stdout: string, stderr: string }
+  try {
+    writeFileSync(scriptFile, script)
+    result = spawnSync(REAL.timeout, ['-k', '2', String(seconds), 'bash', scriptFile], {
+      cwd: opts.cwd ?? REPO,
+      encoding: 'utf8',
+      env: { ...process.env, ...(opts.env ?? {}) },
+      // An EMPTY stdin rather than this process's: a shim that reads stdin then gets EOF instead of
+      // blocking on a terminal that will never answer.
+      input: '',
+      maxBuffer: RUN_BASH_MAX_OUTPUT_BYTES,
+    })
+  } finally {
+    rmSync(dirname(scriptFile), { recursive: true, force: true })
+  }
   if (result.error) {
     throw new HarnessRunaway(`the harness could not bound this execution: ${result.error.message}`)
   }

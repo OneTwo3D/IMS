@@ -1248,11 +1248,21 @@ export function readAuthorityRecord(stateFile, expectedUid, stat = lstatSync) {
 //
 // WHO DECIDES WHICH. NOT THIS PROCESS AND NOT THE PLAN. `fence_mode` is stamped by ROOT, in the
 // validator, in the same process that renames the record into place, from a fact root can see and
-// the application account cannot forge: whether an authority was already present at the
-// destination. ${DB_FENCE_DIR} is root-owned and unwritable by anyone else, so that account can
-// neither create a record to obtain the lax rule nor remove one to obtain the strict rule. A
-// `fence_mode` carried IN the plan is dropped by the template like every other field root does not
-// compute for itself.
+// the application account cannot forge. ${DB_FENCE_DIR} is root-owned and unwritable by anyone
+// else, so that account can neither create a record to obtain the lax rule nor remove one to obtain
+// the strict rule. A `fence_mode` carried IN the plan is dropped by the template like every other
+// field root does not compute for itself.
+//
+// AND THE FACT IS NOT "A FILE IS THERE" (o3d-secops r25, Codex HIGH). Presence conflates ROOT
+// PUBLISHED AN AUTHORITY with THE FENCE WAS APPLIED, and only the second is a standing fence. A
+// publication that fails after its atomic rename -- the directory fsync is the validator's last
+// barrier and leaves the record visible when it fails -- and a SIGKILL between the rename and
+// `BEGIN` both leave the first without the second. So the record carries `fence_applied`, written 0
+// by the validator and raised to 1 by root only after THIS mode reports the revokes are, or may be,
+// on the medium; `fence_mode` is computed from that. The rule lives in ONE place, the root-side
+// validator in scripts/lib/db-fence-protected.sh, and deliberately not here as well: it decides
+// which rule THIS process is held to, and a copy in the process being constrained is a copy that
+// could come to disagree with the one doing the constraining. What arrives here is the answer.
 //
 // WHAT RECOVERY ACCEPTS THAT INITIAL DOES NOT, SAID PLAINLY. On a recovery re-fence a grantee that
 // an administrator removed by hand is indistinguishable from one the standing fence removed — both
@@ -1276,6 +1286,12 @@ export const FENCE_MODE_RECOVERY = 'recovery'
  * strand that fence with neither a re-apply nor a release. It is not a hole an unprivileged
  * account can reach through either: the field is absent only in records root itself wrote, in a
  * directory nothing else may write, and every authority published from this round on carries it.
+ *
+ * o3d-secops r25 applies the SAME argument one level down, to the `fence_applied` stamp the
+ * validator now computes `fence_mode` from: a record with no stamp at all predates the stamp and is
+ * read as standing, while one carrying the stamp at 0 was published and never applied and is read
+ * as an initial fence. That discrimination is root's and is made in the validator; by the time a
+ * record reaches this function the answer is already in `fence_mode`.
  */
 export function authorityFenceMode(record) {
   return record && record.fence_mode === FENCE_MODE_INITIAL ? FENCE_MODE_INITIAL : FENCE_MODE_RECOVERY

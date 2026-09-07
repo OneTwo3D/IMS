@@ -1310,7 +1310,7 @@ if (priorMeta !== null) {
     process.stderr.write("There is no fence record at " + destination + ", only a " + (priorMeta.isSymbolicLink() ? "symbolic link" : "non-regular file") + ", so nothing there says a fence was ever applied. Publishing an INITIAL authority.\n");
   } else {
     var priorRaw = "";
-    try { priorRaw = fs.readFileSync(destination, "utf8"); } catch (e) { fail(destination + " could not be read (" + e.message + "), so this run cannot tell whether the fence it records was ever applied. Nothing has been published."); }
+    try { priorRaw = fs.readFileSync(destination, "utf8"); } catch (e) { fail(destination + " could not be opened (" + e.message + "), so this run cannot tell whether the fence it records was ever applied. Nothing has been published."); }
     var prior = null;
     try { prior = JSON.parse(priorRaw); } catch (ignored) { void ignored; prior = null; }
     if (prior === null || typeof prior !== "object" || Array.isArray(prior)) {
@@ -1430,7 +1430,7 @@ try { fileMeta = fs.lstatSync(destination); } catch (e) { fail(destination + " c
 if (!fileMeta.isFile()) fail(destination + " is not a regular file");
 if (fileMeta.uid !== process.getuid()) fail(destination + " is owned by uid " + fileMeta.uid + " and this run is uid " + process.getuid() + ", so it was not published by this account");
 var raw = "";
-try { raw = fs.readFileSync(destination, "utf8"); } catch (e) { fail(destination + " could not be read (" + e.message + ")"); }
+try { raw = fs.readFileSync(destination, "utf8"); } catch (e) { fail(destination + " could not be opened (" + e.message + ")"); }
 var record = null;
 try { record = JSON.parse(raw); } catch (e) { fail(destination + " does not hold valid JSON (" + e.message + ")"); }
 if (record === null || typeof record !== "object" || Array.isArray(record)) fail(destination + " does not hold a JSON object");
@@ -1586,7 +1586,7 @@ db_fence_raise() {
     # account of what was revoked and is never this run's to remove.
     if [[ "${had_authority}" -eq 0 ]]; then
       if ! db_fence_clear_authority "${state_file}"; then
-        echo "The connection-fence authority could not be published AND the partial record at ${state_file} could not be removed. It carries no applied stamp, so no later run can read it as a standing fence and it cannot buy the recovery rule; it is still litter at the authoritative path. Remove it by hand." >&2
+        echo "The connection-fence authority could not be published AND the partial record at ${state_file} could not be removed. It carries no applied stamp, so no later run can treat it as a standing fence and it cannot buy the recovery rule; it is still litter at the authoritative path. Remove it by hand." >&2
       fi
     fi
     echo "NOT FENCED: the connection-fence authority could not be published at ${state_file} (the reason is printed above)." >&2
@@ -1853,7 +1853,7 @@ raise_the_fence() {
     if [[ "${had_authority}" -eq 0 ]]; then
       rm -f "${state_file}" 2>/dev/null || true
       if [[ -e "${state_file}" ]]; then
-        echo "The authority could not be published AND the partial record at ${state_file} could not be removed. It carries no applied stamp, so no later run can read it as a standing fence, but it is litter at the authoritative path. Remove it by hand." >&2
+        echo "The authority could not be published AND the partial record at ${state_file} could not be removed. It carries no applied stamp, so no later run can treat it as a standing fence, but it is litter at the authoritative path. Remove it by hand." >&2
       fi
     fi
     return 1
