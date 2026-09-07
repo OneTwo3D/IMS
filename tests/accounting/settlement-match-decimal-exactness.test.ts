@@ -792,7 +792,7 @@ test('[o3d-r948 r3] a differing but UNREADABLE half does not clear the record it
  * already recorded against a different row, case-folded, and excluded nothing else. The option is
  * gone: `classifyLedgerSettlement` takes two arguments and measures every record the probe returned.
  * See the note above that function for the four rounds of narrowing and the two facts nothing in
- * this system records, and bd o3d-hold1 for the permanent hold that leaves standing.
+ * this system records, and bd o3d-llyw for the permanent hold that leaves standing.
  *
  * The test below replaces it, on the opposite property.
  * -------------------------------------------------------------------------------------------- */

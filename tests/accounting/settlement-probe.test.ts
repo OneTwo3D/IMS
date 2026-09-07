@@ -594,7 +594,7 @@ test('the probe key is not split by an anchor the TYPE does not have (o3d-0m56 r
  * with it rather than sitting on the probe result inviting reuse. A sound version is REQUEST-BOUND:
  * `XeroResponse` already carries the `tenantId` its request went out under, and `qboFetch` resolves
  * a `realmId` per request that `QboResponse` discards — and a QuickBooks probe makes 1 + N fetches,
- * so every one of those responses would have to be proven to belong to one realm. bd o3d-hold1.
+ * so every one of those responses would have to be proven to belong to one realm. bd o3d-llyw.
  * ------------------------------------------------------------------------------------------- */
 
 /** Counts reads of the local `accounting_tokens` row, so "it does not read it" can be asserted. */
@@ -666,5 +666,5 @@ test('[o3d-r948 r6] no caller can ask the probe which organisation answered', as
     path.join(process.cwd(), 'lib/connectors/accounting-settlement-probe.ts'), 'utf8',
   )
   assert.doesNotMatch(impl, /activeAccountingIdProvenance/,
-    'and the probe must not resurrect a token-snapshot reading — see bd o3d-hold1 for what a sound one needs')
+    'and the probe must not resurrect a token-snapshot reading — see bd o3d-llyw for what a sound one needs')
 })

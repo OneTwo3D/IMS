@@ -289,7 +289,7 @@ test('an attempt that PROVABLY never posted does not block the receipt (o3d-0m56
  *
  * The first of them is the one that mattered: it pinned that a SYNCED row's own unmeasurable payment
  * STOPS blocking every later receipt. That behaviour is deliberately reversed below. It blocks again,
- * and the permanent hold that creates is filed as its own problem (bd o3d-hold1) rather than lifted
+ * and the permanent hold that creates is filed as its own problem (bd o3d-llyw) rather than lifted
  * by a rule four rounds of adversarial review kept finding holes in.
  *
  * WHAT REPLACES THEM is the round-2 rule, asserted directly: an unmeasurable settlement withholds,
@@ -556,11 +556,11 @@ test('sales.ts asks the ledger exactly when the decision needs it (o3d-0m56)', a
   // o3d-r948 r6: AND NOTHING BESIDE THE RECORDS. r5 plumbed the probe's organisation through here so
   // the decision's exclusion set could be scoped to it. That exclusion is gone, and so is the
   // provenance — which was itself unsound, being two token snapshots either side of the fetch. A
-  // reader who finds this pair reinstated should read bd o3d-hold1 before trusting it.
+  // reader who finds this pair reinstated should read bd o3d-llyw before trusting it.
   const enqueueCode = source.split('\n').filter((l) => !/^\s*(\/\/|\*|\/\*)/.test(l)).join('\n')
   assert.match(enqueueCode, /ledgerSettlements,/, 'the comment strip must leave the enqueue code standing')
   assert.doesNotMatch(enqueueCode, /ledgerConnectionProvenance/,
-    'no connection provenance may be plumbed into the decision again without the evidence o3d-hold1 names')
+    'no connection provenance may be plumbed into the decision again without the evidence o3d-llyw names')
 
   // The two fields the unresolved rule is decided from must actually be read off the stored row.
   // Without paymentDate no attempt can ever be matched, so every receipt beside a failed row is
@@ -583,7 +583,7 @@ test('sales.ts asks the ledger exactly when the decision needs it (o3d-0m56)', a
   // organisation the probe answered from. Nothing excludes a settlement record now, so the loader
   // reads neither — and this asserts the absence rather than merely stopping asserting the presence,
   // because a half-restored version (the column selected, the stamp trusted) is exactly the shape
-  // Codex found could still authorise a duplicate payment. See bd o3d-hold1.
+  // Codex found could still authorise a duplicate payment. See bd o3d-llyw.
   //
   // ASSERTED ON THE CODE, NOT ON THE PROSE. The note above this in the loader explains the removal
   // and necessarily spells the column's name, so a bare source match would trip on the sentence that
@@ -593,7 +593,7 @@ test('sales.ts asks the ledger exactly when the decision needs it (o3d-0m56)', a
   const loaderCode = loaderBody.split('\n').filter((l) => !/^\s*(\/\/|\*|\/\*)/.test(l)).join('\n')
   assert.match(loaderCode, /settlementBasis: true,/, 'the strip must leave the loader\'s actual selects standing')
   assert.doesNotMatch(loaderCode, /connectionProvenance/,
-    'the loader must not resurrect a row origin without the issuer evidence o3d-hold1 names')
+    'the loader must not resurrect a row origin without the issuer evidence o3d-llyw names')
   assert.doesNotMatch(loaderCode, /readAccountingOriginRecord/,
     'nor read one through the origin reader')
 

@@ -715,7 +715,7 @@ export async function probeLedgerSettlement(
   // — so the unsound reading is removed rather than left standing beside a caller that might trust
   // it. A sound version is REQUEST-BOUND, not snapshot-bound: propagate the `tenantId` `XeroResponse`
   // already carries and the `realmId` `qboFetch` resolves and drops, and refuse a multi-fetch probe
-  // whose responses disagree. bd o3d-hold1 has the estimate.
+  // whose responses disagree. bd o3d-llyw has the estimate.
   try {
     return connector === 'xero'
       ? await (async () => {

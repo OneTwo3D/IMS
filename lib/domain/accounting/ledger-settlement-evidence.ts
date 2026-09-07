@@ -102,7 +102,7 @@ export type LedgerSettlementProbe =
        *
        * A sound replacement is request-bound, not snapshot-bound: `XeroResponse` already carries the
        * `tenantId` its request went out under, and QuickBooks resolves a `realmId` per request that
-       * `QboResponse` currently discards. bd o3d-hold1 carries that design.
+       * `QboResponse` currently discards. bd o3d-llyw carries that design.
        */
     }
   | { ok: false; reason: string }
@@ -389,7 +389,7 @@ const money = formatLedgerMoney
  * o3d-r948 r6 — `LedgerSettlementOptions` / `settlementsOfOtherAttempts` WAS HERE, AND IS GONE.
  *
  * Four rounds built it and a fifth removed it. It is recorded here rather than deleted silently
- * because the hole it was filling is still open (bd o3d-hold1), and the next person to meet that
+ * because the hole it was filling is still open (bd o3d-llyw), and the next person to meet that
  * hole will reach for exactly this shape again.
  *
  * WHAT IT WAS. `classifyLedgerSettlement` withholds on a settlement it cannot measure — an amount it
@@ -441,7 +441,7 @@ const money = formatLedgerMoney
  * `resolveSettledRow`), and the note that used to sit at the revival gate — "it excludes nothing,
  * and that is the cost of the rule rather than a gap in it" — is now simply the rule.
  *
- * WHAT A SOUND VERSION WOULD REQUIRE, if anyone comes back to it: bd o3d-hold1 carries the whole
+ * WHAT A SOUND VERSION WOULD REQUIRE, if anyone comes back to it: bd o3d-llyw carries the whole
  * estimate. It is a new write-once-on-post column plus its own trigger (the existing
  * `connection_provenance` trigger CLEARS on UPDATE, and an issuer is written by the post-time
  * UPDATE, so that shape cannot be reused), issuer capture at every id-writing path in both

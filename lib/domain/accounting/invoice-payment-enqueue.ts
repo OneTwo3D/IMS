@@ -122,7 +122,7 @@ export async function loadInvoicePaymentSyncRows(
       // here for r5's exclusion scoping and are not any more — nothing excludes a settlement record
       // on any identity now, so no consumer of these rows needs to know which organisation each was
       // raised against. See the note at the `classifyLedgerSettlement` call in
-      // invoice-payment-registration.ts, and bd o3d-hold1 for what a sound version would need.
+      // invoice-payment-registration.ts, and bd o3d-llyw for what a sound version would need.
     },
     orderBy: { createdAt: 'desc' },
   })

@@ -359,7 +359,7 @@ export function decideInvoicePaymentRegistration(input: {
         //
         // SO THE ROUND-2 BEHAVIOUR IS RESTORED: AN UNMEASURABLE SETTLEMENT WITHHOLDS, WHATEVER ID
         // ANY ROW OF OURS RECORDS. The permanent hold is real and is now tracked as its own problem
-        // (bd o3d-hold1) with the full cost of a sound exclusion written down. The trade is the one
+        // (bd o3d-llyw) with the full cost of a sound exclusion written down. The trade is the one
         // `classifyLedgerSettlement` has always stated: the cost of holding a genuine payment back
         // is a visible refusal with a nameable remedy, and the cost of the alternative is a second
         // payment on somebody's ledger, which is neither visible nor remediable.
