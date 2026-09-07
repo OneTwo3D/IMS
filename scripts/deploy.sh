@@ -2009,7 +2009,10 @@ publish_durable_dropin() {
 ensure_fence_marker_dir() {
   local dir
   [[ -n "${FENCE_FILE:-}" ]] || return 1
-  dir="$(dirname "${FENCE_FILE}")"
+  # THE STATUS IS TAKEN (o3d-batch-ret). Every caller of this reaches it through an `|| return`, so
+  # errexit is SUSPENDED here: an unchecked substitution that failed would hand on an empty string
+  # and the mkdir below would be aimed at the current directory.
+  dir="$(dirname "${FENCE_FILE}")" || return 1
   [[ -L "${dir}" ]] && return 1
   mkdir -p "${dir}" || return 1
   [[ -L "${dir}" ]] && return 1
@@ -2031,9 +2034,12 @@ ensure_fence_marker_dir() {
 # impeccable modes inside a directory the service account can write is a marker it can replace.
 fence_marker_is_trustworthy() {
   local self dir info rest owner mode kind
-  self="$(id -u)"
-  dir="$(dirname "${FENCE_FILE}")"
   FENCE_MARKER_REFUSAL=""
+  # AND THEIR STATUS IS TAKEN, for the reason above and one more: this function answers a SECURITY
+  # question, so a substitution that failed silently would compare an empty uid against an empty
+  # owner and answer "trustworthy". A refusal that cannot say why is still a refusal.
+  self="$(id -u)" || { FENCE_MARKER_REFUSAL="This run could not read its own uid, so it cannot say whether ${FENCE_FILE} is a record it wrote."; return 1; }
+  dir="$(dirname "${FENCE_FILE}")" || { FENCE_MARKER_REFUSAL="The directory holding ${FENCE_FILE} could not be named, so nothing can be said about who may replace what is in it."; return 1; }
 
   # THE FIELDS ARE CUT BY PARAMETER EXPANSION AND NOT BY `read` (o3d-secops r20). Two of these
   # three scripts set IFS to newline-and-tab, so `read -r a b c` of a SPACE-separated line puts the

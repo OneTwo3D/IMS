@@ -4308,6 +4308,369 @@ test('all three entrypoints resolve the cutover namespace from the same expressi
   }
 })
 
+
+// ---------------------------------------------------------------------------
+// THE MARKER'S PARENT (o3d-secops r20, Codex CRITICAL)
+//
+// ${FENCE_FILE} lived in ${CUTOVER_STATE_DIR} — the application's own data directory, which
+// section 8 hands to ${APP_USER} — and was protected by being root-owned and 0600. That protects
+// its BYTES. `unlink(2)` and `rename(2)` ask for write permission ON THE PARENT and ask nothing at
+// all about the file, so the account the fence exists to stop could remove the marker (which lifts
+// the `AssertPathExists=!` on the next boot) or move it aside and leave one of its own at the name
+// (which adoption reads as a record of what the interrupted privileged run did).
+//
+// WHAT THIS HARNESS CAN AND CANNOT SHOW, STATED RATHER THAN GLOSSED. It runs as ONE account, so
+// "${APP_USER} cannot, and root can" is not measurable here — that half rests on the same argument
+// the staging-directory prune rests on. What IS measured, for real and on a real filesystem: the
+// directory the shipped function creates and the modes it ends up with; the kernel's own answer to
+// "may this name be removed", which is a question about the parent's write bit and not about the
+// file (asserted only when this harness is unprivileged, because root bypasses it); every shape the
+// account could leave at the marker's name being REFUSED rather than adopted; and the relocation
+// itself, run against real files, leaving the host fenced at every instant.
+// ---------------------------------------------------------------------------
+
+/** The uid this harness runs as. `process.getuid` is optional in the platform typings — on a
+ *  platform that does not have it these tests cannot run at all, so its absence is a refusal
+ *  rather than a value to guess. */
+function harnessUid(): number {
+  assert.ok(typeof process.getuid === 'function', 'these tests measure ownership and need a uid')
+  return process.getuid!()
+}
+
+/** Where the relocated marker lives in these harnesses: a directory of the run's own, named as a
+ *  publication trust root exactly as /etc/ims-cutover is in production (it IS
+ *  ${DB_ENV_SNAPSHOT_DIR} there, which is why no new root had to be added for it). */
+const FENCE_RELOCATION_EXTRA = (dir: string) => `
+LEGACY_STATE_DIR_FENCE_FILE="${dir}/DEPLOY-FENCED"
+FENCE_MARKER_DIR="${dir}/marker-dir"
+FENCE_FILE="\${FENCE_MARKER_DIR}/DEPLOY-FENCED"
+DB_ENV_SNAPSHOT_DIR="\${FENCE_MARKER_DIR}"
+`
+
+for (const entry of R9_SCRIPTS) {
+  test(`${entry.name} creates the fence marker's directory owned by the run and private to it, and refuses a symlink at its name`, () => {
+    /**
+     * ROUTE: the shipped ensure_fence_marker_dir(), run for real, over a directory that already
+     * exists at 0777 — which is what the marker's old home effectively is, since ${DATA_DIR} is
+     * handed to ${APP_USER}. What is measured is the mode and owner left behind.
+     */
+    const made = runR9(entry, ['ensure_fence_marker_dir'], [
+      'mkdir -p "${FENCE_MARKER_DIR}"',
+      'chmod 0777 "${FENCE_MARKER_DIR}"',
+      'ensure_fence_marker_dir; echo "RC=$?"',
+      'stat -c "MODE=%a OWNER=%u KIND=%F" "${FENCE_MARKER_DIR}"',
+    ].join('\n'), FENCE_RELOCATION_EXTRA('$CUTOVER_STATE_DIR'))
+    assert.match(made.stdout, /^RC=0$/m, made.stdout)
+    assert.match(made.stdout, /^MODE=700 OWNER=\d+ KIND=directory$/m,
+      `the marker's directory must end up private to the account running the cutover:\n${made.stdout}`)
+    assert.match(made.stdout, new RegExp(`^MODE=700 OWNER=${harnessUid()} `, 'm'),
+      `and owned by it:\n${made.stdout}`)
+
+    // MEASURED BY MUTATION, ROUTE STATED: the same shipped function with its chmod made a no-op,
+    // which is what leaving the marker in a directory anybody can write amounts to. The 0777 stays.
+    const mutated = runR9(entry, [], [
+      shellFunction(entry.source, 'ensure_fence_marker_dir').replace('chmod 700 "${dir}" || return 1', ': "${dir}"'),
+      'mkdir -p "${FENCE_MARKER_DIR}"',
+      'chmod 0777 "${FENCE_MARKER_DIR}"',
+      'ensure_fence_marker_dir; echo "RC=$?"',
+      'stat -c "MODE=%a" "${FENCE_MARKER_DIR}"',
+    ].join('\n'), FENCE_RELOCATION_EXTRA('$CUTOVER_STATE_DIR'))
+    assert.match(mutated.stdout, /^MODE=777$/m,
+      `without the chmod the marker sits in a directory anybody can unlink it from — that is the finding:\n${mutated.stdout}`)
+
+    // AND A SYMLINK AT THAT NAME IS A REFUSAL, not something to chmod: `mkdir -p` is happy with a
+    // link to a directory, and a chmod would then secure whatever it points at.
+    const linked = runR9(entry, ['ensure_fence_marker_dir'], [
+      'mkdir -p "${CUTOVER_STATE_DIR}/elsewhere"',
+      'chmod 0777 "${CUTOVER_STATE_DIR}/elsewhere"',
+      'ln -s "${CUTOVER_STATE_DIR}/elsewhere" "${FENCE_MARKER_DIR}"',
+      // `set -e` is on, so the status is TAKEN rather than left to abort the rig — which would make
+      // the refusal indistinguishable from a harness that fell over.
+      'rc=0; ensure_fence_marker_dir || rc=$?; echo "RC=${rc}"',
+      'stat -c "TARGET=%a" "${CUTOVER_STATE_DIR}/elsewhere"',
+    ].join('\n'), FENCE_RELOCATION_EXTRA('$CUTOVER_STATE_DIR'))
+    assert.match(linked.stdout, /^RC=1$/m, `a symlink at the marker's directory must be refused:\n${linked.stdout}`)
+    assert.match(linked.stdout, /^TARGET=777$/m,
+      `and nothing may be done to what it points at:\n${linked.stdout}`)
+  })
+
+  test(`${entry.name} refuses to adopt anything at the marker's name that this run did not publish`, () => {
+    /**
+     * Every shape the account that owns the old parent could leave at the marker's name, and the
+     * one the installer publishes. ROUTE: the shipped fence_marker_is_trustworthy(), run for real
+     * against real files, with the refusal it produces printed.
+     *
+     * The FOURTH case is the finding itself: an impeccable 0600 marker inside a directory that is
+     * group- and other-writable — which is exactly the shape ${CUTOVER_STATE_DIR} has, because the
+     * installer hands that tree to ${APP_USER}.
+     */
+    const run = runR9(entry, ['ensure_fence_marker_dir', 'fence_marker_is_trustworthy'], [
+      'check() { fence_marker_is_trustworthy && echo "$1=TRUSTED" || echo "$1=REFUSED ${FENCE_MARKER_REFUSAL}"; }',
+      'rm -rf "${FENCE_MARKER_DIR}"',
+      'check missing',
+      'ensure_fence_marker_dir',
+      'printf "phase=stopping\\nmarker_complete=1\\n" > "${FENCE_FILE}"',
+      'chmod 600 "${FENCE_FILE}"',
+      'check published',
+      'rm -f "${FENCE_FILE}"; ln -s "${CUTOVER_STATE_DIR}/planted" "${FENCE_FILE}"',
+      'printf "phase=none\\n" > "${CUTOVER_STATE_DIR}/planted"',
+      'check symlink',
+      'rm -f "${FENCE_FILE}"; mkdir "${FENCE_FILE}"',
+      'check directory',
+      'rmdir "${FENCE_FILE}"',
+      'printf "phase=stopping\\n" > "${FENCE_FILE}"; chmod 600 "${FENCE_FILE}"',
+      'chmod 0777 "${FENCE_MARKER_DIR}"',
+      'check writable_parent',
+      'chmod 700 "${FENCE_MARKER_DIR}"',
+      'chmod 0666 "${FENCE_FILE}"',
+      'check writable_marker',
+    ].join('\n'), FENCE_RELOCATION_EXTRA('$CUTOVER_STATE_DIR'))
+
+    assert.match(run.stdout, /^published=TRUSTED$/m,
+      `the marker the installer publishes must be adoptable, or nothing recovers:\n${run.stdout}`)
+    for (const name of ['missing', 'symlink', 'directory', 'writable_parent', 'writable_marker']) {
+      assert.match(run.stdout, new RegExp(`^${name}=REFUSED `, 'm'),
+        `a ${name} at the marker's name is not a record of what a privileged run did:\n${run.stdout}`)
+    }
+    assert.match(run.stdout, /^writable_parent=REFUSED .*writable by group or other/m,
+      `and the refusal must name the parent, which is the whole finding:\n${run.stdout}`)
+
+    // MEASURED BY MUTATION, ROUTE STATED: the check adoption made before this round — `[[ -f ]]`,
+    // which follows a symlink and asks nothing about who wrote what it found. Every one of those
+    // shapes is then adopted.
+    const mutated = runR9(entry, ['ensure_fence_marker_dir'], [
+      'check() { [[ -f "${FENCE_FILE}" ]] && echo "$1=TRUSTED" || echo "$1=REFUSED"; }',
+      'ensure_fence_marker_dir',
+      'printf "phase=none\\n" > "${CUTOVER_STATE_DIR}/planted"',
+      'ln -s "${CUTOVER_STATE_DIR}/planted" "${FENCE_FILE}"',
+      'check symlink',
+      'rm -f "${FENCE_FILE}"',
+      'printf "phase=stopping\\n" > "${FENCE_FILE}"; chmod 600 "${FENCE_FILE}"',
+      'chmod 0777 "${FENCE_MARKER_DIR}"',
+      'check writable_parent',
+    ].join('\n'), FENCE_RELOCATION_EXTRA('$CUTOVER_STATE_DIR'))
+    assert.match(mutated.stdout, /^symlink=TRUSTED$/m,
+      `the existence check adopts a symlink somebody else planted — that is what it replaced:\n${mutated.stdout}`)
+    assert.match(mutated.stdout, /^writable_parent=TRUSTED$/m,
+      `and a marker in a directory anybody can rewrite:\n${mutated.stdout}`)
+  })
+
+  test(`${entry.name} moves a marker left at the pre-r20 path without ever leaving the host unfenced`, () => {
+    /**
+     * AN ALREADY-FENCED INSTALL, UPGRADED. The marker is at ${CUTOVER_STATE_DIR}/DEPLOY-FENCED and
+     * the installed drop-in names that path. ROUTE: the shipped import_relocated_fence_marker(),
+     * run for real through the shipped publisher.
+     *
+     * The claim is an ORDERING: the new marker exists and the OLD ONE IS STILL THERE when the
+     * import returns, because the drop-in on disk still asserts on the old one. Only
+     * install_reboot_fence(), after it has written, reloaded and VERIFIED a drop-in naming the new
+     * path, clears it.
+     */
+    const moved = runR9(entry, ['fsync_path', 'publish_durable_file', 'ensure_fence_marker_dir', 'import_relocated_fence_marker'], [
+      'printf "phase=stopping\\nschema_touched=true\\nmarker_complete=1\\n" > "${LEGACY_STATE_DIR_FENCE_FILE}"',
+      'import_relocated_fence_marker; echo "RC=$?"',
+      '[[ -f "${FENCE_FILE}" ]] && echo NEW_MARKER_PUBLISHED || echo NEW_MARKER_MISSING',
+      '[[ -f "${LEGACY_STATE_DIR_FENCE_FILE}" ]] && echo OLD_MARKER_STILL_FENCING || echo OLD_MARKER_GONE',
+      'cmp -s "${FENCE_FILE}" "${LEGACY_STATE_DIR_FENCE_FILE}" && echo SAME_BYTES || echo BYTES_DIFFER',
+    ].join('\n'), FENCE_RELOCATION_EXTRA('$CUTOVER_STATE_DIR'))
+    assert.match(moved.stdout, /^RC=0$/m, moved.stdout)
+    assert.match(moved.stdout, /^NEW_MARKER_PUBLISHED$/m, `the marker must reach its new home:\n${moved.stdout}`)
+    assert.match(moved.stdout, /^SAME_BYTES$/m, `carrying what the interrupted run recorded:\n${moved.stdout}`)
+    assert.match(moved.stdout, /^OLD_MARKER_STILL_FENCING$/m,
+      `and the old one must survive the import, because the drop-in on disk still asserts on it:\n${moved.stdout}`)
+    assert.match(moved.stdout, /Moved the cutover marker out of the application's own data directory/,
+      `and the operator must be told:\n${moved.stdout}`)
+
+    // MEASURED BY MUTATION, ROUTE STATED: the same shipped importer with the `rm -f` that
+    // import_legacy_file() performs appended to it — the obvious shape, and the dangerous one. The
+    // old marker is then gone while the installed drop-in still names it, so a reboot in the
+    // interval before the drop-in is re-pointed starts the service over the migrated schema.
+    const eager = runR9(entry, ['fsync_path', 'publish_durable_file', 'ensure_fence_marker_dir'], [
+      shellFunction(entry.source, 'import_relocated_fence_marker')
+        .replace('  return 0\n}', '  rm -f "${LEGACY_STATE_DIR_FENCE_FILE}"\n  return 0\n}'),
+      'printf "phase=stopping\\nmarker_complete=1\\n" > "${LEGACY_STATE_DIR_FENCE_FILE}"',
+      'import_relocated_fence_marker >/dev/null',
+      '[[ -f "${LEGACY_STATE_DIR_FENCE_FILE}" ]] && echo OLD_MARKER_STILL_FENCING || echo OLD_MARKER_GONE',
+    ].join('\n'), FENCE_RELOCATION_EXTRA('$CUTOVER_STATE_DIR'))
+    assert.match(eager.stdout, /^OLD_MARKER_GONE$/m,
+      `an importer that removes the old marker itself leaves the installed drop-in asserting on a file that is gone — that is the failure this ordering exists to avoid:\n${eager.stdout}`)
+
+    // AND BOTH ARE ALREADY PRESENT WITHOUT A REFUSAL, because that is what a crash between the
+    // publication and the re-pointed drop-in leaves, and it is the ordinary retry loop.
+    const both = runR9(entry, ['fsync_path', 'publish_durable_file', 'ensure_fence_marker_dir', 'import_relocated_fence_marker'], [
+      'ensure_fence_marker_dir',
+      'printf "phase=stopping\\ncanonical=1\\n" > "${FENCE_FILE}"',
+      'printf "phase=stopping\\nold=1\\n" > "${LEGACY_STATE_DIR_FENCE_FILE}"',
+      'import_relocated_fence_marker; echo "RC=$?"',
+      'grep -q "^canonical=1$" "${FENCE_FILE}" && echo CANONICAL_KEPT || echo CANONICAL_OVERWRITTEN',
+    ].join('\n'), FENCE_RELOCATION_EXTRA('$CUTOVER_STATE_DIR'))
+    assert.match(both.stdout, /^RC=0$/m, `a crash-recovery re-run must not be refused:\n${both.stdout}`)
+    assert.match(both.stdout, /^CANONICAL_KEPT$/m, `and the authoritative marker must not be overwritten:\n${both.stdout}`)
+    assert.match(both.stdout, /A cutover marker is present at BOTH/, `and it must be said out loud:\n${both.stdout}`)
+  })
+
+  test(`${entry.name} clears the pre-r20 marker only after the drop-in naming the new one is verified, and lifts both`, () => {
+    // THE ORDERING, ASSERTED IN THE SHIPPED TEXT: the removal is BELOW `REBOOT_FENCE_INSTALLED=true`,
+    // which install_reboot_fence() only reaches after publish_durable_dropin(), daemon-reload and
+    // verify_reboot_fence() have all succeeded. Above that line there is an interval in which the
+    // loaded drop-in still names the old marker.
+    const arm = shellFunction(entry.source, 'install_reboot_fence')
+    const installed = arm.indexOf('REBOOT_FENCE_INSTALLED=true')
+    const cleared = arm.indexOf('rm -f "${LEGACY_STATE_DIR_FENCE_FILE}"')
+    const verified = arm.indexOf('verify_reboot_fence')
+    assert.ok(installed !== -1 && cleared !== -1 && verified !== -1,
+      `install_reboot_fence() must verify the fence and then clear the pre-r20 marker:\n${arm}`)
+    assert.ok(verified < installed && installed < cleared,
+      `the pre-r20 marker may only be cleared once the new fence is verified:\n${arm}`)
+
+    // AND LIFTING THE FENCE LIFTS BOTH, run for real: a marker left at either path refuses the next
+    // boot, and there is then nothing left saying why.
+    const lifted = runR9(entry, ['remove_reboot_fence'], [
+      'systemctl(){ return 0; }',
+      'fence_dropin_file(){ echo "${CUTOVER_STATE_DIR}/dropin.conf"; }',
+      'FENCE_DROPIN_DIR="${CUTOVER_STATE_DIR}/dropin.d"',
+      'FENCE_DROPIN_FILE="${FENCE_DROPIN_DIR}/zz-deploy-fence.conf"',
+      'mkdir -p "${FENCE_DROPIN_DIR}" "${FENCE_MARKER_DIR}"',
+      ': > "${FENCE_DROPIN_FILE}"',
+      ': > "${FENCE_FILE}"',
+      ': > "${LEGACY_STATE_DIR_FENCE_FILE}"',
+      'remove_reboot_fence >/dev/null 2>&1 || true',
+      '[[ -e "${FENCE_FILE}" ]] && echo NEW_MARKER_REMAINS || echo NEW_MARKER_LIFTED',
+      '[[ -e "${LEGACY_STATE_DIR_FENCE_FILE}" ]] && echo OLD_MARKER_REMAINS || echo OLD_MARKER_LIFTED',
+    ].join('\n'), FENCE_RELOCATION_EXTRA('$CUTOVER_STATE_DIR'))
+    assert.match(lifted.stdout, /^NEW_MARKER_LIFTED$/m, lifted.stdout)
+    assert.match(lifted.stdout, /^OLD_MARKER_LIFTED$/m,
+      `a marker left at the pre-r20 path refuses the next boot just as well:\n${lifted.stdout}`)
+  })
+
+  test(`${entry.name} completes an ordinary install and an ordinary upgrade with the marker in its new home`, () => {
+    // AN ORDINARY INSTALL: nothing at either path. The import is a no-op, the writer creates the
+    // marker's directory itself, publishes into it, and what it published is adoptable.
+    const fresh = runR9(entry, ['fsync_path', 'publish_durable_file', 'ensure_fence_marker_dir', 'import_relocated_fence_marker',
+      'fence_marker_is_trustworthy', entry.writer], [
+      'import_relocated_fence_marker; echo "IMPORT_RC=$?"',
+      '[[ -e "${FENCE_FILE}" ]] && echo MARKER_INVENTED || echo NO_MARKER_YET',
+      // A PERMISSIVE UMASK, WHICH IS THE POINT. publish_durable_file() creates whatever components
+      // of the destination are missing, so the directory would exist either way — at whatever the
+      // ambient umask leaves. `umask 000` is what makes the difference between "the writer creates
+      // the marker's home ITSELF, root-owned and 0700" and "something created it, 0777" visible,
+      // and 0777 is precisely the shape a marker can be unlinked out of.
+      'umask 000',
+      `${entry.writer} "cutover started"; echo "WRITE_RC=$?"`,
+      'stat -c "MARKERDIR_MODE=%a" "${FENCE_MARKER_DIR}"',
+      'fence_marker_is_trustworthy && echo ADOPTABLE || echo "NOT_ADOPTABLE ${FENCE_MARKER_REFUSAL}"',
+      'grep -q "^marker_complete=1$" "${FENCE_FILE}" && echo COMPLETE || echo INCOMPLETE',
+      '[[ -e "${LEGACY_STATE_DIR_FENCE_FILE}" ]] && echo WROTE_OLD_PATH || echo OLD_PATH_UNUSED',
+    ].join('\n'), FENCE_RELOCATION_EXTRA('$CUTOVER_STATE_DIR'))
+    assert.match(fresh.stdout, /^IMPORT_RC=0$/m, fresh.stdout)
+    assert.match(fresh.stdout, /^NO_MARKER_YET$/m, `a fresh install must not invent a fence:\n${fresh.stdout}`)
+    assert.match(fresh.stdout, /^WRITE_RC=0$/m, `and the writer must create its own directory:\n${fresh.stdout}`)
+    assert.match(fresh.stdout, /^MARKERDIR_MODE=700$/m,
+      `and it must be private to this run whatever the ambient umask is, or the marker can be unlinked out of it:\n${fresh.stdout}`)
+    assert.match(fresh.stdout, /^ADOPTABLE$/m, `and publish something the next run may act on:\n${fresh.stdout}`)
+    assert.match(fresh.stdout, /^COMPLETE$/m, fresh.stdout)
+    assert.match(fresh.stdout, /^OLD_PATH_UNUSED$/m,
+      `and nothing may be written to the path inside the application's own data directory:\n${fresh.stdout}`)
+
+    // AN ORDINARY UPGRADE: a marker this round's own code left at the new path. Nothing is imported,
+    // nothing is refused, and it is adopted exactly as it was written.
+    const upgrade = runR9(entry, ['fsync_path', 'publish_durable_file', 'ensure_fence_marker_dir', 'import_relocated_fence_marker',
+      'fence_marker_is_trustworthy'], [
+      'ensure_fence_marker_dir',
+      'printf "phase=stopping\\nschema_touched=true\\nmarker_complete=1\\n" > "${FENCE_FILE}"',
+      'chmod 600 "${FENCE_FILE}"',
+      'import_relocated_fence_marker; echo "IMPORT_RC=$?"',
+      'fence_marker_is_trustworthy && echo ADOPTABLE || echo "NOT_ADOPTABLE ${FENCE_MARKER_REFUSAL}"',
+      'grep -q "^schema_touched=true$" "${FENCE_FILE}" && echo UNCHANGED || echo REWRITTEN',
+    ].join('\n'), FENCE_RELOCATION_EXTRA('$CUTOVER_STATE_DIR'))
+    assert.match(upgrade.stdout, /^IMPORT_RC=0$/m, upgrade.stdout)
+    assert.match(upgrade.stdout, /^ADOPTABLE$/m, upgrade.stdout)
+    assert.match(upgrade.stdout, /^UNCHANGED$/m, `an upgrade may not rewrite the record it is adopting:\n${upgrade.stdout}`)
+  })
+}
+
+test('all three reboot-fence drop-ins assert on the one marker, so a fence one entrypoint writes is a fence the others see', () => {
+  // THE HALF THAT WOULD BE WORSE THAN THE FINDING. ${FENCE_FILE} resolving identically in all three
+  // is asserted above; this is the other end of it — what systemd is actually told to look at. A
+  // drop-in naming a different path from the marker the same script publishes is a fence that is
+  // invisible to the run that has to lift it.
+  const asserted = R9_SCRIPTS.map((entry) => {
+    const lines = entry.source.split(/\r?\n/).filter((line) => line.startsWith('AssertPathExists='))
+    assert.equal(lines.length, 1, `${entry.name} must install exactly one reboot-fence assertion: ${lines.join(' | ')}`)
+    return lines[0]
+  })
+  assert.equal(new Set(asserted).size, 1,
+    `the three drop-ins must assert on the same marker:\n${R9_SCRIPTS.map((e, i) => `${e.name}: ${asserted[i]}`).join('\n')}`)
+  assert.equal(asserted[0], 'AssertPathExists=!${FENCE_FILE}',
+    `and on the constant rather than on a path retyped beside it: ${asserted[0]}`)
+
+  // AND EVERY ONE OF THEM ASKS WHETHER THE MARKER MAY BE BELIEVED BEFORE IT READS ONE (o3d-secops
+  // r20). The refusal is exercised for real above; what is asserted here is that adoption actually
+  // goes through it, which no run of the function on its own can show. It must come BEFORE the
+  // first line of the marker is read, so `marker_phase` is the boundary.
+  for (const entry of R9_SCRIPTS) {
+    const lines = entry.source.split(/\r?\n/)
+    const checked = lines.findIndex((line) => line.includes('fence_marker_is_trustworthy || die'))
+    // install.sh keeps its adoption in a function and its phase in a local, so the boundary is the
+    // call itself rather than one spelling of the variable it lands in.
+    const read = lines.findIndex((line) => /=\"\$\(marker_phase\)\"$/.test(line.trim()))
+    assert.ok(checked !== -1, `${entry.name} must refuse a marker it cannot trust before adopting it`)
+    assert.ok(read !== -1, `${entry.name} must still read the phase it adopts`)
+    assert.ok(checked < read,
+      `${entry.name} asks whether the marker may be believed AFTER reading it, which is no check at all`)
+
+    // AND THE RELOCATION IS LOOKED FOR ON EVERY RUN, not only on a host that used the namespace
+    // deploy.sh kept before o3d-2sm1.5. import_legacy_cutover_state() returns early when
+    // ${LEGACY_CUTOVER_STATE_DIR} is absent, so a call placed after that early return would never
+    // fire on the hosts this migration is actually for.
+    const body = shellFunction(entry.source, 'import_legacy_cutover_state')
+    const relocation = body.indexOf('import_relocated_fence_marker')
+    const earlyReturn = body.indexOf('|| return 0')
+    assert.ok(relocation !== -1, `${entry.name} must look for a marker at the pre-r20 path:\n${body}`)
+    assert.ok(earlyReturn !== -1 && relocation < earlyReturn,
+      `${entry.name} looks for it only after an early return that most hosts take:\n${body}`)
+  }
+})
+
+test('the kernel decides whether a name may be removed by the PARENT, which is the whole of the finding', () => {
+  /**
+   * NOT A CLAIM ABOUT THE SHIPPED CODE — a claim about `unlink(2)`, measured on a real filesystem,
+   * because it is the premise everything above rests on and it was the premise the previous round
+   * got wrong ("root-owned so that the service account cannot forge a fence").
+   *
+   * A file at mode 0400 that its owner cannot write is removed without complaint from a directory
+   * that is writable, and is NOT removable from one that is not. The file's mode is not consulted.
+   *
+   * ONLY WHEN UNPRIVILEGED: root bypasses the permission check entirely, so under root this would
+   * assert nothing. The run's uid is printed either way, so a suite that quietly became root does
+   * not quietly turn this into a pass.
+   */
+  const base = createTempDirSync('ims-secops-r20-unlink-')
+  const writable = join(base, 'writable')
+  const sealed = join(base, 'sealed')
+  for (const dir of [writable, sealed]) mkdirSync(dir)
+  for (const dir of [writable, sealed]) {
+    writeFileSync(join(dir, 'DEPLOY-FENCED'), 'phase=stopping\n')
+    chmodSync(join(dir, 'DEPLOY-FENCED'), 0o400)
+  }
+  chmodSync(sealed, 0o500)
+  try {
+    const removed = runShell(`rm -f ${JSON.stringify(join(writable, 'DEPLOY-FENCED'))}; echo "RC=$?"`)
+    assert.match(removed.output, /^RC=0$/m, `a 0400 file in a writable directory is removed: ${removed.output}`)
+    assert.equal(existsSync(join(writable, 'DEPLOY-FENCED')), false,
+      'the file mode protects the BYTES and says nothing about the name')
+
+    if (harnessUid() !== 0) {
+      const refused = runShell(`rm -f ${JSON.stringify(join(sealed, 'DEPLOY-FENCED'))} 2>&1; echo "RC=$?"`)
+      assert.match(refused.output, /^RC=[^0]/m, `and the same file is NOT removable from a sealed directory: ${refused.output}`)
+      assert.equal(existsSync(join(sealed, 'DEPLOY-FENCED')), true, 'the parent is what decides')
+    }
+  } finally {
+    chmodSync(sealed, 0o700)
+    rmSync(base, { recursive: true, force: true })
+  }
+})
+
 test('all three entrypoints carry the same durability and namespace primitives, byte for byte', () => {
   // A fix applied to one script and not the others is how both the AND-OR harness defect and
   // this namespace split survived a round. Shared text cannot drift silently.
