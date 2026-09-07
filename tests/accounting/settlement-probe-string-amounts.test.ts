@@ -1181,6 +1181,206 @@ test('[o3d-obyd r31] contradictory settled figures refuse, rather than the zero 
     'and it proves the collection just as the totals pair does')
 })
 
+/* ------------------------------------------------------------------------------------------- *
+ * 6b. o3d-acctmoney (Codex HIGH) — THE IDENTITY HAS FOUR TERMS, AND THE MISSING ONE REFUSED A
+ *     DOCUMENT XERO SENDS CORRECTLY.
+ *
+ * `AmountDue = Total - CISDeduction - AmountPaid - AmountCredited`. Under the UK Construction
+ * Industry Scheme a contractor withholds `CISDeduction` from a subcontractor and pays it to HMRC:
+ * it comes off `AmountDue` and it is in NO payment, NO credit note, NO prepayment and NO
+ * overpayment. The three-term identity therefore read every CIS invoice as self-contradictory, and
+ * the shortfall check would have read the deduction as settlement nobody could account for.
+ *
+ * These are the first tests on this branch about a document that is RIGHT. Everything above them
+ * refuses something malformed; these pin what must keep working, which is the ordinary first
+ * payment against a UK construction invoice.
+ * ------------------------------------------------------------------------------------------- */
+
+/** Codex's shape, verbatim, before anything has been paid against it. */
+const CIS_UNPAID = {
+  CurrencyCode: 'GBP', Total: 400, CISDeduction: 80, AmountDue: 320,
+  AmountPaid: 0, AmountCredited: 0, Payments: [],
+}
+
+test('[o3d-acctmoney] Codex\'s CIS invoice is coherent UNPAID, and the first payment still posts', async () => {
+  // ROUTE: probeXeroSettlement's invoice arm -> wireAmount(invoice.CISDeduction) -> settledFromTotals
+  //        = Total - AmountDue - CISDeduction -> agreement check -> settled/explained shortfall ->
+  //        settlementAnswer -> classifyLedgerSettlement.
+  // MUTATION: drop the third term (`subtractMoney(total, amountDue)` alone, which is what stood
+  //        before this commit). Measured: ok:false, "two amounts settled ... 80.00 by Total less
+  //        AmountDue and 0.00 by AmountPaid plus AmountCredited" — the finding, exactly.
+
+  // PRECONDITION 1 — the THREE-term identity really does fail on this document, stated as arithmetic
+  // here rather than taken on trust from the probe. If Xero ever stopped reducing AmountDue by the
+  // deduction this would become 0 and the test would be examining nothing.
+  assert.equal(CIS_UNPAID.Total - CIS_UNPAID.AmountDue, 80,
+    'PRECONDITION: the three-term derivation says 80 has settled...')
+  assert.equal(CIS_UNPAID.AmountPaid + CIS_UNPAID.AmountCredited, 0,
+    '...while the component pair says nothing has, which is the disagreement that refused it')
+  // PRECONDITION 2 — and the FOUR-term identity is the one that holds.
+  assert.equal(CIS_UNPAID.Total - CIS_UNPAID.AmountDue - CIS_UNPAID.CISDeduction, 0,
+    'PRECONDITION: with the deduction taken off, the two derivations agree at zero')
+  assert.equal(CIS_UNPAID.Payments.length, 0, 'and there is no record that could carry the answer instead')
+
+  const probe = await probeInvoice(CIS_UNPAID)
+  assert.equal(probe.ok, true, 'a correct UK construction invoice is not an incoherent response')
+  assert.equal(probe.ok === true ? probe.records.length : null, 0,
+    'nothing has settled it, and the ledger says so in its own numbers')
+  assert.equal(probe.ok === true ? probe.provedComplete : null, true,
+    'the emptiness is PROVED by the four-term identity, not assumed from a missing figure')
+
+  // THE END THIS PROTECTS, and it is the ordinary operation: `clear` is what authorises the post.
+  assert.equal(classifyLedgerSettlement(attemptFor('320.00'), probe).outcome, 'clear',
+    'the first payment against a CIS invoice must post, not queue for a human')
+})
+
+test('[o3d-acctmoney] the SAME CIS invoice once PAID accounts for itself, and does not clear again', async () => {
+  // ROUTE: as above, with the deduction now sitting between a zero AmountDue and a Total the
+  //        payment does not reach: settled = 400 - 0 - 80 = 320, explained = the 320 payment.
+  // MUTATION: drop the third term. settled becomes 400, explained stays 320, and the probe answers
+  //        ok:false "Xero reports 400.00 already settled ... but only 320.00 of it is accounted
+  //        for" — measured. The retry of a CIS payment is refused as malformed.
+
+  const CIS_PAID = {
+    CurrencyCode: 'GBP', Total: 400, CISDeduction: 80, AmountDue: 0,
+    AmountPaid: 320, AmountCredited: 0,
+    Payments: [{ PaymentID: 'PAY-1', Date: `${DATE}T00:00:00`, Amount: 320, Reference: 'IMS-abc123abc123' }],
+  }
+
+  // PRECONDITION — the subcontractor is paid 320 and HMRC gets 80, so the document is FULLY settled
+  // at an AmountDue of zero while `AmountPaid` is 80 short of `Total`. That gap is the deduction,
+  // and it is exactly what no collection on this response can ever explain.
+  assert.equal(CIS_PAID.Total - CIS_PAID.AmountPaid, 80, 'PRECONDITION: Total exceeds what was paid...')
+  assert.equal(CIS_PAID.AmountDue, 0, '...and yet nothing is still due, because the rest went to HMRC')
+  assert.equal(CIS_PAID.Total - CIS_PAID.AmountDue - CIS_PAID.CISDeduction,
+    CIS_PAID.AmountPaid + CIS_PAID.AmountCredited,
+    'PRECONDITION: the four-term identity holds on the paid invoice too')
+
+  const probe = await probeInvoice(CIS_PAID)
+  assert.equal(probe.ok, true)
+  assert.equal(probe.ok === true ? probe.provedComplete : null, true,
+    'the payment list is measured against a figure the deduction no longer inflates')
+  assert.deepEqual(probe.ok === true ? probe.records : null, [
+    { amount: toDecimal(320), date: DATE, id: 'PAY-1', reference: 'IMS-abc123abc123' },
+  ])
+
+  // AND THE POINT OF READING IT AT ALL: the payment that is already there is FOUND, so a retry is
+  // told it is present rather than being told the document is clear.
+  const again = classifyLedgerSettlement(attemptFor('320.00'), probe)
+  assert.equal(again.outcome, 'present',
+    'the settlement IMS already made is visible, which is what stops the second one')
+  assert.notEqual(again.outcome, 'clear')
+})
+
+test('[o3d-acctmoney] a non-CIS invoice is untouched: an ABSENT deduction is a zero, not a skip', async () => {
+  // ROUTE: `cisDeductionRead.value ?? toDecimal(0)` -> settledFromTotals -> settlementAnswer.
+  // MUTATION: make an ABSENT deduction refuse the way an unreadable one does (hand
+  //        completenessCannotRun an `unreadable: '(absent)'` reading when the field is missing).
+  //        Measured: this test fails, and so do 19 others — every ordinary Xero invoice in the file,
+  //        because outside the scheme nothing states the field. Fail-closed on absence is the
+  //        plausible wrong answer here, and it is the one this pins.
+  // NOT A MUTATION, STATED SO NOBODY SPENDS AN AFTERNOON ON IT: guarding the subtraction on the
+  //        figure being stated (`cis !== null ? T - D - cis : T - D`) is EQUIVALENT to `T - D -
+  //        (cis ?? 0)` and no test can distinguish it. It is a refactor of this line, not a defect
+  //        in it, which is why the assertion below is an EQUIVALENCE against the explicit zero
+  //        rather than a claim about how the zero is spelled.
+
+  // The ordinary part-paid invoice, with no such field anywhere in the response.
+  const NO_FIELD = {
+    CurrencyCode: 'GBP', Total: 100, AmountDue: 90, AmountPaid: 10, AmountCredited: 0,
+    Payments: [{ PaymentID: 'PAY-1', Date: `${DATE}T00:00:00`, Amount: 10 }],
+  }
+  assert.equal('CISDeduction' in NO_FIELD, false, 'PRECONDITION: the field is absent, not zero')
+
+  const absent = await probeInvoice(NO_FIELD)
+  const explicitZero = await probeInvoice({ ...NO_FIELD, CISDeduction: 0 })
+
+  assert.equal(absent.ok, true, 'an invoice outside the scheme still answers')
+  assert.deepEqual(absent, explicitZero,
+    'and it answers IDENTICALLY to the same invoice that states a zero deduction — same records, '
+    + 'same provedComplete, same everything')
+  assert.equal(classifyLedgerSettlement(attemptFor('90.00'), absent).outcome, 'clear',
+    'the ordinary second instalment is unaffected by any of this')
+})
+
+test('[o3d-acctmoney] an UNREADABLE CISDeduction refuses, and does not quietly become a zero', async () => {
+  // ROUTE: wireAmount -> `unreadable` -> completenessCannotRun -> ok:false, before any arithmetic.
+  // MUTATION: remove `['CISDeduction', cisDeductionRead]` from the completenessCannotRun list. The
+  //        reading then falls through `?? toDecimal(0)`, the figures below agree at 80, and the
+  //        probe answers ok:true with provedComplete — measured. A figure Xero STATED and IMS
+  //        could not read would have been spent as permission, which is o3d-obyd's whole finding
+  //        reintroduced through the new field.
+
+  // The shape is chosen so the mutation is SILENT rather than merely differently-worded: with the
+  // deduction read as zero these four figures are coherent and the payment list is whole.
+  const COHERENT_IF_ZERO = {
+    CurrencyCode: 'GBP', Total: 400, AmountDue: 320, AmountPaid: 80, AmountCredited: 0,
+    Payments: [{ PaymentID: 'PAY-1', Date: `${DATE}T00:00:00`, Amount: 80 }],
+  }
+  const control = await probeInvoice(COHERENT_IF_ZERO)
+  assert.equal(control.ok, true,
+    'PRECONDITION: with NO deduction stated this document is accepted, so nothing else can be doing the refusing')
+  assert.equal(control.ok === true ? control.provedComplete : null, true)
+
+  for (const [stated, named] of [['eighty', 'eighty'], ['', '(blank)'], [{ Amount: 80 }, 'object']] as const) {
+    const probe = await probeInvoice({ ...COHERENT_IF_ZERO, CISDeduction: stated })
+    assert.equal(probe.ok, false, `a CISDeduction of ${JSON.stringify(stated)} is not a figure IMS may ignore`)
+    assert.match(reasonOf(probe), new RegExp(`CISDeduction ${named.replace(/[()]/g, '\\$&')}`),
+      'and the refusal NAMES it, so an operator is told which figure could not be read')
+    assert.match(reasonOf(probe), /cannot read as an amount/)
+    assert.notEqual(classifyLedgerSettlement(attemptFor('320.00'), probe).outcome, 'clear')
+  }
+
+  // AND THE MAGNITUDE RULE IS INHERITED TOO, which is the other half of "the same discipline as
+  // every other figure": a JSON number too large to hold half a minor unit is a figure whose token
+  // `Response.json()` has already destroyed, and it is refused rather than read.
+  const overBound = await probeInvoice({
+    ...COHERENT_IF_ZERO, CISDeduction: ledgerDifferenceMagnitudeBound('GBP'),
+  })
+  assert.equal(overBound.ok, false,
+    'a deduction at the difference bound cannot be subtracted to within half a penny, so it is not subtracted')
+  assert.match(reasonOf(overBound), /CISDeduction /)
+
+  // A NUMERIC STRING IS THE ORDINARY CASE AND IS READ, not refused — same decoder as every other
+  // money figure this file admits.
+  const asText = await probeInvoice({ ...CIS_UNPAID, CISDeduction: '80.00' })
+  assert.equal(asText.ok, true, 'text is how one of these two ledgers states its money')
+  assert.equal(asText.ok === true ? asText.provedComplete : null, true)
+  assert.equal(classifyLedgerSettlement(attemptFor('320.00'), asText).outcome, 'clear')
+})
+
+test('[o3d-acctmoney] the contradiction check still catches a real contradiction, deduction and all', async () => {
+  // ROUTE: settledFromTotals (four-term) vs settledFromComponents -> they differ -> ok:false.
+  // MUTATION: delete the agreement check and restore `settled = settledFromTotals ?? …`. The probe
+  //        then answers ok:true over an EMPTY record list with a settled figure of exactly zero and
+  //        the classifier says `clear` — measured. This is o3d-obyd r31's finding, re-run on a
+  //        document that now goes through the CIS term, so widening the identity did not widen the
+  //        hole it closed.
+
+  // Codex's invoice with a credit Xero also says nothing was: the four-term derivation says zero has
+  // come off, the component pair says 10 has.
+  const CIS_CONTRADICTORY = { ...CIS_UNPAID, AmountCredited: 10 }
+  assert.equal(
+    CIS_CONTRADICTORY.Total - CIS_CONTRADICTORY.AmountDue - CIS_CONTRADICTORY.CISDeduction, 0,
+    'PRECONDITION: the corrected derivation still says nothing has settled...')
+  assert.equal(CIS_CONTRADICTORY.AmountPaid + CIS_CONTRADICTORY.AmountCredited, 10,
+    '...and the component pair still says 10 has, so this is a genuine disagreement and not the CIS gap')
+
+  const probe = await probeInvoice(CIS_CONTRADICTORY)
+  assert.equal(probe.ok, false, 'a proved zero must not be forged out of two figures that cannot both be true')
+  assert.match(reasonOf(probe), /two amounts settled against this document that do not agree/)
+  assert.match(reasonOf(probe), /0\.00 by Total less AmountDue less the 80\.00 CIS deduction/,
+    'and the sentence names the third term it took off, or an operator cannot check the arithmetic')
+  assert.match(reasonOf(probe), /10\.00 by AmountPaid plus AmountCredited/)
+  assert.notEqual(classifyLedgerSettlement(attemptFor('320.00'), probe).outcome, 'clear')
+
+  // THE DISCRIMINATING HALF: the same document without the spurious credit is the CIS invoice that
+  // must keep working, so this test cannot pass by refusing everything with a deduction on it.
+  const coherent = await probeInvoice(CIS_UNPAID)
+  assert.equal(coherent.ok, true)
+  assert.equal(classifyLedgerSettlement(attemptFor('320.00'), coherent).outcome, 'clear')
+})
+
 test('[o3d-obyd r31 / o3d-zo4j] the FIGURELESS unproved answer carries records — and the EXCESS one does not', async () => {
   // WHY THIS EXISTS. `authoriseMoneyPost`'s undescribable-attempt branch is the one place outside
   // `classifyLedgerSettlement` that draws a conclusion from a record list directly, and it draws the
