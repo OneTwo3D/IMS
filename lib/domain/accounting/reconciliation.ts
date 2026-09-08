@@ -263,6 +263,11 @@ type PersistedAccountingReconciliationRun = {
   warningCount: number
   criticalCount: number
   createdAt: Date | string
+  /**
+   * o3d-11rf r5: the run's truncation sentinels, or `null` for a run written before the column
+   * existed. `null` is UNKNOWN completeness, not "complete" — see the migration.
+   */
+  truncations?: unknown
   findings?: PersistedAccountingReconciliationFinding[]
   _count?: { findings: number }
 }
@@ -283,6 +288,57 @@ type AccountingReconciliationPersistenceClient = {
 export const ACCOUNTING_RECONCILIATION_FINDING_STATUSES = ['OPEN', 'RESOLVED', 'ACCEPTED'] as const
 export const MAX_RECONCILIATION_LIST_RUNS = 100
 export const MAX_RECONCILIATION_FINDINGS_PER_RUN = 500
+
+/**
+ * o3d-11rf r5 (Codex r4, HIGH) — THE FINDINGS WHOSE WHOLE CONTENT IS "THIS REPORT IS INCOMPLETE",
+ * and why they may not be left to compete for the budget they describe.
+ *
+ * WHAT CODEX FOUND. r3 bounded the contradiction query at `MAX_RECONCILIATION_FINDINGS_PER_RUN`
+ * precisely so nothing is written that the run view cannot render — and then appended the truncation
+ * warning AFTER the loop, making 501 rows for a 500-row page. The row most likely to be dropped is
+ * the one saying the list is short. r3's stated guarantee — "a short list with no truncation finding
+ * beside it proves the list is complete" — is therefore FALSE at exactly the boundary it was written
+ * for, and a mechanism that can be discarded for being one row too many is not a mechanism.
+ *
+ * IT IS NOT FIXABLE BY ORDERING, WHICH IS WHY THE REMEDY IS STRUCTURAL. A run's findings are written
+ * by ONE `createMany` inside ONE transaction, and `createdAt` defaults to CURRENT_TIMESTAMP — in
+ * PostgreSQL, transaction start time. Every finding of a run shares one `createdAt`, so the reader's
+ * `orderBy: { createdAt: 'asc' }, take: 500` has nothing to order by and returns whichever 500 the
+ * plan emits. "Prioritise the sentinel" would need a priority column and an ORDER BY on it. Given a
+ * migration either way, the honest place for the fact is the RUN — where it is returned with the run
+ * row, including to the cheap list view that asks for no findings at all.
+ *
+ * A REGISTRY, AND THE PRODUCERS SPELL THEIR CODE FROM IT. Both `addRowCapFindings` and
+ * `addUnclassifiedVoidMirrorFindings` take their `code` from these constants, so the string at the
+ * push site IS the entry here and the two cannot drift apart. A NEW sentinel still has to be added
+ * by hand — no mechanism enforces that — which is why this note names the property to look for:
+ * a finding that describes the completeness of the report rather than a defect in the data.
+ */
+export const RECONCILIATION_ROW_CAP_REACHED = 'reconciliation_row_cap_reached'
+export const VOID_MIRROR_CONTRADICTIONS_TRUNCATED = 'void_mirror_basis_unknown_contradictions_truncated'
+export const RECONCILIATION_TRUNCATION_FINDING_CODES: ReadonlySet<string> = new Set([
+  RECONCILIATION_ROW_CAP_REACHED,
+  VOID_MIRROR_CONTRADICTIONS_TRUNCATED,
+])
+
+/** One truncation sentinel, lifted onto the run row. Carries the message so it needs no re-rendering. */
+export type AccountingReconciliationTruncation = {
+  code: string
+  message: string
+  details: unknown
+}
+
+/**
+ * The run-level incompleteness record. Returns `[]` — never `null` — when nothing was truncated:
+ * `[]` says "asked and answered", and only a run written before the column existed may say nothing.
+ */
+export function reconciliationTruncations(
+  findings: readonly AccountingReconciliationFinding[],
+): AccountingReconciliationTruncation[] {
+  return findings
+    .filter((finding) => RECONCILIATION_TRUNCATION_FINDING_CODES.has(finding.code))
+    .map((finding) => ({ code: finding.code, message: finding.message, details: finding.details }))
+}
 
 export const DEFAULT_RECONCILIATION_LOOKBACK_DAYS = 90
 const MAX_RECONCILIATION_ROWS = 10_000
@@ -709,7 +765,7 @@ function addRowCapFindings(
     if (count < MAX_RECONCILIATION_ROWS) continue
     findings.push({
       severity: 'warning',
-      code: 'reconciliation_row_cap_reached',
+      code: RECONCILIATION_ROW_CAP_REACHED,
       message: `Accounting reconciliation reached the ${MAX_RECONCILIATION_ROWS} row cap for ${dataset}; report may be incomplete`,
       details: {
         dataset,
@@ -1134,13 +1190,20 @@ function addUnclassifiedVoidMirrorFindings(
   }
 
   // THE BOUND, SAID OUT LOUD. `total` is counted by the statement that produced the page, over the
-  // same snapshot, so this is not "there may be more" — it is HOW MANY more. A short list with no
-  // such finding beside it therefore means the list is COMPLETE, which is the property that makes the
-  // list worth reading at all; without it the truncation would be the original defect one level up.
+  // same snapshot, so this is not "there may be more" — it is HOW MANY more.
+  //
+  // r5: THIS ROW IS NO LONGER THE ONLY WITNESS, AND MUST NOT BE. r3 claimed that a short list with
+  // no such finding beside it proves the list is COMPLETE. That was false at the one boundary it was
+  // written for: the loop above appends up to MAX_VOID_MIRROR_CONTRADICTIONS findings and this is one
+  // more, so on a run that truncates it is the 501st row of a 500-row page — the row saying "this
+  // list is short" dropped for being one row too many. It is still emitted, because next to the rows
+  // it describes is where it reads best; but the load-bearing copy is now lifted onto the RUN by
+  // `reconciliationTruncations`, which no findings page can drop. See
+  // RECONCILIATION_TRUNCATION_FINDING_CODES.
   if (contradictions.total > contradictions.rows.length) {
     findings.push({
       severity: 'warning',
-      code: 'void_mirror_basis_unknown_contradictions_truncated',
+      code: VOID_MIRROR_CONTRADICTIONS_TRUNCATED,
       message:
         `${contradictions.total} unclassified VOID mirrors have live sync rows still working on the same `
         + `document; only the first ${contradictions.rows.length} are listed. The rest are not in this `
@@ -1497,6 +1560,11 @@ export async function persistAccountingReconciliationReport(
         totalCount: report.summary.total,
         warningCount: report.summary.warning,
         criticalCount: report.summary.critical,
+        // o3d-11rf r5: the same sentinels are ALSO written as findings, because they are worth
+        // reading beside the rows they describe. But a finding is subject to the reader's page and
+        // this is not, and `totalCount` above cannot substitute: it counts findings, and says
+        // nothing about whether the DATASETS behind them were complete.
+        truncations: toJsonInputValue(reconciliationTruncations(report.findings)),
       },
     })
 

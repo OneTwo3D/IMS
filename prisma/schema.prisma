@@ -2817,6 +2817,11 @@ model AccountingReconciliationRun {
   warningCount  Int
   criticalCount Int
   createdAt     DateTime @default(now())
+  /// o3d-11rf r5 — THE INCOMPLETENESS OF THIS RUN, RECORDED WHERE THE FINDINGS PAGE CANNOT DROP IT.
+  /// An array of the run's truncation sentinels ({ code, message, details }). NULL means the run
+  /// predates the column, i.e. its completeness is UNKNOWN; `[]` means it was recorded and nothing
+  /// was truncated. See RECONCILIATION_TRUNCATION_FINDING_CODES.
+  truncations   Json?
 
   findings      AccountingReconciliationFinding[]
 
