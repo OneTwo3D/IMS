@@ -4725,430 +4725,168 @@ test('[o3d-ov60] update.sh copies the git metadata into a directory it created a
 })
 
 // ---------------------------------------------------------------------------
-// AND THE PIN HELD ACROSS EVERY OPERATION IT WAS TAKEN FOR (o3d-ov60 r2, Codex CRITICAL)
+// SITE 5 IS WITHDRAWN, AND THIS IS THE RECORD OF WHY (o3d-ov60 r4)
 //
-// r1 walked into the backup directory with mkdir_service_subdir(), which RESTORES THE WORKING
-// DIRECTORY — and the dump redirection, the publication `mv` and the `rm --` prune then each
-// re-resolved ${BACKUP_DIR} by name. A directory proved at one instant and operated through its
-// name three times afterwards is proved for none of the three. So the block is lifted WHOLE now,
-// from the guard down to the descriptor's close, and the two windows are forced open through call
-// sites the shipped code itself makes: `info` (between the walk and the dump) and
-// `pin_migration_window` (between the dump and the publication and prune). Nothing is spliced into
-// the shipped text to do it.
+// Three rounds tried to make a root-side `pg_dump`, `mv` and `rm --` safe INSIDE a directory
+// ${APP_USER} may own, because `IMS_BACKUP_DIR` puts them there and nothing validates it. Each
+// round closed its finding by opening a worse one, and the third opened ARBITRARY CODE EXECUTION
+// AS ROOT. What ships now is the `mkdir -p` and the plain redirection that were here before the
+// branch — the status quo ante, which is a denial of service that has always been reachable
+// through that override and is not a regression.
+//
+//   r1  the symlink-proof walk, through the twin that RESTORES the working directory, after which
+//       the dump, the publication and the prune each re-resolved ${BACKUP_DIR} by name. The guard
+//       was not wrong, it was SPENT.
+//   r2  the walk's result kept and pinned as a descriptor, with `set -C` creating the partial.
+//       `set -C` is open(O_CREAT|O_EXCL) only until that open FAILS: bash re-opens WITHOUT O_EXCL
+//       for anything that is not a regular file, so a planted named pipe was OPENED, and an open
+//       of a FIFO with no reader BLOCKS — with the service stopped, cron stopped and the database
+//       connections fenced.
+//   r3  a node helper, scripts/lib/write-new-file.mjs, to name `O_EXCL|O_NONBLOCK` where a shell
+//       cannot. That is what the two tests below are about.
+//
+// AND THE WALK'S ANCHOR WAS NEVER SOUND EITHER. enter_service_subdir() treats its FIRST argument
+// as a trusted root — `mkdir -p`, `cd -P`, no checks — and its own refusal text says the walk
+// "only means anything for components below the directory the service account owns". r1 handed it
+// `${BACKUP_DIR%/*}`, which is a prefix of the untrusted override, so everything above the final
+// component was entered unvalidated. Constraining the override instead is o3d-noka; the
+// repository-wide helper-provenance design is o3d-kyqa.
 // ---------------------------------------------------------------------------
 
-const UPDATE_BACKUP_DIR = shippedUpdateBlock(
-  '  BACKUP_DIR_WALK="${BACKUP_DIR%/}"',
-  '  exec {BACKUP_DIR_FD}<&-',
-)
-
-/**
- * THE SEQUENCE update.sh CARRIED UNTIL o3d-ov60 r2, WHICH IS THE MUTATION.
- *
- * It is the r1 shape: the same walk, through the twin that gives the working directory back, and
- * then three operations that each name ${BACKUP_DIR} or ${BACKUP_TARGET} again. It is typed here
- * rather than lifted because it is no longer in any shipped file — which is exactly what makes it
- * a mutation and not a second reading of the subject.
- */
-const UPDATE_BACKUP_DIR_RETIRED = [
-  '  BACKUP_DIR_WALK="${BACKUP_DIR%/}"',
-  '  [[ "${BACKUP_DIR_WALK}" == /*/* ]] || die "not absolute"',
-  '  mkdir_service_subdir "${BACKUP_DIR_WALK%/*}" 022 "${BACKUP_DIR_WALK}"',
-  '  info "Backing up database to ${BACKUP_TARGET}..."',
-  '  BACKUP_PARTIAL="${BACKUP_TARGET}.part"',
-  '  backup_rc=0',
-  '  pg_dump "${MIGRATION_DATABASE_URL}" | gzip > "${BACKUP_PARTIAL}" || { backup_rc=$?; rm -f "${BACKUP_PARTIAL}"; }',
-  '  pin_migration_window "The pre-migration backup"',
-  '  [[ "${backup_rc}" -eq 0 ]] || die "pg_dump did not complete"',
-  '  mv "${BACKUP_PARTIAL}" "${BACKUP_TARGET}"',
-  '  BACKUP_FILE="${BACKUP_TARGET}"',
-  '  ls -t "${BACKUP_DIR}"/pre-update-*.sql.gz 2>/dev/null | tail -n +11 | xargs -r rm --',
-].join('\n')
-
-/** The stamped name the block composes above the lifted region; one literal, both shapes. */
-const BACKUP_TARGET_BASE = 'pre-update-00000000-000000.sql.gz'
-
-/** The program that creates the partial, as it ships (o3d-ov60 r3). */
-const BACKUP_WRITER_HELPER = join(REPO, 'scripts/lib/write-new-file.mjs')
-
-/**
- * THE SHIPPED STATEMENT THAT CREATES AND FILLS THE PARTIAL, and the one it replaced.
- *
- * Both are lifted or typed as WHOLE STATEMENTS so that the mutation below is a one-operand swap
- * inside the block every other assertion in this section runs: the walk, the descriptor, the
- * publication and the prune are identical on both sides, and the only thing that differs is how
- * the `.part` file comes into existence.
- */
-const SHIPPED_PARTIAL_WRITE = [
-  '  pg_dump "${MIGRATION_DATABASE_URL}" | gzip \\',
-  '    | node "${BACKUP_WRITER}" "${BACKUP_AT}" "${BACKUP_PARTIAL_BASE}" \\',
-].join('\n')
-
-/**
- * THE `noclobber` REDIRECTION update.sh CARRIED UNTIL o3d-ov60 r3 (Codex HIGH), typed here because
- * it is no longer in any shipped file — which is what makes it a mutation rather than a second
- * reading of the subject. `set -C` is open(O_CREAT|O_EXCL) only until that open fails: bash then
- * stats the name and, for anything that is not a regular file, re-opens WITHOUT O_EXCL. A named
- * pipe is therefore opened, and an open of a FIFO with no reader BLOCKS.
- */
-const RETIRED_PARTIAL_WRITE = [
-  '  ( set -C; pg_dump "${MIGRATION_DATABASE_URL}" | gzip > "${BACKUP_AT}/${BACKUP_PARTIAL_BASE}" ) \\',
-].join('\n')
-
-/**
- * The rig both shapes run in.
- *
- * `pg_dump` and `gzip` are SHELL FUNCTIONS rather than shims, so the REDIRECTION — the thing under
- * test — is performed by the same bash that runs the shipped line. What a real pg_dump would add is
- * bytes; it would not answer "which directory did the `>` reach" any differently.
- *
- * `info` and `pin_migration_window` are the two windows. Each defaults to a no-op and a test
- * replaces the one it is opening, so a rename lands at a point the shipped sequence itself chose
- * rather than at a line this file inserted.
- *
- * ${IMS_BACKUP_WRITER_HELPER} IS THE SHIPPED HELPER, not a stand-in (o3d-ov60 r3). update.sh
- * resolves scripts/lib/write-new-file.mjs from its own ${BASH_SOURCE}, which a lifted block does
- * not have; the override the shipped line already reads is pointed at the real file, so what
- * creates the partial in these runs is the program that creates it on a host.
- */
-function backupRig(site: string, vars: string[], hooks: string[] = []): string {
-  return rig(['enter_service_subdir', 'mkdir_service_subdir'], [
-    'MIGRATION_DATABASE_URL="postgresql://example/db"',
-    `IMS_BACKUP_WRITER_HELPER=${q(BACKUP_WRITER_HELPER)}`,
-    'pg_dump() { printf %s "DUMP-OF-$1"; }',
-    'gzip() { cat; }',
-    'success() { printf "SUCCESS: %s\\n" "$*"; }',
-    'pin_migration_window() { :; }',
-    ...vars,
-    `BACKUP_TARGET="\${BACKUP_DIR}/${BACKUP_TARGET_BASE}"`,
-    ...hooks,
-    site,
-    `echo ${REACHED}`,
-  ].join('\n'))
-}
-
-test('[o3d-ov60] update.sh creates its backup directory by a walk it proves, and dumps nothing through a link', (t) => {
-  const plant = (prefix: string) => {
-    const root = createTempDirSync(prefix, t)
-    const parent = join(root, 'var-backups')
-    const victim = join(root, 'victim')
-    mkdirSync(parent)
-    mkdirSync(victim)
-    // A link at the FINAL component, which is what `mkdir -p` accepts and returns 0 for.
-    const backupDir = join(parent, 'one-two-inventory')
-    symlinkSync(victim, backupDir)
-    return { backupDir, victim }
-  }
-
-  const script = (site: string, p: ReturnType<typeof plant>) =>
-    backupRig(site, [`BACKUP_DIR=${q(p.backupDir)}`])
-
-  const shipped = plant('ims-ov60-backup-')
-  const run = runBash(script(UPDATE_BACKUP_DIR, shipped))
-  assert.equal(run.status, 1, `a symlink at the backup directory's own name must end the run: ${run.stdout} ${run.stderr}`)
-  assert.ok(!run.stdout.includes(REACHED), 'and the dump after it may not run')
-  assert.deepEqual(readdirSync(shipped.victim), [],
-    'and nothing may be written into the directory the link chose')
-  assert.equal(lstatSync(shipped.backupDir).isSymbolicLink(), true,
-    'and the refusal must leave the operator the path to look at')
-
-  // MEASURED BY MUTATION, ROUTE STATED: the r1 sequence, whose walk is the same one — so what this
-  // exhibits is the OTHER half of it. `mkdir_service_subdir` refuses the link exactly as the walk
-  // does, and this run must therefore refuse too; what it may not do is refuse for a reason the
-  // shipped block does not have. The `mkdir -p` this walk itself replaced is measured by the
-  // ancestry test above, which is where that mutation belongs.
-  const mutant = plant('ims-ov60-backup-mutant-')
-  const mutated = runBash(script(UPDATE_BACKUP_DIR_RETIRED, mutant))
-  assert.equal(mutated.status, 1,
-    `the retired sequence's walk refuses the same link: ${mutated.stdout} ${mutated.stderr}`)
-  assert.deepEqual(readdirSync(mutant.victim), [],
-    'and nothing may be written into the directory the link chose')
-})
-
-/**
- * A REAL BACKUP DIRECTORY, PLUS THE DIRECTORY A RENAME WOULD SUBSTITUTE FOR IT.
- *
- * `decoyContents` is what the substituted directory ALREADY holds when the swap happens. It is what
- * turns "root's `rm --` ran somewhere" from a claim into a reading: eleven stamped files is one more
- * than the prune keeps, so a prune aimed at this directory DELETES from it, and a prune aimed at the
- * descriptor leaves every one of them where it is.
- */
-function plantSwappableBackupDir(t: TestContext, prefix: string) {
-  const root = createTempDirSync(prefix, t)
-  const parent = join(root, 'var-backups')
-  mkdirSync(parent)
-  const backupDir = join(parent, 'one-two-inventory')
-  const moved = join(parent, 'one-two-inventory-moved')
-  mkdirSync(backupDir)
-  const decoyContents: string[] = []
-  for (let i = 0; i < 11; i += 1) {
-    const name = `pre-update-1999010${i < 10 ? `0${i}` : i}-000000.sql.gz`
-    decoyContents.push(name)
-  }
-  decoyContents.push(`${BACKUP_TARGET_BASE}.part`)
-  /** Plant the decoy's contents once the swap has put it at the name. */
-  const fillDecoy = () => {
-    for (const name of decoyContents) writeFileSync(join(backupDir, name), 'DECOY\n')
-  }
-  /** The swap itself, as a shell statement: the account that owns ${parent} renames and replaces. */
-  const swap = [
-    `${REAL.mv} ${q(backupDir)} ${q(moved)}`,
-    `${REAL.mkdir} ${q(backupDir)}`,
-    ...decoyContents.map((name) => `printf 'DECOY\\n' > ${q(join(backupDir, name))}`),
-  ].join('\n')
-  return { root, parent, backupDir, moved, decoyContents, fillDecoy, swap }
-}
-
-test('[o3d-ov60] a rename between the guard and the DUMP cannot move the dump (the window before it)', (t) => {
-  const run = (site: string, prefix: string) => {
-    const p = plantSwappableBackupDir(t, prefix)
-    // THE WINDOW, OPENED AT A CALL SITE THE SHIPPED SEQUENCE MAKES. `info` is what the block runs
-    // between the walk and the dump; overriding it puts the rename exactly there, deterministically,
-    // which is the only way to exhibit the race from outside the process.
-    const out = runBash(backupRig(site, [`BACKUP_DIR=${q(p.backupDir)}`],
-      [`info() { printf 'INFO: %s\\n' "$*"; ${p.swap}; }`]))
-    return { p, out }
-  }
-
-  const shipped = run(UPDATE_BACKUP_DIR, 'ims-ov60-window1-')
-  // NOT VACUOUS: the swap really happened, so the shipped run met the finding.
-  assert.notEqual(lstatSync(shipped.p.backupDir).ino, lstatSync(shipped.p.moved).ino,
-    'a different directory must now stand at the name the guard checked')
-  assert.equal(shipped.out.status, 0, `the shipped block must complete: ${shipped.out.stdout} ${shipped.out.stderr}`)
-  assert.ok(readdirSync(shipped.p.moved).includes(BACKUP_TARGET_BASE),
-    'the dump must land in the inode the walk proved, which the rename moved but did not change')
-  assert.deepEqual(readdirSync(shipped.p.backupDir).sort(), [...shipped.p.decoyContents].sort(),
-    'and NOTHING may be written into, or deleted from, the directory the rename put at the name')
-
-  // MEASURED BY MUTATION, ROUTE STATED: the r1 sequence. Its walk proves the same directory and
-  // then gives the working directory back, so the redirection below resolves ${BACKUP_TARGET} from
-  // the top and writes the whole database into the directory the rename chose.
-  const mutant = run(UPDATE_BACKUP_DIR_RETIRED, 'ims-ov60-window1-mutant-')
-  assert.ok(readdirSync(mutant.p.backupDir).includes(BACKUP_TARGET_BASE),
-    `THE FINDING: re-resolving the name puts the dump in the substituted directory: ${mutant.out.stdout} ${mutant.out.stderr}`)
-  assert.ok(!readdirSync(mutant.p.moved).includes(BACKUP_TARGET_BASE),
-    'and the directory the guard actually proved never receives it')
-})
-
-test('[o3d-ov60] a rename between the dump and the PUBLICATION and the PRUNE cannot move either', (t) => {
-  const run = (site: string, prefix: string) => {
-    const p = plantSwappableBackupDir(t, prefix)
-    // The second window: `pin_migration_window` is called by the shipped sequence after the dump and
-    // before the `mv` that publishes it and the `rm --` that prunes beside it.
-    const out = runBash(backupRig(site, [`BACKUP_DIR=${q(p.backupDir)}`],
-      [`pin_migration_window() { printf 'PIN: %s\\n' "$*"; ${p.swap}; }`]))
-    return { p, out }
-  }
-
-  const shipped = run(UPDATE_BACKUP_DIR, 'ims-ov60-window2-')
-  assert.notEqual(lstatSync(shipped.p.backupDir).ino, lstatSync(shipped.p.moved).ino,
-    'a different directory must now stand at the name the guard checked')
-  assert.equal(shipped.out.status, 0, `the shipped block must complete: ${shipped.out.stdout} ${shipped.out.stderr}`)
-  assert.ok(readdirSync(shipped.p.moved).includes(BACKUP_TARGET_BASE),
-    'the publication must rename the partial inside the inode the walk proved')
-  assert.ok(!readdirSync(shipped.p.moved).includes(`${BACKUP_TARGET_BASE}.part`),
-    'and the partial must be gone from it, so the restore point ${BACKUP_FILE} names is really there')
-  assert.deepEqual(readdirSync(shipped.p.backupDir).sort(), [...shipped.p.decoyContents].sort(),
-    'and the substituted directory must be untouched: nothing published into it, and — the `rm --` '
-    + 'being the other half of this — not one of its eleven stamped files deleted out of it')
-
-  // MEASURED BY MUTATION, ROUTE STATED: the r1 sequence again. Its `mv` and its `ls | xargs rm --`
-  // both name ${BACKUP_DIR} after the rename, so root publishes inside the substituted directory and
-  // then deletes from it.
-  const mutant = run(UPDATE_BACKUP_DIR_RETIRED, 'ims-ov60-window2-mutant-')
-  const after = readdirSync(mutant.p.backupDir)
-  assert.ok(after.includes(BACKUP_TARGET_BASE),
-    `THE FINDING: root publishes into the directory the rename chose: ${mutant.out.stdout} ${mutant.out.stderr}`)
-  assert.ok(after.length < mutant.p.decoyContents.length,
-    `AND PRUNES IT: root's \`rm --\` ran in the substituted directory (${after.length} of `
-    + `${mutant.p.decoyContents.length} entries left): ${mutant.out.stdout} ${mutant.out.stderr}`)
-})
-
-test('[o3d-ov60] a symlink planted at the partial file inside the proved directory is refused, not written through', (t) => {
-  const plant = (prefix: string) => {
-    const root = createTempDirSync(prefix, t)
-    const parent = join(root, 'var-backups')
-    const victim = join(root, 'victim.sql.gz')
-    mkdirSync(parent)
-    writeFileSync(victim, '')
-    const backupDir = join(parent, 'one-two-inventory')
-    mkdirSync(backupDir)
-    // The predictable name, inside a directory the walk legitimately accepts — which is the case
-    // IMS_BACKUP_DIR reaches: an existing ordinary directory under a path ${APP_USER} owns.
-    symlinkSync(victim, join(backupDir, `${BACKUP_TARGET_BASE}.part`))
-    return { backupDir, victim }
-  }
-
-  const shipped = plant('ims-ov60-part-')
-  const run = runBash(backupRig(UPDATE_BACKUP_DIR, [`BACKUP_DIR=${q(shipped.backupDir)}`]))
-  // NOT VACUOUS: the link is still a link, so the run really met it.
-  assert.equal(lstatSync(shipped.victim).isFile(), true, 'the victim must still be an ordinary file')
-  assert.equal(run.status, 1, `a link at the partial's name must end the run: ${run.stdout} ${run.stderr}`)
-  assert.ok(!run.stdout.includes(REACHED), 'and nothing after it may execute')
-  assert.equal(readFileSync(shipped.victim, 'utf8'), '',
-    'and the database dump may not be written through it')
-
-  // MEASURED BY MUTATION, ROUTE STATED: the r1 redirection, which had no `set -C` — a plain `>` is
-  // open(O_CREAT|O_TRUNC) and follows the link, as root, into whatever it points at.
-  const mutant = plant('ims-ov60-part-mutant-')
-  runBash(backupRig(UPDATE_BACKUP_DIR_RETIRED, [`BACKUP_DIR=${q(mutant.backupDir)}`]))
-  assert.notEqual(readFileSync(mutant.victim, 'utf8'), '',
-    'THE FINDING: without O_EXCL the dump is written through the link, as root')
-})
-
-test('[o3d-ov60] a FIFO planted at the partial file is REFUSED, and does not hang the fenced cutover', (t) => {
+test('[o3d-ov60 r4] the withdrawn backup helper is gone, and update.sh executes no program at its dump', () => {
   /**
-   * THE ONE TYPE `noclobber` LETS THROUGH IS THE ONE TYPE WHOSE open(2) BLOCKS (Codex HIGH).
-   *
-   * `set -C` is open(O_CREAT|O_EXCL) only until that open fails. On EEXIST bash stats the name and,
-   * for anything that is not a REGULAR file, re-opens WITHOUT O_EXCL — POSIX requires it, so that
-   * `> /dev/null` keeps working. So the symlink test above passes and this one did not exist: a
-   * named pipe at the predictable `.part` name is opened rather than refused, and an open of a FIFO
-   * with no reader waits. The waiting is done by root, after the service and cron are stopped and
-   * the database connections are fenced, which is the state a deployment cannot be left in.
-   *
-   * EVERY ASSERTION HERE IS BOUNDED FROM OUTSIDE THE SHELL. `runBash` runs its subject under
-   * `timeout` and turns an expired bound into a thrown `HarnessRunaway`, so a hang FAILS with a
-   * status rather than occupying the runner — and the two directions are then measurable against
-   * each other: the retired redirection must exceed the bound, and the shipped block must not.
+   * THE SHAPE OF THIS GUARD IS scripts/lib/pin-source-file.mjs's, and for the same reason: an
+   * unused apparatus whose premise this round rejects is the clearest possible invitation to wire
+   * it back up. A COMMENT MAY NAME THE HELPER — the block carries the paragraph that says why it
+   * went, and a rule that forbade the word would delete the reasoning with the code. What may not
+   * survive is an executable reference: a resolution, or an invocation.
    */
-  const plant = (prefix: string) => {
-    const root = createTempDirSync(prefix, t)
-    const parent = join(root, 'var-backups')
-    mkdirSync(parent)
-    // An ORDINARY directory under a path the harness owns, which is exactly what IMS_BACKUP_DIR
-    // reaches and what the walk legitimately accepts. The finding is not about the directory.
-    const backupDir = join(parent, 'one-two-inventory')
-    mkdirSync(backupDir)
-    const fifo = join(backupDir, `${BACKUP_TARGET_BASE}.part`)
-    const made = spawnSync(REAL.mkfifo, [fifo], { encoding: 'utf8' })
-    assert.equal(made.status, 0, `the harness must be able to plant a named pipe: ${made.stderr}`)
-    assert.equal(lstatSync(fifo).isFIFO(), true, 'and what it planted must be one')
-    return { backupDir, fifo }
+  assert.equal(existsSync(join(REPO, 'scripts/lib/write-new-file.mjs')), false,
+    'scripts/lib/write-new-file.mjs made root execute bytes out of an ${APP_USER}-owned checkout '
+    + 'in the middle of a cutover; it is withdrawn, and an unused copy is an invitation to re-wire it')
+
+  const block = shippedUpdateBlock('  mkdir -p "${BACKUP_DIR}"', '  ls -t "${BACKUP_DIR}"/pre-update-*.sql.gz 2>/dev/null | tail -n +11 | xargs -r rm --')
+  const code = block.split('\n').filter((line) => !/^\s*#/.test(line)).join('\n')
+  assert.ok(!/\bnode\b/.test(code),
+    `update.sh's backup block must run no program resolved out of the checkout:\n${code}`)
+  assert.ok(!/BACKUP_WRITER|IMS_BACKUP_WRITER_HELPER/.test(UPDATE_SH),
+    'update.sh must not carry the resolution — or the override — for a helper that is gone')
+
+  // AND THE REASONING SURVIVES WITH THE CODE. Three rounds of findings are worth nothing if the
+  // next reader meets a bare `mkdir -p` and closes it again the same way. Lifted as its own
+  // contiguous region, so a paragraph moved away from the statement it explains fails this too.
+  const record = shippedUpdateBlock(
+    '  # THIS IS BACK TO `mkdir -p` AND A PLAIN REDIRECTION, AND THAT IS THE RESULT OF THE ROUND',
+    '  mkdir -p "${BACKUP_DIR}"',
+  )
+  for (const owed of ['o3d-noka', 'o3d-kyqa', 'ARBITRARY CODE EXECUTION AS ROOT']) {
+    assert.ok(record.includes(owed),
+      `the withdrawal must say ${owed} at the site, or it is a silent revert:\n${record}`)
   }
-
-  const shipped = plant('ims-ov60-fifo-')
-
-  // NOT VACUOUS, AND ESTABLISHED BEFORE ANYTHING IS CLAIMED: a bare `set -C` redirection at THIS
-  // path, in this bash, really does block. Without this the refusal below could be a refusal for
-  // some reason that has nothing to do with the type of the entry.
-  assert.throws(
-    () => runBash(`set -C; echo hi > ${q(shipped.fifo)}`, { deadlineMs: 3_000 }),
-    /deadline of \d+s exceeded/,
-    'precondition: an open of this FIFO with no reader must BLOCK under `noclobber`, or nothing '
-    + 'below is a statement about hanging',
-  )
-  assert.equal(lstatSync(shipped.fifo).isFIFO(), true, 'and the plant must have survived the control run')
-
-  // THE SHIPPED BLOCK. It must come back, and it must come back refusing.
-  const run = runBash(backupRig(UPDATE_BACKUP_DIR, [`BACKUP_DIR=${q(shipped.backupDir)}`]),
-    { deadlineMs: 20_000 })
-  assert.equal(run.status, 1, `a named pipe at the partial's name must END the run: ${run.stdout} ${run.stderr}`)
-  assert.ok(!run.stdout.includes(REACHED), 'and nothing after it may execute')
-  // AND IT REFUSED THE ENTRY, rather than failing somewhere earlier for an unrelated reason: the
-  // helper names the entry it would not create. (The plant itself is gone by now — the shipped
-  // statement's own `rm -f --` removes whatever is at the partial's name on failure — so the
-  // reading has to be taken from the refusal.)
-  assert.match(run.stderr, /write-new-file: .*\.part could not be CREATED/,
-    `the refusal must come from the create, and must name what it refused: ${run.stderr}`)
-
-  // MEASURED BY MUTATION, ROUTE STATED: the SAME block with one statement swapped back to the
-  // `set -C` redirection r2 shipped. Everything else — the walk, the descriptor, the publication,
-  // the prune — is identical, so what this exhibits is the redirection and nothing else.
-  const mutantBlock = UPDATE_BACKUP_DIR.replace(SHIPPED_PARTIAL_WRITE, RETIRED_PARTIAL_WRITE)
-  assert.notEqual(mutantBlock, UPDATE_BACKUP_DIR,
-    'precondition: the swap must have changed the block, or this runs the subject twice')
-  assert.ok(mutantBlock.includes('set -C'), 'and it must have put the retired redirection in')
-  const mutant = plant('ims-ov60-fifo-mutant-')
-  assert.throws(
-    () => runBash(backupRig(mutantBlock, [`BACKUP_DIR=${q(mutant.backupDir)}`]), { deadlineMs: 5_000 }),
-    /deadline of \d+s exceeded/,
-    'THE FINDING: `noclobber` opens the planted FIFO and the dump blocks on it indefinitely, with '
-    + 'the service stopped, cron stopped and the database fenced',
-  )
-  assert.equal(lstatSync(mutant.fifo).isFIFO(), true,
-    'and it never got as far as its own `rm -f --`, which is what "hang" means here')
 })
 
-test('[o3d-ov60] an ordinary file already at the partial\'s name is refused, not written on top of', (t) => {
+test('[o3d-ov60 r4] THE WITHDRAWN SHAPE, EXERCISED: a helper replaced mid-cutover is EXECUTED, and the shipped block executes nothing', (t) => {
   /**
-   * WHAT MAKES `O_EXCL` LOAD-BEARING RATHER THAN DECORATIVE.
+   * WHY THIS TEST EXISTS AT ALL, GIVEN THAT THE CODE IT INDICTS IS GONE.
    *
-   * The two tests above would both pass on an open that had only `O_NOFOLLOW|O_NONBLOCK`: a symlink
-   * is ELOOP and a writer's FIFO with no reader is ENXIO, so both still refuse. A REGULAR file is
-   * the case that separates them — an open without `O_EXCL` succeeds on it, and with no `O_TRUNC`
-   * writes the new dump OVER the front of the old one and leaves whatever was longer behind the
-   * end. `mv -T` then publishes that as this run's restore point.
+   * The finding is not "write-new-file.mjs was written badly" — it was not. It is that the
+   * documented update is `cd /opt/one-two-inventory && bash scripts/update.sh`, that install.sh
+   * and update.sh both `chown -R "${APP_USER}:${APP_USER}" "${APP_DIR}"`, and that a program
+   * resolved out of that checkout AT THE MIGRATION STEP is bytes the service account may replace
+   * AFTER the operator started a run they had reason to believe was clean. Any future round that
+   * reaches for a helper here re-opens it, so the mechanism is exhibited rather than described.
    *
-   * IT IS NOT A HYPOTHETICAL SHAPE. `<stamp>.sql.gz.part` is exactly what a previous cutover leaves
-   * at that name when it is SIGKILLed between the dump and the publication, and the stamp has
-   * one-second resolution.
+   * WHAT IS PLANTED IS NOT A MUTATED HELPER. It is the file the ATTACKER writes: the shipped
+   * helper's bytes are irrelevant, because they are not the bytes that get executed.
+   *
+   * AND IT IS PLANTED THROUGH THE WINDOW THE SHIPPED SEQUENCE ITSELF MAKES. `info` is called
+   * between the directory's preparation and the dump in every version of this block, so the
+   * replacement happens at a point the code chose, not at a line this file spliced in. Nothing
+   * about the exhibition depends on the replacement PRECEDING the run.
    */
-  const plant = (prefix: string) => {
-    const root = createTempDirSync(prefix, t)
-    const parent = join(root, 'var-backups')
-    mkdirSync(parent)
-    const backupDir = join(parent, 'one-two-inventory')
-    mkdirSync(backupDir)
-    const partial = join(backupDir, `${BACKUP_TARGET_BASE}.part`)
-    // Longer than what the rig's `pg_dump` produces, so an open without O_TRUNC leaves a tail and
-    // the reading is "this was written over", not merely "this was rewritten".
-    writeFileSync(partial, `${'EARLIER-TRUNCATED-DUMP-'.repeat(64)}\n`)
-    return { backupDir, partial, before: readFileSync(partial, 'utf8') }
-  }
-
-  const shipped = plant('ims-ov60-existing-')
-  const run = runBash(backupRig(UPDATE_BACKUP_DIR, [`BACKUP_DIR=${q(shipped.backupDir)}`]))
-  assert.equal(run.status, 1, `a file already at the partial's name must END the run: ${run.stdout} ${run.stderr}`)
-  assert.ok(!run.stdout.includes(REACHED), 'and nothing after it may execute')
-  assert.match(run.stderr, /write-new-file: .*\.part could not be CREATED/,
-    `and the refusal must come from the create: ${run.stderr}`)
-  assert.equal(existsSync(join(shipped.backupDir, BACKUP_TARGET_BASE)), false,
-    'and nothing may be published as this run\'s restore point')
-
-  // MEASURED BY MUTATION, ROUTE STATED: the helper with `O_EXCL` taken out of its one open, which
-  // is the flag `set -C` silently dropped and the flag the two tests above cannot see.
-  const mutantHelper = join(createTempDirSync('ims-ov60-existing-mutant-', t), 'write-new-file.mjs')
-  const withoutExcl = readFileSync(BACKUP_WRITER_HELPER, 'utf8').replace(' | constants.O_EXCL\n', '\n')
-  assert.notEqual(withoutExcl, readFileSync(BACKUP_WRITER_HELPER, 'utf8'),
-    'precondition: the flag must have been removed, or this runs the subject twice')
-  writeFileSync(mutantHelper, withoutExcl)
-  const mutant = plant('ims-ov60-existing-mutant-run-')
-  runBash(backupRig(UPDATE_BACKUP_DIR, [`BACKUP_DIR=${q(mutant.backupDir)}`],
-    [`IMS_BACKUP_WRITER_HELPER=${q(mutantHelper)}`]))
-  assert.notEqual(readFileSync(join(mutant.backupDir, BACKUP_TARGET_BASE), 'utf8'), mutant.before,
-    'THE FINDING: without O_EXCL the run writes over the file already at that name and publishes '
-    + 'the result as a restore point')
-})
-
-test('[o3d-ov60] a directory planted at the restore point\'s own name is refused, not published into', (t) => {
-  const plant = (prefix: string) => {
-    const root = createTempDirSync(prefix, t)
+  const rig = (statement: string, extra: string[]) => {
+    const root = createTempDirSync('ims-ov60-r4-', t)
     const backupDir = join(root, 'one-two-inventory')
-    mkdirSync(join(root, 'parent-placeholder'))
     mkdirSync(backupDir)
-    // A DIRECTORY, not a link: `mv src dst` with dst a directory moves src INSIDE it, so the
-    // published restore point would sit at a path ${BACKUP_FILE} does not name and the operator
-    // would be offered one that is not there. `-T` is what turns that into a refusal.
-    mkdirSync(join(backupDir, BACKUP_TARGET_BASE))
-    return { backupDir }
+    const lib = join(root, 'lib')
+    mkdirSync(lib)
+    // What the release shipped: a helper that does its job and nothing else.
+    const helper = join(lib, 'write-new-file.mjs')
+    writeFileSync(helper, 'process.stdin.pipe(process.stdout)\n')
+    // What ${APP_USER} replaces it with once the cutover is under way.
+    const owned = join(root, 'ROOT-CODE-EXECUTION')
+    const planted = `import { writeFileSync } from 'node:fs'\nwriteFileSync(${JSON.stringify(owned)}, String(process.getuid?.() ?? ''))\n`
+    return {
+      backupDir,
+      helper,
+      owned,
+      script: [
+        'set -uo pipefail',
+        'error() { printf "ERROR: %s\\n" "$*" >&2; }',
+        'die() { error "$*"; exit 1; }',
+        'MIGRATION_DATABASE_URL="postgresql://example/db"',
+        'pg_dump() { printf %s "DUMP-OF-$1"; }',
+        'gzip() { cat; }',
+        'success() { printf "SUCCESS: %s\\n" "$*"; }',
+        'pin_migration_window() { :; }',
+        // THE WINDOW, opened at the call site the shipped block already makes.
+        `info() { printf "INFO: %s\\n" "$*"; cat > ${q(helper)} <<'PLANTED'\n${planted}PLANTED\n}`,
+        `BACKUP_DIR=${q(backupDir)}`,
+        `BACKUP_TARGET="\${BACKUP_DIR}/${'pre-update-00000000-000000.sql.gz'}"`,
+        ...extra,
+        statement,
+        'echo REACHED_THE_WRITES',
+      ].join('\n'),
+    }
   }
 
-  const shipped = plant('ims-ov60-target-dir-')
-  const run = runBash(backupRig(UPDATE_BACKUP_DIR, [`BACKUP_DIR=${q(shipped.backupDir)}`]))
-  assert.equal(run.status, 1, `a directory at the target's name must end the run: ${run.stdout} ${run.stderr}`)
-  assert.ok(!run.stdout.includes(REACHED), 'and nothing after it may execute')
-  assert.deepEqual(readdirSync(join(shipped.backupDir, BACKUP_TARGET_BASE)), [],
-    'and nothing may be moved inside it')
+  /**
+   * THE r3 STATEMENT, TYPED HERE BECAUSE IT IS IN NO SHIPPED FILE — which is what makes it a
+   * mutation and not a second reading of the subject. `${BACKUP_AT}` was `/proc/self/fd/N` on the
+   * proved directory; the directory itself is used here, because the finding is about WHICH
+   * PROGRAM RUNS and not about which directory it writes into.
+   */
+  const RETIRED_R3 = [
+    '  info "Backing up database to ${BACKUP_TARGET}..."',
+    '  backup_rc=0',
+    '  pg_dump "${MIGRATION_DATABASE_URL}" | gzip \\',
+    '    | node "${BACKUP_WRITER}" "${BACKUP_AT}" "${BACKUP_PARTIAL_BASE}" \\',
+    '    || { backup_rc=$?; rm -f -- "${BACKUP_AT}/${BACKUP_PARTIAL_BASE}"; }',
+  ].join('\n')
 
-  // MEASURED BY MUTATION, ROUTE STATED: the same shipped line with `-T` taken off it, which is the
-  // spelling every earlier round of this file used.
-  const mutant = plant('ims-ov60-target-dir-mutant-')
-  runBash(backupRig(UPDATE_BACKUP_DIR.replace('mv -f -T --', 'mv -f --'),
-    [`BACKUP_DIR=${q(mutant.backupDir)}`]))
-  assert.deepEqual(readdirSync(join(mutant.backupDir, BACKUP_TARGET_BASE)), [`${BACKUP_TARGET_BASE}.part`],
-    'THE FINDING: without -T the completed dump is moved INSIDE the planted directory, and the '
-    + 'restore point the operator is offered names a path that holds nothing')
+  const mutant = rig(RETIRED_R3, [
+    'BACKUP_WRITER="${BACKUP_DIR}/../lib/write-new-file.mjs"',
+    'BACKUP_AT="${BACKUP_DIR}"',
+    'BACKUP_PARTIAL_BASE="pre-update-00000000-000000.sql.gz.part"',
+  ])
+  // NOT VACUOUS, ESTABLISHED BEFORE THE CLAIM: the marker is absent, and the helper on disk is the
+  // benign one, at the instant the run starts.
+  assert.equal(existsSync(mutant.owned), false, 'precondition: nothing has been executed yet')
+  assert.equal(readFileSync(mutant.helper, 'utf8').includes('ROOT-CODE-EXECUTION'), false,
+    'precondition: the release\'s own helper must be what is on disk when the run begins')
+  const ran = runBash(mutant.script)
+  assert.match(ran.stdout, /^INFO: /m, `precondition: the window must have been reached: ${ran.stdout} ${ran.stderr}`)
+  assert.equal(existsSync(mutant.owned), true,
+    'THE FINDING: the bytes ${APP_USER} put at the helper\'s path AFTER the run started were '
+    + `executed by the account running the cutover: ${ran.stdout} ${ran.stderr}`)
+  assert.equal(readFileSync(mutant.owned, 'utf8'), String(process.getuid?.() ?? ''),
+    'and they ran as that account — root, on a host, where this harness is unprivileged')
+
+  // THE SHIPPED BLOCK, through the same rig and the same window. It resolves no program, so the
+  // same plant reaches nothing: the redirection is performed by the bash that is already running.
+  const shipped = rig(
+    shippedUpdateBlock('  mkdir -p "${BACKUP_DIR}"', '  ls -t "${BACKUP_DIR}"/pre-update-*.sql.gz 2>/dev/null | tail -n +11 | xargs -r rm --'),
+    [],
+  )
+  assert.equal(existsSync(shipped.owned), false, 'precondition: nothing has been executed yet')
+  const clean = runBash(shipped.script)
+  assert.match(clean.stdout, /^INFO: /m, `precondition: the same window must have been reached: ${clean.stdout} ${clean.stderr}`)
+  assert.ok(clean.stdout.includes('REACHED_THE_WRITES'),
+    `and the shipped block must still take its backup: ${clean.stdout} ${clean.stderr}`)
+  assert.equal(readFileSync(shipped.helper, 'utf8').includes('ROOT-CODE-EXECUTION'), true,
+    'the plant must still have happened, or the comparison is between two different runs')
+  assert.equal(existsSync(shipped.owned), false,
+    'and the shipped block must execute nothing that was planted: it names no program to run')
 })
 
 // ---------------------------------------------------------------------------

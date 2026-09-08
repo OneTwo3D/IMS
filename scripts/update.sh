@@ -5514,134 +5514,80 @@ BACKUP_TARGET="${BACKUP_DIR}/pre-update-$(date +%Y%m%d-%H%M%S).sql.gz"
 if $DRY_RUN; then
   echo -e "${YELLOW}[DRY]${RESET}   would pg_dump to ${BACKUP_TARGET}"
 else
-  # THE BACKUP DIRECTORY IS WALKED INTO AND THEN HELD AS A DESCRIPTOR, AND NOTHING BELOW NAMES IT
-  # AGAIN (o3d-ov60 r2, Codex CRITICAL).
+  # ---------------------------------------------------------------------------
+  # THIS IS BACK TO `mkdir -p` AND A PLAIN REDIRECTION, AND THAT IS THE RESULT OF THE ROUND
+  # (o3d-ov60 r4). Three rounds tried to make a root-side dump safe INSIDE a directory
+  # ${APP_USER} may own, and each closed its finding by opening a worse one. The record is here,
+  # at the site, so the next reader does not re-attempt any of the three.
   #
-  # WHAT o3d-ov60 GOT RIGHT AND WHERE IT STOPPED. `mkdir -p` ACCEPTS a symlink-to-directory at its
-  # final component and returns 0, so the directory is created by the walk instead:
-  # enter_service_subdir() creates the last component with a PLAIN `mkdir` (EEXIST on a planted
-  # link, where `mkdir -p` silently works INSIDE its target), lstats what is there, enters it with
-  # `cd -P` and proves both its inode and its `..`. That is still what happens. What r1 then did was
-  # call mkdir_service_subdir(), THE TWIN THAT RESTORES THE WORKING DIRECTORY — after which the dump
-  # redirection, the publication `mv` and the `rm --` prune each RE-RESOLVED ${BACKUP_DIR} BY NAME.
+  #   r1  replaced `mkdir -p "${BACKUP_DIR}"` with the symlink-proof walk — through
+  #       mkdir_service_subdir(), THE TWIN THAT RESTORES THE WORKING DIRECTORY. The dump, the
+  #       publication `mv` and the `rm --` prune then each re-resolved ${BACKUP_DIR} by name. A
+  #       directory proved at one instant and operated through its name three times afterwards is
+  #       proved for none of the three: the guard was not wrong, it was SPENT.
   #
-  # THAT IS THIS BRANCH'S OWN THESIS USED AGAINST IT. A directory proved at one instant and then
-  # operated through its NAME three times afterwards is proved for none of the three: the guard is
-  # not wrong, it is SPENT. What follows through that name is a pg_dump of the whole database, a
-  # rename that publishes it, and an `rm --` — so a rename of the checked directory between the
-  # walk and any of them aims a root-side write, exactly as a symlink at the name would have.
+  #   r2  kept the walk's result (enter_service_subdir() ends INSIDE the directory, `exec {FD}<.`
+  #       pins that) and created the partial with `set -C`. `set -C` is open(O_CREAT|O_EXCL) only
+  #       until that open FAILS: on EEXIST bash stats the name and, for anything that is not a
+  #       REGULAR file, re-opens WITHOUT O_EXCL — POSIX requires it, so `> /dev/null` keeps working
+  #       under `noclobber`. So the one type it lets through is the one type whose open(2) BLOCKS.
+  #       A named pipe planted at the predictable `.part` name wedged root's `gzip >` waiting for a
+  #       reader that never comes, with the service stopped, cron stopped and the database
+  #       connections fenced — and a hang, unlike a refusal, does not unwind.
   #
-  # WHERE THAT IS REACHABLE, STATED RATHER THAN IMPLIED: the shipped default is
-  # /var/backups/${APP_NAME}, whose parent is root-owned, and nothing but root can plant or rename
-  # anything in it; IMS_BACKUP_DIR moves this directory wherever the operator names, including
-  # underneath a path ${APP_USER} owns, and nothing validates it. The documented "anywhere" override
-  # is the whole of the exposure, and it is not narrowed here — it is made harmless.
+  #   r3  removed the hang by naming `O_EXCL|O_NONBLOCK` somewhere a shell can name them: a node
+  #       helper, scripts/lib/write-new-file.mjs, resolved from ${IMS_SCRIPT_LIB_DIR}. THAT TURNED
+  #       A DENIAL OF SERVICE INTO ARBITRARY CODE EXECUTION AS ROOT, and it is why this block is
+  #       back where it started. The documented update is `cd /opt/one-two-inventory` and then
+  #       `bash scripts/update.sh`; install.sh and the clone path a few hundred lines above both
+  #       `chown -R "${APP_USER}:${APP_USER}" "${APP_DIR}"`, so that checkout — and everything the
+  #       helper would be resolved out of — belongs to the service account.
   #
-  # SO THE WALK'S RESULT IS KEPT. enter_service_subdir() ends with this process INSIDE the proved
-  # directory — that is its contract — and `exec {BACKUP_DIR_FD}<.` opens THAT, `.` being the one
-  # thing in a shell that is not a pathname: the kernel answers it from the descriptor the shell is
-  # already holding, so no component of ${BACKUP_DIR} is looked up a second time. The working
-  # directory is then restored, because everything after this block (`npx prisma migrate deploy
-  # --schema prisma/schema.prisma`) is resolved relative to it, and the DESCRIPTOR carries the pin
-  # from here on. `/proc/self/fd/N/<name>` IS `openat(N, "<name>", …)` — the same primitive
-  # publish_durable_file() aims its `mv -T` and its fsync through, in this same file — so the dump,
-  # the publication and the prune are all aimed at the inode the walk proved and cannot be moved by
-  # a rename of any name on the way to it.
+  # WHY THE THREE `source`s AT THE TOP OF THIS FILE ARE NOT THE SAME THING, since a reader will
+  # reach for them as the counter-example. The paragraph above ${IMS_SCRIPT_LIB_DIR} has always
+  # said it: they are read AT STARTUP, in the same instant as this file's own body and out of the
+  # same tree, so they add NO WINDOW THE ENTRYPOINT DOES NOT ALREADY HAVE. A helper read at THIS
+  # line is read a build, a stop and a drain later — and after this run has itself re-handed the
+  # tree to the account — so replacing it between the two is a window r3 opened and nothing else
+  # in this file had. That distinction is this repository's own, and it is the entire reason the
+  # connection-fence helper has a root-owned protected copy and a digest supplied on the
+  # privileged invocation.
   #
-  # AND THE PARTIAL FILE IS CREATED WITH O_EXCL — BY A HELPER, BECAUSE `set -C` IS NOT ONE
-  # (o3d-ov60 r3, Codex HIGH). The pin answers "which directory", and inside a directory
-  # ${APP_USER} owns it is still that account's to plant `.part` in: a predictable name, at a
-  # moment the service is stopped, cron is stopped and the database connections are fenced. r2
-  # answered that with bash's `noclobber`, on the reading that `set -C` is open(O_CREAT|O_EXCL).
-  # It is that only until the open FAILS. On EEXIST bash stats the name, and if what is there is
-  # not a REGULAR file it re-opens WITHOUT O_EXCL — POSIX requires exactly that, so that
-  # `> /dev/null` keeps working under `noclobber`. Measured, in this bash:
+  # AND "PIN THE HELPER" IS NOT THE ANSWER: it moves the boundary rather than establishing one,
+  # because the pin would be computed by a script that was itself read from the same checkout.
+  # scripts/lib/pin-source-file.mjs existed to authenticate exactly such bytes and was DELETED in
+  # o3d-secops r22 for that reason, with a guard in tests/scripts/deploy-order.test.ts that fails
+  # if it comes back. The same shape ships twice already, in install.sh's chown_state_tree() and
+  # its auth probe; one more instance is not a fix and one instance repaired alone is theatre.
+  # That is o3d-kyqa, and it is a repository-wide design, not a line in this block.
   #
-  #     mkfifo p; ( set -C; echo hi > p )   ->  blocks for ever
-  #     : > r;    ( set -C; echo hi > r )   ->  "cannot overwrite existing file"
+  # WHAT WOULD ACTUALLY CLOSE THIS SITE IS CONSTRAINING THE OVERRIDE, NOT DEFENDING AGAINST IT
+  # (o3d-noka). Everything above follows from one fact: `IMS_BACKUP_DIR` moves a root-side
+  # `pg_dump`, `mv` and `rm --` wherever an operator names, including underneath a path
+  # ${APP_USER} owns, and nothing validates it. Require instead that every component of that path,
+  # from the filesystem root down, is a real directory owned by the account this run executes as
+  # and writable by no one else, and REFUSE what is not — and then nothing but root can plant a
+  # FIFO, a symlink or a stale `.part` at the predictable name, a name-check before the
+  # redirection has no TOCTOU left to lose, no helper is needed at all, and the dump stops being
+  # readable by the service account into the bargain. That is an operator-visible narrowing of a
+  # documented "anywhere" override; it is its own change, with its own docs and its own review.
   #
-  # So the one type `noclobber` lets through is the one type whose open(2) BLOCKS. A named pipe at
-  # the `.part` name wedges root's `gzip >` waiting for a reader that never comes, with nothing
-  # serving and the fence up — and a hang, unlike a refusal, does not unwind.
-  #
-  # WHAT REMOVES IT IS `O_NONBLOCK` PLUS AN `O_EXCL` THAT IS NOT RETRIED, AND A SHELL REDIRECTION
-  # CANNOT ASK FOR EITHER. There is no better spelling of `>`; the flags have to be named
-  # somewhere that can name them. scripts/lib/write-new-file.mjs is that place — the same move
-  # scripts/lib/chown-tree.mjs makes for the walk it needs and a shell cannot express — and it is
-  # handed ${BACKUP_AT}, so its one open is still `openat(N, "<name>", …)` against the descriptor
-  # this block proved and never a second resolution of ${BACKUP_DIR}. Anything already at the
-  # name — a FIFO, a device, a directory, a symlink dangling or not, or an ordinary file from an
-  # earlier run — is EEXIST, and EEXIST is a refusal.
-  #
-  # THE MODE IS UNCHANGED: 022 for the directory, which is the umask `mkdir -p` ran under, and the
-  # ambient umask for the dump, which is what the redirection always ran under. Narrowing either is
-  # a separate question about who may read a database dump, and is not decided by a change about
-  # which directory is written into.
-  BACKUP_DIR_WALK="${BACKUP_DIR%/}"
-  [[ "${BACKUP_DIR_WALK}" == /*/* ]] || die \
-    "The backup directory is '${BACKUP_DIR}', which is not an absolute path with a parent to walk down from, so this run cannot prove which directory it would write ${BACKUP_TARGET} into. It will not create it by name. Set IMS_BACKUP_DIR to an absolute path and re-run. NOTHING HAS BEEN MIGRATED."
-  # The two names, taken apart ONCE, here, while ${BACKUP_TARGET} is still a pathname. Everything
-  # below uses the basenames against the descriptor; the full paths are kept only to be PRINTED.
-  BACKUP_BASE="${BACKUP_TARGET##*/}"
-  BACKUP_PARTIAL_BASE="${BACKUP_BASE}.part"
-  BACKUP_PARTIAL="${BACKUP_TARGET}.part"
-  # THE CREATOR OF THAT PARTIAL, RESOLVED FROM THIS SCRIPT'S OWN lib DIRECTORY — the release being
-  # deployed, not ${APP_DIR}. Same rule, and the same spelling, as install.sh's chown_state_tree()
-  # uses for chown-tree.mjs and its auth probe uses for pg-auth-request.mjs.
-  # ${IMS_BACKUP_WRITER_HELPER} exists for the regressions, which run this block outside the
-  # shipped file and so have no BASH_SOURCE to resolve from; pointing it elsewhere produces a
-  # different program, not an exemption.
-  BACKUP_WRITER="${IMS_BACKUP_WRITER_HELPER:-${IMS_SCRIPT_LIB_DIR:-}/write-new-file.mjs}"
-  [[ -f "${BACKUP_WRITER}" ]] || die \
-    "${BACKUP_WRITER} is missing, so this run cannot create ${BACKUP_PARTIAL} with the open(2) flags that make a planted named pipe a refusal instead of an indefinite block. It will not fall back to a shell redirection, which is the defect that helper exists to remove. Restore the checkout and re-run. NOTHING HAS BEEN MIGRATED."
-  command -v node >/dev/null 2>&1 || die \
-    "node is not on PATH, so this run cannot create ${BACKUP_PARTIAL} through ${BACKUP_WRITER}. NOTHING HAS BEEN MIGRATED."
-  # INITIALISED, not merely declared, for the reason crontab-lock.sh initialises CRONTAB_LOCK_FD:
-  # this script runs under `set -u`, `exec {NAME}<` is the only thing that ever assigns this, and the
-  # repository walk in tests/scripts/deploy-order.test.ts reads a plain assignment or nothing at all.
-  # bash allocates a fresh descriptor at 10 or above and overwrites whatever is here.
-  BACKUP_DIR_FD=""
-  [[ -d /proc/self/fd ]] || die \
-    "/proc is not mounted, so this run cannot hold a descriptor on ${BACKUP_DIR_WALK} and would have to write ${BACKUP_TARGET}, publish it and prune beside it through that name three times over. A name can be renamed between the check and the write. Mount /proc and re-run. NOTHING HAS BEEN MIGRATED."
-  BACKUP_SAVED_CWD="$(pwd -P)" || die \
-    "this run cannot establish its own working directory, so it will not walk into ${BACKUP_DIR_WALK} and back. NOTHING HAS BEEN MIGRATED."
-  # Dies on anything it cannot prove, and ENDS THE RUN when it does, so the moved cwd never
-  # outlives the process; see the prose above enter_service_subdir().
-  enter_service_subdir "${BACKUP_DIR_WALK%/*}" 022 "${BACKUP_DIR_WALK}"
-  BACKUP_DIR_IDENT="$(stat -c '%d:%i' . 2>/dev/null || true)"
-  [[ -n "${BACKUP_DIR_IDENT}" ]] || die \
-    "${BACKUP_DIR_WALK} could not be identified after this run walked into it, so it cannot show that the descriptor it is about to open is that directory. NOTHING HAS BEEN MIGRATED."
-  # THE FAILURE IS TAKEN EXPLICITLY, NOT LEFT TO `set -e`: a bare `exec {fd}< …` whose redirection
-  # fails ends a non-interactive shell only BECAUSE errexit is on, and `||` also suspends errexit
-  # for the left-hand command, which is what lets this `die` be the diagnostic. The same reasoning,
-  # and the same spelling, as require_real_service_root() in scripts/install.sh.
-  exec {BACKUP_DIR_FD}<. || die \
-    "${BACKUP_DIR_WALK} could not be opened to hold a descriptor on it, so the dump, its publication and the prune would each have to resolve that name again. NOTHING HAS BEEN MIGRATED."
-  # `-L`, WHICH IS THE ONE PLACE THAT WANTS IT. /proc/self/fd/N is a magic link the kernel resolves
-  # to the OPEN FILE and never to a pathname, so this is an fstat(2) of the descriptor; without `-L`
-  # it would compare the inode of the /proc entry against a directory and never match.
-  [[ "$(stat -L -c '%d:%i' "/proc/self/fd/${BACKUP_DIR_FD}" 2>/dev/null || true)" == "${BACKUP_DIR_IDENT}" ]] || die \
-    "The descriptor this run opened on ${BACKUP_DIR_WALK} is not the directory its walk had just landed in. Refusing to write a database dump through something this run cannot identify. NOTHING HAS BEEN MIGRATED."
-  BACKUP_AT="/proc/self/fd/${BACKUP_DIR_FD}"
-  cd "${BACKUP_SAVED_CWD}" || die \
-    "this run could not return to ${BACKUP_SAVED_CWD} after walking into ${BACKUP_DIR_WALK}. NOTHING HAS BEEN MIGRATED."
+  # SO WHAT IS SHIPPED HERE IS THE STATUS QUO ANTE, HONESTLY LABELLED. `mkdir -p` accepts a
+  # symlink-to-directory at its final component, and the three operations below resolve
+  # ${BACKUP_DIR} and ${BACKUP_TARGET} by name. Under the shipped default that is unreachable —
+  # /var/backups has a root-owned parent and nothing but root can plant or rename anything in it.
+  # Under an `IMS_BACKUP_DIR` pointed into a tree the service account owns it is reachable, and it
+  # was reachable before this branch and is no worse for it. A denial of service that has always
+  # been here is not a regression; a root code-execution path introduced while closing it is.
+  # ---------------------------------------------------------------------------
+  mkdir -p "${BACKUP_DIR}"
   info "Backing up database to ${BACKUP_TARGET}..."
+  BACKUP_PARTIAL="${BACKUP_TARGET}.part"
   backup_rc=0
   # THE PARTIAL FILE IS DELETED INSIDE THIS STATEMENT, not below the pin (o3d-secops r34, Codex
   # HIGH 2). The placement now runs before the failure is propagated and can itself refuse, and a
   # truncated dump left on disk by that path would be a file nothing names as not-a-restore-point.
-  #
-  # THE HELPER IS THE LAST STAGE OF THE PIPELINE, not a wrapper around it: `pipefail` is on, so a
-  # pg_dump or a gzip that fails is still this statement's status, and the helper's own refusal —
-  # exit 1, before a byte is read — is the rightmost non-zero and therefore the one reported.
-  # Nothing is spawned holding ${MIGRATION_DATABASE_URL} in its argv.
-  #
-  # THE `rm` STAYS THE CALLER'S. The helper deliberately does not unlink what it created: the dump
-  # can fail long after the file is a perfectly good descriptor's worth of truncated bytes, and one
-  # owner for that removal is better than two.
-  pg_dump "${MIGRATION_DATABASE_URL}" | gzip \
-    | node "${BACKUP_WRITER}" "${BACKUP_AT}" "${BACKUP_PARTIAL_BASE}" \
-    || { backup_rc=$?; rm -f -- "${BACKUP_AT}/${BACKUP_PARTIAL_BASE}"; }
+  pg_dump "${MIGRATION_DATABASE_URL}" | gzip > "${BACKUP_PARTIAL}" || { backup_rc=$?; rm -f "${BACKUP_PARTIAL}"; }
   # THE RESTORE POINT IS PLACED BEFORE IT IS OFFERED AS ONE (o3d-secops r33, Codex HIGH 2).
   # `pg_dump` is a consumer of the same movable string as everything else, and the aggregate
   # sighting could be satisfied entirely by prisma -- so a dump of ANOTHER cluster was recordable
@@ -5653,19 +5599,10 @@ else
   # Status captured, pin first, failure propagated after it (o3d-secops r34, Codex HIGH 2).
   pin_migration_window "The pre-migration backup"
   [[ "${backup_rc}" -eq 0 ]] || die "pg_dump did not complete; the partial file has been deleted. Nothing has been migrated and there is no restore point for this run."
-  # `-T`, SO A DIRECTORY AT THE TARGET NAME IS A REFUSAL AND NOT A DESTINATION. Without it `mv src
-  # dst` moves INTO dst when dst is a directory, which would leave the restore point at a path
-  # ${BACKUP_FILE} does not name; with it the operation is a rename(2) of one entry onto another,
-  # inside the descriptor, and rename(2) does not follow a symlink at either name.
-  mv -f -T -- "${BACKUP_AT}/${BACKUP_PARTIAL_BASE}" "${BACKUP_AT}/${BACKUP_BASE}" || die \
-    "The completed dump at ${BACKUP_PARTIAL} could not be published as ${BACKUP_TARGET}. The dump itself finished; what this run cannot do is name it as the restore point, so it does not. NOTHING HAS BEEN MIGRATED."
+  mv "${BACKUP_PARTIAL}" "${BACKUP_TARGET}"
   BACKUP_FILE="${BACKUP_TARGET}"
   success "Backup saved: ${BACKUP_FILE}"
-  ls -t "${BACKUP_AT}"/pre-update-*.sql.gz 2>/dev/null | tail -n +11 | xargs -r rm --
-  # AND THE DESCRIPTOR IS CLOSED HERE, at the end of the last operation aimed through it. What
-  # follows this block is the build, the migration and `systemctl start`, and an open descriptor on
-  # a backup directory would be inherited by every one of them for no reason at all.
-  exec {BACKUP_DIR_FD}<&-
+  ls -t "${BACKUP_DIR}"/pre-update-*.sql.gz 2>/dev/null | tail -n +11 | xargs -r rm --
 fi
 
 header "Running database migrations"
