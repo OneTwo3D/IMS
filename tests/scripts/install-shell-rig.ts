@@ -11,13 +11,15 @@
 import assert from 'node:assert/strict'
 import { execFileSync, spawn } from 'node:child_process'
 import { createHash } from 'node:crypto'
-import { chmodSync, readFileSync, writeFileSync } from 'node:fs'
+import { chmodSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import tls from 'node:tls'
 
 import pg from 'pg'
 
 import { type Cluster, cleanLibpqEnv, currentUser, shippedFunction } from './real-postgres-cluster.ts'
+import { shellConstant } from './shell-symbol.ts'
+import { createTempDirSync } from './temp-dir.ts'
 
 export const REPO = process.cwd()
 export const INSTALL_SOURCE = readFileSync(join(REPO, 'scripts/install.sh'), 'utf8')
@@ -105,6 +107,18 @@ export const SHIPPED = [
   'prompt_db_sslmode',
   // r39 (Codex HIGH): the durable mechanism, and the journal that makes the ALTER recoverable.
   'fsync_path',
+  // o3d-rn10: the publisher resolves its destination from a trusted ancestor instead of stat-ing
+  // its own pathname, so the table and the walk come with it.
+  'publish_trust_root_candidates',
+  // r4: publish_root_anchored() is a subshell around this walk, and is nothing without it.
+  'pin_publish_root_parent',
+  'publish_root_anchored',
+  'publish_trust_root',
+  // o3d-secops r7: pin_dir_beneath_root() prints its symlinked-root refusal through this, and the
+  // installer's own pre-flight gate prints the same bytes. A rig missing it turns a refusal into a
+  // `command not found` on stderr and a test that only greps stderr passes for the wrong reason.
+  'refuse_symlinked_root',
+  'pin_dir_beneath_root',
   'publish_durable_file',
   'rotation_journal_encode',
   'rotation_journal_decode',
@@ -169,6 +183,23 @@ export const CAPTURE_TERMINATOR_ASSIGNMENT = (() => {
  * A rig that declared its own copies would agree with itself and with nothing else: the accept-list
  * is the whole of the disclosure fix, and the generation name is the whole of the overwrite fix.
  */
+/**
+ * THE STAGING DIRECTORY publish_durable_file() PUBLISHES THROUGH (o3d-czpy).
+ *
+ * Lifted for the same reason CAPTURE_TERMINATOR is: scripts/install.sh names it once, because the
+ * recursive chown over ${DATA_DIR} has to prune the same name, and a rig that spelled it itself
+ * would agree with itself and with nothing else. Unset, `${dir}/` resolves to the target's own
+ * directory and every one of these tests measures a publication that is not the shipped one.
+ */
+/*
+ * LIFTED THROUGH shellConstant(), NOT THROUGH `^NAME=` (o3d-secops). The declaration carries a
+ * `readonly` in front of the name now, and a line anchored to the name would silently stop
+ * finding it — which is the failure this rig exists to prevent. shellConstant() detects the
+ * assignment by SCOPE, still refuses a script that assigns it twice, and returns the whole line
+ * including the `readonly`, which is what a rig that executes it should run.
+ */
+export const PUBLISH_STAGE_ASSIGNMENT = shellConstant(INSTALL_SOURCE, 'PUBLISH_STAGE_DIRNAME', 'scripts/install.sh')
+
 export const DB_CA_ASSIGNMENTS = [
   'DB_CA_ACCEPTED_PEM_LABELS',
   'DB_CA_GENERATION_PREFIX',
@@ -176,11 +207,8 @@ export const DB_CA_ASSIGNMENTS = [
   'DB_CA_GENERATIONS_RETAINED',
   'DB_CA_REFRESH_FAILURE_ADVICE',
 ]
-  .map((name) => {
-    const match = new RegExp(`^${name}=.*$`, 'm').exec(INSTALL_SOURCE)
-    assert.ok(match, `precondition: scripts/install.sh must define ${name} at top level`)
-    return match[0]
-  })
+  // Through the same reader, for the same reason: two of these five are `readonly` now.
+  .map((name) => shellConstant(INSTALL_SOURCE, name, 'scripts/install.sh'))
   .join('\n')
 
 export const ENV_HEREDOC_DEFAULTS = [
@@ -351,15 +379,33 @@ DB_CA_PUBLISHED_FILE="\${DB_CA_PUBLISHED_FILE-}"
 # retyped: a rig that spelled the prefix itself would pass while install.sh used another one, and
 # the two would disagree only in production.
 ${DB_CA_ASSIGNMENTS}
+${PUBLISH_STAGE_ASSIGNMENT}
 ${ENV_HEREDOC_DEFAULTS}
 ${SHIPPED}
 ${body}
 `
   const env = { ...cleanLibpqEnv(), ...(options.env ?? {}) }
+  // THE SCRIPT IS RUN FROM A FILE AND NOT FROM `bash -c`'s ARGUMENT (o3d-rn10 r5).
+  //
+  // Linux caps a SINGLE argv element at MAX_ARG_STRLEN — 32 pages, 128 KiB — and ${SHIPPED} alone
+  // is already ~115 KiB of lifted installer text. Adding a few lines of comment to any function on
+  // that list crossed the limit, and what that looked like was: `execve` fails with E2BIG,
+  // execFileSync throws an error carrying NO `status`, NO `stdout` and NO `stderr`, and the catch
+  // below turns it into `status: -1` with an EMPTY output. Every test in three files then failed
+  // with `-1 !== 0` and a blank message, naming neither the limit nor the edit that hit it. A
+  // harness that cannot say why it failed is worse than one that fails.
+  //
+  // A FILE HAS NO SUCH LIMIT, and `bash FILE ARGS...` binds `$1..` exactly as `bash -c SCRIPT $0
+  // ARGS...` did — nothing lifted reads `$0`, which is the only thing that changes. The directory
+  // is removed in a `finally`, so the temp-dir sentinel sees nothing left behind whether the script
+  // returned, failed or threw.
+  const dir = createTempDirSync('ims-shell-rig-')
   try {
+    const scriptFile = join(dir, 'rig.sh')
+    writeFileSync(scriptFile, script)
     return {
       status: 0,
-      output: execFileSync('bash', ['-c', script, 'install.sh', ...(options.argv ?? [])], {
+      output: execFileSync('bash', [scriptFile, ...(options.argv ?? [])], {
         encoding: 'utf8',
         env,
         stdio: ['ignore', 'pipe', 'pipe'],
@@ -368,6 +414,8 @@ ${body}
   } catch (error) {
     const failure = error as { status?: number; stdout?: string; stderr?: string }
     return { status: failure.status ?? -1, output: `${failure.stdout ?? ''}${failure.stderr ?? ''}` }
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
   }
 }
 
@@ -530,6 +578,32 @@ export function base64(value: string): string {
  */
 export const DECODE_HELPER = `decode_b64() { printf '%s' "$1" | base64 -d; }`
 
+/**
+ * AN INSTALL ROOT WITH AN ANCHOR ABOVE IT (o3d-rn10 r2).
+ *
+ * The rig hands the caller's directory to the shipped script as ${APP_DIR}, and derives
+ * ${DB_ENV_SNAPSHOT_DIR} and ${DB_CA_PUBLISH_DIR} from it — three of the six directories
+ * publish_durable_file() will publish into. It now refuses a root whose OWN PARENT could be
+ * renamed inside by anyone but root, and the unit suite's TMPDIR deliberately mirrors /tmp at
+ * 1777, so a bare `mkdtemp` root has no anchor and every publication in the rig fails for a reason
+ * that has nothing to do with what it measures. One nesting level supplies it.
+ *
+ * THE ANCHOR IS 0755 AND NOT 0700, because an anchor is about WRITE. Several tests here assert
+ * that a published CA is readable by every uid on the box, which a 0700 ancestor would make false;
+ * the roots that need it chmod THEMSELVES to 0755 already, and this keeps that reachable.
+ * The root itself is created 0700, which is what `mkdtemp` gave them.
+ *
+ * The outer directory is registered for removal at exit, so a caller that `rmSync`s the root it
+ * was given still leaves nothing behind.
+ */
+export function installRoot(prefix: string): string {
+  const outer = createTempDirSync(prefix)
+  chmodSync(outer, 0o755)
+  const root = join(outer, 'app')
+  mkdirSync(root, { mode: 0o700 })
+  return root
+}
+
 /** The four values that identify one credential, as the rig's tests supply them. */
 export function installVars(cluster: Cluster, root: string): Record<string, string> {
   return {
@@ -649,10 +723,13 @@ export function caGenerationPath(publishDir: string, caFile: string, trusted = f
     stdio: ['ignore', 'pipe', 'pipe'],
   })
   const digest = createHash('sha256').update(normalized).digest('hex')
-  const prefix = /^DB_CA_GENERATION_PREFIX="([^"]*)"$/m.exec(INSTALL_SOURCE)
-  const suffix = /^DB_CA_GENERATION_SUFFIX="([^"]*)"$/m.exec(INSTALL_SOURCE)
-  assert.ok(prefix && suffix, 'precondition: scripts/install.sh must spell the generation name in two literals')
-  return join(publishDir, `${prefix[1]}${digest}${suffix[1]}`)
+  const [prefix, suffix] = ['DB_CA_GENERATION_PREFIX', 'DB_CA_GENERATION_SUFFIX'].map((name) => {
+    // The VALUE, off the line shellConstant() resolved — the line itself now begins `readonly`.
+    const match = /="([^"]*)"$/.exec(shellConstant(INSTALL_SOURCE, name, 'scripts/install.sh'))
+    assert.ok(match, `precondition: scripts/install.sh must spell ${name} as a double-quoted literal`)
+    return match[1]
+  })
+  return join(publishDir, `${prefix}${digest}${suffix}`)
 }
 
 /**

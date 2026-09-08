@@ -996,6 +996,14 @@ Both inputs are now written to **separately created temporary files**, each `mkt
 
 **The lock is root's, and the service only reads it.** `${DATA_DIR}/locks` is created by the installer as `root:root` 0755 and the lock file inside it as `root:root` 0644 — the state directory around them stays owned by `imsapp`, as systemd requires, but nothing inside `locks/` can be created, replaced or removed by that user. That is deliberate: the installer runs as root, and a root-side `touch`/`chown`/`chmod` on a path the service account can turn into a symlink is a privilege-escalation primitive (it was one until r24). `flock(2)` ignores a descriptor's access mode, so the application opens the lock **read-only** and takes exactly the same exclusive lock; it never needs to write it. Do not `chown` the lock to `imsapp` "to fix permissions" — that re-opens the hole, and nothing needs it. On a host that was never installed by `scripts/install.sh` (a hand-deployed unit, `next dev`) the application creates `locks/` and the lock file itself, as the service user; there is no root writer there to be protected from.
 
+**And that primitive was not confined to the lock** (o3d-czpy). The lock file was one instance of a class: `scripts/install.sh` runs as root and writes into `${DATA_DIR}` and `${APP_DIR}`, both of which *it* hands to `imsapp` with a recursive `chown` — so on the next run every path it resolves inside them is a name the service account can have replaced with a symlink. Eight further sites were converted, and they now share three primitives with `prepare_crontab_lock`:
+
+* **Every publication is staged in a root-owned directory.** `publish_durable_file()` — the writer behind `${APP_DIR}/.env`, `${APP_DIR}/.deploy-meta`, `${DATA_DIR}/git-ssh/known_hosts`, `/etc/ims-cutover/DEPLOY-FENCED` and the crontab backup — creates `.ims-publish` beside the target as `root:root` 0700, `cd`s into it (so the shell holds the *inode*, which no rename can move), makes its temporary there, applies **owner and mode before the content**, and publishes with `mv -T`. `rename(2)` replaces a symlink entry instead of following it. **And the rename names the destination RELATIVELY** (`../known_hosts`, never the absolute path): a pinned inode does not pin the path used afterwards, and `${DATA_DIR}/git-ssh` is a directory `imsapp` can rename aside between the pin and the publication, which would have sent a root-written `known_hosts` to a directory of their choosing. **And the destination itself is reached by walking down from a directory `imsapp` cannot replace**, one component at a time, rather than by `stat`ing its pathname: a pin taken from a name proves the directory did not *move*, and says nothing about *which* directory was pinned, so `git-ssh` replaced by a symlink to `/root/.ssh` **before** the installer ran would have been pinned as `/root/.ssh` and passed every later check. The walk starts at the nearest of `/opt/one-two-inventory`, `/var/lib/one-two-inventory`, the cutover state directory, `/etc/ims-cutover`, `/etc/ims-cutover-state`, `/etc/ims-db-ca` and `/etc/ims-cutover-recovery` — each of which has a **root-owned parent** (`/opt`, `/var/lib`, `/etc`), so its own name cannot be renamed aside or forged — and refuses a publication whose destination lies under none of them. `deploy.sh` and `update.sh` carry the same publisher and the same table, byte for byte. From the moment the walk ends, the destination exists only as **a descriptor opened on it**, and is **never spelled again**: the staging directory, its `chown -h` and its `lstat` are all single relative components resolved from the working directory, and the publication and the final fsync go through `/proc/self/fd/N` — which the kernel resolves to the open directory, so `mv -T … /proc/self/fd/N/known_hosts` *is* `renameat(N, "known_hosts", …)`. It used to be `../known_hosts` and `fsync ..`. `..` is the kernel's own parent link, so no rename of any *name* above the staging directory can redirect it — but it is a property of **where the staging directory is**, re-read at every syscall, and a staging directory moved *wholesale* into another parent takes `../known_hosts` with it. What actually prevented that move was never written down: renaming a directory into a **different** parent requires write permission on the directory being moved, and the staging directory is `root:root` 0700, so `imsapp` gets `EACCES`. The publication's safety rested on the staging directory's *mode*, one inference away. It now rests on the descriptor, which is a fact about the destination and not about the staging directory at all (o3d-secops r19). The `..` checks are kept: they now **refuse** a moved staging directory instead of following it. **You will see a `.ims-publish` directory inside `/var/lib/one-two-inventory` and in `/opt/one-two-inventory`; leave it, and do not `chown` it to `imsapp`.** The installer's recursive chown over the state directory prunes it, at any depth, for the same reason it prunes `locks/` — and that walk is **no longer `find -exec chown`** (o3d-n8xx). `find -exec` enumerates *pathnames* and hands them to a `chown` that resolves them again afterwards, and `chown -h` protects only the final component; on an upgrade the service account owns this tree and the service is still running, so a descendant directory renamed into a symlink between the enumeration and the execution redirected a root-side ownership change through it (GNU find's own documentation calls `-exec` insecure for exactly this). `scripts/lib/chown-tree.mjs` now walks it **by descriptor**: every entry — directory, file, symlink, fifo, socket, device — is opened ONCE with `O_PATH|O_NOFOLLOW` relative to its parent's descriptor, `fstat` on that descriptor answers what it is and which inode it is, and the ownership change goes through `/proc/self/fd/N`, which the kernel resolves to the open file. There is no pathname left for anyone to re-resolve. **A name is never looked up twice** (o3d-secops r20): it used to `lstat` the name to decide the entry was not a directory and `lchown` the same name afterwards, so `imsapp` — who owns the parent and is still running — could plant a sacrificial regular file, wait for the walk to reach it, and rename the staging directory onto that name in the gap. The prune is only consulted for directories, so it never ran, and `lchown` on a directory is exactly `chown`: the debris of an interrupted publication was handed to the account that planted the swap. The directory branch had the same gap one step further along, in its fallback for an `O_DIRECTORY` open answered `ENOTDIR` or `ELOOP`. `O_PATH` is what lets one open cover every type: it needs no read permission, does not block on a fifo, and with `O_NOFOLLOW` opens a *symlink itself* instead of failing `ELOOP` — and a chown through the descriptor's own `/proc` name changes the link and not its target, exactly as `chown -h` promised. Because `open(2)` silently ignores flag bits it does not know, the walk proves it has `O_PATH` before using it: `fchown` on such a descriptor is `EBADF`, and anything else — a success included — is a refusal. `locks/` is pruned by **verified identity** — its `dev:ino` is taken once from the root's own descriptor, so renaming it mid-walk cannot get it chowned under another name. Staging directories are pruned by **shape**, not by name (o3d-secops r19): a directory owned by the uid running the walk whose mode is exactly `0700` is not handed over, wherever it is and whatever it is called. It used to be pruned by the name `.ims-publish`, and a name is not a boundary — `imsapp` owns the containing directory, so renaming `.ims-publish` to an ordinary name costs it nothing (a rename *within* one parent needs no permission on the directory being moved), and the walk then handed the directory over. That matters because a `SIGKILL` or a power loss between the fill and the rename cannot run a failure path, so the staging directory is left holding a **complete, root-owned copy of whatever was being published**. The shape is one `imsapp` can neither manufacture (it cannot `chown` to root) nor alter (it does not own it, so `chmod` is `EPERM`), so it survives every rename `imsapp` can perform. Everything the installer creates *for* `imsapp` it creates under `umask 022`, so `0755`; a `0700` root-owned directory is one `imsapp` cannot enter today, so withholding it takes away nothing that worked. `LOG_DIR`'s equivalent is `chown -Rh .` inside a root entered by descriptor, which coreutils walks with `fchownat` relative to descriptors it holds; the one over the application directory runs in section 9, before section 10 has created it, and the publisher re-takes root ownership with `chown -h` on every run and **refuses** — rather than correcting — anything at that path it does not end up inside.
+* **Every directory below one of those roots is created with a plain `mkdir`, one component at a time, by a walk that never names an ancestor twice.** `mkdir -p a/b` succeeds *silently* when `a` is a symlink to a directory; a plain `mkdir` fails with `EEXIST` and the installer then `lstat`s the path and **refuses the run**, naming it. That covers the component being created and says nothing about the ones already accepted, so the walk `cd`s into each component as it goes and creates the next one **relative to the directory it is inside** — an ancestor that is renamed after it was checked cannot redirect anything, because the shell holds its inode. The one remaining window, between the `stat` that says "directory" and the `cd` into it, is closed by taking the component's **inode** in the same `lstat` that took its type and requiring the directory the walk lands in to be that exact inode — and by checking `..` after the step as well. The two catch different things and both are needed: the inode refuses a component swapped for a symlink to a **sibling under the same parent**, which `..` cannot tell apart from the real destination; `..` refuses a destination **moved wholesale into another parent**, which keeps its inode. Together they close the class in shell — no descriptor-relative `openat2` helper is needed, because an `lstat` names an inode and a `cd` lands in one, and a rename between them can only make the two differ. The same check protects `${APP_DIR}/.git`, where the previous version asked only whether the directory it had entered was root-owned — which a symlink to *any other* root-owned directory satisfies. The state roots themselves (`/var/lib/one-two-inventory`, `/var/log/one-two-inventory`) still use `mkdir -p`, because their parents are root-owned. **The root used to be the one hop that was not proved** (o3d-rn10 r5): it was entered with a `cd -P` that followed a symlink *deliberately*, so a state root symlinked onto a second disk kept working. Only the link's **name** is protected by its root-owned parent, though — the path its **target** resolves through is proved by nothing, so a target under a directory the application account owns can be renamed aside and rebound to `/root/.ssh`, and the unchanged root entry passes every check while the publication lands there as root. The root is therefore now created, `lstat`ed, entered and inode/`..` checked exactly like every component below it, and **a symlinked root is refused** — naming the bind mount that replaces it and pointing at the procedure under “Putting a state root on another disk” below. Put a state root on another disk with a **bind mount**, never a symlink.
+* **No `chmod`, anywhere on these paths.** `chmod` has no `--no-dereference` on Linux, so a raced one is the same escalation with a different verb. `${DATA_DIR}/git-ssh` is now created at 0700 by `umask` and a wrong mode is **refused** rather than corrected — set it back to 0700 by hand if you ever changed it.
+
+Two behaviour changes an operator may notice. `ssh-keyscan` output is captured and checked before it is published, so a keyscan that fails or returns nothing now **aborts the install** instead of leaving an empty `known_hosts`. The legacy-upload migration no longer requires its destination to be owned by the installer's uid — on any rerun the previous install has already chowned the upload roots to `imsapp`, so that check refused the ordinary upgrade; the walk above establishes the destination's identity instead, and the files are moved into the directory it is standing in. And `/tmp/one-two-inventory/pdf` and `/tmp/one-two-inventory/uploads` are **no longer created**: `/tmp` is world-writable, which made those the one pair of paths any local user could aim, and nothing in the application ever opened them (its own temporary uploads live under `os.tmpdir()/onetwoinventory`, created at runtime by the service).
+
 Never delete and recreate the lock file — the lock lives on the inode, so a replaced file silently gives two writers two different locks. To see who holds it: `fuser -v ${DATA_DIR}/locks/.crontab-reconcile.lock`. A save that cannot get the lock within the wait reports "the scheduler may be behind" and changes nothing; re-apply from Settings → System → Scheduler. **If the lock file cannot be opened at all** — no `StateDirectory=` in the unit, a missing or unreadable `locks/` directory, a read-only mount — the reconciliation *refuses*: it does not read or write the crontab, and the error names the path it tried and the `StateDirectory` directive to fix. It never falls back to reconciling without the lock, because an unserialised reconciliation is exactly the defect the lock exists to prevent.
 
 **An upgrade proves the application is running *this* build before it touches the crontab.** That flock only excludes a process locking the *same* file, which is true only of a process running the build the installer just deployed, under the unit it just wrote. The installer establishes that in three steps, not one: the cutover **stops** the service before the migration and refuses to go on while anything is still bound to the app port; section 12 then `enable`s the unit and `start`s it — deliberately two statements, because `enable --now` reloads systemd implicitly and would re-read every unit file *after* the check that the loaded configuration binds the service to this run's database; and section 12b then asks the port *which build answered*, by fetching `/_next/static/<BUILD_ID>/`, a route only the process whose own build id is that one serves. `/api/health` alone is not enough — a predecessor still holding the port answers it just as well. **And the asset fetch alone is not enough either** (o3d-p9dq): it proves which *tree* is being served, not whose *process* is serving it. A same-build process started by hand out of `${APP_DIR}` after the port was drained can win the bind while `systemctl start` returns for a unit that then fails to bind — and, not being the unit's child, it has no `$STATE_DIRECTORY`, so it resolves the crontab lock under its own working directory and the installer's flock would exclude nothing. So section 12b also verifies that the unit is active, resolves its `MainPID` and `ControlGroup`, checks that every pid holding a listening socket on the app port is inside that control group (a cgroup rather than a pid equality, because a Next.js unit's listener is routinely a child of the `ExecStart` process), and reads each listener's **own** effective `STATE_DIRECTORY` out of `/proc/<pid>/environ` to confirm its first colon-separated entry is `${DATA_DIR}` — the value the application joins `locks/.crontab-reconcile.lock` onto. An `environ` that cannot be read (the process exited, or `/proc` is mounted with `hidepid=` for this reader) is *proof not established* and aborts; it is not treated as an absent variable. **If either proof fails the install aborts** and the crontab section never runs, because taking a lock that excludes nothing is worse than not writing the crontab at all. The result is carried to the crontab section as `APP_SERVICE_ON_NEW_BUILD`, which section 16 refuses to open the lock without, so reordering the two sections fails loudly rather than silently reopening the race. A **hand-deployed** upgrade has none of this: nothing stopped the service, so it must rebuild, then `systemctl restart` (a `start` on a running unit is a no-op and leaves the old process on the old lock path), and only then touch the crontab — see `deploy/README.md`.
@@ -1188,8 +1196,9 @@ exists to prevent.
   operator following the block literally left every cron writer running across the migration,
   which is the second half of "stop and drain every writer".
 * **Nothing it wrote was durable.** `printf > file` is neither atomic nor flushed. The scripts
-  publish through `publish_durable_file()`: a temporary in the same directory, an `fsync` of
-  the data, the `rename`, an `fsync` of the parent directory, and a `marker_complete=1`
+  publish through `publish_durable_file()`: a temporary in a root-owned staging directory on the
+  same filesystem, an `fsync` of the data, a `renameat` through a descriptor held on the
+  destination, an `fsync` of that same descriptor, and a `marker_complete=1`
   sentinel written last so a reader can tell a whole marker from a torn one. A shell
   redirection has none of that, and a reboot can find an empty marker, the previous one, or no
   marker at all.
@@ -1221,16 +1230,481 @@ All three entrypoints read and write the same four paths, so a fence left standi
 of them is adopted by any other — which is what the failure banners have always told operators
 to do:
 
-| what | path |
-| --- | --- |
-| cutover marker | `/var/lib/one-two-inventory/DEPLOY-FENCED` |
-| crontab backup | `/var/lib/one-two-inventory/crontab-<service user>.bak` |
-| connection-fence state | `/var/lib/one-two-inventory/deploy/db-connect-fence.json` |
-| cutover lock | `/var/lib/one-two-inventory/cutover.lock` |
+| what | path | owner, mode |
+| --- | --- | --- |
+| cutover marker | `/etc/ims-cutover/DEPLOY-FENCED` | `root:root` 0600, in a `root:root` **0700** directory |
+| cutover lock | `/etc/ims-cutover-state/cutover.lock` | `root:root` **0600**, in a `root:root` **0711** directory |
+| connection-fence authority | `/etc/ims-cutover-state/db-fence/db-connect-fence.json` | `root:root` **0644**, in a `root:root` **0755** directory. Carries `fence_mode` (`initial` or `recovery`) since o3d-secops r24 and `fence_applied` (`0`, raised to `1` by root after the revoke) since r25. A record carrying **no** `fence_applied` key is refused by every automatic path since r26 — see *Two kinds of fence* |
+| crontab backup | `/var/lib/one-two-inventory/crontab-<service user>.bak` | `root:root` 0600 |
 
-Set `IMS_CUTOVER_STATE_DIR` **in the environment of the root invocation** to move all four
-together; `IMS_DEPLOY_STATE_DIR` and `IMS_DATA_DIR` are still honoured. Setting any of them in
-`APP_DIR/.env` does nothing: the application user owns that file, and since o3d-2sm1.5 r25 none of
+Set `IMS_CUTOVER_STATE_DIR` **in the environment of the root invocation** to move the crontab
+backup and the crontab lock directory; `IMS_DEPLOY_STATE_DIR` and `IMS_DATA_DIR` are still honoured.
+**No variable moves the first three.**
+
+**The lock and the connection-fence directory left the state directory in o3d-secops r22, for the
+reason the marker left it in r20.** `/var/lib/one-two-inventory` is handed to `imsapp` on every run,
+so every name directly beneath it is that account's to create, replace and unlink — and two of the
+things that lived there were opened or created **by root**:
+
+* the lock was `exec 9>"$LOCK_FILE"`, which is `open(O_WRONLY|O_CREAT|O_TRUNC)`. A symlink at that
+  name **truncated the target to zero** before `flock` was reached — any file root can write, a unit
+  file or the fence marker included — and the `flock` that followed proved only that *a* lock had
+  been taken, never that it had been taken on *this* file;
+* the connection-fence directory was `mkdir -p`, which **accepts a symlink-to-directory** at the
+  final component and returns success, followed by a `chown` and a `chmod` that both dereference. A
+  link there pointing at `/etc`, at `/root`, or at any directory on the box handed that directory to
+  `imsapp` at mode 0700.
+
+They now live under **`/etc/ims-cutover-state`**, root-owned and **0711**: nobody else can create,
+replace or unlink a name inside it, so there is no symlink left to plant at either. It is a
+**literal** in all three scripts, for the same reason the marker's directory and the
+database-identity snapshot's are. `/etc/ims-cutover` was not reused and was not touched: it is 0700
+because it holds the database password and the boot authority, the connection-fence record has to be
+**readable by the service user** (the helper that executes a fence and a release runs as that
+account), and relaxing the one directory that exists to be private, so that a readable child could
+be traversed to, is not a trade worth making.
+
+**0711 and not 0755, and the lock is 0600** (o3d-secops r23). r22 justified only the `x` bit on the
+parent and the `r` bit came with it; nothing in there needs to be *listed* by the service account,
+which reaches `db-fence/` by a name compiled into the scripts. And the lock's mode is load-bearing
+after all: `flock(2)` needs nothing but an open descriptor, so **read permission on the lock file is
+permission to hold the cutover exclusion** — at 0644 the service account could open it, take it, and
+freeze every deploy, update and install on the box for as long as it liked. r22 dropped the mode
+*assertion* because an ambient umask would then refuse a cutover for a property nothing repaired; it
+is now **set** instead — created under a stated `umask 077`, and narrowed on the descriptor
+`verify_held_lock()` has just identified (`chmod` of `/proc/self/fd/N`, which is an `fchmod`) with
+the result read back off that same descriptor before `flock` is taken.
+
+**And a lock that was ever wide is replaced, not repaired** (o3d-secops r24). Narrowing closes the
+door to new opens and does nothing whatever to a descriptor somebody already holds: **permission is
+checked at `open(2)` and never again**. On a host upgraded from a checkout that left this file at
+`0644`, the service account can have opened it *before* the cutover started, **without locking it**
+— an open is invisible where a lock is not, and `fuser` shows nothing — and then `flock` it the
+moment the cutover exits, freezing every deploy, update and install afterwards with nothing to point
+at. So where the lock is **inherited** at anything other than `0600`, the run creates a fresh `0600`
+inode in the same root-owned directory, opens it read-only, verifies it, narrows it, **locks it**,
+and only then renames it over `cutover.lock`. A descriptor opened while the old file was wide now
+refers to an inode with no name. It happens **once**: the gate is the mode the lock was inherited
+at, so the next cutover finds `0600` and replaces nothing.
+
+The trade, stated. Replacing an inode means giving up exclusion against anything still holding the
+old one — which is the point, and would be a disaster if a genuine concurrent cutover were the
+holder. It cannot be: the replacement is reached **only after this run holds `flock` on the
+inherited inode**, so at the instant of the rename nothing else holds that lock, and `fd 9` is then
+kept open on the retired inode for the rest of the run. A real predecessor therefore never loses —
+if it got there first, this run dies at `Refusing to run two cutovers at once` and **nothing is
+rotated**, so its inode is never swapped out from under it; a cutover arriving while `fd 9` is held
+is refused on the old inode, and one arriving after the rename is refused on the new one. The only
+process that can ever take the orphaned inode's lock is one that opened it and did not immediately
+try to lock it — and no cutover here is ever in that state, because `flock -n` is non-blocking,
+follows the open in the same function, and every failure ends the run. That state belongs to the
+holdout this exists to defeat and to nothing else.
+
+**And nothing in that namespace is aimed at a pathname.** The directory is created one component at
+a time by the same symlink-proof walk `install.sh` has always used for `${DATA_DIR}` — plain `mkdir`
+(EEXIST on a planted symlink, where `mkdir -p` silently works *inside* its target), `lstat`, `cd -P`,
+and the inode it landed on proved against the entry — and its owner and mode are then applied to
+`.`, the directory the shell is standing in, which is `fchown(2)`/`fchmod(2)` in the only spelling a
+shell has. The lock is opened **read-only** (`flock(2)` locks the open file description whatever its
+access mode, which is what `lib/crontab-lock.sh` already relies on), so there is no `O_CREAT` and no
+`O_TRUNC` left to aim; the descriptor is then `fstat`ed through `/proc/self/fd/N` and required to be
+a regular file owned by the account running the cutover **and** to be that name's own inode by
+`lstat` — which is `O_NOFOLLOW` proven rather than assumed — and `flock` is taken on **that same
+descriptor**, which is never reopened. The walk, the lock and the directory now have exactly one
+definition each, in `scripts/lib/cutover-namespace.sh`, sourced by all three entrypoints: the walk
+used to exist in `install.sh` alone while the two paths that most needed it were in the other two.
+
+### Before a cutover: no other cutover
+
+**One lock excludes one population, and it is not everything that can run a cutover on this host.**
+`/etc/ims-cutover-state/cutover.lock` excludes every `deploy.sh`, `update.sh` and `install.sh` that
+takes *that* lock. A cutover launched from a **checkout that predates o3d-secops r22** takes a lock
+under `/var/lib/one-two-inventory`, which the service account may rename between that run's `open`
+and this one's — so **nothing in the code can exclude it**, and since r23 nothing pretends to. Every
+non-dry run says so out loud at the moment it takes its own lock.
+
+r22 shipped a bridge that also locked the old name. It could not do what it claimed: a predecessor
+holds an **inode**, the bridge opened a **name**, and the account that owns that directory can move
+the name out from under the inode and leave a fresh regular file at it — on which every check the
+bridge made passes. The two honest ways out are a **transitional predecessor** that also takes the
+protected lock, and **operator-controlled quiescence**. The first is not available: a transitional
+release would have to reach a host *before* the checkout that moved the lock, and every host with a
+pre-r22 checkout has it already. So it is the second, and this is where the requirement lives:
+
+> **Before starting a cutover, establish that no other one is running.** `fuser -v
+> /etc/ims-cutover-state/cutover.lock` names anything holding the shared lock. For a checkout that
+> predates it, look for a running `deploy.sh`, `update.sh` or `install.sh` from **any** directory
+> (`pgrep -af 'install\.sh|deploy\.sh|update\.sh'`), and prefer removing or upgrading stale
+> checkouts to remembering this step. Two concurrent cutovers migrate one schema twice.
+
+One claim survives in code, with its precondition **proved rather than assumed**: the lock at
+`/var/lib/ims-deploy/deploy.lock` is still taken, but **only** where `stat` says that directory is
+owned by the account running the cutover and is writable by nobody else. Where it is not — including
+where it does not exist — nothing is opened, created or locked there, and what is not excluded is
+named.
+
+**Connection-fence records at the old paths are named and not imported.** Both
+`/var/lib/one-two-inventory/deploy/db-connect-fence.json` (pre-r22) and
+`/var/lib/ims-deploy/db-connect-fence.json` (the namespace `deploy.sh` used before the shared one)
+list the grantees a fence revoked `CONNECT` from, and both were written by the fence helper running
+as the service account. Earlier checkouts **republished** the second one into the shared namespace;
+that made root act on the application's own choice of who gets database access, which is the
+r23 CRITICAL with an older file in it. A fence that really is standing is still found — from the
+database, which is where the release path already asks, and which already refuses with the grantees
+named when the record is gone.
+
+**The cutover marker is NOT one of them, and no variable moves it** (o3d-secops r20). It used to
+live at `/var/lib/one-two-inventory/DEPLOY-FENCED`, root-owned and `0600` — and that protects its
+*bytes* and nothing else. `unlink(2)` and `rename(2)` ask for write permission **on the parent
+directory** and ask nothing whatever about the file, and `/var/lib/one-two-inventory` is handed to
+`imsapp` on every run. So the service account could delete the marker — which lifts the
+`AssertPathExists=!` and lets the unit start on the next boot, over a schema in whatever state the
+interrupted cutover left it — or move it aside and leave one of its own at the name, which the next
+run reads as an account of what the interrupted *privileged* run did and acts on line by line. The
+marker now lives under `/etc/ims-cutover`, created root-owned and `0700`, which is the same
+directory the database-identity snapshot already uses and one of the publication trust roots.
+Its path is a **literal** in all three scripts for the reason the snapshot's is: an override only a
+root-owned source may set is indistinguishable from no override, and a privileged path resolved
+from a variable the application can set is not a privileged path. A deployment that must move it
+edits that line, which is a root-owned change to a root-owned file.
+
+**Adoption checks provenance, not existence.** Before a single line of a marker is read, all three
+scripts require it to be a *regular file* (`lstat`, so a symlink is refused) owned by the account
+running the cutover with no group or other write bit, **inside a directory** owned by that account
+with no group or other write bit. Anything else — a symlink, a directory, a marker in a parent
+somebody else can write — is refused with a message naming what is wrong, and nothing is stopped
+and nothing is migrated.
+
+**Upgrading a host that is currently fenced.** If a marker is sitting at the old path when a
+post-r20 entrypoint runs, it is **republished at the new one before anything is adopted** and the
+old file is deliberately **left where it is**: the drop-in already on disk still asserts on it, so
+the host stays fenced across the move. Only once a drop-in naming `/etc/ims-cutover/DEPLOY-FENCED`
+has been written, `daemon-reload`ed and *verified* is the old marker removed. A crash anywhere in
+between leaves both, which is the safe direction — whichever drop-in is loaded, the file it asserts
+on is there — and the next run says so and adopts the one under `/etc`. Lifting the fence removes
+both. **Nothing is silently released:** there is no state in which the marker stops being seen.
+
+**And the marker at the old path is NOT READ AT ALL** (o3d-secops r22). Relocating it meant reaching
+back into the directory the relocation exists to escape, and r20 did that with `[[ -f ]]` — which
+*follows a symlink* and says nothing about who wrote what it found — followed by a redirection that
+resolved the same name a second time, as root, straight into the publisher. r21 replaced that pair
+with a descriptor helper: one `open(2)` with `O_NOFOLLOW`, then every fact taken from the `fstat` of
+that descriptor — a regular file, owned by the uid running the cutover, no group or other write bit,
+and exactly **one link** — the descriptor proved to be that name's own inode, and the bytes copied
+from the descriptor rather than from the name.
+
+Every one of those checks is sound. Together they still do not establish what the relocation needed,
+and the link count is where that becomes visible. **`st_nlink` is a fact about the present, not about
+the past.** It says no second name exists *at the moment of the `fstat`*; it cannot say none ever
+did. The service account can hard-link a root-owned 0600 inode **whose content it influenced** into a
+directory it controls, drop the other name, and leave exactly one link at a path of its choosing —
+and these scripts create root-owned 0600 files out of that account's own content on every run: the
+crontab backup *is* its crontab, written by root, in its own directory. r21 named
+`fs.protected_hardlinks` as what normally forbids the link, and then rested on it — which is resting
+a privilege boundary on a sysctl these scripts neither set nor read back.
+
+There is no seventh check that fixes that. When the adversary owns the directory a file is named in,
+no sequence of questions about the file establishes provenance: whatever the check, the account can
+arrange for a file that passes it. So the answer stopped being a better inspection and became a
+different use of the answer.
+
+**The PRESENCE is the signal; the content is not evidence of anything.** While *anything* exists at
+`/var/lib/one-two-inventory/DEPLOY-FENCED`, an `AssertPathExists=!` installed by an earlier checkout
+is satisfied by it, so the host **is** fenced — whoever put it there, and whatever is inside it. That
+is a fact about the **name**, which is the one thing that cannot be forged away: the account can
+create that name, and cannot make the running system ignore it. It is also everything the relocation
+needs.
+
+So nothing is opened and nothing is read. `scripts/lib/pin-source-file.mjs` is **gone**, with its
+regressions: it existed to authenticate those bytes, and an unused apparatus whose premise has been
+rejected is an invitation to wire it back up. The marker published at `/etc/ims-cutover/DEPLOY-FENCED`
+is composed by the run itself, out of its own facts, and records **the most conservative fence state
+there is**:
+
+| line | what it means |
+| --- | --- |
+| `phase=stopping` | assume the predecessor had begun stopping |
+| `migration_attempted=true` | assume the reboot fence was meant |
+| `schema_touched=true` | assume the schema may be half migrated |
+| `legacy_marker_unauthenticated=1` | and say that those three are a **policy**, not a reading |
+| `legacy_marker_path=…` | the old path it came from, so an operator can go and look at it |
+
+Those are the same three values adoption already derives for a marker that fails its completeness
+sentinel — *missing is not false, it is unknown, and unknown is read the expensive way* — reached
+here by a different route for the same reason. **Not one line of the old file is carried forward**,
+including its own `marker_complete=`: a truncated predecessor cannot be told from a forged one, and
+neither may be republished as this host's record of what a privileged run did. In practice the run
+therefore re-migrates, re-checks drift and re-verifies before anything gets `CONNECT` back, and it
+does not resume an "interrupted arming" over a service it would otherwise have left running.
+
+**The old entry is still left exactly where it is**, and the run still does not delete it: the
+drop-in on disk asserts on that name, so removing it is a release. Adoption prints the marker
+verbatim, so an operator sees `legacy_marker_unauthenticated=1`, and the run names the two things
+that **can** be established without trusting that file — ask systemd what is actually asserted
+(`systemctl show -p DropInPaths` on the unit, then read the drop-in it names), and ask the database
+whether the application role still has `CONNECT`. Settle those, clear the entry by hand, and a later
+run has nothing to adopt.
+
+**This gives `imsapp` nothing it did not already have.** It can now make every subsequent cutover
+adopt a conservative fence by touching one name — and it could already do strictly more with that
+same name, because a drop-in asserting on it stops the unit from booting. The outcome is fail-closed
+either way.
+
+**An override has to be ANCHORED, and an unanchored one stops the run rather than being trusted.**
+Every path above is published by a walk that starts at a directory the scripts take on trust, so
+that directory's own name must be one the service user cannot replace. That is decided by walking
+to it from `/`: **every directory from `/` down to the override's parent** must belong to root (or
+to whoever is running the script), must carry no group or other write bit, and must be a real
+directory rather than a symlink. `/opt`, `/var/lib` and `/etc` all satisfy that, which is why the
+shipped defaults work; `/tmp` does not, and neither does anything under a directory the application
+account owns.
+
+It is the **whole ancestry** and not just the parent, because a parent nobody can write into is
+worth nothing if somebody can rename the parent. `IMS_CUTOVER_STATE_DIR=/home/app/guard/state` with
+`guard` root-owned and `0755` is refused, because `/home/app` belongs to the application account and
+`guard` is theirs to move aside. A **sticky** ancestor — `/tmp`'s `1777` — is accepted as an
+ancestor, since sticky stops anyone but an entry's owner from renaming it; it is **not** accepted as
+the override's own parent, because on a first install the directory does not exist yet and sticky
+says nothing about who may create it. So a root directly under `/tmp` is refused either way.
+
+* An override **nested inside another root** — `IMS_CUTOVER_STATE_DIR=/var/lib/one-two-inventory/cutover`
+  — is supported and needs no anchor of its own. The walk simply starts at the data directory and
+  resolves `cutover` like any other component: created with a plain `mkdir`, checked with `lstat`,
+  and **refused if it is a symlink**. So do not point a nested state directory at another disk with
+  a symlink — and since o3d-rn10 r5 do not point the **root** at one either; see the last bullet.
+* An override **outside every other root** whose parent is writable by anyone but root — say
+  `IMS_CUTOVER_STATE_DIR=/home/deploy/state` — is refused. The run fails, loudly, at the first
+  publication, rather than writing root-owned state into a directory somebody else can redirect.
+* A root that **is itself a symlink** — `/var/lib/one-two-inventory -> /srv/disk2/ims`, which is how
+  a second disk used to be wired in — is refused too. `install.sh` refuses it **at pre-flight**,
+  before it creates, enters or writes anything at all; the publisher refuses it at the first
+  publication. Both print the same lines:
+
+  ```text
+  ERROR: /var/lib/one-two-inventory is a symbolic link, and a root this run writes into may not be one: nothing here proves the path its target resolves through.
+  ERROR: WHY: every later run of these scripts rsyncs into this root with --delete and chowns it RECURSIVELY. A root that is an ALIAS for another directory hands both of those to whatever the alias resolves to at that moment, and any account that can rename a directory on the way to the target chooses what that is. Stopping the service does not remove that account.
+  ERROR: To keep /var/lib/one-two-inventory on another disk, replace the link with a real directory and bind-mount the disk onto it — no data has to move, because the bind exposes the same filesystem at the same path.
+  ERROR: This run resolved that link to: /srv/disk2/ims
+  ERROR: THE BIND-MOUNT PROCEDURE IS IN THE DOCUMENTATION, NOT ON THIS SCREEN: docs/installation.md, "Putting a state root on another disk". It is not printed here because it cannot be pasted safely without checks only you can make: the target must hold NOTHING BUT this application's data, every directory from / down to it must be one only root can replace, and the parent of this root may not be. The documentation names all of those, the order to stop the writers in, the identity check to make after the mount, how to put the link back if the mount does not take, and the fstab line that makes the bind survive a reboot.
+  ```
+
+  **The commands themselves are no longer printed** (o3d-secops r8). They used to be: a five-step
+  `rm && mkdir -p && mount --bind` procedure, with an apparatus in front of it deciding whether the
+  procedure was safe to print — an ancestry walk over the target, a device/inode capture, a
+  system-directory exclusion, and containment checks in both directions against every root the run
+  writes into. **That apparatus produced a finding in every review it survived**: a fail-open
+  descriptor acquisition, an ancestry gate that proved an adjacent property, a fail-open identity
+  capture, an identity that was not globally unique, and finally the procedure itself. `rm ROOT &&
+  mkdir -p ROOT && mount --bind TARGET ROOT` is raceable for `LOG_DIR`, whose `/var/log` parent the
+  installer *itself* recognises as group-writable and non-sticky: between the `rm` and the `mount`
+  the `syslog` account can create the name, and the bind lands on their directory entry. Five
+  findings from one operator convenience. The refusal, the reason and the resolved target stayed;
+  the recipe moved here, where a human reads it, checks their own parent directory, and is not
+  handed a paste. The **only** thing the scripts still do about a symlinked root is refuse it.
+
+  **Why they refuse it at all:** the root's own *name* is safe, because its parent is root-owned;
+  the *path its target resolves through* is not walked by anything, so any directory on that path
+  the application account can write is a place to redirect a root-side publication of `.env`. A bind
+  mount is the same indirection with the resolution done **once**, at mount time, out of a mount
+  table only root can write.
+
+#### Putting a state root on another disk
+
+This is the procedure the installer used to print. Read it, decide each point for your own host,
+and then run it **with the writers stopped**. It applies to `APP_DIR`, `DATA_DIR`, `LOG_DIR` and to
+any anchored override — anywhere you would otherwise have reached for a symlink.
+
+**Before anything else — the precondition no program can check for you.** The target directory must
+hold **nothing but this application's data**. After the bind, every later run of `install.sh`,
+`deploy.sh` and `update.sh` treats that directory *as the root*: it `rsync --delete`s into it and
+`chown -R`s it to the service account. Anything else living there is deleted or taken over. "A
+directory that holds nothing but this application's data" is not a question a filesystem can be
+asked, and no denylist converges on it. If you are not certain, move the application's data into a
+directory of its own first and bind **that**.
+
+**Then check the target, by hand, against all five of these.** Each was a gate the installer used
+to apply before it would print anything; they are the operator's now.
+
+1. **The target must resolve to a directory.** If the link is dangling there is nothing to bind, and
+   nothing here will guess what it was meant to point at.
+2. **Every directory from `/` down to the target must be one only root can replace** — owned by root
+   and carrying no group or other write bit. This is the same ancestry question that decides whether
+   a directory may be a publication root at all, and it is the whole reason a bind is safer than a
+   symlink: a bind resolves the path **once**, at mount time, but only if nobody can change what
+   that path means before you type the command. `/srv`, `/var/lib` and `/mnt` normally satisfy it;
+   a directory under `/home` or under anything the application account owns does not. Check it with
+   `namei -l /srv/disk2/ims`.
+3. **The target may not be part of the operating system.** `/`, `/bin`, `/boot`, `/dev`, `/etc`,
+   `/lib*`, `/proc`, `/root`, `/run`, `/sbin`, `/sys`, `/usr` and `/var/www` are not bind sources: a
+   bind source is where data lives. `/opt/one-two-inventory -> /etc/systemd/system` satisfies every
+   other question on this list and would put the host's unit tree where the next run rsyncs,
+   deletes and chowns. `/srv`, `/mnt`, `/media`, `/opt`, `/var` and `/home` stay available.
+4. **The target may not be the root, an ancestor of it, anything under it, or any other root these
+   scripts write into.** Those are `APP_DIR`, `DATA_DIR`, `LOG_DIR`, the cutover state directory,
+   `/etc/ims-cutover`, `/etc/ims-cutover-state`, `/etc/ims-db-ca` and `/etc/ims-cutover-recovery`.
+   `/opt/one-two-inventory -> /opt` passes every other question — `/opt`'s name cannot be rebound by
+   anybody but root — and binding `/opt` onto `/opt/one-two-inventory` hands the next run the whole
+   of `/opt` to `rsync --delete` into and `chown -R`. The same shape gives `/var/lib` for `DATA_DIR`
+   and `/var/log` for `LOG_DIR`. Compare **device and inode**, not spellings: two paths can be the
+   same directory, or nested, without sharing a prefix, because a bind mount already in place gives
+   one directory two names. `stat -c %d:%i` on each, in both directions.
+5. **The root's own parent may be writable by somebody other than root, and `/var/log` is.** On
+   Ubuntu `/var/log` is `drwxrwxr-x root:syslog` and not sticky, so the `syslog` account may create
+   and rename entries in it. The `rm` in step 3 below removes a name in that directory and the
+   `mkdir` on the line after it creates the name again: in that gap, that account can take it, and
+   the `mount --bind` then lands on **their** directory entry. This is exactly why the installer no
+   longer prints these commands. For `LOG_DIR` — or for any root whose parent is group-writable and
+   not sticky (`ls -ld` the parent) — do not run `rm` + `mkdir` blind. Stop the accounts that can
+   write the parent first, or make the parent sticky (`chmod +t`) for the duration, and let step 5
+   tell you whether what you mounted onto is the directory you created.
+
+**Then do it, in this order, and not as a one-liner.** The sequence matters: the refusal appears
+while the service and its cron are still running, and step 3 removes a live pathname.
+
+```bash
+# 1. Stop the writers. Nothing may be writing under the root while its name is being replaced.
+systemctl stop one-two-inventory.service
+crontab -l                       # note and pause anything writing under the root
+
+# 2. Confirm the target is where the data actually is, and record its identity.
+readlink -f /var/lib/one-two-inventory     # -> /srv/disk2/ims
+stat -c %d:%i /srv/disk2/ims               # -> e.g. 2049:262145   (keep this)
+
+# 3. Replace the link with a real directory. See check 5 above before doing this on LOG_DIR.
+rm /var/lib/one-two-inventory
+mkdir /var/lib/one-two-inventory
+
+# 4. Bind the disk onto it. Nothing moves: the bind exposes the same filesystem at the same path,
+#    so the data, the ownership and the free space are the ones that were already there.
+mount --bind /srv/disk2/ims /var/lib/one-two-inventory
+
+# 5. Verify BOTH, and put the link back at once if either is wrong.
+findmnt -no TARGET,SOURCE /var/lib/one-two-inventory   # must name the root
+stat -c %d:%i /var/lib/one-two-inventory               # must print the identity from step 2
+
+# If the mount did not take, or either check differs:
+umount /var/lib/one-two-inventory 2>/dev/null
+rmdir /var/lib/one-two-inventory && ln -s /srv/disk2/ims /var/lib/one-two-inventory
+
+# 6. Make it survive a reboot, then start the service again.
+printf '%s\n' '/srv/disk2/ims /var/lib/one-two-inventory none bind 0 0' >> /etc/fstab
+systemctl start one-two-inventory.service
+```
+
+**Step 5 is not optional.** Without it, a wrong or unavailable target leaves an **empty real
+directory** at the live path with the data detached behind it, and the application either fails or
+quietly populates a shadow tree — with nothing on screen to say how to get back.
+
+**`/etc/fstab` has its own escaping, and it is not the shell's.** Fields are split on whitespace,
+and a space, a tab or a backslash is written as an octal escape — `\040`, `\011`, `\134`. A
+newline or a `#` has no escape in that format at all: a path containing either cannot be written
+into `/etc/fstab`, and needs a systemd `.mount` unit instead.
+
+### `install.sh` proves its three roots before it touches them
+
+`APP_DIR` (`/opt/one-two-inventory`), `DATA_DIR` (`/var/lib/one-two-inventory`) and `LOG_DIR`
+(`/var/log/one-two-inventory`) are checked in **section 1**, immediately after the "must be run as
+root" check and before any other statement in the run. Each is resolved by a walk that starts at
+`/` and takes one component at a time: every component is `lstat`ed, so a **symlinked ancestor** is
+refused rather than followed, and after each step the directory the walk landed in is checked
+against both the inode the entry named and its own `..`. The root's own entry is then read by a
+single `lstat` inside that pinned parent — never as a pathname — and **a symlink at it ends the
+run**.
+
+This is an **ordering** rule, and the order is the point. Before it, `install.sh` created and
+entered those same roots with a bare `mkdir -p` plus `cd -P`, so on a host where one of them was a
+link, `useradd --create-home`, the upload migration, the crontab-lock preparation, the cron backup,
+`rsync`, `git clone` and every `chown -R` acted **through** the link, and the refusal above arrived
+afterwards. The gate now precedes all of them.
+
+`LOG_DIR` is in the list even though nothing is published under it, because the ownership change
+that follows **dereferences its operand**: a link at `/var/log/one-two-inventory` would hand the
+whole of whatever it points at to the service account, recursively.
+
+**The gate is a snapshot, and for `LOG_DIR` a snapshot is not enough.** It proves what is at the
+name when it runs and then releases the directory it walked to. For `APP_DIR` and `DATA_DIR` that
+settles it: `/opt` and `/var/lib` are root-owned and `0755`, so from that moment only root can put
+anything else at those names. `/var/log` on Ubuntu is `drwxrwxr-x root:syslog` and **not sticky**,
+so the `syslog` account may *rename* any entry in it — root-owned ones included — with **no symlink
+involved at all**. Between pre-flight and section 8 it could move the real log root aside and
+rename another `/var/log` subtree into its name.
+
+So section 8 does not act on the name, and it is held to **what pre-flight approved**. The gate
+records the root's `dev:ino` (or the word `absent`, when the name was free). `enter_service_root()`
+then walks from `/` again, creates the root with a plain `mkdir` — which fails on a planted link
+rather than working inside it — or accepts an existing one, steps **into** it, checks its inode and
+its `..`, and finally requires the directory it is standing in to be **the very entry the gate
+approved**. A root the gate found absent must be one this run's own `mkdir` created; a root that
+appeared in between belongs to whoever made it and is refused. The process is left inside, and the
+ownership change is made of `.`, so a rename of the name afterwards cannot move a descriptor.
+
+Identity, not ownership: the recursive chowns hand `DATA_DIR` and `LOG_DIR` **themselves** to the
+service account, so from the second run onward the roots are not root-owned and a "must be owned by
+root" rule would refuse every upgrade — while still accepting a *different* root-owned subtree
+renamed into the name. Continuity from the gate answers both.
+
+The gate also **opens a descriptor** on an approved root and holds it for the run, and section 8
+enters through `/proc/self/fd/N` — which the kernel resolves to the open file rather than to a
+pathname. A `dev:ino` alone would not be enough: inode numbers are reused, so an account that can
+write the parent could remove an empty approved root, create its own at the name, and win if the
+filesystem handed back the inode it had just freed. Acquiring that descriptor is **mandatory**: a failed
+walk, a failed open or a verification that does not match ends the run, and a missing descriptor at
+section 8 is a refusal rather than permission to enter by name. Fail-open here would be worse than
+not trying: an account that can write `/var/log` could rename the entry aside for the instant of the
+open and switch the weaker mode on at will.
+
+**`/proc` must be mounted, and a host without it is refused** (o3d-secops r8). This used to be the
+one remaining way of not getting a descriptor: a missing `/proc/self/fd` was a `warn` and the run
+carried on on the `dev:ino` comparison, with a by-name entry branch in `enter_service_root()` to
+fall into. That was a fail-open in the middle of the hardening that exists to remove exactly it —
+and the code's own comment explains why identifying a root by name is unsafe. There is no way to
+name an open directory without `/proc`, so there is no weaker mode worth keeping: the gate now
+`die`s, at pre-flight, before anything has been created, migrated or started, and the by-name branch
+is gone with it. A hardened container without `/proc` is not a supported install for these scripts;
+mount it and run again.
+
+The ownership change itself is never `find … -exec chown`. For `LOG_DIR` it is `chown -Rh … .`
+inside the entered root — coreutils walks with `fchownat(AT_SYMLINK_NOFOLLOW)` relative to
+descriptors it holds. For `DATA_DIR`, which has two things to withhold and so cannot use `chown -R`
+at all, it is `scripts/lib/chown-tree.mjs`, which descends by descriptor and does the same thing
+(o3d-n8xx; see the publication bullet above for how it prunes — `locks/` by identity, staging
+directories by shape rather than by name). `find -exec` enumerates pathnames
+that are resolved again afterwards, and `-h` protects only the final component, so a descendant
+directory swapped for a symlink in between would redirect the change — and on an upgrade the account
+that can do that owns the tree and is still running, because section 8 precedes the `systemctl stop`
+in section 10c.
+
+Every `stat -c %F` in these scripts runs under `LC_ALL=C`, because coreutils **translates** those
+file-type descriptions and every walk compares them against the English words.
+
+**What this still does not cover**, stated rather than glossed: `logrotate` resolves
+`/var/log/one-two-inventory/*.log` by pathname, as root, on its own schedule, and on a
+group-writable `/var/log` that name is rebindable by the same account. That is a property of putting
+logs in `/var/log` on Ubuntu and is shared with every package that ships a logrotate fragment; an
+installer cannot pin it from here. `chmod +t /var/log` closes it host-wide — sticky means only an
+entry's owner may rename or remove it — and is the recommended hardening if that account is in your
+threat model.
+
+**Upgrading an installation whose root IS a symlink.** The run stops at pre-flight, prints the
+refusal above naming that root, and adds:
+
+```text
+ERROR: /var/lib/one-two-inventory — the state directory — is a symbolic link, so this run stops here rather than creating, entering, migrating into, rsyncing into or chowning whatever it resolves to. […] NOTHING has been created, nothing has been migrated and nothing has been started — this is the FIRST statement in the run that looks at /var/lib/one-two-inventory, so an existing installation is exactly as it was.
+```
+
+Nothing has changed on the host at that point — no user, no directory, no crontab, no migration —
+so the installation you had is the installation you still have. Replace the link with a bind mount
+by following “Putting a state root on another disk” above, then re-run `install.sh`. Your data does
+not move: the bind exposes the same filesystem at the same path.
+
+The **anchor** rule in the previous section (every directory from `/` down to the root owned by
+root and carrying no group or other write bit) is *additional*, and applies only to the roots that
+are **publication** roots — `APP_DIR`, `DATA_DIR` and the cutover/snapshot/CA directories. It is not
+applied to `LOG_DIR`, and deliberately so: on Ubuntu `/var/log` is `drwxrwxr-x root:syslog`, which
+the anchor refuses, and nothing is published under `/var/log`. The **symlink** rule is one rule for
+all three, stated in one wording by one function.
+
+Setting any of them in `APP_DIR/.env` does nothing: the application user owns that file, and since o3d-2sm1.5 r25 none of
 the three entrypoints puts it into a shell's environment at all — each reads the handful of keys it
 needs out of it by name, so an `IMS_*` line in it never becomes a variable anywhere. Until o3d-2sm1.5 `deploy.sh` kept its own set under
 `/var/lib/ims-deploy` while the other two used the paths above, so following the banner after a
@@ -1927,6 +2401,20 @@ same instant as the body of the script, so it adds no window the entrypoint does
 unlike the helper, which is executed several phases later, after the application account has had a
 cutover's worth of time to replace it.
 
+**The library's own paths are `readonly`, and it may be sourced only once.** Every constant the
+privileged mechanism acts on without re-deriving — the recovery root, the identity record, the
+protected application tree, the fence helper inside it, the staging and retired trees, the artefact
+digest record and its manifest, the two operator wrappers, the two expected digests, and the
+vendoring policy — is declared `readonly` at its one declaration in
+`scripts/lib/db-fence-protected.sh`. A scanner can only see `NAME=` words, and `printf -v`, `read`,
+a nameref and `(( ))` each change a variable without writing one; `readonly` makes bash refuse all
+of them, including forms nobody has listed. Two consequences for anyone editing these scripts:
+**source the library exactly once per entrypoint** — a second `source` in the same shell fails on
+the first `readonly` and `set -e` aborts the run — and **do not reassign these names anywhere**;
+move the value by editing the declaration itself. A path added to that file later is refused by the
+census in `tests/scripts/install-root-safe-writes.test.ts` until it is either declared `readonly`
+and listed as protected or recorded as deliberately mutable with a reason.
+
 `--dry-run` is the one invocation that cannot use the publishing path, because a dry run writes
 nothing and least of all under `/etc`. It may not run the checkout's file in place either
 (`--preflight` opens the admin connection with `DEPLOY_ADMIN_DATABASE_URL`, so "it only reads" is a
@@ -1975,6 +2463,7 @@ exactly, and it is **copied**, root-owned, into the mirror:
 | `/etc/ims-cutover-recovery/db-fence-artefact.manifest` | per-file digests, so a mismatch can name the file |
 | `/etc/ims-cutover-recovery/release-db-fence` | the root-owned recovery wrapper (below) |
 | `/etc/ims-cutover-recovery/refence-db` | the same, for raising the fence again |
+| `/etc/ims-cutover-recovery/resolve-legacy-db-fence` | the one-time operator resolution for an authority that carries no applied stamp (o3d-secops r26). No banner prints it and no cutover runs it — the validator's refusal is the only thing that names it |
 
 Three refusals make that a boundary rather than a copy:
 
@@ -2101,7 +2590,7 @@ under it, before copying:
   Either answer coming back wrong is a refusal with nothing published.
 
 
-#### The two commands an operator is ever given
+#### The two commands an operator is ever given (and the third nobody is)
 
 r31 fixed which bytes the scripts execute and left every printed instruction describing the world
 before it. Two separate defects of one kind:
@@ -2114,18 +2603,263 @@ before it. Two separate defects of one kind:
 * the re-fence banner — printed at the single highest-pressure moment in the script, schema moved
   and fence down — still said `node ${DB_FENCE_SCRIPT} --fence`, the **application-owned** path.
 
-So nothing prints a command line any more. Root writes two wrappers at fence time:
+So nothing prints a command line any more. Root writes two wrappers at fence time, and both of
+them are printed:
 
 ```bash
 sudo /etc/ims-cutover-recovery/release-db-fence      # release the standing fence
 sudo /etc/ims-cutover-recovery/refence-db            # raise it again
 ```
 
+A third is written beside them and is **not** one of these: `resolve-legacy-db-fence` is run by an
+operator, once, only when an automatic path has refused an authority carrying no applied stamp, and
+by no banner and no cutover — see *An unstamped record is ambiguous* below.
+
 Each one is root-owned and `0700`, **never sources anything from the checkout**, carries this run's
 state file and four identity values baked in, re-verifies the artefact digest before `exec`, takes
 `DEPLOY_ADMIN_DATABASE_URL` from its own environment or from `APP_DIR/.env` with the same one-key
 reader the entrypoints use, and runs the helper **as the application user**. There is nothing to
-fill in.
+fill in. Since **o3d-secops r23** they must be run **as root** and no longer accept being run by
+the application account: they publish and remove the connection-fence authority, which lives in a
+root-owned directory — see below.
+
+#### Who decides what a release grants (o3d-secops r23)
+
+`/etc/ims-cutover-state/db-fence/db-connect-fence.json` names the roles a `--release` hands
+`GRANT CONNECT` back to. It used to be **published by the helper**, which runs as the service
+account, into a directory owned by that account for exactly that reason — so the account being
+defended against could pre-create or replace the file that decides who gets database access, at any
+time, and the reader authenticated its **shape**. A well-formed JSON object proves the file is
+well-formed JSON; it says nothing about who wrote it. That is the same defect as the legacy fence
+marker one round earlier, with another file in it.
+
+Raising a fence is now **three steps**, and the privileged one is in the middle:
+
+| step | who | what |
+| --- | --- | --- |
+| `--plan` | service account | opens the admin connection, reads the ACL, computes the grantee list, **prints** it as one line of JSON. Revokes nothing and writes nothing. |
+| authorise | **root** | validates that request field by field against the database and role **root itself supplied**, rebuilds the record from its own template (anything the request carried that is not in the template is dropped), and publishes it durably — temporary in the destination directory, `fsync`, atomic rename, directory `fsync`. |
+| `--fence` | service account | **executes** the authority. It cannot write it; an absent or unauthenticated record is a refusal, not a fresh fence. |
+
+#### Two kinds of fence, with two different rules (o3d-secops r24)
+
+`--fence` used to compare the published authority with the live ACL **in one direction only**: had a
+grantee *appeared* since the plan? A role that **loses** `CONNECT` between `--plan` and `--fence` —
+an administrator revoking it by hand, a role dropped, any other ACL edit — leaves that comparison
+empty, so the stale list was accepted whole, its `REVOKE` was a no-op nobody noticed, and
+`--release` afterwards issued `GRANT CONNECT` to **every** role the record named, handing database
+access back to one somebody had deliberately removed. Checking for additions is not checking for
+equality.
+
+Both differences are compared now, and which of them is fatal depends on a `fence_mode` field
+**root** stamps into the record:
+
+| `fence_mode` | when root stamps it | what `--fence` accepts |
+| --- | --- | --- |
+| `initial` | nothing was at `db-connect-fence.json` when root looked | the live grantee list must match the record **exactly**. Any difference either way aborts, and a re-run re-plans and re-publishes. |
+| `recovery` | an authority was already there — a previous cutover revoked and did not release, so its fence is still standing | recorded grantees that no longer hold `CONNECT` are **expected** (that fence is what took it from them). A grantee that has *appeared* is still fatal. |
+
+The stamp is the difference between the two rules, so it is the field worth forging — and it is
+computed by root, in the process that does the rename, in a directory the service account cannot
+write. That account can neither create a record to obtain the tolerance nor unlink one to escape it,
+and a `fence_mode` carried **in** the plan is dropped by the template like every other field root
+does not compute for itself. A record with **no** `fence_mode` is read as **`initial`**, the strict
+rule — see *An unstamped record is ambiguous* below, which reversed r24's reading of that case.
+
+##### Do not infer a standing fence solely from record presence (o3d-secops r25)
+
+Until r25 root stamped `recovery` whenever **anything** was at `db-connect-fence.json`, and presence
+conflates two different states: *root published an authority* and *the fence was actually applied*.
+Only the second is a standing fence, and only the second may buy the recovery tolerance. Several
+things produce the first without the second, and all of them leave the same file at the same name:
+
+* the publication itself failing **after** the rename — the directory `fsync` is the validator's
+  last barrier, and when it fails it says so and deliberately leaves the record visible;
+* `--fence` failing with a status the orchestration does not enumerate, or the cutover being killed,
+  between the rename and `BEGIN`;
+* `SIGKILL` or power loss at the same point, where no cleanup runs because no process is left.
+
+So the record carries **`fence_applied`**, written `0` by the validator and raised to `1` **by
+root**, after `--fence` reports the revokes are (or may be) on the medium. `fence_mode` is computed
+from that stamp and not from the pathname, which makes a record left behind by *any* publication
+failure inert by construction: it can only ever produce another `initial` fence, held to the strict
+rule.
+
+| what is at the path | how it is read | why |
+| --- | --- | --- |
+| nothing | `initial` | no fence, no record |
+| `fence_applied: 1` | `recovery` | root saw `--fence` succeed, so a fence stands |
+| `fence_applied: 0` | `initial` | published, never applied — what a failed publication or a pre-`BEGIN` refusal leaves |
+| **no `fence_applied` key at all** | **REFUSED** | ambiguous — see *An unstamped record is ambiguous* below |
+| not a regular file, or not usable JSON | `initial` | nothing there can show a fence was applied |
+
+The two stamped rows hold for the same reason `fence_mode` itself does — the directory is
+`root:root` and unwritable by anything else, so the service account can neither raise the key to buy
+the lax rule nor strip it.
+
+**Where this fails, said plainly.** If a run dies between a successful `REVOKE` and root raising the
+stamp, the record says `0` while a fence *is* standing. The next cutover reads `initial`, the strict
+rule sees the recorded grantees missing from the ACL, and it **refuses**. That is the deliberate
+direction: a refusal that names the record is recoverable with the release wrapper, which reads the
+record and grants back regardless of the stamp, while the other direction would hand drift tolerance
+to a fence nobody can show exists. The run announces it at the moment it happens.
+
+Root stamps the record for exit `0` and exit `5` (`EXIT_FENCE_STANDING`, where the `COMMIT` was
+issued and its acknowledgement may have been lost — the only safe reading of unknown is that
+`CONNECT` may be revoked) and for **no other status**. Exit `1` in particular is the helper's
+catch-all: it covers a connection that never opened as well as a teardown that threw after a
+successful fence, and a status that cannot tell those apart may not declare a fence applied.
+
+##### An unstamped record is ambiguous, and only the ACL can settle it (o3d-secops r26)
+
+r25 read a record carrying **no `fence_applied` key** as a fence raised before the stamp existed,
+and therefore standing. The premise is right — that key is absent only in records an older validator
+wrote — and the conclusion does not follow from it. **That older validator published its record
+before invoking `--fence`**, so its own `SIGKILL`/power-loss window between the rename and `BEGIN`
+leaves exactly this record with no fence behind it. An absent stamp dates the *writer*; it says
+nothing about which phase the writer reached, and reading it as standing hands the lax rule to a
+fence nobody can show exists.
+
+So **every automatic path refuses it**:
+
+* the **validator** refuses to publish over it. Nothing is published, nothing is revoked, and the
+  refusal names the record, says why the two cases cannot be told apart from the filesystem, and
+  names the wrapper below;
+* the **executor** resolves an unrecognised `fence_mode` to `initial` as well, as defence in depth.
+
+**Nothing on the filesystem can settle it — the ACL settles half of it.** The fence's whole effect
+is that the recorded grantees lose `CONNECT`, so a grantee that **still holds** it proves no revoke
+took it away, and that half is conclusive whoever was at the keyboard. The other half is not: the
+ACL is a statement of the grants **as they are** and carries no history, so the absence of a grant
+is evidence of a revoke and never evidence of *whose*. The question is asked by a read-only mode,
+`--audit-authority` (no `BEGIN`, no `GRANT`, no `REVOKE`, no write), and acted on by a third
+root-owned wrapper an operator runs **once**, deliberately, and no cutover ever runs:
+
+```
+sudo /etc/ims-cutover-recovery/resolve-legacy-db-fence
+```
+
+| what the ACL says about the recorded grantees | what it means | what the wrapper does |
+| --- | --- | --- |
+| every one of them still holds `CONNECT` | the `REVOKE` names exactly those roles, so it cannot have run | **clears** the record, automatically; the next cutover plans an `initial` fence as on any other host |
+| not one of them holds `CONNECT` | **two histories, and the ACL cannot tell them apart**: this fence revoked them, or an administrator revoked the same roles independently | **reports** it — the recorded grantees, that none holds `CONNECT`, and both histories — and **changes nothing** until the operator confirms (below) |
+| some do and some do not, or the record names nobody | a half-applied fence and an administrator's own revoke read identically | **refuses**, changes nothing, and prints both lists |
+
+##### Why the clear is automatic and the stamp is not (o3d-secops r27)
+
+**The two outcomes are not symmetric, so they do not share an evidential bar.** Clearing a record
+nothing stands behind restores nobody's privilege — it is inert whichever history produced the
+reading. **Stamping is what later restores privilege:** a stamped record is one the release wrapper,
+and a `recovery` re-fence, will `GRANT CONNECT` back from, *to every role it names*. If those roles
+lost `CONNECT` because an administrator deliberately took it from them, stamping is the first step
+of handing it back — on evidence that cannot rule that history out.
+
+So the stamp requires the operator to say, in as many words, that the fence is theirs:
+
+```
+sudo /etc/ims-cutover-recovery/resolve-legacy-db-fence --this-fence-revoked-them
+```
+
+Run **without** it, the resolution still does its whole read — the record is inspected, the ACL is
+audited, the grantee list and both possible histories are printed — and then changes nothing. That
+is the two-step on purpose: the first run is what shows you the roles you are about to authorise a
+later `GRANT` for. **The argument authorises nothing by itself.** It is read after the audit, never
+before, and it is consulted on one reading only; a mixed ACL, an audit that could not bind its
+identity, and a record that is not the ambiguous one are refused with it exactly as without it.
+
+If any of those roles was revoked deliberately and must stay revoked, **do not stamp**. Either leave
+the record alone — every automatic path goes on refusing it, which is the safe state — or take the
+fence down with the release wrapper, which restores from the record without needing the stamp and
+will grant those roles back too, so re-revoke them by hand afterwards.
+
+**Is there better evidence anywhere?** No, and it was looked for rather than assumed. Postgres event
+triggers do not fire for DDL targeting **shared objects**, which is what a database is, so
+`REVOKE ... ON DATABASE` cannot be captured by one. `track_commit_timestamp` is `off` by default and
+"can only be set at server start", so it is never retroactive for a record already on disk — and at
+best it would date the last change to the `pg_database` row, not attribute it. `pgaudit` or
+`log_statement = 'ddl'` would record the statement and its session role, but they are opt-in, equally
+non-retroactive, and write to the server's own log, which the audit — deliberately unprivileged —
+cannot read. For fences raised **from this round onward** the question does not arise: `fence_applied`
+is written by root the moment the fence goes up, and this whole procedure exists only for records
+that predate it.
+
+##### The audit binds the cluster, not just the database name (o3d-secops r27)
+
+`--audit-authority` is held to the same identity gate as `--preflight`, `--fence` and `--release`:
+`DEPLOY_ADMIN_DATABASE_URL` must name the same host, port and database as `--app-host/--app-port/
+--app-database`, the connection must have landed on that database, and the role it logged in as
+(`session_user`) must be the role the URL names and the role it is running as (`current_user`).
+
+It bound only the **database name** when it shipped, and a name is not a cluster. An admin URL
+pointing at a different server whose database happens to be called the same thing reaches an
+**unfenced** host: every recorded grantee holds `CONNECT` there, the verdict is `absent`, and the
+wrapper deletes the sole authority for a fence still standing on the real cluster — after which
+nothing can release it automatically. A refusal here prints **no verdict line at all**, so neither of
+the wrapper's two channels can be acted on and the record is left byte for byte as it was found.
+
+One thing the gate cannot do here, said plainly: `--release` additionally opens the application's own
+`DATABASE_URL` and compares `pg_postmaster_start_time()` across both connections, which catches a URL
+that *names* the right host and *resolves* elsewhere. That cross-check is unavailable to the audit and
+cannot be made available — the audit is asked precisely when a fence may be standing, and a standing
+fence is exactly what closes the application's connection, so its failure would report "no answer" for
+the very reason the answer is "a fence is standing".
+
+**Partial results fail toward refusing, at every step.** An audit that cannot connect, cannot read
+the record, is pointed at another database, exits with a status the wrapper does not enumerate, or
+prints a verdict line that does not agree with that status leaves the record exactly as it was
+found — which keeps every automatic path refusing, the state this procedure exists to leave when it
+cannot do better. The wrapper also refuses any record that is *not* the ambiguous one: one already
+stamped applied, one carrying `fence_applied: 0` (which is this round's own "published, never
+applied" and is already handled by the strict rule), a truncated one, and one nobody published.
+
+**The release wrapper works throughout, stamp or no stamp.** It restores from the record's own
+grantee list and consults neither `fence_applied` nor `fence_mode`, so an operator holding a record
+no automatic path will touch can still take a standing fence down — that is what makes refusing the
+safe direction rather than a dead end.
+
+What `recovery` accepts that `initial` does not, said plainly: on a re-fence a grantee an
+administrator removed by hand is indistinguishable from one the standing fence removed — both are
+simply absent from the ACL — so that role is re-granted on release. That residue is bounded to hosts
+with an **interrupted cutover**, it is announced on stderr when it happens, and the alternative is a
+standing fence that can be neither re-applied nor released. On an `initial` fence — every ordinary
+deploy, update and install — there is no residue.
+
+**And this run's own authority is cleaned up on every pre-`REVOKE` failure**, as defence in depth on
+top of the stamp. Exit `3` (`EXIT_NOT_FENCEABLE`) is returned only *before* `BEGIN`, so nothing was
+revoked and the record is this run's own: it is removed. A **failed publication** is removed for the
+same reason and was the route r24 missed — its cleanup hung off the execution's exit code, and a
+publication that fails after the rename never reaches an execution at all. Whether the record **is**
+this run's own is read *before* the publication: where a fence was already standing, that record is
+the only account of what an earlier run revoked and it is left exactly where it is. If a removal
+cannot be completed the run says so and names the file; the leftover is inert either way, because it
+carries no applied stamp.
+
+`--release` reads that record through the same provenance gate — the **directory** first, because
+`unlink(2)` and `rename(2)` ask for write permission on the parent and nothing about the file — and
+**root** removes it afterwards, once the release is verified and never before. The validator is an
+inline program held in one constant in `scripts/lib/db-fence-protected.sh`; the operator wrappers
+bake in that same text at publication, so there is one program and two callers. It runs as root, so
+it may not be a file out of the checkout, and `node -e` resolves no module and reads no path.
+
+**What is left on the application side: nothing.** There is no request file and no app-writable
+directory in the cutover namespace any more — the plan travels on a pipe. The record stays
+world-**readable** because the executor is unprivileged and must obey it; readable is not writable,
+and it holds role names, not secrets.
+
+**Upgrading a host to r23.** `/etc/ims-cutover-state/db-fence` was owned by the service account at
+`0700`; the namespace walk re-owns it to root at `0755` on the next cutover. A record the *previous*
+checkout's helper left inside it is that account's, so the provenance gate refuses it — loudly, with
+nothing revoked or granted. That is the safe direction and it is not a dead end: the file is still
+there and still readable by root. If a fence really was standing, read it, run the `GRANT CONNECT`
+statements for every role in its `revoked` list by hand as a superuser, remove it, and re-run.
+
+**What this does not close, said plainly.** The helper runs with `DEPLOY_ADMIN_DATABASE_URL` in its
+environment for the length of a cutover, so during that window the application account can issue any
+SQL the admin can — this record included. What the split closes is the **persistent** half, which is
+the half that matters: a file planted at any time, by an account holding no credential at all, that
+makes some later privileged release grant `CONNECT` to roles of its choosing. Closing the window
+itself means not handing that account the credential, which is a larger change to how the fence is
+executed than this round makes.
 
 **r33: the banners print the `sudo`, and that is not decoration.** r32 asked of every printed line
 "would it run if pasted?" and answered yes for these — correctly for root, and wrongly for the
@@ -2583,6 +3317,129 @@ file as one.
 
 Never run two versions of IMS against the same database at once — no rolling restart, no
 blue/green overlap, no second instance left running on another port.
+
+### The connection witness, and what binds the migration to the fenced server
+
+A fence, a migration and a release are **four or more separate connections**, opened minutes apart
+from the same connection string. A DNS change, a proxy, a failover or a pooler can re-point that
+string between any two of them, and every check the fence makes — host, port, database name, role,
+the cluster fingerprint, even the fenced ACL itself on a physical copy — is satisfied on both
+servers at once. So since o3d-secops r31 the cutover holds a **connection witness**: a session
+opened before the first `REVOKE`, on *another database of the same cluster* (`postgres`, else
+`template1`, so the drain cannot reach it), holding a session-scoped advisory lock on a nonce
+generated seconds earlier. An advisory lock lives in one instance's shared memory: no snapshot,
+base backup or restored image carries it, and no other server can answer for it.
+
+Three questions are asked of it, each **on the asking process's own connection**:
+
+| when | what is asked | what a "no" costs |
+| --- | --- | --- |
+| `--fence` | can this backend, one statement from issuing the `REVOKE`s, see the lock? | nothing. The fence goes up; the run loses only the **automatic removal** of its own fence record. |
+| `--bind-migration`, before any DDL | can a connection opened with the **migration's own URL** see it, and did that URL's stamp survive? | the cutover **refuses**. Nothing has been migrated and the schema is untouched. |
+| `--bind-migration`, after **each** consumer (a *pin*) | can a connection opened with that step's own URL still see it? | the cutover **refuses**, naming the step. The schema may have moved, so the fence is held and nothing starts. |
+| `--bind-migration --hold-stamp`, after the last consumer | the same, plus: can the witness's sampler **see** this connection? | the cutover **refuses** before the new build starts. The fence is held and its record kept. |
+| `--release` | can the backend that just granted see a lock taken *at release time*? | the fence is still released; the **record is kept** for a person to end with the release wrapper. |
+
+**How the migration's own connections are stamped.** `--print-migration-url` composes
+`application_name=ims-migration-<nonce>` into the migration URL beside the existing
+`options=-c role=<app role>`, so every consumer of `MIGRATION_DATABASE_URL` carries it — `prisma
+migrate deploy`, `scripts/check-prisma-drift.mjs`, `pg_dump`, `scripts/check-app-db-object-access.mjs`
+and `scripts/run-migration-verifications.mjs`, plus `npm run db:seed` and
+`scripts/provision-instance.mjs` on `install.sh`. It is a **connection parameter and not a third `-c`**:
+measured on PostgreSQL 17.11, libpq applies the GUCs in `options` *before* the startup packet's
+`application_name` (or the client's own `fallback_application_name`), so `options=-c
+application_name=…` is silently overridden and would have shipped a binding that never binds.
+PostgreSQL truncates `application_name` at 63 bytes; the composer **refuses** to emit a stamp that
+would be truncated, because a truncated stamp reads as *absent* and absent reads as a redirect.
+
+**Every consumer is placed, not just the window (o3d-secops r33).** Each of the steps above is
+followed by a **pin** — a `--bind-migration` opened on that step's own connection string,
+immediately after it — so the window reads
+
+```
+opening bind -> consumer -> pin -> consumer -> pin -> … -> consumer -> closing gate
+```
+
+and every consumer runs *between two connections that were proved to reach the fenced instance*.
+Before r33 the closing gate was the only question asked after the migration, and it asked whether
+the sampler had seen **any** backend wearing the shared stamp — so one correctly routed connection
+certified all the others, and `pg_dump` could take `update.sh`'s restore point from a different
+cluster with every gate green. A per-consumer *sighting* cannot replace the pin: polling is
+measured not to promise the observation of a 40 ms connection, so requiring one sighting per
+consumer would refuse ordinary cutovers. The pins cost one short-lived connection per step and are
+a no-op on any run with no fence standing.
+
+**A step's pin runs whether the step succeeded or not, and a placement refusal outranks its exit
+status (o3d-secops r34).** As r33 shipped it, every consumer left the script on a non-zero exit
+*before* its pin — `set -e` for the bare steps, an explicit `|| die` for the rest — so the chain
+was complete only for steps that succeeded, and the step whose placement is worth having is the
+other one: a stable redirect sends `prisma migrate deploy` to another cluster, it applies three
+statements and fails on the fourth, and nothing asks where that DDL landed. Every consumer now
+captures its own exit status, runs its placement, and propagates the failure afterwards. If the
+step both failed **and** cannot be placed, what an operator is told is the **placement** —
+`… DID NOT RUN AGAINST THE SERVER THIS RUN FENCED … WHATEVER IT WROTE OR READ MAY BE ON ANOTHER
+SERVER` — because "prisma exited 7" would send them to the wrong server.
+
+The residual, stated plainly: a redirect that begins **and** reverts inside a single consumer's own
+execution is still caught only by the sampler, so only probabilistically. Closing that completely
+needs the server to record every login — a login event trigger, a superuser DDL change to the
+customer's database, and a lockout risk if it ever fails.
+
+**What the witness's sampler is, and is not.** While the window is open the witness polls
+`pg_stat_activity` (cluster-wide, so it sees the fenced database from outside it) for that exact
+stamp and accumulates the distinct backends it saw. That is *evidence about the migration's own
+connections* — but it is **not** what the refusal rests on, and deliberately: measured, a warm
+`prisma migrate status` connects, reads and disconnects inside about 40 ms, and polling cannot
+promise to observe a connection somebody else opens and closes. A gate that refused on a missed
+sample would refuse ordinary cutovers. So the refusal rests on the `--hold-stamp` probe and on the
+pins, whose lifetimes the cutover controls; the sampler's count is reported, and when it is zero
+the run says so and **keeps the fence record** for a person, without failing. A pin is deliberately
+*not countable* — it renames its own backend to `ims-deploy-fence-bind` the instant it connects —
+because otherwise the sixteen probes a run now opens would satisfy that evidence by observing
+themselves.
+
+**"The record is kept" never means "the run failed" (o3d-secops r33).** Both degraded readings —
+the sampler saw nothing, and there was no witness to ask — cost the **automatic removal of the
+fence record and nothing else**. The run finishes, the fence is released, the application starts,
+and the record is left for a person with the release wrapper; the next run adopts it. Until r33
+neither of them did that: the sampler-miss path lowered the same flag that means *there is no
+witness*, so the release issued no challenge and returned failure two steps later, and the
+no-witness path — every host behind a transaction-mode pooler — hit the same wall on all three
+entrypoints. The one reading that is still fatal is the one the witness exists for: a challenge
+**was** put to a live witness and the release's own connection could **not** see it, which is a
+release that may have landed on a copy while the real server is still fenced.
+
+That fatal reading is evaluated **before** the kept record is acted on (o3d-secops r34). r33 placed
+the "keep the record" shortcut between the line that reads the release's verdict and the line that
+acts on it, so a run that had been told `RELEASE_WITNESS <nonce> absent` reported success whenever
+the sampler had also missed — and a sampling miss is precisely the run whose routing is in
+question. The two degraded readings still cost nothing but the automatic removal; a challenge that
+was issued and not answered `colocated` still refuses, kept record or not, and the application is
+not started.
+
+**What an operator sees when the nonce cannot be seen.** A redirect and a lost witness are not
+distinguishable, and the message says so. Before any DDL the run stops with `THE MIGRATION WOULD
+NOT HAVE LANDED ON THE SERVER THIS RUN FENCED … NOTHING HAS BEEN MIGRATED`. After the migration it
+stops with `THE MIGRATION WINDOW DID NOT CLOSE ON THE SERVER THIS RUN FENCED … THE SCHEMA MAY HAVE
+MOVED`, the new build is not started, the fence stays up and its record is kept: find out which
+server `/etc/ims-cutover-state/db-fence/db-connect-fence.json` names and which one the migration
+reached before releasing anything.
+
+**A host that can hold no witness is not refused.** A transaction-mode pooler that gives out no
+stable backend, a cluster with neither `postgres` nor `template1`, an idle-session timeout: all of
+these read as *no witness*, the fence still goes up, the migration still runs, and the only cost is
+that the fence record is kept at the end of the run for you to end. Refusing every such deploy
+would trade one finding for an outage.
+
+**The verdicts are machine lines, and they are read as machine lines.** Everything an operator
+reads from `scripts/fence-db-connections.mjs` is on **stderr**; stdout carries only the structured
+lines root parses, and the script replaces `console.log` at start-up so a newly added line cannot
+reach that channel. Each verdict is a whole line carrying the run's own nonce
+(`RELEASE_WITNESS <nonce> colocated`), the shell matches the whole line rather than a substring, a
+stream that answers the same nonce twice is refused, and a verdict is consulted **only where the
+challenge was actually issued** — so the absence of the exchange can never read as success. Before
+r32 the verdict was a substring of a stream that also carried `Connection fence released: CONNECT
+restored to <roles> on <database>.`, and a database or role name containing the token forged it.
 
 ### Post-migration verification: `verify.sql`
 

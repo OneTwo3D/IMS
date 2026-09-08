@@ -34,21 +34,21 @@
  * file's author can write "authentication failed" twice.
  */
 import assert from 'node:assert/strict'
-import { mkdtempSync, readFileSync, rmSync, statSync } from 'node:fs'
-import { tmpdir } from 'node:os'
+import { readFileSync, rmSync, statSync } from 'node:fs'
 import { join } from 'node:path'
 import test from 'node:test'
 
 import {
-  INSTALL_SOURCE,
-  type HeldSession,
-  REINSTALL_BODY,
   connectAs,
   envDatabaseUrl,
   holdSession,
+  INSTALL_SOURCE,
+  installRoot,
   readVar,
+  REINSTALL_BODY,
   runShipped,
   seedLiveInstallation,
+  type HeldSession,
   writeInstalledEnv,
 } from './install-shell-rig.ts'
 import { type Cluster, currentUser, freePort, shippedFunction, startCluster } from './real-postgres-cluster.ts'
@@ -83,7 +83,7 @@ test('r38: an ordinary re-install preserves the installed credential across the 
   //      connection with the live password is refused and this test fails on it; tests 2, 4 and
   //      6 fail as well, along with the adopted-fence test in
   //      install-database-endpoint-binding.test.ts. Tests 3 and 5 stay green.
-  const root = mkdtempSync(join(tmpdir(), 'ims-cred-'))
+  const root = installRoot('ims-cred-')
   let cluster: Cluster | undefined
   let held: HeldSession | undefined
   try {
@@ -172,7 +172,7 @@ test('r38: an explicit rotation changes nothing before the stop, and the build g
   //      which is right — both are statements about the same defect.
   //   3. stop recovering the installed credential (route 1 of test 1): ROTATION_PENDING is never
   //      set, and this test fails on that assertion.
-  const root = mkdtempSync(join(tmpdir(), 'ims-cred-'))
+  const root = installRoot('ims-cred-')
   let cluster: Cluster | undefined
   let held: HeldSession | undefined
   try {
@@ -263,7 +263,7 @@ test('r38: the rotation happens inside the stopped, fenced window and moves exac
   //      same assertion fails — this is why the two statements sit together.
   //   3. make the ALTER a no-op (`SELECT 1;`). The new password never reaches the server and the
   //      new-credential assertion fails.
-  const root = mkdtempSync(join(tmpdir(), 'ims-cred-'))
+  const root = installRoot('ims-cred-')
   let cluster: Cluster | undefined
   try {
     cluster = startCluster(root, 'live', await freePort(), '127.0.0.1')
@@ -367,7 +367,7 @@ test('r38: the rotation refuses outside the stopped, fenced window and leaves th
   //   3. restore the r37 ALTER in provision_database_role_and_privileges(), or stop recovering
   //      the installed credential: this test fails on its live-credential assertion too, because
   //      the refusals it exercises are only meaningful over a role that still has its password.
-  const root = mkdtempSync(join(tmpdir(), 'ims-cred-'))
+  const root = installRoot('ims-cred-')
   let cluster: Cluster | undefined
   try {
     cluster = startCluster(root, 'live', await freePort(), '127.0.0.1')
@@ -449,7 +449,7 @@ test('r38: the installed password is recovered only for the same role, host, por
   //      or WRONG_DB respectively, alone in this file. Those three are asserted against the
   //      function directly because the behavioural half can only exercise one of the four at a
   //      time, and four clusters to prove one decision is four chances to prove something else.
-  const root = mkdtempSync(join(tmpdir(), 'ims-cred-'))
+  const root = installRoot('ims-cred-')
   let cluster: Cluster | undefined
   try {
     cluster = startCluster(root, 'live', await freePort(), '127.0.0.1')
