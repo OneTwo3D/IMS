@@ -9,6 +9,7 @@ import { BACK_REFERENCE_PO_ATTRIBUTION_LOCK_NAMESPACE } from '@/lib/db/advisory-
 import { BACK_REFERENCE_PAIRS, syncTypeWritesBackReference } from '@/lib/domain/accounting/back-reference'
 import {
   BACK_REFERENCE_AMBIGUITY_RECHECK_INTERVAL_MS,
+  BACK_REFERENCE_DEFERRAL_REPORT_INTERVAL_MS,
   BACK_REFERENCE_CANDIDATE_SELECT,
   BACK_REFERENCE_SWEEP_TYPES,
   buildBackReferenceCandidateQuery,
@@ -51,6 +52,13 @@ type SyncRow = {
   attemptRevision: number
   backReferenceCheckedAt: Date | null
   backReferenceAmbiguousLoggedAt: Date | null
+  /**
+   * o3d-3ix5: when this row's current unbroken run of settlement deferrals began. NULL = not being
+   * deferred. MODELLED HERE, and it has to be: the sweep reads it as a Date-or-NULL, and a fixture
+   * that simply omitted the column handed it `undefined` — on which the interval arithmetic threw,
+   * inside a catch that counted the row as a FAILURE. A real row always has the column.
+   */
+  backReferenceDeferredSinceAt: Date | null
   /** Retention has reduced this row to an attribution-only tombstone (r3 finding 3). */
   backReferenceEvidenceCompactedAt: Date | null
   /** The row's link is written but its follow-ups have not been enqueued yet (Codex r9 finding 1). */
@@ -84,7 +92,7 @@ const SYNC_COLUMNS = new Set([
   'id', 'connector', 'type', 'referenceType', 'referenceId', 'externalTransactionId',
   'status', 'payload', 'createdAt', 'backReferenceCheckedAt', 'backReferenceAmbiguousLoggedAt',
   'backReferenceEvidenceCompactedAt', 'backReferenceFollowUpsPendingAt', 'settlementBasis',
-  'attemptRevision',
+  'attemptRevision', 'backReferenceDeferredSinceAt',
 ])
 const BILL_COLUMNS = new Set(['id', 'poId', 'accountingInvoiceId', 'createdAt'])
 
@@ -592,6 +600,7 @@ function salesInvoiceRow(index: number, overrides: Partial<SyncRow> = {}): SyncR
     attemptRevision: 1,
     backReferenceCheckedAt: null,
     backReferenceAmbiguousLoggedAt: null,
+    backReferenceDeferredSinceAt: null,
     backReferenceEvidenceCompactedAt: null,
     backReferenceFollowUpsPendingAt: null,
     settlementBasis: null,
@@ -1648,6 +1657,7 @@ function creditNoteRow(index: number, overrides: Partial<SyncRow> = {}): SyncRow
     attemptRevision: 1,
     backReferenceCheckedAt: null,
     backReferenceAmbiguousLoggedAt: null,
+    backReferenceDeferredSinceAt: null,
     backReferenceEvidenceCompactedAt: null,
     backReferenceFollowUpsPendingAt: null,
     settlementBasis: null,
@@ -1788,6 +1798,7 @@ function salesCreditNoteRow(index: number, overrides: Partial<SyncRow> = {}): Sy
     attemptRevision: 1,
     backReferenceCheckedAt: null,
     backReferenceAmbiguousLoggedAt: null,
+    backReferenceDeferredSinceAt: null,
     backReferenceEvidenceCompactedAt: null,
     backReferenceFollowUpsPendingAt: null,
     settlementBasis: null,
@@ -4120,5 +4131,185 @@ test('[Codex HIGH] no reader in the sweep consults ONE axis of the follow-up out
     text.slice(text.indexOf('const followUpSettlement'), text.indexOf('const settlementPrerequisite')),
     /reportRefusedFollowUps\(row, outcome\)/,
     'and it asks the `enqueued` axis through its reporter, which is why that read is not in the list above',
+  )
+})
+
+// ---------------------------------------------------------------------------
+// o3d-3ix5 — A REFUSAL THAT IS COUNTED IS NOT A REFUSAL THAT IS OBSERVED.
+//
+// The sweep defers a row at two points — `markChecked`'s settlement CAS and
+// `claimFollowUpObligation`'s exclusive claim — and both only ever incremented `settlementDeferred`
+// and printed a console line. That counter reaches the cron response JSON and the manual-sync
+// activity metadata and nothing else, so a row starved of its settlement across every pass was
+// invisible: the obligation stays set and nothing is lost, but `backReferenceCheckedAt` is never
+// written, so the row stays a candidate for ever and occupies a slot in every scan.
+//
+// These tests are written against the CLAIM deferral because it is reachable from the harness's
+// `raceAfterProbe`; the settlement CAS deferral shares the same `deferSettlement` and the fence it
+// passes is asserted to carry the marker below.
+// ---------------------------------------------------------------------------
+
+/** A row that loses the obligation claim on every pass: each probe is followed by a new generation. */
+function makeStarvedHarness() {
+  const harness = makeHarness({
+    syncRows: [salesInvoiceRow(1, { status: 'FAILED', attemptRevision: 3, backReferenceFollowUpsPendingAt: at(500) })],
+    bills: [],
+    orders: [{ id: 'so-1', accountingInvoiceId: null }],
+  })
+  let generation = 1000
+  harness.raceAfterProbe = (rows) => { rows[0].backReferenceFollowUpsPendingAt = at(++generation) }
+  return harness
+}
+
+test('[o3d-3ix5] ONE deferral warns about nothing and starts the clock', async () => {
+  // Two runs meeting on one row is the expected case, not an incident: the loser writes nothing and
+  // the next pass settles from current state. Warning here would make the healthy case loud and bury
+  // the pathological one inside it. What the pass must leave behind is the START of the run, because
+  // nothing else can tell a first deferral from a hundredth.
+  const harness = makeStarvedHarness()
+  const clock = fakeClock()
+
+  const run = await repairAccountingBackReferences(sweepDeps(harness, clock.now), { limit: 10 })
+
+  assert.equal(run.settlementDeferred, 1)
+  assert.equal(
+    harness.activities.filter((entry) => entry.action === 'xero_backreference_settlement_deferred').length,
+    0,
+    'a single deferral is a healthy overlap and must not page anybody',
+  )
+  assert.deepEqual(
+    harness.store.syncRows[0].backReferenceDeferredSinceAt,
+    clock.now(),
+    'but the run it begins is on record, which is the whole difference from the counter',
+  )
+  assert.equal(harness.store.syncRows[0].backReferenceCheckedAt, null, 'and the row is still a candidate')
+})
+
+test('[o3d-3ix5] a row that cannot settle ACROSS an interval is reported, and named', async () => {
+  const harness = makeStarvedHarness()
+  const clock = fakeClock()
+
+  await repairAccountingBackReferences(sweepDeps(harness, clock.now), { limit: 10 })
+  const startedAt = harness.store.syncRows[0].backReferenceDeferredSinceAt
+  assert.ok(startedAt)
+
+  // Still inside the interval: contended again, and still not worth telling anybody about.
+  clock.advance(BACK_REFERENCE_DEFERRAL_REPORT_INTERVAL_MS - 1000)
+  const inside = await repairAccountingBackReferences(sweepDeps(harness, clock.now), { limit: 10 })
+  assert.equal(inside.settlementDeferred, 1)
+  assert.equal(harness.activities.filter((entry) => entry.action === 'xero_backreference_settlement_deferred').length, 0)
+  assert.deepEqual(
+    harness.store.syncRows[0].backReferenceDeferredSinceAt,
+    startedAt,
+    'the marker is the START of the run, so an ordinary deferral must not push it forward',
+  )
+
+  // Past it. The row has now been denied a settlement on every pass for a day.
+  clock.advance(2000)
+  const reportedAt = clock.now()
+  const outside = await repairAccountingBackReferences(sweepDeps(harness, clock.now), { limit: 10 })
+  assert.equal(outside.settlementDeferred, 1)
+  const warnings = harness.activities.filter((entry) => entry.action === 'xero_backreference_settlement_deferred')
+  assert.equal(warnings.length, 1)
+  assert.equal(warnings[0].level, 'WARNING')
+  assert.equal(warnings[0].metadata.syncLogId, 'log-0001', 'the row is NAMED — a count cannot be acted on')
+  assert.equal(warnings[0].metadata.deferredSinceAt, startedAt.toISOString())
+  assert.deepEqual(
+    harness.store.syncRows[0].backReferenceDeferredSinceAt,
+    reportedAt,
+    'and the marker moves forward, so a permanently contended row repeats once per interval rather than once ever',
+  )
+  assert.equal(harness.store.syncRows[0].backReferenceCheckedAt, null, 'reporting is not a verdict')
+})
+
+test('[o3d-3ix5] a warning that was NOT persisted does not buy an interval of silence', async () => {
+  // The same asymmetry `warnAndDefer` documents: moving the marker is what suppresses the next
+  // interval, so a marker moved on an unwritten warning loses the only notification there was.
+  const harness = makeStarvedHarness()
+  const clock = fakeClock()
+  await repairAccountingBackReferences(sweepDeps(harness, clock.now), { limit: 10 })
+  const startedAt = harness.store.syncRows[0].backReferenceDeferredSinceAt
+  assert.ok(startedAt)
+
+  harness.failActivityFor.add('xero_backreference_settlement_deferred')
+  clock.advance(BACK_REFERENCE_DEFERRAL_REPORT_INTERVAL_MS + 1000)
+  await repairAccountingBackReferences(sweepDeps(harness, clock.now), { limit: 10 })
+  assert.equal(harness.activities.length, 0, 'nothing reached the log')
+  assert.deepEqual(
+    harness.store.syncRows[0].backReferenceDeferredSinceAt,
+    startedAt,
+    'so the row stays DUE, and the next pass reports it',
+  )
+
+  harness.failActivityFor.clear()
+  clock.advance(1000)
+  await repairAccountingBackReferences(sweepDeps(harness, clock.now), { limit: 10 })
+  assert.equal(
+    harness.activities.filter((entry) => entry.action === 'xero_backreference_settlement_deferred').length,
+    1,
+    'immediately, and not one interval later',
+  )
+})
+
+test('[o3d-3ix5] settling the row ENDS the run — the next deferral starts a fresh one', async () => {
+  // Without the clear, a row that was contended once and then settled would carry a start time for
+  // ever, and its NEXT deferral — months later, and on its own a healthy overlap — would be reported
+  // as a day-long starvation. The marker means "this row is stuck right now", so the write that
+  // proves it is not stuck has to end it, in the same statement that ends its candidacy.
+  const harness = makeStarvedHarness()
+  const clock = fakeClock()
+  await repairAccountingBackReferences(sweepDeps(harness, clock.now), { limit: 10 })
+  assert.ok(harness.store.syncRows[0].backReferenceDeferredSinceAt, 'contended once')
+
+  // The competitor goes away, so this pass owns the obligation and settles the row.
+  harness.raceAfterProbe = null
+  clock.advance(BACK_REFERENCE_DEFERRAL_REPORT_INTERVAL_MS * 3)
+  const settled = await repairAccountingBackReferences(sweepDeps(harness, clock.now), { limit: 10 })
+
+  assert.equal(settled.settlementDeferred, 0)
+  assert.ok(harness.store.syncRows[0].backReferenceCheckedAt, 'the row is settled')
+  assert.equal(
+    harness.store.syncRows[0].backReferenceDeferredSinceAt,
+    null,
+    'and its run of deferrals is over — a stale start time would misreport the next one as starvation',
+  )
+})
+
+test('[o3d-3ix5] the deferral marker must NEVER narrow the candidate query', async () => {
+  // THE ONE WAY COPYING `backReferenceAmbiguousLoggedAt` WHOLESALE WOULD HAVE MADE THIS WORSE.
+  // That column throttles CANDIDACY: an ambiguous row leaves the scan for an interval, which is
+  // affordable because re-probing a backlog of them starves newer rows. A deferred row is one that
+  // has been denied a settlement, so taking it out of the scan applies the defect as its own remedy
+  // — it would convert "reported starvation" into "enforced starvation". The marker gates the
+  // WARNING and nothing else.
+  //
+  // BOTH BRANCHES, because the builder has two and they do not share a `where`: the first page
+  // nests `[notRecentlyAmbiguous]` under AND, and the keyset page REBUILDS that array with the
+  // cursor clause. A filter added to one of them only would throttle candidacy for every page after
+  // the first — the pages a starved row is most likely to be on, since it never leaves the scan.
+  const firstPage = buildBackReferenceCandidateQuery({
+    connector: 'xero', after: null, ambiguityRecheckBefore: at(0), take: 10,
+  })
+  const keysetPage = buildBackReferenceCandidateQuery({
+    connector: 'xero', after: { createdAt: at(5), id: 'log-0001' }, ambiguityRecheckBefore: at(0), take: 10,
+  })
+  for (const [label, query] of [['first page', firstPage], ['keyset page', keysetPage]] as const) {
+    assert.doesNotMatch(
+      JSON.stringify(query.where),
+      /backReferenceDeferredSinceAt/,
+      `${label}: a deferred row is exactly the row that most needs the next pass to look at it`,
+    )
+  }
+  const { where } = firstPage
+
+  // And proved on the row rather than only on the query shape: a row mid-deferral still comes back.
+  const harness = makeStarvedHarness()
+  const clock = fakeClock()
+  await repairAccountingBackReferences(sweepDeps(harness, clock.now), { limit: 10 })
+  assert.ok(harness.store.syncRows[0].backReferenceDeferredSinceAt)
+  assert.equal(
+    matches(harness.store.syncRows[0] as unknown as Record<string, unknown>, where, SYNC_COLUMNS),
+    true,
+    'a row being deferred is still a candidate',
   )
 })

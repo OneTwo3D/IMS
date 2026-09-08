@@ -1,0 +1,50 @@
+-- o3d-3ix5 — A REFUSAL THAT IS COUNTED IS NOT A REFUSAL THAT IS OBSERVED.
+--
+-- THE DEFECT THIS CLOSES. The back-reference sweep refuses to write at two points and defers the row
+-- to the next pass: `markChecked`'s settlement compare-and-set, and `claimFollowUpObligation`'s
+-- exclusive claim. Both increment `BackReferenceRepairResult.settlementDeferred` and print one
+-- console line. Nothing else reads that counter: it reaches the cron response JSON, which nobody
+-- opens unless they are already reading cron output, and the `xero_manual_sync` activity metadata,
+-- which only exists when a human presses the sync button.
+--
+-- The protocol those refusals belong to is SAFE unconditionally — a run that loses writes nothing,
+-- the obligation stays set, and every deferred pass re-enqueues idempotently — but it is LIVE only
+-- on the assumption that some claim-to-settle window eventually completes uncontended. Nothing makes
+-- that true. Under continuously overlapping runs (a cron tick outrunning its period, the manual
+-- sweep behind the sync button, and a connector re-posting the same row) a row's settlement can be
+-- starved without bound. What that costs is bookkeeping rather than money: `backReferenceCheckedAt`
+-- is never written, so the row stays a candidate for ever and occupies a slot in every scan — and
+-- until this column, the ONLY detector of that unbounded starvation mode was a number in a JSON
+-- body.
+--
+-- WHAT THE COLUMN HOLDS: the instant the row's CURRENT UNBROKEN RUN of deferrals began. NULL means
+-- it is not being deferred — it never has been, or its last pass settled and the settlement write
+-- cleared it in the same statement that stamped `backReferenceCheckedAt`. So a row that loses one
+-- race and settles on the next pass leaves no trace, which is correct: a single deferral is a
+-- healthy overlap, not an incident. What is reportable is a run of them that outlives an interval.
+--
+-- IT DOES NOT THROTTLE CANDIDACY, AND THAT IS THE DIFFERENCE FROM
+-- `backReferenceAmbiguousLoggedAt`, whose shape this otherwise mirrors. That column takes an
+-- ambiguous row OUT of the candidate set for one interval, because re-probing and re-warning a
+-- backlog of them on every cron cycle would starve newer rows. Applying the same treatment here
+-- would be the defect's own remedy applied backwards: a deferred row is one that has been denied a
+-- settlement, so removing it from the scan denies it the settlement for longer. No query filters on
+-- this column. It gates the WARNING and nothing else.
+--
+-- WHY A TIMESTAMP AND NOT A COUNT. The question an operator needs answered is "has this row been
+-- unable to settle for longer than a sweep interval?", and a count cannot answer it: the same count
+-- means an hour on a busy installation and a month on a quiet one, because it advances per PASS and
+-- passes are not evenly spaced. Nor is a count self-throttling — reporting "every N" would either
+-- re-warn a permanently contended row on every pass past the threshold or never warn again after the
+-- first. A timestamp compared against one interval gives both the condition and the throttle from
+-- one value, and it is moved forward as each warning is written, so a row contended for ever is
+-- reported once per interval rather than once in total.
+--
+-- NOT BACKFILLED, and nothing is lost by that: the state it records is transient by construction. A
+-- row deferred at the moment of this deploy is deferred again on the next pass, and that pass starts
+-- its run. Every historical deferral is already over.
+--
+-- ADDITIVE AND NON-BLOCKING: one nullable column, no default, no index — it is read only from rows
+-- the sweep's candidate index has already selected, and written only by primary key. On
+-- PostgreSQL 11+ this is a catalogue-only change and takes no table rewrite.
+ALTER TABLE "accounting_sync_logs" ADD COLUMN "backReferenceDeferredSinceAt" TIMESTAMP(3);

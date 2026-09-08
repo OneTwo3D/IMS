@@ -2464,6 +2464,16 @@ model AccountingSyncLog {
   // over. The repeat warning carries the previous timestamp so a row nobody ever links by hand
   // cannot go quiet.
   backReferenceAmbiguousLoggedAt DateTime?
+  // o3d-3ix5: when this row's CURRENT UNBROKEN RUN of settlement deferrals began. NULL = it is not
+  // being deferred (it has never been, or its last pass settled). Set on the first deferral, moved
+  // forward each time a warning about it is written, and CLEARED by the settlement write itself.
+  //
+  // THE OPPOSITE OF backReferenceAmbiguousLoggedAt IN THE ONE WAY THAT MATTERS, and copying that
+  // column's shape without noticing would make things worse: ambiguity throttles CANDIDACY, so an
+  // ambiguous row leaves the scan for an interval. A deferred row must stay fully eligible — being
+  // starved of a settlement is the defect, so removing it from the scan is the defect's own remedy
+  // applied backwards. This column throttles the WARNING only, and no query filters on it.
+  backReferenceDeferredSinceAt DateTime?
   // o3d-9kek r3 finding 3: when this row's full payload was compacted to an attribution-only
   // TOMBSTONE because it outlived the retention period while still unresolved. Tombstones keep the
   // (connector, type, status, referenceType, referenceId, externalTransactionId) evidence that stops
