@@ -1583,6 +1583,31 @@ test('o3d-11rf r3: an unexplained VOID with nothing live beside it is NOT report
   assert.deepEqual(unexplainedVoidFindings(none), [], 'and neither is a void with no sync row at all')
 })
 
+test('o3d-11rf r3: SYNCED is excluded ON ITS OWN, not only when it kept a document id', () => {
+  // THE STATUS RULE, ISOLATED. The case above clears the status AND sets a document id, so the
+  // `externalTransactionId` guard alone accounts for it and the status set is never exercised —
+  // adding SYNCED to MIRROR_CONTRADICTING_SYNC_STATUSES changed nothing and the mutation survived.
+  // A SYNCED row with no document id is a real shape (a journal type claims none), and it is the one
+  // that separates the two rules: it has already done its posting, so reviving the mirror is not its
+  // remedy whatever it kept.
+  const rows = unexplainedVoidRows()
+  rows.syncLogs[0].status = 'SYNCED'
+  assert.equal(rows.syncLogs[0].externalTransactionId, null, 'the OTHER guard cannot be what excludes it')
+
+  assert.deepEqual(unexplainedVoidFindings(rows), [])
+})
+
+test('o3d-11rf r3: a FAILED or CANCELLED row is not live work either', () => {
+  // The complement of the case above, and the reason the set is stated rather than derived: these
+  // are terminal, so a VOID mirror is not preventing anything. Only PENDING and PROCESSING are work
+  // that will never be done.
+  for (const status of ['FAILED', 'CANCELLED']) {
+    const rows = unexplainedVoidRows()
+    rows.syncLogs[0].status = status
+    assert.deepEqual(unexplainedVoidFindings(rows), [], `a ${status} row is not work owed`)
+  }
+})
+
 test('o3d-11rf r3: a live row carrying a document id is NOT reported — that is a different disagreement', () => {
   // o3d-ju8t: a row with an externalTransactionId describes a document that EXISTS, so it is not
   // work owed and reviving its mirror is not the remedy. `posted_event_without_external_id` and the
