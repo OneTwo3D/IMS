@@ -88,21 +88,34 @@ const ALLOWLIST: Record<string, string> = {
   // either: every dispatcher carries its delegate's gate (see the note at the top
   // of app/actions/accounting-sync.ts).
 
-  // o3d-512h — REASON NARROWED. An allowlist reason is a claim about code, and
-  // this one claimed more than the code does. What is actually true is stated
-  // here; what is NOT verified is stated as not verified, because "connector
-  // facade → guarded X actions" reads as a coverage guarantee and was being taken
-  // as one.
+  // o3d-1fel — THE WILDCARD IS GONE, AND WITH IT THE LAST NON-FACADE EXEMPTION.
   //
-  // quickbooks-sync.ts is not a facade at all: six of its exports
-  // (getQuickBooksSettingsMasked, getQuickBooksConnectionStatus,
-  // getQuickBooksAccounts, fetchQuickBooksTaxCodes, getQuickBooksSyncLogs,
-  // getQuickBooksSyncReadiness) carry NO guard and read Prisma or the QuickBooks
-  // API directly. They are separately addressable endpoints. QuickBooks is out of
-  // scope for this branch by owner instruction, so they are left as they are —
-  // but this entry no longer asserts they are guarded.
-  'quickbooks-sync.ts:*':
-    'OUT OF SCOPE (QuickBooks, owner instruction) — NOT verified as guarded: six exports carry no guard; reachable via accounting-sync.ts only behind its dispatcher gate',
+  // o3d-512h narrowed this entry's REASON until it read as a bug report filed
+  // against itself: "six exports carry no guard; reachable via accounting-sync.ts
+  // only behind its dispatcher gate". The second half is true and irrelevant. A
+  // `'use server'` export is an endpoint in its OWN right — the dispatcher that
+  // usually calls it is not on the wire between an attacker and it — so
+  // "reachable only behind a gate" describes the app's call graph, not the
+  // attack surface. That is the adjacent property: sound about routing, silent
+  // about the thing the test exists to check.
+  //
+  // The six are now guarded at their own boundary with `requirePermission('sync')`,
+  // which is what their Xero counterparts have carried all along:
+  //
+  //   getQuickBooksSettingsMasked   ↔ getXeroSettingsMasked
+  //   getQuickBooksConnectionStatus ↔ getXeroConnectionStatus
+  //   getQuickBooksAccounts         ↔ getAccountingAccounts   (xero-sync.ts)
+  //   fetchQuickBooksTaxCodes       ↔ fetchXeroTaxRates
+  //   getQuickBooksSyncLogs         ↔ getXeroSyncLogs
+  //   getQuickBooksSyncReadiness    ↔ getXeroSyncReadiness
+  //
+  // ONE RULE, TWO READERS, ONE FIXED — that was the whole defect. Both files are
+  // arms of the SAME `getAccountingConnector` switch
+  // (lib/connectors/accounting-registry.ts), reached from the same guarded
+  // dispatchers in accounting-sync.ts, so the two arms had no business being
+  // gated differently. Double-gating costs the legitimate caller nothing: every
+  // registry call site in accounting-sync.ts already holds `sync` (or more), so
+  // the second check can only ever pass for them.
 
   // o3d-512h round 7, Codex finding 1 — THE ONE RESIDUAL IN THE TREE.
   //
