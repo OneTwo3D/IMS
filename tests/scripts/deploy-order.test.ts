@@ -8,6 +8,7 @@ import { test } from 'node:test'
 import {
   checkoutHelper,
   checkoutPgEntry,
+  FENCE_PLAN_CLUSTER,
   protectedLibraryLines,
   protectedLibraryLinesAt,
   sealCheckoutModes,
@@ -15,6 +16,7 @@ import {
   protectedPaths,
   writeFenceCheckout,
 } from './fence-artefact-harness.ts'
+import { shellConstant, shellFunction, shellFunctionDefinitions } from './shell-symbol.ts'
 import { createTempDirSync } from './temp-dir.ts'
 
 // o3d-2sm1.1 — the deploy order is a safety property, not a style choice, so it is
@@ -31,6 +33,43 @@ import { createTempDirSync } from './temp-dir.ts'
 // header comment cannot satisfy an assertion about what the script actually does.
 
 const LOCK_LIB = join(process.cwd(), 'scripts/lib/crontab-lock.sh')
+
+/** THE CUTOVER NAMESPACE LIBRARY (o3d-secops r22, Codex CRITICAL x2). The shared cutover lock, the
+ *  app-writable connection-fence directory and the walk that creates either of them are ONE
+ *  definition each now, in scripts/lib/cutover-namespace.sh, sourced by all three entrypoints.
+ *  Harnesses lift a function out of the file that DEFINES it: a rig that kept asking `entry.source`
+ *  for these would fail with "the script must define …", and a rig that re-typed them would prove
+ *  its author can re-type them. */
+const CUTOVER_NS_LIB = readFileSync(join(process.cwd(), 'scripts/lib/cutover-namespace.sh'), 'utf8')
+const CUTOVER_NS_FUNCTIONS = new Set([
+  'enter_service_subdir',
+  'mkdir_service_subdir',
+  'own_service_subdir',
+  'verify_held_lock',
+  'narrow_held_lock',
+  'held_lock_mode',
+  'lock_mode_is_private',
+  'rotate_cutover_lock_inode',
+  'dir_is_private_to_this_run',
+  'prepare_cutover_lock_file',
+  'ensure_cutover_root_dir',
+  'ensure_cutover_state_dirs',
+  'acquire_cutover_lock',
+  'acquire_legacy_namespace_lock',
+  'state_pre_r22_cutovers_are_not_excluded',
+  'warn_pre_r22_db_fence_state',
+  'warn_legacy_namespace_db_fence_state',
+])
+/** Lift `name` from whichever shipped file defines it. */
+function shippedShellFunction(source: string, name: string): string {
+  return shellFunction(CUTOVER_NS_FUNCTIONS.has(name) ? CUTOVER_NS_LIB : source, name)
+}
+
+/** ensure_cutover_state_dirs() and the walk it is built out of, as one lift, for the rigs that
+ *  only need the connection-fence directory to exist. */
+const CUTOVER_DIR_PRIMITIVES = ['enter_service_subdir', 'own_service_subdir', 'ensure_cutover_root_dir', 'ensure_cutover_state_dirs']
+  .map((name) => shellFunction(CUTOVER_NS_LIB, name))
+  .join('\n')
 const DEPLOY_LINES = readFileSync(join(process.cwd(), 'scripts/deploy.sh'), 'utf8').split(/\r?\n/)
 const UPDATE_LINES = readFileSync(join(process.cwd(), 'scripts/update.sh'), 'utf8').split(/\r?\n/)
 
@@ -252,21 +291,19 @@ function phaseEnd(lines: string[], phase: string): number {
   return next === -1 ? lines.length : next
 }
 
-/**
- * The text of one top-level shell function, from `name() {` to the `}` in column 0.
+/*
+ * shellFunction() and shellConstant() come from ./shell-symbol.ts, shared with
+ * install-root-safe-writes.test.ts, and assert that the script defines the symbol EXACTLY ONCE
+ * before handing back its text (o3d-rn10 r4).
  *
- * Used by the durability tests below to RUN the shipped code rather than to describe it:
- * a re-implementation of the marker writer would pass while the script wrote something
- * else, which is the failure mode this whole file exists to prevent.
+ * They are used by the durability tests below to RUN the shipped code rather than to describe it:
+ * a re-implementation of the marker writer would pass while the script wrote something else, which
+ * is the failure mode this whole file exists to prevent. publish_durable_file() reads
+ * PUBLISH_STAGE_DIRNAME, which scripts/install.sh ALSO has to prune out of its recursive chown over
+ * ${DATA_DIR}, so that name is lifted too rather than re-typed. Taking the FIRST of two definitions
+ * is the same failure wearing a different hat — bash runs the LAST one — so the extractor refuses a
+ * script that carries two.
  */
-function shellFunction(source: string, name: string): string {
-  const start = source.indexOf(`\n${name}() {\n`)
-  assert.notEqual(start, -1, `the script must define ${name}()`)
-  const rest = source.slice(start + 1)
-  const end = rest.indexOf('\n}\n')
-  assert.notEqual(end, -1, `${name}() must be closed by a } in column 0`)
-  return rest.slice(0, end + 2)
-}
 
 /**
  * The durability primitives every marker and cron-backup writer now goes through, taken
@@ -277,12 +314,31 @@ function shellFunction(source: string, name: string): string {
  */
 function durabilityFunctions(source: string): string {
   return [
+    // o3d-czpy: the staging directory publish_durable_file() writes through, named once.
+    shellConstant(source, 'PUBLISH_STAGE_DIRNAME'),
     shellFunction(source, 'fsync_path'),
+    // o3d-rn10: publish_durable_file() no longer stats its own destination pathname. It asks which
+    // trusted ancestor the destination lies under and walks down from there, so all three come
+    // with it — a rig missing them fails every publication with "command not found", and every
+    // "the publish must fail" test then passes for the wrong reason.
+    shellFunction(source, 'publish_trust_root_candidates'),
+    // o3d-rn10 r4: publish_root_anchored() is a subshell around the walk, so the walk comes with it.
+    shellFunction(source, 'pin_publish_root_parent'),
+    shellFunction(source, 'publish_root_anchored'),
+    shellFunction(source, 'publish_trust_root'),
+    // o3d-secops r7: the shared refusal pin_dir_beneath_root() prints a symlinked root through.
+    shellFunction(source, 'refuse_symlinked_root'),
+    shellFunction(source, 'pin_dir_beneath_root'),
     shellFunction(source, 'publish_durable_file'),
     // The drop-in publisher is one of these too (o3d-2sm1.5, Codex r11): install_reboot_fence()
     // routes the systemd fragment through it, so a harness without it fails the install with
     // "command not found" and every "the install must fail" test passes for the wrong reason.
     shellFunction(source, 'publish_durable_dropin'),
+    // o3d-secops r20: the marker no longer lives in ${CUTOVER_STATE_DIR}, and every writer of it
+    // now creates the root-owned private directory it does live in first. Lifted here for the
+    // reason the trust-root walk is: a rig missing it fails every marker publication with
+    // "command not found", and every "the publish must fail" test then passes for the wrong reason.
+    shellFunction(source, 'ensure_fence_marker_dir'),
   ].join('\n')
 }
 
@@ -296,15 +352,14 @@ function durabilityFunctions(source: string): string {
  * two rounds running has been precisely that one entrypoint was reading a different copy of the
  * rule.
  *
- * The literal paths under /etc are then redirected at the harness directory — after the source,
- * so the assignments here win over the library's own. Everything else about it runs unchanged,
- * including the refusal to overwrite an existing protected copy.
+ * Its trust root is redirected at the harness directory by substituting the ONE /etc literal in
+ * the shipped TEXT before it is run — not by reassigning the paths afterwards, which `readonly`
+ * refuses since o3d-secops r2. Everything else about it runs unchanged, the nine paths composed
+ * from that root are composed by the library itself, and the refusal to overwrite an existing
+ * protected copy is the shipped one. See tests/scripts/fence-artefact-harness.ts.
  */
 function fenceProtectedLibrary(dir: string): string {
-  return [
-    `source ${JSON.stringify(join(process.cwd(), 'scripts/lib/db-fence-protected.sh'))}`,
-    ...protectedLibraryLines(dir),
-  ].join('\n')
+  return protectedLibraryLines(dir).join('\n')
 }
 
 /** The one marker filename, in the one cutover namespace, for all three entrypoints. */
@@ -860,9 +915,38 @@ die() { echo "die: $*" >&2; exit 1; }
   },
 ] as const
 
+/**
+ * A STATE DIRECTORY WITH AN ANCHOR ABOVE IT (o3d-rn10 r2).
+ *
+ * publish_durable_file() refuses a trust root whose OWN PARENT the service account could rename
+ * inside, and /tmp is 1777 — so a mkdtemp directory used directly as ${CUTOVER_STATE_DIR} or
+ * ${DATA_DIR} is a root with no anchor, and every publication in a rig that did so would fail for
+ * a reason unrelated to what the rig measures. One nesting level gives the state directory a 0700
+ * parent of this run's own, which is the standing /var/lib gives it in production. The returned
+ * `dir` is the state directory; `outer` is what the caller removes.
+ */
+function anchoredStateDir(prefix: string): { outer: string; dir: string } {
+  const outer = mkdtempSync(join(tmpdir(), prefix))
+  const dir = join(outer, 'state')
+  mkdirSync(dir)
+  return { outer, dir }
+}
+
+/**
+ * ${APP_DIR}, ${CUTOVER_STATE_DIR} and ${DB_FENCE_RECOVERY_DIR} under ONE anchor, for the reason
+ * anchoredStateDir() gives: each of the three is a publication root, and a root directly beneath a
+ * 1777 directory has no anchor and is refused.
+ */
+function anchoredRoots(prefix: string): { outer: string; app: string; state: string; recovery: string } {
+  const outer = mkdtempSync(join(tmpdir(), prefix))
+  const dirs = { outer, app: join(outer, 'app'), state: join(outer, 'state'), recovery: join(outer, 'recovery') }
+  for (const dir of [dirs.app, dirs.state, dirs.recovery]) mkdirSync(dir)
+  return dirs
+}
+
 /** Run the script's OWN marker functions, then walk away — exactly what a SIGKILL leaves. */
 function runMarkerHarness(entry: (typeof MARKER_CASES)[number], call: string): string {
-  const dir = mkdtempSync(join(tmpdir(), 'ims-marker-'))
+  const { outer, dir } = anchoredStateDir('ims-marker-')
   try {
     const program = [
       'set -euo pipefail',
@@ -875,7 +959,7 @@ function runMarkerHarness(entry: (typeof MARKER_CASES)[number], call: string): s
     execFileSync('bash', ['-c', program], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] })
     return readFileSync(join(dir, MARKER_NAME), 'utf8')
   } finally {
-    rmSync(dir, { recursive: true, force: true })
+    rmSync(outer, { recursive: true, force: true })
   }
 }
 
@@ -994,8 +1078,19 @@ for (const entry of MARKER_CASES) {
 
     const publish = shellFunction(entry.source, 'publish_durable_file')
     const fileBarrier = publish.indexOf('fsync_path "$tmp"')
-    const rename = publish.indexOf('mv -f "$tmp" "$target"')
-    const dirBarrier = publish.indexOf('fsync_path "$dir"')
+    // o3d-czpy: `-T`, so a DIRECTORY planted at the target name is refused rather than filled
+    // with a stray temporary while the run reports success.
+    // o3d-czpy r2: never the absolute target, which re-resolved the destination parent at the
+    // instant of the rename.
+    // o3d-secops r19: and no longer `../${base}` either. `..` is the kernel's own parent link, so
+    // no rename of a NAME above the staging directory could redirect it — but it is a property of
+    // WHERE THE STAGING DIRECTORY IS, and a staging directory moved wholesale into another parent
+    // takes it along. The destination is a descriptor opened before the staging directory exists,
+    // so `/proc/self/fd/N/${base}` is `renameat(N, "${base}", …)` and names nothing that can move.
+    const rename = publish.indexOf('mv -f -T "$tmp" "/proc/self/fd/${dest}/${base}"')
+    // And the directory barrier flushes THAT SAME DESCRIPTOR — the directory the rename landed in,
+    // asked for as an open file rather than as `..` of wherever the staging directory now is.
+    const dirBarrier = publish.indexOf('fsync_path "/proc/self/fd/${dest}"')
     assert.ok(fileBarrier !== -1, 'the data must be fsynced')
     assert.ok(rename !== -1, 'and published by rename')
     assert.ok(dirBarrier !== -1, 'and the parent directory fsynced')
@@ -1072,7 +1167,10 @@ for (const [name, source] of [
     // check, because the new build cannot serve a database it may not connect to. If either
     // then fails the trap used to announce a HELD fence — one it had already released.
     const refence = shellFunction(source, 'refence_db_connections')
-    assert.match(refence, /--fence/, 'the trap-safe re-fence must actually re-apply the revoke')
+    // o3d-secops r23: raising a fence is db_fence_raise() — plan as the service account, validate
+    // and publish the authority as root, then `--fence`. A re-fence that only ran `--fence` would
+    // now revoke from an authority nothing had republished, which the helper refuses.
+    assert.match(refence, /db_fence_raise/, 'the trap-safe re-fence must actually re-apply the revoke')
     assert.ok(!/\bdie\b/.test(refence), 'and must never die, because it runs inside the exit trap')
 
     const trapName = name === 'install.sh' ? 'on_cutover_exit' : 'on_exit'
@@ -1165,7 +1263,16 @@ BLUE=''; GREEN=''; YELLOW=''; RED=''; BOLD=''; RESET=''
 APP_USER="$(id -un)"
 STATE_DIR='${dir}'
 CUTOVER_STATE_DIR='${dir}'
-DB_FENCE_DIR='${dir}'
+# o3d-secops r22: the connection-fence directory is walked to beneath a root-owned parent
+# now, so a rig that names it must name the parent it hangs off as well.
+CUTOVER_STATE_DIR="${'${CUTOVER_STATE_DIR:-'}${dir}}"
+CUTOVER_ROOT_DIR='${dir}'
+DB_FENCE_DIR='${dir}/fence'
+# o3d-secops r28: the recovery wrappers this rig's resolver publishes now take the entrypoint's
+# own cutover lock for their whole read/audit/act sequence, so the entrypoint hands them its path
+# and a rig that omitted it would be measuring a publication the shipped script cannot perform.
+LOCK_FILE='${dir}/cutover.lock'
+LEGACY_STATE_DIR_DB_FENCE_STATE="${'${CUTOVER_STATE_DIR}'}/deploy/db-connect-fence.json"
 DB_FENCE_SCRIPT='${dir}/app/scripts/fence-db-connections.mjs'
 DB_FENCE_STATE='${dir}/db-connect-fence.json'
 DEPLOY_ADMIN_DATABASE_URL='postgres://admin@127.0.0.1/nowhere'
@@ -1197,6 +1304,21 @@ DB_IDENTITY_DRIFT_REASON=''
 # pointed at the harness directory instead of /etc.
 ${fenceProtectedLibrary(dir)}
 ${shellFunction(DEPLOY_LINES.join('\n'), 'resolve_fence_script')}
+# o3d-secops r23: raising a fence is plan -> authorise -> execute, and db_fence_raise() (sourced
+# above with the library) reaches back for the ONE part each entrypoint supplies for itself, plus
+# the namespace library's directory predicate. Lifted rather than stubbed, for the reason
+# everything else here is: a rig that supplied its own would stop measuring the shipped ordering.
+${shellFunction(CUTOVER_NS_LIB, 'dir_is_private_to_this_run')}
+${shellFunction(DEPLOY_LINES.join('\n'), 'db_fence_helper')}
+# o3d-secops r32: and the three the migration binding is made of -- the drop to the application
+# account carrying MIGRATION_DATABASE_URL, and the two gates that read db_fence_migration_bind() and
+# db_fence_migration_witnessed(). Lifted rather than stubbed for the reason everything else
+# here is: fence_db_connections() CALLS the first of them, so a rig without it would measure
+# an ordering the shipped script does not have.
+${shellFunction(DEPLOY_LINES.join('\n'), 'db_fence_migration_helper')}
+${shellFunction(DEPLOY_LINES.join('\n'), 'bind_migration_to_fenced_server')}
+${shellFunction(DEPLOY_LINES.join('\n'), 'require_migration_landed_on_fenced_server')}
+${shellFunction(DEPLOY_LINES.join('\n'), 'pin_migration_window')}
 DB_FENCE_REFENCE_CMD="\${DB_FENCE_REFENCE_WRAPPER}"
 : "\${APP_DIR_REAL:=/opt/app}"
 : "\${APP_DIR:=/opt/app}"
@@ -1224,7 +1346,16 @@ mkdir -p "\${CRONTAB_LOCK_DIR}"
 DRY_RUN=false
 BLUE=''; GREEN=''; YELLOW=''; RED=''; BOLD=''; RESET=''
 APP_USER="$(id -un)"
-DB_FENCE_DIR='${dir}'
+# o3d-secops r22: the connection-fence directory is walked to beneath a root-owned parent
+# now, so a rig that names it must name the parent it hangs off as well.
+CUTOVER_STATE_DIR="${'${CUTOVER_STATE_DIR:-'}${dir}}"
+CUTOVER_ROOT_DIR='${dir}'
+DB_FENCE_DIR='${dir}/fence'
+# o3d-secops r28: the recovery wrappers this rig's resolver publishes now take the entrypoint's
+# own cutover lock for their whole read/audit/act sequence, so the entrypoint hands them its path
+# and a rig that omitted it would be measuring a publication the shipped script cannot perform.
+LOCK_FILE='${dir}/cutover.lock'
+LEGACY_STATE_DIR_DB_FENCE_STATE="${'${CUTOVER_STATE_DIR}'}/deploy/db-connect-fence.json"
 DB_FENCE_SCRIPT='${dir}/app/scripts/fence-db-connections.mjs'
 DB_FENCE_STATE='${dir}/db-connect-fence.json'
 DATABASE_URL='postgres://app@127.0.0.1/nowhere'
@@ -1260,6 +1391,17 @@ DB_IDENTITY_DRIFT_REASON=''
 # assertion below still reads what was invoked.
 ${fenceProtectedLibrary(dir)}
 ${shellFunction(UPDATE_LINES.join('\n'), 'resolve_fence_script')}
+${shellFunction(CUTOVER_NS_LIB, 'dir_is_private_to_this_run')}
+${shellFunction(UPDATE_LINES.join('\n'), 'db_fence_helper')}
+# o3d-secops r32: and the three the migration binding is made of -- the drop to the application
+# account carrying MIGRATION_DATABASE_URL, and the two gates that read db_fence_migration_bind() and
+# db_fence_migration_witnessed(). Lifted rather than stubbed for the reason everything else
+# here is: fence_db_connections() CALLS the first of them, so a rig without it would measure
+# an ordering the shipped script does not have.
+${shellFunction(UPDATE_LINES.join('\n'), 'db_fence_migration_helper')}
+${shellFunction(UPDATE_LINES.join('\n'), 'bind_migration_to_fenced_server')}
+${shellFunction(UPDATE_LINES.join('\n'), 'require_migration_landed_on_fenced_server')}
+${shellFunction(UPDATE_LINES.join('\n'), 'pin_migration_window')}
 DB_FENCE_REFENCE_CMD="\${DB_FENCE_REFENCE_WRAPPER}"
 DB_FENCE_IDENTITY_FROM_RECORD=false
 DB_FENCE_ADOPTING=false
@@ -1305,7 +1447,16 @@ mkdir -p "\${CRONTAB_LOCK_DIR}"
 BLUE=''; GREEN=''; YELLOW=''; RED=''; BOLD=''; RESET=''
 APP_USER="$(id -un)"
 APP_DIR='${dir}'
-DB_FENCE_DIR='${dir}'
+# o3d-secops r22: the connection-fence directory is walked to beneath a root-owned parent
+# now, so a rig that names it must name the parent it hangs off as well.
+CUTOVER_STATE_DIR="${'${CUTOVER_STATE_DIR:-'}${dir}}"
+CUTOVER_ROOT_DIR='${dir}'
+DB_FENCE_DIR='${dir}/fence'
+# o3d-secops r28: the recovery wrappers this rig's resolver publishes now take the entrypoint's
+# own cutover lock for their whole read/audit/act sequence, so the entrypoint hands them its path
+# and a rig that omitted it would be measuring a publication the shipped script cannot perform.
+LOCK_FILE='${dir}/cutover.lock'
+LEGACY_STATE_DIR_DB_FENCE_STATE="${'${CUTOVER_STATE_DIR}'}/deploy/db-connect-fence.json"
 DB_FENCE_SCRIPT='${dir}/app/scripts/fence-db-connections.mjs'
 DB_FENCE_STATE='${dir}/db-connect-fence.json'
 DATABASE_URL='postgres://app@127.0.0.1/nowhere'
@@ -1338,6 +1489,17 @@ DB_IDENTITY_DRIFT_REASON=''
 # pointed at the harness directory instead of /etc.
 ${fenceProtectedLibrary(dir)}
 ${shellFunction(INSTALL_SOURCE, 'resolve_fence_script')}
+${shellFunction(CUTOVER_NS_LIB, 'dir_is_private_to_this_run')}
+${shellFunction(INSTALL_SOURCE, 'db_fence_helper')}
+# o3d-secops r32: and the three the migration binding is made of -- the drop to the application
+# account carrying MIGRATION_DATABASE_URL, and the two gates that read db_fence_migration_bind() and
+# db_fence_migration_witnessed(). Lifted rather than stubbed for the reason everything else
+# here is: fence_db_connections() CALLS the first of them, so a rig without it would measure
+# an ordering the shipped script does not have.
+${shellFunction(INSTALL_SOURCE, 'db_fence_migration_helper')}
+${shellFunction(INSTALL_SOURCE, 'bind_migration_to_fenced_server')}
+${shellFunction(INSTALL_SOURCE, 'require_migration_landed_on_fenced_server')}
+${shellFunction(INSTALL_SOURCE, 'pin_migration_window')}
 # o3d-2sm1.5 r35: install.sh's resolver refuses outright on a FIRST INSTALL, which performs no
 # credentialed fence execution. Every harness below is an UPGRADE cutover — that is what they are
 # for — so the flag is named here with the value the upgrade branch runs under. Named rather than
@@ -1368,8 +1530,8 @@ for (const entry of FENCE_HARNESS) {
       const program = [
         'set -euo pipefail',
         entry.preamble(dir),
-        shellFunction(entry.source, 'ensure_cutover_state_dirs'),
-        shellFunction(entry.source, 'ensure_cutover_state_dirs'),
+        CUTOVER_DIR_PRIMITIVES,
+        CUTOVER_DIR_PRIMITIVES,
       shellFunction(entry.source, 'fence_db_connections'),
         'fence_db_connections',
         'echo "REACHED THE MIGRATION"',
@@ -1388,6 +1550,151 @@ for (const entry of FENCE_HARNESS) {
       assert.notEqual(status, 0, 'exit 3 from the fence script must abort the cutover')
       assert.ok(!output.includes('REACHED THE MIGRATION'), 'and nothing after it may run')
       assert.match(output, /COULD NOT BE FENCED/, 'and it must say the database is not held closed')
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  test(`${entry.name} publishes the authority before it revokes, and root clears it after the release`, () => {
+    /**
+     * o3d-secops r23, Codex CRITICAL — THE WHOLE CYCLE, THROUGH THE SHIPPED SHELL.
+     *
+     * The ordering property the helper used to own is now the caller's: a REVOKE is a committed
+     * transaction that outlives a power cut, this record is the only thing that undoes it, and so
+     * the record has to be DURABLE BEFORE the revoke is issued. db_fence_raise() plans, hands the
+     * plan to the privileged validator, and only then invokes `--fence`.
+     *
+     * OBSERVED AT THE HELPER, not asserted from the source: the stub records, for each mode, what
+     * was at the authority path at the moment it ran. A publication ordered after the revoke would
+     * show `--fence` running with nothing there.
+     */
+    const dir = mkdtempSync(join(tmpdir(), 'ims-fence-cycle-'))
+    try {
+      const log = join(dir, 'modes.json')
+      // THE STUB IS WRITTEN OVER writeFenceCheckout()'s, not appended to it: the shared plan
+      // responder exits on `--plan` before anything else runs, and what this test is measuring is
+      // the ORDER of the three invocations, so it has to see that one too.
+      const helper = writeFenceCheckout(dir, '')
+      writeFileSync(helper, [
+        "import { appendFileSync, existsSync, readFileSync } from 'node:fs'",
+        "const state = process.argv.find((a) => a.startsWith('--state-file='))?.slice('--state-file='.length) ?? ''",
+        `appendFileSync(${JSON.stringify(log)}, JSON.stringify({`,
+        "  mode: process.argv.find((a) => a.startsWith('--') && !a.includes('=')),",
+        '  authority: existsSync(state) ? JSON.parse(readFileSync(state, "utf8")) : null,',
+        "}) + '\\n')",
+        "if (process.argv.includes('--plan')) {",
+        "  process.stdout.write(JSON.stringify({",
+        "    database: 'imsdb', owner_role: 'imsapp', app_role: 'imsapp', admin_role: 'deployadmin',",
+        "    revoked: ['PUBLIC', 'imsapp'], datacl_before: null, fenced_at: '2026-01-01T00:00:00.000Z',",
+        "  }) + '\\n')",
+        '}',
+        // o3d-secops r32: STAMPED, because the shipped `--print-migration-url` stamps. Root reads the
+        // nonce back out of this URL and asks the witness about that value, so a stub that emitted a
+        // bare URL would exercise the "this run composed a migration it cannot place" refusal on every
+        // ordinary cutover instead of the cutover.
+        "if (process.argv.includes('--print-migration-url')) process.stdout.write(`postgres://admin@127.0.0.1/nowhere?application_name=ims-migration-${process.argv.find((a) => a.startsWith('--migration-nonce='))?.slice('--migration-nonce='.length) ?? ''}\\n`)",
+        // THE WITNESS PROTOCOL, EMULATED (o3d-secops r31). The ordinary cutover now holds a session
+        // across the fence and the release and asks BOTH connections whether they can see it, so a
+        // stub that answered nothing here would be measuring a cutover the shipped scripts do not
+        // perform -- and this test's subject is precisely that the ordinary one still ends its own
+        // record with nobody at a terminal.
+        ...WITNESS_STUB_LINES(),
+        'process.exit(0)',
+        '',
+      ].join('\n'))
+      const program = [
+        'set -euo pipefail',
+        entry.preamble(dir),
+        CUTOVER_DIR_PRIMITIVES,
+        shellFunction(entry.source, 'fence_db_connections'),
+        shellFunction(entry.source, 'release_db_connections'),
+        'fence_db_connections',
+        'echo "AUTHORITY=$(LC_ALL=C stat -c "%a %u" "${DB_FENCE_STATE}" 2>/dev/null || echo missing)"',
+        'release_db_connections || echo "RELEASE_FAILED"',
+        '[[ -e "${DB_FENCE_STATE}" ]] && echo AUTHORITY_REMAINS || echo AUTHORITY_CLEARED',
+      ].join('\n')
+      const output = execFileSync('bash', ['-c', program], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] })
+
+      const calls = readFileSync(log, 'utf8').split('\n').filter(Boolean).map((line) => JSON.parse(line) as { mode: string; authority: { revoked: string[] } | null })
+      const plan = calls.find((call) => call.mode === '--plan')
+      const fence = calls.find((call) => call.mode === '--fence')
+      const release = calls.find((call) => call.mode === '--release')
+      assert.ok(plan, `the helper must be asked for a plan first:\n${output}`)
+      assert.equal(plan?.authority, null, 'and it must run before anything is recorded — it is a REQUEST, not a publication')
+      assert.ok(fence, `and then asked to fence:\n${output}`)
+      assert.deepEqual(fence?.authority?.revoked, ['PUBLIC', 'imsapp'],
+        `with the authority already complete on the medium at the moment it revokes:\n${output}`)
+      assert.match(output, new RegExp(`^AUTHORITY=644 ${harnessUid()}$`, 'm'),
+        `published root-owned and unwritable by the account that executes it:\n${output}`)
+      assert.ok(release, `and the release must reach the helper:\n${output}`)
+      assert.match(output, /^AUTHORITY_CLEARED$/m,
+        `and ROOT removes the record afterwards — the helper cannot, because an unlink is a write to that directory:\n${output}`)
+      assert.ok(!/RELEASE_FAILED/.test(output), `and the release must succeed:\n${output}`)
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  test(`${entry.name} revokes nothing when the authority cannot be published`, () => {
+    /**
+     * THE REFUSAL THAT KEEPS THE ASYMMETRY CLOSED, at the layer that now owns it. The plan is
+     * computed; the publication cannot be made; and NOTHING is revoked — the helper is never
+     * invoked with `--fence` at all.
+     *
+     * ROUTE: the shipped db_fence_raise() -> db_fence_publish_authority(), refused because the
+     * destination directory is not one only this run may write. That is the same question the
+     * validator asks in the process that does the rename; this one refuses before `node` starts,
+     * so the message names the namespace.
+     */
+    const dir = mkdtempSync(join(tmpdir(), 'ims-fence-unrecordable-'))
+    try {
+      const log = join(dir, 'modes.log')
+      // Written OVER the shared stub, which answers `--plan` and exits before anything else can
+      // record that it was asked — and what this test is measuring is which modes ran at all.
+      const helper = writeFenceCheckout(dir, '')
+      writeFileSync(helper, [
+        "import { appendFileSync } from 'node:fs'",
+        `appendFileSync(${JSON.stringify(log)}, process.argv.slice(2).join(' ') + '\\n')`,
+        "if (process.argv.includes('--plan')) {",
+        "  process.stdout.write(JSON.stringify({",
+        "    database: 'imsdb', owner_role: 'imsapp', app_role: 'imsapp', admin_role: 'deployadmin',",
+        "    revoked: ['PUBLIC', 'imsapp'], datacl_before: null, fenced_at: '2026-01-01T00:00:00.000Z',",
+        "  }) + '\\n')",
+        '}',
+        'process.exit(0)',
+        '',
+      ].join('\n'))
+      const program = [
+        'set -euo pipefail',
+        entry.preamble(dir),
+        CUTOVER_DIR_PRIMITIVES,
+        shellFunction(entry.source, 'fence_db_connections'),
+        // The authority's directory, opened to everybody. On a real host this cannot happen —
+        // ${CUTOVER_ROOT_DIR} is created and proved by the namespace library — which is why the
+        // refusal has to be exhibited rather than argued: the mechanism must not rest on the mode
+        // of a directory being what the previous function left it.
+        // Its OWN directory: ensure_cutover_root_dir() re-asserts the mode of ${CUTOVER_ROOT_DIR}
+        // on every run, so a mode planted on that one would be corrected before this could
+        // measure anything.
+        'DB_FENCE_STATE="${CUTOVER_ROOT_DIR}/exposed/db-connect-fence.json"',
+        'mkdir -p "${CUTOVER_ROOT_DIR}/exposed"',
+        'chmod 777 "${CUTOVER_ROOT_DIR}/exposed"',
+        // A SUBSHELL, because `die` is `exit`: without it the refusal ends this rig and the
+        // post-conditions below it are never observed.
+        '( fence_db_connections ) || echo "FENCE_REFUSED"',
+        'echo "CALLS=$(tr "\\n" ";" < ' + JSON.stringify(log) + ' 2>/dev/null || true)"',
+      ].join('\n')
+      // BOTH STREAMS: the refusal is on stderr, which is where a refusal belongs and where a
+      // stdout-only capture would silently stop seeing it.
+      const run = spawnSync('bash', ['-c', program], { encoding: 'utf8' })
+      const output = `${run.stdout ?? ''}${run.stderr ?? ''}`
+      assert.match(output, /--plan/, `the plan must have been computed, or this test measures nothing:\n${output}`)
+      assert.ok(!/CALLS=[^\n]*--fence/.test(output),
+        `and NOTHING may be revoked when the record that undoes it could not be published:\n${output}`)
+      assert.match(output, /not a directory only this run may write/,
+        `and the refusal must name what it could not establish:\n${output}`)
+      assert.match(output, /Refusing to revoke CONNECT/,
+        `and say that this is why nothing was revoked:\n${output}`)
     } finally {
       rmSync(dir, { recursive: true, force: true })
     }
@@ -1412,8 +1719,8 @@ for (const entry of FENCE_HARNESS) {
       const program = [
         'set -euo pipefail',
         entry.preamble(dir),
-        shellFunction(entry.source, 'ensure_cutover_state_dirs'),
-        shellFunction(entry.source, 'ensure_cutover_state_dirs'),
+        CUTOVER_DIR_PRIMITIVES,
+        CUTOVER_DIR_PRIMITIVES,
       shellFunction(entry.source, 'fence_db_connections'),
         'fence_db_connections',
         'echo "FENCE_UP=${DB_FENCE_UP} MIGRATION_URL=${MIGRATION_DATABASE_URL}"',
@@ -1452,8 +1759,8 @@ for (const entry of FENCE_HARNESS) {
       const program = [
         'set -euo pipefail',
         entry.preamble(dir),
-        shellFunction(entry.source, 'ensure_cutover_state_dirs'),
-        shellFunction(entry.source, 'ensure_cutover_state_dirs'),
+        CUTOVER_DIR_PRIMITIVES,
+        CUTOVER_DIR_PRIMITIVES,
       shellFunction(entry.source, 'fence_db_connections'),
         'fence_db_connections',
         'echo "REACHED THE MIGRATION"',
@@ -1504,6 +1811,72 @@ function fenceStub(dir: string, exitCode: number): void {
       '',
     ].join('\n'),
   )
+}
+
+/**
+ * A STUB THAT SPEAKS THE r31 WITNESS PROTOCOL (o3d-secops r31, Codex HIGH 1).
+ *
+ * The shipped helper holds a session across the fence and the release and reports, on each of its
+ * OWN connections, whether it can see that session. There is no PostgreSQL in these harnesses, so
+ * the three lines root reads are produced directly -- what is under test here is the SHELL: that
+ * root issues a challenge, passes it to `--release`, reads the verdict out of the release's own
+ * output, and lets that decide whether the record is removed.
+ *
+ * `verdict` is what `--release` reports. 'yes' is the ordinary cutover; 'no' is a release that
+ * landed somewhere the witness is not, which is the whole finding.
+ */
+function WITNESS_STUB_LINES(
+  verdict: 'yes' | 'no' = 'yes',
+  extraStdout: string[] = [],
+  { sightings = 1, binding = 'colocated' }: { sightings?: number; binding?: 'colocated' | 'absent' } = {},
+): string[] {
+  return [
+    "if (process.argv.includes('--witness')) {",
+    "  const nonce = process.argv.find((a) => a.startsWith('--witness-nonce='))?.slice('--witness-nonce='.length) ?? ''",
+    "  process.stdout.write(`WITNESS_READY ${nonce}\\n`)",
+    "  let buffer = ''",
+    "  process.stdin.on('data', (chunk) => {",
+    "    buffer += chunk.toString('utf8')",
+    "    let index",
+    "    while ((index = buffer.indexOf('\\n')) >= 0) {",
+    "      const line = buffer.slice(0, index).trim()",
+    "      buffer = buffer.slice(index + 1)",
+    "      const hit = /^challenge ([0-9a-f]+)$/.exec(line)",
+    "      if (hit) process.stdout.write(`WITNESS_HELD ${hit[1]}\\n`)",
+    // o3d-secops r32: the migration binding's two commands. `watch` arms the sampler; `sightings`
+    // reports how many distinct backends carrying the migration's stamp it has seen since. The
+    // count is a parameter so a test can exhibit the case where the migration went elsewhere.
+    "      const w = /^watch ([0-9a-f]+)$/.exec(line)",
+    "      if (w) process.stdout.write(`WITNESS_WATCHING ${w[1]}\\n`)",
+    "      const g = /^sightings ([0-9a-f]+)$/.exec(line)",
+    `      if (g) process.stdout.write(\`WITNESS_SIGHTINGS \${g[1]} ${sightings}\\n\`)`,
+    "    }",
+    "  })",
+    // TOP-LEVEL AWAIT RATHER THAN `return`: this stub is an .mjs, so `return` at module scope is a
+    // syntax error, and the witness must not fall through to the `process.exit(0)` below it.
+    "  await new Promise((resolve) => process.stdin.on('end', resolve))",
+    "  process.exit(0)",
+    "}",
+    // THE r32 GRAMMAR: a whole line, naming the exact nonce the caller passed. The stub reads the
+    // nonce off its own argv rather than being told one, so a shell that passed a DIFFERENT nonce
+    // to `--release` than it later looked for would be caught here rather than papered over.
+    "const lockArg = process.argv.find((a) => a.startsWith('--witness-lock='))?.slice('--witness-lock='.length) ?? ''",
+    "const challengeArg = process.argv.find((a) => a.startsWith('--witness-challenge='))?.slice('--witness-challenge='.length) ?? ''",
+    // o3d-secops r32: the pre-DDL probe. It reports on the same machine channel, in the same
+    // grammar, naming the migration nonce root read back out of the URL it composed -- so a shell
+    // that asked about a different nonce than it stamped would fail here rather than pass quietly.
+    "const migrationArg = process.argv.find((a) => a.startsWith('--migration-nonce='))?.slice('--migration-nonce='.length) ?? ''",
+    `if (process.argv.includes('--bind-migration')) {`,
+    `  process.stdout.write(\`MIGRATION_BINDING \${migrationArg} ${binding}\\n\`)`,
+    `  process.exit(${'colocated' === binding ? 0 : 1})`,
+    `}`,
+    "if (process.argv.includes('--fence') && lockArg) process.stdout.write(`FENCE_WITNESS ${lockArg} colocated\\n`)",
+    `if (process.argv.includes('--release') && challengeArg) process.stdout.write(\`RELEASE_WITNESS \${challengeArg} ${verdict === 'yes' ? 'colocated' : 'absent'}\\n\`)`,
+    // AND WHATEVER ELSE THE CALLER WANTS ON THE CHANNEL. This is how the hostile-identifier and
+    // conflicting-verdict cases below put text on stdout that a substring reader would have taken
+    // for a verdict; an empty list is the ordinary cutover and changes nothing.
+    ...extraStdout,
+  ]
 }
 
 function runShell(program: string): { status: number; output: string } {
@@ -1980,7 +2353,7 @@ systemctl() { [ "$1" = daemon-reload ] && return 1; return 0; }
 ] as const
 
 function runFenceInstallHarness(entry: (typeof FENCE_INSTALL_CASES)[number], prelude: string) {
-  const dir = mkdtempSync(join(tmpdir(), 'ims-fenceinstall-'))
+  const { outer, dir } = anchoredStateDir('ims-fenceinstall-')
   try {
     const program = [
       'set -uo pipefail',
@@ -2002,7 +2375,7 @@ function runFenceInstallHarness(entry: (typeof FENCE_INSTALL_CASES)[number], pre
       dir,
     }
   } finally {
-    rmSync(dir, { recursive: true, force: true })
+    rmSync(outer, { recursive: true, force: true })
   }
 }
 
@@ -2040,7 +2413,7 @@ for (const entry of FENCE_INSTALL_CASES) {
     // leave a marker rather than a fence nobody can undo. So it initially says `absent`, and the
     // install has to correct it — otherwise the file the next run and the operator read describes
     // a fence that was in fact installed as one that was not.
-    const dir = mkdtempSync(join(tmpdir(), 'ims-fenceok-'))
+    const { outer, dir } = anchoredStateDir('ims-fenceok-')
     try {
       const preamble = entry
         .preamble(dir)
@@ -2072,7 +2445,7 @@ for (const entry of FENCE_INSTALL_CASES) {
         'the marker must record the fence that is actually loaded, not the one that was intended',
       )
     } finally {
-      rmSync(dir, { recursive: true, force: true })
+      rmSync(outer, { recursive: true, force: true })
     }
   })
 }
@@ -2111,6 +2484,76 @@ function callContinuation(lines: string[], index: number): string {
   return text
 }
 
+/** The 1-based index of the last physical line of the logical statement starting at `index`. */
+function statementEnd(lines: string[], index: number): number {
+  let cursor = index
+  while (/\\\s*$/.test(lines[cursor]) && cursor + 1 < lines.length) cursor += 1
+  return cursor
+}
+
+/**
+ * WHERE A CONSUMER'S NON-ZERO EXIT ENDS UP (o3d-secops r34, Codex HIGH 2).
+ *
+ * Two shapes are allowed and they are not interchangeable, which is the whole finding:
+ *
+ *   direct    `... || die "..."`. The step dies where it stands. Correct only for a step that has
+ *             NO placement after it, because a `die` before the pin is exactly how r33's chain
+ *             came apart -- a redirected consumer partially applied DDL, exited non-zero, and its
+ *             placement never ran.
+ *   captured  `... || <name>=$?`, and the FIRST read of `<name>` anywhere below is a fatal
+ *             propagation: `[[ "${name}" -eq 0 ]] || die` or `if [[ "${name}" -ne 0 ]]; then ...
+ *             die ... fi`. "First read" is the load-bearing word. A capture whose status is read
+ *             once to print something and only later to die would be a status that had already
+ *             licensed a message, and a capture never read at all is `|| true` wearing a variable.
+ *
+ * Anything else -- `|| true`, `|| warn`, a bare statement under `set -e`, a capture nobody reads
+ * -- is reported as `none`, and every caller treats that as a failure.
+ */
+function consumerFailureDisposition(lines: string[], index: number): {
+  shape: 'direct' | 'captured' | 'none'
+  status: string | null
+  detail: string
+} {
+  const continuation = callContinuation(lines, index)
+  if (/\|\|\s*(\\\s*\n\s*)?(true|:|warn|info|success|echo)\b/.test(continuation)) {
+    return { shape: 'none', status: null, detail: `a no-op continuation swallows the failure:\n${continuation}` }
+  }
+  if (/\|\|\s*(\\\s*\n\s*)?die\b/.test(continuation)) {
+    return { shape: 'direct', status: null, detail: continuation }
+  }
+  // TWO CAPTURE FORMS, and the second is not a loophole. `|| { name=$?; tail -40 "$LOG" >&2; }`
+  // keeps a diagnostic that belongs to the failure INSIDE the failing statement, where it still runs
+  // when the placement below refuses. Whatever else is in those braces is part of the same
+  // statement and cannot stand between the capture and the propagation, because "the first read"
+  // below is measured from the END of the statement.
+  const capture = /\|\|\s*(?:\\\s*\n\s*)?([A-Za-z_][A-Za-z0-9_]*)=\$\?\s*$/.exec(continuation)
+    ?? /\|\|\s*\{\s*([A-Za-z_][A-Za-z0-9_]*)=\$\?\s*;/.exec(continuation)
+  if (!capture) {
+    return { shape: 'none', status: null, detail: `neither a die nor a captured status:\n${continuation}` }
+  }
+  const status = capture[1]
+  const reference = new RegExp(`\\$\\{?${status}\\}?\\b`)
+  for (let cursor = statementEnd(lines, index) + 1; cursor < lines.length; cursor += 1) {
+    const line = lines[cursor]
+    if (/^\s*#/.test(line) || !reference.test(line)) continue
+    // The first read. It must be the fatal one, in one of the two shapes the entrypoints use.
+    if (new RegExp(`\\[\\[\\s*"\\$\\{?${status}\\}?"\\s+-eq\\s+0\\s*\\]\\]\\s*\\|\\|\\s*die\\b`).test(line)) {
+      return { shape: 'captured', status, detail: line.trim() }
+    }
+    if (new RegExp(`^\\s*if\\s+\\[\\[\\s*"\\$\\{?${status}\\}?"\\s+-ne\\s+0\\s*\\]\\]\\s*;\\s*then\\s*$`).test(line)) {
+      const body = lines.slice(cursor + 1, cursor + 8)
+      const fi = body.findIndex((entry) => /^\s*fi\s*$/.test(entry))
+      const guarded = fi === -1 ? body : body.slice(0, fi)
+      if (guarded.some((entry) => /(^|\s)die\b/.test(entry))) {
+        return { shape: 'captured', status, detail: [line, ...guarded].join('\n').trim() }
+      }
+      return { shape: 'none', status, detail: `the first read of ${status} branches but never dies:\n${[line, ...guarded].join('\n')}` }
+    }
+    return { shape: 'none', status, detail: `the first read of ${status} is not a fatal propagation:\n${line.trim()}` }
+  }
+  return { shape: 'none', status, detail: `${status} is captured and never read` }
+}
+
 for (const [name, lines, startPattern] of [
   ['deploy.sh', DEPLOY_LINES, /systemctl start|npm start/],
   ['update.sh', UPDATE_LINES, /systemctl start/],
@@ -2140,16 +2583,18 @@ for (const [name, lines, startPattern] of [
   test(`${name} STOPS when the application role cannot use the schema, rather than noting it`, () => {
     const call = realCodeLine(lines, OBJECT_ACCESS_INVOCATION)
     assert.notEqual(call, -1)
-    const continuation = callContinuation(lines, call)
 
-    assert.match(
-      continuation,
-      /\|\|\s*(\\\s*\n\s*)?die\b/,
-      'a schema the application cannot use must `die`; `|| true` was a mutation this file passed',
-    )
-    assert.ok(
-      !/\|\|\s*(true|:|warn|info|success|echo)\b/.test(continuation),
-      'and the guard must not be satisfied by a no-op continuation',
+    // THE SUBJECT IS UNCHANGED AND THE SHAPE IS WIDER (o3d-secops r34, Codex HIGH 2). This used to
+    // require `|| die` ON THE CALL, and r34 had to take that away: a `die` before the step's pin
+    // is precisely how a consumer that moved schema and then failed escaped its placement. What
+    // must still hold is that the failure is FATAL, so the two shapes are spelled out in
+    // consumerFailureDisposition() and `|| true`, `|| warn` and a captured-but-unread status are
+    // all still `none` -- the mutation this file used to name still fails it.
+    const disposition = consumerFailureDisposition(lines, call)
+    assert.notEqual(
+      disposition.shape,
+      'none',
+      `a schema the application cannot use must reach a \`die\`; \`|| true\` was a mutation this file passed: ${disposition.detail}`,
     )
   })
 
@@ -3104,7 +3549,7 @@ const R8_CASES = ARMING_TRAP_CASES.map((entry) => ({
 // FINDING 1a — the marker records the phase, and records it separately from the intent.
 // ---------------------------------------------------------------------------
 function runMarkerWriter(entry: (typeof R8_CASES)[number], state: string): string {
-  const dir = mkdtempSync(join(tmpdir(), 'ims-r8-marker-'))
+  const { outer, dir } = anchoredStateDir('ims-r8-marker-')
   try {
     const program = [
       'set -euo pipefail',
@@ -3120,7 +3565,7 @@ function runMarkerWriter(entry: (typeof R8_CASES)[number], state: string): strin
     ].join('\n')
     return execFileSync('bash', ['-c', program], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] })
   } finally {
-    rmSync(dir, { recursive: true, force: true })
+    rmSync(outer, { recursive: true, force: true })
   }
 }
 
@@ -3191,6 +3636,10 @@ function adoptionProgram(entry: (typeof R8_CASES)[number], dir: string, state: s
     parts.push('fence_dropin_file(){ echo "${FENCE_DROPIN_DIR}/${FENCE_DROPIN_NAME}"; }')
   }
   parts.push(
+    // o3d-secops r20: adoption now asks whether the marker is one this run may believe — a regular
+    // file it owns, inside a directory only it can write — before it reads a line of it. Lifted, not
+    // stubbed: a stub would make every adoption test pass over a marker anybody could have planted.
+    shellFunction(entry.source, 'fence_marker_is_trustworthy'),
     shellFunction(entry.source, 'marker_is_complete'),
     shellFunction(entry.source, 'marker_phase'),
     shellFunction(entry.source, 'predecessor_is_active'),
@@ -3211,7 +3660,7 @@ function runAdoption(
   marker: string,
   state: string,
 ): { log: string; stdout: string; status: number; markerExists: boolean; dropinExists: boolean; backupExists: boolean } {
-  const dir = mkdtempSync(join(tmpdir(), 'ims-r8-adopt-'))
+  const { outer, dir } = anchoredStateDir('ims-r8-adopt-')
   try {
     const dropinDir = join(dir, 'dropin')
     execFileSync('mkdir', ['-p', dropinDir])
@@ -3253,7 +3702,7 @@ function runAdoption(
       backupExists: existsSync(join(dir, 'crontab.bak')),
     }
   } finally {
-    rmSync(dir, { recursive: true, force: true })
+    rmSync(outer, { recursive: true, force: true })
   }
 }
 
@@ -3778,7 +4227,17 @@ BACKUP_FILE=''
 SERVICE_UNITS=(app.service)
 CRON_BACKUP_CREATED=false
 CRON_FENCED=false
-DB_FENCE_STATE="\${CUTOVER_STATE_DIR}/deploy/db-connect-fence.json"
+# o3d-secops r22: the shared lock and the connection-fence directory live under a ROOT-OWNED
+# parent now, not under \${CUTOVER_STATE_DIR}, which the installer hands to \${APP_USER}. The rig
+# points that parent inside its own anchored temporary tree for the same reason it points every
+# other root there: an unprivileged harness cannot write /etc, and what is being measured is the
+# mechanism, not the literal.
+CUTOVER_ROOT_DIR='${dir}/cutover-root'
+DB_FENCE_DIR="\${CUTOVER_ROOT_DIR}/db-fence"
+DB_FENCE_STATE="\${DB_FENCE_DIR}/db-connect-fence.json"
+LEGACY_STATE_DIR_DB_FENCE_STATE="\${CUTOVER_STATE_DIR}/deploy/db-connect-fence.json"
+LOCK_FILE="\${CUTOVER_ROOT_DIR}/cutover.lock"
+LEGACY_CUTOVER_STATE_DIR='${dir}/ims-deploy'
 DB_FENCE_RELEASE_CMD='node fence-db-connections.mjs --release --app-host=localhost --app-port=5432 --app-user=imsapp --app-database=imsdb'
 # o3d-2sm1.5 r19: the application's connection identity, which the helper is TOLD and never works
 # out. Every entrypoint passes it on every fence invocation, and refuses when it cannot read it —
@@ -3814,7 +4273,11 @@ die(){ echo "DIE: $*" >&2; exit 1; }
 const R9_BARRIER_SHIMS = `
 BARRIERS="\${CUTOVER_STATE_DIR}/barriers.log"
 : > "\${BARRIERS}"
-sync(){ echo "sync \$*" >> "\${BARRIERS}"; command sync "\$@"; }
+# o3d-czpy r2: publish_durable_file() flushes its PINNED parent as \`..\` — the point of the fix
+# is that it never names the destination again — so an operand that is a directory is recorded by
+# the physical path it resolves to. A file operand (the temporary) is recorded verbatim, and the
+# no-operand fallback stays distinguishable.
+sync(){ local _p=""; if [[ -n "\${1:-}" ]]; then _p="\$(cd "\${1}" 2>/dev/null && pwd -P)" || _p=""; fi; echo "sync \${_p:-\$*}" >> "\${BARRIERS}"; command sync "\$@"; }
 mv(){ echo "mv \$*" >> "\${BARRIERS}"; command mv "\$@"; }
 crontab(){
   echo "crontab \$*" >> "\${BARRIERS}"
@@ -3832,13 +4295,50 @@ function runR9(
   body: string,
   extra = '',
 ): { stdout: string; status: number; dir: string; files: string[]; marker: string | null; barriers: string[] } {
-  const dir = mkdtempSync(join(tmpdir(), 'ims-r9-'))
+  const { outer, dir } = anchoredStateDir('ims-r9-')
   try {
     const program = [
       'set -euo pipefail',
       R9_MARKER_PREAMBLE(dir),
       extra,
-      ...functions.map((name) => shellFunction(entry.source, name)),
+      // o3d-czpy: publish_durable_file() stages through this directory, and it is lifted rather
+      // than re-typed for the same reason its functions are.
+      shellConstant(entry.source, 'PUBLISH_STAGE_DIRNAME'),
+      // o3d-rn10: publish_durable_file() resolves its destination from a trusted ancestor now, so
+      // wherever it is asked for, the table and the walk come with it. Named here rather than at
+      // each call site: a rig missing them fails every publication with "command not found", and
+      // every "the publish must fail" test then passes for the wrong reason.
+      ...functions
+        .flatMap((name) => (name === 'publish_durable_file'
+          ? ['publish_trust_root_candidates', 'pin_publish_root_parent', 'publish_root_anchored', 'publish_trust_root', 'refuse_symlinked_root', 'pin_dir_beneath_root', name]
+          : [name]))
+        // o3d-secops r20: the same edges for the relocated marker. Every writer of it creates its
+        // root-owned directory first, and the legacy import now moves a marker out of
+        // ${CUTOVER_STATE_DIR} before it looks at the /var/lib/ims-deploy namespace at all.
+        .flatMap((name) => (name === 'write_fence_marker' || name === 'write_cutover_marker'
+          ? ['ensure_fence_marker_dir', name]
+          : name === 'import_legacy_cutover_state'
+            // o3d-secops r23: and the connection-fence record it no longer imports. Naming it is
+            // an edge like any other; a rig without it fails with "command not found" and every
+            // "the import must succeed" assertion below would then pass for the wrong reason.
+            ? ['ensure_fence_marker_dir', 'import_relocated_fence_marker', 'warn_legacy_namespace_db_fence_state', name]
+            : [name]))
+        // o3d-secops r22: the namespace library's own edges. ensure_cutover_state_dirs() no longer
+        // `mkdir -p`s anything — it walks to the directory and applies the owner and the mode to the
+        // descriptor it lands on — and acquire_cutover_lock() opens, judges and locks a descriptor.
+        // A rig that lifted either without the walk would fail with "command not found", and every
+        // "the run must refuse" assertion below it would then pass for the wrong reason.
+        .flatMap((name) => (name === 'ensure_cutover_state_dirs'
+          ? ['enter_service_subdir', 'own_service_subdir', 'ensure_cutover_root_dir', name]
+          : name === 'acquire_cutover_lock'
+            ? ['enter_service_subdir', 'own_service_subdir', 'ensure_cutover_root_dir', 'ensure_cutover_state_dirs',
+               'prepare_cutover_lock_file', 'verify_held_lock', 'narrow_held_lock', 'held_lock_mode',
+               'lock_mode_is_private', 'rotate_cutover_lock_inode', 'dir_is_private_to_this_run',
+               'acquire_legacy_namespace_lock', 'state_pre_r22_cutovers_are_not_excluded',
+               'warn_pre_r22_db_fence_state', name]
+            : [name]))
+        .filter((name, index, all) => all.indexOf(name) === index)
+        .map((name) => shippedShellFunction(entry.source, name)),
       body,
     ].join('\n')
     let stdout = ''
@@ -3861,7 +4361,7 @@ function runR9(
       barriers: existsSync(barrierPath) ? readFileSync(barrierPath, 'utf8').split('\n').filter(Boolean) : [],
     }
   } finally {
-    rmSync(dir, { recursive: true, force: true })
+    rmSync(outer, { recursive: true, force: true })
   }
 }
 
@@ -3873,8 +4373,11 @@ for (const entry of R9_SCRIPTS) {
     const result = runR9(entry, ['fsync_path', 'publish_durable_file', entry.writer], `${entry.writer} "under test"`, R9_BARRIER_SHIMS)
     assert.equal(result.status, 0, `the writer must succeed:\n${result.stdout}`)
 
-    const dataBarrier = result.barriers.findIndex((line) => /^sync .*DEPLOY-FENCED\.\w+$/.test(line))
-    const rename = result.barriers.findIndex((line) => /^mv -f .*DEPLOY-FENCED\.\w+ .*DEPLOY-FENCED$/.test(line))
+    // o3d-czpy: the temporary is made INSIDE the root-owned staging directory and named
+    // relative to it, so it is `./publish.XXXXXX` and no longer `DEPLOY-FENCED.XXXXXX` beside
+    // the marker. The ordering being measured is unchanged.
+    const dataBarrier = result.barriers.findIndex((line) => /^sync \.\/publish\.\w+$/.test(line))
+    const rename = result.barriers.findIndex((line) => /^mv -f -T \.\/publish\.\w+ .*DEPLOY-FENCED$/.test(line))
     const dirBarrier = result.barriers.findIndex((line) => new RegExp(`^sync ${result.dir}$`).test(line))
 
     assert.notEqual(dataBarrier, -1, `the temporary must be fsynced: ${result.barriers.join(' | ')}`)
@@ -3909,10 +4412,17 @@ for (const entry of R9_SCRIPTS) {
       result.marker !== null && /^marker_complete=1$/m.test(result.marker),
       'and it is still a complete marker, not a truncated one',
     )
+    // o3d-czpy: temporaries live in the root-owned staging directory now, so that is where a
+    // leaked one would be. Checking only for `DEPLOY-FENCED.*` beside the marker would pass
+    // whatever the publisher did.
+    const staged = existsSync(join(result.dir, '.ims-publish'))
+      ? readdirSync(join(result.dir, '.ims-publish'))
+      : []
+    assert.deepEqual(staged, [], `and no temporary may be left behind in the staging directory: ${staged.join(', ')}`)
     assert.deepEqual(
       result.files.filter((name) => name.startsWith('DEPLOY-FENCED.')),
       [],
-      `and no temporary may be left behind: ${result.files.join(', ')}`,
+      `nor beside the marker: ${result.files.join(', ')}`,
     )
   })
 
@@ -4139,11 +4649,19 @@ for (const entry of R8_CASES) {
 // namespace holding none of it.
 // ---------------------------------------------------------------------------
 
-/** The right-hand side of one top-level assignment, as the script actually writes it. */
+/**
+ * The right-hand side of the one SCRIPT-SCOPE assignment, as the script actually writes it.
+ *
+ * Resolved through shellConstant() rather than by an anchor on the name (o3d-secops): most of
+ * these declarations begin `readonly` now, and a `^NAME=` match would simply have stopped finding
+ * them. shellConstant() also refuses a script that assigns the name twice, which the anchor would
+ * have taken the first of.
+ */
 function assignment(source: string, name: string): string {
-  const match = new RegExp(`^${name}=(.*)$`, 'm').exec(source)
-  assert.notEqual(match, null, `the script must define ${name}`)
-  return (match as RegExpExecArray)[1]
+  const line = shellConstant(source, name)
+  const at = line.indexOf(`${name}=`)
+  assert.notEqual(at, -1, `the script must define ${name}`)
+  return line.slice(at + name.length + 1)
 }
 
 test('all three entrypoints resolve the cutover namespace from the same expression', () => {
@@ -4155,15 +4673,46 @@ test('all three entrypoints resolve the cutover namespace from the same expressi
   )
 
   // And every path that decides recovery hangs off it, in the same shape everywhere.
-  for (const key of ['FENCE_FILE', 'CRON_BACKUP', 'DB_FENCE_DIR', 'LOCK_FILE'] as const) {
+  for (const key of ['CRON_BACKUP', 'DB_FENCE_DIR', 'LOCK_FILE'] as const) {
     const values = R9_SCRIPTS.map((entry) => assignment(entry.source, key))
     assert.equal(
       new Set(values).size,
       1,
       `${key} must be the same path in all three:\n${R9_SCRIPTS.map((e, i) => `${e.name}: ${values[i]}`).join('\n')}`,
     )
-    assert.match(values[0], /\$\{CUTOVER_STATE_DIR\}/, `${key} must derive from the shared namespace, not a private directory`)
+    // o3d-secops r22, Codex CRITICAL x2: two of these three left ${CUTOVER_STATE_DIR}, and it is
+    // the same reason the marker left it in r20 — it is the application's own data directory, so
+    // ${APP_USER} owns every name directly beneath it, and both of these were root-side targets.
+    // ONE path everywhere is still the requirement; which shared parent it hangs off is the fix.
+    const root = key === 'CRON_BACKUP' ? /\$\{CUTOVER_STATE_DIR\}/ : /\$\{CUTOVER_ROOT_DIR\}/
+    assert.match(values[0], root, `${key} must derive from a shared namespace, not a private directory`)
   }
+
+  // THE MARKER IS THE ONE THAT LEFT, AND DELIBERATELY (o3d-secops r20, Codex CRITICAL). One path
+  // everywhere is still the requirement — a fence one entrypoint writes and another cannot see is
+  // the failure the shared namespace exists to end — but ${CUTOVER_STATE_DIR} is the application's
+  // own data directory, and `unlink(2)`/`rename(2)` ask for write permission ON THE PARENT and
+  // nothing about the file. A root-owned 0600 marker in a directory ${APP_USER} owns is a marker
+  // ${APP_USER} can delete, and deleting it lifts the reboot fence. So it is under a root-owned
+  // literal, and that it is a LITERAL rather than an override is the point: an override only a
+  // root-owned source may set is indistinguishable from no override.
+  for (const key of ['FENCE_MARKER_DIR', 'FENCE_FILE', 'LEGACY_STATE_DIR_FENCE_FILE'] as const) {
+    const values = R9_SCRIPTS.map((entry) => assignment(entry.source, key))
+    assert.equal(
+      new Set(values).size,
+      1,
+      `${key} must be the same path in all three:\n${R9_SCRIPTS.map((e, i) => `${e.name}: ${values[i]}`).join('\n')}`,
+    )
+  }
+  const markerDir = R9_SCRIPTS.map((entry) => assignment(entry.source, 'FENCE_MARKER_DIR'))[0]
+  assert.equal(markerDir, '"/etc/ims-cutover"',
+    `the marker's directory must be a root-owned literal, not an expression anything else can aim: ${markerDir}`)
+  assert.match(assignment(R9_SCRIPTS[0].source, 'FENCE_FILE'), /^"\$\{FENCE_MARKER_DIR\}\//,
+    'and the marker must hang off it rather than spelling a second path')
+  // AND THE PATH IT LEFT IS STILL NAMED, because an installation fenced before this round has its
+  // marker there and a drop-in that asserts on it.
+  assert.match(assignment(R9_SCRIPTS[0].source, 'LEGACY_STATE_DIR_FENCE_FILE'), /\$\{CUTOVER_STATE_DIR\}/,
+    'the pre-r20 marker path must still be derived from the shared namespace, or an upgrade cannot find it')
 
   // The connection-fence state is one level down, and also shared.
   const fenceStates = R9_SCRIPTS.map((entry) => assignment(entry.source, 'DB_FENCE_STATE'))
@@ -4173,9 +4722,398 @@ test('all three entrypoints resolve the cutover namespace from the same expressi
   for (const entry of R9_SCRIPTS) {
     const privatePaths = entry.source
       .split(/\r?\n/)
-      .filter((line) => /^(FENCE_FILE|CRON_BACKUP|DB_FENCE_STATE|DB_FENCE_DIR|LOCK_FILE)=/.test(line))
-      .filter((line) => !line.includes('${CUTOVER_STATE_DIR}') && !line.includes('${DB_FENCE_DIR}'))
+      .filter((line) => /^(CRON_BACKUP|DB_FENCE_STATE|DB_FENCE_DIR|LOCK_FILE)=/.test(line))
+      .filter((line) => !line.includes('${CUTOVER_STATE_DIR}') && !line.includes('${CUTOVER_ROOT_DIR}') && !line.includes('${DB_FENCE_DIR}'))
     assert.deepEqual(privatePaths, [], `${entry.name} still resolves cutover state outside the shared namespace: ${privatePaths}`)
+  }
+})
+
+
+// ---------------------------------------------------------------------------
+// THE MARKER'S PARENT (o3d-secops r20, Codex CRITICAL)
+//
+// ${FENCE_FILE} lived in ${CUTOVER_STATE_DIR} — the application's own data directory, which
+// section 8 hands to ${APP_USER} — and was protected by being root-owned and 0600. That protects
+// its BYTES. `unlink(2)` and `rename(2)` ask for write permission ON THE PARENT and ask nothing at
+// all about the file, so the account the fence exists to stop could remove the marker (which lifts
+// the `AssertPathExists=!` on the next boot) or move it aside and leave one of its own at the name
+// (which adoption reads as a record of what the interrupted privileged run did).
+//
+// WHAT THIS HARNESS CAN AND CANNOT SHOW, STATED RATHER THAN GLOSSED. It runs as ONE account, so
+// "${APP_USER} cannot, and root can" is not measurable here — that half rests on the same argument
+// the staging-directory prune rests on. What IS measured, for real and on a real filesystem: the
+// directory the shipped function creates and the modes it ends up with; the kernel's own answer to
+// "may this name be removed", which is a question about the parent's write bit and not about the
+// file (asserted only when this harness is unprivileged, because root bypasses it); every shape the
+// account could leave at the marker's name being REFUSED rather than adopted; and the relocation
+// itself, run against real files, leaving the host fenced at every instant.
+// ---------------------------------------------------------------------------
+
+/** The uid this harness runs as. `process.getuid` is optional in the platform typings — on a
+ *  platform that does not have it these tests cannot run at all, so its absence is a refusal
+ *  rather than a value to guess. */
+function harnessUid(): number {
+  assert.ok(typeof process.getuid === 'function', 'these tests measure ownership and need a uid')
+  return process.getuid!()
+}
+
+/** THE DESCRIPTOR HELPER THE RELOCATION READS ITS SOURCE THROUGH (o3d-secops r21). Named here for
+ *  the reason install.sh's own rigs name ${IMS_CHOWN_TREE_HELPER}: these harnesses run the shipped
+ *  functions OUTSIDE the shipped file, so there is no ${BASH_SOURCE} for the default
+ *  `${IMS_SCRIPT_LIB_DIR}/pin-source-file.mjs` to resolve from. It is the shipped helper, not a
+ *  stand-in; that the entrypoints reach it by that default is asserted from the source below. */
+const PIN_SOURCE_HELPER = join(process.cwd(), 'scripts/lib/pin-source-file.mjs')
+
+/** Where the relocated marker lives in these harnesses: a directory of the run's own, named as a
+ *  publication trust root exactly as /etc/ims-cutover is in production (it IS
+ *  ${DB_ENV_SNAPSHOT_DIR} there, which is why no new root had to be added for it). */
+const FENCE_RELOCATION_EXTRA = (dir: string) => `
+LEGACY_STATE_DIR_FENCE_FILE="${dir}/DEPLOY-FENCED"
+FENCE_MARKER_DIR="${dir}/marker-dir"
+FENCE_FILE="\${FENCE_MARKER_DIR}/DEPLOY-FENCED"
+DB_ENV_SNAPSHOT_DIR="\${FENCE_MARKER_DIR}"
+`
+
+for (const entry of R9_SCRIPTS) {
+  test(`${entry.name} creates the fence marker's directory owned by the run and private to it, and refuses a symlink at its name`, () => {
+    /**
+     * ROUTE: the shipped ensure_fence_marker_dir(), run for real, over a directory that already
+     * exists at 0777 — which is what the marker's old home effectively is, since ${DATA_DIR} is
+     * handed to ${APP_USER}. What is measured is the mode and owner left behind.
+     */
+    const made = runR9(entry, ['ensure_fence_marker_dir'], [
+      'mkdir -p "${FENCE_MARKER_DIR}"',
+      'chmod 0777 "${FENCE_MARKER_DIR}"',
+      'ensure_fence_marker_dir; echo "RC=$?"',
+      'stat -c "MODE=%a OWNER=%u KIND=%F" "${FENCE_MARKER_DIR}"',
+    ].join('\n'), FENCE_RELOCATION_EXTRA('$CUTOVER_STATE_DIR'))
+    assert.match(made.stdout, /^RC=0$/m, made.stdout)
+    assert.match(made.stdout, /^MODE=700 OWNER=\d+ KIND=directory$/m,
+      `the marker's directory must end up private to the account running the cutover:\n${made.stdout}`)
+    assert.match(made.stdout, new RegExp(`^MODE=700 OWNER=${harnessUid()} `, 'm'),
+      `and owned by it:\n${made.stdout}`)
+
+    // MEASURED BY MUTATION, ROUTE STATED: the same shipped function with its chmod made a no-op,
+    // which is what leaving the marker in a directory anybody can write amounts to. The 0777 stays.
+    const mutated = runR9(entry, [], [
+      shellFunction(entry.source, 'ensure_fence_marker_dir').replace('chmod 700 "${dir}" || return 1', ': "${dir}"'),
+      'mkdir -p "${FENCE_MARKER_DIR}"',
+      'chmod 0777 "${FENCE_MARKER_DIR}"',
+      'ensure_fence_marker_dir; echo "RC=$?"',
+      'stat -c "MODE=%a" "${FENCE_MARKER_DIR}"',
+    ].join('\n'), FENCE_RELOCATION_EXTRA('$CUTOVER_STATE_DIR'))
+    assert.match(mutated.stdout, /^MODE=777$/m,
+      `without the chmod the marker sits in a directory anybody can unlink it from — that is the finding:\n${mutated.stdout}`)
+
+    // AND A SYMLINK AT THAT NAME IS A REFUSAL, not something to chmod: `mkdir -p` is happy with a
+    // link to a directory, and a chmod would then secure whatever it points at.
+    const linked = runR9(entry, ['ensure_fence_marker_dir'], [
+      'mkdir -p "${CUTOVER_STATE_DIR}/elsewhere"',
+      'chmod 0777 "${CUTOVER_STATE_DIR}/elsewhere"',
+      'ln -s "${CUTOVER_STATE_DIR}/elsewhere" "${FENCE_MARKER_DIR}"',
+      // `set -e` is on, so the status is TAKEN rather than left to abort the rig — which would make
+      // the refusal indistinguishable from a harness that fell over.
+      'rc=0; ensure_fence_marker_dir || rc=$?; echo "RC=${rc}"',
+      'stat -c "TARGET=%a" "${CUTOVER_STATE_DIR}/elsewhere"',
+    ].join('\n'), FENCE_RELOCATION_EXTRA('$CUTOVER_STATE_DIR'))
+    assert.match(linked.stdout, /^RC=1$/m, `a symlink at the marker's directory must be refused:\n${linked.stdout}`)
+    assert.match(linked.stdout, /^TARGET=777$/m,
+      `and nothing may be done to what it points at:\n${linked.stdout}`)
+  })
+
+  test(`${entry.name} refuses to adopt anything at the marker's name that this run did not publish`, () => {
+    /**
+     * Every shape the account that owns the old parent could leave at the marker's name, and the
+     * one the installer publishes. ROUTE: the shipped fence_marker_is_trustworthy(), run for real
+     * against real files, with the refusal it produces printed.
+     *
+     * The FOURTH case is the finding itself: an impeccable 0600 marker inside a directory that is
+     * group- and other-writable — which is exactly the shape ${CUTOVER_STATE_DIR} has, because the
+     * installer hands that tree to ${APP_USER}.
+     */
+    const run = runR9(entry, ['ensure_fence_marker_dir', 'fence_marker_is_trustworthy'], [
+      'check() { fence_marker_is_trustworthy && echo "$1=TRUSTED" || echo "$1=REFUSED ${FENCE_MARKER_REFUSAL}"; }',
+      'rm -rf "${FENCE_MARKER_DIR}"',
+      'check missing',
+      'ensure_fence_marker_dir',
+      'printf "phase=stopping\\nmarker_complete=1\\n" > "${FENCE_FILE}"',
+      'chmod 600 "${FENCE_FILE}"',
+      'check published',
+      'rm -f "${FENCE_FILE}"; ln -s "${CUTOVER_STATE_DIR}/planted" "${FENCE_FILE}"',
+      'printf "phase=none\\n" > "${CUTOVER_STATE_DIR}/planted"',
+      'check symlink',
+      'rm -f "${FENCE_FILE}"; mkdir "${FENCE_FILE}"',
+      'check directory',
+      'rmdir "${FENCE_FILE}"',
+      'printf "phase=stopping\\n" > "${FENCE_FILE}"; chmod 600 "${FENCE_FILE}"',
+      'chmod 0777 "${FENCE_MARKER_DIR}"',
+      'check writable_parent',
+      'chmod 700 "${FENCE_MARKER_DIR}"',
+      'chmod 0666 "${FENCE_FILE}"',
+      'check writable_marker',
+    ].join('\n'), FENCE_RELOCATION_EXTRA('$CUTOVER_STATE_DIR'))
+
+    assert.match(run.stdout, /^published=TRUSTED$/m,
+      `the marker the installer publishes must be adoptable, or nothing recovers:\n${run.stdout}`)
+    for (const name of ['missing', 'symlink', 'directory', 'writable_parent', 'writable_marker']) {
+      assert.match(run.stdout, new RegExp(`^${name}=REFUSED `, 'm'),
+        `a ${name} at the marker's name is not a record of what a privileged run did:\n${run.stdout}`)
+    }
+    assert.match(run.stdout, /^writable_parent=REFUSED .*writable by group or other/m,
+      `and the refusal must name the parent, which is the whole finding:\n${run.stdout}`)
+
+    // MEASURED BY MUTATION, ROUTE STATED: the check adoption made before this round — `[[ -f ]]`,
+    // which follows a symlink and asks nothing about who wrote what it found. Every one of those
+    // shapes is then adopted.
+    const mutated = runR9(entry, ['ensure_fence_marker_dir'], [
+      'check() { [[ -f "${FENCE_FILE}" ]] && echo "$1=TRUSTED" || echo "$1=REFUSED"; }',
+      'ensure_fence_marker_dir',
+      'printf "phase=none\\n" > "${CUTOVER_STATE_DIR}/planted"',
+      'ln -s "${CUTOVER_STATE_DIR}/planted" "${FENCE_FILE}"',
+      'check symlink',
+      'rm -f "${FENCE_FILE}"',
+      'printf "phase=stopping\\n" > "${FENCE_FILE}"; chmod 600 "${FENCE_FILE}"',
+      'chmod 0777 "${FENCE_MARKER_DIR}"',
+      'check writable_parent',
+    ].join('\n'), FENCE_RELOCATION_EXTRA('$CUTOVER_STATE_DIR'))
+    assert.match(mutated.stdout, /^symlink=TRUSTED$/m,
+      `the existence check adopts a symlink somebody else planted — that is what it replaced:\n${mutated.stdout}`)
+    assert.match(mutated.stdout, /^writable_parent=TRUSTED$/m,
+      `and a marker in a directory anybody can rewrite:\n${mutated.stdout}`)
+  })
+
+  test(`${entry.name} moves a marker left at the pre-r20 path without ever leaving the host unfenced`, () => {
+    /**
+     * AN ALREADY-FENCED INSTALL, UPGRADED. The marker is at ${CUTOVER_STATE_DIR}/DEPLOY-FENCED and
+     * the installed drop-in names that path. ROUTE: the shipped import_relocated_fence_marker(),
+     * run for real through the shipped publisher.
+     *
+     * The claim is an ORDERING: the new marker exists and the OLD ONE IS STILL THERE when the
+     * import returns, because the drop-in on disk still asserts on the old one. Only
+     * install_reboot_fence(), after it has written, reloaded and VERIFIED a drop-in naming the new
+     * path, clears it.
+     *
+     * WHAT CHANGED IN r22, AND IT IS THE OTHER HALF OF THIS TEST NOW: the marker at the new path is
+     * NOT a copy. Not one byte of the old file is read (see the r22 section at the end of this
+     * file for why no reading of it can be trusted), so what is published is composed from this
+     * run's own facts at the most conservative fence state there is. The ordering above is
+     * unchanged and is still what keeps the host fenced across the republication.
+     */
+    const moved = runR9(entry, ['fsync_path', 'publish_durable_file', 'ensure_fence_marker_dir', 'import_relocated_fence_marker'], [
+      'printf "phase=arming\\nschema_touched=false\\nmarker_complete=1\\nROOT_ONLY_BYTES=1\\n" > "${LEGACY_STATE_DIR_FENCE_FILE}"',
+      'import_relocated_fence_marker; echo "RC=$?"',
+      '[[ -f "${FENCE_FILE}" ]] && echo NEW_MARKER_PUBLISHED || echo NEW_MARKER_MISSING',
+      '[[ -f "${LEGACY_STATE_DIR_FENCE_FILE}" ]] && echo OLD_MARKER_STILL_FENCING || echo OLD_MARKER_GONE',
+      'cmp -s "${FENCE_FILE}" "${LEGACY_STATE_DIR_FENCE_FILE}" && echo SAME_BYTES || echo BYTES_DIFFER',
+      'grep -q "^ROOT_ONLY_BYTES=1$" "${FENCE_FILE}" && echo SOURCE_BYTES_REPUBLISHED || echo SOURCE_BYTES_NOT_REPUBLISHED',
+      'sed -n "s/^\\(phase\\|schema_touched\\|migration_attempted\\|legacy_marker_unauthenticated\\)=/ADOPTED_\\1=/p" "${FENCE_FILE}"',
+    ].join('\n'), FENCE_RELOCATION_EXTRA('$CUTOVER_STATE_DIR'))
+    assert.match(moved.stdout, /^RC=0$/m, moved.stdout)
+    assert.match(moved.stdout, /^NEW_MARKER_PUBLISHED$/m, `the marker must reach its new home:\n${moved.stdout}`)
+    assert.match(moved.stdout, /^BYTES_DIFFER$/m,
+      `and it must NOT be a copy of a file in the service account's own directory:\n${moved.stdout}`)
+    assert.match(moved.stdout, /^SOURCE_BYTES_NOT_REPUBLISHED$/m,
+      `not one byte of the old file may become this host's record of an interrupted deploy:\n${moved.stdout}`)
+    // AND THE THREE LINES ADOPTION ACTS ON ARE THE EXPENSIVE READING, not the old file's own. The
+    // planted marker said `arming` and `schema_touched=false`, which is the reading that leaves a
+    // service running and releases a connection fence; neither survives.
+    assert.match(moved.stdout, /^ADOPTED_phase=stopping$/m, `phase must be read the expensive way:\n${moved.stdout}`)
+    assert.match(moved.stdout, /^ADOPTED_schema_touched=true$/m, `and so must the schema:\n${moved.stdout}`)
+    assert.match(moved.stdout, /^ADOPTED_migration_attempted=true$/m, `and the intent:\n${moved.stdout}`)
+    assert.match(moved.stdout, /^ADOPTED_legacy_marker_unauthenticated=1$/m,
+      `and the marker must say those three are a policy and not a reading:\n${moved.stdout}`)
+    assert.match(moved.stdout, /^OLD_MARKER_STILL_FENCING$/m,
+      `and the old one must survive the import, because the drop-in on disk still asserts on it:\n${moved.stdout}`)
+    assert.match(moved.stdout, /NONE OF IT HAS BEEN READ/,
+      `and the operator must be told what was and was not established:\n${moved.stdout}`)
+
+    // MEASURED BY MUTATION, ROUTE STATED: the same shipped importer with the `rm -f` that
+    // import_legacy_file() performs appended to it — the obvious shape, and the dangerous one. The
+    // old marker is then gone while the installed drop-in still names it, so a reboot in the
+    // interval before the drop-in is re-pointed starts the service over the migrated schema.
+    const eager = runR9(entry, ['fsync_path', 'publish_durable_file', 'ensure_fence_marker_dir'], [
+      shellFunction(entry.source, 'import_relocated_fence_marker')
+        .replace('  return 0\n}', '  rm -f "${LEGACY_STATE_DIR_FENCE_FILE}"\n  return 0\n}'),
+      'printf "phase=stopping\\nmarker_complete=1\\n" > "${LEGACY_STATE_DIR_FENCE_FILE}"',
+      'import_relocated_fence_marker >/dev/null',
+      '[[ -f "${LEGACY_STATE_DIR_FENCE_FILE}" ]] && echo OLD_MARKER_STILL_FENCING || echo OLD_MARKER_GONE',
+    ].join('\n'), FENCE_RELOCATION_EXTRA('$CUTOVER_STATE_DIR'))
+    assert.match(eager.stdout, /^OLD_MARKER_GONE$/m,
+      `an importer that removes the old marker itself leaves the installed drop-in asserting on a file that is gone — that is the failure this ordering exists to avoid:\n${eager.stdout}`)
+
+    // AND BOTH ARE ALREADY PRESENT WITHOUT A REFUSAL, because that is what a crash between the
+    // publication and the re-pointed drop-in leaves, and it is the ordinary retry loop.
+    const both = runR9(entry, ['fsync_path', 'publish_durable_file', 'ensure_fence_marker_dir', 'import_relocated_fence_marker'], [
+      'ensure_fence_marker_dir',
+      'printf "phase=stopping\\ncanonical=1\\n" > "${FENCE_FILE}"',
+      'printf "phase=stopping\\nold=1\\n" > "${LEGACY_STATE_DIR_FENCE_FILE}"',
+      'import_relocated_fence_marker; echo "RC=$?"',
+      'grep -q "^canonical=1$" "${FENCE_FILE}" && echo CANONICAL_KEPT || echo CANONICAL_OVERWRITTEN',
+    ].join('\n'), FENCE_RELOCATION_EXTRA('$CUTOVER_STATE_DIR'))
+    assert.match(both.stdout, /^RC=0$/m, `a crash-recovery re-run must not be refused:\n${both.stdout}`)
+    assert.match(both.stdout, /^CANONICAL_KEPT$/m, `and the authoritative marker must not be overwritten:\n${both.stdout}`)
+    assert.match(both.stdout, /A cutover marker is present at BOTH/, `and it must be said out loud:\n${both.stdout}`)
+  })
+
+  test(`${entry.name} clears the pre-r20 marker only after the drop-in naming the new one is verified, and lifts both`, () => {
+    // THE ORDERING, ASSERTED IN THE SHIPPED TEXT: the removal is BELOW `REBOOT_FENCE_INSTALLED=true`,
+    // which install_reboot_fence() only reaches after publish_durable_dropin(), daemon-reload and
+    // verify_reboot_fence() have all succeeded. Above that line there is an interval in which the
+    // loaded drop-in still names the old marker.
+    const arm = shellFunction(entry.source, 'install_reboot_fence')
+    const installed = arm.indexOf('REBOOT_FENCE_INSTALLED=true')
+    const cleared = arm.indexOf('rm -f "${LEGACY_STATE_DIR_FENCE_FILE}"')
+    const verified = arm.indexOf('verify_reboot_fence')
+    assert.ok(installed !== -1 && cleared !== -1 && verified !== -1,
+      `install_reboot_fence() must verify the fence and then clear the pre-r20 marker:\n${arm}`)
+    assert.ok(verified < installed && installed < cleared,
+      `the pre-r20 marker may only be cleared once the new fence is verified:\n${arm}`)
+
+    // AND LIFTING THE FENCE LIFTS BOTH, run for real: a marker left at either path refuses the next
+    // boot, and there is then nothing left saying why.
+    const lifted = runR9(entry, ['remove_reboot_fence'], [
+      'systemctl(){ return 0; }',
+      'fence_dropin_file(){ echo "${CUTOVER_STATE_DIR}/dropin.conf"; }',
+      'FENCE_DROPIN_DIR="${CUTOVER_STATE_DIR}/dropin.d"',
+      'FENCE_DROPIN_FILE="${FENCE_DROPIN_DIR}/zz-deploy-fence.conf"',
+      'mkdir -p "${FENCE_DROPIN_DIR}" "${FENCE_MARKER_DIR}"',
+      ': > "${FENCE_DROPIN_FILE}"',
+      ': > "${FENCE_FILE}"',
+      ': > "${LEGACY_STATE_DIR_FENCE_FILE}"',
+      'remove_reboot_fence >/dev/null 2>&1 || true',
+      '[[ -e "${FENCE_FILE}" ]] && echo NEW_MARKER_REMAINS || echo NEW_MARKER_LIFTED',
+      '[[ -e "${LEGACY_STATE_DIR_FENCE_FILE}" ]] && echo OLD_MARKER_REMAINS || echo OLD_MARKER_LIFTED',
+    ].join('\n'), FENCE_RELOCATION_EXTRA('$CUTOVER_STATE_DIR'))
+    assert.match(lifted.stdout, /^NEW_MARKER_LIFTED$/m, lifted.stdout)
+    assert.match(lifted.stdout, /^OLD_MARKER_LIFTED$/m,
+      `a marker left at the pre-r20 path refuses the next boot just as well:\n${lifted.stdout}`)
+  })
+
+  test(`${entry.name} completes an ordinary install and an ordinary upgrade with the marker in its new home`, () => {
+    // AN ORDINARY INSTALL: nothing at either path. The import is a no-op, the writer creates the
+    // marker's directory itself, publishes into it, and what it published is adoptable.
+    const fresh = runR9(entry, ['fsync_path', 'publish_durable_file', 'ensure_fence_marker_dir', 'import_relocated_fence_marker',
+      'fence_marker_is_trustworthy', entry.writer], [
+      'import_relocated_fence_marker; echo "IMPORT_RC=$?"',
+      '[[ -e "${FENCE_FILE}" ]] && echo MARKER_INVENTED || echo NO_MARKER_YET',
+      // A PERMISSIVE UMASK, WHICH IS THE POINT. publish_durable_file() creates whatever components
+      // of the destination are missing, so the directory would exist either way — at whatever the
+      // ambient umask leaves. `umask 000` is what makes the difference between "the writer creates
+      // the marker's home ITSELF, root-owned and 0700" and "something created it, 0777" visible,
+      // and 0777 is precisely the shape a marker can be unlinked out of.
+      'umask 000',
+      `${entry.writer} "cutover started"; echo "WRITE_RC=$?"`,
+      'stat -c "MARKERDIR_MODE=%a" "${FENCE_MARKER_DIR}"',
+      'fence_marker_is_trustworthy && echo ADOPTABLE || echo "NOT_ADOPTABLE ${FENCE_MARKER_REFUSAL}"',
+      'grep -q "^marker_complete=1$" "${FENCE_FILE}" && echo COMPLETE || echo INCOMPLETE',
+      '[[ -e "${LEGACY_STATE_DIR_FENCE_FILE}" ]] && echo WROTE_OLD_PATH || echo OLD_PATH_UNUSED',
+    ].join('\n'), FENCE_RELOCATION_EXTRA('$CUTOVER_STATE_DIR'))
+    assert.match(fresh.stdout, /^IMPORT_RC=0$/m, fresh.stdout)
+    assert.match(fresh.stdout, /^NO_MARKER_YET$/m, `a fresh install must not invent a fence:\n${fresh.stdout}`)
+    assert.match(fresh.stdout, /^WRITE_RC=0$/m, `and the writer must create its own directory:\n${fresh.stdout}`)
+    assert.match(fresh.stdout, /^MARKERDIR_MODE=700$/m,
+      `and it must be private to this run whatever the ambient umask is, or the marker can be unlinked out of it:\n${fresh.stdout}`)
+    assert.match(fresh.stdout, /^ADOPTABLE$/m, `and publish something the next run may act on:\n${fresh.stdout}`)
+    assert.match(fresh.stdout, /^COMPLETE$/m, fresh.stdout)
+    assert.match(fresh.stdout, /^OLD_PATH_UNUSED$/m,
+      `and nothing may be written to the path inside the application's own data directory:\n${fresh.stdout}`)
+
+    // AN ORDINARY UPGRADE: a marker this round's own code left at the new path. Nothing is imported,
+    // nothing is refused, and it is adopted exactly as it was written.
+    const upgrade = runR9(entry, ['fsync_path', 'publish_durable_file', 'ensure_fence_marker_dir', 'import_relocated_fence_marker',
+      'fence_marker_is_trustworthy'], [
+      'ensure_fence_marker_dir',
+      'printf "phase=stopping\\nschema_touched=true\\nmarker_complete=1\\n" > "${FENCE_FILE}"',
+      'chmod 600 "${FENCE_FILE}"',
+      'import_relocated_fence_marker; echo "IMPORT_RC=$?"',
+      'fence_marker_is_trustworthy && echo ADOPTABLE || echo "NOT_ADOPTABLE ${FENCE_MARKER_REFUSAL}"',
+      'grep -q "^schema_touched=true$" "${FENCE_FILE}" && echo UNCHANGED || echo REWRITTEN',
+    ].join('\n'), FENCE_RELOCATION_EXTRA('$CUTOVER_STATE_DIR'))
+    assert.match(upgrade.stdout, /^IMPORT_RC=0$/m, upgrade.stdout)
+    assert.match(upgrade.stdout, /^ADOPTABLE$/m, upgrade.stdout)
+    assert.match(upgrade.stdout, /^UNCHANGED$/m, `an upgrade may not rewrite the record it is adopting:\n${upgrade.stdout}`)
+  })
+}
+
+test('all three reboot-fence drop-ins assert on the one marker, so a fence one entrypoint writes is a fence the others see', () => {
+  // THE HALF THAT WOULD BE WORSE THAN THE FINDING. ${FENCE_FILE} resolving identically in all three
+  // is asserted above; this is the other end of it — what systemd is actually told to look at. A
+  // drop-in naming a different path from the marker the same script publishes is a fence that is
+  // invisible to the run that has to lift it.
+  const asserted = R9_SCRIPTS.map((entry) => {
+    const lines = entry.source.split(/\r?\n/).filter((line) => line.startsWith('AssertPathExists='))
+    assert.equal(lines.length, 1, `${entry.name} must install exactly one reboot-fence assertion: ${lines.join(' | ')}`)
+    return lines[0]
+  })
+  assert.equal(new Set(asserted).size, 1,
+    `the three drop-ins must assert on the same marker:\n${R9_SCRIPTS.map((e, i) => `${e.name}: ${asserted[i]}`).join('\n')}`)
+  assert.equal(asserted[0], 'AssertPathExists=!${FENCE_FILE}',
+    `and on the constant rather than on a path retyped beside it: ${asserted[0]}`)
+
+  // AND EVERY ONE OF THEM ASKS WHETHER THE MARKER MAY BE BELIEVED BEFORE IT READS ONE (o3d-secops
+  // r20). The refusal is exercised for real above; what is asserted here is that adoption actually
+  // goes through it, which no run of the function on its own can show. It must come BEFORE the
+  // first line of the marker is read, so `marker_phase` is the boundary.
+  for (const entry of R9_SCRIPTS) {
+    const lines = entry.source.split(/\r?\n/)
+    const checked = lines.findIndex((line) => line.includes('fence_marker_is_trustworthy || die'))
+    // install.sh keeps its adoption in a function and its phase in a local, so the boundary is the
+    // call itself rather than one spelling of the variable it lands in.
+    const read = lines.findIndex((line) => /=\"\$\(marker_phase\)\"$/.test(line.trim()))
+    assert.ok(checked !== -1, `${entry.name} must refuse a marker it cannot trust before adopting it`)
+    assert.ok(read !== -1, `${entry.name} must still read the phase it adopts`)
+    assert.ok(checked < read,
+      `${entry.name} asks whether the marker may be believed AFTER reading it, which is no check at all`)
+
+    // AND THE RELOCATION IS LOOKED FOR ON EVERY RUN, not only on a host that used the namespace
+    // deploy.sh kept before o3d-2sm1.5. import_legacy_cutover_state() returns early when
+    // ${LEGACY_CUTOVER_STATE_DIR} is absent, so a call placed after that early return would never
+    // fire on the hosts this migration is actually for.
+    const body = shellFunction(entry.source, 'import_legacy_cutover_state')
+    const relocation = body.indexOf('import_relocated_fence_marker')
+    const earlyReturn = body.indexOf('|| return 0')
+    assert.ok(relocation !== -1, `${entry.name} must look for a marker at the pre-r20 path:\n${body}`)
+    assert.ok(earlyReturn !== -1 && relocation < earlyReturn,
+      `${entry.name} looks for it only after an early return that most hosts take:\n${body}`)
+  }
+})
+
+test('the kernel decides whether a name may be removed by the PARENT, which is the whole of the finding', () => {
+  /**
+   * NOT A CLAIM ABOUT THE SHIPPED CODE — a claim about `unlink(2)`, measured on a real filesystem,
+   * because it is the premise everything above rests on and it was the premise the previous round
+   * got wrong ("root-owned so that the service account cannot forge a fence").
+   *
+   * A file at mode 0400 that its owner cannot write is removed without complaint from a directory
+   * that is writable, and is NOT removable from one that is not. The file's mode is not consulted.
+   *
+   * ONLY WHEN UNPRIVILEGED: root bypasses the permission check entirely, so under root this would
+   * assert nothing. The run's uid is printed either way, so a suite that quietly became root does
+   * not quietly turn this into a pass.
+   */
+  const base = createTempDirSync('ims-secops-r20-unlink-')
+  const writable = join(base, 'writable')
+  const sealed = join(base, 'sealed')
+  for (const dir of [writable, sealed]) mkdirSync(dir)
+  for (const dir of [writable, sealed]) {
+    writeFileSync(join(dir, 'DEPLOY-FENCED'), 'phase=stopping\n')
+    chmodSync(join(dir, 'DEPLOY-FENCED'), 0o400)
+  }
+  chmodSync(sealed, 0o500)
+  try {
+    const removed = runShell(`rm -f ${JSON.stringify(join(writable, 'DEPLOY-FENCED'))}; echo "RC=$?"`)
+    assert.match(removed.output, /^RC=0$/m, `a 0400 file in a writable directory is removed: ${removed.output}`)
+    assert.equal(existsSync(join(writable, 'DEPLOY-FENCED')), false,
+      'the file mode protects the BYTES and says nothing about the name')
+
+    if (harnessUid() !== 0) {
+      const refused = runShell(`rm -f ${JSON.stringify(join(sealed, 'DEPLOY-FENCED'))} 2>&1; echo "RC=$?"`)
+      assert.match(refused.output, /^RC=[^0]/m, `and the same file is NOT removable from a sealed directory: ${refused.output}`)
+      assert.equal(existsSync(join(sealed, 'DEPLOY-FENCED')), true, 'the parent is what decides')
+    }
+  } finally {
+    chmodSync(sealed, 0o700)
+    rmSync(base, { recursive: true, force: true })
   }
 })
 
@@ -4184,13 +5122,24 @@ test('all three entrypoints carry the same durability and namespace primitives, 
   // this namespace split survived a round. Shared text cannot drift silently.
   for (const name of [
     'fsync_path',
+    'publish_trust_root_candidates',
+    'pin_publish_root_parent',
+    'publish_root_anchored',
+    'publish_trust_root',
+    'refuse_symlinked_root',
+    'pin_dir_beneath_root',
     'publish_durable_file',
     'publish_durable_dropin',
-    'ensure_cutover_state_dirs',
-    'acquire_cutover_lock',
     'marker_is_complete',
     'import_legacy_file',
     'import_legacy_cutover_state',
+    // o3d-secops r20: the marker's directory, the check that decides whether a marker may be
+    // adopted at all, and the move out of ${CUTOVER_STATE_DIR}. A fence written by one entrypoint
+    // and invisible to another is worse than the finding being fixed, so these three are held to
+    // the same byte-for-byte rule as the publisher.
+    'ensure_fence_marker_dir',
+    'fence_marker_is_trustworthy',
+    'import_relocated_fence_marker',
   ]) {
     const bodies = R9_SCRIPTS.map((entry) => shellFunction(entry.source, name))
     assert.equal(
@@ -4261,7 +5210,6 @@ LEGACY_CUTOVER_STATE_DIR="\${CUTOVER_STATE_DIR}/legacy"
 LEGACY_FENCE_FILE="\${LEGACY_CUTOVER_STATE_DIR}/FENCED"
 LEGACY_CRON_BACKUP="\${LEGACY_CUTOVER_STATE_DIR}/crontab-appuser.bak"
 LEGACY_DB_FENCE_STATE="\${LEGACY_CUTOVER_STATE_DIR}/db-connect-fence.json"
-DB_FENCE_DIR="\${CUTOVER_STATE_DIR}/deploy"
 mkdir -p "\${LEGACY_CUTOVER_STATE_DIR}"
 printf 'phase=stopping\\nmigration_attempted=true\\nschema_touched=true\\n' > "\${LEGACY_FENCE_FILE}"
 printf '*/5 * * * * /usr/bin/true\\n' > "\${LEGACY_CRON_BACKUP}"
@@ -4280,6 +5228,7 @@ for (const entry of R9_SCRIPTS) {
         'echo "CRON=$(cat "${CRON_BACKUP}" 2>/dev/null)"',
         'echo "DBSTATE=$(cat "${DB_FENCE_STATE}" 2>/dev/null)"',
         '[[ -e "${LEGACY_FENCE_FILE}" ]] && echo LEGACY_MARKER_REMAINS || echo LEGACY_MARKER_MOVED',
+        '[[ -e "${LEGACY_DB_FENCE_STATE}" ]] && echo LEGACY_DBSTATE_REMAINS || echo LEGACY_DBSTATE_GONE',
       ].join('\n'),
       R9_LEGACY_STATE,
     )
@@ -4287,7 +5236,16 @@ for (const entry of R9_SCRIPTS) {
     assert.equal(result.status, 0, `the import must succeed:\n${result.stdout}`)
     assert.match(result.stdout, /MARKER=phase=stopping;/, `the marker must arrive at the shared path:\n${result.stdout}`)
     assert.match(result.stdout, /CRON=\*\/5 \* \* \* \* \/usr\/bin\/true/, 'and the crontab backup with it')
-    assert.match(result.stdout, /DBSTATE=\{"grants":\[\]\}/, 'and the recorded grants, or the fence can never be released')
+    // o3d-secops r23, Codex CRITICAL: THE CONNECTION-FENCE RECORD IS NOT ONE OF THEM ANY MORE.
+    // It was written by the fence helper running as the service account, and republishing it into
+    // the shared namespace made root build `GRANT CONNECT` out of statements that account
+    // authored. It is reported and left exactly where it is.
+    assert.match(result.stdout, /DBSTATE=$/m,
+      `the legacy connection-fence record must NOT be imported:\n${result.stdout}`)
+    assert.match(result.stdout, /IT HAS NOT BEEN READ, COPIED OR IMPORTED/,
+      `and the operator must be told it is there and why it is being left alone:\n${result.stdout}`)
+    assert.match(result.stdout, /LEGACY_DBSTATE_REMAINS/,
+      `and it stays where it is, so it can still be read by hand:\n${result.stdout}`)
     assert.match(result.stdout, /LEGACY_MARKER_MOVED/, 'and nothing may be left at the old path for a later run to adopt twice')
   })
 
@@ -4326,7 +5284,6 @@ for (const entry of R9_SCRIPTS) {
         'LEGACY_FENCE_FILE="${LEGACY_CUTOVER_STATE_DIR}/FENCED"',
         'LEGACY_CRON_BACKUP="${LEGACY_CUTOVER_STATE_DIR}/crontab-appuser.bak"',
         'LEGACY_DB_FENCE_STATE="${LEGACY_CUTOVER_STATE_DIR}/db-connect-fence.json"',
-        'DB_FENCE_DIR="${CUTOVER_STATE_DIR}/deploy"',
         'mkdir -p "${LEGACY_CUTOVER_STATE_DIR}"',
         `printf '*/5 * * * * /usr/bin/true\\n' > "\${LEGACY_CRON_BACKUP}"`,
         'chown(){ :; }',
@@ -4355,7 +5312,6 @@ for (const entry of R9_SCRIPTS) {
         'LEGACY_FENCE_FILE="${LEGACY_CUTOVER_STATE_DIR}/FENCED"',
         'LEGACY_CRON_BACKUP="${LEGACY_CUTOVER_STATE_DIR}/crontab-appuser.bak"',
         'LEGACY_DB_FENCE_STATE="${LEGACY_CUTOVER_STATE_DIR}/db-connect-fence.json"',
-        'DB_FENCE_DIR="${CUTOVER_STATE_DIR}/deploy"',
       ].join('\n'),
     )
 
@@ -4406,7 +5362,12 @@ for (const entry of R9_SCRIPTS) {
  */
 const R10_POST_RENAME_BARRIER_SHIM = `
 sync(){
-  if [[ $# -eq 0 || "\${1}" == "\${CUTOVER_STATE_DIR}" ]]; then return 1; fi
+  # o3d-czpy r2: the POST-RENAME barrier is now \`sync ..\` from inside the staging directory, so
+  # the operand is matched by the directory it RESOLVES to and not by its spelling.
+  if [[ $# -eq 0 ]]; then return 1; fi
+  local _p
+  _p="\$(cd "\${1}" 2>/dev/null && pwd -P)" || _p=""
+  if [[ -n "\${_p}" && "\${_p}" == "\$(cd "\${CUTOVER_STATE_DIR}" && pwd -P)" ]]; then return 1; fi
   command sync "\$@"
 }
 `
@@ -4611,7 +5572,11 @@ fence_dropin_file(){ echo "\${SYSTEMD_ROOT}/\$1.d/\${FENCE_DROPIN_NAME}"; }
 write_fence_marker(){ printf 'reboot_fence=absent\\nmarker_complete=1\\n' > "\${FENCE_FILE}"; return 0; }
 write_cutover_marker(){ write_fence_marker "\$@"; }
 verify_reboot_fence(){ echo VERIFIED; return 0; }
-sync(){ echo "sync \$*" >> "\${BARRIERS}"; command sync "\$@"; }
+# o3d-czpy r2: publish_durable_file() flushes its PINNED parent as \`..\` — the point of the fix
+# is that it never names the destination again — so an operand that is a directory is recorded by
+# the physical path it resolves to. A file operand (the temporary) is recorded verbatim, and the
+# no-operand fallback stays distinguishable.
+sync(){ local _p=""; if [[ -n "\${1:-}" ]]; then _p="\$(cd "\${1}" 2>/dev/null && pwd -P)" || _p=""; fi; echo "sync \${_p:-\$*}" >> "\${BARRIERS}"; command sync "\$@"; }
 mv(){ echo "mv \$*" >> "\${BARRIERS}"; command mv "\$@"; }
 rm(){
   local __a
@@ -4855,7 +5820,7 @@ for (const entry of FENCE_HARNESS) {
         entry.preamble(dir),
         'error() { echo "ERROR: $*" >&2; }',
         'DB_FENCE_RAISED=false',
-        shellFunction(entry.source, 'ensure_cutover_state_dirs'),
+        CUTOVER_DIR_PRIMITIVES,
         shellFunction(entry.source, 'fence_db_connections'),
         shellFunction(entry.source, 'release_db_connections'),
         'on_exit() { if release_db_connections; then echo "TRAP RELEASE SAID OK"; else echo "TRAP RELEASE REFUSED"; fi; }',
@@ -4988,10 +5953,13 @@ test('the environment snapshot lives at a literal path in all three entrypoints,
   // MUTATION ROUTE: put `${IMS_CUTOVER_ENV_DIR:-...}` back in any one of the three and the
   // equality below fails, naming the script that reintroduced it.
   for (const entry of R9_SCRIPTS) {
-    const line = entry.source.split(/\r?\n/).find((candidate) => candidate.startsWith('DB_ENV_SNAPSHOT_DIR='))
+    // Read through shellConstant() rather than by line prefix (o3d-secops): the declaration is
+    // `readonly` now, and it also has to stay the ONLY script-scope assignment, which is what
+    // shellConstant() refuses a second one for.
+    const line = shellConstant(entry.source, 'DB_ENV_SNAPSHOT_DIR', entry.name)
     assert.equal(
       line,
-      'DB_ENV_SNAPSHOT_DIR="/etc/ims-cutover"',
+      'readonly DB_ENV_SNAPSHOT_DIR="/etc/ims-cutover"',
       `${entry.name} must resolve the snapshot directory to a literal: an override only a root-owned source may set is indistinguishable from no override, and one an app-owned source CAN set is the finding`,
     )
   }
@@ -5387,7 +6355,9 @@ const MENTION_SHAPES: ReadonlyArray<{ why: string; match: RegExp }> = (
     { why: 'a file-shape or readability test opening a block', match: '(el)?if \\[\\[[^\\]]*\\]\\]; then' },
     { why: 'a file-shape or readability test guarding a refusal', match: '\\[\\[[^\\]]*\\]\\] \\|\\| die "[^"]*"' },
     // The path itself, assigned to a name.
-    { why: 'a path assignment', match: `(local )?[A-Za-z_][A-Za-z0-9_]*="(${APP_OWNED_PATH})"` },
+    // `readonly` is one of the prefixes now (o3d-secops): ${DEPLOY_META_FILE} is a protected
+    // publication constant, so its declaration carries the word bash refuses mutations with.
+    { why: 'a path assignment', match: `((local|readonly) )?[A-Za-z_][A-Za-z0-9_]*="(${APP_OWNED_PATH})"` },
     // Path canonicalisation for the EnvironmentFile= comparison — readlink resolves, it does not
     // read. Spelled out in full rather than as a fragment: this is one line in each script.
     {
@@ -5409,7 +6379,12 @@ const MENTION_SHAPES: ReadonlyArray<{ why: string; match: RegExp }> = (
       why: 'passed by path to db_fence_publish_operator_wrappers(), which writes it into a root-owned wrapper',
       match:
         `db_fence_publish_operator_wrappers "\\$\\{APP_USER\\}" "(${APP_OWNED_PATH})" ` +
-        '"\\$\\{DB_FENCE_STATE\\}" "\\$\\{DB_FENCE_IDENTITY_ARGS\\[@\\]:-\\}"' +
+        // o3d-secops r28: ${LOCK_FILE} joined the call, between the state file and the identity.
+        // The wrappers read the fence record, ask the database about it and then write or remove
+        // it, and that sequence is now excluded against every cutover and every other wrapper on
+        // the entrypoint's own lock. Spelt out here for the reason the rest of this shape is: a
+        // call that started passing something ELSE in that position is not covered by this.
+        '"\\$\\{DB_FENCE_STATE\\}" "\\$\\{LOCK_FILE\\}" "\\$\\{DB_FENCE_IDENTITY_ARGS\\[@\\]:-\\}"' +
         '( \\|\\| echo "[^"]*" >&2)?',
     },
     // install.sh OWNS these two files: it writes them, then locks them down.
@@ -5438,6 +6413,20 @@ const MENTION_SHAPES: ReadonlyArray<{ why: string; match: RegExp }> = (
       match:
         'write_role_rotation_journal "\\$\\{DB_PASSWORD_EFFECTIVE\\}" "\\$\\{DB_PASSWORD\\}"'
         + ' "\\$\\{DB_ROTATION_PROBE_DATABASE\\}" \\|\\| die "[^"]*"',
+    },
+    // AND `.deploy-meta` JOINED IT (o3d-czpy). It was `cat > "${DEPLOY_META_FILE}" <<EOF`
+    // followed by a chown and a chmod 600 — three root-side operations on a name inside
+    // ${APP_DIR}, which belongs to ${APP_USER} by the time an upgrade reaches that line, so a
+    // symlink planted there aimed all three. It now goes through the same publisher `.env` does.
+    // Spelled out in full for the same reason that one is: the bytes come from the brace group
+    // immediately above, whose closing `}` opens this logical line, and the application-owned path
+    // appears here as a DESTINATION and never as an input. A call that piped something else in, or
+    // that dropped the ownership argument, is not covered by this.
+    {
+      why: 'install.sh publishing the deploy metadata it owns, by rename, from a group it composed itself',
+      match:
+        `\\} \\| publish_durable_file "(${APP_OWNED_PATH})" `
+        + '"\\$\\{APP_USER\\}:\\$\\{APP_USER\\}" 600 \\|\\| die "[^"]*"',
     },
     {
       why: 'install.sh locking down or removing the file it owns',
@@ -5769,11 +6758,19 @@ function runLayoutGate(options: { env: string | null; marker: string | null }): 
   const state = mkdtempSync(join(tmpdir(), 'ims-layout-state-'))
   try {
     if (options.env !== null) writeFileSync(join(dir, '.env'), options.env)
-    if (options.marker !== null) writeFileSync(join(state, 'DEPLOY-FENCED'), options.marker)
+    // THE MARKER LIVES UNDER A ROOT-OWNED LITERAL NOW (o3d-secops r20), and this harness runs the
+    // REAL prelude, unprivileged, so it cannot write there. The literal is substituted for a
+    // directory of this run's own — asserted present first, so a rename of the constant cannot
+    // leave this quietly measuring an adoption that never had a marker to find. That it is a
+    // literal rather than an ${IMS_*} override is asserted by the namespace test above, which is
+    // where that claim belongs.
+    const markerDir = join(state, 'marker-dir')
+    mkdirSync(markerDir)
+    if (options.marker !== null) writeFileSync(join(markerDir, 'DEPLOY-FENCED'), options.marker)
     const log = join(state, 'calls.log')
     const source = UPDATE_LINES.join('\n')
     const program = [
-      preludeThrough(UPDATE_LINES, /^DB_OBJECT_ACCESS_SCRIPT=/),
+      redirectFenceMarkerDir(preludeThrough(UPDATE_LINES, /^DB_OBJECT_ACCESS_SCRIPT=/), markerDir),
       `LOG=${JSON.stringify(log)}`,
       ': > "${LOG}"',
       'DRY_RUN=false',
@@ -5792,6 +6789,9 @@ function runLayoutGate(options: { env: string | null; marker: string | null }): 
       // adoption. They are exercised against real files in the recovery tests below.
       'require_adoption_identity(){ echo "require_adoption_identity" >> "${LOG}"; return 0; }',
       'refuse_adoption_identity_mismatch(){ echo "refuse_adoption_identity_mismatch $*" >> "${LOG}"; return 0; }',
+      // o3d-secops r20: adoption asks whether the marker is one this run may believe before it
+      // reads a line of it. Lifted rather than stubbed, for the reason everything else here is.
+      shellFunction(source, 'fence_marker_is_trustworthy'),
       shellFunction(source, 'marker_is_complete'),
       shellFunction(source, 'marker_phase'),
       shellFunction(source, 'predecessor_is_active'),
@@ -5831,6 +6831,14 @@ function layoutInvocation(program: string, env: string): string {
   const script = join(stage, 'lifted.sh')
   writeFileSync(script, `${program}\n`)
   return `${env} bash ${JSON.stringify(script)} --dry-run`
+}
+
+/** The shipped literal, and where a harness that cannot write /etc puts it instead. */
+function redirectFenceMarkerDir(program: string, dir: string): string {
+  const shipped = 'readonly FENCE_MARKER_DIR="/etc/ims-cutover"'
+  assert.equal(program.split(shipped).length - 1, 1,
+    `precondition: the lifted prelude must carry the marker directory literal:\n${shipped}`)
+  return program.replace(shipped, `readonly FENCE_MARKER_DIR=${JSON.stringify(dir)}`)
 }
 
 /** What an interrupted run that had already begun migrating leaves behind. */
@@ -5931,9 +6939,8 @@ function plantProtectedArtefact(recovery: string, helperBody: string): void {
       [
         'set -uo pipefail',
         'exec 2>&1',
-        `source ${JSON.stringify(join(process.cwd(), 'scripts/lib/db-fence-protected.sh'))}`,
-        `DB_FENCE_SCRIPT=${JSON.stringify(checkoutHelper(seed))}`,
         ...protectedLibraryLinesAt(recovery),
+        `DB_FENCE_SCRIPT=${JSON.stringify(checkoutHelper(seed))}`,
         'chown(){ :; }',
         'publish_fence_script_copy || { echo "PLANT FAILED: ${DB_FENCE_ROTATION_NOTE}"; exit 1; }',
       ].join('\n'),
@@ -5955,28 +6962,43 @@ function fenceRecoveryHarness(dirs: { app: string; state: string; recovery: stri
     `APP_DIR=${JSON.stringify(dirs.app)}`,
     `LOG=${JSON.stringify(join(dirs.state, 'calls.log'))}`,
     ': > "${LOG}"',
+    // o3d-secops r22: the connection-fence directory is created by the namespace library's walk
+    // now, beneath a root-owned parent, and fence_db_connections() calls it rather than carrying a
+    // second copy of the `mkdir -p`/`chown`/`chmod` trio. Lifted, so this rig runs the shipped one.
+    `CUTOVER_STATE_DIR=${JSON.stringify(dirs.state)}`,
+    `CUTOVER_ROOT_DIR=${JSON.stringify(dirs.state)}`,
     `DB_FENCE_DIR=${JSON.stringify(join(dirs.state, 'deploy'))}`,
+    // o3d-secops r28: the recovery wrappers take the entrypoint's own cutover lock for their whole
+    // read/audit/act sequence, so the entrypoint passes them its path -- and a rig that omitted it
+    // would measure a publication the shipped script refuses to perform.
+    `LOCK_FILE=${JSON.stringify(join(dirs.state, 'cutover.lock'))}`,
+    CUTOVER_DIR_PRIMITIVES,
     `DB_FENCE_STATE=${JSON.stringify(join(dirs.state, 'deploy', 'db-connect-fence.json'))}`,
     `DB_FENCE_SCRIPT=${JSON.stringify(join(dirs.app, 'scripts', 'fence-db-connections.mjs'))}`,
     // THE SHARED LIBRARY, SOURCED FOR REAL (o3d-2sm1.5 r31), then pointed at the harness
     // directory. It is what decides which bytes any of the three entrypoints may execute with
     // DEPLOY_ADMIN_DATABASE_URL, so a harness that re-implemented any part of it would be
     // asserting about a rule the shipped scripts no longer read.
-    fenceProtectedLibrary(dirs.recovery.replace(/\/recovery$/, '')),
-    `DB_FENCE_RECOVERY_DIR=${JSON.stringify(dirs.recovery)}`,
-    `DB_FENCE_IDENTITY_FILE=${JSON.stringify(join(dirs.recovery, 'db-fence-identity.env'))}`,
-    `DB_FENCE_PROTECTED_APP_DIR=${JSON.stringify(join(dirs.recovery, 'app'))}`,
-    `DB_FENCE_SCRIPT_COPY=${JSON.stringify(join(dirs.recovery, 'app', 'scripts', 'fence-db-connections.mjs'))}`,
-    `DB_FENCE_STAGED_APP_DIR=${JSON.stringify(join(dirs.recovery, '.app.staged'))}`,
-    `DB_FENCE_RETIRED_APP_DIR=${JSON.stringify(join(dirs.recovery, '.app.retired'))}`,
-    `DB_FENCE_ARTEFACT_FILE=${JSON.stringify(join(dirs.recovery, 'db-fence-artefact.sha256'))}`,
-    `DB_FENCE_MANIFEST_FILE=${JSON.stringify(join(dirs.recovery, 'db-fence-artefact.manifest'))}`,
-    `DB_FENCE_RELEASE_WRAPPER=${JSON.stringify(join(dirs.recovery, 'release-db-fence'))}`,
-    `DB_FENCE_REFENCE_WRAPPER=${JSON.stringify(join(dirs.recovery, 'refence-db'))}`,
+    // ONE redirection, not eleven: the recovery root is substituted in the library's own text and
+    // the rest are composed from it BY THE LIBRARY. The eleven-line block that used to stand here
+    // restated that composition in TypeScript, which is a second reader of the rule this file is a
+    // library to avoid having (o3d-secops r2).
+    protectedLibraryLinesAt(dirs.recovery).join('\n'),
     // The shipped resolver, not a stub (o3d-2sm1.5 r32): it is what every fence path in update.sh
     // now calls, and it does two things — resolve the artefact and rewrite the root-owned recovery
     // wrappers — that a stub would silently drop.
     shellFunction(source, 'resolve_fence_script'),
+    // o3d-secops r23: db_fence_raise() reaches back for the one part each entrypoint supplies for
+    // itself, and for the namespace library's directory predicate. Lifted for the reason the
+    // resolver is: a stub would drop the privilege drop the shipped ordering is built on.
+    shellFunction(CUTOVER_NS_LIB, 'dir_is_private_to_this_run'),
+    shellFunction(source, 'db_fence_helper'),
+    // o3d-secops r32: and the three the migration binding is made of. fence_db_connections() CALLS
+    // bind_migration_to_fenced_server(), so a rig without it would measure an ordering the shipped
+    // script does not have -- which is what it did for one round, as a `command not found`.
+    shellFunction(source, 'db_fence_migration_helper'),
+    shellFunction(source, 'bind_migration_to_fenced_server'),
+    shellFunction(source, 'require_migration_landed_on_fenced_server'),
     // The two recovery commands, exactly as update.sh sets them: the PATHS of the root-owned
     // wrappers, not a command line (o3d-2sm1.5 r32). Setting them empty here would let a banner
     // that prints nothing pass every assertion about what it names.
@@ -6019,7 +7041,11 @@ function fenceRecoveryHarness(dirs: { app: string; state: string; recovery: stri
     '  shift',
     '  echo "run_as_user $*" >> "${LOG}"',
     '  case "$*" in',
-    '    *--fence*) mkdir -p "$(dirname "${DB_FENCE_STATE}")"; echo "{}" > "${DB_FENCE_STATE}"; return "${FENCE_EXIT:-0}" ;;',
+    // o3d-secops r23: the helper no longer writes the record — root does, out of the plan this
+    // prints. The stub answers the plan the shipped `--plan` mode would, derived from the identity
+    // it is passed, because root validates it against the database and role root itself supplied.
+    `    *--plan*) printf '{"database":"%s","owner_role":"imsapp","app_role":"%s","admin_role":"deployadmin","revoked":["PUBLIC","imsapp"],"datacl_before":null,"fenced_at":"2026-01-01T00:00:00.000Z"}\\n' "\${DB_IDENTITY_DATABASE:-imsdb}" "\${DB_IDENTITY_USER:-imsapp}"; return 0 ;;`,
+    '    *--fence*) return "${FENCE_EXIT:-0}" ;;',
     "    *--print-migration-url*) printf 'postgresql://admin:pw@127.0.0.1:5432/imsdb?options=-c%%20role%%3Dimsapp\\n'; return 0 ;;",
     '  esac',
     '  return 0',
@@ -6065,9 +7091,7 @@ test('a deleted .env does not stop the connection fence being adopted', () => {
   //   3. make publish_fence_recovery_record() a no-op and phase 2 fails on the missing record,
   //      naming it — the record has to be written when the fence is RAISED or there is nothing
   //      to recover from.
-  const app = mkdtempSync(join(tmpdir(), 'ims-recover-app-'))
-  const state = mkdtempSync(join(tmpdir(), 'ims-recover-state-'))
-  const recovery = mkdtempSync(join(tmpdir(), 'ims-recover-etc-'))
+  const { outer, app, state, recovery } = anchoredRoots('ims-recover-')
   try {
     // PHASE 1 — an ordinary run raises a fence, with .env in place and the script in the
     // checkout. Nothing here is about recovery; it is what produces the record.
@@ -6150,9 +7174,7 @@ test('a deleted .env does not stop the connection fence being adopted', () => {
       `nor the sole-source question about it:\n${log}`,
     )
   } finally {
-    rmSync(app, { recursive: true, force: true })
-    rmSync(state, { recursive: true, force: true })
-    rmSync(recovery, { recursive: true, force: true })
+    rmSync(outer, { recursive: true, force: true })
   }
 })
 
@@ -6165,9 +7187,7 @@ test('a recovery with no privileged credential refuses, naming the argument that
   // adopt_db_connections() and this test fails at the status assertion — the run proceeds to
   // invoke the fence with an empty admin URL, which is the shape that revokes CONNECT and then
   // cannot get back in.
-  const app = mkdtempSync(join(tmpdir(), 'ims-recover-app-'))
-  const state = mkdtempSync(join(tmpdir(), 'ims-recover-state-'))
-  const recovery = mkdtempSync(join(tmpdir(), 'ims-recover-etc-'))
+  const { outer, app, state, recovery } = anchoredRoots('ims-recover-')
   try {
     mkdirSync(join(state, 'deploy'), { recursive: true })
     writeFileSync(join(state, 'deploy', 'db-connect-fence.json'), '{}\n')
@@ -6197,9 +7217,7 @@ test('a recovery with no privileged credential refuses, naming the argument that
     assert.match(result.output, /imsapp@127\.0\.0\.1:5432\/imsdb/, 'and the record gave the identity')
     assert.ok(!/--fence/.test(readCalls(state)), 'and no fence was attempted without a connection that survives it')
   } finally {
-    rmSync(app, { recursive: true, force: true })
-    rmSync(state, { recursive: true, force: true })
-    rmSync(recovery, { recursive: true, force: true })
+    rmSync(outer, { recursive: true, force: true })
   }
 })
 
@@ -6233,9 +7251,7 @@ for (const scenario of RECOVERY_RECORD_REFUSALS) {
     // adopt_identity_from_recovery_record() and the truncated case stops refusing — it adopts
     // host, port and role from the record and NO database, which is three of four values about a
     // database nothing named.
-    const app = mkdtempSync(join(tmpdir(), 'ims-recover-app-'))
-    const state = mkdtempSync(join(tmpdir(), 'ims-recover-state-'))
-    const recovery = mkdtempSync(join(tmpdir(), 'ims-recover-etc-'))
+    const { outer, app, state, recovery } = anchoredRoots('ims-recover-')
     try {
       mkdirSync(join(state, 'deploy'), { recursive: true })
       writeFileSync(join(state, 'deploy', 'db-connect-fence.json'), '{}\n')
@@ -6254,9 +7270,7 @@ for (const scenario of RECOVERY_RECORD_REFUSALS) {
       assert.match(result.output, scenario.says, `and it must say what is wrong with the record:\n${result.output}`)
       assert.ok(!/--fence/.test(readCalls(state)), `and nothing may be re-fenced on a guess:\n${readCalls(state)}`)
     } finally {
-      rmSync(app, { recursive: true, force: true })
-      rmSync(state, { recursive: true, force: true })
-      rmSync(recovery, { recursive: true, force: true })
+      rmSync(outer, { recursive: true, force: true })
     }
   })
 }
@@ -6288,16 +7302,12 @@ function raiseFenceFor(dirs: { app: string; state: string; recovery: string }, s
   assert.match(raised.output, /^RAISED=true$/m, `precondition: and the fence must go up:\n${raised.output}`)
 }
 
-function recoveryDirs(): { app: string; state: string; recovery: string } {
-  return {
-    app: mkdtempSync(join(tmpdir(), 'ims-r30-app-')),
-    state: mkdtempSync(join(tmpdir(), 'ims-r30-state-')),
-    recovery: mkdtempSync(join(tmpdir(), 'ims-r30-etc-')),
-  }
+function recoveryDirs(): { outer: string; app: string; state: string; recovery: string } {
+  return anchoredRoots('ims-r30-')
 }
 
-function cleanUp(dirs: { app: string; state: string; recovery: string }): void {
-  for (const dir of [dirs.app, dirs.state, dirs.recovery]) rmSync(dir, { recursive: true, force: true })
+function cleanUp(dirs: { outer: string }): void {
+  rmSync(dirs.outer, { recursive: true, force: true })
 }
 
 test('an .env retargeted to another database cannot redirect a standing fence', () => {
@@ -6579,9 +7589,11 @@ test('the recovery record lives where the application user cannot rewrite it', (
   // only as trustworthy as whatever can set that variable.
   const LIBRARY = readFileSync(join(process.cwd(), 'scripts/lib/db-fence-protected.sh'), 'utf8')
   const LIBRARY_LINES = LIBRARY.split(/\r?\n/)
-  const line = LIBRARY_LINES.find((candidate) => /^DB_FENCE_RECOVERY_DIR=/.test(candidate))
-  assert.ok(line !== undefined, 'the library must resolve a recovery directory')
-  assert.match(line, /^DB_FENCE_RECOVERY_DIR="\/etc\/[^$]*"$/, `it must be a literal outside the application's tree: ${line}`)
+  // o3d-secops r2: the declaration begins `readonly` now, and the readers below REQUIRE that word
+  // rather than tolerating it — a `^DB_FENCE_` match would have gone on finding nothing and passing.
+  const line = LIBRARY_LINES.find((candidate) => /^readonly DB_FENCE_RECOVERY_DIR=/.test(candidate))
+  assert.ok(line !== undefined, 'the library must resolve a recovery directory, and declare it `readonly`')
+  assert.match(line, /^readonly DB_FENCE_RECOVERY_DIR="\/etc\/[^$]*"$/, `it must be a literal outside the application's tree: ${line}`)
   assert.ok(!/CUTOVER_STATE_DIR|APP_DIR|DATA_DIR|\$\{IMS_/.test(line), `and not derived from anything the application can move: ${line}`)
   for (const [label, lines] of [['update.sh', UPDATE_LINES], ['deploy.sh', DEPLOY_LINES], ['install.sh', INSTALL_LINES]] as const) {
     const reassign = lines.filter(
@@ -6598,10 +7610,10 @@ test('the recovery record lives where the application user cannot rewrite it', (
   //
   // MUTATION ROUTE: point DB_FENCE_SCRIPT_COPY back at "${DB_FENCE_RECOVERY_DIR}/fence-db-connections.mjs"
   // and the assertion below fails.
-  const copyLine = LIBRARY_LINES.find((candidate) => /^DB_FENCE_SCRIPT_COPY=/.test(candidate))
+  const copyLine = LIBRARY_LINES.find((candidate) => /^readonly DB_FENCE_SCRIPT_COPY=/.test(candidate))
   assert.match(
     copyLine ?? '',
-    /^DB_FENCE_SCRIPT_COPY="\$\{DB_FENCE_PROTECTED_APP_DIR\}\/scripts\/fence-db-connections\.mjs"$/,
+    /^readonly DB_FENCE_SCRIPT_COPY="\$\{DB_FENCE_PROTECTED_APP_DIR\}\/scripts\/fence-db-connections\.mjs"$/,
     `the protected copy must sit at <root>/scripts/, the layout node's module walk expects: ${copyLine}`,
   )
   // AND ITS IMPORTS ARE COPIED, NOT LINKED (o3d-2sm1.5 r32, Codex CRITICAL). r31 pointed
@@ -7432,7 +8444,8 @@ test('every entrypoint defines what the shared fence library reads', () => {
 
   for (const [label, lines] of [['update.sh', UPDATE_LINES], ['deploy.sh', DEPLOY_LINES], ['install.sh', INSTALL_LINES]] as const) {
     const source = lines.filter((line) => !/^\s*#/.test(line)).join('\n')
-    const missing = [...needed].filter((name) => !new RegExp(`(^|\\n)\\s*(export\\s+)?${name}=`).test(source))
+    // `readonly` is a declaration prefix here too since o3d-secops.
+    const missing = [...needed].filter((name) => !new RegExp(`(^|\\n)\\s*((export|readonly)\\s+)?${name}=`).test(source))
     assert.deepEqual(missing, [], `${label} sources the fence library but never assigns what it reads`)
     // AND IT REALLY SOURCES IT, from its own directory rather than from an application path.
     assert.match(
@@ -7634,16 +8647,24 @@ test('the entrypoints no longer claim an atomicity that only covered explicit re
 // the filesystem rather than by reading the source.
 // ---------------------------------------------------------------------------
 
-/** A fence helper that records every invocation, and answers the two modes the callers read. */
+/**
+ * A fence helper that records every invocation, and answers the two modes the callers read.
+ *
+ * IT DOES NOT WRITE THE AUTHORITY RECORD, and since o3d-secops r26 that matters rather than merely
+ * being tidier. It used to drop `{}` at ${DB_FENCE_STATE} on `--fence`, which is what the helper
+ * did before r23 moved the publication to root — so the stub was OVERWRITING root's own record
+ * with a shapeless one, and the second phase of the test below was then re-fencing over an object
+ * with no `fence_applied` key. r25 read that as a standing fence and published `recovery`; r26
+ * refuses it, correctly, and the refusal was the stub's leftover rather than the code's. The
+ * shipped `--fence` writes no file at all — it runs as ${APP_USER} and cannot — so neither does
+ * this.
+ */
 function shippedHelper(dir: string): string {
   return [
     "import { appendFileSync, writeFileSync } from 'node:fs'",
     `appendFileSync(${JSON.stringify(join(dir, 'calls.log'))}, 'SHIPPED ' + process.argv.slice(2).join(' ') + '\\n')`,
     "if (process.argv.includes('--print-migration-url')) {",
     "  process.stdout.write('postgres://admin@127.0.0.1/nowhere?options=-c%20role%3Dimsapp\\n')",
-    '}',
-    "if (process.argv.includes('--fence')) {",
-    `  writeFileSync(${JSON.stringify(join(dir, 'db-connect-fence.json'))}, '{}')`,
     '}',
     'process.exit(0)',
     '',
@@ -7662,9 +8683,6 @@ function substitutedHelper(dir: string): string {
     `writeFileSync(${JSON.stringify(join(dir, 'STOLEN'))}, String(process.env.DEPLOY_ADMIN_DATABASE_URL ?? ''))`,
     "if (process.argv.includes('--print-migration-url')) {",
     "  process.stdout.write('postgres://attacker@127.0.0.1/nowhere?options=-c%20role%3Dimsapp\\n')",
-    '}',
-    "if (process.argv.includes('--fence')) {",
-    `  writeFileSync(${JSON.stringify(join(dir, 'db-connect-fence.json'))}, '{}')`,
     '}',
     'process.exit(0)',
     '',
@@ -7696,7 +8714,7 @@ for (const entry of FENCE_HARNESS) {
           // both streams, so the harness does too.
           'exec 2>&1',
           entry.preamble(dir),
-          shellFunction(entry.source, 'ensure_cutover_state_dirs'),
+          CUTOVER_DIR_PRIMITIVES,
           shellFunction(entry.source, 'fence_db_connections'),
           'fence_db_connections',
           'echo "FENCE_UP=${DB_FENCE_UP}"',
@@ -7755,20 +8773,65 @@ for (const entry of FENCE_HARNESS) {
 // ---------------------------------------------------------------------------
 
 /** The library alone, pointed at a scratch directory, with a checkout beside it. */
-function rotationHarness(dirs: { app: string; recovery: string; state: string }, body: string[]): string {
+/**
+ * THE PINS GO IN FRONT OF THE LIBRARY, NOT OVER IT (o3d-secops r2).
+ *
+ * ${DB_FENCE_EXPECTED_SHA256} and ${DB_FENCE_EXPECTED_ARTEFACT_SHA256} are what AUTHENTICATES a
+ * rotation, and they are `readonly` for the same reason the paths are. These harnesses used to
+ * assign them after the source, which bash now refuses — so they set the environment variables the
+ * library derives them FROM, which is the route the operator has and the derivation the shipped
+ * line performs. `pins` is spliced BEFORE the library text; nothing else may go there.
+ */
+function rotationHarness(
+  dirs: { app: string; recovery: string; state: string },
+  body: string[],
+  pins: string[] = [],
+): string {
   return [
     'set -uo pipefail',
     // The library reports a refused promotion on stderr, because every caller reads it through a
     // command substitution and a global set inside one dies with the subshell. Merged here so the
     // harness sees what an operator would.
     'exec 2>&1',
-    `source ${JSON.stringify(join(process.cwd(), 'scripts/lib/db-fence-protected.sh'))}`,
-    `DB_FENCE_SCRIPT=${JSON.stringify(join(dirs.app, 'scripts', 'fence-db-connections.mjs'))}`,
+    ...pins,
     ...protectedLibraryLinesAt(dirs.recovery),
+    `DB_FENCE_SCRIPT=${JSON.stringify(join(dirs.app, 'scripts', 'fence-db-connections.mjs'))}`,
     `DB_FENCE_STATE=${JSON.stringify(join(dirs.state, 'db-connect-fence.json'))}`,
     'chown(){ :; }',
     ...body,
   ].join('\n')
+}
+
+/**
+ * THE TWO THINGS db_fence_preflight() ASKS ITS CALLER FOR, AS OBSERVABLES (o3d-secops r3).
+ *
+ * The file a preflight would execute is no longer a variable any of these harnesses can read: it
+ * is a `local` of the function that runs it, which is the whole point of the round. So what is
+ * observed instead is the ARGV — strictly stronger, because it is the bytes root would actually
+ * have executed rather than a variable somebody hoped named them.
+ *
+ * `runner` stands in for the entrypoints' `as_app_user env …`; db_fence_preflight() hands it
+ * `node <path> --preflight [identity args]`, so ${2} is the file. `notice` stands in for warn().
+ *
+ * ${TMPDIR} is redirected at a scratch directory so that "no throwaway tree survives" is asked of
+ * the FILESYSTEM. The assertion it replaces was `TEMP=[]` — a variable being empty, which is
+ * exactly the kind of evidence this round found wanting.
+ */
+function preflightSpies(scratch: string): string[] {
+  mkdirSync(scratch, { recursive: true })
+  return [
+    `export TMPDIR=${JSON.stringify(scratch)}`,
+    `PROBE_PATH_FILE=${JSON.stringify(`${scratch}.probe-path`)}`,
+    ':> "${PROBE_PATH_FILE}"',
+    'notice() { echo "NOTICE=[$*]"; }',
+    'runner() { echo "EXEC=[$*]"; printf "%s" "${2:-}" > "${PROBE_PATH_FILE}";'
+      + ' echo "CONTENT=[$(cat "${2:-/dev/null}" 2>/dev/null)]"; }',
+    // The same recording, but it really EXECUTES what it was handed — for the cases whose claim is
+    // "the credential reached nothing", where a runner that only records would prove the recording.
+    'exec_runner() { echo "EXEC=[$*]"; printf "%s" "${2:-}" > "${PROBE_PATH_FILE}"; env "$@"; }',
+    'report_probe() { echo "PROBE=[$(cat "${PROBE_PATH_FILE}")]";'
+      + ' echo "TMPLEFT=[$(ls -A "${TMPDIR}" 2>/dev/null | tr "\\n" " ")]"; }',
+  ]
 }
 
 function rotationDirs(): { app: string; recovery: string; state: string } {
@@ -7839,7 +8902,7 @@ test('r31: the protected helper is bootstrapped once and then only rotated by an
     // CASE 3 — AN EXPECTED DIGEST THAT DOES NOT MATCH THE CHECKOUT. The rotation is refused and
     // the standing copy is untouched: an operator who was given the wrong digest, or a checkout
     // that was tampered with between the release and the box, are the same event here.
-    const wrong = runShell(rotationHarness(dirs, [`DB_FENCE_EXPECTED_SHA256=${sha256('// something else\n')}`, 'db_fence_script_in_use && echo']))
+    const wrong = runShell(rotationHarness(dirs, ['db_fence_script_in_use && echo'], [`IMS_FENCE_SCRIPT_SHA256=${sha256('// something else\n')}`]))
     assert.notEqual(wrong.status, 0, `a digest that does not match must refuse:\n${wrong.output}`)
     assert.equal(readFileSync(copy, 'utf8'), V1, 'and change nothing')
     assert.ok(!existsSync(join(dirs.recovery, 'app', 'scripts', '.fence-db-connections.mjs.staged')), 'and leave no staged file behind')
@@ -7847,7 +8910,7 @@ test('r31: the protected helper is bootstrapped once and then only rotated by an
     // CASE 4 — THE LEGITIMATE UPGRADE. The digest comes from the release, on the root invocation;
     // the bytes are staged inside the root-owned directory, hashed THERE, and that same file is
     // renamed into place, so the checkout cannot change between the check and the publication.
-    const rotate = runShell(rotationHarness(dirs, [`DB_FENCE_EXPECTED_SHA256=${sha256(V2)}`, 'db_fence_script_in_use && echo']))
+    const rotate = runShell(rotationHarness(dirs, ['db_fence_script_in_use && echo'], [`IMS_FENCE_SCRIPT_SHA256=${sha256(V2)}`]))
     assert.equal(rotate.status, 0, `the authenticated rotation must succeed:\n${rotate.output}`)
     assert.equal(readFileSync(copy, 'utf8'), V2, 'and the protected copy moves')
     const after = readFileSync(record, 'utf8')
@@ -7859,7 +8922,7 @@ test('r31: the protected helper is bootstrapped once and then only rotated by an
     // has to release it, from a record the raise wrote.
     writeFileSync(helper, '// v3\n')
     writeFileSync(join(dirs.state, 'db-connect-fence.json'), '{}\n')
-    const held = runShell(rotationHarness(dirs, [`DB_FENCE_EXPECTED_SHA256=${sha256('// v3\n')}`, 'db_fence_script_in_use && echo']))
+    const held = runShell(rotationHarness(dirs, ['db_fence_script_in_use && echo'], [`IMS_FENCE_SCRIPT_SHA256=${sha256('// v3\n')}`]))
     assert.equal(readFileSync(copy, 'utf8'), V2, 'a standing fence blocks the rotation')
     assert.match(held.output, /Release the fence first/, `and says why:\n${held.output}`)
     assert.equal(held.status, 0, 'without failing the run, which still has a fence to release')
@@ -7903,11 +8966,11 @@ test('r34: a dry run computes the candidate digest by READING, and hands back no
   // refusal itself advertised. So the dry run reads and hashes; it does not run.
   //
   // MUTATION ROUTE (each verified by making the change locally and re-running):
-  //   1. put r33's tail back — set DB_FENCE_PROBE_SCRIPT to the snapshot's helper unconditionally
-  //      at the end of db_fence_probe_script() — and PROBE/TEMP stop being empty. Measured: the
-  //      unpinned probe hands back ${TMPDIR}/…/scripts/fence-db-connections.mjs.
-  //   2. delete the `_fence_probe_discard_candidate` call on the refusal path: TEMP is empty but
-  //      the tree survives, so a caller that ignores the return value still has something to run.
+  //   1. put r33's tail back — nominate the snapshot's helper unconditionally at the end of
+  //      db_fence_preflight()'s resolution — and PHASE 1's `runner` is called. Measured: EXEC
+  //      names ${TMPDIR}/…/scripts/fence-db-connections.mjs on an unpinned run.
+  //   2. delete the `rm -rf "${_fence_probe_dir}"` on the refusal path: nothing is executed but
+  //      TMPLEFT names the surviving tree, so a later caller still has something to run.
   //   3. drop the digest match from the pinned arm — accept any candidate when
   //      IMS_FENCE_ARTEFACT_SHA256 is merely SET — and PHASE 2's control (a pin that names a
   //      different tree) stops being refused.
@@ -7919,17 +8982,19 @@ test('r34: a dry run computes the candidate digest by READING, and hands back no
     // PHASE 1 — NO ARTEFACT, NO PIN. The digest is still produced; nothing is offered to run.
     const probe = runShell(
       rotationHarness(dirs, [
-        'db_fence_probe_script; echo "RC=$?"',
-        'echo "PROBE=[${DB_FENCE_PROBE_SCRIPT}]"',
-        'echo "TEMP=[${DB_FENCE_PROBE_TEMP}]"',
+        ...preflightSpies(join(dirs.app, '..', 'scratch-1')),
+        'db_fence_probe_digests; echo "DRC=$?"',
         'echo "CANDIDATE=[${DB_FENCE_PROBE_ARTEFACT_SHA256}]"',
         'echo "STANDING=[${DB_FENCE_PROBE_STANDING_SHA256}]"',
+        'db_fence_preflight notice -- runner; echo "RC=$?"',
         'echo "REASON=[${DB_FENCE_PROBE_REASON}]"',
+        'report_probe',
       ]),
     )
     assert.match(probe.output, /^RC=1$/m, `an unauthenticated candidate is not preflightable:\n${probe.output}`)
-    assert.match(probe.output, /^PROBE=\[\]$/m, 'and there is NOTHING for a caller to execute')
-    assert.match(probe.output, /^TEMP=\[\]$/m, 'and no tree left on disk for one to find')
+    assert.doesNotMatch(probe.output, /^EXEC=/m, 'and NOTHING was executed — the runner was never reached')
+    assert.match(probe.output, /^PROBE=\[\]$/m, 'so no argv named a file')
+    assert.match(probe.output, /^TMPLEFT=\[\s*\]$/m, 'and no tree left on disk for a later caller to find')
     const candidate = /^CANDIDATE=\[([0-9a-f]{64})\]$/m.exec(probe.output)?.[1] ?? ''
     assert.match(candidate, /^[0-9a-f]{64}$/, `the ANSWER survives the restriction:\n${probe.output}`)
     assert.match(probe.output, /^STANDING=\[\]$/m, 'and there is no standing artefact to report')
@@ -7938,10 +9003,7 @@ test('r34: a dry run computes the candidate digest by READING, and hands back no
 
     // THE VALUE IS THE ONE A PUBLICATION WOULD RECORD, which is what makes it usable as a pin.
     const published = runShell(
-      rotationHarness(dirs, [
-        `DB_FENCE_EXPECTED_ARTEFACT_SHA256=${candidate}`,
-        'db_fence_script_in_use >/dev/null; echo "RC=$?"',
-      ]),
+      rotationHarness(dirs, ['db_fence_script_in_use >/dev/null; echo "RC=$?"'], [`IMS_FENCE_ARTEFACT_SHA256=${candidate}`]),
     )
     assert.match(published.output, /^RC=0$/m, `the digest a dry run reports must authorise the publication:\n${published.output}`)
     assert.equal(
@@ -7956,33 +9018,216 @@ test('r34: a dry run computes the candidate digest by READING, and hands back no
     // which is the failure mode a refusal has to avoid.
     const pinned = runShell(
       rotationHarness(dirs, [
-        `DB_FENCE_EXPECTED_ARTEFACT_SHA256=${candidate}`,
-        'db_fence_probe_script; echo "RC=$?"',
-        'echo "PROBE=[${DB_FENCE_PROBE_SCRIPT}]"',
-        'echo "CONTENT=$(cat "${DB_FENCE_PROBE_SCRIPT}")"',
-        'temp="${DB_FENCE_PROBE_TEMP}"',
-        'db_fence_probe_cleanup',
-        'echo "AFTER=$([[ -e "${temp}" ]] && echo present || echo gone)"',
-      ]),
+        ...preflightSpies(join(dirs.app, '..', 'scratch-2')),
+        'db_fence_preflight notice -- runner; echo "RC=$?"',
+        'report_probe',
+      ], [`IMS_FENCE_ARTEFACT_SHA256=${candidate}`]),
     )
     assert.match(pinned.output, /^RC=0$/m, `a pinned candidate is preflightable:\n${pinned.output}`)
     const probed = /^PROBE=\[(.*)\]$/m.exec(pinned.output)?.[1] ?? ''
+    assert.match(probed, /\/scripts\/fence-db-connections\.mjs$/, `something really was executed:\n${pinned.output}`)
     assert.notEqual(probed, join(dirs.app, 'scripts', 'fence-db-connections.mjs'), 'never the checkout file in place')
-    assert.match(pinned.output, /^CONTENT=\/\/ v1$/m, 'but the same bytes, snapshotted')
-    assert.match(pinned.output, /^AFTER=gone$/m, 'and the snapshot is removed when it is done with')
+    // CONTENT is captured INSIDE the runner, so it is what the file held at the instant of the
+    // call — not what happened to be on disk afterwards.
+    assert.match(pinned.output, /^CONTENT=\[\/\/ v1\]$/m, 'but the same bytes, snapshotted')
+    assert.match(pinned.output, /^NOTICE=\[This dry run probes with a throwaway copy/m,
+      `and the operator was told which of the two sources it was:\n${pinned.output}`)
+    assert.match(pinned.output, /^TMPLEFT=\[\s*\]$/m, 'and the snapshot is destroyed by the call that made it')
     assert.ok(!existsSync(dirs.recovery), 'and a dry run still publishes nothing')
 
-    // THE CONTROL FOR PHASE 2: a pin that names a DIFFERENT tree hands back nothing, so what was
+    // THE CONTROL FOR PHASE 2: a pin that names a DIFFERENT tree executes nothing, so what was
     // accepted above was the match and not the mere presence of the variable.
     const wrong = runShell(
       rotationHarness(dirs, [
-        `DB_FENCE_EXPECTED_ARTEFACT_SHA256=${'0'.repeat(64)}`,
-        'db_fence_probe_script; echo "RC=$?"',
-        'echo "PROBE=[${DB_FENCE_PROBE_SCRIPT}]"',
-      ]),
+        ...preflightSpies(join(dirs.app, '..', 'scratch-3')),
+        'db_fence_preflight notice -- runner; echo "RC=$?"',
+        'report_probe',
+      ], [`IMS_FENCE_ARTEFACT_SHA256=${'0'.repeat(64)}`]),
     )
     assert.match(wrong.output, /^RC=1$/m, `a pin that does not match authorises nothing:\n${wrong.output}`)
+    assert.doesNotMatch(wrong.output, /^EXEC=/m, wrong.output)
     assert.match(wrong.output, /^PROBE=\[\]$/m, wrong.output)
+    assert.match(wrong.output, /^TMPLEFT=\[\s*\]$/m, 'and the tree it assembled to check is gone')
+  } finally {
+    rmSync(join(dirs.app, '..'), { recursive: true, force: true })
+  }
+})
+
+test('o3d-secops r3: after a real publish and a real preflight, the six steering names are not globals', () => {
+  // THE LOAD-BEARING ASSERTION OF THE ROUND, asked of a live shell rather than of the source.
+  //
+  // Four names the census called reports steered privileged execution, authentication, publication
+  // and deletion, and the remedy was not `readonly` — none of them can carry it — but that they
+  // stop being script-scope names at all. A static rule says the declarations are gone. This says
+  // the VALUES are gone: after the publication path and the preflight path have both run for real,
+  // bash itself is asked whether each name exists, and the answer must be no.
+  //
+  // MUTATION ROUTE (verified by making each change locally and re-running):
+  //   1. put `DB_FENCE_SOURCE_UNTRUSTED_PATH=""` back at script scope in the library: that name
+  //      reports `set` and the loop fails, naming it.
+  //   2. delete the `local DB_FENCE_SOURCE_UNTRUSTED_PATH=""` from _fence_stage_and_publish(): the
+  //      assignment two frames down creates the global again and the same assertion fails.
+  //   3. delete the `local -a _FENCE_SRC_*` from _fence_vendor_into(): all three report `set`.
+  //   4. have db_fence_preflight() publish its resolved path into a global before running it —
+  //      on EITHER arm: DB_FENCE_PROBE_SCRIPT reports `set`. Both arms are exercised below,
+  //      because a mutation of the candidate arm alone is invisible to a run that has a standing
+  //      artefact, and the first draft of this test had only the standing one. (Measured: the
+  //      candidate-arm mutation left this test green until the second arm was added.)
+  const dirs = rotationDirs()
+  const scratch = join(dirs.app, '..', 'scratch-globals')
+  const NAMES = [
+    'DB_FENCE_PROBE_SCRIPT', 'DB_FENCE_PROBE_TEMP', 'DB_FENCE_SOURCE_UNTRUSTED_PATH',
+    '_FENCE_SRC_STRICT', '_FENCE_SRC_PACKAGES', '_FENCE_SRC_PARENTS',
+  ]
+  const probeGlobals = [
+    `for n in ${NAMES.join(' ')} DB_FENCE_PROBE_REASON; do`,
+    '  echo "GLOBAL ${n}=[${!n+set}]"',
+    'done',
+  ]
+  try {
+    writeFileSync(join(dirs.app, 'scripts', 'fence-db-connections.mjs'), '// v1\n')
+    rmSync(dirs.recovery, { recursive: true, force: true })
+    const digest = runShell(
+      rotationHarness(dirs, ['db_fence_probe_digests >/dev/null 2>&1', 'echo "CANDIDATE=[${DB_FENCE_PROBE_ARTEFACT_SHA256}]"']),
+    )
+    const candidate = /^CANDIDATE=\[([0-9a-f]{64})\]$/m.exec(digest.output)?.[1] ?? ''
+    assert.match(candidate, /^[0-9a-f]{64}$/, digest.output)
+
+    const run = runShell(
+      rotationHarness(dirs, [
+        ...preflightSpies(scratch),
+        // THE PUBLICATION PATH, for real — it is the one that runs _fence_stage_and_publish(),
+        // _fence_vendor_into(), _fence_source_paths() and _fence_source_trust().
+        'db_fence_script_in_use >/dev/null; echo "PUBLISHED=$?"',
+        // AND THE PREFLIGHT PATH, for real — it is the one that resolves and executes.
+        'db_fence_preflight notice -- runner >/dev/null; echo "PREFLIGHT=$?"',
+        ...probeGlobals,
+        'report_probe',
+      ], [`IMS_FENCE_ARTEFACT_SHA256=${candidate}`]),
+    )
+
+    // PRECONDITIONS — both paths really ran, or the loop below is asking about code that never
+    // executed and every answer would be "unset" for the wrong reason.
+    assert.match(run.output, /^PUBLISHED=0$/m, `the publication path must have run:\n${run.output}`)
+    assert.match(run.output, /^PREFLIGHT=0$/m, `and the preflight path with it:\n${run.output}`)
+    assert.ok(existsSync(join(dirs.recovery, 'app', 'scripts', 'fence-db-connections.mjs')),
+      'and the artefact really was published, which is what proves _fence_source_trust() ran')
+    assert.match(run.output, new RegExp(`^PROBE=\\[${escapeRe(join(dirs.recovery, 'app', 'scripts', 'fence-db-connections.mjs'))}\\]$`, 'm'),
+      `and something really was executed:\n${run.output}`)
+
+    // THE CLAIM.
+    for (const name of NAMES) {
+      assert.match(run.output, new RegExp(`^GLOBAL ${name}=\\[\\]$`, 'm'),
+        `${name} must not exist in the shell after both paths have run — it steers execution, `
+        + `authentication, publication or deletion:\n${run.output}`)
+    }
+
+    // AND THE CONTROL, because "no name reported `set`" would also be the answer if `${!n+set}`
+    // never worked: a name that IS deliberately a global reports `set` in the same loop.
+    assert.match(run.output, /^GLOBAL DB_FENCE_PROBE_REASON=\[set\]$/m,
+      `the probe must be able to SEE a global, or the six above prove nothing:\n${run.output}`)
+
+    // AND THE OTHER ARM. With the artefact discarded and the same pin supplied, the preflight
+    // resolves and runs the CANDIDATE it assembles from the checkout — a different branch, with a
+    // different path, a different digest comparison and a throwaway to destroy afterwards.
+    rmSync(dirs.recovery, { recursive: true, force: true })
+    const fromCandidate = runShell(
+      rotationHarness(dirs, [
+        ...preflightSpies(join(dirs.app, '..', 'scratch-candidate')),
+        'db_fence_preflight notice -- runner >/dev/null; echo "PREFLIGHT=$?"',
+        ...probeGlobals,
+        'report_probe',
+      ], [`IMS_FENCE_ARTEFACT_SHA256=${candidate}`]),
+    )
+    assert.match(fromCandidate.output, /^PREFLIGHT=0$/m,
+      `precondition: the candidate arm must have run:\n${fromCandidate.output}`)
+    assert.match(fromCandidate.output, /^PROBE=\[\/.*\/scripts\/fence-db-connections\.mjs\]$/m,
+      `and executed a checkout-derived tree:\n${fromCandidate.output}`)
+    assert.doesNotMatch(fromCandidate.output,
+      new RegExp(`^PROBE=\\[${escapeRe(join(dirs.recovery, 'app'))}`, 'm'),
+      'which is NOT the standing artefact, because there is not one')
+    for (const name of NAMES) {
+      assert.match(fromCandidate.output, new RegExp(`^GLOBAL ${name}=\\[\\]$`, 'm'),
+        `${name} must not exist after the candidate arm either:\n${fromCandidate.output}`)
+    }
+    assert.match(fromCandidate.output, /^TMPLEFT=\[\s*\]$/m, 'and the throwaway it ran is destroyed')
+  } finally {
+    rmSync(join(dirs.app, '..'), { recursive: true, force: true })
+  }
+})
+
+test('o3d-secops r3: each entrypoint\'s own preflight line runs the standing artefact through the library', () => {
+  // THE WIRING, RUN RATHER THAN READ. Moving the exec into the library changed both entrypoints'
+  // call from `node "${VAR}" …` to `db_fence_preflight warn -- <runner…>`, and the two runners are
+  // spelled differently. A static assertion that the call exists would not notice a missing `--`,
+  // a notice that is not a command, or a runner whose arguments land in the wrong order — all of
+  // which are silent until a cutover.
+  //
+  // So the LINE IS LIFTED OUT OF THE SHIPPED FILE and executed against the real library, with the
+  // entrypoint's own warn() and its own privilege-dropping helper stubbed to report their argv.
+  //
+  // MUTATION ROUTE (each verified locally): drop the `--` from either call and the invocation
+  // returns 1 with nothing executed, so EXEC never appears; swap the notice for a name no function
+  // has and the same; put the runner's arguments after the `node` in the library and the argv
+  // assertion fails, naming the file.
+  const dirs = rotationDirs()
+  try {
+    writeFileSync(join(dirs.app, 'scripts', 'fence-db-connections.mjs'), '// v1\n')
+    rmSync(dirs.recovery, { recursive: true, force: true })
+    const digest = runShell(
+      rotationHarness(dirs, ['db_fence_probe_digests >/dev/null 2>&1', 'echo "CANDIDATE=[${DB_FENCE_PROBE_ARTEFACT_SHA256}]"']),
+    )
+    const candidate = /^CANDIDATE=\[([0-9a-f]{64})\]$/m.exec(digest.output)?.[1] ?? ''
+    const publish = runShell(
+      rotationHarness(dirs, ['db_fence_script_in_use >/dev/null; echo "RC=$?"'], [`IMS_FENCE_ARTEFACT_SHA256=${candidate}`]),
+    )
+    assert.match(publish.output, /^RC=0$/m, `precondition: an artefact must be standing:\n${publish.output}`)
+
+    for (const script of ['scripts/deploy.sh', 'scripts/update.sh']) {
+      const lines = readFileSync(join(process.cwd(), script), 'utf8').split('\n')
+      const start = lines.findIndex((line) => /^\s*db_fence_preflight /.test(line))
+      assert.ok(start >= 0, `${script}: precondition: it must call db_fence_preflight`)
+      const call: string[] = []
+      for (let i = start; i < lines.length; i += 1) {
+        call.push(lines[i])
+        if (!/\\$/.test(lines[i].trimEnd())) break
+      }
+      assert.ok(call.join('\n').includes(' -- '), `${script}: precondition: the lifted call must be complete:\n${call.join('\n')}`)
+
+      const run = runShell(
+        rotationHarness(dirs, [
+          ...preflightSpies(join(dirs.app, '..', `scratch-${script.replace(/\W/g, '-')}`)),
+          'warn() { echo "WARN: $*"; }',
+          // The two spellings, each reporting exactly what the library handed it.
+          'as_app_user() { echo "EXEC=[$*]"; printf "%s" "${2:-}" > "${PROBE_PATH_FILE}"; }',
+          'run_as_user() { local who="$1"; shift; echo "AS=${who}"; echo "EXEC=[$*]"; }',
+          'APP_USER=ims-app',
+          'DATABASE_URL=postgresql://app:pw@127.0.0.1:5432/imsdb',
+          'DEPLOY_ADMIN_DATABASE_URL=postgresql://admin:pw@127.0.0.1:5432/imsdb',
+          'dry_rc=0',
+          ...call,
+          'echo "DRY_RC=${dry_rc}"',
+          'echo "REASON=[${DB_FENCE_PROBE_REASON}]"',
+        ]),
+      )
+      assert.match(run.output, /^DRY_RC=0$/m, `${script}: the lifted call must succeed:\n${run.output}`)
+      assert.match(run.output, /^REASON=\[\]$/m,
+        `${script}: an empty reason is how the entrypoint learns the helper ran:\n${run.output}`)
+      assert.match(run.output, /^WARN: This dry run probes with the root-owned artefact at /m,
+        `${script}: and the announcement must come back through the entrypoint's own warn():\n${run.output}`)
+      const exec = /^EXEC=\[(.*)\]$/m.exec(run.output)?.[1] ?? ''
+      // The entrypoint's own environment comes FIRST (it is the runner it wrote), then the
+      // library's `node <artefact> --preflight`. The two scripts set different variables, so what
+      // is asserted is the shape and the boundary between them, not one script's spelling.
+      assert.match(exec, /^env (?:[A-Z_]+=\S+ )+node /,
+        `${script}: the runner must be handed its own environment first: ${exec}`)
+      assert.match(exec, /\bDEPLOY_ADMIN_DATABASE_URL=\S+/,
+        `${script}: including the credential the preflight needs: ${exec}`)
+      assert.ok(
+        exec.endsWith(`node ${join(dirs.recovery, 'app', 'scripts', 'fence-db-connections.mjs')} --preflight `),
+        `${script}: and then the STANDING artefact, appended by the library: ${exec}`,
+      )
+    }
   } finally {
     rmSync(join(dirs.app, '..'), { recursive: true, force: true })
   }
@@ -8020,14 +9265,14 @@ const STEALING_PG = [
   '',
 ].join('\n')
 
-/** The library alone, pointed at a scratch root laid out by writeFenceCheckout(). */
-function artefactHarness(root: string, body: string[]): string {
+/** The library alone, pointed at a scratch root laid out by writeFenceCheckout(). `pins` as above. */
+function artefactHarness(root: string, body: string[], pins: string[] = []): string {
   return [
     'set -uo pipefail',
     'exec 2>&1',
-    `source ${JSON.stringify(join(process.cwd(), 'scripts/lib/db-fence-protected.sh'))}`,
-    `DB_FENCE_SCRIPT=${JSON.stringify(checkoutHelper(root))}`,
+    ...pins,
     ...protectedLibraryLines(root),
+    `DB_FENCE_SCRIPT=${JSON.stringify(checkoutHelper(root))}`,
     `DB_FENCE_STATE=${JSON.stringify(join(root, 'state.json'))}`,
     'chown(){ :; }',
     ...body,
@@ -8139,7 +9384,7 @@ test('r32: no module resolution out of the protected artefact can reach the appl
 /** The recipe the library computes with, and the one docs/installation.md prints. */
 const ARTEFACT_RECIPE = (() => {
   const library = readFileSync(join(process.cwd(), 'scripts/lib/db-fence-protected.sh'), 'utf8')
-  const line = /^DB_FENCE_ARTEFACT_RECIPE="(.+)"$/m.exec(library)
+  const line = /^readonly DB_FENCE_ARTEFACT_RECIPE="(.+)"$/m.exec(library)
   assert.ok(line, 'the library must state the digest recipe as one string')
   return line[1].replace(/\\\\/g, '\\')
 })()
@@ -8247,7 +9492,7 @@ test('r32: IMS_FENCE_ARTEFACT_SHA256 pins the whole tree, at publication and at 
     const paths = protectedPaths(dir)
 
     // 1 — A WRONG PIN AT BOOTSTRAP PUBLISHES NOTHING AT ALL.
-    const wrong = runShell(artefactHarness(dir, [`IMS_FENCE_ARTEFACT_SHA256=${'a'.repeat(64)}`, 'DB_FENCE_EXPECTED_ARTEFACT_SHA256="${IMS_FENCE_ARTEFACT_SHA256}"', 'db_fence_script_in_use >/dev/null; echo "RC=$?"']))
+    const wrong = runShell(artefactHarness(dir, ['db_fence_script_in_use >/dev/null; echo "RC=$?"'], [`IMS_FENCE_ARTEFACT_SHA256=${'a'.repeat(64)}`]))
     assert.match(wrong.output, /^RC=1$/m, `a mismatched pin must refuse:\n${wrong.output}`)
     assert.match(wrong.output, /IMS_FENCE_ARTEFACT_SHA256 expects/, wrong.output)
     assert.ok(!existsSync(paths.app), 'and leave nothing behind under the protected directory')
@@ -8257,11 +9502,11 @@ test('r32: IMS_FENCE_ARTEFACT_SHA256 pins the whole tree, at publication and at 
     const digest = /^fence_artefact_sha256=([0-9a-f]{64})$/m.exec(readFileSync(paths.artefactFile, 'utf8'))![1]
 
     // 3 — THE RIGHT PIN RUNS; A WRONG ONE REFUSES A TREE ALREADY STANDING.
-    const pinned = runShell(artefactHarness(dir, [`IMS_FENCE_ARTEFACT_SHA256=${digest}`, 'DB_FENCE_EXPECTED_ARTEFACT_SHA256="${IMS_FENCE_ARTEFACT_SHA256}"', 'db_fence_script_in_use >/dev/null; echo "RC=$?"']))
+    const pinned = runShell(artefactHarness(dir, ['db_fence_script_in_use >/dev/null; echo "RC=$?"'], [`IMS_FENCE_ARTEFACT_SHA256=${digest}`]))
     assert.match(pinned.output, /^RC=0$/m, `the matching pin must be accepted:\n${pinned.output}`)
     // A mismatched pin against a standing artefact is refused at the ROTATION: the pin says
     // "publish this exact tree", the tree that can be assembled is not it, and nothing is written.
-    const mismatched = runShell(artefactHarness(dir, [`IMS_FENCE_ARTEFACT_SHA256=${'b'.repeat(64)}`, 'DB_FENCE_EXPECTED_ARTEFACT_SHA256="${IMS_FENCE_ARTEFACT_SHA256}"', 'db_fence_script_in_use >/dev/null; echo "RC=$?"']))
+    const mismatched = runShell(artefactHarness(dir, ['db_fence_script_in_use >/dev/null; echo "RC=$?"'], [`IMS_FENCE_ARTEFACT_SHA256=${'b'.repeat(64)}`]))
     assert.match(mismatched.output, /^RC=1$/m, `and a mismatched one must refuse:\n${mismatched.output}`)
     assert.match(mismatched.output, /IMS_FENCE_ARTEFACT_SHA256 expects b{64}/, mismatched.output)
     assert.match(mismatched.output, /NOTHING was published/, 'and say that nothing moved')
@@ -8276,7 +9521,7 @@ test('r32: IMS_FENCE_ARTEFACT_SHA256 pins the whole tree, at publication and at 
     // invocation did not authenticate: the rotation says "not now", and without the second check
     // the run would carry on with whatever is there.
     writeFileSync(join(dir, 'state.json'), '{}\n')
-    const standing = runShell(artefactHarness(dir, [`IMS_FENCE_ARTEFACT_SHA256=${'c'.repeat(64)}`, 'DB_FENCE_EXPECTED_ARTEFACT_SHA256="${IMS_FENCE_ARTEFACT_SHA256}"', 'db_fence_script_in_use >/dev/null; echo "RC=$?"']))
+    const standing = runShell(artefactHarness(dir, ['db_fence_script_in_use >/dev/null; echo "RC=$?"'], [`IMS_FENCE_ARTEFACT_SHA256=${'c'.repeat(64)}`]))
     assert.match(standing.output, /a connection fence is recorded at/, `the rotation must be refused while a fence stands:\n${standing.output}`)
     assert.match(standing.output, /^RC=1$/m, 'and the run must not go on with an unauthenticated tree')
     assert.match(standing.output, /Refusing to run a tree this invocation did not authenticate/, standing.output)
@@ -8477,7 +9722,7 @@ test('r32: the recovery wrapper an operator is given runs, as pasted, with nothi
     const publish = runShell(
       artefactHarness(dir, [
         'db_fence_script_in_use >/dev/null || exit 1',
-        `db_fence_publish_operator_wrappers "$(id -un)" ${JSON.stringify(join(dir, 'app', '.env'))} ${JSON.stringify(join(dir, 'state.json'))} --app-host=db.internal --app-port=6432 --app-user=imsapp --app-database=imsdb || exit 1`,
+        `db_fence_publish_operator_wrappers "$(id -un)" ${JSON.stringify(join(dir, 'app', '.env'))} ${JSON.stringify(join(dir, 'state.json'))} ${JSON.stringify(join(dir, 'cutover.lock'))} --app-host=db.internal --app-port=6432 --app-user=imsapp --app-database=imsdb || exit 1`,
       ]),
     )
     assert.equal(publish.status, 0, `the wrappers must be published:\n${publish.output}`)
@@ -8494,8 +9739,11 @@ test('r32: the recovery wrapper an operator is given runs, as pasted, with nothi
     assert.equal(invocation.ran, paths.helper, 'and the file it ran is the PROTECTED one, not the checkout')
     assert.deepEqual(
       invocation.argv,
-      ['--release', '--state-file=' + join(dir, 'state.json'), '--app-host=db.internal', '--app-port=6432', '--app-user=imsapp', '--app-database=imsdb'],
-      'with this run\'s state file and the four identity values already filled in',
+      // o3d-secops r23: and the uid the authority must belong to. Baked as `id -u` rather than a
+      // literal 0, for the reason publish_durable_file() asks it — the property is "the privileged
+      // account that owns this install", and asking is what lets this regression run unprivileged.
+      ['--release', '--state-file=' + join(dir, 'state.json'), `--state-owner=${process.getuid?.() ?? 0}`, '--app-host=db.internal', '--app-port=6432', '--app-user=imsapp', '--app-database=imsdb'],
+      'with this run\'s state file, the uid that publishes the authority, and the four identity values already filled in',
     )
     assert.equal(
       invocation.admin,
@@ -8509,6 +9757,57 @@ test('r32: the recovery wrapper an operator is given runs, as pasted, with nothi
     const refence = spawnSync(paths.refenceWrapper, [], { encoding: 'utf8', env: { PATH: process.env.PATH ?? '' } as unknown as NodeJS.ProcessEnv })
     assert.equal(refence.status, 0, `${refence.stdout}${refence.stderr}`)
     assert.equal(JSON.parse(readFileSync(log, 'utf8')).argv[0], '--fence', 'the re-fence wrapper raises the fence')
+    // AND IT LEAVES A RECORD THAT SAYS THE FENCE WENT UP (o3d-secops r25). The wrapper bakes the
+    // applied stamp beside the validator and runs it after `--fence`, for the same reason
+    // db_fence_raise() does: `fence_mode` is computed from that stamp and not from the pathname, so
+    // a re-fence that raised a fence and did not stamp it would leave the NEXT cutover reading an
+    // unapplied record and refusing. Asserted on the artefact and on the wrapper's own words —
+    // delete either half of the wrapper's stamp and this fails.
+    const raisedRecord = JSON.parse(readFileSync(join(dir, 'state.json'), 'utf8'))
+    assert.equal(raisedRecord.fence_mode, 'initial', 'nothing was standing, so the wrapper published an initial authority')
+    assert.equal(raisedRecord.fence_applied, 1,
+      `and the fence it raised must be recorded as applied:\n${refence.stderr}`)
+    assert.match(refence.stderr, /is stamped APPLIED/, `announced by the stamp itself:\n${refence.stderr}`)
+
+    // PHASE 1b — A PUBLICATION THAT FAILS AFTER ITS RENAME (o3d-secops r25, Codex HIGH). The
+    // validator's last barrier is the directory fsync, and it runs AFTER the atomic rename: when it
+    // fails it says so and leaves the record visible. o3d-secops r24 hung the wrapper's cleanup off
+    // the EXECUTION's exit 3, and this route never reaches an execution, so the record survived for
+    // the next cutover to find. The wrapper now removes its own half-published record here too.
+    //
+    // ROUTE, AND IT IS THE REAL ONE: the authority's directory is made mode 0300 — searchable and
+    // writable, so `stat`, the temporary, the rename and the `rm -f` all work, and not readable, so
+    // `open(directory, 'r')` for the fsync returns EACCES. Root has no such denial, hence the skip.
+    if ((process.getuid?.() ?? 0) !== 0) {
+      const tornPublication = () => {
+        rmSync(log, { force: true })
+        chmodSync(dir, 0o300)
+        const run = spawnSync(paths.refenceWrapper, [], { encoding: 'utf8', env: { PATH: process.env.PATH ?? '' } as unknown as NodeJS.ProcessEnv })
+        chmodSync(dir, 0o700)
+        assert.match(run.stderr, /NAME is not durable/,
+          `precondition: the publication must fail at the post-rename barrier:\n${run.stdout}${run.stderr}`)
+        assert.equal(run.status, 1, `and the re-fence must refuse:\n${run.stdout}${run.stderr}`)
+        assert.ok(!existsSync(log), 'and must never reach the helper with an authority it could not publish')
+        return run
+      }
+
+      // FIRST, THE HALF THAT MUST NOT FIRE. The fence raised above is still standing and its record
+      // is still there, so the record this refusal is looking at is NOT this run's own — it is the
+      // only account of what the earlier run revoked, and every grantee it names depends on it.
+      const overStanding = tornPublication()
+      assert.equal(existsSync(join(dir, 'state.json')), true,
+        `a standing fence's record is never removed by a refusal:\n${overStanding.stdout}${overStanding.stderr}`)
+
+      // AND THEN THE ONE THAT MUST. With nothing at the path when the wrapper starts, the record a
+      // failed publication leaves is this run's own and describes a fence that does not exist.
+      rmSync(join(dir, 'state.json'))
+      const torn = tornPublication()
+      assert.equal(existsSync(join(dir, 'state.json')), false,
+        `and must not leave its half-published record at the authoritative path:\n${torn.stdout}${torn.stderr}`)
+      // The invocation log is what the phases below remove and then assert the absence of; this
+      // phase consumed it proving the helper was never reached, so it is put back.
+      writeFileSync(log, '{}')
+    }
 
     // PHASE 2 — NO CREDENTIAL ANYWHERE. It refuses, names the variable, and prints its OWN path
     // in the command that would supply it, so the next paste works too.
@@ -8541,6 +9840,571 @@ test('r32: the recovery wrapper an operator is given runs, as pasted, with nothi
     assert.equal(stale.status, 1, 'a wrapper whose artefact moved must refuse')
     assert.ok(!existsSync(log), 'and must not run it')
     assert.match(stale.stderr, /has changed since the fence was raised/, stale.stderr)
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+
+/**
+ * A HELPER THAT ANSWERS `--audit-authority` OUT OF THE SHIPPED MODE (o3d-secops r26).
+ *
+ * Not a stub of the verdict: it IMPORTS doAuditAuthority() from the repository's own
+ * scripts/fence-db-connections.mjs and hands it a client whose one answer is a `datacl` string
+ * read from a fixture file the test rewrites between phases. So the record read, the provenance
+ * gate, the ACL parse, the three-way rule, the verdict line and the exit status are all the
+ * shipped ones, and what the fixture supplies is the database's answer and nothing else.
+ *
+ * A rig that computed the verdict itself would be asserting that its author can compare two
+ * lists, and would go on passing if the rule the wrapper acts on changed underneath it.
+ */
+function auditingHelper(dir: string, fixtureFile: string): string {
+  const shipped = `file://${join(process.cwd(), 'scripts', 'fence-db-connections.mjs')}`
+  return [
+    "import { appendFileSync, readFileSync, writeFileSync } from 'node:fs'",
+    `import { doAuditAuthority } from ${JSON.stringify(shipped)}`,
+    `appendFileSync(${JSON.stringify(join(dir, 'calls.log'))}, process.argv.slice(2).join(' ') + '\\n')`,
+    'const arg = (name) => {',
+    '  const hit = process.argv.find((a) => a.startsWith(`--${name}=`))',
+    '  return hit ? hit.slice(name.length + 3) : \'\'',
+    '}',
+    "if (process.argv.includes('--audit-authority')) {",
+    `  const fixture = JSON.parse(readFileSync(${JSON.stringify(fixtureFile)}, 'utf8'))`,
+    // A CONCURRENT WRITER, LANDING IN THE ONE WINDOW THE ROUND IS ABOUT (o3d-secops r28, Codex
+    // HIGH 3). The wrapper inspects the record, runs THIS process to audit it, and then stamps or
+    // removes it. `rewriteStateTo` makes the audit itself replace the record while the wrapper is
+    // between its read and its write — which is exactly what a release running beside a resolution
+    // does, and is not something a test can arrange from outside the wrapper at all.
+    "  if (fixture.rewriteStateTo !== undefined) {",
+    `    writeFileSync(arg('state-file'), fixture.rewriteStateTo)`,
+    '  }',
+    '  const client = {',
+    '    query: async (sql) => {',
+    '      const text = String(sql)',
+    // The cluster fingerprint's own query, kept its own because a server may refuse it.
+    "      if (text.includes('FROM pg_catalog.pg_control_system()')) {",
+    '        if (fixture.systemIdentifierError) throw new Error(fixture.systemIdentifierError)',
+    "        return { rows: [{ system_identifier: fixture.systemIdentifier ?? '' }] }",
+    '      }',
+    "      if (text.includes('AS audited_database')) {",
+    // EVERY COLUMN THROUGH THE ALIAS TEST, NOT ONLY THE TWO ROLE ONES (o3d-secops r28, Codex
+    // MEDIUM). r27 introduced this helper for the role halves and went on fabricating the
+    // database, the owner and — the load-bearing one — the ACL whatever the SELECT named. A
+    // fixture that answers a SHAPE cannot notice a column being dropped, so removing the ACL from
+    // the audit's read would have left every phase below deciding on an ACL this file invented.
+    "        const askedFor = (alias, value) => (text.includes('AS ' + alias) ? { [alias]: value } : {})",
+    '        return { rows: [{',
+    "          ...askedFor('audited_database', 'imsdb'),",
+    "          ...askedFor('audited_login_role', 'admin'),",
+    "          ...askedFor('audited_effective_role', 'admin'),",
+    "          ...askedFor('audited_owner_role', 'owner'),",
+    "          ...askedFor('audited_datacl_privileges', fixture.privileges),",
+    "          ...askedFor('audited_database_oid', fixture.databaseOid ?? ''),",
+    '        }] }',
+    '      }',
+    "      throw new Error('the audit asked something this fixture does not answer: ' + sql)",
+    '    },',
+    '  }',
+    // AND THE IDENTITY THE WRAPPER PASSES ON ARGV IS PASSED STRAIGHT THROUGH (o3d-secops r27). The
+    // gate is only exercised end to end if what reaches it is what the published wrapper baked in.
+    '  const decided = await doAuditAuthority(client, {',
+    "    stateFile: arg('state-file'),",
+    "    stateOwnerUid: Number(arg('state-owner')),",
+    "    appRole: arg('app-role') || arg('app-user'),",
+    "    appHost: arg('app-host'),",
+    "    appPort: arg('app-port'),",
+    "    appUser: arg('app-user'),",
+    "    appDatabase: arg('app-database'),",
+    '  })',
+    // A HELPER THAT DECIDED AND THEN DIED ON THE WAY OUT. The verdict is on stdout and the exit
+    // status is a failure: two channels that disagree, which is the case the wrapper's `&&` is
+    // there for and which a fixture where they always agree cannot exhibit.
+    '  process.exit(fixture.crash ? 1 : decided)',
+    '}',
+    'process.exit(0)',
+    '',
+  ].join('\n')
+}
+
+/**
+ * aclexplode()'s rows, written the way a fixture wants to state them (o3d-secops r28).
+ *
+ * NOT A PARSER, deliberately: the entries are spelt out and expanded. Writing PostgreSQL's printed
+ * `datacl::text` here and taking it apart again would put the very defect this round removed back
+ * inside the test. What the real escaping does is measured against a real cluster in
+ * tests/scripts/db-connection-fence.test.ts.
+ */
+function auditAclRows(entries: ReadonlyArray<readonly [string, string]>) {
+  const named: Record<string, string> = { C: 'CREATE', T: 'TEMPORARY', c: 'CONNECT' }
+  return entries.flatMap(([grantee, letters], index) =>
+    [...letters].map((letter) => ({
+      grantee_oid: grantee === '' ? '0' : String(16384 + index),
+      grantee,
+      privilege: named[letter] ?? letter,
+    })),
+  )
+}
+
+/**
+ * THE ONE-TIME OPERATOR RESOLUTION, END TO END (o3d-secops r26/r27, reworked r28).
+ *
+ * WHAT IS BEING PROVED, in the order it matters:
+ *   1. the automatic re-fence REFUSES over an unstamped record, and says which record and where to
+ *      go — it does not silently pick a state, which is what r25 did;
+ *   2. the RELEASE wrapper still works over that same record, unchanged, which is the escape hatch
+ *      that makes the refusal survivable;
+ *   3. a fully-withdrawn ACL is REPORTED and not stamped until the operator says the fence is
+ *      theirs AND types a token bound to this record at a terminal (r27, then r28);
+ *   4. a MIXED reading changes nothing at all, with or without either argument;
+ *   5. it refuses every record that is not the ambiguous one, so it cannot be used as a
+ *      general-purpose "make this record say what I want" tool;
+ *   6. an audit that reached a SAME-NAMED DATABASE ON ANOTHER HOST resolves nothing;
+ *   7. (r28) and neither does one that reached a same-named database on ANOTHER CLUSTER at the
+ *      right host — which is the case r27 documented and went on deleting records on.
+ *
+ * WHAT r28 CHANGED IN THIS TEST, and why the old assertions could not simply stay.
+ *
+ *   PHASE 4a USED TO ASSERT THAT A SPENT LEGACY RECORD IS CLEARED AUTOMATICALLY. It is not any
+ *   more, and that is the HIGH. `absent` on an unfenced BYSTANDER cluster reachable at the same
+ *   host, port and database name is the identical reading, and clearing on it destroys the only
+ *   account of a fence standing on the real one. The clear is automatic where the record's
+ *   fingerprint and the answering cluster's AGREE, and asks the operator where it cannot be shown
+ *   — which, for a record published before the fingerprint existed, is always. PHASE 4a now
+ *   asserts the refusal and PHASE 4d asserts the automatic clear on a fingerprinted record, so
+ *   both arms are measured rather than one being traded for the other.
+ *
+ *   PHASE 3b USED TO PASS `--this-fence-revoked-them` AND EXPECT A STAMP. The flag now selects the
+ *   decision and authorises nothing; what authorises it is a token typed at the wrapper's
+ *   controlling terminal, derived from the action, the exact bytes of the record and the cluster
+ *   that answered. So PHASE 3b runs the wrapper under a real pty and types it.
+ *
+ * ROUTE: real processes. The wrappers are the ones db_fence_publish_operator_wrappers() writes,
+ * run as an operator would with nothing supplied; the record is published by the shipped validator
+ * through the shipped re-fence wrapper and then stripped of the fields an older validator never
+ * wrote; the verdict comes from the shipped `--audit-authority` over a fixture that answers the
+ * query it was actually asked. The terminal is a real pty, allocated by script(1).
+ *
+ * MUTATION ROUTE (each made against the shipped file and reverted):
+ *   1. put r25's rule back in the validator (`standing = true` where the refusal now is): PHASE 1
+ *      stops refusing.
+ *   2. drop the `"${rc}" -eq 0 &&` half of the clearing arm in resolve_legacy_fence(): PHASE 4c
+ *      clears the record on the word of a run that did not finish.
+ *   3. remove the `fence_applied` check from db_fence_legacy_inspect_program(): PHASE 5 stops
+ *      refusing.
+ *   4. (r27) drop the `[[ "${confirmed_stamp}" -ne 1 ]]` gate from the stamping arm: PHASE 3a
+ *      stamps without being asked.
+ *   5. (r27) drop the `case` arm's `*)` refusal: PHASE 7 stops refusing.
+ *   6. (r27, against scripts/fence-db-connections.mjs) delete the requireBoundDatabaseIdentity()
+ *      call from doAuditAuthority(): PHASE 6's `unfenced` arm removes the record.
+ *   7. (r27) add a `[[ "${confirmed_stamp}" -eq 1 ]]` stamp in front of the final refusal: PHASE
+ *      4b's confirmed run stamps a MIXED reading.
+ *   8. (r28, against scripts/fence-db-connections.mjs) make compareClusterIdentity() return
+ *      CLUSTER_IDENTITY_PROVEN where it returns UNPROVEN: PHASE 4a stops refusing and clears a
+ *      legacy record with no fingerprint automatically — the finding, exactly.
+ *   9. (r28) delete the mismatch arm of compareClusterIdentity(): PHASE 8 clears the record of a
+ *      fence standing on another cluster.
+ *  10. (r28) drop `operator_confirms stamp ...` from the stamping arm: PHASE 3b-i, which types a
+ *      WRONG answer, stamps anyway.
+ *  11. (r28) pass no digest to the stamp (`node -e "${mark_applied}" -- "${state_file}"`): PHASE 9
+ *      stamps a record that was replaced while the audit was running.
+ *  12. (r28) delete `take_cutover_lock || return 1` from any of the three wrappers: PHASE 10's
+ *      corresponding arm runs instead of refusing.
+ */
+test('r26/r27/r28: the operator resolution acts only on a reading it can attribute, and only on a confirmation a script cannot give', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'ims-r26-resolve-'))
+  try {
+    const fixtureFile = join(dir, 'audit-fixture.json')
+    const state = join(dir, 'state.json')
+    const calls = join(dir, 'calls.log')
+    const cutoverLock = join(dir, 'cutover.lock')
+    // THE THREE READINGS. The record names PUBLIC and imsapp, which is what FENCE_PLAN_STUB plans;
+    // the owner keeps its own entry in all three, because a fence never takes the owner's.
+    const UNFENCED = auditAclRows([['owner', 'CTc'], ['', 'Tc'], ['imsapp', 'c']])
+    const FENCED = auditAclRows([['owner', 'CTc']])
+    const MIXED = auditAclRows([['owner', 'CTc'], ['imsapp', 'c']])
+    // THE CLUSTER THE FIXTURE SAYS ANSWERED. The default is the one FENCE_PLAN_STUB writes into
+    // every record it plans, so a fingerprinted record and this fixture agree unless a phase moves
+    // one of them on purpose.
+    const fixture = (extra: Record<string, unknown>) =>
+      writeFileSync(fixtureFile, `${JSON.stringify({
+        privileges: UNFENCED,
+        systemIdentifier: FENCE_PLAN_CLUSTER.systemIdentifier,
+        databaseOid: FENCE_PLAN_CLUSTER.databaseOid,
+        ...extra,
+      })}\n`)
+
+    fixture({})
+    writeFenceCheckout(dir, auditingHelper(dir, fixtureFile))
+    // THE ADMIN URL NAMES THE SERVER THE IDENTITY ARGV NAMES (o3d-secops r27).
+    const envFile = join(dir, 'app', '.env')
+    const adminUrlNaming = (server: string) =>
+      writeFileSync(envFile, `DEPLOY_ADMIN_DATABASE_URL="postgresql://admin:pw@${server}/imsdb"\n`)
+    adminUrlNaming('db.internal:6432')
+    const paths = protectedPaths(dir)
+    const wrapperEnv = { PATH: process.env.PATH ?? '' } as unknown as NodeJS.ProcessEnv
+    const run = (wrapper: string, args: string[] = []) => spawnSync(wrapper, args, { encoding: 'utf8', env: wrapperEnv })
+
+    /**
+     * THE SAME WRAPPER, RUN AT A REAL TERMINAL (o3d-secops r28, Codex MEDIUM).
+     *
+     * script(1) allocates a pty and makes it the child's controlling terminal, so `/dev/tty` opens
+     * inside the wrapper exactly as it does for an operator — and `typed` is what that operator
+     * types. Piping into the wrapper's STDIN cannot substitute for this and is asserted not to:
+     * the wrapper reads its answer from the terminal and never from stdin.
+     */
+    const runOnTty = (wrapper: string, args: string[], typed: string) => {
+      const quoted = [wrapper, ...args].map((word) => `'${word.replace(/'/g, `'\\''`)}'`).join(' ')
+      const child = spawnSync('script', ['-q', '-e', '-c', quoted, '/dev/null'], {
+        encoding: 'utf8',
+        input: `${typed}\n`,
+        env: wrapperEnv,
+      })
+      // script(1) merges the streams through the pty and the tty turns \n into \r\n.
+      return { status: child.status, output: `${child.stdout ?? ''}${child.stderr ?? ''}`.replace(/\r/g, '') }
+    }
+    /** The token the wrapper displayed, read back out of what it printed. */
+    const tokenFrom = (output: string, action: string) => {
+      const match = new RegExp(`Type (${action}-[0-9a-f]{12}) to proceed`).exec(output)
+      assert.ok(match, `the wrapper must display the token it wants typed:\n${output}`)
+      return match[1]
+    }
+
+    const publish = runShell(
+      artefactHarness(dir, [
+        'db_fence_script_in_use >/dev/null || exit 1',
+        `db_fence_publish_operator_wrappers "$(id -un)" ${JSON.stringify(envFile)} ${JSON.stringify(state)} ${JSON.stringify(cutoverLock)} --app-host=db.internal --app-port=6432 --app-user=imsapp --app-database=imsdb || exit 1`,
+      ]),
+    )
+    assert.equal(publish.status, 0, `the wrappers must be published:\n${publish.output}`)
+    assert.ok(existsSync(paths.resolveWrapper), `the resolution wrapper must be published too:\n${publish.output}`)
+    assert.equal(spawnSync('bash', ['-n', paths.resolveWrapper], { encoding: 'utf8' }).status, 0, 'and must parse')
+
+    // THE RECORDS, MADE THE ONLY HONEST WAY: published by the shipped validator through the
+    // shipped wrapper, then stripped of the fields a validator that predates them never wrote.
+    const raised = run(paths.refenceWrapper)
+    assert.equal(raised.status, 0, `${raised.stdout}${raised.stderr}`)
+    const modern = JSON.parse(readFileSync(state, 'utf8'))
+    assert.equal(modern.fence_applied, 1, 'precondition: an ordinary re-fence stamps its record applied')
+    assert.equal(modern.cluster_system_identifier, FENCE_PLAN_CLUSTER.systemIdentifier,
+      'precondition: and records which cluster it was raised against (o3d-secops r28)')
+    const withoutStamp = { ...modern }
+    delete withoutStamp.fence_applied
+    delete withoutStamp.fence_mode
+    // A RECORD FROM A VALIDATOR THAT PREDATES THE STAMP PREDATES THE FINGERPRINT TOO. That is what
+    // makes every legacy record UNPROVEN by construction and is the whole of r28's HIGH 1.
+    const legacyRecord = { ...withoutStamp }
+    delete legacyRecord.cluster_system_identifier
+    delete legacyRecord.cluster_database_oid
+    const LEGACY = `${JSON.stringify(legacyRecord, null, 2)}\n`
+    const FINGERPRINTED = `${JSON.stringify(withoutStamp, null, 2)}\n`
+    const plantLegacy = () => writeFileSync(state, LEGACY)
+    const plantFingerprinted = () => writeFileSync(state, FINGERPRINTED)
+
+    // PHASE 1 — THE AUTOMATIC PATH REFUSES, AND SAYS WHERE TO GO.
+    plantLegacy()
+    const refused = run(paths.refenceWrapper)
+    assert.equal(refused.status, 1, `a re-fence over an unstamped record must refuse:\n${refused.stdout}${refused.stderr}`)
+    assert.equal(readFileSync(state, 'utf8'), LEGACY, 'and publish nothing over it')
+    assert.match(refused.stderr, /carries no applied stamp at all/, refused.stderr)
+    assert.ok(refused.stderr.includes(paths.resolveWrapper),
+      `the refusal must name the wrapper that resolves it:\n${refused.stderr}`)
+    assert.ok(!/--fence/.test(readFileSync(calls, 'utf8').split('\n').slice(-1)[0] ?? ''),
+      `and must never reach the executor:\n${readFileSync(calls, 'utf8')}`)
+
+    // PHASE 2 — AND THE RELEASE STILL WORKS OVER IT, WHICH IS THE ESCAPE HATCH. Nothing in the
+    // release path consults the stamp or the fingerprint's absence, so an operator holding a record
+    // no automatic path will touch can still take a standing fence down.
+    //
+    // WHAT r30 CHANGED HERE, AND WHY (Codex HIGH 1). The GRANTs are still automatic -- that is the
+    // escape hatch, and restoring privilege is the recoverable direction -- but ROOT NO LONGER
+    // REMOVES THE RECORD on the strength of the helper's exit status. r29 measured that a physical
+    // copy of a fenced cluster answers a release exactly as the original does, so an exit 0 here
+    // cannot show WHICH server was released, and removing the record on it would destroy the only
+    // account of a fence possibly still standing on the original. This wrapper is the case that
+    // matters: it is run against records EARLIER runs published, so it has nothing to attest with.
+    // It therefore offers the removal and asks at the terminal -- and this fixture has none, which
+    // is exactly the refusal asserted below. The record surviving is the finding being closed, not
+    // a regression: the ordinary in-cutover release still clears its own record automatically,
+    // which is what tests/scripts/db-connection-fence.test.ts measures against real clusters.
+    writeFileSync(calls, '')
+    const released = run(paths.releaseWrapper)
+    assert.match(readFileSync(calls, 'utf8'), /^--release /m, 'reaching the helper with the record it names')
+    assert.match(released.stderr, /ABOUT TO REMOVE the connection-fence authority/,
+      `the release must still run and then OFFER the removal:\n${released.stdout}${released.stderr}`)
+    assert.match(released.stderr, /record digest:\s+[0-9a-f]{64}/,
+      `bound to the record's exact bytes:\n${released.stderr}`)
+    assert.equal(released.status, 1,
+      `and with no terminal to confirm at, it must not remove anything:\n${released.stdout}${released.stderr}`)
+    assert.match(released.stderr, /no controlling terminal/, released.stderr)
+    assert.equal(existsSync(state), true,
+      'so the record survives -- it is the only thing a release of the REAL fence could be built from')
+    assert.equal(readFileSync(state, 'utf8'), LEGACY, 'byte for byte as it was found')
+
+    // PHASE 3a — A FULLY-WITHDRAWN ACL IS REPORTED AND NOT STAMPED (o3d-secops r27, Codex HIGH).
+    plantLegacy()
+    fixture({ privileges: FENCED })
+    const reported = run(paths.resolveWrapper)
+    assert.equal(reported.status, 1, `an unconfirmed run must not stamp:\n${reported.stdout}${reported.stderr}`)
+    assert.equal(readFileSync(state, 'utf8'), LEGACY, 'and must leave the record byte for byte as it was found')
+    assert.match(reported.stderr, /TWO HISTORIES/, `naming both causes:\n${reported.stderr}`)
+    assert.match(reported.stderr, /ADMINISTRATOR took CONNECT/, `including the one that is not a fence:\n${reported.stderr}`)
+    assert.match(reported.stderr, /PUBLIC, imsapp/, `and printing the evidence itself:\n${reported.stderr}`)
+    assert.ok(reported.stderr.includes('--this-fence-revoked-them'),
+      `and telling the operator exactly what to re-run:\n${reported.stderr}`)
+
+    // PHASE 3b — AND THE FLAG ALONE IS STILL NOT A CONFIRMATION (o3d-secops r28, Codex MEDIUM).
+    // With no terminal there is nobody to confirm to, so the run that used to stamp now refuses —
+    // and it refuses in the direction that changes nothing.
+    const flagOnly = run(paths.resolveWrapper, ['--this-fence-revoked-them'])
+    assert.equal(flagOnly.status, 1, `a flag is not a confirmation:\n${flagOnly.stdout}${flagOnly.stderr}`)
+    assert.equal(readFileSync(state, 'utf8'), LEGACY, 'and the record must be exactly as it was found')
+    assert.match(flagOnly.stderr, /NOT CONFIRMED/, flagOnly.stderr)
+    assert.match(flagOnly.stderr, /no controlling terminal/, `saying what is missing:\n${flagOnly.stderr}`)
+    // AND STDIN IS NOT THE TERMINAL. Piping the right shape of answer in is the copy-paste route
+    // the finding is about, and it must not work either.
+    const piped = spawnSync(paths.resolveWrapper, ['--this-fence-revoked-them'], {
+      encoding: 'utf8', env: wrapperEnv, input: 'stamp-000000000000\n',
+    })
+    assert.equal(piped.status, 1, `stdin is not a controlling terminal:\n${piped.stdout}${piped.stderr}`)
+    assert.equal(readFileSync(state, 'utf8'), LEGACY, 'and nothing was changed by it')
+
+    // PHASE 3b-i — AT A TERMINAL, WITH THE WRONG ANSWER. The token is displayed and something else
+    // is typed; the record must not move. This is what proves the comparison is load-bearing
+    // rather than the terminal merely being present.
+    const wrongAnswer = runOnTty(paths.resolveWrapper, ['--this-fence-revoked-them'], 'stamp-deadbeefcafe')
+    assert.equal(wrongAnswer.status, 1, `a wrong answer must abort:\n${wrongAnswer.output}`)
+    assert.equal(readFileSync(state, 'utf8'), LEGACY, 'and change nothing')
+    assert.match(wrongAnswer.output, /NOT CONFIRMED/, wrongAnswer.output)
+    const stampToken = tokenFrom(wrongAnswer.output, 'stamp')
+
+    // PHASE 3b-ii — AND WITH THE TOKEN IT DISPLAYED, TYPED BACK, IT STAMPS. This is the fact only a
+    // person holds: they know whether they revoked those roles, and the database never will.
+    const stamped = runOnTty(paths.resolveWrapper, ['--this-fence-revoked-them'], stampToken)
+    assert.equal(stamped.status, 0, `a confirmed standing fence must resolve:\n${stamped.output}`)
+    assert.match(stamped.output, /CONFIRMED BY THE OPERATOR/, stamped.output)
+    const afterStamp = JSON.parse(readFileSync(state, 'utf8'))
+    assert.equal(afterStamp.fence_applied, 1, 'the record now says the fence it describes is standing')
+    assert.deepEqual(afterStamp.revoked, modern.revoked, 'and nothing else about it moved')
+    assert.match(stamped.output, /is stamped APPLIED/, stamped.output)
+    // AND THE AUTOMATIC PATH IS UNBLOCKED, under the rule the evidence earned.
+    const afterResolve = run(paths.refenceWrapper)
+    assert.equal(afterResolve.status, 0, `${afterResolve.stdout}${afterResolve.stderr}`)
+    assert.equal(JSON.parse(readFileSync(state, 'utf8')).fence_mode, 'recovery',
+      `a resolved standing fence re-fences under the recovery rule:\n${afterResolve.stderr}`)
+
+    // PHASE 3b-iii — AND THE TOKEN IS BOUND TO THAT RECORD AND NOT TO THE ACTION (o3d-secops r28).
+    // The same operator, the same wrapper, the same decision — over a record whose bytes differ —
+    // must not accept the token the previous record displayed. Without this the token would be a
+    // password, and a password typed once is a flag with extra steps.
+    plantLegacy()
+    const otherRecord = JSON.parse(LEGACY)
+    otherRecord.revoked = ['PUBLIC', 'imsapp', 'metabase']
+    writeFileSync(state, `${JSON.stringify(otherRecord, null, 2)}\n`)
+    const staleToken = runOnTty(paths.resolveWrapper, ['--this-fence-revoked-them'], stampToken)
+    assert.equal(staleToken.status, 1, `a token bound to another record must not confirm this one:\n${staleToken.output}`)
+    assert.equal(JSON.parse(readFileSync(state, 'utf8')).fence_applied, undefined, 'and the record must be unstamped still')
+    assert.notEqual(tokenFrom(staleToken.output, 'stamp'), stampToken,
+      'and the token it asks for must differ, because the record does')
+
+    // PHASE 4a — A SPENT LEGACY RECORD IS NOT CLEARED AUTOMATICALLY (o3d-secops r28, Codex HIGH 1).
+    // Every recorded grantee still holds CONNECT, which is what a publication killed before BEGIN
+    // leaves — AND is what an unfenced bystander cluster with a database of the same name shows.
+    // The record carries no fingerprint, so the two cannot be told apart, and the arm that deletes
+    // is the one that must not guess.
+    plantLegacy()
+    fixture({ privileges: UNFENCED })
+    const notCleared = run(paths.resolveWrapper)
+    assert.equal(notCleared.status, 1, `an unattributable reading must not delete a record:\n${notCleared.stdout}${notCleared.stderr}`)
+    assert.equal(readFileSync(state, 'utf8'), LEGACY, 'and the record must be byte for byte what it was')
+    assert.match(notCleared.stderr, /CANNOT BE ATTRIBUTED/, notCleared.stderr)
+    assert.match(notCleared.stderr, /no cluster fingerprint/, `naming what is missing:\n${notCleared.stderr}`)
+    assert.ok(notCleared.stderr.includes('--no-fence-stands-here'),
+      `and telling the operator exactly what to re-run:\n${notCleared.stderr}`)
+
+    // PHASE 4a-i — AND WITH THE ARGUMENT AND THE TOKEN, IT GOES. The operator has looked at the
+    // host and vouched that this is the cluster the record was written against; that is the fact
+    // the fingerprint would have supplied and does not.
+    const clearRefused = runOnTty(paths.resolveWrapper, ['--no-fence-stands-here'], 'clear-000000000000')
+    assert.equal(clearRefused.status, 1, `a wrong answer must abort the removal too:\n${clearRefused.output}`)
+    assert.equal(readFileSync(state, 'utf8'), LEGACY, 'and the record must survive it')
+    const clearToken = tokenFrom(clearRefused.output, 'clear')
+    const cleared = runOnTty(paths.resolveWrapper, ['--no-fence-stands-here'], clearToken)
+    assert.equal(cleared.status, 0, `a confirmed removal must resolve:\n${cleared.output}`)
+    assert.equal(existsSync(state), false, 'by being removed, so the next cutover plans afresh')
+
+    // PHASE 4d — AND WHERE THE CLUSTER IS PROVEN IT IS AUTOMATIC AGAIN. The record carries the
+    // fingerprint of the cluster that just answered, so the reading is attributable and clearing
+    // costs nothing whichever history produced it. Without this arm the round would have traded
+    // one defect for a wrapper that can never finish anything on its own.
+    plantFingerprinted()
+    const autoCleared = run(paths.resolveWrapper)
+    assert.equal(autoCleared.status, 0, `an attributable spent record must clear automatically:\n${autoCleared.stdout}${autoCleared.stderr}`)
+    assert.equal(existsSync(state), false, 'and be gone')
+
+    // PHASE 4b — THE MIXED READING CHANGES NOTHING.
+    plantLegacy()
+    fixture({ privileges: MIXED })
+    const undecided = run(paths.resolveWrapper)
+    assert.equal(undecided.status, 1, `a mixed reading must refuse:\n${undecided.stdout}${undecided.stderr}`)
+    assert.equal(readFileSync(state, 'utf8'), LEGACY, 'and leave the record byte for byte as it was found')
+    assert.match(undecided.stderr, /NOT RESOLVED/, undecided.stderr)
+    assert.match(undecided.stderr, /A MIXED reading/, `naming what it could not settle:\n${undecided.stderr}`)
+
+    // AND NEITHER ARGUMENT AUTHORISES ANYTHING BY ITSELF (o3d-secops r27, extended r28). Each is
+    // consulted on ONE reading, and a mixed ACL is neither of them — so no terminal is even
+    // offered and nothing moves.
+    for (const flag of ['--this-fence-revoked-them', '--no-fence-stands-here']) {
+      const forced = runOnTty(paths.resolveWrapper, [flag], 'anything')
+      assert.equal(forced.status, 1, `${flag} must not settle a mixed reading:\n${forced.output}`)
+      assert.equal(readFileSync(state, 'utf8'), LEGACY, `${flag}: and must change nothing`)
+      assert.match(forced.output, /authorised nothing/, `${flag}: saying so plainly:\n${forced.output}`)
+    }
+
+    // PHASE 4c — AND THE TWO CHANNELS MUST AGREE. The audit decided `absent` and then failed on its
+    // way out; a status can be produced by a shell that never ran the helper and a line by a helper
+    // that could not decide, so neither alone may move a record.
+    plantFingerprinted()
+    fixture({ privileges: UNFENCED, crash: true })
+    const halfAnswered = run(paths.resolveWrapper)
+    assert.equal(halfAnswered.status, 1, `a verdict from a run that failed must not be acted on:\n${halfAnswered.stdout}${halfAnswered.stderr}`)
+    assert.equal(readFileSync(state, 'utf8'), FINGERPRINTED, 'and the record must be exactly as it was found')
+    assert.match(halfAnswered.stderr, /NOT RESOLVED/, halfAnswered.stderr)
+
+    // PHASE 5 — AND IT IS NOT A GENERAL-PURPOSE STAMP.
+    fixture({ privileges: FENCED })
+    const notAmbiguous: [string, string, RegExp][] = [
+      ['already stamped', JSON.stringify({ ...modern, fence_mode: 'initial', fence_applied: 1 }, null, 2), /already stamped applied/],
+      ['published, never applied', JSON.stringify({ ...modern, fence_mode: 'initial', fence_applied: 0 }, null, 2), /PUBLISHED, NEVER APPLIED/],
+      ['truncated', JSON.stringify({ ...modern, state_complete: undefined }, null, 2), /completeness sentinel/],
+      ['not JSON', 'this is not a record', /does not hold valid JSON/],
+    ]
+    for (const [label, body, says] of notAmbiguous) {
+      writeFileSync(state, `${body}\n`)
+      const before = readFileSync(state, 'utf8')
+      const refusal = run(paths.resolveWrapper)
+      assert.equal(refusal.status, 1, `${label}: must refuse:\n${refusal.stdout}${refusal.stderr}`)
+      assert.match(refusal.stderr, says, `${label}: naming why:\n${refusal.stderr}`)
+      assert.equal(readFileSync(state, 'utf8'), before, `${label}: and changing nothing`)
+    }
+
+    // PHASE 6 — A SAME-NAMED DATABASE ON ANOTHER HOST RESOLVES NOTHING (o3d-secops r27, HIGH 1).
+    adminUrlNaming('replica.internal:6432')
+    for (const [label, privileges] of [['unfenced', UNFENCED], ['fenced', FENCED]] as const) {
+      plantLegacy()
+      fixture({ privileges })
+      const wrongCluster = run(paths.resolveWrapper)
+      assert.equal(wrongCluster.status, 1, `${label}: another host must resolve nothing:\n${wrongCluster.stdout}${wrongCluster.stderr}`)
+      assert.equal(readFileSync(state, 'utf8'), LEGACY, `${label}: and the authority must be byte for byte what it was`)
+      assert.match(wrongCluster.stderr, /NOT AUDITED/, `${label}: the audit itself must refuse:\n${wrongCluster.stderr}`)
+      assert.match(wrongCluster.stderr, /replica\.internal/, `${label}: naming the host it reached:\n${wrongCluster.stderr}`)
+      assert.ok(!/legacy_fence_verdict=/.test(wrongCluster.stdout),
+        `${label}: and no verdict may be printed for the wrapper to act on:\n${wrongCluster.stdout}`)
+    }
+    adminUrlNaming('db.internal:6432')
+
+    // PHASE 8 — AND A SAME-NAMED DATABASE ON ANOTHER CLUSTER AT THE RIGHT HOST RESOLVES NOTHING
+    // EITHER (o3d-secops r28, Codex HIGH 1). THE LOAD-BEARING CASE. Every argv/URL check above
+    // passes: the host, the port, the database name and the role are all correct, and the server
+    // behind them is a different PostgreSQL cluster — which is what DNS, a proxy or a failover
+    // produces and what r27 said it could not detect. The ACL is the UNFENCED one, which is
+    // exactly the reading that made r26 and r27 DELETE the record.
+    plantFingerprinted()
+    for (const [label, privileges] of [['unfenced', UNFENCED], ['fenced', FENCED]] as const) {
+      writeFileSync(state, FINGERPRINTED)
+      fixture({ privileges, systemIdentifier: '7409999999999999999' })
+      const otherCluster = run(paths.resolveWrapper)
+      assert.equal(otherCluster.status, 1, `${label}: another cluster must resolve nothing:\n${otherCluster.stdout}${otherCluster.stderr}`)
+      assert.equal(readFileSync(state, 'utf8'), FINGERPRINTED, `${label}: and the authority must be byte for byte what it was`)
+      assert.match(otherCluster.stderr, /NOT AUDITED/, `${label}: the audit itself must refuse:\n${otherCluster.stderr}`)
+      assert.match(otherCluster.stderr, /7409999999999999999/, `${label}: naming the cluster that answered:\n${otherCluster.stderr}`)
+      assert.ok(!/legacy_fence_verdict=/.test(otherCluster.stdout),
+        `${label}: and no verdict may be printed:\n${otherCluster.stdout}`)
+    }
+    // AND THE DATABASE OID IS THE OTHER HALF: the same cluster, and a database of the same name
+    // that was dropped and recreated. The system identifier cannot see that at all.
+    writeFileSync(state, FINGERPRINTED)
+    fixture({ privileges: UNFENCED, databaseOid: '29999' })
+    const recreated = run(paths.resolveWrapper)
+    assert.equal(recreated.status, 1, `a recreated database is not the one the record names:\n${recreated.stdout}${recreated.stderr}`)
+    assert.equal(readFileSync(state, 'utf8'), FINGERPRINTED, 'and the record must survive it')
+    assert.match(recreated.stderr, /OID/, recreated.stderr)
+
+    // PHASE 9 — A RECORD THAT CHANGED BETWEEN THE AUDIT AND THE ACTION IS NOT ACTED ON
+    // (o3d-secops r28, Codex HIGH 3). The audit rewrites the record while it runs, which is what a
+    // concurrent release does in that window, and is not something this test could arrange from
+    // outside the wrapper. The stamp is held to the digest the inspection reported, so it refuses.
+    plantFingerprinted()
+    const replacement = `${JSON.stringify({ ...withoutStamp, revoked: ['PUBLIC'] }, null, 2)}\n`
+    fixture({ privileges: FENCED, rewriteStateTo: replacement })
+    // THE CONFIRMATION IS REACHED FIRST, SO IT HAS TO BE SATISFIED OR THE COMPARE-AND-SWAP IS
+    // NEVER EXERCISED AT ALL. Measured: with a wrong answer here, deleting the digest from the
+    // stamp changed nothing anywhere in this file — the run aborted at the terminal and the write
+    // was never attempted. So the token this record displays is read off a probe run, the record
+    // is put back to the bytes that token belongs to, and the real run types it: the operator
+    // confirms the record they were shown, and the record changes underneath them anyway.
+    const probe = runOnTty(paths.resolveWrapper, ['--this-fence-revoked-them'], 'stamp-000000000000')
+    assert.equal(probe.status, 1, `the probe run must abort at the terminal:\n${probe.output}`)
+    const movedToken = tokenFrom(probe.output, 'stamp')
+    plantFingerprinted()
+    const moved = runOnTty(paths.resolveWrapper, ['--this-fence-revoked-them'], movedToken)
+    assert.equal(moved.status, 1, `a record that moved under the audit must not be stamped:\n${moved.output}`)
+    assert.match(moved.output, /NOT STAMPED/, `and must say so:\n${moved.output}`)
+    assert.match(moved.output, /inspected and audited/, `naming the bytes it was held to:\n${moved.output}`)
+    assert.equal(readFileSync(state, 'utf8'), replacement, 'and what is there is what the other writer left')
+    assert.equal(JSON.parse(readFileSync(state, 'utf8')).fence_applied, undefined, 'unstamped')
+    // AND THE SAME FOR THE REMOVAL, which is the more expensive of the two: a record deleted in
+    // error is the only account of what a standing fence revoked.
+    plantFingerprinted()
+    fixture({ privileges: UNFENCED, rewriteStateTo: replacement })
+    const movedClear = run(paths.resolveWrapper)
+    assert.equal(movedClear.status, 1, `a record that moved under the audit must not be removed:\n${movedClear.stdout}${movedClear.stderr}`)
+    assert.equal(existsSync(state), true, 'and must still be there')
+    assert.match(movedClear.stderr, /NOT CLEARED/, movedClear.stderr)
+    assert.match(movedClear.stderr, /inspected and audited/, `saying that the bytes moved:\n${movedClear.stderr}`)
+
+    // PHASE 10 — AND ALL THREE WRAPPERS HOLD THE SHARED CUTOVER LOCK FOR THE WHOLE SEQUENCE
+    // (o3d-secops r28, Codex HIGH 3). A cutover, or another wrapper, holding it means this one
+    // reads nothing at all — which is the point: the interleaving the finding describes starts at
+    // the read.
+    plantFingerprinted()
+    fixture({ privileges: UNFENCED })
+    writeFileSync(calls, '')
+    const before = readFileSync(state, 'utf8')
+    for (const wrapper of [paths.resolveWrapper, paths.releaseWrapper, paths.refenceWrapper]) {
+      const held = spawnSync('bash', [
+        '-c',
+        'exec 9<"$1" || exit 90; flock -n 9 || exit 91; "$2"; printf "WRAPPER_RC=%s\\n" "$?"',
+        'holder', cutoverLock, wrapper,
+      ], { encoding: 'utf8', env: wrapperEnv })
+      const said = `${held.stdout ?? ''}${held.stderr ?? ''}`
+      assert.match(said, /^WRAPPER_RC=1$/m, `${wrapper} must refuse while the cutover lock is held:\n${said}`)
+      assert.match(said, /is held by another run/, `${wrapper} must say what holds it:\n${said}`)
+      assert.equal(readFileSync(state, 'utf8'), before, `${wrapper}: and must change nothing`)
+      assert.equal(readFileSync(calls, 'utf8'), '', `${wrapper}: and must not reach the helper at all`)
+    }
+    // AND THE LOCK IS RELEASED WITH THE PROCESS, so the very next run works. Without this the
+    // assertions above would be satisfied by a wrapper that refuses unconditionally.
+    const afterLock = run(paths.resolveWrapper)
+    assert.equal(afterLock.status, 0, `with nothing holding the lock the same run must proceed:\n${afterLock.stdout}${afterLock.stderr}`)
+    assert.equal(existsSync(state), false, 'and clear the attributable spent record it was given')
+
+    // PHASE 7 — AND AN ARGUMENT IT DOES NOT RECOGNISE IS A REFUSAL, NOT SOMETHING IGNORED.
+    plantLegacy()
+    fixture({ privileges: FENCED })
+    writeFileSync(calls, '')
+    const mistyped = run(paths.resolveWrapper, ['--this-fence-revoked-tem'])
+    assert.equal(mistyped.status, 1, `an unrecognised argument must refuse:\n${mistyped.stdout}${mistyped.stderr}`)
+    assert.match(mistyped.stderr, /unrecognised argument/, mistyped.stderr)
+    assert.equal(readFileSync(state, 'utf8'), LEGACY, 'and change nothing')
+    assert.equal(readFileSync(calls, 'utf8'), '', 'and never reach the helper at all')
+
+    // AND WITH NO RECORD AT ALL, which is not a fence it may declare resolved either.
+    plantLegacy()
+    rmSync(state)
+    const nothing = run(paths.resolveWrapper)
+    assert.equal(nothing.status, 1, `${nothing.stdout}${nothing.stderr}`)
+    assert.match(nothing.stderr, /NOT RESOLVABLE/, nothing.stderr)
+    assert.equal(existsSync(state), false, 'and it creates nothing')
   } finally {
     rmSync(dir, { recursive: true, force: true })
   }
@@ -8601,7 +10465,7 @@ test('r33: a script-only pin cannot authorise a publication whose closure comes 
 
     // PHASE 1 — THE PIN THAT LOOKS LIKE AUTHORISATION.
     const refused = runShell(
-      artefactHarness(dir, [`DB_FENCE_EXPECTED_SHA256=${entryDigest}`, 'db_fence_script_in_use >/dev/null; echo "RC=$?"']),
+      artefactHarness(dir, ['db_fence_script_in_use >/dev/null; echo "RC=$?"'], [`IMS_FENCE_SCRIPT_SHA256=${entryDigest}`]),
     )
     assert.match(refused.output, /^RC=1$/m, `a script-only pin must not authorise this publication:\n${refused.output}`)
     assert.match(refused.output, /IMS_FENCE_SCRIPT_SHA256 IS NOT SUFFICIENT HERE/, refused.output)
@@ -8641,10 +10505,9 @@ test('r33: a script-only pin cannot authorise a publication whose closure comes 
     const reported = /just now hashes to ([0-9a-f]{64})/.exec(refused.output)?.[1]
     assert.ok(reported, `the refusal must report what the tree would hash to:\n${refused.output}`)
     const pinned = runShell(
-      artefactHarness(dir, [
-        `DB_FENCE_EXPECTED_SHA256=${entryDigest}`,
-        `DB_FENCE_EXPECTED_ARTEFACT_SHA256=${reported}`,
-        'db_fence_script_in_use >/dev/null; echo "RC=$?"',
+      artefactHarness(dir, ['db_fence_script_in_use >/dev/null; echo "RC=$?"'], [
+        `IMS_FENCE_SCRIPT_SHA256=${entryDigest}`,
+        `IMS_FENCE_ARTEFACT_SHA256=${reported}`,
       ]),
     )
     assert.match(pinned.output, /^RC=0$/m, `the artefact pin the refusal named must be accepted:\n${pinned.output}`)
@@ -8665,7 +10528,7 @@ test('r33: a script-only pin cannot authorise a publication whose closure comes 
     writeFenceCheckout(clean, importReportingHelper(clean))
     const digest = sha256File(checkoutHelper(clean))
     const result = runShell(
-      artefactHarness(clean, [`DB_FENCE_EXPECTED_SHA256=${digest}`, 'db_fence_script_in_use >/dev/null; echo "RC=$?"']),
+      artefactHarness(clean, ['db_fence_script_in_use >/dev/null; echo "RC=$?"'], [`IMS_FENCE_SCRIPT_SHA256=${digest}`]),
     )
     assert.match(result.output, /^RC=0$/m, `a trusted source must publish under the entry-file pin alone:\n${result.output}`)
     assert.doesNotMatch(result.output, /IS NOT SUFFICIENT/, result.output)
@@ -8738,15 +10601,12 @@ test('r34: an unpinned bootstrap out of an application-writable checkout is REFU
     // the release host produces it: assemble and hash without executing) and the bootstrap goes
     // through. This is the assertion that keeps the refusal from being a brick wall.
     const probe = runShell(
-      artefactHarness(dir, ['db_fence_probe_script >/dev/null 2>&1', 'echo "CANDIDATE=[${DB_FENCE_PROBE_ARTEFACT_SHA256}]"']),
+      artefactHarness(dir, ['db_fence_probe_digests >/dev/null 2>&1', 'echo "CANDIDATE=[${DB_FENCE_PROBE_ARTEFACT_SHA256}]"']),
     )
     const candidate = /^CANDIDATE=\[([0-9a-f]{64})\]$/m.exec(probe.output)?.[1] ?? ''
     assert.match(candidate, /^[0-9a-f]{64}$/, `the digest must be obtainable without publishing:\n${probe.output}`)
     const pinned = runShell(
-      artefactHarness(dir, [
-        `DB_FENCE_EXPECTED_ARTEFACT_SHA256=${candidate}`,
-        'db_fence_script_in_use >/dev/null; echo "RC=$?"',
-      ]),
+      artefactHarness(dir, ['db_fence_script_in_use >/dev/null; echo "RC=$?"'], [`IMS_FENCE_ARTEFACT_SHA256=${candidate}`]),
     )
     assert.match(pinned.output, /^RC=0$/m, `the pinned bootstrap must publish:\n${pinned.output}`)
     assert.equal(
@@ -8955,7 +10815,7 @@ test('r33: every printed recovery instruction carries the privilege the account 
     const publish = runShell(
       artefactHarness(dir, [
         'db_fence_script_in_use >/dev/null || exit 1',
-        `db_fence_publish_operator_wrappers "$(id -un)" ${JSON.stringify(join(dir, 'app', '.env'))} ${JSON.stringify(join(dir, 'state.json'))} --app-user=imsapp || exit 1`,
+        `db_fence_publish_operator_wrappers "$(id -un)" ${JSON.stringify(join(dir, 'app', '.env'))} ${JSON.stringify(join(dir, 'state.json'))} ${JSON.stringify(join(dir, 'cutover.lock'))} --app-user=imsapp || exit 1`,
       ]),
     )
     assert.equal(publish.status, 0, `the wrappers must be published:\n${publish.output}`)
@@ -9249,7 +11109,7 @@ test('r33: an authenticated rotation out of an application-writable checkout nee
     writeFenceCheckout(dir, importReportingHelper(dir))
     const paths = protectedPaths(dir)
     const v1 = sha256File(checkoutHelper(dir))
-    const first = runShell(artefactHarness(dir, [`DB_FENCE_EXPECTED_SHA256=${v1}`, 'db_fence_script_in_use >/dev/null; echo "RC=$?"']))
+    const first = runShell(artefactHarness(dir, ['db_fence_script_in_use >/dev/null; echo "RC=$?"'], [`IMS_FENCE_SCRIPT_SHA256=${v1}`]))
     assert.match(first.output, /^RC=0$/m, `the clean bootstrap must publish:\n${first.output}`)
     const standing = readFileSync(paths.pgEntry, 'utf8')
     assert.match(standing, /SHIPPED-PG/, 'and the vendored package is the shipped one')
@@ -9260,7 +11120,7 @@ test('r33: an authenticated rotation out of an application-writable checkout nee
     chmodSync(checkoutPgEntry(dir), 0o664)
     const v2 = sha256File(checkoutHelper(dir))
     assert.notEqual(v2, v1, 'precondition: this is a real upgrade of the entry file')
-    const refused = runShell(artefactHarness(dir, [`DB_FENCE_EXPECTED_SHA256=${v2}`, 'db_fence_script_in_use >/dev/null; echo "RC=$?"']))
+    const refused = runShell(artefactHarness(dir, ['db_fence_script_in_use >/dev/null; echo "RC=$?"'], [`IMS_FENCE_SCRIPT_SHA256=${v2}`]))
     assert.match(refused.output, /^RC=1$/m, `the rotation must be refused:\n${refused.output}`)
     assert.match(refused.output, /IMS_FENCE_SCRIPT_SHA256 IS NOT SUFFICIENT HERE/, refused.output)
     assert.equal(readFileSync(paths.pgEntry, 'utf8'), standing, 'and the standing artefact must be untouched')
@@ -9271,10 +11131,9 @@ test('r33: an authenticated rotation out of an application-writable checkout nee
     const reported = /just now hashes to ([0-9a-f]{64})/.exec(refused.output)?.[1]
     assert.ok(reported, `the refusal must report what the tree would hash to:\n${refused.output}`)
     const rotated = runShell(
-      artefactHarness(dir, [
-        `DB_FENCE_EXPECTED_SHA256=${v2}`,
-        `DB_FENCE_EXPECTED_ARTEFACT_SHA256=${reported}`,
-        'db_fence_script_in_use >/dev/null; echo "RC=$?"',
+      artefactHarness(dir, ['db_fence_script_in_use >/dev/null; echo "RC=$?"'], [
+        `IMS_FENCE_SCRIPT_SHA256=${v2}`,
+        `IMS_FENCE_ARTEFACT_SHA256=${reported}`,
       ]),
     )
     assert.match(rotated.output, /^RC=0$/m, `the whole-tree pin must authorise it:\n${rotated.output}`)
@@ -9362,9 +11221,8 @@ test('r34: a directory ABOVE the application directory is part of the provenance
       [
         'set -uo pipefail',
         'exec 2>&1',
-        `source ${JSON.stringify(join(process.cwd(), 'scripts/lib/db-fence-protected.sh'))}`,
-        `DB_FENCE_SCRIPT=${JSON.stringify(checkoutHelper(parent))}`,
         ...protectedLibraryLinesAt(recovery),
+        `DB_FENCE_SCRIPT=${JSON.stringify(checkoutHelper(parent))}`,
         'chown(){ :; }',
         'db_fence_script_in_use >/dev/null; echo "RC=$?"',
       ].join('\n'),
@@ -9471,12 +11329,12 @@ test('r34: a dry run reports the tree it WOULD publish, not the one already stan
     writeFileSync(join(dirs.app, 'scripts', 'fence-db-connections.mjs'), '// v1\n')
     rmSync(dirs.recovery, { recursive: true, force: true })
     const first = runShell(
-      rotationHarness(dirs, ['db_fence_probe_script >/dev/null 2>&1', 'echo "CANDIDATE=[${DB_FENCE_PROBE_ARTEFACT_SHA256}]"']),
+      rotationHarness(dirs, ['db_fence_probe_digests >/dev/null 2>&1', 'echo "CANDIDATE=[${DB_FENCE_PROBE_ARTEFACT_SHA256}]"']),
     )
     const v1 = /^CANDIDATE=\[([0-9a-f]{64})\]$/m.exec(first.output)?.[1] ?? ''
     assert.match(v1, /^[0-9a-f]{64}$/, first.output)
     const publish = runShell(
-      rotationHarness(dirs, [`DB_FENCE_EXPECTED_ARTEFACT_SHA256=${v1}`, 'db_fence_script_in_use >/dev/null; echo "RC=$?"']),
+      rotationHarness(dirs, ['db_fence_script_in_use >/dev/null; echo "RC=$?"'], [`IMS_FENCE_ARTEFACT_SHA256=${v1}`]),
     )
     assert.match(publish.output, /^RC=0$/m, `precondition: an artefact must be standing:\n${publish.output}`)
 
@@ -9484,10 +11342,12 @@ test('r34: a dry run reports the tree it WOULD publish, not the one already stan
     writeFileSync(join(dirs.app, 'scripts', 'fence-db-connections.mjs'), '// v2\n')
     const probe = runShell(
       rotationHarness(dirs, [
-        'db_fence_probe_script; echo "RC=$?"',
-        'echo "PROBE=[${DB_FENCE_PROBE_SCRIPT}]"',
+        ...preflightSpies(join(dirs.app, '..', 'scratch-upgrade')),
+        'db_fence_probe_digests; echo "DRC=$?"',
         'echo "CANDIDATE=[${DB_FENCE_PROBE_ARTEFACT_SHA256}]"',
         'echo "STANDING=[${DB_FENCE_PROBE_STANDING_SHA256}]"',
+        'db_fence_preflight notice -- runner; echo "RC=$?"',
+        'report_probe',
       ]),
     )
     const candidate = /^CANDIDATE=\[([0-9a-f]{64})\]$/m.exec(probe.output)?.[1] ?? ''
@@ -9496,21 +11356,20 @@ test('r34: a dry run reports the tree it WOULD publish, not the one already stan
     assert.equal(standing, v1, 'the standing digest is what was published')
     assert.notEqual(candidate, standing, 'and the candidate is a DIFFERENT tree, because the checkout moved')
 
-    // THE PREFLIGHT STILL USES THE AUTHENTICATED ARTEFACT, which is the other half of the split:
-    // reporting the candidate does not mean running it.
+    // THE PREFLIGHT STILL RUNS THE AUTHENTICATED ARTEFACT, which is the other half of the split:
+    // reporting the candidate does not mean running it. Observed as the argv the runner was given.
     assert.match(
       probe.output,
       new RegExp(`^PROBE=\\[${escapeRe(join(dirs.recovery, 'app', 'scripts', 'fence-db-connections.mjs'))}\\]$`, 'm'),
-      `the standing artefact is what a preflight may execute:\n${probe.output}`,
+      `the standing artefact is what a preflight executes:\n${probe.output}`,
     )
+    assert.match(probe.output, /^CONTENT=\[\/\/ v1\]$/m, 'the OLD bytes, because the artefact did not move')
+    assert.match(probe.output, /^TMPLEFT=\[\s*\]$/m, 'and the candidate it hashed to report is not left lying about')
 
     // AND THE REPORTED CANDIDATE IS THE VALUE THAT AUTHORISES THE ROTATION — which is the whole
     // point of reporting it, and what the standing digest could never do.
     const rotated = runShell(
-      rotationHarness(dirs, [
-        `DB_FENCE_EXPECTED_ARTEFACT_SHA256=${candidate}`,
-        'db_fence_script_in_use >/dev/null; echo "RC=$?"',
-      ]),
+      rotationHarness(dirs, ['db_fence_script_in_use >/dev/null; echo "RC=$?"'], [`IMS_FENCE_ARTEFACT_SHA256=${candidate}`]),
     )
     assert.match(rotated.output, /^RC=0$/m, `the reported candidate must authorise the rotation:\n${rotated.output}`)
     assert.equal(
@@ -9534,12 +11393,17 @@ test('r34: a dry run against a substituted checkout executes no part of it, and 
   // says the substituted `pg` got DEPLOY_ADMIN_DATABASE_URL. Neither may appear.
   //
   // MUTATION ROUTE (each verified by making the change locally and re-running):
-  //   1. restore r33's tail — DB_FENCE_PROBE_SCRIPT="${dir}/scripts/fence-db-connections.mjs" and
-  //      return 0 with no pin — and BOTH witnesses appear. Measured: flavour.txt holds
-  //      SUBSTITUTED-PG and STOLEN holds the admin URL, from the dry run alone, before any
-  //      publication and with no digest anywhere in the invocation.
-  //   2. keep the refusal but drop the _fence_probe_discard_candidate call: PROBE stays empty and
-  //      the assertion on TEMP fails — the snapshot is still on disk for the next caller.
+  //   1. restore r33's tail — nominate "${_fence_probe_dir}/scripts/fence-db-connections.mjs"
+  //      with no pin — and BOTH witnesses appear. Measured: flavour.txt holds SUBSTITUTED-PG and
+  //      STOLEN holds the admin URL, from the dry run alone, before any publication and with no
+  //      digest anywhere in the invocation.
+  //   2. keep the refusal but drop the `rm -rf "${_fence_probe_dir}"` on that path: nothing runs
+  //      but TMPLEFT names the snapshot — still on disk for the next caller.
+  //
+  // AND THE CALLER IS STILL THE UNDISCIPLINED ONE. r34 proved the library refuses even when the
+  // caller does not check; the caller can no longer even TRY, because there is no variable naming
+  // a file for it to run (o3d-secops r3). What stands in for the r33 caller is a real `node` on
+  // the checkout's own helper path, which is what that caller would have reached for.
   const dir = mkdtempSync(join(tmpdir(), 'ims-r34-dry-'))
   const admin = 'postgresql://admin:sup3rsecret@127.0.0.1:5432/imsdb'
   try {
@@ -9550,14 +11414,15 @@ test('r34: a dry run against a substituted checkout executes no part of it, and 
 
     const run = runShell(
       artefactHarness(dir, [
+        ...preflightSpies(join(dir, 'scratch-dry')),
         `export DEPLOY_ADMIN_DATABASE_URL=${JSON.stringify(admin)}`,
         `export IMS_TEST_STOLEN_PATH=${JSON.stringify(stolen)}`,
-        'db_fence_probe_script; echo "RC=$?"',
-        'echo "PROBE=[${DB_FENCE_PROBE_SCRIPT}]"',
-        'echo "TEMP=[${DB_FENCE_PROBE_TEMP}]"',
+        'db_fence_probe_digests >/dev/null 2>&1; echo "DRC=$?"',
         'echo "CANDIDATE=[${DB_FENCE_PROBE_ARTEFACT_SHA256}]"',
-        // THE r33 CALLER, WORD FOR WORD: run whatever the probe returned, with the credential.
-        'node "${DB_FENCE_PROBE_SCRIPT:-/nonexistent-probe}" --preflight >/dev/null 2>&1; echo "EXEC=$?"',
+        // THE REAL RUNNER, not a spy: if the library nominates anything at all here, node runs it
+        // with the credential in its environment and the two witnesses appear.
+        'db_fence_preflight notice -- exec_runner; echo "RC=$?"',
+        'report_probe',
       ]),
     )
     // THE WITNESSES FIRST, because they are the finding: under r33's behaviour both of these
@@ -9565,10 +11430,9 @@ test('r34: a dry run against a substituted checkout executes no part of it, and 
     // route below a MEASUREMENT rather than a prediction.
     assert.ok(!existsSync(flavour), 'NO part of the checkout helper graph may have run')
     assert.ok(!existsSync(stolen), 'and DEPLOY_ADMIN_DATABASE_URL may not have reached any of it')
-    assert.match(run.output, /^RC=1$/m, `the probe must refuse to nominate anything:\n${run.output}`)
+    assert.match(run.output, /^RC=1$/m, `the preflight must refuse to run anything:\n${run.output}`)
     assert.match(run.output, /^PROBE=\[\]$/m, run.output)
-    assert.match(run.output, /^TEMP=\[\]$/m, 'and leave no snapshot behind for a caller to find')
-    assert.match(run.output, /^EXEC=[1-9][0-9]*$/m, 'the unchecked caller fails, having executed nothing')
+    assert.match(run.output, /^TMPLEFT=\[\s*\]$/m, 'and leave no snapshot behind for a caller to find')
 
     // THE ANSWERABILITY IT WAS TRADED AGAINST SURVIVES: the digest was still produced, from the
     // same bytes, by reading them.
@@ -9594,33 +11458,46 @@ test('r34: neither entrypoint executes a probe it was not given, and both print 
   // proof that a rule changed in one entrypoint and not the other is a rule that is not one.
   //
   // MUTATION ROUTE (each verified by making the change locally and re-running):
-  //   1. delete the `-z "${DB_FENCE_PROBE_SCRIPT}"` guard from either entrypoint: the "guarded
-  //      before it is run" assertion fails, naming that file.
-  //   2. move the db_fence_probe_script call below the DEPLOY_ADMIN_DATABASE_URL refusal: the
+  //   1. give either entrypoint back a `node "${...}" --preflight` of its own: the "no entrypoint
+  //      executes a fence helper it named itself" assertion fails, naming that file.
+  //   2. move the db_fence_probe_digests call below the DEPLOY_ADMIN_DATABASE_URL refusal: the
   //      ordering assertion fails, and with it the release build host's only way to obtain the
   //      digest it is supposed to publish.
   //   3. inline the digest-provenance sentence into an entrypoint instead of printing
   //      db_fence_probe_report: the "one text" assertion fails.
+  //
+  // WHAT THE GUARD BECAME (o3d-secops r3). Until this round each entrypoint held the resolved
+  // path in ${DB_FENCE_PROBE_SCRIPT} and this test checked that a `-z` guard stood between the
+  // resolution and the `node`. That guard is gone because the gap it spanned is gone: resolution
+  // and execution are one call inside the library, and there is no name for an entrypoint to
+  // execute. So what is asserted is the STRONGER property — no entrypoint executes a fence helper
+  // at all on this path — plus the one call that does.
   for (const [name, source] of [
     ['scripts/update.sh', readFileSync(join(process.cwd(), 'scripts/update.sh'), 'utf8')],
     ['scripts/deploy.sh', readFileSync(join(process.cwd(), 'scripts/deploy.sh'), 'utf8')],
   ] as const) {
     const lines = source.split('\n').filter((line) => !/^\s*#/.test(line))
-    const probeCall = lines.findIndex((line) => /db_fence_probe_script/.test(line))
+    const probeCall = lines.findIndex((line) => /db_fence_probe_digests/.test(line))
     const report = lines.findIndex((line) => /db_fence_probe_report/.test(line))
     const firstRefusal = lines.findIndex((line) => /A REAL RUN WOULD BE REFUSED HERE/.test(line))
-    const guard = lines.findIndex((line) => /-z "\$\{?DB_FENCE_PROBE_SCRIPT\}?"/.test(line))
-    const exec = lines.findIndex((line) => /node "\$\{?DB_FENCE_PROBE_SCRIPT\}?"/.test(line))
+    const preflight = lines.findIndex((line) => /db_fence_preflight /.test(line))
 
     assert.ok(probeCall >= 0, `${name}: precondition: the dry run must ask the library`)
     assert.ok(report > probeCall, `${name}: what it found must be printed`)
     assert.ok(firstRefusal > report, `${name}: the digest must be printed before any refusal can return`)
-    assert.ok(guard >= 0, `${name}: an empty probe must be checked for`)
-    assert.ok(exec > guard, `${name}: and checked BEFORE anything is executed with the credential`)
+    assert.ok(preflight > report, `${name}: and the preflight comes after, through the library`)
     assert.equal(
-      lines.filter((line) => /node "\$\{?DB_FENCE_PROBE_SCRIPT\}?"/.test(line)).length,
+      lines.filter((line) => /db_fence_preflight /.test(line)).length,
       1,
-      `${name}: exactly one place may execute the probe, or the guard covers only one of them`,
+      `${name}: exactly one call may preflight, or a second one is outside the rule`,
+    )
+    // AND NO ENTRYPOINT NAMES A FENCE HELPER TO node ITSELF. This is the assertion the `-z` guard
+    // used to approximate: the guard could be right and the value still be re-aimed between the
+    // check and the exec, because the value was a variable. There is now no variable.
+    assert.deepEqual(
+      lines.filter((line) => /\bnode\b.*fence-db-connections|\bnode\b\s+"\$\{?DB_FENCE_[A-Z_]*(SCRIPT|PROBE)/.test(line)),
+      [],
+      `${name}: the library is the only thing that executes the fence helper`,
     )
     // AND THE INSTRUCTION FOR OBTAINING THE DIGEST IS THE LIBRARY'S, once, not each entrypoint's.
     assert.doesNotMatch(
@@ -9689,3 +11566,3201 @@ test('r34: the runbook says where a first-ever install gets the digest, in the w
     'and the installer must be the thing that says it, in the refusal an operator would actually meet',
   )
 })
+
+// ---------------------------------------------------------------------------
+// THE CUTOVER NAMESPACE (o3d-secops r22, Codex CRITICAL x2 + HIGH)
+//
+// THREE FINDINGS, ONE SHAPE: a privileged process deciding something from a name, or from bytes,
+// that ${APP_USER} controls. ${CUTOVER_STATE_DIR} is the application's own data directory, so every
+// name directly beneath it is that account's to create, replace and unlink — `unlink(2)` and
+// `rename(2)` ask for write permission on the PARENT and ask nothing whatever about the file.
+//
+//   THE LOCK          `exec 9>"$LOCK_FILE"` is O_WRONLY|O_CREAT|O_TRUNC, as root, on that name.
+//   THE FENCE DIR     `mkdir -p` accepts a symlink-to-directory, and the `chown`/`chmod` that
+//                     followed both dereference.
+//   THE OLD MARKER    r21 authenticated its bytes with `st_nlink`, which is a fact about the
+//                     present and not about the past.
+//
+// WHAT THIS HARNESS CAN AND CANNOT SHOW, stated rather than glossed, exactly as the r20 and r21
+// sections state it. It runs as ONE account, so "${APP_USER} planted this and root did not" is not
+// directly measurable, and neither is "the service account cannot chown anything to root". What IS
+// measured, for real, on a real filesystem, through the SHIPPED functions: a planted symlink at
+// each of the two root-side targets, the victim's bytes and modes before and after, where each
+// construct stops, and — by mutation of the shipped text — that the retired construct does the
+// damage the finding describes. Every mutation below changes SHIPPED TEXT rather than
+// re-implementing it, so a mutant that no longer matches throws instead of quietly passing.
+// ---------------------------------------------------------------------------
+
+/** The namespace library's own path, asserted rather than assumed: three entrypoints source it, and
+ *  a test that read a file the scripts do not run would measure nothing. */
+const CUTOVER_NS_LIB_PATH = join(process.cwd(), 'scripts/lib/cutover-namespace.sh')
+
+/** The shipped gate the importer asks the legacy NAME, quoted exactly. */
+const SHIPPED_SOURCE_GATE = '  [[ -e "${LEGACY_STATE_DIR_FENCE_FILE}" || -L "${LEGACY_STATE_DIR_FENCE_FILE}" ]] || return 0'
+/** THE PRE-r22 GATE AND READ. `[[ -f ]]` follows a symlink and asks nothing about who wrote what it
+ *  found; the publication then took the old file's bytes verbatim — which is r20/r21's shape, and
+ *  the shape whose premise r22 rejects. Everything else in the function is shipped text, so what
+ *  these mutants measure is exactly this pair. */
+const PRE_R22_GATE = '  [[ -f "${LEGACY_STATE_DIR_FENCE_FILE}" ]] || return 0'
+const COMPOSED_MARKER_START = '  {\n    echo "fenced_at=$(date -Iseconds)"'
+const COMPOSED_MARKER_END = 'Nothing has been stopped and nothing has been migrated."\n'
+
+/** The shipped importer with its composed marker replaced by the copy it retired. */
+function preR22Importer(source: string): string {
+  const shipped = shellFunction(source, 'import_relocated_fence_marker')
+  assert.ok(shipped.includes(SHIPPED_SOURCE_GATE),
+    `the shipped importer must ask the NAME one question and open nothing:\n${shipped}`)
+  const start = shipped.indexOf(COMPOSED_MARKER_START)
+  assert.notEqual(start, -1, `the shipped importer must COMPOSE the marker it publishes:\n${shipped}`)
+  const end = shipped.indexOf(COMPOSED_MARKER_END, start)
+  assert.notEqual(end, -1, `the composed publication must end in a die:\n${shipped}`)
+  return (shipped.slice(0, start)
+    + '  publish_durable_file "${FENCE_FILE}" < "${LEGACY_STATE_DIR_FENCE_FILE}" || die "the retired copy could not be published"\n'
+    + shipped.slice(end + COMPOSED_MARKER_END.length)
+  ).replace(SHIPPED_SOURCE_GATE, PRE_R22_GATE)
+}
+
+/** What the relocation left behind, read back the same way for every shape. */
+const RELOCATION_OUTCOME = [
+  'rc=0; ( import_relocated_fence_marker ) 2>&1 || rc=$?; echo "RC=${rc}"',
+  '[[ -e "${FENCE_FILE}" ]] && echo PUBLISHED || echo NOT_PUBLISHED',
+  'if [[ -f "${FENCE_FILE}" ]] && grep -q "^ROOT_ONLY_BYTES=1$" "${FENCE_FILE}"; then echo SOURCE_BYTES_REPUBLISHED; else echo SOURCE_BYTES_NOT_REPUBLISHED; fi',
+  'if [[ -f "${FENCE_FILE}" ]]; then sed -n "s/^\\(phase\\|schema_touched\\|migration_attempted\\|legacy_marker_unauthenticated\\)=/ADOPTED_\\1=/p" "${FENCE_FILE}"; fi',
+  '[[ -e "${LEGACY_STATE_DIR_FENCE_FILE}" || -L "${LEGACY_STATE_DIR_FENCE_FILE}" ]] && echo ENTRY_LEFT_IN_PLACE || echo ENTRY_REMOVED',
+]
+
+const RELOCATION_FUNCTIONS = ['fsync_path', 'publish_durable_file', 'ensure_fence_marker_dir', 'import_relocated_fence_marker']
+const RELOCATION_FUNCTIONS_FOR_MUTANT = ['fsync_path', 'publish_durable_file', 'ensure_fence_marker_dir']
+
+/** The three lines adoption acts on, asserted together: any one of them read the cheap way is the
+ *  reading that leaves a service running, or releases a connection fence, over a schema that may
+ *  have moved. */
+function assertConservativeAdoption(stdout: string, what: string): void {
+  assert.match(stdout, /^ADOPTED_phase=stopping$/m, `${what}: phase must be read the expensive way:\n${stdout}`)
+  assert.match(stdout, /^ADOPTED_schema_touched=true$/m, `${what}: and the schema:\n${stdout}`)
+  assert.match(stdout, /^ADOPTED_migration_attempted=true$/m, `${what}: and the intent:\n${stdout}`)
+  assert.match(stdout, /^ADOPTED_legacy_marker_unauthenticated=1$/m,
+    `${what}: and the marker must record that those three are a policy, not a reading:\n${stdout}`)
+}
+
+for (const entry of R9_SCRIPTS) {
+  test(`${entry.name} does not follow a symlink at the pre-r20 marker path, and publishes nothing that came out of it`, () => {
+    /**
+     * ROUTE: the shipped import_relocated_fence_marker(), run for real, with a REAL symlink at
+     * ${LEGACY_STATE_DIR_FENCE_FILE} pointing at a file that is otherwise a perfect marker — 0600,
+     * owned by this run, complete. Everything a destination check would ask about it is true. The
+     * only thing wrong with it is that this run did not put it at that name.
+     *
+     * WHAT r22 CHANGED, AND IT IS THE POINT: the run no longer REFUSES here. An entry at that name
+     * is what an earlier checkout's `AssertPathExists=!` asserts on, so the host may be fenced and
+     * that alone is what the marker records. What must not happen — and what the mutation below
+     * shows happening — is the link's target becoming this host's account of an interrupted deploy.
+     */
+    const planted = [
+      'printf "phase=arming\\nschema_touched=false\\nmarker_complete=1\\nROOT_ONLY_BYTES=1\\n" > "${CUTOVER_STATE_DIR}/somewhere-else"',
+      'chmod 600 "${CUTOVER_STATE_DIR}/somewhere-else"',
+      'ln -s "${CUTOVER_STATE_DIR}/somewhere-else" "${LEGACY_STATE_DIR_FENCE_FILE}"',
+    ]
+    const run = runR9(entry, RELOCATION_FUNCTIONS, [...planted, ...RELOCATION_OUTCOME].join('\n'),
+      FENCE_RELOCATION_EXTRA('$CUTOVER_STATE_DIR'))
+
+    assert.match(run.stdout, /^RC=0$/m, `an entry at that name is a signal, not an error:\n${run.stdout}`)
+    assert.match(run.stdout, /^PUBLISHED$/m,
+      `and it must leave a marker at the canonical path, or the host is adopted as unfenced:\n${run.stdout}`)
+    assert.match(run.stdout, /^SOURCE_BYTES_NOT_REPUBLISHED$/m,
+      `but the link's target must not become this host's record of an interrupted deploy:\n${run.stdout}`)
+    assertConservativeAdoption(run.stdout, 'a symlink at the old path')
+    assert.match(run.stdout, /^ENTRY_LEFT_IN_PLACE$/m,
+      `and the entry stays, because an installed drop-in still asserts on it — removing it is a release:\n${run.stdout}`)
+    assert.match(run.stdout, /NONE OF IT HAS BEEN READ/, `and the operator is told what was not established:\n${run.stdout}`)
+    assert.match(run.stdout, /DropInPaths/, `and what CAN be established instead:\n${run.stdout}`)
+
+    // MEASURED BY MUTATION, ROUTE STATED: the same shipped importer with the pre-r22 pair — the
+    // `[[ -f ]]` that follows the link, and the publication that takes the old file's bytes. The
+    // target's bytes are then published at ${FENCE_FILE}, root-owned and 0600, where every
+    // provenance check the destination makes passes because the publication made it pass — and
+    // `phase=arming`/`schema_touched=false` become what adoption acts on.
+    const mutated = runR9(entry, RELOCATION_FUNCTIONS_FOR_MUTANT,
+      [preR22Importer(entry.source), ...planted, ...RELOCATION_OUTCOME].join('\n'),
+      FENCE_RELOCATION_EXTRA('$CUTOVER_STATE_DIR'))
+    assert.match(mutated.stdout, /^SOURCE_BYTES_REPUBLISHED$/m,
+      `the retired construct launders the link's target into root-owned state at the marker's name — that is the finding:\n${mutated.stdout}`)
+    assert.match(mutated.stdout, /^ADOPTED_phase=arming$/m,
+      `and hands adoption the cheap reading, chosen by whoever planted the link:\n${mutated.stdout}`)
+    assert.match(mutated.stdout, /^ADOPTED_schema_touched=false$/m,
+      `including the one that releases a connection fence over a schema that may be half migrated:\n${mutated.stdout}`)
+  })
+
+  test(`${entry.name} does not believe a pre-r20 marker that passes every check r21 made of it`, () => {
+    /**
+     * THE r22 HIGH, EXHIBITED. r21's helper asked six questions of the descriptor it held: regular
+     * file, owned by this run's uid, not group- or other-writable, exactly ONE link, and the
+     * descriptor is that name's own inode. The file planted below answers all six correctly — it
+     * is a 0600 regular file owned by this run with `st_nlink == 1` — AND ITS CONTENT WAS CHOSEN BY
+     * WHOEVER PLANTED IT, because a second name existed while it was being written and was then
+     * dropped. `st_nlink` is a fact about the present; it cannot say the inode was never linked.
+     *
+     * The harness constructs exactly that history — write, `ln`, `rm` — which is what the account
+     * that owns this directory can do to any root-owned 0600 file whose CONTENT it influenced, and
+     * this branch creates one of those on every run (${CRON_BACKUP} is that account's own crontab).
+     *
+     * ROUTE: the shipped importer. It never opens the file, so the history does not matter, which
+     * is the whole change: the answer stopped depending on a question that cannot be answered.
+     */
+    const planted = [
+      'printf "phase=arming\\nschema_touched=false\\nmarker_complete=1\\nROOT_ONLY_BYTES=1\\n" > "${CUTOVER_STATE_DIR}/influenced"',
+      'chmod 600 "${CUTOVER_STATE_DIR}/influenced"',
+      // THE SECOND NAME, AND THEN ITS REMOVAL. What is left at the marker's path is one link to an
+      // inode this run would find impeccable and did not write.
+      'ln "${CUTOVER_STATE_DIR}/influenced" "${LEGACY_STATE_DIR_FENCE_FILE}"',
+      'rm -f "${CUTOVER_STATE_DIR}/influenced"',
+      'stat -c "PLANTED_LINKS=%h PLANTED_MODE=%a PLANTED_OWNER=%u" "${LEGACY_STATE_DIR_FENCE_FILE}"',
+    ]
+    const run = runR9(entry, RELOCATION_FUNCTIONS, [...planted, ...RELOCATION_OUTCOME].join('\n'),
+      FENCE_RELOCATION_EXTRA('$CUTOVER_STATE_DIR'))
+
+    // THE PRECONDITION IS ASSERTED, or this test is about a file that would have been refused for
+    // some other reason and proves nothing about the link count at all.
+    assert.match(run.stdout, /^PLANTED_LINKS=1 PLANTED_MODE=600 PLANTED_OWNER=\d+$/m,
+      `the planted file must be exactly what r21 would have accepted:\n${run.stdout}`)
+    assert.match(run.stdout, new RegExp(`^PLANTED_LINKS=1 PLANTED_MODE=600 PLANTED_OWNER=${harnessUid()}$`, 'm'),
+      `owned by the account running the cutover:\n${run.stdout}`)
+
+    assert.match(run.stdout, /^RC=0$/m, run.stdout)
+    assert.match(run.stdout, /^PUBLISHED$/m, `the host is still recorded as possibly fenced:\n${run.stdout}`)
+    assert.match(run.stdout, /^SOURCE_BYTES_NOT_REPUBLISHED$/m,
+      `and none of its bytes reach the canonical marker:\n${run.stdout}`)
+    assertConservativeAdoption(run.stdout, 'an impeccable planted marker')
+    assert.match(run.stdout, /^ENTRY_LEFT_IN_PLACE$/m, run.stdout)
+
+    // MEASURED BY MUTATION, ROUTE STATED: the retired copy, over the same file. Every check r21
+    // made passes — that is the point of the file — and `phase=arming, schema_touched=false`, a
+    // reading chosen by whoever influenced those bytes, becomes what adoption acts on.
+    const mutated = runR9(entry, RELOCATION_FUNCTIONS_FOR_MUTANT,
+      [preR22Importer(entry.source), ...planted, ...RELOCATION_OUTCOME].join('\n'),
+      FENCE_RELOCATION_EXTRA('$CUTOVER_STATE_DIR'))
+    assert.match(mutated.stdout, /^SOURCE_BYTES_REPUBLISHED$/m,
+      `a file with one link, 0600, owned by this run, is exactly what the retired construct accepts:\n${mutated.stdout}`)
+    assert.match(mutated.stdout, /^ADOPTED_schema_touched=false$/m,
+      `and the fence is released on a byte the service account chose:\n${mutated.stdout}`)
+  })
+
+  test(`${entry.name} treats a directory, a fifo and a dangling link at the pre-r20 path as the same signal, and opens none of them`, () => {
+    /**
+     * EVERY OTHER SHAPE THE ACCOUNT THAT OWNS THAT DIRECTORY CAN LEAVE THERE. r21 refused each of
+     * them, on the descriptor; r22 does not open them at all, so each is what its PRESENCE says it
+     * is — this host may be fenced — and nothing else.
+     *
+     * THE FIFO IS HERE FOR A REASON BEYOND THE OUTCOME: `open(2)` on a fifo for reading blocks
+     * until a writer appears, so an importer that still opened this name would park a root-side
+     * cutover for ever. This test completing at all is the measurement, and it needs no timeout
+     * and no O_NONBLOCK to make it, because nothing opens anything.
+     */
+    for (const shape of [
+      { name: 'directory', plant: 'mkdir "${LEGACY_STATE_DIR_FENCE_FILE}"', clean: 'rmdir "${LEGACY_STATE_DIR_FENCE_FILE}"' },
+      { name: 'fifo', plant: 'mkfifo "${LEGACY_STATE_DIR_FENCE_FILE}"', clean: 'rm -f "${LEGACY_STATE_DIR_FENCE_FILE}"' },
+      { name: 'dangling', plant: 'ln -s "${CUTOVER_STATE_DIR}/never-existed" "${LEGACY_STATE_DIR_FENCE_FILE}"', clean: 'rm -f "${LEGACY_STATE_DIR_FENCE_FILE}"' },
+    ]) {
+      const run = runR9(entry, RELOCATION_FUNCTIONS, [
+        shape.plant,
+        ...RELOCATION_OUTCOME,
+        // AND THEN THE ENTRY IS CLEARED, WHICH IS A FACT ABOUT THIS HARNESS AND NOT ABOUT THE CODE:
+        // runR9() reads ${dir}/DEPLOY-FENCED unconditionally when it returns, and `readFileSync` on
+        // a fifo blocks for ever while on a directory it throws. The assertion that the shipped run
+        // left the entry alone has already been recorded above this line.
+        shape.clean,
+      ].join('\n'), FENCE_RELOCATION_EXTRA('$CUTOVER_STATE_DIR'))
+      assert.match(run.stdout, /^RC=0$/m, `${shape.name}: an entry is an entry:\n${run.stdout}`)
+      assert.match(run.stdout, /^PUBLISHED$/m, `${shape.name}: and the host is recorded as possibly fenced:\n${run.stdout}`)
+      assertConservativeAdoption(run.stdout, shape.name)
+      assert.match(run.stdout, /^ENTRY_LEFT_IN_PLACE$/m, `${shape.name}: and nothing is removed:\n${run.stdout}`)
+    }
+  })
+}
+
+test('[o3d-secops r22] no entrypoint reads the pre-r20 marker, and the helper that used to has gone with the reason for it', () => {
+  // THE SWEEP. r21's answer was a descriptor helper; r22's is that there is no question a helper
+  // could answer. Both halves are held here: the retired constructs are absent from all three, the
+  // helper file is gone, and the importer is one text.
+  assert.equal(existsSync(join(process.cwd(), 'scripts/lib/pin-source-file.mjs')), false,
+    'scripts/lib/pin-source-file.mjs authenticated bytes that cannot be authenticated; an unused apparatus with that premise is an invitation to wire it back up')
+
+  const bodies = R9_SCRIPTS.map((entry) => shellFunction(entry.source, 'import_relocated_fence_marker'))
+  assert.equal(new Set(bodies).size, 1,
+    `import_relocated_fence_marker() has drifted between the entrypoints:\n${R9_SCRIPTS.map((e, i) => `--- ${e.name} ---\n${bodies[i]}`).join('\n')}`)
+
+  for (const entry of R9_SCRIPTS) {
+    const body = shellFunction(entry.source, 'import_relocated_fence_marker')
+    // A COMMENT MAY NAME IT — the entrypoints carry the paragraph that says why it went, and a
+    // rule that forbade the word would delete the reasoning along with the code. What may not
+    // survive is an executable reference: a resolution, or an invocation.
+    assert.ok(!/helper=.*pin-source-file/.test(entry.source),
+      `${entry.name} must not resolve a helper for a question it no longer asks`)
+    assert.ok(!/\bhelper\b/.test(body),
+      `${entry.name}'s importer must not resolve or run a helper at all — chown-tree.mjs still uses a local of that name elsewhere, which is why this is asked of the FUNCTION and not of the file:\n${body}`)
+    assert.ok(!/IMS_FENCE_SOURCE_HELPER/.test(entry.source),
+      `${entry.name} must not carry the override for a helper that is gone`)
+    assert.ok(!/< "\$\{LEGACY_STATE_DIR_FENCE_FILE\}"/.test(body),
+      `${entry.name} must not read the legacy marker by name:\n${body}`)
+    assert.ok(!/(cat|node) .*LEGACY_STATE_DIR_FENCE_FILE/.test(body),
+      `${entry.name} must not open the legacy marker at all:\n${body}`)
+    assert.ok(body.includes(SHIPPED_SOURCE_GATE),
+      `${entry.name} must ask that name exactly one question, and it must see a dangling link:\n${body}`)
+    for (const line of ['echo "phase=stopping"', 'echo "schema_touched=true"', 'echo "migration_attempted=true"', 'echo "legacy_marker_unauthenticated=1"']) {
+      assert.ok(body.includes(`    ${line}`), `${entry.name} must compose ${line} itself:\n${body}`)
+    }
+  }
+})
+
+// ---------------------------------------------------------------------------
+// THE TWO ROOT-SIDE TARGETS (o3d-secops r22, Codex CRITICAL x2)
+// ---------------------------------------------------------------------------
+
+/** The namespace functions, and the ONE file that defines each of them. A definition that came back
+ *  to an entrypoint would be a fourth copy of a rule about where a privileged process may write. */
+const CUTOVER_NS_OWNED = [
+  'enter_service_subdir',
+  'mkdir_service_subdir',
+  'own_service_subdir',
+  'ensure_cutover_root_dir',
+  'ensure_cutover_state_dirs',
+  'verify_held_lock',
+  'narrow_held_lock',
+  'held_lock_mode',
+  'lock_mode_is_private',
+  'rotate_cutover_lock_inode',
+  'dir_is_private_to_this_run',
+  'prepare_cutover_lock_file',
+  'acquire_cutover_lock',
+  'acquire_legacy_namespace_lock',
+  'state_pre_r22_cutovers_are_not_excluded',
+  'warn_pre_r22_db_fence_state',
+  'warn_legacy_namespace_db_fence_state',
+] as const
+
+/** What a run leaves behind at both root-side targets, read back the same way every time.
+ *
+ *  THE SUBSHELL IS THE POINT AND IT IS ALSO A LIMIT. `die` is `exit 1`, so a refusal has to run
+ *  inside `( … )` or the rig ends and none of the post-conditions below it are observed — but a
+ *  subshell that exits CLOSES the descriptors, and closing the last descriptor on an flock RELEASES
+ *  it. So a test that asks whether the lock is actually HELD uses the inline form below instead,
+ *  which is only usable where the call is expected to succeed. */
+const NAMESPACE_OUTCOME = [
+  'rc=0; ( acquire_cutover_lock ) 2>&1 || rc=$?; echo "RC=${rc}"',
+  'echo "ROOT=$(LC_ALL=C stat -c "%F %a %u" "${CUTOVER_ROOT_DIR}" 2>/dev/null || echo missing)"',
+  'echo "FENCEDIR=$(LC_ALL=C stat -c "%F %a" "${DB_FENCE_DIR}" 2>/dev/null || echo missing)"',
+  'echo "FENCEDIROWNER=$(LC_ALL=C stat -c "%u" "${DB_FENCE_DIR}" 2>/dev/null || echo missing)"',
+  'echo "LOCK=$(LC_ALL=C stat -c "%F %a" "${LOCK_FILE}" 2>/dev/null || echo missing)"',
+]
+
+/** The same, with the acquisition in THIS shell, so the descriptors — and the locks on them —
+ *  outlive it and can be asked about. */
+const NAMESPACE_OUTCOME_INLINE = ['acquire_cutover_lock', 'echo "RC=0"', ...NAMESPACE_OUTCOME.slice(1)]
+
+/** o3d-secops r24: the rotation replaces the canonical inode, so it may only ever run once this run
+ *  has PROVED nothing else holds the lock on it — which is `flock -n 9` succeeding. Written as a
+ *  predicate rather than inline so the ordering is stated once. */
+const ACQUIRE_ORDER = (acquire: string) =>
+  acquire.indexOf('flock -n 9') !== -1 &&
+  acquire.indexOf('rotate_cutover_lock_inode "$LOCK_FILE"') > acquire.indexOf('flock -n 9')
+
+for (const entry of R9_SCRIPTS) {
+  test(`${entry.name} creates the cutover namespace under a root-owned parent, and takes the lock on it`, () => {
+    /**
+     * THE ORDINARY RUN, WITHOUT WHICH EVERY REFUSAL BELOW IS WORTHLESS. ROUTE: the shipped
+     * acquire_cutover_lock(), which walks to ${CUTOVER_ROOT_DIR}, walks to ${DB_FENCE_DIR} beneath
+     * it, applies owner and mode to the descriptor it lands on, creates the lock file with
+     * O_CREAT|O_EXCL, opens it READ-ONLY, judges that descriptor and locks it.
+     */
+    const run = runR9(entry, ['acquire_cutover_lock'], [
+      ...NAMESPACE_OUTCOME_INLINE,
+      // THE LOCK IS ACTUALLY HELD, asked of the kernel rather than of this script: a second flock
+      // on the same inode, from a child with its own descriptor, must fail.
+      '( exec 5<"${LOCK_FILE}"; flock -n 5 && echo LOCK_FREE || echo LOCK_HELD )',
+    ].join('\n'), FENCE_RELOCATION_EXTRA('$CUTOVER_STATE_DIR'))
+    assert.match(run.stdout, /^RC=0$/m, `an ordinary cutover must still take its lock:\n${run.stdout}`)
+    assert.match(run.stdout, /^LOCK_HELD$/m,
+      `and it must be a lock, not a file it opened and let go:\n${run.stdout}`)
+    assert.match(run.stdout, new RegExp(`^ROOT=directory 711 ${harnessUid()}$`, 'm'),
+      `the parent must be owned by the account running the cutover and writable by nobody else — that is what makes the two names beneath it unplantable — and traversable without being LISTABLE (o3d-secops r23):\n${run.stdout}`)
+    assert.match(run.stdout, /^FENCEDIR=directory 755$/m,
+      `and the connection-fence directory must be root-owned and readable rather than app-owned: since r23 the record in it is published by root and only EXECUTED by the service account:\n${run.stdout}`)
+    assert.match(run.stdout, new RegExp(`^FENCEDIROWNER=${harnessUid()}$`, 'm'),
+      `owned by the account running the cutover, which is what makes a record inside it one the service account cannot have written:\n${run.stdout}`)
+    assert.match(run.stdout, /^LOCK=regular (empty )?file 600$/m,
+      `and the lock must be a plain file no other account can open: flock needs nothing but a descriptor, so readable is holdable (o3d-secops r23, Codex HIGH):\n${run.stdout}`)
+  })
+
+  test(`${entry.name} does not truncate what a symlink at the lock path points at, and refuses to lock it`, () => {
+    /**
+     * CRITICAL 1, EXHIBITED, AND ISOLATED — because the shipped run has TWO guards in front of that
+     * open and a test that only shows "the victim survived" does not say which of them saved it, or
+     * whether either did. So the same planted link is run past three constructs:
+     *
+     *   SHIPPED       prepare_cutover_lock_file() lstats the name, reads "symbolic link", and the
+     *                 run ends before anything is opened at all.
+     *   MUTANT A      that lstat neutered, the shipped READ-ONLY open kept. The link IS followed —
+     *                 and the target still cannot be truncated, because an `open(O_RDONLY)` has no
+     *                 O_TRUNC in it — and verify_held_lock() then refuses, because the descriptor is
+     *                 not that name's own inode. This is what the second guard is worth on its own.
+     *   MUTANT B      that lstat neutered AND the open restored to `exec 9>"$LOCK_FILE"`, which is
+     *                 the pre-r22 construct exactly. The victim is 0 bytes.
+     *
+     * Both mutants are built by replacing SHIPPED TEXT, asserted present first, so a mutant that
+     * stopped matching throws instead of quietly running the shipped function and passing.
+     *
+     * The parent is root-owned in production, so this shape cannot arise there — which is the fix.
+     * It is planted here anyway because the mechanism must not rest on the mode of a directory:
+     * that is an argument, and an argument is what the next round reads past.
+     */
+    const plant = [
+      'mkdir -p "${CUTOVER_ROOT_DIR}"',
+      'printf "SECRET-CONTENT\\n" > "${CUTOVER_STATE_DIR}/victim"',
+      'chmod 600 "${CUTOVER_STATE_DIR}/victim"',
+      'echo "BEFORE=$(stat -c %s "${CUTOVER_STATE_DIR}/victim")"',
+      'ln -s "${CUTOVER_STATE_DIR}/victim" "${LOCK_FILE}"',
+    ]
+    const readBack = [
+      'echo "AFTER=$(stat -c %s "${CUTOVER_STATE_DIR}/victim")"',
+      '[[ -L "${LOCK_FILE}" ]] && echo LINK_LEFT_ALONE || echo LINK_TOUCHED',
+    ]
+
+    const run = runR9(entry, ['acquire_cutover_lock'], [...plant, ...NAMESPACE_OUTCOME, ...readBack].join('\n'),
+      FENCE_RELOCATION_EXTRA('$CUTOVER_STATE_DIR'))
+    assert.match(run.stdout, /^BEFORE=15$/m, `the victim must start with content, or this test measures nothing:\n${run.stdout}`)
+    assert.match(run.stdout, /^RC=1$/m, `a name the run cannot identify must end it:\n${run.stdout}`)
+    assert.match(run.stdout, /^AFTER=15$/m,
+      `and the target must be untouched — the truncation is the whole of the damage:\n${run.stdout}`)
+    assert.match(run.stdout, /is not a regular file this run may lock/,
+      `and the lstat of the NAME is what must have said so:\n${run.stdout}`)
+    assert.match(run.stdout, /Nothing has been stopped/, `and the refusal must say what state the host is in:\n${run.stdout}`)
+    assert.match(run.stdout, /^LINK_LEFT_ALONE$/m, `and nothing may be created or removed at that name:\n${run.stdout}`)
+
+    // MUTATION A, ROUTE STATED: the type question removed from prepare_cutover_lock_file(), so the
+    // shipped open is reached with a symlink at that name and follows it.
+    const PREPARE = shellFunction(CUTOVER_NS_LIB, 'prepare_cutover_lock_file')
+    const KIND_CHECK = '  [[ "${kind}" == "regular file" || "${kind}" == "regular empty file" ]] || return 1'
+    assert.ok(PREPARE.includes(KIND_CHECK), `the shipped preparation must refuse anything that is not a plain file:\n${PREPARE}`)
+    const permissive = PREPARE.replace(KIND_CHECK, '  : "${kind}"')
+
+    const mutantA = runR9(entry, ['acquire_cutover_lock'], [
+      permissive, ...plant, ...NAMESPACE_OUTCOME, ...readBack,
+    ].join('\n'), FENCE_RELOCATION_EXTRA('$CUTOVER_STATE_DIR'))
+    assert.match(mutantA.stdout, /^RC=1$/m, `the descriptor check must still end the run:\n${mutantA.stdout}`)
+    assert.match(mutantA.stdout, /is not that name's own inode/,
+      `and it must be the descriptor check that says so, not the lstat this mutation removed:\n${mutantA.stdout}`)
+    assert.match(mutantA.stdout, /^AFTER=15$/m,
+      `and a followed link still cannot be truncated through an O_RDONLY open — that is what opening it for READING is worth:\n${mutantA.stdout}`)
+
+    // MUTATION B, ROUTE STATED: and the open restored to what it was. `exec 9>` is
+    // O_WRONLY|O_CREAT|O_TRUNC, the truncation lands before `flock` is reached, and the lock the
+    // run then reports is held on the attacker's chosen inode.
+    const ACQUIRE = shellFunction(CUTOVER_NS_LIB, 'acquire_cutover_lock')
+    const SHIPPED_OPEN = '  exec 9<"$LOCK_FILE"\n'
+    const SHIPPED_FLOCK = '  flock -n 9 || die'
+    const openAt = ACQUIRE.indexOf(SHIPPED_OPEN)
+    const flockAt = ACQUIRE.indexOf(SHIPPED_FLOCK)
+    assert.ok(openAt !== -1 && flockAt > openAt,
+      `the shipped lock must be opened for reading and judged before it is locked:\n${ACQUIRE}`)
+    const preR22Acquire = `${ACQUIRE.slice(0, openAt)}  exec 9>"$LOCK_FILE"\n${ACQUIRE.slice(flockAt)}`
+
+    const mutantB = runR9(entry, ['acquire_cutover_lock'], [
+      permissive, preR22Acquire, ...plant, ...NAMESPACE_OUTCOME, ...readBack,
+    ].join('\n'), FENCE_RELOCATION_EXTRA('$CUTOVER_STATE_DIR'))
+    assert.match(mutantB.stdout, /^RC=0$/m,
+      `the retired construct reports a lock it took on somebody else's file:\n${mutantB.stdout}`)
+    assert.match(mutantB.stdout, /^AFTER=0$/m,
+      `having truncated it as root before the flock — that is the finding:\n${mutantB.stdout}`)
+  })
+
+  test(`${entry.name} locks the descriptor it judged, and refuses one that is not the name's own inode`, () => {
+    /**
+     * THE OTHER HALF OF CRITICAL 1, WHICH THE OLD CODE COULD NOT STATE AT ALL: `flock -n 9`
+     * succeeding says a lock was taken and says nothing about what it was taken ON.
+     *
+     * ROUTE: the shipped verify_held_lock(), run against a descriptor this harness opens itself, so
+     * what is measured is the function and not the caller. Three cases, one of them the shipped
+     * one. The middle case is the race the check exists for: the descriptor is opened, the NAME is
+     * then replaced, and the two no longer agree — which is refused, because a disagreement is
+     * never read as an acceptance.
+     */
+    const run = runR9(entry, ['verify_held_lock'], [
+      'printf "" > "${CUTOVER_STATE_DIR}/real.lock"',
+      'printf "" > "${CUTOVER_STATE_DIR}/other.lock"',
+      'exec 9<"${CUTOVER_STATE_DIR}/real.lock"',
+      'verify_held_lock 9 "${CUTOVER_STATE_DIR}/real.lock" && echo MATCHING=OK || echo MATCHING=REFUSED',
+      // THE NAME MOVES AND THE DESCRIPTOR DOES NOT. This is exactly what a rename by the account
+      // that owns the directory does between the open and the check.
+      'mv -f "${CUTOVER_STATE_DIR}/other.lock" "${CUTOVER_STATE_DIR}/real.lock"',
+      'verify_held_lock 9 "${CUTOVER_STATE_DIR}/real.lock" && echo SWAPPED=OK || echo SWAPPED=REFUSED',
+      // AND A DESCRIPTOR ON SOMETHING THAT IS NOT A REGULAR FILE.
+      'exec 8<"${CUTOVER_STATE_DIR}"',
+      'verify_held_lock 8 "${CUTOVER_STATE_DIR}" && echo DIRECTORY=OK || echo DIRECTORY=REFUSED',
+    ].join('\n'), FENCE_RELOCATION_EXTRA('$CUTOVER_STATE_DIR'))
+
+    assert.match(run.stdout, /^MATCHING=OK$/m,
+      `the descriptor a run opened on its own lock must be accepted, or nothing ever locks:\n${run.stdout}`)
+    assert.match(run.stdout, /^SWAPPED=REFUSED$/m,
+      `and a name replaced after the open must be refused — the fd is the pin, the name is not:\n${run.stdout}`)
+    assert.match(run.stdout, /^DIRECTORY=REFUSED$/m, `and a descriptor on anything but a regular file:\n${run.stdout}`)
+
+    // MEASURED BY MUTATION, ROUTE STATED: the identity comparison removed, which is what the code
+    // did before r22 — nothing at all asked what the fd was on. The swapped case is then accepted,
+    // and with it every symlink the fd was opened through.
+    const body = shellFunction(CUTOVER_NS_LIB, 'verify_held_lock')
+    const IDENTITY = '  [[ -n "${ident}" && "${named}" == "${ident}" ]] || return 1'
+    assert.ok(body.includes(IDENTITY), `the shipped check must prove the fd is the name's own inode:\n${body}`)
+    const mutated = runR9(entry, [], [
+      body.replace(IDENTITY, '  : "${ident}" "${named}"'),
+      'printf "" > "${CUTOVER_STATE_DIR}/m-real.lock"',
+      'printf "" > "${CUTOVER_STATE_DIR}/m-other.lock"',
+      'exec 9<"${CUTOVER_STATE_DIR}/m-real.lock"',
+      'mv -f "${CUTOVER_STATE_DIR}/m-other.lock" "${CUTOVER_STATE_DIR}/m-real.lock"',
+      'verify_held_lock 9 "${CUTOVER_STATE_DIR}/m-real.lock" && echo MUTANT_SWAPPED=OK || echo MUTANT_SWAPPED=REFUSED',
+    ].join('\n'), FENCE_RELOCATION_EXTRA('$CUTOVER_STATE_DIR'))
+    assert.match(mutated.stdout, /^MUTANT_SWAPPED=OK$/m,
+      `without it the run believes a descriptor it never related to the name it locked:\n${mutated.stdout}`)
+  })
+
+  test(`${entry.name} does not chown or chmod what a symlink at the DB fence directory points at`, () => {
+    /**
+     * CRITICAL 2, EXHIBITED. ROUTE: the shipped acquire_cutover_lock() -> ensure_cutover_state_dirs()
+     * -> own_service_subdir() -> enter_service_subdir(), with a REAL symlink-to-directory at
+     * ${DB_FENCE_DIR}. What is measured is the victim directory's OWNER AND MODE, before and after.
+     */
+    const run = runR9(entry, ['acquire_cutover_lock'], [
+      'mkdir -p "${CUTOVER_ROOT_DIR}" "${CUTOVER_STATE_DIR}/victimdir"',
+      'chmod 755 "${CUTOVER_STATE_DIR}/victimdir"',
+      'echo "BEFORE=$(LC_ALL=C stat -c "%a" "${CUTOVER_STATE_DIR}/victimdir")"',
+      'ln -s "${CUTOVER_STATE_DIR}/victimdir" "${DB_FENCE_DIR}"',
+      ...NAMESPACE_OUTCOME,
+      'echo "AFTER=$(LC_ALL=C stat -c "%a" "${CUTOVER_STATE_DIR}/victimdir")"',
+      '[[ -L "${DB_FENCE_DIR}" ]] && echo LINK_LEFT_ALONE || echo LINK_TOUCHED',
+    ].join('\n'), FENCE_RELOCATION_EXTRA('$CUTOVER_STATE_DIR'))
+
+    assert.match(run.stdout, /^BEFORE=755$/m, `the victim must start reachable, or this test measures nothing:\n${run.stdout}`)
+    assert.match(run.stdout, /^RC=1$/m, `a symlink where a directory must be created ends the run:\n${run.stdout}`)
+    assert.match(run.stdout, /^AFTER=755$/m,
+      `and its target must not be chmodded, because a chmod OF A PATHNAME has no --no-dereference on Linux:\n${run.stdout}`)
+    assert.match(run.stdout, /is a symbolic link, not a directory/,
+      `and the refusal must name what it found rather than following it:\n${run.stdout}`)
+    assert.match(run.stdout, /^LINK_LEFT_ALONE$/m, `and nothing may be done to the entry either:\n${run.stdout}`)
+
+    // MEASURED BY MUTATION, ROUTE STATED: the retired trio, in its own shell, over the same planted
+    // link. `mkdir -p` reports success on a symlink-to-directory, and the `chmod` that follows
+    // dereferences it — so the target ends up at the mode this installer chose for a directory it
+    // believes it created.
+    const mutated = runR9(entry, [], [
+      'mkdir -p "${CUTOVER_STATE_DIR}/victimdir2"',
+      'chmod 755 "${CUTOVER_STATE_DIR}/victimdir2"',
+      'ln -s "${CUTOVER_STATE_DIR}/victimdir2" "${CUTOVER_STATE_DIR}/planted-fence"',
+      'DB_FENCE_DIR="${CUTOVER_STATE_DIR}/planted-fence"',
+      'mkdir -p "$DB_FENCE_DIR" && echo PRE_R22_ACCEPTED_THE_LINK',
+      'chmod 700 "$DB_FENCE_DIR" 2>/dev/null || true',
+      'echo "MUTANT_AFTER=$(LC_ALL=C stat -c "%a" "${CUTOVER_STATE_DIR}/victimdir2")"',
+    ].join('\n'), FENCE_RELOCATION_EXTRA('$CUTOVER_STATE_DIR'))
+    assert.match(mutated.stdout, /^PRE_R22_ACCEPTED_THE_LINK$/m,
+      `\`mkdir -p\` sees a directory and returns 0 — that is the half of the finding nobody looks at:\n${mutated.stdout}`)
+    assert.match(mutated.stdout, /^MUTANT_AFTER=700$/m,
+      `and the chmod then dereferences it as root — that is the other half:\n${mutated.stdout}`)
+  })
+
+  test(`${entry.name} takes a lock no other account can open, and narrows one an older run left wide`, () => {
+    /**
+     * o3d-secops r23, Codex HIGH. THE LOCK'S MODE IS LOAD-BEARING AND r22 DROPPED THE ASSERTION.
+     *
+     * `flock(2)` applies to the OPEN FILE DESCRIPTION whatever its access mode — which is why the
+     * lock is opened O_RDONLY in the first place — so READ permission on this file is permission
+     * to hold the cutover exclusion. ${CUTOVER_ROOT_DIR} has to be traversable by ${APP_USER}
+     * because ${DB_FENCE_DIR} lives under it; at 0644 that account could open this file, take
+     * `flock -n`, and refuse every deploy, update and install on the box for as long as it liked.
+     *
+     * r22's objection was right and is answered rather than overruled: the mode is SET, not
+     * asserted. Four cases, and the middle two are what "set rather than asserted" means.
+     */
+    const shipped = runR9(entry, ['acquire_cutover_lock'], [
+      ...NAMESPACE_OUTCOME_INLINE,
+      // The bits that matter, spelled out: nothing outside the owner may read it, so nothing
+      // outside the owner may open it, so nothing outside the owner may hold this lock.
+      'echo "GROUPOTHER=$(( $(LC_ALL=C stat -c "0%a" "${LOCK_FILE}") & 0077 ))"',
+    ].join('\n'), FENCE_RELOCATION_EXTRA('$CUTOVER_STATE_DIR'))
+    assert.match(shipped.stdout, /^RC=0$/m, shipped.stdout)
+    assert.match(shipped.stdout, /^LOCK=regular (empty )?file 600$/m, `the lock this run creates must be 0600:\n${shipped.stdout}`)
+    assert.match(shipped.stdout, /^GROUPOTHER=0$/m,
+      `with no bit set for group or other — that, and not the parent's mode, is what stops another account taking this lock:\n${shipped.stdout}`)
+
+    // AN AMBIENT UMASK CANNOT PRODUCE A WIDE LOCK. The creation runs under a STATED umask, so a
+    // host whose umask is 022 gets the same 0600. This is the case r22 said an assertion would
+    // turn into a refused cutover; setting the mode means there is nothing left to refuse.
+    const ambient = runR9(entry, ['acquire_cutover_lock'], [
+      'umask 000',
+      ...NAMESPACE_OUTCOME_INLINE,
+    ].join('\n'), FENCE_RELOCATION_EXTRA('$CUTOVER_STATE_DIR'))
+    assert.match(ambient.stdout, /^RC=0$/m,
+      `an ambient umask may not refuse a cutover — that was the objection to asserting the mode:\n${ambient.stdout}`)
+    assert.match(ambient.stdout, /^LOCK=regular (empty )?file 600$/m,
+      `and it may not produce a wide lock either:\n${ambient.stdout}`)
+
+    // AND A HOST UPGRADING FROM r22 HAS ONE ALREADY, AT 0644. It is narrowed rather than refused.
+    const upgraded = runR9(entry, ['acquire_cutover_lock'], [
+      'mkdir -p "${CUTOVER_ROOT_DIR}"',
+      '( umask 022; : > "${LOCK_FILE}" )',
+      'echo "BEFORE=$(LC_ALL=C stat -c "%a" "${LOCK_FILE}")"',
+      ...NAMESPACE_OUTCOME_INLINE,
+    ].join('\n'), FENCE_RELOCATION_EXTRA('$CUTOVER_STATE_DIR'))
+    assert.match(upgraded.stdout, /^BEFORE=644$/m, `the fixture must start wide, or this measures nothing:\n${upgraded.stdout}`)
+    assert.match(upgraded.stdout, /^RC=0$/m, `and the cutover must still run:\n${upgraded.stdout}`)
+    assert.match(upgraded.stdout, /^LOCK=regular (empty )?file 600$/m,
+      `and the lock left behind by the previous checkout must be narrowed, not merely complained about:\n${upgraded.stdout}`)
+
+    // MUTATION A, ROUTE STATED: the stated umask put back to r22's, with narrow_held_lock intact.
+    // The file is created 0644 and the narrowing repairs it — which is the whole claim that the
+    // property is a FACT and not an assertion about the environment.
+    const PREPARE = shellFunction(CUTOVER_NS_LIB, 'prepare_cutover_lock_file')
+    const STATED_UMASK = '( umask 077; set -C; : > "${path}" )'
+    assert.ok(PREPARE.includes(STATED_UMASK), `the shipped creation must state its own umask:\n${PREPARE}`)
+    // r24: with the rotation stubbed out, so what is measured here is still the NARROWING alone —
+    // the two repairs both end at 0600 and this case would otherwise stop distinguishing them.
+    const wideCreate = runR9(entry, ['acquire_cutover_lock'], [
+      PREPARE.replace(STATED_UMASK, '( umask 022; set -C; : > "${path}" )'),
+      'rotate_cutover_lock_inode() { return 0; }',
+      ...NAMESPACE_OUTCOME_INLINE,
+    ].join('\n'), FENCE_RELOCATION_EXTRA('$CUTOVER_STATE_DIR'))
+    assert.match(wideCreate.stdout, /^LOCK=regular (empty )?file 600$/m,
+      `the narrowing must be what makes the mode true, so that no umask anywhere decides it:\n${wideCreate.stdout}`)
+
+    // MUTATION B, ROUTE STATED: and with BOTH gone, which is r22 exactly. 0644, and the run
+    // reports an exclusion any account able to open that file could have taken first.
+    //
+    // THE THIRD STUB IS r24's AND IS WHY THIS MUTATION CHANGED (o3d-secops r24, Codex MEDIUM).
+    // r24 added a SECOND repair for a wide inherited lock — rotate_cutover_lock_inode(), which
+    // replaces the inode rather than narrowing it, because `chmod` cannot reach a descriptor
+    // somebody already holds. It leaves a 0600 lock too, so with only the two r23 stubs in place
+    // this mutation would no longer reproduce r22 and would pass while measuring nothing. What is
+    // being exhibited is unchanged; reproducing it now takes removing both repairs.
+    const ACQUIRE = shellFunction(CUTOVER_NS_LIB, 'acquire_cutover_lock')
+    const NARROW = '  narrow_held_lock 9 || die'
+    assert.ok(ACQUIRE.includes(NARROW), `the shipped acquisition must narrow the descriptor it locks:\n${ACQUIRE}`)
+    assert.ok(ACQUIRE.includes('rotate_cutover_lock_inode "$LOCK_FILE" || die'),
+      `and replace one it inherited wide, rather than believing a chmod reached a descriptor somebody already had:\n${ACQUIRE}`)
+    const pre23 = runR9(entry, ['acquire_cutover_lock'], [
+      PREPARE.replace(STATED_UMASK, '( umask 022; set -C; : > "${path}" )'),
+      'narrow_held_lock() { return 0; }',
+      'rotate_cutover_lock_inode() { return 0; }',
+      ...NAMESPACE_OUTCOME_INLINE,
+      'echo "MUTANT_GROUPOTHER=$(( $(LC_ALL=C stat -c "0%a" "${LOCK_FILE}") & 0077 ))"',
+    ].join('\n'), FENCE_RELOCATION_EXTRA('$CUTOVER_STATE_DIR'))
+    assert.match(pre23.stdout, /^RC=0$/m, pre23.stdout)
+    assert.match(pre23.stdout, /^LOCK=regular (empty )?file 644$/m,
+      `r22 left a world-readable lock — that is the finding:\n${pre23.stdout}`)
+    assert.match(pre23.stdout, /^MUTANT_GROUPOTHER=36$/m,
+      `readable by group and other, and readable is holdable:\n${pre23.stdout}`)
+
+    // AND THE READ-BACK IS NOT VACUOUS. With the chmod neutered — a read-only mount, an immutable
+    // attribute — narrow_held_lock() must REFUSE rather than report a mode it did not set.
+    const refused = runR9(entry, ['acquire_cutover_lock'], [
+      PREPARE.replace(STATED_UMASK, '( umask 022; set -C; : > "${path}" )'),
+      'chmod() { return 0; }',
+      ...NAMESPACE_OUTCOME,
+    ].join('\n'), FENCE_RELOCATION_EXTRA('$CUTOVER_STATE_DIR'))
+    assert.match(refused.stdout, /^RC=1$/m,
+      `a mode this run could not set must end the run, not be assumed:\n${refused.stdout}`)
+    assert.match(refused.stdout, /could not be narrowed to 0600/,
+      `and say what it could not establish:\n${refused.stdout}`)
+  })
+
+  test(`${entry.name} replaces a lock inode that was ever openable by another account, so a descriptor opened while it was wide cannot block a later cutover`, () => {
+    /**
+     * o3d-secops r24, Codex MEDIUM. PERMISSION IS CHECKED AT `open(2)` AND NEVER AGAIN.
+     *
+     * r23 narrowed an inherited 0644 lock to 0600 on the descriptor, proved the new mode off that
+     * same descriptor, and concluded that only a privileged account could now take this lock. It
+     * revokes nothing already held: on a host upgraded from a checkout that left this file at
+     * 0644, ${APP_USER} can have opened it BEFORE the cutover started, WITHOUT locking it — an
+     * open is invisible where a lock is not — and the `chmod` does not touch that descriptor. The
+     * instant this cutover exits, that process `flock`s what it has been holding all along and
+     * every deploy, update and install afterwards dies at the exclusion with nothing to point at.
+     *
+     * ROUTE: the shipped acquire_cutover_lock() over a 0644 lock, with a real unlocked descriptor
+     * open on it across the whole run, and then the two questions that matter — can the holdout
+     * take a lock, and does anything it takes block the NEXT cutover.
+     */
+    const fixture = [
+      'mkdir -p "${CUTOVER_ROOT_DIR}"',
+      '( umask 022; : > "${LOCK_FILE}" )',
+      'echo "BEFORE=$(LC_ALL=C stat -c "%a" "${LOCK_FILE}")"',
+      'old_inode="$(LC_ALL=C stat -c "%i" "${LOCK_FILE}")"',
+      // THE HOLDOUT. Opened while the file is wide, and deliberately NOT locked: that is the state
+      // nothing the cutover looks at can see, and it is the whole of the attack.
+      'exec 5<"${LOCK_FILE}"',
+    ]
+    const measure = [
+      'echo "AFTER=$(LC_ALL=C stat -c "%a" "${LOCK_FILE}")"',
+      '[[ "${old_inode}" == "$(LC_ALL=C stat -c "%i" "${LOCK_FILE}")" ]] && echo INODE=SAME || echo INODE=REPLACED',
+      // The holdout now takes the lock it could have taken at any point.
+      'flock -n 5 && echo HOLDOUT=LOCKED || echo HOLDOUT=BLOCKED',
+      // AND THE NEXT CUTOVER. A fresh descriptor on the canonical NAME, which is what every later
+      // deploy, update and install opens.
+      '( exec 7<"${LOCK_FILE}"; flock -n 7 && echo NEXT=FREE || echo NEXT=BLOCKED )',
+    ]
+    // A WHOLE CUTOVER, START TO FINISH: the subshell's descriptors die with it, which is what a run
+    // that has completed leaves behind. Only then is the holdout asked what it can do.
+    const RUN = 'rc=0; ( acquire_cutover_lock; echo "RC=0" ) || rc=$?; [[ "${rc}" -eq 0 ]] || echo "RC=${rc}"'
+
+    const shipped = runR9(entry, ['acquire_cutover_lock'], [...fixture, RUN, ...measure].join('\n'),
+      FENCE_RELOCATION_EXTRA('$CUTOVER_STATE_DIR'))
+    assert.match(shipped.stdout, /^BEFORE=644$/m, `the fixture must start wide, or this measures nothing:\n${shipped.stdout}`)
+    assert.match(shipped.stdout, /^RC=0$/m, `and an upgraded host must still be able to run a cutover:\n${shipped.stdout}`)
+    assert.match(shipped.stdout, /^AFTER=600$/m, `whose lock ends 0600:\n${shipped.stdout}`)
+    assert.match(shipped.stdout, /^INODE=REPLACED$/m,
+      `and the wide inode must be REPLACED rather than narrowed — narrowing cannot reach a descriptor that is already open:\n${shipped.stdout}`)
+    assert.match(shipped.stdout, /^HOLDOUT=LOCKED$/m,
+      `the holdout still gets its lock, because nothing can take a descriptor back — that is the point:\n${shipped.stdout}`)
+    assert.match(shipped.stdout, /^NEXT=FREE$/m,
+      `but the lock it gets is on an inode with no name, so the next cutover is not blocked by it:\n${shipped.stdout}`)
+
+    // MEASURED BY MUTATION, ROUTE STATED: the replacement stubbed out to report success and do
+    // nothing, which is r23 exactly — the narrowing runs, the mode reads back 0600, and the run
+    // reports an exclusion the holdout can take away from every future cutover on the box.
+    const ACQUIRE = shellFunction(CUTOVER_NS_LIB, 'acquire_cutover_lock')
+    assert.ok(ACQUIRE.includes('rotate_cutover_lock_inode "$LOCK_FILE" || die'),
+      `the shipped acquisition must replace a lock it inherited wide:\n${ACQUIRE}`)
+    const r23 = runR9(entry, ['acquire_cutover_lock'], [
+      'rotate_cutover_lock_inode() { return 0; }',
+      ...fixture, RUN, ...measure,
+    ].join('\n'), FENCE_RELOCATION_EXTRA('$CUTOVER_STATE_DIR'))
+    assert.match(r23.stdout, /^AFTER=600$/m, `r23 left the mode looking right:\n${r23.stdout}`)
+    assert.match(r23.stdout, /^INODE=SAME$/m, `on the same inode the holdout is holding:\n${r23.stdout}`)
+    assert.match(r23.stdout, /^HOLDOUT=LOCKED$/m, `which it then locks:\n${r23.stdout}`)
+    assert.match(r23.stdout, /^NEXT=BLOCKED$/m,
+      `and every later deploy, update and install is refused by a descriptor a chmod could not reach — that is the finding:\n${r23.stdout}`)
+  })
+
+  test(`${entry.name} rotates only a lock it inherited wide, and never one a predecessor is holding`, () => {
+    /**
+     * WHAT REPLACING AN INODE COSTS, AND WHY IT IS PAID SAFELY (o3d-secops r24).
+     *
+     * Replacing the canonical inode means giving up exclusion against anything still holding the
+     * old one — which is exactly what defeats the holdout, and would be a disaster if a GENUINE
+     * concurrent cutover were the holder. It cannot be: the rotation is reached only after this
+     * run holds `flock` on the inherited inode, so at the instant of the rename nothing else holds
+     * that lock. Both halves are measured here.
+     *
+     * ROUTE: the shipped acquire_cutover_lock(), twice. Once against a predecessor that HOLDS the
+     * lock — which must refuse and must leave the predecessor's inode exactly where it is — and
+     * once on an ordinary 0600 lock, which must not be rotated at all.
+     */
+    const predecessor = runR9(entry, ['acquire_cutover_lock'], [
+      'mkdir -p "${CUTOVER_ROOT_DIR}"',
+      '( umask 022; : > "${LOCK_FILE}" )',
+      'old_inode="$(LC_ALL=C stat -c "%i" "${LOCK_FILE}")"',
+      // A GENUINE PREDECESSOR: it holds the lock, on the wide inode, exactly as a cutover launched
+      // a moment earlier from the pre-r24 checkout would.
+      'exec 5<"${LOCK_FILE}"',
+      'flock -n 5 && echo PREDECESSOR=HELD || echo PREDECESSOR=FAILED',
+      'rc=0; ( acquire_cutover_lock ) 2>&1 || rc=$?; echo "RC=${rc}"',
+      '[[ "${old_inode}" == "$(LC_ALL=C stat -c "%i" "${LOCK_FILE}")" ]] && echo INODE=SAME || echo INODE=REPLACED',
+    ].join('\n'), FENCE_RELOCATION_EXTRA('$CUTOVER_STATE_DIR'))
+    assert.match(predecessor.stdout, /^PREDECESSOR=HELD$/m,
+      `the predecessor must actually hold the lock, or this test measures nothing:\n${predecessor.stdout}`)
+    assert.match(predecessor.stdout, /^RC=1$/m, `and the second cutover must refuse:\n${predecessor.stdout}`)
+    assert.match(predecessor.stdout, /Refusing to run two cutovers at once/,
+      `saying which exclusion it could not take:\n${predecessor.stdout}`)
+    assert.match(predecessor.stdout, /NOTHING HAS BEEN ROTATED/,
+      `and saying that the replacement was not reached:\n${predecessor.stdout}`)
+    assert.match(predecessor.stdout, /^INODE=SAME$/m,
+      `because a predecessor's inode may never be swapped out from under it — the rotation runs only while THIS run holds the lock:\n${predecessor.stdout}`)
+
+    // AND THE GATE IS NOT VACUOUS: an ordinary 0600 lock is left alone, so the canonical inode is
+    // stable from one cutover to the next and the replacement is a one-time repair.
+    const TWO_RUNS = [
+      '( acquire_cutover_lock; echo "RUN1=0" ) || echo "RUN1=FAILED"',
+      'first="$(LC_ALL=C stat -c "%i" "${LOCK_FILE}")"',
+      '( acquire_cutover_lock; echo "RUN2=0" ) || echo "RUN2=FAILED"',
+      '[[ "${first}" == "$(LC_ALL=C stat -c "%i" "${LOCK_FILE}")" ]] && echo STABLE=yes || echo STABLE=no',
+    ]
+    const ordinary = runR9(entry, ['acquire_cutover_lock'], TWO_RUNS.join('\n'),
+      FENCE_RELOCATION_EXTRA('$CUTOVER_STATE_DIR'))
+    assert.match(ordinary.stdout, /^RUN1=0$/m, ordinary.stdout)
+    assert.match(ordinary.stdout, /^RUN2=0$/m, ordinary.stdout)
+    assert.match(ordinary.stdout, /^STABLE=yes$/m,
+      `a lock this run created at 0600 was never openable by anybody else, so there is nothing to replace:\n${ordinary.stdout}`)
+
+    // MEASURED BY MUTATION, ROUTE STATED: the gate answered "never private", so every run rotates.
+    // The inode then changes underneath a host that had nothing wrong with it, which is the churn
+    // the mode question exists to avoid.
+    const GATE = shellFunction(CUTOVER_NS_LIB, 'lock_mode_is_private')
+    assert.ok(GATE.includes('(( (8#${mode} & 0077) == 0 )) || return 1'),
+      `the gate must ask about group and other, and about READ as much as write:\n${GATE}`)
+    const alwaysRotates = runR9(entry, ['acquire_cutover_lock'], [
+      'lock_mode_is_private() { return 1; }',
+      ...TWO_RUNS,
+    ].join('\n'), FENCE_RELOCATION_EXTRA('$CUTOVER_STATE_DIR'))
+    assert.match(alwaysRotates.stdout, /^STABLE=no$/m,
+      `without it the canonical inode is replaced on every cutover:\n${alwaysRotates.stdout}`)
+
+    // AND THE REPLACEMENT IS OPENED FOR READING AND LOCKED BEFORE IT IS PUBLISHED. A source-shaped
+    // check about GRAMMAR, for the reason the r22 one gives: the behaviour above cannot show that
+    // the next edit keeps the property.
+    const ROTATE = shellFunction(CUTOVER_NS_LIB, 'rotate_cutover_lock_inode')
+    assert.ok(ROTATE.includes('exec 6<"${temporary}"') && !/exec 6>/.test(ROTATE),
+      `the replacement must be opened for READING, like the lock it replaces:\n${ROTATE}`)
+    assert.ok(ROTATE.indexOf('flock -n 6') < ROTATE.indexOf('mv -f "${temporary}" "${path}"'),
+      `and locked BEFORE the rename publishes its name, or there is an instant in which the canonical name is unlocked:\n${ROTATE}`)
+    assert.ok(ACQUIRE_ORDER(shellFunction(CUTOVER_NS_LIB, 'acquire_cutover_lock')),
+      'and the rotation must come after the exclusion is taken, never before it')
+  })
+
+  test(`${entry.name} claims no exclusion over the pre-r22 lock, and says so on every run`, () => {
+    /**
+     * o3d-secops r23, Codex CRITICAL. THE BRIDGE r22 SHIPPED IS GONE, AND THIS IS WHY.
+     *
+     * r22 also locked `${CUTOVER_STATE_DIR}/cutover.lock` so a cutover already running from the
+     * previous checkout stayed excluded. A predecessor holds an INODE; the bridge opened a NAME,
+     * inside a directory ${APP_USER} owns. That account can rename the entry out from under the
+     * locked inode and leave a fresh regular file at the name, and every check the bridge made —
+     * lstat says regular file, the descriptor is that name's own inode — passes on the
+     * REPLACEMENT. The run then reported an exclusion it had never taken.
+     *
+     * SO THE TEST IS THE OTHER WAY ROUND NOW. What is asserted is that a run holding a lock on
+     * the old name is NOT excluded by this one (the honest state), that nothing is opened,
+     * created or locked at a name the service account controls, and that the limitation is stated
+     * UNCONDITIONALLY — keying it on whether that name exists would be reading an absence as an
+     * answer at a name the adversary controls, which is the same mistake one layer up.
+     *
+     * ROUTE: the shipped acquire_cutover_lock(), which calls state_pre_r22_cutovers_are_not_excluded().
+     */
+    const held = runR9(entry, ['acquire_cutover_lock'], [
+      // A "predecessor" holding the pre-r22 name, from a child that keeps its descriptor open.
+      'printf "" > "${CUTOVER_STATE_DIR}/cutover.lock"',
+      'exec 4<"${CUTOVER_STATE_DIR}/cutover.lock"',
+      'flock -n 4 && echo PREDECESSOR_HOLDS || echo PREDECESSOR_FAILED',
+      ...NAMESPACE_OUTCOME_INLINE,
+      // Nothing may have been done to that name, and this run must not report it excluded.
+      'echo "OLDLOCK=$(LC_ALL=C stat -c "%F %s" "${CUTOVER_STATE_DIR}/cutover.lock" 2>/dev/null || echo missing)"',
+    ].join('\n'), FENCE_RELOCATION_EXTRA('$CUTOVER_STATE_DIR'))
+    assert.match(held.stdout, /^PREDECESSOR_HOLDS$/m, `the fixture must actually hold the old lock:\n${held.stdout}`)
+    assert.match(held.stdout, /^RC=0$/m,
+      `and this run still takes its own lock — the old name may not stop every cutover on the box:\n${held.stdout}`)
+    assert.match(held.stdout, /NOTHING HERE CAN EXCLUDE IT/,
+      `and it must say plainly that a pre-r22 cutover is not excluded, rather than reporting a continuity it cannot establish:\n${held.stdout}`)
+    assert.match(held.stdout, /docs\/installation\.md/,
+      `and send the reader to where the requirement they have to satisfy is written down:\n${held.stdout}`)
+    assert.match(held.stdout, /^OLDLOCK=regular (empty )?file 0$/m,
+      `and nothing may be written through that name:\n${held.stdout}`)
+
+    // AND THE STATEMENT IS UNCONDITIONAL. With no entry at the old name at all — which proves
+    // nothing, because the account that owns that directory can unlink it — the same sentence is
+    // printed. A version that only warned when the file existed would go quiet exactly when an
+    // adversary wanted it to.
+    const absent = runR9(entry, ['acquire_cutover_lock'], [
+      ...NAMESPACE_OUTCOME_INLINE,
+      '[[ -e "${CUTOVER_STATE_DIR}/cutover.lock" ]] && echo OLD_NAME_CREATED || echo OLD_NAME_UNTOUCHED',
+    ].join('\n'), FENCE_RELOCATION_EXTRA('$CUTOVER_STATE_DIR'))
+    assert.match(absent.stdout, /^RC=0$/m, absent.stdout)
+    assert.match(absent.stdout, /NOTHING HERE CAN EXCLUDE IT/,
+      `the limitation is a property of the relocation, not of what happens to be on the disk:\n${absent.stdout}`)
+    assert.match(absent.stdout, /^OLD_NAME_UNTOUCHED$/m,
+      `and nothing may be created at a name the service account controls — that was the r22 finding:\n${absent.stdout}`)
+
+    // MEASURED BY MUTATION, ROUTE STATED: the statement removed. Without it the run is silent
+    // about a population its lock does not cover, which is what "reads as covered" means.
+    const body = shellFunction(CUTOVER_NS_LIB, 'state_pre_r22_cutovers_are_not_excluded')
+    assert.ok(body.includes('NOTHING HERE CAN EXCLUDE IT'), `the shipped statement must name what is not excluded:\n${body}`)
+    const mutated = runR9(entry, ['acquire_cutover_lock'], [
+      'state_pre_r22_cutovers_are_not_excluded() { return 0; }',
+      ...NAMESPACE_OUTCOME_INLINE,
+    ].join('\n'), FENCE_RELOCATION_EXTRA('$CUTOVER_STATE_DIR'))
+    assert.match(mutated.stdout, /^RC=0$/m, mutated.stdout)
+    assert.ok(!/NOTHING HERE CAN EXCLUDE IT/.test(mutated.stdout),
+      `without it the run says nothing at all about the cutovers it cannot exclude:\n${mutated.stdout}`)
+  })
+
+  test(`${entry.name} takes the /var/lib/ims-deploy lock only where that directory is private to this run`, () => {
+    /**
+     * THE ONE CONTINUITY CLAIM THAT SURVIVES, AND ITS PRECONDITION PROVED RATHER THAN ASSUMED
+     * (o3d-secops r23). A lock on a name inside a directory somebody else may write proves
+     * nothing; a lock on a name inside a directory only this run may write does. So the claim is
+     * made where dir_is_private_to_this_run() says it can be, and abandoned — loudly, with
+     * nothing opened or created — where it cannot.
+     *
+     * ROUTE: the shipped acquire_legacy_namespace_lock(), through acquire_cutover_lock().
+     */
+    const priv = runR9(entry, ['acquire_cutover_lock'], [
+      'mkdir -p "${LEGACY_CUTOVER_STATE_DIR}"',
+      'chmod 755 "${LEGACY_CUTOVER_STATE_DIR}"',
+      ...NAMESPACE_OUTCOME_INLINE,
+      '( exec 5<"${LEGACY_CUTOVER_STATE_DIR}/deploy.lock"; flock -n 5 && echo LEGACY_FREE || echo LEGACY_HELD )',
+      'echo "LEGACYMODE=$(LC_ALL=C stat -c "%a" "${LEGACY_CUTOVER_STATE_DIR}/deploy.lock" 2>/dev/null || echo missing)"',
+    ].join('\n'), FENCE_RELOCATION_EXTRA('$CUTOVER_STATE_DIR'))
+    assert.match(priv.stdout, /^RC=0$/m, priv.stdout)
+    assert.match(priv.stdout, /^LEGACY_HELD$/m,
+      `where the directory is this run's own, the exclusion is real and must be taken:\n${priv.stdout}`)
+    assert.match(priv.stdout, /^LEGACYMODE=600$/m,
+      `and that lock is narrowed too — a readable lock file is a holdable one:\n${priv.stdout}`)
+
+    // AND WHERE IT IS NOT. A world-writable legacy directory is one in which the entry can be
+    // renamed between a predecessor's open and this one's, so nothing is opened, nothing is
+    // created, and what is not excluded is named.
+    const shared = runR9(entry, ['acquire_cutover_lock'], [
+      'mkdir -p "${LEGACY_CUTOVER_STATE_DIR}"',
+      'chmod 777 "${LEGACY_CUTOVER_STATE_DIR}"',
+      ...NAMESPACE_OUTCOME_INLINE,
+      '[[ -e "${LEGACY_CUTOVER_STATE_DIR}/deploy.lock" ]] && echo LEGACY_LOCK_CREATED || echo LEGACY_LOCK_ABSENT',
+    ].join('\n'), FENCE_RELOCATION_EXTRA('$CUTOVER_STATE_DIR'))
+    assert.match(shared.stdout, /^RC=0$/m, shared.stdout)
+    assert.match(shared.stdout, /^LEGACY_LOCK_ABSENT$/m,
+      `nothing may be created as root at a name another account can replace:\n${shared.stdout}`)
+    assert.match(shared.stdout, /is not a directory only this run may write/,
+      `and the run must say why it is claiming nothing there:\n${shared.stdout}`)
+
+    // MEASURED BY MUTATION, ROUTE STATED: the precondition removed, which is r22's behaviour
+    // exactly. The lock is then taken inside a directory anybody can rename entries in, and the
+    // run reports an exclusion that proves nothing about who is running.
+    const guard = shellFunction(CUTOVER_NS_LIB, 'acquire_legacy_namespace_lock')
+    const PRECONDITION = '  if ! dir_is_private_to_this_run "${LEGACY_CUTOVER_STATE_DIR}"; then'
+    assert.ok(guard.includes(PRECONDITION), `the shipped claim must be conditional on its precondition:\n${guard}`)
+    const mutated = runR9(entry, ['acquire_cutover_lock'], [
+      guard.replace(PRECONDITION, '  if false; then'),
+      'mkdir -p "${LEGACY_CUTOVER_STATE_DIR}"',
+      'chmod 777 "${LEGACY_CUTOVER_STATE_DIR}"',
+      ...NAMESPACE_OUTCOME_INLINE,
+      '[[ -e "${LEGACY_CUTOVER_STATE_DIR}/deploy.lock" ]] && echo MUTANT_LOCK_CREATED || echo MUTANT_LOCK_ABSENT',
+    ].join('\n'), FENCE_RELOCATION_EXTRA('$CUTOVER_STATE_DIR'))
+    assert.match(mutated.stdout, /^MUTANT_LOCK_CREATED$/m,
+      `without the precondition the run creates and locks a name in a directory anybody may write:\n${mutated.stdout}`)
+  })
+
+  test(`${entry.name} names a connection-fence record left at the pre-r22 path and does not read it`, () => {
+    // A record at the old path lists the grantees a fence revoked CONNECT from. Importing it would
+    // make root act on GRANT statements chosen by the account being defended against, which is the
+    // r22 HIGH with a different file in it. So the NAME is reported and the bytes are left alone.
+    const run = runR9(entry, ['acquire_cutover_lock'], [
+      'mkdir -p "${CUTOVER_STATE_DIR}/deploy"',
+      'printf "{\\"grantees\\":[\\"postgres\\"]}\\n" > "${LEGACY_STATE_DIR_DB_FENCE_STATE}"',
+      ...NAMESPACE_OUTCOME,
+      '[[ -e "${DB_FENCE_STATE}" ]] && echo IMPORTED || echo NOT_IMPORTED',
+    ].join('\n'), FENCE_RELOCATION_EXTRA('$CUTOVER_STATE_DIR'))
+    assert.match(run.stdout, /^RC=0$/m, run.stdout)
+    assert.match(run.stdout, /^NOT_IMPORTED$/m,
+      `root does not take GRANT statements out of the service account's own directory:\n${run.stdout}`)
+    assert.match(run.stdout, /IT HAS NOT BEEN READ AND IT WILL NOT BE/,
+      `and the operator must be told the record is there and why it is being ignored:\n${run.stdout}`)
+  })
+}
+
+test('[o3d-secops r22] the cutover namespace is one definition, in the library the three entrypoints source', () => {
+  // THE POINT OF THE LIFT, ASSERTED. Three byte-identical copies is how the r9 lock split and the
+  // r20 namespace split both survived a round; the walk that would have made either of these two
+  // paths safe existed in install.sh and only in install.sh.
+  const lib = readFileSync(CUTOVER_NS_LIB_PATH, 'utf8')
+  for (const name of CUTOVER_NS_OWNED) {
+    assert.equal(shellFunctionDefinitions(lib, name, 'scripts/lib/cutover-namespace.sh').length, 1,
+      `${name}() must be defined exactly once, in the library`)
+    for (const entry of R9_SCRIPTS) {
+      assert.equal(shellFunctionDefinitions(entry.source, name, entry.name).length, 0,
+        `${entry.name} must not carry its own ${name}() — that is the shape of every one of these findings`)
+    }
+  }
+  for (const entry of R9_SCRIPTS) {
+    assert.match(entry.source, /source "\$\{IMS_SCRIPT_LIB_DIR\}\/cutover-namespace\.sh"/,
+      `${entry.name} must source the library, and from its own release rather than from ${'${APP_DIR}'}`)
+    // AND THE TWO PATHS COME OFF THE ROOT-OWNED PARENT, which is the finding restated as a
+    // constant: a spelling under ${CUTOVER_STATE_DIR} is a spelling the service account owns.
+    assert.match(entry.source, /^readonly CUTOVER_ROOT_DIR="\/etc\/ims-cutover-state"$/m,
+      `${entry.name} must resolve the root-owned parent from a LITERAL, for the reason ${'${DB_ENV_SNAPSHOT_DIR}'} is one`)
+    assert.match(entry.source, /^LOCK_FILE="\$\{CUTOVER_ROOT_DIR\}\/cutover\.lock"$/m,
+      `${entry.name}: the shared lock must not live where ${'${APP_USER}'} can replace its name`)
+    assert.match(entry.source, /^readonly DB_FENCE_DIR="\$\{CUTOVER_ROOT_DIR\}\/db-fence"$/m,
+      `${entry.name}: nor the connection-fence directory`)
+    assert.match(entry.source, /"\$\{CUTOVER_ROOT_DIR:-\}"/,
+      `${entry.name}: and the publisher must accept the new root, or importing into it is refused`)
+  }
+})
+
+test('[o3d-secops r22] the library aims every privileged operation at a descriptor and never at a name', () => {
+  // A SOURCE-SHAPED CHECK, AND IT IS ABOUT GRAMMAR RATHER THAN PROXIMITY. What the behaviour tests
+  // above cannot show is that the NEXT edit keeps the property: `chown "$owner" "$path"` would pass
+  // every one of them on a host where the link is not planted at the instant the test runs. So the
+  // two calls that apply ownership and mode to a walked-to directory are required to name `.` and
+  // nothing else, and the lock is required to be opened for READING.
+  const lib = readFileSync(CUTOVER_NS_LIB_PATH, 'utf8')
+  const own = shellFunction(lib, 'own_service_subdir')
+  assert.match(own, /^  chmod "\$\{mode\}" \.( |$)/m, `own_service_subdir must fchmod the descriptor it walked to:\n${own}`)
+  assert.match(own, /^  chown "\$\{owner\}:\$\{owner\}" \. /m, `and fchown it:\n${own}`)
+  const root = shellFunction(lib, 'ensure_cutover_root_dir')
+  assert.match(root, /^  if ! chmod 711 \. \|\| ! chown "\$\(id -u\):\$\(id -g\)" \.; then$/m,
+    `and the parent itself is walked into before its mode and owner are applied:\n${root}`)
+
+  const acquire = shellFunction(lib, 'acquire_cutover_lock')
+  assert.ok(acquire.includes('exec 9<"$LOCK_FILE"'),
+    `the shared lock must be opened for READING — an O_RDONLY open has no O_CREAT and no O_TRUNC to aim:\n${acquire}`)
+  assert.ok(!/exec 9>/.test(acquire) && !/exec 8>/.test(acquire) && !/exec 6>/.test(acquire),
+    `and no descriptor in this file may be opened for writing:\n${acquire}`)
+  assert.ok(acquire.indexOf('verify_held_lock 9') < acquire.indexOf('flock -n 9'),
+    `and the descriptor must be judged BEFORE it is locked, or the judgement is about a lock already taken:\n${acquire}`)
+
+  // AND THE WALK CAME ACROSS WHOLE. It is install.sh's, unchanged, and the entrypoint that used to
+  // own it must not have kept a second copy — which the definition count above already refuses —
+  // nor a divergent one, which this refuses.
+  const walk = shellFunction(lib, 'enter_service_subdir')
+  assert.match(walk, /if ! \(umask "\$\{mask\}"; mkdir "\$\{comp\}"\) 2>\/dev\/null; then/,
+    `each component must be created with a PLAIN mkdir, which fails with EEXIST on a planted symlink:\n${walk}`)
+  assert.match(walk, /stat -c '%F\|%d:%i' "\$\{comp\}"/, `lstat-ed, not stat -L:\n${walk}`)
+  assert.match(walk, /cd -P "\$\{comp\}"/, `and entered, so the descriptor is the pin:\n${walk}`)
+})
+
+/**
+ * EVERY RELEASE THAT REMOVES THE RECORD SAYS WHY IT MAY (o3d-secops r30, Codex HIGH 1).
+ *
+ * db_fence_clear_authority() is where the deletion happens on all three entrypoints, and since
+ * r30 it refuses without an attestation that this run RAISED the fence it just released. That
+ * fact is not in any database -- which is the point, because r29 measured that a physical copy of
+ * a fenced cluster answers a release exactly as the original does -- so the only thing that can
+ * supply it is the caller's own memory of its own act.
+ *
+ * THIS TEST IS ABOUT THE CALLERS, and it is a census rather than a spot check: a rule enforced in
+ * the function and then bypassed by one of six call sites passing a constant would leave the
+ * finding open on that path with the guard looking green. So every call in the three entrypoints
+ * and the library is enumerated, and each is required to be one of exactly two shapes -- the
+ * literal attestation, which only a run that published the record itself may use, or a variable
+ * whose assignment is guarded by ${DB_FENCE_RAISED}.
+ *
+ * MUTATION ROUTE (made against the shipped files and reverted): change any call site to pass the
+ * literal unconditionally -- which is what an ordinary "fix the argument" edit looks like -- and
+ * the census names that file and line.
+ */
+test('[o3d-secops r30] every caller of db_fence_clear_authority attests, or passes nothing', () => {
+  const FILES: ReadonlyArray<readonly [string, string]> = [
+    ['scripts/lib/db-fence-protected.sh', readFileSync(join(process.cwd(), 'scripts/lib/db-fence-protected.sh'), 'utf8')],
+    ['scripts/deploy.sh', readFileSync(join(process.cwd(), 'scripts/deploy.sh'), 'utf8')],
+    ['scripts/update.sh', readFileSync(join(process.cwd(), 'scripts/update.sh'), 'utf8')],
+    ['scripts/install.sh', readFileSync(join(process.cwd(), 'scripts/install.sh'), 'utf8')],
+  ]
+
+  const sites: { where: string; line: string }[] = []
+  for (const [name, source] of FILES) {
+    source.split(/\r?\n/).forEach((line, index) => {
+      // The definition itself is not a call site.
+      if (/^\s*db_fence_clear_authority\s*\(\s*\)/.test(line)) return
+      if (!/db_fence_clear_authority\s+/.test(line)) return
+      if (/^\s*#/.test(line)) return
+      sites.push({ where: `${name}:${index + 1}`, line: line.trim() })
+    })
+  }
+
+  // THE WALK REACHED THE FILES, stated as a number: a census that enumerated nothing would satisfy
+  // every rule below vacuously, which is exactly how a guard comes to be green about nothing.
+  assert.ok(sites.length >= 5,
+    `the census must find the shipped call sites; it found ${sites.length}: ${sites.map((s) => s.where).join(', ')}`)
+
+  const UNATTESTED = sites.filter(({ line }) => !/db_fence_clear_authority\s+\S+\s+\S/.test(line))
+  assert.deepEqual(UNATTESTED, [],
+    'a call with no second argument removes nothing since r30, so this is a path that silently stopped clearing its record rather than one that clears it safely')
+
+  // WHERE THE LITERAL IS PERMITTED IS THE WHOLE RULE, and writing the census without that part is
+  // how it comes to establish an adjacent property: a first draft of this test accepted the
+  // literal at ANY site, so changing an entrypoint to pass it unconditionally -- exactly the
+  // "fix the argument" edit somebody would make -- left the census green while reopening the
+  // finding on that path. The literal is a claim that THIS RUN published the record it is
+  // removing, and only db_fence_raise() is in a position to make it: it read ${had_authority}
+  // before publishing and both of its calls are bounded by that. Every entrypoint's release is
+  // releasing a fence it may not have raised, so there the attestation must be a value the flag
+  // decided.
+  const RAISE = shellFunction(readFileSync(join(process.cwd(), 'scripts/lib/db-fence-protected.sh'), 'utf8'), 'db_fence_raise')
+  for (const site of sites) {
+    const literal = /db_fence_clear_authority\s+\S+\s+"?raised-by-this-run"?/.test(site.line)
+    const variable = /db_fence_clear_authority\s+\S+\s+"\$\{?clear_attestation\}?"/.test(site.line)
+    assert.ok(literal || variable,
+      `${site.where} passes something this census does not recognise as an attestation:\n  ${site.line}`)
+    if (!literal) continue
+    assert.ok(site.where.startsWith('scripts/lib/db-fence-protected.sh:'),
+      `${site.where} claims outright that this run raised the fence it is clearing. Only db_fence_raise() may: an entrypoint's release runs against records earlier runs published too, and there the attestation must come from \${DB_FENCE_RAISED}.\n  ${site.line}`)
+    assert.ok(RAISE.includes(site.line),
+      `${site.where} makes that claim from outside db_fence_raise(), which is the only function that read whether an authority was already standing before it published one:\n  ${site.line}`)
+  }
+
+  // AND THE VARIABLE IS NEVER SET WITHOUT THE FLAG. Without this the shape check above is
+  // satisfied by a caller that assigns the attestation unconditionally, which is the same defect
+  // wearing a name.
+  for (const [name, source] of FILES) {
+    source.split(/\r?\n/).forEach((line, index) => {
+      if (!/clear_attestation="raised-by-this-run"/.test(line)) return
+      assert.match(line, /DB_FENCE_RAISED/,
+        `${name}:${index + 1} assigns the attestation without asking whether this run raised the fence:\n  ${line.trim()}`)
+    })
+  }
+
+  // AND SINCE r31, EVERY CALL SAYS WHICH SERVER TOO (o3d-secops r31, Codex HIGH 1). "This run
+  // raised the fence" is a fact about a PROCESS, and a process spans the two connections a proxy or
+  // a failover can separate; the removal therefore takes a second literal saying which server was
+  // released. The same census shape, for the same reason: a rule enforced in the function and
+  // bypassed by one call site passing the literal unconditionally would leave the finding open on
+  // that path with the guard green.
+  //
+  // MUTATION ROUTE (made against the shipped files and reverted): change an entrypoint's release to
+  // pass `"same-server-as-the-fence"` outright instead of ${clear_server}, and the census names it.
+  for (const site of sites) {
+    // The third argument as it is WRITTEN, quotes and all, and stopping at the closing quote --
+    // these calls sit inside `if ! ... ; then`, so a greedy \\S+ swallows the `;` and every
+    // comparison below then fails against a token nobody wrote.
+    const third = /db_fence_clear_authority\s+\S+\s+\S+\s+("[^"]*")/.exec(site.line)
+    assert.ok(third, `${site.where} passes no answer about WHICH SERVER it released, so since r31 it removes nothing:\n  ${site.line}`)
+    const literal = third![1].replace(/"/g, '')
+    if (literal === 'nothing-was-revoked') {
+      // The only place that may say it: db_fence_raise() removing its OWN publication after a
+      // failure that is strictly BEFORE any REVOKE, where there is no server to be wrong about.
+      assert.ok(site.where.startsWith('scripts/lib/db-fence-protected.sh:') && RAISE.includes(site.line),
+        `${site.where} claims nothing was revoked, which only db_fence_raise()'s two removals of its own never-executed publication may:\n  ${site.line}`)
+      continue
+    }
+    assert.match(third![1], /^"\$\{?clear_server\}?"$/,
+      `${site.where} must take its answer about the server from a value the release's own output decided, not from a literal:\n  ${site.line}`)
+  }
+
+  // AND THAT VALUE IS ONLY EVER SET FROM THE RELEASE'S OWN REPORT, UNDER A GUARD THAT ALSO PROVES
+  // THE QUESTION WAS ASKED (o3d-secops r31, extended r32 for Codex HIGH 1).
+  //
+  // r31 wrote this as a SAME-LINE rule -- the assignment had to carry `witness_colocated=yes` on
+  // its own line -- and that is the vacuous shape this branch keeps rediscovering: it holds only
+  // while the guard happens to fit on one line, and it says nothing about what the guard ASKS. r32
+  // splits the guard across three lines (it now takes two conditions), so the same-line rule would
+  // have had to be deleted to make the file pass, which is a rule deleting itself.
+  //
+  // SO IT IS ASKED OF THE ENCLOSING CONDITIONAL INSTEAD. From the assignment, walk UP to the `if`
+  // that governs it, and require that conditional to contain BOTH halves: the strict whole-line
+  // reader over the release's own output, AND the proof that a challenge was issued at all. Either
+  // one alone is a defect this branch has already shipped once.
+  //
+  // MUTATION ROUTE (made against the shipped files and reverted): drop `${#witness_argv[@]}` from
+  // deploy.sh's guard, leaving only the verdict read, and this names deploy.sh; replace the whole
+  // guard with `if true; then` and it names it again. Delete the `if` and the walk below finds
+  // none, which is its own failure rather than a silent pass.
+  let guardedAssignments = 0
+  for (const [name, source] of FILES) {
+    const lines = source.split(/\r?\n/)
+    lines.forEach((line, index) => {
+      if (!/clear_server="same-server-as-the-fence"/.test(line)) return
+      guardedAssignments += 1
+      let open = -1
+      for (let back = index; back >= 0; back -= 1) {
+        if (/^\s*if\s/.test(lines[back])) { open = back; break }
+        if (/^\s*(fi|esac|\})\s*$/.test(lines[back])) break
+      }
+      assert.notEqual(open, -1,
+        `${name}:${index + 1} sets which server was released with no conditional governing it at all:\n  ${line.trim()}`)
+      const guard = lines.slice(open, index + 1).join('\n')
+      assert.match(guard, /db_fence_machine_verdict "[^"]*" "RELEASE_WITNESS"/,
+        `${name}:${index + 1} decides which server was released without reading, as a whole line and against this run's own nonce, what the release itself reported:\n${guard}`)
+      assert.match(guard, /\$\{#witness_argv\[@\]\}/,
+        `${name}:${index + 1} acts on a witness verdict without first showing that a challenge was ISSUED. A stream that answers a question nobody asked must not license a deletion:\n${guard}`)
+    })
+  }
+  // THE WALK REACHED THEM, stated as a number: three entrypoints, one assignment each. A loop that
+  // matched nothing would otherwise pass exactly as one that matched everything and found it sound.
+  assert.equal(guardedAssignments, 3,
+    `the census must reach one guarded assignment per entrypoint; it reached ${guardedAssignments}`)
+
+  // THE FUNCTION ITSELF REFUSES, EXERCISED UNDER A REAL SHELL rather than read. Both directions,
+  // so a passing test cannot be a function that never removes anything.
+  const dir = mkdtempSync(join(tmpdir(), 'ims-clear-'))
+  try {
+    const record = join(dir, 'db-connect-fence.json')
+    const CLEAR = shellFunction(readFileSync(join(process.cwd(), 'scripts/lib/db-fence-protected.sh'), 'utf8'), 'db_fence_clear_authority')
+    // o3d-secops r31: two answers, WHO and WHICH SERVER, so this takes both and each loop below
+    // holds one of them right and varies the other.
+    const ask = (attestation: string, server = 'same-server-as-the-fence') => {
+      writeFileSync(record, '{"state_complete":1}\n')
+      const run = runShell([
+        'set -uo pipefail',
+        'exec 2>&1',
+        'DB_FENCE_SUDO_PREFIX=""',
+        'DB_FENCE_RELEASE_WRAPPER="/opt/cutover/release-db-fence"',
+        CLEAR,
+        `db_fence_clear_authority ${JSON.stringify(record)} ${JSON.stringify(attestation)} ${JSON.stringify(server)}`,
+        'echo "RC=$?"',
+      ].join('\n'))
+      return { output: run.output, survived: existsSync(record) }
+    }
+
+    for (const wrong of ['', 'true', 'yes', 'raised-by-this-run ', 'RAISED-BY-THIS-RUN']) {
+      const refused = ask(wrong)
+      assert.match(refused.output, /^RC=2$/m, `${JSON.stringify(wrong)} must not license an unlink:\n${refused.output}`)
+      assert.equal(refused.survived, true, `and ${JSON.stringify(wrong)} must leave the record where it was`)
+    }
+
+    // AND THE SAME CENSUS OF NEAR-MISSES ON THE SECOND ANSWER (o3d-secops r31, Codex HIGH 1). The
+    // WHO is correct in every one of these, which is the point: r30's attestation on its own is
+    // satisfied by a run whose release was re-pointed to a copy of the fenced cluster.
+    for (const wrong of ['', 'true', 'yes', 'same-server-as-the-fence ', 'SAME-SERVER-AS-THE-FENCE', 'nothing-was-revoked-x']) {
+      const refused = ask('raised-by-this-run', wrong)
+      assert.match(refused.output, /^RC=2$/m, `${JSON.stringify(wrong)} must not license an unlink either:\n${refused.output}`)
+      assert.equal(refused.survived, true, `and ${JSON.stringify(wrong)} must leave the record where it was`)
+    }
+
+    const allowed = ask('raised-by-this-run')
+    assert.match(allowed.output, /^RC=0$/m, `an attested removal must still happen:\n${allowed.output}`)
+    assert.equal(allowed.survived, false, 'and the record must be gone')
+
+    // AND THE OTHER PERMITTED SECOND ANSWER REMOVES TOO, or db_fence_raise() could never clear its
+    // own never-executed publication and every refused initial fence would leave litter behind.
+    const nothingRevoked = ask('raised-by-this-run', 'nothing-was-revoked')
+    assert.match(nothingRevoked.output, /^RC=0$/m, `a record nothing revoked from must still be removable:\n${nothingRevoked.output}`)
+    assert.equal(nothingRevoked.survived, false, 'and that record must be gone as well')
+
+    // AND AN ABSENT RECORD IS NOT A REFUSAL: the recovery paths reach this after a release that
+    // found no record at all, and turning that into a refusal would stop the one state that needs
+    // no decision.
+    const nothing = runShell([
+      'set -uo pipefail',
+      'exec 2>&1',
+      'DB_FENCE_SUDO_PREFIX=""',
+      'DB_FENCE_RELEASE_WRAPPER="/opt/cutover/release-db-fence"',
+      CLEAR,
+      `db_fence_clear_authority ${JSON.stringify(join(dir, 'not-there.json'))} "" ""`,
+      'echo "RC=$?"',
+    ].join('\n'))
+    assert.match(nothing.output, /^RC=0$/m, `nothing to remove is not something to refuse:\n${nothing.output}`)
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+/**
+ * AND THE BAKED RELEASE WRAPPER NEVER UNLINKS ON ITS OWN (o3d-secops r30, Codex HIGH 1 + MEDIUM).
+ *
+ * The wrapper root writes into the cutover recovery directory is the case the finding is really
+ * about: it is run by a person, days later, against a record an earlier run published, so it has
+ * no memory to attest with and the copy it may be pointed at is not a thought experiment. It used
+ * to `rm -f` the record on the helper's exit 0.
+ *
+ * MUTATION ROUTE: put `rm -f "${state_file}"` back into release_the_fence() and the first
+ * assertion fails; delete the `-ne 6` half of its status test and the retry assertion fails.
+ */
+test('[o3d-secops r30] the release wrapper asks before it removes, and completes a retry', () => {
+  const LIBRARY = readFileSync(join(process.cwd(), 'scripts/lib/db-fence-protected.sh'), 'utf8')
+  // release_the_fence() lives INSIDE the quoted WRAPPER_EOF heredoc that
+  // db_fence_publish_operator_wrappers() writes into the cutover recovery directory, so it has to
+  // be lifted out of the heredoc before it can be read as shell.
+  const OPEN = "cat <<'WRAPPER_EOF'\n"
+  const CLOSE = '\nWRAPPER_EOF\n'
+  const opened = LIBRARY.indexOf(OPEN)
+  const closed = LIBRARY.indexOf(CLOSE, opened)
+  assert.ok(opened >= 0 && closed > opened, 'the wrapper body must still be a quoted heredoc in the library')
+  const WRAPPER_BODY = LIBRARY.slice(opened + OPEN.length, closed)
+  const RELEASE = shellFunction(WRAPPER_BODY, 'release_the_fence')
+
+  // THE PRECONDITION: this is the function that runs the release, or the assertions below are
+  // about some other text entirely.
+  assert.match(RELEASE, /--release/, `the subject must be the release arm:\n${RELEASE}`)
+
+  assert.doesNotMatch(RELEASE, /\brm -f\b/,
+    `the standalone release wrapper may not unlink the record on its own -- it cannot show which server answered:\n${RELEASE}`)
+  assert.match(RELEASE, /operator_confirms clear/,
+    `and the removal must be confirmed at the terminal:\n${RELEASE}`)
+  assert.match(RELEASE, /decision_token clear "\$\{digest\}" "\$\{identity\}"/,
+    `bound to the record's exact bytes AND the cluster that answered, so the token cannot be reused:\n${RELEASE}`)
+  assert.match(RELEASE, /node -e "\$\{clear_authority\}" -- "\$\{state_file\}" "\$\{digest\}"/,
+    `and the removal itself is the compare-and-swap, not a name:\n${RELEASE}`)
+
+  // THE RETRY: exit 6 is EXIT_ALREADY_RELEASED and must be accepted exactly as 0 is, or the loop
+  // r30 exists to break is still there.
+  assert.match(RELEASE, /"\$\{rc\}" -ne 0 && "\$\{rc\}" -ne 6/,
+    `a release that finds its grants already restored must still reach the removal offer:\n${RELEASE}`)
+
+  // AND THE HELPER REALLY DOES PRODUCE THAT STATUS AND THAT LINE, so the wrapper is not reading
+  // for something nothing emits.
+  const HELPER = readFileSync(join(process.cwd(), 'scripts/fence-db-connections.mjs'), 'utf8')
+  assert.match(HELPER, /export const EXIT_ALREADY_RELEASED = 6/, 'the helper must define that status')
+  assert.match(HELPER, /release_cluster_identity=/, 'and print the cluster line the token binds')
+})
+
+// ---------------------------------------------------------------------------
+// o3d-secops r31, Codex HIGH 2 — A FENCE THAT WENT UP LOST ITS OWN RECORD OF STANDING.
+//
+// `DB_FENCE_UP` and `DB_FENCE_RAISED` used to be assigned AFTER `--print-migration-url` had run
+// and its output had been validated. So a fence that had genuinely gone up — REVOKEs committed,
+// authority stamped — lost both flags to a failure that had nothing to do with it: an OOM kill of
+// `node`, a signal, a URL this run could not compose. The exit trap then released the grants and
+// the r30 removal gate, seeing no attestation, kept the record; the next unattended run read a
+// stamped, already-released authority and stopped for a terminal confirmation nobody was there to
+// give.
+//
+// The flags are the fact that `db_fence_raise()` returned 0, and nothing between that return and
+// their assignment may be able to make it untrue. These run the shipped functions, in all three
+// entrypoints, with a helper that fences and then refuses to compose a URL.
+// ---------------------------------------------------------------------------
+
+/** Fences successfully, refuses `--print-migration-url`, and answers a release with exit 4. */
+function fenceStubUrlFails(dir: string): void {
+  writeFenceCheckout(
+    dir,
+    [
+      "import { appendFileSync } from 'node:fs'",
+      `appendFileSync(${JSON.stringify(join(dir, 'calls.log'))}, process.argv.slice(2).join(' ') + '\\n')`,
+      // THE FALLIBLE STEP THAT IS NOT THE FENCE. It runs after the REVOKEs are committed and it
+      // knows nothing about them, which is the whole shape of the finding.
+      "if (process.argv.includes('--print-migration-url')) process.exit(7)",
+      "if (process.argv.includes('--release')) process.exit(4)",
+      'process.exit(0)',
+      '',
+    ].join('\n'),
+  )
+}
+
+for (const entry of FENCE_HARNESS) {
+  test(`${entry.name} keeps the attestation for a fence that went up when a later step fails (o3d-secops r31, Codex HIGH 2)`, () => {
+    const dir = mkdtempSync(join(tmpdir(), 'ims-r31urlfail-'))
+    try {
+      fenceStubUrlFails(dir)
+      const program = [
+        'set -uo pipefail',
+        entry.preamble(dir),
+        'error() { echo "ERROR: $*" >&2; }',
+        'DB_FENCE_RAISED=false',
+        CUTOVER_DIR_PRIMITIVES,
+        shellFunction(entry.source, 'fence_db_connections'),
+        shellFunction(entry.source, 'release_db_connections'),
+        'on_exit() { if release_db_connections; then echo "TRAP RELEASE SAID OK"; else echo "TRAP RELEASE REFUSED"; fi; }',
+        'trap on_exit EXIT',
+        'fence_db_connections',
+        'echo "REACHED THE MIGRATION"',
+      ].join('\n')
+      const result = runShell(program)
+
+      // MUTATION ROUTE: move the `DB_FENCE_UP=true` / `DB_FENCE_RAISED=true` pair back below the
+      // `[[ -n "$MIGRATION_DATABASE_URL" ]] || die` line — which is exactly where they were before
+      // this round — and 'TRAP RELEASE SAID OK' is printed instead, over a fence that is standing.
+      assert.match(calls(dir), /^--fence /m, 'precondition: the fence itself was reached and executed')
+      assert.match(calls(dir), /^--print-migration-url /m, 'precondition: and the step that fails ran after it')
+      assert.ok(!result.output.includes('REACHED THE MIGRATION'),
+        `a run that cannot compose a migration URL must still not migrate:\n${result.output}`)
+      assert.match(result.output, /TRAP RELEASE REFUSED/,
+        `the fence went up, so a release that can prove nothing about the record must refuse:\n${result.output}`)
+      assert.ok(!result.output.includes('TRAP RELEASE SAID OK'),
+        `which is the branch a lost DB_FENCE_RAISED takes -- and the one this finding is about:\n${result.output}`)
+      assert.match(result.output, /RECORD IS GONE/,
+        `and it must say that THIS RUN raised the fence whose record it can no longer find:\n${result.output}`)
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  // -------------------------------------------------------------------------
+  // o3d-secops r31 — THE WITNESS MAY COST THE AUTOMATION AND NOTHING ELSE.
+  //
+  // This is the safety property the whole of HIGH 1's fix rests on: nothing about a witness may
+  // refuse a fence, fail a release, or stop a migration. A cluster with no second database, a
+  // pooler that hands out no stable backend, a helper too old to know the mode — each must cost the
+  // automatic removal of the record at the end of the run and NOTHING else.
+  //
+  // MUTATION ROUTE (made against the shipped file and reverted): make the witness load-bearing in
+  // db_fence_raise() — `db_fence_witness_start ... || return 3` in place of the `if`, which is the
+  // shape somebody reaches for on being told the attestation matters — and this run refuses to
+  // fence at all, with 'REACHED THE MIGRATION' unprinted.
+  //
+  // (The SIGPIPE hazard the teardown ONCE had is guarded separately and deterministically at the
+  // end of this file: whether it fires here depends on when bash happens to reap the co-process,
+  // and a guard that rests on that is a guard that is green about nothing.)
+  // -------------------------------------------------------------------------
+  test(`${entry.name} fences and migrates normally when no witness can be held (o3d-secops r31)`, () => {
+    const dir = mkdtempSync(join(tmpdir(), 'ims-r31nowitness-'))
+    try {
+      // Everything succeeds except `--witness`, which refuses outright — a cluster with no second
+      // database, a pooler that will not give out a stable backend, a helper too old to know the
+      // mode. The fence must be completely unaffected.
+      writeFenceCheckout(
+        dir,
+        [
+          "import { appendFileSync } from 'node:fs'",
+          `appendFileSync(${JSON.stringify(join(dir, 'calls.log'))}, process.argv.slice(2).join(' ') + '\\n')`,
+          "if (process.argv.includes('--witness')) process.exit(9)",
+          "if (process.argv.includes('--print-migration-url')) { process.stdout.write('postgres://admin@127.0.0.1/main?options=-c%20role%3Dimsapp\\n'); process.exit(0) }",
+          'process.exit(0)',
+          '',
+        ].join('\n'),
+      )
+      const program = [
+        'set -uo pipefail',
+        entry.preamble(dir),
+        'error() { echo "ERROR: $*" >&2; }',
+        'DB_FENCE_RAISED=false',
+        CUTOVER_DIR_PRIMITIVES,
+        shellFunction(entry.source, 'fence_db_connections'),
+        'fence_db_connections',
+        'echo "REACHED THE MIGRATION"',
+      ].join('\n')
+      const result = runShell(program)
+
+      assert.match(calls(dir), /^--witness /m, 'precondition: a witness was attempted, or this measures nothing')
+      assert.match(calls(dir), /^--fence /m, 'and the fence itself still ran')
+      assert.match(result.output, /REACHED THE MIGRATION/,
+        `a witness that cannot be held must cost the automatic removal of the record and NOTHING else:\n${result.output}`)
+      assert.notEqual(result.status, -1,
+        `and the run must not die on a signal, which is what writing down a dead co-process's pipe did:\n${result.output}`)
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+}
+
+// ---------------------------------------------------------------------------
+// o3d-secops r31, Codex HIGH 1 — THE ENTRYPOINT SIDE OF THE BINDING.
+//
+// The library refuses without the second attestation and the helper decides what that attestation
+// is; what is left, and what these measure, is the SHELL BETWEEN THEM. An entrypoint that issued
+// the challenge, ran the release and then removed the record from its own DB_FENCE_RAISED flag
+// regardless of what the release reported would leave the finding entirely open with every other
+// test in this round green.
+//
+// Both directions, in all three entrypoints, with the SAME stub differing only in the one line the
+// release reports — so a passing negative cannot be a path that never removes anything.
+// ---------------------------------------------------------------------------
+
+/** The full cycle stub of the r23 ordering test, with the release's verdict as a parameter. */
+function witnessCycleCheckout(dir: string, verdict: 'yes' | 'no'): void {
+  const helper = writeFenceCheckout(dir, '')
+  writeFileSync(helper, [
+    "import { appendFileSync } from 'node:fs'",
+    `appendFileSync(${JSON.stringify(join(dir, 'calls.log'))}, process.argv.slice(2).join(' ') + '\\n')`,
+    "if (process.argv.includes('--plan')) {",
+    "  process.stdout.write(JSON.stringify({",
+    "    database: 'imsdb', owner_role: 'imsapp', app_role: 'imsapp', admin_role: 'deployadmin',",
+    "    revoked: ['PUBLIC', 'imsapp'], datacl_before: null, fenced_at: '2026-01-01T00:00:00.000Z',",
+    "  }) + '\\n')",
+    '}',
+    // o3d-secops r32: STAMPED, because the shipped `--print-migration-url` stamps. Root reads the
+        // nonce back out of this URL and asks the witness about that value, so a stub that emitted a
+        // bare URL would exercise the "this run composed a migration it cannot place" refusal on every
+        // ordinary cutover instead of the cutover.
+        "if (process.argv.includes('--print-migration-url')) process.stdout.write(`postgres://admin@127.0.0.1/nowhere?application_name=ims-migration-${process.argv.find((a) => a.startsWith('--migration-nonce='))?.slice('--migration-nonce='.length) ?? ''}\\n`)",
+    ...WITNESS_STUB_LINES(verdict),
+    'process.exit(0)',
+    '',
+  ].join('\n'))
+}
+
+for (const entry of FENCE_HARNESS) {
+  for (const verdict of ['yes', 'no'] as const) {
+    const cleared = verdict === 'yes'
+    // The label is the r32 grammar, because the r31 one no longer exists: the verdict is a whole
+    // line naming this run's own nonce, and a test named after the token it used to be a substring
+    // of is a name that tells the next reader something untrue about what it exercises.
+    test(`${entry.name} removes its own record only when the release saw the witness (RELEASE_WITNESS ${verdict === 'yes' ? 'colocated' : 'absent'}) (o3d-secops r31, Codex HIGH 1)`, () => {
+      const dir = mkdtempSync(join(tmpdir(), `ims-r31verdict-${verdict}-`))
+      try {
+        witnessCycleCheckout(dir, verdict)
+        const program = [
+          'set -uo pipefail',
+          // The refusal an operator has to read is on stderr, and this run is expected to SUCCEED,
+          // so runShell() would return stdout alone and the assertion would be about nothing.
+          'exec 2>&1',
+          entry.preamble(dir),
+          'error() { echo "ERROR: $*" >&2; }',
+          'DB_FENCE_RAISED=false',
+          CUTOVER_DIR_PRIMITIVES,
+          shellFunction(entry.source, 'fence_db_connections'),
+          shellFunction(entry.source, 'release_db_connections'),
+          'fence_db_connections',
+          'release_db_connections || echo "RELEASE REPORTED FAILURE"',
+          '[[ -e "${DB_FENCE_STATE}" ]] && echo AUTHORITY_REMAINS || echo AUTHORITY_CLEARED',
+        ].join('\n')
+        const result = runShell(program)
+
+        // THE PRECONDITIONS, so neither direction can pass on a run that did none of this.
+        assert.match(calls(dir), /^--witness --witness-nonce=[0-9a-f]{32} /m,
+          `the fence must open a witness before it revokes:\n${result.output}`)
+        assert.match(calls(dir), /^--fence .*--witness-lock=[0-9a-f]{32}/m,
+          `and tell --fence which lock to look for:\n${result.output}`)
+        assert.match(calls(dir), /^--release .*--witness-challenge=[0-9a-f]{32}/m,
+          `and the release must be given a challenge minted at release time:\n${result.output}`)
+        // AND THE CHALLENGE IS NOT THE FENCE'S OWN NONCE. A reused one would be a lock some earlier
+        // snapshot of the cluster could already contain, which is the property being bought here.
+        const fenceNonce = /--witness-lock=([0-9a-f]{32})/.exec(calls(dir))?.[1]
+        const challenge = /--witness-challenge=([0-9a-f]{32})/.exec(calls(dir))?.[1]
+        assert.ok(fenceNonce && challenge, `both nonces must reach the helper:\n${calls(dir)}`)
+        assert.notEqual(fenceNonce, challenge, 'the release challenge must be fresh, not the fence own nonce')
+
+        // MUTATION ROUTE (all made against the shipped files and reverted): in the entrypoint's
+        // release, assign clear_server unconditionally instead of from the release's own verdict --
+        // the 'no' case then prints AUTHORITY_CLEARED. Drop the third argument from the
+        // db_fence_clear_authority call -- the 'yes' case prints AUTHORITY_REMAINS, and the
+        // ordinary cutover starts asking a human on every deploy. Make db_fence_witness_nonce()
+        // return a constant -- the freshness assertion above fails in both directions.
+        if (cleared) {
+          assert.match(result.output, /^AUTHORITY_CLEARED$/m,
+            `a release whose own connection saw the witness must end its own record with nobody at a terminal:\n${result.output}`)
+          assert.ok(!/RELEASE REPORTED FAILURE/.test(result.output),
+            `and the ordinary cutover must not report a failure:\n${result.output}`)
+        } else {
+          assert.match(result.output, /^AUTHORITY_REMAINS$/m,
+            `a release that could not see the witness may have landed on a copy, so the record must survive:\n${result.output}`)
+          assert.match(result.output, /RELEASE REPORTED FAILURE/,
+            `and the entrypoint must say so rather than reporting a clean release:\n${result.output}`)
+          assert.match(result.output, /deliberately NOT removed/,
+            `naming the record it kept and how to end it:\n${result.output}`)
+        }
+      } finally {
+        rmSync(dir, { recursive: true, force: true })
+      }
+    })
+  }
+}
+
+/**
+ * TAKING THE WITNESS DOWN MUST NOT TAKE THE ENTRYPOINT'S STDERR WITH IT (o3d-secops r31).
+ *
+ * This is a regression test for a defect this round INTRODUCED and then removed, and it is here
+ * because the defect was invisible in exactly the way that matters: `exec {fd}>&- 2>/dev/null` is a
+ * BARE `exec` with a redirection, so bash applies the `2>/dev/null` TO THE SHELL and keeps it. Every
+ * warning, refusal and `die` the entrypoint printed after its first witness teardown then went to
+ * /dev/null -- and a cutover's stderr is the only account an operator has of a fence that is
+ * standing, a record that was kept, or a migration that was refused. It surfaced as eight
+ * intermittent failures in this file, every one of them on a message about a FENCE, and not one of
+ * them naming the witness at all.
+ *
+ * MUTATION ROUTE (made against the shipped file and reverted): un-group either close in
+ * db_fence_witness_stop() -- `{ exec {fd}>&-; } 2>/dev/null` back to `exec {fd}>&- 2>/dev/null` --
+ * and the line after the teardown is not printed.
+ */
+test('[o3d-secops r31] taking the connection witness down leaves the shell able to speak', () => {
+  const FENCE_LIB = readFileSync(join(process.cwd(), 'scripts/lib/db-fence-protected.sh'), 'utf8')
+  const result = runShell([
+    'set -uo pipefail',
+    'exec 2>&1',
+    'db_fence_helper() { cat; }',
+    shellFunction(FENCE_LIB, 'db_fence_witness_nonce'),
+    shellFunction(FENCE_LIB, 'db_fence_witness_stop'),
+    'DB_FENCE_WITNESS_BOUND=0',
+    'echo "BEFORE" >&2',
+    // A REAL CO-PROCESS, so the fds are real and the teardown is the one that runs on every cutover.
+    'coproc DB_FENCE_WITNESS { db_fence_helper; }',
+    'db_fence_witness_stop',
+    'echo "AFTER ONE TEARDOWN" >&2',
+    // AND AGAIN WITH NOTHING THERE, which is the ordinary path: the fence calls it once on the way
+    // in and the release calls it again on the way out.
+    'db_fence_witness_stop',
+    'echo "AFTER A SECOND TEARDOWN" >&2',
+    'echo "AND STDOUT TOO"',
+  ].join('\n'))
+
+  assert.match(result.output, /^BEFORE$/m, `precondition: stderr reached the caller before any teardown:\n${result.output}`)
+  assert.match(result.output, /^AFTER ONE TEARDOWN$/m,
+    `a witness teardown must not silence the shell that performed it:\n${result.output}`)
+  assert.match(result.output, /^AFTER A SECOND TEARDOWN$/m,
+    `nor may the second one, which every release performs:\n${result.output}`)
+  assert.match(result.output, /^AND STDOUT TOO$/m, `and stdout must survive it as well:\n${result.output}`)
+})
+
+/**
+ * TAKING DOWN A WITNESS WHOSE READER HAS GONE MUST NOT KILL THE SHELL (o3d-secops r31).
+ *
+ * The companion to the stderr test above, and the other half of the same defect. The teardown used
+ * to send a `close` line down the co-process's pipe. On the ordinary "no witness here" path the
+ * reader is already gone, bash does NOT ignore SIGPIPE, and the write therefore killed the WHOLE
+ * ENTRYPOINT with a signal — mid-cutover, with a fence possibly standing. It is guarded here rather
+ * than through db_fence_raise() because there it fires only when bash has not yet reaped the
+ * co-process, and a guard that depends on that is a guard that is green about nothing.
+ *
+ * THE READER IS GONE WHILE THE FD IS STILL KNOWN, which is the state that makes it deterministic:
+ * the co-process closes its own stdin and stays alive, so ${DB_FENCE_WITNESS[1]} is still a real
+ * descriptor and the pipe behind it has no reader at all.
+ *
+ * MUTATION ROUTE (made against the shipped file and reverted): put
+ * `printf 'close\n' >&"${DB_FENCE_WITNESS[1]}" 2>/dev/null || true` back at the top of
+ * db_fence_witness_stop() and this run exits 141 with 'SURVIVED THE TEARDOWN' unprinted.
+ */
+test('[o3d-secops r31] taking down a witness whose reader has gone does not kill the shell', () => {
+  const FENCE_LIB = readFileSync(join(process.cwd(), 'scripts/lib/db-fence-protected.sh'), 'utf8')
+  const result = runShell([
+    'set -uo pipefail',
+    'exec 2>&1',
+    shellFunction(FENCE_LIB, 'db_fence_witness_nonce'),
+    shellFunction(FENCE_LIB, 'db_fence_witness_stop'),
+    'DB_FENCE_WITNESS_BOUND=0',
+    // ALIVE, WITH NO READER. `exec 0<&-` closes the co-process's own stdin; the sleep keeps the
+    // process (and so bash's record of its descriptors) in place while the teardown runs.
+    'coproc DB_FENCE_WITNESS { exec 0<&-; sleep 3; }',
+    'sleep 0.4',
+    'PRECONDITION="${DB_FENCE_WITNESS[1]:-none}"',
+    'echo "WRITE FD IS ${PRECONDITION}"',
+    'db_fence_witness_stop',
+    'echo "SURVIVED THE TEARDOWN"',
+  ].join('\n'))
+
+  assert.doesNotMatch(result.output, /^WRITE FD IS none$/m,
+    `precondition: the descriptor must still be known, or this exercises the easy case:\n${result.output}`)
+  assert.match(result.output, /^SURVIVED THE TEARDOWN$/m,
+    `taking down a witness whose reader has gone must not kill the cutover with a signal:\n${result.output}`)
+  assert.equal(result.status, 0, `and the shell must exit cleanly, not on SIGPIPE:\n${result.output}`)
+})
+
+// ---------------------------------------------------------------------------
+// o3d-secops r32, Codex HIGH 1 — PROSE AND MACHINE DATA NO LONGER SHARE A CHANNEL,
+// AND THE CHANNEL IS NO LONGER READ BY SUBSTRING.
+//
+// THE FINDING. `released` held the WHOLE of `--release`'s stdout, and the shell accepted the
+// verdict with `[[ "$released" == *"witness_colocated=yes"* ]]`. Eleven `console.log` calls in the
+// helper wrote to that same stdout, and several of them interpolate a DATABASE OR ROLE NAME --
+// `Connection fence released: CONNECT restored to <roles> on <database>.` above all. A database or
+// a role called `x witness_colocated=yes` therefore set the verdict, and root then deleted the
+// sole authority for a fence still standing on the real server. The fence side had the same defect
+// with `fence_witness=colocated`, and both were duplicated across all three entrypoints.
+//
+// WHAT THESE MEASURE, and it is three separate properties rather than three spellings of one:
+//
+//   1. A NAME SOMEBODY ELSE CHOSE CANNOT FORGE A VERDICT. The stub puts the token on the channel
+//      the way an identifier would -- inside a longer line, and on a line of its own carrying a
+//      DIFFERENT nonce -- and the record must survive.
+//   2. TWO ANSWERS ARE NOT AN ANSWER. A stream that says both must refuse rather than take the
+//      last one, because `tail -1` semantics are how an appended line becomes the verdict.
+//   3. A VERDICT WITH NO CHALLENGE REFUSES. This is the one that is easy to miss and the shape
+//      this branch has closed four times: the ABSENCE of the exchange must not read as success.
+//      The stub learns the nonce through the witness co-process and answers PERFECTLY -- right
+//      grammar, right nonce, single line -- while the shell never issued the challenge, so only
+//      the `${#witness_argv[@]}` guard can refuse it.
+// ---------------------------------------------------------------------------
+
+/**
+ * A checkout whose `--release` speaks the r32 grammar and whatever else the case needs on stdout.
+ *
+ * `nonceSink` is the file the WITNESS stub writes every challenge nonce it is asked for. It is how
+ * case 3 above is reachable at all: `--release` is a different process from the witness, so
+ * without a channel between them a run that never passed `--witness-challenge=` could not produce
+ * a correctly-formed verdict, and the guard being tested would have nothing to refuse.
+ */
+function witnessProtocolCheckout(
+  dir: string,
+  options: {
+    verdict?: 'yes' | 'no'
+    extraStdout?: string[]
+    confirmChallenge?: boolean
+    sightings?: number
+    // ONE ANSWER, OR ONE PER CALL. The re-fence case needs the FIRST `--bind-migration` to bind --
+    // the cutover's own gate refuses otherwise and the run never reaches its trap -- and the
+    // SECOND, the trap's own, to fail. A single value repeats for every call.
+    binding?: 'colocated' | 'absent' | ReadonlyArray<'colocated' | 'absent'>
+    samplerStuck?: boolean
+  } = {},
+): void {
+  const {
+    verdict = 'yes', extraStdout = [], confirmChallenge = true,
+    sightings = 1, binding = 'colocated', samplerStuck = false,
+  } = options
+  const helper = writeFenceCheckout(dir, '')
+  const sink = JSON.stringify(join(dir, 'challenge-nonce'))
+  // WHERE THE `--hold-stamp` PROBE ANNOUNCES ITSELF. In the shipped mechanism the witness sees that
+  // probe through `pg_stat_activity`; there is no PostgreSQL here and the witness is a different
+  // process, so the probe leaves a file and the witness stub counts it. What is under test in this
+  // file is the SHELL: that it runs the probe, asks the sampler on both sides of it, and refuses
+  // when the count did not move.
+  const held = JSON.stringify(join(dir, 'hold-stamp-probe'))
+  const bindings = Array.isArray(binding) ? binding : [binding as 'colocated' | 'absent']
+  const bindSeq = JSON.stringify(join(dir, 'bind-call-count'))
+  writeFileSync(helper, [
+    "import { appendFileSync, existsSync, readFileSync, writeFileSync } from 'node:fs'",
+    `appendFileSync(${JSON.stringify(join(dir, 'calls.log'))}, process.argv.slice(2).join(' ') + '\\n')`,
+    "if (process.argv.includes('--plan')) {",
+    "  process.stdout.write(JSON.stringify({",
+    "    database: 'imsdb', owner_role: 'imsapp', app_role: 'imsapp', admin_role: 'deployadmin',",
+    "    revoked: ['PUBLIC', 'imsapp'], datacl_before: null, fenced_at: '2026-01-01T00:00:00.000Z',",
+    "  }) + '\\n')",
+    '}',
+    "if (process.argv.includes('--print-migration-url')) process.stdout.write(`postgres://admin@127.0.0.1/nowhere?application_name=ims-migration-${process.argv.find((a) => a.startsWith('--migration-nonce='))?.slice('--migration-nonce='.length) ?? ''}\\n`)",
+    // THE WITNESS, WHICH ALSO RECORDS EVERY NONCE IT IS CHALLENGED WITH. Whether it CONFIRMS is
+    // the parameter: a witness that hears the challenge and says nothing is exactly the state in
+    // which the shell issues no `--witness-challenge=` and the verdict below is unasked-for.
+    "if (process.argv.includes('--witness')) {",
+    "  const nonce = process.argv.find((a) => a.startsWith('--witness-nonce='))?.slice('--witness-nonce='.length) ?? ''",
+    "  process.stdout.write(`WITNESS_READY ${nonce}\\n`)",
+    "  let buffer = ''",
+    "  process.stdin.on('data', (chunk) => {",
+    "    buffer += chunk.toString('utf8')",
+    "    let index",
+    "    while ((index = buffer.indexOf('\\n')) >= 0) {",
+    "      const line = buffer.slice(0, index).trim()",
+    "      buffer = buffer.slice(index + 1)",
+    "      const hit = /^challenge ([0-9a-f]+)$/.exec(line)",
+    `      if (hit) { writeFileSync(${sink}, hit[1]); ${confirmChallenge ? 'process.stdout.write(`WITNESS_HELD ${hit[1]}\\n`)' : '/* heard, never confirmed */'} }`,
+    "      const w = /^watch ([0-9a-f]+)$/.exec(line)",
+    "      if (w) process.stdout.write(`WITNESS_WATCHING ${w[1]}\\n`)",
+    "      const g = /^sightings ([0-9a-f]+)$/.exec(line)",
+    // THE COUNT GROWS WHEN, AND ONLY WHEN, A `--hold-stamp` PROBE HAS RUN. `samplerStuck` is how
+    // a sampler that has DIED is exhibited: the probe runs and reports colocated, and the count
+    // does not move -- which reads exactly like "the migration went elsewhere" and must refuse.
+    `      const grown = ${samplerStuck ? '0' : `(existsSync(${held}) ? 1 : 0)`}`,
+    `      if (g) process.stdout.write(\`WITNESS_SIGHTINGS \${g[1]} \${${sightings} + grown}\n\`)`,
+    "    }",
+    "  })",
+    "  await new Promise((resolve) => process.stdin.on('end', resolve))",
+    "  process.exit(0)",
+    "}",
+    "const lockArg = process.argv.find((a) => a.startsWith('--witness-lock='))?.slice('--witness-lock='.length) ?? ''",
+    "const migrationArg = process.argv.find((a) => a.startsWith('--migration-nonce='))?.slice('--migration-nonce='.length) ?? ''",
+    "if (process.argv.includes('--bind-migration')) {",
+    `  if (process.argv.includes('--hold-stamp')) writeFileSync(${held}, 'held')`,
+    `  const answers = ${JSON.stringify(bindings)}`,
+    `  const seen = existsSync(${bindSeq}) ? Number(readFileSync(${bindSeq}, 'utf8')) : 0`,
+    `  writeFileSync(${bindSeq}, String(seen + 1))`,
+    '  const answer = answers[Math.min(seen, answers.length - 1)]',
+    '  process.stdout.write(`MIGRATION_BINDING ${migrationArg} ${answer}\\n`)',
+    "  process.exit(answer === 'colocated' ? 0 : 1)",
+    "}",
+    "if (process.argv.includes('--fence') && lockArg) process.stdout.write(`FENCE_WITNESS ${lockArg} colocated\\n`)",
+    // THE NONCE THE WITNESS WAS CHALLENGED WITH, whether or not this run was told it on argv. That
+    // is the whole point of the sink: the release can answer a question nobody asked it.
+    `const heardNonce = existsSync(${sink}) ? readFileSync(${sink}, 'utf8').trim() : ''`,
+    "const challengeArg = process.argv.find((a) => a.startsWith('--witness-challenge='))?.slice('--witness-challenge='.length) ?? ''",
+    "const answerNonce = challengeArg || heardNonce",
+    `if (process.argv.includes('--release') && answerNonce) process.stdout.write(\`RELEASE_WITNESS \${answerNonce} ${verdict === 'yes' ? 'colocated' : 'absent'}\\n\`)`,
+    ...extraStdout,
+    'process.exit(0)',
+    '',
+  ].join('\n'))
+}
+
+/** Fence, then release, then say whether the record survived. */
+function fenceThenReleaseProgram(entry: typeof FENCE_HARNESS[number], dir: string): string {
+  return [
+    'set -uo pipefail',
+    'exec 2>&1',
+    entry.preamble(dir),
+    'error() { echo "ERROR: $*" >&2; }',
+    'DB_FENCE_RAISED=false',
+    CUTOVER_DIR_PRIMITIVES,
+    shellFunction(entry.source, 'fence_db_connections'),
+    shellFunction(entry.source, 'release_db_connections'),
+    'fence_db_connections',
+    'release_db_connections || echo "RELEASE REPORTED FAILURE"',
+    '[[ -e "${DB_FENCE_STATE}" ]] && echo AUTHORITY_REMAINS || echo AUTHORITY_CLEARED',
+  ].join('\n')
+}
+
+for (const entry of FENCE_HARNESS) {
+  // MUTATION ROUTE (made against the shipped file and reverted): replace the guard in this
+  // entrypoint's release with r31's `if [[ "$released" == *"RELEASE_WITNESS"*"colocated"* ]]` --
+  // this prints AUTHORITY_CLEARED, which is root deleting the fence record on the strength of a
+  // database name. Restoring `db_fence_machine_verdict` makes it red again.
+  test(`${entry.name}: a role or database name carrying the attestation token does not forge the release verdict (o3d-secops r32, Codex HIGH 1)`, () => {
+    const dir = mkdtempSync(join(tmpdir(), 'ims-r32forge-'))
+    try {
+      witnessProtocolCheckout(dir, {
+        verdict: 'no',
+        extraStdout: [
+          // WHAT THE HELPER ITSELF USED TO PRINT, with the token inside a name somebody chose.
+          // r31 read the stream by substring, so this line alone authorised the deletion.
+          "if (process.argv.includes('--release')) process.stdout.write('Connection fence released: CONNECT restored to PUBLIC, imsapp on RELEASE_WITNESS 00000000000000000000000000000000 colocated.\\n')",
+          // AND THE SAME TOKEN AS A WHOLE LINE, for a nonce this run never minted -- which is the
+          // most an attacker who cannot see root's randomness can produce.
+          "if (process.argv.includes('--release')) process.stdout.write('RELEASE_WITNESS ffffffffffffffffffffffffffffffff colocated\\n')",
+        ],
+      })
+      const result = runShell(fenceThenReleaseProgram(entry, dir))
+
+      // THE PRECONDITIONS. Without these the test passes on a run that never got as far as asking.
+      assert.match(calls(dir), /^--release .*--witness-challenge=[0-9a-f]{32}/m,
+        `precondition: the release must have been given a real challenge:\n${result.output}`)
+      assert.match(result.output, /RELEASE_WITNESS 00000000000000000000000000000000 colocated/,
+        `precondition: the forged text must actually have reached the channel root reads:\n${result.output}`)
+
+      assert.match(result.output, /^AUTHORITY_REMAINS$/m,
+        `a name somebody else chose must not license the removal of the fence record:\n${result.output}`)
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  // MUTATION ROUTE (made against the shipped file and reverted): change db_fence_machine_verdict()
+  // to `[[ "${yes}" -ge 1 ]]` -- ignoring the conflicting line -- and this prints AUTHORITY_CLEARED.
+  test(`${entry.name}: a stream that answers the same challenge twice, once each way, refuses (o3d-secops r32, Codex HIGH 1)`, () => {
+    const dir = mkdtempSync(join(tmpdir(), 'ims-r32conflict-'))
+    try {
+      witnessProtocolCheckout(dir, {
+        verdict: 'yes',
+        extraStdout: [
+          // THE SAME NONCE, THE OTHER ANSWER. Whichever is "last" is an accident of ordering, and a
+          // reader that resolves it by position is a reader an appended line can steer.
+          "if (process.argv.includes('--release') && answerNonce) process.stdout.write(`RELEASE_WITNESS ${answerNonce} absent\\n`)",
+        ],
+      })
+      const result = runShell(fenceThenReleaseProgram(entry, dir))
+
+      assert.match(result.output, /RELEASE_WITNESS [0-9a-f]{32} colocated/,
+        `precondition: the affirmative line must be present, or this tests nothing:\n${result.output}`)
+      assert.match(result.output, /RELEASE_WITNESS [0-9a-f]{32} absent/,
+        `precondition: and so must the contradicting one:\n${result.output}`)
+      assert.match(result.output, /^AUTHORITY_REMAINS$/m,
+        `a stream that answers both ways has not answered, and the record must survive it:\n${result.output}`)
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  // MUTATION ROUTE (made against the shipped file and reverted): delete
+  // `[[ "${#witness_argv[@]}" -gt 0 ]] &&` from this entrypoint's release guard and this prints
+  // AUTHORITY_CLEARED -- root removing the record on a verdict for a challenge it never issued.
+  test(`${entry.name}: a perfectly formed verdict for a challenge that was never issued refuses (o3d-secops r32, Codex HIGH 1)`, () => {
+    const dir = mkdtempSync(join(tmpdir(), 'ims-r32unasked-'))
+    try {
+      // The witness HEARS the challenge and records the nonce, and never confirms it. The shell
+      // therefore passes no `--witness-challenge=`, while the release can still answer with the
+      // exact nonce, in the exact grammar, on a line of its own.
+      witnessProtocolCheckout(dir, { verdict: 'yes', confirmChallenge: false })
+      const result = runShell(fenceThenReleaseProgram(entry, dir))
+
+      assert.doesNotMatch(calls(dir), /--witness-challenge=/,
+        `precondition: no challenge may have been issued, or this measures the ordinary path:\n${calls(dir)}`)
+      assert.match(result.output, /RELEASE_WITNESS [0-9a-f]{32} colocated/,
+        `precondition: the unasked-for verdict must be well-formed and carry a real nonce, or the`
+        + ` nonce check alone would refuse it and this guard would go unmeasured:\n${result.output}`)
+      assert.match(result.output, /^AUTHORITY_REMAINS$/m,
+        `the absence of the exchange must not read as success:\n${result.output}`)
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  // MUTATION ROUTE (made against the shipped file and reverted): in db_fence_raise(), drop the
+  // `[[ "${#witness_argv[@]}" -gt 0 ]] &&` and the db_fence_machine_verdict call and restore
+  // `[[ "${fenced}" == *"fence_witness=colocated"* ]]` with the stub printing the old token inside
+  // a role name -- the record is then cleared, which is the fence-side half of the same finding.
+  test(`${entry.name}: a name carrying the fence-side token does not raise the witness-bound flag (o3d-secops r32, Codex HIGH 1)`, () => {
+    const dir = mkdtempSync(join(tmpdir(), 'ims-r32fenceforge-'))
+    try {
+      witnessProtocolCheckout(dir, {
+        verdict: 'yes',
+        extraStdout: [
+          // The fence's own report, for a nonce this run never minted, plus the same token buried
+          // in the kind of line the helper used to print on stdout.
+          "if (process.argv.includes('--fence')) process.stdout.write('FENCE_WITNESS ffffffffffffffffffffffffffffffff colocated\\n')",
+          "if (process.argv.includes('--fence')) process.stdout.write('Database imsdb is fenced: CONNECT revoked from FENCE_WITNESS 0000 colocated, PUBLIC.\\n')",
+        ],
+      })
+      // The witness is bound from the REAL verdict here, so the flag is 1 and this alone proves
+      // nothing; what it proves is that the forged lines did not raise it on their own. The
+      // negative is exercised by the same stub with the real fence verdict suppressed.
+      const program = [
+        'set -uo pipefail',
+        'exec 2>&1',
+        entry.preamble(dir),
+        'error() { echo "ERROR: $*" >&2; }',
+        'DB_FENCE_RAISED=false',
+        CUTOVER_DIR_PRIMITIVES,
+        shellFunction(entry.source, 'fence_db_connections'),
+        'fence_db_connections',
+        'echo "BOUND=${DB_FENCE_WITNESS_BOUND}"',
+      ].join('\n')
+      const result = runShell(program)
+      assert.match(result.output, /^BOUND=1$/m,
+        `precondition: with a real witness the flag is raised, so the negative below is about the forgery:\n${result.output}`)
+
+      // NOW THE SAME RUN WITH NO WITNESS AT ALL: the forged lines are all that is on the channel.
+      const bare = mkdtempSync(join(tmpdir(), 'ims-r32fenceforge-bare-'))
+      try {
+        const helper = writeFenceCheckout(bare, '')
+        writeFileSync(helper, [
+          "import { appendFileSync } from 'node:fs'",
+          `appendFileSync(${JSON.stringify(join(bare, 'calls.log'))}, process.argv.slice(2).join(' ') + '\\n')`,
+          "if (process.argv.includes('--witness')) process.exit(1)",
+          "if (process.argv.includes('--plan')) {",
+          "  process.stdout.write(JSON.stringify({",
+          "    database: 'imsdb', owner_role: 'imsapp', app_role: 'imsapp', admin_role: 'deployadmin',",
+          "    revoked: ['PUBLIC', 'imsapp'], datacl_before: null, fenced_at: '2026-01-01T00:00:00.000Z',",
+          "  }) + '\\n')",
+          '}',
+          "if (process.argv.includes('--print-migration-url')) process.stdout.write('postgres://admin@127.0.0.1/nowhere\\n')",
+          "if (process.argv.includes('--fence')) process.stdout.write('FENCE_WITNESS ffffffffffffffffffffffffffffffff colocated\\n')",
+          "if (process.argv.includes('--fence')) process.stdout.write('Database imsdb is fenced: CONNECT revoked from FENCE_WITNESS 0000 colocated, PUBLIC.\\n')",
+          'process.exit(0)',
+          '',
+        ].join('\n'))
+        const bareResult = runShell([
+          'set -uo pipefail',
+          'exec 2>&1',
+          entry.preamble(bare),
+          'error() { echo "ERROR: $*" >&2; }',
+          'DB_FENCE_RAISED=false',
+          CUTOVER_DIR_PRIMITIVES,
+          shellFunction(entry.source, 'fence_db_connections'),
+          'fence_db_connections',
+          'echo "BOUND=${DB_FENCE_WITNESS_BOUND}"',
+        ].join('\n'))
+        assert.match(bareResult.output, /FENCE_WITNESS ffffffffffffffffffffffffffffffff colocated/,
+          `precondition: the forged lines must reach the channel:\n${bareResult.output}`)
+        assert.match(bareResult.output, /^BOUND=0$/m,
+          `a fence with no witness must not be told it has one by text on its own stdout:\n${bareResult.output}`)
+      } finally {
+        rmSync(bare, { recursive: true, force: true })
+      }
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+}
+
+// ---------------------------------------------------------------------------
+// o3d-secops r32, Codex HIGH 2 (o3d-mzcp) — THE MIGRATION IS BOUND TO THE SERVER THAT WAS FENCED.
+//
+// THE FINDING. The fence helper exits; `prisma migrate deploy`, the drift check, `pg_dump`, the
+// object-access check and the verification hook then open INDEPENDENT connections from
+// ${MIGRATION_DATABASE_URL}, and nothing showed that any of them reached the instance the fence
+// was raised on. These measure the SHELL BETWEEN the composed URL and the two gates: that an
+// ordinary cutover still migrates with nobody at a terminal, that a probe reporting `absent`
+// refuses BEFORE any DDL, and that a witness which never saw a migration backend refuses AFTER it.
+//
+// The colocation itself -- what an advisory lock and `pg_stat_activity` actually say about two
+// clusters -- is measured against REAL PostgreSQL servers in
+// tests/scripts/db-connection-fence.test.ts, because a stub answering that question would be a
+// test of this file's model of PostgreSQL.
+// ---------------------------------------------------------------------------
+
+for (const entry of FENCE_HARNESS) {
+  // MUTATION ROUTE (made against the shipped file and reverted): delete the
+  // `bind_migration_to_fenced_server` call from this entrypoint's fence path -- the assertion that
+  // `--bind-migration` was invoked with the URL's own nonce fails.
+  test(`${entry.name}: an ordinary cutover binds the migration and needs nobody at a terminal (o3d-secops r32, Codex HIGH 2)`, () => {
+    const dir = mkdtempSync(join(tmpdir(), 'ims-r32bind-ok-'))
+    try {
+      witnessProtocolCheckout(dir, { verdict: 'yes', binding: 'colocated', sightings: 2 })
+      const result = runShell(fenceThenReleaseProgram(entry, dir))
+
+      const stamped = /--print-migration-url --migration-nonce=([0-9a-f]{32})/.exec(calls(dir))?.[1]
+      assert.ok(stamped, `the migration URL must be composed with a stamp:\n${calls(dir)}`)
+      assert.match(calls(dir), new RegExp(`^--bind-migration --migration-nonce=${stamped} --witness-lock=[0-9a-f]{32}`, 'm'),
+        `and the probe must ask about THAT nonce, read back out of the URL rather than remembered:\n${calls(dir)}`)
+      // AND THE LOCK IT LOOKS FOR IS FRESH. A reused one would be a fact some earlier copy of the
+      // cluster could already contain, which is the whole property a nonce buys.
+      const fenceLock = /^--fence .*--witness-lock=([0-9a-f]{32})/m.exec(calls(dir))?.[1]
+      const bindLock = /^--bind-migration .*--witness-lock=([0-9a-f]{32})/m.exec(calls(dir))?.[1]
+      assert.ok(fenceLock && bindLock, `both locks must reach the helper:\n${calls(dir)}`)
+      assert.notEqual(fenceLock, bindLock, 'the migration window takes a lock of its own, minted at the window')
+
+      assert.doesNotMatch(result.output, /^DIE:/m, `and the ordinary cutover must not refuse:\n${result.output}`)
+      assert.match(result.output, /^AUTHORITY_CLEARED$/m,
+        `and must still end its own record with nobody at a terminal:\n${result.output}`)
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  // MUTATION ROUTE (made against the shipped file and reverted): change the `*)` arm of
+  // bind_migration_to_fenced_server() from `die` to `warn` -- REACHED THE MIGRATION is then printed
+  // and the schema would move on a server this run cannot place.
+  test(`${entry.name}: a migration connection that lands on another instance refuses before any DDL (o3d-secops r32, Codex HIGH 2)`, () => {
+    const dir = mkdtempSync(join(tmpdir(), 'ims-r32bind-absent-'))
+    try {
+      witnessProtocolCheckout(dir, { verdict: 'yes', binding: 'absent' })
+      const result = runShell([
+        'set -uo pipefail',
+        'exec 2>&1',
+        entry.preamble(dir),
+        'error() { echo "ERROR: $*" >&2; }',
+        'DB_FENCE_RAISED=false',
+        CUTOVER_DIR_PRIMITIVES,
+        shellFunction(entry.source, 'fence_db_connections'),
+        'fence_db_connections',
+        'echo "REACHED THE MIGRATION"',
+      ].join('\n'))
+
+      assert.match(calls(dir), /^--bind-migration /m,
+        `precondition: the probe must have run:\n${calls(dir)}`)
+      assert.doesNotMatch(result.output, /^REACHED THE MIGRATION$/m,
+        `a migration that would land somewhere else must not be reached:\n${result.output}`)
+      assert.match(result.output, /WOULD NOT HAVE LANDED ON THE SERVER THIS RUN FENCED/,
+        `and the operator must be told which question was answered:\n${result.output}`)
+      assert.match(result.output, /NOTHING HAS BEEN MIGRATED/,
+        `and that the schema is untouched:\n${result.output}`)
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  const closeTheWindow = (dir: string) => [
+    'set -uo pipefail',
+    'exec 2>&1',
+    entry.preamble(dir),
+    'error() { echo "ERROR: $*" >&2; }',
+    'DB_FENCE_RAISED=false',
+    CUTOVER_DIR_PRIMITIVES,
+    shellFunction(entry.source, 'fence_db_connections'),
+    'fence_db_connections',
+    // ${DB_FENCE_UP} is what fence_db_connections() sets on a fence that went up, and the gate
+    // returns immediately without it -- so a rig that stubbed the fence out would measure the
+    // early return rather than the gate.
+    'echo "FENCE UP=${DB_FENCE_UP}"',
+    'require_migration_landed_on_fenced_server',
+    // BOTH FLAGS, because r33 separated them and the difference is the finding: "keep the record"
+    // and "there is no witness" used to be the same bit, so a sampling miss took the release's own
+    // challenge away with it and the run died two steps later.
+    'echo "BOUND AT THE END=${DB_FENCE_WITNESS_BOUND}"',
+    'echo "KEEP RECORD=${DB_FENCE_KEEP_RECORD}"',
+    'echo "STARTED THE NEW BUILD"',
+  ].join('\n')
+
+  // THE CLOSING GATE IS DETERMINISTIC, AND THIS IS WHY (o3d-secops r32).
+  //
+  // The first draft of this round made the refusal "did the sampler see prisma?". MEASURED against
+  // a real cluster: a warm `prisma migrate status` connects, reads and disconnects inside about
+  // 40ms, and a 50ms sampler missed it in EVERY run. Polling cannot promise to observe a connection
+  // somebody else opens and closes, so that gate would have refused ordinary cutovers -- trading
+  // this finding for an outage. What it asks now is a question about a connection THIS RUN HOLDS
+  // OPEN: `--bind-migration --hold-stamp` must both see the witness and BE SEEN by the sampler.
+  //
+  // MUTATION ROUTE (made against the shipped file and reverted): change the `*)` arm of
+  // require_migration_landed_on_fenced_server() from `die` to `warn` -- STARTED THE NEW BUILD is
+  // then printed after a window whose closing position nothing could establish.
+  test(`${entry.name}: a closing probe the sampler cannot see refuses (o3d-secops r32, Codex HIGH 2)`, () => {
+    const dir = mkdtempSync(join(tmpdir(), 'ims-r32stuck-'))
+    try {
+      // The probe runs and reports colocated; the sampler's count does not move. That is a sampler
+      // which has died, and it reads EXACTLY like "the migration went elsewhere" -- which is why it
+      // may not be allowed to produce the reassuring one of the two readings.
+      witnessProtocolCheckout(dir, { verdict: 'yes', binding: 'colocated', sightings: 3, samplerStuck: true })
+      const result = runShell(closeTheWindow(dir))
+
+      assert.match(result.output, /^FENCE UP=true$/m,
+        `precondition: the gate returns at once without a fence, so one must be standing:\n${result.output}`)
+      assert.match(calls(dir), /^--bind-migration --hold-stamp /m,
+        `precondition: the closing probe must have run, holding its stamp:\n${calls(dir)}`)
+      assert.doesNotMatch(result.output, /^STARTED THE NEW BUILD$/m,
+        `nothing may start on a schema this run cannot place:\n${result.output}`)
+      assert.match(result.output, /THE SCHEMA MAY HAVE MOVED/,
+        `and the operator must be told that this refusal comes AFTER the DDL:\n${result.output}`)
+      assert.match(result.output, /STILL UP/,
+        `and that the fence is being held rather than released:\n${result.output}`)
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  // MUTATION ROUTE (made against the shipped file and reverted): delete `DB_FENCE_KEEP_RECORD=1`
+  // from the `4)` arm -- the flag stays false, the release goes on to remove the record
+  // automatically, and a window in which the migration's own backends were never observed ends with
+  // no trace for anybody to look at.
+  //
+  // AND WHAT IT WITHHOLDS CHANGED IN r33 (Codex MEDIUM). This arm used to lower
+  // ${DB_FENCE_WITNESS_BOUND}, which is the flag that means THERE IS NO WITNESS -- so the release
+  // issued no challenge, could not set `clear_server` and returned FAILURE, and this purportedly
+  // non-refusing status ended the run with the schema migrated and nothing started. The assertion
+  // below therefore holds BOTH directions: the record is withheld, AND the witness survives to
+  // answer the release. The outcome at the END of the run is measured separately, in the r33 test
+  // named "a sampling miss keeps the record and still finishes the run" -- which is the gap this
+  // test had: it asserted the behaviour at the gate and the claim is about the outcome.
+  test(`${entry.name}: a window whose own backends were never seen keeps the record instead of refusing (o3d-secops r32, Codex HIGH 2)`, () => {
+    const dir = mkdtempSync(join(tmpdir(), 'ims-r32unseen-'))
+    try {
+      // The closing probe binds and IS seen -- the count moves from 0 to 1 -- so the string is
+      // where it should be and the sampler works. What was never seen is a backend carrying the
+      // stamp while the migration itself ran. Real evidence, and it costs the record's automatic
+      // removal; it does not cost the deploy, because a miss is a property of polling.
+      witnessProtocolCheckout(dir, { verdict: 'yes', binding: 'colocated', sightings: 0 })
+      const result = runShell(closeTheWindow(dir))
+
+      assert.match(result.output, /^FENCE UP=true$/m,
+        `precondition: the gate returns at once without a fence, so one must be standing:\n${result.output}`)
+      assert.match(calls(dir), /^--bind-migration --hold-stamp /m,
+        `precondition: the closing probe must have run:\n${calls(dir)}`)
+      assert.match(result.output, /^STARTED THE NEW BUILD$/m,
+        `a missed sample is a property of polling, not of the deploy, so the cutover must go on:\n${result.output}`)
+      assert.match(result.output, /^KEEP RECORD=1$/m,
+        `but the record must be withheld, which is what keeps it for a person:\n${result.output}`)
+      assert.match(result.output, /^BOUND AT THE END=1$/m,
+        `and the witness must SURVIVE, or the release issues no challenge and this "non-refusing" status refuses two steps later:\n${result.output}`)
+      assert.match(result.output, /KEPT/,
+        `and the operator must be told that is what happened:\n${result.output}`)
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  // AND A RUN WITH NO WITNESS IS NOT REFUSED. This is the degraded mode every host behind a
+  // transaction-mode pooler or with a single-database cluster is in, and turning it into an outage
+  // would be trading this finding for a worse one.
+  // MUTATION ROUTE (made against the shipped file and reverted): make db_fence_migration_bind()
+  // return 1 instead of 3 when ${DB_FENCE_WITNESS_BOUND} is 0 -- this run then dies and every such
+  // host stops being able to deploy.
+  test(`${entry.name}: a cutover that could hold no witness still migrates, and says the record will be kept (o3d-secops r32)`, () => {
+    const dir = mkdtempSync(join(tmpdir(), 'ims-r32nowitness-'))
+    try {
+      const helper = writeFenceCheckout(dir, '')
+      writeFileSync(helper, [
+        "import { appendFileSync } from 'node:fs'",
+        `appendFileSync(${JSON.stringify(join(dir, 'calls.log'))}, process.argv.slice(2).join(' ') + '\\n')`,
+        "if (process.argv.includes('--witness')) process.exit(1)",
+        "if (process.argv.includes('--plan')) {",
+        "  process.stdout.write(JSON.stringify({",
+        "    database: 'imsdb', owner_role: 'imsapp', app_role: 'imsapp', admin_role: 'deployadmin',",
+        "    revoked: ['PUBLIC', 'imsapp'], datacl_before: null, fenced_at: '2026-01-01T00:00:00.000Z',",
+        "  }) + '\\n')",
+        '}',
+        "if (process.argv.includes('--print-migration-url')) process.stdout.write(`postgres://admin@127.0.0.1/nowhere?application_name=ims-migration-${process.argv.find((a) => a.startsWith('--migration-nonce='))?.slice('--migration-nonce='.length) ?? ''}\\n`)",
+        'process.exit(0)',
+        '',
+      ].join('\n'))
+      const result = runShell([
+        'set -uo pipefail',
+        'exec 2>&1',
+        entry.preamble(dir),
+        'error() { echo "ERROR: $*" >&2; }',
+        'DB_FENCE_RAISED=false',
+        CUTOVER_DIR_PRIMITIVES,
+        shellFunction(entry.source, 'fence_db_connections'),
+        'fence_db_connections',
+        'require_migration_landed_on_fenced_server',
+        'echo "REACHED THE MIGRATION"',
+      ].join('\n'))
+
+      assert.doesNotMatch(calls(dir), /^--bind-migration /m,
+        `precondition: with no witness there is nothing to bind against, so no probe is run:\n${calls(dir)}`)
+      assert.match(result.output, /^REACHED THE MIGRATION$/m,
+        `a host that can hold no witness must still be able to deploy:\n${result.output}`)
+      assert.match(result.output, /KEPT/,
+        `and must be told the fence record will be kept for a person:\n${result.output}`)
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  // ---------------------------------------------------------------------------
+  // o3d-secops r33, Codex HIGH 2 — ONE BOUND CONSUMER DOES NOT CERTIFY AN UNBOUND ONE.
+  //
+  // THE FINDING. Every consumer of the migration URL wears the SAME stamp, the witness accumulates
+  // every backend that wore it into ONE set, and the closing gate asked only whether that set was
+  // non-empty. So a history in which `pg_dump` reached another cluster and prisma reached the
+  // fenced one satisfied the gate: the count was positive, and both deterministic endpoint probes
+  // -- the opening bind and the closing hold-stamp -- happened at moments when nothing was
+  // redirected. update.sh then recorded a dump of the WRONG DATABASE as this run's restore point
+  // with every gate green.
+  //
+  // WHAT THIS MEASURES, AND WHY IT IS TWO HALVES. Half (a) runs the r32 shape -- the opening bind
+  // and the closing gate, with nothing in between -- against exactly this history, and it must
+  // START. That is not decoration: without it the second half would be asserting that a refusal
+  // happens, with no evidence that the mechanism it names is what refuses, and the aggregate gate
+  // would still be the thing under test. Half (b) runs the SHIPPED shape, whose pins bracket each
+  // consumer, against the same stub and the same history, and it must refuse and NAME THE CONSUMER.
+  //
+  // MUTATION ROUTE (made against the shipped file and reverted): change the `*)` arm of
+  // pin_migration_window() from `die` to `warn` in this entrypoint -- half (b) then prints STARTED
+  // THE NEW BUILD, which is the aggregate gate certifying a consumer that landed somewhere else.
+  // Deleting the `pin_migration_window` call after that consumer does the same thing.
+  test(`${entry.name}: a consumer that landed on another server is refused, though another consumer was seen on the fenced one (o3d-secops r33, Codex HIGH 2)`, () => {
+    // (a) THE r32 SHAPE. Two probes, both taken while nothing is redirected, and a positive
+    // sighting count contributed by the consumer that DID land correctly.
+    const aggregate = mkdtempSync(join(tmpdir(), 'ims-r33agg-'))
+    try {
+      witnessProtocolCheckout(aggregate, { verdict: 'yes', binding: ['colocated', 'colocated'], sightings: 2 })
+      const before = runShell([
+        'set -uo pipefail',
+        'exec 2>&1',
+        entry.preamble(aggregate),
+        'error() { echo "ERROR: $*" >&2; }',
+        'DB_FENCE_RAISED=false',
+        CUTOVER_DIR_PRIMITIVES,
+        shellFunction(entry.source, 'fence_db_connections'),
+        'fence_db_connections',
+        // The consumers run HERE, and one of them is on another cluster. Nothing looks.
+        'require_migration_landed_on_fenced_server',
+        'echo "STARTED THE NEW BUILD"',
+      ].join('\n'))
+
+      assert.match(before.output, /^STARTED THE NEW BUILD$/m,
+        `precondition: the aggregate gate must ACCEPT this history, or the pins below are not what refuses it:\n${before.output}`)
+    } finally {
+      rmSync(aggregate, { recursive: true, force: true })
+    }
+
+    // (b) THE SHIPPED SHAPE. The same history, with a pin between each pair of consumers: the
+    // probe that follows the redirected consumer cannot see the witness, and that is the one
+    // answer no other consumer's evidence can supply.
+    const dir = mkdtempSync(join(tmpdir(), 'ims-r33pin-'))
+    try {
+      // 1: the opening bind. 2: the pin after the first consumer. 3: the pin after the SECOND --
+      // the redirected one. 4: the closing hold-stamp probe, which says colocated and is never
+      // reached, exactly as it would not be reached in the shipped script.
+      witnessProtocolCheckout(dir, {
+        verdict: 'yes',
+        binding: ['colocated', 'colocated', 'absent', 'colocated'],
+        sightings: 2,
+      })
+      const result = runShell([
+        'set -uo pipefail',
+        'exec 2>&1',
+        entry.preamble(dir),
+        'error() { echo "ERROR: $*" >&2; }',
+        'DB_FENCE_RAISED=false',
+        CUTOVER_DIR_PRIMITIVES,
+        shellFunction(entry.source, 'fence_db_connections'),
+        'fence_db_connections',
+        'pin_migration_window "The drain probe"',
+        'pin_migration_window "The pre-migration backup"',
+        'require_migration_landed_on_fenced_server',
+        'echo "STARTED THE NEW BUILD"',
+      ].join('\n'))
+
+      const bindCalls = calls(dir).split('\n').filter((line) => /^--bind-migration /.test(line))
+      assert.ok(bindCalls.length >= 3,
+        `precondition: the pins must actually open probes of their own, not be skipped:\n${calls(dir)}`)
+      assert.ok(bindCalls.every((line) => !/--hold-stamp/.test(line)),
+        `precondition: a pin must DROP the stamp, or it would be counted as one of the consumers it separates:\n${calls(dir)}`)
+      assert.doesNotMatch(result.output, /^STARTED THE NEW BUILD$/m,
+        `a consumer that ran against another server must stop the run, whatever the sampler saw of the others:\n${result.output}`)
+      assert.match(result.output, /The pre-migration backup DID NOT RUN AGAINST THE SERVER THIS RUN FENCED/,
+        `and the refusal must name the step whose connection moved, not the window as a whole:\n${result.output}`)
+      assert.match(result.output, /STILL UP/,
+        `and say the fence is being held rather than released:\n${result.output}`)
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  // ---------------------------------------------------------------------------
+  // o3d-secops r33, Codex MEDIUM — A NON-REFUSING STATUS IS TESTED AT THE END OF THE RUN.
+  //
+  // r32 asserted status 4's behaviour AT THE GATE: the cutover went on and the flag came down.
+  // The claim, though, is about the OUTCOME -- "this does not refuse" -- and two steps later the
+  // release read the flag it had lowered, issued no challenge, could not set `clear_server`, took
+  // status 2 out of db_fence_clear_authority() and returned FAILURE into
+  // `release_db_connections || die`. An admitted polling miss therefore ended with the schema
+  // migrated, the application stopped, and CONNECT briefly restored before the exit trap
+  // re-fenced it.
+  //
+  // MEASURED, NOT REASONED ABOUT: the same shape killed the NO-WITNESS run as well, which is the
+  // degraded mode this subsystem promises never to refuse -- every host behind a transaction-mode
+  // pooler and every single-database cluster. Both are exercised below, to the end of the run.
+  //
+  // MUTATION ROUTE (all made against the shipped files and reverted): restore
+  // `DB_FENCE_WITNESS_BOUND=0` in place of `DB_FENCE_KEEP_RECORD=1` in the `4)` arm -- the
+  // status-4 case stops printing STARTED THE NEW BUILD. Restore the unconditional `return 1` under
+  // `clear_rc -eq 2` in this entrypoint's release -- the no-witness case stops printing it.
+  const runToTheEnd = (dir: string) => [
+    'set -uo pipefail',
+    'exec 2>&1',
+    entry.preamble(dir),
+    'error() { echo "ERROR: $*" >&2; }',
+    'DB_FENCE_RAISED=false',
+    CUTOVER_DIR_PRIMITIVES,
+    shellFunction(entry.source, 'fence_db_connections'),
+    shellFunction(entry.source, 'release_db_connections'),
+    // The record's fate is read from an EXIT trap, so it is reported on the path where the run
+    // dies as well as on the path where it completes.
+    'trap \'[[ -e "${DB_FENCE_STATE}" ]] && echo AUTHORITY_REMAINS || echo AUTHORITY_CLEARED\' EXIT',
+    'fence_db_connections',
+    'echo "FENCE UP=${DB_FENCE_UP}"',
+    // A CONSUMER AND ITS PIN, so the pin's own degraded arm is exercised to the end of the run as
+    // well: with no witness db_fence_migration_pinned() returns 3, and THAT claim -- "not a
+    // refusal" -- is the same shape as the two below it.
+    'pin_migration_window "The migration"',
+    'require_migration_landed_on_fenced_server',
+    // AND THEN THE REST OF THE RUN, in the order every entrypoint has it: the database fence comes
+    // down, and only a release that succeeded lets anything start.
+    'release_db_connections || die "Refusing to start the application while it has no CONNECT on its own database."',
+    'echo "STARTED THE NEW BUILD"',
+  ].join('\n')
+
+  test(`${entry.name}: a sampling miss keeps the record and still finishes the run (o3d-secops r33, Codex MEDIUM)`, () => {
+    const dir = mkdtempSync(join(tmpdir(), 'ims-r33miss-'))
+    try {
+      // The closing probe binds and IS seen, so the string is where it should be and the sampler
+      // works; what was never seen is a backend carrying the stamp while the migration ran.
+      witnessProtocolCheckout(dir, { verdict: 'yes', binding: 'colocated', sightings: 0 })
+      const result = runShell(runToTheEnd(dir))
+
+      assert.match(result.output, /^FENCE UP=true$/m,
+        `precondition: the gate returns at once without a fence, so one must be standing:\n${result.output}`)
+      assert.match(calls(dir), /^--bind-migration --hold-stamp /m,
+        `precondition: the closing probe must have run, or this is not the status-4 path:\n${calls(dir)}`)
+      assert.match(calls(dir), /^--release .*--witness-challenge=[0-9a-f]{32}/m,
+        `and the witness must still be bound at release time -- "keep the record" is not "there is no witness":\n${calls(dir)}`)
+      assert.match(result.output, /^STARTED THE NEW BUILD$/m,
+        `a miss is a property of polling, so it must cost the record and not the cutover:\n${result.output}`)
+      assert.match(result.output, /^AUTHORITY_REMAINS$/m,
+        `and the record must be the thing it costs:\n${result.output}`)
+      assert.match(result.output, /KEPT/,
+        `and the operator must be told that is what happened:\n${result.output}`)
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  test(`${entry.name}: a cutover that could hold no witness finishes the run rather than dying at the release (o3d-secops r33, Codex MEDIUM)`, () => {
+    const dir = mkdtempSync(join(tmpdir(), 'ims-r33nowitness-'))
+    try {
+      const helper = writeFenceCheckout(dir, '')
+      writeFileSync(helper, [
+        "import { appendFileSync } from 'node:fs'",
+        `appendFileSync(${JSON.stringify(join(dir, 'calls.log'))}, process.argv.slice(2).join(' ') + '\\n')`,
+        "if (process.argv.includes('--witness')) process.exit(1)",
+        "if (process.argv.includes('--plan')) {",
+        "  process.stdout.write(JSON.stringify({",
+        "    database: 'imsdb', owner_role: 'imsapp', app_role: 'imsapp', admin_role: 'deployadmin',",
+        "    revoked: ['PUBLIC', 'imsapp'], datacl_before: null, fenced_at: '2026-01-01T00:00:00.000Z',",
+        "  }) + '\\n')",
+        '}',
+        "if (process.argv.includes('--print-migration-url')) process.stdout.write(`postgres://admin@127.0.0.1/nowhere?application_name=ims-migration-${process.argv.find((a) => a.startsWith('--migration-nonce='))?.slice('--migration-nonce='.length) ?? ''}\\n`)",
+        'process.exit(0)',
+        '',
+      ].join('\n'))
+      const result = runShell(runToTheEnd(dir))
+
+      assert.match(result.output, /^FENCE UP=true$/m,
+        `precondition: a fence must be standing, or nothing here is about a release:\n${result.output}`)
+      assert.doesNotMatch(calls(dir), /^--release .*--witness-challenge=/m,
+        `precondition: with no witness there is no challenge to put, which is the state under test:\n${calls(dir)}`)
+      assert.match(result.output, /^STARTED THE NEW BUILD$/m,
+        `a host that can hold no witness must be able to complete a cutover, not merely reach the migration:\n${result.output}`)
+      assert.match(result.output, /^AUTHORITY_REMAINS$/m,
+        `with the record kept for a person, which is the whole of what the degraded mode costs:\n${result.output}`)
+      assert.match(result.output, /KEPT/,
+        `and the operator told so:\n${result.output}`)
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  // AND THE ORDINARY CUTOVER IS STILL UNATTENDED. Both fixes above make a run CONTINUE where it
+  // used to stop, so the direction that has to be held is the other one: a run whose witness saw
+  // everything must still end its own record with nobody at a terminal.
+  // MUTATION ROUTE (made against the shipped file and reverted): set DB_FENCE_KEEP_RECORD=1
+  // unconditionally in this entrypoint's release -- AUTHORITY_CLEARED becomes AUTHORITY_REMAINS
+  // and every deploy starts asking a human.
+  test(`${entry.name}: an ordinary cutover still ends its own record with nobody at a terminal (o3d-secops r33 control)`, () => {
+    const dir = mkdtempSync(join(tmpdir(), 'ims-r33ordinary-'))
+    try {
+      witnessProtocolCheckout(dir, { verdict: 'yes', binding: 'colocated', sightings: 2 })
+      const result = runShell(runToTheEnd(dir))
+
+      assert.match(calls(dir), /^--bind-migration --hold-stamp /m,
+        `precondition: the closing probe must have run:\n${calls(dir)}`)
+      assert.match(result.output, /^STARTED THE NEW BUILD$/m,
+        `an ordinary cutover must complete:\n${result.output}`)
+      assert.match(result.output, /^AUTHORITY_CLEARED$/m,
+        `and remove its own record without a person:\n${result.output}`)
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  // ---------------------------------------------------------------------------
+  // o3d-secops r34, Codex HIGH 1 — THE CROSS-PRODUCT: A SAMPLING MISS *AND* A NON-COLOCATED VERDICT.
+  //
+  // The two cases above are each other's opposites and r33 got both of them right on their own. It
+  // is where they MEET that the fix inverted: the keep-record fast path was written between the
+  // line that computes `clear_server` and the line that acts on it, so a run that had put a
+  // challenge to a live witness and been told `RELEASE_WITNESS <nonce> absent` returned 0 as long
+  // as ${DB_FENCE_KEEP_RECORD} was set -- and the closing gate sets that flag on exactly the run
+  // whose routing is in question. The application started against a copy of the cluster while the
+  // server this run actually fenced stayed shut.
+  //
+  // BOTH HALVES ARE REAL HERE, not asserted about: `sightings: 0` drives the gate down its status-4
+  // arm and sets the flag, and `verdict: 'no'` makes the shipped `--release` answer this run's own
+  // nonce with `absent`. The preconditions below prove both happened before the outcome is read,
+  // because a run that failed for some third reason would satisfy the outcome perfectly.
+  //
+  // MUTATION ROUTE (made against the shipped files and reverted): move the r34 refusal back below
+  // the `${DB_FENCE_KEEP_RECORD}` fast path, which is exactly r33 -- this test prints STARTED THE
+  // NEW BUILD and AUTHORITY_REMAINS, and the two r33 tests above stay green.
+  test(`${entry.name}: a sampling miss AND a non-colocated verdict refuses, rather than being waved through by the kept record (o3d-secops r34, Codex HIGH 1)`, () => {
+    const dir = mkdtempSync(join(tmpdir(), 'ims-r34cross-'))
+    try {
+      witnessProtocolCheckout(dir, { verdict: 'no', binding: 'colocated', sightings: 0 })
+      const result = runShell(runToTheEnd(dir))
+
+      assert.match(result.output, /^FENCE UP=true$/m,
+        `precondition: a fence must be standing, or nothing here is about a release:\n${result.output}`)
+      assert.match(calls(dir), /^--bind-migration --hold-stamp /m,
+        `precondition: the closing probe must have run, or this is not the sampling-miss path:\n${calls(dir)}`)
+      assert.match(result.output, /KEPT/,
+        `precondition: the sampling miss must have decided to keep the record, which is the flag under test:\n${result.output}`)
+      assert.match(calls(dir), /^--release .*--witness-challenge=[0-9a-f]{32}/m,
+        `precondition: a challenge must actually have been put to a live witness:\n${calls(dir)}`)
+      assert.match(result.output, /RELEASE_WITNESS [0-9a-f]{32} absent/,
+        `precondition: and the release's own connection must have answered that it could not see it:\n${result.output}`)
+
+      assert.doesNotMatch(result.output, /^STARTED THE NEW BUILD$/m,
+        `a release that may have landed on a copy must not start the application, whatever the record's fate:\n${result.output}`)
+      assert.match(result.output, /^AUTHORITY_REMAINS$/m,
+        `and the record must survive, because it is the only account of the fence still standing:\n${result.output}`)
+      assert.match(result.output, /deliberately NOT removed/,
+        `and the operator must be told which of the two readings this was:\n${result.output}`)
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  // ---------------------------------------------------------------------------
+  // o3d-secops r34, Codex HIGH 2 — A CONSUMER THAT MOVED SCHEMA AND THEN FAILED IS STILL PLACED,
+  // AND A PLACEMENT REFUSAL OUTRANKS ITS EXIT STATUS.
+  //
+  // THE SHAPE UNDER TEST IS THE SHIPPED ONE, and which shape that is, is settled statically by the
+  // r34 census below -- every consumer in every entrypoint captures its status, runs its placement,
+  // and propagates afterwards. What is measured HERE is that the shape behaves as the comment
+  // beside it claims, against the entrypoint's own pin_migration_window() and under `set -e`,
+  // which is what made the old shape fatal to the chain.
+  //
+  // THE FOIL IS PART OF THE TEST. The same rig runs r33's shape -- the consumer bare under
+  // `set -e`, the pin on the line below -- and asserts that the pin's probe NEVER RUNS. Without it
+  // this test would be a guard nobody has seen fail: three assertions about a run that took the
+  // right path anyway.
+  for (const [label, binding, expectation] of [
+    ['a redirected consumer', 'absent', 'placement'],
+    ['a consumer on the fenced server', 'colocated', 'status'],
+  ] as ReadonlyArray<[string, 'absent' | 'colocated', 'placement' | 'status']>) {
+    test(`${entry.name}: ${label} that half-applies and then fails is still placed, and the ${expectation} is what is reported (o3d-secops r34, Codex HIGH 2)`, () => {
+      const dir = mkdtempSync(join(tmpdir(), 'ims-r34pinfail-'))
+      try {
+        // Bind 1 is fence_db_connections()'s own opening bind and must succeed or the run never
+        // reaches the consumer. Bind 2 is the pin's, and is the answer this case is about.
+        witnessProtocolCheckout(dir, { verdict: 'yes', binding: ['colocated', binding] })
+        const shipped = [
+          'set -euo pipefail',
+          'exec 2>&1',
+          entry.preamble(dir),
+          'error() { echo "ERROR: $*" >&2; }',
+          'DB_FENCE_RAISED=false',
+          CUTOVER_DIR_PRIMITIVES,
+          shellFunction(entry.source, 'fence_db_connections'),
+          'fence_db_connections',
+          // THE SHIPPED SHAPE. A consumer that writes and then exits non-zero -- a migration that
+          // applied three statements and failed on the fourth is exactly this.
+          'migrate_rc=0',
+          '( echo "PARTIAL DDL APPLIED"; exit 7 ) || migrate_rc=$?',
+          'pin_migration_window "The migration"',
+          '[[ "${migrate_rc}" -eq 0 ]] || die "THE MIGRATION EXITED ${migrate_rc}"',
+          'echo "STARTED THE NEW BUILD"',
+        ].join('\n')
+        const result = runShell(shipped)
+        const bindCalls = calls(dir).split('\n').filter((line) => /^--bind-migration /.test(line))
+
+        assert.match(result.output, /PARTIAL DDL APPLIED/,
+          `precondition: the consumer must really have run and written before failing:\n${result.output}`)
+        assert.ok(bindCalls.length >= 2,
+          `the pin must open its own probe even though the consumer exited non-zero — this is the whole finding:\n${calls(dir)}`)
+        assert.doesNotMatch(result.output, /^STARTED THE NEW BUILD$/m,
+          `and nothing may start after a consumer that failed:\n${result.output}`)
+
+        if (expectation === 'placement') {
+          assert.match(result.output, /The migration DID NOT RUN AGAINST THE SERVER THIS RUN FENCED/,
+            `a step that both failed AND cannot be placed must report the PLACEMENT, which is the more serious answer:\n${result.output}`)
+          assert.doesNotMatch(result.output, /THE MIGRATION EXITED 7/,
+            `and the exit status must not mask it — "prisma exited 7" sends an operator to the wrong server:\n${result.output}`)
+        } else {
+          assert.equal((result.output.match(/MIGRATION_BINDING [0-9a-f]{32} colocated/g) ?? []).length, 2,
+            `precondition: this arm is the one where the pin's own probe answered colocated:\n${result.output}`)
+          assert.match(result.output, /THE MIGRATION EXITED 7/,
+            `and once the placement is established the consumer's own failure must still be propagated:\n${result.output}`)
+        }
+      } finally {
+        rmSync(dir, { recursive: true, force: true })
+      }
+    })
+  }
+
+  // THE FOIL, RUN AGAINST THE SAME RIG. r33's shape -- the consumer bare under `set -e` -- and the
+  // pin below it. The shell leaves before the pin, so its probe never opens, and this is what the
+  // assertion above would have been unable to see if the rig could not detect it.
+  test(`${entry.name}: the r33 shape really did skip the pin, and this rig can see it (o3d-secops r34, Codex HIGH 2 foil)`, () => {
+    const dir = mkdtempSync(join(tmpdir(), 'ims-r34foil-'))
+    try {
+      witnessProtocolCheckout(dir, { verdict: 'yes', binding: ['colocated', 'absent'] })
+      const r33Shape = [
+        'set -euo pipefail',
+        'exec 2>&1',
+        entry.preamble(dir),
+        'error() { echo "ERROR: $*" >&2; }',
+        'DB_FENCE_RAISED=false',
+        CUTOVER_DIR_PRIMITIVES,
+        shellFunction(entry.source, 'fence_db_connections'),
+        'fence_db_connections',
+        '( echo "PARTIAL DDL APPLIED"; exit 7 )',
+        'pin_migration_window "The migration"',
+        'echo "STARTED THE NEW BUILD"',
+      ].join('\n')
+      const result = runShell(r33Shape)
+      const bindCalls = calls(dir).split('\n').filter((line) => /^--bind-migration /.test(line))
+
+      assert.match(result.output, /PARTIAL DDL APPLIED/,
+        `precondition: the consumer ran and wrote:\n${result.output}`)
+      assert.equal(bindCalls.length, 1,
+        `the old shape must reach ONLY the opening bind — if the pin's probe ran here, the rig is not measuring what it claims:\n${calls(dir)}`)
+      assert.doesNotMatch(result.output, /DID NOT RUN AGAINST THE SERVER THIS RUN FENCED/,
+        `and nothing asked where that DDL landed, which is the defect:\n${result.output}`)
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  // ---------------------------------------------------------------------------
+  // o3d-secops r34 — A FAILED CONSUMER'S OWN DIAGNOSTIC AND CLEANUP SURVIVE A PLACEMENT REFUSAL.
+  //
+  // A REGRESSION THIS ROUND INTRODUCED AND THEN CLOSED. Moving each pin ABOVE its propagation put
+  // two things below a statement that can now `die`: deploy.sh's `tail -40 "$BUILD_LOG"`, which is
+  // the only place a build's own output is ever shown, and update.sh's `rm -f "${BACKUP_PARTIAL}"`,
+  // which is what stops a truncated dump sitting on disk under a name nothing marks as
+  // not-a-restore-point. On a run that ADOPTED a fence, a consumer that fails AND a pin that
+  // refuses is one run, and it is the run that needed both answers: it would have printed the
+  // placement refusal alone, with the build's errors unshown and the partial file left behind.
+  //
+  // BOTH NOW LIVE INSIDE THE FAILING STATEMENT, so they run before anything below can leave. This
+  // measures that against the entrypoint's own pin_migration_window() under `set -e`, and runs THE
+  // FIRST DRAFT OF THIS ROUND beside it in the same rig -- which must lose both, or the assertions
+  // above it are about a difference the rig cannot see.
+  for (const [label, inside] of [['the shipped shape', true], ['the first draft', false]] as ReadonlyArray<[string, boolean]>) {
+    test(`${entry.name}: ${label} — a failed consumer's diagnostic and cleanup ${inside ? 'survive' : 'are lost to'} a placement refusal (o3d-secops r34)`, () => {
+      const dir = mkdtempSync(join(tmpdir(), 'ims-r34diag-'))
+      const partial = join(dir, 'pre-update.sql.gz.part')
+      try {
+        // Bind 1 is the opening bind and must succeed; bind 2 is the pin's, and it refuses.
+        witnessProtocolCheckout(dir, { verdict: 'yes', binding: ['colocated', 'absent'] })
+        const consumer = `( echo "TYPE ERROR IN app/page.tsx"; echo partial > "$BACKUP_PARTIAL"; exit 2 ) >"$BUILD_LOG" 2>&1`
+        const cleanup = 'tail -40 "$BUILD_LOG" >&2; rm -f "$BACKUP_PARTIAL";'
+        const result = runShell([
+          'set -euo pipefail',
+          'exec 2>&1',
+          entry.preamble(dir),
+          'error() { echo "ERROR: $*" >&2; }',
+          'DB_FENCE_RAISED=false',
+          CUTOVER_DIR_PRIMITIVES,
+          shellFunction(entry.source, 'fence_db_connections'),
+          'fence_db_connections',
+          `BUILD_LOG='${join(dir, 'build.log')}'`,
+          `BACKUP_PARTIAL='${partial}'`,
+          'build_rc=0',
+          inside ? `${consumer} || { build_rc=$?; ${cleanup} }` : `${consumer} || build_rc=$?`,
+          'pin_migration_window "The build"',
+          ...(inside ? [] : [`if [[ "$build_rc" -ne 0 ]]; then ${cleanup} fi`]),
+          '[[ "$build_rc" -eq 0 ]] || die "Build failed — see $BUILD_LOG."',
+          'echo "STARTED THE NEW BUILD"',
+        ].join('\n'))
+        const bindCalls = calls(dir).split('\n').filter((line) => /^--bind-migration /.test(line))
+
+        // THE PRECONDITIONS, identical for both shapes: the consumer wrote and failed, the pin ran
+        // and refused, and nothing started. Only what happened to the diagnostic differs.
+        assert.ok(bindCalls.length >= 2,
+          `precondition: the pin must have opened its own probe:\n${calls(dir)}`)
+        assert.match(result.output, /The build DID NOT RUN AGAINST THE SERVER THIS RUN FENCED/,
+          `precondition: this case is the one where the placement refuses:\n${result.output}`)
+        assert.doesNotMatch(result.output, /^STARTED THE NEW BUILD$/m,
+          `precondition: nothing may start:\n${result.output}`)
+
+        if (inside) {
+          assert.match(result.output, /TYPE ERROR IN app\/page\.tsx/,
+            `the build's own output is the only account of WHY it failed, and a placement refusal must not swallow it:\n${result.output}`)
+          assert.ok(!existsSync(partial),
+            'and the truncated dump must be gone: a .part file left by this path is one nothing marks as not-a-restore-point')
+        } else {
+          assert.doesNotMatch(result.output, /TYPE ERROR IN app\/page\.tsx/,
+            `the first draft must LOSE the diagnostic, or this rig cannot see the difference the shipped shape makes:\n${result.output}`)
+          assert.ok(existsSync(partial),
+            'and must leave the truncated dump behind, which is the second half of the same regression')
+        }
+      } finally {
+        rmSync(dir, { recursive: true, force: true })
+      }
+    })
+  }
+}
+
+// ---------------------------------------------------------------------------
+// o3d-secops r33, Codex HIGH 1 — THE CENSUS OF DATABASE CONSUMERS, TAKEN FROM THE ENTRYPOINTS.
+//
+// THE FINDING. The closing gate was placed after what a COMMENT called "every consumer", and the
+// comment was written from the author's own list rather than from the file. install.sh had SEVEN
+// consumers inside the fenced window and the list named five: `npm run db:seed` and
+// `provision-instance.mjs` both ran AFTER the window had been declared closed, on the same movable
+// ${MIGRATION_DATABASE_URL}, so a DNS change, a proxy or a failover taking effect after the gate
+// sent the seed, the default administrator, the SMTP configuration and the WooCommerce credentials
+// to another cluster and returned. Nothing looked afterwards, and the run then attested against
+// the original server and started the application there.
+//
+// SO THE LIST IS NOT WRITTEN DOWN IN A COMMENT ANY MORE. This walks each shipped entrypoint,
+// finds every TOP-LEVEL step that hands a process the migration connection string, and requires
+// each one to be followed by a placement -- a pin, or the closing gate -- before the next one
+// begins. A consumer added below the gate in some future round fails here rather than being
+// discovered by a reviewer reading a stale list.
+//
+// THE EXPECTED SET IS SPELLED OUT AS WELL AS THE RULE, because a walk that found nothing would
+// satisfy "every consumer is placed" perfectly. The count is asserted, the labels are asserted,
+// and the two facts are read out of the same scan.
+//
+// MUTATION ROUTE (all made against the shipped files and reverted): move
+// `require_migration_landed_on_fenced_server` in install.sh back above `header "Seeding
+// database"` -- the seed and the bootstrap then trail the last placement and this fails naming
+// both. Delete any single `pin_migration_window` line -- the consumer above it becomes unplaced.
+// Add a new `DATABASE_URL="${MIGRATION_DATABASE_URL}"` step after the gate -- the expected-set
+// assertion fails until it is placed.
+// ---------------------------------------------------------------------------
+
+/**
+ * THE CENSUS KEYS ON THE URL ITSELF, NOT ON THE FORMS IT HAS BEEN SPELLED IN SO FAR
+ * (o3d-secops r34, Codex MEDIUM).
+ *
+ * THE FINDING. r33 replaced a comment with a census, and the census was three regexes:
+ * `DATABASE_URL="${MIGRATION_DATABASE_URL}"`, `pg_dump "${MIGRATION_DATABASE_URL}"` and
+ * `as_app_user_db `. A new top-level step written any other way -- `psql "$MIGRATION_DATABASE_URL"`,
+ * an unquoted assignment, a command handed the URL through a name it was copied into -- matched
+ * none of them, changed neither the detected list nor the expected list, and passed the census
+ * exactly as before. A list of forms is a list; it was the same shape of thing as the comment it
+ * replaced.
+ *
+ * SO IT KEYS ON THE THING. Any top-level statement that references ${MIGRATION_DATABASE_URL} AT
+ * ALL, however spelled, is a database consumer that must be placed -- UNLESS it is explicitly
+ * classified as one of three other things, and each of those has to earn it:
+ *
+ *   assignment   the statement is ENTIRELY `MIGRATION_DATABASE_URL=<value>` with no command
+ *                substitution in it. It sets the name; it hands nothing to a process. An
+ *                assignment whose value comes out of `$( ... )` DOES run a process and is a
+ *                consumer.
+ *   alias        the statement is ENTIRELY `SOME_NAME=<the URL>`, again with no command
+ *                substitution. It hands nothing over either -- but SOME_NAME now carries the URL,
+ *                so every later statement that mentions it is a reference in its own right. This
+ *                is the indirection Codex named, and it is closed rather than described.
+ *   mechanism    a call to one of the fence's own functions, named in MIGRATION_URL_MECHANISMS
+ *                below. These are what RAISES, MOVES and PLACES the URL rather than steps that
+ *                consume it, and every name in that table is checked to be a real function that
+ *                really does touch the URL, so a stale entry cannot silently excuse a consumer.
+ *
+ * AND FUNCTIONS ARE FOLLOWED, ONE HOP AND THEN TO A FIXPOINT. A helper whose body names the URL --
+ * `as_app_user_db()` is the shipped example, and any future one is the interesting case -- makes
+ * every top-level CALL to it a reference, so moving a consumer into a helper does not remove it
+ * from the census. Function bodies are read from the entrypoint AND from the fence library it
+ * sources, so a consumer added to lib/db-fence-protected.sh and called from the top level of an
+ * entrypoint is caught too.
+ *
+ * WHAT STILL ESCAPES IT, said plainly rather than papered over:
+ *
+ *   - A NAME COMPUTED AT RUNTIME. `eval`, `${!ref}`, `declare -n`, or a command built by string
+ *     concatenation. This walk is textual; a name that does not exist until the shell runs cannot
+ *     be followed by reading the file, and nothing short of running the entrypoint would find it.
+ *   - THE ENVIRONMENT. If the URL were EXPORTED, a later process would inherit it without any
+ *     statement naming it. No entrypoint exports it today -- every consumer is handed it as an
+ *     `env NAME=value` prefix -- and that is the property this leans on rather than checks.
+ *   - A CONSUMER INSIDE A FUNCTION THAT NEVER NAMES THE URL, reaching the database some other way
+ *     (a `.env` file, a hard-coded string). It would not be a consumer of the MIGRATION url, which
+ *     is what the fence and the pins are about, but it would still be a database consumer.
+ *
+ * MUTATION ROUTE (all made against the shipped files and reverted): add `psql
+ * "$MIGRATION_DATABASE_URL" -c 'select 1'` below the closing gate in install.sh -- the classified
+ * list gains an entry and the gate stops being the last placement, and the r33 census saw nothing.
+ * Add `MIGRATION_URL_COPY=$MIGRATION_DATABASE_URL` and then `node x.mjs "$MIGRATION_URL_COPY"` --
+ * the alias is classified and the command below it is an unplaced consumer. Move
+ * `require_migration_landed_on_fenced_server` in install.sh back above `header "Seeding
+ * database"` -- the seed and the bootstrap then trail the last placement. Delete any single
+ * `pin_migration_window` line -- the consumer above it becomes unplaced. Change any consumer's
+ * `|| <name>_rc=$?` back to `|| die` -- the r34 disposition rule fails naming that step.
+ */
+
+/**
+ * The fence's own machinery: what raises, moves, holds and places the migration URL. Every name is
+ * asserted below to be a function that really does reference the URL, in the entrypoint or in the
+ * library it sources, so this table cannot become a place to hide a step.
+ */
+const MIGRATION_URL_MECHANISMS: ReadonlyArray<string> = [
+  'fence_db_connections',
+  'release_db_connections',
+  'refence_db_connections',
+  'adopt_db_connections',
+  'adopt_existing_fence',
+  'resume_from_interrupted_arming',
+]
+
+type CensusEntry = {
+  kind: 'consumer' | 'assignment' | 'alias' | 'mechanism' | 'placement'
+  label: string
+  step: string
+  line: number
+  placedBy: string | null
+}
+
+/** Every function defined in `source`, as name -> body text of its logical statements. */
+function shellFunctionBodies(source: string): Map<string, string> {
+  const bodies = new Map<string, string>()
+  let name: string | null = null
+  let body: string[] = []
+  for (const raw of source.split('\n')) {
+    if (name === null) {
+      const opens = /^([a-z_][a-z0-9_]*)\(\)\s*\{$/.exec(raw)
+      if (opens) { name = opens[1]; body = [] }
+      continue
+    }
+    if (raw === '}') { bodies.set(name, body.join('\n')); name = null; continue }
+    body.push(raw)
+  }
+  return bodies
+}
+
+/** The names of functions that reach ${MIGRATION_DATABASE_URL}, directly or through each other. */
+function migrationUrlCarriers(sources: ReadonlyArray<string>): Set<string> {
+  const bodies = new Map<string, string>()
+  for (const source of sources) for (const [name, body] of shellFunctionBodies(source)) bodies.set(name, body)
+  const carriers = new Set<string>()
+  for (const [name, body] of bodies) if (/\bMIGRATION_DATABASE_URL\b/.test(body)) carriers.add(name)
+  // To a fixpoint: a helper that calls a carrier carries it too.
+  for (;;) {
+    let grew = false
+    for (const [name, body] of bodies) {
+      if (carriers.has(name)) continue
+      for (const carrier of carriers) {
+        if (new RegExp(`(^|[\\s;(&|!])${carrier}(\\s|$|\\))`, 'm').test(body)) { carriers.add(name); grew = true; break }
+      }
+    }
+    if (!grew) break
+  }
+  return carriers
+}
+
+/**
+ * Every TOP-LEVEL statement of one entrypoint that references the migration URL, classified, in
+ * file order, with the placement that follows each consumer.
+ *
+ * ONE ENTRY PER LOGICAL STATEMENT, not per physical line. Every one of these steps is written as
+ * `run_as_user ... env \` / `DATABASE_URL=... \` / `node <script>`, so a scan that read physical
+ * lines would find the string on one line and the script's name on another -- and a label taken
+ * from "the next few lines" reads the COMMENT ABOVE THE NEXT STEP, which is how the first draft of
+ * this census reported a pg_dump in deploy.sh, which has none.
+ *
+ * TOP LEVEL ONLY. Function bodies are skipped by tracking the `name() {` ... `}` blocks these
+ * scripts are written in -- but a call to a function that carries the URL is itself a reference,
+ * so a consumer moved into a helper stays in the census instead of leaving it.
+ */
+function migrationConsumerCensus(lines: ReadonlyArray<string>, carriers: ReadonlySet<string>): CensusEntry[] {
+  const logical: Array<{ text: string; line: number }> = []
+  let buffer = ''
+  let opener = 0
+  lines.forEach((raw, index) => {
+    const line = raw.trim()
+    if (buffer === '') opener = index
+    buffer = buffer === '' ? line : `${buffer} ${line}`
+    if (/\\$/.test(line)) { buffer = buffer.replace(/\\$/, ''); return }
+    logical.push({ text: buffer, line: opener })
+    buffer = ''
+  })
+  if (buffer !== '') logical.push({ text: buffer, line: opener })
+
+  const out: CensusEntry[] = []
+  const aliases = new Set<string>()
+  let depth = 0
+  let pending: CensusEntry | null = null
+  const place = (placedBy: string | null) => {
+    if (pending !== null) { pending.placedBy = placedBy; out.push(pending); pending = null }
+  }
+  for (const { text, line } of logical) {
+    const raw = lines[line]
+    // The brace convention these scripts are written in, matched on the RAW line so that a `}`
+    // inside a heredoc cannot close a function this walk thinks it is inside.
+    if (/^[a-z_][a-z0-9_]*\(\)\s*\{$/.test(raw)) { depth += 1; continue }
+    if (depth > 0) { if (raw === '}') depth -= 1; continue }
+    if (text.startsWith('#')) continue
+
+    const pin = /^pin_migration_window (.*)$/.exec(text)
+    if (pin) {
+      place('pin')
+      out.push({ kind: 'placement', label: `pin ${pin[1]}`, step: text, line, placedBy: null })
+      continue
+    }
+    if (/^require_migration_landed_on_fenced_server$/.test(text)) {
+      place('gate')
+      out.push({ kind: 'placement', label: 'gate', step: text, line, placedBy: null })
+      continue
+    }
+
+    const word = /^([A-Za-z_][A-Za-z0-9_]*)/.exec(text)?.[1] ?? ''
+    const mentions = (name: string) => new RegExp(`(^|[^A-Za-z0-9_])\\$\\{?${name}\\}?([^A-Za-z0-9_]|$)`).test(text)
+      || new RegExp(`(^|[\\s;(&|!])${name}(\\s|=|$|\\))`).test(text)
+    const references = /\bMIGRATION_DATABASE_URL\b/.test(text)
+      || [...aliases].some(mentions)
+      || [...carriers].some((name) => new RegExp(`(^|[\\s;(&|!])${name}(\\s|$|\\))`).test(text))
+    if (!references) continue
+
+    // A WHOLE-STATEMENT ASSIGNMENT, and nothing that merely BEGINS with one. `DATABASE_URL="..."
+    // node x` is an `env`-style prefix on a command and is a consumer; `NAME="..."` on its own is
+    // not. Command substitution anywhere in the value makes it a consumer either way, because
+    // `$( ... )` runs a process with that value in hand.
+    const assignment = /^([A-Za-z_][A-Za-z0-9_]*)=("[^"]*"|'[^']*'|\S*)$/.exec(text)
+    if (assignment && !/\$\(/.test(text)) {
+      const [, name] = assignment
+      if (name === 'MIGRATION_DATABASE_URL') {
+        place(null)
+        out.push({ kind: 'assignment', label: 'MIGRATION_DATABASE_URL=', step: text, line, placedBy: null })
+      } else {
+        aliases.add(name)
+        place(null)
+        out.push({ kind: 'alias', label: `alias:${name}`, step: text, line, placedBy: null })
+      }
+      continue
+    }
+
+    if (MIGRATION_URL_MECHANISMS.includes(word)) {
+      place(null)
+      out.push({ kind: 'mechanism', label: word, step: text, line, placedBy: null })
+      continue
+    }
+
+    // AN EXIT TRAP IS A REGISTRATION, NOT A STEP. `trap on_cutover_exit EXIT` names a handler that
+    // reaches the URL -- which is why it is in this census at all -- but it runs nothing now, and
+    // there is nothing for a pin to place. It is classified rather than excused: the handler has to
+    // BE a carrier, and the whole statement is spelled out in the expected list below, so a trap
+    // that started calling something else fails here.
+    const trapped = /^trap ([A-Za-z_][A-Za-z0-9_]*) ([A-Z]+)$/.exec(text)
+    if (trapped && carriers.has(trapped[1])) {
+      place(null)
+      out.push({ kind: 'mechanism', label: text, step: text, line, placedBy: null })
+      continue
+    }
+
+    place(null)
+    pending = { kind: 'consumer', label: labelFor(text), step: text, line, placedBy: null }
+  }
+  place(null)
+  return out
+}
+
+/** What each consumer is called in the assertions below, so a failure names a step. */
+const CONSUMER_LABELS: ReadonlyArray<[RegExp, string]> = [
+  [/prisma generate/, 'prisma generate'],
+  [/npm run build/, 'npm run build'],
+  [/check-wms-push-state-enum/, 'check-wms-push-state-enum.mjs'],
+  [/check-db-writers/, 'check-db-writers.mjs'],
+  [/pg_dump/, 'pg_dump'],
+  [/prisma migrate deploy/, 'prisma migrate deploy'],
+  [/check-prisma-drift/, 'check-prisma-drift.mjs'],
+  [/DB_OBJECT_ACCESS_SCRIPT|check-app-db-object-access/, 'check-app-db-object-access.mjs'],
+  [/run-migration-verifications/, 'run-migration-verifications.mjs'],
+  [/db:seed/, 'db:seed'],
+  [/BOOTSTRAP_SCRIPT|provision-instance/, 'provision-instance.mjs'],
+]
+
+/** The step's own text, and nothing else: the whole statement is already in `step`. */
+const labelFor = (step: string): string => {
+  for (const [pattern, label] of CONSUMER_LABELS) if (pattern.test(step)) return label
+  return step
+}
+
+const FENCE_LIB_SOURCE = readFileSync(join(process.cwd(), 'scripts/lib/db-fence-protected.sh'), 'utf8')
+
+for (const [name, lines, expectedConsumers, expectedClassified] of [
+  ['install.sh', INSTALL_LINES, [
+    'prisma generate', 'npm run build',
+    'check-db-writers.mjs', 'prisma migrate deploy', 'check-prisma-drift.mjs',
+    'check-app-db-object-access.mjs', 'run-migration-verifications.mjs',
+    'db:seed', 'provision-instance.mjs',
+  ], [
+    'assignment:MIGRATION_DATABASE_URL=',
+    'assignment:MIGRATION_DATABASE_URL=',
+    'mechanism:trap on_cutover_exit EXIT',
+    'mechanism:adopt_existing_fence',
+    'consumer:prisma generate', 'placement:pin "The Prisma client generation"',
+    'consumer:npm run build', 'placement:pin "The build"',
+    'mechanism:fence_db_connections',
+    'consumer:check-db-writers.mjs', 'placement:pin "The drain probe"',
+    'consumer:prisma migrate deploy', 'placement:pin "The migration"',
+    'consumer:check-prisma-drift.mjs', 'placement:pin "The drift check"',
+    'consumer:check-app-db-object-access.mjs', 'placement:pin "The object-access check"',
+    'consumer:run-migration-verifications.mjs', 'placement:pin "The verification hook"',
+    'consumer:db:seed', 'placement:pin "The seed"',
+    'consumer:provision-instance.mjs', 'placement:gate',
+    'mechanism:release_db_connections',
+  ]],
+  ['update.sh', UPDATE_LINES, [
+    'prisma generate', 'npm run build',
+    'check-db-writers.mjs', 'pg_dump', 'prisma migrate deploy', 'check-prisma-drift.mjs',
+    'check-app-db-object-access.mjs', 'run-migration-verifications.mjs',
+  ], [
+    'assignment:MIGRATION_DATABASE_URL=',
+    'mechanism:trap on_exit EXIT',
+    'mechanism:resume_from_interrupted_arming',
+    'mechanism:adopt_db_connections',
+    'mechanism:release_db_connections',
+    'consumer:prisma generate', 'placement:pin "The Prisma client generation"',
+    'consumer:npm run build', 'placement:pin "The build"',
+    'mechanism:fence_db_connections',
+    'consumer:check-db-writers.mjs', 'placement:pin "The drain probe"',
+    'consumer:pg_dump', 'placement:pin "The pre-migration backup"',
+    'consumer:prisma migrate deploy', 'placement:pin "The migration"',
+    'consumer:check-prisma-drift.mjs', 'placement:pin "The drift check"',
+    'consumer:check-app-db-object-access.mjs', 'placement:pin "The object-access check"',
+    'consumer:run-migration-verifications.mjs', 'placement:gate',
+    'mechanism:release_db_connections',
+  ]],
+  ['deploy.sh', DEPLOY_LINES, [
+    'npm run build', 'check-wms-push-state-enum.mjs',
+    'check-db-writers.mjs', 'prisma migrate deploy', 'check-prisma-drift.mjs',
+    'check-app-db-object-access.mjs', 'run-migration-verifications.mjs',
+  ], [
+    'assignment:MIGRATION_DATABASE_URL=',
+    'mechanism:trap on_exit EXIT',
+    'mechanism:resume_from_interrupted_arming',
+    'mechanism:adopt_db_connections',
+    'mechanism:release_db_connections',
+    'consumer:npm run build', 'placement:pin "The build"',
+    'consumer:check-wms-push-state-enum.mjs', 'placement:pin "The WMS push-state vocabulary check"',
+    'mechanism:fence_db_connections',
+    'consumer:check-db-writers.mjs', 'placement:pin "The drain probe"',
+    'consumer:prisma migrate deploy', 'placement:pin "The migration"',
+    'consumer:check-prisma-drift.mjs', 'placement:pin "The drift check"',
+    'consumer:check-app-db-object-access.mjs', 'placement:pin "The object-access check"',
+    'consumer:run-migration-verifications.mjs', 'placement:gate',
+    'mechanism:release_db_connections',
+  ]],
+] as ReadonlyArray<[string, string[], string[], string[]]>) {
+  test(`${name}: every top-level reference to the migration URL is classified, and every consumer is placed (o3d-secops r34, Codex MEDIUM)`, () => {
+    const carriers = migrationUrlCarriers([lines.join('\n'), FENCE_LIB_SOURCE])
+    const census = migrationConsumerCensus(lines, carriers)
+
+    // THE MECHANISM TABLE CANNOT BE A HIDING PLACE. Every name this file classified as mechanism
+    // must be a real function that really does reach the URL; a renamed or invented one fails here
+    // rather than quietly excusing a step from its placement.
+    for (const entry of census.filter((row) => row.kind === 'mechanism')) {
+      const handler = /^trap ([A-Za-z_][A-Za-z0-9_]*) /.exec(entry.label)?.[1] ?? entry.label
+      assert.ok(carriers.has(handler),
+        `${entry.label} is classified as fence machinery but is not a function that touches the migration URL:\n${entry.step}`)
+    }
+
+    // THE WALK REACHED THE FILE. A census that found nothing would pass every rule below.
+    assert.ok(census.length >= 15,
+      `precondition: the walk must find this entrypoint's references, not an empty file:\n${JSON.stringify(census, null, 2)}`)
+    assert.ok(carriers.has('pin_migration_window') && carriers.size >= 8,
+      `precondition: function bodies must have been read, or nothing is being followed:\n${[...carriers].join(', ')}`)
+
+    // EVERY TOP-LEVEL REFERENCE, CLASSIFIED, IN FILE ORDER. This is the fail-closed half: a step
+    // added in ANY spelling changes this list, whatever regex it would or would not have matched.
+    assert.deepEqual(census.map((row) => `${row.kind}:${row.label}`), expectedClassified,
+      `the top-level references to the migration URL are not what this entrypoint was last read to have:\n${JSON.stringify(census, null, 2)}`)
+
+    const consumers = census.filter((row) => row.kind === 'consumer')
+    assert.deepEqual(consumers.map((row) => row.label), expectedConsumers,
+      `the consumers of the migration URL, in file order, are not what this entrypoint was last read to have:\n${JSON.stringify(consumers, null, 2)}`)
+
+    const unplaced = consumers.filter((row) => row.placedBy === null)
+    assert.deepEqual(unplaced.map((row) => row.label), [],
+      `every step handed the migration URL must be followed by a pin or by the closing gate before the next one begins; these are not:\n${JSON.stringify(unplaced, null, 2)}`)
+
+    // AND THE GATE IS THE LAST PLACEMENT, not one in the middle with consumers trailing it. This
+    // is the r32 defect stated as a rule: the seed and the bootstrap sat below it.
+    const gated = consumers.findIndex((row) => row.placedBy === 'gate')
+    assert.notEqual(gated, -1, `the closing gate must place one of them:\n${JSON.stringify(consumers, null, 2)}`)
+    assert.equal(gated, consumers.length - 1,
+      `the closing gate must place the LAST consumer; these run after it with nothing watching: ${consumers.slice(gated + 1).map((row) => row.label).join(', ')}`)
+  })
+
+  test(`${name}: a consumer that fails still reaches its placement, and its status is propagated after it (o3d-secops r34, Codex HIGH 2)`, () => {
+    const carriers = migrationUrlCarriers([lines.join('\n'), FENCE_LIB_SOURCE])
+    const consumers = migrationConsumerCensus(lines, carriers).filter((row) => row.kind === 'consumer')
+    assert.ok(consumers.length >= 7, `precondition: the walk must find the consumers:\n${JSON.stringify(consumers, null, 2)}`)
+
+    for (const consumer of consumers) {
+      const disposition = consumerFailureDisposition(lines as string[], consumer.line)
+      // EVERY ONE OF THEM IS PLACED, so every one of them must CAPTURE rather than die where it
+      // stands: a `die` above the pin is exactly how a step that moved schema and then failed
+      // escaped its placement, and `set -e` on a bare statement does the same thing silently.
+      assert.equal(disposition.shape, 'captured',
+        `${consumer.label} is placed by ${consumer.placedBy}, so its exit status must be captured and propagated AFTER that placement, not before it: ${disposition.detail}`)
+      // AND THE PROPAGATION IS BELOW THE PLACEMENT, which is the ordering the finding is about.
+      const propagation = (lines as string[]).findIndex((line, index) =>
+        index > consumer.line && disposition.status !== null && new RegExp(`\\$\\{?${disposition.status}\\}?\\b`).test(line))
+      const placement = (lines as string[]).findIndex((line, index) =>
+        index > consumer.line && /^\s*(pin_migration_window |require_migration_landed_on_fenced_server$)/.test(line))
+      assert.notEqual(placement, -1, `${consumer.label} must have a placement below it`)
+      assert.ok(propagation > placement,
+        `${consumer.label}: its failure is propagated at line ${propagation + 1}, above its placement at line ${placement + 1} — the placement would never run`)
+    }
+  })
+}
+
+// ---------------------------------------------------------------------------
+// o3d-secops r34, Codex MEDIUM — A CONSUMER ADDED IN A FORM NOBODY LISTED.
+//
+// The census above asserts what the entrypoints hold TODAY, and a list of what is there cannot
+// show that a list of FORMS would have missed something: r33's three regexes passed their own
+// census perfectly, every round, while the shape they could not see was the whole finding. So this
+// splices new consumers into a shipped entrypoint, in three forms that r33's detector is carried
+// here verbatim to be shown NOT MATCHING, and requires the new census to catch each one.
+//
+// THE POSITION IS THE r32 DEFECT'S OWN. Each is added immediately BELOW the closing gate, which is
+// where `npm run db:seed` and `provision-instance.mjs` actually sat -- past the last placement,
+// on the same movable string, with nothing looking afterwards.
+// ---------------------------------------------------------------------------
+test('the census catches a consumer added in a form no earlier round listed, and r33\'s three regexes do not (o3d-secops r34, Codex MEDIUM)', () => {
+  const carriers = migrationUrlCarriers([INSTALL_LINES.join('\n'), FENCE_LIB_SOURCE])
+  const shipped = migrationConsumerCensus(INSTALL_LINES, carriers)
+  // ANNOTATED, BECAUSE `assert.ok` IS AN ASSERTION FUNCTION. TypeScript narrows through one only
+  // when the asserted name is declared with an explicit type; without it the narrowing of `gate`
+  // becomes circular through the initializers below and every one of them falls back to `any`.
+  const gate: CensusEntry | undefined = shipped.find((row) => row.label === 'gate')
+  assert.ok(gate, `precondition: the shipped entrypoint must have a closing gate to add below:\n${JSON.stringify(shipped, null, 2)}`)
+  assert.deepEqual(shipped.filter((row) => row.kind === 'consumer' && row.placedBy === null), [],
+    'precondition: the shipped file must start with every consumer placed, or the assertions below prove nothing')
+
+  // r33'S DETECTOR, COPIED VERBATIM. It is the foil: each addition below must be invisible to it.
+  const r33Hands = (text: string): boolean =>
+    /DATABASE_URL="\$\{?MIGRATION_DATABASE_URL\}?"/.test(text)
+    || /(^|[!\s])pg_dump "\$\{MIGRATION_DATABASE_URL\}"/.test(text)
+    || /(^|[!\s])as_app_user_db /.test(text)
+
+  for (const [shape, added, expectedTail] of [
+    ['a top-level command handed the URL directly',
+      ['psql "$MIGRATION_DATABASE_URL" -c \'select 1\''],
+      ['consumer']],
+    ['an unquoted assignment prefix',
+      ['DATABASE_URL=$MIGRATION_DATABASE_URL node scripts/whatever.mjs'],
+      ['consumer']],
+    ['a command that reaches it through a name it was copied into',
+      ['MIGRATION_URL_COPY="${MIGRATION_DATABASE_URL}"', 'node scripts/whatever.mjs "$MIGRATION_URL_COPY"'],
+      ['alias', 'consumer']],
+  ] as ReadonlyArray<[string, string[], string[]]>) {
+    assert.ok(!added.some(r33Hands),
+      `precondition: ${shape} must be invisible to r33's three forms, or this case proves nothing about them:\n${added.join('\n')}`)
+
+    const mutated = [...INSTALL_LINES.slice(0, gate.line + 1), ...added, ...INSTALL_LINES.slice(gate.line + 1)]
+    const census = migrationConsumerCensus(mutated, carriers)
+
+    // THE CLASSIFICATION IS FAIL-CLOSED: every one of them lands in the list, in the kind it is.
+    const spliced: CensusEntry[] = census.filter((row) => row.line > gate.line && row.line <= gate.line + added.length)
+    assert.deepEqual(
+      spliced.map((row) => row.kind),
+      expectedTail,
+      `${shape} must be classified rather than skipped:\n${JSON.stringify(census, null, 2)}`,
+    )
+
+    // AND THE CONSUMER IT ADDS IS UNPLACED, which is the rule that would fail a real one.
+    const unplaced = census.filter((row) => row.kind === 'consumer' && row.placedBy === null)
+    assert.equal(unplaced.length, 1,
+      `${shape} must leave exactly one consumer with nothing placing it:\n${JSON.stringify(census, null, 2)}`)
+
+    // AND THE GATE IS NO LONGER THE LAST PLACEMENT, which is r32's rule restated.
+    const consumers = census.filter((row) => row.kind === 'consumer')
+    const gated = consumers.findIndex((row) => row.placedBy === 'gate')
+    assert.notEqual(gated, consumers.length - 1,
+      `${shape} runs after the closing gate, so the gate must stop being the last placement:\n${JSON.stringify(consumers, null, 2)}`)
+  }
+})
+
+// AND A CONSUMER MOVED INTO A HELPER DOES NOT LEAVE THE CENSUS (o3d-secops r34, Codex MEDIUM).
+// r33 skipped function bodies and said so, on the grounds that a consumer moved into one "would
+// leave the census rather than silently passing it" -- but leaving a census IS passing it: the
+// detected list and the expected list both shrink by the same entry and nothing fails. The census
+// now follows calls to any function whose body reaches the URL, so the helper's CALL SITE is the
+// reference and it still has to be placed.
+test('a consumer moved into a helper is still in the census, through the call site (o3d-secops r34, Codex MEDIUM)', () => {
+  const carriers = migrationUrlCarriers([INSTALL_LINES.join('\n'), FENCE_LIB_SOURCE])
+  const gate: CensusEntry | undefined = migrationConsumerCensus(INSTALL_LINES, carriers).find((row) => row.label === 'gate')
+  assert.ok(gate)
+
+  const helper = [
+    'late_settings_writer() {',
+    '  run_as_user "${APP_USER}" env DATABASE_URL="${MIGRATION_DATABASE_URL}" node scripts/whatever.mjs',
+    '}',
+    'late_settings_writer',
+  ]
+  const mutated = [...INSTALL_LINES.slice(0, gate.line + 1), ...helper, ...INSTALL_LINES.slice(gate.line + 1)]
+  const mutatedCarriers = migrationUrlCarriers([mutated.join('\n'), FENCE_LIB_SOURCE])
+
+  assert.ok(mutatedCarriers.has('late_settings_writer'),
+    `precondition: the helper's body names the URL, so the walk must have learned that it carries it:\n${[...mutatedCarriers].join(', ')}`)
+
+  const census = migrationConsumerCensus(mutated, mutatedCarriers)
+  const unplaced = census.filter((row) => row.kind === 'consumer' && row.placedBy === null)
+  assert.deepEqual(unplaced.map((row) => row.step), ['late_settings_writer'],
+    `the call site must be the unplaced consumer, not an entry that quietly vanished:\n${JSON.stringify(census, null, 2)}`)
+})
+
+// AND THE SHIPPED FILES REALLY ARE WRITTEN THAT WAY (o3d-secops r34). The rig above proves what the
+// two shapes DO; this is the half that fails if either entrypoint drifts back to the first draft.
+//
+// MUTATION ROUTE (made against the shipped files and reverted): move `tail -40 "$BUILD_LOG" >&2`
+// out of the build statement in deploy.sh and back into an `if [[ "$build_rc" -ne 0 ]]` block below
+// `pin_migration_window "The build"` -- both assertions below fail, naming deploy.sh. The same for
+// `rm -f "${BACKUP_PARTIAL}"` in update.sh.
+for (const [name, lines, consumer, diagnostic] of [
+  ['deploy.sh', DEPLOY_LINES, /as_app_user_db npm run build /, 'tail -40 "$BUILD_LOG"'],
+  ['update.sh', UPDATE_LINES, /pg_dump "\$\{MIGRATION_DATABASE_URL\}"/, 'rm -f "${BACKUP_PARTIAL}"'],
+] as ReadonlyArray<[string, string[], RegExp, string]>) {
+  test(`${name}: the diagnostic belonging to a failed consumer is inside its own statement, not below the placement (o3d-secops r34)`, () => {
+    const call = realCodeLine(lines, consumer)
+    assert.notEqual(call, -1, 'precondition: the consumer must be found, or this test walks nothing')
+
+    const statement = callContinuation(lines, call)
+    assert.ok(statement.includes(diagnostic),
+      `${diagnostic} belongs to this step's failure and must run INSIDE its statement, because the placement below it can itself refuse:\n${statement}`)
+
+    // AND IT IS STILL A CAPTURE, so widening the statement did not cost the propagation.
+    const disposition = consumerFailureDisposition(lines, call)
+    assert.equal(disposition.shape, 'captured',
+      `and the status must still be captured and propagated after the placement: ${disposition.detail}`)
+
+    // AND NOWHERE BELOW THE PLACEMENT, which is the position it was lost from.
+    const end = statementEnd(lines, call)
+    const placement = lines.findIndex((line, index) => index > end && /^\s*pin_migration_window /.test(line))
+    assert.notEqual(placement, -1, 'precondition: this consumer must have a placement below it')
+    const below = lines.slice(placement, placement + 10)
+    assert.ok(!below.some((line) => line.includes(diagnostic)),
+      `${diagnostic} must not also sit below the placement, where a refusal would leave before it:\n${below.join('\n')}`)
+  })
+}
+
+// ---------------------------------------------------------------------------
+// o3d-secops r32, Codex HIGH 1 — THE OTHER MACHINE LINES THIS BRANCH READS.
+//
+// The verdicts are not the only things read out of a captured stream. Root also reads the fence
+// PLAN (one JSON document), the digest of the record the validator published, the release's
+// cluster identity, and the audit's three verdict lines. Every one of them was `sed -n
+// 's/^key=\(.*\)$/\1/p' | tail -1` or a bare substring, and the two defects are separable:
+//
+//   THE CHANNEL. Fixed at the source: all eleven of the helper's `console.log` calls are on stderr
+//   now and its main() reseats `console.log`, so nothing carrying a database or role name can
+//   reach stdout. The producers of `authority_sha256=` do the same -- `CONNECT will be revoked
+//   from <roles> on <database>` is on stderr beside it.
+//
+//   THE READER. `tail -1` is duplicate-TOLERANT: a stream carrying the key twice is read as its
+//   last occurrence rather than refused, which is exactly how an appended line becomes the answer.
+//   That is what these measure, against the shipped readers, under a real shell.
+// ---------------------------------------------------------------------------
+
+/**
+ * A MULTI-LINE STREAM, BUILT SO THAT IT REALLY IS MULTI-LINE.
+ *
+ * `JSON.stringify('a\nb')` yields `"a\nb"`, and inside a bash DOUBLE-QUOTED assignment that is a
+ * backslash and an `n` -- one line, not two. The first draft of the tests below passed a
+ * JSON-stringified two-line stream, and BOTH of them stayed green when the duplicate guard was
+ * mutated away: the reader was refusing a one-line value of the wrong SHAPE, not a duplicate key,
+ * so the assertion said nothing about the rule it names. Each line is single-quoted separately and
+ * `printf` supplies the newlines.
+ */
+function shellStream(lines: readonly string[]): string {
+  const quoted = lines.map((line) => `'${line.replace(/'/g, `'\\''`)}'`).join(' ')
+  return `stream="$(printf '%s\\n' ${quoted})"`
+}
+
+test('[o3d-secops r32] the shared machine-field reader takes one value of the stated shape, or nothing', () => {
+  const FENCE_LIB = readFileSync(join(process.cwd(), 'scripts/lib/db-fence-protected.sh'), 'utf8')
+  const run = (lines: readonly string[]) => runShell([
+    'set -uo pipefail',
+    shellFunction(FENCE_LIB, 'db_fence_machine_field'),
+    shellStream(lines),
+    'if v="$(db_fence_machine_field "${stream}" authority_sha256 "^[0-9a-f]{64}\\$")"; then echo "TOOK=${v}"; else echo "REFUSED"; fi',
+  ].join('\n'))
+  const digest = 'a'.repeat(64)
+  const other = 'b'.repeat(64)
+
+  // THE ORDINARY CASE, so nothing below passes because the reader refuses everything.
+  assert.match(run([`authority_sha256=${digest}`]).output, new RegExp(`^TOOK=${digest}$`, 'm'))
+  // AND THE STREAM REALLY IS TWO LINES: a reader handed one line containing a literal backslash-n
+  // refuses for the wrong reason, and the duplicate rule below would go unmeasured.
+  assert.match(run([`authority_sha256=${digest}`, 'noise']).output, new RegExp(`^TOOK=${digest}$`, 'm'),
+    'precondition: a second, unrelated line must not disturb the reading')
+  // AND IT IS A WHOLE LINE: prose that CONTAINS the key is not the key.
+  assert.match(run([`published authority_sha256=${digest} somewhere`]).output, /^REFUSED$/m)
+  // MUTATION ROUTE (made against the shipped file and reverted): change `[[ "${hits}" -eq 1 ]]` to
+  // `-ge 1` -- the reader then takes the LAST value, which is the `tail -1` behaviour this
+  // replaced, and the two-line case below reports the appended digest instead of refusing.
+  assert.match(run([`authority_sha256=${digest}`, `authority_sha256=${other}`]).output, /^REFUSED$/m,
+    'a stream carrying the key twice has not answered')
+  // AND THE SHAPE IS ENFORCED: a value that is not the thing it claims to be is not a value.
+  assert.match(run(['authority_sha256=not-a-digest']).output, /^REFUSED$/m)
+  assert.match(run(['nothing here at all']).output, /^REFUSED$/m)
+})
+
+test('[o3d-secops r32] the recovery wrappers read their machine lines the same way', () => {
+  // THE WRAPPER'S OWN COPY, lifted out of the heredoc the library publishes rather than re-written
+  // here: these run as separate root-owned scripts and carry `machine_field` in their own text, so
+  // a rule fixed in the library and not in the wrapper would leave the finding open on the path an
+  // operator actually drives.
+  const FENCE_LIB = readFileSync(join(process.cwd(), 'scripts/lib/db-fence-protected.sh'), 'utf8')
+  // THE HEREDOC'S CONTENT, without its opener: that content IS the published wrapper, and it is a
+  // shell script in its own right. Slicing from the `cat <<'WRAPPER_EOF'` line instead hands the
+  // lexer an unterminated here-document, which it refuses to read -- correctly, and loudly.
+  const opener = FENCE_LIB.indexOf("cat <<'WRAPPER_EOF'")
+  assert.notEqual(opener, -1, 'precondition: the library must publish its wrappers from a heredoc')
+  const body = FENCE_LIB.slice(FENCE_LIB.indexOf('\n', opener) + 1, FENCE_LIB.indexOf('\nWRAPPER_EOF\n') + 1)
+  assert.ok(body.includes('machine_field()'), 'precondition: the published wrapper must carry the reader')
+  const reader = shellFunction(body, 'machine_field')
+  const run = (lines: readonly string[], key: string, shape: string) => runShell([
+    'set -uo pipefail',
+    reader,
+    shellStream(lines),
+    `if v="$(machine_field "${'${stream}'}" ${key} ${JSON.stringify(shape)})"; then echo "TOOK=${'${v}'}"; else echo "REFUSED"; fi`,
+  ].join('\n'))
+
+  const IDENTITY = '^([0-9]+|<unavailable>)/([0-9]+|<unavailable>)$'
+  assert.match(run(['release_cluster_identity=7401234/16400'], 'release_cluster_identity', IDENTITY).output, /^TOOK=7401234\/16400$/m)
+  assert.match(run(['release_cluster_identity=<unavailable>/16400'], 'release_cluster_identity', IDENTITY).output, /^TOOK=<unavailable>\/16400$/m,
+    'a server that will not identify itself is a value, and the operator is shown it')
+  assert.match(run(['release_cluster_identity=7401234/16400', 'release_state=already-released'], 'release_cluster_identity', IDENTITY).output, /^TOOK=7401234\/16400$/m,
+    'precondition: the stream really is several lines, or the duplicate rule below goes unmeasured')
+  // TWO ANSWERS, AND THE SECOND ONE IS THE APPENDED ONE. Under `tail -1` this returned the
+  // attacker's; the confirmation token an operator types binds this value.
+  // MUTATION ROUTE (made against the shipped file and reverted): `-eq 1` to `-ge 1` in the
+  // WRAPPER'S copy of machine_field() -- this line then reports 9999999/16400.
+  assert.match(run(['release_cluster_identity=7401234/16400', 'release_cluster_identity=9999999/16400'], 'release_cluster_identity', IDENTITY).output, /^REFUSED$/m)
+  // AND THE AUDIT'S VERDICT IS AN ENUMERATION, not "anything after the equals sign".
+  const VERDICT = '^(absent|stands|ambiguous)$'
+  assert.match(run(['legacy_fence_verdict=absent'], 'legacy_fence_verdict', VERDICT).output, /^TOOK=absent$/m)
+  assert.match(run(['legacy_fence_verdict=absent-ish'], 'legacy_fence_verdict', VERDICT).output, /^REFUSED$/m)
+  assert.match(run(['legacy_fence_verdict=stands', 'legacy_fence_verdict=absent'], 'legacy_fence_verdict', VERDICT).output, /^REFUSED$/m,
+    'and a stream that says both is not evidence for either')
+})
+
+// ---------------------------------------------------------------------------
+// o3d-secops r32 — AND THE EXIT TRAP'S RE-FENCE STILL CANNOT DIE.
+//
+// r13's rule, which every round since has had to keep: `refence_db_connections()` runs INSIDE the
+// exit trap, where a `die` abandons the rest of the unwind — the crontab, the reboot fence, the
+// marker that tells the next run what this one reached. r32 gave the re-fence a new gate that
+// refuses, and a refusal reached from a trap is exactly that abandonment.
+//
+// So the gate takes a MODE, and the difference is only what happens to THIS RUN: on the trap path
+// it empties ${MIGRATION_DATABASE_URL} — the same thing the composer's own refusal already does —
+// so nothing downstream can migrate on a string this run could not place, and the unwind carries
+// on. The existing r13 assertion is a TEXT check (`refence_db_connections` must not contain the
+// word `die`), and it passed the whole time this defect was in: the `die` was one call away.
+// ---------------------------------------------------------------------------
+
+for (const entry of FENCE_HARNESS) {
+  // MUTATION ROUTE (made against the shipped file and reverted): change the re-fence's call back to
+  // a bare `bind_migration_to_fenced_server` -- the trap dies, UNWIND CONTINUED is not printed, and
+  // the run exits non-zero from inside its own cleanup.
+  test(`${entry.name}: a re-fence that cannot place the migration does not kill the exit trap (o3d-secops r32)`, () => {
+    const dir = mkdtempSync(join(tmpdir(), 'ims-r32trap-'))
+    try {
+      // The cutover's own gate binds; the TRAP's re-fence does not. Both go through the same
+      // shipped function, and only the mode differs.
+      witnessProtocolCheckout(dir, { verdict: 'yes', binding: ['colocated', 'absent'] })
+      const result = runShell([
+        'set -uo pipefail',
+        'exec 2>&1',
+        entry.preamble(dir),
+        'error() { echo "ERROR: $*" >&2; }',
+        'DB_FENCE_RAISED=false',
+        CUTOVER_DIR_PRIMITIVES,
+        shellFunction(entry.source, 'fence_db_connections'),
+        shellFunction(entry.source, 'refence_db_connections'),
+        // THE STATE THE TRAP ACTUALLY RUNS IN: the cutover fenced, migrated and RELEASED, and the
+        // start or the health check then failed. `refence_db_connections()` returns immediately
+        // while ${DB_FENCE_UP} is true, so a rig that skipped the release would exercise nothing.
+        'fence_db_connections',
+        'DB_FENCE_UP=false',
+        'MIGRATION_DATABASE_URL=""',
+        // The two names the shipped re-fence reads that this rig does not otherwise set. Both are
+        // true of the moment it runs: the schema HAS moved (the start failed after the migration)
+        // and no adoption is in progress.
+        'SCHEMA_TOUCHED=true',
+        'DB_FENCE_ADOPTING=false',
+        // The trap's shape, reduced to the two facts that matter: the re-fence runs, and the
+        // unwind has more to do afterwards.
+        'on_exit() { refence_db_connections || true; echo "UNWIND CONTINUED"; }',
+        'trap on_exit EXIT',
+        'echo "THE RUN FAILED SOMEWHERE"',
+      ].join('\n'))
+
+      assert.match(calls(dir), /^--bind-migration /m,
+        `precondition: the re-fence must have tried to place the migration:\n${calls(dir)}`)
+      assert.match(result.output, /^UNWIND CONTINUED$/m,
+        `a gate that refuses inside the exit trap must not abandon the rest of the unwind:\n${result.output}`)
+      assert.doesNotMatch(result.output, /^DIE:/m,
+        `and must not die from inside it:\n${result.output}`)
+      assert.match(result.output, /discarded/,
+        `while still emptying the migration URL, so nothing can migrate on a string it could not place:\n${result.output}`)
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+}

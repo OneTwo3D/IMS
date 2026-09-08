@@ -1066,6 +1066,14 @@ const DATABASE_EXECUTION_PATHS: Record<string,
   // discriminates between passwords while checking a credential ALTER ROLE cannot change. It is the
   // one entry here that opens a connection it deliberately never completes.
   'scripts/lib/pg-auth-request.mjs': 'protocol-handshake-only',
+  // o3d-secops r32. The shared library the three cutover entrypoints drive the connection fence
+  // through. It EXECUTES no SQL of its own and opens no connection: every statement this subsystem
+  // issues is in scripts/fence-db-connections.mjs, classified above, and this file only decides
+  // WHICH bytes of it may run, publishes the authority record and reads back the verdicts. It is
+  // found by this scan because its prose names `prisma migrate deploy`, `pg_dump` and
+  // `pg_stat_activity` while explaining what the migration window binds itself to. Rewording that
+  // to dodge the detector would delete the explanation to satisfy it.
+  'scripts/lib/db-fence-protected.sh': 'names-the-tools-only',
   // o3d-2k5r r6 / o3d-1izw. Found for the same reason: its REFUSAL TEXT names `prisma migrate
   // deploy`, because a refusal whose remedy is "apply the migration" is one nobody can act on. The
   // module executes nothing — it takes a reader function and compares enum labels — and the one

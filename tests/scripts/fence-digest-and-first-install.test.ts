@@ -50,6 +50,10 @@ function releaseCheckout(): string {
   // …and the crontab exclusion, sourced from the same directory since o3d-p9dq. A release checkout
   // without it is not a release checkout: update.sh refuses to start.
   cpSync(join(REPO, 'scripts/lib/crontab-lock.sh'), join(checkout, 'scripts/lib/crontab-lock.sh'))
+  // …and the cutover namespace, sourced from the same directory since o3d-secops r22, for the same
+  // reason: it owns the shared lock and the connection-fence directory, and update.sh refuses to
+  // start without it.
+  cpSync(join(REPO, 'scripts/lib/cutover-namespace.sh'), join(checkout, 'scripts/lib/cutover-namespace.sh'))
   cpSync(join(REPO, 'scripts/fence-db-connections.mjs'), join(checkout, 'scripts/fence-db-connections.mjs'))
   writeCheckoutPg(checkout)
   mkdirSync(join(root, 'tmp'), { recursive: true })
@@ -182,9 +186,9 @@ test('r35: the digest-report mode needs no database, no credential and no standi
   // and no IMS_FENCE_* of any kind on the invocation — and there is no standing artefact anywhere
   // near the scratch root, so a mode that quietly consulted one would be visible as a refusal.
   //
-  // MUTATION ROUTE: make db_fence_report_candidate_digest() call db_fence_probe_script() instead
-  // of db_fence_probe_candidate_digest() — it then consults ${DB_FENCE_SCRIPT_COPY} and, with no
-  // pin supplied, returns non-zero, so the run exits 1 and this test fails on `status`.
+  // MUTATION ROUTE: make db_fence_report_candidate_digest() call db_fence_probe_digests() instead
+  // of _fence_probe_assemble() — it then consults ${DB_FENCE_SCRIPT_COPY} for a standing artefact
+  // and reports on a box the command is explicitly not about.
   const root = releaseCheckout()
   try {
     const checkout = join(root, 'checkout')
@@ -289,8 +293,7 @@ function runFirstInstall(
     APP_DIR=${JSON.stringify(checkout)}
     DB_FENCE_STATE=${JSON.stringify(join(root, 'no-fence-state.json'))}
     DB_FENCE_IDENTITY_ARGS=()
-    source ${JSON.stringify(join(REPO, 'scripts/lib/db-fence-protected.sh'))}
-    ${protectedLibraryLinesAt(recovery).join('\n    ')}
+${protectedLibraryLinesAt(recovery).join('\n')}
     DB_FENCE_SCRIPT=${JSON.stringify(join(checkout, 'scripts', 'fence-db-connections.mjs'))}
     DB_HOST=localhost
     DB_PORT=5432
@@ -346,6 +349,7 @@ function firstInstallFixture(): { root: string; digest: string } {
   cpSync(join(REPO, 'scripts/update.sh'), join(release, 'scripts/update.sh'))
   cpSync(join(REPO, 'scripts/lib/db-fence-protected.sh'), join(release, 'scripts/lib/db-fence-protected.sh'))
   cpSync(join(REPO, 'scripts/lib/crontab-lock.sh'), join(release, 'scripts/lib/crontab-lock.sh'))
+  cpSync(join(REPO, 'scripts/lib/cutover-namespace.sh'), join(release, 'scripts/lib/cutover-namespace.sh'))
   cpSync(join(app, 'scripts/fence-db-connections.mjs'), join(release, 'scripts/fence-db-connections.mjs'))
   writeCheckoutPg(release)
   const printed = execFileSync('bash', ['scripts/update.sh', '--print-fence-digest'], {
