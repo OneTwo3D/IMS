@@ -7,7 +7,6 @@ import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
 import { requireInternalUser, requirePermission } from '@/lib/auth/server'
 import {
-  buildProductCategoryPathDisplay,
   buildProductCategoryPathMap,
   buildProductCategoryPathNormalized,
   cleanProductCategoryName,
@@ -323,6 +322,3 @@ async function renameSubtree(
     await tx.productCategory.update({ where: { id }, data: { nameNormalized } })
   }
 }
-
-// Re-export the path-display helper so consumers don't have to reach into lib/products/categories.
-export { buildProductCategoryPathDisplay }

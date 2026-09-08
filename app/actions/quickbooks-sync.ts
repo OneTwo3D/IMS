@@ -49,6 +49,10 @@ async function requireFreshAdmin() {
 // ---------------------------------------------------------------------------
 
 export async function getQuickBooksSettingsMasked(): Promise<QuickBooksSettings & { secretMasked: boolean }> {
+  // o3d-1fel: `sync`, the same gate getXeroSettingsMasked carries. Reads the stored
+  // QuickBooks credential row — masked, but the client id, realm and "a secret is
+  // configured" flag are not.
+  await requireSyncPermission()
   const settings = await getQuickBooksSettings()
   const masked = maskSecret(settings.quickbooks_client_secret)
   return { ...settings, quickbooks_client_secret: masked, secretMasked: !!settings.quickbooks_client_secret }
@@ -184,6 +188,9 @@ export async function getQuickBooksConnectionStatus(): Promise<{
   connected: boolean
   tenantName?: string
 }> {
+  // o3d-1fel: `sync`, the same gate getXeroConnectionStatus carries. Names the
+  // connected accounting tenant.
+  await requireSyncPermission()
   return isConnected()
 }
 
@@ -268,6 +275,10 @@ export async function syncQuickBooksAccounts(): Promise<{ synced: number; errors
 }
 
 export async function getQuickBooksAccounts(): Promise<Array<{ id: string; externalAccountId: string; code: string | null; name: string; type: string }>> {
+  // o3d-1fel: reads the chart of accounts straight out of the database. A single
+  // `return db.<model>.findMany(...)` is NOT a delegating facade — there is no
+  // downstream guard to inherit. Same gate as xero-sync.ts:getAccountingAccounts.
+  await requireSyncPermission()
   return db.accountingAccount.findMany({
     where: { connector: 'quickbooks', active: true },
     select: { id: true, externalAccountId: true, code: true, name: true, type: true },
@@ -276,6 +287,10 @@ export async function getQuickBooksAccounts(): Promise<Array<{ id: string; exter
 }
 
 export async function fetchQuickBooksTaxCodes(): Promise<Array<{ taxType: string; name: string; rate: number }>> {
+  // o3d-1fel: makes a LIVE outbound call to the tenant's QuickBooks company on the
+  // stored token, so leaving it open is request amplification as well as a data
+  // leak. Same gate as xero-sync.ts:fetchXeroTaxRates.
+  await requireSyncPermission()
   const result = await getQuickBooksTaxCodes()
   return result.map((tc) => ({ taxType: tc.id, name: tc.name, rate: 0 }))
 }
@@ -306,6 +321,9 @@ export type QuickBooksSyncLogRow = {
 }
 
 export async function getQuickBooksSyncLogs(limit = 50): Promise<QuickBooksSyncLogRow[]> {
+  // o3d-1fel: `sync`, the same gate getXeroSyncLogs carries. Sync-log rows carry
+  // order references and provider error text.
+  await requireSyncPermission()
   const rows = await db.accountingSyncLog.findMany({
     where: { connector: 'quickbooks' },
     orderBy: { createdAt: 'desc' },
@@ -612,6 +630,9 @@ const REQUIRED_ACCOUNTS: Array<{ key: keyof QuickBooksSettings; label: string }>
 ]
 
 export async function getQuickBooksSyncReadiness(): Promise<QuickBooksSyncReadiness> {
+  // o3d-1fel: `sync`, the same gate getXeroSyncReadiness carries. Reads settings,
+  // connection state and the tax-rate table.
+  await requireSyncPermission()
   const [settings, connStatus, taxRates] = await Promise.all([
     getQuickBooksSettings(),
     isConnected(),
