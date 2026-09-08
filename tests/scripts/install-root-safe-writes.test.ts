@@ -4723,13 +4723,75 @@ test('[o3d-ov60] update.sh copies the git metadata into a directory it created a
     'and it must land the clone metadata inside the directory the link chose')
 })
 
+// ---------------------------------------------------------------------------
+// AND THE PIN HELD ACROSS EVERY OPERATION IT WAS TAKEN FOR (o3d-ov60 r2, Codex CRITICAL)
+//
+// r1 walked into the backup directory with mkdir_service_subdir(), which RESTORES THE WORKING
+// DIRECTORY — and the dump redirection, the publication `mv` and the `rm --` prune then each
+// re-resolved ${BACKUP_DIR} by name. A directory proved at one instant and operated through its
+// name three times afterwards is proved for none of the three. So the block is lifted WHOLE now,
+// from the guard down to the descriptor's close, and the two windows are forced open through call
+// sites the shipped code itself makes: `info` (between the walk and the dump) and
+// `pin_migration_window` (between the dump and the publication and prune). Nothing is spliced into
+// the shipped text to do it.
+// ---------------------------------------------------------------------------
+
 const UPDATE_BACKUP_DIR = shippedUpdateBlock(
   '  BACKUP_DIR_WALK="${BACKUP_DIR%/}"',
-  '  mkdir_service_subdir "${BACKUP_DIR_WALK%/*}" 022 "${BACKUP_DIR_WALK}"',
+  '  exec {BACKUP_DIR_FD}<&-',
 )
 
-/** The line it replaced, which is the mutation. */
-const UPDATE_BACKUP_DIR_RETIRED = '  mkdir -p "${BACKUP_DIR}"'
+/**
+ * THE SEQUENCE update.sh CARRIED UNTIL o3d-ov60 r2, WHICH IS THE MUTATION.
+ *
+ * It is the r1 shape: the same walk, through the twin that gives the working directory back, and
+ * then three operations that each name ${BACKUP_DIR} or ${BACKUP_TARGET} again. It is typed here
+ * rather than lifted because it is no longer in any shipped file — which is exactly what makes it
+ * a mutation and not a second reading of the subject.
+ */
+const UPDATE_BACKUP_DIR_RETIRED = [
+  '  BACKUP_DIR_WALK="${BACKUP_DIR%/}"',
+  '  [[ "${BACKUP_DIR_WALK}" == /*/* ]] || die "not absolute"',
+  '  mkdir_service_subdir "${BACKUP_DIR_WALK%/*}" 022 "${BACKUP_DIR_WALK}"',
+  '  info "Backing up database to ${BACKUP_TARGET}..."',
+  '  BACKUP_PARTIAL="${BACKUP_TARGET}.part"',
+  '  backup_rc=0',
+  '  pg_dump "${MIGRATION_DATABASE_URL}" | gzip > "${BACKUP_PARTIAL}" || { backup_rc=$?; rm -f "${BACKUP_PARTIAL}"; }',
+  '  pin_migration_window "The pre-migration backup"',
+  '  [[ "${backup_rc}" -eq 0 ]] || die "pg_dump did not complete"',
+  '  mv "${BACKUP_PARTIAL}" "${BACKUP_TARGET}"',
+  '  BACKUP_FILE="${BACKUP_TARGET}"',
+  '  ls -t "${BACKUP_DIR}"/pre-update-*.sql.gz 2>/dev/null | tail -n +11 | xargs -r rm --',
+].join('\n')
+
+/** The stamped name the block composes above the lifted region; one literal, both shapes. */
+const BACKUP_TARGET_BASE = 'pre-update-00000000-000000.sql.gz'
+
+/**
+ * The rig both shapes run in.
+ *
+ * `pg_dump` and `gzip` are SHELL FUNCTIONS rather than shims, so the REDIRECTION — the thing under
+ * test — is performed by the same bash that runs the shipped line. What a real pg_dump would add is
+ * bytes; it would not answer "which directory did the `>` reach" any differently.
+ *
+ * `info` and `pin_migration_window` are the two windows. Each defaults to a no-op and a test
+ * replaces the one it is opening, so a rename lands at a point the shipped sequence itself chose
+ * rather than at a line this file inserted.
+ */
+function backupRig(site: string, vars: string[], hooks: string[] = []): string {
+  return rig(['enter_service_subdir', 'mkdir_service_subdir'], [
+    'MIGRATION_DATABASE_URL="postgresql://example/db"',
+    'pg_dump() { printf %s "DUMP-OF-$1"; }',
+    'gzip() { cat; }',
+    'success() { printf "SUCCESS: %s\\n" "$*"; }',
+    'pin_migration_window() { :; }',
+    ...vars,
+    `BACKUP_TARGET="\${BACKUP_DIR}/${BACKUP_TARGET_BASE}"`,
+    ...hooks,
+    site,
+    `echo ${REACHED}`,
+  ].join('\n'))
+}
 
 test('[o3d-ov60] update.sh creates its backup directory by a walk it proves, and dumps nothing through a link', (t) => {
   const plant = (prefix: string) => {
@@ -4744,15 +4806,8 @@ test('[o3d-ov60] update.sh creates its backup directory by a walk it proves, and
     return { backupDir, victim }
   }
 
-  // The dump itself stands in for `pg_dump | gzip > "${BACKUP_TARGET}"`: what is measured is WHICH
-  // DIRECTORY the redirection reaches, and a real pg_dump would answer that question no differently.
-  const script = (site: string, p: ReturnType<typeof plant>) => rig(['enter_service_subdir', 'mkdir_service_subdir'], [
-    `BACKUP_DIR=${q(p.backupDir)}`,
-    'BACKUP_TARGET="${BACKUP_DIR}/pre-update-00000000-000000.sql.gz"',
-    site,
-    'echo DUMP > "${BACKUP_TARGET}"',
-    `echo ${REACHED}`,
-  ].join('\n'))
+  const script = (site: string, p: ReturnType<typeof plant>) =>
+    backupRig(site, [`BACKUP_DIR=${q(p.backupDir)}`])
 
   const shipped = plant('ims-ov60-backup-')
   const run = runBash(script(UPDATE_BACKUP_DIR, shipped))
@@ -4763,14 +4818,178 @@ test('[o3d-ov60] update.sh creates its backup directory by a walk it proves, and
   assert.equal(lstatSync(shipped.backupDir).isSymbolicLink(), true,
     'and the refusal must leave the operator the path to look at')
 
-  // MEASURED BY MUTATION, ROUTE STATED: the bare `mkdir -p` this replaced. It returns 0 on the
-  // planted link and the dump is then written, as root, into whatever it points at.
+  // MEASURED BY MUTATION, ROUTE STATED: the r1 sequence, whose walk is the same one — so what this
+  // exhibits is the OTHER half of it. `mkdir_service_subdir` refuses the link exactly as the walk
+  // does, and this run must therefore refuse too; what it may not do is refuse for a reason the
+  // shipped block does not have. The `mkdir -p` this walk itself replaced is measured by the
+  // ancestry test above, which is where that mutation belongs.
   const mutant = plant('ims-ov60-backup-mutant-')
   const mutated = runBash(script(UPDATE_BACKUP_DIR_RETIRED, mutant))
-  assert.ok(mutated.stdout.includes(REACHED),
-    `\`mkdir -p\` must accept the link and carry on: ${mutated.stdout} ${mutated.stderr}`)
-  assert.deepEqual(readdirSync(mutant.victim), ['pre-update-00000000-000000.sql.gz'],
-    'and the database dump lands in the directory the link chose — which is the finding')
+  assert.equal(mutated.status, 1,
+    `the retired sequence's walk refuses the same link: ${mutated.stdout} ${mutated.stderr}`)
+  assert.deepEqual(readdirSync(mutant.victim), [],
+    'and nothing may be written into the directory the link chose')
+})
+
+/**
+ * A REAL BACKUP DIRECTORY, PLUS THE DIRECTORY A RENAME WOULD SUBSTITUTE FOR IT.
+ *
+ * `decoyContents` is what the substituted directory ALREADY holds when the swap happens. It is what
+ * turns "root's `rm --` ran somewhere" from a claim into a reading: eleven stamped files is one more
+ * than the prune keeps, so a prune aimed at this directory DELETES from it, and a prune aimed at the
+ * descriptor leaves every one of them where it is.
+ */
+function plantSwappableBackupDir(t: TestContext, prefix: string) {
+  const root = createTempDirSync(prefix, t)
+  const parent = join(root, 'var-backups')
+  mkdirSync(parent)
+  const backupDir = join(parent, 'one-two-inventory')
+  const moved = join(parent, 'one-two-inventory-moved')
+  mkdirSync(backupDir)
+  const decoyContents: string[] = []
+  for (let i = 0; i < 11; i += 1) {
+    const name = `pre-update-1999010${i < 10 ? `0${i}` : i}-000000.sql.gz`
+    decoyContents.push(name)
+  }
+  decoyContents.push(`${BACKUP_TARGET_BASE}.part`)
+  /** Plant the decoy's contents once the swap has put it at the name. */
+  const fillDecoy = () => {
+    for (const name of decoyContents) writeFileSync(join(backupDir, name), 'DECOY\n')
+  }
+  /** The swap itself, as a shell statement: the account that owns ${parent} renames and replaces. */
+  const swap = [
+    `${REAL.mv} ${q(backupDir)} ${q(moved)}`,
+    `${REAL.mkdir} ${q(backupDir)}`,
+    ...decoyContents.map((name) => `printf 'DECOY\\n' > ${q(join(backupDir, name))}`),
+  ].join('\n')
+  return { root, parent, backupDir, moved, decoyContents, fillDecoy, swap }
+}
+
+test('[o3d-ov60] a rename between the guard and the DUMP cannot move the dump (the window before it)', (t) => {
+  const run = (site: string, prefix: string) => {
+    const p = plantSwappableBackupDir(t, prefix)
+    // THE WINDOW, OPENED AT A CALL SITE THE SHIPPED SEQUENCE MAKES. `info` is what the block runs
+    // between the walk and the dump; overriding it puts the rename exactly there, deterministically,
+    // which is the only way to exhibit the race from outside the process.
+    const out = runBash(backupRig(site, [`BACKUP_DIR=${q(p.backupDir)}`],
+      [`info() { printf 'INFO: %s\\n' "$*"; ${p.swap}; }`]))
+    return { p, out }
+  }
+
+  const shipped = run(UPDATE_BACKUP_DIR, 'ims-ov60-window1-')
+  // NOT VACUOUS: the swap really happened, so the shipped run met the finding.
+  assert.notEqual(lstatSync(shipped.p.backupDir).ino, lstatSync(shipped.p.moved).ino,
+    'a different directory must now stand at the name the guard checked')
+  assert.equal(shipped.out.status, 0, `the shipped block must complete: ${shipped.out.stdout} ${shipped.out.stderr}`)
+  assert.ok(readdirSync(shipped.p.moved).includes(BACKUP_TARGET_BASE),
+    'the dump must land in the inode the walk proved, which the rename moved but did not change')
+  assert.deepEqual(readdirSync(shipped.p.backupDir).sort(), [...shipped.p.decoyContents].sort(),
+    'and NOTHING may be written into, or deleted from, the directory the rename put at the name')
+
+  // MEASURED BY MUTATION, ROUTE STATED: the r1 sequence. Its walk proves the same directory and
+  // then gives the working directory back, so the redirection below resolves ${BACKUP_TARGET} from
+  // the top and writes the whole database into the directory the rename chose.
+  const mutant = run(UPDATE_BACKUP_DIR_RETIRED, 'ims-ov60-window1-mutant-')
+  assert.ok(readdirSync(mutant.p.backupDir).includes(BACKUP_TARGET_BASE),
+    `THE FINDING: re-resolving the name puts the dump in the substituted directory: ${mutant.out.stdout} ${mutant.out.stderr}`)
+  assert.ok(!readdirSync(mutant.p.moved).includes(BACKUP_TARGET_BASE),
+    'and the directory the guard actually proved never receives it')
+})
+
+test('[o3d-ov60] a rename between the dump and the PUBLICATION and the PRUNE cannot move either', (t) => {
+  const run = (site: string, prefix: string) => {
+    const p = plantSwappableBackupDir(t, prefix)
+    // The second window: `pin_migration_window` is called by the shipped sequence after the dump and
+    // before the `mv` that publishes it and the `rm --` that prunes beside it.
+    const out = runBash(backupRig(site, [`BACKUP_DIR=${q(p.backupDir)}`],
+      [`pin_migration_window() { printf 'PIN: %s\\n' "$*"; ${p.swap}; }`]))
+    return { p, out }
+  }
+
+  const shipped = run(UPDATE_BACKUP_DIR, 'ims-ov60-window2-')
+  assert.notEqual(lstatSync(shipped.p.backupDir).ino, lstatSync(shipped.p.moved).ino,
+    'a different directory must now stand at the name the guard checked')
+  assert.equal(shipped.out.status, 0, `the shipped block must complete: ${shipped.out.stdout} ${shipped.out.stderr}`)
+  assert.ok(readdirSync(shipped.p.moved).includes(BACKUP_TARGET_BASE),
+    'the publication must rename the partial inside the inode the walk proved')
+  assert.ok(!readdirSync(shipped.p.moved).includes(`${BACKUP_TARGET_BASE}.part`),
+    'and the partial must be gone from it, so the restore point ${BACKUP_FILE} names is really there')
+  assert.deepEqual(readdirSync(shipped.p.backupDir).sort(), [...shipped.p.decoyContents].sort(),
+    'and the substituted directory must be untouched: nothing published into it, and — the `rm --` '
+    + 'being the other half of this — not one of its eleven stamped files deleted out of it')
+
+  // MEASURED BY MUTATION, ROUTE STATED: the r1 sequence again. Its `mv` and its `ls | xargs rm --`
+  // both name ${BACKUP_DIR} after the rename, so root publishes inside the substituted directory and
+  // then deletes from it.
+  const mutant = run(UPDATE_BACKUP_DIR_RETIRED, 'ims-ov60-window2-mutant-')
+  const after = readdirSync(mutant.p.backupDir)
+  assert.ok(after.includes(BACKUP_TARGET_BASE),
+    `THE FINDING: root publishes into the directory the rename chose: ${mutant.out.stdout} ${mutant.out.stderr}`)
+  assert.ok(after.length < mutant.p.decoyContents.length,
+    `AND PRUNES IT: root's \`rm --\` ran in the substituted directory (${after.length} of `
+    + `${mutant.p.decoyContents.length} entries left): ${mutant.out.stdout} ${mutant.out.stderr}`)
+})
+
+test('[o3d-ov60] a symlink planted at the partial file inside the proved directory is refused, not written through', (t) => {
+  const plant = (prefix: string) => {
+    const root = createTempDirSync(prefix, t)
+    const parent = join(root, 'var-backups')
+    const victim = join(root, 'victim.sql.gz')
+    mkdirSync(parent)
+    writeFileSync(victim, '')
+    const backupDir = join(parent, 'one-two-inventory')
+    mkdirSync(backupDir)
+    // The predictable name, inside a directory the walk legitimately accepts — which is the case
+    // IMS_BACKUP_DIR reaches: an existing ordinary directory under a path ${APP_USER} owns.
+    symlinkSync(victim, join(backupDir, `${BACKUP_TARGET_BASE}.part`))
+    return { backupDir, victim }
+  }
+
+  const shipped = plant('ims-ov60-part-')
+  const run = runBash(backupRig(UPDATE_BACKUP_DIR, [`BACKUP_DIR=${q(shipped.backupDir)}`]))
+  // NOT VACUOUS: the link is still a link, so the run really met it.
+  assert.equal(lstatSync(shipped.victim).isFile(), true, 'the victim must still be an ordinary file')
+  assert.equal(run.status, 1, `a link at the partial's name must end the run: ${run.stdout} ${run.stderr}`)
+  assert.ok(!run.stdout.includes(REACHED), 'and nothing after it may execute')
+  assert.equal(readFileSync(shipped.victim, 'utf8'), '',
+    'and the database dump may not be written through it')
+
+  // MEASURED BY MUTATION, ROUTE STATED: the r1 redirection, which had no `set -C` — a plain `>` is
+  // open(O_CREAT|O_TRUNC) and follows the link, as root, into whatever it points at.
+  const mutant = plant('ims-ov60-part-mutant-')
+  runBash(backupRig(UPDATE_BACKUP_DIR_RETIRED, [`BACKUP_DIR=${q(mutant.backupDir)}`]))
+  assert.notEqual(readFileSync(mutant.victim, 'utf8'), '',
+    'THE FINDING: without O_EXCL the dump is written through the link, as root')
+})
+
+test('[o3d-ov60] a directory planted at the restore point\'s own name is refused, not published into', (t) => {
+  const plant = (prefix: string) => {
+    const root = createTempDirSync(prefix, t)
+    const backupDir = join(root, 'one-two-inventory')
+    mkdirSync(join(root, 'parent-placeholder'))
+    mkdirSync(backupDir)
+    // A DIRECTORY, not a link: `mv src dst` with dst a directory moves src INSIDE it, so the
+    // published restore point would sit at a path ${BACKUP_FILE} does not name and the operator
+    // would be offered one that is not there. `-T` is what turns that into a refusal.
+    mkdirSync(join(backupDir, BACKUP_TARGET_BASE))
+    return { backupDir }
+  }
+
+  const shipped = plant('ims-ov60-target-dir-')
+  const run = runBash(backupRig(UPDATE_BACKUP_DIR, [`BACKUP_DIR=${q(shipped.backupDir)}`]))
+  assert.equal(run.status, 1, `a directory at the target's name must end the run: ${run.stdout} ${run.stderr}`)
+  assert.ok(!run.stdout.includes(REACHED), 'and nothing after it may execute')
+  assert.deepEqual(readdirSync(join(shipped.backupDir, BACKUP_TARGET_BASE)), [],
+    'and nothing may be moved inside it')
+
+  // MEASURED BY MUTATION, ROUTE STATED: the same shipped line with `-T` taken off it, which is the
+  // spelling every earlier round of this file used.
+  const mutant = plant('ims-ov60-target-dir-mutant-')
+  runBash(backupRig(UPDATE_BACKUP_DIR.replace('mv -f -T --', 'mv -f --'),
+    [`BACKUP_DIR=${q(mutant.backupDir)}`]))
+  assert.deepEqual(readdirSync(join(mutant.backupDir, BACKUP_TARGET_BASE)), [`${BACKUP_TARGET_BASE}.part`],
+    'THE FINDING: without -T the completed dump is moved INSIDE the planted directory, and the '
+    + 'restore point the operator is offered names a path that holds nothing')
 })
 
 // ---------------------------------------------------------------------------

@@ -14074,7 +14074,7 @@ for (const entry of FENCE_HARNESS) {
   //
   // A REGRESSION THIS ROUND INTRODUCED AND THEN CLOSED. Moving each pin ABOVE its propagation put
   // two things below a statement that can now `die`: deploy.sh's `tail -40 "$BUILD_LOG"`, which is
-  // the only place a build's own output is ever shown, and update.sh's `rm -f "${BACKUP_PARTIAL}"`,
+  // the only place a build's own output is ever shown, and update.sh's `rm -f -- "${BACKUP_AT}/${BACKUP_PARTIAL_BASE}"`,
   // which is what stops a truncated dump sitting on disk under a name nothing marks as
   // not-a-restore-point. On a run that ADOPTED a fence, a consumer that fails AND a pin that
   // refuses is one run, and it is the run that needed both answers: it would have printed the
@@ -14649,10 +14649,10 @@ test('a consumer moved into a helper is still in the census, through the call si
 // MUTATION ROUTE (made against the shipped files and reverted): move `tail -40 "$BUILD_LOG" >&2`
 // out of the build statement in deploy.sh and back into an `if [[ "$build_rc" -ne 0 ]]` block below
 // `pin_migration_window "The build"` -- both assertions below fail, naming deploy.sh. The same for
-// `rm -f "${BACKUP_PARTIAL}"` in update.sh.
+// `rm -f -- "${BACKUP_AT}/${BACKUP_PARTIAL_BASE}"` in update.sh.
 for (const [name, lines, consumer, diagnostic] of [
   ['deploy.sh', DEPLOY_LINES, /as_app_user_db npm run build /, 'tail -40 "$BUILD_LOG"'],
-  ['update.sh', UPDATE_LINES, /pg_dump "\$\{MIGRATION_DATABASE_URL\}"/, 'rm -f "${BACKUP_PARTIAL}"'],
+  ['update.sh', UPDATE_LINES, /pg_dump "\$\{MIGRATION_DATABASE_URL\}"/, 'rm -f -- "${BACKUP_AT}/${BACKUP_PARTIAL_BASE}"'],
 ] as ReadonlyArray<[string, string[], RegExp, string]>) {
   test(`${name}: the diagnostic belonging to a failed consumer is inside its own statement, not below the placement (o3d-secops r34)`, () => {
     const call = realCodeLine(lines, consumer)
