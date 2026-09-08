@@ -50,12 +50,21 @@ import {
   WITHHELD_RECHECK_BATCH,
 } from '@/lib/domain/accounting/withheld-reversal-markers'
 import { withPaymentWriteLockOrSkip, isLockSkipped } from './payment-write-lock'
+import {
+  LAG_ALERT_FLOOR_MS,
+  MIN_LAG_PROGRESS_MS,
+  assessCursorLag,
+  describeLagDuration,
+  readCursorLagSetting,
+} from './payment-poll-lag'
 
 import {
   advanceCheckpoint,
   CURSOR_OVERLAP_MS,
   drainInvoicesModifiedSince,
   idsWhere,
+  MAX_REQUESTS_PER_POLL,
+  parsePersistedDrainHint,
   listedLedgerPaymentIds,
   parseLedgerAmount,
   xeroInvoiceCurrency,
@@ -709,6 +718,18 @@ type PollResult = {
    */
   withheldRechecked: number
   withheldResolved: number
+  /**
+   * o3d-pzu0 — WHAT THIS POLL COST, AND HOW FAR BEHIND IT LEFT THE CURSOR.
+   *
+   * The request budget has always counted the spend and `spent()` was surfaced nowhere, so "is the
+   * tenant's Xero quota the problem?" could not be answered from a run at all. `cursorLagMs` is the
+   * other half: the gap between the poll's own start and the cursor it leaves behind, which is the
+   * number that says whether the drain is keeping up. Both are reported rather than merely logged,
+   * because the issue's remaining ask — size the per-poll allocation above supported ingress — is a
+   * product decision that needs a few weeks of exactly these two figures.
+   */
+  xeroRequests: number
+  cursorLagMs: number
   errors: string[]
   skipped?: string
 }
@@ -1437,6 +1458,10 @@ export async function pollXeroPayments(): Promise<PollResult> {
       salesPaid: 0, billsPaid: 0, salesReversed: 0, billsReversed: 0,
       salesReversalsWithheld: 0, billReversalsWithheld: 0,
       withheldRechecked: 0, withheldResolved: 0,
+      // A skipped poll asked Xero nothing and moved no cursor, so it spent nothing and is
+      // responsible for no lag. Reported as zeros rather than omitted: an absent number would have
+      // to be guessed at by every reader.
+      xeroRequests: 0, cursorLagMs: 0,
       errors: [], skipped: 'backlog reconcile held the payment-write lock',
     }
   }
@@ -1448,6 +1473,7 @@ async function pollXeroPaymentsLocked(): Promise<PollResult> {
     salesPaid: 0, billsPaid: 0, salesReversed: 0, billsReversed: 0,
     salesReversalsWithheld: 0, billReversalsWithheld: 0,
     withheldRechecked: 0, withheldResolved: 0,
+    xeroRequests: 0, cursorLagMs: 0,
     errors: [] as string[],
   }
 
@@ -1511,6 +1537,21 @@ async function pollXeroPaymentsLocked(): Promise<PollResult> {
   }
 
   let checkpoint = lastPollDate
+
+  // o3d-pzu0 — WHAT THE LAST POLL LEARNED ABOUT THIS WINDOW.
+  //
+  // Every poll opened with an unbounded whole-window walk, and a poll RESUMING a drain spent up to
+  // MAX_PAGES+1 of them re-establishing what the previous one already knew: this window is
+  // oversized. Against the tenant's shared daily allowance that is pure waste on exactly the polls
+  // that can least afford it.
+  //
+  // Keyed to the cursor it was written against and refused otherwise, so a hint can never describe a
+  // window other than the one about to be read. The drain still PROBES rather than trusting it.
+  const drainHint = parsePersistedDrainHint(
+    (await db.setting.findUnique({ where: { key: 'xero_payment_poll_drain' }, select: { value: true } }))?.value,
+    lastPollDate.toISOString(),
+  )
+
   const drain = await drainInvoicesModifiedSince(
     since,
     pollStartedAt,
@@ -1546,9 +1587,80 @@ async function pollXeroPaymentsLocked(): Promise<PollResult> {
     // Real HTTP attempts, not fetcher invocations: xeroGet retries a 429 internally, so one
     // invocation can be several tenant API calls (o3d-8f9 r3).
     xeroHttpAttemptCount,
+    drainHint ?? undefined,
   )
 
   if (!drain.ok) result.errors.push(`Xero invoice fetch failed: ${drain.error}`)
+
+  // o3d-pzu0 — MEASURE THE POLL, THEN DECIDE WHETHER THE DRAIN IS CONVERGING.
+  //
+  // `checkpoint` is the cursor this poll leaves behind: `lastPollDate` if nothing advanced it, or
+  // the `through` of the last chunk that did. The gap between it and the moment the poll started is
+  // the backlog still owed — the one number that says whether the drain is keeping up, and the one
+  // nothing has ever recorded.
+  result.xeroRequests = drain.requests
+  result.cursorLagMs = Math.max(0, pollStartedAt.getTime() - checkpoint.getTime())
+
+  // Carry the hint forward, keyed to the cursor this poll is LEAVING — which is the cursor the next
+  // poll will read. Cleared when the drain finished, and only written when there is something to
+  // say: a healthy poll that never had a hint must not create a settings row per run.
+  if (drain.hint) {
+    const value = JSON.stringify({ cursor: checkpoint.toISOString(), spanMs: drain.hint.spanMs })
+    await db.setting.upsert({
+      where: { key: 'xero_payment_poll_drain' },
+      create: { key: 'xero_payment_poll_drain', value },
+      update: { value },
+    })
+  } else if (drainHint !== null) {
+    // The drain completed. Blanked rather than deleted so this needs no second Prisma verb on a path
+    // that already has one, and `parsePersistedDrainHint` reads a blank as absent.
+    await db.setting.upsert({
+      where: { key: 'xero_payment_poll_drain' },
+      create: { key: 'xero_payment_poll_drain', value: '' },
+      update: { value: '' },
+    })
+  }
+
+  const previousLag = readCursorLagSetting(
+    (await db.setting.findUnique({ where: { key: 'xero_payment_poll_lag' }, select: { value: true } }))?.value,
+  )
+  const lag = assessCursorLag(previousLag, result.cursorLagMs)
+
+  // Written unless there is genuinely nothing to remember: no history, and a lag inside the normal
+  // steady state. Persisting there would create a row per healthy poll saying only "all is well",
+  // and — because this runs on every poll — would make the cursor-write assertions elsewhere read a
+  // setting write that has nothing to do with the cursor.
+  if (previousLag !== null || lag.next.lagMs >= LAG_ALERT_FLOOR_MS) {
+    const value = JSON.stringify(lag.next)
+    await db.setting.upsert({
+      where: { key: 'xero_payment_poll_lag' },
+      create: { key: 'xero_payment_poll_lag', value },
+      update: { value },
+    })
+  }
+
+  if (lag.escalate) {
+    // A DIFFERENT ACTION AT A DIFFERENT LEVEL from `xero_payment_poll_backlog_draining`, which is
+    // the whole point. That one is emitted by a drain that is working through a bulk edit and will
+    // be finished in three polls, so an operator who has seen it before has learned it means "it is
+    // working" — and a drain that will NEVER finish was emitting the identical line.
+    await logActivity({
+      entityType: 'SYSTEM',
+      action: 'xero_payment_poll_lag_not_converging',
+      tag: 'sync',
+      level: 'ERROR',
+      description:
+        `Xero payment polling is running but NOT catching up: the cursor is ${describeLagDuration(lag.next.lagMs)} ` +
+        `behind and ${lag.next.stalledPolls} consecutive polls have failed to remove ` +
+        `${describeLagDuration(MIN_LAG_PROGRESS_MS)} of that. Payments are still being detected, but ` +
+        `${describeLagDuration(lag.next.lagMs)} late, and the delay is not shrinking on its own. This poll spent ` +
+        `${drain.requests} Xero request(s) of the ${MAX_REQUESTS_PER_POLL} it may use per run. Either ` +
+        `invoice changes are arriving faster than one poll can drain, or the drain is failing and ` +
+        `holding the cursor — check for a companion cursor_held error (o3d-pzu0).`,
+      metadata: { ...result, stalledPolls: lag.next.stalledPolls, progressMs: lag.progressMs },
+      resolveUser: false,
+    })
+  }
 
   if (result.errors.length > 0) {
     await logActivity({

@@ -53,6 +53,25 @@ const state = {
   salesOrderUpdates: [] as { id: unknown; data: Row }[],
   /** Every cursor write the drain made. Empty means the chunk was NOT checkpointed. */
   settingUpserts: [] as unknown[],
+  /**
+   * o3d-pzu0: how far behind the persisted cursor is when the poll starts. The default is the
+   * ordinary case — one minute, i.e. no backlog. A test that wants a backlog moves it.
+   */
+  lastPollCursorAgeMs: 60_000,
+  /** o3d-pzu0: the persisted `xero_payment_poll_lag` reading, or null for "never recorded". */
+  lagState: null as { lagMs: number; stalledPolls: number } | null,
+  /** o3d-pzu0: the persisted `xero_payment_poll_drain` hint, verbatim, or null for "none". */
+  drainHint: null as string | null,
+  /**
+   * o3d-pzu0: the instant the poll cursor is measured back from, FROZEN at reset().
+   *
+   * It used to be `Date.now()` evaluated inside the setting double, so the cursor string differed by
+   * a millisecond or two between the test that seeded a hint against it and the poll that read it —
+   * and `parsePersistedDrainHint` correctly refused the mismatch. That made the clearing test pass
+   * only when both calls landed in the same millisecond: a 50% flake, and one that would have been
+   * blamed on the production code.
+   */
+  cursorBaseMs: Date.now(),
   /** Set to make the activity-log / notification write REPORT failure, as the real ones do. */
   activityWriteFails: false,
   notificationWriteFails: false,
@@ -120,6 +139,11 @@ async function withHostClockSkew<T>(skewMs: number, fn: () => Promise<T>): Promi
   }
 }
 
+/** The cursor the poll will read, to the millisecond — so a test can key a hint to exactly it. */
+function currentCursorIso(): string {
+  return new Date(state.cursorBaseMs - state.lastPollCursorAgeMs).toISOString()
+}
+
 function reset(): void {
   state.invoices = []
   state.salesOrders = []
@@ -135,6 +159,10 @@ function reset(): void {
   state.syncLogUpdates = []
   state.salesOrderUpdates = []
   state.settingUpserts = []
+  state.lastPollCursorAgeMs = 60_000
+  state.lagState = null
+  state.drainHint = null
+  state.cursorBaseMs = Date.now()
   state.activityWriteFails = false
   state.notificationWriteFails = false
   state.dbClockSkewMs = 0
@@ -374,7 +402,21 @@ const dbDouble: Record<string, unknown> = {
     },
   },
   setting: {
-    findUnique: async () => ({ key: 'xero_last_payment_poll', value: new Date(Date.now() - 60_000).toISOString() }),
+    // o3d-pzu0: KEY-AWARE. It used to answer every findUnique with the poll cursor, whatever was
+    // asked for — so a second setting (the lag reading) would have been handed a date string and
+    // parsed as garbage, and a test could not tell the two reads apart.
+    findUnique: async ({ where }: { where: { key: string } }) => {
+      if (where.key === 'xero_last_payment_poll') {
+        return { key: where.key, value: currentCursorIso() }
+      }
+      if (where.key === 'xero_payment_poll_lag') {
+        return state.lagState === null ? null : { key: where.key, value: JSON.stringify(state.lagState) }
+      }
+      if (where.key === 'xero_payment_poll_drain') {
+        return state.drainHint === null ? null : { key: where.key, value: state.drainHint }
+      }
+      return null
+    },
     upsert: async (args: unknown) => { state.settingUpserts.push(args); return {} },
   },
   user: { findMany: async () => [{ id: 'admin_1' }] },
@@ -1650,4 +1692,187 @@ test('[o3d-psrx] a REFUND receipt is not an invoice receipt and does not withhol
 
   assert.deepEqual(state.chargebacks, ['so_1'])
   assert.equal(result.salesReversalsWithheld, 0)
+})
+
+// ---------------------------------------------------------------------------
+// o3d-pzu0 — a drain that never catches up must stop looking like a healthy one
+// ---------------------------------------------------------------------------
+//
+// MAX_CHUNKS_PER_POLL * MAX_PAGES * PAGE_SIZE caps unique progress per run, so at sustained ingress
+// at or above that rate the cursor lag cannot shrink and payment detection is delayed indefinitely.
+// The only signal was `xero_payment_poll_backlog_draining` at WARNING — which a drain that IS
+// catching up emits too, so an operator has learned it means "it is working".
+
+/** A page Xero cannot answer whole: every request comes back full, so the window always overflows. */
+function overflowingPage(): XeroInvoice[] {
+  return Array.from({ length: 100 }, (_, i) => ({
+    InvoiceID: `XOVER${i}`,
+    Type: 'ACCREC' as const,
+    Status: 'AUTHORISED',
+    AmountPaid: 0,
+    AmountDue: 100,
+  }))
+}
+
+const SIX_HOURS_MS = 6 * 60 * 60_000
+
+function lagEscalations(): LoggedActivity[] {
+  return state.activity.filter((entry) => entry.action === 'xero_payment_poll_lag_not_converging')
+}
+
+function lagUpserts(): Array<{ where: { key: string }; update: { value: string } }> {
+  return state.settingUpserts.filter(
+    (u): u is { where: { key: string }; update: { value: string } } =>
+      typeof u === 'object' && u !== null && (u as { where?: { key?: string } }).where?.key === 'xero_payment_poll_lag',
+  )
+}
+
+test('o3d-pzu0: a drain stalled for LAG_STALL_POLLS polls escalates at ERROR, not as another draining WARNING', async () => {
+  reset()
+  state.invoices = overflowingPage()
+  state.lastPollCursorAgeMs = SIX_HOURS_MS
+  // Three consecutive polls have already failed to remove a minute of lag; this is the fourth.
+  state.lagState = { lagMs: SIX_HOURS_MS, stalledPolls: 3 }
+
+  await poll()
+
+  const escalations = lagEscalations()
+  assert.equal(escalations.length, 1, `expected one escalation, got ${JSON.stringify(state.activity.map((a) => a.action))}`)
+  assert.equal(escalations[0].level, 'ERROR', 'a different LEVEL from the draining WARNING, deliberately')
+  assert.match(String(escalations[0].description), /not converging|not catching up/i)
+})
+
+test('o3d-pzu0: the same stall with NO prior reading does not escalate — one reading is not a trend', async () => {
+  reset()
+  // Null-totality control. The first poll after a deploy sees a six-hour backlog and knows nothing
+  // about whether it is shrinking; escalating there would fire on every fresh install.
+  state.invoices = overflowingPage()
+  state.lastPollCursorAgeMs = SIX_HOURS_MS
+  state.lagState = null
+
+  await poll()
+
+  assert.deepEqual(lagEscalations(), [], 'nothing to compare against yet')
+  assert.equal(lagUpserts().length, 1, 'but the reading IS recorded, so the next poll can compare')
+  assert.deepEqual(
+    JSON.parse(lagUpserts()[0].update.value),
+    { lagMs: JSON.parse(lagUpserts()[0].update.value).lagMs, stalledPolls: 0 },
+    'and it starts the counter at zero',
+  )
+})
+
+test('o3d-pzu0: a healthy poll clears a stall counter it inherited, and never escalates', async () => {
+  reset()
+  // The CONTROL that stops this becoming an alarm nobody can silence: a drain that catches up must
+  // put the counter back, or the next blip escalates instantly.
+  state.invoices = []
+  state.lastPollCursorAgeMs = 60_000
+  state.lagState = { lagMs: SIX_HOURS_MS, stalledPolls: 10 }
+
+  await poll()
+
+  assert.deepEqual(lagEscalations(), [])
+  const written = lagUpserts()
+  assert.equal(written.length, 1, 'the cleared counter is persisted, not just decided')
+  assert.equal(JSON.parse(written[0].update.value).stalledPolls, 0)
+})
+
+test('o3d-pzu0: the poll reports what it SPENT and how far behind it is', async () => {
+  reset()
+  // budget.spent() was never surfaced anywhere, so "is the quota the problem?" was unanswerable
+  // from a run — and the issue's third ask (size the allocation above supported ingress) cannot be
+  // decided without it.
+  state.invoices = overflowingPage()
+  state.lastPollCursorAgeMs = SIX_HOURS_MS
+
+  const result = await poll()
+
+  assert.ok(result.xeroRequests > 1, `a chunking poll spends many requests, got ${result.xeroRequests}`)
+  assert.ok(
+    result.cursorLagMs >= SIX_HOURS_MS,
+    `the cursor is still six hours behind, got ${result.cursorLagMs}`,
+  )
+})
+
+function drainUpserts(): Array<{ where: { key: string }; update: { value: string } }> {
+  return state.settingUpserts.filter(
+    (u): u is { where: { key: string }; update: { value: string } } =>
+      typeof u === 'object' && u !== null && (u as { where?: { key?: string } }).where?.key === 'xero_payment_poll_drain',
+  )
+}
+
+test('o3d-pzu0: a poll that could not finish an oversized window records the hint for the next one', async () => {
+  reset()
+  state.invoices = overflowingPage()
+  state.lastPollCursorAgeMs = SIX_HOURS_MS
+
+  await poll()
+
+  const written = drainUpserts()
+  assert.equal(written.length, 1, 'the hint is persisted, not merely returned')
+  const hint = JSON.parse(written[0].update.value)
+  assert.equal(typeof hint.spanMs, 'number')
+  assert.ok(hint.spanMs > 0, 'and carries a usable chunk width')
+  // KEYED TO THE CURSOR THIS POLL LEAVES, which is the one the next poll will read. Keyed to the
+  // cursor it STARTED from, the next poll would refuse its own hint every time.
+  assert.equal(typeof hint.cursor, 'string')
+  assert.ok(Number.isFinite(Date.parse(hint.cursor)), `the cursor must be a readable date, got ${hint.cursor}`)
+  // This drain checkpointed NOTHING (it failed to subdivide), so the cursor it leaves is the one it
+  // started from — six hours ago, not the poll's own start. Pinned as a real value rather than a
+  // shape: the first version of this assertion compared hint.cursor with an expression containing
+  // hint.cursor, which is true whatever the code does.
+  const startedFrom = Date.parse(currentCursorIso())
+  assert.ok(
+    Math.abs(Date.parse(hint.cursor) - startedFrom) < 60_000,
+    `expected the hint keyed to the unmoved cursor ~${new Date(startedFrom).toISOString()}, got ${hint.cursor}`,
+  )
+})
+
+test('o3d-pzu0: a poll that finishes CLEARS a hint it inherited', async () => {
+  // A stale hint would make every later poll pay a sentinel probe for a window that has fitted
+  // whole for a week — the same waste this fix removes, arriving from the other direction.
+  reset()
+  state.invoices = []
+  state.lastPollCursorAgeMs = 60_000
+  state.drainHint = JSON.stringify({ cursor: currentCursorIso(), spanMs: 120_000 })
+
+  await poll()
+
+  const written = drainUpserts()
+  assert.equal(written.length, 1, 'the stale hint is written away')
+  assert.equal(written[0].update.value, '', 'blanked, which reads back as absent')
+})
+
+test('o3d-pzu0: a healthy poll with no hint writes no drain setting at all', async () => {
+  // The control that keeps this from becoming a settings write per poll.
+  reset()
+  state.invoices = []
+  state.lastPollCursorAgeMs = 60_000
+  state.drainHint = null
+
+  await poll()
+
+  assert.deepEqual(drainUpserts(), [])
+})
+
+test('o3d-pzu0: the poll actually HANDS the hint to the drain', async () => {
+  // Persisting and clearing a hint nobody passes on would be bookkeeping, not a fix — and the tests
+  // above pass either way. The observable difference is one sentinel probe: with a hint the drain
+  // asks "is this still oversized?" before the unbounded walk, so a healthy window costs two
+  // requests instead of one.
+  reset()
+  state.invoices = []
+  state.lastPollCursorAgeMs = 60_000
+  await poll()
+  const withoutHint = state.attempts
+
+  reset()
+  state.invoices = []
+  state.lastPollCursorAgeMs = 60_000
+  state.drainHint = JSON.stringify({ cursor: currentCursorIso(), spanMs: 120_000 })
+  await poll()
+  const withHint = state.attempts
+
+  assert.equal(withoutHint, 1, 'the hot path is still ONE unbounded request')
+  assert.equal(withHint, withoutHint + 1, 'and a hint adds exactly the one sentinel probe')
 })
