@@ -1667,12 +1667,24 @@ export async function persistAccountingReconciliationReport(
   return client.$transaction ? client.$transaction(persist) : persist(client)
 }
 
+/**
+ * A run as this reader hands it out: the row, plus the INTERPRETATION of its completeness column.
+ *
+ * o3d-11rf r6 — the raw `truncations` is still there, because the run view renders the sentinel
+ * messages, but nothing downstream has to know that NULL is not `[]` in order to be right about it.
+ * A caller that wants "was this run complete?" reads `completeness.state`; the only way left to get
+ * that wrong is to ignore this field and re-derive it from the raw column, which greps.
+ */
+export type ListedAccountingReconciliationRun = PersistedAccountingReconciliationRun & {
+  completeness: AccountingReconciliationCompleteness
+}
+
 export async function listAccountingReconciliationRuns(
   client: AccountingReconciliationPersistenceClient = db as unknown as AccountingReconciliationPersistenceClient,
   options: { limit?: number; includeFindings?: boolean } = {},
-): Promise<PersistedAccountingReconciliationRun[]> {
+): Promise<ListedAccountingReconciliationRun[]> {
   const take = Math.min(Math.max(options.limit ?? 25, 1), MAX_RECONCILIATION_LIST_RUNS)
-  return client.accountingReconciliationRun.findMany({
+  const runs = await client.accountingReconciliationRun.findMany({
     orderBy: { createdAt: 'desc' },
     take,
     include: options.includeFindings
@@ -1685,6 +1697,8 @@ export async function listAccountingReconciliationRuns(
         }
       : { _count: { select: { findings: true } } },
   })
+
+  return runs.map((run) => ({ ...run, completeness: readReconciliationCompleteness(run.truncations) }))
 }
 
 export type AccountingReconciliationFindingStatusUpdate = {

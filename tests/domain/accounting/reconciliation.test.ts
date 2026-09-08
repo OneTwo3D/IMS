@@ -1984,3 +1984,52 @@ test('o3d-11rf r6: what a persisted run records is what the reader reads back', 
   assert.equal(readReconciliationCompleteness(clean.truncations).state, 'complete',
     'and a run with nothing to report reads back as proven complete, not as unknown')
 })
+
+test('o3d-11rf r6: the list reader hands out the reading, so its callers cannot re-derive it wrongly', async () => {
+  // THE OTHER READER OF THE SAME COLUMN. /api/admin/accounting/reconciliation/runs serialises what
+  // this function returns straight to its caller. It drew no conclusion of its own, which made it
+  // correct and made it the next place the NULL-versus-[] rule could be missed. It now cannot be:
+  // the answer travels with the row.
+  const { client } = persistenceClient()
+  const capReached: AccountingReconciliationFinding = {
+    severity: 'warning',
+    code: RECONCILIATION_ROW_CAP_REACHED,
+    message: 'Accounting reconciliation reached the 10000 row cap for salesOrders; report may be incomplete',
+    details: { dataset: 'salesOrders', scanned: 10_000, limit: 10_000 },
+  }
+  await persistAccountingReconciliationReport(reportOf([capReached]), client as never)
+  const [listed] = await listAccountingReconciliationRuns(client as never, { limit: 10 })
+
+  assert.equal(listed.completeness.state, 'truncated')
+  assert.deepEqual(listed.completeness.truncations?.map((entry) => entry.code), [RECONCILIATION_ROW_CAP_REACHED])
+  assert.deepEqual(listed.truncations, [{
+    code: RECONCILIATION_ROW_CAP_REACHED,
+    message: capReached.message,
+    details: capReached.details,
+  }], 'the raw column is still there, because the run view renders these messages')
+})
+
+test('o3d-11rf r6: a run row the list reader finds with no completeness recorded is unknown, not clean', async () => {
+  // A row written by the predecessor binary, reached through the reader an operator's run list uses.
+  const client = {
+    accountingReconciliationRun: {
+      create: async () => { throw new Error('not used') },
+      findMany: async () => [
+        { id: 'legacy-run', fromDate: null, toDate: null, status: 'COMPLETED', totalCount: 0,
+          warningCount: 0, criticalCount: 0, createdAt: new Date('2026-05-01T10:00:00.000Z'),
+          truncations: null, _count: { findings: 0 } },
+      ],
+    },
+    accountingReconciliationFinding: {
+      createMany: async () => ({ count: 0 }),
+      findUnique: async () => null,
+      update: async () => { throw new Error('not used') },
+    },
+  }
+
+  const [listed] = await listAccountingReconciliationRuns(client as never, { limit: 10 })
+
+  assert.equal(listed.completeness.state, 'unknown',
+    'zero findings and a NULL column is a run nobody checked, not a run with nothing wrong')
+  assert.equal(isReconciliationProvenComplete(listed.completeness), false)
+})
