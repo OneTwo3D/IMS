@@ -49,7 +49,6 @@ async function requireFreshAdmin() {
 export type WcSyncSettings = {
   wc_sync_enabled: string
   wc_sync_order_statuses: string
-  wc_sync_interval_minutes: string
   wc_sync_product_enabled: string
   wc_sync_product_direction: string
   wc_stock_sync_enabled: string
@@ -72,8 +71,25 @@ export type WcSyncSettings = {
   envOverrides: Record<string, string>
 }
 
+/**
+ * o3d-potv: `wc_sync_interval_minutes` USED TO BE HERE, and nothing ever read it.
+ *
+ * It was typed, defaulted to '5', saved by `saveWcSyncSettings` and rendered as an editable
+ * "Polling interval (minutes)" input — while the cadence that actually decides when
+ * WooCommerce is polled is the `wc-reconcile` cron schedule (lib/cron-jobs/woocommerce.ts,
+ * `0 4 * * *` by default), stored as `cron_wc_reconcile_schedule` and edited in
+ * Settings -> System -> Scheduler. An operator who set five minutes after a webhook outage
+ * got a daily 04:00 sweep and was told nothing.
+ *
+ * It is REMOVED rather than wired up. The cron registry genuinely owns this fact — schedule,
+ * enable flag and crontab sync all hang off it — so a second minutes field would be a second
+ * writer of one value with no defined precedence, and the job it would have to drive polls
+ * orders, releases held sales invoices, polls products and reconciles stock, none of which an
+ * "order polling interval" can express. Dropping the key from this list is also what makes a
+ * stale client's posted value a no-op rather than a silently stored one.
+ */
 const SYNC_SETTING_KEYS = [
-  'wc_sync_enabled', 'wc_sync_order_statuses', 'wc_sync_interval_minutes',
+  'wc_sync_enabled', 'wc_sync_order_statuses',
   'wc_sync_product_enabled', 'wc_sync_product_direction', 'wc_stock_sync_enabled', 'wc_cogs_sync_enabled',
   'wc_webhook_secret', 'wc_webhook_last_received_at', 'wc_order_webhook_last_received_at', 'wc_product_webhook_last_received_at',
   'last_wc_order_sync_at', 'last_wc_order_reconcile_at', 'last_wc_product_sync_at', 'last_wc_product_reconcile_at', 'last_wc_stock_sync_at',
@@ -101,7 +117,6 @@ const MACHINE_MANAGED_SYNC_KEYS = new Set<string>([
 const SYNC_DEFAULTS: WcSyncSettings = {
   wc_sync_enabled: 'false',
   wc_sync_order_statuses: '["processing"]',
-  wc_sync_interval_minutes: '5',
   wc_sync_product_enabled: 'false',
   wc_sync_product_direction: 'from_wc',
   wc_stock_sync_enabled: 'false',

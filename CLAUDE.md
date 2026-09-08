@@ -508,10 +508,13 @@ Copy `.env.example` to `.env` and configure. Uses **NextAuth.js v5** variable na
 > `WC_WEBHOOK_SECRET` / `WC_INVOICE_PDF_SECRET` **are** runtime overrides; the Connection tab shows
 > an "overridden by" banner while one is set.
 
-> Which order statuses import, webhooks vs polling, and the poll interval are **not** environment
-> variables. They are application settings edited in Settings -> Sync -> WooCommerce and stored in
-> the `settings` table (`wc_sync_order_statuses`, `wc_sync_interval_minutes`); the importer reads
-> them from the database. `WC_SYNC_STATUSES`, `WC_USE_WEBHOOKS` and `WC_POLL_INTERVAL_MINUTES` were
+> Which order statuses import is **not** an environment variable. It is an application setting
+> edited in Settings -> Sync -> WooCommerce and stored in the `settings` table
+> (`wc_sync_order_statuses`); the importer reads it from the database. The POLL CADENCE is neither
+> an env var nor a sync setting: it is the `wc-reconcile` cron schedule
+> (`cron_wc_reconcile_schedule`, default `0 4 * * *`), edited in Settings -> System -> Scheduler.
+> `wc_sync_interval_minutes` was a settings field offering a minutes box that no code read, and was
+> removed for that reason (o3d-potv). `WC_SYNC_STATUSES`, `WC_USE_WEBHOOKS` and `WC_POLL_INTERVAL_MINUTES` were
 > documented here and read by nothing (o3d-tj6v) - setting them silently changed nothing.
 
 > `wc_sync_order_statuses` decides which orders IMS **takes on**. It governs every route that
