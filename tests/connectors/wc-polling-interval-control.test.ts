@@ -258,6 +258,23 @@ function collectControls(sf: ts.SourceFile, root: ts.Node = sf): Control[] {
   return found
 }
 
+/**
+ * Everything an operator actually READS inside a block: prose included this time, because the
+ * question is what reaches the page. JSX comments are `JsxExpression` nodes with no expression,
+ * so they contribute nothing here either — a job name that survives only in a comment cannot
+ * satisfy a requirement that the page name it.
+ */
+function renderedTextOf(node: ts.Node): string {
+  let out = ''
+  const visit = (n: ts.Node) => {
+    if (ts.isJsxText(n)) out += ` ${n.text}`
+    else if (ts.isStringLiteral(n) && n.parent && ts.isJsxExpression(n.parent)) out += ` ${n.text}`
+    n.forEachChild(visit)
+  }
+  visit(node)
+  return out.replace(/\s+/g, ' ').trim()
+}
+
 /** Every element in the tree, so a landmark can be located structurally. */
 function findElements(root: ts.Node, predicate: (node: ts.Node) => boolean): ts.Node[] {
   const found: ts.Node[] = []
@@ -408,9 +425,14 @@ test('o3d-potv: no editable control on the sync page sets a polling cadence, and
   assert.match(src, /wc_sync_interval_minutes/, 'the gravestone comment is worth more than a grep-clean file')
   assert.match(src, /editable minutes input/)
 
-  // Naming the job and the page is the whole remedy: an operator who came here to speed the
-  // sweep up has to leave knowing where the cadence actually lives.
-  assert.match(src, /WooCommerce Reconcile/)
+  // (4) Naming the job is the other half of the remedy: an operator who came here to speed the
+  // sweep up has to leave knowing where the cadence actually lives. Asserted against what the
+  // cadence block RENDERS, not against the file — the same rule the rest of this test obeys, and
+  // a job name left only in a comment (which is where this file's removed key now lives) tells
+  // an operator nothing.
+  const cadenceText = renderedTextOf(cadenceBlock.block)
+  assert.ok(cadenceText.length > 80, `the cadence block should render a statement, got ${cadenceText.length} chars`)
+  assert.match(cadenceText, /WooCommerce Reconcile/)
 })
 
 test('o3d-potv: every operator-facing pointer at the WooCommerce polling cadence names a page that exists', async () => {
@@ -475,7 +497,12 @@ test('o3d-potv: the WooCommerce help doc describes the cadence as a pointer, nev
       /Settings → System → Scheduler/,
       `the "${bullet.name}" bullet must name the page that does own the cadence`,
     )
+    // Scoped to the bullet for the same reason: a file-wide match is satisfied by any of the
+    // dozen other mentions of the job elsewhere in this document.
+    assert.match(
+      bullet.body,
+      /WooCommerce Reconcile/,
+      `the "${bullet.name}" bullet must name the schedule that does set the cadence`,
+    )
   }
-
-  assert.match(doc, /WooCommerce Reconcile/)
 })
