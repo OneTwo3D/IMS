@@ -589,3 +589,41 @@ test('o3d-g42a: provision-ims-tenant.sh ANSWERS the rate-limit question for ever
   ))
   assert.equal(backendIn(disabledAnswers.value), 'memory', 'a tenant with Redis disabled is not enrolled by a reachable URL')
 })
+
+// ---------------------------------------------------------------------------
+// The .env heredoc is UNQUOTED, and that is a trap for whoever edits it next.
+// ---------------------------------------------------------------------------
+
+test('the .env heredoc contains no command substitution, in a comment or anywhere else', async () => {
+  // FOUND BY WRITING IT. The comment added above `RATE_LIMIT_BACKEND` originally read
+  // "written by the installer as `redis` ONLY" — with markdown-style backticks, as every other
+  // comment in this codebase is written. `render_app_env_file` is `cat <<EOF` with an UNQUOTED
+  // delimiter, so bash ran `redis` as a command, the shipped comment came out as "as  ONLY", and
+  // a "redis: command not found" went to the installer's stderr. Every test in this file still
+  // passed, because they all read the KEY=VALUE lines.
+  //
+  // A comment is the dangerous place for it precisely because it looks inert. The rule is about
+  // the whole rendered file rather than about comments: the heredoc must interpolate VARIABLES,
+  // which is what it is for, and must never RUN anything, because the only inputs it could run are
+  // credentials and operator-supplied strings.
+  //
+  // `${...}` is deliberately still allowed — that is the mechanism the file is built on. `$(...)`
+  // and backticks are not.
+  const src = await installSource()
+  const body = shippedFunction(src, 'render_app_env_file')
+  const offenders = body
+    .split('\n')
+    .map((line, index) => ({ line, number: index + 1 }))
+    .filter(({ line }) => line.includes('`') || line.includes('$('))
+
+  assert.deepEqual(
+    offenders, [],
+    'render_app_env_file() is an unquoted heredoc, so a backtick or $( in ANY line — including a '
+    + 'comment — is executed while the .env is being built. Write it without them.',
+  )
+
+  // The precondition, so that a rename or a refactor cannot turn this into a check of an empty
+  // string that passes by finding nothing at all.
+  assert.ok(body.split('\n').length > 30, 'precondition: the heredoc body was actually found')
+  assert.ok(body.includes('${RATE_LIMIT_BACKEND}'), 'precondition: and it is the one that carries the setting')
+})

@@ -8835,7 +8835,7 @@ AUTH_URL=https://${APP_DOMAIN}
 REDIS_URL=${REDIS_URL}
 REDIS_PASSWORD=${REDIS_PASSWORD_ENV}
 REDIS_KEY_PREFIX=${REDIS_KEY_PREFIX}
-# memory (per-process) or redis (shared across replicas). Written by the installer as `redis` ONLY
+# memory (per-process) or redis (shared across replicas). Written by the installer as redis ONLY
 # when the operator opted in AND the REDIS_URL above answered PING at install time (o3d-g42a). Do
 # not set it to redis by hand without checking that Redis answers: the login rate-limit buckets
 # fail closed, so an unreachable backend here is a sign-in lockout, not a slower login page.
