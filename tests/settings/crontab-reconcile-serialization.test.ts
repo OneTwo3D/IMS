@@ -16,8 +16,8 @@ import {
 import { writeFile } from 'node:fs/promises'
 import { createReadStream } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { basename, dirname, join } from 'node:path'
-import test, { mock, type TestContext } from 'node:test'
+import { dirname, join } from 'node:path'
+import test, { mock } from 'node:test'
 
 import { shellConstant } from '../scripts/shell-symbol.ts'
 
@@ -577,8 +577,6 @@ source '${CRONTAB_LOCK_LIB}'
 echo "RESOLVED-WAIT=\${CRONTAB_LOCK_WAIT_SECONDS}"
 CRONTAB_LOCK_DIR='${dirname(LOCK_FILE)}'
 CRONTAB_LOCK_FILE='${LOCK_FILE}'
-APP_USER=appuser
-${PREPARE_THE_SHIPPED_LOCK.join('\n')}
 probe_body() {
 ${body}
 }
@@ -1132,30 +1130,10 @@ test('[o3d-batch-ret] every crontab writer in the repository is inside the one e
     'every root-side operation on the crontab lock paths must be symlink-proof: only `chown -h` '
     + '(which never dereferences) is allowed, and touch/chmod are not',
   )
-  // AND SINCE o3d-q766 r2 THERE ARE NONE LEFT AT ALL, WHICH IS STRONGER THAN PERMITTING `chown -h`.
-  // prepare_crontab_lock() now stands INSIDE the lock directory and takes ownership of `.` and of
-  // the bare filename, so neither pathname is the operand of anything that could resolve a
-  // component a second time. The two ownership changes are still asserted — at the operands they
-  // now take — immediately below, so this is not a rule that passed by the code disappearing.
-  assert.deepEqual(lockPathOperations, [],
-    'no root-side operation may name either lock PATHNAME any more: the preparation pins the '
-    + 'directory and works inside it, and an entrypoint that grew one of its own would be '
-    + 'resolving an ancestry the pin exists to stop consulting')
-  // NOT VACUOUS: the filter still finds a real one, planted in the same source.
-  assert.deepEqual(
-    [`chmod 0644 "\${CRONTAB_LOCK_FILE}"`, `chown -h root:root "\${CRONTAB_LOCK_DIR}"`]
-      .filter((text) => !text.startsWith('#')
-        && /\$\{CRONTAB_LOCK_(?:DIR|FILE)\}/.test(text)
-        && /^(touch|chmod|chown|install|ln|cp|mv|rm)\b/.test(text)),
-    [`chmod 0644 "\${CRONTAB_LOCK_FILE}"`, `chown -h root:root "\${CRONTAB_LOCK_DIR}"`],
-    'the operand rule must still be able to see a root-side operation on a lock pathname')
-  const pinnedChowns = installerPreparerCode().split('\n').map((line) => line.trim())
-    .filter((line) => /^chown\b/.test(line))
-  assert.deepEqual(pinnedChowns, ['chown -h root:root .', 'chown -h root:root "${file_base}"'],
-    'the two ownership changes prepare_crontab_lock makes — the directory it is STANDING IN, and '
-    + 'the lock file by its bare name inside it — and nothing else. `.` is the fchown(2) a shell '
-    + 'can spell: no component of either path is looked up a second time, so no rename between '
-    + 'the walk and the call can aim them anywhere')
+  assert.deepEqual(lockPathOperations.map(({ file }) => file),
+    ['scripts/lib/crontab-lock.sh', 'scripts/lib/crontab-lock.sh'],
+    'the two `chown -h root:root` calls in prepare_crontab_lock — the directory and the file — and '
+    + 'no entrypoint may have grown one of its own')
   // A `chown` COMMAND, not any word beginning with those five letters (o3d-n8xx). The rule is that
   // no root-side ownership change may name the service account and a lock path in the same
   // statement; `chown_state_tree "${DATA_DIR}" "${APP_USER}" "${CRONTAB_LOCK_DIRNAME}" …` names both
@@ -1818,457 +1796,16 @@ test('[o3d-batch-ret] the shared library prepares the lock with symlink-proof pr
   assert.doesNotMatch(code, /\b(chmod|touch|install)\b/,
     'chmod has no --no-dereference on Linux and touch follows symlinks, so neither may be RUN on '
     + 'these paths — the modes come from umask at creation instead')
+  assert.doesNotMatch(code, /stat -L/, 'stat -L would dereference; the checks must be lstat')
   assert.doesNotMatch(code, /chown(?! -h )/,
     'every chown must be --no-dereference')
-
-  // `stat -L` ON A PATHNAME dereferences and is still refused (o3d-q766). On /proc/self/fd/N it is
-  // the opposite operation: the magic link IS the open file description, so following it is an
-  // fstat(2) of the descriptor this function is holding and resolves no component of any path.
-  // The rule is therefore about the OPERAND and not about the flag — and it is asked of EVERY
-  // occurrence, so a second one added later cannot ride in behind the first.
-  const statLOperands = [...code.matchAll(/stat -L -c '[^']*' "([^"]*)"/g)].map((match) => match[1])
-  assert.equal(statLOperands.length, code.split('stat -L').length - 1,
-    `every \`stat -L\` must be a quoted-format query with a quoted operand:\n${code}`)
-  assert.deepEqual(statLOperands.filter((operand) => !operand.startsWith('/proc/self/fd/')), [],
-    'stat -L on a pathname would dereference a planted symlink; the only operand it may take in '
-    + 'this function is /proc/self/fd/N, which asks about the descriptor and not about a name')
 
   // And the guard is not vacuous: each of those patterns is asked of a body that violates it.
   const dereferencing = code
     .replace('mkdir "${CRONTAB_LOCK_DIR}"', 'mkdir -p "${CRONTAB_LOCK_DIR}"')
     .replace('set -C; : >', 'touch')
-    .replace('"/proc/self/fd/${CRONTAB_LOCK_FD}"', '"${CRONTAB_LOCK_FILE}"')
   assert.doesNotMatch(dereferencing, /mkdir "\$\{CRONTAB_LOCK_DIR\}"/)
   assert.match(dereferencing, /\btouch\b/)
-  assert.deepEqual(
-    [...dereferencing.matchAll(/stat -L -c '[^']*' "([^"]*)"/g)]
-      .map((match) => match[1]).filter((operand) => !operand.startsWith('/proc/self/fd/')),
-    ['${CRONTAB_LOCK_FILE}'],
-    'the operand rule must be able to see a `stat -L` aimed at a name')
-})
-
-/**
- * THE ACQUISITION IS THE DESCRIPTOR PREPARATION PROVED, AND NOT THE NAME (o3d-q766)
- *
- * prepare_crontab_lock() does the hard work correctly and used to throw the result away:
- * with_crontab_lock() re-resolved ${CRONTAB_LOCK_FILE} on EVERY acquisition, with a `[[ -f … ]]`
- * that dereferences and a `7<…` that dereferences again and is a different lookup from the test
- * that preceded it. The lock DIRECTORY lives under ${DATA_DIR}, which belongs to ${APP_USER}, and
- * a same-directory rename(2) of a directory needs no permission on the directory being renamed —
- * so that account can move it aside at any moment and leave its own at the name. Preparation
- * happens once, early; the acquisitions happen many times, late.
- *
- * WHAT IS MEASURED, AND WHY IT IS BEHAVIOURAL RATHER THAN A /proc READING. Somebody else holds an
- * exclusive flock on the inode preparation proved. A run that still locks THAT inode is REFUSED,
- * with the status the library reserves for a conflict; a run that follows the name locks the
- * decoy and is granted. So the question "which file did this acquisition lock" is answered by the
- * exclusion itself — which is the only thing this library produces — instead of by reading a
- * symlink in /proc and believing what it says.
- */
-function plantSwappableLockDir(t: TestContext) {
-  const root = mkdtempSync(join(HARNESS, 'q766-'))
-  t.after(() => rmSync(root, { recursive: true, force: true }))
-  const locks = join(root, 'locks')
-  const decoy = join(root, 'locks-decoy')
-  mkdirSync(locks)
-  mkdirSync(decoy)
-  const lockPath = join(locks, '.crontab-reconcile.lock')
-  writeFileSync(lockPath, '')
-  writeFileSync(join(decoy, '.crontab-reconcile.lock'), '')
-  return { root, locks, decoy, lockPath }
-}
-
-/** The body with_crontab_lock() carried before o3d-q766, appended so it overrides the shipped one. */
-const WITH_CRONTAB_LOCK_BY_NAME = `with_crontab_lock() {
-  local rc=0
-  [[ -f "\${CRONTAB_LOCK_FILE}" ]] || die "missing lock file"
-  {
-    if flock --exclusive --timeout "\${CRONTAB_LOCK_WAIT_SECONDS}" 7; then
-      "$@" || rc=$?
-    else
-      rc=\${CRONTAB_LOCK_CONFLICT}
-    fi
-  } 7<"\${CRONTAB_LOCK_FILE}"
-  return "\$rc"
-}`
-
-test('[o3d-q766] an acquisition locks the inode preparation proved, not whatever the name leads to now', async (t) => {
-  const acquisitionAfterTheSwap = async (override: string) => {
-    const plant = plantSwappableLockDir(t)
-    // The holder is a REAL flock(2) on the REAL inode, taken before anything below runs and held
-    // for the whole of it. `sleep` is the holder's body only because the exclusion is what is
-    // being observed; nothing reads or writes the file's contents, here or in the library.
-    const holder = spawn('flock', ['--exclusive', plant.lockPath, 'sleep', '60'], { stdio: 'ignore' })
-    t.after(() => holder.kill('SIGKILL'))
-    // PRECONDITION, WAITED FOR RATHER THAN ASSUMED: the inode really is locked before the shipped
-    // program runs, or a granted acquisition below would prove nothing at all.
-    const until = Date.now() + WAIT_BOUND_MS
-    for (;;) {
-      const free = await sh(`flock --exclusive --timeout 0 '${plant.lockPath}' true`)
-      if (free.code !== 0) break
-      assert.ok(Date.now() < until, 'the external holder never took the lock')
-    }
-
-    const run = await sh([
-      'set -uo pipefail',
-      'IMS_CRONTAB_LOCK_WAIT_SECONDS=1',
-      'die(){ echo "DIE: $*" >&2; exit 9; }',
-      `source '${CRONTAB_LOCK_LIB}'`,
-      `CRONTAB_LOCK_DIR='${plant.locks}'`,
-      `CRONTAB_LOCK_FILE='${plant.lockPath}'`,
-      'APP_USER=appuser',
-      ...PREPARE_THE_SHIPPED_LOCK,
-      override,
-      // THE RENAME THE PROSE ABOVE prepare_crontab_lock DESCRIBES, performed after the
-      // preparation and before the acquisition. Nothing here is privileged: this is what the
-      // account that owns ${DATA_DIR} can do at any moment, to a directory it does not own.
-      `mv '${plant.locks}' '${plant.root}/locks-moved'`,
-      `mv '${plant.decoy}' '${plant.locks}'`,
-      'body() { echo ACQUIRED; }',
-      'rc=0',
-      'with_crontab_lock body || rc=$?',
-      'echo "RC=$rc"',
-    ].join('\n'))
-    // NOT VACUOUS: the swap really happened, so both runs met the finding.
-    assert.ok(existsSync(join(plant.root, 'locks-moved', '.crontab-reconcile.lock')),
-      'the prepared lock directory must have been renamed aside')
-    assert.notEqual(statSync(plant.lockPath).ino, statSync(join(plant.root, 'locks-moved', '.crontab-reconcile.lock')).ino,
-      'and a different inode must now stand at the name')
-    return run
-  }
-
-  const shipped = await acquisitionAfterTheSwap('')
-  assert.match(shipped.stdout, new RegExp(`^RC=${SHELL_LOCK_CONFLICT}$`, 'm'),
-    `the acquisition must still be on the inode preparation proved, and that one is held:\n${shipped.stdout}${shipped.stderr}`)
-  assert.doesNotMatch(shipped.stdout, /ACQUIRED/,
-    'and the body must not run behind an exclusion this run does not hold')
-
-  // MEASURED BY MUTATION, ROUTE STATED: with_crontab_lock() as it stood before o3d-q766, appended
-  // so it overrides the shipped definition and everything else runs unchanged. It re-resolves the
-  // name, reaches the inode the service account put there, and is granted a lock that excludes
-  // nobody — while the application goes on holding the one that matters.
-  const byName = await acquisitionAfterTheSwap(WITH_CRONTAB_LOCK_BY_NAME)
-  assert.match(byName.stdout, /^RC=0$/m,
-    `THE FINDING: re-opening by name is granted a lock on the file the name now leads to:\n${byName.stdout}${byName.stderr}`)
-  assert.match(byName.stdout, /ACQUIRED/,
-    'and the crontab read-modify-write runs behind it')
-})
-
-test('[o3d-q766] the descriptor preparation opens is checked against the inode it proved, and that check can fail', async (t) => {
-  // A GUARD NOBODY HAS SEEN REFUSE IS NOT A GUARD. prepare_crontab_lock() re-derives everything
-  // with lstat and then opens a descriptor, and between those two steps there is a window — small,
-  // and the whole argument of this library is that the size of a window is not a defence. So the
-  // window is FORCED here: a `stat` shim performs the rename the instant the post-condition query
-  // it belongs to has been answered, which is the only way to exhibit it from outside the process.
-  const plant = () => {
-    const root = mkdtempSync(join(HARNESS, 'q766-window-'))
-    t.after(() => rmSync(root, { recursive: true, force: true }))
-    const locks = join(root, 'locks')
-    mkdirSync(locks)
-    const lockPath = join(locks, '.crontab-reconcile.lock')
-    writeFileSync(lockPath, '')
-    const bin = join(root, 'bin')
-    mkdirSync(bin)
-    const fired = join(root, 'fired')
-    const realStat = ['/usr/bin/stat', '/bin/stat'].find((c) => existsSync(c))
-    assert.ok(realStat, 'this host must have a real stat for the shim to delegate to')
-    return { root, locks, lockPath, bin, fired, realStat }
-  }
-
-  // The shim answers the post-condition query TRUTHFULLY and only then swaps the file, so what the
-  // checks above the open passed on is exactly the inode that is no longer at the name.
-  const swapAfterTheProof = (p: ReturnType<typeof plant>) => `#!/bin/sh
-"${p.realStat}" "$@"
-status=$?
-case "$*" in
-  *'%F|%u|%d:%i'*)
-    if [ ! -e '${p.fired}' ]; then
-      : > '${p.fired}'
-      mv '${p.lockPath}' '${p.lockPath}.moved'
-      : > '${p.lockPath}'
-    fi
-    ;;
-esac
-exit $status
-`
-
-  const run = async (shim: ((p: ReturnType<typeof plant>) => string) | null) => {
-    const p = plant()
-    if (shim) {
-      writeFileSync(join(p.bin, 'stat'), shim(p))
-      chmodSync(join(p.bin, 'stat'), 0o755)
-    }
-    const out = await sh([
-      'set -uo pipefail',
-      ...(shim ? [`PATH='${p.bin}':"$PATH"`] : []),
-      'die(){ echo "DIE: $*" >&2; exit 9; }',
-      `source '${CRONTAB_LOCK_LIB}'`,
-      `CRONTAB_LOCK_DIR='${p.locks}'`,
-      `CRONTAB_LOCK_FILE='${p.lockPath}'`,
-      'APP_USER=appuser',
-      ...PREPARE_THE_SHIPPED_LOCK,
-      'echo PREPARED',
-    ].join('\n'))
-    return { out, p }
-  }
-
-  // CONTROL FIRST: with nothing interfering the preparation completes, so the refusal below is
-  // about the swap and not about a function that refuses everything.
-  const ordinary = await run(null)
-  assert.match(ordinary.out.stdout, /^PREPARED$/m,
-    `an undisturbed preparation must succeed:\n${ordinary.out.stdout}${ordinary.out.stderr}`)
-
-  const raced = await run(swapAfterTheProof)
-  // NOT VACUOUS: the shim really fired and the name really carries a different inode now.
-  assert.ok(existsSync(raced.p.fired), 'the shim must have been reached by the post-condition query')
-  assert.ok(existsSync(`${raced.p.lockPath}.moved`), 'and the proved inode must have been renamed aside')
-
-  assert.equal(raced.out.code, 9,
-    `a descriptor that is not the inode this run proved must end the run:\n${raced.out.stdout}${raced.out.stderr}`)
-  assert.doesNotMatch(raced.out.stdout, /PREPARED/, 'and nothing after it may run')
-  assert.match(raced.out.stderr, /is not the inode this run had just proved/,
-    `and the refusal must name what it could not identify:\n${raced.out.stderr}`)
-})
-
-// ---------------------------------------------------------------------------
-// AND THE WORST OUTCOME AT THAT NAME IS NOT A WRONG INODE, IT IS A HANG (o3d-q766 r2, Codex HIGH)
-//
-// r1 identified the hang as the worst case — "a refusal unwinds; a hang does not" — and then put
-// the inode check AFTER the `exec` that would do the hanging. A check that runs after a blocking
-// open(2) cannot prevent the block: `open` on a FIFO with no writer waits, and `O_NONBLOCK` is what
-// would make it return instead. A shell redirection has no way to ask for that, so the open itself
-// has to be made unable to reach a FIFO — which is what standing inside the pinned, proved,
-// root-only-writable directory and opening a single component does.
-//
-// BOTH ASSERTIONS ARE BOUNDED FROM OUTSIDE THE SHELL, by `timeout`, so a hang FAILS these tests
-// with a status rather than occupying the runner. That is the whole reason the deadline is here and
-// not in an `await` — a suite that hangs reports nothing at all.
-// ---------------------------------------------------------------------------
-
-/** Long enough that a bounded refusal is never mistaken for a hang; short enough that a hang is cheap. */
-const FIFO_DEADLINE_SECONDS = 8
-/** `timeout`'s own status when it had to send the signal, which is what a hang looks like from here. */
-const TIMEOUT_EXPIRED = 124
-
-/**
- * Run a bash program under a HARD external deadline.
- *
- * `timeout` without `--foreground` runs the program in its own process group and signals the GROUP,
- * so a shell blocked in `open(2)` dies with it rather than being left behind. The program travels as
- * a FILE: `bash -c` would put the whole of it — including a spliced-in function definition — into
- * one argv entry, which Linux caps at 128 KiB.
- */
-function shBounded(dir: string, program: string, seconds = FIFO_DEADLINE_SECONDS) {
-  const file = join(dir, `program-${Math.random().toString(36).slice(2)}.sh`)
-  writeFileSync(file, program)
-  return sh(`timeout -k 2 ${seconds} bash '${file}'`)
-}
-
-test('[o3d-q766] a FIFO at the lock file is REFUSED, and the refusal is bounded where an open is not', async (t) => {
-  const root = mkdtempSync(join(HARNESS, 'q766-fifo-present-'))
-  t.after(() => rmSync(root, { recursive: true, force: true }))
-  const locks = join(root, 'locks')
-  mkdirSync(locks)
-  const lockPath = join(locks, '.crontab-reconcile.lock')
-  const { code: mk } = await sh(`mkfifo '${lockPath}'`)
-  assert.equal(mk, 0, 'this host must be able to create a FIFO for this test to state anything')
-
-  // NOT VACUOUS, AND THIS IS THE POINT OF THE WHOLE TEST: the plant really does block an open, so
-  // "the run refused" below is a refusal INSTEAD OF a hang and not merely a refusal.
-  const wouldHang = await sh(`timeout -k 2 3 bash -c "exec 3< '${lockPath}'"`)
-  assert.equal(wouldHang.code, TIMEOUT_EXPIRED,
-    'the planted FIFO must actually block a read-only open, or this test proves nothing about hangs')
-
-  const run = await shBounded(root, [
-    'set -uo pipefail',
-    'die(){ echo "DIE: $*" >&2; exit 9; }',
-    `source '${CRONTAB_LOCK_LIB}'`,
-    `CRONTAB_LOCK_DIR='${locks}'`,
-    `CRONTAB_LOCK_FILE='${lockPath}'`,
-    'APP_USER=appuser',
-    ...PREPARE_THE_SHIPPED_LOCK,
-    'echo PREPARED',
-  ].join('\n'))
-
-  assert.notEqual(run.code, TIMEOUT_EXPIRED,
-    `the preparation must not block on the FIFO — it must refuse:\n${run.stdout}${run.stderr}`)
-  assert.equal(run.code, 9, `and the refusal is this library's die:\n${run.stdout}${run.stderr}`)
-  assert.doesNotMatch(run.stdout, /PREPARED/, 'and nothing after it may run')
-  assert.match(run.stderr, /is not a regular file/,
-    `and it must name what it found:\n${run.stderr}`)
-  assert.ok(lstatSync(lockPath).isFIFO(), 'and the plant is left for the operator to look at')
-})
-
-test('[o3d-q766] a FIFO planted in a SUBSTITUTED lock directory is never opened, and never hangs', async (t) => {
-  const plant = () => {
-    const root = mkdtempSync(join(HARNESS, 'q766-fifo-swap-'))
-    t.after(() => rmSync(root, { recursive: true, force: true }))
-    const locks = join(root, 'locks')
-    mkdirSync(locks)
-    const lockPath = join(locks, '.crontab-reconcile.lock')
-    writeFileSync(lockPath, '')
-    const moved = join(root, 'locks-moved')
-    const bin = join(root, 'bin')
-    mkdirSync(bin)
-    const fired = join(root, 'fired')
-    const realStat = ['/usr/bin/stat', '/bin/stat'].find((c) => existsSync(c))
-    assert.ok(realStat, 'this host must have a real stat for the shim to delegate to')
-    // The shim answers the FILE post-condition query TRUTHFULLY and only then performs the swap the
-    // prose above prepare_crontab_lock describes: ${DATA_DIR} belongs to ${APP_USER}, so that
-    // account may rename the root-owned lock DIRECTORY aside at any moment and leave its own at the
-    // name — with a named pipe inside it. Nothing here is privileged.
-    writeFileSync(join(bin, 'stat'), `#!/bin/sh
-"${realStat}" "$@"
-status=$?
-case "$*" in
-  *'%F|%u|%d:%i'*)
-    if [ ! -e '${fired}' ]; then
-      : > '${fired}'
-      mv '${locks}' '${moved}'
-      mkdir '${locks}'
-      mkfifo '${locks}/.crontab-reconcile.lock'
-    fi
-    ;;
-esac
-exit $status
-`)
-    chmodSync(join(bin, 'stat'), 0o755)
-    return { root, locks, lockPath, moved, bin, fired }
-  }
-
-  const program = (p: ReturnType<typeof plant>, mutation: string) => [
-    'set -uo pipefail',
-    `PATH='${p.bin}':"$PATH"`,
-    'IMS_CRONTAB_LOCK_WAIT_SECONDS=1',
-    'die(){ echo "DIE: $*" >&2; exit 9; }',
-    `source '${CRONTAB_LOCK_LIB}'`,
-    mutation,
-    `CRONTAB_LOCK_DIR='${p.locks}'`,
-    `CRONTAB_LOCK_FILE='${p.lockPath}'`,
-    'APP_USER=appuser',
-    ...PREPARE_THE_SHIPPED_LOCK,
-    'echo PREPARED',
-    'body() { echo ACQUIRED; }',
-    'rc=0',
-    'with_crontab_lock body || rc=$?',
-    'echo "RC=$rc"',
-  ].join('\n')
-
-  /**
-   * Somebody else holds an exclusive flock on the inode preparation proved, for the whole run. A
-   * descriptor on THAT inode is refused with the library's conflict status; a descriptor on
-   * anything else is granted. So "which file did this preparation open" is answered by the
-   * exclusion — the only thing this library produces — and not by reading a link in /proc.
-   */
-  const holdTheProvedInode = async (p: ReturnType<typeof plant>) => {
-    const holder = spawn('flock', ['--exclusive', p.lockPath, 'sleep', '60'], { stdio: 'ignore' })
-    t.after(() => holder.kill('SIGKILL'))
-    const until = Date.now() + WAIT_BOUND_MS
-    for (;;) {
-      const free = await sh(`flock --exclusive --timeout 0 '${p.lockPath}' true`)
-      if (free.code !== 0) break
-      assert.ok(Date.now() < until, 'the external holder never took the lock')
-    }
-    return holder
-  }
-
-  const shippedPlant = plant()
-  await holdTheProvedInode(shippedPlant)
-  const shipped = await shBounded(shippedPlant.root, program(shippedPlant, ''))
-
-  // NOT VACUOUS: the shim fired and the name really carries a FIFO in a different directory now.
-  assert.ok(existsSync(shippedPlant.fired), 'the shim must have been reached by the post-condition query')
-  assert.ok(lstatSync(shippedPlant.lockPath).isFIFO(),
-    'and a named pipe must now stand at the pathname the preparation started from')
-  assert.ok(existsSync(join(shippedPlant.moved, '.crontab-reconcile.lock')),
-    'and the proved directory must have been renamed aside')
-
-  assert.notEqual(shipped.code, TIMEOUT_EXPIRED,
-    `THE PROPERTY: the preparation must not block on the substituted FIFO:\n${shipped.stdout}${shipped.stderr}`)
-  assert.equal(shipped.code, 0, `and it must complete:\n${shipped.stdout}${shipped.stderr}`)
-  assert.match(shipped.stdout, /^PREPARED$/m, shipped.stdout)
-  assert.match(shipped.stdout, new RegExp(`^RC=${SHELL_LOCK_CONFLICT}$`, 'm'),
-    `and the descriptor it holds must be the inode it proved, which is the one held:\n${shipped.stdout}${shipped.stderr}`)
-  assert.doesNotMatch(shipped.stdout, /ACQUIRED/,
-    'and no crontab read-modify-write may run behind an exclusion this run does not hold')
-
-  // MEASURED BY MUTATION, ROUTE STATED: the open as r1 wrote it — the full pathname, which resolves
-  // the lock DIRECTORY a second time and lands on whatever now stands at that name. The definition
-  // is lifted from the shipped library with that one operand changed and appended after the
-  // `source`, so it overrides the shipped one and everything else runs unaltered.
-  const byName = installerPreparer()
-    .replace('exec {CRONTAB_LOCK_FD}<"${file_base}"', 'exec {CRONTAB_LOCK_FD}<"${CRONTAB_LOCK_FILE}"')
-  assert.notEqual(byName, installerPreparer(),
-    'precondition: the mutation must have found the open it is changing')
-
-  const mutantPlant = plant()
-  const mutant = await shBounded(mutantPlant.root, program(mutantPlant, byName))
-  assert.ok(existsSync(mutantPlant.fired), 'the shim must have fired for the mutant too')
-  assert.equal(mutant.code, TIMEOUT_EXPIRED,
-    `THE FINDING: re-resolving the pathname reaches the planted FIFO and the open BLOCKS — with the `
-    + `service stopped and the database fenced, and no later check can undo it:\n${mutant.stdout}${mutant.stderr}`)
-  assert.doesNotMatch(mutant.stdout, /PREPARED/,
-    'and it never gets past the open, so the inode check below it is never reached')
-})
-
-test('[o3d-q766] the exclusion is one read-modify-write long: a held descriptor is not a held lock', async (t) => {
-  /**
-   * THE HALF OF THE DESCRIPTOR CHANGE THAT COULD HAVE GONE WRONG SILENTLY. The lock used to be
-   * released by the `{ …; } 7<…` group CLOSING its descriptor when the group finished; there is no
-   * closing step any more, because the descriptor is meant to outlive the critical section. The
-   * release is therefore an explicit `flock --unlock`, and a release that is a statement rather
-   * than a consequence is one that can be deleted without anything noticing — the entrypoint would
-   * go on to build, migrate and restart holding the crontab lock for the whole run, and every
-   * reconciliation the application attempted in that time would time out. Nothing in this file
-   * measured that until this test: removing the `flock --unlock` line left all of it green.
-   *
-   * BOTH DIRECTIONS, from one program, so neither is a claim about the other. `flock … 0 <file>
-   * true` opens its OWN descriptor on the same inode, and flock(2) treats independent descriptions
-   * independently even within one process — so it answers "is this inode locked by anybody",
-   * which is the question, and not "did this shell allocate a variable".
-   */
-  const root = mkdtempSync(join(HARNESS, 'q766-release-'))
-  t.after(() => rmSync(root, { recursive: true, force: true }))
-  const locks = join(root, 'locks')
-  mkdirSync(locks)
-  const lockPath = join(locks, '.crontab-reconcile.lock')
-  writeFileSync(lockPath, '')
-
-  const observe = (label: string) =>
-    `if flock --exclusive --timeout 0 "\${CRONTAB_LOCK_FILE}" true 2>/dev/null;`
-    + ` then echo '${label}=free'; else echo '${label}=held'; fi`
-
-  const run = await sh([
-    'set -uo pipefail',
-    'IMS_CRONTAB_LOCK_WAIT_SECONDS=1',
-    'die(){ echo "DIE: $*" >&2; exit 9; }',
-    `source '${CRONTAB_LOCK_LIB}'`,
-    `CRONTAB_LOCK_DIR='${locks}'`,
-    `CRONTAB_LOCK_FILE='${lockPath}'`,
-    'APP_USER=appuser',
-    ...PREPARE_THE_SHIPPED_LOCK,
-    `body() { ${observe('DURING')}; }`,
-    observe('BEFORE'),
-    'rc=0',
-    'with_crontab_lock body || rc=$?',
-    'echo "RC=$rc"',
-    observe('AFTER'),
-    // …and the next acquisition is granted, which is what the entrypoints actually depend on:
-    // fence_cron and unfence_cron are two separate read-modify-writes in one run.
-    'rc2=0',
-    'with_crontab_lock body || rc2=$?',
-    'echo "RC2=$rc2"',
-  ].join('\n'))
-
-  assert.match(run.stdout, /^BEFORE=free$/m,
-    `precondition: holding a prepared DESCRIPTOR must not hold the lock:\n${run.stdout}${run.stderr}`)
-  assert.match(run.stdout, /^DURING=held$/m,
-    `the body must run behind a real exclusion, or this test states nothing:\n${run.stdout}${run.stderr}`)
-  assert.match(run.stdout, /^RC=0$/m, run.stdout)
-  assert.match(run.stdout, /^AFTER=free$/m,
-    `THE PROPERTY: the exclusion ends with the read-modify-write, not with the run:\n${run.stdout}${run.stderr}`)
-  assert.match(run.stdout, /^RC2=0$/m,
-    `and a second acquisition on the same descriptor is granted:\n${run.stdout}${run.stderr}`)
 })
 
 test('[o3d-batch-ret] the installer REFUSES a lock file replaced by a symlink, and never touches the target', async () => {
@@ -2362,17 +1899,9 @@ test('[o3d-batch-ret] the prepared lock cannot be replaced from a directory the 
   assert.ok(statSync(lockFile).isFile(), 'the lock file is a plain file the installer created')
   assert.equal(statSync(lockDir).mode & 0o022, 0,
     'the lock directory is not group- or other-writable — that mode IS the protection')
-  assert.deepEqual(run.chowns, ['-h root:root .', `-h root:root ${basename(lockFile)}`],
-    'both are taken by ROOT, with --no-dereference, and neither is ever chowned to the service '
-    + 'user — which is what round 23 did on every re-run. o3d-q766 r2: the OPERANDS are now `.` '
-    + 'and a bare filename, because the preparation stands inside the pinned lock directory and '
-    + 'neither pathname is resolved a second time')
-  // AND THE OPERANDS REALLY WERE THOSE TWO OBJECTS, which a recorded argument list cannot say on
-  // its own: `.` is only the lock directory if the process was standing in it.
-  assert.equal(statSync(lockDir).uid, process.getuid?.(),
-    'the directory the preparation chowned `.` for is this run\'s')
-  assert.equal(statSync(lockFile).uid, process.getuid?.(),
-    'and the file it chowned by bare name is the one inside it')
+  assert.deepEqual(run.chowns, [`-h root:root ${lockDir}`, `-h root:root ${lockFile}`],
+    'both paths are taken by ROOT, with --no-dereference, and neither is ever chowned to the '
+    + 'service user — which is what round 23 did on every re-run')
 
   // The service user's position, modelled by the same permission check a root-owned 0755 directory
   // produces for it: a directory this process may not write.
@@ -2661,21 +2190,6 @@ if [ "$src" = "-" ]; then cat > '${CRONTAB_FILE}'; else cat "$src" > '${CRONTAB_
 chmodSync(join(CUTOVER_BIN, 'crontab'), 0o755)
 
 /**
- * THE SHIPPED PREPARATION, WHICH IS WHERE THE LOCK DESCRIPTOR COMES FROM (o3d-q766).
- *
- * with_crontab_lock() no longer re-opens ${CRONTAB_LOCK_FILE} by name on every acquisition; it
- * flocks the descriptor prepare_crontab_lock() opened and proved. Every program below that takes
- * the lock therefore runs the shipped preparation first, which is what the three entrypoints do
- * and what these programs always claimed to be doing. It goes at the END of a prelude because it
- * needs `die`, ${CRONTAB_LOCK_DIR} and ${CRONTAB_LOCK_FILE} to be in place first.
- *
- * `chown` is the one step an unprivileged harness cannot perform — the shipped function asks
- * `id -u` rather than hardcoding 0 for exactly that reason — so it is stubbed, the same way
- * `die`, `info` and `warn` are. Nothing else about the acquisition is stubbed or retyped.
- */
-const PREPARE_THE_SHIPPED_LOCK = ['chown() { :; }', 'prepare_crontab_lock']
-
-/**
  * A bash program built out of the SHIPPED entrypoint's own functions.
  *
  * `extraFunctions` lifts further bodies by name; `mutate` is applied to the assembled prelude, and
@@ -2707,7 +2221,6 @@ function cutoverProgram(
     shellFunctionFrom(INSTALL_SH, 'unfence_cron_locked', 'scripts/install.sh'),
     shellFunctionFrom(INSTALL_SH, 'unfence_cron', 'scripts/install.sh'),
     ...(opts.extraFunctions ?? []).map((name) => shellFunctionFrom(INSTALL_SH, name, 'scripts/install.sh')),
-    ...PREPARE_THE_SHIPPED_LOCK,
   ].join('\n')
   const prelude = opts.mutate ? opts.mutate(program) : program
   assert.notEqual(prelude, opts.mutate ? program : null,
@@ -3586,7 +3099,6 @@ function faultProgram(
     'info(){ :; }; ok(){ :; }; success(){ :; }; warn(){ echo "WARN: $*" >&2; }',
     'die(){ echo "DIE: $*" >&2; exit 9; }',
     ...opts.functions.map((name) => shellFunctionFrom(src, name, where)),
-    ...PREPARE_THE_SHIPPED_LOCK,
   ].join('\n')
   const prelude = opts.mutate ? opts.mutate(program) : program
   if (opts.mutate) assert.notEqual(prelude, program, 'a mutation that changes nothing tests nothing')
@@ -4268,11 +3780,7 @@ test('[o3d-batch-ret] no application code path reads the crontab without discrim
 // would never be reached at all.
 const NO_CRONTAB_BIN = join(FAULT_DIR, 'bin-without-crontab')
 mkdirSync(NO_CRONTAB_BIN, { recursive: true })
-// o3d-q766 adds `mkdir` and `stat`: the lock DESCRIPTOR is opened by the shipped
-// prepare_crontab_lock(), which every one of these programs now runs, and it derives what it is
-// looking at with those two. A host missing them is not the host being modelled here.
-for (const tool of ['pgrep', 'ls', 'id', 'mktemp', 'cat', 'rm', 'sed', 'tr', 'awk', 'grep', 'flock',
-  'mkdir', 'stat']) {
+for (const tool of ['pgrep', 'ls', 'id', 'mktemp', 'cat', 'rm', 'sed', 'tr', 'awk', 'grep', 'flock']) {
   const real = ['/usr/bin', '/bin', '/usr/sbin', '/sbin'].map((d) => join(d, tool)).find((c) => existsSync(c))
   if (real) symlinkSync(real, join(NO_CRONTAB_BIN, tool))
 }

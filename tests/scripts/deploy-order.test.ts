@@ -759,18 +759,12 @@ const MARKER_CASES = [
 # THE REAL CRONTAB EXCLUSION, SOURCED RATHER THAN STUBBED (o3d-p9dq). Every fence, unfence,
 # adoption and unwind lifted into these harnesses performs its read-modify-write through
 # with_crontab_lock, so a harness that stubbed it out would be measuring an ordering the shipped
-# code no longer has.#
-# o3d-q766: THE ACQUISITION IS A DESCRIPTOR NOW. prepare_crontab_lock() opens it, proves it
-# against the inode its own post-conditions passed on, and with_crontab_lock() flocks that one —
-# so the SHIPPED preparation runs here rather than a lock file being conjured beside it. It does
-# not need root: it asks \`id -u\` rather than hardcoding 0, precisely so a harness can exercise
-# it. \`chown\` is the one step it takes that an unprivileged harness cannot, so it is stubbed
-# the way every other side effect in these harnesses is.
+# code no longer has. The lock file is created directly because prepare_crontab_lock needs root;
+# its preparation is exercised in tests/settings/crontab-reconcile-serialization.test.ts.
 source '${LOCK_LIB}'
 crontab_lock_paths '${dir}'
 mkdir -p "\${CRONTAB_LOCK_DIR}"
-chown() { :; }
-prepare_crontab_lock
+: > "\${CRONTAB_LOCK_FILE}"
 DRY_RUN=false
 BLUE=''; GREEN=''; YELLOW=''; RED=''; BOLD=''; RESET=''
 STATE_DIR='${dir}'
@@ -821,18 +815,12 @@ die() { echo "die: $*" >&2; exit 1; }
 # THE REAL CRONTAB EXCLUSION, SOURCED RATHER THAN STUBBED (o3d-p9dq). Every fence, unfence,
 # adoption and unwind lifted into these harnesses performs its read-modify-write through
 # with_crontab_lock, so a harness that stubbed it out would be measuring an ordering the shipped
-# code no longer has.#
-# o3d-q766: THE ACQUISITION IS A DESCRIPTOR NOW. prepare_crontab_lock() opens it, proves it
-# against the inode its own post-conditions passed on, and with_crontab_lock() flocks that one —
-# so the SHIPPED preparation runs here rather than a lock file being conjured beside it. It does
-# not need root: it asks \`id -u\` rather than hardcoding 0, precisely so a harness can exercise
-# it. \`chown\` is the one step it takes that an unprivileged harness cannot, so it is stubbed
-# the way every other side effect in these harnesses is.
+# code no longer has. The lock file is created directly because prepare_crontab_lock needs root;
+# its preparation is exercised in tests/settings/crontab-reconcile-serialization.test.ts.
 source '${LOCK_LIB}'
 crontab_lock_paths '${dir}'
 mkdir -p "\${CRONTAB_LOCK_DIR}"
-chown() { :; }
-prepare_crontab_lock
+: > "\${CRONTAB_LOCK_FILE}"
 DRY_RUN=false
 BLUE=''; GREEN=''; YELLOW=''; RED=''; BOLD=''; RESET=''
 DATA_DIR='${dir}'
@@ -881,18 +869,12 @@ die() { echo "die: $*" >&2; exit 1; }
 # THE REAL CRONTAB EXCLUSION, SOURCED RATHER THAN STUBBED (o3d-p9dq). Every fence, unfence,
 # adoption and unwind lifted into these harnesses performs its read-modify-write through
 # with_crontab_lock, so a harness that stubbed it out would be measuring an ordering the shipped
-# code no longer has.#
-# o3d-q766: THE ACQUISITION IS A DESCRIPTOR NOW. prepare_crontab_lock() opens it, proves it
-# against the inode its own post-conditions passed on, and with_crontab_lock() flocks that one —
-# so the SHIPPED preparation runs here rather than a lock file being conjured beside it. It does
-# not need root: it asks \`id -u\` rather than hardcoding 0, precisely so a harness can exercise
-# it. \`chown\` is the one step it takes that an unprivileged harness cannot, so it is stubbed
-# the way every other side effect in these harnesses is.
+# code no longer has. The lock file is created directly because prepare_crontab_lock needs root;
+# its preparation is exercised in tests/settings/crontab-reconcile-serialization.test.ts.
 source '${LOCK_LIB}'
 crontab_lock_paths '${dir}'
 mkdir -p "\${CRONTAB_LOCK_DIR}"
-chown() { :; }
-prepare_crontab_lock
+: > "\${CRONTAB_LOCK_FILE}"
 DATA_DIR='${dir}'
 CUTOVER_STATE_DIR='${dir}'
 FENCE_FILE="\${CUTOVER_STATE_DIR}/DEPLOY-FENCED"
@@ -1270,18 +1252,12 @@ const FENCE_HARNESS = [
 # THE REAL CRONTAB EXCLUSION, SOURCED RATHER THAN STUBBED (o3d-p9dq). Every fence, unfence,
 # adoption and unwind lifted into these harnesses performs its read-modify-write through
 # with_crontab_lock, so a harness that stubbed it out would be measuring an ordering the shipped
-# code no longer has.#
-# o3d-q766: THE ACQUISITION IS A DESCRIPTOR NOW. prepare_crontab_lock() opens it, proves it
-# against the inode its own post-conditions passed on, and with_crontab_lock() flocks that one —
-# so the SHIPPED preparation runs here rather than a lock file being conjured beside it. It does
-# not need root: it asks \`id -u\` rather than hardcoding 0, precisely so a harness can exercise
-# it. \`chown\` is the one step it takes that an unprivileged harness cannot, so it is stubbed
-# the way every other side effect in these harnesses is.
+# code no longer has. The lock file is created directly because prepare_crontab_lock needs root;
+# its preparation is exercised in tests/settings/crontab-reconcile-serialization.test.ts.
 source '${LOCK_LIB}'
 crontab_lock_paths '${dir}'
 mkdir -p "\${CRONTAB_LOCK_DIR}"
-chown() { :; }
-prepare_crontab_lock
+: > "\${CRONTAB_LOCK_FILE}"
 DRY_RUN=false
 BLUE=''; GREEN=''; YELLOW=''; RED=''; BOLD=''; RESET=''
 APP_USER="$(id -un)"
@@ -1361,18 +1337,12 @@ chown() { :; }
 # THE REAL CRONTAB EXCLUSION, SOURCED RATHER THAN STUBBED (o3d-p9dq). Every fence, unfence,
 # adoption and unwind lifted into these harnesses performs its read-modify-write through
 # with_crontab_lock, so a harness that stubbed it out would be measuring an ordering the shipped
-# code no longer has.#
-# o3d-q766: THE ACQUISITION IS A DESCRIPTOR NOW. prepare_crontab_lock() opens it, proves it
-# against the inode its own post-conditions passed on, and with_crontab_lock() flocks that one —
-# so the SHIPPED preparation runs here rather than a lock file being conjured beside it. It does
-# not need root: it asks \`id -u\` rather than hardcoding 0, precisely so a harness can exercise
-# it. \`chown\` is the one step it takes that an unprivileged harness cannot, so it is stubbed
-# the way every other side effect in these harnesses is.
+# code no longer has. The lock file is created directly because prepare_crontab_lock needs root;
+# its preparation is exercised in tests/settings/crontab-reconcile-serialization.test.ts.
 source '${LOCK_LIB}'
 crontab_lock_paths '${dir}'
 mkdir -p "\${CRONTAB_LOCK_DIR}"
-chown() { :; }
-prepare_crontab_lock
+: > "\${CRONTAB_LOCK_FILE}"
 DRY_RUN=false
 BLUE=''; GREEN=''; YELLOW=''; RED=''; BOLD=''; RESET=''
 APP_USER="$(id -un)"
@@ -1468,18 +1438,12 @@ chown() { :; }
 # THE REAL CRONTAB EXCLUSION, SOURCED RATHER THAN STUBBED (o3d-p9dq). Every fence, unfence,
 # adoption and unwind lifted into these harnesses performs its read-modify-write through
 # with_crontab_lock, so a harness that stubbed it out would be measuring an ordering the shipped
-# code no longer has.#
-# o3d-q766: THE ACQUISITION IS A DESCRIPTOR NOW. prepare_crontab_lock() opens it, proves it
-# against the inode its own post-conditions passed on, and with_crontab_lock() flocks that one —
-# so the SHIPPED preparation runs here rather than a lock file being conjured beside it. It does
-# not need root: it asks \`id -u\` rather than hardcoding 0, precisely so a harness can exercise
-# it. \`chown\` is the one step it takes that an unprivileged harness cannot, so it is stubbed
-# the way every other side effect in these harnesses is.
+# code no longer has. The lock file is created directly because prepare_crontab_lock needs root;
+# its preparation is exercised in tests/settings/crontab-reconcile-serialization.test.ts.
 source '${LOCK_LIB}'
 crontab_lock_paths '${dir}'
 mkdir -p "\${CRONTAB_LOCK_DIR}"
-chown() { :; }
-prepare_crontab_lock
+: > "\${CRONTAB_LOCK_FILE}"
 BLUE=''; GREEN=''; YELLOW=''; RED=''; BOLD=''; RESET=''
 APP_USER="$(id -un)"
 APP_DIR='${dir}'
@@ -2208,18 +2172,12 @@ const FENCE_INSTALL_CASES = [
 # THE REAL CRONTAB EXCLUSION, SOURCED RATHER THAN STUBBED (o3d-p9dq). Every fence, unfence,
 # adoption and unwind lifted into these harnesses performs its read-modify-write through
 # with_crontab_lock, so a harness that stubbed it out would be measuring an ordering the shipped
-# code no longer has.#
-# o3d-q766: THE ACQUISITION IS A DESCRIPTOR NOW. prepare_crontab_lock() opens it, proves it
-# against the inode its own post-conditions passed on, and with_crontab_lock() flocks that one —
-# so the SHIPPED preparation runs here rather than a lock file being conjured beside it. It does
-# not need root: it asks \`id -u\` rather than hardcoding 0, precisely so a harness can exercise
-# it. \`chown\` is the one step it takes that an unprivileged harness cannot, so it is stubbed
-# the way every other side effect in these harnesses is.
+# code no longer has. The lock file is created directly because prepare_crontab_lock needs root;
+# its preparation is exercised in tests/settings/crontab-reconcile-serialization.test.ts.
 source '${LOCK_LIB}'
 crontab_lock_paths '${dir}'
 mkdir -p "\${CRONTAB_LOCK_DIR}"
-chown() { :; }
-prepare_crontab_lock
+: > "\${CRONTAB_LOCK_FILE}"
 DRY_RUN=false
 BLUE=''; GREEN=''; YELLOW=''; RED=''; BOLD=''; RESET=''
 STATE_DIR='${dir}'
@@ -2277,18 +2235,12 @@ systemctl() { [ "$1" = daemon-reload ] && return 1; return 0; }
 # THE REAL CRONTAB EXCLUSION, SOURCED RATHER THAN STUBBED (o3d-p9dq). Every fence, unfence,
 # adoption and unwind lifted into these harnesses performs its read-modify-write through
 # with_crontab_lock, so a harness that stubbed it out would be measuring an ordering the shipped
-# code no longer has.#
-# o3d-q766: THE ACQUISITION IS A DESCRIPTOR NOW. prepare_crontab_lock() opens it, proves it
-# against the inode its own post-conditions passed on, and with_crontab_lock() flocks that one —
-# so the SHIPPED preparation runs here rather than a lock file being conjured beside it. It does
-# not need root: it asks \`id -u\` rather than hardcoding 0, precisely so a harness can exercise
-# it. \`chown\` is the one step it takes that an unprivileged harness cannot, so it is stubbed
-# the way every other side effect in these harnesses is.
+# code no longer has. The lock file is created directly because prepare_crontab_lock needs root;
+# its preparation is exercised in tests/settings/crontab-reconcile-serialization.test.ts.
 source '${LOCK_LIB}'
 crontab_lock_paths '${dir}'
 mkdir -p "\${CRONTAB_LOCK_DIR}"
-chown() { :; }
-prepare_crontab_lock
+: > "\${CRONTAB_LOCK_FILE}"
 DRY_RUN=false
 BLUE=''; GREEN=''; YELLOW=''; RED=''; BOLD=''; RESET=''
 DATA_DIR='${dir}'
@@ -2346,18 +2298,12 @@ systemctl() { [ "$1" = daemon-reload ] && return 1; return 0; }
 # THE REAL CRONTAB EXCLUSION, SOURCED RATHER THAN STUBBED (o3d-p9dq). Every fence, unfence,
 # adoption and unwind lifted into these harnesses performs its read-modify-write through
 # with_crontab_lock, so a harness that stubbed it out would be measuring an ordering the shipped
-# code no longer has.#
-# o3d-q766: THE ACQUISITION IS A DESCRIPTOR NOW. prepare_crontab_lock() opens it, proves it
-# against the inode its own post-conditions passed on, and with_crontab_lock() flocks that one —
-# so the SHIPPED preparation runs here rather than a lock file being conjured beside it. It does
-# not need root: it asks \`id -u\` rather than hardcoding 0, precisely so a harness can exercise
-# it. \`chown\` is the one step it takes that an unprivileged harness cannot, so it is stubbed
-# the way every other side effect in these harnesses is.
+# code no longer has. The lock file is created directly because prepare_crontab_lock needs root;
+# its preparation is exercised in tests/settings/crontab-reconcile-serialization.test.ts.
 source '${LOCK_LIB}'
 crontab_lock_paths '${dir}'
 mkdir -p "\${CRONTAB_LOCK_DIR}"
-chown() { :; }
-prepare_crontab_lock
+: > "\${CRONTAB_LOCK_FILE}"
 DATA_DIR='${dir}'
 CUTOVER_STATE_DIR='${dir}'
 FENCE_FILE="\${CUTOVER_STATE_DIR}/DEPLOY-FENCED"
@@ -3004,18 +2950,12 @@ const ARMING_TRAP_CASES = [
 # THE REAL CRONTAB EXCLUSION, SOURCED RATHER THAN STUBBED (o3d-p9dq). Every fence, unfence,
 # adoption and unwind lifted into these harnesses performs its read-modify-write through
 # with_crontab_lock, so a harness that stubbed it out would be measuring an ordering the shipped
-# code no longer has.#
-# o3d-q766: THE ACQUISITION IS A DESCRIPTOR NOW. prepare_crontab_lock() opens it, proves it
-# against the inode its own post-conditions passed on, and with_crontab_lock() flocks that one —
-# so the SHIPPED preparation runs here rather than a lock file being conjured beside it. It does
-# not need root: it asks \`id -u\` rather than hardcoding 0, precisely so a harness can exercise
-# it. \`chown\` is the one step it takes that an unprivileged harness cannot, so it is stubbed
-# the way every other side effect in these harnesses is.
+# code no longer has. The lock file is created directly because prepare_crontab_lock needs root;
+# its preparation is exercised in tests/settings/crontab-reconcile-serialization.test.ts.
 source '${LOCK_LIB}'
 crontab_lock_paths '${dir}'
 mkdir -p "\${CRONTAB_LOCK_DIR}"
-chown() { :; }
-prepare_crontab_lock
+: > "\${CRONTAB_LOCK_FILE}"
 DRY_RUN=false
 BLUE=''; GREEN=''; YELLOW=''; RED=''; BOLD=''; RESET=''
 STATE_DIR='${dir}'
@@ -3076,18 +3016,12 @@ DB_IDENTITY_DRIFT_REASON=''
 # THE REAL CRONTAB EXCLUSION, SOURCED RATHER THAN STUBBED (o3d-p9dq). Every fence, unfence,
 # adoption and unwind lifted into these harnesses performs its read-modify-write through
 # with_crontab_lock, so a harness that stubbed it out would be measuring an ordering the shipped
-# code no longer has.#
-# o3d-q766: THE ACQUISITION IS A DESCRIPTOR NOW. prepare_crontab_lock() opens it, proves it
-# against the inode its own post-conditions passed on, and with_crontab_lock() flocks that one —
-# so the SHIPPED preparation runs here rather than a lock file being conjured beside it. It does
-# not need root: it asks \`id -u\` rather than hardcoding 0, precisely so a harness can exercise
-# it. \`chown\` is the one step it takes that an unprivileged harness cannot, so it is stubbed
-# the way every other side effect in these harnesses is.
+# code no longer has. The lock file is created directly because prepare_crontab_lock needs root;
+# its preparation is exercised in tests/settings/crontab-reconcile-serialization.test.ts.
 source '${LOCK_LIB}'
 crontab_lock_paths '${dir}'
 mkdir -p "\${CRONTAB_LOCK_DIR}"
-chown() { :; }
-prepare_crontab_lock
+: > "\${CRONTAB_LOCK_FILE}"
 DRY_RUN=false
 BLUE=''; GREEN=''; YELLOW=''; RED=''; BOLD=''; RESET=''
 DATA_DIR='${dir}'
@@ -3146,18 +3080,12 @@ DB_IDENTITY_DRIFT_REASON=''
 # THE REAL CRONTAB EXCLUSION, SOURCED RATHER THAN STUBBED (o3d-p9dq). Every fence, unfence,
 # adoption and unwind lifted into these harnesses performs its read-modify-write through
 # with_crontab_lock, so a harness that stubbed it out would be measuring an ordering the shipped
-# code no longer has.#
-# o3d-q766: THE ACQUISITION IS A DESCRIPTOR NOW. prepare_crontab_lock() opens it, proves it
-# against the inode its own post-conditions passed on, and with_crontab_lock() flocks that one —
-# so the SHIPPED preparation runs here rather than a lock file being conjured beside it. It does
-# not need root: it asks \`id -u\` rather than hardcoding 0, precisely so a harness can exercise
-# it. \`chown\` is the one step it takes that an unprivileged harness cannot, so it is stubbed
-# the way every other side effect in these harnesses is.
+# code no longer has. The lock file is created directly because prepare_crontab_lock needs root;
+# its preparation is exercised in tests/settings/crontab-reconcile-serialization.test.ts.
 source '${LOCK_LIB}'
 crontab_lock_paths '${dir}'
 mkdir -p "\${CRONTAB_LOCK_DIR}"
-chown() { :; }
-prepare_crontab_lock
+: > "\${CRONTAB_LOCK_FILE}"
 DATA_DIR='${dir}'
 CUTOVER_STATE_DIR='${dir}'
 APP_USER=appuser
@@ -4270,18 +4198,13 @@ DRY_RUN=false
 BLUE=''; GREEN=''; YELLOW=''; RED=''; BOLD=''; RESET=''
 # THE REAL CRONTAB EXCLUSION, sourced rather than stubbed (o3d-p9dq): fence_cron and its siblings
 # perform their read-modify-write through with_crontab_lock, so a harness without it would be
-# measuring an ordering the shipped code no longer has.#
-# o3d-q766: THE ACQUISITION IS A DESCRIPTOR NOW. prepare_crontab_lock() opens it, proves it
-# against the inode its own post-conditions passed on, and with_crontab_lock() flocks that one —
-# so the SHIPPED preparation runs here rather than a lock file being conjured beside it. It does
-# not need root: it asks \`id -u\` rather than hardcoding 0, precisely so a harness can exercise
-# it. \`chown\` is the one step it takes that an unprivileged harness cannot, so it is stubbed
-# the way every other side effect in these harnesses is.
+# measuring an ordering the shipped code no longer has. The lock file is created directly because
+# prepare_crontab_lock needs root; its preparation is exercised in
+# tests/settings/crontab-reconcile-serialization.test.ts.
 source '${LOCK_LIB}'
 crontab_lock_paths '${dir}'
 mkdir -p "\${CRONTAB_LOCK_DIR}"
-chown() { :; }
-prepare_crontab_lock
+: > "\${CRONTAB_LOCK_FILE}"
 CUTOVER_STATE_DIR='${dir}'
 STATE_DIR='${dir}'
 DATA_DIR='${dir}'

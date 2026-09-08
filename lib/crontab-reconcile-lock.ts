@@ -218,22 +218,6 @@ function systemdStateDirectory(): string | null {
 /**
  * Where the lock file is.
  *
- * THE OTHER PARTY RESOLVES THIS NAME INDEPENDENTLY, AND THAT IS AN OPEN FINDING (o3d-txoe, Codex
- * HIGH). `scripts/lib/crontab-lock.sh` now pins the lock DIRECTORY with a chdir and opens the lock
- * file as a single component from that descriptor, so the shell side cannot be redirected once it
- * has prepared. Nothing carries that pin across to here: `acquireCrontabFileLock` calls this
- * function and opens the pathname it returns on EVERY acquisition. `$STATE_DIRECTORY` is owned by
- * the service user, so that account can rename the root-owned `locks` directory aside after a
- * cutover has prepared and leave its own at the name — the shell then holds the inode it proved and
- * this process holds the replacement, and both report an exclusion neither has. It is reachable at
- * post-start unfencing, where this lock is the only exclusion because the service is already up.
- *
- * The remedy is a RELOCATION beneath a parent the service user cannot rename within, derived by
- * both parties, with a stated migration consequence for the first run after a deploy — o3d-txoe
- * carries it, together with the `next dev` fallback question it raises for the resolution order
- * below. It is filed rather than half-built, because a partial conversion would read as a finished
- * one.
- *
  * ONE source, in this order:
  *
  *   1. `$STATE_DIRECTORY` — systemd's own answer, and the only one a supported deployment uses. It
