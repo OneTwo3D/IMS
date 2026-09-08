@@ -1131,13 +1131,28 @@ export function SyncClient({ settings: init, statusMappings, logs, shoppingCrede
                 )}
               </div>
               <div className="space-y-1.5">
-                <Label className={orderWebhookActive ? 'text-muted-foreground' : ''}>Polling interval (minutes)</Label>
-                <Input type="number" min={1} value={s.wc_sync_interval_minutes} onChange={(e) => setS({ ...s, wc_sync_interval_minutes: e.target.value })} className="h-9 text-sm w-24" disabled={orderWebhookActive} />
+                {/*
+                  o3d-potv: this used to be an editable minutes input bound to the
+                  wc_sync_interval_minutes setting, which nothing read. The sweep runs on the
+                  WooCommerce Reconcile cron schedule and always did, so the field is replaced by a
+                  pointer at the control that works rather than by a second copy of it. The removed
+                  key is deliberately spelled without the `s.` binding form so a guard can tell a
+                  gravestone from a resurrection.
+                */}
+                <Label>Polling cadence</Label>
+                <p className="text-xs text-muted-foreground">
+                  How often IMS sweeps WooCommerce is the <strong>WooCommerce Reconcile</strong>{' '}
+                  schedule (daily at 04:00 unless you change it), edited in{' '}
+                  <a href="/settings/system?tab=scheduler" className="underline underline-offset-2">
+                    Settings → System → Scheduler
+                  </a>
+                  . There is no separate interval here.
+                </p>
                 {orderWebhookActive && (
-                  <p className="text-xs text-muted-foreground">Primary order polling is disabled — orders are received in real-time via webhook (last received: {formatDateTime(s.wc_order_webhook_last_received_at)}). Cron now acts only as backup reconciliation, roughly daily.</p>
+                  <p className="text-xs text-muted-foreground">Orders are received in real-time via webhook (last received: {formatDateTime(s.wc_order_webhook_last_received_at)}), so that sweep acts only as backup reconciliation.</p>
                 )}
                 {s.wc_webhook_secret_set === 'true' && !orderWebhookActive && (
-                  <p className="text-xs text-amber-600">Webhook secret is set but no recent order webhook has been received — polling reconciliation is still active.</p>
+                  <p className="text-xs text-amber-600">Webhook secret is set but no recent order webhook has been received — the sweep is the only route orders are arriving by, at whatever cadence the WooCommerce Reconcile schedule sets.</p>
                 )}
               </div>
             </div>

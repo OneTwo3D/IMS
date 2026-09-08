@@ -96,7 +96,11 @@ With the initial import complete, new and updated WooCommerce orders are importe
 
 - **Enable/disable** order sync with the toggle
 - **Status filter** — choose which WooCommerce statuses trigger an import (e.g. `processing`, `on-hold`, `completed`). At least one status must be ticked: an empty selection is rejected when you save, because it is not a filter WooCommerce can be asked for. To stop importing orders altogether, turn **Enable order sync** off instead.
-- **Sync interval** — how often the system polls WooCommerce for changes (default: 5 minutes). This field is disabled when webhooks are active.
+- **Polling cadence** — how often IMS sweeps WooCommerce is **not** set on this page. It is the
+  **WooCommerce Reconcile** cron schedule (daily at 04:00 unless you change it), edited in
+  **Settings → System → Scheduler**. The sync page used to offer a "Polling interval (minutes)"
+  box that nothing read, so setting it changed nothing; it has been removed rather than left to
+  contradict the schedule.
 
 **What happens when an order is imported:**
 
@@ -309,7 +313,10 @@ Webhooks deliver order changes to One Two Inventory in real-time, rather than wa
    - `order.updated` — syncs status changes and refunds
    - `product.updated` — syncs product changes
 
-Once the first webhook is verified, the polling interval field is replaced with a "Last received" timestamp. Webhooks and polling can coexist safely — order import is idempotent (duplicate imports are silently skipped).
+Once the first webhook is verified, the sync page shows a "Last received" timestamp and the
+**WooCommerce Reconcile** sweep becomes backup reconciliation rather than the primary route.
+Webhooks and the sweep can coexist safely — order import is idempotent (duplicate imports are
+silently skipped).
 
 ### Status Mapping
 

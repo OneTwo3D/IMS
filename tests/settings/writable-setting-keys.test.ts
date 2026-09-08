@@ -182,7 +182,10 @@ test('every WooCommerce sync setting is refused, driven from wc-sync.ts rather t
   assert.ok(machineManaged.includes('wc_initial_import_completed'), 'the flag is still declared machine-managed')
   assert.ok(machineManaged.includes('last_wc_order_sync_at'), 'the order cursor is still declared machine-managed')
   assert.ok(machineManaged.length >= 10, `read ${machineManaged.length} machine-managed keys`)
-  assert.ok(allSyncKeys.length >= 19, `read ${allSyncKeys.length} sync keys`)
+  // 18 since o3d-potv removed wc_sync_interval_minutes, the one key on this list that no
+  // runtime reader consulted. The bound exists to prove the walk really read the constant,
+  // so it tracks the list; it is not an assertion that the list may never shrink.
+  assert.ok(allSyncKeys.length >= 18, `read ${allSyncKeys.length} sync keys`)
   for (const key of machineManaged) {
     assert.ok(allSyncKeys.includes(key), `${key} is machine-managed but no longer a sync key — the walk drifted`)
   }

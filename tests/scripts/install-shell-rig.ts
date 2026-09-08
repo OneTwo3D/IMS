@@ -425,6 +425,12 @@ ${body}
 
 export interface HeldSession {
   alive(): boolean
+  /**
+   * Ends the session and resolves once the child's output is COMPLETE — end-of-file on its pipes,
+   * not merely process exit (o3d-msv1). Safe to call more than once: every call awaits the same
+   * settlement and gets the same result, which is what lets a test assert on it and a `finally`
+   * clean up after it.
+   */
   finish(): Promise<{ code: number | null; stdout: string; stderr: string }>
 }
 
@@ -454,7 +460,38 @@ export async function holdSession(cluster: Cluster, user: string, password: stri
   child.stderr.setEncoding('utf8')
   child.stdout.on('data', (chunk: string) => { stdout += chunk })
   child.stderr.on('data', (chunk: string) => { stderr += chunk })
-  child.on('exit', (status) => { exited = true; code = status })
+
+  // o3d-msv1 — EVERY LISTENER IS ATTACHED HERE, IN THE TICK THAT SPAWNED THE CHILD, AND EVERY
+  // PROMISE IS CREATED HERE TOO. A promise created later, inside finish(), is a promise that can
+  // be created after the event it is waiting for has already fired; that is how the identical
+  // crontab-reconcile helper hung on a child the reaper had already collected.
+  const exitedPromise = new Promise<void>((resolve) => {
+    child.on('exit', (status) => { exited = true; code = status; resolve() })
+    // A spawn that fails emits 'error' and 'close' and never 'exit', so 'close' is the backstop
+    // that keeps finish() from waiting on an event that will not come.
+    child.on('close', () => { exited = true; resolve() })
+  })
+  child.on('error', (error: Error) => { stderr += `\nspawn error: ${error.message}` })
+  // Writing to a child that has already gone is an EPIPE, and an unhandled one on stdin would
+  // take the whole test process down rather than failing the assertion that is about to be made.
+  child.stdin.on('error', () => undefined)
+
+  // THE FIX, AND THE POINT OF IT. finish() below promises the caller the child's COMPLETE output,
+  // so what it must wait for is that output arriving — end-of-file on the pipes — and not the
+  // process exiting. `exit` fires when the process is reaped; bytes it wrote just before that can
+  // still be sitting in the pipe, undelivered to any 'data' handler. Resolving on `exit` therefore
+  // returns whatever happens to have been collected by then, which on a loaded machine is
+  // sometimes the first line and not the second: the r38 rotation test asserting on
+  // `still-authenticated` and receiving only `session-opened`. 'end' is EOF on a flowing stream,
+  // emitted after the last 'data'; 'close' covers a stream destroyed without one. Either means
+  // there is nothing further to collect.
+  const readToEof = (stream: NodeJS.ReadableStream): Promise<void> =>
+    new Promise<void>((resolve) => {
+      stream.on('end', () => resolve())
+      stream.on('close', () => resolve())
+    })
+  const stdoutEof = readToEof(child.stdout)
+  const stderrEof = readToEof(child.stderr)
 
   child.stdin.write("SELECT 'session-opened';\n")
   const deadline = Date.now() + 15_000
@@ -464,18 +501,33 @@ export async function holdSession(cluster: Cluster, user: string, password: stri
     await new Promise((resolve) => setTimeout(resolve, 25))
   }
 
+  // ONE settlement, memoised. Every caller of finish() — the test body, and the `finally` that
+  // calls it again on the way out — awaits the same promise: the second call neither writes a
+  // second statement to a closed stdin, nor waits on an EOF that has already happened, nor
+  // re-collects. It simply returns the same result.
+  let finished: Promise<{ code: number | null; stdout: string; stderr: string }> | undefined
+
   return {
     alive: () => !exited,
-    async finish() {
-      if (!exited) {
-        child.stdin.write("SELECT 'still-authenticated';\n")
-        child.stdin.end()
-        await new Promise<void>((resolve) => {
-          if (exited) resolve()
-          else child.on('exit', () => resolve())
-        })
-      }
-      return { code, stdout, stderr }
+    finish() {
+      finished ??= (async () => {
+        if (!exited) {
+          child.stdin.write("SELECT 'still-authenticated';\n")
+          child.stdin.end()
+        }
+        // A watchdog that KILLS rather than one that resolves: closing the pipes is what makes the
+        // awaited EOF arrive. Resolving early on a timer would be the very thing this fix removes
+        // — it would hand back a partial stdout and call it complete.
+        const watchdog = setTimeout(() => { child.kill('SIGKILL') }, 30_000)
+        watchdog.unref?.()
+        try {
+          await Promise.all([stdoutEof, stderrEof, exitedPromise])
+        } finally {
+          clearTimeout(watchdog)
+        }
+        return { code, stdout, stderr }
+      })()
+      return finished
     },
   }
 }
