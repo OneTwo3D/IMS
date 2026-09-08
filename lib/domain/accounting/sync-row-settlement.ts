@@ -892,8 +892,17 @@ export function isSaleScopedSettlementRow(referenceType: string): boolean {
  * operator asserted. Only the shared mirror is left to its owner, and the skip is recorded in the
  * audit so it is visible rather than silent.
  *
- * This read is an EXPLANATION, not a fence: settlementMirrorGuard above is what makes a stale answer
- * here harmless.
+ * THE READ IS SERIALISED BY THE CALLER (o3d-11rf). settleAccountingSyncRow takes the follow-up
+ * scope lock on (connector, type, referenceType, referenceId) — the tuple this read filters on —
+ * before running it, so a sibling cannot be inserted between the read and the write that follows.
+ *
+ * This comment used to say the read was "an EXPLANATION, not a fence", with settlementMirrorGuard
+ * making a stale answer harmless. That was only ever half true. The guard refuses a VOID against an
+ * event that is already POSTED, which covers a sibling that BEATS the settlement; it cannot cover a
+ * replacement enqueued AFTER the read, because such a row is PENDING with no external id and so
+ * satisfies the guard exactly. The guard is still here and still wanted — it is what keeps the two
+ * writes safe in either order — but it is no longer the only thing standing between a live
+ * replacement and a VOIDed mirror.
  */
 export const MIRROR_OWNING_SYNC_STATUSES = ['PENDING', 'PROCESSING', 'SYNCED'] as const
 

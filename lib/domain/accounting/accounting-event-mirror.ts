@@ -13,51 +13,24 @@ import {
 import type { AccountingEventDraft, AccountingEventLine, AccountingEventStatus } from './accounting-event-types'
 import { isExternalAccountingReferenceUniqueError, isIdempotencyKeyUniqueError } from './prisma-errors'
 import { withSavepoint } from '@/lib/db/savepoint'
+import {
+  isMirrorableAccountingSyncType,
+  isMirrorableJournalAccountingSyncType,
+} from './mirrored-sync-types'
+import type { MirroredAccountingSyncType } from './mirrored-sync-types'
 
-export type MirroredJournalAccountingSyncType =
-  | 'DAILY_BATCH_REVENUE_DEFERRAL'
-  | 'DAILY_BATCH_INVENTORY_ALLOC'
-  | 'DAILY_BATCH_GROUP_B'
-  | 'COGS_REVERSAL'
-  | 'UNEARNED_REV_REVERSAL'
-
-export type MirroredDocumentAccountingSyncType =
-  | 'SALES_INVOICE'
-  | 'SALES_INVOICE_UPDATE'
-  | 'CREDIT_NOTE'
-  | 'PURCHASE_INVOICE'
-  | 'PURCHASE_INVOICE_UPDATE'
-
-export type MirroredAccountingSyncType = MirroredJournalAccountingSyncType | MirroredDocumentAccountingSyncType
+// o3d-11rf: the mirrored TYPE LIST now lives in the leaf module ./mirrored-sync-types, because
+// followup-scope-lock.ts needs it too and this module is mocked wholesale by dozens of tests — a
+// partial mock would have handed it `undefined`. Re-exported here so every existing importer, and
+// the reading order of this file, are unchanged.
+export type {
+  MirroredJournalAccountingSyncType,
+  MirroredDocumentAccountingSyncType,
+  MirroredAccountingSyncType,
+} from './mirrored-sync-types'
+export { MIRRORED_JOURNAL_ACCOUNTING_SYNC_TYPES, MIRRORED_ACCOUNTING_SYNC_TYPES, isMirrorableAccountingSyncType } from './mirrored-sync-types'
 
 export type AccountingEventMirrorTransactionClient = Pick<Prisma.TransactionClient, 'accountingEvent' | 'accountingEventLog'>
-
-export const MIRRORED_JOURNAL_ACCOUNTING_SYNC_TYPES = [
-  'DAILY_BATCH_REVENUE_DEFERRAL',
-  'DAILY_BATCH_INVENTORY_ALLOC',
-  'DAILY_BATCH_GROUP_B',
-  // cogs-audit scjz.60.4: mirror the inventory rounding-difference sweep so the
-  // internal accounting-event ledger reflects the same correction posted to Xero.
-  'DAILY_BATCH_INVENTORY_RECONCILIATION',
-  // khdw: mirror the COGS rounding-difference sweep on the same basis.
-  'DAILY_BATCH_COGS_RECONCILIATION',
-  // 6oyu.4 (khdw): mirror the STOCK_IN_TRANSIT rounding-difference sweep likewise.
-  'DAILY_BATCH_TRANSIT_RECONCILIATION',
-  'COGS_REVERSAL',
-  'UNEARNED_REV_REVERSAL',
-] as const
-
-export const MIRRORED_ACCOUNTING_SYNC_TYPES = [
-  ...MIRRORED_JOURNAL_ACCOUNTING_SYNC_TYPES,
-  'SALES_INVOICE',
-  'SALES_INVOICE_UPDATE',
-  'CREDIT_NOTE',
-  'PURCHASE_INVOICE',
-  'PURCHASE_INVOICE_UPDATE',
-] as const
-
-const MIRRORED_JOURNAL_TYPES = new Set<string>(MIRRORED_JOURNAL_ACCOUNTING_SYNC_TYPES)
-const MIRRORED_TYPES = new Set<string>(MIRRORED_ACCOUNTING_SYNC_TYPES)
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value)
@@ -152,10 +125,6 @@ export function buildMirroredAccountingEventIdempotencyKey(params: {
   ])
 }
 
-export function isMirrorableAccountingSyncType(type: string): type is MirroredAccountingSyncType {
-  return MIRRORED_TYPES.has(type)
-}
-
 /**
  * EVERY idempotency key `updateMirroredAccountingEventStatus` would try for these params, in the
  * order it tries them: the primary key (which prefers the payload's `_idempotencyKey`, then the
@@ -181,9 +150,7 @@ export function mirroredAccountingEventIdempotencyKeys(params: {
   return [...new Set([primary, legacy].filter((key): key is string => typeof key === 'string' && key.length > 0))]
 }
 
-function isMirrorableJournalAccountingSyncType(type: string): type is MirroredJournalAccountingSyncType {
-  return MIRRORED_JOURNAL_TYPES.has(type)
-}
+
 
 export function buildMirroredAccountingEventDraft(params: {
   syncLogId?: string
@@ -934,10 +901,20 @@ export type MirroredEventUpdateOutcome =
  * Mirror identity is logical, not per-row: buildMirroredAccountingEventIdempotencyKey prefers the
  * payload's `_idempotencyKey`, and the legacy fallback key is shared by every attempt on the same
  * day — so one AccountingEvent can be the mirror of several AccountingSyncLog rows. Reading the
- * siblings first tells a caller who else might own it, but that read is not a lock: a sibling can
- * post between the read and the write. Guarding the write itself makes both interleavings safe —
+ * siblings first tells a caller who else might own it, but that read is not itself a lock: a sibling
+ * can post between the read and the write. Guarding the write itself makes both interleavings safe —
  * the late poster overwrites a VOID with its POSTED, and the late VOID is refused against an
- * already-POSTED event — without any caller having to serialise on the mirror key.
+ * already-POSTED event.
+ *
+ * WHAT THE GUARD DOES NOT DO, stated because this block used to end "...without any caller having to
+ * serialise on the mirror key", and a caller read that as permission not to (o3d-11rf). The guard is
+ * a fence around an event that ALREADY EXISTS in a state it can recognise. A replacement attempt
+ * enqueued after the sibling read is PENDING and names no document, which is exactly what
+ * `settlementMirrorGuard` ALLOWS a write through — so a settlement voids the shared mirror of a live
+ * row it never saw, and nothing repairs that until the replacement itself posts. Closing that needs
+ * serialisation, not a CAS, because the row in question does not exist when the read runs and
+ * PostgreSQL has no predicate locks. `settleAccountingSyncRow` therefore takes `lockFollowUpScope`,
+ * which every enqueue writer in the scope already takes.
  */
 export type MirroredEventWriteGuard = {
   /** Write only while the event is in one of these statuses. */

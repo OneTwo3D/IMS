@@ -39,6 +39,7 @@ import {
   type SettlementRefusalCode,
   type SettlementUniqueConflictKind,
 } from '@/lib/domain/accounting/sync-row-settlement'
+import { lockFollowUpScope } from '@/lib/domain/accounting/followup-scope-lock'
 import { lockSalesOrder } from '@/lib/domain/sales/allocation-service'
 import {
   accountingSyncEnabledSettingKey,
@@ -507,6 +508,50 @@ export async function settleAccountingSyncRow(
         const retiredForCancelledSale = sale === 'CANCELLED' && assertion.outcome === 'POSTED'
         const settledStatusNow = retiredForCancelledSale ? 'CANCELLED' as const : settledStatus
 
+        // 0b. SERIALISE THIS SCOPE AGAINST EVERY OTHER WRITER IN IT (o3d-11rf).
+        //
+        //     Step 2 below decides whether this row's mirrored accounting event belongs to it by
+        //     READING the row's siblings. Nothing made that read stable: a replacement enqueued
+        //     after it is still PENDING with no external id, which is precisely what
+        //     settlementMirrorGuard() permits, so its shared mirror was VOIDed by a settlement that
+        //     never saw it — and stayed VOIDed unless and until that replacement posted.
+        //
+        //     The CAS on the mirror write closes the OTHER direction (a sibling that already
+        //     POSTED refuses the VOID) and cannot close this one, because the row it needs to know
+        //     about does not exist when the read runs. PostgreSQL has no predicate locks, so no
+        //     `FOR UPDATE` closes it either. Only a lock BOTH sides take does, and the enqueue side
+        //     has taken one on this exact tuple since o3d-0m56 — settlement never did. (o3d-11rf
+        //     also had to WIDEN that lock: it gated on money-moving types, and no mirrored type is
+        //     money-moving, so it covered none of them. Taking it without widening it would have
+        //     serialised nothing.)
+        //
+        //     WHICH ROWS WERE ACTUALLY EXPOSED — narrower than o3d-11rf was filed as, and worth
+        //     writing down so nobody re-derives the wrong blast radius from the issue. A
+        //     'SalesOrder'-scoped row was ALREADY serialised: step 0 above locks that order row via
+        //     readSaleCancellationStateUnderLock, and lockOrderForAccountingEnqueue locks the same
+        //     row for every order-scoped enqueue, so the two already contended. The genuinely open
+        //     cases are the mirrored rows whose referenceType is anything else, because
+        //     isSaleScopedSettlementRow covers ONLY 'SalesOrder' and settlement therefore held no
+        //     lock at all for them:
+        //       • 'PurchaseInvoice' / 'PurchaseOrder' (PURCHASE_INVOICE, PURCHASE_INVOICE_UPDATE) —
+        //         ORDER_SCOPED_REFERENCE_TYPES does not contain them, so NEITHER side took a row
+        //         lock. Fully unserialised, and closed by this.
+        //       • 'Shipment' — the enqueue locks the shipment's ORDER, settlement locked nothing, so
+        //         the two contended on nothing. Closed by this.
+        //       • 'DailyBatch' — closed on this side; see the residual note on lockFollowUpScope,
+        //         because the daily-batch enqueue does not take the scope lock yet (o3d-rznn).
+        //
+        //     TAKEN AFTER THE ORDER ROW LOCK AND BEFORE THE FENCE. After, because that is the order
+        //     every enqueue writer takes the two in, and two transactions taking the same pair in
+        //     opposite orders is the one way this deadlocks. Before, because the fence is the first
+        //     statement that touches the sync row.
+        await lockFollowUpScope(tx, {
+          connector: row.connector,
+          type: row.type,
+          referenceType: row.referenceType,
+          referenceId: row.referenceId,
+        })
+
         // 1. THE FENCE. Nothing else in this transaction runs unless the decision landed on the
         //    exact attempt the operator judged. On refusal the fence's own message names what moved
         //    — a later attempt, or the same attempt having reached an outcome — and NOTHING is
@@ -532,8 +577,14 @@ export async function settleAccountingSyncRow(
         //    mirror unconditionally could VOID — and clear the externalId of — an event that now
         //    belongs to a live or already-POSTED replacement.
         //
-        //    This read is an EXPLANATION, not a lock; a sibling can still commit after it. What makes
-        //    a stale answer harmless is settlementMirrorGuard(), the CAS on the mirror write itself.
+        //    THIS READ IS NOW SERIALISED (o3d-11rf). Step 0b holds the follow-up scope lock for
+        //    (connector, type, referenceType, referenceId) — the same tuple this `where` filters on
+        //    and the same lock every enqueue writer in the scope takes — so a sibling cannot be
+        //    inserted between this read and the write below. It used to say the opposite: "an
+        //    EXPLANATION, not a lock; a sibling can still commit after it", resting the whole
+        //    outcome on settlementMirrorGuard(). That CAS is still here and still load-bearing for
+        //    the direction it does cover (a sibling that already POSTED refuses the VOID); what it
+        //    never covered is a PENDING replacement, which satisfies the guard exactly.
         let mirrorConflict: MirrorOwnershipConflict | null = null
         if (mirrorKeys.length > 0) {
           const siblings = await tx.accountingSyncLog.findMany({
