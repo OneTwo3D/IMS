@@ -5511,7 +5511,10 @@ else
   info "Backing up database to ${BACKUP_TARGET}..."
   BACKUP_PARTIAL="${BACKUP_TARGET}.part"
   backup_rc=0
-  pg_dump "${MIGRATION_DATABASE_URL}" | gzip > "${BACKUP_PARTIAL}" || backup_rc=$?
+  # THE PARTIAL FILE IS DELETED INSIDE THIS STATEMENT, not below the pin (o3d-secops r34, Codex
+  # HIGH 2). The placement now runs before the failure is propagated and can itself refuse, and a
+  # truncated dump left on disk by that path would be a file nothing names as not-a-restore-point.
+  pg_dump "${MIGRATION_DATABASE_URL}" | gzip > "${BACKUP_PARTIAL}" || { backup_rc=$?; rm -f "${BACKUP_PARTIAL}"; }
   # THE RESTORE POINT IS PLACED BEFORE IT IS OFFERED AS ONE (o3d-secops r33, Codex HIGH 2).
   # `pg_dump` is a consumer of the same movable string as everything else, and the aggregate
   # sighting could be satisfied entirely by prisma -- so a dump of ANOTHER cluster was recordable
@@ -5522,10 +5525,7 @@ else
   # says the string moved before the migration, which the fence record cannot.
   # Status captured, pin first, failure propagated after it (o3d-secops r34, Codex HIGH 2).
   pin_migration_window "The pre-migration backup"
-  if [[ "${backup_rc}" -ne 0 ]]; then
-    rm -f "${BACKUP_PARTIAL}"
-    die "pg_dump did not complete; the partial file has been deleted. Nothing has been migrated and there is no restore point for this run."
-  fi
+  [[ "${backup_rc}" -eq 0 ]] || die "pg_dump did not complete; the partial file has been deleted. Nothing has been migrated and there is no restore point for this run."
   mv "${BACKUP_PARTIAL}" "${BACKUP_TARGET}"
   BACKUP_FILE="${BACKUP_TARGET}"
   success "Backup saved: ${BACKUP_FILE}"

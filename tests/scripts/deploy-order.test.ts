@@ -2521,7 +2521,13 @@ function consumerFailureDisposition(lines: string[], index: number): {
   if (/\|\|\s*(\\\s*\n\s*)?die\b/.test(continuation)) {
     return { shape: 'direct', status: null, detail: continuation }
   }
+  // TWO CAPTURE FORMS, and the second is not a loophole. `|| { name=$?; tail -40 "$LOG" >&2; }`
+  // keeps a diagnostic that belongs to the failure INSIDE the failing statement, where it still runs
+  // when the placement below refuses. Whatever else is in those braces is part of the same
+  // statement and cannot stand between the capture and the propagation, because "the first read"
+  // below is measured from the END of the statement.
   const capture = /\|\|\s*(?:\\\s*\n\s*)?([A-Za-z_][A-Za-z0-9_]*)=\$\?\s*$/.exec(continuation)
+    ?? /\|\|\s*\{\s*([A-Za-z_][A-Za-z0-9_]*)=\$\?\s*;/.exec(continuation)
   if (!capture) {
     return { shape: 'none', status: null, detail: `neither a die nor a captured status:\n${continuation}` }
   }
@@ -13527,7 +13533,7 @@ for (const entry of FENCE_HARNESS) {
     }
   })
 
-  // MUTATION ROUTE (made against the shipped file and reverted): delete `DB_FENCE_KEEP_RECORD=true`
+  // MUTATION ROUTE (made against the shipped file and reverted): delete `DB_FENCE_KEEP_RECORD=1`
   // from the `4)` arm -- the flag stays false, the release goes on to remove the record
   // automatically, and a window in which the migration's own backends were never observed ends with
   // no trace for anybody to look at.
@@ -13723,7 +13729,7 @@ for (const entry of FENCE_HARNESS) {
   // pooler and every single-database cluster. Both are exercised below, to the end of the run.
   //
   // MUTATION ROUTE (all made against the shipped files and reverted): restore
-  // `DB_FENCE_WITNESS_BOUND=0` in place of `DB_FENCE_KEEP_RECORD=true` in the `4)` arm -- the
+  // `DB_FENCE_WITNESS_BOUND=0` in place of `DB_FENCE_KEEP_RECORD=1` in the `4)` arm -- the
   // status-4 case stops printing STARTED THE NEW BUILD. Restore the unconditional `return 1` under
   // `clear_rc -eq 2` in this entrypoint's release -- the no-witness case stops printing it.
   const runToTheEnd = (dir: string) => [
@@ -13814,7 +13820,7 @@ for (const entry of FENCE_HARNESS) {
   // AND THE ORDINARY CUTOVER IS STILL UNATTENDED. Both fixes above make a run CONTINUE where it
   // used to stop, so the direction that has to be held is the other one: a run whose witness saw
   // everything must still end its own record with nobody at a terminal.
-  // MUTATION ROUTE (made against the shipped file and reverted): set DB_FENCE_KEEP_RECORD=true
+  // MUTATION ROUTE (made against the shipped file and reverted): set DB_FENCE_KEEP_RECORD=1
   // unconditionally in this entrypoint's release -- AUTHORITY_CLEARED becomes AUTHORITY_REMAINS
   // and every deploy starts asking a human.
   test(`${entry.name}: an ordinary cutover still ends its own record with nobody at a terminal (o3d-secops r33 control)`, () => {
@@ -13982,6 +13988,76 @@ for (const entry of FENCE_HARNESS) {
       rmSync(dir, { recursive: true, force: true })
     }
   })
+
+  // ---------------------------------------------------------------------------
+  // o3d-secops r34 — A FAILED CONSUMER'S OWN DIAGNOSTIC AND CLEANUP SURVIVE A PLACEMENT REFUSAL.
+  //
+  // A REGRESSION THIS ROUND INTRODUCED AND THEN CLOSED. Moving each pin ABOVE its propagation put
+  // two things below a statement that can now `die`: deploy.sh's `tail -40 "$BUILD_LOG"`, which is
+  // the only place a build's own output is ever shown, and update.sh's `rm -f "${BACKUP_PARTIAL}"`,
+  // which is what stops a truncated dump sitting on disk under a name nothing marks as
+  // not-a-restore-point. On a run that ADOPTED a fence, a consumer that fails AND a pin that
+  // refuses is one run, and it is the run that needed both answers: it would have printed the
+  // placement refusal alone, with the build's errors unshown and the partial file left behind.
+  //
+  // BOTH NOW LIVE INSIDE THE FAILING STATEMENT, so they run before anything below can leave. This
+  // measures that against the entrypoint's own pin_migration_window() under `set -e`, and runs THE
+  // FIRST DRAFT OF THIS ROUND beside it in the same rig -- which must lose both, or the assertions
+  // above it are about a difference the rig cannot see.
+  for (const [label, inside] of [['the shipped shape', true], ['the first draft', false]] as ReadonlyArray<[string, boolean]>) {
+    test(`${entry.name}: ${label} — a failed consumer's diagnostic and cleanup ${inside ? 'survive' : 'are lost to'} a placement refusal (o3d-secops r34)`, () => {
+      const dir = mkdtempSync(join(tmpdir(), 'ims-r34diag-'))
+      const partial = join(dir, 'pre-update.sql.gz.part')
+      try {
+        // Bind 1 is the opening bind and must succeed; bind 2 is the pin's, and it refuses.
+        witnessProtocolCheckout(dir, { verdict: 'yes', binding: ['colocated', 'absent'] })
+        const consumer = `( echo "TYPE ERROR IN app/page.tsx"; echo partial > "$BACKUP_PARTIAL"; exit 2 ) >"$BUILD_LOG" 2>&1`
+        const cleanup = 'tail -40 "$BUILD_LOG" >&2; rm -f "$BACKUP_PARTIAL";'
+        const result = runShell([
+          'set -euo pipefail',
+          'exec 2>&1',
+          entry.preamble(dir),
+          'error() { echo "ERROR: $*" >&2; }',
+          'DB_FENCE_RAISED=false',
+          CUTOVER_DIR_PRIMITIVES,
+          shellFunction(entry.source, 'fence_db_connections'),
+          'fence_db_connections',
+          `BUILD_LOG='${join(dir, 'build.log')}'`,
+          `BACKUP_PARTIAL='${partial}'`,
+          'build_rc=0',
+          inside ? `${consumer} || { build_rc=$?; ${cleanup} }` : `${consumer} || build_rc=$?`,
+          'pin_migration_window "The build"',
+          ...(inside ? [] : [`if [[ "$build_rc" -ne 0 ]]; then ${cleanup} fi`]),
+          '[[ "$build_rc" -eq 0 ]] || die "Build failed — see $BUILD_LOG."',
+          'echo "STARTED THE NEW BUILD"',
+        ].join('\n'))
+        const bindCalls = calls(dir).split('\n').filter((line) => /^--bind-migration /.test(line))
+
+        // THE PRECONDITIONS, identical for both shapes: the consumer wrote and failed, the pin ran
+        // and refused, and nothing started. Only what happened to the diagnostic differs.
+        assert.ok(bindCalls.length >= 2,
+          `precondition: the pin must have opened its own probe:\n${calls(dir)}`)
+        assert.match(result.output, /The build DID NOT RUN AGAINST THE SERVER THIS RUN FENCED/,
+          `precondition: this case is the one where the placement refuses:\n${result.output}`)
+        assert.doesNotMatch(result.output, /^STARTED THE NEW BUILD$/m,
+          `precondition: nothing may start:\n${result.output}`)
+
+        if (inside) {
+          assert.match(result.output, /TYPE ERROR IN app\/page\.tsx/,
+            `the build's own output is the only account of WHY it failed, and a placement refusal must not swallow it:\n${result.output}`)
+          assert.ok(!existsSync(partial),
+            'and the truncated dump must be gone: a .part file left by this path is one nothing marks as not-a-restore-point')
+        } else {
+          assert.doesNotMatch(result.output, /TYPE ERROR IN app\/page\.tsx/,
+            `the first draft must LOSE the diagnostic, or this rig cannot see the difference the shipped shape makes:\n${result.output}`)
+          assert.ok(existsSync(partial),
+            'and must leave the truncated dump behind, which is the second half of the same regression')
+        }
+      } finally {
+        rmSync(dir, { recursive: true, force: true })
+      }
+    })
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -14406,7 +14482,10 @@ for (const [name, lines, expectedConsumers, expectedClassified] of [
 test('the census catches a consumer added in a form no earlier round listed, and r33\'s three regexes do not (o3d-secops r34, Codex MEDIUM)', () => {
   const carriers = migrationUrlCarriers([INSTALL_LINES.join('\n'), FENCE_LIB_SOURCE])
   const shipped = migrationConsumerCensus(INSTALL_LINES, carriers)
-  const gate = shipped.find((row) => row.label === 'gate')
+  // ANNOTATED, BECAUSE `assert.ok` IS AN ASSERTION FUNCTION. TypeScript narrows through one only
+  // when the asserted name is declared with an explicit type; without it the narrowing of `gate`
+  // becomes circular through the initializers below and every one of them falls back to `any`.
+  const gate: CensusEntry | undefined = shipped.find((row) => row.label === 'gate')
   assert.ok(gate, `precondition: the shipped entrypoint must have a closing gate to add below:\n${JSON.stringify(shipped, null, 2)}`)
   assert.deepEqual(shipped.filter((row) => row.kind === 'consumer' && row.placedBy === null), [],
     'precondition: the shipped file must start with every consumer placed, or the assertions below prove nothing')
@@ -14435,7 +14514,7 @@ test('the census catches a consumer added in a form no earlier round listed, and
     const census = migrationConsumerCensus(mutated, carriers)
 
     // THE CLASSIFICATION IS FAIL-CLOSED: every one of them lands in the list, in the kind it is.
-    const spliced = census.filter((row) => row.line > gate.line && row.line <= gate.line + added.length)
+    const spliced: CensusEntry[] = census.filter((row) => row.line > gate.line && row.line <= gate.line + added.length)
     assert.deepEqual(
       spliced.map((row) => row.kind),
       expectedTail,
@@ -14463,7 +14542,7 @@ test('the census catches a consumer added in a form no earlier round listed, and
 // reference and it still has to be placed.
 test('a consumer moved into a helper is still in the census, through the call site (o3d-secops r34, Codex MEDIUM)', () => {
   const carriers = migrationUrlCarriers([INSTALL_LINES.join('\n'), FENCE_LIB_SOURCE])
-  const gate = migrationConsumerCensus(INSTALL_LINES, carriers).find((row) => row.label === 'gate')
+  const gate: CensusEntry | undefined = migrationConsumerCensus(INSTALL_LINES, carriers).find((row) => row.label === 'gate')
   assert.ok(gate)
 
   const helper = [
@@ -14483,6 +14562,40 @@ test('a consumer moved into a helper is still in the census, through the call si
   assert.deepEqual(unplaced.map((row) => row.step), ['late_settings_writer'],
     `the call site must be the unplaced consumer, not an entry that quietly vanished:\n${JSON.stringify(census, null, 2)}`)
 })
+
+// AND THE SHIPPED FILES REALLY ARE WRITTEN THAT WAY (o3d-secops r34). The rig above proves what the
+// two shapes DO; this is the half that fails if either entrypoint drifts back to the first draft.
+//
+// MUTATION ROUTE (made against the shipped files and reverted): move `tail -40 "$BUILD_LOG" >&2`
+// out of the build statement in deploy.sh and back into an `if [[ "$build_rc" -ne 0 ]]` block below
+// `pin_migration_window "The build"` -- both assertions below fail, naming deploy.sh. The same for
+// `rm -f "${BACKUP_PARTIAL}"` in update.sh.
+for (const [name, lines, consumer, diagnostic] of [
+  ['deploy.sh', DEPLOY_LINES, /as_app_user_db npm run build /, 'tail -40 "$BUILD_LOG"'],
+  ['update.sh', UPDATE_LINES, /pg_dump "\$\{MIGRATION_DATABASE_URL\}"/, 'rm -f "${BACKUP_PARTIAL}"'],
+] as ReadonlyArray<[string, string[], RegExp, string]>) {
+  test(`${name}: the diagnostic belonging to a failed consumer is inside its own statement, not below the placement (o3d-secops r34)`, () => {
+    const call = realCodeLine(lines, consumer)
+    assert.notEqual(call, -1, 'precondition: the consumer must be found, or this test walks nothing')
+
+    const statement = callContinuation(lines, call)
+    assert.ok(statement.includes(diagnostic),
+      `${diagnostic} belongs to this step's failure and must run INSIDE its statement, because the placement below it can itself refuse:\n${statement}`)
+
+    // AND IT IS STILL A CAPTURE, so widening the statement did not cost the propagation.
+    const disposition = consumerFailureDisposition(lines, call)
+    assert.equal(disposition.shape, 'captured',
+      `and the status must still be captured and propagated after the placement: ${disposition.detail}`)
+
+    // AND NOWHERE BELOW THE PLACEMENT, which is the position it was lost from.
+    const end = statementEnd(lines, call)
+    const placement = lines.findIndex((line, index) => index > end && /^\s*pin_migration_window /.test(line))
+    assert.notEqual(placement, -1, 'precondition: this consumer must have a placement below it')
+    const below = lines.slice(placement, placement + 10)
+    assert.ok(!below.some((line) => line.includes(diagnostic)),
+      `${diagnostic} must not also sit below the placement, where a refusal would leave before it:\n${below.join('\n')}`)
+  })
+}
 
 // ---------------------------------------------------------------------------
 // o3d-secops r32, Codex HIGH 1 — THE OTHER MACHINE LINES THIS BRANCH READS.

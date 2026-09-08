@@ -3369,6 +3369,17 @@ measured not to promise the observation of a 40 ms connection, so requiring one 
 consumer would refuse ordinary cutovers. The pins cost one short-lived connection per step and are
 a no-op on any run with no fence standing.
 
+**A step's pin runs whether the step succeeded or not, and a placement refusal outranks its exit
+status (o3d-secops r34).** As r33 shipped it, every consumer left the script on a non-zero exit
+*before* its pin — `set -e` for the bare steps, an explicit `|| die` for the rest — so the chain
+was complete only for steps that succeeded, and the step whose placement is worth having is the
+other one: a stable redirect sends `prisma migrate deploy` to another cluster, it applies three
+statements and fails on the fourth, and nothing asks where that DDL landed. Every consumer now
+captures its own exit status, runs its placement, and propagates the failure afterwards. If the
+step both failed **and** cannot be placed, what an operator is told is the **placement** —
+`… DID NOT RUN AGAINST THE SERVER THIS RUN FENCED … WHATEVER IT WROTE OR READ MAY BE ON ANOTHER
+SERVER` — because "prisma exited 7" would send them to the wrong server.
+
 The residual, stated plainly: a redirect that begins **and** reverts inside a single consumer's own
 execution is still caught only by the sampler, so only probabilistically. Closing that completely
 needs the server to record every login — a login event trigger, a superuser DDL change to the
@@ -3397,6 +3408,14 @@ no-witness path — every host behind a transaction-mode pooler — hit the same
 entrypoints. The one reading that is still fatal is the one the witness exists for: a challenge
 **was** put to a live witness and the release's own connection could **not** see it, which is a
 release that may have landed on a copy while the real server is still fenced.
+
+That fatal reading is evaluated **before** the kept record is acted on (o3d-secops r34). r33 placed
+the "keep the record" shortcut between the line that reads the release's verdict and the line that
+acts on it, so a run that had been told `RELEASE_WITNESS <nonce> absent` reported success whenever
+the sampler had also missed — and a sampling miss is precisely the run whose routing is in
+question. The two degraded readings still cost nothing but the automatic removal; a challenge that
+was issued and not answered `colocated` still refuses, kept record or not, and the application is
+not started.
 
 **What an operator sees when the nonce cannot be seen.** A redirect and a lost witness are not
 distinguishable, and the message says so. Before any DDL the run stops with `THE MIGRATION WOULD

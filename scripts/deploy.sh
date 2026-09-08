@@ -4525,7 +4525,11 @@ if ! $SKIP_BUILD; then
     # the fence working as intended and not a build error. On a normal run
     # MIGRATION_DATABASE_URL is empty and this is exactly `as_app_user`.
     build_rc=0
-    as_app_user_db npm run build >"$BUILD_LOG" 2>&1 || build_rc=$?
+    # THE BUILD LOG IS TAILED INSIDE THIS STATEMENT, not below the pin (o3d-secops r34, Codex
+    # HIGH 2). The placement now runs before the failure is propagated, and on a run that
+    # ADOPTED a fence that placement can itself refuse -- so a diagnostic left below it would be
+    # lost on exactly the run that needed both answers.
+    as_app_user_db npm run build >"$BUILD_LOG" 2>&1 || { build_rc=$?; tail -40 "$BUILD_LOG" >&2; }
     # A BUILD IS A DATABASE CONSUMER TOO, ON THE RECOVERY PATH (o3d-secops r33, Codex HIGH 1). On
     # an ordinary run this is a no-op: no fence is standing yet, so pin_migration_window() returns
     # at once. On a run that ADOPTED a standing fence it is not -- the migration URL is live by
@@ -4533,10 +4537,7 @@ if ! $SKIP_BUILD; then
     # string as everything below.
     # Status captured, pin first, failure propagated after it (o3d-secops r34, Codex HIGH 2).
     pin_migration_window "The build"
-    if [[ "$build_rc" -ne 0 ]]; then
-      tail -40 "$BUILD_LOG" >&2
-      die "Build failed — see $BUILD_LOG. Nothing has been stopped and nothing has been migrated."
-    fi
+    [[ "$build_rc" -eq 0 ]] || die "Build failed — see $BUILD_LOG. Nothing has been stopped and nothing has been migrated."
     tail -5 "$BUILD_LOG"
     ok "Build complete."
   fi
