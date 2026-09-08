@@ -1598,10 +1598,34 @@ test('o3d-11rf r4: the bound is applied AFTER the grouping, and it is the stated
   assert.ok(where < groupBy && groupBy < limit,
     'filter, then group, then bound — a bound reached before the filter is the defect this replaced')
 
+  // AND THE PAGE IS ORDERED BEFORE IT IS BOUNDED. Asserted on the STATEMENT, not on the rows that
+  // come back, and that is a repair rather than a preference: deleting this `ORDER BY` killed no
+  // database test, because the grouped plan happens to emit its rows in group-key order and would
+  // have gone on doing so until a row count or a version changed the plan. The rows can only ever
+  // show what one planner did once; what has to be true is that the statement ASKS. Without it the
+  // bound takes whatever the plan reached first, and an operator working a truncated list across
+  // runs would be handed a different 500 each time and never reach the end of it.
+  const orderBy = sql.indexOf('ORDER BY')
+  assert.notEqual(orderBy, -1, 'the page is ordered')
+  assert.ok(groupBy < orderBy && orderBy < limit, 'ordered after grouping, and bounded after that')
+  assert.match(sql.slice(orderBy, limit), /"accountingEventId"/,
+    'by the event id — the same page every run, so a truncated list can be worked through')
+
   assert.equal(values.at(-1), MAX_VOID_MIRROR_CONTRADICTIONS,
     'the bound is a parameter, and it is the one the truncation finding names')
   assert.deepEqual(values[0], ['PENDING', 'PROCESSING'],
     'and the live statuses are parameters too, so the constant is the single spelling of that set')
+})
+
+test('o3d-11rf r4: the bound is DERIVED from what the run view shows, not a number someone picked', () => {
+  // A MUTATION SURVIVOR, REPAIRED. Widening this constant to 1,000 killed nothing: the over-cap test
+  // sizes its fixture from the constant, so the constant moved and the fixture moved with it. That
+  // test proves the BEHAVIOUR at the bound and cannot also prove the bound, because the argument for
+  // the bound is a RELATIONSHIP rather than a magnitude — past the number of findings a run will
+  // render, one more contradiction is a row written and never read, and the exact count in the
+  // truncation finding is the better thing to hand the operator. So the relationship is the assertion.
+  assert.equal(MAX_VOID_MIRROR_CONTRADICTIONS, MAX_RECONCILIATION_FINDINGS_PER_RUN,
+    'the bound is the number of findings the run view will display at all; a literal here has to argue with this')
 })
 
 test('o3d-11rf r4: the total comes from the same statement, and zero rows means zero', async () => {

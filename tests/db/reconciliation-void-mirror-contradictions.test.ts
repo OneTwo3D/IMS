@@ -385,17 +385,26 @@ test('o3d-11rf r4: over the bound, the list says how much of it is missing', { s
   const over = MAX_VOID_MIRROR_CONTRADICTIONS + 5
 
   const { findings, surviving } = await withRollback(async (tx) => {
-    // Ids are zero-padded so `ORDER BY "accountingEventId"` is the numeric order, and the page the
-    // query returns is therefore predictable rather than whatever the planner felt like.
+    // WRITTEN IN THE OPPOSITE ORDER TO THEIR IDS: `lpad($2 + 1 - g)` means the first row on disk
+    // carries the HIGHEST id. That removes the cheapest way for this fixture to agree with the
+    // query by accident.
+    //
+    // IT IS STILL NOT A PROOF THAT THE STATEMENT ORDERS, and the comment says so rather than
+    // implying otherwise: deleting the `ORDER BY` from the query leaves this test green either way,
+    // because the grouped plan emits its rows in group-key order all on its own. That is a property
+    // of one planner on one row count, not of the query, so the ORDER BY is asserted where it can
+    // be asserted — on the STATEMENT, in the sibling unit suite. What this test proves is the other
+    // half: WHICH 500 of the 505 come back.
     await tx.$executeRawUnsafe(
       `INSERT INTO "accounting_events" (
          "id", "type", "sourceEntityType", "sourceEntityId", "businessDate", "status",
          "idempotencyKey", "linesJson", "currency", "externalSystem", "voidBasis", "createdAt", "updatedAt"
        )
        SELECT
-         $1 || lpad(g::text, 5, '0'), 'SALES_INVOICE', 'SalesOrder', $1 || lpad(g::text, 5, '0'),
+         $1 || lpad(($2::int + 1 - g)::text, 5, '0'), 'SALES_INVOICE', 'SalesOrder',
+         $1 || lpad(($2::int + 1 - g)::text, 5, '0'),
          TIMESTAMP '2026-06-01 00:00:00', 'VOID',
-         $1 || lpad(g::text, 5, '0') || '-key', '[]'::jsonb, 'GBP', 'xero', NULL, now(), now()
+         $1 || lpad(($2::int + 1 - g)::text, 5, '0') || '-key', '[]'::jsonb, 'GBP', 'xero', NULL, now(), now()
        FROM generate_series(1, $2::int) g`,
       `11rf4-many-${run}-`,
       over,
@@ -406,8 +415,9 @@ test('o3d-11rf r4: over the bound, the list says how much of it is missing', { s
          "externalTransactionId", "createdAt"
        )
        SELECT
-         $1 || lpad(g::text, 5, '0') || '-s', 'xero', 'SALES_INVOICE'::"AccountingSyncType",
-         'PENDING'::"AccountingSyncStatus", 'SalesOrder', $1 || lpad(g::text, 5, '0'), NULL, now()
+         $1 || lpad(($2::int + 1 - g)::text, 5, '0') || '-s', 'xero', 'SALES_INVOICE'::"AccountingSyncType",
+         'PENDING'::"AccountingSyncStatus", 'SalesOrder', $1 || lpad(($2::int + 1 - g)::text, 5, '0'),
+         NULL, now()
        FROM generate_series(1, $2::int) g`,
       `11rf4-many-${run}-`,
       over,
@@ -430,16 +440,17 @@ test('o3d-11rf r4: over the bound, the list says how much of it is missing', { s
   })
   assert.match(truncated[0].message, new RegExp(String(over)), 'the number is where an operator reads it')
 
-  // The page is the FIRST bound-many by id, not an arbitrary bound-many: a LIMIT with no ORDER BY
-  // would pass every assertion above while returning a different set on every run, and an operator
-  // working the list would never reach the end of it.
+  // THE PAGE IS THE FIRST bound-many BY ID, not an arbitrary bound-many — asserted over the WHOLE
+  // page rather than its ends, so a page that is the right size but the wrong 500 fails. (That the
+  // STATEMENT is what orders it, rather than the plan, is asserted in the unit suite; see the note
+  // on the fixture above.)
   assert.deepEqual(
-    reported.slice(0, 3).map((f) => f.accountingEventId),
-    [1, 2, 3].map((n) => `11rf4-many-${run}-${String(n).padStart(5, '0')}`),
-  )
-  assert.equal(
-    reported.at(-1)?.accountingEventId,
-    `11rf4-many-${run}-${String(MAX_VOID_MIRROR_CONTRADICTIONS).padStart(5, '0')}`,
+    reported.map((f) => f.accountingEventId),
+    Array.from(
+      { length: MAX_VOID_MIRROR_CONTRADICTIONS },
+      (_unused, i) => `11rf4-many-${run}-${String(i + 1).padStart(5, '0')}`,
+    ),
+    'the first 500 by id, in id order — the same 500 every run',
   )
 })
 

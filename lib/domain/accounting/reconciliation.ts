@@ -1255,7 +1255,7 @@ async function collectVoidMirrorContradictions(
         e."sourceEntityId"   AS "referenceId",
         e."idempotencyKey"   AS "idempotencyKey",
         array_agg(l."id" ORDER BY l."id")    AS "syncLogIds",
-        array_agg(DISTINCT l."status"::text) AS "syncLogStatuses"
+        array_agg(DISTINCT l."status"::text ORDER BY l."status"::text) AS "syncLogStatuses"
       FROM "accounting_events" e
       JOIN "accounting_sync_logs" l
         ON l."connector"     = e."externalSystem"
@@ -1285,7 +1285,19 @@ async function collectVoidMirrorContradictions(
   `) as Array<VoidMirrorContradictionRow & { totalContradictions: number }>
 
   return {
-    rows: rows.map(({ totalContradictions: _ignored, ...row }) => row),
+    // Named field by field rather than spread, for the reason the sync-log select next door gives:
+    // the window count rides on every row, and a spread would carry it into the finding's details as
+    // if it were something about THIS document's sync rows.
+    rows: rows.map((row) => ({
+      accountingEventId: row.accountingEventId,
+      connector: row.connector,
+      syncType: row.syncType,
+      referenceType: row.referenceType,
+      referenceId: row.referenceId,
+      idempotencyKey: row.idempotencyKey,
+      syncLogIds: row.syncLogIds,
+      syncLogStatuses: row.syncLogStatuses,
+    })),
     // Zero rows means zero contradictions: the window count only exists where a row does.
     total: rows[0]?.totalContradictions ?? 0,
   }
