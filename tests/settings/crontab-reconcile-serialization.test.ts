@@ -16,7 +16,7 @@ import {
 import { writeFile } from 'node:fs/promises'
 import { createReadStream } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { dirname, join } from 'node:path'
+import { basename, dirname, join } from 'node:path'
 import test, { mock, type TestContext } from 'node:test'
 
 import { shellConstant } from '../scripts/shell-symbol.ts'
@@ -1132,10 +1132,30 @@ test('[o3d-batch-ret] every crontab writer in the repository is inside the one e
     'every root-side operation on the crontab lock paths must be symlink-proof: only `chown -h` '
     + '(which never dereferences) is allowed, and touch/chmod are not',
   )
-  assert.deepEqual(lockPathOperations.map(({ file }) => file),
-    ['scripts/lib/crontab-lock.sh', 'scripts/lib/crontab-lock.sh'],
-    'the two `chown -h root:root` calls in prepare_crontab_lock — the directory and the file — and '
-    + 'no entrypoint may have grown one of its own')
+  // AND SINCE o3d-q766 r2 THERE ARE NONE LEFT AT ALL, WHICH IS STRONGER THAN PERMITTING `chown -h`.
+  // prepare_crontab_lock() now stands INSIDE the lock directory and takes ownership of `.` and of
+  // the bare filename, so neither pathname is the operand of anything that could resolve a
+  // component a second time. The two ownership changes are still asserted — at the operands they
+  // now take — immediately below, so this is not a rule that passed by the code disappearing.
+  assert.deepEqual(lockPathOperations, [],
+    'no root-side operation may name either lock PATHNAME any more: the preparation pins the '
+    + 'directory and works inside it, and an entrypoint that grew one of its own would be '
+    + 'resolving an ancestry the pin exists to stop consulting')
+  // NOT VACUOUS: the filter still finds a real one, planted in the same source.
+  assert.deepEqual(
+    [`chmod 0644 "\${CRONTAB_LOCK_FILE}"`, `chown -h root:root "\${CRONTAB_LOCK_DIR}"`]
+      .filter((text) => !text.startsWith('#')
+        && /\$\{CRONTAB_LOCK_(?:DIR|FILE)\}/.test(text)
+        && /^(touch|chmod|chown|install|ln|cp|mv|rm)\b/.test(text)),
+    [`chmod 0644 "\${CRONTAB_LOCK_FILE}"`, `chown -h root:root "\${CRONTAB_LOCK_DIR}"`],
+    'the operand rule must still be able to see a root-side operation on a lock pathname')
+  const pinnedChowns = installerPreparerCode().split('\n').map((line) => line.trim())
+    .filter((line) => /^chown\b/.test(line))
+  assert.deepEqual(pinnedChowns, ['chown -h root:root .', 'chown -h root:root "${file_base}"'],
+    'the two ownership changes prepare_crontab_lock makes — the directory it is STANDING IN, and '
+    + 'the lock file by its bare name inside it — and nothing else. `.` is the fchown(2) a shell '
+    + 'can spell: no component of either path is looked up a second time, so no rename between '
+    + 'the walk and the call can aim them anywhere')
   // A `chown` COMMAND, not any word beginning with those five letters (o3d-n8xx). The rule is that
   // no root-side ownership change may name the service account and a lock path in the same
   // statement; `chown_state_tree "${DATA_DIR}" "${APP_USER}" "${CRONTAB_LOCK_DIRNAME}" …` names both
@@ -2010,6 +2030,187 @@ exit $status
     `and the refusal must name what it could not identify:\n${raced.out.stderr}`)
 })
 
+// ---------------------------------------------------------------------------
+// AND THE WORST OUTCOME AT THAT NAME IS NOT A WRONG INODE, IT IS A HANG (o3d-q766 r2, Codex HIGH)
+//
+// r1 identified the hang as the worst case — "a refusal unwinds; a hang does not" — and then put
+// the inode check AFTER the `exec` that would do the hanging. A check that runs after a blocking
+// open(2) cannot prevent the block: `open` on a FIFO with no writer waits, and `O_NONBLOCK` is what
+// would make it return instead. A shell redirection has no way to ask for that, so the open itself
+// has to be made unable to reach a FIFO — which is what standing inside the pinned, proved,
+// root-only-writable directory and opening a single component does.
+//
+// BOTH ASSERTIONS ARE BOUNDED FROM OUTSIDE THE SHELL, by `timeout`, so a hang FAILS these tests
+// with a status rather than occupying the runner. That is the whole reason the deadline is here and
+// not in an `await` — a suite that hangs reports nothing at all.
+// ---------------------------------------------------------------------------
+
+/** Long enough that a bounded refusal is never mistaken for a hang; short enough that a hang is cheap. */
+const FIFO_DEADLINE_SECONDS = 8
+/** `timeout`'s own status when it had to send the signal, which is what a hang looks like from here. */
+const TIMEOUT_EXPIRED = 124
+
+/**
+ * Run a bash program under a HARD external deadline.
+ *
+ * `timeout` without `--foreground` runs the program in its own process group and signals the GROUP,
+ * so a shell blocked in `open(2)` dies with it rather than being left behind. The program travels as
+ * a FILE: `bash -c` would put the whole of it — including a spliced-in function definition — into
+ * one argv entry, which Linux caps at 128 KiB.
+ */
+function shBounded(dir: string, program: string, seconds = FIFO_DEADLINE_SECONDS) {
+  const file = join(dir, `program-${Math.random().toString(36).slice(2)}.sh`)
+  writeFileSync(file, program)
+  return sh(`timeout -k 2 ${seconds} bash '${file}'`)
+}
+
+test('[o3d-q766] a FIFO at the lock file is REFUSED, and the refusal is bounded where an open is not', async (t) => {
+  const root = mkdtempSync(join(HARNESS, 'q766-fifo-present-'))
+  t.after(() => rmSync(root, { recursive: true, force: true }))
+  const locks = join(root, 'locks')
+  mkdirSync(locks)
+  const lockPath = join(locks, '.crontab-reconcile.lock')
+  const { code: mk } = await sh(`mkfifo '${lockPath}'`)
+  assert.equal(mk, 0, 'this host must be able to create a FIFO for this test to state anything')
+
+  // NOT VACUOUS, AND THIS IS THE POINT OF THE WHOLE TEST: the plant really does block an open, so
+  // "the run refused" below is a refusal INSTEAD OF a hang and not merely a refusal.
+  const wouldHang = await sh(`timeout -k 2 3 bash -c "exec 3< '${lockPath}'"`)
+  assert.equal(wouldHang.code, TIMEOUT_EXPIRED,
+    'the planted FIFO must actually block a read-only open, or this test proves nothing about hangs')
+
+  const run = await shBounded(root, [
+    'set -uo pipefail',
+    'die(){ echo "DIE: $*" >&2; exit 9; }',
+    `source '${CRONTAB_LOCK_LIB}'`,
+    `CRONTAB_LOCK_DIR='${locks}'`,
+    `CRONTAB_LOCK_FILE='${lockPath}'`,
+    'APP_USER=appuser',
+    ...PREPARE_THE_SHIPPED_LOCK,
+    'echo PREPARED',
+  ].join('\n'))
+
+  assert.notEqual(run.code, TIMEOUT_EXPIRED,
+    `the preparation must not block on the FIFO — it must refuse:\n${run.stdout}${run.stderr}`)
+  assert.equal(run.code, 9, `and the refusal is this library's die:\n${run.stdout}${run.stderr}`)
+  assert.doesNotMatch(run.stdout, /PREPARED/, 'and nothing after it may run')
+  assert.match(run.stderr, /is not a regular file/,
+    `and it must name what it found:\n${run.stderr}`)
+  assert.ok(lstatSync(lockPath).isFIFO(), 'and the plant is left for the operator to look at')
+})
+
+test('[o3d-q766] a FIFO planted in a SUBSTITUTED lock directory is never opened, and never hangs', async (t) => {
+  const plant = () => {
+    const root = mkdtempSync(join(HARNESS, 'q766-fifo-swap-'))
+    t.after(() => rmSync(root, { recursive: true, force: true }))
+    const locks = join(root, 'locks')
+    mkdirSync(locks)
+    const lockPath = join(locks, '.crontab-reconcile.lock')
+    writeFileSync(lockPath, '')
+    const moved = join(root, 'locks-moved')
+    const bin = join(root, 'bin')
+    mkdirSync(bin)
+    const fired = join(root, 'fired')
+    const realStat = ['/usr/bin/stat', '/bin/stat'].find((c) => existsSync(c))
+    assert.ok(realStat, 'this host must have a real stat for the shim to delegate to')
+    // The shim answers the FILE post-condition query TRUTHFULLY and only then performs the swap the
+    // prose above prepare_crontab_lock describes: ${DATA_DIR} belongs to ${APP_USER}, so that
+    // account may rename the root-owned lock DIRECTORY aside at any moment and leave its own at the
+    // name — with a named pipe inside it. Nothing here is privileged.
+    writeFileSync(join(bin, 'stat'), `#!/bin/sh
+"${realStat}" "$@"
+status=$?
+case "$*" in
+  *'%F|%u|%d:%i'*)
+    if [ ! -e '${fired}' ]; then
+      : > '${fired}'
+      mv '${locks}' '${moved}'
+      mkdir '${locks}'
+      mkfifo '${locks}/.crontab-reconcile.lock'
+    fi
+    ;;
+esac
+exit $status
+`)
+    chmodSync(join(bin, 'stat'), 0o755)
+    return { root, locks, lockPath, moved, bin, fired }
+  }
+
+  const program = (p: ReturnType<typeof plant>, mutation: string) => [
+    'set -uo pipefail',
+    `PATH='${p.bin}':"$PATH"`,
+    'IMS_CRONTAB_LOCK_WAIT_SECONDS=1',
+    'die(){ echo "DIE: $*" >&2; exit 9; }',
+    `source '${CRONTAB_LOCK_LIB}'`,
+    mutation,
+    `CRONTAB_LOCK_DIR='${p.locks}'`,
+    `CRONTAB_LOCK_FILE='${p.lockPath}'`,
+    'APP_USER=appuser',
+    ...PREPARE_THE_SHIPPED_LOCK,
+    'echo PREPARED',
+    'body() { echo ACQUIRED; }',
+    'rc=0',
+    'with_crontab_lock body || rc=$?',
+    'echo "RC=$rc"',
+  ].join('\n')
+
+  /**
+   * Somebody else holds an exclusive flock on the inode preparation proved, for the whole run. A
+   * descriptor on THAT inode is refused with the library's conflict status; a descriptor on
+   * anything else is granted. So "which file did this preparation open" is answered by the
+   * exclusion — the only thing this library produces — and not by reading a link in /proc.
+   */
+  const holdTheProvedInode = async (p: ReturnType<typeof plant>) => {
+    const holder = spawn('flock', ['--exclusive', p.lockPath, 'sleep', '60'], { stdio: 'ignore' })
+    t.after(() => holder.kill('SIGKILL'))
+    const until = Date.now() + WAIT_BOUND_MS
+    for (;;) {
+      const free = await sh(`flock --exclusive --timeout 0 '${p.lockPath}' true`)
+      if (free.code !== 0) break
+      assert.ok(Date.now() < until, 'the external holder never took the lock')
+    }
+    return holder
+  }
+
+  const shippedPlant = plant()
+  await holdTheProvedInode(shippedPlant)
+  const shipped = await shBounded(shippedPlant.root, program(shippedPlant, ''))
+
+  // NOT VACUOUS: the shim fired and the name really carries a FIFO in a different directory now.
+  assert.ok(existsSync(shippedPlant.fired), 'the shim must have been reached by the post-condition query')
+  assert.ok(lstatSync(shippedPlant.lockPath).isFIFO(),
+    'and a named pipe must now stand at the pathname the preparation started from')
+  assert.ok(existsSync(join(shippedPlant.moved, '.crontab-reconcile.lock')),
+    'and the proved directory must have been renamed aside')
+
+  assert.notEqual(shipped.code, TIMEOUT_EXPIRED,
+    `THE PROPERTY: the preparation must not block on the substituted FIFO:\n${shipped.stdout}${shipped.stderr}`)
+  assert.equal(shipped.code, 0, `and it must complete:\n${shipped.stdout}${shipped.stderr}`)
+  assert.match(shipped.stdout, /^PREPARED$/m, shipped.stdout)
+  assert.match(shipped.stdout, new RegExp(`^RC=${SHELL_LOCK_CONFLICT}$`, 'm'),
+    `and the descriptor it holds must be the inode it proved, which is the one held:\n${shipped.stdout}${shipped.stderr}`)
+  assert.doesNotMatch(shipped.stdout, /ACQUIRED/,
+    'and no crontab read-modify-write may run behind an exclusion this run does not hold')
+
+  // MEASURED BY MUTATION, ROUTE STATED: the open as r1 wrote it — the full pathname, which resolves
+  // the lock DIRECTORY a second time and lands on whatever now stands at that name. The definition
+  // is lifted from the shipped library with that one operand changed and appended after the
+  // `source`, so it overrides the shipped one and everything else runs unaltered.
+  const byName = installerPreparer()
+    .replace('exec {CRONTAB_LOCK_FD}<"${file_base}"', 'exec {CRONTAB_LOCK_FD}<"${CRONTAB_LOCK_FILE}"')
+  assert.notEqual(byName, installerPreparer(),
+    'precondition: the mutation must have found the open it is changing')
+
+  const mutantPlant = plant()
+  const mutant = await shBounded(mutantPlant.root, program(mutantPlant, byName))
+  assert.ok(existsSync(mutantPlant.fired), 'the shim must have fired for the mutant too')
+  assert.equal(mutant.code, TIMEOUT_EXPIRED,
+    `THE FINDING: re-resolving the pathname reaches the planted FIFO and the open BLOCKS — with the `
+    + `service stopped and the database fenced, and no later check can undo it:\n${mutant.stdout}${mutant.stderr}`)
+  assert.doesNotMatch(mutant.stdout, /PREPARED/,
+    'and it never gets past the open, so the inode check below it is never reached')
+})
+
 test('[o3d-q766] the exclusion is one read-modify-write long: a held descriptor is not a held lock', async (t) => {
   /**
    * THE HALF OF THE DESCRIPTOR CHANGE THAT COULD HAVE GONE WRONG SILENTLY. The lock used to be
@@ -2161,9 +2362,17 @@ test('[o3d-batch-ret] the prepared lock cannot be replaced from a directory the 
   assert.ok(statSync(lockFile).isFile(), 'the lock file is a plain file the installer created')
   assert.equal(statSync(lockDir).mode & 0o022, 0,
     'the lock directory is not group- or other-writable — that mode IS the protection')
-  assert.deepEqual(run.chowns, [`-h root:root ${lockDir}`, `-h root:root ${lockFile}`],
-    'both paths are taken by ROOT, with --no-dereference, and neither is ever chowned to the '
-    + 'service user — which is what round 23 did on every re-run')
+  assert.deepEqual(run.chowns, ['-h root:root .', `-h root:root ${basename(lockFile)}`],
+    'both are taken by ROOT, with --no-dereference, and neither is ever chowned to the service '
+    + 'user — which is what round 23 did on every re-run. o3d-q766 r2: the OPERANDS are now `.` '
+    + 'and a bare filename, because the preparation stands inside the pinned lock directory and '
+    + 'neither pathname is resolved a second time')
+  // AND THE OPERANDS REALLY WERE THOSE TWO OBJECTS, which a recorded argument list cannot say on
+  // its own: `.` is only the lock directory if the process was standing in it.
+  assert.equal(statSync(lockDir).uid, process.getuid?.(),
+    'the directory the preparation chowned `.` for is this run\'s')
+  assert.equal(statSync(lockFile).uid, process.getuid?.(),
+    'and the file it chowned by bare name is the one inside it')
 
   // The service user's position, modelled by the same permission check a root-owned 0755 directory
   // produces for it: a directory this process may not write.
