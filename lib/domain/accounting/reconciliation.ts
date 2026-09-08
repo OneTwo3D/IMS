@@ -10,6 +10,19 @@ import {
 } from './accounting-event-mirror'
 import { isOperatorAssertedSettlement } from './sync-row-settlement'
 
+/**
+ * o3d-11rf r3 — the sync-row statuses that CONTRADICT a VOID mirror, i.e. work still owed.
+ *
+ * Deliberately NOT `MIRROR_OWNING_SYNC_STATUSES`, which is the neighbouring set and is one member
+ * wider. That set answers "may this row still lay claim to the mirror?", for which SYNCED belongs:
+ * a SYNCED row owns its mirror. This one answers a different question — "is there posting work here
+ * that a VOID mirror is preventing?" — and a SYNCED row has already done its posting, so it is not
+ * work owed and reviving the mirror is not its remedy. Stated rather than derived by subtraction,
+ * because a set defined as another set minus a member reads as a variation on it, and these two are
+ * answers to different questions that happen to overlap.
+ */
+const MIRROR_CONTRADICTING_SYNC_STATUSES = ['PENDING', 'PROCESSING'] as const
+
 export type AccountingReconciliationSeverity = 'warning' | 'critical'
 export type AccountingReconciliationRunStatus = 'COMPLETED' | 'FAILED' | 'PARTIAL'
 export type AccountingReconciliationFindingStatus = 'OPEN' | 'RESOLVED' | 'ACCEPTED'
@@ -107,6 +120,17 @@ type AccountingEventRow = {
   idempotencyKey: string
   externalSystem: string | null
   externalId: string | null
+  /**
+   * o3d-11rf r3 — WHY this event is VOID, when a writer said. NULL means NO WRITER SAID, which is
+   * never revivable (see lib/domain/accounting/accounting-event-void-basis.ts) — so a NULL here on a
+   * VOID row that a live sync row still contradicts is a document nothing will ever post and nothing
+   * else in the product reports. That is what `addUnclassifiedVoidMirrorFindings` below exists for.
+   *
+   * Optional so the pure-evaluator fixtures that predate the column still compile and still mean what
+   * they meant; `collectAccountingReconciliationRows` always selects it. Absent reads the same as
+   * NULL here, deliberately: both are "no writer said", which is the whole condition being reported.
+   */
+  voidBasis?: string | null
 }
 
 /**
@@ -947,6 +971,7 @@ export function evaluateAccountingReconciliationRows(
   }
 
   addAssumedRevisionOrderFindings(findings, rows)
+  addUnclassifiedVoidMirrorFindings(findings, rows)
 
   return findings
 }
@@ -970,6 +995,92 @@ export function evaluateAccountingReconciliationRows(
  * being asked to confirm describes the document — with the row that released it, the document id and
  * the basis alongside, so the check can be made without opening the audit table.
  */
+/**
+ * o3d-11rf r3 (Codex r2, HIGH) — THE OPERATOR SURFACE FOR A VOID MIRROR NOBODY CAN CLASSIFY.
+ *
+ * WHAT THIS IS THE OTHER HALF OF. `voidBasis` records WHY a mirrored event is VOID so a new live
+ * attempt may take back a void that retired an ATTEMPT while never taking back one that retired the
+ * DOCUMENT. NULL means no writer said which, and NULL is never revived — the only safe reading, and
+ * the reason the column could be added with no default. The backfill migration
+ * (20260908170000_accounting_event_void_basis_backfill) then repairs every historical row where a
+ * NOT_POSTED settlement is PROVABLE from two independent witnesses.
+ *
+ * WHAT NEITHER OF THOSE REACHES. A void whose provenance is genuinely unrecoverable — both witnesses
+ * present so only an untrustworthy clock could order them, a settlement made before
+ * `accounting_sync_logs.settlement_basis` existed to record it, a row an administrator wrote by hand
+ * — stays NULL for ever. If a LIVE sync row is still working on that document, that pairing is the
+ * exact o3d-11rf defect, frozen: a PENDING row that will never post, against a mirror that will
+ * never be revived. Silently leaving those broken is what this exists to refuse. A migration that
+ * repairs what it can prove and says nothing about the rest has still abandoned the rest.
+ *
+ * IT IS THE PAIRING THAT IS REPORTED, NOT THE NULL. Almost every VOID row in a mature database is a
+ * legitimate cancellation from before the column existed, and reporting all of them would bury the
+ * handful that matter in thousands that do not — the failure mode `document_claim_moved_on_assumed_order`
+ * next door already names ("a finding that can never stop appearing stops being read at all"). So
+ * the condition is a VOID-with-no-basis event that a sync row in the SAME SCOPE still contradicts by
+ * being live and unposted. Nothing to do means nothing reported.
+ *
+ * UNPOSTED, and that clause is load-bearing. A row carrying an `externalTransactionId` describes a
+ * document that EXISTS (o3d-ju8t), so it is not work owed and reviving its mirror is not the remedy;
+ * it is a different disagreement, and `posted_event_without_external_id` and the duplicate-reference
+ * findings are where that surfaces. Only PENDING/PROCESSING with no document id is work that will
+ * never be done.
+ *
+ * A WARNING, NOT A CRITICAL, for the same reason the assumed-order finding is one: nothing here is
+ * KNOWN to be wrong. The remedy is an operator judgement this report cannot make — re-settle the
+ * live row, or confirm the document was retired with its order — and both ids are in the finding so
+ * it can be made without opening the audit tables.
+ */
+function addUnclassifiedVoidMirrorFindings(
+  findings: AccountingReconciliationFinding[],
+  rows: AccountingReconciliationRows,
+): void {
+  const unexplainedVoids = rows.accountingEvents.filter(
+    (event) => event.status === 'VOID' && (event.voidBasis ?? null) === null,
+  )
+  if (unexplainedVoids.length === 0) return
+
+  // Scope, spelled the way the mirror spells it: a sync log's (connector, type, referenceType,
+  // referenceId) is an event's (externalSystem, type, sourceEntityType, sourceEntityId). Indexed
+  // rather than scanned per event, because both datasets are capped at MAX_RECONCILIATION_ROWS and
+  // the nested loop would be their product.
+  const liveUnpostedByScope = new Map<string, AccountingSyncLogRow[]>()
+  for (const log of rows.syncLogs) {
+    if (!(MIRROR_CONTRADICTING_SYNC_STATUSES as readonly string[]).includes(log.status)) continue
+    if (log.externalTransactionId?.trim()) continue
+    const key = `${log.connector}\u0000${log.type}\u0000${log.referenceType}\u0000${log.referenceId}`
+    const existing = liveUnpostedByScope.get(key)
+    if (existing) existing.push(log)
+    else liveUnpostedByScope.set(key, [log])
+  }
+  if (liveUnpostedByScope.size === 0) return
+
+  for (const event of unexplainedVoids) {
+    const key = `${event.externalSystem ?? ''}\u0000${event.type}\u0000${event.sourceEntityType}\u0000${event.sourceEntityId}`
+    const contradicting = liveUnpostedByScope.get(key)
+    if (!contradicting || contradicting.length === 0) continue
+    findings.push({
+      severity: 'warning',
+      code: 'void_mirror_basis_unknown_with_live_sync_row',
+      accountingEventId: event.id,
+      message:
+        `Mirrored accounting event ${event.id} is VOID for a reason no writer recorded, while `
+        + `${contradicting.length} live sync row(s) are still working on the same document. It cannot be `
+        + 'revived automatically, so that work will never post until someone decides which is right',
+      details: {
+        connector: event.externalSystem,
+        syncType: event.type,
+        referenceType: event.sourceEntityType,
+        referenceId: event.sourceEntityId,
+        // Both sides by id, so the judgement can be made without opening the audit tables.
+        syncLogIds: contradicting.map((log) => log.id),
+        syncLogStatuses: Array.from(new Set(contradicting.map((log) => log.status))),
+        idempotencyKey: event.idempotencyKey,
+      },
+    })
+  }
+}
+
 function addAssumedRevisionOrderFindings(
   findings: AccountingReconciliationFinding[],
   rows: AccountingReconciliationRows,
@@ -1122,6 +1233,9 @@ export async function collectAccountingReconciliationRows(
         idempotencyKey: true,
         externalSystem: true,
         externalId: true,
+        // o3d-11rf r3: read so a VOID mirror NO WRITER EXPLAINED can be told apart from one a
+        // cancellation or a settlement did explain. Only the unexplained ones are reported.
+        voidBasis: true,
       },
     }),
     // o3d-cvj9 r7: the handovers the live mirror made on an order nothing established. Selected on

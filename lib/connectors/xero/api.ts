@@ -241,6 +241,16 @@ export type XeroResponse<T = unknown> = {
   tenantId?: string
 }
 
+/**
+ * Per-request options common to the transport. `attemptMeter` is o3d-11rf r3's request-local attempt
+ * count — see {@link XeroAttemptMeter} for why a delta of the process-wide counter is not one.
+ */
+type XeroRequestOptions = {
+  idempotencyKey?: string
+  ifModifiedSince?: Date | string
+  attemptMeter?: XeroAttemptMeter
+}
+
 function sleep(ms: number) {
   return new Promise((resolve) => setTimeout(resolve, ms))
 }
@@ -332,9 +342,46 @@ export function xeroHttpAttemptCount(): number {
   return xeroHttpAttempts
 }
 
-function noteRequest(tenantId: string) {
+/**
+ * o3d-11rf r3 (Codex r2, MEDIUM) — REQUEST-LOCAL ATTEMPT ACCOUNTING, because the counter above is
+ * process-wide and a delta of it is not a measurement of one caller.
+ *
+ * WHY THE DELTA WAS NEVER SOUND. `xeroHttpAttemptCount()` counts every attempt this PROCESS makes
+ * against Xero, across all tenants and all jobs. Taking its difference across an awaited call
+ * measures that call ONLY IF nothing else touched Xero in between — and this is Node: while a caller
+ * awaits its socket, main sync, the daily batch, a manual sync and the outbox all get to run and all
+ * of them increment it. So a "per-poll" figure built that way silently absorbs whatever else the
+ * process happened to be doing, and it absorbs MORE of it exactly when the system is busiest, which
+ * is when the number is being looked at. A lock does not save it either: the payment-write lock
+ * excludes the payment reconcile job and nothing else.
+ *
+ * A METER IS OWNED BY ITS CALLER, so nobody else can add to it. It is handed to the requests that
+ * caller issues and counts on the SAME STATEMENT as `noteRequest` — immediately before
+ * `connectorFetch`, on the one path in this module that reaches Xero's API — so it keeps everything
+ * the process-wide counter was chosen for: a 429 retried three times inside one `xeroGet` counts as
+ * the four tenant calls it is, not as one invocation.
+ *
+ * AND IT SURVIVES A THROW, which is why the caller owns it rather than the response carrying the
+ * count. A request that rejects mid-flight still spent what it spent; a count returned on a response
+ * that never arrives is lost, and the spend would be under-reported for precisely the runs that went
+ * worst.
+ *
+ * NOT A REPLACEMENT for `xeroHttpAttemptCount`. That remains the honest answer to "what has this
+ * process spent in total"; this is the honest answer to "what did THIS piece of work spend".
+ */
+export type XeroAttemptMeter = { attempts: number }
+
+/** A fresh meter. See {@link XeroAttemptMeter}. */
+export function createXeroAttemptMeter(): XeroAttemptMeter {
+  return { attempts: 0 }
+}
+
+function noteRequest(tenantId: string, meter: XeroAttemptMeter | undefined) {
   const now = Date.now()
   xeroHttpAttempts += 1
+  // Same statement as the process-wide increment, deliberately: the two can then never disagree
+  // about whether an attempt happened, only about which population it is counted into.
+  if (meter) meter.attempts += 1
   pushRequestTimestamp(minuteBuckets, tenantId, now, 60_000)
   pushRequestTimestamp(dayBuckets, tenantId, now, 86_400_000)
 }
@@ -399,7 +446,13 @@ function parseRetryAfterMs(value: string | null): number {
   return Number.isFinite(absolute) ? Math.max(0, absolute - Date.now()) : 0
 }
 
-async function performRequest(auth: { accessToken: string; tenantId: string }, init: RequestInit, url: string) {
+async function performRequest(
+  auth: { accessToken: string; tenantId: string },
+  init: RequestInit,
+  url: string,
+  /** o3d-11rf r3: the CALLER's own attempt count, if it is keeping one. See {@link XeroAttemptMeter}. */
+  attemptMeter?: XeroAttemptMeter,
+) {
   let lastRateLimitMs = 0
   /**
    * When Xero started this request's Idempotency-Key clock. Null until the first attempt actually
@@ -591,7 +644,7 @@ async function performRequest(auth: { accessToken: string; tenantId: string }, i
       return budgetSpentResponse(XERO_IN_REQUEST_RETRY_BUDGET_MS - remainingAtSend)
     }
 
-    noteRequest(auth.tenantId)
+    noteRequest(auth.tenantId, attemptMeter)
     firstCallAt ??= Date.now()
 
     const res = await connectorFetch(url, init, { connectorName: 'Xero' })
@@ -707,7 +760,7 @@ async function xeroFetch<T = unknown>(
   method: 'GET' | 'POST' | 'PUT',
   path: string,
   body?: unknown,
-  opts?: { idempotencyKey?: string; ifModifiedSince?: Date | string },
+  opts?: XeroRequestOptions,
 ): Promise<XeroResponse<T>> {
   let auth: Awaited<ReturnType<typeof getAccessToken>>
   try {
@@ -740,7 +793,7 @@ async function xeroFetchWithAuth<T = unknown>(
   method: 'GET' | 'POST' | 'PUT',
   path: string,
   body?: unknown,
-  opts?: { idempotencyKey?: string; ifModifiedSince?: Date | string },
+  opts?: XeroRequestOptions,
 ): Promise<XeroResponse<T>> {
   // EVERY STATEMENT THAT ASSEMBLES THE REQUEST, IN ONE BLOCK THAT CANNOT THROW PAST ITSELF
   // (o3d-2w2j r2). Two of them can throw today — `formatIfModifiedSince` on an unparseable date and
@@ -782,7 +835,7 @@ async function xeroFetchWithAuth<T = unknown>(
     return requestUnbuildableResponse<T>(auth.tenantId, error)
   }
 
-  const res = await performRequest(auth, init, url)
+  const res = await performRequest(auth, init, url, opts?.attemptMeter)
   // Refused before sending. Reported verbatim rather than falling through to the `!res.ok` branch,
   // which would prefix it with "HTTP 0:" and so describe a reply Xero never made.
   if (res.status === XERO_NOT_SENT_STATUS) {
@@ -928,7 +981,7 @@ export async function xeroGetCached<T = unknown>(
 
 export async function xeroGet<T = unknown>(
   path: string,
-  opts?: { ifModifiedSince?: Date | string },
+  opts?: { ifModifiedSince?: Date | string; attemptMeter?: XeroAttemptMeter },
 ): Promise<XeroResponse<T>> {
   return xeroFetch<T>('GET', path, undefined, opts)
 }

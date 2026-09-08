@@ -27,7 +27,7 @@
  * notices. See drainInvoicesModifiedSince for the boundary rules that keep chunking lossless.
  */
 
-import { xeroHttpAttemptCount } from '@/lib/connectors/xero/api'
+import { createXeroAttemptMeter } from '@/lib/connectors/xero/api'
 import { db } from '@/lib/db'
 import { xeroGet } from './api'
 import { logActivity, logActivityPersisted } from '@/lib/activity-log'
@@ -1562,10 +1562,21 @@ async function pollXeroPaymentsLocked(): Promise<PollResult> {
     lastPollDate.toISOString(),
   )
 
+  // o3d-11rf r3 (Codex r2, MEDIUM) — THIS POLL'S OWN ATTEMPTS, AND NOBODY ELSE'S.
+  //
+  // The drain reconciles its per-poll budget against real transport attempts rather than fetcher
+  // invocations (o3d-8f9 r3), and it used to do that by differencing `xeroHttpAttemptCount()` — a
+  // PROCESS-WIDE counter. Main sync, the daily batch, a manual sync and the outbox all move it while
+  // this poll awaits its socket, and every attempt they made was charged to this poll's ceiling: the
+  // drain stopped early, held its cursor and reported a backlog it had not actually spent its budget
+  // on. The meter is owned here and handed only to the fetcher below, so it counts only what this
+  // drain issued. See createXeroAttemptMeter.
+  const drainMeter = createXeroAttemptMeter()
   const drain = await drainInvoicesModifiedSince(
     since,
     pollStartedAt,
-    (path, opts) => xeroGet<XeroInvoicesResponse>(path, opts),  // budget-reconciled inside the drain
+    // budget-reconciled inside the drain, against this poll's own meter
+    (path, opts) => xeroGet<XeroInvoicesResponse>(path, { ...opts, attemptMeter: drainMeter }),
     async ({ invoices, through }) => {
       const errorsBefore = result.errors.length
       await processDeltaChunk(invoices, result, {
@@ -1595,8 +1606,9 @@ async function pollXeroPaymentsLocked(): Promise<PollResult> {
       return 'continue'
     },
     // Real HTTP attempts, not fetcher invocations: xeroGet retries a 429 internally, so one
-    // invocation can be several tenant API calls (o3d-8f9 r3).
-    xeroHttpAttemptCount,
+    // invocation can be several tenant API calls (o3d-8f9 r3) — and REQUEST-LOCAL ones, so a
+    // concurrent job's traffic is not charged to this poll's ceiling (o3d-11rf r3).
+    () => drainMeter.attempts,
     drainHint ?? undefined,
   )
 
@@ -1719,22 +1731,36 @@ async function pollXeroPaymentsLocked(): Promise<PollResult> {
   // the polls with the most work to do, and understating the tenant's real quota draw in the one
   // number the quota decision is meant to rest on.
   //
-  // MEASURED, NOT COUNTED BY HAND: the delta of `xeroHttpAttemptCount()` across the whole recheck,
-  // which is the same monotonic transport counter the drain's budget reconciles against, so a 429
-  // retry inside one `xeroGet` is counted as the several tenant calls it is. Taken over the WHOLE
-  // call rather than around the fetcher, so anything the recheck's own decision pass ever spends is
-  // inside the measurement rather than outside it. Its one assumption is that no OTHER Xero caller
-  // interleaves with this awaited tree, which is what the payment-write lock already establishes
-  // for the poll and its reconcile.
-  const recheckAttemptsBefore = xeroHttpAttemptCount()
+  // MEASURED, NOT COUNTED BY HAND, AND REQUEST-LOCAL (o3d-11rf r3, Codex r2 MEDIUM). Every attempt
+  // the recheck's own fetcher makes is counted on the same statement the transport counts its
+  // process-wide total on, so a 429 retried inside one `xeroGet` is still counted as the several
+  // tenant calls it is.
+  //
+  // ROUND 2 MEASURED THIS AS A DELTA OF `xeroHttpAttemptCount()`, AND THAT WAS A DEFECT IN ITS OWN
+  // FIX: it replaced a number that EXCLUDED the recheck's traffic with one that INCLUDED other jobs'.
+  // The counter is process-wide, and the assumption written here — that "no OTHER Xero caller
+  // interleaves with this awaited tree, which is what the payment-write lock already establishes" —
+  // was simply untrue. That lock excludes the payment RECONCILE job and nothing else, so main sync,
+  // the daily batch, a manual sync and the outbox were all free to run during the await and have
+  // their attempts charged to `recheckRequests`, and thence to `xeroRequests` — the one number the
+  // quota decision is supposed to rest on. A meter this function owns cannot be written to by
+  // anything it did not hand itself to.
+  //
+  // READ AFTER THE CATCH rather than in a `finally`, for the reason round 2 gave and which is still
+  // right: a recheck that THREW still spent what it spent, and a poll reporting nothing for it would
+  // under-report the runs that went worst. The meter survives the throw precisely BECAUSE the caller
+  // owns it — a count carried back on a response would be lost along with the response.
+  const recheckMeter = createXeroAttemptMeter()
   try {
-    await recheckWithheldReversals(result, lastPollDate, (path) => xeroGet<XeroInvoicesResponse>(path))
+    await recheckWithheldReversals(
+      result,
+      lastPollDate,
+      (path) => xeroGet<XeroInvoicesResponse>(path, { attemptMeter: recheckMeter }),
+    )
   } catch (e) {
     result.errors.push(`Withheld-reversal recheck error: ${String(e)}`)
   }
-  // Where a `finally` would put it: a recheck that THREW still spent what it spent, and a poll that
-  // reported nothing for it would be under-reporting the runs that went worst.
-  result.recheckRequests = Math.max(0, xeroHttpAttemptCount() - recheckAttemptsBefore)
+  result.recheckRequests = recheckMeter.attempts
   result.xeroRequests = result.drainRequests + result.recheckRequests
 
   // `billReversalsWithheld` counts BOTH causes — a ledger amount that does not prove a reversal, and
