@@ -134,8 +134,13 @@ function readRepoFile(path: string): string {
 // enable on this same page, and flagging it would make the rule about wording rather than
 // about controls that set a cadence.
 // ---------------------------------------------------------------------------
+// The boundary is `(?<![A-Za-z])`, NOT `\b`. `\b` treats `_` as a word character, so `\bpoll`
+// does not match inside `wc_poll_every_minutes` — the very name a resurrection would use. A
+// mutation that recreated the control under that name away from the cadence block passed the
+// first draft of this rule for exactly that reason: the label half fired on the block heading
+// while the binding half was silently inert.
 const CADENCE_NAME =
-  /\b(?:poll|interval|cadence|frequenc|freq\b|sweep|how often|every|minute|mins?\b|second|secs?\b|hour|period|schedul|throttle|debounce|refresh|tick)/i
+  /(?<![A-Za-z])(?:poll|interval|cadence|frequenc|freq(?![a-z])|sweep|how often|every|minute|min(?![a-z])|second|sec(?![a-z])|hour|period|schedul|throttle|debounce|refresh|tick)/i
 
 function cadenceHit(text: string): string | null {
   const m = CADENCE_NAME.exec(text)
