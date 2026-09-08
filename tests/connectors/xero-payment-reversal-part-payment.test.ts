@@ -44,6 +44,16 @@ const state = {
    */
   payments: [] as Row[],
   attempts: 0,
+  /**
+   * o3d-11rf r3 — ANOTHER JOB'S Xero traffic, landing DURING one of this poll's own awaits.
+   *
+   * Main sync, the daily batch, a manual sync and the outbox all share the process and the tenant,
+   * and the payment-write lock excludes only the payment RECONCILE job — so this is the ordinary
+   * case, not an exotic one. Each entry moves the PROCESS-WIDE counter (`state.attempts`) and touches
+   * no caller's meter, which is exactly what a real concurrent call does.
+   */
+  unrelatedAttemptsDuringDrain: 0,
+  unrelatedAttemptsDuringRecheck: 0,
   activity: [] as LoggedActivity[],
   notifications: [] as { title?: string; message?: string; userId?: string | null }[],
   chargebacks: [] as string[],
@@ -152,6 +162,8 @@ function reset(): void {
   state.payments = []
   state.rawStatements = []
   state.attempts = 0
+  state.unrelatedAttemptsDuringDrain = 0
+  state.unrelatedAttemptsDuringRecheck = 0
   state.activity = []
   state.notifications = []
   state.chargebacks = []
@@ -241,17 +253,28 @@ mock.module('@/lib/connectors/xero/payment-write-lock', {
 mock.module('@/lib/connectors/xero/api', {
   namedExports: {
     xeroHttpAttemptCount: () => state.attempts,
-    xeroGet: async (path: string) => {
+    // o3d-11rf r3: the transport's request-local attempt count. The real one is incremented on the
+    // same statement as the process-wide counter, immediately before the socket; this double keeps
+    // that relationship — `state.attempts` for the process, `opts.attemptMeter` for the caller — so
+    // a test can drive them apart the way a concurrent job does.
+    createXeroAttemptMeter: () => ({ attempts: 0 }),
+    xeroGet: async (path: string, opts?: { attemptMeter?: { attempts: number } }) => {
       state.attempts += 1
+      if (opts?.attemptMeter) opts.attemptMeter.attempts += 1
       // The withheld-reversal recheck asks for specific invoices by id, precisely because they will
       // never come back through the modified-since delta on their own.
       if (typeof path === 'string' && path.startsWith('Invoices?IDs=')) {
         state.recheckFetches.push(path)
+        // ANOTHER JOB, running during this request's await. It moves the process-wide counter and
+        // nothing else — which is what the recheck's figure used to be measured off.
+        state.attempts += state.unrelatedAttemptsDuringRecheck
         if (state.recheckFetchFails) return { ok: false, status: 503, error: 'Xero unavailable' }
         const ids = path.slice('Invoices?IDs='.length).split(',')
         return { ok: true, status: 200, data: { Invoices: state.recheckInvoices.filter((i) => ids.includes(i.InvoiceID)) } }
       }
-      // One short page: walkPages treats it as the last, so the whole window is one chunk.
+      // One short page: walkPages treats it as the last, so the whole window is one chunk. Another
+      // job gets to run during this await too — the drain's budget was measured the same wrong way.
+      state.attempts += state.unrelatedAttemptsDuringDrain
       return { ok: true, status: 200, data: { Invoices: state.invoices } }
     },
   },
@@ -1820,6 +1843,63 @@ test('o3d-pzu0 r2: the reported cost INCLUDES the withheld-reversal recheck, not
     result.xeroRequests > result.drainRequests,
     `a poll with a due recheck must report more than the drain alone (${result.xeroRequests} vs ${result.drainRequests})`,
   )
+})
+
+test('o3d-11rf r3: a concurrent unrelated Xero caller is NOT charged to the recheck', async () => {
+  reset()
+  // Codex r2 MEDIUM, and it is a defect in o3d-pzu0 r2's OWN FIX. That round corrected an
+  // under-report by measuring the delta of `xeroHttpAttemptCount()` across the recheck — a
+  // PROCESS-WIDE counter — so it swapped a number that excluded the recheck's own calls for one that
+  // included every other job's. It shipped with the claim that the payment-write lock made the
+  // interval exclusive; that lock excludes the payment RECONCILE job and nothing else, so main sync,
+  // the daily batch, a manual sync and the outbox were all free to run during the await.
+  state.invoices = []
+  state.activityRows = [withheldMarker()]
+  state.purchaseInvoices = [paidBillRow()]
+  state.syncLogs = [billRegistration({ status: 'CANCELLED', externalTransactionId: null, syncedAt: null })]
+  state.recheckInvoices = [bill({ AmountPaid: 0, AmountDue: 500 })]
+  // Seven attempts by somebody else, landing inside the recheck's await.
+  state.unrelatedAttemptsDuringRecheck = 7
+
+  const attemptsBefore = state.attempts
+  const result = await poll()
+
+  // The recheck genuinely went to Xero, and the other job genuinely ran — without BOTH of these the
+  // rest of this test is vacuous, and the second is what the process-wide measure would have read.
+  assert.deepEqual(state.recheckFetches, ['Invoices?IDs=XB1'])
+  assert.ok(
+    state.attempts - attemptsBefore >= 8,
+    `the unrelated traffic really did move the process-wide counter, got ${state.attempts - attemptsBefore}`,
+  )
+
+  assert.equal(
+    result.recheckRequests, 1,
+    'THE POINT: the recheck reports the one attempt IT made, not the eight the process made',
+  )
+  assert.equal(result.xeroRequests, result.drainRequests + result.recheckRequests)
+})
+
+test('o3d-11rf r3: a concurrent unrelated Xero caller is not charged to the drain budget either', async () => {
+  reset()
+  // The same primitive, the same defect, and it matters MORE here because this number is not only
+  // reported: it is a per-poll ceiling. Charging another job's traffic to it makes the drain stop
+  // early, hold its cursor and report a backlog it never actually spent its budget on.
+  state.invoices = []
+  state.unrelatedAttemptsDuringDrain = 9
+
+  const attemptsBefore = state.attempts
+  const result = await poll()
+
+  assert.ok(
+    state.attempts - attemptsBefore >= 10,
+    `the unrelated traffic really did move the process-wide counter, got ${state.attempts - attemptsBefore}`,
+  )
+  assert.equal(
+    result.drainRequests, 1,
+    'THE POINT: a one-page drain spent one attempt, whatever else the process was doing',
+  )
+  assert.equal(result.recheckRequests, 0, 'and nothing is invented for a recheck that never ran')
+  assert.equal(result.xeroRequests, 1)
 })
 
 test('o3d-pzu0 r2: a poll with no due recheck reports the drain and nothing invented', async () => {

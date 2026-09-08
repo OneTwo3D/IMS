@@ -1462,3 +1462,175 @@ test('[o3d-anu8] the identical row written back by the connector still silences 
 
   assert.equal(codes.includes('terminal_refunded_order_missing_credit_note_evidence'), false)
 })
+
+// --- o3d-11rf r3: the VOID mirrors nobody can classify, and the live rows they are blocking ---
+
+/**
+ * o3d-11rf r3 (Codex r2, HIGH) — THE OTHER HALF OF "REPAIR WHAT YOU CAN PROVE".
+ *
+ * The backfill migration repairs every historical NOT_POSTED settlement void it can prove from two
+ * independent witnesses and refuses every one it cannot. What it cannot prove stays NULL, and NULL is
+ * never revivable — so a live sync row that is still working on that document will never post, and
+ * nothing else in the product says so: the accounting health view excludes VOID events, and
+ * reconciliation's own existence check treats ANY matching event as present. A migration that
+ * repaired what it could and said nothing about the rest would have abandoned the rest silently,
+ * which is the thing Codex's HIGH is actually about.
+ *
+ * THE PAIRING IS THE FINDING, NOT THE NULL. Nearly every VOID in a mature database is a legitimate
+ * cancellation from before the column existed; reporting all of them would bury the few that matter,
+ * which is the failure mode the assumed-order finding next door already names. So these fixtures pin
+ * the boundary in both directions — the shapes that must NOT be reported are what stop this passing
+ * against a rule that simply reports every VOID.
+ */
+function unexplainedVoidRows(): AccountingReconciliationRows {
+  const rows = cleanRows()
+  rows.accountingEvents = [{
+    id: 'event-void',
+    type: 'SALES_INVOICE',
+    sourceEntityType: 'SalesOrder',
+    sourceEntityId: 'order-1',
+    businessDate: A1_DATE,
+    status: 'VOID',
+    idempotencyKey: 'xero:SALES_INVOICE:SalesOrder:order-1',
+    externalSystem: 'xero',
+    externalId: null,
+    voidBasis: null,
+  }]
+  rows.syncLogs = [{
+    id: 'sync-live',
+    connector: 'xero',
+    type: 'SALES_INVOICE',
+    status: 'PENDING',
+    referenceType: 'SalesOrder',
+    referenceId: 'order-1',
+    externalTransactionId: null,
+    payload: null,
+    settlementBasis: null,
+  }]
+  return rows
+}
+
+function unexplainedVoidFindings(rows: AccountingReconciliationRows) {
+  return evaluateAccountingReconciliationRows(rows)
+    .filter((finding) => finding.code === 'void_mirror_basis_unknown_with_live_sync_row')
+}
+
+test('o3d-11rf r3: the report actually READS voidBasis — without it the finding can never fire', async () => {
+  // The evaluator tests below all hand `voidBasis` in on a fixture. That proves the rule and proves
+  // nothing about production, where the column has to be SELECTED or every event arrives with it
+  // undefined — which this finding reads as "no writer said" and would therefore report on every
+  // VOID in the database. A rule that is right on fixtures and catastrophic in production is exactly
+  // the shape the assumed-order dataset test next door was written to catch.
+  const calls: Record<string, unknown> = {}
+  const client = {
+    salesOrder: { async findMany() { return [] } },
+    shipment: { async findMany() { return [] } },
+    salesOrderRefund: { async findMany() { return [] } },
+    accountingSyncLog: { async findMany() { return [] } },
+    accountingEvent: {
+      async findMany(args: unknown) {
+        calls.accountingEvent = args
+        return []
+      },
+    },
+    accountingEventLog: { async findMany() { return [] } },
+  }
+
+  await collectAccountingReconciliationRows(client, { lookbackDays: 30, toDate: new Date('2026-08-20T00:00:00.000Z') })
+
+  const call = calls.accountingEvent as { select?: Record<string, unknown> }
+  assert.ok(call, 'the events are read at all')
+  assert.equal(call.select?.voidBasis, true, 'and the basis comes with them')
+})
+
+test('o3d-11rf r3: an unexplained VOID mirror with a live sync row is reported, with both rows named', () => {
+  const findings = unexplainedVoidFindings(unexplainedVoidRows())
+
+  assert.equal(findings.length, 1)
+  assert.equal(findings[0].severity, 'warning', 'unclassifiable is not the same as known-broken')
+  assert.equal(findings[0].accountingEventId, 'event-void', 'keyed to the row that must be repaired')
+  assert.deepEqual(findings[0].details, {
+    connector: 'xero',
+    syncType: 'SALES_INVOICE',
+    referenceType: 'SalesOrder',
+    referenceId: 'order-1',
+    syncLogIds: ['sync-live'],
+    syncLogStatuses: ['PENDING'],
+    idempotencyKey: 'xero:SALES_INVOICE:SalesOrder:order-1',
+  }, 'so the judgement can be made without opening the audit tables')
+})
+
+test('o3d-11rf r3: a VOID a writer DID explain is not reported, in either direction', () => {
+  // The whole point of the column is that these two are no longer one bit. A finding that fired for
+  // them would be reporting the fix as a defect, and would bury the rows that need a person.
+  for (const basis of ['source_cancelled', 'attempt_settled_not_posted']) {
+    const rows = unexplainedVoidRows()
+    rows.accountingEvents[0].voidBasis = basis
+    assert.deepEqual(unexplainedVoidFindings(rows), [], `a ${basis} void is explained, so nothing is owed`)
+  }
+})
+
+test('o3d-11rf r3: an unexplained VOID with nothing live beside it is NOT reported', () => {
+  // Almost every VOID in a mature database is a pre-column cancellation with no live work against
+  // it. Reporting those is how a surface stops being read at all.
+  const rows = unexplainedVoidRows()
+  rows.syncLogs[0].status = 'SYNCED'
+  rows.syncLogs[0].externalTransactionId = 'INV-7'
+  assert.deepEqual(unexplainedVoidFindings(rows), [], 'a row that already posted is not work a VOID mirror is blocking')
+
+  const none = unexplainedVoidRows()
+  none.syncLogs = []
+  assert.deepEqual(unexplainedVoidFindings(none), [], 'and neither is a void with no sync row at all')
+})
+
+test('o3d-11rf r3: a live row carrying a document id is NOT reported — that is a different disagreement', () => {
+  // o3d-ju8t: a row with an externalTransactionId describes a document that EXISTS, so it is not
+  // work owed and reviving its mirror is not the remedy. `posted_event_without_external_id` and the
+  // duplicate-reference findings are where that surfaces.
+  const rows = unexplainedVoidRows()
+  rows.syncLogs[0].externalTransactionId = 'INV-8'
+  assert.deepEqual(unexplainedVoidFindings(rows), [])
+})
+
+test('o3d-11rf r3: a live row in a DIFFERENT scope does not implicate this void', () => {
+  // The match is the mirror's own scope tuple. A rule that matched more loosely would name a
+  // document the operator has no reason to look at, next to one they do.
+  for (const change of [
+    (rows: AccountingReconciliationRows) => { rows.syncLogs[0].connector = 'quickbooks' },
+    (rows: AccountingReconciliationRows) => { rows.syncLogs[0].type = 'CREDIT_NOTE' },
+    (rows: AccountingReconciliationRows) => { rows.syncLogs[0].referenceType = 'Shipment' },
+    (rows: AccountingReconciliationRows) => { rows.syncLogs[0].referenceId = 'order-2' },
+  ]) {
+    const rows = unexplainedVoidRows()
+    change(rows)
+    assert.deepEqual(unexplainedVoidFindings(rows), [], 'a different scope is a different document')
+  }
+})
+
+test('o3d-11rf r3: a PROCESSING row counts as live, and every contradicting row is named', () => {
+  const rows = unexplainedVoidRows()
+  rows.syncLogs.push({
+    ...rows.syncLogs[0], id: 'sync-live-2', status: 'PROCESSING',
+  })
+
+  const findings = unexplainedVoidFindings(rows)
+  assert.equal(findings.length, 1, 'one finding per VOID mirror, not one per sync row')
+  assert.deepEqual(
+    (findings[0].details as { syncLogIds: string[] }).syncLogIds,
+    ['sync-live', 'sync-live-2'],
+    'and it names every row whose work the void is blocking',
+  )
+  assert.deepEqual(
+    (findings[0].details as { syncLogStatuses: string[] }).syncLogStatuses,
+    ['PENDING', 'PROCESSING'],
+  )
+})
+
+test('o3d-11rf r3: a fixture predating the column reads as unexplained, not as explained', () => {
+  // `voidBasis` is optional on the row type so pre-existing fixtures still compile. Absent must read
+  // the same as NULL — both are "no writer said", which IS the condition — or every such fixture
+  // would silently opt out of the check.
+  const rows = unexplainedVoidRows()
+  delete (rows.accountingEvents[0] as { voidBasis?: string | null }).voidBasis
+  assert.equal(unexplainedVoidFindings(rows).length, 1)
+})
