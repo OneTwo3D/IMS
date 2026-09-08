@@ -5070,6 +5070,57 @@ test('[o3d-ov60] a FIFO planted at the partial file is REFUSED, and does not han
     'and it never got as far as its own `rm -f --`, which is what "hang" means here')
 })
 
+test('[o3d-ov60] an ordinary file already at the partial\'s name is refused, not written on top of', (t) => {
+  /**
+   * WHAT MAKES `O_EXCL` LOAD-BEARING RATHER THAN DECORATIVE.
+   *
+   * The two tests above would both pass on an open that had only `O_NOFOLLOW|O_NONBLOCK`: a symlink
+   * is ELOOP and a writer's FIFO with no reader is ENXIO, so both still refuse. A REGULAR file is
+   * the case that separates them — an open without `O_EXCL` succeeds on it, and with no `O_TRUNC`
+   * writes the new dump OVER the front of the old one and leaves whatever was longer behind the
+   * end. `mv -T` then publishes that as this run's restore point.
+   *
+   * IT IS NOT A HYPOTHETICAL SHAPE. `<stamp>.sql.gz.part` is exactly what a previous cutover leaves
+   * at that name when it is SIGKILLed between the dump and the publication, and the stamp has
+   * one-second resolution.
+   */
+  const plant = (prefix: string) => {
+    const root = createTempDirSync(prefix, t)
+    const parent = join(root, 'var-backups')
+    mkdirSync(parent)
+    const backupDir = join(parent, 'one-two-inventory')
+    mkdirSync(backupDir)
+    const partial = join(backupDir, `${BACKUP_TARGET_BASE}.part`)
+    // Longer than what the rig's `pg_dump` produces, so an open without O_TRUNC leaves a tail and
+    // the reading is "this was written over", not merely "this was rewritten".
+    writeFileSync(partial, `${'EARLIER-TRUNCATED-DUMP-'.repeat(64)}\n`)
+    return { backupDir, partial, before: readFileSync(partial, 'utf8') }
+  }
+
+  const shipped = plant('ims-ov60-existing-')
+  const run = runBash(backupRig(UPDATE_BACKUP_DIR, [`BACKUP_DIR=${q(shipped.backupDir)}`]))
+  assert.equal(run.status, 1, `a file already at the partial's name must END the run: ${run.stdout} ${run.stderr}`)
+  assert.ok(!run.stdout.includes(REACHED), 'and nothing after it may execute')
+  assert.match(run.stderr, /write-new-file: .*\.part could not be CREATED/,
+    `and the refusal must come from the create: ${run.stderr}`)
+  assert.equal(existsSync(join(shipped.backupDir, BACKUP_TARGET_BASE)), false,
+    'and nothing may be published as this run\'s restore point')
+
+  // MEASURED BY MUTATION, ROUTE STATED: the helper with `O_EXCL` taken out of its one open, which
+  // is the flag `set -C` silently dropped and the flag the two tests above cannot see.
+  const mutantHelper = join(createTempDirSync('ims-ov60-existing-mutant-', t), 'write-new-file.mjs')
+  const withoutExcl = readFileSync(BACKUP_WRITER_HELPER, 'utf8').replace(' | constants.O_EXCL\n', '\n')
+  assert.notEqual(withoutExcl, readFileSync(BACKUP_WRITER_HELPER, 'utf8'),
+    'precondition: the flag must have been removed, or this runs the subject twice')
+  writeFileSync(mutantHelper, withoutExcl)
+  const mutant = plant('ims-ov60-existing-mutant-run-')
+  runBash(backupRig(UPDATE_BACKUP_DIR, [`BACKUP_DIR=${q(mutant.backupDir)}`],
+    [`IMS_BACKUP_WRITER_HELPER=${q(mutantHelper)}`]))
+  assert.notEqual(readFileSync(join(mutant.backupDir, BACKUP_TARGET_BASE), 'utf8'), mutant.before,
+    'THE FINDING: without O_EXCL the run writes over the file already at that name and publishes '
+    + 'the result as a restore point')
+})
+
 test('[o3d-ov60] a directory planted at the restore point\'s own name is refused, not published into', (t) => {
   const plant = (prefix: string) => {
     const root = createTempDirSync(prefix, t)

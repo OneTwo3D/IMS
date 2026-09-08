@@ -34,9 +34,12 @@
  *     here rather than a second attempt. This is the flag `set -C` silently dropped.
  *   • O_NOFOLLOW — redundant beside O_CREAT|O_EXCL, which never follows a final-component symlink,
  *     and stated anyway: the refusal must not depend on a reader knowing that.
- *   • O_NONBLOCK — so that even a kernel or filesystem that somehow answered this open with a FIFO
- *     returns instead of waiting. It is the flag whose ABSENCE is the finding, and on the regular
- *     file O_EXCL guarantees was just created it has no effect on the writes below.
+ *   • O_NONBLOCK — so that an open which somehow reached a FIFO RETURNS instead of waiting. Stated
+ *     honestly: no regression can kill this one on its own, because O_EXCL above already refuses a
+ *     named pipe with EEXIST and the open never gets far enough to block. It is here because the
+ *     finding is a HANG and the flag that ends a hang costs nothing — on the regular file O_EXCL
+ *     guarantees was just created it has no effect on the writes below. Removing it passes every
+ *     test in tests/scripts/install-root-safe-writes.test.ts; removing O_EXCL does not.
  *
  * `<dir>` is passed as `/proc/self/fd/N` by the caller, N being the descriptor scripts/update.sh
  * holds on the backup directory it walked into and proved. The kernel resolves that prefix to the
