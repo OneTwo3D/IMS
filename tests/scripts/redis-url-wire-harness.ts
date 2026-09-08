@@ -201,6 +201,96 @@ type FakeRedis = {
   close(): Promise<void>
 }
 
+/**
+ * A Redis that ENFORCES `requirepass` and records everything (o3d-g42a).
+ *
+ * `startFakeRedis()` below answers `+OK` to whatever it is sent, which is all the encoder tests
+ * need: they assert on the ARGUMENT of `AUTH`, and a server that never refuses cannot change what
+ * arrived. The installer's rate-limit decision needs the other half — a Redis that says NO — because
+ * the question it answers is "will the application be able to talk to this?", and the failure it
+ * must not mistake for success is a Redis that is up and refusing us. `requirepass` disagreeing with
+ * the URL by one byte is exactly the o3d-tsc0 defect, and its symptom is `NOAUTH`/`WRONGPASS` on
+ * every command — indistinguishable, to a limiter that fails closed, from no Redis at all.
+ *
+ * So this one implements the parts of the state machine that can say no, in redis's own words:
+ *
+ *   requirePassword: null   no `requirepass`. `AUTH` is then an ERROR, as it is on a real server —
+ *                           a client that sends a password to a server with none configured is
+ *                           misconfigured, and real Redis tells it so.
+ *   requirePassword: '...'  every command before a correct `AUTH` is refused with `-NOAUTH`, a
+ *                           wrong one with `-WRONGPASS`, and the comparison is on the BYTES that
+ *                           arrived so an encoding that only agrees with itself cannot pass.
+ *
+ * `EVAL` is answered the way `startFakeRedis` answers it so that the production
+ * `RedisRateLimitBackend` can run a real `check()` against this server too — which is what lets the
+ * probe and the application be compared on one wire rather than by inspection.
+ */
+export type RecordingRedis = {
+  port: number
+  /** Every command that arrived, in order, across every connection. */
+  commands: string[][]
+  close(): Promise<void>
+}
+
+export async function startRecordingRedis(
+  options: { requirePassword?: string | null } = {},
+): Promise<RecordingRedis> {
+  const requirePassword = options.requirePassword ?? null
+  const commands: string[][] = []
+  const sockets = new Set<net.Socket>()
+
+  const server = net.createServer((socket) => {
+    sockets.add(socket)
+    socket.on('close', () => sockets.delete(socket))
+    let authenticated = requirePassword === null
+    let buffer = Buffer.alloc(0)
+    socket.on('data', (chunk) => {
+      buffer = Buffer.concat([buffer, chunk])
+      const parsed = parseCommands(buffer)
+      buffer = Buffer.from(parsed.rest)
+      for (const command of parsed.commands) {
+        commands.push(command)
+        const name = command[0]?.toUpperCase() ?? ''
+        if (name === 'AUTH') {
+          if (requirePassword === null) {
+            socket.write('-ERR Client sent AUTH, but no password is set\r\n')
+          } else if (command[command.length - 1] === requirePassword) {
+            authenticated = true
+            socket.write('+OK\r\n')
+          } else {
+            socket.write('-WRONGPASS invalid username-password pair\r\n')
+          }
+          continue
+        }
+        if (!authenticated) {
+          socket.write('-NOAUTH Authentication required.\r\n')
+          continue
+        }
+        if (name === 'PING') socket.write('+PONG\r\n')
+        // {allowed, count, retryAfterMs} — one allowed request, as startFakeRedis answers it.
+        else if (name === 'EVAL') socket.write('*3\r\n:1\r\n:1\r\n:0\r\n')
+        else socket.write('+OK\r\n')
+      }
+    })
+    socket.on('error', () => undefined)
+  })
+
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve))
+  const address = server.address()
+  assert.ok(address && typeof address === 'object', 'the recording Redis did not bind')
+
+  return {
+    port: address.port,
+    commands,
+    // Sockets the application client is holding open for its idle window would keep `close()`
+    // pending, and a harness that hangs on teardown is reported as a leak rather than as a bug.
+    close: () => new Promise<void>((resolve) => {
+      for (const socket of sockets) socket.destroy()
+      server.close(() => resolve())
+    }),
+  }
+}
+
 async function startFakeRedis(): Promise<FakeRedis> {
   const seen: string[][] = []
   let resolveReceived: (value: string[][]) => void = () => undefined

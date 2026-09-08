@@ -264,6 +264,94 @@ redis_url_credential_state() {
   printf 'ambiguous'
 }
 
+# ---------------------------------------------------------------------------
+# WHICH RATE LIMITER THE APPLICATION IS GIVEN (o3d-g42a)
+# ---------------------------------------------------------------------------
+# This installer provisioned Redis, set `requirepass` on it, wrote REDIS_URL, REDIS_PASSWORD and
+# REDIS_KEY_PREFIX -- and never wrote RATE_LIMIT_BACKEND, so lib/security/rate-limit.ts defaulted to
+# `memory` on every host it has ever built. Redis was provisioned, secured, and then unused.
+#
+# THE TWO VALUES ARE NOT SYMMETRIC, and that asymmetry is the whole of the design below:
+#
+#   memory  per-process counters. Exactly right for one replica; weaker than the docs describe for
+#           several. It is also what every installer-built host has today, so it cannot regress one.
+#   redis   the shared limiter the docs describe -- IF the URL answers. If it does not, it is a
+#           total sign-in LOCKOUT rather than a degradation: the login and TOTP buckets are checked
+#           with `failClosed: true` (lib/auth/config.ts), and checkRateLimit() DENIES when the
+#           backend throws.
+#
+# So `redis` is written only on positive evidence, and it is NEVER inferred from REDIS_URL being
+# non-empty. The external-Redis prompt DEFAULTS that variable to redis://localhost:6379, so an
+# operator who answered "n" to "Install Redis on this server?" and pressed Enter through the rest
+# holds a non-empty URL naming a Redis that need not exist. The evidence required is an explicit
+# opt-in AND a PING answered by that exact URL, with that exact credential, moments before the
+# environment file is written.
+
+# Does the URL the application is about to be handed answer PING, right now?
+#
+# The probe is a separate program rather than a `redis-cli -u`, because the URL parse has to be the
+# APPLICATION'S parse: the password is percent-encoded INTO the URL (o3d-tsc0) and redis-cli does
+# not decode userinfo, so a redis-cli probe would be answering about a credential nothing sends.
+# scripts/lib/redis-ping.mjs says the rest, including the regression that binds its parse to
+# redisConnectionOptions() on the wire instead of by inspection.
+#
+# ANYTHING THAT IS NOT A PONG IS A NO -- no node, no probe file, a refused connection, NOAUTH,
+# WRONGPASS, a timeout, an error nobody predicted. Absence of evidence has to fall back to `memory`,
+# because the alternative is a brand new production server nobody can sign in to.
+redis_ping_answers() {
+  local url="$1" fallback_password="${2:-}" probe output status
+  REDIS_PING_DETAIL=""
+  if [[ -z "${url}" ]]; then
+    REDIS_PING_DETAIL="REDIS_URL is empty"
+    return 1
+  fi
+  probe="${IMS_REDIS_PING_PROBE:-${IMS_SCRIPT_LIB_DIR:-}/redis-ping.mjs}"
+  if [[ ! -f "${probe}" ]]; then
+    REDIS_PING_DETAIL="the Redis probe at ${probe} is not there to run"
+    return 1
+  fi
+  if ! command -v node >/dev/null 2>&1; then
+    REDIS_PING_DETAIL="node is not on PATH, so the Redis probe cannot run"
+    return 1
+  fi
+  # THE URL TRAVELS IN THE ENVIRONMENT, NOT IN argv. It carries the Redis password, and
+  # /proc/<pid>/cmdline is world-readable while /proc/<pid>/environ is not.
+  output="$(IMS_REDIS_PING_URL="${url}" \
+            IMS_REDIS_PING_PASSWORD="${fallback_password}" \
+            IMS_REDIS_PING_TIMEOUT_MS="${REDIS_PING_TIMEOUT_MS:-5000}" \
+            node "${probe}" 2>&1)" && status=0 || status=$?
+  REDIS_PING_DETAIL="${output}"
+  return "${status}"
+}
+
+# `memory` FIRST, and exactly ONE line below can change it -- the one inside the probe's `if`.
+#
+# Written this way round on purpose: every route out of this function that is not a PONG leaves the
+# assignment that was made before anything could fail, so a `return` added later, an error, or a
+# branch nobody thought of all land on the value that cannot lock anybody out.
+resolve_rate_limit_backend() {
+  RATE_LIMIT_BACKEND=memory
+  if [[ "${RATE_LIMIT_BACKEND_REQUESTED}" != "redis" ]]; then
+    info "Rate limiter: in-memory, per-process. That is correct for a single replica; if you run more than one, point RATE_LIMIT_BACKEND=redis at a REDIS_URL that answers."
+    return 0
+  fi
+  # Three attempts, because `systemctl restart redis-server` returning is not quite the same
+  # instant as the server accepting connections.
+  local attempt
+  for attempt in 1 2 3; do
+    if redis_ping_answers "${REDIS_URL}" "${REDIS_PASSWORD_ENV}"; then
+      RATE_LIMIT_BACKEND=redis
+      success "Rate limiter: Redis. REDIS_URL answered PING, so login and cron counters are shared across replicas."
+      return 0
+    fi
+    if [[ "${attempt}" != 3 ]]; then
+      sleep 1
+    fi
+  done
+  warn "Redis was asked for as the rate-limit backend and did not answer PING, so RATE_LIMIT_BACKEND is being written as 'memory' rather than 'redis': ${REDIS_PING_DETAIL}. THIS IS DELIBERATE, and it is not the smaller failure it looks like: the sign-in rate-limit buckets fail CLOSED, so a limiter pointed at a Redis that does not answer is not a slower login page, it is NOBODY BEING ABLE TO LOG IN. Per-process counters are what every previous install of this application has had. Fix REDIS_URL and re-run this installer to pick it up."
+  return 0
+}
+
 # A prompt default is echoed to the terminal and captured by any typescript of the
 # install, so a credential recovered from an existing .env is NEVER the thing shown.
 # Pressing Enter still keeps the real value.
@@ -8026,6 +8114,38 @@ if [[ "${REDIS_URL_HAS_CREDENTIAL}" == "y" ]]; then
   REDIS_PASSWORD_ENV=""
 fi
 
+# THE RATE LIMITER IS AN OPT-IN, NOT AN INFERENCE (o3d-g42a). See resolve_rate_limit_backend().
+#
+# INSTALL_REDIS=y means "this run provisioned, secured and started a Redis on this host", which is
+# the only branch where a reachable Redis is this installer's own doing. The predicate is spelled
+# byte for byte as section 7's is, because the two must not be able to disagree: a run that decided
+# `redis` here and installed nothing there would write a backend for a server that does not exist.
+#
+# The external-Redis operator is ASKED instead, because their REDIS_URL may be a default they never
+# looked at. The question defaults to what the PREVIOUS run committed to, so an upgrade does not
+# silently downgrade a working multi-replica deployment to per-process counters.
+#
+# Neither answer writes anything yet: both are re-checked against a live PING further down, once
+# section 7 has actually started the server.
+RATE_LIMIT_BACKEND_REQUESTED=memory
+if [[ "$INSTALL_REDIS" == "y" ]]; then
+  RATE_LIMIT_BACKEND_REQUESTED=redis
+else
+  RATE_LIMIT_REDIS_DEFAULT=n
+  if [[ "$(existing_env RATE_LIMIT_BACKEND)" == "redis" ]]; then
+    RATE_LIMIT_REDIS_DEFAULT=y
+  fi
+  prompt_yn RATE_LIMIT_REDIS "Use Redis for rate limiting? (only needed when you run more than one replica)" "${RATE_LIMIT_REDIS_DEFAULT}"
+  if [[ "$RATE_LIMIT_REDIS" == "y" ]]; then
+    RATE_LIMIT_BACKEND_REQUESTED=redis
+  fi
+fi
+# Declared before anything can read it. The .env heredoc interpolates it under `set -u`, and
+# write_app_env_file() is reachable from the rotation window as well as from section 10, so an
+# unset variable here is a dead shell in the middle of a fenced migration rather than a missing
+# line. resolve_rate_limit_backend() replaces this with the answer.
+RATE_LIMIT_BACKEND=memory
+
 echo ""
 info "--- WooCommerce (optional — can be configured later in Settings) ---"
 prompt WC_STORE_URL       "WooCommerce store URL"      ""
@@ -8271,6 +8391,13 @@ if [[ "$INSTALL_REDIS" == "y" ]]; then
   systemctl restart redis-server
   success "Redis configured and started."
 fi
+
+# ASKED HERE, WHICH IS AFTER THE SERVER EXISTS AND BEFORE THE .env IS WRITTEN (o3d-g42a).
+#
+# Section 10 publishes REDIS_URL and RATE_LIMIT_BACKEND together, and nothing between here and
+# there changes the URL, so this is the latest moment at which the evidence is still about the
+# value that gets written -- and the earliest at which a Redis this run installed is running.
+resolve_rate_limit_backend
 
 # ---------------------------------------------------------------------------
 # 8. App user and directories
@@ -8708,6 +8835,11 @@ AUTH_URL=https://${APP_DOMAIN}
 REDIS_URL=${REDIS_URL}
 REDIS_PASSWORD=${REDIS_PASSWORD_ENV}
 REDIS_KEY_PREFIX=${REDIS_KEY_PREFIX}
+# memory (per-process) or redis (shared across replicas). Written by the installer as `redis` ONLY
+# when the operator opted in AND the REDIS_URL above answered PING at install time (o3d-g42a). Do
+# not set it to redis by hand without checking that Redis answers: the login rate-limit buckets
+# fail closed, so an unreachable backend here is a sign-in lockout, not a slower login page.
+RATE_LIMIT_BACKEND=${RATE_LIMIT_BACKEND}
 
 WC_STORE_URL=${WC_STORE_URL}
 WC_CONSUMER_KEY=${WC_CONSUMER_KEY}
