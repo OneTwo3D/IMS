@@ -161,6 +161,40 @@ export function startCluster(
     chmodSync(join(data, 'server.key'), 0o600)
     writeFileSync(join(data, 'postgresql.conf'), `${readFileSync(join(data, 'postgresql.conf'), 'utf8')}\nssl = on\n`)
   }
+  return bringUp(root, name, data, socket, port, listen)
+}
+
+/**
+ * A PHYSICAL CLONE OF A RUNNING CLUSTER, STARTED AS ITS OWN PRIMARY (o3d-secops r29, Codex HIGH 2).
+ *
+ * `pg_basebackup` is what a restored snapshot, a staging copy and a base-backup standby all begin
+ * as, and the finding is about what such a copy INHERITS: measured on PostgreSQL 17 it carries the
+ * source's system identifier, its database OIDs and -- when it is started directly rather than
+ * promoted out of recovery -- its timeline id, while its ACL holds only what had been replayed by
+ * the moment the copy was taken. A test that faked this would be testing its author's model of
+ * physical replication, which is exactly the thing the finding says was modelled wrongly.
+ *
+ * The source must admit a replication connection: pass `['local replication all trust']` to
+ * startCluster()'s `hbaHostLines`, because a `local all` rule does NOT match one.
+ */
+export function cloneCluster(root: string, source: Cluster, name: string, port: number, listen = ''): Cluster {
+  const bin = pgBinDir()
+  const data = join(root, name, 'data')
+  const socket = join(root, name, 'sock')
+  mkdirSync(socket, { recursive: true })
+  execFileSync(join(bin, 'pg_basebackup'), [
+    '-D', data,
+    '-h', source.socket,
+    '-p', String(source.port),
+    '-U', currentUser(),
+    '-X', 'stream',
+  ], { stdio: 'pipe', env: cleanLibpqEnv() })
+  return bringUp(root, name, data, socket, port, listen)
+}
+
+/** pg_ctl-start a data directory that already exists, however it came to exist. */
+function bringUp(root: string, name: string, data: string, socket: string, port: number, listen: string): Cluster {
+  const bin = pgBinDir()
   execFileSync(join(bin, 'pg_ctl'), [
     '-D', data,
     '-l', join(root, name, 'pg.log'),

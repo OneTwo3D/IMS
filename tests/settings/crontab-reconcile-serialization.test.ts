@@ -19,6 +19,8 @@ import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import test, { mock } from 'node:test'
 
+import { shellConstant } from '../scripts/shell-symbol.ts'
+
 // ---------------------------------------------------------------------------
 // Codex r21 HIGH + r22 HIGH x2 — THE CRONTAB HAS EXACTLY ONE EXCLUSION PROTOCOL,
 // AND EVERY WRITER JOINS IT.
@@ -1132,11 +1134,23 @@ test('[o3d-batch-ret] every crontab writer in the repository is inside the one e
     ['scripts/lib/crontab-lock.sh', 'scripts/lib/crontab-lock.sh'],
     'the two `chown -h root:root` calls in prepare_crontab_lock — the directory and the file — and '
     + 'no entrypoint may have grown one of its own')
+  // A `chown` COMMAND, not any word beginning with those five letters (o3d-n8xx). The rule is that
+  // no root-side ownership change may name the service account and a lock path in the same
+  // statement; `chown_state_tree "${DATA_DIR}" "${APP_USER}" "${CRONTAB_LOCK_DIRNAME}" …` names both
+  // and is the OPPOSITE of the defect — the lock name is its PRUNE argument, which is what keeps
+  // the lock out of the walk. `\bchown\b` tells the two apart, because `_` is a word character, and
+  // the prune's own correctness is asserted where it can be measured rather than spelled: see
+  // tests/scripts/install-root-safe-writes.test.ts, which runs the shipped walk over a real tree
+  // and requires the lock directory's ctime to be unchanged afterwards.
   for (const [name, src] of [['scripts/lib/crontab-lock.sh', CRONTAB_LOCK_LIB_SRC] as [string, string],
     ...SHELL_ENTRYPOINTS]) {
-    assert.doesNotMatch(src, /chown[^\n]*\$\{APP_USER\}[^\n]*\$\{CRONTAB_LOCK_/,
+    assert.doesNotMatch(src, /\bchown\b[^\n]*\$\{APP_USER\}[^\n]*\$\{CRONTAB_LOCK_/,
       `${name}: the lock must never be handed to the service user — that is what made an installer `
       + 're-run a privilege-escalation primitive (r24 CRITICAL)')
+    // NOT VACUOUS: the rule still fires on the statement it is about, appended to the same source.
+    assert.match(`${src}\nchown "\${APP_USER}:\${APP_USER}" "\${CRONTAB_LOCK_DIR}"\n`,
+      /\bchown\b[^\n]*\$\{APP_USER\}[^\n]*\$\{CRONTAB_LOCK_/,
+      `${name}: the guard must still catch a real chown of the lock path`)
   }
   assert.ok(
     installLines.findIndex((l) => l === 'prepare_crontab_lock') < taken,
@@ -1214,9 +1228,11 @@ test('[o3d-batch-ret] the census fails on a FIFTEENTH writer, wherever it is put
 const COMPOSED_LOCK_NAMES = ['CRONTAB_LOCK_DIR', 'CRONTAB_LOCK_FILE']
 async function installerResolves(names: string[]): Promise<Record<string, string>> {
   const defs = names.filter((name) => !COMPOSED_LOCK_NAMES.includes(name)).map((name) => {
-    const line = INSTALL_SH.match(new RegExp(`^${name}="[^"]*"$`, 'm'))
-    assert.ok(line, `scripts/install.sh must define ${name} on one line`)
-    return line![0]
+    // o3d-secops: APP_NAME, APP_DIR and DATA_DIR are protected publication constants and their
+    // declarations begin `readonly`, so the line is resolved by scope rather than by an anchor on
+    // the name — and shellConstant() refuses a script that assigns one of them twice, which a
+    // `^NAME=` match would have taken the first of.
+    return shellConstant(INSTALL_SH, name, 'scripts/install.sh')
   })
   const compose = INSTALL_SH.match(/^crontab_lock_paths "\$\{DATA_DIR\}"$/m)
   assert.ok(compose, 'scripts/install.sh must compose its crontab lock path from ${DATA_DIR} '

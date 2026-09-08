@@ -178,7 +178,7 @@ prepare_crontab_lock() {
   # (1) THE DIRECTORY. Plain `mkdir`: a symlink already at this path makes it fail with EEXIST
   # instead of being followed, and we then refuse below rather than working inside it.
   if ! (umask 022; mkdir "${CRONTAB_LOCK_DIR}") 2>/dev/null; then
-    [[ "$(stat -c '%F' "${CRONTAB_LOCK_DIR}" 2>/dev/null || true)" == "directory" ]] || die \
+    [[ "$(LC_ALL=C stat -c '%F' "${CRONTAB_LOCK_DIR}" 2>/dev/null || true)" == "directory" ]] || die \
       "${CRONTAB_LOCK_DIR} exists and is not a directory (a symlink there is how a compromised '${APP_USER}' would aim a root-side write). Remove or fix that path, then run the installer again."
   fi
   # Take/keep root ownership. `-h` so this is safe even if the path became a symlink just now.
@@ -197,7 +197,7 @@ prepare_crontab_lock() {
   fi
   # `stat -c %F` says "regular empty file" for a zero-length one, and this file is ALWAYS empty —
   # nothing ever writes to it. Both spellings are the same st_mode, and neither is a symlink.
-  file_kind="$(stat -c '%F' "${CRONTAB_LOCK_FILE}" 2>/dev/null || true)"
+  file_kind="$(LC_ALL=C stat -c '%F' "${CRONTAB_LOCK_FILE}" 2>/dev/null || true)"
   [[ "${file_kind}" == "regular file" || "${file_kind}" == "regular empty file" ]] || die \
     "${CRONTAB_LOCK_FILE} is not a regular file (it is a ${file_kind:-missing path}). The crontab reconciliation lock must be a plain file that only root can replace; refusing to write to that path."
   chown -h root:root "${CRONTAB_LOCK_FILE}"
@@ -212,7 +212,7 @@ prepare_crontab_lock() {
   # comparison does not already do. What matters is that this is written down; every OTHER capture
   # in this file whose failure is not already a refusal takes its status explicitly, and the
   # repository walk in tests/settings/crontab-reconcile-serialization.test.ts holds that line.
-  dir_meta="$(stat -c '%F|%u|%a' "${CRONTAB_LOCK_DIR}" 2>/dev/null || true)"
+  dir_meta="$(LC_ALL=C stat -c '%F|%u|%a' "${CRONTAB_LOCK_DIR}" 2>/dev/null || true)"
   IFS='|' read -r dir_kind dir_owner dir_mode <<< "${dir_meta}"
   [[ "${dir_kind}" == "directory" && "${dir_owner}" == "${self}" ]] || die \
     "${CRONTAB_LOCK_DIR} must be a directory owned by uid ${self} after preparation, and is '${dir_meta}'."
@@ -220,7 +220,7 @@ prepare_crontab_lock() {
   # other-writable mode would give the lock file back to them, so it is refused, not chmod'ed away.
   (( (8#${dir_mode:-777} & 0022) == 0 )) || die \
     "${CRONTAB_LOCK_DIR} is mode ${dir_mode}: group- or other-writable, so '${APP_USER}' could still replace the lock file inside it. Set it to 0755 and run the installer again."
-  file_meta="$(stat -c '%F|%u' "${CRONTAB_LOCK_FILE}" 2>/dev/null || true)"
+  file_meta="$(LC_ALL=C stat -c '%F|%u' "${CRONTAB_LOCK_FILE}" 2>/dev/null || true)"
   IFS='|' read -r file_kind file_owner <<< "${file_meta}"
   # No mode assertion on the FILE, deliberately: nothing ever reads or writes its contents, and it
   # cannot be replaced from inside a directory the service user cannot write. Only "root owns it and

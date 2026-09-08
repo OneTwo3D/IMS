@@ -480,12 +480,54 @@ header() {
 }
 
 # ---------------------------------------------------------------------------
+# WHY EVERY PROTECTED PUBLICATION CONSTANT BELOW IS `readonly` (o3d-secops, Codex HIGH)
+#
+# tests/scripts/shell-symbol.ts proves each of these names is assigned EXACTLY ONCE at script
+# scope, and the entrypoint tests compare the value across all three scripts. That is a claim
+# about ASSIGNMENT SYNTAX, and bash does not need an assignment word to change a variable:
+#
+#     printf -v PUBLISH_STAGE_DIRNAME %s ../../attacker
+#     read PUBLISH_STAGE_DIRNAME <<<'../../attacker'
+#     declare -n ref=PUBLISH_STAGE_DIRNAME; ref=../../attacker
+#     (( PUBLISH_STAGE_DIRNAME = 0 ))
+#
+# Not one of those is a `NAME=` word, all four take effect, and each one re-aims the staging
+# directory every publication passes through — or, for the other names here, the trust root a
+# destination is checked against and the path it is published to. A scanner can only catch them
+# by ENUMERATING them, which is the losing shape three earlier rounds on this branch already
+# replaced with an authority: the command-position rule gave way to a parse fact, the lexer was
+# paired with bash's own parser, the trusted-root list gave way to a walk from /.
+#
+# SO THE AUTHORITY IS BASH. `readonly` at the canonical declaration makes bash refuse every
+# mutation path, including the ones nobody has listed; the scanner keeps the job it can do —
+# proving there is exactly one declaration — and now also asserts the `readonly` is still
+# there, so deleting this word fails a test rather than silently reopening the surface.
+#
+# NOTHING IN ANY ENTRYPOINT REASSIGNS ONE OF THEM. That was checked before this was applied and
+# is asserted by tests/scripts/install-root-safe-writes.test.ts, which also runs each of the four
+# mutations above against the shipped declaration under a real bash and requires a refusal.
+#
+# AND THE SHARED LIBRARY IS UNDER THE SAME RULE (o3d-secops r2, Codex HIGH). The first round of
+# this applied the word to the entrypoints and stopped at the file boundary, leaving
+# scripts/lib/db-fence-protected.sh — which names the recovery root, the protected tree and the
+# EXECUTABLE HELPER — as ordinary mutable variables, on the grounds that the fence harnesses
+# source it and then point its /etc literals at a scratch directory. That was a property of where
+# the HARNESS substituted, not of the library: it redirects the one trust-root literal in the
+# shipped text now, and the library's sixteen protected constants carry the word at their own
+# canonical declarations. See the block above them there for which names and why.
+#
+# ONE CONSEQUENCE, STATED HERE BECAUSE IT IS ABOUT THIS FILE: a second `source` of that library in
+# one shell is now FATAL — the second `readonly NAME=` is an error and `set -e` takes it. Each
+# entrypoint sources it exactly once, and a test requires that.
+# ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
 # Defaults (overridden by prompts or --non-interactive env vars)
 # ---------------------------------------------------------------------------
-APP_NAME="one-two-inventory"
+readonly APP_NAME="one-two-inventory"
 APP_USER="imsapp"
-APP_DIR="/opt/${APP_NAME}"
-DATA_DIR="/var/lib/${APP_NAME}"
+readonly APP_DIR="/opt/${APP_NAME}"
+readonly DATA_DIR="/var/lib/${APP_NAME}"
 LOG_DIR="/var/log/${APP_NAME}"
 BACKUP_DIR="${DATA_DIR}/backups"
 UPLOAD_STORAGE_DIR="${DATA_DIR}/uploads"
@@ -496,9 +538,9 @@ PUBLIC_UPLOAD_STORAGE_DIR="${DATA_DIR}/public-uploads"
 # directory and the application derives it from $STATE_DIRECTORY (lib/crontab-reconcile-lock.ts).
 NGINX_CONF="/etc/nginx/sites-available/${APP_NAME}"
 NODE_VERSION="22"
-DEPLOY_SSH_DIR="${DATA_DIR}/git-ssh"
+readonly DEPLOY_SSH_DIR="${DATA_DIR}/git-ssh"
 DEPLOY_SSH_KEY_PATH="${DEPLOY_SSH_DIR}/id_ed25519"
-DEPLOY_SSH_KNOWN_HOSTS="${DEPLOY_SSH_DIR}/known_hosts"
+readonly DEPLOY_SSH_KNOWN_HOSTS="${DEPLOY_SSH_DIR}/known_hosts"
 
 # ---------------------------------------------------------------------------
 # THE UPGRADE CUTOVER FENCE (o3d-2sm1.3)
@@ -673,13 +715,109 @@ CUTOVER_STEP="startup"
 # So all four paths are resolved by the SAME expression in all three scripts, defaulting to
 # the application data directory — what the installed unit's AssertPathExists= already names
 # and what docs/installation.md documents for a manual fence.
-CUTOVER_STATE_DIR="${IMS_CUTOVER_STATE_DIR:-${IMS_DEPLOY_STATE_DIR:-${IMS_DATA_DIR:-/var/lib/one-two-inventory}}}"
-FENCE_FILE="${CUTOVER_STATE_DIR}/DEPLOY-FENCED"
-CRON_BACKUP="${CUTOVER_STATE_DIR}/crontab-${APP_USER}.bak"
+readonly CUTOVER_STATE_DIR="${IMS_CUTOVER_STATE_DIR:-${IMS_DEPLOY_STATE_DIR:-${IMS_DATA_DIR:-/var/lib/one-two-inventory}}}"
+# THE HALF OF THE CUTOVER NAMESPACE THAT IS A ROOT-SIDE TARGET (o3d-secops r22, Codex CRITICAL x2).
+#
+# ${CUTOVER_STATE_DIR} above is the APPLICATION'S OWN data directory and is owned by ${APP_USER}:
+# that is what it is for, and it is why `unlink(2)` and `rename(2)` on every name directly beneath
+# it belong to that account. Two of the things this script put there were opened or created BY
+# ROOT, which made both of them primitives rather than state:
+#
+#   ${CUTOVER_STATE_DIR}/cutover.lock  opened `exec 9>`, i.e. O_WRONLY|O_CREAT|O_TRUNC, as root,
+#                                      on a name that account could replace with a symlink to any
+#                                      file root may write. The target was TRUNCATED before the
+#                                      `flock` was even reached, and the `flock` that followed
+#                                      proved only that a lock had been taken, never that it had
+#                                      been taken on this file.
+#   ${CUTOVER_STATE_DIR}/deploy        created `mkdir -p`, which ACCEPTS a symlink-to-directory at
+#                                      the final component, and then `chown`ed and `chmod`ed by
+#                                      path — both of which dereference — handing whatever that
+#                                      link pointed at to ${APP_USER} at mode 0700.
+#
+# SO THEY LIVE UNDER A ROOT-OWNED PARENT, AND THE PATH IS A LITERAL, for exactly the reasons
+# written out for ${DB_ENV_SNAPSHOT_DIR} below: an override only a root-owned source may set is
+# indistinguishable from no override, and a privileged path resolved from a variable the
+# application can set is not a privileged path. Nobody but root may create, replace or unlink a
+# name inside /etc/ims-cutover-state, so there is no symlink left to plant at either of them.
+#
+# WHY NOT /etc/ims-cutover, WHICH r20 ALREADY CREATED. Because that one is 0700 and has to stay
+# 0700 — it holds ${DB_ENV_SNAPSHOT_FILE}, which carries the database password, and ${FENCE_FILE},
+# which is the boot authority — while the connection-fence directory has to be WRITABLE by
+# ${APP_USER}, since the fence script runs as that account. A directory nobody may traverse is
+# writable by nobody. Relaxing the one directory on the box that exists to be private, so that a
+# lock file could live beneath it, is not a trade worth making; this round does not touch it at
+# all. /etc/ims-cutover-state is 0755 and root-owned — the same shape ${DB_FENCE_RECOVERY_DIR}
+# already has, for the same reason.
+#
+# WHAT DOES NOT MOVE: the crontab backup and the crontab lock directory, which stay in
+# ${CUTOVER_STATE_DIR}. The crontab lock is already root-owned inside a root-owned subdirectory
+# and never followed (lib/crontab-lock.sh, r24 CRITICAL). The backup is its own finding and a
+# different shape — nothing truncates or dereferences it; what is wrong is that its PRESENCE and
+# its ABSENCE at that name are both read as answers — and moving the file would not fix that.
+readonly CUTOVER_ROOT_DIR="/etc/ims-cutover-state"
+# THE MARKER'S PARENT DECIDES WHO CAN REMOVE IT (o3d-secops r20, Codex CRITICAL).
+#
+# ${FENCE_FILE} used to default inside ${CUTOVER_STATE_DIR}, which is the application's own data
+# directory. The previous round noticed that the marker was published without an explicit owner and
+# fixed the CHOWN — and ownership was never the protection. A file's mode and owner secure ITS
+# BYTES; the DIRECTORY ENTRY that gives it a name belongs to whoever can write the parent, and that
+# is ${APP_USER}. `unlink(2)` and `rename(2)` ask for write permission ON THE DIRECTORY and ask
+# nothing whatever about the file, so a root-owned 0600 marker inside a directory the service
+# account owns is a marker the service account can delete. Which is the entire fence: the drop-in
+# says `AssertPathExists=!<marker>`, so removing the marker lets the unit start on the next boot,
+# over a schema in whatever state the interrupted cutover left it. Or the marker is renamed aside
+# and one of their own left at the name — and adoption reads that file as an account of what the
+# previous privileged run did, and acts on every line of it.
+#
+# The comment on the ownership fix said these markers are "deliberately root-owned so that the
+# service account cannot forge a fence". Half of that was true. It could not forge the CONTENT; it
+# could always forge the NAME.
+#
+# SO THE MARKER LIVES UNDER A ROOT-OWNED PARENT, AND THE PATH IS A LITERAL, for exactly the reasons
+# written out for ${DB_ENV_SNAPSHOT_DIR} below: an override only a root-owned source may set is
+# indistinguishable from no override, and a privileged path resolved from a variable the
+# application can set is not a privileged path. It is the SAME directory as the environment
+# snapshot — under /etc, whose own parent is root-owned, so the directory's own name cannot be
+# renamed aside or forged either — and that directory is ALREADY one of the publication trust
+# roots, so nothing in the publisher had to move to accept a destination inside it.
+#
+# AND THIS ONE COULD MOVE, WHERE THE STAGING DIRECTORY COULD NOT (o3d-secops r19). A staging
+# directory is where a publication is BUILT, and publication is a `rename(2)` into the
+# destination's own directory: it therefore has to share a filesystem with every destination, and
+# the trust roots span filesystems, so it cannot be relocated to one place. The marker is a
+# DESTINATION and not a stage. publish_durable_file() creates its `.ims-publish` beside the target —
+# here, inside /etc/ims-cutover — and renames within that directory, exactly as it already does for
+# ${DB_ENV_SNAPSHOT_FILE} and ${DB_ROLE_ROTATION_JOURNAL}. Nothing crosses a filesystem, and the
+# r19 argument does not apply.
+#
+# THE REST OF THE NAMESPACE STAYS WHERE IT IS. The cron backup, the connection-fence state and the
+# lock are not what a `AssertPathExists=!` asserts on, the connection-fence state must be WRITABLE
+# by ${APP_USER} because the fence script runs as that account, and moving the lock would split the
+# mutual exclusion the shared namespace exists to give. Only the marker is a boot-time authority.
+readonly FENCE_MARKER_DIR="/etc/ims-cutover"
+readonly FENCE_FILE="${FENCE_MARKER_DIR}/DEPLOY-FENCED"
+# WHERE THE MARKER USED TO LIVE, AND WHY IT IS STILL READ. An installation fenced by a checkout that
+# predates the line above has its marker at this path and a drop-in that names it. A run that looked
+# only at the new path would find no fence, adopt nothing, take a fresh crontab backup over an
+# already-fenced crontab and re-point the drop-in at a file that does not exist — RELEASING, in
+# silence, a fence standing over a possibly half-migrated schema. That is a worse failure than the
+# one being fixed, so it is handled rather than documented: import_relocated_fence_marker()
+# republishes the marker at ${FENCE_FILE} before anything is adopted, and install_reboot_fence()
+# clears the old one only AFTER a drop-in naming the new one has been written, reloaded and
+# verified. At every instant one of the two pairs is fencing the host.
+readonly LEGACY_STATE_DIR_FENCE_FILE="${CUTOVER_STATE_DIR}/DEPLOY-FENCED"
+readonly CRON_BACKUP="${CUTOVER_STATE_DIR}/crontab-${APP_USER}.bak"
 FENCE_DROPIN_DIR="/etc/systemd/system/${APP_NAME}.service.d"
 FENCE_DROPIN_FILE="${FENCE_DROPIN_DIR}/zz-deploy-fence.conf"
-DB_FENCE_DIR="${CUTOVER_STATE_DIR}/deploy"
-DB_FENCE_STATE="${DB_FENCE_DIR}/db-connect-fence.json"
+# Under the root-owned parent since o3d-secops r22, and still owned by ${APP_USER} at 0700,
+# because the connection fence script writes it AS that account. A directory the service
+# account may write, whose NAME only root may create, is both of those things at once.
+readonly DB_FENCE_DIR="${CUTOVER_ROOT_DIR}/db-fence"
+# Where the pair above lived before r22. Nothing writes here any more; a run that finds a
+# connection-fence record at this path says so and refuses to read it — see
+# import_relocated_fence_marker() and warn_pre_r22_db_fence_state().
+readonly LEGACY_STATE_DIR_DB_FENCE_STATE="${CUTOVER_STATE_DIR}/deploy/db-connect-fence.json"
+readonly DB_FENCE_STATE="${DB_FENCE_DIR}/db-connect-fence.json"
 # THE ENVIRONMENT THE STARTED SERVICE IS BOUND TO (o3d-2sm1.5 r23, Codex HIGH).
 #
 # Rounds 13-22 asked, in eleven spellings, WHICH DATABASE THE SERVICE WILL USE, and every answer
@@ -732,8 +870,8 @@ DB_FENCE_STATE="${DB_FENCE_DIR}/db-connect-fence.json"
 # variable the application can set. This script never put ${APP_DIR}/.env into its environment at
 # all — it reads one key at a time with env_file_value() — and since r25 update.sh does the same,
 # so no IMS_* line in that file becomes a variable in any of the three entrypoints.
-DB_ENV_SNAPSHOT_DIR="/etc/ims-cutover"
-DB_ENV_SNAPSHOT_FILE="${DB_ENV_SNAPSHOT_DIR}/db-identity-snapshot.env"
+readonly DB_ENV_SNAPSHOT_DIR="/etc/ims-cutover"
+readonly DB_ENV_SNAPSHOT_FILE="${DB_ENV_SNAPSHOT_DIR}/db-identity-snapshot.env"
 DB_ENV_SNAPSHOT_DROPIN_NAME="zz-deploy-db-identity.conf"
 DB_ENV_SNAPSHOT_DROPIN_FILE="${FENCE_DROPIN_DIR}/${DB_ENV_SNAPSHOT_DROPIN_NAME}"
 # THE TRUST ROOT, AT A PATH ALL THREE PRINCIPALS CAN OPEN (o3d-2sm1.5 r46, Codex MEDIUM).
@@ -783,13 +921,13 @@ DB_ENV_SNAPSHOT_DROPIN_FILE="${FENCE_DROPIN_DIR}/${DB_ENV_SNAPSHOT_DROPIN_NAME}"
 # the application can set is not a privileged path. The owner is a literal beside it so the
 # regression rigs — which run as an ordinary user with no root to give a file to, and which lift
 # FUNCTIONS rather than these assignments — can measure the mechanism without measuring `chown`.
-DB_CA_PUBLISH_DIR="/etc/ims-db-ca"
+readonly DB_CA_PUBLISH_DIR="/etc/ims-db-ca"
 DB_CA_PUBLISH_OWNER="root:root"
 # The generation name, in two halves so prune_db_ca_generations() can glob exactly what
 # db_ca_generation_file() emits and nothing else — the publication's own temporary files live in
 # the same directory and must not match.
-DB_CA_GENERATION_PREFIX="db-ca-"
-DB_CA_GENERATION_SUFFIX=".crt"
+readonly DB_CA_GENERATION_PREFIX="db-ca-"
+readonly DB_CA_GENERATION_SUFFIX=".crt"
 # How many generations survive a prune BEYOND the two that are never pruned (this run's, and the one
 # the previous installation was using). Three is two rotations of headroom on a cluster whose CA
 # turns over yearly, and every one of them is a public certificate at 0644 — the cost of keeping
@@ -855,7 +993,9 @@ DB_ROUTE_DROPIN_NAME="zz-deploy-db-route.conf"
 DB_ROUTE_DROPIN_FILE="${FENCE_DROPIN_DIR}/${DB_ROUTE_DROPIN_NAME}"
 # ONE lock for all three entrypoints. deploy.sh and update.sh each held their own and this
 # script took none at all, so an install could run straight through another cutover.
-LOCK_FILE="${CUTOVER_STATE_DIR}/cutover.lock"
+# Under the root-owned parent since o3d-secops r22; see ${CUTOVER_ROOT_DIR} above, and
+# lib/cutover-namespace.sh for how it is opened, judged and locked.
+LOCK_FILE="${CUTOVER_ROOT_DIR}/cutover.lock"
 # The namespace deploy.sh wrote to before this round. Nothing writes here any more, and a run
 # that finds state at these paths IMPORTS it into the canonical namespace before it changes a
 # unit or a crontab — see import_legacy_cutover_state().
@@ -898,6 +1038,11 @@ source "${IMS_SCRIPT_LIB_DIR}/db-fence-protected.sh" || {
 # shellcheck source=lib/crontab-lock.sh
 source "${IMS_SCRIPT_LIB_DIR}/crontab-lock.sh" || {
   echo "FATAL: ${IMS_SCRIPT_LIB_DIR}/crontab-lock.sh could not be sourced. It is the only exclusion between this script's crontab writes and the running application's, and without it a cutover can silently discard a schedule an operator has just saved. Nothing has been changed." >&2
+  exit 1
+}
+# shellcheck source=lib/cutover-namespace.sh
+source "${IMS_SCRIPT_LIB_DIR}/cutover-namespace.sh" || {
+  echo "FATAL: ${IMS_SCRIPT_LIB_DIR}/cutover-namespace.sh could not be sourced. It is the only thing in this repository that creates a directory beneath a root-owned parent, takes ownership of one, or opens the shared cutover lock, and without it this run would have to resolve those paths by name as root. Nothing has been changed." >&2
   exit 1
 }
 crontab_lock_paths "${DATA_DIR}"
@@ -2284,7 +2429,7 @@ resolve_fence_script() {
     return 1
   fi
   script="$(db_fence_script_in_use)" || return 1
-  db_fence_publish_operator_wrappers "${APP_USER}" "${APP_DIR}/.env" "${DB_FENCE_STATE}" \
+  db_fence_publish_operator_wrappers "${APP_USER}" "${APP_DIR}/.env" "${DB_FENCE_STATE}" "${LOCK_FILE}" \
     "${DB_FENCE_IDENTITY_ARGS[@]:-}" \
     || echo "The recovery wrappers at ${DB_FENCE_RELEASE_WRAPPER} and ${DB_FENCE_REFENCE_WRAPPER} could not be refreshed for this run. Anything printed below that names them may be a previous run's copy; check it before running it." >&2
   printf '%s' "$script"
@@ -2565,6 +2710,447 @@ fsync_path() {
   return 1
 }
 
+# THE NAME OF THE ROOT-OWNED STAGING DIRECTORY publish_durable_file() writes through (o3d-czpy).
+#
+# ONE NAME, STATED ONCE, because scripts/install.sh also has to PRUNE it out of the recursive
+# `chown -h ${APP_USER}` it runs over ${DATA_DIR}: half this function's targets live under that
+# directory, and a staging directory handed to the service account is not a staging directory.
+readonly PUBLISH_STAGE_DIRNAME=".ims-publish"
+
+# THE TRUSTED ANCESTORS EVERY publish_durable_file() DESTINATION IS REACHED FROM (o3d-rn10).
+#
+# THE FINDING THIS CLOSES, WHICH THE PREVIOUS ROUND LEFT OPEN. Round 2 pinned the destination as a
+# device and an inode and published `../${base}` from inside the staging directory, so nothing
+# AFTER the pin could redirect the write. But the pin itself was `stat -c '%d:%i' "$dir"` — a
+# pathname resolution, made with no relationship to any directory this run trusts. For
+# ${DEPLOY_SSH_KNOWN_HOSTS} that pathname is ${DATA_DIR}/git-ssh, and ${DATA_DIR} belongs to
+# ${APP_USER} on every upgrade: they replace `git-ssh` with a symlink to /root/.ssh BEFORE this
+# function runs, the `stat` records /root/.ssh itself, `.ims-publish` is created and entered THERE,
+# `..` is /root/.ssh — which is exactly what was pinned — and every check passes while the rename
+# publishes a service-owned known_hosts over /root/.ssh/known_hosts. A pin proves that the
+# directory did not MOVE; it says nothing about which directory was pinned.
+#
+# SO THE DESTINATION IS RESOLVED FROM A DIRECTORY THE SERVICE ACCOUNT CANNOT REPLACE, one component
+# at a time, by the same chdir walk enter_service_subdir() uses — and never converted back into an
+# absolute pathname afterwards, which is where the round-2 code reopened the hole it had just
+# closed.
+#
+# WHY A CANDIDATE IS TRUSTWORTHY — AND WHY THAT IS NOW A CHECK AND NOT A PARAGRAPH (o3d-rn10 r2).
+#
+# The previous round argued the property here, in prose: each of the six is a directory whose OWN
+# PARENT is root-owned and not writable by ${APP_USER} — /opt for ${APP_DIR}, /var/lib for
+# ${DATA_DIR} and the default ${CUTOVER_STATE_DIR}, /etc for the three literals
+# (${DB_ENV_SNAPSHOT_DIR}, ${DB_CA_PUBLISH_DIR} and the shared library's ${DB_FENCE_RECOVERY_DIR}).
+# The service account can rewrite anything INSIDE such a directory and nothing ABOUT it: it cannot
+# rename ${APP_DIR} aside, and it cannot leave a symlink at that name. The argument is right, and
+# it was the only thing standing behind the table — a candidate was admitted by its SPELLING, and
+# the deepest spelling won.
+#
+# WHICH IS NOT A PROPERTY OF A STRING, BECAUSE THREE OF THE SIX ARE OPERATOR-SETTABLE.
+# ${IMS_APP_DIR}, ${IMS_DATA_DIR} and ${IMS_CUTOVER_STATE_DIR} can point a root anywhere, and the
+# runbook itself suggests the case that breaks the paragraph: `IMS_CUTOVER_STATE_DIR=${DATA_DIR}/cutover`,
+# where ${APP_USER} owns ${DATA_DIR} and can replace `cutover` with a symlink to a directory of
+# their choosing. The destination still MATCHES the candidate text, the deepest match wins, and
+# `cd -P "$root"` follows the link deliberately — publishing root-side into an attacker's pick.
+#
+# SO THE ANCHOR IS PROVEN AT RUNTIME, by publish_root_anchored(), and a candidate that cannot prove
+# it is not a root. What that costs: nothing at all when the override is anchored, and a walk
+# instead of a shortcut when it is not — see publish_trust_root() for what demotion means, and for
+# what happens to an override with nothing left to demote to.
+#
+# THE LINE IS DRAWN AT THESE DIRECTORIES RATHER THAN AT `/`, AND UNTIL r5 THE ROOT ITSELF WAS
+# FOLLOWED. A symlinked ${DATA_DIR} — /var/lib/${APP_NAME} pointing at a second disk — was a
+# supported operator layout, so the root, and only the root, was entered with `cd -P`; every
+# component below it was refused.
+#
+# THAT ONE HOP LEFT THE PROVED TREE, WHICH IS THE r5 FINDING (Codex HIGH). The link ENTRY is safe:
+# it sits in a parent this walk proves only the privileged account can write, so nobody else can
+# rebind the root's own name. Its TARGET is not. `/var/lib/${APP_NAME} -> /srv/disk2/ims` resolves
+# through `/srv/disk2`, which nothing here walks and which the service account may own: they rename
+# `ims` aside and leave a link to /root/.ssh at that name, the root entry never changes, every
+# anchor check passes, and the publication creates its staging directory and writes `.env` — as
+# root — in the directory they chose. The walk proved every component except the one that mattered.
+#
+# SO A SYMLINKED ROOT IS REFUSED, AND A SECOND DISK IS A BIND MOUNT. pin_dir_beneath_root() prints
+# what an operator has to do, and does it at the write, naming the root. Every root is then an
+# ORDINARY COMPONENT, proved exactly as the ones below it are, and the walk has no exception left.
+#
+# A FUNCTION AND NOT AN ARRAY, so the list is read at the moment of the publication rather than at
+# the moment this file was parsed: a root reassigned by a prompt would otherwise leave the table
+# naming a directory nothing publishes into. `${VAR:-}` because an empty entry is skipped and a
+# destination that matches no root is REFUSED — a new publication site outside these six fails
+# loudly at install time instead of silently resolving its own path.
+publish_trust_root_candidates() {
+  printf '%s\n' "${APP_DIR:-}" "${DATA_DIR:-}" "${CUTOVER_STATE_DIR:-}" "${CUTOVER_ROOT_DIR:-}" "${DB_ENV_SNAPSHOT_DIR:-}" "${DB_CA_PUBLISH_DIR:-}" "${DB_FENCE_RECOVERY_DIR:-}"
+}
+
+# WHETHER "$1" MAY BE A STARTING POINT FOR THE WALK — PROVEN BY WALKING TO IT (o3d-rn10 r4).
+#
+# The root, and only the root, is entered with `cd -P`, which follows a symlink. Everything below
+# it is created with a plain `mkdir`, lstat-ed and inode-checked; the root is taken on trust, so
+# the trust has to be earned. What earns it is one property: NO ACCOUNT BUT THE PRIVILEGED ONE CAN
+# CHANGE WHAT THE ROOT'S OWN NAME BINDS TO.
+#
+# ROUND 3 ASKED THAT OF THE PARENT ALONE, AND ASKED IT OF A PATHNAME. `stat "$parent"` answered
+# that the parent was root-owned and 0755, and stopped — so `IMS_CUTOVER_STATE_DIR=/home/app/guard/state`
+# passed with `guard` root-owned 0755 while ${APP_USER} owned /home/app and was free to rename
+# `guard` aside and leave a tree of their own at that name, `state` a symlink inside it. A
+# directory whose own name somebody else can replace anchors nothing, whatever its mode reads. The
+# question recurses, and the only place it terminates is `/`.
+#
+# SO THE ANCHOR IS A WALK FROM `/`, AND IT IS THE SAME WALK pin_dir_beneath_root() PERFORMS BELOW.
+# Each component is lstat-ed (`stat` without `-L`, so a symlinked ancestor reads as "symbolic
+# link" and is REFUSED — an ancestor resolved by name is an ancestor taken on trust), entered with
+# `cd -P`, and the directory we landed in is then required to BE the inode that entry named, with
+# `..` still the directory we came from. An ancestor is never named again after it has been
+# entered, and the walk ends holding the parent as a cwd rather than as a string.
+#
+# AND EVERY DIRECTORY ON THE WAY IS ASKED THE CONTAINER QUESTION — of the inode this process is
+# standing in, never of a pathname: is it owned by root or by whoever is running this, and can
+# anybody else write into it? `id -u` for the same reason publish_durable_file() asks it instead of
+# hardcoding 0: the property is "the privileged account that owns this install", and asking lets
+# the regression rigs measure the mechanism unprivileged. uid 0 is accepted unconditionally as
+# well, because root IS that account by definition — which is also what lets an unprivileged
+# harness resolve the SHIPPED roots under /opt, /var/lib and /etc.
+#
+# THE STICKY BIT IS CREDITED FOR AN ANCESTOR AND REFUSED FOR THE PARENT, which is a real
+# distinction and not a convenience. Sticky lets anybody CREATE an entry in the directory and lets
+# only that entry's owner — or the directory's, or root — rename or remove one. For an ANCESTOR
+# that is the whole question: the component already exists and already belongs to the privileged
+# account, so no third party can move it, and whatever they may create beside it is a name this
+# walk will never utter. For the PARENT it is not the question at all, because on a first install
+# THE ROOT DOES NOT EXIST YET: "cannot replace an existing entry" says nothing about who gets to
+# create it. A root directly under /tmp is therefore still refused, and a root inside a 0700
+# directory that /tmp happens to hold is not — which is precisely the difference between the two.
+#
+# WHAT THIS STILL DOES NOT CLAIM. POSIX ACLs are not read: a directory carrying a write ACL is
+# outside anything a mode can express. And the ROOT ITSELF is not lstat-ed HERE — on a first
+# install it does not exist yet, so the question belongs to the walk that CREATES it. Since r5
+# pin_dir_beneath_root() asks it there and REFUSES a symlink rather than following it: this
+# function proves the root's name cannot be rebound, which says nothing about what a link at that
+# name would resolve through.
+#
+# IT LEAVES THE CALLING SHELL INSIDE THE PARENT, on success AND part-way down on failure, which is
+# the half the anchor never had. Its only caller that wants an answer rather than a position is
+# publish_root_anchored(), which runs it in a subshell.
+pin_publish_root_parent() {
+  local root="$1" parent rel comp self here entry meta owner mode
+  [[ "$root" == /* ]] || return 1
+  root="${root%/}"
+  # `/` has no parent that could anchor it, and is not a directory anything here publishes under.
+  [[ -n "$root" ]] || return 1
+  parent="${root%/*}"
+  [[ -n "$parent" ]] || parent="/"
+  self="$(id -u)" || return 1
+  # THE FIXED TRUSTED ANCESTOR, and the only one there is: `/` is the one directory on the machine
+  # whose name nothing can rebind. Everything between it and the parent is proved, not assumed.
+  cd -P / 2>/dev/null || return 1
+  here="$(stat -c '%d:%i' . 2>/dev/null || true)"
+  [[ -n "$here" ]] || return 1
+  rel="${parent#/}"
+  while :; do
+    # THE CONTAINER QUESTION, asked of `.` and never of a name. ONE stat takes the owner and the
+    # mode together, so the two answers cannot describe different directories.
+    meta="$(stat -c '%u|%a' . 2>/dev/null || true)"
+    [[ "$meta" == *"|"* ]] || return 1
+    owner="${meta%%|*}"
+    mode="${meta##*|}"
+    [[ "$owner" == "0" || "$owner" == "$self" ]] || return 1
+    # Validated BEFORE `8#` sees it: `8#` on anything that is not octal is a fatal arithmetic error
+    # under `set -e`, which is a crash and not a refusal.
+    [[ "$mode" =~ ^[0-7]+$ ]] || return 1
+    if [[ -z "$rel" ]]; then
+      # THE PARENT, whose next entry — the root — may not exist yet. No sticky credit here.
+      (( (8#$mode & 8#22) == 0 )) || return 1
+      return 0
+    fi
+    comp="${rel%%/*}"
+    if [[ "$comp" == "$rel" ]]; then rel=""; else rel="${rel#*/}"; fi
+    # A `//` in the candidate names the directory we are already standing in.
+    [[ -n "$comp" ]] || continue
+    # `.` and `..` would step outside the walk while it believed it was stepping down it.
+    [[ "$comp" != "." && "$comp" != ".." ]] || return 1
+    # ONE lstat, TAKING THE TYPE AND THE IDENTITY TOGETHER, so the two cannot describe different
+    # directories. No `-L`, so a symlinked ancestor is refused rather than followed.
+    entry="$(LC_ALL=C stat -c '%F|%d:%i' "$comp" 2>/dev/null || true)"
+    [[ "${entry%%|*}" == "directory" ]] || return 1
+    entry="${entry#*|}"
+    if (( (8#$mode & 8#22) != 0 )); then
+      # Writable by somebody else, so only the sticky bit can still make THIS entry unreplaceable.
+      # It does so only for an entry the privileged account owns — and THAT is not re-asked here,
+      # because the next turn of this loop asks it of `.` after the chdir, of an inode this walk
+      # has already pinned to this entry. Asking twice would be the same question in a worse place.
+      (( (8#$mode & 8#1000) != 0 )) || return 1
+    fi
+    cd -P "$comp" 2>/dev/null || return 1
+    # AND THE DIRECTORY WE LANDED IN IS THE ONE THAT ENTRY NAMED — the same pair of questions the
+    # walk below asks, for the same reason. An lstat gives the inode of the entry, `stat .` gives
+    # the inode we are standing in, and a rename between them can only make the two differ. `..`
+    # also refuses a directory moved WHOLESALE into another parent, which preserves its inode.
+    [[ "$(stat -c '%d:%i' . 2>/dev/null || true)" == "$entry" ]] || return 1
+    [[ "$(stat -c '%d:%i' .. 2>/dev/null || true)" == "$here" ]] || return 1
+    here="$entry"
+  done
+}
+
+# The same question as a PREDICATE: may "$1" be a root, asked without going anywhere.
+#
+# A SUBSHELL, so the walk's chdir dies with it. publish_trust_root() asks this of every candidate
+# in the table while it is choosing one, and a selector left standing inside the last candidate it
+# considered would be a worse bug than the one this closes. It creates nothing either: the `mkdir`
+# a first install needs belongs to the acting path, and a predicate that made directories would
+# make one for every candidate it rejected.
+#
+# THE ANSWER IS ADVISORY, AND DELIBERATELY SO. It decides WHICH of the six the publication is
+# walked from — a question about the table — and NOTHING ACTS ON IT. pin_dir_beneath_root() walks
+# from `/` again at the moment it enters the root, so no operation is ever aimed by an answer this
+# function gave earlier; a parent replaced in between is re-proved from scratch or refused, and is
+# never entered on the strength of the older answer.
+publish_root_anchored() {
+  ( pin_publish_root_parent "$1" )
+}
+
+# The SHALLOWEST ANCHORED candidate that "$1" lies at or under, printed; non-zero when there is
+# none.
+#
+# ANCHORED FIRST, AND A CANDIDATE THAT FAILS IS DEMOTED RATHER THAN FATAL. Dropping it from the
+# table is not the same as refusing the publication, and the difference is the whole behaviour of
+# the two override shapes:
+#
+#   • `IMS_CUTOVER_STATE_DIR=${DATA_DIR}/cutover` is UNANCHORED — ${APP_USER} owns ${DATA_DIR} — but
+#     ${DATA_DIR} is anchored and covers it. The walk therefore starts at ${DATA_DIR}, and `cutover`
+#     is an ORDINARY COMPONENT: plain `mkdir`, lstat-ed, inode-checked, refused outright if it is a
+#     symlink. The supported nested layout keeps working, and the attack on it stops working.
+#   • `IMS_CUTOVER_STATE_DIR=/home/svc/state` is unanchored AND under no anchored candidate. There
+#     is nothing to demote it to, so this returns non-zero and publish_durable_file() REFUSES every
+#     publication into it. An unanchored override never becomes a trusted root by being spelled in
+#     the table; at worst it stops the run, loudly, at the write.
+#
+# Demotion rather than blanket refusal because refusing every unanchored candidate outright would
+# also refuse the nested layout, for no security gain: the walk from the outer anchor already
+# resolves every component the candidate names, one at a time and under lstat, which is strictly
+# more than trusting the candidate ever did.
+#
+# SHALLOWEST AND NOT DEEPEST — round 1's rule, inverted. Two candidates that both cover "$1" are
+# necessarily nested, one a prefix of the other, so the shallowest is an ancestor of every other:
+# the walk from it COVERS them, and they need no anchor of their own. Preferring the deepest was
+# defended as "the fewest components resolved by name", which had it backwards. A component the
+# walk resolves is not resolved by name — it is created, lstat-ed and inode-checked. Fewer starting
+# assumptions beats fewer steps.
+publish_trust_root() {
+  local dir="$1" root best="" list
+  # A CHECKED CAPTURE AND A HERE-STRING, NEVER `< <(...)`. A process substitution has no status
+  # anybody can take, so a producer that died half-way through is indistinguishable from one that
+  # listed every root — and here that difference is the difference between refusing a publication
+  # and refusing all of them. This is the same rule the crontab/fence subsystem is held to.
+  list="$(publish_trust_root_candidates)" || return 1
+  while IFS= read -r root; do
+    [[ -n "$root" ]] || continue
+    root="${root%/}"
+    [[ -n "$root" ]] || continue
+    [[ "$dir" == "$root" || "$dir" == "${root}/"* ]] || continue
+    publish_root_anchored "$root" || continue
+    if [[ -z "$best" ]] || (( ${#root} < ${#best} )); then best="$root"; fi
+  done <<< "$list"
+  [[ -n "$best" ]] || return 1
+  printf '%s\n' "$best"
+}
+
+# Walk from "$1" down to "$2" one component at a time, LEAVING THE CALLING SHELL INSIDE "$2".
+#
+# The non-fatal twin of enter_service_subdir(): same mechanism, same refusals, but it returns
+# rather than calling `die`, because publish_durable_file()'s whole contract with its callers is a
+# return code — every one of them decides for itself whether a failed publication ends the run.
+# It is called from inside publish_durable_file()'s subshell, so the moved cwd dies with it.
+#
+# Each component is created with a PLAIN `mkdir` (EEXIST on a planted symlink, where `mkdir -p`
+# would silently work inside its target) and lstat-ed with `stat -c '%F'` when that fails, so a
+# link reads as "symbolic link" and is refused. Then `cd -P` pins the inode and `..` — the kernel's
+# own answer for the directory this process is inside — is compared against the component we came
+# from, which closes the window between the lstat and the chdir. An ancestor is never named again
+# after it has been entered.
+#
+# THE MODE OF A COMPONENT THIS CREATES comes from the ambient umask, which is what the `mkdir -p`
+# it replaces used. Every destination this function is asked for is created earlier and
+# deliberately by mkdir_service_subdir() or ensure_cutover_state_dirs(); creating one here is the
+# first-install fallback, not the path that decides the permissions.
+# THE ANCHOR AND THE ENTRY ARE ONE WALK (o3d-rn10 r4), and that was r4's finding. Round 3 asked
+# publish_root_anchored() whether the root's parent looked right, by PATHNAME, and then ran
+# `mkdir -p "$root"` and `cd -P "$root"` — two further resolutions of the same pathname, after the
+# check and independent of it. Re-asking a pathname question only ever adds another window.
+# pin_publish_root_parent() instead walks from `/` to the parent, proving every component on the
+# way and ending with this shell INSIDE the parent, so the operations below are aimed at a
+# directory descriptor the kernel is holding rather than at a name anybody can rebind.
+#
+# AND THE ROOT ITSELF IS NO LONGER AN EXCEPTION (o3d-rn10 r5, Codex HIGH). It used to be entered
+# with a bare `cd -P` that followed a symlink DELIBERATELY — a ${DATA_DIR} on a second disk was a
+# supported layout, and the link's own NAME sits in a parent the anchor walk proves only the
+# privileged account can write. That argument covers the ENTRY and nothing else: the path the
+# link's TARGET resolves through is proved by nothing, so a target under a directory the service
+# account owns can be renamed aside and rebound to a directory of their choosing, and the unchanged
+# root entry passes every check while the publication lands there as root.
+#
+# WHY REFUSING THE SYMLINK AND NOT PINNING ITS TARGET. Pinning would keep the configuration
+# working: read the link, walk its target from `/` through this same machinery, bound the chain,
+# decide what a relative target means. That is a SECOND path proved per publication, in three
+# byte-identical copies, to keep an indirection re-resolved every time it is used. A bind mount is
+# the same layout with the resolution done ONCE, at mount time, out of a mount table only root can
+# write — and it leaves this walk with no exception in it at all. The cost is operator-facing, so
+# the refusal prints the two commands that replace the link.
+#
+# AND THIS PARAGRAPH IS OUT HERE RATHER THAN IN THE BODY. Every byte between `name() {` and the
+# closing brace is lifted verbatim by tests/scripts/install-shell-rig.ts into the script the
+# installer regressions run; prose above the definition is not lifted, so it costs them nothing.
+# It used to matter more than tidiness: the rig handed that script to `bash -c` as a SINGLE argv
+# element, which Linux caps at MAX_ARG_STRLEN, and the first draft of this paragraph crossed the
+# cap — E2BIG, which arrives as a spawn error carrying no status and no output at all. The rig now
+# writes the script to a file, so the cliff is gone; the habit is still the right one.
+
+# THE REFUSAL ITSELF, IN ONE PLACE (o3d-secops r7, Codex CRITICAL).
+#
+# It was four printf lines inside pin_dir_beneath_root(), which made it the PUBLISHER's rule. The
+# installer needs the identical rule for ${APP_DIR}, ${DATA_DIR} and ${LOG_DIR} at the top of the
+# run — see require_real_service_root() below — and an operator who meets one wording at pre-flight
+# and a different one at the first publication has met two rules. There is one rule, so there is
+# one text: both callers print THESE bytes, and a test asserts the up-front refusal and the
+# publisher's refusal are the same function.
+#
+# "a root this run writes into" rather than "a publication root": ${LOG_DIR} is not a publication
+# root — nothing is published under it — and it is still subject to `chown -R`, which dereferences
+# its OPERAND. The sentence has to cover both or it is wrong at one of the two call sites.
+#
+# AND THE REMEDY IS NO LONGER PRINTED AT ALL (o3d-secops r8, Codex HIGH). It was a five-step
+# `rm && mkdir -p && mount --bind` procedure with an apparatus in front of it deciding whether it
+# was safe to print, and that apparatus produced a finding in every review it survived — the last
+# of them being that the procedure itself is raceable for ${LOG_DIR}, whose /var/log parent this
+# same script recognises as group-writable and non-sticky. The refusal stays, the reason stays, the
+# resolved target stays; the commands moved to docs/installation.md, where a human reads them,
+# checks their own parent directory and their own target, and is not handed a paste. The body
+# below says why in full.
+refuse_symlinked_root() {
+  local root="$1" target="" qtarget=""
+  # THE TARGET IS RESOLVED HERE AND PRINTED, not left to the operator to retype. Its status is
+  # taken so that this stays out of the unchecked-substitution census: a `readlink` that fails is a
+  # dangling or unreadable link, which the branch below covers.
+  target="$(readlink -f "$root" 2>/dev/null)" || target=""
+  # NO "NOTHING HAS BEEN CHANGED" IN HERE (o3d-secops r7 sixth pass, Codex MEDIUM). This text is
+  # printed by TWO callers: the pre-flight gate, where nothing has happened yet, and
+  # pin_dir_beneath_root(), which is reached at the first publication — by which time packages are
+  # installed, directories are created, uploads are migrated and the checkout is in place. A shared
+  # helper that asserted "nothing has been changed" was telling half its callers' operators
+  # something false, and telling them not to look. The claim belongs to whoever can make it, so the
+  # gate's own `die` carries it and this function states only what is true wherever it is printed.
+  printf 'ERROR: %s is a symbolic link, and a root this run writes into may not be one: nothing here proves the path its target resolves through.\n' "$root" >&2
+  printf 'ERROR: WHY: every later run of these scripts rsyncs into this root with --delete and chowns it RECURSIVELY. A root that is an ALIAS for another directory hands both of those to whatever the alias resolves to at that moment, and any account that can rename a directory on the way to the target chooses what that is. Stopping the service does not remove that account.\n' >&2
+  printf 'ERROR: To keep %s on another disk, replace the link with a real directory and bind-mount the disk onto it — no data has to move, because the bind exposes the same filesystem at the same path.\n' "$root" >&2
+  # THE RESOLVED TARGET IS A DIAGNOSTIC, AND IT IS STILL QUOTED. It is no longer part of a command
+  # anybody is told to paste, but it is still a value an account this script does not trust can
+  # name: a newline in it would forge an ERROR line of its own, and a control byte would corrupt
+  # the terminal it is printed to. `printf %q` is a bash builtin over a value this function already
+  # holds; its status is taken, and a value it cannot quote is simply not printed.
+  qtarget="$(printf '%q' "$target")" || qtarget=""
+  # A LINK THAT DOES NOT RESOLVE TO A DIRECTORY GETS A DIFFERENT ANSWER AND STOPS HERE, because
+  # there is nothing to bind yet. `readlink -f` canonicalises a DANGLING link too — it answers with
+  # a path that does not exist — so the test is on what is there, not on whether the resolution
+  # produced a string.
+  if [[ -z "$target" || ! -d "$target" ]]; then
+    printf 'ERROR: That link does not resolve to a directory%s, so there is no bind mount to make yet. Fix or remove it by hand — this run will not guess what it was meant to point at.\n' "${qtarget:+ (it resolves to ${qtarget})}" >&2
+    return 0
+  fi
+  if [[ -z "$qtarget" ]]; then
+    printf 'ERROR: This run could not render that link'"'"'s target safely for a terminal, so it is not printed here. Read it with: readlink -f -- THE-LINK\n' >&2
+  else
+    printf 'ERROR: This run resolved that link to: %s\n' "$qtarget" >&2
+  fi
+  # AND THE PROCEDURE IS IN THE DOCUMENTATION, NOT ON THIS SCREEN (o3d-secops r8, Codex HIGH).
+  #
+  # THE FINDING, AND WHY IT IS ANSWERED BY DELETION. This function used to print a five-step
+  # `rm && mkdir -p && mount --bind` recipe, gated by a growing apparatus whose only job was to
+  # decide whether the recipe was safe to print: an ancestry walk over the target, a device/inode
+  # capture, a system-directory exclusion, and containment checks in both directions against every
+  # root these scripts write into.
+  #
+  # THAT APPARATUS PRODUCED A FINDING IN EVERY REVIEW IT SURVIVED — a fail-open descriptor
+  # acquisition, an ancestry gate that proved an adjacent property, a fail-open identity capture, an
+  # identity that was not globally unique, and finally the recipe itself: `rm ROOT && mkdir -p ROOT
+  # && mount --bind TARGET ROOT`, printed for ${LOG_DIR} among others — whose /var/log parent THIS
+  # SAME SCRIPT recognises as group-writable and non-sticky, so the `syslog` account can take the
+  # name between the `rm` and the `mount` and the operator binds their disk onto somebody else's
+  # directory entry. Five findings from one operator convenience.
+  #
+  # SO IT IS DELETED, NOT HARDENED AGAIN. The precondition the recipe rests on — that the target
+  # holds nothing but this application's data — is not a question a filesystem can be asked, so no
+  # amount of checking here reaches it; and a sequence that must be weighed against the operator's
+  # own parent directory, their own target and their own service state is a sequence that belongs
+  # where a human reads it and decides, not in a copy-pasteable block printed by a program that has
+  # just said it cannot prove the thing the block depends on.
+  #
+  # NOTHING IS LOST BUT THE PASTE. The substance is kept in full in docs/installation.md: the
+  # precondition, the order the writers must be stopped in, the checks to make on the target and on
+  # every directory above it, the identity check to make after the mount, the command that puts the
+  # link back if the mount does not take, and the /etc/fstab line.
+  printf 'ERROR: THE BIND-MOUNT PROCEDURE IS IN THE DOCUMENTATION, NOT ON THIS SCREEN: docs/installation.md, "Putting a state root on another disk". It is not printed here because it cannot be pasted safely without checks only you can make: the target must hold NOTHING BUT this application'"'"'s data, every directory from / down to it must be one only root can replace, and the parent of this root may not be. The documentation names all of those, the order to stop the writers in, the identity check to make after the mount, how to put the link back if the mount does not take, and the fstab line that makes the bind survive a reboot.\n' >&2
+  return 0
+}
+
+pin_dir_beneath_root() {
+  local root="$1" path="$2" rel comp here entry base
+  [[ "$root" == /* && "$path" == /* ]] || return 1
+  root="${root%/}"
+  [[ -n "$root" ]] || return 1
+  [[ "$path" == "$root" || "$path" == "${root}/"* ]] || return 1
+  # ONE COMPONENT, which is what the pinned parent lets us enter the root as.
+  base="${root##*/}"
+  [[ -n "$base" && "$base" != "." && "$base" != ".." ]] || return 1
+  # THE ANCHOR AND THE ENTRY ARE ONE WALK (o3d-rn10 r4). See above.
+  pin_publish_root_parent "$root" || return 1
+  # THE PARENT, AS AN INODE, so the `..` check below has a pinned directory to compare against.
+  here="$(stat -c '%d:%i' . 2>/dev/null || true)"
+  [[ -n "$here" ]] || return 1
+  # AND THE ROOT IS AN ORDINARY COMPONENT (o3d-rn10 r5) — created, lstat-ed, entered and
+  # inode/`..` checked like every component below it, with a SYMLINK AT IT REFUSED. See the
+  # comment above for the finding and for why the second disk is a bind mount and not a link.
+  mkdir "$base" 2>/dev/null || true
+  entry="$(LC_ALL=C stat -c '%F|%d:%i' "$base" 2>/dev/null || true)"
+  if [[ "${entry%%|*}" != "directory" ]]; then
+    if [[ "${entry%%|*}" == "symbolic link" ]]; then
+      # THE SAME BYTES THE PRE-FLIGHT GATE PRINTS (o3d-secops r7). One rule, one text.
+      refuse_symlinked_root "$root"
+    fi
+    return 1
+  fi
+  cd -P "$base" 2>/dev/null || return 1
+  [[ "$(stat -c '%d:%i' . 2>/dev/null || true)" == "${entry#*|}" ]] || return 1
+  [[ "$(stat -c '%d:%i' .. 2>/dev/null || true)" == "$here" ]] || return 1
+  here="${entry#*|}"
+  rel="${path#"$root"}"
+  rel="${rel#/}"
+  while [[ -n "$rel" ]]; do
+    comp="${rel%%/*}"
+    if [[ "$comp" == "$rel" ]]; then rel=""; else rel="${rel#*/}"; fi
+    [[ -n "$comp" ]] || continue
+    # `.` and `..` would step outside the walk while it believed it was stepping down it.
+    [[ "$comp" != "." && "$comp" != ".." ]] || return 1
+    mkdir "$comp" 2>/dev/null || true
+    # ONE lstat, TAKING THE TYPE AND THE IDENTITY TOGETHER — whether this run created the component
+    # a moment ago or found it already there. `stat` without `-L` does not dereference, so a link
+    # reads as "symbolic link" and is refused before anything steps into it.
+    entry="$(LC_ALL=C stat -c '%F|%d:%i' "$comp" 2>/dev/null || true)"
+    [[ "${entry%%|*}" == "directory" ]] || return 1
+    cd -P "$comp" 2>/dev/null || return 1
+    # AND THE DIRECTORY WE LANDED IN IS THE ONE THAT ENTRY NAMED. `..` alone accepts a component
+    # swapped for a symlink to a SIBLING under the same parent — the residual o3d-rn10 was filed
+    # with, and the one case that looked like it needed openat2. It does not: an lstat gives the
+    # inode of the entry, `stat .` gives the inode we are standing in, and a rename between them
+    # can only make the two differ. Both are kept: `..` also refuses a directory moved WHOLESALE
+    # into another parent, which preserves its inode.
+    [[ "$(stat -c '%d:%i' . 2>/dev/null || true)" == "${entry#*|}" ]] || return 1
+    [[ "$(stat -c '%d:%i' .. 2>/dev/null || true)" == "$here" ]] || return 1
+    here="${entry#*|}"
+  done
+  return 0
+}
+
 # Publish stdin at "$1" so that a SIGKILL or a power loss at any instant leaves either the
 # PREVIOUS durable content or the complete new content, and never a truncated file.
 #
@@ -2583,28 +3169,714 @@ fsync_path() {
 # before the rename, so the name is published once and everything about it is already true.
 # `$2` and `$3` are optional and default to what every earlier caller already got: root's own
 # ownership, since this script runs as root, and mode 0600.
+#
+# AND THE TEMPORARY FILE IS NOT MADE BESIDE ITS TARGET ANY MORE (o3d-czpy). Round 24's CRITICAL
+# was about a root-side write into a directory ${APP_USER} owns, and every one of this function's
+# targets is in such a directory: ${APP_DIR}/.env, ${APP_DIR}/.deploy-meta,
+# ${CUTOVER_STATE_DIR}/DEPLOY-FENCED, the cron backup. `mktemp "${target}.XXXXXX"` is not itself
+# plantable — the name is unpredictable and the create is O_CREAT|O_EXCL — but everything done to
+# it AFTERWARDS is by PATH, and the service user can watch the directory, rename the new entry
+# aside and leave a symlink at the same name. Then the `chmod` chmods their choice, the `chown`
+# hands their choice to them, and the `cat >` writes the application's secrets into it. Three
+# root-side operations aimed by a rename, and no amount of re-checking the path closes it, because
+# the check and the operation are two syscalls.
+#
+# So the temporary lives in a ROOT-OWNED 0700 DIRECTORY the service user cannot write, cannot
+# rename inside, and cannot list. It is created with the same primitives prepare_crontab_lock uses
+# and for the same reasons — plain `mkdir` (which fails with EEXIST on a planted symlink where
+# `mkdir -p` would silently work inside its target), `stat -c %F` (lstat, so a symlink reads as
+# "symbolic link" and is refused), `chown -h` (which cannot dereference) — and it is a SIBLING of
+# the target, so the publication is still a same-filesystem rename.
+#
+# AND THE ONE HOLE THAT LEAVES IS CLOSED BY `cd`, NOT BY ANOTHER CHECK. ${APP_USER} owns the
+# CONTAINING directory, so they can rename ${dir}/.ims-publish aside AFTER it has been verified and
+# put a symlink there; a fourth lstat would race exactly like the first three. `cd` does not: it
+# resolves the path once and the shell then holds a descriptor on that INODE, which no rename can
+# move. Everything below runs relative to that cwd. The verification is therefore made of `.`
+# AFTER the chdir — it asks what this process is actually inside — and it asks for uid ${self} and
+# mode 0700, which is a directory the service user cannot manufacture: they cannot chown anything
+# to root. `%d` is in the same stat so the same answer also proves the rename below is a rename
+# and not a dereferencing cross-device copy.
+#
+# AND THE DESTINATION IS A DESCRIPTOR, NOT `..` (o3d-secops r19, Codex CRITICAL). Until this round
+# the publication was `mv -T "$tmp" "../${base}"` and the final barrier was `fsync_path ..`, on the
+# argument that `..` is the kernel's own parent link and so cannot be redirected by renaming any
+# NAME above it. That argument is true, and it is not the whole argument, because `..` is a
+# property of WHERE THE STAGING DIRECTORY IS — it is re-read at every syscall, and a staging
+# directory moved WHOLESALE into another parent takes `../${base}` with it. What actually stopped
+# that move was never written down: `rename(2)` of a directory into a DIFFERENT parent requires
+# write permission on the directory being moved, and the staging directory is root-owned 0700, so
+# ${APP_USER} gets EACCES. The publication's safety therefore rested on the staging directory's
+# MODE, one inference away from the code, in a function whose whole subject is not resting security
+# on properties of the staging directory.
+#
+# So the destination is pinned the way chown-tree.mjs pins one: a descriptor, opened on `.` while
+# this process is standing in the directory pin_dir_beneath_root() walked to, BEFORE the staging
+# directory exists at all. `/proc/self/fd/N` is resolved BY THE KERNEL to the open file rather than
+# to a pathname, so `mv -T … /proc/self/fd/N/${base}` IS `renameat(N, "${base}", …)` and
+# `sync /proc/self/fd/N` IS an fsync of that same open directory. Neither mentions the staging
+# directory, so neither depends on where it is, what it is called, or who may move it. /proc is
+# already a declared, gated dependency of these scripts — enter_service_root() enters every state
+# root through it and refuses a host without it — so this costs nothing that was not already spent,
+# and the `stat -L` immediately after the open proves BOTH that the descriptor is the directory that
+# was walked to AND that an external command can still reach it, which is the one way this could
+# fail quietly. The `..` checks are KEPT: they cost a stat and they still refuse a staging directory
+# that has been moved, which is now a refusal rather than a redirection.
+#
+# MODE AND OWNER ARE APPLIED BEFORE THE CONTENT, not after it. `.env` is the reason: it carries
+# AUTH_SECRET, SETTINGS_ENCRYPTION_KEY, CRON_SECRET and the database password, and a file that is
+# filled first and restricted second exists, for an instant, with secrets in it at whatever mode
+# the create left. Inside a 0700 root-owned directory nothing can open it either way — which is
+# the belt — but the ordering is the braces, and it costs nothing.
 publish_durable_file() {
-  local target="$1" owner="${2:-}" mode="${3:-600}" dir tmp
+  local target="$1" owner="${2:-}" mode="${3:-600}" dir base root self tmp meta parent dest
+  # Absolute, so `dirname` and `basename` below split a whole path rather than a fragment of one.
+  [[ "$target" == /* ]] || target="${PWD}/${target}"
   dir="$(dirname "$target")"
-  mkdir -p "$dir" || return 1
-  tmp="$(mktemp "${target}.XXXXXX" 2>/dev/null)" || return 1
-  if ! cat > "$tmp" 2>/dev/null; then rm -f "$tmp"; return 1; fi
-  if ! chmod "$mode" "$tmp" 2>/dev/null; then rm -f "$tmp"; return 1; fi
-  if [[ -n "$owner" ]] && ! chown "$owner" "$tmp" 2>/dev/null; then rm -f "$tmp"; return 1; fi
+  base="$(basename "$target")" || return 1
+  # ONE REAL COMPONENT. Everything below publishes `../${base}` from inside the staging directory,
+  # so an empty `base`, or `.` or `..`, would aim the rename at the destination directory itself.
+  [[ -n "$base" && "$base" != "." && "$base" != ".." && "$base" != */* ]] || return 1
+  # THE DESTINATION IS NO LONGER PINNED FROM ITS OWN PATHNAME (o3d-rn10, Codex HIGH). It used to be
+  # `stat -c '%d:%i' "$dir"`, which follows whatever ${dir} resolves to at that instant and relates
+  # it to nothing: a `git-ssh` replaced by a symlink to /root/.ssh BEFORE this function ran was
+  # pinned as /root/.ssh, and every check afterwards agreed with the attacker's choice. So the
+  # destination is reached from a directory ${APP_USER} cannot replace — see
+  # publish_trust_root_candidates() above for which ancestors those are and why. A destination
+  # under none of them is REFUSED rather than resolved.
+  root="$(publish_trust_root "$dir")" || return 1
+  # Asked rather than hardcoded, exactly as prepare_crontab_lock asks it: the property is "owned by
+  # the privileged user that owns this install", and it lets the harnesses run this unprivileged.
+  self="$(id -u)" || return 1
+  (
+    # THE WALK, WHICH ENDS WITH THIS SUBSHELL INSIDE ${dir}. From here on the destination exists
+    # only as this process's cwd — a descriptor no rename can move — AND IS NEVER SPELLED AGAIN.
+    # That is the half round 2 got wrong: it rebuilt `${dir}/${PUBLISH_STAGE_DIRNAME}` and handed
+    # the whole pathname to `mkdir`, `stat` and `chown`, so all three re-resolved every component
+    # the pin had already accepted.
+    pin_dir_beneath_root "$root" "$dir" || exit 1
+    # The destination, recorded as a device and an inode. The first field is what proves the
+    # publication below is a rename and not a dereferencing cross-device copy; the second is what
+    # makes it the SAME directory rather than the same name.
+    parent="$(stat -c '%d:%i' . 2>/dev/null || true)"
+    [[ -n "$parent" ]] || exit 1
+    # THE DESTINATION, AS A DESCRIPTOR ON THE INODE THIS PROCESS IS STANDING IN — taken here, before
+    # the staging directory exists, so nothing that happens to the staging directory afterwards can
+    # move it. A failed `exec` redirection ends this non-interactive subshell, which the `|| return 1`
+    # below reads as a refusal; the explicit `|| exit 1` is for the shell that would only warn.
+    exec {dest}< . 2>/dev/null || exit 1
+    # AND IT IS THE DIRECTORY THAT WAS WALKED TO. `-L` because /proc/self/fd/N is a magic symlink:
+    # without it `stat` reports the inode of the /proc entry itself and this could never match. The
+    # check is run by an EXTERNAL command on purpose — it is the same route `mv` and `sync` take
+    # below, so a descriptor those two could not reach is refused here rather than at the rename.
+    [[ "$(stat -L -c '%d:%i' "/proc/self/fd/${dest}" 2>/dev/null || true)" == "$parent" ]] || exit 1
+    # A SINGLE RELATIVE COMPONENT, resolved by the kernel from the directory this process holds.
+    if ! (umask 077; mkdir "${PUBLISH_STAGE_DIRNAME}") 2>/dev/null; then
+      [[ "$(LC_ALL=C stat -c '%F' "${PUBLISH_STAGE_DIRNAME}" 2>/dev/null || true)" == "directory" ]] || exit 1
+    fi
+    # `-h`, so a name that became a symlink between the mkdir and here has the LINK re-owned and
+    # not its target. The verification that follows the chdir is what decides whether we proceed.
+    chown -h "$self" "${PUBLISH_STAGE_DIRNAME}" 2>/dev/null || exit 1
+    cd "${PUBLISH_STAGE_DIRNAME}" 2>/dev/null || exit 1
+    meta="$(stat -c '%u|%a|%d' . 2>/dev/null || true)"
+    [[ "$meta" == "${self}|700|${parent%%:*}" ]] || exit 1
+    # AND `..` IS THE DESTINATION, ASKED OF THE KERNEL RATHER THAN OF A PATHNAME. The shell holds a
+    # descriptor on the staging inode; `..` is that directory's own parent link, so it answers
+    # "the directory this staging directory is IN", which no rename of any name above it can move.
+    # A staging directory moved wholesale into some other directory changes it, and is refused.
+    [[ "$(stat -c '%d:%i' .. 2>/dev/null || true)" == "$parent" ]] || exit 1
+    if ! tmp="$(mktemp ./publish.XXXXXX 2>/dev/null)"; then exit 1; fi
+    if ! chmod "$mode" "$tmp" 2>/dev/null; then rm -f "$tmp"; exit 1; fi
+    if [[ -n "$owner" ]] && ! chown "$owner" "$tmp" 2>/dev/null; then rm -f "$tmp"; exit 1; fi
+    if ! cat > "$tmp" 2>/dev/null; then rm -f "$tmp"; exit 1; fi
   # BARRIER 1: the data, before the name exists. After this the rename can only publish
   # bytes that are already on the medium.
-  if ! fsync_path "$tmp"; then rm -f "$tmp"; return 1; fi
-  if ! mv -f "$tmp" "$target" 2>/dev/null; then rm -f "$tmp"; return 1; fi
+    if ! fsync_path "$tmp"; then rm -f "$tmp"; exit 1; fi
+    # ONE COMPONENT, RESOLVED FROM THE PINNED DESCRIPTOR — `renameat(dest, base)`, and never the
+    # absolute target, and no longer `../${base}` either. See the comment above the function.
+    if ! mv -f -T "$tmp" "/proc/self/fd/${dest}/${base}" 2>/dev/null; then rm -f "$tmp"; exit 1; fi
   # BARRIER 2: the directory entry the rename created. Without it the reboot can find the
-  # old name, or neither name, however well the data was flushed.
+  # old name, or neither name, however well the data was flushed. It flushes THE DESCRIPTOR the
+  # rename landed in — not `fsync_path "$dir"`, which re-resolved the pathname a third time and
+  # could report durability for a directory nothing was published into, and no longer `..`, which
+  # answers for wherever the staging directory happens to be by then.
   #
   # A FAILURE HERE RETURNS NON-ZERO WITH THE NEW BYTES ALREADY AT $target (o3d-2sm1.5, Codex
   # r10 HIGH). That is not a leak, it is the honest answer: the content is VISIBLE and its
   # NAME is not proven, so a power loss can restore the previous directory entry and with it
   # the previous marker. Callers must act on THIS RETURN VALUE. Anything that greps $target
   # instead reads the new content and concludes a durability it was never given.
-  fsync_path "$dir" || return 1
+    fsync_path "/proc/self/fd/${dest}" || exit 1
+  ) || return 1
   return 0
+}
+
+# enter_service_subdir() and mkdir_service_subdir() live in lib/cutover-namespace.sh since
+# o3d-secops r22 (Codex CRITICAL x2). The walk was correct and it was here, in one of the three
+# entrypoints; the two paths that most needed it — the shared cutover lock and the connection-fence
+# directory, both root-side targets inside a directory ${APP_USER} owns — were in the other two.
+# A rule about where a privileged process may write cannot live in one caller and be one rule.
+
+# ---------------------------------------------------------------------------
+# THE THREE ROOTS THEMSELVES, PROVED FROM `/` BEFORE ANYTHING FOLLOWS ONE (o3d-secops r7,
+# Codex CRITICAL)
+#
+# THE FINDING. Round 6 hardened the PUBLISHER to refuse a symlinked root and told the operator to
+# use a bind mount instead. The installer kept the old behaviour at the same three names:
+# enter_service_subdir() opens with `mkdir -p "${root}"` and `cd -P "${root}"` on the root itself,
+# and section 8 opens with a bare `mkdir -p "${DATA_DIR}" "${LOG_DIR}"`. Both FOLLOW a symlink at
+# the root. So on a host where /var/lib/one-two-inventory is a link, this script's `useradd
+# --create-home`, its `mkdir -p`, its upload migration, its crontab-lock preparation and cron
+# backup, its `rsync`, its `git clone` and its `chown -R` all landed through the link — and the
+# refusal that says a symlinked root is not allowed arrived afterwards, at the first publication.
+# A gate that runs after the writes it is guarding is not a gate. The comment two lines below that
+# `mkdir -p` describes this very hazard for the SUBDIRECTORIES; the roots kept the behaviour the
+# subdirectories were fixed for.
+#
+# ORDERING IS THE FIX, so this runs in section 1, immediately after the `EUID` check and before
+# ANY other statement in the run — before `load_existing_env "${APP_DIR}/.env"`, which is the first
+# statement in the whole script that resolves one of these names at all.
+#
+# WHAT IT PROVES, EXACTLY. A walk from `/` — the one directory whose name nothing can rebind — to
+# the root's parent, one component at a time: each is lstat-ed (`stat` without `-L`, so a link
+# reads as "symbolic link" and is refused rather than followed), entered with `cd -P`, and then
+# checked BOTH ways round — the inode we are standing in must be the one the entry named, and `..`
+# must be the directory we came from. That pair is what closes the window between the lstat and the
+# chdir, and it is the same pair pin_publish_root_parent() and pin_dir_beneath_root() use. The
+# root's own entry is then read by ONE lstat inside the pinned parent, never as a pathname, and a
+# symlink at it ends the run through refuse_symlinked_root() — the publisher's own text.
+#
+# WHY NOT SIMPLY CALL pin_publish_root_parent(), WHICH ALREADY WALKS FROM `/`. Two reasons, and
+# both are about not turning a symlink fix into a policy change:
+#
+#   • It also decides OWNERSHIP AND MODE — every ancestor root-owned-or-ours, no group or other
+#     write bit on the parent. That is the anchor a PUBLICATION root must satisfy, and ${APP_DIR}
+#     and ${DATA_DIR} are publication roots, so they satisfy it already or every publication into
+#     them fails later anyway. ${LOG_DIR} IS NOT ONE — nothing is published under /var/log — and on
+#     Ubuntu /var/log is `drwxrwxr-x root:syslog`, which the anchor refuses. Applying it here would
+#     refuse a stock Ubuntu install over a question no publication asks.
+#   • It CREATES nothing and must not: ${APP_DIR} is created by `useradd --create-home` a few
+#     hundred lines below, and a root-owned directory pre-made at that name would leave the
+#     first-install `git clone`, which runs as ${APP_USER}, unable to write into it.
+#
+# So the two functions divide the question exactly as the two rules do: THE SYMLINK RULE IS ONE
+# RULE, applied here to all three roots and by the publisher to its own, printing the same bytes;
+# THE ANCHOR is an additional property only a publication root carries, and it is still enforced
+# where it always was.
+#
+# AND "PIN" MEANS WHAT IT CAN MEAN IN A SHELL — WHICH IS WHY THE GATE IS NOT THE WHOLE ANSWER
+# (o3d-secops r7 second pass, Codex HIGH). This process cannot hold a descriptor on three
+# directories for the length of an install, so what the gate establishes is a fact about the moment
+# it ran. For ${APP_DIR} and ${DATA_DIR} that is enough on its own: their parents (/opt, /var/lib)
+# are root-owned and 0755 on every supported distribution, so from that moment only root can put
+# anything else at those names.
+#
+# ${LOG_DIR} IS THE ONE THAT IS NOT ENOUGH, and the reason is the reason the anchor is not applied
+# to it: on Ubuntu /var/log is `drwxrwxr-x root:syslog` and NOT sticky, so the `syslog` account may
+# rename ANY entry in it — including one root owns. Between this gate and section 8 it could move
+# the real log root aside and rename another /var/log subtree into its name; a later
+# `chown -R … "${LOG_DIR}"` would then hand that subtree to ${APP_USER}. NO SYMLINK IS INVOLVED, so
+# refusing symlinks does not touch it, and no snapshot check can: the answer has to be a pin the
+# operation itself uses. enter_service_root() below is that pin — it walks, creates or accepts the
+# root, steps INTO it, proves the inode and the `..`, and leaves the process there, so section 8's
+# ownership change is made relative to `.` and can land nowhere else. See its own comment.
+#
+# What this still does not reach is a root-run consumer LATER and outside this script: logrotate
+# resolves ${LOG_DIR}/*.log by pathname on its own schedule, and on a group-writable /var/log that
+# name is rebindable by the same account. That is a property of putting logs in /var/log on Ubuntu
+# and is shared with every package that ships a logrotate fragment; it is not something an
+# installer can pin from here. `chmod +t /var/log` closes it host-wide, and docs/installation.md
+# says so.
+service_root_entry_kind() {
+  local root="${1%/}" base
+  [[ "${root}" == /* ]] || return 1
+  [[ -n "${root}" ]] || return 1
+  base="${root##*/}"
+  # THE WALK, WHICH LEAVES THIS SHELL INSIDE THE PARENT. Its caller runs it in a command
+  # substitution, so the moved cwd dies with the subshell.
+  pin_service_root_parent "${root}" || return 1
+  # ONE lstat, in the directory the walk is standing in, of a SINGLE COMPONENT — never a pathname.
+  # "absent|" is a first install, and is the one answer that is neither a directory nor a refusal.
+  #
+  # `LC_ALL=C`, ON EVERY `%F` IN THESE SCRIPTS (o3d-secops r7 fourth pass, Codex MEDIUM). GNU
+  # coreutils TRANSLATES the file-type descriptions `%F` prints — "répertoire", "Verzeichnis",
+  # "lien symbolique" — and every walk here compares them against the English words. Unforced, the
+  # parent walk would reject `/opt` on the first component of a French or German host and the
+  # installer would refuse to run at all; and where a comparison is `== "symbolic link"` rather than
+  # `== "directory"`, a translated answer would fail to RECOGNISE a link. The tests run in a C
+  # locale and could never have shown either.
+  #
+  # THE IDENTITY COMES BACK WITH THE KIND (o3d-secops r7 third pass, Codex HIGH), taken by the SAME
+  # lstat so the two cannot describe different directories. enter_service_root() then requires the
+  # entry it acts on to be this one, which is what turns the gate from an observation into a
+  # premise the acting path can be held to.
+  LC_ALL=C stat -c '%F|%d:%i' "${base}" 2>/dev/null || printf 'absent|\n'
+}
+
+# THE WALK, ONCE, USED BOTH TO ASK AND TO ACT (o3d-secops r7 second pass).
+#
+# It walks from `/` — the one directory whose name nothing can rebind — to the PARENT of "$1", one
+# component at a time: each is lstat-ed (`stat` without `-L`, so a symlinked ancestor is refused
+# rather than followed), entered with `cd -P`, and then checked BOTH ways round — the inode this
+# process is standing in must be the one the entry named, and `..` must be the directory it came
+# from. That pair closes the window between the lstat and the chdir; `..` alone would accept a
+# component swapped for a symlink to a SIBLING, and the inode alone would accept a directory moved
+# WHOLESALE into another parent.
+#
+# IT LEAVES THE CALLING SHELL INSIDE THE PARENT, on success and part-way down on failure, and puts
+# that parent's device and inode in ${SERVICE_ROOT_PARENT} — which is what lets the caller check
+# the `..` of the root it then enters. Callers that want an answer rather than a position run it in
+# a subshell.
+#
+# THE INODE IS A VARIABLE AND NOT SOMETHING IT PRINTS, because a caller that read it through `$( )`
+# would be reading it out of a SUBSHELL — and the chdir, which is the whole point, would die with
+# that subshell while the caller went on to `mkdir` and `cd` relative to wherever it already was.
+# That was written first and caught by the regressions: enter_service_root() refused every root,
+# because the `..` it compared belonged to a directory the walk had never entered.
+#
+# THE OWNERSHIP AND MODE OF THE ANCESTORS ARE DELIBERATELY NOT ASKED HERE. That is
+# pin_publish_root_parent()'s question, and it is the right one for a PUBLICATION root; asking it
+# of ${LOG_DIR} would refuse a stock Ubuntu install over a question no publication asks. See the
+# comment above.
+pin_service_root_parent() {
+  local root="${1%/}" rel comp here entry
+  SERVICE_ROOT_PARENT=""
+  [[ "${root}" == /* ]] || return 1
+  [[ -n "${root}" ]] || return 1
+  # THE FIXED TRUSTED ANCESTOR, and the only one there is.
+  cd -P / 2>/dev/null || return 1
+  here="$(stat -c '%d:%i' . 2>/dev/null || true)"
+  [[ -n "${here}" ]] || return 1
+  rel="${root#/}"
+  # Every component ABOVE the root. The root's own name is what is left in ${rel} at the end, and
+  # it is deliberately not entered here: asking and acting want different things of it.
+  while [[ "${rel}" == */* ]]; do
+    comp="${rel%%/*}"
+    rel="${rel#*/}"
+    # A `//` names the directory we are already standing in.
+    [[ -n "${comp}" ]] || continue
+    # `.` and `..` would step outside the walk while it believed it was stepping down it.
+    [[ "${comp}" != "." && "${comp}" != ".." ]] || return 1
+    # ONE lstat, TAKING THE TYPE AND THE IDENTITY TOGETHER, so the two cannot describe different
+    # directories. No `-L`, so a symlinked ancestor is refused rather than followed.
+    entry="$(LC_ALL=C stat -c '%F|%d:%i' "${comp}" 2>/dev/null || true)"
+    [[ "${entry%%|*}" == "directory" ]] || return 1
+    cd -P "${comp}" 2>/dev/null || return 1
+    [[ "$(stat -c '%d:%i' . 2>/dev/null || true)" == "${entry#*|}" ]] || return 1
+    [[ "$(stat -c '%d:%i' .. 2>/dev/null || true)" == "${here}" ]] || return 1
+    here="${entry#*|}"
+  done
+  # The walk consumed every component but the last, so what is left must be the root's own name. A
+  # trailing `/` or a `//` that made the two disagree is a refusal and not a guess.
+  [[ "${rel}" == "${root##*/}" ]] || return 1
+  SERVICE_ROOT_PARENT="${here}"
+}
+
+# WHAT THE GATE APPROVED, BY IDENTITY, so the acting path can be held to it (o3d-secops r7 third
+# pass, Codex HIGH). Keyed by the root's pathname; the value is its `dev:ino` when the gate found a
+# directory there, and the word `absent` when the name was free.
+declare -A SERVICE_ROOT_APPROVED=()
+
+# AND AN OPEN DESCRIPTOR ON IT, WHERE THERE IS ONE TO OPEN (o3d-secops r7 fourth pass, Codex HIGH).
+#
+# A `dev:ino` is not a durable identity: inode numbers are REUSED. An account that can write the
+# root's parent — /var/log is group-writable on Ubuntu — can remove an empty approved root and
+# create its own directory at the name, and if the filesystem hands back the inode it just freed,
+# every comparison a later check makes succeeds. ext4 reuses recently-freed inodes readily enough
+# that this is not a theoretical objection.
+#
+# A DESCRIPTOR IS THE DURABLE IDENTITY. The gate opens the approved directory — by SINGLE COMPONENT,
+# from inside the parent its own walk pinned — and holds the fd for the length of the run.
+# enter_service_root() then reaches the directory through `/proc/self/fd/N`, which the kernel
+# resolves to the open file itself rather than to a pathname, so a rename cannot move it and a
+# delete-and-recreate cannot impersonate it. Verified rather than assumed: with the entry renamed
+# aside and a fresh directory at its name, `cd /proc/self/fd/N` lands on the ORIGINAL inode and its
+# `..` is still the parent.
+#
+# /proc IS A DEPENDENCY AND IT IS DECLARED. This installer supports Debian and Ubuntu, where /proc
+# is always mounted; a host without it falls back to entering by name with the `dev:ino` comparison,
+# which is where this stood before this pass, and which is still stronger than the pathname it
+# replaced.
+declare -A SERVICE_ROOT_FD=()
+
+# The gate. It either returns or ends the run; there is no third outcome and no caller decides.
+require_real_service_root() {
+  local root="$1" what="$2" answer kind base saved fd rc=0
+  base="${root##*/}"
+  # A COMMAND SUBSTITUTION IS THE SUBSHELL: service_root_entry_kind() leaves the shell it runs in
+  # inside the parent, on success and part-way down on failure, and the installer's own cwd must
+  # not move. The status is taken with `|| rc=$?` because under `set -e` a failed substitution in
+  # an assignment ends the script before the `die` below could say why.
+  answer="$(service_root_entry_kind "${root}")" || rc=$?
+  if (( rc != 0 )); then
+    die "${root} — ${what} — could not be resolved from \`/\` without following a symbolic link, or a directory on the way to it changed while this run was walking it. Every component from \`/\` down to ${root} must be a real directory. NOTHING has been created, nothing has been migrated and nothing has been started."
+  fi
+  kind="${answer%%|*}"
+  case "${kind}" in
+    directory)
+      SERVICE_ROOT_APPROVED["${root}"]="${answer#*|}"
+      # THE DESCRIPTOR IS MANDATORY, AND EVERY WAY OF NOT GETTING ONE IS FATAL — INCLUDING A
+      # MISSING /proc (o3d-secops r7 fifth pass, Codex HIGH; r8 thirteenth pass, Codex MEDIUM).
+      #
+      # It was written to fall through — a failed walk, a failed open, a failed verification all
+      # left the run going with no descriptor, and enter_service_root() then entered by name, which
+      # is precisely the state the descriptor was introduced to leave. Worse, it was REACHABLE: an
+      # account that can write /var/log can rename the entry aside for the instant of the open and
+      # put it back, and the installer would carry on in the weaker mode without saying so. A
+      # guarantee that an attacker can switch off is not a guarantee, so each step below either
+      # succeeds or ends the run.
+      #
+      # AND THE LAST WAY OF NOT GETTING ONE WAS THE ABSENCE OF /proc ITSELF, which was skipped with
+      # a `warn` and left the entry to be taken by NAME later — the fifth fail-open in this round's
+      # own hardening, and the one the code's own comment explains is unsafe. There is no way to
+      # name an open directory without /proc, so there is no weaker mode to fall back to that is
+      # worth having: a `dev:ino` pair is a claim about an inode NUMBER, and inode numbers are
+      # reused. A hardened environment without /proc is not a supported install for a script whose
+      # every root-side write is aimed through a descriptor, and refusing is the honest outcome —
+      # it arrives at the PRE-FLIGHT gate, before anything has been created, migrated or started.
+      [[ -d /proc/self/fd ]] || die \
+        "/proc is not mounted, so this run cannot hold a descriptor on ${root} — ${what} — and would have to identify it by name. That is the defect this gate exists to remove: a name can be renamed between the check and the write, and a device/inode pair is a number the kernel reuses. Mount /proc and run this again. NOTHING has been created, nothing has been migrated and nothing has been started."
+      # THE DESCRIPTOR, OPENED FROM INSIDE THE PINNED PARENT. The walk runs a second time here —
+      # the open has to happen where the shell is standing in the parent, and the answer above
+      # came out of a subshell that has already gone. A second walk can land on a different entry
+      # than the first if somebody renamed in between; the `dev:ino` comparison below catches
+      # that, and a refusal is the right outcome either way.
+      saved="$(pwd -P)" || die "this run cannot establish its own working directory. Nothing has been changed."
+      pin_service_root_parent "${root}" || die \
+        "${root} — ${what} — could not be resolved from \`/\` a second time, to open a descriptor on it: a directory on the way changed while this run was walking it. Nothing has been changed."
+      [[ -d "${base}" ]] || die \
+        "${root} — ${what} — was a directory a moment ago and is not one now, so this run cannot open a descriptor on it. Nothing has been changed."
+      # THE FAILURE IS TAKEN EXPLICITLY, NOT LEFT TO `set -e` (o3d-secops r7 sixth pass, Codex
+      # MEDIUM). A bare `exec {fd}< …` whose redirection fails ends a non-interactive shell only
+      # BECAUSE errexit is on — measured, not assumed: without it bash prints its message, leaves
+      # ${fd} unset and CARRIES ON. Resting a fail-closed guarantee on an ambient shell option is
+      # resting it on something a caller can change and a harness does not share, so the status is
+      # taken here. `||` also suspends errexit for the left-hand command, which is what lets this
+      # `die` be the diagnostic instead of bash's one-liner.
+      exec {fd}< "${base}" || die \
+        "${root} — ${what} — could not be opened to hold a descriptor on it: the open was refused (a permission this run does not have, or a process-wide file-descriptor limit). This run will not carry on identifying it by name. Nothing has been changed."
+      # `-L`, WHICH IS THE ONE PLACE IN THESE SCRIPTS THAT WANTS IT. /proc/self/fd/N is a magic
+      # link, and every other `stat` here is deliberately an lstat — so without `-L` this compares
+      # the inode of the /proc entry against the inode of a directory and never matches, which is
+      # a descriptor silently not taken rather than a refusal. It was written that way first.
+      [[ "$(stat -L -c '%d:%i' "/proc/self/fd/${fd}" 2>/dev/null || true)" == "${answer#*|}" ]] || die \
+        "${root} — ${what} — is not the directory this run had just checked: the entry at that name was replaced between the check and the descriptor this run opened on it. This run refuses rather than holding a descriptor on something else; nothing has been changed."
+      SERVICE_ROOT_FD["${root}"]="${fd}"
+      cd "${saved}" || die "this run could not return to ${saved} after checking ${root}. Nothing further has been changed."
+      return 0
+      ;;
+    absent)    SERVICE_ROOT_APPROVED["${root}"]="absent"       ; return 0 ;;
+    'symbolic link')
+      refuse_symlinked_root "${root}"
+      die "${root} — ${what} — is a symbolic link, so this run stops here rather than creating, entering, migrating into, rsyncing into or chowning whatever it resolves to. The lines above say what to do about it. NOTHING has been created, nothing has been migrated and nothing has been started — this is the FIRST statement in the run that looks at ${root}, so an existing installation is exactly as it was."
+      ;;
+    *)
+      die "${root} — ${what} — is a ${kind}, not a directory. This run will not create anything at that name or write through it. NOTHING has been created, nothing has been migrated and nothing has been started."
+      ;;
+  esac
+}
+
+# CREATE-OR-ACCEPT A ROOT AND STAND INSIDE IT, so that what follows is aimed at an inode rather
+# than a name (o3d-secops r7 second pass, Codex HIGH).
+#
+# THE FINDING THIS ANSWERS. require_real_service_root() above is a SNAPSHOT: it proves what was at
+# the name when it ran and then releases the cwd it walked to. For a root whose parent only root
+# can write, that is the whole answer. For ${LOG_DIR} on Ubuntu it is not — /var/log is
+# `drwxrwxr-x root:syslog` and not sticky, so the `syslog` account may RENAME entries in it, and a
+# rename needs no symlink. Between the gate and section 8 it can move the real log root aside and
+# rename another /var/log subtree into its name; the `chown -R "${LOG_DIR}"` that used to follow
+# would then transfer that subtree to ${APP_USER}, recursively, and it could be renamed back
+# afterwards carrying the wrong ownership. Nothing a check makes of a PATHNAME can see that.
+#
+# SO THE OPERATION IS AIMED AT A DESCRIPTOR. This walks from `/` (pin_service_root_parent), creates
+# the root with a PLAIN `mkdir` — EEXIST on a planted symlink, where `mkdir -p` would silently work
+# inside its target — lstats what is there when the create fails, refuses a link through the shared
+# refusal, steps in with `cd -P`, and then proves BOTH that the directory it is standing in is the
+# one the entry named AND that its `..` is the parent the walk pinned. It LEAVES THE PROCESS THERE.
+# Section 8 then changes the ownership of `.`, and a rename of the NAME afterwards cannot move it.
+#
+# AND AN EXISTING ROOT MUST BELONG TO root. A directory the attacking account created at the name
+# BEFORE this run passes every structural check — it is a real directory in the right parent — and
+# handing it to ${APP_USER} would be handing them a directory they already chose the contents of.
+# `mkdir` succeeding means this run created it; `mkdir` failing means it must be proved instead,
+# and uid 0 is that proof. It is asked of `.` after the chdir, of an inode this walk has pinned.
+#
+# THE MODE COMES FROM THE UMASK THE CALLER STATES, at creation, and a directory that is already
+# there keeps whatever mode it has: chmod has no --no-dereference on Linux, which is the same
+# reason mkdir_service_subdir() gives.
+enter_service_root() {
+  local root="$1" mask="$2" what="$3" base parent entry kind approved landed fd newfd created=false
+  base="${root##*/}"
+  [[ "${root}" == /* && -n "${base}" && "${base}" != "." && "${base}" != ".." ]] || die \
+    "enter_service_root was asked for '${root}', which is not an absolute path with a nameable last component. This is a bug in this script, not an operator error."
+  # WHAT THE GATE APPROVED, AND A REFUSAL IF IT APPROVED NOTHING. Acting on a root no pre-flight
+  # check has seen would be the defect this whole round is about, one call site over.
+  approved="${SERVICE_ROOT_APPROVED[${root}]-}"
+  fd="${SERVICE_ROOT_FD[${root}]-}"
+  [[ -n "${approved}" ]] || die \
+    "enter_service_root was asked for ${root}, which require_real_service_root() has not approved in this run. This is a bug in this script, not an operator error: the gate is what establishes the identity this function holds the entry to."
+  # CALLED DIRECTLY AND NOT THROUGH `$( )`: the chdir it performs is the pin every step below
+  # depends on, and a command substitution would discard it. See its own comment.
+  pin_service_root_parent "${root}" || die \
+    "${root} — ${what} — could not be resolved from \`/\` without following a symbolic link, or a directory on the way to it changed while this run was walking it. Nothing has been changed."
+  parent="${SERVICE_ROOT_PARENT}"
+  [[ -n "${parent}" ]] || die \
+    "${root} — ${what} — was walked to but its parent could not be identified, so this run cannot prove where it is about to create or enter it. Nothing has been changed."
+  # A PLAIN `mkdir`, not `mkdir -p`: it refuses a name that is already taken instead of working
+  # inside whatever is there. Whether it SUCCEEDED is the fact the continuity check below rests on.
+  if (umask "${mask}"; mkdir "${base}") 2>/dev/null; then
+    created=true
+  fi
+  # CONTINUITY FROM THE GATE, WHICH IS WHAT OWNERSHIP WAS STANDING IN FOR (o3d-secops r7 third
+  # pass, Codex HIGH). An earlier draft required the root to be owned by root. That is wrong twice
+  # over: the recursive chown below hands ${DATA_DIR} and ${LOG_DIR} THEMSELVES to ${APP_USER}, so
+  # the check refused every upgrade after the first — and root ownership does not identify anything
+  # anyway, since a group-writable /var/log lets another account rename a DIFFERENT root-owned
+  # subtree into the name. The question is not who owns it; it is whether it is the entry the gate
+  # approved.
+  if [[ "${approved}" == "absent" ]]; then
+    if ! ${created}; then
+      # A FAILED `mkdir` HAS TWO MEANINGS AND THEY GET DIFFERENT SENTENCES. If the name is still
+      # free the filesystem refused us — read-only, full, or a permission this run does not have —
+      # and telling that operator somebody planted a directory would send them hunting for an
+      # attacker that is not there.
+      entry="$(LC_ALL=C stat -c '%F|%d:%i' "${base}" 2>/dev/null || true)"
+      [[ -n "${entry}" ]] || die \
+        "${root} — ${what} — could not be created. The name is still free, so this is the filesystem refusing: a read-only mount, a full disk, or a permission this run does not have. Nothing has been changed."
+      die \
+        "${root} — ${what} — did not exist when this run checked it at pre-flight and something has created it since. This run will not adopt a directory it did not make at that name — on a parent another account can write, that entry is theirs and its contents are whatever they chose. Remove it and run the installer again; nothing has been changed."
+    fi
+  else
+    ! ${created} || die \
+      "${root} — ${what} — existed when this run checked it at pre-flight and does not now: it was removed while this installation was running. This run refuses rather than carrying on against a directory that is not the one it approved. Nothing has been changed."
+  fi
+  entry="$(LC_ALL=C stat -c '%F|%d:%i' "${base}" 2>/dev/null || true)"
+  kind="${entry%%|*}"
+  if [[ "${kind}" != "directory" ]]; then
+    if [[ "${kind}" == "symbolic link" ]]; then
+      refuse_symlinked_root "${root}"
+    fi
+    die "${root} — ${what} — is a ${kind:-missing path}, not a directory, so this run will not create anything at that name or write through it. Nothing has been changed."
+  fi
+  # THE NAME MUST STILL LEAD TO THE APPROVED ENTRY, asked here — before this process goes anywhere —
+  # because it is a statement about the DEPLOYMENT and not about this operation: a root renamed
+  # aside and replaced leaves the service, the crontab and logrotate pointing at the replacement,
+  # and a run that quietly chowned the old inode and carried on would have made that coherent-
+  # looking and wrong.
+  if [[ "${approved}" != "absent" ]]; then
+    [[ "${entry#*|}" == "${approved}" ]] || die \
+      "${root} — ${what} — is not the directory this run approved at pre-flight: the entry at that name was replaced between the two. On a parent another account can write — /var/log is group-writable on some distributions — that takes a rename and nothing else, and every other check here passes on the replacement. This run refuses rather than writing into it; nothing has been changed."
+  fi
+  # ENTERED THROUGH THE DESCRIPTOR THE GATE OPENED, where there is one (o3d-secops r7 fourth pass,
+  # Codex HIGH). `/proc/self/fd/N` is resolved by the kernel to the OPEN FILE, not to a pathname, so
+  # a rename cannot move it and a delete-and-recreate that recycles the inode cannot impersonate it.
+  # The entry check above has already established that the NAME still leads here, which is the other
+  # half: without it this would happily chown a directory the deployment no longer refers to.
+  # A MISSING DESCRIPTOR IS A REFUSAL, NOT PERMISSION TO ENTER BY NAME (o3d-secops r7 fifth pass,
+  # Codex HIGH). The gate is required to have taken one — it now DIES on a host with no /proc
+  # rather than warning and going on (r8 thirteenth pass, Codex MEDIUM) — so its absence here means
+  # a bug in this script or a run that has been downgraded, and entering by name on the strength of
+  # a `dev:ino` is exactly the state the descriptor exists to leave.
+  #
+  # AND THERE IS NO BY-NAME BRANCH LEFT TO FALL INTO. There used to be one, guarded by
+  # `[[ -d /proc/self/fd ]]`, for the host the gate had only warned about; with the gate refusing
+  # that host the branch was unreachable in a real run and reachable in a mutated one, which is the
+  # worst of both. The condition that decides how this enters is now the descriptor itself.
+  if [[ "${approved}" == "absent" ]]; then
+    # THIS RUN'S OWN `mkdir` MADE IT, a moment ago, in the parent this walk pinned — there is no
+    # earlier descriptor to enter through, and the inode and `..` checks below are what establish
+    # that the name still leads to what was created. The descriptor is opened afterwards, for the
+    # calls that come later.
+    cd -P "${base}" 2>/dev/null || die \
+      "${root} — ${what} — could not be entered after this run created it. Nothing has been changed."
+  else
+    [[ -n "${fd}" ]] || die \
+      "${root} — ${what} — has no descriptor from this run's pre-flight check, and every supported host has one. This run will not fall back to entering it by name: that is the weaker identity the descriptor replaced. Nothing has been changed."
+    cd "/proc/self/fd/${fd}" 2>/dev/null || die \
+      "${root} — ${what} — could not be entered through the descriptor this run opened for it at pre-flight; the directory it names has been removed. Nothing has been changed."
+  fi
+  # THE TWO IDENTITY CHECKS, of `.` and of `..`, both answered by the kernel for the inode this
+  # process is inside rather than by re-resolving a name.
+  landed="$(stat -c '%d:%i' . 2>/dev/null || true)"
+  [[ -n "${landed}" && "${landed}" == "${entry#*|}" ]] || die \
+    "${root} — ${what} — is not the directory this run had just created or accepted: it was replaced between the check and the step into it. This run refuses rather than following it; nothing has been changed."
+  [[ "$(stat -c '%d:%i' .. 2>/dev/null || true)" == "${parent}" ]] || die \
+    "${root} — ${what} — is not in the directory this run walked to: it was replaced between the check and the step into it. This run refuses rather than following it; nothing has been changed."
+  if [[ "${approved}" == "absent" ]]; then
+    # Created by THIS run's `mkdir`, so it is ours. Record what it made — and open a descriptor on
+    # it — because the next call for the same root (the ownership change below is one) must be held
+    # to this same directory, and by then the name is no more trustworthy than any other.
+    SERVICE_ROOT_APPROVED["${root}"]="${landed}"
+    # AND THE DESCRIPTOR ON IT IS MANDATORY HERE TOO (o3d-secops r7 fifth pass, Codex HIGH), with
+    # no `[[ -d /proc/self/fd ]]` around it any more (r8 thirteenth pass, Codex MEDIUM): a root this
+    # run created and could not hold open is a root the next call would have to reach by name, and
+    # the gate has already refused the host that has no /proc to name it with.
+    exec {newfd}< . || die \
+      "${root} — ${what} — was created by this run but could not be opened to hold a descriptor on it: the open was refused (a permission this run does not have, or a process-wide file-descriptor limit). The calls that follow would have to reach it by name, which is the weaker identity this replaced, so this run stops instead. Nothing further has been changed."
+    SERVICE_ROOT_FD["${root}"]="${newfd}"
+  else
+    # AND IT IS THE VERY ENTRY THE GATE APPROVED. A rename in a group-writable parent needs no
+    # symlink and no privilege, and every structural check above passes on the replacement: it is a
+    # real directory, in the right parent, and its `..` is correct. Only its identity differs.
+    #
+    # WHAT A dev:ino DOES NOT PROVE, stated rather than glossed: inode numbers are REUSED. An
+    # attacker who removes the approved root and gets the filesystem to hand the same inode back
+    # to a directory of their own would pass this. That is not a race they can aim — the allocator
+    # chooses, not they — and it costs them the log directory, which is noisy; the alternative is
+    # to hold an open descriptor from pre-flight to section 8, through the `$( )` the gate runs in
+    # and across every intervening command, which bash cannot do without /proc pathnames that
+    # reintroduce a name. The bound here is the same one publish_durable_file() lives with.
+    [[ "${landed}" == "${approved}" ]] || die \
+      "${root} — ${what} — is not the directory this run approved at pre-flight: the entry at that name was replaced between the two. On a parent another account can write — /var/log is group-writable on some distributions — that takes a rename and nothing else, and every other check here passes on the replacement. This run refuses rather than writing into it; nothing has been changed."
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# THE RECURSIVE OWNERSHIP CHANGE OVER A STATE ROOT, AIMED AT INODES (o3d-n8xx, Codex CRITICAL)
+#
+# THE FINDING. ${DATA_DIR}'s chown could not follow ${LOG_DIR}'s to `chown -Rh .` because it must
+# PRUNE two subtrees — the root-owned crontab lock directory, and every staging directory
+# publish_durable_file() has left behind, at any depth — and `chown -R` cannot express a prune. So
+# it stayed as
+#
+#     find "${DATA_DIR}" \( -path "${CRONTAB_LOCK_DIR}" -o -name "${PUBLISH_STAGE_DIRNAME}" \) \
+#       -prune -o -exec chown -h "${APP_USER}:${APP_USER}" {} +
+#
+# and `find -exec` ENUMERATES PATHNAMES and hands them to a `chown` that resolves them AGAIN
+# afterwards. `-h` protects only the FINAL component. On an upgrade the service account owns this
+# tree, and section 8 runs BEFORE section 10c stops the service — so that account is LIVE while
+# this walk happens. A descendant directory renamed aside and replaced by a symlink between the
+# enumeration and the execution redirects a root-side ownership change through it: `find` prints
+# ${DATA_DIR}/d/f, `d` becomes a link to /etc, and `chown -h ${DATA_DIR}/d/f` changes /etc/f. GNU
+# find's own documentation calls `-exec` insecure for exactly this.
+#
+# WHAT REPLACES IT, AND WHY IT IS NOT SHELL. The answer is an fd-relative traversal —
+# `openat`/`fstatat`/`fchownat` with AT_SYMLINK_NOFOLLOW, pruning by verified identity — and bash
+# cannot express one: it has no `openat`, and every builtin that takes a path re-resolves it.
+#
+# THE ALTERNATIVE THAT WAS WEIGHED AND REJECTED was restructuring so that plain `chown -R` could do
+# the walk (it does not follow symlinks without -L/-H, so the race disappears) and re-taking the two
+# protected subtrees immediately afterwards. It does not work here. The staging directories PERSIST
+# — publish_durable_file() creates one beside every durable publication and never removes it — so
+# "re-chown them afterwards" would need a `find` to locate them, which is the same pathname
+# enumeration this finding is about, one verb later. And the window it opens is open while the
+# service is RUNNING: a staging directory handed to the service account is a staging directory they
+# can rename, which is the whole of o3d-czpy. A window that exposes the crontab lock alone would
+# have been arguable; one that also exposes every publication staging directory is not.
+#
+# AND THE STAGING PRUNE IS NO LONGER A NAME (o3d-secops r19, Codex CRITICAL). It used to be the
+# single component `.ims-publish`, passed down as a fifth argument. ${APP_USER} owns the containing
+# directory and a rename WITHIN one parent needs no permission on the directory being moved, so they
+# could rename a staging directory to an ordinary name before this line and the walk would hand it
+# over — and what it holds, after a SIGKILL between the fill and the rename, is a complete
+# root-owned copy of whatever was being published. The helper now prunes by the SHAPE of such a
+# directory instead: owned by the uid running the walk, mode exactly 0700. That is a shape
+# ${APP_USER} can neither manufacture (they cannot chown to root) nor alter (they do not own it), so
+# it is invariant under every rename they can perform. See the PRUNING section of the helper.
+#
+# SO IT IS A NODE HELPER, AND THAT ADDS NO DEPENDENCY. node is installed by section 4, which runs
+# before this; the installer already ships and runs scripts/lib/pg-auth-request.mjs. Node has no
+# `dir_fd` parameter, but `/proc/self/fd/N` is resolved BY THE KERNEL to the open file, so
+# `/proc/self/fd/N/child` IS `openat(N, "child", …)` — the same primitive enter_service_root()
+# already enters a root with. A python3 helper would say it with real `dir_fd=` arguments and no
+# /proc; python3 is NOT a declared dependency of this installer (it arrives only as a transitive
+# dependency of `unattended-upgrades` and `apt-listchanges`, which section 3 happens to install),
+# and resting a security primitive on that is a dependency in all but name. /proc is mandatory for
+# this script as of the same change, so the /proc route costs nothing that was not already spent.
+#
+# THE ROOT IS ENTERED BY DESCRIPTOR FIRST, exactly as ${LOG_DIR}'s is: enter_service_root() re-walks
+# from `/`, re-proves the root's identity and its `..`, enters it through the descriptor pre-flight
+# opened, and leaves the SUBSHELL inside it — so the helper is handed `.` and never a pathname. Its
+# subshell is why the installer's own cwd is unaffected.
+chown_state_tree() {
+  local root="$1" owner="$2" prune_here="$3" what="$4" uid gid helper
+  # NUMERIC IDS, RESOLVED ONCE AND CHECKED. `chown` takes a name and resolves it itself; `fchown`
+  # takes numbers, so the resolution happens here — and a name that resolves to nothing must end
+  # the run rather than reach the helper as an empty string.
+  uid="$(id -u "${owner}" 2>/dev/null)" || uid=""
+  gid="$(id -g "${owner}" 2>/dev/null)" || gid=""
+  [[ "${uid}" =~ ^[0-9]+$ && "${gid}" =~ ^[0-9]+$ ]] || die \
+    "the account '${owner}' could not be resolved to a numeric uid and gid, so this run cannot set the ownership of ${root} — ${what}. Nothing has been started."
+  # WHERE THE HELPER LIVES: THIS SCRIPT'S OWN lib directory, resolved from BASH_SOURCE at startup —
+  # the release being installed, not ${APP_DIR}. Same rule as db-fence-protected.sh and
+  # pg-auth-request.mjs, and for the same reason. IMS_CHOWN_TREE_HELPER exists for the regressions,
+  # which run the shipped functions outside the shipped file and so have no BASH_SOURCE to resolve
+  # from; pointing it somewhere else produces a different program, not an exemption.
+  helper="${IMS_CHOWN_TREE_HELPER:-${IMS_SCRIPT_LIB_DIR:-}/chown-tree.mjs}"
+  [[ -f "${helper}" ]] || die \
+    "${helper} is missing, so this run cannot set the ownership of ${root} — ${what} — without re-resolving pathnames a compromised service account can rename. It will not do that. Restore the checkout and run the installer again; nothing has been started."
+  command -v node >/dev/null 2>&1 || die \
+    "node is not on PATH, so this run cannot set the ownership of ${root} — ${what}. Section 4 installs it; if you have reached here without it, something removed it. Nothing has been started."
+  if ! (
+    enter_service_root "${root}" 022 "${what}"
+    node "${helper}" . "${uid}" "${gid}" "${prune_here}"
+  ); then
+    die "The ownership of ${root} — ${what} — could not be set; the reason is above. Nothing has been started."
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# COPYING A TREE INTO A DIRECTORY THE SERVICE ACCOUNT OWNS (o3d-czpy)
+#
+# `rm -rf "${APP_DIR}/.git"` followed by `cp -a "${clone}/.git" "${APP_DIR}/.git"` is the same
+# finding one more time, and the `rm` is what opens it: it removes a symlink without following it
+# (correct), and leaves the NAME free for the service account to re-create as a symlink to
+# somewhere else before the `cp` runs. `cp -a src dest` with `dest` a symlink-to-directory copies
+# INTO the target, as root, with the copy's ownership.
+#
+# Two steps, and the second is the one that matters. A plain `mkdir` refuses a name that is already
+# taken, so a link planted between the `rm` and here ends the run instead of being followed. Then
+# `cd` PINS the result: the shell holds a descriptor on the inode it just created, and a rename of
+# the name cannot move it. The copy is then made relative to that cwd and can land nowhere else.
+#
+# BUT OWNERSHIP IS NOT IDENTITY, AND THAT IS WHAT THE uid CHECK WAS MISTAKEN FOR (o3d-czpy r2,
+# Codex HIGH). There is a window between the `mkdir` and the `cd`. The service account owns
+# ${APP_DIR}, so in that window they can rename the directory this run just created aside and leave
+# at its name a SYMLINK TO ANOTHER ROOT-OWNED DIRECTORY — /root, /etc/systemd/system, the git
+# metadata of some other install. `cd` follows it, and `stat -c '%F|%u' .` then answers
+# "directory|0" and the check PASSES, precisely because the target they chose is root-owned. The
+# root-side `cp -a` writes the whole of the clone's .git into that directory, overwriting any
+# entry with a matching name — `config` among them. Being owned by root is a property a great many
+# directories have; being THE directory this run created is a property exactly one has.
+#
+# SO THE CHECK IS `..` AND NOT THE OWNER. ${APP_DIR}'s own parent is root-owned, so ${APP_DIR}
+# cannot be renamed by the service account and its device and inode, taken before the `rm`, are a
+# fact this function can rely on. After the chdir, `..` — the kernel's answer for the parent of the
+# inode this process is inside, not a re-resolution of a pathname — must be that same directory.
+# A link to anywhere outside ${APP_DIR} fails it. A link to another directory INSIDE ${APP_DIR}
+# passes it and is harmless: that directory already belongs to the service account. The uid check
+# is kept for what it does prove — that the `mkdir` and not somebody else created what we are in.
+#
+# WHY THIS AND NOT `run_as_user "${APP_USER}"`, which is the other remedy and would delete the
+# class rather than guard it: the result IS service-owned (the callers chown -R it immediately
+# afterwards), so the drop is available here and would be sound. It is not taken because the
+# guarantee it gives cannot be EXHIBITED. A drop is worth exactly one sentence — "the account that
+# could plant the symlink is the account doing the write" — and to observe it a harness needs two
+# uids, which an unprivileged test run does not have; under a drop the planted symlink is FOLLOWED
+# rather than refused, so the operator also loses the refusal that names the path. The pin is
+# uid-independent, which matters because the same argument cannot be made for publish_durable_file()
+# at all: its markers are deliberately root-owned INSIDE service-owned directories, so that the
+# service account cannot forge a fence, and there is no version of them that root does not write.
+# One mechanism, stated once, holding for every principal. The descriptor-relative alternative
+# (openat2 with RESOLVE_BENEATH|RESOLVE_NO_SYMLINKS, mkdirat, renameat) is stronger still — it
+# closes the link-inside-the-same-parent case too — but it is not shell: it would mean a compiled
+# or Python helper shipped and verified alongside this script, on a host where the installer is the
+# thing that establishes what is installed.
+copy_tree_into_new_dir() {
+  local src="$1" dest="$2" self meta parent
+  self="$(id -u)" || die "\`id -u\` failed, so this run cannot establish which uid it is and cannot prove that ${dest} is the directory it just created."
+  parent="$(stat -c '%d:%i' "$(dirname "${dest}")" 2>/dev/null || true)"
+  [[ -n "${parent}" ]] || die "$(dirname "${dest}") could not be identified, so this run cannot prove where ${dest} is. Nothing has been copied."
+  rm -rf "${dest}"
+  (umask 022; mkdir "${dest}") 2>/dev/null || die \
+    "${dest} could not be created: something is already at that path after it was removed, which is how a compromised '${APP_USER}' would aim this copy at a directory of their choosing. Nothing has been copied."
+  (
+    cd -P "${dest}" 2>/dev/null || exit 1
+    meta="$(LC_ALL=C stat -c '%F|%u' . 2>/dev/null || true)"
+    [[ "${meta}" == "directory|${self}" ]] || exit 1
+    [[ "$(stat -c '%d:%i' .. 2>/dev/null || true)" == "${parent}" ]] || exit 1
+    cp -a "${src}/." . 2>/dev/null || exit 1
+  ) || die "${src} could not be copied into ${dest}: either the copy failed, or the name this run created was replaced — after it was created — by a link to a directory somewhere else, which this run refuses to follow however that directory is owned. Nothing that a later step depends on has been written."
 }
 
 # ---------------------------------------------------------------------------
@@ -3061,7 +4333,7 @@ verify_db_ca_published() {
 # publish_durable_file() gives it mode 0600 before the rename — so it is root-owned and 0600 from
 # the instant its name exists.
 # ---------------------------------------------------------------------------
-DB_ROLE_ROTATION_JOURNAL="${DB_ENV_SNAPSHOT_DIR}/db-role-rotation.journal"
+readonly DB_ROLE_ROTATION_JOURNAL="${DB_ENV_SNAPSHOT_DIR}/db-role-rotation.journal"
 # Set by reconcile_interrupted_role_rotation() when it found a journal and established, from the
 # server, which of the two credentials is live.
 DB_ROTATION_JOURNAL_FOUND=false
@@ -3737,33 +5009,241 @@ publish_durable_dropin() {
 # that need protecting carry their own 0600, and the connection-fence state lives in a 0700
 # subdirectory owned by ${APP_USER}, which is the identity that writes it: the fence script
 # runs as the app user, so a root-owned 0700 directory made that write impossible.
-ensure_cutover_state_dirs() {
-  mkdir -p "$CUTOVER_STATE_DIR" || return 1
-  mkdir -p "$DB_FENCE_DIR" || return 1
-  chown "${APP_USER}:${APP_USER}" "$DB_FENCE_DIR" 2>/dev/null || true
-  chmod 700 "$DB_FENCE_DIR" 2>/dev/null || true
+# THE MARKER'S DIRECTORY, ROOT-OWNED AND PRIVATE (o3d-secops r20). Created here rather than left to
+# the publication, because publish_durable_file() secures the FILE and this finding is about the
+# PARENT: a directory an unprivileged account can write is one it can unlink the marker out of,
+# whatever the marker's own mode says.
+#
+# `id -u` rather than a hardcoded 0, exactly as publish_durable_file() asks it and for the same
+# reason: the property is "the privileged account that owns this install", and asking it lets an
+# unprivileged regression rig exhibit the mechanism with an ordinary directory instead of needing
+# two accounts. Under all three entrypoints it is 0.
+#
+# A SYMLINK AT THAT NAME IS A REFUSAL, not something to chmod. `mkdir -p` is happy with a symlink to
+# a directory and `chmod` would then secure the target, leaving the name pointing wherever it
+# pointed — which is the shape of every finding on this branch.
+ensure_fence_marker_dir() {
+  local dir
+  [[ -n "${FENCE_FILE:-}" ]] || return 1
+  # THE STATUS IS TAKEN (o3d-batch-ret). Every caller of this reaches it through an `|| return`, so
+  # errexit is SUSPENDED here: an unchecked substitution that failed would hand on an empty string
+  # and the mkdir below would be aimed at the current directory.
+  dir="$(dirname "${FENCE_FILE}")" || return 1
+  [[ -L "${dir}" ]] && return 1
+  mkdir -p "${dir}" || return 1
+  [[ -L "${dir}" ]] && return 1
+  chown "$(id -u):$(id -g)" "${dir}" || return 1
+  chmod 700 "${dir}" || return 1
   return 0
 }
 
-# ONE LOCK FOR ALL THREE ENTRYPOINTS (o3d-2sm1.5, Codex r9 HIGH). deploy.sh held
-# ${STATE_DIR}/deploy.lock and update.sh held ${DATA_DIR}/update.lock, so "refusing to run
-# two cutovers at once" was true of two deploys and false of a deploy racing an update;
-# install.sh took no lock at all. One path, taken by all three.
-acquire_cutover_lock() {
-  ensure_cutover_state_dirs || die "Could not create ${CUTOVER_STATE_DIR}; the cutover namespace is unusable. Nothing has been stopped."
-  exec 9>"$LOCK_FILE"
-  flock -n 9 || die "Another cutover (deploy.sh, update.sh or install.sh) holds ${LOCK_FILE}. Refusing to run two cutovers at once."
-  # AND the lock the previous version of deploy.sh took, so a cutover started from a checkout
-  # that predates the shared namespace is still excluded. Only when that directory already
-  # exists: creating it would be re-creating the namespace this round retired.
-  if [[ -d "$LEGACY_CUTOVER_STATE_DIR" ]]; then
-    exec 8>"${LEGACY_CUTOVER_STATE_DIR}/deploy.lock"
-    flock -n 8 || die "A cutover from a checkout that predates the shared namespace holds ${LEGACY_CUTOVER_STATE_DIR}/deploy.lock. Refusing to run two cutovers at once."
+# WHAT MAY BE ADOPTED AS A FENCE (o3d-secops r20, Codex CRITICAL). Adoption asked `[[ -f ]]`, which
+# follows a symlink and says nothing about who wrote what it found. A marker is a DESCRIPTION of an
+# interrupted privileged run — which phase it reached, whether a migration was attempted, whether
+# the schema was touched — and every one of those lines is acted on: they decide whether this run
+# stops a healthy service, whether it may skip the migration, and whether it releases a connection
+# fence. A marker somebody else could have placed is therefore worse than no marker at all. It is a
+# false account of what happened, believed.
+#
+# Three facts, asked of the LINK rather than of its target (`stat` without -L is an lstat), and
+# asked of the PARENT as well as of the file — because the parent is the finding. A marker with
+# impeccable modes inside a directory the service account can write is a marker it can replace.
+fence_marker_is_trustworthy() {
+  local self dir info rest owner mode kind
+  FENCE_MARKER_REFUSAL=""
+  # AND THEIR STATUS IS TAKEN, for the reason above and one more: this function answers a SECURITY
+  # question, so a substitution that failed silently would compare an empty uid against an empty
+  # owner and answer "trustworthy". A refusal that cannot say why is still a refusal.
+  self="$(id -u)" || { FENCE_MARKER_REFUSAL="This run could not read its own uid, so it cannot say whether ${FENCE_FILE} is a record it wrote."; return 1; }
+  dir="$(dirname "${FENCE_FILE}")" || { FENCE_MARKER_REFUSAL="The directory holding ${FENCE_FILE} could not be named, so nothing can be said about who may replace what is in it."; return 1; }
+
+  # THE FIELDS ARE CUT BY PARAMETER EXPANSION AND NOT BY `read` (o3d-secops r20). Two of these
+  # three scripts set IFS to newline-and-tab, so `read -r a b c` of a SPACE-separated line puts the
+  # whole line in `a` and leaves the other two empty — and every check below would then read "not
+  # there" about a directory that is there, refusing every adoption there is. A delimiter the fields
+  # cannot contain, cut with ${...%%...} and ${...#...}, depends on no ambient setting at all; and
+  # deploy.sh, which does NOT set IFS, would have behaved differently from the other two, which is
+  # the drift this branch keeps finding.
+  info="$(stat -c '%u|%a|%F' "${dir}" 2>/dev/null)" || info=""
+  owner="${info%%|*}"; rest="${info#*|}"; mode="${rest%%|*}"; kind="${rest#*|}"
+  [[ "${info}" == *"|"* ]] || kind=""
+  if [[ "${kind:-}" != "directory" ]]; then
+    FENCE_MARKER_REFUSAL="${dir} is ${kind:-not there} and not a directory, so anything found at ${FENCE_FILE} was reached through something this run did not create."
+    return 1
   fi
+  if [[ "${owner}" != "${self}" ]]; then
+    FENCE_MARKER_REFUSAL="${dir} is owned by uid ${owner} and this cutover runs as uid ${self}, so whoever owns that directory can rename or unlink the marker inside it at will."
+    return 1
+  fi
+  if (( 0${mode} & 0022 )); then
+    FENCE_MARKER_REFUSAL="${dir} is mode ${mode}, which is writable by group or other: the marker inside it can be renamed or unlinked by exactly the accounts this fence exists to stop."
+    return 1
+  fi
+
+  info="$(stat -c '%u|%a|%F' "${FENCE_FILE}" 2>/dev/null)" || info=""
+  owner="${info%%|*}"; rest="${info#*|}"; mode="${rest%%|*}"; kind="${rest#*|}"
+  [[ "${info}" == *"|"* ]] || kind=""
+  if [[ "${kind:-}" != "regular file" && "${kind:-}" != "regular empty file" ]]; then
+    FENCE_MARKER_REFUSAL="${FENCE_FILE} is ${kind:-not there} and not a regular file. A fence marker is a file this installer published; anything else at that name was put there by something else."
+    return 1
+  fi
+  if [[ "${owner}" != "${self}" ]]; then
+    FENCE_MARKER_REFUSAL="${FENCE_FILE} is owned by uid ${owner} and this cutover runs as uid ${self}, so it is not a record this run may act on."
+    return 1
+  fi
+  if (( 0${mode} & 0022 )); then
+    FENCE_MARKER_REFUSAL="${FENCE_FILE} is mode ${mode}, which is writable by group or other, so its contents are not a record of what the interrupted run did."
+    return 1
+  fi
+  return 0
 }
+
+# THE MARKER AT THE OLD PATH, MOVED WITHOUT EVER LOWERING THE FENCE (o3d-secops r20).
+#
+# THE ORDERING IS THE WHOLE OF IT. The canonical marker is published FIRST and the old one is left
+# exactly where it is, so across the republication the drop-in on disk still names the old path and
+# the old path still exists — the host stays fenced. install_reboot_fence() clears the old marker
+# only after a drop-in naming ${FENCE_FILE} has been written, daemon-reloaded and VERIFIED, by which
+# point the new pair is what fences the host. A crash anywhere in between leaves BOTH markers, which
+# is the safe direction: whichever drop-in is loaded, the file it asserts on is there.
+#
+# AND BOTH PRESENT IS NOT A REFUSAL, unlike import_legacy_file()'s two-namespace case. Those were two
+# separate namespaces whose markers described two different runs, and choosing between them would
+# have discarded a record nothing else could reconstruct. These are ONE namespace at two spellings:
+# the canonical marker is only ever created by a run that also re-points the drop-in at it, so it is
+# the authoritative one and the other is debris this run clears. The alternative — dying — would
+# strand the ordinary retry loop, because a cutover that adopts and fails again leaves exactly this
+# state. It is said out loud rather than passed over in silence.
+# AND ITS CONTENT IS NOT BELIEVED, BECAUSE IT CANNOT BE (o3d-secops r22, Codex HIGH).
+#
+# r21 pinned the SOURCE of this relocation to a descriptor: one `open(2)` with `O_NOFOLLOW`, then
+# every fact taken from the `fstat` of that descriptor — a regular file, owned by this run's uid,
+# not group- or other-writable, and with exactly ONE link — and the bytes copied from the same
+# descriptor rather than from the name a second time. Every one of those checks is sound. Together
+# they still do not establish the thing the relocation needed, and `st_nlink` is where that
+# becomes visible.
+#
+# THE LINK COUNT IS A FACT ABOUT THE PRESENT, NOT ABOUT THE PAST. r21 argued that `st_nlink` was
+# "a fact about the inode being held", and it is; what it is not is a fact about the inode's
+# HISTORY. It says no second name exists AT THE MOMENT OF THE fstat. It cannot say none ever did.
+# The service account can link a root-owned 0600 inode whose CONTENT IT INFLUENCED into a directory
+# it controls, unlink the other name, and leave exactly one link at a path of its choosing — and
+# this branch creates root-owned mode-0600 files out of ${APP_USER}-controlled content on every
+# run: ${CRON_BACKUP} is that account's own crontab, written by root, at 0600, in that account's
+# own directory. `fs.protected_hardlinks` normally forbids linking to a file you neither own nor
+# may write, and r21 said so — and then rested on it anyway, which is resting a privilege boundary
+# on a sysctl this script does not set and cannot read back meaningfully.
+#
+# SO THE ANSWER IS NOT ANOTHER INSPECTION. There is no sequence of questions about a file that
+# establishes provenance when the adversary owns the directory the file is named in: whatever the
+# check, the account can arrange for a file that passes it. Adding a seventh check makes the
+# apparatus longer and the guarantee identical. What has to change is what the answer is USED FOR.
+#
+# THE PRESENCE IS THE SIGNAL; THE CONTENT IS NOT EVIDENCE OF ANYTHING. An entry at
+# ${LEGACY_STATE_DIR_FENCE_FILE} is what a drop-in installed by an earlier checkout asserts on with
+# `AssertPathExists=!`, so while it is there THIS HOST IS FENCED — whoever put it there, and
+# whatever is inside it. That fact alone is everything this function needs, and it is a fact about
+# the NAME, which is the one thing that cannot be forged away: the account can create that name and
+# cannot make the running system ignore it.
+#
+# So nothing is opened and nothing is read. The marker published at ${FENCE_FILE} is composed
+# HERE, out of this run's own facts, and it records THE MOST CONSERVATIVE FENCE STATE THERE IS:
+#
+#   phase=stopping             marker_phase() reads anything unrecognised as `stopping` already,
+#                              because that is the reading that stops a service rather than leaving
+#                              one running over a schema that may have moved. It is written
+#                              explicitly rather than left to that default.
+#   schema_touched=true        the schema MAY be half-migrated, so the connection fence is not
+#                              released and the migration is re-run, re-drift-checked and
+#                              re-verified before anything gets CONNECT back.
+#   migration_attempted=true   and the reboot fence is treated as one that was meant.
+#
+# Those are the same three values adoption already derives for a marker that fails
+# marker_is_complete() — "missing is not false, it is unknown, and unknown is read the expensive
+# way" — reached here for the same reason by a different route. What is NOT copied forward is any
+# line of the old file: not `phase`, not `schema_touched`, not `marker_complete`. A truncated
+# predecessor cannot be told from a forged one, and neither may be republished as this host's
+# record of what a privileged run did.
+#
+# AND THE OPERATOR IS TOLD, because "the most conservative state" is a guess and the run says so.
+# The marker carries `legacy_marker_unauthenticated=1` and the path it came from, adoption prints
+# the marker verbatim, and the warnings below name the two things that CAN be established
+# independently: what systemd actually asserts on, and what the database actually says.
+#
+# WHY THIS IS NOT A NEW DENIAL OF SERVICE, stated rather than glossed. ${APP_USER} can now make
+# every subsequent cutover adopt a conservative fence by touching one name. It could already do
+# strictly more than that with the same name: a drop-in that asserts on it is a drop-in that stops
+# the unit from booting. The capability is unchanged and the outcome is fail-closed either way.
+#
+# WHAT r21's HELPER WAS AND WHY IT IS GONE. scripts/lib/pin-source-file.mjs existed to authenticate
+# these bytes and nothing else; with the bytes no longer read there is nothing left for it to
+# authenticate, and keeping an unused apparatus whose premise this comment rejects would be the
+# clearest possible invitation to wire it back up. It is deleted, with its regressions.
+#
+# THE ORDERING IS UNCHANGED, and it is still the whole of the safety: the canonical marker is
+# published FIRST and the old entry is left exactly where it is, so across the republication the
+# drop-in on disk still names the old path and the old path still exists. install_reboot_fence()
+# clears the old marker only after a drop-in naming ${FENCE_FILE} has been written, reloaded and
+# VERIFIED. At every instant one of the two pairs is fencing the host.
+import_relocated_fence_marker() {
+  [[ -n "${LEGACY_STATE_DIR_FENCE_FILE:-}" ]] || return 0
+  [[ "${LEGACY_STATE_DIR_FENCE_FILE}" != "${FENCE_FILE}" ]] || return 0
+  # THE ONLY QUESTION THE NAME IS ASKED, AND THE ONLY ONE IT CAN ANSWER: is there an entry here?
+  # `-e` on its own answers "no" for a DANGLING symlink — an entry that IS there, and that an
+  # `AssertPathExists=!` still refuses a boot over — so `-L` is asked beside it. Neither test opens
+  # anything. Nothing below opens it either.
+  [[ -e "${LEGACY_STATE_DIR_FENCE_FILE}" || -L "${LEGACY_STATE_DIR_FENCE_FILE}" ]] || return 0
+  if [[ -e "${FENCE_FILE}" ]]; then
+    warn "A cutover marker is present at BOTH ${LEGACY_STATE_DIR_FENCE_FILE} and ${FENCE_FILE}."
+    warn "The one under $(dirname "${FENCE_FILE}") is the authoritative one and is what this run adopts; the other is cleared once the reboot fence names it."
+    return 0
+  fi
+  ensure_fence_marker_dir || die "Could not create $(dirname "${FENCE_FILE}") owned by this run and private to it, so the fence a previous run left standing cannot be recorded where only this run can remove it. Nothing has been stopped."
+  # COMPOSED HERE, FROM THIS RUN'S OWN FACTS. The only thing taken from the old path is its NAME,
+  # which is recorded so an operator can go and look at it; not one byte of its content is read,
+  # and `publish_durable_file` therefore has nothing on stdin that ${APP_USER} chose.
+  {
+    echo "fenced_at=$(date -Iseconds)"
+    echo "reason=an entry at ${LEGACY_STATE_DIR_FENCE_FILE} says this host may be fenced by an interrupted cutover, and nothing in that directory can be authenticated"
+    echo "failed_step=unknown"
+    echo "exit_status=unknown"
+    # THE CONSERVATIVE READING, WRITTEN OUT. See the comment above this function for why each of
+    # these three is the expensive answer and not the convenient one.
+    echo "phase=stopping"
+    echo "migration_attempted=true"
+    echo "schema_touched=true"
+    echo "reboot_fence=unknown"
+    echo "db_connect_fence=unknown"
+    echo "legacy_marker_path=${LEGACY_STATE_DIR_FENCE_FILE}"
+    # THE LINE THAT SAYS THE THREE ABOVE ARE A POLICY AND NOT A READING. Adoption prints this
+    # marker verbatim, so whoever reads it sees that its predecessor was never authenticated.
+    echo "legacy_marker_unauthenticated=1"
+    # LAST, AND IT IS ABOUT THIS PUBLICATION AND NOT ABOUT THE PREDECESSOR: publish_durable_file()
+    # writes it last, so its presence proves the lines above it reached the medium together. The
+    # predecessor's own `marker_complete=` was not read and is not carried forward.
+    echo "marker_complete=1"
+  } | publish_durable_file "${FENCE_FILE}" || die \
+    "A cutover marker could not be published durably at ${FENCE_FILE}, so this run cannot record the fence the entry at ${LEGACY_STATE_DIR_FENCE_FILE} says may be standing. Nothing has been stopped and nothing has been migrated."
+  warn "An entry at ${LEGACY_STATE_DIR_FENCE_FILE} — the path a checkout older than this one fenced with — says this host may be mid-cutover."
+  warn "IT IS IN ${APP_USER}'S OWN DIRECTORY, so nothing in it can be shown to have been written by a privileged run: not the phase, not whether the schema was touched, not the completeness sentinel. NONE OF IT HAS BEEN READ."
+  warn "A marker recording the MOST CONSERVATIVE state has been published at ${FENCE_FILE} instead: this run assumes the predecessor had begun stopping and may have migrated, so it re-migrates, re-checks drift and re-verifies before anything gets CONNECT back."
+  warn "The old entry stays where it is, and the installed drop-in still names it, until the reboot fence has been re-pointed — so this host is fenced throughout."
+  warn "TWO THINGS CAN BE ESTABLISHED WITHOUT TRUSTING THAT FILE, and they are worth establishing before the next run: what systemd actually asserts on (systemctl show -p DropInPaths on the application's unit, then read the drop-in it names), and what the database actually says (whether the application role still has CONNECT). Settle those, clear the old entry by hand, and a later run will have nothing to adopt."
+  return 0
+}
+
+# ensure_cutover_state_dirs(), acquire_cutover_lock() and the walk they are built on live in
+# lib/cutover-namespace.sh since o3d-secops r22 (Codex CRITICAL x2). They were three byte-identical
+# copies of a rule about where a privileged process may write, and the walk that would have made
+# either of them safe existed in exactly one of the three. See that file for what the old
+# `mkdir -p`/`chown`/`chmod` trio and the old `exec 9>"$LOCK_FILE"` actually did.
 
 write_cutover_marker() {
   local reason="$1" status="${2:-0}"
+  # The marker's own directory, which is NOT ${CUTOVER_STATE_DIR} any more (o3d-secops r20): it is
+  # root-owned and private, because a marker inside a directory ${APP_USER} can write is one it can
+  # unlink. A marker that cannot be published where only this run can remove it is not a fence.
+  ensure_fence_marker_dir || return 1
   mkdir -p "${CUTOVER_STATE_DIR}"
   {
     echo "fenced_at=$(date -Iseconds)"
@@ -4603,6 +6083,15 @@ FENCEEOF
     return 1
   fi
   REBOOT_FENCE_INSTALLED=true
+  # AND ONLY NOW IS A MARKER AT THE PRE-r20 PATH CLEARED. The drop-in just written, reloaded and
+  # verified names ${FENCE_FILE}, and ${FENCE_FILE} exists — so from this line the new pair is what
+  # fences this host and a marker left at the path an older checkout used fences nothing. Clearing
+  # it any earlier would open a window in which the drop-in on disk still named a file this run had
+  # already deleted, which is the failure the relocation exists to avoid.
+  if [[ -n "${LEGACY_STATE_DIR_FENCE_FILE:-}" && "${LEGACY_STATE_DIR_FENCE_FILE}" != "${FENCE_FILE}" && -e "${LEGACY_STATE_DIR_FENCE_FILE}" ]]; then
+    rm -f "${LEGACY_STATE_DIR_FENCE_FILE}" \
+      || warn "${LEGACY_STATE_DIR_FENCE_FILE} could not be removed; it is inert now that the fence names ${FENCE_FILE}, but remove it by hand."
+  fi
   # Re-written now that the answer is known. The marker is the file the NEXT run (and the
   # operator after a hard kill) reads, and it was written before the drop-in was verified —
   # so it said `reboot_fence=absent` about a fence that had just been installed.
@@ -4619,6 +6108,10 @@ remove_reboot_fence() {
   fi
   # The marker is the condition, so deleting it is what lifts the fence.
   rm -f "${FENCE_FILE}"
+  # AND THE ONE AT THE PRE-r20 PATH WITH IT (o3d-secops r20): a fence is lifted by removing the file
+  # the drop-in asserts on, and on a host part-way through the relocation two drop-ins could be
+  # asserting. Leaving that one behind would refuse the next boot with nothing left saying why.
+  [[ -z "${LEGACY_STATE_DIR_FENCE_FILE:-}" ]] || rm -f "${LEGACY_STATE_DIR_FENCE_FILE}"
   return 0
 }
 
@@ -4992,6 +6485,177 @@ resume_from_interrupted_arming() {
   success "The interrupted arming has been undone. The existing installation was never stopped and is still serving."
 }
 
+# HOW THIS ENTRYPOINT DROPS TO ${APP_USER} TO RUN THE FENCE HELPER (o3d-secops r23).
+#
+# db_fence_raise() in lib/db-fence-protected.sh owns the ORDER -- plan, authorise and publish as
+# root, then execute -- and this is the one part of it that cannot be written down once: the three
+# entrypoints drop privilege in three different ways with three different environments. It takes
+# the script to run and the helper own arguments, and nothing else.
+db_fence_helper() {
+  local fence_script="$1"
+  shift
+  ( cd "${APP_DIR}" && run_as_user "${APP_USER}" env \
+      DATABASE_URL="${DATABASE_URL}" \
+      DEPLOY_ADMIN_DATABASE_URL="${DEPLOY_ADMIN_DATABASE_URL}" \
+      node "${fence_script}" "$@" )
+}
+
+# THE SAME DROP TO ${APP_USER}, WITH THE MIGRATION'S OWN CONNECTION STRING IN THE ENVIRONMENT
+# (o3d-secops r32, Codex HIGH 2). `--bind-migration` is the one mode that must open the URL the
+# MIGRATION will use rather than the admin URL, so it is the one mode whose DATABASE_URL matters --
+# and it is the same string prisma, the drift check and the verification hook are handed below,
+# because binding a string the consumers are not given would bind nothing.
+db_fence_migration_helper() {
+  local fence_script="$1"
+  shift
+  ( cd "${APP_DIR}" && run_as_user "${APP_USER}" env \
+      DATABASE_URL="${MIGRATION_DATABASE_URL}" \
+      DEPLOY_ADMIN_DATABASE_URL="${DEPLOY_ADMIN_DATABASE_URL}" \
+      node "${fence_script}" "$@" )
+}
+
+# THE GATE BEFORE ANY DDL (o3d-secops r32, Codex HIGH 2 / o3d-mzcp). The argument is above
+# db_fence_migration_bind() in lib/db-fence-protected.sh; what belongs here is what an operator
+# sees for each answer.
+bind_migration_to_fenced_server() {
+  # THE EXIT TRAP'S RE-FENCE CALLS THIS TOO, AND A TRAP MAY NOT `die` (o3d-secops r32).
+  # `${1}` is `advisory` on that path and empty on the cutover's own. The DIFFERENCE IS ONLY WHAT
+  # HAPPENS TO THIS RUN, never what happens to the migration: an advisory refusal EMPTIES
+  # ${MIGRATION_DATABASE_URL}, which is the same thing the composer's own refusal does, so nothing
+  # downstream can migrate on a string this run could not place. A `die` inside the trap would
+  # abandon the rest of the unwind -- the crontab, the reboot fence, the marker -- to protect
+  # against a redirect, which is a worse trade than the one it is protecting against.
+  local mode="${1:-fatal}" bind_rc=0 bind_script
+  if ! bind_script="$(resolve_fence_script)"; then
+    if [[ "${mode}" == "advisory" ]]; then
+      MIGRATION_DATABASE_URL=""
+      warn "The re-fence has no fence script it is willing to execute, so nothing can show that a migration"
+      warn "connection would reach the server it fenced. The migration URL has been discarded."
+      return 0
+    fi
+    die \
+    "The connection fence is up and this run has no fence script it is willing to execute, so it cannot show that the migration connection reaches the server it fenced. Nothing has been migrated; release the fence with: ${DB_FENCE_RELEASE_CMD}"
+  fi
+  db_fence_migration_bind "${bind_script}" "${MIGRATION_DATABASE_URL}" "${DB_FENCE_IDENTITY_ARGS[@]:-}" || bind_rc=$?
+  case "${bind_rc}" in
+    0)
+      success "The migration connection lands on the fenced server: it carries this run's stamp and can see the connection witness."
+      ;;
+    3)
+      warn "This run holds no connection witness, so NOTHING HERE CAN SHOW that the migration lands on the"
+      warn "server that was fenced. The migration proceeds -- refusing every such run would be an outage on"
+      warn "every host with a pooler -- and the fence record will be KEPT at the end for you to end."
+      ;;
+    2)
+      if [[ "${mode}" == "advisory" ]]; then
+        MIGRATION_DATABASE_URL=""
+        warn "The re-fence composed a migration URL carrying no binding stamp; it has been discarded."
+        return 0
+      fi
+      die "The connection fence is up and the migration URL carries no binding stamp, so nothing can show which server the migration would reach. Refusing to migrate. Nothing has been migrated; release the fence with: ${DB_FENCE_RELEASE_CMD}"
+      ;;
+    *)
+      if [[ "${mode}" == "advisory" ]]; then
+        MIGRATION_DATABASE_URL=""
+        warn "The re-fence could not show that a migration connection would reach the server it fenced"
+        warn "(the reason is printed above). The migration URL has been discarded, so nothing can migrate"
+        warn "on it; the fence itself is up and its record is kept."
+        return 0
+      fi
+      die "THE MIGRATION WOULD NOT HAVE LANDED ON THE SERVER THIS RUN FENCED (the reason is printed above). A connection opened with the exact string prisma is about to be handed either could not see the connection witness or did not carry this run's stamp — so a DNS change, a proxy, a failover or a pooler is putting the migration somewhere the fence never reached. NOTHING HAS BEEN MIGRATED and the schema is untouched. Release the fence with: ${DB_FENCE_RELEASE_CMD}"
+      ;;
+  esac
+}
+
+# THE GATE AFTER THE LAST CONSUMER, and the one that catches a redirect the probe above cannot:
+# one that begins after it and reverts before the release. By here the schema MAY HAVE MOVED, so
+# this refusal holds the fence, leaves the record standing and does not start the application.
+require_migration_landed_on_fenced_server() {
+  # NO FENCE, NO WINDOW TO PLACE (o3d-secops r32). This is not an absence read as an answer: a
+  # migration that ran with no connection fence has no fenced instance to be bound TO, and every
+  # path that expects one has already died if it could not raise it. The fresh-install path is the
+  # real case -- there is no predecessor to fence -- and warning there about a witness nothing
+  # asked for would be noise on the one run where it means nothing.
+  ${DB_FENCE_UP} || { info "No connection fence was raised for this run, so there is no migration window to place."; return 0; }
+  local seen_rc=0 seen_script
+  seen_script="$(resolve_fence_script)" || die \
+    "The migration has run and this run has no fence script it is willing to execute, so nothing can show which server it ran on. The connection fence is STILL UP and its record is kept. Release it with: ${DB_FENCE_RELEASE_CMD}"
+  db_fence_migration_witnessed "${seen_script}" "${MIGRATION_DATABASE_URL}" "${DB_FENCE_IDENTITY_ARGS[@]:-}" || seen_rc=$?
+  case "${seen_rc}" in
+    0)
+      success "The migration window closed on the server this run fenced, and the witness saw the migration's own backends there."
+      ;;
+    3)
+      warn "This run holds no connection witness, so nothing observed which server the migration actually"
+      warn "reached. The fence record will be KEPT at the end of this run for you to end."
+      ;;
+    4)
+      # THE MIGRATION'S OWN BACKENDS WERE NEVER SEEN, while the string still reaches the witness and
+      # the sampler is demonstrably working. Not a refusal -- a connection somebody else opens and
+      # closes cannot be promised to a poller, and refusing here would refuse ordinary cutovers --
+      # but it IS the evidence this run was buying, so its absence costs the automatic removal of
+      # the record.
+      #
+      # AND IT COSTS THAT AND NOTHING ELSE (o3d-secops r33, Codex MEDIUM). This arm used to
+      # withhold the removal by setting ${DB_FENCE_WITNESS_BOUND} back to 0 -- the flag that means
+      # THERE IS NO WITNESS. The release reads it to decide whether it can put a challenge at all,
+      # so a purportedly non-refusing sampling miss went on to issue no challenge, could not set
+      # `clear_server`, took status 2 out of db_fence_clear_authority() and returned FAILURE into
+      # `release_db_connections || die`. The run then ended with the schema migrated, the
+      # application stopped and CONNECT briefly restored before the exit trap re-fenced it -- the
+      # exact opposite of "this does not refuse". The witness is left bound; only the record is
+      # kept.
+      DB_FENCE_KEEP_RECORD=1
+      warn "The migration window closed on the server this run fenced -- a connection opened on the"
+      warn "migration's own string could still see the witness -- but the witness never saw a backend"
+      warn "carrying this run's stamp while the migration ran. Nothing here is wrong with the schema,"
+      warn "and nothing is being undone. What it costs is the AUTOMATIC removal of the fence record:"
+      warn "it will be KEPT at the end of this run and ${DB_FENCE_RELEASE_CMD} will ask you to end it."
+      ;;
+    *)
+      die "THE MIGRATION WINDOW DID NOT CLOSE ON THE SERVER THIS RUN FENCED. A connection opened with the migration's own connection string, after the last thing that used it, either could not see the connection witness or could not be seen by it. TWO HISTORIES END HERE AND NOTHING CAN SEPARATE THEM: the migration was routed to another server — in which case THAT server now carries the schema change and this one does not — or the witness was lost mid-window. THE SCHEMA MAY HAVE MOVED. The application has NOT been started, the connection fence is STILL UP and its record is kept. Find out which server ${DB_FENCE_STATE} names and which one the migration reached before you release anything: ${DB_FENCE_RELEASE_CMD}"
+      ;;
+  esac
+}
+
+# ONE PIN BETWEEN EVERY PAIR OF CONSUMERS (o3d-secops r33, Codex HIGH 2).
+#
+# The argument is in full above db_fence_migration_pinned() in lib/db-fence-protected.sh. In short:
+# the sampler's count is an AGGREGATE over one shared stamp, so one correctly routed connection
+# certified every other consumer of the same string -- `pg_dump` could reach another cluster while
+# prisma reached the fenced one and nothing could tell. A per-consumer SIGHTING cannot replace it,
+# because polling is measured not to promise the observation of a 40ms connection and seven
+# required sightings would refuse ordinary cutovers. So each consumer is placed by a connection
+# THIS RUN opens on the consumer's own string, immediately after it, and every consumer therefore
+# runs between two probes that were proved to reach the fenced instance.
+#
+# ${1} is what has just finished, and it is only ever used in a message.
+pin_migration_window() {
+  local what="$1" pin_rc=0 pin_script
+  # The same early return the closing gate takes, and for the same reason: with no fence there is
+  # no window to place, and the fresh-install path is the real case.
+  ${DB_FENCE_UP} || return 0
+  [[ -n "${MIGRATION_DATABASE_URL}" ]] || return 0
+  pin_script="$(resolve_fence_script)" || die \
+    "${what} has run and this run has no fence script it is willing to execute, so nothing can show which server it reached. The connection fence is STILL UP and its record is kept. Release it with: ${DB_FENCE_RELEASE_CMD}"
+  db_fence_migration_pinned "${pin_script}" "${MIGRATION_DATABASE_URL}" "${DB_FENCE_IDENTITY_ARGS[@]:-}" || pin_rc=$?
+  case "${pin_rc}" in
+    0)
+      info "${what}: still on the fenced server."
+      ;;
+    3)
+      # No witness. Already said once, loudly, by the opening bind; saying it again after each of
+      # seven consumers would bury the one message that matters.
+      ;;
+    2)
+      die "The connection fence is up and the migration URL carries no binding stamp, so nothing can show which server ${what} reached. THE SCHEMA MAY HAVE MOVED. The application has NOT been started, the connection fence is STILL UP and its record is kept: ${DB_FENCE_RELEASE_CMD}"
+      ;;
+    *)
+      die "${what} DID NOT RUN AGAINST THE SERVER THIS RUN FENCED, or nothing could show that it did. A connection opened with that step's own connection string, immediately after it, either could not see the connection witness or did not carry this run's stamp — so a DNS change, a proxy, a failover or a pooler moved the migration string across that step. WHATEVER ${what} WROTE OR READ MAY BE ON ANOTHER SERVER. The application has NOT been started, the connection fence is STILL UP and its record is kept. Find out which server ${DB_FENCE_STATE} names and which one that step reached before you release anything: ${DB_FENCE_RELEASE_CMD}"
+      ;;
+  esac
+}
+
 # The continuous half of the drain. check-db-writers.mjs snapshots pg_stat_activity and
 # closes; the migration opens its own connection afterwards with nothing holding the gap.
 fence_db_connections() {
@@ -5004,21 +6668,43 @@ fence_db_connections() {
   # own yet, and a fence over an unnamed connection is exactly what this round removed.
   require_db_identity || die \
     "The application's database has not been set up yet in this run, so there is no host, port, role and database to tell the connection fence about. The fence is TOLD which connection it closes — it no longer works that out from the environment. Nothing has been migrated."
-  mkdir -p "${DB_FENCE_DIR}"
-  chown "${APP_USER}:${APP_USER}" "${DB_FENCE_DIR}"
-  chmod 700 "${DB_FENCE_DIR}"
+  # THE SAME NAMESPACE, THROUGH THE SAME WALK (o3d-secops r22, Codex CRITICAL). This used to be a
+  # second, unguarded copy of the trio ensure_cutover_state_dirs() carried — `mkdir -p`, which
+  # ACCEPTS a symlink-to-directory at the final component, and then a `chown` and a `chmod` that both
+  # dereference. Fixing one of the two copies and leaving the other is how this class survives a
+  # round, so there is one caller and no second spelling.
+  ensure_cutover_state_dirs || die \
+    "The connection-fence directory ${DB_FENCE_DIR} could not be created beneath ${CUTOVER_ROOT_DIR} owned by this run and writable by nobody else, so the fence about to be raised would have nowhere it could record what it revoked — and nowhere a record could be published that the application account cannot replace. NO FENCE HAS BEEN RAISED and nothing has been migrated."
 
   # THE ONLY FILE THIS FUNCTION RUNS IS THE ROOT-OWNED ONE (o3d-2sm1.5 r31, Codex CRITICAL).
   local rc=0 fence_script
   fence_script="$(resolve_fence_script)" || die \
     "This run has no fence script it is willing to execute (the reason is printed above), so it cannot hold the database closed for the migration window. A snapshot probe is not a fence. Nothing has been migrated."
-  ( cd "${APP_DIR}" && run_as_user "${APP_USER}" env \
-      DATABASE_URL="${DATABASE_URL}" \
-      DEPLOY_ADMIN_DATABASE_URL="${DEPLOY_ADMIN_DATABASE_URL}" \
-      node "${fence_script}" --fence --state-file="${DB_FENCE_STATE}" "${DB_FENCE_IDENTITY_ARGS[@]:-}" ) || rc=$?
+  # PLAN, AUTHORISE, THEN EXECUTE (o3d-secops r23, Codex CRITICAL). This used to be one
+  # invocation, which computed the grantee list and PUBLISHED it into a directory owned by
+  # ${APP_USER} -- so the account being defended against chose what a later release would
+  # GRANT CONNECT to. db_fence_raise() runs the helper twice with a privileged validation and a
+  # durable publication in between; see lib/db-fence-protected.sh.
+  db_fence_raise "${fence_script}" "${DB_FENCE_STATE}" "${DB_FENCE_IDENTITY_ARGS[@]:-}" || rc=$?
 
   case "${rc}" in
     0)
+      # A FENCE THAT WENT UP IS RECORDED AS UP BEFORE ANYTHING ELSE CAN FAIL (o3d-secops r31,
+      # Codex HIGH 2). These two lines used to sit AFTER `--print-migration-url` had been run and
+      # its output validated, so a fence that was genuinely standing could lose its own record of
+      # standing to a failure that had nothing to do with it: an OOM kill of `node`, a signal, a
+      # URL this run could not compose. The exit trap then ran with the REVOKEs COMMITTED and a
+      # stamped authority on disk and BOTH FLAGS FALSE -- so cleanup restored the grants and the
+      # attested-removal gate refused to remove the record of a fence this run had in fact raised,
+      # leaving the next unattended run to read a stamped, already-released authority, take the
+      # refusal, and stop for a terminal confirmation nobody is there to give.
+      #
+      # EXIT 0 IS THE FACT THESE FLAGS STATE, and it is already known at this line. Nothing between
+      # db_fence_raise() returning and here can make it less true, so nothing is allowed to sit in
+      # front of it. The re-fence path has had this order since r13 (see refence_db_connections);
+      # this is that order on the path the ordinary cutover takes.
+      DB_FENCE_UP=true
+      DB_FENCE_RAISED=true
       # THE MIGRATION CONNECTS AS THE ADMIN AND RUNS AS THE APPLICATION ROLE (o3d-2sm1.5,
       # Codex r4 CRITICAL). This installer makes the APPLICATION role the database owner, and
       # the fence refuses when admin == app — so the only fenceable configuration here is a
@@ -5026,15 +6712,23 @@ fence_db_connections() {
       # a migration created was owned by that superuser with no grant to the application at
       # all. Invisible to the whole pipeline: prisma, the drift check and the verification
       # hook share this same admin connection and read everything perfectly.
+      #
+      # AND IT CARRIES A STAMP EVERY CONSUMER OF THIS STRING WILL WEAR (o3d-secops r32, Codex
+      # HIGH 2 / o3d-mzcp): `application_name=ims-migration-<nonce>`. The nonce is minted here,
+      # goes into the URL, and is read back OUT of the URL by the two gates below -- so what they
+      # ask the witness about is by construction what prisma, the drift check, the object-access
+      # check and the verification hook were handed.
+      local migration_nonce=""
+      migration_nonce="$(db_fence_witness_nonce)" || die \
+        "The connection fence is up and this run could not mint the nonce that binds the migration to the server it fenced (no readable randomness). Refusing to migrate on a connection nothing can place. Nothing has been migrated; release the fence with: ${DB_FENCE_RELEASE_CMD}"
       MIGRATION_DATABASE_URL="$( cd "${APP_DIR}" && run_as_user "${APP_USER}" env \
         DATABASE_URL="${DATABASE_URL}" \
         DEPLOY_ADMIN_DATABASE_URL="${DEPLOY_ADMIN_DATABASE_URL}" \
-        node "${fence_script}" --print-migration-url "${DB_FENCE_IDENTITY_ARGS[@]:-}" )" || die \
+        node "${fence_script}" --print-migration-url --migration-nonce="${migration_nonce}" "${DB_FENCE_IDENTITY_ARGS[@]:-}" )" || die \
         "The connection fence is up but the migration URL could not be composed, so the migration would run as the deploy admin and create objects the application cannot use. Nothing has been migrated; release the fence with: ${DB_FENCE_RELEASE_CMD}"
       [[ -n "${MIGRATION_DATABASE_URL}" ]] || die \
         "The connection fence is up but --print-migration-url produced nothing. Nothing has been migrated; release the fence with: ${DB_FENCE_RELEASE_CMD}"
-      DB_FENCE_UP=true
-      DB_FENCE_RAISED=true
+      bind_migration_to_fenced_server
       success "Connection fence up: new application connections are refused for the window."
       success "The migration will connect as the deploy admin and RUN AS the application role, so what it creates is owned by the application."
       ;;
@@ -5132,14 +6826,131 @@ release_db_connections() {
   # account being released rewrite what "released" means, and report success without doing it.
   local rc=0 fence_script
   fence_script="$(resolve_fence_script)" || { error "Cannot release the connection fence: this run has no fence script it is willing to execute (the reason is printed above), so nothing here can ask the database whether one is standing."; return 1; }
-  ( cd "${APP_DIR}" && run_as_user "${APP_USER}" env \
-      DATABASE_URL="${DATABASE_URL}" \
-      DEPLOY_ADMIN_DATABASE_URL="${DEPLOY_ADMIN_DATABASE_URL}" \
-      node "${fence_script}" --release --state-file="${DB_FENCE_STATE}" "${DB_FENCE_IDENTITY_ARGS[@]:-}" ) || rc=$?
+  # THE CHALLENGE, ISSUED BEFORE THE RELEASE RUNS (o3d-secops r31, Codex HIGH 1).
+  #
+  # The witness is asked to take a lock on a nonce generated a moment ago; `--release` then looks
+  # for that lock ON ITS OWN CONNECTION, after it has granted. An affirmative answer is the one
+  # thing that can show that the server just released is the server that was fenced -- a lock on a
+  # number that did not exist when a copy of a cluster was taken cannot be in that copy.
+  #
+  # A FAILURE HERE IS NOT A FAILURE. No witness, a dropped session, a pooler that hands out no
+  # stable backend: the challenge is simply absent, `--release` is invoked exactly as it was before
+  # this round, the fence is released exactly as before, and the ONE thing that changes is that the
+  # record is kept for a person to end rather than removed automatically.
+  # THE NONCE IS MINTED HERE AND LIVES IN THIS FRAME (o3d-secops r31). It is handed to the witness
+  # as an argument and to `--release` as an argument, and there is no script-scope name for it: a
+  # value that decides what a privileged run accepts as proof is not one a later path may write.
+  local witness_argv=() witness_nonce=""
+  witness_nonce="$(db_fence_witness_nonce)" || witness_nonce=""
+  if [[ -n "${witness_nonce}" ]] && db_fence_witness_challenge "${witness_nonce}"; then
+    witness_argv=(--witness-challenge="${witness_nonce}")
+  fi
+  # Captured and printed back, like release_the_fence() in the library: the verdict is a machine
+  # line on stdout, and every word an operator reads is on stderr and still streams live.
+  local released=""
+  released="$(db_fence_helper "${fence_script}" --release --state-file="${DB_FENCE_STATE}" --state-owner="$(id -u)" "${witness_argv[@]}" "${DB_FENCE_IDENTITY_ARGS[@]:-}")" || rc=$?
+  [[ -z "${released}" ]] || printf '%s\n' "${released}"
 
   if [[ "${rc}" -eq 0 ]]; then
     MIGRATION_DATABASE_URL="${DATABASE_URL}"
     DB_FENCE_UP=false
+    # AND ROOT CLEARS THE RECORD, BECAUSE THE HELPER CANNOT (o3d-secops r23). The authority lives
+    # in a directory only this account may write, so the unlink is this account own. It happens
+    # AFTER the release has been verified: until then the record is the only account of what was
+    # revoked, and a record describing a released fence is the safe way round -- a re-fence
+    # re-applies the same list, a second release re-grants what is already granted. A failure to
+    # remove it would make the NEXT run believe a fence is standing, so it is a failure here.
+    # AND THE REMOVAL IS ATTESTED, OR IT DOES NOT HAPPEN (o3d-secops r30 + r31, Codex HIGH 1).
+    # It takes TWO answers, because r30's one answer was half of the question. WHO: this run's own
+    # memory of having raised the fence it just released, which no copy of any cluster can produce
+    # because it is not in any cluster. WHERE: that the server just released is the server that was
+    # fenced -- r30 said "over this same connection string", and a connection string is exactly what
+    # a proxy, a DNS change or a failover re-points between two processes, so it is now MEASURED
+    # rather than assumed, by a witness session both connections had to be able to see. Either
+    # answer missing and the record is left alone: the grants above are done and are safe to repeat,
+    # and a person ends the record. See db_fence_clear_authority() in lib/db-fence-protected.sh.
+    local clear_attestation="" clear_server="" clear_rc=0
+    if ${DB_FENCE_RAISED:-false}; then clear_attestation="raised-by-this-run"; fi
+    # AND WHICH SERVER IT IS SPEAKING ABOUT (o3d-secops r31, Codex HIGH 1). Read out of THIS
+    # release's own output, which reports what its own database connection could see; it is not
+    # read from a flag this shell set, because a flag is the process-shaped memory whose reach
+    # across two connections is the finding. No line, no removal.
+    # AND IT IS A WHOLE LINE NAMING THIS RUN'S OWN CHALLENGE, READ ONLY IF ONE WAS ISSUED
+    # (o3d-secops r32, Codex HIGH 1). r31 read `witness_colocated=yes` as a SUBSTRING of a stream
+    # that also carried `Connection fence released: CONNECT restored to <roles> on <database>.`, so
+    # a database or a role whose NAME contained that token set this variable. Two guards now, and
+    # the first is the one that is easy to miss: `${#witness_argv[@]}` proves a challenge was
+    # actually put to the witness, so a stream answering a question nobody asked cannot license a
+    # deletion. The second holds the answer to the exact nonce, as a whole line, and refuses a
+    # stream that answers twice.
+    if [[ "${#witness_argv[@]}" -gt 0 ]] \
+      && db_fence_machine_verdict "${released}" "RELEASE_WITNESS" "${witness_nonce}" "colocated"; then
+      clear_server="same-server-as-the-fence"
+    fi
+    # AND AN ISSUED CHALLENGE IS ANSWERED BEFORE ANY FAST PATH READS A FLAG (o3d-secops r34,
+    # Codex HIGH 1). r33 put the keep-record fast path BELOW the assignment above and ABOVE the
+    # reading that acted on it, so the one case the witness exists to catch was RETURNED PAST. The
+    # closing gate sets ${DB_FENCE_KEEP_RECORD} on a sampling miss -- and a sampling miss is
+    # precisely the run on which routing may have moved between the gate and this release. A
+    # challenge went out, `--release` answered `RELEASE_WITNESS <nonce> absent`, and this function
+    # returned 0: the application then started against a copy while the fenced server stayed shut.
+    #
+    # THE READING IS STILL EXACTLY r31'S AND NOTHING WIDER: a challenge WAS put to a live witness
+    # AND the answer was not "same-server-as-the-fence". db_fence_machine_verdict() is false for
+    # all three ways that can happen -- no line carrying this nonce, a line for this nonce saying
+    # something other than `colocated`, and a stream answering the same nonce twice -- so missing,
+    # conflicting and non-colocated are ONE refusal here. A run that could put no challenge at all
+    # never reaches it, which is the degraded mode r33 was fixing and which still completes.
+    #
+    # IT IS EVALUATED ONCE, HERE, AND THE clear_rc==2 ARM BELOW NO LONGER REPEATS IT: past this
+    # line a run that issued a challenge HAS a colocated verdict, so a second copy of the test
+    # would be a guard that can never fire -- and this branch has spent two rounds on exactly that
+    # shape of thing.
+    if [[ "${#witness_argv[@]}" -gt 0 && -z "${clear_server}" ]]; then
+      error "The connection fence WAS released -- CONNECT is restored -- and its record at ${DB_FENCE_STATE} was deliberately NOT removed. A challenge WAS put to this run's witness and the release's own connection could not see it, so nothing here can show that the server just released is the server that was fenced. The next run reads that file as a STANDING FENCE. End it with ${DB_FENCE_RELEASE_CMD}, which asks you to confirm at your terminal."
+      return 1
+    fi
+    # AND A RUN THAT ALREADY KNOWS THE RECORD IS BEING KEPT DOES NOT ASK (o3d-secops r33, Codex
+    # MEDIUM). ${DB_FENCE_KEEP_RECORD} is set by the closing gate when the sampler never saw the
+    # migration's own backends. The removal is withheld HERE, where the fence has just been
+    # released and the challenge has just been answered, rather than by taking the witness away
+    # upstream and letting the missing attestation surface as a failure two steps later.
+    if [[ "${DB_FENCE_KEEP_RECORD:-0}" == "1" ]]; then
+      warn "The connection fence WAS released -- CONNECT is restored -- and its record at ${DB_FENCE_STATE} is being KEPT deliberately: the witness never saw a backend carrying this run's stamp while the migration ran. The next run reads that file as a STANDING FENCE and adopts it. End it with ${DB_FENCE_RELEASE_CMD}, which asks you to confirm at your terminal."
+      db_fence_witness_stop
+      success "Connection fence released; its record is kept for you to end."
+      return 0
+    fi
+    db_fence_clear_authority "${DB_FENCE_STATE}" "${clear_attestation}" "${clear_server}" || clear_rc=$?
+    if [[ "${clear_rc}" -eq 2 ]]; then
+      # A KEPT RECORD IS NOT A FAILED RELEASE (o3d-secops r33, Codex MEDIUM). CONNECT is restored;
+      # what could not be established is the right to DELETE the record, and this branch used to
+      # return failure for that -- so every host that can hold no witness at all, which is the
+      # degraded mode this whole subsystem promises not to refuse, died at
+      # `release_db_connections || die` with the schema migrated and nothing started. Measured on
+      # all three entrypoints, not reasoned about.
+      #
+      # AND THE READING THAT IS FATAL IS NO LONGER TESTED HERE (o3d-secops r34, Codex HIGH 1).
+      # r33 asked, under this arm, whether a challenge had been issued and left unanswered -- but
+      # the keep-record fast path above returned before the arm could be reached at all. The test
+      # has moved to the one place every path through this function passes, above that fast path,
+      # so by here a run that issued a challenge already has its colocated verdict. What is left
+      # under status 2 is the pair that was never fatal: no challenge could be put at all, or the
+      # record describes a fence this run did not RAISE. The grants are back either way, and
+      # nothing about either says the release landed somewhere else.
+      warn "The connection fence WAS released -- CONNECT is restored -- and its record at ${DB_FENCE_STATE} is being KEPT (the reason is printed above). Either no challenge could be put to a witness on this run, or the record describes a fence this run did not raise; either way the removal has nothing to rest on, and the release itself is unaffected. The next run reads that file as a STANDING FENCE and adopts it. End it with ${DB_FENCE_RELEASE_CMD}, which asks you to confirm at your terminal."
+      db_fence_witness_stop
+      success "Connection fence released; its record is kept for you to end."
+      return 0
+    fi
+    if [[ "${clear_rc}" -ne 0 ]]; then
+      error "The connection fence was released and its record at ${DB_FENCE_STATE} could not be removed. The next run reads that file as a STANDING FENCE and will refuse to start the application. Remove it by hand once you have confirmed CONNECT is back."
+      return 1
+    fi
+    # THE WITNESS HAS NOTHING LEFT TO ATTEST (o3d-secops r31). The fence is down and its record is
+    # gone, so the session closes here rather than at the end of the script; a re-fence later in
+    # this same run opens a new one, bound to the fence it actually raises.
+    db_fence_witness_stop
     success "Connection fence released."
     return 0
   fi
@@ -5200,10 +7011,12 @@ refence_db_connections() {
   # exactly where substituted code would most like to be handed the admin credential.
   local rc=0 fence_script
   fence_script="$(resolve_fence_script)" || return 1
-  ( cd "${APP_DIR}" && run_as_user "${APP_USER}" env \
-      DATABASE_URL="${DATABASE_URL}" \
-      DEPLOY_ADMIN_DATABASE_URL="${DEPLOY_ADMIN_DATABASE_URL}" \
-      node "${fence_script}" --fence --state-file="${DB_FENCE_STATE}" "${DB_FENCE_IDENTITY_ARGS[@]:-}" ) || rc=$?
+  # PLAN, AUTHORISE, THEN EXECUTE (o3d-secops r23, Codex CRITICAL). This used to be one
+  # invocation, which computed the grantee list and PUBLISHED it into a directory owned by
+  # ${APP_USER} -- so the account being defended against chose what a later release would
+  # GRANT CONNECT to. db_fence_raise() runs the helper twice with a privileged validation and a
+  # durable publication in between; see lib/db-fence-protected.sh.
+  db_fence_raise "${fence_script}" "${DB_FENCE_STATE}" "${DB_FENCE_IDENTITY_ARGS[@]:-}" || rc=$?
   # EVERY POST-COMMIT RESULT RAISES THE STICKY FLAG (o3d-2sm1.5, Codex r13 HIGH). Exit 5 says
   # the REVOKEs are COMMITTED and standing: this call could not call the database fenced, but it
   # certainly fenced something, and DB_FENCE_RAISED is the flag that decides whether a later
@@ -5229,15 +7042,21 @@ refence_db_connections() {
   # while the log announces the application role; catching that throw and assigning
   # DEPLOY_ADMIN_DATABASE_URL substitutes exactly the URL it refused to emit. Fail loudly and
   # leave it empty instead: the fence is up, and nothing this trap does next needs the URL.
-  local url_rc=0
+  # THE RE-FENCE STAMPS ITS URL TOO (o3d-secops r32). This is the recovery path, and it goes on to
+  # migrate through exactly the same consumers -- so a URL composed here without the binding stamp
+  # would leave the recovery as the one route with no answer to "which server did this reach?".
+  local url_rc=0 migration_nonce=""
+  migration_nonce="$(db_fence_witness_nonce)" || migration_nonce=""
   MIGRATION_DATABASE_URL="$( cd "${APP_DIR}" && run_as_user "${APP_USER}" env \
     DATABASE_URL="${DATABASE_URL}" \
     DEPLOY_ADMIN_DATABASE_URL="${DEPLOY_ADMIN_DATABASE_URL}" \
-    node "${fence_script}" --print-migration-url "${DB_FENCE_IDENTITY_ARGS[@]:-}" )" || url_rc=$?
+    node "${fence_script}" --print-migration-url --migration-nonce="${migration_nonce}" "${DB_FENCE_IDENTITY_ARGS[@]:-}" )" || url_rc=$?
   if [[ "${url_rc}" -ne 0 || -z "${MIGRATION_DATABASE_URL}" ]]; then
     MIGRATION_DATABASE_URL=""
     warn "--print-migration-url refused to compose a migration URL (exit ${url_rc}); NOT falling back to DEPLOY_ADMIN_DATABASE_URL. The fence is up."
+    return 0
   fi
+  bind_migration_to_fenced_server advisory
   return 0
 }
 
@@ -5280,13 +7099,17 @@ import_legacy_file() {
 }
 
 import_legacy_cutover_state() {
+  # FIRST, AND UNCONDITIONALLY (o3d-secops r20). The relocation of the marker out of the
+  # application's own data directory is not a property of the /var/lib/ims-deploy namespace, and the
+  # early return below is: a host that never used the old deploy.sh would otherwise never look.
+  import_relocated_fence_marker
   [[ "$LEGACY_CUTOVER_STATE_DIR" != "$CUTOVER_STATE_DIR" ]] || return 0
   [[ -d "$LEGACY_CUTOVER_STATE_DIR" ]] || return 0
   ensure_cutover_state_dirs || die "Could not create ${CUTOVER_STATE_DIR}; the cutover namespace is unusable. Nothing has been stopped."
   local imported=false
-  # The connection-fence state goes back to ${APP_USER}: the fence script runs as the app
-  # user, and a root-owned copy is one it cannot release.
-  if import_legacy_file "$LEGACY_DB_FENCE_STATE" "$DB_FENCE_STATE" "connection-fence state" "$APP_USER"; then imported=true; fi
+  # THE CONNECTION-FENCE RECORD IS NOT IMPORTED (o3d-secops r23, Codex CRITICAL). It is reported
+  # and left where it is; see warn_legacy_namespace_db_fence_state() in lib/cutover-namespace.sh.
+  warn_legacy_namespace_db_fence_state
   if import_legacy_file "$LEGACY_CRON_BACKUP" "$CRON_BACKUP" "crontab backup"; then imported=true; fi
   # LAST, because the marker is what adoption keys on: until it is at the canonical path
   # nothing adopts anything, so a crash part-way through this import leaves a run that finds
@@ -5302,6 +7125,10 @@ import_legacy_cutover_state() {
 
 adopt_existing_fence() {
   [[ -f "${FENCE_FILE}" ]] || return 0
+  # AND IT IS A FENCE THIS RUN MAY BELIEVE (o3d-secops r20, Codex CRITICAL). Existence is not
+  # provenance: every line below is acted on, so a marker that is not a regular file owned by this
+  # run inside a directory only this run can write is refused rather than read.
+  fence_marker_is_trustworthy || die "${FENCE_MARKER_REFUSAL} Refusing to adopt it as a cutover fence. Nothing has been stopped and nothing has been migrated: read ${FENCE_FILE} by hand, decide what the interrupted run actually did, remove it, and re-run."
 
   # WHAT PHASE DID THE RUN THAT LEFT THIS ACTUALLY REACH? (o3d-2sm1.5, Codex r8 HIGH)
   #
@@ -5691,6 +7518,39 @@ prompt_yn() {
 header "Pre-flight checks"
 
 [[ $EUID -ne 0 ]] && die "This script must be run as root. Try: sudo bash install.sh"
+
+# THE THREE ROOTS, BEFORE ANY OTHER STATEMENT IN THE RUN (o3d-secops r7, Codex CRITICAL).
+#
+# This is the first line after the privilege check for a reason: every root-side operation this
+# script performs on these three names comes after it, and there is no statement before it that
+# resolves any of them. In run order, what it now precedes is
+#
+#   load_existing_env "${APP_DIR}/.env"                 the first read of any of the three
+#   useradd --home-dir "${APP_DIR}" --create-home       creates ${APP_DIR}
+#   enter_service_root "${DATA_DIR}" / "${LOG_DIR}"     section 8's own roots
+#   mkdir_service_subdir / enter_service_subdir         the walk beneath ${DATA_DIR}/${APP_DIR}
+#   migrate_uploads                                     moves the uploads into ${DATA_DIR}
+#   find "${DATA_DIR}" ... -exec chown -h               the recursive chown of the state root
+#   the ownership change under ${LOG_DIR}               made of `.` inside a re-proved root
+#   prepare_crontab_lock                                the root-owned lock under ${DATA_DIR}
+#   mkdir_service_subdir "${DATA_DIR}" 077 …            the deploy key directory
+#   git clone / git fetch / rsync -a --delete           into ${APP_DIR}
+#   copy_tree_into_new_dir … "${APP_DIR}/.git"          and its git metadata
+#   chown -R … "${APP_DIR}"                             the recursive chown of the app root
+#   publish_durable_file "${APP_DIR}/.env"              and every later publication
+#   fence_cron -> mkdir -p "${DATA_DIR}" + CRON_BACKUP  the crontab fence and its backup
+#   the migration, the seed, the unit and the service   everything downstream of all of it
+#
+# ${LOG_DIR} is in the list because `chown -R` DEREFERENCES its operand: a link at /var/log/<app>
+# hands the whole of whatever it points at to ${APP_USER}, recursively.
+#
+# AND THE GATE IS NOT THE WHOLE ANSWER FOR ${LOG_DIR}. It is a snapshot, and /var/log is
+# group-writable and not sticky on Ubuntu, so the `syslog` account can RENAME the root after this
+# line has passed on it — no symlink involved, and nothing a snapshot can see. enter_service_root()
+# is the other half: section 8 creates, re-proves and ENTERS the root, and changes ownership of `.`.
+require_real_service_root "${APP_DIR}"  "the application directory"
+require_real_service_root "${DATA_DIR}" "the state directory"
+require_real_service_root "${LOG_DIR}"  "the log directory"
 
 if [[ -f /etc/os-release ]]; then
   . /etc/os-release
@@ -6437,15 +8297,53 @@ if [[ -n "${DB_SSLROOTCERT}" ]]; then
     "The database CA at ${DB_CA_PUBLISHED_FILE} is not usable by the account the service runs as; the reason is above. DB_SSLMODE=${DB_SSLMODE} verifies every connection against that file, so an application that cannot open it cannot start. NOTHING HAS BEEN MIGRATED and nothing has been stopped. ${DB_CA_REFRESH_FAILURE_ADVICE}"
 fi
 
-mkdir -p "${DATA_DIR}" "${LOG_DIR}" "${BACKUP_DIR}" \
+# THE STATE ROOTS THEMSELVES, CREATED BY THE WALK AND NOT BY `mkdir -p` (o3d-secops r7).
+#
+# This was `mkdir -p "${DATA_DIR}" "${LOG_DIR}"`, on the argument that /var/lib and /var/log are
+# root-owned so a symlink at either name is an operator's storage layout rather than an attack.
+# Round 6 had already withdrawn that argument for the PUBLISHER — it refuses a symlinked root and
+# names the bind mount that replaces it — and leaving it standing here is what made the refusal
+# arrive after the writes it was meant to prevent. `mkdir -p` follows a link at the root silently;
+# a plain `mkdir` inside a pinned parent does not, and enter_service_root() is that.
+#
+# NOT IN A SUBSHELL, and that is load-bearing (o3d-secops r7 third pass). enter_service_root()
+# RECORDS the identity of a root it creates, and the ownership change further down is held to that
+# record; a subshell would discard it and the second call would refuse the directory the first one
+# made. So the cwd is saved and restored around the two calls instead, exactly as
+# mkdir_service_subdir() does — every `die` inside them ends the run, so the moved cwd never
+# outlives the process.
+SERVICE_ROOT_CWD="$(pwd -P)" || die "this run cannot establish its own working directory, so it will not walk into its state roots and back. Nothing has been changed."
+enter_service_root "${DATA_DIR}" 022 "the state directory"
+cd "${SERVICE_ROOT_CWD}" || die "this run could not return to ${SERVICE_ROOT_CWD} after creating ${DATA_DIR}. Nothing further has been changed."
+enter_service_root "${LOG_DIR}" 022 "the log directory"
+cd "${SERVICE_ROOT_CWD}" || die "this run could not return to ${SERVICE_ROOT_CWD} after creating ${LOG_DIR}. Nothing further has been changed."
+
+# EVERYTHING BENEATH THEM GOES THROUGH THE SYMLINK-PROOF WALK (o3d-czpy). On an upgrade the
+# containing directory already belongs to ${APP_USER} — the recursive chown below did that on the
+# previous run — so `mkdir -p` here was creating whatever a planted symlink pointed at, and the
+# application's uploads are then written into it.
+mkdir_service_subdir "${DATA_DIR}" 022 \
+  "${BACKUP_DIR}" \
   "${DATA_DIR}/xero" \
   "${UPLOAD_STORAGE_DIR}/invoices" \
   "${UPLOAD_STORAGE_DIR}/quarantine/invoices" \
   "${PUBLIC_UPLOAD_STORAGE_DIR}/branding" \
-  "${PUBLIC_UPLOAD_STORAGE_DIR}/avatars" \
-  "${APP_DIR}/backups" \
-  /tmp/${APP_NAME}/pdf \
-  /tmp/${APP_NAME}/uploads
+  "${PUBLIC_UPLOAD_STORAGE_DIR}/avatars"
+mkdir_service_subdir "${APP_DIR}" 022 "${APP_DIR}/backups"
+
+# AND /tmp/${APP_NAME}/pdf AND /tmp/${APP_NAME}/uploads ARE NOT CREATED AT ALL ANY MORE (o3d-czpy).
+#
+# /tmp is 1777, so `mkdir -p /tmp/${APP_NAME}/pdf` as root was the one site in this script reachable
+# by ANY local user and not merely by ${APP_USER}: pre-create /tmp/${APP_NAME} as a symlink and the
+# next install run makes root create directories wherever it points.
+#
+# THE FIX IS DELETION, BECAUSE NOTHING READS THEM. ${APP_NAME} is "one-two-inventory"; the
+# application's own temporary uploads path is `path.join(os.tmpdir(), 'onetwoinventory', 'uploads')`
+# (lib/ops/health.ts) and its dev backup root is /tmp/onetwoinventory/backups
+# (lib/backup-storage.ts) — different names, neither of them these. Nothing in the repository, in
+# either spelling of the app name, opens /tmp/one-two-inventory. Making a dead directory safe is
+# not the fix for creating it in a world-writable place; not creating it is. The app creates its own
+# temp directories at runtime, under its own uid, and the health check reports on them.
 
 # Migrate uploads from any previous in-tree location to the new storage roots.
 # Existing DB rows reference filenames only, so files left behind under
@@ -6455,10 +8353,30 @@ mkdir -p "${DATA_DIR}" "${LOG_DIR}" "${BACKUP_DIR}" \
 migrate_uploads() {
   local src="$1"
   local dest="$2"
+  local saved
   if [[ -d "${src}" ]] && [[ -n "$(find "${src}" -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null)" ]]; then
     info "Migrating legacy uploads: ${src} -> ${dest}"
-    mkdir -p "${dest}"
-    find "${src}" -mindepth 1 -maxdepth 1 -exec mv -n -t "${dest}" {} +
+    # THE DESTINATION IS CREATED SYMLINK-PROOF AND THEN USED WITHOUT BEING NAMED AGAIN (o3d-czpy).
+    # `mkdir -p "${dest}"` followed by `mv -t "${dest}"` was two resolutions of a path inside a
+    # directory ${APP_USER} owns, and the run that matters is the UPGRADE — where the previous run
+    # has already handed ${DATA_DIR} to them. enter_service_subdir() walks there by chdir and
+    # LEAVES THIS PROCESS INSIDE the destination, so the files are moved into `.`: the pin the walk
+    # established is the same pin the move uses, with no pathname in between to re-resolve.
+    #
+    # AND IT NO LONGER DEMANDS THAT THE DESTINATION BE OWNED BY THIS RUN (o3d-czpy r2, Codex
+    # MEDIUM). It did — `stat -c '%F|%u' .` against `id -u` — on the argument that the recursive
+    # chown had not happened YET. That is true of a first install and false of every rerun after
+    # one: the previous install chowned ${UPLOAD_STORAGE_DIR} and ${PUBLIC_UPLOAD_STORAGE_DIR} to
+    # ${APP_USER}, so on the ordinary upgrade path the destination comes back owned by the SERVICE
+    # account, `stat` returns its uid, and the installer aborted — a legitimate migration refused
+    # by a check that could only pass on the run that needed it least. A same-account harness
+    # cannot see it, because there the two uids are one. The identity of the destination is what
+    # mattered and ownership was standing in for it; the walk pins the identity directly.
+    saved="$(pwd -P)" || die "this run cannot establish its own working directory, so it will not migrate ${src}."
+    enter_service_subdir "${DATA_DIR}" 022 "${dest}"
+    find "${src}" -mindepth 1 -maxdepth 1 -exec mv -n -t . {} + \
+      || die "Legacy uploads at ${src} could not be moved into ${dest}. Nothing has been started and nothing has been migrated."
+    cd "${saved}" || die "this run could not return to ${saved} after migrating ${src}. Nothing further has been changed."
     rmdir "${src}" 2>/dev/null || true
   fi
 }
@@ -6470,11 +8388,70 @@ migrate_uploads "${APP_DIR}/public/uploads/avatars" "${PUBLIC_UPLOAD_STORAGE_DIR
 
 # The crontab lock directory below is deliberately NOT handed to the service user, so it is pruned
 # out of this recursive chown rather than being taken back and re-taken on every re-run (which would
-# open a window in which the service user could plant a symlink inside it). `-exec chown -h` also
-# means a symlink anywhere under ${DATA_DIR} has its own ownership changed rather than its target's.
-find "${DATA_DIR}" -path "${CRONTAB_LOCK_DIR}" -prune -o -exec chown -h "${APP_USER}:${APP_USER}" {} +
-chown -R "${APP_USER}:${APP_USER}" "${LOG_DIR}"
-chown -R "${APP_USER}:${APP_USER}" "${UPLOAD_STORAGE_DIR}" "${PUBLIC_UPLOAD_STORAGE_DIR}"
+# open a window in which the service user could plant a symlink inside it). The staging directories
+# publish_durable_file() leaves behind are withheld for the SAME reason and at any depth (o3d-czpy):
+# it stages ${CUTOVER_STATE_DIR}/DEPLOY-FENCED and the cron backup through root-owned 0700
+# directories inside ${DATA_DIR}, and a staging directory this line handed to ${APP_USER} would be a
+# staging directory they can rename — which is the whole finding.
+#
+# THEY ARE WITHHELD BY SHAPE AND NOT BY NAME, WHICH IS WHY ${PUBLISH_STAGE_DIRNAME} IS NOT PASSED
+# HERE (o3d-secops r19, Codex CRITICAL). ${APP_USER} owns the directory a staging directory sits in
+# and can rename it to an ordinary name before this line runs; the walk would then have met an
+# ordinary name and handed over a directory that, after a SIGKILL between the fill and the rename,
+# holds a complete root-owned copy of the thing being published. The helper prunes a directory owned
+# by the uid running the walk whose mode is exactly 0700 — a shape ${APP_USER} can neither
+# manufacture nor alter — so no rename reaches it. ${PUBLISH_STAGE_DIRNAME} remains the name
+# publish_durable_file() CREATES; it is no longer the name anything DEFENDS.
+#
+# AND THE WALK IS FD-RELATIVE, NOT `find -exec chown -h` (o3d-n8xx, Codex CRITICAL). See
+# chown_state_tree() above for the finding, the alternative that was weighed, and why the traversal
+# is not written in shell. What changes here is that the lock prune is named as a SINGLE COMPONENT —
+# resolved against the descriptor of the directory it sits in, never as a pathname.
+#
+# THE LOCK DIRECTORY'S NAME AND ITS PATH ARE THE SAME FACT, AND THIS SAYS SO. crontab_lock_paths()
+# composes ${CRONTAB_LOCK_DIR} as ${DATA_DIR}/${CRONTAB_LOCK_DIRNAME}; the walk prunes the single
+# component. If those two ever stop agreeing the prune would silently protect nothing, so they are
+# checked against each other here rather than left to be true.
+[[ "${CRONTAB_LOCK_DIR}" == "${DATA_DIR%/}/${CRONTAB_LOCK_DIRNAME}" ]] || die \
+  "the crontab lock directory is ${CRONTAB_LOCK_DIR}, which is not ${DATA_DIR%/}/${CRONTAB_LOCK_DIRNAME}: the recursive ownership change over the state directory prunes it by its single name component, and a name that does not compose the same path would prune nothing. This is a bug in this script, not an operator error."
+chown_state_tree "${DATA_DIR}" "${APP_USER}" "${CRONTAB_LOCK_DIRNAME}" "the state directory"
+# ${LOG_DIR}'S OWNERSHIP IS AIMED AT A DESCRIPTOR, NOT AT A NAME (o3d-secops r7 second pass,
+# Codex HIGH).
+#
+# `chown -R "${APP_USER}:${APP_USER}" "${LOG_DIR}"` DEREFERENCES ITS OPERAND, and /var/log is
+# `drwxrwxr-x root:syslog` and not sticky on Ubuntu — so the `syslog` account may rename entries in
+# it, root-owned ones included, WITH NO SYMLINK ANYWHERE. Between the pre-flight gate and this
+# line it could move the real log root aside and rename another /var/log subtree into its name, and
+# this `chown -R` would transfer that subtree, recursively, to ${APP_USER}. A pathname check cannot
+# see a rename; only an operation aimed at an inode is unaffected by one.
+#
+# So enter_service_root() re-walks from `/`, re-proves the root's identity and its `..`, enters it
+# through the descriptor pre-flight opened on it, and leaves this subshell INSIDE it — and the
+# ownership change is then made of `.`. Its subshell is why the installer's own cwd is unaffected.
+#
+# AND IT IS `chown -Rh .`, NOT `find . -exec chown -h {} +` (o3d-secops r7 fourth pass, Codex HIGH).
+# `find -exec` ENUMERATES pathnames and hands them to a chown that resolves them again afterwards;
+# `-h` protects only the FINAL component, so on an upgrade — where ${APP_USER} owns this tree — a
+# descendant directory renamed into a symlink between the enumeration and the chown redirects a
+# root-side ownership change through it. GNU find's own documentation calls `-exec` insecure for
+# exactly this. coreutils' chown walks with fts and `fchownat(AT_SYMLINK_NOFOLLOW)` relative to
+# directory descriptors it holds, so there is no pathname to re-resolve: `-R` is the recursion, `-h`
+# is the no-follow, and `.` is the pinned root. (The ${DATA_DIR} line above still uses `find`
+# because it must PRUNE two subtrees by name, which chown cannot express; it carries the same
+# residual and is not this round's change.)
+if ! (
+  enter_service_root "${LOG_DIR}" 022 "the log directory"
+  chown -Rh "${APP_USER}:${APP_USER}" .
+); then
+  die "The ownership of ${LOG_DIR} could not be set; the reason is above. Nothing has been started."
+fi
+# AND THE TWO STORAGE ROOTS ARE NOT CHOWNED A SECOND TIME (o3d-n8xx). There used to be a
+# `chown -R "${APP_USER}:${APP_USER}" "${UPLOAD_STORAGE_DIR}" "${PUBLIC_UPLOAD_STORAGE_DIR}"` here.
+# Both are ${DATA_DIR}/uploads and ${DATA_DIR}/public-uploads — inside the tree the walk above has
+# just handed over in full, and pruned by neither name — so it did nothing the walk had not already
+# done, and it did it with a `chown -R` that DEREFERENCES ITS OPERAND, at two names inside a
+# directory ${APP_USER} owns. That is the shape the ${LOG_DIR} note below is about, at two more
+# sites, for no effect. A redundant root-side operation is not free: it is one more name to aim.
 
 # THE CRONTAB RECONCILIATION LOCK, prepared here and defined in scripts/lib/crontab-lock.sh.
 #
@@ -6500,9 +8477,29 @@ if [[ "${GIT_DEPLOY_KEY_ENABLED:-n}" == "y" ]]; then
   [[ -n "${GITHUB_REPO_NAME:-}" ]] || die "GITHUB_REPO_NAME is required when GIT_DEPLOY_KEY_ENABLED=y."
   git_repo_uses_ssh "${GIT_REPO_URL}" || die "GIT_REPO_URL must use the GitHub SSH form when GIT_DEPLOY_KEY_ENABLED=y."
 
-  mkdir -p "${DEPLOY_SSH_DIR}"
-  chown -R "${APP_USER}:${APP_USER}" "${DEPLOY_SSH_DIR}"
-  chmod 700 "${DEPLOY_SSH_DIR}"
+  # THE DIRECTORY THAT HOLDS THE DEPLOY PRIVATE KEY (o3d-czpy).
+  #
+  # It was `mkdir -p` + `chown -R` + `chmod 700`, all three of which resolve a path inside
+  # ${DATA_DIR} — which the previous run gave to ${APP_USER}. `mkdir -p` accepts a symlink to a
+  # directory silently, and the `chmod 700` that followed it therefore made an arbitrary directory
+  # of the service account's choosing root-only: a root-side mode change aimed by a symlink.
+  #
+  # NOW: the walk creates it with a PLAIN mkdir under `umask 077`, so the mode is 0700 from the
+  # create and there is nothing to correct afterwards. A mode that is already wrong is REFUSED, not
+  # chmod'ed — the same rule prepare_crontab_lock states, for the same reason: chmod has no
+  # --no-dereference on Linux. (Every installation that has run any previous version of this script
+  # already has 0700 here, because the line above set it on every run, so this refuses only a
+  # directory somebody changed by hand.)
+  #
+  # `chown -h` and NOT `chown -R`: -R's OPERAND is dereferenced, so a symlink that arrived between
+  # the mkdir and here would have had its target's ownership changed. There is nothing recursive to
+  # do in any case — ssh-keygen creates the key as ${APP_USER} below, and known_hosts is published
+  # with its owner applied before the rename.
+  mkdir_service_subdir "${DATA_DIR}" 077 "${DEPLOY_SSH_DIR}"
+  DEPLOY_SSH_DIR_MODE="$(stat -c '%a' "${DEPLOY_SSH_DIR}" 2>/dev/null || true)"
+  [[ "${DEPLOY_SSH_DIR_MODE}" == "700" ]] || die \
+    "${DEPLOY_SSH_DIR} is mode ${DEPLOY_SSH_DIR_MODE:-unreadable}, not 700. It holds the deploy private key, and ssh itself refuses a key in a group- or world-accessible directory. This run will not chmod it: chmod has no --no-dereference on Linux, so correcting a path inside a directory '${APP_USER}' owns is the same escalation with a different verb. Set it to 700 by hand and run the installer again."
+  chown -h "${APP_USER}:${APP_USER}" "${DEPLOY_SSH_DIR}"
 
   if [[ ! -f "${DEPLOY_SSH_KEY_PATH}" ]]; then
     run_as_user "${APP_USER}" ssh-keygen -q -t ed25519 -N "" -C "${GITHUB_DEPLOY_KEY_TITLE}" -f "${DEPLOY_SSH_KEY_PATH}"
@@ -6511,10 +8508,22 @@ if [[ "${GIT_DEPLOY_KEY_ENABLED:-n}" == "y" ]]; then
     info "Reusing existing deploy key at ${DEPLOY_SSH_KEY_PATH}."
   fi
 
-  ssh-keyscan -H github.com > "${DEPLOY_SSH_KNOWN_HOSTS}.tmp" 2>/dev/null
-  mv "${DEPLOY_SSH_KNOWN_HOSTS}.tmp" "${DEPLOY_SSH_KNOWN_HOSTS}"
-  chmod 600 "${DEPLOY_SSH_KNOWN_HOSTS}"
-  chown "${APP_USER}:${APP_USER}" "${DEPLOY_SSH_KNOWN_HOSTS}"
+  # THE HOST KEYS, CAPTURED AND THEN PUBLISHED (o3d-czpy). The redirection wrote into
+  # ${DEPLOY_SSH_DIR}, which belongs to ${APP_USER}: `>` follows a symlink at the final component,
+  # so a planted `known_hosts.tmp` sent ssh-keyscan's output — and, on the older layout, the mode
+  # and owner changes after it — wherever they chose. The rename that followed was the only safe
+  # step of the four, and it happened after the write.
+  #
+  # CAPTURED FIRST, so an ssh-keyscan that fails or that returns nothing cannot publish an EMPTY
+  # known_hosts: that file is the only thing standing between this deploy key and a man in the
+  # middle, and an empty one makes every later `git` either refuse or prompt.
+  KEYSCAN_OUTPUT="$(ssh-keyscan -H github.com 2>/dev/null)" || die \
+    "ssh-keyscan could not reach github.com, so this run cannot pin its host keys. ${DEPLOY_SSH_KNOWN_HOSTS} is unchanged and nothing has been started."
+  [[ -n "${KEYSCAN_OUTPUT}" ]] || die \
+    "ssh-keyscan returned no host keys for github.com. Publishing an empty ${DEPLOY_SSH_KNOWN_HOSTS} would leave every later git fetch unauthenticated, so this run refuses; the existing file is unchanged and nothing has been started."
+  printf '%s\n' "${KEYSCAN_OUTPUT}" \
+    | publish_durable_file "${DEPLOY_SSH_KNOWN_HOSTS}" "${APP_USER}:${APP_USER}" 600 || die \
+    "${DEPLOY_SSH_KNOWN_HOSTS} could not be published. The file at that path is whatever the previous run left there, complete and unchanged — it is published by rename — and nothing has been started."
 
   DEPLOY_PUBLIC_KEY="$(<"${DEPLOY_SSH_KEY_PATH}.pub")"
   EXISTING_KEYS_JSON="$(github_api GET "/repos/${GITHUB_REPO_OWNER}/${GITHUB_REPO_NAME}/keys")"
@@ -6567,8 +8576,7 @@ if [[ "$INSTALL_FROM_GIT" == "y" ]]; then
       --exclude='uploads' \
       --exclude='public/uploads' \
       "${TMP_CLONE_WORKTREE%/}/" "${APP_DIR}/"
-    rm -rf "${APP_DIR}/.git"
-    cp -a "${TMP_CLONE_WORKTREE}/.git" "${APP_DIR}/.git"
+    copy_tree_into_new_dir "${TMP_CLONE_WORKTREE}/.git" "${APP_DIR}/.git"
     chown -R "${APP_USER}:${APP_USER}" "${APP_DIR}"
     rm -rf "${TMP_CLONE_DIR}"
     success "Repository synced into existing directory."
@@ -6601,23 +8609,27 @@ else
     chown "${APP_USER}:${APP_USER}" "${TMP_CLONE_DIR}"
     run_git_as_user "${APP_USER}" git clone --branch "${GIT_BRANCH}" --depth 1 \
       "${GIT_REPO_URL}" "${TMP_CLONE_WORKTREE}"
-    rm -rf "${APP_DIR}/.git"
-    cp -a "${TMP_CLONE_WORKTREE}/.git" "${APP_DIR}/.git"
+    copy_tree_into_new_dir "${TMP_CLONE_WORKTREE}/.git" "${APP_DIR}/.git"
     chown -R "${APP_USER}:${APP_USER}" "${APP_DIR}/.git"
     rm -rf "${TMP_CLONE_DIR}"
     success "Git metadata attached."
   fi
 fi
 
-DEPLOY_META_FILE="${APP_DIR}/.deploy-meta"
-cat > "${DEPLOY_META_FILE}" <<EOF
-INSTALL_FROM_GIT=${INSTALL_FROM_GIT}
-GIT_REPO_URL=${GIT_REPO_URL:-}
-GIT_BRANCH=${GIT_BRANCH:-}
-GIT_DEPLOY_KEY_ENABLED=${GIT_DEPLOY_KEY_ENABLED:-n}
-EOF
-chown "${APP_USER}:${APP_USER}" "${DEPLOY_META_FILE}"
-chmod 600 "${DEPLOY_META_FILE}"
+readonly DEPLOY_META_FILE="${APP_DIR}/.deploy-meta"
+# PUBLISHED, NOT TRUNCATED-THEN-FILLED (o3d-czpy). ${APP_DIR} belongs to ${APP_USER} by the time an
+# upgrade reaches this line, so `cat >` followed by a `chown` and a `chmod 600` was three root-side
+# operations on a name they can turn into a symlink — the same shape as the `.env` write, over the
+# file update.sh reads GIT_REPO_URL out of. publish_durable_file() stages it in a root-owned 0700
+# directory, applies the owner and the mode there, and renames; rename replaces a symlink entry
+# instead of following it.
+{
+  echo "INSTALL_FROM_GIT=${INSTALL_FROM_GIT}"
+  echo "GIT_REPO_URL=${GIT_REPO_URL:-}"
+  echo "GIT_BRANCH=${GIT_BRANCH:-}"
+  echo "GIT_DEPLOY_KEY_ENABLED=${GIT_DEPLOY_KEY_ENABLED:-n}"
+} | publish_durable_file "${DEPLOY_META_FILE}" "${APP_USER}:${APP_USER}" 600 || die \
+  "${DEPLOY_META_FILE} could not be written. Nothing has been stopped and nothing has been migrated; the file at that path is whatever the previous run left there, complete and unchanged — it is published by rename."
 
 # ---------------------------------------------------------------------------
 # 10. Write .env file
@@ -6879,8 +8891,16 @@ CUTOVER_STEP="build"
 header "Generating Prisma client"
 
 cd "${APP_DIR}"
+prisma_generate_rc=0
 run_as_user "${APP_USER}" env DATABASE_URL="${MIGRATION_DATABASE_URL}" \
-  npx prisma generate --schema prisma/schema.prisma
+  npx prisma generate --schema prisma/schema.prisma || prisma_generate_rc=$?
+# A BUILD IS A DATABASE CONSUMER TOO, ON THE RECOVERY PATH (o3d-secops r33, Codex HIGH 1). On an
+# ordinary run this is a no-op: no fence is standing yet, so pin_migration_window() returns at once.
+# On a run that ADOPTED a standing fence it is not -- the migration URL is live by then, the sampler
+# is armed, and this step reaches the database through the same movable string as everything below.
+# Status captured, pin first, failure propagated after it (o3d-secops r34, Codex HIGH 2).
+pin_migration_window "The Prisma client generation"
+[[ "${prisma_generate_rc}" -eq 0 ]] || die "prisma generate exited ${prisma_generate_rc} — see above. The existing installation has NOT been stopped and nothing has been migrated."
 success "Prisma client generated."
 
 header "Building Next.js application (existing installation still serving)"
@@ -6891,8 +8911,12 @@ header "Building Next.js application (existing installation still serving)"
 # changes; inside one, without it, anything the build touches in the database fails with
 # "permission denied for database" — the fence working as intended, presenting as a build
 # error.
+build_rc=0
 run_as_user "${APP_USER}" env DATABASE_URL="${MIGRATION_DATABASE_URL}" \
-  npm run build --prefix "${APP_DIR}"
+  npm run build --prefix "${APP_DIR}" || build_rc=$?
+# Status captured, pin first, failure propagated after it (o3d-secops r34, Codex HIGH 2).
+pin_migration_window "The build"
+[[ "${build_rc}" -eq 0 ]] || die "Build failed — see above. The existing installation has NOT been stopped and nothing has been migrated."
 success "Build complete."
 
 CUTOVER_STEP="validate"
@@ -6987,11 +9011,15 @@ if ${UPGRADE_EXISTING}; then
   # and the migration opens its own afterwards with nothing holding the gap.
   fence_db_connections
   info "Asking Postgres whether anything else is still connected..."
+  drain_probe_rc=0
   ( cd "${APP_DIR}" && run_as_user "${APP_USER}" env \
       DATABASE_URL="${MIGRATION_DATABASE_URL}" \
       DEPLOY_ADMIN_DATABASE_URL="${DEPLOY_ADMIN_DATABASE_URL}" \
       node "${APP_DIR}/scripts/check-db-writers.mjs" ) \
-    || die "Another client is still connected to the target database. Stop it and re-run; the migration has NOT been applied."
+    || drain_probe_rc=$?
+  # Status captured, pin first, failure propagated after it (o3d-secops r34, Codex HIGH 2).
+  pin_migration_window "The drain probe"
+  [[ "${drain_probe_rc}" -eq 0 ]] || die "Another client is still connected to the target database. Stop it and re-run; the migration has NOT been applied."
   success "No other client backends on the target database."
 
   # AND ONLY NOW MAY A WORKING CREDENTIAL BE TAKEN AWAY (o3d-2sm1.5 r38, Codex HIGH). Nothing is
@@ -7016,14 +9044,36 @@ CUTOVER_STEP="migrate"
 # is exactly what this flag exists for, and one that only ever reached shell memory is false
 # for every one of those cases.
 mark_schema_touched
+migrate_rc=0
 run_as_user "${APP_USER}" env DATABASE_URL="${MIGRATION_DATABASE_URL}" \
-  npx prisma migrate deploy --schema prisma/schema.prisma
+  npx prisma migrate deploy --schema prisma/schema.prisma || migrate_rc=$?
+# AND ITS PLACEMENT RUNS WHATEVER THE STEP DID (o3d-secops r34, Codex HIGH 2). Every consumer
+# in this file was written so that a non-zero exit left the script BEFORE its pin -- `set -e`
+# for the bare ones, an explicit `|| die` for the rest. The chain r33 built was therefore
+# complete only for consumers that SUCCEEDED, and the consumer whose placement matters most is
+# the other one: a stable redirect sends the migration to another cluster, it partially applies
+# DDL and then fails, and nothing ever asks where it ran. ${DB_FENCE_UP} is still true, so the
+# exit trap re-fences and reports an unknown schema state for the ORIGINAL database and says
+# nothing at all about the one the DDL reached.
+#
+# SO THE STATUS IS CAPTURED, THE PIN RUNS, AND ONLY THEN IS THE FAILURE PROPAGATED, and that
+# order is the point rather than an accident of layout. pin_migration_window() DIES on a
+# placement refusal, so a step that both failed AND cannot be placed reports the PLACEMENT --
+# "whatever that step wrote may be on another server, the fence is STILL UP" -- and never the
+# exit status, which is the weaker of the two answers and would mask it. The exit status is
+# propagated only once the placement has been established.
+pin_migration_window "The migration"
+[[ "${migrate_rc}" -eq 0 ]] || die "prisma migrate deploy exited ${migrate_rc} — see above. THE SCHEMA MAY HAVE PARTLY MOVED: a migration that fails part-way has applied what ran before the statement that failed. The step above has just been placed on the server this run fenced, so what it applied is on that server. Nothing has been started and the connection fence is STILL UP."
 success "Database migrations applied."
 
 header "Validating database schema"
 
+drift_rc=0
 run_as_user "${APP_USER}" env DATABASE_URL="${MIGRATION_DATABASE_URL}" \
-  node "${APP_DIR}/scripts/check-prisma-drift.mjs"
+  node "${APP_DIR}/scripts/check-prisma-drift.mjs" || drift_rc=$?
+# Status captured, pin first, failure propagated after it (o3d-secops r34, Codex HIGH 2).
+pin_migration_window "The drift check"
+[[ "${drift_rc}" -eq 0 ]] || die "The deployed schema does not match prisma/schema.prisma — see above. Nothing has been started."
 success "Database schema matches prisma/schema.prisma."
 
 # AND THAT THE APPLICATION CAN ACTUALLY USE WHAT JUST LANDED (o3d-2sm1.5, Codex r4 CRITICAL).
@@ -7034,11 +9084,15 @@ success "Database schema matches prisma/schema.prisma."
 # APPLICATION role, the one question none of the other steps ask.
 header "Checking the application role can use what the migration created"
 
+object_access_rc=0
 run_as_user "${APP_USER}" env \
   DATABASE_URL="${MIGRATION_DATABASE_URL}" \
   DEPLOY_ADMIN_DATABASE_URL="${DEPLOY_ADMIN_DATABASE_URL}" \
   node "${DB_OBJECT_ACCESS_SCRIPT}" --state-file="${DB_FENCE_STATE}" \
-  || die "The migration left objects the application role cannot use — see above. Nothing has been started."
+  || object_access_rc=$?
+# Status captured, pin first, failure propagated after it (o3d-secops r34, Codex HIGH 2).
+pin_migration_window "The object-access check"
+[[ "${object_access_rc}" -eq 0 ]] || die "The migration left objects the application role cannot use — see above. Nothing has been started."
 success "The application role can use everything in the database."
 
 # ---------------------------------------------------------------------------
@@ -7052,19 +9106,31 @@ success "The application role can use everything in the database."
 CUTOVER_STEP="verify-migrations"
 header "Running the migrations' own verification checks"
 
+verify_hook_rc=0
 run_as_user "${APP_USER}" env \
   DATABASE_URL="${MIGRATION_DATABASE_URL}" \
   DEPLOY_ADMIN_DATABASE_URL="${DEPLOY_ADMIN_DATABASE_URL}" \
   node "${APP_DIR}/scripts/run-migration-verifications.mjs" \
-  || die "A migration's verification check did not return zero. Nothing has been started."
+  || verify_hook_rc=$?
+# Status captured, pin first, failure propagated after it (o3d-secops r34, Codex HIGH 2).
+pin_migration_window "The verification hook"
+[[ "${verify_hook_rc}" -eq 0 ]] || die "A migration's verification check did not return zero. Nothing has been started."
 success "Every declared verification check returned zero (the coverage report above says what was NOT declared)."
 
 header "Seeding database"
 
+seed_rc=0
 run_as_user "${APP_USER}" env DATABASE_URL="${MIGRATION_DATABASE_URL}" SEED_TEST_ADMIN="false" \
-  npm run db:seed --prefix "${APP_DIR}"
+  npm run db:seed --prefix "${APP_DIR}" || seed_rc=$?
+# Status captured, pin first, failure propagated after it (o3d-secops r34, Codex HIGH 2).
+pin_migration_window "The seed"
+[[ "${seed_rc}" -eq 0 ]] || die "The database seed exited ${seed_rc} — see above. Nothing has been started."
 success "Database seed applied."
 
+# DECLARED OUTSIDE THE BRANCH, because the closing gate below reads them whether or not this
+# branch ran (o3d-secops r34, Codex HIGH 2), and `set -u` would kill the run otherwise.
+bootstrap_rc=0
+bootstrap_ran=0
 if [[ -n "${DEFAULT_ADMIN_EMAIL}" || -n "${SMTP_HOST}" || -n "${SMTP_FROM_EMAIL}" || -n "${APP_DOMAIN}" || -n "${WC_STORE_URL}" ]]; then
   header "Bootstrapping default admin and seeded settings"
   BOOTSTRAP_SCRIPT="${APP_DIR}/scripts/provision-instance.mjs"
@@ -7089,9 +9155,39 @@ if [[ -n "${DEFAULT_ADMIN_EMAIL}" || -n "${SMTP_HOST}" || -n "${SMTP_FROM_EMAIL}
     WC_STORE_URL="${WC_STORE_URL}" \
     WC_CONSUMER_KEY="${WC_CONSUMER_KEY}" \
     WC_CONSUMER_SECRET="${WC_CONSUMER_SECRET}" \
-    node "${BOOTSTRAP_SCRIPT}"
-  success "Bootstrap configuration complete."
+    node "${BOOTSTRAP_SCRIPT}" || bootstrap_rc=$?
+  # ITS PLACEMENT IS THE CLOSING GATE BELOW (o3d-secops r34, Codex HIGH 2), so the status is
+  # carried past the `fi` and BOTH the refusal and the success line come after it: a
+  # bootstrap the gate is about to refuse must not have been reported complete first.
+  bootstrap_ran=1
 fi
+
+# AND ONLY NOW IS IT ASKED WHERE ALL OF THAT LANDED (o3d-secops r32, Codex HIGH 2 / o3d-mzcp;
+# moved below the seed and the bootstrap in r33, Codex HIGH 1).
+#
+# THE GATE HAS TO SIT AFTER THE LAST DATABASE CONSUMER, AND THERE ARE SEVEN OF THEM ON THIS
+# ENTRYPOINT, not the five the r32 comment counted. In order: the drain probe, `prisma migrate
+# deploy`, the drift check, the object-access check, the verification hook -- AND THEN `db:seed`
+# AND `provision-instance.mjs`, which are the two this gate used to run in front of. Both write,
+# both go through the same movable ${MIGRATION_DATABASE_URL}, and nothing looked at either of them
+# afterwards: a DNS change, a proxy or a failover taking effect after the old position sent the
+# seed, the default administrator, the SMTP configuration and the WooCommerce credentials to
+# another cluster and returned, and the run then attested against the original server and started
+# the application there.
+#
+# Each of the seven is also placed individually by pin_migration_window() as it finishes -- see the
+# section above that function -- so this is the last link of a chain rather than the only one.
+# Still before the application is started, because starting is the first thing that would SERVE a
+# schema this run cannot place.
+#
+# AND BEFORE THE BOOTSTRAP'S OWN FAILURE IS PROPAGATED (o3d-secops r34, Codex HIGH 2). The
+# bootstrap is the LAST consumer, so this gate is its placement; exiting on its status before
+# the gate ran left the whole window unplaced on exactly the run where the default
+# administrator, the SMTP configuration and the WooCommerce credentials may have been written
+# to another cluster.
+require_migration_landed_on_fenced_server
+[[ "${bootstrap_rc}" -eq 0 ]] || die "The bootstrap of the default administrator and the seeded settings exited ${bootstrap_rc} — see above. Nothing has been started."
+if [[ "${bootstrap_ran}" == "1" ]]; then success "Bootstrap configuration complete."; fi
 
 # The build does NOT live here any more (o3d-2sm1.5, Codex r4 CRITICAL). It ran above,
 # before the stop, with the existing installation still serving the old schema — which is
