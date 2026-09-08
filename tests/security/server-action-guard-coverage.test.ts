@@ -52,11 +52,13 @@ const GUARD_IDENTIFIERS = new Set([
 // Exports intentionally without a direct guard. Each entry needs a reason.
 const ALLOWLIST: Record<string, string> = {
   // Pre-auth by design (account recovery / login ceremonies).
-  'password-reset.ts:*': 'password reset is pre-auth; rate-limited + anti-enumeration',
+  'password-reset.ts:requestPasswordReset': 'password reset is pre-auth; rate-limited + anti-enumeration',
+  'password-reset.ts:resetPassword': 'password reset is pre-auth; the one-time token IS the credential',
   'passkey.ts:getPasskeyAuthenticationOptions': 'pre-auth passkey login ceremony',
   'passkey.ts:verifyPasskeyAuthentication': 'pre-auth passkey login ceremony (one-time token bound)',
   // Public, static content.
-  'help.ts:*': 'static product help content; slug is allowlisted/sanitized',
+  'help.ts:getHelpDocs': 'static product help content; lists bundled docs, reads no database',
+  'help.ts:getHelpDoc': 'static product help content; slug is allowlisted/sanitized',
   // Public, static (non-sensitive) connector catalogue.
   'company.ts:getShoppingConnectors': 'returns static connector id/label/available metadata only',
 
@@ -183,6 +185,60 @@ test('every allowlist entry actually suppresses a live violation — no dead exe
     + '(delete the entry — that is the good direction), or the file/export was renamed '
     + 'or removed and the exemption is now a trap set for whoever recreates the name:\n'
     + dead.join('\n'),
+  )
+})
+
+/**
+ * o3d-1fel — A WILDCARD IS NOT AN EXEMPTION, IT IS A STANDING ONE.
+ *
+ * `'quickbooks-sync.ts:*'` is how six unguarded endpoints stayed invisible: the
+ * entry was written when the module was believed to be a thin facade, and it
+ * went on clearing whatever that file exported for as long as it stood. The
+ * six were gated and the wildcard deleted — but two `file:*` entries survived
+ * that round, and the same hole survived with them. Demonstrated, not assumed:
+ * appending
+ *
+ *   export async function exfiltrateEverything() {
+ *     return db.user.findMany({ select: { id: true, email: true, passwordHash: true } })
+ *   }
+ *
+ * to app/actions/help.ts left ALL FIFTEEN rules in this file green, because
+ * `'help.ts:*'` cleared it on a reason written about two static-content getters.
+ * The rule above is the one that exists to catch precisely that, and a wildcard
+ * is what switched it off.
+ *
+ * So the allowlist must now name every export it clears, and this test is what
+ * makes that structural rather than a convention: the set of exports the tree
+ * ACTUALLY leaves unguarded must equal the set the allowlist NAMES. A wildcard
+ * cannot satisfy it — `help.ts:*` is not the string `help.ts:getHelpDoc` — so
+ * the ban needs no separate syntactic rule, and neither does the reverse
+ * direction: a new unguarded export inside an already-allowlisted module lands
+ * on the left-hand side with nothing on the right to meet it.
+ *
+ * This is deliberately stronger than "no dead exemptions" below, which only
+ * asks each entry to suppress SOMETHING. Both stay: that one names the dead
+ * entry, this one names the unlisted export, and the messages are what a
+ * reviewer reads first.
+ */
+test('the allowlist names EXACTLY the exports the tree leaves unguarded — no open-ended wildcard', () => {
+  const unguarded = scanActionsDir(ACTIONS_DIR, {}, scanSource, graph, ACTIONS_KEY_PREFIX).sort()
+
+  // The walk reached the files. An empty left-hand side would satisfy the
+  // equality against an empty allowlist while proving nothing at all, and this
+  // whole file's failure mode is a rule that inspects nothing and reports green.
+  assert.ok(
+    unguarded.length > 0,
+    'the scan found NO unguarded exports at all — that is a broken walk, not a clean tree: '
+    + 'the pre-auth login and password-reset ceremonies are unguarded by design and must appear here',
+  )
+
+  assert.deepEqual(
+    unguarded,
+    Object.keys(ALLOWLIST).sort(),
+    'The allowlist and the tree disagree. On the LEFT, an export with no guard that nothing '
+    + 'names: gate it, or add it BY NAME with a reason — not by widening a module entry to `*`, '
+    + 'which is how six unguarded QuickBooks endpoints hid behind a reason written for a facade. '
+    + 'On the RIGHT, an entry naming an export that is now guarded or gone: delete it.',
   )
 })
 
