@@ -5,6 +5,7 @@ import test from 'node:test'
 import {
   DAILY_BATCH_SPLIT_BRIDGE_AMBIGUOUS,
   MAX_RECONCILIATION_FINDINGS_PER_RUN,
+  MAX_VOID_MIRROR_CONTRADICTIONS,
   collectAccountingReconciliationRows,
   evaluateAccountingReconciliationRows,
   listAccountingReconciliationRuns,
@@ -829,6 +830,9 @@ test('accounting reconciliation row collection selects required datasets', async
         return []
       },
     },
+    // o3d-11rf r4: required by the client type, so every double has to answer it. See the
+    // contradiction-query tests below for what this statement is asserted to be.
+    async $queryRaw() { return [] },
   }
 
   await collectAccountingReconciliationRows(client)
@@ -1146,6 +1150,7 @@ test('o3d-cvj9 r7: the report reads the handovers made on an assumed order, boun
         return []
       },
     },
+    async $queryRaw() { return [] },
   }
 
   const toDate = new Date('2026-08-20T00:00:00.000Z')
@@ -1463,26 +1468,216 @@ test('[o3d-anu8] the identical row written back by the connector still silences 
   assert.equal(codes.includes('terminal_refunded_order_missing_credit_note_evidence'), false)
 })
 
-// --- o3d-11rf r3: the VOID mirrors nobody can classify, and the live rows they are blocking ---
+// --- o3d-11rf r4: the VOID mirrors nobody can classify, ASKED FOR RATHER THAN SIFTED OUT ---
 
 /**
- * o3d-11rf r3 (Codex r2, HIGH) — THE OTHER HALF OF "REPAIR WHAT YOU CAN PROVE".
+ * o3d-11rf r4 (Codex r4, HIGH) — WHERE THIS RULE LIVES NOW, AND THEREFORE WHERE IT IS PROVED.
  *
- * The backfill migration repairs every historical NOT_POSTED settlement void it can prove from two
- * independent witnesses and refuses every one it cannot. What it cannot prove stays NULL, and NULL is
- * never revivable — so a live sync row that is still working on that document will never post, and
- * nothing else in the product says so: the accounting health view excludes VOID events, and
- * reconciliation's own existence check treats ANY matching event as present. A migration that
- * repaired what it could and said nothing about the rest would have abandoned the rest silently,
- * which is the thing Codex's HIGH is actually about.
+ * Round 3 paired unclassified VOID mirrors against live sync rows IN THIS FILE, over the two general
+ * pages the report already loads. Both are `ORDER BY <date> DESC LIMIT 10,000` — a bound imposed on a
+ * broad load with the filter that decides relevance applied afterwards — so the OLDEST victims, which
+ * are the only kind this warning has, were dropped before the pairing that would have named them.
  *
- * THE PAIRING IS THE FINDING, NOT THE NULL. Nearly every VOID in a mature database is a legitimate
- * cancellation from before the column existed; reporting all of them would bury the few that matter,
- * which is the failure mode the assumed-order finding next door already names. So these fixtures pin
- * the boundary in both directions — the shapes that must NOT be reported are what stop this passing
- * against a rule that simply reports every VOID.
+ * The rule is now a JOIN. That moves the whole of it into PostgreSQL, and a rule that lives in SQL
+ * cannot honestly be proved by fixtures handed to a TypeScript function: a double could only show the
+ * shape of a string. So the shapes that must and must not be reported — the scope tuple, the live
+ * statuses, an explained void, a row that already carries a document id — are proved against a real
+ * database in tests/db/reconciliation-void-mirror-contradictions.test.ts, together with the over-cap
+ * case that is the point of the change.
+ *
+ * WHAT IS LEFT HERE IS THE TWO THINGS THAT ARE STILL THIS FILE'S: that the statement is ISSUED and is
+ * the fixed one (a report that never asks cannot find anything, however right the SQL is), and that
+ * what comes back is TURNED INTO FINDINGS honestly — including the truncation finding, without which
+ * a short list would silently mean the same thing as a complete one.
+ *
+ * The evaluator deliberately does NOT re-apply the rule to what the query returns. A second filter
+ * here would mask a widened predicate in the SQL — the mutation that kills nothing because an
+ * adjacent guard accounted for the case — and would leave two spellings of one rule to drift apart.
  */
-function unexplainedVoidRows(): AccountingReconciliationRows {
+
+function contradiction(overrides: Partial<VoidMirrorContradictionFixture> = {}): VoidMirrorContradictionFixture {
+  return {
+    accountingEventId: 'event-void',
+    connector: 'xero',
+    syncType: 'SALES_INVOICE',
+    referenceType: 'SalesOrder',
+    referenceId: 'order-1',
+    idempotencyKey: 'xero:SALES_INVOICE:SalesOrder:order-1',
+    syncLogIds: ['sync-live'],
+    syncLogStatuses: ['PENDING'],
+    ...overrides,
+  }
+}
+
+type VoidMirrorContradictionFixture = {
+  accountingEventId: string
+  connector: string | null
+  syncType: string
+  referenceType: string
+  referenceId: string
+  idempotencyKey: string
+  syncLogIds: string[]
+  syncLogStatuses: string[]
+}
+
+function voidMirrorFindings(contradictions: AccountingReconciliationRows['voidMirrorContradictions']) {
+  const rows = cleanRows()
+  rows.voidMirrorContradictions = contradictions
+  return evaluateAccountingReconciliationRows(rows)
+    .filter((finding) => finding.code.startsWith('void_mirror_basis_unknown'))
+}
+
+/** The collector double, capturing the one statement the contradiction query issues. */
+async function captureContradictionQuery(result: unknown[] = []) {
+  const captured: { strings?: TemplateStringsArray; values?: unknown[] } = {}
+  const client = {
+    salesOrder: { async findMany() { return [] } },
+    shipment: { async findMany() { return [] } },
+    salesOrderRefund: { async findMany() { return [] } },
+    accountingSyncLog: { async findMany() { return [] } },
+    accountingEvent: { async findMany() { return [] } },
+    accountingEventLog: { async findMany() { return [] } },
+    async $queryRaw(strings: TemplateStringsArray, ...values: unknown[]) {
+      captured.strings = strings
+      captured.values = values
+      return result
+    },
+  }
+
+  const rows = await collectAccountingReconciliationRows(client, {
+    lookbackDays: 30,
+    toDate: new Date('2026-08-20T00:00:00.000Z'),
+  })
+
+  assert.ok(captured.strings, 'the contradiction query is issued at all — a report that never asks finds nothing')
+  return { rows, sql: captured.strings.join('?'), values: captured.values ?? [] }
+}
+
+test('o3d-11rf r4: the contradictions are ASKED FOR, by a statement with no date bound in it', async () => {
+  // THE FINDING, STATED AS AN ASSERTION. The subjects of this warning are older than any lookback by
+  // definition — a settlement made before the column existed, a row written by hand. A statement that
+  // carried a date bound, or that ordered a general page and filtered afterwards, would drop exactly
+  // them. So: the join is the filter, and nothing narrows it by time.
+  const { sql } = await captureContradictionQuery()
+
+  assert.match(sql, /FROM "accounting_events" e/, 'the events are one side')
+  assert.match(sql, /JOIN "accounting_sync_logs" l/, 'and the live sync rows are the other')
+  assert.match(sql, /e\."status" = 'VOID'/)
+  assert.match(sql, /e\."voidBasis" IS NULL/, 'only the voids NO WRITER EXPLAINED')
+  assert.match(sql, /l\."externalTransactionId" IS NULL OR btrim\(l\."externalTransactionId"\) = ''/,
+    'and only sync rows that hold no document id — a row that has one describes a document that exists')
+
+  assert.ok(!/businessDate|createdAt|syncedAt|fromDate/.test(sql),
+    'NO date bound anywhere in the statement: the oldest victim is the one this exists to find')
+})
+
+test('o3d-11rf r4: the identity joined on is the mirror scope, all four parts of it', async () => {
+  const { sql } = await captureContradictionQuery()
+
+  // Named individually rather than by counting join clauses: dropping any one of them widens the
+  // rule to name a document the operator has no reason to look at, next to one they do.
+  assert.match(sql, /l\."connector"\s+= e\."externalSystem"/)
+  assert.match(sql, /l\."type"::text\s+= e\."type"/)
+  assert.match(sql, /l\."referenceType" = e\."sourceEntityType"/)
+  assert.match(sql, /l\."referenceId"\s+= e\."sourceEntityId"/)
+})
+
+test('o3d-11rf r4: the bound is applied AFTER the grouping, and it is the stated one', async () => {
+  const { sql, values } = await captureContradictionQuery()
+
+  // THE SHAPE OF THE DEFECT, PINNED. `LIMIT` before the filter is the bug; `LIMIT` after the grouped
+  // join is the fix. Both positions are asserted FOUND before they are compared — an unmatched
+  // indexOf returns -1, which is less than every real index and would make this pass for the exact
+  // reason it exists to catch.
+  const groupBy = sql.indexOf('GROUP BY')
+  const limit = sql.indexOf('LIMIT')
+  const where = sql.indexOf('WHERE')
+  assert.notEqual(where, -1, 'the statement filters')
+  assert.notEqual(groupBy, -1, 'and groups the pairs onto their event')
+  assert.notEqual(limit, -1, 'and is bounded')
+  assert.ok(where < groupBy && groupBy < limit,
+    'filter, then group, then bound — a bound reached before the filter is the defect this replaced')
+
+  assert.equal(values.at(-1), MAX_VOID_MIRROR_CONTRADICTIONS,
+    'the bound is a parameter, and it is the one the truncation finding names')
+  assert.deepEqual(values[0], ['PENDING', 'PROCESSING'],
+    'and the live statuses are parameters too, so the constant is the single spelling of that set')
+})
+
+test('o3d-11rf r4: the total comes from the same statement, and zero rows means zero', async () => {
+  const empty = await captureContradictionQuery([])
+  assert.deepEqual(empty.rows.voidMirrorContradictions, { rows: [], total: 0 },
+    'no rows is not "unknown": the window count only exists where a row does')
+
+  const one = await captureContradictionQuery([{ ...contradiction(), totalContradictions: 7 }])
+  assert.equal(one.rows.voidMirrorContradictions?.total, 7, 'the count is carried off the row')
+  assert.equal(one.rows.voidMirrorContradictions?.rows.length, 1)
+  assert.ok(!('totalContradictions' in (one.rows.voidMirrorContradictions?.rows[0] ?? {})),
+    'and stripped from the row, so a per-row count cannot be mistaken for this document’s sync rows')
+})
+
+test('o3d-11rf r4: a contradiction is reported with both sides named', () => {
+  const findings = voidMirrorFindings({ rows: [contradiction()], total: 1 })
+
+  assert.equal(findings.length, 1)
+  assert.equal(findings[0].code, 'void_mirror_basis_unknown_with_live_sync_row')
+  assert.equal(findings[0].severity, 'warning', 'unclassifiable is not the same as known-broken')
+  assert.equal(findings[0].accountingEventId, 'event-void', 'keyed to the row that must be repaired')
+  assert.deepEqual(findings[0].details, {
+    connector: 'xero',
+    syncType: 'SALES_INVOICE',
+    referenceType: 'SalesOrder',
+    referenceId: 'order-1',
+    syncLogIds: ['sync-live'],
+    syncLogStatuses: ['PENDING'],
+    idempotencyKey: 'xero:SALES_INVOICE:SalesOrder:order-1',
+  }, 'so the judgement can be made without opening the audit tables')
+})
+
+test('o3d-11rf r4: one finding per VOID mirror, naming every row whose work it blocks', () => {
+  const findings = voidMirrorFindings({
+    rows: [contradiction({ syncLogIds: ['sync-live', 'sync-live-2'], syncLogStatuses: ['PENDING', 'PROCESSING'] })],
+    total: 1,
+  })
+
+  assert.equal(findings.length, 1, 'one per mirror, not one per sync row')
+  assert.match(findings[0].message, /2 live sync row\(s\)/, 'and the count in the message is of those rows')
+  assert.deepEqual((findings[0].details as { syncLogIds: string[] }).syncLogIds, ['sync-live', 'sync-live-2'])
+  assert.deepEqual((findings[0].details as { syncLogStatuses: string[] }).syncLogStatuses, ['PENDING', 'PROCESSING'])
+})
+
+test('o3d-11rf r4: a truncated list SAYS SO, with the exact number that did not fit', () => {
+  // A silently short list is the original defect one level up: the operator reads three findings and
+  // has no way to know there are nine hundred. The count is exact because it was taken by the same
+  // statement over the same snapshot as the page.
+  const rows = [contradiction({ accountingEventId: 'event-a' }), contradiction({ accountingEventId: 'event-b' })]
+  const findings = voidMirrorFindings({ rows, total: 917 })
+
+  assert.equal(findings.length, 3, 'the two that fit, plus the fact that they are not all of them')
+  const truncated = findings.find((f) => f.code === 'void_mirror_basis_unknown_contradictions_truncated')
+  assert.ok(truncated, 'the truncation is a finding of its own, not a note inside another one')
+  assert.equal(truncated.severity, 'warning')
+  assert.deepEqual(truncated.details, { reported: 2, total: 917, limit: MAX_VOID_MIRROR_CONTRADICTIONS })
+  assert.match(truncated.message, /917/, 'the number is in the message, where an operator reads it')
+})
+
+test('o3d-11rf r4: a COMPLETE list carries no truncation finding — that is what makes it readable', () => {
+  // The fence in the other direction. Without it the truncation finding could be emitted always, and
+  // "the list is complete" would stop meaning anything.
+  const rows = [contradiction({ accountingEventId: 'event-a' }), contradiction({ accountingEventId: 'event-b' })]
+  const codes = voidMirrorFindings({ rows, total: 2 }).map((f) => f.code)
+  assert.deepEqual(codes, [
+    'void_mirror_basis_unknown_with_live_sync_row',
+    'void_mirror_basis_unknown_with_live_sync_row',
+  ])
+
+  assert.deepEqual(voidMirrorFindings({ rows: [], total: 0 }), [], 'and nothing to report reports nothing')
+})
+
+test('o3d-11rf r4: a dataset that was NOT READ reports nothing, rather than a clean bill', () => {
+  // `voidMirrorContradictions` absent means the collector never asked — a pure-evaluator fixture, or
+  // a caller that could not. Reporting zero contradictions there would be vouching for a check that
+  // never ran. It must also NOT fall back to pairing the general pages: that fallback is the defect.
   const rows = cleanRows()
   rows.accountingEvents = [{
     id: 'event-void',
@@ -1507,155 +1702,9 @@ function unexplainedVoidRows(): AccountingReconciliationRows {
     payload: null,
     settlementBasis: null,
   }]
-  return rows
-}
+  assert.equal(rows.voidMirrorContradictions, undefined)
 
-function unexplainedVoidFindings(rows: AccountingReconciliationRows) {
-  return evaluateAccountingReconciliationRows(rows)
-    .filter((finding) => finding.code === 'void_mirror_basis_unknown_with_live_sync_row')
-}
-
-test('o3d-11rf r3: the report actually READS voidBasis — without it the finding can never fire', async () => {
-  // The evaluator tests below all hand `voidBasis` in on a fixture. That proves the rule and proves
-  // nothing about production, where the column has to be SELECTED or every event arrives with it
-  // undefined — which this finding reads as "no writer said" and would therefore report on every
-  // VOID in the database. A rule that is right on fixtures and catastrophic in production is exactly
-  // the shape the assumed-order dataset test next door was written to catch.
-  const calls: Record<string, unknown> = {}
-  const client = {
-    salesOrder: { async findMany() { return [] } },
-    shipment: { async findMany() { return [] } },
-    salesOrderRefund: { async findMany() { return [] } },
-    accountingSyncLog: { async findMany() { return [] } },
-    accountingEvent: {
-      async findMany(args: unknown) {
-        calls.accountingEvent = args
-        return []
-      },
-    },
-    accountingEventLog: { async findMany() { return [] } },
-  }
-
-  await collectAccountingReconciliationRows(client, { lookbackDays: 30, toDate: new Date('2026-08-20T00:00:00.000Z') })
-
-  const call = calls.accountingEvent as { select?: Record<string, unknown> }
-  assert.ok(call, 'the events are read at all')
-  assert.equal(call.select?.voidBasis, true, 'and the basis comes with them')
-})
-
-test('o3d-11rf r3: an unexplained VOID mirror with a live sync row is reported, with both rows named', () => {
-  const findings = unexplainedVoidFindings(unexplainedVoidRows())
-
-  assert.equal(findings.length, 1)
-  assert.equal(findings[0].severity, 'warning', 'unclassifiable is not the same as known-broken')
-  assert.equal(findings[0].accountingEventId, 'event-void', 'keyed to the row that must be repaired')
-  assert.deepEqual(findings[0].details, {
-    connector: 'xero',
-    syncType: 'SALES_INVOICE',
-    referenceType: 'SalesOrder',
-    referenceId: 'order-1',
-    syncLogIds: ['sync-live'],
-    syncLogStatuses: ['PENDING'],
-    idempotencyKey: 'xero:SALES_INVOICE:SalesOrder:order-1',
-  }, 'so the judgement can be made without opening the audit tables')
-})
-
-test('o3d-11rf r3: a VOID a writer DID explain is not reported, in either direction', () => {
-  // The whole point of the column is that these two are no longer one bit. A finding that fired for
-  // them would be reporting the fix as a defect, and would bury the rows that need a person.
-  for (const basis of ['source_cancelled', 'attempt_settled_not_posted']) {
-    const rows = unexplainedVoidRows()
-    rows.accountingEvents[0].voidBasis = basis
-    assert.deepEqual(unexplainedVoidFindings(rows), [], `a ${basis} void is explained, so nothing is owed`)
-  }
-})
-
-test('o3d-11rf r3: an unexplained VOID with nothing live beside it is NOT reported', () => {
-  // Almost every VOID in a mature database is a pre-column cancellation with no live work against
-  // it. Reporting those is how a surface stops being read at all.
-  const rows = unexplainedVoidRows()
-  rows.syncLogs[0].status = 'SYNCED'
-  rows.syncLogs[0].externalTransactionId = 'INV-7'
-  assert.deepEqual(unexplainedVoidFindings(rows), [], 'a row that already posted is not work a VOID mirror is blocking')
-
-  const none = unexplainedVoidRows()
-  none.syncLogs = []
-  assert.deepEqual(unexplainedVoidFindings(none), [], 'and neither is a void with no sync row at all')
-})
-
-test('o3d-11rf r3: SYNCED is excluded ON ITS OWN, not only when it kept a document id', () => {
-  // THE STATUS RULE, ISOLATED. The case above clears the status AND sets a document id, so the
-  // `externalTransactionId` guard alone accounts for it and the status set is never exercised —
-  // adding SYNCED to MIRROR_CONTRADICTING_SYNC_STATUSES changed nothing and the mutation survived.
-  // A SYNCED row with no document id is a real shape (a journal type claims none), and it is the one
-  // that separates the two rules: it has already done its posting, so reviving the mirror is not its
-  // remedy whatever it kept.
-  const rows = unexplainedVoidRows()
-  rows.syncLogs[0].status = 'SYNCED'
-  assert.equal(rows.syncLogs[0].externalTransactionId, null, 'the OTHER guard cannot be what excludes it')
-
-  assert.deepEqual(unexplainedVoidFindings(rows), [])
-})
-
-test('o3d-11rf r3: a FAILED or CANCELLED row is not live work either', () => {
-  // The complement of the case above, and the reason the set is stated rather than derived: these
-  // are terminal, so a VOID mirror is not preventing anything. Only PENDING and PROCESSING are work
-  // that will never be done.
-  for (const status of ['FAILED', 'CANCELLED']) {
-    const rows = unexplainedVoidRows()
-    rows.syncLogs[0].status = status
-    assert.deepEqual(unexplainedVoidFindings(rows), [], `a ${status} row is not work owed`)
-  }
-})
-
-test('o3d-11rf r3: a live row carrying a document id is NOT reported — that is a different disagreement', () => {
-  // o3d-ju8t: a row with an externalTransactionId describes a document that EXISTS, so it is not
-  // work owed and reviving its mirror is not the remedy. `posted_event_without_external_id` and the
-  // duplicate-reference findings are where that surfaces.
-  const rows = unexplainedVoidRows()
-  rows.syncLogs[0].externalTransactionId = 'INV-8'
-  assert.deepEqual(unexplainedVoidFindings(rows), [])
-})
-
-test('o3d-11rf r3: a live row in a DIFFERENT scope does not implicate this void', () => {
-  // The match is the mirror's own scope tuple. A rule that matched more loosely would name a
-  // document the operator has no reason to look at, next to one they do.
-  for (const change of [
-    (rows: AccountingReconciliationRows) => { rows.syncLogs[0].connector = 'quickbooks' },
-    (rows: AccountingReconciliationRows) => { rows.syncLogs[0].type = 'CREDIT_NOTE' },
-    (rows: AccountingReconciliationRows) => { rows.syncLogs[0].referenceType = 'Shipment' },
-    (rows: AccountingReconciliationRows) => { rows.syncLogs[0].referenceId = 'order-2' },
-  ]) {
-    const rows = unexplainedVoidRows()
-    change(rows)
-    assert.deepEqual(unexplainedVoidFindings(rows), [], 'a different scope is a different document')
-  }
-})
-
-test('o3d-11rf r3: a PROCESSING row counts as live, and every contradicting row is named', () => {
-  const rows = unexplainedVoidRows()
-  rows.syncLogs.push({
-    ...rows.syncLogs[0], id: 'sync-live-2', status: 'PROCESSING',
-  })
-
-  const findings = unexplainedVoidFindings(rows)
-  assert.equal(findings.length, 1, 'one finding per VOID mirror, not one per sync row')
-  assert.deepEqual(
-    (findings[0].details as { syncLogIds: string[] }).syncLogIds,
-    ['sync-live', 'sync-live-2'],
-    'and it names every row whose work the void is blocking',
-  )
-  assert.deepEqual(
-    (findings[0].details as { syncLogStatuses: string[] }).syncLogStatuses,
-    ['PENDING', 'PROCESSING'],
-  )
-})
-
-test('o3d-11rf r3: a fixture predating the column reads as unexplained, not as explained', () => {
-  // `voidBasis` is optional on the row type so pre-existing fixtures still compile. Absent must read
-  // the same as NULL — both are "no writer said", which IS the condition — or every such fixture
-  // would silently opt out of the check.
-  const rows = unexplainedVoidRows()
-  delete (rows.accountingEvents[0] as { voidBasis?: string | null }).voidBasis
-  assert.equal(unexplainedVoidFindings(rows).length, 1)
+  const codes = evaluateAccountingReconciliationRows(rows).map((finding) => finding.code)
+  assert.equal(codes.includes('void_mirror_basis_unknown_with_live_sync_row'), false,
+    'the in-memory pairing over the capped pages is gone, and nothing may quietly reinstate it')
 })

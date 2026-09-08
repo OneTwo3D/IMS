@@ -151,6 +151,39 @@ type RevisionClaimLogRow = {
   createdAt: Date | string
 }
 
+/**
+ * o3d-11rf r4 (Codex r4, HIGH) — ONE CONTRADICTION, as the database found it.
+ *
+ * A VOID mirror no writer classified, together with EVERY live unposted sync row still working on the
+ * same document. Both halves come out of a single grouped join, so the pairing is a property of the
+ * query rather than of what happened to survive two independent caps.
+ */
+type VoidMirrorContradictionRow = {
+  accountingEventId: string
+  /** The event's `externalSystem`, which is the sync row's `connector`. */
+  connector: string | null
+  /** The event's `type`, which is the sync row's `type`. */
+  syncType: string
+  /** The event's `sourceEntityType`/`sourceEntityId`, which are the sync row's reference pair. */
+  referenceType: string
+  referenceId: string
+  idempotencyKey: string
+  /** Every contradicting sync row, by id, ascending. */
+  syncLogIds: string[]
+  /** The distinct statuses those rows are in, ascending. */
+  syncLogStatuses: string[]
+}
+
+export type VoidMirrorContradictions = {
+  /** The bounded page — at most `MAX_VOID_MIRROR_CONTRADICTIONS` entries, one per VOID event. */
+  rows: VoidMirrorContradictionRow[]
+  /**
+   * How many contradicting VOID events EXIST — counted by the same statement that produced the page,
+   * over the same snapshot, so `total > rows.length` is exact rather than a "there may be more".
+   */
+  total: number
+}
+
 export type AccountingReconciliationRows = {
   salesOrders: SourceOrderRow[]
   shipments: SourceShipmentRow[]
@@ -164,9 +197,28 @@ export type AccountingReconciliationRows = {
    * — a dataset that was never read has not "returned zero rows".
    */
   revisionClaimLogs?: RevisionClaimLogRow[]
+  /**
+   * o3d-11rf r4 — the unclassified-VOID contradictions, ALREADY PAIRED BY THE DATABASE. Not a page of
+   * events and a page of sync rows for this file to pair up: see `collectVoidMirrorContradictions`.
+   *
+   * Optional for the same reason as `revisionClaimLogs` — the pure-evaluator fixtures predate it —
+   * and absent means THE DATASET WAS NOT READ, which is not the same as "there are none". The
+   * evaluator therefore reports nothing at all when it is absent rather than reporting zero
+   * contradictions, and `collectAccountingReconciliationRows` always provides it.
+   */
+  voidMirrorContradictions?: VoidMirrorContradictions
 }
 
 type AccountingReconciliationClient = {
+  /**
+   * o3d-11rf r4 (Codex r4, HIGH) — REQUIRED, not optional, and deliberately so.
+   *
+   * The unclassified-VOID contradictions are the one dataset here that CANNOT be assembled from the
+   * capped per-table pages below (see `collectVoidMirrorContradictions` for why). A client that did
+   * not offer this would silently produce a report with that check missing, which is the same defect
+   * one level up. Making it required means a caller has to say out loud that it cannot answer.
+   */
+  $queryRaw(query: TemplateStringsArray, ...values: unknown[]): Promise<unknown[]>
   salesOrder: {
     findMany(args: unknown): Promise<SourceOrderRow[]>
   }
@@ -234,6 +286,25 @@ export const MAX_RECONCILIATION_FINDINGS_PER_RUN = 500
 
 export const DEFAULT_RECONCILIATION_LOOKBACK_DAYS = 90
 const MAX_RECONCILIATION_ROWS = 10_000
+/**
+ * o3d-11rf r4 (Codex r4, HIGH) — THE BOUND ON THE CONTRADICTION QUERY, and why it is this number.
+ *
+ * Not `MAX_RECONCILIATION_ROWS`. That cap bounds a general page which is filtered afterwards, and
+ * spending 10,000 rows to find a handful is exactly the shape this replaced. This one bounds a set
+ * that is ALREADY only contradictions, so the question it answers is different: how many of these can
+ * a person actually be shown?
+ *
+ * The answer is `MAX_RECONCILIATION_FINDINGS_PER_RUN` — the number of findings the run view will
+ * display AT ALL. Past it, an extra row is not an extra finding an operator can read; it is a row
+ * that is written and then never rendered. So the bound is derived from that number rather than
+ * picked, and what sits beyond it is reported as an exact COUNT instead
+ * (`void_mirror_basis_unknown_contradictions_truncated`), which is information the operator can act
+ * on where a longer unreadable list is not.
+ *
+ * A run that fills this bound is a systemic breakage, not a work queue: 500 documents nothing will
+ * ever post is a decision about the backfill, not 500 individual judgements.
+ */
+export const MAX_VOID_MIRROR_CONTRADICTIONS = MAX_RECONCILIATION_FINDINGS_PER_RUN
 // Refunded orders are picked up by the refundStatus OR-branch in the source query;
 // this set is now purely terminal lifecycle statuses.
 const TERMINAL_SALES_ORDER_STATUSES = ['CANCELLED', 'COMPLETED', 'DELIVERED'] as const
@@ -1035,47 +1106,49 @@ function addUnclassifiedVoidMirrorFindings(
   findings: AccountingReconciliationFinding[],
   rows: AccountingReconciliationRows,
 ): void {
-  const unexplainedVoids = rows.accountingEvents.filter(
-    (event) => event.status === 'VOID' && (event.voidBasis ?? null) === null,
-  )
-  if (unexplainedVoids.length === 0) return
+  const contradictions = rows.voidMirrorContradictions
+  // Absent is "not read", not "none found" — see the field's own note. Reporting nothing is right;
+  // reporting a clean bill would be a lie about a check that never ran.
+  if (!contradictions) return
 
-  // Scope, spelled the way the mirror spells it: a sync log's (connector, type, referenceType,
-  // referenceId) is an event's (externalSystem, type, sourceEntityType, sourceEntityId). Indexed
-  // rather than scanned per event, because both datasets are capped at MAX_RECONCILIATION_ROWS and
-  // the nested loop would be their product.
-  const liveUnpostedByScope = new Map<string, AccountingSyncLogRow[]>()
-  for (const log of rows.syncLogs) {
-    if (!(MIRROR_CONTRADICTING_SYNC_STATUSES as readonly string[]).includes(log.status)) continue
-    if (log.externalTransactionId?.trim()) continue
-    const key = `${log.connector}\u0000${log.type}\u0000${log.referenceType}\u0000${log.referenceId}`
-    const existing = liveUnpostedByScope.get(key)
-    if (existing) existing.push(log)
-    else liveUnpostedByScope.set(key, [log])
-  }
-  if (liveUnpostedByScope.size === 0) return
-
-  for (const event of unexplainedVoids) {
-    const key = `${event.externalSystem ?? ''}\u0000${event.type}\u0000${event.sourceEntityType}\u0000${event.sourceEntityId}`
-    const contradicting = liveUnpostedByScope.get(key)
-    if (!contradicting || contradicting.length === 0) continue
+  for (const row of contradictions.rows) {
     findings.push({
       severity: 'warning',
       code: 'void_mirror_basis_unknown_with_live_sync_row',
-      accountingEventId: event.id,
+      accountingEventId: row.accountingEventId,
       message:
-        `Mirrored accounting event ${event.id} is VOID for a reason no writer recorded, while `
-        + `${contradicting.length} live sync row(s) are still working on the same document. It cannot be `
+        `Mirrored accounting event ${row.accountingEventId} is VOID for a reason no writer recorded, while `
+        + `${row.syncLogIds.length} live sync row(s) are still working on the same document. It cannot be `
         + 'revived automatically, so that work will never post until someone decides which is right',
       details: {
-        connector: event.externalSystem,
-        syncType: event.type,
-        referenceType: event.sourceEntityType,
-        referenceId: event.sourceEntityId,
+        connector: row.connector,
+        syncType: row.syncType,
+        referenceType: row.referenceType,
+        referenceId: row.referenceId,
         // Both sides by id, so the judgement can be made without opening the audit tables.
-        syncLogIds: contradicting.map((log) => log.id),
-        syncLogStatuses: Array.from(new Set(contradicting.map((log) => log.status))),
-        idempotencyKey: event.idempotencyKey,
+        syncLogIds: row.syncLogIds,
+        syncLogStatuses: row.syncLogStatuses,
+        idempotencyKey: row.idempotencyKey,
+      },
+    })
+  }
+
+  // THE BOUND, SAID OUT LOUD. `total` is counted by the statement that produced the page, over the
+  // same snapshot, so this is not "there may be more" — it is HOW MANY more. A short list with no
+  // such finding beside it therefore means the list is COMPLETE, which is the property that makes the
+  // list worth reading at all; without it the truncation would be the original defect one level up.
+  if (contradictions.total > contradictions.rows.length) {
+    findings.push({
+      severity: 'warning',
+      code: 'void_mirror_basis_unknown_contradictions_truncated',
+      message:
+        `${contradictions.total} unclassified VOID mirrors have live sync rows still working on the same `
+        + `document; only the first ${contradictions.rows.length} are listed. The rest are not in this `
+        + 'report — at this scale it is the void-basis backfill that needs a decision, not the documents',
+      details: {
+        reported: contradictions.rows.length,
+        total: contradictions.total,
+        limit: MAX_VOID_MIRROR_CONTRADICTIONS,
       },
     })
   }
@@ -1125,6 +1198,99 @@ function addAssumedRevisionOrderFindings(
   }
 }
 
+/**
+ * o3d-11rf r4 (Codex r4, HIGH) — THE CAP APPLIED BEFORE THE QUESTION, AND THE FIX FOR IT.
+ *
+ * WHAT WAS WRONG. Round 3 paired unclassified VOID mirrors against live sync rows IN MEMORY, over the
+ * two general pages the report already had. Both pages are `ORDER BY <date> DESC LIMIT 10,000`: a
+ * bound imposed on a broad load, with the filter that decides relevance applied AFTERWARDS. The event
+ * page is every non-POSTED event, which on a mature install is dominated by pre-column cancellation
+ * VOIDs — and those compete for the same 10,000 slots as the rows this check exists to find.
+ *
+ * That is not a rounding error, it is an inversion. The victims this warning was built for are BY
+ * DEFINITION old: a settlement made before `settlement_basis` existed, a row an administrator wrote
+ * by hand, a void whose two witnesses only an untrustworthy clock could order. The older a victim is,
+ * the further down a `businessDate DESC` page it sits, and the more likely it is dropped BEFORE the
+ * pairing that would have named it. The mechanism built to surface abandoned rows preferentially
+ * discarded the most abandoned ones — and did so silently, because the generic
+ * `reconciliation_row_cap_reached` warning names a dataset, not a stranded document.
+ *
+ * WHAT THIS DOES INSTEAD. It asks the database the actual question. The join IS the filter: live
+ * unposted sync rows against NULL-basis VOID events on the identity the mirror uses, so what comes
+ * back is contradictions rather than a page in which contradictions might be found. There is no date
+ * bound at all — the whole point of the finding is that its subjects are older than any lookback —
+ * and only THEN is a bound applied, to a set that is already nothing but answers.
+ *
+ * THE IDENTITY, and it is the mirror's own: a sync log's (connector, type, referenceType,
+ * referenceId) is an event's (externalSystem, type, sourceEntityType, sourceEntityId). `connector` is
+ * NOT NULL and `externalSystem` is nullable, and SQL equality never matches a NULL — which is the
+ * same answer the in-memory pairing gave (it keyed a null `externalSystem` as the empty string, which
+ * no connector equals), reached by the language's own rule rather than by a sentinel.
+ *
+ * WHY BOTH SIDES ARE AGGREGATED HERE and not grouped by the caller: the finding is one per VOID
+ * event naming every live row it blocks, so the grouping is part of the question. Pulling pairs back
+ * and grouping them in TypeScript would put a bound on PAIRS, and a document with many attempts could
+ * then push a different document out of the page — the same defect wearing a different hat.
+ *
+ * THE COUNT IS FROM THE SAME STATEMENT. `count(*) OVER ()` is computed over the whole grouped set
+ * before `LIMIT` takes a page of it, so the total is exact and is a fact about the SAME SNAPSHOT the
+ * page came from. A second `COUNT` query would be a different snapshot and could disagree with the
+ * page it describes.
+ *
+ * PLANNING. `accounting_events (status, businessDate)` narrows to the VOID rows and
+ * `accounting_sync_logs (connector, referenceType, referenceId)` serves the probe for each. No
+ * partial index is added: this runs once per reconciliation cron, and an index carrying a predicate
+ * Prisma's schema cannot express would have to live in the drift allowlist for the life of the table.
+ */
+async function collectVoidMirrorContradictions(
+  client: AccountingReconciliationClient,
+): Promise<VoidMirrorContradictions> {
+  const rows = (await client.$queryRaw`
+    WITH contradiction AS (
+      SELECT
+        e."id"               AS "accountingEventId",
+        e."externalSystem"   AS "connector",
+        e."type"             AS "syncType",
+        e."sourceEntityType" AS "referenceType",
+        e."sourceEntityId"   AS "referenceId",
+        e."idempotencyKey"   AS "idempotencyKey",
+        array_agg(l."id" ORDER BY l."id")    AS "syncLogIds",
+        array_agg(DISTINCT l."status"::text) AS "syncLogStatuses"
+      FROM "accounting_events" e
+      JOIN "accounting_sync_logs" l
+        ON l."connector"     = e."externalSystem"
+       AND l."type"::text    = e."type"
+       AND l."referenceType" = e."sourceEntityType"
+       AND l."referenceId"   = e."sourceEntityId"
+      WHERE e."status" = 'VOID'
+        AND e."voidBasis" IS NULL
+        AND l."status"::text = ANY(${[...MIRROR_CONTRADICTING_SYNC_STATUSES]}::text[])
+        AND (l."externalTransactionId" IS NULL OR btrim(l."externalTransactionId") = '')
+      GROUP BY
+        e."id", e."externalSystem", e."type", e."sourceEntityType", e."sourceEntityId", e."idempotencyKey"
+    )
+    SELECT
+      "accountingEventId",
+      "connector",
+      "syncType",
+      "referenceType",
+      "referenceId",
+      "idempotencyKey",
+      "syncLogIds",
+      "syncLogStatuses",
+      (count(*) OVER ())::int AS "totalContradictions"
+    FROM contradiction
+    ORDER BY "accountingEventId"
+    LIMIT ${MAX_VOID_MIRROR_CONTRADICTIONS}
+  `) as Array<VoidMirrorContradictionRow & { totalContradictions: number }>
+
+  return {
+    rows: rows.map(({ totalContradictions: _ignored, ...row }) => row),
+    // Zero rows means zero contradictions: the window count only exists where a row does.
+    total: rows[0]?.totalContradictions ?? 0,
+  }
+}
+
 export async function collectAccountingReconciliationRows(
   client: AccountingReconciliationClient = db as unknown as AccountingReconciliationClient,
   options: { lookbackDays?: number; toDate?: Date } = {},
@@ -1133,7 +1299,9 @@ export async function collectAccountingReconciliationRows(
     options.lookbackDays ?? DEFAULT_RECONCILIATION_LOOKBACK_DAYS,
     options.toDate,
   )
-  const [salesOrders, shipments, refunds, syncLogs, accountingEvents, revisionClaimLogs] = await Promise.all([
+  const [
+    salesOrders, shipments, refunds, syncLogs, accountingEvents, revisionClaimLogs, voidMirrorContradictions,
+  ] = await Promise.all([
     client.salesOrder.findMany({
       where: {
         OR: [
@@ -1263,9 +1431,15 @@ export async function collectAccountingReconciliationRows(
         createdAt: true,
       },
     }),
+    // o3d-11rf r4: the ONE dataset here that is not a capped page of a table. It is asked as the
+    // question it answers — see collectVoidMirrorContradictions — because a page taken before the
+    // filter drops exactly the rows this check exists to find.
+    collectVoidMirrorContradictions(client),
   ])
 
-  return { salesOrders, shipments, refunds, syncLogs, accountingEvents, revisionClaimLogs }
+  return {
+    salesOrders, shipments, refunds, syncLogs, accountingEvents, revisionClaimLogs, voidMirrorContradictions,
+  }
 }
 
 export async function runAccountingReconciliationReport(options: {
