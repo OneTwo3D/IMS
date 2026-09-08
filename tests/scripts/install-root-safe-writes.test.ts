@@ -1074,6 +1074,62 @@ test('[o3d-rn10] pin_dir_beneath_root refuses an unanchored root of its own acco
   assert.deepEqual(readdirSync(state), ['deploy'], 'and the component created')
 })
 
+/**
+ * WHETHER THIS MACHINE'S OWN ANCESTRY CAN STAND BEHIND A SHIPPED ROOT (o3d-secops).
+ *
+ * WHY ANY TEST HERE NAMES AN ABSOLUTE PATH AT ALL. Every hierarchy these harnesses build is built
+ * by the account running them, so every walk over one answers through the `owner == $self` half of
+ * the container question. The OTHER half — "the parent belongs to root" — is the one an
+ * unprivileged harness cannot plant, because it cannot chown a directory to root: the only
+ * root-owned parents it will ever see are the machine's own. `/opt`, `/var/lib` and `/etc` are
+ * therefore named for that branch and for nothing else, and this is the whole of what a real path
+ * is used for below.
+ *
+ * AND WHY THE ANSWER IS CONDITIONAL. Those directories are root-owned and 0755 on a deployment
+ * host and NEED NOT BE ON A BUILD RUNNER — where `/opt` is group-writable, and where this file
+ * therefore failed one assertion while the function it tests was entirely correct. A unit test may
+ * not require the permissions of the box it runs on. So the ancestry is CHECKED first, with node's
+ * own lstat, and the assertion is made only where the check holds; where it does not, the case is
+ * reported by name and not asserted, which is a stated skip and not a silent pass.
+ *
+ * IT RESTATES THE WALK'S RULE RATHER THAN ASKING THE SHIPPED FUNCTION, deliberately. A gate that
+ * asked the subject its own question would step aside in exactly the case where the subject was
+ * wrong. It is a GATE AND NEVER AN EXPECTATION: every expected rc below is written out literally,
+ * and this function's only output is a reason to say nothing.
+ *
+ * THE RULE IT RESTATES is the one pin_publish_root_parent() applies, at its STRICTEST reading — the
+ * shipped roots' parents are claimed to be ROOT-owned, not merely owned by whoever runs this, so a
+ * host that satisfies this gate satisfies the uid-0 branch specifically. Each directory from `/`
+ * down must be a real directory owned by root; an ANCESTOR may be writable by others only with the
+ * sticky bit; the root's own PARENT may not be writable by others at all, sticky or not.
+ */
+function rootOwnedAncestryDefect(candidate: string): string | undefined {
+  const parent = dirname(candidate)
+  const chain: string[] = ['/']
+  for (const part of parent.split('/')) if (part !== '') chain.push(join(chain[chain.length - 1], part))
+  for (const dir of chain) {
+    let entry
+    try {
+      entry = lstatSync(dir)
+    } catch {
+      return `${dir} does not exist or cannot be read`
+    }
+    if (entry.isSymbolicLink()) return `${dir} is a symbolic link`
+    if (!entry.isDirectory()) return `${dir} is not a directory`
+    if (entry.uid !== 0) return `${dir} is owned by uid ${entry.uid} and not by root`
+    const mode = entry.mode & 0o7777
+    if ((mode & 0o022) === 0) continue
+    if (dir === parent) return `${dir} is mode 0${mode.toString(8)}, and a root's own parent gets no sticky credit`
+    if ((mode & 0o1000) === 0) return `${dir} is mode 0${mode.toString(8)}, which others can write and which is not sticky`
+  }
+  return undefined
+}
+
+/** The roots the shipped table names whose parents the paragraph above claims are root-owned.
+ *  Spelled here rather than taken from SHIPPED_ROOTS, which is a check on the TABLE's contents and
+ *  would silently change what these assertions ask if the table grew an entry. */
+const SHIPPED_ROOTS_WITH_ROOT_OWNED_PARENTS = ['/opt/one-two-inventory', '/var/lib/one-two-inventory', '/etc/ims-cutover'] as const
+
 test('[o3d-rn10] publish_root_anchored decides on the PARENT mode, and does not credit the sticky bit', (t) => {
   const root = createTempDirSync('ims-rn10-anchor-mode-', t)
   const parent = join(root, 'parent')
@@ -1102,14 +1158,40 @@ test('[o3d-rn10] publish_root_anchored decides on the PARENT mode, and does not 
       `a parent at mode 0${mode.toString(8)} must be ${expected ? 'anchored' : 'refused'}: ${run.stdout}${run.stderr}`)
   }
 
-  // And the shipped roots' real parents, on this machine, answer the way the table's paragraph
-  // always claimed they would — through the uid-0 branch, which is why an unprivileged harness can
-  // ask at all.
-  for (const [dir, expected] of [['/opt/one-two-inventory', true], ['/var/lib/one-two-inventory', true],
-    ['/etc/ims-cutover', true], ['/tmp/ims-state', false]] as const) {
+  // AND THE SHIPPED ROOTS' REAL PARENTS, which is the one part of this test that needs an absolute
+  // path — see rootOwnedAncestryDefect() for why, and for why the machine is asked whether it can
+  // stand behind the claim before the claim is made of it. A host whose `/opt` anybody can write
+  // into says nothing whatever about publish_root_anchored(), so on such a host this states the
+  // defect and asks nothing.
+  for (const dir of SHIPPED_ROOTS_WITH_ROOT_OWNED_PARENTS) {
+    const defect = rootOwnedAncestryDefect(dir)
+    if (defect !== undefined) {
+      t.diagnostic(`not asked of ${dir}: this host cannot stand behind a shipped root — ${defect}`)
+      continue
+    }
     const run = runBash(rig([...ANCHOR], `publish_root_anchored "${dir}"; echo "rc=$?"`))
-    assert.match(run.stdout, new RegExp(`^rc=${expected ? 0 : 1}$`, 'm'),
-      `${dir} must be ${expected ? 'anchored' : 'refused'}: ${run.stdout}${run.stderr}`)
+    assert.match(run.stdout, /^rc=0$/m, `${dir} must be anchored: ${run.stdout}${run.stderr}`)
+
+    // AND THROUGH THE uid-0 BRANCH, which is the only reason a real path is here: with an `id` that
+    // answers a uid owning none of these directories, `owner == $self` cannot be what admitted
+    // them, so what did is the branch no harness-built hierarchy can reach.
+    const foreign = runBash(rig([...ANCHOR], `publish_root_anchored "${dir}"; echo "rc=$?"`,
+      'id() { printf "%s\\n" 424242; }'))
+    assert.match(foreign.stdout, /^rc=0$/m,
+      `${dir} must be anchored through the uid-0 branch: ${foreign.stdout}${foreign.stderr}`)
+  }
+
+  // AND THE SAME QUESTION AT A REAL PATH, THE OTHER WAY ROUND. `/tmp/ims-state` is refused because
+  // its parent is one anybody may create an entry in — sticky bit and all, which is the table's
+  // last row planted where an operator would really try it. A `/tmp` nobody else could write into
+  // would make the EXPECTATION wrong rather than the function, so that too is checked; the mode
+  // itself is not asserted, because this test is not about how a machine ships its /tmp.
+  const tmpMode = statSync('/tmp').mode & 0o7777
+  if ((tmpMode & 0o022) === 0) {
+    t.diagnostic(`not asked of /tmp/ims-state: /tmp is mode 0${tmpMode.toString(8)}, which no other account can write into`)
+  } else {
+    const run = runBash(rig([...ANCHOR], 'publish_root_anchored "/tmp/ims-state"; echo "rc=$?"'))
+    assert.match(run.stdout, /^rc=1$/m, `/tmp/ims-state must be refused: ${run.stdout}${run.stderr}`)
   }
 })
 
@@ -1137,11 +1219,19 @@ test('[o3d-rn10] publish_root_anchored refuses a parent that belongs to neither 
   assert.match(own.stdout, /^rc=0$/m, `and it must be anchored for the account that owns it: ${own.stdout}${own.stderr}`)
 
   // And the uid-0 branch is reachable with that same foreign `id`: /etc belongs to root, and root
-  // is the privileged account by definition however this process was started.
-  const rootOwned = runBash(rig([...ANCHOR],
-    `publish_root_anchored "/etc/ims-cutover"; echo "rc=$?"`,
-    'id() { printf "%s\\n" 424242; }'))
-  assert.match(rootOwned.stdout, /^rc=0$/m, `a root-owned parent must be anchored regardless of who runs this: ${rootOwned.stdout}${rootOwned.stderr}`)
+  // is the privileged account by definition however this process was started. THE ONE ABSOLUTE PATH
+  // IN THIS TEST, for the reason rootOwnedAncestryDefect() gives — no harness can chown a directory
+  // to root — and gated for the same reason: a machine whose /etc ancestry does not qualify would
+  // fail this line while the function was right, which is a fact about the machine.
+  const etcDefect = rootOwnedAncestryDefect('/etc/ims-cutover')
+  if (etcDefect !== undefined) {
+    t.diagnostic(`the uid-0 branch is not asked of /etc/ims-cutover: ${etcDefect}`)
+  } else {
+    const rootOwned = runBash(rig([...ANCHOR],
+      `publish_root_anchored "/etc/ims-cutover"; echo "rc=$?"`,
+      'id() { printf "%s\\n" 424242; }'))
+    assert.match(rootOwned.stdout, /^rc=0$/m, `a root-owned parent must be anchored regardless of who runs this: ${rootOwned.stdout}${rootOwned.stderr}`)
+  }
 })
 
 // ---------------------------------------------------------------------------
