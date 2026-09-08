@@ -2,6 +2,12 @@ import type { Prisma } from '@/app/generated/prisma/client'
 import { WMS_LOOKUP_CONFIRMED_ABSENT } from '@/lib/domain/wms/order-status-sweep'
 import { provesNoRemoteWmsCall } from '@/lib/domain/wms/order-push-sweep'
 import { isOperatorAssertedSettlement } from '@/lib/domain/accounting/sync-row-settlement'
+import {
+  DAILY_BATCH_REFERENCE_TYPE,
+  EXTERNAL_DOCUMENT_EVIDENCE_REFERENCE_TYPES,
+  SALES_ORDER_REFERENCE_TYPE,
+  SHIPMENT_REFERENCE_TYPE,
+} from '@/lib/domain/accounting/external-document-evidence'
 
 /**
  * o3d-5r8 — hard-delete safety for sales orders.
@@ -60,6 +66,17 @@ import { isOperatorAssertedSettlement } from '@/lib/domain/accounting/sync-row-s
  * can be safely ignored here — is the rest of o3d-ju8t.
  */
 export const LIVE_ACCOUNTING_SYNC_STATUSES = ['PENDING', 'PROCESSING', 'SYNCED', 'FAILED'] as const
+
+/**
+ * o3d-v7sy — the reference types this guard reads as evidence, re-exported from the constant
+ * retention's exemption is keyed on.
+ *
+ * Every AccountingSyncLog query below is written with one of these three identifiers rather than a
+ * string literal, so a fourth reference type cannot be added to this guard without joining the set
+ * retention refuses to delete. Deleting a row this guard would have blocked on does not make it
+ * fail — it makes it PERMIT an irreversible hard delete and strand the document.
+ */
+export const DELETE_GUARD_EVIDENCE_REFERENCE_TYPES = EXTERNAL_DOCUMENT_EVIDENCE_REFERENCE_TYPES
 
 export type SalesOrderDeleteBlocker = {
   code:
@@ -360,10 +377,10 @@ export async function findSalesOrderDeleteBlocker(
     })
   }
   const orderKeyed: Prisma.AccountingSyncLogWhereInput[] = [
-    { referenceType: 'SalesOrder', referenceId: orderId },
+    { referenceType: SALES_ORDER_REFERENCE_TYPE, referenceId: orderId },
   ]
   if (shipmentIds.length > 0) {
-    orderKeyed.push({ referenceType: 'Shipment', referenceId: { in: shipmentIds } })
+    orderKeyed.push({ referenceType: SHIPMENT_REFERENCE_TYPE, referenceId: { in: shipmentIds } })
   }
   // externalTransactionId is the POST evidence, and status is not a proxy for it: Xero reverts an
   // already-posted row to PENDING when follow-up work fails, KEEPING the external id, and
@@ -530,7 +547,7 @@ export async function findSalesOrderDeleteBlocker(
       where: {
         status: { in: [...LIVE_ACCOUNTING_SYNC_STATUSES] },
         type: batch.type as Prisma.AccountingSyncLogWhereInput['type'],
-        referenceType: 'DailyBatch',
+        referenceType: DAILY_BATCH_REFERENCE_TYPE,
         ...referenceWhere,
       },
       select: { id: true, connector: true, referenceId: true, status: true },
