@@ -1,5 +1,6 @@
 import { db } from '@/lib/db'
 import {
+  isReconciliationProvenComplete,
   readReconciliationCompleteness,
   type AccountingReconciliationCompleteness,
 } from '@/lib/domain/accounting/reconciliation'
@@ -851,6 +852,12 @@ function classifyReconciliationCompleteness(
   warnings: RolloutReadinessFinding[],
 ): void {
   const completeness = latest.completeness
+
+  // THE ONE QUESTION, ASKED THROUGH THE ONE FUNCTION THAT ANSWERS IT. Not `state === 'complete'`
+  // written out again here: a second encoding of "proven complete" is a second thing to keep in step
+  // with the first, and this whole finding is what happens when two readers of one rule drift.
+  if (isReconciliationProvenComplete(completeness)) return
+
   switch (completeness.state) {
     case 'complete':
       return
