@@ -314,6 +314,23 @@ export const DEFAULT_BACK_REFERENCE_SWEEP_PAGE_SIZE = 50
  */
 export const BACK_REFERENCE_AMBIGUITY_RECHECK_INTERVAL_MS = 24 * 60 * 60 * 1000
 
+/**
+ * o3d-3ix5 — how long a row must have been UNABLE TO SETTLE before that is reportable, and then how
+ * often it is repeated.
+ *
+ * ONE INTERVAL, DOING TWO JOBS, because they are the same judgement. Below it, a deferral is a
+ * healthy overlap: two runs met on one row, the loser wrote nothing, and the next pass settles it.
+ * Above it, the row has been denied a settlement across every pass for a day and is not converging —
+ * which is the starvation mode `claimFollowUpObligation`'s "WHAT IT DOES NOT GUARANTEE" block
+ * describes and which nothing else can see.
+ *
+ * The same 24 hours as the ambiguity recheck, and deliberately not tied to the cron period: the
+ * question is "has this been stuck for longer than a person would expect?", which is a human
+ * interval, not a scheduling one. A shorter one would report ordinary contention on a busy
+ * installation; a longer one would let a starved row sit unreported for more than a working day.
+ */
+export const BACK_REFERENCE_DEFERRAL_REPORT_INTERVAL_MS = 24 * 60 * 60 * 1000
+
 export type BackReferenceSweepRow = {
   id: string
   type: AccountingSyncType
@@ -331,6 +348,16 @@ export type BackReferenceSweepRow = {
   attemptRevision: number
   /** When this row's PO ambiguity was last reported. NULL = never. */
   backReferenceAmbiguousLoggedAt: Date | null
+  /**
+   * o3d-3ix5 — when this row's CURRENT UNBROKEN RUN of settlement deferrals began. NULL = it is not
+   * being deferred; the settlement write clears it in the same statement that stamps
+   * `backReferenceCheckedAt`.
+   *
+   * Read, and deliberately NOT filtered on. Unlike `backReferenceAmbiguousLoggedAt` this must never
+   * narrow the candidate query: a deferred row is one that has been denied a settlement, so taking
+   * it out of the scan is the very starvation the reporting exists to expose.
+   */
+  backReferenceDeferredSinceAt: Date | null
   /**
    * When retention compacted this row to an attribution-only tombstone. NULL = payload intact.
    *
@@ -400,6 +427,10 @@ export const BACK_REFERENCE_CANDIDATE_SELECT = {
   payload: true,
   createdAt: true,
   backReferenceAmbiguousLoggedAt: true,
+  // o3d-3ix5: the start of this row's current run of settlement deferrals, so a run that has
+  // outlived one interval can be reported. In the SELECT and NOT in the WHERE, unlike the ambiguity
+  // marker beside it — see the field's own note for why filtering on it would starve the row further.
+  backReferenceDeferredSinceAt: true,
   backReferenceEvidenceCompactedAt: true,
   backReferenceFollowUpsPendingAt: true,
   // Defect 7. Without this column in the SELECT the gate below cannot run at all, and an
@@ -1056,6 +1087,13 @@ export async function repairAccountingBackReferences(
     status: row.status,
     attemptRevision: row.attemptRevision,
     followUpsPendingAt,
+    // o3d-3ix5. Carried on the fence rather than re-read, because `markChecked` is handed a fence
+    // and not a row, and the deferral report needs the value the run OBSERVED — the same discipline
+    // as the columns above it. It is NOT part of the compare-and-set: see `deferSettlement`.
+    deferredSinceAt: row.backReferenceDeferredSinceAt,
+    type: row.type,
+    referenceType: row.referenceType,
+    referenceId: row.referenceId,
   })
 
   /**
@@ -1069,10 +1107,92 @@ export async function repairAccountingBackReferences(
    * folding it into failures would make a healthy overlap look like an error while making a real
    * error harder to see. What it must never be is invisible — a refusal counted nowhere is
    * indistinguishable from a settlement.
+   *
+   * o3d-3ix5 — AND COUNTED IS NOT OBSERVED. The counter reaches the cron response JSON and the
+   * manual-sync activity metadata, and no operator reads either unless they already suspect
+   * something. So the refusal now also leaves a mark ON THE ROW: `backReferenceDeferredSinceAt`
+   * records when this row's current unbroken run of deferrals began, and a run that outlives
+   * `BACK_REFERENCE_DEFERRAL_REPORT_INTERVAL_MS` produces a throttled WARNING activity naming the
+   * row — the way a permanently ambiguous row already surfaces.
+   *
+   * A SINGLE DEFERRAL WARNS ABOUT NOTHING, on purpose. Two runs meeting on one row is the expected
+   * case and the protocol handles it: the loser writes nothing, the row is untouched, the next pass
+   * reaches its own verdict from current state. Warning on that would make the healthy case loud and
+   * the pathological case invisible inside it. What is reportable is the row that cannot settle
+   * ACROSS an interval, which is the starvation `claimFollowUpObligation`'s "WHAT IT DOES NOT
+   * GUARANTEE" block describes and which the counter cannot distinguish from ordinary overlap.
+   *
+   * THE STAMP IS NOT PART OF THE COMPARE-AND-SET. `markChecked`'s CAS matches on the columns the
+   * verdict was reached about; this one is written after it has already failed, by primary key, and
+   * is read by nothing that decides anything. Putting it in the CAS would make two runs' deferral
+   * bookkeeping able to void each other's settlements, which is the failure this whole mechanism
+   * exists to report.
    */
-  const deferSettlement = (id: string, reason: string) => {
+  const deferSettlement = async (
+    fence: Pick<ReturnType<typeof settlementFence>, 'id' | 'deferredSinceAt' | 'type' | 'referenceType' | 'referenceId'>,
+    reason: string,
+  ) => {
     result.settlementDeferred++
-    console.error(`${prefix}: ${reason}; leaving the row eligible`, id)
+    console.error(`${prefix}: ${reason}; leaving the row eligible`, fence.id)
+
+    const observedAt = now()
+    // `?? null` and not `=== null`, because ABSENT AND NULL MEAN THE SAME THING HERE and only one of
+    // them is a value. A row read by a caller whose select predates this column arrives with the
+    // field `undefined`, and `undefined.getTime()` throws inside the sweep's per-row catch — which
+    // counts the row as a FAILURE. A reporting mechanism that can turn a healthy deferral into a
+    // reported failure is worse than the silence it replaced, so the two are collapsed at the door.
+    const deferredSince = fence.deferredSinceAt ?? null
+    // FIRST DEFERRAL OF A RUN: start the clock and say nothing. There is nothing to report yet, and
+    // the row is left fully eligible either way.
+    if (deferredSince === null) {
+      await stampDeferral(fence.id, observedAt, null)
+      return
+    }
+    if (observedAt.getTime() - deferredSince.getTime() < BACK_REFERENCE_DEFERRAL_REPORT_INTERVAL_MS) return
+
+    // WARNING FIRST, STAMP SECOND — the same asymmetry `warnAndDefer` documents. Moving the marker
+    // forward is what suppresses the next interval's warning, so doing it before the warning is
+    // confirmed can lose the only notification; doing it after can at worst repeat one.
+    const persisted = await deps.logActivity({
+      entityType: 'SYSTEM',
+      action: `${prefix}_backreference_settlement_deferred`,
+      tag: 'sync',
+      level: 'WARNING',
+      description:
+        `${connectorLabel} back-reference sweep has been unable to settle ${fence.type} `
+        + `${fence.referenceType} ${fence.referenceId} since ${deferredSince.toISOString()}: ${reason}. `
+        + 'Every pass re-enqueues idempotently and the follow-up obligation stays set, so no money or '
+        + 'work has been lost — but the row is never marked checked, so it stays a candidate and takes '
+        + 'a slot in every scan. A row that stays here is one whose sweep runs are continuously '
+        + 'overlapping: check whether the accounting sync cron is outrunning its own interval, or '
+        + 'whether the manual sync button is being pressed while a run is already going.',
+      metadata: {
+        syncLogId: fence.id,
+        type: fence.type,
+        referenceType: fence.referenceType,
+        referenceId: fence.referenceId,
+        deferredSinceAt: deferredSince.toISOString(),
+        reason,
+      },
+    })
+    if (!persisted) {
+      console.error(`${prefix}: settlement deferral warning was not persisted; leaving the marker where it is`, fence.id)
+      return
+    }
+    await stampDeferral(fence.id, observedAt, deferredSince)
+  }
+
+  const stampDeferral = async (id: string, observedAt: Date, previous: Date | null) => {
+    try {
+      await deps.db.accountingSyncLog.update({
+        where: { id },
+        data: { backReferenceDeferredSinceAt: observedAt },
+      })
+    } catch (stampError) {
+      // The row can legitimately be gone — retention, or a connector switch cancelling it — between
+      // the candidate read and here. Nothing to record, and nothing to retry.
+      console.error(`${prefix}: could not record the settlement deferral`, id, previous, stampError)
+    }
   }
 
   const markChecked = async (
@@ -1087,10 +1207,20 @@ export async function repairAccountingBackReferences(
         attemptRevision: fence.attemptRevision,
         backReferenceFollowUpsPendingAt: fence.followUpsPendingAt,
       },
-      data: { backReferenceCheckedAt: now(), backReferenceFollowUpsPendingAt: null, ...extra },
+      data: {
+        backReferenceCheckedAt: now(),
+        backReferenceFollowUpsPendingAt: null,
+        // o3d-3ix5 — THE RUN OF DEFERRALS ENDS HERE, in the same statement that ends the row's
+        // candidacy. Written unconditionally rather than only when a marker exists: this is the one
+        // moment that provably discharges the row, and a clear that is conditional on what THIS run
+        // observed would leave a marker written by a concurrent run behind for ever, so the next row
+        // to be deferred would inherit a start time from a run that already succeeded.
+        backReferenceDeferredSinceAt: null,
+        ...extra,
+      },
     })
     if (settled.count > 0) return true
-    deferSettlement(fence.id, "back-reference settlement refused — the row moved since this run's verdict was reached")
+    await deferSettlement(fence, "back-reference settlement refused — the row moved since this run's verdict was reached")
     return false
   }
 
@@ -1780,7 +1910,7 @@ export async function repairAccountingBackReferences(
     const obligation = await claimFollowUpObligation(row)
     if (!obligation.claimed) {
       if (obligation.contended) {
-        deferSettlement(row.id, 'another run holds this row\'s follow-up obligation, so this pass is not the one to discharge it')
+        await deferSettlement(settlementFence(row), 'another run holds this row\'s follow-up obligation, so this pass is not the one to discharge it')
       } else {
         result.failed++
       }
@@ -2164,7 +2294,7 @@ export async function repairAccountingBackReferences(
             const obligation = await claimFollowUpObligation(row)
             if (!obligation.claimed) {
               if (obligation.contended) {
-                deferSettlement(row.id, 'another run holds this row\'s follow-up obligation, so this pass is not the one to discharge it')
+                await deferSettlement(settlementFence(row), 'another run holds this row\'s follow-up obligation, so this pass is not the one to discharge it')
               } else {
                 result.failed++
               }
@@ -2277,7 +2407,7 @@ export async function repairAccountingBackReferences(
         const obligation = await claimFollowUpObligation(row)
         if (!obligation.claimed) {
           if (obligation.contended) {
-            deferSettlement(row.id, 'another run holds this row\'s follow-up obligation, so this pass is not the one to discharge it')
+            await deferSettlement(settlementFence(row), 'another run holds this row\'s follow-up obligation, so this pass is not the one to discharge it')
           } else {
             result.failed++
           }
