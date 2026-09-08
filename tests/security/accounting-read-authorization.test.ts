@@ -221,3 +221,97 @@ test('fetchXeroTaxRates refuses before making the outbound Xero call', async () 
   )
   recorder.assertNoReads('WAREHOUSE calling fetchXeroTaxRates')
 })
+
+// ---------------------------------------------------------------------------
+// o3d-1fel — THE OTHER ARM OF THE SAME SWITCH
+// ---------------------------------------------------------------------------
+
+/**
+ * ONE RULE, TWO READERS, ONE PROVEN.
+ *
+ * Everything above executes the Xero arm of `getAccountingConnector`. The
+ * QuickBooks arm — the same six reads, reached from the same six dispatchers in
+ * app/actions/accounting-sync.ts — had no executing counterpart at all. It was
+ * covered only by the STATIC scanner in server-action-guard-coverage.ts, and
+ * that scanner answers an ADJACENT question: it asks whether a guard identifier
+ * appears in the body (or in something the body resolves to), not whether the
+ * call actually refuses, not which permission the refusal names, and not whether
+ * anything was read before it threw. A guard placed after the `findMany`, or one
+ * calling a `requireSyncPermission` that had been redefined to return, satisfies
+ * the scanner and leaks every row.
+ *
+ * So the QuickBooks arm gets the same executed proof the Xero arm has: the real
+ * RBAC decision, driven through the real `requirePermission`, with only the
+ * session source mocked, and `recorder.assertNoReads` — which will not certify an
+ * empty touch list until the recorder has PROVED in this process that it can see
+ * a read.
+ *
+ * `fetchQuickBooksTaxCodes` is on the REFUSAL lists only and never on the admit
+ * list: it makes a live outbound call to the tenant's QuickBooks company, and the
+ * property worth asserting is precisely that an unprivileged caller cannot cause
+ * one. Its Xero counterpart is treated the same way for the same reason.
+ */
+const QUICKBOOKS_REFUSABLE_READS: Array<[string, (mod: typeof import('@/app/actions/quickbooks-sync')) => Promise<unknown>]> = [
+  ['getQuickBooksSettingsMasked', (mod) => mod.getQuickBooksSettingsMasked()],
+  ['getQuickBooksConnectionStatus', (mod) => mod.getQuickBooksConnectionStatus()],
+  ['getQuickBooksAccounts', (mod) => mod.getQuickBooksAccounts()],
+  ['fetchQuickBooksTaxCodes', (mod) => mod.fetchQuickBooksTaxCodes()],
+  ['getQuickBooksSyncLogs', (mod) => mod.getQuickBooksSyncLogs(5)],
+  ['getQuickBooksSyncReadiness', (mod) => mod.getQuickBooksSyncReadiness()],
+]
+
+for (const role of ['WAREHOUSE', 'READONLY', 'FINANCE', 'SUPPLIER'] as const) {
+  test(`every QuickBooks read refuses a ${role} session by NAME, before touching the database`, async () => {
+    currentRole = role
+    const mod = await import('@/app/actions/quickbooks-sync')
+    for (const [name, call] of QUICKBOOKS_REFUSABLE_READS) {
+      recorder.reset()
+      await assert.rejects(() => call(mod), (error: unknown) => {
+        assert.equal(
+          (error as { permission?: string }).permission,
+          'sync',
+          `${name} must refuse ${role} by naming the sync permission`,
+        )
+        return true
+      })
+      recorder.assertNoReads(`${role} calling ${name}`)
+    }
+  })
+}
+
+test('fetchQuickBooksTaxCodes refuses BEFORE making the outbound QuickBooks call', async () => {
+  // Same reason as its Xero counterpart: an open endpoint that calls the tenant's
+  // QuickBooks company is request amplification against a rate-limited third
+  // party, on top of the data leak. The stored OAuth token is read on that path,
+  // so `assertNoReads` is the assertion that the token was never fetched either.
+  currentRole = 'WAREHOUSE'
+  recorder.reset()
+  const { fetchQuickBooksTaxCodes } = await import('@/app/actions/quickbooks-sync')
+  await assert.rejects(
+    () => fetchQuickBooksTaxCodes(),
+    (error: unknown) => (error as { permission?: string }).permission === 'sync',
+  )
+  recorder.assertNoReads('WAREHOUSE calling fetchQuickBooksTaxCodes')
+})
+
+test('MANAGER KEEPS every QuickBooks read the /sync page performs', async () => {
+  // The counter-guard, exactly as for Xero. `sync` is what the /sync page itself
+  // requires and MANAGER holds it, so a gate tightened to ADMIN here would not be
+  // a safer system, it would be a 500 on a page the role is entitled to. This is
+  // what stops the fix for o3d-1fel from being "over-gate it and call it secure".
+  // fetchQuickBooksTaxCodes is excluded: admitting it would make a live outbound
+  // call from the unit suite.
+  currentRole = 'MANAGER'
+  const mod = await import('@/app/actions/quickbooks-sync')
+  const reads: Array<[string, () => Promise<unknown>]> = [
+    ['getQuickBooksSettingsMasked', () => mod.getQuickBooksSettingsMasked()],
+    ['getQuickBooksConnectionStatus', () => mod.getQuickBooksConnectionStatus()],
+    ['getQuickBooksAccounts', () => mod.getQuickBooksAccounts()],
+    ['getQuickBooksSyncLogs', () => mod.getQuickBooksSyncLogs(5)],
+    ['getQuickBooksSyncReadiness', () => mod.getQuickBooksSyncReadiness()],
+  ]
+  for (const [name, read] of reads) {
+    recorder.reset()
+    await assert.doesNotReject(read, `${name} must admit MANAGER — the /sync page cannot render without it`)
+  }
+})
