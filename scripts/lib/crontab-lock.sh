@@ -44,8 +44,22 @@
 # on an flock RELEASES it. Round 22's crontab section did exactly that: from the moment it ran,
 # the run that was supposedly excluding every other cutover was excluding nothing, and its final
 # `exec 9>&-` left the process with no cutover lock at all. The crontab lock therefore lives on
-# its own descriptor, and it is scoped to a command group rather than `exec`ed, so it cannot
-# leak past the critical section however the body returns.
+# its own descriptor.
+#
+# AND BASH CHOOSES THE NUMBER (o3d-q766). It used to be the literal 7, scoped to the `{ …; }`
+# group the redirection was attached to. A literal is a number this file cannot know is free: 7 is
+# not allocated by anything here, but it is allocated by whatever invoked this script, and an
+# inherited descriptor at 7 is silently replaced for the length of the critical section — the same
+# class of accident as `exec 9<`, one number along. `exec {CRONTAB_LOCK_FD}<` asks bash for a free
+# descriptor at 10 or above and records which one it got, so the choice is made by the only party
+# that knows the answer.
+#
+# WHAT THAT COSTS, AND WHAT PAYS FOR IT. A group-scoped redirection released the lock by CLOSING
+# the descriptor when the group finished; a descriptor held for the whole run cannot be released
+# that way, so with_crontab_lock() releases it with `flock --unlock` instead. The exclusion is
+# still exactly one read-modify-write long. What it buys is that the acquisition no longer
+# RESOLVES A NAME: see prepare_crontab_lock() below, which opens this descriptor once, at the
+# moment it has just proved the inode, and hands it to every acquisition afterwards.
 #
 # READ-ONLY, ALWAYS. flock(2) locks the open file DESCRIPTION whatever its access mode, so a
 # read-only descriptor takes the same exclusive lock — and the lock file is root-owned inside a
@@ -65,14 +79,20 @@
 CRONTAB_LOCK_DIRNAME="locks"
 CRONTAB_LOCK_FILENAME=".crontab-reconcile.lock"
 
-# The descriptor the exclusion is held on. 8 and 9 belong to the cutover locks; see above.
+# The descriptor the exclusion is held on: EMPTY until prepare_crontab_lock() opens it, and then
+# whichever number bash allocated. 8 and 9 belong to the cutover locks; see above.
 #
-# A LITERAL, NOT A `{varname}<` ALLOCATION. Bash only began closing automatically-allocated
-# descriptors when the compound command they were attached to completes in 5.2; on anything
-# older the fd — and the lock on it — would leak out of the critical section and be held for the
-# rest of the run. A literal fd attached to a `{ ...; }` group is scoped by the group on every
-# bash this ships to. It is stated here as well so the tests can assert the two agree.
-CRONTAB_LOCK_FD=7
+# NOT A LITERAL (o3d-q766). The reason it was one — bash before 5.2 does not close an
+# automatically-allocated descriptor when the compound command it was attached to completes, so
+# the fd and the lock on it would leak out of the critical section — stops applying the moment
+# the descriptor is meant to outlive the critical section, which is the whole of this change. The
+# leak IS the mechanism now, and the lock is released by `flock --unlock` rather than by the fd
+# going away. What the literal cost, on every bash, is that 7 might already belong to whoever
+# invoked the entrypoint.
+#
+# INITIALISED, not merely declared: every entrypoint runs under `set -u`, and with_crontab_lock()
+# asks whether this is empty to tell "prepare_crontab_lock has not run" from "it has".
+CRONTAB_LOCK_FD=""
 
 # How long a shell writer waits for the application to finish reconciling before it gives up.
 #
@@ -167,7 +187,7 @@ crontab_lock_paths() {
 # able to do is aim a root-side write, and they cannot.
 # ---------------------------------------------------------------------------
 prepare_crontab_lock() {
-  local self dir_meta file_meta dir_kind dir_owner dir_mode file_kind file_owner
+  local self dir_meta file_meta dir_kind dir_owner dir_mode file_kind file_owner file_ident held_ident
   # 0 — the EUID guard at the top of every entrypoint has already refused to run as anything
   # else. It is asked rather than hardcoded so the check below reads as "owned by the privileged
   # user that owns this install", which is the property that matters, and so this function can be
@@ -220,14 +240,55 @@ prepare_crontab_lock() {
   # other-writable mode would give the lock file back to them, so it is refused, not chmod'ed away.
   (( (8#${dir_mode:-777} & 0022) == 0 )) || die \
     "${CRONTAB_LOCK_DIR} is mode ${dir_mode}: group- or other-writable, so '${APP_USER}' could still replace the lock file inside it. Set it to 0755 and run the installer again."
-  file_meta="$(LC_ALL=C stat -c '%F|%u' "${CRONTAB_LOCK_FILE}" 2>/dev/null || true)"
-  IFS='|' read -r file_kind file_owner <<< "${file_meta}"
+  # THE INODE TRAVELS WITH THE KIND AND THE OWNER, because step (4) has to be able to say that the
+  # descriptor it opened is THIS file and not merely a file that answers the same questions.
+  file_meta="$(LC_ALL=C stat -c '%F|%u|%d:%i' "${CRONTAB_LOCK_FILE}" 2>/dev/null || true)"
+  IFS='|' read -r file_kind file_owner file_ident <<< "${file_meta}"
   # No mode assertion on the FILE, deliberately: nothing ever reads or writes its contents, and it
   # cannot be replaced from inside a directory the service user cannot write. Only "root owns it and
   # it is a plain file" is load-bearing.
   [[ ( "${file_kind}" == "regular file" || "${file_kind}" == "regular empty file" ) \
      && "${file_owner}" == "${self}" ]] || die \
     "${CRONTAB_LOCK_FILE} must be a regular file owned by uid ${self} after preparation, and is '${file_meta}'."
+
+  # (4) AND THE PROOF IS KEPT, AS A DESCRIPTOR (o3d-q766).
+  #
+  # THE FINDING. Everything above establishes one fact — that ${CRONTAB_LOCK_FILE} names a
+  # root-owned regular file inside a directory nobody else may write — and then threw it away.
+  # with_crontab_lock() re-resolved the NAME on every acquisition (`[[ -f … ]]`, which
+  # dereferences, and then `7<…`, which dereferences again and is not the same lookup), and the
+  # note above this function says exactly why that is not the same fact: ${DATA_DIR} belongs to
+  # ${APP_USER}, so that account can rename(2) the lock DIRECTORY aside within it and leave
+  # something else at the name. Preparation happens once, early; the acquisitions happen many
+  # times, late, and each of them was a fresh unverified lookup.
+  #
+  # WHAT THAT IS AND IS NOT. It is NOT a privilege crossing and this function does not pretend
+  # otherwise: the open is O_RDONLY, so there is no O_CREAT and no O_TRUNC to aim at a file root
+  # may write, the descriptor's CONTENTS are never read, and the same reasoning that makes
+  # acquire_cutover_lock()'s `exec 9<` safe applies here unchanged. What it voids is the
+  # EXCLUSION, which is the only thing this library produces: a run that locks an inode the
+  # application is not locking reports mutual exclusion it does not have, and the crontab
+  # read-modify-write it then performs can discard a reconciliation the application had already
+  # committed and already reported as saved. Two further consequences are worth naming because
+  # they are cheaper for an attacker than the race: an inode that account holds an exclusive lock
+  # on wedges every cutover for ${CRONTAB_LOCK_WAIT_SECONDS} and then fails it, and a FIFO at that
+  # name makes the redirection BLOCK — indefinitely, with the service already stopped and the
+  # database already fenced, which is worse than a refusal because a refusal unwinds.
+  #
+  # THE FIX IS ONE OPEN, HERE, WHERE THE PROOF IS STILL FRESH. The descriptor is taken at the
+  # moment the post-conditions above passed, checked against the inode THEY validated rather than
+  # against a fresh lstat, and held for the rest of the run. Nothing after this point resolves the
+  # name again, so there is no later lookup to redirect and no window to shorten.
+  #
+  # `stat -L` on /proc/self/fd/N is an fstat(2) of the open file description — the same primitive
+  # verify_held_lock() uses in scripts/lib/cutover-namespace.sh, asked here of the inode this
+  # function has itself just proved. `|| true` and a comparison against a POSITIVE value, so a
+  # stat that could not run yields the empty string and the run is refused.
+  exec {CRONTAB_LOCK_FD}<"${CRONTAB_LOCK_FILE}" || die \
+    "${CRONTAB_LOCK_FILE} could not be opened to hold a descriptor on it, so every crontab write in this run would have to resolve that name again — and ${DATA_DIR:-the state directory} belongs to '${APP_USER}', which is what makes a second resolution a different question from the first. Nothing has been written."
+  held_ident="$(stat -L -c '%d:%i' "/proc/self/fd/${CRONTAB_LOCK_FD}" 2>/dev/null || true)"
+  [[ -n "${file_ident}" && "${held_ident}" == "${file_ident}" ]] || die \
+    "The descriptor this run opened on ${CRONTAB_LOCK_FILE} is not the inode this run had just proved: it is '${held_ident:-unreadable}' and the checks above passed on '${file_ident:-unreadable}'. Something replaced that name between the proof and the open. Refusing to serialize this run's crontab writes against a file it cannot identify. Nothing has been written."
 }
 
 # ---------------------------------------------------------------------------
@@ -248,10 +309,15 @@ prepare_crontab_lock() {
 # reconciling right now" from "the write failed". Callers DIE on it: writing without the lock is
 # the defect itself, and skipping the write silently leaves a fenced crontab in place.
 #
-# REENTRANT BY REFUSAL, NOT BY RECURSION. flock on a second, independently opened descriptor for
-# the same file blocks against the first — a nested call would deadlock until the timeout and
-# then report a conflict that is this very process. So a nested call runs the body directly, on
-# the lock the outer call is already holding.
+# REENTRANT BY REFUSAL, NOT BY RECURSION — AND THE REASON CHANGED WITH THE DESCRIPTOR (o3d-q766).
+# It used to be a deadlock: flock on a second, independently opened descriptor for the same file
+# blocks against the first, so a nested call would wait out the timeout and then report a conflict
+# that was this very process. There is one descriptor now, and flock(2) on a description that
+# already holds the lock returns immediately — so a nested call would SUCCEED, and its release
+# would drop the lock the OUTER call is still relying on, in the middle of that call's
+# read-modify-write. The guard is therefore load-bearing in a way it was not before: it is what
+# keeps the exclusion one acquisition deep. A nested call runs the body directly, on the lock the
+# outer call is already holding, and does not release it.
 # ---------------------------------------------------------------------------
 CRONTAB_LOCK_CONFLICT=75
 CRONTAB_LOCK_HELD=false
@@ -291,17 +357,27 @@ with_crontab_lock() {
   fi
   [[ -n "${CRONTAB_LOCK_FILE:-}" ]] || die \
     "with_crontab_lock was called before CRONTAB_LOCK_FILE was composed (crontab_lock_paths). This is an ordering bug in the entrypoint, not an operator error: a crontab write that cannot be serialized against the application's can silently discard it."
-  [[ -f "${CRONTAB_LOCK_FILE}" ]] || die \
-    "${CRONTAB_LOCK_FILE} is missing or is not a regular file, so this crontab write cannot be serialized against the application's. prepare_crontab_lock creates it; that call must run before anything touches the crontab. Nothing has been written."
-  {
-    if flock --exclusive --timeout "${CRONTAB_LOCK_WAIT_SECONDS}" 7; then
-      CRONTAB_LOCK_HELD=true
-      "$@" || rc=$?
-      CRONTAB_LOCK_HELD=false
-    else
-      rc=${CRONTAB_LOCK_CONFLICT}
-    fi
-  } 7<"${CRONTAB_LOCK_FILE}"
+  # THE DESCRIPTOR, NOT THE NAME (o3d-q766). This was `[[ -f "${CRONTAB_LOCK_FILE}" ]]` followed by
+  # a `} 7<"${CRONTAB_LOCK_FILE}"` — a dereferencing test of one lookup, and then a second,
+  # independent dereferencing lookup that the test said nothing about. Both are gone: what is
+  # asked here is whether prepare_crontab_lock() ran, and the answer to that is a descriptor it
+  # opened and proved. See step (4) of that function for what re-resolving the name exposed.
+  [[ -n "${CRONTAB_LOCK_FD}" ]] || die \
+    "with_crontab_lock was called before prepare_crontab_lock opened the lock descriptor. This is an ordering bug in the entrypoint, not an operator error: a crontab write that cannot be serialized against the application's can silently discard it. Nothing has been written."
+  if flock --exclusive --timeout "${CRONTAB_LOCK_WAIT_SECONDS}" "${CRONTAB_LOCK_FD}"; then
+    CRONTAB_LOCK_HELD=true
+    "$@" || rc=$?
+    CRONTAB_LOCK_HELD=false
+    # RELEASED EXPLICITLY, because the descriptor outlives the critical section now. The exclusion
+    # is one read-modify-write long and no longer than that: the entrypoint goes on to build,
+    # migrate and restart, and the application must be able to reconcile in between. A release
+    # that failed would leave this run holding the lock for the rest of it, which is a fact about
+    # the box and not a detail — so it is a refusal and not a warning.
+    flock --unlock "${CRONTAB_LOCK_FD}" || die \
+      "The crontab reconciliation lock could not be released after this run's crontab write. It would otherwise be held for the remainder of this run, blocking every reconciliation the application attempts. The write itself completed; what is unknown is the state of the exclusion, so this run stops rather than continuing behind it."
+  else
+    rc=${CRONTAB_LOCK_CONFLICT}
+  fi
   return "${rc}"
 }
 
