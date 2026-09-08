@@ -340,6 +340,77 @@ export function reconciliationTruncations(
     .map((finding) => ({ code: finding.code, message: finding.message, details: finding.details }))
 }
 
+/**
+ * o3d-11rf r6 (Codex r5, HIGH) — THE ONE PLACE THE `truncations` COLUMN IS INTERPRETED.
+ *
+ * WHAT WENT WRONG WITHOUT IT. r5 gave the column a three-way meaning — NULL is "nobody recorded
+ * this", `[]` is "recorded, nothing was truncated", a non-empty array is "recorded, and here is what
+ * was lost" — and then taught ONE reader to honour it. The rollout-readiness gate, which is
+ * consulted BEFORE a deploy, did not even select the column: it read a COMPLETED run with zero
+ * warning and zero critical findings as a clean run and returned `ready`. A run written by the
+ * predecessor binary still serving across the deploy — the common case in the minutes after this
+ * ships — therefore reported a green light for a check that had never run. That is r5's own defect,
+ * unknown completeness conflated with proven completeness, reproduced at the deployment gate.
+ *
+ * WHY A FUNCTION AND NOT A CONVENTION. "Remember that NULL is not `[]`" is a rule enforced by
+ * whoever remembers it, and this branch has now missed it three times at three different readers.
+ * The remedy is to delete the representation that allows the mistake: readers are handed this
+ * DISCRIMINATED UNION rather than the raw JSON, so `state` is not something they may skip past to
+ * get at an array — the array only exists on the branches where it means something, and `unknown`
+ * carries `null` in its place. A `switch` on `state` with a `never` default makes a reader that
+ * forgets the unknown case a COMPILE error rather than a silent green.
+ *
+ * AN UNREADABLE PAYLOAD IS UNKNOWN, NOT COMPLETE. The column is `Json?`, so a row can hold something
+ * that is neither NULL nor an array of sentinels — a shape from a future writer, or a corrupted
+ * value. Nothing about such a row proves the run was complete, so it fails closed to `unknown` with
+ * `reason: 'unreadable'` to distinguish it from an honestly-silent predecessor row. The one thing it
+ * may never do is answer "yes, complete".
+ */
+export type AccountingReconciliationCompleteness =
+  | {
+    readonly state: 'unknown'
+    /** `not-recorded`: NULL, a run predating the column. `unreadable`: a payload we cannot parse. */
+    readonly reason: 'not-recorded' | 'unreadable'
+    readonly truncations: null
+  }
+  | { readonly state: 'complete'; readonly truncations: readonly [] }
+  | { readonly state: 'truncated'; readonly truncations: readonly AccountingReconciliationTruncation[] }
+
+/** Interpret a run row's `truncations` column. The ONLY sanctioned reading of that column. */
+export function readReconciliationCompleteness(raw: unknown): AccountingReconciliationCompleteness {
+  if (raw === null || raw === undefined) {
+    return { state: 'unknown', reason: 'not-recorded', truncations: null }
+  }
+  if (!Array.isArray(raw)) return { state: 'unknown', reason: 'unreadable', truncations: null }
+
+  const entries: AccountingReconciliationTruncation[] = []
+  for (const entry of raw) {
+    if (!entry || typeof entry !== 'object' || Array.isArray(entry)) {
+      return { state: 'unknown', reason: 'unreadable', truncations: null }
+    }
+    const { code, message, details } = entry as Record<string, unknown>
+    if (typeof code !== 'string' || code.length === 0 || typeof message !== 'string') {
+      return { state: 'unknown', reason: 'unreadable', truncations: null }
+    }
+    entries.push({ code, message, details })
+  }
+
+  return entries.length === 0
+    ? { state: 'complete', truncations: [] }
+    : { state: 'truncated', truncations: entries }
+}
+
+/**
+ * "Is this run's completeness PROVEN?" — the single question every gate should be asking. True only
+ * for a run that recorded `[]`. A truncated run is proven INCOMPLETE and an unknown one proves
+ * nothing, and neither is a clean run.
+ */
+export function isReconciliationProvenComplete(
+  completeness: AccountingReconciliationCompleteness,
+): boolean {
+  return completeness.state === 'complete'
+}
+
 export const DEFAULT_RECONCILIATION_LOOKBACK_DAYS = 90
 const MAX_RECONCILIATION_ROWS = 10_000
 /**

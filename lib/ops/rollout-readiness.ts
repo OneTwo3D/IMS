@@ -1,5 +1,9 @@
 import { db } from '@/lib/db'
 import {
+  readReconciliationCompleteness,
+  type AccountingReconciliationCompleteness,
+} from '@/lib/domain/accounting/reconciliation'
+import {
   HEALTH_NO_STORE_HEADERS,
   collectAdminHealth,
   type AdminHealthAuthorizer,
@@ -59,6 +63,14 @@ export type LatestAccountingReconciliationRun = {
   warningCount: number
   criticalCount: number
   createdAt: string
+  /**
+   * o3d-11rf r6: whether this run recorded its own completeness, and what it said. Required, not
+   * optional, so no adapter or fixture can leave the question unanswered by omission, and carried as
+   * the parsed union rather than the raw `truncations` column so no reader can reach an array
+   * without the `state` that says whether the array means anything. `completeness.truncations` is
+   * the sentinel list — `null` exactly when nothing was recorded.
+   */
+  completeness: AccountingReconciliationCompleteness
 }
 
 export type RolloutReadinessResponse = {
@@ -112,7 +124,7 @@ export function createDefaultRolloutReadinessAdapters(): RolloutReadinessAdapter
     now: () => new Date(),
     runPreflight: () => runProductionPreflight(),
     collectAdminHealth: () => collectAdminHealth(),
-    latestAccountingReconciliationRun: getLatestAccountingReconciliationRun,
+    latestAccountingReconciliationRun: () => getLatestAccountingReconciliationRun(),
   }
 }
 
@@ -239,8 +251,30 @@ export function createRolloutReadinessHandler({
   }
 }
 
-async function getLatestAccountingReconciliationRun(): Promise<LatestAccountingReconciliationRun | null> {
-  const latest = await db.accountingReconciliationRun.findFirst({
+/**
+ * o3d-11rf r6: the client is injectable so the SELECT itself can be proved against real PostgreSQL —
+ * that the column is asked for at all, and that a NULL in it arrives here as `unknown`. A test that
+ * only hands `collectRolloutReadiness` a fixture proves the classifier and nothing about the query,
+ * and the query omitting the column was half of what Codex found.
+ */
+export type LatestAccountingReconciliationRunClient = {
+  accountingReconciliationRun: {
+    findFirst(args: unknown): Promise<{
+      id: string
+      status: string
+      totalCount: number
+      warningCount: number
+      criticalCount: number
+      createdAt: Date
+      truncations: unknown
+    } | null>
+  }
+}
+
+export async function getLatestAccountingReconciliationRun(
+  client: LatestAccountingReconciliationRunClient = db as unknown as LatestAccountingReconciliationRunClient,
+): Promise<LatestAccountingReconciliationRun | null> {
+  const latest = await client.accountingReconciliationRun.findFirst({
     where: {
       status: {
         in: [...TERMINAL_ACCOUNTING_RECONCILIATION_RUN_STATUSES],
@@ -254,14 +288,19 @@ async function getLatestAccountingReconciliationRun(): Promise<LatestAccountingR
       warningCount: true,
       criticalCount: true,
       createdAt: true,
+      // o3d-11rf r6: without this the gate could not tell a run that proved itself complete from one
+      // that never said, and read both as clean.
+      truncations: true,
     },
   })
 
   if (!latest) return null
+  const { truncations, ...rest } = latest
   return {
-    ...latest,
+    ...rest,
     status: latest.status as AccountingReconciliationRunStatus,
     createdAt: latest.createdAt.toISOString(),
+    completeness: readReconciliationCompleteness(truncations),
   }
 }
 
@@ -735,7 +774,13 @@ function classifyAccountingReconciliation(
     warningCount: latest.warningCount,
     criticalCount: latest.criticalCount,
     createdAt: latest.createdAt,
+    completeness: latest.completeness.state,
   }
+
+  // o3d-11rf r6 — BEFORE the status switch, because every branch of it returns. A FAILED or PARTIAL
+  // run blocks or warns on its own, but a COMPLETED one with no findings is the case this gate got
+  // wrong, and a completeness question asked after an early `return` is a question not asked.
+  classifyReconciliationCompleteness(latest, warnings)
 
   switch (latest.status) {
     case 'FAILED':
@@ -776,6 +821,74 @@ function classifyAccountingReconciliation(
           details,
         })
       }
+  }
+}
+
+/**
+ * o3d-11rf r6 (Codex r5, HIGH) — WHY UNKNOWN COMPLETENESS WARNS HERE RATHER THAN BLOCKS.
+ *
+ * A WARNING IS NOT A GREEN LIGHT AT THIS GATE. `collectRolloutReadiness` sets `status` to `warning`
+ * when any warning is present, `ok` to false with it, and `createRolloutReadinessHandler` answers
+ * **412** for anything that is not `ready` unless the caller passes `?allowWarnings=true`. So a
+ * warning already STOPS an automated rollout and can only be got past by an explicit, recorded
+ * override. The distinction being drawn is between "stop, and a human may say why this is fine" and
+ * "stop, and nobody may proceed" — not between stopping and not stopping.
+ *
+ * AND WHY NOT A BLOCKER. NULL is the expected state of every run in the database at the moment this
+ * column ships, and of any run written by the predecessor binary while it is still serving across
+ * the deploy. A blocker would make the readiness endpoint impossible to satisfy until a fresh
+ * reconciliation had been run on the new build — on the very deploy that introduces the column — and
+ * a gate that cannot go green on a correct deploy is a gate that gets routed around, which protects
+ * nothing at all. The remedy the operator needs is stated in the message: run reconciliation again on
+ * this build. A run that is genuinely truncated warns for the same reason: it is a real answer about
+ * a real dataset, and the person deploying should decide, not be silently overruled.
+ *
+ * WHAT WOULD MAKE IT A BLOCKER. Once no NULL rows remain, `not-recorded` stops being expected and
+ * becomes evidence of a writer that is not recording completeness. That is a follow-up, not this fix.
+ */
+function classifyReconciliationCompleteness(
+  latest: LatestAccountingReconciliationRun,
+  warnings: RolloutReadinessFinding[],
+): void {
+  const completeness = latest.completeness
+  switch (completeness.state) {
+    case 'complete':
+      return
+    case 'unknown':
+      warnings.push({
+        id: 'accounting-reconciliation:completeness-unknown',
+        severity: 'warning',
+        source: 'accounting-reconciliation',
+        message: completeness.reason === 'not-recorded'
+          ? 'Latest accounting reconciliation run did not record whether its report was complete, so it does not show this build\'s reconciliation ran. Run reconciliation again before rolling out.'
+          : 'Latest accounting reconciliation run recorded an unreadable completeness value, so its report cannot be shown to be complete. Run reconciliation again before rolling out.',
+        details: {
+          id: latest.id,
+          createdAt: latest.createdAt,
+          completeness: completeness.state,
+          reason: completeness.reason,
+        },
+      })
+      return
+    case 'truncated':
+      warnings.push({
+        id: 'accounting-reconciliation:truncated',
+        severity: 'warning',
+        source: 'accounting-reconciliation',
+        message: 'Latest accounting reconciliation run reported its own findings as incomplete.',
+        details: {
+          id: latest.id,
+          createdAt: latest.createdAt,
+          completeness: completeness.state,
+          codes: completeness.truncations.map((truncation) => truncation.code),
+        },
+      })
+      return
+    default: {
+      // A new completeness state must be classified here or this stops compiling. That is the point.
+      const unhandled: never = completeness
+      throw new Error(`Unhandled accounting reconciliation completeness: ${String(unhandled)}`)
+    }
   }
 }
 
