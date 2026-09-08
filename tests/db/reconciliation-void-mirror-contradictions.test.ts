@@ -5,10 +5,16 @@ import { config } from 'dotenv'
 
 import {
   DEFAULT_RECONCILIATION_LOOKBACK_DAYS,
+  MAX_RECONCILIATION_FINDINGS_PER_RUN,
+  MAX_RECONCILIATION_LIST_RUNS,
   MAX_VOID_MIRROR_CONTRADICTIONS,
   collectAccountingReconciliationRows,
   evaluateAccountingReconciliationRows,
+  listAccountingReconciliationRuns,
+  persistAccountingReconciliationReport,
   reconciliationLookbackDate,
+  type AccountingReconciliationFinding,
+  type AccountingReconciliationTruncation,
 } from '../../lib/domain/accounting/reconciliation'
 
 /**
@@ -65,6 +71,40 @@ type Tx = {
   $executeRawUnsafe(sql: string, ...values: unknown[]): Promise<number>
   accountingEvent: { create(args: unknown): Promise<unknown>; findMany(args: unknown): Promise<Array<{ id: string }>> }
   accountingSyncLog: { create(args: unknown): Promise<unknown> }
+}
+
+/** The over-cap fixture, shared by the r4 collector test and the r5 persistence test below. */
+async function insertContradictions(tx: Tx, prefix: string, count: number) {
+  // WRITTEN IN THE OPPOSITE ORDER TO THEIR IDS: `lpad($2 + 1 - g)` means the first row on disk
+  // carries the HIGHEST id. That removes the cheapest way for a fixture to agree with the query by
+  // accident.
+  await tx.$executeRawUnsafe(
+    `INSERT INTO "accounting_events" (
+       "id", "type", "sourceEntityType", "sourceEntityId", "businessDate", "status",
+       "idempotencyKey", "linesJson", "currency", "externalSystem", "voidBasis", "createdAt", "updatedAt"
+     )
+     SELECT
+       $1 || lpad(($2::int + 1 - g)::text, 5, '0'), 'SALES_INVOICE', 'SalesOrder',
+       $1 || lpad(($2::int + 1 - g)::text, 5, '0'),
+       TIMESTAMP '2026-06-01 00:00:00', 'VOID',
+       $1 || lpad(($2::int + 1 - g)::text, 5, '0') || '-key', '[]'::jsonb, 'GBP', 'xero', NULL, now(), now()
+     FROM generate_series(1, $2::int) g`,
+    prefix,
+    count,
+  )
+  await tx.$executeRawUnsafe(
+    `INSERT INTO "accounting_sync_logs" (
+       "id", "connector", "type", "status", "referenceType", "referenceId",
+       "externalTransactionId", "createdAt"
+     )
+     SELECT
+       $1 || lpad(($2::int + 1 - g)::text, 5, '0') || '-s', 'xero', 'SALES_INVOICE'::"AccountingSyncType",
+       'PENDING'::"AccountingSyncStatus", 'SalesOrder', $1 || lpad(($2::int + 1 - g)::text, 5, '0'),
+       NULL, now()
+     FROM generate_series(1, $2::int) g`,
+    prefix,
+    count,
+  )
 }
 
 async function withRollback<T>(fn: (tx: Tx) => Promise<T>, timeout = 180_000): Promise<T> {
@@ -385,9 +425,7 @@ test('o3d-11rf r4: over the bound, the list says how much of it is missing', { s
   const over = MAX_VOID_MIRROR_CONTRADICTIONS + 5
 
   const { findings, surviving } = await withRollback(async (tx) => {
-    // WRITTEN IN THE OPPOSITE ORDER TO THEIR IDS: `lpad($2 + 1 - g)` means the first row on disk
-    // carries the HIGHEST id. That removes the cheapest way for this fixture to agree with the
-    // query by accident.
+    // The fixture writes its rows in the opposite order to their ids; see `insertContradictions`.
     //
     // IT IS STILL NOT A PROOF THAT THE STATEMENT ORDERS, and the comment says so rather than
     // implying otherwise: deleting the `ORDER BY` from the query leaves this test green either way,
@@ -395,33 +433,7 @@ test('o3d-11rf r4: over the bound, the list says how much of it is missing', { s
     // of one planner on one row count, not of the query, so the ORDER BY is asserted where it can
     // be asserted — on the STATEMENT, in the sibling unit suite. What this test proves is the other
     // half: WHICH 500 of the 505 come back.
-    await tx.$executeRawUnsafe(
-      `INSERT INTO "accounting_events" (
-         "id", "type", "sourceEntityType", "sourceEntityId", "businessDate", "status",
-         "idempotencyKey", "linesJson", "currency", "externalSystem", "voidBasis", "createdAt", "updatedAt"
-       )
-       SELECT
-         $1 || lpad(($2::int + 1 - g)::text, 5, '0'), 'SALES_INVOICE', 'SalesOrder',
-         $1 || lpad(($2::int + 1 - g)::text, 5, '0'),
-         TIMESTAMP '2026-06-01 00:00:00', 'VOID',
-         $1 || lpad(($2::int + 1 - g)::text, 5, '0') || '-key', '[]'::jsonb, 'GBP', 'xero', NULL, now(), now()
-       FROM generate_series(1, $2::int) g`,
-      `11rf4-many-${run}-`,
-      over,
-    )
-    await tx.$executeRawUnsafe(
-      `INSERT INTO "accounting_sync_logs" (
-         "id", "connector", "type", "status", "referenceType", "referenceId",
-         "externalTransactionId", "createdAt"
-       )
-       SELECT
-         $1 || lpad(($2::int + 1 - g)::text, 5, '0') || '-s', 'xero', 'SALES_INVOICE'::"AccountingSyncType",
-         'PENDING'::"AccountingSyncStatus", 'SalesOrder', $1 || lpad(($2::int + 1 - g)::text, 5, '0'),
-         NULL, now()
-       FROM generate_series(1, $2::int) g`,
-      `11rf4-many-${run}-`,
-      over,
-    )
+    await insertContradictions(tx, `11rf4-many-${run}-`, over)
 
     const { rows, findings: all } = await reportFindings(tx)
     return { findings: all, surviving: rows.voidMirrorContradictions }
@@ -454,9 +466,103 @@ test('o3d-11rf r4: over the bound, the list says how much of it is missing', { s
   )
 })
 
+/**
+ * o3d-11rf r5 (Codex r4, HIGH) — THE HALF THE r4 TEST ABOVE COULD NOT REACH.
+ *
+ * The test above stops at the evaluator's array, where all 501 findings exist. An operator never sees
+ * that array. They see a PERSISTED run read back through `listAccountingReconciliationRuns`, which
+ * returns at most `MAX_RECONCILIATION_FINDINGS_PER_RUN` findings — so the truncation warning, being
+ * the 501st, is the row that need not come back, and a test that stopped at the collector would pass
+ * against code where it never does.
+ *
+ * WHY THE REMEDY COULD NOT BE AN ORDERING, PROVED HERE RATHER THAN ASSERTED. The findings of a run
+ * are written by one `createMany` inside one transaction, and `createdAt` defaults to
+ * CURRENT_TIMESTAMP — transaction start time in PostgreSQL. This test counts the DISTINCT `createdAt`
+ * values of a 501-row run and finds ONE. The reader's `ORDER BY "createdAt" ASC LIMIT 500` therefore
+ * has nothing to order by, and which 500 come back is whatever the plan emits: prioritising the
+ * sentinel by ordering is not available without a new priority column and an ORDER BY on it. Given a
+ * migration either way, the fact belongs on the run, where no page can drop it.
+ *
+ * So this test deliberately asserts NOTHING about whether the warning is in the returned page. That
+ * is unspecified, and a test that pinned it would be pinning one plan.
+ */
+test('o3d-11rf r5: a PERSISTED over-cap run still tells an operator the list is short', { skip }, async () => {
+  const run = randomUUID().slice(0, 8)
+  const over = MAX_VOID_MIRROR_CONTRADICTIONS + 5
+
+  const observed = await withRollback(async (tx) => {
+    await insertContradictions(tx, `11rf5-many-${run}-`, over)
+
+    const { findings } = await reportFindings(tx)
+    const report = {
+      checkedAt: '2026-09-08T12:00:00.000Z',
+      fromDate: '2026-06-10T12:00:00.000Z',
+      toDate: '2026-09-08T12:00:00.000Z',
+      findings,
+      summary: {
+        total: findings.length,
+        warning: findings.filter((finding: AccountingReconciliationFinding) => finding.severity === 'warning').length,
+        critical: findings.filter((finding: AccountingReconciliationFinding) => finding.severity === 'critical').length,
+      },
+    }
+
+    // The real writer and the real reader, against real PostgreSQL — the two steps between the
+    // evaluator and the operator, and the only place the warning can go missing.
+    const persisted = await persistAccountingReconciliationReport(report, tx as never)
+    const runs = await listAccountingReconciliationRuns(tx as never, {
+      limit: MAX_RECONCILIATION_LIST_RUNS,
+      includeFindings: true,
+    })
+    const distinct = await tx.$queryRaw`
+      SELECT count(DISTINCT "createdAt")::int AS "distinctCreatedAt"
+      FROM "accounting_reconciliation_findings"
+      WHERE "runId" = ${persisted.runId}
+    ` as Array<{ distinctCreatedAt: number }>
+
+    return {
+      evaluated: findings.length,
+      runId: persisted.runId,
+      reloaded: runs.find((entry) => entry.id === persisted.runId),
+      distinctCreatedAt: distinct[0]?.distinctCreatedAt,
+    }
+  })
+
+  // THE PREMISE, ASSERTED BEFORE ANYTHING IS CONCLUDED FROM IT.
+  assert.equal(observed.evaluated, MAX_RECONCILIATION_FINDINGS_PER_RUN + 1,
+    'the run overflows the reader by exactly the truncation warning — without that there is nothing to lose')
+
+  const reloaded = observed.reloaded
+  assert.ok(reloaded, 'the run was persisted and read back')
+  assert.equal(reloaded.findings?.length, MAX_RECONCILIATION_FINDINGS_PER_RUN, 'the reader hands back a capped page')
+  assert.equal(reloaded._count?.findings, MAX_RECONCILIATION_FINDINGS_PER_RUN + 1, 'and one written row is not on it')
+
+  // WHY ORDERING WAS NEVER AN OPTION.
+  assert.equal(observed.distinctCreatedAt, 1,
+    'every finding of a run shares one createdAt, so the reader\'s ORDER BY cannot prefer the sentinel')
+
+  // AND WHAT THE OPERATOR CAN STILL READ, whichever 500 the plan chose.
+  const truncations = reloaded.truncations as AccountingReconciliationTruncation[]
+  assert.equal(truncations.length, 1, 'the run itself names what was truncated')
+  assert.equal(truncations[0].code, TRUNCATED)
+  assert.deepEqual(truncations[0].details, {
+    reported: MAX_VOID_MIRROR_CONTRADICTIONS,
+    total: over,
+    limit: MAX_VOID_MIRROR_CONTRADICTIONS,
+  }, 'with the exact count taken by the statement that produced the page')
+  assert.match(truncations[0].message, new RegExp(String(over)))
+
+  // The run this test wrote must not outlive the probe transaction either.
+  loadEnv()
+  const { db } = await import('../../lib/db')
+  assert.equal(await db.accountingReconciliationRun.count({ where: { id: observed.runId } }), 0,
+    'the persisted run rolled back with everything else')
+})
+
 test('o3d-11rf r4: the probes left the database as they found it', { skip }, async () => {
   loadEnv()
   const { db } = await import('../../lib/db')
   const survivors = await db.accountingEvent.count({ where: { id: { startsWith: '11rf4-' } } })
   assert.equal(survivors, 0, 'every probe above rolled back')
+  const r5Survivors = await db.accountingEvent.count({ where: { id: { startsWith: '11rf5-' } } })
+  assert.equal(r5Survivors, 0, 'the persistence probe too')
 })
