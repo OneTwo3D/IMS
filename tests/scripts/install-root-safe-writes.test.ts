@@ -1351,11 +1351,23 @@ test('[o3d-rn10] the anchor credits the sticky bit on an ANCESTOR and never on t
   chmodSync(mid, 0o1777)
   assert.match(ask(candidate).stdout, /^rc=0$/m, 'sticky must be credited for an ancestor whose entry we own')
 
-  // AND THIS IS THE LIVE INSTANCE OF THE RULE, not a hypothetical: /tmp itself is root-owned and
-  // 1777, so the sticky credit is what lets every harness in this file build an anchored root under
-  // a mkdtemp directory at all. Remove the credit and twenty tests here fail, which is the honest
-  // account of why it is there.
-  assert.equal(statSync('/tmp').mode & 0o7777, 0o1777, '/tmp must be sticky and world-writable, or the line above states nothing')
+  // AND THIS IS THE LIVE INSTANCE OF THE RULE, not a hypothetical: every harness in this file
+  // builds under /tmp, which is root-owned and world-writable, so the sticky credit is what lets a
+  // mkdtemp directory anchor anything at all. Remove the credit and twenty tests here fail, which
+  // is the honest account of why it is there.
+  //
+  // THE MODE IS READ AND THE IMPLICATION IS ASSERTED, rather than the mode itself (o3d-secops). How
+  // a machine ships its /tmp is a fact about the machine, and this test is not about that: a /tmp
+  // no other account could write into would make the credit UNNECESSARY here, not wrong, and a
+  // unit test may not go red over it. What must hold, and what is asserted, is the pairing — a
+  // /tmp that is world-writable and NOT sticky is a machine on which the paragraph above is empty.
+  const tmpMode = statSync('/tmp').mode & 0o7777
+  if ((tmpMode & 0o022) === 0) {
+    t.diagnostic(`/tmp is mode 0${tmpMode.toString(8)}: no other account can write into it, so the sticky credit is not what carries these harnesses on this machine`)
+  } else {
+    assert.equal(tmpMode & 0o1000, 0o1000,
+      `/tmp is mode 0${tmpMode.toString(8)} — world-writable and not sticky — so the line above states nothing`)
+  }
   assert.equal(statSync(root).uid, process.getuid?.(), 'and the mkdtemp directory must belong to this account')
 
   // WHAT THIS HARNESS CANNOT PLANT, STATED RATHER THAN GLOSSED. The credit is against the WRITE
