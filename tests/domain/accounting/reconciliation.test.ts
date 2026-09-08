@@ -1605,11 +1605,13 @@ test('o3d-11rf r4: the bound is applied AFTER the grouping, and it is the stated
   // show what one planner did once; what has to be true is that the statement ASKS. Without it the
   // bound takes whatever the plan reached first, and an operator working a truncated list across
   // runs would be handed a different 500 each time and never reach the end of it.
-  const orderBy = sql.indexOf('ORDER BY')
-  assert.notEqual(orderBy, -1, 'the page is ordered')
-  assert.ok(groupBy < orderBy && orderBy < limit, 'ordered after grouping, and bounded after that')
-  assert.match(sql.slice(orderBy, limit), /"accountingEventId"/,
-    'by the event id — the same page every run, so a truncated list can be worked through')
+  //
+  // MATCHED AGAINST THE OUTER SELECT BY NAME, not by looking for the first `ORDER BY` in the
+  // statement. The first one is inside `array_agg(... ORDER BY ...)`, which sits before the GROUP BY
+  // — so an index comparison against it was red whatever the query did, and the mutation that was
+  // supposed to prove this assertion was killed by a test that could not pass either way.
+  assert.match(sql, /FROM contradiction\s+ORDER BY "accountingEventId"\s+LIMIT/,
+    'the page taken off the grouped set is ordered by event id and only then bounded — the same 500 every run')
 
   assert.equal(values.at(-1), MAX_VOID_MIRROR_CONTRADICTIONS,
     'the bound is a parameter, and it is the one the truncation finding names')
