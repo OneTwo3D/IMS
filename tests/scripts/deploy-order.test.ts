@@ -13833,6 +13833,155 @@ for (const entry of FENCE_HARNESS) {
       rmSync(dir, { recursive: true, force: true })
     }
   })
+
+  // ---------------------------------------------------------------------------
+  // o3d-secops r34, Codex HIGH 1 — THE CROSS-PRODUCT: A SAMPLING MISS *AND* A NON-COLOCATED VERDICT.
+  //
+  // The two cases above are each other's opposites and r33 got both of them right on their own. It
+  // is where they MEET that the fix inverted: the keep-record fast path was written between the
+  // line that computes `clear_server` and the line that acts on it, so a run that had put a
+  // challenge to a live witness and been told `RELEASE_WITNESS <nonce> absent` returned 0 as long
+  // as ${DB_FENCE_KEEP_RECORD} was set -- and the closing gate sets that flag on exactly the run
+  // whose routing is in question. The application started against a copy of the cluster while the
+  // server this run actually fenced stayed shut.
+  //
+  // BOTH HALVES ARE REAL HERE, not asserted about: `sightings: 0` drives the gate down its status-4
+  // arm and sets the flag, and `verdict: 'no'` makes the shipped `--release` answer this run's own
+  // nonce with `absent`. The preconditions below prove both happened before the outcome is read,
+  // because a run that failed for some third reason would satisfy the outcome perfectly.
+  //
+  // MUTATION ROUTE (made against the shipped files and reverted): move the r34 refusal back below
+  // the `${DB_FENCE_KEEP_RECORD}` fast path, which is exactly r33 -- this test prints STARTED THE
+  // NEW BUILD and AUTHORITY_REMAINS, and the two r33 tests above stay green.
+  test(`${entry.name}: a sampling miss AND a non-colocated verdict refuses, rather than being waved through by the kept record (o3d-secops r34, Codex HIGH 1)`, () => {
+    const dir = mkdtempSync(join(tmpdir(), 'ims-r34cross-'))
+    try {
+      witnessProtocolCheckout(dir, { verdict: 'no', binding: 'colocated', sightings: 0 })
+      const result = runShell(runToTheEnd(dir))
+
+      assert.match(result.output, /^FENCE UP=true$/m,
+        `precondition: a fence must be standing, or nothing here is about a release:\n${result.output}`)
+      assert.match(calls(dir), /^--bind-migration --hold-stamp /m,
+        `precondition: the closing probe must have run, or this is not the sampling-miss path:\n${calls(dir)}`)
+      assert.match(result.output, /KEPT/,
+        `precondition: the sampling miss must have decided to keep the record, which is the flag under test:\n${result.output}`)
+      assert.match(calls(dir), /^--release .*--witness-challenge=[0-9a-f]{32}/m,
+        `precondition: a challenge must actually have been put to a live witness:\n${calls(dir)}`)
+      assert.match(result.output, /RELEASE_WITNESS [0-9a-f]{32} absent/,
+        `precondition: and the release's own connection must have answered that it could not see it:\n${result.output}`)
+
+      assert.doesNotMatch(result.output, /^STARTED THE NEW BUILD$/m,
+        `a release that may have landed on a copy must not start the application, whatever the record's fate:\n${result.output}`)
+      assert.match(result.output, /^AUTHORITY_REMAINS$/m,
+        `and the record must survive, because it is the only account of the fence still standing:\n${result.output}`)
+      assert.match(result.output, /deliberately NOT removed/,
+        `and the operator must be told which of the two readings this was:\n${result.output}`)
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  // ---------------------------------------------------------------------------
+  // o3d-secops r34, Codex HIGH 2 — A CONSUMER THAT MOVED SCHEMA AND THEN FAILED IS STILL PLACED,
+  // AND A PLACEMENT REFUSAL OUTRANKS ITS EXIT STATUS.
+  //
+  // THE SHAPE UNDER TEST IS THE SHIPPED ONE, and which shape that is, is settled statically by the
+  // r34 census below -- every consumer in every entrypoint captures its status, runs its placement,
+  // and propagates afterwards. What is measured HERE is that the shape behaves as the comment
+  // beside it claims, against the entrypoint's own pin_migration_window() and under `set -e`,
+  // which is what made the old shape fatal to the chain.
+  //
+  // THE FOIL IS PART OF THE TEST. The same rig runs r33's shape -- the consumer bare under
+  // `set -e`, the pin on the line below -- and asserts that the pin's probe NEVER RUNS. Without it
+  // this test would be a guard nobody has seen fail: three assertions about a run that took the
+  // right path anyway.
+  for (const [label, binding, expectation] of [
+    ['a redirected consumer', 'absent', 'placement'],
+    ['a consumer on the fenced server', 'colocated', 'status'],
+  ] as ReadonlyArray<[string, 'absent' | 'colocated', 'placement' | 'status']>) {
+    test(`${entry.name}: ${label} that half-applies and then fails is still placed, and the ${expectation} is what is reported (o3d-secops r34, Codex HIGH 2)`, () => {
+      const dir = mkdtempSync(join(tmpdir(), 'ims-r34pinfail-'))
+      try {
+        // Bind 1 is fence_db_connections()'s own opening bind and must succeed or the run never
+        // reaches the consumer. Bind 2 is the pin's, and is the answer this case is about.
+        witnessProtocolCheckout(dir, { verdict: 'yes', binding: ['colocated', binding] })
+        const shipped = [
+          'set -euo pipefail',
+          'exec 2>&1',
+          entry.preamble(dir),
+          'error() { echo "ERROR: $*" >&2; }',
+          'DB_FENCE_RAISED=false',
+          CUTOVER_DIR_PRIMITIVES,
+          shellFunction(entry.source, 'fence_db_connections'),
+          'fence_db_connections',
+          // THE SHIPPED SHAPE. A consumer that writes and then exits non-zero -- a migration that
+          // applied three statements and failed on the fourth is exactly this.
+          'migrate_rc=0',
+          '( echo "PARTIAL DDL APPLIED"; exit 7 ) || migrate_rc=$?',
+          'pin_migration_window "The migration"',
+          '[[ "${migrate_rc}" -eq 0 ]] || die "THE MIGRATION EXITED ${migrate_rc}"',
+          'echo "STARTED THE NEW BUILD"',
+        ].join('\n')
+        const result = runShell(shipped)
+        const bindCalls = calls(dir).split('\n').filter((line) => /^--bind-migration /.test(line))
+
+        assert.match(result.output, /PARTIAL DDL APPLIED/,
+          `precondition: the consumer must really have run and written before failing:\n${result.output}`)
+        assert.ok(bindCalls.length >= 2,
+          `the pin must open its own probe even though the consumer exited non-zero — this is the whole finding:\n${calls(dir)}`)
+        assert.doesNotMatch(result.output, /^STARTED THE NEW BUILD$/m,
+          `and nothing may start after a consumer that failed:\n${result.output}`)
+
+        if (expectation === 'placement') {
+          assert.match(result.output, /The migration DID NOT RUN AGAINST THE SERVER THIS RUN FENCED/,
+            `a step that both failed AND cannot be placed must report the PLACEMENT, which is the more serious answer:\n${result.output}`)
+          assert.doesNotMatch(result.output, /THE MIGRATION EXITED 7/,
+            `and the exit status must not mask it — "prisma exited 7" sends an operator to the wrong server:\n${result.output}`)
+        } else {
+          assert.equal((result.output.match(/MIGRATION_BINDING [0-9a-f]{32} colocated/g) ?? []).length, 2,
+            `precondition: this arm is the one where the pin's own probe answered colocated:\n${result.output}`)
+          assert.match(result.output, /THE MIGRATION EXITED 7/,
+            `and once the placement is established the consumer's own failure must still be propagated:\n${result.output}`)
+        }
+      } finally {
+        rmSync(dir, { recursive: true, force: true })
+      }
+    })
+  }
+
+  // THE FOIL, RUN AGAINST THE SAME RIG. r33's shape -- the consumer bare under `set -e` -- and the
+  // pin below it. The shell leaves before the pin, so its probe never opens, and this is what the
+  // assertion above would have been unable to see if the rig could not detect it.
+  test(`${entry.name}: the r33 shape really did skip the pin, and this rig can see it (o3d-secops r34, Codex HIGH 2 foil)`, () => {
+    const dir = mkdtempSync(join(tmpdir(), 'ims-r34foil-'))
+    try {
+      witnessProtocolCheckout(dir, { verdict: 'yes', binding: ['colocated', 'absent'] })
+      const r33Shape = [
+        'set -euo pipefail',
+        'exec 2>&1',
+        entry.preamble(dir),
+        'error() { echo "ERROR: $*" >&2; }',
+        'DB_FENCE_RAISED=false',
+        CUTOVER_DIR_PRIMITIVES,
+        shellFunction(entry.source, 'fence_db_connections'),
+        'fence_db_connections',
+        '( echo "PARTIAL DDL APPLIED"; exit 7 )',
+        'pin_migration_window "The migration"',
+        'echo "STARTED THE NEW BUILD"',
+      ].join('\n')
+      const result = runShell(r33Shape)
+      const bindCalls = calls(dir).split('\n').filter((line) => /^--bind-migration /.test(line))
+
+      assert.match(result.output, /PARTIAL DDL APPLIED/,
+        `precondition: the consumer ran and wrote:\n${result.output}`)
+      assert.equal(bindCalls.length, 1,
+        `the old shape must reach ONLY the opening bind — if the pin's probe ran here, the rig is not measuring what it claims:\n${calls(dir)}`)
+      assert.doesNotMatch(result.output, /DID NOT RUN AGAINST THE SERVER THIS RUN FENCED/,
+        `and nothing asked where that DDL landed, which is the defect:\n${result.output}`)
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
 }
 
 // ---------------------------------------------------------------------------
@@ -14240,6 +14389,100 @@ for (const [name, lines, expectedConsumers, expectedClassified] of [
     }
   })
 }
+
+// ---------------------------------------------------------------------------
+// o3d-secops r34, Codex MEDIUM — A CONSUMER ADDED IN A FORM NOBODY LISTED.
+//
+// The census above asserts what the entrypoints hold TODAY, and a list of what is there cannot
+// show that a list of FORMS would have missed something: r33's three regexes passed their own
+// census perfectly, every round, while the shape they could not see was the whole finding. So this
+// splices new consumers into a shipped entrypoint, in three forms that r33's detector is carried
+// here verbatim to be shown NOT MATCHING, and requires the new census to catch each one.
+//
+// THE POSITION IS THE r32 DEFECT'S OWN. Each is added immediately BELOW the closing gate, which is
+// where `npm run db:seed` and `provision-instance.mjs` actually sat -- past the last placement,
+// on the same movable string, with nothing looking afterwards.
+// ---------------------------------------------------------------------------
+test('the census catches a consumer added in a form no earlier round listed, and r33\'s three regexes do not (o3d-secops r34, Codex MEDIUM)', () => {
+  const carriers = migrationUrlCarriers([INSTALL_LINES.join('\n'), FENCE_LIB_SOURCE])
+  const shipped = migrationConsumerCensus(INSTALL_LINES, carriers)
+  const gate = shipped.find((row) => row.label === 'gate')
+  assert.ok(gate, `precondition: the shipped entrypoint must have a closing gate to add below:\n${JSON.stringify(shipped, null, 2)}`)
+  assert.deepEqual(shipped.filter((row) => row.kind === 'consumer' && row.placedBy === null), [],
+    'precondition: the shipped file must start with every consumer placed, or the assertions below prove nothing')
+
+  // r33'S DETECTOR, COPIED VERBATIM. It is the foil: each addition below must be invisible to it.
+  const r33Hands = (text: string): boolean =>
+    /DATABASE_URL="\$\{?MIGRATION_DATABASE_URL\}?"/.test(text)
+    || /(^|[!\s])pg_dump "\$\{MIGRATION_DATABASE_URL\}"/.test(text)
+    || /(^|[!\s])as_app_user_db /.test(text)
+
+  for (const [shape, added, expectedTail] of [
+    ['a top-level command handed the URL directly',
+      ['psql "$MIGRATION_DATABASE_URL" -c \'select 1\''],
+      ['consumer']],
+    ['an unquoted assignment prefix',
+      ['DATABASE_URL=$MIGRATION_DATABASE_URL node scripts/whatever.mjs'],
+      ['consumer']],
+    ['a command that reaches it through a name it was copied into',
+      ['MIGRATION_URL_COPY="${MIGRATION_DATABASE_URL}"', 'node scripts/whatever.mjs "$MIGRATION_URL_COPY"'],
+      ['alias', 'consumer']],
+  ] as ReadonlyArray<[string, string[], string[]]>) {
+    assert.ok(!added.some(r33Hands),
+      `precondition: ${shape} must be invisible to r33's three forms, or this case proves nothing about them:\n${added.join('\n')}`)
+
+    const mutated = [...INSTALL_LINES.slice(0, gate.line + 1), ...added, ...INSTALL_LINES.slice(gate.line + 1)]
+    const census = migrationConsumerCensus(mutated, carriers)
+
+    // THE CLASSIFICATION IS FAIL-CLOSED: every one of them lands in the list, in the kind it is.
+    const spliced = census.filter((row) => row.line > gate.line && row.line <= gate.line + added.length)
+    assert.deepEqual(
+      spliced.map((row) => row.kind),
+      expectedTail,
+      `${shape} must be classified rather than skipped:\n${JSON.stringify(census, null, 2)}`,
+    )
+
+    // AND THE CONSUMER IT ADDS IS UNPLACED, which is the rule that would fail a real one.
+    const unplaced = census.filter((row) => row.kind === 'consumer' && row.placedBy === null)
+    assert.equal(unplaced.length, 1,
+      `${shape} must leave exactly one consumer with nothing placing it:\n${JSON.stringify(census, null, 2)}`)
+
+    // AND THE GATE IS NO LONGER THE LAST PLACEMENT, which is r32's rule restated.
+    const consumers = census.filter((row) => row.kind === 'consumer')
+    const gated = consumers.findIndex((row) => row.placedBy === 'gate')
+    assert.notEqual(gated, consumers.length - 1,
+      `${shape} runs after the closing gate, so the gate must stop being the last placement:\n${JSON.stringify(consumers, null, 2)}`)
+  }
+})
+
+// AND A CONSUMER MOVED INTO A HELPER DOES NOT LEAVE THE CENSUS (o3d-secops r34, Codex MEDIUM).
+// r33 skipped function bodies and said so, on the grounds that a consumer moved into one "would
+// leave the census rather than silently passing it" -- but leaving a census IS passing it: the
+// detected list and the expected list both shrink by the same entry and nothing fails. The census
+// now follows calls to any function whose body reaches the URL, so the helper's CALL SITE is the
+// reference and it still has to be placed.
+test('a consumer moved into a helper is still in the census, through the call site (o3d-secops r34, Codex MEDIUM)', () => {
+  const carriers = migrationUrlCarriers([INSTALL_LINES.join('\n'), FENCE_LIB_SOURCE])
+  const gate = migrationConsumerCensus(INSTALL_LINES, carriers).find((row) => row.label === 'gate')
+  assert.ok(gate)
+
+  const helper = [
+    'late_settings_writer() {',
+    '  run_as_user "${APP_USER}" env DATABASE_URL="${MIGRATION_DATABASE_URL}" node scripts/whatever.mjs',
+    '}',
+    'late_settings_writer',
+  ]
+  const mutated = [...INSTALL_LINES.slice(0, gate.line + 1), ...helper, ...INSTALL_LINES.slice(gate.line + 1)]
+  const mutatedCarriers = migrationUrlCarriers([mutated.join('\n'), FENCE_LIB_SOURCE])
+
+  assert.ok(mutatedCarriers.has('late_settings_writer'),
+    `precondition: the helper's body names the URL, so the walk must have learned that it carries it:\n${[...mutatedCarriers].join(', ')}`)
+
+  const census = migrationConsumerCensus(mutated, mutatedCarriers)
+  const unplaced = census.filter((row) => row.kind === 'consumer' && row.placedBy === null)
+  assert.deepEqual(unplaced.map((row) => row.step), ['late_settings_writer'],
+    `the call site must be the unplaced consumer, not an entry that quietly vanished:\n${JSON.stringify(census, null, 2)}`)
+})
 
 // ---------------------------------------------------------------------------
 // o3d-secops r32, Codex HIGH 1 — THE OTHER MACHINE LINES THIS BRANCH READS.
