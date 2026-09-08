@@ -5548,12 +5548,30 @@ else
   # the publication and the prune are all aimed at the inode the walk proved and cannot be moved by
   # a rename of any name on the way to it.
   #
-  # AND THE PARTIAL FILE IS CREATED WITH O_EXCL. The pin answers "which directory", and inside a
-  # directory ${APP_USER} owns it is still that account's to plant `.part` in — a predictable name,
-  # and a plain `>` would follow a symlink there and truncate whatever it points at. `set -C` is
-  # open(O_CREAT|O_EXCL), which by POSIX fails with EEXIST when the final component is a symlink and
-  # creates nothing, dangling or not; it is the same primitive prepare_crontab_lock() creates the
-  # crontab lock file with, and for the same reason.
+  # AND THE PARTIAL FILE IS CREATED WITH O_EXCL — BY A HELPER, BECAUSE `set -C` IS NOT ONE
+  # (o3d-ov60 r3, Codex HIGH). The pin answers "which directory", and inside a directory
+  # ${APP_USER} owns it is still that account's to plant `.part` in: a predictable name, at a
+  # moment the service is stopped, cron is stopped and the database connections are fenced. r2
+  # answered that with bash's `noclobber`, on the reading that `set -C` is open(O_CREAT|O_EXCL).
+  # It is that only until the open FAILS. On EEXIST bash stats the name, and if what is there is
+  # not a REGULAR file it re-opens WITHOUT O_EXCL — POSIX requires exactly that, so that
+  # `> /dev/null` keeps working under `noclobber`. Measured, in this bash:
+  #
+  #     mkfifo p; ( set -C; echo hi > p )   ->  blocks for ever
+  #     : > r;    ( set -C; echo hi > r )   ->  "cannot overwrite existing file"
+  #
+  # So the one type `noclobber` lets through is the one type whose open(2) BLOCKS. A named pipe at
+  # the `.part` name wedges root's `gzip >` waiting for a reader that never comes, with nothing
+  # serving and the fence up — and a hang, unlike a refusal, does not unwind.
+  #
+  # WHAT REMOVES IT IS `O_NONBLOCK` PLUS AN `O_EXCL` THAT IS NOT RETRIED, AND A SHELL REDIRECTION
+  # CANNOT ASK FOR EITHER. There is no better spelling of `>`; the flags have to be named
+  # somewhere that can name them. scripts/lib/write-new-file.mjs is that place — the same move
+  # scripts/lib/chown-tree.mjs makes for the walk it needs and a shell cannot express — and it is
+  # handed ${BACKUP_AT}, so its one open is still `openat(N, "<name>", …)` against the descriptor
+  # this block proved and never a second resolution of ${BACKUP_DIR}. Anything already at the
+  # name — a FIFO, a device, a directory, a symlink dangling or not, or an ordinary file from an
+  # earlier run — is EEXIST, and EEXIST is a refusal.
   #
   # THE MODE IS UNCHANGED: 022 for the directory, which is the umask `mkdir -p` ran under, and the
   # ambient umask for the dump, which is what the redirection always ran under. Narrowing either is
@@ -5567,6 +5585,17 @@ else
   BACKUP_BASE="${BACKUP_TARGET##*/}"
   BACKUP_PARTIAL_BASE="${BACKUP_BASE}.part"
   BACKUP_PARTIAL="${BACKUP_TARGET}.part"
+  # THE CREATOR OF THAT PARTIAL, RESOLVED FROM THIS SCRIPT'S OWN lib DIRECTORY — the release being
+  # deployed, not ${APP_DIR}. Same rule, and the same spelling, as install.sh's chown_state_tree()
+  # uses for chown-tree.mjs and its auth probe uses for pg-auth-request.mjs.
+  # ${IMS_BACKUP_WRITER_HELPER} exists for the regressions, which run this block outside the
+  # shipped file and so have no BASH_SOURCE to resolve from; pointing it elsewhere produces a
+  # different program, not an exemption.
+  BACKUP_WRITER="${IMS_BACKUP_WRITER_HELPER:-${IMS_SCRIPT_LIB_DIR:-}/write-new-file.mjs}"
+  [[ -f "${BACKUP_WRITER}" ]] || die \
+    "${BACKUP_WRITER} is missing, so this run cannot create ${BACKUP_PARTIAL} with the open(2) flags that make a planted named pipe a refusal instead of an indefinite block. It will not fall back to a shell redirection, which is the defect that helper exists to remove. Restore the checkout and re-run. NOTHING HAS BEEN MIGRATED."
+  command -v node >/dev/null 2>&1 || die \
+    "node is not on PATH, so this run cannot create ${BACKUP_PARTIAL} through ${BACKUP_WRITER}. NOTHING HAS BEEN MIGRATED."
   # INITIALISED, not merely declared, for the reason crontab-lock.sh initialises CRONTAB_LOCK_FD:
   # this script runs under `set -u`, `exec {NAME}<` is the only thing that ever assigns this, and the
   # repository walk in tests/scripts/deploy-order.test.ts reads a plain assignment or nothing at all.
@@ -5602,9 +5631,16 @@ else
   # HIGH 2). The placement now runs before the failure is propagated and can itself refuse, and a
   # truncated dump left on disk by that path would be a file nothing names as not-a-restore-point.
   #
-  # THE SUBSHELL IS THE `set -C`, and nothing else: `pipefail` is inherited, so the status this
-  # captures is still the pipeline's, and the deletion below it still runs in this shell.
-  ( set -C; pg_dump "${MIGRATION_DATABASE_URL}" | gzip > "${BACKUP_AT}/${BACKUP_PARTIAL_BASE}" ) \
+  # THE HELPER IS THE LAST STAGE OF THE PIPELINE, not a wrapper around it: `pipefail` is on, so a
+  # pg_dump or a gzip that fails is still this statement's status, and the helper's own refusal —
+  # exit 1, before a byte is read — is the rightmost non-zero and therefore the one reported.
+  # Nothing is spawned holding ${MIGRATION_DATABASE_URL} in its argv.
+  #
+  # THE `rm` STAYS THE CALLER'S. The helper deliberately does not unlink what it created: the dump
+  # can fail long after the file is a perfectly good descriptor's worth of truncated bytes, and one
+  # owner for that removal is better than two.
+  pg_dump "${MIGRATION_DATABASE_URL}" | gzip \
+    | node "${BACKUP_WRITER}" "${BACKUP_AT}" "${BACKUP_PARTIAL_BASE}" \
     || { backup_rc=$?; rm -f -- "${BACKUP_AT}/${BACKUP_PARTIAL_BASE}"; }
   # THE RESTORE POINT IS PLACED BEFORE IT IS OFFERED AS ONE (o3d-secops r33, Codex HIGH 2).
   # `pg_dump` is a consumer of the same movable string as everything else, and the aggregate

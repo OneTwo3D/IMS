@@ -239,6 +239,7 @@ const REAL = {
   stat: realBin('stat'),
   rm: realBin('rm'),
   mkdir: realBin('mkdir'),
+  mkfifo: realBin('mkfifo'),
   mv: realBin('mv'),
   ln: realBin('ln'),
   id: realBin('id'),
@@ -4767,6 +4768,33 @@ const UPDATE_BACKUP_DIR_RETIRED = [
 /** The stamped name the block composes above the lifted region; one literal, both shapes. */
 const BACKUP_TARGET_BASE = 'pre-update-00000000-000000.sql.gz'
 
+/** The program that creates the partial, as it ships (o3d-ov60 r3). */
+const BACKUP_WRITER_HELPER = join(REPO, 'scripts/lib/write-new-file.mjs')
+
+/**
+ * THE SHIPPED STATEMENT THAT CREATES AND FILLS THE PARTIAL, and the one it replaced.
+ *
+ * Both are lifted or typed as WHOLE STATEMENTS so that the mutation below is a one-operand swap
+ * inside the block every other assertion in this section runs: the walk, the descriptor, the
+ * publication and the prune are identical on both sides, and the only thing that differs is how
+ * the `.part` file comes into existence.
+ */
+const SHIPPED_PARTIAL_WRITE = [
+  '  pg_dump "${MIGRATION_DATABASE_URL}" | gzip \\',
+  '    | node "${BACKUP_WRITER}" "${BACKUP_AT}" "${BACKUP_PARTIAL_BASE}" \\',
+].join('\n')
+
+/**
+ * THE `noclobber` REDIRECTION update.sh CARRIED UNTIL o3d-ov60 r3 (Codex HIGH), typed here because
+ * it is no longer in any shipped file — which is what makes it a mutation rather than a second
+ * reading of the subject. `set -C` is open(O_CREAT|O_EXCL) only until that open fails: bash then
+ * stats the name and, for anything that is not a regular file, re-opens WITHOUT O_EXCL. A named
+ * pipe is therefore opened, and an open of a FIFO with no reader BLOCKS.
+ */
+const RETIRED_PARTIAL_WRITE = [
+  '  ( set -C; pg_dump "${MIGRATION_DATABASE_URL}" | gzip > "${BACKUP_AT}/${BACKUP_PARTIAL_BASE}" ) \\',
+].join('\n')
+
 /**
  * The rig both shapes run in.
  *
@@ -4777,10 +4805,16 @@ const BACKUP_TARGET_BASE = 'pre-update-00000000-000000.sql.gz'
  * `info` and `pin_migration_window` are the two windows. Each defaults to a no-op and a test
  * replaces the one it is opening, so a rename lands at a point the shipped sequence itself chose
  * rather than at a line this file inserted.
+ *
+ * ${IMS_BACKUP_WRITER_HELPER} IS THE SHIPPED HELPER, not a stand-in (o3d-ov60 r3). update.sh
+ * resolves scripts/lib/write-new-file.mjs from its own ${BASH_SOURCE}, which a lifted block does
+ * not have; the override the shipped line already reads is pointed at the real file, so what
+ * creates the partial in these runs is the program that creates it on a host.
  */
 function backupRig(site: string, vars: string[], hooks: string[] = []): string {
   return rig(['enter_service_subdir', 'mkdir_service_subdir'], [
     'MIGRATION_DATABASE_URL="postgresql://example/db"',
+    `IMS_BACKUP_WRITER_HELPER=${q(BACKUP_WRITER_HELPER)}`,
     'pg_dump() { printf %s "DUMP-OF-$1"; }',
     'gzip() { cat; }',
     'success() { printf "SUCCESS: %s\\n" "$*"; }',
@@ -4960,6 +4994,80 @@ test('[o3d-ov60] a symlink planted at the partial file inside the proved directo
   runBash(backupRig(UPDATE_BACKUP_DIR_RETIRED, [`BACKUP_DIR=${q(mutant.backupDir)}`]))
   assert.notEqual(readFileSync(mutant.victim, 'utf8'), '',
     'THE FINDING: without O_EXCL the dump is written through the link, as root')
+})
+
+test('[o3d-ov60] a FIFO planted at the partial file is REFUSED, and does not hang the fenced cutover', (t) => {
+  /**
+   * THE ONE TYPE `noclobber` LETS THROUGH IS THE ONE TYPE WHOSE open(2) BLOCKS (Codex HIGH).
+   *
+   * `set -C` is open(O_CREAT|O_EXCL) only until that open fails. On EEXIST bash stats the name and,
+   * for anything that is not a REGULAR file, re-opens WITHOUT O_EXCL — POSIX requires it, so that
+   * `> /dev/null` keeps working. So the symlink test above passes and this one did not exist: a
+   * named pipe at the predictable `.part` name is opened rather than refused, and an open of a FIFO
+   * with no reader waits. The waiting is done by root, after the service and cron are stopped and
+   * the database connections are fenced, which is the state a deployment cannot be left in.
+   *
+   * EVERY ASSERTION HERE IS BOUNDED FROM OUTSIDE THE SHELL. `runBash` runs its subject under
+   * `timeout` and turns an expired bound into a thrown `HarnessRunaway`, so a hang FAILS with a
+   * status rather than occupying the runner — and the two directions are then measurable against
+   * each other: the retired redirection must exceed the bound, and the shipped block must not.
+   */
+  const plant = (prefix: string) => {
+    const root = createTempDirSync(prefix, t)
+    const parent = join(root, 'var-backups')
+    mkdirSync(parent)
+    // An ORDINARY directory under a path the harness owns, which is exactly what IMS_BACKUP_DIR
+    // reaches and what the walk legitimately accepts. The finding is not about the directory.
+    const backupDir = join(parent, 'one-two-inventory')
+    mkdirSync(backupDir)
+    const fifo = join(backupDir, `${BACKUP_TARGET_BASE}.part`)
+    const made = spawnSync(REAL.mkfifo, [fifo], { encoding: 'utf8' })
+    assert.equal(made.status, 0, `the harness must be able to plant a named pipe: ${made.stderr}`)
+    assert.equal(lstatSync(fifo).isFIFO(), true, 'and what it planted must be one')
+    return { backupDir, fifo }
+  }
+
+  const shipped = plant('ims-ov60-fifo-')
+
+  // NOT VACUOUS, AND ESTABLISHED BEFORE ANYTHING IS CLAIMED: a bare `set -C` redirection at THIS
+  // path, in this bash, really does block. Without this the refusal below could be a refusal for
+  // some reason that has nothing to do with the type of the entry.
+  assert.throws(
+    () => runBash(`set -C; echo hi > ${q(shipped.fifo)}`, { deadlineMs: 3_000 }),
+    /deadline of \d+s exceeded/,
+    'precondition: an open of this FIFO with no reader must BLOCK under `noclobber`, or nothing '
+    + 'below is a statement about hanging',
+  )
+  assert.equal(lstatSync(shipped.fifo).isFIFO(), true, 'and the plant must have survived the control run')
+
+  // THE SHIPPED BLOCK. It must come back, and it must come back refusing.
+  const run = runBash(backupRig(UPDATE_BACKUP_DIR, [`BACKUP_DIR=${q(shipped.backupDir)}`]),
+    { deadlineMs: 20_000 })
+  assert.equal(run.status, 1, `a named pipe at the partial's name must END the run: ${run.stdout} ${run.stderr}`)
+  assert.ok(!run.stdout.includes(REACHED), 'and nothing after it may execute')
+  // AND IT REFUSED THE ENTRY, rather than failing somewhere earlier for an unrelated reason: the
+  // helper names the entry it would not create. (The plant itself is gone by now — the shipped
+  // statement's own `rm -f --` removes whatever is at the partial's name on failure — so the
+  // reading has to be taken from the refusal.)
+  assert.match(run.stderr, /write-new-file: .*\.part could not be CREATED/,
+    `the refusal must come from the create, and must name what it refused: ${run.stderr}`)
+
+  // MEASURED BY MUTATION, ROUTE STATED: the SAME block with one statement swapped back to the
+  // `set -C` redirection r2 shipped. Everything else — the walk, the descriptor, the publication,
+  // the prune — is identical, so what this exhibits is the redirection and nothing else.
+  const mutantBlock = UPDATE_BACKUP_DIR.replace(SHIPPED_PARTIAL_WRITE, RETIRED_PARTIAL_WRITE)
+  assert.notEqual(mutantBlock, UPDATE_BACKUP_DIR,
+    'precondition: the swap must have changed the block, or this runs the subject twice')
+  assert.ok(mutantBlock.includes('set -C'), 'and it must have put the retired redirection in')
+  const mutant = plant('ims-ov60-fifo-mutant-')
+  assert.throws(
+    () => runBash(backupRig(mutantBlock, [`BACKUP_DIR=${q(mutant.backupDir)}`]), { deadlineMs: 5_000 }),
+    /deadline of \d+s exceeded/,
+    'THE FINDING: `noclobber` opens the planted FIFO and the dump blocks on it indefinitely, with '
+    + 'the service stopped, cron stopped and the database fenced',
+  )
+  assert.equal(lstatSync(mutant.fifo).isFIFO(), true,
+    'and it never got as far as its own `rm -f --`, which is what "hang" means here')
 })
 
 test('[o3d-ov60] a directory planted at the restore point\'s own name is refused, not published into', (t) => {
