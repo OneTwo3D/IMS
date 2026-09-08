@@ -139,10 +139,17 @@ export const POSTED_ACCOUNTING_EVENT_STATUS = 'POSTED'
 /**
  * Mirrored-event statuses that settle a SALES_INVOICE_UPDATE.
  *
- * POSTED is read as a document below. VOID is written by `voidMirroredAccountingEventsForOrder` only
- * for an order whose invoice work was retired unposted (a cancelled order), so it is a positive
- * statement that this update never reached the ledger. Everything else — PENDING, FAILED, REVERSED —
- * leaves open that the remote document was modified, and is refused.
+ * POSTED is read as a document below. VOID has two writers and BOTH are positive statements that
+ * this update never reached the ledger, which is the only property this list needs:
+ * `voidMirroredAccountingEventsForOrder` retires the invoice work of a CANCELLED order unposted, and
+ * a NOT_POSTED operator settlement retires one attempt on the operator's assertion that nothing was
+ * sent. Everything else — PENDING, FAILED, REVERSED — leaves open that the remote document was
+ * modified, and is refused.
+ *
+ * o3d-11rf r2: a VOID event that a NEW LIVE ATTEMPT takes over is returned to PENDING by
+ * `reviveMirroredEventForNewAttempt` — so a document with live work in flight leaves this list
+ * rather than being read here as settled, which is stricter than before and in the right direction.
+ * Which of the two voids may be taken over is recorded on the row; see accounting-event-void-basis.ts.
  */
 export const SETTLED_INVOICE_UPDATE_EVENT_STATUSES = ['POSTED', 'VOID'] as const
 

@@ -32,6 +32,7 @@ import {
   settlementMirrorExternalId,
   settlementMirrorGuard,
   settlementMirrorStatus,
+  settlementMirrorVoidBasis,
   settlementNote,
   type MirrorOwnershipConflict,
   type SettlementAssertion,
@@ -545,6 +546,19 @@ export async function settleAccountingSyncRow(
         //     every enqueue writer takes the two in, and two transactions taking the same pair in
         //     opposite orders is the one way this deadlocks. Before, because the fence is the first
         //     statement that touches the sync row.
+        //
+        //     AND THIS LOCK IS HALF THE FIX, NOT THE WHOLE OF IT (r2, Codex HIGH). It makes the two
+        //     writers ordered; it cannot make both orders end correctly. THIS order — settlement
+        //     first — commits the shared event VOID below, and the enqueue that follows meets that
+        //     event's idempotency key. It used to return without touching it, leaving a live PENDING
+        //     row with a VOID mirror: the very state o3d-11rf was filed to remove, surviving on the
+        //     other side of the serialisation. The enqueue now takes such an event back to PENDING —
+        //     but ONLY a void that retired an attempt, which is why the write below records
+        //     `voidBasis`. See lib/domain/accounting/accounting-event-void-basis.ts.
+        //
+        //     Nor is it only a race: `classifyPriorAttempts` reads a CANCELLED attempt as asserting
+        //     nothing was sent, so settling a row NOT_POSTED is exactly what LETS a replacement be
+        //     enqueued — days later, with no concurrency at all, onto the same VOID mirror.
         await lockFollowUpScope(tx, {
           connector: row.connector,
           type: row.type,
@@ -648,6 +662,13 @@ export async function settleAccountingSyncRow(
             referenceId: row.referenceId,
             payload: row.payload,
             status: settlementMirrorStatus(assertion.outcome),
+            // o3d-11rf r2: WHAT THIS VOID RETIRES. A NOT_POSTED settlement retires ONE ATTEMPT and
+            // says nothing about whether the document is still owed — and settling it NOT_POSTED is
+            // exactly what lets a replacement be enqueued. Recorded on the event so the enqueue side
+            // can take the shared mirror back to PENDING for that replacement WITHOUT also reviving
+            // a mirror a cancellation retired. Without it the two voids are one bit and the enqueue
+            // must refuse both, which is the state this round is fixing.
+            voidBasis: settlementMirrorVoidBasis(assertion.outcome),
             externalId: externalTransactionId,
             message: settlementNote(assertion),
             guard: settlementMirrorGuard(),

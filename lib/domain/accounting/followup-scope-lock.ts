@@ -25,6 +25,15 @@
  *     row's siblings. That read cannot be serialised against a sibling INSERT by any row lock, for
  *     the reason given above, so the settlement and the enqueue have to take this.
  *
+ * WHAT THIS LOCK DOES NOT DO, stated because a reader took it for more (o3d-11rf r2, Codex HIGH).
+ * It ORDERS the settlement and the enqueue. It does not make both orders correct, and only one of
+ * them was: enqueue-then-settlement is safe because the settlement's sibling read now sees the live
+ * row, while settlement-then-enqueue commits the shared event VOID and the enqueue that follows
+ * collides with it. That half is closed on the ENQUEUE side, by
+ * `reviveMirroredEventForNewAttempt`, on a basis recorded at void time. Serialisation is what makes
+ * that revive well-defined — it is the reason the enqueue is looking at a settled decision rather
+ * than at a half-made one — and it is not by itself the answer.
+ *
  * The two sets are DISJOINT — no mirrored type is money-moving — so before o3d-11rf this lock was
  * taken for exactly no mirrored type. "Settlement takes the same lock the enqueue takes" would have
  * serialised nothing at all; widening the gate is what makes taking it mean something. Ordinary

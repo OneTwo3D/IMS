@@ -2754,6 +2754,15 @@ model AccountingEvent {
   // assumption, which the live mirror acts on (and audits) and the backfill declines.
   // Null everywhere else — including on the enqueue-time row of every live revision.
   revisionOrderBasis String?
+  // o3d-11rf r2: WHY this event is VOID, and so whether a later live attempt may take it back to
+  // PENDING. Two voids used to be one bit: `source_cancelled` retires the DOCUMENT (the order was
+  // cancelled — never revivable) and `attempt_settled_not_posted` retires ONE ATTEMPT (an operator
+  // settled a single sync row NOT_POSTED — revivable, because re-queueing is the ordinary next
+  // step). NULL means no writer said which, and NULL is never revived: every row written before
+  // this column, and any written by a predecessor binary serving across the migration, lands on
+  // the safe side. Written only alongside a VOID status and cleared by any write that leaves the
+  // row in another status. See lib/domain/accounting/accounting-event-void-basis.ts.
+  voidBasis        String?
   reversalOfId     String?
   createdAt        DateTime @default(now())
   updatedAt        DateTime @updatedAt

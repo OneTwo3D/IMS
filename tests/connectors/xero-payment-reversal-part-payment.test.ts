@@ -1794,6 +1794,47 @@ test('o3d-pzu0: the poll reports what it SPENT and how far behind it is', async 
   )
 })
 
+test('o3d-pzu0 r2: the reported cost INCLUDES the withheld-reversal recheck, not just the drain', async () => {
+  reset()
+  // Codex MEDIUM. `xeroRequests` was finalised from `drain.requests` BEFORE the recheck ran, so a
+  // poll that went on to read invoices by id — the recheck's whole job, and the traffic `xeroGet`
+  // may multiply by retrying a 429 — reported a cost that omitted them. It under-reported precisely
+  // the polls with the most work to do, in the one number a quota decision is meant to rest on.
+  state.invoices = []
+  state.activityRows = [withheldMarker()]
+  state.purchaseInvoices = [paidBillRow()]
+  state.syncLogs = [billRegistration({ status: 'CANCELLED', externalTransactionId: null, syncedAt: null })]
+  state.recheckInvoices = [bill({ AmountPaid: 0, AmountDue: 500 })]
+
+  const result = await poll()
+
+  // The recheck genuinely went to Xero — without this the rest of the test is vacuous.
+  assert.deepEqual(state.recheckFetches, ['Invoices?IDs=XB1'])
+  assert.equal(result.recheckRequests, 1, 'the recheck spent one transport attempt')
+  assert.ok(result.drainRequests >= 1, `the drain spent its own, got ${result.drainRequests}`)
+  assert.equal(
+    result.xeroRequests, result.drainRequests + result.recheckRequests,
+    'the reported cost is the whole poll, not the drain half of it',
+  )
+  assert.ok(
+    result.xeroRequests > result.drainRequests,
+    `a poll with a due recheck must report more than the drain alone (${result.xeroRequests} vs ${result.drainRequests})`,
+  )
+})
+
+test('o3d-pzu0 r2: a poll with no due recheck reports the drain and nothing invented', async () => {
+  reset()
+  // The control. If `recheckRequests` were measured off anything but this poll's own traffic — a
+  // process-wide counter read too widely, say — it would be non-zero here too.
+  state.invoices = []
+
+  const result = await poll()
+
+  assert.deepEqual(state.recheckFetches, [])
+  assert.equal(result.recheckRequests, 0)
+  assert.equal(result.xeroRequests, result.drainRequests)
+})
+
 function drainUpserts(): Array<{ where: { key: string }; update: { value: string } }> {
   return state.settingUpserts.filter(
     (u): u is { where: { key: string }; update: { value: string } } =>

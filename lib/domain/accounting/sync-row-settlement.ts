@@ -3,6 +3,9 @@ import { isUniqueConstraintViolation, uniqueConstraintFields } from '@/lib/db/pr
 import { UNCLAIMED_ATTEMPT_REVISION } from '@/lib/domain/accounting/sync-log-attempt'
 import type { AccountingEventStatus } from '@/lib/domain/accounting/accounting-event-types'
 import type { MirroredEventWriteGuard } from '@/lib/domain/accounting/accounting-event-mirror'
+// From the LEAF module, not from accounting-event-mirror: this file is imported by suites that
+// replace that module with a partial mock, under which a value import of it would be `undefined`.
+import { ATTEMPT_SETTLED_VOID_BASIS } from '@/lib/domain/accounting/accounting-event-void-basis'
 
 /**
  * o3d-nf9i + o3d-osl8 item 2 — OPERATOR SETTLEMENT of an AccountingSyncLog row the system cannot
@@ -747,6 +750,26 @@ export function settlementNote(assertion: SettlementAssertion): string {
  */
 export function settlementMirrorStatus(outcome: SettlementOutcome): AccountingEventStatus {
   return outcome === 'POSTED' ? 'POSTED' : 'VOID'
+}
+
+/**
+ * o3d-11rf r2 — WHAT THIS VOID RETIRES, recorded on the event so the enqueue side can tell.
+ *
+ * ONE ATTEMPT, and only that. The operator asserted that THE ROW THEY SETTLED reached nothing; they
+ * were not asked, and did not answer, whether the document is still owed. It usually is — settling a
+ * row NOT_POSTED is precisely what lets a replacement be enqueued, because `classifyPriorAttempts`
+ * reads a CANCELLED attempt as asserting nothing was sent. So a later live attempt at the same
+ * document may take the shared mirror back to PENDING.
+ *
+ * That is NOT true of `voidMirroredAccountingEventsForOrder`, which retires the DOCUMENT because the
+ * order is cancelled, and the two were indistinguishable on the row until this. See
+ * accounting-event-void-basis.ts.
+ *
+ * `undefined` on the POSTED branch: nothing is being retired, and `updateMirroredAccountingEventStatus`
+ * clears the column on any write that does not leave the row VOID.
+ */
+export function settlementMirrorVoidBasis(outcome: SettlementOutcome): string | undefined {
+  return outcome === 'POSTED' ? undefined : ATTEMPT_SETTLED_VOID_BASIS
 }
 
 /** The external id to stamp on the mirrored event. Null for NOT_POSTED, for the reasons above. */

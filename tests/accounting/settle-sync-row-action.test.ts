@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict'
 import test, { mock } from 'node:test'
+import { ATTEMPT_SETTLED_VOID_BASIS } from '@/lib/domain/accounting/accounting-event-void-basis'
 
 // o3d-nf9i + o3d-osl8 item 2 — settleAccountingSyncRow: its guard, the attempt fence it is the
 // caller of (o3d-e2mz), what the operator's assertion writes, what it refuses and WHY, the shared
@@ -612,6 +613,42 @@ test('a mirrored row VOIDs its event and records that it did', async () => {
   assert.equal('mirror' in result ? result.mirror : null, 'updated')
   assert.equal(state.events[0].status, 'VOID')
   assert.equal((settlementAudit()[0].metadata as Record<string, unknown>).mirrorUpdate, 'updated')
+})
+
+test('a NOT_POSTED settlement records WHAT its VOID retires, so a later enqueue can revive it (o3d-11rf r2)', async () => {
+  // The o3d-11rf r2 HIGH is the settlement-then-enqueue order: settlement voids the shared mirror,
+  // and the replacement it makes possible then collides with that VOID. The enqueue may only take
+  // that event back to PENDING if it can tell an attempt-retiring void from a document-retiring one,
+  // and this is the write that tells it. Without the basis on the row the enqueue must refuse both,
+  // which is the broken state — so this pins the ACTION's wiring, not just the policy function.
+  const settle = await loadAction()
+  state.rows = [syncRow({ ...MIRRORED })]
+  state.events = [{ id: 'evt-1', idempotencyKey: mirrorKeyFor(), status: 'PENDING', externalId: null }]
+  const result = await settle('log-1', notPosted())
+  assert.equal(result.success, true)
+  assert.equal(state.events[0].status, 'VOID')
+  assert.equal(
+    (state.events[0] as Record<string, unknown>).voidBasis, ATTEMPT_SETTLED_VOID_BASIS,
+    'the settlement must record that it retired ONE ATTEMPT, not the document',
+  )
+})
+
+test('a POSTED settlement leaves no void basis behind on the event (o3d-11rf r2)', async () => {
+  // The column is a permission. A row that is not VOID must not carry one — a stale
+  // `attempt_settled_not_posted` beside a document id would let a later enqueue revive a posting.
+  const settle = await loadAction()
+  state.rows = [syncRow({ ...MIRRORED })]
+  state.events = [{
+    id: 'evt-1', idempotencyKey: mirrorKeyFor(), status: 'PENDING', externalId: null,
+    voidBasis: ATTEMPT_SETTLED_VOID_BASIS,
+  } as never]
+  const result = await settle('log-1', posted({ externalTransactionId: 'INV-7001' }))
+  assert.equal(result.success, true)
+  assert.equal(state.events[0].status, 'POSTED')
+  assert.equal(
+    (state.events[0] as Record<string, unknown>).voidBasis, null,
+    'a write that leaves the row POSTED must clear the basis',
+  )
 })
 
 test('a mirror that matches no event records `not_found` — the audit never asserts an update that did not happen', async () => {

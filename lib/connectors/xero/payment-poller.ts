@@ -729,6 +729,16 @@ type PollResult = {
    * product decision that needs a few weeks of exactly these two figures.
    */
   xeroRequests: number
+  /**
+   * o3d-pzu0 r2 (Codex MEDIUM): the two halves of `xeroRequests`, kept apart because they are
+   * bounded by different things and answer different questions. `drainRequests` is what the delta
+   * drain spent and is the figure `MAX_REQUESTS_PER_POLL` caps; `recheckRequests` is what the
+   * withheld-reversal recheck spent AFTER the cursor was decided, and nothing here caps it.
+   * `xeroRequests` is their SUM — what the tenant's allowance actually paid for this run, which is
+   * the number a quota decision needs and the one that used to omit the recheck entirely.
+   */
+  drainRequests: number
+  recheckRequests: number
   cursorLagMs: number
   errors: string[]
   skipped?: string
@@ -1461,7 +1471,7 @@ export async function pollXeroPayments(): Promise<PollResult> {
       // A skipped poll asked Xero nothing and moved no cursor, so it spent nothing and is
       // responsible for no lag. Reported as zeros rather than omitted: an absent number would have
       // to be guessed at by every reader.
-      xeroRequests: 0, cursorLagMs: 0,
+      xeroRequests: 0, drainRequests: 0, recheckRequests: 0, cursorLagMs: 0,
       errors: [], skipped: 'backlog reconcile held the payment-write lock',
     }
   }
@@ -1473,7 +1483,7 @@ async function pollXeroPaymentsLocked(): Promise<PollResult> {
     salesPaid: 0, billsPaid: 0, salesReversed: 0, billsReversed: 0,
     salesReversalsWithheld: 0, billReversalsWithheld: 0,
     withheldRechecked: 0, withheldResolved: 0,
-    xeroRequests: 0, cursorLagMs: 0,
+    xeroRequests: 0, drainRequests: 0, recheckRequests: 0, cursorLagMs: 0,
     errors: [] as string[],
   }
 
@@ -1598,6 +1608,12 @@ async function pollXeroPaymentsLocked(): Promise<PollResult> {
   // the `through` of the last chunk that did. The gap between it and the moment the poll started is
   // the backlog still owed — the one number that says whether the drain is keeping up, and the one
   // nothing has ever recorded.
+  // The drain's own spend, and — until the withheld recheck below has run and added its own — the
+  // whole of what is known about this poll's cost. The activity rows emitted between here and there
+  // (the lag escalation, the cursor-held warning) therefore carry the drain figure, which is what
+  // they are about: `MAX_REQUESTS_PER_POLL` bounds the DRAIN. `xeroRequests` is finalised as the
+  // TOTAL after the recheck (o3d-pzu0 r2), which is what the poll summary and every quota reader see.
+  result.drainRequests = drain.requests
   result.xeroRequests = drain.requests
   result.cursorLagMs = Math.max(0, pollStartedAt.getTime() - checkpoint.getTime())
 
@@ -1653,8 +1669,10 @@ async function pollXeroPaymentsLocked(): Promise<PollResult> {
         `Xero payment polling is running but NOT catching up: the cursor is ${describeLagDuration(lag.next.lagMs)} ` +
         `behind and ${lag.next.stalledPolls} consecutive polls have failed to remove ` +
         `${describeLagDuration(MIN_LAG_PROGRESS_MS)} of that. Payments are still being detected, but ` +
-        `${describeLagDuration(lag.next.lagMs)} late, and the delay is not shrinking on its own. This poll spent ` +
-        `${drain.requests} Xero request(s) of the ${MAX_REQUESTS_PER_POLL} it may use per run. Either ` +
+        `${describeLagDuration(lag.next.lagMs)} late, and the delay is not shrinking on its own. The drain spent ` +
+        `${drain.requests} Xero request(s) of the ${MAX_REQUESTS_PER_POLL} it may use per run — the ` +
+        `withheld-reversal recheck runs after this line and spends more, so read xeroRequests on the ` +
+        `poll summary for the total (o3d-pzu0 r2). Either ` +
         `invoice changes are arriving faster than one poll can drain, or the drain is failing and ` +
         `holding the cursor — check for a companion cursor_held error (o3d-pzu0).`,
       metadata: { ...result, stalledPolls: lag.next.stalledPolls, progressMs: lag.progressMs },
@@ -1693,11 +1711,31 @@ async function pollXeroPaymentsLocked(): Promise<PollResult> {
 
   // Reconsider withheld verdicts AFTER the drain, so a recheck failure can never be mistaken for a
   // reason to hold the poll cursor: by here the cursor has already been decided.
+  //
+  // o3d-pzu0 r2 (Codex MEDIUM) — AND ITS TRAFFIC IS PART OF WHAT THE POLL COST. `drain.requests` is
+  // the DRAIN's budget and nothing else; the recheck below calls `xeroGet` once per batch of due
+  // documents and `xeroGet` retries a 429 internally, so a poll with due withheld reversals spent
+  // more than the figure that was being reported as "what this poll spent" — under-reporting exactly
+  // the polls with the most work to do, and understating the tenant's real quota draw in the one
+  // number the quota decision is meant to rest on.
+  //
+  // MEASURED, NOT COUNTED BY HAND: the delta of `xeroHttpAttemptCount()` across the whole recheck,
+  // which is the same monotonic transport counter the drain's budget reconciles against, so a 429
+  // retry inside one `xeroGet` is counted as the several tenant calls it is. Taken over the WHOLE
+  // call rather than around the fetcher, so anything the recheck's own decision pass ever spends is
+  // inside the measurement rather than outside it. Its one assumption is that no OTHER Xero caller
+  // interleaves with this awaited tree, which is what the payment-write lock already establishes
+  // for the poll and its reconcile.
+  const recheckAttemptsBefore = xeroHttpAttemptCount()
   try {
     await recheckWithheldReversals(result, lastPollDate, (path) => xeroGet<XeroInvoicesResponse>(path))
   } catch (e) {
     result.errors.push(`Withheld-reversal recheck error: ${String(e)}`)
   }
+  // Where a `finally` would put it: a recheck that THREW still spent what it spent, and a poll that
+  // reported nothing for it would be under-reporting the runs that went worst.
+  result.recheckRequests = Math.max(0, xeroHttpAttemptCount() - recheckAttemptsBefore)
+  result.xeroRequests = result.drainRequests + result.recheckRequests
 
   // `billReversalsWithheld` counts BOTH causes — a ledger amount that does not prove a reversal, and
   // a registration this read cannot speak for (o3d-a3wx round 4) — so this one summand covers both.
