@@ -185,10 +185,16 @@ test('[o3d-nepa] SYNCED is an outcome and is never held back by this clause', as
 test('[o3d-nepa] retention and the daily-batch recreate verdict both READ the rule rather than restating it', async () => {
   const retention = await readFile(path.join(process.cwd(), 'lib/data-retention.ts'), 'utf8')
   assert.match(retention, /UNRESOLVED_ABANDONED_CLAIM_WHERE/, 'retention names the record via the shared constant')
-  const deletePredicate = retention.slice(
-    retention.indexOf('db.accountingSyncLog.deleteMany'),
-    retention.indexOf('syncLogsDeleted = wc.count'),
-  )
+  // BOTH ENDS ASSERTED (o3d-v7sy). `indexOf` answers -1 for a marker that has moved and `slice`
+  // reads -1 as "one before the end", so the stale end marker `syncLogsDeleted = wc.count` — gone
+  // since the delete became a two-statement transaction — had quietly widened this predicate to the
+  // whole rest of the file. The two `doesNotMatch` assertions below were then about every line of
+  // retention, including its prose, rather than about the delete's own `where`.
+  const deleteStart = retention.indexOf('db.accountingSyncLog.deleteMany')
+  const deleteEnd = retention.indexOf('syncLogsDeleted =', deleteStart)
+  assert.ok(deleteStart >= 0, 'the delete statement is still spelled this way')
+  assert.ok(deleteEnd > deleteStart, 'and the slice really ends at the assignment that closes it')
+  const deletePredicate = retention.slice(deleteStart, deleteEnd)
   assert.doesNotMatch(deletePredicate, /abandonedBeforeRemoteCall/,
     'and does not spell the column out locally, which is how the two sides drift')
   assert.doesNotMatch(deletePredicate, /settlementBasis/, 'nor the round-4 column')

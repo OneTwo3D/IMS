@@ -13,6 +13,7 @@ import {
   RECOVERABLE_REFUND_PARK_STATUSES,
   WC_REFUND_PARK_RECOVERED_ACTION,
 } from '@/lib/domain/sales/refund-park-recovery'
+import { EXTERNAL_DOCUMENT_EVIDENCE_WHERE } from '@/lib/domain/accounting/external-document-evidence'
 import { REMOTE_MONEY_EVIDENCE_TYPES } from '@/lib/domain/accounting/remote-money-evidence'
 import { UNRESOLVED_ABANDONED_CLAIM_WHERE } from '@/lib/domain/accounting/unresolved-abandoned-claim'
 import {
@@ -339,13 +340,21 @@ export async function purgeExpiredData(): Promise<{
           createdAt: { lt: cutoff },
           status: { notIn: [...POSTABLE_ACCOUNTING_SYNC_STATUSES] },
           type: { notIn: [...REMOTE_MONEY_EVIDENCE_TYPES] },
-          // TWO exemptions, both expressed as a NOT over a SHARED constant, and neither spelled out
-          // here. `AND` rather than two `NOT` keys because an object literal has only one of those —
-          // and writing them as one merged predicate would make the delete pass true when EITHER
-          // clause was satisfied, which is the opposite of what both of them mean.
+          // THREE exemptions, each expressed as a NOT over a SHARED constant, and none spelled out
+          // here. `AND` rather than three `NOT` keys because an object literal has only one of those —
+          // and writing them as one merged predicate would make the delete pass true when ANY ONE
+          // clause was satisfied, which is the opposite of what all of them mean.
+          //
+          // o3d-v7sy — THE THIRD ASKS "IS THIS ROW THE ONLY LOCAL RECORD OF A DOCUMENT THAT POSTED?"
+          // A SYNCED row keyed to a sales order, one of its shipments, or a daily batch it was staged
+          // into is what `findSalesOrderDeleteBlocker` reads to refuse an IRREVERSIBLE hard delete.
+          // It is in none of the other two: SYNCED is outside POSTABLE by design, a linked row has
+          // `backReferenceCheckedAt` set so the back-reference clause releases it, and it is not
+          // CANCELLED so the abandoned-claim clause never sees it. See external-document-evidence.ts.
           AND: [
             { NOT: UNRESOLVED_BACK_REFERENCE_EVIDENCE_WHERE },
             { NOT: UNRESOLVED_ABANDONED_CLAIM_WHERE },
+            { NOT: EXTERNAL_DOCUMENT_EVIDENCE_WHERE },
           ],
         },
       }),
@@ -462,13 +471,27 @@ export async function purgeExpiredData(): Promise<{
     //
     // Spelled as the SAME predicate the delete uses, over the SAME shared constant, so the two passes
     // cannot drift on what a money row is.
+    //
+    // o3d-v7sy — THE THIRD POPULATION, AND IT ENTERS BOTH PASSES IN THE SAME EDIT. Holding a row back
+    // from the delete without adding it here is what puts a row in NEITHER pass: retained whole and
+    // for ever, which is the objection that reverted the PROCESSING exemption. The external-document
+    // evidence loses and keeps exactly what the other two do — the delete guard reads COLUMNS
+    // (referenceType, referenceId, status, externalTransactionId, settlementBasis, connector, type)
+    // and never the payload, so the customer names, addresses and line descriptions still expire on
+    // the schedule the settings UI promises while the row survives as the guard's evidence.
     const compactableWhere = {
       createdAt: { lt: cutoff },
       backReferenceEvidenceCompactedAt: null,
       type: { notIn: [...REMOTE_MONEY_EVIDENCE_TYPES] },
       AND: [
         { OR: [{ syncedAt: null }, { syncedAt: { lt: cutoff } }] },
-        { OR: [UNRESOLVED_BACK_REFERENCE_EVIDENCE_WHERE, UNRESOLVED_ABANDONED_CLAIM_WHERE] },
+        {
+          OR: [
+            UNRESOLVED_BACK_REFERENCE_EVIDENCE_WHERE,
+            UNRESOLVED_ABANDONED_CLAIM_WHERE,
+            EXTERNAL_DOCUMENT_EVIDENCE_WHERE,
+          ],
+        },
       ],
     }
     let compacted = 0

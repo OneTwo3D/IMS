@@ -3,26 +3,30 @@ import type { Prisma } from '@/app/generated/prisma/client'
 // ---------------------------------------------------------------------------
 // o3d-v7sy — THE ROW THAT IS THE ONLY LOCAL RECORD OF AN EXTERNAL ACCOUNTING DOCUMENT.
 //
-// Two readers ask "does a document already stand against this order?" and BOTH answer it purely
-// from `accounting_sync_logs`. Retention deletes those rows by age, so both answers have a shelf
-// life — and neither reader FAILS when its evidence is gone. Each returns the confident negative:
+// `findSalesOrderDeleteBlocker` (lib/domain/sales/order-delete-guard.ts) asks "does a document
+// already stand against this order?" and answers it purely from `accounting_sync_logs`: rows keyed
+// to the order, to its shipments, and to the daily batches the order was staged into. Retention
+// deletes those rows by age, so that answer has a shelf life — and the guard does not FAIL when its
+// evidence is gone, it returns the confident negative. No rows, no blocker, and the order is
+// HARD-DELETED, leaving a real invoice, COGS journal or batch entry in Xero/QuickBooks with no IMS
+// order behind it. The delete is irreversible and there is no sweep that ever notices. That is the
+// whole of o3d-v7sy.
 //
-//   • `findSalesOrderDeleteBlocker` (lib/domain/sales/order-delete-guard.ts) counts rows keyed to
-//     the order, to its shipments, and to the daily batches the order was staged into. No rows, no
-//     blocker, and the order is HARD-DELETED — leaving a real invoice, COGS journal or batch entry
-//     in Xero/QuickBooks with no IMS order behind it. That is the whole of o3d-v7sy.
+// THE OTHER READER OF THE SAME TABLE IS ALREADY SAFE, AND SAYING SO IS PART OF THE RULE.
+// `dailyBatchRecreateVerdict` (lib/connectors/xero/daily-sync.ts, and the QuickBooks twin) reads its
+// `rows.length === 0` arm as "the journal never posted" and re-raises it — which a deleted SYNCED
+// batch row would turn into a DUPLICATE JOURNAL. It does not, because scjz.36 already bounded the
+// recreate sweep to the same retention window: `recreateJournaledDateFilter`
+// (lib/domain/accounting/daily-batch-retention.ts) restricts its candidates to stage stamps at or
+// after the cutoff, and a batch log is never created BEFORE the date it is staged for, so any log
+// old enough to be deleted (`createdAt < cutoff`) belongs to a stage date the sweep has already
+// excluded. The two bounds are the same `retention_sync_logs_months` setting. So this module is NOT
+// justified by a money reader — it is justified by the hard delete alone, which is enough.
 //
-//   • `dailyBatchRecreateVerdict` (lib/connectors/xero/daily-sync.ts) is the ONLY thing stopping a
-//     re-run of a past-dated daily batch from posting its journal a SECOND time. Its
-//     `rows.length === 0` arm reads "no log at all, so the journal never posted". Retention deleting
-//     the SYNCED batch row hands it exactly that state, and it re-raises a duplicate journal into a
-//     live ledger. This reader WRITES MONEY, and it is the reason this rule is not a nicety.
-//
-// o3d-nepa closed HALF of this, for the CANCELLED rows only: `UNRESOLVED_ABANDONED_CLAIM_WHERE`
-// keeps a cancelled row whose abandonment proves nothing. It named `dailyBatchRecreateVerdict` as
-// the reader that would post a duplicate — and then exempted only the population it was about. A
-// SYNCED batch row, which is the one that says the journal DID post, was left deletable. One rule,
-// two populations, one fixed: this module is the other one.
+// o3d-nepa closed HALF of this table's problem, for the CANCELLED rows only:
+// `UNRESOLVED_ABANDONED_CLAIM_WHERE` keeps a cancelled row whose abandonment proves nothing. The
+// SYNCED row — the one that says the document DID post — was left deletable. One rule, two
+// populations, one fixed: this module is the other one, and it enters the SAME two passes.
 //
 // WHY IT IS KEYED ON THE READER'S OWN REFERENCE TYPES rather than on a list of document types.
 // A type list is a restatement of what the readers happen to look for today, and it drifts the

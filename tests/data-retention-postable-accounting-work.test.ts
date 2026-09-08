@@ -358,8 +358,17 @@ test('the exemption uses the SAME constant the coupon backfill counts on (Codex 
   const { join } = await import('node:path')
   const src = readFileSync(join(process.cwd(), 'lib/data-retention.ts'), 'utf8')
   assert.match(src, /POSTABLE_ACCOUNTING_SYNC_STATUSES/, 'retention imports it rather than restating it')
+  // BOTH ENDS ASSERTED, because `indexOf` answers -1 for a marker that has moved and `slice` reads
+  // -1 as "one before the end" rather than as an error. The end marker used to be
+  // `syncLogsDeleted = wc.count`, which stopped existing when the delete became a two-statement
+  // transaction — so this predicate silently became THE WHOLE FILE FROM THE DELETE ONWARDS, and the
+  // check below stopped being about the delete's own `where` at all (o3d-v7sy).
+  const deleteStart = src.indexOf('db.accountingSyncLog.deleteMany')
+  const deleteEnd = src.indexOf('syncLogsDeleted =', deleteStart)
+  assert.ok(deleteStart >= 0, 'the delete statement is still spelled this way')
+  assert.ok(deleteEnd > deleteStart, 'and the slice really ends at the assignment that closes it')
   assert.doesNotMatch(
-    src.slice(src.indexOf('db.accountingSyncLog.deleteMany'), src.indexOf('syncLogsDeleted = wc.count')),
+    src.slice(deleteStart, deleteEnd),
     /'PROCESSING'/,
     'and does not spell the statuses out locally',
   )
@@ -530,17 +539,20 @@ test('[o3d-nepa round 4] an operator settlement that NAMES a document is still k
 })
 
 // ---------------------------------------------------------------------------
-// o3d-v7sy — THE DELETE GUARD'S (AND THE BATCH VERDICT'S) EVIDENCE AGED OUT.
+// o3d-v7sy — THE DELETE GUARD'S EVIDENCE AGED OUT.
 //
-// Two readers answer "does an external document already stand against this order?" entirely from
-// this table, and neither FAILS when its rows are gone — each returns the confident negative:
+// findSalesOrderDeleteBlocker answers "does an external document already stand against this order?"
+// entirely from this table, and it does not FAIL when its rows are gone — it returns the confident
+// negative and permits an IRREVERSIBLE hard delete, stranding the document.
 //
-//   • findSalesOrderDeleteBlocker permits an IRREVERSIBLE hard delete, stranding the document;
-//   • dailyBatchRecreateVerdict takes its `rows.length === 0` arm and POSTS THE JOURNAL AGAIN.
+// The batch verdict is NOT a second victim here, and the tests below do not claim it is: scjz.36
+// already bounds `recreateMissingDailyBatchLogs` to the same retention window, so a log old enough
+// to be purged belongs to a stage date the sweep has already excluded. See the header of
+// lib/domain/accounting/external-document-evidence.ts for why that bound holds in the right
+// direction. The delete guard alone is the whole justification.
 //
-// o3d-nepa closed this for CANCELLED rows and named that second reader while doing it. The SYNCED
-// row — the one that says the document DID post — was left deletable. Same rule, two populations,
-// one fixed.
+// o3d-nepa closed this for CANCELLED rows. The SYNCED row — the one that says the document DID post
+// — was left deletable. Same rule, two populations, one fixed.
 // ---------------------------------------------------------------------------
 
 test('[o3d-v7sy] a posted DAILY BATCH journal survives the purge — it is the only proof the batch ran', async () => {
@@ -566,8 +578,9 @@ test('[o3d-v7sy] a posted DAILY BATCH journal survives the purge — it is the o
   assert.ok(kept, 'the batch row survives the age-based delete')
   assert.equal(result.backReferenceEvidenceCompacted, 1, 'and is compacted rather than retained whole')
   assert.deepEqual(kept.payload, {}, 'so the journal lines still expire on the promised schedule')
-  // EXACTLY the columns dailyBatchRecreateVerdict selects. It reads no others and no payload, so
-  // the tombstone is a complete answer for it — that is what makes compaction safe here.
+  // EXACTLY the columns the delete guard's batch query and dailyBatchRecreateVerdict select between
+  // them. Neither reads the payload, so the tombstone is a complete answer for both — that is what
+  // makes COMPACTING rather than retaining whole the right shape here.
   assert.equal(kept.status, 'SYNCED')
   assert.equal(kept.externalTransactionId, 'XERO-JOURNAL-42')
   assert.equal(kept.abandonedBeforeRemoteCall ?? null, null)
@@ -597,31 +610,47 @@ test('[o3d-v7sy] a posted SHIPMENT-keyed document survives — a COGS journal ha
   assert.deepEqual(kept.payload, {}, 'compacted, not retained whole')
 })
 
-test('[o3d-v7sy] a CANCELLED order-keyed row that still NAMES a document survives too', async () => {
-  // The status filter cannot come first, which is why the exemption is "SYNCED **or** carries an
-  // id". Xero reverts an already-posted row to PENDING when a follow-up fails, KEEPING the external
-  // id, and the orphan sweep can then cancel it — a row whose document is real and whose status
-  // says nothing of the sort. The delete guard matches it on the id alone.
-  const purgeExpiredData = await loadPurge()
-  seed()
-  store.accounting.push({
+test('[o3d-v7sy] the "or carries a document id" arm is real, and is NOT what keeps such a row today', async () => {
+  // WHY THIS IS ASSERTED AGAINST THE CONSTANT AND NOT THROUGH THE PURGE.
+  //
+  // The exemption is "SYNCED **or** carries an id" because the status filter cannot come first:
+  // Xero reverts an already-posted row to PENDING when a follow-up fails, KEEPING the external id,
+  // and the orphan sweep can then cancel it — a row whose document is real and whose status says
+  // nothing of the sort. The delete guard matches it on the id alone.
+  //
+  // But a CANCELLED row naming a document ALREADY survives `purgeExpiredData`, and did before this
+  // rule existed: it is the FIRST arm of o3d-nepa's UNRESOLVED_ABANDONED_CLAIM_WHERE ("the row names
+  // a document the ledger returned, which outranks every resolution below"). An end-to-end test of
+  // that row would therefore pass with this whole module deleted — it would prove nepa, not v7sy.
+  // The first draft of this file contained exactly that test, asserting the opposite of what the
+  // nepa rule says, and it passed for the wrong reason.
+  //
+  // So the arm is tested where it is the only thing answering: on the predicate itself. It is
+  // redundant with nepa for the CANCELLED case and stated anyway, because this rule has to be
+  // complete on its own — nepa's clause is about ABANDONMENT and could be narrowed to non-posted
+  // rows without anyone noticing it was also carrying this.
+  const { EXTERNAL_DOCUMENT_EVIDENCE_WHERE } = await import(
+    '@/lib/domain/accounting/external-document-evidence'
+  )
+  const cancelledButPosted: SyncRow = {
     id: 'cancelled-but-posted',
     createdAt: OLD,
     status: 'CANCELLED',
     type: 'SALES_INVOICE',
     referenceType: 'SalesOrder',
-    // RESOLVED as far as o3d-nepa is concerned — the orphan sweep proved it pre-call — so nepa's
-    // clause releases it. This one does not, because the id outranks the flag.
     abandonedBeforeRemoteCall: true,
     externalTransactionId: 'XERO-INV-5',
     payload: { customer: 'A Person' },
-  })
-
-  await purgeExpiredData()
-
-  assert.ok(
-    store.accounting.some((row) => row.id === 'cancelled-but-posted'),
+  }
+  assert.equal(
+    matches(cancelledButPosted, EXTERNAL_DOCUMENT_EVIDENCE_WHERE as Where),
+    true,
     'an abandonment written over a document id does not undo the document',
+  )
+  assert.equal(
+    matches({ ...cancelledButPosted, externalTransactionId: null }, EXTERNAL_DOCUMENT_EVIDENCE_WHERE as Where),
+    false,
+    'and with the id gone the same row is outside this rule entirely — the arm is load-bearing',
   )
 })
 
