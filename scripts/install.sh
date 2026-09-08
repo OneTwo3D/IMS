@@ -6907,7 +6907,7 @@ release_db_connections() {
     # would be a guard that can never fire -- and this branch has spent two rounds on exactly that
     # shape of thing.
     if [[ "${#witness_argv[@]}" -gt 0 && -z "${clear_server}" ]]; then
-      error "The connection fence WAS released -- CONNECT is restored -- and its record at ${DB_FENCE_STATE} has NOT been removed. A challenge WAS put to this run's witness and the release's own connection could not see it, so nothing here can show that the server just released is the server that was fenced. The next run reads that file as a STANDING FENCE. End it with ${DB_FENCE_RELEASE_CMD}, which asks you to confirm at your terminal."
+      error "The connection fence WAS released -- CONNECT is restored -- and its record at ${DB_FENCE_STATE} was deliberately NOT removed. A challenge WAS put to this run's witness and the release's own connection could not see it, so nothing here can show that the server just released is the server that was fenced. The next run reads that file as a STANDING FENCE. End it with ${DB_FENCE_RELEASE_CMD}, which asks you to confirm at your terminal."
       return 1
     fi
     # AND A RUN THAT ALREADY KNOWS THE RECORD IS BEING KEPT DOES NOT ASK (o3d-secops r33, Codex
@@ -9127,9 +9127,10 @@ pin_migration_window "The seed"
 [[ "${seed_rc}" -eq 0 ]] || die "The database seed exited ${seed_rc} — see above. Nothing has been started."
 success "Database seed applied."
 
-# DECLARED OUTSIDE THE BRANCH, because the closing gate below reads it whether or not this
+# DECLARED OUTSIDE THE BRANCH, because the closing gate below reads them whether or not this
 # branch ran (o3d-secops r34, Codex HIGH 2), and `set -u` would kill the run otherwise.
 bootstrap_rc=0
+bootstrap_ran=0
 if [[ -n "${DEFAULT_ADMIN_EMAIL}" || -n "${SMTP_HOST}" || -n "${SMTP_FROM_EMAIL}" || -n "${APP_DOMAIN}" || -n "${WC_STORE_URL}" ]]; then
   header "Bootstrapping default admin and seeded settings"
   BOOTSTRAP_SCRIPT="${APP_DIR}/scripts/provision-instance.mjs"
@@ -9155,9 +9156,10 @@ if [[ -n "${DEFAULT_ADMIN_EMAIL}" || -n "${SMTP_HOST}" || -n "${SMTP_FROM_EMAIL}
     WC_CONSUMER_KEY="${WC_CONSUMER_KEY}" \
     WC_CONSUMER_SECRET="${WC_CONSUMER_SECRET}" \
     node "${BOOTSTRAP_SCRIPT}" || bootstrap_rc=$?
-  # ITS PLACEMENT IS THE CLOSING GATE BELOW, so the status is carried past the `fi` and
-  # propagated after it (o3d-secops r34, Codex HIGH 2).
-  [[ "${bootstrap_rc}" -ne 0 ]] || success "Bootstrap configuration complete."
+  # ITS PLACEMENT IS THE CLOSING GATE BELOW (o3d-secops r34, Codex HIGH 2), so the status is
+  # carried past the `fi` and BOTH the refusal and the success line come after it: a
+  # bootstrap the gate is about to refuse must not have been reported complete first.
+  bootstrap_ran=1
 fi
 
 # AND ONLY NOW IS IT ASKED WHERE ALL OF THAT LANDED (o3d-secops r32, Codex HIGH 2 / o3d-mzcp;
@@ -9185,6 +9187,7 @@ fi
 # to another cluster.
 require_migration_landed_on_fenced_server
 [[ "${bootstrap_rc}" -eq 0 ]] || die "The bootstrap of the default administrator and the seeded settings exited ${bootstrap_rc} — see above. Nothing has been started."
+if [[ "${bootstrap_ran}" == "1" ]]; then success "Bootstrap configuration complete."; fi
 
 # The build does NOT live here any more (o3d-2sm1.5, Codex r4 CRITICAL). It ran above,
 # before the stop, with the existing installation still serving the old schema — which is

@@ -2484,6 +2484,70 @@ function callContinuation(lines: string[], index: number): string {
   return text
 }
 
+/** The 1-based index of the last physical line of the logical statement starting at `index`. */
+function statementEnd(lines: string[], index: number): number {
+  let cursor = index
+  while (/\\\s*$/.test(lines[cursor]) && cursor + 1 < lines.length) cursor += 1
+  return cursor
+}
+
+/**
+ * WHERE A CONSUMER'S NON-ZERO EXIT ENDS UP (o3d-secops r34, Codex HIGH 2).
+ *
+ * Two shapes are allowed and they are not interchangeable, which is the whole finding:
+ *
+ *   direct    `... || die "..."`. The step dies where it stands. Correct only for a step that has
+ *             NO placement after it, because a `die` before the pin is exactly how r33's chain
+ *             came apart -- a redirected consumer partially applied DDL, exited non-zero, and its
+ *             placement never ran.
+ *   captured  `... || <name>=$?`, and the FIRST read of `<name>` anywhere below is a fatal
+ *             propagation: `[[ "${name}" -eq 0 ]] || die` or `if [[ "${name}" -ne 0 ]]; then ...
+ *             die ... fi`. "First read" is the load-bearing word. A capture whose status is read
+ *             once to print something and only later to die would be a status that had already
+ *             licensed a message, and a capture never read at all is `|| true` wearing a variable.
+ *
+ * Anything else -- `|| true`, `|| warn`, a bare statement under `set -e`, a capture nobody reads
+ * -- is reported as `none`, and every caller treats that as a failure.
+ */
+function consumerFailureDisposition(lines: string[], index: number): {
+  shape: 'direct' | 'captured' | 'none'
+  status: string | null
+  detail: string
+} {
+  const continuation = callContinuation(lines, index)
+  if (/\|\|\s*(\\\s*\n\s*)?(true|:|warn|info|success|echo)\b/.test(continuation)) {
+    return { shape: 'none', status: null, detail: `a no-op continuation swallows the failure:\n${continuation}` }
+  }
+  if (/\|\|\s*(\\\s*\n\s*)?die\b/.test(continuation)) {
+    return { shape: 'direct', status: null, detail: continuation }
+  }
+  const capture = /\|\|\s*(?:\\\s*\n\s*)?([A-Za-z_][A-Za-z0-9_]*)=\$\?\s*$/.exec(continuation)
+  if (!capture) {
+    return { shape: 'none', status: null, detail: `neither a die nor a captured status:\n${continuation}` }
+  }
+  const status = capture[1]
+  const reference = new RegExp(`\\$\\{?${status}\\}?\\b`)
+  for (let cursor = statementEnd(lines, index) + 1; cursor < lines.length; cursor += 1) {
+    const line = lines[cursor]
+    if (/^\s*#/.test(line) || !reference.test(line)) continue
+    // The first read. It must be the fatal one, in one of the two shapes the entrypoints use.
+    if (new RegExp(`\\[\\[\\s*"\\$\\{?${status}\\}?"\\s+-eq\\s+0\\s*\\]\\]\\s*\\|\\|\\s*die\\b`).test(line)) {
+      return { shape: 'captured', status, detail: line.trim() }
+    }
+    if (new RegExp(`^\\s*if\\s+\\[\\[\\s*"\\$\\{?${status}\\}?"\\s+-ne\\s+0\\s*\\]\\]\\s*;\\s*then\\s*$`).test(line)) {
+      const body = lines.slice(cursor + 1, cursor + 8)
+      const fi = body.findIndex((entry) => /^\s*fi\s*$/.test(entry))
+      const guarded = fi === -1 ? body : body.slice(0, fi)
+      if (guarded.some((entry) => /(^|\s)die\b/.test(entry))) {
+        return { shape: 'captured', status, detail: [line, ...guarded].join('\n').trim() }
+      }
+      return { shape: 'none', status, detail: `the first read of ${status} branches but never dies:\n${[line, ...guarded].join('\n')}` }
+    }
+    return { shape: 'none', status, detail: `the first read of ${status} is not a fatal propagation:\n${line.trim()}` }
+  }
+  return { shape: 'none', status, detail: `${status} is captured and never read` }
+}
+
 for (const [name, lines, startPattern] of [
   ['deploy.sh', DEPLOY_LINES, /systemctl start|npm start/],
   ['update.sh', UPDATE_LINES, /systemctl start/],
@@ -2513,16 +2577,18 @@ for (const [name, lines, startPattern] of [
   test(`${name} STOPS when the application role cannot use the schema, rather than noting it`, () => {
     const call = realCodeLine(lines, OBJECT_ACCESS_INVOCATION)
     assert.notEqual(call, -1)
-    const continuation = callContinuation(lines, call)
 
-    assert.match(
-      continuation,
-      /\|\|\s*(\\\s*\n\s*)?die\b/,
-      'a schema the application cannot use must `die`; `|| true` was a mutation this file passed',
-    )
-    assert.ok(
-      !/\|\|\s*(true|:|warn|info|success|echo)\b/.test(continuation),
-      'and the guard must not be satisfied by a no-op continuation',
+    // THE SUBJECT IS UNCHANGED AND THE SHAPE IS WIDER (o3d-secops r34, Codex HIGH 2). This used to
+    // require `|| die` ON THE CALL, and r34 had to take that away: a `die` before the step's pin
+    // is precisely how a consumer that moved schema and then failed escaped its placement. What
+    // must still hold is that the failure is FATAL, so the two shapes are spelled out in
+    // consumerFailureDisposition() and `|| true`, `|| warn` and a captured-but-unread status are
+    // all still `none` -- the mutation this file used to name still fails it.
+    const disposition = consumerFailureDisposition(lines, call)
+    assert.notEqual(
+      disposition.shape,
+      'none',
+      `a schema the application cannot use must reach a \`die\`; \`|| true\` was a mutation this file passed: ${disposition.detail}`,
     )
   })
 
@@ -13800,60 +13866,230 @@ for (const entry of FENCE_HARNESS) {
 // ---------------------------------------------------------------------------
 
 /**
- * The steps in one entrypoint that hand a process the migration connection string, in file order,
- * with the placement that follows each one.
+ * THE CENSUS KEYS ON THE URL ITSELF, NOT ON THE FORMS IT HAS BEEN SPELLED IN SO FAR
+ * (o3d-secops r34, Codex MEDIUM).
  *
- * TOP LEVEL ONLY, and that exclusion is the interesting half. `db_fence_migration_helper()`,
- * `as_app_user_db()` and the fence's own probes all name ${MIGRATION_DATABASE_URL} too -- they are
- * the MECHANISM that hands it over and the mechanism that places it, not steps that consume it.
- * Function bodies are skipped by tracking the `name() {` ... `}` blocks these scripts are written
- * in, so a consumer moved INTO a helper would leave the census rather than silently passing it.
+ * THE FINDING. r33 replaced a comment with a census, and the census was three regexes:
+ * `DATABASE_URL="${MIGRATION_DATABASE_URL}"`, `pg_dump "${MIGRATION_DATABASE_URL}"` and
+ * `as_app_user_db `. A new top-level step written any other way -- `psql "$MIGRATION_DATABASE_URL"`,
+ * an unquoted assignment, a command handed the URL through a name it was copied into -- matched
+ * none of them, changed neither the detected list nor the expected list, and passed the census
+ * exactly as before. A list of forms is a list; it was the same shape of thing as the comment it
+ * replaced.
+ *
+ * SO IT KEYS ON THE THING. Any top-level statement that references ${MIGRATION_DATABASE_URL} AT
+ * ALL, however spelled, is a database consumer that must be placed -- UNLESS it is explicitly
+ * classified as one of three other things, and each of those has to earn it:
+ *
+ *   assignment   the statement is ENTIRELY `MIGRATION_DATABASE_URL=<value>` with no command
+ *                substitution in it. It sets the name; it hands nothing to a process. An
+ *                assignment whose value comes out of `$( ... )` DOES run a process and is a
+ *                consumer.
+ *   alias        the statement is ENTIRELY `SOME_NAME=<the URL>`, again with no command
+ *                substitution. It hands nothing over either -- but SOME_NAME now carries the URL,
+ *                so every later statement that mentions it is a reference in its own right. This
+ *                is the indirection Codex named, and it is closed rather than described.
+ *   mechanism    a call to one of the fence's own functions, named in MIGRATION_URL_MECHANISMS
+ *                below. These are what RAISES, MOVES and PLACES the URL rather than steps that
+ *                consume it, and every name in that table is checked to be a real function that
+ *                really does touch the URL, so a stale entry cannot silently excuse a consumer.
+ *
+ * AND FUNCTIONS ARE FOLLOWED, ONE HOP AND THEN TO A FIXPOINT. A helper whose body names the URL --
+ * `as_app_user_db()` is the shipped example, and any future one is the interesting case -- makes
+ * every top-level CALL to it a reference, so moving a consumer into a helper does not remove it
+ * from the census. Function bodies are read from the entrypoint AND from the fence library it
+ * sources, so a consumer added to lib/db-fence-protected.sh and called from the top level of an
+ * entrypoint is caught too.
+ *
+ * WHAT STILL ESCAPES IT, said plainly rather than papered over:
+ *
+ *   - A NAME COMPUTED AT RUNTIME. `eval`, `${!ref}`, `declare -n`, or a command built by string
+ *     concatenation. This walk is textual; a name that does not exist until the shell runs cannot
+ *     be followed by reading the file, and nothing short of running the entrypoint would find it.
+ *   - THE ENVIRONMENT. If the URL were EXPORTED, a later process would inherit it without any
+ *     statement naming it. No entrypoint exports it today -- every consumer is handed it as an
+ *     `env NAME=value` prefix -- and that is the property this leans on rather than checks.
+ *   - A CONSUMER INSIDE A FUNCTION THAT NEVER NAMES THE URL, reaching the database some other way
+ *     (a `.env` file, a hard-coded string). It would not be a consumer of the MIGRATION url, which
+ *     is what the fence and the pins are about, but it would still be a database consumer.
+ *
+ * MUTATION ROUTE (all made against the shipped files and reverted): add `psql
+ * "$MIGRATION_DATABASE_URL" -c 'select 1'` below the closing gate in install.sh -- the classified
+ * list gains an entry and the gate stops being the last placement, and the r33 census saw nothing.
+ * Add `MIGRATION_URL_COPY=$MIGRATION_DATABASE_URL` and then `node x.mjs "$MIGRATION_URL_COPY"` --
+ * the alias is classified and the command below it is an unplaced consumer. Move
+ * `require_migration_landed_on_fenced_server` in install.sh back above `header "Seeding
+ * database"` -- the seed and the bootstrap then trail the last placement. Delete any single
+ * `pin_migration_window` line -- the consumer above it becomes unplaced. Change any consumer's
+ * `|| <name>_rc=$?` back to `|| die` -- the r34 disposition rule fails naming that step.
  */
-function migrationConsumerCensus(source: string): Array<{ step: string; placedBy: string | null }> {
-  // ONE ENTRY PER LOGICAL STATEMENT, not per physical line. Every one of these steps is written as
-  // `run_as_user ... env \` / `DATABASE_URL=... \` / `node <script>`, so a scan that read physical
-  // lines would find the string on one line and the script's name on another -- and a label taken
-  // from "the next few lines" reads the COMMENT ABOVE THE NEXT STEP, which is how the first draft
-  // of this census reported a pg_dump in deploy.sh, which has none.
-  const logical: Array<{ text: string; raw: string }> = []
-  let buffer = ''
-  let opener = ''
-  for (const raw of source.split('\n')) {
-    const line = raw.trim()
-    if (buffer === '') opener = raw
-    buffer = buffer === '' ? line : `${buffer} ${line}`
-    if (/\\$/.test(line)) { buffer = buffer.replace(/\\$/, '') ; continue }
-    logical.push({ text: buffer, raw: opener })
-    buffer = ''
-  }
-  if (buffer !== '') logical.push({ text: buffer, raw: opener })
 
-  const out: Array<{ step: string; placedBy: string | null }> = []
-  let depth = 0
-  let pending: string | null = null
-  const push = (placedBy: string | null) => {
-    if (pending !== null) { out.push({ step: pending, placedBy }); pending = null }
+/**
+ * The fence's own machinery: what raises, moves, holds and places the migration URL. Every name is
+ * asserted below to be a function that really does reference the URL, in the entrypoint or in the
+ * library it sources, so this table cannot become a place to hide a step.
+ */
+const MIGRATION_URL_MECHANISMS: ReadonlyArray<string> = [
+  'fence_db_connections',
+  'release_db_connections',
+  'refence_db_connections',
+  'adopt_db_connections',
+  'adopt_existing_fence',
+  'resume_from_interrupted_arming',
+]
+
+type CensusEntry = {
+  kind: 'consumer' | 'assignment' | 'alias' | 'mechanism' | 'placement'
+  label: string
+  step: string
+  line: number
+  placedBy: string | null
+}
+
+/** Every function defined in `source`, as name -> body text of its logical statements. */
+function shellFunctionBodies(source: string): Map<string, string> {
+  const bodies = new Map<string, string>()
+  let name: string | null = null
+  let body: string[] = []
+  for (const raw of source.split('\n')) {
+    if (name === null) {
+      const opens = /^([a-z_][a-z0-9_]*)\(\)\s*\{$/.exec(raw)
+      if (opens) { name = opens[1]; body = [] }
+      continue
+    }
+    if (raw === '}') { bodies.set(name, body.join('\n')); name = null; continue }
+    body.push(raw)
   }
-  for (const { text, raw } of logical) {
+  return bodies
+}
+
+/** The names of functions that reach ${MIGRATION_DATABASE_URL}, directly or through each other. */
+function migrationUrlCarriers(sources: ReadonlyArray<string>): Set<string> {
+  const bodies = new Map<string, string>()
+  for (const source of sources) for (const [name, body] of shellFunctionBodies(source)) bodies.set(name, body)
+  const carriers = new Set<string>()
+  for (const [name, body] of bodies) if (/\bMIGRATION_DATABASE_URL\b/.test(body)) carriers.add(name)
+  // To a fixpoint: a helper that calls a carrier carries it too.
+  for (;;) {
+    let grew = false
+    for (const [name, body] of bodies) {
+      if (carriers.has(name)) continue
+      for (const carrier of carriers) {
+        if (new RegExp(`(^|[\\s;(&|!])${carrier}(\\s|$|\\))`, 'm').test(body)) { carriers.add(name); grew = true; break }
+      }
+    }
+    if (!grew) break
+  }
+  return carriers
+}
+
+/**
+ * Every TOP-LEVEL statement of one entrypoint that references the migration URL, classified, in
+ * file order, with the placement that follows each consumer.
+ *
+ * ONE ENTRY PER LOGICAL STATEMENT, not per physical line. Every one of these steps is written as
+ * `run_as_user ... env \` / `DATABASE_URL=... \` / `node <script>`, so a scan that read physical
+ * lines would find the string on one line and the script's name on another -- and a label taken
+ * from "the next few lines" reads the COMMENT ABOVE THE NEXT STEP, which is how the first draft of
+ * this census reported a pg_dump in deploy.sh, which has none.
+ *
+ * TOP LEVEL ONLY. Function bodies are skipped by tracking the `name() {` ... `}` blocks these
+ * scripts are written in -- but a call to a function that carries the URL is itself a reference,
+ * so a consumer moved into a helper stays in the census instead of leaving it.
+ */
+function migrationConsumerCensus(lines: ReadonlyArray<string>, carriers: ReadonlySet<string>): CensusEntry[] {
+  const logical: Array<{ text: string; line: number }> = []
+  let buffer = ''
+  let opener = 0
+  lines.forEach((raw, index) => {
+    const line = raw.trim()
+    if (buffer === '') opener = index
+    buffer = buffer === '' ? line : `${buffer} ${line}`
+    if (/\\$/.test(line)) { buffer = buffer.replace(/\\$/, ''); return }
+    logical.push({ text: buffer, line: opener })
+    buffer = ''
+  })
+  if (buffer !== '') logical.push({ text: buffer, line: opener })
+
+  const out: CensusEntry[] = []
+  const aliases = new Set<string>()
+  let depth = 0
+  let pending: CensusEntry | null = null
+  const place = (placedBy: string | null) => {
+    if (pending !== null) { pending.placedBy = placedBy; out.push(pending); pending = null }
+  }
+  for (const { text, line } of logical) {
+    const raw = lines[line]
     // The brace convention these scripts are written in, matched on the RAW line so that a `}`
     // inside a heredoc cannot close a function this walk thinks it is inside.
     if (/^[a-z_][a-z0-9_]*\(\)\s*\{$/.test(raw)) { depth += 1; continue }
     if (depth > 0) { if (raw === '}') depth -= 1; continue }
     if (text.startsWith('#')) continue
-    if (/^pin_migration_window /.test(text)) { push('pin'); continue }
-    if (/^require_migration_landed_on_fenced_server$/.test(text)) { push('gate'); continue }
-    const hands = /DATABASE_URL="\$\{?MIGRATION_DATABASE_URL\}?"/.test(text)
-      || /(^|[!\s])pg_dump "\$\{MIGRATION_DATABASE_URL\}"/.test(text)
-      || /(^|[!\s])as_app_user_db /.test(text)
-    if (!hands) continue
-    push(null)
-    pending = text
+
+    const pin = /^pin_migration_window (.*)$/.exec(text)
+    if (pin) {
+      place('pin')
+      out.push({ kind: 'placement', label: `pin ${pin[1]}`, step: text, line, placedBy: null })
+      continue
+    }
+    if (/^require_migration_landed_on_fenced_server$/.test(text)) {
+      place('gate')
+      out.push({ kind: 'placement', label: 'gate', step: text, line, placedBy: null })
+      continue
+    }
+
+    const word = /^([A-Za-z_][A-Za-z0-9_]*)/.exec(text)?.[1] ?? ''
+    const mentions = (name: string) => new RegExp(`(^|[^A-Za-z0-9_])\\$\\{?${name}\\}?([^A-Za-z0-9_]|$)`).test(text)
+      || new RegExp(`(^|[\\s;(&|!])${name}(\\s|=|$|\\))`).test(text)
+    const references = /\bMIGRATION_DATABASE_URL\b/.test(text)
+      || [...aliases].some(mentions)
+      || [...carriers].some((name) => new RegExp(`(^|[\\s;(&|!])${name}(\\s|$|\\))`).test(text))
+    if (!references) continue
+
+    // A WHOLE-STATEMENT ASSIGNMENT, and nothing that merely BEGINS with one. `DATABASE_URL="..."
+    // node x` is an `env`-style prefix on a command and is a consumer; `NAME="..."` on its own is
+    // not. Command substitution anywhere in the value makes it a consumer either way, because
+    // `$( ... )` runs a process with that value in hand.
+    const assignment = /^([A-Za-z_][A-Za-z0-9_]*)=("[^"]*"|'[^']*'|\S*)$/.exec(text)
+    if (assignment && !/\$\(/.test(text)) {
+      const [, name] = assignment
+      if (name === 'MIGRATION_DATABASE_URL') {
+        place(null)
+        out.push({ kind: 'assignment', label: 'MIGRATION_DATABASE_URL=', step: text, line, placedBy: null })
+      } else {
+        aliases.add(name)
+        place(null)
+        out.push({ kind: 'alias', label: `alias:${name}`, step: text, line, placedBy: null })
+      }
+      continue
+    }
+
+    if (MIGRATION_URL_MECHANISMS.includes(word)) {
+      place(null)
+      out.push({ kind: 'mechanism', label: word, step: text, line, placedBy: null })
+      continue
+    }
+
+    // AN EXIT TRAP IS A REGISTRATION, NOT A STEP. `trap on_cutover_exit EXIT` names a handler that
+    // reaches the URL -- which is why it is in this census at all -- but it runs nothing now, and
+    // there is nothing for a pin to place. It is classified rather than excused: the handler has to
+    // BE a carrier, and the whole statement is spelled out in the expected list below, so a trap
+    // that started calling something else fails here.
+    const trapped = /^trap ([A-Za-z_][A-Za-z0-9_]*) ([A-Z]+)$/.exec(text)
+    if (trapped && carriers.has(trapped[1])) {
+      place(null)
+      out.push({ kind: 'mechanism', label: text, step: text, line, placedBy: null })
+      continue
+    }
+
+    place(null)
+    pending = { kind: 'consumer', label: labelFor(text), step: text, line, placedBy: null }
   }
-  push(null)
+  place(null)
   return out
 }
 
-/** What each census entry is called in the assertions below, so a failure names a step. */
+/** What each consumer is called in the assertions below, so a failure names a step. */
 const CONSUMER_LABELS: ReadonlyArray<[RegExp, string]> = [
   [/prisma generate/, 'prisma generate'],
   [/npm run build/, 'npm run build'],
@@ -13874,44 +14110,134 @@ const labelFor = (step: string): string => {
   return step
 }
 
-for (const [name, source, expected] of [
-  ['install.sh', INSTALL_SOURCE, [
+const FENCE_LIB_SOURCE = readFileSync(join(process.cwd(), 'scripts/lib/db-fence-protected.sh'), 'utf8')
+
+for (const [name, lines, expectedConsumers, expectedClassified] of [
+  ['install.sh', INSTALL_LINES, [
     'prisma generate', 'npm run build',
     'check-db-writers.mjs', 'prisma migrate deploy', 'check-prisma-drift.mjs',
     'check-app-db-object-access.mjs', 'run-migration-verifications.mjs',
     'db:seed', 'provision-instance.mjs',
+  ], [
+    'assignment:MIGRATION_DATABASE_URL=',
+    'assignment:MIGRATION_DATABASE_URL=',
+    'mechanism:trap on_cutover_exit EXIT',
+    'mechanism:adopt_existing_fence',
+    'consumer:prisma generate', 'placement:pin "The Prisma client generation"',
+    'consumer:npm run build', 'placement:pin "The build"',
+    'mechanism:fence_db_connections',
+    'consumer:check-db-writers.mjs', 'placement:pin "The drain probe"',
+    'consumer:prisma migrate deploy', 'placement:pin "The migration"',
+    'consumer:check-prisma-drift.mjs', 'placement:pin "The drift check"',
+    'consumer:check-app-db-object-access.mjs', 'placement:pin "The object-access check"',
+    'consumer:run-migration-verifications.mjs', 'placement:pin "The verification hook"',
+    'consumer:db:seed', 'placement:pin "The seed"',
+    'consumer:provision-instance.mjs', 'placement:gate',
+    'mechanism:release_db_connections',
   ]],
-  ['update.sh', UPDATE_LINES.join('\n'), [
+  ['update.sh', UPDATE_LINES, [
     'prisma generate', 'npm run build',
     'check-db-writers.mjs', 'pg_dump', 'prisma migrate deploy', 'check-prisma-drift.mjs',
     'check-app-db-object-access.mjs', 'run-migration-verifications.mjs',
+  ], [
+    'assignment:MIGRATION_DATABASE_URL=',
+    'mechanism:trap on_exit EXIT',
+    'mechanism:resume_from_interrupted_arming',
+    'mechanism:adopt_db_connections',
+    'mechanism:release_db_connections',
+    'consumer:prisma generate', 'placement:pin "The Prisma client generation"',
+    'consumer:npm run build', 'placement:pin "The build"',
+    'mechanism:fence_db_connections',
+    'consumer:check-db-writers.mjs', 'placement:pin "The drain probe"',
+    'consumer:pg_dump', 'placement:pin "The pre-migration backup"',
+    'consumer:prisma migrate deploy', 'placement:pin "The migration"',
+    'consumer:check-prisma-drift.mjs', 'placement:pin "The drift check"',
+    'consumer:check-app-db-object-access.mjs', 'placement:pin "The object-access check"',
+    'consumer:run-migration-verifications.mjs', 'placement:gate',
+    'mechanism:release_db_connections',
   ]],
-  ['deploy.sh', DEPLOY_LINES.join('\n'), [
+  ['deploy.sh', DEPLOY_LINES, [
     'npm run build', 'check-wms-push-state-enum.mjs',
     'check-db-writers.mjs', 'prisma migrate deploy', 'check-prisma-drift.mjs',
     'check-app-db-object-access.mjs', 'run-migration-verifications.mjs',
+  ], [
+    'assignment:MIGRATION_DATABASE_URL=',
+    'mechanism:trap on_exit EXIT',
+    'mechanism:resume_from_interrupted_arming',
+    'mechanism:adopt_db_connections',
+    'mechanism:release_db_connections',
+    'consumer:npm run build', 'placement:pin "The build"',
+    'consumer:check-wms-push-state-enum.mjs', 'placement:pin "The WMS push-state vocabulary check"',
+    'mechanism:fence_db_connections',
+    'consumer:check-db-writers.mjs', 'placement:pin "The drain probe"',
+    'consumer:prisma migrate deploy', 'placement:pin "The migration"',
+    'consumer:check-prisma-drift.mjs', 'placement:pin "The drift check"',
+    'consumer:check-app-db-object-access.mjs', 'placement:pin "The object-access check"',
+    'consumer:run-migration-verifications.mjs', 'placement:gate',
+    'mechanism:release_db_connections',
   ]],
-] as ReadonlyArray<[string, string, string[]]>) {
-  test(`${name}: every step handed the migration URL is placed, and the closing gate is below the last of them (o3d-secops r33, Codex HIGH 1)`, () => {
-    const census = migrationConsumerCensus(source)
-    const labelled = census.map((entry) => ({ ...entry, label: labelFor(entry.step) }))
+] as ReadonlyArray<[string, string[], string[], string[]]>) {
+  test(`${name}: every top-level reference to the migration URL is classified, and every consumer is placed (o3d-secops r34, Codex MEDIUM)`, () => {
+    const carriers = migrationUrlCarriers([lines.join('\n'), FENCE_LIB_SOURCE])
+    const census = migrationConsumerCensus(lines, carriers)
+
+    // THE MECHANISM TABLE CANNOT BE A HIDING PLACE. Every name this file classified as mechanism
+    // must be a real function that really does reach the URL; a renamed or invented one fails here
+    // rather than quietly excusing a step from its placement.
+    for (const entry of census.filter((row) => row.kind === 'mechanism')) {
+      const handler = /^trap ([A-Za-z_][A-Za-z0-9_]*) /.exec(entry.label)?.[1] ?? entry.label
+      assert.ok(carriers.has(handler),
+        `${entry.label} is classified as fence machinery but is not a function that touches the migration URL:\n${entry.step}`)
+    }
 
     // THE WALK REACHED THE FILE. A census that found nothing would pass every rule below.
-    assert.ok(labelled.length >= 7,
-      `precondition: the walk must find the entrypoint's consumers, not an empty file:\n${JSON.stringify(labelled, null, 2)}`)
-    assert.deepEqual(labelled.map((entry) => entry.label), expected,
-      `the consumers of the migration URL, in file order, are not what this entrypoint was last read to have:\n${JSON.stringify(labelled, null, 2)}`)
+    assert.ok(census.length >= 15,
+      `precondition: the walk must find this entrypoint's references, not an empty file:\n${JSON.stringify(census, null, 2)}`)
+    assert.ok(carriers.has('pin_migration_window') && carriers.size >= 8,
+      `precondition: function bodies must have been read, or nothing is being followed:\n${[...carriers].join(', ')}`)
 
-    const unplaced = labelled.filter((entry) => entry.placedBy === null)
-    assert.deepEqual(unplaced.map((entry) => entry.label), [],
+    // EVERY TOP-LEVEL REFERENCE, CLASSIFIED, IN FILE ORDER. This is the fail-closed half: a step
+    // added in ANY spelling changes this list, whatever regex it would or would not have matched.
+    assert.deepEqual(census.map((row) => `${row.kind}:${row.label}`), expectedClassified,
+      `the top-level references to the migration URL are not what this entrypoint was last read to have:\n${JSON.stringify(census, null, 2)}`)
+
+    const consumers = census.filter((row) => row.kind === 'consumer')
+    assert.deepEqual(consumers.map((row) => row.label), expectedConsumers,
+      `the consumers of the migration URL, in file order, are not what this entrypoint was last read to have:\n${JSON.stringify(consumers, null, 2)}`)
+
+    const unplaced = consumers.filter((row) => row.placedBy === null)
+    assert.deepEqual(unplaced.map((row) => row.label), [],
       `every step handed the migration URL must be followed by a pin or by the closing gate before the next one begins; these are not:\n${JSON.stringify(unplaced, null, 2)}`)
 
     // AND THE GATE IS THE LAST PLACEMENT, not one in the middle with consumers trailing it. This
     // is the r32 defect stated as a rule: the seed and the bootstrap sat below it.
-    const gateIndex = labelled.findIndex((entry) => entry.placedBy === 'gate')
-    assert.notEqual(gateIndex, -1, `the closing gate must place one of them:\n${JSON.stringify(labelled, null, 2)}`)
-    assert.equal(gateIndex, labelled.length - 1,
-      `the closing gate must place the LAST consumer; these run after it with nothing watching: ${labelled.slice(gateIndex + 1).map((entry) => entry.label).join(', ')}`)
+    const gated = consumers.findIndex((row) => row.placedBy === 'gate')
+    assert.notEqual(gated, -1, `the closing gate must place one of them:\n${JSON.stringify(consumers, null, 2)}`)
+    assert.equal(gated, consumers.length - 1,
+      `the closing gate must place the LAST consumer; these run after it with nothing watching: ${consumers.slice(gated + 1).map((row) => row.label).join(', ')}`)
+  })
+
+  test(`${name}: a consumer that fails still reaches its placement, and its status is propagated after it (o3d-secops r34, Codex HIGH 2)`, () => {
+    const carriers = migrationUrlCarriers([lines.join('\n'), FENCE_LIB_SOURCE])
+    const consumers = migrationConsumerCensus(lines, carriers).filter((row) => row.kind === 'consumer')
+    assert.ok(consumers.length >= 7, `precondition: the walk must find the consumers:\n${JSON.stringify(consumers, null, 2)}`)
+
+    for (const consumer of consumers) {
+      const disposition = consumerFailureDisposition(lines as string[], consumer.line)
+      // EVERY ONE OF THEM IS PLACED, so every one of them must CAPTURE rather than die where it
+      // stands: a `die` above the pin is exactly how a step that moved schema and then failed
+      // escaped its placement, and `set -e` on a bare statement does the same thing silently.
+      assert.equal(disposition.shape, 'captured',
+        `${consumer.label} is placed by ${consumer.placedBy}, so its exit status must be captured and propagated AFTER that placement, not before it: ${disposition.detail}`)
+      // AND THE PROPAGATION IS BELOW THE PLACEMENT, which is the ordering the finding is about.
+      const propagation = (lines as string[]).findIndex((line, index) =>
+        index > consumer.line && disposition.status !== null && new RegExp(`\\$\\{?${disposition.status}\\}?\\b`).test(line))
+      const placement = (lines as string[]).findIndex((line, index) =>
+        index > consumer.line && /^\s*(pin_migration_window |require_migration_landed_on_fenced_server$)/.test(line))
+      assert.notEqual(placement, -1, `${consumer.label} must have a placement below it`)
+      assert.ok(propagation > placement,
+        `${consumer.label}: its failure is propagated at line ${propagation + 1}, above its placement at line ${placement + 1} — the placement would never run`)
+    }
   })
 }
 

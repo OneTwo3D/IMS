@@ -4029,7 +4029,7 @@ release_db_connections() {
     # would be a guard that can never fire -- and this branch has spent two rounds on exactly that
     # shape of thing.
     if [[ "${#witness_argv[@]}" -gt 0 && -z "${clear_server}" ]]; then
-      error "The connection fence WAS released -- CONNECT is restored -- and its record at ${DB_FENCE_STATE} has NOT been removed. A challenge WAS put to this run's witness and the release's own connection could not see it, so nothing here can show that the server just released is the server that was fenced. The next run reads that file as a STANDING FENCE. End it with ${DB_FENCE_RELEASE_CMD}, which asks you to confirm at your terminal."
+      error "The connection fence WAS released -- CONNECT is restored -- and its record at ${DB_FENCE_STATE} was deliberately NOT removed. A challenge WAS put to this run's witness and the release's own connection could not see it, so nothing here can show that the server just released is the server that was fenced. The next run reads that file as a STANDING FENCE. End it with ${DB_FENCE_RELEASE_CMD}, which asks you to confirm at your terminal."
       return 1
     fi
     # AND A RUN THAT ALREADY KNOWS THE RECORD IS BEING KEPT DOES NOT ASK (o3d-secops r33, Codex
