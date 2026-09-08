@@ -44,6 +44,10 @@ const INSTALL_SH = readFileSync(join(REPO, 'scripts/install.sh'), 'utf8')
  */
 const CUTOVER_NS_LIB = readFileSync(join(REPO, 'scripts/lib/cutover-namespace.sh'), 'utf8')
 const CUTOVER_NS_FUNCTIONS = new Set([
+  // o3d-ov60: and the tree copier, which had one definition in install.sh and two of the three
+  // clone paths that perform it. It moved here so update.sh's could reach it; the regressions
+  // below are unchanged except for where they lift it from.
+  'copy_tree_into_new_dir',
   'enter_service_subdir',
   'mkdir_service_subdir',
   'own_service_subdir',
@@ -4623,6 +4627,150 @@ test('[o3d-czpy] copy_tree_into_new_dir refuses a name replaced, AFTER it was cr
   assert.equal(readFileSync(join(victim, 'config'), 'utf8'), 'UNTOUCHED\n',
     'and the git metadata must not be copied over the entries of the directory the link chose')
   assert.deepEqual(readdirSync(victim), ['config'], 'nor anything else be left in it')
+})
+
+// ---------------------------------------------------------------------------
+// SITE 8 AND SITE 5, IN THE OTHER ENTRYPOINT THAT PERFORMS THEM (o3d-ov60)
+//
+// o3d-czpy wrote copy_tree_into_new_dir() and gave it install.sh's two clone paths. update.sh has
+// a third, doing the identical thing to the identical name, and it kept the raw
+// `rm -rf` + `cp -a` pair; and its pre-migration backup directory was still created with a bare
+// `mkdir -p`, which accepts a symlink at its final component and returns 0. Both are measured
+// here the way every other site in this file is: the SHIPPED statement, lifted out of
+// scripts/update.sh by its own text, run by a real bash against a real planted symlink, with the
+// retired statement as the stated mutation.
+// ---------------------------------------------------------------------------
+
+const UPDATE_SH = readFileSync(join(REPO, 'scripts/update.sh'), 'utf8')
+
+/**
+ * A SHIPPED, CONTIGUOUS RUN OF TOP-LEVEL LINES OF scripts/update.sh, lifted by its own first and
+ * last line rather than retyped — the same rule shippedStatement() states for install.sh. A
+ * statement this file lifts by its text is not one it may find twice or not at all.
+ */
+function shippedUpdateBlock(firstLine: string, lastLine: string): string {
+  const lines = UPDATE_SH.split('\n')
+  const start = lines.indexOf(firstLine)
+  assert.notEqual(start, -1, `scripts/update.sh must contain the line ${JSON.stringify(firstLine)}`)
+  assert.equal(lines.lastIndexOf(firstLine), start,
+    `scripts/update.sh must contain exactly one line ${JSON.stringify(firstLine)}`)
+  const end = lines.indexOf(lastLine, start)
+  assert.notEqual(end, -1, `scripts/update.sh must close that block with ${JSON.stringify(lastLine)}`)
+  assert.equal(lines.lastIndexOf(lastLine), end,
+    `scripts/update.sh must contain exactly one line ${JSON.stringify(lastLine)}`)
+  return lines.slice(start, end + 1).join('\n')
+}
+
+const UPDATE_GIT_COPY = shippedUpdateBlock(
+  '    copy_tree_into_new_dir "${TMP_CLONE_WORKTREE}/.git" "${APP_DIR}/.git"',
+  '    copy_tree_into_new_dir "${TMP_CLONE_WORKTREE}/.git" "${APP_DIR}/.git"',
+)
+
+/** The two lines it replaced, which are the mutation. */
+const UPDATE_GIT_COPY_RETIRED = [
+  '    rm -rf "${APP_DIR}/.git"',
+  '    cp -a "${TMP_CLONE_WORKTREE}/.git" "${APP_DIR}/.git"',
+].join('\n')
+
+test('[o3d-ov60] update.sh copies the git metadata into a directory it created and pinned, never into a name', (t) => {
+  // The name update.sh removes and re-creates belongs to ${APP_USER}: `rm -rf` unlinks a symlink
+  // without following it, which is correct, and leaves the entry free to be re-created between the
+  // removal and the copy. This shim IS that window, made deterministic — it is the one the
+  // existing o3d-czpy regression above uses, because it is the only way to exhibit the race from
+  // outside the process.
+  const plant = (prefix: string) => {
+    const root = createTempDirSync(prefix, t)
+    const appDir = join(root, 'app')
+    const clone = join(root, 'clone')
+    const victim = join(root, 'victim')
+    mkdirSync(appDir)
+    mkdirSync(victim)
+    mkdirSync(join(clone, '.git'), { recursive: true })
+    writeFileSync(join(clone, '.git/HEAD'), 'ref: refs/heads/main\n')
+    writeFileSync(join(clone, '.git/config'), '[remote "origin"]\n')
+    const bin = shimDir(t, {
+      rm: `${REAL.rm} "$@"\nfor a in "$@"; do case "$a" in */.git) ${REAL.ln} -s ${q(victim)} "$a" ;; esac; done\nexit 0`,
+    })
+    return { appDir, clone, victim, bin }
+  }
+
+  const script = (site: string, p: ReturnType<typeof plant>) => rig(['copy_tree_into_new_dir'], [
+    `TMP_CLONE_WORKTREE=${q(p.clone)}`,
+    `APP_DIR=${q(p.appDir)}`,
+    site,
+    `echo ${REACHED}`,
+  ].join('\n'))
+
+  const shipped = plant('ims-ov60-git-')
+  const run = runBash(script(UPDATE_GIT_COPY, shipped), { env: { PATH: `${shipped.bin}:${process.env.PATH ?? ''}` } })
+
+  // NOT VACUOUS: the shim really did re-plant the link, so the shipped run met the finding.
+  assert.equal(lstatSync(join(shipped.appDir, '.git')).isSymbolicLink(), true,
+    'the destination name must have been re-taken by a link after the removal')
+  assert.equal(run.status, 1, `a name taken between the removal and the create must end the run: ${run.stdout} ${run.stderr}`)
+  assert.ok(!run.stdout.includes(REACHED), 'and nothing after it may execute')
+  assert.deepEqual(readdirSync(shipped.victim), [],
+    'and no git metadata may be copied into the directory the link chose')
+
+  // MEASURED BY MUTATION, ROUTE STATED: the two lines update.sh carried until this change, in
+  // place of the shipped call. `cp -a src dest` with `dest` a symlink-to-directory copies INTO the
+  // target, as root — which is the finding, executed.
+  const mutant = plant('ims-ov60-git-mutant-')
+  const mutated = runBash(script(UPDATE_GIT_COPY_RETIRED, mutant), { env: { PATH: `${mutant.bin}:${process.env.PATH ?? ''}` } })
+  assert.ok(mutated.stdout.includes(REACHED),
+    `the retired pair must run to completion: ${mutated.stdout} ${mutated.stderr}`)
+  assert.notDeepEqual(readdirSync(mutant.victim), [],
+    'and it must land the clone metadata inside the directory the link chose')
+})
+
+const UPDATE_BACKUP_DIR = shippedUpdateBlock(
+  '  BACKUP_DIR_WALK="${BACKUP_DIR%/}"',
+  '  mkdir_service_subdir "${BACKUP_DIR_WALK%/*}" 022 "${BACKUP_DIR_WALK}"',
+)
+
+/** The line it replaced, which is the mutation. */
+const UPDATE_BACKUP_DIR_RETIRED = '  mkdir -p "${BACKUP_DIR}"'
+
+test('[o3d-ov60] update.sh creates its backup directory by a walk it proves, and dumps nothing through a link', (t) => {
+  const plant = (prefix: string) => {
+    const root = createTempDirSync(prefix, t)
+    const parent = join(root, 'var-backups')
+    const victim = join(root, 'victim')
+    mkdirSync(parent)
+    mkdirSync(victim)
+    // A link at the FINAL component, which is what `mkdir -p` accepts and returns 0 for.
+    const backupDir = join(parent, 'one-two-inventory')
+    symlinkSync(victim, backupDir)
+    return { backupDir, victim }
+  }
+
+  // The dump itself stands in for `pg_dump | gzip > "${BACKUP_TARGET}"`: what is measured is WHICH
+  // DIRECTORY the redirection reaches, and a real pg_dump would answer that question no differently.
+  const script = (site: string, p: ReturnType<typeof plant>) => rig(['enter_service_subdir', 'mkdir_service_subdir'], [
+    `BACKUP_DIR=${q(p.backupDir)}`,
+    'BACKUP_TARGET="${BACKUP_DIR}/pre-update-00000000-000000.sql.gz"',
+    site,
+    'echo DUMP > "${BACKUP_TARGET}"',
+    `echo ${REACHED}`,
+  ].join('\n'))
+
+  const shipped = plant('ims-ov60-backup-')
+  const run = runBash(script(UPDATE_BACKUP_DIR, shipped))
+  assert.equal(run.status, 1, `a symlink at the backup directory's own name must end the run: ${run.stdout} ${run.stderr}`)
+  assert.ok(!run.stdout.includes(REACHED), 'and the dump after it may not run')
+  assert.deepEqual(readdirSync(shipped.victim), [],
+    'and nothing may be written into the directory the link chose')
+  assert.equal(lstatSync(shipped.backupDir).isSymbolicLink(), true,
+    'and the refusal must leave the operator the path to look at')
+
+  // MEASURED BY MUTATION, ROUTE STATED: the bare `mkdir -p` this replaced. It returns 0 on the
+  // planted link and the dump is then written, as root, into whatever it points at.
+  const mutant = plant('ims-ov60-backup-mutant-')
+  const mutated = runBash(script(UPDATE_BACKUP_DIR_RETIRED, mutant))
+  assert.ok(mutated.stdout.includes(REACHED),
+    `\`mkdir -p\` must accept the link and carry on: ${mutated.stdout} ${mutated.stderr}`)
+  assert.deepEqual(readdirSync(mutant.victim), ['pre-update-00000000-000000.sql.gz'],
+    'and the database dump lands in the directory the link chose — which is the finding')
 })
 
 // ---------------------------------------------------------------------------

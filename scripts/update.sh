@@ -5267,8 +5267,15 @@ if ! $NO_GIT; then
       --exclude='uploads' \
       --exclude='public/uploads' \
       "${TMP_CLONE_WORKTREE%/}/" "${APP_DIR}/"
-    rm -rf "${APP_DIR}/.git"
-    cp -a "${TMP_CLONE_WORKTREE}/.git" "${APP_DIR}/.git"
+    # THE GIT METADATA GOES INTO A DIRECTORY THIS RUN CREATED AND PINNED (o3d-ov60). It was
+    # `rm -rf "${APP_DIR}/.git"` and then `cp -a … "${APP_DIR}/.git"`, and the `rm` is what opened
+    # it: it removes a symlink without following it, and leaves the NAME free for ${APP_USER} —
+    # who owns ${APP_DIR} — to re-create as a link to a directory of their choosing before the
+    # root-side `cp` runs. o3d-czpy built copy_tree_into_new_dir() for exactly this and gave it
+    # install.sh's two clone paths; this one, which does the identical thing in the identical
+    # place, was left on the raw pair. See the prose above the helper in
+    # scripts/lib/cutover-namespace.sh for what the `mkdir`, the `cd` and the `..` check buy.
+    copy_tree_into_new_dir "${TMP_CLONE_WORKTREE}/.git" "${APP_DIR}/.git"
     chown -R "${APP_USER}:${APP_USER}" "${APP_DIR}"
     rm -rf "${TMP_CLONE_DIR}"
     success "Repository synced into existing app directory."
@@ -5507,7 +5514,27 @@ BACKUP_TARGET="${BACKUP_DIR}/pre-update-$(date +%Y%m%d-%H%M%S).sql.gz"
 if $DRY_RUN; then
   echo -e "${YELLOW}[DRY]${RESET}   would pg_dump to ${BACKUP_TARGET}"
 else
-  mkdir -p "${BACKUP_DIR}"
+  # THE BACKUP DIRECTORY IS WALKED INTO, NOT `mkdir -p`ed (o3d-ov60). `mkdir -p` ACCEPTS a
+  # symlink-to-directory at its final component and returns 0, and what follows it here is the
+  # whole database written out as root and an `rm --` that prunes what it finds — so a link at
+  # that name aims both. WHERE THAT IS REACHABLE, STATED RATHER THAN IMPLIED: the shipped default
+  # is /var/backups/${APP_NAME}, whose parent is root-owned, and nothing but root can plant a link
+  # in it; IMS_BACKUP_DIR moves this directory wherever the operator names, including underneath a
+  # path ${APP_USER} owns, and nothing validates it. The rule this file holds everywhere else is
+  # that a root-side create PROVES the component it created rather than trusting the ancestry it
+  # was handed, and the walk that does it already exists in the library all three entrypoints
+  # source: enter_service_subdir() creates the last component with a PLAIN `mkdir` (EEXIST on a
+  # planted link, where `mkdir -p` silently works INSIDE its target), lstats what is there, enters
+  # it with `cd -P` and proves both its inode and its `..`. mkdir_service_subdir() is the twin
+  # that restores the working directory afterwards, which everything below this line depends on.
+  #
+  # THE MODE IS UNCHANGED: 022, which is the umask `mkdir -p` ran under, so this creates the same
+  # 0755 directory it always did. Narrowing it is a separate question about who may read a
+  # database dump, and is not decided by a change about which directory is written into.
+  BACKUP_DIR_WALK="${BACKUP_DIR%/}"
+  [[ "${BACKUP_DIR_WALK}" == /*/* ]] || die \
+    "The backup directory is '${BACKUP_DIR}', which is not an absolute path with a parent to walk down from, so this run cannot prove which directory it would write ${BACKUP_TARGET} into. It will not create it by name. Set IMS_BACKUP_DIR to an absolute path and re-run. NOTHING HAS BEEN MIGRATED."
+  mkdir_service_subdir "${BACKUP_DIR_WALK%/*}" 022 "${BACKUP_DIR_WALK}"
   info "Backing up database to ${BACKUP_TARGET}..."
   BACKUP_PARTIAL="${BACKUP_TARGET}.part"
   backup_rc=0
