@@ -8,6 +8,8 @@ import {
   MAX_VOID_MIRROR_CONTRADICTIONS,
   RECONCILIATION_ROW_CAP_REACHED,
   VOID_MIRROR_CONTRADICTIONS_TRUNCATED,
+  isReconciliationProvenComplete,
+  readReconciliationCompleteness,
   collectAccountingReconciliationRows,
   evaluateAccountingReconciliationRows,
   listAccountingReconciliationRuns,
@@ -1896,4 +1898,89 @@ test('o3d-11rf r5: only truncation sentinels are lifted — the run is not a sec
   assert.deepEqual(withFindings.truncations, [],
     'a defect in the DATA is not a statement about the completeness of the report')
   assert.equal(withFindings._count?.findings, 1, 'and it is still persisted as a finding, where it belongs')
+})
+
+/**
+ * o3d-11rf r6 (Codex r5, HIGH) — THE READING ITSELF, ONCE, WHERE EVERY READER GETS IT FROM.
+ *
+ * The r5 column carries a three-way meaning and r5 taught it to one reader. The rollout-readiness
+ * gate then made the same mistake the column exists to prevent. These tests are about the function
+ * that reading now goes through, so a reader that uses it cannot repeat the conflation and a reader
+ * that does not use it is the only remaining way to get it wrong — which is a thing a grep can find.
+ */
+test('o3d-11rf r6: NULL is unknown completeness and [] is proven completeness, and they are not the same value', async () => {
+  const unrecorded = readReconciliationCompleteness(null)
+  assert.equal(unrecorded.state, 'unknown')
+  assert.equal(unrecorded.state === 'unknown' && unrecorded.reason, 'not-recorded')
+  assert.equal(unrecorded.truncations, null, 'there is no array to mistake for an empty one')
+  assert.equal(isReconciliationProvenComplete(unrecorded), false,
+    'a run that never said proves nothing, and this is the whole distinction')
+
+  // A column Prisma was never asked for arrives as `undefined`, not `null`. Same claim, same answer.
+  assert.equal(readReconciliationCompleteness(undefined).state, 'unknown')
+
+  const recorded = readReconciliationCompleteness([])
+  assert.equal(recorded.state, 'complete')
+  assert.deepEqual(recorded.truncations, [])
+  assert.equal(isReconciliationProvenComplete(recorded), true)
+})
+
+test('o3d-11rf r6: a recorded truncation is read back with its code, message and details', async () => {
+  const completeness = readReconciliationCompleteness([
+    { code: RECONCILIATION_ROW_CAP_REACHED, message: '10000 rows scanned', details: { dataset: 'salesOrders' } },
+    { code: VOID_MIRROR_CONTRADICTIONS_TRUNCATED, message: '917 found, 500 reported', details: { total: 917 } },
+  ])
+
+  assert.equal(completeness.state, 'truncated')
+  assert.equal(isReconciliationProvenComplete(completeness), false,
+    'a truncated run is proven INCOMPLETE — also not a clean run')
+  assert.deepEqual(completeness.truncations?.map((entry) => entry.code),
+    [RECONCILIATION_ROW_CAP_REACHED, VOID_MIRROR_CONTRADICTIONS_TRUNCATED])
+  assert.deepEqual(completeness.truncations?.[1].details, { total: 917 })
+})
+
+test('o3d-11rf r6: a payload the reader cannot parse is unknown, and never complete', async () => {
+  // THE FAIL-CLOSED DIRECTION. The column is `Json?`, so a row can hold a shape this reader does not
+  // recognise — a future writer's format, or a corrupted value. None of these prove a run was
+  // complete, and the one answer that must never come back is `complete`.
+  for (const raw of [
+    {},                                        // an object rather than an array
+    { truncated: true },                       // something that LOOKS like a completeness claim
+    'none',                                    // a string
+    0,                                         // a number, where 0 might be read as "no truncations"
+    [null],                                    // an array with a hole in it
+    [[]],                                      // an array of arrays
+    [{ code: 'x' }],                           // an entry with no message
+    [{ message: 'x' }],                        // an entry with no code
+    [{ code: '', message: 'x' }],              // an entry whose code says nothing
+    [{ code: 1, message: 'x' }],               // an entry whose code is the wrong type
+    [{ code: 'a', message: 'a' }, 'not-an-entry'], // one good entry does not carry a bad one
+  ]) {
+    const completeness = readReconciliationCompleteness(raw)
+    assert.equal(completeness.state, 'unknown', `${JSON.stringify(raw)} proves nothing about completeness`)
+    assert.equal(completeness.state === 'unknown' && completeness.reason, 'unreadable',
+      'and is distinguishable from an honestly-silent predecessor row')
+    assert.equal(isReconciliationProvenComplete(completeness), false)
+  }
+})
+
+test('o3d-11rf r6: what a persisted run records is what the reader reads back', async () => {
+  // THE JOIN BETWEEN THE TWO HALVES. The writer lifts sentinels onto the run; the reader interprets
+  // the column. If either changes shape without the other, this fails — which is the only thing
+  // holding `reconciliationTruncations` and `readReconciliationCompleteness` to the same format.
+  const truncating: AccountingReconciliationFinding = {
+    severity: 'warning',
+    code: RECONCILIATION_ROW_CAP_REACHED,
+    message: 'Accounting reconciliation reached the 10000 row cap for salesOrders; report may be incomplete',
+    details: { dataset: 'salesOrders', scanned: 10_000, limit: 10_000 },
+  }
+
+  const { withFindings } = await persistAndReload([truncating])
+  const completeness = readReconciliationCompleteness(withFindings.truncations)
+  assert.equal(completeness.state, 'truncated')
+  assert.deepEqual(completeness.truncations?.map((entry) => entry.code), [RECONCILIATION_ROW_CAP_REACHED])
+
+  const { withFindings: clean } = await persistAndReload([])
+  assert.equal(readReconciliationCompleteness(clean.truncations).state, 'complete',
+    'and a run with nothing to report reads back as proven complete, not as unknown')
 })
