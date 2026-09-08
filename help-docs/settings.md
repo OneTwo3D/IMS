@@ -363,6 +363,8 @@ If your cron daemon retries on transient errors and the underlying issue resolve
 
 For multi-instance deployments (multiple application replicas behind a load balancer), set `RATE_LIMIT_BACKEND=redis` and `REDIS_URL` so the rate limit is shared across replicas. The default in-memory backend doesn't share state.
 
+The installer sets this for you: it writes `RATE_LIMIT_BACKEND=redis` when you asked for Redis **and** the URL it was about to write answered `PING`, and `RATE_LIMIT_BACKEND=memory` otherwise, with a warning explaining which. If you set it to `redis` by hand, check that Redis really answers on that `REDIS_URL` first — sign-in throttles deny requests when the backend is unreachable, so a wrong value there stops everyone logging in rather than merely loosening a limit.
+
 ### Invariant check
 
 The system runs a periodic invariant check that scans inventory, accounting, and sales data for known drift conditions (negative stock, orphan cost layers, refund-status mismatches, etc.). Critical findings trigger an admin notification.

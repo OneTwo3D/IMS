@@ -765,6 +765,30 @@ After installation, sign in and set the organisation base currency in **Settings
 - **Redis URL** (default: `redis://localhost:6379`) — only asked when Redis is not installed here
 - **Redis password** — leave blank if not required
 - **Redis key prefix** — optional namespace for Redis-backed features
+- **Use Redis for rate limiting?** (default: `n`) — only asked when Redis is *not* installed here.
+  Answering `y` writes `RATE_LIMIT_BACKEND=redis`, which is what a multi-replica deployment needs so
+  that login, TOTP and cron counters are shared rather than per-process. On a re-install the default
+  is whatever the existing `.env` says, so an upgrade neither invents the setting nor silently
+  removes it.
+
+#### What actually decides `RATE_LIMIT_BACKEND`
+
+Answering the prompts is not enough on its own. Just before the environment file is written — after
+a locally installed Redis has been started — the installer **connects to the exact `REDIS_URL` it is
+about to write, with the exact credential it is about to write, and sends `PING`**. Only a `PONG`
+produces `RATE_LIMIT_BACKEND=redis`. Anything else — a refused connection, `NOAUTH`, `WRONGPASS`, a
+timeout, a missing `node` — writes `RATE_LIMIT_BACKEND=memory` and prints a warning saying so.
+
+That asymmetry is deliberate. `memory` means per-process counters, which is correct for a single
+replica and is what every earlier install of this application ran. `redis` pointed at a Redis that
+does not answer is not a slower login page: the auth buckets fail **closed**, so it is nobody being
+able to sign in at all. The installer therefore never infers the backend from `REDIS_URL` merely
+being set — that variable has a default (`redis://localhost:6379`) that an operator may have pressed
+Enter through, and a Redis that happens to answer there is not one they chose.
+
+If the probe falls back and you know the URL is right, fix Redis and re-run the installer; it will
+pick it up. Setting `RATE_LIMIT_BACKEND=redis` in `.env` by hand works too, but check that Redis
+answers with that URL first — that value is the one that can lock everybody out.
 
 The password you enter is placed **inside `REDIS_URL`**, percent-encoded, and the `REDIS_PASSWORD`
 line in `.env` is left empty. `REDIS_URL` is what the application authenticates with; a password that

@@ -122,6 +122,7 @@ bash scripts/provision-ims-tenant.sh
 - `REDIS_MODE=local` installs `redis-server` inside the new LXC and points IMS at `localhost`.
 - `REDIS_MODE=external` builds `REDIS_URL` from `REDIS_HOST`/`REDIS_PORT`/`REDIS_DB` if you do not set `REDIS_URL` directly.
 - `REDIS_KEY_PREFIX` defaults to `TENANT_SLUG` and is written into the tenant `.env` so Redis-backed features can namespace keys per tenant.
+- Any `REDIS_MODE` other than `disabled` also answers the installer's rate-limit question with `y`, so the tenant gets `RATE_LIMIT_BACKEND=redis` — which is what makes the per-tenant `REDIS_KEY_PREFIX` above mean anything. `install.sh` still `PING`s the URL before committing to it and falls back to `memory` with a warning if it does not answer, because the sign-in throttles fail closed.
 - `PROXY_TYPE=ols` uses the OpenLiteSpeed configuration branch. `PROXY_TYPE=nginx` uses an nginx vhost plus `certbot --nginx`.
 - The install step stores `public_app_url` and SMTP settings in the IMS settings table so the fresh instance has its public URL and outbound mail defaults from the start.
 - `NEXT_PUBLIC_TURNSTILE_SITE_KEY` and `TURNSTILE_SECRET_KEY` are passed through to the tenant `.env`. Leave them blank to keep password login Turnstile disabled on that tenant.

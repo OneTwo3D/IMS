@@ -183,6 +183,13 @@ When something goes wrong, three places hold the information you need:
 
 ### Multi-instance rate limits don't work
 - The default `RATE_LIMIT_BACKEND=memory` keeps counters per-process. For multi-replica deployments, switch to `RATE_LIMIT_BACKEND=redis` and set `REDIS_URL`.
+- If the installer left it on `memory` after you asked for Redis, it is because the `REDIS_URL` it was about to write did not answer `PING`; the install transcript says so. Fix Redis and re-run the installer.
+
+### Nobody can sign in after switching to `RATE_LIMIT_BACKEND=redis`
+- The sign-in, TOTP, step-up and password-reset throttles **fail closed**: when the rate-limit backend is unreachable they deny the request rather than allowing it. So an unreachable or mis-credentialled Redis does not look like a Redis fault — it looks like every password being rejected.
+- Look for `rate_limit_backend_error` WARNING entries in the activity log; the message carries the underlying `NOAUTH`/`WRONGPASS`/connection error.
+- Check the URL by hand from the application host: `redis-cli -u "$REDIS_URL" ping` should answer `PONG`. Note that `redis-cli` does not percent-decode the password in a URL, so if yours contains encoded characters, test with `redis-cli -h host -p port -a '<the decoded password>' ping` instead.
+- The immediate remedy is `RATE_LIMIT_BACKEND=memory` and a restart: counters become per-process, which is the state every single-replica install runs in.
 
 ### `/api/cron/*` returns 401 in production
 - `CRON_SECRET` env var is missing or doesn't match the `Authorization: Bearer ...` header your cron daemon sends.

@@ -344,7 +344,14 @@ Bcrypt cost is set to 12. Each rule emits a distinct error code so the UI can sh
 
 #### Rate limiting
 
-Login, TOTP verification, password change, and supplier-quote endpoints share a token bucket backed by `RATE_LIMIT_BACKEND` (`memory` or `redis`). The Redis backend uses a single atomic sorted-set Lua script for check-and-record so multi-replica deployments stay coherent. On backend failure the limiter fails open and writes a warning to the activity log.
+Login, TOTP verification, password change, and supplier-quote endpoints share a token bucket backed by `RATE_LIMIT_BACKEND` (`memory` or `redis`). The Redis backend uses a single atomic sorted-set Lua script for check-and-record so multi-replica deployments stay coherent.
+
+On backend failure the limiter writes a `rate_limit_backend_error` WARNING to the activity log and then does one of two things, which is the distinction that matters operationally:
+
+- **Auth-critical buckets fail CLOSED.** Sign-in, TOTP, step-up, password reset and e-mail change pass `failClosed: true`, so a backend that throws DENIES the request. That is deliberate — a rate-limit outage must not silently disable brute-force protection — but it means a `RATE_LIMIT_BACKEND=redis` pointed at a Redis that does not answer presents as *nobody being able to sign in*, not as a Redis fault.
+- **Everything else fails open**, including the cron throttles, which are already gated by `CRON_SECRET`.
+
+Because of the first bullet, `scripts/install.sh` writes `RATE_LIMIT_BACKEND=redis` only after `PING`ing the exact `REDIS_URL` it is about to write, and falls back to `memory` with a warning otherwise (o3d-g42a). Do not set it to `redis` by hand without checking that Redis answers with that URL.
 
 ### Passkey Provider (WebAuthn)
 1. User clicks "Sign in with Passkey" on the login page
