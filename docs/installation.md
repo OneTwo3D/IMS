@@ -3315,6 +3315,21 @@ written to a `.part` file and renamed on completion; if it fails, the partial fi
 the failure banner says there is no restore point for this run rather than naming a truncated
 file as one.
 
+**And that `.part` file must not already exist** (o3d-ov60). It is created by
+`scripts/lib/write-new-file.mjs` with `O_CREAT|O_EXCL|O_NOFOLLOW|O_NONBLOCK`, opened against the
+descriptor the run holds on the backup directory rather than through the directory's name a second
+time, so **anything already at that name is a refusal**: an ordinary file, a symlink, a directory or
+a named pipe. That matters because `IMS_BACKUP_DIR` may point the dump at a directory the service
+account owns, `pre-update-<stamp>.sql.gz.part` is a predictable name inside it, and the shell
+redirection this replaces (`set -C`, i.e. `noclobber`) is *not* an unconditional `O_EXCL` — bash
+re-opens **without** it when what is at the name is not a regular file, so a named pipe planted
+there made root's `gzip >` block indefinitely, with the service stopped, cron stopped and the
+database connections already fenced. **What an operator may see:** a run that was `SIGKILL`ed
+between its dump and the rename leaves a `.part` behind (the ordinary failure path deletes it), and
+the next run within the same second refuses with `write-new-file: … could not be CREATED` and
+migrates nothing. Delete the stale `.part` and re-run. `node` must be on `PATH` and the helper must
+be present in the release being deployed; neither missing falls back to a plain redirection.
+
 Never run two versions of IMS against the same database at once — no rolling restart, no
 blue/green overlap, no second instance left running on another port.
 
