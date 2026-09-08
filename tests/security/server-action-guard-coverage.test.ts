@@ -119,28 +119,23 @@ const ALLOWLIST: Record<string, string> = {
   // registry call site in accounting-sync.ts already holds `sync` (or more), so
   // the second check can only ever pass for them.
 
-  // o3d-512h round 7, Codex finding 1 — THE ONE RESIDUAL IN THE TREE.
+  // o3d-512h round 7 left ONE RESIDUAL here, and o3d-1fel closed it by DELETING the
+  // export rather than by describing it better.
   //
-  // The collector is now exhaustive: every name a 'use server' module publishes
-  // produces an entry, and anything not established to be an async function is
-  // NOT VERIFIED rather than dropped. This is the only export in 55 'use server'
-  // modules that lands there, and it needs an entry BY NAME — a `file:*` wildcard
-  // cannot clear an unverified export any more (isUnverifiedAllowlisted).
+  // `app/actions/categories.ts` carried `export { buildProductCategoryPathDisplay }`
+  // — a SYNCHRONOUS re-export from a `'use server'` module, published by nothing and
+  // imported by nobody. Its own comment said it existed "so consumers don't have to
+  // reach into lib/products/categories", and there were zero consumers: the stated
+  // purpose was the whole justification and it was not true of the tree.
   //
-  // WHAT IS VERIFIED: the name resolves through the graph to
-  // lib/products/categories.ts:buildProductCategoryPathDisplay, a SYNCHRONOUS,
-  // pure string function over its own arguments. It reads no database, no
-  // session and no setting, so there is no data for a guard to protect.
-  //
-  // WHAT IS NOT VERIFIED, and cannot be from here: whether Next's action protocol
-  // publishes it. `next build` compiles this tree (round 6), so the usual
-  // "a 'use server' module may only export async functions" build error does not
-  // fire on a sync RE-export, and this scanner deliberately does not decide a
-  // question only the compiler can answer. If it IS published, the endpoint hands
-  // an unauthenticated caller a formatted string built from the argument they
-  // sent.
-  'categories.ts:buildProductCategoryPathDisplay':
-    'sync re-export of a pure string helper (lib/products/categories.ts); touches no data, session or setting. NOT verified: whether Next publishes a sync re-export from a `use server` module — a next build question, flagged rather than assumed either way',
+  // The entry that stood here was honest about the part it could not settle —
+  // whether Next's action protocol publishes a sync re-export, which is a `next build`
+  // question this scanner deliberately does not answer. But an unanswerable question
+  // about a DEAD export is not a question worth carrying: deleting the export answers
+  // it in the only direction that is safe under either answer, and costs nothing.
+  // The allowlist is now empty of unverified exports, and the rule below is what keeps
+  // it that way — a re-added sync re-export lands on the left-hand side with nothing
+  // to meet it.
 }
 
 test('every exported server action enforces an auth guard or is allowlisted', () => {
