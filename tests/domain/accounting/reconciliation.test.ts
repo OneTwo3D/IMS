@@ -6,14 +6,18 @@ import {
   DAILY_BATCH_SPLIT_BRIDGE_AMBIGUOUS,
   MAX_RECONCILIATION_FINDINGS_PER_RUN,
   MAX_VOID_MIRROR_CONTRADICTIONS,
+  RECONCILIATION_ROW_CAP_REACHED,
+  VOID_MIRROR_CONTRADICTIONS_TRUNCATED,
   collectAccountingReconciliationRows,
   evaluateAccountingReconciliationRows,
   listAccountingReconciliationRuns,
   persistAccountingReconciliationReport,
   reconciliationLookbackDate,
   updateAccountingReconciliationFindingStatus,
+  type AccountingReconciliationFinding,
   type AccountingReconciliationReport,
   type AccountingReconciliationRows,
+  type AccountingReconciliationTruncation,
 } from '@/lib/domain/accounting/reconciliation'
 
 const A1_DATE = new Date('2026-04-24T10:00:00.000Z')
@@ -1733,4 +1737,163 @@ test('o3d-11rf r4: a dataset that was NOT READ reports nothing, rather than a cl
   const codes = evaluateAccountingReconciliationRows(rows).map((finding) => finding.code)
   assert.equal(codes.includes('void_mirror_basis_unknown_with_live_sync_row'), false,
     'the in-memory pairing over the capped pages is gone, and nothing may quietly reinstate it')
+})
+
+// ---------------------------------------------------------------------------------------------
+// o3d-11rf r5 (Codex r4, HIGH) — THE ROW THAT SAYS THE LIST IS SHORT, DROPPED FOR BEING ONE ROW TOO MANY
+// ---------------------------------------------------------------------------------------------
+
+/**
+ * WHAT CODEX FOUND, AND WHY THE r4 TESTS COULD NOT SEE IT. r3 bounded the contradiction query at the
+ * number of findings the run view renders, so that nothing is written that cannot be read — and then
+ * appended the truncation warning AFTER that loop. A truncating run therefore produces 501 findings
+ * for a 500-finding page, and the row most likely to be left out is the one whose entire content is
+ * "the list you are reading is incomplete". Every r4 test stopped at the evaluator's in-memory array,
+ * where all 501 are present; the loss happens later, in the reader.
+ *
+ * SO THESE TESTS GO THROUGH PERSISTENCE AND THE CAPPED READER, and assert the thing an operator can
+ * actually do: look at a run and tell whether what they are reading is all of it.
+ *
+ * The double pages by insertion order. PostgreSQL does not even do that — one `createMany` in one
+ * transaction gives every finding the same `createdAt`, so `ORDER BY "createdAt" ASC LIMIT 500`
+ * returns whichever 500 the plan emits, which is why the remedy could not be an ordering. That half
+ * is proved where it can be, against a real database, in
+ * tests/db/reconciliation-void-mirror-contradictions.test.ts.
+ */
+
+function reportOf(findings: AccountingReconciliationFinding[]): AccountingReconciliationReport {
+  return {
+    checkedAt: '2026-09-08T12:00:00.000Z',
+    fromDate: '2026-06-10T12:00:00.000Z',
+    toDate: '2026-09-08T12:00:00.000Z',
+    findings,
+    summary: {
+      total: findings.length,
+      warning: findings.filter((finding) => finding.severity === 'warning').length,
+      critical: findings.filter((finding) => finding.severity === 'critical').length,
+    },
+  }
+}
+
+async function persistAndReload(findings: AccountingReconciliationFinding[]) {
+  const { client } = persistenceClient()
+  await persistAccountingReconciliationReport(reportOf(findings), client as never)
+  const [withFindings] = await listAccountingReconciliationRuns(client as never, { limit: 10, includeFindings: true })
+  const [listedOnly] = await listAccountingReconciliationRuns(client as never, { limit: 10 })
+  return { withFindings, listedOnly }
+}
+
+test('o3d-11rf r5: over the cap the reader drops the truncation FINDING, and the run still says the list is short', async () => {
+  // THE PREMISE, ASSERTED RATHER THAN ASSUMED. A full contradiction page is exactly the display cap,
+  // so the warning about it is the 501st finding of a 500-finding page. If this stops being true the
+  // test below stops being about anything, so it is checked first.
+  const rows = cleanRows()
+  const dropped = 417
+  rows.voidMirrorContradictions = {
+    rows: Array.from({ length: MAX_VOID_MIRROR_CONTRADICTIONS }, (_unused, index) => contradiction({
+      accountingEventId: `event-${index}`,
+      referenceId: `order-${index}`,
+    })),
+    total: MAX_VOID_MIRROR_CONTRADICTIONS + dropped,
+  }
+  const findings = evaluateAccountingReconciliationRows(rows)
+  assert.equal(findings.length, MAX_RECONCILIATION_FINDINGS_PER_RUN + 1,
+    'the run overflows the reader by exactly the truncation warning — that is the whole defect')
+
+  const { withFindings, listedOnly } = await persistAndReload(findings)
+
+  // THE LOSS, MADE VISIBLE. Every finding was written; the reader hands back a page one short, and
+  // the row it left behind is the one that was supposed to prove the page complete.
+  assert.equal(withFindings.findings?.length, MAX_RECONCILIATION_FINDINGS_PER_RUN, 'the page is capped')
+  assert.equal(withFindings._count?.findings, MAX_RECONCILIATION_FINDINGS_PER_RUN + 1, 'and one row did not fit in it')
+  assert.equal(
+    withFindings.findings?.some((finding) => finding.code === VOID_MIRROR_CONTRADICTIONS_TRUNCATED),
+    false,
+    'the warning is the row that fell off — a short list otherwise indistinguishable from a complete one',
+  )
+
+  // AND WHAT THE OPERATOR CAN STILL SEE. Recorded on the run, so no findings page can drop it.
+  const truncations = withFindings.truncations as AccountingReconciliationTruncation[]
+  assert.equal(truncations.length, 1, 'the run names the one thing that was truncated')
+  assert.equal(truncations[0].code, VOID_MIRROR_CONTRADICTIONS_TRUNCATED)
+  assert.deepEqual(truncations[0].details, {
+    reported: MAX_VOID_MIRROR_CONTRADICTIONS,
+    total: MAX_VOID_MIRROR_CONTRADICTIONS + dropped,
+    limit: MAX_VOID_MIRROR_CONTRADICTIONS,
+  }, 'with the exact count, not "there may be more"')
+  assert.match(truncations[0].message, new RegExp(String(MAX_VOID_MIRROR_CONTRADICTIONS + dropped)),
+    'and the number where an operator reads it, so the run row needs no finding to be legible')
+
+  // THE CHEAP LIST VIEW TOO — the one that asks for no findings at all, which a sentinel finding
+  // could never have reached however it was ordered or budgeted.
+  assert.equal(listedOnly.findings, undefined, 'this reader asks for no findings')
+  assert.deepEqual(listedOnly.truncations, withFindings.truncations, 'and is still told the report is incomplete')
+})
+
+test('o3d-11rf r5: the row-cap sentinel is lifted onto the run as well, not only the contradiction one', async () => {
+  // THE OTHER SENTINEL WITH THE SAME PROPERTY. `reconciliation_row_cap_reached` describes the
+  // completeness of the report and competes for the same 500 slots as the findings it qualifies. It
+  // is pushed before the loops rather than after, which saves it in an array — and saves it nowhere
+  // in PostgreSQL, where the findings of a run share one `createdAt` and the page is whatever the
+  // plan emits. Placed last here to model that page, since insertion order is all the double has.
+  const capReached: AccountingReconciliationFinding = {
+    severity: 'warning',
+    code: RECONCILIATION_ROW_CAP_REACHED,
+    message: 'Accounting reconciliation reached the 10000 row cap for salesOrders; report may be incomplete',
+    details: { dataset: 'salesOrders', scanned: 10_000, limit: 10_000 },
+  }
+  const filler: AccountingReconciliationFinding[] = Array.from(
+    { length: MAX_RECONCILIATION_FINDINGS_PER_RUN },
+    (_unused, index) => ({
+      severity: 'warning' as const,
+      code: 'source_shipment_without_event',
+      message: `no mirrored event ${index}`,
+      details: { index },
+    }),
+  )
+
+  const { withFindings } = await persistAndReload([...filler, capReached])
+
+  assert.equal(
+    withFindings.findings?.some((finding) => finding.code === RECONCILIATION_ROW_CAP_REACHED),
+    false,
+    'the page dropped it, exactly as it drops the contradiction warning',
+  )
+  const truncations = withFindings.truncations as AccountingReconciliationTruncation[]
+  assert.deepEqual(truncations.map((entry) => entry.code), [RECONCILIATION_ROW_CAP_REACHED],
+    'and the run carries it, so "10,000 rows were scanned and this is a partial answer" survives the cap')
+  assert.deepEqual(truncations[0].details, { dataset: 'salesOrders', scanned: 10_000, limit: 10_000 })
+})
+
+test('o3d-11rf r5: a run with nothing truncated records [], which is not the same as recording nothing', async () => {
+  // THE FENCE IN THE OTHER DIRECTION, AND THE ONE THAT MAKES THE COLUMN WORTH READING. `[]` means
+  // asked and answered: this run was complete. NULL is reserved for a run written before the column
+  // existed, whose completeness nobody recorded — and a reader that treats those alike is back to
+  // the defect, believing a short list because nothing said otherwise.
+  const findings = evaluateAccountingReconciliationRows(cleanRows())
+  assert.deepEqual(findings, [], 'the clean fixture truncates nothing, so there is nothing to lift')
+
+  const { withFindings, listedOnly } = await persistAndReload(findings)
+
+  assert.deepEqual(withFindings.truncations, [], 'recorded, and empty')
+  assert.deepEqual(listedOnly.truncations, [], 'on the cheap list view too')
+  assert.notEqual(withFindings.truncations, null, 'never null: null is a run that never said')
+  assert.notEqual(withFindings.truncations, undefined)
+})
+
+test('o3d-11rf r5: only truncation sentinels are lifted — the run is not a second copy of the findings', async () => {
+  // Without this the column would fill with ordinary defects on any large run and stop being the
+  // short, exact statement about completeness that a reader can trust at a glance.
+  const findings = evaluateAccountingReconciliationRows(cleanRows())
+  const ordinary: AccountingReconciliationFinding = {
+    severity: 'critical',
+    code: 'posted_event_without_external_id',
+    message: 'a posted row with no document id',
+    details: { eventId: 'event-1' },
+  }
+  const { withFindings } = await persistAndReload([...findings, ordinary])
+
+  assert.deepEqual(withFindings.truncations, [],
+    'a defect in the DATA is not a statement about the completeness of the report')
+  assert.equal(withFindings._count?.findings, 1, 'and it is still persisted as a finding, where it belongs')
 })
