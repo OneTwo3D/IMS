@@ -23,7 +23,7 @@
 export const RETIRED_ENV_VARS: Readonly<Record<string, string>> = {
   WC_SYNC_STATUSES: 'The order status filter is the wc_sync_order_statuses setting, edited in Settings -> Sync -> WooCommerce. It governs the routes that FETCH orders (the initial import and the poll/reconcile sweeps), not the order webhook, which imports whatever the store pushes.',
   WC_USE_WEBHOOKS: 'There is no webhooks-or-polling switch: webhook events are accepted whenever a WooCommerce webhook secret is configured, and the wc-reconcile cron polls regardless.',
-  WC_POLL_INTERVAL_MINUTES: 'The polling cadence is the wc-reconcile cron schedule, edited in Settings -> System -> Scheduler. There is no minutes field anywhere: the WooCommerce sync page used to show one (wc_sync_interval_minutes) and nothing read that either (o3d-potv).',
+  WC_POLL_INTERVAL_MINUTES: 'The polling cadence is the wc-reconcile cron schedule, edited in Settings -> System -> Scheduler. There is no minutes field on the WooCommerce sync page either: the one that used to be there was read by nothing and has been removed (o3d-potv).',
   XERO_CLIENT_ID: 'The Xero OAuth client id is the xero_client_id setting, entered in Settings -> Integrations -> Xero.',
   XERO_CLIENT_SECRET: 'The Xero OAuth client secret is the xero_client_secret setting, entered in Settings -> Integrations -> Xero. Remove this copy: it is a credential in a file nothing opens.',
   XERO_TOKEN_PATH: 'Xero access and refresh tokens are stored encrypted in Postgres. There is no token file, so do not scope backups or incident response around this path.',
