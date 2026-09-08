@@ -12,6 +12,7 @@ import { ENV_HEREDOC_DEFAULTS } from './install-shell-rig.ts'
 import { shippedFunction } from './real-postgres-cluster.ts'
 import {
   AWKWARD_PASSWORD,
+  sliceBlock,
   sliceOptionalBlock,
   sliceRange,
   startRecordingRedis,
@@ -170,6 +171,26 @@ test('o3d-g42a: pressing Enter through the external-Redis prompts writes memory,
 
   assert.match(decision.envFile, /^REDIS_URL=redis:\/\/localhost:6379$/m, 'precondition: the URL default is non-empty')
   assert.equal(backendIn(decision), 'memory')
+})
+
+test('o3d-g42a: a REACHABLE Redis nobody opted in to is still memory — the probe is not the opt-in', async () => {
+  // THE TEST THE FIRST DRAFT OF THIS FILE DID NOT HAVE, and the reason it is here is worth keeping.
+  //
+  // Replacing the opt-in with `[[ -n "${REDIS_URL}" ]]` — the derivation this issue was filed to
+  // forbid — passed every other test in this file. It passed because the PROBE happened to save
+  // it: nothing answers on the default redis://localhost:6379 on a test host, so the wrong
+  // decision produced the right value and the suite was measuring an adjacent property.
+  //
+  // On a host where something DOES answer there — a Redis kept for something else, or one a
+  // previous install left running — that derivation silently enrols the operator's rate limiter
+  // into a server they never named, on the strength of a prompt default they pressed Enter
+  // through. So the two halves are separated here: the URL answers, and the answer is still
+  // `memory`, because nobody asked.
+  const decision = await againstRedis(null, async (port) =>
+    runInstallerDecision(`INSTALL_REDIS=n\nREDIS_URL=redis://127.0.0.1:${port}`))
+
+  assert.equal(backendIn(decision.value), 'memory')
+  assert.deepEqual(decision.commands, [], 'and a URL nobody opted in to is not even probed')
 })
 
 test('o3d-g42a: opting IN to Redis rate limiting against a Redis that does not answer still writes memory', async () => {
@@ -511,4 +532,60 @@ test('o3d-g42a: an unreachable probe is "no", not "yes" — the fallback is stru
     src,
   )
   assert.equal(backendIn(decision), 'memory')
+})
+
+// ---------------------------------------------------------------------------
+// The OTHER caller of install.sh (o3d-g42a). One rule, and this is its third reader.
+// ---------------------------------------------------------------------------
+
+test('o3d-g42a: provision-ims-tenant.sh ANSWERS the rate-limit question for every REDIS_MODE', async (t: TestContext) => {
+  // scripts/provision-ims-tenant.sh runs `install.sh --non-interactive` off an environment file it
+  // writes, so it — not an operator — is what answers the new prompt on every tenant. Left
+  // unanswered, `prompt_yn` takes its default of `n` and a REDIS_MODE=external tenant gets
+  // per-process counters plus a REDIS_KEY_PREFIX that namespaces nothing, which is the same
+  // "configured and then unused" shape this issue is about, one level up.
+  //
+  // The block is EXECUTED rather than grepped, through the shipped `append_env_line`, so the value
+  // asserted is the one that reaches the file — `%q` and all.
+  const source = await readFile(path.join(REPO, 'scripts/provision-ims-tenant.sh'), 'utf8')
+  const block = sliceRange(source, 'if [[ "${REDIS_MODE}" == "local" ]]; then', 'append_env_line "${INSTALL_ENV_FILE}" REDIS_PORT')
+  const dir = await createTempDir('o3d-g42a-tenant-', t)
+
+  const answers: Record<string, Record<string, string>> = {}
+  for (const mode of ['local', 'external', 'disabled']) {
+    const file = path.join(dir, `${mode}.env`)
+    await execFileAsync('bash', ['-c', [
+      'set -euo pipefail',
+      sliceBlock(source, 'append_env_line() {'),
+      `REDIS_MODE=${shq(mode)}`,
+      `INSTALL_ENV_FILE=${shq(file)}`,
+      block,
+    ].join('\n')])
+    answers[mode] = Object.fromEntries(
+      (await readFile(file, 'utf8')).split('\n').filter(Boolean).map((line) => {
+        const at = line.indexOf('=')
+        return [line.slice(0, at), line.slice(at + 1)]
+      }),
+    )
+  }
+
+  assert.deepEqual(answers.local, { INSTALL_REDIS: 'y', RATE_LIMIT_REDIS: 'y' })
+  assert.deepEqual(answers.external, { INSTALL_REDIS: 'n', RATE_LIMIT_REDIS: 'y' })
+  assert.deepEqual(answers.disabled, { INSTALL_REDIS: 'n', RATE_LIMIT_REDIS: 'n' })
+
+  // ...and the answer really does decide, rather than merely being written down: the external
+  // tenant's answers, fed to the installer against a Redis that answers, produce `redis`.
+  const external = await againstRedis(null, async (port) => runInstallerDecision(
+    `INSTALL_REDIS=${answers.external.INSTALL_REDIS}\n`
+    + `RATE_LIMIT_REDIS=${answers.external.RATE_LIMIT_REDIS}\n`
+    + `REDIS_URL=redis://127.0.0.1:${port}`,
+  ))
+  assert.equal(backendIn(external.value), 'redis')
+
+  const disabledAnswers = await againstRedis(null, async (port) => runInstallerDecision(
+    `INSTALL_REDIS=${answers.disabled.INSTALL_REDIS}\n`
+    + `RATE_LIMIT_REDIS=${answers.disabled.RATE_LIMIT_REDIS}\n`
+    + `REDIS_URL=redis://127.0.0.1:${port}`,
+  ))
+  assert.equal(backendIn(disabledAnswers.value), 'memory', 'a tenant with Redis disabled is not enrolled by a reachable URL')
 })

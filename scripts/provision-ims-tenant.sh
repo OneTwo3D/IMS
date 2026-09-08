@@ -419,6 +419,22 @@ if [[ "${REDIS_MODE}" == "local" ]]; then
 else
   append_env_line "${INSTALL_ENV_FILE}" INSTALL_REDIS "n"
 fi
+# THE ANSWER TO install.sh's RATE-LIMIT QUESTION, GIVEN RATHER THAN DEFAULTED (o3d-g42a).
+#
+# install.sh asks the external-Redis operator whether Redis should back the rate limiter, and
+# defaults that question to `n` because its REDIS_URL prompt has a default nobody may have looked
+# at. That reasoning does not apply here: REDIS_MODE is a deliberate choice, and this script gives
+# every tenant its own REDIS_KEY_PREFIX precisely so their rate-limit counters do not collide --
+# which is only meaningful if the rate limiter is the Redis-backed one. Left unanswered, a
+# REDIS_MODE=external tenant would silently get per-process counters and a key prefix nothing uses.
+#
+# It is an ANSWER, not an override: install.sh still probes the URL and falls back to `memory` with
+# a warning if it does not answer, because the auth buckets fail closed.
+if [[ "${REDIS_MODE}" == "disabled" ]]; then
+  append_env_line "${INSTALL_ENV_FILE}" RATE_LIMIT_REDIS "n"
+else
+  append_env_line "${INSTALL_ENV_FILE}" RATE_LIMIT_REDIS "y"
+fi
 append_env_line "${INSTALL_ENV_FILE}" REDIS_PORT "${REDIS_PORT}"
 append_env_line "${INSTALL_ENV_FILE}" REDIS_URL "${REDIS_URL}"
 append_env_line "${INSTALL_ENV_FILE}" REDIS_PASSWORD "${REDIS_PASSWORD}"
