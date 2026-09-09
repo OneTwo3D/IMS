@@ -29,6 +29,58 @@ import { isOperatorAssertedSettlement } from './sync-row-settlement'
  */
 const MIRROR_CONTRADICTING_SYNC_STATUSES = ['PENDING', 'PROCESSING'] as const
 
+/**
+ * o3d-11rf r10 (Codex r10, HIGH) — EVERY CHARACTER `String.prototype.trim` STRIPS, AND ONLY THOSE.
+ *
+ * WHAT WENT WRONG. The contradiction join below decides, in SQL, the question `stringValue` decides
+ * in TypeScript: is this payload token BLANK? `stringValue` asks JavaScript `.trim()`. The statement
+ * asked `btrim(text)`, which strips ORDINARY SPACES AND NOTHING ELSE. So `_idempotencyKey: "\t"` —
+ * likewise a newline, a CR, an NBSP — read as PRESENT in SQL and ABSENT in TypeScript. The two
+ * derivations then took different branches: TypeScript fell through to the row key (and the legacy
+ * date key beside it), while SQL selected the payload branch, disabled both fallback arms, and then
+ * normalised the token itself to NULL — leaving the row with NO mirror key at all. A live row whose
+ * own mirror is an unexplained VOID vanished from reconciliation entirely. The battery that was
+ * supposed to prove the two derivations agree used ordinary spaces, which `btrim` happens to handle.
+ *
+ * THE SET IS ECMAScript's, ENUMERATED: WhiteSpace ∪ LineTerminator — tab, LF, VT, FF, CR, space,
+ * NBSP, BOM, the Unicode space separators, and the two line separators. Spelled out rather than
+ * described because NO SQL character class is this set. PostgreSQL's `[[:space:]]` (and `\s`, which
+ * is the same class) follows the database ctype: it excludes NBSP and includes U+0085 NEL, and
+ * JavaScript disagrees with it on both. `tests/domain/accounting/reconciliation.test.ts` derives the
+ * set from the running engine and asserts the statement sends exactly this one, so a JavaScript that
+ * one day trims one more character cannot leave this list behind quietly.
+ */
+const ECMASCRIPT_TRIM_CHARACTERS = [
+  // WhiteSpace: the five format-control characters and the Unicode space separators (category Zs).
+  '\u0009', '\u000b', '\u000c', '\ufeff',
+  '\u0020', '\u00a0', '\u1680',
+  '\u2000', '\u2001', '\u2002', '\u2003', '\u2004', '\u2005', '\u2006',
+  '\u2007', '\u2008', '\u2009', '\u200a', '\u202f', '\u205f', '\u3000',
+  // LineTerminator: LF, CR, and the two Unicode separators. `trim` strips these too.
+  '\u000a', '\u000d', '\u2028', '\u2029',
+] as const
+
+/**
+ * "Every character of this value is one JavaScript would trim" — the blank test, as a POSIX regular
+ * expression, and it is an ALTERNATION OF WHOLE CHARACTERS rather than a bracket class or a `btrim`
+ * character set FOR A REASON.
+ *
+ * Every database in this estate is SQL_ASCII, where PostgreSQL's character operations are BYTE
+ * operations. A character set built from the list above contains the bytes `C2` (from NBSP) and `85`
+ * (from U+2005), so `btrim(v, set)` strips U+0085 NEL — which JavaScript does NOT trim — and eats
+ * U+201A `‚` (bytes `E2 80 9A`) down to nothing, calling a perfectly ordinary punctuation mark blank.
+ * An alternation of whole UTF-8 sequences cannot do that: UTF-8 is prefix-free and self-synchronising,
+ * so a byte string matches `^(a|b|…)*$` exactly when it decodes to a sequence of those characters.
+ * The same pattern is exact under a UTF8 database too, where each alternative is one character — and
+ * that is the property that lets ONE statement be right on both. Both claims are proved against a
+ * real database in `tests/db/reconciliation-void-mirror-contradictions.test.ts`, over the whole set
+ * and over the near-miss characters that separate these spellings.
+ *
+ * ALL-WHITESPACE rather than trims-to-empty on purpose: they are the same question — a string trims
+ * to empty exactly when every character in it is trimmable — and this spelling needs no trim.
+ */
+export const ECMASCRIPT_BLANK_PATTERN = `^(?:${ECMASCRIPT_TRIM_CHARACTERS.join('|')})*$`
+
 export type AccountingReconciliationSeverity = 'warning' | 'critical'
 export type AccountingReconciliationRunStatus = 'COMPLETED' | 'FAILED' | 'PARTIAL'
 export type AccountingReconciliationFindingStatus = 'OPEN' | 'RESOLVED' | 'ACCEPTED'
@@ -1399,7 +1451,9 @@ function addAssumedRevisionOrderFindings(
  *
  * THE PARTS ARE NORMALISED THE WAY `buildAccountingEventIdempotencyKey` NORMALISES THEM — lowercased,
  * every run of characters outside `[a-z0-9._:-]` collapsed to one `-`, leading and trailing `-`
- * stripped, then joined on `:`. The one deliberate divergence: TypeScript THROWS when a part
+ * stripped, then joined on `:`. NON-BLANK, in every one of those sentences, is JavaScript `trim()`'s
+ * sense of it and not `btrim`'s — see ECMASCRIPT_BLANK_PATTERN, which is the whole of o3d-11rf r10.
+ * The one deliberate divergence: TypeScript THROWS when a part
  * normalises to blank, and this yields NO KEY instead (the `nullif(..., '')` makes the concatenation
  * NULL and the key drops out). That direction is the safe one — a row whose key cannot be built owns
  * nothing and is not reported — and it keeps a malformed row from taking down the reconciliation
@@ -1461,13 +1515,18 @@ async function collectVoidMirrorContradictions(
       -- The payload fields AS stringValue reads them: a JSON string, and non-blank. A number, a null,
       -- a missing field, or a payload that is not an object at all is no value -- which is what
       -- normalizePayload does by returning an empty record for anything that is not a record.
+      --
+      -- NON-BLANK IS JAVASCRIPT trim(), NOT btrim(). See ECMASCRIPT_BLANK_PATTERN: btrim(text)
+      -- strips ordinary spaces only, so a token of a single TAB read as PRESENT here and ABSENT in
+      -- stringValue, and the two derivations branched apart. The RAW value is what is carried
+      -- forward, exactly as stringValue returns the value it was given rather than a trimmed copy.
       CROSS JOIN LATERAL (
         SELECT
           CASE WHEN jsonb_typeof(l."payload" -> '_idempotencyKey') = 'string'
-                AND btrim(l."payload" ->> '_idempotencyKey') <> ''
+                AND l."payload" ->> '_idempotencyKey' !~ ${ECMASCRIPT_BLANK_PATTERN}
                THEN l."payload" ->> '_idempotencyKey' END AS "payloadKey",
           CASE WHEN jsonb_typeof(l."payload" -> 'date') = 'string'
-                AND btrim(l."payload" ->> 'date') <> ''
+                AND l."payload" ->> 'date' !~ ${ECMASCRIPT_BLANK_PATTERN}
                THEN l."payload" ->> 'date' END AS "payloadDate"
       ) raw
       -- buildAccountingEventIdempotencyKey's per-part normalisation, applied once per part and named
@@ -1490,7 +1549,11 @@ async function collectVoidMirrorContradictions(
       WHERE l."status"::text = ANY(${[...MIRROR_CONTRADICTING_SYNC_STATUSES]}::text[])
         -- A type that is not mirrored has no mirror to own, so it can contradict nothing.
         AND l."type"::text = ANY(${[...MIRRORED_ACCOUNTING_SYNC_TYPES]}::text[])
-        AND (l."externalTransactionId" IS NULL OR btrim(l."externalTransactionId") = '')
+        -- "Holds no document id", and blank means what trim() means here too: every TypeScript
+        -- reader of this column asks externalTransactionId?.trim(), so a tab-only id was work owed
+        -- everywhere except in this one statement, which read it as a document that exists and
+        -- dropped the row out of the live set.
+        AND (l."externalTransactionId" IS NULL OR l."externalTransactionId" ~ ${ECMASCRIPT_BLANK_PATTERN})
     ),
     contradiction AS (
       SELECT

@@ -4,6 +4,7 @@ import test from 'node:test'
 
 import {
   DAILY_BATCH_SPLIT_BRIDGE_AMBIGUOUS,
+  ECMASCRIPT_BLANK_PATTERN,
   MAX_RECONCILIATION_FINDINGS_PER_RUN,
   MAX_VOID_MIRROR_CONTRADICTIONS,
   RECONCILIATION_ROW_CAP_REACHED,
@@ -1559,6 +1560,32 @@ async function captureContradictionQuery(result: unknown[] = []) {
   return { rows, sql: captured.strings.join('?'), values: captured.values ?? [] }
 }
 
+/**
+ * WHERE EACH PARAMETER SITS IN THE STATEMENT, named rather than counted at each use. The positions
+ * are the order the `${}` holes appear in the template, so inserting a parameter renumbers every one
+ * after it — which is how the three blank-test patterns arriving first (o3d-11rf r10) pushed the two
+ * list parameters along. `assertParameterPositions` below reads them back off a real capture, so a
+ * renumbering that these constants did not follow fails ONCE, here, instead of silently turning every
+ * assertion that uses them into an assertion about the wrong value.
+ */
+const PAYLOAD_KEY_BLANK_PARAMETER = 0
+const PAYLOAD_DATE_BLANK_PARAMETER = 1
+const STATUSES_PARAMETER = 2
+const TYPES_PARAMETER = 3
+const EXTERNAL_ID_BLANK_PARAMETER = 4
+
+test('o3d-11rf r10: the statement’s parameters are where the assertions below say they are', async () => {
+  const { values } = await captureContradictionQuery()
+
+  assert.equal(values.length, 6, 'six holes in the template: three blank patterns, two lists and the bound')
+  assert.equal(typeof values[PAYLOAD_KEY_BLANK_PARAMETER], 'string')
+  assert.equal(typeof values[PAYLOAD_DATE_BLANK_PARAMETER], 'string')
+  assert.ok(Array.isArray(values[STATUSES_PARAMETER]), 'the statuses are the first list')
+  assert.ok(Array.isArray(values[TYPES_PARAMETER]), 'the types are the second')
+  assert.equal(typeof values[EXTERNAL_ID_BLANK_PARAMETER], 'string')
+  assert.equal(typeof values.at(-1), 'number', 'and the bound is last')
+})
+
 test('o3d-11rf r4: the contradictions are ASKED FOR, by a statement with no date bound in it', async () => {
   // THE FINDING, STATED AS AN ASSERTION. The subjects of this warning are older than any lookback by
   // definition — a settlement made before the column existed, a row written by hand. A statement that
@@ -1570,7 +1597,7 @@ test('o3d-11rf r4: the contradictions are ASKED FOR, by a statement with no date
   assert.match(sql, /FROM "accounting_sync_logs" l/, 'and the live sync rows are the other')
   assert.match(sql, /e\."status" = 'VOID'/)
   assert.match(sql, /e\."voidBasis" IS NULL/, 'only the voids NO WRITER EXPLAINED')
-  assert.match(sql, /l\."externalTransactionId" IS NULL OR btrim\(l\."externalTransactionId"\) = ''/,
+  assert.match(sql, /l\."externalTransactionId" IS NULL OR l\."externalTransactionId" ~ \?/,
     'and only sync rows that hold no document id — a row that has one describes a document that exists')
 
   assert.ok(!/businessDate|createdAt|syncedAt|fromDate/.test(sql),
@@ -1618,8 +1645,81 @@ test('o3d-11rf r9: and the ownership clause is joined on too, by the mirror key 
 
   // A row whose type is not mirrored has no mirror, so it is not in the live set at all.
   assert.match(sql, /l\."type"::text = ANY\(\?::text\[\]\)/, 'the mirrored types are a parameter')
-  assert.deepEqual(values[1], [...MIRRORED_ACCOUNTING_SYNC_TYPES],
+  assert.deepEqual(values[TYPES_PARAMETER], [...MIRRORED_ACCOUNTING_SYNC_TYPES],
     'and it is the ONE list, not a copy that can fall behind it')
+})
+
+/**
+ * o3d-11rf r10 (Codex r10, HIGH) — THE BLANK TEST IS JAVASCRIPT'S, AND IT IS ENUMERATED HERE FROM THE
+ * ENGINE RATHER THAN TYPED OUT.
+ *
+ * The defect this replaces: the statement asked `btrim(text)`, which strips ORDINARY SPACES ONLY, for
+ * a question `stringValue` answers with `.trim()`. A `_idempotencyKey` of one TAB was therefore
+ * PRESENT to SQL and ABSENT to TypeScript, the two derivations took different branches, and the row
+ * ended with no mirror key at all.
+ *
+ * WHY THE SET IS DERIVED HERE. Spelling the 25 characters out in the test and comparing them with the
+ * 25 spelled out in the query would prove only that one person typed the same list twice. What has to
+ * be true is that the list IS `String.prototype.trim`'s, so it is taken from the running engine — and
+ * if a future JavaScript trims one more character, this goes red rather than the two spellings
+ * quietly parting company.
+ *
+ * WHAT IT CANNOT SHOW is what PostgreSQL does with the pattern. That is a fact about a database and
+ * it is proved against one in tests/db/reconciliation-void-mirror-contradictions, over every one of
+ * these characters and over the near-misses that separate this spelling from the plausible wrong ones.
+ */
+function everyCharacterJavaScriptTrims(): string[] {
+  const characters: string[] = []
+  for (let point = 0; point <= 0x10ffff; point++) {
+    if (point >= 0xd800 && point <= 0xdfff) continue
+    const character = String.fromCodePoint(point)
+    if (character.trim() === '') characters.push(character)
+  }
+  return characters
+}
+
+test('o3d-11rf r10: the blank test the statement sends IS JavaScript trim(), character for character', async () => {
+  const trimmable = everyCharacterJavaScriptTrims()
+
+  // THE PREMISE, ASSERTED BEFORE ANYTHING IS CONCLUDED FROM IT: this set is not the ASCII one, which
+  // is the entire finding. A `btrim(text)` that handled it would make the rest of this test vacuous.
+  assert.ok(trimmable.includes('\t'), 'tab is trimmable — the character Codex named')
+  assert.ok(trimmable.includes('\u00a0') && trimmable.includes('\ufeff') && trimmable.includes('\u3000'),
+    'and so are NBSP, the BOM and an ideographic space — none of which btrim(text) touches')
+  assert.equal(trimmable.includes('\u0085'), false, 'NEL is NOT trimmable, whatever a ctype-driven class says')
+  assert.equal(trimmable.includes('\u200b'), false, 'nor is a zero-width space')
+
+  const { sql, values } = await captureContradictionQuery()
+
+  // The pattern is read back OUT of the statement's own parameters, so this is an assertion about
+  // what production sends and not about a constant that happens to sit beside it.
+  const sent = [values[PAYLOAD_KEY_BLANK_PARAMETER], values[PAYLOAD_DATE_BLANK_PARAMETER], values[EXTERNAL_ID_BLANK_PARAMETER]]
+  assert.deepEqual(sent, [ECMASCRIPT_BLANK_PATTERN, ECMASCRIPT_BLANK_PATTERN, ECMASCRIPT_BLANK_PATTERN],
+    'all three blank tests in the statement ask the same question, and it is the exported one')
+
+  // `[\s\S]` rather than `.` with the `s` flag: the alternation CONTAINS a newline and a CR, and the
+  // flag is not available at this tsconfig target.
+  const match = /^\^\(\?:([\s\S]*)\)\*\$$/.exec(ECMASCRIPT_BLANK_PATTERN)
+  assert.ok(match, 'the pattern is an anchored repetition of an alternation — anything else is a different rule')
+  const alternatives = match[1].split('|')
+  assert.equal(alternatives.length, trimmable.length,
+    'one alternative per trimmable character, no duplicates and none invented')
+  assert.deepEqual([...alternatives].sort(), [...trimmable].sort(),
+    'and they are exactly the characters the engine trims')
+
+  // AN ALTERNATION OF WHOLE CHARACTERS, NOT A CLASS. Every database in this estate is SQL_ASCII, where
+  // a bracket expression or a btrim character set is a set of BYTES: it would eat U+0085 and chew
+  // U+201A to nothing. Asserted on the spelling because the consequence is asserted in the DB suite.
+  assert.ok(!/\[\[:space:\]\]|\\s/.test(ECMASCRIPT_BLANK_PATTERN),
+    'no ctype-driven class: PostgreSQL disagrees with JavaScript about NBSP and about NEL')
+  // Over the EXECUTABLE statement with its `--` prose stripped out, because the prose beside the
+  // predicates names `btrim` in order to say why it is gone.
+  const executable = sql.replace(/--[^\n]*/g, '')
+  assert.ok(/!~ \?/.test(executable), 'the comment stripper left the predicates behind — it is not eating the statement')
+  assert.ok(!/btrim/.test(executable), 'and no btrim left in the statement — that spelling is the defect')
+
+  assert.match(sql, /l\."payload" ->> '_idempotencyKey' !~ \?/, 'the payload token is tested with it')
+  assert.match(sql, /l\."payload" ->> 'date' !~ \?/, 'the legacy date is too')
 })
 
 test('o3d-11rf r4: the bound is applied AFTER the grouping, and it is the stated one', async () => {
@@ -1655,7 +1755,7 @@ test('o3d-11rf r4: the bound is applied AFTER the grouping, and it is the stated
 
   assert.equal(values.at(-1), MAX_VOID_MIRROR_CONTRADICTIONS,
     'the bound is a parameter, and it is the one the truncation finding names')
-  assert.deepEqual(values[0], ['PENDING', 'PROCESSING'],
+  assert.deepEqual(values[STATUSES_PARAMETER], ['PENDING', 'PROCESSING'],
     'and the live statuses are parameters too, so the constant is the single spelling of that set')
 })
 
