@@ -78,6 +78,21 @@ const WORKFLOW = '.github/workflows/schema-guardrails.yml'
 const DB_SUITE_INVOCATION = ['npm', 'run', 'test:db']
 const MIGRATE_INVOCATION = ['prisma', 'migrate', 'deploy']
 
+/**
+ * The programs that actually collect and run test files here. An allowlist, so that a script this
+ * guard cannot read reports itself rather than being read loosely.
+ */
+const TEST_RUNNERS = new Set(['tsx', 'node', 'vitest', 'jest', 'mocha', 'ava', 'tap', 'playwright'])
+
+/** The program a command invokes: its first word past leading assignments, wrappers and flags. */
+function headOf(words: string[]): string {
+  const head = words.find((word) => !/^[A-Za-z_][A-Za-z0-9_]*=/.test(word) && !word.startsWith('-')
+    && !SHELL_WRAPPERS.has(word))
+  return (head ?? '').replace(/^.*\//, '')
+}
+const SHELL_WRAPPERS = new Set(['npx', 'pnpm', 'yarn', 'bun', 'bunx', 'sudo', 'env', 'time', 'nice',
+  'exec', 'command', 'cross-env', 'dotenv', 'xvfb-run'])
+
 /** The files that were gated on the day this guard was written. The walk must keep finding them. */
 const KNOWN_GATED = [
   'tests/db/accounting-event-void-basis-backfill.test.ts',
@@ -153,9 +168,18 @@ test(`npm run test:db sets ${GATE} and ${TRIPWIRE} and reaches every gated file`
     `test:db must set ${TRIPWIRE}=1 so a half-wired invocation fails instead of skipping: `
     + `${JSON.stringify(script)}`)
 
-  const globs = shellCommands(script).flatMap((words) => words)
+  // AND THE GLOBS ARE READ OFF THE COMMAND THAT RUNS THE TESTS, not off the script. Taking every
+  // starred word in the script would let `echo "tests/db/**" && tsx --test one-file.test.ts` supply
+  // the coverage the runner does not — an argument standing in for an invocation again, one field
+  // over. The runner list is an ALLOWLIST so the failure direction is safe: a script whose runner
+  // this guard does not recognise reports that, instead of quietly reading globs from anywhere.
+  const runnerCommands = shellCommands(script).filter((words) => TEST_RUNNERS.has(headOf(words)))
+  assert.ok(runnerCommands.length > 0,
+    `test:db runs no recognised test runner (${JSON.stringify([...TEST_RUNNERS])}); its globs cannot `
+    + `be read off a command that does not run tests: ${JSON.stringify(script)}`)
+  const globs = runnerCommands.flatMap((words) => words)
     .filter((word) => word.includes('*') && !word.startsWith('-'))
-  assert.ok(globs.length > 0, `test:db names no test glob: ${rest}`)
+  assert.ok(globs.length > 0, `test:db's runner names no test glob: ${rest}`)
   const matchers = globs.map(globToRegExp)
   // The matcher itself must be able to say no, or "covered" means nothing.
   assert.ok(!matchers.some((matcher) => matcher.test('tests/unit/not-a-db-test.spec.ts')),
@@ -477,6 +501,9 @@ test('the shell reader reads the command, not the string', () => {
     'the splitter reads words, keeps a quoted argument whole, and ends a command at &&')
   assert.equal(invokes(['echo', 'npm', 'run', 'test:db'], DB_SUITE_INVOCATION), false,
     'position, not presence')
+  assert.equal(headOf(['A=1', 'npx', '--yes', 'tsx', '--test', 'tests/db/*.test.ts']), 'tsx',
+    'the program a command invokes is read past assignments, wrappers and flags')
+  assert.equal(headOf(['echo', 'tsx']), 'echo', 'and echo is the program, whatever it is handed')
 })
 
 /**
