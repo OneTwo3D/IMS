@@ -50,7 +50,6 @@ import {
 import { syncRefundsForOrder } from '@/lib/connectors/woocommerce/sync/refund-sync'
 import { wcFetch } from '@/lib/connectors/woocommerce/api'
 import {
-  RECOVERABLE_REFUND_PARK_STATUSES,
   activeRefundParkWhere,
   buildRefundParkDismissData,
   buildRefundParkReassignData,
@@ -2451,13 +2450,15 @@ export async function recoverRefundSyncPark(
       // overwritten by a conclusion formed about the row as it was.
       const updated = await tx.shoppingSyncLog.updateMany({
         where: {
+          // o3d-272i: the shared park predicate, which is also the one REFUND_PARK_WHERE listed this
+          // row by, so the re-verify asks for exactly what the read asked for. Hand-written, it left
+          // out `recordKind` — and the sequence that column exists for is precisely a park being
+          // rewritten as a held sales invoice between the inbox read and this write, which this
+          // condition would then have failed to notice.
+          ...activeRefundParkWhere(),
           id: park.id,
-          connector: 'woocommerce',
-          direction: 'FROM_CONNECTOR',
-          entityType: 'SalesOrder',
           externalId: park.externalId,
           entityId: park.entityId,
-          status: { in: [...RECOVERABLE_REFUND_PARK_STATUSES] },
         },
         data: assertion.outcome === 'REASSIGN'
           ? buildRefundParkReassignData(targetOrderId as string, note, now)

@@ -209,12 +209,28 @@ function makeDependencies(options: {
       return null
     },
     async create(args: { data: Record<string, unknown> }) {
-      const d = args.data as { externalId?: string; entityType?: string; direction?: string; status?: string }
+      const d = args.data as { externalId?: string; entityType?: string; direction?: string; status?: string; recordKind?: string }
       const actionable = ['PENDING', 'FAILED', 'QUARANTINED']
-      if (d.entityType === 'SalesOrder' && d.direction === 'FROM_CONNECTOR' && actionable.includes(d.status ?? '')) {
+      // o3d-272i r2: the double stands in for shopping_sync_logs_active_refund_park_uq, so it carries
+      // the index's OWN predicate — including the `recordKind` clause migration 20260909090000 added.
+      // Without it this fake refuses a held sales invoice colliding with a refund id, which is exactly
+      // the behaviour the real index has stopped having: a stand-in for the fixed database that still
+      // models the bug is worse than none, because the next reader would trust it.
+      //
+      // AND NOTHING IN THIS FILE REACHES THE THROW — measured, by making this branch unreachable and
+      // watching all 57 tests stay green. It is kept, and kept correct, because a future duplicate
+      // fixture would otherwise be answered by a fake that models July's index. The uniqueness itself
+      // is asserted where it can actually fail: tests/concurrency/refund-park-index-family-scope
+      // .concurrent.test.ts, against the real index in a database built from the migrations.
+      const isPark = (row?: { entityType?: string; direction?: string; status?: string; recordKind?: string }) =>
+        row?.entityType === 'SalesOrder'
+        && row?.direction === 'FROM_CONNECTOR'
+        && row?.recordKind === 'WC_REFUND_PARK'
+        && actionable.includes(row?.status ?? '')
+      if (isPark(d)) {
         const dup = syncLogs.some((r) => {
           const rd = (r as { data?: typeof d }).data
-          return rd?.entityType === 'SalesOrder' && rd?.direction === 'FROM_CONNECTOR' && rd?.externalId === d.externalId && actionable.includes(rd?.status ?? '')
+          return isPark(rd) && rd?.externalId === d.externalId
         })
         if (dup) throw new Prisma.PrismaClientKnownRequestError('Unique constraint failed', { code: 'P2002', clientVersion: 'test', meta: { target: ['shopping_sync_logs_active_refund_park_uq'] } })
       }

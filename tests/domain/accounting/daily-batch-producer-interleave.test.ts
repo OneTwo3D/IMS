@@ -206,7 +206,12 @@ function makeTx(hooks: { onBackfillCount?: () => Promise<void> | void } = {}) {
     // here instead of silently matching everything.
     shoppingSyncLog: {
       findMany: async ({ where }: { where: Record<string, unknown> }) => {
-        const taught = new Set(['connector', 'direction', 'entityType', 'status', 'entityId', 'externalId'])
+        // o3d-272i: `recordKind` joined the predicate when WC_COUPON_REFUND_PARK_WHERE stopped being a
+        // hand-written copy and became `activeRefundParkWhere()` + this site's own externalId clause.
+        // THIS DOUBLE IS WHY THAT WAS NOT SILENT: it threw here rather than accepting a query it does
+        // not model, which is exactly what it is for. Kept as an explicit list rather than derived from
+        // the predicate, so the next clause surfaces the same way.
+        const taught = new Set(['connector', 'direction', 'entityType', 'status', 'entityId', 'externalId', 'recordKind'])
         for (const key of Object.keys(where)) {
           if (!taught.has(key)) throw new Error(`shoppingSyncLog double was not taught the predicate ${key}`)
         }

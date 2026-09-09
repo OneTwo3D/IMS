@@ -43,38 +43,26 @@
  */
 
 /**
- * The park statuses an operator may recover.
- *
- * These are precisely the ACTIONABLE statuses — the set carried by the partial unique index
- * `shopping_sync_logs_active_refund_park_uq`, by REFUND_PARK_WHERE in the exception inbox, by the
- * order delete guard, and by the retention exemption. A park in any of them is blocking something;
- * a park outside them is already resolved and is not this action's business.
- *
- * QUARANTINED is included deliberately. It is the o3d-iup "monetary-only refund on a non-uniformly
- * taxed order" refusal — but the tax profile it was refused against is the profile of the order the
- * park is sitting on, which is exactly what is in question here. A quarantine computed against the
- * WRONG order carries no information about the right one.
+ * The actionable-status set and the park's own `recordKind` stamp now live in
+ * lib/domain/sales/wc-sync-row-families.ts, beside the held sales invoice's stamp and the union
+ * predicate the order-protecting readers need (o3d-272i). They are re-exported here unchanged
+ * because this is where most callers import them from, and because moving a name is not the point —
+ * having exactly one of it is.
  */
-export const RECOVERABLE_REFUND_PARK_STATUSES = ['PENDING', 'FAILED', 'QUARANTINED'] as const
+import {
+  ACTIVE_REFUND_PARK_ROW,
+  RECOVERABLE_REFUND_PARK_STATUSES,
+  WC_REFUND_PARK_RECORD_KIND,
+  isRecoverableRefundParkStatus,
+  type RecoverableRefundParkStatus,
+} from '@/lib/domain/sales/wc-sync-row-families'
 
-export type RecoverableRefundParkStatus = (typeof RECOVERABLE_REFUND_PARK_STATUSES)[number]
-
-export function isRecoverableRefundParkStatus(status: string): status is RecoverableRefundParkStatus {
-  return (RECOVERABLE_REFUND_PARK_STATUSES as readonly string[]).includes(status)
-}
-
-/**
- * WHAT THIS ROW IS — the value a refund park stamps into `recordKind` (o3d-xnwu r8, Codex HIGH).
- *
- * `entityType` says what the row is ABOUT (a sales order). This says what the row IS. They are
- * different questions and r7's predicate could only ask the first one, which is why it admitted a
- * held sales invoice — see {@link activeRefundParkWhere}.
- *
- * Written by `upsertRefundPark` and by nothing else, and read by every predicate that means "an
- * actionable refund park". It is an assertion the writer makes about its own row, never an
- * inference from what a row lacks.
- */
-export const WC_REFUND_PARK_RECORD_KIND = 'WC_REFUND_PARK'
+export {
+  RECOVERABLE_REFUND_PARK_STATUSES,
+  WC_REFUND_PARK_RECORD_KIND,
+  isRecoverableRefundParkStatus,
+} from '@/lib/domain/sales/wc-sync-row-families'
+export type { RecoverableRefundParkStatus } from '@/lib/domain/sales/wc-sync-row-families'
 
 /**
  * THE WITNESS — the activity-log action `recoverParkedWcRefund` writes when it recovers a park, and
@@ -161,6 +149,27 @@ export const WC_REFUND_PARK_RECOVERED_ACTION = 'wc_refund_park_recovered'
  * ONE DEFINITION, three readers: the exception inbox, the refund sync's cross-order guard, and the
  * park upsert. They must agree with each other and with the partial unique index
  * `shopping_sync_logs_active_refund_park_uq`, and three hand-written copies could not.
+ *
+ * AND THE INDEX WAS A FOURTH COPY THAT DID NOT AGREE, until o3d-272i r2 (Codex HIGH). It is DDL,
+ * so no sweep of this repository's TypeScript could see it, and it was built in July with the
+ * pre-`recordKind` shape: connector, direction, `SalesOrder`, an actionable status, a non-null
+ * externalId and a non-null entityId. A held sales invoice writes every one of those, so the index
+ * treated one as a refund park and REFUSED it whenever its external order id equalled some
+ * refund's id — overriding this predicate however carefully it distinguishes the two. The literals
+ * therefore now live in `ACTIVE_REFUND_PARK_ROW`, which also renders the index's WHERE clause
+ * (`activeRefundParkIndexPredicateSql`); migration 20260909090000 carries that rendered text, and
+ * two tests hold the three spellings together — one comparing the file against the renderer, one
+ * executing the SHIPPED index predicate against this `where` over a probe matrix.
+ *
+ * NARROW IT. DO NOT NEGATE IT (o3d-272i r3, Codex MEDIUM). Every reader below spreads this and adds
+ * clauses, which is safe. `{ NOT: activeRefundParkWhere() }` would NOT be: Prisma compiles it to a
+ * SQL negation of the whole conjunction, `recordKind` is a nullable column, and an UNSTAMPED row
+ * therefore answers UNKNOWN to the predicate AND UNKNOWN to its negation — it appears in neither
+ * result, so the "complement" is quietly the complement minus the unstamped rows. Nothing here can
+ * prevent that from inside the returned object (the `where` language has no COALESCE and `NOT`
+ * wraps whatever it is given), so scripts/check-wc-sync-row-predicates.mjs refuses the negation at
+ * build time. Where a genuine complement is needed, `unresolvedWcOrderRowSql()` renders a TOTAL
+ * fragment for exactly this reason.
  */
 export function activeRefundParkWhere(): {
   connector: string
@@ -171,17 +180,17 @@ export function activeRefundParkWhere(): {
   status: { in: RecoverableRefundParkStatus[] }
 } {
   return {
-    connector: 'woocommerce',
-    direction: 'FROM_CONNECTOR',
-    entityType: 'SalesOrder',
+    connector: ACTIVE_REFUND_PARK_ROW.connector,
+    direction: ACTIVE_REFUND_PARK_ROW.direction,
+    entityType: ACTIVE_REFUND_PARK_ROW.entityType,
     // A park is evidence ABOUT AN IMS ORDER, so it always names one. This is also what the partial
     // unique index requires, and what separates a park from the row families that have NO entityId
     // (a failed import, a pending-FX queue row, an admission refusal).
     entityId: { not: null },
     // …and this is what separates it from the one family that DOES have one: the held sales
     // invoice. The row says which family it belongs to; nothing here infers it (r8).
-    recordKind: WC_REFUND_PARK_RECORD_KIND,
-    status: { in: [...RECOVERABLE_REFUND_PARK_STATUSES] },
+    recordKind: ACTIVE_REFUND_PARK_ROW.recordKind,
+    status: { in: [...ACTIVE_REFUND_PARK_ROW.statuses] },
   }
 }
 

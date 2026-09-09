@@ -208,8 +208,10 @@ import {
  *                  r7 finding 1, and the signal whose ABSENCE was the worst of the four. A
  *                  WooCommerce refund that arrived and could NOT be recorded is durably PARKED as a
  *                  `ShoppingSyncLog` row (`refund-sync.ts`: connector woocommerce, FROM_CONNECTOR,
- *                  entityType SalesOrder, an entityId, and status PENDING / FAILED / QUARANTINED —
- *                  exactly the predicate of the `shopping_sync_logs_active_refund_park_uq` index).
+ *                  entityType SalesOrder, recordKind WC_REFUND_PARK, an entityId, and status
+ *                  PENDING / FAILED / QUARANTINED — exactly the predicate of the
+ *                  `shopping_sync_logs_active_refund_park_uq` index, which has carried the
+ *                  recordKind clause since 20260909090000).
  *                  It creates NO refund row, NO status change and NO credit note, so all three
  *                  signals above read "not refunded" for it — while the money has already left the
  *                  business. A monetary-only refund on a non-uniformly-taxed order is quarantined

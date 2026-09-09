@@ -31,6 +31,11 @@ import {
   evaluateWooCommerceEnableConnectionGate,
 } from '@/lib/connectors/woocommerce/connection-test-gate'
 import { normaliseWcOrderStatus } from '@/lib/connectors/woocommerce/order-status-filter'
+import {
+  UNRESOLVED_WC_ORDER_ROW_DESCRIPTIONS,
+  isUnresolvedWcOrderRowFamily,
+  unresolvedWcOrderRowWhere,
+} from '@/lib/domain/sales/wc-sync-row-families'
 
 // All mutating exports in this file require the `sync` permission. Renamed from `requireAdmin`,
 // which shadowed the ADMIN-only helper of that name in @/lib/auth/server.
@@ -440,19 +445,29 @@ export async function saveWcCredentials(url: string, key: string, secret: string
     // switch would fetch the NEW store by that id — stranding it (id absent) or MISAPPLYING a different
     // store's refund to the old IMS order. Block until the operator resolves them. (Full fix — bind links/
     // parks to an immutable store identity + reject a retry on mismatch — remains tracked in o3d-7yf.)
+    //
+    // o3d-272i: THE SET IS THE SAME, THE SENTENCE IS NOT. This was a hand-written copy of the
+    // pre-recordKind refund-park shape, so it also counted HELD SALES INVOICES (o3d-k26m.6) — which
+    // is the right set to block a rebind on, and for the same reason with the same force: a hold
+    // carries the OLD store's externalOrderId with no store-identity binding, so releasing it after
+    // the switch would fetch the NEW store by that id. What was wrong was that every one of them was
+    // reported to the operator as an "unresolved refund", including the ones that are invoices, and
+    // the remedy offered was an inbox that does not list them.
     const storeUrlChanging = prevUrl !== '' && validatedUrl.normalizedUrl !== prevUrl
     if (storeUrlChanging) {
-      const parkedCount = await tx.shoppingSyncLog.count({
-        where: {
-          connector: 'woocommerce',
-          direction: 'FROM_CONNECTOR',
-          entityType: 'SalesOrder',
-          status: { in: ['PENDING', 'FAILED', 'QUARANTINED'] },
-          entityId: { not: null },
-        },
+      const unresolvedByKind = await tx.shoppingSyncLog.groupBy({
+        by: ['recordKind'],
+        where: unresolvedWcOrderRowWhere(),
+        _count: { _all: true },
       })
-      if (parkedCount > 0) {
-        return { blocked: true as const, parkedCount }
+      if (unresolvedByKind.length > 0) {
+        return {
+          blocked: true as const,
+          unresolved: unresolvedByKind.map((group) => ({
+            recordKind: group.recordKind,
+            count: group._count._all,
+          })),
+        }
       }
     }
 
@@ -506,10 +521,23 @@ export async function saveWcCredentials(url: string, key: string, secret: string
   })
 
   if ('blocked' in saveOutcome && saveOutcome.blocked) {
+    // One phrase per family, so an operator counting three "unresolved refunds" that are actually
+    // two refunds and an invoice hold is told which is which and where each one is resolved. The
+    // fallback branch is unreachable while `unresolvedWcOrderRowWhere` admits only the families it
+    // enumerates — and it COUNTS the unrecognised row rather than dropping it, because a rebind
+    // refused for a reason this build cannot name is still the safe answer.
+    const counted = saveOutcome.unresolved.map(({ recordKind, count }) => (
+      isUnresolvedWcOrderRowFamily(recordKind)
+        ? `${count} ${UNRESOLVED_WC_ORDER_ROW_DESCRIPTIONS[recordKind].countNoun}`
+        : `${count} unresolved WooCommerce sync row(s) of a kind this build does not recognise`
+    ))
     return {
       success: false,
       wipedMappings: 0,
-      error: `Cannot change the WooCommerce store URL while ${saveOutcome.parkedCount} unresolved refund(s) are parked for review. They are bound to the current store — resolve them in the sync exceptions inbox first, or they would be stranded or misapplied against a different store.`,
+      error: `Cannot change the WooCommerce store URL while this store still has ${counted.join(' and ')}. `
+        + 'They are bound to the current store — a parked refund is resolved in the sync exceptions inbox, '
+        + 'and a held invoice releases once WooCommerce issues its number — so resolve them first, or they '
+        + 'would be stranded or misapplied against a different store.',
       code: 'unresolved_refund_parks',
     }
   }
