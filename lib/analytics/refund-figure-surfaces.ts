@@ -166,10 +166,10 @@ export const REFUND_FIGURE_SURFACES: readonly RefundFigureSurface[] = [
   },
   {
     file: 'app/(dashboard)/analytics/product-profitability/product-profitability-client.tsx',
-    figures: ['currentFyProfit', 'currentFyRevenue', 'previousFyProfit', 'previousFyRevenue', 'unitMargin', 'unitMarginPct'],
+    figures: ['currentFyProfit', 'currentFyRevenue', 'currentFyRevenueBound', 'previousFyProfit', 'previousFyRevenue', 'previousFyRevenueBound', 'unitMargin', 'unitMarginPct'],
     treatment: 'basis-aware',
     reason:
-      'Renders the FY revenue/profit bounds and the unplaced-credit columns from app/actions/product-profitability.ts.',
+      'Renders the FY revenue/profit bounds and the unplaced-credit columns from app/actions/product-profitability.ts. o3d-la3n: the fourteen marked sites here \u2014 cells, footers, colouring, cards and the browser-built CSV\u2019s two bound columns \u2014 READ the producer\u2019s currentFy/previousFyRevenueBound. Twelve of them derived a \u2264 from \u2026RefundBasisComplete, a boolean that cannot say indeterminate, and the CSV\u2019s two derived it from refundsGrossBasis + refundsUnknownBasis, a signed sum in which two opposite same-basis credits cancel. The filtered subtotal combines the row markers through combineNetLinearFigureBounds rather than re-summing anything.',
   },
   {
     file: 'app/(dashboard)/analytics/purchase-stats/purchase-stats-client.tsx',
@@ -271,10 +271,10 @@ export const REFUND_FIGURE_SURFACES: readonly RefundFigureSurface[] = [
   },
   {
     file: 'app/actions/product-profitability.ts',
-    figures: ['currentFyProfit', 'currentFyRevenue', 'getProductProfitability', 'previousFyProfit', 'previousFyRevenue', 'revenue', 'unitMargin', 'unitMarginPct'],
+    figures: ['currentFyProfit', 'currentFyRevenue', 'currentFyRevenueBound', 'getProductProfitability', 'previousFyProfit', 'previousFyRevenue', 'previousFyRevenueBound', 'revenue', 'unitMargin', 'unitMarginPct'],
     treatment: 'basis-aware',
     reason:
-      'FY revenue/profit bucket refunds by basis and publish per-FY bounds.',
+      'FY revenue/profit bucket refunds by basis and publish per-FY bounds. o3d-la3n: the bound is a MARKER classified here from the unrounded interval (\u03a3 min(entry,0) to \u03a3 max(entry,0)), not a signed credit sum left for the page to re-derive.',
   },
   {
     file: 'app/actions/purchase-stats.ts',

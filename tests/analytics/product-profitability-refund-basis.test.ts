@@ -1,6 +1,9 @@
 import assert from 'node:assert/strict'
 import test, { mock } from 'node:test'
 
+// Import-free and pure by contract, so it is safe above the module mocks below.
+import * as linear from '@/lib/domain/sales/derived-figure-bound'
+
 /**
  * o3d-iigc: the FY profitability report built `revenue` from ex-VAT line totals and then did
  * `agg.revenue -= Number(rl.totalBase)` for every refund line, whatever basis the parent refund was
@@ -166,4 +169,187 @@ test('a product with no sales at all is not reported as an upper bound (o3d-iigc
   assert.equal(r.currentFyRefundBasisComplete, true)
   assert.equal(r.previousFyRefundBasisComplete, true)
   assert.equal(r.currentFyRevenue, 0)
+})
+
+// ---------------------------------------------------------------------------
+// o3d-la3n: A `≤` MAY NOT COME OFF A SIGNED CREDIT SUM, OR OFF A BOOLEAN
+// ---------------------------------------------------------------------------
+
+/**
+ * THE DEFECT IN MONEY. Widget sells for £100 ex-VAT in the FY against £40 of COGS, and carries two
+ * GROSS-basis credits: +£120.00 and −£60.00 (a credit and a partial reversal of it, both stamped
+ * gross, neither placeable on this report's ex-VAT basis).
+ *
+ *   published FY revenue                 £100.00      no gross-basis credit is subtracted
+ *   published FY profit                  £ 60.00
+ *   published `refundsGrossBasis`        £ 60.00      120 + (−60) — THE SIGNED SUM
+ *
+ * Every consumer classified the bound from that £60.00, or from the boolean beside it. £60.00 is not
+ * negative, so all fourteen of them printed `≤`: "FY revenue is AT MOST £100.00".
+ *
+ * It is not. The unplaced credit's true ex-VAT value lies in [Σ min(entry,0), Σ max(entry,0)] =
+ * [−£60.00, +£120.00] — a gross credit's net value is between zero and the credit itself, and this
+ * one has an entry that is NEGATIVE. So the true revenue lies in [£100 − £120, £100 + £60] =
+ * [−£20.00, £160.00], and can sit £60.00 ABOVE the ceiling the page printed. The relation is not
+ * `≤`; there is no relation, and the report has to say so.
+ */
+
+/** The classification every consumer performed before this fix, reproduced exactly. */
+function theOldRule(row: { basisComplete: boolean; gross: number; unknown: number }) {
+  return linear.netLinearFigureBound({
+    basisComplete: row.basisComplete,
+    unplacedCredit: row.gross + row.unknown,
+  })
+}
+
+test('two gross credits that partly cancel: the OLD rule says ≤, and the published verdict says nothing (o3d-la3n)', async () => {
+  CURRENT_FY_ORDERS = [order({
+    lines: [{ productId: 'p1', qty: 1, totalBase: 100, cogsBase: 40 }],
+    refunds: [
+      { totalsBasis: 'GROSS', lines: [{ productId: 'p1', qty: 1, totalBase: 120 }] },
+      { totalsBasis: 'GROSS', lines: [{ productId: 'p1', qty: -1, totalBase: -60 }] },
+    ],
+  })]
+  PREVIOUS_FY_ORDERS = []
+  const { bySku } = await rowsBySku()
+  const r = bySku.get('SKU-1')!
+
+  // The published figures are unchanged — this finding is about the RELATION, not the number.
+  assert.equal(r.currentFyRevenue, 100)
+  assert.equal(r.currentFyProfit, 60)
+  // The trap, on the two columns a consumer had to work from.
+  assert.equal(r.currentFyRefundsGrossBasis, 60, '120 + (-60): the signed sum is POSITIVE')
+  assert.equal(r.currentFyRefundsUnknownBasis, 0)
+  assert.equal(r.currentFyRefundBasisComplete, false)
+  assert.equal(
+    theOldRule({ basisComplete: r.currentFyRefundBasisComplete, gross: r.currentFyRefundsGrossBasis, unknown: r.currentFyRefundsUnknownBasis }),
+    'upper',
+    'the rule this fix removes really does answer `upper` on this order — otherwise the test below proves nothing',
+  )
+  assert.equal(r.currentFyRevenueBound, 'indeterminate', 'the true revenue can be £160 — £60 ABOVE the published £100')
+})
+
+test('two gross credits that cancel EXACTLY leave a zero bucket and still claim nothing (o3d-la3n)', async () => {
+  CURRENT_FY_ORDERS = [order({
+    lines: [{ productId: 'p1', qty: 1, totalBase: 100, cogsBase: 40 }],
+    refunds: [
+      { totalsBasis: 'GROSS', lines: [{ productId: 'p1', qty: 1, totalBase: 120 }] },
+      { totalsBasis: 'GROSS', lines: [{ productId: 'p1', qty: -1, totalBase: -120 }] },
+    ],
+  })]
+  PREVIOUS_FY_ORDERS = []
+  const { bySku } = await rowsBySku()
+  const r = bySku.get('SKU-1')!
+
+  assert.equal(r.currentFyRefundsGrossBasis, 0, 'the two entries are gone; the column cannot tell this from "no credit"')
+  assert.equal(r.currentFyRefundBasisComplete, false, 'but the flag remembers that something was unplaceable')
+  assert.equal(theOldRule({ basisComplete: false, gross: 0, unknown: 0 }), 'upper', 'zero is not negative')
+  assert.equal(r.currentFyRevenueBound, 'indeterminate')
+})
+
+test('an ORDINARY single gross credit is still a sound upper bound — the fix is not blanket (o3d-la3n)', async () => {
+  CURRENT_FY_ORDERS = [order({
+    lines: [{ productId: 'p1', qty: 1, totalBase: 100, cogsBase: 40 }],
+    refunds: [{ totalsBasis: 'GROSS', lines: [{ productId: 'p1', qty: 1, totalBase: 120 }] }],
+  })]
+  PREVIOUS_FY_ORDERS = []
+  const { bySku } = await rowsBySku()
+  const r = bySku.get('SKU-1')!
+
+  assert.equal(r.currentFyRevenueBound, 'upper', 'no entry was negative, so £100 IS a ceiling')
+  assert.equal(r.previousFyRevenueBound, 'exact', 'and the FY with no credit at all is unmarked')
+})
+
+test('a clean FY publishes `exact`, and so does a product with no sales (o3d-la3n)', async () => {
+  CURRENT_FY_ORDERS = [order({
+    lines: [{ productId: 'p1', qty: 1, totalBase: 100, cogsBase: 40 }],
+    refunds: [{ totalsBasis: 'NET', lines: [{ productId: 'p1', qty: 1, totalBase: 25 }] }],
+  })]
+  PREVIOUS_FY_ORDERS = []
+  const { bySku, summary } = await rowsBySku()
+
+  assert.equal(bySku.get('SKU-1')!.currentFyRevenue, 75, 'a NET credit is subtracted as it always was')
+  assert.equal(bySku.get('SKU-1')!.currentFyRevenueBound, 'exact')
+  assert.equal(bySku.get('SKU-2')!.currentFyRevenueBound, 'exact', 'nothing sold, nothing unplaced')
+  assert.equal(summary.currentFyRevenueBound, 'exact')
+})
+
+test('SUB-PENNY cancellation: the ROUNDED column loses the negative entry, the verdict does not (o3d-la3n)', async () => {
+  // The interval is classified from the UNROUNDED aggregate. Round the two endpoints first and
+  // +£0.001 against −£0.004 becomes a total of £0.00 against a positive part of £0.00 — a lower
+  // endpoint of zero, and a `≤` produced entirely by two decimal places.
+  CURRENT_FY_ORDERS = [order({
+    lines: [{ productId: 'p1', qty: 1, totalBase: 100, cogsBase: 0 }],
+    refunds: [
+      { totalsBasis: 'GROSS', lines: [{ productId: 'p1', qty: 0, totalBase: 0.001 }] },
+      { totalsBasis: 'GROSS', lines: [{ productId: 'p1', qty: 0, totalBase: -0.004 }] },
+    ],
+  })]
+  PREVIOUS_FY_ORDERS = []
+  const { bySku } = await rowsBySku()
+  const r = bySku.get('SKU-1')!
+
+  assert.ok(!(r.currentFyRefundsGrossBasis < 0), 'the published column rounds to zero, which is not negative — the trap')
+  assert.equal(theOldRule({ basisComplete: false, gross: Math.abs(r.currentFyRefundsGrossBasis), unknown: 0 }), 'upper')
+  assert.equal(r.currentFyRevenueBound, 'indeterminate', 'classified before the rounding, so the −£0.004 entry still counts')
+})
+
+test('ONE indeterminate row makes the whole-table total indeterminate, not merely bounded (o3d-la3n)', async () => {
+  CURRENT_FY_ORDERS = [order({
+    lines: [
+      { productId: 'p1', qty: 1, totalBase: 100, cogsBase: 40 },
+      { productId: 'p2', qty: 1, totalBase: 60, cogsBase: 0 },
+    ],
+    refunds: [
+      // p1 cancels to a positive bucket; p2 carries an ordinary gross credit.
+      { totalsBasis: 'GROSS', lines: [{ productId: 'p1', qty: 1, totalBase: 120 }] },
+      { totalsBasis: 'GROSS', lines: [{ productId: 'p1', qty: -1, totalBase: -60 }] },
+      { totalsBasis: 'GROSS', lines: [{ productId: 'p2', qty: 0, totalBase: 12 }] },
+    ],
+  })]
+  PREVIOUS_FY_ORDERS = []
+  const { bySku, summary } = await rowsBySku()
+
+  assert.equal(bySku.get('SKU-1')!.currentFyRevenueBound, 'indeterminate')
+  assert.equal(bySku.get('SKU-2')!.currentFyRevenueBound, 'upper', 'a sound row beside it stays sound')
+  assert.equal(summary.currentFyRevenueBound, 'indeterminate')
+  assert.equal(summary.previousFyRevenueBound, 'exact', 'and the untouched FY is not dragged with it')
+})
+
+test('the combined verdict IS the verdict over the summed interval — the lemma the client relies on (o3d-la3n)', async () => {
+  // combineNetLinearFigureBounds folds ROW VERDICTS because the browser re-sums an arbitrary
+  // filtered subset and never sees the parts. This checks that fold against the arithmetic it
+  // stands in for: `unplacedCreditBoundFromParts` over the SUMMED parts, which is what the producer
+  // would compute if it could know the subset.
+  const { unplacedCreditBoundFromParts } = await import('@/lib/domain/sales/refund-basis-analytics')
+  type Part = { total: number; positive: number; complete: boolean }
+  const universe: Part[] = [
+    { total: 0, positive: 0, complete: true },      // clean
+    { total: 120, positive: 120, complete: false }, // ordinary gross credit  -> upper
+    { total: 60, positive: 120, complete: false },  // +120 and -60           -> indeterminate
+    { total: 0, positive: 120, complete: false },   // +120 and -120          -> indeterminate
+    { total: -30, positive: 0, complete: false },   // a lone negative credit -> indeterminate
+    { total: 5, positive: 5, complete: false },     // small ordinary credit  -> upper
+  ]
+  const verdict = (p: Part) => linear.netLinearFigureBound({
+    basisComplete: p.complete,
+    unplacedCredit: unplacedCreditBoundFromParts([{ total: p.total, positive: p.positive }]),
+  })
+  let checked = 0
+  for (let mask = 0; mask < 1 << universe.length; mask++) {
+    const subset = universe.filter((_, i) => mask & (1 << i))
+    const combined = linear.combineNetLinearFigureBounds(subset.map(verdict))
+    const direct = linear.netLinearFigureBound({
+      basisComplete: subset.every((p) => p.complete),
+      unplacedCredit: unplacedCreditBoundFromParts(subset.map((p) => ({ total: p.total, positive: p.positive }))),
+    })
+    assert.equal(combined, direct, `subset ${mask}: folding the verdicts must equal classifying the summed interval`)
+    checked++
+  }
+  assert.equal(checked, 64, 'every subset of the six was actually visited')
+  // And the fold is not trivially constant: these three answers all occur in the universe above.
+  assert.deepEqual(
+    [...new Set(universe.map(verdict))].sort(),
+    ['exact', 'indeterminate', 'upper'],
+  )
 })

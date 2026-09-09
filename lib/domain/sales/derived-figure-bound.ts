@@ -50,3 +50,46 @@ export function netLinearFigureBound(params: {
   if (!Number.isFinite(params.unplacedCredit) || params.unplacedCredit < 0) return 'indeterminate'
   return 'upper'
 }
+
+/**
+ * THE VERDICT FOR A SUM OF LINEAR FIGURES, FROM THE VERDICTS OF ITS PARTS (o3d-la3n).
+ *
+ * Product Profitability's totals are re-summed IN THE BROWSER over whatever subset the operator has
+ * filtered to, so the producer cannot publish a marker for them: there is one marker per row and an
+ * unbounded number of subsets. The browser must therefore combine. What it must NOT do is combine by
+ * re-deriving from published columns — those arrive ROUNDED, and `refundsGrossBasis +
+ * refundsUnknownBasis` is a SIGNED SUM in which two opposite same-basis credits cancel to a zero
+ * that is not negative, which is the whole defect this function exists to make unrepresentable.
+ *
+ * WHY COMBINING THE VERDICTS IS SOUND HERE, WHICH IS NOT A GENERAL LICENCE.
+ *
+ * Write each part's unplaced credit as the interval `[lᵢ, uᵢ]` with `lᵢ = Σ min(entry, 0)` and
+ * `uᵢ = Σ max(entry, 0)` over that part's own entries. Two facts do the work:
+ *
+ *   1. `lᵢ ≤ 0` ALWAYS — it is a sum of `min(x, 0)` terms. So `Σ lᵢ < 0` if and only if some
+ *      individual `lᵢ < 0`. `netLinearFigureBound` answers `indeterminate` exactly on `l < 0`, so
+ *      the sum is indeterminate exactly when SOME part is.
+ *   2. A part whose flag says `basisComplete` has no unplaced entry that is not exactly zero — the
+ *      placement rule treats an exactly-zero amount as placeable on either basis and nothing else —
+ *      so its interval is `[0, 0]` and it cannot make the sum indeterminate. The sum is `exact`
+ *      exactly when EVERY part is.
+ *
+ * That leaves `upper` for everything else, and the three cases are exhaustive.
+ *
+ * PRECONDITION, and it is the whole of it: the combined figure must be the SUM of the figures whose
+ * verdicts these are, each one classified by `netLinearFigureBound` over its OWN unplaced-credit
+ * interval. A RATIO is not covered — `marginFigureBound`'s case analysis divides two figures that
+ * move together, and a row whose margin is indeterminate can sit inside a period whose margin is a
+ * sound upper bound, and the reverse. Do not reach for this function there.
+ *
+ * `tests/analytics/product-profitability-refund-basis.test.ts` pins fact 1 by checking this against
+ * `unplacedCreditBoundFromParts` over the summed parts, which is the arithmetic it stands in for.
+ */
+export function combineNetLinearFigureBounds(bounds: Iterable<DerivedFigureBound>): DerivedFigureBound {
+  let sawInexact = false
+  for (const bound of bounds) {
+    if (bound === 'indeterminate') return 'indeterminate'
+    if (bound !== 'exact') sawInexact = true
+  }
+  return sawInexact ? 'upper' : 'exact'
+}
