@@ -5,8 +5,8 @@ import path from 'node:path'
 import test from 'node:test'
 
 import {
-  asMap, asSeq, asString, leadingAssignments, parseWorkflowYaml, stripShellComments, stripTsComments,
-  type YamlMap, type YamlNode,
+  asMap, asSeq, asString, invokes, leadingAssignments, parseWorkflowYaml, scriptInvokes, shellCommands,
+  stripShellComments, stripTsComments, type YamlMap, type YamlNode,
 } from './helpers/live-source'
 
 /**
@@ -69,7 +69,14 @@ const GATE = 'RUN_DB_MIGRATION_TESTS'
 const GATE_READ = `process.env.${GATE}`
 const TRIPWIRE = 'REQUIRE_DB_MIGRATION_TESTS'
 const WORKFLOW = '.github/workflows/schema-guardrails.yml'
-const DB_SUITE_COMMAND = /\bnpm run test:db\b/
+/**
+ * The invocations this guard asks about, as WORDS. A regular expression over the job's text answers
+ * yes to a commented-out line (r15) and to `echo "npm run test:db"` — text in an argument executes
+ * no more than text in a comment. A word sequence in command position is the question that was
+ * meant.
+ */
+const DB_SUITE_INVOCATION = ['npm', 'run', 'test:db']
+const MIGRATE_INVOCATION = ['prisma', 'migrate', 'deploy']
 
 /** The files that were gated on the day this guard was written. The walk must keep finding them. */
 const KNOWN_GATED = [
@@ -146,7 +153,8 @@ test(`npm run test:db sets ${GATE} and ${TRIPWIRE} and reaches every gated file`
     `test:db must set ${TRIPWIRE}=1 so a half-wired invocation fails instead of skipping: `
     + `${JSON.stringify(script)}`)
 
-  const globs = [...rest.matchAll(/"([^"]*\*[^"]*)"|'([^']*\*[^']*)'/g)].map((match) => match[1] ?? match[2])
+  const globs = shellCommands(script).flatMap((words) => words)
+    .filter((word) => word.includes('*') && !word.startsWith('-'))
   assert.ok(globs.length > 0, `test:db names no test glob: ${rest}`)
   const matchers = globs.map(globToRegExp)
   // The matcher itself must be able to say no, or "covered" means nothing.
@@ -228,12 +236,12 @@ function neverRuns(node: YamlNode | undefined): boolean {
 }
 
 /** Every step of `job` that really invokes `command`. */
-function stepsInvoking(job: YamlMap, command: RegExp): YamlMap[] {
-  return stepsOf(job).filter((step) => command.test(liveRunOf(step)) && !neverRuns(step.if))
+function stepsInvoking(job: YamlMap, command: string[]): YamlMap[] {
+  return stepsOf(job).filter((step) => scriptInvokes(liveRunOf(step), command) && !neverRuns(step.if))
 }
 
 /** Every job of one workflow that really invokes `command`, by name. */
-function jobsInvoking(jobs: Map<string, YamlMap>, command: RegExp): Map<string, YamlMap> {
+function jobsInvoking(jobs: Map<string, YamlMap>, command: string[]): Map<string, YamlMap> {
   const found = new Map<string, YamlMap>()
   for (const [name, job] of jobs) {
     if (neverRuns(job.if)) continue
@@ -249,7 +257,7 @@ function jobsInvoking(jobs: Map<string, YamlMap>, command: RegExp): Map<string, 
  * `DATABASE_URL` the job or the step sets — and not off the job's text, where a `#` in front of any
  * of those three lines left all three questions answered yes.
  */
-function whyJobCannotServeTheSuite(job: YamlMap, command: RegExp): string[] {
+function whyJobCannotServeTheSuite(job: YamlMap, command: string[]): string[] {
   const reasons: string[] = []
   const services = asMap(job.services) ?? {}
   const images = Object.values(services)
@@ -258,7 +266,7 @@ function whyJobCannotServeTheSuite(job: YamlMap, command: RegExp): string[] {
   if (!images.some((image) => /^postgres:\d/.test(image))) {
     reasons.push(`it stands up no postgres service (images: ${JSON.stringify(images)})`)
   }
-  if (!stepsOf(job).some((step) => /prisma migrate deploy/.test(liveRunOf(step)) && !neverRuns(step.if))) {
+  if (stepsInvoking(job, MIGRATE_INVOCATION).length === 0) {
     reasons.push('no step it runs migrates the database (prisma migrate deploy)')
   }
   const urls = [
@@ -288,14 +296,14 @@ test('a CI job runs npm run test:db against a migrated postgres service', () => 
       + `would be asked of a shorter document than the file. Parsed: ${JSON.stringify([...jobs.keys()])}`)
   }
 
-  const runners = jobsInvoking(jobs, DB_SUITE_COMMAND)
+  const runners = jobsInvoking(jobs, DB_SUITE_INVOCATION)
   assert.ok(runners.size > 0,
     `no job in ${WORKFLOW} RUNS "npm run test:db" — a commented-out or switched-off step does not `
     + `count — so ${gatedFiles.length} gated files run nowhere. `
     + `Jobs present: ${JSON.stringify([...jobs.keys()])}`)
 
   for (const [name, job] of runners) {
-    assert.deepEqual(whyJobCannotServeTheSuite(job, DB_SUITE_COMMAND), [],
+    assert.deepEqual(whyJobCannotServeTheSuite(job, DB_SUITE_INVOCATION), [],
       `${WORKFLOW} job "${name}" runs the DB suites but cannot serve them`)
   }
 })
@@ -329,6 +337,8 @@ const RUNNER_FIXTURE = [
   '      - run: |',
   '          # npm run test:db',
   '          echo a shell comment inside a run block executes nothing',
+  '      - run: echo "npm run test:db"',
+  '      - run: echo npm run test:db > /dev/null',
   '  db:',
   '    runs-on: ubuntu-latest',
   '    services:',
@@ -349,7 +359,7 @@ function commentedOut(pattern: RegExp): string {
 }
 
 function fixtureRunners(source: string): string[] {
-  return [...jobsInvoking(jobsOf('fixture.yml', source), DB_SUITE_COMMAND).keys()]
+  return [...jobsInvoking(jobsOf('fixture.yml', source), DB_SUITE_INVOCATION).keys()]
 }
 
 test('the workflow reader counts a step that RUNS the DB suites, and nothing that merely says so', () => {
@@ -387,7 +397,7 @@ test('the workflow reader checks the database off the structure, not off the job
     assert.ok(job, 'the fixture must still declare the db job')
     return job as YamlMap
   }
-  assert.deepEqual(whyJobCannotServeTheSuite(jobOf(RUNNER_FIXTURE.join('\n')), DB_SUITE_COMMAND), [],
+  assert.deepEqual(whyJobCannotServeTheSuite(jobOf(RUNNER_FIXTURE.join('\n')), DB_SUITE_INVOCATION), [],
     'the intact fixture job can serve the suites')
 
   // One comment-out per property the job has to carry. Each leaves the text in the file.
@@ -398,7 +408,7 @@ test('the workflow reader checks the database off the structure, not off the job
   ]
   for (const [what, line, expected] of cases) {
     const mutated = commentedOut(line)
-    const reasons = whyJobCannotServeTheSuite(jobOf(mutated), DB_SUITE_COMMAND)
+    const reasons = whyJobCannotServeTheSuite(jobOf(mutated), DB_SUITE_INVOCATION)
     assert.ok(reasons.some((reason) => expected.test(reason)),
       `commenting out ${what} must be reported, and was not: ${JSON.stringify(reasons)}`)
   }
@@ -447,6 +457,26 @@ test('the shell reader reads the command, not the string', () => {
   assert.equal(trailing.assignments.get(GATE), '1')
   assert.equal(trailing.assignments.has(TRIPWIRE), false, 'a trailing comment sets nothing')
   assert.ok(!trailing.rest.includes('#'), 'the comment is gone from the command')
+
+  // AN ARGUMENT IS NOT AN INVOCATION, which is the same rule as "a comment is not code" reached from
+  // the other side. Removing comments alone still accepted `echo "npm run test:db"`; this test
+  // exists because the mutation harness for r15 found exactly that and it went green.
+  assert.equal(scriptInvokes('npm run test:db', DB_SUITE_INVOCATION), true, 'the command invokes it')
+  assert.equal(scriptInvokes('npx prisma migrate deploy --schema prisma/schema.prisma', MIGRATE_INVOCATION),
+    true, 'a known wrapper in front of the command still invokes it')
+  assert.equal(scriptInvokes('echo "npm run test:db"', DB_SUITE_INVOCATION), false,
+    'a quoted argument is one word and invokes nothing')
+  assert.equal(scriptInvokes('echo npm run test:db > /dev/null', DB_SUITE_INVOCATION), false,
+    'an unquoted argument is still an argument: echo is not a wrapper')
+  assert.equal(scriptInvokes('# npm run test:db\necho x', DB_SUITE_INVOCATION), false,
+    'a shell comment inside a run: block invokes nothing')
+  assert.equal(scriptInvokes('echo start && npm run test:db', DB_SUITE_INVOCATION), true,
+    'the second command of a chain is still a command')
+  assert.deepEqual(shellCommands('A=1 npm run test:db && echo "done now"'),
+    [['A=1', 'npm', 'run', 'test:db'], ['echo', 'done now']],
+    'the splitter reads words, keeps a quoted argument whole, and ends a command at &&')
+  assert.equal(invokes(['echo', 'npm', 'run', 'test:db'], DB_SUITE_INVOCATION), false,
+    'position, not presence')
 })
 
 /**

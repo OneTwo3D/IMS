@@ -393,3 +393,84 @@ export function leadingAssignments(command: string): { assignments: Map<string, 
   }
   return { assignments, rest }
 }
+
+/**
+ * One shell script split into the commands it runs, each as its words with quoting removed.
+ *
+ * WHY WORDS AND NOT A SEARCH. `echo "npm run test:db"` contains the command and runs nothing —
+ * removing comments is not enough, because an ARGUMENT is text that never executes either. Splitting
+ * into words puts the question where it belongs: is this string in COMMAND POSITION, or is it
+ * something a command was handed? A quoted argument stays one word and can never match a multi-word
+ * invocation; an unquoted one is a word whose predecessor is `echo`, and `echo` is not a wrapper.
+ *
+ * The subset is the one CI `run:` scripts and npm scripts are written in: words, quotes, escapes,
+ * and the separators `;` `&&` `||` `|` `&` and newline. Redirections and substitutions are left
+ * inside the words they appear in — they cannot turn a non-invocation into one.
+ */
+export function shellCommands(script: string): string[][] {
+  const commands: string[][] = []
+  const text = stripShellComments(script)
+  let words: string[] = []
+  let current = ''
+  let started = false
+  let quote: string | null = null
+  const endWord = (): void => {
+    if (started) { words.push(current); current = ''; started = false }
+  }
+  const endCommand = (): void => {
+    endWord()
+    if (words.length > 0) commands.push(words)
+    words = []
+  }
+  for (let index = 0; index < text.length; index += 1) {
+    const char = text[index]
+    if (quote !== null) {
+      if (char === '\\' && quote === '"') { current += text[index + 1] ?? ''; index += 1; started = true; continue }
+      if (char === quote) { quote = null; continue }
+      current += char
+      started = true
+      continue
+    }
+    if (char === '\\') { current += text[index + 1] ?? ''; index += 1; started = true; continue }
+    if (char === '"' || char === "'") { quote = char; started = true; continue }
+    if (char === ';' || char === '&' || char === '|') {
+      endCommand()
+      if (text[index + 1] === char) index += 1
+      continue
+    }
+    if (/\s/.test(char)) {
+      if (char === '\n') endCommand()
+      else endWord()
+      continue
+    }
+    current += char
+    started = true
+  }
+  endCommand()
+  return commands
+}
+
+/** Programs that stand in front of the real command without changing what is being invoked. */
+const WRAPPERS = new Set(['npx', 'pnpm', 'yarn', 'bun', 'bunx', 'sudo', 'env', 'time', 'nice', 'exec',
+  'command', 'cross-env', 'dotenv', 'xvfb-run', 'node_modules/.bin/npx'])
+
+/**
+ * Whether one command's words really INVOKE `sequence` — the words appearing consecutively in
+ * command position, reached past nothing but leading assignments, option flags and known wrappers.
+ * `npx prisma migrate deploy` invokes `prisma migrate deploy`; `echo prisma migrate deploy` does not.
+ */
+export function invokes(words: string[], sequence: string[]): boolean {
+  for (let start = 0; start + sequence.length <= words.length; start += 1) {
+    if (!sequence.every((word, offset) => words[start + offset] === word)) continue
+    const before = words.slice(0, start)
+    if (before.every((word) => /^[A-Za-z_][A-Za-z0-9_]*=/.test(word) || word.startsWith('-') || WRAPPERS.has(word))) {
+      return true
+    }
+  }
+  return false
+}
+
+/** Whether a whole script (a `run:` block, an npm script) invokes `sequence` in any of its commands. */
+export function scriptInvokes(script: string, sequence: string[]): boolean {
+  return shellCommands(script).some((words) => invokes(words, sequence))
+}
