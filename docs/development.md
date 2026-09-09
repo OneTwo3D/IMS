@@ -89,9 +89,9 @@ Four tests inside `tests/db/reconciliation-void-mirror-contradictions.test.ts` a
 scratch database with the ICU `tr-TR` locale, to prove the collation pin on the reconciliation
 statement's `lower()` fold. On a PostgreSQL built without ICU those four **skip and say so** — on
 stderr, as a GitHub `::warning::` annotation, and into `$GITHUB_STEP_SUMMARY` when that is set —
-while the rest of the file still runs. A server
-that has ICU but no `tr-TR` **fails** instead: `tr` is a core CLDR locale, so that combination means
-the probe is wrong rather than the server incomplete.
+while the rest of the file still runs. A server that has ICU but no `tr-TR` **fails** instead: `tr`
+is a core CLDR locale, so that combination means the probe is wrong rather than the server
+incomplete.
 
 To run either tier locally, point `DATABASE_URL` at a scratch database you do not mind writing to
 (the suites roll their probes back, but they do write) and make sure the role can `CREATEDB` — the
