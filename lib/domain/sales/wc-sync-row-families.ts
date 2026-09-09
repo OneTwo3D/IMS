@@ -104,6 +104,89 @@ export function isRecoverableRefundParkStatus(status: string): status is Recover
 }
 
 /**
+ * THE REFUND PARK'S OWN LITERAL VALUES, ONCE — and the object THREE renderers read (o3d-272i r2).
+ *
+ * The union below ({@link UNRESOLVED_WC_ORDER_ROW}) has two renderers because one of its readers
+ * deletes with raw SQL. This one has three, and the third is the reason this object exists at all:
+ * THE DATABASE IS A READER OF THIS RULE, and it reads it as DDL.
+ *
+ * `shopping_sync_logs_active_refund_park_uq` — the partial UNIQUE index migration 20260721150000
+ * built to make the park dedup race-proof — restates the pre-`recordKind` five-clause shape in its
+ * WHERE predicate. o3d-272i swept the TypeScript AST and removed eight hand-written copies of that
+ * shape; no AST sweep could see this one, because it is not TypeScript. So it survived, and being
+ * an INDEX it OVERRIDES every application-side fix: however correctly the code now tells a held
+ * sales invoice from a refund park, an index that does not know the difference REJECTS the
+ * collision, and the held invoice is the row that loses.
+ *
+ * That is the same defect, third instance. The first was `foreignPark` in refund-service throwing
+ * on a held invoice whose external order id collided with a refund id; the second was the park
+ * resolvers settling such a hold to SYNCED. Both were fixed by asking `recordKind`. The index could
+ * not ask it, because nothing had told the index the column existed.
+ *
+ * WHAT THE THREE RENDERERS ARE. {@link activeRefundParkWhere} in
+ * lib/domain/sales/refund-park-recovery.ts (the Prisma `where` five readers narrow), the DDL
+ * predicate {@link activeRefundParkIndexPredicateSql} below, and — transitively — the migration
+ * file itself, which CONTAINS that rendered text verbatim and is held to it by
+ * tests/prisma/refund-park-unique-index-record-kind-migration.test.ts.
+ */
+export const ACTIVE_REFUND_PARK_ROW = {
+  connector: 'woocommerce',
+  direction: 'FROM_CONNECTOR',
+  entityType: 'SalesOrder',
+  recordKind: WC_REFUND_PARK_RECORD_KIND,
+  statuses: RECOVERABLE_REFUND_PARK_STATUSES,
+} as const
+
+/** The partial UNIQUE index that enforces one actionable park per (connector, externalId). */
+export const ACTIVE_REFUND_PARK_INDEX_NAME = 'shopping_sync_logs_active_refund_park_uq'
+
+/** The columns that index is keyed on. A park is unique per refund id within a connector. */
+export const ACTIVE_REFUND_PARK_INDEX_COLUMNS = 'connector, "externalId"'
+
+/** A SQL string literal. Single quotes are doubled; nothing here is ever caller-supplied. */
+function sqlLiteral(value: string): string {
+  return `'${value.replace(/'/g, "''")}'`
+}
+
+/**
+ * THE INDEX'S WHERE PREDICATE, RENDERED FROM {@link ACTIVE_REFUND_PARK_ROW} — the text migration
+ * 20260909090000 carries, character for character.
+ *
+ * WHY A RENDERER AND NOT A HAND-WRITTEN PREDICATE IN THE .sql. A migration cannot call TypeScript:
+ * Prisma applies a static, checksummed file, so the DDL genuinely cannot be GENERATED at deploy
+ * time from this object. What it can be is CHECKED against it, and that is the whole difference
+ * between a ninth copy and a tenth. The migration test asserts the file contains exactly this
+ * string, so changing a literal here without writing the migration that follows it turns the suite
+ * red — and so does editing the .sql on its own.
+ *
+ * TWO CLAUSES ARE THE INDEX'S AND NOT THE PREDICATE'S, and they are stated here rather than left
+ * implicit. `"externalId" IS NOT NULL` is about the KEY: a row with no external id has no refund to
+ * be unique per, and Postgres would index it under a NULL key that collides with nothing anyway.
+ * `"entityId" IS NOT NULL` is in {@link activeRefundParkWhere} too, as `entityId: { not: null }`,
+ * and is written out longhand because SQL has no other spelling of it. So the set this index
+ * covers is exactly `activeRefundParkWhere()` narrowed by a non-null externalId — which is what
+ * tests/concurrency/refund-park-index-family-scope.concurrent.test.ts executes both sides of.
+ *
+ * The enum columns take unquoted literals (`direction`, `status`): Postgres resolves an
+ * unknown-typed literal against the column's type, exactly as the predecessor index did.
+ */
+export function activeRefundParkIndexPredicateSql(): string {
+  return [
+    `connector = ${sqlLiteral(ACTIVE_REFUND_PARK_ROW.connector)}`,
+    `direction = ${sqlLiteral(ACTIVE_REFUND_PARK_ROW.direction)}`,
+    `"entityType" = ${sqlLiteral(ACTIVE_REFUND_PARK_ROW.entityType)}`,
+    // THE CLAUSE THE LIVE INDEX HAS NEVER CARRIED, and the whole of this migration. Without it
+    // every actionable woocommerce/FROM_CONNECTOR/SalesOrder row with both ids is treated as a
+    // refund park, so a held sales invoice whose external ORDER id equals some refund's id is
+    // refused entry to a table it has every right to be in.
+    `"recordKind" = ${sqlLiteral(ACTIVE_REFUND_PARK_ROW.recordKind)}`,
+    `status IN (${ACTIVE_REFUND_PARK_ROW.statuses.map(sqlLiteral).join(', ')})`,
+    '"externalId" IS NOT NULL',
+    '"entityId" IS NOT NULL',
+  ].join('\n  AND ')
+}
+
+/**
  * The families a `shopping_sync_logs` row can belong to while it NAMES AN IMS SALES ORDER and is
  * still unresolved — i.e. exactly the rows an order-protecting reader must not step over.
  *

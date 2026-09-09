@@ -22,6 +22,23 @@
  * the original defect with better ergonomics, so raw SQL naming this table may not also name the
  * family's discriminating columns or literals.
  *
+ * AND THE SAME RULE IN DDL (o3d-272i r2, Codex HIGH). The eight copies this guard was written for
+ * were all TypeScript, and the sweep that found them read the TypeScript AST. It could not see the
+ * NINTH: `shopping_sync_logs_active_refund_park_uq`, a partial UNIQUE index whose WHERE predicate
+ * restated the pre-`recordKind` shape in SQL, inside a migration. That reader OVERRIDES every
+ * application-side fix — an index that cannot tell a held sales invoice from a refund park REJECTS
+ * the collision whatever the code believes — so it is the most damaging copy of the eight and the
+ * only one no `where` object could correct. A migration under prisma/migrations that names this
+ * table and TWO OR MORE of the family's discriminating LITERALS is therefore a DDL statement of the
+ * rule, and must be named in MIGRATION_OWNERS with a reason.
+ *
+ * TWO LITERALS, NOT ONE, AND LITERALS RATHER THAN COLUMN NAMES. The init migration defines the
+ * `ShoppingSyncDirection` enum, so it contains `FROM_CONNECTOR`; several migrations name
+ * `entityType` because it is a column. Neither re-derives anything, and a guard that flagged them
+ * would be answered with an allowlist long enough to stop meaning anything. Two of
+ * FROM_CONNECTOR / 'SalesOrder' / WC_REFUND_PARK / WC_HELD_SALES_INVOICE in one file that also
+ * names the table is a predicate, and today it matches exactly the four files that are one.
+ *
  * WHY THIS IS NOT A PROXIMITY RULE. It reads the TypeScript AST: the pairs must be properties of
  * ONE object literal, and the write/select distinction is the nearest enclosing `where`/`data`
  * property, not "a `data` appears within N lines". Nothing here can be satisfied or triggered by a
@@ -65,8 +82,10 @@ const PREDICATE_OWNERS = [
   // the store-rebind guard and the retention exemption.
   'lib/domain/sales/wc-sync-row-families.ts::UNRESOLVED_WC_ORDER_ROW',
   // The refund park, on its own. Read by the recovery inbox, the cross-order guard, the park
-  // upsert, the park resolvers and the coupon-correction evidence read.
-  'lib/domain/sales/refund-park-recovery.ts::activeRefundParkWhere',
+  // upsert, the park resolvers and the coupon-correction evidence read — AND, since o3d-272i r2, by
+  // the partial unique index's DDL predicate, which is why the literals sit in an object beside the
+  // renderer that writes them as SQL rather than inside `activeRefundParkWhere` as they used to.
+  'lib/domain/sales/wc-sync-row-families.ts::ACTIVE_REFUND_PARK_ROW',
   // The held sales invoice queue (o3d-k26m.6).
   'lib/connectors/woocommerce/sync/held-sales-invoice.ts::heldSalesInvoiceQueueWhere',
   // The two families written BEFORE an IMS order exists, so they carry no entityId.
@@ -94,6 +113,52 @@ const SQL_FAMILY_TOKENS = [
 ]
 
 const SQL_TABLE = 'shopping_sync_logs'
+
+/** Where the migrations live, and the extension a DDL reader of this rule is written in. */
+const MIGRATIONS_ROOT = 'prisma/migrations'
+
+/**
+ * The LITERALS a family predicate is built out of — the values, not the column names. A file that
+ * names two or more of these AND the table is stating the rule, not merely touching the table.
+ */
+const SQL_FAMILY_LITERALS = ['FROM_CONNECTOR', "'SalesOrder'", 'WC_REFUND_PARK', 'WC_HELD_SALES_INVOICE']
+
+/** How many of them make a file a statement of the rule rather than a mention of its parts. */
+const SQL_FAMILY_LITERAL_THRESHOLD = 2
+
+/**
+ * The migrations that DO state this rule in DDL, and why each is allowed to.
+ *
+ * An applied migration is immutable — Prisma checksums it — so this list only ever grows, and it
+ * grows by a DECISION. Adding a line to it says: this migration writes the family rule into the
+ * database, and something holds it to lib/domain/sales/wc-sync-row-families.ts. For the index that
+ * is tests/prisma/refund-park-unique-index-record-kind-migration.test.ts (the migration text IS the
+ * string the shared module renders) and tests/concurrency/refund-park-index-family-scope
+ * .concurrent.test.ts (the SHIPPED predicate and the shared `where` select the same rows).
+ */
+const MIGRATION_OWNERS = new Map([
+  [
+    '20260721150000_refund_park_unique_index/migration.sql',
+    'Builds the partial unique index, in the pre-recordKind shape. Applied everywhere and therefore '
+    + 'immutable; 20260909090000 replaces its predicate.',
+  ],
+  [
+    '20260822120000_shopping_sync_log_record_kind/migration.sql',
+    'Adds recordKind and backfills every pre-existing row into one family or the other, so it must '
+    + 'name both families by value.',
+  ],
+  [
+    '20260822120000_shopping_sync_log_record_kind/verify.sql',
+    'The cutover gate for that backfill: five shapes no legitimate writer produces, each of which '
+    + 'has to name the family it is asserting about.',
+  ],
+  [
+    '20260909090000_refund_park_unique_index_record_kind/migration.sql',
+    'Rebuilds the index with the refund-park recordKind clause. Its WHERE predicate is the string '
+    + 'activeRefundParkIndexPredicateSql() renders, asserted character for character by '
+    + 'tests/prisma/refund-park-unique-index-record-kind-migration.test.ts.',
+  ],
+])
 
 /** Property names whose value is a row being written, not a row being selected. */
 const WRITE_POSITIONS = new Set(['data', 'create', 'update'])
@@ -253,6 +318,56 @@ for (const file of files) {
 }
 
 // ---------------------------------------------------------------------------
+// THE DDL READERS. Same rule, different language, and the one the AST could not reach.
+// ---------------------------------------------------------------------------
+
+/** Every .sql under prisma/migrations, as repository-relative paths. */
+function listMigrationSql(dir, out) {
+  let entries
+  try {
+    entries = readdirSync(dir)
+  } catch {
+    return out
+  }
+  for (const entry of entries) {
+    const full = join(dir, entry)
+    if (statSync(full).isDirectory()) listMigrationSql(full, out)
+    else if (extname(full) === '.sql') out.push(full)
+  }
+  return out
+}
+
+/** The SQL a file EXECUTES: `--` line comments and `/* *\/` blocks removed. */
+function executableSql(source) {
+  return source.replace(/--[^\n]*/g, ' ').replace(/\/\*[\s\S]*?\*\//g, ' ')
+}
+
+const migrationFiles = listMigrationSql(join(ROOT, MIGRATIONS_ROOT), [])
+const migrationOwnersSeen = new Set()
+let migrationPredicateCount = 0
+
+for (const file of migrationFiles) {
+  const relativePath = relative(join(ROOT, MIGRATIONS_ROOT), file).split(sep).join('/')
+  const sql = executableSql(readFileSync(file, 'utf8'))
+  if (!sql.includes(SQL_TABLE)) continue
+  const named = SQL_FAMILY_LITERALS.filter((literal) => sql.includes(literal))
+  if (named.length < SQL_FAMILY_LITERAL_THRESHOLD) continue
+
+  migrationPredicateCount += 1
+  if (MIGRATION_OWNERS.has(relativePath)) migrationOwnersSeen.add(relativePath)
+  else {
+    violations.push(
+      `${MIGRATIONS_ROOT}/${relativePath}  states the ${SQL_TABLE} family rule in DDL (names ${named.join(', ')}). `
+      + 'The database is a reader of this rule like any other, and a migration cannot call TypeScript — so render '
+      + 'the predicate with activeRefundParkIndexPredicateSql() in lib/domain/sales/wc-sync-row-families.ts, paste '
+      + 'that exact text into the migration, and add the file to MIGRATION_OWNERS in this script saying what holds '
+      + 'the two together. o3d-272i r2: the last hand-written one sat in the database for seven weeks refusing '
+      + 'held sales invoices, and no sweep of this repository could see it.',
+    )
+  }
+}
+
+// ---------------------------------------------------------------------------
 // PROVE THE WALK REACHED SOMETHING. A guard that scanned nothing, or whose allowlist no longer
 // names anything real, passes every file in the repository without reading a line of it.
 // ---------------------------------------------------------------------------
@@ -260,6 +375,11 @@ const structural = []
 if (files.length === 0) structural.push(`scanned 0 files under ${SCAN_ROOTS.join(', ')}`)
 if (familyLiteralCount === 0) structural.push('found 0 shopping_sync_logs family literals — the detector matched nothing at all')
 if (sqlTemplateCount === 0) structural.push(`found 0 raw SQL templates naming ${SQL_TABLE}`)
+if (migrationFiles.length === 0) structural.push(`scanned 0 .sql files under ${MIGRATIONS_ROOT}`)
+if (migrationPredicateCount === 0) structural.push(`found 0 migrations stating the ${SQL_TABLE} family rule — the DDL detector matched nothing at all`)
+for (const owner of MIGRATION_OWNERS.keys()) {
+  if (!migrationOwnersSeen.has(owner)) structural.push(`allowlisted migration no longer states the rule: ${MIGRATIONS_ROOT}/${owner}`)
+}
 for (const owner of [...PREDICATE_OWNERS, SQL_OWNER]) {
   if (!ownersSeen.has(owner)) structural.push(`allowlisted definition not found: ${owner}`)
 }
@@ -285,5 +405,7 @@ if (violations.length > 0) {
 
 console.log(
   `check:wc-sync-row-predicates OK — ${files.length} files, ${familyLiteralCount} family literal(s), `
-  + `${sqlTemplateCount} raw ${SQL_TABLE} statement(s), all ${PREDICATE_OWNERS.length + 1} owning definitions present.`,
+  + `${sqlTemplateCount} raw ${SQL_TABLE} statement(s), all ${PREDICATE_OWNERS.length + 1} owning definitions present; `
+  + `${migrationFiles.length} migration .sql file(s), ${migrationPredicateCount} stating the rule in DDL, all `
+  + `${MIGRATION_OWNERS.size} accounted for.`,
 )

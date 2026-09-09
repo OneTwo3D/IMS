@@ -50,6 +50,7 @@
  * having exactly one of it is.
  */
 import {
+  ACTIVE_REFUND_PARK_ROW,
   RECOVERABLE_REFUND_PARK_STATUSES,
   WC_REFUND_PARK_RECORD_KIND,
   isRecoverableRefundParkStatus,
@@ -148,6 +149,17 @@ export const WC_REFUND_PARK_RECOVERED_ACTION = 'wc_refund_park_recovered'
  * ONE DEFINITION, three readers: the exception inbox, the refund sync's cross-order guard, and the
  * park upsert. They must agree with each other and with the partial unique index
  * `shopping_sync_logs_active_refund_park_uq`, and three hand-written copies could not.
+ *
+ * AND THE INDEX WAS A FOURTH COPY THAT DID NOT AGREE, until o3d-272i r2 (Codex HIGH). It is DDL,
+ * so no sweep of this repository's TypeScript could see it, and it was built in July with the
+ * pre-`recordKind` shape: connector, direction, `SalesOrder`, an actionable status, a non-null
+ * externalId and a non-null entityId. A held sales invoice writes every one of those, so the index
+ * treated one as a refund park and REFUSED it whenever its external order id equalled some
+ * refund's id — overriding this predicate however carefully it distinguishes the two. The literals
+ * therefore now live in `ACTIVE_REFUND_PARK_ROW`, which also renders the index's WHERE clause
+ * (`activeRefundParkIndexPredicateSql`); migration 20260909090000 carries that rendered text, and
+ * two tests hold the three spellings together — one comparing the file against the renderer, one
+ * executing the SHIPPED index predicate against this `where` over a probe matrix.
  */
 export function activeRefundParkWhere(): {
   connector: string
@@ -158,17 +170,17 @@ export function activeRefundParkWhere(): {
   status: { in: RecoverableRefundParkStatus[] }
 } {
   return {
-    connector: 'woocommerce',
-    direction: 'FROM_CONNECTOR',
-    entityType: 'SalesOrder',
+    connector: ACTIVE_REFUND_PARK_ROW.connector,
+    direction: ACTIVE_REFUND_PARK_ROW.direction,
+    entityType: ACTIVE_REFUND_PARK_ROW.entityType,
     // A park is evidence ABOUT AN IMS ORDER, so it always names one. This is also what the partial
     // unique index requires, and what separates a park from the row families that have NO entityId
     // (a failed import, a pending-FX queue row, an admission refusal).
     entityId: { not: null },
     // …and this is what separates it from the one family that DOES have one: the held sales
     // invoice. The row says which family it belongs to; nothing here infers it (r8).
-    recordKind: WC_REFUND_PARK_RECORD_KIND,
-    status: { in: [...RECOVERABLE_REFUND_PARK_STATUSES] },
+    recordKind: ACTIVE_REFUND_PARK_ROW.recordKind,
+    status: { in: [...ACTIVE_REFUND_PARK_ROW.statuses] },
   }
 }
 
