@@ -19,7 +19,6 @@ import { type TestContext, test } from 'node:test'
 import pg from 'pg'
 import { parse as driverParse } from 'pg-connection-string'
 
-import { shellFunction } from './shell-symbol.ts'
 
 /** The final connection configuration, built exactly as `pg` builds it and never opened. */
 function driverConnection(connectionString: string) {
