@@ -20,6 +20,7 @@ import {
   type AccountingReconciliationRows,
   type AccountingReconciliationTruncation,
 } from '@/lib/domain/accounting/reconciliation'
+import { MIRRORED_ACCOUNTING_SYNC_TYPES } from '@/lib/domain/accounting/mirrored-sync-types'
 
 const A1_DATE = new Date('2026-04-24T10:00:00.000Z')
 const A2_DATE = new Date('2026-04-24T11:00:00.000Z')
@@ -1566,7 +1567,7 @@ test('o3d-11rf r4: the contradictions are ASKED FOR, by a statement with no date
   const { sql } = await captureContradictionQuery()
 
   assert.match(sql, /FROM "accounting_events" e/, 'the events are one side')
-  assert.match(sql, /JOIN "accounting_sync_logs" l/, 'and the live sync rows are the other')
+  assert.match(sql, /FROM "accounting_sync_logs" l/, 'and the live sync rows are the other')
   assert.match(sql, /e\."status" = 'VOID'/)
   assert.match(sql, /e\."voidBasis" IS NULL/, 'only the voids NO WRITER EXPLAINED')
   assert.match(sql, /l\."externalTransactionId" IS NULL OR btrim\(l\."externalTransactionId"\) = ''/,
@@ -1576,15 +1577,49 @@ test('o3d-11rf r4: the contradictions are ASKED FOR, by a statement with no date
     'NO date bound anywhere in the statement: the oldest victim is the one this exists to find')
 })
 
-test('o3d-11rf r4: the identity joined on is the mirror scope, all four parts of it', async () => {
+test('o3d-11rf r4: the scope joined on is the mirror scope, all four parts of it', async () => {
   const { sql } = await captureContradictionQuery()
 
   // Named individually rather than by counting join clauses: dropping any one of them widens the
   // rule to name a document the operator has no reason to look at, next to one they do.
   assert.match(sql, /l\."connector"\s+= e\."externalSystem"/)
-  assert.match(sql, /l\."type"::text\s+= e\."type"/)
+  assert.match(sql, /l\."type"\s+= e\."type"/)
   assert.match(sql, /l\."referenceType" = e\."sourceEntityType"/)
   assert.match(sql, /l\."referenceId"\s+= e\."sourceEntityId"/)
+})
+
+/**
+ * o3d-11rf r9 (Codex r9, HIGH) — AND THE SCOPE IS NOT THE IDENTITY.
+ *
+ * These are STATEMENT-shape assertions and they are the weaker half on purpose: what the join
+ * actually selects is proved against PostgreSQL in tests/db/reconciliation-void-mirror-contradictions,
+ * because only a database can answer which rows a join pairs. What is asserted here is that the
+ * ownership clause is IN the statement at all, and that the derivation spells the same three key
+ * forms `mirroredAccountingEventIdempotencyKeys` spells — a reader deleting the ownership clause to
+ * "simplify the join" has to argue with this first.
+ */
+test('o3d-11rf r9: and the ownership clause is joined on too, by the mirror key itself', async () => {
+  const { sql, values } = await captureContradictionQuery()
+
+  assert.match(sql, /e\."idempotencyKey" = ANY\(l\."mirrorKeys"\)/,
+    'the event must be the one THIS row derives, not one about the same document')
+
+  // The three key forms, by their literal prefixes and their part order.
+  assert.match(sql, /'accounting-sync:' \|\| n\."connector" \|\| ':' \|\| n\."type" \|\| ':' \|\| n\."payloadKey"/,
+    'the payload key form')
+  assert.match(sql, /'accounting-sync-log:' \|\| n\."connector" \|\| ':' \|\| n\."syncLogId"/,
+    'the sync-log id form')
+  assert.match(sql, /n\."referenceType"\s*\n?\s*\|\| ':' \|\| n\."referenceId" \|\| ':' \|\| n\."payloadDate"/,
+    'and the legacy date form, which is the one the recommendation named by hand')
+
+  // buildAccountingEventIdempotencyKey's normalisation, per part, with the blank-part guard.
+  assert.match(sql, /\[\^a-z0-9\._:-\]\+/, 'the allowed character class is the builder\'s')
+  assert.match(sql, /nullif\(regexp_replace/, 'and a part that normalises to blank makes its key NULL')
+
+  // A row whose type is not mirrored has no mirror, so it is not in the live set at all.
+  assert.match(sql, /l\."type"::text = ANY\(\?::text\[\]\)/, 'the mirrored types are a parameter')
+  assert.deepEqual(values[1], [...MIRRORED_ACCOUNTING_SYNC_TYPES],
+    'and it is the ONE list, not a copy that can fall behind it')
 })
 
 test('o3d-11rf r4: the bound is applied AFTER the grouping, and it is the stated one', async () => {

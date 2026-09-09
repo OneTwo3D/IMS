@@ -8,6 +8,12 @@ import {
   isDocumentRevisionAccountingSyncType,
   isMirrorableAccountingSyncType,
 } from './accounting-event-mirror'
+// Read from the LEAF module rather than from accounting-event-mirror's re-export, for the reason
+// that module's own header gives: a great many suites replace accounting-event-mirror wholesale with
+// a partial `mock.module`, which turns everything it exports and the mock does not name into
+// `undefined`. A `text[]` parameter that silently became `undefined` would widen this query to every
+// sync type rather than fail.
+import { MIRRORED_ACCOUNTING_SYNC_TYPES } from './mirrored-sync-types'
 import { isOperatorAssertedSettlement } from './sync-row-settlement'
 
 /**
@@ -154,9 +160,13 @@ type RevisionClaimLogRow = {
 /**
  * o3d-11rf r4 (Codex r4, HIGH) — ONE CONTRADICTION, as the database found it.
  *
- * A VOID mirror no writer classified, together with EVERY live unposted sync row still working on the
- * same document. Both halves come out of a single grouped join, so the pairing is a property of the
- * query rather than of what happened to survive two independent caps.
+ * A VOID mirror no writer classified, together with EVERY live unposted sync row THAT OWNS IT — i.e.
+ * whose own `mirroredAccountingEventIdempotencyKeys` names this event, not merely rows that share the
+ * document. Both halves come out of a single grouped join, so the pairing is a property of the query
+ * rather than of what happened to survive two independent caps.
+ *
+ * o3d-11rf r9: "owns it" is the r9 repair. Sharing the document was what this used to mean, and a
+ * document has many attempts with many mirrors between them.
  */
 type VoidMirrorContradictionRow = {
   accountingEventId: string
@@ -1205,8 +1215,15 @@ export function evaluateAccountingReconciliationRows(
  * legitimate cancellation from before the column existed, and reporting all of them would bury the
  * handful that matter in thousands that do not — the failure mode `document_claim_moved_on_assumed_order`
  * next door already names ("a finding that can never stop appearing stops being read at all"). So
- * the condition is a VOID-with-no-basis event that a sync row in the SAME SCOPE still contradicts by
- * being live and unposted. Nothing to do means nothing reported.
+ * the condition is a VOID-with-no-basis event that a sync row OF ITS OWN still contradicts by being
+ * live and unposted. Nothing to do means nothing reported.
+ *
+ * AND "OF ITS OWN" IS LOAD-BEARING (o3d-11rf r9, Codex r9 HIGH). It used to read "in the SAME SCOPE",
+ * and the query matched that: four columns naming a DOCUMENT. A document has many attempts and each
+ * derives its own mirror key, so a settled attempt's VOID event was reported against a healthy live
+ * attempt that had a healthy PENDING mirror of its own. Those findings were FALSE — the named live
+ * row was never blocked by the named event — and they stop being emitted. The pairing is now the
+ * mirror key itself; see `collectVoidMirrorContradictions`.
  *
  * UNPOSTED, and that clause is load-bearing. A row carrying an `externalTransactionId` describes a
  * document that EXISTS (o3d-ju8t), so it is not work owed and reviving its mirror is not the remedy;
@@ -1235,7 +1252,7 @@ function addUnclassifiedVoidMirrorFindings(
       accountingEventId: row.accountingEventId,
       message:
         `Mirrored accounting event ${row.accountingEventId} is VOID for a reason no writer recorded, while `
-        + `${row.syncLogIds.length} live sync row(s) are still working on the same document. It cannot be `
+        + `${row.syncLogIds.length} live sync row(s) whose mirror IT IS are still working. It cannot be `
         + 'revived automatically, so that work will never post until someone decides which is right',
       details: {
         connector: row.connector,
@@ -1345,11 +1362,54 @@ function addAssumedRevisionOrderFindings(
  * bound at all — the whole point of the finding is that its subjects are older than any lookback —
  * and only THEN is a bound applied, to a set that is already nothing but answers.
  *
- * THE IDENTITY, and it is the mirror's own: a sync log's (connector, type, referenceType,
- * referenceId) is an event's (externalSystem, type, sourceEntityType, sourceEntityId). `connector` is
- * NOT NULL and `externalSystem` is nullable, and SQL equality never matches a NULL — which is the
- * same answer the in-memory pairing gave (it keyed a null `externalSystem` as the empty string, which
- * no connector equals), reached by the language's own rule rather than by a sentinel.
+ * THE SCOPE, and it is the mirror's own: a sync log's (connector, type, referenceType, referenceId)
+ * is an event's (externalSystem, type, sourceEntityType, sourceEntityId). `connector` is NOT NULL and
+ * `externalSystem` is nullable, and SQL equality never matches a NULL — which is the same answer the
+ * in-memory pairing gave (it keyed a null `externalSystem` as the empty string, which no connector
+ * equals), reached by the language's own rule rather than by a sentinel.
+ *
+ * ================================================================================================
+ * o3d-11rf r9 (Codex r9, HIGH) — AND THE SCOPE IS NOT THE IDENTITY. THIS IS THE FIX FOR THAT.
+ * ================================================================================================
+ *
+ * WHAT WAS WRONG. Those four columns were the WHOLE join. They name a DOCUMENT; they do not name a
+ * MIRROR. One document has many attempts — a FAILED row and its live replacement, a revision and the
+ * revision after it — and each attempt derives its OWN `idempotencyKey`, which is the thing an
+ * `accounting_events` row actually is. So a VOID event belonging to attempt A was paired with a
+ * PENDING attempt B purely for sharing a document, and the report told an operator that B's work
+ * will never post when B's own mirror was sitting there PENDING and perfectly healthy. A false
+ * warning, with the wrong pair of ids on it, on precisely the surface built to be believed.
+ *
+ * OWNERSHIP IS `mirroredAccountingEventIdempotencyKeys`, AND NOTHING WEAKER. That function is the
+ * one definition of "which event is THIS row's mirror", and the join now asks it rather than
+ * approximating it. For a row it yields, in this order:
+ *
+ *   • the PAYLOAD key `accounting-sync:<connector>:<type>:<payload._idempotencyKey>` when the payload
+ *     carries a non-blank STRING `_idempotencyKey` — and then that is the ONLY key, because the
+ *     primary and the legacy derivation both stop there. Shared BY CONSTRUCTION across every attempt
+ *     that was handed the same token, which is exactly what makes attempts converge on one mirror.
+ *   • otherwise the ROW key `accounting-sync-log:<connector>:<syncLogId>` (the primary) and, when the
+ *     payload carries a non-blank string `date`, the LEGACY key
+ *     `accounting-sync:<connector>:<type>:<referenceType>:<referenceId>:<date>` beside it — the form
+ *     that predates the sync-log id and is shared by every attempt made on the same day.
+ *
+ * So a row has TWO keys, or ONE, or NONE: none when its type is not mirrored at all (nothing is
+ * mirrored, so nothing can be owned), which is why the live set is narrowed by
+ * MIRRORED_ACCOUNTING_SYNC_TYPES before a key is built.
+ *
+ * THE PARTS ARE NORMALISED THE WAY `buildAccountingEventIdempotencyKey` NORMALISES THEM — lowercased,
+ * every run of characters outside `[a-z0-9._:-]` collapsed to one `-`, leading and trailing `-`
+ * stripped, then joined on `:`. The one deliberate divergence: TypeScript THROWS when a part
+ * normalises to blank, and this yields NO KEY instead (the `nullif(..., '')` makes the concatenation
+ * NULL and the key drops out). That direction is the safe one — a row whose key cannot be built owns
+ * nothing and is not reported — and it keeps a malformed row from taking down the reconciliation
+ * cron. `reconciliation-void-mirror-contradictions.test.ts` pins both halves of that against the
+ * TypeScript function itself, so the two derivations cannot drift apart unnoticed.
+ *
+ * THE FOUR SCOPE COLUMNS ARE KEPT ALONGSIDE the key, not replaced by it. The payload-key form does
+ * not carry `referenceType`/`referenceId`, so two different documents handed the same token would
+ * match on key alone; and the null-`externalSystem` exclusion described above is a property of the
+ * scope join. Ownership NARROWS the pairing; it does not license widening it.
  *
  * WHY BOTH SIDES ARE AGGREGATED HERE and not grouped by the caller: the finding is one per VOID
  * event naming every live row it blocks, so the grouping is part of the question. Pulling pairs back
@@ -1361,16 +1421,78 @@ function addAssumedRevisionOrderFindings(
  * page came from. A second `COUNT` query would be a different snapshot and could disagree with the
  * page it describes.
  *
- * PLANNING. `accounting_events (status, businessDate)` narrows to the VOID rows and
- * `accounting_sync_logs (connector, referenceType, referenceId)` serves the probe for each. No
- * partial index is added: this runs once per reconciliation cron, and an index carrying a predicate
- * Prisma's schema cannot express would have to live in the drift allowlist for the life of the table.
+ * PLANNING. The statement now drives from the LIVE side, which is the small one: PENDING/PROCESSING
+ * mirrored rows holding no document id are the working queue, whereas the VOID events are the whole
+ * history of the table. Each live row then probes `accounting_events` by `idempotencyKey`, which is
+ * UNIQUE, so the per-row lookup is an index hit rather than a scan. No partial index is added: this
+ * runs once per reconciliation cron, and an index carrying a predicate Prisma's schema cannot express
+ * would have to live in the drift allowlist for the life of the table.
  */
 async function collectVoidMirrorContradictions(
   client: AccountingReconciliationClient,
 ): Promise<VoidMirrorContradictions> {
   const rows = (await client.$queryRaw`
-    WITH contradiction AS (
+    WITH live AS (
+      SELECT
+        l."id",
+        l."connector",
+        l."type"::text   AS "type",
+        l."referenceType",
+        l."referenceId",
+        l."status"::text AS "status",
+        -- EVERY key mirroredAccountingEventIdempotencyKeys would derive for this row, in its order:
+        -- the payload key alone, or the row key with the legacy date key beside it. A part that
+        -- normalises to blank makes its whole key NULL (concatenation with NULL is NULL) and the key
+        -- drops out here, where TypeScript would have thrown.
+        ARRAY(
+          SELECT k
+          FROM unnest(ARRAY[
+            CASE WHEN raw."payloadKey" IS NOT NULL
+                 THEN 'accounting-sync:' || n."connector" || ':' || n."type" || ':' || n."payloadKey" END,
+            CASE WHEN raw."payloadKey" IS NULL
+                 THEN 'accounting-sync-log:' || n."connector" || ':' || n."syncLogId" END,
+            CASE WHEN raw."payloadKey" IS NULL AND raw."payloadDate" IS NOT NULL
+                 THEN 'accounting-sync:' || n."connector" || ':' || n."type" || ':' || n."referenceType"
+                      || ':' || n."referenceId" || ':' || n."payloadDate" END
+          ]) AS k
+          WHERE k IS NOT NULL
+        ) AS "mirrorKeys"
+      FROM "accounting_sync_logs" l
+      -- The payload fields AS stringValue reads them: a JSON string, and non-blank. A number, a null,
+      -- a missing field, or a payload that is not an object at all is no value -- which is what
+      -- normalizePayload does by returning an empty record for anything that is not a record.
+      CROSS JOIN LATERAL (
+        SELECT
+          CASE WHEN jsonb_typeof(l."payload" -> '_idempotencyKey') = 'string'
+                AND btrim(l."payload" ->> '_idempotencyKey') <> ''
+               THEN l."payload" ->> '_idempotencyKey' END AS "payloadKey",
+          CASE WHEN jsonb_typeof(l."payload" -> 'date') = 'string'
+                AND btrim(l."payload" ->> 'date') <> ''
+               THEN l."payload" ->> 'date' END AS "payloadDate"
+      ) raw
+      -- buildAccountingEventIdempotencyKey's per-part normalisation, applied once per part and named
+      -- rather than repeated at each use. The two ARRAY literals below are positionally paired.
+      CROSS JOIN LATERAL (
+        SELECT parts[1] AS "connector", parts[2] AS "type", parts[3] AS "referenceType",
+               parts[4] AS "referenceId", parts[5] AS "syncLogId",
+               parts[6] AS "payloadKey", parts[7] AS "payloadDate"
+        FROM (
+          SELECT array_agg(
+                   nullif(regexp_replace(regexp_replace(lower(part.value), '[^a-z0-9._:-]+', '-', 'g'), '^-+|-+$', '', 'g'), '')
+                   ORDER BY part.ord
+                 ) AS parts
+          FROM unnest(ARRAY[
+            l."connector", l."type"::text, l."referenceType", l."referenceId", l."id",
+            raw."payloadKey", raw."payloadDate"
+          ]) WITH ORDINALITY AS part(value, ord)
+        ) normalized
+      ) n
+      WHERE l."status"::text = ANY(${[...MIRROR_CONTRADICTING_SYNC_STATUSES]}::text[])
+        -- A type that is not mirrored has no mirror to own, so it can contradict nothing.
+        AND l."type"::text = ANY(${[...MIRRORED_ACCOUNTING_SYNC_TYPES]}::text[])
+        AND (l."externalTransactionId" IS NULL OR btrim(l."externalTransactionId") = '')
+    ),
+    contradiction AS (
       SELECT
         e."id"               AS "accountingEventId",
         e."externalSystem"   AS "connector",
@@ -1379,17 +1501,18 @@ async function collectVoidMirrorContradictions(
         e."sourceEntityId"   AS "referenceId",
         e."idempotencyKey"   AS "idempotencyKey",
         array_agg(l."id" ORDER BY l."id")    AS "syncLogIds",
-        array_agg(DISTINCT l."status"::text ORDER BY l."status"::text) AS "syncLogStatuses"
+        array_agg(DISTINCT l."status" ORDER BY l."status") AS "syncLogStatuses"
       FROM "accounting_events" e
-      JOIN "accounting_sync_logs" l
+      JOIN live l
         ON l."connector"     = e."externalSystem"
-       AND l."type"::text    = e."type"
+       AND l."type"          = e."type"
        AND l."referenceType" = e."sourceEntityType"
        AND l."referenceId"   = e."sourceEntityId"
+       -- OWNERSHIP, and it is the clause the four above cannot stand in for: this row's own mirror
+       -- is this event, not merely some event about the same document.
+       AND e."idempotencyKey" = ANY(l."mirrorKeys")
       WHERE e."status" = 'VOID'
         AND e."voidBasis" IS NULL
-        AND l."status"::text = ANY(${[...MIRROR_CONTRADICTING_SYNC_STATUSES]}::text[])
-        AND (l."externalTransactionId" IS NULL OR btrim(l."externalTransactionId") = '')
       GROUP BY
         e."id", e."externalSystem", e."type", e."sourceEntityType", e."sourceEntityId", e."idempotencyKey"
     )

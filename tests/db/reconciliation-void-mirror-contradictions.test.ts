@@ -16,6 +16,7 @@ import {
   type AccountingReconciliationFinding,
   type AccountingReconciliationTruncation,
 } from '../../lib/domain/accounting/reconciliation'
+import { mirroredAccountingEventIdempotencyKeys } from '../../lib/domain/accounting/accounting-event-mirror'
 
 /**
  * o3d-11rf r4 (Codex r4, HIGH) — THE CAP APPLIED BEFORE THE QUESTION.
@@ -73,8 +74,21 @@ type Tx = {
   accountingSyncLog: { create(args: unknown): Promise<unknown> }
 }
 
-/** The over-cap fixture, shared by the r4 collector test and the r5 persistence test below. */
+/**
+ * The over-cap fixture, shared by the r4 collector test and the r5 persistence test below.
+ *
+ * o3d-11rf r9: every event here carries the key ITS OWN sync row derives. These rows have no payload,
+ * so that is the `accounting-sync-log:<connector>:<syncLogId>` form, built in SQL because the rows are
+ * built in SQL — and then checked against the mirror's own builder before a single one is trusted, so
+ * a bulk fixture cannot quietly go on agreeing with a rule that has changed.
+ */
 async function insertContradictions(tx: Tx, prefix: string, count: number) {
+  const firstSyncLogId = `${prefix}${String(1).padStart(5, '0')}-s`
+  assert.equal(
+    `accounting-sync-log:xero:${firstSyncLogId.toLowerCase()}`,
+    mirrorKeyFor({ syncLogId: firstSyncLogId, referenceId: 'unused-by-this-key-form' }),
+    'the bulk fixture builds the same key the mirror would',
+  )
   // WRITTEN IN THE OPPOSITE ORDER TO THEIR IDS: `lpad($2 + 1 - g)` means the first row on disk
   // carries the HIGHEST id. That removes the cheapest way for a fixture to agree with the query by
   // accident.
@@ -87,7 +101,8 @@ async function insertContradictions(tx: Tx, prefix: string, count: number) {
        $1 || lpad(($2::int + 1 - g)::text, 5, '0'), 'SALES_INVOICE', 'SalesOrder',
        $1 || lpad(($2::int + 1 - g)::text, 5, '0'),
        TIMESTAMP '2026-06-01 00:00:00', 'VOID',
-       $1 || lpad(($2::int + 1 - g)::text, 5, '0') || '-key', '[]'::jsonb, 'GBP', 'xero', NULL, now(), now()
+       'accounting-sync-log:xero:' || lower($1 || lpad(($2::int + 1 - g)::text, 5, '0') || '-s'),
+       '[]'::jsonb, 'GBP', 'xero', NULL, now(), now()
      FROM generate_series(1, $2::int) g`,
     prefix,
     count,
@@ -131,6 +146,13 @@ type EventShape = {
   type?: string
   sourceEntityType?: string
   businessDate?: Date
+  /**
+   * o3d-11rf r9 — THE KEY IS THE MIRROR'S IDENTITY, so a fixture that wants to be OWNED by a sync row
+   * has to carry the key that row derives. Fixtures used to default to `<id>-key`, an id-shaped
+   * string no row could ever produce, and the join paired them anyway because it matched on the four
+   * scope columns alone. That is the r9 defect, and it is why these fixtures could not have caught it.
+   */
+  idempotencyKey?: string
 }
 
 async function makeEvent(tx: Tx, shape: EventShape) {
@@ -142,7 +164,7 @@ async function makeEvent(tx: Tx, shape: EventShape) {
       sourceEntityId: shape.reference,
       businessDate: shape.businessDate ?? new Date('2026-01-01T00:00:00Z'),
       status: shape.status ?? 'VOID',
-      idempotencyKey: `${shape.id}-key`,
+      idempotencyKey: shape.idempotencyKey ?? `${shape.id}-key`,
       linesJson: [],
       currency: 'GBP',
       externalSystem: shape.externalSystem === undefined ? 'xero' : shape.externalSystem,
@@ -159,6 +181,8 @@ type SyncShape = {
   connector?: string
   type?: string
   referenceType?: string
+  /** What the row was going to send. The mirror key is derived from it, so it is identity here. */
+  payload?: unknown
 }
 
 async function makeSyncLog(tx: Tx, shape: SyncShape) {
@@ -171,8 +195,34 @@ async function makeSyncLog(tx: Tx, shape: SyncShape) {
       referenceType: shape.referenceType ?? 'SalesOrder',
       referenceId: shape.reference,
       externalTransactionId: shape.externalTransactionId ?? null,
+      payload: shape.payload === undefined ? undefined : (shape.payload as never),
     },
   })
+}
+
+/**
+ * The key the mirror would give a row of this shape — asked of the PRODUCTION function, never spelled
+ * out here. A fixture that hand-built the string would agree with a SQL derivation that had drifted
+ * from the TypeScript one, which is the failure this whole file now exists to make impossible.
+ */
+function mirrorKeyFor(params: {
+  syncLogId?: string
+  connector?: string
+  type?: string
+  referenceType?: string
+  referenceId: string
+  payload?: unknown
+}): string {
+  const keys = mirroredAccountingEventIdempotencyKeys({
+    syncLogId: params.syncLogId,
+    connector: params.connector ?? 'xero',
+    type: params.type ?? 'SALES_INVOICE',
+    referenceType: params.referenceType ?? 'SalesOrder',
+    referenceId: params.referenceId,
+    payload: params.payload ?? null,
+  })
+  assert.ok(keys.length > 0, 'the fixture asked for a key the mirror does not derive')
+  return keys[0]
 }
 
 /** The whole path a cron run takes: collect (which issues the join) then evaluate. */
@@ -202,6 +252,23 @@ type Shape = {
   reported: boolean
   /** When reported, the sync-row suffixes expected in the finding, in order. */
   expectSyncSuffixes?: number[]
+  /**
+   * o3d-11rf r9 — WHICH KEY FORM MAKES THIS SHAPE'S EVENT THE ROW'S OWN MIRROR.
+   *
+   * 'row'     — no payload; the key is `accounting-sync-log:<connector>:<syncLogId>`, so exactly ONE
+   *             row can own the event.
+   * 'payload' — the row carries an `_idempotencyKey`, and the key is derived from it. ONE live row
+   *             only, and that is the DATABASE's rule rather than a choice made here:
+   *             `accounting_sync_logs_idempotency_key_uq` is UNIQUE on
+   *             (connector, type, referenceType, referenceId, payload->>'_idempotencyKey') for
+   *             PENDING/PROCESSING/SYNCED, so two LIVE rows in one scope cannot share that token.
+   * 'legacy'  — every sync log carries the same `date` and no `_idempotencyKey`, so all of them derive
+   *             the SAME legacy `accounting-sync:<connector>:<type>:<ref>:<date>` key and all of them
+   *             own the event. The unique index above does not reach these (its predicate needs the
+   *             key to be PRESENT), so this — not 'payload' — is how several live rows legitimately
+   *             share one mirror, and it is the form the r9 recommendation named by hand.
+   */
+  ownership?: 'row' | 'payload' | 'legacy'
 }
 
 const SHAPES: Shape[] = [
@@ -211,6 +278,7 @@ const SHAPES: Shape[] = [
     syncLogs: [{ status: 'PENDING' }],
     reported: true,
     expectSyncSuffixes: [0],
+    ownership: 'row',
   },
   {
     label: 'PROCESSING is live work too',
@@ -218,13 +286,15 @@ const SHAPES: Shape[] = [
     syncLogs: [{ status: 'PROCESSING' }],
     reported: true,
     expectSyncSuffixes: [0],
+    ownership: 'row',
   },
   {
-    label: 'every contradicting row is named, on ONE finding',
+    label: 'every contradicting row is named, on ONE finding — the shared LEGACY key',
     event: {},
     syncLogs: [{ status: 'PENDING' }, { status: 'PROCESSING' }],
     reported: true,
     expectSyncSuffixes: [0, 1],
+    ownership: 'legacy',
   },
   {
     label: 'a blank document id is no document id (btrim), so the row is still work owed',
@@ -313,9 +383,34 @@ test('o3d-11rf r4: which pairs the contradiction join selects, and which it refu
   const findings = await withRollback(async (tx) => {
     for (const [index, shape] of SHAPES.entries()) {
       const reference = `11rf4-${run}-o${index}`
-      await makeEvent(tx, { ...shape.event, id: `11rf4-${run}-e${index}`, reference })
+      const syncLogId = (n: number) => `11rf4-${run}-s${index}-${n}`
+
+      // o3d-11rf r9 — the event carries the key its OWNER derives, asked of the mirror's own builder.
+      // A shape that gets this wrong is not a shape the join can report, however its scope reads.
+      const ownership = shape.ownership ?? 'payload'
+      const payload =
+        ownership === 'payload' ? { _idempotencyKey: `11rf4-${run}-doc${index}` }
+        : ownership === 'legacy' ? { date: '2026-01-02' }
+        : undefined
+      if (ownership !== 'legacy') {
+        assert.equal(shape.syncLogs.length, 1,
+          `${shape.label} — only the legacy key form can be owned by more than one live row`)
+      }
+
+      await makeEvent(tx, {
+        ...shape.event,
+        id: `11rf4-${run}-e${index}`,
+        reference,
+        // 'row' passes the sync-log id so the PRIMARY key is the row form; 'legacy' withholds it so
+        // the primary IS the legacy form. Neither spells a key out.
+        idempotencyKey: mirrorKeyFor({
+          referenceId: reference,
+          payload,
+          ...(ownership === 'row' ? { syncLogId: syncLogId(0) } : {}),
+        }),
+      })
       for (const [n, log] of shape.syncLogs.entries()) {
-        await makeSyncLog(tx, { ...log, id: `11rf4-${run}-s${index}-${n}`, reference })
+        await makeSyncLog(tx, { ...log, id: syncLogId(n), reference, payload })
       }
     }
     return (await reportFindings(tx)).findings
@@ -379,6 +474,7 @@ test('o3d-11rf r4: an OLD contradiction beyond the previous 10,000-row page IS r
       id: `11rf4-victim-e-${run}`,
       reference,
       businessDate: new Date('2019-03-04T00:00:00Z'),
+      idempotencyKey: mirrorKeyFor({ syncLogId: `11rf4-victim-s-${run}`, referenceId: reference }),
     })
     await makeSyncLog(tx, { id: `11rf4-victim-s-${run}`, reference, status: 'PENDING' })
 
@@ -558,6 +654,233 @@ test('o3d-11rf r5: a PERSISTED over-cap run still tells an operator the list is 
     'the persisted run rolled back with everything else')
 })
 
+// ---------------------------------------------------------------------------------------------
+// o3d-11rf r9 (Codex r9, HIGH) — A SHARED SCOPE IS NOT OWNERSHIP OF THE SAME MIRROR
+// ---------------------------------------------------------------------------------------------
+
+/**
+ * THE DECISIVE TEST, and the one the r4 suite above could not be: every fixture there gave a document
+ * ONE sync row and ONE event, so "the event this row owns" and "an event about this row's document"
+ * were the same set and no test could tell the two rules apart.
+ *
+ * WHAT PRODUCTION LOOKS LIKE INSTEAD. A settled attempt and its replacement share all four scope
+ * columns, and the database ALLOWS that: `accounting_sync_logs_idempotency_key_uq` only forbids two
+ * LIVE rows sharing a payload `_idempotencyKey`, and a CANCELLED row is outside its predicate
+ * entirely. Each attempt derives its own mirror key, so the settled one's unexplained VOID says
+ * nothing whatever about the live one — whose own mirror is sitting there PENDING and healthy.
+ *
+ * IT ASSERTS ITS OWN PRECONDITION BY RUNNING THE OLD RULE. The scope-only join is spelled out below
+ * and must PAIR them; if it did not, this fixture would never have reached the defect and the test
+ * would pass against the unfixed code for the wrong reason.
+ */
+test('o3d-11rf r9: a VOID mirror is NOT reported against a live row that owns a different mirror', { skip }, async () => {
+  const run = randomUUID().slice(0, 8)
+  const shared = `11rf9-shared-${run}`
+  const other = `11rf9-other-${run}`
+  const settledRow = `11rf9-s-settled-${run}`
+  const liveRow = `11rf9-s-live-${run}`
+  const victimRow = `11rf9-s-victim-${run}`
+
+  const { findings, scopeOnlyPairs, scopes } = await withRollback(async (tx) => {
+    // ONE document, TWO attempts. The settled attempt's mirror is VOID and nobody recorded why.
+    await makeSyncLog(tx, { id: settledRow, reference: shared, status: 'CANCELLED' })
+    await makeEvent(tx, {
+      id: `11rf9-e-void-${run}`,
+      reference: shared,
+      status: 'VOID',
+      voidBasis: null,
+      idempotencyKey: mirrorKeyFor({ syncLogId: settledRow, referenceId: shared }),
+    })
+
+    // The replacement, live and unposted — and its OWN mirror, PENDING and perfectly healthy.
+    await makeSyncLog(tx, { id: liveRow, reference: shared, status: 'PENDING' })
+    await makeEvent(tx, {
+      id: `11rf9-e-live-${run}`,
+      reference: shared,
+      status: 'PENDING',
+      idempotencyKey: mirrorKeyFor({ syncLogId: liveRow, referenceId: shared }),
+    })
+
+    // A POSITIVE CONTROL on a different document, so "nothing reported" cannot pass by the query
+    // having been narrowed into uselessness.
+    await makeSyncLog(tx, { id: victimRow, reference: other, status: 'PENDING' })
+    await makeEvent(tx, {
+      id: `11rf9-e-victim-${run}`,
+      reference: other,
+      status: 'VOID',
+      voidBasis: null,
+      idempotencyKey: mirrorKeyFor({ syncLogId: victimRow, referenceId: other }),
+    })
+
+    // THE PRECONDITION: the rule this replaced, spelled as it was spelled, against these very rows.
+    const scopeOnly = await tx.$queryRaw`
+      SELECT e."id" AS "eventId", l."id" AS "syncLogId"
+      FROM "accounting_events" e
+      JOIN "accounting_sync_logs" l
+        ON l."connector"     = e."externalSystem"
+       AND l."type"::text    = e."type"
+       AND l."referenceType" = e."sourceEntityType"
+       AND l."referenceId"   = e."sourceEntityId"
+      WHERE e."status" = 'VOID'
+        AND e."voidBasis" IS NULL
+        AND l."status"::text = ANY(ARRAY['PENDING', 'PROCESSING']::text[])
+        AND (l."externalTransactionId" IS NULL OR btrim(l."externalTransactionId") = '')
+        AND e."id" LIKE ${`11rf9-e-%-${run}`}
+      ORDER BY e."id", l."id"
+    ` as Array<{ eventId: string; syncLogId: string }>
+
+    // And that the two attempts really do share every one of the four columns.
+    const scopes = await tx.$queryRaw`
+      SELECT "id", "connector", "type"::text AS "type", "referenceType", "referenceId"
+      FROM "accounting_sync_logs"
+      WHERE "id" IN (${settledRow}, ${liveRow})
+      ORDER BY "id"
+    ` as Array<Record<string, string>>
+
+    return { findings: (await reportFindings(tx)).findings, scopeOnlyPairs: scopeOnly, scopes }
+  })
+
+  assert.equal(scopes.length, 2, 'both attempts exist')
+  assert.deepEqual(
+    { ...scopes[0], id: undefined },
+    { ...scopes[1], id: undefined },
+    'the two attempts share all four scope columns — which is what made the old join pair them',
+  )
+  assert.deepEqual(
+    scopeOnlyPairs,
+    [
+      { eventId: `11rf9-e-victim-${run}`, syncLogId: victimRow },
+      { eventId: `11rf9-e-void-${run}`, syncLogId: liveRow },
+    ],
+    'the OLD scope-only rule pairs the settled attempt’s VOID with the LIVE row it does not own — '
+    + 'the false finding, reproduced here so its disappearance below means something',
+  )
+
+  const reported = findings.filter((f) => f.code === CONTRADICTION)
+  assert.deepEqual(
+    reported.map((f) => f.accountingEventId),
+    [`11rf9-e-victim-${run}`],
+    'ownership reports only the document whose OWN mirror is an unexplained VOID',
+  )
+  assert.deepEqual(
+    (reported[0].details as { syncLogIds: string[] }).syncLogIds,
+    [victimRow],
+    'and names that document’s own row, not a stranger sharing its scope',
+  )
+})
+
+/**
+ * THE DERIVATION ITSELF, CHECKED AGAINST THE FUNCTION IT REIMPLEMENTS.
+ *
+ * The join builds mirror keys in SQL because it has to: the pairing must BE the filter, or the bound
+ * lands before the question again (see the r4 note at the top of this file). The cost of that is two
+ * implementations of one rule, and the only honest mitigation is to make them prove they agree — over
+ * every branch `mirroredAccountingEventIdempotencyKeys` has, including the two payload shapes that
+ * LOOK like a key and are not one, and the type that is not mirrored at all.
+ *
+ * EACH SHAPE IS ASSERTED IN BOTH DIRECTIONS: an event carrying a key the function derives IS reported,
+ * and an event in the SAME SCOPE carrying a sibling attempt’s key is NOT. Without the negative half
+ * every one of these would pass against the scope-only join this replaced.
+ */
+const PAYLOAD_SHAPES: Array<{ label: string; payload: unknown; keys: number; type?: string }> = [
+  { label: 'no payload at all: the sync-log id form, and only that', payload: null, keys: 1 },
+  { label: 'a payload key, normalised the way the builder normalises it', payload: { _idempotencyKey: 'Doc/42' }, keys: 1 },
+  { label: 'a date and no key: the row form AND the legacy form beside it', payload: { date: '2026-01-02' }, keys: 2 },
+  { label: 'a key beats a date, and is then the only key', payload: { _idempotencyKey: 'K1', date: '2026-01-02' }, keys: 1 },
+  { label: 'a NUMERIC _idempotencyKey is not a string, so it is not a key', payload: { _idempotencyKey: 77, date: '2026-01-03' }, keys: 2 },
+  { label: 'a blank _idempotencyKey is not a key either', payload: { _idempotencyKey: '   ', date: '2026-01-04' }, keys: 2 },
+  { label: 'a payload that is not a record at all reads as an empty one', payload: [1, 2], keys: 1 },
+]
+
+test('o3d-11rf r9: the SQL key derivation is the TypeScript one, branch for branch', { skip }, async () => {
+  const run = randomUUID().slice(0, 8)
+
+  // NOT VACUOUS: the battery must actually exercise the two-key case, or the legacy form is untested.
+  assert.ok(PAYLOAD_SHAPES.some((shape) => shape.keys === 2), 'the battery covers a row with two keys')
+
+  const expected: string[] = []
+  const findings = await withRollback(async (tx) => {
+    for (const [index, shape] of PAYLOAD_SHAPES.entries()) {
+      const reference = `11rf9-k-${run}-o${index}`
+      const rowId = `11rf9-k-${run}-s${index}`
+      const keys = mirroredAccountingEventIdempotencyKeys({
+        syncLogId: rowId,
+        connector: 'xero',
+        type: 'SALES_INVOICE',
+        referenceType: 'SalesOrder',
+        referenceId: reference,
+        payload: shape.payload,
+      })
+      assert.equal(keys.length, shape.keys, `${shape.label} — the builder yields the stated number of keys`)
+
+      await makeSyncLog(tx, { id: rowId, reference, status: 'PENDING', payload: shape.payload })
+      for (const [k, key] of keys.entries()) {
+        const eventId = `11rf9-k-${run}-e${index}-${k}`
+        await makeEvent(tx, { id: eventId, reference, status: 'VOID', voidBasis: null, idempotencyKey: key })
+        expected.push(eventId)
+      }
+      // The negative half: a sibling attempt's mirror, same document, same four columns, not owned.
+      await makeEvent(tx, {
+        id: `11rf9-k-${run}-e${index}-ghost`,
+        reference,
+        status: 'VOID',
+        voidBasis: null,
+        idempotencyKey: mirrorKeyFor({ syncLogId: `${rowId}-ghost`, referenceId: reference }),
+      })
+    }
+
+    // A TYPE THAT IS NOT MIRRORED HAS NO MIRROR TO OWN. INVOICE_PAYMENT is a real sync type and it is
+    // not in MIRRORED_ACCOUNTING_SYNC_TYPES, so the builder returns nothing for it and neither may the
+    // join — even though an event sharing its four columns is sitting right there.
+    const unmirroredRef = `11rf9-k-${run}-unmirrored`
+    assert.deepEqual(
+      mirroredAccountingEventIdempotencyKeys({
+        syncLogId: `${unmirroredRef}-s`, connector: 'xero', type: 'INVOICE_PAYMENT',
+        referenceType: 'SalesOrder', referenceId: unmirroredRef, payload: null,
+      }),
+      [], 'the builder mirrors nothing for an unmirrored type',
+    )
+    await makeSyncLog(tx, { id: `${unmirroredRef}-s`, reference: unmirroredRef, status: 'PENDING', type: 'INVOICE_PAYMENT' })
+    await makeEvent(tx, {
+      id: `${unmirroredRef}-e`, reference: unmirroredRef, status: 'VOID', voidBasis: null,
+      type: 'INVOICE_PAYMENT', idempotencyKey: `accounting-sync-log:xero:${unmirroredRef}-s`,
+    })
+
+    // A KEY THE BUILDER CANNOT BUILD. Every part of '!!!' is stripped by the normaliser, so TypeScript
+    // THROWS rather than returning a key; SQL yields no key instead, which is the safe direction and
+    // the one deliberate divergence between the two. Either way this row owns nothing.
+    const junkRef = `11rf9-k-${run}-junk`
+    assert.throws(() => mirroredAccountingEventIdempotencyKeys({
+      syncLogId: `${junkRef}-s`, connector: 'xero', type: 'SALES_INVOICE',
+      referenceType: 'SalesOrder', referenceId: junkRef, payload: { _idempotencyKey: '!!!' },
+    }), /must not be blank/, 'a part that normalises away is refused, not silently skipped')
+    await makeSyncLog(tx, { id: `${junkRef}-s`, reference: junkRef, status: 'PENDING', payload: { _idempotencyKey: '!!!' } })
+    // The two keys a WRONG derivation would reach for, sitting in the junk row's own scope so that
+    // either mistake is a reported finding rather than a silent difference:
+    //   • the empty-part key, which is what dropping the blank-part guard produces;
+    //   • the sync-log id key, which is what branching on the NORMALISED payload key rather than on
+    //     the raw one produces — it would read '!!!' as absent and fall through to the row form.
+    // The builder above throws for this row, so the right answer is that it owns neither.
+    await makeEvent(tx, {
+      id: `${junkRef}-e-empty`, reference: junkRef, status: 'VOID', voidBasis: null,
+      idempotencyKey: 'accounting-sync:xero:sales_invoice:',
+    })
+    await makeEvent(tx, {
+      id: `${junkRef}-e-fallthrough`, reference: junkRef, status: 'VOID', voidBasis: null,
+      idempotencyKey: `accounting-sync-log:xero:${junkRef}-s`,
+    })
+
+    return (await reportFindings(tx)).findings
+  })
+
+  assert.deepEqual(
+    findings.filter((f) => f.code === CONTRADICTION).map((f) => f.accountingEventId).sort(),
+    [...expected].sort(),
+    'every key the builder derives is joined on, no key it does not derive is, and the two unbuildable '
+    + 'rows own nothing',
+  )
+})
+
 test('o3d-11rf r4: the probes left the database as they found it', { skip }, async () => {
   loadEnv()
   const { db } = await import('../../lib/db')
@@ -565,4 +888,8 @@ test('o3d-11rf r4: the probes left the database as they found it', { skip }, asy
   assert.equal(survivors, 0, 'every probe above rolled back')
   const r5Survivors = await db.accountingEvent.count({ where: { id: { startsWith: '11rf5-' } } })
   assert.equal(r5Survivors, 0, 'the persistence probe too')
+  const r9Survivors = await db.accountingEvent.count({ where: { id: { startsWith: '11rf9-' } } })
+  assert.equal(r9Survivors, 0, 'and the ownership probes')
+  const r9Rows = await db.accountingSyncLog.count({ where: { id: { startsWith: '11rf9-' } } })
+  assert.equal(r9Rows, 0, 'sync rows included — these fixtures write both sides')
 })
