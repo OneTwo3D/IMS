@@ -1543,15 +1543,16 @@ async function withTurkishDatabase<T>(fn: (run: Sql, name: string) => Promise<T>
   const name = `ims_11rf12_${randomUUID().replace(/-/g, '').slice(0, 16)}`
   let created = false
   try {
-    // o3d-11rf r13 — THE PROBE HAD TO SURVIVE THE CI IMAGE, AND IT DID NOT.
+    // o3d-11rf r13 — THE PROBE WAS PINNED TO ONE POSTGRESQL MAJOR AND DID NOT SAY SO.
     //
     // `pg_collation.colllocale` is a PostgreSQL 17 COLUMN NAME. PostgreSQL 16 — which is what
-    // `.github/workflows/schema-guardrails.yml` runs, and what the new job runs — calls the same
-    // column `colliculocale` (renamed in 17). The old spelling therefore did not return zero rows on
-    // a 16: it raised `column "colllocale" does not exist`, and the four locale tests would have gone
-    // RED on the very runner this round wired them into, for a reason that has nothing to do with
-    // the finding. Reading the column out of `to_jsonb(c)` asks for a KEY rather than a column, so a
-    // name that is absent is NULL instead of an error, and one statement answers on both versions.
+    // `.github/workflows/schema-guardrails.yml` stands up for its own jobs, and the version this
+    // suite is most likely to be pointed at on a runner — calls the same column `colliculocale`
+    // (renamed in 17). The old spelling therefore did not return zero rows on a 16: it raised
+    // `column "colllocale" does not exist`, so the four locale tests would have gone RED for a
+    // reason that has nothing to do with the finding, the first time anyone ran them anywhere but
+    // here. Reading the column out of `to_jsonb(c)` asks for a KEY rather than a column, so a name
+    // that is absent is NULL instead of an error, and one statement answers on both versions.
     //
     // TWO COUNTS, NOT ONE, because the two ways this can come back empty are not the same fact:
     //   - no ICU collations AT ALL — the server was built without ICU, there is no `tr-TR` to ask
