@@ -13,6 +13,7 @@ import {
   listAccountingReconciliationRuns,
   persistAccountingReconciliationReport,
   reconciliationLookbackDate,
+  ECMASCRIPT_BLANK_PATTERN,
   type AccountingReconciliationFinding,
   type AccountingReconciliationTruncation,
 } from '../../lib/domain/accounting/reconciliation'
@@ -297,9 +298,21 @@ const SHAPES: Shape[] = [
     ownership: 'legacy',
   },
   {
-    label: 'a blank document id is no document id (btrim), so the row is still work owed',
+    label: 'a blank document id is no document id, so the row is still work owed',
     event: {},
     syncLogs: [{ status: 'PENDING', externalTransactionId: '   ' }],
+    reported: true,
+    expectSyncSuffixes: [0],
+  },
+  {
+    // o3d-11rf r10 — AND BLANK MEANS WHAT `.trim()` MEANS. Every TypeScript reader of this column
+    // asks `externalTransactionId?.trim()`; this statement asked `btrim(text)`, which strips ordinary
+    // spaces only. A tab-and-NBSP id therefore described a DOCUMENT THAT EXISTS to the join alone,
+    // and the row it belongs to was dropped out of the live set — the same defect Codex found on the
+    // payload token, twenty-five lines further down the same statement.
+    label: 'a document id of a TAB and an NBSP is blank too, whatever btrim(text) makes of it',
+    event: {},
+    syncLogs: [{ status: 'PENDING', externalTransactionId: '\u0009\u00a0' }],
     reported: true,
     expectSyncSuffixes: [0],
   },
@@ -790,6 +803,40 @@ const PAYLOAD_SHAPES: Array<{ label: string; payload: unknown; keys: number; typ
   { label: 'a NUMERIC _idempotencyKey is not a string, so it is not a key', payload: { _idempotencyKey: 77, date: '2026-01-03' }, keys: 2 },
   { label: 'a blank _idempotencyKey is not a key either', payload: { _idempotencyKey: '   ', date: '2026-01-04' }, keys: 2 },
   { label: 'a payload that is not a record at all reads as an empty one', payload: [1, 2], keys: 1 },
+
+  // o3d-11rf r10 (Codex r10, HIGH) — THE SHAPES THIS BATTERY WAS MISSING, AND WHY IT MISSED THEM.
+  //
+  // Every case above spells "blank" with ORDINARY SPACES, which is the one whitespace character
+  // `btrim(text)` happens to strip. So the battery agreed with a SQL derivation that agreed with
+  // JavaScript on spaces alone. Each token below is BLANK to `.trim()` and NOT blank to `btrim`: the
+  // statement used to read it as a PRESENT payload key, disable both fallback arms, and then
+  // normalise the token itself away — deriving NO KEY AT ALL where TypeScript derives two, and
+  // dropping a live row out of reconciliation entirely.
+  //
+  // Each carries a `date` as well, so both fallback forms are asserted: the row key AND the legacy
+  // one, which is what Codex asked for by name.
+  { label: 'a TAB-only _idempotencyKey is blank, so the row form and the legacy form both stand', payload: { _idempotencyKey: '\u0009', date: '2026-01-05' }, keys: 2 },
+  { label: 'a NEWLINE-only one likewise', payload: { _idempotencyKey: '\u000a', date: '2026-01-06' }, keys: 2 },
+  { label: 'a CARRIAGE RETURN, and the CRLF pair a pasted value carries', payload: { _idempotencyKey: '\u000d\u000a', date: '2026-01-07' }, keys: 2 },
+  { label: 'a VERTICAL TAB and a FORM FEED', payload: { _idempotencyKey: '\u000b\u000c', date: '2026-01-08' }, keys: 2 },
+  { label: 'a NON-BREAKING SPACE, which PostgreSQL\u2019s own ctype class does NOT call whitespace', payload: { _idempotencyKey: '\u00a0', date: '2026-01-09' }, keys: 2 },
+  { label: 'a BYTE ORDER MARK, which JavaScript trims and Unicode does not call a space', payload: { _idempotencyKey: '\ufeff', date: '2026-01-10' }, keys: 2 },
+  { label: 'an EN QUAD, a Unicode space separator', payload: { _idempotencyKey: '\u2000', date: '2026-01-11' }, keys: 2 },
+  { label: 'a LINE SEPARATOR, which is a LineTerminator rather than a space', payload: { _idempotencyKey: '\u2028', date: '2026-01-12' }, keys: 2 },
+  { label: 'an IDEOGRAPHIC SPACE', payload: { _idempotencyKey: '\u3000', date: '2026-01-13' }, keys: 2 },
+  { label: 'a MIXED RUN of them, leading, trailing and in between', payload: { _idempotencyKey: '\u0009\u000a \u00a0\ufeff\u3000\u000d', date: '2026-01-14' }, keys: 2 },
+
+  // THE OTHER HALF OF THE RULE, AND IT IS A DIFFERENT RULE. Trimming decides whether the token is
+  // THERE; the normaliser then COLLAPSES every run of characters outside `[a-z0-9._:-]` to one `-`
+  // wherever it sits. A token with whitespace in the middle is PRESENT, so the payload key is the
+  // only key — and it is the collapsed form, which is what these two prove.
+  { label: 'INTERIOR whitespace is collapsed, not trimmed: the token is present and is the only key', payload: { _idempotencyKey: 'Doc\u000943', date: '2026-01-15' }, keys: 1 },
+  { label: 'LEADING and TRAILING whitespace around a real token comes off, and the token stays', payload: { _idempotencyKey: '\u00a0 Doc/44\u000a', date: '2026-01-16' }, keys: 1 },
+
+  // A BLANK DATE, for completeness of the branch rather than for discrimination: this shape cannot
+  // tell the two spellings apart, because a date that normalises away drops its key either way (the
+  // legacy arm is enabled and then yields NULL). Stated so nobody reads it as evidence it is not.
+  { label: 'a whitespace-only date is no date, so the row form stands alone', payload: { date: '\u000b' }, keys: 1 },
 ]
 
 test('o3d-11rf r9: the SQL key derivation is the TypeScript one, branch for branch', { skip }, async () => {
@@ -849,26 +896,49 @@ test('o3d-11rf r9: the SQL key derivation is the TypeScript one, branch for bran
     // A KEY THE BUILDER CANNOT BUILD. Every part of '!!!' is stripped by the normaliser, so TypeScript
     // THROWS rather than returning a key; SQL yields no key instead, which is the safe direction and
     // the one deliberate divergence between the two. Either way this row owns nothing.
-    const junkRef = `11rf9-k-${run}-junk`
-    assert.throws(() => mirroredAccountingEventIdempotencyKeys({
-      syncLogId: `${junkRef}-s`, connector: 'xero', type: 'SALES_INVOICE',
-      referenceType: 'SalesOrder', referenceId: junkRef, payload: { _idempotencyKey: '!!!' },
-    }), /must not be blank/, 'a part that normalises away is refused, not silently skipped')
-    await makeSyncLog(tx, { id: `${junkRef}-s`, reference: junkRef, status: 'PENDING', payload: { _idempotencyKey: '!!!' } })
-    // The two keys a WRONG derivation would reach for, sitting in the junk row's own scope so that
-    // either mistake is a reported finding rather than a silent difference:
-    //   • the empty-part key, which is what dropping the blank-part guard produces;
-    //   • the sync-log id key, which is what branching on the NORMALISED payload key rather than on
-    //     the raw one produces — it would read '!!!' as absent and fall through to the row form.
-    // The builder above throws for this row, so the right answer is that it owns neither.
-    await makeEvent(tx, {
-      id: `${junkRef}-e-empty`, reference: junkRef, status: 'VOID', voidBasis: null,
-      idempotencyKey: 'accounting-sync:xero:sales_invoice:',
-    })
-    await makeEvent(tx, {
-      id: `${junkRef}-e-fallthrough`, reference: junkRef, status: 'VOID', voidBasis: null,
-      idempotencyKey: `accounting-sync-log:xero:${junkRef}-s`,
-    })
+    //
+    // o3d-11rf r10 — U+0085 NEL and U+200B ZWSP join it, and they are the NEAR MISSES rather than more
+    // of the same. JavaScript does NOT trim either, so both are PRESENT tokens that normalise away,
+    // exactly like '!!!'. They are what separates the blank test the statement now asks from the two
+    // plausible wrong ones: PostgreSQL's ctype-driven `[[:space:]]` calls NEL whitespace, and a
+    // `btrim(v, characters)` set built from the trimmable characters holds the bytes C2 and 85, so it
+    // eats NEL outright — every database in this estate being SQL_ASCII, where character operations
+    // are byte operations. Either mistake reads these rows as having no payload key, falls through to
+    // the row form, and reports the fallthrough event below.
+    const unbuildable = [
+      { suffix: 'junk', token: '!!!' },
+      { suffix: 'nel', token: '\u0085' },
+      { suffix: 'zwsp', token: '\u200b' },
+    ]
+    for (const [index, { suffix, token }] of unbuildable.entries()) {
+      const junkRef = `11rf9-k-${run}-${suffix}`
+      assert.throws(() => mirroredAccountingEventIdempotencyKeys({
+        syncLogId: `${junkRef}-s`, connector: 'xero', type: 'SALES_INVOICE',
+        referenceType: 'SalesOrder', referenceId: junkRef, payload: { _idempotencyKey: token },
+      }), /must not be blank/, `a part that normalises away is refused, not silently skipped (${suffix})`)
+      // AND IT IS REFUSED FOR THE RIGHT REASON: the token is PRESENT and normalises to nothing, not
+      // absent. Without this the NEL and ZWSP rows would prove nothing that '!!!' does not.
+      assert.notEqual(token.trim(), '', `${suffix} is not blank to JavaScript — which is what makes it a near miss`)
+      await makeSyncLog(tx, { id: `${junkRef}-s`, reference: junkRef, status: 'PENDING', payload: { _idempotencyKey: token } })
+      // The two keys a WRONG derivation would reach for, sitting in the row's own scope so that
+      // either mistake is a reported finding rather than a silent difference:
+      //   • the empty-part key, which is what dropping the blank-part guard produces;
+      //   • the sync-log id key, which is what branching on the NORMALISED payload key rather than on
+      //     the raw one produces — and what reading the token as BLANK produces too.
+      // The builder above throws for every one of these rows, so the right answer is that they own
+      // neither. The empty-part key is written once because it has no scope in it to differ by, and
+      // `accounting_events.idempotencyKey` is UNIQUE.
+      if (index === 0) {
+        await makeEvent(tx, {
+          id: `${junkRef}-e-empty`, reference: junkRef, status: 'VOID', voidBasis: null,
+          idempotencyKey: 'accounting-sync:xero:sales_invoice:',
+        })
+      }
+      await makeEvent(tx, {
+        id: `${junkRef}-e-fallthrough`, reference: junkRef, status: 'VOID', voidBasis: null,
+        idempotencyKey: `accounting-sync-log:xero:${junkRef}-s`,
+      })
+    }
 
     return (await reportFindings(tx)).findings
   })
@@ -879,6 +949,128 @@ test('o3d-11rf r9: the SQL key derivation is the TypeScript one, branch for bran
     'every key the builder derives is joined on, no key it does not derive is, and the two unbuildable '
     + 'rows own nothing',
   )
+})
+
+/**
+ * o3d-11rf r10 (Codex r10, HIGH) — THE DECISIVE CASE, AND IT CANNOT BE SEEN FROM TYPESCRIPT.
+ *
+ * `stringValue` asks JavaScript `.trim()`; the statement asked PostgreSQL `btrim(text)`, which strips
+ * ORDINARY SPACES AND NOTHING ELSE. So `_idempotencyKey: "\t"` was ABSENT to TypeScript and PRESENT to
+ * SQL. TypeScript fell through to the row key with the legacy date key beside it; SQL took the payload
+ * branch, disabled both fallback arms, and then normalised the tab away to NULL — so the row derived
+ * NO KEY AT ALL and its unexplained VOID mirror vanished from the report.
+ *
+ * COMPARING TWO STRINGS IN NODE COULD NOT HAVE SHOWN THIS. The second derivation is a SQL statement,
+ * and what it does with a tab is a fact about PostgreSQL. So both sides are asserted here: the keys
+ * the production TypeScript function returns, and the events the production statement reports for a
+ * row carrying exactly that payload.
+ *
+ * IT ASSERTS ITS OWN PRECONDITION by running BOTH spellings of "blank" against the token, in the
+ * database, and showing they disagree. Without that this fixture might never have reached the defect.
+ */
+test('o3d-11rf r10: a TAB _idempotencyKey derives the SAME keys in SQL as in TypeScript', { skip }, async () => {
+  const run = randomUUID().slice(0, 8)
+  const reference = `11rf10-${run}-o`
+  const rowId = `11rf10-${run}-s`
+  const payload = { _idempotencyKey: '\u0009', date: '2026-02-03' }
+
+  // THE TYPESCRIPT SIDE, from the production function and spelled out so a drift in either is loud.
+  const keys = mirroredAccountingEventIdempotencyKeys({
+    syncLogId: rowId,
+    connector: 'xero',
+    type: 'SALES_INVOICE',
+    referenceType: 'SalesOrder',
+    referenceId: reference,
+    payload,
+  })
+  assert.deepEqual(keys, [
+    `accounting-sync-log:xero:${rowId}`,
+    `accounting-sync:xero:sales_invoice:salesorder:${reference}:2026-02-03`,
+  ], 'a tab is blank to .trim(), so the token is absent and BOTH fallback forms stand')
+
+  const { findings, blankness } = await withRollback(async (tx) => {
+    // THE PRECONDITION: the two spellings really do disagree about this token.
+    const [row] = await tx.$queryRaw`
+      SELECT btrim(${payload._idempotencyKey}::text) = '' AS "blankToBtrim",
+             ${payload._idempotencyKey}::text ~ ${ECMASCRIPT_BLANK_PATTERN} AS "blankToJavaScript"
+    ` as Array<{ blankToBtrim: boolean; blankToJavaScript: boolean }>
+
+    await makeSyncLog(tx, { id: rowId, reference, status: 'PENDING', payload })
+    for (const [n, key] of keys.entries()) {
+      await makeEvent(tx, {
+        id: `11rf10-${run}-e${n}`, reference, status: 'VOID', voidBasis: null, idempotencyKey: key,
+      })
+    }
+    return { findings: (await reportFindings(tx)).findings, blankness: row }
+  })
+
+  assert.equal(blankness.blankToBtrim, false,
+    'btrim(text) reads a lone tab as a PRESENT token — the defect, stated as a fact about this fixture')
+  assert.equal(blankness.blankToJavaScript, true, 'and the statement now reads it the way .trim() does')
+
+  assert.deepEqual(
+    findings.filter((f) => f.code === CONTRADICTION).map((f) => f.accountingEventId).sort(),
+    [`11rf10-${run}-e0`, `11rf10-${run}-e1`],
+    'SQL derives the same two keys TypeScript does; before r10 it derived none and both rows vanished',
+  )
+})
+
+/**
+ * o3d-11rf r10 — THE WHOLE SET, AND THE NEAR MISSES EITHER SIDE OF IT.
+ *
+ * The lesson of r10 is that a parity battery proves parity only over the shapes it contains, so this
+ * one does not choose shapes at all: it takes EVERY character `String.prototype.trim` strips, from the
+ * running engine, and asks PostgreSQL about each one — as raw text and through a jsonb round trip,
+ * because the production predicate reads its value out of a jsonb payload.
+ *
+ * THE DECOYS ARE THE POINT AS MUCH AS THE SET IS. U+0085 NEL and U+200B ZWSP are NOT trimmed by
+ * JavaScript, and U+201A is an ordinary punctuation mark. Each is a character one of the plausible
+ * wrong spellings gets wrong: `[[:space:]]` calls NEL whitespace, and `btrim(v, characters)` — the
+ * obvious fix — chews all three, because every database in this estate is SQL_ASCII and its character
+ * sets are BYTE sets. That is why the predicate is an alternation of whole characters.
+ */
+test('o3d-11rf r10: PostgreSQL agrees with JavaScript trim() on every character, and on the near misses', { skip }, async () => {
+  const trimmable: string[] = []
+  for (let point = 0; point <= 0x10ffff; point++) {
+    if (point >= 0xd800 && point <= 0xdfff) continue
+    const character = String.fromCodePoint(point)
+    if (character.trim() === '') trimmable.push(character)
+  }
+  assert.ok(trimmable.length > 6, 'the trimmable set reaches well past the ASCII controls')
+
+  const decoys = [
+    '\u0085', '\u200b', '\u201a', '\u180e', '!!!', 'a b', 'x', ' x ', '\u3000x', '',
+    '\u0009\u000a\u00a0\ufeff', ' \u0009 ',
+  ]
+  const cases = [...trimmable, ...decoys]
+
+  const observed = await withRollback(async (tx) => await tx.$queryRaw`
+    SELECT v,
+           (v ~ ${ECMASCRIPT_BLANK_PATTERN}) AS "blankAsText",
+           ((jsonb_build_object('_idempotencyKey', v) ->> '_idempotencyKey') ~ ${ECMASCRIPT_BLANK_PATTERN})
+             AS "blankViaJsonb",
+           ((jsonb_build_object('_idempotencyKey', v) ->> '_idempotencyKey') IS NOT DISTINCT FROM v)
+             AS "survivesJsonb",
+           (btrim(v) = '') AS "blankToBtrim"
+    FROM unnest(${cases}::text[]) AS v
+  ` as Array<{ v: string; blankAsText: boolean; blankViaJsonb: boolean; survivesJsonb: boolean; blankToBtrim: boolean }>)
+
+  assert.equal(observed.length, cases.length, 'every case came back')
+  const disagreements = observed
+    .filter((row) => {
+      const blankToJavaScript = row.v.trim() === ''
+      return row.blankAsText !== blankToJavaScript || row.blankViaJsonb !== blankToJavaScript || !row.survivesJsonb
+    })
+    .map((row) => JSON.stringify(row.v))
+  assert.deepEqual(disagreements, [],
+    'PostgreSQL and JavaScript agree on every one, through jsonb as well as raw text')
+
+  // NOT VACUOUS. The spelling this replaced disagrees with JavaScript on most of these, so a fixture
+  // that had reached none of them would show up here as a number that is too small.
+  const btrimWrong = observed.filter((row) => row.blankToBtrim !== (row.v.trim() === ''))
+  assert.ok(btrimWrong.length >= 20,
+    `btrim(text) is wrong on ${btrimWrong.length} of these — the battery really does reach the defect`)
+  assert.ok(btrimWrong.some((row) => row.v === '\u0009'), 'a lone tab among them, the character Codex named')
 })
 
 test('o3d-11rf r4: the probes left the database as they found it', { skip }, async () => {
@@ -892,4 +1084,8 @@ test('o3d-11rf r4: the probes left the database as they found it', { skip }, asy
   assert.equal(r9Survivors, 0, 'and the ownership probes')
   const r9Rows = await db.accountingSyncLog.count({ where: { id: { startsWith: '11rf9-' } } })
   assert.equal(r9Rows, 0, 'sync rows included — these fixtures write both sides')
+  const r10Survivors = await db.accountingEvent.count({ where: { id: { startsWith: '11rf10-' } } })
+  assert.equal(r10Survivors, 0, 'and the r10 whitespace probes')
+  const r10Rows = await db.accountingSyncLog.count({ where: { id: { startsWith: '11rf10-' } } })
+  assert.equal(r10Rows, 0, 'both sides of those too')
 })
