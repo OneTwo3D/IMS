@@ -19,6 +19,9 @@ on:
       - "scripts/fence-db-connections.mjs"
       - "scripts/run-migration-verifications.mjs"
       - "scripts/check-app-db-object-access.mjs"
+      - "tests/db/**"
+      - "lib/db/**"
+      - "lib/domain/accounting/**"
   push:
     branches:
       - main
@@ -39,6 +42,9 @@ on:
       - "scripts/fence-db-connections.mjs"
       - "scripts/run-migration-verifications.mjs"
       - "scripts/check-app-db-object-access.mjs"
+      - "tests/db/**"
+      - "lib/db/**"
+      - "lib/domain/accounting/**"
 
 jobs:
   migration-scope:
@@ -149,3 +155,86 @@ jobs:
           # design, so a job-wide value would break such a step rather than help it.
           DATABASE_SESSION_LOCK_URL: ${{ steps.direct-db.outputs.url }}
         run: npm run test:concurrency
+
+  # ===========================================================================================
+  # THE DB-BACKED REGRESSION SUITES, WHICH UNTIL o3d-11rf r13 RAN NOWHERE (Codex r13, HIGH)
+  # ===========================================================================================
+  # WHAT WAS WRONG. `tests/db/reconciliation-void-mirror-contradictions.test.ts` and
+  # `tests/db/accounting-event-void-basis-backfill.test.ts` gate every test on
+  # `RUN_DB_MIGRATION_TESTS === '1'`, and NO checked-in workflow set it. `npm run test:unit`'s glob
+  # (`tests/**/*.test.ts`) collects both files on every CI run, so they reported as skipped tests
+  # inside a green suite and nothing anywhere said that the branch's central evidence — the
+  # ownership join, the truncation containment, the fold parity, the Turkish locale — had not been
+  # executed. The other nine files in tests/db/ are static source scanners that never open a
+  # connection, which is why they run in test:unit and these two cannot.
+  #
+  # WHY A SIBLING JOB AND NOT MORE STEPS ON `fresh-db-drift`. Both were available; the deciding
+  # facts are about the DATABASE and about what a red job means.
+  #
+  #   1. THE DATABASES MUST NOT BE THE SAME ONE. `fresh-db-drift`'s database IS its subject: it is
+  #      migrated and then compared against prisma/schema.prisma, and its later steps run the
+  #      migrations' own verification queries over it. This suite CREATEs and DROPs scratch
+  #      databases on the same server (the tr-TR locale probes) and writes into transactions on the
+  #      main one. Sharing a service container would put a drift verdict downstream of a domain
+  #      suite's cleanup — the drift check would still be about a freshly migrated database only for
+  #      as long as that stayed true. A separate job gets a separate container and the question
+  #      stays clean.
+  #   2. A RED JOB SHOULD NAME ITS OWN SUBJECT. `fresh-db-drift` is already a five-link chain (drift
+  #      -> migration verifications -> object access -> direct-address resolution -> concurrency).
+  #      Appending a sixth means an accounting regression is reported as a schema guardrail, and it
+  #      means this suite is reachable only after five other things pass — the mask that o3d-amy8
+  #      was about, one workflow up.
+  #   3. IT COSTS NO WALL-CLOCK. The jobs run in parallel, so the duplicated `npm ci` +
+  #      `migrate deploy` is runner time and not time on the critical path.
+  #
+  # It is MODELLED ON `fresh-db-drift` and not on a new pattern: the same pinned action SHAs, the
+  # same `postgres:16` service with the same health check, the same DATABASE_URL shape, the same
+  # generate-then-deploy prelude. It deliberately does NOT take the DATABASE_SESSION_LOCK_URL
+  # override that job needs — nothing here acquires a session advisory lock.
+  #
+  # NO `DATABASE_SESSION_LOCK_URL`, AND SUPERUSER ON PURPOSE. The locale half CREATEs a database, so
+  # the connecting role needs CREATEDB and a route to the `postgres` maintenance database; the
+  # service's `POSTGRES_USER: postgres` is a superuser and provides both.
+  accounting-db-regressions:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: ims_ci
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d ims_ci"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:5432/ims_ci?schema=public
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npx prisma generate --schema prisma/schema.prisma
+      - run: npx prisma migrate deploy --schema prisma/schema.prisma
+      # `test:db` sets RUN_DB_MIGRATION_TESTS=1 *and* REQUIRE_DB_MIGRATION_TESTS=1. The second is the
+      # tripwire for this job: if an edit ever drops the first, the suites refuse to load instead of
+      # skipping themselves into a green run again.
+      #
+      # THE LOCALE HALF IS CONDITIONAL ON THE IMAGE AND SAYS SO. Four tests create a scratch database
+      # with `LOCALE_PROVIDER icu ICU_LOCALE 'tr-TR'`. The `postgres:16` image installs PGDG
+      # `postgresql-16`, whose control file carries a hard `Depends: libicu72`, so the server is
+      # linked against ICU and initdb imports the system ICU collations; `tr-TR` is core CLDR and is
+      # expected to be among them. That is package metadata, NOT a measurement on a runner. If it is
+      # absent anyway the four tests skip and say so — on stderr, as a `::warning::` annotation and
+      # in this job's summary — while the other eleven still run against the migrated database. What
+      # is NOT tolerated is ICU being present without `tr-TR`: that is the probe being wrong, and the
+      # suite fails rather than retiring its own evidence.
+      - name: Run the DB-backed regression suites
+        run: npm run test:db

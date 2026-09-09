@@ -68,17 +68,22 @@ npm run test:db            # RUN_DB_MIGRATION_TESTS=1,   tests/db/**
 
 **Read the gate honestly.** `npm run test:unit`'s glob (`tests/**/*.test.ts`) **collects** the gated
 files anyway and reports them as skips, so a missing variable removes whole suites from a run that
-still reads as green. `tests/concurrency/**` is run in CI by the `fresh-db-drift` job in
-`.github/workflows/schema-guardrails.yml`. **`tests/db/**` is not run by any CI job.** Those suites
-execute only when somebody runs `npm run test:db` against a database they pointed `DATABASE_URL` at.
-Treat their evidence as evidence you have to go and collect, not as a gate that will stop a
-regression on a pull request.
+still reads as green. Both database tiers are run in CI by
+`.github/workflows/schema-guardrails.yml`: `tests/concurrency/**` by the `fresh-db-drift` job, and
+`tests/db/**` by the `accounting-db-regressions` job, which stands up its own `postgres:16` service,
+migrates it, and runs `npm run test:db` against it. The two jobs deliberately do not share a
+database — the reason is written out above the second job.
 
-o3d-11rf r13 through r16 attempted to close that gap with a CI job plus a standing guard that read
-the workflow and `package.json` to prove the job really invoked the script. The guard was withdrawn:
-it kept admitting deterministic states in which the job was green and the suites never ran, and a
-guard that reports enforcement it does not have is worse than none. **o3d-n3yt** carries the whole
-attempt — what was established, what the remaining holes are, and the one reader that did hold up.
+WHAT THAT DOES AND DOES NOT BUY YOU. A pull request that touches one of the job's `paths:` filters
+runs the suites, and a failing suite turns the job red — proved by mutation, not by reading: drop
+the `COLLATE "C"` pin inside the fold in `lib/domain/accounting/reconciliation.ts` and
+`npm run test:db` exits non-zero. What is NOT enforced is that the job keeps existing. o3d-11rf r13
+through r16 attempted that with a standing guard that read the workflow and `package.json` to prove
+the job really invoked the script; the guard was withdrawn, because it kept admitting deterministic
+states in which the job was green and the suites never ran, and a guard that reports enforcement it
+does not have is worse than none. So an edit that deletes the job, renames the script, or drops
+`tests/db/**` from the filters is caught by review and by nothing else. **o3d-n3yt** carries that
+hole — what was established, what remains open, and the one reader that did hold up.
 
 `test:db` sets **`REQUIRE_DB_MIGRATION_TESTS=1`** alongside `RUN_DB_MIGRATION_TESTS=1`. A gated file
 that finds the first set and the second not throws on load instead of skipping, so a future
