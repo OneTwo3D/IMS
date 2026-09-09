@@ -67,6 +67,8 @@ import { readdirSync, readFileSync, statSync } from 'node:fs'
 import { extname, join, relative, sep } from 'node:path'
 import ts from 'typescript'
 
+import { addLocalFunctionAliases, calleeName, importAliases } from './lib/ts-import-aliases.mjs'
+
 const ROOT = process.cwd()
 const SCAN_ROOTS = ['app', 'lib', 'components', 'scripts']
 const SCANNED_EXTENSIONS = new Set(['.ts', '.tsx'])
@@ -267,42 +269,82 @@ function unwrap(node) {
 }
 
 /**
- * Does this expression CARRY a family predicate — is it a call to one, a spread of one, an array
- * containing one, or a local name bound to one?
+ * Prisma's logical combinators. A `where` reached through one of these is the SAME predicate: `{
+ * NOT: { AND: [p] } }` and `{ NOT: p }` compile to the same negation, so a detector that reads only
+ * the immediate initializer is defeated by typing four characters.
+ */
+const LOGICAL_PROPERTIES = new Set(['AND', 'OR', 'NOT'])
+
+/**
+ * Does this expression CARRY a family predicate — is it a call to one, a spread of one, an array or
+ * a logical wrapper containing one, a hand-written copy of one, or a local name bound to any of
+ * those?
  *
  * `known` is the set of local identifiers already found to be bound to a family predicate, which is
  * what catches the real spelling: `const REFUND_PARK_WHERE = activeRefundParkWhere()` at module
- * level and `{ NOT: REFUND_PARK_WHERE }` three hundred lines below.
+ * level and `{ NOT: REFUND_PARK_WHERE }` three hundred lines below. `aliases` resolves the name a
+ * call actually invokes (see below).
+ *
+ * THE TWO EVASIONS THIS CLOSES, AND WHY THEY ARE THE SAME MISTAKE TWICE (o3d-272i r4). The first
+ * spelling asked `ts.isIdentifier(callee) && FAMILY_PREDICATE_FUNCTIONS.has(callee.text)` — the
+ * callee's OWN name — so `import { activeRefundParkWhere as parkWhere }` and `{ NOT: parkWhere() }`
+ * passed, and so did a namespace import's `families.activeRefundParkWhere()`. That is verbatim the
+ * hole check-fulfillment-requirement-seam.mjs was mutated into revealing earlier on this branch,
+ * written a second time in the guard that fixed it. It is fixed here by IMPORTING that guard's
+ * resolver rather than writing a third one.
+ *
+ * The second was structural: only a direct spread was followed out of an object literal, so `{ NOT:
+ * { AND: [activeRefundParkWhere()] } }` — an ordinary, valid Prisma spelling — reached the same
+ * SQL negation with the detector reporting nothing. Logical wrappers are now followed to any depth.
+ *
+ * WHY A NEGATED HAND-WRITTEN COPY COUNTS TOO. `{ NOT: { direction: 'FROM_CONNECTOR', entityType:
+ * 'SalesOrder', ... } }` is already refused by the hand-written-copy half below, but as a copy. It
+ * is also the exact defect this rule is about, and saying so in the negation message is what tells
+ * the reader that spreading the owner is not the fix here — not negating is.
  */
-function carriesFamilyPredicate(node, known) {
+function carriesFamilyPredicate(node, known, aliases) {
   const current = unwrap(node)
   if (!current) return false
   if (ts.isCallExpression(current)) {
-    return ts.isIdentifier(current.expression) && FAMILY_PREDICATE_FUNCTIONS.has(current.expression.text)
+    const called = calleeName(current, aliases)
+    return called !== null && FAMILY_PREDICATE_FUNCTIONS.has(called)
   }
   if (ts.isIdentifier(current)) return known.has(current.text)
   if (ts.isObjectLiteralExpression(current)) {
-    return current.properties.some(
-      (property) => ts.isSpreadAssignment(property) && carriesFamilyPredicate(property.expression, known),
-    )
+    if (isFamilyLiteral(current)) return true
+    return current.properties.some((property) => {
+      if (ts.isSpreadAssignment(property)) return carriesFamilyPredicate(property.expression, known, aliases)
+      if (ts.isPropertyAssignment(property) && LOGICAL_PROPERTIES.has(propertyName(property) ?? '')) {
+        return carriesFamilyPredicate(property.initializer, known, aliases)
+      }
+      return false
+    })
   }
   if (ts.isArrayLiteralExpression(current)) {
-    return current.elements.some((element) => carriesFamilyPredicate(element, known))
+    return current.elements.some((element) => carriesFamilyPredicate(element, known, aliases))
   }
   return false
 }
 
 /**
- * The local names bound to a family predicate in this file. Two passes, so a name bound to another
- * name (`const A = activeRefundParkWhere(); const B = { ...A }`) is found too; a third level is not
- * worth the fixpoint loop and would still be caught at the call it was built from.
+ * The local names bound to a family predicate in this file, to a FIXPOINT.
+ *
+ * It used to be two passes, on the argument that a third level of indirection "would still be
+ * caught at the call it was built from" — which is true of a chain of binds and false as soon as one
+ * link is a logical wrapper, because a wrapper has no call of its own to be caught at. The loop
+ * terminates because `known` only ever grows and is bounded by the file's declarations.
  */
-function localFamilyPredicateNames(source) {
+function localFamilyPredicateNames(source, aliases) {
   const known = new Set()
-  for (let pass = 0; pass < 2; pass += 1) {
+  let changed = true
+  while (changed) {
+    changed = false
     const visit = (node) => {
       if (ts.isVariableDeclaration(node) && ts.isIdentifier(node.name) && node.initializer) {
-        if (carriesFamilyPredicate(node.initializer, known)) known.add(node.name.text)
+        if (!known.has(node.name.text) && carriesFamilyPredicate(node.initializer, known, aliases)) {
+          known.add(node.name.text)
+          changed = true
+        }
       }
       ts.forEachChild(node, visit)
     }
@@ -362,14 +404,15 @@ for (const file of files) {
   const relativePath = relative(ROOT, file).split(sep).join('/')
   const source = ts.createSourceFile(file, readFileSync(file, 'utf8'), ts.ScriptTarget.Latest, true)
   const at = (node) => source.getLineAndCharacterOfPosition(node.getStart()).line + 1
-  const known = localFamilyPredicateNames(source)
+  const aliases = addLocalFunctionAliases(source, importAliases(source), FAMILY_PREDICATE_FUNCTIONS)
+  const known = localFamilyPredicateNames(source, aliases)
 
   const visit = (node) => {
     // NARROW IT, DO NOT NEGATE IT (o3d-272i r3). Every `NOT:` in the tree is examined; the ones
     // that carry a family predicate are refused, whatever they are nested in.
     if (ts.isPropertyAssignment(node) && propertyName(node) === NEGATION_PROPERTY) {
       negationCount += 1
-      if (carriesFamilyPredicate(node.initializer, known)) {
+      if (carriesFamilyPredicate(node.initializer, known, aliases)) {
         violations.push(
           `${relativePath}:${at(node)}  a shopping_sync_logs family predicate is being NEGATED `
           + `(\`${NEGATION_PROPERTY}:\`). Prisma compiles that to a SQL negation of the whole conjunction, and `

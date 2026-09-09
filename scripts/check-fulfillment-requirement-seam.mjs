@@ -38,6 +38,8 @@ import { readdirSync, readFileSync, statSync } from 'node:fs'
 import { extname, join, relative, sep } from 'node:path'
 import ts from 'typescript'
 
+import { addLocalFunctionAliases, calleeName, importAliases } from './lib/ts-import-aliases.mjs'
+
 const ROOT = process.cwd()
 const SCAN_ROOTS = ['app', 'lib', 'components', 'scripts']
 const SCANNED_EXTENSIONS = new Set(['.ts', '.tsx'])
@@ -97,41 +99,21 @@ function listFiles(dir, out) {
 }
 
 /**
- * Local name -> IMPORTED name, for every named import in a file.
+ * THE NAME A CALL ACTUALLY INVOKES lives in scripts/lib/ts-import-aliases.mjs, and this guard is why
+ * that module exists.
  *
- * WHY THIS IS NOT OPTIONAL, and it was found by mutating this guard rather than by reasoning about
+ * WHY IT IS NOT OPTIONAL, and it was found by mutating this guard rather than by reasoning about
  * it. The first spelling compared the callee's own identifier against the fenced names, and
  * `import { expandFulfillmentRequirementsDecimal as probeExpand }` walked straight past it: the call
  * reads `probeExpand(...)`, the guard saw a name it did not recognise, and the check reported OK
  * over exactly the thing it exists to forbid. A guard that can be switched off by an `as` clause is
  * not a guard, and no amount of reading it would have said so — the mutation did.
- */
-function importAliases(source) {
-  const aliases = new Map()
-  for (const statement of source.statements) {
-    if (!ts.isImportDeclaration(statement) || !statement.importClause) continue
-    const bindings = statement.importClause.namedBindings
-    if (bindings && ts.isNamedImports(bindings)) {
-      for (const element of bindings.elements) {
-        aliases.set(element.name.text, (element.propertyName ?? element.name).text)
-      }
-    }
-  }
-  return aliases
-}
-
-/**
- * The name a call expression invokes, resolved through any import alias.
  *
- * A property-access callee (`kit.expandFulfillmentRequirementsDecimal(...)`, the namespace-import
- * shape) is read from the PROPERTY, which an `import * as` cannot rename.
+ * WHY IT IS SHARED RATHER THAN COPIED (o3d-272i r4). The next guard written on this branch,
+ * scripts/check-wc-sync-row-predicates.mjs, had the same hole: its prohibition also compared the
+ * callee's own identifier. Two copies of this resolution would have been that defect a third time,
+ * so there is one, and fixing it fixes both.
  */
-function calleeName(node, aliases) {
-  const callee = node.expression
-  if (ts.isIdentifier(callee)) return aliases.get(callee.text) ?? callee.text
-  if (ts.isPropertyAccessExpression(callee) && ts.isIdentifier(callee.name)) return callee.name.text
-  return null
-}
 
 const files = []
 for (const root of SCAN_ROOTS) {
@@ -149,7 +131,7 @@ let ownerCalls = 0
 for (const file of files) {
   const relativePath = relative(ROOT, file).split(sep).join('/')
   const source = ts.createSourceFile(file, readFileSync(file, 'utf8'), ts.ScriptTarget.Latest, true)
-  const aliases = importAliases(source)
+  const aliases = addLocalFunctionAliases(source, importAliases(source), CURRENT_GRAPH_EXPANDERS)
   const visit = (node) => {
     const called = ts.isCallExpression(node) ? calleeName(node, aliases) : null
     if (called !== null && CURRENT_GRAPH_EXPANDERS.has(called)) {
