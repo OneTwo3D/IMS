@@ -17,6 +17,7 @@ import {
 } from '@/lib/domain/integrations/outbox'
 import {
   INTEGRATION_OUTBOX_REGISTRY,
+  integrationOutboxReplayPolicy,
   integrationOutboxStaleReclaimScope,
   parseIntegrationOutboxPayload,
   WcStockSyncOutboxPayloadSchema,
@@ -24,6 +25,7 @@ import {
 import {
   OUTBOX_REPLAY_SAFETY_VALUES,
   outboxReplayPolicyGrantsStaleReclaim,
+  resolveOutboxReplaySafety,
 } from '@/lib/domain/integrations/outbox-replay-policy'
 import { adapterUniqueViolation, legacyUniqueViolation } from '@/tests/helpers/prisma-unique-error'
 
@@ -771,9 +773,15 @@ test('integration outbox success clears claim state', async () => {
 test('integration outbox completion rejects stale worker claims after reclaim', async () => {
   const workerOneLock = new Date('2026-04-27T09:45:00.000Z')
   const workerTwoLock = new Date('2026-04-27T10:00:00.000Z')
+  // A declared-safe operation, because this test is about the HANDOVER fence and a reclaim has to
+  // be granted for it to be exercised at all. woocommerce/stock.push no longer permits one (o3d-8td2
+  // round 2), which is asserted separately below.
   const { client, rows } = makeClient([
     makeRow({
       id: 'job-1',
+      connector: 'sales',
+      operation: 'refund.reservation-release',
+      idempotencyKey: 'sales:refund.reservation-release:order-1',
       status: INTEGRATION_OUTBOX_STATUS.PROCESSING,
       lockedAt: workerOneLock,
       lockedBy: 'worker-1',
@@ -782,7 +790,7 @@ test('integration outbox completion rejects stale worker claims after reclaim', 
 
   const reclaimed = await claimIntegrationOutboxWork({
     client,
-    connector: 'woocommerce',
+    connector: 'sales',
     limit: 1,
     workerId: 'worker-2',
     now: workerTwoLock,
@@ -806,25 +814,100 @@ test('integration outbox completion rejects stale worker claims after reclaim', 
 })
 
 // ---------------------------------------------------------------------------
-// o3d-8td2 — the stale-lock reclaim is granted per OPERATION, on its declared
+// o3d-8td2 — the stale-lock reclaim is granted per EFFECT, on its declared
 // replay safety, and not on elapsed time alone.
+//
+// Round 2 (Codex): two of the six round-1 verdicts were wrong, for two different
+// reasons. `woocommerce/stock.push` confused idempotence with ORDERING; an
+// absolute assignment survives repetition and not reordering. `xero/accounting.post`
+// answered for a MULTIPLEX of AccountingSyncType effects with one verdict, which
+// is an average. Both are now `unsafe-to-replay`, and the tests below drive the
+// interleaving each one was cleared on rather than restating the declaration.
 // ---------------------------------------------------------------------------
 
-test('every registered outbox operation declares a known replay-safety answer', () => {
-  const declared: Array<{ key: string; replay: string }> = []
+/** A row that is stale-eligible on every ground EXCEPT its operation's declaration. */
+function staleProcessingRow(overrides: Partial<IntegrationOutboxRow>): IntegrationOutboxRow {
+  return makeRow({
+    status: INTEGRATION_OUTBOX_STATUS.PROCESSING,
+    lockedAt: new Date('2026-04-27T09:45:00.000Z'),
+    lockedBy: 'worker-1',
+    attempts: 1,
+    createdAt: new Date('2026-04-27T09:00:00.000Z'),
+    ...overrides,
+  })
+}
+
+const RECLAIM_NOW = new Date('2026-04-27T10:00:00.000Z')
+const RECLAIM_STALE_MS = 10 * 60 * 1000
+
+/**
+ * The CONTROL for the two pause proofs: a row identical to theirs in status, lock, staleness and
+ * attempt count, differing ONLY in the operation it names. If this claim is granted, the refusal
+ * those proofs assert cannot have come from any other clause of the predicate.
+ */
+async function claimGrantedFor(connector: string, operation: string, id: string): Promise<string[]> {
+  const { client } = makeClient([staleProcessingRow({
+    id,
+    connector,
+    operation,
+    idempotencyKey: `${connector}:${operation}:control`,
+  })])
+  const granted = await claimIntegrationOutboxWork({
+    client,
+    connector,
+    operation,
+    limit: 10,
+    workerId: 'worker-2',
+    now: RECLAIM_NOW,
+    staleLockMs: RECLAIM_STALE_MS,
+  })
+  return granted.map((claimed) => claimed.id)
+}
+
+/**
+ * Did the (lockedBy, lockedAt) fence refuse this worker's completion? `markIntegrationOutboxSuccess`
+ * THROWS a claim-conflict rather than returning a flag, so the refusal is read from the throw — and
+ * only from that throw, so an unrelated failure is re-raised instead of being scored as a fence.
+ */
+async function completionIsRefused(
+  client: IntegrationOutboxClient,
+  id: string,
+  workerId: string,
+  lockedAt: Date,
+): Promise<boolean> {
+  try {
+    await markIntegrationOutboxSuccess({ client, id, workerId, lockedAt })
+    return false
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error)
+    assert.match(message, new RegExp(`is not claimed by ${workerId}`), `unexpected failure completing ${id}`)
+    return true
+  }
+}
+
+test('every registered outbox operation declares a known replay-safety answer and an effect scope', () => {
+  const declared: Array<{ key: string; replay: string; keyedBy: string }> = []
   for (const [connector, operations] of Object.entries(INTEGRATION_OUTBOX_REGISTRY)) {
     for (const [operation, entry] of Object.entries(operations)) {
-      declared.push({ key: `${connector}/${operation}`, replay: entry.replay })
+      declared.push({ key: `${connector}/${operation}`, replay: entry.replay, keyedBy: entry.effects.keyedBy })
     }
   }
   // The walk itself is asserted, not just its verdict: a registry this loop failed to enumerate
   // would otherwise pass by examining nothing.
   assert.ok(declared.length >= 6, `expected the registry walk to reach every operation, saw ${declared.length}`)
-  for (const { key, replay } of declared) {
+  for (const { key, replay, keyedBy } of declared) {
     assert.ok(
       (OUTBOX_REPLAY_SAFETY_VALUES as readonly string[]).includes(replay),
       `${key} declares an unknown replay-safety answer: ${replay}`,
     )
+    assert.ok(
+      keyedBy === 'operation' || keyedBy === 'sub-operation',
+      `${key} declares an unknown effect scope: ${keyedBy}`,
+    )
+    // The rule the type states, restated against the built object so a cast cannot slip past it.
+    if (keyedBy === 'sub-operation') {
+      assert.equal(replay, 'unsafe-to-replay', `${key} multiplexes its effects and cannot carry a safe verdict`)
+    }
   }
   assert.deepEqual(
     declared.map((entry) => entry.key).sort(),
@@ -840,6 +923,26 @@ test('every registered outbox operation declares a known replay-safety answer', 
   )
 })
 
+test('the six verdicts are the round-2 corrected ones', () => {
+  const verdicts = Object.fromEntries(
+    Object.entries(INTEGRATION_OUTBOX_REGISTRY).flatMap(([connector, operations]) =>
+      Object.entries(operations).map(([operation, entry]) => [`${connector}/${operation}`, entry.replay]),
+    ),
+  )
+  assert.deepEqual(verdicts, {
+    // Codex round 2 HIGH 1: absolute-value writes are safe against repetition, NOT against a
+    // reordering, and WooCommerce offers no token to reject a regression with.
+    'woocommerce/stock.push': 'unsafe-to-replay',
+    // Codex round 2 HIGH 2: multiplexes AccountingSyncType; INVOICE_EMAIL enqueues an unguarded
+    // EmailOutbox row (whose own queue is unfenced — o3d-alnk).
+    'xero/accounting.post': 'unsafe-to-replay',
+    'mintsoft/inbound.booked-in': 'local-only-guarded',
+    'accounting/landed-cost.adjustment-journal': 'local-only-guarded',
+    'sales/refund.reservation-release': 'local-only-guarded',
+    'sales/refund.unmatched-warning': 'local-only-guarded',
+  })
+})
+
 test('only the unsafe replay answer withholds a stale-lock reclaim', () => {
   assert.equal(outboxReplayPolicyGrantsStaleReclaim('local-only-guarded'), true)
   assert.equal(outboxReplayPolicyGrantsStaleReclaim('remote-write-idempotent'), true)
@@ -847,12 +950,44 @@ test('only the unsafe replay answer withholds a stale-lock reclaim', () => {
   assert.equal(outboxReplayPolicyGrantsStaleReclaim('unsafe-to-replay'), false)
 })
 
+test('a multiplexing entry cannot be safe at runtime even when its field says it is', () => {
+  // The type already refuses this pairing; the fold is the same rule where a cast, a dynamically
+  // built registry or a later caller could otherwise route around it. Proved by constructing the
+  // pairing the type forbids and showing the resolver still refuses it.
+  assert.equal(
+    resolveOutboxReplaySafety({
+      replay: 'local-only-guarded',
+      effects: { keyedBy: 'sub-operation', discriminator: 'AccountingSyncType', weakestKnownEffect: 'INVOICE_EMAIL' },
+    }),
+    'unsafe-to-replay',
+  )
+  // ...and that it is the SCOPE doing it, not a blanket refusal: the same verdict with a
+  // single-effect scope passes through untouched.
+  assert.equal(
+    resolveOutboxReplaySafety({ replay: 'local-only-guarded', effects: { keyedBy: 'operation' } }),
+    'local-only-guarded',
+  )
+})
+
+test('no AccountingSyncType can reach the claim path through a stale reclaim', () => {
+  // The declaration was NOT re-keyed by AccountingSyncType — the outbox row carries no such
+  // column, so the claim predicate could not read one. The equivalent guarantee is that the whole
+  // multiplexing operation is unreclaimable, which is what these three assertions are.
+  assert.equal(integrationOutboxReplayPolicy('xero', 'accounting.post'), 'unsafe-to-replay')
+  assert.equal(integrationOutboxStaleReclaimScope('xero', 'accounting.post'), null)
+  assert.equal(integrationOutboxStaleReclaimScope('xero', undefined), null)
+})
+
 test('the stale-reclaim scope fails closed on an operation this build does not know', () => {
-  assert.deepEqual(integrationOutboxStaleReclaimScope('woocommerce', 'stock.push'), {})
-  assert.equal(integrationOutboxStaleReclaimScope('woocommerce', 'legacy.unregistered'), null)
-  assert.equal(integrationOutboxStaleReclaimScope('no-such-connector', 'stock.push'), null)
+  assert.deepEqual(integrationOutboxStaleReclaimScope('sales', 'refund.reservation-release'), {})
+  assert.equal(integrationOutboxStaleReclaimScope('sales', 'legacy.unregistered'), null)
+  assert.equal(integrationOutboxStaleReclaimScope('no-such-connector', 'refund.reservation-release'), null)
   assert.equal(integrationOutboxStaleReclaimScope('no-such-connector', undefined), null)
-  assert.equal(integrationOutboxStaleReclaimScope(undefined, 'stock.push'), null)
+  assert.equal(integrationOutboxStaleReclaimScope(undefined, 'refund.reservation-release'), null)
+  // woocommerce has exactly one operation and it is now unsafe, so the connector-scoped arm
+  // disappears entirely rather than matching every row.
+  assert.equal(integrationOutboxStaleReclaimScope('woocommerce', 'stock.push'), null)
+  assert.equal(integrationOutboxStaleReclaimScope('woocommerce', undefined), null)
   assert.deepEqual(
     integrationOutboxStaleReclaimScope('sales', undefined),
     { operation: { in: ['refund.reservation-release', 'refund.unmatched-warning'] } },
@@ -860,41 +995,36 @@ test('the stale-reclaim scope fails closed on an operation this build does not k
   const unscoped = integrationOutboxStaleReclaimScope(undefined, undefined) as { OR: Array<{ connector: string }> }
   assert.deepEqual(
     unscoped.OR.map((scope) => scope.connector).sort(),
-    ['accounting', 'mintsoft', 'sales', 'woocommerce', 'xero'],
+    ['accounting', 'mintsoft', 'sales'],
+    'woocommerce and xero are unsafe-to-replay, so neither may contribute a stale-reclaim arm',
   )
 })
 
 test('a stale PROCESSING lock is reclaimed per operation, not on elapsed time alone', async () => {
   const workerOneLock = new Date('2026-04-27T09:45:00.000Z')
-  const now = new Date('2026-04-27T10:00:00.000Z')
   const { client, rows } = makeClient([
-    makeRow({
+    staleProcessingRow({
       id: 'declared-safe',
-      operation: 'stock.push',
-      idempotencyKey: 'woocommerce:stock.push:sku-1',
-      status: INTEGRATION_OUTBOX_STATUS.PROCESSING,
-      lockedAt: workerOneLock,
-      lockedBy: 'worker-1',
-      createdAt: new Date('2026-04-27T09:00:00.000Z'),
+      connector: 'sales',
+      operation: 'refund.reservation-release',
+      idempotencyKey: 'sales:refund.reservation-release:order-1',
     }),
-    makeRow({
+    staleProcessingRow({
       id: 'undeclared',
+      connector: 'sales',
       operation: 'legacy.unregistered',
-      idempotencyKey: 'woocommerce:legacy.unregistered:sku-2',
-      status: INTEGRATION_OUTBOX_STATUS.PROCESSING,
-      lockedAt: workerOneLock,
-      lockedBy: 'worker-1',
+      idempotencyKey: 'sales:legacy.unregistered:order-2',
       createdAt: new Date('2026-04-27T09:01:00.000Z'),
     }),
   ])
 
   const reclaimed = await claimIntegrationOutboxWork({
     client,
-    connector: 'woocommerce',
+    connector: 'sales',
     limit: 10,
     workerId: 'worker-2',
-    now,
-    staleLockMs: 10 * 60 * 1000,
+    now: RECLAIM_NOW,
+    staleLockMs: RECLAIM_STALE_MS,
   })
 
   // Both rows are equally stale and equally old, so time alone cannot separate them: the ONLY
@@ -903,4 +1033,201 @@ test('a stale PROCESSING lock is reclaimed per operation, not on elapsed time al
   assert.equal(rows.find((row) => row.id === 'declared-safe')?.lockedBy, 'worker-2')
   assert.equal(rows.find((row) => row.id === 'undeclared')?.lockedBy, 'worker-1')
   assert.deepEqual(rows.find((row) => row.id === 'undeclared')?.lockedAt, workerOneLock)
+})
+
+// ---------------------------------------------------------------------------
+// PROOF 1 (Codex round 2, HIGH 1). The WooCommerce pause, driven rather than argued.
+//
+// Worker A computes stock_quantity BEFORE the batch POST and holds it across the
+// await. If a reclaim is granted, worker B can compute a FRESHER value, push it and
+// close the row, and A can then land its older value last. The first half of this
+// test runs that interleaving against an operation the registry DOES declare
+// reclaimable, so the harness is shown to reach the damage; the second half runs the
+// identical interleaving against woocommerce/stock.push and shows the reclaim is
+// refused, so the interleaving cannot begin.
+// ---------------------------------------------------------------------------
+
+type WooWorld = {
+  /** What WooCommerce holds — the last absolute assignment to arrive, whoever sent it. */
+  remoteQty: number | null
+  /** What IMS persisted as lastPushedQty — written by pushStockToWc, which knows nothing of the outbox. */
+  lastPushedQty: number | null
+  /** Set when worker B actually got the row: the precondition this test must reach to mean anything. */
+  reclaimHappened: boolean
+  /** Set when the slow worker's completion was refused by the (lockedBy, lockedAt) fence. */
+  loserFenced: boolean
+}
+
+async function runWooPauseInterleaving(row: IntegrationOutboxRow): Promise<WooWorld> {
+  const world: WooWorld = { remoteQty: null, lastPushedQty: null, reclaimHappened: false, loserFenced: false }
+  const { client } = makeClient([row])
+
+  // Worker A is mid-flight: it read the row, resolved stock_quantity = 10, and is paused on the
+  // socket. That is exactly the state `lockedAt` in the past represents.
+  const workerAComputedQty = 10
+  const workerALockedAt = row.lockedAt as Date
+
+  // IMS stock has since fallen to 0.
+  const freshQty = 0
+
+  const reclaimed = await claimIntegrationOutboxWork({
+    client,
+    connector: row.connector,
+    operation: row.operation,
+    limit: 10,
+    workerId: 'worker-2',
+    now: RECLAIM_NOW,
+    staleLockMs: RECLAIM_STALE_MS,
+  })
+
+  if (reclaimed.length > 0) {
+    world.reclaimHappened = true
+    const claimed = reclaimed[0]
+    // Worker B computes from current IMS state, pushes, persists and completes.
+    world.remoteQty = freshQty
+    world.lastPushedQty = freshQty
+    await markIntegrationOutboxSuccess({
+      client,
+      id: claimed.id,
+      workerId: 'worker-2',
+      lockedAt: claimed.lockedAt as Date,
+    })
+  }
+
+  // Worker A resumes. Nothing in pushStockToWc consults the outbox, so the POST and the
+  // lastPushedQty upsert both happen regardless of who owns the row.
+  world.remoteQty = workerAComputedQty
+  world.lastPushedQty = workerAComputedQty
+
+  // Only NOW does A meet the fence — after the effect has already landed.
+  world.loserFenced = await completionIsRefused(client, row.id, 'worker-1', workerALockedAt)
+
+  return world
+}
+
+test('the WooCommerce pause: a granted reclaim lets the older quantity land last', async () => {
+  // Control arm. The operation is a stand-in for "the registry says yes" — nothing about refund
+  // release is a stock push; it is used only because it is the declaration this build permits.
+  const world = await runWooPauseInterleaving(staleProcessingRow({
+    id: 'reclaimable-stand-in',
+    connector: 'sales',
+    operation: 'refund.reservation-release',
+    idempotencyKey: 'sales:refund.reservation-release:order-1',
+  }))
+
+  assert.equal(world.reclaimHappened, true, 'the contended path was not reached: worker B never got the row')
+  assert.equal(world.loserFenced, true, 'the slow worker should be fenced out of the ROW')
+  // ...and yet:
+  assert.equal(world.remoteQty, 10, 'the older computed quantity landed last at the remote')
+  assert.equal(world.lastPushedQty, 10, 'and IMS persisted it over the fresher value')
+  // That is the whole finding: the row fence is sound and the EFFECT is still wrong. Idempotence
+  // would have made a repeat harmless; nothing here makes a REORDERING harmless.
+})
+
+test('the WooCommerce pause: stock.push refuses the reclaim, so it cannot begin', async () => {
+  const row = staleProcessingRow({
+    id: 'stock-push-row',
+    connector: 'woocommerce',
+    operation: 'stock.push',
+    idempotencyKey: 'woocommerce:stock.push:sku-1',
+  })
+  const world = await runWooPauseInterleaving(row)
+
+  assert.equal(world.reclaimHappened, false, 'stock.push is unsafe-to-replay: no second worker may take it')
+  // The row is still worker A's, so A's completion is honoured rather than fenced — the park costs
+  // the SURVIVING worker nothing.
+  assert.equal(world.loserFenced, false)
+  assert.equal(world.remoteQty, 10, 'only one worker ever pushed, so no older value can land last')
+
+  // Non-vacuity: the row really was stale-eligible on every other ground. Proved by re-running the
+  // identical claim against a FRESH row identical in every field but its operation — same lock, same
+  // staleness, same attempt count, same instant — and watching that one be granted. (Fresh, because
+  // the harness above completes the row it was handed and would otherwise be re-read as SUCCEEDED.)
+  const granted = await claimGrantedFor('sales', 'refund.reservation-release', row.id)
+  assert.deepEqual(granted, [row.id])
+})
+
+// ---------------------------------------------------------------------------
+// PROOF 2 (Codex round 2, HIGH 2). The Xero INVOICE_EMAIL pause.
+//
+// `fenceBeforeRemoteWrite('invoice-email')` takes no dispatch record, and the effect
+// behind it — queueEmail -> db.emailOutbox.create — has no uniqueness guard of any
+// kind. So the fence proves ownership before the effect and cannot couple that
+// effect to the completion. Same two arms as proof 1.
+// ---------------------------------------------------------------------------
+
+type EmailWorld = {
+  /** One entry per EmailOutbox row inserted. There is no unique key on that table to stop a second. */
+  enqueued: string[]
+  reclaimHappened: boolean
+  loserFenced: boolean
+}
+
+async function runInvoiceEmailPauseInterleaving(row: IntegrationOutboxRow): Promise<EmailWorld> {
+  const world: EmailWorld = { enqueued: [], reclaimHappened: false, loserFenced: false }
+  const { client } = makeClient([row])
+  const workerALockedAt = row.lockedAt as Date
+
+  // Worker A has already passed its fence and inserted the EmailOutbox row, and is paused before
+  // completing the sync-log and outbox rows.
+  world.enqueued.push('worker-1')
+
+  const reclaimed = await claimIntegrationOutboxWork({
+    client,
+    connector: row.connector,
+    operation: row.operation,
+    limit: 10,
+    workerId: 'worker-2',
+    now: RECLAIM_NOW,
+    staleLockMs: RECLAIM_STALE_MS,
+  })
+
+  if (reclaimed.length > 0) {
+    world.reclaimHappened = true
+    const claimed = reclaimed[0]
+    // B's own fence passes honestly: it holds the row, A's lock is stale. Nothing it can read says
+    // an email has already been queued, because nothing was written to say so.
+    world.enqueued.push('worker-2')
+    await markIntegrationOutboxSuccess({
+      client,
+      id: claimed.id,
+      workerId: 'worker-2',
+      lockedAt: claimed.lockedAt as Date,
+    })
+  }
+
+  world.loserFenced = await completionIsRefused(client, row.id, 'worker-1', workerALockedAt)
+  return world
+}
+
+test('the INVOICE_EMAIL pause: a granted reclaim enqueues the invoice email twice', async () => {
+  const world = await runInvoiceEmailPauseInterleaving(staleProcessingRow({
+    id: 'reclaimable-stand-in',
+    connector: 'sales',
+    operation: 'refund.reservation-release',
+    idempotencyKey: 'sales:refund.reservation-release:order-1',
+  }))
+
+  assert.equal(world.reclaimHappened, true, 'the contended path was not reached: worker B never got the row')
+  assert.equal(world.loserFenced, true, 'the slow worker is fenced out of the ROW, and too late')
+  assert.deepEqual(world.enqueued, ['worker-1', 'worker-2'], 'two EmailOutbox rows — the customer is emailed twice')
+})
+
+test('the INVOICE_EMAIL pause: xero/accounting.post refuses the reclaim, so it cannot begin', async () => {
+  const row = staleProcessingRow({
+    id: 'xero-row',
+    connector: 'xero',
+    operation: 'accounting.post',
+    idempotencyKey: 'xero:accounting.post:log-1',
+    payloadJson: { accountingSyncLogId: 'log-1' },
+  })
+  const world = await runInvoiceEmailPauseInterleaving(row)
+
+  assert.equal(world.reclaimHappened, false, 'xero/accounting.post is unsafe-to-replay: no second worker may take it')
+  assert.equal(world.loserFenced, false)
+  assert.deepEqual(world.enqueued, ['worker-1'], 'exactly one enqueue, because only one worker ever held the row')
+
+  // Non-vacuity, as in proof 1: an otherwise identical row under a declared-safe operation IS granted.
+  const granted = await claimGrantedFor('sales', 'refund.unmatched-warning', row.id)
+  assert.deepEqual(granted, [row.id])
 })
