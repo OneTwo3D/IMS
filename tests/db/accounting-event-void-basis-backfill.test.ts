@@ -36,14 +36,23 @@ import { config } from 'dotenv'
  * Gated behind RUN_DB_MIGRATION_TESTS=1: `npm run test:unit` has no database. Imports are RELATIVE
  * for the same reason as tests/concurrency/* and tests/db/*.
  *
- * o3d-11rf r13 — AND UNTIL r13 NOTHING SET THAT VARIABLE. This file was collected by
- * `npm run test:unit`'s glob on every CI run and skipped whole, silently, inside a green suite. It
- * now runs under `npm run test:db` (schema-guardrails.yml, job `accounting-db-regressions`), which
- * sets `REQUIRE_DB_MIGRATION_TESTS=1` alongside it: that second variable means "this environment
- * promised a migrated database", so a gate that is still closed under it is a wiring defect and
+ * o3d-11rf r13 / o3d-n3yt — AND NOTHING IN CI SETS THAT VARIABLE, STILL. This file is collected by
+ * `npm run test:unit`'s glob on every CI run and skipped whole, silently, inside a green suite. No
+ * workflow job runs it. The only invocation that executes it is `npm run test:db`, run by hand
+ * against a database you pointed `DATABASE_URL` at. SO READ ITS EVIDENCE AS EVIDENCE SOMEBODY HAS
+ * TO GO AND COLLECT, not as a gate that will stop a regression on a pull request.
+ *
+ * `npm run test:db` also sets `REQUIRE_DB_MIGRATION_TESTS=1`: that second variable means "this
+ * environment promised a migrated database", so a gate still closed under it is a wiring defect and
  * this module refuses to load rather than reporting a silent skip. An unset pair is an ordinary
- * local run and still skips. `tests/db-suite-ci-wiring.test.ts` is the standing guard that keeps a
- * CI job naming this file at all.
+ * local run and still skips.
+ *
+ * r13 DID wire a CI job (`accounting-db-regressions`) and a standing guard that read the workflow to
+ * prove the job invoked the script. Rounds 14, 15 and 16 each found that guard green over a state in
+ * which the suites never ran, so both were withdrawn from this branch: a guard reporting an
+ * enforcement it does not have is worse than none. o3d-n3yt carries the whole attempt — what was
+ * established, the five remaining holes, and the one reader (the YAML structural parser) that held
+ * up — for whoever wires this properly.
  */
 
 const skip = process.env.RUN_DB_MIGRATION_TESTS !== '1'

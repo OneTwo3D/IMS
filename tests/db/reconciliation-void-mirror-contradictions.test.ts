@@ -62,16 +62,26 @@ import { buildAccountingEventIdempotencyKey } from '../../lib/domain/accounting/
  * evidence — the ownership join, the truncation containment, the fold parity, the Turkish locale —
  * were checked in in a form that never ran, and a reader of the CI log had nothing to tell them so.
  *
- * WHAT IS DIFFERENT NOW. `npm run test:db` (schema-guardrails.yml, job `accounting-db-regressions`)
- * sets BOTH variables against a `postgres:16` service migrated by `prisma migrate deploy`. The
- * second variable is the tripwire: `REQUIRE_DB_MIGRATION_TESTS=1` says "this environment PROMISED a
- * database", so a `RUN_DB_MIGRATION_TESTS` that is not also `1` is a wiring defect, and the module
- * refuses to load rather than skipping fifteen tests under it. An unset pair is still an ordinary
- * local run and still skips.
+ * WHAT IS DIFFERENT NOW, AND WHAT IS NOT (o3d-n3yt). What IS different: `npm run test:db` exists and
+ * sets BOTH variables, so there is now a named invocation that runs this file. The tripwire is
+ * `REQUIRE_DB_MIGRATION_TESTS=1`: it says "this environment PROMISED a database", so a
+ * `RUN_DB_MIGRATION_TESTS` that is not also `1` is a wiring defect and the module refuses to load
+ * rather than skipping fifteen tests under it. An unset pair is still an ordinary local run and
+ * still skips.
  *
- * THE STANDING GUARD IS ELSEWHERE, because a test that skips cannot police its own invocation:
- * `tests/db-suite-ci-wiring.test.ts` runs in `npm run test:unit` WITHOUT a database and fails when
- * any file gated on `RUN_DB_MIGRATION_TESTS` is not named by a CI job that sets it.
+ * WHAT IS NOT DIFFERENT: NO CI JOB RUNS THAT SCRIPT. Somebody has to run it, against a database they
+ * pointed `DATABASE_URL` at. The evidence below is real and it is mutation-proved, but it is
+ * evidence you go and collect — it will not turn a pull request red on its own.
+ *
+ * r13 did add a CI job and a standing guard (`tests/db-suite-ci-wiring.test.ts`) that read the
+ * workflow to prove the job invoked the script, on the sound principle that a test which skips
+ * cannot police its own invocation. Rounds 14, 15 and 16 each found the guard green over a state in
+ * which these suites never ran — the last of them five separate ways at once, all in its shell
+ * parser and its TypeScript comment stripper. Both were withdrawn: a guard that reports an
+ * enforcement it does not have is worse than no guard, because the gated-but-unwired state at least
+ * tells the truth. o3d-n3yt carries the whole attempt, including Codex's recommendation to prove the
+ * tripwire BEHAVIOURALLY (import this file in a child process with REQUIRE set and RUN unset, and
+ * require a fatal exit) rather than by parsing anything.
  */
 const skip = process.env.RUN_DB_MIGRATION_TESTS !== '1'
 
