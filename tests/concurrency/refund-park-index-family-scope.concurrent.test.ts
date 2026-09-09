@@ -3,12 +3,20 @@ import { randomUUID } from 'node:crypto'
 import test from 'node:test'
 import { config } from 'dotenv'
 
+import { Prisma } from '@/app/generated/prisma/client'
 import {
   ACTIVE_REFUND_PARK_INDEX_NAME,
   HELD_SALES_INVOICE_RECORD_KIND,
   WC_REFUND_PARK_RECORD_KIND,
+  unresolvedWcOrderRowSql,
+  unresolvedWcOrderRowWhere,
 } from '@/lib/domain/sales/wc-sync-row-families'
 import { activeRefundParkWhere } from '@/lib/domain/sales/refund-park-recovery'
+import {
+  ACTIVE_REFUND_PARK_MATRIX_MEMBERS,
+  UNRESOLVED_WC_ORDER_ROW_MATRIX_MEMBERS,
+  makeWcSyncRowMatrix,
+} from '@/tests/helpers/wc-sync-row-matrix'
 
 /**
  * o3d-272i r2 (Codex HIGH) — THE PARTIAL UNIQUE INDEX IS A READER OF THE REFUND-PARK RULE, AND IT
@@ -249,35 +257,23 @@ test('o3d-272i r2: the SHIPPED index predicate and activeRefundParkWhere() selec
   const { probe, rowId, row } = makeFixture()
 
   /**
-   * One row per clause the predicate has, each differing from a matching row in exactly one respect,
-   * and each with its OWN externalId so the index cannot refuse the seeding. The two rows that share
-   * a value are the coexistence pair, tested above.
+   * ONE ROW PER CLAUSE, from tests/helpers/wc-sync-row-matrix.ts — the same thirteen rows
+   * tests/domain/sales/wc-sync-row-families.test.ts runs the two application-side spellings over.
+   * It was written out here and there separately until o3d-272i r3, and the two copies had already
+   * drifted (this one carried `park-no-external`; that one did not), which is the module's own
+   * defect one level up.
+   *
+   * Each row has its OWN externalId so the index cannot refuse the seeding — except
+   * `park-no-external`, which is THE ONE CLAUSE THE INDEX HAS AND THE PREDICATE DOES NOT: a park
+   * with no externalId is an actionable park by every rule the application applies, and is simply
+   * not indexable. Naming it is what makes the comparison below an assertion about ONE known
+   * difference rather than a hope that there is none. The two rows that share a key value are the
+   * coexistence pair, tested above.
    */
-  const rows: ProbeRow[] = [
-    // --- the three the refund-park rule admits ------------------------------------------------
-    row('park-pending', { externalId: `${probe}-e1` }),
-    row('park-failed', { status: 'FAILED', externalId: `${probe}-e2` }),
-    row('park-quarantined', { status: 'QUARANTINED', externalId: `${probe}-e3` }),
-    // --- and one counter-example per clause ----------------------------------------------------
-    row('park-synced', { status: 'SYNCED', externalId: `${probe}-e4` }),
-    row('park-no-entity', { entityId: null, externalId: `${probe}-e5` }),
-    row('unstamped', { recordKind: null, externalId: `${probe}-e6` }),
-    row('other-kind', { recordKind: 'WC_SOMETHING_ELSE', externalId: `${probe}-e7` }),
-    row('other-connector', { connector: 'shopify', externalId: `${probe}-e8` }),
-    row('outbound', { direction: 'TO_CONNECTOR', externalId: `${probe}-e9` }),
-    row('other-entity-type', { entityType: 'Product', externalId: `${probe}-e10` }),
-    row('hold-pending', { recordKind: HELD_SALES_INVOICE_RECORD_KIND, externalId: `${probe}-e11` }),
-    row('hold-failed', { recordKind: HELD_SALES_INVOICE_RECORD_KIND, status: 'FAILED', externalId: `${probe}-e12` }),
-    // THE ONE CLAUSE THE INDEX HAS AND THE PREDICATE DOES NOT. A park with no externalId is an
-    // actionable park by every rule the application applies, and is simply not indexable: there is
-    // no refund id for it to be unique per. Naming it here is what makes the comparison below an
-    // assertion about ONE known difference rather than a hope that there is none.
-    row('park-no-external', { externalId: null }),
-  ]
+  const { rowId: matrixId, rows, ids } = makeWcSyncRowMatrix(probe)
 
   try {
     await db.shoppingSyncLog.createMany({ data: rows })
-    const ids = rows.map((r) => r.id)
 
     // THE PREDICATE THE DATABASE ACTUALLY HAS — its own rendering of what the migration built, not
     // the migration's text and not this repository's idea of it.
@@ -305,14 +301,15 @@ test('o3d-272i r2: the SHIPPED index predicate and activeRefundParkWhere() selec
 
     // MEMBERSHIP FIRST. Two predicates that both match everything, or both match nothing, agree
     // perfectly; asserting the expected sets is what makes the agreement mean something.
+    assert.equal(rows.length, 13, 'precondition: the whole matrix was seeded')
     assert.deepEqual(
       viaPredicate,
-      [rowId('park-pending'), rowId('park-failed'), rowId('park-quarantined'), rowId('park-no-external')].sort(),
+      ACTIVE_REFUND_PARK_MATRIX_MEMBERS.map(matrixId).sort(),
       'activeRefundParkWhere() admits the parks in the three actionable statuses, and nothing else',
     )
     assert.deepEqual(
       viaIndex,
-      [rowId('park-pending'), rowId('park-failed'), rowId('park-quarantined')].sort(),
+      ACTIVE_REFUND_PARK_MATRIX_MEMBERS.filter((suffix) => suffix !== 'park-no-external').map(matrixId).sort(),
       'the shipped index covers exactly those of them that have an externalId to be unique per',
     )
 
@@ -322,8 +319,151 @@ test('o3d-272i r2: the SHIPPED index predicate and activeRefundParkWhere() selec
     // viaIndex and this fails naming them.
     assert.deepEqual(
       viaIndex,
-      viaPredicate.filter((id) => id !== rowId('park-no-external')),
+      viaPredicate.filter((id) => id !== matrixId('park-no-external')),
       'the index and the shared predicate differ by the non-null externalId clause and by nothing else',
+    )
+  } finally {
+    await cleanUp(db, probe)
+  }
+})
+
+// ---------------------------------------------------------------------------
+// o3d-272i r3 (Codex MEDIUM) — THE SHARED RULE READ BACKWARDS.
+//
+// The three tests above are about the refund-park family and the index that enforces it. These two
+// are about the OTHER renderer in the same module — `unresolvedWcOrderRowSql()`, the union of the
+// two entityId-bearing families — and about the one reader that does not ask which rows the rule
+// ADMITS but which rows it does not: `lib/data-retention.ts`, whose bulk delete is
+// `... AND NOT (${unresolvedWcOrderRowSql()})`.
+//
+// THE FINDING. `recordKind` is nullable. An unstamped row therefore answers UNKNOWN to
+// `"recordKind" = ANY(...)`, and UNKNOWN propagates: the row is not admitted by `WHERE (fragment)`,
+// which is correct and documented — and it is not admitted by `WHERE NOT (fragment)` either,
+// because `NOT UNKNOWN` is UNKNOWN. It falls out of BOTH halves of a partition that has to cover
+// every row, and at the negating reader falling out means EXEMPT FROM RETENTION: the row the module
+// says belongs to no family was inheriting the families' protection from deletion.
+//
+// WHY THESE LIVE HERE AND NOT ONLY IN THE UNIT SUITE. Three-valued logic is the database's
+// behaviour, not the ORM's and not this repository's, and the migrated schema is what makes
+// `recordKind` nullable in the first place. tests/domain/sales/wc-sync-row-families.test.ts asserts
+// the same property against whatever database is configured; this asserts it against one built by
+// `prisma migrate deploy`, over the same thirteen-row matrix.
+//
+// BOTH SIDES, ALWAYS. A test that asserted only "the unstamped row is not admitted" passes against
+// the unfixed code — that side was never broken. A test that asserted only "the complement is
+// non-empty" passes too. It is the pair, and the partition, that names the defect.
+// ---------------------------------------------------------------------------
+
+test('o3d-272i r3: the shared SQL predicate partitions the table, so retention\'s NOT (...) is total', { skip: SKIP }, async () => {
+  const db = await loadDb()
+  const { probe } = makeFixture()
+  const { rowId: matrixId, rows, ids } = makeWcSyncRowMatrix(probe)
+
+  try {
+    await db.shoppingSyncLog.createMany({ data: rows })
+    assert.equal(rows.length, 13, 'precondition: the whole matrix was seeded')
+
+    const select = async (fragment: Prisma.Sql): Promise<string[]> => {
+      const found = await db.$queryRaw<Array<{ id: string }>>(Prisma.sql`
+        SELECT id FROM "shopping_sync_logs" WHERE id = ANY(${ids}::text[]) AND ${fragment}`)
+      return found.map((r) => r.id).sort()
+    }
+
+    const admitted = await select(Prisma.sql`(${unresolvedWcOrderRowSql()})`)
+    // EXACTLY THE SPELLING lib/data-retention.ts USES. Not `IS NOT TRUE`, not any other locally
+    // corrected form: `NOT (...)` is what a reader writes, and the fragment has to be safe under it.
+    const complement = await select(Prisma.sql`NOT (${unresolvedWcOrderRowSql()})`)
+    const undecided = await select(Prisma.sql`(${unresolvedWcOrderRowSql()}) IS NULL`)
+
+    // PRECONDITION: the predicate is doing real work over these rows. An empty admitted set would
+    // satisfy the partition assertion trivially.
+    assert.deepEqual(
+      admitted,
+      UNRESOLVED_WC_ORDER_ROW_MATRIX_MEMBERS.map(matrixId).sort(),
+      'precondition: the predicate admits both entityId-bearing families in the three actionable statuses',
+    )
+
+    // THE PROPERTY, STATED DIRECTLY: the fragment is two-valued.
+    assert.deepEqual(undecided, [], 'the fragment must answer TRUE or FALSE for every row, never NULL')
+
+    // AND THE NULL PROBE ROW, ASSERTED BOTH WAYS. Neither of these holds on its own: the first
+    // passes against the unfixed code, and the second is the one it fails.
+    assert.ok(
+      !admitted.includes(matrixId('unstamped')),
+      'a NULL recordKind must not be ADMITTED by the predicate — it is not a family membership',
+    )
+    assert.ok(
+      complement.includes(matrixId('unstamped')),
+      'a NULL recordKind must not be EXEMPTED by the complement — retention deletes by exactly this',
+    )
+
+    // THE PARTITION. Every row is in exactly one half, which is what "total" means and what makes
+    // the complement safe for a reader who has not read the module.
+    assert.deepEqual(
+      [...admitted, ...complement].sort(),
+      [...ids].sort(),
+      'the predicate and its negation must cover the table between them',
+    )
+    assert.deepEqual(
+      admitted.filter((id) => complement.includes(id)),
+      [],
+      'and must not overlap',
+    )
+
+    // MUTATION ROUTE: drop the `COALESCE(( ... ), FALSE)` wrapper from unresolvedWcOrderRowSql.
+    // `unstamped` leaves the complement, `undecided` stops being empty, and the coverage assertion
+    // fails naming the row that is in neither half.
+  } finally {
+    await cleanUp(db, probe)
+  }
+})
+
+test('o3d-272i r3: the Prisma renderer is NOT total under negation, which is why negating it is refused', { skip: SKIP }, async () => {
+  // THE QUESTION THE FINDING DID NOT ASK, ANSWERED AGAINST A DATABASE RATHER THAN ASSUMED.
+  // `unresolvedWcOrderRowSql()` was made total; `unresolvedWcOrderRowWhere()` CANNOT BE, because
+  // the Prisma `where` language has no COALESCE and `NOT` wraps whatever the function returns. So
+  // the same trap is live in the Prisma spelling, and the only defence is a prohibition:
+  // scripts/check-wc-sync-row-predicates.mjs fails the build on `NOT:` over a family predicate, and
+  // the renderer's docstring says to use the SQL one when a complement is what you want.
+  //
+  // THIS TEST PINS THE REASON. It asserts the asymmetry as a FACT about the stack rather than
+  // leaving it as a claim in a comment — so if a future Prisma changes its null semantics, or the
+  // column stops being nullable, this fails and the prohibition gets revisited instead of outliving
+  // its justification. NO PRODUCTION READER NEGATES THIS PREDICATE; the negation below exists only
+  // here, which is the whole point.
+  const db = await loadDb()
+  const { probe } = makeFixture()
+  const { rowId: matrixId, rows, ids } = makeWcSyncRowMatrix(probe)
+
+  try {
+    await db.shoppingSyncLog.createMany({ data: rows })
+
+    const admitted = (await db.shoppingSyncLog.findMany({
+      where: { ...unresolvedWcOrderRowWhere(), id: { in: ids } },
+      select: { id: true },
+    })).map((r) => r.id).sort()
+    const negated = (await db.shoppingSyncLog.findMany({
+      where: { NOT: unresolvedWcOrderRowWhere(), id: { in: ids } },
+      select: { id: true },
+    })).map((r) => r.id).sort()
+
+    assert.deepEqual(
+      admitted,
+      UNRESOLVED_WC_ORDER_ROW_MATRIX_MEMBERS.map(matrixId).sort(),
+      'precondition: the positive Prisma reading is the one every production caller uses, and it is correct',
+    )
+    assert.ok(
+      !negated.includes(matrixId('unstamped')),
+      'Prisma NOT is a SQL negation, so the unstamped row is in neither half — this is the trap the guard forbids',
+    )
+    assert.ok(
+      negated.includes(matrixId('park-synced')),
+      'precondition: the negation is not simply empty — a settled row IS in it',
+    )
+    assert.notDeepEqual(
+      [...admitted, ...negated].sort(),
+      [...ids].sort(),
+      'and the two halves do NOT cover the table, which is exactly what the SQL renderer had to fix',
     )
   } finally {
     await cleanUp(db, probe)

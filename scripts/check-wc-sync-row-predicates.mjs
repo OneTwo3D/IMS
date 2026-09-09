@@ -39,6 +39,18 @@
  * FROM_CONNECTOR / 'SalesOrder' / WC_REFUND_PARK / WC_HELD_SALES_INVOICE in one file that also
  * names the table is a predicate, and today it matches exactly the four files that are one.
  *
+ * AND THE SAME RULE READ BACKWARDS (o3d-272i r3, Codex MEDIUM). A family predicate may be NARROWED
+ * and may not be NEGATED. `{ NOT: activeRefundParkWhere() }` does not mean "every row this does not
+ * admit": Prisma compiles it to a SQL negation of the whole conjunction, and `recordKind` is
+ * NULLABLE, so an unstamped row answers UNKNOWN to the predicate AND UNKNOWN to its negation and
+ * appears in neither result. The SQL renderer `unresolvedWcOrderRowSql()` was made TOTAL for
+ * exactly this reason — it renders `COALESCE((...), FALSE)` — but a Prisma `where` object cannot
+ * be: whatever the function returns, `NOT` wraps it, and the `where` language has no COALESCE. So
+ * the Prisma side is defended by prohibition rather than repair, and a reader who wants a complement
+ * is sent to the renderer that has one. tests/concurrency/refund-park-index-family-scope
+ * .concurrent.test.ts executes both readings against a real database and asserts the asymmetry, so
+ * this rule is held to a measured fact rather than to a belief about Prisma.
+ *
  * WHY THIS IS NOT A PROXIMITY RULE. It reads the TypeScript AST: the pairs must be properties of
  * ONE object literal, and the write/select distinction is the nearest enclosing `where`/`data`
  * property, not "a `data` appears within N lines". Nothing here can be satisfied or triggered by a
@@ -163,6 +175,22 @@ const MIGRATION_OWNERS = new Map([
 /** Property names whose value is a row being written, not a row being selected. */
 const WRITE_POSITIONS = new Set(['data', 'create', 'update'])
 
+/**
+ * The functions that RETURN a family predicate. Negating any of them is the o3d-272i r3 defect; see
+ * the note at the top of this file. Kept as a list rather than derived from PREDICATE_OWNERS
+ * because two of those owners are objects of literals, not `where` builders.
+ */
+const FAMILY_PREDICATE_FUNCTIONS = new Set([
+  'unresolvedWcOrderRowWhere',
+  'activeRefundParkWhere',
+  'heldSalesInvoiceQueueWhere',
+  'pendingFxQueueWhere',
+  'wcAdmissionRefusalQueueWhere',
+])
+
+/** Prisma's negation key. */
+const NEGATION_PROPERTY = 'NOT'
+
 function listFiles(dir, out) {
   for (const entry of readdirSync(dir)) {
     if (SKIPPED_DIRECTORIES.has(entry)) continue
@@ -226,6 +254,63 @@ function isWritePayload(node) {
   return false
 }
 
+/** See through `as const` / `satisfies` / parentheses to the expression underneath. */
+function unwrap(node) {
+  let current = node
+  while (
+    current
+    && (ts.isAsExpression(current) || ts.isParenthesizedExpression(current) || ts.isSatisfiesExpression(current))
+  ) {
+    current = current.expression
+  }
+  return current
+}
+
+/**
+ * Does this expression CARRY a family predicate — is it a call to one, a spread of one, an array
+ * containing one, or a local name bound to one?
+ *
+ * `known` is the set of local identifiers already found to be bound to a family predicate, which is
+ * what catches the real spelling: `const REFUND_PARK_WHERE = activeRefundParkWhere()` at module
+ * level and `{ NOT: REFUND_PARK_WHERE }` three hundred lines below.
+ */
+function carriesFamilyPredicate(node, known) {
+  const current = unwrap(node)
+  if (!current) return false
+  if (ts.isCallExpression(current)) {
+    return ts.isIdentifier(current.expression) && FAMILY_PREDICATE_FUNCTIONS.has(current.expression.text)
+  }
+  if (ts.isIdentifier(current)) return known.has(current.text)
+  if (ts.isObjectLiteralExpression(current)) {
+    return current.properties.some(
+      (property) => ts.isSpreadAssignment(property) && carriesFamilyPredicate(property.expression, known),
+    )
+  }
+  if (ts.isArrayLiteralExpression(current)) {
+    return current.elements.some((element) => carriesFamilyPredicate(element, known))
+  }
+  return false
+}
+
+/**
+ * The local names bound to a family predicate in this file. Two passes, so a name bound to another
+ * name (`const A = activeRefundParkWhere(); const B = { ...A }`) is found too; a third level is not
+ * worth the fixpoint loop and would still be caught at the call it was built from.
+ */
+function localFamilyPredicateNames(source) {
+  const known = new Set()
+  for (let pass = 0; pass < 2; pass += 1) {
+    const visit = (node) => {
+      if (ts.isVariableDeclaration(node) && ts.isIdentifier(node.name) && node.initializer) {
+        if (carriesFamilyPredicate(node.initializer, known)) known.add(node.name.text)
+      }
+      ts.forEachChild(node, visit)
+    }
+    visit(source)
+  }
+  return known
+}
+
 /** The nearest named function or variable declaration a node sits inside. */
 function enclosingDeclaration(node) {
   let current = node.parent
@@ -271,13 +356,32 @@ const violations = []
 const ownersSeen = new Set()
 let familyLiteralCount = 0
 let sqlTemplateCount = 0
+let negationCount = 0
 
 for (const file of files) {
   const relativePath = relative(ROOT, file).split(sep).join('/')
   const source = ts.createSourceFile(file, readFileSync(file, 'utf8'), ts.ScriptTarget.Latest, true)
   const at = (node) => source.getLineAndCharacterOfPosition(node.getStart()).line + 1
+  const known = localFamilyPredicateNames(source)
 
   const visit = (node) => {
+    // NARROW IT, DO NOT NEGATE IT (o3d-272i r3). Every `NOT:` in the tree is examined; the ones
+    // that carry a family predicate are refused, whatever they are nested in.
+    if (ts.isPropertyAssignment(node) && propertyName(node) === NEGATION_PROPERTY) {
+      negationCount += 1
+      if (carriesFamilyPredicate(node.initializer, known)) {
+        violations.push(
+          `${relativePath}:${at(node)}  a shopping_sync_logs family predicate is being NEGATED `
+          + `(\`${NEGATION_PROPERTY}:\`). Prisma compiles that to a SQL negation of the whole conjunction, and `
+          + '`recordKind` is nullable — so an UNSTAMPED row answers UNKNOWN to the predicate and UNKNOWN to '
+          + 'its negation, and is in NEITHER result. It is not "every row the predicate does not admit"; it '
+          + 'is that set minus the unstamped rows, silently. Use the total SQL renderer '
+          + 'unresolvedWcOrderRowSql() — it renders COALESCE((...), FALSE), so NOT (...) really is its '
+          + 'complement — or, if the Prisma form is unavoidable, write the complement explicitly with its own '
+          + 'name and its own test and say there what happens to a NULL recordKind.',
+        )
+      }
+    }
     if (ts.isObjectLiteralExpression(node) && isFamilyLiteral(node)) {
       familyLiteralCount += 1
       if (!isWritePayload(node)) {
@@ -376,6 +480,10 @@ const structural = []
 if (files.length === 0) structural.push(`scanned 0 files under ${SCAN_ROOTS.join(', ')}`)
 if (familyLiteralCount === 0) structural.push('found 0 shopping_sync_logs family literals — the detector matched nothing at all')
 if (sqlTemplateCount === 0) structural.push(`found 0 raw SQL templates naming ${SQL_TABLE}`)
+// The negation rule has no legitimate occurrence to count — nothing in the tree may negate a family
+// predicate — so what is proved instead is that the detector REACHED real `NOT:` properties. A
+// traversal that saw none would pass the rule over a repository full of them.
+if (negationCount === 0) structural.push(`examined 0 \`${NEGATION_PROPERTY}:\` properties — the negation detector traversed nothing`)
 if (migrationFiles.length === 0) structural.push(`scanned 0 .sql files under ${MIGRATIONS_ROOT}`)
 if (migrationPredicateCount === 0) structural.push(`found 0 migrations stating the ${SQL_TABLE} family rule — the DDL detector matched nothing at all`)
 for (const owner of MIGRATION_OWNERS.keys()) {
@@ -406,7 +514,8 @@ if (violations.length > 0) {
 
 console.log(
   `check:wc-sync-row-predicates OK — ${files.length} files, ${familyLiteralCount} family literal(s), `
-  + `${sqlTemplateCount} raw ${SQL_TABLE} statement(s), all ${PREDICATE_OWNERS.length + 1} owning definitions present; `
+  + `${sqlTemplateCount} raw ${SQL_TABLE} statement(s), ${negationCount} \`${NEGATION_PROPERTY}:\` propert(ies) examined and `
+  + `none negating a family predicate, all ${PREDICATE_OWNERS.length + 1} owning definitions present; `
   + `${migrationFiles.length} migration .sql file(s), ${migrationPredicateCount} stating the rule in DDL, all `
   + `${MIGRATION_OWNERS.size} accounted for.`,
 )

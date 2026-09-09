@@ -51,6 +51,16 @@ import { Prisma } from '@/app/generated/prisma/client'
  * row what it is instead of inferring it, and it is the same consequence `activeRefundParkWhere`
  * has already accepted since r8.
  *
+ * THAT SENTENCE IS ABOUT NON-MEMBERSHIP, AND NON-MEMBERSHIP HAS TO BE STATED TWICE (o3d-272i r3).
+ * "Not admitted" is what a POSITIVE reader sees; "not exempt from retention" is what a NEGATING one
+ * sees, and in SQL those are different claims because `recordKind` is nullable. Saying the first
+ * does not give you the second: `NOT (UNKNOWN)` is UNKNOWN, so a `WHERE NOT (predicate)` sweep skips
+ * the unstamped row instead of taking it. {@link unresolvedWcOrderRowSql} is therefore rendered
+ * TOTAL — see its own note — so that both halves of that sentence are true of the same fragment.
+ * {@link unresolvedWcOrderRowWhere}, the Prisma spelling, CANNOT be made total from inside the
+ * object it returns, and must not be negated; that is stated on it and enforced by
+ * scripts/check-wc-sync-row-predicates.mjs.
+ *
  * Pure module. No database handle, no connector client — `Prisma.sql` is a template builder, not a
  * connection — so every rule here is unit-testable, and the SQL renderer can be compared against the
  * Prisma one row for row.
@@ -226,6 +236,20 @@ export const UNRESOLVED_WC_ORDER_ROW = {
  * `activeRefundParkWhere` states at length. Callers narrow it by spreading and adding `entityId`
  * (one order) or `recordKind` (one family); they must not RE-STATE any clause it already carries,
  * and scripts/check-wc-sync-row-predicates.mjs makes a re-statement a build failure.
+ *
+ * NARROW IT. DO NOT NEGATE IT (o3d-272i r3). `{ NOT: unresolvedWcOrderRowWhere() }` does NOT mean
+ * "every row this predicate does not admit": Prisma compiles it to a SQL negation of the whole
+ * conjunction, and `recordKind` is nullable, so an UNSTAMPED row answers UNKNOWN to the positive
+ * form and UNKNOWN to the negation too — it appears in neither result. This is not a guess about
+ * Prisma's semantics; tests/concurrency/refund-park-index-family-scope.concurrent.test.ts executes
+ * both forms against a real database over the probe matrix and asserts exactly that.
+ *
+ * AND IT CANNOT BE FIXED FROM INSIDE THIS OBJECT, which is why the rule is a prohibition rather
+ * than a repair. The Prisma `where` language has no `COALESCE`, and whatever this function returns,
+ * `NOT` wraps it — so there is no value it could return that survives being negated. The SQL
+ * renderer {@link unresolvedWcOrderRowSql} IS total and is the one to use when a complement is what
+ * you want; scripts/check-wc-sync-row-predicates.mjs fails the build on a `NOT:` over any of the
+ * family predicates so that this stays a decision somebody makes rather than one they inherit.
  */
 export function unresolvedWcOrderRowWhere(): {
   connector: string
@@ -272,18 +296,55 @@ export function unresolvedWcOrderRowWhere(): {
  *
  * The status array is cast to the enum and the recordKind array to text, matching the columns:
  * `status` is `"ShoppingSyncStatus"`, `recordKind` is a nullable TEXT added by migration
- * 20260822120000. A NULL `recordKind` fails `= ANY(...)` (it evaluates to UNKNOWN, not TRUE), which
- * is the intended answer — see the module docstring on unstamped rows.
+ * 20260822120000.
+ *
+ * AND THE FRAGMENT IS TOTAL — `COALESCE(( ... ), FALSE)` — WHICH IS THE WHOLE OF o3d-272i r3
+ * (Codex MEDIUM).
+ *
+ * `recordKind` is nullable, so `"recordKind" = ANY(...)` answers UNKNOWN for an unstamped row
+ * rather than FALSE. READ POSITIVELY THAT IS THE RIGHT ANSWER AND ALWAYS WAS: `WHERE (predicate)`
+ * keeps only the rows the predicate says TRUE about, so an unstamped row is not admitted, exactly
+ * as the module docstring promises. READ NEGATIVELY IT IS THE WRONG ONE: `WHERE NOT (predicate)`
+ * evaluates `NOT UNKNOWN`, which is UNKNOWN, so the unstamped row is not in the complement either.
+ * It falls out of BOTH halves of a partition that is supposed to cover every row of the table — and
+ * the negating reader is lib/data-retention.ts, where "not in the complement" means EXEMPT FROM
+ * RETENTION. The row this module says is not a member of either family was inheriting the families'
+ * protection from deletion.
+ *
+ * WHY THE TOTALITY LIVES HERE AND NOT AT THE CALL SITE. `AND (...) IS NOT TRUE` in
+ * lib/data-retention.ts would correct that one DELETE and leave the trap loaded for the next reader
+ * who writes `NOT (...)` — which is the shape everybody writes, and which would be wrong again with
+ * nothing in the tree to say so. The defect this module exists to remove is a rule that means two
+ * things depending on who is reading it; a predicate that is correct read one way and wrong read
+ * the other IS that defect, in the artifact built to end it. So the FRAGMENT is two-valued: it
+ * evaluates to TRUE or FALSE for every row of this table and never to NULL, and `NOT (fragment)` is
+ * therefore its exact complement for any caller who writes one, today or later.
+ *
+ * THE WHOLE CONJUNCTION IS WRAPPED, NOT THE ONE NULLABLE COMPARISON. `recordKind` is the only
+ * nullable column this predicate compares by equality today — `entityId` is asked with
+ * `IS NOT NULL`, which is already two-valued, and connector/direction/entityType/status are NOT
+ * NULL in the schema — so `COALESCE("recordKind" = ANY(...), FALSE)` would also be total. Today.
+ * Wrapping the conjunction makes the totality a property of THIS FRAGMENT rather than a standing
+ * bet on the nullability of four other columns, so making one of them nullable later cannot quietly
+ * reopen this.
+ *
+ * AND IT IS NOT CONDITIONAL ON THE BACKFILL HAVING RUN. Migration 20260822120000 stamps every
+ * actionable entityId-bearing row, and its cutover gate (verify.sql check 2) refuses to start the
+ * new build while any is left NULL — so a NULL `recordKind` should not exist in a migrated database
+ * at all. THAT IS WHY THIS IS LOW RISK, AND IT IS NOT A REASON TO SKIP IT: a predicate whose
+ * correctness depends on a backfill having run is coupled to a migration that is already history,
+ * and the coupling is invisible at every site that reads the predicate. The totality is stated here
+ * so that no reader of this rule has to know what ran in August.
  */
 export function unresolvedWcOrderRowSql(): Prisma.Sql {
-  return Prisma.sql`
+  return Prisma.sql`COALESCE((
         "shopping_sync_logs".connector = ${UNRESOLVED_WC_ORDER_ROW.connector}
     AND "shopping_sync_logs".direction = ${UNRESOLVED_WC_ORDER_ROW.direction}::"ShoppingSyncDirection"
     AND "shopping_sync_logs"."entityType" = ${UNRESOLVED_WC_ORDER_ROW.entityType}
     AND "shopping_sync_logs"."entityId" IS NOT NULL
     AND "shopping_sync_logs"."recordKind" = ANY(${[...UNRESOLVED_WC_ORDER_ROW.recordKinds]}::text[])
     AND "shopping_sync_logs".status = ANY(${[...UNRESOLVED_WC_ORDER_ROW.statuses]}::"ShoppingSyncStatus"[])
-  `
+  ), FALSE)`
 }
 
 /**

@@ -230,3 +230,44 @@ test('o3d-272i: the exemption asks the row what family it is, and reaches the dr
     `both exempt families must reach the statement (had: ${JSON.stringify(call.values)})`,
   )
 })
+
+test('o3d-272i r3: the sweep negates the SHARED fragment verbatim, and adds no correction of its own', async () => {
+  // WHERE THE TOTALITY HAS TO LIVE, ASSERTED AS STRUCTURE (Codex r3 MEDIUM).
+  //
+  // `recordKind` is nullable, so before r3 this statement's `NOT ( ... )` was `NOT UNKNOWN` for an
+  // unstamped row — neither exempt nor deletable, which HERE means exempt forever. The two shapes
+  // available were an `IS NOT TRUE` at THIS call site, or a total fragment. The fragment was chosen,
+  // because a call-site fix protects this DELETE and leaves the next reader who writes the obvious
+  // `NOT ( ... )` wrong again.
+  //
+  // THAT CHOICE IS ONLY WORTH ANYTHING IF THIS SITE REALLY DOES NEGATE THE FRAGMENT AS RENDERED —
+  // no local narrowing, no local repair, nothing added. So this compares the statement's exemption
+  // group against `unresolvedWcOrderRowSql()` character for character, modulo whitespace and the
+  // parameter renumbering that composition performs.
+  //
+  // The SEMANTIC half — that the fragment really is two-valued, and that the unstamped row is in
+  // the complement — is asserted against a real database in
+  // tests/concurrency/refund-park-index-family-scope.concurrent.test.ts and
+  // tests/domain/sales/wc-sync-row-families.test.ts. This half is what stops the two coming apart.
+  //
+  // MUTATION ROUTE: add anything to the negation here — `AND (...) IS NOT TRUE`, an extra status
+  // clause, a re-stated recordKind — and the equality fails naming the difference. Remove the
+  // COALESCE wrapper from the renderer and the precondition below fails instead.
+  const { unresolvedWcOrderRowSql } = await import('@/lib/domain/sales/wc-sync-row-families')
+  const fragment = unresolvedWcOrderRowSql()
+  const normalize = (text: string) => text.replace(/\$\d+/g, '$?').replace(/\s+/g, ' ').trim()
+  const rendered = normalize(fragment.sql)
+
+  // PRECONDITIONS: the fragment is the real rule, and it is the TOTAL rendering of it. Without
+  // these the equality below would be satisfied by an empty fragment negated by an empty group.
+  assert.match(rendered, /"recordKind" = ANY/, 'precondition: the fragment still asks the row its family')
+  assert.match(rendered, /^COALESCE\(\(/, 'precondition: the fragment is rendered total')
+  assert.match(rendered, /\), FALSE\)$/, 'precondition: and its default for an UNKNOWN row is FALSE')
+
+  const call = await syncLogDelete()
+  assert.equal(
+    normalize(activeParkGroup(call.sql)),
+    `NOT (${rendered})`,
+    'the retention exemption must be the shared fragment negated, and nothing else',
+  )
+})

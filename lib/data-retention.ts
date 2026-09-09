@@ -211,8 +211,21 @@ export async function purgeExpiredData(): Promise<{
              -- helper it cannot call. It keeps exactly the set it kept before — an unresolved
              -- WooCommerce row that names an IMS order, refund park or held sales invoice — and now
              -- says so by asking the row's own recordKind column, so a family added to this table
-             -- later
-             -- has to claim the exemption rather than inherit it.
+             -- later has to claim the exemption rather than inherit it.
+             --
+             -- o3d-272i r3 (Codex MEDIUM): THIS IS THE ONE READER THAT NEGATES THE SHARED RULE,
+             -- and negation is where a three-valued predicate stops meaning what it reads as
+             -- meaning. recordKind is NULLABLE, so an UNSTAMPED row answers UNKNOWN to the
+             -- predicate -- and NOT UNKNOWN is UNKNOWN, so the row would be in neither the exempt
+             -- set nor the deletable one. HERE that means silently exempt from retention forever:
+             -- the row the shared module says belongs to no family would inherit the families'
+             -- protection from deletion.
+             --
+             -- THE FIX IS NOT LOCAL. unresolvedWcOrderRowSql() renders COALESCE((...), FALSE), so
+             -- the fragment is two-valued and this negation is its exact complement. Nothing is
+             -- added here on top of it, deliberately: an IS NOT TRUE at this call site would
+             -- protect this DELETE and no future one, and the next reader would write the obvious
+             -- negation and be wrong again with nothing in the tree to say so.
              AND NOT (${unresolvedWcOrderRowSql()})
              AND NOT EXISTS (
                    SELECT 1

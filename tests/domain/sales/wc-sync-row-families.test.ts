@@ -13,6 +13,10 @@ import {
   unresolvedWcOrderRowSql,
   unresolvedWcOrderRowWhere,
 } from '@/lib/domain/sales/wc-sync-row-families'
+import {
+  UNRESOLVED_WC_ORDER_ROW_MATRIX_MEMBERS,
+  makeWcSyncRowMatrix,
+} from '@/tests/helpers/wc-sync-row-matrix'
 
 /**
  * o3d-272i — THE TWO SPELLINGS OF ONE RULE, ASKED OF A REAL DATABASE.
@@ -28,75 +32,28 @@ import {
  * `recordKind` silently fails `= ANY(...)`, `IS NOT NULL` and `<> NULL` are different questions, and
  * an enum cast can be wrong in a way that only a server notices. So the test below puts rows that
  * differ in EVERY clause the predicate has into a real table, runs both spellings over exactly those
- * rows, and asserts the two id sets are identical AND are the expected five.
+ * rows, and asserts the two id sets are identical AND are the expected six.
  *
  * IT ASSERTS THE SET, NOT ONLY THE AGREEMENT. Two predicates that both match everything, or both
  * match nothing, agree perfectly. The membership assertion is what makes the agreement mean
  * something.
  *
+ * AND SINCE r3 IT ASSERTS THE COMPLEMENT TOO. The SQL renderer's only negating reader is retention,
+ * and a predicate that is right read positively and wrong read negatively is the same two-meanings
+ * defect this module exists to remove. See the partition test below; the decisive database-backed
+ * version, against a schema built from the migrations, is in
+ * tests/concurrency/refund-park-index-family-scope.concurrent.test.ts.
+ *
+ * The probe matrix is tests/helpers/wc-sync-row-matrix.ts — shared with that concurrency test,
+ * because a fixture written out twice drifts exactly the way a predicate written out twice does.
+ *
  * Everything is written inside a transaction that is rolled back, so the seeded rows never exist for
  * any other reader and nothing is left behind. The test SKIPS when no PostgreSQL is reachable.
  */
 
-type ProbeRow = {
-  id: string
-  connector: string
-  direction: 'FROM_CONNECTOR' | 'TO_CONNECTOR'
-  entityType: string
-  entityId: string | null
-  status: 'PENDING' | 'FAILED' | 'QUARANTINED' | 'SYNCED'
-  recordKind: string | null
-}
+const { rowId, rows: ROWS, ids: IDS } = makeWcSyncRowMatrix(`o3d272i-${Math.random().toString(36).slice(2, 10)}`)
 
-const PROBE = `o3d272i-${Math.random().toString(36).slice(2, 10)}`
-const id = (suffix: string) => `${PROBE}-${suffix}`
-
-function row(suffix: string, overrides: Partial<ProbeRow>): ProbeRow {
-  return {
-    id: id(suffix),
-    connector: 'woocommerce',
-    direction: 'FROM_CONNECTOR',
-    entityType: 'SalesOrder',
-    entityId: 'so-probe',
-    status: 'PENDING',
-    recordKind: WC_REFUND_PARK_RECORD_KIND,
-    ...overrides,
-  }
-}
-
-/**
- * One row per clause, each differing from a matching row in exactly one respect. A clause that were
- * dropped from either renderer changes the answer for at least one of these.
- */
-const ROWS: ProbeRow[] = [
-  // --- the five the rule admits -------------------------------------------------------------
-  row('park-pending', {}),
-  row('park-failed', { status: 'FAILED' }),
-  row('park-quarantined', { status: 'QUARANTINED' }),
-  row('hold-pending', { recordKind: HELD_SALES_INVOICE_RECORD_KIND }),
-  row('hold-failed', { recordKind: HELD_SALES_INVOICE_RECORD_KIND, status: 'FAILED' }),
-  // --- and one counter-example per clause ----------------------------------------------------
-  // Resolved: SYNCED is this table's "an operator settled it" terminal.
-  row('park-synced', { status: 'SYNCED' }),
-  // Names no IMS order — the pending-FX queue and the admission-refusal queue live here.
-  row('park-no-entity', { entityId: null }),
-  // NEVER STAMPED. The row migration 20260822120000's backfill would have stamped, had it run.
-  // It must NOT be admitted: that is the whole of asking the row what it is.
-  row('unstamped', { recordKind: null }),
-  // A family that does not exist yet, which is exactly the point of enumerating the ones that do.
-  row('other-kind', { recordKind: 'WC_SOMETHING_ELSE' }),
-  row('other-connector', { connector: 'shopify' }),
-  row('outbound', { direction: 'TO_CONNECTOR' }),
-  row('other-entity-type', { entityType: 'Product' }),
-]
-
-const EXPECTED = [
-  id('park-pending'),
-  id('park-failed'),
-  id('park-quarantined'),
-  id('hold-pending'),
-  id('hold-failed'),
-].sort()
+const EXPECTED = UNRESOLVED_WC_ORDER_ROW_MATRIX_MEMBERS.map(rowId).sort()
 
 class Rollback extends Error {}
 
@@ -118,7 +75,16 @@ function configuredDatabaseUrl(): string | null {
   return null
 }
 
-async function bothSpellings(t: TestContext): Promise<{ viaPrisma: string[]; viaSql: string[] } | null> {
+type Answers = {
+  viaPrisma: string[]
+  viaSql: string[]
+  /** `NOT (fragment)` — the shape lib/data-retention.ts deletes by. */
+  viaSqlComplement: string[]
+  /** Rows for which the fragment answers neither TRUE nor FALSE. Must always be empty. */
+  undecided: string[]
+}
+
+async function bothSpellings(t: TestContext): Promise<Answers | null> {
   const databaseUrl = configuredDatabaseUrl()
   if (!databaseUrl) {
     t.skip('no DATABASE_URL configured; the SQL/Prisma agreement check needs a reachable PostgreSQL')
@@ -126,26 +92,43 @@ async function bothSpellings(t: TestContext): Promise<{ viaPrisma: string[]; via
   }
   process.env.DATABASE_URL = databaseUrl
   const { db } = await import('@/lib/db')
-  const ids = ROWS.map((probe) => probe.id)
-  let captured: { viaPrisma: string[]; viaSql: string[] } | null = null
+  let captured: Answers | null = null
   try {
     await db.$transaction(async (tx) => {
       await tx.shoppingSyncLog.createMany({ data: ROWS })
       const prismaRows = await tx.shoppingSyncLog.findMany({
         // Scoped to this run's rows so a development database's real content cannot decide the
         // answer either way.
-        where: { ...unresolvedWcOrderRowWhere(), id: { in: ids } },
+        where: { ...unresolvedWcOrderRowWhere(), id: { in: IDS } },
         select: { id: true },
       })
       const sqlRows = await tx.$queryRaw<Array<{ id: string }>>(Prisma.sql`
         SELECT id
           FROM "shopping_sync_logs"
-         WHERE "shopping_sync_logs".id = ANY(${ids}::text[])
+         WHERE "shopping_sync_logs".id = ANY(${IDS}::text[])
            AND (${unresolvedWcOrderRowSql()})
+      `)
+      // THE COMPLEMENT, WRITTEN THE WAY THE RETENTION SWEEP WRITES IT. Not `IS NOT TRUE`, and not
+      // any other locally-corrected spelling: the obvious `NOT (...)` is what a reader writes, and
+      // the fragment has to be safe under it.
+      const complementRows = await tx.$queryRaw<Array<{ id: string }>>(Prisma.sql`
+        SELECT id
+          FROM "shopping_sync_logs"
+         WHERE "shopping_sync_logs".id = ANY(${IDS}::text[])
+           AND NOT (${unresolvedWcOrderRowSql()})
+      `)
+      // AND THE PROPERTY ITSELF, INDEPENDENT OF EITHER QUERY: no row may make the fragment NULL.
+      const undecidedRows = await tx.$queryRaw<Array<{ id: string }>>(Prisma.sql`
+        SELECT id
+          FROM "shopping_sync_logs"
+         WHERE "shopping_sync_logs".id = ANY(${IDS}::text[])
+           AND (${unresolvedWcOrderRowSql()}) IS NULL
       `)
       captured = {
         viaPrisma: prismaRows.map((probe) => probe.id).sort(),
         viaSql: sqlRows.map((probe) => probe.id).sort(),
+        viaSqlComplement: complementRows.map((probe) => probe.id).sort(),
+        undecided: undecidedRows.map((probe) => probe.id).sort(),
       }
       // Nothing this test wrote may survive it.
       throw new Rollback()
@@ -165,7 +148,7 @@ test('o3d-272i: the SQL spelling and the Prisma spelling select the same rows (l
 
   // PRECONDITION: the seeding and both queries really ran over the whole matrix. Without this an
   // empty answer on both sides would satisfy the agreement assertion perfectly.
-  assert.equal(ROWS.length, 12, 'precondition: every clause has a counter-example row')
+  assert.equal(ROWS.length, 13, 'precondition: every clause has a counter-example row')
   assert.deepEqual(
     result.viaPrisma,
     EXPECTED,
@@ -193,9 +176,51 @@ test('o3d-272i: an unstamped row is admitted by neither spelling', async (t) => 
   const result = await bothSpellings(t)
   if (!result) return
   for (const spelling of [result.viaPrisma, result.viaSql]) {
-    assert.ok(!spelling.includes(id('unstamped')), 'a NULL recordKind is not a family membership')
-    assert.ok(!spelling.includes(id('other-kind')), 'an unknown recordKind is not a family membership')
+    assert.ok(!spelling.includes(rowId('unstamped')), 'a NULL recordKind is not a family membership')
+    assert.ok(!spelling.includes(rowId('other-kind')), 'an unknown recordKind is not a family membership')
   }
+})
+
+test('o3d-272i r3: the SQL fragment partitions the table, so NOT (...) is its exact complement', async (t) => {
+  // THE FINDING (Codex r3 MEDIUM). `recordKind` is nullable, so before r3 the fragment answered
+  // UNKNOWN for the `unstamped` row: not admitted by `WHERE (fragment)`, and — because `NOT UNKNOWN`
+  // is UNKNOWN — not admitted by `WHERE NOT (fragment)` either. It fell out of both halves, and the
+  // half it fell out of at the only negating reader is lib/data-retention.ts, where "not in the
+  // complement" means EXEMPT FROM RETENTION. `unresolvedWcOrderRowSql()` now renders
+  // `COALESCE((...), FALSE)`.
+  //
+  // ASSERTED FROM BOTH ENDS ON PURPOSE. A test that only checked the positive side passes against
+  // the unfixed code; so does one that only checked that the complement is non-empty.
+  //
+  // MUTATION ROUTE: remove the `COALESCE(( ... ), FALSE)` wrapper from unresolvedWcOrderRowSql.
+  // `unstamped` leaves the complement, the partition assertion fails naming it, and `undecided`
+  // stops being empty.
+  const result = await bothSpellings(t)
+  if (!result) return
+
+  assert.deepEqual(result.undecided, [], 'the fragment must answer TRUE or FALSE for every row, never NULL')
+
+  // THE UNSTAMPED ROW, BOTH WAYS. Neither of these holds on its own.
+  assert.ok(
+    !result.viaSql.includes(rowId('unstamped')),
+    'a NULL recordKind must not be ADMITTED by the predicate',
+  )
+  assert.ok(
+    result.viaSqlComplement.includes(rowId('unstamped')),
+    'a NULL recordKind must not be EXEMPTED by the complement the retention sweep deletes by',
+  )
+
+  // AND THE GENERAL PROPERTY: every row of the matrix is in exactly one of the two halves.
+  assert.deepEqual(
+    [...result.viaSql, ...result.viaSqlComplement].sort(),
+    [...IDS].sort(),
+    'the predicate and its negation must cover the table between them',
+  )
+  assert.deepEqual(
+    result.viaSql.filter((id) => result.viaSqlComplement.includes(id)),
+    [],
+    'and must not overlap',
+  )
 })
 
 test('o3d-272i: a held sales invoice is not described to an operator as a refund', () => {
