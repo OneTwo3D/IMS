@@ -73,6 +73,19 @@ const CUTOVER_DIR_PRIMITIVES = ['enter_service_subdir', 'own_service_subdir', 'e
 const DEPLOY_LINES = readFileSync(join(process.cwd(), 'scripts/deploy.sh'), 'utf8').split(/\r?\n/)
 const UPDATE_LINES = readFileSync(join(process.cwd(), 'scripts/update.sh'), 'utf8').split(/\r?\n/)
 
+/**
+ * THE ENVIRONMENT-SOURCE SCAN, WHICH IS IN NO ENTRYPOINT NOW (o3d-rret).
+ *
+ * `unit_env_var_sole_source()` and its five bus readers answer one question — what, other than the
+ * file this run read, can define a named variable for a service — and until this round every
+ * entrypoint answered it with its own transcription. deploy.sh's was still the un-parameterised r20
+ * form; update.sh's had taken (variable, layer) at r28; install.sh's had taken (variable) at r44 and
+ * lost the layer again at r45. One rule, three implementations, no two of them the same. It is one
+ * definition now, and the harnesses below lift it from the file that holds it.
+ */
+const UNIT_ENV_LIB_PATH = join(process.cwd(), 'scripts/lib/unit-environment.sh')
+const UNIT_ENV_LIB = readFileSync(UNIT_ENV_LIB_PATH, 'utf8')
+
 const DEPLOY_PHASES = [
   'preflight',
   'build',
@@ -7788,12 +7801,15 @@ function runPortResolution(options: {
     '  esac',
     '}',
     shellFunction(source, 'valid_tcp_port'),
-    shellFunction(source, 'bus_read_strings'),
-    shellFunction(source, 'bus_array_count'),
-    shellFunction(source, 'bus_unit_property'),
-    shellFunction(source, 'bus_element_names_variable'),
-    shellFunction(source, 'bus_read_env_ignore_flags'),
-    shellFunction(source, 'unit_env_var_sole_source'),
+    // THE SCAN COMES OUT OF THE LIBRARY THAT DEFINES IT (o3d-rret). update.sh sources it rather
+    // than carrying it, so lifting it from UPDATE_LINES would lift nothing — and lifting a
+    // re-typed copy would measure this file's transcription instead of the shipped one.
+    shellFunction(UNIT_ENV_LIB, 'bus_read_strings'),
+    shellFunction(UNIT_ENV_LIB, 'bus_array_count'),
+    shellFunction(UNIT_ENV_LIB, 'bus_unit_property'),
+    shellFunction(UNIT_ENV_LIB, 'bus_element_names_variable'),
+    shellFunction(UNIT_ENV_LIB, 'bus_read_env_ignore_flags'),
+    shellFunction(UNIT_ENV_LIB, 'unit_env_var_sole_source'),
     shellFunction(source, 'unit_listen_port'),
     shellFunction(source, 'resolve_app_port'),
     'if resolve_app_port; then echo "PORT=${APP_PORT}"; echo "SOURCE=${APP_PORT_SOURCE}"; else echo "REFUSED=${APP_PORT_REASON}"; fi',
@@ -7944,7 +7960,7 @@ test('the environment-source doctrine is ONE mechanism, told which variable to a
   // of calling unit_env_var_sole_source() and the first assertion fails; hard-code
   // `DATABASE_URL` back into unit_env_var_sole_source() and the second does.
   const source = UPDATE_LINES.join('\n')
-  const scan = shellFunction(source, 'unit_env_var_sole_source')
+  const scan = shellFunction(UNIT_ENV_LIB, 'unit_env_var_sole_source')
   assert.ok(
     /local variable="\$\{1:-\}" layer="\$\{2:-\}"/.test(scan),
     `the scan must take the variable and the layer as arguments:\n${scan.slice(0, 400)}`,
@@ -7954,14 +7970,19 @@ test('the environment-source doctrine is ONE mechanism, told which variable to a
 
   // Both callers go through it, and there is no second copy of the question anywhere.
   assert.ok(
-    /unit_env_var_sole_source DATABASE_URL file "\$@"/.test(shellFunction(source, 'env_file_is_sole_database_url_source')),
+    /unit_env_var_sole_source DATABASE_URL file "\$@"/.test(shellFunction(UNIT_ENV_LIB, 'env_file_is_sole_database_url_source')),
     'the DATABASE_URL entry point must be a wrapper over the one scan',
   )
   assert.ok(
     /unit_env_var_sole_source PORT directive/.test(shellFunction(source, 'unit_listen_port')),
     'and the port resolver must ask the same one',
   )
-  const callers = UPDATE_LINES.filter((line) => isCode(line) && /bus_unit_property "\$object" Service EnvironmentFiles/.test(line))
+  // AND `EXACTLY ONE PLACE` NOW MEANS ACROSS THE THREE ENTRYPOINTS AND THE LIBRARY (o3d-rret),
+  // not within update.sh alone: the reason this question is asked is that deploy.sh answered it
+  // with its own transcription for four rounds while this assertion, scoped to update.sh, stayed
+  // green throughout.
+  const callers = [...UNIT_ENV_LIB.split(/\r?\n/), ...UPDATE_LINES, ...DEPLOY_LINES, ...INSTALL_LINES]
+    .filter((line) => isCode(line) && /bus_unit_property "\$object" Service EnvironmentFiles/.test(line))
   assert.equal(callers.length, 1, `EnvironmentFiles= must be read in exactly one place, found ${callers.length}`)
 
   // AND NOTHING ELSE IN THE THREE ENTRYPOINTS READS `Environment=` WITH THE OLD ASSUMPTION.
@@ -8342,6 +8363,10 @@ test('update.sh never reads a shell variable that only the deleted `source` coul
     // CRONTAB_LOCK_FILE, CRONTAB_LOCK_CONFLICT and CRONTAB_LOCK_WAIT_SECONDS, which update.sh
     // expands with no default — so leaving it out of this scan reports three names as unsupplied.
     ...readFileSync(join(process.cwd(), 'scripts/lib/crontab-lock.sh'), 'utf8').split(/\r?\n/),
+    // …and the environment-source scan, sourced by all three since o3d-rret. It assigns
+    // ENV_VAR_SOURCE_REASON, BUS_STRINGS, BUS_ENV_IGNORE_FLAGS and DB_IDENTITY_REQUIRE_SNAPSHOT,
+    // which update.sh expands with no default — so leaving it out reports them as unsupplied.
+    ...readFileSync(join(process.cwd(), 'scripts/lib/unit-environment.sh'), 'utf8').split(/\r?\n/),
   ]
   const label = 'update.sh'
   const code = [...UPDATE_LINES, ...LIBRARY_LINES].filter((line) => !/^\s*#/.test(line))
@@ -8414,7 +8439,7 @@ test('every entrypoint defines what the shared fence library reads', () => {
   // BOTH shared libraries, for the same reason (o3d-p9dq added the second): each is sourced by
   // all three entrypoints and each expands names the entrypoint must supply — DB_FENCE_SCRIPT for
   // the fence, APP_USER for the crontab lock's refusal messages.
-  const libCode = ['scripts/lib/db-fence-protected.sh', 'scripts/lib/crontab-lock.sh']
+  const libCode = ['scripts/lib/db-fence-protected.sh', 'scripts/lib/crontab-lock.sh', 'scripts/lib/unit-environment.sh']
     .flatMap((rel) => readFileSync(join(process.cwd(), rel), 'utf8').split(/\r?\n/))
     .filter((line) => !/^\s*#/.test(line))
 
@@ -8456,6 +8481,8 @@ test('every entrypoint defines what the shared fence library reads', () => {
     assert.match(source, /source "\$\{IMS_SCRIPT_LIB_DIR\}\/db-fence-protected\.sh"/, `${label} must source it`)
     assert.match(source, /source "\$\{IMS_SCRIPT_LIB_DIR\}\/crontab-lock\.sh"/,
       `${label} must source the crontab exclusion from the same place`)
+    assert.match(source, /source "\$\{IMS_SCRIPT_LIB_DIR\}\/unit-environment\.sh"/,
+      `${label} must source the environment-source scan from the same place (o3d-rret)`)
   }
 })
 
@@ -12451,6 +12478,55 @@ for (const entry of R9_SCRIPTS) {
       `and the operator must be told the record is there and why it is being ignored:\n${run.stdout}`)
   })
 }
+
+/** The environment-source functions, and the ONE file that defines each of them (o3d-rret).
+ *  A definition that came back to an entrypoint would be a fourth transcription of one rule. */
+const UNIT_ENV_OWNED = [
+  // The scan itself, and the DATABASE_URL naming of the question that wraps it.
+  'unit_env_var_sole_source',
+  'env_file_is_sole_database_url_source',
+  // The five bus readers under it. They were BYTE-IDENTICAL in all three entrypoints, which is
+  // not reassurance: byte-identical copies are how the r9 lock split and the r20 namespace split
+  // both survived a round, and the scan they serve had already drifted three ways above them.
+  'bus_read_strings',
+  'bus_array_count',
+  'bus_unit_property',
+  'bus_element_names_variable',
+  'bus_read_env_ignore_flags',
+] as const
+
+test('[o3d-rret] the environment-source doctrine is one definition, in the library the three entrypoints source', () => {
+  // THE POINT OF THE LIFT, ASSERTED — and this one is not a hypothetical. deploy.sh really did
+  // carry the un-parameterised r20 copy for four rounds after update.sh was generalised, and
+  // PR #664 rewrote all three files without closing it, because nothing failed while it was open.
+  // This is what fails now.
+  //
+  // MUTATION ROUTE (run): paste update.sh's unit_env_var_sole_source() body back into
+  // scripts/deploy.sh and this names deploy.sh; delete the library's copy and the first assertion
+  // names it instead. shellFunctionDefinitions() counts through bash's own parser as well as its
+  // own lexer, so a one-line body, a split header or a definition after `if` counts too.
+  for (const name of UNIT_ENV_OWNED) {
+    assert.equal(shellFunctionDefinitions(UNIT_ENV_LIB, name, 'scripts/lib/unit-environment.sh').length, 1,
+      `${name}() must be defined exactly once, in the library`)
+    for (const entry of R9_SCRIPTS) {
+      assert.equal(shellFunctionDefinitions(entry.source, name, entry.name).length, 0,
+        `${entry.name} must not carry its own ${name}() — that is the shape of this finding`)
+    }
+  }
+
+  // AND THE OLD, UN-PARAMETERISED NAME IS GONE RATHER THAN KEPT AS A SECOND WAY TO ASK. deploy.sh's
+  // matcher hard-coded the variable into the function; a copy of it surviving anywhere is the
+  // drift returning under its own name.
+  for (const entry of [...R9_SCRIPTS, { name: 'scripts/lib/unit-environment.sh', source: UNIT_ENV_LIB }]) {
+    assert.ok(!/bus_element_names_database_url/.test(entry.source),
+      `${entry.name} must not name a matcher that answers for one hard-coded variable`)
+  }
+
+  // THE SCAN NAMES NO VARIABLE OF ITS OWN, asked of the library rather than of whichever
+  // entrypoint happened to be checked. This is the assertion deploy.sh would have failed.
+  const scan = shellFunction(UNIT_ENV_LIB, 'unit_env_var_sole_source')
+  assert.ok(!/DATABASE_URL/.test(scan), 'the one scan must be told which variable to ask about')
+})
 
 test('[o3d-secops r22] the cutover namespace is one definition, in the library the three entrypoints source', () => {
   // THE POINT OF THE LIFT, ASSERTED. Three byte-identical copies is how the r9 lock split and the

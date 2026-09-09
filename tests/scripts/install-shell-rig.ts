@@ -25,6 +25,33 @@ export const REPO = process.cwd()
 export const INSTALL_SOURCE = readFileSync(join(REPO, 'scripts/install.sh'), 'utf8')
 
 /**
+ * THE ENVIRONMENT-SOURCE DOCTRINE, WHICH IS NOT IN install.sh ANY MORE (o3d-rret).
+ *
+ * The scan that asks systemd what can define one variable for a service — and the five bus readers
+ * under it — used to be written out in install.sh, in deploy.sh and in update.sh: one rule, three
+ * hand-written implementations, two of them generalised and one of them a round behind. It is one
+ * definition now, in scripts/lib/unit-environment.sh, which the three entrypoints source. A harness
+ * lifts a function out of the file that DEFINES it, so the resolver below decides which file that
+ * is; nothing else about these rigs changes, because the scan itself came across unchanged.
+ */
+export const UNIT_ENV_SOURCE = readFileSync(join(REPO, 'scripts/lib/unit-environment.sh'), 'utf8')
+
+export const UNIT_ENV_FUNCTIONS: ReadonlySet<string> = new Set([
+  'bus_read_strings',
+  'bus_array_count',
+  'bus_unit_property',
+  'bus_element_names_variable',
+  'bus_read_env_ignore_flags',
+  'unit_env_var_sole_source',
+  'env_file_is_sole_database_url_source',
+])
+
+/** Lift `name` out of whichever shipped file defines it. */
+export function shippedFromDefiner(name: string): string {
+  return shippedFunction(UNIT_ENV_FUNCTIONS.has(name) ? UNIT_ENV_SOURCE : INSTALL_SOURCE, name)
+}
+
+/**
  * Everything the credential decision is made of, lifted whole out of the shipped script.
  *
  * classify_database_credential_rotation() is in this list because r38 turned four straight-line
@@ -148,7 +175,7 @@ export const SHIPPED = [
   'write_app_env_file',
   'rotate_database_password_in_fenced_window',
 ]
-  .map((name) => shippedFunction(INSTALL_SOURCE, name))
+  .map(shippedFromDefiner)
   .join('\n')
 
 /**
