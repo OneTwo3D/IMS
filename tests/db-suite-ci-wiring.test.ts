@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict'
+import { execSync } from 'node:child_process'
 import { readFileSync, readdirSync, statSync } from 'node:fs'
 import path from 'node:path'
 import test from 'node:test'
@@ -183,17 +184,255 @@ test('a CI job runs npm run test:db against a migrated postgres service', () => 
   }
 })
 
-test(`${WORKFLOW} is triggered by changes to the gated files themselves`, () => {
+/**
+ * o3d-11rf r14 (Codex r14, HIGH) — A PATH FILTER THAT NAMES A PATH THAT DOES NOT EXIST.
+ *
+ * WHAT WAS FOUND. The job added above was gated on `lib/db.ts`, and there is no `lib/db.ts`. The
+ * database client both suites import is `lib/db/index.ts`, reached as `../../lib/db`. A pull request
+ * touching only that client therefore did not start the job that runs the evidence about it:
+ * `test:unit` collected the two suites and skipped them, exactly as it did before the job existed.
+ * A filter naming nothing looks identical — in the file, and in the Actions UI — to a filter that
+ * works. It never errors. It just silently declines to match.
+ *
+ * WHY THE CHECKS BELOW ARE ABOUT THE CLASS AND NOT ABOUT `lib/db/**`. Asserting that this workflow
+ * lists `lib/db/**` would correct the sentence and leave the grammar: the next filter to name a
+ * moved, renamed or mistyped path would be just as dead and just as invisible. What is wrong with
+ * `lib/db.ts` is checkable without knowing anything about `lib/db` at all — A GLOB THAT MATCHES
+ * ZERO FILES IN THE REPOSITORY IS A FILTER DOING NOTHING — so the assertion is universal: every
+ * path filter, in every workflow, under `paths:` and under `paths-ignore:`, must match at least one
+ * tracked file. The list it is stated over is PARSED from the workflows, never maintained here.
+ *
+ * AND SEPARATELY, THE PROPERTY THE DEAD FILTER WAS SUPPOSED TO CARRY. "Matches something" is not
+ * "matches the right thing": `lib/db.ts` could have been a live-but-irrelevant path and the class
+ * check would be satisfied while the job still never ran on a client change. That half is checkable
+ * generically too. The gated suites' own relative imports are resolved to repository files, and
+ * every one of them must be covered by EVERY event's `paths:` list. Nothing below names `lib/db`;
+ * the walk finds it because the suites import it.
+ *
+ * PER EVENT, NOT PER FILE. `pull_request:` and `push:` carry SEPARATE `paths:` lists here, and the
+ * earlier version of the last check below flattened both into one — a path present in only one of
+ * them read as covered. Every coverage assertion is now made against one event's list at a time.
+ */
+
+const WORKFLOW_DIR = '.github/workflows'
+
+/**
+ * Every file the repository tracks. This is the universe a GitHub path filter is compared against:
+ * the filter is matched against the paths of the files a push or pull request CHANGED, and only a
+ * tracked file can appear in that set. Read from git rather than by walking the filesystem, so that
+ * build output, node_modules and untracked scratch files cannot make a dead filter look alive.
+ */
+function trackedFiles(): string[] {
+  return execSync('git ls-files', { cwd: REPO_ROOT, encoding: 'utf8', maxBuffer: 256 * 1024 * 1024 })
+    .split('\n')
+    .filter(Boolean)
+}
+
+type PathFilter = { workflow: string; event: string; key: 'paths' | 'paths-ignore'; value: string; line: number }
+
+/**
+ * The `paths:` / `paths-ignore:` entries of a workflow's `on:` block, each tagged with the EVENT and
+ * the KEY it was found under.
+ *
+ * Read by indentation rather than with a YAML library because this repository declares no YAML
+ * dependency — `tests/production-readiness-workflow.test.ts` and `jobBlocks()` above read these
+ * files as text for the same reason.
+ *
+ * A COMMENT IS NOT A FILTER, and that distinction is the one this guard has already been caught on
+ * once: the tripwire check further up originally accepted a doc-comment mention as satisfying a
+ * rule. So lines whose first non-space character is `#` are dropped before anything else looks at
+ * them — a commented-out list entry supplies no coverage, and prose naming a path supplies none
+ * either. Nor can an entry under `paths-ignore:` stand in for one under `paths:`: the key is carried
+ * on every entry so that a coverage question can be asked of `paths` alone. (Both are still subject
+ * to the dead-glob check: a `paths-ignore:` entry matching nothing is equally a no-op.)
+ */
+function parseTriggerPathFilters(source: string, workflow: string): PathFilter[] {
+  const lines = source.split('\n')
+  const start = lines.findIndex((line) => /^on:\s*$/.test(line))
+  if (start < 0) return []
+  const found: PathFilter[] = []
+  let event: string | null = null
+  let key: string | null = null
+  for (let index = start + 1; index < lines.length; index += 1) {
+    const line = lines[index]
+    if (line.trim() === '') continue
+    if (line.trimStart().startsWith('#')) continue
+    if (!/^\s/.test(line)) break // back to column 0: the on: block has ended
+    const eventHeader = /^ {2}([A-Za-z_][\w-]*):\s*$/.exec(line)
+    if (eventHeader) {
+      event = eventHeader[1]
+      key = null
+      continue
+    }
+    const keyHeader = /^ {4}([A-Za-z_][\w-]*):\s*$/.exec(line)
+    if (keyHeader) {
+      key = keyHeader[1]
+      continue
+    }
+    const item = /^ {6}- (.+?)\s*$/.exec(line)
+    if (!item || !event || (key !== 'paths' && key !== 'paths-ignore')) continue
+    const raw = item[1]
+    const quoted = /^"(.*)"$/.exec(raw) ?? /^'(.*)'$/.exec(raw)
+    found.push({ workflow, event, key, value: quoted ? quoted[1] : raw, line: index + 1 })
+  }
+  return found
+}
+
+/** One event's `paths:` globs, keyed by event name. `paths-ignore:` is deliberately not included. */
+function pathsByEvent(workflow: string): Map<string, string[]> {
+  const source = readFileSync(path.join(REPO_ROOT, workflow), 'utf8')
+  const byEvent = new Map<string, string[]>()
+  for (const filter of parseTriggerPathFilters(source, workflow)) {
+    if (filter.key !== 'paths') continue
+    byEvent.set(filter.event, [...(byEvent.get(filter.event) ?? []), filter.value])
+  }
+  return byEvent
+}
+
+/** A relative import specifier resolved to the repository file it actually loads, or null. */
+function resolveRelativeImport(fromFile: string, specifier: string, tracked: Set<string>): string | null {
+  const base = path.posix.normalize(path.posix.join(path.posix.dirname(fromFile), specifier))
+  const candidates = [base, `${base}.ts`, `${base}.tsx`, `${base}.mts`, `${base}.cts`, `${base}.js`,
+    `${base}.mjs`, `${base}/index.ts`, `${base}/index.tsx`, `${base}/index.js`, `${base}/index.mjs`]
+  return candidates.find((candidate) => tracked.has(candidate)) ?? null
+}
+
+/** The relative import specifiers of one module, both static `from '...'` and dynamic `import('...')`. */
+function relativeImportsOf(source: string): string[] {
+  return [...new Set([
+    ...[...source.matchAll(/\bfrom\s+['"](\.[^'"]+)['"]/g)].map((match) => match[1]),
+    ...[...source.matchAll(/\b(?:import|require)\s*\(\s*['"](\.[^'"]+)['"]/g)].map((match) => match[1]),
+  ])]
+}
+
+test('the trigger parser reads filters, not prose: comments and paths-ignore supply no coverage', () => {
+  // The parser is the thing every assertion below stands on, so it is pinned against a document
+  // built to defeat it: a prose mention of a path, a commented-out list entry at the list's own
+  // indentation, a commented-out entry indented as a key, an entry under paths-ignore, and a
+  // list item outside the on: block entirely.
+  const fixture = [
+    'name: Fixture',
+    '# Prose about "lib/db/**" and lib/db/index.ts, at length, naming paths it does not filter on.',
+    'on:',
+    '  pull_request:',
+    '    # - "lib/commented-out-as-a-key.ts"',
+    '    paths:',
+    '      - "lib/real.ts"',
+    '#      - "lib/commented-out-as-an-entry.ts"',
+    '      - lib/unquoted.ts',
+    '  push:',
+    '    branches:',
+    '      - development',
+    '    paths-ignore:',
+    '      - "lib/ignored.ts"',
+    '',
+    'jobs:',
+    '  a:',
+    '    steps:',
+    '      - "not a path filter at all"',
+    '',
+  ].join('\n')
+  const parsed = parseTriggerPathFilters(fixture, 'fixture.yml')
+  assert.deepEqual(parsed.map((filter) => `${filter.event}.${filter.key}=${filter.value}`), [
+    'pull_request.paths=lib/real.ts',
+    'pull_request.paths=lib/unquoted.ts',
+    'push.paths-ignore=lib/ignored.ts',
+  ], 'the parser must read exactly the live list entries: no prose, no commented-out lines, and '
+    + 'nothing from outside the on: block')
+  assert.deepEqual(parsed.filter((filter) => filter.key === 'paths').map((filter) => filter.value),
+    ['lib/real.ts', 'lib/unquoted.ts'],
+    'an entry under paths-ignore: must never be counted as coverage under paths:')
+  // And the branches list, which sits at the same indentation as a paths list, is not a path filter.
+  assert.ok(!parsed.some((filter) => filter.value === 'development'), 'branches: is not paths:')
+})
+
+test('every path filter in every workflow matches at least one file that exists in the repository', () => {
+  const tracked = trackedFiles()
+  // The universe has to be real: if `git ls-files` returned nothing, EVERY glob would match nothing
+  // and this check would report the whole repository as dead rather than pass vacuously — but it
+  // would report it for the wrong reason, so the list is anchored before it is used.
+  assert.ok(tracked.length > 100 && tracked.includes('package.json'),
+    `the tracked-file list is not a repository listing (${tracked.length} entries)`)
+
+  const workflows = readdirSync(path.join(REPO_ROOT, WORKFLOW_DIR)).filter((name) => /\.ya?ml$/.test(name))
+  assert.ok(workflows.length > 0, `${WORKFLOW_DIR} contains no workflow files; the walk reached nothing`)
+
+  const filters: PathFilter[] = []
+  for (const name of workflows) {
+    const relative = `${WORKFLOW_DIR}/${name}`
+    const source = readFileSync(path.join(REPO_ROOT, relative), 'utf8')
+    // A parser that silently stopped reading would turn this check green over any number of dead
+    // filters, so a file that DECLARES a list must yield entries from it.
+    if (/^ {4}paths(-ignore)?:\s*$/m.test(source)) {
+      assert.ok(parseTriggerPathFilters(source, relative).length > 0,
+        `${relative} declares a paths: list and the trigger parser read none of it`)
+    }
+    filters.push(...parseTriggerPathFilters(source, relative))
+  }
+  assert.ok(filters.length > 0, 'no workflow declares a path filter; the walk reached nothing')
+
+  // The matcher must be able to say NO, and specifically it must not read a FILE path as covering
+  // the DIRECTORY that replaced it. That is the r14 defect exactly, and if this line ever passes in
+  // the other direction every dead filter below reads as live.
+  assert.equal(globToRegExp('lib/db.ts').test('lib/db/index.ts'), false,
+    'a filter naming a file must not be treated as matching a path inside a directory of that name')
+  assert.equal(globToRegExp('lib/db/**').test('lib/db/index.ts'), true,
+    'the matcher must accept a directory glob over a file directly inside it')
+
+  const dead = filters
+    .filter((filter) => !tracked.some((file) => globToRegExp(filter.value).test(file)))
+    .map((filter) => `${filter.workflow}:${filter.line} (${filter.event}.${filter.key}) ${filter.value}`)
+  assert.deepEqual(dead, [],
+    'these path filters match no file in the repository, so they contribute nothing to the trigger '
+    + 'and a change they were written to catch starts no job. A filter naming a moved, renamed or '
+    + 'mistyped path never errors — it silently declines to match, and reads as working')
+})
+
+test(`${WORKFLOW} is triggered by changes to the gated files themselves, on every event that filters`, () => {
   // A path-filtered workflow that does not list tests/db/** would not run on a pull request that
   // only changed one of these suites — the job would exist and still never execute.
-  const workflow = readFileSync(path.join(REPO_ROOT, WORKFLOW), 'utf8')
-  const triggers = workflow.slice(0, workflow.indexOf('\njobs:'))
-  const pathFilters = [...triggers.matchAll(/^ {6}- "([^"]+)"$/gm)].map((match) => match[1])
-  assert.ok(pathFilters.length > 0, `${WORKFLOW} declares no path filters to check`)
-  const matchers = pathFilters.map(globToRegExp)
+  const byEvent = pathsByEvent(WORKFLOW)
+  assert.ok(byEvent.size > 0, `${WORKFLOW} declares no path filters to check`)
+  for (const [event, globs] of byEvent) {
+    const matchers = globs.map(globToRegExp)
+    for (const file of gatedFiles) {
+      assert.ok(matchers.some((matcher) => matcher.test(file)),
+        `a ${event} changing only ${file} would not trigger ${WORKFLOW}: that event's paths filter `
+        + 'does not cover the file, so the job added for it would never run')
+    }
+  }
+})
+
+test(`${WORKFLOW} is also triggered by the modules the gated files import`, () => {
+  // THE r14 FINDING AS A RULE. A suite that runs only when its own text changes is half-wired: the
+  // regressions it exists to catch arrive in the code it CALLS. The dependencies are resolved from
+  // the suites' own import statements, so nothing here has to be kept in step by hand.
+  const tracked = new Set(trackedFiles())
+  const dependencies = new Map<string, string[]>()
   for (const file of gatedFiles) {
-    assert.ok(matchers.some((matcher) => matcher.test(file)),
-      `a pull request changing only ${file} would not trigger ${WORKFLOW}: its paths filter `
-      + 'does not cover the file, so the job added for it would never run')
+    const specifiers = relativeImportsOf(readFileSync(path.join(REPO_ROOT, file), 'utf8'))
+    assert.ok(specifiers.length > 0,
+      `no relative import was read out of ${file}; the import extractor reached nothing, which `
+      + 'would make every assertion below a loop over an empty list')
+    dependencies.set(file, specifiers.map((specifier) => {
+      const target = resolveRelativeImport(file, specifier, tracked)
+      assert.ok(target, `${file} imports ${specifier}, which resolves to no tracked file`)
+      return target as string
+    }))
+  }
+
+  const byEvent = pathsByEvent(WORKFLOW)
+  assert.ok(byEvent.size > 0, `${WORKFLOW} declares no path filters to check`)
+  for (const [event, globs] of byEvent) {
+    const matchers = globs.map(globToRegExp)
+    for (const [file, targets] of dependencies) {
+      for (const target of targets) {
+        assert.ok(matchers.some((matcher) => matcher.test(target)),
+          `${WORKFLOW}'s ${event} paths filter does not cover ${target}, which ${file} imports `
+          + 'directly. A pull request changing only that module would not start the job that runs '
+          + `${file}, and test:unit would collect it and skip it — which is the r13 finding all `
+          + 'over again, reached through the trigger instead of through the environment')
+      }
+    }
   }
 })

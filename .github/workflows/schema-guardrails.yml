@@ -20,7 +20,7 @@ on:
       - "scripts/run-migration-verifications.mjs"
       - "scripts/check-app-db-object-access.mjs"
       - "tests/db/**"
-      - "lib/db.ts"
+      - "lib/db/**"
       - "lib/domain/accounting/**"
   push:
     branches:
@@ -43,7 +43,7 @@ on:
       - "scripts/run-migration-verifications.mjs"
       - "scripts/check-app-db-object-access.mjs"
       - "tests/db/**"
-      - "lib/db.ts"
+      - "lib/db/**"
       - "lib/domain/accounting/**"
 
 jobs:
