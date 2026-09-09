@@ -3780,12 +3780,20 @@ async function readPaymentRegistrations(
     // things — a VERIFIED reversal (buildVerifiedReversalData, Xero said DELETED) and an operator
     // asserting the document exists on a cancelled sale. This column is the only difference between
     // them, and `registrationLedgerStanding` draws opposite conclusions from the two.
-    select: { id: true, connector: true, status: true, externalTransactionId: true, settlementBasis: true, payload: true },
+    // o3d-f709: abandonedBeforeRemoteCall, because a CANCELLED row carrying a document id is written
+    // by THREE things, not two — the third is the cross-connector orphan sweep, which stamps this
+    // column `true` over a row it proved nothing about beyond its PENDING status, and a posted row
+    // sits at PENDING whenever follow-up work has failed. It is REQUIRED on PaymentRegistrationRow,
+    // so omitting it here is a compile error rather than a silently permissive delete.
+    select: {
+      id: true, connector: true, status: true, externalTransactionId: true, settlementBasis: true,
+      abandonedBeforeRemoteCall: true, payload: true,
+    },
   })
   return rows
     .filter((row) => payloadPaymentId(row.payload) === paymentId)
-    .map(({ id, connector, status, externalTransactionId, settlementBasis }) => (
-      { id, connector, status, externalTransactionId, settlementBasis }
+    .map(({ id, connector, status, externalTransactionId, settlementBasis, abandonedBeforeRemoteCall }) => (
+      { id, connector, status, externalTransactionId, settlementBasis, abandonedBeforeRemoteCall }
     ))
 }
 

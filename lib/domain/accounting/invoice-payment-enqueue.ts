@@ -118,6 +118,12 @@ export async function loadInvoicePaymentSyncRows(
       // PaymentSyncRow, so dropping it in this move would have been a silent regression rather than
       // a type error.
       settlementBasis: true,
+      // o3d-f709: the orphan sweep's pre-call claim, so the settlement badge and the delete refusal
+      // read the SAME classifier on the SAME columns. Without it a row the delete refuses to touch
+      // — a posted payment the sweep retired without clearing its id — was displayed as a plainly
+      // unpaid order with no discrepancy, which is the exact drift o3d-nf9i r3 closed for
+      // `settlementBasis`.
+      abandonedBeforeRemoteCall: true,
       // o3d-r948 r6: `connectionProvenance` and `backReferenceEvidenceCompactedAt` were selected
       // here for r5's exclusion scoping and are not any more — nothing excludes a settlement record
       // on any identity now, so no consumer of these rows needs to know which organisation each was
@@ -139,6 +145,7 @@ export async function loadInvoicePaymentSyncRows(
       // decides whether more money may move. See `InvoicePaymentSyncRow.registeredAmount`.
       registeredAmount: readPayloadRegisteredAmount(r.payload, documentCurrency),
       settlementBasis: r.settlementBasis,
+      abandonedBeforeRemoteCall: r.abandonedBeforeRemoteCall,
       paymentId: payloadPaymentId(r.payload),
       // o3d-hbgo: WHICH ledger invoice this settled. A row against a document the order no longer has
       // (deleted and re-posted) must not be read as bearing on the replacement's settlement.
