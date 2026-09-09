@@ -1284,13 +1284,20 @@ async function readLiveRefundEvidence(
 /**
  * WOOCOMMERCE REFUNDS THAT ARRIVED AND COULD NOT BE RECORDED (o3d-y14 r7 finding 1).
  *
- * THE PREDICATE IS THE INDEX'S. `shopping_sync_logs_active_refund_park_uq` (migration
- * 20260721150000) is a partial unique index on exactly `connector = 'woocommerce' AND direction =
- * 'FROM_CONNECTOR' AND entityType = 'SalesOrder' AND status IN (PENDING, FAILED, QUARANTINED) AND
+ * THE PREDICATE IS THE INDEX'S. `shopping_sync_logs_active_refund_park_uq` is a partial unique
+ * index on exactly `connector = 'woocommerce' AND direction = 'FROM_CONNECTOR' AND entityType =
+ * 'SalesOrder' AND recordKind = 'WC_REFUND_PARK' AND status IN (PENDING, FAILED, QUARANTINED) AND
  * externalId IS NOT NULL AND entityId IS NOT NULL`, and `upsertRefundPark` matches it deliberately
  * "EXACTLY so this can never pick up an order-import failure log (same connector/type but no
  * entityId)". Copying that predicate rather than inventing a looser one is what keeps this from
  * counting an unrelated failed order import as a refund.
+ *
+ * THE `recordKind` CLAUSE ARRIVED LATE, AND IN THE INDEX LATEST OF ALL (o3d-272i r2). 20260721150000
+ * built the index a month before the column existed, so until 20260909090000 the DDL still said
+ * "any actionable WooCommerce sales-order row with both ids" — which is a held sales invoice too.
+ * The predicate above is now rendered from one object in lib/domain/sales/wc-sync-row-families.ts
+ * and the migration carries that rendered text, so this description cannot go stale again without a
+ * test saying so.
  *
  * WHY ALL THREE STATUSES, and not just QUARANTINED. Each means the refund is UNRESOLVED, and
  * unresolved is the whole point — the money left WooCommerce and IMS holds no refund row for it:
