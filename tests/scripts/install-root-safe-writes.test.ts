@@ -44,6 +44,10 @@ const INSTALL_SH = readFileSync(join(REPO, 'scripts/install.sh'), 'utf8')
  */
 const CUTOVER_NS_LIB = readFileSync(join(REPO, 'scripts/lib/cutover-namespace.sh'), 'utf8')
 const CUTOVER_NS_FUNCTIONS = new Set([
+  // o3d-ov60: and the tree copier, which had one definition in install.sh and two of the three
+  // clone paths that perform it. It moved here so update.sh's could reach it; the regressions
+  // below are unchanged except for where they lift it from.
+  'copy_tree_into_new_dir',
   'enter_service_subdir',
   'mkdir_service_subdir',
   'own_service_subdir',
@@ -235,6 +239,7 @@ const REAL = {
   stat: realBin('stat'),
   rm: realBin('rm'),
   mkdir: realBin('mkdir'),
+  mkfifo: realBin('mkfifo'),
   mv: realBin('mv'),
   ln: realBin('ln'),
   id: realBin('id'),
@@ -4623,6 +4628,265 @@ test('[o3d-czpy] copy_tree_into_new_dir refuses a name replaced, AFTER it was cr
   assert.equal(readFileSync(join(victim, 'config'), 'utf8'), 'UNTOUCHED\n',
     'and the git metadata must not be copied over the entries of the directory the link chose')
   assert.deepEqual(readdirSync(victim), ['config'], 'nor anything else be left in it')
+})
+
+// ---------------------------------------------------------------------------
+// SITE 8 AND SITE 5, IN THE OTHER ENTRYPOINT THAT PERFORMS THEM (o3d-ov60)
+//
+// o3d-czpy wrote copy_tree_into_new_dir() and gave it install.sh's two clone paths. update.sh has
+// a third, doing the identical thing to the identical name, and it kept the raw
+// `rm -rf` + `cp -a` pair; and its pre-migration backup directory was still created with a bare
+// `mkdir -p`, which accepts a symlink at its final component and returns 0. Both are measured
+// here the way every other site in this file is: the SHIPPED statement, lifted out of
+// scripts/update.sh by its own text, run by a real bash against a real planted symlink, with the
+// retired statement as the stated mutation.
+// ---------------------------------------------------------------------------
+
+const UPDATE_SH = readFileSync(join(REPO, 'scripts/update.sh'), 'utf8')
+
+/**
+ * A SHIPPED, CONTIGUOUS RUN OF TOP-LEVEL LINES OF scripts/update.sh, lifted by its own first and
+ * last line rather than retyped — the same rule shippedStatement() states for install.sh. A
+ * statement this file lifts by its text is not one it may find twice or not at all.
+ */
+function shippedUpdateBlock(firstLine: string, lastLine: string): string {
+  const lines = UPDATE_SH.split('\n')
+  const start = lines.indexOf(firstLine)
+  assert.notEqual(start, -1, `scripts/update.sh must contain the line ${JSON.stringify(firstLine)}`)
+  assert.equal(lines.lastIndexOf(firstLine), start,
+    `scripts/update.sh must contain exactly one line ${JSON.stringify(firstLine)}`)
+  const end = lines.indexOf(lastLine, start)
+  assert.notEqual(end, -1, `scripts/update.sh must close that block with ${JSON.stringify(lastLine)}`)
+  assert.equal(lines.lastIndexOf(lastLine), end,
+    `scripts/update.sh must contain exactly one line ${JSON.stringify(lastLine)}`)
+  return lines.slice(start, end + 1).join('\n')
+}
+
+const UPDATE_GIT_COPY = shippedUpdateBlock(
+  '    copy_tree_into_new_dir "${TMP_CLONE_WORKTREE}/.git" "${APP_DIR}/.git"',
+  '    copy_tree_into_new_dir "${TMP_CLONE_WORKTREE}/.git" "${APP_DIR}/.git"',
+)
+
+/** The two lines it replaced, which are the mutation. */
+const UPDATE_GIT_COPY_RETIRED = [
+  '    rm -rf "${APP_DIR}/.git"',
+  '    cp -a "${TMP_CLONE_WORKTREE}/.git" "${APP_DIR}/.git"',
+].join('\n')
+
+test('[o3d-ov60] update.sh copies the git metadata into a directory it created and pinned, never into a name', (t) => {
+  // The name update.sh removes and re-creates belongs to ${APP_USER}: `rm -rf` unlinks a symlink
+  // without following it, which is correct, and leaves the entry free to be re-created between the
+  // removal and the copy. This shim IS that window, made deterministic — it is the one the
+  // existing o3d-czpy regression above uses, because it is the only way to exhibit the race from
+  // outside the process.
+  const plant = (prefix: string) => {
+    const root = createTempDirSync(prefix, t)
+    const appDir = join(root, 'app')
+    const clone = join(root, 'clone')
+    const victim = join(root, 'victim')
+    mkdirSync(appDir)
+    mkdirSync(victim)
+    mkdirSync(join(clone, '.git'), { recursive: true })
+    writeFileSync(join(clone, '.git/HEAD'), 'ref: refs/heads/main\n')
+    writeFileSync(join(clone, '.git/config'), '[remote "origin"]\n')
+    const bin = shimDir(t, {
+      rm: `${REAL.rm} "$@"\nfor a in "$@"; do case "$a" in */.git) ${REAL.ln} -s ${q(victim)} "$a" ;; esac; done\nexit 0`,
+    })
+    return { appDir, clone, victim, bin }
+  }
+
+  const script = (site: string, p: ReturnType<typeof plant>) => rig(['copy_tree_into_new_dir'], [
+    `TMP_CLONE_WORKTREE=${q(p.clone)}`,
+    `APP_DIR=${q(p.appDir)}`,
+    site,
+    `echo ${REACHED}`,
+  ].join('\n'))
+
+  const shipped = plant('ims-ov60-git-')
+  const run = runBash(script(UPDATE_GIT_COPY, shipped), { env: { PATH: `${shipped.bin}:${process.env.PATH ?? ''}` } })
+
+  // NOT VACUOUS: the shim really did re-plant the link, so the shipped run met the finding.
+  assert.equal(lstatSync(join(shipped.appDir, '.git')).isSymbolicLink(), true,
+    'the destination name must have been re-taken by a link after the removal')
+  assert.equal(run.status, 1, `a name taken between the removal and the create must end the run: ${run.stdout} ${run.stderr}`)
+  assert.ok(!run.stdout.includes(REACHED), 'and nothing after it may execute')
+  assert.deepEqual(readdirSync(shipped.victim), [],
+    'and no git metadata may be copied into the directory the link chose')
+
+  // MEASURED BY MUTATION, ROUTE STATED: the two lines update.sh carried until this change, in
+  // place of the shipped call. `cp -a src dest` with `dest` a symlink-to-directory copies INTO the
+  // target, as root — which is the finding, executed.
+  const mutant = plant('ims-ov60-git-mutant-')
+  const mutated = runBash(script(UPDATE_GIT_COPY_RETIRED, mutant), { env: { PATH: `${mutant.bin}:${process.env.PATH ?? ''}` } })
+  assert.ok(mutated.stdout.includes(REACHED),
+    `the retired pair must run to completion: ${mutated.stdout} ${mutated.stderr}`)
+  assert.notDeepEqual(readdirSync(mutant.victim), [],
+    'and it must land the clone metadata inside the directory the link chose')
+})
+
+// ---------------------------------------------------------------------------
+// SITE 5 IS WITHDRAWN, AND THIS IS THE RECORD OF WHY (o3d-ov60 r4)
+//
+// Three rounds tried to make a root-side `pg_dump`, `mv` and `rm --` safe INSIDE a directory
+// ${APP_USER} may own, because `IMS_BACKUP_DIR` puts them there and nothing validates it. Each
+// round closed its finding by opening a worse one, and the third opened ARBITRARY CODE EXECUTION
+// AS ROOT. What ships now is the `mkdir -p` and the plain redirection that were here before the
+// branch — the status quo ante, which is a denial of service that has always been reachable
+// through that override and is not a regression.
+//
+//   r1  the symlink-proof walk, through the twin that RESTORES the working directory, after which
+//       the dump, the publication and the prune each re-resolved ${BACKUP_DIR} by name. The guard
+//       was not wrong, it was SPENT.
+//   r2  the walk's result kept and pinned as a descriptor, with `set -C` creating the partial.
+//       `set -C` is open(O_CREAT|O_EXCL) only until that open FAILS: bash re-opens WITHOUT O_EXCL
+//       for anything that is not a regular file, so a planted named pipe was OPENED, and an open
+//       of a FIFO with no reader BLOCKS — with the service stopped, cron stopped and the database
+//       connections fenced.
+//   r3  a node helper, scripts/lib/write-new-file.mjs, to name `O_EXCL|O_NONBLOCK` where a shell
+//       cannot. That is what the two tests below are about.
+//
+// AND THE WALK'S ANCHOR WAS NEVER SOUND EITHER. enter_service_subdir() treats its FIRST argument
+// as a trusted root — `mkdir -p`, `cd -P`, no checks — and its own refusal text says the walk
+// "only means anything for components below the directory the service account owns". r1 handed it
+// `${BACKUP_DIR%/*}`, which is a prefix of the untrusted override, so everything above the final
+// component was entered unvalidated. Constraining the override instead is o3d-noka; the
+// repository-wide helper-provenance design is o3d-kyqa.
+// ---------------------------------------------------------------------------
+
+test('[o3d-ov60 r4] the withdrawn backup helper is gone, and update.sh executes no program at its dump', () => {
+  /**
+   * THE SHAPE OF THIS GUARD IS scripts/lib/pin-source-file.mjs's, and for the same reason: an
+   * unused apparatus whose premise this round rejects is the clearest possible invitation to wire
+   * it back up. A COMMENT MAY NAME THE HELPER — the block carries the paragraph that says why it
+   * went, and a rule that forbade the word would delete the reasoning with the code. What may not
+   * survive is an executable reference: a resolution, or an invocation.
+   */
+  assert.equal(existsSync(join(REPO, 'scripts/lib/write-new-file.mjs')), false,
+    'scripts/lib/write-new-file.mjs made root execute bytes out of an ${APP_USER}-owned checkout '
+    + 'in the middle of a cutover; it is withdrawn, and an unused copy is an invitation to re-wire it')
+
+  const block = shippedUpdateBlock('  mkdir -p "${BACKUP_DIR}"', '  ls -t "${BACKUP_DIR}"/pre-update-*.sql.gz 2>/dev/null | tail -n +11 | xargs -r rm --')
+  const code = block.split('\n').filter((line) => !/^\s*#/.test(line)).join('\n')
+  assert.ok(!/\bnode\b/.test(code),
+    `update.sh's backup block must run no program resolved out of the checkout:\n${code}`)
+  assert.ok(!/BACKUP_WRITER|IMS_BACKUP_WRITER_HELPER/.test(UPDATE_SH),
+    'update.sh must not carry the resolution — or the override — for a helper that is gone')
+
+  // AND THE REASONING SURVIVES WITH THE CODE. Three rounds of findings are worth nothing if the
+  // next reader meets a bare `mkdir -p` and closes it again the same way. Lifted as its own
+  // contiguous region, so a paragraph moved away from the statement it explains fails this too.
+  const record = shippedUpdateBlock(
+    '  # THIS IS BACK TO `mkdir -p` AND A PLAIN REDIRECTION, AND THAT IS THE RESULT OF THE ROUND',
+    '  mkdir -p "${BACKUP_DIR}"',
+  )
+  for (const owed of ['o3d-noka', 'o3d-kyqa', 'ARBITRARY CODE EXECUTION AS ROOT']) {
+    assert.ok(record.includes(owed),
+      `the withdrawal must say ${owed} at the site, or it is a silent revert:\n${record}`)
+  }
+})
+
+test('[o3d-ov60 r4] THE WITHDRAWN SHAPE, EXERCISED: a helper replaced mid-cutover is EXECUTED, and the shipped block executes nothing', (t) => {
+  /**
+   * WHY THIS TEST EXISTS AT ALL, GIVEN THAT THE CODE IT INDICTS IS GONE.
+   *
+   * The finding is not "write-new-file.mjs was written badly" — it was not. It is that the
+   * documented update is `cd /opt/one-two-inventory && bash scripts/update.sh`, that install.sh
+   * and update.sh both `chown -R "${APP_USER}:${APP_USER}" "${APP_DIR}"`, and that a program
+   * resolved out of that checkout AT THE MIGRATION STEP is bytes the service account may replace
+   * AFTER the operator started a run they had reason to believe was clean. Any future round that
+   * reaches for a helper here re-opens it, so the mechanism is exhibited rather than described.
+   *
+   * WHAT IS PLANTED IS NOT A MUTATED HELPER. It is the file the ATTACKER writes: the shipped
+   * helper's bytes are irrelevant, because they are not the bytes that get executed.
+   *
+   * AND IT IS PLANTED THROUGH THE WINDOW THE SHIPPED SEQUENCE ITSELF MAKES. `info` is called
+   * between the directory's preparation and the dump in every version of this block, so the
+   * replacement happens at a point the code chose, not at a line this file spliced in. Nothing
+   * about the exhibition depends on the replacement PRECEDING the run.
+   */
+  const rig = (statement: string, extra: string[]) => {
+    const root = createTempDirSync('ims-ov60-r4-', t)
+    const backupDir = join(root, 'one-two-inventory')
+    mkdirSync(backupDir)
+    const lib = join(root, 'lib')
+    mkdirSync(lib)
+    // What the release shipped: a helper that does its job and nothing else.
+    const helper = join(lib, 'write-new-file.mjs')
+    writeFileSync(helper, 'process.stdin.pipe(process.stdout)\n')
+    // What ${APP_USER} replaces it with once the cutover is under way.
+    const owned = join(root, 'ROOT-CODE-EXECUTION')
+    const planted = `import { writeFileSync } from 'node:fs'\nwriteFileSync(${JSON.stringify(owned)}, String(process.getuid?.() ?? ''))\n`
+    return {
+      backupDir,
+      helper,
+      owned,
+      script: [
+        'set -uo pipefail',
+        'error() { printf "ERROR: %s\\n" "$*" >&2; }',
+        'die() { error "$*"; exit 1; }',
+        'MIGRATION_DATABASE_URL="postgresql://example/db"',
+        'pg_dump() { printf %s "DUMP-OF-$1"; }',
+        'gzip() { cat; }',
+        'success() { printf "SUCCESS: %s\\n" "$*"; }',
+        'pin_migration_window() { :; }',
+        // THE WINDOW, opened at the call site the shipped block already makes.
+        `info() { printf "INFO: %s\\n" "$*"; cat > ${q(helper)} <<'PLANTED'\n${planted}PLANTED\n}`,
+        `BACKUP_DIR=${q(backupDir)}`,
+        `BACKUP_TARGET="\${BACKUP_DIR}/${'pre-update-00000000-000000.sql.gz'}"`,
+        ...extra,
+        statement,
+        'echo REACHED_THE_WRITES',
+      ].join('\n'),
+    }
+  }
+
+  /**
+   * THE r3 STATEMENT, TYPED HERE BECAUSE IT IS IN NO SHIPPED FILE — which is what makes it a
+   * mutation and not a second reading of the subject. `${BACKUP_AT}` was `/proc/self/fd/N` on the
+   * proved directory; the directory itself is used here, because the finding is about WHICH
+   * PROGRAM RUNS and not about which directory it writes into.
+   */
+  const RETIRED_R3 = [
+    '  info "Backing up database to ${BACKUP_TARGET}..."',
+    '  backup_rc=0',
+    '  pg_dump "${MIGRATION_DATABASE_URL}" | gzip \\',
+    '    | node "${BACKUP_WRITER}" "${BACKUP_AT}" "${BACKUP_PARTIAL_BASE}" \\',
+    '    || { backup_rc=$?; rm -f -- "${BACKUP_AT}/${BACKUP_PARTIAL_BASE}"; }',
+  ].join('\n')
+
+  const mutant = rig(RETIRED_R3, [
+    'BACKUP_WRITER="${BACKUP_DIR}/../lib/write-new-file.mjs"',
+    'BACKUP_AT="${BACKUP_DIR}"',
+    'BACKUP_PARTIAL_BASE="pre-update-00000000-000000.sql.gz.part"',
+  ])
+  // NOT VACUOUS, ESTABLISHED BEFORE THE CLAIM: the marker is absent, and the helper on disk is the
+  // benign one, at the instant the run starts.
+  assert.equal(existsSync(mutant.owned), false, 'precondition: nothing has been executed yet')
+  assert.equal(readFileSync(mutant.helper, 'utf8').includes('ROOT-CODE-EXECUTION'), false,
+    'precondition: the release\'s own helper must be what is on disk when the run begins')
+  const ran = runBash(mutant.script)
+  assert.match(ran.stdout, /^INFO: /m, `precondition: the window must have been reached: ${ran.stdout} ${ran.stderr}`)
+  assert.equal(existsSync(mutant.owned), true,
+    'THE FINDING: the bytes ${APP_USER} put at the helper\'s path AFTER the run started were '
+    + `executed by the account running the cutover: ${ran.stdout} ${ran.stderr}`)
+  assert.equal(readFileSync(mutant.owned, 'utf8'), String(process.getuid?.() ?? ''),
+    'and they ran as that account — root, on a host, where this harness is unprivileged')
+
+  // THE SHIPPED BLOCK, through the same rig and the same window. It resolves no program, so the
+  // same plant reaches nothing: the redirection is performed by the bash that is already running.
+  const shipped = rig(
+    shippedUpdateBlock('  mkdir -p "${BACKUP_DIR}"', '  ls -t "${BACKUP_DIR}"/pre-update-*.sql.gz 2>/dev/null | tail -n +11 | xargs -r rm --'),
+    [],
+  )
+  assert.equal(existsSync(shipped.owned), false, 'precondition: nothing has been executed yet')
+  const clean = runBash(shipped.script)
+  assert.match(clean.stdout, /^INFO: /m, `precondition: the same window must have been reached: ${clean.stdout} ${clean.stderr}`)
+  assert.ok(clean.stdout.includes('REACHED_THE_WRITES'),
+    `and the shipped block must still take its backup: ${clean.stdout} ${clean.stderr}`)
+  assert.equal(readFileSync(shipped.helper, 'utf8').includes('ROOT-CODE-EXECUTION'), true,
+    'the plant must still have happened, or the comparison is between two different runs')
+  assert.equal(existsSync(shipped.owned), false,
+    'and the shipped block must execute nothing that was planted: it names no program to run')
 })
 
 // ---------------------------------------------------------------------------

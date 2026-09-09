@@ -3315,6 +3315,37 @@ written to a `.part` file and renamed on completion; if it fails, the partial fi
 the failure banner says there is no restore point for this run rather than naming a truncated
 file as one.
 
+**`IMS_BACKUP_DIR` is not validated, and three rounds of trying to make that harmless were
+withdrawn rather than shipped** (o3d-ov60, o3d-noka). The dump, the rename that publishes it and
+the `rm --` that prunes beside it are all done **by root, through the pathname this variable
+names**. Under the shipped default that is unreachable — `/var/backups` has a root-owned parent, so
+nothing but root can plant or rename anything on the way to it. Point `IMS_BACKUP_DIR` underneath a
+directory the **service account** owns and it becomes reachable: `mkdir -p` accepts a
+symlink-to-directory at its final component and returns 0, and `pre-update-<stamp>.sql.gz.part` is a
+predictable name that account may plant a named pipe at, which makes root's `gzip >` block
+indefinitely with the service stopped, cron stopped and the database connections already fenced.
+
+**Until `o3d-noka` lands, treat this as an operator constraint rather than a defended path: point
+`IMS_BACKUP_DIR` only at a directory whose whole ancestry is root-owned and writable by nobody
+else, and bind-mount a backup volume under such a path rather than symlinking one.** Note that
+`APP_DIR/.env` carries a *different* variable also spelled `BACKUP_DIR` — that one is the
+application's own upload/backup area under the state directory, it is owned by the service account
+by design, and it is **not** a valid value for `IMS_BACKUP_DIR`.
+
+What was tried and withdrawn, so that nobody re-attempts it: a symlink-proof walk anchored at the
+override's own parent directory (it validates only the final component, because the walk treats its
+first argument as a *trusted root* — that is its documented contract); and a `node` helper that
+opened the partial with `O_CREAT|O_EXCL|O_NOFOLLOW|O_NONBLOCK` to turn the planted-pipe hang into a
+refusal. The helper closed the hang and **opened arbitrary code execution as root**: the documented
+update runs `scripts/update.sh` out of `/opt/one-two-inventory`, which is `chown -R`ed to the
+service account, so a file resolved from that checkout *in the middle of the cutover* is bytes that
+account can replace after the operator started the run. The three libraries this script `source`s
+at startup are not the same case — they are read in the same instant as the entrypoint's own body,
+so they add no window the entrypoint does not already have — and pinning the helper would only move
+the boundary to a script read from the same checkout. `scripts/lib/pin-source-file.mjs` was built
+for exactly that and deleted for exactly that reason. The same late-read shape already ships twice,
+in `install.sh`'s `chown_state_tree()` and its auth probe; that is `o3d-kyqa`.
+
 Never run two versions of IMS against the same database at once — no rolling restart, no
 blue/green overlap, no second instance left running on another port.
 
