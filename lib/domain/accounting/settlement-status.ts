@@ -179,6 +179,21 @@ export type SettlementStatus =
    */
   | 'ASSERTED_UNVERIFIED'
   /**
+   * o3d-f709 r2 — THE ROW WAS RETIRED AND IT STILL NAMES A PAYMENT NOTHING HAS ACCOUNTED FOR.
+   *
+   * A CANCELLED registration that carries a document id the cancellation itself does not explain:
+   * `cancelOrphanedRowsUnderLock` retires a PENDING row as "pre-call" on the strength of that
+   * status alone, and a POSTED row sits at PENDING whenever follow-up work has failed, KEEPING the
+   * id the ledger issued. So the payment is very probably standing in the ledger — and nothing will
+   * ever chase it, because the row that would have is retired.
+   *
+   * NOT `NOT_SENT`, which is the claim that the ledger was never told and is the inverse of what the
+   * id says. NOT `SETTLED`, because no call was read back and no amount was ever compared. NOT
+   * `ASSERTED_UNVERIFIED`, which is a HUMAN's unverified claim: here nobody claimed anything, the
+   * ledger issued the id, and the basis says so.
+   */
+  | 'LEDGER_UNRESOLVED'
+  /**
    * o3d-r948 r2 — THE ROW STATES A SETTLED FIGURE AND IMS WILL NOT READ IT.
    *
    * Its exact decimal string does not parse, or it is stated in a currency that is not this
@@ -543,7 +558,7 @@ export function settlementStatus(input: {
           `registering another payment.`,
         basis: 'NONE',
       }
-    case 'CANCELLED':
+    case 'CANCELLED': {
       // A CANCELLED ROW THAT NAMES A DOCUMENT IS NOT "NEVER SENT" (o3d-anu8).
       //
       // `buildCancelledSaleSettlementData` writes CANCELLED **with** the operator's typed document
@@ -551,16 +566,52 @@ export function settlementStatus(input: {
       // carries a cancelled sale's remaining work any further. Telling the operator "the ledger was
       // never told" over one of those is the exact inverse of what was asserted, and it is the
       // sentence that talks somebody into registering the payment a second time.
-      if (assertedPost && p.externalTransactionId) {
+      //
+      // AND THE QUESTION IS PUT TO THE SHARED CLASSIFIER, NOT ANSWERED AGAIN HERE (o3d-f709 r2,
+      // Codex HIGH). This branch used to weigh `settlementBasis` ALONE — it recognised the operator's
+      // typed id and nothing else — so the THIRD writer of a CANCELLED-plus-a-document-id row fell
+      // straight through to NOT_SENT: `cancelOrphanedRowsUnderLock` retires a PENDING row claiming
+      // it was pre-call, a POSTED row sits at PENDING whenever follow-up work failed and KEEPS the
+      // id the ledger issued, and the sweep does not clear it. "The ledger was never told" over one
+      // of those is the same inversion in a second dress, on a row `deletePayment` refuses to touch
+      // for exactly the opposite reason. Four separate readers of this one fact have now been wrong
+      // about it; `registrationLedgerStanding` is where it is decided, and the branch above (the
+      // not-paid-locally one) has read it since o3d-nf9i r3.
+      //
+      // THE STANDING IS ASKED FIRST AND IT IS WHAT DECIDES, so no row the classifier declines to
+      // call NOTHING can reach the NOT_SENT sentence, whatever a later hand adds to this switch.
+      const standing = registrationLedgerStanding(p)
+      if (standing !== 'NOTHING') {
+        // TWO ROWS, ONE STANDING, AND THE DIFFERENCE IS WHOSE ID IT IS. Both carry a document id the
+        // cancellation does not account for; the operator's was typed in and the sweep's was issued
+        // by the ledger. The instruction is the same — go and look before registering anything else
+        // — and the basis is not, which is the whole reason a verdict carries one.
+        if (assertedPost) {
+          return {
+            status: 'ASSERTED_UNVERIFIED',
+            discrepancy: true,
+            basis: 'OPERATOR_ASSERTION',
+            detail:
+              `An operator recorded this as posted in the ledger (payment ${p.externalTransactionId}) and the row was ` +
+              'then retired, so nothing here will chase it. IMS never made the call, never read the document and never ' +
+              'compared the amount. Open that payment in the accounting system and confirm it before registering ' +
+              'anything else against this document.',
+          }
+        }
         return {
-          status: 'ASSERTED_UNVERIFIED',
+          status: 'LEDGER_UNRESOLVED',
           discrepancy: true,
-          basis: 'OPERATOR_ASSERTION',
+          // LEDGER_CONFIRMED, and deliberately the same basis the not-paid-locally branch gives
+          // this identical row: the id was issued by the ledger, which is a different and stronger
+          // thing than a human typing one in. What is unconfirmed is the SETTLEMENT, and that is
+          // what the status carries.
+          basis: 'LEDGER_CONFIRMED',
           detail:
-            `An operator recorded this as posted in the ledger (payment ${p.externalTransactionId}) and the row was ` +
-            'then retired, so nothing here will chase it. IMS never made the call, never read the document and never ' +
-            'compared the amount. Open that payment in the accounting system and confirm it before registering ' +
-            'anything else against this document.',
+            `The payment sync row was retired as if nothing had been sent, but it still names ledger payment `
+            + `${p.externalTransactionId} — an id only a real call returns. A posted payment is put back to `
+            + `PENDING whenever follow-up work fails, and the orphan sweep then retires it without clearing `
+            + `that id, so nothing here will chase it. Open that payment in the accounting system and confirm `
+            + `it before registering anything else against this document.`,
         }
       }
       return {
@@ -576,6 +627,7 @@ export function settlementStatus(input: {
             : ''),
         basis: assertedPost ? 'OPERATOR_ASSERTION' : 'NONE',
       }
+    }
   }
 }
 

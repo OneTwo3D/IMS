@@ -1173,6 +1173,9 @@ export function SoDetailClient({ order: so, warehouses, currencies, externalOrde
     // o3d-nf9i r3: an operator's assertion is not the ledger's word. Shown as its own state so the
     // badge never reads the same as a confirmed settlement.
     : settlement.status === 'ASSERTED_UNVERIFIED' ? ' · ASSERTED, NOT VERIFIED'
+    // o3d-f709 r2: the registration was retired as if nothing had been sent and it still names the
+    // payment the ledger issued. Not "not sent" — that is the inverse of what the id says.
+    : settlement.status === 'LEDGER_UNRESOLVED' ? ' · RETIRED, PAYMENT UNRESOLVED'
     // o3d-r948 r2: the ledger took the payment, and IMS cannot read what its own registration says
     // that payment settled — so no amount has been compared. Not "part paid" (nothing measured a
     // shortfall) and emphatically not a plain green "Paid".
