@@ -160,6 +160,16 @@ export const WC_REFUND_PARK_RECOVERED_ACTION = 'wc_refund_park_recovered'
  * (`activeRefundParkIndexPredicateSql`); migration 20260909090000 carries that rendered text, and
  * two tests hold the three spellings together — one comparing the file against the renderer, one
  * executing the SHIPPED index predicate against this `where` over a probe matrix.
+ *
+ * NARROW IT. DO NOT NEGATE IT (o3d-272i r3, Codex MEDIUM). Every reader below spreads this and adds
+ * clauses, which is safe. `{ NOT: activeRefundParkWhere() }` would NOT be: Prisma compiles it to a
+ * SQL negation of the whole conjunction, `recordKind` is a nullable column, and an UNSTAMPED row
+ * therefore answers UNKNOWN to the predicate AND UNKNOWN to its negation — it appears in neither
+ * result, so the "complement" is quietly the complement minus the unstamped rows. Nothing here can
+ * prevent that from inside the returned object (the `where` language has no COALESCE and `NOT`
+ * wraps whatever it is given), so scripts/check-wc-sync-row-predicates.mjs refuses the negation at
+ * build time. Where a genuine complement is needed, `unresolvedWcOrderRowSql()` renders a TOTAL
+ * fragment for exactly this reason.
  */
 export function activeRefundParkWhere(): {
   connector: string

@@ -179,6 +179,21 @@ function sqlLiteral(value: string): string {
  *
  * The enum columns take unquoted literals (`direction`, `status`): Postgres resolves an
  * unknown-typed literal against the column's type, exactly as the predecessor index did.
+ *
+ * AND IT IS NOT WRAPPED IN A COALESCE, UNLIKE {@link unresolvedWcOrderRowSql} (o3d-272i r3). The
+ * same nullable column is compared here — `"recordKind" = '...'` is UNKNOWN for an unstamped row —
+ * but this string is read in ONE position and only ever positively. A PostgreSQL partial index
+ * covers the rows its predicate says TRUE about, so UNKNOWN excludes, which is precisely the
+ * intended answer and the same one `activeRefundParkWhere()` gives. The application-side reader
+ * (tests/concurrency/refund-park-index-family-scope.concurrent.test.ts) executes it as
+ * `AND (predicate)`, also positively.
+ *
+ * SO THE TOTALITY WOULD BUY NOTHING HERE AND WOULD COST A MIGRATION: this text is carried character
+ * for character by 20260909090000, which is applied and checksummed, so changing it means REBUILDING
+ * A SHIPPED UNIQUE INDEX to alter a reading nothing performs. What is written down instead is the
+ * rule: if a reader ever needs this predicate's COMPLEMENT, it must not be spelled `NOT (...)` over
+ * this string — an unstamped row would fall out of both halves — and the fix at that point is to
+ * wrap it, in a migration, deliberately.
  */
 export function activeRefundParkIndexPredicateSql(): string {
   return [
