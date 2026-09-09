@@ -19,6 +19,7 @@ import { type TestContext, test } from 'node:test'
 import pg from 'pg'
 import { parse as driverParse } from 'pg-connection-string'
 
+
 /** The final connection configuration, built exactly as `pg` builds it and never opened. */
 function driverConnection(connectionString: string) {
   const client = new pg.Client({ connectionString })
@@ -3991,18 +3992,35 @@ test('o3d-2sm1.5 r20: a percent-escaped query KEY is refused, because the driver
 })
 
 /**
- * The bus reader and the question it answers, lifted out of the shipped script and run by bash.
+ * The bus reader and the question it answers, lifted out of the shipped LIBRARY and run by bash.
  *
- * From the first helper to the end of the function, so a mutation anywhere in the mechanism —
+ * From the first helper to the end of the wrapper, so a mutation anywhere in the mechanism —
  * the tokenizer, the arity check, the name match or any refusal — reaches this test.
+ *
+ * o3d-rret: THERE IS ONE PLACE TO LIFT IT FROM NOW. This used to take the entrypoint's name and cut
+ * the slab out of scripts/<name>.sh, because each of the three carried its own copy — and the
+ * copies were not the same: deploy.sh's was still the un-parameterised r20 form while update.sh's
+ * and install.sh's had been generalised, and the two generalised ones did not even share a
+ * signature. Running the same fixtures against three bodies is not proof that they agree; it is
+ * three separate proofs that each of them, separately, does something. The bodies are one body now,
+ * and SOLE_SOURCE_DEFINER is the file that holds it. That the entrypoints hold none of it is
+ * asserted below, in the r20 test.
  */
-function liftSoleSource(script: 'deploy.sh' | 'update.sh' | 'install.sh'): string {
-  const source = readFileSync(join(process.cwd(), `scripts/${script}`), 'utf8')
+const SOLE_SOURCE_DEFINER = 'scripts/lib/unit-environment.sh'
+
+function liftSoleSource(): string {
+  const source = readFileSync(join(process.cwd(), SOLE_SOURCE_DEFINER), 'utf8')
   const start = source.indexOf('bus_read_strings() {')
   const main = source.indexOf('env_file_is_sole_database_url_source() {')
-  assert.ok(start > 0 && main > start, `${script}: precondition — the question is asked by the shipped script`)
-  const terminator = '\n  return 0\n}\n'
-  return source.slice(start, source.indexOf(terminator, main) + terminator.length)
+  assert.ok(start > 0 && main > start, `${SOLE_SOURCE_DEFINER}: precondition — the question is asked by the shipped library`)
+  // TO THE END OF THE WRAPPER, and no further. This used to run to the next `\n  return 0\n}\n`
+  // after it, which in an entrypoint landed inside some LATER function; in the library the wrapper
+  // ends `return "$rc"` and there is no such terminator after it at all. The close of the wrapper
+  // is the honest end of the mechanism, and the preconditions at every call site check that the
+  // whole of it came across.
+  const end = source.indexOf('\n}\n', main)
+  assert.ok(end > main, `${SOLE_SOURCE_DEFINER}: precondition — the wrapper closes at a } in column 0`)
+  return source.slice(start, end + 3)
 }
 
 /**
@@ -4141,8 +4159,8 @@ test('o3d-2sm1.5 r21: a unit that can define DATABASE_URL anywhere but that file
     )
     chmodSync(join(dir, 'busctl'), 0o755)
 
-    for (const script of ['deploy.sh', 'update.sh'] as const) {
-      const lifted = liftSoleSource(script)
+    for (const script of [SOLE_SOURCE_DEFINER] as const) {
+      const lifted = liftSoleSource()
       // PRECONDITION: the whole mechanism was lifted, so a mutation to the shipped script really
       // does reach this test.
       assert.ok(lifted.includes('PAMName'), `${script}: the lifted reader asks about PAMName`)
@@ -4198,6 +4216,100 @@ test('o3d-2sm1.5 r21: a unit that can define DATABASE_URL anywhere but that file
   }
 })
 
+test('[o3d-rret] each entrypoint\'s own call site reaches the one definition, and refuses through it', () => {
+  // THE PORT, PROVED FROM THE CALLER RATHER THAN FROM THE FUNCTION (o3d-rret).
+  //
+  // The test above lifts the scan out of the library and runs it. That says the LIBRARY is right;
+  // it says nothing about whether deploy.sh reaches it, and "deploy.sh reaches it" is the whole of
+  // this round — deploy.sh had its own transcription of the scan for four rounds while every rig
+  // that ran it ran deploy.sh's copy and passed. So this one runs the SHIPPED LIBRARY FILE, sourced
+  // the way the entrypoints source it, with each entrypoint's OWN require_env_file_is_sole_definition
+  // lifted on top of it and its OWN globals supplied — ${APP_DIR_REAL} and a SERVICE_UNITS array in
+  // deploy.sh, ${APP_DIR} and a scalar SERVICE_UNIT in update.sh, ${APP_NAME}.service in install.sh.
+  // Nothing is re-typed and no slab is cut: a `source` of the file on disk.
+  //
+  // MUTATION ROUTES (each run, each red on exactly what it names, then reverted):
+  //   * delete the `-n "$pam_name"` refusal from the library     -> all three report SOLE for the
+  //     PAMName fixture, so all three really are asking through this one body;
+  //   * change deploy.sh's call site to pass a literal unit name instead of "${SERVICE_UNITS[@]:-}"
+  //     -> deploy.sh's REFUSE stops naming the unit the caller asked about.
+  const dir = mkdtempSync(join(tmpdir(), 'ims-rret-caller-'))
+  try {
+    writeFileSync(
+      join(dir, 'busctl'),
+      [
+        '#!/usr/bin/env bash',
+        'if [[ "$1" == "call" ]]; then printf \'o "/org/freedesktop/systemd1/unit/fake_2eservice"\\n\'; exit 0; fi',
+        '[[ "$1" == "get-property" ]] || exit 1',
+        'name="FAKE_$5"',
+        '[[ -n "${!name+set}" ]] || exit 1',
+        'printf \'%s\\n\' "${!name}"',
+        '',
+      ].join('\n'),
+    )
+    chmodSync(join(dir, 'busctl'), 0o755)
+
+    // Each entrypoint's own spelling of "which unit, and which file", taken from the shipped
+    // require_env_file_is_sole_definition() rather than restated here.
+    const entrypoints = [
+      ['deploy.sh', ['APP_DIR_REAL="/opt/app"', 'SERVICE_UNITS=("one-two-inventory.service")']],
+      ['update.sh', ['APP_DIR="/opt/app"', 'SERVICE_UNIT="one-two-inventory.service"']],
+      ['install.sh', ['APP_DIR="/opt/app"', 'APP_NAME="one-two-inventory"']],
+    ] as const
+
+    for (const [script, globals] of entrypoints) {
+      const source = readFileSync(join(process.cwd(), `scripts/${script}`), 'utf8')
+      const caller = shellFunction(source, 'require_env_file_is_sole_definition')
+      // PRECONDITION: it really is the shipped caller, and it really does go through the wrapper.
+      assert.match(caller, /env_file_is_sole_database_url_source /, `${script}: the lifted caller asks the shared question`)
+
+      function ask(unit: SystemdUnit): string {
+        const program = [
+          'set -uo pipefail',
+          `source "${join(process.cwd(), SOLE_SOURCE_DEFINER)}"`,
+          'DB_IDENTITY_SOURCE_REASON=""',
+          'DB_ENV_SNAPSHOT_FILE="/etc/ims-cutover/db-identity-snapshot.env"',
+          'DB_ENV_SNAPSHOT_DROPIN_NAME="zz-deploy-db-identity.conf"',
+          'DB_ENV_SNAPSHOT_PUBLISHED=false',
+          ...globals,
+          caller,
+          'if require_env_file_is_sole_definition; then printf "SOLE\\n"; else printf "REFUSE %s\\n" "$DB_IDENTITY_SOURCE_REASON"; fi',
+        ].join('\n')
+        const env: NodeJS.ProcessEnv = { ...process.env, PATH: `${dir}:${process.env.PATH ?? ''}` }
+        for (const [key, value] of Object.entries({ ...SOLE_UNIT, ...unit })) env[`FAKE_${key}`] = value
+        const run = spawnSync('bash', ['-c', program], { encoding: 'utf8', env })
+        assert.equal(run.status, 0, `${script}: ${run.stderr}`)
+        return (run.stdout ?? '').trim()
+      }
+
+      // THE ORDINARY ANSWER, without which every refusal below is vacuous: the unit loads that one
+      // file and nothing else defines the variable.
+      assert.equal(ask({}), 'SOLE', `${script}: a unit that loads only ${'${APP_DIR}'}/.env must pass`)
+
+      // AND EACH REFUSAL, THROUGH THE SAME BODY. These are the arms deploy.sh's copy also had; what
+      // is new is that all three now get them from one place, so a later round cannot fix two.
+      for (const [label, unit, refusal] of [
+        ['an Environment= directive', { Environment: 'as 1 "DATABASE_URL=postgresql://app:pw@elsewhere:5432/other"' }, /sets DATABASE_URL in its own Environment=/],
+        ['PassEnvironment=', { PassEnvironment: 'as 1 "DATABASE_URL"' }, /lists DATABASE_URL in PassEnvironment=/],
+        ['UnsetEnvironment=', { UnsetEnvironment: 'as 1 "DATABASE_URL"' }, /lists DATABASE_URL in UnsetEnvironment=/],
+        ['a PAM stack', { PAMName: 's "login"' }, /sets PAMName=login/],
+        ['a second environment file', { EnvironmentFiles: 'a(sb) 2 "/opt/app/.env" true "/etc/other.env" false' }, /loads a second environment file/],
+        ['no environment file at all', { EnvironmentFiles: 'a(sb) 0' }, /does not load \/opt\/app\/\.env with EnvironmentFile=/],
+        ['a unit systemd does not have', { LoadState: 's "not-found"' }, /rather than loaded/],
+      ] as ReadonlyArray<[string, SystemdUnit, RegExp]>) {
+        const answer = ask(unit)
+        assert.match(answer, /^REFUSE /, `${script}: ${label} must be refused:\n${answer}`)
+        assert.match(answer, refusal, `${script}: ${label} — and the refusal must name it:\n${answer}`)
+        // AND IT NAMES THE UNIT THE CALLER ASKED ABOUT, which is what says the caller's own
+        // spelling of ${'${SERVICE_UNITS[@]}'} / ${'${SERVICE_UNIT}'} / ${'${APP_NAME}.service'} really reached it.
+        assert.match(answer, /one-two-inventory\.service/, `${script}: ${label} — about the caller's own unit:\n${answer}`)
+      }
+    }
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
 test('o3d-2sm1.5 r20: every fence path asks it, and the installer is still exempt', () => {
   // The question is only worth asking where it gates something. This is the other half of the
   // test above: that the shipped entrypoints actually put it in front of the fence, the
@@ -4228,14 +4340,25 @@ test('o3d-2sm1.5 r20: every fence path asks it, and the installer is still exemp
     assert.ok(identity >= 3, `${name}: precondition — the identity is required at more than one place (${identity})`)
     assert.equal(sole, identity, `${name}: and its source is questioned at every one of them (${sole} of ${identity})`)
 
-    // It asks systemd, and it asks about the one variable.
-    // It asks SYSTEMD's own bus, and it asks about every property that can carry the variable —
-    // PAMName included, which is the environment source the five-property text query omitted.
-    assert.match(source, /busctl get-property org\.freedesktop\.systemd1/, `${name}: asks systemd over its bus`)
-    assert.match(source, /for property in Environment PassEnvironment UnsetEnvironment/, `${name}: scans all three lists the same way`)
-    assert.match(source, /bus_unit_property "\$object" Service PAMName/, `${name}: and asks about PAMName`)
+    // AND IT ASKS THE ONE MECHANISM RATHER THAN A COPY OF IT (o3d-rret). Until this round each
+    // entrypoint answered the question with its own transcription of the scan, so this test asked
+    // each of them, separately, whether it had transcribed the right things — which is the check
+    // that let deploy.sh sit a round behind for as long as it did. The property assertions moved
+    // to the library below; what is asked HERE is that this file no longer answers the question
+    // itself. MUTATION: paste bus_unit_property() back into scripts/deploy.sh and this fails.
     assert.ok(!source.includes('systemctl show -p Environment'), `${name}: and no longer parses systemctl's text rendering for it`)
+    assert.ok(!/^bus_unit_property\(\) \{$/m.test(source), `${name} must not carry its own bus reader — that is the shape of this finding`)
+    assert.ok(!/^unit_env_var_sole_source\(\) \{$/m.test(source), `${name} must not carry its own copy of the scan`)
+    assert.match(source, /source "\$\{IMS_SCRIPT_LIB_DIR\}\/unit-environment\.sh"/, `${name} must source the one definition, from its own release`)
   }
+
+  // IT ASKS SYSTEMD'S OWN BUS, and about every property that can carry the variable — PAMName
+  // included, which is the environment source the five-property text query omitted. Asked ONCE,
+  // of the file that defines the scan.
+  const lib = readFileSync(join(process.cwd(), SOLE_SOURCE_DEFINER), 'utf8')
+  assert.match(lib, /busctl get-property org\.freedesktop\.systemd1/, `${SOLE_SOURCE_DEFINER}: asks systemd over its bus`)
+  assert.match(lib, /for property in Environment PassEnvironment UnsetEnvironment/, `${SOLE_SOURCE_DEFINER}: scans all three lists the same way`)
+  assert.match(lib, /bus_unit_property "\$object" Service PAMName/, `${SOLE_SOURCE_DEFINER}: and asks about PAMName`)
 
   // THE INSTALLER WAS EXEMPT UNTIL ROUND 23, AND IS NOT ANY MORE (Codex HIGH). The exemption's
   // reasoning was that it prompts for DB_HOST/DB_PORT/DB_NAME/DB_USER, composes DATABASE_URL out
@@ -4255,7 +4378,8 @@ test('o3d-2sm1.5 r20: every fence path asks it, and the installer is still exemp
     1,
     'install.sh gates its start on the composed unit, once, after its final daemon-reload',
   )
-  assert.match(install, /busctl get-property org\.freedesktop\.systemd1/, 'install.sh: over the bus, like the other two')
+  assert.ok(!/^unit_env_var_sole_source\(\) \{$/m.test(install), 'install.sh must not carry its own copy of the scan either')
+  assert.match(install, /source "\$\{IMS_SCRIPT_LIB_DIR\}\/unit-environment\.sh"/, 'install.sh: over the bus, like the other two, and through the one definition')
 })
 
 /**
@@ -4547,8 +4671,8 @@ test('o3d-2sm1.5 r23: the loaded unit must name THIS run\'s snapshot, last and m
     )
     chmodSync(join(dir, 'busctl'), 0o755)
 
-    for (const script of ['deploy.sh', 'update.sh', 'install.sh'] as const) {
-      const lifted = liftSoleSource(script)
+    for (const script of [SOLE_SOURCE_DEFINER] as const) {
+      const lifted = liftSoleSource()
       // PRECONDITION: the r23 half really was lifted, so a mutation to the shipped script reaches
       // this test rather than a stale copy of an older function.
       assert.ok(lifted.includes('bus_read_env_ignore_flags'), `${script}: the lifted reader reads the ignore_errors flags`)
