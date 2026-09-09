@@ -31,6 +31,7 @@
  * settings change between hold and release cannot quietly alter what posts.
  */
 
+import { HELD_SALES_INVOICE_RECORD_KIND } from '@/lib/domain/sales/wc-sync-row-families'
 import type { Prisma } from '@/app/generated/prisma/client'
 import { PRIOR_ATTEMPT_COUNTERPART_EXISTS_OR } from '@/lib/domain/accounting/prior-posting-evidence'
 
@@ -53,8 +54,12 @@ export const MISSING_INVOICE_NUMBER_QUEUE_REASON = 'missing_wc_invoice_number'
  * text a human types when issuing it. So an operator who wrote `missing_wc_invoice_number` had
  * their park silently overwritten with an invoice payload, or its own error text replaced. That is
  * the o3d-xnwu r7 defect with the destination and the source swapped.
+ *
+ * DEFINED IN lib/domain/sales/wc-sync-row-families.ts (o3d-272i) and re-exported here, beside the
+ * refund park's own stamp and the union predicate the delete guard, the store-rebind guard and the
+ * retention exemption all need. Importers are unaffected; there is still exactly one of this value.
  */
-export const HELD_SALES_INVOICE_RECORD_KIND = 'WC_HELD_SALES_INVOICE'
+export { HELD_SALES_INVOICE_RECORD_KIND } from '@/lib/domain/sales/wc-sync-row-families'
 
 /**
  * THE THREE SENTENCES THE RELEASE SWEEP SETTLES A HOLD WITH (o3d-xnwu r9, Codex MEDIUM).

@@ -9,10 +9,8 @@ import {
 } from '@/lib/domain/accounting/back-reference-sweep'
 import { followUpObligationsOwedBy } from '@/lib/domain/accounting/compacted-followup-loss'
 import { POSTABLE_ACCOUNTING_SYNC_STATUSES } from '@/lib/domain/accounting/postable-sync-statuses'
-import {
-  RECOVERABLE_REFUND_PARK_STATUSES,
-  WC_REFUND_PARK_RECOVERED_ACTION,
-} from '@/lib/domain/sales/refund-park-recovery'
+import { WC_REFUND_PARK_RECOVERED_ACTION } from '@/lib/domain/sales/refund-park-recovery'
+import { unresolvedWcOrderRowSql } from '@/lib/domain/sales/wc-sync-row-families'
 import { EXTERNAL_DOCUMENT_EVIDENCE_WHERE } from '@/lib/domain/accounting/external-document-evidence'
 import { REMOTE_MONEY_EVIDENCE_TYPES } from '@/lib/domain/accounting/remote-money-evidence'
 import { UNRESOLVED_ABANDONED_CLAIM_WHERE } from '@/lib/domain/accounting/unresolved-abandoned-claim'
@@ -208,13 +206,14 @@ export async function purgeExpiredData(): Promise<{
         WITH deleted AS (
           DELETE FROM "shopping_sync_logs"
            WHERE "createdAt" < ${cutoff}
-             AND NOT (
-                   connector = 'woocommerce'
-               AND direction = 'FROM_CONNECTOR'::"ShoppingSyncDirection"
-               AND "entityType" = 'SalesOrder'
-               AND status = ANY(${[...RECOVERABLE_REFUND_PARK_STATUSES]}::"ShoppingSyncStatus"[])
-               AND "entityId" IS NOT NULL
-             )
+             -- o3d-272i: the exemption is the SHARED predicate, rendered as SQL by the module that
+             -- also renders the Prisma one, not a hand-written fourth copy of it standing beside a
+             -- helper it cannot call. It keeps exactly the set it kept before — an unresolved
+             -- WooCommerce row that names an IMS order, refund park or held sales invoice — and now
+             -- says so by asking the row's own recordKind column, so a family added to this table
+             -- later
+             -- has to claim the exemption rather than inherit it.
+             AND NOT (${unresolvedWcOrderRowSql()})
              AND NOT EXISTS (
                    SELECT 1
                      FROM "activity_logs"

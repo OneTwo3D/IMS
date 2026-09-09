@@ -103,6 +103,7 @@ import { addMoney, roundQuantity, toDecimal, type DecimalInput } from '@/lib/dom
 import { POSTABLE_ACCOUNTING_SYNC_STATUSES } from '@/lib/domain/accounting/postable-sync-statuses'
 import { liveDailyBatchDeferralWhere } from '@/lib/domain/accounting/daily-batch-discount-fence'
 import { buildDiscountRestatement } from '@/lib/domain/accounting/discount-restatement'
+import { activeRefundParkWhere } from '@/lib/domain/sales/refund-park-recovery'
 
 import { resolveWcOrderLevelDiscount } from './field-mapping'
 import { readPostedInvoiceOrderDiscount } from '@/lib/domain/accounting/posted-order-discount'
@@ -1317,12 +1318,25 @@ export async function readWcCouponRefundParks(
 /**
  * The park predicate, shared by the report (which reads them in bulk) and the apply-time read above,
  * so the reviewer is shown the same set apply compares against.
+ *
+ * IT IS `activeRefundParkWhere`, NOT A COPY OF IT (o3d-272i). This used to be a hand-written
+ * five-clause predicate with no `recordKind`, and it was the one of the four copies that was simply
+ * WRONG: a held sales invoice (o3d-k26m.6) writes the same connector, direction, `SalesOrder` and an
+ * actionable status, so it was counted here as unresolved REFUND evidence. That evidence is what
+ * `wcCouponCorrectionNeedsLedgerAdjustment` classifies the handoff on, so an order with no refund at
+ * all — only an invoice waiting for its number — was reported as carrying one, and the coupon
+ * correction was routed to a human on the strength of it. This reader has no protective role, so
+ * pointing it at the shared refund predicate is the whole fix.
+ *
+ * THE ONE CLAUSE THAT IS NOT THE SHARED PREDICATE'S, and why it stays. `externalId: { not: null }`
+ * is a genuine narrowing this site needs rather than a leftover: `readWcCouponRefundParks` returns
+ * the parks' `externalId`s AS the posted-document evidence, and a park with none contributes a null
+ * to that list. Every park `upsertRefundPark` writes has one, so the clause selects the same rows
+ * today — it is here to keep the RETURN TYPE honest, not to change the set, and it is stated as an
+ * addition to the shared predicate rather than as a re-statement of it.
  */
 export const WC_COUPON_REFUND_PARK_WHERE = {
-  connector: 'woocommerce',
-  direction: 'FROM_CONNECTOR',
-  entityType: 'SalesOrder',
-  status: { in: ['PENDING', 'FAILED', 'QUARANTINED'] },
+  ...activeRefundParkWhere(),
   externalId: { not: null },
 } as const satisfies Prisma.ShoppingSyncLogWhereInput
 

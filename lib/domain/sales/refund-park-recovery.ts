@@ -43,38 +43,25 @@
  */
 
 /**
- * The park statuses an operator may recover.
- *
- * These are precisely the ACTIONABLE statuses — the set carried by the partial unique index
- * `shopping_sync_logs_active_refund_park_uq`, by REFUND_PARK_WHERE in the exception inbox, by the
- * order delete guard, and by the retention exemption. A park in any of them is blocking something;
- * a park outside them is already resolved and is not this action's business.
- *
- * QUARANTINED is included deliberately. It is the o3d-iup "monetary-only refund on a non-uniformly
- * taxed order" refusal — but the tax profile it was refused against is the profile of the order the
- * park is sitting on, which is exactly what is in question here. A quarantine computed against the
- * WRONG order carries no information about the right one.
+ * The actionable-status set and the park's own `recordKind` stamp now live in
+ * lib/domain/sales/wc-sync-row-families.ts, beside the held sales invoice's stamp and the union
+ * predicate the order-protecting readers need (o3d-272i). They are re-exported here unchanged
+ * because this is where most callers import them from, and because moving a name is not the point —
+ * having exactly one of it is.
  */
-export const RECOVERABLE_REFUND_PARK_STATUSES = ['PENDING', 'FAILED', 'QUARANTINED'] as const
+import {
+  RECOVERABLE_REFUND_PARK_STATUSES,
+  WC_REFUND_PARK_RECORD_KIND,
+  isRecoverableRefundParkStatus,
+  type RecoverableRefundParkStatus,
+} from '@/lib/domain/sales/wc-sync-row-families'
 
-export type RecoverableRefundParkStatus = (typeof RECOVERABLE_REFUND_PARK_STATUSES)[number]
-
-export function isRecoverableRefundParkStatus(status: string): status is RecoverableRefundParkStatus {
-  return (RECOVERABLE_REFUND_PARK_STATUSES as readonly string[]).includes(status)
-}
-
-/**
- * WHAT THIS ROW IS — the value a refund park stamps into `recordKind` (o3d-xnwu r8, Codex HIGH).
- *
- * `entityType` says what the row is ABOUT (a sales order). This says what the row IS. They are
- * different questions and r7's predicate could only ask the first one, which is why it admitted a
- * held sales invoice — see {@link activeRefundParkWhere}.
- *
- * Written by `upsertRefundPark` and by nothing else, and read by every predicate that means "an
- * actionable refund park". It is an assertion the writer makes about its own row, never an
- * inference from what a row lacks.
- */
-export const WC_REFUND_PARK_RECORD_KIND = 'WC_REFUND_PARK'
+export {
+  RECOVERABLE_REFUND_PARK_STATUSES,
+  WC_REFUND_PARK_RECORD_KIND,
+  isRecoverableRefundParkStatus,
+} from '@/lib/domain/sales/wc-sync-row-families'
+export type { RecoverableRefundParkStatus } from '@/lib/domain/sales/wc-sync-row-families'
 
 /**
  * THE WITNESS — the activity-log action `recoverParkedWcRefund` writes when it recovers a park, and

@@ -3,6 +3,11 @@ import { WMS_LOOKUP_CONFIRMED_ABSENT } from '@/lib/domain/wms/order-status-sweep
 import { provesNoRemoteWmsCall } from '@/lib/domain/wms/order-push-sweep'
 import { isOperatorAssertedSettlement } from '@/lib/domain/accounting/sync-row-settlement'
 import {
+  UNRESOLVED_WC_ORDER_ROW_DESCRIPTIONS,
+  UNRESOLVED_WC_ORDER_ROW_FAMILIES,
+  unresolvedWcOrderRowWhere,
+} from '@/lib/domain/sales/wc-sync-row-families'
+import {
   DAILY_BATCH_REFERENCE_TYPE,
   EXTERNAL_DOCUMENT_EVIDENCE_REFERENCE_TYPES,
   SALES_ORDER_REFERENCE_TYPE,
@@ -87,6 +92,17 @@ export type SalesOrderDeleteBlocker = {
     | 'accounting_document_exists'
     | 'daily_batch_staged'
     | 'parked_refund'
+    // o3d-272i: an invoice waiting for its WooCommerce number is not a parked refund, and the
+    // operator must not be sent to the refund recovery inbox to look for it.
+    | 'held_sales_invoice'
+    // o3d-272i, THE FAIL-CLOSED BRANCH. `unresolvedWcOrderRowWhere` admits exactly the families
+    // named in UNRESOLVED_WC_ORDER_ROW_FAMILIES, and every one of them has a description, so this
+    // code is unreachable while that holds. It exists because the alternative to "unreachable" here
+    // is "silently not a blocker": if the predicate ever widened — a clause dropped, a family added
+    // without a description — a row it admitted would otherwise be read, matched against no known
+    // family, and stepped over. A delete that proceeds because nothing recognised the evidence is
+    // exactly the outcome this guard exists to prevent, so an unrecognised admitted row BLOCKS.
+    | 'unresolved_wc_sync_row'
   message: string
 }
 
@@ -573,22 +589,38 @@ export async function findSalesOrderDeleteBlocker(
   // written between the check and the delete would be missed.
   //
   // entityId scoping already excludes the entity-less missing-FX rows.
-  const parkedRefund = await tx.shoppingSyncLog.findFirst({
-    where: {
-      connector: 'woocommerce',
-      direction: 'FROM_CONNECTOR',
-      entityType: 'SalesOrder',
-      entityId: orderId,
-      status: { in: ['PENDING', 'FAILED', 'QUARANTINED'] },
-    },
-    select: { id: true },
+  //
+  // o3d-272i: THE SET IS THE SAME, THE SENTENCE IS NOT. This predicate used to be a hand-written
+  // copy of the pre-recordKind refund-park shape, and it therefore also matched a HELD SALES INVOICE
+  // (o3d-k26m.6) — which is the right set to block a delete on, for the same reason and then some:
+  // deleting an order whose invoice is waiting for a number strands an invoice that will never post.
+  // What was wrong was that it told the operator the order had "an unresolved WooCommerce refund
+  // parked for review" and sent them to the refund recovery inbox, which does not list holds and
+  // never will. So the widest correct set is kept, taken from the one place it is defined, and each
+  // family gets its own sentence and its own remedy.
+  const unresolvedWcRows = await tx.shoppingSyncLog.findMany({
+    where: { ...unresolvedWcOrderRowWhere(), entityId: orderId },
+    select: { recordKind: true },
+    distinct: ['recordKind'],
   })
-  if (parkedRefund) {
-    blockers.push({
-      code: 'parked_refund',
-      message: 'This order has an unresolved WooCommerce refund parked for review; resolve it in the '
-        + 'sync exceptions inbox before deleting the order.',
-    })
+  if (unresolvedWcRows.length > 0) {
+    const kinds = new Set(unresolvedWcRows.map((row) => row.recordKind))
+    for (const family of UNRESOLVED_WC_ORDER_ROW_FAMILIES) {
+      if (!kinds.has(family)) continue
+      const description = UNRESOLVED_WC_ORDER_ROW_DESCRIPTIONS[family]
+      blockers.push({ code: description.deleteBlockerCode, message: description.deleteMessage })
+      kinds.delete(family)
+    }
+    // Whatever the predicate admitted that nothing above described. Unreachable today — see the
+    // `unresolved_wc_sync_row` note on SalesOrderDeleteBlocker['code'] — and deliberately still here.
+    if (kinds.size > 0) {
+      blockers.push({
+        code: 'unresolved_wc_sync_row',
+        message: 'This order carries an unresolved WooCommerce sync row of a kind this build does not '
+          + `recognise (${[...kinds].map((kind) => kind ?? 'unstamped').sort().join(', ')}), so it cannot say `
+          + 'what deleting the order would strand. Resolve it in the sync exceptions inbox, or report this.',
+      })
+    }
   }
 
   if (blockers.length === 0) return null
@@ -597,25 +629,36 @@ export async function findSalesOrderDeleteBlocker(
   // one needs the connector checked before anything else is done; an in-flight one needs waiting.
   // Only once none of those apply is "cancel the order" the right advice — so WMS evidence and
   // merely-queued accounting work rank last, because cancelling genuinely resolves them.
-  const REMEDY_ORDER: SalesOrderDeleteBlocker['code'][] = [
+  //
+  // A RECORD, NOT AN ARRAY WITH AN `indexOf` (o3d-272i). This was `REMEDY_ORDER.indexOf(code)` with
+  // `-1` folded to "last", so a code added to the union and forgotten here did not fail anything —
+  // it silently ranked below every real blocker and an operator was shown the wrong remedy. A
+  // `Record` over the code union does not compile until the new code is ranked.
+  const REMEDY_RANK: Record<SalesOrderDeleteBlocker['code'], number> = {
     // A parked refund outranks everything: the money has ALREADY left the business, and unlike
     // the others, cancelling the order does not resolve it (o3d-7yf/o3d-iup).
-    'parked_refund',
-    'accounting_document_exists',
-    'daily_batch_staged',
-    'accounting_sync_live',
+    parked_refund: 0,
+    // o3d-272i: ranks immediately below a parked refund and above the ledger blockers. Nothing has
+    // posted for a held invoice and no money has moved, so it is less binding than a refund that
+    // has already left — but, exactly like one, CANCELLING THE ORDER DOES NOT RESOLVE IT, which is
+    // what separates both from everything below.
+    held_sales_invoice: 1,
+    // The unrecognised-family fail-closed branch. Ranked with the two families it stands in for:
+    // the whole point of it is that the build cannot say what the row is, so it must not be
+    // presented as the mildest thing on the list.
+    unresolved_wc_sync_row: 2,
+    accounting_document_exists: 3,
+    daily_batch_staged: 4,
+    accounting_sync_live: 5,
     // o3d-2y1c: ranks below the accounting blockers (whose remedies are a ledger reversal or
     // waiting on an in-flight call) and above the WMS ones. A dispatched shipment is a physical
     // fact about goods; a WMS record is a fact about a document, and cancelling resolves the
     // latter. Ranked as one code rather than splitting SHIPPED out, because both variants of the
     // message are more specific than either WMS message.
-    'committed_shipment',
-    'wms_order_status_snapshot',
-    'wms_order_push_link',
-  ]
-  const severity = (blocker: SalesOrderDeleteBlocker) => {
-    const index = REMEDY_ORDER.indexOf(blocker.code)
-    return index === -1 ? REMEDY_ORDER.length : index
+    committed_shipment: 6,
+    wms_order_status_snapshot: 7,
+    wms_order_push_link: 8,
   }
+  const severity = (blocker: SalesOrderDeleteBlocker) => REMEDY_RANK[blocker.code]
   return [...blockers].sort((a, b) => severity(a) - severity(b))[0]
 }

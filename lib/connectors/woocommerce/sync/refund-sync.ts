@@ -405,11 +405,16 @@ async function resolveActionableParks(
 ): Promise<void> {
   await client.shoppingSyncLog.updateMany({
     where: {
-      connector: 'woocommerce',
-      direction: 'FROM_CONNECTOR',
-      entityType: 'SalesOrder',
+      // o3d-272i: the shared park predicate, not a copy of the pre-recordKind shape. This is an
+      // UPDATE, and without `recordKind` it selected a held sales invoice (o3d-k26m.6) whose
+      // externalId happened to equal this refund's id on this order — settling to SYNCED a hold that
+      // nothing then posts, which is exactly the collision r8 added the column to end, running in
+      // the direction that writes.
+      ...activeRefundParkWhere(),
       externalId,
       entityId: soId,
+      // QUARANTINED is left untouched (see above), so the status set is narrowed rather than taken
+      // from the shared predicate.
       status: { in: ['PENDING', 'FAILED'] },
     },
     data: { status: 'SYNCED', syncedAt: new Date(), errorMessage: null },

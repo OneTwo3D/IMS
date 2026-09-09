@@ -1,6 +1,8 @@
 import assert from 'node:assert/strict'
 import test, { mock } from 'node:test'
 
+import { Prisma } from '@/app/generated/prisma/client'
+
 // ---------------------------------------------------------------------------
 // o3d-xnwu r15 (Codex HIGH) - A JOIN NEEDS BOTH SIDES.
 //
@@ -43,8 +45,14 @@ mock.module('@/lib/db', {
       // No override rows: the DEFAULT retention is what a fresh install sweeps with, and it is the
       // one that would take the accused row.
       setting: { findMany: async () => [] },
+      // o3d-272i: the statement is COMPOSED, not joined. `lib/data-retention.ts` now interpolates
+      // `unresolvedWcOrderRowSql()` — a `Prisma.Sql` fragment — into this template, and Prisma's own
+      // `Sql` constructor is what flattens a nested fragment into the text and parameters the driver
+      // sees. Joining the raw `strings` instead would drop the fragment entirely and leave every
+      // assertion below examining a statement that was never sent.
       $queryRaw: async (strings: TemplateStringsArray, ...values: unknown[]) => {
-        calls.push({ sql: strings.join(' '), values })
+        const composed = new Prisma.Sql([...strings], values)
+        calls.push({ sql: composed.sql, values: composed.values })
         return [{ count: 0 }]
       },
       shoppingSyncLog: noopDelegate(),
@@ -179,4 +187,46 @@ test('o3d-xnwu r15: the witness is spelled identically by the writer, the retent
   const call = await syncLogDelete()
   assert.ok(call.sql.includes(`"activity_logs".metadata->>'shoppingSyncLogId' = "shopping_sync_logs".id`))
   assert.ok(call.values.includes(WC_REFUND_PARK_RECOVERED_ACTION))
+})
+
+
+// ---------------------------------------------------------------------------
+// o3d-272i — the retention exemption is the SHARED predicate, in SQL.
+// ---------------------------------------------------------------------------
+
+test('o3d-272i: the exemption asks the row what family it is, and reaches the driver saying so', async () => {
+  // THE READER THAT COULD NOT USE A TYPESCRIPT HELPER. This is a bulk `DELETE ... WHERE NOT (...)`,
+  // so consolidating the other three readers behind `unresolvedWcOrderRowWhere()` and leaving this
+  // one hand-written next to it would have been the same defect with better ergonomics. It renders
+  // the same rule through `unresolvedWcOrderRowSql()`, and
+  // tests/domain/sales/wc-sync-row-families.test.ts runs BOTH spellings over one seeded table to
+  // prove they select the same rows.
+  //
+  // MUTATION ROUTE: drop the recordKind clause from UNRESOLVED_WC_ORDER_ROW / the SQL renderer.
+  // Neither record kind reaches the statement as a parameter and the group loses its clause, so both
+  // assertions below fail — at this reader, as they must at every other one.
+  const {
+    HELD_SALES_INVOICE_RECORD_KIND,
+    WC_REFUND_PARK_RECORD_KIND,
+  } = await import('@/lib/domain/sales/wc-sync-row-families')
+  const call = await syncLogDelete()
+  const group = activeParkGroup(call.sql)
+
+  assert.match(group, /status = ANY/, 'precondition: the group found is the row-family exemption')
+  assert.match(
+    group,
+    /"shopping_sync_logs"\."recordKind" = ANY/,
+    'the exemption must ask the row which family it belongs to',
+  )
+
+  // The two families reach the statement as PARAMETERS carrying the shared constants, so a rename of
+  // either stamp cannot leave a literal behind in a statement nothing type-checks.
+  const kinds = call.values.find(
+    (value): value is string[] => Array.isArray(value) && value.includes(WC_REFUND_PARK_RECORD_KIND),
+  )
+  assert.deepEqual(
+    kinds,
+    [WC_REFUND_PARK_RECORD_KIND, HELD_SALES_INVOICE_RECORD_KIND],
+    `both exempt families must reach the statement (had: ${JSON.stringify(call.values)})`,
+  )
 })
