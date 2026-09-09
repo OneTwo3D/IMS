@@ -14,13 +14,13 @@ import { DEFAULT_BASE_CURRENCY, getBaseCurrencyCode } from '@/lib/base-currency'
 import { SourceScanTooLargeError, assertSourceLimit } from '@/lib/security/source-scan-error'
 import {
   calculateDecimalCoverageByLine,
-  requirementsMapToDecimalRows,
   type DecimalFulfillmentRequirement,
 } from '@/lib/products/fulfillment-coverage'
-import {
-  expandFulfillmentRequirementsDecimal,
-  loadFulfillmentProductGraph,
-} from '@/lib/products/kit-fulfillment'
+// o3d-4gh9: `expandFulfillmentRequirementsDecimal` is deliberately NOT imported here any more. Every
+// requirement expansion in this file goes through `lineFulfillmentRequirements`, which answers from
+// the line's pin when it has one — and scripts/check-fulfillment-requirement-seam.mjs makes a direct
+// call from this module (or any other) a build failure rather than a review comment.
+import { loadFulfillmentProductGraph } from '@/lib/products/kit-fulfillment'
 import { lineFulfillmentRequirements } from '@/lib/products/fulfillment-requirement-snapshot'
 import { isStockTrackedProductType } from '@/lib/domain/inventory/backorder-policy'
 import {
@@ -300,6 +300,14 @@ type SalesOrderLineRow = {
   sku: string | null
   description: string
   qty: DecimalInput
+  /**
+   * o3d-4gh9: the line's PINNED fulfilment requirements (o3d-kouj). Optional in the type because
+   * `lineFulfillmentRequirements` treats an absent snapshot as "expand the current graph", which is
+   * exactly the pre-snapshot behaviour — but every loader in this file selects it, because a reader
+   * that silently omits the column reports an in-flight line against a recipe it was never allocated
+   * from, and does it without an error.
+   */
+  fulfillmentRequirements?: unknown
   totalForeign: DecimalInput
   totalBase: DecimalInput
   taxForeign: DecimalInput
@@ -629,7 +637,18 @@ type RefundLineRow = {
 type DispatchMovementRow = {
   productId: string
   qty: DecimalInput
-  shipmentLine: { lineId: string; line: { productId: string | null } | null } | null
+  /**
+   * o3d-4gh9: the SALES LINE, not just its product. The returns denominator converts a kit's leaf
+   * dispatch movements back into whole ordered units, and that conversion is the line's fulfilment
+   * requirements — which for an in-flight or shipped line are PINNED (o3d-kouj), not whatever the
+   * catalogue expands to now. Keyed by product alone, this reader could not reach the pin at all;
+   * that is the "thread the line through, or state why returns should use the live graph" decision
+   * o3d-4gh9 left open, and it is threaded.
+   */
+  shipmentLine: {
+    lineId: string
+    line: { id: string; productId: string | null; fulfillmentRequirements?: unknown } | null
+  } | null
 }
 
 type ShipmentRow = {
@@ -789,6 +808,10 @@ async function loadSalesOrders(client: SalesFulfillmentAnalyticsClient, filters:
           taxForeign: true,
           taxBase: true,
           discountAmount: true,
+          // o3d-4gh9: the pin. Gross Margin prorates revenue to what actually shipped, and that
+          // conversion is a component expansion — so it has to be the expansion the order was
+          // ALLOCATED against, not whatever the catalogue says today.
+          fulfillmentRequirements: true,
           product: { select: { id: true, sku: true, type: true, name: true, category: { select: { name: true } } } },
         },
       },
@@ -836,6 +859,10 @@ async function loadSalesOrdersByIds(client: SalesFulfillmentAnalyticsClient, ord
           taxForeign: true,
           taxBase: true,
           discountAmount: true,
+          // o3d-4gh9: the pin. Gross Margin prorates revenue to what actually shipped, and that
+          // conversion is a component expansion — so it has to be the expansion the order was
+          // ALLOCATED against, not whatever the catalogue says today.
+          fulfillmentRequirements: true,
           product: { select: { id: true, sku: true, type: true, name: true, category: { select: { name: true } } } },
         },
       },
@@ -1934,14 +1961,18 @@ async function loadInWindowDispatchedQtyByLine(
     client as unknown as Parameters<typeof loadFulfillmentProductGraph>[0],
     [...new Set(orders.flatMap((order) => order.lines.map((line) => line.productId)).filter((id): id is string => Boolean(id)))],
   )
+  //
+  // o3d-4gh9: THE PIN, NOT THE CURRENT GRAPH. This expanded `line.productId` against the graph it
+  // had just loaded, which is the very inconsistency o3d-kouj exists to remove: for an in-flight
+  // line the current recipe is not what the order was allocated against, so a kit re-composed after
+  // the order shipped moved this figure retroactively. The line object was in hand the whole time
+  // and `lineFulfillmentRequirements` is the seam every other reader already goes through — the only
+  // thing missing was `fulfillmentRequirements` on the SELECT, which is now there.
   const requirementsByLine = new Map<string, DecimalFulfillmentRequirement[]>()
   for (const order of orders) {
     for (const line of order.lines) {
       if (!line.productId || requirementsByLine.has(line.id)) continue
-      requirementsByLine.set(
-        line.id,
-        requirementsMapToDecimalRows(expandFulfillmentRequirementsDecimal(line.productId, 1, graph)),
-      )
+      requirementsByLine.set(line.id, lineFulfillmentRequirements(line, graph))
     }
   }
   return {
@@ -2382,7 +2413,14 @@ export async function getReturnsAnalyticsReport(filters: SalesAnalyticsFilters =
       select: {
         productId: true,
         qty: true,
-        shipmentLine: { select: { lineId: true, line: { select: { productId: true } } } },
+        shipmentLine: {
+          select: {
+            lineId: true,
+            // o3d-4gh9: `fulfillmentRequirements` — a shipped line is converted through the recipe
+            // it actually shipped under.
+            line: { select: { id: true, productId: true, fulfillmentRequirements: true } },
+          },
+        },
       },
       take: SOURCE_ROW_LIMIT + 1,
     }) as Promise<DispatchMovementRow[]>,
@@ -2401,22 +2439,25 @@ export async function getReturnsAnalyticsReport(filters: SalesAnalyticsFilters =
   // graph as the fill-rate reader — coverage is min over components of qty/factor — and then
   // attributed to the parent product of the sales line they shipped against. A non-kit line is one
   // self-requirement of factor 1, so non-kit arithmetic is unchanged.
-  const parentProductIdByShipmentLine = new Map<string, string>()
+  //
+  // o3d-4gh9: THE SALES LINE IS CARRIED, NOT JUST ITS PRODUCT, so this expansion can read the same
+  // pin the fill-rate reader below already reads. Keyed by parentProductId it could not: a pin lives
+  // on a LINE, and two lines of the same product can legitimately hold snapshots taken at different
+  // graph versions. Everything downstream still needs the parent product, so it is taken off the
+  // line rather than tracked in a second map that could disagree with it.
+  const parentLineByShipmentLine = new Map<string, NonNullable<NonNullable<DispatchMovementRow['shipmentLine']>['line']> & { productId: string }>()
   for (const movement of shippedMovements) {
     const lineId = movement.shipmentLine?.lineId
-    const parentProductId = movement.shipmentLine?.line?.productId
-    if (lineId && parentProductId) parentProductIdByShipmentLine.set(lineId, parentProductId)
+    const line = movement.shipmentLine?.line
+    if (lineId && line?.productId) parentLineByShipmentLine.set(lineId, { ...line, productId: line.productId })
   }
   const returnsGraph = await loadFulfillmentProductGraph(
     client as unknown as Parameters<typeof loadFulfillmentProductGraph>[0],
-    [...new Set(parentProductIdByShipmentLine.values())],
+    [...new Set([...parentLineByShipmentLine.values()].map((line) => line.productId))],
   )
   const returnsRequirementsByLine = new Map<string, DecimalFulfillmentRequirement[]>()
-  for (const [lineId, parentProductId] of parentProductIdByShipmentLine) {
-    returnsRequirementsByLine.set(
-      lineId,
-      requirementsMapToDecimalRows(expandFulfillmentRequirementsDecimal(parentProductId, 1, returnsGraph)),
-    )
+  for (const [lineId, line] of parentLineByShipmentLine) {
+    returnsRequirementsByLine.set(lineId, lineFulfillmentRequirements(line, returnsGraph))
   }
   const dispatchedCoverageByLine = calculateDecimalCoverageByLine(
     returnsRequirementsByLine,
@@ -2426,7 +2467,7 @@ export async function getReturnsAnalyticsReport(filters: SalesAnalyticsFilters =
   )
   const shippedByProduct = new Map<string, Prisma.Decimal>()
   for (const [lineId, coverage] of dispatchedCoverageByLine) {
-    const parentProductId = parentProductIdByShipmentLine.get(lineId)
+    const parentProductId = parentLineByShipmentLine.get(lineId)?.productId
     if (!parentProductId) continue
     shippedByProduct.set(parentProductId, (shippedByProduct.get(parentProductId) ?? new Prisma.Decimal(0)).add(coverage))
   }
