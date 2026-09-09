@@ -74,6 +74,16 @@ export type PaymentSyncRow = {
    * which must not turn that into a SETTLED verdict however well the numbers line up.
    */
   settlementBasis?: string | null
+  /**
+   * o3d-f709 — the cross-connector orphan sweep's claim that this row was retired PRE-CALL, which it
+   * infers from `status = 'PENDING'` and nothing else. `registrationLedgerStanding` weighs it
+   * against the row's own document id; see `cancelledDocumentIdIsAccountedFor`.
+   *
+   * OPTIONAL, like `settlementBasis` beside it, and carried through `aggregatePaymentSyncRows`'s
+   * CANCELLED branch by the spread. It is REQUIRED on the delete path's `PaymentRegistrationRow`
+   * instead, because there an absent column costs a payment record rather than a badge.
+   */
+  abandonedBeforeRemoteCall?: boolean | null
 }
 
 /**

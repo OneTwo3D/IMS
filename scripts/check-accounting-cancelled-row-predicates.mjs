@@ -199,7 +199,14 @@ const STATUS_COMPARISON_OWNERS = new Map([
       + 'and answered DELETED — and reading them as UNDECIDED would alarm for ever over the reversal '
       + 'that fixed them. It already consults `settlementBasis` and post evidence. Kept as an '
       + 'explicit override of the shared rule rather than folded into it: the two disagree about the '
-      + 'unflagged row, on purpose, and merging them would change what deletePayment is allowed to do.',
+      + 'unflagged row, on purpose, and merging them would change what deletePayment is allowed to do.\n'
+      + '      o3d-f709: the divergence is deliberate; its COVERAGE was not. It recognised two writers '
+      + 'of the CANCELLED-with-a-document-id shape and there are three. The cross-connector orphan '
+      + 'sweep stamps `abandonedBeforeRemoteCall: true` on the strength of `status = PENDING` alone, '
+      + 'and a POSTED row sits at PENDING whenever follow-up work has failed — so that row named a '
+      + 'live payment and read NOTHING. It now reads that column too, which is the shared rule\'s own '
+      + 'external-id veto (`cancelledClaimIsResolved`) applied where it was missing rather than a '
+      + 'fourth reading of the status.',
   }],
   ['lib/domain/accounting/invoice-payment-registration.ts', {
     count: 4,

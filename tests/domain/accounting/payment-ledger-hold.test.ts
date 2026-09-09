@@ -41,7 +41,14 @@ import {
 // operator cannot perform.
 
 function reg(over: Partial<PaymentRegistrationRow> = {}): PaymentRegistrationRow {
-  return { id: 'log-1', connector: 'xero', status: 'PENDING', externalTransactionId: null, ...over }
+  return {
+    id: 'log-1', connector: 'xero', status: 'PENDING', externalTransactionId: null,
+    // o3d-f709: the column defaults to "not on record", which is what every row written before it
+    // existed carries and what the verified reversal leaves. `true` is the orphan sweep's claim and
+    // has to be stated by a fixture that means it.
+    abandonedBeforeRemoteCall: null,
+    ...over,
+  }
 }
 
 test('the held statuses are exactly the ones settlementStatus reads as held by the ledger', () => {
@@ -177,7 +184,7 @@ test('the undecided refusal states what is UNKNOWN, and never that a payment exi
 // ONE CLASSIFIER, so the delete and the settlement verdict cannot answer differently
 // ---------------------------------------------------------------------------
 
-test('registrationLedgerStanding gives the three answers, and CANCELLED is NOTHING even with a document id', () => {
+test('registrationLedgerStanding gives the three answers, and a BARE CANCELLED is NOTHING even with a document id', () => {
   // The drift this closes: the delete grew a third answer for a FAILED row naming no document while
   // the settlement verdict kept two, so the row one module refused to touch was shown by the other
   // as a plainly unpaid order needing no attention.
@@ -190,6 +197,9 @@ test('registrationLedgerStanding gives the three answers, and CANCELLED is NOTHI
   // ...except against CANCELLED, the one status written only where "nothing stands there" is already
   // established. A verified reversal KEEPS the document id on purpose, so reading it as a live hold
   // would make the fix alarm for ever.
+  // BARE: no settlementBasis and no abandonedBeforeRemoteCall, i.e. the verified reversal's shape.
+  // The two cancellations that carry an id NOTHING has accounted for read HELD instead — see the
+  // o3d-anu8 and o3d-f709 tests below.
   assert.equal(registrationLedgerStanding({ status: 'CANCELLED', externalTransactionId: 'PAY-1' }), 'NOTHING')
   assert.equal(registrationLedgerStanding({ status: 'CANCELLED', externalTransactionId: null }), 'NOTHING')
 })
@@ -441,9 +451,68 @@ test('[o3d-anu8] a CANCELLED registration an OPERATOR asserted still HOLDS — o
   )
 })
 
+test('[o3d-f709] a CANCELLED registration the ORPHAN SWEEP retired still HOLDS when it names a payment', () => {
+  // THE THIRD WRITER OF THE CANCELLED-WITH-A-DOCUMENT-ID SHAPE, and the one the o3d-anu8 argument
+  // above does not cover. `cancelOrphanedRowsUnderLock` matches `status = 'PENDING'` — with no type
+  // filter — and writes { CANCELLED, abandonedBeforeRemoteCall: true } WITHOUT clearing the external
+  // id. Its "pre-call" claim is inferred from that status alone, and a POSTED row is put back to
+  // PENDING whenever follow-up work fails (postedRowRetryColumns, and Xero's single-statement
+  // recovery write), KEEPING the id the ledger issued.
+  //
+  // So this row's own contents contradict the flag on it, which is exactly what
+  // `cancelledClaimIsResolved`'s external-id veto has said since o3d-nepa. Reading it as NOTHING let
+  // deletePayment destroy the last local record of a payment standing in a live ledger.
+  assert.equal(
+    registrationLedgerStanding({
+      status: 'CANCELLED', externalTransactionId: 'PAY-1',
+      settlementBasis: null, abandonedBeforeRemoteCall: true,
+    }),
+    'HELD',
+  )
+  // The same flag with NO document id is the sweep's claim on a row that genuinely never posted, and
+  // it still frees the receipt. Without this the fix would be indistinguishable from "a cancelled
+  // row never means nothing".
+  assert.equal(
+    registrationLedgerStanding({
+      status: 'CANCELLED', externalTransactionId: null,
+      settlementBasis: null, abandonedBeforeRemoteCall: true,
+    }),
+    'NOTHING',
+  )
+  // ...and the VERIFIED REVERSAL is untouched: it writes neither column, so its id stays accounted
+  // for by the cancellation itself and the reversal that fixed the discrepancy does not alarm for
+  // ever.
+  assert.equal(
+    registrationLedgerStanding({
+      status: 'CANCELLED', externalTransactionId: 'PAY-1',
+      settlementBasis: null, abandonedBeforeRemoteCall: null,
+    }),
+    'NOTHING',
+  )
+})
+
+test('[o3d-f709] the delete split routes the orphan-swept posted registration into ledgerHold', () => {
+  const row = {
+    id: 'r1', connector: 'xero', status: 'CANCELLED', externalTransactionId: 'PAY-9',
+    settlementBasis: null, abandonedBeforeRemoteCall: true,
+  }
+  // Asserted rather than assumed: a fixture that lost its id would make this pass while testing the
+  // shape next door.
+  assert.equal(row.externalTransactionId, 'PAY-9')
+  assert.equal(row.abandonedBeforeRemoteCall, true)
+
+  const split = splitPaymentRegistrations([row])
+  assert.deepEqual(split.ledgerHold.map((r) => r.id), ['r1'])
+  assert.deepEqual(split.retirable, [])
+  assert.deepEqual(split.undecided, [])
+})
+
 test('[o3d-anu8] the delete split routes the asserted cancellation into ledgerHold, not into no bucket at all', () => {
   const split = splitPaymentRegistrations([
-    { id: 'r1', connector: 'xero', status: 'CANCELLED', externalTransactionId: 'PAY-1', settlementBasis: 'OPERATOR_ASSERTION' },
+    {
+      id: 'r1', connector: 'xero', status: 'CANCELLED', externalTransactionId: 'PAY-1',
+      settlementBasis: 'OPERATOR_ASSERTION', abandonedBeforeRemoteCall: null,
+    },
   ])
   assert.deepEqual(split.ledgerHold.map((row) => row.id), ['r1'])
   assert.deepEqual(split.retirable, [])

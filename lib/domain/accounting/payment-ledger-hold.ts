@@ -107,6 +107,18 @@ export type PaymentRegistrationRow = {
    * before the column existed and for callers that legitimately have only a status and an id.
    */
   settlementBasis?: string | null
+  /**
+   * o3d-f709 — WHETHER THE CANCELLER CLAIMED THE ROW WAS PRE-CALL. Only
+   * `cancelOrphanedRowsUnderLock` ever writes `true`, and it infers it from `status = 'PENDING'`
+   * alone.
+   *
+   * REQUIRED here, unlike `settlementBasis`, and required for the reason
+   * cancelled-row-evidence.ts gives about `LedgerStandingRow`: absent reads as "not flagged", which
+   * is the PERMISSIVE answer on this path — it lets deletePayment destroy the local record of a
+   * payment. A caller that has not loaded the column must fail `tsc`, not quietly get the old
+   * verdict.
+   */
+  abandonedBeforeRemoteCall: boolean | null
 }
 
 export type PaymentRegistrationSplit = {
@@ -154,8 +166,41 @@ export type RegistrationLedgerStanding =
   /** Nothing was sent, or what was sent has been established — by evidence — to be gone. */
   | 'NOTHING'
 
+/**
+ * o3d-f709 — IS A CANCELLED ROW'S DOCUMENT ID ACCOUNTED FOR BY THE CANCELLATION ITSELF?
+ *
+ * `true` for exactly ONE shape, and it is the shape the short-circuit below was written for:
+ * `buildVerifiedReversalData`'s. That writes `{ status: CANCELLED, errorMessage }` after IMS asked
+ * Xero about the payment and was told DELETED — and it touches NEITHER of the two columns read
+ * here, which is what makes it recognisable.
+ *
+ * The two shapes it is `false` for both carry an id NOTHING has accounted for:
+ *
+ *   `settlementBasis = OPERATOR_ASSERTION` — `buildCancelledSaleSettlementData`: a human typed a
+ *   document id in. That is an unverified claim the document EXISTS, the opposite fact (o3d-anu8).
+ *
+ *   `abandonedBeforeRemoteCall = true` — `cancelOrphanedRowsUnderLock`, and this one was missed.
+ *   The sweep proves "pre-call" from `status = 'PENDING'` and nothing else, but a POSTED row is put
+ *   BACK to PENDING whenever follow-up work fails, KEEPING its external id
+ *   (`postedRowRetryColumns`, and Xero's single-statement recovery write). The sweep then retires it
+ *   without clearing that id, and its claim is contradicted by the row's own contents. This is not a
+ *   new rule: `cancelledClaimIsResolved` has vetoed both resolutions on a non-null
+ *   `externalTransactionId` since o3d-nepa, in exactly these words — "the id exists only because a
+ *   remote call returned". The delete path simply was not asking.
+ */
+function cancelledDocumentIdIsAccountedFor(
+  row: { settlementBasis?: string | null; abandonedBeforeRemoteCall?: boolean | null },
+): boolean {
+  return !isOperatorAssertedSettlement(row.settlementBasis) && row.abandonedBeforeRemoteCall !== true
+}
+
 export function registrationLedgerStanding(
-  row: { status: string; externalTransactionId?: string | null; settlementBasis?: string | null },
+  row: {
+    status: string
+    externalTransactionId?: string | null
+    settlementBasis?: string | null
+    abandonedBeforeRemoteCall?: boolean | null
+  },
 ): RegistrationLedgerStanding {
   // CANCELLED IS ASKED FIRST, AHEAD OF POST EVIDENCE, and this is the one place that precedence is
   // inverted. Everywhere else a document id outranks a status, because a status is what IMS wrote
@@ -179,10 +224,18 @@ export function registrationLedgerStanding(
   // asserted row that NAMES a document falls through to the post-evidence rule below and reads
   // HELD, which is what its own note says it is.
   //
+  // AND A SECOND WRITER BREAKS IT THE SAME WAY (o3d-f709). `cancelOrphanedRowsUnderLock` retires a
+  // PENDING row to CANCELLED, stamping `abandonedBeforeRemoteCall: true` on the strength of that
+  // status alone — but a posted row is put BACK to PENDING whenever follow-up work fails, keeping
+  // the id the ledger issued, and the sweep does not clear it. That row too is an id nothing has
+  // accounted for, and reading it as NOTHING let deletePayment destroy the last local record of a
+  // payment standing in a live ledger. See cancelledDocumentIdIsAccountedFor above; the rule it
+  // applies is `cancelledClaimIsResolved`'s external-id veto, which this path was not asking.
+  //
   // An asserted CANCELLED row with NO document id (the NOT_POSTED settlement) still reads NOTHING,
   // deliberately: that assertion IS "nothing posted", it is audited with a person's name on it, and
   // giving a stranded receipt a way out is what the settlement action exists for.
-  if (row.status === 'CANCELLED' && !(isOperatorAssertedSettlement(row.settlementBasis) && hasPostEvidence(row))) {
+  if (row.status === 'CANCELLED' && (!hasPostEvidence(row) || cancelledDocumentIdIsAccountedFor(row))) {
     return 'NOTHING'
   }
   // POST EVIDENCE OUTRANKS STATUS. The processor calls the ledger BEFORE it writes the result down,
