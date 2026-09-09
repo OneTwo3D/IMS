@@ -18,6 +18,7 @@ import {
   type AccountingReconciliationTruncation,
 } from '../../lib/domain/accounting/reconciliation'
 import { mirroredAccountingEventIdempotencyKeys } from '../../lib/domain/accounting/accounting-event-mirror'
+import { buildAccountingEventIdempotencyKey } from '../../lib/domain/accounting/accounting-event-builder'
 
 /**
  * o3d-11rf r4 (Codex r4, HIGH) — THE CAP APPLIED BEFORE THE QUESTION.
@@ -1119,9 +1120,58 @@ const CASE_FOLD_CHARACTERS = [
   { suffix: 'dotted', character: 'İ', label: 'U+0130 LATIN CAPITAL LETTER I WITH DOT ABOVE' },
 ] as const
 
-/** The normalisation the statement performed BEFORE r11 — restated here so the defect can be measured. */
-const UNSUBSTITUTED_NORMALISATION =
-  "nullif(regexp_replace(regexp_replace(lower(v), '[^a-z0-9._:-]+', '-', 'g'), '^-+|-+$', '', 'g'), '')"
+/**
+ * THE PER-PART NORMALISATION, IN THE TWO HALVES THE STATEMENT SPELLS IT IN — restated here so it can
+ * be run over a character the statement itself would never be handed, and PINNED to the production
+ * text below so a restatement that has drifted fails instead of quietly measuring the wrong thing.
+ * `$2`..`$5` are the four fold substitutions; `$1` is the array of characters being swept.
+ */
+const FOLD_EXPRESSION = (value: string) => `lower(replace(replace(${value}, $2, $3), $4, $5))`
+const COLLAPSE_EXPRESSION = (value: string) =>
+  `nullif(regexp_replace(regexp_replace(${value}, '[^a-z0-9._:-]+', '-', 'g'), '^-+|-+$', '', 'g'), '')`
+
+/** The normalisation the statement performed BEFORE r11 — restated so the defect can be measured. */
+const UNSUBSTITUTED_NORMALISATION = COLLAPSE_EXPRESSION('lower(v)')
+
+/** Whitespace is not meaning in SQL, and the production statement is wrapped and indented. */
+const squash = (sql: string) => sql.replace(/\s+/g, ' ').trim()
+
+/** The one statement the report issues, captured rather than rebuilt. */
+async function captureStatement() {
+  const captured: { strings?: TemplateStringsArray; values?: unknown[] } = {}
+  const client = {
+    salesOrder: { async findMany() { return [] } },
+    shipment: { async findMany() { return [] } },
+    salesOrderRefund: { async findMany() { return [] } },
+    accountingSyncLog: { async findMany() { return [] } },
+    accountingEvent: { async findMany() { return [] } },
+    accountingEventLog: { async findMany() { return [] } },
+    async $queryRaw(strings: TemplateStringsArray, ...values: unknown[]) {
+      captured.strings = strings
+      captured.values = values
+      return []
+    },
+  }
+  await collectAccountingReconciliationRows(
+    client as unknown as Parameters<typeof collectAccountingReconciliationRows>[0],
+  )
+  assert.ok(captured.strings, 'the contradiction query is issued at all')
+  return { sql: captured.strings.join('?'), values: captured.values ?? [] }
+}
+
+/**
+ * The part TypeScript builds, from the PRODUCTION builder and never a copy of it. A part that
+ * normalises to blank makes that function THROW; the statement yields no part instead, and `nullif`
+ * turns the whole key NULL. That is the one deliberate divergence between the two derivations, and
+ * mapping the throw onto NULL here is how this sweep states it rather than stepping around it.
+ */
+function typescriptPart(value: string): string | null {
+  try {
+    return buildAccountingEventIdempotencyKey([value])
+  } catch {
+    return null
+  }
+}
 
 test('o3d-11rf r11: a KELVIN SIGN and a DOTTED CAPITAL I derive the SAME keys in SQL as in TypeScript', { skip }, async () => {
   const run = randomUUID().slice(0, 8)
@@ -1235,19 +1285,56 @@ test('o3d-11rf r11: a KELVIN SIGN and a DOTTED CAPITAL I derive the SAME keys in
 })
 
 /**
- * o3d-11rf r11 — THE CLOSURE, AGAINST THE DATABASE.
+ * o3d-11rf r11 — THE WHOLE PER-PART NORMALISER, OVER THE WHOLE OF UNICODE.
  *
- * The unit suite proves, over every code point of the running engine, that JavaScript `toLowerCase()`
- * and an ASCII-ONLY fold can only disagree about a key for the two characters substituted in the
- * statement. That proof rests on one claim about PostgreSQL: that `lower()` on this database IS an
- * ASCII-only fold. This asserts that claim, and it asserts it over EVERY character rather than over a
- * chosen few, because a battery proves parity only over the shapes it contains — the lesson of r10.
+ * Rounds 9, 10 and 11 were all one shape: a SQL reimplementation of a TypeScript function drifting
+ * from it — scope, then blankness, then case. Patching the third instance leaves the shape. So this
+ * does not test the fold: it runs the ENTIRE per-part normalisation the production statement
+ * performs — substitute, fold, collapse, strip, `nullif` — against the PRODUCTION TypeScript builder,
+ * for every code point of the running engine, standalone and embedded.
+ *
+ * Standalone and embedded are different questions and both are asked. Standalone is where a
+ * difference EMPTIES the part, and an empty part makes the whole key NULL and the row own nothing —
+ * the false negative. Embedded is where it merely yields a DIFFERENT key, which is worse to read,
+ * because the row's sibling key still pairs and the report looks healthy.
+ *
+ * THE RESTATED EXPRESSION IS PINNED TO THE STATEMENT. A test that spells the normalisation out a
+ * second time proves parity with its own copy, which is the exact failure this file exists to
+ * prevent. So the halves are asserted PRESENT, character for character (whitespace aside), in the
+ * statement production actually issues, before a single character is swept through them.
  *
  * U+0000 IS THE ONE EXCLUSION AND IT IS NOT A GAP: PostgreSQL `text` cannot carry a NUL byte and
  * `jsonb` rejects the escape that would produce one, so no key part can ever contain it.
  */
-test('o3d-11rf r11: PostgreSQL lower() folds ASCII and nothing else, on every character', { skip }, async () => {
-  const asciiFold = (value: string) => value.replace(/[A-Z]/g, (character) => character.toLowerCase())
+/**
+ * THE POSITIONS EACH CHARACTER IS SWEPT IN, and the list is what it is because a shorter one was
+ * MEASURED AND FOUND WANTING. With only `v` and `a<v>b`, dropping `-` from the collapse alphabet — a
+ * genuine defect, and the exact next-instance shape this sweep exists to catch — survived: a single
+ * hyphen is REPLACED BY A HYPHEN, so it reads the same either way, and a run of two never occurred.
+ * `a<v><v>b` makes the run; `-<v>-` puts the character against the leading/trailing strip.
+ */
+const FORMS = [
+  { label: 'alone', sql: (v: string) => v, js: (v: string) => v },
+  { label: 'embedded', sql: (v: string) => `'a' || ${v} || 'b'`, js: (v: string) => `a${v}b` },
+  { label: 'doubled', sql: (v: string) => `'a' || ${v} || ${v} || 'b'`, js: (v: string) => `a${v}${v}b` },
+  { label: 'against the strip', sql: (v: string) => `'-' || ${v} || '-'`, js: (v: string) => `-${v}-` },
+] as const
+
+test('o3d-11rf r11: the SQL per-part normalisation IS the TypeScript one, on every code point', { skip }, async () => {
+  // THE PIN. Both halves, as the statement spells them, with its parameter holes written as `?`.
+  const { sql, values } = await captureStatement()
+  const production = squash(sql)
+  const foldHalf = squash(FOLD_EXPRESSION('part.value').replace(/\$\d/g, '?'))
+  const collapseHalf = squash(COLLAPSE_EXPRESSION('folded.value'))
+  assert.ok(production.includes(foldHalf),
+    `the restated fold is the statement's own: ${foldHalf}`)
+  assert.ok(production.includes(collapseHalf),
+    `the restated collapse is the statement's own: ${collapseHalf}`)
+
+  // The four substitution parameters come from the statement too, not from a constant beside it.
+  const substitutions = values.slice(2, 6) as string[]
+  assert.equal(substitutions.length, 4, 'four substitution parameters, read off the real capture')
+  assert.ok(substitutions.every((value) => typeof value === 'string'))
 
   const characters: string[] = []
   for (let point = 1; point <= 0x10ffff; point++) {
@@ -1257,31 +1344,45 @@ test('o3d-11rf r11: PostgreSQL lower() folds ASCII and nothing else, on every ch
   assert.ok(characters.length > 1_000_000, 'every code point, not a sample')
 
   const disagreements: string[] = []
-  const unicodeDifferences: string[] = []
+  let unsubstitutedWrong = 0
+  const unsubstitutedNames: string[] = []
   await withRollback(async (tx) => {
     for (let at = 0; at < characters.length; at += 100_000) {
       const chunk = characters.slice(at, at + 100_000)
-      const folded = await tx.$queryRaw`
-        SELECT v, lower(v) AS "sqlFold" FROM unnest(${chunk}::text[]) AS v
-      ` as Array<{ v: string; sqlFold: string }>
-      assert.equal(folded.length, chunk.length, 'every character in the chunk came back')
-      for (const row of folded) {
-        if (row.sqlFold !== asciiFold(row.v)) disagreements.push(JSON.stringify(row.v))
-        if (row.sqlFold !== row.v.toLowerCase()) unicodeDifferences.push(row.v)
+      const rows = await tx.$queryRawUnsafe(
+        `SELECT v,
+                ${FORMS.map(({ sql }, index) => `${COLLAPSE_EXPRESSION(FOLD_EXPRESSION(sql('v')))} AS "f${index}"`).join(',\n                ')},
+                ${UNSUBSTITUTED_NORMALISATION} AS "before"
+         FROM unnest($1::text[]) AS v`,
+        chunk, ...substitutions,
+      ) as Array<Record<string, string | null> & { v: string }>
+      assert.equal(rows.length, chunk.length, 'every character in the chunk came back')
+      for (const row of rows) {
+        for (const [index, form] of FORMS.entries()) {
+          if (row[`f${index}`] !== typescriptPart(form.js(row.v))) {
+            disagreements.push(`${JSON.stringify(row.v)} ${form.label}`)
+          }
+        }
+        if (row.before !== typescriptPart(row.v)) {
+          unsubstitutedWrong++
+          if (unsubstitutedNames.length < 4) unsubstitutedNames.push(JSON.stringify(row.v))
+        }
       }
     }
-  }, 600_000)
+  }, 1_800_000)
 
   assert.deepEqual(disagreements.slice(0, 20), [],
-    'PostgreSQL lower() folds ASCII and nothing else on this database — the premise the unit closure rests on')
+    'the statement derives the same part TypeScript does, for every character, in both positions')
 
-  // NOT VACUOUS, TWICE OVER. The sweep must actually reach characters the two folds differ on, and it
-  // must reach the two this statement substitutes — otherwise it would pass against a database on
-  // which nothing interesting happens.
-  assert.ok(unicodeDifferences.length > 1_000,
-    `lower() and toLowerCase() differ on ${unicodeDifferences.length} characters — the sweep reaches them`)
+  // NOT VACUOUS. The sweep must reach characters the PRE-r11 spelling got wrong, and it must reach
+  // the two this statement substitutes — otherwise it would pass against a normaliser that never
+  // fixed anything.
+  assert.equal(unsubstitutedWrong, CASE_FOLD_CHARACTERS.length,
+    `the spelling this replaced disagrees on exactly ${CASE_FOLD_CHARACTERS.length} characters `
+    + `(${unsubstitutedNames.join(', ')}) — the whole set, and the sweep reaches every one`)
   for (const { character, label } of CASE_FOLD_CHARACTERS) {
-    assert.ok(unicodeDifferences.includes(character), `${label} among them, the character Codex named`)
+    const [alone] = await Promise.resolve([typescriptPart(character)])
+    assert.ok(alone, `${label} builds a part in TypeScript — which is what the old spelling lost`)
   }
 })
 
