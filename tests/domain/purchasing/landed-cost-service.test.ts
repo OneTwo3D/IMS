@@ -9,6 +9,7 @@ import {
   getTransferConsumedQtyForCostLayer,
   updateSnapshotsForCostLayerChange,
 } from '@/lib/cost-layers'
+import { TRANSFER_STATUSES_WITH_OUTSTANDING_SOURCE_CONSUMPTION } from '@/lib/domain/inventory/movement-cogs-relevance'
 import { toDecimal } from '@/lib/domain/math/decimal'
 import {
   LANDED_COST_DISTRIBUTION_METHODS,
@@ -162,6 +163,8 @@ test('retrospective layer adjustment splits inventory and consumed COGS deltas',
     returnedQty: 1,
     supplierReturnedQty: 2,
     manufacturingConsumedQty: 0,
+    reversalConsumedQty: 0,
+    transferConsumedQty: 0,
   })), {
     costDelta: 2,
     consumedQty: 6,
@@ -182,6 +185,8 @@ test('retrospective layer adjustment includes supplier-returned units in COGS (s
     returnedQty: 0,
     supplierReturnedQty: 4,
     manufacturingConsumedQty: 0,
+    reversalConsumedQty: 0,
+    transferConsumedQty: 0,
   })), {
     costDelta: 1,
     consumedQty: 10,
@@ -203,6 +208,7 @@ test('retrospective layer adjustment excludes PURCHASE_REVERSAL-consumed units f
     returnedQty: 0,
     supplierReturnedQty: 0,
     manufacturingConsumedQty: 0,
+    transferConsumedQty: 0,
     reversalConsumedQty: 3,
   })), {
     costDelta: 2,
@@ -225,6 +231,7 @@ test('retrospective layer adjustment excludes TRANSFER_OUT-consumed units from C
     returnedQty: 0,
     supplierReturnedQty: 0,
     manufacturingConsumedQty: 0,
+    reversalConsumedQty: 0,
     transferConsumedQty: 3,
   })), {
     costDelta: 2,
@@ -250,6 +257,7 @@ test('a fully-transferred layer posts NO COGS on revaluation (6oyu.19 double-cou
     returnedQty: 0,
     supplierReturnedQty: 0,
     manufacturingConsumedQty: 0,
+    reversalConsumedQty: 0,
     transferConsumedQty: 100,
   })), {
     costDelta: 1,
@@ -296,6 +304,7 @@ test('netConsumedQty floors at zero when exclusions exceed consumption (6oyu.19)
     returnedQty: 0,
     supplierReturnedQty: 0,
     manufacturingConsumedQty: 0,
+    reversalConsumedQty: 0,
     transferConsumedQty: 99,
   })), {
     costDelta: 2,
@@ -315,6 +324,8 @@ test('retrospective layer adjustment handles landed-cost decreases', () => {
     returnedQty: 0,
     supplierReturnedQty: 0,
     manufacturingConsumedQty: 0,
+    reversalConsumedQty: 0,
+    transferConsumedQty: 0,
   })), {
     costDelta: -2,
     consumedQty: 3,
@@ -335,6 +346,8 @@ test('retrospective layer adjustment excludes customer returns but includes supp
     returnedQty: 4,
     supplierReturnedQty: 2,
     manufacturingConsumedQty: 0,
+    reversalConsumedQty: 0,
+    transferConsumedQty: 0,
   })
 
   assert.equal(deltas.netConsumedQty.toNumber(), 2)
@@ -353,6 +366,8 @@ test('retrospective layer adjustment excludes manufacturing-consumed units from 
     returnedQty: 0,
     supplierReturnedQty: 0,
     manufacturingConsumedQty: 3,
+    reversalConsumedQty: 0,
+    transferConsumedQty: 0,
   })
 
   assert.equal(deltas.consumedQty.toNumber(), 6)
@@ -453,6 +468,8 @@ test('retrospective layer adjustment uses Decimal arithmetic for fractional land
     returnedQty: '0',
     supplierReturnedQty: '0',
     manufacturingConsumedQty: '0',
+    reversalConsumedQty: 0,
+    transferConsumedQty: 0,
   })
 
   assert.equal(deltas.costDelta.toString(), '0.2')
@@ -504,17 +521,19 @@ test('getTransferConsumedQtyForCostLayer sums only the requested layer, from the
 test('getTransferConsumedQtyForCostLayer only counts dispatched transfers, via the snapshot not cogs_entries (6oyu.19)', async () => {
   // Pins the load-bearing details of the query, none of which a mock can infer:
   //  - it reads stock_transfer_lines (transfers write NO cogs_entries at all)
-  //  - IN_TRANSIT + RECEIVED only: a DRAFT transfer has consumed nothing, and a
-  //    future cancel-after-dispatch path would restore the layer, so subtracting
-  //    its snapshot would under-post COGS.
+  //  - the status list is BOUND as $2 from the shared classification, never spelled
+  //    out in the SQL: a DRAFT transfer consumed nothing, while a cancelled
+  //    DISPATCH did consume and never got it back (see the behavioural test below).
   //  - it filters by jsonb containment on the parameter, hitting the GIN index
   //    rather than scanning every transfer line ever written.
   let capturedSql = ''
   let capturedParam: unknown = null
+  let capturedStatuses: unknown = null
   const tx = {
-    $queryRawUnsafe: async (sql: string, param: unknown) => {
+    $queryRawUnsafe: async (sql: string, param: unknown, statuses: unknown) => {
       capturedSql = sql
       capturedParam = param
+      capturedStatuses = statuses
       return []
     },
   }
@@ -524,9 +543,15 @@ test('getTransferConsumedQtyForCostLayer only counts dispatched transfers, via t
   assert.equal(transferred.toString(), '0')
   assert.match(capturedSql, /"stock_transfer_lines"/)
   assert.doesNotMatch(capturedSql, /cogs_entries/)
-  assert.match(capturedSql, /st\.status IN \('IN_TRANSIT', 'RECEIVED'\)/)
+  assert.match(capturedSql, /st\.status = ANY\(\$2::"StockTransferStatus"\[\]\)/)
+  // No status literal may appear in the SQL at all: the list is bound from
+  // STOCK_TRANSFER_SOURCE_LAYER_CONSUMPTION so the query cannot drift from the
+  // classification (a hard-coded 'IN_TRANSIT', 'RECEIVED' is what left cancelled
+  // dispatches double-counted).
+  assert.doesNotMatch(capturedSql, /'(DRAFT|IN_TRANSIT|RECEIVED|CANCELLED)'/)
   assert.match(capturedSql, /"costLayerSnapshot" @> \$1::jsonb/)
   assert.equal(capturedParam, JSON.stringify([{ costLayerId: 'layer-a' }]))
+  assert.deepEqual(capturedStatuses, TRANSFER_STATUSES_WITH_OUTSTANDING_SOURCE_CONSUMPTION)
 })
 
 test('snapshot updates lock matching rows FOR UPDATE before rewriting the JSON array', async () => {
@@ -1522,4 +1547,125 @@ test('a revaluation rewrites the LIVE pin and leaves the POSTED amount alone (o3
     assert.equal(snapshot[0].unitCostBase, '9.000000', 'the live pin follows the layer')
     assert.equal(snapshot[0].postedUnitCostBase, '4.000000', 'what was POSTED does not')
   }
+})
+
+// ---------------------------------------------------------------------------
+// 6oyu.19 (reopened): a CANCELLED dispatch consumed source layers too
+// ---------------------------------------------------------------------------
+
+/**
+ * A miniature executor for the transfer-snapshot query, so the tests below assert
+ * WHICH TRANSFERS ARE COUNTED rather than what the SQL string looks like. It
+ * understands both predicate shapes this query has had — the bound
+ * `= ANY($2::"StockTransferStatus"[])` and the old hard-coded
+ * `st.status IN ('IN_TRANSIT', 'RECEIVED')` — so reintroducing the literal list
+ * fails on the resulting COGS number, not on a text match.
+ */
+function createTransferSnapshotTx(
+  rows: Array<{ status: string; snapshot: Array<{ costLayerId: string; qty: string; unitCostBase: number }> }>,
+) {
+  return {
+    $queryRawUnsafe: async (sql: string, containment: string, statuses?: unknown) => {
+      let allowed: string[]
+      if (/st\.status\s*=\s*ANY\(\$2::"StockTransferStatus"\[\]\)/.test(sql)) {
+        assert.ok(Array.isArray(statuses), 'the status list must be bound as $2, not inlined')
+        allowed = statuses as string[]
+      } else {
+        const literal = sql.match(/st\.status\s+IN\s*\(([^)]*)\)/)
+        assert.ok(literal, `unrecognised transfer-status predicate in query: ${sql}`)
+        allowed = literal[1].split(',').map((value) => value.trim().replace(/'/g, ''))
+      }
+      const wanted = (JSON.parse(containment) as Array<{ costLayerId: string }>)[0].costLayerId
+      return rows
+        .filter((row) => allowed.includes(row.status))
+        .filter((row) => row.snapshot.some((entry) => entry.costLayerId === wanted))
+        .map((row) => ({ costLayerSnapshot: row.snapshot }))
+    },
+  }
+}
+
+test('a cancelled DISPATCH posts no spurious COGS on revaluation (6oyu.19 reopened)', async () => {
+  // 100 units received at £10 and dispatched to another warehouse; the dispatch is
+  // then cancelled. cancelDispatchedTransfer does NOT un-consume the original
+  // layer (its own comment says so) — it books REPLACEMENT layers at the source
+  // and links each back with a costLayerSourceLine. So the original layer stays at
+  // remainingQty 0 while propagateLandedCostToOutputs revalues the replacement.
+  //
+  // A later £1/unit freight bill therefore debits transit £100 once. If this side
+  // also counts the 100 units, transit is drained £200 — £100 of spurious COGS on
+  // the original layer plus £100 of inventory on the replacement — leaving a
+  // permanent stranded credit. Exactly the 6oyu.19 double count, reached through
+  // the cancel path that the first fix assumed did not exist.
+  const tx = createTransferSnapshotTx([
+    { status: 'CANCELLED', snapshot: [{ costLayerId: 'layer-a', qty: '100', unitCostBase: 10 }] },
+  ])
+
+  const transferConsumedQty = await getTransferConsumedQtyForCostLayer(tx as never, 'layer-a')
+
+  // Asserted before the quantity itself, so a regression fails on the GL number
+  // that is actually wrong (cogsDelta 100 instead of 0) rather than on a helper.
+  assert.deepEqual(deltasToNumbers(calculateLayerAdjustmentDeltas({
+    oldUnitCost: 10,
+    newUnitCost: 11,
+    receivedQty: 100,
+    remainingQty: 0,
+    returnedQty: 0,
+    supplierReturnedQty: 0,
+    manufacturingConsumedQty: 0,
+    reversalConsumedQty: 0,
+    transferConsumedQty,
+  })), {
+    costDelta: 1,
+    consumedQty: 100,
+    netConsumedQty: 0,
+    cogsDelta: 0,
+    inventoryDelta: 0,
+  })
+  assert.equal(transferConsumedQty.toString(), '100')
+})
+
+test('the transfer-snapshot query counts every dispatched status and no undispatched one (6oyu.19)', async () => {
+  // Proves the predicate is applied at all (a query with the status filter dropped
+  // would return 111 here) and that it spans all three dispatched states.
+  const tx = createTransferSnapshotTx([
+    { status: 'IN_TRANSIT', snapshot: [{ costLayerId: 'layer-a', qty: '1', unitCostBase: 10 }] },
+    { status: 'RECEIVED', snapshot: [{ costLayerId: 'layer-a', qty: '10', unitCostBase: 10 }] },
+    { status: 'CANCELLED', snapshot: [{ costLayerId: 'layer-a', qty: '100', unitCostBase: 10 }] },
+    // Synthetic: a DRAFT never has a snapshot, because dispatch is what writes one.
+    // Carrying one here proves the status filter is doing the excluding rather than
+    // the absence of data quietly making the test pass either way.
+    { status: 'DRAFT', snapshot: [{ costLayerId: 'layer-a', qty: '1000', unitCostBase: 10 }] },
+    { status: 'RECEIVED', snapshot: [{ costLayerId: 'other-layer', qty: '7', unitCostBase: 10 }] },
+  ])
+
+  const transferred = await getTransferConsumedQtyForCostLayer(tx as never, 'layer-a')
+  assert.equal(transferred.toString(), '111')
+})
+
+test('the revaluation exclusion queries are enumerated in exactly one place (6oyu.19)', () => {
+  // The recurring shape of this defect class is an exclusion that reaches some
+  // revaluation entry points and not others. recalculateLandedCosts,
+  // recalculateDirectLandedCosts and propagateLandedCostToOutputs must all obtain
+  // their exclusions from loadLayerConsumptionExclusions, so each loader is named
+  // exactly once in the service.
+  const source = readFileSync('lib/domain/purchasing/landed-cost-service.ts', 'utf8')
+  assert.match(source, /function loadLayerConsumptionExclusions\(/, 'precondition: the shared loader must exist in the file read')
+
+  for (const loader of [
+    'getReturnedQtyForCostLayer',
+    'getSupplierReturnedQtyForCostLayer',
+    'getManufacturingConsumedQtyForCostLayer',
+    'getReversalConsumedQtyForCostLayer',
+    'getTransferConsumedQtyForCostLayer',
+  ]) {
+    const invocations = source.match(new RegExp(`(?:deps|serviceDeps)\\.${loader}\\(`, 'g')) ?? []
+    assert.equal(
+      invocations.length,
+      1,
+      `${loader} is invoked ${invocations.length} times; every revaluation path must go through loadLayerConsumptionExclusions`,
+    )
+  }
+
+  const loaderCalls = source.match(/loadLayerConsumptionExclusions\(/g) ?? []
+  assert.equal(loaderCalls.length, 4, 'expected the loader definition plus its three revaluation call sites')
 })

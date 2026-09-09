@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { StockMovementType } from '../../../app/generated/prisma/client.ts'
+import { StockMovementType, StockTransferStatus } from '../../../app/generated/prisma/client.ts'
 import {
   COGS_ENTRY_EXCLUDED_MOVEMENT_TYPES,
   LAYER_CONSUMING_MOVEMENT_TYPES_WITHOUT_COGS_ENTRIES,
@@ -8,11 +8,15 @@ import {
   REVALUATION_ACCEPTED_TRADEOFF_MOVEMENT_TYPES,
   REVALUATION_EXCLUDED_MOVEMENT_TYPES,
   REVALUATION_KNOWN_GAP_MOVEMENT_TYPES,
+  STOCK_TRANSFER_SOURCE_LAYER_CONSUMPTION,
   TRANSFER_SNAPSHOT_EXCLUDED_MOVEMENT_TYPES,
+  TRANSFER_STATUSES_WITH_OUTSTANDING_SOURCE_CONSUMPTION,
 } from '../../../lib/domain/inventory/movement-cogs-relevance.ts'
+import { STOCK_TRANSFER_TRANSITIONS } from '../../../lib/domain/workflows/stock-transfer-state.ts'
 import { REVALUATION_EXCLUSION_QUERY_MOVEMENT_TYPES } from '../../../lib/cost-layers.ts'
 
 const ALL_MOVEMENT_TYPES = Object.values(StockMovementType) as StockMovementType[]
+const ALL_TRANSFER_STATUSES = Object.values(StockTransferStatus) as StockTransferStatus[]
 
 test('every StockMovementType is classified against customer COGS (6oyu.7)', () => {
   // The registry is typed Record<StockMovementType, ...>, so an unclassified new
@@ -135,4 +139,59 @@ test('accepted trade-offs are exactly the ones decided (6oyu.20)', () => {
   for (const type of REVALUATION_ACCEPTED_TRADEOFF_MOVEMENT_TYPES) {
     assert.ok(!REVALUATION_EXCLUDED_MOVEMENT_TYPES.includes(type), `${type}: accepted into COGS, so it must not be excluded`)
   }
+})
+
+test('every StockTransferStatus is classified for source-layer consumption (6oyu.19)', () => {
+  // Typed Record<StockTransferStatus, ...>, so an unclassified new status is a
+  // compile error. Asserted at runtime too, to catch the generated client and the
+  // registry drifting apart after a DB enum change.
+  const missing = ALL_TRANSFER_STATUSES.filter((status) => !(status in STOCK_TRANSFER_SOURCE_LAYER_CONSUMPTION))
+  assert.deepEqual(missing, [], `unclassified transfer statuses: ${missing.join(', ')}`)
+
+  const extra = Object.keys(STOCK_TRANSFER_SOURCE_LAYER_CONSUMPTION).filter(
+    (status) => !ALL_TRANSFER_STATUSES.includes(status as StockTransferStatus),
+  )
+  assert.deepEqual(extra, [], `registry classifies non-existent transfer statuses: ${extra.join(', ')}`)
+
+  for (const status of ALL_TRANSFER_STATUSES) {
+    assert.ok(
+      STOCK_TRANSFER_SOURCE_LAYER_CONSUMPTION[status].note.trim().length > 0,
+      `${status}: must say WHY, since this list is what the exclusion query filters on`,
+    )
+  }
+})
+
+test('a cancelled dispatch still counts as outstanding source consumption (6oyu.19)', () => {
+  // The load-bearing entry. cancelDispatchedTransfer (IN_TRANSIT -> CANCELLED,
+  // audit-C5) does NOT un-consume the original source layers: it creates
+  // REPLACEMENT layers and links them back with a costLayerSourceLine, so
+  // propagateLandedCostToOutputs carries the revaluation delta onto the
+  // replacement exactly as it does onto a transfer destination. Leaving CANCELLED
+  // out of this list posts the delta as COGS on the original layer as well —
+  // 6oyu.19's double count, reached through the cancel path instead of receipt.
+  assert.deepEqual(TRANSFER_STATUSES_WITH_OUTSTANDING_SOURCE_CONSUMPTION, ['CANCELLED', 'IN_TRANSIT', 'RECEIVED'])
+  assert.equal(STOCK_TRANSFER_SOURCE_LAYER_CONSUMPTION.CANCELLED.consumption, 'OUTSTANDING')
+  // DRAFT never dispatched, so it consumed nothing and wrote no snapshot.
+  assert.equal(STOCK_TRANSFER_SOURCE_LAYER_CONSUMPTION.DRAFT.consumption, 'NOT_DISPATCHED')
+  assert.ok(!TRANSFER_STATUSES_WITH_OUTSTANDING_SOURCE_CONSUMPTION.includes('DRAFT'))
+})
+
+test('the transfer-status list is NOT derived from the transfer state machine (6oyu.19)', () => {
+  // Why this test exists: STOCK_TRANSFER_TRANSITIONS models the plain cancel path
+  // only and states IN_TRANSIT -> RECEIVED as the sole exit from IN_TRANSIT.
+  // cancelDispatchedTransfer deliberately performs IN_TRANSIT -> CANCELLED outside
+  // the machine. The first fix for 6oyu.19 trusted the map and hard-coded
+  // ('IN_TRANSIT', 'RECEIVED'), which is precisely how the cancelled-dispatch case
+  // stayed broken. Assert the divergence so that "just derive it from the state
+  // machine" is never a tidy-up someone makes.
+  assert.deepEqual(STOCK_TRANSFER_TRANSITIONS.IN_TRANSIT, ['RECEIVED'])
+  const reachableFromInTransit = new Set<string>(STOCK_TRANSFER_TRANSITIONS.IN_TRANSIT)
+  assert.ok(
+    !reachableFromInTransit.has('CANCELLED'),
+    'if the machine ever models IN_TRANSIT -> CANCELLED, re-read this test before deriving the list from it',
+  )
+  assert.ok(
+    TRANSFER_STATUSES_WITH_OUTSTANDING_SOURCE_CONSUMPTION.includes('CANCELLED'),
+    'CANCELLED is only reachable post-dispatch via a path the state machine does not model',
+  )
 })

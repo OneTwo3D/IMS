@@ -1,4 +1,4 @@
-import { StockMovementType } from '@/app/generated/prisma/client'
+import { StockMovementType, StockTransferStatus } from '@/app/generated/prisma/client'
 
 /**
  * Central classification of every StockMovementType against customer COGS.
@@ -110,7 +110,7 @@ export const MOVEMENT_COGS_RELEVANCE: Record<StockMovementType, MovementCogsClas
     treatment: 'EXCLUDE',
     writesCogsEntries: false,
     exclusionSource: 'TRANSFER_SNAPSHOT',
-    note: 'onetwo3d-ims-6oyu.19 — stock moved warehouse, it was not sold. Excluded via getTransferConsumedQtyForCostLayer, which reads stock_transfer_lines.costLayerSnapshot NOT cogs_entries: transfer dispatch writes none, so the cogsEntry-based exclusions were structurally blind to it (that is why this survived every earlier audit). The delta reaches the destination layer via propagateLandedCostToOutputs, so counting it here too double-posted it.',
+    note: 'onetwo3d-ims-6oyu.19 — stock moved warehouse, it was not sold. Excluded via getTransferConsumedQtyForCostLayer, which reads stock_transfer_lines.costLayerSnapshot NOT cogs_entries: transfer dispatch writes none, so the cogsEntry-based exclusions were structurally blind to it (that is why this survived every earlier audit). The delta reaches the destination (or, after a cancelled dispatch, the replacement) layer via propagateLandedCostToOutputs, so counting it here too double-posted it. WHICH transfer rows that query may read is STOCK_TRANSFER_SOURCE_LAYER_CONSUMPTION below — not a status list spelled out in the SQL.',
   },
   KIT_ASSEMBLY_OUT: {
     relevance: 'NEVER_CONSUMES',
@@ -209,3 +209,79 @@ export const REVALUATION_KNOWN_GAP_MOVEMENT_TYPES: StockMovementType[] =
  */
 export const REVALUATION_ACCEPTED_TRADEOFF_MOVEMENT_TYPES: StockMovementType[] =
   movementTypesWhere((entry) => entry.treatment === 'ACCEPTED_TRADEOFF')
+
+// ---------------------------------------------------------------------------
+// TRANSFER_SNAPSHOT exclusion — which transfer rows the snapshot query may read
+// ---------------------------------------------------------------------------
+
+/**
+ * What a stock transfer in a given status has done to its SOURCE cost layers.
+ *
+ * TRANSFER_OUT is excluded from retrospective COGS by reading
+ * stock_transfer_lines.costLayerSnapshot (see getTransferConsumedQtyForCostLayer).
+ * That query is only correct if it reads exactly the transfers whose dispatch-time
+ * consumption of the source layer is STILL OUTSTANDING — the source layer's
+ * remainingQty is still reduced and the value now lives in some other layer that
+ * propagateLandedCostToOutputs can reach through a costLayerSourceLine.
+ *
+ *  - NOT_DISPATCHED: never left the source warehouse, so no layer was consumed and
+ *    no snapshot was written. Subtracting one would under-post COGS.
+ *  - OUTSTANDING: the source layer was consumed at dispatch and has NOT been given
+ *    back. Subtract it: the delta reaches the units through their replacement /
+ *    destination layer instead.
+ *  - RESTORED_ON_SOURCE_LAYER: a path that un-consumes the ORIGINAL source layer
+ *    (raising its remainingQty back) would remove those units from consumedQty
+ *    already, so subtracting the snapshot too would under-post COGS. No path does
+ *    this today — the value exists so that adding one is a decision recorded here
+ *    rather than a silent double-subtraction.
+ */
+export type TransferSourceLayerConsumption =
+  | 'NOT_DISPATCHED'
+  | 'OUTSTANDING'
+  | 'RESTORED_ON_SOURCE_LAYER'
+
+export type TransferStatusCostConsumption = {
+  consumption: TransferSourceLayerConsumption
+  note: string
+}
+
+/**
+ * Total classification. `Record<StockTransferStatus, ...>` is deliberate: adding a
+ * value to the Prisma StockTransferStatus enum without classifying it here is a
+ * type error, so a new transfer state cannot silently fall out of (or into) the
+ * revaluation exclusion.
+ *
+ * Do NOT derive this from STOCK_TRANSFER_TRANSITIONS. That map models the plain
+ * cancel path only and states IN_TRANSIT -> RECEIVED as the sole transition out of
+ * IN_TRANSIT, yet cancelDispatchedTransfer (app/actions/transfers.ts) deliberately
+ * performs IN_TRANSIT -> CANCELLED outside the machine. Trusting the map is exactly
+ * how the CANCELLED case was missed.
+ */
+export const STOCK_TRANSFER_SOURCE_LAYER_CONSUMPTION: Record<StockTransferStatus, TransferStatusCostConsumption> = {
+  DRAFT: {
+    consumption: 'NOT_DISPATCHED',
+    note: 'Dispatch is what consumes source layers and writes the costLayerSnapshot; a draft has done neither.',
+  },
+  IN_TRANSIT: {
+    consumption: 'OUTSTANDING',
+    note: 'Dispatched: consumeFifoLayersStrict reduced the source layer and froze the snapshot on the line. No destination layer exists yet, so the delta is not carried anywhere until receipt creates one (6oyu.19 residual, visible via the 6oyu.4 STOCK_IN_TRANSIT reconciliation sweep).',
+  },
+  RECEIVED: {
+    consumption: 'OUTSTANDING',
+    note: 'The source layer stays consumed; receiveTransfer creates the destination layer and links it back with a costLayerSourceLine, so propagateLandedCostToOutputs carries the delta there.',
+  },
+  CANCELLED: {
+    consumption: 'OUTSTANDING',
+    note: 'Covers cancelDispatchedTransfer (IN_TRANSIT -> CANCELLED, audit-C5), which explicitly does NOT un-consume the original layers — it creates equivalent REPLACEMENT layers at the source and links each back to the original with a costLayerSourceLine (app/actions/transfers.ts). So the consumption is still outstanding and the delta still reaches the units through propagation, exactly as for RECEIVED. A DRAFT -> CANCELLED transfer was never dispatched and therefore carries no snapshot, so it contributes nothing to the containment query.',
+  },
+}
+
+/**
+ * Transfer statuses whose dispatch-time costLayerSnapshot must be subtracted from
+ * netConsumedQty. The single definition behind getTransferConsumedQtyForCostLayer's
+ * SQL predicate — never re-spell this list at a call site.
+ */
+export const TRANSFER_STATUSES_WITH_OUTSTANDING_SOURCE_CONSUMPTION: StockTransferStatus[] =
+  (Object.keys(STOCK_TRANSFER_SOURCE_LAYER_CONSUMPTION) as StockTransferStatus[])
+    .filter((status) => STOCK_TRANSFER_SOURCE_LAYER_CONSUMPTION[status].consumption === 'OUTSTANDING')
+    .sort()

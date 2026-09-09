@@ -10,6 +10,7 @@
 import type { Prisma, StockMovementType } from '@/app/generated/prisma/client'
 import { getAccountingSettings, isAccountingSyncTypeEnabled, isDailyBatchPostingEnabled, queueAccountingSyncTx } from '@/lib/accounting'
 import { parseCostLayerSnapshot, serializeCostLayerSnapshot, sumCostLayerSnapshot } from '@/lib/cost-layer-snapshots'
+import { TRANSFER_STATUSES_WITH_OUTSTANDING_SOURCE_CONSUMPTION } from '@/lib/domain/inventory/movement-cogs-relevance'
 import { getInventoryConstraintMessage } from '@/lib/domain/inventory/prisma-errors'
 import { recordCogsSubledgerMovement } from '@/lib/domain/accounting/cogs-subledger-movement'
 import {
@@ -942,12 +943,20 @@ export async function getReturnedQtyForCostLayer(
  * to the source with a costLayerSourceLine). Counting them in netConsumedQty as
  * well double-posted the delta and stranded a permanent balance in transit.
  *
- * Status filter: a snapshot is written at dispatch, and STOCK_TRANSFER_TRANSITIONS
- * only allows IN_TRANSIT -> RECEIVED (CANCELLED is reachable from DRAFT alone, i.e.
- * never dispatched). IN_TRANSIT + RECEIVED are therefore exactly the states whose
- * snapshot represents real consumption. The filter is explicit rather than implied
- * by "has a snapshot" so that adding a cancel-after-dispatch path — which would
- * restore the layer and must NOT be subtracted — fails safe.
+ * Status filter: bound from STOCK_TRANSFER_SOURCE_LAYER_CONSUMPTION, the total
+ * per-status classification of whether the dispatch-time consumption of the source
+ * layer is still OUTSTANDING. It is passed as a parameter rather than spelled out
+ * here so the SQL and the classification cannot drift apart, and so a new
+ * StockTransferStatus fails to compile until it is classified.
+ *
+ * The list is NOT derivable from STOCK_TRANSFER_TRANSITIONS: that map states
+ * IN_TRANSIT -> RECEIVED as the only transition out of IN_TRANSIT, but
+ * cancelDispatchedTransfer deliberately performs IN_TRANSIT -> CANCELLED outside
+ * the machine and does NOT un-consume the original layers (it creates replacement
+ * layers linked back by costLayerSourceLine). An earlier version of this query
+ * hard-coded ('IN_TRANSIT', 'RECEIVED') on the strength of that map and so
+ * re-opened 6oyu.19 for every cancelled dispatch: spurious COGS on the original
+ * layer plus the propagated uplift on the replacement layer.
  */
 export async function getTransferConsumedQtyForCostLayer(
   tx: TxClient,
@@ -958,9 +967,10 @@ export async function getTransferConsumedQtyForCostLayer(
     `SELECT stl."costLayerSnapshot"
        FROM "stock_transfer_lines" stl
        INNER JOIN "stock_transfers" st ON st.id = stl."transferId"
-      WHERE st.status IN ('IN_TRANSIT', 'RECEIVED')
+      WHERE st.status = ANY($2::"StockTransferStatus"[])
         AND stl."costLayerSnapshot" @> $1::jsonb`,
     containsCostLayer,
+    TRANSFER_STATUSES_WITH_OUTSTANDING_SOURCE_CONSUMPTION,
   )
 
   let transferredQty = toDecimal(0)
