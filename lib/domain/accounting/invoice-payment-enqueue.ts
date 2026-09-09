@@ -37,6 +37,7 @@ import {
 } from '@/lib/domain/accounting/back-reference'
 import { followUpObligationRecoveryFor } from '@/lib/domain/accounting/follow-up-obligation-registry'
 import { ledgerSalesInvoiceTotalForeign, type PaymentSyncRow } from '@/lib/domain/accounting/settlement-status'
+import type { LedgerStandingRow } from '@/lib/domain/accounting/cancelled-row-evidence'
 import { lockFollowUpScope } from '@/lib/domain/accounting/followup-scope-lock'
 import { attemptCouldHaveReachedTheLedger, effectiveTokenFor } from '@/lib/domain/accounting/followup-retry-guard'
 import { pinnedAttemptDate, settlementMarkerFor } from '@/lib/domain/accounting/ledger-settlement-evidence'
@@ -57,8 +58,16 @@ const STOCK_TX_OPTIONS = { maxWait: 5000, timeout: 20000 }
  * told about this order's receipts. Scoped to the ACTIVE connector: rows left by a connector that is no
  * longer in use describe a ledger nobody is reconciling against, and judging today's settlement by them
  * would report a discrepancy against a system that has been switched off.
+ *
+ * o3d-kof8 — AND THE WHOLE {@link LedgerStandingRow}, REQUIRED, WHICH `PaymentSyncRow` LEAVES
+ * OPTIONAL. That type serves the settlement BADGE, where a missing column costs a wrong label; this
+ * one serves `decideInvoicePaymentRegistration`, where it costs a second payment on a customer
+ * invoice. An optional column reads as absent, absent reads as "nothing resolved this cancellation"
+ * in one direction and as the permissive answer in the other, and neither is a verdict a loader
+ * should be able to produce by forgetting a line of a `select`. Requiring them here means the
+ * `select` below cannot lose a column without failing `tsc`.
  */
-export type InvoicePaymentSyncRow = PaymentSyncRow & {
+export type InvoicePaymentSyncRow = PaymentSyncRow & LedgerStandingRow & {
   /**
    * o3d-6abj — WHAT THIS ROW REGISTERED, EXACTLY, IN THE CURRENCY THE CALLER NAMED.
    *

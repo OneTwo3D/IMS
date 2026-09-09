@@ -36,7 +36,28 @@ import { toDecimal } from '@/lib/domain/math/decimal'
  * fixture that set only one would describe a row production cannot produce — and, worse, would let
  * the arithmetic under test read a figure no writer ever puts there.
  */
-function live(row: Omit<ExistingInvoicePaymentSync, 'registeredAmount'>): ExistingInvoicePaymentSync {
+/**
+ * o3d-kof8 — THE THREE LEDGER-STANDING COLUMNS DEFAULT TO "NOTHING RECORDED" HERE, AND NOWHERE ELSE.
+ *
+ * `ExistingInvoicePaymentSync` now REQUIRES them, so a production loader cannot answer the
+ * cancellation question without having selected the evidence for it. A fixture is the one caller for
+ * which that is noise: a row that names no document, carries no sweep claim and no operator basis is
+ * what `loadInvoicePaymentSyncRows` produces for the ordinary registration these hundred cases are
+ * about, and spelling three nulls into each of them would bury the cases that DO set one.
+ *
+ * They are defaulted, never merged away: a fixture that passes a value keeps it.
+ */
+type RegistrationFixtureRow =
+  Omit<
+    ExistingInvoicePaymentSync,
+    'registeredAmount' | 'externalTransactionId' | 'abandonedBeforeRemoteCall' | 'settlementBasis'
+  >
+  & Partial<Pick<
+    ExistingInvoicePaymentSync,
+    'externalTransactionId' | 'abandonedBeforeRemoteCall' | 'settlementBasis'
+  >>
+
+function live(row: RegistrationFixtureRow): ExistingInvoicePaymentSync {
   // o3d-r948 r2: a READING now, and `loadInvoicePaymentSyncRows` builds exactly these two — a row
   // with a number states its own decimal reading, a row without one states nothing.
   //
@@ -45,6 +66,9 @@ function live(row: Omit<ExistingInvoicePaymentSync, 'registeredAmount'>): Existi
   // provenance, because nothing excludes a settlement record any more.
   return {
     ...row,
+    externalTransactionId: row.externalTransactionId ?? null,
+    abandonedBeforeRemoteCall: row.abandonedBeforeRemoteCall ?? null,
+    settlementBasis: row.settlementBasis ?? null,
     registeredAmount: row.amount == null
       ? { kind: 'not-stated' }
       : { kind: 'stated', amount: toDecimal(row.amount) },
@@ -482,15 +506,131 @@ test('[o3d-ekn8 r4] a PENDING row for this receipt on a retired document refuses
   assert.equal(d.register === false && d.refusal, 'SETTLED_ON_RETIRED_DOCUMENT')
 })
 
-test('[o3d-ekn8 r4] a CANCELLED retired-document row clears it — that is a human saying they read the ledger', () => {
-  // The one thing that IS evidence, and the reason this refusal is not a permanent dead end: an
-  // operator cancelling the row asserts the ledger no longer holds that payment, which is the fact
-  // the code cannot establish for itself. o3d-ekn8's "never silently unsettled for ever" survives —
-  // the refusal above is WARNED about and names this remedy.
+// ---------------------------------------------------------------------------
+// o3d-kof8 / o3d-f709 round 3 (Codex HIGH) — A SWEPT CANCELLED PAYMENT, REGISTERED AGAIN AGAINST
+// THE REPLACEMENT INVOICE.
+//
+// The test that stood here asserted the defect as the feature: "a CANCELLED retired-document row
+// clears it — that is a human saying they read the ledger". A human saying so is ONE of five ways a
+// row reaches CANCELLED, and it is the only one that says anything. The others include the
+// cross-connector orphan sweep, which stamps `abandonedBeforeRemoteCall: true` on the strength of
+// `status = 'PENDING'` alone — and a POSTED row is put BACK to PENDING whenever follow-up work
+// fails, KEEPING the payment id Xero issued.
+//
+// THE FULL PATH, WHICH IS A REAL PRODUCTION ROW AND NOT A CONSTRUCTION:
+//   1. Receipt `pay-new` registers against invoice A (INV-1). Xero issues payment PAY-XERO-1 and the
+//      row goes SYNCED, carrying that id.
+//   2. Follow-up work fails; the row returns to PENDING with the id intact.
+//   3. The orphan sweep retires it: CANCELLED, `abandonedBeforeRemoteCall: true`, id untouched.
+//   4. The invoice is deleted and re-posted as B (INV-2); the order now points at B.
+//
+// Every gate then let it through. The selector scopes A away; `unresolvedInvoicePaymentAttempts`
+// excludes the receipt's OWN row; the retired-document filter excluded every CANCELLED row; the
+// capacity sum drops it for naming another document. And the enqueue key names the invoice, so B
+// gets a DIFFERENT idempotency key and a second payment posts against a live customer invoice.
+// ---------------------------------------------------------------------------
+
+test('[o3d-kof8] a swept CANCELLED row that still names the ledger payment REFUSES against the replacement', () => {
+  const d = decideInvoicePaymentRegistration({
+    ...base,
+    accountingInvoiceId: 'INV-2',
+    existing: [live({
+      status: 'CANCELLED',
+      amount: 100,
+      paymentId: 'pay-new',
+      accountingInvoiceId: 'INV-1',
+      // The id the LEDGER issued, still on the row after the sweep retired it.
+      externalTransactionId: 'PAY-XERO-1',
+      // The sweep's claim, inferred from `status = PENDING` and nothing else.
+      abandonedBeforeRemoteCall: true,
+    })],
+  })
+  assert.equal(d.register, false, 'this is the second payment against a real customer invoice')
+  assert.equal(d.register === false && d.refusal, 'SETTLED_ON_RETIRED_DOCUMENT')
+  assert.match(
+    (d.register === false && d.detail) || '',
+    /INV-1.*PAY-XERO-1/,
+    'and it names the document and the payment an operator has to go and read',
+  )
+})
+
+test('[o3d-kof8] a CANCELLED row nothing resolved refuses too, id or no id', () => {
+  // The majority shape: `cancelPendingSalesInvoiceSyncForOrder` and the post-time retirement leave
+  // BOTH columns null, so nothing establishes an absence. Unknown reads as "possibly this one",
+  // which is this module's own rule and was the one thing the status test could not express.
   const d = decideInvoicePaymentRegistration({
     ...base,
     accountingInvoiceId: 'INV-2',
     existing: [live({ status: 'CANCELLED', amount: 100, paymentId: 'pay-new', accountingInvoiceId: 'INV-1' })],
+  })
+  assert.equal(d.register === false && d.refusal, 'SETTLED_ON_RETIRED_DOCUMENT')
+})
+
+test('[o3d-ekn8 r4] a RESOLVED cancellation clears it — that is a human saying they read the ledger', () => {
+  // The remedy the refusal names, and it still works: o3d-ekn8's "never silently unsettled for ever"
+  // survives. What changed is what counts as the human's word — an OPERATOR_ASSERTION settlement
+  // naming no document, which is the audited NOT_POSTED assertion, rather than any row at all that
+  // happens to be CANCELLED.
+  const asserted = decideInvoicePaymentRegistration({
+    ...base,
+    accountingInvoiceId: 'INV-2',
+    existing: [live({
+      status: 'CANCELLED',
+      amount: 100,
+      paymentId: 'pay-new',
+      accountingInvoiceId: 'INV-1',
+      settlementBasis: OPERATOR_ASSERTION_SETTLEMENT_BASIS,
+    })],
+  })
+  assert.equal(asserted.register, true, 'the audited NOT_POSTED assertion is the fact IMS cannot establish')
+
+  // And the sweep's pre-call proof, where it is not contradicted by an id, resolves it as well.
+  const swept = decideInvoicePaymentRegistration({
+    ...base,
+    accountingInvoiceId: 'INV-2',
+    existing: [live({
+      status: 'CANCELLED',
+      amount: 100,
+      paymentId: 'pay-new',
+      accountingInvoiceId: 'INV-1',
+      abandonedBeforeRemoteCall: true,
+    })],
+  })
+  assert.equal(swept.register, true, 'a PENDING row retired with no document id really was pre-call')
+})
+
+test('[o3d-kof8] a FAILED row on a retired document refuses as well — a failure is not a non-call', () => {
+  // The same correction reached from the other status. `unresolvedInvoicePaymentAttempts` skips this
+  // receipt's OWN rows, so before this gate looked at FAILED rows nothing in the decision saw one.
+  const d = decideInvoicePaymentRegistration({
+    ...base,
+    accountingInvoiceId: 'INV-2',
+    existing: [live({
+      status: 'FAILED',
+      amount: 100,
+      paymentId: 'pay-new',
+      accountingInvoiceId: 'INV-1',
+      externalTransactionId: 'PAY-XERO-2',
+      couldHaveReachedLedger: true,
+    })],
+  })
+  assert.equal(d.register === false && d.refusal, 'SETTLED_ON_RETIRED_DOCUMENT')
+})
+
+test('[o3d-kof8] a row whose stored body could never have posted still clears it', () => {
+  // The payload proof, kept: `attemptCouldHaveReachedTheLedger` reports that the connector's own
+  // guard would have rejected the body before any call, and that is a positive fact about a terminal
+  // row. Without this the retired-document gate would strand every receipt behind an incomplete row.
+  const d = decideInvoicePaymentRegistration({
+    ...base,
+    accountingInvoiceId: 'INV-2',
+    existing: [live({
+      status: 'CANCELLED',
+      amount: 100,
+      paymentId: 'pay-new',
+      accountingInvoiceId: 'INV-1',
+      couldHaveReachedLedger: false,
+    })],
   })
   assert.equal(d.register, true)
 })

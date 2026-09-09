@@ -5,7 +5,7 @@
  * type/status partitioning are where this went wrong before, and both are pure given a fetcher.
  */
 
-import { mayHaveReachedLedger } from '@/lib/domain/accounting/cancelled-row-evidence'
+import { mayHaveReachedLedger, type LedgerStandingRow } from '@/lib/domain/accounting/cancelled-row-evidence'
 import { coversDocumentTotal } from '@/lib/domain/accounting/paid-coverage'
 import {
   addMoney,
@@ -2410,16 +2410,36 @@ export function zeroPaidIsProvenReversal(verdict: RegisteredPaymentVerdict): boo
  * raised by the SALES_INVOICE follow-up for an imported order — names no receipt and so clears none;
  * that is the conservative direction and it is deliberate.
  *
- * CANCELLED REGISTRATIONS DO NOT COUNT AS TELLING THE LEDGER. A retired row asserts nothing was
- * sent, which leaves the receipt exactly as unregistered as it was before the row existed.
+ * o3d-f709 r3 (Codex MEDIUM 1) — AND "CANCELLED REGISTRATIONS DO NOT COUNT AS TELLING THE LEDGER"
+ * WAS THE SIXTEENTH COPY OF THE CLAIM THIS BRANCH EXISTS TO END.
+ *
+ * The sentence that stood here said a retired row "asserts nothing was sent, which leaves the
+ * receipt exactly as unregistered as it was before the row existed". Three of the five writers of
+ * CANCELLED assert no such thing — the orphan sweep, the post-time retirement and the cancelled-sale
+ * settlement — and the first two can retire a row that is already in a ledger, keeping the payment
+ * id the ledger issued. Reading that row as "never told" is what talks a reversal pass into clearing
+ * `paidAt` and raising a chargeback credit note against revenue nobody reversed.
+ *
+ * IT WAS INVISIBLE TO THE CENSUS BECAUSE OF THE SHAPE OF THIS PARAMETER, not because of the
+ * comparison: `{ status: string; paymentId }` is a sync-log row with its evidence columns dropped at
+ * the call site, and this file never names `accountingSyncLog`, so no detector could tell whose
+ * status it was. The parameter is now the full {@link LedgerStandingRow}, REQUIRED — the caller in
+ * payment-reversal.ts already selects all four columns — and the census learnt to follow reduced
+ * rows into helpers so the next one cannot hide the same way.
+ *
+ * `mayHaveReachedLedger` is the fail-closed direction here: a row that may be holding a payment
+ * counts as having told the ledger, so the receipt is NOT reported unregistered and no reversal is
+ * raised on the strength of a registration nobody can speak for. Only a RESOLVED cancellation — an
+ * audited NOT_POSTED assertion or a pre-call sweep, neither naming a document — leaves the receipt
+ * unregistered, and that is a fact somebody established rather than one inferred from a status.
  */
 export function unregisteredLocalReceipts(
   receiptIds: readonly string[],
-  registrations: readonly { status: string; paymentId: string | null }[],
+  registrations: readonly (LedgerStandingRow & { paymentId: string | null })[],
 ): string[] {
   const named = new Set(
     registrations
-      .filter((row) => row.status !== 'CANCELLED')
+      .filter((row) => mayHaveReachedLedger(row))
       .map((row) => row.paymentId)
       .filter((id): id is string => typeof id === 'string' && id.length > 0),
   )

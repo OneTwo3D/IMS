@@ -22,6 +22,7 @@ import {
   type InvoiceFetcher,
   type XeroInvoice,
 } from '@/lib/connectors/xero/invoice-delta'
+import type { LedgerStandingRow } from '@/lib/domain/accounting/cancelled-row-evidence'
 import { qboLedgerAmount } from '@/lib/connectors/quickbooks/payment-poller'
 import { currencyMinorUnits, ledgerAmountEpsilon, toDecimal } from '@/lib/domain/math/decimal'
 
@@ -1176,12 +1177,27 @@ test('a registration that synced at the very instant of the read is undecided, m
 // The witness is the receipt itself, already written in the right transaction. These are the reader.
 // ---------------------------------------------------------------------------
 
+/**
+ * o3d-f709 r3 — A REGISTRATION AS THE READER NOW REQUIRES IT: the status plus the three columns the
+ * shared cancellation rule reads. Defaulted to "nothing recorded" so a case that turns on ONE of
+ * them says so, and never spread over a value a case supplied.
+ */
+const reg = (
+  row: { status: string; paymentId: string | null } & Partial<LedgerStandingRow>,
+): LedgerStandingRow & { paymentId: string | null } => ({
+  externalTransactionId: row.externalTransactionId ?? null,
+  abandonedBeforeRemoteCall: row.abandonedBeforeRemoteCall ?? null,
+  settlementBasis: row.settlementBasis ?? null,
+  status: row.status,
+  paymentId: row.paymentId,
+})
+
 test('[o3d-psrx] a receipt no registration names is unregistered', () => {
   // MUTATION ROUTE: return `[]` unconditionally and every test below passes vacuously — so each one
   // also asserts the paired case, where the receipt IS named and must NOT be reported.
   assert.deepEqual(unregisteredLocalReceipts(['pay_1'], []), ['pay_1'],
     'no registration at all: the window this issue is about')
-  assert.deepEqual(unregisteredLocalReceipts(['pay_1'], [{ status: 'PENDING', paymentId: 'pay_1' }]), [],
+  assert.deepEqual(unregisteredLocalReceipts(['pay_1'], [reg({ status: 'PENDING', paymentId: 'pay_1' })]), [],
     'a PENDING registration DOES name it — the ordinary path a moment later')
 })
 
@@ -1190,17 +1206,59 @@ test('[o3d-psrx] a registration for a DIFFERENT receipt leaves this one unregist
   // receipt. A second receipt added to an already-registered order then reads as covered, and the
   // window reopens for it alone — the hardest case to notice, because the order does have a row.
   assert.deepEqual(
-    unregisteredLocalReceipts(['pay_1', 'pay_2'], [{ status: 'SYNCED', paymentId: 'pay_1' }]),
+    unregisteredLocalReceipts(['pay_1', 'pay_2'], [reg({ status: 'SYNCED', paymentId: 'pay_1' })]),
     ['pay_2'],
   )
 })
 
-test('[o3d-psrx] a CANCELLED registration has told the ledger nothing', () => {
-  // CANCELLED asserts that nothing was sent (see classifyRegisteredPayment), so it leaves the
-  // receipt exactly as unregistered as it was before the row existed.
+test('[o3d-psrx] a RESOLVED cancellation has told the ledger nothing', () => {
+  // A cancellation that resolves something — here an operator's audited NOT_POSTED assertion, which
+  // names no document — really does leave the receipt as unregistered as it was before the row
+  // existed, and the reversal pass must still see it.
   //
-  // MUTATION ROUTE: drop the CANCELLED filter and this fails.
-  assert.deepEqual(unregisteredLocalReceipts(['pay_1'], [{ status: 'CANCELLED', paymentId: 'pay_1' }]), ['pay_1'])
+  // MUTATION ROUTE: return `mayHaveReachedLedger`'s answer inverted, or hard-code `true`, and this
+  // fails: the receipt reads as told-about and the window this issue is about reopens.
+  assert.deepEqual(
+    unregisteredLocalReceipts(['pay_1'], [reg({
+      status: 'CANCELLED',
+      paymentId: 'pay_1',
+      abandonedBeforeRemoteCall: true,
+    })]),
+    ['pay_1'],
+  )
+})
+
+test('[o3d-f709 r3] a CANCELLED registration that still names a payment has NOT told nothing', () => {
+  // THE SIXTEENTH READER (Codex MEDIUM 1). This helper read `status !== 'CANCELLED'` and called
+  // every retired row "never sent". The cross-connector orphan sweep retires a PENDING row —
+  // stamping `abandonedBeforeRemoteCall: true` from that status alone — and a POSTED row is put back
+  // to PENDING whenever follow-up work fails, KEEPING the payment id the ledger issued. So this row
+  // describes a payment that is probably standing in Xero, and reading it as "never told" is what
+  // clears `paidAt` and raises a chargeback credit note against revenue nobody reversed.
+  //
+  // The document id vetoes the sweep's claim (`cancelledClaimIsResolved`), so the receipt counts as
+  // spoken for and no reversal is raised on the strength of it.
+  assert.deepEqual(
+    unregisteredLocalReceipts(['pay_1'], [reg({
+      status: 'CANCELLED',
+      paymentId: 'pay_1',
+      abandonedBeforeRemoteCall: true,
+      externalTransactionId: 'PAY-XERO-1',
+    })]),
+    [],
+    'a swept row that still names the ledger payment is not evidence that nothing was sent',
+  )
+  // AND THE PAIRED CASE, so this cannot pass by reporting nothing: the same row with the id cleared
+  // is a resolved cancellation and the receipt IS reported.
+  assert.deepEqual(
+    unregisteredLocalReceipts(['pay_1'], [reg({
+      status: 'CANCELLED',
+      paymentId: 'pay_1',
+      abandonedBeforeRemoteCall: true,
+      externalTransactionId: null,
+    })]),
+    ['pay_1'],
+  )
 })
 
 test('[o3d-psrx] a registration that names no receipt clears none', () => {
@@ -1208,7 +1266,7 @@ test('[o3d-psrx] a registration that names no receipt clears none', () => {
   // for an imported order. Naming nothing, it clears nothing — the conservative direction.
   //
   // MUTATION ROUTE: treat a null paymentId as a wildcard and this fails.
-  assert.deepEqual(unregisteredLocalReceipts(['pay_1'], [{ status: 'SYNCED', paymentId: null }]), ['pay_1'])
+  assert.deepEqual(unregisteredLocalReceipts(['pay_1'], [reg({ status: 'SYNCED', paymentId: null })]), ['pay_1'])
 })
 
 test('[o3d-psrx] an order with an unregistered receipt is RECEIPT_NOT_REGISTERED, not NOTHING_REGISTERED', () => {

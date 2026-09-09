@@ -185,8 +185,24 @@ test(
 
     const readRegistrations = async () => (await db.accountingSyncLog.findMany({
       where: { connector: 'xero', type: 'INVOICE_PAYMENT', referenceType: 'SalesOrder', referenceId: orderId },
-      select: { status: true, payload: true },
-    })).map((row) => ({ status: row.status, paymentId: payloadPaymentId(row.payload) }))
+      // o3d-f709 r3: the ledger-standing columns, because `unregisteredLocalReceipts` now decides
+      // through the shared classifier and its parameter REQUIRES them. This select is the reason
+      // that requirement is worth having: it is a hand-written reader of the same rows, and before
+      // the type demanded them it could — and did — answer the cancellation question from a status.
+      select: {
+        status: true,
+        payload: true,
+        externalTransactionId: true,
+        abandonedBeforeRemoteCall: true,
+        settlementBasis: true,
+      },
+    })).map((row) => ({
+      status: row.status,
+      externalTransactionId: row.externalTransactionId,
+      abandonedBeforeRemoteCall: row.abandonedBeforeRemoteCall,
+      settlementBasis: row.settlementBasis,
+      paymentId: payloadPaymentId(row.payload),
+    }))
 
     const receiptIds = (await db.payment.findMany({
       where: { orderId, refundId: null }, select: { id: true },

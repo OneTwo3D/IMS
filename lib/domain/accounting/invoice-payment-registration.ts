@@ -14,9 +14,14 @@
  */
 
 import {
+  mayHaveReachedLedger,
+  type LedgerStandingRow,
+} from './cancelled-row-evidence'
+import {
   classifyLedgerSettlement,
   type LedgerSettlementProbe,
 } from './ledger-settlement-evidence'
+import { LEDGER_HELD_REGISTRATION_STATUSES } from './payment-ledger-hold'
 import {
   exactAmountReadingOrLegacy,
   statedAmountOnly,
@@ -59,8 +64,10 @@ export type InvoicePaymentRegistrationRefusal =
    */
   | 'LEDGER_AMOUNT_ASSERTED'
   /**
-   * A LIVE row for THIS receipt settles a ledger document this order no longer points at
-   * (o3d-ekn8 r4). The invoice was deleted and re-posted, so the row is dropped by every
+   * A row for THIS receipt that may be holding a payment settles a ledger document this order no
+   * longer points at (o3d-ekn8 r4; o3d-kof8 for what "may be holding" replaced — see
+   * {@link mayHoldLedgerPayment}, and note that a CANCELLED row is one of these, not an exit from
+   * them). The invoice was deleted and re-posted, so the row is dropped by every
    * document-scoped filter — and it is the record of a payment that was actually SENT. Registering
    * the receipt again against the replacement pays it twice. See the gate for why this is a refusal
    * rather than a silent pass, and what clears it.
@@ -80,8 +87,25 @@ export type InvoicePaymentRegistrationDecision =
       detail?: string
     }
 
-/** One INVOICE_PAYMENT sync row, reduced to what the decision depends on. */
-export type ExistingInvoicePaymentSync = {
+/**
+ * One INVOICE_PAYMENT sync row, reduced to what the decision depends on.
+ *
+ * o3d-kof8 / o3d-f709 r3 (Codex HIGH) — IT CARRIES THE WHOLE {@link LedgerStandingRow}, REQUIRED.
+ *
+ * The four gates below used to ask `status !== 'CANCELLED'` and `couldHaveReachedLedger !== false`,
+ * which is this tree's oldest hand-written claim — "an abandoned row committed nothing" — and it is
+ * FALSE for the majority of cancelled rows (cancelled-row-evidence.ts states why, once). The gates
+ * now ask {@link mayHaveReachedLedger}, and that reading needs three columns beyond the status.
+ *
+ * THEY ARE REQUIRED RATHER THAN OPTIONAL, AND THAT IS THE FIX RATHER THAN A DETAIL OF IT. Two of
+ * them were already declared here as OPTIONAL — `settlementBasis` and `externalTransactionId` —
+ * and an absent optional field reads, in `cancelledClaimIsResolved`, as the PERMISSIVE answer: a
+ * loader that forgot to select `abandonedBeforeRemoteCall` would have got a silently weaker verdict
+ * on the money path instead of a compile error. Requiring them makes that omission unrepresentable:
+ * `loadInvoicePaymentSyncRows` cannot drop a column without failing `tsc`, which is strictly better
+ * than a fifth guard that checks the loader remembered.
+ */
+export type ExistingInvoicePaymentSync = LedgerStandingRow & {
   status: 'PENDING' | 'PROCESSING' | 'SYNCED' | 'FAILED' | 'CANCELLED'
   /**
    * WHAT WAS SENT, as the JSON number the connector put on the wire and the ledger therefore holds.
@@ -126,26 +150,74 @@ export type ExistingInvoicePaymentSync = {
    * has to read as "possibly this one": for money, unknown is not the same as irrelevant.
    */
   accountingInvoiceId?: string | null
-  /**
-   * HOW this row reached its status (o3d-anu8). NULL / absent = the connector's own writeback, so a
-   * real call was made and the ledger answered. `OPERATOR_ASSERTION` = a human typed the outcome and
-   * the document id in, and IMS verified nothing — see lib/domain/accounting/sync-row-settlement.ts.
+  /*
+   * AND FROM {@link LedgerStandingRow}, ALL REQUIRED — `status` (narrowed above),
+   * `settlementBasis`, `externalTransactionId` and `abandonedBeforeRemoteCall`.
    *
-   * Read from the COLUMN. `loadInvoicePaymentSyncRows` already selects it; it is declared here so
-   * the capacity arithmetic below can see it rather than receiving a row that merely happens to
-   * carry it.
+   * `settlementBasis` (o3d-anu8): HOW this row reached its status. NULL = the connector's own
+   * writeback, so a real call was made and the ledger answered; `OPERATOR_ASSERTION` = a human
+   * typed the outcome and the document id in, and IMS verified nothing.
+   * `externalTransactionId` (o3d-anu8): the ledger document this row's settlement is recorded
+   * under — the payment a refusal has to NAME so an operator can go and read it, and the veto
+   * `cancelledClaimIsResolved` applies to every cancellation claim.
+   * `abandonedBeforeRemoteCall` (o3d-f709): whether the canceller CLAIMED the row was pre-call.
+   * Only the cross-connector orphan sweep writes `true`, and it infers it from `status = PENDING`
+   * alone — which a POSTED row is put back to whenever follow-up work fails.
+   *
+   * They are NOT restated as fields here on purpose: a second declaration is a place for the two to
+   * disagree, and this file's own history is a catalogue of exactly that.
    */
-  settlementBasis?: string | null
-  /**
-   * The ledger document this row's settlement is recorded under. Carried only so a refusal can NAME
-   * the payment an operator has to go and read (o3d-anu8).
-   */
-  externalTransactionId?: string | null
+}
+
+/**
+ * o3d-kof8 — COULD THIS ROW BE HOLDING A PAYMENT IN THE LEDGER? THE ONE READING, FOR ALL FOUR GATES.
+ *
+ * Two independent proofs of absence exist for an INVOICE_PAYMENT row, and a gate that consults one
+ * and not the other answers the wrong question:
+ *
+ *   `couldHaveReachedLedger === false` — the PAYLOAD proof. The stored body was missing a field the
+ *   connector requires, so the call was rejected before any HTTP request. Derived by
+ *   `attemptCouldHaveReachedTheLedger` from the payload, and this file has always asked it.
+ *
+ *   `mayHaveReachedLedger(row) === false` — the COLUMN proof, and the one that was missing. A
+ *   cancellation resolves only when nothing local contradicts it; a CANCELLED row that still names
+ *   the document the ledger issued resolves NOTHING, whatever the sweep stamped on it. The rule is
+ *   `cancelledClaimIsResolved`, stated once in cancelled-row-evidence.ts.
+ *
+ * Either proof is sufficient. Neither is available from the STATUS, which is what the four gates
+ * used to read, and what let a swept CANCELLED receipt be registered a second time against a
+ * replacement invoice (Codex, o3d-f709 round 3 HIGH).
+ *
+ * AND THE PAYLOAD PROOF IS ASKED ONLY OF A ROW WITH NO LIVE WORK ON IT, which is not a hedge: it is
+ * what that proof means. `attemptCouldHaveReachedTheLedger` reads the STORED BODY and reports that
+ * the connector's own guard would have rejected it before the call — an argument about an attempt
+ * whose outcome was never recorded. A row that is SYNCED says the call happened AND succeeded, and a
+ * PENDING or PROCESSING one has not been decided yet; letting a body-completeness heuristic overrule
+ * a recorded success would have been a new fail-open, and the redrive fixtures found it immediately.
+ */
+function mayHoldLedgerPayment(row: ExistingInvoicePaymentSync): boolean {
+  if (!mayHaveReachedLedger(row)) return false
+  if (hasLiveRegistrationWork(row)) return true
+  return row.couldHaveReachedLedger !== false
+}
+
+/**
+ * Is there LIVE WORK on this row — a registration queued, in flight, or recorded as done?
+ *
+ * A DIFFERENT QUESTION FROM {@link mayHoldLedgerPayment}, and deliberately still a status test. It
+ * asks what the follow-up machinery is doing, not what the ledger received; the shared set is
+ * payment-ledger-hold's, so the two files cannot drift, and it omits FAILED as well as CANCELLED —
+ * which is why it is not a spelling of "an abandoned row committed nothing" (see the census header
+ * in scripts/check-accounting-cancelled-row-predicates.mjs on why a set that drops FAILED too is a
+ * different claim).
+ */
+function hasLiveRegistrationWork(row: ExistingInvoicePaymentSync): boolean {
+  return (LEDGER_HELD_REGISTRATION_STATUSES as readonly string[]).includes(row.status)
 }
 
 /**
  * Attempts whose outcome is not established: FAILED or CANCELLED, not this receipt's own row, and
- * structurally complete enough that the connector would have made the call.
+ * not proved — by payload or by column — to be absent from the ledger.
  *
  * Exported because the caller needs to know whether to ASK the ledger at all — the probe is a
  * network read and must not run on every receipt, only on the ones with a history.
@@ -163,7 +235,11 @@ export function unresolvedInvoicePaymentAttempts(
   return existing.filter((r) =>
     (r.status === 'FAILED' || r.status === 'CANCELLED')
     && (r.paymentId == null || r.paymentId !== paymentId)
-    && r.couldHaveReachedLedger !== false)
+    // o3d-kof8: BOTH proofs, through the one reading. `couldHaveReachedLedger !== false` alone let
+    // a CANCELLED row whose payload was complete count as unresolved for ever — right — and let a
+    // CANCELLED row an operator had signed NOT_POSTED count too, which is the resolution this
+    // system records precisely so a stranded receipt has a way out.
+    && mayHoldLedgerPayment(r))
 }
 
 /**
@@ -188,10 +264,13 @@ export function unresolvedInvoicePaymentAttempts(
  * twice. And it inverts this module's own stated rule: for money, unknown must read as "possibly
  * this one".
  *
- * So a live row naming a retired document REFUSES, at both the enqueue gate and the post-site guard,
+ * So a row naming a retired document REFUSES, at both the enqueue gate and the post-site guard,
  * which is what keeps the two from disagreeing. What clears it is the one thing that is actual
- * evidence: the row stops being live. Cancelling it is an operator saying "I looked, and the ledger
- * does not hold this payment" — and that is exactly the fact the code cannot establish for itself.
+ * evidence, and o3d-kof8 corrected what that is: NOT "the row stops being live". Cancelling a row
+ * is three different writers' act in this system and only one of them looked at a ledger, so the
+ * clearing fact is a RESOLVED cancellation as `cancelledClaimIsResolved` defines it — an operator's
+ * audited NOT_POSTED assertion, or a sweep's pre-call proof, and in neither case may the row still
+ * name a document the ledger issued. See {@link mayHoldLedgerPayment}.
  *
  * NOT SILENT, which is what o3d-ekn8 exists to prevent. `selectReceiptsAwaitingRegistration` still
  * SELECTS the receipt, so the guarded decision runs and its refusal is warned about with a nameable
@@ -207,8 +286,33 @@ export function retiredDocumentInvoicePaymentAttempts(
   accountingInvoiceId: string,
 ): ExistingInvoicePaymentSync[] {
   return existing.filter((r) =>
-    r.status !== 'FAILED'
-    && r.status !== 'CANCELLED'
+    // o3d-kof8 / o3d-f709 r3 (Codex HIGH) — WHAT "LIVE" HAD TO BECOME, AND WHY THE STATUS COULD NOT
+    // SAY IT.
+    //
+    // This read `status !== 'FAILED' && status !== 'CANCELLED'`, and the sentence above — "what
+    // clears it is the one thing that is actual evidence: the row stops being live" — was written
+    // believing a CANCELLED row IS that evidence. It is not, and this file already knew: an orphan
+    // sweep, a post-time retirement and an operator's cancelled-sale settlement all reach CANCELLED
+    // knowing nothing, and the first two do it to rows that may already have posted.
+    //
+    // THE PATH THAT MADE IT MONEY. Receipt P registers against invoice A and the ledger issues a
+    // payment id. Follow-up work fails, so the row goes BACK to PENDING keeping that id; the
+    // cross-connector orphan sweep then retires it — CANCELLED, `abandonedBeforeRemoteCall: true`
+    // on the strength of `status = PENDING` alone, id untouched. The order's invoice moves to B.
+    // Every gate then let it through: the selector scopes A away, the unresolved-attempt probe
+    // skips the receipt's OWN row, this filter dropped it for being CANCELLED, and the capacity sum
+    // drops it for naming another document. B's enqueue key is different — the key names the
+    // invoice — so a SECOND payment posts against a real customer invoice.
+    //
+    // Asking `mayHoldLedgerPayment` closes it at the type level as well as here: the row's own
+    // `externalTransactionId` vetoes its cancellation claim (`cancelledClaimIsResolved`), and
+    // `ExistingInvoicePaymentSync` now REQUIRES that column, so no loader can answer this question
+    // without having loaded the evidence for it.
+    //
+    // A FAILED row naming another document is caught here now too, and that is the same correction:
+    // o3d-ju8t settled that a failure recorded after the call is not proof of a non-call, and the
+    // unresolved-attempt probe above deliberately skips this receipt's own rows.
+    mayHoldLedgerPayment(r)
     && r.accountingInvoiceId != null
     && r.accountingInvoiceId !== accountingInvoiceId
     && (r.paymentId == null || r.paymentId === paymentId))
@@ -302,6 +406,19 @@ export function decideInvoicePaymentRegistration(input: {
   //
   // So the unresolved-attempt question is asked FIRST, before any arithmetic, because the arithmetic
   // cannot see it.
+  /**
+   * o3d-kof8 — ROWS THIS DECISION HAS ESTABLISHED HOLD NOTHING, carried to the capacity sum.
+   *
+   * The sum below has to know which rows consume capacity, and it used to answer that from the
+   * STATUS: FAILED and CANCELLED "hold nothing — the ledger rejected them or never saw them". That
+   * is the same false claim the retired-document gate above was making, and the sum could not stop
+   * making it because the fact that clears a terminal row is not on the row at all — it is the
+   * LEDGER PROBE's answer, computed here and then thrown away.
+   *
+   * So it is kept. A terminal row leaves the sum when something PROVED it absent: its payload or
+   * its columns (`mayHoldLedgerPayment`), or this probe. Anything else is counted.
+   */
+  const provedAbsent = new Set<ExistingInvoicePaymentSync>()
   const unresolved = unresolvedInvoicePaymentAttempts(input.existing, input.paymentId)
   if (unresolved.length > 0) {
     if (input.ledgerSettlements === null) {
@@ -381,7 +498,12 @@ export function decideInvoicePaymentRegistration(input: {
         // is a visible refusal with a nameable remedy, and the cost of the alternative is a second
         // payment on somebody's ledger, which is neither visible nor remediable.
       )
-      if (verdict.outcome === 'clear') continue
+      if (verdict.outcome === 'clear') {
+        // The ledger was asked and does not hold this attempt. That — and not its status — is what
+        // frees the capacity it would otherwise consume.
+        provedAbsent.add(attempt)
+        continue
+      }
       return {
         register: false,
         refusal: 'UNRESOLVED_PAYMENT_ATTEMPT',
@@ -417,10 +539,28 @@ export function decideInvoicePaymentRegistration(input: {
     }
   }
 
-  // FAILED and CANCELLED rows hold nothing — the ledger rejected them or never saw them — so they free
-  // the capacity again, exactly as the index's live-status predicate does.
+  // WHAT CONSUMES THE INVOICE'S CAPACITY (o3d-kof8 — the fourth gate).
+  //
+  // This said "FAILED and CANCELLED rows hold nothing — the ledger rejected them or never saw them
+  // — so they free the capacity again, exactly as the index's live-status predicate does". The
+  // index's predicate is about SLOTS and is right about them; this sum is about MONEY IN A LEDGER,
+  // and for that the sentence is the branch's whole subject: a failure is recorded after the call
+  // (o3d-ju8t) and a cancellation is written by three writers that know nothing.
+  //
+  // A row is counted unless it may not be holding anything. `hasLiveRegistrationWork` keeps every
+  // queued, in-flight or recorded registration counted exactly as before — including one whose
+  // payload is too incomplete to post, which is the one case where the two readings differ and the
+  // conservative answer is to keep counting it. Everything else must have been PROVED absent, by
+  // the row's own evidence or by the ledger probe above.
+  //
+  // ON TODAY'S PATHS THIS SELECTS THE SAME ROWS THE STATUS TEST DID, and that is checked rather
+  // than assumed: every terminal row that is not this receipt's own has already been through the
+  // probe, so it is either in `provedAbsent` or the decision returned before reaching here. The
+  // difference is what happens when that stops being true — a gate reordered, a caller that skips
+  // the probe, a fourth writer of CANCELLED. Then this counts the row and refuses, where the status
+  // test freed the capacity and let a second payment out.
   const live = input.existing.filter(
-    (r) => r.status !== 'FAILED' && r.status !== 'CANCELLED'
+    (r) => mayHoldLedgerPayment(r) && !provedAbsent.has(r)
     // Our OWN row, if this ever runs twice for one receipt: the idempotency key already makes the second
     // queue a no-op, so treating it as an obstacle would refuse the retry for its own success.
     && (r.paymentId == null || r.paymentId !== input.paymentId)
@@ -583,8 +723,22 @@ export function selectReceiptsAwaitingRegistration<T extends { id: string }>(inp
   const aboutThisDocument = input.existing.filter(
     (r) => r.accountingInvoiceId == null || r.accountingInvoiceId === input.accountingInvoiceId,
   )
+  // o3d-kof8 — THE ONE GATE HERE THAT IS NOT A LEDGER QUESTION, AND IT IS NOT WIDENED.
+  //
+  // The other three gates now ask `mayHoldLedgerPayment`, because they decide whether money may
+  // move. This one decides whether a receipt is even OFFERED to that decision, and the two point in
+  // opposite directions: returning `[]` here is the SILENT end — no refusal is raised, no warning is
+  // logged, the replacement invoice is simply never settled — which is the loss o3d-ekn8 exists to
+  // prevent. So it must not fire more often than it has to, and a CANCELLED row that may be holding
+  // a payment must reach `decideInvoicePaymentRegistration`, which refuses it out loud.
+  //
+  // What it asks instead is "is there live WORK on an unattributable row", through the same set
+  // payment-ledger-hold's classifier reads — a set that omits FAILED as well as CANCELLED, which is
+  // a question about the follow-up queue and not a claim about what the ledger received. Identical
+  // rows to the pair of status comparisons it replaces, without restating what a cancelled row
+  // proves.
   const unattributedLive = aboutThisDocument.some(
-    (r) => r.status !== 'FAILED' && r.status !== 'CANCELLED' && r.paymentId == null,
+    (r) => hasLiveRegistrationWork(r) && r.paymentId == null,
   )
   if (unattributedLive) return []
   const spokenFor = new Set(

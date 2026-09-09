@@ -204,7 +204,17 @@ test('[o3d-6abj] the enqueue guard still registers an ordinary second receipt th
     ...registrationBase,
     paymentAmount: toDecimal('60.00'),
     ledgerTotal: toDecimal('100.00'),
-    existing: [{ status: 'SYNCED', amount: 40, registeredAmount: { kind: 'stated', amount: toDecimal('40.00') }, paymentId: 'pay-old' }],
+    existing: [{
+      status: 'SYNCED',
+      amount: 40,
+      registeredAmount: { kind: 'stated', amount: toDecimal('40.00') },
+      paymentId: 'pay-old',
+      // o3d-kof8: the three ledger-standing columns are REQUIRED on this type now — an ordinary
+      // connector-written registration names no document and carries no cancellation claim.
+      externalTransactionId: null,
+      abandonedBeforeRemoteCall: null,
+      settlementBasis: null,
+    }],
   })
   assert.equal(decision.register, true)
 })
@@ -262,6 +272,9 @@ test('[o3d-6abj] the ENQUEUE sum reads the exact string too, not the number besi
       registeredAmount: readPayloadRegisteredAmount(
         { amount: 1, [REGISTERED_AMOUNT_DECIMAL_FIELD]: '99.00', currency: 'GBP' }, 'GBP'),
       paymentId: 'pay-old',
+      externalTransactionId: null,
+      abandonedBeforeRemoteCall: null,
+      settlementBasis: null,
     }],
   })
   assert.equal(decision.register, false)

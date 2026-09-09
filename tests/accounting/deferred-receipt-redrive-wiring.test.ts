@@ -6,6 +6,7 @@ import {
   obligationReleasePrerequisite,
   refusedFollowUpEnqueue,
 } from '@/lib/domain/accounting/followup-enqueue-outcome'
+import { OPERATOR_ASSERTION_SETTLEMENT_BASIS } from '@/lib/domain/accounting/sync-row-settlement'
 
 /**
  * o3d-ekn8 — DB WIRING for the deferred-receipt re-drive.
@@ -25,7 +26,19 @@ type QueuedRow = { type: string; payload: Record<string, unknown>; idempotencyKe
 const state = {
   // `id` is not decoration: o3d-0m56 derives the token an attempt POSTED under from the row id when
   // its payload pinned none, so a row without one makes the settlement marker a hash of `undefined`.
-  syncRows: [] as Array<{ id: string; status: string; externalTransactionId: null; errorMessage: null; retryCount: number; payload: Record<string, unknown> }>,
+  // o3d-kof8: `settlementBasis` and `abandonedBeforeRemoteCall` are on the row because the decision
+  // now reads them — a cancellation resolves only when one of them says so and no document id
+  // contradicts it — and the fake database has to be able to present a row that is NOT resolved.
+  syncRows: [] as Array<{
+    id: string
+    status: string
+    externalTransactionId: string | null
+    errorMessage: null
+    retryCount: number
+    payload: Record<string, unknown>
+    settlementBasis?: string | null
+    abandonedBeforeRemoteCall?: boolean | null
+  }>,
   queued: [] as QueuedRow[],
   activity: [] as Array<{ action: string; level: string; description: string; metadata: Record<string, unknown> }>,
   payments: [] as Array<{ id: string; amount: number; currency: string; method: string | null; reference: string | null; paidAt: Date }>,
@@ -320,15 +333,30 @@ test('an order carrying NO invoice id is the back-reference having failed, and i
 // The scenario below is the one the branch's own commit message names as motivating.
 // ---------------------------------------------------------------------------
 
-/** The row that registered pay-1 against the invoice that has since been deleted. */
+/**
+ * The row that registered pay-1 against the invoice that has since been deleted.
+ *
+ * o3d-kof8 — `bankAccountId` IS IN THE PAYLOAD, and it is not decoration. Without it
+ * `attemptCouldHaveReachedTheLedger` reports that the connector's own guard would have rejected this
+ * body before any call, so every assertion below about what a RETIRED DOCUMENT proves was being
+ * decided by a missing field instead: two of these tests passed for the payload's reason and one
+ * would have gone on passing after the defect was fixed. This is the body a real registration
+ * carries.
+ */
 function rowForRetiredInvoice(idempotencyKey: string) {
   return {
     id: 'log-retired',
     status: 'SYNCED',
-    externalTransactionId: null,
+    externalTransactionId: null as string | null,
     errorMessage: null,
     retryCount: 0,
-    payload: { amount: 100, accountingInvoiceId: 'INV-1', paymentId: 'pay-1', _idempotencyKey: idempotencyKey },
+    payload: {
+      amount: 100,
+      accountingInvoiceId: 'INV-1',
+      bankAccountId: 'BANK-1',
+      paymentId: 'pay-1',
+      _idempotencyKey: idempotencyKey,
+    },
   }
 }
 
@@ -387,14 +415,47 @@ test('[o3d-ekn8 r4] an UN-ATTRIBUTED live row on the retired document refuses to
   )
 })
 
-test('[o3d-ekn8 r4] once the retired row is CANCELLED the replacement invoice IS settled, key and all', async () => {
-  // Cancelling it is an operator asserting they read the ledger and the old payment is gone — the one
-  // fact this code cannot establish for itself. o3d-ekn8's outcome then holds exactly as before: the
-  // replacement is settled rather than left outstanding for ever, under a key anchored to INV-2 so
-  // the retired row can never claim to be this one. The legacy un-anchored key is used deliberately,
-  // because that is the shape production presents and it is what the anchor exists to defeat.
+test('[o3d-kof8] a SWEPT retired row that still names the ledger payment refuses — it is not evidence', async () => {
+  // Codex, o3d-f709 round 3 HIGH, through the real wiring. The row went SYNCED against INV-1 and Xero
+  // issued PAY-XERO-1; follow-up work failed, putting it back to PENDING with the id intact; the
+  // cross-connector orphan sweep then retired it, stamping `abandonedBeforeRemoteCall: true` from
+  // that status alone and leaving the id where it was. The invoice was re-posted as INV-2.
+  //
+  // The enqueue key names the INVOICE, so INV-2 gets a key the retired row cannot short-circuit:
+  // nothing but the decision stands between this and a second payment on a live customer invoice.
   state.order.accountingInvoiceId = 'INV-2'
-  state.syncRows = [{ ...rowForRetiredInvoice('invoice-payment:payment:pay-1'), status: 'CANCELLED' }]
+  state.syncRows = [{
+    ...rowForRetiredInvoice('invoice-payment:payment:pay-1:invoice:INV-1'),
+    status: 'CANCELLED',
+    externalTransactionId: 'PAY-XERO-1',
+    abandonedBeforeRemoteCall: true,
+  }]
+  state.payments = [...ONE_RECEIPT]
+
+  await redrive('INV-2')
+
+  assert.equal(state.queued.length, 0, 'a second payment must not be queued against the replacement')
+  const refusals = state.activity.filter((a) => a.action === 'invoice_payment_not_registered')
+  assert.equal(refusals.length, 1, 'and the refusal is REPORTED rather than silent')
+  assert.equal(refusals[0].metadata.refusal, 'SETTLED_ON_RETIRED_DOCUMENT')
+  assert.match(refusals[0].description, /INV-1/)
+})
+
+test('[o3d-ekn8 r4] once the retired row is RESOLVED the replacement invoice IS settled, key and all', async () => {
+  // Cancelling it is an operator asserting they read the ledger and the old payment is gone — the one
+  // fact this code cannot establish for itself. o3d-kof8 narrowed what counts as that assertion: the
+  // row must carry an OPERATOR_ASSERTION basis and name no document, which is the audited NOT_POSTED
+  // settlement rather than any row that happens to be CANCELLED. o3d-ekn8's outcome then holds
+  // exactly as before: the replacement is settled rather than left outstanding for ever, under a key
+  // anchored to INV-2 so the retired row can never claim to be this one. The legacy un-anchored key
+  // is used deliberately, because that is the shape production presents and it is what the anchor
+  // exists to defeat.
+  state.order.accountingInvoiceId = 'INV-2'
+  state.syncRows = [{
+    ...rowForRetiredInvoice('invoice-payment:payment:pay-1'),
+    status: 'CANCELLED',
+    settlementBasis: OPERATOR_ASSERTION_SETTLEMENT_BASIS,
+  }]
   state.payments = [...ONE_RECEIPT]
 
   await redrive('INV-2')

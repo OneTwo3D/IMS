@@ -146,3 +146,84 @@ test('[o3d-f709] a status clause nested under an AND inside a rescued OR stays b
   assert.equal(clauses.length, 1)
   assert.equal(clauses[0].rescued, false)
 })
+
+// ---------------------------------------------------------------------------
+// o3d-f709 round 3 (Codex MEDIUM 2) — THE SIBLING LOOP WAS NOT REDUNDANT, AND THE DEPTH CUTOFFS
+// WERE WHY NOBODY COULD SEE IT.
+//
+// Round 2 recorded, beside the sibling loop, that reverting it alone "turns no test red" — a
+// conclusion drawn from a mutation with no counterexample. `restrictsStatus` stopped at depth 6
+// while `collectStatusClauses` ran to depth 8, and the walk that gave up answered FALSE, i.e. "this
+// arm restricts no status", i.e. the permissive answer. So an arm could guarantee a document id at
+// its very top and bury a status restriction four `AND`s down: the arm was accepted, the exclusion
+// beside it was tagged `rescued`, and the predicate still admitted no cancelled row at all.
+// ---------------------------------------------------------------------------
+
+/** Wrap `body` in `depth` nested single-element ANDs — `{ AND: [{ AND: [ … ] }] }`. */
+function nestedAnds(depth: number, body: string): string {
+  let out = body
+  for (let i = 0; i < depth; i++) out = `{ AND: [${out}] }`
+  return out
+}
+
+test('[o3d-f709 r3] a sibling arm restricting the status FOUR ANDs down cannot rescue either', () => {
+  // The counterexample the M7 mutation lacked. The arm names a non-null document id at its top —
+  // `guaranteesPostEvidence` sees that immediately — and restricts the status below the old
+  // `restrictsStatus` cutoff of 6, so the old code called it an alternative. It is not: the whole
+  // predicate is `status IN (LIVE) OR (id IS NOT NULL AND status = 'SYNCED')`, which admits no
+  // CANCELLED row whatever its id, exactly like the round-1 money defect.
+  //
+  // MUTATION: restore `if (depth > 6) return false` in `restrictsStatus` and the first clause is
+  // tagged `rescued: true` again — and the deep clause vanishes from the walk entirely.
+  const clauses = clausesOf(`{
+    OR: [
+      { status: { in: ${LIVE} } },
+      {
+        externalTransactionId: { not: null },
+        AND: [${nestedAnds(4, "{ status: 'SYNCED' }")}],
+      },
+    ],
+  }`)
+  assert.equal(clauses.length, 2, 'the precondition: BOTH status clauses were walked, deep one included')
+  assert.deepEqual(clauses.map((c) => c.rescued), [false, false],
+    'an arm that restricts the status ANYWHERE within it is not an alternative, at any depth')
+})
+
+test('[o3d-f709 r3] the same shape at a depth the OLD walk could still reach is refused too', () => {
+  // THE CONTROL, and it is what makes the test above a statement about the CUTOFF rather than about
+  // the rule. One AND down, the old `restrictsStatus` saw the status and refused the arm, and it
+  // still does. If this one had flipped, the fix would have changed what the census means instead of
+  // how far it looks. (Reverting the cutoff turns the deep case red and leaves this one green — the
+  // difference between them IS the finding.)
+  const clauses = clausesOf(`{
+    OR: [
+      { status: { in: ${LIVE} } },
+      {
+        externalTransactionId: { not: null },
+        AND: [${nestedAnds(1, "{ status: 'SYNCED' }")}],
+      },
+    ],
+  }`)
+  assert.equal(clauses[0].rescued, false)
+})
+
+test('[o3d-f709 r3] a walk that runs out of depth reports UNKNOWN instead of answering', () => {
+  // The limit is now unreachable by anything a human writes, and reaching it is a CENSUS FAILURE
+  // rather than a verdict — the opposite polarity to the cutoff it replaced, which answered "no
+  // status restriction here" and let the exclusion be marked rescued.
+  const sf = ts.createSourceFile(
+    'where.ts',
+    `const where = ${nestedAnds(200, "{ status: 'SYNCED' }")}\n`,
+    ts.ScriptTarget.ES2022,
+    true,
+  )
+  const statement = sf.statements[0]
+  assert.ok(ts.isVariableStatement(statement))
+  const initializer = statement.declarationList.declarations[0].initializer
+  assert.ok(initializer)
+  const ctx = { truncated: false }
+  const out: Array<{ prop: ts.PropertyAssignment; rescued: boolean }> = []
+  collectStatusClauses(initializer, out, 0, false, ctx)
+  assert.equal(ctx.truncated, true, 'the walk says it did not finish')
+  assert.equal(out.length, 0, 'and it did NOT reach the clause — which is why the caller must fail')
+})

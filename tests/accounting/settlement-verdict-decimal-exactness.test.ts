@@ -445,6 +445,11 @@ test('[o3d-r948] an unresolved attempt with a refused figure is undescribable, n
     paymentDate: R948_DATE,
     paymentId: 'pay-old',
     couldHaveReachedLedger: true,
+    // o3d-kof8: REQUIRED now. A FAILED row that names no document and carries no cancellation
+    // claim is exactly what the connector writes when a call is attempted and does not answer.
+    externalTransactionId: null,
+    abandonedBeforeRemoteCall: null,
+    settlementBasis: null,
   })
   const decide = (exact: unknown) => decideInvoicePaymentRegistration({
     syncEnabled: true,
