@@ -70,6 +70,7 @@ class RollbackProbe extends Error {}
 
 type Tx = {
   $queryRaw(query: TemplateStringsArray, ...values: unknown[]): Promise<unknown[]>
+  $queryRawUnsafe(sql: string, ...values: unknown[]): Promise<unknown[]>
   $executeRawUnsafe(sql: string, ...values: unknown[]): Promise<number>
   accountingEvent: { create(args: unknown): Promise<unknown>; findMany(args: unknown): Promise<Array<{ id: string }>> }
   accountingSyncLog: { create(args: unknown): Promise<unknown> }
@@ -1074,6 +1075,216 @@ test('o3d-11rf r10: PostgreSQL agrees with JavaScript trim() on every character,
   assert.ok(btrimWrong.some((row) => row.v === '\u0009'), 'a lone tab among them, the character Codex named')
 })
 
+/**
+ * o3d-11rf r11 (Codex r11, HIGH) — THE SAME DEFECT AS r10, WEARING CASE INSTEAD OF WHITESPACE.
+ *
+ * `buildAccountingEventIdempotencyKey` lowercases with JavaScript `toLowerCase()`, which is Unicode
+ * case mapping. The statement lowercased with PostgreSQL `lower()`, which on this estate's SQL_ASCII
+ * / C-ctype databases folds `A`-`Z` and leaves every other byte alone. Almost all of that difference
+ * is invisible, because the normaliser then collapses everything outside `[a-z0-9._:-]` to `-` and
+ * `á` and `Á` collapse alike. It survives for exactly two characters — the two whose lowercase form
+ * contains an ASCII LETTER:
+ *
+ *   • U+212A KELVIN SIGN, lowercase `k`.
+ *   • U+0130 LATIN CAPITAL LETTER I WITH DOT ABOVE, lowercase `i` + U+0307.
+ *
+ * AND THE CONSEQUENCE IS THE ONE A DETECTOR MAY NOT HAVE. A part of `İ` alone normalises to `i` in
+ * TypeScript and to NOTHING in SQL, so `nullif` made the whole key NULL and the row derived no key at
+ * all: its unexplained VOID mirror owned nothing, paired with nothing, and vanished from the report.
+ * A false NEGATIVE, silently removing exactly the stranded accounting row this reconciliation exists
+ * to find.
+ *
+ * BOTH FORMS ARE HERE because they fail differently. STANDALONE (the whole part is the character) is
+ * the key that disappears; EMBEDDED (`a<char>b` inside a referenceId) is the key that comes out
+ * DIFFERENT — `a-b` instead of `akb` — and quietly pairs with nothing while its sibling row key still
+ * pairs, which is the form that leaves the report looking healthy.
+ *
+ * IT ASSERTS ITS OWN PRECONDITIONS, in the database, before it concludes anything: that PostgreSQL's
+ * fold and JavaScript's really do disagree about these characters, and that the derivation as it was
+ * SPELLED BEFORE THE FIX really does produce a different key — or no key at all — for these exact
+ * tokens. Without those, a fixture like this one can pass while reaching nothing.
+ *
+ * THE PRECONDITIONS ARE ABOUT THIS ESTATE; THE CONCLUSION IS NOT, and the difference was MEASURED
+ * rather than reasoned. Run against a PostgreSQL 17 database created with `LOCALE_PROVIDER builtin
+ * BUILTIN_LOCALE 'C.UTF-8'`, whose `lower()` folds U+212A to `k` on its own and U+0130 to a bare `i`,
+ * the two preconditions below FAIL — correctly, because on such a database the pre-r11 spelling had
+ * no Kelvin defect to measure — while the closing assertion, that the production statement reports
+ * every event the TypeScript builder's keys name, still PASSES. The substitution puts both characters
+ * beyond `lower()` before it runs, so the statement derives the same keys whatever the ctype does;
+ * the fixture's ability to DEMONSTRATE the old defect is what depends on the ctype. A failure in a
+ * precondition here therefore means the premise moved, not that the query regressed.
+ */
+const CASE_FOLD_CHARACTERS = [
+  { suffix: 'kelvin', character: 'K', label: 'U+212A KELVIN SIGN' },
+  { suffix: 'dotted', character: 'İ', label: 'U+0130 LATIN CAPITAL LETTER I WITH DOT ABOVE' },
+] as const
+
+/** The normalisation the statement performed BEFORE r11 — restated here so the defect can be measured. */
+const UNSUBSTITUTED_NORMALISATION =
+  "nullif(regexp_replace(regexp_replace(lower(v), '[^a-z0-9._:-]+', '-', 'g'), '^-+|-+$', '', 'g'), '')"
+
+test('o3d-11rf r11: a KELVIN SIGN and a DOTTED CAPITAL I derive the SAME keys in SQL as in TypeScript', { skip }, async () => {
+  const run = randomUUID().slice(0, 8)
+
+  // THE TYPESCRIPT SIDE, from the production builder, for every fixture this test is about to write.
+  const fixtures = CASE_FOLD_CHARACTERS.flatMap(({ suffix, character, label }) => {
+    const standaloneRef = `11rf11-${run}-${suffix}-alone`
+    const embeddedRef = `11rf11-${run}-${suffix}-a${character}b`
+    return [
+      {
+        label: `${label}, STANDALONE as the payload token`,
+        character,
+        rowId: `${standaloneRef}-s`,
+        reference: standaloneRef,
+        payload: { _idempotencyKey: character },
+        // The token the two foldings disagree about, as the statement sees it.
+        token: character,
+      },
+      {
+        label: `${label}, EMBEDDED in the referenceId of a legacy-key row`,
+        character,
+        rowId: `${embeddedRef}-s`,
+        reference: embeddedRef,
+        payload: { date: '2026-02-03' },
+        token: embeddedRef,
+      },
+    ]
+  }).map((fixture) => ({
+    ...fixture,
+    keys: mirroredAccountingEventIdempotencyKeys({
+      syncLogId: fixture.rowId,
+      connector: 'xero',
+      type: 'SALES_INVOICE',
+      referenceType: 'SalesOrder',
+      referenceId: fixture.reference,
+      payload: fixture.payload,
+    }),
+  }))
+
+  // NOT VACUOUS: the standalone fixtures must yield the ONE payload key, the embedded ones the row key
+  // WITH the legacy key beside it — the second of which is the only one the referenceId reaches.
+  assert.deepEqual(fixtures.map((f) => f.keys.length), [1, 2, 1, 2],
+    'the builder yields the key forms this fixture is built to exercise')
+  assert.deepEqual(
+    fixtures.filter((f) => f.keys.length === 1).map((f) => f.keys[0]),
+    ['accounting-sync:xero:sales_invoice:k', 'accounting-sync:xero:sales_invoice:i'],
+    'a standalone KELVIN SIGN lowercases to k and a standalone dotted capital I to i — in JavaScript',
+  )
+
+  const expected = fixtures.flatMap((f) => f.keys.map((_, k) => `${f.rowId}-e${k}`))
+
+  const { findings, folds, derivations } = await withRollback(async (tx) => {
+    // PRECONDITION 1 — THE TWO FOLDS DISAGREE, and PostgreSQL is asked rather than assumed.
+    const folds = await tx.$queryRaw`
+      SELECT v, lower(v) AS "sqlFold"
+      FROM unnest(${CASE_FOLD_CHARACTERS.map((c) => c.character)}::text[]) AS v
+    ` as Array<{ v: string; sqlFold: string }>
+
+    // PRECONDITION 2 — AND IT REACHES THE KEY. The pre-r11 spelling is run against each fixture's own
+    // token, so the difference is measured on the strings this test actually uses.
+    const derivations = await tx.$queryRawUnsafe(
+      `SELECT v, ${UNSUBSTITUTED_NORMALISATION} AS "before" FROM unnest($1::text[]) AS v`,
+      fixtures.map((f) => f.token),
+    ) as Array<{ v: string; before: string | null }>
+
+    for (const fixture of fixtures) {
+      await makeSyncLog(tx, {
+        id: fixture.rowId, reference: fixture.reference, status: 'PENDING', payload: fixture.payload,
+      })
+      for (const [k, key] of fixture.keys.entries()) {
+        await makeEvent(tx, {
+          id: `${fixture.rowId}-e${k}`, reference: fixture.reference,
+          status: 'VOID', voidBasis: null, idempotencyKey: key,
+        })
+      }
+    }
+
+    return { findings: (await reportFindings(tx)).findings, folds, derivations }
+  })
+
+  for (const { character, label } of CASE_FOLD_CHARACTERS) {
+    const observed = folds.find((row) => row.v === character)
+    assert.ok(observed, `${label} survived the round trip`)
+    assert.equal(observed.sqlFold, character,
+      `${label} — PostgreSQL lower() leaves it exactly as it found it. Every database in this estate `
+      + 'is SQL_ASCII with a C ctype; see the note above for what a failure here means')
+    assert.notEqual(character.toLowerCase(), character,
+      `${label} — JavaScript toLowerCase() does not. THAT is the disagreement, stated before it is used`)
+  }
+
+  // And the disagreement changes the KEY, not merely the character: the pre-r11 derivation produces
+  // something OTHER than what TypeScript produces for every one of these four tokens.
+  for (const fixture of fixtures) {
+    const before = derivations.find((row) => row.v === fixture.token)
+    assert.ok(before, `${fixture.label} — the pre-r11 derivation was measured`)
+    const typescriptPart = fixture.token.trim().toLowerCase()
+      .replace(/[^a-z0-9._:-]+/g, '-').replace(/^-+|-+$/g, '')
+    assert.notEqual(before.before, typescriptPart,
+      `${fixture.label} — the derivation this replaced gives ${JSON.stringify(before.before)} where `
+      + `TypeScript gives ${JSON.stringify(typescriptPart)}`)
+  }
+  assert.ok(derivations.some((row) => row.before === null || row.before === ''),
+    'and for a standalone one it gave NO PART AT ALL, which is how the whole key went NULL — the '
+    + 'shape of the false negative, measured rather than described')
+
+  assert.deepEqual(
+    findings.filter((f) => f.code === CONTRADICTION).map((f) => f.accountingEventId).sort(),
+    [...expected].sort(),
+    'every key the TypeScript builder derives for these rows is joined on by the production statement',
+  )
+})
+
+/**
+ * o3d-11rf r11 — THE CLOSURE, AGAINST THE DATABASE.
+ *
+ * The unit suite proves, over every code point of the running engine, that JavaScript `toLowerCase()`
+ * and an ASCII-ONLY fold can only disagree about a key for the two characters substituted in the
+ * statement. That proof rests on one claim about PostgreSQL: that `lower()` on this database IS an
+ * ASCII-only fold. This asserts that claim, and it asserts it over EVERY character rather than over a
+ * chosen few, because a battery proves parity only over the shapes it contains — the lesson of r10.
+ *
+ * U+0000 IS THE ONE EXCLUSION AND IT IS NOT A GAP: PostgreSQL `text` cannot carry a NUL byte and
+ * `jsonb` rejects the escape that would produce one, so no key part can ever contain it.
+ */
+test('o3d-11rf r11: PostgreSQL lower() folds ASCII and nothing else, on every character', { skip }, async () => {
+  const asciiFold = (value: string) => value.replace(/[A-Z]/g, (character) => character.toLowerCase())
+
+  const characters: string[] = []
+  for (let point = 1; point <= 0x10ffff; point++) {
+    if (point >= 0xd800 && point <= 0xdfff) continue
+    characters.push(String.fromCodePoint(point))
+  }
+  assert.ok(characters.length > 1_000_000, 'every code point, not a sample')
+
+  const disagreements: string[] = []
+  const unicodeDifferences: string[] = []
+  await withRollback(async (tx) => {
+    for (let at = 0; at < characters.length; at += 100_000) {
+      const chunk = characters.slice(at, at + 100_000)
+      const folded = await tx.$queryRaw`
+        SELECT v, lower(v) AS "sqlFold" FROM unnest(${chunk}::text[]) AS v
+      ` as Array<{ v: string; sqlFold: string }>
+      assert.equal(folded.length, chunk.length, 'every character in the chunk came back')
+      for (const row of folded) {
+        if (row.sqlFold !== asciiFold(row.v)) disagreements.push(JSON.stringify(row.v))
+        if (row.sqlFold !== row.v.toLowerCase()) unicodeDifferences.push(row.v)
+      }
+    }
+  }, 600_000)
+
+  assert.deepEqual(disagreements.slice(0, 20), [],
+    'PostgreSQL lower() folds ASCII and nothing else on this database — the premise the unit closure rests on')
+
+  // NOT VACUOUS, TWICE OVER. The sweep must actually reach characters the two folds differ on, and it
+  // must reach the two this statement substitutes — otherwise it would pass against a database on
+  // which nothing interesting happens.
+  assert.ok(unicodeDifferences.length > 1_000,
+    `lower() and toLowerCase() differ on ${unicodeDifferences.length} characters — the sweep reaches them`)
+  for (const { character, label } of CASE_FOLD_CHARACTERS) {
+    assert.ok(unicodeDifferences.includes(character), `${label} among them, the character Codex named`)
+  }
+})
+
 test('o3d-11rf r4: the probes left the database as they found it', { skip }, async () => {
   loadEnv()
   const { db } = await import('../../lib/db')
@@ -1089,4 +1300,8 @@ test('o3d-11rf r4: the probes left the database as they found it', { skip }, asy
   assert.equal(r10Survivors, 0, 'and the r10 whitespace probes')
   const r10Rows = await db.accountingSyncLog.count({ where: { id: { startsWith: '11rf10-' } } })
   assert.equal(r10Rows, 0, 'both sides of those too')
+  const r11Survivors = await db.accountingEvent.count({ where: { id: { startsWith: '11rf11-' } } })
+  assert.equal(r11Survivors, 0, 'and the r11 case-folding probes')
+  const r11Rows = await db.accountingSyncLog.count({ where: { id: { startsWith: '11rf11-' } } })
+  assert.equal(r11Rows, 0, 'both sides of those as well')
 })

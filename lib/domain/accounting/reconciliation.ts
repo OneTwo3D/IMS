@@ -84,6 +84,64 @@ const ECMASCRIPT_TRIM_CHARACTERS = [
  */
 export const ECMASCRIPT_BLANK_PATTERN = `^(?:${ECMASCRIPT_TRIM_CHARACTERS.join('|')})*$`
 
+/**
+ * o3d-11rf r11 (Codex r11, HIGH) — THE OTHER HALF OF "THE SAME STRING FUNCTION": CASE.
+ *
+ * `buildAccountingEventIdempotencyKey` lowercases with JavaScript `toLowerCase()`, which is UNICODE
+ * case mapping. The statement below lowercases with PostgreSQL `lower()`, which on this estate's
+ * SQL_ASCII / C-ctype databases is a BYTE operation: it folds `A`-`Z` and leaves every other byte
+ * exactly as it found it. So the two functions do not compute the same thing, and r10's tab is the
+ * same defect in a different dress.
+ *
+ * MOST OF THAT DIFFERENCE IS HARMLESS AND IT IS WORTH SAYING WHY, because it is what makes the fix
+ * small enough to be exhaustive. After folding, the normaliser COLLAPSES every run of characters
+ * outside `[a-z0-9._:-]` to a single `-`. A difference between the two foldings can therefore only
+ * SURVIVE when one of them produces a character INSIDE that alphabet and the other does not: `Á`
+ * lowercases to `á` in JavaScript and stays `Á` in SQL, and both collapse to `-`, so nothing about
+ * the key changes. Case mappings never produce digits or punctuation, so "inside that alphabet"
+ * means "an ASCII letter" — and Unicode contains exactly TWO characters whose lowercase form
+ * contains an ASCII letter while the character itself is not ASCII:
+ *
+ *   • U+212A KELVIN SIGN, whose lowercase is `k`.
+ *   • U+0130 LATIN CAPITAL LETTER I WITH DOT ABOVE, whose FULL lowercase is `i` + U+0307 COMBINING
+ *     DOT ABOVE — two characters, which is why no 1:1 mapping (`translate`) can express it.
+ *
+ * THAT CLOSURE IS NOT ASSERTED FROM MEMORY. `tests/domain/accounting/reconciliation.test.ts` walks
+ * EVERY code point of the running engine, normalises it standalone and embedded under both foldings,
+ * and asserts the set that disagrees is exactly this table — so a future JavaScript, or a future
+ * Unicode, that adds a third goes RED here instead of quietly parting the two derivations again.
+ *
+ * WHAT IT COST TO GET WRONG, and it is the reason this is not a curiosity. `referenceId = 'İ'`
+ * builds the key part `i` in TypeScript and NOTHING in SQL — the part normalises to empty, `nullif`
+ * makes the whole concatenation NULL, and the row derives no key at all. Its unexplained VOID mirror
+ * then owns nothing, pairs with no live row, and drops out of the report: a FALSE NEGATIVE in a
+ * detector, which is the one failure a detector may not have.
+ *
+ * SUBSTITUTED BEFORE `lower()`, NOT AFTER, and with `replace()` rather than a character set.
+ *
+ * BEFORE, because that is what makes the statement INDIFFERENT TO THE DATABASE'S CTYPE — and the
+ * difference was measured, not reasoned. On a PostgreSQL 17 database created with
+ * `LOCALE_PROVIDER builtin BUILTIN_LOCALE 'C.UTF-8'`, `lower()` folds U+212A to `k` on its own and
+ * U+0130 to a BARE `i` (simple case mapping, where JavaScript uses the full one and produces
+ * `i` + U+0307). Substituting AFTER the fold would hand `lower()` the two characters it gets wrong
+ * and then look for originals that are no longer there — right on this estate by luck, wrong on that
+ * one. Substituting first means neither character ever reaches `lower()`, so the statement derives
+ * the same keys on both; the DB suite asserts exactly that, having been run against both.
+ *
+ * WITH `replace()`, because it matches a SUBSTRING: on a SQL_ASCII database the search is a byte
+ * string, and UTF-8 is prefix-free and self-synchronising, so a byte match can only land on a real
+ * character boundary — the same property that lets ECMASCRIPT_BLANK_PATTERN be an alternation of
+ * whole characters. `translate()` could not be used even if the mapping were 1:1: it is a BYTE set
+ * here and would tear these sequences apart.
+ */
+const ASCII_FOLD_EXCEPTIONS = [
+  ['\u212a', '\u006b'],
+  ['\u0130', '\u0069\u0307'],
+] as const
+
+/** The table above, flattened the way the statement sends it, for the test that reads it back. */
+export const ASCII_FOLD_EXCEPTION_PARAMETERS: readonly string[] = ASCII_FOLD_EXCEPTIONS.flat()
+
 export type AccountingReconciliationSeverity = 'warning' | 'critical'
 export type AccountingReconciliationRunStatus = 'COMPLETED' | 'FAILED' | 'PARTIAL'
 export type AccountingReconciliationFindingStatus = 'OPEN' | 'RESOLVED' | 'ACCEPTED'
@@ -1454,7 +1512,10 @@ function addAssumedRevisionOrderFindings(
  *
  * THE PARTS ARE NORMALISED THE WAY `buildAccountingEventIdempotencyKey` NORMALISES THEM — lowercased,
  * every run of characters outside `[a-z0-9._:-]` collapsed to one `-`, leading and trailing `-`
- * stripped, then joined on `:`. NON-BLANK, in every one of those sentences, is JavaScript `trim()`'s
+ * stripped, then joined on `:`. LOWERCASED means JavaScript `toLowerCase()` and not PostgreSQL
+ * `lower()`, which on a SQL_ASCII database folds ASCII bytes and nothing else — see
+ * ASCII_FOLD_EXCEPTIONS, which is the whole of o3d-11rf r11 and names the only two characters where
+ * the two can still differ once the collapse has run. NON-BLANK, in every one of those sentences, is JavaScript `trim()`'s
  * sense of it and not `btrim`'s — see ECMASCRIPT_BLANK_PATTERN, which is the whole of o3d-11rf r10.
  * The one deliberate divergence: TypeScript THROWS when a part
  * normalises to blank, and this yields NO KEY instead (the `nullif(..., '')` makes the concatenation
@@ -1540,13 +1601,22 @@ async function collectVoidMirrorContradictions(
                parts[6] AS "payloadKey", parts[7] AS "payloadDate"
         FROM (
           SELECT array_agg(
-                   nullif(regexp_replace(regexp_replace(lower(part.value), '[^a-z0-9._:-]+', '-', 'g'), '^-+|-+$', '', 'g'), '')
+                   nullif(regexp_replace(regexp_replace(folded.value, '[^a-z0-9._:-]+', '-', 'g'), '^-+|-+$', '', 'g'), '')
                    ORDER BY part.ord
                  ) AS parts
           FROM unnest(ARRAY[
             l."connector", l."type"::text, l."referenceType", l."referenceId", l."id",
             raw."payloadKey", raw."payloadDate"
           ]) WITH ORDINALITY AS part(value, ord)
+          -- LOWERCASED THE WAY JavaScript toLowerCase() LOWERCASES, not the way lower() does. See
+          -- ASCII_FOLD_EXCEPTIONS: lower() is a BYTE fold on a SQL_ASCII database, and the only two
+          -- characters where that difference can outlive the collapse below are substituted first.
+          -- A NULL part stays NULL through both, which is what makes an unbuildable key drop out.
+          CROSS JOIN LATERAL (
+            SELECT lower(replace(replace(part.value,
+                     ${ASCII_FOLD_EXCEPTIONS[0][0]}, ${ASCII_FOLD_EXCEPTIONS[0][1]}),
+                     ${ASCII_FOLD_EXCEPTIONS[1][0]}, ${ASCII_FOLD_EXCEPTIONS[1][1]})) AS value
+          ) folded
         ) normalized
       ) n
       WHERE l."status"::text = ANY(${[...MIRROR_CONTRADICTING_SYNC_STATUSES]}::text[])

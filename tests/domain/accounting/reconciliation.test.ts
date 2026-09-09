@@ -5,6 +5,7 @@ import test from 'node:test'
 import {
   DAILY_BATCH_SPLIT_BRIDGE_AMBIGUOUS,
   ECMASCRIPT_BLANK_PATTERN,
+  ASCII_FOLD_EXCEPTION_PARAMETERS,
   MAX_RECONCILIATION_FINDINGS_PER_RUN,
   MAX_VOID_MIRROR_CONTRADICTIONS,
   RECONCILIATION_ROW_CAP_REACHED,
@@ -1570,16 +1571,20 @@ async function captureContradictionQuery(result: unknown[] = []) {
  */
 const PAYLOAD_KEY_BLANK_PARAMETER = 0
 const PAYLOAD_DATE_BLANK_PARAMETER = 1
-const STATUSES_PARAMETER = 2
-const TYPES_PARAMETER = 3
-const EXTERNAL_ID_BLANK_PARAMETER = 4
+/** o3d-11rf r11: the four case-fold substitution parameters, `from`/`to` in table order. */
+const FOLD_EXCEPTION_PARAMETERS = [2, 3, 4, 5]
+const STATUSES_PARAMETER = 6
+const TYPES_PARAMETER = 7
+const EXTERNAL_ID_BLANK_PARAMETER = 8
 
 test('o3d-11rf r10: the statement’s parameters are where the assertions below say they are', async () => {
   const { values } = await captureContradictionQuery()
 
-  assert.equal(values.length, 6, 'six holes in the template: three blank patterns, two lists and the bound')
+  assert.equal(values.length, 10,
+    'ten holes in the template: three blank patterns, four fold substitutions, two lists and the bound')
   assert.equal(typeof values[PAYLOAD_KEY_BLANK_PARAMETER], 'string')
   assert.equal(typeof values[PAYLOAD_DATE_BLANK_PARAMETER], 'string')
+  for (const at of FOLD_EXCEPTION_PARAMETERS) assert.equal(typeof values[at], 'string')
   assert.ok(Array.isArray(values[STATUSES_PARAMETER]), 'the statuses are the first list')
   assert.ok(Array.isArray(values[TYPES_PARAMETER]), 'the types are the second')
   assert.equal(typeof values[EXTERNAL_ID_BLANK_PARAMETER], 'string')
@@ -1720,6 +1725,92 @@ test('o3d-11rf r10: the blank test the statement sends IS JavaScript trim(), cha
 
   assert.match(sql, /l\."payload" ->> '_idempotencyKey' !~ \?/, 'the payload token is tested with it')
   assert.match(sql, /l\."payload" ->> 'date' !~ \?/, 'the legacy date is too')
+})
+
+/**
+ * o3d-11rf r11 (Codex r11, HIGH) — CASE, AND THE PROOF THAT THE SET OF EXCEPTIONS IS THE WHOLE SET.
+ *
+ * TypeScript lowercases with `toLowerCase()` (Unicode); the statement lowercases with PostgreSQL
+ * `lower()`, which on this estate's SQL_ASCII / C-ctype databases folds `A`-`Z` and touches nothing
+ * else. Rounds 9, 10 and 11 have now all been the same shape — a SQL derivation drifting from the
+ * TypeScript one — so this test does not patch the instance. It CLOSES the class for case, by
+ * walking every code point of the running engine and asserting that the set on which the two
+ * foldings can still produce different KEYS is exactly the table the statement substitutes.
+ *
+ * WHY A CLOSED SET EXISTS AT ALL, and it is the fact that makes this tractable. After folding, the
+ * normaliser collapses every run of characters outside `[a-z0-9._:-]` to one `-`. A folding
+ * difference can therefore only reach the key when one side produces a character INSIDE that
+ * alphabet and the other does not; case mappings never produce digits or punctuation, so that means
+ * an ASCII LETTER. The walk below finds the two characters for which that is true and asserts there
+ * is no third — so the next Unicode, or the next JavaScript, is caught HERE rather than in a review.
+ *
+ * WHAT IT CANNOT SHOW is that PostgreSQL's `lower()` really is the ASCII-only fold modelled here.
+ * That is a fact about a database and it is proved against one, over every character, in
+ * tests/db/reconciliation-void-mirror-contradictions.
+ */
+const ASCII_ONLY_FOLD = (value: string) => value.replace(/[A-Z]/g, (character) => character.toLowerCase())
+
+/** The normalisation `buildAccountingEventIdempotencyKey` applies to ONE part, with the fold swapped out. */
+function normalisePart(value: string, fold: (value: string) => string): string {
+  return fold(value.trim()).replace(/[^a-z0-9._:-]+/g, '-').replace(/^-+|-+$/g, '')
+}
+
+test('o3d-11rf r11: the fold exceptions the statement substitutes are the WHOLE set, over every code point', async () => {
+  // EVERY CODE POINT, in the two positions that behave differently: standalone (where a difference can
+  // empty the part and kill the whole key) and embedded (where it merely produces a different key).
+  const disagreeing: Array<[string, string]> = []
+  for (let point = 1; point <= 0x10ffff; point++) {
+    if (point >= 0xd800 && point <= 0xdfff) continue
+    const character = String.fromCodePoint(point)
+    const differs = [character, `a${character}b`].some(
+      (token) => normalisePart(token, (v) => v.toLowerCase()) !== normalisePart(token, ASCII_ONLY_FOLD),
+    )
+    if (differs) disagreeing.push([character, character.toLowerCase()])
+  }
+
+  // THE CLOSURE. Not "the two we know about are in the set" — that the set has nothing else in it.
+  assert.deepEqual(disagreeing, [
+    ['İ', 'i̇'],
+    ['K', 'k'],
+  ], 'exactly two characters in all of Unicode can make these two foldings build different keys')
+
+  // AND THE STATEMENT SUBSTITUTES EXACTLY THOSE, read back OUT of the parameters production sends —
+  // not off the constant sitting beside them.
+  const { values } = await captureContradictionQuery()
+  const sent = FOLD_EXCEPTION_PARAMETERS.map((at) => values[at] as string)
+  assert.deepEqual(sent, ASCII_FOLD_EXCEPTION_PARAMETERS,
+    'the four substitution parameters are the exported table, flattened')
+  assert.deepEqual(
+    [[sent[0], sent[1]], [sent[2], sent[3]]].sort(),
+    [...disagreeing].sort(),
+    'and the exported table IS the set this walk just derived from the engine',
+  )
+
+  // NOT VACUOUS: each substitution must be the character's own JavaScript lowercase, or the statement
+  // would be replacing one wrong answer with another.
+  for (const [character, lowercase] of disagreeing) {
+    assert.equal(character.toLowerCase(), lowercase, 'the replacement is toLowerCase()’s own answer')
+    assert.notEqual(ASCII_ONLY_FOLD(character), lowercase,
+      'and an ASCII-only fold does NOT reach it — which is the entire finding')
+  }
+})
+
+test('o3d-11rf r11: the fold is applied to the SUBSTITUTED value, and no bare lower() survives', async () => {
+  const { sql } = await captureContradictionQuery()
+  const executable = sql.replace(/--[^\n]*/g, '')
+  assert.ok(/lower\(/.test(executable), 'the comment stripper left the statement behind')
+
+  // ORDER IS THE WHOLE POINT: substitute, THEN fold. Folding first would hand `lower()` the very
+  // characters it gets wrong, and replacing afterwards would never find them.
+  assert.match(executable, /lower\(replace\(replace\(part\."?value"?,\s*\?,\s*\?\),\s*\?,\s*\?\)\)/,
+    'lower() is applied to a doubly-substituted part, with both replacements inside it')
+  assert.ok(!/lower\(part\.value\)/.test(executable),
+    'and no bare lower(part.value) is left anywhere — that spelling IS the defect')
+
+  // The collapse reads the FOLDED value, not the raw one: a substitution the normaliser never sees
+  // would be a fix that changes nothing.
+  assert.match(executable, /regexp_replace\(regexp_replace\(folded\.value,/,
+    'the collapse consumes the folded value')
 })
 
 test('o3d-11rf r4: the bound is applied AFTER the grouping, and it is the stated one', async () => {
