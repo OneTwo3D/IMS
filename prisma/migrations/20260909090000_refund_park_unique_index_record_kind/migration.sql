@@ -15,12 +15,24 @@
 -- lib/connectors/woocommerce/sync/order-import.ts). That is the collision o3d-xnwu r8 added
 -- `recordKind` to end, and o3d-272i removed eight hand-written TypeScript copies of the old shape
 -- for. This one is not TypeScript, so no AST sweep reached it — and being an INDEX it OVERRIDES the
--- application fixes rather than merely lagging them. The two rows' externalIds come from DIFFERENT
--- WooCommerce id spaces: a park carries the REFUND id, a hold carries the ORDER id. They collide as
--- soon as some order id equals some refund id, which is a matter of time and not of misuse. When
--- they do, whichever row is written second is refused by a UNIQUE violation for sharing a key with a
--- row of another family entirely: a legitimate invoice hold cannot be recorded, or a refund park
--- cannot be recorded, and the loser is decided by arrival order.
+-- application fixes rather than merely lagging them.
+--
+-- WHAT THE INDEX THEN ASSERTS, AND WHY IT IS FALSE. The two families put DIFFERENT external ids in
+-- the same column: a park carries the REFUND id, a hold carries the WooCommerce ORDER id. So the
+-- index says "no refund park and no invoice hold may ever share an external id", which is not a
+-- property either family has and not a rule anything in IMS wants. When two such rows do share one,
+-- whichever is written second is refused with a 23505 for colliding with a row of another family
+-- entirely — a legitimate invoice hold that cannot be recorded, or a refund park that cannot be
+-- recorded, with the loser decided by arrival order.
+--
+-- HOW REACHABLE IS THAT, STATED HONESTLY. Within ONE WooCommerce site an order and a refund are both
+-- posts drawn from one id sequence, so their ids do not collide, and this is not a defect that has
+-- necessarily fired yet. But the key is (connector, "externalId") and `connector` names the
+-- CONNECTOR, not the STORE: this database has a store-rebind path (app/actions/wc-sync.ts) and keeps
+-- the rows written under a previous store, so nothing scopes the two id spaces to one site over the
+-- table's lifetime. The fix does not rest on that argument either way. An index that decides whether
+-- an INSERT lands must be asking the question it means to ask, and this one was asking whether a row
+-- of another family exists.
 --
 -- THE FIX is the clause the index has never carried. The predicate below is rendered by
 -- `activeRefundParkIndexPredicateSql()` in lib/domain/sales/wc-sync-row-families.ts, from the same

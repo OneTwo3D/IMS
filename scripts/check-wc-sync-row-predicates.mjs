@@ -361,8 +361,9 @@ for (const file of migrationFiles) {
       + 'The database is a reader of this rule like any other, and a migration cannot call TypeScript — so render '
       + 'the predicate with activeRefundParkIndexPredicateSql() in lib/domain/sales/wc-sync-row-families.ts, paste '
       + 'that exact text into the migration, and add the file to MIGRATION_OWNERS in this script saying what holds '
-      + 'the two together. o3d-272i r2: the last hand-written one sat in the database for seven weeks refusing '
-      + 'held sales invoices, and no sweep of this repository could see it.',
+      + 'the two together. o3d-272i r2: the last hand-written one was built a month before the column that '
+      + 'tells these families apart existed, went on refusing held sales invoices from the day that family '
+      + 'was added, and no sweep of this repository could see it.',
     )
   }
 }

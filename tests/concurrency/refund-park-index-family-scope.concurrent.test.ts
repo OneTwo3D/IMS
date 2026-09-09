@@ -20,13 +20,22 @@ import { activeRefundParkWhere } from '@/lib/domain/sales/refund-park-recovery'
  * HELD SALES INVOICE writes every one of them. So the index treated a hold as a park, and enforced
  * uniqueness of (connector, externalId) ACROSS BOTH FAMILIES.
  *
- * AND THE TWO externalIds COME FROM DIFFERENT WooCOMMERCE ID SPACES. A park carries the REFUND id; a
- * hold carries the ORDER id. Nothing keeps those apart, so the first time some order id equals some
- * refund id the second row to arrive is refused with a 23505 — a legitimate invoice hold that cannot
- * be recorded, or a refund park that cannot be recorded, decided by arrival order. o3d-xnwu r8 fixed
- * this collision in `foreignPark` (which threw on a hold) and in the park resolvers (which settled
- * one to SYNCED); this is its third instance, and an index OVERRIDES both of those fixes rather than
- * merely lagging them.
+ * AND THE TWO FAMILIES PUT DIFFERENT IDS IN THAT COLUMN. A park carries the REFUND id; a hold
+ * carries the WooCommerce ORDER id. So the index asserts that no park and no hold may ever share an
+ * external id — a rule neither family has any reason to obey — and when two such rows do share one,
+ * the second to arrive is refused with a 23505 for colliding with a row of another family entirely.
+ *
+ * HOW REACHABLE, STATED HONESTLY. Within one WooCommerce site an order and a refund are posts from a
+ * single id sequence and do not collide, so this is not asserted to have fired in production. The
+ * key is nonetheless (connector, externalId) and `connector` names the connector, not the store —
+ * and this database has a store-rebind path and keeps rows written under a previous store. The test
+ * below does not depend on the two id spaces overlapping on the day it runs: it constructs the
+ * collision, because the property under test is that the index must not be asking about a family it
+ * was never meant to constrain.
+ *
+ * o3d-xnwu r8 fixed the same collision in `foreignPark` (which threw on a hold) and in the park
+ * resolvers (which settled one to SYNCED); this is its third instance, and an index OVERRIDES both
+ * of those fixes rather than merely lagging them.
  *
  * WHY IT HAS TO BE A REAL DATABASE, AND A REAL INDEX. This is a property of shipped DDL. A hand-made
  * table, or a double standing in for Prisma, answers whatever it was built to answer — the earlier
