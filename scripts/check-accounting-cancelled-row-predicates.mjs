@@ -13,10 +13,26 @@
  * not. The processors POST BEFORE they persist SYNCED and the external id, so an abandoned row may
  * already be in a real ledger with nothing local saying so.
  *
- * Ten readers nonetheless spelt "a cancelled row committed nothing" for themselves, each under a
+ * Sixteen readers nonetheless spelt "a cancelled row committed nothing" for themselves, each under a
  * comment asserting it, and the money-path ones turn that into an ADMITTED reversal, a released
  * blocker, or a second payment. `lib/domain/accounting/cancelled-row-evidence.ts` states the rule
  * once, over `cancelledClaimIsResolved`, in the two languages the readers ask it in.
+ *
+ * ── AND THE SAME RULE AFTER THE ROW HAS BEEN TAKEN APART (o3d-f709 round 3) ──────────────────────
+ *
+ * The SIXTEENTH was `unregisteredLocalReceipts`, which took its rows as
+ * `{ status: string; paymentId: string | null }` — a sync-log row with its evidence columns dropped
+ * at the call site — and read `status !== 'CANCELLED'` on them. All three detectors below declined
+ * it: the status is a bare `string`, the shape carries no marker column, and its file never names
+ * `accountingSyncLog`. It decided whether a reversal pass clears `paidAt`, and the census reported
+ * FIFTEEN readers and a green measurement for three rounds while it stood.
+ *
+ * So the reduction is followed. An object literal that assigns a RECOGNISED sync-log `status` into a
+ * property called `status` mints a REDUCED ROW SHAPE, keyed by its property-name signature, and a
+ * `.status` read on any receiver with that signature is a read of this table's status wherever it is
+ * written. Iterated to a fixed point, because a reduction can be reduced again; exhausting the
+ * rounds is a failure, not an answer. The shapes found are PRINTED on every run — that tally is the
+ * population the sixteenth reader hid in, and it is not something to leave implicit again.
  *
  * ── THE RULE, GRAMMATICALLY (the query half) ────────────────────────────────────────────────────
  *
@@ -104,14 +120,30 @@
  *     aliases, namespace imports and `const a = b` chains by construction. There is no name for an
  *     alias to hide.
  *   • A read reached through a VARIABLE — `const s = row.status; if (s === 'CANCELLED')`, or a
- *     destructured `const { status } = row`. Still unseen, and now MEASURED rather than predicted:
- *     a one-off sweep that resolved identifiers and binding elements back to their initialisers
- *     found the same fifteen sites this guard reports and not one more. The `switch` form used to
- *     be excused by the same sentence and turned out to be the live defect, so this is recorded as
- *     a known hole with a measurement beside it, not as a judgement that it cannot happen.
- *   • A status compared inside a function that takes it as a bare `string` parameter
- *     (`describeUnsettleableStatus(row.status)`): the receiver is gone by then, and the caller's
- *     `row.status` is what this guard sees instead.
+ *     destructured `const { status } = row`, or a bare `string` parameter
+ *     (`describeUnsettleableStatus(row.status)`). Still unseen. The measurement was re-taken in
+ *     round 3 with a sweep that does NOT filter by receiver type at all — the method that would
+ *     have found the sixteenth reader, since the previous measurement had been taken with the very
+ *     detectors that could not see it. It reports 45 comparisons against a bare identifier across
+ *     the four source roots. Every one was read: `isLiveStatus` and `isPostableAccountingSyncStatus`
+ *     ask about live WORK (their sets drop FAILED as well, which the header above explains is a
+ *     different claim); `describeUnsettleableStatus` and `accounting-settlement.ts`'s
+ *     `observedStatus` are re-settleability and the error CODE for a refusal already made;
+ *     `ledgerAloneProvesTheReversal` reads XERO's payment status, not a row's;
+ *     `revenue-recognition` and `reconciliation` read other enums entirely; and
+ *     xero/sync-processor's `liveStatus === 'CANCELLED'` treats a retired row as terminal, which is
+ *     the conservative direction and is argued in place. NONE of the 45 states this rule. That is a
+ *     fact about this tree today, not a property of the guard.
+ *   • A reduction built by SHORTHAND — `const { status } = row; return { status, paymentId }`.
+ *     PASS 1 follows only the `status: <row>.status` property-assignment form. Measured: of the 44
+ *     shorthand `status` builders in these roots, ZERO carry a sync-log row's status through a
+ *     binding element or a `const s = row.status`. A reduction built by SPREAD (`{ ...row, x }`) is
+ *     not a hole at all — it KEEPS the marker columns, so the second detector recognises the result
+ *     directly; 13 of those exist and all are visible.
+ *   • A reduced shape whose signature COLLIDES with an unrelated type's. Recognition is by
+ *     property-name signature, so an unrelated `{ status, paymentId }` would be treated as a
+ *     sync-log row and demand an owner entry. That is the fail-closed direction and is the intended
+ *     trade: a false positive costs one declared line, a false negative costs a money defect.
  *
  * ── THE GUARD PROVES IT RAN ─────────────────────────────────────────────────────────────────────
  *
@@ -253,13 +285,25 @@ const STATUS_COMPARISON_OWNERS = new Map([
       + 'fourth reading of the status.',
   }],
   ['lib/domain/accounting/invoice-payment-registration.ts', {
-    count: 4,
+    count: 1,
     reason:
-      'CAPACITY ARITHMETIC, not a posting verdict, and it already carries its own carrier for this '
-      + 'question: `unresolvedInvoicePaymentAttempts` gates on `couldHaveReachedLedger`, which '
-      + '`attemptCouldHaveReachedTheLedger` derives from the PAYLOAD rather than from the status. '
-      + 'The three `!== CANCELLED` filters partition the same population that function admits. '
-      + 'FLAGGED AS NOT-YET-VERIFIED, not as correct: see o3d-f709\'s follow-up issue.',
+      'o3d-kof8 — THE FOUR WERE NOT-YET-VERIFIED AND THREE OF THEM WERE WRONG. The entry that stood '
+      + 'here argued that all four `!== CANCELLED` filters were capacity arithmetic backed by '
+      + '`couldHaveReachedLedger`, "which `attemptCouldHaveReachedTheLedger` derives from the PAYLOAD '
+      + 'rather than from the status", and flagged itself NOT-YET-VERIFIED. Codex verified it in '
+      + 'round 3: a receipt SYNCED against invoice A, returned to PENDING by a failed follow-up and '
+      + 'then orphan-swept to CANCELLED WITH THE LEDGER\'S PAYMENT ID STILL ON IT, was registered a '
+      + 'second time against the replacement invoice B. Every one of the four gates let it through, '
+      + 'and the enqueue key names the invoice so B minted a fresh one.\n'
+      + '      THE THREE THAT DECIDED WHAT THE LEDGER HOLDS NOW ASK `mayHaveReachedLedger`, through '
+      + 'one local reading (`mayHoldLedgerPayment`) that also keeps the payload proof for terminal '
+      + 'rows. `ExistingInvoicePaymentSync` REQUIRES the whole `LedgerStandingRow`, so a loader that '
+      + 'drops a column fails `tsc` instead of quietly answering the permissive way. The one that '
+      + 'remains is `(status === FAILED || status === CANCELLED)` in '
+      + '`unresolvedInvoicePaymentAttempts`, and it is a POPULATION, not a verdict: it selects the '
+      + 'rows whose outcome is not established so the ledger can be asked about them, and the verdict '
+      + 'on each is `mayHoldLedgerPayment` plus the probe. Widening it would ask the ledger about rows '
+      + 'that plainly succeeded; narrowing it would stop asking about ones that plainly did not.',
   }],
   ['lib/domain/accounting/settlement-status.ts', {
     count: 4,
@@ -451,14 +495,42 @@ function excludesCancelled(initializer, checker) {
   return null
 }
 
-/** Collect `status` clauses conjoined into a where object, through AND/OR/NOT and arrays. */
+/**
+ * o3d-f709 round 3 (Codex MEDIUM 2) — THE DEPTH CUTOFFS WERE INCONSISTENT, AND ONE OF THEM FAILED
+ * OPEN.
+ *
+ * Three walks over the same `where` literal stopped at three different depths: `restrictsStatus` at
+ * 6, `guaranteesPostEvidence` at 6, `collectStatusClauses` at 8. The first of those returned
+ * `false` — "no status restriction here" — on running out of depth, which is the PERMISSIVE answer,
+ * and the walk that consumes it is the one that decides whether an OR arm RESCUES an exclusion. So a
+ * sibling arm could guarantee a document id at the top and restrict the status four ANDs down: the
+ * arm was accepted as post evidence, the CANCELLED-excluding clause beside it was marked `rescued`,
+ * and the whole predicate still excluded every cancelled row. Round 2's mutation M7 concluded the
+ * sibling loop was redundant; it was not, the mutation simply had no counterexample deep enough.
+ *
+ * A `where` literal is a FINITE tree and every node here is visited once, so there is no traversal
+ * to bound — the limit below exists only so a pathological or generated file cannot exhaust the
+ * stack. Reaching it is an UNKNOWN, recorded on the shared `ctx` and reported as a census FAILURE by
+ * the caller. It is never an answer, and never the permissive one.
+ */
+const MAX_WHERE_DEPTH = 64
 
-/** Does a `status` key appear ANYWHERE in this subtree? See {@link isPostEvidenceArm}. */
-function restrictsStatus(node, depth = 0) {
-  if (depth > 6) return false
+/** The shared traversal record. `truncated` means "this walk did not finish; do not trust it". */
+function whereWalkContext() {
+  return { truncated: false }
+}
+
+/**
+ * Does a `status` key appear ANYWHERE in this subtree? See {@link isPostEvidenceArm}.
+ *
+ * UNKNOWN ANSWERS `true`: a subtree this walk could not finish reading may restrict the status, and
+ * an arm that may restrict the status cannot rescue anything.
+ */
+function restrictsStatus(node, ctx, depth = 0) {
+  if (depth > MAX_WHERE_DEPTH) { ctx.truncated = true; return true }
   let n = node
   while (ts.isAsExpression(n) || ts.isParenthesizedExpression(n)) n = n.expression
-  if (ts.isArrayLiteralExpression(n)) return n.elements.some((e) => restrictsStatus(e, depth + 1))
+  if (ts.isArrayLiteralExpression(n)) return n.elements.some((e) => restrictsStatus(e, ctx, depth + 1))
   if (!ts.isObjectLiteralExpression(n)) return false
   for (const prop of n.properties) {
     if (!ts.isPropertyAssignment(prop)) continue
@@ -467,7 +539,7 @@ function restrictsStatus(node, depth = 0) {
         ? prop.name.expression.text
         : null
     if (key === 'status') return true
-    if (restrictsStatus(prop.initializer, depth + 1)) return true
+    if (restrictsStatus(prop.initializer, ctx, depth + 1)) return true
   }
   return false
 }
@@ -479,8 +551,8 @@ function restrictsStatus(node, depth = 0) {
  * `OR` needs EVERY branch to, or the alternative it offers admits a row with no document id.
  * `NOT` is not reasoned about at all and answers false.
  */
-function guaranteesPostEvidence(node, depth = 0) {
-  if (depth > 6) return false
+function guaranteesPostEvidence(node, ctx, depth = 0) {
+  if (depth > MAX_WHERE_DEPTH) { ctx.truncated = true; return false }
   let n = node
   while (ts.isAsExpression(n) || ts.isParenthesizedExpression(n)) n = n.expression
   if (!ts.isObjectLiteralExpression(n)) return false
@@ -493,8 +565,8 @@ function guaranteesPostEvidence(node, depth = 0) {
       if (!ts.isArrayLiteralExpression(inner)) continue
       const branches = inner.elements
       if (key === 'AND') {
-        if (branches.some((e) => guaranteesPostEvidence(e, depth + 1))) return true
-      } else if (branches.length > 0 && branches.every((e) => guaranteesPostEvidence(e, depth + 1))) {
+        if (branches.some((e) => guaranteesPostEvidence(e, ctx, depth + 1))) return true
+      } else if (branches.length > 0 && branches.every((e) => guaranteesPostEvidence(e, ctx, depth + 1))) {
         return true
       }
       continue
@@ -536,8 +608,8 @@ function guaranteesPostEvidence(node, depth = 0) {
  * DIFFERENT sibling of the same `OR` from the one the status clause sits in — see
  * {@link collectStatusClauses}, which is where "sibling" is enforced.
  */
-function isPostEvidenceArm(node) {
-  return guaranteesPostEvidence(node) && !restrictsStatus(node)
+function isPostEvidenceArm(node, ctx) {
+  return guaranteesPostEvidence(node, ctx) && !restrictsStatus(node, ctx)
 }
 
 /**
@@ -556,23 +628,33 @@ function isPostEvidenceArm(node) {
  * externalTransactionId: { not: null } }]` therefore excludes every CANCELLED row exactly as the
  * round-1 defect did. Each element is tested against its SIBLINGS only.
  *
- * AND THIS HALF IS NOT INDEPENDENTLY OBSERVABLE TODAY, which is worth writing down rather than
- * leaving for the next person to discover by deleting it. `isPostEvidenceArm` refuses any element
- * that restricts `status` anywhere within itself, so an element carrying a status clause can never
- * BE an arm, and for every shape expressible in a Prisma `where` the two halves refuse the same
- * things: reverting this loop alone turns no test red. Both were kept because they answer different
- * questions — "is this an alternative at all?" and "an alternative to WHAT?" — and because the
- * measurement above is a fact about the current arm test, not a property of the rule. Loosen that
- * test and this loop is the only thing standing between the census and the same-object defect.
- * Proved by mutation the honest way: reverting BOTH (tests 2, 3 and 5 in
- * tests/scripts/cancelled-row-predicate-census.test.ts) is what goes red.
+ * THE SUBSUMPTION CLAIM, CORRECTED — AND IT IS STILL A REDUNDANCY, WITH A CONDITION ON IT
+ * (o3d-f709 round 3, Codex MEDIUM 2).
+ *
+ * What stood here said the two halves "refuse the same things for every shape expressible in a
+ * Prisma `where`", so reverting this loop alone turns no test red. The second half was TRUE and was
+ * re-measured this round — replacing the per-sibling test with "is there ANY arm in this OR" leaves
+ * all ten tests in tests/scripts/cancelled-row-predicate-census.test.ts green, so this loop is not
+ * independently observable today and saying otherwise would be one more claim nothing checks.
+ *
+ * THE FIRST HALF WAS FALSE, and that is the finding. The redundancy is not a property of Prisma's
+ * grammar; it holds only while `isPostEvidenceArm` refuses EVERY element that restricts `status`
+ * anywhere within itself — and for four rounds it did not. `restrictsStatus` gave up at depth 6 and
+ * answered `false`, the permissive answer, so an element could guarantee a document id at its top
+ * and hide a status restriction under four nested `AND`s. Both halves then agreed on the WRONG
+ * answer: the arm was accepted, the exclusion beside it was tagged `rescued`, and the predicate
+ * still admitted no cancelled row. A redundancy is only as good as the test it is redundant WITH.
+ *
+ * So the cutoffs are gone (see {@link MAX_WHERE_DEPTH}), the deep shape is pinned by a fixture, and
+ * this loop stays — as the thing that answers "an alternative to WHAT?" if the arm test is ever
+ * loosened again, which is exactly how the round-2 same-object defect arrived.
  */
-export function collectStatusClauses(node, out, depth = 0, rescued = false) {
-  if (depth > 8) return
+export function collectStatusClauses(node, out, depth = 0, rescued = false, ctx = whereWalkContext()) {
+  if (depth > MAX_WHERE_DEPTH) { ctx.truncated = true; return }
   let n = node
   while (ts.isAsExpression(n) || ts.isParenthesizedExpression(n)) n = n.expression
   if (ts.isArrayLiteralExpression(n)) {
-    for (const e of n.elements) collectStatusClauses(e, out, depth + 1, rescued)
+    for (const e of n.elements) collectStatusClauses(e, out, depth + 1, rescued, ctx)
     return
   }
   if (!ts.isObjectLiteralExpression(n)) return
@@ -594,13 +676,13 @@ export function collectStatusClauses(node, out, depth = 0, rescued = false) {
         // PER ELEMENT, AGAINST ITS SIBLINGS. A status clause is rescued by an alternative offered
         // ELSEWHERE in the same OR, never by post evidence written in its own element — there the
         // two are ANDed and the exclusion stands.
-        const arms = inner.elements.map((e) => isPostEvidenceArm(e))
+        const arms = inner.elements.map((e) => isPostEvidenceArm(e, ctx))
         inner.elements.forEach((element, i) => {
-          collectStatusClauses(element, out, depth + 1, arms.some((isArm, j) => isArm && j !== i))
+          collectStatusClauses(element, out, depth + 1, arms.some((isArm, j) => isArm && j !== i), ctx)
         })
         continue
       }
-      collectStatusClauses(prop.initializer, out, depth + 1, false)
+      collectStatusClauses(prop.initializer, out, depth + 1, false, ctx)
     }
   }
 }
@@ -632,15 +714,43 @@ function accountingSyncLogColumns() {
   return columns
 }
 
-function main() {
-  const configPath = ts.findConfigFile(ROOT, ts.sys.fileExists, 'tsconfig.json')
-  if (!configPath) { console.error('tsconfig.json not found'); process.exit(2) }
-  const config = ts.readConfigFile(configPath, ts.sys.readFile)
-  const parsed = ts.parseJsonConfigFileContent(config.config, ts.sys, ROOT)
-  const program = ts.createProgram(parsed.fileNames, { ...parsed.options, noEmit: true })
-  const checker = program.getTypeChecker()
+/**
+ * o3d-f709 round 3 (Codex MEDIUM 1) — THE SIXTEENTH READER, AND WHY IT WAS INVISIBLE.
+ *
+ * `unregisteredLocalReceipts` (lib/connectors/xero/invoice-delta.ts) took
+ * `{ status: string; paymentId: string | null }[]` and treated every CANCELLED row as never sent.
+ * None of the three detectors could see it: the status is a bare `string`, so it is not the enum
+ * union; the shape carries no marker column, so it is not sync-log-shaped; and `invoice-delta.ts`
+ * never names `accountingSyncLog`, so the third detector — which exists for exactly this kind of
+ * loosely-typed row — declines it too. The row IS a sync-log row: payment-reversal.ts loads it from
+ * the table and drops the evidence columns at the call site.
+ *
+ * So the census follows the reduction. Any object literal that assigns a RECOGNISED sync-log
+ * `status` into a property called `status` mints a REDUCED ROW SHAPE, recorded by its property-name
+ * signature; a `.status` read on any receiver with that signature is then a read of a sync-log row's
+ * status, wherever it is written and whatever the file around it mentions. That is structural, not
+ * nominal: renaming the helper, the parameter or the file changes nothing.
+ *
+ * IT IS ITERATED TO A FIXED POINT, because a reduction can be reduced again. Each round can only add
+ * signatures and the set is finite, so it terminates; exhausting the cap is reported as a failure
+ * rather than accepted as an answer.
+ *
+ * WHAT STILL ESCAPES, measured rather than predicted — see the header's "what it cannot see".
+ */
+const MAX_SHAPE_ROUNDS = 8
 
-  const inScope = new Set(SOURCE_ROOTS.flatMap((root) => walk(join(ROOT, root))).map((p) => relative(ROOT, p)))
+/**
+ * The scan itself, over a BUILT PROGRAM rather than over this repository.
+ *
+ * Separated from {@link main} so the detectors can be driven against synthetic sources that this
+ * tree does not contain — a guard is worth what it REFUSES, and every shape the census learns to
+ * see should be provable on a fixture instead of on whichever real file happens to have it today.
+ * Owner reconciliation and the DDL census stay in `main`: those are claims about THIS repository.
+ */
+export function scanProgram({ program, checker, inScope, columns }) {
+  const failures = []
+  const seenPredicateFiles = new Map()
+  const seenComparisonFiles = new Map()
 
   const isSyncStatusUnion = (t) => {
     if (!t) return false
@@ -648,7 +758,6 @@ function main() {
     if (parts.length < 2) return false
     return parts.every((p) => typeof p.value === 'string' && SYNC_STATUSES.has(p.value))
   }
-  const columns = accountingSyncLogColumns()
   const isSyncLogShaped = (t) => {
     if (!t) return false
     let props
@@ -685,42 +794,112 @@ function main() {
     return props.every((name) => columns.has(name))
   }
 
+  /** A type's property-name signature — the key a reduced row shape is recognised by. */
+  const shapeSignature = (t) => {
+    if (!t) return null
+    let props
+    try { props = checker.getPropertiesOfType(t).map((p) => p.getName()) } catch { return null }
+    if (props.length === 0 || !props.includes('status')) return null
+    return [...props].sort().join(',')
+  }
+
+  /** signature -> where the reduction was written, so a failure can name its provenance. */
+  const reducedRowShapes = new Map()
+
+  const files = []
   for (const sf of program.getSourceFiles()) {
     if (sf.isDeclarationFile) continue
     const file = relative(ROOT, sf.fileName)
     if (!inScope.has(file)) continue
-    const fileQueriesSyncLogs = sf.text.includes('accountingSyncLog')
+    files.push({ sf, file, queriesSyncLogs: sf.text.includes('accountingSyncLog') })
+  }
 
-    // ── EXPRESSION HALF ──────────────────────────────────────────────────────────────────────
-    //
-    // IS THIS `<x>.status` A SYNC-LOG ROW'S STATUS? The three detectors, shared by all three forms
-    // below so a new form cannot arrive with a weaker idea of whose status it is reading.
-    //
-    // THE DECLARED TYPE OF THE PROPERTY, NOT THE NARROWED TYPE AT THIS EXPRESSION — a second
-    // mutation's finding. `journal.status === 'CANCELLED' && journal.status !== 'CANCELLED'`
-    // narrows the second occurrence to the literal `"CANCELLED"`, which is neither `string`
-    // (so the third detector declined it) nor a union of two or more members (so the first
-    // did). Every extra comparison inside an `&&` was therefore invisible, which is exactly
-    // the shape a SEVENTH copy takes when it is added next to an owned sixth.
-    const readsSyncLogStatus = (access) => {
-      if (!ts.isPropertyAccessExpression(access) || access.name.text !== 'status') return false
-      let declaredStatusType = null
-      let receiverType = null
-      try {
-        receiverType = checker.getTypeAtLocation(access.expression)
-        const property = receiverType?.getProperty?.('status')
-        declaredStatusType = property ? checker.getTypeOfSymbol(property) : checker.getTypeAtLocation(access)
-      } catch { /* unresolvable: not this guard's business */ }
-      return isSyncStatusUnion(declaredStatusType)
-        || isSyncLogShaped(receiverType)
-        || (fileQueriesSyncLogs && isUntypedSyncLogShape(declaredStatusType, receiverType))
+  const statusTypesOf = (access) => {
+    let declaredStatusType = null
+    let receiverType = null
+    try {
+      receiverType = checker.getTypeAtLocation(access.expression)
+      const property = receiverType?.getProperty?.('status')
+      declaredStatusType = property ? checker.getTypeOfSymbol(property) : checker.getTypeAtLocation(access)
+    } catch { /* unresolvable: not this guard's business */ }
+    return { declaredStatusType, receiverType }
+  }
+
+  /**
+   * IS THIS `<x>.status` A SYNC-LOG ROW'S STATUS? Four detectors, shared by every form below so a
+   * new form cannot arrive with a weaker idea of whose status it is reading.
+   *
+   * THE DECLARED TYPE OF THE PROPERTY, NOT THE NARROWED TYPE AT THIS EXPRESSION — a mutation's
+   * finding. `journal.status === 'CANCELLED' && journal.status !== 'CANCELLED'` narrows the second
+   * occurrence to the literal `"CANCELLED"`, which is neither `string` (so the third detector
+   * declined it) nor a union of two or more members (so the first did). Every extra comparison
+   * inside an `&&` was therefore invisible, which is exactly the shape a copy takes when it is
+   * added next to an owned one.
+   */
+  const readsSyncLogStatus = (access, queriesSyncLogs) => {
+    if (!ts.isPropertyAccessExpression(access) || access.name.text !== 'status') return false
+    const { declaredStatusType, receiverType } = statusTypesOf(access)
+    return isSyncStatusUnion(declaredStatusType)
+      || isSyncLogShaped(receiverType)
+      || (queriesSyncLogs && isUntypedSyncLogShape(declaredStatusType, receiverType))
+      || reducedRowShapes.has(shapeSignature(receiverType))
+  }
+
+  // ── PASS 1: WHICH REDUCED SHAPES ARE SYNC-LOG ROWS ────────────────────────────────────────────
+  for (let round = 0; round < MAX_SHAPE_ROUNDS; round++) {
+    const before = reducedRowShapes.size
+    for (const { sf, file, queriesSyncLogs } of files) {
+      const seek = (node) => {
+        if (ts.isObjectLiteralExpression(node)) {
+          for (const prop of node.properties) {
+            if (!ts.isPropertyAssignment(prop)) continue
+            const key = ts.isIdentifier(prop.name) || ts.isStringLiteral(prop.name) ? prop.name.text : null
+            if (key !== 'status') continue
+            let value = prop.initializer
+            while (ts.isAsExpression(value) || ts.isParenthesizedExpression(value)) value = value.expression
+            if (!readsSyncLogStatus(value, queriesSyncLogs)) continue
+            let signature = null
+            try { signature = shapeSignature(checker.getTypeAtLocation(node)) } catch { signature = null }
+            if (signature === null || reducedRowShapes.has(signature)) continue
+            const { line } = sf.getLineAndCharacterOfPosition(node.getStart(sf))
+            reducedRowShapes.set(signature, `${file}:${line + 1}`)
+          }
+        }
+        ts.forEachChild(node, seek)
+      }
+      seek(sf)
     }
+    if (reducedRowShapes.size === before) break
+    if (round === MAX_SHAPE_ROUNDS - 1) {
+      failures.push(
+        `the reduced-row-shape scan was still finding new shapes after ${MAX_SHAPE_ROUNDS} rounds, so the\n`
+        + '    set it judged the sources against is INCOMPLETE. That is an unknown, and an unknown here\n'
+        + '    reads as "a reader may be unseen" — raise MAX_SHAPE_ROUNDS and re-run.',
+      )
+    }
+  }
+
+  // ── PASS 2: THE READERS ───────────────────────────────────────────────────────────────────────
+  for (const { sf, file, queriesSyncLogs } of files) {
     const isCancelledLiteral = (literal) => {
       let lit = literal
       while (ts.isAsExpression(lit) || ts.isParenthesizedExpression(lit)) lit = lit.expression
       return ts.isStringLiteral(lit) && lit.text === 'CANCELLED'
     }
-    const record = (at, description) => {
+    /** The provenance note for a reader reached only through a reduction — see PASS 1. */
+    const reductionNote = (access) => {
+      if (!ts.isPropertyAccessExpression(access)) return ''
+      const { declaredStatusType, receiverType } = statusTypesOf(access)
+      if (isSyncStatusUnion(declaredStatusType) || isSyncLogShaped(receiverType)) return ''
+      if (queriesSyncLogs && isUntypedSyncLogShape(declaredStatusType, receiverType)) return ''
+      const signature = shapeSignature(receiverType)
+      const origin = signature === null ? null : reducedRowShapes.get(signature)
+      return origin
+        ? `\n    Reached as a REDUCED sync-log row {${signature}}, built at ${origin}: the evidence columns\n`
+          + '    were dropped at the call site, which is what hid this reader for three rounds.'
+        : ''
+    }
+    const record = (at, description, access) => {
       const { line } = sf.getLineAndCharacterOfPosition(at.getStart(sf))
       seenComparisonFiles.set(file, (seenComparisonFiles.get(file) ?? 0) + 1)
       if (file !== OWNING_MODULE && !STATUS_COMPARISON_OWNERS.has(file)) {
@@ -728,7 +907,8 @@ function main() {
           `${file}:${line + 1} decides what a CANCELLED sync row means in TypeScript — `
           + `${description.replace(/\s+/g, ' ').slice(0, 80)}.\n`
           + `    Ask \`${SHARED_PREDICATE}(row)\` from ${OWNING_MODULE}, or add this file to\n`
-          + '    STATUS_COMPARISON_OWNERS with the argument for why it must differ.',
+          + '    STATUS_COMPARISON_OWNERS with the argument for why it must differ.'
+          + (access ? reductionNote(access) : ''),
         )
       }
     }
@@ -747,7 +927,18 @@ function main() {
               if (!ts.isPropertyAssignment(prop)) continue
               if (!ts.isIdentifier(prop.name) || prop.name.text !== 'where') continue
               const clauses = []
-              collectStatusClauses(prop.initializer, clauses)
+              const ctx = whereWalkContext()
+              collectStatusClauses(prop.initializer, clauses, 0, false, ctx)
+              if (ctx.truncated) {
+                const { line } = sf.getLineAndCharacterOfPosition(prop.getStart(sf))
+                failures.push(
+                  `${file}:${line + 1} has a \`where\` this census could not finish reading (depth > `
+                  + `${MAX_WHERE_DEPTH}).\n`
+                  + '    UNKNOWN fails CLOSED here on purpose: the walk that gave up used to answer "no\n'
+                  + '    status restriction", which is the permissive answer, and that is how a rescued\n'
+                  + '    exclusion earned a green tag over a predicate that admitted no cancelled row.',
+                )
+              }
               for (const { prop: clause, rescued } of clauses) {
                 const described = excludesCancelled(clause.initializer, checker)
                 if (described === null) continue
@@ -778,8 +969,8 @@ function main() {
           .includes(node.operatorToken.kind)) {
         for (const [access, literal] of [[node.left, node.right], [node.right, node.left]]) {
           if (!isCancelledLiteral(literal)) continue
-          if (!readsSyncLogStatus(access)) continue
-          record(node, node.getText())
+          if (!readsSyncLogStatus(access, queriesSyncLogs)) continue
+          record(node, node.getText(), access)
         }
       }
 
@@ -790,10 +981,10 @@ function main() {
       // paid-local settlement verdict, which reported an orphan-swept posted payment as NOT_SENT
       // for two rounds while the census counted that file's three direct comparisons and passed it.
       // A judgement about how a claim "gets written" is not a property of the claim.
-      if (ts.isSwitchStatement(node) && readsSyncLogStatus(node.expression)) {
+      if (ts.isSwitchStatement(node) && readsSyncLogStatus(node.expression, queriesSyncLogs)) {
         for (const clause of node.caseBlock.clauses) {
           if (ts.isCaseClause(clause) && isCancelledLiteral(clause.expression)) {
-            record(clause, `switch (${node.expression.getText()}) { case 'CANCELLED': …`)
+            record(clause, `switch (${node.expression.getText()}) { case 'CANCELLED': …`, node.expression)
           }
         }
       }
@@ -804,15 +995,33 @@ function main() {
       // exactly as a `where` set is, so a constant named for something else cannot hide it.
       if (ts.isCallExpression(node) && ts.isPropertyAccessExpression(node.expression)
         && ['includes', 'has'].includes(node.expression.name.text)
-        && node.arguments.length === 1 && readsSyncLogStatus(node.arguments[0])) {
+        && node.arguments.length === 1 && readsSyncLogStatus(node.arguments[0], queriesSyncLogs)) {
         const members = resolveStatusList(node.expression.expression, checker)
-        if (members !== null && members.includes('CANCELLED')) record(node, node.getText())
+        if (members !== null && members.includes('CANCELLED')) {
+          record(node, node.getText(), node.arguments[0])
+        }
       }
       ts.forEachChild(node, visit)
     }
     visit(sf)
   }
 
+  return { failures, seenPredicateFiles, seenComparisonFiles, reducedRowShapes }
+}
+
+function main() {
+  const configPath = ts.findConfigFile(ROOT, ts.sys.fileExists, 'tsconfig.json')
+  if (!configPath) { console.error('tsconfig.json not found'); process.exit(2) }
+  const config = ts.readConfigFile(configPath, ts.sys.readFile)
+  const parsed = ts.parseJsonConfigFileContent(config.config, ts.sys, ROOT)
+  const program = ts.createProgram(parsed.fileNames, { ...parsed.options, noEmit: true })
+  const checker = program.getTypeChecker()
+
+  const inScope = new Set(SOURCE_ROOTS.flatMap((root) => walk(join(ROOT, root))).map((p) => relative(ROOT, p)))
+  const scan = scanProgram({ program, checker, inScope, columns: accountingSyncLogColumns() })
+  const failures = scan.failures
+  const seenPredicateFiles = scan.seenPredicateFiles
+  const seenComparisonFiles = scan.seenComparisonFiles
   // ── THE GUARD PROVES IT RAN: every owner found, at the stated count ───────────────────────────
   for (const [file, owner] of PREDICATE_OWNERS) {
     const tally = seenPredicateFiles.get(file) ?? { total: 0, orPostEvidence: 0, bare: 0, sites: [] }
@@ -938,11 +1147,16 @@ function main() {
   // clauses accounted for" was true on the day two of them silently excluded a posted row.
   const rescued = tallies.reduce((a, b) => a + b.orPostEvidence, 0)
   const comparisons = [...seenComparisonFiles.values()].reduce((a, b) => a + b, 0)
+  // REPORTED, not merely used: the reduced-row shapes are the population the sixteenth reader hid
+  // in, so the tally is part of the measurement rather than an implementation detail (o3d-f709 r3).
+  const shapes = [...scan.reducedRowShapes.entries()].map(([sig, at]) => `{${sig}} from ${at}`)
   console.log(
     `✓ CANCELLED-row evidence: ${queries} query clause(s) (${rescued} ORed with post evidence, `
     + `${queries - rescued} bare) and ${comparisons} comparison(s) accounted for, `
-    + `${seenMigrations.size} migration(s) censused.`,
+    + `${seenMigrations.size} migration(s) censused, `
+    + `${shapes.length} reduced row shape(s) followed.`,
   )
+  for (const shape of shapes) console.log(`    reduced row shape: ${shape}`)
 }
 
 /**

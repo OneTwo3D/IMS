@@ -10,7 +10,7 @@ import {
   type RegisteredPaymentRow,
   type RegisteredPaymentVerdict,
 } from '@/lib/connectors/xero/invoice-delta'
-import { MAY_HAVE_REACHED_LEDGER_WHERE } from '@/lib/domain/accounting/cancelled-row-evidence'
+import { MAY_HAVE_REACHED_LEDGER_WHERE, type LedgerStandingRow } from '@/lib/domain/accounting/cancelled-row-evidence'
 import { storedBodyMayHaveReachedTheLedger } from '@/lib/domain/accounting/followup-idempotency'
 import { payloadAccountingInvoiceId, payloadPaymentId, payloadRegisteredAmount } from '@/lib/domain/accounting/invoice-payment-enqueue'
 import { toDecimal, type Decimal } from '@/lib/domain/math/decimal'
@@ -237,7 +237,19 @@ export async function readPaidProvenanceVerdicts<T extends PaidProvenanceDoc>(
   }
 
   const byDocument = new Map<string, RegisteredPaymentRow[]>()
-  const receiptsNamedByDocument = new Map<string, { status: string; paymentId: string | null }[]>()
+  /**
+   * o3d-f709 r3 (Codex MEDIUM 1) — THE WHOLE {@link LedgerStandingRow}, NOT `{ status, paymentId }`.
+   *
+   * This reduced each registration to a status and a receipt id, and `unregisteredLocalReceipts`
+   * then read the status alone: every CANCELLED row counted as "the ledger was never told". Three
+   * of the five writers of CANCELLED assert nothing of the sort, and the reduction is what hid it —
+   * a row with its evidence columns dropped cannot be recognised as a sync-log row by anything
+   * downstream, so the census walked past the reader for three rounds.
+   *
+   * The columns are already selected above for `classifyRegisteredPayment`; carrying them here
+   * costs nothing and makes the omission impossible to spell.
+   */
+  const receiptsNamedByDocument = new Map<string, (LedgerStandingRow & { paymentId: string | null })[]>()
   for (const row of rows) {
     const list = byDocument.get(row.referenceId) ?? []
     const documentCurrency = documentTotals.get(row.referenceId)?.currency ?? null
@@ -267,7 +279,13 @@ export async function readPaidProvenanceVerdicts<T extends PaidProvenanceDoc>(
     })
     byDocument.set(row.referenceId, list)
     const named = receiptsNamedByDocument.get(row.referenceId) ?? []
-    named.push({ status: row.status, paymentId: payloadPaymentId(row.payload) })
+    named.push({
+      status: row.status,
+      externalTransactionId: row.externalTransactionId,
+      abandonedBeforeRemoteCall: row.abandonedBeforeRemoteCall,
+      settlementBasis: row.settlementBasis,
+      paymentId: payloadPaymentId(row.payload),
+    })
     receiptsNamedByDocument.set(row.referenceId, named)
   }
 
