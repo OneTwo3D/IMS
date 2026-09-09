@@ -31,8 +31,9 @@
  * The third clause is why this is not simply a search for the word. `['PENDING','PROCESSING',
  * 'SYNCED','FAILED']` IS `{ not: 'CANCELLED' }` written out, and it is how two of the six copies
  * were spelt — one of them behind a constant named for something else entirely
- * (`PURCHASE_ORDER_ATTRIBUTION_LIVE_STATUSES`), and one behind a name that a DIFFERENT constant in
- * this tree also carries with a different body (`LIVE_ACCOUNTING_SYNC_STATUSES` is four statuses in
+ * (`PURCHASE_ORDER_ATTRIBUTION_LIVE_STATUSES`, since DELETED: it turned out to be the round-1 HIGH
+ * and not an override at all, see below), and one behind a name that a DIFFERENT constant in this
+ * tree also carries with a different body (`LIVE_ACCOUNTING_SYNC_STATUSES` is four statuses in
  * lib/domain/sales/order-delete-guard.ts and two in app/actions/accounting-sync.ts).
  *
  * WHY THE COMPLEMENT AND NOT MERELY "OMITS CANCELLED", which was this guard's first form and which
@@ -128,13 +129,19 @@ const PREDICATE_OWNERS = new Map([
   ['lib/domain/sales/order-delete-guard.ts', {
     count: 2,
     reason:
-      'o3d-v7sy/o3d-anu8: this guard does not read the status ALONE — every query ORs the live set '
-      + 'with `externalTransactionId: { not: null }`, so shape (c) (CANCELLED + an operator-typed '
-      + 'document id) still blocks the delete. The CANCELLED-with-no-id case is EXCLUDED ON PURPOSE '
-      + 'and the file argues it at length: `buildSettlementData` leaves the column NULL precisely so '
-      + 'that an audited NOT_POSTED assertion makes an order deletable again, which is the state '
-      + 'o3d-nf9i exists to reach. Routing it through the shared predicate would re-strand every '
-      + 'order an operator has settled.',
+      'o3d-v7sy/o3d-anu8: this guard does not read the status ALONE — BOTH queries OR the live set '
+      + 'with `externalTransactionId: { not: null }`, so shape (c) (CANCELLED + a document id) still '
+      + 'blocks the delete. The CANCELLED-with-no-id case is EXCLUDED ON PURPOSE and the file argues '
+      + 'it at length: `buildSettlementData` leaves the column NULL precisely so that an audited '
+      + 'NOT_POSTED assertion makes an order deletable again, which is the state o3d-nf9i exists to '
+      + 'reach. Routing it through the shared predicate would re-strand every order an operator has '
+      + 'settled.\n'
+      + '      o3d-f709: "BOTH" is load-bearing and was FALSE when this entry was written. The '
+      + 'daily-batch blocker had the status set as its ONLY test, conjoined at the top level of the '
+      + 'where — an AND, not an OR — so a CANCELLED DAILY_BATCH_* row carrying the journal id Xero '
+      + 'issued matched nothing and the blocker disappeared. Fixed in the same commit as this '
+      + 'sentence. Whoever edits either query must re-read BOTH before editing this reason: the '
+      + 'count proves the clauses exist, and NOTHING here proves they are still ORed.',
   }],
   ['app/actions/sales.ts', {
     count: 1,
@@ -147,15 +154,6 @@ const PREDICATE_OWNERS = new Map([
       + 'without changing the classifier is what this owner entry exists to make visible. FOUND BY '
       + 'THE GUARD ITSELF, after the constant resolver was rebuilt on the checker: the name-map '
       + 'version could not see through the import and reported this file clean.',
-  }],
-  ['lib/domain/accounting/back-reference.ts', {
-    count: 1,
-    reason:
-      'o3d-9kek: `resolvePurchaseOrderBackReference` ANDs `externalTransactionId: { not: null }` '
-      + 'onto the live-status set, so a cancelled row that names a document is already counted and '
-      + 'one that names none competes for no bill link. The count can only push the verdict toward '
-      + 'AMBIGUOUS, which REFUSES — safe in both directions, which is why o3d-f709 ruled it out by '
-      + 'name rather than converting it.',
   }],
 ])
 

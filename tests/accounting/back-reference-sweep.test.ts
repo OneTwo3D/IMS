@@ -987,10 +987,50 @@ test('ambiguity is detected when one sync row maps to a PO with several unlinked
   assert.equal(warning.metadata.reason, 'MULTIPLE_UNLINKED_BILLS')
 })
 
-test('a CANCELLED sibling row does not make a PO ambiguous', async () => {
-  // audit-46ry: a cancelled row is deliberately abandoned and competes for nothing.
+test('[o3d-f709] a CANCELLED sibling row that NAMES A BILL still makes the PO ambiguous', async () => {
+  // THE TEST THIS REPLACES ASSERTED THE DEFECT, and is why the branch's own suite was green over
+  // it. It was written as "a CANCELLED sibling row does not make a PO ambiguous" under the comment
+  // "audit-46ry: a cancelled row is deliberately abandoned and competes for nothing" — and it built
+  // that sibling with `poRow`, which stamps `externalTransactionId: 'XBILL-2'` on every row it
+  // makes. So the row it called "competes for nothing" was a row THE LEDGER HAD ISSUED A BILL
+  // NUMBER TO, and the assertion was that the repair goes ahead and writes XBILL-1 onto the only
+  // unlinked bill — a coin flip between two posted bills, which is the exact defect o3d-9kek
+  // finding 1 exists to refuse.
+  //
+  // A cancelled row's id is not undone by the cancellation: `cancelOrphanedRowsUnderLock` retires a
+  // PENDING row without clearing `externalTransactionId`, and a posted row is put BACK to PENDING
+  // whenever follow-up work fails. So this shape is the ordinary consequence of switching a
+  // connector off after a partial post, not a contrivance.
   const harness = makeHarness({
     syncRows: [poRow(1, 'po-1'), poRow(2, 'po-1', { status: 'CANCELLED' })],
+    bills: [{ id: 'bill-1', poId: 'po-1', accountingInvoiceId: null, createdAt: at(1) }],
+    orders: [],
+  })
+
+  // The row shape is asserted rather than assumed: if `poRow` ever stopped stamping an id, this
+  // test would go on passing while testing nothing (the failure mode of the test it replaces).
+  assert.equal(harness.store.syncRows[1].status, 'CANCELLED')
+  assert.equal(harness.store.syncRows[1].externalTransactionId, 'XBILL-2')
+
+  const run = await repairAccountingBackReferences(sweepDeps(harness), { limit: 10 })
+  assert.equal(run.repaired, 0)
+  assert.equal(run.skippedAmbiguous, 1)
+  assert.equal(harness.calls.billUpdates, 0)
+  assert.equal(harness.store.bills[0].accountingInvoiceId, null, 'no id may be stamped on a coin flip')
+
+  const warning = harness.activities.find((entry) => entry.action === 'xero_backreference_repair_ambiguous')
+  assert.ok(warning)
+  assert.equal(warning.metadata.reason, 'MULTIPLE_SYNC_ROWS')
+  assert.equal(warning.metadata.syncRowCount, 2, 'the cancelled row is COUNTED, not silently dropped')
+})
+
+test('[o3d-f709] a CANCELLED sibling row that names NO bill still competes for nothing', async () => {
+  // The other half, and the reason the fix is "count on the post evidence" and not "count every
+  // status". A row that never got an id posted nothing, so it cannot be a rival claimant — o3d-9kek
+  // finding 2, unchanged. Without this, the fix above would be indistinguishable from simply
+  // deleting the evidence clause.
+  const harness = makeHarness({
+    syncRows: [poRow(1, 'po-1'), poRow(2, 'po-1', { status: 'CANCELLED', externalTransactionId: null })],
     bills: [{ id: 'bill-1', poId: 'po-1', accountingInvoiceId: null, createdAt: at(1) }],
     orders: [],
   })
@@ -1109,8 +1149,11 @@ test('[o3d-9kek f2] an ambiguous row stays eligible and is repaired once the amb
   assert.equal(firstRun.skippedAmbiguous, 2)
   assert.equal(harness.store.syncRows[0].backReferenceCheckedAt, null, 'ambiguity is not a verdict')
 
-  // The competing row is cancelled (audit-46ry — deliberately abandoned).
+  // The competing row turns out never to have posted — its id is cleared and it is retired. o3d-f709:
+  // cancelling it is NOT on its own what clears the ambiguity, because a cancelled row that still
+  // names a bill is still a rival claimant; what clears it is that this row claims no document.
   harness.store.syncRows[1].status = 'CANCELLED'
+  harness.store.syncRows[1].externalTransactionId = null
 
   clock.advance(BACK_REFERENCE_AMBIGUITY_RECHECK_INTERVAL_MS + 1)
   const secondRun = await repairAccountingBackReferences(sweepDeps(harness, clock.now), { limit: 10 })
