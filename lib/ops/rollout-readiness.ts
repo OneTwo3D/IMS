@@ -243,6 +243,15 @@ export function createRolloutReadinessHandler({
     if (denyResponse) return denyResponse
 
     const report = await collect()
+    // o3d-11rf r7 (Codex r6, HIGH) — WHAT THIS FLAG IS, STATED WHERE IT LIVES. It is pre-existing:
+    // it shipped with this endpoint and is unchanged on `development`. It is also a GLOBAL boolean
+    // that takes no reason, names no findings, identifies no actor and writes no audit record — one
+    // caller passing it accepts EVERY warning in the verdict at once, including ones they never
+    // looked at, and nothing afterwards says it happened. So it is not a place where a human
+    // decision gets recorded, and no severity choice elsewhere in this file may be justified by
+    // pretending that it is. Scoping it (named finding ids, a required reason, an audit row) is
+    // o3d-yby2. Until then, anything that must not be waved through has to be a BLOCKER — see
+    // classifyReconciliationCompleteness.
     const allowWarnings = request ? new URL(request.url).searchParams.get('allowWarnings') === 'true' : false
     const statusCode = report.status === 'ready' || (report.status === 'warning' && allowWarnings) ? 200 : 412
     return Response.json(report, {
@@ -781,7 +790,7 @@ function classifyAccountingReconciliation(
   // o3d-11rf r6 — BEFORE the status switch, because every branch of it returns. A FAILED or PARTIAL
   // run blocks or warns on its own, but a COMPLETED one with no findings is the case this gate got
   // wrong, and a completeness question asked after an early `return` is a question not asked.
-  classifyReconciliationCompleteness(latest, warnings)
+  classifyReconciliationCompleteness(latest, blockers, warnings)
 
   switch (latest.status) {
     case 'FAILED':
@@ -826,29 +835,53 @@ function classifyAccountingReconciliation(
 }
 
 /**
- * o3d-11rf r6 (Codex r5, HIGH) — WHY UNKNOWN COMPLETENESS WARNS HERE RATHER THAN BLOCKS.
+ * o3d-11rf r7 (Codex r6, HIGH) — WHY TWO OF THE THREE NOT-PROVEN STATES BLOCK, AND ONE WARNS.
  *
- * A WARNING IS NOT A GREEN LIGHT AT THIS GATE. `collectRolloutReadiness` sets `status` to `warning`
- * when any warning is present, `ok` to false with it, and `createRolloutReadinessHandler` answers
- * **412** for anything that is not `ready` unless the caller passes `?allowWarnings=true`. So a
- * warning already STOPS an automated rollout and can only be got past by an explicit, recorded
- * override. The distinction being drawn is between "stop, and a human may say why this is fine" and
- * "stop, and nobody may proceed" — not between stopping and not stopping.
+ * THE ARGUMENT THIS REPLACES WAS FALSE, AND IT IS WORTH SAYING SO HERE. r6 left all three states as
+ * warnings and defended that by saying a warning at this gate means "stop, and a human may record
+ * why this is fine": `collectRolloutReadiness` sets `ok` false, and the handler answers 412 for
+ * anything that is not `ready` unless the caller passes `?allowWarnings=true`. The first half is
+ * still true. The second half was not checked. `allowWarnings` (see `createRolloutReadinessHandler`)
+ * takes NO reason, names NO findings, identifies NO actor and writes NO audit row — it converts
+ * every warning-only verdict to 200 at once. So a caller waving through an unrelated advisory
+ * warning also waved through an incomplete reconciliation report, and nothing anywhere recorded that
+ * it had happened. The choice that comment described did not exist, so it cannot justify anything.
  *
- * AND WHY NOT A BLOCKER. NULL is the expected state of every run in the database at the moment this
- * column ships, and of any run written by the predecessor binary while it is still serving across
- * the deploy. A blocker would make the readiness endpoint impossible to satisfy until a fresh
- * reconciliation had been run on the new build — on the very deploy that introduces the column — and
- * a gate that cannot go green on a correct deploy is a gate that gets routed around, which protects
- * nothing at all. The remedy the operator needs is stated in the message: run reconciliation again on
- * this build. A run that is genuinely truncated warns for the same reason: it is a real answer about
- * a real dataset, and the person deploying should decide, not be silently overruled.
+ * WHAT SEPARATES THE THREE STATES IS WHERE EACH ONE CAN COME FROM.
  *
- * WHAT WOULD MAKE IT A BLOCKER. Once no NULL rows remain, `not-recorded` stops being expected and
- * becomes evidence of a writer that is not recording completeness. That is a follow-up, not this fix.
+ *   `unknown` / `not-recorded` — a SQL NULL. `persistAccountingReconciliationReport` is the only
+ *     writer of this column in the codebase and it ALWAYS writes an array, because
+ *     `reconciliationTruncations` returns `[]` when nothing was truncated; the migration added the
+ *     column nullable with no default and no backfill. NULL is therefore exactly a row written
+ *     before the column existed, or by the predecessor binary still serving across the deploy. It is
+ *     EXPECTED, and it is the state of every row in the table on the deploy that ships the column.
+ *     Blocking it would make readiness unsatisfiable until a fresh reconciliation had run on the new
+ *     build, and a gate that cannot go green on a correct deploy is a gate that gets routed around.
+ *     It WARNS, and the message says the one thing that clears it.
+ *
+ *   `unknown` / `unreadable` — a non-NULL payload that is not an array of `{code, message}`
+ *     sentinels. NOTHING in this codebase can write that. It is a corrupted value or a writer nobody
+ *     has explained, and no amount of deploying makes it expected. It BLOCKS.
+ *
+ *   `truncated` — the run's own positive statement that its report omitted findings. A fact about
+ *     real data rather than an artefact of the deploy, and the findings it omitted are exactly the
+ *     ones nobody has seen. It BLOCKS.
+ *
+ * NEITHER BLOCKER IS UNSATISFIABLE. Both clear the same way: run reconciliation again on this build
+ * and have it complete. That is the same remedy the warning asks for, so the gate that stops here
+ * can always be made to go green without anybody being asked to ignore it.
+ *
+ * WHAT IS STILL OVERRIDABLE, SAID PLAINLY. `allowWarnings=true` still converts every REMAINING
+ * warning — `not-recorded` among them, along with `:missing`, `:partial`, `:warnings` and every
+ * preflight and admin-health warning — to 200, still without recording anything. That mechanism
+ * predates this branch (it shipped with the endpoint itself and is unchanged on `development`), and
+ * scoping it to named finding ids with a reason and an audit record is o3d-yby2. What has changed
+ * here is only this: it can no longer be used, deliberately or by accident, to wave past the two
+ * completeness states that mean something is actually wrong.
  */
 function classifyReconciliationCompleteness(
   latest: LatestAccountingReconciliationRun,
+  blockers: RolloutReadinessFinding[],
   warnings: RolloutReadinessFinding[],
 ): void {
   const completeness = latest.completeness
@@ -858,35 +891,50 @@ function classifyReconciliationCompleteness(
   // with the first, and this whole finding is what happens when two readers of one rule drift.
   if (isReconciliationProvenComplete(completeness)) return
 
+  const details = {
+    id: latest.id,
+    createdAt: latest.createdAt,
+    completeness: completeness.state,
+  }
+
   switch (completeness.state) {
     case 'complete':
       return
     case 'unknown':
-      warnings.push({
-        id: 'accounting-reconciliation:completeness-unknown',
-        severity: 'warning',
-        source: 'accounting-reconciliation',
-        message: completeness.reason === 'not-recorded'
-          ? 'Latest accounting reconciliation run did not record whether its report was complete, so it does not show this build\'s reconciliation ran. Run reconciliation again before rolling out.'
-          : 'Latest accounting reconciliation run recorded an unreadable completeness value, so its report cannot be shown to be complete. Run reconciliation again before rolling out.',
-        details: {
-          id: latest.id,
-          createdAt: latest.createdAt,
-          completeness: completeness.state,
-          reason: completeness.reason,
-        },
-      })
-      return
+      switch (completeness.reason) {
+        case 'not-recorded':
+          warnings.push({
+            id: 'accounting-reconciliation:completeness-unknown',
+            severity: 'warning',
+            source: 'accounting-reconciliation',
+            message: 'Latest accounting reconciliation run did not record whether its report was complete, so it does not show this build\'s reconciliation ran. Run reconciliation again before rolling out.',
+            details: { ...details, reason: completeness.reason },
+          })
+          return
+        case 'unreadable':
+          blockers.push({
+            id: 'accounting-reconciliation:completeness-unreadable',
+            severity: 'blocker',
+            source: 'accounting-reconciliation',
+            message: 'Latest accounting reconciliation run recorded a completeness value this build cannot read, which no writer in this codebase can produce. Run reconciliation again before rolling out.',
+            details: { ...details, reason: completeness.reason },
+          })
+          return
+        default: {
+          // A new reason must be classified here or this stops compiling — the point being that a
+          // reason added later must not fall into whichever branch happens to be last.
+          const unhandledReason: never = completeness.reason
+          throw new Error(`Unhandled accounting reconciliation completeness reason: ${String(unhandledReason)}`)
+        }
+      }
     case 'truncated':
-      warnings.push({
+      blockers.push({
         id: 'accounting-reconciliation:truncated',
-        severity: 'warning',
+        severity: 'blocker',
         source: 'accounting-reconciliation',
         message: 'Latest accounting reconciliation run reported its own findings as incomplete.',
         details: {
-          id: latest.id,
-          createdAt: latest.createdAt,
-          completeness: completeness.state,
+          ...details,
           codes: completeness.truncations.map((truncation) => truncation.code),
         },
       })

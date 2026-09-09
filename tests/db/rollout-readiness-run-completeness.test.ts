@@ -4,8 +4,10 @@ import { config } from 'dotenv'
 
 import {
   collectRolloutReadiness,
+  createRolloutReadinessHandler,
   getLatestAccountingReconciliationRun,
   type LatestAccountingReconciliationRunClient,
+  type RolloutReadinessResponse,
 } from '../../lib/ops/rollout-readiness.ts'
 import { createAdminHealth, createPreflight, READINESS_FIXED_DATE } from '../fixtures/rollout-readiness.ts'
 
@@ -85,6 +87,25 @@ function readinessAdapters(tx: Tx) {
   }
 }
 
+/**
+ * o3d-11rf r7 — THE ANSWER DEPLOYMENT TOOLING ACTUALLY READS, for a row that came out of PostgreSQL.
+ *
+ * The severity split this file proves is only worth anything at the HTTP boundary: `blocker` and
+ * `warning` differ precisely in that `?allowWarnings=true` converts the second to 200 and cannot
+ * touch the first. A test that stopped at `report.status` would be re-asserting the classifier.
+ */
+async function gateStatuses(report: RolloutReadinessResponse) {
+  const handler = createRolloutReadinessHandler({
+    authorize: async () => null,
+    collect: async () => report,
+  })
+  const plain = await handler(new Request('https://ims.example.test/api/admin/rollout-readiness'))
+  const overridden = await handler(
+    new Request('https://ims.example.test/api/admin/rollout-readiness?allowWarnings=true'),
+  )
+  return { plain: plain.status, overridden: overridden.status }
+}
+
 test('o3d-11rf r6: a run row with a NULL truncations column does not read as ready at the rollout gate', { skip }, async () => {
   await withRollback(async (tx) => {
     await insertRun(tx, 'o3d-11rf-r6-null', 'NULL')
@@ -109,6 +130,11 @@ test('o3d-11rf r6: a run row with a NULL truncations column does not read as rea
       true,
       'and the gate says so by name',
     )
+
+    // o3d-11rf r7 — a NULL column is the state of EVERY row on the deploy that ships the column, so
+    // this one stays a warning and stays overridable. That is deliberate, and it is the boundary the
+    // two tests below are on the other side of.
+    assert.deepEqual(await gateStatuses(report), { plain: 412, overridden: 200 })
   })
 })
 
@@ -125,10 +151,12 @@ test('o3d-11rf r6: the same row recording [] IS ready, so the gate is stopped by
     assert.equal(report.status, 'ready', 'a run that proved itself complete clears the gate')
     assert.equal(report.ok, true)
     assert.deepEqual(report.warnings, [])
+    assert.deepEqual(await gateStatuses(report), { plain: 200, overridden: 200 },
+      'and needs no override to do it, so the 412s below are about completeness and not about the fixture')
   })
 })
 
-test('o3d-11rf r6: a row recording a truncation reaches the gate as an incomplete report', { skip }, async () => {
+test('o3d-11rf r7: a row recording a truncation blocks the gate, and the override does not get past it', { skip }, async () => {
   await withRollback(async (tx) => {
     await insertRun(
       tx,
@@ -144,10 +172,38 @@ test('o3d-11rf r6: a row recording a truncation reaches the gate as an incomplet
     )
 
     const report = await collectRolloutReadiness(readinessAdapters(tx))
-    assert.notEqual(report.status, 'ready')
-    const warning = report.warnings.find((finding) => finding.id === 'accounting-reconciliation:truncated')
-    assert(warning, 'the gate reports the report as incomplete, not merely as carrying warnings')
-    assert.deepEqual(warning?.details?.codes, ['void_mirror_basis_unknown_contradictions_truncated'])
+    assert.equal(report.status, 'blocked')
+    const blocker = report.blockers.find((finding) => finding.id === 'accounting-reconciliation:truncated')
+    assert(blocker, 'the gate reports the report as incomplete, not merely as carrying warnings')
+    assert.deepEqual(blocker?.details?.codes, ['void_mirror_basis_unknown_contradictions_truncated'])
+
+    // o3d-11rf r7 (Codex r6, HIGH) — THE DECISIVE ONE. A run that says its own findings are short is
+    // a fact about real data, not an artefact of this deploy, and `allowWarnings` records nothing
+    // about who accepted it or why (o3d-yby2). So the override must not reach it.
+    assert.deepEqual(await gateStatuses(report), { plain: 412, overridden: 412 })
+  })
+})
+
+test('o3d-11rf r7: a row holding a payload the reader cannot parse blocks the gate, override or not', { skip }, async () => {
+  await withRollback(async (tx) => {
+    // A JSONB value that is neither NULL nor an array of sentinels. Nothing in this codebase writes
+    // one — `persistAccountingReconciliationReport` always writes the array — so this is corruption
+    // or an unexplained writer, and there is no correct deploy on which it is expected.
+    await insertRun(tx, 'o3d-11rf-r7-unreadable', `'{"truncated": true}'::jsonb`)
+
+    const latest = await getLatestAccountingReconciliationRun(tx)
+    assert.equal(latest?.id, 'o3d-11rf-r7-unreadable')
+    assert(latest && latest.completeness.state === 'unknown' && latest.completeness.reason === 'unreadable',
+      'read out of PostgreSQL, an unparseable payload fails closed to unreadable rather than to complete')
+
+    const report = await collectRolloutReadiness(readinessAdapters(tx))
+    assert.equal(report.status, 'blocked')
+    assert.equal(
+      report.blockers.some((finding) => finding.id === 'accounting-reconciliation:completeness-unreadable'),
+      true,
+      'and it is reported apart from the run that merely never said',
+    )
+    assert.deepEqual(await gateStatuses(report), { plain: 412, overridden: 412 })
   })
 })
 
@@ -155,7 +211,7 @@ test('o3d-11rf r6: nothing was left behind', { skip }, async () => {
   loadEnv()
   const { db } = await import('../../lib/db')
   const surviving = await db.accountingReconciliationRun.count({
-    where: { id: { in: ['o3d-11rf-r6-null', 'o3d-11rf-r6-empty', 'o3d-11rf-r6-truncated'] } },
+    where: { id: { in: ['o3d-11rf-r6-null', 'o3d-11rf-r6-empty', 'o3d-11rf-r6-truncated', 'o3d-11rf-r7-unreadable'] } },
   })
   assert.equal(surviving, 0, 'every probe transaction aborted')
 })

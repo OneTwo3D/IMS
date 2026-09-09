@@ -91,8 +91,14 @@ test('o3d-11rf r6: a run that never recorded its completeness does not read as r
   assert.equal(warning?.details?.reason, 'not-recorded')
   assert.match(String(warning?.message), /reconciliation again/i, 'and what to do about it')
 
-  // WHAT AN AUTOMATED ROLLOUT ACTUALLY SEES. A warning is not advisory here: the handler answers 412
-  // for anything that is not `ready`, so this stops a deploy unless a human passes allowWarnings.
+  // WHAT AN AUTOMATED ROLLOUT ACTUALLY SEES, AND WHAT r6 GOT WRONG ABOUT IT. The handler answers 412
+  // for anything that is not `ready`, so this does stop a deploy by default. r6 then called
+  // `allowWarnings=true` "an explicit, recorded override" and rested the whole warn-not-block choice
+  // on it. It records NOTHING — no reason, no named findings, no actor, no audit row — and it
+  // accepts every warning in the verdict at once (o3d-yby2). This state stays a warning anyway,
+  // because a NULL column is what EVERY row holds on the deploy that ships the column and a gate
+  // that cannot go green on a correct deploy gets routed around. The two completeness states that
+  // are NOT expected on a correct deploy are blockers instead; see the two tests below.
   const handler = createRolloutReadinessHandler({
     authorize: async () => null,
     collect: async () => report,
@@ -102,7 +108,8 @@ test('o3d-11rf r6: a run that never recorded its completeness does not read as r
   const overridden = await handler(
     new Request('https://ims.example.test/api/admin/rollout-readiness?allowWarnings=true'),
   )
-  assert.equal(overridden.status, 200, 'and can only be got past by an explicit override')
+  assert.equal(overridden.status, 200,
+    'and this state — and only this state — remains gettable past by the unrecorded global flag')
 })
 
 test('o3d-11rf r6: a run that recorded [] IS clean, so the warning is about the missing claim and not about the column', async () => {
@@ -118,7 +125,21 @@ test('o3d-11rf r6: a run that recorded [] IS clean, so the warning is about the 
   assert.deepEqual(report.warnings, [], 'a run that proved itself complete raises nothing')
 })
 
-test('o3d-11rf r6: a run that recorded a truncation is reported as incomplete, by code', async () => {
+/**
+ * o3d-11rf r7 (Codex r6, HIGH) — A TRUNCATED REPORT IS NOT OVERRIDABLE.
+ *
+ * r6 made this a WARNING and justified it with the claim that `?allowWarnings=true` is "an explicit,
+ * recorded override". It records nothing: no reason, no named findings, no actor, no audit row, and
+ * it converts EVERY warning-only verdict at once. So the state that says "the reconciliation report
+ * you are about to deploy on omitted findings" could be waved past by a caller who was overriding
+ * something else entirely, and nothing would say so afterwards.
+ *
+ * The decisive assertion is the last one, and it is made THROUGH THE HANDLER. A test that stopped at
+ * `report.status` would pass against the r6 code as soon as it was rewritten to expect `warning`;
+ * only the HTTP answer with the override set distinguishes "stops a deploy" from "stops a deploy
+ * unless anyone asks it not to".
+ */
+test('o3d-11rf r7: a run that recorded a truncation blocks the gate, and the override does not get past it', async () => {
   const truncated = readReconciliationCompleteness([
     {
       code: 'void_mirror_basis_unknown_contradictions_truncated',
@@ -132,13 +153,31 @@ test('o3d-11rf r6: a run that recorded a truncation is reported as incomplete, b
     latestAccountingReconciliationRun: createReconciliationRun(truncated),
   }))
 
-  assert.equal(report.status, 'warning')
-  const warning = report.warnings.find((finding) => finding.id === 'accounting-reconciliation:truncated')
-  assert(warning, 'named as a truncation rather than folded into the generic warnings count')
-  assert.deepEqual(warning?.details?.codes, ['void_mirror_basis_unknown_contradictions_truncated'])
+  assert.equal(report.status, 'blocked')
+  assert.equal(report.ok, false)
+  const blocker = report.blockers.find((finding) => finding.id === 'accounting-reconciliation:truncated')
+  assert(blocker, 'named as a truncation rather than folded into the generic warnings count')
+  assert.equal(blocker?.severity, 'blocker')
+  assert.deepEqual(blocker?.details?.codes, ['void_mirror_basis_unknown_contradictions_truncated'])
+  assert.equal(
+    report.warnings.some((finding) => finding.id === 'accounting-reconciliation:truncated'),
+    false,
+    'and it is not ALSO a warning, which is the severity the override can reach',
+  )
+
+  const handler = createRolloutReadinessHandler({
+    authorize: async () => null,
+    collect: async () => report,
+  })
+  const blocked = await handler(new Request('https://ims.example.test/api/admin/rollout-readiness'))
+  assert.equal(blocked.status, 412)
+  const overridden = await handler(
+    new Request('https://ims.example.test/api/admin/rollout-readiness?allowWarnings=true'),
+  )
+  assert.equal(overridden.status, 412, 'THE POINT: no query flag turns an incomplete report into a green deploy')
 })
 
-test('o3d-11rf r6: completeness is classified even when the run status returns early', async () => {
+test('o3d-11rf r7: completeness is classified even when the run status returns early', async () => {
   // EVERY BRANCH OF THE STATUS SWITCH RETURNS. A completeness check placed after it would be skipped
   // for a FAILED or PARTIAL run — and PARTIAL is precisely a run whose completeness is in question.
   const report = await collectRolloutReadiness(createAdapters({
@@ -152,17 +191,79 @@ test('o3d-11rf r6: completeness is classified even when the run status returns e
   assert.equal(ids.has('accounting-reconciliation:completeness-unknown'), true, 'and so is the completeness')
 })
 
-test('o3d-11rf r6: a completeness payload the reader cannot parse is unknown, never clean', async () => {
+/**
+ * o3d-11rf r7 — AN UNREADABLE COMPLETENESS PAYLOAD BLOCKS, BECAUSE NOTHING CAN WRITE ONE.
+ *
+ * `persistAccountingReconciliationReport` is the only writer of this column and it always writes an
+ * array of `{code, message}` sentinels. A value that is neither NULL nor such an array therefore did
+ * not come from this codebase: it is corruption, or a writer nobody has explained. Unlike a NULL —
+ * which every row in the table holds on the deploy that ships the column — there is no correct
+ * deploy on which this is expected, so blocking it can never make the gate unsatisfiable.
+ */
+test('o3d-11rf r7: a completeness payload the reader cannot parse blocks the gate, override or not', async () => {
   const unreadable = readReconciliationCompleteness({ truncated: true })
-  assert.equal(unreadable.state, 'unknown')
+  assert(unreadable.state === 'unknown' && unreadable.reason === 'unreadable',
+    'the premise: a payload that is neither NULL nor a sentinel array is unreadable, not complete')
 
   const report = await collectRolloutReadiness(createAdapters({
     latestAccountingReconciliationRun: createReconciliationRun(unreadable),
   }))
 
-  assert.equal(report.status, 'warning', 'a shape we cannot read proves nothing about completeness')
-  const warning = report.warnings.find((finding) => finding.id === 'accounting-reconciliation:completeness-unknown')
-  assert.equal(warning?.details?.reason, 'unreadable')
+  assert.equal(report.status, 'blocked', 'a shape we cannot read proves nothing about completeness')
+  const blocker = report.blockers.find((finding) => finding.id === 'accounting-reconciliation:completeness-unreadable')
+  assert(blocker, 'and it is reported apart from the run that merely never said')
+  assert.equal(blocker?.details?.reason, 'unreadable')
+
+  const handler = createRolloutReadinessHandler({
+    authorize: async () => null,
+    collect: async () => report,
+  })
+  const overridden = await handler(
+    new Request('https://ims.example.test/api/admin/rollout-readiness?allowWarnings=true'),
+  )
+  assert.equal(overridden.status, 412, 'no query flag reads an unreadable payload as a complete one')
+})
+
+/**
+ * o3d-11rf r7 (Codex r6, the test it asked for by name) — AN OVERRIDE RAISED FOR ONE WARNING CANNOT
+ * SUPPRESS RECONCILIATION INCOMPLETENESS.
+ *
+ * `allowWarnings` is a single global boolean over the whole verdict, so the caller who sets it to get
+ * past a trusted-proxy advisory is not told, and cannot be told, that they also accepted a
+ * reconciliation report with findings missing from it. Severity is the only thing separating the two,
+ * which is why the incompleteness has to be a BLOCKER rather than a better-worded warning.
+ */
+test('o3d-11rf r7: an override raised for an unrelated advisory warning cannot suppress an incomplete reconciliation report', async () => {
+  const report = await collectRolloutReadiness(createAdapters({
+    preflight: createPreflight([
+      { id: 'trusted-proxy', name: 'TRUSTED_PROXY_CIDRS', status: 'warn', message: 'Trusted proxy CIDRs are not configured.' },
+    ]),
+    latestAccountingReconciliationRun: createReconciliationRun(readReconciliationCompleteness([
+      { code: 'reconciliation_row_cap_reached', message: 'salesOrders scan hit the 10,000 row cap', details: { dataset: 'salesOrders' } },
+    ])),
+  }))
+
+  // THE OVERRIDE HAS SOMETHING REAL TO ACT ON. Without this the test could pass on a report that
+  // simply had no overridable warning in it, which is not the situation being guarded against.
+  assert.equal(
+    report.warnings.some((finding) => finding.id === 'preflight:trusted-proxy'),
+    true,
+    'the advisory warning a caller would legitimately be overriding is present',
+  )
+  assert.equal(report.status, 'blocked')
+
+  const handler = createRolloutReadinessHandler({
+    authorize: async () => null,
+    collect: async () => report,
+  })
+  const overridden = await handler(
+    new Request('https://ims.example.test/api/admin/rollout-readiness?allowWarnings=true'),
+  )
+  assert.equal(
+    overridden.status,
+    412,
+    'accepting the advisory warning does not silently accept the incomplete report alongside it',
+  )
 })
 
 test('rollout readiness reports warnings without blocking rollout', async () => {
