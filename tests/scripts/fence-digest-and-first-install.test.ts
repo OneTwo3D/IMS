@@ -54,6 +54,10 @@ function releaseCheckout(): string {
   // reason: it owns the shared lock and the connection-fence directory, and update.sh refuses to
   // start without it.
   cpSync(join(REPO, 'scripts/lib/cutover-namespace.sh'), join(checkout, 'scripts/lib/cutover-namespace.sh'))
+  // …and the environment-source scan, sourced from the same directory since o3d-rret. Same reason
+  // again: it is the only thing that asks systemd what composes the service's environment, and
+  // update.sh refuses to start without it.
+  cpSync(join(REPO, 'scripts/lib/unit-environment.sh'), join(checkout, 'scripts/lib/unit-environment.sh'))
   cpSync(join(REPO, 'scripts/fence-db-connections.mjs'), join(checkout, 'scripts/fence-db-connections.mjs'))
   writeCheckoutPg(checkout)
   mkdirSync(join(root, 'tmp'), { recursive: true })
@@ -350,6 +354,7 @@ function firstInstallFixture(): { root: string; digest: string } {
   cpSync(join(REPO, 'scripts/lib/db-fence-protected.sh'), join(release, 'scripts/lib/db-fence-protected.sh'))
   cpSync(join(REPO, 'scripts/lib/crontab-lock.sh'), join(release, 'scripts/lib/crontab-lock.sh'))
   cpSync(join(REPO, 'scripts/lib/cutover-namespace.sh'), join(release, 'scripts/lib/cutover-namespace.sh'))
+  cpSync(join(REPO, 'scripts/lib/unit-environment.sh'), join(release, 'scripts/lib/unit-environment.sh'))
   cpSync(join(app, 'scripts/fence-db-connections.mjs'), join(release, 'scripts/fence-db-connections.mjs'))
   writeCheckoutPg(release)
   const printed = execFileSync('bash', ['scripts/update.sh', '--print-fence-digest'], {

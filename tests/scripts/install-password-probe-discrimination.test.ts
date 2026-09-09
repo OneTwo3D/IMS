@@ -59,6 +59,7 @@ import {
   REPO,
   runShipped,
   seedLiveInstallation,
+  shippedFromDefiner,
   SHIPPED_ROTATION_UP_TO_THE_CLEAR,
   writeCertificate,
   writeInstalledEnv,
@@ -2045,12 +2046,7 @@ const HOST_UNSET = 'as 3 "PGSSLMODE" "PGREPLICATION" "NODE_PG_FORCE_NATIVE"'
 
 function runRouteEnv(options: RouteEnvOptions): { status: number; output: string } {
   const source = readFileSync(join(REPO, 'scripts/install.sh'), 'utf8')
-  const lift = (name: string): string => {
-    const start = source.indexOf(`\n${name}() {\n`)
-    assert.notEqual(start, -1, `precondition: scripts/install.sh must define ${name}()`)
-    const end = source.indexOf('\n}\n', start)
-    return source.slice(start + 1, end + 3)
-  }
+  const lift = shippedFromDefiner
   const program = [
     'set -uo pipefail',
     'APP_NAME="one-two-inventory"; APP_DIR=/opt/app; APP_PORT=3000',
@@ -2437,11 +2433,7 @@ test('r45: the start gate refuses a transport the run never authenticated agains
   //         here still passes, which is why the ORDER is not what this test claims — the claim is
   //         that all four refuse, and the control is that a clean unit binds.
   const source = readFileSync(join(REPO, 'scripts/install.sh'), 'utf8')
-  const lift = (name: string): string => {
-    const start = source.indexOf(`\n${name}() {\n`)
-    assert.notEqual(start, -1, `precondition: scripts/install.sh must define ${name}()`)
-    return source.slice(start + 1, source.indexOf('\n}\n', start) + 3)
-  }
+  const lift = shippedFromDefiner
   const root = installRoot('ims-r45-start-')
   try {
     const envPath = join(root, '.env')
@@ -3906,11 +3898,7 @@ test('r45: the installer writes the UnsetEnvironment directive the start gate re
   //         db_route_env_variables(): NAMES_MATCH fails, because the two lists could then drift
   //         and the start gate would demand a name the drop-in does not state.
   const source = readFileSync(join(REPO, 'scripts/install.sh'), 'utf8')
-  const lift = (name: string): string => {
-    const start = source.indexOf(`\n${name}() {\n`)
-    assert.notEqual(start, -1, `precondition: scripts/install.sh must define ${name}()`)
-    return source.slice(start + 1, source.indexOf('\n}\n', start) + 3)
-  }
+  const lift = shippedFromDefiner
   const dryRun = source.match(/^DRY_RUN=.*$/gm) ?? []
   assert.equal(dryRun.length, 1, 'precondition: scripts/install.sh must declare DRY_RUN exactly once at top level')
 
