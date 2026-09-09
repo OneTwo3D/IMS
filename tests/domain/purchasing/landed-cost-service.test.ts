@@ -8,9 +8,7 @@ import {
   createCostLayer,
   getReturnedQtyForCostLayer,
   getSupplierReturnedQtyForCostLayer,
-  getInTransitTransferConsumptionForCostLayer,
   getTransferConsumedQtyForCostLayer,
-  recordPendingTransferLandedCostReclass,
   updateSnapshotsForCostLayerChange,
 } from '@/lib/cost-layers'
 import { TRANSFER_STATUSES_WITH_OUTSTANDING_SOURCE_CONSUMPTION } from '@/lib/domain/inventory/movement-cogs-relevance'
@@ -30,14 +28,6 @@ import {
   roundAdjustmentTotalDelta,
   type LandedCostServiceDeps,
 } from '@/lib/domain/purchasing/landed-cost-service'
-
-const TEST_REVALUATION_CONTEXT = {
-  primaryPoId: 'po-1',
-  primaryPoRef: 'PO-1',
-  freightPoId: null,
-  recalcRunId: 'test-recalc-run',
-  revaluedAt: new Date('2026-06-20T00:00:00.000Z'),
-} as const
 
 const TEST_AUDIT_OPTIONS = {
   triggeredById: null,
@@ -420,7 +410,7 @@ test('propagateLandedCostToOutputs cascades a component cost change through nest
   await propagateLandedCostToOutputs(
     tx as never, deps, 'comp-1', toDecimal(2),
     (c, i) => { cogs = cogs.add(c); inv = inv.add(i) },
-    new Set(), 1, TEST_REVALUATION_CONTEXT,
+    new Set(), 1, 'test-recalc-run', new Date('2026-06-20T00:00:00.000Z'),
   )
   // out-1 unit cost up 2×4/10 = 0.8 → 5.8; out-2 up 0.8×2/5 = 0.32 → 7.32.
   assert.equal(updates['out-1'], '5.8')
@@ -465,7 +455,7 @@ test('propagateLandedCostToOutputs accumulates BOTH paths of a diamond BOM (audi
   })
   await propagateLandedCostToOutputs(
     tx as never, deps, 'comp-1', toDecimal(1),
-    () => {}, new Set(), 1, TEST_REVALUATION_CONTEXT,
+    () => {}, new Set(), 1, 'test-recalc-run', new Date('2026-06-20T00:00:00.000Z'),
   )
   assert.equal(state['out-1'].unitCostBase, '4')
   assert.equal(state['out-2'].unitCostBase, '4')
@@ -810,8 +800,6 @@ function noopDeps(overrides: Partial<LandedCostServiceDeps> = {}): LandedCostSer
     getManufacturingConsumedQtyForCostLayer: async () => new Prisma.Decimal(0),
     getReversalConsumedQtyForCostLayer: async () => new Prisma.Decimal(0),
     getTransferConsumedQtyForCostLayer: async () => new Prisma.Decimal(0),
-    getInTransitTransferConsumptionForCostLayer: async () => [],
-    recordPendingTransferLandedCostReclass: async () => false,
     getDependentOutputSourceLines: async () => [],
     updateSnapshotsForCostLayerChange: async () => 0,
     refreshShipmentCogsForCostLayerChange: async () => ({ shipmentsUpdated: 0, cogsRevaluationDelta: new Prisma.Decimal(0) }),
@@ -1715,23 +1703,6 @@ type WorldSourceLine = {
   unitCostBase: string
   totalCostBase: string
 }
-type WorldPendingReclass = {
-  id: string
-  sourceCostLayerId: string
-  transferLineId: string
-  qty: string
-  qtyConsumed: string
-  unitCostDelta: string
-  primaryPoId: string
-  primaryPoRef: string
-  freightPoId: string | null
-  recalcRunId: string
-  idempotencyKey: string
-  revaluedAt: Date
-  settledAt: Date | null
-  createdAt: number
-}
-
 /**
  * A small in-memory Prisma stand-in covering exactly the tables this flow touches.
  * The raw-SQL handler reads the STATUS LIST OUT OF THE BOUND PARAMETER rather than
@@ -1746,12 +1717,8 @@ function createLandedCostWorld(init: {
   const costLayers = new Map(init.costLayers.map((layer) => [layer.id, { ...layer }]))
   const sourceLines: WorldSourceLine[] = [...(init.sourceLines ?? [])]
   const transferLines: WorldTransferLine[] = [...(init.transferLines ?? [])]
-  const pending: WorldPendingReclass[] = []
-  const journals: Array<{ type: string; idempotencyKey?: string; payload: Record<string, unknown>; referenceId: string }> = []
-  const transitLedger: Array<{ sourceType: string; idempotencyKey: string; baseDelta: number }> = []
   let layerSeq = 0
   let sourceLineSeq = 0
-  let pendingSeq = 0
 
   function snapshotRows(sql: string, containment: string, statuses: unknown) {
     // Mirrors the discipline of createTransferSnapshotTx above: the status list must
@@ -1769,14 +1736,6 @@ function createLandedCostWorld(init: {
   const tx = {
     $queryRawUnsafe: async (sql: string, containment: string, statuses: unknown) => {
       const rows = snapshotRows(sql, containment, statuses)
-      if (sql.includes('stl.id AS "transferLineId"')) {
-        return rows.map((line) => ({
-          transferLineId: line.id,
-          costLayerSnapshot: line.snapshot,
-          qty: line.qty,
-          qtyReceived: line.qtyReceived,
-        }))
-      }
       return rows.map((line) => ({ costLayerSnapshot: line.snapshot }))
     },
     purchaseOrderLine: { update: async (args: unknown) => args },
@@ -1827,37 +1786,6 @@ function createLandedCostWorld(init: {
         return { count: data.length }
       },
     },
-    pendingTransferLandedCostReclass: {
-      createMany: async ({ data }: { data: Array<Record<string, unknown>> }) => {
-        let count = 0
-        for (const row of data) {
-          if (pending.some((existing) => existing.idempotencyKey === row.idempotencyKey)) continue
-          pending.push({
-            id: `pending-${++pendingSeq}`,
-            qtyConsumed: '0',
-            settledAt: null,
-            createdAt: pendingSeq,
-            ...(row as unknown as Omit<WorldPendingReclass, 'id' | 'qtyConsumed' | 'settledAt' | 'createdAt'>),
-          })
-          count += 1
-        }
-        return { count }
-      },
-      findMany: async ({ where }: { where: { sourceCostLayerId: string; transferLineId: string; settledAt: null } }) =>
-        pending
-          .filter((row) => row.sourceCostLayerId === where.sourceCostLayerId
-            && row.transferLineId === where.transferLineId
-            && row.settledAt === null)
-          .sort((left, right) => left.createdAt - right.createdAt),
-      update: async ({ where, data }: { where: { id: string }; data: { qtyConsumed: string; settledAt: Date | null } }) => {
-        const row = pending.find((candidate) => candidate.id === where.id)
-        if (row) {
-          row.qtyConsumed = data.qtyConsumed
-          row.settledAt = data.settledAt
-        }
-        return row
-      },
-    },
   }
 
   const recreationDeps = {
@@ -1866,31 +1794,15 @@ function createLandedCostWorld(init: {
     // stubbing it would test the stub.
     createCostLayer,
     copyCostLayerSourceLinesProportionally,
-    getAccountingSettings: (async () => ({ inventoryAccount: '1000', transitAccount: '1200', cogsAccount: '5000' })) as never,
-    queueAccountingSyncTx: (async (_tx: unknown, params: {
-      type: string
-      idempotencyKey?: string
-      payload: Record<string, unknown>
-      referenceId: string
-    }) => {
-      if (params.idempotencyKey && journals.some((entry) => entry.idempotencyKey === params.idempotencyKey)) return false
-      journals.push({ type: params.type, idempotencyKey: params.idempotencyKey, payload: params.payload, referenceId: params.referenceId })
-      return true
-    }) as never,
-    recordTransitSubledgerMovement: (async (_tx: unknown, input: { sourceType: string; idempotencyKey: string; baseDelta: number }) => {
-      transitLedger.push({ sourceType: input.sourceType, idempotencyKey: input.idempotencyKey, baseDelta: Number(input.baseDelta) })
-    }) as never,
   }
 
-  return { tx, costLayers, sourceLines, transferLines, pending, journals, transitLedger, recreationDeps }
+  return { tx, costLayers, sourceLines, transferLines, recreationDeps }
 }
 
 /** Deps wired to the world, using the REAL transfer/deferral queries under test. */
 function worldDeps(world: ReturnType<typeof createLandedCostWorld>): LandedCostServiceDeps {
   return noopDeps({
     getTransferConsumedQtyForCostLayer: (tx, id) => getTransferConsumedQtyForCostLayer(tx, id) as never,
-    getInTransitTransferConsumptionForCostLayer: (tx, id) => getInTransitTransferConsumptionForCostLayer(tx, id) as never,
-    recordPendingTransferLandedCostReclass,
     getDependentOutputSourceLines: async (tx, sourceCostLayerId) => {
       const rows = await tx.costLayerSourceLine.findMany({
         where: { sourceCostLayerId },
@@ -1965,159 +1877,6 @@ test('a cancelled dispatch reclasses the WHOLE landed-cost delta to inventory an
   // Precondition: the replacement layer really was revalued, so the reclass total
   // above is coming from the propagation and not from an unrelated zero.
   assert.equal(world.costLayers.get('layer-replacement')?.unitCostBase, '11')
-  assert.equal(world.pending.length, 0, 'the units have landed — nothing to defer')
-})
-
-test('a revaluation BEFORE receipt defers the reclass, and the receipt journals it (Codex r2 HIGH-2)', async () => {
-  // The stranded-transit case. Nothing holds these units: the source layer is fully
-  // consumed and the destination layer does not exist yet. Round-1 behaviour was to
-  // subtract the snapshot from COGS, find no dependent output, rewrite the snapshot
-  // and queue NOTHING — the £100 freight debit then sat in transit forever with
-  // inventory £100 understated, invisible to the 6oyu.4 transit sweep because a
-  // MISSING posting is absent from both sides of the comparison that sweep makes.
-  const world = createLandedCostWorld({
-    costLayers: [{ id: 'layer-a', unitCostBase: '10', receivedQty: '100', remainingQty: '0' }],
-    transferLines: [{ id: 'tl-1', status: 'IN_TRANSIT', qty: 100, qtyReceived: 0, snapshot: [{ costLayerId: 'layer-a', qty: '100', unitCostBase: 10 }] }],
-  })
-  const tx = { ...world.tx, purchaseOrder: { findUnique: async () => transferredPo('layer-a') } }
-
-  const result = await recalculateDirectLandedCosts(tx as never, 'po-1', worldDeps(world), TEST_AUDIT_OPTIONS)
-
-  // Still no COGS (6oyu.19) and still nothing to reclass YET — but now the debt is
-  // recorded rather than forgotten.
-  assert.equal(totalOf(result.cogsAdjustments), 0)
-  assert.equal(totalOf(result.inventoryTransitAdjustments), 0, 'no layer exists to carry it, so this recalc posts nothing')
-  assert.equal(world.pending.length, 1, 'the delta must be written down as an obligation, not dropped')
-  assert.equal(world.pending[0].qty, '100.000000')
-  assert.equal(world.pending[0].unitCostDelta, '1.000000')
-  assert.equal(world.pending[0].primaryPoRef, 'PO-1')
-  assert.equal(world.journals.length, 0, 'precondition: the revaluation itself queues nothing here')
-
-  // ... and now the goods arrive. The receipt rebuilds the layers from the (already
-  // rewritten, £11) snapshot and must discharge the obligation in the same breath.
-  await recreateTransferCostLayersFromSnapshotSlice(
-    tx as never,
-    { productId: 'prod-1', warehouseId: 'wh-dest', transferLineId: 'tl-1', contextLabel: 'transfer TR-1 receipt' },
-    [{ costLayerId: 'layer-a', qty: '100.000000', unitCostBase: '11.000000' }],
-    world.recreationDeps as never,
-  )
-
-  // Asserted THROUGH THE JOURNAL, deliberately. A snapshot- or layer-level assertion
-  // cannot see this defect: the snapshot was rewritten to £11 by the revaluation
-  // either way, so the destination layer comes out at £11 whether or not the GL ever
-  // hears about it. The queued journal is the only thing that distinguishes them.
-  assert.equal(world.journals.length, 1, 'the deferred reclass must reach the ledger when the units land')
-  const journal = world.journals[0]
-  assert.equal(journal.type, 'STOCK_IN_TRANSIT')
-  assert.equal(journal.referenceId, 'po-1')
-  assert.deepEqual(
-    (journal.payload.lines as Array<Record<string, unknown>>),
-    [
-      { accountCode: '1000', description: 'Landed cost reclass — PO-1', debit: 100 },
-      { accountCode: '1200', description: 'Landed cost reclass — PO-1', credit: 100 },
-    ],
-    'DR inventory / CR transit for the full £100 — the reclass the revaluation could not make',
-  )
-  assert.deepEqual(
-    world.transitLedger.map((row) => ({ sourceType: row.sourceType, baseDelta: row.baseDelta })),
-    [{ sourceType: 'LANDED_COST_RECLASS', baseDelta: -100 }],
-    'the transit leg must be recorded too, or the 6oyu.4 sweep flags the journal as unexplained',
-  )
-  assert.equal(world.pending[0].settledAt instanceof Date, true, 'the obligation is discharged, not left to double-post')
-})
-
-test('a revaluation BEFORE a dispatch cancellation is journaled by the cancellation (Codex r2 HIGH-2)', async () => {
-  // The other way in-transit units come to rest. cancelDispatchedTransfer creates
-  // REPLACEMENT layers at the source rather than un-consuming the originals, so it
-  // is just as much "the moment a layer finally holds these units" as a receipt is —
-  // and it must discharge the same obligation. Round-1 code created the replacement
-  // layer at the revised cost and queued no journal at all.
-  const world = createLandedCostWorld({
-    costLayers: [{ id: 'layer-a', unitCostBase: '10', receivedQty: '100', remainingQty: '0' }],
-    transferLines: [{ id: 'tl-1', status: 'IN_TRANSIT', qty: 100, qtyReceived: 0, snapshot: [{ costLayerId: 'layer-a', qty: '100', unitCostBase: 10 }] }],
-  })
-  const tx = { ...world.tx, purchaseOrder: { findUnique: async () => transferredPo('layer-a') } }
-  await recalculateDirectLandedCosts(tx as never, 'po-1', worldDeps(world), TEST_AUDIT_OPTIONS)
-  assert.equal(world.pending.length, 1, 'precondition: the revaluation deferred the reclass')
-
-  await recreateTransferCostLayersFromSnapshotSlice(
-    tx as never,
-    { productId: 'prod-1', warehouseId: 'wh-source', transferLineId: 'tl-1', contextLabel: 'transfer TR-1 dispatch cancellation' },
-    [{ costLayerId: 'layer-a', qty: '100.000000', unitCostBase: '11.000000' }],
-    world.recreationDeps as never,
-  )
-
-  assert.equal(world.journals.length, 1)
-  assert.equal(world.journals[0].type, 'STOCK_IN_TRANSIT')
-  assert.match(String(world.journals[0].payload.narration), /released by transfer TR-1 dispatch cancellation/)
-  assert.deepEqual(world.transitLedger.map((row) => row.baseDelta), [-100])
-})
-
-test('a partial receipt settles only its share of the deferred reclass (6oyu.19)', async () => {
-  // Partial receipts are how a real transfer lands, and a reclass that posts the
-  // WHOLE obligation on the first slice over-credits transit by the remainder.
-  const world = createLandedCostWorld({
-    costLayers: [{ id: 'layer-a', unitCostBase: '10', receivedQty: '100', remainingQty: '0' }],
-    transferLines: [{ id: 'tl-1', status: 'IN_TRANSIT', qty: 100, qtyReceived: 0, snapshot: [{ costLayerId: 'layer-a', qty: '100', unitCostBase: 10 }] }],
-  })
-  const tx = { ...world.tx, purchaseOrder: { findUnique: async () => transferredPo('layer-a') } }
-  await recalculateDirectLandedCosts(tx as never, 'po-1', worldDeps(world), TEST_AUDIT_OPTIONS)
-
-  for (const qty of ['40.000000', '60.000000']) {
-    await recreateTransferCostLayersFromSnapshotSlice(
-      tx as never,
-      { productId: 'prod-1', warehouseId: 'wh-dest', transferLineId: 'tl-1', contextLabel: 'transfer TR-1 receipt' },
-      [{ costLayerId: 'layer-a', qty, unitCostBase: '11.000000' }],
-      world.recreationDeps as never,
-    )
-  }
-
-  assert.deepEqual(world.journals.map((entry) => (entry.payload.lines as Array<{ debit?: number }>)[0].debit), [40, 60])
-  assert.equal(world.transitLedger.reduce((sum, row) => sum + row.baseDelta, 0), -100, 'the two slices must sum to the whole obligation, no more')
-  assert.equal(world.pending[0].settledAt instanceof Date, true)
-})
-
-test('re-running the same recalc does not double the deferred obligation (6oyu.19)', async () => {
-  // The obligation is keyed by (recalc run, source layer, transfer line): a replayed
-  // recalc must be a no-op, or a retry would reclass the freight twice.
-  const world = createLandedCostWorld({
-    costLayers: [{ id: 'layer-a', unitCostBase: '10', receivedQty: '100', remainingQty: '0' }],
-    transferLines: [{ id: 'tl-1', status: 'IN_TRANSIT', qty: 100, qtyReceived: 0, snapshot: [{ costLayerId: 'layer-a', qty: '100', unitCostBase: 10 }] }],
-  })
-  const tx = { ...world.tx, purchaseOrder: { findUnique: async () => transferredPo('layer-a') } }
-  const deps = worldDeps(world)
-  await recalculateDirectLandedCosts(tx as never, 'po-1', deps, TEST_AUDIT_OPTIONS)
-  const firstKey = world.pending[0].idempotencyKey
-  // Second pass: the layer is already at £11, so costDelta is 0 and nothing new is
-  // deferred. Re-recording the SAME key is separately blocked by skipDuplicates.
-  await recordPendingTransferLandedCostReclass(tx as never, {
-    sourceCostLayerId: 'layer-a',
-    transferLineId: 'tl-1',
-    qty: 100,
-    unitCostDelta: 1,
-    primaryPoId: 'po-1',
-    primaryPoRef: 'PO-1',
-    freightPoId: null,
-    recalcRunId: firstKey.split(':')[0],
-    revaluedAt: new Date(),
-  })
-  assert.equal(world.pending.length, 1, 'a replay of the same recalc run must not add a second obligation')
-})
-
-test('the in-transit deferral reaches EVERY revaluation path (6oyu.19)', () => {
-  // Same census shape as the exclusion-loader test above, and for the same reason:
-  // the recurring defect in this file is a rule that reaches some revaluation entry
-  // points and not others. recalculateLandedCosts, recalculateDirectLandedCosts and
-  // propagateLandedCostToOutputs must all defer, via the one shared function.
-  const source = readFileSync('lib/domain/purchasing/landed-cost-service.ts', 'utf8')
-  assert.match(source, /async function deferInTransitLandedCostReclass\(/, 'precondition: the shared deferral must exist in the file read')
-
-  for (const loader of ['getInTransitTransferConsumptionForCostLayer', 'recordPendingTransferLandedCostReclass']) {
-    const invocations = source.match(new RegExp(`(?:deps|serviceDeps)\\.${loader}\\(`, 'g')) ?? []
-    assert.equal(invocations.length, 1, `${loader} is invoked ${invocations.length} times; it must go through deferInTransitLandedCostReclass`)
-  }
-  const calls = source.match(/deferInTransitLandedCostReclass\(/g) ?? []
-  assert.equal(calls.length, 4, 'expected the definition plus its three revaluation call sites')
 })
 
 test('a WMS-received transfer layer is reachable by revaluation, so COGS stays zero and the reclass posts (Codex r2 HIGH-1)', async () => {
@@ -2210,7 +1969,6 @@ test('WITHOUT the link the delta is silently stranded — the state the fix remo
   assert.equal(totalOf(result.cogsAdjustments), 0)
   assert.equal(totalOf(result.inventoryTransitAdjustments), 0, 'no link, no reclass — £100 stranded in transit, and nothing says so')
   assert.equal(world.costLayers.get('layer-dest-unlinked')?.unitCostBase, '10', 'the destination layer is not even revalued')
-  // A RECEIVED transfer defers nothing, so there is no second chance either: this
-  // is a permanent loss, which is why the link is now a helper postcondition.
-  assert.equal(world.pending.length, 0)
+  // Nothing records the omission either: no obligation is persisted anywhere, so
+  // this is a permanent loss. That is why the link is now a helper postcondition.
 })

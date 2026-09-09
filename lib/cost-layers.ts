@@ -10,11 +10,7 @@
 import type { Prisma, StockMovementType } from '@/app/generated/prisma/client'
 import { getAccountingSettings, isAccountingSyncTypeEnabled, isDailyBatchPostingEnabled, queueAccountingSyncTx } from '@/lib/accounting'
 import { parseCostLayerSnapshot, serializeCostLayerSnapshot, sumCostLayerSnapshot } from '@/lib/cost-layer-snapshots'
-import {
-  TRANSFER_STATUSES_AWAITING_DESTINATION_LAYER,
-  TRANSFER_STATUSES_WITH_OUTSTANDING_SOURCE_CONSUMPTION,
-} from '@/lib/domain/inventory/movement-cogs-relevance'
-import { sliceTransferSnapshotForReceipt } from '@/lib/domain/wms/asn-reconciliation'
+import { TRANSFER_STATUSES_WITH_OUTSTANDING_SOURCE_CONSUMPTION } from '@/lib/domain/inventory/movement-cogs-relevance'
 import { getInventoryConstraintMessage } from '@/lib/domain/inventory/prisma-errors'
 import { recordCogsSubledgerMovement } from '@/lib/domain/accounting/cogs-subledger-movement'
 import {
@@ -987,116 +983,6 @@ export async function getTransferConsumedQtyForCostLayer(
   }
 
   return transferredQty
-}
-
-export type InTransitTransferConsumption = {
-  transferLineId: string
-  /** Units of this cost layer dispatched but NOT yet landed in any layer. */
-  qty: Decimal
-}
-
-/**
- * The units of `costLayerId` that a transfer has consumed and that NO cost layer
- * holds yet — dispatched, still in transit, not yet received and not yet restored
- * by a dispatch cancellation.
- *
- * This is the OTHER half of getTransferConsumedQtyForCostLayer. That query answers
- * "which transferred units must be kept out of retrospective COGS"; this one answers
- * "and which of those have nowhere for the delta to go". They read the same
- * snapshot, filtered by two lists derived from the SAME per-status classification
- * (STOCK_TRANSFER_SOURCE_LAYER_CONSUMPTION), so they cannot disagree about what
- * "in transit" means, and a new StockTransferStatus fails to compile until it is
- * classified for both.
- *
- * A partially received transfer is still IN_TRANSIT while part of its snapshot has
- * already been rebuilt into destination layers. Those units ARE propagatable, so
- * only the unreceived remainder is returned — sliced with the very function the
- * receipt path uses (sliceTransferSnapshotForReceipt, walking past qtyReceived), so
- * the quantity deferred here is exactly the quantity the later receipt will settle.
- */
-export async function getInTransitTransferConsumptionForCostLayer(
-  tx: TxClient,
-  costLayerId: string,
-): Promise<InTransitTransferConsumption[]> {
-  const containsCostLayer = JSON.stringify([{ costLayerId }])
-  const rows = await tx.$queryRawUnsafe<Array<{
-    transferLineId: string
-    costLayerSnapshot: unknown
-    qty: DecimalInput
-    qtyReceived: DecimalInput
-  }>>(
-    `SELECT stl.id AS "transferLineId", stl."costLayerSnapshot", stl.qty, stl."qtyReceived"
-       FROM "stock_transfer_lines" stl
-       INNER JOIN "stock_transfers" st ON st.id = stl."transferId"
-      WHERE st.status = ANY($2::"StockTransferStatus"[])
-        AND stl."costLayerSnapshot" @> $1::jsonb`,
-    containsCostLayer,
-    TRANSFER_STATUSES_AWAITING_DESTINATION_LAYER,
-  )
-
-  const consumption: InTransitTransferConsumption[] = []
-  for (const row of rows) {
-    const alreadyReceived = toDecimal(row.qtyReceived ?? 0)
-    const outstanding = subtractMoney(row.qty ?? 0, alreadyReceived)
-    if (outstanding.lte(0)) continue
-    const slice = sliceTransferSnapshotForReceipt({
-      snapshot: row.costLayerSnapshot,
-      alreadyReceivedQty: alreadyReceived.toNumber(),
-      qtyReceived: outstanding.toNumber(),
-    })
-    let qty = toDecimal(0)
-    for (const entry of slice) {
-      if (entry.costLayerId === costLayerId) qty = addMoney(qty, entry.qty)
-    }
-    if (qty.gt(0)) consumption.push({ transferLineId: row.transferLineId, qty })
-  }
-  return consumption
-}
-
-/**
- * Persist one obligation to reclass DR inventory / CR transit when in-transit units
- * finally land, because the revaluation that created the delta had no cost layer to
- * journal it against (6oyu.19, Codex round-2 HIGH-2).
- *
- * Idempotent on (source layer, transfer line, recalc run): replaying the same recalc
- * must not double the obligation, while a genuinely NEW revaluation of the same
- * units — a second freight bill, say — is a distinct run and so a distinct row.
- * Settled by recreateTransferCostLayersFromSnapshotSlice.
- */
-export async function recordPendingTransferLandedCostReclass(
-  tx: TxClient,
-  input: {
-    sourceCostLayerId: string
-    transferLineId: string
-    qty: DecimalInput
-    unitCostDelta: DecimalInput
-    primaryPoId: string
-    primaryPoRef: string
-    freightPoId: string | null
-    recalcRunId: string
-    revaluedAt: Date
-  },
-): Promise<boolean> {
-  const qty = roundQuantity(input.qty, 6)
-  const unitCostDelta = roundQuantity(input.unitCostDelta, 6)
-  if (qty.lte(0) || unitCostDelta.isZero()) return false
-  const idempotencyKey = `${input.recalcRunId}:${input.sourceCostLayerId}:${input.transferLineId}`
-  const created = await tx.pendingTransferLandedCostReclass.createMany({
-    data: [{
-      sourceCostLayerId: input.sourceCostLayerId,
-      transferLineId: input.transferLineId,
-      qty: qty.toFixed(6),
-      unitCostDelta: unitCostDelta.toFixed(6),
-      primaryPoId: input.primaryPoId,
-      primaryPoRef: input.primaryPoRef,
-      freightPoId: input.freightPoId,
-      recalcRunId: input.recalcRunId,
-      idempotencyKey,
-      revaluedAt: input.revaluedAt,
-    }],
-    skipDuplicates: true,
-  })
-  return created.count > 0
 }
 
 /**

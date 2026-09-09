@@ -1,9 +1,8 @@
 /**
  * THE one way to recreate FIFO cost layers from a stock-transfer dispatch snapshot.
  *
- * WHY THIS EXISTS (6oyu.19, Codex round-2 HIGH-1 and HIGH-2). Four paths land
- * transferred units back into a warehouse and rebuild layers from the frozen
- * dispatch snapshot:
+ * WHY THIS EXISTS (6oyu.19, Codex round-2 HIGH-1). Four paths land transferred units
+ * back into a warehouse and rebuild layers from the frozen dispatch snapshot:
  *
  *   1. manual receipt              app/actions/transfers.ts  (applyTransferLineReceipt)
  *   2. dispatch cancellation       app/actions/transfers.ts  (cancelDispatchedTransfer)
@@ -27,51 +26,40 @@
  * source census in tests/domain/inventory/transfer-cost-layer-recreation.test.ts
  * fails if a fifth path ever open-codes the sequence again.
  *
- * The same function is also the settlement point for the deferred in-transit reclass
- * (HIGH-2): a revaluation that lands while the units are in transit has no layer to
- * journal against, so it persists a PendingTransferLandedCostReclass instead. This
- * is the moment the layer comes into existence, so this is where the obligation is
- * discharged — in the SAME transaction, so a crash cannot leave the layer without
- * its journal or the journal without its layer.
+ * WHAT THIS FUNCTION DOES NOT DO (6oyu.19 split, o3d-nrl4). It does not settle a
+ * landed-cost revaluation that happened while these units were IN TRANSIT. That
+ * revaluation has no layer to journal against, and IMS currently posts nothing for
+ * it — the delta stays in the transit clearing account. An earlier revision of this
+ * branch persisted a `PendingTransferLandedCostReclass` and discharged it here; that
+ * settlement machinery was withdrawn on Codex round-2 review (four HIGH findings,
+ * including per-transfer rather than per-revaluation obligations and settlement on a
+ * disabled connector) and is tracked as o3d-nrl4 on branch
+ * `o3d-6oyu19-deferred-transit-reclass-withdrawn` (commit 89a124f5). This function
+ * is the natural settlement point when that work returns; it deliberately does not
+ * pretend to be one today.
  */
 
 import type { Prisma } from '@/app/generated/prisma/client'
-import { getAccountingSettings, queueAccountingSyncTx } from '@/lib/accounting'
 import { createCostLayer, copyCostLayerSourceLinesProportionally } from '@/lib/cost-layers'
 import type { CostLayerSnapshotEntry } from '@/lib/cost-layer-snapshots'
-import { recordTransitSubledgerMovement } from '@/lib/domain/accounting/transit-subledger-movement'
-import {
-  addMoney,
-  multiplyMoney,
-  roundQuantity,
-  subtractMoney,
-  toDecimal,
-  type Decimal,
-} from '@/lib/domain/math/decimal'
+import { multiplyMoney, roundQuantity, toDecimal } from '@/lib/domain/math/decimal'
 
 type TxClient = Prisma.TransactionClient
-
-/**
- * Below this the reclass is not worth a journal line. Deliberately the SAME
- * threshold queueLandedCostAdjustmentJournals uses for the on-hand reclass, so a
- * delta that would have been dropped had the transfer already been received is
- * dropped here too, rather than the two paths disagreeing by rounding.
- */
-const RECLASS_JOURNAL_EPSILON = toDecimal('0.01')
 
 export type TransferLayerRecreationTarget = {
   productId: string
   /** Destination for a receipt; the SOURCE warehouse for a dispatch cancellation. */
   warehouseId: string
   /**
-   * The transfer line whose dispatch snapshot this slice was drawn from. Required:
-   * it is half the key that finds the pending in-transit reclass obligations, so a
-   * caller that cannot name its line cannot settle them either.
+   * The transfer line whose dispatch snapshot this slice was drawn from. Diagnostic
+   * context: it is what names the offending line if the reachability postcondition
+   * ever fires, and an unreachable layer is otherwise almost impossible to trace
+   * back to the receipt that created it.
    */
   transferLineId: string
   /** Stamped on created layers by the WMS alignment path; null everywhere else. */
   adjustmentMovementId?: string | null
-  /** Journal narration context ("Transfer TR-1 received"). */
+  /** Human context for diagnostics ("transfer TR-1 receipt"). */
   contextLabel: string
 }
 
@@ -88,28 +76,25 @@ export type TransferLayerRecreationResult = {
    * Snapshot entries NOT turned into a layer because their unit cost was negative.
    * The manual receipt path converts the resulting quantity gap into a £0 balancing
    * layer; reported here so no caller has to infer it from a length mismatch.
+   *
+   * The two WMS paths have no such balancing step, so for them a skipped entry is a
+   * quantity at the destination with no cost layer behind it. That is the deliberate
+   * side of the trade: a negative snapshot unit cost is corrupt provenance, and
+   * capitalising a negative layer (what those paths did before they were routed
+   * through here) is the worse of the two outcomes. It is pathological input —
+   * dispatch snapshots are built from real layers — and the count makes it visible.
    */
   skippedNegativeCostEntries: number
-  /** Signed base-currency in-transit reclass settled (and journaled) by this call. */
-  settledReclassBase: Decimal
-  /** Pending obligations touched, whether or not they cleared the journal epsilon. */
-  settledReclassRows: number
 }
 
 export type TransferCostLayerRecreationDeps = {
   createCostLayer: typeof createCostLayer
   copyCostLayerSourceLinesProportionally: typeof copyCostLayerSourceLinesProportionally
-  getAccountingSettings: typeof getAccountingSettings
-  queueAccountingSyncTx: typeof queueAccountingSyncTx
-  recordTransitSubledgerMovement: typeof recordTransitSubledgerMovement
 }
 
 const defaultDeps: TransferCostLayerRecreationDeps = {
   createCostLayer,
   copyCostLayerSourceLinesProportionally,
-  getAccountingSettings,
-  queueAccountingSyncTx,
-  recordTransitSubledgerMovement,
 }
 
 /**
@@ -129,141 +114,23 @@ const defaultDeps: TransferCostLayerRecreationDeps = {
  */
 async function assertLayerIsReachableByPropagation(
   tx: TxClient,
-  params: { costLayerId: string; sourceCostLayerId: string; transferLineId: string },
+  params: { costLayerId: string; sourceCostLayerId: string; transferLineId: string; contextLabel: string },
 ): Promise<void> {
   const links = await tx.costLayerSourceLine.count({ where: { costLayerId: params.costLayerId } })
   if (links > 0) return
   throw new Error(
     `recreateTransferCostLayersFromSnapshotSlice: cost layer ${params.costLayerId} was created from ` +
-    `source layer ${params.sourceCostLayerId} (transfer line ${params.transferLineId}) with no ` +
-    `costLayerSourceLine, so a retrospective landed-cost revaluation of the source could never reach ` +
-    `it. Refusing to leave an unreachable layer behind (6oyu.19).`,
+    `source layer ${params.sourceCostLayerId} (transfer line ${params.transferLineId}, ` +
+    `${params.contextLabel}) with no costLayerSourceLine, so a retrospective landed-cost revaluation ` +
+    `of the source could never reach it. Refusing to leave an unreachable layer behind (6oyu.19).`,
   )
 }
 
 /**
- * Settle the in-transit landed-cost reclass obligations this newly created layer
- * discharges, and queue the journal that was deferred when the revaluation ran.
- *
- * Runs on the CALLER'S transaction, alongside the layer insert. That atomicity is
- * the point: the obligation exists precisely because "the layer now exists" and
- * "the reclass has been posted" must become true together.
- */
-async function settlePendingTransitReclass(
-  tx: TxClient,
-  deps: TransferCostLayerRecreationDeps,
-  params: {
-    sourceCostLayerId: string
-    transferLineId: string
-    destinationCostLayerId: string
-    qty: Decimal
-    contextLabel: string
-  },
-): Promise<{ settledBase: Decimal; rows: number }> {
-  const pending = await tx.pendingTransferLandedCostReclass.findMany({
-    where: {
-      sourceCostLayerId: params.sourceCostLayerId,
-      transferLineId: params.transferLineId,
-      settledAt: null,
-    },
-    orderBy: { createdAt: 'asc' },
-    select: { id: true, qty: true, qtyConsumed: true, unitCostDelta: true, primaryPoId: true, primaryPoRef: true },
-  })
-  if (pending.length === 0) return { settledBase: toDecimal(0), rows: 0 }
-
-  let remaining = params.qty
-  let settledBase = toDecimal(0)
-  let rows = 0
-
-  for (const row of pending) {
-    if (remaining.lte(0)) break
-    const outstanding = subtractMoney(row.qty, row.qtyConsumed)
-    if (outstanding.lte(0)) continue
-    const take = roundQuantity(outstanding.lt(remaining) ? outstanding : remaining, 6)
-    if (take.lte(0)) continue
-    remaining = subtractMoney(remaining, take)
-
-    const nowConsumed = roundQuantity(addMoney(row.qtyConsumed, take), 6)
-    const fullySettled = nowConsumed.gte(roundQuantity(row.qty, 6))
-    await tx.pendingTransferLandedCostReclass.update({
-      where: { id: row.id },
-      data: {
-        qtyConsumed: nowConsumed.toFixed(6),
-        settledAt: fullySettled ? new Date() : null,
-      },
-    })
-    rows += 1
-
-    const amount = roundQuantity(multiplyMoney(take, row.unitCostDelta), 6)
-    settledBase = addMoney(settledBase, amount)
-    if (amount.abs().lte(RECLASS_JOURNAL_EPSILON)) {
-      // Same epsilon the on-hand reclass uses. The obligation is still marked
-      // consumed: leaving it open would make it look unsettled forever, and the
-      // sub-penny residue is exactly what the guarded reconciliation sweep absorbs.
-      continue
-    }
-
-    const settings = await deps.getAccountingSettings()
-    const isIncrease = amount.gt(0)
-    const absDelta = amount.abs().toDecimalPlaces(2).toNumber()
-    // Keyed by the OBLIGATION plus the layer that discharged it: one pending row
-    // split across two partial receipts settles into two distinct journals, and a
-    // replay of the same receipt collides on this key rather than double-posting.
-    const idempotencyKey = `landed-cost-transit-reclass:${row.id}:${params.destinationCostLayerId}`
-    const payload = {
-      date: new Date().toISOString().slice(0, 10),
-      reference: `Landed cost reclass — ${row.primaryPoRef}`,
-      narration:
-        `Deferred landed cost ${isIncrease ? 'capitalisation' : 'reversal'} of £${absDelta.toFixed(2)} ` +
-        `on ${row.primaryPoRef}, released by ${params.contextLabel}`,
-      lines: [
-        {
-          accountCode: isIncrease ? settings.inventoryAccount : settings.transitAccount,
-          description: `Landed cost reclass — ${row.primaryPoRef}`,
-          debit: absDelta,
-        },
-        {
-          accountCode: isIncrease ? settings.transitAccount : settings.inventoryAccount,
-          description: `Landed cost reclass — ${row.primaryPoRef}`,
-          credit: absDelta,
-        },
-      ],
-    }
-    // A disabled connector / posting type returns false: no queue row, and so no
-    // subledger row either. The obligation is still marked settled, deliberately and
-    // for the same reason queueLandedCostAdjustmentJournals does not retry its own
-    // reclass — when postings are off, "not posted" is the correct outcome, and a
-    // row left open would later post at a moment with no relation to the movement.
-    const queued = await deps.queueAccountingSyncTx(tx, {
-      type: 'STOCK_IN_TRANSIT',
-      referenceType: 'PurchaseOrder',
-      referenceId: row.primaryPoId,
-      payload,
-      idempotencyKey,
-    })
-    if (queued) {
-      // Same 6oyu.4 pairing as queueLandedCostAdjustmentJournals: the transit LEG of
-      // this journal, signed from transit's point of view (capitalisation credits
-      // transit). Already inside the caller's transaction, so queue and ledger row
-      // commit together by construction.
-      await deps.recordTransitSubledgerMovement(tx, {
-        sourceType: 'LANDED_COST_RECLASS',
-        sourceRef: row.primaryPoId,
-        idempotencyKey,
-        baseDelta: isIncrease ? -absDelta : absDelta,
-        journalDate: payload.date,
-      })
-    }
-  }
-
-  return { settledBase, rows }
-}
-
-/**
- * Recreate the FIFO layers for one slice of a dispatch snapshot, guaranteeing both
- * halves of the registry contract: every created layer is reachable by
- * propagateLandedCostToOutputs, and any landed-cost delta deferred while these units
- * were in transit is settled and journaled here.
+ * Recreate the FIFO layers for one slice of a dispatch snapshot, guaranteeing the
+ * half of the registry contract that IS guaranteed today: every created layer is
+ * reachable by propagateLandedCostToOutputs, so a landed-cost revaluation of the
+ * source layer carries its delta onto these units.
  *
  * `snapshotSlice` must come from sliceTransferSnapshotForReceipt — it is the
  * unconsumed portion of the dispatch snapshot for the quantity now landing.
@@ -277,8 +144,6 @@ export async function recreateTransferCostLayersFromSnapshotSlice(
   const result: TransferLayerRecreationResult = {
     createdLayers: [],
     skippedNegativeCostEntries: 0,
-    settledReclassBase: toDecimal(0),
-    settledReclassRows: 0,
   }
 
   for (const entry of snapshotSlice) {
@@ -320,17 +185,8 @@ export async function recreateTransferCostLayersFromSnapshotSlice(
       costLayerId: newLayerId,
       sourceCostLayerId: entry.costLayerId,
       transferLineId: target.transferLineId,
-    })
-
-    const settled = await settlePendingTransitReclass(tx, deps, {
-      sourceCostLayerId: entry.costLayerId,
-      transferLineId: target.transferLineId,
-      destinationCostLayerId: newLayerId,
-      qty: entryQty,
       contextLabel: target.contextLabel,
     })
-    result.settledReclassBase = addMoney(result.settledReclassBase, settled.settledBase)
-    result.settledReclassRows += settled.rows
 
     result.createdLayers.push({
       costLayerId: newLayerId,

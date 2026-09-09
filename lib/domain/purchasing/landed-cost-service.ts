@@ -10,8 +10,6 @@ import {
   getReversalConsumedQtyForCostLayer,
   getSupplierReturnedQtyForCostLayer,
   getTransferConsumedQtyForCostLayer,
-  getInTransitTransferConsumptionForCostLayer,
-  recordPendingTransferLandedCostReclass,
   recordCostLayerRevaluation,
   refreshSalesOrderLineCogsForCostLayerChange,
   refreshShipmentCogsForCostLayerChange,
@@ -169,8 +167,6 @@ export type LandedCostServiceDeps = {
   getManufacturingConsumedQtyForCostLayer: typeof getManufacturingConsumedQtyForCostLayer
   getReversalConsumedQtyForCostLayer: typeof getReversalConsumedQtyForCostLayer
   getTransferConsumedQtyForCostLayer: typeof getTransferConsumedQtyForCostLayer
-  getInTransitTransferConsumptionForCostLayer: typeof getInTransitTransferConsumptionForCostLayer
-  recordPendingTransferLandedCostReclass: typeof recordPendingTransferLandedCostReclass
   getDependentOutputSourceLines: typeof getDependentOutputSourceLines
   updateSnapshotsForCostLayerChange: typeof updateSnapshotsForCostLayerChange
   refreshShipmentCogsForCostLayerChange: typeof refreshShipmentCogsForCostLayerChange
@@ -186,8 +182,6 @@ const defaultDeps: LandedCostServiceDeps = {
   getManufacturingConsumedQtyForCostLayer,
   getReversalConsumedQtyForCostLayer,
   getTransferConsumedQtyForCostLayer,
-  getInTransitTransferConsumptionForCostLayer,
-  recordPendingTransferLandedCostReclass,
   getDependentOutputSourceLines,
   updateSnapshotsForCostLayerChange,
   refreshShipmentCogsForCostLayerChange,
@@ -333,74 +327,25 @@ async function loadLayerConsumptionExclusions(
 }
 
 /**
- * Everything a revaluation needs to ATTRIBUTE a posting it cannot make yet.
- *
- * Threaded through propagateLandedCostToOutputs rather than reconstructed there:
- * the deferred in-transit reclass is journaled much later, by a transfer receipt
- * that has no idea which freight bill caused it, so the PO reference has to travel
- * with the obligation. `revaluedAt`/`recalcRunId` were already threaded for the
- * revaluation audit trail and are folded in here rather than passed alongside.
- */
-export type LandedCostRevaluationContext = {
-  primaryPoId: string
-  primaryPoRef: string
-  freightPoId: string | null
-  recalcRunId: string
-  revaluedAt: Date
-}
-
-/**
- * Persist the part of this layer's revaluation delta that belongs to units still IN
- * TRANSIT (6oyu.19, Codex round-2 HIGH-2).
+ * KNOWN GAP, recorded here rather than silently absent (o3d-nrl4, ex-6oyu.19).
  *
  * calculateLayerAdjustmentDeltas correctly keeps transferred units out of COGS —
- * they moved warehouse, they were not sold — and for a received or cancelled
+ * they moved warehouse, they were not sold — and for a RECEIVED or CANCELLED
  * transfer propagateLandedCostToOutputs then carries the delta to the layer holding
- * them. For a transfer still in transit there IS no such layer: propagation finds
+ * them. For a transfer still IN TRANSIT there is no such layer: propagation finds
  * nothing, inventoryDelta is zero because the source layer's remainingQty is zero,
- * and the recalc queues NO journal at all. The freight debit then sits in the
- * transit clearing account indefinitely with inventory understated, and the 6oyu.4
- * transit-vs-GL sweep cannot see it because a missing posting is absent from both
- * sides of the comparison it makes.
+ * and this recalc queues NO journal at all. The freight debit stays in the transit
+ * clearing account with inventory understated, and the 6oyu.4 transit-vs-GL sweep
+ * cannot see it because a MISSING posting is absent from both sides of the
+ * comparison it makes.
  *
- * So the delta is written down as an obligation and settled by
- * recreateTransferCostLayersFromSnapshotSlice, in the same transaction as the layer
- * that finally holds the units.
- *
- * Called from ALL THREE revaluation paths (recalculateLandedCosts,
- * recalculateDirectLandedCosts, propagateLandedCostToOutputs) — the defect shape in
- * this file is a rule that reaches some entry points and not others, so this lives
- * in one function the way loadLayerConsumptionExclusions does, and the census test
- * in landed-cost-service.test.ts fails if a path stops calling it.
+ * Closing it needs an obligation persisted at revaluation time and discharged by the
+ * receipt or dispatch cancellation that creates the layer. That was implemented,
+ * reviewed and withdrawn from this branch on four HIGH findings; it is tracked as
+ * o3d-nrl4 and preserved on `o3d-6oyu19-deferred-transit-reclass-withdrawn`
+ * (commit 89a124f5). The classification that names the gap is
+ * STOCK_TRANSFER_SOURCE_LAYER_CONSUMPTION.IN_TRANSIT.
  */
-async function deferInTransitLandedCostReclass(
-  tx: Prisma.TransactionClient,
-  deps: LandedCostServiceDeps,
-  costLayerId: string,
-  costDelta: Prisma.Decimal,
-  context: LandedCostRevaluationContext,
-): Promise<Prisma.Decimal> {
-  if (costDelta.abs().lte(LANDED_COST_DELTA_EPSILON)) return new Prisma.Decimal(0)
-  const inTransit = await deps.getInTransitTransferConsumptionForCostLayer(tx, costLayerId)
-  let deferred = new Prisma.Decimal(0)
-  for (const line of inTransit) {
-    const qty = decimal(line.qty)
-    if (qty.lte(0)) continue
-    await deps.recordPendingTransferLandedCostReclass(tx, {
-      sourceCostLayerId: costLayerId,
-      transferLineId: line.transferLineId,
-      qty,
-      unitCostDelta: costDelta,
-      primaryPoId: context.primaryPoId,
-      primaryPoRef: context.primaryPoRef,
-      freightPoId: context.freightPoId,
-      recalcRunId: context.recalcRunId,
-      revaluedAt: context.revaluedAt,
-    })
-    deferred = deferred.add(costDelta.mul(qty))
-  }
-  return deferred
-}
 
 // BOM nesting is shallow in practice; this is a runaway/cycle backstop only.
 const MAX_LANDED_COST_PROPAGATION_DEPTH = 20
@@ -436,9 +381,9 @@ export async function propagateLandedCostToOutputs(
   ) => void,
   ancestors: Set<string>,
   depth: number,
-  context: LandedCostRevaluationContext,
+  recalcRunId: string,
+  revaluedAt: Date,
 ): Promise<void> {
-  const { recalcRunId, revaluedAt } = context
   if (costDeltaPerUnit.abs().lte(LANDED_COST_DELTA_EPSILON)) return
   if (depth > MAX_LANDED_COST_PROPAGATION_DEPTH) return
   if (ancestors.has(sourceCostLayerId)) return // cycle on the current path
@@ -518,9 +463,6 @@ export async function propagateLandedCostToOutputs(
       outputShipmentRevalDelta = shipmentRefresh.cogsRevaluationDelta
       await deps.refreshSalesOrderLineCogsForCostLayerChange(tx, outputCostLayerId)
     }
-    // A produced-output layer can itself be sitting in transit, so it needs the
-    // same deferral as a directly revalued layer — one rule, every revaluation path.
-    await deferInTransitLandedCostReclass(tx, deps, outputCostLayerId, outDeltas.costDelta, context)
     accumulate(outDeltas.cogsDelta.sub(outputShipmentRevalDelta), outDeltas.inventoryDelta, {
       sourceCostLayerId,
       outputCostLayerId,
@@ -530,7 +472,7 @@ export async function propagateLandedCostToOutputs(
     })
 
     // Cascade into outputs that consumed THIS output (nested BOM levels).
-    await propagateLandedCostToOutputs(tx, deps, outputCostLayerId, outputUnitDelta, accumulate, nextAncestors, depth + 1, context)
+    await propagateLandedCostToOutputs(tx, deps, outputCostLayerId, outputUnitDelta, accumulate, nextAncestors, depth + 1, recalcRunId, revaluedAt)
   }
 }
 
@@ -1100,19 +1042,6 @@ export async function recalculateLandedCosts(
 
     let totalCogsDelta = new Prisma.Decimal(0)
     let totalInventoryDelta = new Prisma.Decimal(0)
-    // 6oyu.19: reported in the audit run, NOT added to either journal total — it is
-    // the value this recalc deliberately did not post because the units it revalued
-    // are still in transit. It reconciles as: freight debit = COGS + on-hand
-    // inventory + deferred, so a non-zero figure here explains a transit balance
-    // that would otherwise look like a missing posting.
-    let totalDeferredTransitDelta = new Prisma.Decimal(0)
-    const revaluationContext: LandedCostRevaluationContext = {
-      primaryPoId,
-      primaryPoRef: primaryPo.reference,
-      freightPoId,
-      recalcRunId,
-      revaluedAt,
-    }
     const adjustmentLayers: LandedCostAdjustmentLayerContext[] = []
     // audit-e7h8: itemised record of the BOM-cascade so the journal total (which
     // includes propagated output-layer deltas) is substantiated in the audit run.
@@ -1212,13 +1141,6 @@ export async function recalculateLandedCosts(
           reason: 'landed_cost_recalc',
         })
 
-        // 6oyu.19: units of this layer still IN TRANSIT have no layer to propagate
-        // into and are excluded from COGS, so their delta must be written down as a
-        // pending reclass or it is stranded in transit for good.
-        totalDeferredTransitDelta = totalDeferredTransitDelta.add(
-          await deferInTransitLandedCostReclass(tx, serviceDeps, cl.id, deltas.costDelta, revaluationContext),
-        )
-
         // audit-e7h8: cascade the delta into produced output layers (the
         // manufacturing-consumed portion was excluded from this layer's COGS).
         await propagateLandedCostToOutputs(
@@ -1228,7 +1150,7 @@ export async function recalculateLandedCosts(
             totalInventoryDelta = totalInventoryDelta.add(invD)
             propagatedOutputLayers.push({ ...audit, cogsDelta: cogsD.toString(), inventoryDelta: invD.toString() })
           },
-          new Set(), 1, revaluationContext,
+          new Set(), 1, recalcRunId, revaluedAt,
         )
 
         let affectedRefundSnapshots = 0
@@ -1316,7 +1238,6 @@ export async function recalculateLandedCosts(
           purchaseOrder: { id: primaryPo.id, reference: primaryPo.reference },
           lines: afterLines,
           propagatedOutputLayers,
-          deferredInTransitReclassBase: totalDeferredTransitDelta.toString(),
         }),
         accountingJson: toJsonInputValue(revaluationAccountingJson({
           primaryPoId,
@@ -1449,15 +1370,6 @@ export async function recalculateDirectLandedCosts(
 
   let totalCogsDelta = new Prisma.Decimal(0)
   let totalInventoryDelta = new Prisma.Decimal(0)
-  /** See the sibling in recalculateLandedCosts: audit-only, never a journal total. */
-  let totalDeferredTransitDelta = new Prisma.Decimal(0)
-  const revaluationContext: LandedCostRevaluationContext = {
-    primaryPoId: poId,
-    primaryPoRef: po.reference,
-    freightPoId: null,
-    recalcRunId,
-    revaluedAt,
-  }
   const adjustmentLayers: LandedCostAdjustmentLayerContext[] = []
   // audit-e7h8: itemised record of the BOM-cascade so the journal total (which
   // includes propagated output-layer deltas) is substantiated in the audit run.
@@ -1557,12 +1469,6 @@ export async function recalculateDirectLandedCosts(
         reason: 'landed_cost_recalc',
       })
 
-      // 6oyu.19: see the sibling call in recalculateLandedCosts — the in-transit
-      // portion has nowhere to land, so its delta is deferred rather than dropped.
-      totalDeferredTransitDelta = totalDeferredTransitDelta.add(
-        await deferInTransitLandedCostReclass(tx, serviceDeps, cl.id, deltas.costDelta, revaluationContext),
-      )
-
       // audit-e7h8: cascade the delta into produced output layers (the
       // manufacturing-consumed portion was excluded from this layer's COGS).
       await propagateLandedCostToOutputs(
@@ -1572,7 +1478,7 @@ export async function recalculateDirectLandedCosts(
           totalInventoryDelta = totalInventoryDelta.add(invD)
           propagatedOutputLayers.push({ ...audit, cogsDelta: cogsD.toString(), inventoryDelta: invD.toString() })
         },
-        new Set(), 1, revaluationContext,
+        new Set(), 1, recalcRunId, revaluedAt,
       )
 
       let affectedRefundSnapshots = 0
@@ -1649,7 +1555,6 @@ export async function recalculateDirectLandedCosts(
         purchaseOrder: { id: po.id, reference: po.reference },
         lines: afterLines,
         propagatedOutputLayers,
-        deferredInTransitReclassBase: totalDeferredTransitDelta.toString(),
       }),
       accountingJson: toJsonInputValue(revaluationAccountingJson({
         primaryPoId: poId,

@@ -12,6 +12,11 @@ import { recreateTransferCostLayersFromSnapshotSlice } from '@/lib/domain/invent
  * landed-cost delta to go. These tests cover the two halves of the fix: the link is
  * a POSTCONDITION of the shared helper (so no caller can forget it), and a census
  * that fails if a fifth path open-codes the sequence again.
+ *
+ * The helper does NOT settle a revaluation that landed while the units were in
+ * transit — that machinery was withdrawn from this branch (o3d-nrl4), so there are
+ * no settlement tests here. See the contract on
+ * STOCK_TRANSFER_SOURCE_LAYER_CONSUMPTION.IN_TRANSIT for what is still open.
  */
 
 type Store = {
@@ -54,9 +59,6 @@ function createStore(sourceLayerHasProvenance: boolean): { store: Store; tx: unk
       },
       count: async ({ where }: { where: { costLayerId: string } }) =>
         store.sourceLines.filter((line) => line.costLayerId === where.costLayerId).length,
-    },
-    pendingTransferLandedCostReclass: {
-      findMany: async () => [],
     },
   }
   return { store, tx }
@@ -125,9 +127,6 @@ test('the reachability postcondition FAILS when no link was written (6oyu.19)', 
           .costLayer.create({ data })
           .then((layer) => layer.id)) as never,
         copyCostLayerSourceLinesProportionally: (async () => 1) as never,
-        getAccountingSettings: (async () => ({})) as never,
-        queueAccountingSyncTx: (async () => false) as never,
-        recordTransitSubledgerMovement: (async () => {}) as never,
       },
     ),
     /no\s+costLayerSourceLine/,
@@ -189,11 +188,6 @@ test('every transfer-snapshot recreation goes through the shared helper (6oyu.19
     if (file.endsWith('asn-reconciliation.ts')) continue
     if (!source.includes('sliceTransferSnapshotForReceipt(')) continue
     slicers.push(file)
-    // lib/cost-layers.ts slices to MEASURE (getInTransitTransferConsumptionForCostLayer
-    // asks how much of a layer is still in transit) and creates nothing, so it has no
-    // link to guarantee. It still has to appear in the expected list below, so its
-    // exemption is visible rather than assumed.
-    if (file.endsWith('lib/cost-layers.ts')) continue
     if (!source.includes('recreateTransferCostLayersFromSnapshotSlice(')) {
       offenders.push(`${file}: slices a dispatch snapshot but never calls the shared recreation helper`)
     }
@@ -205,7 +199,6 @@ test('every transfer-snapshot recreation goes through the shared helper (6oyu.19
     [
       'app/actions/transfers.ts',
       'lib/connectors/mintsoft/sync/stock-sync.ts',
-      'lib/cost-layers.ts',
       'lib/domain/wms/booked-in-service.ts',
     ],
     'the set of snapshot-slicing files changed — a new one must route through the helper (and be listed here)',
