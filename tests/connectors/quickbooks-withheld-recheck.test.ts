@@ -289,7 +289,12 @@ test('a withheld QuickBooks reversal is revisited after its cause resolves, WITH
     + 'the marker, not the cursor, is what brings this document back')
 
   // ---- The cause resolves LOCALLY, with nothing whatever happening in QuickBooks.
-  state.syncLogs = [inFlightRegistration({ status: 'CANCELLED' })]
+  //
+  // o3d-f709: the resolution is the operator's NOT_POSTED SETTLEMENT — CANCELLED plus the
+  // `settlementBasis` that records a human having looked in the ledger — and not the CANCELLED
+  // status alone. Three of the five writers that reach CANCELLED on this table establish nothing,
+  // and a reversal taken on one of those clears `paidAt` over a payment that may exist.
+  state.syncLogs = [inFlightRegistration({ status: 'CANCELLED', settlementBasis: 'OPERATOR_ASSERTION' })]
   // ...and the delta window is now empty, because the invoice has not been touched since poll 1.
   state.deltaBalanceDue = []
   state.settingUpserts = []
