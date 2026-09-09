@@ -1,11 +1,5 @@
 import { db } from '@/lib/db'
 import {
-  DEFAULT_RECONCILIATION_LOOKBACK_DAYS,
-  isReconciliationProvenComplete,
-  readReconciliationRunProof,
-  type AccountingReconciliationCompleteness,
-} from '@/lib/domain/accounting/reconciliation'
-import {
   HEALTH_NO_STORE_HEADERS,
   collectAdminHealth,
   type AdminHealthAuthorizer,
@@ -65,23 +59,6 @@ export type LatestAccountingReconciliationRun = {
   warningCount: number
   criticalCount: number
   createdAt: string
-  /**
-   * o3d-11rf r8: the window the run covered, as ISO strings, `null` for a row that recorded neither.
-   * Required for the same reason `completeness` is: a `[]` from a one-day run is not the same fact as
-   * a `[]` from a default-scope run, and an adapter or fixture allowed to omit the window would be
-   * back to reading the first as the second. It is also what makes the SELECT observable — a query
-   * that stops asking for these columns is visible in the response, not only in a verdict.
-   */
-  fromDate: string | null
-  toDate: string | null
-  /**
-   * o3d-11rf r6: whether this run recorded its own completeness, and what it said. Required, not
-   * optional, so no adapter or fixture can leave the question unanswered by omission, and carried as
-   * the parsed union rather than the raw `truncations` column so no reader can reach an array
-   * without the `state` that says whether the array means anything. `completeness.truncations` is
-   * the sentinel list — `null` exactly when nothing was recorded.
-   */
-  completeness: AccountingReconciliationCompleteness
 }
 
 export type RolloutReadinessResponse = {
@@ -135,7 +112,7 @@ export function createDefaultRolloutReadinessAdapters(): RolloutReadinessAdapter
     now: () => new Date(),
     runPreflight: () => runProductionPreflight(),
     collectAdminHealth: () => collectAdminHealth(),
-    latestAccountingReconciliationRun: () => getLatestAccountingReconciliationRun(),
+    latestAccountingReconciliationRun: getLatestAccountingReconciliationRun,
   }
 }
 
@@ -253,15 +230,6 @@ export function createRolloutReadinessHandler({
     if (denyResponse) return denyResponse
 
     const report = await collect()
-    // o3d-11rf r7 (Codex r6, HIGH) — WHAT THIS FLAG IS, STATED WHERE IT LIVES. It is pre-existing:
-    // it shipped with this endpoint and is unchanged on `development`. It is also a GLOBAL boolean
-    // that takes no reason, names no findings, identifies no actor and writes no audit record — one
-    // caller passing it accepts EVERY warning in the verdict at once, including ones they never
-    // looked at, and nothing afterwards says it happened. So it is not a place where a human
-    // decision gets recorded, and no severity choice elsewhere in this file may be justified by
-    // pretending that it is. Scoping it (named finding ids, a required reason, an audit row) is
-    // o3d-yby2. Until then, anything that must not be waved through has to be a BLOCKER — see
-    // classifyReconciliationCompleteness.
     const allowWarnings = request ? new URL(request.url).searchParams.get('allowWarnings') === 'true' : false
     const statusCode = report.status === 'ready' || (report.status === 'warning' && allowWarnings) ? 200 : 412
     return Response.json(report, {
@@ -271,32 +239,8 @@ export function createRolloutReadinessHandler({
   }
 }
 
-/**
- * o3d-11rf r6: the client is injectable so the SELECT itself can be proved against real PostgreSQL —
- * that the column is asked for at all, and that a NULL in it arrives here as `unknown`. A test that
- * only hands `collectRolloutReadiness` a fixture proves the classifier and nothing about the query,
- * and the query omitting the column was half of what Codex found.
- */
-export type LatestAccountingReconciliationRunClient = {
-  accountingReconciliationRun: {
-    findFirst(args: unknown): Promise<{
-      id: string
-      status: string
-      totalCount: number
-      warningCount: number
-      criticalCount: number
-      createdAt: Date
-      fromDate: Date | null
-      toDate: Date | null
-      truncations: unknown
-    } | null>
-  }
-}
-
-export async function getLatestAccountingReconciliationRun(
-  client: LatestAccountingReconciliationRunClient = db as unknown as LatestAccountingReconciliationRunClient,
-): Promise<LatestAccountingReconciliationRun | null> {
-  const latest = await client.accountingReconciliationRun.findFirst({
+async function getLatestAccountingReconciliationRun(): Promise<LatestAccountingReconciliationRun | null> {
+  const latest = await db.accountingReconciliationRun.findFirst({
     where: {
       status: {
         in: [...TERMINAL_ACCOUNTING_RECONCILIATION_RUN_STATUSES],
@@ -310,28 +254,14 @@ export async function getLatestAccountingReconciliationRun(
       warningCount: true,
       criticalCount: true,
       createdAt: true,
-      // o3d-11rf r6: without this the gate could not tell a run that proved itself complete from one
-      // that never said, and read both as clean.
-      truncations: true,
-      // o3d-11rf r8: and without THESE it could not tell what the run looked at, so a one-day run's
-      // `[]` read as a statement about everything. The row is still chosen by `createdAt` alone —
-      // filtering the SELECT by scope would let a NEWER run's criticals be skipped over, which is a
-      // second hole in place of the first. The narrow run is still the run the gate reports on; what
-      // changes is only that its `[]` no longer proves anything.
-      fromDate: true,
-      toDate: true,
     },
   })
 
   if (!latest) return null
-  const { truncations, fromDate, toDate, ...rest } = latest
   return {
-    ...rest,
+    ...latest,
     status: latest.status as AccountingReconciliationRunStatus,
     createdAt: latest.createdAt.toISOString(),
-    fromDate: fromDate ? fromDate.toISOString() : null,
-    toDate: toDate ? toDate.toISOString() : null,
-    completeness: readReconciliationRunProof({ truncations, fromDate, toDate }),
   }
 }
 
@@ -805,13 +735,7 @@ function classifyAccountingReconciliation(
     warningCount: latest.warningCount,
     criticalCount: latest.criticalCount,
     createdAt: latest.createdAt,
-    completeness: latest.completeness.state,
   }
-
-  // o3d-11rf r6 — BEFORE the status switch, because every branch of it returns. A FAILED or PARTIAL
-  // run blocks or warns on its own, but a COMPLETED one with no findings is the case this gate got
-  // wrong, and a completeness question asked after an early `return` is a question not asked.
-  classifyReconciliationCompleteness(latest, blockers, warnings)
 
   switch (latest.status) {
     case 'FAILED':
@@ -852,146 +776,6 @@ function classifyAccountingReconciliation(
           details,
         })
       }
-  }
-}
-
-/**
- * o3d-11rf r7 (Codex r6, HIGH) — WHY TWO OF THE THREE NOT-PROVEN STATES BLOCK, AND ONE WARNS.
- *
- * THE ARGUMENT THIS REPLACES WAS FALSE, AND IT IS WORTH SAYING SO HERE. r6 left all three states as
- * warnings and defended that by saying a warning at this gate means "stop, and a human may record
- * why this is fine": `collectRolloutReadiness` sets `ok` false, and the handler answers 412 for
- * anything that is not `ready` unless the caller passes `?allowWarnings=true`. The first half is
- * still true. The second half was not checked. `allowWarnings` (see `createRolloutReadinessHandler`)
- * takes NO reason, names NO findings, identifies NO actor and writes NO audit row — it converts
- * every warning-only verdict to 200 at once. So a caller waving through an unrelated advisory
- * warning also waved through an incomplete reconciliation report, and nothing anywhere recorded that
- * it had happened. The choice that comment described did not exist, so it cannot justify anything.
- *
- * WHAT SEPARATES THE THREE STATES IS WHERE EACH ONE CAN COME FROM.
- *
- *   `unknown` / `not-recorded` — a SQL NULL. `persistAccountingReconciliationReport` is the only
- *     writer of this column in the codebase and it ALWAYS writes an array, because
- *     `reconciliationTruncations` returns `[]` when nothing was truncated; the migration added the
- *     column nullable with no default and no backfill. NULL is therefore exactly a row written
- *     before the column existed, or by the predecessor binary still serving across the deploy. It is
- *     EXPECTED, and it is the state of every row in the table on the deploy that ships the column.
- *     Blocking it would make readiness unsatisfiable until a fresh reconciliation had run on the new
- *     build, and a gate that cannot go green on a correct deploy is a gate that gets routed around.
- *     It WARNS, and the message says the one thing that clears it.
- *
- *   `unknown` / `unreadable` — a non-NULL payload that is not an array of `{code, message}`
- *     sentinels. NOTHING in this codebase can write that. It is a corrupted value or a writer nobody
- *     has explained, and no amount of deploying makes it expected. It BLOCKS.
- *
- *   `truncated` — the run's own positive statement that its report omitted findings. A fact about
- *     real data rather than an artefact of the deploy, and the findings it omitted are exactly the
- *     ones nobody has seen. It BLOCKS.
- *
- *   `unknown` / `scope-not-proven` (o3d-11rf r8, Codex r7, HIGH) — the run recorded `[]`, but its
- *     window is narrower than a default-scope run's, or it recorded no window at all. It BLOCKS, and
- *     the severity is forced rather than chosen. A WARNING would not fix the finding it exists for:
- *     `allowWarnings=true` turns every warning into 200, so a truncated 90-day run could still be
- *     erased by POSTing `{"lookbackDays":1}` and passing the flag — which is the bypass, one step
- *     longer. It is SATISFIABLE without anyone deciding a policy: POST the reconciliation endpoint
- *     with no `lookbackDays`. And unlike `not-recorded` it is not the state of rows on a correct
- *     deploy — `persistAccountingReconciliationReport` writes both dates from a report whose
- *     `fromDate` is `now - lookbackDays`, so every row it writes covers the default unless somebody
- *     asked for less. The one thing this blocker does NOT claim is that the run is recent enough or
- *     wide enough for a deploy; that is a policy nobody has set, and this branch declines to set it.
- *
- * NEITHER BLOCKER IS UNSATISFIABLE. Both clear the same way: run reconciliation again on this build
- * and have it complete. That is the same remedy the warning asks for, so the gate that stops here
- * can always be made to go green without anybody being asked to ignore it.
- *
- * WHAT IS STILL OVERRIDABLE, SAID PLAINLY. `allowWarnings=true` still converts every REMAINING
- * warning — `not-recorded` among them, along with `:missing`, `:partial`, `:warnings` and every
- * preflight and admin-health warning — to 200, still without recording anything. That mechanism
- * predates this branch (it shipped with the endpoint itself and is unchanged on `development`), and
- * scoping it to named finding ids with a reason and an audit record is o3d-yby2. What has changed
- * here is only this: it can no longer be used, deliberately or by accident, to wave past the two
- * completeness states that mean something is actually wrong.
- */
-function classifyReconciliationCompleteness(
-  latest: LatestAccountingReconciliationRun,
-  blockers: RolloutReadinessFinding[],
-  warnings: RolloutReadinessFinding[],
-): void {
-  const completeness = latest.completeness
-
-  // THE ONE QUESTION, ASKED THROUGH THE ONE FUNCTION THAT ANSWERS IT. Not `state === 'complete'`
-  // written out again here: a second encoding of "proven complete" is a second thing to keep in step
-  // with the first, and this whole finding is what happens when two readers of one rule drift.
-  if (isReconciliationProvenComplete(completeness)) return
-
-  const details = {
-    id: latest.id,
-    createdAt: latest.createdAt,
-    completeness: completeness.state,
-  }
-
-  switch (completeness.state) {
-    case 'complete':
-      return
-    case 'unknown':
-      switch (completeness.reason) {
-        case 'not-recorded':
-          warnings.push({
-            id: 'accounting-reconciliation:completeness-unknown',
-            severity: 'warning',
-            source: 'accounting-reconciliation',
-            message: 'Latest accounting reconciliation run did not record whether its report was complete, so it does not show this build\'s reconciliation ran. Run reconciliation again before rolling out.',
-            details: { ...details, reason: completeness.reason },
-          })
-          return
-        case 'unreadable':
-          blockers.push({
-            id: 'accounting-reconciliation:completeness-unreadable',
-            severity: 'blocker',
-            source: 'accounting-reconciliation',
-            message: 'Latest accounting reconciliation run recorded a completeness value this build cannot read, which no writer in this codebase can produce. Run reconciliation again before rolling out.',
-            details: { ...details, reason: completeness.reason },
-          })
-          return
-        case 'scope-not-proven':
-          blockers.push({
-            id: 'accounting-reconciliation:completeness-scope',
-            severity: 'blocker',
-            source: 'accounting-reconciliation',
-            message: `Latest accounting reconciliation run reported no truncation, but it covered less than the default ${DEFAULT_RECONCILIATION_LOOKBACK_DAYS}-day window (or recorded no window), so it does not show the reconciliation was complete. Run reconciliation again with no lookbackDays before rolling out.`,
-            details: {
-              ...details,
-              reason: completeness.reason,
-              fromDate: latest.fromDate,
-              toDate: latest.toDate,
-              defaultLookbackDays: DEFAULT_RECONCILIATION_LOOKBACK_DAYS,
-            },
-          })
-          return
-        default: {
-          // A new reason must be classified here or this stops compiling — the point being that a
-          // reason added later must not fall into whichever branch happens to be last.
-          const unhandledReason: never = completeness.reason
-          throw new Error(`Unhandled accounting reconciliation completeness reason: ${String(unhandledReason)}`)
-        }
-      }
-    case 'truncated':
-      blockers.push({
-        id: 'accounting-reconciliation:truncated',
-        severity: 'blocker',
-        source: 'accounting-reconciliation',
-        message: 'Latest accounting reconciliation run reported its own findings as incomplete.',
-        details: {
-          ...details,
-          codes: completeness.truncations.map((truncation) => truncation.code),
-        },
-      })
-      return
-    default: {
-      // A new completeness state must be classified here or this stops compiling. That is the point.
-      const unhandled: never = completeness
-      throw new Error(`Unhandled accounting reconciliation completeness: ${String(unhandled)}`)
-    }
   }
 }
 
