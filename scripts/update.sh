@@ -5267,8 +5267,15 @@ if ! $NO_GIT; then
       --exclude='uploads' \
       --exclude='public/uploads' \
       "${TMP_CLONE_WORKTREE%/}/" "${APP_DIR}/"
-    rm -rf "${APP_DIR}/.git"
-    cp -a "${TMP_CLONE_WORKTREE}/.git" "${APP_DIR}/.git"
+    # THE GIT METADATA GOES INTO A DIRECTORY THIS RUN CREATED AND PINNED (o3d-ov60). It was
+    # `rm -rf "${APP_DIR}/.git"` and then `cp -a … "${APP_DIR}/.git"`, and the `rm` is what opened
+    # it: it removes a symlink without following it, and leaves the NAME free for ${APP_USER} —
+    # who owns ${APP_DIR} — to re-create as a link to a directory of their choosing before the
+    # root-side `cp` runs. o3d-czpy built copy_tree_into_new_dir() for exactly this and gave it
+    # install.sh's two clone paths; this one, which does the identical thing in the identical
+    # place, was left on the raw pair. See the prose above the helper in
+    # scripts/lib/cutover-namespace.sh for what the `mkdir`, the `cd` and the `..` check buy.
+    copy_tree_into_new_dir "${TMP_CLONE_WORKTREE}/.git" "${APP_DIR}/.git"
     chown -R "${APP_USER}:${APP_USER}" "${APP_DIR}"
     rm -rf "${TMP_CLONE_DIR}"
     success "Repository synced into existing app directory."
@@ -5507,6 +5514,72 @@ BACKUP_TARGET="${BACKUP_DIR}/pre-update-$(date +%Y%m%d-%H%M%S).sql.gz"
 if $DRY_RUN; then
   echo -e "${YELLOW}[DRY]${RESET}   would pg_dump to ${BACKUP_TARGET}"
 else
+  # ---------------------------------------------------------------------------
+  # THIS IS BACK TO `mkdir -p` AND A PLAIN REDIRECTION, AND THAT IS THE RESULT OF THE ROUND
+  # (o3d-ov60 r4). Three rounds tried to make a root-side dump safe INSIDE a directory
+  # ${APP_USER} may own, and each closed its finding by opening a worse one. The record is here,
+  # at the site, so the next reader does not re-attempt any of the three.
+  #
+  #   r1  replaced `mkdir -p "${BACKUP_DIR}"` with the symlink-proof walk — through
+  #       mkdir_service_subdir(), THE TWIN THAT RESTORES THE WORKING DIRECTORY. The dump, the
+  #       publication `mv` and the `rm --` prune then each re-resolved ${BACKUP_DIR} by name. A
+  #       directory proved at one instant and operated through its name three times afterwards is
+  #       proved for none of the three: the guard was not wrong, it was SPENT.
+  #
+  #   r2  kept the walk's result (enter_service_subdir() ends INSIDE the directory, `exec {FD}<.`
+  #       pins that) and created the partial with `set -C`. `set -C` is open(O_CREAT|O_EXCL) only
+  #       until that open FAILS: on EEXIST bash stats the name and, for anything that is not a
+  #       REGULAR file, re-opens WITHOUT O_EXCL — POSIX requires it, so `> /dev/null` keeps working
+  #       under `noclobber`. So the one type it lets through is the one type whose open(2) BLOCKS.
+  #       A named pipe planted at the predictable `.part` name wedged root's `gzip >` waiting for a
+  #       reader that never comes, with the service stopped, cron stopped and the database
+  #       connections fenced — and a hang, unlike a refusal, does not unwind.
+  #
+  #   r3  removed the hang by naming `O_EXCL|O_NONBLOCK` somewhere a shell can name them: a node
+  #       helper, scripts/lib/write-new-file.mjs, resolved from ${IMS_SCRIPT_LIB_DIR}. THAT TURNED
+  #       A DENIAL OF SERVICE INTO ARBITRARY CODE EXECUTION AS ROOT, and it is why this block is
+  #       back where it started. The documented update is `cd /opt/one-two-inventory` and then
+  #       `bash scripts/update.sh`; install.sh and the clone path a few hundred lines above both
+  #       `chown -R "${APP_USER}:${APP_USER}" "${APP_DIR}"`, so that checkout — and everything the
+  #       helper would be resolved out of — belongs to the service account.
+  #
+  # WHY THE THREE `source`s AT THE TOP OF THIS FILE ARE NOT THE SAME THING, since a reader will
+  # reach for them as the counter-example. The paragraph above ${IMS_SCRIPT_LIB_DIR} has always
+  # said it: they are read AT STARTUP, in the same instant as this file's own body and out of the
+  # same tree, so they add NO WINDOW THE ENTRYPOINT DOES NOT ALREADY HAVE. A helper read at THIS
+  # line is read a build, a stop and a drain later — and after this run has itself re-handed the
+  # tree to the account — so replacing it between the two is a window r3 opened and nothing else
+  # in this file had. That distinction is this repository's own, and it is the entire reason the
+  # connection-fence helper has a root-owned protected copy and a digest supplied on the
+  # privileged invocation.
+  #
+  # AND "PIN THE HELPER" IS NOT THE ANSWER: it moves the boundary rather than establishing one,
+  # because the pin would be computed by a script that was itself read from the same checkout.
+  # scripts/lib/pin-source-file.mjs existed to authenticate exactly such bytes and was DELETED in
+  # o3d-secops r22 for that reason, with a guard in tests/scripts/deploy-order.test.ts that fails
+  # if it comes back. The same shape ships twice already, in install.sh's chown_state_tree() and
+  # its auth probe; one more instance is not a fix and one instance repaired alone is theatre.
+  # That is o3d-kyqa, and it is a repository-wide design, not a line in this block.
+  #
+  # WHAT WOULD ACTUALLY CLOSE THIS SITE IS CONSTRAINING THE OVERRIDE, NOT DEFENDING AGAINST IT
+  # (o3d-noka). Everything above follows from one fact: `IMS_BACKUP_DIR` moves a root-side
+  # `pg_dump`, `mv` and `rm --` wherever an operator names, including underneath a path
+  # ${APP_USER} owns, and nothing validates it. Require instead that every component of that path,
+  # from the filesystem root down, is a real directory owned by the account this run executes as
+  # and writable by no one else, and REFUSE what is not — and then nothing but root can plant a
+  # FIFO, a symlink or a stale `.part` at the predictable name, a name-check before the
+  # redirection has no TOCTOU left to lose, no helper is needed at all, and the dump stops being
+  # readable by the service account into the bargain. That is an operator-visible narrowing of a
+  # documented "anywhere" override; it is its own change, with its own docs and its own review.
+  #
+  # SO WHAT IS SHIPPED HERE IS THE STATUS QUO ANTE, HONESTLY LABELLED. `mkdir -p` accepts a
+  # symlink-to-directory at its final component, and the three operations below resolve
+  # ${BACKUP_DIR} and ${BACKUP_TARGET} by name. Under the shipped default that is unreachable —
+  # /var/backups has a root-owned parent and nothing but root can plant or rename anything in it.
+  # Under an `IMS_BACKUP_DIR` pointed into a tree the service account owns it is reachable, and it
+  # was reachable before this branch and is no worse for it. A denial of service that has always
+  # been here is not a regression; a root code-execution path introduced while closing it is.
+  # ---------------------------------------------------------------------------
   mkdir -p "${BACKUP_DIR}"
   info "Backing up database to ${BACKUP_TARGET}..."
   BACKUP_PARTIAL="${BACKUP_TARGET}.part"

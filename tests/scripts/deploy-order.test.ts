@@ -11819,6 +11819,9 @@ test('[o3d-secops r22] no entrypoint reads the pre-r20 marker, and the helper th
 /** The namespace functions, and the ONE file that defines each of them. A definition that came back
  *  to an entrypoint would be a fourth copy of a rule about where a privileged process may write. */
 const CUTOVER_NS_OWNED = [
+  // o3d-ov60. It was defined in install.sh and called only from install.sh, so update.sh's clone
+  // path — the same rm -rf and the same cp -a into the same name — could not reach it.
+  'copy_tree_into_new_dir',
   'enter_service_subdir',
   'mkdir_service_subdir',
   'own_service_subdir',
