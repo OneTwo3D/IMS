@@ -5,6 +5,7 @@ import { cache } from 'react'
 import { z } from 'zod'
 import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
+import { MAY_HAVE_REACHED_LEDGER_WHERE } from '@/lib/domain/accounting/cancelled-row-evidence'
 import { requireInternalUser, requirePermission } from '@/lib/auth/server'
 import { wcFetch } from '@/lib/connectors/woocommerce/api'
 import { getAccountingSettings } from '@/lib/accounting'
@@ -490,16 +491,22 @@ export async function updateAdjustmentMovement(
       // silently drift the GL sub-ledger from inventory. Block the edit once a
       // journal exists; the operator posts a reversing adjustment (which carries
       // its own compensating journal) instead.
-      // Ignore CANCELLED rows (deliberately abandoned — never re-queued, so they
-      // never reach the ledger). PENDING/PROCESSING/SYNCED block (posted or will
-      // post); FAILED also blocks because it can be re-queued by reconciliation
-      // and would then post the OLD value, drifting from the edited inventory.
+      // PENDING/PROCESSING/SYNCED block (posted or will post); FAILED also blocks because it
+      // can be re-queued by reconciliation and would then post the OLD value, drifting from the
+      // edited inventory.
+      //
+      // o3d-f709: AND SO DOES AN UNRESOLVED CANCELLED ROW. This used to read `status: { not:
+      // 'CANCELLED' }` under a comment saying a cancelled row is "deliberately abandoned — never
+      // re-queued, so they never reach the ledger". Abandonment is not a statement about the
+      // ledger: the processors post BEFORE they persist SYNCED, so a row abandoned after it was
+      // claimed may already carry a journal. The rule is stated once in `cancelled-row-evidence.ts`;
+      // only a row carrying its own proof of a pre-call abandonment stops blocking the edit.
       const postedJournal = await tx.accountingSyncLog.findFirst({
         where: {
           referenceType: 'StockMovement',
           referenceId: id,
           type: 'INVENTORY_ADJUSTMENT',
-          status: { not: 'CANCELLED' },
+          ...MAY_HAVE_REACHED_LEDGER_WHERE,
         },
         select: { id: true },
       })

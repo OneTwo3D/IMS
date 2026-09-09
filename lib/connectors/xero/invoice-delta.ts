@@ -5,6 +5,7 @@
  * type/status partitioning are where this went wrong before, and both are pure given a fetcher.
  */
 
+import { mayHaveReachedLedger } from '@/lib/domain/accounting/cancelled-row-evidence'
 import { coversDocumentTotal } from '@/lib/domain/accounting/paid-coverage'
 import {
   addMoney,
@@ -1496,6 +1497,20 @@ export type RegisteredPaymentRow = {
   /** The ledger's id for the payment this registration created, if it got that far. */
   externalTransactionId: string | null
   /**
+   * o3d-f709 — WHAT THIS ROW'S `CANCELLED`, IF IT IS CANCELLED, IS ALLOWED TO MEAN.
+   *
+   * Both REQUIRED, and required rather than optional on purpose. The classifier below asks
+   * `mayHaveReachedLedger`, whose whole job is to answer "unproved" for a row that carries neither
+   * marker — and `undefined` from a select that forgot the column is indistinguishable from a
+   * genuine NULL. Optional fields would therefore turn "this reader did not load the evidence" into
+   * a silent, correct-looking verdict. Required, a caller that has not loaded them does not compile.
+   *
+   * See lib/domain/accounting/cancelled-row-evidence.ts for the rule and
+   * lib/domain/accounting/unresolved-abandoned-claim.ts for the argument behind it.
+   */
+  abandonedBeforeRemoteCall: boolean | null
+  settlementBasis: string | null
+  /**
    * When the registration became complete — CLAIMED. Which clock produced it is not visible here.
    *
    * `stampSyncedAtFromDatabaseClock` writes `clock_timestamp()`, but an application host's `new
@@ -2088,9 +2103,17 @@ export function classifyRegisteredPaymentAgainstListing(
   const unbound: string[] = []
 
   for (const row of registrations) {
-    // CANCELLED is the one status this tree only ever asserts where "nothing was sent" is true, so it
-    // holds no payment and blocks nothing.
-    if (row.status === 'CANCELLED') continue
+    // o3d-f709 — THE COMMENT THIS REPLACES WAS FALSE, AND IT WAS LOAD-BEARING. It read: "CANCELLED
+    // is the one status this tree only ever asserts where 'nothing was sent' is true, so it holds no
+    // payment and blocks nothing." Two settlement writers and the post-time retirement of a claimed
+    // row all reach CANCELLED without establishing anything of the kind, and dropping such a row
+    // here collapses the verdict to NOTHING_REGISTERED — which is an ADMITTED reversal, clears
+    // `PurchaseInvoice.paidAt`, and re-arms Mark Paid over a payment that may be in the ledger.
+    //
+    // The rule is not restated here: only a cancelled row that carries its own proof of a pre-call
+    // abandonment (or an operator's audited NOT_POSTED assertion), and names no document, still
+    // drops out.
+    if (!mayHaveReachedLedger(row)) continue
     // The completion instant the DATABASE minted, or null when the row cannot prove which clock wrote
     // it — an old build's host-clock stamp is not a fence, it is the defect (round 5, finding 1).
     const completedAt = databaseStampedCompletion(row)

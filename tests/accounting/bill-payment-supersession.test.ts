@@ -16,6 +16,8 @@ import {
   reversalIsProven,
 } from '@/lib/domain/accounting/payment-reversal'
 import { databaseLedgerFence } from '@/lib/connectors/xero/invoice-delta'
+import { MAY_HAVE_REACHED_LEDGER_WHERE } from '@/lib/domain/accounting/cancelled-row-evidence'
+import { matchesWhere } from '@/tests/helpers/shopping-sync-log-fake'
 
 /**
  * o3d-a3wx. BILL_PAYMENT joined accounting_sync_logs_followup_live_unique. markBillPaid only wins the
@@ -283,16 +285,37 @@ test('a row that went FAILED under us REFUSES — leaving the live predicate is 
   assert.deepEqual(result.outcome === 'refused' && result.blockingIds, ['log-1'])
 })
 
-test('the shortfall re-read asks only for rows that are NOT CANCELLED', async () => {
-  // CANCELLED is the one destination that is not a refusal: whoever wrote it asserted, under the rule
-  // o3d-sref set, that nothing was sent. Everything else is unknown and must be excluded from the
-  // proceed path — so the query has to be shaped as "anything but CANCELLED", not "in flight".
+test('o3d-f709: the shortfall re-read asks the SHARED rule, not a hand-written "not CANCELLED"', async () => {
+  // The only destination that is not a refusal is a cancelled row THAT CARRIES ITS OWN PROOF the
+  // abandonment was pre-call. This used to be spelt `status: { not: 'CANCELLED' }` here, under a
+  // comment claiming whoever wrote CANCELLED had asserted that nothing was sent — which is true of
+  // exactly one canceller out of five. Asserted against the imported constant rather than against a
+  // second hand-written copy of it, which is the whole point of the constant.
   const { tx, calls } = mockTx([{ id: 'log-1', status: 'PENDING' }], { retiredCount: 0, afterRetire: [] })
 
   const result = await markBillPaidSupersedingStaleRegistrations(tx as never, PARAMS)
 
   assert.equal(result.outcome, 'paid', 'a row someone else retired pre-call must not strand the payment')
-  assert.deepEqual(calls.syncFindMany[1].where, { id: { in: ['log-1'] }, status: { not: 'CANCELLED' } })
+  assert.deepEqual(calls.syncFindMany[1].where, { id: { in: ['log-1'] }, ...MAY_HAVE_REACHED_LEDGER_WHERE })
+
+  // AND THE CONSTANT HAS TO DIVIDE THE POPULATION, or the assertion above only says the two spellings
+  // are the same characters. `matchesWhere` throws on an operator it does not implement, so a
+  // predicate that grows a shape it cannot read fails here rather than matching everything.
+  const cancelled = (extra: Record<string, unknown>) => ({
+    status: 'CANCELLED', externalTransactionId: null,
+    abandonedBeforeRemoteCall: null, settlementBasis: null, ...extra,
+  })
+  assert.equal(matchesWhere(cancelled({}), MAY_HAVE_REACHED_LEDGER_WHERE), true,
+    'a row cancelPendingSalesInvoiceSyncForOrder retired proves nothing, so it is still a refusal')
+  assert.equal(matchesWhere(cancelled({ abandonedBeforeRemoteCall: true }), MAY_HAVE_REACHED_LEDGER_WHERE), false,
+    'the orphan sweep matched PENDING and recorded the fact, so its row is not a refusal')
+  assert.equal(matchesWhere(cancelled({ settlementBasis: 'OPERATOR_ASSERTION' }), MAY_HAVE_REACHED_LEDGER_WHERE), false,
+    'nor is a row an operator settled NOT_POSTED, having looked in the ledger')
+  assert.equal(
+    matchesWhere(cancelled({ abandonedBeforeRemoteCall: true, externalTransactionId: 'PAY-9' }), MAY_HAVE_REACHED_LEDGER_WHERE),
+    true, 'but a document id outranks the proof: the id exists because a call returned')
+  assert.equal(matchesWhere({ ...cancelled({}), status: 'FAILED' }, MAY_HAVE_REACHED_LEDGER_WHERE), true,
+    'and FAILED was never proof of a non-call (o3d-ju8t)')
 })
 
 test('losing the paidAt compare-and-swap reports already-paid and retires nothing', async () => {
