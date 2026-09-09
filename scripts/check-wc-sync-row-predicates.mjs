@@ -51,10 +51,66 @@
  * .concurrent.test.ts executes both readings against a real database and asserts the asymmetry, so
  * this rule is held to a measured fact rather than to a belief about Prisma.
  *
- * WHY THIS IS NOT A PROXIMITY RULE. It reads the TypeScript AST: the pairs must be properties of
- * ONE object literal, and the write/select distinction is the nearest enclosing `where`/`data`
- * property, not "a `data` appears within N lines". Nothing here can be satisfied or triggered by a
- * comment.
+ * AND THE SAME RULE SPELLED DIFFERENTLY (o3d-272i r4). Every clause above identifies its subject BY
+ * NAME — a function's exported name, a column's name, a literal's text — and a name is the one
+ * thing an author can change without changing what the code does. Three of these clauses were
+ * defeated by an ordinary rename and the fourth by a pair of quotes, all four proved by mutation
+ * rather than by reading:
+ *
+ *   • the NEGATION rule compared the callee's OWN identifier, so `import { activeRefundParkWhere as
+ *     parkWhere }` and `{ NOT: parkWhere() }` passed, and so did a namespace import's
+ *     `families.activeRefundParkWhere()` and a local `const p = activeRefundParkWhere`. That is
+ *     VERBATIM the hole check-fulfillment-requirement-seam.mjs was mutated into revealing on this
+ *     same branch, written a second time in the guard that fixed it. Both guards now import ONE
+ *     resolver, scripts/lib/ts-import-aliases.mjs; a second copy would have been that defect again.
+ *   • the NEGATION rule followed only a direct spread out of an object literal, so `{ NOT: { AND:
+ *     [activeRefundParkWhere()] } }` — valid Prisma, same SQL negation — was invisible. Logical
+ *     wrappers (`AND`/`OR`/`NOT`, arrays, any depth) are now followed.
+ *   • the HAND-WRITTEN COPY rule required both pairs in ONE literal and both values written as
+ *     literal text, so `{ AND: [{ direction: 'FROM_CONNECTOR' }, { entityType: 'SalesOrder' }] }`,
+ *     `const DIRECTION = 'FROM_CONNECTOR'` and the computed key `['direction']:` each walked past
+ *     it. Clauses are now collected across `AND` (and only `AND` — an `OR` of the two halves is a
+ *     different, wider set), same-file string constants are resolved, and a computed key that is a
+ *     string is read as its name.
+ *   • the RAW SQL rule read only TEMPLATE literals, identifying its subject by node kind. One pair
+ *     of quotes was therefore enough — and `$queryRawUnsafe`/`$executeRawUnsafe`, which take a
+ *     plain string rather than a tagged template, are called at twenty-odd sites here, one of them
+ *     already passing a quoted string (scripts/landed-cost-e2e-fixture.ts). Plain string literals
+ *     are now read too.
+ *
+ * WHAT IT STILL CANNOT SEE, SAID PLAINLY. This is syntax, not a type checker, and the Prisma half of
+ * the negation rule is the WHOLE defence for its half of the rule — so the residual is worth stating
+ * rather than implying completeness:
+ *
+ *   • A value or predicate reached ACROSS A MODULE BOUNDARY by name: `import { WC_DIRECTION }` used
+ *     as a clause value, or a family predicate imported as a const object rather than called. Only
+ *     the calls are resolved cross-file (by their imported name); constants and objects are
+ *     resolved same-file only.
+ *   • A predicate that passes through control flow or a local helper: `let w; if (x) w =
+ *     activeRefundParkWhere()` (an assignment, not a declaration with an initializer), `function
+ *     mine() { return activeRefundParkWhere() }` then `{ NOT: mine() }`, a conditional expression,
+ *     `Object.assign`, or an object built in a loop.
+ *   • REACHABILITY, judged rather than waved at: none of these is how a `NOT` gets written by
+ *     accident, which is the case this rule exists for — the r3 defect was somebody spelling the
+ *     complement the obvious way. They are how one gets written by somebody working around a red
+ *     check, and for that reader the guard is a message rather than a wall. What has been removed is
+ *     the class that is NOT a workaround: the spellings a reasonable author picks for their own
+ *     reasons — an alias to avoid a name clash, an `AND` because a second condition was added, a
+ *     constant to avoid repeating a string. Those were silent, and are now loud.
+ *   • Prisma's OTHER whole-predicate negation, a `none:` relation filter, is not checked — and
+ *     cannot be written today, because `ShoppingSyncLog` is polymorphic by `entityType`/`entityId`
+ *     with NO relation field pointing at it (see the schema), so there is no relation to filter. If
+ *     a relation is ever added, `none:` becomes a second spelling of this defect and belongs in
+ *     NEGATION_PROPERTY.
+ *   • The DDL half is substring matching over SQL text, where no aliases exist — but a rule split
+ *     across TWO migrations, each naming the table and only ONE literal, stays under the threshold,
+ *     and a predicate assembled by concatenation or `format()` is not read as text at all. The
+ *     threshold is a deliberate trade (see below); the assembled case is out of reach.
+ *
+ * WHY THIS IS NOT A PROXIMITY RULE. It reads the TypeScript AST: the pairs must be clauses the SAME
+ * object CONJOINS (its own properties, or ones it reaches through `AND`), and the write/select
+ * distinction is the nearest enclosing `where`/`data` property, not "a `data` appears within N
+ * lines". Nothing here can be satisfied or triggered by a comment.
  *
  * THE GUARD PROVES IT RAN. Every allowlisted definition must be FOUND — if a rename or a deletion
  * means an owner no longer matches, that is an error, not a quiet pass. A guard whose allowlist has
@@ -204,33 +260,105 @@ function listFiles(dir, out) {
   return out
 }
 
-/** The string a node denotes, seeing through `as const` / `as Foo` and parentheses. */
-function stringValue(node) {
+/** See through `as const` / `satisfies` / parentheses to the expression underneath. */
+function unwrap(node) {
   let current = node
-  while (current && (ts.isAsExpression(current) || ts.isParenthesizedExpression(current) || ts.isSatisfiesExpression(current))) {
+  while (
+    current
+    && (ts.isAsExpression(current) || ts.isParenthesizedExpression(current) || ts.isSatisfiesExpression(current))
+  ) {
     current = current.expression
   }
+  return current
+}
+
+/** The string a node LITERALLY is, seeing through `as const` / `as Foo` and parentheses. */
+function literalStringOf(node) {
+  const current = unwrap(node)
   if (!current) return null
   if (ts.isStringLiteral(current) || ts.isNoSubstitutionTemplateLiteral(current)) return current.text
   return null
 }
 
-function propertyName(property) {
-  if (!property.name) return null
-  if (ts.isIdentifier(property.name) || ts.isStringLiteral(property.name)) return property.name.text
+/**
+ * Same-file `const NAME = 'literal'` bindings.
+ *
+ * WHY (o3d-272i r4). The clause detector recognised its subject by the literal TEXT
+ * `'FROM_CONNECTOR'`, so `const DIRECTION = 'FROM_CONNECTOR'` one line above and `direction:
+ * DIRECTION` in the predicate was a hand-written copy the guard could not see — the same shape as
+ * the aliased import that walked past the negation rule, one level down in the grammar. Same file
+ * only: following the binding across a module boundary is a type-checker's job, and the residual is
+ * stated in this file's header.
+ */
+function localStringConstants(source) {
+  const values = new Map()
+  const visit = (node) => {
+    if (ts.isVariableDeclaration(node) && ts.isIdentifier(node.name) && node.initializer) {
+      const text = literalStringOf(node.initializer)
+      if (text !== null) values.set(node.name.text, text)
+    }
+    ts.forEachChild(node, visit)
+  }
+  visit(source)
+  return values
+}
+
+/** The string a node denotes, resolving a same-file string constant by name. */
+function stringValue(node, constants) {
+  const literal = literalStringOf(node)
+  if (literal !== null) return literal
+  const current = unwrap(node)
+  if (current && ts.isIdentifier(current) && constants) return constants.get(current.text) ?? null
   return null
 }
 
-/** Is this literal a hand-written WooCommerce sales-order family predicate? */
-function isFamilyLiteral(node) {
-  const seen = new Map()
+/**
+ * A property's name, including a computed key that is a string — `['direction']: 'FROM_CONNECTOR'`
+ * and `{ ['NOT']: p }` are the same properties as their bare spellings, and reading only the bare
+ * ones is another way to spell past this guard.
+ */
+function propertyName(property) {
+  if (!property.name) return null
+  if (ts.isIdentifier(property.name) || ts.isStringLiteral(property.name)) return property.name.text
+  if (ts.isComputedPropertyName(property.name)) return literalStringOf(property.name.expression)
+  return null
+}
+
+/**
+ * Every `name: 'literal'` clause this object CONJOINS, including the ones reached through `AND`.
+ *
+ * `AND` and only `AND`: `{ AND: [{ direction: 'FROM_CONNECTOR' }, { entityType: 'SalesOrder' }] }`
+ * is the family predicate written with one extra key, and the previous reading — the two pairs must
+ * be properties of ONE literal — missed it. `OR` is deliberately NOT followed: a disjunction of the
+ * two clauses is a different, wider set, and treating it as the family predicate would be a false
+ * positive rather than a missed copy.
+ */
+function familyClausePairs(node, constants, found = new Set(), depth = 0) {
+  if (depth > 8) return found
   for (const property of node.properties) {
     if (!ts.isPropertyAssignment(property)) continue
     const name = propertyName(property)
     if (name === null) continue
-    seen.set(name, stringValue(property.initializer))
+    if (name === 'AND') {
+      const inner = unwrap(property.initializer)
+      if (!inner) continue
+      const parts = ts.isArrayLiteralExpression(inner) ? inner.elements : [inner]
+      for (const part of parts) {
+        const object = unwrap(part)
+        if (object && ts.isObjectLiteralExpression(object)) familyClausePairs(object, constants, found, depth + 1)
+      }
+      continue
+    }
+    const value = stringValue(property.initializer, constants)
+    if (value !== null) found.add(`${name}=${value}`)
   }
-  return FAMILY_CLAUSES.every(([name, value]) => seen.get(name) === value)
+  return found
+}
+
+/** Is this literal a hand-written WooCommerce sales-order family predicate? */
+function isFamilyLiteral(node, constants) {
+  const found = familyClausePairs(node, constants)
+  return FAMILY_CLAUSES.every(([name, value]) => found.has(`${name}=${value}`))
 }
 
 /**
@@ -254,18 +382,6 @@ function isWritePayload(node) {
     current = current.parent
   }
   return false
-}
-
-/** See through `as const` / `satisfies` / parentheses to the expression underneath. */
-function unwrap(node) {
-  let current = node
-  while (
-    current
-    && (ts.isAsExpression(current) || ts.isParenthesizedExpression(current) || ts.isSatisfiesExpression(current))
-  ) {
-    current = current.expression
-  }
-  return current
 }
 
 /**
@@ -302,26 +418,26 @@ const LOGICAL_PROPERTIES = new Set(['AND', 'OR', 'NOT'])
  * is also the exact defect this rule is about, and saying so in the negation message is what tells
  * the reader that spreading the owner is not the fix here — not negating is.
  */
-function carriesFamilyPredicate(node, known, aliases) {
+function carriesFamilyPredicate(node, ctx) {
   const current = unwrap(node)
   if (!current) return false
   if (ts.isCallExpression(current)) {
-    const called = calleeName(current, aliases)
+    const called = calleeName(current, ctx.aliases)
     return called !== null && FAMILY_PREDICATE_FUNCTIONS.has(called)
   }
-  if (ts.isIdentifier(current)) return known.has(current.text)
+  if (ts.isIdentifier(current)) return ctx.known.has(current.text)
   if (ts.isObjectLiteralExpression(current)) {
-    if (isFamilyLiteral(current)) return true
+    if (isFamilyLiteral(current, ctx.constants)) return true
     return current.properties.some((property) => {
-      if (ts.isSpreadAssignment(property)) return carriesFamilyPredicate(property.expression, known, aliases)
+      if (ts.isSpreadAssignment(property)) return carriesFamilyPredicate(property.expression, ctx)
       if (ts.isPropertyAssignment(property) && LOGICAL_PROPERTIES.has(propertyName(property) ?? '')) {
-        return carriesFamilyPredicate(property.initializer, known, aliases)
+        return carriesFamilyPredicate(property.initializer, ctx)
       }
       return false
     })
   }
   if (ts.isArrayLiteralExpression(current)) {
-    return current.elements.some((element) => carriesFamilyPredicate(element, known, aliases))
+    return current.elements.some((element) => carriesFamilyPredicate(element, ctx))
   }
   return false
 }
@@ -334,14 +450,15 @@ function carriesFamilyPredicate(node, known, aliases) {
  * link is a logical wrapper, because a wrapper has no call of its own to be caught at. The loop
  * terminates because `known` only ever grows and is bounded by the file's declarations.
  */
-function localFamilyPredicateNames(source, aliases) {
+function localFamilyPredicateNames(source, aliases, constants) {
   const known = new Set()
+  const ctx = { known, aliases, constants }
   let changed = true
   while (changed) {
     changed = false
     const visit = (node) => {
       if (ts.isVariableDeclaration(node) && ts.isIdentifier(node.name) && node.initializer) {
-        if (!known.has(node.name.text) && carriesFamilyPredicate(node.initializer, known, aliases)) {
+        if (!known.has(node.name.text) && carriesFamilyPredicate(node.initializer, ctx)) {
           known.add(node.name.text)
           changed = true
         }
@@ -366,8 +483,20 @@ function enclosingDeclaration(node) {
 }
 
 /**
- * The SQL a template literal actually CONTRIBUTES: its literal spans only, with SQL comments
- * removed.
+ * Is this node a string the file could be handing to the database?
+ *
+ * Template literals ARE how `Prisma.$queryRaw` and `Prisma.sql` are written — but not how
+ * `$queryRawUnsafe` and `$executeRawUnsafe` are, and this repository calls those a dozen times with
+ * an ordinary quoted string. Reading only templates identified the subject by its NODE KIND, which
+ * one pair of quotes changes; that is the same shape as identifying a call by the callee's own name
+ * (o3d-272i r4).
+ */
+function isSqlStringNode(node) {
+  return ts.isTemplateExpression(node) || ts.isNoSubstitutionTemplateLiteral(node) || ts.isStringLiteral(node)
+}
+
+/**
+ * The SQL a string node actually CONTRIBUTES: its literal spans only, with SQL comments removed.
  *
  * NOT `node.getText()`, which was this guard's first spelling and was wrong twice over. It returns
  * the SOURCE, so `${unresolvedWcOrderRowSql()}` — the correct thing to write — reads as a
@@ -375,9 +504,9 @@ function enclosingDeclaration(node) {
  * fires on the fix and on prose is a guard that gets suppressed.
  */
 function sqlTextOf(node) {
-  const spans = ts.isNoSubstitutionTemplateLiteral(node)
-    ? [node.text]
-    : [node.head.text, ...node.templateSpans.map((span) => span.literal.text)]
+  let spans
+  if (ts.isTemplateExpression(node)) spans = [node.head.text, ...node.templateSpans.map((span) => span.literal.text)]
+  else spans = [node.text]
   return spans
     .join('\n')
     .replace(/--[^\n]*/g, ' ')
@@ -405,14 +534,16 @@ for (const file of files) {
   const source = ts.createSourceFile(file, readFileSync(file, 'utf8'), ts.ScriptTarget.Latest, true)
   const at = (node) => source.getLineAndCharacterOfPosition(node.getStart()).line + 1
   const aliases = addLocalFunctionAliases(source, importAliases(source), FAMILY_PREDICATE_FUNCTIONS)
-  const known = localFamilyPredicateNames(source, aliases)
+  const constants = localStringConstants(source)
+  const known = localFamilyPredicateNames(source, aliases, constants)
+  const ctx = { known, aliases, constants }
 
   const visit = (node) => {
     // NARROW IT, DO NOT NEGATE IT (o3d-272i r3). Every `NOT:` in the tree is examined; the ones
     // that carry a family predicate are refused, whatever they are nested in.
     if (ts.isPropertyAssignment(node) && propertyName(node) === NEGATION_PROPERTY) {
       negationCount += 1
-      if (carriesFamilyPredicate(node.initializer, known, aliases)) {
+      if (carriesFamilyPredicate(node.initializer, ctx)) {
         violations.push(
           `${relativePath}:${at(node)}  a shopping_sync_logs family predicate is being NEGATED `
           + `(\`${NEGATION_PROPERTY}:\`). Prisma compiles that to a SQL negation of the whole conjunction, and `
@@ -425,7 +556,7 @@ for (const file of files) {
         )
       }
     }
-    if (ts.isObjectLiteralExpression(node) && isFamilyLiteral(node)) {
+    if (ts.isObjectLiteralExpression(node) && isFamilyLiteral(node, constants)) {
       familyLiteralCount += 1
       if (!isWritePayload(node)) {
         const owner = `${relativePath}::${enclosingDeclaration(node) ?? '(top level)'}`
@@ -441,7 +572,7 @@ for (const file of files) {
         }
       }
     }
-    if (ts.isTemplateExpression(node) || ts.isNoSubstitutionTemplateLiteral(node)) {
+    if (isSqlStringNode(node)) {
       const text = sqlTextOf(node)
       if (text.includes(SQL_TABLE)) {
         sqlTemplateCount += 1
