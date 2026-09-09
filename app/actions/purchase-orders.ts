@@ -593,6 +593,14 @@ async function latestBillPaymentSyncRows(
       referenceId: true, status: true, externalTransactionId: true, errorMessage: true, retryCount: true, payload: true,
       // o3d-nf9i r3: an operator-asserted BILL_PAYMENT must not read as a ledger confirmation.
       settlementBasis: true,
+      // o3d-f709 r2: and the orphan sweep's pre-call claim, which is the OTHER way a CANCELLED row
+      // comes to name a payment nothing has accounted for. `settlementBasis` alone answers only for
+      // the operator's typed id; without this column the bill side could not see the sweep's at all,
+      // so `settlementStatus` had nothing to weigh and every such row read NOT_SENT — "the ledger
+      // was never told" over a payment the ledger issued an id for. It is OPTIONAL on
+      // `PaymentSyncRow`, so omitting it was silent rather than a type error, which is why it is
+      // spelt out here with the reason attached.
+      abandonedBeforeRemoteCall: true,
     },
     orderBy: { createdAt: 'desc' },
   })
@@ -612,6 +620,7 @@ async function latestBillPaymentSyncRows(
       // before — and it becomes exact for nothing but free the moment that writer carries one.
       registeredAmount: readPayloadRegisteredAmount(r.payload, documentCurrency),
       settlementBasis: r.settlementBasis,
+      abandonedBeforeRemoteCall: r.abandonedBeforeRemoteCall,
     })
   }
   return out

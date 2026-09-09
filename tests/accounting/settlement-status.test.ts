@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict'
+import { readFileSync } from 'node:fs'
 import test from 'node:test'
 
 import {
@@ -8,6 +9,8 @@ import {
   settlementStatus,
   type PaymentSyncRow,
 } from '@/lib/domain/accounting/settlement-status'
+import { registrationLedgerStanding } from '@/lib/domain/accounting/payment-ledger-hold'
+import { loadInvoicePaymentSyncRows } from '@/lib/domain/accounting/invoice-payment-enqueue'
 
 /**
  * o3d-lgo.15. markBillPaid marks a bill paid in IMS and only QUEUES the BILL_PAYMENT. That sync can
@@ -596,4 +599,173 @@ test('[o3d-anu8] an ordinary connector cancellation is unchanged', () => {
   assert.equal(v.basis, 'NONE')
   assert.match(v.detail, /never told/)
   assert.doesNotMatch(v.detail, /ASSERTION/)
+})
+
+// ---------------------------------------------------------------------------
+// o3d-f709 round 2 (Codex HIGH) — THE ORPHAN-SWEPT POSTED PAYMENT, ON THE PAID-LOCAL PATH.
+//
+// THE ROUTE, and it is the one already written down on `registrationLedgerStanding`: a payment
+// POSTS and Xero issues its id; follow-up work fails and the row is put BACK to PENDING keeping
+// that id; `cancelOrphanedRowsUnderLock` then retires it to CANCELLED, stamping
+// `abandonedBeforeRemoteCall: true` on the strength of `status = PENDING` and nothing else. The
+// sweep's claim is contradicted by the row's own contents, and the shared classifier has said so
+// since this branch's first commit: that row is HELD.
+//
+// The NOT-paid-locally branch asks the classifier. The PAID-local switch below it did not — it read
+// `settlementBasis` alone, saw no operator assertion, and fell through to NOT_SENT: "the payment
+// sync was cancelled, so the ledger was never told about this settlement and still shows the amount
+// outstanding". Over a payment the ledger issued an id for. That is the fourth reader of this one
+// fact to be wrong about it, and it is the sentence that talks somebody into registering a second
+// payment against an invoice that already has one.
+// ---------------------------------------------------------------------------
+
+/** The exact row the sweep leaves behind: no operator anywhere near it, and a live document id. */
+const orphanSwept = (over: Partial<PaymentSyncRow> = {}): PaymentSyncRow => row({
+  status: 'CANCELLED',
+  externalTransactionId: 'PAY-LIVE',
+  settlementBasis: null,
+  abandonedBeforeRemoteCall: true,
+  ...over,
+})
+
+test('[o3d-f709] an orphan-swept row that still names its ledger payment is NOT reported as never sent', () => {
+  // ROUTE: settlementStatus's paid-local `case 'CANCELLED'`.
+  // MUTATION: read `assertedPost` alone again (drop the `registrationLedgerStanding` call) and this
+  // returns NOT_SENT with "the ledger was never told" over a payment that is standing in Xero.
+  const v = settlementStatus({ ...base, payment: orphanSwept(), totalForeign: 100 })
+
+  assert.notEqual(v.status, 'NOT_SENT', 'a cancelled row carrying post evidence never proves nothing was sent')
+  assert.equal(v.status, 'LEDGER_UNRESOLVED')
+  assert.equal(v.discrepancy, true)
+  assert.equal(v.basis, 'LEDGER_CONFIRMED', 'the id is one the ledger issued, not one a human typed')
+  assert.match(v.detail, /PAY-LIVE/, 'and the sentence names the payment to go and look at')
+  assert.doesNotMatch(v.detail, /never told/)
+})
+
+test('[o3d-f709] the paid-local verdict agrees with the classifier the DELETE refuses on', () => {
+  // THE POINT OF THE FIX, and the drift o3d-nf9i r3 closed for `settlementBasis` reopened here for
+  // `abandonedBeforeRemoteCall`: deletePayment refuses to touch this row because a payment may be
+  // standing in a real ledger, while the badge over it said nothing was ever sent. One module
+  // refusing to act, the other saying there is nothing to act on.
+  //
+  // ROUTE: registrationLedgerStanding, read by both.
+  // MUTATION: as above — the two verdicts diverge again and this assertion is what says so.
+  const p = orphanSwept()
+  assert.equal(
+    registrationLedgerStanding({ ...p, abandonedBeforeRemoteCall: p.abandonedBeforeRemoteCall ?? null }),
+    'HELD',
+    'the precondition: the shared classifier calls this row HELD',
+  )
+  // THE INVARIANT, STATED OVER BOTH DIRECTIONS: a row the classifier calls HELD gets a verdict that
+  // NAMES the payment and denies nothing. `discrepancy: true` alone would have been vacuous here —
+  // NOT_SENT carries it as well, which is how a test can be green over the very defect it is about.
+  const paidHere = settlementStatus({ ...base, payment: p, totalForeign: 100 })
+  // The mirror image: the same row on an order IMS does not believe is paid already read
+  // LEDGER_UNMATCHED through that classifier. Both directions now come from the one answer.
+  const notPaidHere = settlementStatus({ ...base, paidLocally: false, payment: p })
+  assert.equal(notPaidHere.status, 'LEDGER_UNMATCHED')
+  for (const [label, v] of [['paid locally', paidHere], ['not paid locally', notPaidHere]] as const) {
+    assert.equal(v.discrepancy, true, label)
+    assert.match(v.detail, /PAY-LIVE/, `${label}: the verdict names the payment to go and look at`)
+    assert.doesNotMatch(v.detail, /never told|NO payment was ever queued/, `${label}: and denies nothing`)
+  }
+})
+
+test('[o3d-f709] a sweep that retired a row it really did prove pre-call still reads NOT_SENT', () => {
+  // THE OTHER HALF, and it is what keeps the fix from being "never say NOT_SENT": the sweep's claim
+  // is only contradicted by an id the row still carries. With no id there is nothing to account
+  // for, the classifier answers NOTHING, and a locally-paid document whose registration was retired
+  // before any call genuinely was never sent.
+  //
+  // ROUTE: the same branch, standing === 'NOTHING'.
+  // MUTATION: return LEDGER_UNRESOLVED for every CANCELLED row and this goes red — an ordinary
+  // abandoned registration would start alarming about a ledger payment that does not exist.
+  const v = settlementStatus({
+    ...base,
+    payment: orphanSwept({ externalTransactionId: null }),
+    totalForeign: 100,
+  })
+  assert.equal(v.status, 'NOT_SENT')
+  assert.equal(v.basis, 'NONE')
+  assert.match(v.detail, /never told/)
+})
+
+test('[o3d-f709] a VERIFIED reversal is still an absence, not an unresolved payment', () => {
+  // `buildVerifiedReversalData` writes { CANCELLED, externalTransactionId, errorMessage } AFTER
+  // asking Xero and being told DELETED, and it touches neither of the two columns the classifier
+  // weighs. That row names a document id and is nonetheless the complete account of a payment that
+  // existed and was undone — reading it as unresolved would alarm for ever over the reversal that
+  // fixed it.
+  //
+  // ROUTE: cancelledDocumentIdIsAccountedFor, through registrationLedgerStanding.
+  // MUTATION: tag every CANCELLED row that carries an id as unresolved and this goes red.
+  const v = settlementStatus({
+    ...base,
+    payment: row({
+      status: 'CANCELLED',
+      externalTransactionId: 'PAY-REVERSED',
+      settlementBasis: null,
+      abandonedBeforeRemoteCall: null,
+    }),
+    totalForeign: 100,
+  })
+  assert.equal(v.status, 'NOT_SENT')
+  assert.equal(v.basis, 'NONE')
+})
+
+// ---------------------------------------------------------------------------
+// o3d-f709 round 2 — AND THE COLUMN HAS TO ARRIVE. Both loaders, because a classifier that weighs a
+// column a loader never selected reads exactly as it did before the column existed: `undefined` is
+// "not flagged", which is the PERMISSIVE answer here.
+// ---------------------------------------------------------------------------
+
+test('[o3d-f709] the SALES-INVOICE loader carries the sweep flag through to the verdict', async () => {
+  // ROUTE: loadInvoicePaymentSyncRows -> aggregatePaymentSyncRows -> settlementStatus.
+  // MUTATION: drop `abandonedBeforeRemoteCall` from either the loader's `select` or the row it
+  // builds, and this returns NOT_SENT — the badge over a live ledger payment says the ledger was
+  // never told, with nothing anywhere reporting a missing column.
+  const client = {
+    accountingSyncLog: {
+      findMany: async () => [{
+        id: 'log-1',
+        status: 'CANCELLED',
+        externalTransactionId: 'PAY-LIVE',
+        errorMessage: 'Retired: no worker claimed this row.',
+        retryCount: 0,
+        settlementBasis: null,
+        abandonedBeforeRemoteCall: true,
+        payload: { accountingInvoiceId: 'INV-1', bankAccountId: 'bank-1', paymentId: 'pay-1', amount: 100, currency: 'GBP' },
+      }],
+    },
+  } as unknown as Parameters<typeof loadInvoicePaymentSyncRows>[3]
+
+  const rows = await loadInvoicePaymentSyncRows('so-1', 'xero', 'GBP', client)
+  assert.equal(rows.length, 1, 'the precondition: the loader returned the row at all')
+  assert.equal(rows[0].abandonedBeforeRemoteCall, true, 'and it carried the sweep\'s claim off the column')
+
+  const v = settlementStatus({ ...base, payment: aggregatePaymentSyncRows(rows), totalForeign: 100 })
+  assert.equal(v.status, 'LEDGER_UNRESOLVED')
+  assert.doesNotMatch(v.detail, /never told/)
+})
+
+test('[o3d-f709] the BILL-PAYMENT loader selects the sweep flag and puts it on the row', () => {
+  // A SOURCE ASSERTION, and it is the honest one available: `latestBillPaymentSyncRows` is private to
+  // app/actions/purchase-orders.ts and reaches the database through the module-level client, so
+  // there is no seam to hand a fake row through. What can be established is that the column is asked
+  // for and copied across — which is exactly what was missing: the bill side selected
+  // `settlementBasis` and not this, so the classifier saw `undefined`, read it as "not flagged", and
+  // every orphan-swept BILL_PAYMENT reported NOT_SENT.
+  //
+  // ROUTE: the `select` and the `out.set` in latestBillPaymentSyncRows.
+  // MUTATION: remove either line and this goes red.
+  const source = readFileSync(new URL('../../app/actions/purchase-orders.ts', import.meta.url), 'utf8')
+  const start = source.indexOf('async function latestBillPaymentSyncRows')
+  assert.ok(start > 0, 'the precondition: the loader is still called this')
+  const end = source.indexOf('\nexport async function getPurchaseOrder', start)
+  assert.ok(end > start, 'the precondition: and the slice really ends at the next function')
+  const loader = source.slice(start, end)
+  assert.match(loader, /type: 'BILL_PAYMENT'/, 'the precondition: this is the BILL_PAYMENT loader')
+  assert.match(loader, /abandonedBeforeRemoteCall: true/, 'it is SELECTED')
+  assert.match(loader, /abandonedBeforeRemoteCall: r\.abandonedBeforeRemoteCall/, 'and it is put on the row')
+  assert.match(loader, /settlementBasis: r\.settlementBasis/, 'beside the column it was missing next to')
 })
