@@ -2,6 +2,7 @@ import assert from 'node:assert/strict'
 import test from 'node:test'
 import { config } from 'dotenv'
 
+import { DEFAULT_RECONCILIATION_LOOKBACK_DAYS } from '../../lib/domain/accounting/reconciliation.ts'
 import {
   collectRolloutReadiness,
   createRolloutReadinessHandler,
@@ -68,12 +69,36 @@ async function withRollback<T>(fn: (tx: Tx) => Promise<T>, timeout = 60_000): Pr
  * NULL rather than as the JSON literal `null`, which is a different value in a JSONB column and
  * would make the test agree with itself instead of with the database.
  */
-async function insertRun(tx: Tx, id: string, truncationsSql: string) {
+type RunScope = {
+  /** SQL for the run's window and its `createdAt`, so a NULL window can be written as a SQL NULL. */
+  fromSql: string
+  toSql: string
+  createdAtSql: string
+}
+
+/**
+ * o3d-11rf r8 — THE WINDOW IS PART OF THE FIXTURE NOW, and the default one is WIDE. Until r8 every
+ * row here was written with a NULL window, which was only harmless while nothing read it: a run's
+ * `[]` is a statement about the window it covered, so a row with no window recorded proves nothing.
+ * The rows below whose subject is the `truncations` column therefore carry a window that is not
+ * narrower than a default-scope run's, so the verdict they produce is about the column and not about
+ * their scope. 91 rather than exactly 90 days: the boundary itself is a unit test
+ * (`reconciliationScopeCoversDefaultLookback`), and pinning it here as well would make these tests
+ * depend on `now()` and `setUTCDate` rounding identically to the millisecond.
+ */
+const DEFAULT_SCOPE: RunScope = {
+  fromSql: `now() - interval '91 days'`,
+  toSql: 'now()',
+  createdAtSql: `now() + interval '1 day'`,
+}
+
+async function insertRun(tx: Tx, id: string, truncationsSql: string, scope: RunScope = DEFAULT_SCOPE) {
   await tx.$executeRawUnsafe(
     `INSERT INTO "accounting_reconciliation_runs"
        ("id", "fromDate", "toDate", "status", "totalCount", "warningCount", "criticalCount",
         "createdAt", "truncations")
-     VALUES ($1, NULL, NULL, 'COMPLETED', 0, 0, 0, now() + interval '1 day', ${truncationsSql})`,
+     VALUES ($1, ${scope.fromSql}, ${scope.toSql}, 'COMPLETED', 0, 0, 0, ${scope.createdAtSql},
+             ${truncationsSql})`,
     id,
   )
 }
@@ -108,7 +133,10 @@ async function gateStatuses(report: RolloutReadinessResponse) {
 
 test('o3d-11rf r6: a run row with a NULL truncations column does not read as ready at the rollout gate', { skip }, async () => {
   await withRollback(async (tx) => {
-    await insertRun(tx, 'o3d-11rf-r6-null', 'NULL')
+    // A row that predates BOTH columns: no completeness, no window. `not-recorded` is decided by the
+    // truncations column alone, so it is unaffected by r8 and still warns.
+    await insertRun(tx, 'o3d-11rf-r6-null', 'NULL',
+      { fromSql: 'NULL', toSql: 'NULL', createdAtSql: `now() + interval '1 day'` })
 
     // THE QUERY. This is the half a fixture cannot reach: the column has to be asked for.
     const latest = await getLatestAccountingReconciliationRun(tx)
@@ -146,6 +174,15 @@ test('o3d-11rf r6: the same row recording [] IS ready, so the gate is stopped by
     assert.equal(latest?.id, 'o3d-11rf-r6-empty')
     assert.equal(latest?.completeness.state, 'complete', 'an empty array is proven completeness')
     assert.deepEqual(latest?.completeness.truncations, [])
+
+    // o3d-11rf r8 — the window is SELECTed and comes back, which is what lets the narrow-run test
+    // below mean anything: this row's `[]` counts as proof because the row says what it covered.
+    assert(latest?.fromDate && latest.toDate, 'the query asks for the window and PostgreSQL returns it')
+    assert(
+      new Date(latest.toDate).getTime() - new Date(latest.fromDate).getTime()
+        >= DEFAULT_RECONCILIATION_LOOKBACK_DAYS * 24 * 60 * 60 * 1000,
+      'and this row covers at least what a default-scope run covers',
+    )
 
     const report = await collectRolloutReadiness(readinessAdapters(tx))
     assert.equal(report.status, 'ready', 'a run that proved itself complete clears the gate')
@@ -207,11 +244,83 @@ test('o3d-11rf r7: a row holding a payload the reader cannot parse blocks the ga
   })
 })
 
+test('o3d-11rf r8: a narrower clean run does not erase the truncation blocker a wider run left', { skip }, async () => {
+  await withRollback(async (tx) => {
+    // THE ATTACK, EXACTLY AS CODEX DESCRIBED IT. A default-scope run truncates — the blocker r7 made
+    // unbypassable. Then a one-day run is POSTed. Its datasets are far under the caps, so it honestly
+    // records `[]`, and it is now the newest terminal row the gate will read.
+    await insertRun(
+      tx,
+      'o3d-11rf-r8-wide-truncated',
+      `'[{"code":"reconciliation_row_cap_reached","message":"10000 rows reached","details":{"cap":10000}}]'::jsonb`,
+    )
+    await insertRun(tx, 'o3d-11rf-r8-narrow-clean', `'[]'::jsonb`, {
+      fromSql: `now() - interval '1 day'`,
+      toSql: 'now()',
+      createdAtSql: `now() + interval '2 days'`,
+    })
+
+    const latest = await getLatestAccountingReconciliationRun(tx)
+    assert.equal(latest?.id, 'o3d-11rf-r8-narrow-clean',
+      'the newest row IS the narrow one — the fix is not to look past it, which would skip its own findings')
+    assert(latest?.fromDate && latest.toDate)
+    assert.equal(
+      new Date(latest.toDate).getTime() - new Date(latest.fromDate).getTime(),
+      24 * 60 * 60 * 1000,
+      'and it covered one day, read back out of PostgreSQL',
+    )
+
+    // THE FIX. Its `[]` is true about that one day and proves nothing about the 90 the truncated run
+    // could not finish. Without r8 this reads `complete`.
+    assert(latest && latest.completeness.state === 'unknown' && latest.completeness.reason === 'scope-not-proven',
+      'a run narrower than the default scope does not prove the reconciliation was complete')
+    assert.equal(latest.completeness.truncations, null)
+
+    const report = await collectRolloutReadiness(readinessAdapters(tx))
+    assert.equal(report.status, 'blocked')
+    const blocker = report.blockers.find((finding) => finding.id === 'accounting-reconciliation:completeness-scope')
+    assert(blocker, 'the gate says why: the run that cleared the blocker did not look at enough to clear it')
+    assert.equal(blocker?.details?.defaultLookbackDays, DEFAULT_RECONCILIATION_LOOKBACK_DAYS)
+    assert.equal(blocker?.details?.fromDate, latest.fromDate)
+    assert.equal(blocker?.details?.toDate, latest.toDate)
+
+    // AND IT IS A BLOCKER, not a warning. A warning would leave the bypass intact one step longer:
+    // POST a one-day run, then pass `allowWarnings=true` and get the same 200.
+    assert.deepEqual(await gateStatuses(report), { plain: 412, overridden: 412 })
+  })
+})
+
+test('o3d-11rf r8: a clean run that recorded no window at all is not proof either', { skip }, async () => {
+  await withRollback(async (tx) => {
+    // `persistAccountingReconciliationReport` always writes both dates, so this row cannot come from
+    // this build — the same standing as an unreadable payload. It fails closed rather than counting a
+    // window nobody recorded as a window wide enough.
+    await insertRun(tx, 'o3d-11rf-r8-no-window', `'[]'::jsonb`,
+      { fromSql: 'NULL', toSql: 'NULL', createdAtSql: `now() + interval '1 day'` })
+
+    const latest = await getLatestAccountingReconciliationRun(tx)
+    assert(latest && latest.completeness.state === 'unknown' && latest.completeness.reason === 'scope-not-proven')
+    assert.equal(latest.fromDate, null)
+    assert.equal(latest.toDate, null)
+
+    const report = await collectRolloutReadiness(readinessAdapters(tx))
+    assert.equal(report.status, 'blocked')
+    assert.deepEqual(await gateStatuses(report), { plain: 412, overridden: 412 })
+  })
+})
+
 test('o3d-11rf r6: nothing was left behind', { skip }, async () => {
   loadEnv()
   const { db } = await import('../../lib/db')
   const surviving = await db.accountingReconciliationRun.count({
-    where: { id: { in: ['o3d-11rf-r6-null', 'o3d-11rf-r6-empty', 'o3d-11rf-r6-truncated', 'o3d-11rf-r7-unreadable'] } },
+    where: {
+      id: {
+        in: [
+          'o3d-11rf-r6-null', 'o3d-11rf-r6-empty', 'o3d-11rf-r6-truncated', 'o3d-11rf-r7-unreadable',
+          'o3d-11rf-r8-wide-truncated', 'o3d-11rf-r8-narrow-clean', 'o3d-11rf-r8-no-window',
+        ],
+      },
+    },
   })
   assert.equal(surviving, 0, 'every probe transaction aborted')
 })

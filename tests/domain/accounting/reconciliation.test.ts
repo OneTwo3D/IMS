@@ -8,8 +8,11 @@ import {
   MAX_VOID_MIRROR_CONTRADICTIONS,
   RECONCILIATION_ROW_CAP_REACHED,
   VOID_MIRROR_CONTRADICTIONS_TRUNCATED,
+  DEFAULT_RECONCILIATION_LOOKBACK_DAYS,
   isReconciliationProvenComplete,
   readReconciliationCompleteness,
+  readReconciliationRunProof,
+  reconciliationScopeCoversDefaultLookback,
   collectAccountingReconciliationRows,
   evaluateAccountingReconciliationRows,
   listAccountingReconciliationRuns,
@@ -2032,4 +2035,100 @@ test('o3d-11rf r6: a run row the list reader finds with no completeness recorded
   assert.equal(listed.completeness.state, 'unknown',
     'zero findings and a NULL column is a run nobody checked, not a run with nothing wrong')
   assert.equal(isReconciliationProvenComplete(listed.completeness), false)
+})
+
+/**
+ * o3d-11rf r8 (Codex r7, HIGH) — WHAT A RUN'S `[]` IS A STATEMENT ABOUT.
+ *
+ * The column reader answers "were THIS run's datasets cut short", which is the honest per-run fact
+ * the runs list renders. A gate asks something else — "does this run show the reconciliation was
+ * complete" — and for a run that looked at one day the answer is no, however clean that day was.
+ * These tests are about the second function, and about the yardstick it uses: the reconciliation's
+ * OWN default lookback, not a rollout window invented for the occasion.
+ */
+const R8_TO = new Date('2026-05-01T10:00:00.000Z')
+const R8_DEFAULT_FROM = reconciliationLookbackDate(DEFAULT_RECONCILIATION_LOOKBACK_DAYS, R8_TO)
+
+test('o3d-11rf r8: exactly the default lookback is NOT narrower, and one day less is', async () => {
+  assert.equal(
+    reconciliationScopeCoversDefaultLookback({ fromDate: R8_DEFAULT_FROM, toDate: R8_TO }),
+    true,
+    'a default-scope run is the case that must keep working — a rule that fails it is unsatisfiable',
+  )
+  assert.equal(
+    reconciliationScopeCoversDefaultLookback({
+      fromDate: reconciliationLookbackDate(DEFAULT_RECONCILIATION_LOOKBACK_DAYS + 1, R8_TO),
+      toDate: R8_TO,
+    }),
+    true,
+    'and a WIDER one covers it too — the rule is a floor, not an equality',
+  )
+  assert.equal(
+    reconciliationScopeCoversDefaultLookback({
+      fromDate: reconciliationLookbackDate(DEFAULT_RECONCILIATION_LOOKBACK_DAYS - 1, R8_TO),
+      toDate: R8_TO,
+    }),
+    false,
+    'one day short of the default is short',
+  )
+  assert.equal(reconciliationScopeCoversDefaultLookback({ fromDate: R8_DEFAULT_FROM, toDate: null }), false)
+  assert.equal(reconciliationScopeCoversDefaultLookback({ fromDate: null, toDate: R8_TO }), false)
+  assert.equal(
+    reconciliationScopeCoversDefaultLookback({ fromDate: 'not a date', toDate: R8_TO.toISOString() }),
+    false,
+    'an unparseable window proves no coverage rather than throwing',
+  )
+  assert.equal(
+    reconciliationScopeCoversDefaultLookback({
+      fromDate: R8_DEFAULT_FROM.toISOString(),
+      toDate: R8_TO.toISOString(),
+    }),
+    true,
+    'ISO strings and Dates answer the same, because the row reaches readers both ways',
+  )
+})
+
+test('o3d-11rf r8: a narrow run\'s [] is unknown to a gate and still complete to the runs list', async () => {
+  const narrow = { truncations: [], fromDate: reconciliationLookbackDate(1, R8_TO), toDate: R8_TO }
+
+  const proof = readReconciliationRunProof(narrow)
+  assert.equal(proof.state, 'unknown')
+  assert.equal(proof.state === 'unknown' && proof.reason, 'scope-not-proven')
+  assert.equal(proof.truncations, null)
+  assert.equal(isReconciliationProvenComplete(proof), false,
+    'so a truncated run before it cannot be cleared by running a shorter one')
+
+  // The SAME row read as the per-run fact it is. Demoting this too would replace one falsehood with
+  // another: nothing about that one day WAS cut short.
+  const completeness = readReconciliationCompleteness(narrow.truncations)
+  assert.equal(completeness.state, 'complete')
+  assert.equal(isReconciliationProvenComplete(completeness), true)
+})
+
+test('o3d-11rf r8: a default-scope [] is still proof, and truncated/unreadable keep their own reasons', async () => {
+  assert.equal(
+    readReconciliationRunProof({ truncations: [], fromDate: R8_DEFAULT_FROM, toDate: R8_TO }).state,
+    'complete',
+    'the gate can still be satisfied — by the run the endpoint makes when nobody asks for a scope',
+  )
+
+  // A narrow run that ALSO truncated keeps the more specific answer: it said so itself.
+  const truncated = readReconciliationRunProof({
+    truncations: [{ code: RECONCILIATION_ROW_CAP_REACHED, message: '10000 rows scanned' }],
+    fromDate: reconciliationLookbackDate(1, R8_TO),
+    toDate: R8_TO,
+  })
+  assert.equal(truncated.state, 'truncated')
+  assert.deepEqual(truncated.truncations?.map((entry) => entry.code), [RECONCILIATION_ROW_CAP_REACHED])
+
+  const unreadable = readReconciliationRunProof({
+    truncations: { truncated: true },
+    fromDate: reconciliationLookbackDate(1, R8_TO),
+    toDate: R8_TO,
+  })
+  assert.equal(unreadable.state === 'unknown' && unreadable.reason, 'unreadable')
+
+  const unrecorded = readReconciliationRunProof({ truncations: null, fromDate: null, toDate: null })
+  assert.equal(unrecorded.state === 'unknown' && unrecorded.reason, 'not-recorded',
+    'a row predating the column is still the expected deploy-time state, not a scope complaint')
 })

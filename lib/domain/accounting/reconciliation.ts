@@ -369,8 +369,12 @@ export function reconciliationTruncations(
 export type AccountingReconciliationCompleteness =
   | {
     readonly state: 'unknown'
-    /** `not-recorded`: NULL, a run predating the column. `unreadable`: a payload we cannot parse. */
-    readonly reason: 'not-recorded' | 'unreadable'
+    /**
+     * `not-recorded`: NULL, a run predating the column. `unreadable`: a payload we cannot parse.
+     * `scope-not-proven`: the run recorded `[]`, but its own window does not show it looked at as
+     * much as a default-scope run would — see `readReconciliationRunProof`.
+     */
+    readonly reason: 'not-recorded' | 'unreadable' | 'scope-not-proven'
     readonly truncations: null
   }
   | { readonly state: 'complete'; readonly truncations: readonly [] }
@@ -409,6 +413,76 @@ export function isReconciliationProvenComplete(
   completeness: AccountingReconciliationCompleteness,
 ): boolean {
   return completeness.state === 'complete'
+}
+
+/** The window a run covered, as its row records it. Either column may be NULL. */
+export type AccountingReconciliationRunScope = {
+  readonly fromDate: Date | string | null
+  readonly toDate: Date | string | null
+}
+
+function asDate(value: Date | string | null | undefined): Date | null {
+  if (value === null || value === undefined) return null
+  const date = value instanceof Date ? value : new Date(value)
+  return Number.isNaN(date.getTime()) ? null : date
+}
+
+/**
+ * Does this run's recorded window reach back at least as far as a DEFAULT-scope run ending when this
+ * one ended? The yardstick is `reconciliationLookbackDate(DEFAULT_RECONCILIATION_LOOKBACK_DAYS, …)`,
+ * the same call `runAccountingReconciliationReport` makes when nobody asks for a scope — deliberately
+ * NOT a window invented here; see `readReconciliationRunProof`.
+ *
+ * A row missing either date answers FALSE. Nothing about such a row shows what it looked at, and the
+ * question is "does this PROVE coverage", not "is it plausible".
+ */
+export function reconciliationScopeCoversDefaultLookback(scope: AccountingReconciliationRunScope): boolean {
+  const from = asDate(scope.fromDate)
+  const to = asDate(scope.toDate)
+  if (!from || !to) return false
+  return from.getTime() <= reconciliationLookbackDate(DEFAULT_RECONCILIATION_LOOKBACK_DAYS, to).getTime()
+}
+
+/**
+ * o3d-11rf r8 (Codex r7, HIGH) — "DOES THIS RUN PROVE THE RECONCILIATION WAS COMPLETE?", which is a
+ * DIFFERENT question from `readReconciliationCompleteness`, and the difference is the whole finding.
+ *
+ * WHAT CODEX FOUND. `truncations: []` is a true statement about the run that wrote it: nothing the
+ * run looked at was cut short. The rollout gate read it as a statement about the SYSTEM. But the
+ * endpoint takes any positive `lookbackDays`, so a run may have looked at one day. Follow a truncated
+ * 90-day run with a clean one-day run and the newest row says `[]`; the gate saw a clean run and
+ * returned 200, and the data that caused the truncation was never reconciled. The blocker r7 made
+ * unbypassable was cleared through a supported API instead of through `allowWarnings`. This is r5's
+ * conflation — a run that never answered read as a run that answered "yes" — reappearing as a run
+ * that answered "yes" about SOMETHING ELSE.
+ *
+ * WHAT THIS DOES, AND THE POLICY IT REFUSES TO INVENT. Codex's recommendation was to define a
+ * "rollout-qualified reconciliation scope". That is a decision about what window a deploy is entitled
+ * to demand, and nobody has made it; inventing one here would be a second unreviewed judgement riding
+ * on the first. So the rule is the weakest one that closes the hole and needs no such decision: a
+ * run's `[]` proves completeness only if the run's window is NOT NARROWER than what the reconciliation
+ * itself does when asked for nothing. Anything narrower — or a run whose window is not recorded at
+ * all — is `unknown`, the state this gate already handles, and NOT `complete`. No window is chosen
+ * here that the reconciliation had not already chosen for itself. Choosing a rollout-specific window
+ * (recency, or a longer one) remains open as o3d-yby2's neighbour and is deliberately not done here.
+ *
+ * WHY THE COLUMN READER IS LEFT ALONE. `readReconciliationCompleteness` answers "did THIS run's
+ * datasets get cut short", which is what the runs list renders beside a run, and for a one-day run the
+ * honest answer there is still "complete". Demoting it there would put a second falsehood in place of
+ * the first. The scope condition belongs to the question a GATE asks, so it lives in the function a
+ * gate calls, and that function returns the same union so a caller cannot handle the narrow case by
+ * forgetting it: `reason` is exhaustively switched with a `never` default at the gate.
+ *
+ * A `truncated` or `unreadable` run is returned unchanged — those already fail, and their reason is
+ * more specific than this one.
+ */
+export function readReconciliationRunProof(
+  run: { readonly truncations: unknown } & AccountingReconciliationRunScope,
+): AccountingReconciliationCompleteness {
+  const completeness = readReconciliationCompleteness(run.truncations)
+  if (completeness.state !== 'complete') return completeness
+  if (reconciliationScopeCoversDefaultLookback(run)) return completeness
+  return { state: 'unknown', reason: 'scope-not-proven', truncations: null }
 }
 
 export const DEFAULT_RECONCILIATION_LOOKBACK_DAYS = 90

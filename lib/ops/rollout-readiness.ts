@@ -1,7 +1,8 @@
 import { db } from '@/lib/db'
 import {
+  DEFAULT_RECONCILIATION_LOOKBACK_DAYS,
   isReconciliationProvenComplete,
-  readReconciliationCompleteness,
+  readReconciliationRunProof,
   type AccountingReconciliationCompleteness,
 } from '@/lib/domain/accounting/reconciliation'
 import {
@@ -64,6 +65,15 @@ export type LatestAccountingReconciliationRun = {
   warningCount: number
   criticalCount: number
   createdAt: string
+  /**
+   * o3d-11rf r8: the window the run covered, as ISO strings, `null` for a row that recorded neither.
+   * Required for the same reason `completeness` is: a `[]` from a one-day run is not the same fact as
+   * a `[]` from a default-scope run, and an adapter or fixture allowed to omit the window would be
+   * back to reading the first as the second. It is also what makes the SELECT observable — a query
+   * that stops asking for these columns is visible in the response, not only in a verdict.
+   */
+  fromDate: string | null
+  toDate: string | null
   /**
    * o3d-11rf r6: whether this run recorded its own completeness, and what it said. Required, not
    * optional, so no adapter or fixture can leave the question unanswered by omission, and carried as
@@ -276,6 +286,8 @@ export type LatestAccountingReconciliationRunClient = {
       warningCount: number
       criticalCount: number
       createdAt: Date
+      fromDate: Date | null
+      toDate: Date | null
       truncations: unknown
     } | null>
   }
@@ -301,16 +313,25 @@ export async function getLatestAccountingReconciliationRun(
       // o3d-11rf r6: without this the gate could not tell a run that proved itself complete from one
       // that never said, and read both as clean.
       truncations: true,
+      // o3d-11rf r8: and without THESE it could not tell what the run looked at, so a one-day run's
+      // `[]` read as a statement about everything. The row is still chosen by `createdAt` alone —
+      // filtering the SELECT by scope would let a NEWER run's criticals be skipped over, which is a
+      // second hole in place of the first. The narrow run is still the run the gate reports on; what
+      // changes is only that its `[]` no longer proves anything.
+      fromDate: true,
+      toDate: true,
     },
   })
 
   if (!latest) return null
-  const { truncations, ...rest } = latest
+  const { truncations, fromDate, toDate, ...rest } = latest
   return {
     ...rest,
     status: latest.status as AccountingReconciliationRunStatus,
     createdAt: latest.createdAt.toISOString(),
-    completeness: readReconciliationCompleteness(truncations),
+    fromDate: fromDate ? fromDate.toISOString() : null,
+    toDate: toDate ? toDate.toISOString() : null,
+    completeness: readReconciliationRunProof({ truncations, fromDate, toDate }),
   }
 }
 
@@ -867,6 +888,18 @@ function classifyAccountingReconciliation(
  *     real data rather than an artefact of the deploy, and the findings it omitted are exactly the
  *     ones nobody has seen. It BLOCKS.
  *
+ *   `unknown` / `scope-not-proven` (o3d-11rf r8, Codex r7, HIGH) — the run recorded `[]`, but its
+ *     window is narrower than a default-scope run's, or it recorded no window at all. It BLOCKS, and
+ *     the severity is forced rather than chosen. A WARNING would not fix the finding it exists for:
+ *     `allowWarnings=true` turns every warning into 200, so a truncated 90-day run could still be
+ *     erased by POSTing `{"lookbackDays":1}` and passing the flag — which is the bypass, one step
+ *     longer. It is SATISFIABLE without anyone deciding a policy: POST the reconciliation endpoint
+ *     with no `lookbackDays`. And unlike `not-recorded` it is not the state of rows on a correct
+ *     deploy — `persistAccountingReconciliationReport` writes both dates from a report whose
+ *     `fromDate` is `now - lookbackDays`, so every row it writes covers the default unless somebody
+ *     asked for less. The one thing this blocker does NOT claim is that the run is recent enough or
+ *     wide enough for a deploy; that is a policy nobody has set, and this branch declines to set it.
+ *
  * NEITHER BLOCKER IS UNSATISFIABLE. Both clear the same way: run reconciliation again on this build
  * and have it complete. That is the same remedy the warning asks for, so the gate that stops here
  * can always be made to go green without anybody being asked to ignore it.
@@ -918,6 +951,21 @@ function classifyReconciliationCompleteness(
             source: 'accounting-reconciliation',
             message: 'Latest accounting reconciliation run recorded a completeness value this build cannot read, which no writer in this codebase can produce. Run reconciliation again before rolling out.',
             details: { ...details, reason: completeness.reason },
+          })
+          return
+        case 'scope-not-proven':
+          blockers.push({
+            id: 'accounting-reconciliation:completeness-scope',
+            severity: 'blocker',
+            source: 'accounting-reconciliation',
+            message: `Latest accounting reconciliation run reported no truncation, but it covered less than the default ${DEFAULT_RECONCILIATION_LOOKBACK_DAYS}-day window (or recorded no window), so it does not show the reconciliation was complete. Run reconciliation again with no lookbackDays before rolling out.`,
+            details: {
+              ...details,
+              reason: completeness.reason,
+              fromDate: latest.fromDate,
+              toDate: latest.toDate,
+              defaultLookbackDays: DEFAULT_RECONCILIATION_LOOKBACK_DAYS,
+            },
           })
           return
         default: {

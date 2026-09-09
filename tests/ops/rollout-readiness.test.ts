@@ -2,7 +2,10 @@ import assert from 'node:assert/strict'
 import test from 'node:test'
 
 import {
+  DEFAULT_RECONCILIATION_LOOKBACK_DAYS,
   readReconciliationCompleteness,
+  readReconciliationRunProof,
+  reconciliationLookbackDate,
   type AccountingReconciliationCompleteness,
 } from '../../lib/domain/accounting/reconciliation.ts'
 import {
@@ -222,6 +225,72 @@ test('o3d-11rf r7: a completeness payload the reader cannot parse blocks the gat
     new Request('https://ims.example.test/api/admin/rollout-readiness?allowWarnings=true'),
   )
   assert.equal(overridden.status, 412, 'no query flag reads an unreadable payload as a complete one')
+})
+
+/**
+ * o3d-11rf r8 (Codex r7, HIGH) — A RUN THAT LOOKED AT LESS CANNOT CLEAR WHAT A WIDER RUN FOUND.
+ *
+ * The gate reads the newest terminal run. `truncations: []` from a one-day run is TRUE about that
+ * day and says nothing about the 90 the previous run could not finish, so the gate may not read it as
+ * proof. The full sequence — truncated wide run, then clean narrow run — is proved against PostgreSQL
+ * in tests/db/rollout-readiness-run-completeness.test.ts, because only there is the run actually the
+ * newest row; here the subject is the classification and the severity.
+ */
+test('o3d-11rf r8: a clean run narrower than the default scope blocks the gate, override or not', async () => {
+  const narrowScope = {
+    fromDate: reconciliationLookbackDate(1, FIXED_DATE).toISOString(),
+    toDate: FIXED_DATE.toISOString(),
+  }
+
+  // THE PREMISE, STATED SO THE TEST CANNOT PASS FOR THE WRONG REASON. By the per-run reading — the
+  // one the runs list shows — this run IS complete. Everything below is about the gate reading it as
+  // proof of something wider.
+  const perRun = readReconciliationCompleteness([])
+  assert.equal(perRun.state, 'complete')
+
+  const report = await collectRolloutReadiness(createAdapters({
+    latestAccountingReconciliationRun: createReconciliationRun(
+      readReconciliationRunProof({ truncations: [], ...narrowScope }),
+      narrowScope,
+    ),
+  }))
+
+  assert.equal(report.status, 'blocked')
+  const blocker = report.blockers.find((finding) => finding.id === 'accounting-reconciliation:completeness-scope')
+  assert(blocker, 'the gate names the scope, not merely "not complete"')
+  assert.equal(blocker?.details?.reason, 'scope-not-proven')
+  assert.equal(blocker?.details?.fromDate, narrowScope.fromDate)
+  assert.equal(blocker?.details?.toDate, narrowScope.toDate)
+  assert.equal(blocker?.details?.defaultLookbackDays, DEFAULT_RECONCILIATION_LOOKBACK_DAYS)
+  assert.match(String(blocker?.message), /lookbackDays/,
+    'and says how to clear it, which is the same remedy as the other completeness blockers')
+
+  const handler = createRolloutReadinessHandler({
+    authorize: async () => null,
+    collect: async () => report,
+  })
+  const overridden = await handler(
+    new Request('https://ims.example.test/api/admin/rollout-readiness?allowWarnings=true'),
+  )
+  assert.equal(overridden.status, 412,
+    'a warning here would leave the bypass intact: POST a one-day run, then wave the warning through')
+})
+
+test('o3d-11rf r8: the same run at the default scope is ready, so the block is about the window and nothing else', async () => {
+  const defaultScopedRun = createReconciliationRun(
+    readReconciliationRunProof({
+      truncations: [],
+      fromDate: reconciliationLookbackDate(DEFAULT_RECONCILIATION_LOOKBACK_DAYS, FIXED_DATE),
+      toDate: FIXED_DATE,
+    }),
+  )
+  assert.equal(defaultScopedRun.completeness.state, 'complete')
+
+  const report = await collectRolloutReadiness(createAdapters({
+    latestAccountingReconciliationRun: defaultScopedRun,
+  }))
+  assert.equal(report.status, 'ready', 'the gate is still satisfiable by a run the endpoint makes by default')
+  assert.deepEqual(report.blockers, [])
 })
 
 /**
@@ -552,6 +621,19 @@ function createAdapters(overrides: {
   }
 }
 
+/**
+ * o3d-11rf r8: the default window this helper hands out is the one a reconciliation run makes for
+ * itself when nobody asks for a scope, computed with the production function rather than typed out —
+ * so a run that is clean in every OTHER respect is clean in this one too, and the tests below that
+ * narrow it are narrowing it away from the real default.
+ */
+function defaultScope(toDate: Date = FIXED_DATE): { fromDate: string; toDate: string } {
+  return {
+    fromDate: reconciliationLookbackDate(DEFAULT_RECONCILIATION_LOOKBACK_DAYS, toDate).toISOString(),
+    toDate: toDate.toISOString(),
+  }
+}
+
 function createReconciliationRun(
   completeness: AccountingReconciliationCompleteness,
   overrides: Partial<LatestAccountingReconciliationRun> = {},
@@ -563,6 +645,7 @@ function createReconciliationRun(
     warningCount: 0,
     criticalCount: 0,
     createdAt: FIXED_DATE.toISOString(),
+    ...defaultScope(),
     completeness,
     ...overrides,
   }
