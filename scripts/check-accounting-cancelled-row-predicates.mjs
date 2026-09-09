@@ -103,6 +103,22 @@
  * everything it was written to forbid. It is also what makes a SEVENTH copy in an already-owned
  * file fail — the count, not merely the filename, is the declaration.
  *
+ * AND AN OWNER ENTRY CAN STILL HIDE A DEFECT — it did, twice, and that is what `shapes` is for.
+ * The first version of this guard recorded WHO is exempt and never WHETHER THE EXEMPTION HOLDS. Four
+ * of five entries argued the same structural fact in prose — "the status is not read ALONE; it is
+ * ORed with `externalTransactionId: { not: null }`, so a CANCELLED row that names a document is
+ * still seen" — and at two of those sites the OR was an AND, or absent. A conjunction does not
+ * neutralise the exclusion, it INTERSECTS with it, so the sentence was not merely imprecise: it
+ * asserted the opposite of what the code did, and the count could not tell. Both were live money
+ * defects (a coin-flip bill link; a deletable order whose journal is in the ledger).
+ *
+ * So the one part of that argument that is mechanical is now DATA, and checked: each query-half
+ * owner declares `shapes: { orPostEvidence, bare }` and the walk verifies it. Turning an OR into an
+ * AND leaves the count untouched and fails here. What this does NOT do is make a reason true —
+ * prose can still be wrong about intent, about which writers reach a shape, about whether the
+ * exemption is wise. It closes the one claim a machine can hold, and every reason that rests on
+ * anything else must say, in its own text, what a reader has to go and re-read.
+ *
  * Run via `npm run check:accounting-cancelled-row-predicates`; invoked by `npm run check:all`.
  */
 
@@ -124,10 +140,19 @@ const SHARED_PREDICATE = 'mayHaveReachedLedger'
  * QUERY-HALF OVERRIDES: files permitted to exclude CANCELLED from an accountingSyncLog `status`
  * clause without going through {@link SHARED_WHERE}, with the argument for each. `count` is the
  * number of such clauses in the file, so a SEVENTH copy in an owned file is still a failure.
+ *
+ * `shapes` IS THE STRUCTURAL HALF OF THE ARGUMENT, AS DATA (o3d-f709 round 2). Every entry here
+ * rested its exemption on "the status is not read ALONE — it is ORed with
+ * `externalTransactionId: { not: null }`", and the census could not check that sentence: it counted
+ * clauses. Two of the declared owners turned out not to have the OR at all, and both were live
+ * defects. So each owner now declares how many of its clauses are ORed with the post-evidence arm
+ * (`orPostEvidence`) and how many are reached any other way (`bare`), and the walk verifies it. An
+ * AND written where an OR was does not change the count; it changes this.
  */
 const PREDICATE_OWNERS = new Map([
   ['lib/domain/sales/order-delete-guard.ts', {
     count: 2,
+    shapes: { orPostEvidence: 2, bare: 0 },
     reason:
       'o3d-v7sy/o3d-anu8: this guard does not read the status ALONE — BOTH queries OR the live set '
       + 'with `externalTransactionId: { not: null }`, so shape (c) (CANCELLED + a document id) still '
@@ -145,6 +170,7 @@ const PREDICATE_OWNERS = new Map([
   }],
   ['app/actions/sales.ts', {
     count: 1,
+    shapes: { orPostEvidence: 1, bare: 0 },
     reason:
       'o3d-anu8: `readPaymentRegistrations` ORs READABLE_REGISTRATION_STATUSES (which resolves to '
       + 'the four-status complement) with `externalTransactionId: { not: null }`, so shape (c) is '
@@ -377,12 +403,56 @@ function excludesCancelled(initializer, checker) {
 }
 
 /** Collect `status` clauses conjoined into a where object, through AND/OR/NOT and arrays. */
-function collectStatusClauses(node, out, depth = 0) {
+/**
+ * o3d-f709 — IS THIS BRANCH OF AN `OR` THE POST-EVIDENCE ESCAPE, `{ externalTransactionId: { not: null } }`?
+ *
+ * The one structural fact four of the five owner entries rested their whole argument on. Recognised
+ * by SHAPE, not by text: an object literal carrying an `externalTransactionId` property whose value
+ * is `{ not: null }`.
+ */
+function isPostEvidenceArm(node, depth = 0) {
+  if (depth > 4) return false
+  let n = node
+  while (ts.isAsExpression(n) || ts.isParenthesizedExpression(n)) n = n.expression
+  if (!ts.isObjectLiteralExpression(n)) return false
+  for (const prop of n.properties) {
+    if (!ts.isPropertyAssignment(prop)) continue
+    const key = ts.isIdentifier(prop.name) || ts.isStringLiteral(prop.name) ? prop.name.text : null
+    if (key === 'AND' || key === 'OR') {
+      let inner = prop.initializer
+      while (ts.isAsExpression(inner) || ts.isParenthesizedExpression(inner)) inner = inner.expression
+      if (ts.isArrayLiteralExpression(inner) && inner.elements.some((e) => isPostEvidenceArm(e, depth + 1))) return true
+      continue
+    }
+    if (key !== 'externalTransactionId') continue
+    let value = prop.initializer
+    while (ts.isAsExpression(value) || ts.isParenthesizedExpression(value)) value = value.expression
+    if (!ts.isObjectLiteralExpression(value)) continue
+    for (const op of value.properties) {
+      if (!ts.isPropertyAssignment(op)) continue
+      const opKey = ts.isIdentifier(op.name) || ts.isStringLiteral(op.name) ? op.name.text : null
+      if (opKey === 'not' && op.initializer.kind === ts.SyntaxKind.NullKeyword) return true
+    }
+  }
+  return false
+}
+
+/**
+ * Each collected clause is tagged `rescued` when it sits in an `OR` array that ALSO offers the
+ * post-evidence arm — i.e. when the exclusion it writes is neutralised for exactly the shape this
+ * whole issue is about, a CANCELLED row the ledger gave a document id to.
+ *
+ * A clause reached any other way is `rescued: false`: an AND, a bare top-level `where` key, an `OR`
+ * whose other branches say something else. That is the difference between the two defects o3d-f709's
+ * round 2 found and the two sites that were genuinely safe, and NOTHING in the census could see it
+ * until this flag existed — see the header's note on owner entries.
+ */
+function collectStatusClauses(node, out, depth = 0, rescued = false) {
   if (depth > 8) return
   let n = node
   while (ts.isAsExpression(n) || ts.isParenthesizedExpression(n)) n = n.expression
   if (ts.isArrayLiteralExpression(n)) {
-    for (const e of n.elements) collectStatusClauses(e, out, depth + 1)
+    for (const e of n.elements) collectStatusClauses(e, out, depth + 1, rescued)
     return
   }
   if (!ts.isObjectLiteralExpression(n)) return
@@ -392,8 +462,19 @@ function collectStatusClauses(node, out, depth = 0) {
       : ts.isComputedPropertyName(prop.name) && ts.isStringLiteral(prop.name.expression)
         ? prop.name.expression.text
         : null
-    if (key === 'status') out.push(prop)
-    else if (key === 'AND' || key === 'OR' || key === 'NOT') collectStatusClauses(prop.initializer, out, depth + 1)
+    if (key === 'status') out.push({ prop, rescued })
+    else if (key === 'AND' || key === 'OR' || key === 'NOT') {
+      let inner = prop.initializer
+      while (ts.isAsExpression(inner) || ts.isParenthesizedExpression(inner)) inner = inner.expression
+      // ONLY an `OR` can rescue, and only for the branches OF THAT `OR`. An `AND` whose siblings
+      // mention post evidence is the back-reference defect exactly: the clauses INTERSECT, so the
+      // exclusion still fires. `rescued` is therefore never inherited INTO an AND — it is recomputed
+      // here and passed down, so a nested AND under a rescued OR drops back to false.
+      const branchRescued = key === 'OR'
+        && ts.isArrayLiteralExpression(inner)
+        && inner.elements.some((e) => isPostEvidenceArm(e))
+      collectStatusClauses(prop.initializer, out, depth + 1, branchRescued)
+    }
   }
 }
 
@@ -498,11 +579,16 @@ function main() {
               if (!ts.isIdentifier(prop.name) || prop.name.text !== 'where') continue
               const clauses = []
               collectStatusClauses(prop.initializer, clauses)
-              for (const clause of clauses) {
+              for (const { prop: clause, rescued } of clauses) {
                 const described = excludesCancelled(clause.initializer, checker)
                 if (described === null) continue
                 const { line } = sf.getLineAndCharacterOfPosition(clause.getStart(sf))
-                seenPredicateFiles.set(file, (seenPredicateFiles.get(file) ?? 0) + 1)
+                const tally = seenPredicateFiles.get(file) ?? { total: 0, orPostEvidence: 0, bare: 0, sites: [] }
+                tally.total++
+                if (rescued) tally.orPostEvidence++
+                else tally.bare++
+                tally.sites.push(`${file}:${line + 1} (${rescued ? 'or-post-evidence' : 'BARE'})`)
+                seenPredicateFiles.set(file, tally)
                 if (file !== OWNING_MODULE && !PREDICATE_OWNERS.has(file)) {
                   failures.push(
                     `${file}:${line + 1} hand-writes what a CANCELLED row proves — ${described}.\n`
@@ -562,7 +648,48 @@ function main() {
 
   // ── THE GUARD PROVES IT RAN: every owner found, at the stated count ───────────────────────────
   for (const [file, owner] of PREDICATE_OWNERS) {
-    const found = seenPredicateFiles.get(file) ?? 0
+    const tally = seenPredicateFiles.get(file) ?? { total: 0, orPostEvidence: 0, bare: 0, sites: [] }
+    // ── THE SHAPE, NOT ONLY THE COUNT (o3d-f709 round 2) ──────────────────────────────────────
+    //
+    // WHY THIS EXISTS. Four of the five owner entries argued their exemption on ONE structural
+    // fact — "this file does not read the status ALONE; it ORs the live set with
+    // `externalTransactionId: { not: null }`, so a CANCELLED row that names a document is still
+    // seen." The count proved the clauses were still there. NOTHING proved that sentence. It was
+    // FALSE at two of the sites: back-reference.ts ANDed the two clauses (so they intersected and
+    // the cancelled row was dropped), and order-delete-guard's daily-batch query had no post-
+    // evidence arm at all. Both passed the census, because the census recorded WHO is exempt
+    // without recording WHETHER THE EXEMPTION HOLDS.
+    //
+    // So the structural half of every reason is now declared as data and checked. `orPostEvidence`
+    // is a clause sitting in an `OR` that also offers the post-evidence arm; `bare` is one reached
+    // any other way — an AND, a top-level where key, an OR that offers something else. Changing an
+    // OR to an AND now fails here even though the count is unchanged, which is the exact edit that
+    // produced both defects.
+    //
+    // It does not make a reason TRUE. Prose can still be wrong about intent, about which writers
+    // reach a shape, about whether the exemption is wise. It makes the one claim that is mechanical
+    // mechanical, and leaves the rest as prose that a human must re-read — which is why the
+    // order-delete-guard entry now says so in as many words.
+    const shapes = owner.shapes
+    if (shapes && (tally.orPostEvidence !== shapes.orPostEvidence || tally.bare !== shapes.bare)) {
+      failures.push(
+        `PREDICATE_OWNERS is stale: ${file} was declared with ${shapes.orPostEvidence} clause(s) ORed with\n`
+        + `    \`externalTransactionId: { not: null }\` and ${shapes.bare} bare, but ${tally.orPostEvidence} and `
+        + `${tally.bare} were found.\n`
+        + `    ${tally.sites.join('\n    ')}\n`
+        + '    A clause that moved from an OR to an AND still excludes CANCELLED, and the count cannot\n'
+        + '    see the difference — that is the defect this declaration exists to catch. Re-read the\n'
+        + '    reason above and either restore the post-evidence arm or rewrite the argument.',
+      )
+    }
+    if (!shapes) {
+      failures.push(
+        `PREDICATE_OWNERS: ${file} declares no \`shapes\`. Every query-half owner must state how many\n`
+        + '    of its clauses are ORed with the post-evidence arm and how many are bare — see the\n'
+        + '    note above on why the count alone let two defects through.',
+      )
+    }
+    const found = tally.total
     if (found !== owner.count) {
       failures.push(
         `PREDICATE_OWNERS is stale: ${file} was declared with ${owner.count} CANCELLED-excluding `
@@ -638,10 +765,15 @@ function main() {
     console.error(`${failures.length} problem(s). The rule lives in ${OWNING_MODULE}.\n`)
     process.exit(1)
   }
-  const queries = [...seenPredicateFiles.values()].reduce((a, b) => a + b, 0)
+  const tallies = [...seenPredicateFiles.values()]
+  const queries = tallies.reduce((a, b) => a + b.total, 0)
+  // REPORTED, not merely checked. The split is the thing a reader of this output has to know: "3
+  // clauses accounted for" was true on the day two of them silently excluded a posted row.
+  const rescued = tallies.reduce((a, b) => a + b.orPostEvidence, 0)
   const comparisons = [...seenComparisonFiles.values()].reduce((a, b) => a + b, 0)
   console.log(
-    `✓ CANCELLED-row evidence: ${queries} query clause(s) and ${comparisons} comparison(s) accounted for, `
+    `✓ CANCELLED-row evidence: ${queries} query clause(s) (${rescued} ORed with post evidence, `
+    + `${queries - rescued} bare) and ${comparisons} comparison(s) accounted for, `
     + `${seenMigrations.size} migration(s) censused.`,
   )
 }
