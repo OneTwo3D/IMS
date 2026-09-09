@@ -384,21 +384,6 @@ export type PurchaseOrderAttribution =
   | AmbiguousPurchaseOrderAttribution
 
 /**
- * Rows that still compete for a PO's bill link. CANCELLED is excluded (audit-46ry:
- * deliberately abandoned, e.g. a cross-connector orphan).
- *
- * PENDING/PROCESSING stay in the list for the case that matters — a row retried after a
- * partial post already carries its external id — but see the `externalTransactionId`
- * predicate below: a row that has NOT posted has no external id, so it is competing for
- * nothing yet and must not manufacture ambiguity (o3d-9kek finding 2). Holding the only
- * unlinked bill hostage for it does not protect it either: a PO-keyed row can only ever
- * post against a bill that already exists locally, so if this PO has exactly one unlinked
- * bill, both rows would want that same bill and one of them is a duplicate post — a
- * different defect, which refusing to repair does not fix.
- */
-const PURCHASE_ORDER_ATTRIBUTION_LIVE_STATUSES = ['PENDING', 'PROCESSING', 'SYNCED', 'FAILED'] as const
-
-/**
  * o3d-9kek: which bill a PurchaseOrder-keyed PURCHASE_INVOICE row belongs to.
  *
  * A PURCHASE_INVOICE row enqueued before o3d-9oq names the ORDER, not the bill, so the
@@ -471,17 +456,41 @@ export async function resolvePurchaseOrderBackReference(
   // decision to get wrong.
   if (unlinkedBills.length === 0) return { outcome: 'none' }
 
+  // WHO ELSE CLAIMS TO HAVE POSTED A BILL FOR THIS PO? Asked of the POST EVIDENCE ALONE, with NO
+  // status clause at all.
+  //
+  // A row with no external id has posted nothing, so it competes for no bill link. Counting it
+  // manufactured ambiguity out of a FAILED row that never reached the connector at all, which then
+  // blocked a repair that was in fact unambiguous (o3d-9kek finding 2). That half was always right
+  // and is unchanged.
+  //
+  // WHAT WAS WRONG (o3d-f709, Codex round 1 HIGH). The evidence test used to be ANDed onto a
+  // four-status set `['PENDING','PROCESSING','SYNCED','FAILED']` — the longhand spelling of
+  // `status != 'CANCELLED'`. Under an AND the two clauses do not reinforce each other, they
+  // INTERSECT: a CANCELLED row carrying a ledger-issued bill id failed the status half and was
+  // dropped, so the strongest possible competitor — a row the ledger itself gave a document number
+  // to — was the one competitor this count could not see. `cancelOrphanedRowsUnderLock` reaches
+  // CANCELLED over a PENDING row WITHOUT clearing its external id, and a posted row is reverted to
+  // PENDING whenever follow-up work fails (postedRowRetryColumns, and Xero's single-statement
+  // recovery write), so the shape is not hypothetical. The count then read 1 instead of 2 and
+  // stamped a coin-flip id onto the only unlinked bill.
+  //
+  // THE STATUS IS NOT ASKED AT ALL, rather than asked through MAY_HAVE_REACHED_LEDGER_WHERE. On
+  // this predicate the two are the same set — every row with a non-null external id satisfies that
+  // disjunction, by its `status != CANCELLED` arm or by `UNRESOLVED_ABANDONED_CLAIM_WHERE`'s
+  // external-id veto — and composing a clause that can never exclude anything would state the rule
+  // a second time to no effect, which is what cancelled-row-evidence.ts exists to stop. The id IS
+  // the evidence here; nothing further needs deciding.
+  //
+  // AND THE `=== 0` FENCE BELOW STILL MEANS WHAT IT SAYS. Its purpose is that the decision is made
+  // against evidence that still exists; a CANCELLED row naming a document is evidence that still
+  // exists, so admitting it narrows the fence's blind spot rather than widening it.
   const syncRowCount = await deps.accountingSyncLog.count({
     where: {
       connector: params.connector,
       type: 'PURCHASE_INVOICE',
       referenceType: 'PurchaseOrder',
       referenceId: params.purchaseOrderId,
-      status: { in: [...PURCHASE_ORDER_ATTRIBUTION_LIVE_STATUSES] },
-      // A row with no external id has posted nothing, so it competes for no bill link.
-      // Counting it manufactured ambiguity out of a FAILED row that never reached the
-      // connector at all, which then blocked a repair that was in fact unambiguous
-      // (o3d-9kek finding 2).
       externalTransactionId: { not: null },
     },
   })

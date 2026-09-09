@@ -438,6 +438,53 @@ test('a still-queued A2 batch blocks too — the order value is already inside t
   assert.equal(blocker?.code, 'daily_batch_staged')
 })
 
+test('[o3d-f709] a CANCELLED A2 batch row that CARRIES THE JOURNAL ID still blocks', async () => {
+  // THE ROUND-1 HIGH, IN ITS SECOND COPY. This query's status set was its ONLY test and sat at the
+  // top level of the `where` — an AND with the type and reference clauses, not an OR with the post
+  // evidence the document query beside it uses. So this exact row matched nothing and the blocker
+  // silently disappeared, while the journal it names sits in a real ledger.
+  //
+  // The shape is what a switched-off connector leaves behind: a posted row is put BACK to PENDING
+  // when follow-up work fails (KEEPING its external id), and cancelOrphanedRowsUnderLock then
+  // matches `status = 'PENDING'` with no type filter and retires it to CANCELLED without clearing
+  // that id.
+  const row = syncLog({
+    id: 'a2', type: 'DAILY_BATCH_INVENTORY_ALLOC', status: 'CANCELLED',
+    referenceType: 'DailyBatch', referenceId: 'A2-2026-07-20',
+    externalTransactionId: 'XJOURNAL-42',
+  })
+  // Asserted, not assumed: a fixture that quietly lost its id would make this test vacuous, which
+  // is precisely how the sibling defect in the PO attribution suite stayed green.
+  assert.equal(row.status, 'CANCELLED')
+  assert.equal(row.externalTransactionId, 'XJOURNAL-42')
+
+  const blocker = await findSalesOrderDeleteBlocker(
+    makeTx({ syncLogs: [row] }),
+    'order-1',
+    { ...STAMPS, inventoryAllocatedDate: A2_STAGED_AT },
+  )
+  assert.equal(blocker?.code, 'daily_batch_staged')
+  assert.match(blocker!.message, /A2 inventory allocation/)
+})
+
+test('[o3d-f709] a CANCELLED A2 batch row naming NO journal still does not block', async () => {
+  // The other half, and the reason this is an OR and not "drop the status test". A cancelled batch
+  // row with no document id is the pre-call/settled shape the file argues at length must stay
+  // deletable — re-blocking on it would re-strand every order an operator has settled.
+  const blocker = await findSalesOrderDeleteBlocker(
+    makeTx({
+      syncLogs: [syncLog({
+        id: 'a2', type: 'DAILY_BATCH_INVENTORY_ALLOC', status: 'CANCELLED',
+        referenceType: 'DailyBatch', referenceId: 'A2-2026-07-20',
+        externalTransactionId: null,
+      })],
+    }),
+    'order-1',
+    { ...STAMPS, inventoryAllocatedDate: A2_STAGED_AT },
+  )
+  assert.equal(blocker, null)
+})
+
 test('an A2 stamp with no matching batch log does not block (batch never queued)', async () => {
   const blocker = await findSalesOrderDeleteBlocker(
     makeTx({

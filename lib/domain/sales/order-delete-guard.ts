@@ -559,12 +559,36 @@ export async function findSalesOrderDeleteBlocker(
     seenBatchKeys.add(batchKey)
     const referenceWhere = dailyBatchReferenceWhere(batch.group, batch.stagedAt, batch.persistedRef)
     if (!referenceWhere) continue
+    // o3d-f709 — THE SAME "live status OR post evidence" MATCH AS THE DOCUMENT QUERY ABOVE, and it
+    // was an AND until this issue. The status set was the sole test and it sat at the top level of
+    // the `where`, so it was conjoined with the type and reference clauses: a CANCELLED batch row
+    // was excluded outright, EVEN ONE CARRYING THE JOURNAL ID XERO ISSUED.
+    //
+    // That is reachable by exactly the route the document query's own comment (above) already
+    // describes, and nothing about it is specific to sales-invoice rows: a posted row is put BACK to
+    // PENDING when follow-up work fails, KEEPING its external id (`postedRowRetryColumns`, and
+    // Xero's single-statement recovery write), and `cancelOrphanedRowsUnderLock` then matches
+    // `status = 'PENDING'` — with NO type filter at all — and retires it to CANCELLED without
+    // clearing that id. The journal is in the ledger; the blocker vanished; the hard delete
+    // cascaded away the shipments and stamps the journal was built from.
+    //
+    // The CANCELLED-with-NO-id row is still deliberately not a blocker here, for the reason the
+    // document query gives at length: that is the shape an audited NOT_POSTED settlement leaves
+    // behind, and re-blocking on it would re-strand every order an operator has settled.
     const liveBatch = await tx.accountingSyncLog.findFirst({
       where: {
-        status: { in: [...LIVE_ACCOUNTING_SYNC_STATUSES] },
         type: batch.type as Prisma.AccountingSyncLogWhereInput['type'],
         referenceType: DAILY_BATCH_REFERENCE_TYPE,
+        // SPREAD FIRST, and the standing test goes in `AND` rather than beside it: this spread
+        // brings its own top-level `OR` (dailyBatchReferenceWhere returns one), so a sibling `OR`
+        // key here would be OVERWRITTEN by it — silently, and in the permissive direction.
         ...referenceWhere,
+        AND: [{
+          OR: [
+            { status: { in: [...LIVE_ACCOUNTING_SYNC_STATUSES] } },
+            { externalTransactionId: { not: null } },
+          ],
+        }],
       },
       select: { id: true, connector: true, referenceId: true, status: true },
     })
