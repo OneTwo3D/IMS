@@ -8,6 +8,7 @@ import {
   MAX_RECONCILIATION_FINDINGS_PER_RUN,
   MAX_RECONCILIATION_LIST_RUNS,
   MAX_VOID_MIRROR_CONTRADICTIONS,
+  COLLATION_PIN,
   collectAccountingReconciliationRows,
   evaluateAccountingReconciliationRows,
   listAccountingReconciliationRuns,
@@ -1126,12 +1127,25 @@ const CASE_FOLD_CHARACTERS = [
  * text below so a restatement that has drifted fails instead of quietly measuring the wrong thing.
  * `$2`..`$5` are the four fold substitutions; `$1` is the array of characters being swept.
  */
-const FOLD_EXPRESSION = (value: string) => `lower(replace(replace(${value}, $2, $3), $4, $5))`
+const FOLD_EXPRESSION = (value: string) =>
+  `lower(replace(replace(${value}, $2, $3), $4, $5) ${COLLATION_PIN})`
 const COLLAPSE_EXPRESSION = (value: string) =>
-  `nullif(regexp_replace(regexp_replace(${value}, '[^a-z0-9._:-]+', '-', 'g'), '^-+|-+$', '', 'g'), '')`
+  `nullif(regexp_replace(regexp_replace(${value} ${COLLATION_PIN}, '[^a-z0-9._:-]+', '-', 'g'), '^-+|-+$', '', 'g'), '')`
 
 /** The normalisation the statement performed BEFORE r11 — restated so the defect can be measured. */
-const UNSUBSTITUTED_NORMALISATION = COLLAPSE_EXPRESSION('lower(v)')
+const UNSUBSTITUTED_NORMALISATION = (value: string) => COLLAPSE_EXPRESSION(`lower(${value})`)
+
+/**
+ * o3d-11rf r12 — THE FOLD AS IT WAS SPELLED BEFORE THE COLLATION PIN, and the pin PUT IN THE WRONG
+ * PLACE. Both are restated from FOLD_EXPRESSION rather than typed out, so a fold that has moved on
+ * cannot leave these two measuring a spelling nothing ever had.
+ *
+ * UNPINNED is r12's defect: `lower()` resolves the DATABASE'S collation, so the locale decides.
+ * MISPLACED is the trap that makes the fix worth asserting: `lower(x) COLLATE "C"` parses, warns
+ * about nothing, and labels the collation of the RESULT — the fold has already happened.
+ */
+const UNPINNED_FOLD = (value: string) => FOLD_EXPRESSION(value).replace(` ${COLLATION_PIN})`, ')')
+const MISPLACED_PIN_FOLD = (value: string) => `${UNPINNED_FOLD(value)} ${COLLATION_PIN}`
 
 /** Whitespace is not meaning in SQL, and the production statement is wrapped and indented. */
 const squash = (sql: string) => sql.replace(/\s+/g, ' ').trim()
@@ -1233,7 +1247,7 @@ test('o3d-11rf r11: a KELVIN SIGN and a DOTTED CAPITAL I derive the SAME keys in
     // PRECONDITION 2 — AND IT REACHES THE KEY. The pre-r11 spelling is run against each fixture's own
     // token, so the difference is measured on the strings this test actually uses.
     const derivations = await tx.$queryRawUnsafe(
-      `SELECT v, ${UNSUBSTITUTED_NORMALISATION} AS "before" FROM unnest($1::text[]) AS v`,
+      `SELECT v, ${UNSUBSTITUTED_NORMALISATION('v')} AS "before" FROM unnest($1::text[]) AS v`,
       fixtures.map((f) => f.token),
     ) as Array<{ v: string; before: string | null }>
 
@@ -1320,8 +1334,13 @@ const FORMS = [
   { label: 'against the strip', sql: (v: string) => `'-' || ${v} || '-'`, js: (v: string) => `-${v}-` },
 ] as const
 
-test('o3d-11rf r11: the SQL per-part normalisation IS the TypeScript one, on every code point', { skip }, async () => {
-  // THE PIN. Both halves, as the statement spells them, with its parameter holes written as `?`.
+/**
+ * THE PIN, AND THE FOUR SUBSTITUTION PARAMETERS, read off the statement production actually issues.
+ * Extracted so the r11 sweep (this estate's ctype) and the r12 sweep (a Turkish one) prove parity
+ * against the SAME restatement, and a fold that has drifted fails BOTH rather than one quietly
+ * measuring a spelling the statement no longer has.
+ */
+async function pinnedNormalisation() {
   const { sql, values } = await captureStatement()
   const production = squash(sql)
   const foldHalf = squash(FOLD_EXPRESSION('part.value').replace(/\$\d/g, '?'))
@@ -1335,41 +1354,74 @@ test('o3d-11rf r11: the SQL per-part normalisation IS the TypeScript one, on eve
   const substitutions = values.slice(2, 6) as string[]
   assert.equal(substitutions.length, 4, 'four substitution parameters, read off the real capture')
   assert.ok(substitutions.every((value) => typeof value === 'string'))
+  return { production, substitutions }
+}
 
+/** Every code point of the running engine, minus the surrogates and U+0000 (see the block above). */
+function everyCodePoint(): string[] {
   const characters: string[] = []
   for (let point = 1; point <= 0x10ffff; point++) {
     if (point >= 0xd800 && point <= 0xdfff) continue
     characters.push(String.fromCodePoint(point))
   }
   assert.ok(characters.length > 1_000_000, 'every code point, not a sample')
+  return characters
+}
 
+/** What a sweep runs its SQL through: a rolled-back transaction here, a scratch database in r12. */
+type SweepRunner = (sql: string, params: unknown[]) => Promise<Array<Record<string, string | null> & { v: string }>>
+
+/**
+ * Sweep every code point through the PINNED normalisation and through a RIVAL spelling, both in all
+ * four FORMS, comparing each with the production TypeScript builder.
+ *
+ * IT RETURNS WHAT DISAGREED RATHER THAN ASSERTING, because what a rival SHOULD get wrong is the
+ * caller's question and the answer is different for each: on this estate's C-ctype database the
+ * unsubstituted fold misses exactly the two CASE_FOLD_CHARACTERS, and on a tr-TR database the
+ * unpinned fold misses exactly ASCII `I`. A sweep that asserted either number would be wrong on the
+ * other database — and the point of r12 is that there IS another database.
+ */
+async function sweepEveryCodePoint(
+  run: SweepRunner,
+  substitutions: string[],
+  rival: (value: string) => string,
+) {
+  const characters = everyCodePoint()
   const disagreements: string[] = []
-  let unsubstitutedWrong = 0
-  const unsubstitutedNames: string[] = []
-  await withRollback(async (tx) => {
-    for (let at = 0; at < characters.length; at += 100_000) {
-      const chunk = characters.slice(at, at + 100_000)
-      const rows = await tx.$queryRawUnsafe(
-        `SELECT v,
-                ${FORMS.map(({ sql }, index) => `${COLLAPSE_EXPRESSION(FOLD_EXPRESSION(sql('v')))} AS "f${index}"`).join(',\n                ')},
-                ${UNSUBSTITUTED_NORMALISATION} AS "before"
-         FROM unnest($1::text[]) AS v`,
-        chunk, ...substitutions,
-      ) as Array<Record<string, string | null> & { v: string }>
-      assert.equal(rows.length, chunk.length, 'every character in the chunk came back')
-      for (const row of rows) {
-        for (const [index, form] of FORMS.entries()) {
-          if (row[`f${index}`] !== typescriptPart(form.js(row.v))) {
-            disagreements.push(`${JSON.stringify(row.v)} ${form.label}`)
-          }
-        }
-        if (row.before !== typescriptPart(row.v)) {
-          unsubstitutedWrong++
-          if (unsubstitutedNames.length < 4) unsubstitutedNames.push(JSON.stringify(row.v))
-        }
+  const rivalWrong: string[] = []
+  for (let at = 0; at < characters.length; at += 100_000) {
+    const chunk = characters.slice(at, at + 100_000)
+    const rows = await run(
+      `SELECT v,
+              ${FORMS.map(({ sql }, index) => `${COLLAPSE_EXPRESSION(FOLD_EXPRESSION(sql('v')))} AS "f${index}"`).join(',\n              ')},
+              ${FORMS.map(({ sql }, index) => `${rival(sql('v'))} AS "r${index}"`).join(',\n              ')}
+       FROM unnest($1::text[]) AS v`,
+      [chunk, ...substitutions],
+    )
+    assert.equal(rows.length, chunk.length, 'every character in the chunk came back')
+    for (const row of rows) {
+      for (const [index, form] of FORMS.entries()) {
+        const expected = typescriptPart(form.js(row.v))
+        if (row[`f${index}`] !== expected) disagreements.push(`${JSON.stringify(row.v)} ${form.label}`)
+        if (row[`r${index}`] !== expected) rivalWrong.push(`${JSON.stringify(row.v)} ${form.label}`)
       }
     }
-  }, 1_800_000)
+  }
+  const rivalCharacters = [...new Set(rivalWrong.map((entry) => entry.split(' ')[0]))].sort()
+  return { disagreements, rivalWrong, rivalCharacters, swept: characters.length }
+}
+
+test('o3d-11rf r11: the SQL per-part normalisation IS the TypeScript one, on every code point', { skip }, async () => {
+  const { substitutions } = await pinnedNormalisation()
+
+  const { disagreements, rivalCharacters } = await withRollback(
+    async (tx) => sweepEveryCodePoint(
+      (sql, params) => tx.$queryRawUnsafe(sql, ...params) as ReturnType<SweepRunner>,
+      substitutions,
+      UNSUBSTITUTED_NORMALISATION,
+    ),
+    1_800_000,
+  )
 
   assert.deepEqual(disagreements.slice(0, 20), [],
     'the statement derives the same part TypeScript does, for every character, in both positions')
@@ -1377,13 +1429,425 @@ test('o3d-11rf r11: the SQL per-part normalisation IS the TypeScript one, on eve
   // NOT VACUOUS. The sweep must reach characters the PRE-r11 spelling got wrong, and it must reach
   // the two this statement substitutes — otherwise it would pass against a normaliser that never
   // fixed anything.
-  assert.equal(unsubstitutedWrong, CASE_FOLD_CHARACTERS.length,
-    `the spelling this replaced disagrees on exactly ${CASE_FOLD_CHARACTERS.length} characters `
-    + `(${unsubstitutedNames.join(', ')}) — the whole set, and the sweep reaches every one`)
+  assert.deepEqual(rivalCharacters, [...CASE_FOLD_CHARACTERS.map((c) => JSON.stringify(c.character))].sort(),
+    'the spelling this replaced disagrees on exactly the substituted characters and no others — '
+    + 'the whole set, and the sweep reaches every one')
   for (const { character, label } of CASE_FOLD_CHARACTERS) {
     const [alone] = await Promise.resolve([typescriptPart(character)])
     assert.ok(alone, `${label} builds a part in TypeScript — which is what the old spelling lost`)
   }
+})
+
+/**
+ * o3d-11rf r12 (Codex r12, HIGH) — AND THE CLOSURE ABOVE WAS UNDER ONE LOCALE.
+ *
+ * r11 walked all 1,114,111 code points and proved the SQL per-part normalisation IS the TypeScript
+ * one. It walked them on THIS estate's database. `lower()` resolves the COLLATION of its argument,
+ * which for a bare column is whatever the database was created with, so the proof was conditional on
+ * a property of the installation that nothing in IMS enforced — and the r11 tests above SAY so, in
+ * the sentence "every database in this estate is SQL_ASCII with a C ctype".
+ *
+ * WHAT THAT COSTS ON A DATABASE THAT IS NOT THIS ESTATE'S. On PostgreSQL created
+ * `LOCALE_PROVIDER icu ICU_LOCALE 'tr-TR'`, `lower('I')` is `ı` U+0131 DOTLESS I. `ı` is outside
+ * `[a-z0-9._:-]`, so the collapse eats it: `INV-101` derives `-nv-101` in SQL and `inv-101` in
+ * TypeScript. That is not two exotic characters — it is EVERY key containing a capital `I`, i.e.
+ * whole FAMILIES of mirrors the detector then cannot pair and silently does not report.
+ *
+ * SO THIS FILE NOW WALKS LOCALES TOO, and it does it on a REAL Turkish database rather than by
+ * describing one: a scratch database is created with the ICU `tr-TR` locale, migrated with the
+ * repository's own `prisma migrate deploy`, swept, run, and DROPPED in a `finally`.
+ *
+ * IT ASSERTS ITS PRECONDITIONS BEFORE IT CONCLUDES ANYTHING, and there are three, because without
+ * them a green run here would prove only that a database exists:
+ *
+ *   1. THE DATABASE REALLY IS TURKISH — `lower('I')` on it is `ı`, and on the suite's own database
+ *      it is `i`. The difference under test is the LOCALE and not the fixture.
+ *   2. WITHOUT THE FIX IT REALLY IS WRONG — the fold as it was spelled before r12, run on that
+ *      database over these exact tokens, derives something OTHER than TypeScript does.
+ *   3. AND THE PIN HAS TO BE WHERE IT IS — `lower(x) COLLATE "C"`, the spelling a reader reaches for
+ *      first, is measured and is STILL WRONG, because it labels the collation of the result after
+ *      the fold has already happened.
+ *
+ * SKIPPED, LOUDLY, where the server cannot make one: a PostgreSQL without ICU has no `tr-TR` to ask
+ * about. The skip message says so rather than letting an absent proof read as a passing one.
+ */
+const TURKISH_ICU_LOCALE = 'tr-TR'
+
+/** `postgres` on the same server as DATABASE_URL, with the same credentials. */
+function maintenanceUrl(databaseUrl: string): string {
+  const url = new URL(databaseUrl)
+  url.pathname = '/postgres'
+  url.search = ''
+  return url.toString()
+}
+
+function scratchUrl(databaseUrl: string, name: string): string {
+  const url = new URL(databaseUrl)
+  url.pathname = `/${name}`
+  return url.toString()
+}
+
+type Sql = (sql: string, params?: unknown[]) => Promise<Array<Record<string, never>>>
+
+/**
+ * Create a `tr-TR` database, migrate it with THIS worktree's migrations, hand it to `fn`, drop it.
+ * Returns `null` — and the caller skips — when the server has no ICU `tr-TR` to create one with.
+ */
+async function withTurkishDatabase<T>(fn: (run: Sql, name: string) => Promise<T>): Promise<T | null> {
+  loadEnv()
+  const databaseUrl = process.env.DATABASE_URL as string
+  const { Client } = await import('pg')
+  const admin = new Client({ connectionString: maintenanceUrl(databaseUrl) })
+  await admin.connect()
+  const name = `ims_11rf12_${randomUUID().replace(/-/g, '').slice(0, 16)}`
+  let created = false
+  try {
+    const { rows } = await admin.query(
+      'SELECT 1 FROM pg_collation WHERE collprovider = $1 AND colllocale = $2', ['i', TURKISH_ICU_LOCALE],
+    )
+    if (rows.length === 0) return null
+    // LOCALE 'C' with an ICU locale beside it sets the libc side to C and leaves ICU deciding
+    // `lower()` — which is the configuration under test. UTF8 because ICU refuses SQL_ASCII.
+    await admin.query(
+      `CREATE DATABASE "${name}" TEMPLATE template0 ENCODING UTF8`
+      + ` LOCALE_PROVIDER icu ICU_LOCALE '${TURKISH_ICU_LOCALE}' LOCALE 'C'`,
+    )
+    created = true
+    const url = scratchUrl(databaseUrl, name)
+    const scratch = new Client({ connectionString: url })
+    await scratch.connect()
+    try {
+      await scratch.query('CREATE EXTENSION IF NOT EXISTS pg_trgm')
+      // The repository's own migrations, run by the repository's own CLI — not a hand-built schema,
+      // which could differ from the one the statement is written against in exactly the way that
+      // would make this test agree with itself.
+      const { execFileSync } = await import('node:child_process')
+      const root = new URL('../../', import.meta.url).pathname
+      try {
+        execFileSync(`${root}node_modules/.bin/prisma`, ['migrate', 'deploy'], {
+          cwd: root, stdio: 'pipe', env: { ...process.env, DATABASE_URL: url },
+        })
+      } catch (error) {
+        // stdio 'pipe' means the CLI's own diagnosis is on the error, not on the console — and a
+        // migration that will not apply to a UTF8/ICU database is exactly what this test would
+        // otherwise report as an unexplained failure.
+        const { stdout, stderr } = error as { stdout?: Buffer; stderr?: Buffer }
+        throw new Error(`prisma migrate deploy failed on the ${TURKISH_ICU_LOCALE} scratch database: `
+          + `${stderr?.toString() ?? ''}${stdout?.toString() ?? ''}`)
+      }
+      const run: Sql = async (sql, params = []) => (await scratch.query(sql, params)).rows
+      return await fn(run, name)
+    } finally {
+      await scratch.end()
+    }
+  } finally {
+    if (created) await admin.query(`DROP DATABASE IF EXISTS "${name}" WITH (FORCE)`)
+    await admin.end()
+  }
+}
+
+/** `buildAccountingEventIdempotencyKey`'s per-part normalisation, in JavaScript, for one part. */
+const typescriptNormalisation = (value: string) =>
+  value.trim().toLowerCase().replace(/[^a-z0-9._:-]+/g, '-').replace(/^-+|-+$/g, '')
+
+/**
+ * The tokens this round is about, and they are DELIBERATELY ORDINARY: an ASCII capital `I`, standing
+ * alone as a payload token and embedded in a referenceId that looks like every other referenceId.
+ * r11's two characters were exotic enough to be argued about; these are not.
+ */
+const TURKISH_TOKENS = ['I', 'INV-101', 'invoice-I', 'ORDER-IIX'] as const
+
+test('o3d-11rf r12: an ordinary ASCII I derives the SAME key on a TURKISH-locale database', { skip }, async (t) => {
+  const { substitutions } = await pinnedNormalisation()
+  const tokens = [...TURKISH_TOKENS]
+
+  // PRECONDITION 1a, on the suite's OWN database: here `lower()` agrees with JavaScript on `I`.
+  // Without this the test cannot say the Turkish result is about the LOCALE.
+  const here = await withRollback(async (tx) => tx.$queryRaw`SELECT lower('I') AS "fold"`) as Array<{ fold: string }>
+  assert.equal(here[0]?.fold, 'i', "the suite's own database folds I to i — so the difference below is the locale")
+
+  const measured = await withTurkishDatabase(async (run) => {
+    // PRECONDITION 1b — the scratch database really is Turkish, and the pin really does move it.
+    const [fold] = await run(
+      `SELECT lower('I') AS "unpinned", lower('I' ${COLLATION_PIN}) AS "pinned",
+              lower('I') ${COLLATION_PIN} AS "misplaced"`,
+    ) as unknown as Array<{ unpinned: string; pinned: string; misplaced: string }>
+
+    // PRECONDITIONS 2 and 3, and the fix, over the same tokens in one statement so no fixture can
+    // reach one spelling and miss another.
+    const derived = await run(
+      `SELECT v,
+              ${COLLAPSE_EXPRESSION(FOLD_EXPRESSION('v'))}     AS "pinned",
+              ${COLLAPSE_EXPRESSION(UNPINNED_FOLD('v'))}       AS "unpinned",
+              ${COLLAPSE_EXPRESSION(MISPLACED_PIN_FOLD('v'))}  AS "misplaced"
+       FROM unnest($1::text[]) AS v`,
+      [tokens, ...substitutions],
+    ) as unknown as Array<{ v: string; pinned: string | null; unpinned: string | null; misplaced: string | null }>
+    return { fold, derived }
+  })
+
+  if (!measured) {
+    t.skip('this PostgreSQL has no ICU tr-TR collation, so no Turkish database could be created and '
+      + 'the locale half of o3d-11rf r12 is NOT proved on this run')
+    return
+  }
+  const { fold, derived } = measured
+
+  assert.equal(fold.unpinned, 'ı',
+    'PRECONDITION: on a tr-TR database PostgreSQL folds ASCII I to DOTLESS ı — that is the finding')
+  assert.equal(fold.pinned, 'i', `and ${COLLATION_PIN} on the ARGUMENT brings it back to i`)
+  assert.equal(fold.misplaced, 'ı',
+    `while ${COLLATION_PIN} on the RESULT does not: it labels a fold that has already happened`)
+
+  assert.equal(derived.length, tokens.length, 'every token came back')
+  for (const row of derived) {
+    const expected = typescriptNormalisation(row.v)
+    assert.equal(row.pinned, expected,
+      `${JSON.stringify(row.v)} — the pinned statement derives what buildAccountingEventIdempotencyKey does`)
+    assert.notEqual(row.unpinned, expected,
+      `PRECONDITION: ${JSON.stringify(row.v)} — WITHOUT the pin this database derives `
+      + `${JSON.stringify(row.unpinned)} where TypeScript derives ${JSON.stringify(expected)}`)
+    assert.notEqual(row.misplaced, expected,
+      `PRECONDITION: ${JSON.stringify(row.v)} — with the pin on the RESULT it is still wrong`)
+  }
+  // The standalone `I` is the shape that kills the WHOLE key: the part empties, `nullif` makes the
+  // concatenation NULL, and the row owns no mirror at all.
+  const alone = derived.find((row) => row.v === 'I')
+  assert.ok(alone && (alone.unpinned === null || alone.unpinned === ''),
+    'and a standalone I derived NO PART AT ALL without the pin — the false negative, measured')
+})
+
+test('o3d-11rf r12: the WHOLE production statement, run on a TURKISH-locale database', { skip }, async (t) => {
+  const run = randomUUID().slice(0, 8)
+  // Every fixture's referenceId carries an ordinary capital `I`; the standalone one puts it in the
+  // payload token, where an emptied part takes the whole key with it.
+  const fixtures = [
+    { id: `11rf12-${run}-INV-a`, payload: { _idempotencyKey: 'I' } },
+    { id: `11rf12-${run}-INV-b`, payload: { date: '2026-02-03' } },
+    { id: `11rf12-${run}-ORDER-IIX`, payload: { date: '2026-02-03' } },
+  ].map((fixture) => ({
+    ...fixture,
+    rowId: `${fixture.id}-s`,
+    keys: mirroredAccountingEventIdempotencyKeys({
+      syncLogId: `${fixture.id}-s`, connector: 'xero', type: 'SALES_INVOICE',
+      referenceType: 'SalesOrder', referenceId: fixture.id, payload: fixture.payload,
+    }),
+  }))
+  // NOT VACUOUS: the keys the builder derives must actually contain the folded `i` this is about.
+  assert.ok(fixtures.every((f) => f.keys.length > 0), 'every fixture derives at least one key')
+  assert.ok(fixtures.some((f) => f.keys.some((key) => key.endsWith(':i'))),
+    'the standalone payload token folds to a bare i in TypeScript — the part that empties in SQL')
+  const expected = fixtures.flatMap((f) => f.keys.map((_, k) => `${f.rowId}-e${k}`)).sort()
+
+  const { substitutions } = await pinnedNormalisation()
+  // The parts these fixtures' keys are actually built from, so the precondition below is measured on
+  // the strings this test uses rather than on a stand-in.
+  const tokens = [...new Set(fixtures.flatMap((f) => [f.id, ...Object.values(f.payload)]))]
+  assert.ok(tokens.some((token) => /I/.test(token)), 'the fixtures really do carry a capital I')
+
+  const measured = await withTurkishDatabase(async (sql) => {
+    // PRECONDITION, ON THIS DATABASE, BEFORE ANYTHING IS CONCLUDED: without the collation pin these
+    // exact parts derive something else here. Without it a green run below would prove only that
+    // the join works, not that the locale was ever a problem.
+    const derived = await sql(
+      `SELECT v, ${COLLAPSE_EXPRESSION(UNPINNED_FOLD('v'))} AS "unpinned"
+       FROM unnest($1::text[]) AS v`,
+      [tokens, ...substitutions],
+    ) as unknown as Array<{ v: string; unpinned: string | null }>
+
+    for (const fixture of fixtures) {
+      await sql(
+        `INSERT INTO "accounting_sync_logs" ("id","connector","type","status","referenceType","referenceId","payload","createdAt")
+         VALUES ($1,'xero','SALES_INVOICE'::"AccountingSyncType",'PENDING'::"AccountingSyncStatus",'SalesOrder',$2,$3::jsonb,now())`,
+        [fixture.rowId, fixture.id, JSON.stringify(fixture.payload)],
+      )
+      for (const [k, key] of fixture.keys.entries()) {
+        await sql(
+          `INSERT INTO "accounting_events" ("id","type","sourceEntityType","sourceEntityId","businessDate","status",
+             "idempotencyKey","linesJson","currency","externalSystem","voidBasis","createdAt","updatedAt")
+           VALUES ($1,'SALES_INVOICE','SalesOrder',$2,TIMESTAMP '2026-01-01 00:00:00','VOID',$3,'[]'::jsonb,'GBP','xero',NULL,now(),now())`,
+          [`${fixture.rowId}-e${k}`, fixture.id, key],
+        )
+      }
+    }
+
+    // THE PRODUCTION COLLECTOR, on that database. The Prisma-model reads are stubbed empty because
+    // this test is about the one RAW statement; `$queryRaw` is real and goes to the Turkish server.
+    const empty = { async findMany() { return [] } }
+    const client = {
+      salesOrder: empty, shipment: empty, salesOrderRefund: empty,
+      accountingSyncLog: empty, accountingEvent: empty, accountingEventLog: empty,
+      async $queryRaw(strings: TemplateStringsArray, ...values: unknown[]) {
+        const text = strings.reduce((acc, part, index) => acc + (index ? `$${index}` : '') + part, '')
+        return sql(text, values) as unknown as unknown[]
+      },
+    }
+    const rows = await collectAccountingReconciliationRows(
+      client as unknown as Parameters<typeof collectAccountingReconciliationRows>[0],
+    )
+    const found = evaluateAccountingReconciliationRows(rows)
+      .filter((finding) => finding.code === CONTRADICTION)
+      .map((finding) => finding.accountingEventId)
+    return { found, derived }
+  })
+
+  if (!measured) {
+    t.skip('this PostgreSQL has no ICU tr-TR collation, so no Turkish database could be created and '
+      + 'the locale half of o3d-11rf r12 is NOT proved on this run')
+    return
+  }
+  const { found, derived } = measured
+
+  // THE PRECONDITION, ASSERTED FIRST. At least one part of these keys derives DIFFERENTLY on this
+  // database without the pin — otherwise the conclusion below is about nothing.
+  const broken = derived.filter((row) => row.unpinned !== typescriptNormalisation(row.v))
+  assert.ok(broken.length > 0,
+    'PRECONDITION: without the collation pin this database derives a different part for at least one '
+    + `of ${JSON.stringify(tokens)} — it derived ${JSON.stringify(derived)}`)
+  assert.ok(broken.some((row) => row.unpinned === null || row.unpinned === ''),
+    'and for at least one it derives NO PART AT ALL, which is what takes the whole key with it')
+
+  assert.deepEqual([...found].sort(), expected,
+    'on a Turkish-locale database the production statement still pairs every mirror the TypeScript '
+    + 'builder\'s keys name — no family of capital-I keys goes missing')
+})
+
+/**
+ * o3d-11rf r12 — THE OTHER COLLATION THE STATEMENT USED TO INHERIT, AND IT DOES NOT MIS-READ, IT
+ * THROWS.
+ *
+ * The locale half above is about a column read WRONGLY. This is about a column that cannot be read
+ * at all. `l."externalTransactionId"` is a text COLUMN, so a regular-expression match on it resolves
+ * that COLUMN's collation — and a collation declared `deterministic = false` (an ordinary way to make
+ * an identifier column case-insensitive) makes PostgreSQL REFUSE the match: "nondeterministic
+ * collations are not supported for regular expressions". Unpinned, an installation that had done
+ * that to this column would not lose one finding; the whole reconciliation run would raise.
+ *
+ * ITS PRECONDITION IS ASSERTED THE ONLY WAY IT CAN BE — by issuing the unpinned predicate against
+ * that very column on that very database and requiring it to RAISE. Without that, a green run below
+ * would only show that the statement still works on a column nothing had been done to.
+ *
+ * THE TWO jsonb BLANK TESTS ARE NOT PINNED and this test is why they need not be: they read through
+ * `->>`, which yields the DATABASE DEFAULT collation whatever the column underneath is declared as,
+ * and PostgreSQL will not let a database default be nondeterministic.
+ */
+test('o3d-11rf r12: a NONDETERMINISTIC collation on the document-id column does not break the run', { skip }, async (t) => {
+  const run = randomUUID().slice(0, 8)
+  const rowId = `11rf12-${run}-nd-s`
+  const reference = `11rf12-${run}-nd`
+  const keys = mirroredAccountingEventIdempotencyKeys({
+    syncLogId: rowId, connector: 'xero', type: 'SALES_INVOICE',
+    referenceType: 'SalesOrder', referenceId: reference, payload: null,
+  })
+  assert.equal(keys.length, 1, 'a payload-less row derives the one row key')
+
+  const measured = await withTurkishDatabase(async (sql) => {
+    await sql(`CREATE COLLATION "11rf12_nd" (provider = icu, locale = 'und-u-ks-level2', deterministic = false)`)
+    // PostgreSQL refuses to retype a column a trigger's WHEN clause reads, so the one trigger that
+    // reads this column is dropped and PUT BACK from its own definition — the schema this statement
+    // runs against is the migrated one, minus nothing.
+    const triggers = await sql(
+      `SELECT t.tgname AS "name", pg_get_triggerdef(t.oid) AS "def"
+         FROM pg_trigger t JOIN pg_class c ON c.oid = t.tgrelid
+        WHERE c.relname = 'accounting_sync_logs' AND NOT t.tgisinternal
+          AND pg_get_triggerdef(t.oid) LIKE '%externalTransactionId%'`,
+    ) as unknown as Array<{ name: string; def: string }>
+    assert.equal(triggers.length, 1, 'exactly one trigger reads this column, and it is put back below')
+    await sql(`DROP TRIGGER "${triggers[0].name}" ON "accounting_sync_logs"`)
+    await sql(`ALTER TABLE "accounting_sync_logs" ALTER COLUMN "externalTransactionId" TYPE text COLLATE "11rf12_nd"`)
+    await sql(triggers[0].def)
+    // A TAB document id — r10's case, and the one that makes this test bite: `~` is STRICT, so a
+    // NULL externalTransactionId is never handed to the regex and a nondeterministic collation on
+    // the column would go unnoticed. This row's id is non-NULL and blank, so the match really runs,
+    // and the row is in the live set ONLY BECAUSE it ran and said "blank".
+    await sql(
+      `INSERT INTO "accounting_sync_logs" ("id","connector","type","status","referenceType","referenceId","externalTransactionId","createdAt")
+       VALUES ($1,'xero','SALES_INVOICE'::"AccountingSyncType",'PENDING'::"AccountingSyncStatus",'SalesOrder',$2,E'\\t',now())`,
+      [rowId, reference],
+    )
+    await sql(
+      `INSERT INTO "accounting_events" ("id","type","sourceEntityType","sourceEntityId","businessDate","status",
+         "idempotencyKey","linesJson","currency","externalSystem","voidBasis","createdAt","updatedAt")
+       VALUES ($1,'SALES_INVOICE','SalesOrder',$2,TIMESTAMP '2026-01-01 00:00:00','VOID',$3,'[]'::jsonb,'GBP','xero',NULL,now(),now())`,
+      [`${rowId}-e0`, reference, keys[0]],
+    )
+
+    // PRECONDITION: the UNPINNED predicate really is refused on this column, on this database.
+    let refusal: string | null = null
+    try {
+      await sql(`SELECT l."externalTransactionId" ~ $1 AS "blank" FROM "accounting_sync_logs" l`, [ECMASCRIPT_BLANK_PATTERN])
+    } catch (error) {
+      refusal = (error as Error).message
+    }
+    // And the pinned one is not.
+    const [pinned] = await sql(
+      `SELECT count(*)::int AS "n" FROM "accounting_sync_logs" l
+       WHERE l."externalTransactionId" IS NULL OR l."externalTransactionId" ${COLLATION_PIN} ~ $1`,
+      [ECMASCRIPT_BLANK_PATTERN],
+    ) as unknown as Array<{ n: number }>
+
+    const empty = { async findMany() { return [] } }
+    const client = {
+      salesOrder: empty, shipment: empty, salesOrderRefund: empty,
+      accountingSyncLog: empty, accountingEvent: empty, accountingEventLog: empty,
+      async $queryRaw(strings: TemplateStringsArray, ...values: unknown[]) {
+        const text = strings.reduce((acc, part, index) => acc + (index ? `$${index}` : '') + part, '')
+        return sql(text, values) as unknown as unknown[]
+      },
+    }
+    const rows = await collectAccountingReconciliationRows(
+      client as unknown as Parameters<typeof collectAccountingReconciliationRows>[0],
+    )
+    const found = evaluateAccountingReconciliationRows(rows)
+      .filter((finding) => finding.code === CONTRADICTION)
+      .map((finding) => finding.accountingEventId)
+    return { refusal, pinned, found }
+  })
+
+  if (!measured) {
+    t.skip('this PostgreSQL has no ICU tr-TR collation, so no scratch database could be created and '
+      + 'the collation half of o3d-11rf r12 is NOT proved on this run')
+    return
+  }
+  const { refusal, pinned, found } = measured
+
+  assert.ok(refusal && /nondeterministic/i.test(refusal),
+    `PRECONDITION: without the pin PostgreSQL refuses the blank test on this column outright — it said ${JSON.stringify(refusal)}`)
+  assert.equal(pinned.n, 1, `and with ${COLLATION_PIN} the same predicate answers, and answers correctly`)
+  assert.deepEqual(found, [`${rowId}-e0`],
+    'so the whole production statement still runs, and still reports the contradiction')
+})
+
+test('o3d-11rf r12: every code point again, on a TURKISH-locale database', { skip }, async (t) => {
+  const { substitutions } = await pinnedNormalisation()
+
+  const measured = await withTurkishDatabase(async (run) => sweepEveryCodePoint(
+    (sql, params) => run(sql, params) as unknown as ReturnType<SweepRunner>,
+    substitutions,
+    (value) => COLLAPSE_EXPRESSION(UNPINNED_FOLD(value)),
+  ))
+
+  if (!measured) {
+    t.skip('this PostgreSQL has no ICU tr-TR collation, so no Turkish database could be created and '
+      + 'the locale half of o3d-11rf r12 is NOT proved on this run')
+    return
+  }
+  const { disagreements, rivalWrong, rivalCharacters, swept } = measured
+
+  assert.deepEqual(disagreements.slice(0, 20), [],
+    'the pinned statement derives the same part TypeScript does on a tr-TR database too, for every '
+    + 'code point, in all four positions')
+
+  // NOT VACUOUS, AND IT IS ALSO THE CLOSURE. The unpinned fold on a Turkish database disagrees with
+  // TypeScript on EXACTLY ONE code point — and it is `I`. That is the finding stated as a
+  // measurement: r11's exceptions were two characters almost no key contains, and r12's is the
+  // ninth letter of the alphabet, in every position a key part can put it.
+  assert.deepEqual(rivalCharacters, [JSON.stringify('I')],
+    `without the pin this database disagrees on exactly one character, and it is an ordinary ASCII `
+    + `capital I: ${rivalWrong.slice(0, 8).join(', ')}`)
+  assert.equal(rivalWrong.length, FORMS.length,
+    'in every one of the four positions — alone, embedded, doubled and against the strip')
+  assert.ok(swept > 1_000_000, 'every code point, not a sample')
 })
 
 test('o3d-11rf r4: the probes left the database as they found it', { skip }, async () => {

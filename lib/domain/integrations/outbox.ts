@@ -183,6 +183,22 @@ export function calculateIntegrationOutboxRetryDelayMs(options: {
   return Math.min(exponentialDelayMs + jitterDelayMs, maxDelayMs)
 }
 
+/**
+ * THE SECOND COPY OF THE ACCOUNTING KEY NORMALISER, AND IT DOES NOT SHARE ITS PROBLEM (o3d-11rf r12).
+ *
+ * This is character for character `buildAccountingEventIdempotencyKey`'s per-part normalisation, so
+ * the question r12 asked of that one has to be asked here: does the database's LOCALE decide what it
+ * computes? It does not, and for a reason that is worth writing down rather than re-deriving.
+ *
+ * `String.prototype.toLowerCase` is locale-INDEPENDENT by specification — the locale-sensitive
+ * spelling is `toLocaleLowerCase`, which this does not use. What r12 fixed was not a JavaScript
+ * normaliser; it was a SQL RE-IMPLEMENTATION of one, where `lower()` resolves the collation of its
+ * argument and a `tr-TR` database folds ASCII `I` to dotless `ı`. This normaliser has no SQL twin:
+ * `buildOutboxIdempotencyKey` is the only producer of `integration_outbox.idempotencyKey`, every
+ * caller is TypeScript, and the database only stores the result and uniques it. Give it one — a
+ * statement that re-derives an outbox key in SQL — and it acquires r12's exposure immediately, and
+ * the fix is the one that statement carries: pin the collation on the ARGUMENT of `lower()`.
+ */
 function normalizeIdempotencyPart(part: string | number | Date): string {
   const value = part instanceof Date ? part.toISOString().slice(0, 10) : String(part)
   const normalized = value.trim().toLowerCase().replace(/[^a-z0-9._:-]+/g, '-').replace(/^-+|-+$/g, '')

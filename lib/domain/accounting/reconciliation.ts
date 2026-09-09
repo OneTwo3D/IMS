@@ -85,11 +85,73 @@ const ECMASCRIPT_TRIM_CHARACTERS = [
 export const ECMASCRIPT_BLANK_PATTERN = `^(?:${ECMASCRIPT_TRIM_CHARACTERS.join('|')})*$`
 
 /**
+ * o3d-11rf r12 (Codex r12, HIGH) — WHICH `lower()`? THE ONE THE *DATABASE'S LOCALE* PICKS.
+ *
+ * r11 closed the difference between JavaScript's fold and PostgreSQL's by walking every one of the
+ * 1,114,111 code points — UNDER ONE LOCALE. It did not walk locales, and `lower()` takes its
+ * behaviour from the COLLATION of its argument, which for a bare column is whatever the database was
+ * created with. So the closure was conditional on a fact about this estate that nothing enforced.
+ *
+ * WHAT THAT COSTS, MEASURED ON A REAL DATABASE rather than reasoned about. On a PostgreSQL 17
+ * database created `LOCALE_PROVIDER icu ICU_LOCALE 'tr-TR'`, `lower('I')` is `ı` U+0131 DOTLESS I —
+ * not `i`. `ı` is outside `[a-z0-9._:-]`, so the collapse turns it into `-`, and an ordinary
+ * `referenceId` of `INV-101` derives `-nv-101` in SQL against `inv-101` in TypeScript. That is not
+ * two exotic characters: it is EVERY key containing a capital `I`, so the detector loses whole
+ * FAMILIES of mirrors — the false negative r11 named, at a scale r11 did not reach. Between the
+ * default collation and C, `lower()` disagrees on 1,153 characters of the BMP alone on that database.
+ *
+ * THE PIN, AND IT IS ON THE ARGUMENT. `COLLATE "C"` inside the call — `lower(x COLLATE "C")` — sets
+ * the collation `lower()` RESOLVES WITH. `lower(x) COLLATE "C"` labels the collation of the RESULT
+ * and is a no-op for the fold: on that same tr-TR database it still returns `ı`. Both forms parse,
+ * neither warns, and only one of them is the fix; the DB suite asserts the difference rather than
+ * describing it. The same trap sits one operator away in `l."payload" ->> 'k' COLLATE "C"`, which
+ * PostgreSQL parses as `->> ('k' COLLATE "C")` — the pin lands on the KEY NAME — which is why the
+ * two jsonb extractions below are NOT pinned at all (see the next paragraph) rather than pinned
+ * wrongly.
+ *
+ * `"C"` IS ALWAYS AVAILABLE, whatever the encoding: it is a built-in collation with no encoding of
+ * its own, so this one statement is accepted on the estate's SQL_ASCII databases and on a UTF8 one
+ * alike, and both are exercised by the DB suite. Under `"C"`, `lower()` folds `A`-`Z` and touches
+ * nothing else — which is precisely the ASCII-only fold ASCII_FOLD_EXCEPTIONS below was written
+ * against. The pin does not change what this estate computes today; it makes the estate's ctype stop
+ * being load-bearing, so ASCII_FOLD_EXCEPTIONS' exhaustive walk is a statement about the STATEMENT
+ * instead of about this installation.
+ *
+ * WHAT ELSE IN THIS STATEMENT RESOLVES A COLLATION, and what was done about each:
+ *
+ *   • THE FOLD — pinned. Locale-dependent, and demonstrably wrong without the pin (above).
+ *   • THE COLLAPSE `[^a-z0-9._:-]+` — pinned. PostgreSQL compiles a bracket RANGE from character
+ *     CODES, not from a collation's sort order, and that was measured too: across the whole BMP on
+ *     the tr-TR database, the collapse gives the same answer under the default collation and under
+ *     `"C"` for every character. So this pin buys nothing TODAY and is not claimed to; it is here so
+ *     that reading the collapse does not require knowing that, and so a later edit reaching for a
+ *     ctype-driven class (`[[:alpha:]]`, `\w`) cannot quietly make the alphabet the locale's.
+ *   • `l."externalTransactionId" ~ …` — pinned, and this one is load-bearing for a second reason.
+ *     It is a COLUMN, so it carries the collation that column was DECLARED with, and a
+ *     nondeterministic collation (`deterministic = false`, a legitimate thing to put on a
+ *     case-insensitive identifier column) makes PostgreSQL REFUSE the match outright: "nondeterministic
+ *     collations are not supported for regular expressions". Unpinned, the whole reconciliation run
+ *     would throw on such an installation rather than mis-read one row.
+ *   • THE TWO jsonb `->>` BLANK TESTS — NOT pinned, deliberately. A jsonb extraction yields text in
+ *     the DATABASE DEFAULT collation and can never inherit a column's, and a database default is
+ *     always deterministic (PostgreSQL will not create a database with a nondeterministic one). The
+ *     pattern is an alternation of whole literal characters with no class, no range and no
+ *     case-insensitive flag, so nothing in it consults a ctype. Pinning them would buy nothing and
+ *     would have to be written `(l."payload" ->> 'k') COLLATE "C"` to avoid the precedence trap above.
+ *
+ * WHAT THIS IS NOT. It is not an installation-wide locale contract: `install.sh` still does not
+ * dictate the database's `LC_CTYPE`, and every other statement in the tree still resolves the
+ * default collation. That is o3d-60v1, filed rather than folded in here, because a rule about how
+ * every IMS database is CREATED and CONNECTED TO is not a reconciliation change.
+ */
+export const COLLATION_PIN = 'COLLATE "C"'
+
+/**
  * o3d-11rf r11 (Codex r11, HIGH) — THE OTHER HALF OF "THE SAME STRING FUNCTION": CASE.
  *
  * `buildAccountingEventIdempotencyKey` lowercases with JavaScript `toLowerCase()`, which is UNICODE
- * case mapping. The statement below lowercases with PostgreSQL `lower()`, which on this estate's
- * SQL_ASCII / C-ctype databases is a BYTE operation: it folds `A`-`Z` and leaves every other byte
+ * case mapping. The statement below lowercases with PostgreSQL `lower()` — pinned by COLLATION_PIN
+ * to `"C"`, under which it is an ASCII operation: it folds `A`-`Z` and leaves every other character
  * exactly as it found it. So the two functions do not compute the same thing, and r10's tab is the
  * same defect in a different dress.
  *
@@ -119,14 +181,15 @@ export const ECMASCRIPT_BLANK_PATTERN = `^(?:${ECMASCRIPT_TRIM_CHARACTERS.join('
  *
  * SUBSTITUTED BEFORE `lower()`, NOT AFTER, and with `replace()` rather than a character set.
  *
- * BEFORE, because that is what makes the statement INDIFFERENT TO THE DATABASE'S CTYPE — and the
- * difference was measured, not reasoned. On a PostgreSQL 17 database created with
- * `LOCALE_PROVIDER builtin BUILTIN_LOCALE 'C.UTF-8'`, `lower()` folds U+212A to `k` on its own and
- * U+0130 to a BARE `i` (simple case mapping, where JavaScript uses the full one and produces
- * `i` + U+0307). Substituting AFTER the fold would hand `lower()` the two characters it gets wrong
- * and then look for originals that are no longer there — right on this estate by luck, wrong on that
- * one. Substituting first means neither character ever reaches `lower()`, so the statement derives
- * the same keys on both; the DB suite asserts exactly that, having been run against both.
+ * BEFORE, because it keeps the substitution independent of what `lower()` does — and the difference
+ * was measured, not reasoned. On a PostgreSQL 17 database created with `LOCALE_PROVIDER builtin
+ * BUILTIN_LOCALE 'C.UTF-8'`, an UNPINNED `lower()` folds U+212A to `k` on its own and U+0130 to a
+ * BARE `i` (simple case mapping, where JavaScript uses the full one and produces `i` + U+0307).
+ * Substituting AFTER the fold would hand `lower()` the two characters it gets wrong and then look
+ * for originals that are no longer there. r12's COLLATION_PIN now settles what `lower()` does on
+ * every installation, so the order is no longer what carries the property — but the order is still
+ * the one that does not depend on the pin being right, and the DB suite runs this against a
+ * SQL_ASCII database and a tr-TR UTF8 one alike.
  *
  * WITH `replace()`, because it matches a SUBSTRING: on a SQL_ASCII database the search is a byte
  * string, and UTF-8 is prefix-free and self-synchronising, so a byte match can only land on a real
@@ -1513,7 +1576,8 @@ function addAssumedRevisionOrderFindings(
  * THE PARTS ARE NORMALISED THE WAY `buildAccountingEventIdempotencyKey` NORMALISES THEM — lowercased,
  * every run of characters outside `[a-z0-9._:-]` collapsed to one `-`, leading and trailing `-`
  * stripped, then joined on `:`. LOWERCASED means JavaScript `toLowerCase()` and not PostgreSQL
- * `lower()`, which on a SQL_ASCII database folds ASCII bytes and nothing else — see
+ * `lower()`, which under the COLLATION_PIN this statement carries folds ASCII and nothing else on
+ * every installation rather than only on this estate's (o3d-11rf r12) — see
  * ASCII_FOLD_EXCEPTIONS, which is the whole of o3d-11rf r11 and names the only two characters where
  * the two can still differ once the collapse has run. NON-BLANK, in every one of those sentences, is JavaScript `trim()`'s
  * sense of it and not `btrim`'s — see ECMASCRIPT_BLANK_PATTERN, which is the whole of o3d-11rf r10.
@@ -1601,21 +1665,26 @@ async function collectVoidMirrorContradictions(
                parts[6] AS "payloadKey", parts[7] AS "payloadDate"
         FROM (
           SELECT array_agg(
-                   nullif(regexp_replace(regexp_replace(folded.value, '[^a-z0-9._:-]+', '-', 'g'), '^-+|-+$', '', 'g'), '')
+                   nullif(regexp_replace(regexp_replace(folded.value COLLATE "C", '[^a-z0-9._:-]+', '-', 'g'), '^-+|-+$', '', 'g'), '')
                    ORDER BY part.ord
                  ) AS parts
           FROM unnest(ARRAY[
             l."connector", l."type"::text, l."referenceType", l."referenceId", l."id",
             raw."payloadKey", raw."payloadDate"
           ]) WITH ORDINALITY AS part(value, ord)
-          -- LOWERCASED THE WAY JavaScript toLowerCase() LOWERCASES, not the way lower() does. See
-          -- ASCII_FOLD_EXCEPTIONS: lower() is a BYTE fold on a SQL_ASCII database, and the only two
-          -- characters where that difference can outlive the collapse below are substituted first.
+          -- LOWERCASED THE WAY JavaScript toLowerCase() LOWERCASES, not the way this database's
+          -- locale lowercases. See COLLATION_PIN and ASCII_FOLD_EXCEPTIONS: the pin makes lower()
+          -- the ASCII fold on EVERY database rather than only on this estate's, and the two
+          -- characters whose difference can outlive the collapse below are substituted first.
           -- A NULL part stays NULL through both, which is what makes an unbuildable key drop out.
+          --
+          -- THE PIN IS ON THE ARGUMENT, INSIDE THE CALL. A COLLATE outside the closing paren of
+          -- lower() labels the RESULT and folds with the database's locale anyway; measured on a
+          -- tr-TR database, that spelling still returns dotless U+0131 for an ordinary ASCII I.
           CROSS JOIN LATERAL (
             SELECT lower(replace(replace(part.value,
                      ${ASCII_FOLD_EXCEPTIONS[0][0]}, ${ASCII_FOLD_EXCEPTIONS[0][1]}),
-                     ${ASCII_FOLD_EXCEPTIONS[1][0]}, ${ASCII_FOLD_EXCEPTIONS[1][1]})) AS value
+                     ${ASCII_FOLD_EXCEPTIONS[1][0]}, ${ASCII_FOLD_EXCEPTIONS[1][1]}) COLLATE "C") AS value
           ) folded
         ) normalized
       ) n
@@ -1626,7 +1695,10 @@ async function collectVoidMirrorContradictions(
         -- reader of this column asks externalTransactionId?.trim(), so a tab-only id was work owed
         -- everywhere except in this one statement, which read it as a document that exists and
         -- dropped the row out of the live set.
-        AND (l."externalTransactionId" IS NULL OR l."externalTransactionId" ~ ${ECMASCRIPT_BLANK_PATTERN})
+        -- COLLATE "C" for the reason COLLATION_PIN gives: this operand is a COLUMN, so unlike the two
+        -- jsonb extractions above it carries whatever collation that column was declared with, and a
+        -- nondeterministic one makes the match operator throw rather than answer.
+        AND (l."externalTransactionId" IS NULL OR l."externalTransactionId" COLLATE "C" ~ ${ECMASCRIPT_BLANK_PATTERN})
     ),
     contradiction AS (
       SELECT

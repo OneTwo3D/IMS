@@ -6,6 +6,7 @@ import {
   DAILY_BATCH_SPLIT_BRIDGE_AMBIGUOUS,
   ECMASCRIPT_BLANK_PATTERN,
   ASCII_FOLD_EXCEPTION_PARAMETERS,
+  COLLATION_PIN,
   MAX_RECONCILIATION_FINDINGS_PER_RUN,
   MAX_VOID_MIRROR_CONTRADICTIONS,
   RECONCILIATION_ROW_CAP_REACHED,
@@ -1602,7 +1603,7 @@ test('o3d-11rf r4: the contradictions are ASKED FOR, by a statement with no date
   assert.match(sql, /FROM "accounting_sync_logs" l/, 'and the live sync rows are the other')
   assert.match(sql, /e\."status" = 'VOID'/)
   assert.match(sql, /e\."voidBasis" IS NULL/, 'only the voids NO WRITER EXPLAINED')
-  assert.match(sql, /l\."externalTransactionId" IS NULL OR l\."externalTransactionId" ~ \?/,
+  assert.match(sql, /l\."externalTransactionId" IS NULL OR l\."externalTransactionId" COLLATE "C" ~ \?/,
     'and only sync rows that hold no document id — a row that has one describes a document that exists')
 
   assert.ok(!/businessDate|createdAt|syncedAt|fromDate/.test(sql),
@@ -1802,15 +1803,67 @@ test('o3d-11rf r11: the fold is applied to the SUBSTITUTED value, and no bare lo
 
   // ORDER IS THE WHOLE POINT: substitute, THEN fold. Folding first would hand `lower()` the very
   // characters it gets wrong, and replacing afterwards would never find them.
-  assert.match(executable, /lower\(replace\(replace\(part\."?value"?,\s*\?,\s*\?\),\s*\?,\s*\?\)\)/,
+  assert.match(executable, /lower\(replace\(replace\(part\."?value"?,\s*\?,\s*\?\),\s*\?,\s*\?\) COLLATE "C"\)/,
     'lower() is applied to a doubly-substituted part, with both replacements inside it')
   assert.ok(!/lower\(part\.value\)/.test(executable),
     'and no bare lower(part.value) is left anywhere — that spelling IS the defect')
 
   // The collapse reads the FOLDED value, not the raw one: a substitution the normaliser never sees
   // would be a fix that changes nothing.
-  assert.match(executable, /regexp_replace\(regexp_replace\(folded\.value,/,
+  assert.match(executable, /regexp_replace\(regexp_replace\(folded\.value COLLATE "C",/,
     'the collapse consumes the folded value')
+})
+
+/**
+ * o3d-11rf r12 (Codex r12, HIGH) — THE PIN IS INSIDE THE CALL, AND THAT IS THE WHOLE FIX.
+ *
+ * `lower()` resolves the collation of its ARGUMENT. `lower(x COLLATE "C")` therefore folds ASCII on
+ * every installation; `lower(x) COLLATE "C"` labels the collation of the RESULT and folds with the
+ * database's locale exactly as before. Both parse, neither warns, and on a tr-TR database only one
+ * of them returns `i` for `I` — which is measured against a real Turkish database in
+ * tests/db/reconciliation-void-mirror-contradictions.
+ *
+ * WHAT THIS TEST CAN AND CANNOT SHOW. It is a spelling assertion: that the statement production
+ * issues carries the pin, and carries it in the position that works. What the pin DOES is a fact
+ * about PostgreSQL and is proved against one. Both halves are needed — a behavioural proof on one
+ * database cannot stop the next edit from moving the `COLLATE` two characters to the right.
+ */
+test('o3d-11rf r12: the collation pin is on the ARGUMENT of the fold, not on its result', async () => {
+  const { sql } = await captureContradictionQuery()
+  const executable = sql.replace(/--[^\n]*/g, '')
+  assert.ok(/lower\(/.test(executable), 'the comment stripper left the statement behind')
+
+  assert.equal(COLLATION_PIN, 'COLLATE "C"',
+    'the pin is the built-in C collation, which exists whatever the database encoding is')
+
+  // THE FOLD, WITH THE PIN INSIDE THE CLOSING PAREN OF lower(). The statement wraps across lines, so
+  // this reads over newlines deliberately — the property is the nesting, not the layout.
+  const fold = /lower\(replace\(replace\(part\."?value"?,[\s\S]*?\) COLLATE "C"\)/
+  assert.match(executable, fold, 'the fold pins its ARGUMENT — inside the call, where lower() reads it')
+
+  // THE MISPLACEMENT, NAMED AND REFUSED: the same expression with the pin one paren to the right.
+  // It parses, it warns about nothing, and it labels a fold that has already happened.
+  assert.ok(!/lower\(replace\(replace\(part\."?value"?,[\s\S]*?\)\)\s*COLLATE/.test(executable),
+    'and the pin is NOT outside lower(), where it would label the result of a locale-decided fold')
+
+  // The other collation-sensitive operations, named one at a time rather than counted, because
+  // dropping any single one of them re-opens the dependency on its own.
+  assert.match(executable, /regexp_replace\(folded\.value COLLATE "C"/, 'the collapse pins its input')
+  assert.match(executable, /l\."externalTransactionId" COLLATE "C" ~ \?/,
+    'and the one blank test whose operand is a COLUMN pins it too — a column carries the collation '
+    + 'it was declared with, and a nondeterministic one makes ~ throw rather than answer')
+
+  // AND THE TWO jsonb BLANK TESTS ARE DELIBERATELY UNPINNED. `->>` yields the database default
+  // collation, which PostgreSQL will not let be nondeterministic; and writing the pin here without
+  // parentheses would land it on the KEY NAME, because COLLATE binds tighter than `->>`.
+  assert.match(executable, /l\."payload" ->> '_idempotencyKey' !~ \?/, 'the payload token, unpinned')
+  assert.ok(!/->> '[^']*' COLLATE/.test(executable),
+    'and never `->> \'k\' COLLATE "C"`, which PostgreSQL parses as collating the key name')
+
+  // THREE PINS AND NO MORE — so a fourth appearing somewhere this test does not name cannot pass
+  // unnoticed, and so the count is a claim about the whole statement rather than three greps.
+  assert.equal((executable.match(/COLLATE "C"/g) ?? []).length, 3,
+    'the fold, the collapse, and the one blank test whose operand is a column — and nothing else')
 })
 
 test('o3d-11rf r4: the bound is applied AFTER the grouping, and it is the stated one', async () => {
