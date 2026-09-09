@@ -11,6 +11,7 @@ import {
   STOCK_TRANSFER_SOURCE_LAYER_CONSUMPTION,
   TRANSFER_SNAPSHOT_EXCLUDED_MOVEMENT_TYPES,
   TRANSFER_STATUSES_WITH_OUTSTANDING_SOURCE_CONSUMPTION,
+  TRANSFER_STATUSES_AWAITING_DESTINATION_LAYER,
 } from '../../../lib/domain/inventory/movement-cogs-relevance.ts'
 import { STOCK_TRANSFER_TRANSITIONS } from '../../../lib/domain/workflows/stock-transfer-state.ts'
 import { REVALUATION_EXCLUSION_QUERY_MOVEMENT_TYPES } from '../../../lib/cost-layers.ts'
@@ -170,10 +171,63 @@ test('a cancelled dispatch still counts as outstanding source consumption (6oyu.
   // out of this list posts the delta as COGS on the original layer as well —
   // 6oyu.19's double count, reached through the cancel path instead of receipt.
   assert.deepEqual(TRANSFER_STATUSES_WITH_OUTSTANDING_SOURCE_CONSUMPTION, ['CANCELLED', 'IN_TRANSIT', 'RECEIVED'])
-  assert.equal(STOCK_TRANSFER_SOURCE_LAYER_CONSUMPTION.CANCELLED.consumption, 'OUTSTANDING')
+  assert.equal(STOCK_TRANSFER_SOURCE_LAYER_CONSUMPTION.CANCELLED.consumption, 'OUTSTANDING_PROPAGATABLE')
   // DRAFT never dispatched, so it consumed nothing and wrote no snapshot.
   assert.equal(STOCK_TRANSFER_SOURCE_LAYER_CONSUMPTION.DRAFT.consumption, 'NOT_DISPATCHED')
   assert.ok(!TRANSFER_STATUSES_WITH_OUTSTANDING_SOURCE_CONSUMPTION.includes('DRAFT'))
+})
+
+test('IN_TRANSIT is outstanding but NOT propagatable, and says so in its own value (6oyu.19 / Codex r2 HIGH-2)', () => {
+  // The whole point of splitting OUTSTANDING. The old single value justified the
+  // COGS exclusion by "the delta reaches the units through a replacement or
+  // destination layer" — true for RECEIVED and CANCELLED, FALSE for IN_TRANSIT,
+  // where no layer exists yet. Under the old value a revaluation mid-transit
+  // subtracted the whole snapshot from COGS, propagated into nothing, and queued no
+  // journal: the freight debit stayed in transit and inventory stayed understated.
+  //
+  // Both halves are asserted, because either alone reintroduces a known bug:
+  // dropping IN_TRANSIT from the exclusion list is 6oyu.19 (spurious COGS), and
+  // dropping it from the deferral list is the stranded-transit bug.
+  assert.equal(
+    STOCK_TRANSFER_SOURCE_LAYER_CONSUMPTION.IN_TRANSIT.consumption,
+    'OUTSTANDING_AWAITING_DESTINATION_LAYER',
+  )
+  assert.ok(
+    TRANSFER_STATUSES_WITH_OUTSTANDING_SOURCE_CONSUMPTION.includes('IN_TRANSIT'),
+    'IN_TRANSIT units were moved, not sold — they must still be excluded from retrospective COGS',
+  )
+  assert.deepEqual(
+    TRANSFER_STATUSES_AWAITING_DESTINATION_LAYER,
+    ['IN_TRANSIT'],
+    'only IN_TRANSIT has consumed a source layer with no layer anywhere holding the units',
+  )
+
+  // The deferral list must be a STRICT subset of the exclusion list: a status that
+  // defers a reclass but is not excluded would post COGS *and* defer a reclass,
+  // double-counting the delta.
+  for (const status of TRANSFER_STATUSES_AWAITING_DESTINATION_LAYER) {
+    assert.ok(
+      TRANSFER_STATUSES_WITH_OUTSTANDING_SOURCE_CONSUMPTION.includes(status),
+      `${status}: defers a reclass but is not excluded from COGS — the delta would be counted twice`,
+    )
+  }
+  assert.ok(
+    TRANSFER_STATUSES_AWAITING_DESTINATION_LAYER.length < TRANSFER_STATUSES_WITH_OUTSTANDING_SOURCE_CONSUMPTION.length,
+    'precondition: the two lists must differ, or the split is not doing anything',
+  )
+
+  // The statuses that stayed OUTSTANDING must genuinely have a layer to propagate
+  // into — asserted by name so that reclassifying one back without giving it a
+  // destination layer fails here rather than silently stranding value.
+  for (const status of TRANSFER_STATUSES_WITH_OUTSTANDING_SOURCE_CONSUMPTION) {
+    const consumption = STOCK_TRANSFER_SOURCE_LAYER_CONSUMPTION[status].consumption
+    if (TRANSFER_STATUSES_AWAITING_DESTINATION_LAYER.includes(status)) continue
+    assert.equal(
+      consumption,
+      'OUTSTANDING_PROPAGATABLE',
+      `${status}: excluded from COGS without deferring, so a linked layer MUST already exist`,
+    )
+  }
 })
 
 test('the transfer-status list is NOT derived from the transfer state machine (6oyu.19)', () => {

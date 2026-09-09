@@ -110,7 +110,7 @@ export const MOVEMENT_COGS_RELEVANCE: Record<StockMovementType, MovementCogsClas
     treatment: 'EXCLUDE',
     writesCogsEntries: false,
     exclusionSource: 'TRANSFER_SNAPSHOT',
-    note: 'onetwo3d-ims-6oyu.19 — stock moved warehouse, it was not sold. Excluded via getTransferConsumedQtyForCostLayer, which reads stock_transfer_lines.costLayerSnapshot NOT cogs_entries: transfer dispatch writes none, so the cogsEntry-based exclusions were structurally blind to it (that is why this survived every earlier audit). The delta reaches the destination (or, after a cancelled dispatch, the replacement) layer via propagateLandedCostToOutputs, so counting it here too double-posted it. WHICH transfer rows that query may read is STOCK_TRANSFER_SOURCE_LAYER_CONSUMPTION below — not a status list spelled out in the SQL.',
+    note: 'onetwo3d-ims-6oyu.19 — stock moved warehouse, it was not sold. Excluded via getTransferConsumedQtyForCostLayer, which reads stock_transfer_lines.costLayerSnapshot NOT cogs_entries: transfer dispatch writes none, so the cogsEntry-based exclusions were structurally blind to it (that is why this survived every earlier audit). The delta reaches the destination (or, after a cancelled dispatch, the replacement) layer via propagateLandedCostToOutputs, so counting it here too double-posted it. WHICH transfer rows that query may read is STOCK_TRANSFER_SOURCE_LAYER_CONSUMPTION below — not a status list spelled out in the SQL. Excluding is only HALF the answer: for a transfer still IN_TRANSIT no such layer exists yet, so the exclusion must be paired with a persisted pending reclass that the eventual receipt/cancellation settles (see OUTSTANDING_AWAITING_DESTINATION_LAYER).',
   },
   KIT_ASSEMBLY_OUT: {
     relevance: 'NEVER_CONSUMES',
@@ -221,14 +221,33 @@ export const REVALUATION_ACCEPTED_TRADEOFF_MOVEMENT_TYPES: StockMovementType[] =
  * stock_transfer_lines.costLayerSnapshot (see getTransferConsumedQtyForCostLayer).
  * That query is only correct if it reads exactly the transfers whose dispatch-time
  * consumption of the source layer is STILL OUTSTANDING — the source layer's
- * remainingQty is still reduced and the value now lives in some other layer that
- * propagateLandedCostToOutputs can reach through a costLayerSourceLine.
+ * remainingQty is still reduced and the units were not sold.
+ *
+ * "Outstanding" is deliberately split in two, because the ONE contract the earlier
+ * single OUTSTANDING value stated — "safe to exclude, because the delta reaches the
+ * units through a replacement/destination layer" — is true for two of its three
+ * members and FALSE for IN_TRANSIT (Codex r2 HIGH-2). A revaluation that lands mid
+ * transit subtracted the whole snapshot from COGS, found no dependent output to
+ * propagate into, and queued no journal at all: the freight debit stayed in transit
+ * and inventory was understated indefinitely. The transit-vs-GL reconciliation
+ * sweep (6oyu.4) cannot surface that, because a MISSING posting writes neither a
+ * transit_subledger_movements row nor a GL line — it is absent from both sides of
+ * the comparison, so the window ties out exactly.
  *
  *  - NOT_DISPATCHED: never left the source warehouse, so no layer was consumed and
  *    no snapshot was written. Subtracting one would under-post COGS.
- *  - OUTSTANDING: the source layer was consumed at dispatch and has NOT been given
- *    back. Subtract it: the delta reaches the units through their replacement /
- *    destination layer instead.
+ *  - OUTSTANDING_PROPAGATABLE: the source layer was consumed at dispatch and a
+ *    replacement/destination layer EXISTS, linked back by a costLayerSourceLine.
+ *    Subtract it: propagateLandedCostToOutputs carries the delta to that layer and
+ *    journals it there, in the same recalc.
+ *  - OUTSTANDING_AWAITING_DESTINATION_LAYER: consumed at dispatch, but NO layer
+ *    holds the units yet. Still subtract it — the units were not sold, so posting
+ *    COGS would be wrong (that is 6oyu.19) — but the delta then has nowhere to go
+ *    in THIS recalc, so it must be PERSISTED as a pending reclass
+ *    (recordPendingTransferLandedCostReclass) and settled by the receipt or
+ *    dispatch-cancellation that finally creates the layer
+ *    (recreateTransferCostLayersFromSnapshotSlice). Excluding without deferring is
+ *    the stranded-transit bug; deferring without excluding is the 6oyu.19 bug.
  *  - RESTORED_ON_SOURCE_LAYER: a path that un-consumes the ORIGINAL source layer
  *    (raising its remainingQty back) would remove those units from consumedQty
  *    already, so subtracting the snapshot too would under-post COGS. No path does
@@ -237,7 +256,8 @@ export const REVALUATION_ACCEPTED_TRADEOFF_MOVEMENT_TYPES: StockMovementType[] =
  */
 export type TransferSourceLayerConsumption =
   | 'NOT_DISPATCHED'
-  | 'OUTSTANDING'
+  | 'OUTSTANDING_PROPAGATABLE'
+  | 'OUTSTANDING_AWAITING_DESTINATION_LAYER'
   | 'RESTORED_ON_SOURCE_LAYER'
 
 export type TransferStatusCostConsumption = {
@@ -263,17 +283,55 @@ export const STOCK_TRANSFER_SOURCE_LAYER_CONSUMPTION: Record<StockTransferStatus
     note: 'Dispatch is what consumes source layers and writes the costLayerSnapshot; a draft has done neither.',
   },
   IN_TRANSIT: {
-    consumption: 'OUTSTANDING',
-    note: 'Dispatched: consumeFifoLayersStrict reduced the source layer and froze the snapshot on the line. No destination layer exists yet, so the delta is not carried anywhere until receipt creates one (6oyu.19 residual, visible via the 6oyu.4 STOCK_IN_TRANSIT reconciliation sweep).',
+    consumption: 'OUTSTANDING_AWAITING_DESTINATION_LAYER',
+    note: 'Dispatched: consumeFifoLayersStrict reduced the source layer and froze the snapshot on the line. NO layer holds these units — the destination layer is not created until receipt, and the replacement layer not until a dispatch cancellation — so propagateLandedCostToOutputs has nothing to find and this recalc can journal nothing. The delta is instead persisted as a pending reclass and settled atomically by whichever of those two paths creates the layer.',
   },
   RECEIVED: {
-    consumption: 'OUTSTANDING',
+    consumption: 'OUTSTANDING_PROPAGATABLE',
     note: 'The source layer stays consumed; receiveTransfer creates the destination layer and links it back with a costLayerSourceLine, so propagateLandedCostToOutputs carries the delta there.',
   },
   CANCELLED: {
-    consumption: 'OUTSTANDING',
+    consumption: 'OUTSTANDING_PROPAGATABLE',
     note: 'Covers cancelDispatchedTransfer (IN_TRANSIT -> CANCELLED, audit-C5), which explicitly does NOT un-consume the original layers — it creates equivalent REPLACEMENT layers at the source and links each back to the original with a costLayerSourceLine (app/actions/transfers.ts). So the consumption is still outstanding and the delta still reaches the units through propagation, exactly as for RECEIVED. A DRAFT -> CANCELLED transfer was never dispatched and therefore carries no snapshot, so it contributes nothing to the containment query.',
   },
+}
+
+/**
+ * Is this consumption state still OUTSTANDING against the source layer — i.e. must
+ * its dispatch-time snapshot be subtracted from netConsumedQty?
+ *
+ * A total `Record` rather than an `includes()` on a literal array, so a new
+ * TransferSourceLayerConsumption value cannot compile until someone decides whether
+ * it is excluded from COGS. The same reason the registry above is a Record.
+ */
+const CONSUMPTION_IS_OUTSTANDING: Record<TransferSourceLayerConsumption, boolean> = {
+  NOT_DISPATCHED: false,
+  OUTSTANDING_PROPAGATABLE: true,
+  OUTSTANDING_AWAITING_DESTINATION_LAYER: true,
+  RESTORED_ON_SOURCE_LAYER: false,
+}
+
+/**
+ * Does this consumption state require the revaluation delta to be DEFERRED, because
+ * no layer exists for propagateLandedCostToOutputs to carry it to?
+ *
+ * Total for the same reason: a new state that is outstanding but has no destination
+ * layer must not default to the permissive answer (`false` = "somebody downstream
+ * handles it"), which is precisely how the delta got stranded in transit.
+ */
+const CONSUMPTION_DEFERS_RECLASS: Record<TransferSourceLayerConsumption, boolean> = {
+  NOT_DISPATCHED: false,
+  OUTSTANDING_PROPAGATABLE: false,
+  OUTSTANDING_AWAITING_DESTINATION_LAYER: true,
+  RESTORED_ON_SOURCE_LAYER: false,
+}
+
+function transferStatusesWhere(
+  predicate: (consumption: TransferSourceLayerConsumption) => boolean,
+): StockTransferStatus[] {
+  return (Object.keys(STOCK_TRANSFER_SOURCE_LAYER_CONSUMPTION) as StockTransferStatus[])
+    .filter((status) => predicate(STOCK_TRANSFER_SOURCE_LAYER_CONSUMPTION[status].consumption))
+    .sort()
 }
 
 /**
@@ -282,6 +340,13 @@ export const STOCK_TRANSFER_SOURCE_LAYER_CONSUMPTION: Record<StockTransferStatus
  * SQL predicate — never re-spell this list at a call site.
  */
 export const TRANSFER_STATUSES_WITH_OUTSTANDING_SOURCE_CONSUMPTION: StockTransferStatus[] =
-  (Object.keys(STOCK_TRANSFER_SOURCE_LAYER_CONSUMPTION) as StockTransferStatus[])
-    .filter((status) => STOCK_TRANSFER_SOURCE_LAYER_CONSUMPTION[status].consumption === 'OUTSTANDING')
-    .sort()
+  transferStatusesWhere((consumption) => CONSUMPTION_IS_OUTSTANDING[consumption])
+
+/**
+ * Transfer statuses whose excluded consumption has NO layer to propagate into, so a
+ * revaluation landing now must persist a pending reclass instead of journaling.
+ * The single definition behind getInTransitTransferConsumptionForCostLayer's SQL
+ * predicate — and a strict subset of the list above, asserted in the tests.
+ */
+export const TRANSFER_STATUSES_AWAITING_DESTINATION_LAYER: StockTransferStatus[] =
+  transferStatusesWhere((consumption) => CONSUMPTION_DEFERS_RECLASS[consumption])

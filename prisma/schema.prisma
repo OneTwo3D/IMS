@@ -898,6 +898,51 @@ model CostLayerRevaluation {
   @@map("cost_layer_revaluations")
 }
 
+/// 6oyu.19 (Codex round-2 HIGH-2): a landed-cost revaluation that lands while units
+/// are IN TRANSIT has NO cost layer to propagate into — the destination layer is not
+/// created until receipt, and the replacement layer not until a dispatch
+/// cancellation. The revaluation therefore correctly excludes those units from COGS
+/// (they were moved, not sold) but can journal nothing, leaving the freight debit
+/// stranded in the transit clearing account and inventory understated. It is
+/// invisible to the 6oyu.4 transit-vs-GL sweep, which compares recorded transit
+/// movements with GL movements: a MISSING posting is absent from BOTH sides.
+///
+/// One row = one unsettled obligation to reclass DR inventory / CR transit when the
+/// units finally land. `recreateTransferCostLayersFromSnapshotSlice` settles them in
+/// the SAME transaction that creates the layer, so the layer and its journal cannot
+/// desync. No FK relations, deliberately (mirrors TransitSubledgerMovement): an
+/// unsettled accounting obligation must not be cascade-deleted out of existence by
+/// housekeeping on the layer or transfer line that created it.
+model PendingTransferLandedCostReclass {
+  id                String    @id @default(cuid())
+  /// The revalued layer the transferred units were consumed from.
+  sourceCostLayerId String    @map("source_cost_layer_id")
+  /// The dispatch line whose costLayerSnapshot recorded that consumption.
+  transferLineId    String    @map("transfer_line_id")
+  /// In-transit units this obligation covers, and how many have been settled.
+  qty               Decimal   @db.Decimal(14, 6)
+  qtyConsumed       Decimal   @default(0) @db.Decimal(14, 6) @map("qty_consumed")
+  /// Signed per-unit cost change from the revaluation that created this row.
+  unitCostDelta     Decimal   @db.Decimal(18, 6) @map("unit_cost_delta")
+  /// Journal attribution, captured at revaluation time (the recalc knows them; the
+  /// receipt that settles the row does not).
+  primaryPoId       String    @map("primary_po_id")
+  primaryPoRef      String    @map("primary_po_ref")
+  freightPoId       String?   @map("freight_po_id")
+  recalcRunId       String    @map("recalc_run_id")
+  /// Dedupes a replayed recalc: (source layer, transfer line, recalc run).
+  idempotencyKey    String    @unique @map("idempotency_key")
+  revaluedAt        DateTime  @map("revalued_at")
+  /// Set when qtyConsumed reaches qty. A row with settledAt still null and an old
+  /// revaluedAt is an obligation nothing has landed for yet — the audit surface.
+  settledAt         DateTime? @map("settled_at")
+  createdAt         DateTime  @default(now())
+
+  @@index([sourceCostLayerId, transferLineId, settledAt], map: "pending_transfer_landed_cost_reclasses_source_line_settled_idx")
+  @@index([settledAt, revaluedAt], map: "pending_transfer_landed_cost_reclasses_settled_revalued_idx")
+  @@map("pending_transfer_landed_cost_reclasses")
+}
+
 model CostLayerSourceLine {
   id                String    @id @default(cuid())
   costLayerId       String

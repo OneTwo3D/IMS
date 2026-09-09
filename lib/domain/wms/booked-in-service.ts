@@ -2,7 +2,7 @@ import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
 import { recordWmsMutationEvent } from '@/lib/domain/wms/mutation-audit'
 import type { WmsAsnRef } from '@/lib/connectors/wms/types'
-import { copyCostLayerSourceLinesProportionally, createCostLayer } from '@/lib/cost-layers'
+import { recreateTransferCostLayersFromSnapshotSlice } from '@/lib/domain/inventory/transfer-cost-layer-recreation'
 import {
   buildBookedInDryRun,
   reconcileBookedInQuantities,
@@ -955,16 +955,23 @@ export async function processBookedInEvent(
                 },
               })
 
-              for (const entry of snapshotSlice) {
-                const entryQty = toDecimal(entry.qty)
-                const newLayerId = await createCostLayer(tx, {
+              // 6oyu.19: this loop used to create the destination layer and call
+              // copyCostLayerSourceLinesProportionally IGNORING its result, which is
+              // 0 for an ordinary PO-derived source layer (it has no sourceLines of
+              // its own). The layer was therefore left with no costLayerSourceLine,
+              // so the revaluation exclusion removed these units from COGS while
+              // propagation had nowhere to carry the delta. The shared helper makes
+              // the link a postcondition and settles the deferred transit reclass.
+              await recreateTransferCostLayersFromSnapshotSlice(
+                tx,
+                {
                   productId: transferLine.productId,
                   warehouseId: transfer.toWarehouseId,
-                  qty: entryQty,
-                  unitCostBase: entry.unitCostBase,
-                })
-                await copyCostLayerSourceLinesProportionally(tx, entry.costLayerId, newLayerId, entryQty)
-              }
+                  transferLineId: transferLine.id,
+                  contextLabel: `transfer ${transfer.reference} WMS receipt`,
+                },
+                snapshotSlice,
+              )
             }
 
             if (receiptLine.coveredBySnapshotQty > 0) {

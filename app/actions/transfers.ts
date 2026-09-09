@@ -13,16 +13,16 @@ import { validateStockTransferStatusTransition } from '@/lib/domain/workflows/ac
 import type { Prisma } from '@/app/generated/prisma/client'
 import {
   consumeFifoLayersStrict,
-  copyCostLayerSourceLinesProportionally,
   createCostLayer,
 } from '@/lib/cost-layers'
+import { recreateTransferCostLayersFromSnapshotSlice } from '@/lib/domain/inventory/transfer-cost-layer-recreation'
 import { uniqueViolationTargetsField } from '@/lib/db/prisma-unique-violation'
 import { sliceTransferSnapshotForReceipt } from '@/lib/domain/wms/asn-reconciliation'
 import { planTransferPartialReceipt } from '@/lib/domain/inventory/transfer-partial-receipt'
 import { isStockMovementIdempotencyConflict } from '@/lib/domain/inventory/stock-movement-idempotency'
 import { toInventoryConstraintMessage } from '@/lib/domain/inventory/prisma-errors'
 import { canDispatchTransferQty, isCostLayerCoverageSufficient } from '@/lib/domain/inventory/transfer-availability'
-import { addMoney, floorQuantity, multiplyMoney, roundQuantity, subtractMoney, toDecimal } from '@/lib/domain/math/decimal'
+import { addMoney, floorQuantity, multiplyMoney, subtractMoney, toDecimal } from '@/lib/domain/math/decimal'
 import { serializeCostLayerSnapshot } from '@/lib/cost-layer-snapshots'
 import {
   buildStockMovementValueFieldsFromConsumed,
@@ -642,6 +642,7 @@ async function applyTransferLineReceipt(
   tx: Prisma.TransactionClient,
   params: {
     transferId: string
+    transferLineId: string
     transferReference: string
     toWarehouseId: string
     productId: string
@@ -652,7 +653,7 @@ async function applyTransferLineReceipt(
     idempotencyKey?: string
   },
 ): Promise<{ booked: boolean }> {
-  const { transferId, transferReference, toWarehouseId, productId, snapshot, alreadyReceivedQty, qtyToReceive, idempotencyKey } = params
+  const { transferId, transferLineId, transferReference, toWarehouseId, productId, snapshot, alreadyReceivedQty, qtyToReceive, idempotencyKey } = params
 
   const snapshotSlice = sliceTransferSnapshotForReceipt({
     snapshot,
@@ -696,32 +697,19 @@ async function applyTransferLineReceipt(
 
   // Recreate FIFO layers at the destination from the unconsumed slice of the
   // dispatch snapshot (the slicer walks past alreadyReceivedQty and returns the
-  // next qtyToReceive units — the same algorithm the WMS booked-in handler uses).
-  for (const entry of snapshotSlice) {
-    const entryQty = toDecimal(entry.qty)
-    const unitCostBase = toDecimal(entry.unitCostBase)
-    if (entryQty.gt(0) && unitCostBase.gte(0)) {
-      const newLayerId = await createCostLayer(tx, {
-        productId,
-        warehouseId: toWarehouseId,
-        qty: entryQty,
-        unitCostBase,
-      })
-      const copied = await copyCostLayerSourceLinesProportionally(tx, entry.costLayerId, newLayerId, entryQty)
-      if (copied === 0) {
-        await tx.costLayerSourceLine.create({
-          data: {
-            costLayerId: newLayerId,
-            sourceProductId: productId,
-            sourceCostLayerId: entry.costLayerId,
-            qty: entryQty.toFixed(6),
-            unitCostBase,
-            totalCostBase: roundQuantity(multiplyMoney(entryQty, unitCostBase), 6).toFixed(6),
-          },
-        })
-      }
-    }
-  }
+  // next qtyToReceive units). The shared helper is what GUARANTEES each new layer
+  // is reachable by propagateLandedCostToOutputs and settles any landed-cost
+  // reclass deferred while these units were in transit — never open-code this.
+  await recreateTransferCostLayersFromSnapshotSlice(
+    tx,
+    {
+      productId,
+      warehouseId: toWarehouseId,
+      transferLineId,
+      contextLabel: `transfer ${transferReference} receipt`,
+    },
+    snapshotSlice,
+  )
 
   // cogs-audit scjz.5: conserve quantity when the dispatch snapshot under-records
   // costed units (source dispatched legacy/uncosted stock). Balance the shortfall
@@ -806,6 +794,7 @@ export async function receiveTransfer(id: string): Promise<TransferResult> {
         if (remainingQty > 0) {
           await applyTransferLineReceipt(tx, {
             transferId: id,
+            transferLineId: line.id,
             transferReference: transfer.reference,
             toWarehouseId: transfer.toWarehouseId,
             productId: line.productId,
@@ -982,6 +971,7 @@ export async function receiveTransferPartial(id: string, lineDeltas: unknown, su
 
         const { booked } = await applyTransferLineReceipt(tx, {
           transferId: id,
+          transferLineId: line.id,
           transferReference: transfer.reference,
           toWarehouseId: transfer.toWarehouseId,
           productId: line.productId,
@@ -1227,32 +1217,19 @@ export async function cancelDispatchedTransfer(id: string): Promise<TransferResu
         // destination recreation in receiveTransfer, targeting fromWarehouseId).
         // Note: the ORIGINAL layers consumed at dispatch are NOT un-consumed; this
         // creates equivalent replacement layers (same cost basis + source-line
-        // provenance), so source quantity reconciles with cost layers.
-        for (const entry of snapshotSlice) {
-          const entryQty = toDecimal(entry.qty)
-          const unitCostBase = toDecimal(entry.unitCostBase)
-          if (entryQty.gt(0) && unitCostBase.gte(0)) {
-            const newLayerId = await createCostLayer(tx, {
-              productId: line.productId,
-              warehouseId: transfer.fromWarehouseId,
-              qty: entryQty,
-              unitCostBase,
-            })
-            const copied = await copyCostLayerSourceLinesProportionally(tx, entry.costLayerId, newLayerId, entryQty)
-            if (copied === 0) {
-              await tx.costLayerSourceLine.create({
-                data: {
-                  costLayerId: newLayerId,
-                  sourceProductId: line.productId,
-                  sourceCostLayerId: entry.costLayerId,
-                  qty: entryQty.toFixed(6),
-                  unitCostBase,
-                  totalCostBase: roundQuantity(multiplyMoney(entryQty, unitCostBase), 6).toFixed(6),
-                },
-              })
-            }
-          }
-        }
+        // provenance), so source quantity reconciles with cost layers. Same shared
+        // helper as the receipt path: a cancellation is the OTHER way in-transit
+        // units come to rest, so it settles the same deferred reclass obligations.
+        await recreateTransferCostLayersFromSnapshotSlice(
+          tx,
+          {
+            productId: line.productId,
+            warehouseId: transfer.fromWarehouseId,
+            transferLineId: line.id,
+            contextLabel: `transfer ${transfer.reference} dispatch cancellation`,
+          },
+          snapshotSlice,
+        )
         restoredLineCount += 1
       }
 

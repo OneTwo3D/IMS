@@ -4,7 +4,8 @@ import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
 import { recordWmsMutationEvent } from '@/lib/domain/wms/mutation-audit'
 import { classifyUnresolvedWmsSku } from '@/lib/domain/wms/stock-sync-helpers'
-import { createCostLayer, copyCostLayerSourceLinesProportionally } from '@/lib/cost-layers'
+import { createCostLayer } from '@/lib/cost-layers'
+import { recreateTransferCostLayersFromSnapshotSlice } from '@/lib/domain/inventory/transfer-cost-layer-recreation'
 import { notify } from '@/lib/notifications'
 import { getWmsConnector } from '@/lib/connectors/wms/registry'
 import {
@@ -797,17 +798,21 @@ async function applyMintsoftAlignmentForProduct(params: {
           }),
         })
 
-        for (const entry of snapshotSlice) {
-          const entryQty = toDecimal(entry.qty)
-          const newLayerId = await createCostLayer(tx, {
+        // 6oyu.19: same omission as the WMS webhook receipt path — the created
+        // layer had no costLayerSourceLine whenever the source was a plain
+        // PO-derived layer, stranding the landed-cost delta. Routed through the
+        // shared helper so the link is guaranteed, not remembered.
+        await recreateTransferCostLayersFromSnapshotSlice(
+          tx,
+          {
             productId: transferLine.productId,
             warehouseId: params.binding.warehouseId,
-            qty: entryQty,
-            unitCostBase: entry.unitCostBase,
+            transferLineId: transferLine.id,
             adjustmentMovementId: movement.id,
-          })
-          await copyCostLayerSourceLinesProportionally(tx, entry.costLayerId, newLayerId, entryQty)
-        }
+            contextLabel: `transfer line ${transferLine.id} WMS stock-sync alignment`,
+          },
+          snapshotSlice,
+        )
       }
 
       await tx.stockLevel.update({
