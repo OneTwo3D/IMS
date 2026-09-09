@@ -2,6 +2,16 @@ import assert from 'node:assert/strict'
 import test from 'node:test'
 
 import { marginFigureBound, marginFigureBoundDecimal, netLinearFigureBound, netLinearFigureBoundDecimal, shareFigureBound, boundSuffix, unplacedCreditBoundFromParts } from '@/lib/domain/sales/refund-basis-analytics'
+import {
+  EXACT_LINEAR_FIGURE_BOUND,
+  classifyLinearFigureBound,
+  linearFigureBoundFromUnplacedCredit,
+  linearFigureBoundWidth,
+  roundBoundedAmountForDisplay,
+  sumLinearFigureBounds,
+  type DerivedFigureBound,
+  type LinearFigureBoundInterval,
+} from '@/lib/domain/sales/derived-figure-bound'
 
 /**
  * o3d-iigc round 4, Codex finding 1: AVG MARGIN IS NOT NECESSARILY AN UPPER BOUND.
@@ -129,11 +139,15 @@ test('a non-finite CREDIT is never silently classified as a bound (o3d-iigc r4)'
 // The mark itself
 // ---------------------------------------------------------------------------
 
-test('the suffix distinguishes the three claims, and ? is deliberately not ≤ (o3d-iigc r4)', () => {
+test('the suffix distinguishes the four claims, and ? is deliberately not ≤ (o3d-iigc r4, o3d-la3n r2)', () => {
   assert.equal(boundSuffix('exact'), '')
   assert.equal(boundSuffix('upper'), ' ≤')
+  assert.equal(boundSuffix('lower'), ' ≥')
   assert.equal(boundSuffix('indeterminate'), ' ?')
   assert.notEqual(boundSuffix('indeterminate'), boundSuffix('upper'))
+  assert.notEqual(boundSuffix('lower'), boundSuffix('upper'))
+  // All four are distinct: a mark that collides with another is a mark that says the wrong thing.
+  assert.equal(new Set((['exact', 'upper', 'lower', 'indeterminate'] as const).map(boundSuffix)).size, 4)
 })
 
 // ---------------------------------------------------------------------------
@@ -218,4 +232,131 @@ test('the number-world interval keeps a negative entry visible through a zero bu
   // Nothing unplaced at all: both endpoints zero, and the caller's basisComplete flag decides.
   assert.equal(unplacedCreditBoundFromParts([{ total: 0, positive: 0 }]), 0)
   assert.equal(unplacedCreditBoundFromParts([]), 0)
+})
+
+// ---------------------------------------------------------------------------
+// o3d-la3n round 2: THE INTERVAL IS THE MODEL; THE VERDICT IS A RENDERING OF IT
+// ---------------------------------------------------------------------------
+
+/**
+ * Codex round 1, HIGH 2. Round 1 modelled a bound as a three-valued verdict and folded VERDICTS to
+ * bound a filtered subtotal. Two things were wrong with that, and both are about the endpoints the
+ * verdict throws away:
+ *
+ *   1. a negative-only unplaced credit is a PROVABLE LOWER bound — the true figure lies between the
+ *      published one and published + width — and a model with no `lower` has to call that
+ *      `indeterminate`, telling the reader the truth may be below a figure it cannot be below;
+ *   2. the WIDTH of a subtotal's bound is the sum of its parts' widths, and there is nothing in a
+ *      list of marks to sum.
+ *
+ * So the endpoints are carried, added, and classified last.
+ */
+
+test('a NEGATIVE-only unplaced credit is a lower bound, not "direction unknown" (o3d-la3n r2)', () => {
+  const bound = linearFigureBoundFromUnplacedCredit([{ total: -30, positive: 0 }])
+  assert.deepEqual({ ...bound }, { lower: 0, upper: 30 }, 'the truth is between the published figure and +30')
+  assert.equal(classifyLinearFigureBound(bound), 'lower')
+  assert.equal(linearFigureBoundWidth(bound), 30)
+  // The collapsed-scalar classifier the un-migrated producers still use cannot get there: collapsing
+  // keeps the sign and discards the other endpoint, so `indeterminate` is all it can soundly say.
+  assert.equal(netLinearFigureBound({ basisComplete: false, unplacedCredit: unplacedCreditBoundFromParts([{ total: -30, positive: 0 }]) }), 'indeterminate')
+})
+
+test('an UPPER part and a LOWER part fold to indeterminate, and the endpoints say by how much (o3d-la3n r2)', () => {
+  const up = linearFigureBoundFromUnplacedCredit([{ total: 12, positive: 12 }])
+  const down = linearFigureBoundFromUnplacedCredit([{ total: -30, positive: 0 }])
+  assert.equal(classifyLinearFigureBound(up), 'upper')
+  assert.equal(classifyLinearFigureBound(down), 'lower')
+
+  const both = sumLinearFigureBounds([up, down])
+  assert.deepEqual({ ...both }, { lower: -12, upper: 30 })
+  assert.equal(classifyLinearFigureBound(both), 'indeterminate')
+  assert.equal(linearFigureBoundWidth(both), null, 'no single direction, so no single width')
+
+  // A LOWER part beside an EXACT one stays determinate — and this is the case a verdict fold would
+  // have to get from the same two marks it sees above if `exact` were mistaken for `upper`.
+  const still = sumLinearFigureBounds([down, EXACT_LINEAR_FIGURE_BOUND])
+  assert.deepEqual({ ...still }, { lower: 0, upper: 30 })
+  assert.equal(classifyLinearFigureBound(still), 'lower')
+})
+
+test('ZERO-WIDTH intervals: at zero it is exact, away from zero it is a determinate relation (o3d-la3n r2)', () => {
+  assert.deepEqual({ ...EXACT_LINEAR_FIGURE_BOUND }, { lower: 0, upper: 0 })
+  assert.equal(classifyLinearFigureBound(EXACT_LINEAR_FIGURE_BOUND), 'exact')
+  assert.equal(linearFigureBoundWidth(EXACT_LINEAR_FIGURE_BOUND), null, 'an exact figure has no width to disclose')
+  assert.equal(classifyLinearFigureBound(linearFigureBoundFromUnplacedCredit([{ total: 0, positive: 0 }])), 'exact')
+
+  // A zero-width interval AWAY from zero cannot be minted from credit parts — Σmax(e,0) = Σmin(e,0)
+  // forces both to zero — so it is cast in here deliberately, to pin what the classifier does if a
+  // future producer ever hands one over: the figure is known exactly and is NOT the published one,
+  // so a relation is owed and `≤` is the true one.
+  const pinned = { lower: -5, upper: -5 } as unknown as LinearFigureBoundInterval
+  assert.equal(classifyLinearFigureBound(pinned), 'upper')
+  assert.equal(linearFigureBoundWidth(pinned), 5)
+})
+
+test('the EMPTY subset sums to the exact identity, not to a wide interval (o3d-la3n r2)', () => {
+  const empty = sumLinearFigureBounds([])
+  assert.deepEqual({ ...empty }, { lower: 0, upper: 0 })
+  assert.equal(classifyLinearFigureBound(empty), 'exact')
+  assert.equal(boundSuffix(classifyLinearFigureBound(empty)), '', 'an empty filter shows a £0.00 total with no mark')
+  // And it really is the identity for the fold.
+  const one = linearFigureBoundFromUnplacedCredit([{ total: 7, positive: 7 }])
+  assert.deepEqual({ ...sumLinearFigureBounds([one, empty]) }, { ...one })
+})
+
+test('non-finite and inverted intervals establish nothing (o3d-la3n r2)', () => {
+  assert.equal(classifyLinearFigureBound({ lower: Number.NaN, upper: 0 } as unknown as LinearFigureBoundInterval), 'indeterminate')
+  assert.equal(classifyLinearFigureBound({ lower: -Infinity, upper: 0 } as unknown as LinearFigureBoundInterval), 'indeterminate')
+  assert.equal(classifyLinearFigureBound({ lower: 5, upper: -5 } as unknown as LinearFigureBoundInterval), 'indeterminate')
+})
+
+/**
+ * THE BRAND. Round 1's docstring said "a RATIO is not covered — do not reach for this function
+ * there", which is enforcement by comment. `LinearFigureBoundInterval` is now nominal: the ratio
+ * classifier's answer is a verdict and not an interval, and a structurally identical hand-rolled
+ * pair carries no brand, so neither can reach the fold. The `@ts-expect-error` directives BELOW are
+ * the assertion — `tsc --noEmit` fails if either line stops being an error.
+ */
+test('a RATIO bound cannot reach the linear fold, and the legitimate route still does (o3d-la3n r2)', () => {
+  // A real ratio verdict, from the real classifier, on the worked case that makes margin move the
+  // other way: revenue 100, COGS 150, £120 of unplaced credit.
+  const ratioVerdict: DerivedFigureBound = marginFigureBound({ netRevenue: 100, cogs: 150, unplacedCredit: 120, basisComplete: false })
+  assert.equal(ratioVerdict, 'indeterminate', 'the ratio really is bounded differently from the linear figures beside it')
+
+  // @ts-expect-error a ratio's VERDICT is not an interval; it carries no endpoints to add
+  const foldRatioVerdict = () => sumLinearFigureBounds([ratioVerdict])
+  // @ts-expect-error a hand-rolled pair is structurally identical and still refused: it is unbranded
+  const foldRawPair = () => sumLinearFigureBounds([{ lower: 0, upper: 5 }])
+  assert.equal(typeof foldRatioVerdict, 'function', 'both stay uncalled — the compiler is the assertion')
+  assert.equal(typeof foldRawPair, 'function')
+
+  // The only public way in is a mint from credit PARTS, which a ratio has none of to offer.
+  const legitimate = sumLinearFigureBounds([linearFigureBoundFromUnplacedCredit([{ total: 5, positive: 5 }])])
+  assert.equal(classifyLinearFigureBound(legitimate), 'upper')
+  assert.equal(linearFigureBoundWidth(legitimate), 5)
+})
+
+/**
+ * DISPLAY ROUNDING IS PART OF THE CLAIM (o3d-l4zz, folded into this branch).
+ *
+ * A figure that carries a relation is rounded in the direction of that relation. Nearest-cent
+ * rounding is not relation-preserving: £0.024 to the nearest cent is £0.02, and "at most £0.02" is
+ * false of £0.024.
+ */
+test('a bounded amount rounds in the direction its relation allows (o3d-la3n r2)', () => {
+  assert.equal(roundBoundedAmountForDisplay(0.024, 'upper'), 0.03, 'a ceiling rounds UP')
+  assert.equal(roundBoundedAmountForDisplay(0.024, 'lower'), 0.02, 'a floor rounds DOWN')
+  assert.equal(roundBoundedAmountForDisplay(0.024, 'exact'), 0.02, 'and an unrelated figure rounds to nearest')
+  assert.equal(roundBoundedAmountForDisplay(0.024, 'indeterminate'), 0.02, 'as does one claiming no relation')
+
+  // The relation actually holds afterwards, which is the whole point.
+  assert.ok(roundBoundedAmountForDisplay(0.024, 'upper') >= 0.024)
+  assert.ok(roundBoundedAmountForDisplay(0.024, 'lower') <= 0.024)
+
+  // Binary floating point: 0.14 * 100 is 14.000000000000002, and a bare ceil would publish £0.15.
+  assert.equal(roundBoundedAmountForDisplay(0.14, 'upper'), 0.14)
+  assert.equal(roundBoundedAmountForDisplay(0.29, 'upper'), 0.29)
+  assert.equal(roundBoundedAmountForDisplay(-0.145, 'lower'), -0.15)
+  assert.equal(roundBoundedAmountForDisplay(100, 'upper'), 100, 'an exact-cent figure is not nudged')
 })

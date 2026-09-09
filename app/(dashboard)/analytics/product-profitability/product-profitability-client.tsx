@@ -10,8 +10,16 @@ import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter } from '
 import { ProductLink } from '@/components/inventory/product-link'
 import { useBaseCurrency } from '@/components/providers/base-currency-provider'
 import { formatMoney } from '@/lib/utils'
-import type { ProfitabilityRow, ProfitabilitySummary } from '@/app/actions/product-profitability'
-import { boundSuffix, combineNetLinearFigureBounds, type DerivedFigureBound } from '@/lib/domain/sales/derived-figure-bound'
+import type { ProfitabilityFyFigures, ProfitabilityRow, ProfitabilitySummary } from '@/app/actions/product-profitability'
+import {
+  boundSuffix,
+  classifyLinearFigureBound,
+  linearFigureBoundWidth,
+  roundBoundedAmountForDisplay,
+  sumLinearFigureBounds,
+  type DerivedFigureBound,
+  type LinearFigureBoundInterval,
+} from '@/lib/domain/sales/derived-figure-bound'
 
 type Props = {
   data: { rows: ProfitabilityRow[]; summary: ProfitabilitySummary }
@@ -34,32 +42,76 @@ const PAGE_SIZE = 50
 // ---------------------------------------------------------------------------
 
 /**
- * EVERY `≤` ON THIS PAGE COMES FROM A `DerivedFigureBound`, AND FROM NOWHERE ELSE.
+ * EVERY RELATION ON THIS PAGE IS CLASSIFIED FROM A PRODUCER-ISSUED INTERVAL, AND FROM NOTHING ELSE.
  *
  * Until o3d-la3n the fourteen marked figures here — four table cells, four footers, four colour
  * rules, the summary cards and the CSV's two bound columns — each derived their own mark, twelve of
- * them from `…RefundBasisComplete` and two from `netLinearFigureBound` over
+ * them from `…RefundBasisComplete` and two from a classifier over
  * `refundsGrossBasis + refundsUnknownBasis`. Both derivations print `≤` for a product credited
  * +£120 and −£120 on the gross basis: the boolean cannot say anything else, and the signed sum is
  * zero, which is not negative. The true figure in that case can sit £120 ABOVE the published one.
  *
- * The producer now classifies once, from the unrounded entries, and publishes the verdict. These
- * strings are the only thing left for the page to decide.
+ * Round 2 went further and removed the ingredients. `ProfitabilityRow` no longer carries a
+ * completeness boolean at all, and every bounded amount arrives paired with the INTERVAL its truth
+ * occupies. A filtered subtotal adds those intervals (`sumLinearFigureBounds`) and classifies the
+ * result once, here, at the point of display — because a subtotal containing an `upper` row and a
+ * `lower` row cannot be classified from the two verdicts alone; it needs the endpoints.
  */
-const BOUND_TITLE = 'Upper bound: some of this product\u2019s refunds in this FY are on the gross basis or have no proven basis, so they are not subtracted here'
-const BOUND_TITLE_SUMMARY = 'Upper bound: refunds on the gross basis or with no proven basis are not subtracted here'
-const INDETERMINATE_TITLE = 'Direction not established: this product\u2019s unsubtracted credit includes a NEGATIVE entry, so the true figure may be either side of this one. The figure is shown; the relation is not claimed.'
-const INDETERMINATE_TITLE_SUMMARY = 'Direction not established: the credit these totals could not subtract includes a NEGATIVE entry, so the true figure may be either side of this one. The figure is shown; the relation is not claimed.'
+const UPPER_TITLE = 'Upper bound: some of this product\u2019s refunds in this FY are on the gross basis or have no proven basis, so they are not subtracted here'
+const UPPER_TITLE_SUMMARY = 'Upper bound: refunds on the gross basis or with no proven basis are not subtracted here'
+const LOWER_TITLE = 'Lower bound: the credit this product\u2019s FY figures could not subtract is NEGATIVE throughout \u2014 a reversal, not a refund \u2014 so placing it could only RAISE this figure. The published number is a floor, never a ceiling.'
+const LOWER_TITLE_SUMMARY = 'Lower bound: the credit these totals could not subtract is NEGATIVE throughout, so placing it could only RAISE them. The published number is a floor, never a ceiling.'
+const INDETERMINATE_TITLE = 'Direction not established: this product\u2019s unsubtracted credit runs both ways, so the true figure may be either side of this one. The figure is shown; the relation is not claimed.'
+const INDETERMINATE_TITLE_SUMMARY = 'Direction not established: the credit these totals could not subtract runs both ways, so the true figure may be either side of this one. The figure is shown; the relation is not claimed.'
 
 function boundTitle(bound: DerivedFigureBound, summary = false): string | undefined {
   if (bound === 'exact') return undefined
   if (bound === 'indeterminate') return summary ? INDETERMINATE_TITLE_SUMMARY : INDETERMINATE_TITLE
-  return summary ? BOUND_TITLE_SUMMARY : BOUND_TITLE
+  if (bound === 'lower') return summary ? LOWER_TITLE_SUMMARY : LOWER_TITLE
+  return summary ? UPPER_TITLE_SUMMARY : UPPER_TITLE
 }
 
 /** The bound colour replaces any colouring that would read as a profit/loss verdict. */
 function boundTone(bound: DerivedFigureBound): string {
   return bound === 'exact' ? '' : 'text-orange-600'
+}
+
+const GROSS_BUCKET_TITLE = "Refund value recorded on the GROSS basis \u2014 not comparable with this row's ex-VAT revenue, so it is excluded from it. A SIGNED total: opposite entries cancel here, which is why the relation beside the revenue is not derived from this column."
+const UNKNOWN_BUCKET_TITLE = 'Refund value whose basis was never proved \u2014 excluded from revenue rather than guessed at. A SIGNED total, like the gross-basis column beside it.'
+
+/** Quantities are basis-independent and carry no relation; they round to the nearest hundredth. */
+function round2(value: number): number {
+  return Math.round(value * 100) / 100
+}
+
+type MarkedFigure = {
+  bound: DerivedFigureBound
+  /** The amount rounded IN THE DIRECTION ITS RELATION ALLOWS, formatted, with the mark appended. */
+  text: string
+  tone: string
+  title: string | undefined
+}
+
+/**
+ * THE ONE PLACE A NUMBER ON THIS PAGE BECOMES A CLAIM.
+ *
+ * Classify, then round in the direction the classification allows, then mark. Rounding last and
+ * rounding directionally are both load-bearing: a filtered subtotal of raw £0.024 displayed as the
+ * nearest cent is £0.02, and "at most £0.02" is false of a truth that may be £0.024 (o3d-l4zz).
+ */
+function markFigure(
+  amount: number,
+  interval: LinearFigureBoundInterval,
+  fmt: (value: number) => string,
+  summary = false,
+): MarkedFigure {
+  const bound = classifyLinearFigureBound(interval)
+  return {
+    bound,
+    text: `${fmt(roundBoundedAmountForDisplay(amount, bound))}${boundSuffix(bound)}`,
+    tone: boundTone(bound),
+    title: boundTitle(bound, summary),
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -209,8 +261,8 @@ export function ProductProfitabilityClient({ data }: Props) {
     })
 
     result = [...result].sort((a, b) => {
-      const va = getVal(a, sortCol)
-      const vb = getVal(b, sortCol)
+      const va = sortValue(a, sortCol)
+      const vb = sortValue(b, sortCol)
       if (va == null && vb == null) return 0
       if (va == null) return 1
       if (vb == null) return -1
@@ -250,26 +302,35 @@ export function ProductProfitabilityClient({ data }: Props) {
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [rows, lifecycleFilter, hideOutOfStock, targetPct, tolerancePct])
 
-  // Filtered summary (across ALL filtered rows, not just current page)
+  /**
+   * THE FILTERED SUBTOTAL — SUMMED UNROUNDED, WITH ITS BOUND FOLDED ENDPOINT BY ENDPOINT.
+   *
+   * Two things this must not do, both of which it used to (o3d-la3n).
+   *
+   * It must not fold VERDICTS. A subset holding one `≤` row and one `≥` row cannot be classified
+   * from those two marks: `[-30, 0] + [0, 0]` is still a lower bound and `[-30, 0] + [0, 5]` is not,
+   * and the verdicts are identical in both. The endpoints add; the verdicts do not.
+   *
+   * And it must not sum ROUNDED rows. Two products with raw revenue £0.014 and £0.001 of positive
+   * unplaced credit each round to £0.01, sum to £0.02, and carry a `≤` over a true aggregate of at
+   * least £0.026. The producer therefore publishes raw amounts and the rounding happens once, in
+   * `markFigure`, in the direction the relation allows (o3d-l4zz, folded into this branch).
+   */
   const filteredSummary = useMemo(() => {
-    return {
-      currentFyRevenue: filtered.reduce((s, r) => s + r.currentFyRevenue, 0),
-      currentFyRefundsGrossBasis: filtered.reduce((s, r) => s + r.currentFyRefundsGrossBasis, 0),
-      currentFyRefundsUnknownBasis: filtered.reduce((s, r) => s + r.currentFyRefundsUnknownBasis, 0),
-      // o3d-la3n: the SUBTOTAL'S OWN VERDICT, combined from the rows' published markers through the
-      // shared rule. It is deliberately NOT `filtered.every(r => r.currentFyRefundBasisComplete)`:
-      // that boolean has two values and this figure needs three. The row-level positive parts are
-      // never published, so re-forming the signed sum here is not discouraged, it is impossible.
-      currentFyRevenueBound: combineNetLinearFigureBounds(filtered.map((r) => r.currentFyRevenueBound)),
-      currentFyCogs: filtered.reduce((s, r) => s + r.currentFyCogs, 0),
-      currentFyProfit: filtered.reduce((s, r) => s + r.currentFyProfit, 0),
-      previousFyRevenue: filtered.reduce((s, r) => s + r.previousFyRevenue, 0),
-      previousFyRefundsGrossBasis: filtered.reduce((s, r) => s + r.previousFyRefundsGrossBasis, 0),
-      previousFyRefundsUnknownBasis: filtered.reduce((s, r) => s + r.previousFyRefundsUnknownBasis, 0),
-      previousFyRevenueBound: combineNetLinearFigureBounds(filtered.map((r) => r.previousFyRevenueBound)),
-      previousFyCogs: filtered.reduce((s, r) => s + r.previousFyCogs, 0),
-      previousFyProfit: filtered.reduce((s, r) => s + r.previousFyProfit, 0),
+    const fold = (pick: (r: ProfitabilityRow) => ProfitabilityFyFigures): ProfitabilityFyFigures => {
+      const parts = filtered.map(pick)
+      const sum = (get: (f: ProfitabilityFyFigures) => number) => parts.reduce((s, f) => s + get(f), 0)
+      return {
+        revenue: sum((f) => f.revenue),
+        cogs: sum((f) => f.cogs),
+        profit: sum((f) => f.profit),
+        qtySold: sum((f) => f.qtySold),
+        bound: sumLinearFigureBounds(parts.map((f) => f.bound)),
+        refundsGrossBasis: sum((f) => f.refundsGrossBasis),
+        refundsUnknownBasis: sum((f) => f.refundsUnknownBasis),
+      }
     }
+    return { currentFy: fold((r) => r.currentFy), previousFy: fold((r) => r.previousFy) }
   }, [filtered])
 
   // CSV export (all filtered rows, not just current page)
@@ -278,25 +339,30 @@ export function ProductProfitabilityClient({ data }: Props) {
     // export, and it carried the same defect the analytics route did: ONE bound column, named after
     // Revenue, standing in front of a Profit column that is equally bounded and said nothing. Each
     // bounded figure now carries its own verdict immediately to its right, in the same vocabulary
-    // the server CSV uses ('exact' / 'upper' / 'indeterminate'), so the two files read alike.
-    // `Margin %` here is unitMarginPct — list price against latest COGS — which no refund touches,
-    // so it is deliberately NOT marked.
+    // the server CSV uses ('exact' / 'upper' / 'lower' / 'indeterminate'), so the two files read
+    // alike. `Margin %` here is unitMarginPct — list price against latest COGS — which no refund
+    // touches, so it is deliberately NOT marked.
     const header = ['SKU', 'Name', 'Type', 'Status', 'Stock', 'List Price', 'Sale Price', 'Latest COGS', 'Unit Margin', 'Margin %',
       `Revenue (${summary.fyLabel})`, `Revenue bound (${summary.fyLabel})`, `Refunds gross-basis (${summary.fyLabel})`, `Refunds basis unknown (${summary.fyLabel})`, `COGS (${summary.fyLabel})`, `Profit (${summary.fyLabel})`, `Profit bound (${summary.fyLabel})`, `Qty (${summary.fyLabel})`,
       `Revenue (${summary.prevFyLabel})`, `Revenue bound (${summary.prevFyLabel})`, `Refunds gross-basis (${summary.prevFyLabel})`, `Refunds basis unknown (${summary.prevFyLabel})`, `COGS (${summary.prevFyLabel})`, `Profit (${summary.prevFyLabel})`, `Profit bound (${summary.prevFyLabel})`, `Qty (${summary.prevFyLabel})`]
-    const csvRows = filtered.map((r) => {
-      // o3d-la3n: the PRODUCER'S verdict, not a re-derivation. These two columns were classified
-      // here from `refundsGrossBasis + refundsUnknownBasis` — a SIGNED sum, one file downstream of
-      // the entries and already rounded to two places by the time it arrived.
-      const currentBound = r.currentFyRevenueBound
-      const previousBound = r.previousFyRevenueBound
+    // o3d-la3n: the file's amounts are rounded the SAME way the screen rounds them — in the
+    // direction the relation allows — so a reader who checks the `≤` against the number beside it
+    // finds it holds. A file reader has no tooltip, which is why the verdict travels as a column.
+    const csvFy = (f: ProfitabilityFyFigures) => {
+      const bound = classifyLinearFigureBound(f.bound)
+      const money = (value: number) => roundBoundedAmountForDisplay(value, 'exact')
       return [
-        r.sku, `"${r.name.replace(/"/g, '""')}"`, r.type, r.lifecycleStatus, r.totalStock,
-        r.salesPrice ?? '', r.salePrice ?? '', r.latestCogs ?? '', r.unitMargin ?? '', r.unitMarginPct ?? '',
-        r.currentFyRevenue, currentBound, r.currentFyRefundsGrossBasis, r.currentFyRefundsUnknownBasis, r.currentFyCogs, r.currentFyProfit, currentBound, r.currentFyQtySold,
-        r.previousFyRevenue, previousBound, r.previousFyRefundsGrossBasis, r.previousFyRefundsUnknownBasis, r.previousFyCogs, r.previousFyProfit, previousBound, r.previousFyQtySold,
+        roundBoundedAmountForDisplay(f.revenue, bound), bound,
+        money(f.refundsGrossBasis), money(f.refundsUnknownBasis), money(f.cogs),
+        roundBoundedAmountForDisplay(f.profit, bound), bound, round2(f.qtySold),
       ]
-    })
+    }
+    const csvRows = filtered.map((r) => [
+      r.sku, `"${r.name.replace(/"/g, '""')}"`, r.type, r.lifecycleStatus, r.totalStock,
+      r.salesPrice ?? '', r.salePrice ?? '', r.latestCogs ?? '', r.unitMargin ?? '', r.unitMarginPct ?? '',
+      ...csvFy(r.currentFy),
+      ...csvFy(r.previousFy),
+    ])
     const csv = [header.join(','), ...csvRows.map((r) => r.join(','))].join('\n')
     const blob = new Blob([csv], { type: 'text/csv' })
     const url = URL.createObjectURL(blob)
@@ -357,42 +423,55 @@ export function ProductProfitabilityClient({ data }: Props) {
       case 'latestCogs': return <span className="tabular-nums text-xs font-mono text-muted-foreground">{r.latestCogs != null ? fmtBase(r.latestCogs) : '—'}</span>
       case 'unitMarginPct': return <MarginBadge row={r} />
       // o3d-iigc/o3d-la3n: where the FY refunds could not all be placed on the net basis this
-      // figure is bounded — marked with the PRODUCER'S verdict, which can also say `?`.
-      case 'currentFyRevenue': return <span className={`tabular-nums text-xs font-mono font-medium ${boundTone(r.currentFyRevenueBound)}`} title={boundTitle(r.currentFyRevenueBound)}>{r.currentFyRevenue > 0 ? fmtBase(r.currentFyRevenue) : '—'}{boundSuffix(r.currentFyRevenueBound)}</span>
-      case 'currentFyRefundsGrossBasis': return <span className="tabular-nums text-xs font-mono text-orange-600" title="Refund value recorded on the GROSS basis — not comparable with this row's ex-VAT revenue, so it is excluded from it">{r.currentFyRefundsGrossBasis > 0 ? fmtBase(r.currentFyRefundsGrossBasis) : '—'}</span>
-      case 'currentFyRefundsUnknownBasis': return <span className="tabular-nums text-xs font-mono text-orange-600" title="Refund value whose basis was never proved — excluded from revenue rather than guessed at">{r.currentFyRefundsUnknownBasis > 0 ? fmtBase(r.currentFyRefundsUnknownBasis) : '—'}</span>
-      case 'currentFyCogs': return <span className="tabular-nums text-xs font-mono text-muted-foreground">{r.currentFyCogs > 0 ? fmtBase(r.currentFyCogs) : '—'}</span>
-      case 'currentFyProfit': return (
-        <span className={`tabular-nums text-xs font-mono ${r.currentFyRevenueBound !== 'exact' ? 'text-orange-600' : r.currentFyProfit > 0 ? 'text-green-600' : r.currentFyProfit < 0 ? 'text-destructive' : ''}`} title={boundTitle(r.currentFyRevenueBound)}>
-          {r.currentFyRevenue > 0 || r.currentFyCogs > 0 ? fmtBase(r.currentFyProfit) : '—'}{boundSuffix(r.currentFyRevenueBound)}
-        </span>
-      )
-      case 'currentFyQtySold': return <span className="tabular-nums text-xs">{r.currentFyQtySold > 0 ? r.currentFyQtySold : '—'}</span>
-      case 'previousFyRevenue': return <span className={`tabular-nums text-xs font-mono ${boundTone(r.previousFyRevenueBound)}`} title={boundTitle(r.previousFyRevenueBound)}>{r.previousFyRevenue > 0 ? fmtBase(r.previousFyRevenue) : '—'}{boundSuffix(r.previousFyRevenueBound)}</span>
-      case 'previousFyRefundsGrossBasis': return <span className="tabular-nums text-xs font-mono text-orange-600" title="Refund value recorded on the GROSS basis — not comparable with this row's ex-VAT revenue, so it is excluded from it">{r.previousFyRefundsGrossBasis > 0 ? fmtBase(r.previousFyRefundsGrossBasis) : '—'}</span>
-      case 'previousFyRefundsUnknownBasis': return <span className="tabular-nums text-xs font-mono text-orange-600" title="Refund value whose basis was never proved — excluded from revenue rather than guessed at">{r.previousFyRefundsUnknownBasis > 0 ? fmtBase(r.previousFyRefundsUnknownBasis) : '—'}</span>
-      case 'previousFyCogs': return <span className="tabular-nums text-xs font-mono text-muted-foreground">{r.previousFyCogs > 0 ? fmtBase(r.previousFyCogs) : '—'}</span>
-      case 'previousFyProfit': return (
-        <span className={`tabular-nums text-xs font-mono ${r.previousFyRevenueBound !== 'exact' ? 'text-orange-600' : r.previousFyProfit > 0 ? 'text-green-600' : r.previousFyProfit < 0 ? 'text-destructive' : ''}`} title={boundTitle(r.previousFyRevenueBound)}>
-          {r.previousFyRevenue > 0 || r.previousFyCogs > 0 ? fmtBase(r.previousFyProfit) : '—'}{boundSuffix(r.previousFyRevenueBound)}
-        </span>
-      )
-      case 'previousFyQtySold': return <span className="tabular-nums text-xs">{r.previousFyQtySold > 0 ? r.previousFyQtySold : '—'}</span>
+      // figure is bounded. The mark, the colour and the rounding all come out of `markFigure`,
+      // which classifies the PRODUCER'S interval — the cells decide nothing.
+      case 'currentFyRevenue': return <BoundedMoney fy={r.currentFy} amount={r.currentFy.revenue} show={r.currentFy.revenue > 0} className="font-medium" />
+      case 'currentFyRefundsGrossBasis': return <DisclosedMoney amount={r.currentFy.refundsGrossBasis} title={GROSS_BUCKET_TITLE} />
+      case 'currentFyRefundsUnknownBasis': return <DisclosedMoney amount={r.currentFy.refundsUnknownBasis} title={UNKNOWN_BUCKET_TITLE} />
+      case 'currentFyCogs': return <span className="tabular-nums text-xs font-mono text-muted-foreground">{r.currentFy.cogs > 0 ? fmtBase(r.currentFy.cogs) : '—'}</span>
+      case 'currentFyProfit': return <BoundedMoney fy={r.currentFy} amount={r.currentFy.profit} show={r.currentFy.revenue > 0 || r.currentFy.cogs > 0} verdictTone />
+      case 'currentFyQtySold': return <span className="tabular-nums text-xs">{r.currentFy.qtySold > 0 ? round2(r.currentFy.qtySold) : '—'}</span>
+      case 'previousFyRevenue': return <BoundedMoney fy={r.previousFy} amount={r.previousFy.revenue} show={r.previousFy.revenue > 0} />
+      case 'previousFyRefundsGrossBasis': return <DisclosedMoney amount={r.previousFy.refundsGrossBasis} title={GROSS_BUCKET_TITLE} />
+      case 'previousFyRefundsUnknownBasis': return <DisclosedMoney amount={r.previousFy.refundsUnknownBasis} title={UNKNOWN_BUCKET_TITLE} />
+      case 'previousFyCogs': return <span className="tabular-nums text-xs font-mono text-muted-foreground">{r.previousFy.cogs > 0 ? fmtBase(r.previousFy.cogs) : '—'}</span>
+      case 'previousFyProfit': return <BoundedMoney fy={r.previousFy} amount={r.previousFy.profit} show={r.previousFy.revenue > 0 || r.previousFy.cogs > 0} verdictTone />
+      case 'previousFyQtySold': return <span className="tabular-nums text-xs">{r.previousFy.qtySold > 0 ? round2(r.previousFy.qtySold) : '—'}</span>
     }
   }
 
-  // Footer totals mapping
+  /** A money cell that carries its FY's relation. `verdictTone` colours profit/loss when exact. */
+  function BoundedMoney({ fy, amount, show, verdictTone = false, className = '' }: {
+    fy: ProfitabilityFyFigures
+    amount: number
+    show: boolean
+    verdictTone?: boolean
+    className?: string
+  }) {
+    const m = markFigure(amount, fy.bound, fmtBase)
+    const tone = m.bound !== 'exact'
+      ? 'text-orange-600'
+      : verdictTone ? (amount > 0 ? 'text-green-600' : amount < 0 ? 'text-destructive' : '') : ''
+    return <span className={`tabular-nums text-xs font-mono ${tone} ${className}`} title={m.title}>{show ? m.text : '—'}</span>
+  }
+
+  /** An unplaced-credit bucket: a SIGNED total, disclosed. It carries no relation and gets no mark. */
+  function DisclosedMoney({ amount, title }: { amount: number; title: string }) {
+    return <span className="tabular-nums text-xs font-mono text-orange-600" title={title}>{amount !== 0 ? fmtBase(amount) : '—'}</span>
+  }
+
+  // Footer totals mapping. Every entry reads the FILTERED subtotal's own folded interval.
   const FOOTER_COLS: Partial<Record<ColKey, (s: typeof filteredSummary) => string>> = {
-    currentFyRevenue: (s) => `${fmtBase(s.currentFyRevenue)}${boundSuffix(s.currentFyRevenueBound)}`,
-    currentFyRefundsGrossBasis: (s) => fmtBase(s.currentFyRefundsGrossBasis),
-    currentFyRefundsUnknownBasis: (s) => fmtBase(s.currentFyRefundsUnknownBasis),
-    currentFyCogs: (s) => fmtBase(s.currentFyCogs),
-    currentFyProfit: (s) => `${fmtBase(s.currentFyProfit)}${boundSuffix(s.currentFyRevenueBound)}`,
-    previousFyRevenue: (s) => `${fmtBase(s.previousFyRevenue)}${boundSuffix(s.previousFyRevenueBound)}`,
-    previousFyRefundsGrossBasis: (s) => fmtBase(s.previousFyRefundsGrossBasis),
-    previousFyRefundsUnknownBasis: (s) => fmtBase(s.previousFyRefundsUnknownBasis),
-    previousFyCogs: (s) => fmtBase(s.previousFyCogs),
-    previousFyProfit: (s) => `${fmtBase(s.previousFyProfit)}${boundSuffix(s.previousFyRevenueBound)}`,
+    currentFyRevenue: (s) => markFigure(s.currentFy.revenue, s.currentFy.bound, fmtBase, true).text,
+    currentFyRefundsGrossBasis: (s) => fmtBase(s.currentFy.refundsGrossBasis),
+    currentFyRefundsUnknownBasis: (s) => fmtBase(s.currentFy.refundsUnknownBasis),
+    currentFyCogs: (s) => fmtBase(s.currentFy.cogs),
+    currentFyProfit: (s) => markFigure(s.currentFy.profit, s.currentFy.bound, fmtBase, true).text,
+    previousFyRevenue: (s) => markFigure(s.previousFy.revenue, s.previousFy.bound, fmtBase, true).text,
+    previousFyRefundsGrossBasis: (s) => fmtBase(s.previousFy.refundsGrossBasis),
+    previousFyRefundsUnknownBasis: (s) => fmtBase(s.previousFy.refundsUnknownBasis),
+    previousFyCogs: (s) => fmtBase(s.previousFy.cogs),
+    previousFyProfit: (s) => markFigure(s.previousFy.profit, s.previousFy.bound, fmtBase, true).text,
   }
 
   const FOOTER_TONE: Partial<Record<ColKey, (s: typeof filteredSummary) => string>> = {
@@ -402,12 +481,12 @@ export function ProductProfitabilityClient({ data }: Props) {
     currentFyRefundsUnknownBasis: () => 'text-orange-600',
     previousFyRefundsGrossBasis: () => 'text-orange-600',
     previousFyRefundsUnknownBasis: () => 'text-orange-600',
-    // o3d-iigc: an upper-bounded total is not a profit/loss verdict, so it does not get the
-    // green/red treatment that would read as one.
-    currentFyRevenue: (s) => boundTone(s.currentFyRevenueBound),
-    previousFyRevenue: (s) => boundTone(s.previousFyRevenueBound),
-    currentFyProfit: (s) => s.currentFyRevenueBound !== 'exact' ? 'text-orange-600' : s.currentFyProfit >= 0 ? 'text-green-600' : 'text-destructive',
-    previousFyProfit: (s) => s.previousFyRevenueBound !== 'exact' ? 'text-orange-600' : s.previousFyProfit >= 0 ? 'text-green-600' : 'text-destructive',
+    // o3d-iigc: a bounded total is not a profit/loss verdict, so it does not get the green/red
+    // treatment that would read as one.
+    currentFyRevenue: (s) => boundTone(classifyLinearFigureBound(s.currentFy.bound)),
+    previousFyRevenue: (s) => boundTone(classifyLinearFigureBound(s.previousFy.bound)),
+    currentFyProfit: (s) => classifyLinearFigureBound(s.currentFy.bound) !== 'exact' ? 'text-orange-600' : s.currentFy.profit >= 0 ? 'text-green-600' : 'text-destructive',
+    previousFyProfit: (s) => classifyLinearFigureBound(s.previousFy.bound) !== 'exact' ? 'text-orange-600' : s.previousFy.profit >= 0 ? 'text-green-600' : 'text-destructive',
   }
 
   /**
@@ -415,38 +494,37 @@ export function ProductProfitabilityClient({ data }: Props) {
    * ternaries off `…RefundBasisComplete`, which is exactly the shape that let o3d-7jfq fix one
    * reader of this rule and leave five behind (o3d-la3n).
    */
-  function FyCard({ period, label, value, bound = 'exact', verdictTone = false, unplaced }: {
+  function FyCard({ period, label, value, bound, verdictTone = false, disclose = false }: {
     period: string
     label: string
     value: number
-    /** The producer's verdict for this figure. Omitted where no refund can move it (COGS). */
-    bound?: DerivedFigureBound
+    /** The producer's interval for this figure. Omitted where no refund can move it (COGS). */
+    bound?: LinearFigureBoundInterval
     /** Colour the figure green/red as a profit verdict — dropped the moment it is not exact. */
     verdictTone?: boolean
-    /** The two published bucket columns, shown underneath as how loose the bound is. */
-    unplaced?: { gross: number; unknown: number }
+    /** Show how far the figure could move, underneath. */
+    disclose?: boolean
   }) {
-    const marked = bound !== 'exact'
-    const title = boundTitle(bound, true)
-    // o3d-la3n: the two bucket columns are the WIDTH of the bound only while no unplaced entry was
-    // negative — which is exactly when the verdict is `upper`. Where it is `indeterminate`, +£120
-    // and −£120 of gross-basis credit have already cancelled into the £0.00 this line would print,
-    // and "£0.00 not subtracted" beside a figure that may be £120 out is the same defect wearing a
-    // number.
-    const widthKnown = bound === 'upper'
+    // o3d-la3n r2: THE WIDTH COMES OFF THE INTERVAL, not off the two bucket columns. Those are
+    // signed sums: +£120 and −£120 of gross-basis credit have already cancelled into a £0.00 that
+    // would have been printed as "nothing left unsubtracted" beside a figure that may be £120 out.
+    // `linearFigureBoundWidth` returns null wherever no single direction applies.
+    const m = bound ? markFigure(value, bound, fmtBase, true) : null
+    const width = bound ? linearFigureBoundWidth(bound) : null
+    const marked = m != null && m.bound !== 'exact'
     return (
       <div className="rounded-md border p-3">
         <p className="text-[11px] text-muted-foreground">{period}</p>
         <p className="text-xs text-muted-foreground mt-0.5">{label}</p>
         <p
           className={`text-lg font-bold ${marked ? 'text-orange-600' : verdictTone ? (value >= 0 ? 'text-green-600' : 'text-destructive') : ''}`}
-          title={title}
-        >{fmtBase(value)}{boundSuffix(bound)}</p>
-        {marked && unplaced && (
-          <p className="text-[11px] text-orange-600 mt-0.5" title={title}>
-            {widthKnown
-              ? <>Not subtracted: {fmtBase(unplaced.gross)} gross &middot; {fmtBase(unplaced.unknown)} basis ?</>
-              : 'Direction not established \u2014 some credit these totals could not subtract is negative'}
+          title={m?.title}
+        >{m ? m.text : fmtBase(value)}</p>
+        {marked && disclose && (
+          <p className="text-[11px] text-orange-600 mt-0.5" title={m.title}>
+            {m.bound === 'upper' ? <>Not subtracted: up to {fmtBase(width ?? 0)} of credit</>
+              : m.bound === 'lower' ? <>Not subtracted: up to {fmtBase(width ?? 0)} of NEGATIVE credit</>
+              : 'Direction not established \u2014 the credit these totals could not subtract runs both ways'}
           </p>
         )}
       </div>
@@ -471,24 +549,22 @@ export function ProductProfitabilityClient({ data }: Props) {
       {/* Summary cards */}
       <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-3">
         <FyCard
-          period={summary.fyLabel} label="Revenue" value={filteredSummary.currentFyRevenue}
-          bound={filteredSummary.currentFyRevenueBound}
-          unplaced={{ gross: filteredSummary.currentFyRefundsGrossBasis, unknown: filteredSummary.currentFyRefundsUnknownBasis }}
+          period={summary.fyLabel} label="Revenue" value={filteredSummary.currentFy.revenue}
+          bound={filteredSummary.currentFy.bound} disclose
         />
-        <FyCard period={summary.fyLabel} label="COGS" value={filteredSummary.currentFyCogs} />
+        <FyCard period={summary.fyLabel} label="COGS" value={filteredSummary.currentFy.cogs} />
         <FyCard
-          period={summary.fyLabel} label="Profit" value={filteredSummary.currentFyProfit}
-          bound={filteredSummary.currentFyRevenueBound} verdictTone
+          period={summary.fyLabel} label="Profit" value={filteredSummary.currentFy.profit}
+          bound={filteredSummary.currentFy.bound} verdictTone
         />
         <FyCard
-          period={summary.prevFyLabel} label="Revenue" value={filteredSummary.previousFyRevenue}
-          bound={filteredSummary.previousFyRevenueBound}
-          unplaced={{ gross: filteredSummary.previousFyRefundsGrossBasis, unknown: filteredSummary.previousFyRefundsUnknownBasis }}
+          period={summary.prevFyLabel} label="Revenue" value={filteredSummary.previousFy.revenue}
+          bound={filteredSummary.previousFy.bound} disclose
         />
-        <FyCard period={summary.prevFyLabel} label="COGS" value={filteredSummary.previousFyCogs} />
+        <FyCard period={summary.prevFyLabel} label="COGS" value={filteredSummary.previousFy.cogs} />
         <FyCard
-          period={summary.prevFyLabel} label="Profit" value={filteredSummary.previousFyProfit}
-          bound={filteredSummary.previousFyRevenueBound} verdictTone
+          period={summary.prevFyLabel} label="Profit" value={filteredSummary.previousFy.profit}
+          bound={filteredSummary.previousFy.bound} verdictTone
         />
       </div>
 
@@ -700,8 +776,38 @@ export function ProductProfitabilityClient({ data }: Props) {
   )
 }
 
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-function getVal(row: any, field: string): string | number | null {
-  const v = row[field]
-  return v === undefined ? null : v
+/**
+ * THE SORT KEY FOR A COLUMN.
+ *
+ * It used to be `row[field]`, which worked only because every column was a flat field on the row.
+ * The FY figures now live behind `currentFy` / `previousFy` — the public view model that carries an
+ * interval beside each bounded amount instead of the completeness boolean a consumer could rebuild
+ * the old rule from (o3d-la3n r2) — so the mapping is explicit. Sorting uses the UNROUNDED amount:
+ * the display rounding is directional and would order two near-equal rows by their marks.
+ */
+function sortValue(row: ProfitabilityRow, field: string): string | number | null {
+  switch (field as ColKey) {
+    case 'sku': return row.sku
+    case 'name': return row.name
+    case 'type': return row.type
+    case 'lifecycleStatus': return row.lifecycleStatus
+    case 'totalStock': return row.totalStock
+    case 'salesPrice': return row.salesPrice
+    case 'salePrice': return row.salePrice
+    case 'latestCogs': return row.latestCogs
+    case 'unitMarginPct': return row.unitMarginPct
+    case 'currentFyRevenue': return row.currentFy.revenue
+    case 'currentFyRefundsGrossBasis': return row.currentFy.refundsGrossBasis
+    case 'currentFyRefundsUnknownBasis': return row.currentFy.refundsUnknownBasis
+    case 'currentFyCogs': return row.currentFy.cogs
+    case 'currentFyProfit': return row.currentFy.profit
+    case 'currentFyQtySold': return row.currentFy.qtySold
+    case 'previousFyRevenue': return row.previousFy.revenue
+    case 'previousFyRefundsGrossBasis': return row.previousFy.refundsGrossBasis
+    case 'previousFyRefundsUnknownBasis': return row.previousFy.refundsUnknownBasis
+    case 'previousFyCogs': return row.previousFy.cogs
+    case 'previousFyProfit': return row.previousFy.profit
+    case 'previousFyQtySold': return row.previousFy.qtySold
+    default: return null
+  }
 }
