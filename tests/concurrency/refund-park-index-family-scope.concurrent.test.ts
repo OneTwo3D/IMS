@@ -93,12 +93,27 @@ type ProbeRow = {
   recordKind: string | null
 }
 
-/** PostgreSQL's unique-violation SQLSTATE, which is the only outcome that matters here. */
+/** PostgreSQL's unique-violation SQLSTATE. */
 const UNIQUE_VIOLATION = '23505'
 
-function isUniqueViolation(error: unknown): boolean {
-  const text = error instanceof Error ? `${error.message}${'code' in error ? String((error as { code?: unknown }).code) : ''}` : String(error)
-  return text.includes(UNIQUE_VIOLATION) || text.includes('P2002') || /unique constraint/i.test(text)
+/**
+ * A unique violation FROM THIS INDEX, not from any index.
+ *
+ * "some 23505 was raised" is the adjacent property, and it is the one a looser check would
+ * establish: `shopping_sync_logs` also has a primary key, and a duplicate probe id would satisfy a
+ * bare unique-violation assertion while proving nothing about the partial index at all. So the
+ * error has to NAME the index or the two columns it is keyed on — which the adapter does, either as
+ * the constraint name or as Prisma's "Unique constraint failed on the fields: (`connector`,
+ * `"externalId"`)".
+ */
+function isRefundParkIndexViolation(error: unknown): boolean {
+  const text = error instanceof Error
+    ? `${error.message}${'code' in error ? String((error as { code?: unknown }).code) : ''}`
+    : String(error)
+  const unique = text.includes(UNIQUE_VIOLATION) || text.includes('P2002') || /unique constraint/i.test(text)
+  const named = text.includes(ACTIVE_REFUND_PARK_INDEX_NAME)
+    || (text.includes('connector') && text.includes('externalId'))
+  return unique && named
 }
 
 function makeFixture() {
@@ -201,7 +216,10 @@ test('o3d-272i r2: two actionable refund parks on one (connector, externalId) st
     }
 
     assert.ok(raised !== null, `a second actionable park on ${colliding} must be refused by ${ACTIVE_REFUND_PARK_INDEX_NAME}`)
-    assert.ok(isUniqueViolation(raised), `expected a unique violation, got: ${String(raised)}`)
+    assert.ok(
+      isRefundParkIndexViolation(raised),
+      `expected a unique violation naming ${ACTIVE_REFUND_PARK_INDEX_NAME} or its key columns, got: ${String(raised)}`,
+    )
   } finally {
     await cleanUp(db, probe)
   }
