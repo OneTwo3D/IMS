@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict'
 import { randomUUID } from 'node:crypto'
-import test from 'node:test'
+import { appendFileSync } from 'node:fs'
+import test, { type TestContext } from 'node:test'
 import { config } from 'dotenv'
 
 import {
@@ -51,7 +52,37 @@ import { buildAccountingEventIdempotencyKey } from '../../lib/domain/accounting/
  * tests/db/*.
  */
 
+/**
+ * o3d-11rf r13 (Codex r13, HIGH) — THE GATE THAT REMOVED THE WHOLE SUITE AND SAID NOTHING.
+ *
+ * Every test below is `{ skip }`, and `skip` was true whenever `RUN_DB_MIGRATION_TESTS` was unset —
+ * which, until r13, was EVERY environment that exists, because no checked-in workflow set it and no
+ * npm script passed it. `npm run test:unit`'s glob (`tests/**` + `*.test.ts`) COLLECTS this file on
+ * every CI run, so the gate reported fifteen skipped tests inside a green suite. Five rounds of
+ * evidence — the ownership join, the truncation containment, the fold parity, the Turkish locale —
+ * were checked in in a form that never ran, and a reader of the CI log had nothing to tell them so.
+ *
+ * WHAT IS DIFFERENT NOW. `npm run test:db` (schema-guardrails.yml, job `accounting-db-regressions`)
+ * sets BOTH variables against a `postgres:16` service migrated by `prisma migrate deploy`. The
+ * second variable is the tripwire: `REQUIRE_DB_MIGRATION_TESTS=1` says "this environment PROMISED a
+ * database", so a `RUN_DB_MIGRATION_TESTS` that is not also `1` is a wiring defect, and the module
+ * refuses to load rather than skipping fifteen tests under it. An unset pair is still an ordinary
+ * local run and still skips.
+ *
+ * THE STANDING GUARD IS ELSEWHERE, because a test that skips cannot police its own invocation:
+ * `tests/db-suite-ci-wiring.test.ts` runs in `npm run test:unit` WITHOUT a database and fails when
+ * any file gated on `RUN_DB_MIGRATION_TESTS` is not named by a CI job that sets it.
+ */
 const skip = process.env.RUN_DB_MIGRATION_TESTS !== '1'
+
+if (skip && process.env.REQUIRE_DB_MIGRATION_TESTS === '1') {
+  throw new Error(
+    'REQUIRE_DB_MIGRATION_TESTS=1 but RUN_DB_MIGRATION_TESTS is not 1, so every test in '
+    + 'tests/db/reconciliation-void-mirror-contradictions.test.ts would have been skipped in an '
+    + 'environment that promised a migrated database. Fix the invocation (npm run test:db) rather '
+    + 'than this check: a silent skip here is the o3d-11rf r13 finding.',
+  )
+}
 
 /** The cap the OLD code loaded its event page under. Restated here because the point is to exceed it. */
 const PREVIOUS_EVENT_PAGE_CAP = 10_000
@@ -1502,10 +1533,37 @@ async function withTurkishDatabase<T>(fn: (run: Sql, name: string) => Promise<T>
   const name = `ims_11rf12_${randomUUID().replace(/-/g, '').slice(0, 16)}`
   let created = false
   try {
+    // o3d-11rf r13 — THE PROBE HAD TO SURVIVE THE CI IMAGE, AND IT DID NOT.
+    //
+    // `pg_collation.colllocale` is a PostgreSQL 17 COLUMN NAME. PostgreSQL 16 — which is what
+    // `.github/workflows/schema-guardrails.yml` runs, and what the new job runs — calls the same
+    // column `colliculocale` (renamed in 17). The old spelling therefore did not return zero rows on
+    // a 16: it raised `column "colllocale" does not exist`, and the four locale tests would have gone
+    // RED on the very runner this round wired them into, for a reason that has nothing to do with
+    // the finding. Reading the column out of `to_jsonb(c)` asks for a KEY rather than a column, so a
+    // name that is absent is NULL instead of an error, and one statement answers on both versions.
+    //
+    // TWO COUNTS, NOT ONE, because the two ways this can come back empty are not the same fact:
+    //   - no ICU collations AT ALL — the server was built without ICU, there is no `tr-TR` to ask
+    //     for, and the honest outcome is a skip that says so (see `skipUnprovenLocaleHalf`);
+    //   - ICU present but `tr-TR` absent — `tr` is core CLDR, so this is not an image without
+    //     Turkish, it is THIS PROBE being wrong (a third column rename, a canonicalisation change).
+    //     Skipping on it would silently retire the locale half, so it FAILS instead.
     const { rows } = await admin.query(
-      'SELECT 1 FROM pg_collation WHERE collprovider = $1 AND colllocale = $2', ['i', TURKISH_ICU_LOCALE],
+      `SELECT count(*) FILTER (
+                WHERE coalesce(to_jsonb(c) ->> 'colllocale', to_jsonb(c) ->> 'colliculocale') = $1
+              )::int AS "turkish",
+              count(*)::int AS "icu"
+         FROM pg_collation c
+        WHERE c.collprovider = 'i'`,
+      [TURKISH_ICU_LOCALE],
     )
-    if (rows.length === 0) return null
+    const available = (rows as Array<{ turkish: number; icu: number }>)[0]
+    if (!available || available.icu === 0) return null
+    assert.ok(available.turkish > 0,
+      `this PostgreSQL has ${available.icu} ICU collations but none for ${TURKISH_ICU_LOCALE}. `
+      + 'tr is a core CLDR locale, so this is this probe being wrong rather than a server without '
+      + 'Turkish — fix the probe. Skipping here would retire the locale half of o3d-11rf r12 silently.')
     // LOCALE 'C' with an ICU locale beside it sets the libc side to C and leaves ICU deciding
     // `lower()` — which is the configuration under test. UTF8 because ICU refuses SQL_ASCII.
     await admin.query(
@@ -1544,6 +1602,42 @@ async function withTurkishDatabase<T>(fn: (run: Sql, name: string) => Promise<T>
     if (created) await admin.query(`DROP DATABASE IF EXISTS "${name}" WITH (FORCE)`)
     await admin.end()
   }
+}
+
+/**
+ * o3d-11rf r13 — AN ABSENT PROOF MUST NOT READ AS A PASSING ONE.
+ *
+ * `withTurkishDatabase` returns `null` on a PostgreSQL built without ICU, and the four locale tests
+ * then skip. `t.skip()` alone is a line in a TAP stream nobody reads: on a green job it is
+ * indistinguishable from a pass, which is the shape of the r13 finding one level down. So the skip
+ * ALSO announces itself in the two places a CI reader actually looks:
+ *
+ *   - `$GITHUB_STEP_SUMMARY`, a file GitHub renders on the job page. This is the reliable one, it is
+ *     an ordinary append, and it is what a reviewer sees without opening a log.
+ *   - a `::warning::` line, which GitHub turns into a yellow annotation. Best effort — the test
+ *     runner may wrap this file's stdout in TAP — so it is never the only channel.
+ *   - stderr, unconditionally, so a local run says it too.
+ *
+ * WHICH HALF IS THEN PROTECTED, stated rather than implied: the eleven non-locale tests still ran
+ * against the migrated database; the four `TURKISH-locale` ones did not run at all.
+ */
+function skipUnprovenLocaleHalf(t: TestContext, half: string) {
+  const message = `this PostgreSQL was built without ICU, so no ${TURKISH_ICU_LOCALE} database could `
+    + `be created and ${half} is NOT proved on this run. The other tests in this file DID run; the `
+    + 'four TURKISH-locale ones did not.'
+  process.stderr.write(`\n!! UNPROVEN: ${message}\n`)
+  if (process.env.GITHUB_ACTIONS === 'true') {
+    process.stdout.write(`::warning title=o3d-11rf locale half not proved::${message}\n`)
+  }
+  const summary = process.env.GITHUB_STEP_SUMMARY
+  if (summary) {
+    try {
+      appendFileSync(summary, `- **UNPROVEN (o3d-11rf r12 locale half):** ${message}\n`)
+    } catch {
+      // A summary file that cannot be written must not fail the suite; stderr above already said it.
+    }
+  }
+  t.skip(message)
 }
 
 /** `buildAccountingEventIdempotencyKey`'s per-part normalisation, in JavaScript, for one part. */
@@ -1587,8 +1681,7 @@ test('o3d-11rf r12: an ordinary ASCII I derives the SAME key on a TURKISH-locale
   })
 
   if (!measured) {
-    t.skip('this PostgreSQL has no ICU tr-TR collation, so no Turkish database could be created and '
-      + 'the locale half of o3d-11rf r12 is NOT proved on this run')
+    skipUnprovenLocaleHalf(t, 'the locale half of o3d-11rf r12')
     return
   }
   const { fold, derived } = measured
@@ -1692,8 +1785,7 @@ test('o3d-11rf r12: the WHOLE production statement, run on a TURKISH-locale data
   })
 
   if (!measured) {
-    t.skip('this PostgreSQL has no ICU tr-TR collation, so no Turkish database could be created and '
-      + 'the locale half of o3d-11rf r12 is NOT proved on this run')
+    skipUnprovenLocaleHalf(t, 'the locale half of o3d-11rf r12')
     return
   }
   const { found, derived } = measured
@@ -1805,8 +1897,7 @@ test('o3d-11rf r12: a NONDETERMINISTIC collation on the document-id column does 
   })
 
   if (!measured) {
-    t.skip('this PostgreSQL has no ICU tr-TR collation, so no scratch database could be created and '
-      + 'the collation half of o3d-11rf r12 is NOT proved on this run')
+    skipUnprovenLocaleHalf(t, 'the nondeterministic-collation half of o3d-11rf r12')
     return
   }
   const { refusal, pinned, found } = measured
@@ -1828,8 +1919,7 @@ test('o3d-11rf r12: every code point again, on a TURKISH-locale database', { ski
   ))
 
   if (!measured) {
-    t.skip('this PostgreSQL has no ICU tr-TR collation, so no Turkish database could be created and '
-      + 'the locale half of o3d-11rf r12 is NOT proved on this run')
+    skipUnprovenLocaleHalf(t, 'the every-code-point locale half of o3d-11rf r12')
     return
   }
   const { disagreements, rivalWrong, rivalCharacters, swept } = measured

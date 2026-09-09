@@ -56,6 +56,46 @@ Focused tests can also be run directly:
 npx tsx --test tests/<relevant-file>.test.ts
 ```
 
+### Database-backed tiers
+
+Two tiers need a real, migrated PostgreSQL and are therefore **not** part of `npm run test:unit`.
+Both are gated on an environment variable, and both are wired into CI so that the gate is closed
+only where there is genuinely no database:
+
+```bash
+npm run test:concurrency   # RUN_DB_CONCURRENCY_TESTS=1, tests/concurrency/**
+npm run test:db            # RUN_DB_MIGRATION_TESTS=1,   tests/db/**
+```
+
+`npm run test:unit`'s glob (`tests/**/*.test.ts`) **collects** the gated files anyway and reports
+them as skips, so a missing variable removes whole suites from a run that still reads as green.
+That is not a hypothetical: until o3d-11rf r13, `RUN_DB_MIGRATION_TESTS` was set by nothing in the
+repository, and both files under `tests/db/` that gate on it — the accounting reconciliation
+regressions and the void-basis backfill — had never executed in CI at all. Three things now stop
+that recurring:
+
+- `.github/workflows/schema-guardrails.yml` job **`accounting-db-regressions`** runs
+  `npm run test:db` against a `postgres:16` service migrated with `prisma migrate deploy`, beside
+  (not inside) the `fresh-db-drift` job, so the two do not share a database or a verdict.
+- `test:db` sets **`REQUIRE_DB_MIGRATION_TESTS=1`** alongside `RUN_DB_MIGRATION_TESTS=1`. A gated
+  file that finds the first set and the second not throws on load instead of skipping — a
+  half-wired invocation fails loudly rather than quietly running nothing.
+- `tests/db-suite-ci-wiring.test.ts` runs in `npm run test:unit` **without** a database and fails
+  when any file gated on `RUN_DB_MIGRATION_TESTS` is not reachable from `npm run test:db`, when no
+  workflow job runs that script against a migrated service, or when the workflow's path filters
+  would not trigger on a change to the gated file itself.
+
+Four tests inside `tests/db/reconciliation-void-mirror-contradictions.test.ts` additionally create a
+scratch database with the ICU `tr-TR` locale, to prove the collation pin on the reconciliation
+statement's `lower()` fold. On a PostgreSQL built without ICU those four **skip and say so** — on
+stderr, as a GitHub `::warning::` annotation and in the job summary — while the rest of the file
+still runs. A server that has ICU but no `tr-TR` **fails** instead: `tr` is a core CLDR locale, so
+that combination means the probe is wrong rather than the server incomplete.
+
+To run either tier locally, point `DATABASE_URL` at a scratch database you do not mind writing to
+(the suites roll their probes back, but they do write) and make sure the role can `CREATEDB` — the
+locale tests need it.
+
 ### Full-chain E2E tier
 
 `e2e/full-chain/` is a separate, opt-in tier that originates a real order in the stage

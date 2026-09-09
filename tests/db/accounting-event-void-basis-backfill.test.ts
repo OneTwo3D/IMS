@@ -35,9 +35,27 @@ import { config } from 'dotenv'
  *
  * Gated behind RUN_DB_MIGRATION_TESTS=1: `npm run test:unit` has no database. Imports are RELATIVE
  * for the same reason as tests/concurrency/* and tests/db/*.
+ *
+ * o3d-11rf r13 — AND UNTIL r13 NOTHING SET THAT VARIABLE. This file was collected by
+ * `npm run test:unit`'s glob on every CI run and skipped whole, silently, inside a green suite. It
+ * now runs under `npm run test:db` (schema-guardrails.yml, job `accounting-db-regressions`), which
+ * sets `REQUIRE_DB_MIGRATION_TESTS=1` alongside it: that second variable means "this environment
+ * promised a migrated database", so a gate that is still closed under it is a wiring defect and
+ * this module refuses to load rather than reporting a silent skip. An unset pair is an ordinary
+ * local run and still skips. `tests/db-suite-ci-wiring.test.ts` is the standing guard that keeps a
+ * CI job naming this file at all.
  */
 
 const skip = process.env.RUN_DB_MIGRATION_TESTS !== '1'
+
+if (skip && process.env.REQUIRE_DB_MIGRATION_TESTS === '1') {
+  throw new Error(
+    'REQUIRE_DB_MIGRATION_TESTS=1 but RUN_DB_MIGRATION_TESTS is not 1, so every test in '
+    + 'tests/db/accounting-event-void-basis-backfill.test.ts would have been skipped in an '
+    + 'environment that promised a migrated database. Fix the invocation (npm run test:db) rather '
+    + 'than this check: a silent skip here is the o3d-11rf r13 finding.',
+  )
+}
 
 const MIGRATION_SQL = path.join(
   process.cwd(),
