@@ -382,7 +382,15 @@ test('resolvePurchaseOrderBackReference counts the whole population for the PO, 
   assert.equal(calls.lastCountWhere?.type, 'PURCHASE_INVOICE')
   assert.equal(calls.lastCountWhere?.referenceType, 'PurchaseOrder')
   assert.equal(calls.lastCountWhere?.referenceId, 'po-1')
-  assert.deepEqual(calls.lastCountWhere?.status, { in: ['PENDING', 'PROCESSING', 'SYNCED', 'FAILED'] })
+  // o3d-f709: POST EVIDENCE ALONE, and NO status clause at all. This used to assert
+  // `{ in: ['PENDING','PROCESSING','SYNCED','FAILED'] }` beside the evidence clause — the longhand
+  // spelling of `status != 'CANCELLED'`, ANDed with it, so the two INTERSECTED and a CANCELLED row
+  // carrying a ledger-issued bill id was dropped from the count entirely.
+  //
+  // The absence is asserted on the KEY, not by omitting an assertion: a test that simply stopped
+  // checking `status` would pass with the exclusion back in place, which is how this defect
+  // survived its own regression test in the sweep suite.
+  assert.equal('status' in (calls.lastCountWhere ?? {}), false, 'the status must not be asked at all')
   assert.deepEqual(calls.lastCountWhere?.externalTransactionId, { not: null })
   assert.deepEqual(calls.lastBillWhere, { poId: 'po-1', accountingInvoiceId: null })
 })
