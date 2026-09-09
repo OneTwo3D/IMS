@@ -44,9 +44,12 @@ const MIRROR_CONTRADICTING_SYNC_STATUSES = ['PENDING', 'PROCESSING'] as const
  *
  * THE SET IS ECMAScript's, ENUMERATED: WhiteSpace ∪ LineTerminator — tab, LF, VT, FF, CR, space,
  * NBSP, BOM, the Unicode space separators, and the two line separators. Spelled out rather than
- * described because NO SQL character class is this set. PostgreSQL's `[[:space:]]` (and `\s`, which
- * is the same class) follows the database ctype: it excludes NBSP and includes U+0085 NEL, and
- * JavaScript disagrees with it on both. `tests/domain/accounting/reconciliation.test.ts` derives the
+ * described because NO SQL character class is this set — and worse, `[[:space:]]` (and `\s`, which is
+ * the same class) is not a FIXED set at all: it follows the database ctype. Measured on this estate's
+ * C-ctype SQL_ASCII databases it misses NBSP, the BOM, and every Unicode space separator, all of
+ * which JavaScript trims; under a glibc UTF-8 ctype it additionally picks up U+0085 NEL, which
+ * JavaScript does NOT trim. Wrong in both directions, and which way depends on the database it runs
+ * on. `tests/domain/accounting/reconciliation.test.ts` derives the
  * set from the running engine and asserts the statement sends exactly this one, so a JavaScript that
  * one day trims one more character cannot leave this list behind quietly.
  */

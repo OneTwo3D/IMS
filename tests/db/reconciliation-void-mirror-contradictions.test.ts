@@ -819,7 +819,7 @@ const PAYLOAD_SHAPES: Array<{ label: string; payload: unknown; keys: number; typ
   { label: 'a NEWLINE-only one likewise', payload: { _idempotencyKey: '\u000a', date: '2026-01-06' }, keys: 2 },
   { label: 'a CARRIAGE RETURN, and the CRLF pair a pasted value carries', payload: { _idempotencyKey: '\u000d\u000a', date: '2026-01-07' }, keys: 2 },
   { label: 'a VERTICAL TAB and a FORM FEED', payload: { _idempotencyKey: '\u000b\u000c', date: '2026-01-08' }, keys: 2 },
-  { label: 'a NON-BREAKING SPACE, which PostgreSQL\u2019s own ctype class does NOT call whitespace', payload: { _idempotencyKey: '\u00a0', date: '2026-01-09' }, keys: 2 },
+  { label: 'a NON-BREAKING SPACE, which this database\u2019s own ctype class does NOT call whitespace', payload: { _idempotencyKey: '\u00a0', date: '2026-01-09' }, keys: 2 },
   { label: 'a BYTE ORDER MARK, which JavaScript trims and Unicode does not call a space', payload: { _idempotencyKey: '\ufeff', date: '2026-01-10' }, keys: 2 },
   { label: 'an EN QUAD, a Unicode space separator', payload: { _idempotencyKey: '\u2000', date: '2026-01-11' }, keys: 2 },
   { label: 'a LINE SEPARATOR, which is a LineTerminator rather than a space', payload: { _idempotencyKey: '\u2028', date: '2026-01-12' }, keys: 2 },
@@ -900,11 +900,11 @@ test('o3d-11rf r9: the SQL key derivation is the TypeScript one, branch for bran
     // o3d-11rf r10 — U+0085 NEL and U+200B ZWSP join it, and they are the NEAR MISSES rather than more
     // of the same. JavaScript does NOT trim either, so both are PRESENT tokens that normalise away,
     // exactly like '!!!'. They are what separates the blank test the statement now asks from the two
-    // plausible wrong ones: PostgreSQL's ctype-driven `[[:space:]]` calls NEL whitespace, and a
-    // `btrim(v, characters)` set built from the trimmable characters holds the bytes C2 and 85, so it
-    // eats NEL outright — every database in this estate being SQL_ASCII, where character operations
-    // are byte operations. Either mistake reads these rows as having no payload key, falls through to
-    // the row form, and reports the fallthrough event below.
+    // plausible wrong ones: a `btrim(v, characters)` set built from the trimmable characters holds the
+    // bytes C2 and 85, so it eats NEL outright — every database in this estate being SQL_ASCII, where
+    // character operations are BYTE operations — and PostgreSQL's ctype-driven `[[:space:]]` calls NEL
+    // whitespace wherever the database ctype is a glibc UTF-8 one. Either mistake reads these rows as
+    // having no payload key, falls through to the row form, and reports the fallthrough event below.
     const unbuildable = [
       { suffix: 'junk', token: '!!!' },
       { suffix: 'nel', token: '\u0085' },
@@ -1025,9 +1025,10 @@ test('o3d-11rf r10: a TAB _idempotencyKey derives the SAME keys in SQL as in Typ
  *
  * THE DECOYS ARE THE POINT AS MUCH AS THE SET IS. U+0085 NEL and U+200B ZWSP are NOT trimmed by
  * JavaScript, and U+201A is an ordinary punctuation mark. Each is a character one of the plausible
- * wrong spellings gets wrong: `[[:space:]]` calls NEL whitespace, and `btrim(v, characters)` — the
- * obvious fix — chews all three, because every database in this estate is SQL_ASCII and its character
- * sets are BYTE sets. That is why the predicate is an alternation of whole characters.
+ * wrong spellings gets wrong: `btrim(v, characters)` — the obvious fix — chews NEL and U+201A to
+ * nothing, because every database in this estate is SQL_ASCII and its character sets are BYTE sets;
+ * and `[[:space:]]` calls NEL whitespace under a UTF-8 ctype while missing NBSP, the BOM and every
+ * space separator under this one. That is why the predicate is an alternation of whole characters.
  */
 test('o3d-11rf r10: PostgreSQL agrees with JavaScript trim() on every character, and on the near misses', { skip }, async () => {
   const trimmable: string[] = []
