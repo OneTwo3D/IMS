@@ -17,9 +17,14 @@ import {
 } from '@/lib/domain/integrations/outbox'
 import {
   INTEGRATION_OUTBOX_REGISTRY,
+  integrationOutboxStaleReclaimScope,
   parseIntegrationOutboxPayload,
   WcStockSyncOutboxPayloadSchema,
 } from '@/lib/domain/integrations/outbox-registry'
+import {
+  OUTBOX_REPLAY_SAFETY_VALUES,
+  outboxReplayPolicyGrantsStaleReclaim,
+} from '@/lib/domain/integrations/outbox-replay-policy'
 import { adapterUniqueViolation, legacyUniqueViolation } from '@/tests/helpers/prisma-unique-error'
 
 type FindManyArgs = {
@@ -39,7 +44,7 @@ type MockUpdateData = Omit<Partial<IntegrationOutboxRow>, 'attempts'> & {
 type MockWhere = {
   id?: string
   connector?: string
-  operation?: string
+  operation?: string | { in?: string[] }
   idempotencyKey?: { in?: string[] }
   status?: string | { in?: string[] }
   attempts?: number | { lt?: number; gte?: number }
@@ -118,7 +123,10 @@ function makeClient(
     if (where.OR && !where.OR.some((branch) => matchesWhere(row, branch))) return false
     if (where.id && row.id !== where.id) return false
     if (where.connector && row.connector !== where.connector) return false
-    if (where.operation && row.operation !== where.operation) return false
+    if (typeof where.operation === 'string' && row.operation !== where.operation) return false
+    if (typeof where.operation === 'object' && where.operation.in && !where.operation.in.includes(row.operation)) {
+      return false
+    }
     if (where.idempotencyKey?.in && !where.idempotencyKey.in.includes(row.idempotencyKey)) return false
     if (typeof where.status === 'string' && row.status !== where.status) return false
     if (typeof where.status === 'object' && where.status.in && !where.status.in.includes(row.status)) return false
@@ -795,4 +803,104 @@ test('integration outbox completion rejects stale worker claims after reclaim', 
   assert.equal(rows[0].status, INTEGRATION_OUTBOX_STATUS.PROCESSING)
   assert.equal(rows[0].lockedBy, 'worker-2')
   assert.deepEqual(rows[0].lockedAt, workerTwoLock)
+})
+
+// ---------------------------------------------------------------------------
+// o3d-8td2 — the stale-lock reclaim is granted per OPERATION, on its declared
+// replay safety, and not on elapsed time alone.
+// ---------------------------------------------------------------------------
+
+test('every registered outbox operation declares a known replay-safety answer', () => {
+  const declared: Array<{ key: string; replay: string }> = []
+  for (const [connector, operations] of Object.entries(INTEGRATION_OUTBOX_REGISTRY)) {
+    for (const [operation, entry] of Object.entries(operations)) {
+      declared.push({ key: `${connector}/${operation}`, replay: entry.replay })
+    }
+  }
+  // The walk itself is asserted, not just its verdict: a registry this loop failed to enumerate
+  // would otherwise pass by examining nothing.
+  assert.ok(declared.length >= 6, `expected the registry walk to reach every operation, saw ${declared.length}`)
+  for (const { key, replay } of declared) {
+    assert.ok(
+      (OUTBOX_REPLAY_SAFETY_VALUES as readonly string[]).includes(replay),
+      `${key} declares an unknown replay-safety answer: ${replay}`,
+    )
+  }
+  assert.deepEqual(
+    declared.map((entry) => entry.key).sort(),
+    [
+      'accounting/landed-cost.adjustment-journal',
+      'mintsoft/inbound.booked-in',
+      'sales/refund.reservation-release',
+      'sales/refund.unmatched-warning',
+      'woocommerce/stock.push',
+      'xero/accounting.post',
+    ],
+    'a new outbox operation was registered — assess its replay safety on o3d-8td2 before adding it here',
+  )
+})
+
+test('only the unsafe replay answer withholds a stale-lock reclaim', () => {
+  assert.equal(outboxReplayPolicyGrantsStaleReclaim('local-only-guarded'), true)
+  assert.equal(outboxReplayPolicyGrantsStaleReclaim('remote-write-idempotent'), true)
+  assert.equal(outboxReplayPolicyGrantsStaleReclaim('remote-write-fenced-by-consumer'), true)
+  assert.equal(outboxReplayPolicyGrantsStaleReclaim('unsafe-to-replay'), false)
+})
+
+test('the stale-reclaim scope fails closed on an operation this build does not know', () => {
+  assert.deepEqual(integrationOutboxStaleReclaimScope('woocommerce', 'stock.push'), {})
+  assert.equal(integrationOutboxStaleReclaimScope('woocommerce', 'legacy.unregistered'), null)
+  assert.equal(integrationOutboxStaleReclaimScope('no-such-connector', 'stock.push'), null)
+  assert.equal(integrationOutboxStaleReclaimScope('no-such-connector', undefined), null)
+  assert.equal(integrationOutboxStaleReclaimScope(undefined, 'stock.push'), null)
+  assert.deepEqual(
+    integrationOutboxStaleReclaimScope('sales', undefined),
+    { operation: { in: ['refund.reservation-release', 'refund.unmatched-warning'] } },
+  )
+  const unscoped = integrationOutboxStaleReclaimScope(undefined, undefined) as { OR: Array<{ connector: string }> }
+  assert.deepEqual(
+    unscoped.OR.map((scope) => scope.connector).sort(),
+    ['accounting', 'mintsoft', 'sales', 'woocommerce', 'xero'],
+  )
+})
+
+test('a stale PROCESSING lock is reclaimed per operation, not on elapsed time alone', async () => {
+  const workerOneLock = new Date('2026-04-27T09:45:00.000Z')
+  const now = new Date('2026-04-27T10:00:00.000Z')
+  const { client, rows } = makeClient([
+    makeRow({
+      id: 'declared-safe',
+      operation: 'stock.push',
+      idempotencyKey: 'woocommerce:stock.push:sku-1',
+      status: INTEGRATION_OUTBOX_STATUS.PROCESSING,
+      lockedAt: workerOneLock,
+      lockedBy: 'worker-1',
+      createdAt: new Date('2026-04-27T09:00:00.000Z'),
+    }),
+    makeRow({
+      id: 'undeclared',
+      operation: 'legacy.unregistered',
+      idempotencyKey: 'woocommerce:legacy.unregistered:sku-2',
+      status: INTEGRATION_OUTBOX_STATUS.PROCESSING,
+      lockedAt: workerOneLock,
+      lockedBy: 'worker-1',
+      createdAt: new Date('2026-04-27T09:01:00.000Z'),
+    }),
+  ])
+
+  const reclaimed = await claimIntegrationOutboxWork({
+    client,
+    connector: 'woocommerce',
+    limit: 10,
+    workerId: 'worker-2',
+    now,
+    staleLockMs: 10 * 60 * 1000,
+  })
+
+  // Both rows are equally stale and equally old, so time alone cannot separate them: the ONLY
+  // difference is that one operation has a replay-safety declaration and the other has not.
+  assert.deepEqual(reclaimed.map((row) => row.id), ['declared-safe'])
+  assert.equal(rows.find((row) => row.id === 'declared-safe')?.lockedBy, 'worker-2')
+  assert.equal(rows.find((row) => row.id === 'undeclared')?.lockedBy, 'worker-1')
+  assert.deepEqual(rows.find((row) => row.id === 'undeclared')?.lockedAt, workerOneLock)
 })
