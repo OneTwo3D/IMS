@@ -278,15 +278,40 @@ function parseTriggerPathFilters(source: string, workflow: string): PathFilter[]
   return found
 }
 
-/** One event's `paths:` globs, keyed by event name. `paths-ignore:` is deliberately not included. */
-function pathsByEvent(workflow: string): Map<string, string[]> {
+/**
+ * One event's trigger filters, split by key, for every event that declares at least one.
+ *
+ * The two keys are OPPOSITES and are kept apart deliberately. Under `paths:` a glob is the reason a
+ * workflow runs; under `paths-ignore:` the same glob is the reason it does NOT. Asking "is this file
+ * covered?" of a flattened list would report a file that is explicitly EXCLUDED as included, so a
+ * `paths:` list renamed to `paths-ignore:` — one character short of invisible in a diff — would read
+ * as still covering everything it names. Each caller states both halves: what `paths:` must match,
+ * and what `paths-ignore:` must not.
+ */
+function triggerFiltersByEvent(workflow: string): Map<string, { paths: string[]; ignore: string[] }> {
   const source = readFileSync(path.join(REPO_ROOT, workflow), 'utf8')
-  const byEvent = new Map<string, string[]>()
+  const byEvent = new Map<string, { paths: string[]; ignore: string[] }>()
   for (const filter of parseTriggerPathFilters(source, workflow)) {
-    if (filter.key !== 'paths') continue
-    byEvent.set(filter.event, [...(byEvent.get(filter.event) ?? []), filter.value])
+    const entry = byEvent.get(filter.event) ?? { paths: [], ignore: [] }
+    if (filter.key === 'paths') entry.paths.push(filter.value)
+    else entry.ignore.push(filter.value)
+    byEvent.set(filter.event, entry)
   }
   return byEvent
+}
+
+/**
+ * Every reason `${WORKFLOW}` would decline to run on a change to `file`, for one event. Empty means
+ * the event does start the workflow for that file.
+ */
+function reasonsNotTriggered(file: string, event: string, filters: { paths: string[]; ignore: string[] }): string[] {
+  const reasons: string[] = []
+  if (filters.paths.length > 0 && !filters.paths.some((glob) => globToRegExp(glob).test(file))) {
+    reasons.push(`no ${event} paths: entry matches it`)
+  }
+  const excludedBy = filters.ignore.filter((glob) => globToRegExp(glob).test(file))
+  if (excludedBy.length > 0) reasons.push(`${event} paths-ignore: excludes it via ${JSON.stringify(excludedBy)}`)
+  return reasons
 }
 
 /** A relative import specifier resolved to the repository file it actually loads, or null. */
@@ -391,14 +416,14 @@ test('every path filter in every workflow matches at least one file that exists 
 test(`${WORKFLOW} is triggered by changes to the gated files themselves, on every event that filters`, () => {
   // A path-filtered workflow that does not list tests/db/** would not run on a pull request that
   // only changed one of these suites — the job would exist and still never execute.
-  const byEvent = pathsByEvent(WORKFLOW)
+  const byEvent = triggerFiltersByEvent(WORKFLOW)
   assert.ok(byEvent.size > 0, `${WORKFLOW} declares no path filters to check`)
-  for (const [event, globs] of byEvent) {
-    const matchers = globs.map(globToRegExp)
+  for (const [event, filters] of byEvent) {
     for (const file of gatedFiles) {
-      assert.ok(matchers.some((matcher) => matcher.test(file)),
-        `a ${event} changing only ${file} would not trigger ${WORKFLOW}: that event's paths filter `
-        + 'does not cover the file, so the job added for it would never run')
+      const reasons = reasonsNotTriggered(file, event, filters)
+      assert.deepEqual(reasons, [],
+        `a ${event} changing only ${file} would not trigger ${WORKFLOW}, so the job added for it `
+        + 'would never run')
     }
   }
 })
@@ -421,17 +446,16 @@ test(`${WORKFLOW} is also triggered by the modules the gated files import`, () =
     }))
   }
 
-  const byEvent = pathsByEvent(WORKFLOW)
+  const byEvent = triggerFiltersByEvent(WORKFLOW)
   assert.ok(byEvent.size > 0, `${WORKFLOW} declares no path filters to check`)
-  for (const [event, globs] of byEvent) {
-    const matchers = globs.map(globToRegExp)
+  for (const [event, filters] of byEvent) {
     for (const [file, targets] of dependencies) {
       for (const target of targets) {
-        assert.ok(matchers.some((matcher) => matcher.test(target)),
-          `${WORKFLOW}'s ${event} paths filter does not cover ${target}, which ${file} imports `
-          + 'directly. A pull request changing only that module would not start the job that runs '
-          + `${file}, and test:unit would collect it and skip it — which is the r13 finding all `
-          + 'over again, reached through the trigger instead of through the environment')
+        assert.deepEqual(reasonsNotTriggered(target, event, filters), [],
+          `${WORKFLOW} would not run on a ${event} changing only ${target}, which ${file} imports `
+          + 'directly. The job that runs that suite would not start, and test:unit would collect it '
+          + `and skip it — which is the r13 finding all over again, reached through the trigger `
+          + 'instead of through the environment')
       }
     }
   }
