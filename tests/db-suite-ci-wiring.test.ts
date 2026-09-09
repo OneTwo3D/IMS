@@ -4,6 +4,11 @@ import { readFileSync, readdirSync, statSync } from 'node:fs'
 import path from 'node:path'
 import test from 'node:test'
 
+import {
+  asMap, asSeq, asString, leadingAssignments, parseWorkflowYaml, stripShellComments, stripTsComments,
+  type YamlMap, type YamlNode,
+} from './helpers/live-source'
+
 /**
  * o3d-11rf r13 (Codex r13, HIGH) — THE SUITE THAT WAS SKIPPED BY EVERY ENVIRONMENT THAT EXISTS.
  *
@@ -28,13 +33,34 @@ import test from 'node:test'
  *   2. EVERY gated file must be reachable from `npm run test:db`'s glob.
  *   3. EVERY gated file must also carry the `REQUIRE_DB_MIGRATION_TESTS` tripwire, so that a job
  *      which sets only half the pair fails loudly instead of skipping.
- *   4. `npm run test:db` must be invoked BY A JOB THAT CAN SERVE IT — the same job block has to
- *      stand up a `postgres` service and run `prisma migrate deploy`. Naming the script from a job
- *      with no database would satisfy a weaker check while proving nothing.
+ *   4. `npm run test:db` must be invoked BY A JOB THAT CAN SERVE IT — the same job has to stand up
+ *      a `postgres` service and run `prisma migrate deploy`. Naming the script from a job with no
+ *      database would satisfy a weaker check while proving nothing.
  *
  * NOT VACUOUS, and it is written to be provable: the walk's own results are asserted (a walk that
  * reached nothing would otherwise pass every "for every gated file" loop trivially), and the two
  * files known to be gated today are named so that a walk which silently stops finding them fails.
+ *
+ * ─────────────────────────────────────────────────────────────────────────────────────────────
+ * o3d-11rf r15 (Codex r15, HIGH) — AND EVERY ONE OF THOSE QUESTIONS IS ASKED OF LIVE CODE.
+ *
+ * WHAT WAS FOUND. Check 4 above searched a job's RAW TEXT for `npm run test:db`. Putting a `#` in
+ * front of the workflow's `run: npm run test:db` left that search satisfied — and left the postgres,
+ * migrate and DATABASE_URL searches satisfied too, since they read the same raw text. GitHub would
+ * run no suite at all, `test:unit` would collect the gated tests and skip them, and this guard would
+ * stay green over exactly the state it exists to report.
+ *
+ * WHY IT IS WORTH A LONGER NOTE THAN THE FIX. Round 14 had already fixed this rule once, in the
+ * PATH FILTER reader: prose and commented-out list entries no longer supply coverage. It did not
+ * carry the rule one field across to the STEP reader. One rule, two readers, one fixed — and the
+ * guard shipped containing the defect it exists to catch.
+ *
+ * SO THE RULE IS NOW HELD IN ONE PLACE, NOT RE-STATED PER CHECK. `tests/helpers/live-source.ts`
+ * parses a workflow into a STRUCTURE (a comment is not a node, so a commented-out step, job or list
+ * entry does not exist in the result — there is nothing left to match), and strips comments from
+ * TypeScript and from shell commands for the checks that read those. Every assertion below reads one
+ * of those three, and the fixtures at the bottom perform the comment-out mutations themselves and
+ * require the readers to go blind. What is asserted is not "the text appears" but "it executes".
  */
 
 const REPO_ROOT = process.cwd()
@@ -43,6 +69,7 @@ const GATE = 'RUN_DB_MIGRATION_TESTS'
 const GATE_READ = `process.env.${GATE}`
 const TRIPWIRE = 'REQUIRE_DB_MIGRATION_TESTS'
 const WORKFLOW = '.github/workflows/schema-guardrails.yml'
+const DB_SUITE_COMMAND = /\bnpm run test:db\b/
 
 /** The files that were gated on the day this guard was written. The walk must keep finding them. */
 const KNOWN_GATED = [
@@ -58,6 +85,11 @@ function testFilesUnder(dir: string): string[] {
     else if (entry.endsWith('.test.ts')) found.push(relative)
   }
   return found
+}
+
+/** One test file's source with its comments blanked out: what the file actually executes. */
+function liveSourceOf(file: string): string {
+  return stripTsComments(readFileSync(path.join(REPO_ROOT, file), 'utf8'))
 }
 
 /**
@@ -79,40 +111,14 @@ function globToRegExp(glob: string): RegExp {
   return new RegExp(`^${pattern}$`)
 }
 
-/**
- * The block of `.github/workflows/*.yml` belonging to one job, by two-space-indented key. Parsed by
- * indentation rather than by a YAML library because this repository declares no YAML dependency —
- * `tests/production-readiness-workflow.test.ts` reads these files as text for the same reason.
- */
-function jobBlocks(workflow: string): Map<string, string> {
-  const lines = workflow.split('\n')
-  const start = lines.findIndex((line) => line === 'jobs:')
-  assert.ok(start >= 0, `${WORKFLOW} has a top-level jobs: key`)
-  const blocks = new Map<string, string>()
-  let name: string | null = null
-  let body: string[] = []
-  for (const line of lines.slice(start + 1)) {
-    const header = /^ {2}([A-Za-z0-9_-]+):\s*$/.exec(line)
-    if (header) {
-      if (name) blocks.set(name, body.join('\n'))
-      name = header[1]
-      body = []
-    } else if (name) {
-      body.push(line)
-    }
-  }
-  if (name) blocks.set(name, body.join('\n'))
-  return blocks
-}
-
 const gatedFiles = testFilesUnder('tests')
-  .filter((file) => readFileSync(path.join(REPO_ROOT, file), 'utf8').includes(GATE_READ))
+  .filter((file) => liveSourceOf(file).includes(GATE_READ))
   .sort()
 
 test(`the walk finds the files gated on ${GATE} — the precondition for everything below`, () => {
   // If this ever passes with an empty list, every "for every gated file" assertion below becomes a
   // loop over nothing and the guard silently stops guarding. So the walk is asserted first.
-  assert.ok(gatedFiles.length > 0, `no test file mentions ${GATE}; the walk reached nothing`)
+  assert.ok(gatedFiles.length > 0, `no test file READS ${GATE}; the walk reached nothing`)
   for (const known of KNOWN_GATED) {
     assert.ok(gatedFiles.includes(known),
       `${known} is gated on ${GATE} and the walk must still find it — it found ${JSON.stringify(gatedFiles)}`)
@@ -124,12 +130,24 @@ test(`npm run test:db sets ${GATE} and ${TRIPWIRE} and reaches every gated file`
   const script = scripts['test:db']
   assert.ok(script,
     `package.json has no "test:db" script, so nothing sets ${GATE} and every gated file skips whole`)
-  assert.match(script, new RegExp(`\\b${GATE}=1\\b`), `test:db must set ${GATE}=1`)
-  assert.match(script, new RegExp(`\\b${TRIPWIRE}=1\\b`),
-    `test:db must set ${TRIPWIRE}=1 so a half-wired invocation fails instead of skipping`)
 
-  const globs = [...script.matchAll(/"([^"]*\*[^"]*)"/g)].map((match) => match[1])
-  assert.ok(globs.length > 0, `test:db names no test glob: ${script}`)
+  // POSITION IS THE WHOLE QUESTION, not presence. `# RUN_DB_MIGRATION_TESTS=1 tsx --test ...` is a
+  // script that runs nothing and exits 0, and `echo RUN_DB_MIGRATION_TESTS=1` sets no variable —
+  // both would satisfy a search of the script's text. So the command is read as a command: comments
+  // removed, then the assignments that actually precede it.
+  const { assignments, rest } = leadingAssignments(script)
+  assert.ok(rest.trim() !== '',
+    `test:db runs no command once its shell comments are removed (${JSON.stringify(script)}); it `
+    + 'would exit 0 having executed nothing, which is a green CI job over an unrun suite')
+  assert.equal(assignments.get(GATE), '1',
+    `test:db must set ${GATE}=1 as a leading assignment on the command it runs, not mention it: `
+    + `${JSON.stringify(script)}`)
+  assert.equal(assignments.get(TRIPWIRE), '1',
+    `test:db must set ${TRIPWIRE}=1 so a half-wired invocation fails instead of skipping: `
+    + `${JSON.stringify(script)}`)
+
+  const globs = [...rest.matchAll(/"([^"]*\*[^"]*)"|'([^']*\*[^']*)'/g)].map((match) => match[1] ?? match[2])
+  assert.ok(globs.length > 0, `test:db names no test glob: ${rest}`)
   const matchers = globs.map(globToRegExp)
   // The matcher itself must be able to say no, or "covered" means nothing.
   assert.ok(!matchers.some((matcher) => matcher.test('tests/unit/not-a-db-test.spec.ts')),
@@ -148,40 +166,287 @@ test(`npm run test:db sets ${GATE} and ${TRIPWIRE} and reaches every gated file`
 test(`every file gated on ${GATE} refuses to skip when ${TRIPWIRE} promised a database`, () => {
   // A MENTION IS NOT A READ, and the distinction is not academic: the first version of this check
   // accepted `source.includes(TRIPWIRE)`, and deleting the tripwire STATEMENT while leaving the
-  // sentence about it in the file's doc comment passed it. So the check asks for the read
-  // (`process.env.<name>`) and for a `throw` inside the statement that read it.
+  // sentence about it in the file's doc comment passed it. The second version asked for
+  // `process.env.<name>` — in the RAW file, where a `//`-commented-out tripwire reads the same as a
+  // live one. Both are now answered at once by reading the file with its comments blanked out.
   const read = `process.env.${TRIPWIRE}`
   for (const file of gatedFiles) {
-    const source = readFileSync(path.join(REPO_ROOT, file), 'utf8')
+    const source = liveSourceOf(file)
     const at = source.indexOf(read)
     assert.ok(at >= 0,
-      `${file} gates on ${GATE} but never READS ${TRIPWIRE} (a doc-comment mention is not a `
-      + 'tripwire): an invocation that sets one variable and not the other would skip the whole file '
-      + 'silently, which is the o3d-11rf r13 finding')
+      `${file} gates on ${GATE} but never READS ${TRIPWIRE} in live code (a doc-comment mention and `
+      + 'a commented-out statement are both prose): an invocation that sets one variable and not the '
+      + 'other would skip the whole file silently, which is the o3d-11rf r13 finding')
     assert.ok(source.slice(at, at + 200).includes('throw new Error('),
       `${file} reads ${TRIPWIRE} but does not THROW on it — reporting a silent skip is what the `
       + 'tripwire exists to stop, so it has to be fatal')
   }
 })
 
-test('a CI job runs npm run test:db against a migrated postgres service', () => {
-  const workflow = readFileSync(path.join(REPO_ROOT, WORKFLOW), 'utf8')
-  const blocks = jobBlocks(workflow)
-  assert.ok(blocks.size > 0, `${WORKFLOW} parsed to no jobs; the block splitter is broken`)
-
-  const runners = [...blocks].filter(([, body]) => /\bnpm run test:db\b/.test(body))
-  assert.equal(runners.length > 0, true,
-    `no job in ${WORKFLOW} runs "npm run test:db", so ${gatedFiles.length} gated files run nowhere. `
-    + `Jobs present: ${JSON.stringify([...blocks.keys()])}`)
-
-  for (const [job, body] of runners) {
-    assert.match(body, /image: postgres:\d+/,
-      `${WORKFLOW} job "${job}" runs the DB suites but stands up no postgres service`)
-    assert.match(body, /prisma migrate deploy/,
-      `${WORKFLOW} job "${job}" runs the DB suites against a database it never migrated`)
-    assert.match(body, /DATABASE_URL: postgres/,
-      `${WORKFLOW} job "${job}" runs the DB suites without pointing DATABASE_URL at that service`)
+/**
+ * The `jobs:` mapping of one workflow, as a structure.
+ *
+ * WHY NOT THE INDENTATION SPLITTER THIS REPLACED. The previous version cut the file into per-job
+ * text blocks on a two-space-indented header regex. Commenting a job out does not remove its header
+ * from the file, it makes it stop being a header — so the whole commented-out job's body was
+ * appended to the PRECEDING job's text, and every question asked of that text ("does it run the
+ * suite?", "does it have postgres?") was answered yes by lines GitHub would never execute.
+ */
+function jobsOf(workflow: string, source: string): Map<string, YamlMap> {
+  const tree = asMap(parseWorkflowYaml(source, workflow))
+  assert.ok(tree, `${workflow} did not parse to a mapping`)
+  const jobs = asMap((tree as YamlMap).jobs)
+  assert.ok(jobs, `${workflow} declares no jobs: mapping`)
+  const found = new Map<string, YamlMap>()
+  for (const [name, body] of Object.entries(jobs as YamlMap)) {
+    const map = asMap(body)
+    assert.ok(map, `${workflow} job "${name}" did not parse to a mapping`)
+    found.set(name, map as YamlMap)
   }
+  return found
+}
+
+/** The steps of one job, each as a mapping. */
+function stepsOf(job: YamlMap): YamlMap[] {
+  const steps = asSeq(job.steps) ?? []
+  return steps.map(asMap).filter((step): step is YamlMap => step !== null)
+}
+
+/** What one step actually executes: its `run:` scalar with the shell's own comments removed. */
+function liveRunOf(step: YamlMap): string {
+  const run = asString(step.run)
+  return run === null ? '' : stripShellComments(run)
+}
+
+/**
+ * A value that can only ever be false. GitHub expressions are not evaluated here — only the literal
+ * forms are recognised, which is enough to catch a step or job switched off in place.
+ */
+function neverRuns(node: YamlNode | undefined): boolean {
+  const value = asString(node ?? null)
+  return value !== null && /^(false|\$\{\{\s*false\s*\}\})$/.test(value.trim())
+}
+
+/** Every step of `job` that really invokes `command`. */
+function stepsInvoking(job: YamlMap, command: RegExp): YamlMap[] {
+  return stepsOf(job).filter((step) => command.test(liveRunOf(step)) && !neverRuns(step.if))
+}
+
+/** Every job of one workflow that really invokes `command`, by name. */
+function jobsInvoking(jobs: Map<string, YamlMap>, command: RegExp): Map<string, YamlMap> {
+  const found = new Map<string, YamlMap>()
+  for (const [name, job] of jobs) {
+    if (neverRuns(job.if)) continue
+    if (stepsInvoking(job, command).length > 0) found.set(name, job)
+  }
+  return found
+}
+
+/**
+ * Every reason `job` could not actually serve the database suites. Empty means it can.
+ *
+ * Each reason is read off the parsed structure — the service's `image`, a step's live `run`, the
+ * `DATABASE_URL` the job or the step sets — and not off the job's text, where a `#` in front of any
+ * of those three lines left all three questions answered yes.
+ */
+function whyJobCannotServeTheSuite(job: YamlMap, command: RegExp): string[] {
+  const reasons: string[] = []
+  const services = asMap(job.services) ?? {}
+  const images = Object.values(services)
+    .map((service) => asString(asMap(service)?.image ?? null))
+    .filter((image): image is string => image !== null)
+  if (!images.some((image) => /^postgres:\d/.test(image))) {
+    reasons.push(`it stands up no postgres service (images: ${JSON.stringify(images)})`)
+  }
+  if (!stepsOf(job).some((step) => /prisma migrate deploy/.test(liveRunOf(step)) && !neverRuns(step.if))) {
+    reasons.push('no step it runs migrates the database (prisma migrate deploy)')
+  }
+  const urls = [
+    asString(asMap(job.env)?.DATABASE_URL ?? null),
+    ...stepsInvoking(job, command).map((step) => asString(asMap(step.env)?.DATABASE_URL ?? null)),
+  ].filter((url): url is string => url !== null)
+  if (!urls.some((url) => url.startsWith('postgres'))) {
+    reasons.push(`it points DATABASE_URL at no postgres service (${JSON.stringify(urls)})`)
+  }
+  return reasons
+}
+
+test('a CI job runs npm run test:db against a migrated postgres service', () => {
+  const source = readFileSync(path.join(REPO_ROOT, WORKFLOW), 'utf8')
+  const jobs = jobsOf(WORKFLOW, source)
+  assert.ok(jobs.size > 0, `${WORKFLOW} parsed to no jobs`)
+
+  // ANTI-UNDER-READ, and this is the one place raw text is still consulted ON PURPOSE. Its failure
+  // direction is the safe one: it catches the PARSER reading LESS than the document declares, which
+  // would turn every assertion below into a question asked of nothing. A parser reading more than
+  // the document is not a risk it can create.
+  const declared = [...source.matchAll(/^ {2}([A-Za-z0-9_-]+):[ \t]*$/gm)].map((match) => match[1])
+    .filter((name) => new RegExp(`^jobs:$[\\s\\S]*^ {2}${name}:`, 'm').test(source))
+  for (const name of declared) {
+    assert.ok(jobs.has(name),
+      `${WORKFLOW} declares a job "${name}" that the workflow parser did not read; every check below `
+      + `would be asked of a shorter document than the file. Parsed: ${JSON.stringify([...jobs.keys()])}`)
+  }
+
+  const runners = jobsInvoking(jobs, DB_SUITE_COMMAND)
+  assert.ok(runners.size > 0,
+    `no job in ${WORKFLOW} RUNS "npm run test:db" — a commented-out or switched-off step does not `
+    + `count — so ${gatedFiles.length} gated files run nowhere. `
+    + `Jobs present: ${JSON.stringify([...jobs.keys()])}`)
+
+  for (const [name, job] of runners) {
+    assert.deepEqual(whyJobCannotServeTheSuite(job, DB_SUITE_COMMAND), [],
+      `${WORKFLOW} job "${name}" runs the DB suites but cannot serve them`)
+  }
+})
+
+/**
+ * THE REGRESSION FIXTURE FOR THE r15 FINDING, and it performs the mutation itself.
+ *
+ * A guard that says "a commented-out command does not count" has to be provable without editing a
+ * checked-in workflow. So the fixture below IS a workflow, the test comments parts of it out line by
+ * line, and each mutation must make the readers go blind. The text stays in the document every time
+ * — that is the whole point: the same characters, no longer executed.
+ */
+const RUNNER_FIXTURE = [
+  'name: Fixture',
+  '# Prose about npm run test:db, at length, in a job-shaped comment.',
+  'on:',
+  '  pull_request:',
+  '    paths:',
+  '      - "tests/db/**"',
+  'jobs:',
+  '  decoy:',
+  '    runs-on: ubuntu-latest',
+  '    services:',
+  '      postgres:',
+  '        image: postgres:16',
+  '    env:',
+  '      DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:5432/ims_ci',
+  '    steps:',
+  '      - name: npm run test:db',
+  '        run: echo this step is named after the command it does not run',
+  '      - run: |',
+  '          # npm run test:db',
+  '          echo a shell comment inside a run block executes nothing',
+  '  db:',
+  '    runs-on: ubuntu-latest',
+  '    services:',
+  '      postgres:',
+  '        image: postgres:16',
+  '    env:',
+  '      DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:5432/ims_ci',
+  '    steps:',
+  '      - run: npx prisma migrate deploy --schema prisma/schema.prisma',
+  '      - name: Run the DB-backed regression suites',
+  '        run: npm run test:db',
+  '',
+]
+
+/** The fixture with every line matching `pattern` commented out — text kept, execution removed. */
+function commentedOut(pattern: RegExp): string {
+  return RUNNER_FIXTURE.map((line) => (pattern.test(line) ? `#${line}` : line)).join('\n')
+}
+
+function fixtureRunners(source: string): string[] {
+  return [...jobsInvoking(jobsOf('fixture.yml', source), DB_SUITE_COMMAND).keys()]
+}
+
+test('the workflow reader counts a step that RUNS the DB suites, and nothing that merely says so', () => {
+  const intact = RUNNER_FIXTURE.join('\n')
+  // Green first: the reader finds the job that runs it, and does NOT find the job that names the
+  // command in a step title and buries it in a shell comment inside a run block.
+  assert.deepEqual(fixtureRunners(intact), ['db'],
+    'the reader must find the job whose step runs the command, and only that job')
+
+  // r15's mutation, verbatim: one `#` in front of the run line. Every character of the command is
+  // still in the document.
+  const commandCommentedOut = commentedOut(/^ {8}run: npm run test:db$/)
+  assert.ok(commandCommentedOut.includes('npm run test:db'), 'the mutation keeps the text')
+  assert.deepEqual(fixtureRunners(commandCommentedOut), [],
+    'a commented-out run: line is not a step GitHub executes, and must not be read as one')
+
+  // The whole job commented out. The indentation splitter this replaced folded these lines into the
+  // preceding job and answered every question about them yes.
+  const jobCommentedOut = RUNNER_FIXTURE.map((line, index) => (index >= RUNNER_FIXTURE.indexOf('  db:') ? `#${line}` : line))
+    .join('\n')
+  assert.deepEqual(fixtureRunners(jobCommentedOut), [],
+    'a commented-out job does not exist, and its lines belong to no other job either')
+
+  // Switched off in place rather than commented out.
+  const switchedOff = RUNNER_FIXTURE.flatMap((line) => (line === '  db:' ? [line, '    if: false'] : [line])).join('\n')
+  assert.deepEqual(fixtureRunners(switchedOff), [], 'a job that can never run does not run the suites')
+  const stepSwitchedOff = RUNNER_FIXTURE
+    .flatMap((line) => (line === '        run: npm run test:db' ? ['        if: false', line] : [line])).join('\n')
+  assert.deepEqual(fixtureRunners(stepSwitchedOff), [], 'a step that can never run does not run the suites')
+})
+
+test('the workflow reader checks the database off the structure, not off the job text', () => {
+  const jobOf = (source: string): YamlMap => {
+    const job = jobsOf('fixture.yml', source).get('db')
+    assert.ok(job, 'the fixture must still declare the db job')
+    return job as YamlMap
+  }
+  assert.deepEqual(whyJobCannotServeTheSuite(jobOf(RUNNER_FIXTURE.join('\n')), DB_SUITE_COMMAND), [],
+    'the intact fixture job can serve the suites')
+
+  // One comment-out per property the job has to carry. Each leaves the text in the file.
+  const cases: Array<[string, RegExp, RegExp]> = [
+    ['the postgres service', /^ {8}image: postgres:16$/, /stands up no postgres service/],
+    ['the migration step', /^ {6}- run: npx prisma migrate deploy/, /migrates the database/],
+    ['the database URL', /^ {6}DATABASE_URL: /, /DATABASE_URL at no postgres service/],
+  ]
+  for (const [what, line, expected] of cases) {
+    const mutated = commentedOut(line)
+    const reasons = whyJobCannotServeTheSuite(jobOf(mutated), DB_SUITE_COMMAND)
+    assert.ok(reasons.some((reason) => expected.test(reason)),
+      `commenting out ${what} must be reported, and was not: ${JSON.stringify(reasons)}`)
+  }
+})
+
+test('the TypeScript reader reads statements, not sentences', () => {
+  const gate = `process.env.${GATE}`
+  const live = [
+    'const url = "http://example.test/#not-a-comment"',
+    'const pattern = /a\\/\\/b/',
+    `if (${gate} !== '1') throw new Error('x')`,
+  ].join('\n')
+  const stripped = stripTsComments(live)
+  assert.ok(stripped.includes(gate), 'a live read survives')
+  assert.ok(stripped.includes('http://example.test/#not-a-comment'), 'a URL inside a string is not a comment')
+  assert.ok(stripped.includes('a\\/\\/b'), 'a regular expression containing // is not a comment')
+
+  const prose = [
+    `/** This file gates on ${gate} and throws when ${'process.env.' + TRIPWIRE} is set. */`,
+    `// if (${gate} !== '1') throw new Error('x')`,
+    `/* if (${'process.env.' + TRIPWIRE}) throw new Error('x') */`,
+    'const nothing = 1',
+  ].join('\n')
+  const strippedProse = stripTsComments(prose)
+  assert.ok(!strippedProse.includes(gate), 'a commented-out read is not a read')
+  assert.ok(!strippedProse.includes(`process.env.${TRIPWIRE}`), 'a commented-out tripwire is not a tripwire')
+  assert.ok(!strippedProse.includes('throw new Error('), 'a commented-out throw is not a throw')
+  assert.equal(strippedProse.split('\n').length, prose.split('\n').length,
+    'stripping preserves line structure, so offsets still name the right place')
+})
+
+test('the shell reader reads the command, not the string', () => {
+  const live = leadingAssignments(`${GATE}=1 ${TRIPWIRE}=1 tsx --test "tests/db/**/*.test.ts"`)
+  assert.equal(live.assignments.get(GATE), '1')
+  assert.equal(live.assignments.get(TRIPWIRE), '1')
+  assert.match(live.rest, /^tsx --test/)
+
+  const wholeCommandCommentedOut = leadingAssignments(`# ${GATE}=1 ${TRIPWIRE}=1 tsx --test "tests/db/*.test.ts"`)
+  assert.equal(wholeCommandCommentedOut.assignments.size, 0, 'a commented-out script sets nothing')
+  assert.equal(wholeCommandCommentedOut.rest, '', 'a commented-out script runs nothing')
+
+  const mentioned = leadingAssignments(`echo ${GATE}=1 && tsx --test "tests/db/*.test.ts"`)
+  assert.equal(mentioned.assignments.size, 0, 'an assignment after the command name sets nothing')
+
+  const trailing = leadingAssignments(`${GATE}=1 tsx --test "tests/db/*.test.ts" # ${TRIPWIRE}=1`)
+  assert.equal(trailing.assignments.get(GATE), '1')
+  assert.equal(trailing.assignments.has(TRIPWIRE), false, 'a trailing comment sets nothing')
+  assert.ok(!trailing.rest.includes('#'), 'the comment is gone from the command')
 })
 
 /**
@@ -234,48 +499,43 @@ type PathFilter = { workflow: string; event: string; key: 'paths' | 'paths-ignor
  * The `paths:` / `paths-ignore:` entries of a workflow's `on:` block, each tagged with the EVENT and
  * the KEY it was found under.
  *
- * Read by indentation rather than with a YAML library because this repository declares no YAML
- * dependency — `tests/production-readiness-workflow.test.ts` and `jobBlocks()` above read these
- * files as text for the same reason.
- *
- * A COMMENT IS NOT A FILTER, and that distinction is the one this guard has already been caught on
- * once: the tripwire check further up originally accepted a doc-comment mention as satisfying a
- * rule. So lines whose first non-space character is `#` are dropped before anything else looks at
- * them — a commented-out list entry supplies no coverage, and prose naming a path supplies none
- * either. Nor can an entry under `paths-ignore:` stand in for one under `paths:`: the key is carried
- * on every entry so that a coverage question can be asked of `paths` alone. (Both are still subject
- * to the dead-glob check: a `paths-ignore:` entry matching nothing is equally a no-op.)
+ * A COMMENT IS NOT A FILTER — and since r15 that is not a rule this function implements, it is a
+ * property of reading the document as a structure at all: a commented-out list entry is not a node,
+ * so there is nothing here to exclude. Nor can an entry under `paths-ignore:` stand in for one under
+ * `paths:`: the key is carried on every entry so that a coverage question can be asked of `paths`
+ * alone. (Both are still subject to the dead-glob check: a `paths-ignore:` entry matching nothing is
+ * equally a no-op.)
  */
 function parseTriggerPathFilters(source: string, workflow: string): PathFilter[] {
-  const lines = source.split('\n')
-  const start = lines.findIndex((line) => /^on:\s*$/.test(line))
-  if (start < 0) return []
+  const tree = asMap(parseWorkflowYaml(source, workflow))
+  const on = tree === null ? null : asMap(tree.on)
+  if (on === null) return []
   const found: PathFilter[] = []
-  let event: string | null = null
-  let key: string | null = null
-  for (let index = start + 1; index < lines.length; index += 1) {
-    const line = lines[index]
-    if (line.trim() === '') continue
-    if (line.trimStart().startsWith('#')) continue
-    if (!/^\s/.test(line)) break // back to column 0: the on: block has ended
-    const eventHeader = /^ {2}([A-Za-z_][\w-]*):\s*$/.exec(line)
-    if (eventHeader) {
-      event = eventHeader[1]
-      key = null
-      continue
+  for (const [event, config] of Object.entries(on)) {
+    const settings = asMap(config)
+    if (settings === null) continue
+    for (const key of ['paths', 'paths-ignore'] as const) {
+      const declared = settings[key]
+      if (declared === undefined || declared === null) continue
+      // A single-entry list may be written as a scalar; reading it as "no filter" would under-read.
+      const entries = asSeq(declared) ?? [declared]
+      for (const entry of entries) {
+        const value = asString(entry)
+        assert.ok(value !== null,
+          `${workflow} ${event}.${key} contains an entry that is not a string: ${JSON.stringify(entry)}`)
+        found.push({ workflow, event, key, value: value as string, line: lineOf(source, value as string) })
+      }
     }
-    const keyHeader = /^ {4}([A-Za-z_][\w-]*):\s*$/.exec(line)
-    if (keyHeader) {
-      key = keyHeader[1]
-      continue
-    }
-    const item = /^ {6}- (.+?)\s*$/.exec(line)
-    if (!item || !event || (key !== 'paths' && key !== 'paths-ignore')) continue
-    const raw = item[1]
-    const quoted = /^"(.*)"$/.exec(raw) ?? /^'(.*)'$/.exec(raw)
-    found.push({ workflow, event, key, value: quoted ? quoted[1] : raw, line: index + 1 })
   }
   return found
+}
+
+/** Where a filter entry sits in the file — for the error message only, never for a decision. */
+function lineOf(source: string, value: string): number {
+  const lines = source.split('\n')
+  const at = lines.findIndex((line) => !line.trimStart().startsWith('#')
+    && new RegExp(`^\\s*-\\s+["']?${value.replace(/[.*+^${}()|[\]\\?]/g, '\\$&')}["']?\\s*$`).test(line))
+  return at + 1
 }
 
 /**
@@ -322,7 +582,11 @@ function resolveRelativeImport(fromFile: string, specifier: string, tracked: Set
   return candidates.find((candidate) => tracked.has(candidate)) ?? null
 }
 
-/** The relative import specifiers of one module, both static `from '...'` and dynamic `import('...')`. */
+/**
+ * The relative import specifiers of one module, both static `from '...'` and dynamic `import('...')`.
+ * Read from the file's live source: a commented-out import loads nothing, and a workflow does not
+ * have to be triggered by changes to a module no longer imported.
+ */
 function relativeImportsOf(source: string): string[] {
   return [...new Set([
     ...[...source.matchAll(/\bfrom\s+['"](\.[^'"]+)['"]/g)].map((match) => match[1]),
@@ -387,7 +651,8 @@ test('every path filter in every workflow matches at least one file that exists 
     const relative = `${WORKFLOW_DIR}/${name}`
     const source = readFileSync(path.join(REPO_ROOT, relative), 'utf8')
     // A parser that silently stopped reading would turn this check green over any number of dead
-    // filters, so a file that DECLARES a list must yield entries from it.
+    // filters, so a file that DECLARES a list must yield entries from it. Raw text on purpose, and
+    // in the safe direction: it can only ever complain that the parse read TOO LITTLE.
     if (/^ {4}paths(-ignore)?:\s*$/m.test(source)) {
       assert.ok(parseTriggerPathFilters(source, relative).length > 0,
         `${relative} declares a paths: list and the trigger parser read none of it`)
@@ -435,7 +700,7 @@ test(`${WORKFLOW} is also triggered by the modules the gated files import`, () =
   const tracked = new Set(trackedFiles())
   const dependencies = new Map<string, string[]>()
   for (const file of gatedFiles) {
-    const specifiers = relativeImportsOf(readFileSync(path.join(REPO_ROOT, file), 'utf8'))
+    const specifiers = relativeImportsOf(liveSourceOf(file))
     assert.ok(specifiers.length > 0,
       `no relative import was read out of ${file}; the import extractor reached nothing, which `
       + 'would make every assertion below a loop over an empty list')
@@ -458,5 +723,19 @@ test(`${WORKFLOW} is also triggered by the modules the gated files import`, () =
           + 'instead of through the environment')
       }
     }
+  }
+})
+
+test('all checked-in workflows parse, so no assertion above is asked of a document it could not read', () => {
+  // Every workflow, not only the one this guard is about: the readers are shared, and a workflow the
+  // parser cannot read is a workflow whose filters and steps go unchecked.
+  const workflows = readdirSync(path.join(REPO_ROOT, WORKFLOW_DIR)).filter((name) => /\.ya?ml$/.test(name))
+  assert.ok(workflows.length > 0, `${WORKFLOW_DIR} contains no workflow files`)
+  for (const name of workflows) {
+    const relative = `${WORKFLOW_DIR}/${name}`
+    const source = readFileSync(path.join(REPO_ROOT, relative), 'utf8')
+    const tree = asMap(parseWorkflowYaml(source, relative))
+    assert.ok(tree, `${relative} did not parse to a mapping`)
+    assert.ok(asMap((tree as YamlMap).jobs), `${relative} parsed without a jobs: mapping`)
   }
 })
