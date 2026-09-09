@@ -19,9 +19,16 @@ on:
       - "scripts/fence-db-connections.mjs"
       - "scripts/run-migration-verifications.mjs"
       - "scripts/check-app-db-object-access.mjs"
+      - "scripts/check-db-test-gates.mjs"
+      - "scripts/db-test-gate-allowlist.json"
       - "tests/db/**"
       - "lib/db/**"
       - "lib/domain/accounting/**"
+      # The two modules that BUILD the shopping-inbox compaction predicate, which
+      # tests/db/shopping-webhook-retention-evidence.test.ts executes against a real Postgres. Without
+      # them a change to the predicate could not reach the only job that runs that evidence.
+      - "lib/connectors/shopping-webhook-retention.ts"
+      - "lib/connectors/shopping-webhook-inbox.ts"
   push:
     branches:
       - main
@@ -42,9 +49,16 @@ on:
       - "scripts/fence-db-connections.mjs"
       - "scripts/run-migration-verifications.mjs"
       - "scripts/check-app-db-object-access.mjs"
+      - "scripts/check-db-test-gates.mjs"
+      - "scripts/db-test-gate-allowlist.json"
       - "tests/db/**"
       - "lib/db/**"
       - "lib/domain/accounting/**"
+      # The two modules that BUILD the shopping-inbox compaction predicate, which
+      # tests/db/shopping-webhook-retention-evidence.test.ts executes against a real Postgres. Without
+      # them a change to the predicate could not reach the only job that runs that evidence.
+      - "lib/connectors/shopping-webhook-retention.ts"
+      - "lib/connectors/shopping-webhook-inbox.ts"
 
 jobs:
   migration-scope:
@@ -165,8 +179,25 @@ jobs:
   # (`tests/**/*.test.ts`) collects both files on every CI run, so they reported as skipped tests
   # inside a green suite and nothing anywhere said that the branch's central evidence — the
   # ownership join, the truncation containment, the fold parity, the Turkish locale — had not been
-  # executed. The other nine files in tests/db/ are static source scanners that never open a
-  # connection, which is why they run in test:unit and these two cannot.
+  # executed.
+  #
+  # AND THEN IT WAS WRONG AGAIN, THE SAME WAY, FOR A DIFFERENT GATE (Codex r18, HIGH). An earlier
+  # revision of this comment said the OTHER nine files in tests/db/ were static source scanners. They
+  # are not, and the sentence hid the defect it was next to:
+  #
+  #   * THREE files gate on a `RUN_DB_*` variable — the two above, and
+  #     `shopping-webhook-retention-evidence.test.ts`, which gates on `RUN_DB_RETENTION_TESTS`. That
+  #     third variable was set NOWHERE, including by `test:db`, so its one test — the only executable
+  #     evidence that WooCommerce order payloads survive retention compaction — reported a silent
+  #     `# SKIP` inside this very job. It is set below now.
+  #   * FOUR open a real connection whenever DATABASE_URL is set and skip themselves when it is not
+  #     (`connection-schema-pinning`, `guarded-pool-routing`, `session-lock-affinity`,
+  #     `startup-option-verdict-across-bundles`). They run here, against this job's database.
+  #   * FOUR never open one (`advisory-lock-keys`, `pool-acquisition-bound`, `post-remote-persist`,
+  #     `prisma-unique-violation`) and run identically under `test:unit`.
+  #
+  # The lesson is not "count the files again". It is that a prose census goes stale silently, so the
+  # census is now a program: `scripts/check-db-test-gates.mjs`, run as a step of this job.
   #
   # WHY A SIBLING JOB AND NOT MORE STEPS ON `fresh-db-drift`. Both were available; the deciding
   # facts are about the DATABASE and about what a red job means.
@@ -221,11 +252,20 @@ jobs:
           node-version: 22
           cache: npm
       - run: npm ci
+      # BEFORE the suites, because it is about whether they will actually run. It reads the env
+      # assignments on `npm run test:db` and the `process.env` reads in tests/db/, and fails if a gate
+      # there is not set here with a REQUIRE_ counterpart something reads. Codex r18 found
+      # RUN_DB_RETENTION_TESTS gating a real database test that this job never set, so that test
+      # reported `# SKIP` inside a green job; this is what stops the NEXT gate doing the same.
+      - name: Census the tests/db gates against the script this job runs
+        run: npm run check:db-test-gates
       - run: npx prisma generate --schema prisma/schema.prisma
       - run: npx prisma migrate deploy --schema prisma/schema.prisma
-      # `test:db` sets RUN_DB_MIGRATION_TESTS=1 *and* REQUIRE_DB_MIGRATION_TESTS=1. The second is the
+      # `test:db` sets RUN_DB_MIGRATION_TESTS=1 *and* REQUIRE_DB_MIGRATION_TESTS=1, and
+      # RUN_DB_RETENTION_TESTS=1 *and* REQUIRE_DB_RETENTION_TESTS=1. The second of each pair is the
       # tripwire for this job: if an edit ever drops the first, the suites refuse to load instead of
-      # skipping themselves into a green run again.
+      # skipping themselves into a green run again. The census step above is what keeps a THIRD gate
+      # from arriving without either half.
       #
       # THE LOCALE HALF IS CONDITIONAL ON THE IMAGE AND SAYS SO. Four tests create a scratch database
       # with `LOCALE_PROVIDER icu ICU_LOCALE 'tr-TR'`. The `postgres:16` image installs PGDG
