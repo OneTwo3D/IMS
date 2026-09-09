@@ -73,8 +73,10 @@ import {
   describeUnrecordablePostedDocument,
   describeUnrecordedPostedDocumentRecordedOutOfTransaction,
   ledgerTargetIdFromPayload,
+  operationSemanticFor,
   PostedDocumentEvidenceUnwritten,
   UNRECORDED_POSTED_DOCUMENT_ACTION,
+  type DraftCapableSemantic,
   type LedgerPostingMode,
   type PostedOperationOutcome,
   type RemoteEffectOutcome,
@@ -3609,6 +3611,48 @@ const POST_EFFECT_DRAFT_JOURNAL = {
     + 'in Xero if it should not exist. Do NOT post a reversing journal: a reversal posts for real, so it would '
     + 'move the accounts by exactly the amount this draft never moved.',
 } as const
+/**
+ * o3d-d3re — AN INVOICE, BILL OR CREDIT NOTE SENT ON `draft` IS NOT IN THE LEDGER EITHER.
+ *
+ * `_postingMode` is one per-sync-type operator setting, and the create handlers send
+ * `resolveInvoiceStatus(postingMode)` on exactly the value the journal handler sends
+ * `resolveJournalStatus(postingMode)` on. So `draft` produces an UNPOSTED DRAFT document for
+ * SALES_INVOICE, PURCHASE_INVOICE, CREDIT_NOTE and PURCHASE_CREDIT_NOTE — and until this constant
+ * existed every one of them earned POST_EFFECT_LEDGER_DOCUMENT's "The document is in the ledger:
+ * void or credit-note it there". Neither half is true, and the second half is the same trap
+ * POST_EFFECT_DRAFT_JOURNAL was written for, one document type over: A CREDIT NOTE POSTS FOR REAL.
+ * Following the advice takes a draft that moved nothing and books a real credit of exactly its
+ * amount, with the draft still sitting there.
+ *
+ * The wording is `unrecorded-posted-document.ts`'s CREATE_DRAFT remedy, said in this record's own
+ * voice. That module is the sibling this defect was found in and corrected in (o3d-batch-ret r10);
+ * what was left behind here was the READER, not the rule.
+ */
+const POST_EFFECT_DRAFT_LEDGER_DOCUMENT = {
+  effect: 'created a DRAFT document in Xero (nothing posted to the ledger)',
+  remedy: 'The document is a DRAFT — it has not reached the ledger and no balances have moved. DELETE the draft '
+    + 'in Xero if it should not exist. Do NOT void it, credit-note it or reverse it: a credit note POSTS FOR '
+    + 'REAL, so it would move the accounts by exactly the amount this draft never moved, and leave the draft '
+    + 'sitting there as well.',
+} as const
+/**
+ * o3d-d3re — AND AN UPDATE SENT ON `draft` CHANGED A DOCUMENT THAT IS UNPOSTED.
+ *
+ * Both update handlers resolve their status from the same `_postingMode` the creates do (see
+ * DRAFT_CAPABLE_SEMANTICS, which is where that fact is established rather than re-derived), so an
+ * update issued while the setting is `draft` left an unposted draft behind and moved nothing.
+ *
+ * THIS IS THE ONE DRAFT WORDING THAT MUST NOT SAY "DELETE IT", which is why it is a separate
+ * constant rather than a reuse of the one above: the draft this attempt changed STOOD THERE BEFORE
+ * the attempt ran, so deleting it destroys work this row never created. Same rule, same reasoning
+ * and same conclusion as the sibling record's UPDATE_DRAFT.
+ */
+const POST_EFFECT_DRAFT_DOCUMENT_UPDATE = {
+  effect: 'MODIFIED an existing Xero DRAFT document (nothing posted to the ledger)',
+  remedy: 'No new document was created — an existing DRAFT was changed, and no balances have moved. Compare it '
+    + 'against IMS and correct it in Xero if the change should not stand. Do NOT delete it: the draft existed '
+    + 'before this attempt ran. There is nothing to void, credit-note or reverse.',
+} as const
 const POST_EFFECT_PAYMENT = {
   effect: 'APPLIED a payment in Xero',
   remedy: 'A payment is applied against the document named above: remove or reverse THAT PAYMENT in Xero if it '
@@ -3685,18 +3729,61 @@ const POST_EFFECT: Record<AccountingSyncType, { effect: string; remedy: string }
 }
 
 /**
- * The table above answers "what does posting this TYPE do"; the posting mode answers "did it actually
- * reach the ledger". Only the journal types have a mode that changes the answer, and the branch is
- * keyed on the shared constant rather than on a type list, so a journal type added to the table gets
- * the draft wording for free. `resolveJournalStatus` is reused rather than re-tested so the remedy
- * cannot drift from the status the request was actually sent with.
+ * WHAT A DRAFT ATTEMPT LEFT BEHIND, PER SEMANTIC — INDEXED BY THE SHARED AXIS (o3d-d3re).
+ *
+ * `Record<DraftCapableSemantic, …>` and not `Partial<Record<PostedOperationSemantic, …>>`, for the
+ * reason the POST_EFFECT table above is exhaustive over `AccountingSyncType`: a FOURTH member added
+ * to `DRAFT_CAPABLE_SEMANTIC_LIST` in unrecorded-posted-document.ts must fail the type-check HERE
+ * rather than silently inheriting the live wording. That silent inheritance is this issue: the
+ * previous branch tested `effect === POST_EFFECT_JOURNAL`, so widening the draft rule in the
+ * sibling — which o3d-e2mz r5 did, and which this issue's id is cited approvingly for — changed
+ * nothing here at all.
  */
-function postEffectFor(type: AccountingSyncType, payload: SyncPayload): { effect: string; remedy: string } {
+const POST_EFFECT_DRAFT_BY_SEMANTIC: Record<DraftCapableSemantic, { effect: string; remedy: string }> = {
+  CREATE_DOCUMENT: POST_EFFECT_DRAFT_LEDGER_DOCUMENT,
+  UPDATE_DOCUMENT: POST_EFFECT_DRAFT_DOCUMENT_UPDATE,
+  POST_JOURNAL: POST_EFFECT_DRAFT_JOURNAL,
+}
+
+/**
+ * The table above answers "what does posting this TYPE do"; the posting mode answers "did it
+ * actually reach the ledger". THOSE ARE TWO INDEPENDENT AXES, and this function used to collapse
+ * them into one test against one wording object.
+ *
+ * o3d-d3re — WHAT THAT TEST GOT WRONG. `effect === POST_EFFECT_JOURNAL && resolveJournalStatus(…)
+ * === 'DRAFT'` asked whether the TYPE's live wording happened to be the journal one. `_postingMode`
+ * is a per-sync-type operator setting and the create and update handlers resolve their status from
+ * it exactly as the journal handler does, so on `draft` an invoice, a bill, a credit note and both
+ * *_UPDATE types are unposted drafts too — and every one of them was handed
+ * POST_EFFECT_LEDGER_DOCUMENT's "void or credit-note it there".
+ *
+ * WHY IT IS NOT A SECOND `if`. The semantic axis and the draft-capable set are
+ * unrecorded-posted-document.ts's, imported rather than restated: `operationSemanticFor` is the same
+ * classification the unrecorded-post record uses, and indexing a `Record<DraftCapableSemantic, …>`
+ * with it makes the two records structurally unable to disagree about WHICH operations have a draft
+ * form. The sibling was corrected on its own (o3d-batch-ret r10) and this reader was not, which is
+ * the shape the fix has to remove and not merely the bug.
+ *
+ * `xeroPostingMode` rather than `resolveJournalStatus`: it is the reading of `_postingMode` the
+ * sibling record is built from, and tests/accounting/unrecorded-outcome-decides-the-remedy.test.ts
+ * already holds it to the two status resolvers, so the remedy cannot drift from the status the
+ * request was actually sent with.
+ *
+ * EXPORTED for tests/accounting/post-effect-draft-remedy.test.ts, which walks the whole
+ * `AccountingSyncType` x posting-mode matrix. It is not called anywhere else: the WIRING — that the
+ * escalation an operator reads takes its remedy from here — stays pinned end to end by the two
+ * draft/submitted journal tests in tests/accounting/xero-sync-attempt-fence.test.ts, which drive the
+ * real `processPendingXeroSync` loop and would fail if this function stopped being consulted.
+ */
+export function postEffectFor(type: AccountingSyncType, payload: SyncPayload): { effect: string; remedy: string } {
   const effect = POST_EFFECT[type]
-  if (effect === POST_EFFECT_JOURNAL && resolveJournalStatus(payload._postingMode) === 'DRAFT') {
-    return POST_EFFECT_DRAFT_JOURNAL
-  }
-  return effect
+  if (xeroPostingMode(payload) !== 'DRAFT') return effect
+  const semantic = operationSemanticFor(type)
+  // A semantic with no draft form — APPLY_PAYMENT (Xero payments have no draft status),
+  // LEDGER_NON_DOCUMENT, NO_LEDGER_EFFECT — keeps its live wording, which is already correct for it.
+  return (semantic !== undefined && semantic in POST_EFFECT_DRAFT_BY_SEMANTIC)
+    ? POST_EFFECT_DRAFT_BY_SEMANTIC[semantic as DraftCapableSemantic]
+    : effect
 }
 
 /**

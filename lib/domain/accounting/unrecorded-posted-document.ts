@@ -927,9 +927,26 @@ export const OPERATION_SEMANTIC_BY_TYPE =
  * feels like it creates something. A payment is the only document operation that does not: Xero
  * Payments have no draft form and no status is resolved for them.
  */
-const DRAFT_CAPABLE_SEMANTICS = new Set<PostedOperationSemantic>([
-  'CREATE_DOCUMENT', 'UPDATE_DOCUMENT', 'POST_JOURNAL',
-])
+export const DRAFT_CAPABLE_SEMANTIC_LIST = ['CREATE_DOCUMENT', 'UPDATE_DOCUMENT', 'POST_JOURNAL'] as const
+
+/**
+ * o3d-d3re — THE SET AS A TYPE, so a SECOND reader of it is exhaustive by the compiler.
+ *
+ * `postEffectFor` (lib/connectors/xero/sync-processor.ts) answers the same question this module's
+ * incident kinds do — what did a successful attempt actually leave behind, and what may an operator
+ * do about it — for the fence-loss escalation instead of for the unrecorded-post record. It had its
+ * own hand-written version of the branch below, keyed on the journal wording object alone, so an
+ * invoice or credit note created as a DRAFT earned "void or credit-note it there": both halves
+ * false, and a credit note POSTS FOR REAL. It now indexes a table by this union, which means a
+ * FOURTH draft-capable semantic added here fails ITS type-check as well as the ones in this file.
+ *
+ * A `Set` cannot do that — `Set<PostedOperationSemantic>.has()` accepts any semantic and returns a
+ * boolean, so a reader keyed on it silently inherits the live wording for anything new. The set is
+ * DERIVED from the list rather than written beside it.
+ */
+export type DraftCapableSemantic = (typeof DRAFT_CAPABLE_SEMANTIC_LIST)[number]
+
+const DRAFT_CAPABLE_SEMANTICS = new Set<PostedOperationSemantic>(DRAFT_CAPABLE_SEMANTIC_LIST)
 
 /** The operation types this map classifies as reaching no ledger document — derived, never re-listed. */
 type NonDocumentOperationType = {
