@@ -1039,6 +1039,13 @@ const DATABASE_EXECUTION_PATHS: Record<string,
   // comments. Rewording that sentence to dodge this scan would delete the lesson to satisfy the
   // detector, so it is classified instead.
   'scripts/check-documented-env-vars.mjs': 'names-the-tools-only',
+  // o3d-272i r4's shopping_sync_logs row-family guard. It reads the TypeScript AST and the
+  // migration .sql text and executes nothing anywhere. It is discovered here because it EXPLAINS
+  // that reading only template literals identified its subject by node kind — and that
+  // `$queryRawUnsafe` / `$executeRawUnsafe`, which take a plain string, are what one pair of quotes
+  // buys — so it names the two methods in prose. Naming them is the whole point of the sentence;
+  // rewording it to dodge this scan would delete the reason the guard reads plain strings at all.
+  'scripts/check-wc-sync-row-predicates.mjs': 'names-the-tools-only',
   // o3d-2sm1.1's two cutover probes. `check-db-writers.mjs` reads pg_stat_activity to prove the
   // predecessor is STOPPED before a migration is applied; `run-migration-verifications.mjs` runs
   // the read-only checks a migration declares in its own verify.sql, after the schema has moved and

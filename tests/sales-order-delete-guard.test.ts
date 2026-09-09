@@ -6,6 +6,12 @@ import {
   dailyBatchReferenceWhere,
   findSalesOrderDeleteBlocker,
 } from '@/lib/domain/sales/order-delete-guard'
+import {
+  matchesWhere as matches,
+  shoppingSyncLogFake,
+  type ShoppingSyncLogRow,
+  type WhereNode,
+} from './helpers/shopping-sync-log-fake'
 
 type SyncLogRow = {
   id: string
@@ -20,51 +26,12 @@ type SyncLogRow = {
   settlementBasis?: string | null
 }
 
-type WhereNode = Record<string, unknown>
-
 /**
- * Tiny evaluator for the exact `where` shapes order-delete-guard builds: scalar equality,
- * `{ in: [...] }`, `{ startsWith }` and `OR`. Deliberately strict — an unsupported operator
- * throws rather than silently matching, so a future guard change that emits something new
- * fails loudly here instead of quietly passing.
+ * o3d-272i: the `where` evaluator and the shopping_sync_logs delegate moved to
+ * tests/helpers/shopping-sync-log-fake.ts, so this guard and the store-rebind guard are tested
+ * against ONE reading of a Prisma predicate — the same reason the predicate itself is now defined
+ * once. It is still deliberately strict: an unsupported operator throws rather than matching.
  */
-function matches(row: SyncLogRow, where: WhereNode): boolean {
-  for (const [key, condition] of Object.entries(where)) {
-    if (key === 'OR') {
-      const branches = condition as WhereNode[]
-      if (!branches.some((branch) => matches(row, branch))) return false
-      continue
-    }
-    if (key === 'AND') {
-      const branches = condition as WhereNode[]
-      if (!branches.every((branch) => matches(row, branch))) return false
-      continue
-    }
-    const value = (row as unknown as Record<string, unknown>)[key]
-    if (condition !== null && typeof condition === 'object') {
-      const operators = condition as Record<string, unknown>
-      for (const [operator, operand] of Object.entries(operators)) {
-        if (operator === 'in') {
-          if (!(operand as unknown[]).includes(value)) return false
-        } else if (operator === 'startsWith') {
-          if (typeof value !== 'string' || !value.startsWith(operand as string)) return false
-        } else if (operator === 'not') {
-          // Only `{ not: null }` is emitted — "carries an external id, whatever its status".
-          if (operand === null) {
-            if (value === null || value === undefined) return false
-          } else if (value === operand) {
-            return false
-          }
-        } else {
-          throw new Error(`unsupported operator in test evaluator: ${operator}`)
-        }
-      }
-      continue
-    }
-    if (value !== condition) return false
-  }
-  return true
-}
 
 function makeTx(seed: {
   pushLink?: {
@@ -97,12 +64,22 @@ function makeTx(seed: {
     statusLabel: string
     lastError?: string | null
   } | null
-  /** A deliberately parked WooCommerce refund — creates no SalesOrderRefund (o3d-7yf). */
-  parkedRefund?: { id: string } | null
+  /**
+   * Rows in `shopping_sync_logs` for this order. o3d-272i: the guard now reads the SHARED
+   * `unresolvedWcOrderRowWhere()` predicate and reports a blocker PER FAMILY, so the fixture is a
+   * table of rows and the fake actually EVALUATES the predicate against them.
+   *
+   * The predecessor of this fixture was `parkedRefund: { id } | null` served by a `findFirst` that
+   * ignored its `where` entirely. That made every assertion about the park blocker a statement about
+   * the fixture rather than about the predicate: the guard could have asked for anything at all —
+   * including the old copy with no `recordKind`, which is the defect o3d-272i exists to remove — and
+   * the test would have passed unchanged.
+   */
+  shoppingSyncLogs?: ShoppingSyncLogRow[]
 }) {
   return {
     wmsOrderStatusSnapshot: { findUnique: async () => seed.wmsSnapshot ?? null },
-    shoppingSyncLog: { findFirst: async () => seed.parkedRefund ?? null },
+    shoppingSyncLog: shoppingSyncLogFake(seed.shoppingSyncLogs ?? []),
     salesOrder: {
       findUnique: async () => ({
         accountingInvoiceId: seed.order?.accountingInvoiceId ?? null,
@@ -986,7 +963,7 @@ test('a PARKED WooCommerce refund blocks the delete, and outranks every other bl
   const blocker = await findSalesOrderDeleteBlocker(
     makeTx({
       pushLink: { state: 'SYNCED', externalOrderId: '55', externalOrderNumber: 'WMS-55' },
-      parkedRefund: { id: 'log-1' },
+      shoppingSyncLogs: [{ id: 'log-1', recordKind: 'WC_REFUND_PARK' }],
     }),
     'order-1',
     STAMPS,
@@ -1000,13 +977,98 @@ test('no parked refund leaves the other blockers ranked as before (o3d-7yf)', as
   const blocker = await findSalesOrderDeleteBlocker(
     makeTx({
       pushLink: { state: 'SYNCED', externalOrderId: '55', externalOrderNumber: 'WMS-55' },
-      parkedRefund: null,
+      shoppingSyncLogs: [],
     }),
     'order-1',
     STAMPS,
   )
 
   assert.equal(blocker?.code, 'wms_order_push_link')
+})
+
+// ---------------------------------------------------------------------------
+// o3d-272i — the family the delete guard used to call a refund.
+// ---------------------------------------------------------------------------
+
+test('o3d-272i: a HELD SALES INVOICE blocks the delete and is described as one, not as a refund', async () => {
+  // THE DEFECT. The guard's predicate was a hand-written copy of the pre-`recordKind` refund-park
+  // shape, and a held sales invoice (o3d-k26m.6) writes the same connector, direction, entityType,
+  // PENDING and entityId — so it matched, and the operator was told the order had "an unresolved
+  // WooCommerce refund parked for review" and sent to the refund recovery inbox, which does not list
+  // holds. The SET was right; the SENTENCE was false and the remedy led nowhere.
+  //
+  // MUTATION ROUTE: point the guard back at one blocker code for the whole set. `held_sales_invoice`
+  // is not reported, and the message says "refund" about an invoice again.
+  const blocker = await findSalesOrderDeleteBlocker(
+    makeTx({ shoppingSyncLogs: [{ id: 'log-hold', recordKind: 'WC_HELD_SALES_INVOICE' }] }),
+    'order-1',
+    STAMPS,
+  )
+
+  assert.equal(blocker?.code, 'held_sales_invoice', 'a hold blocks the delete in its own right')
+  assert.ok(
+    !/\brefund/i.test(blocker!.message),
+    `an invoice hold must not be described as a refund: ${blocker!.message}`,
+  )
+  assert.match(blocker!.message, /invoice/i)
+})
+
+test('o3d-272i: a park outranks a hold when the order carries both', async () => {
+  const blocker = await findSalesOrderDeleteBlocker(
+    makeTx({
+      shoppingSyncLogs: [
+        { id: 'log-hold', recordKind: 'WC_HELD_SALES_INVOICE' },
+        { id: 'log-park', recordKind: 'WC_REFUND_PARK', status: 'FAILED' },
+      ],
+    }),
+    'order-1',
+    STAMPS,
+  )
+  // The money has already left the business for a park; nothing has posted for a hold.
+  assert.equal(blocker?.code, 'parked_refund')
+})
+
+test('o3d-272i: the guard asks the row what it IS — an unstamped row is not a blocker', async () => {
+  // THE BEHAVIOUR THE `recordKind` CLAUSE BUYS, stated where it can fail. Migration
+  // 20260822120000 stamps every pre-existing actionable row that names an order, and refuses to let
+  // the cutover finish while one is left NULL — so after it there are no unstamped rows, and a row
+  // that turns up with no stamp is a family this build has never heard of rather than one of these
+  // two.
+  //
+  // MUTATION ROUTE, AND THIS IS THE DECISIVE ONE: drop `recordKind` from
+  // `unresolvedWcOrderRowWhere()`. Both rows below are admitted again, neither matches a known
+  // family, and the guard's fail-closed branch reports `unresolved_wc_sync_row` — so this test goes
+  // red at THIS reader, as it must at every other one.
+  const blocker = await findSalesOrderDeleteBlocker(
+    makeTx({
+      shoppingSyncLogs: [
+        { id: 'log-unstamped', recordKind: null },
+        { id: 'log-unknown', recordKind: 'WC_SOMETHING_ELSE' },
+      ],
+    }),
+    'order-1',
+    STAMPS,
+  )
+  assert.equal(blocker, null)
+})
+
+test('o3d-272i: a resolved park, a park on another order and an outbound row are all ignored', async () => {
+  // PRECONDITION FOR THE TESTS ABOVE: the fake really evaluates the predicate. If it matched
+  // everything it was handed, every assertion in this section would be about the fixture.
+  const blocker = await findSalesOrderDeleteBlocker(
+    makeTx({
+      shoppingSyncLogs: [
+        { id: 'log-synced', status: 'SYNCED' },
+        { id: 'log-other-order', entityId: 'order-2' },
+        { id: 'log-outbound', direction: 'TO_CONNECTOR' },
+        { id: 'log-other-connector', connector: 'shopify' },
+        { id: 'log-product', entityType: 'Product' },
+      ],
+    }),
+    'order-1',
+    STAMPS,
+  )
+  assert.equal(blocker, null)
 })
 
 // --- o3d-2y1c: a committed shipment is local evidence that fulfilment has started ----------------

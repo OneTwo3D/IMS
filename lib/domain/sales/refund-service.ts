@@ -54,6 +54,7 @@ import { lockSalesOrder } from '@/lib/domain/sales/allocation-service'
 export const REFUND_TX_OPTIONS = { maxWait: 5000, timeout: 20000 }
 export { REFUND_ACCOUNTING_LOCK_KEY } from '@/lib/db/advisory-locks'
 import { REFUND_ACCOUNTING_LOCK_KEY } from '@/lib/db/advisory-locks'
+import { activeRefundParkWhere } from '@/lib/domain/sales/refund-park-recovery'
 
 /**
  * Deliberate call-site boundary for this number-shaped refund service contract.
@@ -2979,12 +2980,15 @@ export async function createSalesOrderRefund(
       // parks are resolved atomically after the refund row is created, below.)
       const foreignPark = await tx.shoppingSyncLog.findFirst({
         where: {
-          connector: 'woocommerce',
-          direction: 'FROM_CONNECTOR',
-          entityType: 'SalesOrder',
+          // o3d-272i: the shared park predicate. Hand-written, this had no `recordKind`, so a HELD
+          // SALES INVOICE (o3d-k26m.6) on another order whose external ORDER id happened to equal
+          // this refund's id read as a foreign park — and this branch THROWS, refusing to create a
+          // legitimate refund over a row that is not a park at all. Two different WooCommerce id
+          // spaces, both small integers, compared as strings; the collision needs no coincidence
+          // worth calling one.
+          ...activeRefundParkWhere(),
           externalId: String(input.externalRefundId),
           entityId: { not: input.orderId }, // Prisma `not` also excludes NULL, so this is "another order".
-          status: { in: ['PENDING', 'FAILED', 'QUARANTINED'] },
         },
         select: { entityId: true },
       })
@@ -3848,11 +3852,13 @@ export async function createSalesOrderRefund(
     if (input.externalRefundId != null) {
       await tx.shoppingSyncLog.updateMany({
         where: {
-          connector: 'woocommerce',
-          direction: 'FROM_CONNECTOR',
-          entityType: 'SalesOrder',
+          // o3d-272i: the shared park predicate. As in `resolveActionableParks`, this is an UPDATE,
+          // and without `recordKind` it could settle a held sales invoice to SYNCED on an externalId
+          // collision — releasing a hold on an invoice nothing then posts.
+          ...activeRefundParkWhere(),
           externalId: String(input.externalRefundId),
           entityId: input.orderId,
+          // QUARANTINED is operator-gated (see above), so the status set is narrowed deliberately.
           status: { in: ['PENDING', 'FAILED'] },
         },
         data: { status: 'SYNCED', syncedAt: new Date(), errorMessage: null },

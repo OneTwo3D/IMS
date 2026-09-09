@@ -103,6 +103,7 @@ import { addMoney, roundQuantity, toDecimal, type DecimalInput } from '@/lib/dom
 import { POSTABLE_ACCOUNTING_SYNC_STATUSES } from '@/lib/domain/accounting/postable-sync-statuses'
 import { liveDailyBatchDeferralWhere } from '@/lib/domain/accounting/daily-batch-discount-fence'
 import { buildDiscountRestatement } from '@/lib/domain/accounting/discount-restatement'
+import { activeRefundParkWhere } from '@/lib/domain/sales/refund-park-recovery'
 
 import { resolveWcOrderLevelDiscount } from './field-mapping'
 import { readPostedInvoiceOrderDiscount } from '@/lib/domain/accounting/posted-order-discount'
@@ -1283,13 +1284,20 @@ async function readLiveRefundEvidence(
 /**
  * WOOCOMMERCE REFUNDS THAT ARRIVED AND COULD NOT BE RECORDED (o3d-y14 r7 finding 1).
  *
- * THE PREDICATE IS THE INDEX'S. `shopping_sync_logs_active_refund_park_uq` (migration
- * 20260721150000) is a partial unique index on exactly `connector = 'woocommerce' AND direction =
- * 'FROM_CONNECTOR' AND entityType = 'SalesOrder' AND status IN (PENDING, FAILED, QUARANTINED) AND
+ * THE PREDICATE IS THE INDEX'S. `shopping_sync_logs_active_refund_park_uq` is a partial unique
+ * index on exactly `connector = 'woocommerce' AND direction = 'FROM_CONNECTOR' AND entityType =
+ * 'SalesOrder' AND recordKind = 'WC_REFUND_PARK' AND status IN (PENDING, FAILED, QUARANTINED) AND
  * externalId IS NOT NULL AND entityId IS NOT NULL`, and `upsertRefundPark` matches it deliberately
  * "EXACTLY so this can never pick up an order-import failure log (same connector/type but no
  * entityId)". Copying that predicate rather than inventing a looser one is what keeps this from
  * counting an unrelated failed order import as a refund.
+ *
+ * THE `recordKind` CLAUSE ARRIVED LATE, AND IN THE INDEX LATEST OF ALL (o3d-272i r2). 20260721150000
+ * built the index a month before the column existed, so until 20260909090000 the DDL still said
+ * "any actionable WooCommerce sales-order row with both ids" — which is a held sales invoice too.
+ * The predicate above is now rendered from one object in lib/domain/sales/wc-sync-row-families.ts
+ * and the migration carries that rendered text, so this description cannot go stale again without a
+ * test saying so.
  *
  * WHY ALL THREE STATUSES, and not just QUARANTINED. Each means the refund is UNRESOLVED, and
  * unresolved is the whole point — the money left WooCommerce and IMS holds no refund row for it:
@@ -1317,12 +1325,25 @@ export async function readWcCouponRefundParks(
 /**
  * The park predicate, shared by the report (which reads them in bulk) and the apply-time read above,
  * so the reviewer is shown the same set apply compares against.
+ *
+ * IT IS `activeRefundParkWhere`, NOT A COPY OF IT (o3d-272i). This used to be a hand-written
+ * five-clause predicate with no `recordKind`, and it was the one of the four copies that was simply
+ * WRONG: a held sales invoice (o3d-k26m.6) writes the same connector, direction, `SalesOrder` and an
+ * actionable status, so it was counted here as unresolved REFUND evidence. That evidence is what
+ * `wcCouponCorrectionNeedsLedgerAdjustment` classifies the handoff on, so an order with no refund at
+ * all — only an invoice waiting for its number — was reported as carrying one, and the coupon
+ * correction was routed to a human on the strength of it. This reader has no protective role, so
+ * pointing it at the shared refund predicate is the whole fix.
+ *
+ * THE ONE CLAUSE THAT IS NOT THE SHARED PREDICATE'S, and why it stays. `externalId: { not: null }`
+ * is a genuine narrowing this site needs rather than a leftover: `readWcCouponRefundParks` returns
+ * the parks' `externalId`s AS the posted-document evidence, and a park with none contributes a null
+ * to that list. Every park `upsertRefundPark` writes has one, so the clause selects the same rows
+ * today — it is here to keep the RETURN TYPE honest, not to change the set, and it is stated as an
+ * addition to the shared predicate rather than as a re-statement of it.
  */
 export const WC_COUPON_REFUND_PARK_WHERE = {
-  connector: 'woocommerce',
-  direction: 'FROM_CONNECTOR',
-  entityType: 'SalesOrder',
-  status: { in: ['PENDING', 'FAILED', 'QUARANTINED'] },
+  ...activeRefundParkWhere(),
   externalId: { not: null },
 } as const satisfies Prisma.ShoppingSyncLogWhereInput
 

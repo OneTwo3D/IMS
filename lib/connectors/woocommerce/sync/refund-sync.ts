@@ -405,11 +405,16 @@ async function resolveActionableParks(
 ): Promise<void> {
   await client.shoppingSyncLog.updateMany({
     where: {
-      connector: 'woocommerce',
-      direction: 'FROM_CONNECTOR',
-      entityType: 'SalesOrder',
+      // o3d-272i: the shared park predicate, not a copy of the pre-recordKind shape. This is an
+      // UPDATE, and without `recordKind` it selected a held sales invoice (o3d-k26m.6) whose
+      // externalId happened to equal this refund's id on this order — settling to SYNCED a hold that
+      // nothing then posts, which is exactly the collision r8 added the column to end, running in
+      // the direction that writes.
+      ...activeRefundParkWhere(),
       externalId,
       entityId: soId,
+      // QUARANTINED is left untouched (see above), so the status set is narrowed rather than taken
+      // from the shared predicate.
       status: { in: ['PENDING', 'FAILED'] },
     },
     data: { status: 'SYNCED', syncedAt: new Date(), errorMessage: null },
@@ -425,8 +430,10 @@ async function upsertRefundPark(
   input: { soId: string; externalId: string; status: 'PENDING' | 'FAILED' | 'QUARANTINED'; errorMessage: string; payload?: unknown },
 ): Promise<void> {
   // Match the partial unique index shopping_sync_logs_active_refund_park_uq EXACTLY (connector, direction,
-  // entityType, actionable status, externalId, and entityId NOT NULL) so this can never pick up an
-  // order-import failure log (same connector/type but no entityId) that happens to share an externalId.
+  // entityType, recordKind, actionable status, externalId, and entityId NOT NULL) so this can never pick up
+  // an order-import failure log (same connector/type but no entityId) that happens to share an externalId.
+  // o3d-272i r2: "EXACTLY" was aspirational until 20260909090000 — the index had no recordKind clause, so it
+  // ALSO covered the held sales invoice, and refused a park whose refund id equalled some order id.
   // o3d-xnwu r7: the shape is stated ONCE, in activeRefundParkWhere, because the exception inbox and
   // the cross-order guard below have to mean exactly this by "an actionable park" and three
   // hand-written copies could not be relied on to.
