@@ -82,7 +82,12 @@ const BEFORE_READ = new Date('2026-08-20T11:00:00.000Z')
 const AFTER_READ = new Date('2026-08-20T12:00:01.000Z')
 
 const registration = (overrides: Partial<RegisteredPaymentRow> = {}): RegisteredPaymentRow => {
-  const row = { id: 'log_1', status: 'SYNCED', externalTransactionId: 'PAY-1', syncedAt: BEFORE_READ, ...overrides }
+  // o3d-f709: both markers default to null — the shape almost every real cancelled row has, and the
+  // one `mayHaveReachedLedger` refuses to read as "nothing was sent".
+  const row = {
+    id: 'log_1', status: 'SYNCED', externalTransactionId: 'PAY-1', syncedAt: BEFORE_READ,
+    abandonedBeforeRemoteCall: null, settlementBasis: null, ...overrides,
+  }
   return { syncedAtDatabaseClock: row.syncedAt, ...row }
 }
 

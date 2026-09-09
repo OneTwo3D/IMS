@@ -67,6 +67,8 @@ const STALE_COMPLETION = new Date('2026-08-20T09:00:00.000Z')
 const staleRegistration: RegisteredPaymentRow = {
   id: 'log_stale',
   status: 'SYNCED',
+  abandonedBeforeRemoteCall: null,
+  settlementBasis: null,
   externalTransactionId: 'PAY-OLD',
   syncedAt: STALE_COMPLETION,
   // Database-minted and equal, so `databaseStampedCompletion` vouches for it: this row is not
@@ -121,6 +123,10 @@ test('[o3d-psrx r6] the part-covered order\'s OWN receipt is not withheld by the
   const ownRegistration: RegisteredPaymentRow = {
     id: 'log_own',
     status: 'SYNCED',
+    // o3d-f709: neither marker set — named because the type requires it, so a reader cannot ask
+    // `mayHaveReachedLedger` without having loaded the columns that answer it.
+    abandonedBeforeRemoteCall: null,
+    settlementBasis: null,
     externalTransactionId: 'PAY-NEW',
     syncedAt: new Date('2026-08-20T11:00:00.000Z'),
     syncedAtDatabaseClock: new Date('2026-08-20T11:00:00.000Z'),
@@ -160,6 +166,8 @@ test('[o3d-psrx r6] the part-covered order\'s OWN receipt is not withheld by the
 const pennyRegistration: RegisteredPaymentRow = {
   id: 'log_penny',
   status: 'SYNCED',
+  abandonedBeforeRemoteCall: null,
+  settlementBasis: null,
   externalTransactionId: 'PAY-PENNY',
   syncedAt: new Date('2026-08-20T11:00:00.000Z'),
   syncedAtDatabaseClock: new Date('2026-08-20T11:00:00.000Z'),

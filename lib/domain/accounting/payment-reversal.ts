@@ -10,6 +10,7 @@ import {
   type RegisteredPaymentRow,
   type RegisteredPaymentVerdict,
 } from '@/lib/connectors/xero/invoice-delta'
+import { MAY_HAVE_REACHED_LEDGER_WHERE } from '@/lib/domain/accounting/cancelled-row-evidence'
 import { storedBodyMayHaveReachedTheLedger } from '@/lib/domain/accounting/followup-idempotency'
 import { payloadAccountingInvoiceId, payloadPaymentId, payloadRegisteredAmount } from '@/lib/domain/accounting/invoice-payment-enqueue'
 import { toDecimal, type Decimal } from '@/lib/domain/math/decimal'
@@ -188,6 +189,11 @@ export async function readPaidProvenanceVerdicts<T extends PaidProvenanceDoc>(
     select: {
       id: true, referenceId: true, status: true, externalTransactionId: true,
       syncedAt: true, syncedAtDatabaseClock: true,
+      // o3d-f709: the two columns that say what a CANCELLED row's status is allowed to mean.
+      // `classifyRegisteredPayment` used to skip every CANCELLED registration outright; it asks
+      // `mayHaveReachedLedger` now, and a caller that asks that question without loading these
+      // columns does not compile (see LEDGER_STANDING_SELECT).
+      abandonedBeforeRemoteCall: true, settlementBasis: true,
       // o3d-psrx: the receipt this registration NAMES, so a local receipt no registration names can
       // be told from one that is already spoken for. Read through the same `payloadPaymentId` the
       // enqueue writes it with, never re-spelt here.
@@ -241,6 +247,9 @@ export async function readPaidProvenanceVerdicts<T extends PaidProvenanceDoc>(
       externalTransactionId: row.externalTransactionId,
       syncedAt: row.syncedAt,
       syncedAtDatabaseClock: row.syncedAtDatabaseClock,
+      // o3d-f709 — carried, not consulted here: `classifyRegisteredPayment` is the reader.
+      abandonedBeforeRemoteCall: row.abandonedBeforeRemoteCall,
+      settlementBasis: row.settlementBasis,
       // o3d-psrx r4 (Codex HIGH): WHICH LEDGER DOCUMENT this registration was raised against, read
       // through the same helper the enqueue writes it with and never re-spelt here. Selected because
       // `referenceId` alone groups every registration this order has EVER had — including one against
@@ -922,12 +931,20 @@ export async function markBillPaidSupersedingStaleRegistrations(
     // SYNCED is worse still. So the question is not WHERE it went but THAT it went: a row that
     // changed under us was acted on by a worker, and what that worker sent is not knowable from here.
     //
-    // The only destination that is not a refusal is CANCELLED (someone else retired it pre-call, so
-    // nothing was sent) and disappearance (retention deleted a row that had never been claimed).
+    // The only destination that is not a refusal is a CANCELLED row THAT PROVES ITS OWN ABANDONMENT
+    // WAS PRE-CALL, and disappearance (retention deleted a row that had never been claimed).
+    //
+    // o3d-f709: this used to be a bare `status: { not: 'CANCELLED' }` under a comment reading
+    // "someone else retired it pre-call, so nothing was sent". Only ONE canceller can say that —
+    // `cancelOrphanedRowsUnderLock`, which matches PENDING and records the fact in the same UPDATE.
+    // `cancelPendingSalesInvoiceSyncForOrder`, the post-time retirement of a claimed row and an
+    // operator's own NOT_POSTED settlement all reach CANCELLED as well, and the first two of those
+    // establish nothing at all. The rule is stated once in `cancelled-row-evidence.ts`.
+    //
     // Refusing costs one attempt: the row now records its own outcome, and the next try sees it in the
     // survey where it is judged on what it says.
     const moved = await client.accountingSyncLog.findMany({
-      where: { id: { in: requestedIds }, status: { not: 'CANCELLED' } },
+      where: { id: { in: requestedIds }, ...MAY_HAVE_REACHED_LEDGER_WHERE },
       select: { id: true },
     })
     if (moved.length > 0) {

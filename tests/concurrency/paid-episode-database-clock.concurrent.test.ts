@@ -618,6 +618,10 @@ test(
     const registration = {
       id: 'log_1',
       status: 'SYNCED',
+      // o3d-f709: neither marker set — the ordinary shape. Named rather than defaulted, so a reader
+      // cannot ask `mayHaveReachedLedger` without having loaded the columns that answer it.
+      abandonedBeforeRemoteCall: null,
+      settlementBasis: null,
       externalTransactionId: 'PAY-1',
       syncedAt: completedAt,
       syncedAtDatabaseClock: completedAt,
