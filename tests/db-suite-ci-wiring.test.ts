@@ -312,8 +312,15 @@ test('a CI job runs npm run test:db against a migrated postgres service', () => 
   // direction is the safe one: it catches the PARSER reading LESS than the document declares, which
   // would turn every assertion below into a question asked of nothing. A parser reading more than
   // the document is not a risk it can create.
-  const declared = [...source.matchAll(/^ {2}([A-Za-z0-9_-]+):[ \t]*$/gm)].map((match) => match[1])
-    .filter((name) => new RegExp(`^jobs:$[\\s\\S]*^ {2}${name}:`, 'm').test(source))
+  const lines = source.split('\n')
+  const jobsAt = lines.indexOf('jobs:')
+  assert.ok(jobsAt >= 0, `${WORKFLOW} has no top-level jobs: key`)
+  const afterJobs = lines.slice(jobsAt + 1)
+  const endOfJobs = afterJobs.findIndex((line) => /^\S/.test(line))
+  const declared = (endOfJobs < 0 ? afterJobs : afterJobs.slice(0, endOfJobs))
+    .map((line) => /^ {2}([A-Za-z0-9_-]+):[ \t]*$/.exec(line))
+    .filter((match): match is RegExpExecArray => match !== null)
+    .map((match) => match[1])
   for (const name of declared) {
     assert.ok(jobs.has(name),
       `${WORKFLOW} declares a job "${name}" that the workflow parser did not read; every check below `
