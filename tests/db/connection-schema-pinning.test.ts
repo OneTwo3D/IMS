@@ -165,6 +165,9 @@ test('o3d-2k5r r18: every non-ASCII character in the startup options is refused,
  *
  * `pg_split_opts()` tests `isspace((unsigned char) *optstr)`, which in the C locale is exactly
  * these. Round 12 taught the READER all six; round 13 is about the WRITER agreeing.
+ *
+ * THIS LIST IS VERSION-INDEPENDENT AND THE MODULE'S `SCANNER_WHITESPACE` IS NOT, even though they
+ * hold the same six characters on this host — see `VERTICAL_TAB` below (o3d-ik1j).
  */
 const BACKEND_SEPARATORS: [string, string][] = [
   ['space', ' '],
@@ -177,6 +180,44 @@ const BACKEND_SEPARATORS: [string, string][] = [
 
 /** A schema name carrying every one of them at once. */
 const ALL_SEPARATORS_SCHEMA = BACKEND_SEPARATORS.map(([, separator], index) => `t${index}${separator}`).join('') + 'end'
+
+/**
+ * THE ONE OF THE SIX WHOSE ANSWER IS A PROPERTY OF THE SERVER'S MAJOR VERSION (o3d-ik1j).
+ *
+ * `BACKEND_SEPARATORS` above is `pg_split_opts()`'s list, which is libc's `isspace()` and has
+ * included `\v` on every version. `SCANNER_WHITESPACE` in the module is a DIFFERENT function's
+ * list — `scanner_isspace()`, which `SplitIdentifierString()` trims a `search_path` element with —
+ * and the two are only the same set on PostgreSQL 17 and above.
+ *
+ * PostgreSQL commit ae6d06f09684d8f8a7084514c9b35a274babca61, "Handle \v as a whitespace character
+ * in parsers" (2023-07-05), added `'\v'` to `scanner_isspace()`. It shipped in 17 and was
+ * deliberately NOT back-patched: its own message says changing a parser's behaviour in a stable
+ * branch is too risky. `src/backend/parser/scansup.c` on REL_16_STABLE lists
+ * `' '`, `'\t'`, `'\n'`, `'\r'`, `'\f'`; on REL_17_STABLE it lists those and `'\v'`.
+ *
+ * MEASURED on both rather than read only out of the source, with schemas `tenant` and
+ * `<VT>tenant` both present: `set_config('search_path', chr(11) || 'tenant')` put
+ * `current_schema()` on a SEVEN-character name (the VT kept inside the identifier) on PostgreSQL
+ * 16.14, and on `tenant` on 17.11.
+ *
+ * This is why the tests below ask the server its version instead of asserting one answer: the
+ * first CI run of this whole tier ran against `postgres:16` and the flat six-character assertion
+ * failed there (o3d-n3yt). The module has NOT been made version-aware — that is o3d-ik1j, a
+ * product defect with its own branch — and the characterization test named for it below proves
+ * what the module does on a server that keeps the character.
+ */
+const VERTICAL_TAB = '\v'
+
+/** The first PostgreSQL major whose `scanner_isspace()` answers true for `VERTICAL_TAB`. */
+const SCANNER_ISSPACE_LEARNED_VERTICAL_TAB_IN = 17
+
+/** The server's own major version, asked of the server rather than inferred from the environment. */
+async function serverMajorVersion(admin: pg.Client): Promise<number> {
+  const rows = await admin.query<{ num: string }>("select current_setting('server_version_num') as num")
+  const num = Number(rows.rows[0]?.num)
+  assert.ok(Number.isFinite(num) && num > 0, 'the server names its own version')
+  return Math.floor(num / 10_000)
+}
 
 /**
  * `pg_split_opts()` AS THE BACKEND ACTUALLY RUNS IT: over BYTES, with the locale's own `isspace()`.
@@ -1233,13 +1274,28 @@ test('o3d-2k5r r18 (live): the REAL server carries the escaped character, and it
     // its source. This is `SplitIdentifierString()`/`scanner_isspace()` answering directly, with no
     // part of this module involved: set the GUC to the raw value and ask which schema it resolved.
     // It is a FIXED list, not the locale's, so unlike `pg_split_opts()` it is reproducible here —
-    // which is why six characters can be trimmed with confidence and no byte above 0x7F can.
+    // which is why these characters can be trimmed with confidence and no byte above 0x7F can.
+    //
+    // FIXED IS NOT THE SAME AS VERSION-INDEPENDENT, and this assertion used to conflate the two
+    // (o3d-n3yt: it is the one test that failed on the first CI run of this tier, against
+    // `postgres:16`). FIVE of the six are `scanner_isspace()` on every major; the VERTICAL TAB is
+    // `scanner_isspace()` only from PostgreSQL 17 — see `VERTICAL_TAB` above for the upstream
+    // commit and the measurements on 16.14 and 17.11. So the server is asked its major and held to
+    // the answer THAT major gives; a server that gives neither answer still fails here.
+    const major = await serverMajorVersion(scratch.admin)
     for (const [label, whitespace] of BACKEND_SEPARATORS) {
+      const stripped = whitespace !== VERTICAL_TAB || major >= SCANNER_ISSPACE_LEARNED_VERTICAL_TAB_IN
       await scratch.admin.query('select set_config($1, $2, false)', ['search_path', `${whitespace}tenant`])
       assert.equal(
-        (await scratch.admin.query<{ s: string }>('select current_schema() as s')).rows[0]?.s,
-        'tenant',
-        `${label}: PostgreSQL itself strips this one off a search path element`,
+        (await scratch.admin.query<{ s: string | null }>('select current_schema() as s')).rows[0]?.s ?? null,
+        // Only `tenant` exists here, so a KEPT character leaves the path naming a schema that does
+        // not exist and `current_schema()` is NULL. The test below creates the other name too, and
+        // so can say WHICH schema a kept character lands on rather than only which it does not.
+        stripped ? 'tenant' : null,
+        stripped
+          ? `${label}: PostgreSQL ${major} itself strips this one off a search path element`
+          : `${label}: PostgreSQL ${major} KEEPS this one — scanner_isspace() learned it in ` +
+            `${SCANNER_ISSPACE_LEARNED_VERTICAL_TAB_IN} (o3d-ik1j)`,
       )
     }
     for (const [label, whitespace] of KEPT_BY_THE_SERVER) {
@@ -1357,6 +1413,131 @@ test('o3d-2k5r r18 (live): the REAL server carries the escaped character, and it
         }
       }
     }
+  } finally {
+    await scratch.drop()
+  }
+})
+
+test('o3d-ik1j (live): PostgreSQL learned the vertical tab in 17, and this module trims it on EVERY version', async (t) => {
+  const scratch = await openScratch(t)
+  if (!scratch) return
+  const quote = (name: string) => `"${name.replace(/"/g, '""')}"`
+  const VT_TENANT = `${VERTICAL_TAB}tenant`
+  try {
+    const major = await serverMajorVersion(scratch.admin)
+    const serverStrips = major >= SCANNER_ISSPACE_LEARNED_VERTICAL_TAB_IN
+
+    // BOTH NAMES EXIST, so whichever the server lands on is NAMED rather than merely "not the
+    // other one" — the same reason the test above creates every name it can land on.
+    for (const name of ['tenant', VT_TENANT]) {
+      await scratch.admin.query(`CREATE SCHEMA ${quote(name)}`)
+      await scratch.admin.query(
+        `CREATE TABLE ${quote(name)}.settings (key text primary key, value text not null, "updatedAt" timestamptz not null)`,
+      )
+    }
+
+    // WHAT THE SERVER DOES WITH THE CHARACTER, asked of this server with no part of the module
+    // involved. This is `SplitIdentifierString()`/`scanner_isspace()` answering directly.
+    await scratch.admin.query('select set_config($1, $2, false)', ['search_path', VT_TENANT])
+    assert.equal(
+      (await scratch.admin.query<{ s: string | null }>('select current_schema() as s')).rows[0]?.s ?? null,
+      serverStrips ? 'tenant' : VT_TENANT,
+      serverStrips
+        ? `PostgreSQL ${major} strips the vertical tab off the element`
+        : `PostgreSQL ${major} keeps the vertical tab INSIDE the identifier`,
+    )
+    await scratch.admin.query("select set_config('search_path','public',false)")
+
+    // WHAT THE MODULE DOES WITH IT: the same thing on every version, which is the defect.
+    // `SCANNER_WHITESPACE` is a fixed six-character set, so `trimScannerWhitespace()` strips the
+    // vertical tab whether or not the server would, and `pgConnectionConfig()` then DELETES the
+    // URL's own `options` and pins the trimmed name.
+    //
+    // The vertical tab must be backslash-escaped to get here at all: unescaped it is a
+    // `pg_split_opts()` separator on every version (libc `isspace()`), which ends the token and
+    // routes the URL to the zero-length-name refusal instead.
+    const url = new URL(scratch.url)
+    url.searchParams.set('options', `-c search_path=\\${VERTICAL_TAB}tenant`)
+    const config = pgConnectionConfig(url.toString())
+    assert.equal(
+      config.options,
+      '-c search_path="tenant"',
+      'the module trims the vertical tab regardless of what the server does with it',
+    )
+
+    // AND WHERE EACH OF THEM PUTS A WRITE, measured rather than reasoned about: the operator's own
+    // URL sent verbatim, and the same URL through the module.
+    const write = async (client: pg.Client, key: string) => {
+      await client.connect()
+      try {
+        await client.query('insert into settings (key, value, "updatedAt") values ($1, $2, now())', [key, 'x'])
+      } finally {
+        await client.end().catch(() => undefined)
+      }
+    }
+    await write(new pg.Client({ ...config, connectionTimeoutMillis: 3_000 }), 'through-the-module')
+    await write(
+      new pg.Client({
+        connectionString: scratch.url,
+        options: `-c search_path=\\${VERTICAL_TAB}tenant`,
+        connectionTimeoutMillis: 3_000,
+      }),
+      'as-the-url-is-written',
+    )
+    const landed = async (name: string) =>
+      (await scratch.admin.query<{ k: string }>(`select key as k from ${quote(name)}.settings order by key`)).rows.map(
+        (row) => row.k,
+      )
+
+    if (serverStrips) {
+      // ON 17 AND ABOVE THE MODULE IS RIGHT, and this half is what must keep passing once o3d-ik1j
+      // is fixed: both routes name the same schema because the server itself trims the character.
+      assert.deepEqual(
+        await landed('tenant'),
+        ['as-the-url-is-written', 'through-the-module'],
+        `PostgreSQL ${major}: both routes resolve the same schema, so the trim matches the server`,
+      )
+      assert.deepEqual(await landed(VT_TENANT), [], `PostgreSQL ${major}: and nothing reaches the other schema`)
+    } else {
+      // ON 16 AND BELOW IT IS A SILENT CROSS-SCHEMA RETARGETING — the defect class
+      // `trimScannerWhitespace()` exists to prevent (o3d-2k5r r15, the U+00A0 finding), in the same
+      // direction, on an ASCII character round 18's non-ASCII refusal does not cover.
+      //
+      // THIS IS A CHARACTERIZATION OF A KNOWN, TRACKED DEFECT, NOT AN ACCEPTED BEHAVIOUR. It is
+      // asserted rather than skipped so that the tests/db tier reports it on every run against a
+      // pre-17 server (this repository's CI runs `postgres:16` and `postgres:14.13`), and so that
+      // it cannot widen unnoticed. When o3d-ik1j is fixed this branch FAILS — deliberately: the
+      // fix must delete it and leave the `serverStrips` half above, which by then holds on every
+      // version.
+      t.diagnostic(
+        `KNOWN DEFECT o3d-ik1j: on PostgreSQL ${major} the server KEEPS a vertical tab in a ` +
+          'search_path element, the module trims it, and the two routes below resolve DIFFERENT schemas',
+      )
+      assert.deepEqual(
+        await landed('tenant'),
+        ['through-the-module'],
+        `PostgreSQL ${major} (o3d-ik1j): the module retargets the write onto the trimmed name`,
+      )
+      assert.deepEqual(
+        await landed(VT_TENANT),
+        ['as-the-url-is-written'],
+        `PostgreSQL ${major} (o3d-ik1j): while the URL as written names a different, existing schema`,
+      )
+    }
+
+    // AND THE CONFLICT GATE IS DISARMED BY THE SAME TRIM, not merely made inaccurate. o3d-1izw
+    // refuses a URL naming two schemas; here the two halves compare EQUAL after the trim, so on a
+    // server that keeps the character a genuine two-schema URL is reported as agreement.
+    const both = new URL(scratch.url)
+    both.searchParams.set('schema', 'tenant')
+    both.searchParams.set('options', `-c search_path=\\${VERTICAL_TAB}tenant`)
+    assert.equal(
+      pgConnectionConfig(both.toString()).options,
+      '-c search_path="tenant"',
+      serverStrips
+        ? `PostgreSQL ${major}: the two halves really do name one schema, so agreement is correct`
+        : `PostgreSQL ${major} (o3d-ik1j): the two halves name DIFFERENT schemas and are accepted as agreement`,
+    )
   } finally {
     await scratch.drop()
   }
