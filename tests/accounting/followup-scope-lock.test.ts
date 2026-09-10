@@ -4,6 +4,7 @@ import path from 'node:path'
 import test from 'node:test'
 
 import { ACCOUNTING_FOLLOWUP_SCOPE_LOCK_NAMESPACE, TWO_INT_ADVISORY_LOCK_NAMESPACES } from '@/lib/db/advisory-locks'
+import { MIRRORED_ACCOUNTING_SYNC_TYPES } from '@/lib/domain/accounting/mirrored-sync-types'
 import { followUpScopeLockId, lockFollowUpScope } from '@/lib/domain/accounting/followup-scope-lock'
 
 /**
@@ -42,9 +43,19 @@ test('a money-moving scope is locked to COMMIT, in its own namespace (o3d-0m56)'
   assert.deepEqual(calls[0]!.values, [ACCOUNTING_FOLLOWUP_SCOPE_LOCK_NAMESPACE, followUpScopeLockId(scope)])
 })
 
-test('nothing but money pays for the lock (o3d-0m56)', async () => {
-  // Ordinary queue traffic — invoices, journals, PDFs, emails — must not serialize on it.
-  for (const type of ['SALES_INVOICE', 'INVOICE_PDF', 'INVOICE_EMAIL', 'COGS_JOURNAL', 'BILL_ATTACHMENT']) {
+test('money AND mirrored types pay for the lock; nothing else does (o3d-11rf)', async () => {
+  // o3d-11rf WIDENED THIS. The rule used to be "money only", and `SALES_INVOICE` was pinned right
+  // here as a type that must NOT take the lock. That was correct for the race o3d-0m56 closed (two
+  // money rows for one document) and wrong for the one o3d-11rf found, because a MIRRORED type
+  // shares one logical accounting-event mirror across every attempt at the same document — and the
+  // settlement action decides whether to VOID that mirror by reading its siblings. A read cannot be
+  // serialised against an INSERT by a row lock, so both sides have to take this.
+  //
+  // The two sets are DISJOINT: MONEY_MOVING_SYNC_TYPES is {INVOICE_PAYMENT, BILL_PAYMENT,
+  // PURCHASE_CREDIT_NOTE_ALLOCATION} and none of those is mirrored. So before o3d-11rf this lock
+  // was taken for exactly no mirrored type, and "settlement takes the same lock the enqueue takes"
+  // would have serialised NOTHING.
+  for (const type of ['INVOICE_PDF', 'INVOICE_EMAIL', 'COGS_JOURNAL', 'BILL_ATTACHMENT', 'WC_INVOICE_NOTE']) {
     const { tx, calls } = txDouble()
     await lockFollowUpScope(tx, { ...scope, type })
     assert.deepEqual(calls, [], `${type} must not take the lock`)
@@ -54,6 +65,40 @@ test('nothing but money pays for the lock (o3d-0m56)', async () => {
     await lockFollowUpScope(tx, { ...scope, type })
     assert.equal(calls.length, 1, `${type} must take it`)
   }
+  for (const type of ['SALES_INVOICE', 'CREDIT_NOTE', 'PURCHASE_INVOICE']) {
+    const { tx, calls } = txDouble()
+    await lockFollowUpScope(tx, { ...scope, type })
+    assert.equal(calls.length, 1, `${type} is mirrored, so it must take it (o3d-11rf)`)
+  }
+})
+
+/**
+ * TOTALITY, so the two rules cannot drift apart. The mirror's type list is maintained in
+ * accounting-event-mirror.ts and grows (six DAILY_BATCH_* variants have been added to it since it
+ * was written). A type added there but not covered here would be a mirrored document whose
+ * settlement and enqueue do not serialise — the o3d-11rf defect, silently reintroduced for one
+ * type. Derived from the exported list rather than restated, and asserted through the REAL lock
+ * rather than through the predicate alone, so it pins what actually reaches PostgreSQL.
+ */
+test('EVERY mirrored sync type takes the scope lock (o3d-11rf)', async () => {
+  assert.ok(MIRRORED_ACCOUNTING_SYNC_TYPES.length >= 13, 'the mirrored list should not have shrunk to nothing')
+  for (const type of MIRRORED_ACCOUNTING_SYNC_TYPES) {
+    const { tx, calls } = txDouble()
+    await lockFollowUpScope(tx, { ...scope, type })
+    assert.equal(calls.length, 1, `${type} is mirrored and must take the scope lock`)
+    assert.deepEqual(calls[0]!.values, [
+      ACCOUNTING_FOLLOWUP_SCOPE_LOCK_NAMESPACE,
+      followUpScopeLockId({ ...scope, type }),
+    ], `${type} must lock its OWN scope`)
+  }
+})
+
+test('the money and mirrored type sets are disjoint — this is why widening was needed (o3d-11rf)', () => {
+  // Recorded as an assertion because the whole argument for the change rests on it. If a type ever
+  // becomes both, the widening is still correct; but the reasoning above stops being the reason.
+  const money = ['INVOICE_PAYMENT', 'BILL_PAYMENT', 'PURCHASE_CREDIT_NOTE_ALLOCATION']
+  const both = MIRRORED_ACCOUNTING_SYNC_TYPES.filter((type) => money.includes(type))
+  assert.deepEqual(both, [], 'no mirrored type was money-moving, so the money gate covered none of them')
 })
 
 test('the lock id is per document, stable, and a signed int32 (o3d-0m56)', async () => {

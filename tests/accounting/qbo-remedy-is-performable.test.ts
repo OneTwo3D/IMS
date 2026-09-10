@@ -91,6 +91,10 @@ function project<T extends Record<string, unknown>>(row: T, select?: Record<stri
 }
 
 const client = {
+  // o3d-11rf: the settlement action now takes the follow-up scope lock inside its transaction, and
+  // `$transaction` below hands the callback THIS object — so the statement channel has to be here,
+  // not on the `db` wrapper. The lock's own semantics are tested in followup-scope-lock.test.ts.
+  $executeRaw: async () => 1,
   accountingSyncLog: {
     findUnique: async ({ where, select }: { where: { id: string }; select?: Record<string, boolean> }) => {
       const row = state.rows.find((r) => r.id === where.id)

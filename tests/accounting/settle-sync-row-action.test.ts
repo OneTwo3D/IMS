@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict'
 import test, { mock } from 'node:test'
+import { ATTEMPT_SETTLED_VOID_BASIS } from '@/lib/domain/accounting/accounting-event-void-basis'
 
 // o3d-nf9i + o3d-osl8 item 2 — settleAccountingSyncRow: its guard, the attempt fence it is the
 // caller of (o3d-e2mz), what the operator's assertion writes, what it refuses and WHY, the shared
@@ -115,6 +116,8 @@ function makeClient() {
         return row ? project(row as unknown as Record<string, unknown>, select) : null
       },
       findMany: async ({ where, select }: { where: Record<string, unknown>; select?: Record<string, boolean> }) => {
+        // Recorded because o3d-11rf is entirely about WHEN this read happens relative to the lock.
+        state.ops.push('syncLog.findMany')
         return state.rows
           .filter((r) => matches(r as unknown as Record<string, unknown>, where))
           .map((r) => project(r as unknown as Record<string, unknown>, select))
@@ -231,6 +234,20 @@ mock.module('next/cache', { namedExports: { revalidatePath: () => {} } })
 mock.module('@/lib/domain/sales/allocation-service', {
   namedExports: {
     lockSalesOrder: async (_tx: unknown, orderId: string) => { state.ops.push(`lockSalesOrder:${orderId}`) },
+  },
+})
+
+// o3d-11rf: the REAL lockFollowUpScope issues `pg_advisory_xact_lock` through $executeRaw, and its
+// own semantics (which types take it, and on what key) are tested in followup-scope-lock.test.ts.
+// Here the double records the CALL, which is the half this action owns: that settlement serialises
+// on the same scope key the enqueue side takes, and does it before it reads the siblings it decides
+// mirror ownership from.
+mock.module('@/lib/domain/accounting/followup-scope-lock', {
+  namedExports: {
+    lockFollowUpScope: async (_tx: unknown, scope: { connector: string; type: string; referenceType: string; referenceId: string }) => {
+      state.ops.push(`lockFollowUpScope:${scope.connector}:${scope.type}:${scope.referenceType}:${scope.referenceId}`)
+    },
+    followUpScopeLockId: () => 0,
   },
 })
 
@@ -598,6 +615,42 @@ test('a mirrored row VOIDs its event and records that it did', async () => {
   assert.equal((settlementAudit()[0].metadata as Record<string, unknown>).mirrorUpdate, 'updated')
 })
 
+test('a NOT_POSTED settlement records WHAT its VOID retires, so a later enqueue can revive it (o3d-11rf r2)', async () => {
+  // The o3d-11rf r2 HIGH is the settlement-then-enqueue order: settlement voids the shared mirror,
+  // and the replacement it makes possible then collides with that VOID. The enqueue may only take
+  // that event back to PENDING if it can tell an attempt-retiring void from a document-retiring one,
+  // and this is the write that tells it. Without the basis on the row the enqueue must refuse both,
+  // which is the broken state — so this pins the ACTION's wiring, not just the policy function.
+  const settle = await loadAction()
+  state.rows = [syncRow({ ...MIRRORED })]
+  state.events = [{ id: 'evt-1', idempotencyKey: mirrorKeyFor(), status: 'PENDING', externalId: null }]
+  const result = await settle('log-1', notPosted())
+  assert.equal(result.success, true)
+  assert.equal(state.events[0].status, 'VOID')
+  assert.equal(
+    (state.events[0] as Record<string, unknown>).voidBasis, ATTEMPT_SETTLED_VOID_BASIS,
+    'the settlement must record that it retired ONE ATTEMPT, not the document',
+  )
+})
+
+test('a POSTED settlement leaves no void basis behind on the event (o3d-11rf r2)', async () => {
+  // The column is a permission. A row that is not VOID must not carry one — a stale
+  // `attempt_settled_not_posted` beside a document id would let a later enqueue revive a posting.
+  const settle = await loadAction()
+  state.rows = [syncRow({ ...MIRRORED })]
+  state.events = [{
+    id: 'evt-1', idempotencyKey: mirrorKeyFor(), status: 'PENDING', externalId: null,
+    voidBasis: ATTEMPT_SETTLED_VOID_BASIS,
+  } as never]
+  const result = await settle('log-1', posted({ externalTransactionId: 'INV-7001' }))
+  assert.equal(result.success, true)
+  assert.equal(state.events[0].status, 'POSTED')
+  assert.equal(
+    (state.events[0] as Record<string, unknown>).voidBasis, null,
+    'a write that leaves the row POSTED must clear the basis',
+  )
+})
+
 test('a mirror that matches no event records `not_found` — the audit never asserts an update that did not happen', async () => {
   // ROUND 2, FINDING 4. The previous attempt wrote `mirrorUpdate: 'applied'` BEFORE calling the
   // updater, and the updater returned silently when no event matched. A missing mirror is a
@@ -702,6 +755,86 @@ test('a live sibling sharing the mirror keeps it — the settlement skips, and s
   const audit = settlementAudit()[0]
   assert.equal((audit.metadata as Record<string, unknown>).mirrorConflictSyncLogId, 'log-2')
   assert.match(String(audit.description), /still owns it/)
+})
+
+// ---------------------------------------------------------------------------
+// o3d-11rf — the mirror decision is SERIALISED, not merely explained
+// ---------------------------------------------------------------------------
+//
+// The sibling read above tells settlement whose mirror it is. Before o3d-11rf that read held no
+// lock on the logical mirror key, and the module said so in a comment: "This read is an
+// EXPLANATION, not a lock; a sibling can still commit after it."
+//
+// The CAS on the mirror write (settlementMirrorGuard) closes ONE direction of that — a sibling that
+// has already POSTED refuses the VOID. It cannot close the other: a REPLACEMENT enqueued after the
+// read is still PENDING with no external id, which is exactly what the guard permits, so its shared
+// mirror is VOIDed by a settlement that never saw it. Nothing repairs that until (and unless) the
+// replacement itself posts.
+//
+// A row lock cannot fix it either — PostgreSQL has no predicate locks, so `FOR UPDATE` says nothing
+// about a row that does not exist yet. The only thing that serialises an INSERT against a decision
+// is a lock both sides take, and the enqueue side already takes one on exactly this scope tuple.
+
+test('settlement takes the follow-up scope lock, on the row own scope (o3d-11rf)', async () => {
+  const settle = await loadAction()
+  state.rows = [syncRow({ ...MIRRORED })]
+  state.events = [{ id: 'evt-1', idempotencyKey: mirrorKeyFor(), status: 'PENDING', externalId: null }]
+  const result = await settle('log-1', notPosted())
+  assert.equal(result.success, true)
+  assert.ok(
+    state.ops.includes('lockFollowUpScope:xero:SALES_INVOICE:SalesOrder:order-7'),
+    `settlement must serialise on the same (connector, type, referenceType, referenceId) tuple the ` +
+    `enqueue side locks; ops were ${JSON.stringify(state.ops)}`,
+  )
+})
+
+test('the scope lock is held BEFORE the siblings are read (o3d-11rf)', async () => {
+  // Ordering is the whole fix. Taking the lock after the read would serialise the writes and leave
+  // the decision resting on the same stale snapshot — a lock that costs contention and buys nothing.
+  const settle = await loadAction()
+  state.rows = [syncRow({ ...MIRRORED })]
+  state.events = [{ id: 'evt-1', idempotencyKey: mirrorKeyFor(), status: 'PENDING', externalId: null }]
+  await settle('log-1', notPosted())
+
+  const lock = state.ops.indexOf('lockFollowUpScope:xero:SALES_INVOICE:SalesOrder:order-7')
+  const siblings = state.ops.indexOf('syncLog.findMany')
+  assert.notEqual(lock, -1, 'the scope lock must be taken')
+  assert.notEqual(siblings, -1, 'the sibling read must happen')
+  assert.ok(lock < siblings, `the lock must precede the sibling read; ops were ${JSON.stringify(state.ops)}`)
+})
+
+test('the order row lock is still taken FIRST, so the lock ORDER matches the enqueue side (o3d-11rf)', async () => {
+  // followup-scope-lock.ts documents the ordering that keeps this deadlock-free: enqueue writers
+  // take the sales-order row lock first and the scope lock second. Settlement now takes both, so it
+  // has to take them in the SAME order — a pair of transactions taking two locks in opposite orders
+  // is the one way this can deadlock.
+  const settle = await loadAction()
+  state.rows = [syncRow({ ...MIRRORED })]
+  state.events = [{ id: 'evt-1', idempotencyKey: mirrorKeyFor(), status: 'PENDING', externalId: null }]
+  await settle('log-1', notPosted())
+
+  const orderLock = state.ops.indexOf('lockSalesOrder:order-7')
+  const scopeLock = state.ops.indexOf('lockFollowUpScope:xero:SALES_INVOICE:SalesOrder:order-7')
+  assert.notEqual(orderLock, -1, 'the order row lock must still be taken')
+  assert.ok(orderLock < scopeLock, `order lock must precede the scope lock; ops were ${JSON.stringify(state.ops)}`)
+})
+
+test('the scope lock is taken before the row is written, not just before the mirror (o3d-11rf)', async () => {
+  // The fence (syncLog.updateMany) is the first thing that touches the sync row. Locking after it
+  // would leave the row mutated in a window where a replacement can still be enqueued unseen.
+  const settle = await loadAction()
+  state.rows = [syncRow({ ...MIRRORED })]
+  state.events = [{ id: 'evt-1', idempotencyKey: mirrorKeyFor(), status: 'PENDING', externalId: null }]
+  await settle('log-1', notPosted())
+
+  const scopeLock = state.ops.indexOf('lockFollowUpScope:xero:SALES_INVOICE:SalesOrder:order-7')
+  const write = state.ops.indexOf('syncLog.updateMany')
+  // BOTH presence assertions first. Without them `indexOf` returns -1 for a lock that is never
+  // taken, -1 is less than every real index, and the ordering assertion passes for the precise
+  // reason it exists to catch. It did, on the first run of this test.
+  assert.notEqual(scopeLock, -1, 'the scope lock must be taken')
+  assert.notEqual(write, -1, 'the fenced write must happen')
+  assert.ok(scopeLock < write, `the lock must precede the fenced write; ops were ${JSON.stringify(state.ops)}`)
 })
 
 // ---------------------------------------------------------------------------
