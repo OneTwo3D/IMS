@@ -110,7 +110,7 @@ export const MOVEMENT_COGS_RELEVANCE: Record<StockMovementType, MovementCogsClas
     treatment: 'EXCLUDE',
     writesCogsEntries: false,
     exclusionSource: 'TRANSFER_SNAPSHOT',
-    note: 'onetwo3d-ims-6oyu.19 — stock moved warehouse, it was not sold. Excluded via getTransferConsumedQtyForCostLayer, which reads stock_transfer_lines.costLayerSnapshot NOT cogs_entries: transfer dispatch writes none, so the cogsEntry-based exclusions were structurally blind to it (that is why this survived every earlier audit). The delta reaches the destination (or, after a cancelled dispatch, the replacement) layer via propagateLandedCostToOutputs, so counting it here too double-posted it. WHICH transfer rows that query may read is STOCK_TRANSFER_SOURCE_LAYER_CONSUMPTION below — not a status list spelled out in the SQL. Excluding is only HALF the answer: for a transfer still IN_TRANSIT no such layer exists yet, so the delta reaches nothing and the recalc posts no journal at all — the freight debit stays in transit. That gap is NOT closed here; it is classified OUTSTANDING_AWAITING_DESTINATION_LAYER below and tracked as o3d-nrl4.',
+    note: 'onetwo3d-ims-6oyu.19 — stock moved warehouse, it was not sold. Excluded via getTransferConsumedQtyForCostLayer, which reads stock_transfer_lines.costLayerSnapshot NOT cogs_entries: transfer dispatch writes none, so the cogsEntry-based exclusions were structurally blind to it (that is why this survived every earlier audit). The delta reaches the destination (or, after a cancelled dispatch, the replacement) layer via propagateLandedCostToOutputs, so counting it here too double-posted it. WHICH transfer rows that query may read is STOCK_TRANSFER_SOURCE_LAYER_CONSUMPTION below — not a status list spelled out in the SQL. Excluding is only HALF the answer: for the portion of a transfer still in transit no such layer exists yet, so the delta reaches nothing and the recalc posts no journal at all — the freight debit stays in transit. That gap is NOT closed here; the status is classified OUTSTANDING_DESTINATION_LAYER_NOT_ASSURED below (a transfer can be IN_TRANSIT with part of it already landed and fully layered) and the residue is tracked as o3d-nrl4.',
   },
   KIT_ASSEMBLY_OUT: {
     relevance: 'NEVER_CONSUMES',
@@ -226,39 +226,58 @@ export const REVALUATION_ACCEPTED_TRADEOFF_MOVEMENT_TYPES: StockMovementType[] =
  * "Outstanding" is deliberately split in two, because the ONE contract the earlier
  * single OUTSTANDING value stated — "safe to exclude, because the delta reaches the
  * units through a replacement/destination layer" — is true for two of its three
- * members and FALSE for IN_TRANSIT (Codex r2 HIGH-2). The split exists so the
- * registry stops CLAIMING a completion path that IN_TRANSIT does not have. It does
+ * members and NOT ASSURED for IN_TRANSIT (Codex r2 HIGH-2). The split exists so the
+ * registry stops CLAIMING a completion path that IN_TRANSIT may not have. It does
  * not, on its own, create one: see the contract on
- * OUTSTANDING_AWAITING_DESTINATION_LAYER, which states plainly what is and is not
+ * OUTSTANDING_DESTINATION_LAYER_NOT_ASSURED, which states plainly what is and is not
  * guaranteed today.
  *
  *  - NOT_DISPATCHED: never left the source warehouse, so no layer was consumed and
  *    no snapshot was written. Subtracting one would under-post COGS.
  *  - OUTSTANDING_PROPAGATABLE: the source layer was consumed at dispatch and a
- *    replacement/destination layer EXISTS, linked back by a costLayerSourceLine.
- *    Subtract it: propagateLandedCostToOutputs carries the delta to that layer and
- *    journals it there, in the same recalc.
- *  - OUTSTANDING_AWAITING_DESTINATION_LAYER: consumed at dispatch, and NO layer
- *    holds the units yet. Excluded from COGS like the others, with NO completion
- *    path — see its own contract below.
+ *    replacement/destination layer EXISTS for the WHOLE dispatched quantity, linked
+ *    back by a costLayerSourceLine. Subtract it: propagateLandedCostToOutputs carries
+ *    the delta to that layer and journals it there, in the same recalc.
+ *  - OUTSTANDING_DESTINATION_LAYER_NOT_ASSURED: consumed at dispatch, and whether a
+ *    layer holds the units is NOT determined by the status — see its own contract
+ *    below. Excluded from COGS like the others.
  *  - RESTORED_ON_SOURCE_LAYER: a path that un-consumes the ORIGINAL source layer
  *    (raising its remainingQty back) would remove those units from consumedQty
  *    already, so subtracting the snapshot too would under-post COGS. No path does
  *    this today — the value exists so that adding one is a decision recorded here
  *    rather than a silent double-subtraction.
  *
- * THE CONTRACT OF `OUTSTANDING_AWAITING_DESTINATION_LAYER`, EXACTLY (o3d-nrl4).
+ * THE CONTRACT OF `OUTSTANDING_DESTINATION_LAYER_NOT_ASSURED`, EXACTLY (o3d-nrl4).
  *
  * It guarantees ONE thing: these units are kept OUT of retrospective customer COGS,
  * because they were moved between warehouses and not sold. Posting COGS for them is
  * 6oyu.19, and that is what this classification prevents.
  *
- * It guarantees NOTHING about where the revaluation delta goes. There is no layer
- * for propagateLandedCostToOutputs to carry it to, the source layer's remainingQty
- * is zero so inventoryDelta is zero, and IMS persists no obligation to post it
- * later. So the recalc queues NO journal for these units at all: the freight debit
- * stays in the transit clearing account and inventory stays understated until —
- * and unless — something else moves it. Nothing does. This is the behaviour of
+ * It guarantees NOTHING about where the revaluation delta goes, and — the point of
+ * the r4 rename — it does not know. STATUS CANNOT ANSWER "DOES A DESTINATION LAYER
+ * EXIST", because two different routes reach IN_TRANSIT with different answers:
+ *
+ *   - Nothing has landed. No layer holds the units; propagation reaches nothing.
+ *   - Part of the line HAS landed and is fully layered and linked. A manual receipt
+ *     of less than the line quantity, a WMS webhook book-in (booked-in-service flips
+ *     the transfer to RECEIVED only once EVERY line is fully received), and a WMS
+ *     stock-sync alignment (which never writes stockTransfer.status at all) each
+ *     create destination layers, linked back by a costLayerSourceLine, and leave the
+ *     transfer IN_TRANSIT.
+ *
+ * So for a partly-landed transfer the delta DOES reach the landed units by ordinary
+ * propagation, and reaches nothing for the rest. The gap is real but it is a
+ * LINE-LEVEL quantity (qty less qtyReceived), not a property of the status, and
+ * nothing here should be read as saying otherwise. An earlier revision exported a
+ * status-level `TRANSFER_STATUSES_WITH_NO_COMPLETION_PATH` asserting the opposite;
+ * it was removed rather than corrected, because the question it answered cannot be
+ * answered at this grain.
+ *
+ * For the portion still in transit: the source layer's remainingQty is zero so
+ * inventoryDelta is zero, and IMS persists no obligation to post the delta later, so
+ * the recalc queues no journal for those units — the freight debit stays in the
+ * transit clearing account and inventory stays understated until, and unless,
+ * something else moves it. Nothing does. This is the behaviour of
  * `origin/development` today and this classification does not change it; it only
  * stops the registry from asserting otherwise.
  *
@@ -282,7 +301,7 @@ export const REVALUATION_ACCEPTED_TRADEOFF_MOVEMENT_TYPES: StockMovementType[] =
 export type TransferSourceLayerConsumption =
   | 'NOT_DISPATCHED'
   | 'OUTSTANDING_PROPAGATABLE'
-  | 'OUTSTANDING_AWAITING_DESTINATION_LAYER'
+  | 'OUTSTANDING_DESTINATION_LAYER_NOT_ASSURED'
   | 'RESTORED_ON_SOURCE_LAYER'
 
 export type TransferStatusCostConsumption = {
@@ -308,8 +327,8 @@ export const STOCK_TRANSFER_SOURCE_LAYER_CONSUMPTION: Record<StockTransferStatus
     note: 'Dispatch is what consumes source layers and writes the costLayerSnapshot; a draft has done neither.',
   },
   IN_TRANSIT: {
-    consumption: 'OUTSTANDING_AWAITING_DESTINATION_LAYER',
-    note: 'Dispatched: consumeFifoLayersStrict reduced the source layer and froze the snapshot on the line. NO layer holds these units — the destination layer is not created until receipt, and the replacement layer not until a dispatch cancellation. So the exclusion from COGS is right and COMPLETE only in that half: a landed-cost revaluation landing now has nowhere to send its delta and queues no journal, leaving it in the transit clearing account indefinitely. KNOWN GAP, not a solved case — o3d-nrl4.',
+    consumption: 'OUTSTANDING_DESTINATION_LAYER_NOT_ASSURED',
+    note: 'Dispatched: consumeFifoLayersStrict reduced the source layer and froze the snapshot on the line. Whether a destination layer holds these units is NOT decided by this status and MUST NOT be inferred from it — a partial manual receipt, a WMS webhook book-in short of the full line, and a WMS stock-sync alignment all create linked destination layers and leave the transfer IN_TRANSIT, while a transfer that has landed nothing has none. The exclusion from COGS is right either way (the units moved warehouse, they were not sold). For whatever portion HAS landed the delta reaches it by ordinary propagation; for the portion still in transit a landed-cost revaluation has nowhere to send its delta and queues no journal, leaving it in the transit clearing account indefinitely. That residue is a line-level quantity (qty less qtyReceived), not a property of this status — open, o3d-nrl4.',
   },
   RECEIVED: {
     consumption: 'OUTSTANDING_PROPAGATABLE',
@@ -329,35 +348,36 @@ export const STOCK_TRANSFER_SOURCE_LAYER_CONSUMPTION: Record<StockTransferStatus
  * TransferSourceLayerConsumption value cannot compile until someone decides whether
  * it is excluded from COGS. The same reason the registry above is a Record.
  *
- * Note that OUTSTANDING_AWAITING_DESTINATION_LAYER answers `true` here for the
+ * Note that OUTSTANDING_DESTINATION_LAYER_NOT_ASSURED answers `true` here for the
  * narrow reason stated in its contract — the units were not sold — and NOT because
- * anything downstream completes the posting.
+ * anything downstream is known to complete the posting.
  */
 const CONSUMPTION_IS_OUTSTANDING: Record<TransferSourceLayerConsumption, boolean> = {
   NOT_DISPATCHED: false,
   OUTSTANDING_PROPAGATABLE: true,
-  OUTSTANDING_AWAITING_DESTINATION_LAYER: true,
+  OUTSTANDING_DESTINATION_LAYER_NOT_ASSURED: true,
   RESTORED_ON_SOURCE_LAYER: false,
 }
 
 /**
- * Does this consumption state leave the revaluation delta with NOWHERE to go — no
- * layer for propagateLandedCostToOutputs to reach and no persisted obligation?
+ * THERE IS DELIBERATELY NO STATUS-LEVEL "HAS NO COMPLETION PATH" MAP HERE (Codex
+ * round-4 MEDIUM).
  *
- * Total for the same reason: a new outstanding state with no destination layer must
- * not default to the reassuring answer (`false` = "somebody downstream handles
- * it"), which is precisely the assumption that stranded the delta in transit.
+ * An earlier revision exported `CONSUMPTION_HAS_NO_COMPLETION_PATH` and
+ * `TRANSFER_STATUSES_WITH_NO_COMPLETION_PATH`, both answering `true` for IN_TRANSIT
+ * on the premise that a transfer in transit has no destination layer. It does not
+ * hold: a partial manual receipt, a WMS webhook book-in short of the full line, and
+ * a WMS stock-sync alignment each create linked destination layers WITHOUT changing
+ * the status, so units under an IN_TRANSIT transfer may be fully layered and
+ * propagatable. The SQL was unaffected only by luck — both outstanding categories
+ * map to `true` in CONSUMPTION_IS_OUTSTANDING — so the lists were a trap set for the
+ * next reader rather than a live defect.
  *
- * This is a statement of the KNOWN GAP, not a switch that anything acts on. Nothing
- * reads it, deliberately: it names the hole so the split above is not mistaken for a
- * fix. o3d-nrl4 is what makes it actionable.
+ * They were removed rather than corrected because the question cannot be answered at
+ * this grain at all. What is left uncovered is the portion of a line that has not
+ * landed (qty less qtyReceived), which is where o3d-nrl4 has to measure it. Do not
+ * reintroduce a status keyed version.
  */
-export const CONSUMPTION_HAS_NO_COMPLETION_PATH: Record<TransferSourceLayerConsumption, boolean> = {
-  NOT_DISPATCHED: false,
-  OUTSTANDING_PROPAGATABLE: false,
-  OUTSTANDING_AWAITING_DESTINATION_LAYER: true,
-  RESTORED_ON_SOURCE_LAYER: false,
-}
 
 function transferStatusesWhere(
   predicate: (consumption: TransferSourceLayerConsumption) => boolean,
@@ -374,12 +394,3 @@ function transferStatusesWhere(
  */
 export const TRANSFER_STATUSES_WITH_OUTSTANDING_SOURCE_CONSUMPTION: StockTransferStatus[] =
   transferStatusesWhere((consumption) => CONSUMPTION_IS_OUTSTANDING[consumption])
-
-/**
- * Transfer statuses excluded from COGS with no layer to carry the delta and no
- * persisted obligation to post it later — the known gap named above (o3d-nrl4).
- * Exported for the audit/documentation surface and asserted in the tests; no
- * production query filters on it, because there is nothing yet to do with it.
- */
-export const TRANSFER_STATUSES_WITH_NO_COMPLETION_PATH: StockTransferStatus[] =
-  transferStatusesWhere((consumption) => CONSUMPTION_HAS_NO_COMPLETION_PATH[consumption])

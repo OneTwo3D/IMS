@@ -1767,6 +1767,10 @@ function createLandedCostWorld(init: {
         })
         return { id }
       },
+      // recreateTransferCostLayersFromSnapshotSlice re-reads the layers it created to
+      // check that they cover the slice's whole quantity (o3d-eiuo).
+      findMany: async ({ where }: { where: { id: { in: string[] } } }) =>
+        where.id.in.map((id) => costLayers.get(id)).filter((layer) => layer != null),
     },
     costLayerSourceLine: {
       findMany: async ({ where }: { where: { sourceCostLayerId?: string } }) =>

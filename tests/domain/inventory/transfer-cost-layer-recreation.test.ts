@@ -3,15 +3,18 @@ import { readFileSync, readdirSync, statSync } from 'node:fs'
 import { join } from 'node:path'
 import test from 'node:test'
 
+import { consumeFifoLayers } from '@/lib/cost-layers'
 import { recreateTransferCostLayersFromSnapshotSlice } from '@/lib/domain/inventory/transfer-cost-layer-recreation'
 
 /**
- * 6oyu.19 / Codex round-2 HIGH-1. Four paths rebuild cost layers from a transfer's
- * dispatch snapshot; two of them forgot to link the new layer back to the layer it
- * came from, which quietly removed the units from COGS with nowhere for the
- * landed-cost delta to go. These tests cover the two halves of the fix: the link is
- * a POSTCONDITION of the shared helper (so no caller can forget it), and a census
- * that fails if a fifth path open-codes the sequence again.
+ * 6oyu.19 / Codex round-2 HIGH-1 and round-4 HIGH (o3d-eiuo). Four paths rebuild cost
+ * layers from a transfer's dispatch snapshot; two of them forgot to link the new
+ * layer back to the layer it came from, which quietly removed the units from COGS
+ * with nowhere for the landed-cost delta to go. These tests cover the fix's three
+ * parts: the LINK is a postcondition of the shared helper (so no caller can forget
+ * it), the QUANTITY is too (every caller increments stock before calling, so an entry
+ * the helper declines is unlayered stock, not a reportable gap), and a census fails
+ * if a fifth path open-codes the sequence again.
  *
  * The helper does NOT settle a revaluation that landed while the units were in
  * transit — that machinery was withdrawn from this branch (o3d-nrl4), so there are
@@ -47,6 +50,11 @@ function createStore(sourceLayerHasProvenance: boolean): { store: Store; tx: unk
         if (!layer) return null
         return { receivedQty: 10, sourceLines: layer.sourceLines }
       },
+      // The quantity postcondition RE-READS what was persisted rather than trusting
+      // the helper's own tally, so an id it was handed for a layer that was never
+      // written simply does not come back — which is the whole point.
+      findMany: async ({ where }: { where: { id: { in: string[] } } }) =>
+        store.created.filter((layer) => where.id.in.includes(layer.id as string)),
     },
     costLayerSourceLine: {
       create: async ({ data }: { data: Record<string, unknown> }) => {
@@ -138,10 +146,16 @@ test('the reachability postcondition FAILS when no link was written (6oyu.19)', 
   assert.equal(store.sourceLines.length, 0)
 })
 
-test('a negative-cost snapshot entry is counted, never silently swallowed (6oyu.19)', async () => {
-  // Corrupt provenance must not be capitalised, but the quantity gap it leaves has
-  // to be visible to the caller (the manual receipt path turns it into a £0
-  // balancing layer). Reported rather than inferred from a length mismatch.
+test('a negative-cost snapshot entry is LAID DOWN, so on-hand never exceeds layer qty (o3d-eiuo)', async () => {
+  // Codex round-4 HIGH. This entry used to be skipped and counted, on the theory
+  // that a negative unit cost is corrupt provenance. It is not: recalculateLandedCosts
+  // distributes credit freight lines with no positivity filter, and
+  // updateSnapshotsForCostLayerChange rewrites stock_transfer_lines.costLayerSnapshot
+  // in place, so a credit note landing mid-transit turns a positive dispatch snapshot
+  // negative. Every caller has ALREADY incremented stock by the time it calls here, so
+  // the skip left unlayered stock that nothing reported.
+  //
+  // Assert the QUANTITIES, not the absence of a throw.
   const { store, tx } = createStore(false)
 
   const result = await recreateTransferCostLayersFromSnapshotSlice(
@@ -150,9 +164,113 @@ test('a negative-cost snapshot entry is counted, never silently swallowed (6oyu.
     [{ costLayerId: 'layer-src', qty: '10.000000', unitCostBase: '-1.000000' }],
   )
 
-  assert.equal(result.skippedNegativeCostEntries, 1)
-  assert.equal(result.createdLayers.length, 0)
-  assert.equal(store.created.length, 0)
+  const onHandIncrementedByCaller = 10
+  const layerQty = store.created.reduce((sum, layer) => sum + Number(layer.receivedQty), 0)
+  assert.equal(layerQty, onHandIncrementedByCaller, 'on-hand must equal Σ FIFO-layer qty — no unlayered stock')
+  assert.equal(result.recreatedQty, '10.000000')
+  assert.equal(result.negativeCostLayers, 1, 'the unusual valuation is recorded…')
+  assert.equal(result.createdLayers.length, 1, '…but the layer is created, not declined')
+  // The cost basis is PRESERVED, not written off to £0: a warehouse-to-warehouse move
+  // must not revalue the units it moves, and the source layer already stands here.
+  assert.equal(result.createdLayers[0].unitCostBase, '-1.000000')
+  assert.equal(Number(store.created[0].unitCostBase), -1)
+  // Still reachable by propagation — a negative layer is not exempt from the link.
+  assert.equal(store.sourceLines.length, 1)
+  assert.equal(store.sourceLines[0].sourceCostLayerId, 'layer-src')
+})
+
+test('a later FIFO consumption of a negative-cost transfer layer values it correctly (o3d-eiuo)', async () => {
+  // Where the harm of the old skip actually landed. With the layer missing, on-hand
+  // stood 10 above Σ layer qty and a later consumption of those units either failed
+  // (consumeFifoLayersStrict) or fell back to another layer's cost. Drive the REAL
+  // FIFO consumer over the layer this helper now writes and assert the value.
+  const { store, tx } = createStore(false)
+  await recreateTransferCostLayersFromSnapshotSlice(
+    tx as never,
+    TARGET,
+    [{ costLayerId: 'layer-src', qty: '10.000000', unitCostBase: '-1.000000' }],
+  )
+  assert.equal(store.created.length, 1, 'precondition: the transfer layer exists to be consumed')
+
+  // A minimal FIFO store seeded from the layers the helper actually created, driven
+  // by the REAL consumer so the valuation is the production one.
+  function fifoTxFor(layers: Array<{ id: string; remainingQty: string; unitCostBase: string }>) {
+    return {
+      $executeRaw: async () => 0,
+      $queryRaw: async () => layers.filter((layer) => Number(layer.remainingQty) > 0).map((layer) => ({ ...layer })),
+      costLayer: {
+        update: async ({ where, data }: { where: { id: string }; data: { remainingQty: { decrement: number } } }) => {
+          const layer = layers.find((candidate) => candidate.id === where.id)
+          if (layer) layer.remainingQty = String(Number(layer.remainingQty) - data.remainingQty.decrement)
+          return layer
+        },
+      },
+    }
+  }
+
+  const layers = store.created.map((layer, index) => ({
+    id: `fifo-${index}`,
+    remainingQty: String(layer.remainingQty),
+    unitCostBase: String(layer.unitCostBase),
+  }))
+  const consumption = await consumeFifoLayers(fifoTxFor(layers) as never, 'prod-1', 'wh-dest', 4)
+
+  assert.equal(consumption.remainingQty.toString(), '0', 'FIFO finds the units — no shortfall against on-hand')
+  assert.equal(consumption.consumed.length, 1, 'the transfer layer is the one consumed')
+  assert.equal(consumption.consumed[0].qty.toString(), '4')
+  assert.equal(
+    consumption.consumed[0].unitCostBase.toString(),
+    '-1',
+    'valued at the basis it was transferred with, not silently at £0',
+  )
+  assert.equal(consumption.totalCost.toString(), '-4', 'the credit that made the layer negative reaches COGS, not nowhere')
+  assert.equal(layers[0].remainingQty, '6', 'and the layer is drawn down, so on-hand and Σ layer qty stay equal')
+
+  // The negative control: this is what the skipped entry left behind. Same 10 units
+  // on hand (the caller incremented stock either way), no layer — FIFO comes back 4
+  // short and values the consumption at nothing.
+  const unlayered = await consumeFifoLayers(fifoTxFor([]) as never, 'prod-1', 'wh-dest', 4)
+  assert.equal(unlayered.remainingQty.toString(), '4', 'precondition: unlayered stock is exactly a FIFO shortfall')
+  assert.equal(unlayered.totalCost.toString(), '0')
+})
+
+test('the quantity postcondition FAILS if an entry is not laid down (o3d-eiuo)', async () => {
+  // Proof the guard is not vacuous. The tests above would all pass with the
+  // postcondition deleted, because their entries are created. This one reaches the
+  // guard with a real shortfall: the injected creator drops the second entry, exactly
+  // the shape the old negative-cost skip had — stock already incremented by the
+  // caller, one entry's worth of units left with no layer.
+  const { store, tx } = createStore(false)
+
+  await assert.rejects(
+    () => recreateTransferCostLayersFromSnapshotSlice(
+      tx as never,
+      TARGET,
+      [
+        { costLayerId: 'layer-src', qty: '6.000000', unitCostBase: '5.000000' },
+        { costLayerId: 'layer-src', qty: '4.000000', unitCostBase: '-1.000000' },
+      ],
+      {
+        createCostLayer: (async (client: unknown, data: { qty: unknown; unitCostBase: unknown }) => {
+          // Skip the negative entry, as the withdrawn behaviour did, while still
+          // handing back an id — the shape that made the old skip invisible.
+          if (Number(String(data.unitCostBase)) < 0) return 'layer-skipped'
+          // Mirrors the real createCostLayer's qty -> receivedQty/remainingQty mapping,
+          // so the re-read the postcondition performs sees a truthful row.
+          return (tx as { costLayer: { create: (args: unknown) => Promise<{ id: string }> } })
+            .costLayer.create({ data: { ...data, receivedQty: String(data.qty), remainingQty: String(data.qty) } })
+            .then((layer) => layer.id)
+        }) as never,
+        copyCostLayerSourceLinesProportionally: (async () => 0) as never,
+      },
+    ),
+    /no FIFO layer behind them/,
+    'declining an entry must fail loudly, not leave the caller\'s stock increment unlayered',
+  )
+  // Precondition: the guard was reached after a genuine partial creation, not
+  // short-circuited before any work happened.
+  assert.equal(store.created.length, 1, 'the positive entry WAS created — this is a shortfall, not a total failure')
+  assert.equal(Number(store.created[0].receivedQty), 6)
 })
 
 // ---------------------------------------------------------------------------
@@ -231,5 +349,54 @@ test('copyCostLayerSourceLinesProportionally has no unguarded caller left (6oyu.
       'lib/domain/sales/refund-service.ts',
     ],
     'a new caller must handle the 0 return, or its layer is unreachable by landed-cost propagation',
+  )
+})
+
+test('no caller describes the helper as SETTLING a deferred transit reclass (Codex r4 LOW)', () => {
+  // The helper creates propagation links. It persists and posts nothing that was
+  // previously stranded, and the in-transit landed-cost gap (o3d-nrl4) is still open.
+  // Three call-site comments claimed otherwise — a maintainer told the gap is handled
+  // when it is not will not go looking for it.
+  //
+  // The rule is about the GRAMMAR OF THE CLAIM, not about proximity to a correction:
+  // "settles the/any/those <something>" is an affirmative claim of settlement wherever
+  // it appears, while "settles NOTHING" and "settles no deferred reclass" are not.
+  const AFFIRMATIVE_SETTLEMENT = /\bsettle[sd]?\s+(?:the|any|its|those|these|same|all)\b/i
+
+  const files = SCAN_ROOTS.flatMap((root) => walkTypeScript(root))
+    .filter((file) => readFileSync(file, 'utf8').includes('recreateTransferCostLayersFromSnapshotSlice('))
+    .sort()
+
+  // Precondition: the walk actually reached the call sites. A census over an empty
+  // set passes while examining nothing.
+  assert.deepEqual(
+    files,
+    [
+      'app/actions/transfers.ts',
+      'lib/connectors/mintsoft/sync/stock-sync.ts',
+      'lib/domain/inventory/transfer-cost-layer-recreation.ts',
+      'lib/domain/wms/booked-in-service.ts',
+    ],
+    'the set of files mentioning the helper changed — a new one must also not claim settlement',
+  )
+
+  const offenders: string[] = []
+  for (const file of files) {
+    const source = readFileSync(file, 'utf8')
+    for (const [index, line] of source.split('\n').entries()) {
+      if (AFFIRMATIVE_SETTLEMENT.test(line)) {
+        offenders.push(`${file}:${index + 1}: ${line.trim()}`)
+      }
+    }
+    assert.ok(
+      source.includes('o3d-nrl4'),
+      `${file}: must name the still-open in-transit gap rather than leaving the reader to assume it is handled`,
+    )
+  }
+
+  assert.deepEqual(
+    offenders,
+    [],
+    `the helper settles nothing — it only creates propagation links:\n${offenders.join('\n')}`,
   )
 })

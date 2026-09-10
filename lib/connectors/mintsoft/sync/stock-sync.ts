@@ -801,7 +801,15 @@ async function applyMintsoftAlignmentForProduct(params: {
         // 6oyu.19: same omission as the WMS webhook receipt path — the created
         // layer had no costLayerSourceLine whenever the source was a plain
         // PO-derived layer, stranding the landed-cost delta. Routed through the
-        // shared helper so the link is guaranteed, not remembered.
+        // shared helper so the link is guaranteed, not remembered — and so is the
+        // quantity: stock is incremented for this allocation below, and an entry the
+        // helper declined would leave it unlayered (Codex round-4 HIGH).
+        //
+        // Note this alignment does NOT change the transfer's status, so a transfer
+        // can be IN_TRANSIT with these units fully layered and propagatable. What is
+        // still uncovered is a revaluation that landed while units were in transit:
+        // nothing here discharges it and the delta stays in the transit clearing
+        // account. Open, tracked as o3d-nrl4.
         await recreateTransferCostLayersFromSnapshotSlice(
           tx,
           {

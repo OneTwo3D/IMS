@@ -332,12 +332,18 @@ async function loadLayerConsumptionExclusions(
  * calculateLayerAdjustmentDeltas correctly keeps transferred units out of COGS —
  * they moved warehouse, they were not sold — and for a RECEIVED or CANCELLED
  * transfer propagateLandedCostToOutputs then carries the delta to the layer holding
- * them. For a transfer still IN TRANSIT there is no such layer: propagation finds
+ * them. What is uncovered is the portion of a dispatched line that has NOT yet
+ * landed anywhere (qty less qtyReceived): no layer holds it, so propagation finds
  * nothing, inventoryDelta is zero because the source layer's remainingQty is zero,
- * and this recalc queues NO journal at all. The freight debit stays in the transit
+ * and this recalc queues NO journal for it. The freight debit stays in the transit
  * clearing account with inventory understated, and the 6oyu.4 transit-vs-GL sweep
  * cannot see it because a MISSING posting is absent from both sides of the
  * comparison it makes.
+ *
+ * Note this is NOT "every transfer whose status is IN_TRANSIT" (Codex round-4
+ * MEDIUM): a partial receipt or a WMS book-in/alignment creates fully linked
+ * destination layers without moving the status off IN_TRANSIT, and the delta does
+ * reach those units.
  *
  * Closing it needs an obligation persisted at revaluation time and discharged by the
  * receipt or dispatch cancellation that creates the layer. That was implemented,

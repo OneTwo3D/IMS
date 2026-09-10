@@ -11,8 +11,9 @@ import {
   STOCK_TRANSFER_SOURCE_LAYER_CONSUMPTION,
   TRANSFER_SNAPSHOT_EXCLUDED_MOVEMENT_TYPES,
   TRANSFER_STATUSES_WITH_OUTSTANDING_SOURCE_CONSUMPTION,
-  TRANSFER_STATUSES_WITH_NO_COMPLETION_PATH,
 } from '../../../lib/domain/inventory/movement-cogs-relevance.ts'
+import * as movementCogsRelevance from '../../../lib/domain/inventory/movement-cogs-relevance.ts'
+import { sliceTransferSnapshotForReceipt } from '../../../lib/domain/wms/asn-reconciliation.ts'
 import { STOCK_TRANSFER_TRANSITIONS } from '../../../lib/domain/workflows/stock-transfer-state.ts'
 import { REVALUATION_EXCLUSION_QUERY_MOVEMENT_TYPES } from '../../../lib/cost-layers.ts'
 
@@ -177,67 +178,93 @@ test('a cancelled dispatch still counts as outstanding source consumption (6oyu.
   assert.ok(!TRANSFER_STATUSES_WITH_OUTSTANDING_SOURCE_CONSUMPTION.includes('DRAFT'))
 })
 
-test('IN_TRANSIT is outstanding but has NO completion path, and the registry says so (6oyu.19 / o3d-nrl4)', () => {
+test('IN_TRANSIT is outstanding, and the registry does NOT claim a destination layer either way (Codex r4 MEDIUM)', () => {
   // The whole point of splitting OUTSTANDING. The old single value justified the
   // COGS exclusion by "the delta reaches the units through a replacement or
-  // destination layer" — true for RECEIVED and CANCELLED, FALSE for IN_TRANSIT,
-  // where no layer exists yet. A revaluation mid-transit subtracts the whole
-  // snapshot from COGS, propagates into nothing, and queues no journal: the freight
-  // debit stays in transit and inventory stays understated.
-  //
-  // That is STILL the behaviour — the deferred-reclass machinery that would have
-  // closed it was withdrawn on review (o3d-nrl4). What this classification buys is
-  // that the registry no longer CLAIMS a completion path it does not have. Both
-  // halves are asserted, because either alone misstates the contract: dropping
-  // IN_TRANSIT from the exclusion list is 6oyu.19 (spurious COGS), and calling it
-  // OUTSTANDING_PROPAGATABLE is the overstatement this split exists to remove.
+  // destination layer" — true for RECEIVED and CANCELLED, and NOT ASSURED for
+  // IN_TRANSIT. Both halves are asserted, because either alone misstates the
+  // contract: dropping IN_TRANSIT from the exclusion list is 6oyu.19 (spurious
+  // COGS), and calling it OUTSTANDING_PROPAGATABLE is the overstatement this split
+  // exists to remove.
   assert.equal(
     STOCK_TRANSFER_SOURCE_LAYER_CONSUMPTION.IN_TRANSIT.consumption,
-    'OUTSTANDING_AWAITING_DESTINATION_LAYER',
+    'OUTSTANDING_DESTINATION_LAYER_NOT_ASSURED',
   )
   assert.ok(
     TRANSFER_STATUSES_WITH_OUTSTANDING_SOURCE_CONSUMPTION.includes('IN_TRANSIT'),
     'IN_TRANSIT units were moved, not sold — they must still be excluded from retrospective COGS',
-  )
-  assert.deepEqual(
-    TRANSFER_STATUSES_WITH_NO_COMPLETION_PATH,
-    ['IN_TRANSIT'],
-    'only IN_TRANSIT has consumed a source layer with no layer anywhere holding the units',
-  )
-
-  // The gap list must be a STRICT subset of the exclusion list: a status with no
-  // completion path that was ALSO not excluded would post spurious COGS on top.
-  for (const status of TRANSFER_STATUSES_WITH_NO_COMPLETION_PATH) {
-    assert.ok(
-      TRANSFER_STATUSES_WITH_OUTSTANDING_SOURCE_CONSUMPTION.includes(status),
-      `${status}: has no completion path and is not excluded from COGS either — the worst of both`,
-    )
-  }
-  assert.ok(
-    TRANSFER_STATUSES_WITH_NO_COMPLETION_PATH.length < TRANSFER_STATUSES_WITH_OUTSTANDING_SOURCE_CONSUMPTION.length,
-    'precondition: the two lists must differ, or the split is not doing anything',
   )
 
   // The statuses that stayed OUTSTANDING_PROPAGATABLE must genuinely have a layer to
   // propagate into — asserted by name so that reclassifying one without giving it a
   // destination layer fails here rather than silently stranding value.
   for (const status of TRANSFER_STATUSES_WITH_OUTSTANDING_SOURCE_CONSUMPTION) {
-    const consumption = STOCK_TRANSFER_SOURCE_LAYER_CONSUMPTION[status].consumption
-    if (TRANSFER_STATUSES_WITH_NO_COMPLETION_PATH.includes(status)) continue
+    if (status === 'IN_TRANSIT') continue
     assert.equal(
-      consumption,
+      STOCK_TRANSFER_SOURCE_LAYER_CONSUMPTION[status].consumption,
       'OUTSTANDING_PROPAGATABLE',
       `${status}: excluded from COGS, so a linked layer MUST already exist to carry the delta`,
     )
   }
+})
 
-  // And the gap is named as a gap in prose, where a reader looks first. A note that
-  // stops at "excluded from COGS" is the overstatement all over again.
-  assert.match(
-    STOCK_TRANSFER_SOURCE_LAYER_CONSUMPTION.IN_TRANSIT.note,
-    /KNOWN GAP/,
-    'the IN_TRANSIT note must say the delta is stranded, not imply something settles it',
+test('no status-level export may claim IN_TRANSIT has no destination layer (Codex r4 MEDIUM)', () => {
+  // THE FINDING. A partial receipt leaves the transfer IN_TRANSIT after creating
+  // linked destination layers, and a WMS stock-sync alignment creates them without
+  // touching the status at all. The withdrawn
+  // CONSUMPTION_HAS_NO_COMPLETION_PATH / TRANSFER_STATUSES_WITH_NO_COMPLETION_PATH
+  // pair answered `true` for IN_TRANSIT regardless, so any future consumer reusing
+  // them would classify already-landed units as having nowhere to send a delta. The
+  // SQL was unharmed only because both outstanding categories map to `true`.
+  //
+  // Precondition, established with the REAL slicer rather than asserted: a receipt of
+  // part of a line consumes part of the snapshot and leaves the rest behind, which is
+  // what "still IN_TRANSIT with destination layers already created" means. If this
+  // ever stopped being reachable the test below would be guarding nothing.
+  const snapshot = [{ costLayerId: 'layer-src', qty: '10.000000', unitCostBase: '5.000000' }]
+  const firstReceipt = sliceTransferSnapshotForReceipt({ snapshot, alreadyReceivedQty: 0, qtyReceived: 4 })
+  const stillInTransit = sliceTransferSnapshotForReceipt({ snapshot, alreadyReceivedQty: 4, qtyReceived: 6 })
+  assert.equal(
+    firstReceipt.reduce((sum, entry) => sum + Number(entry.qty), 0),
+    4,
+    'precondition: a partial receipt draws a real slice — those units get linked destination layers',
   )
+  assert.equal(
+    stillInTransit.reduce((sum, entry) => sum + Number(entry.qty), 0),
+    6,
+    'precondition: and 6 units are still in transit under the SAME IN_TRANSIT status',
+  )
+
+  const exported = Object.keys(movementCogsRelevance)
+  assert.ok(exported.length > 5, `precondition: the module really was loaded (saw ${exported.length} exports)`)
+  for (const name of ['CONSUMPTION_HAS_NO_COMPLETION_PATH', 'TRANSFER_STATUSES_WITH_NO_COMPLETION_PATH']) {
+    assert.ok(
+      !exported.includes(name),
+      `${name} keys a per-line fact (qty less qtyReceived) on the transfer STATUS, which cannot express it`,
+    )
+  }
+
+  // And no OTHER status-keyed export may quietly reintroduce the same claim by
+  // singling IN_TRANSIT out as the one status with something missing.
+  for (const [name, value] of Object.entries(movementCogsRelevance)) {
+    if (!Array.isArray(value)) continue
+    if (name === 'TRANSFER_STATUSES_WITH_OUTSTANDING_SOURCE_CONSUMPTION') continue
+    assert.notDeepEqual(
+      [...value].sort(),
+      ['IN_TRANSIT'],
+      `${name}: an IN_TRANSIT-only status list is the invariant this finding removed`,
+    )
+  }
+
+  // The note must not assert the absence either — a test pinning prose that is wrong
+  // pins the error, which is why the old /KNOWN GAP/ match was replaced by this.
+  const note = STOCK_TRANSFER_SOURCE_LAYER_CONSUMPTION.IN_TRANSIT.note
+  assert.doesNotMatch(
+    note,
+    /NO layer holds these units/,
+    'a partly-received transfer is IN_TRANSIT with some of its units fully layered',
+  )
+  assert.match(note, /o3d-nrl4/, 'the residue that IS uncovered must still be named and tracked')
 })
 
 test('the transfer-status list is NOT derived from the transfer state machine (6oyu.19)', () => {

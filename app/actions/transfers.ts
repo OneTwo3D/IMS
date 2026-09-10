@@ -697,10 +697,17 @@ async function applyTransferLineReceipt(
 
   // Recreate FIFO layers at the destination from the unconsumed slice of the
   // dispatch snapshot (the slicer walks past alreadyReceivedQty and returns the
-  // next qtyToReceive units). The shared helper is what GUARANTEES each new layer
-  // is reachable by propagateLandedCostToOutputs and settles any landed-cost
-  // reclass deferred while these units were in transit — never open-code this.
-  await recreateTransferCostLayersFromSnapshotSlice(
+  // next qtyToReceive units). The shared helper GUARANTEES two things about the
+  // layers it creates — each is reachable by propagateLandedCostToOutputs, and
+  // together they cover the slice's whole quantity — so never open-code this.
+  //
+  // It settles NOTHING (Codex round-4 LOW). A landed-cost revaluation that landed
+  // while these units were in transit had no layer to journal against and IMS
+  // persisted no obligation for it; creating the layer now does not discharge it,
+  // and the delta is still sitting in the transit clearing account. That gap is
+  // open and tracked as o3d-nrl4 — see the contract on
+  // STOCK_TRANSFER_SOURCE_LAYER_CONSUMPTION.IN_TRANSIT.
+  const recreated = await recreateTransferCostLayersFromSnapshotSlice(
     tx,
     {
       productId,
@@ -714,7 +721,14 @@ async function applyTransferLineReceipt(
   // cogs-audit scjz.5: conserve quantity when the dispatch snapshot under-records
   // costed units (source dispatched legacy/uncosted stock). Balance the shortfall
   // with a £0 layer so on-hand never exceeds Σ layer remainingQty.
-  const sliceQtyTotal = snapshotSlice.reduce((sum, entry) => addMoney(sum, entry.qty), toDecimal(0))
+  //
+  // Measured against the quantity the helper actually LAID DOWN, not against the
+  // slice handed to it (Codex round-4 HIGH). Re-summing the slice assumed every
+  // entry became a layer; when the helper declined one, this step counted the
+  // declined units as covered and the balancing layer it exists to create was never
+  // created. The helper now guarantees the two figures agree — reading its result
+  // is what keeps this step honest if that ever changes.
+  const sliceQtyTotal = toDecimal(recreated.recreatedQty)
   const shortfall = subtractMoney(qtyToReceive, sliceQtyTotal)
   if (shortfall.gt('0.000001')) {
     await createCostLayer(tx, {
@@ -1218,8 +1232,16 @@ export async function cancelDispatchedTransfer(id: string): Promise<TransferResu
         // Note: the ORIGINAL layers consumed at dispatch are NOT un-consumed; this
         // creates equivalent replacement layers (same cost basis + source-line
         // provenance), so source quantity reconciles with cost layers. Same shared
-        // helper as the receipt path: a cancellation is the OTHER way in-transit
-        // units come to rest, so it settles the same deferred reclass obligations.
+        // helper as the receipt path, for the same two guarantees: each replacement
+        // layer is reachable by propagation, and the layers cover the whole restored
+        // quantity (this path has no balancing step of its own, so a layer the helper
+        // declined would leave the restored stock unlayered — Codex round-4 HIGH).
+        //
+        // A cancellation is the OTHER way in-transit units come to rest, and it
+        // settles no deferred reclass either (Codex round-4 LOW): a revaluation that
+        // landed mid-transit was never persisted as an obligation, so nothing here
+        // discharges it and the delta stays in the transit clearing account. Open,
+        // tracked as o3d-nrl4.
         await recreateTransferCostLayersFromSnapshotSlice(
           tx,
           {

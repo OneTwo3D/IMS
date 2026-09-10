@@ -961,7 +961,16 @@ export async function processBookedInEvent(
               // its own). The layer was therefore left with no costLayerSourceLine,
               // so the revaluation exclusion removed these units from COGS while
               // propagation had nowhere to carry the delta. The shared helper makes
-              // the link a postcondition and settles the deferred transit reclass.
+              // the link a postcondition, and the quantity too — this path increments
+              // stock immediately above and has no balancing layer, so an entry the
+              // helper declined would leave the booked-in units unlayered (Codex
+              // round-4 HIGH).
+              //
+              // It settles NO deferred transit reclass (Codex round-4 LOW). A
+              // landed-cost revaluation that landed while these units were in transit
+              // was never persisted as an obligation, so creating the layer does not
+              // discharge it; the delta remains in the transit clearing account.
+              // Open, tracked as o3d-nrl4.
               await recreateTransferCostLayersFromSnapshotSlice(
                 tx,
                 {
