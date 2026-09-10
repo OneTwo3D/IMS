@@ -1,6 +1,6 @@
 /**
  * EVERY LEASE UNDER WHICH A WORKER MAY BELIEVE AN `IntegrationOutbox` ROW IS STILL ITS OWN
- * (o3d-8td2 round 4, Codex HIGH 1).
+ * (o3d-8td2 round 4, Codex HIGH 1; re-stated round 6 when the operator action was withdrawn).
  *
  * A lease is written by exactly one statement in this build — the claim update in
  * `lib/domain/integrations/outbox.ts`, which stamps `lockedAt` — and read back by exactly one
@@ -10,27 +10,64 @@
  * under is the set of `staleLockMs` values passed to `claimIntegrationOutboxWork`, and that set is
  * THIS MAP.
  *
- * WHY IT IS A MAP AND NOT A NUMBER, AND WHY IT LIVES IN ITS OWN LEAF FILE. Round 3 wrote the
- * operator's staleness threshold as its own `10 * 60 * 1000`. It read as the same value as the
- * default lease — but `xero/accounting.post` is drained under FIFTEEN minutes, so the operator
- * surface called a Xero row stale five minutes before its holder's lease had even expired, and
- * offered an action on it. A restated constant cannot notice that; a MAXIMUM over a declared set
- * can, and {@link INTEGRATION_OUTBOX_MAX_LEASE_MS} is what `ADMIN_OUTBOX_STALE_PROCESSING_LOCK_MS`
- * is derived from. Adding a longer lease here raises that threshold in the same edit.
+ * WHAT IT PAYS FOR NOW, SAID AGAIN BECAUSE THE REASON CHANGED. Round 4 derived an operator ACTION's
+ * threshold from this map. Round 6 withdrew that action entirely (see
+ * `lib/domain/integrations/outbox-admin.ts`), and the map stays because the thing that survived
+ * needs it just as much: `stalledIntegrationOutboxParkWhere` is a LIST, and its first condition is
+ * `lockedAt` older than every lease. Without a maximum over a declared set, that condition has to be
+ * restated as a literal — which is exactly what round 3 did, at ten minutes, while
+ * `xero/accounting.post` is drained under FIFTEEN. The result was not a dangerous write; it was a
+ * worse thing for a list to be: a Xero row twelve minutes into a live lease, shown to an operator as
+ * an exception that nothing was wrong with. A restated constant cannot notice that; a MAXIMUM over a
+ * declared set can, and {@link INTEGRATION_OUTBOX_MAX_LEASE_MS} is what
+ * `ADMIN_OUTBOX_STALE_PROCESSING_LOCK_MS` is derived from. Adding a longer lease here raises the
+ * listing's threshold in the same edit.
  *
  * It is a leaf module for the same reason `outbox-replay-policy.ts` is: a DECLARATION every layer
  * reads — the claim, the admin threshold, the Xero drain — should not drag the outbox machinery in
  * behind it, and should not disappear when a test replaces that machinery with a double.
  *
- * `tests/domain/integrations/outbox.test.ts` asserts that no `staleLockMs:` argument anywhere in
- * `lib/` or `app/` is a number of its own, so a lease this file cannot see cannot be introduced.
+ * HOW EXHAUSTIVENESS IS ENFORCED, AND WHY IT IS NOT A TEST (o3d-8td2 round 6, Codex MEDIUM). Rounds
+ * 4 and 5 policed this with a regex over `lib/` and `app/` looking for `staleLockMs:`. Codex was
+ * right that it was porous — `{ staleLockMs }` shorthand, a spread, and any arithmetic merely
+ * CONTAINING the map's name all walked past it — and a cleverer pattern would only move the hole,
+ * because "what value reaches this parameter" is a question about a program and not about a string.
+ * So it is asked of the compiler instead: {@link IntegrationOutboxDrainLeaseMs} is the literal union
+ * of this map's values, and `ClaimIntegrationOutboxOptions.staleLockMs` has that type. Shorthand,
+ * spreads and computed arguments are all checked, because assignability is checked at every call
+ * site whatever its syntax, and `INTEGRATION_OUTBOX_DRAIN_LEASES_MS.default * 2` is `number`, which
+ * is not assignable to `600000 | 900000`. A lease this file cannot see is a TYPE ERROR, not a test
+ * failure — and `tests/domain/integrations/outbox.test.ts` proves the union has not silently widened
+ * to `number` with `@ts-expect-error` fixtures, which fail the build if they ever stop erroring.
+ */
+/**
+ * WRITTEN AS BARE LITERALS ON PURPOSE, and the reason is the type below rather than taste. Under
+ * `as const` TypeScript keeps a LITERAL type only for a literal; `10 * 60 * 1000` is an arithmetic
+ * expression and comes back as plain `number`, which collapses
+ * {@link IntegrationOutboxDrainLeaseMs} to `number` and makes the whole guard accept anything. That
+ * is not a hypothetical: the round-6 first draft wrote it that way, every `@ts-expect-error` fixture
+ * in the test went unused, and `tsc` failed the build for it — which is the guard's own guard
+ * working. `tests/domain/integrations/outbox.test.ts` asserts these numbers are the minutes the
+ * comments claim, so the readability the arithmetic used to carry is checked rather than lost.
  */
 export const INTEGRATION_OUTBOX_DRAIN_LEASES_MS = {
-  /** `claimIntegrationOutboxWork`'s own default: every drain that does not override it. */
-  default: 10 * 60 * 1000,
-  /** lib/connectors/xero/sync-processor.ts `CLAIM_STALE_MS` / `XERO_ENTRY_LEASE_MS`. */
-  xeroAccountingEntry: 15 * 60 * 1000,
+  /** Ten minutes: `claimIntegrationOutboxWork`'s own default, for every drain that does not override it. */
+  default: 600_000,
+  /** Fifteen minutes: lib/connectors/xero/sync-processor.ts `CLAIM_STALE_MS` / `XERO_ENTRY_LEASE_MS`. */
+  xeroAccountingEntry: 900_000,
 } as const
+
+/**
+ * THE ONLY LEASES A CLAIM MAY TAKE — the literal union of the map above, and the type
+ * `claimIntegrationOutboxWork` accepts.
+ *
+ * A drain that needs a lease not listed here adds it to the map, in the same edit that raises the
+ * listing threshold derived from the maximum. That is the whole mechanism; there is no way to pass a
+ * lease around it, because there is no way to produce a value of this type that the map does not
+ * contain.
+ */
+export type IntegrationOutboxDrainLeaseMs =
+  (typeof INTEGRATION_OUTBOX_DRAIN_LEASES_MS)[keyof typeof INTEGRATION_OUTBOX_DRAIN_LEASES_MS]
 
 /** The longest any worker in this build can hold a row and still be within its lease. */
 export const INTEGRATION_OUTBOX_MAX_LEASE_MS = Math.max(

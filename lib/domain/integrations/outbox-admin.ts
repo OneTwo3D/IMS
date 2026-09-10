@@ -6,10 +6,7 @@ import {
   type IntegrationOutboxStatus,
 } from '@/lib/domain/integrations/outbox'
 import { INTEGRATION_OUTBOX_MAX_LEASE_MS } from '@/lib/domain/integrations/outbox-leases'
-import {
-  integrationOutboxUnreclaimableScope,
-  isUnreclaimableOutboxOperation,
-} from '@/lib/domain/integrations/outbox-registry'
+import { integrationOutboxUnreclaimableScope } from '@/lib/domain/integrations/outbox-registry'
 
 const ADMIN_OUTBOX_DEFAULT_LIMIT = 50
 export const ADMIN_OUTBOX_MAX_LIMIT = 100
@@ -263,7 +260,8 @@ async function requireRow(client: IntegrationOutboxClient, id: string): Promise<
 }
 
 /**
- * A ROW NOTHING WILL EVER COME BACK FOR (o3d-8td2 round 3, Codex HIGH; round 4, HIGH 2).
+ * A ROW NOTHING WILL EVER COME BACK FOR — AND THIS FILE ONLY LISTS IT (o3d-8td2 r3 HIGH, r4 HIGH 2,
+ * r6 withdrawal).
  *
  * Two conditions, and both have to hold before a stalled row is an operator's problem:
  *
@@ -283,9 +281,32 @@ async function requireRow(client: IntegrationOutboxClient, id: string): Promise<
  * row on an operation this build has never heard of — which `enqueueIntegrationOutbox` deliberately
  * accepts — is inside it. Round 3 excluded exactly those rows from both the reclaim and the list.
  *
- * The threshold is the SAME constant {@link permanentlyFailIntegrationOutboxAdminRow} refuses below,
- * so a row can never be shown here while the action offered on it would be rejected as
- * `processing_lock_active`.
+ * THERE IS NO ONE-CLICK ACTION ON WHAT THIS RETURNS, AND THAT IS THE FINDING, NOT AN OMISSION
+ * (o3d-8td2 round 6, and o3d-7qdb carries the full record). Rounds 3, 4 and 5 each shipped a
+ * recovery button here and each drew a Codex HIGH:
+ *
+ *   - r3 dead-lettered and re-queued, which is the stale-lock reclaim the declaration forbids, done
+ *     by hand, on the same evidence a worker is not allowed to act on;
+ *   - r4 reduced it to dead-letter-only, defended as producing "no effect at all";
+ *   - r5 showed that defence is false at its root. `PERMANENT_FAILED` IS NOT INERT. WooCommerce's
+ *     normal enqueue path resets a permanent failure to PENDING on the next stock change
+ *     (lib/connectors/woocommerce/sync/stock-sync-jobs.ts, `status: { not: PROCESSING }`), and
+ *     `scheduleXeroAccountingOutbox` does the same (lib/connectors/xero/outbox.ts) from
+ *     `ensureXeroOutboxForPendingSyncLogs`, which runs on EVERY Xero sweep
+ *     (lib/connectors/xero/sync-processor.ts). Dead-lettering a park therefore parks it until the
+ *     next ordinary event replays it — an old absolute stock quantity over a fresh one, or a second
+ *     invoice email.
+ *
+ * The general rule that follows, and the one any future attempt has to answer: THERE IS NO STATUS IN
+ * THIS SYSTEM THAT IS INERT. Every terminal status is an input to some enqueue path. So a recovery
+ * cannot be made safe by choosing a quieter status; it must either verify the remote system directly
+ * or require the operator to supply evidence the system cannot obtain for itself.
+ *
+ * Listing is a read and needs none of that, which is why it is what survived. The operator is not
+ * left helpless: `permanentlyFailIntegrationOutboxAdminRow` (POST
+ * /api/admin/outbox/[id]/permanent-fail) predates this branch, already accepts a stale PROCESSING
+ * row, and carries its own established semantics — including, unchanged, the re-enqueue behaviour
+ * above, which is the reason it is not offered as a button next to a row that merely looks stuck.
  */
 export function stalledIntegrationOutboxParkWhere(options?: {
   now?: Date
@@ -298,107 +319,6 @@ export function stalledIntegrationOutboxParkWhere(options?: {
     status: INTEGRATION_OUTBOX_STATUS.PROCESSING,
     lockedAt: { not: null, lte: new Date(now.getTime() - staleMs) },
   }
-}
-
-/**
- * THE STAMP A DEAD-LETTERED PARK CARRIES, saying in the row itself what nobody can verify.
- *
- * `permanentlyFailIntegrationOutboxAdminRow` writes no `lastError` of its own, so before round 4 a
- * park landed in the PERMANENT_FAILED list carrying whatever the crashed worker had left — usually
- * `null` — and an operator looking at it later had no way to know it had been stopped by hand rather
- * than by a failure, nor what was and was not known about its effect. The re-queue is a SEPARATE act
- * taken on that list; this is the only thing standing between it and a blind one.
- */
-export function stalledOutboxParkDeadLetterReason(row: {
-  connector: string
-  operation: string
-  lockedBy: string | null
-  lockedAt: Date | null
-}): string {
-  const heldBy = row.lockedBy ?? 'an unnamed worker'
-  const heldSince = row.lockedAt ? row.lockedAt.toISOString() : 'an unknown time'
-  const leaseMinutes = Math.round(ADMIN_OUTBOX_STALE_PROCESSING_LOCK_MS / 60_000)
-  return `Dead-lettered from the exception inbox: the PROCESSING lock taken by ${heldBy} at ${heldSince} `
-    + `was never released and is older than every drain lease (${leaseMinutes} minutes). `
-    + 'NOTHING HAS BEEN RE-RUN, and two things are NOT known: whether that worker died or is merely '
-    + `paused, and whether its ${row.connector}/${row.operation} effect reached the remote system. `
-    + 'Re-queueing this row runs the operation again — check the remote system first.'
-}
-
-/**
- * THE ONE ACTION ON A PARK, AND IT DOES NOT RE-RUN THE OPERATION (o3d-8td2 round 4, Codex HIGH 1).
- *
- * ROUND 3 BUILT THE THING THE VERDICT FORBIDS, and the argument against it is this issue's own.
- * `unsafe-to-replay` exists because `lockedAt < now - lease` cannot distinguish a holder that DIED
- * from one that is merely SLOW, so handing the row to a second executor on that evidence can produce
- * the effect twice. Round 3 refused to let a WORKER do that and then offered an OPERATOR a button
- * that did it: dead-letter, then immediately re-queue, on exactly the same evidence. A compare-and-set
- * fences the row's later WRITES; it cannot unsend a WooCommerce push or un-queue an invoice email
- * that the first holder had already issued. A paused worker that resumes after the button is pressed
- * still finishes its work, and the re-queued row does it a second time.
- *
- * SO THE OPERATOR ACTION DEAD-LETTERS AND STOPS. That is the whole of it, and it is defensible where
- * a re-queue is not, for one reason: DEAD-LETTERING PRODUCES NO EFFECT. It moves a row from a status
- * nothing will ever act on to a status nothing will ever act on, and every completion path is fenced
- * on `(lockedBy, lockedAt)`, so a resuming holder cannot write the row either. It needs no belief
- * about whether the holder is alive, which is the only belief this evidence cannot support.
- *
- * RE-ENQUEUE REMAINS AVAILABLE AND REMAINS A SEPARATE ACT. The dead-lettered row lands in the
- * exception inbox's PERMANENT_FAILED section, carrying {@link stalledOutboxParkDeadLetterReason},
- * where {@link replayIntegrationOutboxAdminRow} is the existing affordance. That is deliberately not
- * one click: it is a different surface, a different row state, and a stated reason naming what
- * cannot be verified, so the person who re-runs a possibly-already-delivered effect is asserting
- * something they went and checked rather than something the clock told them.
- *
- * WHAT IT COSTS, said plainly. For `woocommerce/stock.push` the folded backlog does NOT drain on
- * this action — the row's latest quantity still waits for the replay. The park is no longer
- * invisible or self-perpetuating, which was the r3 finding; it is now a two-act recovery, and the
- * second act is the one that can duplicate an effect, so it is the one an operator has to mean.
- *
- * REFUSES ANYTHING THAT IS NOT A PARK. The caller is an inbox row an operator clicked, rendered from
- * a snapshot; by the time the click lands the worker may have finished, or the row may never have
- * been in scope. Re-read and re-checked here against the same predicate the list was built from.
- */
-export async function deadLetterStalledIntegrationOutboxPark(options: {
-  client?: IntegrationOutboxClient
-  id: string
-  now?: Date
-  staleProcessingLockMs?: number
-}): Promise<IntegrationOutboxAdminTransitionResult> {
-  const client = getClient(options.client)
-  const now = options.now ?? new Date()
-  const staleProcessingLockMs = Math.max(
-    0,
-    Math.floor(options.staleProcessingLockMs ?? ADMIN_OUTBOX_STALE_PROCESSING_LOCK_MS),
-  )
-  const prior = await requireRow(client, options.id)
-
-  // The SAME rule the list is built from, so the action can never reach a row the rule does not
-  // cover — and, since round 4, that rule is total over rows: an unregistered operation is inside
-  // it, not invisible to it.
-  if (!isUnreclaimableOutboxOperation(prior.connector, prior.operation)) {
-    throw new IntegrationOutboxAdminError(
-      `Integration outbox row ${options.id} (${prior.connector}/${prior.operation}) is not a parked row: its operation is reclaimable, so a drain sweep recovers it without an operator`,
-      409,
-      'not_a_stalled_park',
-    )
-  }
-  if (prior.status !== INTEGRATION_OUTBOX_STATUS.PROCESSING || prior.lockedAt === null) {
-    throw new IntegrationOutboxAdminError(
-      `Integration outbox row ${options.id} is ${prior.status}, not a stalled PROCESSING park`,
-      409,
-      'not_a_stalled_park',
-    )
-  }
-
-  // One step, and it is the step that fences on `lockedAt` and refuses a lock that is not yet stale.
-  return await permanentlyFailIntegrationOutboxAdminRow({
-    client,
-    id: options.id,
-    now,
-    staleProcessingLockMs,
-    lastError: stalledOutboxParkDeadLetterReason(prior),
-  })
 }
 
 export async function replayIntegrationOutboxAdminRow(options: {
@@ -481,13 +401,6 @@ export async function permanentlyFailIntegrationOutboxAdminRow(options: {
   id: string
   now?: Date
   staleProcessingLockMs?: number
-  /**
-   * Written into `lastError` in the SAME fenced statement as the status flip, so a row can never be
-   * dead-lettered without its reason. Omitted by the generic operator action, which is taken on a
-   * row that already carries the failure that brought it here; supplied by
-   * {@link deadLetterStalledIntegrationOutboxPark}, whose row carries nothing at all.
-   */
-  lastError?: string
 }): Promise<IntegrationOutboxAdminTransitionResult> {
   const client = getClient(options.client)
   const prior = await requireRow(client, options.id)
@@ -506,7 +419,6 @@ export async function permanentlyFailIntegrationOutboxAdminRow(options: {
       nextAttemptAt: null,
       lockedAt: null,
       lockedBy: null,
-      ...(options.lastError === undefined ? {} : { lastError: options.lastError }),
     },
   })
   if (result.count === 0) {

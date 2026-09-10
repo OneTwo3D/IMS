@@ -37,10 +37,8 @@ import { withDispatchSweepLockOrSkip } from '@/lib/domain/wms/dispatch-sweep-loc
 import { logActivity, logActivityInTransaction } from '@/lib/activity-log'
 import { freshAuthFailureResult, requireFreshPermission, requirePermission } from '@/lib/auth/server'
 import {
-  ADMIN_OUTBOX_STALE_PROCESSING_LOCK_MS,
   IntegrationOutboxAdminError,
   listIntegrationOutboxAdminRows,
-  deadLetterStalledIntegrationOutboxPark,
   replayIntegrationOutboxAdminRow,
   stalledIntegrationOutboxParkWhere,
 } from '@/lib/domain/integrations/outbox-admin'
@@ -1380,51 +1378,6 @@ export async function replayOutboxException(id: string): Promise<MutationResult>
       action: 'integration_outbox_replay',
       description: `Re-queued integration outbox row (${result.row.connector}/${result.row.operation}) from ${result.priorStatus} via the exception inbox`,
       metadata: { outboxId: id, priorStatus: result.priorStatus, priorLastError: result.priorLastError, userId: session.user.id },
-    })
-    revalidatePath('/sync/exceptions')
-    return { success: true }
-  } catch (error) {
-    const freshAuthFailure = freshAuthFailureResult(error)
-    if (freshAuthFailure) return freshAuthFailure
-    if (error instanceof IntegrationOutboxAdminError) return { success: false, error: error.message }
-    throw error
-  }
-}
-
-/**
- * STOP A STALLED PARK. IT DOES NOT RE-RUN THE WORK (o3d-8td2 round 4, Codex HIGH 1).
- *
- * The row belongs to an operation that refused the stale-lock reclaim, so no worker will take it and
- * an operator is the only thing left. What round 3 offered here was a one-click dead-letter AND
- * re-queue — which is the reclaim the declaration forbids, done by hand, on the same evidence a
- * worker is not allowed to act on. A lock older than its lease does not prove its holder died, and a
- * compare-and-set cannot unsend an effect the holder already issued.
- *
- * So this dead-letters and stops. That produces no effect at all and needs no belief about whether
- * the holder is alive. The row then appears in the outbox-failures section carrying a stated reason,
- * where `replayOutboxRow` re-queues it — a second, deliberate act on a different surface, which is
- * where the duplicate-effect risk properly belongs.
- *
- * It refuses if the lock is not yet past every drain lease: a holder still inside its lease keeps the
- * row and this returns the refusal.
- */
-export async function deadLetterStalledOutboxPark(id: string): Promise<MutationResult> {
-  try {
-    const session = await requireFreshPermission('sync')
-    const result = await deadLetterStalledIntegrationOutboxPark({ id })
-    await logActivity({
-      entityType: 'SYNC',
-      entityId: id,
-      tag: 'sync',
-      action: 'integration_outbox_park_dead_lettered',
-      description: `Dead-lettered a stalled integration outbox park (${result.row.connector}/${result.row.operation}) from ${result.priorStatus} via the exception inbox; the operation was NOT re-run`,
-      metadata: {
-        outboxId: id,
-        priorStatus: result.priorStatus,
-        priorLastError: result.priorLastError,
-        staleProcessingLockMs: ADMIN_OUTBOX_STALE_PROCESSING_LOCK_MS,
-        userId: session.user.id,
-      },
     })
     revalidatePath('/sync/exceptions')
     return { success: true }

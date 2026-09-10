@@ -3,6 +3,10 @@ import { randomUUID } from 'node:crypto'
 import test from 'node:test'
 import { config } from 'dotenv'
 
+// The lease map is a LEAF declaration with no db or env dependency, which is why it can be imported
+// statically here while everything else in this file is loaded after `loadEnv()`.
+import { INTEGRATION_OUTBOX_DRAIN_LEASES_MS } from '@/lib/domain/integrations/outbox-leases'
+
 /**
  * o3d-8td2 round 3 (Codex HIGH + MEDIUM 2) — THE STALE-LOCK RECLAIM, AND THE PARK IT LEAVES BEHIND,
  * AGAINST A REAL POSTGRES.
@@ -34,9 +38,15 @@ import { config } from 'dotenv'
  * is ever handed the row, that the refusal comes from the declaration rather than from the clock,
  * and, for the email, that the queue it would land in carries no uniqueness to collide with.
  *
- * ROUND 4 ADDS THE TWO SCENARIOS THE REMEDY ITSELF CREATED: an operator acting on a park whose
- * holder is ALIVE-BUT-PAUSED (the recovery must not put the effect back in front of a worker), and a
- * row on an operation this build has never heard of (which round 3 made unreclaimable AND invisible).
+ * ROUND 4 ADDED the row on an operation this build has never heard of, which round 3 had made
+ * unreclaimable AND invisible.
+ *
+ * ROUND 6 REMOVED THE REMEDY AND KEPT THE FINDING. Rounds 3, 4 and 5 each shipped a one-click
+ * operator recovery on this list, and each drew a Codex HIGH; the last one is recorded here as a
+ * test of its own (`PERMANENT_FAILED is not inert`), driven entirely through shipped paths, because
+ * it is the general fact the whole remedy foundered on: no status in this system is inert, so a
+ * recovery cannot be made safe by choosing a quieter one to park a row in. What is tested now is the
+ * LIST — which rows it shows, which it refuses, and that it is a read. o3d-7qdb carries the rest.
  *
  * Gated behind RUN_DB_CONCURRENCY_TESTS=1: `npm run test:concurrency`.
  */
@@ -44,7 +54,7 @@ import { config } from 'dotenv'
 const RUN = process.env.RUN_DB_CONCURRENCY_TESTS === '1'
 /** Enough concurrent claimants that the row is genuinely fought over; the assertion is that it WAS. */
 const WORKERS = 8
-const STALE_LOCK_MS = 10 * 60 * 1000
+const STALE_LOCK_MS = INTEGRATION_OUTBOX_DRAIN_LEASES_MS.default
 /**
  * THE BARRIER, AND WHY IT IS NOT A TIMER (o3d-8td2 round 4, Codex MEDIUM).
  *
@@ -348,7 +358,7 @@ test(
 )
 
 test(
-  '[o3d-8td2 r3] the park swallows later stock changes, is visible to an operator, and drains with the LATEST payload',
+  '[o3d-8td2 r3] the park swallows later stock changes, is visible to an operator, and holds the LATEST payload',
   { skip: !RUN && 'set RUN_DB_CONCURRENCY_TESTS=1' },
   async (t) => {
     const deps = await loadDeps()
@@ -386,37 +396,30 @@ test(
     const listed = await deps.db.integrationOutbox.findMany({ where: where as never, select: { id: true } })
     assert.ok(listed.some((row) => row.id === folded.id), 'the stalled park must be listed for an operator')
 
-    // (3) THE OPERATOR ACTION STOPS IT, AND DOES NOT RE-RUN IT (round 4, Codex HIGH 1). Round 3
-    // dead-lettered and immediately re-queued, which is the reclaim `unsafe-to-replay` exists to
-    // forbid, performed by hand on the same evidence a worker is not allowed to act on.
-    await deps.deadLetterStalledIntegrationOutboxPark({ id: folded.id })
-
-    const stopped = await deps.db.integrationOutbox.findUniqueOrThrow({ where: { id: folded.id } })
-    assert.equal(stopped.status, 'PERMANENT_FAILED', 'the action must stop the row')
-    assert.notEqual(stopped.status, 'PENDING', 'and must never put it back in front of a worker')
-    assert.equal(stopped.lockedBy, null)
-    assert.equal(stopped.lockedAt, null)
-    assert.equal(stopped.nextAttemptAt, null, 'nothing is scheduled: the re-queue is a separate act')
-    assert.match(stopped.lastError ?? '', /NOTHING HAS BEEN RE-RUN/,
-      'the row must carry, in itself, the reason it was stopped and what could not be verified')
-
-    // THE FOLDED PAYLOAD SURVIVES, which is what makes the separate re-queue worth taking: when an
-    // operator does replay it, the push carries the LATEST quantity and settles the whole backlog.
+    // (3) AND THE BACKLOG IS WHAT MAKES IT WORTH SHOWING. The folded payload carries the LATEST
+    // quantity, so an operator who checks WooCommerce and then acts deliberately settles the whole
+    // backlog in one push. Round 6 withdrew the one-click action that used to sit here; the reason
+    // is o3d-7qdb, and the demonstration is the `[r6] PERMANENT_FAILED is not inert` test below.
     assert.deepEqual(
-      stopped.payloadJson,
+      folded.payloadJson,
       { productId, reason: 'WC_WEBHOOK', force: false, webhookQty: 3 },
-      'dead-lettering must not discard the changes that piled up behind the park',
+      'the park must hold the changes that piled up behind it, not discard them',
     )
 
-    // ...and it has left the stalled-park list for the failed-rows list, which is the other half of
-    // "stopped": one operator surface hands it to the other.
+    // (4) NON-VACUITY of (2): the listing is answering about THIS row's lock, not saying yes to
+    // every PROCESSING row. Put the lock back inside every lease and the row leaves the list.
+    await deps.db.integrationOutbox.update({
+      where: { id: folded.id },
+      data: { lockedAt: new Date(Date.now() - 60 * 1000) },
+    })
     const stillListed = await deps.db.integrationOutbox.findMany({ where: where as never, select: { id: true } })
-    assert.ok(!stillListed.some((row) => row.id === folded.id), 'a stopped park must leave the park inbox')
+    assert.ok(!stillListed.some((row) => row.id === folded.id),
+      'a row inside its lease is a job, not an exception')
   },
 )
 
 test(
-  '[o3d-8td2 r3] a park whose worker is still alive is neither listed nor drainable',
+  '[o3d-8td2 r3/r6] a park whose worker is still alive is not listed, and one past every lease is',
   { skip: !RUN && 'set RUN_DB_CONCURRENCY_TESTS=1' },
   async (t) => {
     const deps = await loadDeps()
@@ -437,21 +440,19 @@ test(
     const listed = await deps.db.integrationOutbox.findMany({ where: where as never, select: { id: true } })
     assert.ok(!listed.some((row) => row.id === live.id), 'a live job must not be presented as an exception')
 
-    // And the action refuses it even if a stale page offers the button — re-read and re-checked
-    // against the same rule, so the affordance cannot cut under a worker that is still running.
-    await assert.rejects(
-      () => deps.deadLetterStalledIntegrationOutboxPark({ id: live.id }),
-      (error: unknown) => (error as { code?: string }).code === 'processing_lock_active',
-      'draining a live lock must be refused, not merely discouraged',
-    )
+    // NON-VACUITY: the same row, once past every lease, IS listed — so the assertion above turned on
+    // the lock's age and not on some other clause quietly excluding it.
+    await deps.db.integrationOutbox.update({
+      where: { id: live.id },
+      data: { lockedAt: new Date(Date.now() - deps.ADMIN_OUTBOX_STALE_PROCESSING_LOCK_MS - 60_000) },
+    })
+    const nowListed = await deps.db.integrationOutbox.findMany({ where: where as never, select: { id: true } })
+    assert.ok(nowListed.some((row) => row.id === live.id), 'the listing must be able to see this row at all')
+    await deps.db.integrationOutbox.update({ where: { id: live.id }, data: { lockedAt: live.lockedAt } })
 
-    const after = await deps.db.integrationOutbox.findUniqueOrThrow({ where: { id: live.id } })
-    assert.equal(after.status, 'PROCESSING', 'the refused action must have changed nothing')
-    assert.deepEqual(after.lockedAt, live.lockedAt)
-
-    // AND THE ROW ROUND 3 WOULD HAVE OFFERED (round 4, Codex HIGH 1). Twelve minutes is past round
+    // AND THE ROW ROUND 3 WOULD HAVE LISTED (round 4, Codex HIGH 1). Twelve minutes is past round
     // 3's restated ten-minute threshold and INSIDE the fifteen-minute lease `xero/accounting.post`
-    // is actually drained under — a job that is not stalled at all, listed as one, with a button.
+    // is actually drained under — a job that is not stalled at all, shown as one.
     const midLeaseKey = probeKey('xero-mid-lease')
     const midLease = await seedStalePark(deps.db, {
       connector: 'xero',
@@ -470,28 +471,28 @@ test(
     const midLeaseListed = await deps.db.integrationOutbox.findMany({ where: where as never, select: { id: true } })
     assert.ok(!midLeaseListed.some((row) => row.id === midLease.id),
       'a Xero row inside its own lease must not be presented as a stalled park')
-    await assert.rejects(
-      () => deps.deadLetterStalledIntegrationOutboxPark({ id: midLease.id }),
-      (error: unknown) => (error as { code?: string }).code === 'processing_lock_active',
-    )
   },
 )
 
 test(
-  '[o3d-8td2 r4] an operator stopping a park whose worker is ALIVE-BUT-PAUSED cannot make the effect run again',
+  '[o3d-8td2 r6] PERMANENT_FAILED is not inert: the ordinary enqueue path puts a dead-lettered row back in front of a worker',
   { skip: !RUN && 'set RUN_DB_CONCURRENCY_TESTS=1' },
   async (t) => {
     const deps = await loadDeps()
-    const productId = `8td2r4-paused-${process.pid}-${randomUUID()}`
+    const productId = `8td2r6-not-inert-${process.pid}-${randomUUID()}`
     const key = deps.buildOutboxIdempotencyKey('woocommerce', 'stock.push', productId)
-    const pausedWorker = 'wc-stock-sync'
 
     /**
-     * THE SCENARIO THE VERDICT IS ABOUT. The holder is NOT dead. It is paused mid-`pushStockToWc`
-     * — SIGSTOP, a frozen VM, a host paused in a syscall — and it will resume and finish. The only
-     * evidence anyone has to the contrary is the clock, which is exactly the evidence
-     * `unsafe-to-replay` says is insufficient. Nothing in this row distinguishes the two cases, and
-     * that indistinguishability is the point: the test is that the action is SAFE ANYWAY.
+     * THE FINDING THAT WITHDREW THE OPERATOR ACTION (Codex round 5 HIGH; o3d-7qdb).
+     *
+     * Round 4 defended a one-click dead-letter on the ground that it "produces no effect at all" —
+     * that it moves a row from a status nothing acts on to a status nothing acts on. That is false,
+     * and this test is the demonstration, driven entirely through SHIPPED paths: the pre-existing
+     * admin exit to reach PERMANENT_FAILED, and `enqueueWcStockSyncJobs` — the same function every
+     * stock change in the application calls — to bring it back.
+     *
+     * Nothing here tests withdrawn code. It tests the reason the code was withdrawn, so that a
+     * future attempt to park a row in a "quiet" status fails here first.
      */
     const park = await seedStalePark(deps.db, {
       connector: 'woocommerce',
@@ -499,51 +500,69 @@ test(
       idempotencyKey: key,
       payloadJson: { productId, reason: 'MANUAL', force: false, webhookQty: null },
       lockAgeMs: deps.ADMIN_OUTBOX_STALE_PROCESSING_LOCK_MS + 60_000,
-      lockedBy: pausedWorker,
+      lockedBy: 'wc-stock-sync',
     })
     t.after(() => deps.db.integrationOutbox.deleteMany({ where: { idempotencyKey: key } }))
 
-    // (1) THE OPERATOR ACTS, on a row the list really does show them.
+    // (1) THE PREMISE: this row is on the operator surface, which is the whole population any
+    // recovery would have acted on.
     const where = deps.stalledIntegrationOutboxParkWhere()
     const listed = await deps.db.integrationOutbox.findMany({ where: where as never, select: { id: true } })
-    assert.ok(listed.some((row) => row.id === park.id), 'the premise: this row is on the operator surface')
-    await deps.deadLetterStalledIntegrationOutboxPark({ id: park.id })
+    assert.ok(listed.some((row) => row.id === park.id), 'the premise: this row is listed')
 
+    // (2) IT REACHES PERMANENT_FAILED — by the pre-existing exit, which is the only exit there is.
+    await deps.permanentlyFailIntegrationOutboxAdminRow({ id: park.id })
     const stopped = await deps.db.integrationOutbox.findUniqueOrThrow({ where: { id: park.id } })
     assert.equal(stopped.status, 'PERMANENT_FAILED')
-    assert.notEqual(stopped.status, 'PENDING', 'the operator action must not re-queue an unsafe-to-replay row')
+    assert.equal(stopped.lockedAt, null)
+    assert.equal(stopped.lockedBy, null)
 
-    // (2) THE PAUSED WORKER WAKES UP and still cannot write the row: every completion helper fences
-    // on the exact (lockedBy, lockedAt) it was granted, and the dead-letter cleared both.
-    await assert.rejects(
-      () => deps.markIntegrationOutboxSuccess({ id: park.id, workerId: pausedWorker, lockedAt: park.lockedAt! }),
-      'a resuming holder must not be able to complete a row it no longer holds',
+    // (3) AND IT IS NOT INERT. One ordinary stock change on that product — a manual edit, a receipt,
+    // a sales order, anything at all — and the connector's own enqueue path resets it.
+    await deps.enqueueWcStockSyncJobs([productId], 'MANUAL')
+    const revived = await deps.db.integrationOutbox.findUniqueOrThrow({ where: { id: park.id } })
+    assert.equal(revived.status, 'PENDING',
+      'the WooCommerce enqueue path updates on `status: { not: PROCESSING }`, so PERMANENT_FAILED is matched and reset')
+    assert.notEqual(revived.status, 'PERMANENT_FAILED')
+    assert.equal(revived.attempts, 0, 'and the retry ladder is cleared too, so nothing bounds the re-run')
+
+    // (4) WHICH MEANS A WORKER TAKES IT. Not through the stale-reclaim arm the declaration closes —
+    // through the drain's ORDINARY first arm, because the row is simply PENDING again. This is the
+    // replay `unsafe-to-replay` exists to prevent, reached with no operator decision and no remote
+    // verification anywhere in the chain.
+    const afterRevival = await raceForRow(deps, { connector: 'woocommerce', operation: 'stock.push', idempotencyKey: key })
+    assert.equal(afterRevival.winners.length, 1,
+      'a dead-lettered park is handed straight back to a worker by the next ordinary stock change')
+
+    // (5) NON-VACUITY of (3): the revival is the enqueue path's doing and not the passage of time.
+    // A row left PERMANENT_FAILED with nothing enqueued against it stays put and stays unclaimable.
+    const controlProductId = `8td2r6-control-${process.pid}-${randomUUID()}`
+    const controlKey = deps.buildOutboxIdempotencyKey('woocommerce', 'stock.push', controlProductId)
+    const control = await seedStalePark(deps.db, {
+      connector: 'woocommerce',
+      operation: 'stock.push',
+      idempotencyKey: controlKey,
+      payloadJson: { productId: controlProductId, reason: 'MANUAL', force: false, webhookQty: null },
+      lockAgeMs: deps.ADMIN_OUTBOX_STALE_PROCESSING_LOCK_MS + 60_000,
+      lockedBy: 'wc-stock-sync',
+    })
+    t.after(() => deps.db.integrationOutbox.deleteMany({ where: { idempotencyKey: controlKey } }))
+    await deps.permanentlyFailIntegrationOutboxAdminRow({ id: control.id })
+    const controlRace = await raceForRow(deps, {
+      connector: 'woocommerce',
+      operation: 'stock.push',
+      idempotencyKey: controlKey,
+    })
+    assert.equal(controlRace.winners.length, 0, 'a PERMANENT_FAILED row nobody re-enqueued is not claimable')
+    assert.equal(
+      (await deps.db.integrationOutbox.findUniqueOrThrow({ where: { id: control.id } })).status,
+      'PERMANENT_FAILED',
     )
-
-    // (3) THE ACTUAL DEMAND OF THE FINDING, asserted as the database's answer to every worker in the
-    // fleet: after the operator's action, NOBODY is handed this row, so the effect the paused worker
-    // may already have produced cannot be produced a second time BY THE RECOVERY. Round 3 left the
-    // row PENDING here, and a PENDING stock.push is claimable by the drain's FIRST arm — nothing to
-    // do with the stale-reclaim arm the declaration closes — so one of these eight would have won.
-    const afterStop = await raceForRow(deps, { connector: 'woocommerce', operation: 'stock.push', idempotencyKey: key })
-    assert.equal(afterStop.winners.length, 0,
-      'the operator recovery must not put an unsafe-to-replay effect back in front of a worker')
-    assert.equal(afterStop.losers, WORKERS)
-
-    // (4) NON-VACUITY, and the shape of the remedy. The re-queue still EXISTS; it is a separate,
-    // deliberate act on a different surface, taken on a row that now carries a written statement of
-    // what nobody could verify. Once taken, the same eight claims do take the row — so step (3)
-    // measured the action, not a row that had become permanently unclaimable.
-    assert.match(stopped.lastError ?? '', /Re-queueing this row runs the operation again/)
-    await deps.replayIntegrationOutboxAdminRow({ id: park.id })
-    const afterReplay = await raceForRow(deps, { connector: 'woocommerce', operation: 'stock.push', idempotencyKey: key })
-    assert.equal(afterReplay.winners.length, 1,
-      'the deliberate second act must still be able to re-run the operation, or the park has no exit')
   },
 )
 
 test(
-  '[o3d-8td2 r4] an UNREGISTERED operation crashes into a park that is both listed and stoppable',
+  '[o3d-8td2 r4/r6] an UNREGISTERED operation crashes into a park that nothing reclaims and the list shows',
   { skip: !RUN && 'set RUN_DB_CONCURRENCY_TESTS=1' },
   async (t) => {
     const deps = await loadDeps()
@@ -598,13 +617,13 @@ test(
     assert.ok(listed.some((row) => row.id === claimed.id),
       'a crashed unregistered row must be on the operator surface — it is on no automatic path at all')
 
-    // (5) ...AND THE ACTION MUST REACH IT. Round 3's guard used the same `policy !== null` test, so
-    // this call was refused as `not_a_stalled_park` for a row nothing else was going to touch either.
-    const result = await deps.deadLetterStalledIntegrationOutboxPark({ id: claimed.id })
-    assert.equal(result.row.status, 'PERMANENT_FAILED')
+    // (5) ...AND NOTHING MORE THAN SHOWN (round 6). The pre-existing admin exit reaches it — round
+    // 3's guard would have refused it as `not_a_stalled_park`, for a row nothing else was going to
+    // touch either — but that exit is an admin API call an operator makes deliberately, not a button
+    // beside the row. NON-VACUITY: the row leaves the list only because something acted on it.
+    await deps.permanentlyFailIntegrationOutboxAdminRow({ id: claimed.id })
     const after = await deps.db.integrationOutbox.findUniqueOrThrow({ where: { id: claimed.id } })
     assert.equal(after.status, 'PERMANENT_FAILED')
-    assert.match(after.lastError ?? '', /legacy-connector\/legacy\.unregistered/)
 
     const stillListed = await deps.db.integrationOutbox.findMany({ where: where as never, select: { id: true } })
     assert.ok(!stillListed.some((row) => row.id === claimed.id))

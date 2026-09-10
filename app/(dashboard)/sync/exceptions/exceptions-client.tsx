@@ -3,7 +3,7 @@
 import { Fragment, useState, useTransition } from 'react'
 import Link from 'next/link'
 import { useRouter } from 'next/navigation'
-import { ArrowLeft, CheckCircle2, Inbox, Loader2, OctagonX, PackageCheck, PencilLine, RotateCcw, Split, XCircle } from 'lucide-react'
+import { ArrowLeft, CheckCircle2, Inbox, Loader2, PackageCheck, PencilLine, RotateCcw, Split, XCircle } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { buttonVariants } from '@/components/ui/button-variants'
 import { Card } from '@/components/ui/card'
@@ -31,7 +31,6 @@ import {
   replayDeadReceiptEvent,
   replayDeadWebhookEvent,
   replayOutboxException,
-  deadLetterStalledOutboxPark,
   isolateUnresolvedDriftCohort,
   replayStuckDispatch,
   retryUnresolvedDriftCohort,
@@ -335,11 +334,26 @@ export function ExceptionsClient({ data }: Props) {
         </Card>
       ) : null}
 
+      {/*
+        A LIST AND NOTHING ELSE (o3d-8td2 round 6; the withdrawn action is o3d-7qdb).
+
+        This section had a one-click "Stop" through rounds 3, 4 and 5, and each version drew a Codex
+        HIGH. The last one is the reason there is no button here now: dead-lettering a park is not
+        inert, because both connectors' ORDINARY enqueue paths reset a PERMANENT_FAILED row to
+        PENDING — WooCommerce on the next stock change for that product, Xero on the next sweep, via
+        `ensureXeroOutboxForPendingSyncLogs`. A button labelled "Stop" would therefore have queued
+        the very replay the operation is declared `unsafe-to-replay` to prevent, without the operator
+        ever being asked to check the remote system.
+
+        Nothing about how long a lock has been held is evidence about whether its effect landed, so
+        the surface that rests on elapsed time is the surface that may only READ. The exit is the
+        pre-existing admin route, which carries its own semantics and is not one click from here.
+      */}
       {data.stalledOutboxParks.length > 0 ? (
         <Card className="p-4 space-y-3">
           <SectionHeading
             title={`Integration outbox — stalled parks (${data.summary.stalledOutboxParks})`}
-            detail="Rows still marked PROCESSING under a lock older than every drain lease, where handing the row to a second worker would be unsafe. Nothing retries these: no drain reclaims them and no reconcile drains them. For WooCommerce stock pushes every later change to the same product is folded into the parked row and waits behind it. STOP dead-letters the row and does NOT re-run it — IMS cannot tell whether the holder died or is merely paused, nor whether its effect already reached the remote system. The row then moves to the failed-rows section above, where Replay re-runs the operation; do that only after checking the remote system."
+            detail="Rows still marked PROCESSING under a lock older than every drain lease, where handing the row to a second worker would be unsafe. Nothing retries these: no drain reclaims them and no reconcile drains them. For WooCommerce stock pushes every later change to the same product is folded into the parked row and waits behind it. THIS SECTION IS READ-ONLY ON PURPOSE, and the reason is not caution: IMS cannot tell from a stale lock whether the holder died or is merely paused, nor whether its effect already reached the remote system — and no status it could move the row to is inert, because both connectors' normal enqueue paths reset a dead-lettered row to PENDING on the next stock change or sweep. Check the remote system first (WooCommerce stock for that product, or the Xero invoice and its email), then use the admin outbox API to dead-letter or replay the row deliberately."
             shown={data.stalledOutboxParks.length}
             total={data.summary.stalledOutboxParks}
           />
@@ -351,7 +365,7 @@ export function ExceptionsClient({ data }: Props) {
                 <TableHead>Attempts</TableHead>
                 <TableHead>Held by</TableHead>
                 <TableHead>Locked</TableHead>
-                <TableHead className="text-right">Action</TableHead>
+                <TableHead>Row</TableHead>
               </TableRow>
             </TableHeader>
             <TableBody>
@@ -362,21 +376,9 @@ export function ExceptionsClient({ data }: Props) {
                   <TableCell className="text-xs">{row.attempts}</TableCell>
                   <TableCell className="text-xs font-mono text-muted-foreground">{row.lockedBy ?? '—'}</TableCell>
                   <TableCell className="text-xs text-muted-foreground">{row.lockedAt ? formatDateTime(row.lockedAt) : '—'}</TableCell>
-                  <TableCell className="text-right">
-                    <Button
-                      type="button"
-                      variant="outline"
-                      size="sm"
-                      disabled={isPending}
-                      title="Dead-letters this row. It does NOT re-run the operation: the holder may be paused rather than dead, and its effect may already have landed. Re-queue from the failed-rows section once you have checked."
-                      onClick={() => runAction(
-                        () => deadLetterStalledOutboxPark(row.id),
-                        'Stalled outbox park dead-lettered. It was NOT re-run — replay it from the failed rows above once you have checked the remote system.',
-                      )}
-                    >
-                      <OctagonX className="h-3 w-3 mr-1" />Stop
-                    </Button>
-                  </TableCell>
+                  {/* The id, so the operator can act on this row through the admin API once they
+                      have checked the remote system. Deliberately not a control. */}
+                  <TableCell className="text-xs font-mono text-muted-foreground">{row.id}</TableCell>
                 </TableRow>
               ))}
             </TableBody>

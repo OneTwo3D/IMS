@@ -1,5 +1,8 @@
 import { db } from '@/lib/db'
-import { INTEGRATION_OUTBOX_DRAIN_LEASES_MS } from '@/lib/domain/integrations/outbox-leases'
+import {
+  INTEGRATION_OUTBOX_DRAIN_LEASES_MS,
+  type IntegrationOutboxDrainLeaseMs,
+} from '@/lib/domain/integrations/outbox-leases'
 import {
   isUniqueConstraintViolation,
   uniqueConstraintFields,
@@ -64,7 +67,16 @@ export type ClaimIntegrationOutboxOptions = {
   limit?: number
   workerId: string
   now?: Date
-  staleLockMs?: number
+  /**
+   * o3d-8td2 r6 (Codex MEDIUM): a lease this claim may take, and NOT `number`.
+   *
+   * The listing threshold in `outbox-admin.ts` is the maximum over
+   * `INTEGRATION_OUTBOX_DRAIN_LEASES_MS`, so a lease that map does not contain would let the
+   * exception inbox call a row stalled while its holder was still inside its lease. Typing the
+   * parameter as the map's literal union makes that unrepresentable at every call site — including
+   * the shorthand and spread forms a source scan cannot see — instead of asking a regex to notice it.
+   */
+  staleLockMs?: IntegrationOutboxDrainLeaseMs
   maxAttempts?: number
 }
 
