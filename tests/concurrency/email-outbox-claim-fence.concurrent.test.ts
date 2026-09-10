@@ -48,13 +48,18 @@
  */
 
 import assert from 'node:assert/strict'
+import { execFile, spawn } from 'node:child_process'
 import { randomUUID } from 'node:crypto'
 import { readFileSync } from 'node:fs'
-import { fileURLToPath } from 'node:url'
+import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import test from 'node:test'
+import { fileURLToPath } from 'node:url'
+import { promisify } from 'node:util'
 import { config } from 'dotenv'
 
-import type { EmailOutboxClient } from '@/lib/email-outbox'
+import type { EmailOutboxClient, EmailOutboxHarness } from '@/lib/email-outbox'
 import {
   ThrowawayDatabaseError,
   provisionThrowawayDatabase,
@@ -68,6 +73,16 @@ const MIGRATION_SQL_PATH = fileURLToPath(
   new URL('../../prisma/migrations/20260910120000_email_outbox_claim_fence/migration.sql', import.meta.url),
 )
 const UNDELIVERED_INDEX = 'email_outbox_undelivered_reference_uq'
+
+const execFileAsync = promisify(execFile)
+
+/** Resolved from this file, never from the runner's cwd. */
+const REPO_ROOT = fileURLToPath(new URL('../..', import.meta.url))
+const PRISMA_BIN = fileURLToPath(new URL('../../node_modules/.bin/prisma', import.meta.url))
+const THROWAWAY_HELPER_PATH = fileURLToPath(new URL('../helpers/throwaway-database.ts', import.meta.url))
+
+/** The migration under test, by the name `prisma migrate resolve` takes. */
+const FENCE_MIGRATION = '20260910120000_email_outbox_claim_fence'
 const FIXTURE_RECIPIENT = 'nobody@example.test'
 
 /** 15 minutes is EMAIL_CLAIM_STALE_MS; 16 puts a reclaim just past it. */
@@ -75,6 +90,19 @@ const RECLAIM_AFTER_MS = 16 * 60_000
 
 const noPrepare = async () => null
 const noLog = async () => undefined
+
+/**
+ * EVERY DRAIN IN THIS LANE GOES THROUGH HERE, AND THE PARAMETER TYPE IS THE POINT (o3d-alnk r6).
+ *
+ * `EmailOutboxHarness` has NO optional members, so a call that forgets one does not compile and
+ * cannot quietly fall back to a production dependency — which on this host means the LIVE-SERVED
+ * dev database or the real mailer. The drain itself is passed in because this file imports it
+ * dynamically; the helper NARROWS its second argument and can only pass a complete harness through.
+ */
+const drainWith = (
+  run: typeof import('@/lib/email-outbox').processPendingEmailOutbox,
+  harness: EmailOutboxHarness,
+) => run({ harness })
 
 /**
  * Pull one statement out of the SHIPPED migration by marker.
@@ -145,7 +173,35 @@ type Lane = {
   close: () => Promise<void>
 }
 
-async function openLane(): Promise<Lane> {
+type OpenLaneOptions = {
+  /**
+   * TEST-ONLY, and it exists so the cleanup below is REACHABLE from a proof rather than argued.
+   * Invoked immediately after the database is provisioned and before any client is built; it is
+   * handed the handle so a proof can record WHICH database must be gone afterwards.
+   */
+  failAfterProvision?: (database: ThrowawayDatabase) => void
+}
+
+/**
+ * PROVISION, THEN BUILD CLIENTS — AND DROP THE DATABASE ON ANY FAILURE IN BETWEEN (o3d-alnk r6,
+ * Codex LOW).
+ *
+ * The caller's `finally { lane.close() }` cannot cover this window: it only begins once
+ * `openLane` has RETURNED. A failure in the dynamic imports, in `new PrismaClient`, or in
+ * `sql.connect()` therefore used to leave a freshly migrated database behind for good. Everything
+ * between the provision and the return is now inside a try whose catch closes what is closable and
+ * drops the database before re-throwing.
+ *
+ * WHAT THIS STILL CANNOT COVER, SAID PLAINLY RATHER THAN IMPLIED. A process that does not get to
+ * run any more JavaScript leaves the database behind: SIGKILL, a hard runner timeout that kills
+ * the worker, an OOM kill, the machine losing power. No `finally`, no `process.on('exit')` handler
+ * and no `catch` runs in those cases, and pretending otherwise is the failure mode this branch has
+ * been correcting for six rounds. The mitigation is not a guarantee, it is a NAME: every database
+ * this helper creates matches `ims_throwaway_<label>_<16 hex>`, so a leftover says which lane made
+ * it and can be dropped by hand. `tests/concurrency` has a proof below that DEMONSTRATES the hole
+ * (a child process that provisions and then SIGKILLs itself) instead of asserting its absence.
+ */
+async function openLane(options: OpenLaneOptions = {}): Promise<Lane> {
   config({ path: '.env.local', quiet: true })
   config({ quiet: true })
   if (!process.env.DATABASE_URL) {
@@ -154,27 +210,41 @@ async function openLane(): Promise<Lane> {
 
   const database = await provisionThrowawayDatabase({ label: 'alnkfence' })
 
-  const [{ PrismaClient }, { PrismaPg }, { default: pg }] = await Promise.all([
-    import('@/app/generated/prisma/client'),
-    import('@prisma/adapter-pg'),
-    import('pg'),
-  ])
+  let db: { $disconnect: () => Promise<void> } | null = null
+  let sql: PgClient | null = null
+  try {
+    options.failAfterProvision?.(database)
 
-  // Config form, NOT `new PrismaPg(pool)` (o3d-4ajo): a second copy of `pg` fails the adapter's
-  // `instanceof` check, the Pool is used as a connection CONFIG, and startup dies in the socket
-  // callback with an unsettled promise.
-  const db = new PrismaClient({ adapter: new PrismaPg({ connectionString: database.url, max: 5 }) })
-  const sql = new pg.Client({ connectionString: database.url }) as unknown as PgClient
-  await sql.connect()
+    const [{ PrismaClient }, { PrismaPg }, { default: pg }] = await Promise.all([
+      import('@/app/generated/prisma/client'),
+      import('@prisma/adapter-pg'),
+      import('pg'),
+    ])
+
+    // Config form, NOT `new PrismaPg(pool)` (o3d-4ajo): a second copy of `pg` fails the adapter's
+    // `instanceof` check, the Pool is used as a connection CONFIG, and startup dies in the socket
+    // callback with an unsettled promise.
+    db = new PrismaClient({ adapter: new PrismaPg({ connectionString: database.url, max: 5 }) })
+    sql = new pg.Client({ connectionString: database.url }) as unknown as PgClient
+    await sql.connect()
+  } catch (error) {
+    await sql?.end().catch(() => undefined)
+    await db?.$disconnect().catch(() => undefined)
+    await database.drop()
+    throw error
+  }
+
+  const openedDb = db as NonNullable<typeof db>
+  const openedSql = sql as NonNullable<typeof sql>
 
   return {
     database,
-    db: db as unknown as Lane['db'],
-    sql,
+    db: openedDb as unknown as Lane['db'],
+    sql: openedSql,
     close: async () => {
       // Ordered: let go of every connection before DROP DATABASE, even though it is FORCEd.
-      await sql.end().catch(() => undefined)
-      await db.$disconnect().catch(() => undefined)
+      await openedSql.end().catch(() => undefined)
+      await openedDb.$disconnect().catch(() => undefined)
       await database.drop()
     },
   }
@@ -241,7 +311,7 @@ async function futureSends(lane: Lane, t0: Date): Promise<string[]> {
   const { processPendingEmailOutbox } = await import('@/lib/email-outbox')
   const delivered: string[] = []
   for (const at of [t0, new Date(t0.getTime() + RECLAIM_AFTER_MS), new Date(t0.getTime() + 2 * RECLAIM_AFTER_MS)]) {
-    await processPendingEmailOutbox({
+    await drainWith(processPendingEmailOutbox, {
       client: lane.db as unknown as EmailOutboxClient,
       now: () => at,
       prepareQueuedEmail: noPrepare,
@@ -337,14 +407,14 @@ test(
 
         // Worker A claims, then stalls on the socket. Worker B's whole run happens inside that
         // stall, against the same database.
-        const workerA = await processPendingEmailOutbox({
+        const workerA = await drainWith(processPendingEmailOutbox, {
           client,
           now: () => t0,
           prepareQueuedEmail: noPrepare,
           logActivity: noLog,
           async sendEmail() {
             deliveries.push('worker-A')
-            const workerB = await processPendingEmailOutbox({
+            const workerB = await drainWith(processPendingEmailOutbox, {
               client,
               now: () => tReclaim,
               prepareQueuedEmail: noPrepare,
@@ -675,6 +745,210 @@ test(
         const delivered = await futureSends(lane, t0)
         assert.equal(delivered.length, 1, 'the retained PENDING row delivers a SECOND copy')
         assert.deepEqual(delivered, [FIXTURE_RECIPIENT])
+      })
+
+      /**
+       * CODEX r6 MEDIUM — IF THE REFUSAL FIRES, THE DATABASE IS LEFT EXACTLY AS IT WAS, AND THE
+       * RECOVERY THE HINT PRESCRIBES ACTUALLY WORKS.
+       *
+       * This runs `prisma migrate deploy` — the real runner, not a paraphrase — against a database
+       * this sub-test provisions, strips back to the state before this migration, and seeds with the
+       * ambiguity that makes the guard fire. Then it performs the HINT's recovery verbatim and shows
+       * the deploy succeeds. A HINT that describes an impossible recovery is worse than no HINT, and
+       * the only way to know which kind this is, is to do what it says.
+       *
+       * IT ALSO ASSERTS THE OPERATOR CAN READ THE REFUSAL. That is not decoration: with the DO block
+       * INSIDE the explicit transaction, `migrate deploy` printed `current transaction is aborted`
+       * and nothing else — the message, the DETAIL and the HINT were all lost, because the engine
+       * records the outcome in `_prisma_migrations` on the same connection and that statement failed
+       * first. Move the guard back inside BEGIN and this assertion goes red.
+       */
+      await t.test('the refusal leaves the database untouched, says why, and its recovery works', async () => {
+        const scratch = await provisionThrowawayDatabase({ label: 'alnkmigrate' })
+        try {
+          const runPrisma = async (args: string[]): Promise<{ code: number; output: string }> => {
+            try {
+              const { stdout, stderr } = await execFileAsync(PRISMA_BIN, args, {
+                cwd: REPO_ROOT,
+                env: { ...process.env, DATABASE_URL: scratch.url },
+                timeout: 300_000,
+                maxBuffer: 32 * 1024 * 1024,
+              })
+              return { code: 0, output: `${stdout}\n${stderr}` }
+            } catch (error) {
+              const failure = error as { code?: number; stdout?: string; stderr?: string }
+              return { code: failure.code ?? 1, output: `${failure.stdout ?? ''}\n${failure.stderr ?? ''}` }
+            }
+          }
+
+          const { default: pg } = await import('pg')
+          const sql = new pg.Client({ connectionString: scratch.url }) as unknown as PgClient
+          await sql.connect()
+          try {
+            const hasColumn = async (): Promise<number> => {
+              const rows = await sql.query(
+                "SELECT 1 FROM information_schema.columns WHERE table_name = 'email_outbox' AND column_name = 'lockedBy'",
+              )
+              return rows.rows.length
+            }
+            const hasIndex = async (): Promise<number> => {
+              const rows = await sql.query('SELECT 1 FROM pg_indexes WHERE indexname = $1', [UNDELIVERED_INDEX])
+              return rows.rows.length
+            }
+
+            // Rewind to the state this migration is applied FROM, so the deploy below really is
+            // this migration running for the first time against a database that has never had it.
+            await sql.query(`DROP INDEX IF EXISTS "${UNDELIVERED_INDEX}"`)
+            await sql.query('ALTER TABLE "email_outbox" DROP COLUMN "lockedBy"')
+            await sql.query('DELETE FROM "_prisma_migrations" WHERE migration_name = $1', [FENCE_MIGRATION])
+            await sql.query(
+              `INSERT INTO "email_outbox"
+                 (id, kind, "toEmail", subject, html, "referenceType", "referenceId", status, attempts,
+                  "availableAt", "processingStartedAt", "createdAt", "updatedAt")
+               VALUES
+                 ('amb-a', 'ACCOUNTING_INVOICE', $1, 's', 'h', 'SalesOrder', 'ref-1', 'PROCESSING', 0,
+                  now(), now(), now(), now()),
+                 ('amb-b', 'ACCOUNTING_INVOICE', $1, 's', 'h', 'SalesOrder', 'ref-1', 'PROCESSING', 0,
+                  now(), now(), now(), now())`,
+              [FIXTURE_RECIPIENT],
+            )
+
+            assert.equal(await hasColumn(), 0, 'the rewind did not remove lockedBy')
+            assert.equal(await hasIndex(), 0, 'the rewind did not remove the index')
+            const before = await sql.query('SELECT id, status FROM "email_outbox" ORDER BY id')
+
+            // (1) THE REFUSAL FIRES, THROUGH THE REAL RUNNER.
+            const refused = await runPrisma(['migrate', 'deploy'])
+            assert.notEqual(refused.code, 0, 'migrate deploy applied a migration it should have refused')
+            assert.match(refused.output, /refusing to collapse duplicates for ACCOUNTING_INVOICE\/SalesOrder\/ref-1 \(2 rows\)/)
+
+            // (2) THE OPERATOR CAN READ IT. Both halves matter: the actionable text is present, and
+            // the message that used to REPLACE it is absent.
+            assert.match(refused.output, /HINT: [\s\S]*prisma migrate resolve --rolled-back/)
+            assert.doesNotMatch(
+              refused.output,
+              /current transaction is aborted/,
+              'the refusal was masked by the engine bookkeeping error again: the guard is inside the explicit transaction',
+            )
+
+            // (3) THE DATABASE IS EXACTLY AS IT WAS. Not "mostly": the column the review was about,
+            // the index, and the rows.
+            assert.equal(await hasColumn(), 0, 'a refused migration left the lockedBy column behind')
+            assert.equal(await hasIndex(), 0, 'a refused migration left the unique index behind')
+            const afterRefusal = await sql.query('SELECT id, status FROM "email_outbox" ORDER BY id')
+            assert.deepEqual(afterRefusal.rows, before.rows, 'a refused migration changed rows')
+
+            // (4) AND THE RECOVERY THE HINT PRESCRIBES WORKS, done exactly as written: mark it rolled
+            // back, settle the ambiguity, deploy again.
+            const resolved = await runPrisma(['migrate', 'resolve', '--rolled-back', FENCE_MIGRATION])
+            assert.equal(resolved.code, 0, `migrate resolve --rolled-back failed: ${resolved.output}`)
+            await sql.query("UPDATE \"email_outbox\" SET status = 'SENT' WHERE id = 'amb-b'")
+            const redeployed = await runPrisma(['migrate', 'deploy'])
+            assert.equal(redeployed.code, 0, `the prescribed recovery did not work: ${redeployed.output}`)
+
+            assert.equal(await hasColumn(), 1, 'the recovered deploy did not add lockedBy')
+            assert.equal(await hasIndex(), 1, 'the recovered deploy did not create the index')
+          } finally {
+            await sql.end().catch(() => undefined)
+          }
+        } finally {
+          await scratch.drop()
+        }
+      })
+
+      /**
+       * CODEX r6 LOW — WHAT THE CLEANUP NOW COVERS, AND WHAT IT CANNOT.
+       *
+       * The lane's `finally { lane.close() }` only begins once `openLane` has RETURNED, so a failure
+       * in the dynamic imports, in `new PrismaClient`, or in `sql.connect()` used to leave a freshly
+       * migrated database behind. That window is closed, and closed is DEMONSTRATED here rather than
+       * asserted: the failure is injected at exactly that point and the database is then shown to be
+       * gone from `pg_database`.
+       *
+       * THE REMAINING HOLE IS DEMONSTRATED TOO, NOT WAVED AT. A process that is SIGKILLed — a hard
+       * runner timeout, an OOM kill, the machine losing power — runs no `finally`, no `catch` and no
+       * exit handler. The child below provisions a database and kills itself, and the parent then
+       * finds that database still on the server. That is the honest boundary: what survives it is not
+       * a guarantee but a NAME, `ims_throwaway_<label>_<16 hex>`, which says which lane made the
+       * leftover and makes it safe to drop by hand. This test drops it, because it knows the name.
+       */
+      await t.test('a failure between provisioning and the first query drops the database; a SIGKILL cannot', async () => {
+        // (a) THE WINDOW THAT IS NOW CLOSED.
+        let provisioned: ThrowawayDatabase | null = null
+        const injected = new Error('injected failure between provisioning and the first query')
+        await assert.rejects(
+          () => openLane({
+            failAfterProvision: (database) => {
+              provisioned = database
+              throw injected
+            },
+          }),
+          (error: unknown) => error === injected,
+          'openLane swallowed the injected failure',
+        )
+        const abandoned = provisioned as ThrowawayDatabase | null
+        assert.ok(abandoned, 'the failure hook never ran, so nothing was proved')
+        const leftBehind = await lane.sql.query('SELECT 1 FROM pg_database WHERE datname = $1', [abandoned.name])
+        assert.equal(leftBehind.rows.length, 0, `openLane left ${abandoned.name} behind`)
+
+        // (b) THE HOLE THAT REMAINS. A child provisions, records the name, and SIGKILLs itself.
+        const scratchDir = await mkdtemp(join(tmpdir(), 'alnk-sigkill-'))
+        const namePath = join(scratchDir, 'name')
+        const childPath = join(scratchDir, 'child.ts')
+        let orphan: string | null = null
+        try {
+          // An async IIFE, not top-level await: this file is transformed to CJS by tsx and a
+          // top-level await is a transform error there, which would fail the child for the wrong
+          // reason and make the assertion below vacuous.
+          await writeFile(childPath, [
+            `import { writeFileSync } from 'node:fs'`,
+            `import { provisionThrowawayDatabase } from ${JSON.stringify(THROWAWAY_HELPER_PATH)}`,
+            `void (async () => {`,
+            `  const database = await provisionThrowawayDatabase({ label: 'alnkkilled' })`,
+            `  writeFileSync(${JSON.stringify(namePath)}, database.name)`,
+            `  process.kill(process.pid, 'SIGKILL')`,
+            `})()`,
+            '',
+          ].join('\n'), 'utf8')
+
+          const killed = await new Promise<{ code: number | null; signal: string | null; noise: string }>((resolve) => {
+            const child = spawn(process.execPath, ['--import', 'tsx', childPath], {
+              cwd: REPO_ROOT,
+              env: { ...process.env, DATABASE_URL: process.env.DATABASE_URL },
+              stdio: ['ignore', 'pipe', 'pipe'],
+            })
+            let noise = ''
+            child.stdout?.on('data', (chunk: Buffer) => { noise += chunk.toString() })
+            child.stderr?.on('data', (chunk: Buffer) => { noise += chunk.toString() })
+            child.on('exit', (code, signal) => resolve({ code, signal, noise }))
+          })
+
+          assert.equal(
+            killed.signal,
+            'SIGKILL',
+            `the child did not actually die the way this is about (code ${killed.code}): ${killed.noise.slice(-2000)}`,
+          )
+          orphan = (await readFile(namePath, 'utf8')).trim()
+          assert.match(orphan, /^ims_throwaway_alnkkilled_[0-9a-f]{16}$/)
+
+          // THE HOLE, MEASURED: the database is still there. No `finally` ran, and none could.
+          const survived = await lane.sql.query('SELECT 1 FROM pg_database WHERE datname = $1', [orphan])
+          assert.equal(
+            survived.rows.length,
+            1,
+            'a SIGKILLed provision did NOT leave its database behind — if that is now true, say so here '
+            + 'instead of claiming a hole that no longer exists',
+          )
+        } finally {
+          // The mitigation, exercised: the NAME is enough to clean up by hand.
+          if (orphan) await lane.sql.query(`DROP DATABASE IF EXISTS "${orphan.replace(/"/g, '""')}" WITH (FORCE)`)
+          await rm(scratchDir, { recursive: true, force: true })
+        }
+
+        const cleaned = orphan
+          ? await lane.sql.query('SELECT 1 FROM pg_database WHERE datname = $1', [orphan])
+          : { rows: [] as Record<string, unknown>[] }
+        assert.equal(cleaned.rows.length, 0, 'the orphan this test created is still on the server')
       })
     } finally {
       // UNCONDITIONAL. The database goes whether every proof above passed, one failed, or one

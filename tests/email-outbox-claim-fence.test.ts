@@ -23,7 +23,9 @@
  */
 
 import assert from 'node:assert/strict'
+import { readFileSync } from 'node:fs'
 import test from 'node:test'
+import { fileURLToPath } from 'node:url'
 
 import {
   EMAIL_OUTBOX_UNDELIVERED_REFERENCE_INDEX,
@@ -31,8 +33,19 @@ import {
   processPendingEmailOutbox,
   queueEmail,
   type EmailOutboxClient,
+  type EmailOutboxHarness,
   type EmailOutboxRow,
 } from '@/lib/email-outbox'
+
+/**
+ * EVERY DRAIN IN THIS FILE GOES THROUGH HERE, AND THE PARAMETER TYPE IS THE POINT (o3d-alnk r6).
+ *
+ * `EmailOutboxHarness` has NO optional members, so a call that forgets one does not compile and
+ * cannot quietly fall back to a production dependency. This helper NARROWS — it can only pass a
+ * complete harness through — which is the opposite of the "options object widened through a
+ * helper" that got past three rounds of guards.
+ */
+const drain = (harness: EmailOutboxHarness) => processPendingEmailOutbox({ harness })
 import { adapterUniqueViolation, legacyUniqueViolation } from '@/tests/helpers/prisma-unique-error'
 
 // ---------------------------------------------------------------------------
@@ -200,7 +213,7 @@ async function runPauseInterleaving(options: MakeClientOptions): Promise<PauseWo
   const { client, rows, updateManyCalls } = makeClient([makeRow()], options)
   let reclaimHappened = false
 
-  const workerA = await processPendingEmailOutbox({
+  const workerA = await drain({
     client,
     now: () => T0,
     prepareQueuedEmail: noPrepare,
@@ -208,7 +221,7 @@ async function runPauseInterleaving(options: MakeClientOptions): Promise<PauseWo
     async sendEmail() {
       deliveries.push('worker-A')
       // Worker A is on the socket. Worker B's whole run happens here.
-      const workerB = await processPendingEmailOutbox({
+      const workerB = await drain({
         client,
         now: () => T_RECLAIM,
         prepareQueuedEmail: noPrepare,
@@ -229,7 +242,7 @@ async function runPauseInterleaving(options: MakeClientOptions): Promise<PauseWo
     (call) => 'lockedBy' in call.where && (call.data.status === 'PENDING' || call.data.status === 'FAILED'),
   )
 
-  await processPendingEmailOutbox({
+  await drain({
     client,
     now: () => T_THIRD_TICK,
     prepareQueuedEmail: noPrepare,
@@ -327,7 +340,7 @@ test('REAL: the fence refuses a writer whose TOKEN no longer matches, even when 
   // leave behind, and the reason the column exists rather than the timestamp being trusted as an
   // identity — a timestamp is not one.
   const { client, rows, updateManyCalls } = makeClient([makeRow()])
-  const outcome = await processPendingEmailOutbox({
+  const outcome = await drain({
     client, now: () => T0, prepareQueuedEmail: noPrepare, logActivity: noLog,
     async sendEmail() {
       rows[0].lockedBy = 'another-worker'
@@ -344,7 +357,7 @@ test('REAL: the fence refuses a writer whose TOKEN no longer matches, even when 
 test('REAL: the fence refuses a writer whose CLAIM INSTANT no longer matches, even when the token does', async () => {
   // The mirror image, making `processingStartedAt` independently load-bearing.
   const { client, rows, updateManyCalls } = makeClient([makeRow()])
-  const outcome = await processPendingEmailOutbox({
+  const outcome = await drain({
     client, now: () => T0, prepareQueuedEmail: noPrepare, logActivity: noLog,
     async sendEmail() {
       rows[0].processingStartedAt = new Date(T0.getTime() + 1)
@@ -370,11 +383,11 @@ for (const settlePath of ['a successful send', 'a failed send', 'a thrown send']
     const { client, rows, updateManyCalls } = makeClient([makeRow()])
     let reclaimHappened = false
 
-    const workerA = await processPendingEmailOutbox({
+    const workerA = await drain({
       client, now: () => T0, prepareQueuedEmail: noPrepare, logActivity: noLog,
       async sendEmail() {
         deliveries.push('worker-A')
-        const workerB = await processPendingEmailOutbox({
+        const workerB = await drain({
           client, now: () => T_RECLAIM, prepareQueuedEmail: noPrepare, logActivity: noLog,
           async sendEmail() { deliveries.push('worker-B'); return { success: true } },
         })
@@ -402,7 +415,7 @@ test('REAL: a worker that still holds its claim settles normally', async () => {
   // indistinguishable from "terminal writes never work".
   const deliveries: string[] = []
   const { client, rows } = makeClient([makeRow()])
-  const outcome = await processPendingEmailOutbox({
+  const outcome = await drain({
     client,
     now: () => T0,
     prepareQueuedEmail: noPrepare,
@@ -424,7 +437,7 @@ test('REAL: each claim mints a distinct holder identity, so two runs of one cron
   // The integration outbox's `lockedBy` is a per-DUTY constant ('xero-accounting-sync'), which
   // leaves `lockedAt` as the only discriminator. This queue's token is per CLAIM.
   const { client, rows, updateManyCalls } = makeClient([makeRow()])
-  await processPendingEmailOutbox({
+  await drain({
     client, now: () => T0, prepareQueuedEmail: noPrepare, logActivity: noLog,
     async sendEmail() { return { success: false, error: 'retry me' } },
   })
@@ -432,7 +445,7 @@ test('REAL: each claim mints a distinct holder identity, so two runs of one cron
   rows[0].status = 'PENDING'
   rows[0].availableAt = new Date('2026-09-10T09:00:00.000Z')
 
-  await processPendingEmailOutbox({
+  await drain({
     client, now: () => T0, prepareQueuedEmail: noPrepare, logActivity: noLog,
     async sendEmail() { return { success: false, error: 'retry me' } },
   })
@@ -453,7 +466,7 @@ test('the suppression write is fenced too, and no longer fires before the claim'
     { suppressions: { 'customer@example.test': { id: 'sup-1', reason: 'hard bounce' } } },
   )
 
-  const outcome = await processPendingEmailOutbox({
+  const outcome = await drain({
     client, now: () => T0, prepareQueuedEmail: noPrepare, logActivity: noLog,
     async sendEmail() {
       throw new Error('a suppressed recipient must never reach the sender')
@@ -482,7 +495,7 @@ test('a reclaimed worker cannot write a suppression FAILED over the winner', asy
   const original = client.emailSuppression.findUnique.bind(client.emailSuppression)
   client.emailSuppression.findUnique = async (args: unknown) => {
     client.emailSuppression.findUnique = original
-    const workerB = await processPendingEmailOutbox({
+    const workerB = await drain({
       client, now: () => T_RECLAIM, prepareQueuedEmail: noPrepare, logActivity: noLog,
       async sendEmail() { return { success: true } },
     })
@@ -491,7 +504,7 @@ test('a reclaimed worker cannot write a suppression FAILED over the winner', asy
     return original(args)
   }
 
-  const workerA = await processPendingEmailOutbox({
+  const workerA = await drain({
     client, now: () => T0, prepareQueuedEmail: noPrepare, logActivity: noLog,
     async sendEmail() { throw new Error('unreachable') },
   })
@@ -571,4 +584,74 @@ test('the collision predicate matches both P2002 shapes and nothing else', async
   assert.equal(isUndeliveredEmailCollision(adapterUniqueViolation(['email'], { modelName: 'EmailSuppression' })), false)
   assert.equal(isUndeliveredEmailCollision(new Error('boom')), false)
   assert.equal(isUndeliveredEmailCollision(null), false)
+})
+
+// ---------------------------------------------------------------------------
+// The migration's LAYOUT, asserted about the file (o3d-alnk r6, Codex MEDIUM).
+// ---------------------------------------------------------------------------
+
+/**
+ * WHY THIS IS A TEST ABOUT TEXT, AND NOT ABOUT A DATABASE.
+ *
+ * The review's finding was that `ALTER TABLE ... ADD COLUMN "lockedBy"` sat before the migration's
+ * explicit `BEGIN`, so a fired refusal would leave the column behind while the HINT claimed nothing
+ * was applied. Measured against a real throwaway, that DID NOT reproduce: `prisma migrate deploy`
+ * sends the whole file as one simple query, PostgreSQL wraps a multi-statement simple query in an
+ * implicit transaction, and an inner BEGIN does not start a second one — so the pre-BEGIN ALTER
+ * rolled back with everything else. `tests/concurrency` proves the atomicity end to end.
+ *
+ * WHICH IS EXACTLY WHY THE POSITION NEEDS A TEST OF ITS OWN. The safety depends on an execution
+ * detail of the runner, and no database assertion can tell the two layouts apart while that detail
+ * holds. A runner that sent statements SEPARATELY would half-apply the old layout precisely as the
+ * review described. So the property asserted here is the one that survives either runner: NOTHING
+ * THAT CHANGES ANYTHING RUNS BEFORE THE TRANSACTION. Hoist the ALTER back out and this goes red;
+ * no database is needed and none is touched.
+ */
+const FENCE_MIGRATION_SQL = readFileSync(
+  fileURLToPath(new URL('../prisma/migrations/20260910120000_email_outbox_claim_fence/migration.sql', import.meta.url)),
+  'utf8',
+)
+
+/** Drop whole-line `--` comments; the file is comments-first by design and they are not statements. */
+function statementsOnly(sql: string): string {
+  return sql
+    .split('\n')
+    .filter((line) => !line.trimStart().startsWith('--'))
+    .join('\n')
+    .trim()
+}
+
+test('the migration changes NOTHING before its transaction begins (o3d-alnk r6)', () => {
+  const begin = FENCE_MIGRATION_SQL.indexOf('\nBEGIN;')
+  assert.ok(begin > 0, 'the migration no longer has an explicit BEGIN')
+  const commit = FENCE_MIGRATION_SQL.indexOf('\nCOMMIT;')
+  assert.ok(commit > begin, 'the migration no longer has a COMMIT after its BEGIN')
+
+  const beforeTransaction = statementsOnly(FENCE_MIGRATION_SQL.slice(0, begin))
+
+  // THE ONLY STATEMENT OUT THERE IS THE READ-ONLY REFUSAL, and it is out there so that
+  // `migrate deploy` can print its message at all (see the migration's own comment).
+  assert.match(
+    beforeTransaction,
+    /^DO \$\$[\s\S]*\$\$;$/,
+    'something other than the refusal guard runs before the migration opens its transaction',
+  )
+  for (const mutating of ['ALTER ', 'CREATE ', 'DROP ', 'INSERT ', 'UPDATE ', 'DELETE ', 'LOCK ']) {
+    assert.ok(
+      !beforeTransaction.toUpperCase().includes(mutating),
+      `a ${mutating.trim()} statement runs before the transaction: a refusal would then half-apply `
+      + 'this migration under any runner that sends statements separately',
+    )
+  }
+
+  // NON-VACUITY: the statements that DO change things are inside, and the one the review named is
+  // checked by name rather than by "nothing was found outside".
+  const inTransaction = FENCE_MIGRATION_SQL.slice(begin, commit)
+  assert.match(inTransaction, /ALTER TABLE "email_outbox" ADD COLUMN "lockedBy" TEXT;/)
+  assert.match(inTransaction, /CREATE UNIQUE INDEX "email_outbox_undelivered_reference_uq"/)
+  assert.match(inTransaction, /UPDATE "email_outbox" a/)
+
+  // And the HINT no longer claims the whole migration is one transaction, because it is not: the
+  // guard is deliberately outside it. What it claims is what is true — nothing was applied.
+  assert.match(FENCE_MIGRATION_SQL, /HINT = '[^']*Nothing was applied: this check is the migration''s first statement/)
 })

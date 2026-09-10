@@ -40,13 +40,15 @@
  * second UNDELIVERED row impossible rather than merely unlikely. See the migration
  * 20260910120000_email_outbox_claim_fence for why it is scoped to undelivered statuses.
  *
- * AND THE DRAIN'S OPTIONS ARE A UNION, NOT A BAG OF OPTIONAL FIELDS. This is a SWEEP over the
- * globally oldest eligible rows, so a caller who injects a fake sender WITHOUT also injecting a
- * client points that fake at real customer email. `ProcessEmailOutboxOptions` makes that shape
- * fail to compile, AND `assertBothOrNeitherInjected` makes it throw before the first query for
- * the callers tsc never sees (a cast, `any`, JavaScript). The clock and the preparer ride on the
- * INJECTED arm only, because both of them do decide what leaves the building; the reasoning is on
- * the types.
+ * AND THE DRAIN'S DEPENDENCIES ARE ONE ALL-OR-NOTHING VALUE, NOT A BAG OF OPTIONAL FIELDS. This is
+ * a SWEEP over the globally oldest eligible rows, so a caller who injects a fake sender WITHOUT
+ * also injecting a client points that fake at real customer email. Three rounds tried to forbid
+ * that pairing, and each round Codex found another one — eight in all, because independently
+ * optional dependency fields cannot express "production entirely, or the harness entirely". So
+ * there is ONE field, `harness`, carrying a COMPLETE `EmailOutboxHarness`; absent is pure
+ * production, present is pure harness, and there is no third state to construct.
+ * `resolveEmailOutboxDependencies` is the single check, before the first query, for the callers
+ * tsc never sees (a cast, `any`, JavaScript). See `EmailOutboxHarness` for the full history.
  */
 
 import { randomUUID } from 'node:crypto'
@@ -137,74 +139,79 @@ type EmailClaim = {
 }
 
 /**
- * (a) THE CRON. NOTHING injected — the global client, the real sender, the real clock, the real
- * preparer. Every field is `?: never`, so this arm is the empty object and nothing else.
+ * ONE ALL-OR-NOTHING DEPENDENCY SET (o3d-alnk r6, Codex HIGH x2) — AND WHY IT IS ONE FIELD.
  *
- * o3d-alnk r4 (Codex HIGH) — WHY THE HARNESS OVERRIDES ARE NOT HERE ANY MORE. `now`,
- * `prepareQueuedEmail` and `logActivity` used to ride on BOTH arms, on the reasoning that none of
- * them decides which rows the drain reaches or whether a message leaves the building. That
- * reasoning was wrong on both counts, and the ambient arm is where it was dangerous:
+ * COUNT THE HISTORY BEFORE READING THE TYPE. Rounds 2, 3 and 5 produced EIGHT HIGHs on this one
+ * surface, and every one of them was the same defect wearing different clothes: two dependencies
+ * that could be supplied INDEPENDENTLY, recombined into "fake sender, real data" or "real sender,
+ * tampered clock".
  *
- *   `now` DOES decide which rows the drain reaches. Eligibility is `availableAt <= now()` and
- *   stale reclamation is `processingStartedAt < now() - 15min`, so a FUTURE `now` reclaims rows
- *   whose holders are still on the socket and mails a second copy of a real customer's email.
+ *   r2  `{ sendEmail: fake }`                     — a fake sender over the GLOBAL queue
+ *   r2  `{ client: double }`                      — a fixture handed to the REAL mailer
+ *   r3  `{ sendEmail: fake, referenceIdPrefix }`  — a scoping predicate that narrowed nothing
+ *   r3  `{ now: futureClock }`                    — reclaims rows the predicate never mentioned
+ *   r3  `{ prepareQueuedEmail: fake }`            — decides the recipient, body and PDF
+ *   r5  `{ now: futureClock }` past the union     — the clock rode the ambient arm again
+ *   r5  `{ client: null, sendEmail: fake }`       — `null` is "present" to a guard and "absent"
+ *   r5  `{ client: real, sendEmail: null }`         to `??`, so the pair check and the fallback
+ *                                                   disagreed about the SAME object
  *
- *   `prepareQueuedEmail` DOES decide what leaves the building. It supplies the recipient, the
- *   subject, the body and the PDF; a preparer returning `null` sends the stored placeholder with
- *   no attachment, and one that throws settles the row as a failure instead of sending at all.
+ * Patching case nine is not the answer. The property actually needed is EITHER EVERYTHING COMES
+ * FROM PRODUCTION, OR EVERYTHING COMES FROM THE HARNESS — NEVER A MIXTURE — and independently
+ * optional fields cannot express that. Whatever the guard says about one pairing, the next field
+ * is a new pairing.
  *
- * Neither has a production caller — `app/api/cron/email-outbox/route.ts` passes nothing — so they
- * are now spelled only on the INJECTED arm, where they can only ever be aimed at a caller's own
- * client and a caller's own sender.
+ * SO THERE IS ONE FIELD, AND IT CARRIES EVERYTHING. `harness` is a COMPLETE `EmailOutboxHarness`:
+ * client, sender, preparer, activity logger and clock, none of them optional. Absent means pure
+ * production; present means pure harness. There is no third state to construct, and that is a
+ * property of the shape rather than of a rule someone has to keep correct:
+ *
+ *   - there is no `null`-versus-`??` disagreement, because there is ONE field and ONE check on it;
+ *   - `{ now: futureClock }` is not a shape that exists — `now` is not spellable at the top level;
+ *   - a cast can still force `harness` past tsc, but forcing it supplies a COMPLETE harness, which
+ *     is the SAFE direction: the drain then reads nothing from production at all;
+ *   - the runtime guard is one presence test before the first query, not a pairing rule.
+ *
+ * WHAT IT STILL CANNOT FORBID, STATED PLAINLY. A caller can write `harness: { client: myDouble,
+ * sendEmail: realMailer, ... }` by importing the real mailer and NAMING it. No type stops a
+ * deliberate act of naming a production function. What is gone is the SILENT one — the missing
+ * field that quietly became production. `assertEmailOutboxHarness` closes the two members where
+ * naming production is destructive rather than merely odd (see there); the rest is documented,
+ * not enforced, because pretending otherwise would be the same false comfort the option union
+ * gave for three rounds.
+ *
+ * WHY EVERY MEMBER IS ON IT, INCLUDING THE THREE THAT LOOK HARMLESS:
+ *
+ *   `client`   decides WHICH ROWS. This is a SWEEP over the globally oldest eligible rows.
+ *   `sendEmail` decides WHETHER MAIL LEAVES THE BUILDING.
+ *   `now`      decides WHICH ROWS TOO. Eligibility is `availableAt <= now()` and stale reclamation
+ *              is `processingStartedAt < now() - 15min`, so a FUTURE clock reclaims a row whose
+ *              holder is still on the socket and mails a second copy.
+ *   `prepareQueuedEmail` decides WHAT LEAVES: the recipient, the subject, the body and the PDF.
+ *   `logActivity` writes rows of its own, through whichever database it closes over.
+ *
+ * None of the five has a production caller that overrides it — `app/api/cron/email-outbox/route.ts`
+ * passes nothing at all — so requiring all five costs production nothing and costs a harness one
+ * line it was already writing.
  */
-export type ProcessEmailOutboxAmbientOptions = {
-  client?: never
-  sendEmail?: never
-  prepareQueuedEmail?: never
-  logActivity?: never
-  now?: never
-}
-
-/**
- * (b) A TEST. The rows it may reach, the sender it reaches them with, and — only here — the
- * clock and the preparer, because a caller that has brought its own client and its own sender
- * cannot point either of them at production.
- */
-export type ProcessEmailOutboxInjectedOptions = {
+export type EmailOutboxHarness = {
   client: EmailOutboxClient
   sendEmail: typeof sendEmail
-  prepareQueuedEmail?: typeof prepareQueuedEmail
-  logActivity?: typeof logActivity
-  now?: () => Date
+  prepareQueuedEmail: typeof prepareQueuedEmail
+  logActivity: typeof logActivity
+  now: () => Date
 }
 
 /**
- * o3d-alnk r3/r4 (Codex HIGH) — WHY THIS IS A UNION AND NOT A BAG OF OPTIONAL FIELDS.
+ * The drain's ONLY option. One field, optional, all-or-nothing.
  *
- * `client` and `sendEmail` used to be independently optional, each falling back to the global
- * when absent. That made a third shape representable, and it is the destructive one:
- *
- *   processPendingEmailOutbox({ sendEmail: fake })
- *
- * — a FAKE sender pointed at the REAL queue. `processPendingEmailOutbox` is a SWEEP: it selects
- * the globally oldest eligible rows, not any caller's rows. So that call drains genuine queued
- * customer email through a sender that delivers nothing and stamps every one of them SENT. The
- * row afterwards is indistinguishable from a real delivery, so the loss is silent AND
- * unrecoverable. The mirror shape, `{ client: testDouble }`, is the other half: a test's rows
- * handed to the REAL mailer.
- *
- * There is no legitimate third shape, so the type refuses to spell one — AND SO DOES THE
- * FUNCTION. Round 3 argued a type was enough and a runtime check was not worth having, because
- * "a runtime check only complains once the call has been reached, and the reaching is the
- * damage". That is an argument for having the type; it is not an argument against also having the
- * check. A type-only negative protects nothing from `as ProcessEmailOutboxOptions`, from `any`,
- * or from a JavaScript caller — and `assertBothOrNeitherInjected` below runs BEFORE the first
- * query, so a half-injection that got past tsc throws before it can select a single real row.
- * See tests/email-outbox-injection-shape.test.ts for both halves.
+ * Deliberately NOT a union of two arms: a union still spells the members separately on the
+ * injected arm, and r5's `{ client: null, sendEmail: fake }` got past exactly that. Absent
+ * `harness` is the cron. Present `harness` is a caller that brought its whole world.
  */
-export type ProcessEmailOutboxOptions =
-  | ProcessEmailOutboxAmbientOptions
-  | ProcessEmailOutboxInjectedOptions
+export type ProcessEmailOutboxOptions = {
+  harness?: EmailOutboxHarness
+}
 
 export type ProcessEmailOutboxResult = {
   processed: number
@@ -255,6 +262,11 @@ export async function queueEmail(
   input: QueueEmailInput,
   options: { client?: EmailOutboxClient } = {},
 ): Promise<QueueEmailOutcome> {
+  // ONE optional dependency, and it stays one. The drain's eight recombinations all needed TWO
+  // independently-optional fields to combine; `queueEmail` has a single one and no sender at all —
+  // it never delivers anything, it only INSERTS — so there is no second value for a caller's client
+  // to be paired with. Adding a second optional dependency here would recreate the same hazard, and
+  // the fix would be the same: one all-or-nothing harness.
   const client = options.client ?? (db as unknown as EmailOutboxClient)
   const attachments: QueuedAttachment[] | undefined = input.attachments?.map((attachment) => ({
     filename: attachment.filename,
@@ -306,45 +318,158 @@ async function settleClaimedEmail(
   return settled.count > 0
 }
 
+/** The complete member list, in one place, so the guard and its message cannot drift apart. */
+const EMAIL_OUTBOX_HARNESS_MEMBERS = ['client', 'sendEmail', 'prepareQueuedEmail', 'logActivity', 'now'] as const
+
 /**
- * REFUSE A HALF-INJECTED DRAIN BEFORE THE FIRST QUERY (o3d-alnk r4, Codex HIGH).
- *
- * `ProcessEmailOutboxOptions` makes the two half-injections fail to compile. That covers every
- * caller tsc actually checks — and none of the ones it does not: `as ProcessEmailOutboxOptions`,
- * `any`, an options object widened through a helper, a JavaScript caller. For those, the type is
- * documentation. This is the enforcement, and its placement is the whole point: it runs BEFORE
- * `findMany`, so `{ sendEmail: fake } as ProcessEmailOutboxOptions` throws instead of selecting
- * twenty-five real queued customer emails and stamping them SENT through a sender that delivers
- * nothing.
- *
- * BOTH OR NEITHER, not "a client implies a sender". `{ client: double }` is the mirror hazard —
- * a test's rows handed to the REAL mailer — and it is the one that actually puts mail on the
- * wire, so it is refused by the same test rather than by a second one that could drift.
+ * The production dependency each harness member REPLACES, for the identity refusal below.
+ * `now` has no entry: production's clock is a fresh `() => new Date()` closure with no stable
+ * identity to compare against, and a caller-supplied clock is not dangerous on its own — it is
+ * dangerous combined with production ROWS, which the harness shape already makes impossible.
  */
-export function assertBothOrNeitherInjected(options: ProcessEmailOutboxOptions): void {
-  const given = options as Partial<ProcessEmailOutboxInjectedOptions>
-  const hasClient = given.client !== undefined
-  const hasSender = given.sendEmail !== undefined
-  if (hasClient === hasSender) return
+const EMAIL_OUTBOX_PRODUCTION_DEPENDENCIES: Record<string, unknown> = {
+  client: db,
+  sendEmail,
+  prepareQueuedEmail,
+  logActivity,
+}
+
+function refuseEmailOutboxOptions(detail: string): never {
   throw new Error(
-    'processPendingEmailOutbox: `client` and `sendEmail` must be injected TOGETHER or not at all; '
-    + `received ${hasClient ? 'a client with no sendEmail' : 'a sendEmail with no client'}. `
-    + 'This drain is a SWEEP over the globally oldest eligible rows, so a fake sender with the '
-    + 'global client stamps real customer email SENT with nothing delivered, and a test client '
-    + 'with the real mailer puts a fixture on the wire. Refused before any row was read (o3d-alnk).',
+    `processPendingEmailOutbox: ${detail}. Dependencies are ALL-OR-NOTHING: pass a complete `
+    + `\`harness\` (${EMAIL_OUTBOX_HARNESS_MEMBERS.join(', ')}) or pass nothing at all. This drain is `
+    + 'a SWEEP over the globally oldest eligible rows, so any MIXTURE runs part of it against '
+    + 'production — a fake sender over the real queue stamps genuine customer email SENT with '
+    + 'nothing delivered, and a real sender over a fixture puts a test message on the wire. '
+    + 'Refused before any row was read (o3d-alnk).',
   )
+}
+
+/**
+ * RESOLVE THE DRAIN'S DEPENDENCIES: PRODUCTION IN FULL, OR THE CALLER'S HARNESS IN FULL.
+ *
+ * This is the whole enforcement, and its placement is the point: it runs BEFORE `findMany`, so a
+ * shape that got past tsc (`as unknown as`, `any`, an options object widened through a helper, a
+ * JavaScript caller) throws instead of selecting twenty-five real queued customer emails and
+ * stamping them SENT through a sender that delivers nothing.
+ *
+ * IT RESOLVES RATHER THAN MERELY ASSERTS, ON PURPOSE. Round 5's two HIGHs were both a DISAGREEMENT
+ * between a guard and a fallback about the same object: the guard read `!== undefined` and treated
+ * `null` as present, while `?? ` treated it as absent, so `{ client: null, sendEmail: fake }`
+ * passed validation and then drained the GLOBAL queue through the fake. There is no such gap to
+ * open here, because the caller of this function does not get to apply a fallback — it returns the
+ * five values the drain will use, and the drain destructures them. Grep the drain for `??`: there
+ * is none.
+ *
+ * THE PRODUCTION SET IS BUILT HERE AND ONLY HERE, in one object literal, from the module's own
+ * imports. No caller value can reach it, because a caller value never enters this branch.
+ */
+export function resolveEmailOutboxDependencies(options: ProcessEmailOutboxOptions): EmailOutboxHarness {
+  const candidate: unknown = options
+  if (candidate === null || typeof candidate !== 'object') {
+    refuseEmailOutboxOptions(`options must be an object or omitted; received ${candidate === null ? 'null' : typeof candidate}`)
+  }
+
+  // A STRAY KEY IS REFUSED BY NAME rather than ignored. Every pre-r6 caller shape —
+  // `{ sendEmail }`, `{ client, sendEmail }`, `{ now }`, `{ prepareQueuedEmail }` — lands here.
+  // Ignoring them would be SAFE (they are no longer read, so the drain would simply run pure
+  // production) and would be the worst outcome available: a test that believes it injected a fake
+  // sender, silently sweeping the real queue with the real mailer.
+  const strays = Object.keys(candidate as Record<string, unknown>).filter((key) => key !== 'harness')
+  if (strays.length > 0) {
+    refuseEmailOutboxOptions(
+      `unknown option(s) ${strays.map((key) => JSON.stringify(key)).join(', ')}; dependencies are no `
+      + 'longer spelled one per field, which is the shape that produced eight distinct recombinations',
+    )
+  }
+
+  const given = (candidate as { harness?: unknown }).harness
+  if (given === undefined) {
+    return {
+      client: db as unknown as EmailOutboxClient,
+      sendEmail,
+      prepareQueuedEmail,
+      logActivity,
+      now: () => new Date(),
+    }
+  }
+
+  // `null` IS REFUSED, NOT READ AS ABSENT. This is r5's HIGH stated as a rule: only the ABSENCE of
+  // the field means production, and `null` is a value somebody wrote.
+  if (given === null || typeof given !== 'object') {
+    refuseEmailOutboxOptions(`\`harness\` must be an object; received ${given === null ? 'null' : typeof given}`)
+  }
+  const harness = given as Record<string, unknown>
+
+  const extra = Object.keys(harness).filter(
+    (key) => !(EMAIL_OUTBOX_HARNESS_MEMBERS as readonly string[]).includes(key),
+  )
+  if (extra.length > 0) {
+    refuseEmailOutboxOptions(`\`harness\` carries unknown member(s) ${extra.map((key) => JSON.stringify(key)).join(', ')}`)
+  }
+
+  for (const member of EMAIL_OUTBOX_HARNESS_MEMBERS) {
+    const value = harness[member]
+    if (value === undefined || value === null) {
+      refuseEmailOutboxOptions(
+        `\`harness.${member}\` is ${value === null ? 'null' : 'missing'}; a harness is complete or it `
+        + 'is not a harness, and a missing member is exactly the hole a per-field fallback used to fill '
+        + 'with production',
+      )
+    }
+    // NOT THE PRODUCTION DEPENDENCY ITSELF. A complete harness is safe because it is the CALLER'S
+    // world; naming a production function inside it re-creates the mixture by hand. `client: db`
+    // with a fake sender is the r2 hazard rebuilt, and `sendEmail: realMailer` with a fixture
+    // client is its mirror — the one that actually puts a message on the wire. Applied to all four
+    // rather than to those two, because "which member is harmless" is the judgement that has been
+    // wrong in every round so far.
+    //
+    // FIRST, BEFORE ANY PROPERTY OF THE VALUE IS READ. "Is this the production object?" is
+    // answerable by identity alone, and the shape probe below is NOT: reading `.emailOutbox` off
+    // the global Prisma client instantiates a delegate, and off a test's tripwire double it fires
+    // the tripwire — so a `client: db` refusal has to happen before anything touches it.
+    if (member in EMAIL_OUTBOX_PRODUCTION_DEPENDENCIES && value === EMAIL_OUTBOX_PRODUCTION_DEPENDENCIES[member]) {
+      refuseEmailOutboxOptions(
+        `\`harness.${member}\` IS the production dependency it replaces; a harness is the caller's own `
+        + 'world, and naming a production value inside one rebuilds by hand the mixture this shape exists to forbid',
+      )
+    }
+
+    if (member === 'client') {
+      if (typeof value !== 'object') {
+        refuseEmailOutboxOptions(`\`harness.client\` must be a client object; received ${typeof value}`)
+      }
+      const clientValue = value as Record<string, unknown>
+      for (const model of ['emailOutbox', 'emailSuppression'] as const) {
+        const delegate = clientValue[model]
+        if (delegate === null || typeof delegate !== 'object') {
+          refuseEmailOutboxOptions(
+            `\`harness.client.${model}\` is missing; this is not a client the drain can use, and a `
+            + 'partial one fails at the first query rather than here',
+          )
+        }
+      }
+    } else if (typeof value !== 'function') {
+      refuseEmailOutboxOptions(`\`harness.${member}\` must be a function; received ${typeof value}`)
+    }
+  }
+
+  return harness as unknown as EmailOutboxHarness
 }
 
 export async function processPendingEmailOutbox(
   options: ProcessEmailOutboxOptions = {},
 ): Promise<ProcessEmailOutboxResult> {
-  assertBothOrNeitherInjected(options)
-
-  const client = options.client ?? (db as unknown as EmailOutboxClient)
-  const send = options.sendEmail ?? sendEmail
-  const prepare = options.prepareQueuedEmail ?? prepareQueuedEmail
-  const log = options.logActivity ?? logActivity
-  const now = options.now ?? (() => new Date())
+  // ONE resolution, before the first query. Note what is NOT here: no `??`, no per-dependency
+  // fallback, nothing that can pair a caller's value with a production one. Either all five came
+  // out of the caller's harness or all five came out of production.
+  const {
+    client,
+    sendEmail: send,
+    prepareQueuedEmail: prepare,
+    logActivity: log,
+    now,
+  } = resolveEmailOutboxDependencies(options)
 
   const staleCutoff = new Date(now().getTime() - EMAIL_CLAIM_STALE_MS)
   const result: ProcessEmailOutboxResult = { processed: 0, sent: 0, failed: 0, conflicted: 0 }
