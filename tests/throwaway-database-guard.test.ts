@@ -1000,9 +1000,14 @@ test('r12 HIGH: a name a live handle can still drop is NOT provisioned again', a
   assert.match(second.message, new RegExp(`refused ${MINTED}: THIS PROCESS ALREADY HOLDS`))
   assert.match(second.message, /ownership of the DATABASE THAT WAS CREATED and not of the name/)
 
-  // AND IT IS REFUSED BEFORE ANY STATEMENT IS ISSUED. The whole wire is still just the first
-  // provision's probe and CREATE: no second CREATE, and above all no DROP.
-  assert.deepEqual(wire.statements, [PROBE_STATEMENT, CREATE_STATEMENT], 'the refused provision talked to the server')
+  // AND IT IS REFUSED BEFORE THE CREATE. The second provision issues ONE statement — the existence
+  // probe that decides whether this is the contended case or the already-exists one (r13) — and
+  // then stops: no second CREATE, and above all no DROP.
+  assert.deepEqual(
+    wire.statements,
+    [PROBE_STATEMENT, CREATE_STATEMENT, PROBE_STATEMENT],
+    'the refused provision issued something other than the one probe that chooses the refusal',
+  )
   assert.deepEqual(drops(), [], 'a DROP was issued for a database this process did not create')
   assert.equal(wire.databases.size, 0, 'the fixture never removed the database, so nothing was ever at risk')
   assert.deepEqual(inferenceStatements(), [], 'the claim was decided by asking the server about the database')
@@ -1080,4 +1085,112 @@ test('r12: every provision that returns NO handle gives the name back', async ()
     assert.match(outcome.message, /it is a PROTECTED database/, `attempt ${attempt}: the guard refusal was replaced by a claim refusal`)
     assert.deepEqual(wire.statements, [], `attempt ${attempt}: a protected name reached the server`)
   }
+})
+
+// -------------------------------------------------------------------------------------------
+// ROUND 13 — A NEW GUARD THAT REFUSES EARLIER TAKES THE OLD GUARD'S CASES AWAY.
+//
+// THE REGRESSION THIS FILE DID NOT CATCH, WRITTEN DOWN SO IT CANNOT RECUR. r12's claim was taken
+// AT THE MINT, before the existence probe. Every arm above still passed, because every arm above
+// that exercises a HELD name deletes the database first — that is the r12 finding's premise. The
+// case nobody wrote is the ordinary one: a name that is held by a live handle AND still present on
+// the server, which is what a lane has when it points a provision at its own database to prove the
+// already-exists refusal. That provision was refused as CONTENDED, rule (4) became unreachable
+// through the only seam that can reach it, and the concurrency lane went red on the first run.
+//
+// SO THE PROPERTY UNDER TEST IS NOT "IS IT REFUSED" — every arm here was already refused — BUT
+// WHICH RULE SAYS SO. The four refusals are ordered, several can be true of one name at once, and
+// the earliest one wins.
+// -------------------------------------------------------------------------------------------
+
+test('r13: a held name whose database is STILL THERE is refused as ALREADY EXISTS, not as contended', async () => {
+  resetWire()
+  const incumbent = await provisionHandle()
+  assert.deepEqual([...wire.databases], [MINTED], 'the incumbent never created its database, so nothing is held OR present')
+
+  // BOTH RULES ARE TRUE OF THIS NAME. It is on the server, and a live handle in this process can
+  // still drop it. This is the state a lane is in, and the state no arm above modelled.
+  const second = await withWiredUrl(() => settle(provisionThrowawayDatabase({
+    label: 'alnkfence',
+    mintName: () => MINTED,
+    runMigrations: async () => undefined,
+  })))
+
+  assert.ok(second instanceof ThrowawayDatabaseError, `expected a named refusal, got ${String(second)}`)
+  assert.match(second.message, new RegExp(`refused ${MINTED}: a database of that name ALREADY EXISTS`))
+  assert.doesNotMatch(
+    second.message,
+    /ALREADY HOLDS/,
+    'the claim shadowed the already-exists refusal — this is the r12 regression the concurrency lane caught',
+  )
+
+  // IT IS STILL REFUSED BEFORE THE CREATE, and nothing was dropped: the reordering buys a better
+  // sentence, not a weaker guard.
+  assert.deepEqual(wire.statements, [PROBE_STATEMENT, CREATE_STATEMENT, PROBE_STATEMENT])
+  assert.deepEqual(creates(), [CREATE_STATEMENT], 'the refused provision issued a CREATE')
+  assert.deepEqual(drops(), [], "the refused provision dropped the incumbent's database")
+  assert.deepEqual([...wire.databases], [MINTED], "the incumbent's database did not survive the refusal")
+  assert.deepEqual(inferenceStatements(), [], 'the refusal was decided by inferring ownership')
+
+  // AND THE INCUMBENT'S CLAIM SURVIVED IT (r13 corollary). The refusal above ran through the same
+  // failure path that gives a claim back, while the name belonged to somebody else's handle. If it
+  // had given THAT name back, the r12 defect would be open again — so drive the r12 case now: a
+  // non-participant removes the database, and the next provision must STILL be refused.
+  wire.databases.delete(MINTED)
+  const third = await withWiredUrl(() => settle(provisionThrowawayDatabase({
+    label: 'alnkfence',
+    mintName: () => MINTED,
+    runMigrations: async () => undefined,
+  })))
+  assert.ok(third instanceof ThrowawayDatabaseError, `the incumbent's claim was given away: got ${String(third)}`)
+  assert.match(third.message, new RegExp(`refused ${MINTED}: THIS PROCESS ALREADY HOLDS`))
+  assert.deepEqual(creates(), [CREATE_STATEMENT], 'a second database was created for a name a live handle can still drop')
+
+  // THE INCUMBENT IS UNHARMED THROUGHOUT, and its one DROP is its own.
+  await incumbent.drop()
+  assert.deepEqual(drops(), [DROP_STATEMENT])
+
+  // NON-VACUITY: with the claim released, the same name provisions again.
+  resetWire()
+  const next = await provisionHandle()
+  assert.deepEqual([...wire.databases], [MINTED], 'the released name did not provision again')
+  await next.drop()
+})
+
+test('r13: each of the four refusals reports ITSELF, on the name only it applies to', async () => {
+  // THE ORDER, READ OFF THE MESSAGES. One arm per rule, each on a name the earlier rules do not
+  // fire for, plus the ordinary held-and-present case above which is where the order matters.
+  // A guard added in a future round has to leave this table alone.
+  resetWire()
+  const held = await provisionHandle()
+  wire.databases.delete(MINTED)          // held, absent -> the claim is the only rule left
+  const statementsBefore = wire.statements.length
+
+  const arms: [string, string, RegExp, number][] = [
+    // name, why, expected refusal, statements this arm is allowed to issue
+    [CONFIGURED, 'the configured/protected database', /it is a PROTECTED database/, 0],
+    ['some_other_database', 'a name this module never minted', /it is not a name this module minted/, 0],
+    [MINTED, 'held by a live handle, absent from the server', /THIS PROCESS ALREADY HOLDS/, 1],
+  ]
+  for (const [name, why, expected, allowed] of arms) {
+    const before = wire.statements.length
+    const outcome = await capture({ label: 'alnkfence', mintName: () => name, runMigrations: async () => undefined })
+    assert.ok(outcome instanceof ThrowawayDatabaseError, `${why}: expected a named refusal, got ${String(outcome)}`)
+    assert.match(outcome.message, expected, `${why}: the wrong rule reported`)
+    assert.equal(wire.statements.length - before, allowed, `${why}: issued the wrong number of statements`)
+  }
+
+  // The fourth rule, on a name NOTHING in this process holds: present on the server, and reported
+  // as present. This is the refusal the concurrency lane proves against a real Postgres.
+  const other = 'ims_throwaway_alnkother_00112233445566ff'
+  wire.databases.add(other)
+  const present = await capture({ label: 'alnkother', mintName: () => other, runMigrations: async () => undefined })
+  assert.ok(present instanceof ThrowawayDatabaseError, `expected a named refusal, got ${String(present)}`)
+  assert.match(present.message, new RegExp(`refused ${other}: a database of that name ALREADY EXISTS`))
+
+  assert.deepEqual(drops(), [], 'one of the refusals issued a DROP')
+  assert.ok(wire.statements.length > statementsBefore, 'no arm reached the server, so the statement counts prove nothing')
+
+  await held.drop()
+  assert.deepEqual(drops(), [DROP_STATEMENT], "the incumbent's own drop did not run")
 })

@@ -43,9 +43,15 @@
  *      issue a `DROP DATABASE`. Two live handles on one name are two handles on two different
  *      DATABASES, and each one's cleanup destroys the other's. See the r12 rule below.
  *
- * (1)-(3) and (5) are pure and are asserted by `tests/throwaway-database-guard.test.ts`, which
- * runs on every `npm run test:unit` with no database at all. (4) needs a server and is asserted
- * by the concurrency lane itself.
+ * THEY ARE TRIED IN THAT ORDER, AND THE ORDER IS PART OF THE CONTRACT (r13). Several of them can
+ * be true of one name at once — a lane's own database is minted, present AND held — and the rule
+ * that gets to REPORT is the earliest one in this list, which is the one resting on the fact that
+ * is cheapest to check and easiest to verify by hand. (5) is last because it is the only one whose
+ * evidence lives nowhere but in this process's memory.
+ *
+ * (1)-(3) are pure. (5) is pure too, but is reached only past (4)'s probe. All of them are
+ * asserted by `tests/throwaway-database-guard.test.ts`, which runs on every `npm run test:unit`
+ * against a fake server, and (4) is asserted against a real one by the concurrency lane itself.
  *
  * AND THE DROP IS UNCONDITIONAL FROM THE CALLER'S SIDE. `drop()` re-runs the whole guard before
  * it issues `DROP DATABASE`, so a corrupted or hand-built handle cannot be used to drop something
@@ -179,10 +185,13 @@
  *
  * THE FIX IS A PROCESS-LEVEL CLAIM ON THE NAME, AND IT IS DELIBERATELY NOT AN IDENTITY CHECK.
  * `outstandingMintedNames` below holds every name for which THIS PROCESS COULD STILL ISSUE A
- * `DROP DATABASE`. A second provision of a held name is refused BEFORE ANY STATEMENT IS ISSUED,
- * so the two live handles the finding needs cannot both exist. It costs no round trip, asks the
- * server nothing, and cannot be satisfied by anything a third party produces — the register is
- * this process's own record of what it has done.
+ * `DROP DATABASE`. A second provision of a held name is refused BEFORE THE `CREATE DATABASE`, so
+ * the two live handles the finding needs cannot both exist. It costs no round trip of its own,
+ * asks the server nothing, and cannot be satisfied by anything a third party produces — the
+ * register is this process's own record of what it has done. (r12 took the claim at the mint,
+ * before any statement at all; r13 moved it one step later, behind the existence probe this
+ * function already makes, so that a name which is BOTH held and present is reported as PRESENT.
+ * Nothing about the paragraph above depends on which of the two it is.)
  *
  * WHEN A CLAIM IS RELEASED, AND WHY THAT IS NOT ANOTHER GUESS. A claim is released only on a fact
  * this process established WITHOUT ASKING THE SERVER, and there are exactly two:
@@ -225,6 +234,49 @@
  * `PROTECTED_DATABASE_NAMES` and the configured-database refusal are POLICY — "never touch
  * anything called this, whatever is in it today" — which is the one thing a bare name IS the
  * correct identity for.
+ *
+ * ===========================================================================================
+ * THE ORDER-OF-REFUSALS RULE (o3d-alnk r13). THE FOURTH FORM, AND THE FIRST ONE THAT IS NOT ABOUT
+ * SAFETY AT ALL:
+ *
+ *   A NEW GUARD THAT REFUSES EARLIER THAN AN OLD ONE DOES NOT MERELY ADD A REFUSAL — IT TAKES THE
+ *   OLD ONE'S CASES AWAY. Two rules can both be true of one name, only one of them gets to say
+ *   why, and "which rule fired" is a property this module PROMISES. A guard added without asking
+ *   what it now shadows is a silent narrowing of every proof downstream of it.
+ *
+ * WHAT r12 BROKE, MEASURED RATHER THAN ARGUED. The concurrency lane proves the already-exists
+ * refusal the only way it can be proved — by pointing a provision at a database that really does
+ * exist, which is its OWN, because that is the one database a lane can be sure about. r12 took the
+ * claim at the mint, so that provision was refused as CONTENDED before the probe ran. The refusal
+ * was still correct and nothing unsafe happened; the lane went red because the reason had changed,
+ * and the already-exists rule — rule (4), the only one that needs a real server — had quietly lost
+ * the one case any proof could reach it with. r12 was careful about exactly this for the name
+ * guard, and put the claim after it so a protected name still reads as protected. It simply did
+ * not carry the same care past the next rule along.
+ *
+ * THE FIX IS ORDERING, NOT MACHINERY. The claim moved to just after the existence probe, which
+ * this function already issues, and just before the CREATE. Nothing about r12's property changes:
+ * the check-and-set is still one synchronous tick, still upstream of every CREATE, so two live
+ * handles on one name are still impossible. What changed is that when a name is both PRESENT and
+ * HELD, the refusal names the thing on the server.
+ *
+ * WHY PRESENT BEATS HELD, PUT POSITIVELY. A refusal is a message to whoever has to act on it. "A
+ * database of that name already exists" points at a row in `pg_database` that can be looked at,
+ * counted and dropped by hand. "This process already holds that name" points at a `Set` in a
+ * process that has since exited. When both are true, the checkable one is the more useful thing to
+ * say — and the one left over, a name that is HELD but NOT present, is precisely the r12 finding's
+ * own scenario, which is what makes the two rules genuinely disjoint in what they report.
+ *
+ * THE ONE COST, AND WHY IT IS NOT r10 AGAIN. A refused claim now runs one READ first, where under
+ * r12 it issued nothing. That read does not license anything: both of its answers are refusals, so
+ * there is no window between a permissive answer and a destructive statement for a non-participant
+ * to use. r10's rule is about a read that PERMITS a `DROP`; this is a read that chooses a sentence.
+ *
+ * AND THE COROLLARY FOR THE NEXT ROUND. `giveBackNameClaim` releases only a claim THIS CALL took.
+ * Once a refusal can happen while somebody else's handle holds the name — which is exactly what
+ * this reordering allows — the shared failure path at the bottom of the function would otherwise
+ * hand that handle's name away to the next caller, which is the r12 defect rebuilt by the r13 fix.
+ * Any future rule inserted between the probe and the claim inherits this obligation.
  */
 
 import { execFile } from 'node:child_process'
@@ -390,10 +442,12 @@ type ProvisionOptions = {
   label: string
   /**
    * ONLY a test of this module overrides the minter, and it buys nothing: every name it returns
-   * still has to pass `assertThrowawayDatabaseName`, still has to be one THIS PROCESS DOES NOT
-   * ALREADY HOLD (r12), and still has to not exist on the server. It exists so the two refusals
-   * that need a server — the configured database, and a name somebody else already created — are
-   * reachable from a proof.
+   * still has to pass `assertThrowawayDatabaseName`, still has to not exist on the server, and
+   * still has to be one THIS PROCESS DOES NOT ALREADY HOLD (r12) — in that order (r13). It exists
+   * so the two refusals that need a server — the configured database, and a name somebody else
+   * already created — are reachable from a proof, and r13 is what makes that true again: r12 put
+   * the claim first, and the already-exists refusal is UNREACHABLE through this seam for any name
+   * this process created, which is exactly the name a lane has to hand.
    */
   mintName?: () => string
   /** Milliseconds allowed for `prisma migrate deploy`. 263 migrations against an empty database. */
@@ -426,8 +480,15 @@ type ProvisionOptions = {
 const outstandingMintedNames = new Set<string>()
 
 /**
- * Take the name for this process, or refuse. SYNCHRONOUS AND BEFORE ANY STATEMENT IS ISSUED, so
- * two provisions of one name cannot both get past it, however they are interleaved.
+ * Take the name for this process, or refuse. SYNCHRONOUS AND BEFORE THE `CREATE DATABASE`, so two
+ * provisions of one name cannot both get past it, however they are interleaved: the `has` and the
+ * `add` are one tick with no await between them, and no handle exists that did not come through
+ * here first.
+ *
+ * CALLED AFTER THE EXISTENCE PROBE, NOT AT THE MINT (r13). A name that is both HELD here and
+ * PRESENT on the server is refused either way; what the order decides is WHICH RULE IS REPORTED,
+ * and the already-exists refusal is the one that rests on a fact a human can go and check. See the
+ * r13 rule at the top of this file for why that is worth a round trip this module already makes.
  */
 function claimMintedName(name: string): void {
   if (outstandingMintedNames.has(name)) {
@@ -520,12 +581,29 @@ export async function provisionThrowawayDatabase(options: ProvisionOptions): Pro
   const configuredDatabase = decodeURIComponent(configured.pathname.replace(/^\//, ''))
   const name = (options.mintName ?? (() => mintThrowawayName(options.label)))()
   assertThrowawayDatabaseName(name, configuredDatabase)
-  // AFTER the name guard, so a protected or unminted name is still reported as protected or
-  // unminted rather than as contended, and BEFORE the maintenance connection is even built, so a
-  // refused claim issues nothing at all (r12).
-  claimMintedName(name)
 
   const maintenance = maintenanceUrl(configured)
+
+  /**
+   * DOES *THIS CALL* HOLD THE r12 CLAIM ON THE NAME? (r13.)
+   *
+   * The register is process-level, so `outstandingMintedNames.has(name)` cannot answer "did I put
+   * it there" — and only the call that PUT it there may take it out. Without this flag the
+   * already-exists refusal below, which happens while somebody else's handle holds the name, would
+   * run through the shared failure path at the bottom and GIVE AWAY THE INCUMBENT'S CLAIM: the
+   * next provision of that name would then be allowed, which is the whole of the r12 defect
+   * restored by the r13 fix. Call-local, so it says exactly what it means.
+   */
+  let holdsNameClaim = false
+  const takeNameClaim = (): void => {
+    claimMintedName(name)
+    holdsNameClaim = true
+  }
+  const giveBackNameClaim = (): void => {
+    if (!holdsNameClaim) return
+    holdsNameClaim = false
+    releaseMintedName(name)
+  }
 
   /**
    * ONE DROP, USED BY EVERY PATH THAT NEEDS ONE — the caller's `drop()` and the migration failure
@@ -570,7 +648,7 @@ export async function provisionThrowawayDatabase(options: ProvisionOptions): Pro
     // it can no longer reach any database of this name and holding the claim would buy nothing.
     // Released HERE, off a fact recorded before the await, rather than after an answer that may
     // never arrive — a release that waited for the server would be the r11 defect one level out.
-    releaseMintedName(name)
+    giveBackNameClaim()
     await withMaintenanceClient(maintenance, async (client) => {
       await client.query(`DROP DATABASE IF EXISTS ${quoteIdentifier(name)} WITH (FORCE)`)
       // The server answered. Recorded HERE rather than after `withMaintenanceClient` returns, so a
@@ -609,6 +687,21 @@ export async function provisionThrowawayDatabase(options: ProvisionOptions): Pro
           `refused ${name}: a database of that name ALREADY EXISTS, so this lane did not create it`,
         )
       }
+      // THE r12 CLAIM IS TAKEN HERE — AFTER the probe has had its say and BEFORE the CREATE (r13).
+      //
+      // r12 took it at the mint, before any statement, and that ORDER decided which rule got to
+      // report a name that is BOTH held by a live handle AND present on the server: the claim
+      // always won, and the already-exists refusal — the one the lane proves, and the one whose
+      // evidence a human can go and check — became unreachable for every name this process made.
+      // Refusing is not the same as saying WHY, and the why is the property this module is for.
+      //
+      // It is still SYNCHRONOUS and still BEFORE THE CREATE, which is everything the r12 rule
+      // needs: `has`-then-`add` runs in one tick, so two provisions of one name cannot both get
+      // past it however they interleave, and no handle can exist without having come through it.
+      // What moved is only how much this process knows before it chooses a refusal — one READ,
+      // which licenses nothing: BOTH branches from here refuse, so this is not r10's "a read whose
+      // answer permits a destructive statement" wearing new clothes.
+      takeNameClaim()
       // BEFORE the await, deliberately: from here until an answer arrives, "may exist" is the
       // most this process can honestly claim, and it is the most it will ever claim.
       outcome = 'answer-unknown'
@@ -659,7 +752,7 @@ export async function provisionThrowawayDatabase(options: ProvisionOptions): Pro
       // NO HANDLE IS RETURNED, so nothing in this process can ever drop this name and the claim
       // has no one left to protect (r12). The DATABASE may well be there; that is the leak below,
       // and it is reported rather than registered.
-      releaseMintedName(name)
+      giveBackNameClaim()
       // THE LEAK THIS MODULE ACCEPTS, SURFACED RATHER THAN GUESSED AT (r10).
       throw new ThrowawayDatabaseError(
         `could not create ${name}: ${String(error)}. The CREATE had already been ISSUED and NO ANSWER `
@@ -673,8 +766,11 @@ export async function provisionThrowawayDatabase(options: ProvisionOptions): Pro
     // `not-created` covers both refusals — the probe's and the `42P04` one — and every failure
     // before the CREATE was issued. Re-thrown UNCHANGED so those refusals keep the wording their
     // proofs match on, and, more to the point, WITHOUT ISSUING A DROP.
-    // Nothing was created and no handle is returned, so the claim is given back (r12).
-    releaseMintedName(name)
+    // Nothing was created and no handle is returned, so the claim THIS CALL took is given back
+    // (r12) — and ONLY this call's (r13). The already-exists refusal reaches this line while
+    // ANOTHER handle may hold the name, and a bare `delete` here would hand that handle's name to
+    // the next caller.
+    giveBackNameClaim()
     throw error
   }
 
