@@ -1,4 +1,21 @@
-import { WMS_CONNECTOR_IDS, type WmsConnectorId, isWmsConnectorId } from '@/lib/connectors/wms/types'
+import { WMS_CONNECTOR_IDS, isWmsConnectorId, type WmsConnectorId, type WmsCreateReplayPolicy } from '@/lib/connectors/wms/types'
+
+export type { WmsCreateReplayPolicy }
+
+/**
+ * Where a connector's create-replay policy is read from.
+ *
+ * STRUCTURAL ON PURPOSE, and this module imports the registry NEITHER as a value nor
+ * as a type. A `WmsConnectorRegistry` satisfies it — that is how the second-connector
+ * seam test injects a registry containing a fictitious connector — but this module
+ * must not depend on `lib/connectors/wms/registry`: several suites replace that module
+ * wholesale with `mock.module`, and a module-load-time dereference of an export their
+ * mock does not declare takes down every test in the file with a TypeError that names
+ * nothing useful. (It did exactly that, in 45 tests, before this was inverted.)
+ */
+export type WmsCreateReplayPolicySource = {
+  findDef(id: string): { createReplayPolicy: WmsCreateReplayPolicy } | null
+}
 
 /**
  * WHAT STANDS BETWEEN A SECOND CREATE AND A SECOND WAREHOUSE ORDER (o3d-2k5r r4).
@@ -27,46 +44,45 @@ import { WMS_CONNECTOR_IDS, type WmsConnectorId, isWmsConnectorId } from '@/lib/
  * refused by the party that owns the data. That is a property of the connector, not of the sweep,
  * and it is the only property that makes an automatic retry safe.
  *
- * This table is a `Record` over `WmsConnectorId` on purpose: adding a connector fails `tsc` until
- * somebody has written down which of these answers is true of it. "No policy" is how the create
- * path went uncovered in the first place.
+ * WHERE THE ANSWER COMES FROM. The table below is the shipped answer, and it is a `Record` over
+ * `WmsConnectorId`, so adding a connector fails `tsc` until somebody has written down which answer
+ * is true of it. "No policy" is how the create path went uncovered in the first place.
+ *
+ * Every function below takes a {@link WmsCreateReplayPolicySource} as an optional parameter
+ * defaulting to that table. That is not decoration: only ONE connector ships, and it is the safe
+ * one, so every `client-side-dedupe-only` branch here would otherwise be reachable in a test only
+ * through an UNREGISTERED id — which fails closed for a different reason and produces the same
+ * refusal. A suite built that way would keep passing against a build in which this policy value had
+ * been deleted as unreachable. `tests/wms-second-connector-seam.test.ts` passes a registry that
+ * really CONTAINS such a connector, so the refusal is attributable to the policy and to nothing
+ * else.
  */
-export type WmsCreateReplayPolicy =
-  /**
-   * The REMOTE refuses a duplicate and the connector reconciles to the order that already exists.
-   *
-   * True of Mintsoft: `PUT /api/Order` answers `{Success:false, Message:'Order already exists'}`
-   * for an order number it already holds, and `pushMintsoftOrder` then resolves the existing order
-   * through a ClientId-scoped `Order/Search` and binds THAT id (proved by a read, so it does not
-   * even need the ownership verification a fresh create does). A replay is therefore self-healing:
-   * whichever request loses the race is refused, and the link ends up pointing at the one order the
-   * warehouse holds. When the lookup cannot resolve exactly one row it THROWS rather than creating,
-   * so the failure mode is a retry, never a duplicate.
-   */
-  | 'remote-refuses-duplicate'
-  /**
-   * The only dedupe is a lookup the CONNECTOR performs immediately before its own create, and the
-   * two are separate operations.
-   *
-   * True of ShipHero: `order_create` does not enforce `partner_order_id` uniqueness, so
-   * `pushShipheroOrder`'s `findShipheroOrderByPartnerId` preflight is all there is. It closes the
-   * sequential case and cannot close the concurrent one — a preflight cannot see a request that is
-   * still on the wire, and the create it guards is accepted regardless. Two winners create two
-   * warehouse orders under one partner_order_id, and both get picked.
-   *
-   * So a create whose outcome is unknown is NEVER re-dispatched automatically on such a connector.
-   * The park is the outcome, and the resolution is a person who can look at the WMS.
-   */
-  | 'client-side-dedupe-only'
 
+/**
+ * The shipped connectors' policies.
+ *
+ * A `Record` over `WmsConnectorId`, so adding a connector fails `tsc` here until somebody has
+ * written down which answer is true of it. The registry definition carries the same value
+ * (`WmsConnectorDef.createReplayPolicy`) because that is where a REGISTERED connector's policy
+ * belongs; the two are pinned to each other by
+ * `tests/wms-create-replay-policy.test.ts` → "the shipped registry and this table agree", which is
+ * what stops them drifting apart now that they are declared separately.
+ */
 export const WMS_CREATE_REPLAY_POLICY: Record<WmsConnectorId, WmsCreateReplayPolicy> = {
   mintsoft: 'remote-refuses-duplicate',
-  shiphero: 'client-side-dedupe-only',
+}
+
+/** The default source: the table above, answering `null` for anything not registered. */
+const SHIPPED_POLICY_SOURCE: WmsCreateReplayPolicySource = {
+  findDef: (id) => (isWmsConnectorId(id) ? { createReplayPolicy: WMS_CREATE_REPLAY_POLICY[id] } : null),
 }
 
 /** `null` for a connector id this build does not know — which is never treated as replay-safe. */
-export function wmsCreateReplayPolicy(connectorId: string): WmsCreateReplayPolicy | null {
-  return isWmsConnectorId(connectorId) ? WMS_CREATE_REPLAY_POLICY[connectorId] : null
+export function wmsCreateReplayPolicy(
+  connectorId: string,
+  source: WmsCreateReplayPolicySource = SHIPPED_POLICY_SOURCE,
+): WmsCreateReplayPolicy | null {
+  return source.findDef(connectorId)?.createReplayPolicy ?? null
 }
 
 /**
@@ -76,8 +92,11 @@ export function wmsCreateReplayPolicy(connectorId: string): WmsCreateReplayPolic
  * renamed plugin, a row restored from a backup), and "we have never heard of this connector" is not
  * a reason to believe its warehouse refuses duplicates.
  */
-export function wmsAmbiguousCreateMayBeReplayed(connectorId: string): boolean {
-  return wmsCreateReplayPolicy(connectorId) === 'remote-refuses-duplicate'
+export function wmsAmbiguousCreateMayBeReplayed(
+  connectorId: string,
+  source: WmsCreateReplayPolicySource = SHIPPED_POLICY_SOURCE,
+): boolean {
+  return wmsCreateReplayPolicy(connectorId, source) === 'remote-refuses-duplicate'
 }
 
 /**
@@ -89,8 +108,12 @@ export function wmsAmbiguousCreateMayBeReplayed(connectorId: string): boolean {
  * ordinary reconcile bind it. Neither asks IMS to promote an operator's assertion into evidence
  * (o3d-anu8).
  */
-export function wmsAmbiguousCreateRefusal(connectorId: string, reference: string): string {
-  const policy = wmsCreateReplayPolicy(connectorId)
+export function wmsAmbiguousCreateRefusal(
+  connectorId: string,
+  reference: string,
+  source: WmsCreateReplayPolicySource = SHIPPED_POLICY_SOURCE,
+): string {
+  const policy = wmsCreateReplayPolicy(connectorId, source)
   if (policy === 'remote-refuses-duplicate') {
     // Only reachable when this is called for a connector that IS replay-safe — the caller has
     // decided not to replay for some OTHER reason (the order is no longer eligible, say).
@@ -145,13 +168,13 @@ export const WMS_CREATE_REPLAY_POLICY_IDS = WMS_CONNECTOR_IDS
  * that took neither key.
  *
  * WHAT MADE IT UNSAFE. The hold pass treats `cancelled` and `NOT_FOUND` as the same success. On
- * Mintsoft that is nearly harmless. On ShipHero `NOT_FOUND` IS ONLY A LOOKUP RESULT: the order was
- * not returned by a query we ran, which is consistent with "there is no such order" and equally
- * consistent with "the lookup missed a live order" (a renumbering, a client-scope change, an
- * eventually-consistent index). If the second reading is the true one, the release clears the id,
- * the create pass pushes again, ShipHero's create does not refuse the duplicate, and the goods are
- * picked twice. The state compare-and-set the release already has prevents a stale LOCAL write and
- * says nothing whatever about the remote.
+ * Mintsoft that is nearly harmless. On a `client-side-dedupe-only` connector `NOT_FOUND` IS ONLY A
+ * LOOKUP RESULT: the order was not returned by a query we ran, which is consistent with "there is
+ * no such order" and equally consistent with "the lookup missed a live order" (a renumbering, a
+ * client-scope change, an eventually-consistent index). If the second reading is the true one, the
+ * release clears the id, the create pass pushes again, the connector's create does not refuse the
+ * duplicate, and the goods are picked twice. The state compare-and-set the release already has
+ * prevents a stale LOCAL write and says nothing whatever about the remote.
  *
  * THE TWO KEYS, unchanged from the rest of this file:
  *
@@ -172,9 +195,10 @@ export const WMS_CREATE_REPLAY_POLICY_IDS = WMS_CONNECTOR_IDS
  * carries `cancelledAt` whichever answer the WMS gave, so for those rows the stamp is not evidence
  * and this rule cannot tell. Closing that would need a column to distinguish them, i.e. a
  * migration, and none is applied on this branch. The exposure is bounded: it is only unsafe on a
- * connector with no remote duplicate refusal, which today means ShipHero alone — and ShipHero has
- * no live deployment (the repo is the deploy). On Mintsoft such a row releases, re-creates, and the
- * remote refuses any duplicate, which is the outcome the rule would have chosen anyway.
+ * connector with no remote duplicate refusal, and no shipped connector is one — Mintsoft is
+ * `remote-refuses-duplicate`, so such a row releases, re-creates, and the remote refuses any
+ * duplicate, which is the outcome the rule would have chosen anyway. The residue becomes live again
+ * the day a `client-side-dedupe-only` connector is registered; that is when the column is needed.
  *
  * WHAT THE PROBE IS FOR, AND WHAT IT IS NOT FOR. Where key 1 is absent and key 2 holds, the
  * release still asks the warehouse whether it holds the order (`probeOrderPresence`), because a
@@ -201,11 +225,15 @@ export function decideWmsHeldRelease(input: {
   /** `cancelOrder` answered `cancelled: true` — persisted as the link's `cancelledAt` stamp. */
   remoteCancellationConfirmed: boolean
   reference: string
+  /** Defaults to the shipped policy table; overridden by the second-connector seam test.
+   *  A WmsConnectorRegistry satisfies this structurally. */
+  registry?: WmsCreateReplayPolicySource
 }): WmsHeldReleaseDecision {
+  const source = input.registry ?? SHIPPED_POLICY_SOURCE
   if (input.remoteCancellationConfirmed) {
     return { release: true, evidence: 'remote-cancellation-confirmed', probeRequired: false }
   }
-  if (wmsAmbiguousCreateMayBeReplayed(input.connector)) {
+  if (wmsAmbiguousCreateMayBeReplayed(input.connector, source)) {
     return { release: true, evidence: 'create-refused-remotely', probeRequired: true }
   }
   return {

@@ -38,7 +38,6 @@ function pluginState(over: Partial<IntegrationPluginState> = {}): IntegrationPlu
     xero: false,
     quickbooks: false,
     mintsoft: false,
-    shiphero: false,
     ...over,
   } as IntegrationPluginState
 }

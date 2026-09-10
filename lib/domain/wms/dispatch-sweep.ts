@@ -41,9 +41,10 @@ import { recordWmsMutationEvent } from './mutation-audit'
  *
  * Everything connector-specific is behind the WmsConnector contract: the connector
  * normalises "dispatched" onto WmsOrderStatus/WmsOrderPart and supplies fetchOrderParts /
- * fetchOrderPartItems. So a second WMS (ShipHero) inherits this by implementing the
- * contract. The per-order step (reconcileOneOrder) is exported so a webhook-primary WMS
- * can reconcile a single order on a shipment event rather than polling.
+ * fetchOrderPartItems. So a second WMS inherits this by implementing the contract —
+ * tests/wms-second-connector-seam.test.ts drives this sweep through a fictitious one to
+ * keep that true. The per-order step (reconcileOneOrder) is exported so a webhook-primary
+ * WMS can reconcile a single order on a shipment event rather than polling.
  */
 
 const DISPATCH_SWEEP_DEFAULT_BATCH_SIZE = 50
@@ -527,7 +528,7 @@ export type WmsDispatchSweepDeps = {
     consecutivePasses: number
   }): Promise<void>
   // Inbound Order/List delta (o3d-bjc). Optional so a WMS without a bulk delta
-  // (ShipHero) keeps per-order polling exactly as before. fetchDelta returns
+  // keeps per-order polling exactly as before. fetchDelta returns
   // every order changed since `sinceIso` (already in the tenant timezone) and
   // MUST throw on a truncated/failed delta so the sweep fails safe to a full
   // per-order reconcile. getDeltaState/saveDeltaState persist the watermark +

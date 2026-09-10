@@ -360,7 +360,7 @@ test('a scheduler failure AFTER the commit is reported as committed, not as a re
     // SIX keys, not the five the onboarding payload carries: the returned state is the one read
     // back under the lock, so it includes the plugin this step does not offer. That is the point —
     // it is the database's answer rather than an echo of the request.
-    { woocommerce: true, shopify: false, xero: false, quickbooks: true, mintsoft: false, shiphero: false },
+    { woocommerce: true, shopify: false, xero: false, quickbooks: true, mintsoft: false },
     'and the COMMITTED state is returned, so the caller need not guess from its own copy',
   )
 })
@@ -426,7 +426,7 @@ test('a scheduler failure that THROWS is the same outcome as one that RETURNS', 
   assert.match(result.error, /EACCES/, 'the thrown reason is carried through, like a returned one')
   assert.deepEqual(
     result.pluginState,
-    { woocommerce: true, shopify: false, xero: false, quickbooks: true, mintsoft: false, shiphero: false },
+    { woocommerce: true, shopify: false, xero: false, quickbooks: true, mintsoft: false },
     'with the committed selection, read back under the lock',
   )
   assert.ok(enabled('quickbooks') && enabled('woocommerce'), 'and it really is stored')
@@ -470,7 +470,7 @@ test('the SETTINGS writer reports a scheduler failure as committed, not as a ref
   assert.deepEqual(
     result.pluginState,
     // The full state read back under the lock, not the two keys this partial payload named.
-    { woocommerce: false, shopify: false, xero: true, quickbooks: false, mintsoft: true, shiphero: false },
+    { woocommerce: false, shopify: false, xero: true, quickbooks: false, mintsoft: true },
   )
 })
 
@@ -526,15 +526,22 @@ test('the plugin rows are materialised before they are locked — FOR UPDATE can
   assert.ok(insertAt >= 0 && lockAt > insertAt, 'materialise, then lock')
 })
 
-test('all SIX plugin keys are locked, in one canonical order', async () => {
+test('EVERY plugin key is locked, in one canonical order', async () => {
   // Not just the accounting pair: exclusivity spans WooCommerce/Shopify as well, and one order for
   // one lock set is what stops two callers taking the same rows in opposite orders and deadlocking.
+  //
+  // o3d-remove-shiphero: this used to assert the literal count 6. A hardcoded count is a worse test
+  // than it looks — it fails when a connector is legitimately added OR removed, and it says nothing
+  // about which keys those are. What matters is that the lock set is EXACTLY the registry, so that
+  // is what is asserted; the non-empty check is what stops the comparison passing vacuously if both
+  // sides ever became empty.
   assert.deepEqual(
     [...INTEGRATION_PLUGIN_KEYS_IN_LOCK_ORDER],
     [...Object.values(INTEGRATION_PLUGIN_SETTING_KEYS)].sort(),
     'every plugin key, sorted',
   )
-  assert.equal(INTEGRATION_PLUGIN_KEYS_IN_LOCK_ORDER.length, 6)
+  assert.equal(INTEGRATION_PLUGIN_KEYS_IN_LOCK_ORDER.length, Object.keys(INTEGRATION_PLUGIN_SETTING_KEYS).length)
+  assert.ok(INTEGRATION_PLUGIN_KEYS_IN_LOCK_ORDER.length > 0, 'and the lock set is not empty')
 })
 
 test('the plugin keys have NO environment fallback — the locked row is the whole truth', async () => {

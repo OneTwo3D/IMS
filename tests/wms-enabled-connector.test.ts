@@ -6,7 +6,7 @@ import test, { mock } from 'node:test'
 mock.module('@/lib/integration-plugins', {
   namedExports: {
     getIntegrationPluginState: async () => ({
-      woocommerce: false, shopify: false, xero: false, quickbooks: false, mintsoft: false, shiphero: false,
+      woocommerce: false, shopify: false, xero: false, quickbooks: false, mintsoft: false,
     }),
   },
 })

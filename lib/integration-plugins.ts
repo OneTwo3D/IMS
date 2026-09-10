@@ -19,7 +19,6 @@ const DEFAULT_PLUGIN_STATE: IntegrationPluginState = {
   xero: false,
   quickbooks: false,
   mintsoft: false,
-  shiphero: false,
 }
 
 export async function getIntegrationPluginState(): Promise<IntegrationPluginState> {
@@ -31,7 +30,6 @@ export async function getIntegrationPluginState(): Promise<IntegrationPluginStat
     xero: parseEnabled(values.get(PLUGIN_SETTING_KEYS.xero)),
     quickbooks: parseEnabled(values.get(PLUGIN_SETTING_KEYS.quickbooks)),
     mintsoft: parseEnabled(values.get(PLUGIN_SETTING_KEYS.mintsoft)),
-    shiphero: parseEnabled(values.get(PLUGIN_SETTING_KEYS.shiphero)),
   }
 }
 

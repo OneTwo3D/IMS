@@ -116,7 +116,7 @@ test('a scheduler failure is shown as SAVED with a warning, never as a failed sa
     status: 'scheduler-failed',
     error: 'crontab write failed: no crontab for ims',
     pluginState: {
-      woocommerce: true, shopify: false, xero: false, quickbooks: true, mintsoft: false, shiphero: false,
+      woocommerce: true, shopify: false, xero: false, quickbooks: true, mintsoft: false,
     } as never,
   }
   const screen = await mountSettings()

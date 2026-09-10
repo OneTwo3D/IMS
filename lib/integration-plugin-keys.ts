@@ -11,7 +11,7 @@
  * This module has NO imports, on purpose. Keep it that way.
  */
 
-export type IntegrationPluginId = 'woocommerce' | 'shopify' | 'xero' | 'quickbooks' | 'mintsoft' | 'shiphero'
+export type IntegrationPluginId = 'woocommerce' | 'shopify' | 'xero' | 'quickbooks' | 'mintsoft'
 
 export const INTEGRATION_PLUGIN_SETTING_KEYS = {
   woocommerce: 'plugin_woocommerce_enabled',
@@ -19,7 +19,6 @@ export const INTEGRATION_PLUGIN_SETTING_KEYS = {
   xero: 'plugin_xero_enabled',
   quickbooks: 'plugin_quickbooks_enabled',
   mintsoft: 'plugin_mintsoft_enabled',
-  shiphero: 'plugin_shiphero_enabled',
 } as const
 
 export type IntegrationPluginState = Record<IntegrationPluginId, boolean>

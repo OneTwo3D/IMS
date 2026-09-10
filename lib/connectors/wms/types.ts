@@ -5,14 +5,62 @@
  * connector literal. Add a new id here (plus a registry entry, an
  * IntegrationPluginId + setting key, and per-connector cron/webhook ingress)
  * when a new WMS connector lands; core sales/PO/transfer/stock flows need no edits.
+ *
+ * ONE ENTRY TODAY. ShipHero was removed (o3d-remove-shiphero); Mintsoft is the
+ * only shipped WMS. A one-element tuple reads like a constant begging to be
+ * inlined — it is not. Everything downstream (the registry, the create-replay
+ * policy table, the plugin-enabled resolution order) derives from this list, and
+ * `tests/wms-second-connector-seam.test.ts` registers a fictitious connector and
+ * drives those generic paths through it precisely so the second-connector case
+ * stays exercised while only one connector ships.
  */
-export const WMS_CONNECTOR_IDS = ['mintsoft', 'shiphero'] as const
+export const WMS_CONNECTOR_IDS = ['mintsoft'] as const
 
 export type WmsConnectorId = (typeof WMS_CONNECTOR_IDS)[number]
 
 export function isWmsConnectorId(value: string | null | undefined): value is WmsConnectorId {
   return value != null && (WMS_CONNECTOR_IDS as readonly string[]).includes(value)
 }
+
+/**
+ * Whether a connector's own create refuses a duplicate — a property of the REMOTE,
+ * not of any sweep, and the only property that makes an automatic re-push safe.
+ *
+ * Declared here, on the connector contract, because it is a fact about the warehouse
+ * API the connector wraps. The reasoning that consumes it — why a presence probe and
+ * a lease expiry cannot substitute for it — lives with the policy functions in
+ * lib/domain/wms/create-replay-policy.ts, which re-exports this type.
+ */
+export type WmsCreateReplayPolicy =
+  /**
+   * The REMOTE refuses a duplicate and the connector reconciles to the order that already exists.
+   *
+   * True of Mintsoft: `PUT /api/Order` answers `{Success:false, Message:'Order already exists'}`
+   * for an order number it already holds, and `pushMintsoftOrder` then resolves the existing order
+   * through a ClientId-scoped `Order/Search` and binds THAT id (proved by a read, so it does not
+   * even need the ownership verification a fresh create does). A replay is therefore self-healing:
+   * whichever request loses the race is refused, and the link ends up pointing at the one order the
+   * warehouse holds. When the lookup cannot resolve exactly one row it THROWS rather than creating,
+   * so the failure mode is a retry, never a duplicate.
+   */
+  | 'remote-refuses-duplicate'
+  /**
+   * The only dedupe is a lookup the CONNECTOR performs immediately before its own create, and the
+   * two are separate operations. A preflight cannot see a request that is still on the wire, and
+   * the create it guards is accepted regardless — so two winners create two warehouse orders under
+   * one reference, and both get picked.
+   *
+   * A create whose outcome is unknown is therefore NEVER re-dispatched automatically on such a
+   * connector. The park is the outcome, and the resolution is a person who can look at the WMS.
+   *
+   * NO SHIPPED CONNECTOR TAKES THIS VALUE TODAY. ShipHero did (its `order_create` does not enforce
+   * `partner_order_id` uniqueness) and was removed. The value stays because it is a real property
+   * of real 3PL APIs and because every refusal path in the push sweep, the held-release rule and
+   * the exception inbox is built on it; `tests/wms-second-connector-seam.test.ts` registers a
+   * fictitious connector that takes it, so those paths keep being executed rather than merely
+   * compiled.
+   */
+  | 'client-side-dedupe-only'
 
 export type WmsConnectionSettings = {
   baseUrl: string
@@ -181,7 +229,8 @@ export type WmsOrderStatus = {
 }
 
 /**
- * One part of a (possibly split) WMS order — a Mintsoft split part or a ShipHero shipment.
+ * One part of a (possibly split) WMS order — e.g. a Mintsoft split part, or a per-shipment
+ * record on a WMS that models fulfilment as shipments.
  * Used by the generic dispatch sweep to reconcile per-part despatch.
  */
 export type WmsOrderPart = {
@@ -270,8 +319,23 @@ export type WmsOrderUpdateResult = {
   status: string
 }
 
-export interface WmsConnector {
-  readonly id: WmsConnectorId
+/**
+ * The contract every WMS/3PL connector implements. Core flows depend on THIS and
+ * never on a connector module.
+ *
+ * Generic over the id so a connector can be written for an id this build does not
+ * ship — which is the only way `tests/wms-second-connector-seam.test.ts` can register
+ * a fictitious warehouse and drive the generic layer through it. Production code uses
+ * the default (`WmsConnector` = `WmsConnector<WmsConnectorId>`) and is unaffected.
+ *
+ * OPTIONAL METHODS ARE A CAPABILITY NEGOTIATION, NOT A TODO LIST. A connector that
+ * cannot do something omits the method, and the generic layer must degrade — skip the
+ * bulk delta, report "unsupported" for split parts, refuse a push — rather than
+ * assume. That degradation is what the seam test exercises, because with one shipped
+ * connector implementing nearly everything, no other test can reach those branches.
+ */
+export interface WmsConnector<Id extends string = WmsConnectorId> {
+  readonly id: Id
   readonly name: string
 
   isConfigured(): Promise<boolean>
@@ -292,8 +356,9 @@ export interface WmsConnector {
    * Bulk delta: every order changed since `sinceIso` (already expressed in the
    * WMS tenant's timezone), for the dispatch sweep's Order/List hot-path. One
    * (paginated) call replaces N per-order status polls. Optional — a WMS with
-   * no delta endpoint (ShipHero) omits it and the sweep per-order polls as
-   * before. Implementations MUST throw (never return a partial list) on a
+   * no bulk-delta endpoint omits it and the sweep per-order polls as before, a
+   * degradation the second-connector seam test exercises directly.
+   * Implementations MUST throw (never return a partial list) on a
    * truncated/failed delta so the caller can fail safe to the per-order poll. */
   fetchOrderDelta?(sinceIso: string): Promise<WmsOrderStatus[]>
   /**

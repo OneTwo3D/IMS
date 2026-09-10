@@ -103,9 +103,9 @@ test('[o3d-bjc #3] isDispatchClientScoped: Mintsoft needs a positive integer Cli
   // Mintsoft, configured → scoped → the sweep runs.
   assert.equal(isDispatchClientScoped('mintsoft', '1234'), true)
   assert.equal(isDispatchClientScoped('mintsoft', ' 1234 '), true)
-  // A different WMS (e.g. shiphero) carries no shared-tenant scope → always ok.
-  assert.equal(isDispatchClientScoped('shiphero', null), true)
-  assert.equal(isDispatchClientScoped('shiphero', ''), true)
+  // A different WMS (e.g. a second WMS) carries no shared-tenant scope → always ok.
+  assert.equal(isDispatchClientScoped('acme-wms', null), true)
+  assert.equal(isDispatchClientScoped('acme-wms', ''), true)
 })
 
 // --- Sweep-core delta behaviour --------------------------------------------
@@ -1750,9 +1750,9 @@ test('[o3d-bjc.9] the core counts one unresolved read per PASS — which is why 
 test('[o3d-bjc.9] the dispatch lock key is stable per connector and distinct across them', async () => {
   const { dispatchSweepLockKey } = await import('../lib/domain/wms/dispatch-sweep-lock.ts')
   assert.equal(dispatchSweepLockKey('mintsoft'), dispatchSweepLockKey('mintsoft'))
-  assert.notEqual(dispatchSweepLockKey('mintsoft'), dispatchSweepLockKey('shiphero'))
+  assert.notEqual(dispatchSweepLockKey('mintsoft'), dispatchSweepLockKey('acme-wms'))
   // int4: pg advisory-lock keys are signed 32-bit.
-  for (const id of ['mintsoft', 'shiphero', 'a-very-long-connector-identifier']) {
+  for (const id of ['mintsoft', 'acme-wms', 'a-very-long-connector-identifier']) {
     const key = dispatchSweepLockKey(id)
     assert.ok(Number.isSafeInteger(key) && key >= -(2 ** 31) && key < 2 ** 31, id)
   }

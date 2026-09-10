@@ -12,8 +12,9 @@ const { shouldPushStorefrontCompletion } = 'default' in efNs
 // today; correct once IMS becomes the sole integration.
 
 test('pushes storefront completion for a WMS dispatch that just brought the order to SHIPPED', () => {
+  // The predicate turns on the STATUS transition, not on which WMS reported it — the source is
+  // typed as the shipped connector union, so a second WMS inherits this by being registered.
   assert.equal(shouldPushStorefrontCompletion('mintsoft', 'SHIPPED', 'SHIPPED'), true)
-  assert.equal(shouldPushStorefrontCompletion('shiphero', 'SHIPPED', 'SHIPPED'), true)
 })
 
 test('does NOT push for COMPLETED/DELIVERED (no WC status mapping → would silently no-op)', () => {

@@ -3,7 +3,7 @@
 The IMS treats the 3PL/WMS layer as **connector-agnostic**. Core app flows — sales,
 purchase orders, transfers, stock, onboarding, settings, the `/sync` wiring, and
 external fulfillment — go through a generic boundary and never branch on a
-specific connector (`mintsoft`). A second WMS connector (e.g. ShipHero) is added
+specific connector (`mintsoft`). A second WMS connector is added
 by **implementing the contract + registering it**, with no edits to those core
 flows.
 

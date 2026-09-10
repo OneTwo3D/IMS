@@ -2,7 +2,7 @@
 
 /**
  * Static guard: keeps the 3PL/WMS layer connector-agnostic by blocking any WMS
- * connector literal (`mintsoft`, `shiphero`, …) from leaking into core app
+ * connector literal (`mintsoft`, …) from leaking into core app
  * flows. Core flows (sales / PO /
  * transfer / stock / onboarding / settings / sync wiring / fulfillment) must go
  * through the generic WMS boundary — the WmsConnector contract
@@ -32,9 +32,14 @@ const SCANNED_EXTENSIONS = new Set(['.ts', '.tsx', '.js', '.jsx', '.mjs', '.cjs'
 // 'generated' skips app/generated/** (the Prisma client embeds the full schema as
 // a string, including model doc-comments that legitimately name connectors).
 const SKIPPED_DIRECTORIES = new Set(['.git', '.next', 'node_modules', 'build', 'dist', 'out', 'coverage', 'generated'])
-// Every registered WMS connector literal. Keep in sync with WMS_CONNECTOR_IDS
-// in lib/connectors/wms/types.ts — no core flow may name any of these.
-const CONNECTOR_LITERAL_RE = /mintsoft|shiphero/i
+// Every REGISTERED WMS connector literal. Keep in sync with WMS_CONNECTOR_IDS in
+// lib/connectors/wms/types.ts — no core flow may name any of these. Written as a
+// list, not a bare literal, because there is one entry today (ShipHero was removed
+// in o3d-remove-shiphero) and the whole point of this guard is the day there are two.
+// A REMOVED connector's name is deliberately NOT listed: prose that explains why a
+// generic rule exists by naming the connector it came from is history, not a leak.
+const CONNECTOR_LITERALS = ['mintsoft']
+const CONNECTOR_LITERAL_RE = new RegExp(CONNECTOR_LITERALS.join('|'), 'i')
 const WAIVER_RE = /wms-connector-boundary-ok:\s*[^:\s]+:\s*\S+/i
 
 /**
@@ -62,21 +67,17 @@ const WAIVER_RE = /wms-connector-boundary-ok:\s*[^:\s]+:\s*\S+/i
  */
 const ALLOWLIST = [
   'lib/connectors/mintsoft/',
-  'lib/connectors/shiphero/',
   'lib/connectors/wms/',
   'app/actions/mintsoft-sync.ts',
   'app/actions/wms-asn.ts',
   'app/actions/wms-sync.ts',
   'app/actions/wms-onboarding.ts',
   'app/api/cron/mintsoft-',
-  'app/api/cron/shiphero-',
   'app/api/webhooks/mintsoft/',
-  'app/api/webhooks/shiphero/',
   'app/api/e2e/mintsoft',
   'app/api/export/mintsoft-sync/',
   'app/api/admin/wms/',
   'lib/cron-jobs/wms-mintsoft.ts',
-  'lib/cron-jobs/wms-shiphero.ts',
   'lib/cron-jobs/wms.ts',
   'app/(dashboard)/sync/mintsoft-client.tsx',
   'app/(dashboard)/sync/mintsoft-courier-map.tsx',
@@ -158,7 +159,7 @@ const findings = files
   .flatMap(findLeaks)
 
 if (findings.length > 0) {
-  console.error('WMS connector boundary violation: a WMS connector literal (mintsoft/shiphero) is not allowed in core app flows.')
+  console.error(`WMS connector boundary violation: a WMS connector literal (${CONNECTOR_LITERALS.join('/')}) is not allowed in core app flows.`)
   console.error('Route through the generic WMS boundary (WmsConnector contract + wms-* facades). See docs/wms-connector-boundary.md.')
   console.error('If the reference is genuinely connector-specific, add it to the allowlist in this script or add a waiver:')
   console.error('// wms-connector-boundary-ok: <ticket-or-date>: <reason>')

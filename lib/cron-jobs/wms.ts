@@ -12,4 +12,3 @@ import './wms-order-push'
 import './wms-order-reconcile'
 import './wms-watchdog' // connector-agnostic (module 'wms')
 import './wms-mintsoft' // Mintsoft connector jobs
-import './wms-shiphero' // ShipHero connector jobs

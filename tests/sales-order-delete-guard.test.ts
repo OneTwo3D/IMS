@@ -766,7 +766,7 @@ test('the snapshot falls back to the external id when it has no order number (o3
     makeTx({
       pushLink: null,
       wmsSnapshot: {
-        connectorLabel: 'ShipHero',
+        connectorLabel: 'Acme Fulfilment',
         externalOrderNumber: '',
         externalOrderId: 'sh-99',
         statusLabel: 'Allocated',

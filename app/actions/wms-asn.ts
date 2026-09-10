@@ -2,7 +2,8 @@
 
 import { requirePermission } from '@/lib/auth/server'
 import { getActiveWmsConnectorId } from '@/lib/connectors/wms/active-connector'
-import { getWmsConnectorDef } from '@/lib/connectors/wms/registry'
+import { findWmsConnectorLabel } from '@/lib/connectors/wms/registry'
+import { decorateWmsAsnState, unsupportedWmsAsnState } from '@/lib/connectors/wms/asn-types'
 import type {
   WmsPurchaseOrderAsnState,
   WmsTransferAsnState,
@@ -30,17 +31,17 @@ import type {
  * across all four would have locked WAREHOUSE out of an ASN it is entitled to create.
  */
 
-function disabledAsnState(): WmsPurchaseOrderAsnState {
-  return {
-    pluginEnabled: false,
-    canCreate: false,
-    canManage: false,
-    blockedReason: null,
-    destinationWarehouseCode: null,
-    bindingExternalWarehouseId: null,
-    existingAsns: [],
-    connectorLabel: 'WMS',
-  }
+/**
+ * The label of whatever connector resolved, or null when none did.
+ *
+ * o3d-remove-shiphero: this used to be inlined as the literal `'WMS'` on the
+ * no-Mintsoft arm, which meant a REGISTERED connector that simply has no ASN support
+ * was described to the operator as an anonymous system. `findDef` (not `getDef`) so a
+ * link row written by a connector this build no longer ships degrades to the generic
+ * label instead of throwing inside a read.
+ */
+async function activeWmsLabel(connector: string | null): Promise<string | null> {
+  return connector === null ? null : findWmsConnectorLabel(connector)
 }
 
 export async function getWmsPurchaseOrderAsnState(poId: string): Promise<WmsPurchaseOrderAsnState> {
@@ -50,9 +51,9 @@ export async function getWmsPurchaseOrderAsnState(poId: string): Promise<WmsPurc
   if (connector === 'mintsoft') {
     const { getMintsoftPurchaseOrderAsnState } = await import('@/app/actions/mintsoft-sync')
     const core = await getMintsoftPurchaseOrderAsnState(poId)
-    return { ...core, connectorLabel: getWmsConnectorDef(connector).label }
+    return decorateWmsAsnState(core, await activeWmsLabel(connector))
   }
-  return disabledAsnState()
+  return unsupportedWmsAsnState(await activeWmsLabel(connector))
 }
 
 export async function getWmsTransferAsnStates(
@@ -64,9 +65,9 @@ export async function getWmsTransferAsnStates(
   if (connector === 'mintsoft') {
     const { getMintsoftTransferAsnStates } = await import('@/app/actions/mintsoft-sync')
     const states = await getMintsoftTransferAsnStates(transferIds)
-    const connectorLabel = getWmsConnectorDef(connector).label
+    const connectorLabel = await activeWmsLabel(connector)
     return Object.fromEntries(
-      Object.entries(states).map(([id, state]) => [id, { ...state, connectorLabel }]),
+      Object.entries(states).map(([id, state]) => [id, decorateWmsAsnState(state, connectorLabel)]),
     )
   }
   return {}

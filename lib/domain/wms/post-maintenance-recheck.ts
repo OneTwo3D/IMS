@@ -221,8 +221,9 @@ export async function runPostMaintenanceRecheckForActiveConnector(
   options: { pageSize?: number } = {},
 ): Promise<(PostMaintenanceRecheckResult & { connector: WmsConnectorId }) | null> {
   const connectorId = await getEnabledWmsConnectorId()
-  // Only the Mintsoft connector implements a booked-in re-check; ShipHero's inbound path does not go
-  // through this trigger at all, so there is nothing to reconstruct for it.
+  // Only the Mintsoft connector implements a booked-in re-check (an ASN poll model); a
+  // push-primary WMS's inbound path does not go through this trigger at all, so there is nothing
+  // to reconstruct for it.
   if (connectorId !== 'mintsoft') return null
 
   const result = await runPostMaintenanceBookedInRecheck(connectorId, {

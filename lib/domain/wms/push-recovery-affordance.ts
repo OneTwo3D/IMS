@@ -2,6 +2,7 @@ import {
   wmsAmbiguousCreateMayBeReplayed,
   wmsAmbiguousCreateRefusal,
   wmsMissingOrderRepushRefusal,
+  type WmsCreateReplayPolicySource,
 } from './create-replay-policy'
 import { wmsCreateIneligibleRefusal } from './create-eligibility'
 import { wmsCreateOutcomeIsAmbiguous, wmsPushOrderReference } from './order-push-sweep'
@@ -16,7 +17,8 @@ import { wmsCreateOutcomeIsAmbiguous, wmsPushOrderReference } from './order-push
  * it is indistinguishable from one that can.
  *
  * It had already happened twice on this branch. The exception inbox rendered Replay for every
- * blocked state except VALIDATION_FAILED, so a ShipHero AMBIGUOUS_CREATE row — the one state whose
+ * blocked state except VALIDATION_FAILED, so an AMBIGUOUS_CREATE row on a connector with no
+ * remote duplicate refusal — the one state whose
  * whole point is that IMS must NOT re-dispatch it — got a button the action refuses every single
  * time, under a label calling it an ordinary push failure. And `getWmsOrderPushStateForSalesOrder`
  * wrote `state === 'DEAD_LETTER' || (AMBIGUOUS_CREATE && replayable)` by hand, which omits the
@@ -70,7 +72,14 @@ export const WMS_PUSH_REPLAY_STATES = ['DEAD_LETTER', 'AMBIGUOUS_CREATE'] as con
  * `reference` is only used to compose the connector-policy refusal, which names the string an
  * operator has to search the WMS for.
  */
-export function decideWmsPushReplay(link: WmsPushReplayEvidence, reference: string): WmsPushReplayDecision {
+export function decideWmsPushReplay(
+  link: WmsPushReplayEvidence,
+  reference: string,
+  /** Policy source. Defaults to the shipped table; the second-connector seam test passes a
+   *  registry containing a fictitious `client-side-dedupe-only` connector so this refusal is
+   *  EXECUTED rather than merely compiled — see tests/wms-second-connector-seam.test.ts. */
+  registry?: WmsCreateReplayPolicySource,
+): WmsPushReplayDecision {
   // o3d-92fu: a payload-invalid push has nothing to re-queue — no remote call was ever made, and
   // the sweep's revalidation pass re-queues it for free once the payload builds.
   if (link.state === 'VALIDATION_FAILED') {
@@ -101,11 +110,11 @@ export function decideWmsPushReplay(link: WmsPushReplayEvidence, reference: stri
     }
   }
   // o3d-2k5r r4 — the first of the two keys, and the one no probe can supply. See create-replay-policy.
-  if (wmsCreateOutcomeIsAmbiguous(link) && !wmsAmbiguousCreateMayBeReplayed(link.connector)) {
+  if (wmsCreateOutcomeIsAmbiguous(link) && !wmsAmbiguousCreateMayBeReplayed(link.connector, registry)) {
     return {
       replayable: false,
       reason: 'create-not-repeatable',
-      guidance: wmsAmbiguousCreateRefusal(link.connector, reference),
+      guidance: wmsAmbiguousCreateRefusal(link.connector, reference, registry),
     }
   }
   return { replayable: true }
@@ -165,8 +174,10 @@ export function decideWmsMissingRepush(input: {
   reference: string
   /** The shared create predicate's own answer for this order. */
   createEligible: boolean
+  /** Policy source; defaults to the shipped table. See decideWmsPushReplay. */
+  registry?: WmsCreateReplayPolicySource
 }): WmsMissingRepushDecision {
-  if (!wmsAmbiguousCreateMayBeReplayed(input.connector)) {
+  if (!wmsAmbiguousCreateMayBeReplayed(input.connector, input.registry)) {
     return {
       repushable: false,
       reason: 'create-not-repeatable',

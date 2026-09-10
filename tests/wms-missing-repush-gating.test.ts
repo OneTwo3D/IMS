@@ -21,11 +21,11 @@ const decideCreateClaim = async (...args: Parameters<
  *     `decideCreateClaim` reads a PENDING_CREATE link carrying a stamp older than the lease as
  *     PARK_AMBIGUOUS, so the next sweep parked the order it had supposedly just re-queued. The
  *     action had already RESOLVED the discrepancy and reported success, so the operator saw the
- *     finding leave the inbox while the order left the create queue. On ShipHero that park has no
+ *     finding leave the inbox while the order left the create queue. On such a connector that park has no
  *     automatic exit at all.
  *  2. THE BYPASS. On a link whose stamp was null (a legacy row, a restore) the claim was GRANTED
  *     and the create re-dispatched on the presence probe ALONE — the two-key rule skipped entirely,
- *     and on ShipHero that is two warehouse orders under one reference.
+ *     and on such a connector that is two warehouse orders under one reference.
  *
  * The gate is the connector's own create-replay contract, taken before anything is asked of the
  * warehouse. It closes both directions at once, because on a connector that cannot repeat a create
@@ -129,6 +129,33 @@ mock.module('@/lib/connectors/wms/registry', {
         ? async (reference: string) => { state.probed.push(reference); return state.presence.get(reference) ?? 'MISSING' }
         : undefined,
     }),
+  },
+})
+/**
+ * o3d-remove-shiphero: a build in which a SECOND WMS connector is registered.
+ *
+ * These cases contrast a replay-safe connector with one whose create cannot be repeated. That used
+ * to be Mintsoft vs ShipHero. With one connector shipping, the second id is not in
+ * WMS_CONNECTOR_IDS — and `resetMissingWmsOrderPush` resolves the active connector by scanning
+ * exactly that list, so every second-connector case short-circuited on "this finding belongs to a
+ * connector that is no longer active" and never reached the create-replay gate it was written to
+ * prove. That refusal is real and correct; it is simply a DIFFERENT door, and a suite that quietly
+ * accepted it would have been measuring the wrong one.
+ *
+ * So the module that publishes the registered-id list is replaced with one that has two entries.
+ * `acme-wms` then reaches the gate and is refused there, because the shipped policy table has no
+ * answer for it and "no answer" is never replay-safe.
+ *
+ * WHAT THIS DOES AND DOES NOT PROVE. It proves the ACTION's behaviour: no probe is spent, nothing
+ * is written, the finding stays OPEN. It does NOT prove that the refusal came from the
+ * `client-side-dedupe-only` policy rather than from an absent one — those produce the same refusal
+ * by design, and separating them needs a registry that really carries the policy.
+ * tests/wms-second-connector-seam.test.ts is where that is done.
+ */
+mock.module('@/lib/connectors/wms/types', {
+  namedExports: {
+    WMS_CONNECTOR_IDS: ['mintsoft', 'acme-wms'] as const,
+    isWmsConnectorId: (value: string | null | undefined) => value === 'mintsoft' || value === 'acme-wms',
   },
 })
 
@@ -255,12 +282,14 @@ function reset(over: Row = {}, connector = 'mintsoft') {
 
 // --- the connector contract, in both stamp shapes ---------------------------------------
 
-test('o3d-2k5r r5 repush: a STAMPED ShipHero link is refused — no probe, no write, finding stays OPEN', async () => {
+test('o3d-2k5r r5 repush: a STAMPED unsafe-create link is refused — no probe, no write, finding stays OPEN', async () => {
   // Route: finding read -> link read -> connector match -> decideWmsMissingRepush REFUSES
-  // (shiphero is client-side-dedupe-only) -> return. Pre-fix this reset the link and left the stamp,
+  // (the fictitious connector is client-side-dedupe-only in the seam registry, and not registered at all in
+  // the shipped one — either way the policy refuses; tests/wms-second-connector-seam.test.ts is what
+  // separates those two reasons) -> return. Pre-fix this reset the link and left the stamp,
   // so the next sweep parked the order AMBIGUOUS_CREATE with the finding already resolved — and on
-  // ShipHero that park never opens by itself.
-  reset({}, 'shiphero')
+  // such a connector that park never opens by itself.
+  reset({}, 'acme-wms')
   const result = await (await repush())('so-1')
 
   assert.equal(result.success, false)
@@ -272,11 +301,11 @@ test('o3d-2k5r r5 repush: a STAMPED ShipHero link is refused — no probe, no wr
   assert.deepEqual(state.activity, [])
 })
 
-test('o3d-2k5r r5 repush: a NULL-STAMP ShipHero link is refused too — the bypass is closed by the same gate', async () => {
+test('o3d-2k5r r5 repush: a NULL-STAMP unsafe-create link is refused too — the bypass is closed by the same gate', async () => {
   // Route: identical, and that is the point. A link with no dispatch stamp used to read as CLAIM,
   // so the sweep re-dispatched the create on the presence probe ALONE — the two-key rule skipped.
   // The refusal is a property of the CONNECTOR, so the stamp cannot route around it.
-  reset({ lastAttemptAt: null }, 'shiphero')
+  reset({ lastAttemptAt: null }, 'acme-wms')
   assert.equal(await decideCreateClaim({ state: 'PENDING_CREATE', lastAttemptAt: null }, new Date()), 'CLAIM',
     'precondition: a null stamp is exactly what the sweep would have granted a create on')
 
@@ -364,12 +393,12 @@ test('o3d-2k5r r5 repush: an AMBIGUOUS match is not absence', async () => {
 test('o3d-2k5r r5 repush: a link belonging to a connector that is not active is refused before the policy', async () => {
   // The link can outlive the connector that wrote it. Probing the WRONG warehouse and getting
   // MISSING is not weaker evidence — it is evidence about a different question.
-  reset({ connector: 'shiphero' })
+  reset({ connector: 'acme-wms' })
   state.finding!.connector = 'mintsoft'
   const result = await (await repush())('so-1')
 
   assert.equal(result.success, false)
-  assert.match(result.error!, /belongs to shiphero, which is not the active WMS connector/)
+  assert.match(result.error!, /belongs to acme-wms, which is not the active WMS connector/)
   assert.deepEqual(state.probed, [])
   assert.equal(state.link!.state, 'SYNCED')
 })

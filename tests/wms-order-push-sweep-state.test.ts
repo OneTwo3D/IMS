@@ -1085,7 +1085,7 @@ test('claim: a link that has never been pushed is claimable (o3d-38gl)', () => {
 
 test('claim: a FRESH PENDING_CREATE is refused — another worker holds it (o3d-38gl)', () => {
   // The defect: worker A wrote PENDING_CREATE and committed; worker B then acquired the order
-  // lock, saw PENDING_CREATE, passed the check and also called pushOrder. Worst on ShipHero,
+  // lock, saw PENDING_CREATE, passed the check and also called pushOrder. Worst on a client-side-dedupe-only connector,
   // where preflight and create are separate and partner_order_id is not unique — two winners
   // can create and then fulfil DUPLICATE warehouse orders.
   const held = { state: 'PENDING_CREATE', lastAttemptAt: new Date('2026-07-20T12:00:00Z') }

@@ -4,7 +4,7 @@ import { getIntegrationPluginState } from '@/lib/integration-plugins'
 import { WMS_CONNECTOR_IDS } from '@/lib/connectors/wms/types'
 import { getWmsConnector } from '@/lib/connectors/wms/registry'
 import type { WmsConnector, WmsOrderAddress, WmsOrderPushInput, WmsOrderPushLine } from '@/lib/connectors/wms/types'
-import { decideWmsHeldRelease, wmsAmbiguousCreateMayBeReplayed, wmsAmbiguousCreateRefusal, wmsCreateReplayPolicy } from './create-replay-policy'
+import { decideWmsHeldRelease, wmsAmbiguousCreateMayBeReplayed, wmsAmbiguousCreateRefusal, wmsCreateReplayPolicy, type WmsCreateReplayPolicySource } from './create-replay-policy'
 import { WMS_CREATE_ELIGIBLE_ORDER_FENCES, wmsCreateEligibleOrderWhere } from './create-eligibility'
 import { scrubWmsError } from './error-scrub'
 import { recordWmsMutationEvent, type WmsMutationEventInput } from './mutation-audit'
@@ -38,10 +38,10 @@ const MAX_ATTEMPTS = 5
  * o3d-2k5r r3 — how many warehouse-presence probes ONE sweep may spend resolving ambiguous
  * revalidation candidates.
  *
- * The revalidation pass is otherwise purely local (no connector call, no API budget), and both
- * connectors implement the probe as a real search — Mintsoft an Order/Search, ShipHero a
- * credit-consuming GraphQL query. Bounding it keeps a backlog of ambiguous claims from turning
- * a local pass into a per-sweep quota drain.
+ * The revalidation pass is otherwise purely local (no connector call, no API budget), but a
+ * connector implements the probe as a real remote search — Mintsoft an Order/Search — which on
+ * some 3PL APIs is metered. Bounding it keeps a backlog of ambiguous claims from turning a local
+ * pass into a per-sweep quota drain.
  *
  * Running out is a DELAY, never a decision: an unprobed link is re-stamped and rotates back in on
  * a later sweep, and nothing is re-queued without an answer.
@@ -59,9 +59,9 @@ const PRESENCE_PROBE_BUDGET = 5
  * PENDING_CREATE is a STATE, not a claim: it cannot distinguish "I just took this" from
  * "another worker took this and is still talking to the WMS". Worker A wrote PENDING_CREATE and
  * committed; worker B then acquired the order lock, saw PENDING_CREATE, passed the check and
- * also called pushOrder. Worst on ShipHero, where preflight and create are separate operations
- * and partner_order_id is not unique — two winners can create and then fulfil DUPLICATE
- * warehouse orders.
+ * also called pushOrder. Worst on a `client-side-dedupe-only` connector, where preflight and
+ * create are separate operations and the external reference is not unique — two winners can
+ * create and then fulfil DUPLICATE warehouse orders.
  *
  * `lastAttemptAt` is already stamped on every claim, so it doubles as the lease with no schema
  * change: a claim is refused while another worker's stamp is still fresh. Long enough to cover
@@ -832,13 +832,27 @@ export async function runWmsOrderPushSweepCore(
   connector: PushConnector,
   connectorId: string,
   port: WmsOrderPushPort,
-  options?: { batchSize?: number; now?: () => Date },
+  options?: {
+    batchSize?: number
+    now?: () => Date
+    /**
+     * Where the connector's create-replay policy is read from. Defaults to the shipped registry.
+     *
+     * This is a seam, not a hook: with one shipped connector, every refusal path below that turns
+     * on `client-side-dedupe-only` would be reachable in tests only via an UNREGISTERED id, and an
+     * unregistered id fails closed for a different reason (we have never heard of it). Passing a
+     * registry that really contains such a connector is what separates "refused because the policy
+     * says so" from "refused because nothing is known" — see tests/wms-second-connector-seam.test.ts.
+     */
+    registry?: WmsCreateReplayPolicySource
+  },
 ): Promise<WmsOrderPushSweepResult> {
   const result: WmsOrderPushSweepResult = { created: 0, verified: 0, verifyQuarantined: 0, verifyUnresolved: 0, updated: 0, cancelled: 0, held: 0, released: 0, failed: 0, deadLettered: 0, validationFailed: 0, revalidated: 0, revalidateAmbiguous: 0, createClaimParked: 0, ambiguousCreateRequeued: 0 }
   if (!connector.pushOrder) return { ...result, skipped: 'Active WMS connector has no order-push support' }
 
   const batchSize = options?.batchSize ?? DEFAULT_BATCH_SIZE
   const now = options?.now ?? (() => new Date())
+  const registry = options?.registry
 
   // q66in.4.6 audit timeline: one event per remote mutation (attempted or
   // succeeded), best-effort — an audit failure must never fail the sweep.
@@ -913,9 +927,10 @@ export async function runWmsOrderPushSweepCore(
   // state alone, so the next tick pushes the order again. The pass used to do that for every HELD
   // link, on the reasoning that "its WMS order was cancelled when it was held" — which the hold
   // pass does not actually establish. It parks a link HELD both when the WMS CONFIRMS the
-  // cancellation and when the WMS merely answers NOT_FOUND, and on ShipHero NOT_FOUND is a lookup
-  // result, not a fact about the warehouse. A lookup that missed a live order, followed by a
-  // release, followed by a create ShipHero does not refuse, is two warehouse orders and two picks.
+  // cancellation and when the WMS merely answers NOT_FOUND, and on a `client-side-dedupe-only`
+  // connector NOT_FOUND is a lookup result, not a fact about the warehouse. A lookup that missed a
+  // live order, followed by a release, followed by a create the remote does not refuse, is two
+  // warehouse orders and two picks.
   //
   // So the release takes the two keys the rest of this branch takes, from the one rule in
   // create-replay-policy.ts. See {@link decideWmsHeldRelease} for what each key is and why a
@@ -926,6 +941,7 @@ export async function runWmsOrderPushSweepCore(
     // cancelOrder answered `cancelled: true`.
     const gate = decideWmsHeldRelease({
       connector: connectorId,
+      registry,
       remoteCancellationConfirmed: link.cancelledAt !== null,
       reference,
     })
@@ -951,7 +967,7 @@ export async function runWmsOrderPushSweepCore(
         action: 'order_release', outcome: 'FAILED', entityType: 'SALES_ORDER', entityId: link.orderId, externalId: link.externalOrderId,
         summary: 'Held order NOT re-queued — no confirmed WMS cancellation and this connector does not refuse a duplicate create',
         before: { state: 'HELD', externalOrderId: link.externalOrderId },
-        after: { state: 'DEAD_LETTER', remoteCancellationConfirmed: false, createReplayPolicy: wmsCreateReplayPolicy(connectorId) },
+        after: { state: 'DEAD_LETTER', remoteCancellationConfirmed: false, createReplayPolicy: wmsCreateReplayPolicy(connectorId, registry) },
         error: gate.guidance,
       })
       continue
@@ -1128,8 +1144,8 @@ export async function runWmsOrderPushSweepCore(
         // a second warehouse order. So the probe is only asked for at all once the CONNECTOR's
         // create is known to be safe to repeat — see create-replay-policy.ts, which is also what
         // keeps this gate and the ambiguous-create pass answering the same question the same way.
-        if (!wmsAmbiguousCreateMayBeReplayed(connectorId)) {
-          const message = wmsAmbiguousCreateRefusal(connectorId, wmsPushOrderReference(link.order))
+        if (!wmsAmbiguousCreateMayBeReplayed(connectorId, registry)) {
+          const message = wmsAmbiguousCreateRefusal(connectorId, wmsPushOrderReference(link.order), registry)
           console.warn(`[wms-order-push] link ${link.id} builds a valid payload again but is NOT re-queued — ${connectorId} cannot repeat a create safely`)
           const restamped = await port
             .updateLinkIfState(link.id, 'VALIDATION_FAILED', { lastError: message, lastAttemptAt: ts })
@@ -1266,7 +1282,7 @@ export async function runWmsOrderPushSweepCore(
         + 'rotate in on following sweeps — they are NOT dropped.',
       )
     }
-    const replayable = wmsAmbiguousCreateMayBeReplayed(connectorId)
+    const replayable = wmsAmbiguousCreateMayBeReplayed(connectorId, registry)
     for (const link of links) {
       const externalWarehouseId = link.order.shipFromWarehouseId ? externalWarehouseByWarehouse.get(link.order.shipFromWarehouseId) : undefined
       if (!externalWarehouseId) continue
@@ -1283,7 +1299,7 @@ export async function runWmsOrderPushSweepCore(
       }
       const reference = wmsPushOrderReference(link.order)
       if (!replayable) {
-        const message = wmsAmbiguousCreateRefusal(connectorId, reference)
+        const message = wmsAmbiguousCreateRefusal(connectorId, reference, registry)
         // Re-stamped so the rotation moves on, and audited only when the REASON changed — the same
         // discipline the revalidation pass uses, for the same reason: a persisted disposition exists
         // to stop the operator being told the same thing every ten minutes.
@@ -1526,7 +1542,7 @@ export async function runWmsOrderPushSweepCore(
             + 'recorded — parked rather than re-pushed, so the warehouse is not asked to fulfil it twice',
           before: { state: 'PENDING_CREATE', attempts: order.pushAttempts },
           after: { state: 'AMBIGUOUS_CREATE', attempts: Math.max(order.pushAttempts, AMBIGUOUS_ATTEMPTS), remoteOutcomeAmbiguous: true },
-          error: wmsAmbiguousCreateRefusal(connectorId, reference),
+          error: wmsAmbiguousCreateRefusal(connectorId, reference, registry),
         })
         continue
       }
@@ -2013,7 +2029,8 @@ export async function runWmsOrderPushSweepCore(
           // o3d-2k5r r6 — WHAT THIS WRITE RECORDS IS NOW THE DIFFERENCE BETWEEN THE TWO.
           //
           // `cancelled: true` is the warehouse saying it cancelled the order. `NOT_FOUND` is the
-          // warehouse failing to return one, which on ShipHero is a lookup result and nothing more.
+          // warehouse failing to return one, which on a connector with no remote duplicate
+          // refusal is a lookup result and nothing more.
           // Both used to be stamped `cancelledAt: ts` — writing "cancelled at 09:04" for an order
           // nobody confirmed was cancelled — and the release pass then read that stamp (or rather,
           // read nothing at all) and re-created the order. The stamp is the persisted affirmative
@@ -2025,6 +2042,7 @@ export async function runWmsOrderPushSweepCore(
           const confirmed = cancel.cancelled === true
           const gate = decideWmsHeldRelease({
             connector: connectorId,
+            registry,
             remoteCancellationConfirmed: confirmed,
             reference: link.externalOrderId,
           })

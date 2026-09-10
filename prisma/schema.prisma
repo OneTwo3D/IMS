@@ -3784,11 +3784,28 @@ model WmsInboundReceiptEvent {
   @@map("wms_inbound_receipt_events")
 }
 
-/// Generic inbound webhook event staging for push-primary WMS connectors (ShipHero).
-/// Distinct from WmsInboundReceiptEvent (Mintsoft's ASN-specific poll model): ShipHero
-/// pushes order/shipment/inventory webhooks, staged here by event type with idempotent
-/// dedupe on (connector, externalEventId), retry/dead-letter state, and a monotonic
-/// status rank guarding the writeback against out-of-order delivery.
+/// Generic inbound webhook event staging for push-primary WMS connectors.
+/// Distinct from WmsInboundReceiptEvent (Mintsoft's ASN-specific poll model): a
+/// push-primary WMS sends order/shipment/inventory webhooks, staged here by event type
+/// with idempotent dedupe on (connector, externalEventId), retry/dead-letter state, and
+/// a monotonic status rank guarding the writeback against out-of-order delivery.
+///
+/// NO CONNECTOR WRITES TO THIS TABLE TODAY (o3d-remove-shiphero). ShipHero was the only
+/// push-primary WMS and was removed; Mintsoft is poll-primary and uses
+/// wms_inbound_receipt_events. The table and its generic READERS are kept deliberately:
+///  - the `connector` column, the dedupe key and the status-rank guard are not
+///    ShipHero-shaped — they are what any push-primary 3PL needs, and re-deriving them
+///    is how out-of-order webhook writebacks get re-invented wrongly;
+///  - its readers are shared multi-source aggregators (the sync-exception dead-letter
+///    inbox in app/actions/sync-exceptions.ts, and lib/data-retention.ts), not a
+///    ShipHero code path, so dropping the table would mean amputating one arm of two
+///    generic surfaces for no gain;
+///  - dropping it needs a destructive migration against a live-served development
+///    database whose rows nothing else can reconstruct.
+/// It is EMPTY-BY-DESIGN infrastructure, not dead code behind a flag: nothing branches
+/// on whether it has rows, and the moment a push-primary connector is registered it is
+/// written to with no schema change. If no such connector has landed by the time the
+/// other connector removals are done, drop it then and say so.
 model WmsWebhookEvent {
   id                 String    @id @default(cuid())
   connector          String

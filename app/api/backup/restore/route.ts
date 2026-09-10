@@ -589,13 +589,10 @@ export type RestoreLockContext = {
  *   app/api/webhooks/mintsoft/asn-booked-in            → FENCED as of o3d-hl8l. The route consults
  *       the flag as its FIRST statement, before the body is read and before the signature is
  *       verified, so nothing on the persist path runs during a held restore.
- * wms-connector-boundary-ok: o3d-hl8l: naming which routes maintenance mode does and does not fence is the measured claim itself, not connector dispatch.
- *   app/api/webhooks/shiphero/[event]                  → STILL NOT FENCED. Persists via
- * wms-connector-boundary-ok: o3d-hl8l: naming which routes maintenance mode does and does not fence is the measured claim itself, not connector dispatch.
- *       `persistShipheroWebhookEvent` with no maintenance check anywhere on the path. Left as a
- * wms-connector-boundary-ok: o3d-hl8l: naming which routes maintenance mode does and does not fence is the measured claim itself, not connector dispatch.
- *       stated gap by owner instruction (o3d-hl8l scoped the fix to the Mintsoft half); the row
- *       below says `fenced: 'no'` because that is what the route does, not because nobody looked.
+ *       (o3d-remove-shiphero: the ShipHero webhook route was the one WMS ingress that stayed
+ *       UNFENCED — an owner-scoped gap in o3d-hl8l. Removing the connector removed the route, so
+ *       every WMS webhook entry point this build has now consults the flag. That is a smaller
+ *       claim than "the gap was fixed", and it is the only one the code supports.)
  *   app/api/accounting/callback                        → NOT FENCED. An inbound OAuth callback
  *       that writes credentials and activity rows.
  *
@@ -705,9 +702,9 @@ export type RestoreLockContext = {
  * wms-connector-boundary-ok: o3d-hl8l: naming which routes maintenance mode does and does not fence is the measured claim itself, not connector dispatch.
  *   • FENCED: scheduled jobs (`app/api/cron/*`), WooCommerce webhooks, and the Mintsoft ASN
  *     booked-in webhook.
- * wms-connector-boundary-ok: o3d-hl8l: naming which routes maintenance mode does and does not fence is the measured claim itself, not connector dispatch.
- *   • NOT FENCED: the ShipHero webhook route, the accounting OAuth callback, interactive writes
- *     from the dashboard, other API routes, and anything holding a direct database connection. The
+ *   • NOT FENCED: the accounting OAuth callback, a `shopify` delivery to the shopping webhook
+ *     route, interactive writes from the dashboard, other API routes, and anything holding a
+ *     direct database connection. The
  *     operator has to take the application out of service to stop those; the message below says so
  *     in those words rather than implying it is already down.
  *
@@ -744,10 +741,6 @@ export const MAINTENANCE_MODE_REACH = {
     { route: 'app/api/webhooks/shopping/[connector]/[resource]', fenced: 'woocommerce-only' },
     // wms-connector-boundary-ok: o3d-hl8l: naming which routes maintenance mode does and does not fence is the measured claim itself, not connector dispatch.
     { route: 'app/api/webhooks/mintsoft/asn-booked-in', fenced: 'yes' },
-    // wms-connector-boundary-ok: o3d-hl8l: naming which routes maintenance mode does and does not fence is the measured claim itself, not connector dispatch.
-    // Honestly 'no', not "unreviewed": o3d-hl8l deliberately scoped the fix to the Mintsoft half.
-    // wms-connector-boundary-ok: o3d-hl8l: naming which routes maintenance mode does and does not fence is the measured claim itself, not connector dispatch.
-    { route: 'app/api/webhooks/shiphero/[event]', fenced: 'no' },
     { route: 'app/api/accounting/callback', fenced: 'no' },
   ] as const,
   /**
@@ -1166,9 +1159,7 @@ export async function runRestore(
           + 'changes and orphaned-sync cancellation cannot interleave with it. Scheduled jobs '
           // wms-connector-boundary-ok: o3d-hl8l: naming which routes maintenance mode does and does not fence is the measured claim itself, not connector dispatch.
           + '(app/api/cron/*), WooCommerce webhooks and the Mintsoft ASN webhook are stopped by '
-          + 'maintenance mode. THE '
-          // wms-connector-boundary-ok: o3d-hl8l: naming which routes maintenance mode does and does not fence is the measured claim itself, not connector dispatch.
-          + 'SHIPHERO WEBHOOK ROUTE, THE ACCOUNTING OAUTH CALLBACK AND ALL '
+          + 'maintenance mode. THE ACCOUNTING OAUTH CALLBACK AND ALL '
           + 'INTERACTIVE WRITES FROM THE DASHBOARD ARE NOT STOPPED BY ANYTHING — take the '
           + 'application out of service to stop those. Do NOT '
           + 'restart yet: restarting releases the held lock. Confirm in pg_stat_activity that pid '
