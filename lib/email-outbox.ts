@@ -43,7 +43,10 @@
  * AND THE DRAIN'S OPTIONS ARE A UNION, NOT A BAG OF OPTIONAL FIELDS. This is a SWEEP over the
  * globally oldest eligible rows, so a caller who injects a fake sender WITHOUT also injecting a
  * client points that fake at real customer email. `ProcessEmailOutboxOptions` makes that shape
- * fail to compile rather than default; the reasoning is on the type.
+ * fail to compile, AND `assertBothOrNeitherInjected` makes it throw before the first query for
+ * the callers tsc never sees (a cast, `any`, JavaScript). The clock and the preparer ride on the
+ * INJECTED arm only, because both of them do decide what leaves the building; the reasoning is on
+ * the types.
  */
 
 import { randomUUID } from 'node:crypto'
@@ -59,11 +62,13 @@ const EMAIL_CLAIM_STALE_MS = 15 * 60 * 1000
 const EMAIL_BACKOFF_BASE_MS = 60_000
 const EMAIL_BACKOFF_MAX_MS = 60 * 60 * 1000
 /**
- * How many eligible rows one drain claims. EXPORTED because the concurrency proof has to seed
- * MORE than a batch of bystanders to show that its scoped client keeps the fixture reachable;
- * a hard-coded 25 over there would silently stop measuring that the day this number moved.
+ * How many eligible rows one drain claims. MODULE-LOCAL: it used to be exported so the
+ * concurrency proof could seed more than a batch of bystanders and show that its SCOPED client
+ * still reached the fixture. That proof is gone — the lane provisions its own database now, so
+ * there are no bystanders to be crowded out by — and with it the only reason anything outside
+ * this file needed to know the number.
  */
-export const EMAIL_OUTBOX_BATCH_SIZE = 25
+const EMAIL_OUTBOX_BATCH_SIZE = 25
 
 /** The db-native partial unique index declared by the o3d-alnk migration. */
 export const EMAIL_OUTBOX_UNDELIVERED_REFERENCE_INDEX = 'email_outbox_undelivered_reference_uq'
@@ -132,32 +137,49 @@ type EmailClaim = {
 }
 
 /**
- * The dependencies that are safe to override on their own, because none of them decides WHICH
- * ROWS the drain reaches or WHETHER a message leaves the building.
+ * (a) THE CRON. NOTHING injected — the global client, the real sender, the real clock, the real
+ * preparer. Every field is `?: never`, so this arm is the empty object and nothing else.
+ *
+ * o3d-alnk r4 (Codex HIGH) — WHY THE HARNESS OVERRIDES ARE NOT HERE ANY MORE. `now`,
+ * `prepareQueuedEmail` and `logActivity` used to ride on BOTH arms, on the reasoning that none of
+ * them decides which rows the drain reaches or whether a message leaves the building. That
+ * reasoning was wrong on both counts, and the ambient arm is where it was dangerous:
+ *
+ *   `now` DOES decide which rows the drain reaches. Eligibility is `availableAt <= now()` and
+ *   stale reclamation is `processingStartedAt < now() - 15min`, so a FUTURE `now` reclaims rows
+ *   whose holders are still on the socket and mails a second copy of a real customer's email.
+ *
+ *   `prepareQueuedEmail` DOES decide what leaves the building. It supplies the recipient, the
+ *   subject, the body and the PDF; a preparer returning `null` sends the stored placeholder with
+ *   no attachment, and one that throws settles the row as a failure instead of sending at all.
+ *
+ * Neither has a production caller — `app/api/cron/email-outbox/route.ts` passes nothing — so they
+ * are now spelled only on the INJECTED arm, where they can only ever be aimed at a caller's own
+ * client and a caller's own sender.
  */
-type ProcessEmailOutboxHarness = {
+export type ProcessEmailOutboxAmbientOptions = {
+  client?: never
+  sendEmail?: never
+  prepareQueuedEmail?: never
+  logActivity?: never
+  now?: never
+}
+
+/**
+ * (b) A TEST. The rows it may reach, the sender it reaches them with, and — only here — the
+ * clock and the preparer, because a caller that has brought its own client and its own sender
+ * cannot point either of them at production.
+ */
+export type ProcessEmailOutboxInjectedOptions = {
+  client: EmailOutboxClient
+  sendEmail: typeof sendEmail
   prepareQueuedEmail?: typeof prepareQueuedEmail
   logActivity?: typeof logActivity
   now?: () => Date
 }
 
 /**
- * (a) THE CRON. Nothing injected: the global client, the real sender. `client?: never` and
- * `sendEmail?: never` are what make this arm REFUSE a half-injection rather than default it.
- */
-export type ProcessEmailOutboxAmbientOptions = ProcessEmailOutboxHarness & {
-  client?: never
-  sendEmail?: never
-}
-
-/** (b) A TEST. Both the rows it may reach AND the sender it reaches them with, together. */
-export type ProcessEmailOutboxInjectedOptions = ProcessEmailOutboxHarness & {
-  client: EmailOutboxClient
-  sendEmail: typeof sendEmail
-}
-
-/**
- * o3d-alnk r3 (Codex HIGH) — WHY THIS IS A UNION AND NOT TWO OPTIONAL FIELDS.
+ * o3d-alnk r3/r4 (Codex HIGH) — WHY THIS IS A UNION AND NOT A BAG OF OPTIONAL FIELDS.
  *
  * `client` and `sendEmail` used to be independently optional, each falling back to the global
  * when absent. That made a third shape representable, and it is the destructive one:
@@ -171,9 +193,14 @@ export type ProcessEmailOutboxInjectedOptions = ProcessEmailOutboxHarness & {
  * unrecoverable. The mirror shape, `{ client: testDouble }`, is the other half: a test's rows
  * handed to the REAL mailer.
  *
- * There is no legitimate third shape, so the type refuses to spell one. NOT a runtime guard: a
- * runtime check still lets someone WRITE the call and only complains once it has been reached,
- * and the reaching is the damage. See tests/email-outbox-injection-shape.test.ts.
+ * There is no legitimate third shape, so the type refuses to spell one — AND SO DOES THE
+ * FUNCTION. Round 3 argued a type was enough and a runtime check was not worth having, because
+ * "a runtime check only complains once the call has been reached, and the reaching is the
+ * damage". That is an argument for having the type; it is not an argument against also having the
+ * check. A type-only negative protects nothing from `as ProcessEmailOutboxOptions`, from `any`,
+ * or from a JavaScript caller — and `assertBothOrNeitherInjected` below runs BEFORE the first
+ * query, so a half-injection that got past tsc throws before it can select a single real row.
+ * See tests/email-outbox-injection-shape.test.ts for both halves.
  */
 export type ProcessEmailOutboxOptions =
   | ProcessEmailOutboxAmbientOptions
@@ -279,9 +306,40 @@ async function settleClaimedEmail(
   return settled.count > 0
 }
 
+/**
+ * REFUSE A HALF-INJECTED DRAIN BEFORE THE FIRST QUERY (o3d-alnk r4, Codex HIGH).
+ *
+ * `ProcessEmailOutboxOptions` makes the two half-injections fail to compile. That covers every
+ * caller tsc actually checks — and none of the ones it does not: `as ProcessEmailOutboxOptions`,
+ * `any`, an options object widened through a helper, a JavaScript caller. For those, the type is
+ * documentation. This is the enforcement, and its placement is the whole point: it runs BEFORE
+ * `findMany`, so `{ sendEmail: fake } as ProcessEmailOutboxOptions` throws instead of selecting
+ * twenty-five real queued customer emails and stamping them SENT through a sender that delivers
+ * nothing.
+ *
+ * BOTH OR NEITHER, not "a client implies a sender". `{ client: double }` is the mirror hazard —
+ * a test's rows handed to the REAL mailer — and it is the one that actually puts mail on the
+ * wire, so it is refused by the same test rather than by a second one that could drift.
+ */
+export function assertBothOrNeitherInjected(options: ProcessEmailOutboxOptions): void {
+  const given = options as Partial<ProcessEmailOutboxInjectedOptions>
+  const hasClient = given.client !== undefined
+  const hasSender = given.sendEmail !== undefined
+  if (hasClient === hasSender) return
+  throw new Error(
+    'processPendingEmailOutbox: `client` and `sendEmail` must be injected TOGETHER or not at all; '
+    + `received ${hasClient ? 'a client with no sendEmail' : 'a sendEmail with no client'}. `
+    + 'This drain is a SWEEP over the globally oldest eligible rows, so a fake sender with the '
+    + 'global client stamps real customer email SENT with nothing delivered, and a test client '
+    + 'with the real mailer puts a fixture on the wire. Refused before any row was read (o3d-alnk).',
+  )
+}
+
 export async function processPendingEmailOutbox(
   options: ProcessEmailOutboxOptions = {},
 ): Promise<ProcessEmailOutboxResult> {
+  assertBothOrNeitherInjected(options)
+
   const client = options.client ?? (db as unknown as EmailOutboxClient)
   const send = options.sendEmail ?? sendEmail
   const prepare = options.prepareQueuedEmail ?? prepareQueuedEmail
