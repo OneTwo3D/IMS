@@ -43,7 +43,6 @@ import {
   type RefundParkAllocationTarget,
   type RefundSyncParkRow,
 } from '@/app/actions/sync-exceptions'
-import { stalledOutboxParkGuidanceDetail } from './stalled-park-guidance'
 
 type Props = {
   data: ExceptionInboxData
@@ -328,70 +327,6 @@ export function ExceptionsClient({ data }: Props) {
                       <RotateCcw className="h-3 w-3 mr-1" />Replay
                     </Button>
                   </TableCell>
-                </TableRow>
-              ))}
-            </TableBody>
-          </Table>
-        </Card>
-      ) : null}
-
-      {/*
-        A LIST AND NOTHING ELSE (o3d-8td2 round 6; the withdrawn action is o3d-7qdb).
-
-        This section had a one-click "Stop" through rounds 3, 4 and 5, and each version drew a Codex
-        HIGH. The last one is the reason there is no button here now: dead-lettering a park is not
-        inert, because both connectors' ORDINARY enqueue paths reset a PERMANENT_FAILED row to
-        PENDING — WooCommerce on the next stock change for that product, Xero on the next sweep, via
-        `ensureXeroOutboxForPendingSyncLogs`. A button labelled "Stop" would therefore have queued
-        the very replay the operation is declared `unsafe-to-replay` to prevent, without the operator
-        ever being asked to check the remote system.
-
-        Nothing about how long a lock has been held is evidence about whether its effect landed, so
-        the surface that rests on elapsed time is the surface that may only READ.
-
-        AND IT MAY NOT POINT AT THE WITHDRAWN ACT EITHER (round 7, Codex round 6 HIGH). Through
-        round 6 this section's own copy ended "...then use the admin outbox API to dead-letter or
-        replay the row deliberately" — the same act as the withdrawn button, minus the button. It
-        is not safer for being manual: `permanentlyFailIntegrationOutboxAdminRow` writes the outbox
-        row alone, Xero's work is owned by an `AccountingSyncLog` it does not touch, and
-        `ensureXeroOutboxForPendingSyncLogs` — the FIRST statement of every Xero sweep — rebuilds
-        and re-queues the row from that untouched log on the very next run. So the guidance is now
-        data rather than prose (./stalled-park-guidance.ts): the routes that can move a row live in
-        a prohibition slot proven exhaustive against `app/api/admin/outbox/[id]/`, the
-        recommendation slot is proven to name none of them, and what is recommended is a read of
-        the remote system and a correction made THERE, outside the queue. There is no safe
-        automated remedy to offer; o3d-7qdb is where one is being designed.
-      */}
-      {data.stalledOutboxParks.length > 0 ? (
-        <Card className="p-4 space-y-3">
-          <SectionHeading
-            title={`Integration outbox — stalled parks (${data.summary.stalledOutboxParks})`}
-            detail={stalledOutboxParkGuidanceDetail()}
-            shown={data.stalledOutboxParks.length}
-            total={data.summary.stalledOutboxParks}
-          />
-          <Table containerClassName="rounded-lg border" className="min-w-[900px]">
-            <TableHeader className="bg-muted/40">
-              <TableRow>
-                <TableHead>Connector / operation</TableHead>
-                <TableHead>Held for</TableHead>
-                <TableHead>Attempts</TableHead>
-                <TableHead>Held by</TableHead>
-                <TableHead>Locked</TableHead>
-                <TableHead>Row</TableHead>
-              </TableRow>
-            </TableHeader>
-            <TableBody>
-              {data.stalledOutboxParks.map((row) => (
-                <TableRow key={row.id}>
-                  <TableCell className="text-xs font-mono">{row.connector}/{row.operation}</TableCell>
-                  <TableCell className="text-xs">{formatHeldFor(row.heldForMs)}</TableCell>
-                  <TableCell className="text-xs">{row.attempts}</TableCell>
-                  <TableCell className="text-xs font-mono text-muted-foreground">{row.lockedBy ?? '—'}</TableCell>
-                  <TableCell className="text-xs text-muted-foreground">{row.lockedAt ? formatDateTime(row.lockedAt) : '—'}</TableCell>
-                  {/* The id, so the operator can act on this row through the admin API once they
-                      have checked the remote system. Deliberately not a control. */}
-                  <TableCell className="text-xs font-mono text-muted-foreground">{row.id}</TableCell>
                 </TableRow>
               ))}
             </TableBody>
@@ -1007,19 +942,6 @@ export function ExceptionsClient({ data }: Props) {
       {isPending ? <p className="text-xs text-muted-foreground flex items-center gap-1"><Loader2 className="h-3 w-3 animate-spin" />Working…</p> : null}
     </div>
   )
-}
-
-/**
- * How long the work behind a parked row has not been happening. Rendered coarsely on purpose: the
- * operator decision this drives is "is this hours or days", never "is this 71 or 73 minutes".
- */
-function formatHeldFor(heldForMs: number | null): string {
-  if (heldForMs === null) return '—'
-  const minutes = Math.floor(heldForMs / 60_000)
-  if (minutes < 60) return `${minutes}m`
-  const hours = Math.floor(minutes / 60)
-  if (hours < 48) return `${hours}h ${minutes % 60}m`
-  return `${Math.floor(hours / 24)}d ${hours % 24}h`
 }
 
 function SectionHeading({ title, detail, shown, total }: { title: string; detail: string; shown?: number; total?: number }) {

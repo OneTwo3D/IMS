@@ -124,11 +124,6 @@ mock.module('@/lib/domain/integrations/outbox-admin', {
     IntegrationOutboxAdminError: class extends Error {},
     listIntegrationOutboxAdminRows: async () => ({ rows: [], total: 0 }),
     replayIntegrationOutboxAdminRow: async () => ({ success: true }),
-    // o3d-8td2 r4: the scope is TOTAL over rows (the complement of what a worker may reclaim), so
-    // `null` is not one of its answers. This file is about refund-park allocation targets and stubs
-    // the outbox wholesale, so the stand-in is a predicate that matches nothing. r6: the park's
-    // operator action was withdrawn, so there is no mutating stub left to supply here.
-    stalledIntegrationOutboxParkWhere: () => ({ id: '__no-park-in-this-fixture__' }),
   },
 })
 mock.module('@/lib/activity-log', { namedExports: { logActivity: async () => {} } })

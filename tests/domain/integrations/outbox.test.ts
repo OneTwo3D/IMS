@@ -1,8 +1,7 @@
 import assert from 'node:assert/strict'
-import { readdirSync, readFileSync } from 'node:fs'
+import { readFileSync } from 'node:fs'
 import path from 'node:path'
 import test from 'node:test'
-import ts from 'typescript'
 
 import { Prisma } from '@/app/generated/prisma/client'
 import { StockSyncReason } from '@/app/generated/prisma/enums'
@@ -28,21 +27,12 @@ import {
   INTEGRATION_OUTBOX_REGISTRY,
   integrationOutboxReplayPolicy,
   integrationOutboxStaleReclaimScope,
-  integrationOutboxUnreclaimableScope,
-  isUnreclaimableOutboxOperation,
   parseIntegrationOutboxPayload,
   WcStockSyncOutboxPayloadSchema,
 } from '@/lib/domain/integrations/outbox-registry'
 import {
-  ADMIN_OUTBOX_ROW_MUTATION_ROUTES,
-  STALLED_OUTBOX_PARK_GUIDANCE,
-  stalledOutboxParkGuidanceDetail,
-} from '@/app/(dashboard)/sync/exceptions/stalled-park-guidance'
-import * as outboxAdminModule from '@/lib/domain/integrations/outbox-admin'
-import {
   ADMIN_OUTBOX_POST_LEASE_MARGIN_MS,
   ADMIN_OUTBOX_STALE_PROCESSING_LOCK_MS,
-  stalledIntegrationOutboxParkWhere,
 } from '@/lib/domain/integrations/outbox-admin'
 import {
   OUTBOX_REPLAY_SAFETY_VALUES,
@@ -1039,124 +1029,22 @@ test('the stale-reclaim scope fails closed on an operation this build does not k
 })
 
 // ---------------------------------------------------------------------------
-// THE PARK'S OWN OBLIGATION (Codex round 3, HIGH).
+// THE DEAD-LETTER GATE'S THRESHOLD IS DERIVED FROM THE LEASES IT OVERRIDES
+// (o3d-zdvn; Codex round 4, HIGH 1).
 //
-// Round 2 justified the WooCommerce park with two claims that were false: that the
-// daily reconcile shared the key and would drain it, and that the row was visible
-// anyway. It shares no key (`reconcile.ts` calls `pushStockToWc` directly) and the
-// exception inbox listed only PERMANENT_FAILED. What pays for the park now is that
-// the same declaration which creates it also generates the operator's list.
-// ---------------------------------------------------------------------------
-
-test('the park scope is the complement of the reclaim scope over ROWS, unregistered rows included', () => {
-  // ROUND 4, HIGH 2. Round 3 built this list by enumerating the registry entries declared
-  // `unsafe-to-replay`. That set is exhaustive within the REGISTRY and not across the rows that can
-  // exist, and `enqueueIntegrationOutbox` deliberately accepts an operation this build has never
-  // heard of — so an unregistered row could be claimed, crashed, refused a reclaim (the scope fails
-  // closed) AND excluded from the operator's list. Neither reclaimable nor visible is the black hole
-  // the whole round exists to close.
-  const reclaimable = integrationOutboxStaleReclaimScope(undefined, undefined) as {
-    OR: Array<{ connector: string; operation: { in: string[] } }>
-  } | null
-  assert.ok(reclaimable, 'this build declares reclaimable operations; without one the complement is trivially everything')
-
-  assert.deepEqual(
-    integrationOutboxUnreclaimableScope(),
-    { NOT: reclaimable },
-    'the park scope must be the NEGATION of the reclaim scope, not a second enumeration that can drift from it',
-  )
-
-  // NON-VACUITY of the negation: it excludes a real, non-empty set of pairs.
-  const reclaimablePairs = new Set(
-    reclaimable.OR.flatMap((arm) => arm.operation.in.map((operation) => `${arm.connector}/${operation}`)),
-  )
-  assert.ok(reclaimablePairs.size > 0, 'a NOT over an empty set would put every row on the operator, proving nothing')
-  assert.ok(reclaimablePairs.has('sales/refund.reservation-release'))
-
-  // THE PARTITION, stated over ROWS. Every registered pair, plus pairs no registry entry covers —
-  // which is precisely the population round 3's `policy !== null` dropped on the floor.
-  const registeredPairs = Object.entries(INTEGRATION_OUTBOX_REGISTRY)
-    .flatMap(([connector, operations]) => Object.keys(operations).map((operation) => [connector, operation] as const))
-  assert.ok(registeredPairs.length >= 5, `the registry must be walked, not assumed; found ${registeredPairs.length}`)
-
-  const unregisteredPairs = [
-    ['sales', 'legacy.unregistered'],
-    ['woocommerce', 'stock.push.v2'],
-    ['no-such-connector', 'stock.push'],
-    ['', ''],
-  ] as const
-
-  for (const [connector, operation] of [...registeredPairs, ...unregisteredPairs]) {
-    assert.equal(
-      isUnreclaimableOutboxOperation(connector, operation),
-      !reclaimablePairs.has(`${connector}/${operation}`),
-      `${connector}/${operation} must be on exactly one side: an operator's if no worker may take it`,
-    )
-  }
-
-  // ...and every unregistered pair really is unknown to this build, so the assertion above was about
-  // the fail-closed answer and not about some entry that happens to exist.
-  for (const [connector, operation] of unregisteredPairs) {
-    assert.equal(integrationOutboxReplayPolicy(connector, operation), null,
-      `${connector}/${operation} must be unregistered, or this case is testing a registered operation`)
-    assert.equal(integrationOutboxStaleReclaimScope(connector || 'x', operation || 'y'), null,
-      'the reclaim scope already fails an unknown operation closed')
-    assert.equal(isUnreclaimableOutboxOperation(connector, operation), true,
-      'so the operator list must cover it — this is round 4 HIGH 2')
-  }
-
-  // The three declared parks are still parks, and still nobody's to reclaim.
-  for (const [connector, operation] of [
-    ['woocommerce', 'stock.push'],
-    ['xero', 'accounting.post'],
-    ['mintsoft', 'inbound.booked-in'],
-  ] as const) {
-    assert.equal(integrationOutboxReplayPolicy(connector, operation), 'unsafe-to-replay')
-    assert.equal(isUnreclaimableOutboxOperation(connector, operation), true)
-    assert.equal(integrationOutboxStaleReclaimScope(connector, operation), null)
-  }
-  assert.equal(isUnreclaimableOutboxOperation('sales', 'refund.reservation-release'), false,
-    'a self-healing operation must not be shown as an operator exception')
-})
-
-test('the stalled-park filter asks for a stale lock on an unreclaimable row, and nothing else', () => {
-  const now = new Date('2026-04-27T10:00:00.000Z')
-  const where = stalledIntegrationOutboxParkWhere({ now, staleProcessingLockMs: RECLAIM_STALE_MS }) as {
-    NOT: unknown
-    status: string
-    lockedAt: { not: null; lte: Date }
-  }
-  assert.equal(where.status, INTEGRATION_OUTBOX_STATUS.PROCESSING,
-    'a failed row is the OTHER section; this one is about work that never failed at all')
-  assert.deepEqual(where.lockedAt.lte, new Date(now.getTime() - RECLAIM_STALE_MS))
-  assert.deepEqual(where.NOT, integrationOutboxStaleReclaimScope(undefined, undefined),
-    'the scope half of the filter is the complement of the reclaim scope')
-
-  // ...AND NOTHING ELSE, said as an assertion rather than in the test's name. `matchesStalledParkWhere`
-  // below interprets exactly these three keys, so a predicate that grew a fourth would be applied by
-  // that matcher with the new clause silently ignored — the listing tests would then be asserting
-  // about a filter the application does not use. This is what stops that.
-  assert.deepEqual(Object.keys(where).sort(), ['NOT', 'lockedAt', 'status'],
-    'the park predicate has exactly three clauses; a new one must be taught to the row matcher too')
-
-  // The threshold the shipped predicate actually uses, and it is the derived one: a row is listed
-  // only once its lock is past EVERY declared lease plus the margin.
-  const shipped = stalledIntegrationOutboxParkWhere({ now }) as { lockedAt: { lte: Date } }
-  assert.deepEqual(shipped.lockedAt.lte, new Date(now.getTime() - ADMIN_OUTBOX_STALE_PROCESSING_LOCK_MS))
-})
-
-// ---------------------------------------------------------------------------
-// THE THRESHOLD IS DERIVED FROM THE LEASES IT OVERRIDES (Codex round 4, HIGH 1).
-//
-// Round 3 wrote the operator threshold as its own `10 * 60 * 1000`. It read as
-// agreement with the outbox default lease and silently DISAGREED with the only
+// `development` writes this threshold as its own `10 * 60 * 1000`. It reads as
+// agreement with the outbox default lease and silently DISAGREES with the only
 // lease that differs — `xero/accounting.post` is drained under fifteen minutes —
-// so a Xero row twelve minutes into a live lease was listed as a stalled park.
-// Round 6 withdrew the action that sat on that list; the derivation stays,
-// because a LIST that calls a working job an exception is its own defect.
+// so between minute 10 and minute 15 `permanentlyFailIntegrationOutboxAdminRow`
+// would let an admin bury a Xero claim whose worker was still inside its lease.
+//
+// ROUND 8 WITHDREW THE STALLED-PARK LISTING that also read this constant
+// (o3d-7qdb). The derivation stays because the DEAD-LETTER GATE is a
+// pre-existing mutation with a pre-existing defect, and that defect is this
+// one: the gate must not fire inside a lease it does not know about.
 // ---------------------------------------------------------------------------
 
-test('the listing staleness threshold exceeds every declared drain lease, computed rather than restated', () => {
+test('the dead-letter gate\'s staleness threshold exceeds every declared drain lease, computed rather than restated', () => {
   const leases = Object.entries(INTEGRATION_OUTBOX_DRAIN_LEASES_MS)
   assert.ok(leases.length >= 2, `the lease map must enumerate more than one lease; found ${leases.length}`)
   // NON-VACUITY: the leases genuinely differ, so "greater than every lease" is a real constraint and
@@ -1166,8 +1054,8 @@ test('the listing staleness threshold exceeds every declared drain lease, comput
 
   for (const [name, ms] of leases) {
     assert.ok(ADMIN_OUTBOX_STALE_PROCESSING_LOCK_MS > ms,
-      `the admin threshold (${ADMIN_OUTBOX_STALE_PROCESSING_LOCK_MS}ms) must exceed the ${name} lease (${ms}ms), `
-      + 'or it declares a row stale while its holder is still inside its lease')
+      `the dead-letter gate (${ADMIN_OUTBOX_STALE_PROCESSING_LOCK_MS}ms) must exceed the ${name} lease (${ms}ms), `
+      + 'or an admin can dead-letter a row while its holder is still inside its lease')
   }
   assert.equal(
     ADMIN_OUTBOX_STALE_PROCESSING_LOCK_MS,
@@ -1175,9 +1063,9 @@ test('the listing staleness threshold exceeds every declared drain lease, comput
     'derived from the maximum over the map, so a longer lease raises it in the same edit',
   )
 
-  // AND THE DEFECT ITSELF, named: round 3's ten minutes was SHORTER than a lease it could override.
+  // AND THE DEFECT ITSELF, named: `development`'s ten minutes is SHORTER than a lease it overrides.
   assert.ok(10 * 60 * 1000 < INTEGRATION_OUTBOX_DRAIN_LEASES_MS.xeroAccountingEntry,
-    'round 3 restated ten minutes; the Xero lease is fifteen — that gap is the finding')
+    'development restates ten minutes; the Xero lease is fifteen — that gap is o3d-zdvn')
 })
 
 /**
@@ -1257,373 +1145,6 @@ test('the declared lease map is the set the threshold is a maximum over, and it 
   for (const value of values) {
     assert.ok(Number.isFinite(value) && value > 0, `${value} is not a usable lease`)
   }
-})
-
-// ---------------------------------------------------------------------------
-// THE PARK IS LISTED, AND LISTING IS ALL THAT HAPPENS (o3d-8td2 round 6).
-//
-// Rounds 3, 4 and 5 each shipped an operator ACTION on this list and each drew a
-// Codex HIGH. The last one is why there is no action left to test: round 4's
-// defence was that dead-lettering "produces no effect at all", and round 5 showed
-// PERMANENT_FAILED is not inert — both connectors' ordinary enqueue paths reset it
-// to PENDING (stock-sync-jobs.ts and xero/outbox.ts, the latter from
-// ensureXeroOutboxForPendingSyncLogs on every sweep). The withdrawn work and the
-// constraint on any future attempt are recorded in o3d-7qdb.
-//
-// What survives is a read, and these tests are about the read.
-// ---------------------------------------------------------------------------
-
-function parkedRow(overrides: Partial<IntegrationOutboxRow> = {}): IntegrationOutboxRow {
-  return {
-    id: 'parked',
-    connector: 'woocommerce',
-    operation: 'stock.push',
-    idempotencyKey: 'woocommerce:stock.push:product-1',
-    payloadJson: { productId: 'product-1', reason: StockSyncReason.MANUAL, force: false, webhookQty: null },
-    status: INTEGRATION_OUTBOX_STATUS.PROCESSING,
-    attempts: 1,
-    nextAttemptAt: null,
-    lastError: null,
-    lockedAt: new Date('2026-04-27T09:00:00.000Z'),
-    lockedBy: 'wc-stock-sync',
-    createdAt: new Date('2026-04-27T08:00:00.000Z'),
-    updatedAt: new Date('2026-04-27T09:00:00.000Z'),
-    ...overrides,
-  } as IntegrationOutboxRow
-}
-
-/**
- * The predicate applied to a row, written out here rather than run through `makeClient`.
- *
- * THAT IS DELIBERATE AND IT IS THE ONLY HONEST OPTION. `makeClient`'s `matchesWhere` implements
- * neither `NOT` nor `lockedAt: { lte }` — it would IGNORE both, so every row would "match" and a
- * listing test built on it would pass whatever the predicate said. A double that silently drops the
- * two clauses under test cannot be the thing that tests them. This matcher handles exactly the three
- * keys `stalledIntegrationOutboxParkWhere` produces, and the tests below assert it REJECTS rows as
- * well as accepting them, so it is not a function that says yes to everything either.
- */
-function matchesStalledParkWhere(where: Record<string, unknown>, row: IntegrationOutboxRow): boolean {
-  // FAIL RATHER THAN IGNORE. A matcher that skips the clauses it does not recognise answers about a
-  // filter nobody ships: swap the predicate's `NOT` for a positive enumeration — which is exactly the
-  // round-3 shape that made unregistered rows invisible — and a permissive matcher would go on
-  // saying "listed" for every row. Anything unexpected is a test error, not a match.
-  for (const key of Object.keys(where)) {
-    if (!['status', 'lockedAt', 'NOT'].includes(key)) {
-      throw new Error(`the park predicate grew a '${key}' clause this matcher does not implement`)
-    }
-  }
-  const { status, lockedAt, NOT } = where as {
-    status: string
-    lockedAt: { not: null; lte: Date }
-    NOT?: { OR: Array<{ connector: string; operation: { in: string[] } }> }
-  }
-  if (row.status !== status) return false
-  if (row.lockedAt === null) return false
-  if (row.lockedAt > lockedAt.lte) return false
-  if (NOT) {
-    const reclaimable = NOT.OR.some((arm) => arm.connector === row.connector && arm.operation.in.includes(row.operation))
-    if (reclaimable) return false
-  }
-  return true
-}
-
-test('the listing surfaces a stalled park for a REGISTERED and an UNREGISTERED operation alike', () => {
-  // PROOF 1 for the round-6 split: what round 2's HIGH required — the park is no longer invisible —
-  // is a property of the list, and the list is what shipped.
-  const now = new Date('2026-04-27T10:00:00.000Z')
-  const where = stalledIntegrationOutboxParkWhere({ now })
-
-  const registered = parkedRow()
-  assert.equal(integrationOutboxReplayPolicy('woocommerce', 'stock.push'), 'unsafe-to-replay',
-    'the premise: this operation declared itself a park')
-  assert.ok(matchesStalledParkWhere(where, registered),
-    'a declared park stalled an hour past its lease must be shown to an operator')
-
-  const unregistered = parkedRow({
-    id: 'unregistered',
-    connector: 'legacy-connector',
-    operation: 'legacy.unregistered',
-    idempotencyKey: 'legacy-connector:legacy.unregistered:1',
-    lockedBy: 'a-worker-that-crashed',
-  })
-  // ROUND 4, HIGH 2, and it is the case the list exists for: `enqueueIntegrationOutbox` accepts an
-  // operation this build has never heard of, no worker may reclaim it (the scope fails closed), and
-  // round 3 also excluded it from the list — neither recoverable nor visible.
-  assert.equal(integrationOutboxReplayPolicy('legacy-connector', 'legacy.unregistered'), null)
-  assert.equal(integrationOutboxStaleReclaimScope('legacy-connector', 'legacy.unregistered'), null)
-  assert.ok(matchesStalledParkWhere(where, unregistered),
-    'a row on an operation nothing knows about is the operator\'s, or it is nobody\'s')
-})
-
-test('the listing refuses a live lease and refuses a row a drain will pick up by itself', () => {
-  // NON-VACUITY for the test above: the matcher says no to things, and it says no for the two
-  // reasons the predicate has.
-  const now = new Date('2026-04-27T10:00:00.000Z')
-  const where = stalledIntegrationOutboxParkWhere({ now })
-
-  // (1) INSIDE A LEASE. The exact row round 3's restated ten minutes got wrong: a Xero job twelve
-  // minutes into a lease its own worker measures at fifteen. It is a job, not an exception.
-  const midLease = parkedRow({
-    id: 'xero-mid-lease',
-    connector: 'xero',
-    operation: 'accounting.post',
-    idempotencyKey: 'xero:accounting.post:log-1',
-    payloadJson: { accountingSyncLogId: 'log-1' },
-    lockedAt: new Date(now.getTime() - 12 * 60 * 1000),
-    lockedBy: 'xero-accounting-sync',
-  })
-  assert.ok(12 * 60 * 1000 < INTEGRATION_OUTBOX_DRAIN_LEASES_MS.xeroAccountingEntry,
-    'the premise: this lock is inside a lease that really exists')
-  assert.equal(isUnreclaimableOutboxOperation('xero', 'accounting.post'), true,
-    'and the only thing keeping it off the list is the clock, not the declaration')
-  assert.equal(matchesStalledParkWhere(where, midLease), false)
-
-  // ...and the same row, once past every lease, IS listed — so (1) failed on the lease and not on
-  // some other clause.
-  assert.ok(matchesStalledParkWhere(where, parkedRow({
-    ...midLease,
-    lockedAt: new Date(now.getTime() - (INTEGRATION_OUTBOX_MAX_LEASE_MS + ADMIN_OUTBOX_POST_LEASE_MARGIN_MS + 1)),
-  })))
-
-  // (2) SELF-HEALING. A stale lock on a reclaimable operation is taken by the next drain sweep with
-  // nobody asked, so listing it is noise.
-  const reclaimable = parkedRow({
-    id: 'reclaimable',
-    connector: 'sales',
-    operation: 'refund.reservation-release',
-    idempotencyKey: 'sales:refund.reservation-release:order-1',
-    payloadJson: { orderId: 'order-1', refundId: 'refund-1' },
-    lockedAt: new Date('2026-04-27T08:30:00.000Z'),
-  })
-  assert.equal(isUnreclaimableOutboxOperation('sales', 'refund.reservation-release'), false,
-    'the premise: a worker WILL come back for this one')
-  assert.equal(matchesStalledParkWhere(where, reclaimable), false)
-})
-
-/**
- * The JSX a conditional branch renders, read from the PARSER rather than from the source text
- * (o3d-8td2 r7, Codex r6 MEDIUM).
- *
- * Returns the set of element names, the set of attribute names, the count of spread attributes, and
- * each attribute's initializer as written. Reading these from the AST rather than by regex is the
- * whole point: `<form action={...}>`, `<Foo onSubmit={...}>` and `<Bar {...handlers}>` are all
- * invisible to a token blacklist and all visible here, because the question stops being "does this
- * text contain a banned string" and becomes "what does this JSX actually render".
- */
-function readJsxBranch(sourceFile: ts.SourceFile, conditionText: string): {
-  tags: string[]
-  attributes: string[]
-  spreads: number
-  attributeInitializers: Record<string, string>
-} | null {
-  let branch: ts.Node | null = null
-  const findBranch = (node: ts.Node): void => {
-    if (branch) return
-    if (
-      ts.isConditionalExpression(node)
-      && node.condition.getText(sourceFile).replace(/\s+/g, ' ').trim() === conditionText
-    ) {
-      branch = node.whenTrue
-      return
-    }
-    ts.forEachChild(node, findBranch)
-  }
-  findBranch(sourceFile)
-  if (!branch) return null
-
-  const tags = new Set<string>()
-  const attributes = new Set<string>()
-  const attributeInitializers: Record<string, string> = {}
-  let spreads = 0
-
-  const walk = (node: ts.Node): void => {
-    if (ts.isJsxOpeningElement(node) || ts.isJsxSelfClosingElement(node)) {
-      tags.add(node.tagName.getText(sourceFile))
-      for (const property of node.attributes.properties) {
-        if (ts.isJsxSpreadAttribute(property)) {
-          spreads += 1
-          continue
-        }
-        const name = property.name.getText(sourceFile)
-        attributes.add(name)
-        const initializer = property.initializer
-        if (initializer && ts.isJsxExpression(initializer) && initializer.expression) {
-          attributeInitializers[name] = initializer.expression.getText(sourceFile)
-        } else if (initializer && ts.isStringLiteral(initializer)) {
-          attributeInitializers[name] = initializer.text
-        }
-      }
-    }
-    ts.forEachChild(node, walk)
-  }
-  walk(branch)
-
-  return { tags: [...tags].sort(), attributes: [...attributes].sort(), spreads, attributeInitializers }
-}
-
-test('the admin outbox module has exactly the exports it was reviewed with, and no other', () => {
-  // PROOF 2 FOR THE ROUND-6 SPLIT, REWRITTEN IN ROUND 7 (Codex round 6 MEDIUM).
-  //
-  // Round 6 asked this question by NAME: it looped over the exports and demanded that any whose name
-  // matched /park/i be the listing predicate. Codex's objection is exact and is the same one that got
-  // the census withdrawn from o3d-n3yt — a mutator called `resolveStalledOutbox` has no "park" in it
-  // and sails through, and the module's own `permanentlyFailIntegrationOutboxAdminRow` is the standing
-  // proof that a park-free name can still move a parked row. Semantics are not recoverable from a
-  // name, so this no longer tries: the assertion is CLOSED-WORLD SET EQUALITY over the module's
-  // actual runtime export surface. Whatever a new export is called, it is not in this list, so it
-  // fails here and has to be looked at by a human who must then answer the question below.
-  //
-  // THE QUESTION A FAILURE HERE ASKS: does the thing you are adding WRITE to a row that
-  // `stalledIntegrationOutboxParkWhere` would list? If it does, it belongs to o3d-7qdb and not to
-  // this module, because no status such a row can be moved to is inert (see the header of
-  // outbox-admin.ts). If it does not, add it to the list with that reasoning in the commit.
-  const exported = Object.keys(outboxAdminModule).sort()
-
-  const REVIEWED_EXPORTS = [
-    'ADMIN_OUTBOX_MAX_LIMIT',
-    'ADMIN_OUTBOX_POST_LEASE_MARGIN_MS',
-    'ADMIN_OUTBOX_STALE_PROCESSING_LOCK_MS',
-    'IntegrationOutboxAdminError',
-    'isSensitiveIntegrationOutboxPayloadKey',
-    'listIntegrationOutboxAdminRows',
-    // The two pre-existing row mutations. They are NOT park-scoped and they stay: they predate this
-    // branch, carry their own semantics, and the exception inbox no longer points an operator at
-    // either of them (see the guidance test below).
-    'permanentlyFailIntegrationOutboxAdminRow',
-    'replayIntegrationOutboxAdminRow',
-    'redactIntegrationOutboxPayload',
-    'stalledIntegrationOutboxParkWhere',
-    'toAdminIntegrationOutboxRow',
-  ].sort()
-
-  // NON-VACUITY: a namespace that failed to load, or loaded as a stub, would make an "is absent"
-  // assertion trivially true. Equality cannot be satisfied that way — an empty namespace fails —
-  // but the explicit floor states the intent for a future reader.
-  assert.ok(exported.length >= 10, 'the enumeration is not reading the real module')
-
-  assert.deepEqual(
-    exported,
-    REVIEWED_EXPORTS,
-    'the admin outbox export surface changed. This test is a closed world on purpose: it does not '
-    + 'ask what the new export is CALLED, because a name cannot carry the property that matters. If '
-    + 'the addition can write to a row stalledIntegrationOutboxParkWhere would list, it is the '
-    + 'withdrawn recovery (o3d-7qdb) arriving under a new name and it does not belong here.',
-  )
-})
-
-test('the withdrawn park recovery is prohibited by the guidance, and nothing is recommended in its place', () => {
-  // PROOF 1 FOR ROUND 7 (Codex round 6 HIGH). Round 6 removed the button and then told the operator,
-  // in the section's own copy, to go and do the same thing through the admin API. The defect was in
-  // the TEXT, so the first instinct is to test the text — and that test cannot be written soundly:
-  // honest copy has to NAME the dangerous routes in order to warn about them, so banning the
-  // substring is satisfied by deleting the warning, and "banned unless a negation is nearby" passes
-  // on a stale sentence sitting next to the one that corrects it.
-  //
-  // So the guidance is data, and the question is asked of its GRAMMAR: one slot for what must not be
-  // used, one for what to do, and the check is which slot a route appears in.
-  const guidance = STALLED_OUTBOX_PARK_GUIDANCE
-
-  // (a) THE PROHIBITION IS EXHAUSTIVE OVER WHAT ACTUALLY EXISTS. Not over a remembered list: the
-  // routes are enumerated from disk, so a third mutating admin route added tomorrow fails here until
-  // it is either named as prohibited or shown not to be a row mutation.
-  const repoRoot = path.resolve(__dirname, '..', '..', '..')
-  const routeParent = path.join(repoRoot, 'app/api/admin/outbox/[id]')
-  const routeDirs = readdirSync(routeParent, { withFileTypes: true })
-    .filter((entry) => entry.isDirectory())
-    .map((entry) => entry.name)
-    .sort()
-  assert.ok(routeDirs.length >= 2, 'the route enumeration found nothing, so this proof is scanning an empty directory')
-  for (const dir of routeDirs) {
-    const route = readFileSync(path.join(routeParent, dir, 'route.ts'), 'utf8')
-    assert.ok(/export\s+(?:async\s+)?(?:function|const|let|var)\s+POST\b/.test(route), `${dir} was counted as a POST route but does not export one`)
-  }
-  assert.deepEqual(
-    [...ADMIN_OUTBOX_ROW_MUTATION_ROUTES].sort(),
-    routeDirs.map((dir) => `POST /api/admin/outbox/[id]/${dir}`).sort(),
-    'the prohibition list and the admin API disagree about which routes can move an outbox row',
-  )
-  assert.deepEqual(
-    [...guidance.neverUseOnAListedPark].sort(),
-    [...ADMIN_OUTBOX_ROW_MUTATION_ROUTES].sort(),
-    'every route that can move a row must be named in the prohibition slot',
-  )
-
-  // (b) THE RECOMMENDATION SLOT NAMES NONE OF THEM. This is the mutation that matters: move
-  // 'POST /api/admin/outbox/[id]/permanent-fail' from neverUseOnAListedPark into doInstead — which is
-  // exactly what round 6's prose did — and this fails.
-  for (const step of guidance.doInstead) {
-    const lowered = step.toLowerCase()
-    for (const token of ['/api/admin/outbox', 'permanent-fail', 'permanently fail', 'dead-letter', 'replay']) {
-      assert.ok(
-        !lowered.includes(token),
-        `the guidance recommends "${step}", which names ${token}. Every action this API offers on a `
-        + 'listed park can duplicate the remote effect: dead-lettering does not stop the row, because '
-        + 'the next Xero sweep rebuilds it from the untouched sync log and WooCommerce re-queues it on '
-        + 'the next stock change. There is no safe automated remedy to recommend (o3d-7qdb).',
-      )
-    }
-  }
-  assert.ok(guidance.doInstead.length >= 2, 'the operator is told nothing at all, which is not the intent')
-  assert.equal(guidance.trackedBy, 'o3d-7qdb')
-
-  // (c) THE STRUCTURE IS WHAT THE OPERATOR ACTUALLY READS. Without this the fields could be perfect
-  // and the rendered paragraph could say anything.
-  const detail = stalledOutboxParkGuidanceDetail()
-  for (const route of guidance.neverUseOnAListedPark) {
-    assert.ok(detail.includes(route), `the rendered guidance omits the prohibition on ${route}`)
-  }
-  for (const step of guidance.doInstead) {
-    assert.ok(detail.includes(step), 'the rendered guidance omits a step from the recommendation slot')
-  }
-  assert.ok(detail.includes(guidance.trackedBy), 'the rendered guidance does not say where the missing remedy is tracked')
-})
-
-test('the stalled-park section renders only inert elements, and renders the guidance it was proven against', () => {
-  // THE OTHER HALF OF ROUND 6'S MEDIUM. That version banned three tokens — `<Button`, `onClick=` and
-  // `runAction(` — from a slice of source text, which is an OPEN world: Codex's `<form action={...}>`
-  // contains none of them, and neither does <AnythingElse onSubmit={...}>. A blacklist over a surface
-  // that can grow new members is not a proof.
-  //
-  // So this parses the file and closes the world twice over. Every JSX element the section renders
-  // must be one of a fixed set of presentational components, and every JSX attribute it passes must
-  // be one of a fixed set of inert props. A <form action={...}> fails BOTH: `form` is not an allowed
-  // element and `action` is not an allowed attribute. A spread is refused outright, since {...props}
-  // can carry a handler past any attribute list.
-  const repoRoot = path.resolve(__dirname, '..', '..', '..')
-  const filePath = path.join(repoRoot, 'app/(dashboard)/sync/exceptions/exceptions-client.tsx')
-  const sourceFile = ts.createSourceFile(filePath, readFileSync(filePath, 'utf8'), ts.ScriptTarget.Latest, true, ts.ScriptKind.TSX)
-
-  const park = readJsxBranch(sourceFile, 'data.stalledOutboxParks.length > 0')
-  assert.ok(park, 'the stalled-park branch was not found, so this test is scanning nothing')
-
-  // CALIBRATION — the collector can see a control when one is there. The sibling section three
-  // hundred lines up has a real Replay button, and the SAME code finds it. Without this the
-  // assertions below would pass just as happily on a walker that returned empty sets.
-  const failures = readJsxBranch(sourceFile, 'data.outboxFailures.length > 0')
-  assert.ok(failures, 'the calibration branch was not found')
-  assert.ok(failures.tags.includes('Button'), 'the walker cannot see a Button, so its silence proves nothing')
-  assert.ok(failures.attributes.includes('onClick'), 'the walker cannot see an onClick, so its silence proves nothing')
-
-  assert.deepEqual(park.tags, [
-    'Card', 'SectionHeading', 'Table', 'TableBody', 'TableCell', 'TableHead', 'TableHeader', 'TableRow',
-  ], 'the stalled-park section renders an element it was not reviewed with. It is a read and only a '
-    + 'read: no element that can invoke anything may appear here (o3d-7qdb).')
-
-  assert.deepEqual(park.attributes, [
-    'className', 'containerClassName', 'detail', 'key', 'shown', 'title', 'total',
-  ], 'the stalled-park section passes a prop it was not reviewed with. Anything that can carry a '
-    + 'callback — onClick, onSubmit, action, formAction — is a write on a row nothing may write to.')
-
-  assert.equal(park.spreads, 0, 'a JSX spread in this section could carry a handler past the attribute list')
-
-  // AND THE SECTION RENDERS THE GUIDANCE THAT WAS PROVEN, not a literal that could say anything. The
-  // test above establishes what the structured guidance says; this is what connects it to the page.
-  assert.equal(
-    park.attributeInitializers.detail,
-    'stalledOutboxParkGuidanceDetail()',
-    'the stalled-park heading must render the structured guidance, whose prohibition and '
-    + 'recommendation slots are asserted separately, rather than prose no test can reason about',
-  )
 })
 
 test('a stale PROCESSING lock is reclaimed per operation, not on elapsed time alone', async () => {
@@ -1918,7 +1439,6 @@ test('mintsoft/inbound.booked-in is declared an effect sequence, and cannot be r
   assert.equal(integrationOutboxReplayPolicy('mintsoft', 'inbound.booked-in'), 'unsafe-to-replay')
   assert.equal(integrationOutboxStaleReclaimScope('mintsoft', 'inbound.booked-in'), null)
   assert.equal(integrationOutboxStaleReclaimScope('mintsoft', undefined), null)
-  assert.equal(isUnreclaimableOutboxOperation('mintsoft', 'inbound.booked-in'), true)
 
   // The fold holds at runtime too: even written back to a safe verdict by hand, past the type, an
   // effect-sequence entry resolves unsafe.

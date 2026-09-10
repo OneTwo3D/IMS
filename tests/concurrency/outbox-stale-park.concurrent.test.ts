@@ -41,12 +41,18 @@ import { INTEGRATION_OUTBOX_DRAIN_LEASES_MS } from '@/lib/domain/integrations/ou
  * ROUND 4 ADDED the row on an operation this build has never heard of, which round 3 had made
  * unreclaimable AND invisible.
  *
- * ROUND 6 REMOVED THE REMEDY AND KEPT THE FINDING. Rounds 3, 4 and 5 each shipped a one-click
- * operator recovery on this list, and each drew a Codex HIGH; the last one is recorded here as a
- * test of its own (`PERMANENT_FAILED is not inert`), driven entirely through shipped paths, because
- * it is the general fact the whole remedy foundered on: no status in this system is inert, so a
- * recovery cannot be made safe by choosing a quieter one to park a row in. What is tested now is the
- * LIST — which rows it shows, which it refuses, and that it is a read. o3d-7qdb carries the rest.
+ * ROUND 8 WITHDREW THE OPERATOR SURFACE ENTIRELY AND KEPT THE FINDINGS. Rounds 3-5 each shipped a
+ * one-click recovery on a derived list of these parks and each drew a Codex HIGH; round 6 removed
+ * the button, round 7 removed the copy pointing at the same act by hand, and round 7's review then
+ * found the GUARDS around what was left incomplete in their own turn. Five HIGHs in four rounds, so
+ * the list, its guidance and its guards are gone (o3d-7qdb).
+ *
+ * What is still tested here is the part that does not depend on any surface: that no second worker
+ * is handed the row, that the refusal comes from the declaration rather than from the clock, that a
+ * park really does swallow later stock changes, and — as a test of its own, driven entirely through
+ * shipped paths — that `PERMANENT_FAILED is not inert`. That last one is the general fact the whole
+ * remedy foundered on, and it is exactly what a future attempt must fail against first: no status in
+ * this system is inert, so a recovery cannot be made safe by choosing a quieter one to park a row in.
  *
  * Gated behind RUN_DB_CONCURRENCY_TESTS=1: `npm run test:concurrency`.
  */
@@ -358,7 +364,7 @@ test(
 )
 
 test(
-  '[o3d-8td2 r3] the park swallows later stock changes, is visible to an operator, and holds the LATEST payload',
+  '[o3d-8td2 r3/r8] the park swallows later stock changes and holds the LATEST payload, seen by nobody',
   { skip: !RUN && 'set RUN_DB_CONCURRENCY_TESTS=1' },
   async (t) => {
     const deps = await loadDeps()
@@ -388,89 +394,12 @@ test(
       'the later change was absorbed into the parked row',
     )
 
-    // (2) VISIBLE. The exception inbox's predicate — derived from the replay declarations, not
-    // written beside them — now returns this row. Before this round it returned only
-    // PERMANENT_FAILED, so this row appeared on no operator surface at all.
-    const where = deps.stalledIntegrationOutboxParkWhere()
-    assert.ok(where, 'this build declares unsafe-to-replay operations, so the scope must exist')
-    const listed = await deps.db.integrationOutbox.findMany({ where: where as never, select: { id: true } })
-    assert.ok(listed.some((row) => row.id === folded.id), 'the stalled park must be listed for an operator')
-
-    // (3) AND THE BACKLOG IS WHAT MAKES IT WORTH SHOWING. The folded payload carries the LATEST
-    // quantity, so an operator who checks WooCommerce and then acts deliberately settles the whole
-    // backlog in one push. Round 6 withdrew the one-click action that used to sit here; the reason
-    // is o3d-7qdb, and the demonstration is the `[r6] PERMANENT_FAILED is not inert` test below.
-    assert.deepEqual(
-      folded.payloadJson,
-      { productId, reason: 'WC_WEBHOOK', force: false, webhookQty: 3 },
-      'the park must hold the changes that piled up behind it, not discard them',
-    )
-
-    // (4) NON-VACUITY of (2): the listing is answering about THIS row's lock, not saying yes to
-    // every PROCESSING row. Put the lock back inside every lease and the row leaves the list.
-    await deps.db.integrationOutbox.update({
-      where: { id: folded.id },
-      data: { lockedAt: new Date(Date.now() - 60 * 1000) },
-    })
-    const stillListed = await deps.db.integrationOutbox.findMany({ where: where as never, select: { id: true } })
-    assert.ok(!stillListed.some((row) => row.id === folded.id),
-      'a row inside its lease is a job, not an exception')
-  },
-)
-
-test(
-  '[o3d-8td2 r3/r6] a park whose worker is still alive is not listed, and one past every lease is',
-  { skip: !RUN && 'set RUN_DB_CONCURRENCY_TESTS=1' },
-  async (t) => {
-    const deps = await loadDeps()
-    const key = probeKey('live-worker')
-    // Locked one minute ago: PROCESSING on an unsafe-to-replay operation, but NOT stale. This is a
-    // job, not an exception, and the whole safety of the affordance is that it is left alone.
-    const live = await seedStalePark(deps.db, {
-      connector: 'woocommerce',
-      operation: 'stock.push',
-      idempotencyKey: key,
-      payloadJson: { productId: 'probe-product', reason: 'MANUAL', force: false, webhookQty: null },
-      lockAgeMs: 60 * 1000,
-    })
-    t.after(() => deps.db.integrationOutbox.deleteMany({ where: { idempotencyKey: key } }))
-
-    const where = deps.stalledIntegrationOutboxParkWhere()
-    assert.ok(where)
-    const listed = await deps.db.integrationOutbox.findMany({ where: where as never, select: { id: true } })
-    assert.ok(!listed.some((row) => row.id === live.id), 'a live job must not be presented as an exception')
-
-    // NON-VACUITY: the same row, once past every lease, IS listed — so the assertion above turned on
-    // the lock's age and not on some other clause quietly excluding it.
-    await deps.db.integrationOutbox.update({
-      where: { id: live.id },
-      data: { lockedAt: new Date(Date.now() - deps.ADMIN_OUTBOX_STALE_PROCESSING_LOCK_MS - 60_000) },
-    })
-    const nowListed = await deps.db.integrationOutbox.findMany({ where: where as never, select: { id: true } })
-    assert.ok(nowListed.some((row) => row.id === live.id), 'the listing must be able to see this row at all')
-    await deps.db.integrationOutbox.update({ where: { id: live.id }, data: { lockedAt: live.lockedAt } })
-
-    // AND THE ROW ROUND 3 WOULD HAVE LISTED (round 4, Codex HIGH 1). Twelve minutes is past round
-    // 3's restated ten-minute threshold and INSIDE the fifteen-minute lease `xero/accounting.post`
-    // is actually drained under — a job that is not stalled at all, shown as one.
-    const midLeaseKey = probeKey('xero-mid-lease')
-    const midLease = await seedStalePark(deps.db, {
-      connector: 'xero',
-      operation: 'accounting.post',
-      idempotencyKey: midLeaseKey,
-      payloadJson: { accountingSyncLogId: 'probe-log' },
-      lockAgeMs: 12 * 60 * 1000,
-      lockedBy: 'xero-accounting-sync',
-    })
-    t.after(() => deps.db.integrationOutbox.deleteMany({ where: { idempotencyKey: midLeaseKey } }))
-
-    assert.ok(12 * 60 * 1000 > 10 * 60 * 1000, 'the premise: round 3 would have called this stale')
-    assert.ok(12 * 60 * 1000 < deps.INTEGRATION_OUTBOX_DRAIN_LEASES_MS.xeroAccountingEntry,
-      'and the premise on the other side: the Xero worker holding it is still inside its lease')
-
-    const midLeaseListed = await deps.db.integrationOutbox.findMany({ where: where as never, select: { id: true } })
-    assert.ok(!midLeaseListed.some((row) => row.id === midLease.id),
-      'a Xero row inside its own lease must not be presented as a stalled park')
+    // (2) AND NOBODY IS TOLD (o3d-8td2 r8). Rounds 3-7 followed this assertion with a listing check:
+    // the exception inbox's derived predicate returned this row, closing round 2's "the park is
+    // invisible" HIGH. That whole surface was withdrawn — the listing, its guidance and the guards
+    // around them (o3d-7qdb) — so the row this test just built is once again on no operator surface
+    // anybody watches, and every later stock change for the product waits behind it. Nothing here
+    // can assert that absence usefully; it is recorded so the gap is not mistaken for coverage.
   },
 )
 
@@ -504,13 +433,14 @@ test(
     })
     t.after(() => deps.db.integrationOutbox.deleteMany({ where: { idempotencyKey: key } }))
 
-    // (1) THE PREMISE: this row is on the operator surface, which is the whole population any
-    // recovery would have acted on.
-    const where = deps.stalledIntegrationOutboxParkWhere()
-    const listed = await deps.db.integrationOutbox.findMany({ where: where as never, select: { id: true } })
-    assert.ok(listed.some((row) => row.id === park.id), 'the premise: this row is listed')
+    // (1) THE PREMISE: a stalled park, its lock past every declared lease — the exact population any
+    // recovery would have acted on. Rounds 3-7 asserted it was LISTED here; round 8 withdrew the
+    // listing (o3d-7qdb), and the row's shape is the premise that actually matters.
+    assert.equal(park.status, 'PROCESSING')
+    assert.ok(park.lockedAt && park.lockedAt.getTime() < Date.now() - deps.ADMIN_OUTBOX_STALE_PROCESSING_LOCK_MS)
 
-    // (2) IT REACHES PERMANENT_FAILED — by the pre-existing exit, which is the only exit there is.
+    // (2) IT REACHES PERMANENT_FAILED — by the pre-existing admin mutation, which is not an exit at
+    // all, as (3) and (4) go on to show.
     await deps.permanentlyFailIntegrationOutboxAdminRow({ id: park.id })
     const stopped = await deps.db.integrationOutbox.findUniqueOrThrow({ where: { id: park.id } })
     assert.equal(stopped.status, 'PERMANENT_FAILED')
@@ -562,7 +492,7 @@ test(
 )
 
 test(
-  '[o3d-8td2 r4/r6] an UNREGISTERED operation crashes into a park that nothing reclaims and the list shows',
+  '[o3d-8td2 r4/r8] an UNREGISTERED operation crashes into a park that nothing reclaims and nothing shows',
   { skip: !RUN && 'set RUN_DB_CONCURRENCY_TESTS=1' },
   async (t) => {
     const deps = await loadDeps()
@@ -610,23 +540,11 @@ test(
     assert.equal(refused.winners.length, 0, 'no worker may be handed a row whose effects this build cannot name')
     assert.equal(refused.losers, WORKERS)
 
-    // (4) SO AN OPERATOR MUST BE SHOWN IT. Round 3's scope was exhaustive over the REGISTRY, and
-    // `policy !== null` dropped exactly this row out of both sets: unreclaimable and invisible.
-    const where = deps.stalledIntegrationOutboxParkWhere()
-    const listed = await deps.db.integrationOutbox.findMany({ where: where as never, select: { id: true } })
-    assert.ok(listed.some((row) => row.id === claimed.id),
-      'a crashed unregistered row must be on the operator surface — it is on no automatic path at all')
-
-    // (5) ...AND NOTHING MORE THAN SHOWN (round 6). The pre-existing admin exit reaches it — round
-    // 3's guard would have refused it as `not_a_stalled_park`, for a row nothing else was going to
-    // touch either — but that exit is an admin API call an operator makes deliberately, not a button
-    // beside the row. NON-VACUITY: the row leaves the list only because something acted on it.
-    await deps.permanentlyFailIntegrationOutboxAdminRow({ id: claimed.id })
-    const after = await deps.db.integrationOutbox.findUniqueOrThrow({ where: { id: claimed.id } })
-    assert.equal(after.status, 'PERMANENT_FAILED')
-
-    const stillListed = await deps.db.integrationOutbox.findMany({ where: where as never, select: { id: true } })
-    assert.ok(!stillListed.some((row) => row.id === claimed.id))
+    // (4) AND NOTHING SHOWS IT EITHER (o3d-8td2 r8). Rounds 4-7 ended here by asserting the derived
+    // exception-inbox listing returned this row — the case that surface existed for, since round 3
+    // had made an unregistered park both unreclaimable AND invisible. The surface was withdrawn in
+    // round 8 (o3d-7qdb), so an unregistered park is once again unreclaimable and invisible. What
+    // this branch fixes is (3): it is refused by the DECLARATION's fail-closed rule, not by luck.
   },
 )
 

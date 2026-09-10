@@ -10,18 +10,23 @@
  * under is the set of `staleLockMs` values passed to `claimIntegrationOutboxWork`, and that set is
  * THIS MAP.
  *
- * WHAT IT PAYS FOR NOW, SAID AGAIN BECAUSE THE REASON CHANGED. Round 4 derived an operator ACTION's
- * threshold from this map. Round 6 withdrew that action entirely (see
- * `lib/domain/integrations/outbox-admin.ts`), and the map stays because the thing that survived
- * needs it just as much: `stalledIntegrationOutboxParkWhere` is a LIST, and its first condition is
- * `lockedAt` older than every lease. Without a maximum over a declared set, that condition has to be
- * restated as a literal — which is exactly what round 3 did, at ten minutes, while
- * `xero/accounting.post` is drained under FIFTEEN. The result was not a dangerous write; it was a
- * worse thing for a list to be: a Xero row twelve minutes into a live lease, shown to an operator as
- * an exception that nothing was wrong with. A restated constant cannot notice that; a MAXIMUM over a
- * declared set can, and {@link INTEGRATION_OUTBOX_MAX_LEASE_MS} is what
- * `ADMIN_OUTBOX_STALE_PROCESSING_LOCK_MS` is derived from. Adding a longer lease here raises the
- * listing's threshold in the same edit.
+ * WHAT IT PAYS FOR, SAID AGAIN BECAUSE THE REASON HAS NOW CHANGED TWICE. Round 4 derived an operator
+ * ACTION's threshold from this map; round 6 withdrew that action; round 7 left the LIST it sat on;
+ * round 8 withdrew the list as well (o3d-7qdb). The map outlives all three, because its two real
+ * consumers were never the park:
+ *
+ *   1. THE CLAIM ITSELF. `ClaimIntegrationOutboxOptions.staleLockMs` is typed as
+ *      {@link IntegrationOutboxDrainLeaseMs}, the literal union of this map's values, so a drain
+ *      cannot take a lease this file has not declared — see the enforcement note below. That is a
+ *      property of the claim path and has nothing to do with any operator surface.
+ *   2. THE DEAD-LETTER GATE, which predates this branch.
+ *      `permanentlyFailIntegrationOutboxAdminRow` refuses a PROCESSING row whose lock is younger
+ *      than `ADMIN_OUTBOX_STALE_PROCESSING_LOCK_MS`, and on `development` that constant is its own
+ *      restated `10 * 60 * 1000` — SHORTER than the fifteen minutes `xero/accounting.post` is
+ *      actually drained under, so between minute 10 and minute 15 an admin could bury a live Xero
+ *      claim (o3d-zdvn). A restated constant cannot notice that; a MAXIMUM over a declared set can,
+ *      and {@link INTEGRATION_OUTBOX_MAX_LEASE_MS} is what that threshold is derived from. Adding a
+ *      longer lease here raises the gate in the same edit.
  *
  * It is a leaf module for the same reason `outbox-replay-policy.ts` is: a DECLARATION every layer
  * reads — the claim, the admin threshold, the Xero drain — should not drag the outbox machinery in

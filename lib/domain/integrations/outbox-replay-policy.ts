@@ -116,11 +116,23 @@ export type OutboxReplaySafety =
    * NEITHER. A second execution can do real damage and nothing stands in its way.
    *
    * An operation declared this way is NOT handed to a second worker on a stale lock: the row stays
-   * PROCESSING and an operator resolves it, which is the same trade
-   * `wmsAmbiguousCreateMayBeReplayed` makes — a stalled row somebody has to look at, against a
-   * duplicate nobody notices. The exit exists: `permanentlyFailIntegrationOutboxAdminRow` will
-   * dead-letter a PROCESSING row precisely once its lock has gone stale, so the park is a park and
-   * not a leak.
+   * PROCESSING, which is the same trade `wmsAmbiguousCreateMayBeReplayed` makes — a stalled row
+   * somebody has to look at, against a duplicate nobody notices.
+   *
+   * AND THERE IS NO EXIT (o3d-8td2 r7 MEDIUM, corrected r8). This paragraph used to end "the exit
+   * exists: `permanentlyFailIntegrationOutboxAdminRow` will dead-letter a PROCESSING row precisely
+   * once its lock has gone stale, so the park is a park and not a leak". Every clause of that is
+   * wrong except the first. Permanent-failing a park is not an exit, because PERMANENT_FAILED IS NOT
+   * INERT: WooCommerce's ordinary enqueue path resets it to PENDING with `attempts: 0` on the next
+   * stock change for the product (`stock-sync-jobs.ts`, updating on `status: { not: PROCESSING }`),
+   * and `scheduleXeroAccountingOutbox` does the same from `ensureXeroOutboxForPendingSyncLogs`, which
+   * is the first statement of EVERY Xero sweep and selects the `AccountingSyncLog` the dead-letter
+   * never touched. So dead-lettering a park is a slower REPLAY of exactly what this verdict forbids,
+   * and the park IS a leak — into whichever ordinary enqueue path comes first. The general rule, the
+   * one any future remedy has to answer: there is no status in this system that is inert, so a
+   * recovery cannot be made safe by choosing a quieter one to park a row in. It must verify the
+   * remote system directly, or require evidence the system cannot obtain for itself. That is
+   * o3d-7qdb.
    *
    * THE PARK HAS ITS OWN COST and declaring it is not free. A row nobody reclaims is a row whose
    * work does not happen until a human acts, and for an operation whose enqueue path folds new work
@@ -137,11 +149,23 @@ export type OutboxReplaySafety =
    * was not on it. A remedy whose own failure mode is invisible and self-perpetuating is worse than
    * the defect it replaces.
    *
-   * SO THE PARK NOW GENERATES ITS OWN OBLIGATION. `integrationOutboxUnreclaimableScope` is derived
-   * from THIS declaration, and the exception inbox's stalled-park section is built from it: choosing
-   * `unsafe-to-replay` is what puts an operation's stalled rows in front of an operator, in the same
-   * edit, with a one-action recovery. The two cannot drift apart, because there is only one list and
-   * it is computed from the verdicts rather than maintained beside them.
+   * AND ROUNDS 3 THROUGH 7 FAILED TO PAY FOR IT EITHER (o3d-8td2 r8). The answer attempted there was
+   * an obligation generated from this very declaration: a scope derived from the `unsafe-to-replay`
+   * verdicts, feeding a stalled-park section in the exception inbox — first with a one-click
+   * recovery, then without it, then wrapped in guidance and structural guards. It produced five Codex
+   * HIGHs in four rounds, the last two of them in the GUARDS rather than in the thing guarded, and
+   * the whole surface was WITHDRAWN in round 8. The pattern is worth more than the surface was: four
+   * rounds of guards, each incomplete in a new way, is evidence that a guard defined by enumerating
+   * what an operator or a component might do has no closing condition. A future remedy needs a
+   * property that does not depend on such an enumeration.
+   *
+   * SO THE PARK IS UNPAID FOR, AND SAYING SO IS THE POINT. Declaring an operation `unsafe-to-replay`
+   * today buys correctness at the claim — no second worker is handed the row — and buys the operator
+   * nothing: the stalled row appears on no surface anybody watches, and for a folding operation the
+   * backlog behind it grows in silence. That is a known, tracked cost (o3d-22jw for the black hole,
+   * o3d-7qdb for a remedy that does not rest on elapsed time), not a solved problem, and it is
+   * strictly better than the alternative this file exists to refuse — a second worker replaying an
+   * effect that may already have landed.
    */
   | 'unsafe-to-replay'
 

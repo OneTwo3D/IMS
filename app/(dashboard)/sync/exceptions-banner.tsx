@@ -22,9 +22,6 @@ export function ExceptionsBanner({ summary }: { summary: ExceptionInboxSummary }
     // links, which never reached the WMS at all.
     summary.wmsPushDeadLetters > 0 ? `${summary.wmsPushDeadLetters} blocked order push(es)` : null,
     summary.outboxFailures > 0 ? `${summary.outboxFailures} failed outbox row(s)` : null,
-    // o3d-8td2 r3: "stalled", not "failed" — these rows never failed, which is exactly why nothing
-    // retries them and why they had no surface at all until this round.
-    summary.stalledOutboxParks > 0 ? `${summary.stalledOutboxParks} stalled outbox park(s)` : null,
     summary.deadReceiptEvents > 0 ? `${summary.deadReceiptEvents} dead receipt event(s)` : null,
     summary.refundSyncParks > 0 ? `${summary.refundSyncParks} parked refund(s)` : null,
     summary.stuckDispatches > 0 ? `${summary.stuckDispatches} stuck dispatch(es)` : null,

@@ -161,18 +161,29 @@ export const INTEGRATION_OUTBOX_REGISTRY = defineOutboxRegistry({
     //   and nothing else, so a stalled PROCESSING row appeared on no operator surface at all; the
     //   admin list would show it only to someone who already suspected it and filtered for it.
     //
-    // WHAT PAYS FOR THE PARK NOW is `integrationOutboxUnreclaimableScope` below: every operation
-    // declared `unsafe-to-replay` puts its stalled rows into the exception inbox's stalled-park
-    // section, with a single recovery action (dead-letter the stale lock, then re-queue with the
-    // FOLDED payload — the latest stock change, not the one the dead worker was carrying). The
-    // obligation is computed from this verdict rather than maintained alongside it, so an operation
-    // cannot be parked without also being watched.
+    // AND NOTHING IN THIS BRANCH PAYS FOR IT (o3d-8td2 r8 — the whole park surface was WITHDRAWN,
+    // and o3d-7qdb carries it). Rounds 3 through 7 answered the two findings above with an operator
+    // surface: a derived list of stalled parks in the exception inbox, first with a one-click
+    // recovery, then with the recovery removed, then with guidance and structural guards around what
+    // was left. Five Codex HIGHs came out of it in four rounds — the recovery replayed what this very
+    // verdict forbids (r3), `PERMANENT_FAILED` turned out not to be inert so the recovery replayed it
+    // by a slower route (r5), the listing's own copy directed operators onto that route (r6), and
+    // then the GUARDS meant to keep the section safe were themselves found incomplete (r7). That last
+    // one is the reason it is gone rather than fixed again: a guard built by enumerating what an
+    // operator or a component might do has no closing condition.
+    //
+    // SO THE HONEST POSITION IS WORSE THAN ROUND 2 CLAIMED AND IS WRITTEN DOWN AS SUCH: a row parked
+    // here is invisible on the exception inbox (the admin outbox API can still list PROCESSING rows
+    // to somebody who already suspects one), the daily reconcile corrects the QUANTITY once a day
+    // without touching the row, and every stock change in between is folded into the park and waits.
+    // What this branch does fix is the VERDICT — `unsafe-to-replay` here and on `xero/accounting.post`
+    // — so no second worker is handed the row at all. o3d-22jw tracks the black hole; o3d-7qdb tracks
+    // an operator remedy that does not rest on elapsed time.
     //
     // THE PARK IS STILL A PARK, and that is deliberate. An automatic drain would be a second worker
     // executing the same absolute push, which is the exact reordering hazard this entry is
     // `unsafe-to-replay` for; a self-healing sweep here would reintroduce the defect while looking
-    // like the fix. The real fix is the monotonic push generation named above, and until it exists
-    // the honest position is: parked, visible, one action to recover.
+    // like the fix. The real fix is the monotonic push generation named above.
     'stock.push': {
       name: 'stockSync',
       schema: WcStockSyncOutboxPayloadSchema,
@@ -393,66 +404,13 @@ export function integrationOutboxReplayPolicy(connector: string, operation: stri
   return entry ? resolveOutboxReplaySafety(entry) : null
 }
 
-/** The operations of one connector, split by whether their declared policy permits a stale reclaim. */
-function operationsOf(connector: string, reclaimable: boolean): string[] {
+/** The operations of one connector whose declared policy permits a stale-lock reclaim. */
+function reclaimableOperationsOf(connector: string): string[] {
   const connectorRegistry = INTEGRATION_OUTBOX_REGISTRY[connector as RegisteredOutboxConnector]
   if (!connectorRegistry) return []
   return Object.entries(connectorRegistry as Record<string, OutboxRegistryEntry>)
-    .filter(([, entry]) => outboxReplayPolicyGrantsStaleReclaim(resolveOutboxReplaySafety(entry)) === reclaimable)
+    .filter(([, entry]) => outboxReplayPolicyGrantsStaleReclaim(resolveOutboxReplaySafety(entry)))
     .map(([operation]) => operation)
-}
-
-/** The operations of one connector whose declared policy permits a stale-lock reclaim. */
-function reclaimableOperationsOf(connector: string): string[] {
-  return operationsOf(connector, true)
-}
-
-/**
- * THE OTHER HALF OF THE SAME DECLARATION: every row whose stalled lock nobody will ever come back
- * for. Answered about the ROW, and therefore total — there is always such a scope.
- *
- * `integrationOutboxStaleReclaimScope` says which rows a second WORKER may take. This says which
- * rows an OPERATOR has to, and it is the exact COMPLEMENT of that — negated as a filter rather than
- * re-enumerated from the registry, which is the whole of round 4's HIGH 2.
- *
- * WHY THE COMPLEMENT HAD TO BE TAKEN OVER ROWS AND NOT OVER DECLARATIONS (Codex round 4, HIGH 2).
- * Round 3 built this by listing the operations whose resolved policy is `unsafe-to-replay`. That set
- * is exhaustive within the REGISTRY and not across the rows that can exist: `enqueueIntegrationOutbox`
- * and `parseIntegrationOutboxPayload` deliberately accept an operation this build has never heard of,
- * so an UNREGISTERED row can be claimed, flipped to PROCESSING, and crashed. Its policy is `null`, so
- * `integrationOutboxStaleReclaimScope` failed it closed — no worker would ever reclaim it — while
- * `policy !== null` also excluded it from this scope, so no operator would ever be shown it either.
- * Neither reclaimable nor visible is precisely the black hole this whole round exists to close, and
- * round 3 re-created it one layer up.
- *
- * The fix is to stop asking a question the registry cannot answer. A row is unreclaimable exactly
- * when no worker may take it, and "no worker may take it" is already decided, for every row
- * including an unknown one, by the reclaim scope's own fail-closed rule. So this is `NOT` that
- * scope, and `{}` — every row — when nothing at all is reclaimable. The two predicates now partition
- * the table, which is a property a test can state over unregistered operations as well as registered
- * ones.
- *
- * A row matched by this scope AND stalled in PROCESSING past every lease has, by construction, no
- * automatic recovery left: the drain will not reclaim it, the retry ladder never runs (it is not in a
- * failed state), and — as o3d-22jw had to be corrected to say — no reconcile elsewhere drains it
- * either. The exception inbox's stalled-park section is built from this, so the set of rows that can
- * strand work and the set an operator is shown cannot come apart.
- *
- * RECLAIMABLE OPERATIONS ARE DELIBERATELY EXCLUDED, on the rule this inbox already follows for
- * RETRYABLE_FAILED (Codex r4, app/actions/sync-exceptions.ts): a row still on an automatic recovery
- * path is noise, because the next drain sweep reclaims it without anyone being asked.
- */
-export function isUnreclaimableOutboxOperation(connector: string, operation: string): boolean {
-  const policy = integrationOutboxReplayPolicy(connector, operation)
-  // `null` — an operation this build has never heard of — falls on the OPERATOR's side, which is the
-  // same fail-closed answer `integrationOutboxStaleReclaimScope` already gives a WORKER for it.
-  return policy === null || !outboxReplayPolicyGrantsStaleReclaim(policy)
-}
-
-/** @see isUnreclaimableOutboxOperation — the same rule, shaped as a filter over every ROW. */
-export function integrationOutboxUnreclaimableScope(): Record<string, unknown> {
-  const reclaimable = integrationOutboxStaleReclaimScope(undefined, undefined)
-  return reclaimable === null ? {} : { NOT: reclaimable }
 }
 
 /**
@@ -466,8 +424,18 @@ export function integrationOutboxUnreclaimableScope(): Record<string, unknown> {
  * FAILS CLOSED on anything this build cannot identify. An operation missing from this registry is
  * one whose effects this binary knows nothing about, and "we have never heard of it" is not a reason
  * to believe a second execution is harmless. It costs nothing today — every drain claims its own
- * registered operation — and where it does bite, `permanentlyFailIntegrationOutboxAdminRow` is the
- * operator exit for a row parked with a stale PROCESSING lock.
+ * registered operation.
+ *
+ * AND WHERE IT DOES BITE, THERE IS NO EXIT TO NAME (o3d-8td2 r7 MEDIUM, corrected r8). Until round 7
+ * this comment ended by calling `permanentlyFailIntegrationOutboxAdminRow` "the operator exit for a
+ * row parked with a stale PROCESSING lock". It is not an exit. That function writes the
+ * `integration_outbox` row and nothing else, so for Xero the owning `AccountingSyncLog` is untouched
+ * and stays selectable by `ensureXeroOutboxForPendingSyncLogs` — the first statement of every sweep
+ * — which re-queues the row through `scheduleXeroAccountingOutbox` on that same sweep; a WooCommerce
+ * row is reset to PENDING by the next ordinary stock change for the product. Dead-lettering a park
+ * is a slower replay, not a stop. A maintainer sent here looking for a remedy must be told there is
+ * none rather than pointed at a mutation: the remedy is a read of the remote system and a correction
+ * made THERE, and a safe automated one is open as o3d-7qdb.
  */
 export function integrationOutboxStaleReclaimScope(
   connector: string | undefined,
