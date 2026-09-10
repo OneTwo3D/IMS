@@ -25,6 +25,7 @@ import test, { mock } from 'node:test'
 import {
   PROTECTED_DATABASE_NAMES,
   THROWAWAY_DATABASE_NAME_RE,
+  type ThrowawayDatabase,
   ThrowawayDatabaseError,
   assertThrowawayDatabaseName,
   provisionThrowawayDatabase,
@@ -218,10 +219,30 @@ const wire = {
   loseCreateResponse: false,
   /** The variant where the statement never reached the server at all. */
   loseCreateBeforeExecuting: false,
-  /** Any `DROP DATABASE` fails to be delivered. */
+  /**
+   * A `DROP DATABASE` NEVER REACHES THE SERVER. Nothing is deleted and the client is told. This is
+   * the DROP-side twin of `loseCreateBeforeExecuting`, and until r11 it was the ONLY drop failure
+   * the wire could express — which is why the r11 finding could not be written down here: the fake
+   * threw BEFORE deleting the name, so "the server did the work and the answer was lost" was not
+   * a state this server had.
+   */
   failDrop: false,
+  /**
+   * THE r11 DEFECT: the server EXECUTES the `DROP DATABASE` and the client never hears the answer.
+   *
+   * The same generalisation `loseCreateResponse` got in r9 — the work happens either way, and the
+   * only thing that varies is whether the client survives long enough to be told. It is the case
+   * the finding is about, so the wire has to be able to say it.
+   */
+  loseDropResponse: false,
   /** `client.end()` fails on the session that issued the CREATE, AFTER the CREATE succeeded. */
   failEndAfterCreate: false,
+  /**
+   * `client.end()` fails on the session that issued the DROP, AFTER the server ANSWERED it. The
+   * DROP is DONE; the teardown is what failed. A handle must stay `dropped` through this, or a
+   * failing socket close would silently turn a completed DROP back into an unanswered one.
+   */
+  failEndAfterDrop: false,
   /**
    * ANOTHER PROVISIONER, ARRIVING BETWEEN THE PROBE AND THE CREATE.
    *
@@ -242,7 +263,9 @@ function resetWire(): void {
   wire.loseCreateResponse = false
   wire.loseCreateBeforeExecuting = false
   wire.failDrop = false
+  wire.loseDropResponse = false
   wire.failEndAfterCreate = false
+  wire.failEndAfterDrop = false
   wire.createdByAnotherProvisionerAfterProbe = null
 }
 
@@ -258,6 +281,7 @@ let nextBackendPid = 1000
 class FakeMaintenanceClient {
   readonly backendPid = (nextBackendPid += 1)
   private issuedCreate = false
+  private issuedDrop = false
   private readonly errorListeners: ((error: Error) => void)[] = []
 
   constructor(_config: { connectionString: string }) { void _config }
@@ -329,8 +353,19 @@ class FakeMaintenanceClient {
     }
 
     if (text.startsWith('DROP DATABASE')) {
+      this.issuedDrop = true
+      // THE STATEMENT NEVER ARRIVED. Nothing is deleted — the database is still there.
       if (wire.failDrop) throw new Error('Connection terminated unexpectedly')
+      // THE SERVER DOES THE WORK EITHER WAY (r11). Exactly as with the CREATE: the deletion happens
+      // whether or not the client lives long enough to be told, so the deletion comes FIRST and the
+      // dying comes after it. A fake that died first could not express the case the finding is
+      // about — "the DROP ran and the answer was lost" — and a proof that cannot express its own
+      // failure mode is not a proof of anything.
       wire.databases.delete(quotedName(text))
+      if (wire.loseDropResponse) {
+        this.kill()
+        throw new Error('Connection terminated unexpectedly')
+      }
       return { rows: [] }
     }
 
@@ -341,6 +376,11 @@ class FakeMaintenanceClient {
   }
 
   async end(): Promise<void> {
+    if (this.issuedDrop && wire.failEndAfterDrop) {
+      // The DROP was ANSWERED; only the socket close failed. A completed DROP must survive this.
+      wire.liveSessions.delete(this.backendPid)
+      throw new Error('Connection terminated unexpectedly')
+    }
     if (this.issuedCreate && wire.failEndAfterCreate) {
       // The session is gone as far as the server is concerned; the CLIENT is what failed to be
       // told cleanly. A CREATE that SUCCEEDED and a teardown that did not.
@@ -710,4 +750,210 @@ test('r10: a licensed DROP that ALSO fails says the database is left, and names 
     // nobody will ever look for.
     assert.deepEqual([...wire.databases], [MINTED], `${arm}: the fixture did not leave the database behind`)
   }
+})
+
+// -------------------------------------------------------------------------------------------
+// ROUND 11 — THE RULE THE OTHER FOUR ROUNDS WERE INSTANCES OF: A FACT IS RECORDED BEFORE THE
+// OPERATION IT DESCRIBES, NEVER AFTER.
+//
+// Codex r11 HIGH, verbatim: "`dropped` is set only after `dropDatabase()` returns. If PostgreSQL
+// executes the DROP but its response is lost, the handle remains retryable; two concurrent calls
+// can likewise both pass the initial check. Another provisioner can recreate the visible name
+// before the later DROP executes, causing that later call to destroy a database this process did
+// not create."
+//
+// IT IS THE r9/r10 CREATE FINDING MIRRORED ONTO THE DROP. There, a lost answer read as "nothing
+// was created" and licensed a reclaim. Here, a lost answer read as "not dropped yet" and licensed
+// a retry. The fix is the same sentence applied to the other statement: A HANDLE ISSUES AT MOST
+// ONE `DROP DATABASE`, EVER, and it is marked issued BEFORE the await.
+//
+// THESE PROOFS RUN AGAINST THE MODULE'S OWN HANDLE, not a re-implementation of its state machine.
+// `runMigrations` is the only thing that makes that possible without a Postgres — and the arm
+// below proves that seam cannot reach the r10 rule, because the migrator never runs unless the
+// server already answered this process's own CREATE.
+// -------------------------------------------------------------------------------------------
+
+const DROP_STATEMENT = `DROP DATABASE IF EXISTS "${MINTED}" WITH (FORCE)`
+const PROBE_STATEMENT = 'SELECT 1 FROM pg_database WHERE datname = $1'
+const CREATE_STATEMENT = `CREATE DATABASE "${MINTED}"`
+
+/**
+ * A provision that REACHES ITS RETURN, so the handle's own `drop()` is what the proofs below
+ * drive. Every other test in this file stops at a refusal, which is why the drop path had only
+ * ever been exercised from inside `provisionThrowawayDatabase` — and why a defect that needs TWO
+ * calls on one handle could sit here for eleven rounds without a test that could see it.
+ */
+async function provisionHandle(): Promise<ThrowawayDatabase> {
+  return withWiredUrl(() =>
+    provisionThrowawayDatabase({
+      label: 'alnkfence',
+      mintName: () => MINTED,
+      runMigrations: async () => undefined,
+    }),
+  )
+}
+
+/** Settle a promise without letting a rejection short-circuit the wire assertions that follow. */
+const settle = (promise: Promise<unknown>): Promise<unknown> =>
+  promise.then(() => null, (reason: unknown) => reason)
+
+test('r11 HIGH: a DROP whose response is LOST SPENDS the handle — no second DROP is ever issued', async () => {
+  resetWire()
+  const handle = await provisionHandle()
+  assert.deepEqual([...wire.databases], [MINTED], 'the provision never created the database, so there is nothing to drop')
+
+  wire.loseDropResponse = true
+  const first = await settle(handle.drop())
+
+  // PRECONDITIONS, so this cannot pass by never reaching the case. The DROP has to have been
+  // ISSUED, the server has to have EXECUTED it, and the client has to have been left not knowing.
+  assert.deepEqual(drops(), [DROP_STATEMENT], 'no DROP was issued, so no response could be lost')
+  assert.equal(wire.databases.size, 0, 'the fake threw before executing the DROP — the case under test was never reached')
+  assert.ok(first instanceof Error, `the lost DROP response did not surface as a rejection: ${String(first)}`)
+
+  // ANOTHER PROVISIONER MINTS AND CREATES THE SAME NAME. This is the finding's second half: the
+  // name is visible on the server again, and it is NOT this handle's database.
+  wire.loseDropResponse = false
+  wire.databases.add(MINTED)
+
+  const second = await settle(handle.drop())
+
+  // THE FINDING, ON THE WIRE. `DROP DATABASE IF EXISTS` against a database that IS there succeeds
+  // silently, so "it rejected" measures nothing — the assertion is that no second DROP went down
+  // the wire at all, and that the other provisioner's database is still there.
+  assert.deepEqual(drops(), [DROP_STATEMENT], 'the spent handle issued a SECOND DROP, against a database another provisioner had just created')
+  assert.deepEqual([...wire.databases], [MINTED], "the other provisioner's database did not survive this handle's retry")
+  assert.deepEqual(inferenceStatements(), [], 'the retry path went looking for evidence of ownership')
+
+  // AND THE REFUSAL NAMES THE DATABASE, because the operator has to be able to find the leak.
+  assert.ok(second instanceof ThrowawayDatabaseError, `expected a named refusal, got ${String(second)}`)
+  assert.match(second.message, new RegExp(`refused to issue a SECOND DROP DATABASE for ${MINTED}`))
+  assert.match(second.message, new RegExp(`${MINTED} MAY STILL BE PRESENT ON THE SERVER`))
+  assert.match(second.message, /dropped by hand/)
+  assert.match(second.message, /AT MOST ONE DROP/)
+
+  // SPENT MEANS SPENT. A third call is refused the same way rather than quietly becoming a no-op,
+  // which would be the same defect with the report removed.
+  const third = await settle(handle.drop())
+  assert.ok(third instanceof ThrowawayDatabaseError, `expected a named refusal, got ${String(third)}`)
+  assert.deepEqual(drops(), [DROP_STATEMENT])
+  assert.deepEqual([...wire.databases], [MINTED])
+})
+
+test('r11 HIGH: two CONCURRENT drop() calls issue exactly ONE DROP between them', async () => {
+  resetWire()
+  const handle = await provisionHandle()
+  const connectionsBefore = wire.connections
+
+  // NOT AWAITED IN SEQUENCE. All three are started in the same tick, which is the arrangement the
+  // finding describes: with the flag set after the await, every one of them reads it as false.
+  const settled = await Promise.allSettled([handle.drop(), handle.drop(), handle.drop()])
+
+  assert.deepEqual(
+    drops(),
+    [DROP_STATEMENT],
+    `concurrent callers issued ${drops().length} DROP statements; a handle issues at most one`,
+  )
+  // THE SAME FACT COUNTED A DIFFERENT WAY: one maintenance connection, not three.
+  assert.equal(wire.connections - connectionsBefore, 1, 'a concurrent caller opened its own maintenance connection')
+  assert.equal(wire.databases.size, 0, 'the database was not dropped at all, so this proves nothing')
+
+  const fulfilled = settled.filter((result) => result.status === 'fulfilled')
+  assert.equal(fulfilled.length, 1, `${fulfilled.length} callers believed they had dropped the database`)
+  for (const result of settled) {
+    if (result.status === 'fulfilled') continue
+    assert.ok(result.reason instanceof ThrowawayDatabaseError, `expected a named refusal, got ${String(result.reason)}`)
+    assert.match(result.reason.message, new RegExp(`refused to issue a SECOND DROP DATABASE for ${MINTED}`))
+  }
+})
+
+test('r11: the ordinary path drops EXACTLY ONCE, leaves nothing behind, and a finally may still call it', async () => {
+  // THE COUNTERWEIGHT. Everything above would pass if the handle simply never dropped anything,
+  // which would turn every lane into a leak — so the ordinary path is asserted in the same file.
+  resetWire()
+  const handle = await provisionHandle()
+
+  await handle.drop()
+  assert.deepEqual(drops(), [DROP_STATEMENT])
+  assert.equal(wire.databases.size, 0, `the drop left ${[...wire.databases].join(', ')} behind`)
+
+  // A DROP THE SERVER ANSWERED IS A NO-OP AFTERWARDS, not a refusal: `finally { lane.close() }` is
+  // allowed to run twice. The distinction from the spent handle above is the whole design — one
+  // knows the database is gone, the other knows only that it asked.
+  await handle.drop()
+  await handle.drop()
+  assert.deepEqual(drops(), [DROP_STATEMENT], 'a repeated drop() on an ANSWERED handle issued another DROP')
+
+  // THE EXACT WIRE, in order, for a provision that runs to completion and then drops.
+  assert.deepEqual(wire.statements, [PROBE_STATEMENT, CREATE_STATEMENT, DROP_STATEMENT])
+  assert.deepEqual(inferenceStatements(), [], 'an ownership-inference statement was issued')
+})
+
+test('r11: a DROP the server ANSWERED stays answered even when the teardown fails', async () => {
+  // THE MUTATION THIS EXISTS FOR: recording `'dropped'` after `withMaintenanceClient` RETURNS
+  // instead of the moment the server answers. A failing `client.end()` would then un-record a
+  // completed DROP, and the handle would come back SPENT — reporting a possible leak over a
+  // database that is provably gone. Same shape, one level out.
+  resetWire()
+  const handle = await provisionHandle()
+  wire.failEndAfterDrop = true
+
+  const first = await settle(handle.drop())
+
+  // PRECONDITIONS: the DROP ran, the database is gone, and the failure under test is the teardown.
+  assert.deepEqual(drops(), [DROP_STATEMENT])
+  assert.equal(wire.databases.size, 0, 'the fake did not execute the DROP, so the teardown is not what failed')
+  assert.ok(first instanceof Error, 'the failing teardown did not surface at all')
+
+  // THE FINDING: the handle is DROPPED, not SPENT. A second call is a silent no-op.
+  wire.failEndAfterDrop = false
+  await handle.drop()
+  assert.deepEqual(drops(), [DROP_STATEMENT], 'a completed DROP was un-recorded by a failing teardown')
+})
+
+test('r11: the migrator seam cannot reach the r10 rule — it never runs unless the CREATE completed', async () => {
+  // THE GUARD ON THE NEW OPTION. `runMigrations` exists so the handle is reachable from a proof;
+  // if it could run — or matter — before the create outcome is decided, it would be a new way to
+  // license a DROP, which is exactly the class of seam this branch has spent four rounds closing.
+  for (const [arm, setup] of [
+    ['the CREATE response was lost', () => { wire.loseCreateResponse = true }],
+    ['the CREATE never reached the server', () => { wire.loseCreateBeforeExecuting = true }],
+    ['another provisioner won the name', () => { wire.createdByAnotherProvisionerAfterProbe = MINTED }],
+    ['another provisioner won AND the 42P04 was lost', () => {
+      wire.createdByAnotherProvisionerAfterProbe = MINTED
+      wire.loseCreateResponse = true
+    }],
+    ['the name was already taken', () => { wire.databases.add(MINTED) }],
+  ] as const) {
+    resetWire()
+    setup()
+
+    let migratorRan = false
+    const outcome = await withWiredUrl(() =>
+      settle(provisionThrowawayDatabase({
+        label: 'alnkfence',
+        mintName: () => MINTED,
+        runMigrations: async () => { migratorRan = true },
+      })),
+    )
+
+    assert.ok(outcome instanceof ThrowawayDatabaseError, `${arm}: expected a named refusal, got ${String(outcome)}`)
+    assert.equal(migratorRan, false, `${arm}: the migrator ran for a CREATE this process never saw complete`)
+    assert.deepEqual(drops(), [], `${arm}: a database this process never created was dropped`)
+    assert.deepEqual(inferenceStatements(), [], `${arm}: the module asked the server what the database looks like`)
+  }
+
+  // NON-VACUITY: the migrator DOES run once the server has answered the CREATE — otherwise every
+  // arm above would pass for the wrong reason.
+  resetWire()
+  let ran = false
+  const handle = await withWiredUrl(() =>
+    provisionThrowawayDatabase({
+      label: 'alnkfence',
+      mintName: () => MINTED,
+      runMigrations: async () => { ran = true },
+    }),
+  )
+  assert.equal(ran, true, 'the migrator never runs, so the arms above prove nothing')
+  await handle.drop()
 })

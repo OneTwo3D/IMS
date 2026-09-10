@@ -46,7 +46,10 @@
  *
  * AND THE DROP IS UNCONDITIONAL FROM THE CALLER'S SIDE. `drop()` re-runs the whole guard before
  * it issues `DROP DATABASE`, so a corrupted or hand-built handle cannot be used to drop something
- * real, and it is a no-op after the first call so a `finally` may always call it.
+ * real. It is a NO-OP once the server has ANSWERED a DROP, so a `finally` may always call it; it
+ * is a REFUSAL once a DROP has been ISSUED and not answered, because the handle has by then spent
+ * the one statement it is ever allowed to issue. See the r11 rule below for why that is not a
+ * matter of tidiness.
  *
  * ===========================================================================================
  * THE CLEANUP RULE (o3d-alnk r10). ONE SENTENCE, AND IT IS THE WHOLE OF IT:
@@ -100,6 +103,57 @@
  * (1) and (4) now have the SAME mitigation — the name — and that is the point. One is a catchable
  * rejection and the other is the absence of any further execution, but neither can establish who
  * owns a database after the fact, so neither pretends to.
+ *
+ * ===========================================================================================
+ * THE RECORD-BEFORE-THE-OPERATION RULE (o3d-alnk r11). THIS IS THE GENERAL FORM OF ALL OF THE
+ * ABOVE, AND IT IS WHY THE SAME FINDING KEPT COMING BACK WEARING A DIFFERENT STATEMENT:
+ *
+ *   A FACT ABOUT A STATEMENT IS RECORDED BEFORE THE STATEMENT IS SENT, NEVER AFTER IT RETURNS.
+ *   THE ONLY THING A PROCESS CAN KNOW ABOUT A STATEMENT IS THAT IT ISSUED IT; whether the server
+ *   executed it is an answer that may never arrive. A fact recorded AFTER the operation is a fact
+ *   a lost response DELETES, and a deleted fact reads as "it did not happen" — which is exactly
+ *   the reading that licenses doing it AGAIN, against a name that may no longer be this lane's.
+ *
+ * THE ONE THING THAT MAY BE RECORDED AFTERWARDS is a NARROWING of what was already recorded, and
+ * only where the value recorded beforehand is the CONSERVATIVE one — so that a lost answer leaves
+ * the pessimistic reading standing rather than the permissive one. `'answer-unknown'` narrowing to
+ * `'created'` is such a narrowing; so is a DROP's `'answer-unknown'` narrowing to `'dropped'`.
+ *
+ * EVERY PLACE IN THIS FILE WHERE THE RULE BITES, ENUMERATED SO THE NEXT ROUND DOES NOT HAVE TO
+ * REDISCOVER IT ONE SITE AT A TIME:
+ *
+ *   CREATE (r9, r10). `outcome = 'answer-unknown'` is set BEFORE `client.query`. Before that fix
+ *   a lost response read as "nothing was created", which is the reading that leaked, then — once
+ *   r7 acted on it — the reading that dropped a stranger's database.
+ *
+ *   DROP (r11). `dropOutcome = 'answer-unknown'` is set BEFORE `client.query`, SYNCHRONOUSLY, in
+ *   the same tick as the call that spends the handle. Before that fix `dropped = true` was set
+ *   only after the DROP RETURNED, so (a) a lost DROP response read as "not dropped yet" and left
+ *   the handle retryable — and another provisioner may by then have recreated the visible name,
+ *   so the retry destroys a database this process did not create — and (b) two concurrent
+ *   `drop()` calls both read `dropped === false` and both issued one. It is the CREATE defect
+ *   mirrored, and it is closed the same way: A HANDLE ISSUES AT MOST ONE `DROP DATABASE`, EVER.
+ *
+ *   THE EXISTENCE PROBE. Records nothing and licenses nothing; it can only report absence at the
+ *   instant it ran, which is why `CREATE DATABASE` and its `42P04` are the authority.
+ *
+ *   `prisma migrate deploy`. Its answer is read AFTER it returns, and that is sound rather than an
+ *   exception: a lost answer reads as "the migration failed", whose consequence is a DROP of a
+ *   database whose own CREATE this process watched complete. Nothing about a third party's
+ *   database rests on it, so there is no destructive statement for a lost answer to license.
+ *
+ *   THE `42P04` STEP-BACK. `outcome = 'not-created'` is recorded after the server ANSWERED, and it
+ *   is safe in both directions: it moves from one non-dropping state to another, so a lost answer
+ *   leaves `'answer-unknown'` standing and nothing is dropped on either reading.
+ *
+ *   `client.connect()`, `client.end()` AND THE `dropFailure` LOCALS. No fact about a statement is
+ *   recorded around the first two — a lost `connect` answer can leak a socket in a process that is
+ *   already failing, and licenses nothing. `dropFailure` records a rejection that has ALREADY
+ *   happened, which is the only ordering it can have.
+ *
+ * That is the whole file. Every site is above; there is no other place where a fact is recorded
+ * after the operation it describes, and a fifth round looking for one should start by finding a
+ * NEW await rather than re-reading these.
  */
 
 import { execFile } from 'node:child_process'
@@ -225,6 +279,26 @@ type CreateOutcome =
    */
   | 'created'
 
+/**
+ * WHAT THIS PROCESS KNOWS ABOUT ITS OWN `DROP DATABASE` — the mirror of `CreateOutcome`, and kept
+ * deliberately in the same three shapes so the symmetry is visible rather than argued (r11).
+ *
+ * A HANDLE MOVES THROUGH THESE ONCE AND NEVER BACKWARDS. There is no path from `'answer-unknown'`
+ * to `'not-issued'`, because that transition IS the defect: it would say a DROP that was issued
+ * had not been, and license issuing another one.
+ */
+type DropOutcome =
+  /** No `DROP DATABASE` has been issued for this database by this process. */
+  | 'not-issued'
+  /**
+   * A `DROP DATABASE` was ISSUED and this process did not see it complete. The database MAY be
+   * gone. The handle is SPENT: any further `drop()` is refused by name, because the name may since
+   * have been recreated by another provisioner and a retry would destroy THAT database.
+   */
+  | 'answer-unknown'
+  /** The server ANSWERED the DROP. The database is gone and further calls are a no-op. */
+  | 'dropped'
+
 export type ThrowawayDatabase = {
   /** The database this lane created. */
   readonly name: string
@@ -232,7 +306,11 @@ export type ThrowawayDatabase = {
   readonly url: string
   /** The database the configured `DATABASE_URL` names — never touched. */
   readonly configuredDatabase: string
-  /** Idempotent. Re-runs the full name guard before issuing DDL. */
+  /**
+   * ISSUES AT MOST ONE `DROP DATABASE`, EVER. Re-runs the full name guard before issuing DDL, is a
+   * no-op once the server has answered the DROP, and REFUSES BY NAME once one has been issued
+   * without an answer — see the r11 rule at the top of this file.
+   */
   drop(): Promise<void>
 }
 
@@ -248,6 +326,17 @@ type ProvisionOptions = {
   mintName?: () => string
   /** Milliseconds allowed for `prisma migrate deploy`. 263 migrations against an empty database. */
   migrateTimeoutMs?: number
+  /**
+   * ONLY a test of this module replaces the migrator, and — like `mintName` — it buys nothing that
+   * could widen what this module touches. WHICH database is created, WHICH is dropped and WHEN a
+   * DROP is licensed are all decided BEFORE this runs, by the name guard and by the `CreateOutcome`
+   * the server itself answered; a migrator cannot reach any of them. What it buys is that the
+   * HANDLE this function returns — and therefore its one-shot `drop()` — is reachable from a proof
+   * that has no Postgres, which is where the r11 finding lives. No lane passes it; the default is
+   * the real `prisma migrate deploy` and `tests/throwaway-database-guard.test.ts` still exercises
+   * that default.
+   */
+  runMigrations?: (laneDatabaseUrl: string) => Promise<void>
 }
 
 function mintThrowawayName(label: string): string {
@@ -327,12 +416,42 @@ export async function provisionThrowawayDatabase(options: ProvisionOptions): Pro
    * EVERY CALLER OF THIS IS DOWNSTREAM OF A COMPLETED `CREATE DATABASE`. That is the invariant the
    * r10 rule rests on, and it is structural rather than checked: this closure is only reachable
    * from the `'created'` branch below and from the handle that branch returns.
+   *
+   * AND IT ISSUES AT MOST ONE `DROP DATABASE`, EVER (r11). The state moves to `'answer-unknown'`
+   * SYNCHRONOUSLY, before the first `await` of the first call — which is what makes two concurrent
+   * calls impossible rather than merely unlikely: the second caller runs its checks in a later
+   * tick and finds the handle already spent. See the r11 rule at the top of this file.
    */
+  let dropOutcome: DropOutcome = 'not-issued'
   const dropDatabase = async (): Promise<void> => {
+    // ANSWERED ALREADY. The database is gone, so a `finally` that always calls `drop()` is free.
+    if (dropOutcome === 'dropped') return
+    // ISSUED ALREADY AND NEVER ANSWERED. This is the whole of the r11 fix: the handle is SPENT.
+    // Re-issuing would be this process acting on "it did not happen" when what it actually knows
+    // is "I do not know" — and in the interval another provisioner may have minted and created
+    // this very name, so the second DROP would destroy a database this process never created.
+    if (dropOutcome === 'answer-unknown') {
+      throw new ThrowawayDatabaseError(
+        `refused to issue a SECOND DROP DATABASE for ${name}: this handle had already ISSUED one `
+        + 'and never saw the server answer it, so this process does not know whether that DROP ran. '
+        + 'A handle issues AT MOST ONE DROP: by now another provisioner may have created a database '
+        + 'of this name, and a retry would destroy THAT database rather than this lane\'s. '
+        + `${name} MAY STILL BE PRESENT ON THE SERVER and has to be inspected and dropped by hand`,
+      )
+    }
     // The guard again, on the way out. A handle that was tampered with cannot drop something real.
+    // BEFORE the state moves, so a refused name leaves the handle unspent and the refusal repeats.
     assertThrowawayDatabaseName(name, configuredDatabase)
+    // BEFORE the first await, deliberately and synchronously: from here until an answer arrives,
+    // "the DROP may have run" is the most this process can honestly claim, and a second caller
+    // reaching this function can only reach it after this assignment.
+    dropOutcome = 'answer-unknown'
     await withMaintenanceClient(maintenance, async (client) => {
       await client.query(`DROP DATABASE IF EXISTS ${quoteIdentifier(name)} WITH (FORCE)`)
+      // The server answered. Recorded HERE rather than after `withMaintenanceClient` returns, so a
+      // failing `client.end()` cannot un-record a DROP the server had already confirmed — the same
+      // reasoning that makes a completed CREATE survive a failed teardown.
+      dropOutcome = 'dropped'
     })
   }
 
@@ -428,17 +547,16 @@ export async function provisionThrowawayDatabase(options: ProvisionOptions): Pro
   const laneUrl = new URL(configured.toString())
   laneUrl.pathname = `/${encodeURIComponent(name)}`
 
-  let dropped = false
-  const drop = async (): Promise<void> => {
-    if (dropped) return
-    await dropDatabase()
-    // Set only on SUCCESS, so a drop that failed transiently can be re-driven rather than
-    // silently marked done — which would leave the database behind for good.
-    dropped = true
-  }
+  // NO SECOND WRAPPER AROUND `dropDatabase` (r11). There used to be one here, holding a `dropped`
+  // flag it set only AFTER the drop returned — "so a drop that failed transiently can be
+  // re-driven". That retry is the defect: a DROP whose answer was lost may already have run, the
+  // name may already belong to somebody else's provision, and re-driving it destroys their
+  // database. The one-shot state lives in `dropDatabase` itself, so the migration-failure path
+  // below and the handle returned at the end share it and cannot each get a turn.
 
   try {
-    await execFileAsync(
+    if (options.runMigrations) await options.runMigrations(laneUrl.toString())
+    else await execFileAsync(
       PRISMA_BIN,
       ['migrate', 'deploy'],
       {
@@ -453,7 +571,7 @@ export async function provisionThrowawayDatabase(options: ProvisionOptions): Pro
     // database this process watched itself create.
     let dropFailure: unknown = null
     try {
-      await drop()
+      await dropDatabase()
     } catch (dropError) {
       dropFailure = dropError
     }
@@ -467,5 +585,5 @@ export async function provisionThrowawayDatabase(options: ProvisionOptions): Pro
     )
   }
 
-  return { name, url: laneUrl.toString(), configuredDatabase, drop }
+  return { name, url: laneUrl.toString(), configuredDatabase, drop: dropDatabase }
 }
