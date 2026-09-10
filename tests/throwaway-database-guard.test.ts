@@ -14,19 +14,19 @@
  *
  * The fourth refusal — a name that already exists on the server — needs a server and is proved by
  * the concurrency lane itself (tests/concurrency/email-outbox-claim-fence.concurrent.test.ts).
+ *
+ * r10 ADDED THE OTHER HALF: not only which databases this module refuses to CREATE, but the one
+ * circumstance in which it will DROP one. See the block above the fake server below.
  */
 
 import assert from 'node:assert/strict'
 import test, { mock } from 'node:test'
 
-import { THROWAWAY_DATABASE_PROVISION_LOCK_NAMESPACE } from '@/lib/db/advisory-locks'
 import {
   PROTECTED_DATABASE_NAMES,
-  THROWAWAY_DATABASE_CONNECTION_LIMIT,
   THROWAWAY_DATABASE_NAME_RE,
   ThrowawayDatabaseError,
   assertThrowawayDatabaseName,
-  provisionLockId,
   provisionThrowawayDatabase,
 } from '@/tests/helpers/throwaway-database'
 
@@ -158,18 +158,30 @@ test('a lane label that could smuggle a name past the pattern is refused', async
 })
 
 // ===========================================================================================
-// ROUND 7, Codex LOW — THE LOST-RESPONSE ORPHAN.
+// ROUND 10 — THE CLEANUP RULE, AND WHY THERE IS ONLY ONE.
 //
 // `CREATE DATABASE` is issued over a socket. If PostgreSQL EXECUTES it and the connection then
-// fails before the completion response arrives, `client.query` REJECTS: the database exists, this
-// process never learned so, and `provisionThrowawayDatabase` used to throw before the `drop`
-// closure had even been created. The r6 cleanup could not help — it starts once a handle exists.
+// fails before the completion response arrives, `client.query` REJECTS: the database exists and
+// this process never learned so.
 //
-// THIS IS NOT THE SIGKILL HOLE, and the difference is the whole reason it is fixed rather than
-// documented. SIGKILL runs no further JavaScript, so nothing can clean up. THIS failure is a
-// catchable rejection with a live process on the other side of it, so it is closable, and closed
-// is DEMONSTRATED here rather than argued: a fake wire creates the database, loses the response,
-// and the assertion is that the database is GONE from that fake server afterwards.
+// FOUR ROUNDS TRIED TO CLEAN THAT UP AND EACH ONE WAS UNSOUND IN A NEW WAY. r7 reclaimed it with
+// `DROP DATABASE IF EXISTS`. r8 found the missed answer might have been a `42P04`, so the reclaim
+// could drop the WINNER's database. r9 closed that with a session advisory lock plus a
+// `CONNECTION LIMIT 4242` ownership stamp. r10 found the stamp is a CONVENTION any caller may set
+// — not provenance — and that reading it and dropping it are two statements with a window in
+// between that a COOPERATIVE lock does not close against a non-participant.
+//
+// SO r10 DELETED THE RECLAIM. The rule is now: DROP only a name this process minted and whose own
+// `CREATE DATABASE` it saw COMPLETE. Everything else is LEFT and NAMED. The lock, the stamp and
+// the re-probe went with it, and so did the entire class of finding they attracted — nothing here
+// infers ownership from anything a third party can also produce.
+//
+// WHAT THESE TESTS THEREFORE PROVE, in the order the finding demands:
+//   1. a lost CREATE response LEAVES the database, issues NO DROP, and says so by name;
+//   2. a database this process did not create is never dropped by ANY path;
+//   3. the `created` path still drops, and leaves nothing behind;
+//   4. no lock, no stamp and no ownership probe survive — asserted on the wire, not by reading
+//      the source.
 //
 // NO REAL SERVER, ON PURPOSE. `npm run test:unit` has no database, and a proof that only runs in
 // the concurrency lane is a proof that mostly does not run. `pg` is module-mocked to a fake that
@@ -178,96 +190,67 @@ test('a lane label that could smuggle a name past the pattern is refused', async
 
 
 /**
- * THE FAKE SERVER — now a server with SESSIONS, because the r9 finding is about what one session
- * knows while another one dies.
+ * THE FAKE SERVER — a set of database NAMES, and nothing else about them.
  *
- * r8's wire modelled a single connection at a time and a `loseCreateResponse` that only applied
- * AFTER a successful CREATE. That is the vacuity Codex found: the combined race it claimed to
- * cover — "another provisioner won AND this one lost the resulting 42P04" — could not be
- * EXPRESSED on it, because losing a response was wired to the success branch alone. It models
- * both branches now, and it models advisory locks held per session, so a session can die holding
- * one and the code has to notice.
+ * IT MODELS NO DATABASE ATTRIBUTES, AND THAT IS THE r10 FIX EXPRESSED IN THE FIXTURE. r9's wire
+ * carried a `datconnlimit` per database because the module read one back to decide ownership.
+ * Nothing reads one now, so a fake that still served them would be modelling withdrawn behaviour
+ * — and a reader would reasonably conclude the stamp still meant something.
+ *
+ * IT ALSO HAS NO ADVISORY LOCKS, and their absence is load-bearing rather than tidiness: the
+ * `query` method THROWS on any statement it does not model, so a future round that reintroduces a
+ * lock, a `set_config` or a `SELECT datconnlimit` makes every test in this file fail loudly
+ * instead of quietly passing. That is the regression guard for "the machinery stayed deleted".
  */
 const wire = {
-  /** name -> `datconnlimit`. The stamp is part of the state, because it is part of the answer. */
-  databases: new Map<string, number>(),
+  /** The names the server holds. A Set, because a name is all this module can ask about. */
+  databases: new Set<string>(),
   connections: 0,
   statements: [] as string[],
-  /** Backends the server still has. A killed one answers nothing and holds nothing. */
+  /** Backends the server still has. A killed one answers nothing. */
   liveSessions: new Set<number>(),
-  /** `"<namespace>/<id>"` -> the backend pid holding it. */
-  advisoryLocks: new Map<string, number>(),
-  /** Every client that has taken an advisory lock, so a proof can kill one. */
-  lockSessions: [] as FakeMaintenanceClient[],
   /**
    * THE DEFECT: the server executes the CREATE and the client never hears the answer.
    *
-   * r9: this applies to the answer, WHICHEVER answer it was — the completion OR the `42P04`. The
-   * r8 version only applied after success, so the case that mattered most could not be reached.
+   * Applies to WHICHEVER answer it was — the completion OR the `42P04` — so the combined race
+   * below (somebody else won AND we never heard) is expressible.
    */
   loseCreateResponse: false,
   /** The variant where the statement never reached the server at all. */
   loseCreateBeforeExecuting: false,
-  /** The unrecoverable variant: the reclaiming DROP cannot be delivered either. */
+  /** Any `DROP DATABASE` fails to be delivered. */
   failDrop: false,
   /** `client.end()` fails on the session that issued the CREATE, AFTER the CREATE succeeded. */
   failEndAfterCreate: false,
-  /** The lock session's backend dies at the same instant the create session's does. */
-  killLockSessionWithCreateSession: false,
   /**
    * ANOTHER PROVISIONER, ARRIVING BETWEEN THE PROBE AND THE CREATE.
    *
    * When set to a name, the fake server answers the existence probe TRUTHFULLY — absent, because
    * at that instant it is — and then records that name as created by somebody else before the
-   * CREATE arrives.
-   *
-   * r9: it creates WITHOUT taking the provisioning lock and WITHOUT the ownership stamp
-   * (`datconnlimit` -1, PostgreSQL's default), which is the only way this can still happen now.
-   * A provisioner that takes the lock cannot be in that gap at all — that is what
-   * `the provisioning lock EXCLUDES a second provisioner` below proves.
+   * CREATE arrives. It is a NON-PARTICIPANT: it takes no lock and carries no marker, because
+   * after r10 there is no lock to take and no marker to carry, and it must be droppable by
+   * nothing this module does.
    */
   createdByAnotherProvisionerAfterProbe: null as string | null,
-  /** A foreign session already holding the provisioning lock for a name, from before this run. */
-  lockHeldByForeignSession: null as string | null,
 }
-
-const FOREIGN_BACKEND_PID = 999
 
 function resetWire(): void {
   wire.databases.clear()
   wire.connections = 0
   wire.statements = []
   wire.liveSessions.clear()
-  wire.advisoryLocks.clear()
-  wire.lockSessions = []
   wire.loseCreateResponse = false
   wire.loseCreateBeforeExecuting = false
   wire.failDrop = false
   wire.failEndAfterCreate = false
-  wire.killLockSessionWithCreateSession = false
   wire.createdByAnotherProvisionerAfterProbe = null
-  wire.lockHeldByForeignSession = null
 }
 
-/** `CREATE DATABASE "x" CONNECTION LIMIT 4242` / `DROP DATABASE IF EXISTS "x" ...` -> `x`. */
+/** `CREATE DATABASE "x"` / `DROP DATABASE IF EXISTS "x" ...` -> `x`. */
 function quotedName(statement: string): string {
   const match = /"((?:[^"]|"")*)"/.exec(statement)
   if (!match) throw new Error(`the fake server could not find a quoted name in: ${statement}`)
   return match[1].replace(/""/g, '"')
-}
-
-/** The `CONNECTION LIMIT` a CREATE asked for, or PostgreSQL's default when it asked for none. */
-function requestedConnectionLimit(statement: string): number {
-  const match = /CONNECTION LIMIT\s+(-?\d+)/.exec(statement)
-  return match ? Number(match[1]) : -1
-}
-
-/** A dead backend: it answers nothing, and every session lock it held is freed at once. */
-function terminateBackend(pid: number): void {
-  wire.liveSessions.delete(pid)
-  for (const [key, holder] of [...wire.advisoryLocks]) {
-    if (holder === pid) wire.advisoryLocks.delete(key)
-  }
 }
 
 let nextBackendPid = 1000
@@ -279,7 +262,7 @@ class FakeMaintenanceClient {
 
   constructor(_config: { connectionString: string }) { void _config }
 
-  /** `pg` emits `error` on an idle client whose socket fails; the lock holder listens for it. */
+  /** `pg` emits `error` on an idle client whose socket fails. Kept so a listener cannot crash it. */
   on(event: string, listener: (error: Error) => void): this {
     if (event === 'error') this.errorListeners.push(listener)
     return this
@@ -292,7 +275,7 @@ class FakeMaintenanceClient {
 
   /** The server terminating this backend, and telling the client the only way it can. */
   kill(): void {
-    terminateBackend(this.backendPid)
+    wire.liveSessions.delete(this.backendPid)
     for (const listener of this.errorListeners) listener(new Error('Connection terminated unexpectedly'))
   }
 
@@ -302,44 +285,15 @@ class FakeMaintenanceClient {
       throw new Error('Client has encountered a connection error and is not queryable')
     }
 
-    if (text.startsWith('SELECT set_config')) {
-      return { rows: [{ set_config: String((values ?? [])[1]) }] }
-    }
-
-    if (text.startsWith('SELECT pg_advisory_lock')) {
-      const key = `${(values ?? [])[0]}/${(values ?? [])[1]}`
-      const holder = wire.advisoryLocks.get(key)
-      if (holder !== undefined && holder !== this.backendPid && wire.liveSessions.has(holder)) {
-        // A REAL SERVER WOULD BLOCK, then cancel at `lock_timeout`. The fake collapses the wait to
-        // its outcome, which is the observable this module reacts to: SQLSTATE 55P03.
-        throw Object.assign(new Error('canceling statement due to lock timeout'), { code: '55P03' })
-      }
-      wire.advisoryLocks.set(key, this.backendPid)
-      wire.lockSessions.push(this)
-      return { rows: [{ pg_advisory_lock: null }] }
-    }
-
-    if (text.startsWith('SELECT count(*)::int AS held FROM pg_locks')) {
-      const key = `${(values ?? [])[1]}/${(values ?? [])[2]}`
-      return { rows: [{ held: wire.advisoryLocks.get(key) === this.backendPid ? 1 : 0 }] }
-    }
-
     if (text.startsWith('SELECT 1 FROM pg_database')) {
       const name = String((values ?? [])[0])
       const answer = { rows: wire.databases.has(name) ? [{ exists: 1 }] : [] }
       // AFTER the answer is computed, so the probe reports what was true when it ran and the race
-      // lands in the gap that the finding is about. -1 because a NON-PARTICIPANT created it: it
-      // does not take the lock, and it does not carry this module's ownership stamp.
+      // lands in the gap that the finding is about.
       if (wire.createdByAnotherProvisionerAfterProbe !== null) {
-        wire.databases.set(wire.createdByAnotherProvisionerAfterProbe, -1)
+        wire.databases.add(wire.createdByAnotherProvisionerAfterProbe)
       }
       return answer
-    }
-
-    if (text.startsWith('SELECT datconnlimit FROM pg_database')) {
-      const name = String((values ?? [])[0])
-      const limit = wire.databases.get(name)
-      return { rows: limit === undefined ? [] : [{ datconnlimit: limit }] }
     }
 
     if (text.startsWith('CREATE DATABASE')) {
@@ -348,7 +302,6 @@ class FakeMaintenanceClient {
       const dying = wire.loseCreateResponse || wire.loseCreateBeforeExecuting
       const die = () => {
         this.kill()
-        if (wire.killLockSessionWithCreateSession) for (const session of wire.lockSessions) session.kill()
         throw new Error('Connection terminated unexpectedly')
       }
       // The statement never reached the server: nothing happens on it, and the client still dies.
@@ -358,8 +311,8 @@ class FakeMaintenanceClient {
         // is left ALONE — this branch must not touch `wire.databases`, or the assertion that the
         // winner's database survived would be measuring the fake instead of the fix.
         //
-        // r9: the response can be LOST HERE TOO, and that is the combined race. The server has
-        // still refused; the client simply never finds out which answer it was owed.
+        // The response can be LOST HERE TOO, and that is the combined race. The server has still
+        // refused; the client simply never finds out which answer it was owed.
         if (dying) die()
         throw Object.assign(new Error(`database "${name}" already exists`), {
           code: '42P04',
@@ -367,10 +320,10 @@ class FakeMaintenanceClient {
           routine: 'createdb',
         })
       }
-      // THE SERVER DOES THE WORK EITHER WAY. That is the r7 finding: the database exists whether
-      // or not the client survives long enough to be told, and it carries the stamp the statement
-      // asked for.
-      wire.databases.set(name, requestedConnectionLimit(text))
+      // THE SERVER DOES THE WORK EITHER WAY. That is the r7 finding, and it is still true: the
+      // database exists whether or not the client survives long enough to be told. What changed in
+      // r10 is what this module does about it — nothing, on purpose.
+      wire.databases.add(name)
       if (dying) die()
       return { rows: [] }
     }
@@ -381,17 +334,20 @@ class FakeMaintenanceClient {
       return { rows: [] }
     }
 
+    // THE STRUCTURAL GUARD. Every withdrawn mechanism — `SELECT pg_advisory_lock`, `SELECT
+    // set_config`, `SELECT datconnlimit FROM pg_database` — lands here and fails the test that
+    // reached it, so the r10 removal cannot be quietly undone.
     throw new Error(`the fake server was asked for an unmodelled statement: ${text}`)
   }
 
   async end(): Promise<void> {
     if (this.issuedCreate && wire.failEndAfterCreate) {
       // The session is gone as far as the server is concerned; the CLIENT is what failed to be
-      // told cleanly. That is the r9 LOW: a CREATE that SUCCEEDED and a teardown that did not.
-      terminateBackend(this.backendPid)
+      // told cleanly. A CREATE that SUCCEEDED and a teardown that did not.
+      wire.liveSessions.delete(this.backendPid)
       throw new Error('Connection terminated unexpectedly')
     }
-    terminateBackend(this.backendPid)
+    wire.liveSessions.delete(this.backendPid)
   }
 }
 
@@ -411,15 +367,6 @@ async function withWiredUrl<T>(run: () => Promise<T>): Promise<T> {
   }
 }
 
-/** Seed a lock held by somebody who is not us, so the acquisition below has to contend for it. */
-function seedForeignLock(name: string): void {
-  wire.liveSessions.add(FOREIGN_BACKEND_PID)
-  wire.advisoryLocks.set(
-    `${THROWAWAY_DATABASE_PROVISION_LOCK_NAMESPACE}/${provisionLockId(name)}`,
-    FOREIGN_BACKEND_PID,
-  )
-}
-
 /** Run a provision and hand back whatever came out, refusal included. Never short-circuits. */
 async function capture(options: Parameters<typeof provisionThrowawayDatabase>[0]): Promise<unknown> {
   return withWiredUrl(async () =>
@@ -429,79 +376,149 @@ async function capture(options: Parameters<typeof provisionThrowawayDatabase>[0]
 
 const drops = () => wire.statements.filter((statement) => statement.startsWith('DROP DATABASE'))
 const creates = () => wire.statements.filter((statement) => statement.startsWith('CREATE DATABASE'))
-const locks = () => wire.statements.filter((statement) => statement.startsWith('SELECT pg_advisory_lock'))
+
+/**
+ * Anything that would let this module DECIDE ownership from what is on the server rather than
+ * from what the server answered its own CREATE.
+ *
+ * `datconnlimit` was r9's ownership stamp; `pg_advisory_lock`/`pg_locks`/`set_config` were r9's
+ * exclusion window and its `lock_timeout`. `datdba`, `datacl` and `pg_shdescription` are the
+ * neighbouring attributes a fifth round would reach for next. None of them is provenance — every
+ * one is a value some other caller can also produce — which is why the rule is now "the server
+ * told me my own CREATE completed" and nothing else.
+ */
+const OWNERSHIP_INFERENCE = /datconnlimit|pg_advisory|pg_locks|set_config|datdba|datacl|pg_shdescription/i
+const inferenceStatements = () => wire.statements.filter((statement) => OWNERSHIP_INFERENCE.test(statement))
 
 test('CONTROL: the fake wire really provisions, so the refusals below are not refusing everything', async () => {
   resetWire()
   await withWiredUrl(async () => {
     // `migrateTimeoutMs: 1` makes `prisma migrate deploy` fail immediately — which is the r6
     // cleanup path, and it proves the fake server records a DROP when one is issued. Without this
-    // arm, a missing DROP in the test below could mean the wire never worked at all.
+    // arm, a missing DROP in the tests below could mean the wire never worked at all.
     await assert.rejects(
       () => provisionThrowawayDatabase({ label: 'alnkfence', mintName: () => MINTED, migrateTimeoutMs: 1 }),
       refusal(/could not migrate ims_throwaway_alnkfence_0123456789abcdef/),
     )
   })
-  assert.deepEqual(
-    creates(),
-    [`CREATE DATABASE "${MINTED}" CONNECTION LIMIT ${THROWAWAY_DATABASE_CONNECTION_LIMIT}`],
-    'the CREATE did not carry the ownership stamp the reclaim decides on',
-  )
-  assert.equal(locks().length, 1, 'the provisioning lock was never taken')
+  assert.deepEqual(creates(), [`CREATE DATABASE "${MINTED}"`])
   assert.ok(drops().length > 0, 'the migration-failure cleanup issued no DROP')
-  assert.equal(wire.databases.size, 0, `the migration-failure cleanup left ${[...wire.databases.keys()].join(', ')} behind`)
-  // And the lock did not outlive the provisioning attempt.
-  assert.equal(wire.advisoryLocks.size, 0, 'the provisioning lock was never released')
+  assert.equal(wire.databases.size, 0, `the migration-failure cleanup left ${[...wire.databases].join(', ')} behind`)
 })
 
-test('r7 LOW: a CREATE whose response is LOST leaves no orphan', async () => {
+// -------------------------------------------------------------------------------------------
+// PROOF 4 — WHAT NO LONGER EXISTS. Asserted on the wire so it cannot be undone by a source edit.
+// -------------------------------------------------------------------------------------------
+
+test('r10: a provision issues NO lock, NO stamp and NO ownership probe — the whole statement list', async () => {
   resetWire()
-  wire.loseCreateResponse = true
+  await capture({ label: 'alnkfence', mintName: () => MINTED, migrateTimeoutMs: 1 })
 
-  await withWiredUrl(async () => {
-    await assert.rejects(
-      () => provisionThrowawayDatabase({ label: 'alnkfence', mintName: () => MINTED }),
-      refusal(/could not create ims_throwaway_alnkfence_0123456789abcdef[\s\S]*CREATE had already been ISSUED[\s\S]*reclaimed; nothing was left behind/),
-    )
-  })
+  // THE EXACT WIRE, in order. A stronger assertion than "does not contain X": anything ADDED here
+  // has to be argued for, which is the property four rounds of added machinery needed and lacked.
+  assert.deepEqual(wire.statements, [
+    'SELECT 1 FROM pg_database WHERE datname = $1',
+    `CREATE DATABASE "${MINTED}"`,
+    `DROP DATABASE IF EXISTS "${MINTED}" WITH (FORCE)`,
+  ])
 
-  // THE ASSERTION THAT IS THE FINDING. The server DID create it — the fake adds it before the
-  // rejection, exactly as PostgreSQL would — and it is gone again.
-  assert.equal(
-    wire.databases.size,
-    0,
-    `a lost CREATE response left ${[...wire.databases.keys()].join(', ')} on the server`,
+  // Named individually so a failure says WHICH mechanism came back.
+  assert.deepEqual(inferenceStatements(), [], 'an ownership-inference statement was issued')
+  assert.ok(
+    creates().every((statement) => !/CONNECTION LIMIT/i.test(statement)),
+    'the CREATE carries a CONNECTION LIMIT again — r9 stamped 4242 there and r10 removed it, '
+    + 'because an ordinary caller-settable attribute is not provenance',
   )
-  // And the reclaim used FRESH connections: the one that issued the CREATE is the one that just
-  // died, so a cleanup routed through it would be no cleanup at all. Four in total — the lock
-  // session, the create session, the re-probe that establishes ownership, and the drop.
-  assert.equal(wire.connections, 4, `the reclaim did not open its own connections (${wire.connections} in total)`)
-  assert.deepEqual(drops(), [`DROP DATABASE IF EXISTS "${MINTED}" WITH (FORCE)`])
-  // The migration was never started: there was no database to migrate.
-  assert.ok(!wire.statements.some((statement) => statement.includes('migrate')))
+
+  // AND THE CONNECTION BUDGET, which is the same fact counted a different way. r9 opened four on
+  // the lost-response path (lock session, create session, re-probe, drop); a provision that
+  // creates and drops now opens two, and the failing paths below open ONE.
+  assert.equal(wire.connections, 2, `a provision opened ${wire.connections} connections`)
 })
 
-test('r7 LOW: a reclaim that ALSO fails says the orphan may remain, and names it', async () => {
+test('r10: the module exports no lock id and no ownership stamp', async () => {
+  // The r9 API surface, gone. `provisionLockId` mapped an unbounded name space into 31 bits and
+  // claimed on its way past that "two lanes with different names never contend" — which was FALSE
+  // (`..._0000000000004f42` and `..._00000000000091c8` both hash to 75924636, so two unrelated
+  // lanes could block or time each other out). The false claim is fixed by there being no lock:
+  // nothing hashes a name, so nothing can collide on one.
+  const helper = await import('@/tests/helpers/throwaway-database') as unknown as Record<string, unknown>
+  for (const removed of ['provisionLockId', 'THROWAWAY_DATABASE_CONNECTION_LIMIT']) {
+    assert.equal(helper[removed], undefined, `${removed} is back; the r10 removal was undone`)
+  }
+  const registry = await import('@/lib/db/advisory-locks') as unknown as Record<string, unknown>
+  assert.equal(
+    registry['THROWAWAY_DATABASE_PROVISION_LOCK_NAMESPACE'],
+    undefined,
+    'the provisioning lock namespace is back in the registry',
+  )
+})
+
+// -------------------------------------------------------------------------------------------
+// PROOF 1 — A LOST CREATE RESPONSE LEAVES THE DATABASE AND NAMES IT.
+//
+// This is the r7 test INVERTED, deliberately and with the reason recorded. r7 asserted the
+// database was GONE afterwards; r10 asserts it is STILL THERE and that no DROP was issued, on the
+// grounds that "it might be mine" is not a licence to destroy it. The leak is the accepted cost.
+// -------------------------------------------------------------------------------------------
+
+test('r10 HIGH: a CREATE whose response is LOST is LEFT ON THE SERVER, and no DROP is issued', async () => {
   resetWire()
   wire.loseCreateResponse = true
-  wire.failDrop = true
 
-  await withWiredUrl(async () => {
-    await assert.rejects(
-      () => provisionThrowawayDatabase({ label: 'alnkfence', mintName: () => MINTED }),
-      refusal(new RegExp(`reclaiming DROP ALSO FAILED[\\s\\S]*${MINTED} MAY still exist on the server`)),
-    )
-  })
+  const outcome = await capture({ label: 'alnkfence', mintName: () => MINTED })
 
-  // The honest outcome: it IS still there, and the refusal said so by name rather than reporting
-  // a clean failure over a database nobody will ever look for.
-  assert.deepEqual([...wire.databases.keys()], [MINTED])
+  // PRECONDITION: the server really did execute the CREATE, so there IS something to leak.
+  assert.deepEqual(creates(), [`CREATE DATABASE "${MINTED}"`], 'the CREATE never ran, so this proves nothing')
+  assert.deepEqual([...wire.databases], [MINTED], 'the fake did not create the database this test is about')
+
+  // THE FINDING, ON THE WIRE. `DROP DATABASE IF EXISTS` against a database that is there SUCCEEDS
+  // and destroys it silently, so "it did not throw" measures nothing — the assertion is that no
+  // DROP went down the wire at all.
+  assert.deepEqual(drops(), [], 'the lost-response path issued a DROP for a CREATE it never saw complete')
+  assert.deepEqual(inferenceStatements(), [], 'the cleanup went looking for evidence of ownership again')
+
+  // ONE connection: the probe-and-create session. r9 opened four here. Nothing re-probes and
+  // nothing drops, so nothing else is opened.
+  assert.equal(wire.connections, 1, `the lost-response path opened ${wire.connections} connections`)
+
+  // AND THE LEAK IS SURFACED. An operator has to be able to find it, so the refusal names it.
+  assert.ok(outcome instanceof ThrowawayDatabaseError, `expected a named refusal, got ${String(outcome)}`)
+  assert.match(outcome.message, /NO ANSWER CAME BACK/)
+  assert.match(outcome.message, new RegExp(`${MINTED} MAY BE LEFT ON THE SERVER`))
+  assert.match(outcome.message, /dropped by hand/)
+  assert.match(outcome.message, /NOTHING WAS DROPPED/)
+  assert.doesNotMatch(outcome.message, /nothing was left behind/)
 })
+
+test('r10: a CREATE that never reached the server is reported the SAME way — nothing is claimed', async () => {
+  resetWire()
+  wire.loseCreateBeforeExecuting = true
+
+  const outcome = await capture({ label: 'alnkfence', mintName: () => MINTED })
+
+  assert.deepEqual(creates(), [`CREATE DATABASE "${MINTED}"`])
+  assert.equal(wire.databases.size, 0, 'the fake executed a statement it was told never arrived')
+  assert.deepEqual(drops(), [], 'a name that was never created was still dropped')
+
+  // r9 DISTINGUISHED this from the case above by re-probing under its lock, and said so in the
+  // message. r10 does not: telling them apart requires exactly the ownership inference that was
+  // removed, and the honest report is that this process does not know. The two messages are
+  // identical BY DESIGN, and this assertion is what says that is deliberate rather than a bug.
+  assert.ok(outcome instanceof ThrowawayDatabaseError, `expected a named refusal, got ${String(outcome)}`)
+  assert.match(outcome.message, /NO ANSWER CAME BACK/)
+  assert.match(outcome.message, new RegExp(`${MINTED} MAY BE LEFT ON THE SERVER`))
+  assert.deepEqual(inferenceStatements(), [], 'the cleanup re-probed to tell the two cases apart')
+})
+
+// -------------------------------------------------------------------------------------------
+// PROOF 2 — A DATABASE THIS PROCESS DID NOT CREATE IS NEVER DROPPED, BY ANY PATH.
+// -------------------------------------------------------------------------------------------
 
 test('r7 LOW: the ALREADY EXISTS refusal must NOT drop — it protects a database this lane did not create', async () => {
   resetWire()
   // Somebody else's database, sitting under a name this lane happened to mint.
-  wire.databases.set(MINTED, -1)
+  wire.databases.add(MINTED)
 
   await withWiredUrl(async () => {
     await assert.rejects(
@@ -510,28 +527,10 @@ test('r7 LOW: the ALREADY EXISTS refusal must NOT drop — it protects a databas
     )
   })
 
-  // THE CLEANUP IS KEYED ON "THE CREATE WAS ISSUED", and it was not. A cleanup keyed on the NAME
-  // instead would drop exactly the database this refusal exists to protect.
-  assert.deepEqual([...wire.databases.keys()], [MINTED], 'the already-exists refusal dropped somebody else\'s database')
+  assert.deepEqual([...wire.databases], [MINTED], "the already-exists refusal dropped somebody else's database")
   assert.deepEqual(drops(), [])
   assert.deepEqual(creates(), [])
 })
-
-// ===========================================================================================
-// ROUND 8, Codex HIGH — THE PROBE IS NOT A LOCK, AND `42P04` IS PROOF OF SOMEBODY ELSE.
-//
-// The existence probe and the `CREATE DATABASE` are two statements. Under r8 nothing held the
-// name between them, so two provisioners could both observe it absent; one won the CREATE and the
-// other was REJECTED with SQLSTATE 42P04, and the loser carried that rejection into the
-// lost-response cleanup and issued `DROP DATABASE IF EXISTS` — against the WINNER'S database.
-//
-// r9 puts a lock between them, so a PARTICIPANT can no longer be in that gap at all. What can
-// still be there is something that does not take the lock, and these two tests are about it.
-//
-// PROVED ON THE WIRE, NOT BY THE ABSENCE OF AN EXCEPTION. `DROP DATABASE IF EXISTS` against a
-// database that is there SUCCEEDS and destroys it silently, so "it did not throw" measures
-// nothing at all. The assertion is over `wire.statements`: no DROP was issued.
-// ===========================================================================================
 
 test('r8 HIGH: a CREATE rejected with 42P04 must issue NO DROP — the winner keeps its database', async () => {
   resetWire()
@@ -545,19 +544,12 @@ test('r8 HIGH: a CREATE rejected with 42P04 must issue NO DROP — the winner ke
 
   // THE PRECONDITION, ASSERTED so this cannot pass vacuously: the race really was reached — the
   // probe found nothing, and the CREATE was issued anyway and hit the winner.
-  assert.deepEqual(
-    creates(),
-    [`CREATE DATABASE "${MINTED}" CONNECTION LIMIT ${THROWAWAY_DATABASE_CONNECTION_LIMIT}`],
-    'the CREATE never ran, so this test proves nothing about what happens when it is rejected',
-  )
+  assert.deepEqual(creates(), [`CREATE DATABASE "${MINTED}"`], 'the CREATE never ran, so this test proves nothing about what happens when it is rejected')
 
   // THE FINDING, ON THE WIRE.
   assert.deepEqual(drops(), [], 'the 42P04 refusal issued a DROP against the database another provisioner had just created')
+  assert.deepEqual([...wire.databases], [MINTED], "the winning provisioner's database did not survive the loser's refusal")
 
-  // And the consequence of that, stated as the thing anybody actually cares about.
-  assert.deepEqual([...wire.databases.keys()], [MINTED], "the winning provisioner's database did not survive the loser's refusal")
-
-  // Only now the refusal itself — it must be a refusal, and it must say why nothing was dropped.
   assert.ok(outcome instanceof ThrowawayDatabaseError, `expected a named refusal, got ${String(outcome)}`)
   assert.match(outcome.message, /REJECTED with SQLSTATE 42P04[\s\S]*NOTHING WAS DROPPED/)
 })
@@ -569,216 +561,153 @@ test('r8 HIGH: the 42P04 refusal is reported as a race, not as a failed create',
   const error = await capture({ label: 'alnkfence', mintName: () => MINTED })
 
   assert.ok(error instanceof ThrowawayDatabaseError, `expected a named refusal, got ${String(error)}`)
-  // A REFUSAL, in the same family as the probe's — not the reclaim's "could not create ... the
-  // CREATE had already been ISSUED", which is the wording that would say a drop had been decided
-  // on. Asserting the absence of that phrase is what keeps the two paths from drifting together.
+  // A REFUSAL, in the same family as the probe's — not the answer-unknown path's "could not create
+  // ... the CREATE had already been ISSUED", which is the wording that names a possible leak.
+  // Asserting the absence of that phrase is what keeps the two paths from drifting together.
   assert.match(error.message, new RegExp(`^throwaway database: refused ${MINTED}: `))
   assert.doesNotMatch(error.message, /had already been ISSUED/)
+  assert.doesNotMatch(error.message, /MAY BE LEFT ON THE SERVER/)
   assert.match(error.message, /positive proof another provisioner created that database/)
 })
 
-test('r8 HIGH: a lost response is still reclaimed — the two outcomes stayed distinguishable', async () => {
-  // The regression guard for the fix itself. It would be easy to close the 42P04 hole by never
-  // dropping after a CREATE at all, which would reopen r7. Both arms have to hold at once.
+test('r10 HIGH: THE COMBINED RACE — another provisioner won AND the 42P04 was lost: no DROP', async () => {
+  // r9 needed a lock AND a stamp to survive this one, and r10 found both unsound. It now needs
+  // NEITHER: the module never saw its own CREATE complete, so it does not drop. That is the whole
+  // argument, and there is nothing in it a third party can satisfy.
   resetWire()
-  wire.loseCreateResponse = true
-  await withWiredUrl(async () => {
-    await assert.rejects(
-      () => provisionThrowawayDatabase({ label: 'alnkfence', mintName: () => MINTED }),
-      refusal(/CREATE had already been ISSUED[\s\S]*reclaimed; nothing was left behind/),
-    )
-  })
-  assert.deepEqual(drops(), [`DROP DATABASE IF EXISTS "${MINTED}" WITH (FORCE)`], 'the lost-response reclaim stopped issuing its DROP')
-  assert.equal(wire.databases.size, 0)
-
-  // And the same run, one flag apart, must NOT drop. Same fake server, same name, same code path
-  // up to the answer the server gives — the ONLY difference is which answer arrives.
-  resetWire()
-  wire.createdByAnotherProvisionerAfterProbe = MINTED
-  await withWiredUrl(async () => {
-    await assert.rejects(
-      () => provisionThrowawayDatabase({ label: 'alnkfence', mintName: () => MINTED }),
-      refusal(/NOTHING WAS DROPPED/),
-    )
-  })
-  assert.deepEqual(drops(), [])
-  assert.deepEqual([...wire.databases.keys()], [MINTED])
-})
-
-// ===========================================================================================
-// ROUND 9, Codex HIGH — THE LOCK THE LAST ROUND SAID DID NOT EXIST.
-//
-// r8 closed the 42P04 case and documented the LOST 42P04 as unclosable: "that residue cannot be
-// closed by ordering, because closing it needs a lock the server does not offer for `CREATE
-// DATABASE`". THAT WAS FACTUALLY WRONG. The prohibition it was remembering is
-//
-//     ERROR:  25001: CREATE DATABASE cannot run inside a transaction block
-//
-// which is about TRANSACTIONS, not about locks. `pg_advisory_lock(ns, id)` is SESSION-scoped, is
-// taken and released outside any transaction, and — verified against PostgreSQL 17.11 on this
-// host — is still held after a `CREATE DATABASE` runs on that very session, while a second
-// session's `pg_try_advisory_lock` on the same key returns false throughout.
-//
-// So the residue is closed, and it is closed by a lock held on a SEPARATE maintenance session:
-// one taken on the connection that issues the CREATE would be freed by the very death that opens
-// the window. What the lock cannot exclude is a creator that does not take it, and that is what
-// the CONNECTION LIMIT ownership stamp answers.
-//
-// AND THE WIRE HAD TO CHANGE BEFORE ANY OF THIS COULD BE PROVED. r8's `loseCreateResponse`
-// applied only after a SUCCESSFUL create, so "another provisioner won AND the response was lost"
-// was not expressible on it — a proof that cannot state the failure it claims to cover.
-// ===========================================================================================
-
-test('r9 HIGH: the provisioning lock EXCLUDES a second provisioner — it never reaches the probe', async () => {
-  resetWire()
-  // Somebody else holds the lock for this exact name and has not let go.
-  seedForeignLock(MINTED)
-
-  const outcome = await capture({ label: 'alnkfence', mintName: () => MINTED, lockTimeoutMs: 5 })
-
-  assert.ok(outcome instanceof ThrowawayDatabaseError, `expected a named refusal, got ${String(outcome)}`)
-  assert.match(outcome.message, /could not take the provisioning lock/)
-  assert.match(outcome.message, /NOTHING WAS CREATED/)
-
-  // THE PRECONDITION: the lock really was attempted, so this is exclusion and not some earlier
-  // refusal that happens to look the same.
-  assert.equal(locks().length, 1, 'no attempt to take the provisioning lock was made')
-  // THE FINDING: everything downstream of the lock is unreachable while somebody else holds it.
-  // This is why a PARTICIPANT can no longer sit in the probe-to-CREATE gap.
-  assert.deepEqual(wire.statements.filter((statement) => statement.startsWith('SELECT 1 FROM pg_database')), [])
-  assert.deepEqual(creates(), [])
-  assert.deepEqual(drops(), [])
-  // And the foreign holder still holds it: a failed acquisition must not steal or clear a lock.
-  assert.equal(
-    wire.advisoryLocks.get(`${THROWAWAY_DATABASE_PROVISION_LOCK_NAMESPACE}/${provisionLockId(MINTED)}`),
-    FOREIGN_BACKEND_PID,
-  )
-})
-
-test('r9 HIGH: THE COMBINED RACE — another provisioner won AND the 42P04 was lost: no DROP', async () => {
-  resetWire()
-  // Both halves at once, which is the thing r8's wire could not express: a creator that does not
-  // take the lock takes the name after our probe, AND the resulting 42P04 never reaches us.
   wire.createdByAnotherProvisionerAfterProbe = MINTED
   wire.loseCreateResponse = true
 
   const outcome = await capture({ label: 'alnkfence', mintName: () => MINTED })
 
   // PRECONDITIONS, so this cannot pass by never reaching the race.
-  assert.equal(locks().length, 1, 'the provisioning lock was never taken, so nothing was made exclusive')
-  assert.deepEqual(
-    creates(),
-    [`CREATE DATABASE "${MINTED}" CONNECTION LIMIT ${THROWAWAY_DATABASE_CONNECTION_LIMIT}`],
-    'the CREATE never ran, so the lost 42P04 was never reached',
-  )
-  assert.ok(
-    wire.statements.some((statement) => statement.startsWith('SELECT datconnlimit FROM pg_database')),
-    'the cleanup never re-probed, so it decided without evidence',
-  )
+  assert.deepEqual(creates(), [`CREATE DATABASE "${MINTED}"`], 'the CREATE never ran, so the lost 42P04 was never reached')
 
   // THE FINDING. The winner's database is untouched, and no DROP went down the wire at all.
   assert.deepEqual(drops(), [], 'the LOST 42P04 issued a DROP against the database another provisioner had just created')
-  assert.deepEqual([...wire.databases.keys()], [MINTED])
-  assert.equal(wire.databases.get(MINTED), -1, "the winner's database was modified by the loser")
-
-  // And the refusal says WHY it did not drop: the stamp on the thing it found is not this
-  // module's, so the thing it found was not created by this module.
-  assert.ok(outcome instanceof ThrowawayDatabaseError, `expected a named refusal, got ${String(outcome)}`)
-  assert.match(outcome.message, /CREATE had already been ISSUED/)
-  assert.match(outcome.message, /whose CONNECTION LIMIT is -1, not the 4242/)
-  assert.match(outcome.message, /SOMEBODY ELSE'S\. NOTHING WAS DROPPED/)
-  assert.doesNotMatch(outcome.message, /reclaimed; nothing was left behind/)
-})
-
-test('r9 HIGH: if the LOCK SESSION itself died, nothing is dropped — the window was open', async () => {
-  resetWire()
-  // The lost-response case, except the lock session goes down with the create session. The
-  // database that is there DOES carry this lane's stamp, so the stamp alone would say "drop it" —
-  // and it must not, because between the lock dying and the cleanup running, any other
-  // provisioner could have taken the name and stamped its own.
-  wire.loseCreateResponse = true
-  wire.killLockSessionWithCreateSession = true
-
-  const outcome = await capture({ label: 'alnkfence', mintName: () => MINTED })
-
-  assert.equal(locks().length, 1, 'the provisioning lock was never taken')
-  assert.deepEqual(creates(), [`CREATE DATABASE "${MINTED}" CONNECTION LIMIT ${THROWAWAY_DATABASE_CONNECTION_LIMIT}`])
-  // The stamp IS ours — which is exactly why this test is not vacuous: the only thing standing
-  // between this database and a DROP is the lock check. Both ways of failing this line are named,
-  // because they mean opposite things: still there but unstamped is a broken fixture, gone
-  // altogether is the defect itself.
-  assert.equal(
-    wire.databases.get(MINTED),
-    THROWAWAY_DATABASE_CONNECTION_LIMIT,
-    wire.databases.has(MINTED)
-      ? "the database left behind does not carry this lane's stamp, so this test is not about the lock"
-      : 'the database was DROPPED — the cleanup decided it was this lane\'s with no held lock to say so',
-  )
-  assert.deepEqual(drops(), [], 'a cleanup with no lock still issued a DROP')
-  assert.deepEqual([...wire.databases.keys()], [MINTED])
+  assert.deepEqual([...wire.databases], [MINTED])
+  assert.deepEqual(inferenceStatements(), [], 'the cleanup inspected the winner\'s database to decide whether to drop it')
 
   assert.ok(outcome instanceof ThrowawayDatabaseError, `expected a named refusal, got ${String(outcome)}`)
-  assert.match(outcome.message, /provisioning lock \d+\/\d+ was NO LONGER HELD/)
-  assert.match(outcome.message, /NOTHING WAS DROPPED; if .* exists on the server it has to be/)
-  assert.doesNotMatch(outcome.message, /reclaimed; nothing was left behind/)
+  assert.match(outcome.message, /NO ANSWER CAME BACK/)
+  assert.match(outcome.message, /NOTHING WAS DROPPED/)
+  assert.doesNotMatch(outcome.message, /nothing was left behind/)
 })
 
-test('r9: a CREATE that never reached the server leaves nothing, and the lock says so', async () => {
-  resetWire()
-  wire.loseCreateBeforeExecuting = true
+test('r10 HIGH: a NON-PARTICIPANT holding the name survives EVERY failure mode, whatever it looks like', async () => {
+  // THE r10 FINDING IN ITS GENERAL FORM. Codex's example was a foreign database carrying
+  // `CONNECTION LIMIT 4242` — the stamp r9 read as provenance — and the point generalises: any
+  // marker this module can write, an unrelated caller can write too, and there is a window
+  // between reading one and acting on it.
+  //
+  // THE PROOF IS THEREFORE NOT "a 4242 database survives". It is that NOTHING IS ASKED. The fake
+  // server has no attributes to give and THROWS on any statement that asks for one, so a database
+  // carrying a matching limit — or any other marker a future round might reach for — cannot be
+  // distinguished from one that does not, and every path below leaves it alone.
+  for (const [arm, setup] of [
+    ['it was already there', () => { wire.databases.add(MINTED) }],
+    ['it arrived after our probe', () => { wire.createdByAnotherProvisionerAfterProbe = MINTED }],
+    ['it arrived after our probe and the 42P04 was lost', () => {
+      wire.createdByAnotherProvisionerAfterProbe = MINTED
+      wire.loseCreateResponse = true
+    }],
+    ['it arrived after our probe and our CREATE never reached the server at all', () => {
+      wire.createdByAnotherProvisionerAfterProbe = MINTED
+      wire.loseCreateBeforeExecuting = true
+    }],
+  ] as const) {
+    resetWire()
+    setup()
 
-  const outcome = await capture({ label: 'alnkfence', mintName: () => MINTED })
+    const outcome = await capture({ label: 'alnkfence', mintName: () => MINTED, migrateTimeoutMs: 1 })
 
-  assert.deepEqual(creates(), [`CREATE DATABASE "${MINTED}" CONNECTION LIMIT ${THROWAWAY_DATABASE_CONNECTION_LIMIT}`])
-  assert.equal(wire.databases.size, 0, 'the fake executed a statement it was told never arrived')
-  // A `DROP DATABASE IF EXISTS` here would be harmless, and it would still be a guess. Under the
-  // still-held lock, absent means absent for the whole window, so there is nothing to guess at.
-  assert.deepEqual(drops(), [], 'the cleanup dropped a name it had just proved was not there')
-  assert.ok(outcome instanceof ThrowawayDatabaseError, `expected a named refusal, got ${String(outcome)}`)
-  assert.match(outcome.message, /found no database called .* at all — the server never executed it/)
-  assert.match(outcome.message, /NOTHING WAS DROPPED because there was nothing there/)
+    assert.ok(outcome instanceof ThrowawayDatabaseError, `${arm}: expected a named refusal, got ${String(outcome)}`)
+    assert.deepEqual(drops(), [], `${arm}: a database this process never created was dropped`)
+    assert.deepEqual([...wire.databases], [MINTED], `${arm}: the foreign database did not survive`)
+    assert.deepEqual(inferenceStatements(), [], `${arm}: the module asked the server what the database looks like`)
+  }
 })
 
-test('r9 LOW: a CREATE that SUCCEEDED and a teardown that failed still reclaims the database', async () => {
-  // THE MUTATION THIS EXISTS FOR (Codex r9 LOW): `ownership = 'created'` after the CREATE
-  // completes had no regression proof. Changing it to `'definitely-not-mine'` leaked the newly
-  // created database and the whole suite still passed, because nothing made `client.end()` fail
-  // after a successful CREATE — the migration-failure tests exercise the RETURNED handle's
-  // separate cleanup path, which is reached only once provisioning has already succeeded.
+// -------------------------------------------------------------------------------------------
+// PROOF 3 — THE `created` PATH STILL DROPS, AND LEAVES NOTHING BEHIND.
+//
+// The counterweight to everything above: it would be easy to make all of Proof 2 pass by never
+// dropping at all, which would turn every lane into a leak.
+// -------------------------------------------------------------------------------------------
+
+test('r9 LOW: a CREATE that SUCCEEDED and a teardown that failed still drops the database', async () => {
+  // THE MUTATION THIS EXISTS FOR: `outcome = 'created'` after the CREATE completes had no
+  // regression proof before r9. Changing it to `'not-created'` leaks the newly created database
+  // and the rest of the suite still passes, because nothing else makes `client.end()` fail after
+  // a successful CREATE.
   resetWire()
   wire.failEndAfterCreate = true
 
   const outcome = await capture({ label: 'alnkfence', mintName: () => MINTED })
 
-  // PRECONDITION: the CREATE really did succeed and the database really was created, so the
-  // failure under test is the teardown and nothing else.
-  assert.deepEqual(creates(), [`CREATE DATABASE "${MINTED}" CONNECTION LIMIT ${THROWAWAY_DATABASE_CONNECTION_LIMIT}`])
-  assert.ok(
-    wire.statements.every((statement) => !statement.startsWith('SELECT datconnlimit')),
-    'a COMPLETED create should not need re-probing: the server already answered',
-  )
+  // PRECONDITION: the CREATE really did succeed, so the failure under test is the teardown.
+  assert.deepEqual(creates(), [`CREATE DATABASE "${MINTED}"`])
 
-  // THE FINDING: it is reclaimed, and the wire says so.
+  // THE FINDING: it is dropped, and the wire says so. No probe was needed to license it — the
+  // server had already answered this process's own CREATE.
   assert.deepEqual(drops(), [`DROP DATABASE IF EXISTS "${MINTED}" WITH (FORCE)`], 'a CREATE that succeeded and then failed to tear down leaked its database')
-  assert.equal(wire.databases.size, 0, `the created database was left behind: ${[...wire.databases.keys()].join(', ')}`)
+  assert.equal(wire.databases.size, 0, `the created database was left behind: ${[...wire.databases].join(', ')}`)
+  assert.deepEqual(inferenceStatements(), [], 'a COMPLETED create should not need corroborating: the server already answered')
 
   assert.ok(outcome instanceof ThrowawayDatabaseError, `expected a named refusal, got ${String(outcome)}`)
-  assert.match(outcome.message, /had already been ISSUED and had SUCCEEDED[\s\S]*reclaimed; nothing was left behind/)
+  assert.match(outcome.message, /had already been ISSUED and had SUCCEEDED[\s\S]*nothing was left behind/)
 })
 
-test('r9: the provisioning lock is RELEASED on every exit, success and refusal alike', async () => {
-  // A lock that outlived its provisioner would wedge the next lane on the same name for good, and
-  // it is invisible until it happens. Each arm is a different exit from the function.
-  for (const [arm, setup] of [
-    ['migration failure', () => { /* migrateTimeoutMs does the work */ }],
-    ['lost response', () => { wire.loseCreateResponse = true }],
-    ['42P04', () => { wire.createdByAnotherProvisionerAfterProbe = MINTED }],
-    ['already exists', () => { wire.databases.set(MINTED, -1) }],
+test('r10: the two outcomes stayed DISTINGUISHABLE — a completed CREATE drops, a lost one does not', async () => {
+  // The regression guard for the rule itself, run as one test so the two arms cannot drift apart.
+  // Same fake server, same name, same code path up to the answer the server gives; the ONLY
+  // difference is whether this process saw its own CREATE complete.
+  resetWire()
+  wire.failEndAfterCreate = true
+  await capture({ label: 'alnkfence', mintName: () => MINTED })
+  assert.deepEqual(drops(), [`DROP DATABASE IF EXISTS "${MINTED}" WITH (FORCE)`], 'the completed-CREATE path stopped dropping, so every lane now leaks')
+  assert.equal(wire.databases.size, 0)
+
+  resetWire()
+  wire.loseCreateResponse = true
+  await capture({ label: 'alnkfence', mintName: () => MINTED })
+  assert.deepEqual(drops(), [], 'the lost-response path started dropping again')
+  assert.deepEqual([...wire.databases], [MINTED])
+})
+
+// -------------------------------------------------------------------------------------------
+// AND WHEN THE ONE LICENSED DROP FAILS, THE LEAK IS NAMED TOO.
+// -------------------------------------------------------------------------------------------
+
+test('r10: a licensed DROP that ALSO fails says the database is left, and names it', async () => {
+  for (const [arm, options, expected] of [
+    [
+      'the teardown after a successful CREATE',
+      { migrateTimeoutMs: undefined },
+      /could not create [\s\S]*DROP that would have cleaned it up ALSO FAILED/,
+    ],
+    [
+      'the migration failure',
+      { migrateTimeoutMs: 1 },
+      /could not migrate [\s\S]*DROP that would have cleaned it up ALSO FAILED/,
+    ],
   ] as const) {
     resetWire()
-    setup()
-    await capture({ label: 'alnkfence', mintName: () => MINTED, migrateTimeoutMs: 1 })
-    assert.equal(locks().length, 1, `${arm}: the lock was not taken, so its release proves nothing`)
-    assert.equal(wire.advisoryLocks.size, 0, `${arm}: the provisioning lock was still held on the way out`)
+    wire.failDrop = true
+    // The first arm needs the provision itself to fail after a successful CREATE; the second needs
+    // it to succeed so `prisma migrate deploy` is reached and times out.
+    if (arm === 'the teardown after a successful CREATE') wire.failEndAfterCreate = true
+
+    const outcome = await capture({ label: 'alnkfence', mintName: () => MINTED, ...options })
+
+    assert.ok(outcome instanceof ThrowawayDatabaseError, `${arm}: expected a named refusal, got ${String(outcome)}`)
+    assert.match(outcome.message, expected, `${arm}: the failed DROP was not reported`)
+    assert.match(outcome.message, new RegExp(`${MINTED} IS LEFT ON THE SERVER`), `${arm}: the leak was not named`)
+    assert.match(outcome.message, /dropped by hand/)
+    // PRECONDITION: a DROP really was attempted, so this is a failed cleanup and not a skipped one.
+    assert.ok(drops().length > 0, `${arm}: no DROP was attempted, so nothing failed`)
+    // And it IS still there — the honest outcome, rather than a clean failure over a database
+    // nobody will ever look for.
+    assert.deepEqual([...wire.databases], [MINTED], `${arm}: the fixture did not leave the database behind`)
   }
 })

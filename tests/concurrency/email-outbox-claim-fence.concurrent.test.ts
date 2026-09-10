@@ -866,13 +866,19 @@ test(
        * asserted: the failure is injected at exactly that point and the database is then shown to be
        * gone from `pg_database`.
        *
-       * A SECOND CATCHABLE WINDOW WAS CLOSED IN r7, AND IT IS NOT PROVED HERE. If PostgreSQL
-       * executes `CREATE DATABASE` and the connection dies before the response arrives, the
-       * provision rejects with the database already made; `provisionThrowawayDatabase` now
-       * reclaims it over a fresh maintenance connection. That one is proved in
-       * `tests/throwaway-database-guard.test.ts` against a module-mocked `pg` wire, because it
-       * needs a server that loses a response on demand — and because a proof that only runs in
-       * this opt-in lane is a proof that mostly does not run.
+       * A SECOND CATCHABLE WINDOW IS DELIBERATELY LEFT OPEN, AND IT IS NOT PROVED HERE. If
+       * PostgreSQL executes `CREATE DATABASE` and the connection dies before the response arrives,
+       * the provision rejects with the database possibly already made. r7 through r9 tried to
+       * reclaim it — by dropping, then by a lock, then by an ownership stamp — and each attempt was
+       * found unsound in a new way, because every one of them decided ownership from evidence a
+       * third party can also produce. r10 stopped: `provisionThrowawayDatabase` now drops ONLY a
+       * name whose own `CREATE` it saw complete, so that window LEAKS ONE DATABASE and the refusal
+       * NAMES it. That is proved in `tests/throwaway-database-guard.test.ts` against a
+       * module-mocked `pg` wire, because it needs a server that loses a response on demand — and
+       * because a proof that only runs in this opt-in lane is a proof that mostly does not run.
+       *
+       * SO THERE ARE NOW TWO LEAKS WITH THE SAME MITIGATION, and the one below is the more brutal
+       * of the two. Both are answered by the NAME.
        *
        * THE REMAINING HOLE IS DEMONSTRATED TOO, NOT WAVED AT. A process that is SIGKILLed — a hard
        * runner timeout, an OOM kill, the machine losing power — runs no `finally`, no `catch` and no

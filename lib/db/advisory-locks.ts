@@ -263,31 +263,23 @@ export const ACCOUNTING_MONEY_POST_LOCK_NAMESPACE = 411_220_870
 export const SESSION_LOCK_SPACE_PROBE_NAMESPACE = SESSION_LOCK_SPACE_PROBE_NAMESPACE_FROM_URL_SCHEMA
 
 /**
- * The namespace a THROWAWAY TEST DATABASE is provisioned under (o3d-alnk r9).
+ * THERE IS NO THROWAWAY-TEST-DATABASE LOCK IN THIS REGISTRY ANY MORE (o3d-alnk r10).
  *
- * `tests/helpers/throwaway-database.ts` creates a database per concurrency lane. The probe that
- * asks whether the name is free and the `CREATE DATABASE` that takes it are two statements, and
- * nothing used to hold the name between them: two provisioners could both see it absent, one won
- * the CREATE, and the loser — whose answer never arrived — reclaimed by dropping the WINNER'S
- * database. This namespace is what holds the name across the probe, the CREATE and the cleanup
- * decision, keyed on a stable hash of the database name so two lanes with different names never
- * contend.
+ * r9 put one here — `THROWAWAY_DATABASE_PROVISION_LOCK_NAMESPACE = 411_220_873` — so that
+ * `tests/helpers/throwaway-database.ts` could hold a minted database name across its existence
+ * probe, its `CREATE DATABASE` and a cleanup that decided whether to reclaim what it found. r10
+ * DELETED that cleanup: the helper now drops only a name whose `CREATE` it watched complete, and
+ * leaks anything ambiguous rather than inferring ownership from what is on the server. With
+ * nothing left to decide, the lock excluded nobody worth excluding — two lanes mint 64 bits of
+ * fresh randomness each and never contend for a name — while its id, a 31-bit hash of that name,
+ * could make two UNRELATED lanes wait on each other. It was removed rather than kept as an
+ * optimisation of a contention that does not occur.
  *
- * SESSION-scoped, on a connection of its own, and it has to be both. `pg_advisory_xact_lock` is
- * unusable here because `CREATE DATABASE` cannot run inside a transaction block (SQLSTATE 25001),
- * and a lock taken on the connection that issues the CREATE dies with exactly the connection
- * whose death is the case being closed.
- *
- * Registered here rather than written down in the test because the o3d-4ajo rule is about the
- * VALUE being single-sourced, not about which tree the taker lives in: a namespace nothing
- * compares is how the original collision happened.
+ * 411_220_873 is deliberately NOT reused for anything else, for the same reason 918_274_234 is
+ * not: an operator reading an old `pg_locks` capture, or an old build still running, must not
+ * find that number meaning something new.
  */
-// 873, not 872: 872 is what `lib/db/database-url-schema.mjs` declares for
-// SESSION_LOCK_SPACE_PROBE_NAMESPACE, which this registry re-exports rather than
-// declares — so "the next number after 871" collided with a namespace that is
-// already live. The distinctness test below is what caught it, which is the
-// o3d-4ajo failure happening and being refused instead of shipping.
-export const THROWAWAY_DATABASE_PROVISION_LOCK_NAMESPACE = 411_220_873
+
 
 
 export const TWO_INT_ADVISORY_LOCK_NAMESPACES = {
@@ -299,5 +291,4 @@ export const TWO_INT_ADVISORY_LOCK_NAMESPACES = {
   ACCOUNTING_MONEY_POST_LOCK_NAMESPACE,
   XERO_INVOICE_NUMBER_SLOT_LOCK_NAMESPACE,
   SESSION_LOCK_SPACE_PROBE_NAMESPACE,
-  THROWAWAY_DATABASE_PROVISION_LOCK_NAMESPACE,
 } as const
