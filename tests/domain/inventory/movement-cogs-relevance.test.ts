@@ -1,4 +1,6 @@
 import assert from 'node:assert/strict'
+import { readFileSync, readdirSync, type Dirent } from 'node:fs'
+import { join } from 'node:path'
 import test from 'node:test'
 import { StockMovementType, StockTransferStatus } from '../../../app/generated/prisma/client.ts'
 import {
@@ -285,4 +287,128 @@ test('the transfer-status list is NOT derived from the transfer state machine (6
     TRANSFER_STATUSES_WITH_OUTSTANDING_SOURCE_CONSUMPTION.includes('CANCELLED'),
     'CANCELLED is only reachable post-dispatch via a path the state machine does not model',
   )
+})
+
+// ---------------------------------------------------------------------------
+// The retired claim, wherever it appears (Codex r5 LOW)
+// ---------------------------------------------------------------------------
+
+/**
+ * The classification value IN_TRANSIT used to carry. Assembled from parts so that
+ * this file is not itself an offender and needs no self-exemption — a census that
+ * excuses itself is one edit away from excusing the thing it is looking for.
+ */
+const RETIRED_IN_TRANSIT_CONSUMPTION = 'OUTSTANDING' + '_AWAITING_DESTINATION_LAYER'
+
+/** The vocabulary the registry actually defines today, DERIVED rather than restated. */
+const LIVE_CONSUMPTION_VALUES = new Set(
+  Object.values(STOCK_TRANSFER_SOURCE_LAYER_CONSUMPTION).map((entry) => entry.consumption as string),
+)
+
+const CLAIM_CENSUS_ROOTS = ['app', 'lib', 'components', 'docs', 'help-docs', 'prisma', 'scripts', 'tests', 'e2e']
+const CLAIM_CENSUS_EXTENSIONS = ['.ts', '.tsx', '.md', '.mdx', '.mjs', '.sql']
+const IMPROVEMENT_PLAN = join('docs', 'todo', 'ims-improvement-plan-2026-07.md')
+
+function walkTextFiles(dir: string, out: string[] = []): string[] {
+  let entries: Dirent[]
+  try {
+    entries = readdirSync(dir, { withFileTypes: true })
+  } catch {
+    return out
+  }
+  for (const entry of entries) {
+    if (entry.name === 'node_modules' || entry.name === 'generated' || entry.name === '.next') continue
+    // Skip symlinks rather than following them: docs/ is a symlink farm into
+    // help-docs/, which this walk visits directly, so following would double-count
+    // and could escape the repository entirely.
+    if (entry.isSymbolicLink()) continue
+    const full = join(dir, entry.name)
+    if (entry.isDirectory()) walkTextFiles(full, out)
+    else if (CLAIM_CENSUS_EXTENSIONS.some((extension) => full.endsWith(extension))) out.push(full)
+  }
+  return out
+}
+
+test('no file anywhere classifies IN_TRANSIT under the retired value (Codex r5 LOW)', () => {
+  // WHY THE SUBJECT MOVED OFF THE EXPORT LIST. The round-4 test asked this module what
+  // it exports and asked one note for one exact phrase. Both passed while
+  // docs/todo/ims-improvement-plan-2026-07.md still named the deleted classification
+  // and still asserted, in prose, that an IN_TRANSIT transfer has no destination
+  // layer — the invariant the change existed to remove. A test whose subject is one
+  // module cannot police a claim the repository makes somewhere else.
+  //
+  // WHAT THE SUBJECT IS INSTEAD, and why it is not a third pattern over English: the
+  // classification VOCABULARY is a closed set, derived above from the registry itself.
+  // A file naming a value the registry no longer defines is stale by construction,
+  // with no proximity rule and no grammar to argue about.
+  //
+  // WHAT IT DELIBERATELY DOES NOT COVER, stated rather than implied. The two retired
+  // EXPORT names (CONSUMPTION_HAS_… / TRANSFER_STATUSES_WITH_…) are NOT banned
+  // repo-wide, because the tombstone comments in movement-cogs-relevance.ts and the
+  // plan document legitimately name them to record that they were removed and why —
+  // and those tombstones are worth more than the rule would be. Their absence from
+  // the module is asserted separately, above. Free prose that re-asserts the claim
+  // without naming any value at all is not caught by anything here.
+  assert.ok(
+    !LIVE_CONSUMPTION_VALUES.has(RETIRED_IN_TRANSIT_CONSUMPTION),
+    'precondition: the banned value must be genuinely retired, not one the registry still uses',
+  )
+  assert.equal(
+    STOCK_TRANSFER_SOURCE_LAYER_CONSUMPTION.IN_TRANSIT.consumption,
+    'OUTSTANDING_DESTINATION_LAYER_NOT_ASSURED',
+    'precondition: the value that replaced it',
+  )
+
+  const files = CLAIM_CENSUS_ROOTS.flatMap((root) => walkTextFiles(root))
+  assert.ok(files.length > 500, `precondition: the walk must reach the repository (saw ${files.length} files)`)
+  assert.ok(
+    files.includes(IMPROVEMENT_PLAN),
+    'precondition: the walk must reach the improvement plan — the document that carried the stale claim',
+  )
+
+  const offenders = files
+    .filter((file) => readFileSync(file, 'utf8').includes(RETIRED_IN_TRANSIT_CONSUMPTION))
+    .map((file) => {
+      const source = readFileSync(file, 'utf8')
+      return `${file}:${source.slice(0, source.indexOf(RETIRED_IN_TRANSIT_CONSUMPTION)).split('\n').length}`
+    })
+
+  assert.deepEqual(
+    offenders,
+    [],
+    `${RETIRED_IN_TRANSIT_CONSUMPTION} no longer exists. A transfer STATUS cannot say whether ` +
+    'destination layers exist: a partial receipt and the WMS stock-sync alignment both leave a transfer ' +
+    'IN_TRANSIT with linked destination layers already created, and the uncovered residue is a ' +
+    `LINE-LEVEL quantity (qty less qtyReceived), tracked as o3d-nrl4. Say ` +
+    `${STOCK_TRANSFER_SOURCE_LAYER_CONSUMPTION.IN_TRANSIT.consumption} instead — including in a ` +
+    `tombstone, which can record the rename without re-using the dead value:\n${offenders.join('\n')}`,
+  )
+})
+
+test('the improvement plan describes IN_TRANSIT as the registry does (Codex r5 LOW)', () => {
+  // The specific document the finding was about, tied to the registry rather than to a
+  // phrase. It named the retired value and asserted no destination layer exists; it
+  // must now name the live one, so that a rename cannot leave it silently stale again.
+  const plan = readFileSync(IMPROVEMENT_PLAN, 'utf8')
+  assert.ok(plan.length > 5_000, `precondition: the plan was really read (saw ${plan.length} chars)`)
+  assert.ok(
+    plan.includes(STOCK_TRANSFER_SOURCE_LAYER_CONSUMPTION.IN_TRANSIT.consumption),
+    `${IMPROVEMENT_PLAN}: must name the classification IN_TRANSIT actually carries ` +
+    `(${STOCK_TRANSFER_SOURCE_LAYER_CONSUMPTION.IN_TRANSIT.consumption})`,
+  )
+  assert.ok(
+    plan.includes('o3d-nrl4'),
+    `${IMPROVEMENT_PLAN}: must still name the gap that IS open`,
+  )
+})
+
+test('the retired-value census would FAIL if the value came back (not vacuous)', () => {
+  // Proof the matcher and the walk both work, without reintroducing the value.
+  const revived = `> IN_TRANSIT is classified ${RETIRED_IN_TRANSIT_CONSUMPTION}, where no layer exists yet.`
+  assert.ok(revived.includes(RETIRED_IN_TRANSIT_CONSUMPTION))
+  // And that the banned string is the real retired value rather than a typo that could
+  // never match: it is the live value's own stem under the old, wrong ordering.
+  assert.ok(RETIRED_IN_TRANSIT_CONSUMPTION.startsWith('OUTSTANDING_'))
+  assert.ok(RETIRED_IN_TRANSIT_CONSUMPTION.endsWith('_DESTINATION_LAYER'))
+  assert.notEqual(RETIRED_IN_TRANSIT_CONSUMPTION, STOCK_TRANSFER_SOURCE_LAYER_CONSUMPTION.IN_TRANSIT.consumption)
 })

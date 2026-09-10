@@ -966,6 +966,11 @@ export async function processBookedInEvent(
               // helper declined would leave the booked-in units unlayered (Codex
               // round-4 HIGH).
               //
+              // It REFUSES a snapshot entry whose unit cost is negative (Codex
+              // round-5 HIGH, o3d-gd2f), creating nothing and aborting this
+              // transaction rather than let the stock increment above commit alone.
+              // Do NOT wrap this call in a try or a savepoint.
+              //
               // It settles NO deferred transit reclass (Codex round-4 LOW). A
               // landed-cost revaluation that landed while these units were in transit
               // was never persisted as an obligation, so creating the layer does not

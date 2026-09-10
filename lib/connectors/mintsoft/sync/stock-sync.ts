@@ -805,6 +805,11 @@ async function applyMintsoftAlignmentForProduct(params: {
         // quantity: stock is incremented for this allocation below, and an entry the
         // helper declined would leave it unlayered (Codex round-4 HIGH).
         //
+        // It REFUSES a snapshot entry whose unit cost is negative (Codex round-5
+        // HIGH, o3d-gd2f), creating nothing and aborting this transaction rather
+        // than let the allocation's stock increment commit alone. Do NOT wrap this
+        // call in a try or a savepoint.
+        //
         // Note this alignment does NOT change the transfer's status, so a transfer
         // can be IN_TRANSIT with these units fully layered and propagatable. What is
         // still uncovered is a revaluation that landed while units were in transit:

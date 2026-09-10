@@ -701,6 +701,11 @@ async function applyTransferLineReceipt(
   // layers it creates — each is reachable by propagateLandedCostToOutputs, and
   // together they cover the slice's whole quantity — so never open-code this.
   //
+  // It REFUSES a snapshot entry whose unit cost is negative (Codex round-5 HIGH,
+  // o3d-gd2f): nothing downstream can carry the sign, so it creates nothing and
+  // aborts this transaction rather than let the stock increment above commit
+  // alone. Do NOT wrap this call in a try or a savepoint.
+  //
   // It settles NOTHING (Codex round-4 LOW). A landed-cost revaluation that landed
   // while these units were in transit had no layer to journal against and IMS
   // persisted no obligation for it; creating the layer now does not discharge it,
@@ -1236,6 +1241,11 @@ export async function cancelDispatchedTransfer(id: string): Promise<TransferResu
         // layer is reachable by propagation, and the layers cover the whole restored
         // quantity (this path has no balancing step of its own, so a layer the helper
         // declined would leave the restored stock unlayered — Codex round-4 HIGH).
+        //
+        // It REFUSES a snapshot entry whose unit cost is negative (Codex round-5
+        // HIGH, o3d-gd2f), creating nothing and aborting this transaction rather
+        // than let the restore above commit alone. Do NOT wrap this call in a try
+        // or a savepoint.
         //
         // A cancellation is the OTHER way in-transit units come to rest, and it
         // settles no deferred reclass either (Codex round-4 LOW): a revaluation that

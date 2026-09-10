@@ -4,17 +4,24 @@ import { join } from 'node:path'
 import test from 'node:test'
 
 import { consumeFifoLayers } from '@/lib/cost-layers'
-import { recreateTransferCostLayersFromSnapshotSlice } from '@/lib/domain/inventory/transfer-cost-layer-recreation'
+import {
+  NegativeCostSnapshotEntryError,
+  recreateTransferCostLayersFromSnapshotSlice,
+} from '@/lib/domain/inventory/transfer-cost-layer-recreation'
 
 /**
- * 6oyu.19 / Codex round-2 HIGH-1 and round-4 HIGH (o3d-eiuo). Four paths rebuild cost
- * layers from a transfer's dispatch snapshot; two of them forgot to link the new
- * layer back to the layer it came from, which quietly removed the units from COGS
- * with nowhere for the landed-cost delta to go. These tests cover the fix's three
- * parts: the LINK is a postcondition of the shared helper (so no caller can forget
- * it), the QUANTITY is too (every caller increments stock before calling, so an entry
- * the helper declines is unlayered stock, not a reportable gap), and a census fails
- * if a fifth path open-codes the sequence again.
+ * 6oyu.19 / Codex rounds 2, 4 and 5. Four paths rebuild cost layers from a transfer's
+ * dispatch snapshot; two of them forgot to link the new layer back to the layer it
+ * came from, which quietly removed the units from COGS with nowhere for the
+ * landed-cost delta to go. These tests cover the fix's parts:
+ *
+ *  - the LINK is a postcondition of the shared helper (so no caller can forget it),
+ *  - the QUANTITY is too (every caller increments stock before calling, so an entry
+ *    the helper declines is unlayered stock, not a reportable gap),
+ *  - a NEGATIVE-cost entry is REFUSED with nothing created and the enclosing
+ *    transaction aborted (round-5 HIGH, o3d-gd2f), and
+ *  - a census fails if a fifth path open-codes the sequence again, or if any caller
+ *    wraps the call in something that could swallow the refusal.
  *
  * The helper does NOT settle a revaluation that landed while the units were in
  * transit — that machinery was withdrawn from this branch (o3d-nrl4), so there are
@@ -22,14 +29,41 @@ import { recreateTransferCostLayersFromSnapshotSlice } from '@/lib/domain/invent
  * STOCK_TRANSFER_SOURCE_LAYER_CONSUMPTION.IN_TRANSIT for what is still open.
  */
 
+/** What Postgres says once a statement in the transaction has failed. */
+const ABORTED_TRANSACTION = 'current transaction is aborted, commands ignored until end of transaction block'
+
 type Store = {
   layers: Map<string, { id: string; sourceLines: Array<Record<string, unknown>> }>
   sourceLines: Array<Record<string, unknown>>
   created: Array<Record<string, unknown>>
+  /** Every raw statement the helper issued, with its BOUND parameters. */
+  rawStatements: Array<{ sql: string; params: unknown[] }>
+  /** Mirrors Postgres: once a statement has failed, nothing else may run. */
+  aborted: boolean
+  /** Ordered log of every operation, so "aborted BEFORE anything was written" is assertable. */
+  operations: string[]
 }
 
+/**
+ * A transaction client that models the ONE Postgres behaviour this fix depends on:
+ * a failed statement poisons the transaction, and every later statement — and the
+ * COMMIT — fails with 25P02. Without that, a test asserting "the caller cannot
+ * swallow the refusal" would be asserting something about a mock that cannot refuse.
+ *
+ * Verified against a real Postgres 2026-09-10 (scratch database, Prisma 7.8.0 +
+ * @prisma/adapter-pg): an ordinary throw swallowed inside `db.$transaction` COMMITS
+ * the caller's rows (2 of 2 committed); the same swallow after this abort statement
+ * rejects the transaction with 25P02 and commits 0.
+ */
 function createStore(sourceLayerHasProvenance: boolean): { store: Store; tx: unknown } {
-  const store: Store = { layers: new Map(), sourceLines: [], created: [] }
+  const store: Store = {
+    layers: new Map(),
+    sourceLines: [],
+    created: [],
+    rawStatements: [],
+    aborted: false,
+    operations: [],
+  }
   store.layers.set('layer-src', {
     id: 'layer-src',
     sourceLines: sourceLayerHasProvenance
@@ -37,15 +71,37 @@ function createStore(sourceLayerHasProvenance: boolean): { store: Store; tx: unk
       : [],
   })
   let seq = 0
+  const guard = (operation: string) => {
+    store.operations.push(operation)
+    if (store.aborted) throw new Error(ABORTED_TRANSACTION)
+  }
   const tx = {
+    // Tagged template, as Prisma's is. Faithful rather than unconditional: it fails
+    // (and poisons the transaction) exactly when Postgres would — casting a
+    // non-numeric bound parameter to int — so a test can also express the statement
+    // that does NOT abort.
+    $executeRaw: async (strings: TemplateStringsArray, ...values: unknown[]) => {
+      const sql = strings.join('?')
+      store.operations.push('$executeRaw')
+      store.rawStatements.push({ sql, params: values })
+      if (store.aborted) throw new Error(ABORTED_TRANSACTION)
+      const castsToInt = /CAST\(\?\s*AS\s+int\)/i.test(sql)
+      if (castsToInt && Number.isNaN(Number(values[0]))) {
+        store.aborted = true
+        throw new Error(`invalid input syntax for type integer: "${String(values[0])}"`)
+      }
+      return 0
+    },
     costLayer: {
       create: async ({ data }: { data: Record<string, unknown> }) => {
+        guard('costLayer.create')
         const id = `layer-new-${++seq}`
         store.created.push({ id, ...data })
         store.layers.set(id, { id, sourceLines: [] })
         return { id }
       },
       findUnique: async ({ where }: { where: { id: string } }) => {
+        guard('costLayer.findUnique')
         const layer = store.layers.get(where.id)
         if (!layer) return null
         return { receivedQty: 10, sourceLines: layer.sourceLines }
@@ -53,20 +109,26 @@ function createStore(sourceLayerHasProvenance: boolean): { store: Store; tx: unk
       // The quantity postcondition RE-READS what was persisted rather than trusting
       // the helper's own tally, so an id it was handed for a layer that was never
       // written simply does not come back — which is the whole point.
-      findMany: async ({ where }: { where: { id: { in: string[] } } }) =>
-        store.created.filter((layer) => where.id.in.includes(layer.id as string)),
+      findMany: async ({ where }: { where: { id: { in: string[] } } }) => {
+        guard('costLayer.findMany')
+        return store.created.filter((layer) => where.id.in.includes(layer.id as string))
+      },
     },
     costLayerSourceLine: {
       create: async ({ data }: { data: Record<string, unknown> }) => {
+        guard('costLayerSourceLine.create')
         store.sourceLines.push(data)
         return data
       },
       createMany: async ({ data }: { data: Array<Record<string, unknown>> }) => {
+        guard('costLayerSourceLine.createMany')
         store.sourceLines.push(...data)
         return { count: data.length }
       },
-      count: async ({ where }: { where: { costLayerId: string } }) =>
-        store.sourceLines.filter((line) => line.costLayerId === where.costLayerId).length,
+      count: async ({ where }: { where: { costLayerId: string } }) => {
+        guard('costLayerSourceLine.count')
+        return store.sourceLines.filter((line) => line.costLayerId === where.costLayerId).length
+      },
     },
   }
   return { store, tx }
@@ -146,54 +208,185 @@ test('the reachability postcondition FAILS when no link was written (6oyu.19)', 
   assert.equal(store.sourceLines.length, 0)
 })
 
-test('a negative-cost snapshot entry is LAID DOWN, so on-hand never exceeds layer qty (o3d-eiuo)', async () => {
-  // Codex round-4 HIGH. This entry used to be skipped and counted, on the theory
-  // that a negative unit cost is corrupt provenance. It is not: recalculateLandedCosts
-  // distributes credit freight lines with no positivity filter, and
-  // updateSnapshotsForCostLayerChange rewrites stock_transfer_lines.costLayerSnapshot
-  // in place, so a credit note landing mid-transit turns a positive dispatch snapshot
-  // negative. Every caller has ALREADY incremented stock by the time it calls here, so
-  // the skip left unlayered stock that nothing reported.
-  //
-  // Assert the QUANTITIES, not the absence of a throw.
+// ---------------------------------------------------------------------------
+// The negative-cost refusal (Codex round-5 HIGH, o3d-gd2f)
+// ---------------------------------------------------------------------------
+
+/**
+ * The four call sites, as they configure the helper. All four route through ONE
+ * function (pinned by the census below), so the refusal cannot differ between them —
+ * these drive the shapes each path actually passes, including the WMS alignment's
+ * adjustmentMovementId, so a future per-path branch would have to break one of them.
+ */
+const CALL_PATHS = [
+  { name: 'manual receipt', target: { ...TARGET, contextLabel: 'transfer TR-1 receipt' } },
+  { name: 'dispatch cancellation', target: { ...TARGET, warehouseId: 'wh-source', contextLabel: 'transfer TR-1 dispatch cancellation' } },
+  { name: 'WMS webhook receipt', target: { ...TARGET, contextLabel: 'transfer TR-1 WMS receipt' } },
+  { name: 'WMS stock-sync alignment', target: { ...TARGET, adjustmentMovementId: 'mv-1', contextLabel: 'transfer line tl-1 WMS stock-sync alignment' } },
+] as const
+
+const NEGATIVE_ENTRY = { costLayerId: 'layer-src', qty: '10.000000', unitCostBase: '-1.000000' }
+
+for (const path of CALL_PATHS) {
+  test(`a negative-cost snapshot entry is REFUSED on the ${path.name} path, with nothing created (o3d-gd2f)`, async () => {
+    // Round 3 skipped the entry, leaving the caller's already-committed stock
+    // increment unlayered. Round 4 created the layer at the negative cost, which the
+    // downstream cannot represent: buildStockMovementValueFieldsFromTotal abs()es the
+    // movement total (stock-movement-value.ts:75), so a -£4 layer books a +£4
+    // TRANSFER_IN, and both connector daily syncs emit the COGS pair only when the
+    // batch total is above zero (xero/daily-sync.ts:1970, quickbooks/daily-sync.ts:1197).
+    // Round 5 refuses, and refusing is only safe because NOTHING is written.
+    const { store, tx } = createStore(false)
+
+    let captured: unknown = null
+    try {
+      await recreateTransferCostLayersFromSnapshotSlice(tx as never, path.target, [NEGATIVE_ENTRY])
+      assert.fail('the helper must REFUSE a negative-cost entry, not return')
+    } catch (thrown) {
+      captured = thrown
+    }
+    assert.ok(
+      captured instanceof NegativeCostSnapshotEntryError,
+      `expected NegativeCostSnapshotEntryError, got ${captured instanceof Error ? captured.name + ': ' + captured.message : String(captured)}`,
+    )
+
+    // It NAMES the transfer line, the entry and the negative value — the three things
+    // an operator needs to find the credit note that caused this.
+    assert.match(captured.message, /tl-1/)
+    assert.match(captured.message, /layer-src/)
+    assert.match(captured.message, /-1\.000000\/unit/)
+    assert.match(captured.message, new RegExp(path.target.contextLabel.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')))
+    assert.deepEqual(captured.entries, [{ index: 0, sourceCostLayerId: 'layer-src', qty: '10.000000', unitCostBase: '-1.000000' }])
+    assert.equal(captured.transferLineId, 'tl-1')
+
+    // NOTHING COMMITTED. This is the whole justification for refusing rather than
+    // laying the layer down: the caller's stock increment goes with it.
+    assert.deepEqual(store.created, [], 'no cost layer may be created')
+    assert.deepEqual(store.sourceLines, [], 'and no provenance link either')
+    assert.ok(
+      !store.operations.some((operation) => operation.startsWith('costLayer.') || operation.startsWith('costLayerSourceLine.')),
+      `nothing may even be ATTEMPTED before the refusal (saw ${store.operations.join(', ')})`,
+    )
+  })
+}
+
+test('the refusal aborts the transaction FIRST, so a caller that swallows it commits nothing (o3d-gd2f)', async () => {
+  // THE PROPERTY THAT MAKES THE REFUSAL SAFE. Every caller has already incremented
+  // stock in this same transaction, so a plain throw is not enough: caught and
+  // ignored, the increment commits with no layer behind it — measured against a real
+  // Postgres, 2 of 2 rows committed. The helper therefore runs a statement that is
+  // guaranteed to fail before it throws.
   const { store, tx } = createStore(false)
 
-  const result = await recreateTransferCostLayersFromSnapshotSlice(
-    tx as never,
-    TARGET,
-    [{ costLayerId: 'layer-src', qty: '10.000000', unitCostBase: '-1.000000' }],
+  await assert.rejects(
+    () => recreateTransferCostLayersFromSnapshotSlice(tx as never, TARGET, [NEGATIVE_ENTRY]),
+    NegativeCostSnapshotEntryError,
   )
 
-  const onHandIncrementedByCaller = 10
-  const layerQty = store.created.reduce((sum, layer) => sum + Number(layer.receivedQty), 0)
-  assert.equal(layerQty, onHandIncrementedByCaller, 'on-hand must equal Σ FIFO-layer qty — no unlayered stock')
-  assert.equal(result.recreatedQty, '10.000000')
-  assert.equal(result.negativeCostLayers, 1, 'the unusual valuation is recorded…')
-  assert.equal(result.createdLayers.length, 1, '…but the layer is created, not declined')
-  // The cost basis is PRESERVED, not written off to £0: a warehouse-to-warehouse move
-  // must not revalue the units it moves, and the source layer already stands here.
-  assert.equal(result.createdLayers[0].unitCostBase, '-1.000000')
-  assert.equal(Number(store.created[0].unitCostBase), -1)
-  // Still reachable by propagation — a negative layer is not exempt from the link.
-  assert.equal(store.sourceLines.length, 1)
-  assert.equal(store.sourceLines[0].sourceCostLayerId, 'layer-src')
+  // The abort statement was issued, with the sentinel BOUND rather than interpolated.
+  assert.equal(store.rawStatements.length, 1)
+  assert.match(store.rawStatements[0].sql, /CAST\(\?\s*AS\s+int\)/i)
+  assert.deepEqual(store.rawStatements[0].params, ['transfer_cost_layer_recreation_refused'])
+  assert.equal(store.operations[0], '$executeRaw', 'the abort must precede every other operation')
+  assert.equal(store.aborted, true)
+
+  // Now BE the caller that swallows it: the transaction is already unusable, so the
+  // stock increment it was about to commit cannot be committed.
+  await assert.rejects(
+    async () => {
+      try {
+        await recreateTransferCostLayersFromSnapshotSlice(tx as never, TARGET, [NEGATIVE_ENTRY])
+      } catch {
+        // "just skip this line and carry on" — the shape this defends against.
+      }
+      await (tx as { costLayer: { create: (args: unknown) => Promise<unknown> } })
+        .costLayer.create({ data: { productId: 'prod-1', qty: '10' } })
+    },
+    new RegExp(ABORTED_TRANSACTION),
+    'a swallowed refusal must leave the caller unable to write anything else',
+  )
+  assert.deepEqual(store.created, [], 'and still nothing was created')
 })
 
-test('a later FIFO consumption of a negative-cost transfer layer values it correctly (o3d-eiuo)', async () => {
-  // Where the harm of the old skip actually landed. With the layer missing, on-hand
-  // stood 10 above Σ layer qty and a later consumption of those units either failed
-  // (consumeFifoLayersStrict) or fell back to another layer's cost. Drive the REAL
-  // FIFO consumer over the layer this helper now writes and assert the value.
+test('the refusal FAILS CLOSED when the transaction cannot be aborted (o3d-gd2f)', async () => {
+  // Proof the abort is not decorative. A client with no $executeRaw cannot be
+  // poisoned, so the helper must not pretend it refused safely — it says exactly that
+  // and still creates nothing. Checked outside the try in the implementation on
+  // purpose: inside one, the TypeError would read as "the abort statement failed".
+  const { store, tx } = createStore(false)
+  const withoutRaw = { ...(tx as Record<string, unknown>) }
+  delete withoutRaw.$executeRaw
+
+  await assert.rejects(
+    () => recreateTransferCostLayersFromSnapshotSlice(withoutRaw as never, TARGET, [NEGATIVE_ENTRY]),
+    /exposes no \$executeRaw/,
+  )
+  assert.deepEqual(store.created, [])
+})
+
+test('an abort statement that SUCCEEDS is itself treated as a failure (o3d-gd2f)', async () => {
+  // The other way the guarantee could quietly evaporate: the statement runs, does not
+  // fail, and the transaction stays writable. The helper must not throw its ordinary
+  // refusal in that case, because that refusal advertises a guarantee it no longer has.
+  const { store, tx } = createStore(false)
+  const alwaysSucceeds = { ...(tx as Record<string, unknown>), $executeRaw: async () => 0 }
+
+  await assert.rejects(
+    () => recreateTransferCostLayersFromSnapshotSlice(alwaysSucceeds as never, TARGET, [NEGATIVE_ENTRY]),
+    /abort statement SUCCEEDED/,
+  )
+  assert.deepEqual(store.created, [])
+})
+
+test('a mixed slice refuses BEFORE laying down its positive entries (o3d-gd2f)', async () => {
+  // The refusal is a whole-slice pre-pass, not a per-entry check inside the loop. The
+  // transaction abort would roll a partial write back anyway, but "nothing was
+  // attempted" is a stronger property than "everything was undone" — and it is the
+  // one that survives someone later wrapping the call in a savepoint.
+  const { store, tx } = createStore(false)
+
+  await assert.rejects(
+    () => recreateTransferCostLayersFromSnapshotSlice(tx as never, TARGET, [
+      { costLayerId: 'layer-src', qty: '6.000000', unitCostBase: '5.000000' },
+      { costLayerId: 'layer-src', qty: '4.000000', unitCostBase: '-1.000000' },
+    ]),
+    NegativeCostSnapshotEntryError,
+  )
+  assert.deepEqual(store.created, [], 'the positive entry must not be written either')
+  assert.equal(store.operations[0], '$executeRaw')
+})
+
+test('a negative cost on a ZERO-quantity entry is not refused (o3d-gd2f scope)', async () => {
+  // The refusal is scoped to entries that would actually become a layer.
+  // parseCostLayerSnapshot drops non-positive quantities and the loop skips them, so
+  // such an entry lays down no units and books no movement value; refusing on one
+  // would block a legitimate receipt over a row that changes nothing. Stated as a
+  // test so that widening the scope is a decision rather than a drive-by.
+  const { store, tx } = createStore(false)
+
+  const result = await recreateTransferCostLayersFromSnapshotSlice(tx as never, TARGET, [
+    { costLayerId: 'layer-src', qty: '0.000000', unitCostBase: '-1.000000' },
+    { costLayerId: 'layer-src', qty: '10.000000', unitCostBase: '5.000000' },
+  ])
+
+  assert.equal(result.recreatedQty, '10.000000')
+  assert.equal(store.created.length, 1)
+  assert.equal(store.rawStatements.length, 0, 'nothing was refused, so nothing was aborted')
+})
+
+test('a recreated layer is consumable by the REAL FIFO consumer at the basis it carries (6oyu.19)', async () => {
+  // Where the harm of a skip actually lands, and why refusing-with-nothing-committed
+  // is a different thing from skipping-with-stock-committed. Drive the production FIFO
+  // consumer over the layer this helper writes, then show the negative control: the
+  // same 10 units on hand with NO layer is a straight FIFO shortfall valued at nothing.
   const { store, tx } = createStore(false)
   await recreateTransferCostLayersFromSnapshotSlice(
     tx as never,
     TARGET,
-    [{ costLayerId: 'layer-src', qty: '10.000000', unitCostBase: '-1.000000' }],
+    [{ costLayerId: 'layer-src', qty: '10.000000', unitCostBase: '5.000000' }],
   )
   assert.equal(store.created.length, 1, 'precondition: the transfer layer exists to be consumed')
 
-  // A minimal FIFO store seeded from the layers the helper actually created, driven
-  // by the REAL consumer so the valuation is the production one.
   function fifoTxFor(layers: Array<{ id: string; remainingQty: string; unitCostBase: string }>) {
     return {
       $executeRaw: async () => 0,
@@ -216,19 +409,13 @@ test('a later FIFO consumption of a negative-cost transfer layer values it corre
   const consumption = await consumeFifoLayers(fifoTxFor(layers) as never, 'prod-1', 'wh-dest', 4)
 
   assert.equal(consumption.remainingQty.toString(), '0', 'FIFO finds the units — no shortfall against on-hand')
-  assert.equal(consumption.consumed.length, 1, 'the transfer layer is the one consumed')
+  assert.equal(consumption.consumed.length, 1)
   assert.equal(consumption.consumed[0].qty.toString(), '4')
-  assert.equal(
-    consumption.consumed[0].unitCostBase.toString(),
-    '-1',
-    'valued at the basis it was transferred with, not silently at £0',
-  )
-  assert.equal(consumption.totalCost.toString(), '-4', 'the credit that made the layer negative reaches COGS, not nowhere')
+  assert.equal(consumption.consumed[0].unitCostBase.toString(), '5')
+  assert.equal(consumption.totalCost.toString(), '20')
   assert.equal(layers[0].remainingQty, '6', 'and the layer is drawn down, so on-hand and Σ layer qty stay equal')
 
-  // The negative control: this is what the skipped entry left behind. Same 10 units
-  // on hand (the caller incremented stock either way), no layer — FIFO comes back 4
-  // short and values the consumption at nothing.
+  // The negative control: unlayered stock is exactly a FIFO shortfall valued at £0.
   const unlayered = await consumeFifoLayers(fifoTxFor([]) as never, 'prod-1', 'wh-dest', 4)
   assert.equal(unlayered.remainingQty.toString(), '4', 'precondition: unlayered stock is exactly a FIFO shortfall')
   assert.equal(unlayered.totalCost.toString(), '0')
@@ -238,8 +425,8 @@ test('the quantity postcondition FAILS if an entry is not laid down (o3d-eiuo)',
   // Proof the guard is not vacuous. The tests above would all pass with the
   // postcondition deleted, because their entries are created. This one reaches the
   // guard with a real shortfall: the injected creator drops the second entry, exactly
-  // the shape the old negative-cost skip had — stock already incremented by the
-  // caller, one entry's worth of units left with no layer.
+  // the shape a skip has — stock already incremented by the caller, one entry's worth
+  // of units left with no layer.
   const { store, tx } = createStore(false)
 
   await assert.rejects(
@@ -248,13 +435,13 @@ test('the quantity postcondition FAILS if an entry is not laid down (o3d-eiuo)',
       TARGET,
       [
         { costLayerId: 'layer-src', qty: '6.000000', unitCostBase: '5.000000' },
-        { costLayerId: 'layer-src', qty: '4.000000', unitCostBase: '-1.000000' },
+        { costLayerId: 'layer-src', qty: '4.000000', unitCostBase: '7.000000' },
       ],
       {
         createCostLayer: (async (client: unknown, data: { qty: unknown; unitCostBase: unknown }) => {
-          // Skip the negative entry, as the withdrawn behaviour did, while still
-          // handing back an id — the shape that made the old skip invisible.
-          if (Number(String(data.unitCostBase)) < 0) return 'layer-skipped'
+          // Skip the second entry while still handing back an id — the shape that
+          // makes a skip invisible to a caller that only looks at the return value.
+          if (Number(String(data.qty)) === 4) return 'layer-skipped'
           // Mirrors the real createCostLayer's qty -> receivedQty/remainingQty mapping,
           // so the re-read the postcondition performs sees a truthful row.
           return (tx as { costLayer: { create: (args: unknown) => Promise<{ id: string }> } })
@@ -278,6 +465,8 @@ test('the quantity postcondition FAILS if an entry is not laid down (o3d-eiuo)',
 // ---------------------------------------------------------------------------
 
 const SCAN_ROOTS = ['app', 'lib']
+/** The one call the censuses below are about. */
+const CALL = 'recreateTransferCostLayersFromSnapshotSlice('
 
 function walkTypeScript(dir: string, out: string[] = []): string[] {
   for (const entry of readdirSync(dir)) {
@@ -352,51 +541,203 @@ test('copyCostLayerSourceLinesProportionally has no unguarded caller left (6oyu.
   )
 })
 
-test('no caller describes the helper as SETTLING a deferred transit reclass (Codex r4 LOW)', () => {
-  // The helper creates propagation links. It persists and posts nothing that was
-  // previously stranded, and the in-transit landed-cost gap (o3d-nrl4) is still open.
-  // Three call-site comments claimed otherwise — a maintainer told the gap is handled
-  // when it is not will not go looking for it.
-  //
-  // The rule is about the GRAMMAR OF THE CLAIM, not about proximity to a correction:
-  // "settles the/any/those <something>" is an affirmative claim of settlement wherever
-  // it appears, while "settles NOTHING" and "settles no deferred reclass" are not.
-  const AFFIRMATIVE_SETTLEMENT = /\bsettle[sd]?\s+(?:the|any|its|those|these|same|all)\b/i
+/**
+ * Strip comments and string/template bodies, preserving offsets, so a brace/paren walk
+ * cannot be fooled by a brace inside a comment or a string.
+ */
+function stripCommentsAndStrings(src: string): string {
+  let out = ''
+  let i = 0
+  while (i < src.length) {
+    const c = src[i]
+    const n = src[i + 1]
+    if (c === '/' && n === '/') { while (i < src.length && src[i] !== '\n') { out += ' '; i++ } continue }
+    if (c === '/' && n === '*') {
+      out += '  '; i += 2
+      while (i < src.length && !(src[i] === '*' && src[i + 1] === '/')) { out += src[i] === '\n' ? '\n' : ' '; i++ }
+      out += '  '; i += 2; continue
+    }
+    if (c === '\'' || c === '"' || c === '`') {
+      const quote = c
+      out += ' '; i++
+      while (i < src.length && src[i] !== quote) {
+        if (src[i] === '\\') { out += '  '; i += 2; continue }
+        out += src[i] === '\n' ? '\n' : ' '; i++
+      }
+      out += ' '; i++; continue
+    }
+    out += c; i++
+  }
+  return out
+}
 
+/**
+ * Every construct lexically enclosing `callIndex`, outermost-last, up to and including
+ * the `$transaction(` boundary. Real brace/paren matching, not a proximity regex: the
+ * question "is this call inside a try" has an exact structural answer, and a pattern
+ * that guessed at it would be the same open-space mistake the settlement guard made.
+ */
+function enclosingGuards(source: string, callIndex: number): string[] {
+  const src = stripCommentsAndStrings(source)
+  const guards: string[] = []
+  let braceDepth = 0
+  let parenDepth = 0
+  for (let j = callIndex - 1; j >= 0; j--) {
+    const ch = src[j]
+    if (ch === '}') { braceDepth++; continue }
+    if (ch === ')') { parenDepth++; continue }
+    if (ch === '{') {
+      if (braceDepth > 0) { braceDepth--; continue }
+      if (/\btry$/.test(src.slice(0, j).replace(/\s+$/, ''))) guards.push('try')
+      continue
+    }
+    if (ch === '(') {
+      if (parenDepth > 0) { parenDepth--; continue }
+      const match = /([A-Za-z_$][\w$.]*)\s*$/.exec(src.slice(Math.max(0, j - 80), j))
+      const callee = match ? match[1] : ''
+      if (callee === 'withSavepoint') { guards.push('withSavepoint'); continue }
+      if (/\$transaction$/.test(callee)) { guards.push('$transaction') ; break }
+    }
+  }
+  return guards
+}
+
+test('the enclosing-guard scanner detects what it exists to detect (not vacuous)', () => {
+  // The census below can only be trusted if this walk can actually SEE a try and a
+  // savepoint. Three synthetic call sites, one of each shape plus a clean one — so a
+  // scanner change that silently stopped matching fails here rather than turning the
+  // census into a census of nothing.
+  const call = 'recreateTransferCostLayersFromSnapshotSlice('
+  const inTry = 'await db.$transaction(async (tx) => { try { await ' + call + 'tx, t, s) } catch { } })'
+  const inSavepointExpr = 'await db.$transaction(async (tx) => { await withSavepoint(tx, () => ' + call + 'tx, t, s)) })'
+  const inSavepointBlock = 'await db.$transaction(async (tx) => { await withSavepoint(tx, async () => { await ' + call + 'tx, t, s) }) })'
+  const clean = 'await db.$transaction(async (tx) => { await ' + call + 'tx, t, s) })'
+
+  assert.deepEqual(enclosingGuards(inTry, inTry.indexOf(call)), ['try', '$transaction'])
+  assert.deepEqual(enclosingGuards(inSavepointExpr, inSavepointExpr.indexOf(call)), ['withSavepoint', '$transaction'])
+  assert.deepEqual(enclosingGuards(inSavepointBlock, inSavepointBlock.indexOf(call)), ['withSavepoint', '$transaction'])
+  assert.deepEqual(enclosingGuards(clean, clean.indexOf(call)), ['$transaction'])
+})
+
+test('no call site can swallow the refusal or undo its transaction abort (Codex r5 HIGH)', () => {
+  // THE STATIC HALF of "the refusal cannot be swallowed". The runtime half is the
+  // deliberate abort statement, which stops a caller COMMITTING after a catch. It has
+  // one hole: ROLLBACK TO SAVEPOINT clears the aborted state, so a call wrapped in
+  // withSavepoint could undo the abort and carry on. A `try` is forbidden too — not
+  // because it defeats the abort, but because a catch-and-continue is the shape this
+  // whole finding is about, and it should fail here rather than at 25P02 in production.
+  //
+  // Both are structural questions with exact answers, so this walks braces and parens
+  // rather than matching a pattern near the call.
   const files = SCAN_ROOTS.flatMap((root) => walkTypeScript(root))
-    .filter((file) => readFileSync(file, 'utf8').includes('recreateTransferCostLayersFromSnapshotSlice('))
+    .filter((file) => readFileSync(file, 'utf8').includes(CALL))
+    .filter((file) => !file.endsWith('transfer-cost-layer-recreation.ts'))
     .sort()
 
-  // Precondition: the walk actually reached the call sites. A census over an empty
-  // set passes while examining nothing.
   assert.deepEqual(
     files,
     [
       'app/actions/transfers.ts',
       'lib/connectors/mintsoft/sync/stock-sync.ts',
-      'lib/domain/inventory/transfer-cost-layer-recreation.ts',
       'lib/domain/wms/booked-in-service.ts',
     ],
-    'the set of files mentioning the helper changed — a new one must also not claim settlement',
+    'the set of caller files changed — a new one must also be checked for a swallowing wrapper',
   )
 
   const offenders: string[] = []
+  let callSites = 0
   for (const file of files) {
     const source = readFileSync(file, 'utf8')
-    for (const [index, line] of source.split('\n').entries()) {
-      if (AFFIRMATIVE_SETTLEMENT.test(line)) {
-        offenders.push(`${file}:${index + 1}: ${line.trim()}`)
+    const stripped = stripCommentsAndStrings(source)
+    let index = -1
+    while ((index = stripped.indexOf(CALL, index + 1)) !== -1) {
+      callSites += 1
+      const line = source.slice(0, index).split('\n').length
+      for (const guard of enclosingGuards(source, index)) {
+        if (guard === '$transaction') break
+        offenders.push(
+          `${file}:${line}: the call is inside a \`${guard}\`, which can turn the negative-cost refusal ` +
+          `into a silent skip (a catch continues; a savepoint rollback clears the transaction abort)`,
+        )
       }
     }
+  }
+
+  // Precondition: the walk reached every call site. A census over nothing passes.
+  assert.equal(callSites, 4, `precondition: all four call sites must be found (saw ${callSites})`)
+  assert.deepEqual(offenders, [], offenders.join('\n'))
+})
+
+// ---------------------------------------------------------------------------
+// What the call sites are allowed to SAY about the helper (Codex r4 + r5 LOW)
+// ---------------------------------------------------------------------------
+
+/**
+ * THE EXACT TEXT each call site may carry above its call, normalised (comment markers
+ * stripped, whitespace collapsed). An ALLOWLIST, not a pattern.
+ *
+ * Round 4 shipped a regex for "settles the/any/those <something>". Codex round 5 was
+ * right that it is still a pattern over an open space: "settles deferred transit
+ * reclassification" passes it, and so does "completes the deferred reclassification".
+ * A third regex would fail the same way, so the subject is closed instead — these four
+ * blocks, verbatim. ANY edit to a call-site comment fails this test, which is the
+ * point: the claim a maintainer reads there is the one thing that decided, twice, that
+ * the in-transit gap (o3d-nrl4) was handled when it is not.
+ *
+ * WHAT THIS DOES NOT COVER, stated rather than implied: prose about the helper
+ * ELSEWHERE — in these files, in the helper's own module comment, in docs/ — is not
+ * policed by anything. It cannot be, and this test does not pretend otherwise.
+ * Updating a block below is a normal, expected edit; it just has to be a deliberate one.
+ */
+const ALLOWED_CALL_SITE_COMMENTS: Record<string, string[]> = {
+  'app/actions/transfers.ts': [
+    "Recreate FIFO layers at the destination from the unconsumed slice of the dispatch snapshot (the slicer walks past alreadyReceivedQty and returns the next qtyToReceive units). The shared helper GUARANTEES two things about the layers it creates — each is reachable by propagateLandedCostToOutputs, and together they cover the slice's whole quantity — so never open-code this. It REFUSES a snapshot entry whose unit cost is negative (Codex round-5 HIGH, o3d-gd2f): nothing downstream can carry the sign, so it creates nothing and aborts this transaction rather than let the stock increment above commit alone. Do NOT wrap this call in a try or a savepoint. It settles NOTHING (Codex round-4 LOW). A landed-cost revaluation that landed while these units were in transit had no layer to journal against and IMS persisted no obligation for it; creating the layer now does not discharge it, and the delta is still sitting in the transit clearing account. That gap is open and tracked as o3d-nrl4 — see the contract on STOCK_TRANSFER_SOURCE_LAYER_CONSUMPTION.IN_TRANSIT.",
+    "Recreate FIFO layers at the SOURCE from the snapshot slice (mirrors the destination recreation in receiveTransfer, targeting fromWarehouseId). Note: the ORIGINAL layers consumed at dispatch are NOT un-consumed; this creates equivalent replacement layers (same cost basis + source-line provenance), so source quantity reconciles with cost layers. Same shared helper as the receipt path, for the same two guarantees: each replacement layer is reachable by propagation, and the layers cover the whole restored quantity (this path has no balancing step of its own, so a layer the helper declined would leave the restored stock unlayered — Codex round-4 HIGH). It REFUSES a snapshot entry whose unit cost is negative (Codex round-5 HIGH, o3d-gd2f), creating nothing and aborting this transaction rather than let the restore above commit alone. Do NOT wrap this call in a try or a savepoint. A cancellation is the OTHER way in-transit units come to rest, and it settles no deferred reclass either (Codex round-4 LOW): a revaluation that landed mid-transit was never persisted as an obligation, so nothing here discharges it and the delta stays in the transit clearing account. Open, tracked as o3d-nrl4.",
+  ],
+  'lib/connectors/mintsoft/sync/stock-sync.ts': [
+    "6oyu.19: same omission as the WMS webhook receipt path — the created layer had no costLayerSourceLine whenever the source was a plain PO-derived layer, stranding the landed-cost delta. Routed through the shared helper so the link is guaranteed, not remembered — and so is the quantity: stock is incremented for this allocation below, and an entry the helper declined would leave it unlayered (Codex round-4 HIGH). It REFUSES a snapshot entry whose unit cost is negative (Codex round-5 HIGH, o3d-gd2f), creating nothing and aborting this transaction rather than let the allocation's stock increment commit alone. Do NOT wrap this call in a try or a savepoint. Note this alignment does NOT change the transfer's status, so a transfer can be IN_TRANSIT with these units fully layered and propagatable. What is still uncovered is a revaluation that landed while units were in transit: nothing here discharges it and the delta stays in the transit clearing account. Open, tracked as o3d-nrl4.",
+  ],
+  'lib/domain/wms/booked-in-service.ts': [
+    "6oyu.19: this loop used to create the destination layer and call copyCostLayerSourceLinesProportionally IGNORING its result, which is 0 for an ordinary PO-derived source layer (it has no sourceLines of its own). The layer was therefore left with no costLayerSourceLine, so the revaluation exclusion removed these units from COGS while propagation had nowhere to carry the delta. The shared helper makes the link a postcondition, and the quantity too — this path increments stock immediately above and has no balancing layer, so an entry the helper declined would leave the booked-in units unlayered (Codex round-4 HIGH). It REFUSES a snapshot entry whose unit cost is negative (Codex round-5 HIGH, o3d-gd2f), creating nothing and aborting this transaction rather than let the stock increment above commit alone. Do NOT wrap this call in a try or a savepoint. It settles NO deferred transit reclass (Codex round-4 LOW). A landed-cost revaluation that landed while these units were in transit was never persisted as an obligation, so creating the layer does not discharge it; the delta remains in the transit clearing account. Open, tracked as o3d-nrl4.",
+  ],
+}
+
+test('each call site says exactly what it is allowed to say about the helper (Codex r5 LOW)', () => {
+  const files = Object.keys(ALLOWED_CALL_SITE_COMMENTS).sort()
+  assert.deepEqual(
+    files,
+    SCAN_ROOTS.flatMap((root) => walkTypeScript(root))
+      .filter((file) => readFileSync(file, 'utf8').includes(CALL))
+      .filter((file) => !file.endsWith('transfer-cost-layer-recreation.ts'))
+      .sort(),
+    'a new caller file must have its call-site comment allowlisted here',
+  )
+
+  for (const file of files) {
+    const lines = readFileSync(file, 'utf8').split('\n')
+    const blocks: string[] = []
+    for (const [index, line] of lines.entries()) {
+      if (!line.includes(CALL)) continue
+      let start = index
+      while (start > 0 && /^\s*\/\//.test(lines[start - 1])) start -= 1
+      blocks.push(
+        lines.slice(start, index)
+          .map((commentLine) => commentLine.replace(/^\s*\/\/ ?/, '').trim())
+          .join(' ')
+          .replace(/\s+/g, ' ')
+          .trim(),
+      )
+    }
+    assert.deepEqual(
+      blocks,
+      ALLOWED_CALL_SITE_COMMENTS[file],
+      `${file}: a call-site comment changed. Re-read it against what the helper actually does — it ` +
+      `creates propagation links and refuses a negative basis; it settles nothing and completes nothing ` +
+      `(o3d-nrl4 is still open) — then update ALLOWED_CALL_SITE_COMMENTS deliberately.`,
+    )
     assert.ok(
-      source.includes('o3d-nrl4'),
+      readFileSync(file, 'utf8').includes('o3d-nrl4'),
       `${file}: must name the still-open in-transit gap rather than leaving the reader to assume it is handled`,
     )
   }
-
-  assert.deepEqual(
-    offenders,
-    [],
-    `the helper settles nothing — it only creates propagation links:\n${offenders.join('\n')}`,
-  )
 })

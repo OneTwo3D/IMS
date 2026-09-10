@@ -29,11 +29,53 @@
  * THE SECOND POSTCONDITION IS QUANTITY (Codex round-4 HIGH, o3d-eiuo). All four
  * callers increment stock and then call this, in one transaction, so anything this
  * function declines to lay down is not a reportable gap — it is stock on hand with
- * no FIFO layer behind it. An earlier revision skipped negative-cost snapshot
- * entries and returned a count nobody read; see `negativeCostLayers` for why the
- * input is reachable rather than pathological. The layers created now cover the
- * slice's whole positive quantity or the function throws, taking the caller's stock
- * increment down with it. A skip can only ever be a visible failure, not a trade.
+ * no FIFO layer behind it. The layers created cover the slice's whole positive
+ * quantity or the function throws, taking the caller's stock increment down with it.
+ * A skip can only ever be a visible failure, not a trade.
+ *
+ * A NEGATIVE-COST SNAPSHOT ENTRY IS REFUSED, NOT LAYERED (Codex round-5 HIGH,
+ * o3d-gd2f). This is the third decision on the same input, and the first that the
+ * rest of the system can actually represent.
+ *
+ *  - The input IS reachable, so refusing is not a claim that it cannot happen.
+ *    `recalculateLandedCosts` distributes freight cost lines with no positivity
+ *    filter — its own comment names "a zero/credit cost line" — so
+ *    `grossUnitCostBase = unitCostBase + landedPerUnit` can go negative with nothing
+ *    flooring it, and it is written straight onto the layer.
+ *    `updateSnapshotsForCostLayerChange` then patches
+ *    `stock_transfer_lines.costLayerSnapshot` IN PLACE, so a credit note landing
+ *    while units are in transit rewrites a positive dispatch snapshot negative and
+ *    the receipt reads it.
+ *  - But NOTHING DOWNSTREAM CAN CARRY THE SIGN. Round 4 created the layer at the
+ *    negative cost to conserve basis as well as quantity. That conserves the layer
+ *    and corrupts the ledger, more quietly than the skip did:
+ *      · `buildStockMovementValueFieldsFromTotal`
+ *        (lib/domain/inventory/stock-movement-value.ts:75) applies `.abs()` to the
+ *        requested total, and all four callers hand it the matching negative
+ *        snapshot total. A −£4 layer therefore books a +£4 TRANSFER_IN movement,
+ *        which looks entirely ordinary.
+ *      · A later FIFO consumption of that layer goes through the same builder via
+ *        `buildStockMovementValueFieldsFromConsumed`, so the movement value is
+ *        positive while the shipment's own COGS stays negative.
+ *      · Both connector journal paths emit the COGS pair only when the batch total
+ *        is greater than zero (lib/connectors/xero/daily-sync.ts:1970,
+ *        lib/connectors/quickbooks/daily-sync.ts:1197), so a credit-derived COGS is
+ *        mis-stated or dropped entirely rather than posted.
+ *    Supporting a negative basis means making the movement, FIFO, COGS and both
+ *    connector-journal paths agree on sign. That is a large change to money code and
+ *    is not this branch's subject; it is filed as o3d-gd2f with these findings.
+ *  - So the helper REFUSES. It commits nothing, so it cannot leave unlayered stock
+ *    (the round-4 defect), cannot book a wrong movement and cannot suppress a
+ *    journal line. It fails where an operator can see it, and the action is real:
+ *    the credit note that drove the basis negative is the thing to correct.
+ *  - The refusal ABORTS THE ENCLOSING TRANSACTION before it throws, so a caller
+ *    cannot catch it and go on to commit the stock increment. See
+ *    `abortEnclosingTransactionSoTheRefusalCannotBeSwallowed`.
+ *  - The case has never occurred in development. Read-only census, 2026-09-10:
+ *    cost_layers."unitCostBase" < 0 → 0, freight_cost_lines."amountBase" < 0 → 0,
+ *    stock_transfer_lines with any snapshot entry below zero → 0. Production is
+ *    UNMEASURED, which is the whole of o3d-e65p; that census is what says whether
+ *    this refusal will ever fire on a real receipt.
  *
  * WHAT THIS FUNCTION DOES NOT DO (6oyu.19 split, o3d-nrl4). It does not settle a
  * landed-cost revaluation that happened while these units were IN TRANSIT. That
@@ -93,35 +135,6 @@ export type TransferLayerRecreationResult = {
    * to close.
    */
   recreatedQty: string
-  /**
-   * Layers created at a NEGATIVE unit cost — RECORDED, never skipped (Codex round-4
-   * HIGH; o3d-eiuo).
-   *
-   * An earlier revision skipped these entries on the theory that a negative snapshot
-   * unit cost is corrupt provenance and pathological, "since dispatch snapshots are
-   * built from real layers". BOTH halves of that were wrong, and the skip was the
-   * dangerous half:
-   *
-   *  - It is REACHABLE. `recalculateLandedCosts` distributes freight cost lines with
-   *    no positivity filter at all — its own comment names "a zero/credit cost line"
-   *    — so `grossUnitCostBase = unitCostBase + landedPerUnit` can go negative with
-   *    nothing flooring it, and it is written straight onto the layer. A snapshot is
-   *    not frozen against that either: `updateSnapshotsForCostLayerChange` patches
-   *    `stock_transfer_lines.costLayerSnapshot` IN PLACE with the new unit cost. So a
-   *    credit note landing while units are in transit rewrites a positive dispatch
-   *    snapshot negative, and the receipt then reads it.
-   *  - Skipping did not avoid the bad outcome, it created a worse one. All four
-   *    callers increment stock BEFORE calling here, so a skipped entry left UNLAYERED
-   *    STOCK: on-hand above Σ layer qty, understating inventory and leaving a later
-   *    FIFO consumption to fail or misvalue. Nothing reported it — every caller
-   *    ignored the count, and the balancing step counted the skipped units as covered.
-   *
-   * So the negative cost is preserved, not discarded: the source layer already stands
-   * at that value, and a warehouse-to-warehouse move must not revalue the units it
-   * moves. This count is a record of an unusual valuation for diagnostics; it is NOT
-   * a gap, and no caller has anything to compensate for.
-   */
-  negativeCostLayers: number
 }
 
 export type TransferCostLayerRecreationDeps = {
@@ -132,6 +145,95 @@ export type TransferCostLayerRecreationDeps = {
 const defaultDeps: TransferCostLayerRecreationDeps = {
   createCostLayer,
   copyCostLayerSourceLinesProportionally,
+}
+
+/**
+ * Thrown when a dispatch-snapshot entry carries a NEGATIVE unit cost (Codex round-5
+ * HIGH; o3d-gd2f). Exported so a caller CAN recognise it — for a message, a retry
+ * decision, an alert — but recognising it is all a caller may do with it: by the time
+ * this reaches anyone the enclosing transaction has already been aborted, so there is
+ * no half-state left to choose between.
+ */
+export class NegativeCostSnapshotEntryError extends Error {
+  override readonly name = 'NegativeCostSnapshotEntryError'
+  readonly transferLineId: string
+  readonly contextLabel: string
+  /** The offending entries, in slice order, so the message and the metadata agree. */
+  readonly entries: Array<{ index: number; sourceCostLayerId: string; qty: string; unitCostBase: string }>
+
+  constructor(params: {
+    message: string
+    transferLineId: string
+    contextLabel: string
+    entries: Array<{ index: number; sourceCostLayerId: string; qty: string; unitCostBase: string }>
+  }) {
+    super(params.message)
+    this.transferLineId = params.transferLineId
+    this.contextLabel = params.contextLabel
+    this.entries = params.entries
+  }
+}
+
+/**
+ * The text the abort statement fails on. A CONSTANT, never anything caller-supplied:
+ * it is interpolated as a bound parameter below, but a numeric value would CAST
+ * successfully and the statement would quietly not abort anything.
+ */
+const TRANSACTION_ABORT_SENTINEL = 'transfer_cost_layer_recreation_refused'
+
+/**
+ * ABORT THE ENCLOSING TRANSACTION, so that refusing cannot be turned into skipping.
+ *
+ * WHY A THROW IS NOT ENOUGH. Every caller increments stock BEFORE calling this
+ * function, in the same interactive transaction. A plain `throw` is catchable, and a
+ * caller that catches it and continues commits that increment with no cost layer
+ * behind it — the exact defect (unlayered stock, on-hand above the sum of FIFO layer
+ * quantities, reported by nobody) that o3d-eiuo was raised for. Measured against a
+ * real Postgres, 2026-09-10: an ordinary throw swallowed inside `db.$transaction`
+ * COMMITS the increment.
+ *
+ * WHAT THIS DOES INSTEAD. It runs a statement that is guaranteed to fail — casting a
+ * non-numeric constant to `int` raises `invalid_input_syntax` — which puts Postgres
+ * into aborted-transaction state. Every subsequent statement on that transaction then
+ * fails with 25P02 and the COMMIT degrades to a ROLLBACK, so a caller that swallows
+ * the refusal cannot commit anything at all. Same measurement: 0 rows committed.
+ *
+ * THE PARAMETER IS BOUND, NOT INTERPOLATED. `$executeRaw` is a tagged template, so
+ * the sentinel travels as a query parameter; the error text names it, which is what
+ * makes a swallowed refusal legible in the logs rather than an anonymous 25P02.
+ *
+ * THIS DOES NOT SURVIVE A SAVEPOINT. `ROLLBACK TO SAVEPOINT` clears the aborted
+ * state, so a caller that wrapped the call in `withSavepoint` would undo the abort
+ * and be free to continue. That is why the census test in
+ * tests/domain/inventory/transfer-cost-layer-recreation.test.ts forbids BOTH a `try`
+ * and a `withSavepoint` between a call site and its `db.$transaction` boundary —
+ * belt (static) and braces (runtime), because neither alone closes the hole.
+ */
+async function abortEnclosingTransactionSoTheRefusalCannotBeSwallowed(tx: TxClient): Promise<void> {
+  // Checked OUTSIDE the try on purpose. Inside it, a `tx` with no `$executeRaw` would
+  // raise a TypeError that the catch below would read as "the abort statement failed",
+  // i.e. as success — a hole precisely where this function must have none.
+  if (typeof tx.$executeRaw !== 'function') {
+    throw new Error(
+      'recreateTransferCostLayersFromSnapshotSlice: refusing a negative-cost snapshot entry, but the ' +
+      'transaction client exposes no $executeRaw, so the enclosing transaction cannot be aborted and a ' +
+      'caller could still commit its stock increment. Refusing without that guarantee (6oyu.19 / o3d-gd2f).',
+    )
+  }
+  let aborted = false
+  try {
+    await tx.$executeRaw`SELECT CAST(${TRANSACTION_ABORT_SENTINEL} AS int)`
+  } catch {
+    // EXPECTED, and the entire point of the statement.
+    aborted = true
+  }
+  if (!aborted) {
+    throw new Error(
+      'recreateTransferCostLayersFromSnapshotSlice: refusing a negative-cost snapshot entry, but the ' +
+      'deliberate abort statement SUCCEEDED, so the enclosing transaction is still writable and a caller ' +
+      'could commit its stock increment. Refusing without that guarantee (6oyu.19 / o3d-gd2f).',
+    )
+  }
 }
 
 /**
@@ -173,6 +275,12 @@ async function assertLayerIsReachableByPropagation(
  *
  * `snapshotSlice` must come from sliceTransferSnapshotForReceipt — it is the
  * unconsumed portion of the dispatch snapshot for the quantity now landing.
+ *
+ * THROWS `NegativeCostSnapshotEntryError`, having created nothing and having aborted
+ * the enclosing transaction, if any entry that would become a layer carries a
+ * negative unit cost. See the module comment for why that is refused rather than
+ * skipped (round 3) or capitalised (round 4), and o3d-gd2f for what has to change
+ * before it can be accepted.
  */
 export async function recreateTransferCostLayersFromSnapshotSlice(
   tx: TxClient,
@@ -183,7 +291,51 @@ export async function recreateTransferCostLayersFromSnapshotSlice(
   const result: TransferLayerRecreationResult = {
     createdLayers: [],
     recreatedQty: toDecimal(0).toFixed(6),
-    negativeCostLayers: 0,
+  }
+
+  // THE NEGATIVE-COST REFUSAL (Codex round-5 HIGH; o3d-gd2f). A WHOLE-SLICE PRE-PASS,
+  // deliberately not a per-entry check inside the loop below: a slice whose third
+  // entry is negative must not first write two layers and two source lines. The
+  // transaction would roll those back anyway, but "nothing was attempted" is a
+  // stronger and much easier property to assert than "everything was undone".
+  //
+  // Scoped to entries that would actually BECOME a layer. An entry with qty <= 0 is
+  // dropped by parseCostLayerSnapshot and skipped in the loop below, so it lays down
+  // no units and no wrong movement value; refusing on one would block a receipt over
+  // a row that changes nothing.
+  const negativeCostEntries = snapshotSlice
+    .map((entry, index) => ({ entry, index, qty: toDecimal(entry.qty), unitCostBase: toDecimal(entry.unitCostBase) }))
+    .filter((candidate) => candidate.qty.gt(0) && candidate.unitCostBase.lt(0))
+  if (negativeCostEntries.length > 0) {
+    const entries = negativeCostEntries.map((candidate) => ({
+      index: candidate.index,
+      sourceCostLayerId: candidate.entry.costLayerId,
+      qty: candidate.qty.toFixed(6),
+      unitCostBase: candidate.unitCostBase.toFixed(6),
+    }))
+    // Abort FIRST, throw second: the caller must not be able to catch this and go on
+    // to commit the stock increment it has already made. See the function's comment.
+    await abortEnclosingTransactionSoTheRefusalCannotBeSwallowed(tx)
+    throw new NegativeCostSnapshotEntryError({
+      transferLineId: target.transferLineId,
+      contextLabel: target.contextLabel,
+      entries,
+      message:
+        `recreateTransferCostLayersFromSnapshotSlice: REFUSING the dispatch snapshot for transfer line ` +
+        `${target.transferLineId} (${target.contextLabel}, product ${target.productId}, warehouse ` +
+        `${target.warehouseId}) because ${entries.length === 1 ? 'an entry carries' : `${entries.length} entries carry`} ` +
+        `a NEGATIVE unit cost: ` +
+        entries
+          .map((offender) => `entry #${offender.index} from source layer ${offender.sourceCostLayerId} — ` +
+            `${offender.qty} units at ${offender.unitCostBase}/unit`)
+          .join('; ') +
+        `. A negative basis cannot be represented downstream: buildStockMovementValueFieldsFromTotal ` +
+        `absolutises the movement total, so the layer would book a POSITIVE TRANSFER_IN, and the Xero and ` +
+        `QuickBooks daily syncs emit a COGS journal pair only when the batch total is above zero, so the ` +
+        `credit would be mis-stated or dropped. Nothing has been created and this transaction has been ` +
+        `aborted. The thing to correct is the credit freight line that drove this layer's cost negative ` +
+        `(6oyu.19 / o3d-gd2f; production prevalence is o3d-e65p).`,
+    })
   }
 
   // Computed from the INPUT, before anything is created, and deliberately not
@@ -202,25 +354,7 @@ export async function recreateTransferCostLayersFromSnapshotSlice(
     // carries NO quantity, so passing over it leaves nothing unlayered and cannot
     // open the gap this function's postcondition is about.
     if (entryQty.lte(0)) continue
-    // A negative unit cost is a real revaluation outcome (see negativeCostLayers),
-    // and the units are already on the shelf by the time we are called. Recreate the
-    // layer at the cost the source layer stands at; do NOT decline it.
-    //
-    // Warned rather than only returned, for the same reason the skip was wrong: the
-    // count is the kind of signal every caller ignored. It is unusual enough that
-    // somebody should see it even though nothing has to act on it.
-    if (unitCostBase.lt(0)) {
-      result.negativeCostLayers += 1
-      console.warn(
-        `recreateTransferCostLayersFromSnapshotSlice: creating a NEGATIVE-cost layer ` +
-        `(${unitCostBase.toFixed(6)}/unit x ${entryQty.toFixed(6)}) for product ${target.productId} at ` +
-        `warehouse ${target.warehouseId} from source layer ${entry.costLayerId} (transfer line ` +
-        `${target.transferLineId}, ${target.contextLabel}). The source layer stands at this cost — most ` +
-        `likely a credit freight line revalued it — and the units are already on hand, so the layer is ` +
-        `created rather than skipped (6oyu.19 / o3d-eiuo). Check the freight PO if this was not intended.`,
-      )
-    }
-
+    // Negative unit costs were refused above, before anything was created.
     const newLayerId = await deps.createCostLayer(tx, {
       productId: target.productId,
       warehouseId: target.warehouseId,
