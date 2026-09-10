@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict'
-import { readFileSync } from 'node:fs'
+import { readdirSync, readFileSync } from 'node:fs'
 import path from 'node:path'
 import test from 'node:test'
 
@@ -18,6 +18,10 @@ import {
   type IntegrationOutboxRow,
 } from '@/lib/domain/integrations/outbox'
 import {
+  INTEGRATION_OUTBOX_DRAIN_LEASES_MS,
+  INTEGRATION_OUTBOX_MAX_LEASE_MS,
+} from '@/lib/domain/integrations/outbox-leases'
+import {
   INTEGRATION_OUTBOX_REGISTRY,
   integrationOutboxReplayPolicy,
   integrationOutboxStaleReclaimScope,
@@ -27,8 +31,11 @@ import {
   WcStockSyncOutboxPayloadSchema,
 } from '@/lib/domain/integrations/outbox-registry'
 import {
+  ADMIN_OUTBOX_POST_LEASE_MARGIN_MS,
   ADMIN_OUTBOX_STALE_PROCESSING_LOCK_MS,
+  deadLetterStalledIntegrationOutboxPark,
   stalledIntegrationOutboxParkWhere,
+  stalledOutboxParkDeadLetterReason,
 } from '@/lib/domain/integrations/outbox-admin'
 import {
   OUTBOX_REPLAY_SAFETY_VALUES,
@@ -1034,53 +1041,294 @@ test('the stale-reclaim scope fails closed on an operation this build does not k
 // the same declaration which creates it also generates the operator's list.
 // ---------------------------------------------------------------------------
 
-test('every operation that parks is an operation an operator is shown, and no other', () => {
-  const scope = integrationOutboxUnreclaimableScope() as { OR: Array<{ connector: string; operation: { in: string[] } }> }
-  assert.ok(scope, 'this build declares unsafe-to-replay operations, so the scope must exist')
+test('the park scope is the complement of the reclaim scope over ROWS, unregistered rows included', () => {
+  // ROUND 4, HIGH 2. Round 3 built this list by enumerating the registry entries declared
+  // `unsafe-to-replay`. That set is exhaustive within the REGISTRY and not across the rows that can
+  // exist, and `enqueueIntegrationOutbox` deliberately accepts an operation this build has never
+  // heard of — so an unregistered row could be claimed, crashed, refused a reclaim (the scope fails
+  // closed) AND excluded from the operator's list. Neither reclaimable nor visible is the black hole
+  // the whole round exists to close.
+  const reclaimable = integrationOutboxStaleReclaimScope(undefined, undefined) as {
+    OR: Array<{ connector: string; operation: { in: string[] } }>
+  } | null
+  assert.ok(reclaimable, 'this build declares reclaimable operations; without one the complement is trivially everything')
 
-  // The two sets are complements COMPUTED FROM THE SAME VERDICTS, which is the property that stops
-  // them drifting: an operation cannot be parked without also being watched, and cannot be watched
-  // while a drain sweep is still going to pick it up on its own.
-  const parked = new Map(scope.OR.map((arm) => [arm.connector, arm.operation.in.slice().sort()]))
-  assert.deepEqual([...parked.keys()].sort(), ['mintsoft', 'woocommerce', 'xero'])
-  assert.deepEqual(parked.get('woocommerce'), ['stock.push'])
-  assert.deepEqual(parked.get('xero'), ['accounting.post'])
-  assert.deepEqual(parked.get('mintsoft'), ['inbound.booked-in'])
+  assert.deepEqual(
+    integrationOutboxUnreclaimableScope(),
+    { NOT: reclaimable },
+    'the park scope must be the NEGATION of the reclaim scope, not a second enumeration that can drift from it',
+  )
 
-  for (const [connector, operations] of parked) {
-    for (const operation of operations) {
-      assert.equal(isUnreclaimableOutboxOperation(connector, operation), true)
-      assert.equal(integrationOutboxStaleReclaimScope(connector, operation), null,
-        `${connector}/${operation} is listed for an operator, so no worker may reclaim it`)
-    }
+  // NON-VACUITY of the negation: it excludes a real, non-empty set of pairs.
+  const reclaimablePairs = new Set(
+    reclaimable.OR.flatMap((arm) => arm.operation.in.map((operation) => `${arm.connector}/${operation}`)),
+  )
+  assert.ok(reclaimablePairs.size > 0, 'a NOT over an empty set would put every row on the operator, proving nothing')
+  assert.ok(reclaimablePairs.has('sales/refund.reservation-release'))
+
+  // THE PARTITION, stated over ROWS. Every registered pair, plus pairs no registry entry covers —
+  // which is precisely the population round 3's `policy !== null` dropped on the floor.
+  const registeredPairs = Object.entries(INTEGRATION_OUTBOX_REGISTRY)
+    .flatMap(([connector, operations]) => Object.keys(operations).map((operation) => [connector, operation] as const))
+  assert.ok(registeredPairs.length >= 5, `the registry must be walked, not assumed; found ${registeredPairs.length}`)
+
+  const unregisteredPairs = [
+    ['sales', 'legacy.unregistered'],
+    ['woocommerce', 'stock.push.v2'],
+    ['no-such-connector', 'stock.push'],
+    ['', ''],
+  ] as const
+
+  for (const [connector, operation] of [...registeredPairs, ...unregisteredPairs]) {
+    assert.equal(
+      isUnreclaimableOutboxOperation(connector, operation),
+      !reclaimablePairs.has(`${connector}/${operation}`),
+      `${connector}/${operation} must be on exactly one side: an operator's if no worker may take it`,
+    )
   }
 
-  // ...and the complement really is a complement: a reclaimable operation is in neither list.
-  assert.equal(isUnreclaimableOutboxOperation('sales', 'refund.reservation-release'), false)
-  assert.ok(!parked.has('sales'), 'a self-healing operation must not be shown as an operator exception')
-  // An operation this build has never heard of is in neither list either, so the action gated on
-  // this predicate can never reach a row the list would not have shown.
-  assert.equal(isUnreclaimableOutboxOperation('sales', 'legacy.unregistered'), false)
-  assert.equal(isUnreclaimableOutboxOperation('no-such-connector', 'stock.push'), false)
+  // ...and every unregistered pair really is unknown to this build, so the assertion above was about
+  // the fail-closed answer and not about some entry that happens to exist.
+  for (const [connector, operation] of unregisteredPairs) {
+    assert.equal(integrationOutboxReplayPolicy(connector, operation), null,
+      `${connector}/${operation} must be unregistered, or this case is testing a registered operation`)
+    assert.equal(integrationOutboxStaleReclaimScope(connector || 'x', operation || 'y'), null,
+      'the reclaim scope already fails an unknown operation closed')
+    assert.equal(isUnreclaimableOutboxOperation(connector, operation), true,
+      'so the operator list must cover it — this is round 4 HIGH 2')
+  }
+
+  // The three declared parks are still parks, and still nobody's to reclaim.
+  for (const [connector, operation] of [
+    ['woocommerce', 'stock.push'],
+    ['xero', 'accounting.post'],
+    ['mintsoft', 'inbound.booked-in'],
+  ] as const) {
+    assert.equal(integrationOutboxReplayPolicy(connector, operation), 'unsafe-to-replay')
+    assert.equal(isUnreclaimableOutboxOperation(connector, operation), true)
+    assert.equal(integrationOutboxStaleReclaimScope(connector, operation), null)
+  }
+  assert.equal(isUnreclaimableOutboxOperation('sales', 'refund.reservation-release'), false,
+    'a self-healing operation must not be shown as an operator exception')
 })
 
-test('the stalled-park filter asks for a stale lock on a parked operation, and nothing else', () => {
+test('the stalled-park filter asks for a stale lock on an unreclaimable row, and nothing else', () => {
   const now = new Date('2026-04-27T10:00:00.000Z')
   const where = stalledIntegrationOutboxParkWhere({ now, staleProcessingLockMs: RECLAIM_STALE_MS }) as {
-    OR: Array<{ connector: string }>
+    NOT: unknown
     status: string
     lockedAt: { not: null; lte: Date }
   }
-  assert.ok(where)
   assert.equal(where.status, INTEGRATION_OUTBOX_STATUS.PROCESSING,
     'a failed row is the OTHER section; this one is about work that never failed at all')
   assert.deepEqual(where.lockedAt.lte, new Date(now.getTime() - RECLAIM_STALE_MS))
-  assert.deepEqual(where.OR.map((arm) => arm.connector).sort(), ['mintsoft', 'woocommerce', 'xero'])
+  assert.deepEqual(where.NOT, integrationOutboxStaleReclaimScope(undefined, undefined),
+    'the scope half of the filter is the complement of the reclaim scope')
 
-  // The threshold is the SAME constant the recovery action refuses below, so a row can never be
-  // listed while the only action offered on it would be rejected as `processing_lock_active`.
+  // The threshold is the SAME constant the dead-letter refuses below, so a row can never be listed
+  // while the only action offered on it would be rejected as `processing_lock_active`.
   const shipped = stalledIntegrationOutboxParkWhere({ now }) as { lockedAt: { lte: Date } }
   assert.deepEqual(shipped.lockedAt.lte, new Date(now.getTime() - ADMIN_OUTBOX_STALE_PROCESSING_LOCK_MS))
+})
+
+// ---------------------------------------------------------------------------
+// THE THRESHOLD IS DERIVED FROM THE LEASES IT OVERRIDES (Codex round 4, HIGH 1).
+//
+// Round 3 wrote the operator threshold as its own `10 * 60 * 1000`. It read as
+// agreement with the outbox default lease and silently DISAGREED with the only
+// lease that differs — `xero/accounting.post` is drained under fifteen minutes —
+// so a Xero row twelve minutes into a live lease was offered to an operator as a
+// stalled park, with an action on it.
+// ---------------------------------------------------------------------------
+
+test('the operator staleness threshold exceeds every declared drain lease, computed rather than restated', () => {
+  const leases = Object.entries(INTEGRATION_OUTBOX_DRAIN_LEASES_MS)
+  assert.ok(leases.length >= 2, `the lease map must enumerate more than one lease; found ${leases.length}`)
+  // NON-VACUITY: the leases genuinely differ, so "greater than every lease" is a real constraint and
+  // not one the default value satisfies by accident.
+  assert.ok(new Set(leases.map(([, ms]) => ms)).size >= 2,
+    'if every declared lease were the same number, this test would not be able to catch a restated one')
+
+  for (const [name, ms] of leases) {
+    assert.ok(ADMIN_OUTBOX_STALE_PROCESSING_LOCK_MS > ms,
+      `the admin threshold (${ADMIN_OUTBOX_STALE_PROCESSING_LOCK_MS}ms) must exceed the ${name} lease (${ms}ms), `
+      + 'or it declares a row stale while its holder is still inside its lease')
+  }
+  assert.equal(
+    ADMIN_OUTBOX_STALE_PROCESSING_LOCK_MS,
+    INTEGRATION_OUTBOX_MAX_LEASE_MS + ADMIN_OUTBOX_POST_LEASE_MARGIN_MS,
+    'derived from the maximum over the map, so a longer lease raises it in the same edit',
+  )
+
+  // AND THE DEFECT ITSELF, named: round 3's ten minutes was SHORTER than a lease it could override.
+  assert.ok(10 * 60 * 1000 < INTEGRATION_OUTBOX_DRAIN_LEASES_MS.xeroAccountingEntry,
+    'round 3 restated ten minutes; the Xero lease is fifteen — that gap is the finding')
+})
+
+test('every claim in the tree takes its lease from the declared map, not from a number of its own', () => {
+  // WHY THIS READS THE SOURCE. The test above is about a maximum over a map. On its own it is
+  // satisfied by a map with one entry in it while a drain elsewhere quietly passes its own literal —
+  // the map would be exhaustive over itself and not over the leases that exist. This asserts the
+  // grammar of every call site instead: a `staleLockMs:` argument must be an identifier whose own
+  // definition is derived from INTEGRATION_OUTBOX_DRAIN_LEASES_MS.
+  const repoRoot = path.resolve(__dirname, '..', '..', '..')
+  const files: string[] = []
+  const walk = (dir: string) => {
+    for (const entry of readdirSync(dir, { withFileTypes: true })) {
+      if (entry.name === 'node_modules' || entry.name.startsWith('.')) continue
+      const full = path.join(dir, entry.name)
+      if (entry.isDirectory()) walk(full)
+      else if (entry.name.endsWith('.ts') || entry.name.endsWith('.tsx')) files.push(full)
+    }
+  }
+  walk(path.join(repoRoot, 'lib'))
+  walk(path.join(repoRoot, 'app'))
+  assert.ok(files.length > 100, `the walk must have reached the tree; it visited ${files.length} files`)
+
+  // COMMENTS ARE STRIPPED FIRST. A comment cannot set a lease, so matching one is a false positive —
+  // and this test found one immediately, in the lease module's own prose describing the rule. A
+  // commented-out call site is not a call site either, so nothing is hidden by removing them.
+  const withoutComments = (source: string) => source.replace(/\/\*[\s\S]*?\*\//g, '').replace(/\/\/[^\n]*/g, '')
+
+  const valuePositions: Array<{ file: string; expression: string }> = []
+  let typePositions = 0
+  for (const file of files) {
+    const source = withoutComments(readFileSync(file, 'utf8'))
+    for (const match of source.matchAll(/staleLockMs\??:\s*([^,\n]+)/g)) {
+      const expression = match[1].trim().replace(/,$/, '')
+      // Type positions (`staleLockMs?: number`, `staleLockMs: number): unknown {`) declare the
+      // parameter; they never carry a lease.
+      if (/^number\b/.test(expression)) {
+        typePositions += 1
+        continue
+      }
+      valuePositions.push({ file: path.relative(repoRoot, file), expression })
+    }
+  }
+  assert.ok(typePositions >= 1, 'the scan did not even reach the parameter declarations, so its regex is wrong')
+  assert.ok(valuePositions.length >= 1,
+    'the scan found no claim passing a lease at all, so it is asserting about nothing')
+
+  for (const { file, expression } of valuePositions) {
+    const source = withoutComments(readFileSync(path.join(repoRoot, file), 'utf8'))
+    // Either the argument names the map directly, or it names a constant defined from it.
+    if (expression.includes('INTEGRATION_OUTBOX_DRAIN_LEASES_MS')) continue
+    assert.match(expression, /^[A-Za-z_$][\w$]*$/,
+      `${file} passes staleLockMs: ${expression} — a lease must be a named constant, not an expression`)
+    const definition = source.match(new RegExp(`const ${expression} = ([^\\n]+)`))
+    assert.ok(definition, `${file} passes staleLockMs: ${expression}, which is not defined in that file`)
+    assert.match(definition[1], /INTEGRATION_OUTBOX_DRAIN_LEASES_MS/,
+      `${file} defines ${expression} as ${definition[1].trim()} — a lease the admin threshold cannot see, `
+      + 'so the operator could declare a row stale while this worker still holds it')
+  }
+})
+
+// ---------------------------------------------------------------------------
+// THE OPERATOR ACTION DOES NOT RE-RUN THE WORK (Codex round 4, HIGH 1).
+//
+// Round 3's one-click recovery dead-lettered and then re-queued — the reclaim the
+// declaration forbids, done by hand, on the same evidence (elapsed time) that
+// cannot tell a dead holder from a paused one. The CAS fences the row's later
+// writes; it cannot unsend an effect the first holder already issued.
+// ---------------------------------------------------------------------------
+
+function parkedRow(overrides: Partial<IntegrationOutboxRow> = {}): IntegrationOutboxRow {
+  return {
+    id: 'parked',
+    connector: 'woocommerce',
+    operation: 'stock.push',
+    idempotencyKey: 'woocommerce:stock.push:product-1',
+    payloadJson: { productId: 'product-1', reason: StockSyncReason.MANUAL, force: false, webhookQty: null },
+    status: INTEGRATION_OUTBOX_STATUS.PROCESSING,
+    attempts: 1,
+    nextAttemptAt: null,
+    lastError: null,
+    lockedAt: new Date('2026-04-27T09:00:00.000Z'),
+    lockedBy: 'wc-stock-sync',
+    createdAt: new Date('2026-04-27T08:00:00.000Z'),
+    updatedAt: new Date('2026-04-27T09:00:00.000Z'),
+    ...overrides,
+  } as IntegrationOutboxRow
+}
+
+test('draining a park dead-letters it and does NOT re-queue it', async () => {
+  const now = new Date('2026-04-27T10:00:00.000Z')
+  const { client, rows } = makeClient([parkedRow()])
+
+  const result = await deadLetterStalledIntegrationOutboxPark({ client, id: 'parked', now })
+
+  assert.equal(result.priorStatus, INTEGRATION_OUTBOX_STATUS.PROCESSING)
+  assert.equal(rows[0].status, INTEGRATION_OUTBOX_STATUS.PERMANENT_FAILED,
+    'the action must stop the row, never put it back in front of a worker')
+  assert.notEqual(rows[0].status, INTEGRATION_OUTBOX_STATUS.PENDING)
+  assert.equal(rows[0].lockedAt, null)
+  assert.equal(rows[0].lockedBy, null)
+  assert.equal(rows[0].nextAttemptAt, null, 'nothing is scheduled: a re-queue is a separate act')
+  assert.equal(rows[0].attempts, 1, 'and the retry ladder is not reset, because nothing is retrying')
+
+  // THE STAMP, so the separate re-queue is not a blind one. It names what cannot be verified.
+  assert.equal(rows[0].lastError, stalledOutboxParkDeadLetterReason(parkedRow()))
+  assert.match(rows[0].lastError!, /NOTHING HAS BEEN RE-RUN/)
+  assert.match(rows[0].lastError!, /died or is merely\s+paused/)
+  assert.match(rows[0].lastError!, /Re-queueing this row runs the operation again/)
+  assert.match(rows[0].lastError!, /wc-stock-sync/, 'the holder that never let go is named')
+})
+
+test('a park still inside the longest drain lease is neither listed nor drainable', async () => {
+  // The exact row round 3 would have offered an operator: a Xero job twelve minutes into a lease its
+  // own worker measures at fifteen. Under round 3's ten-minute threshold it was a "stalled park".
+  const now = new Date('2026-04-27T10:00:00.000Z')
+  const lockedAt = new Date(now.getTime() - 12 * 60 * 1000)
+  const row = parkedRow({
+    id: 'xero-mid-lease',
+    connector: 'xero',
+    operation: 'accounting.post',
+    idempotencyKey: 'xero:accounting.post:log-1',
+    payloadJson: { accountingSyncLogId: 'log-1' },
+    lockedAt,
+    lockedBy: 'xero-accounting-sync',
+  })
+  const { client, rows } = makeClient([row])
+
+  // The premise: this lock IS inside a lease that exists, and it IS on a parked operation.
+  assert.ok(12 * 60 * 1000 < INTEGRATION_OUTBOX_DRAIN_LEASES_MS.xeroAccountingEntry)
+  assert.equal(isUnreclaimableOutboxOperation('xero', 'accounting.post'), true)
+
+  const where = stalledIntegrationOutboxParkWhere({ now }) as { lockedAt: { lte: Date } }
+  assert.ok(lockedAt > where.lockedAt.lte, 'a lock inside a live lease must not match the operator list')
+
+  await assert.rejects(
+    () => deadLetterStalledIntegrationOutboxPark({ client, id: 'xero-mid-lease', now }),
+    (error: unknown) => (error as { code?: string }).code === 'processing_lock_active',
+  )
+  assert.equal(rows[0].status, INTEGRATION_OUTBOX_STATUS.PROCESSING, 'the refused action changed nothing')
+  assert.deepEqual(rows[0].lockedAt, lockedAt)
+})
+
+test('an unregistered operation stalled in PROCESSING is both listed and drainable', async () => {
+  // ROUND 4, HIGH 2, at the action rather than at the predicate: round 3's guard used the same
+  // `policy !== null` test, so this call was refused as `not_a_stalled_park` for a row that no list
+  // would ever have shown and no worker would ever have taken.
+  const now = new Date('2026-04-27T10:00:00.000Z')
+  const row = parkedRow({
+    id: 'unregistered',
+    connector: 'legacy-connector',
+    operation: 'legacy.unregistered',
+    idempotencyKey: 'legacy-connector:legacy.unregistered:1',
+    payloadJson: { anything: true },
+    lockedBy: 'a-worker-that-crashed',
+  })
+  const { client, rows } = makeClient([row])
+
+  assert.equal(integrationOutboxReplayPolicy('legacy-connector', 'legacy.unregistered'), null,
+    'the premise: this build knows nothing about the operation')
+  assert.equal(integrationOutboxStaleReclaimScope('legacy-connector', 'legacy.unregistered'), null,
+    'so no worker may ever reclaim it')
+
+  const result = await deadLetterStalledIntegrationOutboxPark({ client, id: 'unregistered', now })
+  assert.equal(result.row.status, INTEGRATION_OUTBOX_STATUS.PERMANENT_FAILED)
+  assert.equal(rows[0].status, INTEGRATION_OUTBOX_STATUS.PERMANENT_FAILED)
+  assert.match(rows[0].lastError!, /legacy-connector\/legacy\.unregistered/)
 })
 
 test('a stale PROCESSING lock is reclaimed per operation, not on elapsed time alone', async () => {

@@ -1,4 +1,5 @@
 import { db } from '@/lib/db'
+import { INTEGRATION_OUTBOX_DRAIN_LEASES_MS } from '@/lib/domain/integrations/outbox-leases'
 import {
   isUniqueConstraintViolation,
   uniqueConstraintFields,
@@ -100,7 +101,8 @@ const CLAIMABLE_STATUSES = [
   INTEGRATION_OUTBOX_STATUS.RETRYABLE_FAILED,
 ] as const
 const DEFAULT_CLAIM_LIMIT = 25
-const DEFAULT_STALE_LOCK_MS = 10 * 60 * 1000
+/** @see INTEGRATION_OUTBOX_DRAIN_LEASES_MS — the one place every lease in this build is declared. */
+const DEFAULT_STALE_LOCK_MS = INTEGRATION_OUTBOX_DRAIN_LEASES_MS.default
 /**
  * First-retry backoff floor. Exported because it is what an automatic connector retry is scheduled
  * against, and therefore what decides whether a remote idempotency key is still alive when the retry

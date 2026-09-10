@@ -3,7 +3,7 @@
 import { Fragment, useState, useTransition } from 'react'
 import Link from 'next/link'
 import { useRouter } from 'next/navigation'
-import { ArrowLeft, CheckCircle2, Inbox, Loader2, PackageCheck, PencilLine, RotateCcw, Split, XCircle } from 'lucide-react'
+import { ArrowLeft, CheckCircle2, Inbox, Loader2, OctagonX, PackageCheck, PencilLine, RotateCcw, Split, XCircle } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { buttonVariants } from '@/components/ui/button-variants'
 import { Card } from '@/components/ui/card'
@@ -31,7 +31,7 @@ import {
   replayDeadReceiptEvent,
   replayDeadWebhookEvent,
   replayOutboxException,
-  recoverStalledOutboxPark,
+  deadLetterStalledOutboxPark,
   isolateUnresolvedDriftCohort,
   replayStuckDispatch,
   retryUnresolvedDriftCohort,
@@ -339,7 +339,7 @@ export function ExceptionsClient({ data }: Props) {
         <Card className="p-4 space-y-3">
           <SectionHeading
             title={`Integration outbox — stalled parks (${data.summary.stalledOutboxParks})`}
-            detail="Rows still marked PROCESSING under a worker that never came back, on operations where handing the row to a second worker would be unsafe. Nothing retries these: no drain reclaims them and no reconcile drains them. For WooCommerce stock pushes every later change to the same product is folded into the parked row and waits behind it. Drain re-queues the row with its LATEST payload, and is refused if the worker is still alive."
+            detail="Rows still marked PROCESSING under a lock older than every drain lease, where handing the row to a second worker would be unsafe. Nothing retries these: no drain reclaims them and no reconcile drains them. For WooCommerce stock pushes every later change to the same product is folded into the parked row and waits behind it. STOP dead-letters the row and does NOT re-run it — IMS cannot tell whether the holder died or is merely paused, nor whether its effect already reached the remote system. The row then moves to the failed-rows section above, where Replay re-runs the operation; do that only after checking the remote system."
             shown={data.stalledOutboxParks.length}
             total={data.summary.stalledOutboxParks}
           />
@@ -368,9 +368,13 @@ export function ExceptionsClient({ data }: Props) {
                       variant="outline"
                       size="sm"
                       disabled={isPending}
-                      onClick={() => runAction(() => recoverStalledOutboxPark(row.id), 'Stalled outbox park re-queued.')}
+                      title="Dead-letters this row. It does NOT re-run the operation: the holder may be paused rather than dead, and its effect may already have landed. Re-queue from the failed-rows section once you have checked."
+                      onClick={() => runAction(
+                        () => deadLetterStalledOutboxPark(row.id),
+                        'Stalled outbox park dead-lettered. It was NOT re-run — replay it from the failed rows above once you have checked the remote system.',
+                      )}
                     >
-                      <RotateCcw className="h-3 w-3 mr-1" />Drain
+                      <OctagonX className="h-3 w-3 mr-1" />Stop
                     </Button>
                   </TableCell>
                 </TableRow>

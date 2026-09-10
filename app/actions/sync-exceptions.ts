@@ -40,7 +40,7 @@ import {
   ADMIN_OUTBOX_STALE_PROCESSING_LOCK_MS,
   IntegrationOutboxAdminError,
   listIntegrationOutboxAdminRows,
-  recoverStalledIntegrationOutboxPark,
+  deadLetterStalledIntegrationOutboxPark,
   replayIntegrationOutboxAdminRow,
   stalledIntegrationOutboxParkWhere,
 } from '@/lib/domain/integrations/outbox-admin'
@@ -531,7 +531,7 @@ const OUTBOX_FAILURE_STATUSES = [
  * replay declarations themselves, so this section covers exactly the operations that chose to park
  * and cannot fall behind a new one.
  */
-function stalledOutboxParkWhere(now: Date): Record<string, unknown> | null {
+function stalledOutboxParkWhere(now: Date): Record<string, unknown> {
   return stalledIntegrationOutboxParkWhere({ now })
 }
 
@@ -808,9 +808,9 @@ async function loadExceptionCounts(): Promise<ExceptionInboxSummary> {
     // belongs in the same total. Kept through the merge with o3d-0bfh's follow-up obligations.
     db.wmsOrderPushLink.count({ where: { state: { in: [...BLOCKED_WMS_PUSH_STATES] } } }),
     db.integrationOutbox.count({ where: { status: { in: OUTBOX_FAILURE_STATUSES } } }),
-    // `null` means this build declares no unreclaimable operation at all, so there is no such thing
-    // as a stalled park — not that the query found none.
-    stalledParkWhere ? db.integrationOutbox.count({ where: stalledParkWhere }) : Promise.resolve(0),
+    // Round 4: the scope is TOTAL over rows (it is the complement of what a worker may reclaim), so
+    // there is no "this build declares no park" case left to special-case — only rows to count.
+    db.integrationOutbox.count({ where: stalledParkWhere }),
     db.wmsInboundReceiptEvent.count({ where: { processingStatus: DEAD_RECEIPT_EVENT_STATUS } }),
     db.wmsWebhookEvent.count({ where: { processingStatus: DEAD_RECEIPT_EVENT_STATUS } }),
     db.shoppingSyncLog.count({ where: REFUND_PARK_WHERE }),
@@ -947,14 +947,12 @@ export async function getExceptionInboxData(): Promise<ExceptionInboxData> {
         .slice(0, SECTION_LIMIT)),
     // Oldest lock first: the row at the top is the one whose work has been not-happening longest,
     // which for a folding operation is also the row with the most changes stacked behind it.
-    stalledParkRowWhere
-      ? db.integrationOutbox.findMany({
-        where: stalledParkRowWhere,
-        orderBy: { lockedAt: 'asc' },
-        take: SECTION_LIMIT,
-        select: STALLED_OUTBOX_PARK_SELECT,
-      })
-      : Promise.resolve([]),
+    db.integrationOutbox.findMany({
+      where: stalledParkRowWhere,
+      orderBy: { lockedAt: 'asc' },
+      take: SECTION_LIMIT,
+      select: STALLED_OUTBOX_PARK_SELECT,
+    }),
     db.wmsInboundReceiptEvent.findMany({
       where: { processingStatus: DEAD_RECEIPT_EVENT_STATUS },
       orderBy: { deadLetteredAt: 'desc' },
@@ -1394,29 +1392,32 @@ export async function replayOutboxException(id: string): Promise<MutationResult>
 }
 
 /**
- * DRAIN A STALLED PARK (o3d-8td2 round 3, Codex HIGH).
+ * STOP A STALLED PARK. IT DOES NOT RE-RUN THE WORK (o3d-8td2 round 4, Codex HIGH 1).
  *
  * The row belongs to an operation that refused the stale-lock reclaim, so no worker will take it and
- * an operator is the only thing left. `recoverStalledIntegrationOutboxPark` dead-letters the stale
- * lock and re-queues in one act, keeping the FOLDED payload — for `woocommerce/stock.push` that is
- * the latest stock quantity, which is also the answer for every change that piled up behind the
- * park, so one drain settles the backlog rather than replaying it.
+ * an operator is the only thing left. What round 3 offered here was a one-click dead-letter AND
+ * re-queue — which is the reclaim the declaration forbids, done by hand, on the same evidence a
+ * worker is not allowed to act on. A lock older than its lease does not prove its holder died, and a
+ * compare-and-set cannot unsend an effect the holder already issued.
  *
- * It refuses if the lock is no longer stale. That is the whole safety of the affordance: a holder
- * that was merely slow, and has come back and re-locked the row, keeps it, and this returns the
- * refusal rather than cutting under a live worker — which would be the very reclaim the operation is
- * declared `unsafe-to-replay` to prevent.
+ * So this dead-letters and stops. That produces no effect at all and needs no belief about whether
+ * the holder is alive. The row then appears in the outbox-failures section carrying a stated reason,
+ * where `replayOutboxRow` re-queues it — a second, deliberate act on a different surface, which is
+ * where the duplicate-effect risk properly belongs.
+ *
+ * It refuses if the lock is not yet past every drain lease: a holder still inside its lease keeps the
+ * row and this returns the refusal.
  */
-export async function recoverStalledOutboxPark(id: string): Promise<MutationResult> {
+export async function deadLetterStalledOutboxPark(id: string): Promise<MutationResult> {
   try {
     const session = await requireFreshPermission('sync')
-    const result = await recoverStalledIntegrationOutboxPark({ id })
+    const result = await deadLetterStalledIntegrationOutboxPark({ id })
     await logActivity({
       entityType: 'SYNC',
       entityId: id,
       tag: 'sync',
-      action: 'integration_outbox_park_recovered',
-      description: `Drained a stalled integration outbox park (${result.row.connector}/${result.row.operation}) from ${result.priorStatus} via the exception inbox`,
+      action: 'integration_outbox_park_dead_lettered',
+      description: `Dead-lettered a stalled integration outbox park (${result.row.connector}/${result.row.operation}) from ${result.priorStatus} via the exception inbox; the operation was NOT re-run`,
       metadata: {
         outboxId: id,
         priorStatus: result.priorStatus,

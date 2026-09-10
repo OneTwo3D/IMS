@@ -408,19 +408,35 @@ function reclaimableOperationsOf(connector: string): string[] {
 }
 
 /**
- * THE OTHER HALF OF THE SAME DECLARATION: every operation whose stalled rows nobody will ever come
- * back for, as a Prisma filter — `null` when no registered operation is `unsafe-to-replay`.
+ * THE OTHER HALF OF THE SAME DECLARATION: every row whose stalled lock nobody will ever come back
+ * for. Answered about the ROW, and therefore total — there is always such a scope.
  *
  * `integrationOutboxStaleReclaimScope` says which rows a second WORKER may take. This says which
- * rows an OPERATOR has to, and it is deliberately the exact complement, computed from the same
- * verdicts in the same pass. Declaring an operation `unsafe-to-replay` buys a park; this is the bill
- * for it, and it arrives in the same edit rather than needing a second one somebody has to remember.
+ * rows an OPERATOR has to, and it is the exact COMPLEMENT of that — negated as a filter rather than
+ * re-enumerated from the registry, which is the whole of round 4's HIGH 2.
  *
- * A row matched by this scope AND stalled in PROCESSING past its lock's staleness has, by
- * construction, no automatic recovery left: the drain will not reclaim it, the retry ladder never
- * runs (it is not in a failed state), and — as o3d-22jw had to be corrected to say — no reconcile
- * elsewhere drains it either. The exception inbox's stalled-park section is built from this, so the
- * set of operations that can strand work and the set an operator is shown cannot come apart.
+ * WHY THE COMPLEMENT HAD TO BE TAKEN OVER ROWS AND NOT OVER DECLARATIONS (Codex round 4, HIGH 2).
+ * Round 3 built this by listing the operations whose resolved policy is `unsafe-to-replay`. That set
+ * is exhaustive within the REGISTRY and not across the rows that can exist: `enqueueIntegrationOutbox`
+ * and `parseIntegrationOutboxPayload` deliberately accept an operation this build has never heard of,
+ * so an UNREGISTERED row can be claimed, flipped to PROCESSING, and crashed. Its policy is `null`, so
+ * `integrationOutboxStaleReclaimScope` failed it closed — no worker would ever reclaim it — while
+ * `policy !== null` also excluded it from this scope, so no operator would ever be shown it either.
+ * Neither reclaimable nor visible is precisely the black hole this whole round exists to close, and
+ * round 3 re-created it one layer up.
+ *
+ * The fix is to stop asking a question the registry cannot answer. A row is unreclaimable exactly
+ * when no worker may take it, and "no worker may take it" is already decided, for every row
+ * including an unknown one, by the reclaim scope's own fail-closed rule. So this is `NOT` that
+ * scope, and `{}` — every row — when nothing at all is reclaimable. The two predicates now partition
+ * the table, which is a property a test can state over unregistered operations as well as registered
+ * ones.
+ *
+ * A row matched by this scope AND stalled in PROCESSING past every lease has, by construction, no
+ * automatic recovery left: the drain will not reclaim it, the retry ladder never runs (it is not in a
+ * failed state), and — as o3d-22jw had to be corrected to say — no reconcile elsewhere drains it
+ * either. The exception inbox's stalled-park section is built from this, so the set of rows that can
+ * strand work and the set an operator is shown cannot come apart.
  *
  * RECLAIMABLE OPERATIONS ARE DELIBERATELY EXCLUDED, on the rule this inbox already follows for
  * RETRYABLE_FAILED (Codex r4, app/actions/sync-exceptions.ts): a row still on an automatic recovery
@@ -428,15 +444,15 @@ function reclaimableOperationsOf(connector: string): string[] {
  */
 export function isUnreclaimableOutboxOperation(connector: string, operation: string): boolean {
   const policy = integrationOutboxReplayPolicy(connector, operation)
-  return policy !== null && !outboxReplayPolicyGrantsStaleReclaim(policy)
+  // `null` — an operation this build has never heard of — falls on the OPERATOR's side, which is the
+  // same fail-closed answer `integrationOutboxStaleReclaimScope` already gives a WORKER for it.
+  return policy === null || !outboxReplayPolicyGrantsStaleReclaim(policy)
 }
 
-/** @see isUnreclaimableOutboxOperation — the same rule, shaped as a filter over every connector. */
-export function integrationOutboxUnreclaimableScope(): Record<string, unknown> | null {
-  const perConnector = Object.keys(INTEGRATION_OUTBOX_REGISTRY)
-    .map((name) => ({ connector: name, operation: { in: operationsOf(name, false) } }))
-    .filter((scope) => scope.operation.in.length > 0)
-  return perConnector.length > 0 ? { OR: perConnector } : null
+/** @see isUnreclaimableOutboxOperation — the same rule, shaped as a filter over every ROW. */
+export function integrationOutboxUnreclaimableScope(): Record<string, unknown> {
+  const reclaimable = integrationOutboxStaleReclaimScope(undefined, undefined)
+  return reclaimable === null ? {} : { NOT: reclaimable }
 }
 
 /**
