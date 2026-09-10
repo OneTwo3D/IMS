@@ -39,6 +39,11 @@
  * (kind, referenceType, referenceId) WHERE status IN ('PENDING','PROCESSING') — makes a
  * second UNDELIVERED row impossible rather than merely unlikely. See the migration
  * 20260910120000_email_outbox_claim_fence for why it is scoped to undelivered statuses.
+ *
+ * AND THE DRAIN'S OPTIONS ARE A UNION, NOT A BAG OF OPTIONAL FIELDS. This is a SWEEP over the
+ * globally oldest eligible rows, so a caller who injects a fake sender WITHOUT also injecting a
+ * client points that fake at real customer email. `ProcessEmailOutboxOptions` makes that shape
+ * fail to compile rather than default; the reasoning is on the type.
  */
 
 import { randomUUID } from 'node:crypto'
@@ -126,13 +131,53 @@ type EmailClaim = {
   claimedAt: Date
 }
 
-export type ProcessEmailOutboxOptions = {
-  client?: EmailOutboxClient
-  sendEmail?: typeof sendEmail
+/**
+ * The dependencies that are safe to override on their own, because none of them decides WHICH
+ * ROWS the drain reaches or WHETHER a message leaves the building.
+ */
+type ProcessEmailOutboxHarness = {
   prepareQueuedEmail?: typeof prepareQueuedEmail
   logActivity?: typeof logActivity
   now?: () => Date
 }
+
+/**
+ * (a) THE CRON. Nothing injected: the global client, the real sender. `client?: never` and
+ * `sendEmail?: never` are what make this arm REFUSE a half-injection rather than default it.
+ */
+export type ProcessEmailOutboxAmbientOptions = ProcessEmailOutboxHarness & {
+  client?: never
+  sendEmail?: never
+}
+
+/** (b) A TEST. Both the rows it may reach AND the sender it reaches them with, together. */
+export type ProcessEmailOutboxInjectedOptions = ProcessEmailOutboxHarness & {
+  client: EmailOutboxClient
+  sendEmail: typeof sendEmail
+}
+
+/**
+ * o3d-alnk r3 (Codex HIGH) — WHY THIS IS A UNION AND NOT TWO OPTIONAL FIELDS.
+ *
+ * `client` and `sendEmail` used to be independently optional, each falling back to the global
+ * when absent. That made a third shape representable, and it is the destructive one:
+ *
+ *   processPendingEmailOutbox({ sendEmail: fake })
+ *
+ * — a FAKE sender pointed at the REAL queue. `processPendingEmailOutbox` is a SWEEP: it selects
+ * the globally oldest eligible rows, not any caller's rows. So that call drains genuine queued
+ * customer email through a sender that delivers nothing and stamps every one of them SENT. The
+ * row afterwards is indistinguishable from a real delivery, so the loss is silent AND
+ * unrecoverable. The mirror shape, `{ client: testDouble }`, is the other half: a test's rows
+ * handed to the REAL mailer.
+ *
+ * There is no legitimate third shape, so the type refuses to spell one. NOT a runtime guard: a
+ * runtime check still lets someone WRITE the call and only complains once it has been reached,
+ * and the reaching is the damage. See tests/email-outbox-injection-shape.test.ts.
+ */
+export type ProcessEmailOutboxOptions =
+  | ProcessEmailOutboxAmbientOptions
+  | ProcessEmailOutboxInjectedOptions
 
 export type ProcessEmailOutboxResult = {
   processed: number

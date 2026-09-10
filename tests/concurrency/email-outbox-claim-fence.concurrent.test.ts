@@ -38,6 +38,13 @@
  * SELECTed, so it cannot be claimed; it cannot be UPDATEd even if it were. The two proofs below
  * (`bystanders`) are the backstop for the one thing the wrapper cannot police: a future edit
  * that reaches for the module-level `db` directly instead of the injected client.
+ *
+ * AND THE WRAPPER BUILDS THAT PREDICATE ITSELF (r3, Codex HIGH). Round 2 took the predicate as a
+ * `Record<string, unknown>` and ANDed it in verbatim, so `{}` was a legal argument and
+ * `AND: [where, {}]` is UNSCOPED — the safety property rested on the caller remembering to
+ * narrow. `rows` is now a validated non-empty set of fixture IDENTIFIERS; there is no longer any
+ * syntax for "every row" to reach the wrapper through. The last test in this file is the proof,
+ * and unlike the two above it is NOT skipped without a database.
  */
 
 import assert from 'node:assert/strict'
@@ -62,15 +69,71 @@ function scopedReference(): string {
   return `test-email-fence-${randomUUID().slice(0, 8)}`
 }
 
+/** Refusing a widening scope is an error with a NAME, so a proof can assert on it. */
+class FixtureScopeError extends Error {
+  constructor(message: string) {
+    super(`fixtureScopedClient: ${message}`)
+    this.name = 'FixtureScopeError'
+  }
+}
+
+/** A tuple that cannot be empty, so `[]` is refused by tsc rather than by a runtime check. */
+type NonEmpty<T> = readonly [T, ...T[]]
+
+/**
+ * WHICH ROWS A SCOPED CLIENT MAY REACH (o3d-alnk r3, Codex HIGH).
+ *
+ * This is a set of FIXTURE IDENTIFIERS, never a predicate. Round 2 took a
+ * `Record<string, unknown>` and ANDed it in verbatim, which meant `{}` was a legal argument and
+ * `AND: [originalWhere, {}]` is an UNSCOPED where — the whole safety property rested on the
+ * caller remembering to narrow. The wrapper BUILDS the predicate now, from one of exactly two
+ * shapes, so a caller has nothing to widen: there is no syntax here for "every row".
+ *
+ * Two shapes because the two proofs know their rows at different times. The fence proof creates
+ * its row first and can name the id; the enqueue proof's rows do not exist until `queueEmail`
+ * makes them, so it can only name the reference prefix it will create them under.
+ */
+type FixtureRowScope =
+  | { readonly ids: NonEmpty<string> }
+  | { readonly referenceIdPrefix: string }
+
+/**
+ * Turn a fixture scope into a Prisma predicate, refusing anything that would match beyond it.
+ *
+ * The length and emptiness checks are NOT redundant with the tuple type: a `readonly string[]`
+ * that happens to be empty, or an id read from a variable that turned out to be `''`, both reach
+ * here past tsc. `startsWith: ''` matches every row in the table, which is the same match-all
+ * hazard one level down.
+ */
+function fixtureRowPredicate(scope: FixtureRowScope): Record<string, unknown> {
+  if ('ids' in scope) {
+    const ids: readonly string[] = scope.ids
+    if (ids.length === 0) {
+      throw new FixtureScopeError('refused an empty id set — it narrows nothing, so the scope is match-all')
+    }
+    for (const id of ids) {
+      if (typeof id !== 'string' || id.trim() === '') {
+        throw new FixtureScopeError(`refused a blank fixture id (${JSON.stringify(id)}) — it would widen the scope`)
+      }
+    }
+    return { id: { in: [...ids] } }
+  }
+  const prefix = scope.referenceIdPrefix
+  if (typeof prefix !== 'string' || prefix.trim() === '') {
+    throw new FixtureScopeError('refused an empty referenceId prefix — startsWith \'\' matches every row')
+  }
+  return { referenceId: { startsWith: prefix } }
+}
+
 /**
  * The real client, narrowed so this run's own rows are the only rows it can reach.
  *
- * `rows` is ANDed into the WHERE of every `emailOutbox` read and write. ANDed, never merged:
- * the caller's predicate is preserved verbatim as one arm, so the drain's selection and — more
- * importantly — the fence's `(id, status, lockedBy, processingStartedAt)` terminal predicate
- * still mean exactly what they mean in production. Narrowing a WHERE can only ever remove rows
- * from a match, so it can turn a fenced write that would have landed into one that does not,
- * but never the reverse; the fixture rows it is scoped TO are unaffected.
+ * The predicate built above is ANDed into the WHERE of every `emailOutbox` read and write.
+ * ANDed, never merged: the caller's predicate is preserved verbatim as one arm, so the drain's
+ * selection and — more importantly — the fence's `(id, status, lockedBy, processingStartedAt)`
+ * terminal predicate still mean exactly what they mean in production. Narrowing a WHERE can only
+ * ever remove rows from a match, so it can turn a fenced write that would have landed into one
+ * that does not, but never the reverse; the fixture rows it is scoped TO are unaffected.
  *
  * `emailSuppression` is a table keyed by address rather than by row, so an id predicate says
  * nothing about it. It gets an explicit allow-list instead, and refuses anything else outright
@@ -85,14 +148,15 @@ function scopedReference(): string {
 function fixtureScopedClient(
   real: EmailOutboxClient,
   scope: {
-    rows: Record<string, unknown>
+    rows: FixtureRowScope
     recipients?: readonly string[]
     allowCreate?: (data: Record<string, unknown>) => boolean
   },
 ): EmailOutboxClient {
+  const rowPredicate = fixtureRowPredicate(scope.rows)
   const narrow = (args: unknown): Record<string, unknown> => {
     const given = (args ?? {}) as Record<string, unknown>
-    return { ...given, where: { AND: [given.where ?? {}, scope.rows] } }
+    return { ...given, where: { AND: [given.where ?? {}, rowPredicate] } }
   }
   const recipientAllowed = (args: unknown): boolean => {
     const where = ((args ?? {}) as { where?: { email?: unknown } }).where
@@ -105,7 +169,7 @@ function fixtureScopedClient(
       create: (args) => {
         const data = ((args ?? {}) as { data?: Record<string, unknown> }).data ?? {}
         if (scope.allowCreate?.(data) !== true) {
-          throw new Error(`fixtureScopedClient: refused an out-of-scope emailOutbox.create: ${JSON.stringify(data.referenceId)}`)
+          throw new FixtureScopeError(`refused an out-of-scope emailOutbox.create: ${JSON.stringify(data.referenceId)}`)
         }
         return real.emailOutbox.create(args)
       },
@@ -113,13 +177,13 @@ function fixtureScopedClient(
     emailSuppression: {
       findUnique: (args) => {
         if (!recipientAllowed(args)) {
-          throw new Error('fixtureScopedClient: refused an out-of-scope emailSuppression.findUnique')
+          throw new FixtureScopeError('refused an out-of-scope emailSuppression.findUnique')
         }
         return real.emailSuppression.findUnique(args)
       },
       upsert: (args) => {
         if (!recipientAllowed(args)) {
-          throw new Error('fixtureScopedClient: refused an out-of-scope emailSuppression.upsert')
+          throw new FixtureScopeError('refused an out-of-scope emailSuppression.upsert')
         }
         return real.emailSuppression.upsert(args)
       },
@@ -203,7 +267,7 @@ test(
       // else the configured database happens to hold.
       const fixtureIds = [row.id, ...bystanders.map((bystander) => bystander.id)]
       const client = fixtureScopedClient(db as unknown as EmailOutboxClient, {
-        rows: { id: { in: [row.id] } },
+        rows: { ids: [row.id] },
         recipients: [FIXTURE_RECIPIENT],
       })
 
@@ -295,7 +359,7 @@ test(
     // all the same, keyed on this run's reference prefix, so that a future edit which teaches it
     // to read or update is scoped by construction rather than by whoever remembers.
     const client = fixtureScopedClient(db as unknown as EmailOutboxClient, {
-      rows: { referenceId: { startsWith: referenceId } },
+      rows: { referenceIdPrefix: referenceId },
       allowCreate: (data) => data.referenceId === referenceId,
     })
 
@@ -332,3 +396,75 @@ test(
     }
   },
 )
+
+/**
+ * o3d-alnk r3 (Codex HIGH) — THE WRAPPER MUST REFUSE A MATCH-ALL SCOPE, NOT TRUST ITS CALLER.
+ *
+ * NOT SKIPPED. It touches no database, and it must run on every `npm run test:unit`, because the
+ * property it holds is what keeps the two proofs above from ever pointing a fake sender at a real
+ * customer's queued email.
+ *
+ * The refusal is in two layers, and both are load-bearing:
+ *
+ *   COMPILE TIME, for the shapes tsc can see. `rows` is a fixture-identifier set, not a
+ *   predicate, so `{}` — the exact `AND: [originalWhere, {}]` unscoped where the finding named —
+ *   has no way to be written, and neither has a hand-rolled predicate nor an empty tuple. Each
+ *   negative carries `@ts-expect-error`: relax the type and the directive goes unused and
+ *   `tsc --noEmit` fails with TS2578.
+ *
+ *   RUNTIME, for the widenings that are well-typed. `referenceIdPrefix: ''` is a perfectly good
+ *   string and `startsWith: ''` matches every row in the table; a `string[]` that happens to be
+ *   empty reaches the same place past a cast. Those throw `FixtureScopeError` BY NAME, before a
+ *   single query is issued.
+ */
+test('fixtureScopedClient refuses a widening scope rather than trusting the caller to narrow (o3d-alnk)', () => {
+  const unreachable = new Error('fixtureScopedClient built a client from a scope it should have refused')
+  const stub = {
+    emailOutbox: {
+      findMany: () => { throw unreachable },
+      updateMany: () => { throw unreachable },
+      create: () => { throw unreachable },
+    },
+    emailSuppression: {
+      findUnique: () => { throw unreachable },
+      upsert: () => { throw unreachable },
+    },
+  } as unknown as EmailOutboxClient
+
+  // COMPILE TIME. Kept inside a function that is referenced and never called.
+  const refusedAtCompileTime = (): void => {
+    // @ts-expect-error `{}` is the match-all scope the finding was about; `rows` no longer admits it
+    void fixtureScopedClient(stub, { rows: {} })
+    // @ts-expect-error a caller cannot hand in a predicate at all — the wrapper builds it
+    void fixtureScopedClient(stub, { rows: { id: { in: ['a'] } } })
+    // @ts-expect-error an empty id set narrows nothing, and the non-empty tuple says so
+    void fixtureScopedClient(stub, { rows: { ids: [] } })
+  }
+  assert.equal(typeof refusedAtCompileTime, 'function')
+
+  // RUNTIME, by name, for the widenings that are well-typed.
+  assert.throws(
+    () => fixtureScopedClient(stub, { rows: { referenceIdPrefix: '' } }),
+    (error: unknown) => error instanceof FixtureScopeError && /matches every row/.test((error as Error).message),
+    'an empty referenceId prefix is a match-all scope',
+  )
+  assert.throws(
+    () => fixtureScopedClient(stub, { rows: { ids: [''] } }),
+    (error: unknown) => error instanceof FixtureScopeError && /blank fixture id/.test((error as Error).message),
+    'a blank id would widen the scope',
+  )
+  assert.throws(
+    () => fixtureScopedClient(stub, { rows: { ids: ([] as unknown) as NonEmpty<string> } }),
+    (error: unknown) => error instanceof FixtureScopeError && /empty id set/.test((error as Error).message),
+    'an empty set that reached here past a cast is still refused',
+  )
+
+  // NON-VACUITY: the two scopes the proofs above actually use are ACCEPTED, so the assertions are
+  // not passing because the wrapper refuses everything.
+  assert.equal(typeof fixtureScopedClient(stub, { rows: { ids: ['row-1'] } }).emailOutbox.findMany, 'function')
+  assert.equal(typeof fixtureScopedClient(stub, { rows: { referenceIdPrefix: 'test-email-fence-' } }).emailOutbox.findMany, 'function')
+
+  // AND THE PREDICATE IT BUILDS IS THE NARROWING ONE, not merely non-throwing.
+  assert.deepEqual(fixtureRowPredicate({ ids: ['row-1', 'row-2'] }), { id: { in: ['row-1', 'row-2'] } })
+  assert.deepEqual(fixtureRowPredicate({ referenceIdPrefix: 'abc' }), { referenceId: { startsWith: 'abc' } })
+})
