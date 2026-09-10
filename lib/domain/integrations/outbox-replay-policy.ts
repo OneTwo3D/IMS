@@ -124,10 +124,24 @@ export type OutboxReplaySafety =
    *
    * THE PARK HAS ITS OWN COST and declaring it is not free. A row nobody reclaims is a row whose
    * work does not happen until a human acts, and for an operation whose enqueue path folds new work
-   * into the existing row rather than creating another, that means the work keeps NOT happening.
-   * `woocommerce/stock.push` is exactly that shape (o3d-8td2 follow-up); the trade was still taken,
-   * because a parked row is visible in the outbox admin and an unrecallable wrong quantity at
-   * WooCommerce is not.
+   * into the existing row rather than creating another, that means the work keeps NOT happening —
+   * every later change is absorbed by the parked row and waits behind it. `woocommerce/stock.push`
+   * is exactly that shape.
+   *
+   * ROUND 2 PAID FOR THAT PARK WITH A CLAIM THAT WAS FALSE (Codex round 3, HIGH). It said the trade
+   * was acceptable because "a parked row is visible in the outbox admin" and the daily reconcile
+   * shares the key and would drain it. Neither half held. The daily reconcile calls `pushStockToWc`
+   * DIRECTLY (lib/connectors/woocommerce/sync/reconcile.ts) and never touches the outbox, so it
+   * corrects the QUANTITY once a day and leaves the park exactly where it was; and the exception
+   * inbox — the surface an operator actually watches — listed only `PERMANENT_FAILED`, so the park
+   * was not on it. A remedy whose own failure mode is invisible and self-perpetuating is worse than
+   * the defect it replaces.
+   *
+   * SO THE PARK NOW GENERATES ITS OWN OBLIGATION. `integrationOutboxUnreclaimableScope` is derived
+   * from THIS declaration, and the exception inbox's stalled-park section is built from it: choosing
+   * `unsafe-to-replay` is what puts an operation's stalled rows in front of an operator, in the same
+   * edit, with a one-action recovery. The two cannot drift apart, because there is only one list and
+   * it is computed from the verdicts rather than maintained beside them.
    */
   | 'unsafe-to-replay'
 
@@ -150,6 +164,10 @@ export type OutboxReplaySafety =
  *   2. establish the weakest answer for EVERY member of the discriminator's domain, exhaustively
  *      (the `Record<AccountingSyncType, …>` idiom `POST_EFFECT` already uses), and widen this type
  *      to carry that table.
+ *
+ * AN OPERATION CAN FAIL TO BE ITS OWN EFFECT IN A SECOND WAY, which round 2 of this file did not
+ * have a shape for and therefore could not refuse: not several effects ACROSS runs, but several
+ * effects WITHIN one run, of which the guard covers only the first. See `effect-sequence` below.
  */
 export type OutboxEffectScope =
   /** The row's operation IS the effect: one registered operation, one kind of thing done. */
@@ -160,6 +178,41 @@ export type OutboxEffectScope =
    * the reason survives in the code rather than only in a review thread.
    */
   | { keyedBy: 'sub-operation'; discriminator: string; weakestKnownEffect: string }
+  /**
+   * THE OTHER WAY AN OPERATION FAILS TO BE ITS OWN EFFECT (o3d-8td2 round 3, Codex MEDIUM 1).
+   *
+   * `sub-operation` catches a row that does DIFFERENT things on different runs. This catches a row
+   * that does SEVERAL things on every run, only one of which the guard covers. The shape is a
+   * guarded transaction that commits an idempotence marker, followed by further effects issued
+   * afterwards — an enqueue, an audit write, an activity entry — or an effect issued inside the
+   * transaction on a DIFFERENT connection, which therefore commits independently of it.
+   *
+   * Both directions are broken, and `local-only-guarded` asserts neither:
+   *
+   *   AFTER the marker commits, a crash strands every remaining effect permanently. The next
+   *   attempt reads the marker, answers `duplicate`, and completes — so the guard that made the
+   *   replay "safe" is exactly what guarantees the outstanding effects never run. That is not a
+   *   duplicate; it is a silent partial application, and it is worse than the duplicate the guard
+   *   was chosen to prevent.
+   *
+   *   INSIDE the transaction but off its connection, an effect survives a rollback the rest of the
+   *   work does not, and is issued again by the retry — so the same operation both loses effects and
+   *   duplicates them, depending on where the failure lands.
+   *
+   * `guardedEffect` names the one effect the guard really covers; `effectsOutsideTheGuard` names
+   * every effect it does not, so the entry cannot claim coverage it was never given. Like
+   * `sub-operation` this may only be declared `unsafe-to-replay`, and
+   * {@link resolveOutboxReplaySafety} folds it there at runtime too.
+   *
+   * TO MAKE SUCH AN OPERATION RECLAIMABLE, move the outstanding effects inside the guard (an outbox
+   * row enqueued in the same transaction, an audit write on `tx`), so that the marker and the
+   * effects commit or roll back together — then, and only then, is the operation its own effect.
+   */
+  | {
+    keyedBy: 'effect-sequence'
+    guardedEffect: string
+    effectsOutsideTheGuard: readonly [string, ...string[]]
+  }
 
 /** Every answer, exported so a test can assert the registry only ever uses these. */
 export const OUTBOX_REPLAY_SAFETY_VALUES = [

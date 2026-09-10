@@ -121,9 +121,15 @@ mock.module('@/lib/auth/server', {
 })
 mock.module('@/lib/domain/integrations/outbox-admin', {
   namedExports: {
+    ADMIN_OUTBOX_STALE_PROCESSING_LOCK_MS: 10 * 60 * 1000,
     IntegrationOutboxAdminError: class extends Error {},
     listIntegrationOutboxAdminRows: async () => ({ rows: [], total: 0 }),
     replayIntegrationOutboxAdminRow: async () => ({ success: true }),
+    recoverStalledIntegrationOutboxPark: async () => ({ success: true }),
+    // o3d-8td2 r3: the exception inbox now also asks which operations park. `null` is the honest
+    // stand-in HERE — this file is about refund-park allocation targets and stubs the outbox
+    // wholesale — and it exercises the "no unreclaimable operation declared" arm of the loader.
+    stalledIntegrationOutboxParkWhere: () => null,
   },
 })
 mock.module('@/lib/activity-log', { namedExports: { logActivity: async () => {} } })

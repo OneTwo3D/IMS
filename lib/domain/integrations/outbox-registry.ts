@@ -79,10 +79,15 @@ export const LandedCostJournalOutboxPayloadSchema = z.object({
  * outbox's own compare-and-set cannot answer it. Every entry's answer must be justified in a
  * comment beside it, naming the guard, fence or dispatch evidence it is claiming.
  *
- * The two fields are one union, not two independent choices: an operation that admits its effects
+ * The two fields are one union, not two independent choices. An operation that admits its effects
  * are keyed by a SUB-OPERATION (`xero/accounting.post`, over `AccountingSyncType`) cannot be
  * declared anything but `unsafe-to-replay`, because a single verdict over several effects is an
  * average, and an average reads as an answer while asserting nothing about the member that matters.
+ *
+ * Nor can an operation whose run is an EFFECT SEQUENCE — one guarded effect followed by effects the
+ * guard does not cover (o3d-8td2 round 3). `mintsoft/inbound.booked-in` declared itself
+ * single-effect and was not, which is the escape this arm closes: an entry can no longer buy a
+ * reclaimable verdict by describing only the part of its run that deserves one.
  */
 type OutboxRegistryEntry<Name extends string = string> =
   & { name: Name; schema: z.ZodTypeAny }
@@ -90,6 +95,14 @@ type OutboxRegistryEntry<Name extends string = string> =
     | { effects: { keyedBy: 'operation' }; replay: OutboxReplaySafety }
     | {
       effects: { keyedBy: 'sub-operation'; discriminator: string; weakestKnownEffect: string }
+      replay: 'unsafe-to-replay'
+    }
+    | {
+      effects: {
+        keyedBy: 'effect-sequence'
+        guardedEffect: string
+        effectsOutsideTheGuard: readonly [string, ...string[]]
+      }
       replay: 'unsafe-to-replay'
     }
   )
@@ -131,11 +144,35 @@ export const INTEGRATION_OUTBOX_REGISTRY = defineOutboxRegistry({
     // write to reject a regression with, so `remote-write-idempotent` cannot honestly be claimed
     // until one exists on our side of the wire (a monotonic push generation the receiver checks).
     //
-    // THE PARK IS NOT FREE, and this is the trade being taken. `applyStockOutboxPayload` folds a new
-    // stock change into an existing PROCESSING row rather than creating another, so a row parked
-    // here keeps absorbing enqueues that will not drain until an operator dead-letters it in the
-    // outbox admin. That is a visible, operator-resolvable stall, weighed against a wrong quantity
-    // at WooCommerce that nobody is told about — see the o3d-8td2 follow-up.
+    // THE PARK IS NOT FREE, and round 2 priced it with two claims that were both FALSE (Codex round
+    // 3, HIGH; o3d-22jw records the corrected analysis). `applyStockOutboxPayload` folds a new stock
+    // change into an existing PROCESSING row rather than creating another, so a row parked here
+    // keeps absorbing enqueues and none of them drain. Round 2 called that acceptable because the
+    // daily reconcile shared the key and an operator could see the row anyway. Verified in round 3:
+    //
+    //   THE DAILY RECONCILE DOES NOT SHARE THE KEY. `runWooCommerceDailyReconcile`
+    //   (lib/connectors/woocommerce/sync/reconcile.ts) calls `pushStockToWc({ forceAll: true })`
+    //   DIRECTLY. It never enqueues, never claims, never completes an outbox row. So it re-pushes
+    //   the correct quantity once a day and leaves the park untouched — which means the park
+    //   survives every reconcile, and between two of them a change made a minute after the crash
+    //   waits up to 24 hours. For a stock quantity that is an oversell window, not a delay.
+    //
+    //   THE PARK WAS NOT VISIBLE WHERE ANYBODY LOOKS. The exception inbox listed `PERMANENT_FAILED`
+    //   and nothing else, so a stalled PROCESSING row appeared on no operator surface at all; the
+    //   admin list would show it only to someone who already suspected it and filtered for it.
+    //
+    // WHAT PAYS FOR THE PARK NOW is `integrationOutboxUnreclaimableScope` below: every operation
+    // declared `unsafe-to-replay` puts its stalled rows into the exception inbox's stalled-park
+    // section, with a single recovery action (dead-letter the stale lock, then re-queue with the
+    // FOLDED payload — the latest stock change, not the one the dead worker was carrying). The
+    // obligation is computed from this verdict rather than maintained alongside it, so an operation
+    // cannot be parked without also being watched.
+    //
+    // THE PARK IS STILL A PARK, and that is deliberate. An automatic drain would be a second worker
+    // executing the same absolute push, which is the exact reordering hazard this entry is
+    // `unsafe-to-replay` for; a self-healing sweep here would reintroduce the defect while looking
+    // like the fix. The real fix is the monotonic push generation named above, and until it exists
+    // the honest position is: parked, visible, one action to recover.
     'stock.push': {
       name: 'stockSync',
       schema: WcStockSyncOutboxPayloadSchema,
@@ -187,25 +224,62 @@ export const INTEGRATION_OUTBOX_REGISTRY = defineOutboxRegistry({
     },
   },
   mintsoft: {
-    // NOT ENQUEUED TODAY: nothing enqueues or claims this operation, and the schema above says why
-    // the entry is a reservation. Assessed against the processor it names anyway, so wiring it up
-    // later does not reopen the question. `processBookedInEvent` (lib/domain/wms/booked-in-service.ts)
-    // reads the WMS with a GET only, takes `SELECT ... FOR UPDATE` on `wms_inbound_receipt_events`
-    // and re-reads `processedAt` inside the same transaction, so a second worker BLOCKS on the row
-    // lock and then returns `duplicate` without applying anything. The apply is a DELTA over each
-    // line's `lastProcessedReceivedQty`, which is why the second pass has nothing left to book in.
+    // UNSAFE (Codex round 3, MEDIUM 1 — round 2 declared this `local-only-guarded` under
+    // `ONE_EFFECT`, and the "one effect" half of that was simply not true of the processor).
     //
-    // ORDERING, re-checked in round 2: the guard sits between the RESUME and the effect, not merely
-    // between the claim and the effect. A slow worker that wakes after a reclaim re-enters the same
-    // transaction, takes the same row lock, re-reads `processedAt` (line ~320) and returns
-    // `duplicate` — it cannot apply a delta computed before it slept, because the delta is
-    // recomputed from `lastProcessedReceivedQty` inside the lock. Nothing here is an absolute
-    // assignment, so there is no older value that can land last.
+    // What round 2 said about the GUARDED part is right, and is kept because it is still the reason
+    // the guarded part needs no more than this: `processBookedInEvent`
+    // (lib/domain/wms/booked-in-service.ts) reads the WMS with a GET only, takes
+    // `SELECT ... FOR UPDATE` on `wms_inbound_receipt_events`, re-reads `processedAt` inside the
+    // same transaction, and applies a DELTA over each line's `lastProcessedReceivedQty`. A second
+    // worker BLOCKS on the row lock and then returns `duplicate` with nothing left to book in, and
+    // because the delta is recomputed inside the lock a slow worker cannot apply one it computed
+    // before it slept. For the RECEIPT, the guard sits between the resume and the effect.
+    //
+    // BUT THE RECEIPT IS NOT THE RUN. The transaction closes at line ~1085; after it commits,
+    // `processBookedInEvent` goes on to do three more things, none of them under any guard:
+    //
+    //   1. `enqueueStockSync(processed.productIds, 'IMS_CHANGE')` (~1131) — the WooCommerce stock
+    //      push for every product whose quantity just changed. Its own throw is swallowed and logged.
+    //   2. `logActivity(... 'mintsoft_booked_in_processed')` (~1137).
+    //   3. `recordWmsMutationEvent(... 'booked_in_receipt', 'SUCCEEDED')` (~1150) — the audit trail
+    //      the ASN timeline is built from.
+    //
+    // A crash anywhere in that tail is UNRECOVERABLE, and it is the guard that makes it so:
+    // `processedAt` is already committed, so the reclaim's second worker re-reads it, answers
+    // `duplicate` at line ~1087 and completes the outbox row SUCCEEDED — having applied nothing.
+    // Stock is booked in and WooCommerce is never told; the audit row for a mutation that really
+    // happened never exists. That is not a duplicate the guard prevented, it is a silent partial
+    // application the guard CAUSED, and `local-only-guarded` asserts the opposite of it.
+    //
+    // AND ONE EFFECT ESCAPES IN THE OTHER DIRECTION. The `received_warehouse_divergence` WARNING at
+    // line ~674 is inside the transaction but is issued through `logActivity`, which writes on the
+    // GLOBAL `db` client, not on `tx` (lib/activity-log.ts — `logActivityInTransaction` is the one
+    // that takes a client, and it is not the one used here). So it commits on its own connection: a
+    // rollback of the receipt work leaves the warning standing, and the retry writes a second one.
+    // The same operation therefore both loses effects and duplicates them.
+    //
+    // STILL NOT ENQUEUED TODAY — nothing enqueues or claims this operation, and the schema above
+    // says why the entry is a reservation. That is precisely why the round-2 declaration was the
+    // dangerous kind of wrong: a dormant entry is read as settled by whoever wires it up, and this
+    // one said the assessment had already been done. Wiring it up now inherits a refusal instead.
+    // To earn a reclaimable verdict, move the three tail effects inside the transaction (the stock
+    // sync as an outbox row enqueued on `tx`, the audit and activity writes on `tx`) and switch the
+    // divergence warning to `logActivityInTransaction`.
     'inbound.booked-in': {
       name: 'processBookedInEvent',
       schema: MintsoftBookedInOutboxPayloadSchema,
-      effects: ONE_EFFECT,
-      replay: 'local-only-guarded',
+      effects: {
+        keyedBy: 'effect-sequence',
+        guardedEffect: 'the receipt application, under SELECT ... FOR UPDATE on wms_inbound_receipt_events + processedAt',
+        effectsOutsideTheGuard: [
+          'enqueueStockSync (post-commit): the WooCommerce stock push for every product booked in',
+          'logActivity mintsoft_booked_in_processed (post-commit)',
+          'recordWmsMutationEvent booked_in_receipt/SUCCEEDED (post-commit)',
+          'logActivity received_warehouse_divergence (in-transaction, but on the global db client, so it commits independently)',
+        ],
+      },
+      replay: 'unsafe-to-replay',
     },
   },
   accounting: {
@@ -319,13 +393,50 @@ export function integrationOutboxReplayPolicy(connector: string, operation: stri
   return entry ? resolveOutboxReplaySafety(entry) : null
 }
 
-/** The operations of one connector whose declared policy permits a stale-lock reclaim. */
-function reclaimableOperationsOf(connector: string): string[] {
+/** The operations of one connector, split by whether their declared policy permits a stale reclaim. */
+function operationsOf(connector: string, reclaimable: boolean): string[] {
   const connectorRegistry = INTEGRATION_OUTBOX_REGISTRY[connector as RegisteredOutboxConnector]
   if (!connectorRegistry) return []
   return Object.entries(connectorRegistry as Record<string, OutboxRegistryEntry>)
-    .filter(([, entry]) => outboxReplayPolicyGrantsStaleReclaim(resolveOutboxReplaySafety(entry)))
+    .filter(([, entry]) => outboxReplayPolicyGrantsStaleReclaim(resolveOutboxReplaySafety(entry)) === reclaimable)
     .map(([operation]) => operation)
+}
+
+/** The operations of one connector whose declared policy permits a stale-lock reclaim. */
+function reclaimableOperationsOf(connector: string): string[] {
+  return operationsOf(connector, true)
+}
+
+/**
+ * THE OTHER HALF OF THE SAME DECLARATION: every operation whose stalled rows nobody will ever come
+ * back for, as a Prisma filter — `null` when no registered operation is `unsafe-to-replay`.
+ *
+ * `integrationOutboxStaleReclaimScope` says which rows a second WORKER may take. This says which
+ * rows an OPERATOR has to, and it is deliberately the exact complement, computed from the same
+ * verdicts in the same pass. Declaring an operation `unsafe-to-replay` buys a park; this is the bill
+ * for it, and it arrives in the same edit rather than needing a second one somebody has to remember.
+ *
+ * A row matched by this scope AND stalled in PROCESSING past its lock's staleness has, by
+ * construction, no automatic recovery left: the drain will not reclaim it, the retry ladder never
+ * runs (it is not in a failed state), and — as o3d-22jw had to be corrected to say — no reconcile
+ * elsewhere drains it either. The exception inbox's stalled-park section is built from this, so the
+ * set of operations that can strand work and the set an operator is shown cannot come apart.
+ *
+ * RECLAIMABLE OPERATIONS ARE DELIBERATELY EXCLUDED, on the rule this inbox already follows for
+ * RETRYABLE_FAILED (Codex r4, app/actions/sync-exceptions.ts): a row still on an automatic recovery
+ * path is noise, because the next drain sweep reclaims it without anyone being asked.
+ */
+export function isUnreclaimableOutboxOperation(connector: string, operation: string): boolean {
+  const policy = integrationOutboxReplayPolicy(connector, operation)
+  return policy !== null && !outboxReplayPolicyGrantsStaleReclaim(policy)
+}
+
+/** @see isUnreclaimableOutboxOperation — the same rule, shaped as a filter over every connector. */
+export function integrationOutboxUnreclaimableScope(): Record<string, unknown> | null {
+  const perConnector = Object.keys(INTEGRATION_OUTBOX_REGISTRY)
+    .map((name) => ({ connector: name, operation: { in: operationsOf(name, false) } }))
+    .filter((scope) => scope.operation.in.length > 0)
+  return perConnector.length > 0 ? { OR: perConnector } : null
 }
 
 /**

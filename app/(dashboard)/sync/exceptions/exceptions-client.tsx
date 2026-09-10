@@ -31,6 +31,7 @@ import {
   replayDeadReceiptEvent,
   replayDeadWebhookEvent,
   replayOutboxException,
+  recoverStalledOutboxPark,
   isolateUnresolvedDriftCohort,
   replayStuckDispatch,
   retryUnresolvedDriftCohort,
@@ -325,6 +326,51 @@ export function ExceptionsClient({ data }: Props) {
                       onClick={() => runAction(() => replayOutboxException(row.id), 'Outbox row re-queued.')}
                     >
                       <RotateCcw className="h-3 w-3 mr-1" />Replay
+                    </Button>
+                  </TableCell>
+                </TableRow>
+              ))}
+            </TableBody>
+          </Table>
+        </Card>
+      ) : null}
+
+      {data.stalledOutboxParks.length > 0 ? (
+        <Card className="p-4 space-y-3">
+          <SectionHeading
+            title={`Integration outbox — stalled parks (${data.summary.stalledOutboxParks})`}
+            detail="Rows still marked PROCESSING under a worker that never came back, on operations where handing the row to a second worker would be unsafe. Nothing retries these: no drain reclaims them and no reconcile drains them. For WooCommerce stock pushes every later change to the same product is folded into the parked row and waits behind it. Drain re-queues the row with its LATEST payload, and is refused if the worker is still alive."
+            shown={data.stalledOutboxParks.length}
+            total={data.summary.stalledOutboxParks}
+          />
+          <Table containerClassName="rounded-lg border" className="min-w-[900px]">
+            <TableHeader className="bg-muted/40">
+              <TableRow>
+                <TableHead>Connector / operation</TableHead>
+                <TableHead>Held for</TableHead>
+                <TableHead>Attempts</TableHead>
+                <TableHead>Held by</TableHead>
+                <TableHead>Locked</TableHead>
+                <TableHead className="text-right">Action</TableHead>
+              </TableRow>
+            </TableHeader>
+            <TableBody>
+              {data.stalledOutboxParks.map((row) => (
+                <TableRow key={row.id}>
+                  <TableCell className="text-xs font-mono">{row.connector}/{row.operation}</TableCell>
+                  <TableCell className="text-xs">{formatHeldFor(row.heldForMs)}</TableCell>
+                  <TableCell className="text-xs">{row.attempts}</TableCell>
+                  <TableCell className="text-xs font-mono text-muted-foreground">{row.lockedBy ?? '—'}</TableCell>
+                  <TableCell className="text-xs text-muted-foreground">{row.lockedAt ? formatDateTime(row.lockedAt) : '—'}</TableCell>
+                  <TableCell className="text-right">
+                    <Button
+                      type="button"
+                      variant="outline"
+                      size="sm"
+                      disabled={isPending}
+                      onClick={() => runAction(() => recoverStalledOutboxPark(row.id), 'Stalled outbox park re-queued.')}
+                    >
+                      <RotateCcw className="h-3 w-3 mr-1" />Drain
                     </Button>
                   </TableCell>
                 </TableRow>
@@ -942,6 +988,19 @@ export function ExceptionsClient({ data }: Props) {
       {isPending ? <p className="text-xs text-muted-foreground flex items-center gap-1"><Loader2 className="h-3 w-3 animate-spin" />Working…</p> : null}
     </div>
   )
+}
+
+/**
+ * How long the work behind a parked row has not been happening. Rendered coarsely on purpose: the
+ * operator decision this drives is "is this hours or days", never "is this 71 or 73 minutes".
+ */
+function formatHeldFor(heldForMs: number | null): string {
+  if (heldForMs === null) return '—'
+  const minutes = Math.floor(heldForMs / 60_000)
+  if (minutes < 60) return `${minutes}m`
+  const hours = Math.floor(minutes / 60)
+  if (hours < 48) return `${hours}h ${minutes % 60}m`
+  return `${Math.floor(hours / 24)}d ${hours % 24}h`
 }
 
 function SectionHeading({ title, detail, shown, total }: { title: string; detail: string; shown?: number; total?: number }) {

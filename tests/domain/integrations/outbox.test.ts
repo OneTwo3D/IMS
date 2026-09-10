@@ -1,4 +1,6 @@
 import assert from 'node:assert/strict'
+import { readFileSync } from 'node:fs'
+import path from 'node:path'
 import test from 'node:test'
 
 import { Prisma } from '@/app/generated/prisma/client'
@@ -19,9 +21,15 @@ import {
   INTEGRATION_OUTBOX_REGISTRY,
   integrationOutboxReplayPolicy,
   integrationOutboxStaleReclaimScope,
+  integrationOutboxUnreclaimableScope,
+  isUnreclaimableOutboxOperation,
   parseIntegrationOutboxPayload,
   WcStockSyncOutboxPayloadSchema,
 } from '@/lib/domain/integrations/outbox-registry'
+import {
+  ADMIN_OUTBOX_STALE_PROCESSING_LOCK_MS,
+  stalledIntegrationOutboxParkWhere,
+} from '@/lib/domain/integrations/outbox-admin'
 import {
   OUTBOX_REPLAY_SAFETY_VALUES,
   outboxReplayPolicyGrantsStaleReclaim,
@@ -901,12 +909,14 @@ test('every registered outbox operation declares a known replay-safety answer an
       `${key} declares an unknown replay-safety answer: ${replay}`,
     )
     assert.ok(
-      keyedBy === 'operation' || keyedBy === 'sub-operation',
+      keyedBy === 'operation' || keyedBy === 'sub-operation' || keyedBy === 'effect-sequence',
       `${key} declares an unknown effect scope: ${keyedBy}`,
     )
     // The rule the type states, restated against the built object so a cast cannot slip past it.
-    if (keyedBy === 'sub-operation') {
-      assert.equal(replay, 'unsafe-to-replay', `${key} multiplexes its effects and cannot carry a safe verdict`)
+    // Both non-`operation` scopes are the same rule: an entry that admits its operation is not its
+    // own effect — whether across runs or within one — may not carry a safe verdict.
+    if (keyedBy !== 'operation') {
+      assert.equal(replay, 'unsafe-to-replay', `${key} is not its own effect and cannot carry a safe verdict`)
     }
   }
   assert.deepEqual(
@@ -923,7 +933,7 @@ test('every registered outbox operation declares a known replay-safety answer an
   )
 })
 
-test('the six verdicts are the round-2 corrected ones', () => {
+test('the six verdicts are the round-3 corrected ones', () => {
   const verdicts = Object.fromEntries(
     Object.entries(INTEGRATION_OUTBOX_REGISTRY).flatMap(([connector, operations]) =>
       Object.entries(operations).map(([operation, entry]) => [`${connector}/${operation}`, entry.replay]),
@@ -936,7 +946,9 @@ test('the six verdicts are the round-2 corrected ones', () => {
     // Codex round 2 HIGH 2: multiplexes AccountingSyncType; INVOICE_EMAIL enqueues an unguarded
     // EmailOutbox row (whose own queue is unfenced — o3d-alnk).
     'xero/accounting.post': 'unsafe-to-replay',
-    'mintsoft/inbound.booked-in': 'local-only-guarded',
+    // Codex round 3 MEDIUM 1: not one guarded effect but a guarded receipt followed by three
+    // unguarded ones, so a crash in the tail strands them BECAUSE the guard commits `processedAt`.
+    'mintsoft/inbound.booked-in': 'unsafe-to-replay',
     'accounting/landed-cost.adjustment-journal': 'local-only-guarded',
     'sales/refund.reservation-release': 'local-only-guarded',
     'sales/refund.unmatched-warning': 'local-only-guarded',
@@ -958,6 +970,18 @@ test('a multiplexing entry cannot be safe at runtime even when its field says it
     resolveOutboxReplaySafety({
       replay: 'local-only-guarded',
       effects: { keyedBy: 'sub-operation', discriminator: 'AccountingSyncType', weakestKnownEffect: 'INVOICE_EMAIL' },
+    }),
+    'unsafe-to-replay',
+  )
+  // The same fold, for the other way an operation fails to be its own effect (round 3).
+  assert.equal(
+    resolveOutboxReplaySafety({
+      replay: 'remote-write-idempotent',
+      effects: {
+        keyedBy: 'effect-sequence',
+        guardedEffect: 'the guarded receipt',
+        effectsOutsideTheGuard: ['a post-commit enqueue'],
+      },
     }),
     'unsafe-to-replay',
   )
@@ -995,9 +1019,68 @@ test('the stale-reclaim scope fails closed on an operation this build does not k
   const unscoped = integrationOutboxStaleReclaimScope(undefined, undefined) as { OR: Array<{ connector: string }> }
   assert.deepEqual(
     unscoped.OR.map((scope) => scope.connector).sort(),
-    ['accounting', 'mintsoft', 'sales'],
-    'woocommerce and xero are unsafe-to-replay, so neither may contribute a stale-reclaim arm',
+    ['accounting', 'sales'],
+    'woocommerce, xero and (since round 3) mintsoft are unsafe-to-replay, so none may contribute an arm',
   )
+})
+
+// ---------------------------------------------------------------------------
+// THE PARK'S OWN OBLIGATION (Codex round 3, HIGH).
+//
+// Round 2 justified the WooCommerce park with two claims that were false: that the
+// daily reconcile shared the key and would drain it, and that the row was visible
+// anyway. It shares no key (`reconcile.ts` calls `pushStockToWc` directly) and the
+// exception inbox listed only PERMANENT_FAILED. What pays for the park now is that
+// the same declaration which creates it also generates the operator's list.
+// ---------------------------------------------------------------------------
+
+test('every operation that parks is an operation an operator is shown, and no other', () => {
+  const scope = integrationOutboxUnreclaimableScope() as { OR: Array<{ connector: string; operation: { in: string[] } }> }
+  assert.ok(scope, 'this build declares unsafe-to-replay operations, so the scope must exist')
+
+  // The two sets are complements COMPUTED FROM THE SAME VERDICTS, which is the property that stops
+  // them drifting: an operation cannot be parked without also being watched, and cannot be watched
+  // while a drain sweep is still going to pick it up on its own.
+  const parked = new Map(scope.OR.map((arm) => [arm.connector, arm.operation.in.slice().sort()]))
+  assert.deepEqual([...parked.keys()].sort(), ['mintsoft', 'woocommerce', 'xero'])
+  assert.deepEqual(parked.get('woocommerce'), ['stock.push'])
+  assert.deepEqual(parked.get('xero'), ['accounting.post'])
+  assert.deepEqual(parked.get('mintsoft'), ['inbound.booked-in'])
+
+  for (const [connector, operations] of parked) {
+    for (const operation of operations) {
+      assert.equal(isUnreclaimableOutboxOperation(connector, operation), true)
+      assert.equal(integrationOutboxStaleReclaimScope(connector, operation), null,
+        `${connector}/${operation} is listed for an operator, so no worker may reclaim it`)
+    }
+  }
+
+  // ...and the complement really is a complement: a reclaimable operation is in neither list.
+  assert.equal(isUnreclaimableOutboxOperation('sales', 'refund.reservation-release'), false)
+  assert.ok(!parked.has('sales'), 'a self-healing operation must not be shown as an operator exception')
+  // An operation this build has never heard of is in neither list either, so the action gated on
+  // this predicate can never reach a row the list would not have shown.
+  assert.equal(isUnreclaimableOutboxOperation('sales', 'legacy.unregistered'), false)
+  assert.equal(isUnreclaimableOutboxOperation('no-such-connector', 'stock.push'), false)
+})
+
+test('the stalled-park filter asks for a stale lock on a parked operation, and nothing else', () => {
+  const now = new Date('2026-04-27T10:00:00.000Z')
+  const where = stalledIntegrationOutboxParkWhere({ now, staleProcessingLockMs: RECLAIM_STALE_MS }) as {
+    OR: Array<{ connector: string }>
+    status: string
+    lockedAt: { not: null; lte: Date }
+  }
+  assert.ok(where)
+  assert.equal(where.status, INTEGRATION_OUTBOX_STATUS.PROCESSING,
+    'a failed row is the OTHER section; this one is about work that never failed at all')
+  assert.deepEqual(where.lockedAt.lte, new Date(now.getTime() - RECLAIM_STALE_MS))
+  assert.deepEqual(where.OR.map((arm) => arm.connector).sort(), ['mintsoft', 'woocommerce', 'xero'])
+
+  // The threshold is the SAME constant the recovery action refuses below, so a row can never be
+  // listed while the only action offered on it would be rejected as `processing_lock_active`.
+  const shipped = stalledIntegrationOutboxParkWhere({ now }) as { lockedAt: { lte: Date } }
+  assert.deepEqual(shipped.lockedAt.lte, new Date(now.getTime() - ADMIN_OUTBOX_STALE_PROCESSING_LOCK_MS))
 })
 
 test('a stale PROCESSING lock is reclaimed per operation, not on elapsed time alone', async () => {
@@ -1036,15 +1119,40 @@ test('a stale PROCESSING lock is reclaimed per operation, not on elapsed time al
 })
 
 // ---------------------------------------------------------------------------
-// PROOF 1 (Codex round 2, HIGH 1). The WooCommerce pause, driven rather than argued.
+// THE TWO PAUSE NARRATIVES — AND, EXPLICITLY, WHAT THEY DO AND DO NOT ESTABLISH.
 //
-// Worker A computes stock_quantity BEFORE the batch POST and holds it across the
-// await. If a reclaim is granted, worker B can compute a FRESHER value, push it and
-// close the row, and A can then land its older value last. The first half of this
-// test runs that interleaving against an operation the registry DOES declare
-// reclaimable, so the harness is shown to reach the damage; the second half runs the
-// identical interleaving against woocommerce/stock.push and shows the reclaim is
-// refused, so the interleaving cannot begin.
+// Codex raised the same objection to these in round 1 and again in round 2, and it
+// was right both times, so this round answers it in words rather than by rebuilding
+// them a third time in the same shape.
+//
+// WHAT THEY ESTABLISH. That `claimIntegrationOutboxWork` grants a stale-lock reclaim
+// for an operation whose declaration permits one and refuses it for an operation
+// whose declaration does not; that the refusal comes from the DECLARATION and not
+// from the clock, proved by re-running the identical claim against a row identical
+// in every field but its operation; and that the surviving worker's completion is
+// honoured when no reclaim was granted. That is a policy gate, and a gate is a real
+// thing to test.
+//
+// WHAT THEY DO NOT ESTABLISH, despite reading like a story about it:
+//
+//   * ANY DATABASE CONTENTION. The client below is an in-memory double driven
+//     SEQUENTIALLY. Nothing in it can lose a race, because there is no race. The
+//     contention is tested for real, concurrently, against Postgres, in
+//     tests/concurrency/outbox-stale-park.concurrent.test.ts.
+//   * THAT THE EFFECTS ORDER AS DESCRIBED. `world.remoteQty = 10` is an assignment
+//     standing in for a WooCommerce batch POST, and `world.enqueued.push(...)` for a
+//     `db.emailOutbox.create`. `pushStockToWc` and `sendAccountingInvoiceEmailInternal`
+//     are NOT invoked and cannot be: the first writes to a live store, the second
+//     mails a customer. The ordering hazard itself is argued in the registry entries
+//     from the code; the database facts those arguments rest on — that EmailOutbox
+//     carries no uniqueness to collide with — are checked in the concurrency file.
+//   * ANYTHING ABOUT THE ARMS THAT USE `sales/refund.reservation-release`. That
+//     operation is a STAND-IN, used only because it is a declaration this build
+//     permits; nothing about a refund release is a stock push or an invoice email.
+//     Those arms show the harness reaches the interleaving, and nothing more.
+//
+// The tests are named for the gate, not for the damage, so the names claim only the
+// first list.
 // ---------------------------------------------------------------------------
 
 type WooWorld = {
@@ -1105,7 +1213,7 @@ async function runWooPauseInterleaving(row: IntegrationOutboxRow): Promise<WooWo
   return world
 }
 
-test('the WooCommerce pause: a granted reclaim lets the older quantity land last', async () => {
+test('the pause harness reaches its interleaving when a declaration permits the reclaim (stock shape)', async () => {
   // Control arm. The operation is a stand-in for "the registry says yes" — nothing about refund
   // release is a stock push; it is used only because it is the declaration this build permits.
   const world = await runWooPauseInterleaving(staleProcessingRow({
@@ -1118,13 +1226,17 @@ test('the WooCommerce pause: a granted reclaim lets the older quantity land last
   assert.equal(world.reclaimHappened, true, 'the contended path was not reached: worker B never got the row')
   assert.equal(world.loserFenced, true, 'the slow worker should be fenced out of the ROW')
   // ...and yet:
-  assert.equal(world.remoteQty, 10, 'the older computed quantity landed last at the remote')
-  assert.equal(world.lastPushedQty, 10, 'and IMS persisted it over the fresher value')
-  // That is the whole finding: the row fence is sound and the EFFECT is still wrong. Idempotence
-  // would have made a repeat harmless; nothing here makes a REORDERING harmless.
+  // MODELLED, NOT MEASURED. These two assertions are about the narrative above, not about
+  // WooCommerce: they say the harness ordered its own assignments the way the finding describes.
+  // They are kept because the interleaving is easier to read as code than as prose, and named here
+  // as a model so nobody mistakes them for evidence about a remote nobody called.
+  assert.equal(world.remoteQty, 10, 'the older computed quantity landed last in the MODEL')
+  assert.equal(world.lastPushedQty, 10, 'and the model persisted it over the fresher value')
+  // The finding itself: the row fence is sound and the EFFECT is still wrong. Idempotence would
+  // have made a repeat harmless; nothing makes a REORDERING harmless.
 })
 
-test('the WooCommerce pause: stock.push refuses the reclaim, so it cannot begin', async () => {
+test('stock.push refuses the reclaim, so the pause interleaving cannot begin', async () => {
   const row = staleProcessingRow({
     id: 'stock-push-row',
     connector: 'woocommerce',
@@ -1200,7 +1312,7 @@ async function runInvoiceEmailPauseInterleaving(row: IntegrationOutboxRow): Prom
   return world
 }
 
-test('the INVOICE_EMAIL pause: a granted reclaim enqueues the invoice email twice', async () => {
+test('the pause harness reaches its interleaving when a declaration permits the reclaim (email shape)', async () => {
   const world = await runInvoiceEmailPauseInterleaving(staleProcessingRow({
     id: 'reclaimable-stand-in',
     connector: 'sales',
@@ -1210,10 +1322,13 @@ test('the INVOICE_EMAIL pause: a granted reclaim enqueues the invoice email twic
 
   assert.equal(world.reclaimHappened, true, 'the contended path was not reached: worker B never got the row')
   assert.equal(world.loserFenced, true, 'the slow worker is fenced out of the ROW, and too late')
-  assert.deepEqual(world.enqueued, ['worker-1', 'worker-2'], 'two EmailOutbox rows — the customer is emailed twice')
+  // MODELLED: two entries in an array standing in for two `db.emailOutbox.create` calls. That the
+  // table would accept both — no idempotency key, no unique constraint — is checked against the
+  // real catalogue in tests/concurrency/outbox-stale-park.concurrent.test.ts.
+  assert.deepEqual(world.enqueued, ['worker-1', 'worker-2'], 'two enqueues in the MODEL: the customer is emailed twice')
 })
 
-test('the INVOICE_EMAIL pause: xero/accounting.post refuses the reclaim, so it cannot begin', async () => {
+test('xero/accounting.post refuses the reclaim, so the pause interleaving cannot begin', async () => {
   const row = staleProcessingRow({
     id: 'xero-row',
     connector: 'xero',
@@ -1230,4 +1345,96 @@ test('the INVOICE_EMAIL pause: xero/accounting.post refuses the reclaim, so it c
   // Non-vacuity, as in proof 1: an otherwise identical row under a declared-safe operation IS granted.
   const granted = await claimGrantedFor('sales', 'refund.unmatched-warning', row.id)
   assert.deepEqual(granted, [row.id])
+})
+
+// ---------------------------------------------------------------------------
+// MINTSOFT: A DORMANT ENTRY THAT DECLARED ITSELF SINGLE-EFFECT AND WAS NOT
+// (Codex round 3, MEDIUM 1).
+//
+// `processBookedInEvent` guards ONE effect — the receipt application, behind
+// SELECT ... FOR UPDATE plus a `processedAt` re-read — and then, AFTER that
+// transaction commits, does three more things nothing guards. A crash in that tail
+// is unrecoverable precisely BECAUSE the guard works: the next attempt reads
+// `processedAt`, answers `duplicate`, and completes having applied nothing.
+//
+// The entry is not wired to anything, which is what made the over-confident verdict
+// dangerous rather than harmless: whoever wires it up inherits the assessment.
+// ---------------------------------------------------------------------------
+
+const MINTSOFT_BOOKED_IN = INTEGRATION_OUTBOX_REGISTRY.mintsoft['inbound.booked-in']
+
+test('mintsoft/inbound.booked-in is declared an effect sequence, and cannot be reclaimed', () => {
+  // The declaration itself. Re-declaring this `ONE_EFFECT` type-checks — a sequence of effects is
+  // not a shape `tsc` can see — so this assertion is the thing standing between a future edit and a
+  // reclaimable verdict for an operation that would lose effects to one.
+  assert.equal(MINTSOFT_BOOKED_IN.effects.keyedBy, 'effect-sequence',
+    'processBookedInEvent runs a guarded receipt and then three unguarded effects; a single-effect '
+    + 'declaration asserts coverage the guard was never given')
+
+  // ...and the consequences, which is what the declaration is FOR.
+  assert.equal(integrationOutboxReplayPolicy('mintsoft', 'inbound.booked-in'), 'unsafe-to-replay')
+  assert.equal(integrationOutboxStaleReclaimScope('mintsoft', 'inbound.booked-in'), null)
+  assert.equal(integrationOutboxStaleReclaimScope('mintsoft', undefined), null)
+  assert.equal(isUnreclaimableOutboxOperation('mintsoft', 'inbound.booked-in'), true)
+
+  // The fold holds at runtime too: even written back to a safe verdict by hand, past the type, an
+  // effect-sequence entry resolves unsafe.
+  assert.equal(
+    resolveOutboxReplaySafety({ replay: 'local-only-guarded', effects: MINTSOFT_BOOKED_IN.effects }),
+    'unsafe-to-replay',
+  )
+})
+
+test('the effects mintsoft declares outside its guard are really outside it', () => {
+  // WHY THIS READS THE SOURCE. The assertion above is about a string in a registry; on its own it
+  // would be a note, and a note cannot notice that the code moved. This one is about the CODE, and
+  // it fails in both directions that matter: if somebody re-declares the entry single-effect while
+  // the tail is still there, the assertion above fails; if somebody makes single-effect legitimate
+  // by moving the tail INSIDE the transaction, this one fails and says the entry is now wrong in the
+  // other direction and owes a re-read.
+  const repoRoot = path.resolve(__dirname, '..', '..', '..')
+  const source = readFileSync(path.join(repoRoot, 'lib/domain/wms/booked-in-service.ts'), 'utf8')
+
+  const processorAt = source.indexOf('export async function processBookedInEvent(')
+  assert.ok(processorAt > 0, 'processBookedInEvent must exist, or this test is asking about nothing')
+
+  // The transaction's own terminator, and it must be unambiguous: if a second one ever appears,
+  // "after the commit" stops being a well-defined position and this test must be rewritten rather
+  // than quietly measuring against the wrong one.
+  const commitAnchor = '}, STOCK_TX_OPTIONS)'
+  assert.equal(source.split(commitAnchor).length - 1, 1,
+    `expected exactly one ${commitAnchor} in booked-in-service.ts`)
+  const commitAt = source.indexOf(commitAnchor, processorAt)
+  assert.ok(commitAt > processorAt, 'the guarded transaction must close inside processBookedInEvent')
+
+  // EVERY effect the registry entry names as unguarded, checked to be positioned after the commit.
+  for (const effect of ['enqueueStockSync(', "action: 'mintsoft_booked_in_processed'", 'recordWmsMutationEvent(']) {
+    const at = source.indexOf(effect, commitAt)
+    assert.ok(at > commitAt,
+      `${effect} must still sit AFTER the guarded transaction commits — the registry entry for `
+      + 'mintsoft/inbound.booked-in declares it unguarded, and a crash there strands it for ever '
+      + 'because the committed processedAt makes the retry answer "duplicate"')
+  }
+
+  // THE OTHER DIRECTION: an effect inside the transaction that escapes its atomicity. The divergence
+  // WARNING is issued through `logActivity`, which writes on the global db client, so it commits on
+  // its own connection — it survives a rollback the receipt work does not, and the retry writes a
+  // second one. `logActivityInTransaction` is the call that would bind it to `tx`, and it is not the
+  // call used here.
+  const divergenceAt = source.indexOf("action: 'received_warehouse_divergence'", processorAt)
+  assert.ok(divergenceAt > processorAt && divergenceAt < commitAt,
+    'the divergence warning must still be INSIDE the guarded transaction for this finding to apply')
+  const divergenceCall = source.slice(source.lastIndexOf('await log', divergenceAt), divergenceAt)
+  assert.ok(divergenceCall.includes('logActivity('),
+    'the divergence warning is expected to use the un-transactional logActivity')
+  assert.ok(!divergenceCall.includes('logActivityInTransaction('),
+    'if this warning has moved onto logActivityInTransaction, the registry entry no longer describes '
+    + 'the code and must be re-read')
+
+  // ...and the entry has to have NAMED them, so the declaration and this check cannot drift apart.
+  assert.ok(MINTSOFT_BOOKED_IN.effects.keyedBy === 'effect-sequence')
+  const declared = MINTSOFT_BOOKED_IN.effects.effectsOutsideTheGuard.join('\n')
+  for (const name of ['enqueueStockSync', 'mintsoft_booked_in_processed', 'recordWmsMutationEvent', 'received_warehouse_divergence']) {
+    assert.ok(declared.includes(name), `the registry entry must name ${name} as an effect outside its guard`)
+  }
 })

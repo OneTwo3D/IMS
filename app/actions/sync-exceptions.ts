@@ -37,9 +37,12 @@ import { withDispatchSweepLockOrSkip } from '@/lib/domain/wms/dispatch-sweep-loc
 import { logActivity, logActivityInTransaction } from '@/lib/activity-log'
 import { freshAuthFailureResult, requireFreshPermission, requirePermission } from '@/lib/auth/server'
 import {
+  ADMIN_OUTBOX_STALE_PROCESSING_LOCK_MS,
   IntegrationOutboxAdminError,
   listIntegrationOutboxAdminRows,
+  recoverStalledIntegrationOutboxPark,
   replayIntegrationOutboxAdminRow,
+  stalledIntegrationOutboxParkWhere,
 } from '@/lib/domain/integrations/outbox-admin'
 import { INTEGRATION_OUTBOX_STATUS } from '@/lib/domain/integrations/outbox'
 import {
@@ -255,6 +258,24 @@ export type OutboxFailureRow = {
   updatedAt: string
 }
 
+/**
+ * A row parked in PROCESSING on an operation no drain will ever reclaim (o3d-8td2 round 3).
+ *
+ * `lockedBy` is the DRAIN's constant name, not a process identity — it says which duty was holding
+ * the row, never which incumbent — so it is shown as context and not as something to go and kill.
+ * `heldForMs` is the number that matters: how long the work behind this row has not been happening.
+ */
+export type StalledOutboxParkRow = {
+  id: string
+  connector: string
+  operation: string
+  attempts: number
+  lockedBy: string | null
+  lockedAt: string | null
+  heldForMs: number | null
+  updatedAt: string
+}
+
 export type DeadReceiptEventRow = {
   id: string
   connector: string
@@ -449,6 +470,14 @@ export type ExceptionInboxSummary = {
   maintenanceRecovery: number
   wmsPushDeadLetters: number
   outboxFailures: number
+  /**
+   * o3d-8td2 round 3 (Codex HIGH): outbox rows stalled in PROCESSING on an operation declared
+   * `unsafe-to-replay`. Nothing automatic recovers these — that is what the declaration means — and
+   * for `woocommerce/stock.push` the enqueue path keeps folding later stock changes into the same
+   * parked row, so the backlog behind one grows silently. Counted because a stall nobody can see is
+   * indistinguishable from work that got done.
+   */
+  stalledOutboxParks: number
   deadReceiptEvents: number
   refundSyncParks: number
   stuckDispatches: number
@@ -470,6 +499,7 @@ export type ExceptionInboxData = {
   maintenanceRecovery: MaintenanceRecoveryState
   wmsPushDeadLetters: WmsPushDeadLetterRow[]
   outboxFailures: OutboxFailureRow[]
+  stalledOutboxParks: StalledOutboxParkRow[]
   deadReceiptEvents: DeadReceiptEventRow[]
   refundSyncParks: RefundSyncParkRow[]
   stuckDispatches: StuckDispatchRow[]
@@ -488,6 +518,56 @@ export type ExceptionInboxData = {
 const OUTBOX_FAILURE_STATUSES = [
   INTEGRATION_OUTBOX_STATUS.PERMANENT_FAILED,
 ]
+
+/**
+ * o3d-8td2 round 3 (Codex HIGH). The statuses above are what an operator was shown, and they are
+ * only the rows the drain GAVE UP on out loud. A row parked in PROCESSING under a dead worker on an
+ * `unsafe-to-replay` operation gave up silently: no reclaim will take it (the declaration forbids
+ * one), no retry ladder applies (it is not in a failed state), and — the premise o3d-22jw recorded
+ * and had to withdraw — no reconcile elsewhere drains it, because the WooCommerce daily reconcile
+ * calls `pushStockToWc` directly and never reads the outbox at all.
+ *
+ * The predicate is not written here. It is `stalledIntegrationOutboxParkWhere`, derived from the
+ * replay declarations themselves, so this section covers exactly the operations that chose to park
+ * and cannot fall behind a new one.
+ */
+function stalledOutboxParkWhere(now: Date): Record<string, unknown> | null {
+  return stalledIntegrationOutboxParkWhere({ now })
+}
+
+const STALLED_OUTBOX_PARK_SELECT = {
+  id: true,
+  connector: true,
+  operation: true,
+  attempts: true,
+  lockedBy: true,
+  lockedAt: true,
+  updatedAt: true,
+} as const
+
+function buildStalledOutboxParkRow(
+  row: {
+    id: string
+    connector: string
+    operation: string
+    attempts: number
+    lockedBy: string | null
+    lockedAt: Date | null
+    updatedAt: Date
+  },
+  now: Date,
+): StalledOutboxParkRow {
+  return {
+    id: row.id,
+    connector: row.connector,
+    operation: row.operation,
+    attempts: row.attempts,
+    lockedBy: row.lockedBy,
+    lockedAt: row.lockedAt?.toISOString() ?? null,
+    heldForMs: row.lockedAt ? Math.max(0, now.getTime() - row.lockedAt.getTime()) : null,
+    updatedAt: row.updatedAt.toISOString(),
+  }
+}
 
 /**
  * WHAT COUNTS AS AN ACTIONABLE REFUND PARK — POSITIVELY (o3d-xnwu r7, Codex HIGH).
@@ -720,12 +800,17 @@ async function loadExceptionCounts(): Promise<ExceptionInboxSummary> {
   // host's. Read before the batch because the predicate is built from it; `null` (unreadable clock)
   // means no grace at all, which lists every marked row — noise in the safe direction.
   const followUpDatabaseNow = await readFollowUpObligationDatabaseNow(db)
-  const [wmsPushDeadLetters, outboxFailures, deadReceipts, deadWebhooks, refundSyncParks, pennyMismatches, stuckDispatches, orderReconcileDrift, productStructureConflicts, driftIncidents, accountingFollowUpObligations] = await Promise.all([
+  const countsNow = new Date()
+  const stalledParkWhere = stalledOutboxParkWhere(countsNow)
+  const [wmsPushDeadLetters, outboxFailures, stalledOutboxParks, deadReceipts, deadWebhooks, refundSyncParks, pennyMismatches, stuckDispatches, orderReconcileDrift, productStructureConflicts, driftIncidents, accountingFollowUpObligations] = await Promise.all([
     // o3d-92fu / o3d-2k5r: the count is over EVERY blocked push state, not DEAD_LETTER alone — a
     // VALIDATION_FAILED or AMBIGUOUS_CREATE order reaches the warehouse only via a human, so it
     // belongs in the same total. Kept through the merge with o3d-0bfh's follow-up obligations.
     db.wmsOrderPushLink.count({ where: { state: { in: [...BLOCKED_WMS_PUSH_STATES] } } }),
     db.integrationOutbox.count({ where: { status: { in: OUTBOX_FAILURE_STATUSES } } }),
+    // `null` means this build declares no unreclaimable operation at all, so there is no such thing
+    // as a stalled park — not that the query found none.
+    stalledParkWhere ? db.integrationOutbox.count({ where: stalledParkWhere }) : Promise.resolve(0),
     db.wmsInboundReceiptEvent.count({ where: { processingStatus: DEAD_RECEIPT_EVENT_STATUS } }),
     db.wmsWebhookEvent.count({ where: { processingStatus: DEAD_RECEIPT_EVENT_STATUS } }),
     db.shoppingSyncLog.count({ where: REFUND_PARK_WHERE }),
@@ -749,6 +834,7 @@ async function loadExceptionCounts(): Promise<ExceptionInboxSummary> {
     maintenanceRecovery,
     wmsPushDeadLetters,
     outboxFailures,
+    stalledOutboxParks,
     deadReceiptEvents,
     refundSyncParks,
     stuckDispatches,
@@ -757,9 +843,9 @@ async function loadExceptionCounts(): Promise<ExceptionInboxSummary> {
     productStructureConflicts,
     unresolvedDrift: driftIncidents.length,
     accountingFollowUpObligations,
-    total: maintenanceRecovery + wmsPushDeadLetters + outboxFailures + deadReceiptEvents + refundSyncParks
-      + stuckDispatches + pennyMismatches + orderReconcileDrift + productStructureConflicts + driftIncidents.length
-      + accountingFollowUpObligations,
+    total: maintenanceRecovery + wmsPushDeadLetters + outboxFailures + stalledOutboxParks + deadReceiptEvents
+      + refundSyncParks + stuckDispatches + pennyMismatches + orderReconcileDrift + productStructureConflicts
+      + driftIncidents.length + accountingFollowUpObligations,
   }
 }
 
@@ -830,7 +916,9 @@ export async function getExceptionInboxData(): Promise<ExceptionInboxData> {
   // threaded through, because the two loads are independent reads and a cutoff a few milliseconds
   // apart cannot change which side of a five-minute grace a row falls on.
   const followUpDatabaseNow = await readFollowUpObligationDatabaseNow(db)
-  const [pushLinks, outbox, deadReceiptRows, deadWebhookRows, refundLogs, stuckDispatches, mismatchLinks, orderReconcileDrift, productStructureConflicts, driftIncidents, followUpObligationRows] = await Promise.all([
+  const rowsNow = new Date()
+  const stalledParkRowWhere = stalledOutboxParkWhere(rowsNow)
+  const [pushLinks, outbox, stalledParkRows, deadReceiptRows, deadWebhookRows, refundLogs, stuckDispatches, mismatchLinks, orderReconcileDrift, productStructureConflicts, driftIncidents, followUpObligationRows] = await Promise.all([
     db.wmsOrderPushLink.findMany({
       where: { state: { in: [...BLOCKED_WMS_PUSH_STATES] } },
       orderBy: { lastAttemptAt: 'desc' },
@@ -857,6 +945,16 @@ export async function getExceptionInboxData(): Promise<ExceptionInboxData> {
         .flatMap((result) => result.rows)
         .sort((left, right) => new Date(right.updatedAt as never).getTime() - new Date(left.updatedAt as never).getTime())
         .slice(0, SECTION_LIMIT)),
+    // Oldest lock first: the row at the top is the one whose work has been not-happening longest,
+    // which for a folding operation is also the row with the most changes stacked behind it.
+    stalledParkRowWhere
+      ? db.integrationOutbox.findMany({
+        where: stalledParkRowWhere,
+        orderBy: { lockedAt: 'asc' },
+        take: SECTION_LIMIT,
+        select: STALLED_OUTBOX_PARK_SELECT,
+      })
+      : Promise.resolve([]),
     db.wmsInboundReceiptEvent.findMany({
       where: { processingStatus: DEAD_RECEIPT_EVENT_STATUS },
       orderBy: { deadLetteredAt: 'desc' },
@@ -1172,6 +1270,7 @@ export async function getExceptionInboxData(): Promise<ExceptionInboxData> {
       lastError: row.lastError,
       updatedAt: row.updatedAt instanceof Date ? row.updatedAt.toISOString() : String(row.updatedAt),
     })),
+    stalledOutboxParks: stalledParkRows.map((row) => buildStalledOutboxParkRow(row, rowsNow)),
     deadReceiptEvents: [
       ...deadReceiptRows.map((event) => ({
         id: event.id,
@@ -1283,6 +1382,48 @@ export async function replayOutboxException(id: string): Promise<MutationResult>
       action: 'integration_outbox_replay',
       description: `Re-queued integration outbox row (${result.row.connector}/${result.row.operation}) from ${result.priorStatus} via the exception inbox`,
       metadata: { outboxId: id, priorStatus: result.priorStatus, priorLastError: result.priorLastError, userId: session.user.id },
+    })
+    revalidatePath('/sync/exceptions')
+    return { success: true }
+  } catch (error) {
+    const freshAuthFailure = freshAuthFailureResult(error)
+    if (freshAuthFailure) return freshAuthFailure
+    if (error instanceof IntegrationOutboxAdminError) return { success: false, error: error.message }
+    throw error
+  }
+}
+
+/**
+ * DRAIN A STALLED PARK (o3d-8td2 round 3, Codex HIGH).
+ *
+ * The row belongs to an operation that refused the stale-lock reclaim, so no worker will take it and
+ * an operator is the only thing left. `recoverStalledIntegrationOutboxPark` dead-letters the stale
+ * lock and re-queues in one act, keeping the FOLDED payload — for `woocommerce/stock.push` that is
+ * the latest stock quantity, which is also the answer for every change that piled up behind the
+ * park, so one drain settles the backlog rather than replaying it.
+ *
+ * It refuses if the lock is no longer stale. That is the whole safety of the affordance: a holder
+ * that was merely slow, and has come back and re-locked the row, keeps it, and this returns the
+ * refusal rather than cutting under a live worker — which would be the very reclaim the operation is
+ * declared `unsafe-to-replay` to prevent.
+ */
+export async function recoverStalledOutboxPark(id: string): Promise<MutationResult> {
+  try {
+    const session = await requireFreshPermission('sync')
+    const result = await recoverStalledIntegrationOutboxPark({ id })
+    await logActivity({
+      entityType: 'SYNC',
+      entityId: id,
+      tag: 'sync',
+      action: 'integration_outbox_park_recovered',
+      description: `Drained a stalled integration outbox park (${result.row.connector}/${result.row.operation}) from ${result.priorStatus} via the exception inbox`,
+      metadata: {
+        outboxId: id,
+        priorStatus: result.priorStatus,
+        priorLastError: result.priorLastError,
+        staleProcessingLockMs: ADMIN_OUTBOX_STALE_PROCESSING_LOCK_MS,
+        userId: session.user.id,
+      },
     })
     revalidatePath('/sync/exceptions')
     return { success: true }
