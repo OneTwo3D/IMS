@@ -35,6 +35,23 @@ function probeSku(label: string) {
   return `R6CTX-${label}-${process.pid}-${Date.now()}`
 }
 
+/**
+ * A short collision-free token for `warehouses.code`, which is UNIQUE and only 20
+ * characters wide.
+ *
+ * The code used to be `probeSku(label).slice(0, 20)`. `Date.now()` is thirteen
+ * digits whose LEADING digits do not change for years, so for any label long enough
+ * to push the timestamp past the cut, the truncated code was effectively
+ * `R6CTX-<label>-<a few pid digits>` — stable across runs, and the fixture rows
+ * outlive the run. Adding two longer labels in round 9 was enough to make it collide
+ * with its own previous run and fail a test that had nothing to do with warehouse
+ * codes. The sibling file already avoided this; this one now does too.
+ */
+function probeCode() {
+  const uid = `${Date.now().toString(36)}${Math.floor(Math.random() * 1_679_616).toString(36).padStart(4, '0')}`
+  return `R6C${uid}`.toUpperCase().slice(0, 20)
+}
+
 /** A product + warehouse + one source cost layer to build snapshot slices against. */
 async function seed(label: string) {
   const { db } = await import('@/lib/db')
@@ -44,7 +61,7 @@ async function seed(label: string) {
     select: { id: true },
   })
   const warehouse = await db.warehouse.create({
-    data: { code: sku.slice(0, 20), name: `r6 ctx wh ${label}`, type: 'STANDARD' },
+    data: { code: probeCode(), name: `r6 ctx wh ${label}`, type: 'STANDARD' },
     select: { id: true },
   })
   const sourceLayer = await db.costLayer.create({
@@ -308,6 +325,116 @@ test(
       await helperThatOnlyReceivesTx(db as object),
       false,
       'the same probe answers false on the autocommit client',
+    )
+  },
+)
+
+// ---------------------------------------------------------------------------
+// THE ZERO-COST BALANCING WARNING IS AS DURABLE AS THE BALANCING
+// (6oyu.19, Codex round-9 MEDIUM-2)
+// ---------------------------------------------------------------------------
+
+/**
+ * `BALANCE_AT_ZERO_COST` is the policy that lets a receipt through with an uncosted
+ * shortfall, so the WARNING is not a notification about the balancing — it is the
+ * only durable record that the policy was exercised. It used to be written by
+ * `logActivity`, on a SEPARATE connection, which swallows its own failures. That was
+ * wrong in BOTH directions, and both are proved here against a real PostgreSQL
+ * because "did this row survive a rollback" is not a property a double can answer.
+ */
+
+const BALANCING_ACTION = 'transfer_uncosted_balancing_layer'
+
+/** A six-unit snapshot against a ten-unit booking — the shortfall that balances. */
+function shortSlice(sourceLayerId: string) {
+  return [{ costLayerId: sourceLayerId, qty: '6.000000', unitCostBase: '5.000000' }]
+}
+
+test(
+  'the balancing WARNING commits with the layer it describes (Codex r9 MEDIUM-2)',
+  { skip: !RUN && 'set RUN_DB_CONCURRENCY_TESTS=1' },
+  async () => {
+    loadEnv()
+    const { db, product, warehouse, sourceLayer } = await seed('warncommit')
+    const { recreateTransferCostLayersFromSnapshotSlice } =
+      await import('@/lib/domain/inventory/transfer-cost-layer-recreation')
+    const transferLineId = `tl-warncommit-${process.pid}-${Date.now()}`
+
+    const result = await db.$transaction(async (tx) => recreateTransferCostLayersFromSnapshotSlice(
+      tx,
+      {
+        productId: product.id,
+        warehouseId: warehouse.id,
+        transferLineId,
+        contextLabel: 'round-9 durable warning probe',
+        bookedQty: 10,
+        uncostedShortfall: 'BALANCE_AT_ZERO_COST',
+      },
+      shortSlice(sourceLayer.id),
+    ), TX)
+
+    assert.ok(result.balancingLayer, 'the fixture must actually reach the balancing branch')
+    assert.equal(result.balancingLayer.qty, '4.000000')
+
+    const warning = await db.activityLog.findFirst({
+      where: { action: BALANCING_ACTION, entityId: transferLineId },
+      select: { level: true, description: true },
+    })
+    assert.ok(warning, 'the WARNING must be readable after the transaction commits')
+    assert.equal(warning.level, 'WARNING')
+    assert.match(String(warning.description), /4\.000000-unit shortfall/)
+  },
+)
+
+test(
+  'and DISAPPEARS when the enclosing transaction rolls back (Codex r9 MEDIUM-2)',
+  { skip: !RUN && 'set RUN_DB_CONCURRENCY_TESTS=1' },
+  async () => {
+    // THE OTHER DIRECTION, and the one a separate-connection write got wrong
+    // silently: the balancing layer is rolled back and the WARNING is not, leaving a
+    // record that a £0 layer was created for stock that was never booked. An
+    // operator reconciling from the activity log would chase a layer that does not
+    // exist.
+    loadEnv()
+    const { db, product, warehouse, sourceLayer } = await seed('warnrollback')
+    const { recreateTransferCostLayersFromSnapshotSlice } =
+      await import('@/lib/domain/inventory/transfer-cost-layer-recreation')
+    const transferLineId = `tl-warnrollback-${process.pid}-${Date.now()}`
+    const layersBefore = await db.costLayer.count({ where: { productId: product.id } })
+
+    const boom = new Error('caller failed AFTER the balancing layer was created')
+    await assert.rejects(
+      () => db.$transaction(async (tx) => {
+        const result = await recreateTransferCostLayersFromSnapshotSlice(
+          tx,
+          {
+            productId: product.id,
+            warehouseId: warehouse.id,
+            transferLineId,
+            contextLabel: 'round-9 rolled-back warning probe',
+            bookedQty: 10,
+            uncostedShortfall: 'BALANCE_AT_ZERO_COST',
+          },
+          shortSlice(sourceLayer.id),
+        )
+        // The precondition of this test: the balancing DID happen, and the warning
+        // was written, before anything went wrong. Without this the rollback
+        // assertion below would pass on a run that never reached the branch at all.
+        assert.ok(result.balancingLayer, 'the balancing branch must be reached before the rollback')
+        throw boom
+      }, TX),
+      /caller failed AFTER the balancing layer was created/,
+    )
+
+    assert.equal(
+      await db.costLayer.count({ where: { productId: product.id } }),
+      layersBefore,
+      'fixture check: the balancing layer really was rolled back',
+    )
+    assert.equal(
+      await db.activityLog.count({ where: { action: BALANCING_ACTION, entityId: transferLineId } }),
+      0,
+      'the WARNING must roll back with the layer it describes — a surviving row would describe a layer that does not exist',
     )
   },
 )

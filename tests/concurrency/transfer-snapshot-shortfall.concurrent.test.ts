@@ -372,4 +372,93 @@ test(
   },
 )
 
+// ---------------------------------------------------------------------------
+// Path 3 — the DISPATCH CANCELLATION, the fourth call site (Codex round-9 LOW-1)
+// ---------------------------------------------------------------------------
+
+test(
+  'CANCELLATION: ten units restored over a six-unit snapshot are ALL backed by a layer (Codex r9 LOW-1)',
+  { skip: !RUN && 'set RUN_DB_CONCURRENCY_TESTS=1' },
+  async () => {
+    // THE GAP THIS CLOSES. Three of the four call sites had a behavioural
+    // short-snapshot regression and this one — cancellation — did not. It passes
+    // `bookedQty: restoreQty`, the FULL outstanding line quantity, and the snapshot
+    // can cover less than that. Change that argument to a slice-derived quantity
+    // (`snapshotSlice.reduce(...qty)`, the shape the other three sites had before
+    // round 8) and the helper's coverage check compares six with six and passes,
+    // while the restore above it has already put ten units back at the source. That
+    // is the unlayered-stock defect exactly, and until this test nothing behavioural
+    // would have gone red.
+    //
+    // It restores to the SOURCE, so the identity is measured as a DELTA: the source
+    // already carries the dispatch layer these units were consumed from.
+    loadEnv()
+    const { db, tag, product, source, transfer } = await seedUnderCostedDispatch('cancel')
+    const { cancelDispatchedTransfer } = await import('@/app/actions/transfers')
+
+    const before = await stockVersusLayers(db as never, product.id, source.id)
+    assert.equal(before.stockQty, 0, 'fixture: the dispatch left no stock at the source')
+    assert.equal(before.layerQty, COSTED_QTY, 'fixture: only the six-unit dispatch layer is there')
+
+    const result = await cancelDispatchedTransfer(transfer.id)
+    assert.equal(result.success, true, `the cancellation must succeed: ${JSON.stringify(result)}`)
+
+    const after = await stockVersusLayers(db as never, product.id, source.id)
+    // TEN units came back, so TEN units of new layer must have come back with them.
+    assert.equal(after.stockQty - before.stockQty, LINE_QTY, 'the full outstanding line is restored')
+    assert.equal(
+      after.layerQty - before.layerQty,
+      LINE_QTY,
+      'every restored unit must be backed by a layer — six costed from the snapshot, four balanced at £0',
+    )
+    // THE IDENTITY. Without the fix this reads a stock delta of 10 against a layer
+    // delta of 6.
+    assert.equal(after.stockQty - before.stockQty, after.layerQty - before.layerQty)
+    assert.equal(
+      after.zeroCostLayerQty,
+      UNCOSTED_QTY,
+      'the four units the snapshot could not cost must be conserved in a £0 balancing layer',
+    )
+
+    // And the record of that policy is DURABLE — same transaction as the layer it
+    // describes (Codex round-9 MEDIUM-2). Before this round it went through
+    // `logActivity` on a separate connection, which swallows its own failures.
+    const warning = await db.activityLog.findFirst({
+      where: { action: 'transfer_uncosted_balancing_layer', entityId: transfer.lines[0]!.id },
+      select: { level: true, description: true },
+    })
+    assert.ok(warning, 'the £0 balancing layer must leave a durable WARNING behind')
+    assert.equal(warning.level, 'WARNING')
+    assert.match(String(warning.description), new RegExp(`${UNCOSTED_QTY}\\.000000-unit shortfall`))
+  },
+)
+
+test(
+  'CANCELLATION: a FULL snapshot restores ten and creates no balancing layer (Codex r9 — not vacuous)',
+  { skip: !RUN && 'set RUN_DB_CONCURRENCY_TESTS=1' },
+  async () => {
+    // The same guard against the test above passing for the wrong reason: if the
+    // balancing branch fired on every cancellation, the £0 assertion would hold no
+    // matter what the snapshot covered.
+    loadEnv()
+    const { db, tag, product, source, transfer } = await seedUnderCostedDispatch('cancelfull', LINE_QTY)
+    const { cancelDispatchedTransfer } = await import('@/app/actions/transfers')
+
+    const before = await stockVersusLayers(db as never, product.id, source.id)
+    const result = await cancelDispatchedTransfer(transfer.id)
+    assert.equal(result.success, true, `the cancellation must succeed: ${JSON.stringify(result)}`)
+
+    const after = await stockVersusLayers(db as never, product.id, source.id)
+    assert.equal(after.stockQty - before.stockQty, LINE_QTY)
+    assert.equal(after.layerQty - before.layerQty, LINE_QTY)
+    assert.equal(after.zeroCostLayerQty, 0, 'a fully costed snapshot must need no balancing layer')
+    const warning = await db.activityLog.findFirst({
+      where: { action: 'transfer_uncosted_balancing_layer', entityId: transfer.lines[0]!.id },
+      select: { id: true },
+    })
+    assert.equal(warning, null, 'and must leave no shortfall warning behind')
+    void tag
+  },
+)
+
 void TX

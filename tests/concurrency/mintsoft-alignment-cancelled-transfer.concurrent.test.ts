@@ -25,25 +25,34 @@ import { config } from 'dotenv'
  * candidate query refuses an ASN whose parent transfer is not IN_TRANSIT or
  * RECEIVED — the same predicate the WMS webhook book-in has always applied.
  *
- * THE LOCK WAS WITHDRAWN (6oyu.19, Codex round-8). Round 7 also had alignment take
- * `stock_transfers FOR UPDATE` after the ASN rows, plus a post-lock re-read, and
- * claimed no lock cycle existed. There is one: the transfer-ASN creation path in
- * app/actions/mintsoft-sync.ts locks `stock_transfers` first (line 3690) and then
- * writes that transfer's existing `wms_asn_line_maps` rows (deleteMany 3892, update
- * 3904) — TRANSFER-then-ASN, the opposite of the order alignment took. Two
- * transactions over one transfer in opposite orders is a deadlock PostgreSQL breaks
- * by aborting one. The round-7 race proof that stood here has gone with it: it used
+ * THE LOCK: WITHDRAWN IN ROUND 8, RESTORED IN ROUND 9 — IN THE OTHER ORDER.
+ *
+ * Round 7 had alignment take `stock_transfers FOR UPDATE` AFTER the ASN rows, plus a
+ * post-lock re-read, and claimed no cycle existed. Round 8 found one — the
+ * transfer-ASN creation path in app/actions/mintsoft-sync.ts locks `stock_transfers`
+ * first (3690) and then rewrites that transfer's `wms_asn_line_maps` rows (3892,
+ * 3904) — and withdrew the lock entirely, leaving the concurrent route open on the
+ * grounds that `development` has no guard at all.
+ *
+ * Round 9 settled it: the cycle was never a property of alignment, it was that the
+ * codebase had no ONE order for these two tables. It has one now
+ * (lib/domain/wms/transfer-asn-lock-order.ts — TRANSFER, then ASN), the single
+ * violator (booked-in reconciliation) obeys it, and alignment takes the lock in that
+ * order. So BOTH routes of o3d-2y5u are closed.
+ *
+ * WHAT THIS FILE PROVES, and what it does not. It proves the SEQUENTIAL route: the
+ * candidate query refuses an ASN whose parent transfer is not IN_TRANSIT or RECEIVED
+ * — the same predicate the WMS webhook book-in has always applied — which needs no
+ * lock to be worth having. The CONCURRENT route is proved in
+ * tests/concurrency/transfer-asn-lock-order.concurrent.test.ts, which is also where
+ * the lock order itself is proved by observing which row each path blocks on.
+ *
+ * The round-7 race proof that stood here is NOT what came back. It used
  * `Promise.all`, which does not force the critical sections to overlap, and its own
  * lock-removal mutation survived one run in five — a proof that admits it cannot
- * prove its claim.
- *
- * WHAT THAT LEAVES. The sequential route of o3d-2y5u — a dispatch cancelled, a later
- * sweep aligning against the still-open ASN — is CLOSED by the guard, and needs no
- * lock to be closed. The concurrent route is OPEN, exactly as it is on
- * `development`, which has no guard at all: nothing regresses, and the deadlock
- * cycle above is why a lock is not a small addition here. Recover the withdrawn code
- * with `git show 7723f229:lib/connectors/mintsoft/sync/stock-sync.ts` and this file
- * at the same revision.
+ * prove its claim. Its replacement parks the cancellation mid-transaction and waits
+ * on `pg_stat_activity` for the server's own report that a backend is lock-blocked,
+ * so the interleaving is a fact of the sequence rather than of the scheduler.
  *
  * Needs a real PostgreSQL: the propagation walks `cost_layer_source_lines` in SQL.
  */
@@ -58,7 +67,7 @@ mock.module('@/lib/auth/server', {
   },
 })
 mock.module('next/cache', { namedExports: { revalidatePath: () => {}, revalidateTag: () => {} } })
-mock.module('@/lib/activity-log', { namedExports: { logActivity: async () => {} } })
+mock.module('@/lib/activity-log', { namedExports: { logActivity: async () => {}, logActivityInTransaction: async () => {} } })
 mock.module('@/lib/shopping', { namedExports: { enqueueStockSync: async () => {} } })
 mock.module('@/lib/domain/wms/mutation-audit', {
   namedExports: { recordWmsMutationEvent: async () => {} },

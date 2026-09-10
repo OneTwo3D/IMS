@@ -120,7 +120,7 @@ import { isClientInsideTransaction, openSavepointDepth } from '@/lib/db/savepoin
 import type { CostLayerSnapshotEntry } from '@/lib/cost-layer-snapshots'
 import { addMoney, multiplyMoney, roundQuantity, subtractMoney, toDecimal } from '@/lib/domain/math/decimal'
 import type { DecimalInput } from '@/lib/domain/math/decimal'
-import { logActivity } from '@/lib/activity-log'
+import { logActivityInTransaction } from '@/lib/activity-log'
 
 type TxClient = Prisma.TransactionClient
 
@@ -252,14 +252,42 @@ export type TransferLayerRecreationResult = {
 export type TransferCostLayerRecreationDeps = {
   createCostLayer: typeof createCostLayer
   copyCostLayerSourceLinesProportionally: typeof copyCostLayerSourceLinesProportionally
-  /** Injected so the £0 balancing layer's WARNING can be asserted without a database. */
-  logActivity: typeof logActivity
+  /**
+   * THE BALANCING WARNING, WRITTEN IN THE CALLER'S TRANSACTION (6oyu.19, Codex
+   * round-9 MEDIUM-2).
+   *
+   * This used to be `logActivity`, which writes through the module-level client on a
+   * SEPARATE connection and deliberately swallows its own failures. Both halves of
+   * that were wrong here, in opposite directions:
+   *
+   *   · the write could FAIL — silently, by design — and the receipt would still
+   *     commit a £0-cost layer. `BALANCE_AT_ZERO_COST` is the policy that lets a
+   *     receipt through with an uncosted shortfall, so this entry is not a
+   *     notification about the balancing, it is the only durable record that the
+   *     policy was exercised at all. Nothing else surfaces a partial snapshot
+   *     shortfall: `linesMissingCostLayers` on the cancellation path counts only
+   *     TOTALLY uncovered lines, and the returned `balancingLayer` is discarded by
+   *     three of the four callers. Losing it understates inventory and later COGS
+   *     with no discrepancy record anywhere.
+   *   · the write could SUCCEED and the transaction then roll back — one of this
+   *     module's own aborts, a caller's later failure — leaving a WARNING that says
+   *     a £0 layer was created for stock that was never booked. An operator
+   *     reconciling from the activity log would be chasing a layer that does not
+   *     exist.
+   *
+   * So it goes through the caller's `tx`, and it does NOT catch: the record commits
+   * with the balancing layer it describes, rolls back with it, and a failure to
+   * write it takes the receipt down rather than quietly costing stock at zero.
+   *
+   * Still injected, so the WARNING can be asserted without a database.
+   */
+  logActivityInTransaction: typeof logActivityInTransaction
 }
 
 const defaultDeps: TransferCostLayerRecreationDeps = {
   createCostLayer,
   copyCostLayerSourceLinesProportionally,
-  logActivity,
+  logActivityInTransaction,
 }
 
 /**
@@ -720,7 +748,12 @@ export async function recreateTransferCostLayersFromSnapshotSlice(
       unitCostBase: 0,
     })
     result.balancingLayer = { costLayerId: balancingLayerId, qty: shortfallQty.toFixed(6) }
-    await deps.logActivity({
+    // In the SAME transaction as the layer above, so the record and the thing it
+    // records commit or roll back together (Codex round-9 MEDIUM-2). `userId` is
+    // null because no operator asserted this: it is the system reporting that it
+    // costed stock at zero.
+    await deps.logActivityInTransaction(tx, {
+      userId: null,
       entityType: 'STOCK_ADJUSTMENT',
       entityId: target.transferLineId,
       tag: 'stock',

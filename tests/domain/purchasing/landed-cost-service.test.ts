@@ -1808,7 +1808,7 @@ function createLandedCostWorld(init: {
     copyCostLayerSourceLinesProportionally,
     // The balancing layer's WARNING is not what these tests are about, and this
     // world has no activity-log table.
-    logActivity: async () => {},
+    logActivityInTransaction: async () => {},
   }
 
   return { tx, costLayers, sourceLines, transferLines, recreationDeps }

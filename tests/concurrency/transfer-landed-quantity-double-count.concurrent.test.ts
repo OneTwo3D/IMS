@@ -40,7 +40,7 @@ mock.module('@/lib/auth/server', {
   },
 })
 mock.module('next/cache', { namedExports: { revalidatePath: () => {}, revalidateTag: () => {} } })
-mock.module('@/lib/activity-log', { namedExports: { logActivity: async () => {} } })
+mock.module('@/lib/activity-log', { namedExports: { logActivity: async () => {}, logActivityInTransaction: async () => {} } })
 mock.module('@/lib/shopping', { namedExports: { enqueueStockSync: async () => {} } })
 mock.module('@/lib/fulfillment/backorder-allocator', {
   namedExports: { allocateBackordersForProducts: async () => ({}) },

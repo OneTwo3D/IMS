@@ -28,6 +28,14 @@ import {
   loadTransferLineLandedQty,
   requireLandedQty,
 } from '@/lib/domain/inventory/transfer-landed-quantity'
+import {
+  assertParentIsLocked,
+  assertParentsWereLocked,
+  lockPurchaseOrders,
+  lockStockTransfers,
+  lockWmsAsnLineMaps,
+  lockWmsAsnMaps,
+} from '@/lib/domain/wms/transfer-asn-lock-order'
 
 // Booked-in reconciliation mutates stock levels, FIFO layers, PO lines, and sync state in one unit.
 // The longer timeout avoids false rollback on large ASNs while preserving a bounded lock window.
@@ -366,6 +374,73 @@ export async function processBookedInEvent(
         }
       }
 
+      // ─── THE GLOBAL TRANSFER/ASN LOCK ORDER (6oyu.19, Codex round-9 MEDIUM-1) ───
+      //
+      // This transaction used to begin at step 4 — `wms_asn_line_maps FOR UPDATE`
+      // right here — and reach its PARENTS only inside the receipt loops far below
+      // (`purchase_orders`, then `stock_transfers`). That is ASN→PARENT, and every
+      // other path over the same two rows is PARENT→ASN: the two manual transfer
+      // actions and both Mintsoft ASN-creation flows. Two transactions over one
+      // transfer in opposite orders is a deadlock, which PostgreSQL breaks by
+      // aborting one of them — losing either a manual receipt or a webhook book-in.
+      //
+      // The crossing became real in round 6, when `receiveTransfer` gained
+      // `absorbWmsSnapshotCreditIntoQtyReceived` and stopped being a pure READER of
+      // these rows. See lib/domain/wms/transfer-asn-lock-order.ts for the order
+      // itself and why it is this one.
+      //
+      // So: discover the parents from an UNLOCKED read, lock them at their own step,
+      // then the ASN header, then the line rows. The discovery read can be stale in
+      // one direction only — a line row for a parent it did not see — and
+      // `assertParentsWereLocked` below refuses that case from the RE-READ rather
+      // than locking a parent out of order to cover it.
+      const discoveredLines = await tx.wmsAsnLineMap.findMany({
+        where: { asnMapId: asnMap.id },
+        select: { id: true, sourceType: true, sourceLineId: true },
+      })
+      const discoveredTransferLineIds = discoveredLines
+        .filter((line) => line.sourceType === 'STOCK_TRANSFER_LINE')
+        .map((line) => line.sourceLineId)
+      const discoveredPurchaseLineIds = discoveredLines
+        .filter((line) => line.sourceType === 'PURCHASE_ORDER_LINE')
+        .map((line) => line.sourceLineId)
+      const discoveredTransferParents = discoveredTransferLineIds.length === 0
+        ? []
+        : await tx.stockTransferLine.findMany({
+          where: { id: { in: discoveredTransferLineIds } },
+          select: { transferId: true },
+        })
+      const discoveredPurchaseParents = discoveredPurchaseLineIds.length === 0
+        ? []
+        : await tx.purchaseOrderLine.findMany({
+          where: { id: { in: discoveredPurchaseLineIds } },
+          select: { poId: true },
+        })
+
+      // STEP 2 — the parents. EVERY parent this ASN could reach, not just the ones
+      // with actionable quantity: the actionable set is computed from the locked
+      // rows, so it is not knowable yet, and locking the wider set is what makes the
+      // step-2 lock complete. Also fixes a second, quieter crossing — the receipt
+      // loops took these locks in Map insertion (ASN-line) order, so two events over
+      // the same two transfers could cross on each other.
+      const lockedTransferIds = await lockStockTransfers(
+        tx,
+        discoveredTransferParents.map((line) => line.transferId),
+      )
+      const lockedPurchaseOrderIds = await lockPurchaseOrders(
+        tx,
+        discoveredPurchaseParents.map((line) => line.poId),
+      )
+
+      // STEP 3 — the ASN header, which this transaction updates once the lines are
+      // done. `finalizePendingAsn` locks the header first and updates line rows
+      // after, so taking the header only at the end crossed it the same way one
+      // table up.
+      await lockWmsAsnMaps(tx, [asnMap.id])
+
+      // STEP 4 — the line rows. Read again AFTER the parent locks: a row committed
+      // between the discovery read and here belongs in this set, and the parent
+      // assertion below is what decides whether this transaction may act on it.
       const lineIds = await tx.wmsAsnLineMap.findMany({
         where: {
           asnMapId: asnMap.id,
@@ -374,9 +449,7 @@ export async function processBookedInEvent(
           id: true,
         },
       })
-      if (lineIds.length > 0) {
-        await tx.$queryRaw`SELECT id FROM wms_asn_line_maps WHERE id = ANY(${lineIds.map((line) => line.id)}::text[]) ORDER BY id FOR UPDATE`
-      }
+      await lockWmsAsnLineMaps(tx, lineIds.map((line) => line.id))
 
       const asnLines = await tx.wmsAsnLineMap.findMany({
         where: {
@@ -463,6 +536,25 @@ export async function processBookedInEvent(
             },
           })
         : []
+
+      // The step-2 locks were taken from a read that ran BEFORE them. This is the
+      // re-read, and every parent it names must be one of those locks — otherwise
+      // this transaction would go on to write a transfer or a PO it does not hold.
+      // Locking it now is the one thing that must not happen: it is a step-2 lock
+      // taken at step 4, which is the inversion the whole order exists to prevent
+      // (6oyu.19, Codex round-9 MEDIUM-1).
+      assertParentsWereLocked({
+        observedParentIds: transferLines.map((line) => line.transferId),
+        lockedParentIds: lockedTransferIds,
+        parentTable: 'stock_transfers',
+        context: `booked-in reconciliation for ASN ${lockedEvent.externalAsnId}`,
+      })
+      assertParentsWereLocked({
+        observedParentIds: purchaseOrderLines.map((line) => line.poId),
+        lockedParentIds: lockedPurchaseOrderIds,
+        parentTable: 'purchase_orders',
+        context: `booked-in reconciliation for ASN ${lockedEvent.externalAsnId}`,
+      })
 
       const purchaseLineById = new Map(purchaseOrderLines.map((line) => [line.id, line]))
       const transferLineById = new Map(transferLines.map((line) => [line.id, line]))
@@ -620,7 +712,12 @@ export async function processBookedInEvent(
       const auditReceiptLines: Array<Record<string, unknown>> = []
 
       for (const [poId, receiptLines] of receiptLinesByPoId) {
-        await tx.$queryRaw`SELECT id FROM purchase_orders WHERE id = ${poId} FOR UPDATE`
+        // Already held since step 2 (lockPurchaseOrders, above) — taking it here was
+        // the out-of-order acquisition, because by now this transaction holds the ASN
+        // line rows. Re-locking a row the transaction already holds is a no-op in
+        // PostgreSQL, so the statement is gone rather than moved: leaving it would
+        // read as though this were where the PO lock is taken (6oyu.19 Codex r9).
+        assertParentIsLocked(poId, lockedPurchaseOrderIds, 'purchase_orders')
 
         const po = await tx.purchaseOrder.findUnique({
           where: { id: poId },
@@ -842,7 +939,11 @@ export async function processBookedInEvent(
       }
 
       for (const [transferId, receiptLines] of receiptLinesByTransferId) {
-        await tx.$queryRaw`SELECT id FROM stock_transfers WHERE id = ${transferId} FOR UPDATE`
+        // Already held since step 2 (lockStockTransfers, above). This was the second
+        // half of the cycle against `receiveTransfer`: by the time control reached
+        // here the transaction held `wms_asn_line_maps`, so acquiring the transfer
+        // row now is ASN→TRANSFER (6oyu.19 Codex r9).
+        assertParentIsLocked(transferId, lockedTransferIds, 'stock_transfers')
 
         const transfer = await tx.stockTransfer.findUnique({
           where: { id: transferId },

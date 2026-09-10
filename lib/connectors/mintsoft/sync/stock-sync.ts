@@ -37,6 +37,7 @@ import {
   buildStockMovementValueFields,
   buildStockMovementValueFieldsFromTotal,
 } from '@/lib/domain/inventory/stock-movement-value'
+import { lockStockTransfers, lockWmsAsnLineMaps } from '@/lib/domain/wms/transfer-asn-lock-order'
 import { addMoney, multiplyMoney, toDecimal } from '@/lib/domain/math/decimal'
 import { enqueueStockSync } from '@/lib/shopping'
 
@@ -583,6 +584,14 @@ type AlignmentCandidateSet = {
    * across the line's open ASN rows.
    */
   transferLineResiduals: Map<string, TransferLineResidualQty>
+  /**
+   * Every parent transfer of every transfer-backed ASN row seen — INCLUDING the
+   * refused ones — so the caller knows which `stock_transfers` rows to lock at step
+   * 2. Refused ones are in deliberately: a status read before the lock is exactly
+   * the fact the lock is being taken to settle, so filtering by it first would
+   * choose the lock set from the answer the lock is meant to produce.
+   */
+  parentTransferIds: string[]
   refused: RefusedAlignmentCandidate[]
 }
 
@@ -607,6 +616,7 @@ async function getAlignmentCandidateLines(
   tx: Prisma.TransactionClient,
   binding: SyncBinding,
   productId: string,
+  lockedTransferIds?: ReadonlySet<string>,
 ): Promise<AlignmentCandidateSet> {
   const lines = await tx.wmsAsnLineMap.findMany({
     where: {
@@ -673,6 +683,7 @@ async function getAlignmentCandidateLines(
   const candidates: AlignmentCandidateLine[] = []
   const transferLineResiduals = new Map<string, TransferLineResidualQty>()
   const refused: RefusedAlignmentCandidate[] = []
+  const parentTransferIds = new Set<string>()
 
   for (const line of lines) {
     const asnResidualQty = resolveWmsAsnLineResidualQty({
@@ -706,6 +717,22 @@ async function getAlignmentCandidateLines(
       })
       continue
     }
+    parentTransferIds.add(transferLine.transferId)
+
+    // Refused BEFORE the status is consulted, because an unlocked status is the one
+    // thing this pass may not rely on. A row whose parent appeared after the step-2
+    // locks were taken cannot be locked now without inverting the global order
+    // (lib/domain/wms/transfer-asn-lock-order.ts), so it waits for the next sweep.
+    if (lockedTransferIds && !lockedTransferIds.has(transferLine.transferId)) {
+      refused.push({
+        asnLineMapId: line.id,
+        externalAsnId: line.asn.externalAsnId,
+        reason: `transfer ${transferLine.transfer.reference} appeared after this run took its transfer locks`,
+        kind: 'unusable',
+      })
+      continue
+    }
+
     if (!isTransferUsableForWmsReceipt(transferLine.transfer.status)) {
       refused.push({
         asnLineMapId: line.id,
@@ -760,6 +787,7 @@ async function getAlignmentCandidateLines(
   return {
     candidates,
     transferLineResiduals,
+    parentTransferIds: [...parentTransferIds],
     refused,
   }
 }
@@ -866,30 +894,47 @@ export async function applyMintsoftAlignmentForProduct(params: {
     }
   }
   const outcome = await db.$transaction(async (tx) => {
-    // NO ROW LOCKS ARE TAKEN HERE, AND THAT IS DELIBERATE (6oyu.19, Codex round-8).
+    // THE LOCKS, IN THE GLOBAL ORDER (6oyu.19, Codex round-9 HIGH-1).
     //
-    // Round 7 added an ASN-rows-then-transfers `FOR UPDATE` pair and a post-lock
-    // re-read, so that the parent status the plan rests on would be a fact a lock
-    // covered. Round 7 also claimed no lock cycle existed. It was wrong: the
-    // transfer-ASN creation path in app/actions/mintsoft-sync.ts takes
-    // `stock_transfers FOR UPDATE` first (line 3690) and then writes the transfer's
-    // existing `wms_asn_line_maps` rows (deleteMany at 3892, update at 3904), which
-    // is TRANSFER-then-ASN — the exact opposite of the order alignment took. Two
-    // transactions over the same transfer in opposite orders is a deadlock, and
-    // PostgreSQL resolves it by aborting one of them.
+    // Round 7 added them ASN-rows-then-transfers and claimed no cycle existed; round
+    // 8 found the cycle — the Mintsoft ASN-creation path takes `stock_transfers`
+    // first and then rewrites that transfer's `wms_asn_line_maps` rows — and
+    // withdrew the locks entirely, leaving the CONCURRENT route of o3d-2y5u open on
+    // the grounds that `development` has no guard at all so nothing regressed.
     //
-    // The whole locking addition has therefore been WITHDRAWN, along with the
-    // post-lock re-read and the "appeared after this run took its locks" refusal.
-    // What is KEPT is the parent-status guard below, which needs no lock to be worth
-    // having: it closes the SEQUENTIAL route of o3d-2y5u — a dispatch cancelled,
-    // then a later sweep aligning against the still-open ASN — which is the route
-    // that finding actually describes. The CONCURRENT route (a cancellation
-    // committing between this read and these writes) stays open, exactly as it is on
-    // `development`, which has no guard at all. Nothing regresses; the race is
-    // recorded on o3d-2y5u, and the cycle above is why closing it is not a small
-    // addition. Recover the withdrawn code with
-    // `git show 7723f229:lib/connectors/mintsoft/sync/stock-sync.ts`.
-    const candidateSet = await getAlignmentCandidateLines(tx, params.binding, params.productId)
+    // Both rounds were reasoning about which order THIS function should take. The
+    // answer was that the codebase needed ONE order and did not have one: three of
+    // the four paths already took TRANSFER→ASN and only booked-in reconciliation
+    // took ASN→TRANSFER. That is now fixed globally
+    // (lib/domain/wms/transfer-asn-lock-order.ts), so alignment takes the same
+    // order as everything else and the cycle round 8 withdrew for does not exist.
+    //
+    // WHAT THE LOCK BUYS. `cancelDispatchedTransfer` restores the FULL line quantity
+    // and a second set of replacement cost layers at the SOURCE, then marks the
+    // transfer CANCELLED. Without the transfer lock it could commit between this
+    // function's status read and its writes, so both copies stayed live and a later
+    // landed-cost revaluation posted the inventory reclassification twice — the
+    // exact double-count this branch exists to close, one route over. The status
+    // guard alone closes only the SEQUENTIAL form of that. The re-read below is what
+    // makes the lock worth taking: taking a lock and then acting on the read from
+    // before it would settle nothing.
+    const discovery = await getAlignmentCandidateLines(tx, params.binding, params.productId)
+    if (discovery.candidates.length === 0) {
+      return {
+        kind: 'unavailable' as const,
+        correctedQty: 0,
+        reason: `No open ASN line is available to absorb this WMS delta.${describeRefusedAlignmentCandidates(discovery.refused)}`,
+      }
+    }
+
+    // STEP 2, then STEP 4 — never the other way about.
+    const lockedTransferIds = new Set(await lockStockTransfers(tx, discovery.parentTransferIds))
+    await lockWmsAsnLineMaps(tx, discovery.candidates.map((candidate) => candidate.id))
+
+    // Read again UNDER the locks. Every fact the plan rests on — each parent
+    // transfer's status, each ASN row's counters — is now covered by a lock this
+    // transaction holds until it commits.
+    const candidateSet = await getAlignmentCandidateLines(tx, params.binding, params.productId, lockedTransferIds)
     const candidates = candidateSet.candidates
 
     if (candidates.length === 0) {

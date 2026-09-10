@@ -26,6 +26,7 @@ import {
   transferLineOutstandingQty,
   type TransferLineLandedQty,
 } from '@/lib/domain/inventory/transfer-landed-quantity'
+import { lockWmsAsnLineMapsForTransferLines } from '@/lib/domain/wms/transfer-asn-lock-order'
 import { planTransferPartialReceipt } from '@/lib/domain/inventory/transfer-partial-receipt'
 import { isStockMovementIdempotencyConflict } from '@/lib/domain/inventory/stock-movement-idempotency'
 import { toInventoryConstraintMessage } from '@/lib/domain/inventory/prisma-errors'
@@ -791,6 +792,20 @@ export async function receiveTransfer(id: string): Promise<TransferResult> {
       const transition = validateStockTransferStatusTransition(transfer.status, 'RECEIVED')
       if (!transition.success) throw new Error(transition.error)
 
+      // STEP 4 of the global transfer/ASN lock order, taken HERE rather than where
+      // the rows are written (6oyu.19, Codex round-9 MEDIUM-1).
+      //
+      // Round 6 gave this path `absorbWmsSnapshotCreditIntoQtyReceived` below, which
+      // UPDATEs the line's `wms_asn_line_maps` rows. That write was the point at
+      // which this transaction first took an ASN row lock — after the stock-level
+      // lock a few lines down, and while booked-in reconciliation was taking the
+      // same two rows the other way round. Taking the lock here puts every
+      // acquisition in the one order, and it also makes the `loadTransferLineLandedQty`
+      // read below a read of rows this transaction holds: the credit it absorbs can
+      // no longer be moved by an alignment between the read and the write.
+      // See lib/domain/wms/transfer-asn-lock-order.ts.
+      await lockWmsAsnLineMapsForTransferLines(tx, transfer.lines.map((line) => line.id))
+
       // Load cost layer snapshots stored at dispatch time
       const linesWithSnapshots = await tx.stockTransferLine.findMany({
         where: { transferId: id },
@@ -983,6 +998,13 @@ export async function receiveTransferPartial(id: string, lineDeltas: unknown, su
       for (const item of requested) {
         if (!lineById.has(item.lineId)) throw new Error(`Transfer line ${item.lineId} is not part of this transfer.`)
       }
+
+      // STEP 4 of the global transfer/ASN lock order, before the stock-level lock
+      // below (6oyu.19, Codex round-9). Like the cancellation path this one only
+      // READS the ASN rows, and like it the read is what the receipt is sized from:
+      // an alignment crediting them in between offers up quantity that has already
+      // landed and been layered.
+      await lockWmsAsnLineMapsForTransferLines(tx, transfer.lines.map((line) => line.id))
 
       // 6oyu.19 (Codex r6): cap against what has already LANDED, from the one
       // definition — `qtyReceived` alone offers up quantity a WMS alignment has
@@ -1201,6 +1223,19 @@ export async function cancelDispatchedTransfer(id: string): Promise<TransferResu
         where: { transferId: id },
         select: { id: true, productId: true, qty: true, qtyReceived: true, costLayerSnapshot: true },
       })
+
+      // STEP 4 of the global transfer/ASN lock order (6oyu.19, Codex round-9).
+      //
+      // This path never WRITES these rows, but it reads them — through
+      // `loadTransferLineLandedQty` immediately below — and then restores the full
+      // outstanding line quantity to source on the strength of that read. An
+      // alignment crediting `qtyAccountedViaSnapshot` between the read and the
+      // restore makes the answer stale in the one direction that duplicates stock:
+      // "nothing has landed" when units just did. The transfer lock above already
+      // serialises this against alignment, which now takes that lock first; this
+      // second lock is what stops the same staleness arriving from the WMS webhook
+      // book-in, which holds no transfer lock until it has these rows.
+      await lockWmsAsnLineMapsForTransferLines(tx, lines.map((line) => line.id))
 
       // A partly-landed transfer (a WMS webhook book-in, a manual partial receipt or
       // a WMS stock-sync alignment has already brought some units to rest and laid

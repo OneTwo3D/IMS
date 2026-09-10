@@ -243,7 +243,7 @@ test('the reachability postcondition FAILS when no link was written (6oyu.19)', 
           .costLayer.create({ data })
           .then((layer) => layer.id)) as never,
         copyCostLayerSourceLinesProportionally: (async () => 1) as never,
-        logActivity: (async () => {}) as never,
+        logActivityInTransaction: (async () => {}) as never,
       },
     ),
     /no\s+costLayerSourceLine/,
@@ -612,7 +612,7 @@ test('the quantity postcondition FAILS if an entry is not laid down (o3d-eiuo)',
             .then((layer) => layer.id)
         }) as never,
         copyCostLayerSourceLinesProportionally: (async () => 0) as never,
-        logActivity: (async () => {}) as never,
+        logActivityInTransaction: (async () => {}) as never,
       },
     ),
     /no FIFO layer behind them/,
@@ -841,7 +841,7 @@ test('the round-4 postcondition PASSES on the short slice — this is what made 
       // 0 — the ordinary PO-derived source layer, so the helper writes the direct
       // provenance link and its reachability postcondition is satisfied.
       copyCostLayerSourceLinesProportionally: (async () => 0) as never,
-      logActivity: (async () => {}) as never,
+      logActivityInTransaction: (async () => {}) as never,
     },
   )
 
@@ -877,7 +877,7 @@ test('the balancing layer logs a WARNING naming the shortfall (Codex r8 HIGH-1)'
           .costLayer.create({ data: { ...data, receivedQty: String(data.qty), remainingQty: String(data.qty) } })
           .then((layer) => layer.id)) as never,
       copyCostLayerSourceLinesProportionally: (async () => 0) as never,
-      logActivity: (async (params: Record<string, unknown>) => { logged.push(params) }) as never,
+      logActivityInTransaction: (async (_tx: unknown, params: Record<string, unknown>) => { logged.push(params) }) as never,
     },
   )
 
@@ -946,7 +946,16 @@ test('a slice LONGER than the booking is refused too — the check binds both wa
   // six and hands over a ten-unit slice would lay down layers for stock nobody
   // incremented, which inflates on-hand value rather than deflating it. The old
   // check could not see this either.
-  const { tx } = createStore(false)
+  //
+  // AND IT POISONS THE TRANSACTION, asserted here rather than assumed (Codex round-9
+  // LOW-2). This is the FINAL coverage check — the only one of the four refusals
+  // whose abort no test exercised independently. Every other refusal in this module
+  // has its `store.aborted` assertion; this one was proved only to THROW, so
+  // deleting its `abortEnclosingTransactionSoTheRefusalCannotBeSwallowed` call left
+  // the whole suite green while a caller that caught the error could commit
+  // over-layered stock — the exact hole round 5 gave the negative-cost refusal an
+  // abort for.
+  const { store, tx } = createStore(false)
   await assert.rejects(
     () => recreateTransferCostLayersFromSnapshotSlice(
       tx as never,
@@ -954,6 +963,17 @@ test('a slice LONGER than the booking is refused too — the check binds both wa
       [{ costLayerId: 'layer-src', qty: '10.000000', unitCostBase: '5.000000' }],
     ),
     /booked 6\.000000 units[\s\S]*but 10\.000000 units are/,
+  )
+
+  assert.equal(store.aborted, true, 'the final coverage refusal must abort FIRST, not merely throw')
+  // And prove the abort BITES rather than just being recorded: a caller who swallows
+  // the throw can write nothing else, so the stock increment it already made cannot
+  // reach the database.
+  await assert.rejects(
+    () => (tx as { costLayer: { create: (args: unknown) => Promise<unknown> } })
+      .costLayer.create({ data: { productId: 'prod-1', qty: '10' } }),
+    new RegExp(ABORTED_TRANSACTION),
+    'a swallowed coverage refusal must leave the caller unable to commit its over-layering',
   )
 })
 
@@ -982,7 +1002,7 @@ test('the QUANTITY postconditions abort the transaction too, not just the cost r
             .then((layer) => layer.id)
         }) as never,
         copyCostLayerSourceLinesProportionally: (async () => 0) as never,
-        logActivity: (async () => {}) as never,
+        logActivityInTransaction: (async () => {}) as never,
       },
     ),
     /no FIFO layer behind them/,
