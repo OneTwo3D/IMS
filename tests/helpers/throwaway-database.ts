@@ -36,7 +36,9 @@
  *   3. a name this module did not mint (anything not matching `THROWAWAY_DATABASE_NAME_RE`) —
  *      this is what "refuses a database it did not create" means at the level of the name;
  *   4. a name that ALREADY EXISTS — the same words at the level of the server. `CREATE DATABASE`
- *      is the authority: it cannot succeed against a database somebody else made.
+ *      is the authority: it cannot succeed against a database somebody else made, and its `42P04`
+ *      is the ONLY thing that establishes who owns the name. The probe that runs before it is a
+ *      courtesy, not a claim: it can only report absence at the instant it ran.
  *
  * (1)-(3) are pure and are asserted by `tests/throwaway-database-guard.test.ts`, which runs on
  * every `npm run test:unit` with no database at all. (4) needs a server and is asserted by the
@@ -50,9 +52,14 @@
  * only begins once it HAS a handle, so every failure before that has to be cleaned up in here:
  *
  *   1. the CREATE was ISSUED and the connection then failed before its response arrived — the
- *      database may exist and this process cannot tell. RECLAIMED (r7): the flag is set before the
- *      await and a fresh maintenance connection issues `DROP DATABASE IF EXISTS`.
- *   2. `prisma migrate deploy` failed. RECLAIMED: the same drop, then a refusal by name.
+ *      database may exist and this process cannot tell. RECLAIMED (r7): the state moves to
+ *      `possibly-created` before the await and a fresh maintenance connection issues
+ *      `DROP DATABASE IF EXISTS`. What that reclaim must NOT swallow is a CREATE the server
+ *      REFUSED as `42P04` — that answer proves the database is somebody else's, and r8 gives it
+ *      its own state (`definitely-not-mine`) so it can never reach a drop. See the three-state
+ *      commentary at the CREATE itself.
+ *   2. `prisma migrate deploy` failed. RECLAIMED: the same drop, then a refusal by name. Ownership
+ *      is not inferred here — this path is only reachable once the CREATE has COMPLETED.
  *   3. a failure between provisioning and the caller's first query — the dynamic imports,
  *      `new PrismaClient`, `sql.connect()`. RECLAIMED by the caller-side `openLane` in the
  *      concurrency lane (r6), which is where those steps live.
@@ -139,6 +146,54 @@ export function assertThrowawayDatabaseName(candidate: string, configuredDatabas
 function quoteIdentifier(name: string): string {
   return `"${name.replace(/"/g, '""')}"`
 }
+
+/**
+ * `duplicate_database`. PostgreSQL raises exactly this SQLSTATE when `CREATE DATABASE` names a
+ * database that already exists — which is the one answer that proves THIS call did not create it.
+ */
+const DUPLICATE_DATABASE_SQLSTATE = '42P04'
+
+/**
+ * Is this rejection the server saying "that name is already taken"?
+ *
+ * Keyed on the SQLSTATE and on nothing else. `pg` puts the server's five-character code on
+ * `error.code` verbatim, and a message-text fallback would be a guess in a place where a guess
+ * decides whether a `DROP DATABASE` is issued. If a future driver stops setting `code`, this
+ * returns false and the caller falls back to the possibly-created path — the same behaviour as
+ * before this check existed, which is the failure mode to prefer over a wrong `true`.
+ */
+function isDuplicateDatabaseError(error: unknown): boolean {
+  return (
+    typeof error === 'object'
+    && error !== null
+    && 'code' in error
+    && (error as { code?: unknown }).code === DUPLICATE_DATABASE_SQLSTATE
+  )
+}
+
+/**
+ * WHAT THIS PROCESS KNOWS ABOUT WHO CREATED THE DATABASE — three states, because there are three
+ * answers and a boolean can only hold two (o3d-alnk r8, Codex HIGH).
+ *
+ * The r7 flag conflated the last two: it recorded that the CREATE had been ISSUED, and every
+ * outcome other than "not issued" was treated as "might be mine, so reclaim it". That is right
+ * for a response that never arrives and WRONG for a response that arrives saying somebody else
+ * got there first — and the wrong one dropped their database.
+ */
+type CreateOwnership =
+  /**
+   * Nothing was issued, or the server REFUSED the CREATE as `42P04`. Either way this call did not
+   * create the database. NEVER cleaned up: there is either nothing there, or something that is
+   * somebody else's.
+   */
+  | 'definitely-not-mine'
+  /**
+   * The CREATE was issued and no answer came back. The database may or may not exist and this
+   * process cannot tell. `DROP DATABASE IF EXISTS` is correct for both, so this state reclaims.
+   */
+  | 'possibly-created'
+  /** The CREATE COMPLETED. The database exists and it is this lane's to drop. */
+  | 'created'
 
 export type ThrowawayDatabase = {
   /** The database this lane created. */
@@ -248,32 +303,43 @@ export async function provisionThrowawayDatabase(options: ProvisionOptions): Pro
   }
 
   /**
-   * THE LOST-RESPONSE ORPHAN (o3d-alnk r7, Codex LOW) — AND WHY IT IS NOT THE SIGKILL HOLE.
+   * THE TWO ORPHAN CASES, AND THE ONE CASE THAT IS NOT AN ORPHAN AT ALL (r7 LOW, r8 HIGH).
    *
-   * `CREATE DATABASE` is issued over a socket. If the server EXECUTES it and the connection then
-   * fails before the completion response arrives — a killed backend, a dropped TCP connection, a
-   * proxy timing out, `client.end()` throwing in the `finally` — `client.query` REJECTS and this
-   * function used to throw straight out. The database existed, nothing held its name, and the
-   * `drop` closure had not been created yet. The cleanup added in r6 could not help: it starts
-   * after the handle is built.
+   * `CREATE DATABASE` is issued over a socket, and the answer decides what this process may clean
+   * up. There are exactly three answers and they are NOT interchangeable:
    *
-   * That is a CATCHABLE failure, so it is closable, and it is closed here. The flag is set BEFORE
-   * the await, not after it, because "did the server do it?" is exactly the question this process
-   * cannot answer — the only thing it knows is that it ISSUED the statement, and that is the fact
-   * the cleanup must key on. `DROP DATABASE IF EXISTS` makes both outcomes correct: a CREATE that
-   * never landed is a no-op, a CREATE that landed is reclaimed.
+   *   COMPLETED -> `created`. The database exists and it is this lane's. Anything that fails
+   *   afterwards (the `client.end()` in the maintenance `finally`, for instance) still leaves a
+   *   database this lane owns, so it is reclaimed.
    *
-   * IT IS SAFE TO DROP ON THIS PATH AND ON NO OTHER. Two facts have already been established when
-   * the flag is set: `assertThrowawayDatabaseName` passed, so the name is one this module minted
-   * and is neither protected nor the configured database; and the existence probe found NOTHING,
-   * so no database of that name belonged to anybody else. The `ALREADY EXISTS` refusal is raised
-   * BEFORE the flag and therefore never reaches the cleanup — dropping there would destroy the
-   * very database the refusal exists to protect.
+   *   NO ANSWER -> `possibly-created`. A killed backend, a dropped TCP connection, a proxy timing
+   *   out: `client.query` REJECTS, the server may or may not have executed the statement, and this
+   *   process cannot find out. `DROP DATABASE IF EXISTS` is correct for both branches, so it is
+   *   reclaimed. This is the r7 finding, and it is unchanged here.
    *
-   * WHAT REMAINS IS THE SIGKILL HOLE AND ONLY THAT: a process that runs no more JavaScript runs no
+   *   `42P04` -> `definitely-not-mine`. The server answered, and its answer was that the name was
+   *   ALREADY TAKEN when the CREATE ran. That is POSITIVE PROOF this call did not create the
+   *   database — so it is the one outcome that must never reach the drop.
+   *
+   * WHY THAT THIRD STATE HAD TO EXIST (o3d-alnk r8, Codex HIGH). The existence probe and the
+   * CREATE are two statements, not one, and nothing holds the name between them. Two provisioners
+   * can both probe absent; one wins the CREATE and the other is rejected. Under r7 the loser had
+   * already set its "issued" flag before the await, so it took the rejection into the cleanup and
+   * issued `DROP DATABASE IF EXISTS` against the WINNER'S database. The probe therefore never
+   * established ownership — it only established absence at probe time, which is a weaker fact —
+   * and the guard that was meant to protect a database this lane did not create was the thing
+   * destroying it. Ownership is established by the CREATE, and only the CREATE can report it.
+   *
+   * WHAT IS LEFT, STATED PLAINLY. `possibly-created` still covers a lost answer that WOULD have
+   * been `42P04`, and a drop there would still hit the winner. That residue cannot be closed by
+   * ordering, because closing it needs a lock the server does not offer for `CREATE DATABASE` —
+   * and it is not what Codex found. What IS closed is every case where the server TOLD us, which
+   * is every case that is reachable without a simultaneous connection failure.
+   *
+   * AND THE SIGKILL HOLE REMAINS THE SIGKILL HOLE: a process that runs no more JavaScript runs no
    * cleanup either. That one is demonstrated, not asserted, in the concurrency lane.
    */
-  let createIssued = false
+  let ownership: CreateOwnership = 'definitely-not-mine'
   try {
     await withMaintenanceClient(maintenance, async (client) => {
       const existing = await client.query('SELECT 1 FROM pg_database WHERE datname = $1', [name])
@@ -282,13 +348,34 @@ export async function provisionThrowawayDatabase(options: ProvisionOptions): Pro
           `refused ${name}: a database of that name ALREADY EXISTS, so this lane did not create it`,
         )
       }
-      createIssued = true
-      await client.query(`CREATE DATABASE ${quoteIdentifier(name)}`)
+      // BEFORE the await, deliberately: from here until an answer arrives, "may exist" is the
+      // most this process can honestly claim.
+      ownership = 'possibly-created'
+      try {
+        await client.query(`CREATE DATABASE ${quoteIdentifier(name)}`)
+      } catch (createError) {
+        if (isDuplicateDatabaseError(createError)) {
+          // The answer arrived and it was somebody else's name. Step BACK to definitely-not-mine
+          // so the cleanup below cannot run: this is the same refusal the probe makes, arriving
+          // one statement later because the race was lost in between.
+          ownership = 'definitely-not-mine'
+          throw new ThrowawayDatabaseError(
+            `refused ${name}: the CREATE was REJECTED with SQLSTATE ${DUPLICATE_DATABASE_SQLSTATE} `
+            + '(duplicate_database), which is positive proof another provisioner created that database '
+            + "between this lane's existence probe and its CREATE. NOTHING WAS DROPPED: the database "
+            + 'of that name belongs to whoever won the race, and this lane never owned it',
+          )
+        }
+        throw createError
+      }
+      // The server answered, and the answer was yes.
+      ownership = 'created'
     })
   } catch (error) {
-    // Nothing was issued, so there is nothing that could exist. Re-thrown UNCHANGED so the
-    // refusals above keep the wording their proofs match on.
-    if (!createIssued) throw error
+    // `definitely-not-mine` covers both refusals — the probe's and the `42P04` one — and every
+    // failure before the CREATE was issued. Re-thrown UNCHANGED so those refusals keep the
+    // wording their proofs match on, and, more to the point, WITHOUT ISSUING A DROP.
+    if (ownership === 'definitely-not-mine') throw error
 
     let reclaimFailure: unknown = null
     try {
@@ -296,10 +383,12 @@ export async function provisionThrowawayDatabase(options: ProvisionOptions): Pro
     } catch (dropError) {
       reclaimFailure = dropError
     }
+    const provenance = ownership === 'created'
+      ? 'The CREATE had already been ISSUED and had SUCCEEDED, so the database this lane owns was'
+      : 'The CREATE had already been ISSUED, so a database created without this process learning of it was'
     throw new ThrowawayDatabaseError(
       reclaimFailure === null
-        ? `could not create ${name}: ${String(error)}. The CREATE had already been ISSUED, so a `
-          + 'database created without this process learning of it was reclaimed; nothing was left behind'
+        ? `could not create ${name}: ${String(error)}. ${provenance} reclaimed; nothing was left behind`
         : `could not create ${name}: ${String(error)}. The CREATE had already been ISSUED and the `
           + `reclaiming DROP ALSO FAILED (${String(reclaimFailure)}), so ${name} MAY still exist on the `
           + 'server and has to be dropped by hand',

@@ -182,6 +182,15 @@ const wire = {
   loseCreateResponse: false,
   /** The unrecoverable variant: the reclaiming DROP cannot be delivered either. */
   failDrop: false,
+  /**
+   * ANOTHER PROVISIONER, ARRIVING BETWEEN THE PROBE AND THE CREATE (o3d-alnk r8).
+   *
+   * When set to a name, the fake server answers the existence probe TRUTHFULLY — absent, because
+   * at that instant it is — and then records that name as created by somebody else before the
+   * CREATE arrives. That is provisioner A winning the race, and it is the only way to reach the
+   * `42P04` branch without two real connections.
+   */
+  createdByAnotherProvisionerAfterProbe: null as string | null,
 }
 
 function resetWire(): void {
@@ -190,6 +199,7 @@ function resetWire(): void {
   wire.statements = []
   wire.loseCreateResponse = false
   wire.failDrop = false
+  wire.createdByAnotherProvisionerAfterProbe = null
 }
 
 /** `CREATE DATABASE "x"` / `DROP DATABASE IF EXISTS "x" WITH (FORCE)` -> `x`. */
@@ -210,12 +220,29 @@ class FakeMaintenanceClient {
     wire.statements.push(text)
     if (text.startsWith('SELECT 1 FROM pg_database')) {
       const name = String((values ?? [])[0])
-      return { rows: wire.databases.has(name) ? [{ exists: 1 }] : [] }
+      const answer = { rows: wire.databases.has(name) ? [{ exists: 1 }] : [] }
+      // AFTER the answer is computed, so the probe reports what was true when it ran and the
+      // race lands in the gap that the finding is about.
+      if (wire.createdByAnotherProvisionerAfterProbe !== null) {
+        wire.databases.add(wire.createdByAnotherProvisionerAfterProbe)
+      }
+      return answer
     }
     if (text.startsWith('CREATE DATABASE')) {
+      const name = quotedName(text)
+      if (wire.databases.has(name)) {
+        // WHAT POSTGRESQL ACTUALLY DOES, with the SQLSTATE it actually sets. The existing
+        // database is left ALONE — this branch must not touch `wire.databases`, or the assertion
+        // that the winner's database survived would be measuring the fake instead of the fix.
+        throw Object.assign(new Error(`database "${name}" already exists`), {
+          code: '42P04',
+          severity: 'ERROR',
+          routine: 'createdb',
+        })
+      }
       // THE SERVER DOES THE WORK EITHER WAY. That is the entire finding: the database exists
       // whether or not the client survives long enough to be told.
-      wire.databases.add(quotedName(text))
+      wire.databases.add(name)
       if (wire.loseCreateResponse) throw new Error('Connection terminated unexpectedly')
       return { rows: [] }
     }
@@ -332,4 +359,123 @@ test('r7 LOW: the ALREADY EXISTS refusal must NOT drop — it protects a databas
   assert.deepEqual([...wire.databases], [MINTED], 'the already-exists refusal dropped somebody else\'s database')
   assert.deepEqual(wire.statements.filter((statement) => statement.startsWith('DROP DATABASE')), [])
   assert.ok(!wire.statements.some((statement) => statement.startsWith('CREATE DATABASE')))
+})
+
+// ===========================================================================================
+// ROUND 8, Codex HIGH — THE PROBE IS NOT A LOCK, AND `42P04` IS PROOF OF SOMEBODY ELSE.
+//
+// The existence probe and the `CREATE DATABASE` are two statements with nothing holding the name
+// between them. Two provisioners can both observe the name absent; one wins the CREATE and the
+// other is REJECTED with SQLSTATE 42P04. Under r7 the loser had already set its "the CREATE was
+// issued" flag before the await, so it carried that rejection into the lost-response cleanup and
+// issued `DROP DATABASE IF EXISTS` — against the WINNER'S database.
+//
+// The state that fixes it is three-valued: `created`, `possibly-created`, `definitely-not-mine`.
+// r7 conflated the last two. `42P04` is the one answer that means definitely-not-mine, because it
+// is the server saying the name was already taken when the CREATE ran.
+//
+// PROVED ON THE WIRE, NOT BY THE ABSENCE OF AN EXCEPTION. `DROP DATABASE IF EXISTS` against a
+// database that is there SUCCEEDS and destroys it silently, so "it did not throw" measures
+// nothing at all. The assertion is over `wire.statements`: no DROP was issued.
+// ===========================================================================================
+
+test('r8 HIGH: a CREATE rejected with 42P04 must issue NO DROP — the winner keeps its database', async () => {
+  resetWire()
+  // Provisioner A takes the name in the gap between B's probe and B's CREATE.
+  wire.createdByAnotherProvisionerAfterProbe = MINTED
+
+  // CAPTURED, NOT `assert.rejects`. Both the fix and the defect reject; what separates them is
+  // what went down the wire on the way out, so the rejection must not be allowed to short-circuit
+  // the assertions that are actually the finding.
+  const outcome = await withWiredUrl(async () =>
+    provisionThrowawayDatabase({ label: 'alnkfence', mintName: () => MINTED }).then(
+      () => null,
+      (reason: unknown) => reason,
+    ),
+  )
+
+  // THE PRECONDITION, ASSERTED so this cannot pass vacuously: the race really was reached — the
+  // probe found nothing, and the CREATE was issued anyway and hit the winner.
+  assert.deepEqual(
+    wire.statements.filter((statement) => statement.startsWith('CREATE DATABASE')),
+    [`CREATE DATABASE "${MINTED}"`],
+    'the CREATE never ran, so this test proves nothing about what happens when it is rejected',
+  )
+
+  // THE FINDING, ON THE WIRE. Not "no exception escaped" — `DROP DATABASE IF EXISTS` against a
+  // database that IS there succeeds and destroys it in silence, so an exception count measures
+  // nothing. The only evidence that means anything is the statement list.
+  assert.deepEqual(
+    wire.statements.filter((statement) => statement.startsWith('DROP DATABASE')),
+    [],
+    'the 42P04 refusal issued a DROP against the database another provisioner had just created',
+  )
+
+  // And the consequence of that, stated as the thing anybody actually cares about.
+  assert.deepEqual(
+    [...wire.databases],
+    [MINTED],
+    "the winning provisioner's database did not survive the loser's refusal",
+  )
+
+  // Only now the refusal itself — it must be a refusal, and it must say why nothing was dropped.
+  assert.ok(outcome instanceof ThrowawayDatabaseError, `expected a named refusal, got ${String(outcome)}`)
+  assert.match(outcome.message, /REJECTED with SQLSTATE 42P04[\s\S]*NOTHING WAS DROPPED/)
+
+  wire.databases.clear()
+})
+
+test('r8 HIGH: the 42P04 refusal is reported as a race, not as a failed create', async () => {
+  resetWire()
+  wire.createdByAnotherProvisionerAfterProbe = MINTED
+
+  const error = await withWiredUrl(async () =>
+    provisionThrowawayDatabase({ label: 'alnkfence', mintName: () => MINTED }).then(
+      () => null,
+      (reason: unknown) => reason,
+    ),
+  )
+
+  assert.ok(error instanceof ThrowawayDatabaseError, `expected a named refusal, got ${String(error)}`)
+  // A REFUSAL, in the same family as the probe's — not the reclaim's "could not create ... the
+  // CREATE had already been ISSUED", which is the wording that would say a drop had been decided
+  // on. Asserting the absence of that phrase is what keeps the two paths from drifting together.
+  assert.match(error.message, new RegExp(`^throwaway database: refused ${MINTED}: `))
+  assert.doesNotMatch(error.message, /had already been ISSUED/)
+  assert.match(error.message, /positive proof another provisioner created that database/)
+
+  wire.databases.clear()
+})
+
+test('r8 HIGH: a lost response is still reclaimed — the two outcomes stayed distinguishable', async () => {
+  // The regression guard for the fix itself. It would be easy to close the 42P04 hole by never
+  // dropping after a CREATE at all, which would reopen r7. Both arms have to hold at once.
+  resetWire()
+  wire.loseCreateResponse = true
+  await withWiredUrl(async () => {
+    await assert.rejects(
+      () => provisionThrowawayDatabase({ label: 'alnkfence', mintName: () => MINTED }),
+      refusal(/CREATE had already been ISSUED[\s\S]*reclaimed; nothing was left behind/),
+    )
+  })
+  assert.deepEqual(
+    wire.statements.filter((statement) => statement.startsWith('DROP DATABASE')),
+    [`DROP DATABASE IF EXISTS "${MINTED}" WITH (FORCE)`],
+    'the lost-response reclaim stopped issuing its DROP',
+  )
+  assert.equal(wire.databases.size, 0)
+
+  // And the same run, one flag apart, must NOT drop. Same fake server, same name, same code path
+  // up to the answer the server gives — the ONLY difference is which answer arrives.
+  resetWire()
+  wire.createdByAnotherProvisionerAfterProbe = MINTED
+  await withWiredUrl(async () => {
+    await assert.rejects(
+      () => provisionThrowawayDatabase({ label: 'alnkfence', mintName: () => MINTED }),
+      refusal(/NOTHING WAS DROPPED/),
+    )
+  })
+  assert.deepEqual(wire.statements.filter((statement) => statement.startsWith('DROP DATABASE')), [])
+  assert.deepEqual([...wire.databases], [MINTED])
+  wire.databases.clear()
 })
