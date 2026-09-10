@@ -49,6 +49,15 @@
  * production, present is pure harness, and there is no third state to construct.
  * `resolveEmailOutboxDependencies` is the single check, before the first query, for the callers
  * tsc never sees (a cast, `any`, JavaScript). See `EmailOutboxHarness` for the full history.
+ *
+ * AND THE CHECK READS EACH FACT EXACTLY ONCE (r7). It enumerates the caller's keys with
+ * `Reflect.ownKeys` behind a plain-prototype rule, so the names it sees are exactly the names a
+ * property read can resolve; and it returns a SNAPSHOT of the values it validated rather than the
+ * caller's object, so no consumer can re-ask a source that is free to answer differently the
+ * second time. Both r7 HIGHs were that one sentence broken: a key check that could not see an
+ * inherited or non-enumerable member (silently falling back to PRODUCTION), and a validated
+ * object handed back for the drain to re-read (a fake during the check, production during the
+ * drain). Read the fact once; use that reading everywhere.
  */
 
 import { randomUUID } from 'node:crypto'
@@ -171,6 +180,15 @@ type EmailClaim = {
  *   - a cast can still force `harness` past tsc, but forcing it supplies a COMPLETE harness, which
  *     is the SAFE direction: the drain then reads nothing from production at all;
  *   - the runtime guard is one presence test before the first query, not a pairing rule.
+ *
+ * ROUND 7 ADDS NO RULE — IT MAKES THE EXISTING ONE READ ITS SUBJECT ONCE. Both r7 HIGHs were
+ * time-of-check/time-of-use on this very object: the guard enumerated with `Object.keys` (blind to
+ * inherited and non-enumerable members, so a hidden `sendEmail` read as "no harness" and ran
+ * PRODUCTION), and it returned the caller's object for the drain to destructure a second time (so
+ * an accessor could show a fixture to the check and the production client to the drain). Neither
+ * needed a hostile caller: a prototype-assigned default and a lazily-memoising object are ordinary
+ * JavaScript. `resolveEmailOutboxDependencies` now enumerates with `Reflect.ownKeys` behind a
+ * plain-prototype rule and returns a SNAPSHOT of what it validated.
  *
  * WHAT IT STILL CANNOT FORBID, STATED PLAINLY. A caller can write `harness: { client: myDouble,
  * sendEmail: realMailer, ... }` by importing the real mailer and NAMING it. No type stops a
@@ -345,6 +363,69 @@ function refuseEmailOutboxOptions(detail: string): never {
   )
 }
 
+/** A key, printable in a refusal. Symbols are own keys too, and `JSON.stringify` throws on one. */
+function describeKey(key: string | symbol): string {
+  return typeof key === 'symbol' ? key.toString() : JSON.stringify(key)
+}
+
+/**
+ * EVERY MEMBER NAME A CALLER'S CONTAINER CARRIES, WITH NOWHERE FOR ONE TO HIDE (o3d-alnk r7,
+ * Codex HIGH 1).
+ *
+ * `Object.keys` was the wrong instrument, and the DIRECTION OF THE HARM is what makes it a HIGH
+ * rather than a curiosity. It lists only ENUMERABLE OWN STRING keys, while a property READ —
+ * `options.harness`, `harness.client` — resolves inherited and non-enumerable properties just the
+ * same. The two disagreed about what the object contains, so `Object.create({ sendEmail: fake })`
+ * and `Object.defineProperty(o, 'sendEmail', { value: fake })` both presented as an EMPTY options
+ * object: no strays to refuse, no `harness` to honour, therefore PRODUCTION. A caller who believed
+ * they had injected a fake sender silently got the GLOBAL database and the REAL mailer, which is
+ * precisely the outcome the stray-key refusal exists to prevent.
+ *
+ * THAT IS AN ACCIDENT PATH, NOT ONLY AN ADVERSARIAL ONE. A builder that assigns defaults onto a
+ * prototype, a class instance, an object built by `Object.assign(Object.create(base), …)`, or
+ * anything defined non-enumerably lands there with nobody intending it — and it fails SILENTLY
+ * TOWARDS PRODUCTION, which is the one direction this surface must never fail in.
+ *
+ * ONE CHECK THAT SEES EVERYTHING, rather than a third rule layered over the other two. Two
+ * conditions are needed and NEITHER IS REDUNDANT:
+ *
+ *   - `Reflect.ownKeys` rather than `Object.keys`, because an own key can be NON-ENUMERABLE or a
+ *     SYMBOL. A prototype rule on its own would wave through `Object.create(null)` carrying a
+ *     non-enumerable `sendEmail`.
+ *   - the prototype must be `Object.prototype` or `null`, because own keys are only the whole
+ *     story when NOTHING IS INHERITED. `Reflect.ownKeys` on its own would wave through
+ *     `Object.create({ sendEmail: fake })`.
+ *
+ * Together they assert ONE property: THE NAMES THIS FUNCTION ENUMERATES ARE EXACTLY THE NAMES A
+ * PROPERTY READ CAN RESOLVE. The disagreement is closed at its source instead of being patched
+ * shape by shape, which is the mistake rounds 2, 3 and 5 made eight times.
+ *
+ * WHAT IT STILL CANNOT SEE, SAID PLAINLY. A `Proxy` may disagree with ITSELF: its `ownKeys` trap
+ * can report nothing while its `get` trap answers `sendEmail`, and its `getPrototypeOf` trap can
+ * name `Object.prototype` whatever the target is. Nothing built on key enumeration catches that,
+ * and there is no reliable way to ask an object whether it is a Proxy. It is left uncaught on
+ * purpose: unlike a prototype-assigned default or a non-enumerable property, NOBODY BUILDS A
+ * LYING PROXY BY ACCIDENT, so it is not the failure this refusal exists for. What is closed is the
+ * accident — and a Proxy that answers honestly is refused exactly like any other object.
+ *
+ * IT APPLIES TO THE CONTAINERS, NOT TO THE VALUES INSIDE THEM. `options` and `harness` are bags of
+ * names this module enumerates, so their key set has to mean something. `harness.client` is a
+ * VALUE — very often a real `PrismaClient`, which is a class instance with a deep prototype chain
+ * — and is never enumerated, only read at names this module chose. Applying the rule there would
+ * refuse every real client and prove nothing.
+ */
+function ownMemberNames(value: object, what: string): (string | symbol)[] {
+  const prototype = Reflect.getPrototypeOf(value)
+  if (prototype !== Object.prototype && prototype !== null) {
+    refuseEmailOutboxOptions(
+      `${what} must be a PLAIN object (prototype \`Object.prototype\` or \`null\`); a member reached `
+      + 'through a PROTOTYPE is invisible to a key check but perfectly visible to a property read, '
+      + 'and that disagreement reads as "no harness" — which means PRODUCTION',
+    )
+  }
+  return Reflect.ownKeys(value)
+}
+
 /**
  * RESOLVE THE DRAIN'S DEPENDENCIES: PRODUCTION IN FULL, OR THE CALLER'S HARNESS IN FULL.
  *
@@ -358,8 +439,37 @@ function refuseEmailOutboxOptions(detail: string): never {
  * `null` as present, while `?? ` treated it as absent, so `{ client: null, sendEmail: fake }`
  * passed validation and then drained the GLOBAL queue through the fake. There is no such gap to
  * open here, because the caller of this function does not get to apply a fallback — it returns the
- * five values the drain will use, and the drain destructures them. Grep the drain for `??`: there
- * is none.
+ * five values the drain will use, and the drain destructures them. The drain does use `??` — grep
+ * and you will find six — but never over a DEPENDENCY: each one defaults a field of a ROW or of
+ * the sender's answer (`prepared?.to ?? email.toEmail`, `sendError ?? 'Unknown email error'`).
+ * The one `??` in this file with a production dependency on its right is `queueEmail`'s
+ * `options.client ?? db`, and it is a different situation for a stated reason: `queueEmail` has
+ * ONE optional dependency and no sender at all, so there is no second value for a caller's client
+ * to be recombined with. See the comment there.
+ *
+ * AND IT RETURNS A SNAPSHOT, NEVER THE CALLER'S OBJECT (o3d-alnk r7, Codex HIGH 2). This used to
+ * end `return harness as unknown as EmailOutboxHarness` — it validated `harness[member]` and then
+ * handed the ORIGINAL back, so the drain's destructuring read every member A SECOND TIME. A
+ * getter, an accessor on a class, a Proxy or a lazily-memoising object may answer differently on
+ * that second read, and the pairing it buys is the worst one available: a fake client during
+ * validation, the PRODUCTION client during the drain, combined with the fake sender the check
+ * approved. Real customer email stamped SENT with nothing delivered — the exact damage this whole
+ * surface exists to prevent, reached WITHOUT a hostile caller, because accessors, proxies and lazy
+ * memoisation are ordinary JavaScript.
+ *
+ * TIME-OF-CHECK/TIME-OF-USE IS THE GENERAL FORM OF EVERY HIGH ON THIS BRANCH: READ THE FACT ONCE,
+ * AND USE THAT READING EVERYWHERE. Never re-ask a source that is free to answer differently. So
+ * each member is read EXACTLY ONCE here, every check runs against that single reading, and the
+ * value returned is a fresh plain object holding those readings. Nothing downstream ever touches
+ * the caller's object again.
+ *
+ * WHERE THE SNAPSHOT STOPS, AND WHY THERE. It holds precisely what the check LOOKED AT: the five
+ * members, plus — because the client's shape is probed here — the two delegates that probe reads.
+ * `client.emailOutbox` is otherwise re-read on every terminal write (`settleClaimedEmail`) and
+ * `client.emailSuppression` once per row, which is the same defect one level down. Below that the
+ * check looks at nothing (it never inspects `findMany`), so re-reading there is ordinary use of a
+ * value, not a re-ask of a checked one. The rule is statable in one line: EVERY VALUE THE CHECK
+ * READ IS IN THE SNAPSHOT, AND NO VALUE THE CHECK READ IS EVER READ AGAIN FROM THE CALLER.
  *
  * THE PRODUCTION SET IS BUILT HERE AND ONLY HERE, in one object literal, from the module's own
  * imports. No caller value can reach it, because a caller value never enters this branch.
@@ -375,10 +485,10 @@ export function resolveEmailOutboxDependencies(options: ProcessEmailOutboxOption
   // Ignoring them would be SAFE (they are no longer read, so the drain would simply run pure
   // production) and would be the worst outcome available: a test that believes it injected a fake
   // sender, silently sweeping the real queue with the real mailer.
-  const strays = Object.keys(candidate as Record<string, unknown>).filter((key) => key !== 'harness')
+  const strays = ownMemberNames(candidate, 'the options object').filter((key) => key !== 'harness')
   if (strays.length > 0) {
     refuseEmailOutboxOptions(
-      `unknown option(s) ${strays.map((key) => JSON.stringify(key)).join(', ')}; dependencies are no `
+      `unknown option(s) ${strays.map(describeKey).join(', ')}; dependencies are no `
       + 'longer spelled one per field, which is the shape that produced eight distinct recombinations',
     )
   }
@@ -401,14 +511,22 @@ export function resolveEmailOutboxDependencies(options: ProcessEmailOutboxOption
   }
   const harness = given as Record<string, unknown>
 
-  const extra = Object.keys(harness).filter(
-    (key) => !(EMAIL_OUTBOX_HARNESS_MEMBERS as readonly string[]).includes(key),
+  const extra = ownMemberNames(harness, '`harness`').filter(
+    (key) => typeof key !== 'string' || !(EMAIL_OUTBOX_HARNESS_MEMBERS as readonly string[]).includes(key),
   )
   if (extra.length > 0) {
-    refuseEmailOutboxOptions(`\`harness\` carries unknown member(s) ${extra.map((key) => JSON.stringify(key)).join(', ')}`)
+    refuseEmailOutboxOptions(`\`harness\` carries unknown member(s) ${extra.map(describeKey).join(', ')}`)
   }
 
+  /**
+   * THE ONE READING OF EACH MEMBER, AND THE ONLY THING ANY CONSUMER EVER SEES. Filled below and
+   * copied into the returned literal; the caller's `harness` is not read again after this loop.
+   */
+  const validated: Record<string, unknown> = {}
+
   for (const member of EMAIL_OUTBOX_HARNESS_MEMBERS) {
+    // THE ONLY READ. Every check below interrogates `value`, and `value` is what is returned —
+    // so a getter that answers differently the second time has no second time (r7 HIGH 2).
     const value = harness[member]
     if (value === undefined || value === null) {
       refuseEmailOutboxOptions(
@@ -428,7 +546,7 @@ export function resolveEmailOutboxDependencies(options: ProcessEmailOutboxOption
     // answerable by identity alone, and the shape probe below is NOT: reading `.emailOutbox` off
     // the global Prisma client instantiates a delegate, and off a test's tripwire double it fires
     // the tripwire — so a `client: db` refusal has to happen before anything touches it.
-    if (member in EMAIL_OUTBOX_PRODUCTION_DEPENDENCIES && value === EMAIL_OUTBOX_PRODUCTION_DEPENDENCIES[member]) {
+    if (Object.hasOwn(EMAIL_OUTBOX_PRODUCTION_DEPENDENCIES, member) && value === EMAIL_OUTBOX_PRODUCTION_DEPENDENCIES[member]) {
       refuseEmailOutboxOptions(
         `\`harness.${member}\` IS the production dependency it replaces; a harness is the caller's own `
         + 'world, and naming a production value inside one rebuilds by hand the mixture this shape exists to forbid',
@@ -440,21 +558,48 @@ export function resolveEmailOutboxDependencies(options: ProcessEmailOutboxOption
         refuseEmailOutboxOptions(`\`harness.client\` must be a client object; received ${typeof value}`)
       }
       const clientValue = value as Record<string, unknown>
-      for (const model of ['emailOutbox', 'emailSuppression'] as const) {
-        const delegate = clientValue[model]
+      // The delegates are snapshotted for the same reason the members are. Without this,
+      // `settleClaimedEmail` re-reads `client.emailOutbox` on EVERY terminal write and the drain
+      // re-reads `client.emailSuppression` once per row — so a client whose delegate is an
+      // accessor could pass the probe as a fixture and then serve the production delegate to the
+      // writes. Same defect, one level down.
+      const readDelegate = (model: string): object => {
+        const delegate = clientValue[model] // THE ONLY READ of this delegate.
         if (delegate === null || typeof delegate !== 'object') {
           refuseEmailOutboxOptions(
             `\`harness.client.${model}\` is missing; this is not a client the drain can use, and a `
             + 'partial one fails at the first query rather than here',
           )
         }
+        return delegate as object
       }
-    } else if (typeof value !== 'function') {
+      // A TYPED LITERAL, not a bag of names. Add a third delegate to `EmailOutboxClient` and this
+      // stops compiling — which is the only thing that stops a new delegate being quietly re-read
+      // off the caller's client for ever, since the returned snapshot is cast.
+      const snapshotClient: EmailOutboxClient = {
+        emailOutbox: readDelegate('emailOutbox') as EmailOutboxClient['emailOutbox'],
+        emailSuppression: readDelegate('emailSuppression') as EmailOutboxClient['emailSuppression'],
+      }
+      validated[member] = snapshotClient
+      continue
+    }
+
+    if (typeof value !== 'function') {
       refuseEmailOutboxOptions(`\`harness.${member}\` must be a function; received ${typeof value}`)
     }
+    validated[member] = value
   }
 
-  return harness as unknown as EmailOutboxHarness
+  // A FRESH OBJECT, MEMBER BY MEMBER, out of the readings taken above. Spelled out rather than
+  // spread so that adding a member to `EmailOutboxHarness` without snapshotting it does not
+  // compile — the failure mode of a snapshot is a member that quietly stayed behind.
+  return {
+    client: validated.client as EmailOutboxClient,
+    sendEmail: validated.sendEmail as EmailOutboxHarness['sendEmail'],
+    prepareQueuedEmail: validated.prepareQueuedEmail as EmailOutboxHarness['prepareQueuedEmail'],
+    logActivity: validated.logActivity as EmailOutboxHarness['logActivity'],
+    now: validated.now as EmailOutboxHarness['now'],
+  }
 }
 
 export async function processPendingEmailOutbox(
@@ -566,7 +711,17 @@ export async function processPendingEmailOutbox(
         attachments,
       })
 
-      if (sendResult.success) {
+      // ONE READING OF THE SENDER'S ANSWER, for the same reason the harness is snapshotted above
+      // (r7 HIGH 2). `sendResult` is a value the CALLER'S sender built; `error` in particular used
+      // to be read three times, in three writes that must agree about what went wrong. A field
+      // that decides a branch and is then re-read to act on that branch is the shape this branch
+      // has spent a round removing, so it is not left standing here either.
+      const delivered = sendResult.success
+      const reportedPermanent = !!sendResult.permanent
+      const invalidRecipient = !!sendResult.invalidRecipient
+      const sendError = sendResult.error
+
+      if (delivered) {
         const settled = await settleClaimedEmail(client, claim, {
           status: 'SENT',
           sentAt: now(),
@@ -579,18 +734,19 @@ export async function processPendingEmailOutbox(
       }
 
       const attempts = email.attempts + 1
-      const permanentFailure = !!sendResult.permanent || attempts >= EMAIL_MAX_ATTEMPTS
-      if (sendResult.invalidRecipient) {
+      const permanentFailure = reportedPermanent || attempts >= EMAIL_MAX_ATTEMPTS
+      if (invalidRecipient) {
+        const suppressionReason = sendError ?? 'Invalid recipient rejected by SMTP provider'
         await client.emailSuppression.upsert({
           where: { email: normalizedRecipient },
           create: {
             email: normalizedRecipient,
-            reason: sendResult.error ?? 'Invalid recipient rejected by SMTP provider',
+            reason: suppressionReason,
             source: 'smtp',
             lastHitAt: now(),
           },
           update: {
-            reason: sendResult.error ?? 'Invalid recipient rejected by SMTP provider',
+            reason: suppressionReason,
             source: 'smtp',
             lastHitAt: now(),
           },
@@ -599,7 +755,7 @@ export async function processPendingEmailOutbox(
       const settled = await settleClaimedEmail(client, claim, {
         status: permanentFailure ? 'FAILED' : 'PENDING',
         attempts,
-        lastError: sendResult.error ?? 'Unknown email error',
+        lastError: sendError ?? 'Unknown email error',
         availableAt: permanentFailure ? email.availableAt : new Date(now().getTime() + getBackoffMs(email.attempts)),
         processingStartedAt: null,
       })

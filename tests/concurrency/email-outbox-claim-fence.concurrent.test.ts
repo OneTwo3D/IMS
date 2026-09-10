@@ -866,6 +866,14 @@ test(
        * asserted: the failure is injected at exactly that point and the database is then shown to be
        * gone from `pg_database`.
        *
+       * A SECOND CATCHABLE WINDOW WAS CLOSED IN r7, AND IT IS NOT PROVED HERE. If PostgreSQL
+       * executes `CREATE DATABASE` and the connection dies before the response arrives, the
+       * provision rejects with the database already made; `provisionThrowawayDatabase` now
+       * reclaims it over a fresh maintenance connection. That one is proved in
+       * `tests/throwaway-database-guard.test.ts` against a module-mocked `pg` wire, because it
+       * needs a server that loses a response on demand — and because a proof that only runs in
+       * this opt-in lane is a proof that mostly does not run.
+       *
        * THE REMAINING HOLE IS DEMONSTRATED TOO, NOT WAVED AT. A process that is SIGKILLed — a hard
        * runner timeout, an OOM kill, the machine losing power — runs no `finally`, no `catch` and no
        * exit handler. The child below provisions a database and kills itself, and the parent then

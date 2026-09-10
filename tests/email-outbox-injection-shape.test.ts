@@ -359,9 +359,16 @@ test('NON-VACUITY: the legal shapes resolve, and to DIFFERENT dependency sets', 
   const harness = completeHarness(spy.client)
   reached.length = 0
 
-  // (b) A HARNESS resolves to ITSELF, member for member. Nothing is blended in.
+  // (b) A HARNESS resolves to the CALLER'S OWN VALUES, member for member. Nothing is blended in.
+  //
+  // `client` is compared by DELEGATE rather than by identity because r7 HIGH 2 made the resolver
+  // return a SNAPSHOT: the object is fresh, and it carries the two delegates the check read —
+  // which are the values `settleClaimedEmail` and the suppression lookup would otherwise re-read
+  // off the caller's client on every write.
   const injected = resolveEmailOutboxDependencies({ harness })
-  assert.equal(injected.client, spy.client)
+  assert.notEqual(injected.client as unknown, spy.client as unknown, 'the resolver handed back the caller\'s own object')
+  assert.equal(injected.client.emailOutbox, spy.client.emailOutbox)
+  assert.equal(injected.client.emailSuppression, spy.client.emailSuppression)
   assert.equal(injected.sendEmail, fakeSender)
   assert.equal(injected.prepareQueuedEmail, fakePrepare)
   assert.equal(injected.logActivity, fakeLog)
@@ -396,4 +403,335 @@ test('NON-VACUITY: the legal shapes resolve, and to DIFFERENT dependency sets', 
       `${member} is the same value in both sets, so the sets are not disjoint`,
     )
   }
+})
+
+// ===========================================================================================
+// ROUND 7 — TIME-OF-CHECK/TIME-OF-USE. The guard has to READ EACH FACT ONCE, and it has to be
+// able to SEE every fact that is there. Both r7 HIGHs were that one sentence broken.
+// ===========================================================================================
+
+/**
+ * A client that WORKS, unlike `spyClient` above, because these proofs have to let the drain RUN.
+ * "Refused before the first query" is not the property here — "the drain that ran never touched a
+ * production dependency, even though the harness offered it one on the second read" is.
+ */
+function workingClient(rows: { id: string; status: string }[]): {
+  client: EmailOutboxClient
+  store: Record<string, Record<string, unknown>>
+} {
+  const store: Record<string, Record<string, unknown>> = {}
+  for (const row of rows) {
+    store[row.id] = {
+      id: row.id,
+      kind: 'ACCOUNTING_INVOICE',
+      toEmail: 'fixture@example.invalid',
+      subject: 'fixture',
+      html: '<p>fixture</p>',
+      attachments: null,
+      referenceType: 'SalesOrder',
+      referenceId: row.id,
+      status: row.status,
+      attempts: 0,
+      availableAt: new Date('2026-01-01T00:00:00.000Z'),
+      processingStartedAt: null,
+      lockedBy: null,
+    }
+  }
+  return {
+    store,
+    client: {
+      emailOutbox: {
+        async findMany() {
+          return Object.values(store)
+            .filter((row) => row.status === 'PENDING')
+            .map((row) => ({ ...row })) as never
+        },
+        async updateMany(args: unknown) {
+          const { where, data } = args as { where: Record<string, unknown>; data: Record<string, unknown> }
+          const row = store[String(where.id)]
+          if (!row) return { count: 0 }
+          // Only the fencing columns matter for these proofs; the full predicate is exercised by
+          // tests/email-outbox-claim-fence.test.ts.
+          if ('lockedBy' in where && row.lockedBy !== where.lockedBy) return { count: 0 }
+          Object.assign(row, data)
+          return { count: 1 }
+        },
+        async create() { return {} },
+      },
+      emailSuppression: {
+        async findUnique() { return null },
+        async upsert() { return {} },
+      },
+    } as unknown as EmailOutboxClient,
+  }
+}
+
+/**
+ * A HARNESS THAT ANSWERS DIFFERENTLY ON THE SECOND READ — Codex r7 HIGH 2, built.
+ *
+ * Every member is an accessor. The FIRST read hands over the caller's own world (a fixture client,
+ * a fake sender, a fixture clock); every read after that hands over PRODUCTION. Nothing here is
+ * exotic: a class with `get client()`, a Proxy, or an object that memoises lazily behaves exactly
+ * like this without anybody intending it.
+ *
+ * `reads` is the instrument. The property under test is not "it threw" — it is THE CALLER'S OBJECT
+ * WAS READ EXACTLY ONCE PER MEMBER, which is what makes the second answer unreachable.
+ */
+function twoFacedHarness(
+  first: EmailOutboxHarness,
+  second: Record<string, unknown>,
+): { harness: object; reads: Record<string, number> } {
+  const reads: Record<string, number> = { client: 0, sendEmail: 0, prepareQueuedEmail: 0, logActivity: 0, now: 0 }
+  const answer = (member: keyof typeof reads): unknown => {
+    reads[member] += 1
+    return reads[member] === 1 ? (first as unknown as Record<string, unknown>)[member] : second[member]
+  }
+  return {
+    reads,
+    harness: {
+      get client() { return answer('client') },
+      get sendEmail() { return answer('sendEmail') },
+      get prepareQueuedEmail() { return answer('prepareQueuedEmail') },
+      get logActivity() { return answer('logActivity') },
+      get now() { return answer('now') },
+    },
+  }
+}
+
+test('r7 HIGH 2: a harness that flips to PRODUCTION on the second read is read only ONCE', async () => {
+  const { resolveEmailOutboxDependencies } = await loadOutbox()
+  const [{ db }, { sendEmail }, { prepareQueuedEmail }, { logActivity }] = await Promise.all([
+    import('@/lib/db'),
+    import('@/lib/mailer'),
+    import('@/lib/order-email'),
+    import('@/lib/activity-log'),
+  ])
+  reached.length = 0
+
+  const fixture = workingClient([])
+  const { harness, reads } = twoFacedHarness(completeHarness(fixture.client), {
+    client: db,
+    sendEmail,
+    prepareQueuedEmail,
+    logActivity,
+    now: () => new Date('2099-01-01T00:00:00.000Z'),
+  })
+
+  const resolved = resolveEmailOutboxDependencies({ harness } as unknown as ProcessEmailOutboxOptions)
+
+  // (a) EXACTLY ONE READ PER MEMBER. This is the whole fix stated as a measurement: the validated
+  // reading is what is returned, so there is no second read for the second answer to ride in on.
+  assert.deepEqual(
+    reads,
+    { client: 1, sendEmail: 1, prepareQueuedEmail: 1, logActivity: 1, now: 1 },
+    `the resolver read the caller's harness more than once: ${JSON.stringify(reads)}`,
+  )
+
+  // (b) AND THE SNAPSHOT HOLDS THE FIRST ANSWERS, not the production ones the getters were poised
+  // to serve. `client` is a fresh object by design — identity is asserted per DELEGATE, because
+  // the delegates are what `settleClaimedEmail` and the suppression lookup re-read.
+  assert.notEqual(resolved.client as unknown, db as unknown, 'the snapshot carried the production client')
+  assert.equal(resolved.client.emailOutbox, fixture.client.emailOutbox)
+  assert.equal(resolved.client.emailSuppression, fixture.client.emailSuppression)
+  assert.equal(resolved.sendEmail, fakeSender)
+  assert.equal(resolved.prepareQueuedEmail, fakePrepare)
+  assert.equal(resolved.logActivity, fakeLog)
+  assert.equal(resolved.now().toISOString(), '2026-09-10T09:00:00.000Z')
+
+  // (c) RESOLVING TOUCHED NO PRODUCTION DEPENDENCY. `db` is a Proxy that tripwires on ANY property
+  // read, so had the resolver read `client` a second time this would name it.
+  assert.deepEqual(reached, [], `resolution reached ${reached.join(', ')}`)
+})
+
+test('r7 HIGH 2: the DRAIN consumes only the snapshot — a two-faced harness cannot reach production', async () => {
+  const { processPendingEmailOutbox: drain } = await loadOutbox()
+  const [{ db }, { sendEmail }, { prepareQueuedEmail }, { logActivity }] = await Promise.all([
+    import('@/lib/db'),
+    import('@/lib/mailer'),
+    import('@/lib/order-email'),
+    import('@/lib/activity-log'),
+  ])
+  reached.length = 0
+
+  // A real row to work on, so the drain runs its whole body: findMany, claim, suppression lookup,
+  // prepare, send, terminal write, activity log. Every one of those is a chance to re-read.
+  const fixture = workingClient([{ id: 'row-1', status: 'PENDING' }])
+  const delivered: string[] = []
+  const recordingSender = async (message: { to: string }) => {
+    delivered.push(message.to)
+    return { success: true as const }
+  }
+
+  const { harness, reads } = twoFacedHarness(
+    { ...completeHarness(fixture.client), sendEmail: recordingSender },
+    { client: db, sendEmail, prepareQueuedEmail, logActivity, now: () => new Date('2099-01-01T00:00:00.000Z') },
+  )
+
+  const result = await drain({ harness } as unknown as ProcessEmailOutboxOptions)
+
+  // THE ASSERTION THAT MATTERS COMES FIRST, and it is about WHAT DID NOT HAPPEN. Without the
+  // snapshot the drain re-reads `client` and gets the GLOBAL database, then stamps whatever it
+  // finds SENT through the fake sender it was handed at validation time.
+  assert.deepEqual(reached, [], `the drain reached ${reached.join(', ')} through the second read`)
+  assert.deepEqual(
+    reads,
+    { client: 1, sendEmail: 1, prepareQueuedEmail: 1, logActivity: 1, now: 1 },
+    `the drain re-read the caller's harness: ${JSON.stringify(reads)}`,
+  )
+
+  // NON-VACUITY: the drain really ran, against the FIXTURE, all the way to a delivery and a SENT
+  // row. A green above with nothing processed would prove nothing at all.
+  assert.deepEqual(result, { processed: 1, sent: 1, failed: 0, conflicted: 0 })
+  assert.deepEqual(delivered, ['fixture@example.invalid'])
+  assert.equal(fixture.store['row-1'].status, 'SENT')
+})
+
+/**
+ * MEMBERS WITH NOWHERE TO HIDE — Codex r7 HIGH 1, built.
+ *
+ * Each shape below carries a `sendEmail` (or a `harness`) that a property READ resolves and that
+ * `Object.keys` cannot see. The old guard therefore found an EMPTY options object, concluded "no
+ * harness", and ran the GLOBAL database through the REAL mailer — while the caller believed they
+ * had injected a fake. The refusal must arrive instead, and it must arrive before any query.
+ */
+const HIDDEN_MEMBER_SHAPES: { name: string; build: () => object; expect: RegExp }[] = [
+  {
+    name: 'Object.create({ sendEmail: fake }) — the member lives on the PROTOTYPE',
+    build: () => Object.create({ sendEmail: fakeSender }) as object,
+    expect: /the options object must be a PLAIN object/,
+  },
+  {
+    name: 'a NON-ENUMERABLE `sendEmail` on an ordinary object',
+    build: () => {
+      const options = {}
+      Object.defineProperty(options, 'sendEmail', { value: fakeSender, enumerable: false, configurable: true })
+      return options
+    },
+    expect: /unknown option\(s\) "sendEmail"/,
+  },
+  {
+    name: 'a NON-ENUMERABLE `sendEmail` on a NULL-prototype object (a prototype rule alone misses this)',
+    build: () => {
+      const options = Object.create(null) as object
+      Object.defineProperty(options, 'sendEmail', { value: fakeSender, enumerable: false, configurable: true })
+      return options
+    },
+    expect: /unknown option\(s\) "sendEmail"/,
+  },
+  {
+    name: 'a class instance whose `harness` is a prototype accessor — the BUILDER accident',
+    build: () => {
+      class HarnessBuilder {
+        get harness(): unknown { return { sendEmail: fakeSender } }
+      }
+      return new HarnessBuilder()
+    },
+    expect: /the options object must be a PLAIN object/,
+  },
+  {
+    name: 'a SYMBOL-keyed member, which `Object.keys` never reports',
+    build: () => ({ [Symbol.for('sendEmail')]: fakeSender }),
+    expect: /unknown option\(s\) Symbol\(sendEmail\)/,
+  },
+  {
+    name: 'a harness built on a PROTOTYPE carrying the members',
+    build: () => ({ harness: Object.create(completeHarness(spyClient().client)) as object }),
+    expect: /`harness` must be a PLAIN object/,
+  },
+  {
+    name: 'a harness carrying a NON-ENUMERABLE extra member',
+    build: () => {
+      const harness: Record<string, unknown> = { ...completeHarness(spyClient().client) }
+      Object.defineProperty(harness, 'referenceIdPrefix', { value: 'alnk-', enumerable: false, configurable: true })
+      return { harness }
+    },
+    expect: /`harness` carries unknown member\(s\) "referenceIdPrefix"/,
+  },
+]
+
+for (const shape of HIDDEN_MEMBER_SHAPES) {
+  test(`r7 HIGH 1: REFUSED, not silently run against production: ${shape.name}`, async () => {
+    const { processPendingEmailOutbox: drain } = await loadOutbox()
+    reached.length = 0
+
+    const refusal = await drain(shape.build() as unknown as ProcessEmailOutboxOptions)
+      .then(() => null, (error: unknown) => error)
+
+    // FIRST, AND IT IS THE POINT OF THE FINDING. The old failure was not "no throw" — it was the
+    // drain sweeping the GLOBAL queue with the REAL mailer while the caller thought otherwise.
+    assert.deepEqual(
+      reached,
+      [],
+      `the hidden member read as "no harness" and the drain ran PRODUCTION: ${reached.join(', ')}`,
+    )
+    assert.ok(refusal instanceof Error, 'the hidden member was accepted as "no harness" — that means production')
+    assert.match(refusal.message, shape.expect)
+  })
+}
+
+test('r7 HIGH 1 NON-VACUITY: the plain-object rule refuses hidden members, not ordinary callers', async () => {
+  const { resolveEmailOutboxDependencies } = await loadOutbox()
+  reached.length = 0
+  const spy = spyClient()
+
+  // The two shapes every real caller uses: `{}` from the default parameter, and an object literal
+  // carrying a literal harness. Both have `Object.prototype`, so both resolve.
+  assert.doesNotThrow(() => resolveEmailOutboxDependencies({}))
+  assert.doesNotThrow(() => resolveEmailOutboxDependencies({ harness: completeHarness(spy.client) }))
+
+  // And a NULL prototype is allowed too — it inherits nothing, so its own keys ARE its members.
+  const bare = Object.create(null) as Record<string, unknown>
+  bare.harness = Object.assign(Object.create(null) as object, completeHarness(spy.client))
+  assert.doesNotThrow(() => resolveEmailOutboxDependencies(bare as unknown as ProcessEmailOutboxOptions))
+
+  assert.deepEqual(reached, [], `resolution reached ${reached.join(', ')}`)
+  assert.deepEqual(spy.queries, [])
+})
+
+test('r7 HIGH 2, one level down: the CLIENT DELEGATES are read once too', async () => {
+  const { processPendingEmailOutbox: drain } = await loadOutbox()
+  reached.length = 0
+
+  // `settleClaimedEmail` reads `client.emailOutbox` on EVERY terminal write and the drain reads
+  // `client.emailSuppression` once per row, so a client whose delegates are accessors is the same
+  // time-of-check/time-of-use one level below the harness: pass the probe as a fixture, serve the
+  // real delegate to the writes. The delegates the probe read are therefore snapshotted as well.
+  const fixture = workingClient([{ id: 'row-1', status: 'PENDING' }])
+  const delegateReads = { emailOutbox: 0, emailSuppression: 0 }
+  const poison = (what: string): unknown => new Proxy({}, { get: () => tripwire(`a POISONED ${what} delegate`) })
+
+  const twoFacedClient = {
+    get emailOutbox() {
+      delegateReads.emailOutbox += 1
+      return delegateReads.emailOutbox === 1 ? fixture.client.emailOutbox : poison('emailOutbox')
+    },
+    get emailSuppression() {
+      delegateReads.emailSuppression += 1
+      return delegateReads.emailSuppression === 1 ? fixture.client.emailSuppression : poison('emailSuppression')
+    },
+  } as unknown as EmailOutboxClient
+
+  const delivered: string[] = []
+  const result = await drain({
+    harness: {
+      ...completeHarness(twoFacedClient),
+      sendEmail: async (message: { to: string }) => {
+        delivered.push(message.to)
+        return { success: true as const }
+      },
+    },
+  } as unknown as ProcessEmailOutboxOptions)
+
+  assert.deepEqual(reached, [], `the drain re-read a delegate and got ${reached.join(', ')}`)
+  assert.deepEqual(
+    delegateReads,
+    { emailOutbox: 1, emailSuppression: 1 },
+    `the drain re-read the caller's client: ${JSON.stringify(delegateReads)}`,
+  )
+
+  // NON-VACUITY: the drain ran the whole body against the fixture — findMany, the claim, the
+  // suppression lookup and the fenced terminal write are four separate delegate uses.
+  assert.deepEqual(result, { processed: 1, sent: 1, failed: 0, conflicted: 0 })
+  assert.deepEqual(delivered, ['fixture@example.invalid'])
+  assert.equal(fixture.store['row-1'].status, 'SENT')
 })

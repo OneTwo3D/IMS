@@ -291,6 +291,12 @@ test('ROUND 7: the outbox really does terminalise a row FAILED for a suppressed 
   const sender = await readFile(path.join(process.cwd(), 'lib/email-outbox.ts'), 'utf8')
   assert.match(sender, /emailSuppression\.findUnique/, 'the suppression lookup')
   assert.match(sender, /status: 'FAILED',\s*\n\s*lastError: `Suppressed recipient/, 'which terminalises the row FAILED')
-  assert.match(sender, /const permanentFailure = !!sendResult\.permanent \|\| attempts >= EMAIL_MAX_ATTEMPTS/)
+  // o3d-alnk r7 moved the READ of the sender's answer above the branch — every field of
+  // `sendResult` is now taken once and used from a local, so a caller-supplied sender cannot
+  // answer differently on the second read. The claim this guard makes is unchanged, so BOTH
+  // halves are asserted: where the permanence flag comes FROM, and what it decides. Asserting
+  // only the second would let the derivation be quietly dropped.
+  assert.match(sender, /const reportedPermanent = !!sendResult\.permanent/, "the sender's own permanence flag")
+  assert.match(sender, /const permanentFailure = reportedPermanent \|\| attempts >= EMAIL_MAX_ATTEMPTS/)
   assert.match(sender, /status: permanentFailure \? 'FAILED' : 'PENDING'/)
 })
