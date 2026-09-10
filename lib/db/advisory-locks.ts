@@ -262,6 +262,34 @@ export const ACCOUNTING_MONEY_POST_LOCK_NAMESPACE = 411_220_870
  */
 export const SESSION_LOCK_SPACE_PROBE_NAMESPACE = SESSION_LOCK_SPACE_PROBE_NAMESPACE_FROM_URL_SCHEMA
 
+/**
+ * The namespace a THROWAWAY TEST DATABASE is provisioned under (o3d-alnk r9).
+ *
+ * `tests/helpers/throwaway-database.ts` creates a database per concurrency lane. The probe that
+ * asks whether the name is free and the `CREATE DATABASE` that takes it are two statements, and
+ * nothing used to hold the name between them: two provisioners could both see it absent, one won
+ * the CREATE, and the loser — whose answer never arrived — reclaimed by dropping the WINNER'S
+ * database. This namespace is what holds the name across the probe, the CREATE and the cleanup
+ * decision, keyed on a stable hash of the database name so two lanes with different names never
+ * contend.
+ *
+ * SESSION-scoped, on a connection of its own, and it has to be both. `pg_advisory_xact_lock` is
+ * unusable here because `CREATE DATABASE` cannot run inside a transaction block (SQLSTATE 25001),
+ * and a lock taken on the connection that issues the CREATE dies with exactly the connection
+ * whose death is the case being closed.
+ *
+ * Registered here rather than written down in the test because the o3d-4ajo rule is about the
+ * VALUE being single-sourced, not about which tree the taker lives in: a namespace nothing
+ * compares is how the original collision happened.
+ */
+// 873, not 872: 872 is what `lib/db/database-url-schema.mjs` declares for
+// SESSION_LOCK_SPACE_PROBE_NAMESPACE, which this registry re-exports rather than
+// declares — so "the next number after 871" collided with a namespace that is
+// already live. The distinctness test below is what caught it, which is the
+// o3d-4ajo failure happening and being refused instead of shipping.
+export const THROWAWAY_DATABASE_PROVISION_LOCK_NAMESPACE = 411_220_873
+
+
 export const TWO_INT_ADVISORY_LOCK_NAMESPACES = {
   WC_PRODUCT_WRITE_LOCK_NAMESPACE,
   DISPATCH_SWEEP_LOCK_NAMESPACE,
@@ -271,4 +299,5 @@ export const TWO_INT_ADVISORY_LOCK_NAMESPACES = {
   ACCOUNTING_MONEY_POST_LOCK_NAMESPACE,
   XERO_INVOICE_NUMBER_SLOT_LOCK_NAMESPACE,
   SESSION_LOCK_SPACE_PROBE_NAMESPACE,
+  THROWAWAY_DATABASE_PROVISION_LOCK_NAMESPACE,
 } as const
