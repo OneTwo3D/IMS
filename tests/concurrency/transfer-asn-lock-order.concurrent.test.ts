@@ -93,46 +93,116 @@ async function rawSession(databaseUrl: string): Promise<RawClient> {
 }
 
 /**
- * Wait until some OTHER backend on this database is blocked on a lock.
+ * ══════════════════════════════════════════════════════════════════════════════
+ * THE WAIT, AND WHY IT IS WRITTEN THIS WAY (6oyu.19, Codex round-10 HIGH-3)
+ * ══════════════════════════════════════════════════════════════════════════════
  *
- * Polls `pg_stat_activity`, which reports the wait as a fact the SERVER observed —
- * not a timer this test hoped was long enough. Scoped to `current_database()`, which
- * is the scratch database, so nothing another session on this box is doing can
- * satisfy it. Deliberately NOT a sleep: a fixed pause would make the whole file
- * timing-dependent, and a fixed pause that was too short would make every tripwire
- * pass vacuously (the path would not have reached its first lock yet, so the ASN row
- * would be free for the wrong reason).
+ * Every tripwire in this file works by holding a row, starting the path, waiting for
+ * the path to BLOCK on that row, and then asking a third session what else the path
+ * is holding. The wait is therefore load-bearing: probe too early and the path has
+ * not reached its first lock, the row under the NOWAIT probe is free for the wrong
+ * reason, and the tripwire reports "conforms" about a path it never observed.
+ *
+ * ROUND 9's WAIT COUNTED LOCK-BLOCKED BACKENDS in the database and returned when the
+ * count rose above a baseline. That is an adjacent property, not the property: `npm
+ * run test:concurrency` runs every file in `tests/concurrency/` as its own process
+ * against ONE database, so any other file that parks a session on a row raises the
+ * count and releases this file's probe early. The proof of the false positive is a
+ * test in this file — `the wait is tied to THIS blocker` below — which stands up an
+ * unrelated blocked pair and shows the round-9 predicate satisfied by it while
+ * nothing at all is running against the fixture under test.
+ *
+ * THE WAIT BELOW NAMES BOTH ENDS instead of counting:
+ *
+ *   · WHICH BACKEND — `pg_blocking_pids(pid)` must contain the pid of the session
+ *     THIS test parked. That session holds one row of one fixture, whose ids are
+ *     unique to this test, so no other file's backend can be blocked by it.
+ *   · ON WHAT — the blocked backend's current statement must name the table the
+ *     tripwire is holding. A path blocked somewhere else entirely is not the
+ *     observation the tripwire needs, and this is what says so.
+ *
+ * It returns the pid it identified, so a caller that needs the NEXT link — "and now
+ * the backend blocked by THAT one" — walks the chain rather than counting again.
  */
-async function waitForABlockedBackend(probe: RawClient, sinceCount: number): Promise<void> {
-  const deadline = Date.now() + BLOCK_WAIT_MS
+
+type BlockedBackend = { pid: number; query: string }
+
+/** This session's own backend pid: the identity a wait is tied to. */
+async function backendPid(session: RawClient): Promise<number> {
+  const { rows } = await session.query('SELECT pg_backend_pid()::int AS pid')
+  return Number(rows[0]!.pid)
+}
+
+/**
+ * Every backend this database currently reports as blocked by one of `blockerPids`.
+ *
+ * `pg_stat_activity.query` is only readable for backends belonging to the SAME role
+ * (or to a superuser / pg_read_all_stats member). Every session in this file connects
+ * with the one DATABASE_URL, so the statement text is visible. If that ever stops
+ * being true the `waitingOn` filter matches nothing and the wait fails loudly on its
+ * budget — the one direction a broken probe is allowed to fail in.
+ */
+async function backendsBlockedBy(probe: RawClient, blockerPids: number[]): Promise<BlockedBackend[]> {
+  const { rows } = await probe.query(
+    `SELECT a.pid::int AS pid, coalesce(a.query, '') AS query
+       FROM pg_stat_activity a
+      WHERE a.datname = current_database()
+        AND a.pid <> pg_backend_pid()
+        AND NOT (a.pid = ANY($1::int[]))
+        AND a.wait_event_type = 'Lock'
+        AND pg_blocking_pids(a.pid) && $1::int[]
+      ORDER BY a.pid`,
+    [blockerPids],
+  )
+  return rows.map((row) => ({ pid: Number(row.pid), query: String(row.query) }))
+}
+
+/**
+ * Block until a backend blocked BY one of `blockedBy` is waiting on a statement that
+ * mentions `waitingOn`, and return it. Never a sleep, and never a population count.
+ */
+async function waitForBlockedBackend(probe: RawClient, params: {
+  blockedBy: number[]
+  waitingOn: RegExp
+  /** Backends already identified in this chain, which must not be re-reported. */
+  exclude?: number[]
+  budgetMs?: number
+  describe: string
+}): Promise<BlockedBackend> {
+  const exclude = params.exclude ?? []
+  const deadline = Date.now() + (params.budgetMs ?? BLOCK_WAIT_MS)
   for (;;) {
-    const { rows } = await probe.query(
-      `SELECT count(*)::int AS blocked
-         FROM pg_stat_activity
-        WHERE datname = current_database()
-          AND wait_event_type = 'Lock'
-          AND pid <> pg_backend_pid()`,
-    )
-    if (Number(rows[0]!.blocked) > sinceCount) return
+    const blocked = (await backendsBlockedBy(probe, params.blockedBy))
+      .filter((backend) => !exclude.includes(backend.pid) && params.waitingOn.test(backend.query))
+    if (blocked.length > 0) return blocked[0]!
     if (Date.now() > deadline) {
       throw new Error(
-        'no backend became lock-blocked within the wait budget. The path under test never reached the ' +
-        'row lock the tripwire holds, so this tripwire would prove nothing about acquisition order.',
+        `${params.describe}: no backend blocked by ${params.blockedBy.join('/')} was waiting on `
+        + `${params.waitingOn} within the wait budget. The path under test never reached that row lock, so `
+        + 'this tripwire would prove nothing about acquisition order.',
       )
     }
     await new Promise((resolve) => setTimeout(resolve, 25))
   }
 }
 
-async function blockedBackendCount(probe: RawClient): Promise<number> {
+/**
+ * THE ROUND-9 PREDICATE, kept only as the negative control.
+ *
+ * Nothing waits on this any more. It survives because the test that proves the new
+ * wait is specific has to be able to show the old one firing on a backend that has
+ * nothing to do with the path under test, and the only honest way to show that is to
+ * evaluate the round-9 predicate itself.
+ */
+async function lockBlockedBackendPids(probe: RawClient): Promise<number[]> {
   const { rows } = await probe.query(
-    `SELECT count(*)::int AS blocked
+    `SELECT pid::int AS pid
        FROM pg_stat_activity
       WHERE datname = current_database()
         AND wait_event_type = 'Lock'
         AND pid <> pg_backend_pid()`,
   )
-  return Number(rows[0]!.blocked)
+  return rows.map((row) => Number(row.pid))
 }
 
 /**
@@ -310,7 +380,7 @@ async function acquiresTransferBeforeAsnLine(params: {
   const blocker = await rawSession(params.databaseUrl)
   const probe = await rawSession(params.databaseUrl)
   try {
-    const baseline = await blockedBackendCount(probe)
+    const blockerPid = await backendPid(blocker)
     await blocker.query('BEGIN')
     await blocker.query('SELECT id FROM stock_transfers WHERE id = $1 FOR UPDATE', [params.transferId])
 
@@ -321,8 +391,14 @@ async function acquiresTransferBeforeAsnLine(params: {
       (error) => { runError = error },
     )
 
-    // The path is now genuinely waiting on the transfer row the blocker holds.
-    await waitForABlockedBackend(probe, baseline)
+    // THE path is now genuinely waiting on THE transfer row THIS blocker holds —
+    // both halves named, so no other file's parked session can release the probe
+    // (Codex round-10 HIGH-3).
+    await waitForBlockedBackend(probe, {
+      blockedBy: [blockerPid],
+      waitingOn: /stock_transfers/i,
+      describe: 'transfer-before-ASN tripwire',
+    })
 
     let transferFirst: boolean
     await probe.query('BEGIN')
@@ -380,7 +456,7 @@ test(
     let blockerError: unknown = null
 
     try {
-      const baseline = await blockedBackendCount(probe)
+      const blockerPid = await backendPid(blocker)
       await blocker.query('BEGIN')
       await blocker.query('SELECT id FROM stock_transfers WHERE id = $1 FOR UPDATE', [seeded.transfer.id])
 
@@ -388,7 +464,11 @@ test(
         (value) => { bookedInOutcome = value },
         (error) => { bookedInError = error },
       )
-      await waitForABlockedBackend(probe, baseline)
+      await waitForBlockedBackend(probe, {
+        blockedBy: [blockerPid],
+        waitingOn: /stock_transfers/i,
+        describe: 'deadlock-cycle probe',
+      })
 
       // The second half of the cycle. On the old order this is where Postgres has to
       // choose a victim.
@@ -603,7 +683,7 @@ async function acquiresAsnLineBeforeStockLevel(params: {
   const blocker = await rawSession(params.databaseUrl)
   const probe = await rawSession(params.databaseUrl)
   try {
-    const baseline = await blockedBackendCount(probe)
+    const blockerPid = await backendPid(blocker)
     await blocker.query('BEGIN')
     await blocker.query(
       'SELECT id FROM stock_levels WHERE "productId" = $1 AND "warehouseId" = $2 FOR UPDATE',
@@ -611,7 +691,11 @@ async function acquiresAsnLineBeforeStockLevel(params: {
     )
 
     const running = params.run().then(() => {}, () => {})
-    await waitForABlockedBackend(probe, baseline)
+    await waitForBlockedBackend(probe, {
+      blockedBy: [blockerPid],
+      waitingOn: /stock_levels/i,
+      describe: 'ASN-before-stock tripwire',
+    })
 
     let asnLineFirst: boolean
     await probe.query('BEGIN')
@@ -727,6 +811,153 @@ test(
   },
 )
 
+test(
+  'ALIGNMENT takes wms_asn_line_maps before stock_levels (Codex r10 HIGH-2)',
+  { skip: !RUN && 'set RUN_DB_CONCURRENCY_TESTS=1' },
+  async () => {
+    // THE HOLE ROUND 9 LEFT. Round 9 added this family precisely because the
+    // transfer/ASN tripwire cannot see the ASN lock — a path that takes the transfer
+    // first blocks at its first statement and never reaches either row, so deleting
+    // the hoist left all four of those tests green. Round 9 then wrote the family
+    // for receipt, cancellation, partial receipt and book-in and left ALIGNMENT out,
+    // which put alignment back in exactly the blind spot the family exists to cover:
+    // its `lockWmsAsnLineMaps` was asserted by nothing, and deleting it regressed
+    // alignment to stock-before-ASN against a book-in that goes ASN-before-stock —
+    // the same crossing, on the pair one table down (Codex round-10 HIGH-2).
+    //
+    // Same tripwire as the four above, and the conforming answer is the same 55P03:
+    // when alignment blocks on the destination stock level it must ALREADY be
+    // holding the ASN rows it planned from.
+    const databaseUrl = loadEnv()
+    const seeded = await seedDispatchedTransferWithOpenAsn('alignsl', { destinationStockLevel: true })
+    const { applyMintsoftAlignmentForProduct } =
+      await import('@/lib/connectors/mintsoft/sync/stock-sync')
+    assert.equal(
+      await acquiresAsnLineBeforeStockLevel({
+        databaseUrl,
+        productId: seeded.product.id,
+        warehouseId: seeded.destination.id,
+        asnLineMapId: seeded.asnLineMapId,
+        run: () => applyMintsoftAlignmentForProduct({
+          binding: seeded.binding as never,
+          jobId: `r10-alignsl-${Date.now()}`,
+          productId: seeded.product.id,
+          sku: seeded.tag,
+          delta: LINE_QTY,
+          dryRun: false,
+        }),
+      }),
+      true,
+      'alignment blocked on stock_levels without holding the ASN rows its plan was built from — '
+      + 'that is stock_levels-then-ASN, and the webhook book-in is ASN-then-stock_levels',
+    )
+  },
+)
+
+// ---------------------------------------------------------------------------
+// THE WAIT ITSELF (Codex round-10 HIGH-3)
+// ---------------------------------------------------------------------------
+
+test(
+  'the lock wait is tied to THIS blocker — the round-9 count was not (Codex r10 HIGH-3)',
+  { skip: !RUN && 'set RUN_DB_CONCURRENCY_TESTS=1' },
+  async () => {
+    // Every tripwire in this file is only as good as the moment it probes at, and
+    // round 9 chose that moment by counting lock-blocked backends in the database.
+    // This test is the demonstration that the count is not about the path under
+    // test: it stands up a lock-blocked pair on a DIFFERENT fixture — which is what
+    // another file of `npm run test:concurrency` looks like, since the runner gives
+    // every file its own process against ONE database — and shows the round-9
+    // predicate satisfied by it while nothing whatsoever is running against this
+    // test's own fixture. Then it shows the replacement refusing that same backend
+    // and accepting only the one genuinely blocked by this test's blocker.
+    const databaseUrl = loadEnv()
+    const mine = await seedDispatchedTransferWithOpenAsn('waitmine')
+    const other = await seedDispatchedTransferWithOpenAsn('waitother')
+
+    const myBlocker = await rawSession(databaseUrl)
+    const unrelatedHolder = await rawSession(databaseUrl)
+    const unrelatedWaiter = await rawSession(databaseUrl)
+    const probe = await rawSession(databaseUrl)
+    try {
+      const myBlockerPid = await backendPid(myBlocker)
+      const unrelatedHolderPid = await backendPid(unrelatedHolder)
+      const unrelatedWaiterPid = await backendPid(unrelatedWaiter)
+
+      // This test's own blocker, holding this test's own transfer row. NOTHING is
+      // running against it — no path has been started at all.
+      await myBlocker.query('BEGIN')
+      await myBlocker.query('SELECT id FROM stock_transfers WHERE id = $1 FOR UPDATE', [mine.transfer.id])
+
+      // The round-9 baseline, taken exactly where round 9 took it.
+      const baselinePids = await lockBlockedBackendPids(probe)
+
+      // An unrelated pair on an unrelated fixture, blocked on each other.
+      await unrelatedHolder.query('BEGIN')
+      await unrelatedHolder.query('SELECT id FROM stock_transfers WHERE id = $1 FOR UPDATE', [other.transfer.id])
+      await unrelatedWaiter.query('BEGIN')
+      const unrelatedWaiting = unrelatedWaiter
+        .query('SELECT id FROM stock_transfers WHERE id = $1 FOR UPDATE', [other.transfer.id])
+        .then(() => {}, () => {})
+      await waitForBlockedBackend(probe, {
+        blockedBy: [unrelatedHolderPid],
+        waitingOn: /stock_transfers/i,
+        describe: 'the unrelated pair must really be blocked',
+      })
+
+      // (a) THE FALSE POSITIVE, SHOWN RATHER THAN ARGUED. The round-9 population has
+      //     gained a backend since its baseline, so `count > sinceCount` is now true
+      //     and its wait would return here — and the backend that made it true is
+      //     the unrelated waiter, which cannot tell anyone anything about the path
+      //     this test would have been probing.
+      const arrivals = (await lockBlockedBackendPids(probe)).filter((pid) => !baselinePids.includes(pid))
+      assert.ok(
+        arrivals.includes(unrelatedWaiterPid),
+        'expected the unrelated backend to enter the round-9 blocked population and satisfy its count',
+      )
+
+      // (b) THE REPLACEMENT IS NOT SATISFIED BY IT. Same database, same instant, same
+      //     blocked backend — and the wait times out, because that backend is not
+      //     blocked by THIS test's blocker.
+      await assert.rejects(
+        waitForBlockedBackend(probe, {
+          blockedBy: [myBlockerPid],
+          waitingOn: /stock_transfers/i,
+          budgetMs: 750,
+          describe: 'specificity check',
+        }),
+        /never reached that row lock/,
+        'the new wait accepted an unrelated blocked backend — it is the round-9 predicate again',
+      )
+
+      // (c) AND IT IS SATISFIED BY THE REAL THING, while the unrelated pair is still
+      //     blocked: a path that genuinely waits on the row this test's blocker holds
+      //     is identified, by pid, and it is neither of the unrelated sessions.
+      const { receiveTransfer } = await import('@/app/actions/transfers')
+      const running = receiveTransfer(mine.transfer.id).then(() => {}, () => {})
+      const observed = await waitForBlockedBackend(probe, {
+        blockedBy: [myBlockerPid],
+        waitingOn: /stock_transfers/i,
+        describe: 'the real path',
+      })
+      assert.notEqual(observed.pid, unrelatedWaiterPid)
+      assert.notEqual(observed.pid, unrelatedHolderPid)
+      assert.notEqual(observed.pid, myBlockerPid)
+
+      await myBlocker.query('ROLLBACK')
+      await running
+      await unrelatedHolder.query('ROLLBACK')
+      await unrelatedWaiting
+      await unrelatedWaiter.query('ROLLBACK')
+    } finally {
+      await myBlocker.end().catch(() => {})
+      await unrelatedHolder.end().catch(() => {})
+      await unrelatedWaiter.end().catch(() => {})
+      await probe.end().catch(() => {})
+    }
+  },
+)
+
 // ---------------------------------------------------------------------------
 // THE CONCURRENT CANCELLATION RACE (Codex round-9 HIGH-1, o3d-2y5u)
 // ---------------------------------------------------------------------------
@@ -765,7 +996,7 @@ test(
     let alignmentBlocked = false
 
     try {
-      const baseline = await blockedBackendCount(probe)
+      const blockerPid = await backendPid(blocker)
 
       // (1) Park the CANCELLATION mid-transaction, at the source stock level — after
       // it has taken the transfer row and the ASN rows, before it has committed.
@@ -776,7 +1007,14 @@ test(
       )
       const cancelling = cancelDispatchedTransfer(seeded.transfer.id)
         .then((value) => { cancelResult = value })
-      await waitForABlockedBackend(probe, baseline)
+      // Identified, not counted: the backend blocked by THIS blocker, on stock_levels.
+      // Its pid is the next link in the chain — it is the cancellation, and it is
+      // what alignment must be seen to block on below (Codex round-10 HIGH-3).
+      const cancellingBackend = await waitForBlockedBackend(probe, {
+        blockedBy: [blockerPid],
+        waitingOn: /stock_levels/i,
+        describe: 'parking the cancellation',
+      })
 
       // (2) Start the alignment into that window. This is the moment the finding is
       // about: the transfer is still IN_TRANSIT on disk, and a cancellation that
@@ -795,8 +1033,9 @@ test(
 
       // (3) Wait for whichever is true of the code under test, with no fixed pause:
       //
-      //   · WITH the transfer lock, alignment becomes the SECOND lock-blocked
-      //     backend — parked behind the cancellation, having read nothing.
+      //   · WITH the transfer lock, alignment blocks on `stock_transfers` — and
+      //     specifically on the row THE CANCELLATION holds, which is why the wait
+      //     names the cancellation's pid rather than counting blocked backends.
       //   · WITHOUT it (the pre-fix code, and `development`), alignment never blocks
       //     at all: it reads IN_TRANSIT, books the destination stock and lays the
       //     second layer, and SETTLES here.
@@ -804,7 +1043,12 @@ test(
       // Both outcomes are observable facts, so the release below happens at the right
       // moment in either case and the assertions can tell the two apart.
       alignmentBlocked = await Promise.race([
-        waitForABlockedBackend(probe, baseline + 1).then(() => true),
+        waitForBlockedBackend(probe, {
+          blockedBy: [cancellingBackend.pid],
+          waitingOn: /stock_transfers/i,
+          exclude: [cancellingBackend.pid],
+          describe: 'alignment parked behind the cancellation',
+        }).then(() => true),
         aligning.then(() => false),
       ])
 
@@ -892,7 +1136,7 @@ test(
     const probe = await rawSession(databaseUrl)
     let alignResult: { applied?: boolean; correctedQty?: number } | null = null
     try {
-      const baseline = await blockedBackendCount(probe)
+      const blockerPid = await backendPid(blocker)
       await blocker.query('BEGIN')
       await blocker.query('SELECT id FROM stock_transfers WHERE id = $1 FOR UPDATE', [seeded.transfer.id])
       const aligning = applyMintsoftAlignmentForProduct({
@@ -903,7 +1147,11 @@ test(
         delta: LINE_QTY,
         dryRun: false,
       }).then((value) => { alignResult = value })
-      await waitForABlockedBackend(probe, baseline)
+      await waitForBlockedBackend(probe, {
+        blockedBy: [blockerPid],
+        waitingOn: /stock_transfers/i,
+        describe: 'alignment parked on its own transfer lock',
+      })
       await blocker.query('ROLLBACK')
       await aligning
     } finally {
@@ -919,5 +1167,395 @@ test(
       select: { quantity: true },
     })
     assert.equal(Number(destinationStock?.quantity ?? 0), LINE_QTY)
+  },
+)
+
+// ---------------------------------------------------------------------------
+// THE RE-READ THAT WAS NOT RESTRICTED TO THE LOCKED ROWS
+// (Codex round-10 HIGH-1 — which is round-8 HIGH-2, returned)
+// ---------------------------------------------------------------------------
+
+/**
+ * A purchase-order world: ONE product in ONE warehouse, and as many PO-backed open
+ * ASNs on it as a test wants.
+ *
+ * PURCHASE ORDERS, NOT TRANSFERS, because the PO side is where the gap was, and the
+ * asymmetry is the point. A transfer-backed row that appears between alignment's two
+ * reads is already refused — its parent transfer cannot be in the locked set, and
+ * the round-9 check tests exactly that — and a transfer-backed row whose parent IS
+ * locked cannot be moved underneath alignment, because every writer of those rows
+ * takes the transfer first and would block. A PO-backed row has neither guard:
+ * alignment locks no `purchase_orders` row, so there is no parent set for a raced PO
+ * line to fail, and the book-in that credits it takes no lock alignment holds.
+ */
+async function seedPurchaseAsnWorld(label: string) {
+  const { db } = await import('@/lib/db')
+
+  const uid = `${Date.now().toString(36)}${Math.floor(Math.random() * 1_679_616).toString(36).padStart(4, '0')}`.toUpperCase()
+  const tag = `R10PO-${label}-${process.pid}-${uid}`
+  const product = await db.product.create({
+    data: { sku: tag, name: `r10 raced PO line ${label}`, type: 'SIMPLE', countryOfOrigin: 'CN' },
+    select: { id: true },
+  })
+  const warehouse = await db.warehouse.create({
+    data: { code: `RX${uid}`, name: `${tag} wh`, type: 'STANDARD' },
+    select: { id: true, code: true, name: true },
+  })
+  // Materialised, so a test can park a transaction on the row alignment must take
+  // last — and so the stock it holds is a number the assertions can read.
+  await db.stockLevel.create({
+    data: { productId: product.id, warehouseId: warehouse.id, quantity: '0', reservedQty: '0' },
+    select: { productId: true },
+  })
+  const supplier = await db.supplier.create({
+    data: { name: `${tag} supplier`, currency: 'GBP' },
+    select: { id: true },
+  })
+
+  /**
+   * One PO with one line, and one OPEN ASN mapped to that line.
+   *
+   * `alreadyReceived` seeds the line as HAVING BEEN RECEIVED already — stock on the
+   * shelf, a cost layer behind it, `qtyReceived` set — with the ASN row still
+   * showing nothing processed. That is an ordinary state: goods booked in by hand,
+   * with the WMS callback still to arrive.
+   */
+  async function addPurchaseOrderAsn(
+    suffix: string,
+    qty: number,
+    options: { alreadyReceived?: boolean } = {},
+  ) {
+    const reference = `${tag}-${suffix}`
+    const total = qty * UNIT_COST
+    const po = await db.purchaseOrder.create({
+      data: {
+        reference,
+        supplierId: supplier.id,
+        status: options.alreadyReceived ? 'PARTIALLY_RECEIVED' : 'PO_SENT',
+        currency: 'GBP',
+        fxRateToBase: '1',
+        subtotalForeign: total,
+        subtotalBase: total,
+        totalForeign: total,
+        totalBase: total,
+        destinationWarehouseId: warehouse.id,
+        lines: {
+          create: [{
+            productId: product.id,
+            qty: `${qty}.0000`,
+            qtyReceived: options.alreadyReceived ? `${qty}.0000` : '0.0000',
+            unitCostForeign: `${UNIT_COST}.000000`,
+            unitCostBase: `${UNIT_COST}.000000`,
+            // Explicit, because every receipt path reads `landedUnitCostBase ??
+            // unitCostBase` and the column defaults to 0 rather than NULL. Left
+            // unset, every layer this fixture produced would be a £0 layer and the
+            // money assertion below would pass on nothing.
+            landedUnitCostBase: `${UNIT_COST}.000000`,
+            totalForeign: total,
+            totalBase: total,
+          }],
+        },
+      },
+      select: { id: true, lines: { select: { id: true } } },
+    })
+
+    if (options.alreadyReceived) {
+      await db.costLayer.create({
+        data: {
+          productId: product.id,
+          warehouseId: warehouse.id,
+          receivedQty: `${qty}.000000`,
+          remainingQty: `${qty}.000000`,
+          unitCostBase: UNIT_COST,
+          poLineId: po.lines[0]!.id,
+        },
+        select: { id: true },
+      })
+      await db.stockLevel.update({
+        where: { productId_warehouseId: { productId: product.id, warehouseId: warehouse.id } },
+        data: { quantity: { increment: qty } },
+        select: { productId: true },
+      })
+    }
+
+    const asn = await db.wmsAsnMap.create({
+      data: {
+        connector: 'mintsoft', // wms-connector-boundary-ok: 6oyu.19: a test fixture row, not a core flow branch
+        externalAsnId: reference,
+        sourceType: 'PURCHASE_ORDER',
+        sourceId: po.id,
+        warehouseId: warehouse.id,
+        status: 'OPEN',
+        lines: {
+          create: [{
+            externalAsnLineId: `${reference}-1`,
+            sourceType: 'PURCHASE_ORDER_LINE',
+            sourceLineId: po.lines[0]!.id,
+            productId: product.id,
+            sku: tag,
+            expectedQty: `${qty}.0000`,
+          }],
+        },
+      },
+      select: { id: true, lines: { select: { id: true, externalAsnLineId: true } } },
+    })
+
+    return {
+      reference,
+      qty,
+      poId: po.id,
+      poLineId: po.lines[0]!.id,
+      asnId: asn.id,
+      asnLineMapId: asn.lines[0]!.id,
+      externalAsnLineId: asn.lines[0]!.externalAsnLineId,
+    }
+  }
+
+  /** The real webhook book-in for one of those ASNs, for its whole quantity. */
+  async function runBookedInFor(asn: Awaited<ReturnType<typeof addPurchaseOrderAsn>>) {
+    const { processBookedInEvent } = await import('@/lib/domain/wms/booked-in-service')
+    const event = await db.wmsInboundReceiptEvent.create({
+      data: {
+        connector: 'mintsoft', // wms-connector-boundary-ok: 6oyu.19: a test fixture row, not a core flow branch
+        externalEventId: `${asn.reference}-evt-${Math.random().toString(36).slice(2, 8)}`,
+        externalAsnId: asn.reference,
+        payload: { asnId: asn.reference },
+      },
+      select: { id: true },
+    })
+    return processBookedInEvent(event.id, {
+      fetchRemoteAsn: async () => ({
+        externalAsnId: asn.reference,
+        status: 'RECEIVED',
+        lines: [{
+          externalLineId: asn.externalAsnLineId,
+          sourceLineId: asn.poLineId,
+          externalProductId: null,
+          sku: tag,
+          quantity: asn.qty,
+          raw: null,
+        }],
+        raw: null,
+      }),
+    })
+  }
+
+  const binding = {
+    id: `binding-${tag}`,
+    connector: 'mintsoft', // wms-connector-boundary-ok: 6oyu.19: a test fixture value, not a core flow branch
+    active: true,
+    externalWarehouseId: '1',
+    stockSyncMode: 'ALIGN_TO_WMS' as const,
+    syncFrequencyMinutes: 60,
+    discrepancyThresholds: null,
+    reportRecipients: [],
+    alignmentConfirmedAt: new Date(),
+    alignDownReasonId: null,
+    warehouseId: warehouse.id,
+    lastStockSyncAt: null,
+    connection: { active: true },
+    warehouse,
+  }
+
+  return { db, tag, product, warehouse, binding, addPurchaseOrderAsn, runBookedInFor }
+}
+
+test(
+  'ALIGNMENT refuses a PO ASN line created after its locks, and books no unit twice (Codex r10 HIGH-1)',
+  { skip: !RUN && 'set RUN_DB_CONCURRENCY_TESTS=1' },
+  async () => {
+    // THE ROUTE, forced step by step rather than hoped for:
+    //
+    //  (1) Alignment discovers ASN-A alone and takes its `wms_asn_line_maps` lock on
+    //      A alone — parked there by a session already holding that row.
+    //  (2) ASN-B, a SECOND purchase order for the same product and warehouse, is
+    //      created and committed. Its ten units are already on the shelf: received by
+    //      hand, layered, with the WMS callback still outstanding. Alignment holds
+    //      nothing that covers row B and never will — it locks no `purchase_orders`
+    //      row, so there is no parent lock for a raced PO line to fail.
+    //  (3) The real webhook book-in for ASN-B starts and is parked at ASN-B's HEADER
+    //      row, before it has credited row B.
+    //  (4) Alignment is released. It locks A, re-reads — and this is the moment the
+    //      finding is about: at READ COMMITTED the re-read returns row B, whose
+    //      counters still say ten units unaccounted, because the book-in has not
+    //      committed. Alignment plans 4 from A and 6 from B and reaches for the stock
+    //      level, which is held.
+    //  (5) The book-in is released and commits, crediting row B for all ten. Every
+    //      counter alignment planned from is now stale.
+    //  (6) The stock level is released and alignment writes.
+    //
+    // BEFORE THE FIX alignment books ten units — six of them against a row a
+    // committed book-in has just accounted in full — so twenty units of stock and
+    // £100 of layers stand for the fourteen that were ordered and the ten that
+    // arrived.
+    //
+    // AFTER THE FIX row B is not in the locked set, so the re-read refuses it. What
+    // is left covers 4 of the 10-unit delta, alignment applies nothing rather than
+    // part of a plan, and the ten units on the shelf stay ten.
+    const databaseUrl = loadEnv()
+    const world = await seedPurchaseAsnWorld('raced')
+    const first = await world.addPurchaseOrderAsn('a', 4)
+    const { applyMintsoftAlignmentForProduct } =
+      await import('@/lib/connectors/mintsoft/sync/stock-sync')
+
+    const holdAsnA = await rawSession(databaseUrl)
+    const holdAsnBHeader = await rawSession(databaseUrl)
+    const holdStock = await rawSession(databaseUrl)
+    const probe = await rawSession(databaseUrl)
+    let alignResult: { applied?: boolean; correctedQty?: number; reason?: string } | null = null
+    let alignError: unknown = null
+    let bookedInOutcome: unknown = null
+    let bookedInError: unknown = null
+    let alignmentReachedStock = false
+    let second: Awaited<ReturnType<typeof world.addPurchaseOrderAsn>> | null = null
+
+    try {
+      const holdAsnAPid = await backendPid(holdAsnA)
+      const holdAsnBHeaderPid = await backendPid(holdAsnBHeader)
+      const holdStockPid = await backendPid(holdStock)
+
+      // (1)
+      await holdAsnA.query('BEGIN')
+      await holdAsnA.query('SELECT id FROM wms_asn_line_maps WHERE id = $1 FOR UPDATE', [first.asnLineMapId])
+
+      const aligning = applyMintsoftAlignmentForProduct({
+        binding: world.binding as never,
+        jobId: `r10-raced-${Date.now()}`,
+        productId: world.product.id,
+        sku: world.tag,
+        delta: 10,
+        dryRun: false,
+      }).then(
+        (value) => { alignResult = value },
+        (error) => { alignError = error },
+      )
+      await waitForBlockedBackend(probe, {
+        blockedBy: [holdAsnAPid],
+        waitingOn: /wms_asn_line_maps/i,
+        describe: 'alignment parked at its ASN row lock, discovery done',
+      })
+
+      // (2) — AFTER the lock set was chosen, which is the whole point.
+      second = await world.addPurchaseOrderAsn('b', 10, { alreadyReceived: true })
+
+      // (3)
+      await holdAsnBHeader.query('BEGIN')
+      await holdAsnBHeader.query('SELECT id FROM wms_asn_maps WHERE id = $1 FOR UPDATE', [second.asnId])
+      const bookingIn = world.runBookedInFor(second).then(
+        (value) => { bookedInOutcome = value },
+        (error) => { bookedInError = error },
+      )
+      await waitForBlockedBackend(probe, {
+        blockedBy: [holdAsnBHeaderPid],
+        waitingOn: /wms_asn_maps/i,
+        describe: 'parking the book-in of the raced ASN at its header',
+      })
+
+      // The last lock alignment takes, held so that alignment stops between its
+      // re-read and its writes rather than racing through them.
+      await holdStock.query('BEGIN')
+      await holdStock.query(
+        'SELECT id FROM stock_levels WHERE "productId" = $1 AND "warehouseId" = $2 FOR UPDATE',
+        [world.product.id, world.warehouse.id],
+      )
+
+      // (4) Release A. Alignment re-reads under its locks and then either refuses row
+      //     B — settling without ever reaching for stock — or parks on the stock row
+      //     with row B in its plan. Both are observable facts, so the releases below
+      //     are correctly timed either way and the assertions tell the two apart.
+      await holdAsnA.query('ROLLBACK')
+      alignmentReachedStock = await Promise.race([
+        waitForBlockedBackend(probe, {
+          blockedBy: [holdStockPid],
+          waitingOn: /stock_levels/i,
+          describe: 'alignment parked at the stock level with its plan already made',
+        }).then(() => true),
+        aligning.then(() => false),
+      ])
+
+      // (5) The book-in commits while alignment cannot write. This is what makes
+      //     alignment's plan stale rather than merely concurrent.
+      await holdAsnBHeader.query('ROLLBACK')
+      await bookingIn
+
+      // (6)
+      await holdStock.query('ROLLBACK')
+      await aligning
+    } finally {
+      await holdAsnA.end().catch(() => {})
+      await holdAsnBHeader.end().catch(() => {})
+      await holdStock.end().catch(() => {})
+      await probe.end().catch(() => {})
+    }
+
+    assert.equal(alignError, null, `alignment must refuse cleanly, not throw: ${String(alignError)}`)
+    assert.equal(bookedInError, null, `the book-in must succeed: ${String(bookedInError)}`)
+    assert.equal(
+      (bookedInOutcome as { status?: string } | null)?.status,
+      'processed',
+      `the book-in must process the raced ASN: ${JSON.stringify(bookedInOutcome)}`,
+    )
+
+    const { db } = world
+    // THE PRECONDITION, asserted rather than assumed: the book-in really did move the
+    // counters alignment had already read. Without this the test could pass because
+    // nothing raced at all.
+    const racedRow = await db.wmsAsnLineMap.findUnique({
+      where: { id: second!.asnLineMapId },
+      select: { qtyAccountedViaSnapshot: true, lastProcessedReceivedQty: true, qtyAccountedViaReceipt: true },
+    })
+    assert.equal(
+      Number(racedRow?.lastProcessedReceivedQty ?? 0),
+      10,
+      'the book-in did not credit the raced row, so nothing made alignment’s read stale',
+    )
+
+    // THE POSTED AMOUNTS, which is what "no unit twice" means.
+    const stock = await db.stockLevel.findUnique({
+      where: { productId_warehouseId: { productId: world.product.id, warehouseId: world.warehouse.id } },
+      select: { quantity: true },
+    })
+    assert.equal(
+      Number(stock?.quantity ?? 0),
+      10,
+      'stock was booked for units that had already landed — alignment planned against an ASN row it '
+      + `never locked and a book-in credited it in between (alignment reached the stock lock: ${alignmentReachedStock})`,
+    )
+
+    const layers = await db.costLayer.findMany({
+      where: { productId: world.product.id, warehouseId: world.warehouse.id },
+      select: { receivedQty: true, unitCostBase: true },
+    })
+    assert.equal(
+      layers.reduce((sum, layer) => sum + Number(layer.receivedQty), 0),
+      10,
+      'and the cost layers must cover those ten units once',
+    )
+    assert.equal(
+      layers.reduce((sum, layer) => sum + Number(layer.receivedQty) * Number(layer.unitCostBase), 0),
+      10 * UNIT_COST,
+      'the money: £50 of inventory for the ten units at £5 that arrived, not £100 for twenty',
+    )
+
+    assert.equal(
+      Number(racedRow?.qtyAccountedViaSnapshot ?? 0),
+      0,
+      'alignment credited an ASN row it never locked',
+    )
+
+    // And the row it DID lock is untouched, because a plan that cannot cover the
+    // delta is not applied in part.
+    const lockedRow = await db.wmsAsnLineMap.findUnique({
+      where: { id: first.asnLineMapId },
+      select: { qtyAccountedViaSnapshot: true },
+    })
+    assert.equal(Number(lockedRow?.qtyAccountedViaSnapshot ?? 0), 0)
+
+    assert.equal(alignResult!.applied, false, `alignment must not apply: ${JSON.stringify(alignResult)}`)
+    assert.equal(alignResult!.correctedQty, 0)
+    // NOT VACUOUS: alignment must refuse for THIS reason, naming the raced ASN, and
+    // not because the fixture failed to give it anything to do.
+    assert.match(alignResult!.reason ?? '', new RegExp(second!.reference))
+    assert.match(alignResult!.reason ?? '', /created after this run took its row locks/)
   },
 )

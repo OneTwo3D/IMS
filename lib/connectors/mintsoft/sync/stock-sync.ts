@@ -572,8 +572,29 @@ type RefusedAlignmentCandidate = {
    * `capped` — it is usable, but for less than its outstanding quantity, because the
    * dispatch snapshot cannot cost the rest (Codex round-8 HIGH-1). The distinction
    * matters to the operator-facing reason: only the first is about transfer status.
+   * `raced` — the row (or its parent) was committed after this transaction took its
+   * locks, so nothing this pass could read about it is covered by a lock. Nothing is
+   * wrong with it; it simply belongs to the next sweep (Codex round-10 HIGH-1).
    */
-  kind: 'unusable' | 'capped'
+  kind: 'unusable' | 'capped' | 'raced'
+}
+
+/**
+ * The rows this transaction actually HOLDS, handed to the re-read so it can refuse
+ * everything else (6oyu.19, Codex round-10 HIGH-1).
+ *
+ * WHY THE RE-READ NEEDS THIS AT ALL. Locking is done from a discovery read, so the
+ * lock set is a set of ids chosen before the locks existed. The re-read that follows
+ * runs at READ COMMITTED against the whole table and therefore sees rows committed
+ * in between — for which this transaction holds nothing. Acting on one is acting on
+ * an unlocked row: a concurrent book-in can move its counters between this read and
+ * the stock write below, and the same units get booked twice.
+ */
+type AlignmentLockSet = {
+  /** `stock_transfers` rows held FOR UPDATE (step 2a of the global order). */
+  transferIds: ReadonlySet<string>
+  /** `wms_asn_line_maps` rows held FOR UPDATE (step 4 of the global order). */
+  asnLineMapIds: ReadonlySet<string>
 }
 
 type AlignmentCandidateSet = {
@@ -607,16 +628,42 @@ type AlignmentCandidateSet = {
  * reclassification. The predicate is the one the WMS webhook book-in has always
  * applied, shared from lib/domain/wms/asn-reconciliation so the two agree.
  *
- * `lockedTransferIds`, when supplied, is the set of `stock_transfers` rows this
- * transaction holds FOR UPDATE. A candidate whose parent is not in it is refused:
- * its status could be changing underneath this read, and a cancellation that
- * interleaves with an alignment is exactly the concurrent form of the same defect.
+ * `locks`, when supplied, is what this transaction HOLDS, and the read becomes a
+ * re-read: it may return only rows this transaction can still be sure of.
+ *
+ *   · `asnLineMapIds` — the `wms_asn_line_maps` rows held FOR UPDATE. A row outside
+ *     that set is refused however innocent it looks. It was committed after the
+ *     locks were taken, so its counters are unlocked and a book-in may be moving
+ *     them right now; planning against them books the same units twice (6oyu.19,
+ *     Codex round-10 HIGH-1 — and round-8 HIGH-2, which said the same thing and was
+ *     dropped when round 8 withdrew the whole locking layer instead of fixing it).
+ *     This is the general form: it refuses a raced PURCHASE_ORDER-backed row, whose
+ *     parent PO this path never locks, as readily as a transfer-backed one, and it
+ *     needs no new lock to do it, so the global lock order is untouched.
+ *   · `transferIds` — the `stock_transfers` rows held FOR UPDATE. A transfer-backed
+ *     candidate whose parent is not in it is refused: its status could be changing
+ *     underneath this read, and a cancellation that interleaves with an alignment is
+ *     exactly the concurrent form of the same defect. Kept alongside the row-id check
+ *     rather than folded into it, because the two answer different questions — one
+ *     is about the row, the other about the parent a locked row points AT, and a row
+ *     can be repointed by `createMintsoftTransferAsn` between the two reads.
+ *
+ * WHY NOT LOCK THE MISSING PARENTS INSTEAD (the other half of the round-10 finding).
+ * Locking `purchase_orders` and `wms_asn_maps` here would be in-order and legal, but
+ * it would not close this: a parent that does not exist at step 2 cannot be locked at
+ * step 2, so a row created afterwards still arrives unlocked and the re-read still
+ * has to refuse it. The refusal is therefore the whole fix and the locks would be
+ * decoration — and every extra lock is contention plus a new pair to keep ordered.
+ * `wms_asn_maps` is left alone for a second reason: nothing in this codebase ever
+ * sets `closedAt`, so the `closedAt: null` filter above cannot change under this
+ * transaction. If a close path is ever added, this comment is wrong and the header
+ * belongs in the lock set.
  */
 async function getAlignmentCandidateLines(
   tx: Prisma.TransactionClient,
   binding: SyncBinding,
   productId: string,
-  lockedTransferIds?: ReadonlySet<string>,
+  locks?: AlignmentLockSet,
 ): Promise<AlignmentCandidateSet> {
   const lines = await tx.wmsAsnLineMap.findMany({
     where: {
@@ -686,6 +733,21 @@ async function getAlignmentCandidateLines(
   const parentTransferIds = new Set<string>()
 
   for (const line of lines) {
+    // FIRST, BEFORE ANY FACT ABOUT THIS ROW IS READ. Under the locks, a row this
+    // transaction does not hold is a row whose every column is still moving. It is
+    // refused whatever its source type, which is what makes a raced PURCHASE_ORDER
+    // line — the case round 10 found, and the one no parent lock on this path would
+    // have covered — refused by the same statement as a raced transfer line.
+    if (locks && !locks.asnLineMapIds.has(line.id)) {
+      refused.push({
+        asnLineMapId: line.id,
+        externalAsnId: line.asn.externalAsnId,
+        reason: 'the ASN line was created after this run took its row locks',
+        kind: 'raced',
+      })
+      continue
+    }
+
     const asnResidualQty = resolveWmsAsnLineResidualQty({
       asnLineMapId: line.id,
       expectedQty: line.expectedQty,
@@ -723,12 +785,12 @@ async function getAlignmentCandidateLines(
     // thing this pass may not rely on. A row whose parent appeared after the step-2
     // locks were taken cannot be locked now without inverting the global order
     // (lib/domain/wms/transfer-asn-lock-order.ts), so it waits for the next sweep.
-    if (lockedTransferIds && !lockedTransferIds.has(transferLine.transferId)) {
+    if (locks && !locks.transferIds.has(transferLine.transferId)) {
       refused.push({
         asnLineMapId: line.id,
         externalAsnId: line.asn.externalAsnId,
         reason: `transfer ${transferLine.transfer.reference} appeared after this run took its transfer locks`,
-        kind: 'unusable',
+        kind: 'raced',
       })
       continue
     }
@@ -810,7 +872,12 @@ function describeRefusedAlignmentCandidates(refused: ReadonlyArray<RefusedAlignm
   const statusNote = refused.some((entry) => entry.kind === 'unusable')
     ? ` Alignment only uses an ASN whose transfer is ${WMS_RECEIPT_USABLE_TRANSFER_STATUSES.join(' or ')}.`
     : ''
-  return ` Open ASN line${refused.length === 1 ? '' : 's'} skipped or capped: ${listed}${more}.${statusNote}`
+  // And a raced row is not a problem to go and look at — it is work deferred by one
+  // sweep. Saying so keeps it out of the operator's defect pile (Codex round-10).
+  const racedNote = refused.some((entry) => entry.kind === 'raced')
+    ? ' Rows created after this run took its locks are left to the next sync rather than acted on unlocked.'
+    : ''
+  return ` Open ASN line${refused.length === 1 ? '' : 's'} skipped or capped: ${listed}${more}.${statusNote}${racedNote}`
 }
 
 async function lockStockLevelForAlignment(
@@ -929,12 +996,24 @@ export async function applyMintsoftAlignmentForProduct(params: {
 
     // STEP 2, then STEP 4 — never the other way about.
     const lockedTransferIds = new Set(await lockStockTransfers(tx, discovery.parentTransferIds))
-    await lockWmsAsnLineMaps(tx, discovery.candidates.map((candidate) => candidate.id))
+    const lockedAsnLineMapIds = new Set(
+      await lockWmsAsnLineMaps(tx, discovery.candidates.map((candidate) => candidate.id)),
+    )
 
-    // Read again UNDER the locks. Every fact the plan rests on — each parent
-    // transfer's status, each ASN row's counters — is now covered by a lock this
-    // transaction holds until it commits.
-    const candidateSet = await getAlignmentCandidateLines(tx, params.binding, params.productId, lockedTransferIds)
+    // Read again UNDER the locks, AND ONLY WITHIN THEM. Every fact the plan rests on
+    // — each parent transfer's status, each ASN row's counters — is now covered by a
+    // lock this transaction holds until it commits, because a row the locks do not
+    // cover is refused rather than planned against.
+    //
+    // ROUND 8 FOUND THIS AND ROUND 8 LOST IT. Its HIGH-2 said this re-read was not
+    // restricted to the locked ids; the response was to withdraw the entire locking
+    // layer for an unrelated deadlock cycle, and when round 9 fixed the cycle and put
+    // the locks back, the unrestricted re-read came back with them. A withdrawn layer
+    // takes its open findings with it — this is the one that had to travel.
+    const candidateSet = await getAlignmentCandidateLines(tx, params.binding, params.productId, {
+      transferIds: lockedTransferIds,
+      asnLineMapIds: lockedAsnLineMapIds,
+    })
     const candidates = candidateSet.candidates
 
     if (candidates.length === 0) {
