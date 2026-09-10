@@ -28,9 +28,10 @@
  * string, in tests/helpers/throwaway-database.ts, proved with no database at all by
  * tests/throwaway-database-guard.test.ts.
  *
- * NO EMAIL IS SENT. Every drain below is given a fake sender that appends to an array, and the
- * option union plus `assertBothOrNeitherInjected` make a drain with a fake sender and the GLOBAL
- * client refuse before it reads a row.
+ * NO EMAIL IS SENT. Every drain below goes through `drainWith`, which takes a COMPLETE
+ * `EmailOutboxHarness` — a fake sender that appends to an array, this lane's own client, its own
+ * clock, preparer and logger — and `resolveEmailOutboxDependencies` refuses any mixture of a
+ * caller's value with a production one before a row is read (o3d-alnk r6).
  *
  * WHY IT HAS TO BE A REAL DATABASE AT ALL — the in-memory arms live in
  * tests/email-outbox-claim-fence.test.ts, and that is where the pre-fix CONTROL is expressible.
