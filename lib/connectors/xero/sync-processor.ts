@@ -128,6 +128,7 @@ import {
   markIntegrationOutboxSuccess,
   type IntegrationOutboxRow,
 } from '@/lib/domain/integrations/outbox'
+import { INTEGRATION_OUTBOX_DRAIN_LEASES_MS } from '@/lib/domain/integrations/outbox-leases'
 import {
   parseXeroAccountingOutboxPayload,
   scheduleXeroAccountingOutbox,
@@ -138,7 +139,15 @@ import { resolveStoredInvoiceUploadPath } from '@/lib/upload-storage'
 
 const MAX_RETRIES = 5
 const MAX_PER_RUN = 50 // Xero rate limit: 60/min — leave headroom
-const CLAIM_STALE_MS = 15 * 60 * 1000
+/**
+ * THE LEASE, TAKEN FROM THE ONE PLACE THAT ENUMERATES THEM (o3d-8td2 r4, Codex HIGH 1).
+ *
+ * This is the longest lease in the build, and the operator's stale-park threshold is derived from
+ * the maximum over `INTEGRATION_OUTBOX_DRAIN_LEASES_MS`. Written as its own `15 * 60 * 1000` it was
+ * invisible to that derivation, and the admin surface declared a Xero row stale five minutes before
+ * this worker's lease had expired.
+ */
+const CLAIM_STALE_MS = INTEGRATION_OUTBOX_DRAIN_LEASES_MS.xeroAccountingEntry
 const RATE_LIMIT_BACKOFF_BASE_MS = 60_000
 const RATE_LIMIT_BACKOFF_MAX_MS = 15 * 60_000
 const XERO_CONNECTOR = 'xero'
