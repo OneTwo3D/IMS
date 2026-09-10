@@ -95,7 +95,24 @@ while IFS= read -r line; do
 done
 `
 
-test('finish() settles on the output being complete, not on the child having exited (o3d-msv1)', async () => {
+/**
+ * TESTS 1 AND 2 DO NOT HAVE THE SHAPE TESTS 3 AND 4 HAD, AND THE REASON IS STRUCTURAL.
+ *
+ * That shape is: a stand-in that ends of its own accord inside the test's patience, so an assertion
+ * about something having been ENDED is satisfied by the ending that was going to happen anyway. It
+ * needs a child that outlives the mechanism under test and a test willing to wait for it. LATE_WRITER
+ * is neither: it exits immediately and its late bytes arrive half a second later, and every assertion
+ * below is on the CONTENT of what was collected, not on a process being gone or a bound having been
+ * honoured. The half second is not the test's patience running out — it IS the mechanism, because
+ * waiting for end-of-file is the only way those bytes can be in the string that is matched. Measured
+ * on the mutation that matters (settle on `exit` again): test 1 fails in well under a second with the
+ * CI signature, and test 2 fails on its occurrence count with the memoisation removed.
+ *
+ * The `timeout` is therefore a backstop and not the assertion — it is here so that a mutation which
+ * makes `finish()` never settle at all is reported as this test failing rather than as the whole run
+ * hanging with nothing said.
+ */
+test('finish() settles on the output being complete, not on the child having exited (o3d-msv1)', { timeout: 15_000 }, async () => {
   await withStandInPsql(LATE_WRITER, async () => {
     const held = await holdSession(STAND_IN_CLUSTER, 'imsuser', 'a-password', 'one_two_inventory')
     assert.ok(held.alive(), 'the stand-in must still be running once the handshake has been answered')
@@ -118,7 +135,7 @@ test('finish() settles on the output being complete, not on the child having exi
   })
 })
 
-test('finish() is idempotent: the `finally` that calls it again gets the same result, not an error', async () => {
+test('finish() is idempotent: the `finally` that calls it again gets the same result, not an error', { timeout: 15_000 }, async () => {
   await withStandInPsql(LATE_WRITER, async () => {
     const held = await holdSession(STAND_IN_CLUSTER, 'imsuser', 'a-password', 'one_two_inventory')
 
@@ -126,7 +143,20 @@ test('finish() is idempotent: the `finally` that calls it again gets the same re
     // awaits it again. Two concurrent calls are the harder case — a second call that re-entered the
     // body would write to a stdin the first one had already ended, and an unhandled
     // ERR_STREAM_WRITE_AFTER_END takes the whole test process down rather than failing an assertion.
-    const [first, second] = await Promise.all([held.finish(), held.finish()])
+    //
+    // IDENTITY, NOT JUST EQUALITY, AND THE DIFFERENCE IS THE WHOLE GUARD (o3d-msv1 round 2). The
+    // three assertions below all held with `finished ??=` mutated to `finished =`: a second,
+    // un-memoised call finds `exited` already true or its write refused by a stdin the first call
+    // ended — node swallows that as an 'error' event the rig deliberately ignores — so it collects
+    // the same closure variables and returns an EQUAL result, and nothing about the output can tell
+    // the two apart. Measured: with the memoisation removed this test stayed green and only test 3
+    // went red. What a second settlement actually costs is a second `killed` flag, a second
+    // watchdog and a second verdict on a child that has already been judged, so the property has to
+    // be read where it is visible — one promise, returned again.
+    const settlement = held.finish()
+    assert.equal(held.finish(), settlement, 'every call must return the ONE settlement, not another like it')
+
+    const [first, second] = await Promise.all([settlement, held.finish()])
     const third = await held.finish()
 
     assert.deepEqual(second, first, 'a concurrent second call must await the same settlement')
@@ -134,7 +164,7 @@ test('finish() is idempotent: the `finally` that calls it again gets the same re
     assert.equal(
       (first.stdout.match(/still-authenticated/g) ?? []).length,
       1,
-      'the closing statement is written once however many times finish() is called',
+      'the answer to the closing statement must be there, and be there exactly once',
     )
   })
 })
@@ -146,13 +176,21 @@ test('finish() is idempotent: the `finally` that calls it again gets the same re
  * holding the write end of stdout are the same one. A shell that merely *ran* `sleep` would be
  * killed while its child kept the pipe open, and the end-of-file `finish()` waits for would never
  * arrive at all — which is a trap this file would otherwise have set for itself.
+ *
+ * TWO MINUTES, AND THE DURATION IS PART OF THE ASSERTION. It was thirty seconds, which is the same
+ * incidental pass test 4 was corrected for and which test 3 below still had: with the kill deleted
+ * from the watchdog but `killed` still set, `finish()` simply waited for the sleep to expire of its
+ * own accord, then threw the expected truncation message at a child whose pid was by then naturally
+ * gone — every assertion satisfied, thirty seconds late, by a watchdog that killed nothing. The
+ * child has to outlive every bound the test is willing to wait for, so that "it is gone" can only
+ * mean "something killed it" and "nothing has settled yet" can only mean "nothing killed it".
  */
 const NEVER_FINISHES = `#!/bin/bash
 printf '%s\\n' "\$\$" > "\$IMS_STAND_IN_PIDFILE"
 while IFS= read -r line; do
   case "\$line" in
     *session-opened*) printf 'session-opened\\n' ;;
-    *still-authenticated*) exec sleep 30 ;;
+    *still-authenticated*) exec sleep 120 ;;
   esac
 done
 `
@@ -184,7 +222,72 @@ async function withPidFile<T>(body: (pidFile: string) => Promise<T>): Promise<T>
   } finally {
     if (restore === undefined) delete process.env.IMS_STAND_IN_PIDFILE
     else process.env.IMS_STAND_IN_PIDFILE = restore
+    reapStandIn(pidFile)
   }
+}
+
+/**
+ * Kill whatever the stand-in recorded, whatever the test decided — INCLUDING when it failed.
+ *
+ * The stand-ins these tests use now outlive the tests themselves on purpose, which means a test
+ * that fails because nothing killed its child is a test that has left a two-minute `sleep` holding
+ * three pipes open on the runner's event loop. The runner would then sit there after the last
+ * assertion had been reported, and a suite that hangs after failing is a suite whose failure nobody
+ * reads. Cleanup runs AFTER the body, so it cannot supply the death test 3 and test 4 assert on:
+ * both make that assertion inside the body, while this is the `finally`.
+ */
+function reapStandIn(pidFile: string): void {
+  let pid = 0
+  try {
+    pid = Number(readFileSync(pidFile, 'utf8').trim())
+  } catch {
+    return // the stand-in never ran; there is nothing of it to reap
+  }
+  if (!Number.isInteger(pid) || pid <= 0) return
+  try {
+    process.kill(pid, 'SIGKILL')
+  } catch {
+    // ESRCH — already gone, which is what a passing run looks like.
+  }
+}
+
+/**
+ * AWAIT A SETTLEMENT UNDER A BOUND THE TEST OWNS, AND SAY SO BY NAME WHEN IT DOES NOT ARRIVE.
+ *
+ * `assert.rejects` will wait for ever, and the runner's own `timeout` reports a bare
+ * `testTimeoutFailure` that says only that something took too long — the same result a slow machine
+ * produces, and no evidence about which promise never settled or why. A promptness claim has to be
+ * an assertion like any other, so it is made here: the bound is a multiple of the watchdog under
+ * test, the failure names the promise and the bound, and the value returned is the rejection reason
+ * for the caller to match on. A promise that RESOLVES fails here too, and differently, because
+ * "settled at the right time with the wrong outcome" is a different defect from "never settled".
+ */
+type Outcome =
+  | { readonly kind: 'resolved'; readonly value: unknown }
+  | { readonly kind: 'rejected'; readonly error: unknown }
+  | { readonly kind: 'overdue' }
+
+async function rejectionWithin(promise: Promise<unknown>, ms: number, what: string): Promise<Error> {
+  // Both outcomes are handled the moment the race is set up, so the loser cannot become an
+  // unhandled rejection later — this promise is deliberately still pending when the bound wins,
+  // and it settles, unwatched, as soon as the `finally` above reaps the child it is waiting for.
+  const settled: Promise<Outcome> = promise.then(
+    (value) => ({ kind: 'resolved', value }) as const,
+    (error: unknown) => ({ kind: 'rejected', error }) as const,
+  )
+  const bound = new Promise<Outcome>((resolve) => {
+    const timer = setTimeout(() => resolve({ kind: 'overdue' }), ms)
+    timer.unref?.()
+  })
+  const outcome = await Promise.race([settled, bound])
+  if (outcome.kind === 'overdue') {
+    assert.fail(`${what}: nothing had settled ${ms}ms later, so the bound it is named for did not fire`)
+  }
+  if (outcome.kind === 'resolved') {
+    assert.fail(`${what}: it settled in time, but by RESOLVING with ${JSON.stringify(outcome.value)}`)
+  }
+  assert.ok(outcome.error instanceof Error, `${what}: rejected with a non-Error ${String(outcome.error)}`)
+  return outcome.error
 }
 
 /** True while a pid names a live process; ESRCH — no such process — is the only accepted refusal. */
@@ -198,9 +301,16 @@ function stillRunning(pid: number): boolean {
   }
 }
 
-test('a watchdog kill is reported as a truncation, never returned as a complete result (o3d-msv1)', async () => {
+// THE BOUNDS ARE THE ASSERTION, not a safety net around it. The stand-in sleeps for two minutes and
+// the watchdog under test is set to 300ms, so a `finish()` that has not settled three seconds later
+// has not killed anything — and the runner's own 20s timeout is only a backstop for a mutation that
+// breaks something this test does not model. Without the inner bound this test passed under the
+// mutation that matters: `finish()` waited out a thirty-second `sleep`, threw the truncation message
+// it was told to expect, and found the pid gone because the child had exited by itself.
+test('a watchdog kill is reported as a truncation, never returned as a complete result (o3d-msv1)', { timeout: 20_000 }, async () => {
   await withPidFile(async (pidFile) => {
     await withStandInPsql(NEVER_FINISHES, async () => {
+      const startedAt = Date.now()
       const held = await holdSession(STAND_IN_CLUSTER, 'imsuser', 'a-password', 'one_two_inventory', {
         watchdogMs: 300,
       })
@@ -209,8 +319,18 @@ test('a watchdog kill is reported as a truncation, never returned as a complete 
       // arrive — and the stdout it arrives with holds `session-opened` and nothing else. A helper
       // that returned it here would reproduce the original CI signature exactly, from a completely
       // different cause, which is the one confusion this change is not allowed to leave behind.
-      await assert.rejects(
+      //
+      // MUTATION ROUTE: delete the `child.kill('SIGKILL')` from the watchdog and leave `killed =
+      // true` where it is. Nothing closes the stand-in's pipes, the awaited end-of-file cannot
+      // arrive while it sleeps, and the failure lands HERE, by name, within three seconds — not
+      // two minutes later wearing the right message for the wrong reason.
+      const failure = await rejectionWithin(
         held.finish(),
+        3_000,
+        'a 300ms watchdog must kill the child and reject that soon after',
+      )
+      assert.match(
+        failure.message,
         /TRUNCATED rather than the child's complete output/,
         'a killed child must be reported as killed, not returned as though it had finished',
       )
@@ -220,6 +340,10 @@ test('a watchdog kill is reported as a truncation, never returned as a complete 
       const pid = Number(readFileSync(pidFile, 'utf8').trim())
       assert.ok(Number.isInteger(pid) && pid > 0, `the stand-in must have recorded its pid: ${pid}`)
       assert.equal(stillRunning(pid), false, 'and the watchdog must actually have killed it')
+      // The child is still sleeping at this point in any run that reaches here, so its death cannot
+      // have been natural — and the whole test has to have taken less time than the child has left.
+      const elapsed = Date.now() - startedAt
+      assert.ok(elapsed < 10_000, `the verdict must arrive long before the stand-in ends: took ${elapsed}ms`)
     })
   })
 })
@@ -251,4 +375,41 @@ test('a handshake that gives up leaves no child running (o3d-msv1)', { timeout: 
       assert.equal(stillRunning(pid), false, 'the abandoned stand-in must not be left running')
     })
   })
+})
+
+/**
+ * A BOUND OF 0, -1, NaN OR Infinity WOULD MAKE THE TWO TESTS ABOVE VACUOUS (o3d-msv1).
+ *
+ * `handshakeMs` and `watchdogMs` exist only so tests can reach the failure paths behind them, and
+ * the thing a test can now do by accident is switch a guard off while appearing to exercise it.
+ * node clamps a non-finite or negative delay to 1ms and warns; 0 fires on the next turn of the loop.
+ * So `{ watchdogMs: Infinity }` — written by someone who meant "do not time out" — kills every
+ * session at once and makes test 3's truncation arrive for a reason that has nothing to do with a
+ * timeout, and `{ handshakeMs: 0 }` abandons a session that answered perfectly well. Both are green
+ * runs proving nothing. They are refused where they enter, and this test is the reader of that.
+ *
+ * NO STAND-IN IS INSTALLED HERE ON PURPOSE. Nothing is spawned before the bounds are checked, so a
+ * rejection that names the parameter — rather than a handshake failure, a missing `psql`, or a hang
+ * on an Infinite deadline — is itself the evidence that the refusal happens at the public entry
+ * point and ahead of the child.
+ */
+test('holdSession refuses a bound that would silently disable the guard it names (o3d-msv1)', { timeout: 15_000 }, async () => {
+  const vacuous: readonly (readonly [string, number])[] = [
+    ['zero', 0],
+    ['negative', -1],
+    ['NaN', Number.NaN],
+    ['Infinity', Number.POSITIVE_INFINITY],
+  ]
+  for (const [label, value] of vacuous) {
+    await assert.rejects(
+      holdSession(STAND_IN_CLUSTER, 'imsuser', 'a-password', 'one_two_inventory', { handshakeMs: value }),
+      /holdSession: handshakeMs must be a positive, finite number of milliseconds/,
+      `a ${label} handshake bound must be refused by name`,
+    )
+    await assert.rejects(
+      holdSession(STAND_IN_CLUSTER, 'imsuser', 'a-password', 'one_two_inventory', { watchdogMs: value }),
+      /holdSession: watchdogMs must be a positive, finite number of milliseconds/,
+      `a ${label} watchdog bound must be refused by name`,
+    )
+  }
 })

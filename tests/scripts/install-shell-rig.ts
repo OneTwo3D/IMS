@@ -481,6 +481,31 @@ export interface HeldSessionOptions {
 }
 
 /**
+ * A BOUND THAT IS NOT A BOUND IS THE ONE WAY THESE PARAMETERS CAN DO HARM (o3d-msv1).
+ *
+ * They exist so a test can shorten a wait it would otherwise never reach; the cost of that is that
+ * a test can also pass a value which silently switches the guard off. `setTimeout(fn, 0)` fires
+ * before the child has done anything, so a watchdog of 0 kills every session and a handshake of 0
+ * abandons every one of them — the truncation path would then be reached by every caller and prove
+ * nothing about the timeout it is named for. `Infinity` and `NaN` are worse and quieter: node
+ * clamps both to 1ms with a runtime warning nobody reads, so a test that meant "never time out"
+ * gets "time out immediately" and a test that meant "wait a long time" gets the same. A negative
+ * value is clamped the same way. Every one of those is a guard that appears to be exercised and is
+ * not, which is precisely the defect class this file was written to close, so they are refused at
+ * the boundary by name rather than being allowed to produce a green run.
+ */
+function boundMs(name: string, value: number | undefined, fallback: number): number {
+  if (value === undefined) return fallback
+  if (typeof value !== 'number' || !Number.isFinite(value) || value <= 0) {
+    throw new TypeError(
+      `holdSession: ${name} must be a positive, finite number of milliseconds, not ${String(value)} `
+      + '— a zero, negative, NaN or Infinite bound does not lengthen or disable the guard, it fires it at once',
+    )
+  }
+  return value
+}
+
+/**
  * The predecessor, modelled as what it actually is: a process that authenticated BEFORE the
  * installer started and goes on issuing statements while it runs.
  *
@@ -497,8 +522,10 @@ export async function holdSession(
   database: string,
   options: HeldSessionOptions = {},
 ): Promise<HeldSession> {
-  const handshakeMs = options.handshakeMs ?? 15_000
-  const watchdogMs = options.watchdogMs ?? 30_000
+  // BEFORE THE SPAWN, so a refused bound costs no child and cannot be mistaken for a handshake
+  // failure. Both are reached from this entry point and only from it; there is no other way in.
+  const handshakeMs = boundMs('handshakeMs', options.handshakeMs, 15_000)
+  const watchdogMs = boundMs('watchdogMs', options.watchdogMs, 30_000)
   const env = cleanLibpqEnv()
   env.PGPASSWORD = password
   const child = spawn('psql', [
