@@ -56,6 +56,70 @@ Focused tests can also be run directly:
 npx tsx --test tests/<relevant-file>.test.ts
 ```
 
+### Database-backed tiers
+
+Two tiers need a real, migrated PostgreSQL and are therefore **not** part of `npm run test:unit`.
+Both are gated on environment variables, and the script named here is the invocation that sets them:
+
+```bash
+npm run test:concurrency   # RUN_DB_CONCURRENCY_TESTS=1   -> tests/concurrency/**
+npm run test:db            # RUN_DB_RETENTION_TESTS=1      -> tests/db/**
+```
+
+`RUN_DB_RETENTION_TESTS` was invented by one file in `tests/db/` and set by nothing for as long as it
+existed, so that file skipped inside a green CI job (Codex r18, HIGH). `npm run check:db-test-gates`
+now enumerates the gates that files in `tests/db/` actually read and fails if `test:db` does not set
+them all.
+
+**Read the gate honestly.** `npm run test:unit`'s glob (`tests/**/*.test.ts`) **collects** the gated
+files anyway and reports them as skips, so a missing variable removes whole suites from a run that
+still reads as green. Both database tiers are run in CI by
+`.github/workflows/schema-guardrails.yml`: `tests/concurrency/**` by the `fresh-db-drift` job, and
+`npm run test:db` — which globs `tests/db/**` — by the `db-backed-regressions` job, which stands up
+its own `postgres:16` service, migrates it, and runs the script against it. The two jobs deliberately
+do not share a database; the reason is written out above the second job.
+
+WHAT THAT DOES AND DOES NOT BUY YOU. State it precisely, because the looser version of this sentence
+("the job runs `tests/db/**`") was true of the glob and false of what executed:
+
+* **ENFORCED.** A pull request touching one of the job's `paths:` filters runs `npm run test:db`
+  against a freshly migrated database, and a failing suite turns the job red — proved by mutation,
+  not by reading: set `PRESERVE_LEGACY_WC_ORDER_CURRENCY_EVIDENCE = false` in
+  `lib/connectors/shopping-webhook-retention.ts` and `npm run test:db` exits non-zero.
+* **ENFORCED.** Every `RUN_DB_*` gate read by a file in `tests/db/` is set to `1` by `test:db`, with
+  a `REQUIRE_` counterpart that some file in that directory actually reads. That is
+  `npm run check:db-test-gates` (`scripts/check-db-test-gates.mjs`), which runs as a step of the same
+  job before the suites and is also in `npm run check:all`. A new gated file that invents a new
+  variable fails it until the variable is wired up, or written into
+  `scripts/db-test-gate-allowlist.json` with a reason.
+* **NOT ENFORCED: that the job keeps existing.** o3d-11rf r13 through r16 attempted that with a
+  standing guard that read the workflow to prove the job really invoked the script; the guard was
+  withdrawn, because it kept admitting deterministic states in which the job was green and the suites
+  never ran, and a guard that reports enforcement it does not have is worse than none. An edit that
+  deletes the job, renames the script, or drops `tests/db/**` from the `paths:` filters is caught by
+  review and by nothing else. The census above deliberately does **not** read the workflow.
+* **NOT ENFORCED: `tests/concurrency/**`.** `RUN_DB_CONCURRENCY_TESTS` has no `REQUIRE_` counterpart
+  in any file, and the census covers only the directories in its own `SUITES` table, which today is
+  `tests/db` alone. Dropping that variable from `test:concurrency` would silently skip that whole
+  tier exactly as `RUN_DB_RETENTION_TESTS` did.
+* **NOT ENFORCED: that a gated file's tests are non-vacuous.** The census proves a gate is set; only
+  a mutation proves the tests behind it assert anything.
+
+**o3d-n3yt** carries the remaining holes.
+
+`test:db` sets **`REQUIRE_DB_RETENTION_TESTS=1`** alongside `RUN_DB_RETENTION_TESTS=1`. A gated file
+that finds the `REQUIRE_` half set and its own half not throws on load instead of skipping, so a
+future invocation that sets only half a pair fails loudly rather than quietly running nothing. An
+unset pair is an ordinary local run and still skips. The census is what makes a new gate arrive with
+both halves.
+
+`tests/db/shopping-webhook-retention-evidence.test.ts` **seeds the two rows it probes** and deletes
+them in a `finally`. It used to select them from whatever the target database already held, which is
+why it could not be pointed at CI's empty one.
+
+To run either tier locally, point `DATABASE_URL` at a scratch database you do not mind writing to
+(the suites roll their probes back, but they do write).
+
 ### Full-chain E2E tier
 
 `e2e/full-chain/` is a separate, opt-in tier that originates a real order in the stage
