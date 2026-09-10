@@ -1,5 +1,10 @@
 import { Prisma } from '@/app/generated/prisma/client'
 import type { WmsStockLine } from '@/lib/connectors/wms/types'
+import {
+  requireTransferLineResidualQty,
+  type TransferLineResidualQty,
+  type WmsAsnLineResidualQty,
+} from '@/lib/domain/inventory/transfer-landed-quantity'
 
 type ThresholdConfig = {
   absoluteDelta: number | null
@@ -15,21 +20,21 @@ export type MintsoftMissingInWmsCandidate = {
 
 export type MintsoftAlignmentCandidate = {
   asnLineMapId: string
-  expectedQty: number
-  qtyAccountedViaSnapshot: number
-  lastProcessedReceivedQty: number
   /**
-   * For a STOCK_TRANSFER_LINE candidate: how much of the SOURCE transfer line has
-   * already landed, from lib/domain/inventory/transfer-landed-quantity (6oyu.19,
-   * Codex round-6 HIGH-1). Null for a PURCHASE_ORDER_LINE candidate, whose landed
-   * quantity is not this question.
-   *
-   * Capacity used to be `expectedQty − max(snapshot, lastProcessed)`, which is blind
-   * to units a MANUAL receipt landed: `stock_transfer_lines.qtyReceived` moves and
-   * neither ASN column does, so a fully-received transfer line still looked like an
-   * open ASN line with room to absorb a WMS delta.
+   * ASN SCOPE (6oyu.19, Codex round-7 HIGH-2): how much room THIS `wms_asn_line_maps`
+   * row itself still has — `expectedQty` less its own credit. Built only by
+   * `resolveWmsAsnLineResidualQty`, so the line-wide landed figure cannot be passed
+   * here: that is precisely the substitution round 6 made, and it under-allocated
+   * every ASN after the first on a multi-ASN transfer line.
    */
-  sourceLineLandedQty?: number | null
+  asnResidualQty: WmsAsnLineResidualQty
+  /**
+   * The transfer line this ASN row draws from, or null for a PURCHASE_ORDER_LINE
+   * candidate. When non-null the planner ALSO applies that line's own residue, so
+   * an already-received transfer line offers no capacity however open its ASN rows
+   * look (the round-6 finding). See `transferLineResiduals` below.
+   */
+  transferLineId: string | null
   sortAt: Date | string
   sortId: string
 }
@@ -175,9 +180,38 @@ export function collectMissingInWmsCandidates(input: {
     .sort((left, right) => left.sku.localeCompare(right.sku))
 }
 
+/**
+ * Spread a positive Mintsoft delta across the open ASN lines that can explain it.
+ *
+ * TWO CAPS, TWO SCOPES (6oyu.19, Codex rounds 6 and 7). An allocation is bounded by
+ * BOTH:
+ *
+ *   1. its own ASN row's residue  — `expectedQty` less that row's own credit; and
+ *   2. its transfer line's residue — `line.qty` less everything that has landed on
+ *      the line by ANY route, shared across every open ASN row of that line and
+ *      depleted as this plan allocates.
+ *
+ * Applying only (1) is the round-6 finding: a line received manually moves
+ * `stock_transfer_lines.qtyReceived` and neither ASN column, so a fully received
+ * line still looked like open capacity. Applying only (2) — round 6's fix, which
+ * subtracted the line-wide landed figure from each ASN row individually — is the
+ * round-7 finding: units absorbed on an earlier, now-closed ASN were charged a
+ * second time against the follow-up ASN raised for the remainder, so a legitimate
+ * delta was rejected with units unallocated and IMS stock left short.
+ *
+ * The two figures are separately branded types, so neither can be supplied where
+ * the other is meant.
+ */
 export function planMintsoftAlignmentAllocations(input: {
   delta: number
   candidates: MintsoftAlignmentCandidate[]
+  /**
+   * LINE SCOPE: the residue of every transfer line any candidate draws from, keyed
+   * by transfer-line id. Required (pass an empty map when every candidate is a PO
+   * line); a candidate naming a transfer line that is absent from this map throws,
+   * because "no entry" and "no cap" must not look alike.
+   */
+  transferLineResiduals: ReadonlyMap<string, TransferLineResidualQty>
 }): {
   allocations: MintsoftAlignmentAllocation[]
   unallocatedQty: number
@@ -198,20 +232,26 @@ export function planMintsoftAlignmentAllocations(input: {
     return left.sortId.localeCompare(right.sortId)
   })
 
+  // Remaining LINE-scope capacity, depleted as this plan allocates, so several open
+  // ASN rows on one transfer line share the line's residue instead of each getting
+  // the whole of it.
+  const lineCapacityRemaining = new Map<string, number>()
+
   for (const candidate of candidates) {
     if (remaining <= 0) break
 
-    const alreadyCreditedQty = Math.max(
-      0,
-      Math.max(
-        candidate.qtyAccountedViaSnapshot,
-        candidate.lastProcessedReceivedQty,
-        // A transfer line's landed quantity counts against this ASN line's capacity
-        // too — see the field's comment (6oyu.19 Codex r6).
-        candidate.sourceLineLandedQty ?? 0,
-      ),
-    )
-    const availableQty = Math.max(0, candidate.expectedQty - alreadyCreditedQty)
+    const transferLineId = candidate.transferLineId
+    let availableQty = Math.max(0, candidate.asnResidualQty.qtyNumber)
+
+    if (transferLineId != null) {
+      let lineCapacity = lineCapacityRemaining.get(transferLineId)
+      if (lineCapacity === undefined) {
+        lineCapacity = Math.max(0, requireTransferLineResidualQty(input.transferLineResiduals, transferLineId).qtyNumber)
+        lineCapacityRemaining.set(transferLineId, lineCapacity)
+      }
+      availableQty = Math.min(availableQty, lineCapacity)
+    }
+
     if (availableQty <= 0) continue
 
     const qty = Math.min(remaining, availableQty)
@@ -220,6 +260,9 @@ export function planMintsoftAlignmentAllocations(input: {
       qty,
     })
     remaining -= qty
+    if (transferLineId != null) {
+      lineCapacityRemaining.set(transferLineId, (lineCapacityRemaining.get(transferLineId) ?? 0) - qty)
+    }
   }
 
   return {

@@ -8,6 +8,31 @@ import {
 
 export const WMS_RECEIPT_QTY_EPSILON = 0.0001
 
+/**
+ * The parent transfer statuses under which a `wms_asn_line_maps` row may still be
+ * used to bring units into stock (6oyu.19, Codex round-7 HIGH-1).
+ *
+ * WHY THIS IS SHARED. The WMS webhook book-in has always checked this — an ASN
+ * callback for a transfer that is not IN_TRANSIT or RECEIVED is refused. The WMS
+ * stock-sync ALIGNMENT path never did, and nothing closes a transfer's ASN when its
+ * dispatch is cancelled: `cancelDispatchedTransfer` restores the FULL line quantity
+ * and its cost layers to the SOURCE and leaves the ASN open. A later automatic
+ * align-up could then use that cancelled line, add stock at the DESTINATION and
+ * create a second replacement layer linked to the same source layer, so one
+ * subsequent landed-cost revaluation propagated into both live layers and posted
+ * the inventory reclassification twice. That is the same double-count this branch
+ * exists to close, reached from a route the branch did not touch — it predates the
+ * branch (see o3d-1mga for production prevalence).
+ *
+ * DRAFT is excluded as well as CANCELLED: nothing has been dispatched, so there is
+ * no cost-layer snapshot to slice and no units to bring to rest.
+ */
+export const WMS_RECEIPT_USABLE_TRANSFER_STATUSES = ['IN_TRANSIT', 'RECEIVED'] as const
+
+export function isTransferUsableForWmsReceipt(status: string): boolean {
+  return (WMS_RECEIPT_USABLE_TRANSFER_STATUSES as ReadonlyArray<string>).includes(status)
+}
+
 export type BookedInDryRunWarningCode =
   | 'remote_regression'
   | 'missing_local_line'

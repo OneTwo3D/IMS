@@ -301,3 +301,122 @@ export function transferLineOutstandingQty(lineQty: DecimalInput, landed: Transf
 export function isTransferLineFullyLanded(lineQty: DecimalInput, landed: TransferLineLandedQty): boolean {
   return transferLineOutstandingQty(lineQty, landed).lte(TRANSFER_LANDED_QTY_EPSILON)
 }
+
+// ---------------------------------------------------------------------------
+// TWO RESIDUES, TWO BRANDS (6oyu.19, Codex round-7 HIGH-2)
+// ---------------------------------------------------------------------------
+
+/**
+ * `TransferLineLandedQty` above answers exactly ONE question — "how much of this
+ * LINE has landed" — and round 6 handed that answer to a caller that needed a
+ * DIFFERENT one: "how much room does THIS ASN row still have".
+ *
+ * The WMS stock-sync alignment planner subtracted the line-wide landed figure from
+ * each individual ASN row's own `expectedQty`. For a ten-unit transfer line with three
+ * units absorbed on a first, now-closed ASN, the follow-up ASN is correctly raised
+ * for the remaining seven — and the planner then subtracted the line-wide three
+ * from those seven and exposed four. A seven-unit WMS delta was rejected with
+ * three units unallocated, and IMS stock stayed wrong.
+ *
+ * The brand did not catch it because both figures are "a landed quantity" and only
+ * one of them had a name. So there are now two names and two SEPARATE brands:
+ *
+ *   · `TransferLineResidualQty` — LINE scope. `line.qty − landed`. How many more
+ *     units this transfer line may take in EVER, across every ASN it spans.
+ *   · `WmsAsnLineResidualQty`   — ASN scope. `expectedQty − this row's own credit`.
+ *     How many more units THIS ASN row may absorb.
+ *
+ * Neither type is assignable to the other, so passing a line-wide figure where a
+ * per-ASN residue is required is a compile error rather than a silent
+ * under-allocation. A correct allocator needs BOTH, as two separate caps: each
+ * allocation is limited by its own ASN row, AND the allocations against one
+ * transfer line are limited in total by that line. Applying either cap alone is a
+ * defect — the ASN cap alone is the round-6 finding (a manually received line still
+ * looked open), the line cap alone is this one.
+ */
+
+declare const TRANSFER_LINE_RESIDUAL_QTY_BRAND: unique symbol
+declare const WMS_ASN_LINE_RESIDUAL_QTY_BRAND: unique symbol
+
+/** LINE SCOPE: how much of a transfer line has not landed anywhere yet. */
+export type TransferLineResidualQty = {
+  readonly [TRANSFER_LINE_RESIDUAL_QTY_BRAND]: 'transfer-line-residual-qty'
+  readonly transferLineId: string
+  readonly qty: Decimal
+  readonly qtyNumber: number
+}
+
+/** ASN SCOPE: how much of ONE `wms_asn_line_maps` row's expectation is uncredited. */
+export type WmsAsnLineResidualQty = {
+  readonly [WMS_ASN_LINE_RESIDUAL_QTY_BRAND]: 'wms-asn-line-residual-qty'
+  readonly asnLineMapId: string
+  readonly qty: Decimal
+  readonly qtyNumber: number
+}
+
+/**
+ * LINE-SCOPE residue. THE ONLY constructor of `TransferLineResidualQty`.
+ *
+ * Takes the landed quantity rather than a number, so the line cap and the snapshot
+ * offset provably come from the same reading of the same two columns.
+ */
+export function resolveTransferLineResidualQty(input: {
+  lineQty: DecimalInput
+  landed: TransferLineLandedQty
+}): TransferLineResidualQty {
+  const qty = transferLineOutstandingQty(input.lineQty, input.landed)
+  return {
+    transferLineId: input.landed.transferLineId,
+    qty,
+    qtyNumber: qty.toNumber(),
+  } as TransferLineResidualQty
+}
+
+/**
+ * ASN-SCOPE residue. THE ONLY constructor of `WmsAsnLineResidualQty`.
+ *
+ * Reads ONLY this row's own columns. `qtyAccountedViaSnapshot` (what alignment has
+ * credited here) and `lastProcessedReceivedQty` (what the WMS has reported booked
+ * in here) overlap — a webhook receipt reports units an earlier alignment already
+ * credited — so the credit is their MAX, never their sum.
+ *
+ * Deliberately blind to `stock_transfer_lines.qtyReceived`: that is a LINE fact and
+ * cannot be charged against one ASN row. It is carried by
+ * `resolveTransferLineResidualQty` instead, and an allocator must apply both.
+ */
+export function resolveWmsAsnLineResidualQty(input: {
+  asnLineMapId: string
+  expectedQty: DecimalInput
+  qtyAccountedViaSnapshot: DecimalInput
+  lastProcessedReceivedQty: DecimalInput
+}): WmsAsnLineResidualQty {
+  const snapshotCredit = maxZero(toDecimal(input.qtyAccountedViaSnapshot))
+  const receiptCredit = maxZero(toDecimal(input.lastProcessedReceivedQty))
+  const credited = snapshotCredit.gt(receiptCredit) ? snapshotCredit : receiptCredit
+  const qty = maxZero(roundQuantity(subtractMoney(toDecimal(input.expectedQty), credited), 6))
+  return {
+    asnLineMapId: input.asnLineMapId,
+    qty,
+    qtyNumber: qty.toNumber(),
+  } as WmsAsnLineResidualQty
+}
+
+/**
+ * The LINE-scope residue for one line out of a map keyed by transfer-line id.
+ * Throws rather than defaulting: a missing entry means the caller assembled the
+ * residues over a different set of lines than it is now allocating against, and
+ * silently answering "no cap" is how round 6's regression would come back.
+ */
+export function requireTransferLineResidualQty(
+  residualByLineId: ReadonlyMap<string, TransferLineResidualQty>,
+  transferLineId: string,
+): TransferLineResidualQty {
+  const residual = residualByLineId.get(transferLineId)
+  if (!residual) {
+    throw new Error(
+      `requireTransferLineResidualQty: no line-scope residual quantity was loaded for transfer line ${transferLineId}. ` +
+      'Build it with resolveTransferLineResidualQty over the SAME set of lines being allocated against (6oyu.19 Codex r7).',
+    )
+  }
+  return residual
+}

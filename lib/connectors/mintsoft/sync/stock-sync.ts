@@ -17,10 +17,18 @@ import {
   parseMintsoftThresholds,
 } from './stock-sync-helpers'
 import { applyStockAdjustment } from '@/lib/domain/inventory/stock-adjustment-apply'
-import { sliceTransferSnapshotForReceipt } from '@/lib/domain/wms/asn-reconciliation'
+import {
+  isTransferUsableForWmsReceipt,
+  sliceTransferSnapshotForReceipt,
+  WMS_RECEIPT_USABLE_TRANSFER_STATUSES,
+} from '@/lib/domain/wms/asn-reconciliation'
 import {
   loadTransferLineLandedQty,
   requireLandedQty,
+  resolveTransferLineResidualQty,
+  resolveWmsAsnLineResidualQty,
+  type TransferLineResidualQty,
+  type WmsAsnLineResidualQty,
 } from '@/lib/domain/inventory/transfer-landed-quantity'
 import {
   buildStockMovementValueFields,
@@ -534,22 +542,67 @@ type AlignmentCandidateLine = {
   sourceLineId: string
   productId: string
   sku: string
-  expectedQty: number
-  qtyAccountedViaSnapshot: number
-  lastProcessedReceivedQty: number
-  /** How much of the SOURCE transfer line has already landed; null for a PO line. */
-  sourceLineLandedQty: number | null
+  /**
+   * ASN SCOPE: how much room THIS ASN row itself still has (6oyu.19 Codex r7 HIGH-2).
+   * Separately branded from the line-scope residue below so the two cannot be
+   * swapped — round 6 subtracted the line-wide figure from each ASN row and
+   * under-allocated every ASN after the first on a multi-ASN transfer line.
+   */
+  asnResidualQty: WmsAsnLineResidualQty
+  /** Parent transfer id for a STOCK_TRANSFER_LINE candidate; null for a PO line. */
+  transferId: string | null
   asn: {
     externalAsnId: string
     createdAt: Date
   }
 }
 
+/** An ASN row that exists but must NOT be aligned against, and why. */
+type RefusedAlignmentCandidate = {
+  asnLineMapId: string
+  externalAsnId: string
+  reason: string
+}
+
+type AlignmentCandidateSet = {
+  candidates: AlignmentCandidateLine[]
+  /**
+   * LINE SCOPE: residue of every transfer line the usable candidates draw from,
+   * keyed by transfer-line id. The planner applies this as a second cap, shared
+   * across the line's open ASN rows.
+   */
+  transferLineResiduals: Map<string, TransferLineResidualQty>
+  /**
+   * Every parent transfer of every transfer-backed ASN row seen — including the
+   * refused ones — so the caller knows which `stock_transfers` rows to lock.
+   */
+  parentTransferIds: string[]
+  refused: RefusedAlignmentCandidate[]
+}
+
+/**
+ * The open ASN lines that may absorb a positive Mintsoft delta for this product.
+ *
+ * PARENT STATUS IS PART OF USABILITY (6oyu.19, Codex round-7 HIGH-1). Cancelling a
+ * dispatch restores the whole line and its cost layers to the SOURCE and leaves the
+ * transfer's ASN OPEN — nothing closes it. Without this check a later automatic
+ * align-up used the cancelled line, added stock at the DESTINATION and created a
+ * second replacement layer linked to the same source layer, so one later landed-cost
+ * revaluation propagated into both live layers and double-posted the inventory
+ * reclassification. The predicate is the one the WMS webhook book-in has always
+ * applied, shared from lib/domain/wms/asn-reconciliation so the two agree.
+ *
+ * `lockedTransferIds`, when supplied, is the set of `stock_transfers` rows this
+ * transaction holds FOR UPDATE. A candidate whose parent is not in it is refused:
+ * its status could be changing underneath this read, and a cancellation that
+ * interleaves with an alignment is exactly the concurrent form of the same defect.
+ */
 async function getAlignmentCandidateLines(
   tx: Prisma.TransactionClient,
   binding: SyncBinding,
   productId: string,
-): Promise<AlignmentCandidateLine[]> {
+  lockedTransferIds?: ReadonlySet<string>,
+): Promise<AlignmentCandidateSet> {
   const lines = await tx.wmsAsnLineMap.findMany({
     where: {
       productId,
@@ -584,34 +637,124 @@ async function getAlignmentCandidateLines(
     ],
   })
 
-  // 6oyu.19 (Codex r6): a transfer line that has already landed — by a manual
-  // receipt, a webhook book-in or an earlier alignment — has no capacity left,
-  // whatever this ASN row's own counters say. One query for the whole candidate set.
-  const transferLineIds = lines
+  const transferLineIds = [...new Set(lines
     .filter((line) => line.sourceType === 'STOCK_TRANSFER_LINE')
-    .map((line) => line.sourceLineId)
+    .map((line) => line.sourceLineId))]
   const transferLines = transferLineIds.length === 0
     ? []
     : await tx.stockTransferLine.findMany({
       where: { id: { in: transferLineIds } },
-      select: { id: true, qtyReceived: true },
+      select: {
+        id: true,
+        qty: true,
+        qtyReceived: true,
+        transferId: true,
+        transfer: { select: { reference: true, status: true } },
+      },
     })
-  const landedByTransferLineId = await loadTransferLineLandedQty(tx, transferLines)
+  const transferLineById = new Map(transferLines.map((line) => [line.id, line]))
+  // 6oyu.19 (Codex r6): capacity must count what has LANDED on the transfer line by
+  // ANY route — a manual receipt moves stock_transfer_lines.qtyReceived and touches
+  // neither ASN column. One query for the whole candidate set.
+  const landedByTransferLineId = await loadTransferLineLandedQty(
+    tx,
+    transferLines.map((line) => ({ id: line.id, qtyReceived: line.qtyReceived })),
+  )
 
-  return lines.map((line) => ({
-    id: line.id,
-    sourceType: line.sourceType as 'PURCHASE_ORDER_LINE' | 'STOCK_TRANSFER_LINE',
-    sourceLineId: line.sourceLineId,
-    productId: line.productId,
-    sku: line.sku,
-    expectedQty: Number(line.expectedQty),
-    qtyAccountedViaSnapshot: Number(line.qtyAccountedViaSnapshot),
-    lastProcessedReceivedQty: Number(line.lastProcessedReceivedQty),
-    sourceLineLandedQty: line.sourceType === 'STOCK_TRANSFER_LINE'
-      ? (landedByTransferLineId.get(line.sourceLineId)?.qtyNumber ?? 0)
-      : null,
-    asn: line.asn,
-  }))
+  const candidates: AlignmentCandidateLine[] = []
+  const transferLineResiduals = new Map<string, TransferLineResidualQty>()
+  const refused: RefusedAlignmentCandidate[] = []
+  const parentTransferIds = new Set<string>()
+
+  for (const line of lines) {
+    const asnResidualQty = resolveWmsAsnLineResidualQty({
+      asnLineMapId: line.id,
+      expectedQty: line.expectedQty,
+      qtyAccountedViaSnapshot: line.qtyAccountedViaSnapshot,
+      lastProcessedReceivedQty: line.lastProcessedReceivedQty,
+    })
+
+    if (line.sourceType !== 'STOCK_TRANSFER_LINE') {
+      candidates.push({
+        id: line.id,
+        sourceType: 'PURCHASE_ORDER_LINE',
+        sourceLineId: line.sourceLineId,
+        productId: line.productId,
+        sku: line.sku,
+        asnResidualQty,
+        transferId: null,
+        asn: line.asn,
+      })
+      continue
+    }
+
+    const transferLine = transferLineById.get(line.sourceLineId)
+    if (!transferLine) {
+      refused.push({
+        asnLineMapId: line.id,
+        externalAsnId: line.asn.externalAsnId,
+        reason: `transfer line ${line.sourceLineId} no longer exists`,
+      })
+      continue
+    }
+    parentTransferIds.add(transferLine.transferId)
+
+    if (lockedTransferIds && !lockedTransferIds.has(transferLine.transferId)) {
+      refused.push({
+        asnLineMapId: line.id,
+        externalAsnId: line.asn.externalAsnId,
+        reason: `transfer ${transferLine.transfer.reference} appeared after this run took its transfer locks`,
+      })
+      continue
+    }
+
+    if (!isTransferUsableForWmsReceipt(transferLine.transfer.status)) {
+      refused.push({
+        asnLineMapId: line.id,
+        externalAsnId: line.asn.externalAsnId,
+        reason: `transfer ${transferLine.transfer.reference} is ${transferLine.transfer.status}`,
+      })
+      continue
+    }
+
+    transferLineResiduals.set(transferLine.id, resolveTransferLineResidualQty({
+      lineQty: transferLine.qty,
+      landed: requireLandedQty(landedByTransferLineId, transferLine.id),
+    }))
+    candidates.push({
+      id: line.id,
+      sourceType: 'STOCK_TRANSFER_LINE',
+      sourceLineId: line.sourceLineId,
+      productId: line.productId,
+      sku: line.sku,
+      asnResidualQty,
+      transferId: transferLine.transferId,
+      asn: line.asn,
+    })
+  }
+
+  return {
+    candidates,
+    transferLineResiduals,
+    parentTransferIds: [...parentTransferIds],
+    refused,
+  }
+}
+
+/**
+ * Why no ASN line could take the delta, naming the refused ones. A cancelled parent
+ * transfer is the answer an operator most needs to see, and a silent "no capacity"
+ * would read as a threshold problem.
+ */
+function describeRefusedAlignmentCandidates(refused: ReadonlyArray<RefusedAlignmentCandidate>): string {
+  if (refused.length === 0) return ''
+  const listed = refused
+    .slice(0, 3)
+    .map((entry) => `ASN ${entry.externalAsnId} (${entry.reason})`)
+    .join('; ')
+  const more = refused.length > 3 ? ` and ${refused.length - 3} more` : ''
+  return ` Unusable open ASN line${refused.length === 1 ? '' : 's'} skipped: ${listed}${more}.` +
+    ` Alignment only uses an ASN whose transfer is ${WMS_RECEIPT_USABLE_TRANSFER_STATUSES.join(' or ')}.`
 }
 
 async function lockAlignmentCandidateLines(
@@ -620,6 +763,30 @@ async function lockAlignmentCandidateLines(
 ): Promise<void> {
   if (candidateIds.length === 0) return
   await tx.$queryRaw`SELECT id FROM wms_asn_line_maps WHERE id = ANY(${candidateIds}::text[]) ORDER BY id FOR UPDATE`
+}
+
+/**
+ * Lock the PARENT transfers of the transfer-backed candidates (6oyu.19, Codex
+ * round-7 HIGH-1).
+ *
+ * Alignment used to lock ASN rows only, while every cancellation and receipt path
+ * locks `stock_transfers`. The two therefore interleaved: a cancellation could
+ * commit between alignment's status read and its writes, so alignment added stock
+ * and a linked layer at the destination for units the cancellation had just
+ * recreated in full at the source. Taking the transfer lock makes the status the
+ * candidate query reads a fact the same lock covers, so the ASN's usability cannot
+ * change under this transaction.
+ *
+ * ORDER: ASN rows first, then transfers, then stock levels — the order
+ * lib/domain/wms/booked-in-service.ts already uses, and cancellation takes
+ * transfers before stock levels and never touches ASN rows, so no cycle exists.
+ */
+async function lockAlignmentCandidateTransfers(
+  tx: Prisma.TransactionClient,
+  transferIds: string[],
+): Promise<void> {
+  if (transferIds.length === 0) return
+  await tx.$queryRaw`SELECT id FROM stock_transfers WHERE id = ANY(${transferIds}::text[]) ORDER BY id FOR UPDATE`
 }
 
 async function lockStockLevelForAlignment(
@@ -671,7 +838,17 @@ async function lockStockLevelForAlignment(
   }
 }
 
-async function applyMintsoftAlignmentForProduct(params: {
+/**
+ * Apply a positive Mintsoft delta by absorbing it into open ASN lines.
+ *
+ * EXPORTED FOR THE DB-BACKED PROOFS in
+ * tests/concurrency/mintsoft-alignment-cancelled-transfer.concurrent.test.ts
+ * (6oyu.19, Codex round-7 HIGH-1). Everything above this function reaches the LIVE
+ * Mintsoft API, so this is the deepest seam a test can drive without going to the
+ * wire; the alignment's own writes — candidate selection, locking, layer creation —
+ * are all below it. Production's only caller is the sweep in this file.
+ */
+export async function applyMintsoftAlignmentForProduct(params: {
   binding: SyncBinding
   jobId: string
   productId: string
@@ -693,39 +870,54 @@ async function applyMintsoftAlignmentForProduct(params: {
     }
   }
   const outcome = await db.$transaction(async (tx) => {
-    let candidates = await getAlignmentCandidateLines(tx, params.binding, params.productId)
+    // First, unlocked read — enough to learn WHICH rows to lock.
+    const unlocked = await getAlignmentCandidateLines(tx, params.binding, params.productId)
+    if (unlocked.candidates.length === 0) {
+      return {
+        kind: 'unavailable' as const,
+        correctedQty: 0,
+        reason: `No open ASN line is available to absorb this WMS delta.${describeRefusedAlignmentCandidates(unlocked.refused)}`,
+      }
+    }
+
+    // Lock the ASN rows AND their parent transfers, then read again: every fact the
+    // plan is built on — the ASN counters and the parent transfer's status — is now
+    // covered by a lock this transaction holds (6oyu.19 Codex r7 HIGH-1).
+    await lockAlignmentCandidateLines(tx, unlocked.candidates.map((candidate) => candidate.id))
+    await lockAlignmentCandidateTransfers(tx, unlocked.parentTransferIds)
+    const lockedTransferIds = new Set(unlocked.parentTransferIds)
+    const candidateSet = await getAlignmentCandidateLines(tx, params.binding, params.productId, lockedTransferIds)
+    const candidates = candidateSet.candidates
+
     if (candidates.length === 0) {
       return {
         kind: 'unavailable' as const,
         correctedQty: 0,
-        reason: 'No open ASN line is available to absorb this WMS delta.',
+        reason: `No open ASN line is available to absorb this WMS delta.${describeRefusedAlignmentCandidates(candidateSet.refused)}`,
       }
     }
-
-    await lockAlignmentCandidateLines(tx, candidates.map((candidate) => candidate.id))
-    candidates = await getAlignmentCandidateLines(tx, params.binding, params.productId)
 
     const plan = planMintsoftAlignmentAllocations({
       delta: params.delta,
       candidates: candidates.map((candidate) => ({
         asnLineMapId: candidate.id,
-        expectedQty: candidate.expectedQty,
-        qtyAccountedViaSnapshot: candidate.qtyAccountedViaSnapshot,
-        lastProcessedReceivedQty: candidate.lastProcessedReceivedQty,
-        sourceLineLandedQty: candidate.sourceLineLandedQty,
+        asnResidualQty: candidate.asnResidualQty,
+        transferLineId: candidate.sourceType === 'STOCK_TRANSFER_LINE' ? candidate.sourceLineId : null,
         sortAt: candidate.asn.createdAt,
         sortId: candidate.id,
       })),
+      transferLineResiduals: candidateSet.transferLineResiduals,
     })
 
     if (plan.allocations.length === 0 || plan.unallocatedQty > 0.0001) {
       const coveredQty = params.delta - plan.unallocatedQty
+      const refusedNote = describeRefusedAlignmentCandidates(candidateSet.refused)
       return {
         kind: 'unavailable' as const,
         correctedQty: 0,
         reason: coveredQty > 0
-          ? `Open ASN lines only explain ${formatQuantity(coveredQty)} of the ${formatQuantity(params.delta)} delta; leaving stock unchanged.`
-          : 'No open ASN line has remaining capacity for this WMS delta.',
+          ? `Open ASN lines only explain ${formatQuantity(coveredQty)} of the ${formatQuantity(params.delta)} delta; leaving stock unchanged.${refusedNote}`
+          : `No open ASN line has remaining capacity for this WMS delta.${refusedNote}`,
       }
     }
 

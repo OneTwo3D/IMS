@@ -5,6 +5,7 @@ import type { WmsAsnRef } from '@/lib/connectors/wms/types'
 import { recreateTransferCostLayersFromSnapshotSlice } from '@/lib/domain/inventory/transfer-cost-layer-recreation'
 import {
   buildBookedInDryRun,
+  isTransferUsableForWmsReceipt,
   reconcileBookedInQuantities,
   sliceTransferSnapshotForReceipt,
   type BookedInDryRun,
@@ -867,7 +868,10 @@ export async function processBookedInEvent(
           throw new Error(`Transfer ${transferId} not found for ASN ${lockedEvent.externalAsnId}`)
         }
 
-        if (!['IN_TRANSIT', 'RECEIVED'].includes(transfer.status)) {
+        // 6oyu.19 (Codex round-7 HIGH-1): the same predicate the stock-sync
+        // alignment path now uses, so the two ways an ASN brings units into stock
+        // agree about which parent statuses make an ASN usable.
+        if (!isTransferUsableForWmsReceipt(transfer.status)) {
           throw new Error(`Transfer ${transfer.reference} is not in transit for ASN ${lockedEvent.externalAsnId}`)
         }
 
