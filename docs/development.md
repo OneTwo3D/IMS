@@ -68,8 +68,29 @@ npm run test:db            # RUN_DB_RETENTION_TESTS=1      -> tests/db/**
 
 `RUN_DB_RETENTION_TESTS` was invented by one file in `tests/db/` and set by nothing for as long as it
 existed, so that file skipped inside a green CI job (Codex r18, HIGH). `npm run check:db-test-gates`
-now enumerates the gates that files in `tests/db/` actually read and fails if `test:db` does not set
-them all.
+now enumerates the gates that files in `tests/db/` actually read and fails if the process `test:db`
+starts for the file that reads one does not have it set.
+
+**How it establishes that, since r20 (Codex r19, four HIGHs).** The first version answered every
+question from text — it recognised a fixed list of `process.env` shapes and contributed nothing for
+the rest, listed only the direct children of `tests/db/` while the command's glob was `**`, and
+accepted `command.includes('tests/db')` as proof the command ran the directory. Each of those PASSED
+what it could not model, and its one non-vacuity check ("some gate was found") stayed satisfied by the
+single gate that was already known. It now:
+
+* **fails on any `process.env` use it cannot resolve to a name**, naming the file and line — a
+  computed key, the whole object bound to a variable, a `RUN_DB_*` name standing alone as a string
+  literal (which is what a delegated `readGate('RUN_DB_NEW')` looks like);
+* **runs the npm script** with `scripts/db-test-gate-collection-probe.mjs` on `NODE_OPTIONS`, which
+  records each file the runner collects and the gate values that file's own process was started with,
+  and exits that process before the test file is loaded. Nothing in the suite executes. An empty
+  collection is a failure, so a script that merely mentions the directory fails;
+* **requires the set it collects and the recursive set of `*.test.ts` under the directory to be equal**;
+* **checks non-vacuity per file** — every file in the list was read and parsed — rather than counting
+  gates.
+
+`tests/scripts/db-test-gate-census.test.ts` is the census's own suite: it builds a throwaway
+repository for each of those shapes and requires a non-zero exit, with a wired fixture as the control.
 
 **Read the gate honestly.** `npm run test:unit`'s glob (`tests/**/*.test.ts`) **collects** the gated
 files anyway and reports them as skips, so a missing variable removes whole suites from a run that
@@ -104,6 +125,10 @@ WHAT THAT DOES AND DOES NOT BUY YOU. State it precisely, because the looser vers
   tier exactly as `RUN_DB_RETENTION_TESTS` did.
 * **NOT ENFORCED: that a gated file's tests are non-vacuous.** The census proves a gate is set; only
   a mutation proves the tests behind it assert anything.
+* **NOT ENFORCED: a gate whose NAME never appears in the test file.** The census scans the collected
+  test files, so `readGate('RUN_DB_NEW')` fails it — the name is there — but a `runIfGated()` whose
+  gate name lives only in an imported helper does not. Following imports would mean applying the same
+  refusals to `lib/`, where `process.env` is legitimately read in shapes this census does not model.
 
 **o3d-n3yt** carries the remaining holes.
 
@@ -113,9 +138,19 @@ future invocation that sets only half a pair fails loudly rather than quietly ru
 unset pair is an ordinary local run and still skips. The census is what makes a new gate arrive with
 both halves.
 
-`tests/db/shopping-webhook-retention-evidence.test.ts` **seeds the two rows it probes** and deletes
-them in a `finally`. It used to select them from whatever the target database already held, which is
-why it could not be pointed at CI's empty one.
+`tests/db/shopping-webhook-retention-evidence.test.ts` **seeds the two rows it probes** in a single
+transaction and removes them afterwards through `tests/helpers/with-cleanup.ts`. It used to select them
+from whatever the target database already held, which is why it could not be pointed at CI's empty one;
+it then seeded them with two separate `create` calls before its `try`, so a seed that failed halfway
+left the first row behind with nothing on any path to remove it (Codex r19). `withCleanup()` also keeps
+a failing cleanup from REPLACING the assertion failure it follows — the run stayed red either way, but
+it reported the cleanup and not the finding.
+
+**The suites run against the service container's bridge address, not `127.0.0.1:5432`.** The live
+session-lock tests in `tests/db/session-lock-affinity.test.ts` require `pgSessionLockConnectionConfig()`
+to ADMIT a direct endpoint, and they build that endpoint out of `DATABASE_URL`. Under `services:` the
+published port is behind docker-proxy, which that check refuses by design — so the job resolves the
+container's own address the way `fresh-db-drift` does and gives it to the suite step.
 
 To run either tier locally, point `DATABASE_URL` at a scratch database you do not mind writing to
 (the suites roll their probes back, but they do write).

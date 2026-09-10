@@ -20,8 +20,12 @@ on:
       - "scripts/run-migration-verifications.mjs"
       - "scripts/check-app-db-object-access.mjs"
       - "scripts/check-db-test-gates.mjs"
+      - "scripts/db-test-gate-collection-probe.mjs"
       - "scripts/db-test-gate-allowlist.json"
       - "tests/db/**"
+      # The cleanup wrapper tests/db/shopping-webhook-retention-evidence.test.ts runs its probe rows
+      # through. A change to it changes what happens to a failing assertion in that suite.
+      - "tests/helpers/with-cleanup.ts"
       - "lib/db/**"
       # The two modules that BUILD the shopping-inbox compaction predicate, which
       # tests/db/shopping-webhook-retention-evidence.test.ts executes against a real Postgres. Without
@@ -49,8 +53,12 @@ on:
       - "scripts/run-migration-verifications.mjs"
       - "scripts/check-app-db-object-access.mjs"
       - "scripts/check-db-test-gates.mjs"
+      - "scripts/db-test-gate-collection-probe.mjs"
       - "scripts/db-test-gate-allowlist.json"
       - "tests/db/**"
+      # The cleanup wrapper tests/db/shopping-webhook-retention-evidence.test.ts runs its probe rows
+      # through. A change to it changes what happens to a failing assertion in that suite.
+      - "tests/helpers/with-cleanup.ts"
       - "lib/db/**"
       # The two modules that BUILD the shopping-inbox compaction predicate, which
       # tests/db/shopping-webhook-retention-evidence.test.ts executes against a real Postgres. Without
@@ -210,9 +218,23 @@ jobs:
   #      `migrate deploy` is runner time and not time on the critical path.
   #
   # It is MODELLED ON `fresh-db-drift` and not on a new pattern: the same pinned action SHAs, the
-  # same `postgres:16` service with the same health check, the same DATABASE_URL shape, the same
-  # generate-then-deploy prelude. It deliberately does NOT take the DATABASE_SESSION_LOCK_URL
-  # override that job needs — nothing here acquires a session advisory lock.
+  # same `postgres:16` service with the same health check, the same generate-then-deploy prelude, and
+  # — as of r20 — the same direct-address resolution step, for the reason below.
+  #
+  # THE SUITES RUN AGAINST THE CONTAINER'S BRIDGE ADDRESS, NOT THE PUBLISHED PORT (Codex r19, HIGH).
+  # `tests/db/session-lock-affinity.test.ts` contains LIVE tests that build a deliberately interposed
+  # data path (a TCP relay of their own) and a deliberately DIRECT lock endpoint, and require
+  # `pgSessionLockConnectionConfig()` to admit the second. The direct endpoint is DATABASE_URL's own
+  # host and port. On `127.0.0.1:5432` that endpoint is not direct at all: it is carried by
+  # docker-proxy, which is the NAT the comment on `fresh-db-drift` above describes at length, and the
+  # affinity check refuses it. The job would then have gone RED on an unrelated false positive before
+  # ever reaching the retention verdict this whole tier exists to run — a red job that says nothing
+  # about its own subject. So the same `docker inspect` step resolves the service container's bridge
+  # address and the suites are given it as DATABASE_URL. Ordinary query traffic is indifferent to which
+  # of the two routes it takes; the affinity check is not, and it is the one with an opinion.
+  #
+  # It still deliberately does NOT take the DATABASE_SESSION_LOCK_URL override `fresh-db-drift` needs:
+  # nothing here reads that variable, and the live tests construct both of their endpoints themselves.
   #
   # SUPERUSER ON PURPOSE. The service's `POSTGRES_USER: postgres` is a superuser, which gives the
   # connecting role CREATEDB and a route to the `postgres` maintenance database. Nothing in the tier
@@ -244,18 +266,44 @@ jobs:
           node-version: 22
           cache: npm
       - run: npm ci
-      # BEFORE the suites, because it is about whether they will actually run. It reads the env
-      # assignments on `npm run test:db` and the `process.env` reads in tests/db/, and fails if a gate
-      # there is not set here with a REQUIRE_ counterpart something reads. Codex r18 found
+      # BEFORE the suites, because it is about whether they will actually run. It RUNS `npm run
+      # test:db` with a collection probe attached, which records every file that runner collects and
+      # the gate values that file's own process was started with, then requires every RUN_DB_* gate
+      # read in tests/db/ to be 1 there with a REQUIRE_ counterpart something reads. Codex r18 found
       # RUN_DB_RETENTION_TESTS gating a real database test that no script set, so that test reported
       # `# SKIP` inside a green job; this is what stops the NEXT gate doing the same.
+      #
+      # It needs no database and no Prisma client, which is why it can run before the two steps below:
+      # the probe exits each collected file's process BEFORE the test file is loaded, so nothing in
+      # the suite executes.
       - name: Census the tests/db gates against the script this job runs
         run: npm run check:db-test-gates
       - run: npx prisma generate --schema prisma/schema.prisma
       - run: npx prisma migrate deploy --schema prisma/schema.prisma
+      # The bridge address, resolved exactly as `fresh-db-drift` resolves it, for the reason written
+      # above the job: the live session-lock tests in tests/db build their DIRECT endpoint out of
+      # DATABASE_URL, and the published port is not one.
+      - name: Resolve the postgres service's direct, non-NAT address
+        id: direct-db
+        run: |
+          ip="$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' '${{ job.services.postgres.id }}')"
+          if [ -z "$ip" ]; then
+            echo "could not read the postgres service container's bridge address" >&2
+            exit 1
+          fi
+          if ! timeout 10 bash -c "until </dev/tcp/${ip}/5432; do sleep 1; done" 2>/dev/null; then
+            echo "the postgres service container is not reachable at ${ip}:5432" >&2
+            exit 1
+          fi
+          echo "url=${DATABASE_URL/@127.0.0.1:5432/@${ip}:5432}" >> "$GITHUB_OUTPUT"
       # `test:db` sets RUN_DB_RETENTION_TESTS=1 *and* REQUIRE_DB_RETENTION_TESTS=1. The second is the
       # tripwire for this job: if an edit ever drops the first, the suite refuses to load instead of
       # skipping itself into a green run again. The census step above is what keeps the NEXT gate
       # from arriving without either half.
       - name: Run the DB-backed regression suites
+        env:
+          # Scoped to THIS step. The steps above are migrating and generating against the same
+          # database through the published port, and re-pointing them would only add a way for the two
+          # to disagree. It is the SUITES that need the route the affinity check can accept.
+          DATABASE_URL: ${{ steps.direct-db.outputs.url }}
         run: npm run test:db
