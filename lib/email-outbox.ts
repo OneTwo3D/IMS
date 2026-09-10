@@ -53,7 +53,12 @@ const EMAIL_MAX_ATTEMPTS = 5
 const EMAIL_CLAIM_STALE_MS = 15 * 60 * 1000
 const EMAIL_BACKOFF_BASE_MS = 60_000
 const EMAIL_BACKOFF_MAX_MS = 60 * 60 * 1000
-const EMAIL_BATCH_SIZE = 25
+/**
+ * How many eligible rows one drain claims. EXPORTED because the concurrency proof has to seed
+ * MORE than a batch of bystanders to show that its scoped client keeps the fixture reachable;
+ * a hard-coded 25 over there would silently stop measuring that the day this number moved.
+ */
+export const EMAIL_OUTBOX_BATCH_SIZE = 25
 
 /** The db-native partial unique index declared by the o3d-alnk migration. */
 export const EMAIL_OUTBOX_UNDELIVERED_REFERENCE_INDEX = 'email_outbox_undelivered_reference_uq'
@@ -256,7 +261,7 @@ export async function processPendingEmailOutbox(
       ],
     },
     orderBy: { createdAt: 'asc' },
-    take: EMAIL_BATCH_SIZE,
+    take: EMAIL_OUTBOX_BATCH_SIZE,
   })
 
   /** Record a refused terminal write. `sent` was already delivered when this fires on success. */
