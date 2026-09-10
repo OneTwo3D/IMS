@@ -457,8 +457,27 @@ export interface HeldSession {
    * not merely process exit (o3d-msv1). Safe to call more than once: every call awaits the same
    * settlement and gets the same result, which is what lets a test assert on it and a `finally`
    * clean up after it.
+   *
+   * THROWS if the watchdog had to kill the child. The output collected by then is truncated, and a
+   * truncated stdout returned as though it were complete is the very failure this helper exists to
+   * make impossible — so it is named here instead of being handed to an `assert.match` that can
+   * only report the symptom.
    */
   finish(): Promise<{ code: number | null; stdout: string; stderr: string }>
+}
+
+/**
+ * The two bounds, as parameters ONLY so that the failure paths behind them can be MEASURED.
+ *
+ * A guard on a fifteen-second handshake and a thirty-second settlement is a guard that no unit run
+ * will ever wait for, and a guard nobody runs is not a guard. Both default to the production
+ * values, so no caller in the installer tests passes either.
+ */
+export interface HeldSessionOptions {
+  /** How long the opening handshake may take before the child is killed and the call throws. */
+  readonly handshakeMs?: number
+  /** How long `finish()` waits for the child's complete output before killing it and throwing. */
+  readonly watchdogMs?: number
 }
 
 /**
@@ -471,7 +490,15 @@ export interface HeldSession {
  * that is exactly why the finding is about NEW connections — so every test that holds one also
  * opens a fresh connection afterwards.
  */
-export async function holdSession(cluster: Cluster, user: string, password: string, database: string): Promise<HeldSession> {
+export async function holdSession(
+  cluster: Cluster,
+  user: string,
+  password: string,
+  database: string,
+  options: HeldSessionOptions = {},
+): Promise<HeldSession> {
+  const handshakeMs = options.handshakeMs ?? 15_000
+  const watchdogMs = options.watchdogMs ?? 30_000
   const env = cleanLibpqEnv()
   env.PGPASSWORD = password
   const child = spawn('psql', [
@@ -520,11 +547,31 @@ export async function holdSession(cluster: Cluster, user: string, password: stri
   const stdoutEof = readToEof(child.stdout)
   const stderrEof = readToEof(child.stderr)
 
+  /**
+   * GIVE UP ON THE HANDSHAKE WITHOUT LEAVING THE CHILD BEHIND (o3d-msv1).
+   *
+   * A `holdSession` that throws returns no `HeldSession`, so there is nothing for any caller's
+   * `finally` to call `finish()` on: whatever was spawned is unreachable from that moment. Both
+   * throws below used to leave it exactly as it was — on the timeout path, an authenticated psql
+   * backend and three open pipes, still holding the runner's event loop open for the rest of the
+   * file, which is how a helper turns one failed test into a whole cancelled one.
+   *
+   * The kill is not enough on its own, and waiting for the pipes afterwards is the same rule
+   * `finish()` follows: a process is not done with until its output is. Waiting also means the
+   * message below carries everything the child managed to say, which on a failed handshake is
+   * usually psql's own reason for refusing.
+   */
+  const abandon = async (why: string): Promise<never> => {
+    if (!exited) child.kill('SIGKILL')
+    await Promise.all([stdoutEof, stderrEof, exitedPromise])
+    throw new Error(`${why}: ${stdout}${stderr}`)
+  }
+
   child.stdin.write("SELECT 'session-opened';\n")
-  const deadline = Date.now() + 15_000
+  const deadline = Date.now() + handshakeMs
   while (!stdout.includes('session-opened')) {
-    if (exited) throw new Error(`the held session never opened (exit ${code}): ${stdout}${stderr}`)
-    if (Date.now() > deadline) throw new Error(`the held session did not answer in time: ${stdout}${stderr}`)
+    if (exited) await abandon(`the held session never opened (exit ${code})`)
+    if (Date.now() > deadline) await abandon(`the held session did not answer within ${handshakeMs}ms`)
     await new Promise((resolve) => setTimeout(resolve, 25))
   }
 
@@ -545,12 +592,27 @@ export async function holdSession(cluster: Cluster, user: string, password: stri
         // A watchdog that KILLS rather than one that resolves: closing the pipes is what makes the
         // awaited EOF arrive. Resolving early on a timer would be the very thing this fix removes
         // — it would hand back a partial stdout and call it complete.
-        const watchdog = setTimeout(() => { child.kill('SIGKILL') }, 30_000)
+        let killed = false
+        const watchdog = setTimeout(() => { killed = true; child.kill('SIGKILL') }, watchdogMs)
         watchdog.unref?.()
         try {
           await Promise.all([stdoutEof, stderrEof, exitedPromise])
         } finally {
           clearTimeout(watchdog)
+        }
+        // AND THE KILL IS NOT A SETTLEMENT EITHER (o3d-msv1). SIGKILL closes the pipes, so the EOF
+        // awaited above does arrive — but what reaches it is whatever the child had managed to
+        // write, not what it owed. Returning that would hand the caller a TRUNCATED stdout labelled
+        // complete, and the assertion failure it produces downstream is the identical, misleading
+        // `still-authenticated` mismatch this whole change exists to remove: the property under
+        // test would look broken because the harness ran out of patience. Naming the truncation
+        // where it happens is what keeps the two apart. The `finally` in the r38 tests catches and
+        // discards, so cleanup is unaffected; a test body awaiting the result fails by cause.
+        if (killed) {
+          throw new Error(
+            `the held session did not finish within ${watchdogMs}ms and was killed, so this output is `
+            + `TRUNCATED rather than the child's complete output: ${stdout}${stderr}`,
+          )
         }
         return { code, stdout, stderr }
       })()
