@@ -6,6 +6,7 @@ import test from 'node:test'
 import { consumeFifoLayers } from '@/lib/cost-layers'
 import { openSavepointDepth, withSavepoint } from '@/lib/db/savepoint'
 import {
+  UncostedBookedQuantityError,
   NegativeCostSnapshotEntryError,
   TransferCostLayerRecreationContextError,
   recreateTransferCostLayersFromSnapshotSlice,
@@ -179,6 +180,11 @@ const TARGET = {
   warehouseId: 'wh-dest',
   transferLineId: 'tl-1',
   contextLabel: 'transfer TR-1 receipt',
+  // The stock the caller has already incremented. Every slice in this file is ten
+  // units, so the default target books ten and expects them all to be costed; the
+  // round-8 tests below vary it deliberately (Codex round-8 HIGH-1).
+  bookedQty: 10,
+  uncostedShortfall: 'REFUSE' as const,
 }
 
 test('a link-less PO-derived source layer gets a DIRECT link on the new layer (6oyu.19)', async () => {
@@ -237,6 +243,7 @@ test('the reachability postcondition FAILS when no link was written (6oyu.19)', 
           .costLayer.create({ data })
           .then((layer) => layer.id)) as never,
         copyCostLayerSourceLinesProportionally: (async () => 1) as never,
+        logActivity: (async () => {}) as never,
       },
     ),
     /no\s+costLayerSourceLine/,
@@ -605,6 +612,7 @@ test('the quantity postcondition FAILS if an entry is not laid down (o3d-eiuo)',
             .then((layer) => layer.id)
         }) as never,
         copyCostLayerSourceLinesProportionally: (async () => 0) as never,
+        logActivity: (async () => {}) as never,
       },
     ),
     /no FIFO layer behind them/,
@@ -751,14 +759,14 @@ test('copyCostLayerSourceLinesProportionally has no unguarded caller left (6oyu.
  */
 const ALLOWED_CALL_SITE_COMMENTS: Record<string, string[]> = {
   'app/actions/transfers.ts': [
-    "Recreate FIFO layers at the destination from the unconsumed slice of the dispatch snapshot (the slicer walks past alreadyReceivedQty and returns the next qtyToReceive units). The shared helper GUARANTEES two things about the layers it creates — each is reachable by propagateLandedCostToOutputs, and together they cover the slice's whole quantity — so never open-code this. It REFUSES a snapshot entry whose unit cost is negative (Codex round-5 HIGH, o3d-gd2f): nothing downstream can carry the sign, so it creates nothing and aborts this transaction rather than let the stock increment above commit alone. Do NOT wrap this call in a try or a savepoint. It settles NOTHING (Codex round-4 LOW). A landed-cost revaluation that landed while these units were in transit had no layer to journal against and IMS persisted no obligation for it; creating the layer now does not discharge it, and the delta is still sitting in the transit clearing account. That gap is open and tracked as o3d-nrl4 — see the contract on STOCK_TRANSFER_SOURCE_LAYER_CONSUMPTION.IN_TRANSIT.",
-    "Recreate FIFO layers at the SOURCE from the snapshot slice (mirrors the destination recreation in receiveTransfer, targeting fromWarehouseId). Note: the ORIGINAL layers consumed at dispatch are NOT un-consumed; this creates equivalent replacement layers (same cost basis + source-line provenance), so source quantity reconciles with cost layers. Same shared helper as the receipt path, for the same two guarantees: each replacement layer is reachable by propagation, and the layers cover the whole restored quantity (this path has no balancing step of its own, so a layer the helper declined would leave the restored stock unlayered — Codex round-4 HIGH). It REFUSES a snapshot entry whose unit cost is negative (Codex round-5 HIGH, o3d-gd2f), creating nothing and aborting this transaction rather than let the restore above commit alone. Do NOT wrap this call in a try or a savepoint. A cancellation is the OTHER way in-transit units come to rest, and it settles no deferred reclass either (Codex round-4 LOW): a revaluation that landed mid-transit was never persisted as an obligation, so nothing here discharges it and the delta stays in the transit clearing account. Open, tracked as o3d-nrl4.",
+    "Recreate FIFO layers at the destination from the unconsumed slice of the dispatch snapshot (the slicer walks past alreadyReceivedQty and returns the next qtyToReceive units). The shared helper GUARANTEES two things about the layers it creates — each is reachable by propagateLandedCostToOutputs, and together they cover the slice's whole quantity — so never open-code this. It REFUSES a snapshot entry whose unit cost is negative (Codex round-5 HIGH, o3d-gd2f): nothing downstream can carry the sign, so it creates nothing and aborts this transaction rather than let the stock increment above commit alone. Do NOT wrap this call in a try or a savepoint. It settles NOTHING (Codex round-4 LOW). A landed-cost revaluation that landed while these units were in transit had no layer to journal against and IMS persisted no obligation for it; creating the layer now does not discharge it, and the delta is still sitting in the transit clearing account. That gap is open and tracked as o3d-nrl4 — see the contract on STOCK_TRANSFER_SOURCE_LAYER_CONSUMPTION.IN_TRANSIT. `bookedQty` is the stock increment made immediately above, and the helper's coverage postcondition is measured against IT, not against the slice (Codex round-8 HIGH-1). cogs-audit scjz.5's £0 balancing layer for an under-recording dispatch snapshot is now the helper's `BALANCE_AT_ZERO_COST` policy: it used to be built here, and the three other call sites — which increment stock the same way — did not build one at all.",
+    "Recreate FIFO layers at the SOURCE from the snapshot slice (mirrors the destination recreation in receiveTransfer, targeting fromWarehouseId). Note: the ORIGINAL layers consumed at dispatch are NOT un-consumed; this creates equivalent replacement layers (same cost basis + source-line provenance), so source quantity reconciles with cost layers. Same shared helper as the receipt path, for the same two guarantees: each replacement layer is reachable by propagation, and the layers cover the whole restored quantity (this path has no balancing step of its own, so a layer the helper declined would leave the restored stock unlayered — Codex round-4 HIGH). It REFUSES a snapshot entry whose unit cost is negative (Codex round-5 HIGH, o3d-gd2f), creating nothing and aborting this transaction rather than let the restore above commit alone. Do NOT wrap this call in a try or a savepoint. A cancellation is the OTHER way in-transit units come to rest, and it settles no deferred reclass either (Codex round-4 LOW): a revaluation that landed mid-transit was never persisted as an obligation, so nothing here discharges it and the delta stays in the transit clearing account. Open, tracked as o3d-nrl4. `bookedQty` is the restore increment above (Codex round-8 HIGH-1). This path restores the FULL outstanding line quantity, and the snapshot can cover less than that — a source that dispatched legacy/uncosted stock is the ordinary case, and `linesMissingCostLayers` above counts only the TOTALLY uncovered one. A partial shortfall used to pass the helper's slice-scoped check and leave restored stock unlayered at the source.",
   ],
   'lib/connectors/mintsoft/sync/stock-sync.ts': [
-    "6oyu.19: same omission as the WMS webhook receipt path — the created layer had no costLayerSourceLine whenever the source was a plain PO-derived layer, stranding the landed-cost delta. Routed through the shared helper so the link is guaranteed, not remembered — and so is the quantity: stock is incremented for this allocation below, and an entry the helper declined would leave it unlayered (Codex round-4 HIGH). It REFUSES a snapshot entry whose unit cost is negative (Codex round-5 HIGH, o3d-gd2f), creating nothing and aborting this transaction rather than let the allocation's stock increment commit alone. Do NOT wrap this call in a try or a savepoint. Note this alignment does NOT change the transfer's status, so a transfer can be IN_TRANSIT with these units fully layered and propagatable. What is still uncovered is a revaluation that landed while units were in transit: nothing here discharges it and the delta stays in the transit clearing account. Open, tracked as o3d-nrl4.",
+    "6oyu.19: same omission as the WMS webhook receipt path — the created layer had no costLayerSourceLine whenever the source was a plain PO-derived layer, stranding the landed-cost delta. Routed through the shared helper so the link is guaranteed, not remembered — and so is the quantity: stock is incremented for this allocation below, and an entry the helper declined would leave it unlayered (Codex round-4 HIGH). It REFUSES a snapshot entry whose unit cost is negative (Codex round-5 HIGH, o3d-gd2f), creating nothing and aborting this transaction rather than let the allocation's stock increment commit alone. Do NOT wrap this call in a try or a savepoint. Note this alignment does NOT change the transfer's status, so a transfer can be IN_TRANSIT with these units fully layered and propagatable. What is still uncovered is a revaluation that landed while units were in transit: nothing here discharges it and the delta stays in the transit clearing account. Open, tracked as o3d-nrl4. `bookedQty` is `allocation.qty`, the stock increment made below, and the helper's coverage postcondition is measured against IT (Codex round-8 HIGH-1). The old postcondition compared the created layers with the SLICE, and the slice is only as long as the snapshot allowed — a ten-unit allocation over a six-unit remaining snapshot compared six with six and passed, then incremented stock by ten. `REFUSE` rather than `BALANCE_AT_ZERO_COST`, and it is a backstop rather than a route: the plan above is already capped by `remainingCostableSnapshotQty`, so a shortfall here means the cap and the slicer have come to disagree. Alignment is an OPTIONAL auto-correction of a WMS/IMS discrepancy — unlike the three receipt paths, nothing is physically waiting to be booked — so inventing £0 units to push an optional correction through would be strictly worse than leaving the discrepancy where an operator can see it.",
   ],
   'lib/domain/wms/booked-in-service.ts': [
-    "6oyu.19: this loop used to create the destination layer and call copyCostLayerSourceLinesProportionally IGNORING its result, which is 0 for an ordinary PO-derived source layer (it has no sourceLines of its own). The layer was therefore left with no costLayerSourceLine, so the revaluation exclusion removed these units from COGS while propagation had nowhere to carry the delta. The shared helper makes the link a postcondition, and the quantity too — this path increments stock immediately above and has no balancing layer, so an entry the helper declined would leave the booked-in units unlayered (Codex round-4 HIGH). It REFUSES a snapshot entry whose unit cost is negative (Codex round-5 HIGH, o3d-gd2f), creating nothing and aborting this transaction rather than let the stock increment above commit alone. Do NOT wrap this call in a try or a savepoint. It settles NO deferred transit reclass (Codex round-4 LOW). A landed-cost revaluation that landed while these units were in transit was never persisted as an obligation, so creating the layer does not discharge it; the delta remains in the transit clearing account. Open, tracked as o3d-nrl4.",
+    "6oyu.19: this loop used to create the destination layer and call copyCostLayerSourceLinesProportionally IGNORING its result, which is 0 for an ordinary PO-derived source layer (it has no sourceLines of its own). The layer was therefore left with no costLayerSourceLine, so the revaluation exclusion removed these units from COGS while propagation had nowhere to carry the delta. The shared helper makes the link a postcondition, and the quantity too — this path increments stock immediately above and has no balancing layer, so an entry the helper declined would leave the booked-in units unlayered (Codex round-4 HIGH). It REFUSES a snapshot entry whose unit cost is negative (Codex round-5 HIGH, o3d-gd2f), creating nothing and aborting this transaction rather than let the stock increment above commit alone. Do NOT wrap this call in a try or a savepoint. It settles NO deferred transit reclass (Codex round-4 LOW). A landed-cost revaluation that landed while these units were in transit was never persisted as an obligation, so creating the layer does not discharge it; the delta remains in the transit clearing account. Open, tracked as o3d-nrl4. `bookedQty` is `stockQtyToAdd`, the increment made immediately above, and the helper's coverage postcondition is measured against IT rather than against the slice (Codex round-8 HIGH-1). The two differ whenever the dispatch snapshot has fewer unconsumed costed units than the WMS has booked in, and this path has no balancing step of its own, so the difference used to go on hand unlayered. BALANCE_AT_ZERO_COST rather than REFUSE because the goods are physically in the warehouse — refusing would fail a real receipt that Mintsoft has already completed — and because the movement written above already values them at the slice's total, i.e. it has already priced the shortfall at zero.",
   ],
 }
 
@@ -800,4 +808,192 @@ test('each call site says exactly what it is allowed to say about the helper (Co
       `${file}: must name the still-open in-transit gap rather than leaving the reader to assume it is handled`,
     )
   }
+})
+
+// ---------------------------------------------------------------------------
+// Codex round 8, HIGH-1: the postcondition measured the SLICE, not the booking
+// ---------------------------------------------------------------------------
+
+/**
+ * A ten-unit booking whose dispatch snapshot has only six unconsumed units left.
+ * This is the finding's exact input: the slice is SHORTER than the allocation, so
+ * the round-4 postcondition compares six against six and passes while the caller's
+ * stock increment of ten stands over six units of layer.
+ */
+const SHORT_SLICE = [{ costLayerId: 'layer-src', qty: '6.000000', unitCostBase: '5.000000' }]
+
+test('the round-4 postcondition PASSES on the short slice — this is what made it invisible (Codex r8 HIGH-1)', async () => {
+  // THE PROOF THAT THE OLD CHECK COULD NOT SEE THIS. Both of its figures are derived
+  // from the slice, so a faithful loop always satisfies it. Run the same input under
+  // BALANCE and read `recreatedQty`: six requested, six created, check satisfied —
+  // and, before this round, that was the whole of the function's quantity guarantee
+  // while ten units were going on hand.
+  const { store, tx } = createStore(false)
+  const result = await recreateTransferCostLayersFromSnapshotSlice(
+    tx as never,
+    { ...TARGET, bookedQty: 10, uncostedShortfall: 'BALANCE_AT_ZERO_COST' },
+    SHORT_SLICE,
+    {
+      createCostLayer: (async (client: unknown, data: { qty: unknown }) =>
+        (tx as { costLayer: { create: (args: unknown) => Promise<{ id: string }> } })
+          .costLayer.create({ data: { ...data, receivedQty: String(data.qty), remainingQty: String(data.qty) } })
+          .then((layer) => layer.id)) as never,
+      // 0 — the ordinary PO-derived source layer, so the helper writes the direct
+      // provenance link and its reachability postcondition is satisfied.
+      copyCostLayerSourceLinesProportionally: (async () => 0) as never,
+      logActivity: (async () => {}) as never,
+    },
+  )
+
+  // The round-4 figure. It agrees with the slice, exactly as it always did.
+  assert.equal(result.recreatedQty, '6.000000', 'the slice-scoped postcondition is satisfied by six units')
+  // And the round-8 figure, which is measured against the ten the caller booked.
+  assert.equal(result.bookedCoverageQty, '10.000000', 'coverage must be measured against the BOOKED quantity')
+  assert.ok(result.balancingLayer, 'the four uncosted units must be backed by a balancing layer')
+  assert.equal(result.balancingLayer!.qty, '4.000000')
+  assert.equal(store.created.length, 2, 'one costed layer of six and one £0 layer of four')
+  assert.equal(Number(store.created[1]!.unitCostBase), 0, 'the balancing layer is at zero cost')
+  assert.equal(Number(store.created[1]!.receivedQty), 4)
+  // The identity the caller's stock increment rests on.
+  assert.equal(
+    store.created.reduce((sum, layer) => sum + Number(layer.receivedQty), 0),
+    10,
+    'Σ layer receivedQty must equal the booked quantity — this is the assertion that fails without the fix',
+  )
+})
+
+test('the balancing layer logs a WARNING naming the shortfall (Codex r8 HIGH-1)', async () => {
+  // Silent conservation is how the round-3 skip hid. The £0 layer is a real
+  // stock/cost-layer desync at the SOURCE warehouse and has to be reportable.
+  const { tx } = createStore(false)
+  const logged: Array<Record<string, unknown>> = []
+  await recreateTransferCostLayersFromSnapshotSlice(
+    tx as never,
+    { ...TARGET, bookedQty: 10, uncostedShortfall: 'BALANCE_AT_ZERO_COST' },
+    SHORT_SLICE,
+    {
+      createCostLayer: (async (client: unknown, data: { qty: unknown }) =>
+        (tx as { costLayer: { create: (args: unknown) => Promise<{ id: string }> } })
+          .costLayer.create({ data: { ...data, receivedQty: String(data.qty), remainingQty: String(data.qty) } })
+          .then((layer) => layer.id)) as never,
+      copyCostLayerSourceLinesProportionally: (async () => 0) as never,
+      logActivity: (async (params: Record<string, unknown>) => { logged.push(params) }) as never,
+    },
+  )
+
+  assert.equal(logged.length, 1)
+  assert.equal(logged[0]!.action, 'transfer_uncosted_balancing_layer')
+  assert.equal(logged[0]!.level, 'WARNING')
+  assert.match(String(logged[0]!.description), /4\.000000-unit shortfall/)
+  assert.equal((logged[0]!.metadata as Record<string, unknown>).bookedQty, '10.000000')
+  assert.equal((logged[0]!.metadata as Record<string, unknown>).costedQty, '6.000000')
+})
+
+test('REFUSE aborts the transaction and creates nothing when the booking is uncosted (Codex r8 HIGH-1)', async () => {
+  // The WMS stock-sync alignment's policy. Alignment is an OPTIONAL correction, so
+  // inventing £0 units to push it through is worse than leaving the discrepancy
+  // where an operator can see it. Same abort-first discipline as the negative-cost
+  // refusal, for the same reason: the caller has already incremented stock.
+  const { store, tx } = createStore(false)
+
+  let captured: unknown = null
+  try {
+    await recreateTransferCostLayersFromSnapshotSlice(
+      tx as never,
+      { ...TARGET, bookedQty: 10, uncostedShortfall: 'REFUSE' },
+      SHORT_SLICE,
+    )
+    assert.fail('a booking the snapshot cannot cost must be REFUSED under this policy')
+  } catch (thrown) {
+    captured = thrown
+  }
+
+  assert.ok(
+    captured instanceof UncostedBookedQuantityError,
+    `expected UncostedBookedQuantityError, got ${captured instanceof Error ? `${captured.name}: ${captured.message}` : String(captured)}`,
+  )
+  assert.equal(captured.bookedQty, '10.000000')
+  assert.equal(captured.costedQty, '6.000000')
+  assert.equal(captured.shortfallQty, '4.000000')
+  assert.equal(captured.transferLineId, 'tl-1')
+  assert.equal(store.aborted, true, 'the refusal must abort FIRST, so a caller cannot swallow it and commit')
+
+  // And the caller who swallows it can write nothing else.
+  await assert.rejects(
+    () => (tx as { costLayer: { create: (args: unknown) => Promise<unknown> } })
+      .costLayer.create({ data: { productId: 'prod-1', qty: '10' } }),
+    new RegExp(ABORTED_TRANSACTION),
+  )
+})
+
+test('a booking the snapshot covers exactly creates no balancing layer (Codex r8 — not vacuous)', async () => {
+  // If the shortfall branch fired unconditionally, every test above would pass for
+  // the wrong reason and every ordinary receipt would grow a spurious £0 layer.
+  const { store, tx } = createStore(false)
+  const result = await recreateTransferCostLayersFromSnapshotSlice(
+    tx as never,
+    { ...TARGET, bookedQty: 10, uncostedShortfall: 'BALANCE_AT_ZERO_COST' },
+    [{ costLayerId: 'layer-src', qty: '10.000000', unitCostBase: '5.000000' }],
+  )
+  assert.equal(result.balancingLayer, null)
+  assert.equal(result.recreatedQty, '10.000000')
+  assert.equal(result.bookedCoverageQty, '10.000000')
+  assert.equal(store.created.length, 1)
+})
+
+test('a slice LONGER than the booking is refused too — the check binds both ways (Codex r8)', async () => {
+  // The other direction of "the two quantities cannot disagree". A caller that books
+  // six and hands over a ten-unit slice would lay down layers for stock nobody
+  // incremented, which inflates on-hand value rather than deflating it. The old
+  // check could not see this either.
+  const { tx } = createStore(false)
+  await assert.rejects(
+    () => recreateTransferCostLayersFromSnapshotSlice(
+      tx as never,
+      { ...TARGET, bookedQty: 6, uncostedShortfall: 'BALANCE_AT_ZERO_COST' },
+      [{ costLayerId: 'layer-src', qty: '10.000000', unitCostBase: '5.000000' }],
+    ),
+    /booked 6\.000000 units[\s\S]*but 10\.000000 units are/,
+  )
+})
+
+test('the QUANTITY postconditions abort the transaction too, not just the cost refusals (Codex r8)', async () => {
+  // Both quantity checks used to be plain throws. Every caller has already
+  // incremented stock when they fire, so a caller that caught one and carried on
+  // committed exactly the unlayered stock they exist to prevent — the same hole the
+  // negative-cost refusal was given an abort for in round 5.
+  //
+  // Driven through the SLICE check (a declined entry), because that one is
+  // reachable with a stub and its abort is the older of the two.
+  const { store, tx } = createStore(false)
+  await assert.rejects(
+    () => recreateTransferCostLayersFromSnapshotSlice(
+      tx as never,
+      { ...TARGET, bookedQty: 10, uncostedShortfall: 'BALANCE_AT_ZERO_COST' },
+      [
+        { costLayerId: 'layer-src', qty: '6.000000', unitCostBase: '5.000000' },
+        { costLayerId: 'layer-src', qty: '4.000000', unitCostBase: '7.000000' },
+      ],
+      {
+        createCostLayer: (async (client: unknown, data: { qty: unknown }) => {
+          if (Number(String(data.qty)) === 4) return 'layer-skipped'
+          return (tx as { costLayer: { create: (args: unknown) => Promise<{ id: string }> } })
+            .costLayer.create({ data: { ...data, receivedQty: String(data.qty), remainingQty: String(data.qty) } })
+            .then((layer) => layer.id)
+        }) as never,
+        copyCostLayerSourceLinesProportionally: (async () => 0) as never,
+        logActivity: (async () => {}) as never,
+      },
+    ),
+    /no FIFO layer behind them/,
+  )
+
+  assert.equal(store.aborted, true, 'the quantity postcondition must poison the transaction before throwing')
+  // And prove the abort bites: the caller who swallows it can write nothing else.
+  await assert.rejects(
+    () => (tx as { costLayer: { create: (args: unknown) => Promise<unknown> } })
+      .costLayer.create({ data: { productId: 'prod-1', qty: '10' } }),
+    new RegExp(ABORTED_TRANSACTION),
+    'a swallowed quantity refusal must leave the caller unable to commit its stock increment',
+  )
 })

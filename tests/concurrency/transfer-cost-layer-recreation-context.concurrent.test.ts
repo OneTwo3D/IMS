@@ -81,6 +81,8 @@ test(
           warehouseId: warehouse.id,
           transferLineId: 'tl-notx',
           contextLabel: 'round-6 non-transactional probe',
+          bookedQty: 10,
+          uncostedShortfall: 'REFUSE',
         },
         [{ costLayerId: sourceLayer.id, qty: '10.000000', unitCostBase: '5.000000' }],
       ),
@@ -120,6 +122,8 @@ test(
         warehouseId: warehouse.id,
         transferLineId: 'tl-intx',
         contextLabel: 'round-6 transactional probe',
+        bookedQty: 10,
+        uncostedShortfall: 'REFUSE',
       },
       [{ costLayerId: sourceLayer.id, qty: '10.000000', unitCostBase: '5.000000' }],
     ), TX)
@@ -154,6 +158,8 @@ test(
             warehouseId: warehouse.id,
             transferLineId: 'tl-swallow',
             contextLabel: 'round-6 swallow probe',
+            bookedQty: 10,
+            uncostedShortfall: 'REFUSE',
           },
           // Negative unit cost: the refusal this mechanism is for.
           [{ costLayerId: sourceLayer.id, qty: '10.000000', unitCostBase: '-1.000000' }],
@@ -251,6 +257,8 @@ test(
           warehouseId: warehouse.id,
           transferLineId: 'tl-savepoint',
           contextLabel: 'round-6 savepoint probe',
+          bookedQty: 10,
+          uncostedShortfall: 'REFUSE',
         },
         [{ costLayerId: sourceLayer.id, qty: '10.000000', unitCostBase: '5.000000' }],
       )), TX).catch((error: unknown) => error)

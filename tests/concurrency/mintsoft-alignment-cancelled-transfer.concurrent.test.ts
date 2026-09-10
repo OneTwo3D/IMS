@@ -21,14 +21,31 @@ import { config } from 'dotenv'
  * double-count route would undercut its own claim. Production prevalence is tracked
  * on o3d-1mga.
  *
- * THE FIX has two halves, and this file proves both:
- *   · the candidate query refuses an ASN whose parent transfer is not IN_TRANSIT or
- *     RECEIVED — the same predicate the WMS webhook book-in has always applied; and
- *   · alignment now takes the `stock_transfers` lock that cancellation takes, so the
- *     status it reads is a fact the lock covers and the two cannot interleave.
+ * THE FIX IS THE GUARD ALONE, and this file proves the SEQUENTIAL route: the
+ * candidate query refuses an ASN whose parent transfer is not IN_TRANSIT or
+ * RECEIVED — the same predicate the WMS webhook book-in has always applied.
  *
- * Needs a real PostgreSQL: the propagation walks `cost_layer_source_lines` in SQL,
- * and the locking half is only meaningful against a real transaction manager.
+ * THE LOCK WAS WITHDRAWN (6oyu.19, Codex round-8). Round 7 also had alignment take
+ * `stock_transfers FOR UPDATE` after the ASN rows, plus a post-lock re-read, and
+ * claimed no lock cycle existed. There is one: the transfer-ASN creation path in
+ * app/actions/mintsoft-sync.ts locks `stock_transfers` first (line 3690) and then
+ * writes that transfer's existing `wms_asn_line_maps` rows (deleteMany 3892, update
+ * 3904) — TRANSFER-then-ASN, the opposite of the order alignment took. Two
+ * transactions over one transfer in opposite orders is a deadlock PostgreSQL breaks
+ * by aborting one. The round-7 race proof that stood here has gone with it: it used
+ * `Promise.all`, which does not force the critical sections to overlap, and its own
+ * lock-removal mutation survived one run in five — a proof that admits it cannot
+ * prove its claim.
+ *
+ * WHAT THAT LEAVES. The sequential route of o3d-2y5u — a dispatch cancelled, a later
+ * sweep aligning against the still-open ASN — is CLOSED by the guard, and needs no
+ * lock to be closed. The concurrent route is OPEN, exactly as it is on
+ * `development`, which has no guard at all: nothing regresses, and the deadlock
+ * cycle above is why a lock is not a small addition here. Recover the withdrawn code
+ * with `git show 7723f229:lib/connectors/mintsoft/sync/stock-sync.ts` and this file
+ * at the same revision.
+ *
+ * Needs a real PostgreSQL: the propagation walks `cost_layer_source_lines` in SQL.
  */
 
 const RUN = process.env.RUN_DB_CONCURRENCY_TESTS === '1'
@@ -395,6 +412,8 @@ test(
           warehouseId: destination.id,
           transferLineId,
           contextLabel: `transfer line ${transferLineId} WMS stock-sync alignment`,
+          bookedQty: 3,
+          uncostedShortfall: 'REFUSE',
         },
         [{ costLayerId: sourceLayer.id, qty: '3.000000', unitCostBase: `${UNIT_COST}.000000` }],
       )
@@ -451,52 +470,14 @@ test(
   },
 )
 
-test(
-  'a cancellation racing an alignment cannot produce a second layer either (Codex r7 HIGH-1, concurrent)',
-  { skip: !RUN && 'set RUN_DB_CONCURRENCY_TESTS=1' },
-  async () => {
-    // Cancellation locks the transfer; alignment used to lock ASN rows only, so the
-    // two could interleave and both commit. Alignment now takes the SAME transfer
-    // lock, so whichever wins, the loser sees the winner's committed state:
-    //   · cancel first  → alignment's post-lock re-read sees CANCELLED and refuses;
-    //   · align first   → cancellation's landed guard sees ten landed and refuses.
-    // Either way exactly one live layer descends from the source layer.
-    loadEnv()
-    const { db, transfer, sourceLayer, product, binding, tag } =
-      await seedDispatchedTransferWithOpenAsn('race')
-    const { cancelDispatchedTransfer } = await import('@/app/actions/transfers')
-
-    const [cancelResult, alignResult] = await Promise.all([
-      cancelDispatchedTransfer(transfer.id),
-      alignUp(binding, product.id, tag),
-    ])
-
-    assert.equal(
-      cancelResult.success === true && alignResult.applied === true,
-      false,
-      `the cancellation and the alignment must not BOTH succeed: ` +
-      `${JSON.stringify({ cancelResult, alignResult })}`,
-    )
-    assert.equal(
-      cancelResult.success === true || alignResult.applied === true,
-      true,
-      `one of them must succeed — a deadlock or a double refusal would strand the units: ` +
-      `${JSON.stringify({ cancelResult, alignResult })}`,
-    )
-
-    assert.equal(
-      await db.costLayerSourceLine.count({ where: { sourceCostLayerId: sourceLayer.id } }),
-      1,
-      `exactly ONE live layer may descend from the source layer, whichever won ` +
-      `(${JSON.stringify({ cancelResult, alignResult })})`,
-    )
-
-    const { posted, totalInventory } = await applyLandedCostChange(sourceLayer.id)
-    assert.equal(posted.length, 1, `reached ${posted.length} layers: ${JSON.stringify(posted)}`)
-    assert.equal(
-      totalInventory.toFixed(2),
-      (LANDED_COST_DELTA_PER_UNIT * LINE_QTY).toFixed(2),
-      `the reclassification must post once (${JSON.stringify(posted)})`,
-    )
-  },
-)
+/*
+ * WITHDRAWN (Codex round-8): the round-7 race proof for the transfer lock.
+ *
+ * It asserted that a cancellation and an alignment cannot both succeed. With the
+ * lock withdrawn that is no longer claimed — the concurrent route is open, and
+ * saying so on o3d-2y5u is more honest than a test that could not establish it
+ * anyway. `Promise.all` starts two promises; it does not make their critical
+ * sections overlap, and the mutation that removed the lock still passed one run in
+ * five. Recover it with
+ * `git show 7723f229:tests/concurrency/mintsoft-alignment-cancelled-transfer.concurrent.test.ts`.
+ */

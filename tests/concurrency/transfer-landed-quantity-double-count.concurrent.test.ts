@@ -166,6 +166,8 @@ async function seedAlignedInTransitTransfer(label: string) {
         warehouseId: destination.id,
         transferLineId,
         contextLabel: `transfer line ${transferLineId} WMS stock-sync alignment`,
+        bookedQty: LINE_QTY,
+        uncostedShortfall: 'REFUSE',
       },
       snapshot,
     )

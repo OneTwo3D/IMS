@@ -183,6 +183,13 @@ function lineResidue(input: {
   lineQty: number
   qtyReceived?: number
   wmsAsnLines?: Array<{ qtyAccountedViaSnapshot: number; qtyAccountedViaReceipt: number }>
+  /**
+   * How much of the dispatch snapshot is still costable (Codex round-8 HIGH-1).
+   * Defaults to the whole line quantity — a snapshot that records every unit it
+   * shipped, which is the ordinary case and the one every test below was written
+   * for. The round-8 test sets it lower on purpose.
+   */
+  costableRemainingQty?: number
 }): TransferLineResidualQty {
   return resolveTransferLineResidualQty({
     lineQty: input.lineQty,
@@ -191,6 +198,7 @@ function lineResidue(input: {
       qtyReceived: input.qtyReceived ?? 0,
       wmsAsnLines: input.wmsAsnLines ?? [],
     }),
+    costableRemainingQty: input.costableRemainingQty ?? input.lineQty,
   })
 }
 
@@ -429,6 +437,148 @@ test('two open ASNs on ONE transfer line share the line residue, they do not eac
     ],
     unallocatedQty: 4,
   })
+})
+
+test('THREE open ASNs on one transfer line share the line residue in ASN ORDER (Codex r8 LOW)', () => {
+  // The two-ASN case above cannot tell a correct depletion from a lucky one: with two
+  // rows, "oldest first" and "whatever order the input arrived in" agree, and the
+  // second row is the only one left to take the remainder. Three rows and an input
+  // in the WRONG order separate the two.
+  //
+  // Line residue is 9. In ASN-created order that is asn-a 4, asn-b 4, asn-c 1 — the
+  // third row is capped by what the first two left, which is the assertion two rows
+  // could not make.
+  const plan = stockSyncHelpers.planMintsoftAlignmentAllocations({
+    delta: 9,
+    candidates: [
+      // DELIBERATELY OUT OF ORDER: newest first, then oldest, then the middle one.
+      // A missing or reversed sort re-orders the allocations and changes the third
+      // row's quantity, so the sort is load-bearing for this assertion.
+      {
+        asnLineMapId: 'asn-c',
+        asnResidualQty: asnResidue({ asnLineMapId: 'asn-c', expectedQty: 4 }),
+        transferLineId: 'tl-1',
+        sortAt: '2026-04-24T10:00:00.000Z',
+        sortId: 'asn-c',
+      },
+      {
+        asnLineMapId: 'asn-a',
+        asnResidualQty: asnResidue({ asnLineMapId: 'asn-a', expectedQty: 4 }),
+        transferLineId: 'tl-1',
+        sortAt: '2026-04-22T10:00:00.000Z',
+        sortId: 'asn-a',
+      },
+      {
+        asnLineMapId: 'asn-b',
+        asnResidualQty: asnResidue({ asnLineMapId: 'asn-b', expectedQty: 4 }),
+        transferLineId: 'tl-1',
+        sortAt: '2026-04-23T10:00:00.000Z',
+        sortId: 'asn-b',
+      },
+    ],
+    transferLineResiduals: new Map([
+      ['tl-1', lineResidue({ transferLineId: 'tl-1', lineQty: 10, qtyReceived: 1 })],
+    ]),
+  })
+
+  assert.deepEqual(plan, {
+    allocations: [
+      { asnLineMapId: 'asn-a', qty: 4 },
+      { asnLineMapId: 'asn-b', qty: 4 },
+      { asnLineMapId: 'asn-c', qty: 1 },
+    ],
+    unallocatedQty: 0,
+  })
+  // Stated separately, because the deepEqual above would also pass if the ORDER were
+  // right and the depletion wrong in a compensating way.
+  assert.deepEqual(plan.allocations.map((allocation) => allocation.asnLineMapId), ['asn-a', 'asn-b', 'asn-c'])
+  assert.equal(plan.allocations.reduce((sum, a) => sum + a.qty, 0), 9, 'the line residue, not 12')
+})
+
+test('the ASN sort is by created-at, not input order — a reversed input allocates the same (Codex r8 LOW)', () => {
+  // The other half of the same gap: every earlier input happened to arrive in
+  // allocation order, so deleting the sort would not have failed any of them. Feed
+  // three rows in exactly reverse order against a delta that only ONE of them can
+  // satisfy, and the answer names the oldest.
+  const candidates = [
+    { asnLineMapId: 'asn-new', sortAt: '2026-04-24T10:00:00.000Z' },
+    { asnLineMapId: 'asn-mid', sortAt: '2026-04-23T10:00:00.000Z' },
+    { asnLineMapId: 'asn-old', sortAt: '2026-04-22T10:00:00.000Z' },
+  ].map((row) => ({
+    asnLineMapId: row.asnLineMapId,
+    asnResidualQty: asnResidue({ asnLineMapId: row.asnLineMapId, expectedQty: 5 }),
+    transferLineId: 'tl-1',
+    sortAt: row.sortAt,
+    sortId: row.asnLineMapId,
+  }))
+
+  const plan = stockSyncHelpers.planMintsoftAlignmentAllocations({
+    delta: 3,
+    candidates,
+    transferLineResiduals: new Map([
+      ['tl-1', lineResidue({ transferLineId: 'tl-1', lineQty: 10 })],
+    ]),
+  })
+
+  assert.deepEqual(
+    plan,
+    { allocations: [{ asnLineMapId: 'asn-old', qty: 3 }], unallocatedQty: 0 },
+    'the OLDEST ASN absorbs it, whatever order the candidates arrived in',
+  )
+})
+
+test('the LINE residue is capped by what the dispatch snapshot can still cost (Codex r8 HIGH-1)', () => {
+  // The round-8 half of the line cap. Ten units are outstanding on the line, but the
+  // dispatch snapshot has only six costable units left — the source shipped legacy
+  // stock with no FIFO layer behind it. Allocating ten would book ten units of stock
+  // over six units of cost layer.
+  const plan = stockSyncHelpers.planMintsoftAlignmentAllocations({
+    delta: 10,
+    candidates: [
+      {
+        asnLineMapId: 'asn-1',
+        asnResidualQty: asnResidue({ asnLineMapId: 'asn-1', expectedQty: 10 }),
+        transferLineId: 'tl-1',
+        sortAt: '2026-04-22T10:00:00.000Z',
+        sortId: 'asn-1',
+      },
+    ],
+    transferLineResiduals: new Map([
+      ['tl-1', lineResidue({ transferLineId: 'tl-1', lineQty: 10, costableRemainingQty: 6 })],
+    ]),
+  })
+
+  assert.deepEqual(
+    plan,
+    { allocations: [{ asnLineMapId: 'asn-1', qty: 6 }], unallocatedQty: 4 },
+    'only the costable six may be planned; the other four come back unallocated',
+  )
+  // And an unallocated remainder is what makes the caller refuse the whole delta, so
+  // nothing is booked at all.
+  assert.ok(plan.unallocatedQty > 0)
+})
+
+test('the costable cap does not bind when the snapshot is complete (Codex r8 — not vacuous)', () => {
+  // If the cap were applied unconditionally, or the minimum taken the wrong way
+  // round, every alignment would shrink. Same input, a snapshot covering all ten.
+  assert.deepEqual(
+    stockSyncHelpers.planMintsoftAlignmentAllocations({
+      delta: 10,
+      candidates: [
+        {
+          asnLineMapId: 'asn-1',
+          asnResidualQty: asnResidue({ asnLineMapId: 'asn-1', expectedQty: 10 }),
+          transferLineId: 'tl-1',
+          sortAt: '2026-04-22T10:00:00.000Z',
+          sortId: 'asn-1',
+        },
+      ],
+      transferLineResiduals: new Map([
+        ['tl-1', lineResidue({ transferLineId: 'tl-1', lineQty: 10, costableRemainingQty: 10 })],
+      ]),
+    }),
+    { allocations: [{ asnLineMapId: 'asn-1', qty: 10 }], unallocatedQty: 0 },
+  )
 })
 
 test('the ASN cap still binds when it is tighter than the line cap (Codex r7 — not vacuous)', () => {

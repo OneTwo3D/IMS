@@ -33,6 +33,30 @@
  * quantity or the function throws, taking the caller's stock increment down with it.
  * A skip can only ever be a visible failure, not a trade.
  *
+ * AND IT IS MEASURED AGAINST THE BOOKED QUANTITY, NOT THE SLICE (Codex round-8
+ * HIGH-1). The paragraph above describes the round-4 check, and that check compares
+ * two figures BOTH derived from the slice: it asks "did the layers cover the slice I
+ * was handed". The harm it exists to prevent is unlayered stock, and the slice is
+ * not the stock — `sliceTransferSnapshotForReceipt` returns whatever the snapshot
+ * still has, which can be LESS than the caller is booking. Ten units allocated
+ * against six unconsumed snapshot units produced a six-unit slice, six layers, and a
+ * postcondition of six against six: it passed, and four units went on hand
+ * unlayered. Exactly the round-3/round-4 harm, reached from the other side of the
+ * same comparison.
+ *
+ * So `bookedQty` is now a REQUIRED field of the target — the quantity of stock the
+ * caller has already incremented — and the final check is against that, re-read from
+ * the database. The two quantities can no longer be made to agree by construction:
+ * one is the caller's own stock movement, the other is what is actually in
+ * `cost_layers`. A caller cannot omit it, and it is deliberately not derivable from
+ * the slice, because deriving it from the slice is the defect.
+ *
+ * What happens when the snapshot genuinely cannot cost the whole booking is the
+ * target's `uncostedShortfall` policy, also required — see
+ * `TransferLayerUncostedShortfallPolicy`. The £0 balancing layer that the manual
+ * receipt path used to build for itself is built HERE now, because three of the four
+ * call sites did not build one and two of those had no balancing step at all.
+ *
  * A NEGATIVE-COST SNAPSHOT ENTRY IS REFUSED, NOT LAYERED (Codex round-5 HIGH,
  * o3d-gd2f). This is the third decision on the same input, and the first that the
  * rest of the system can actually represent.
@@ -94,7 +118,9 @@ import type { Prisma } from '@/app/generated/prisma/client'
 import { createCostLayer, copyCostLayerSourceLinesProportionally } from '@/lib/cost-layers'
 import { isClientInsideTransaction, openSavepointDepth } from '@/lib/db/savepoint'
 import type { CostLayerSnapshotEntry } from '@/lib/cost-layer-snapshots'
-import { addMoney, multiplyMoney, roundQuantity, toDecimal } from '@/lib/domain/math/decimal'
+import { addMoney, multiplyMoney, roundQuantity, subtractMoney, toDecimal } from '@/lib/domain/math/decimal'
+import type { DecimalInput } from '@/lib/domain/math/decimal'
+import { logActivity } from '@/lib/activity-log'
 
 type TxClient = Prisma.TransactionClient
 
@@ -113,6 +139,79 @@ export type TransferLayerRecreationTarget = {
   adjustmentMovementId?: string | null
   /** Human context for diagnostics ("transfer TR-1 receipt"). */
   contextLabel: string
+  /**
+   * THE QUANTITY OF STOCK THE CALLER HAS ALREADY BOOKED for this slice, and the
+   * figure the coverage postcondition is measured against (Codex round-8 HIGH-1).
+   *
+   * REQUIRED, and required because the round-4 postcondition measured the WRONG
+   * SIDE. It asked "did the layers cover the SLICE I was handed", and the slice is
+   * whatever `sliceTransferSnapshotForReceipt` could find — so an allocation that
+   * books ten units against a snapshot with six unconsumed units produced a
+   * six-unit slice, six layers, and a postcondition comparing six with six. It
+   * passed, and four units went on hand with no FIFO layer behind them: the exact
+   * harm o3d-eiuo was raised for, reached from the other side.
+   *
+   * The question is not "did I lay down the slice" but "did I lay down the stock
+   * that is being booked". Only the caller knows the second figure, so it has to
+   * say it, in the same call, and it cannot be defaulted from the slice — deriving
+   * it from the slice is what made the two agree vacuously in the first place.
+   */
+  bookedQty: DecimalInput
+  /**
+   * What to do when the dispatch snapshot cannot cost the whole of `bookedQty`.
+   * REQUIRED and explicit: a new call site must decide, not inherit a default.
+   */
+  uncostedShortfall: TransferLayerUncostedShortfallPolicy
+}
+
+/**
+ * The two answers to "the snapshot covers fewer units than the caller has booked".
+ *
+ * `BALANCE_AT_ZERO_COST` — create a £0-cost layer for the shortfall (cogs-audit
+ * scjz.5). For the paths where the units are PHYSICALLY THERE and refusing would
+ * strand a real receipt: the manual receipt, the WMS webhook book-in and the
+ * dispatch cancellation's restore. It is not a silent capitalisation: all three
+ * value their stock movement with `buildStockMovementValueFieldsFromTotal` over the
+ * SLICE's total, so the movement has already priced the shortfall at zero — the
+ * balancing layer only makes the layers agree with the movement, and it logs a
+ * WARNING naming the shortfall.
+ *
+ * `REFUSE` — throw, taking the caller's stock increment down with it. For a path
+ * that is free NOT to book: the WMS stock-sync alignment is an optional
+ * auto-correction of a WMS/IMS discrepancy, and inventing £0 units to make an
+ * optional correction go through is worse than leaving the discrepancy visible.
+ * Alignment additionally caps its own plan by the snapshot's remaining costable
+ * quantity, so this is its backstop, not its normal route.
+ */
+export type TransferLayerUncostedShortfallPolicy = 'BALANCE_AT_ZERO_COST' | 'REFUSE'
+
+/**
+ * Thrown when the caller's booked quantity is larger than the dispatch snapshot can
+ * cost and the target's policy is `REFUSE` (Codex round-8 HIGH-1).
+ */
+export class UncostedBookedQuantityError extends Error {
+  override readonly name = 'UncostedBookedQuantityError'
+  readonly transferLineId: string
+  readonly contextLabel: string
+  readonly bookedQty: string
+  readonly costedQty: string
+  readonly shortfallQty: string
+
+  constructor(params: {
+    message: string
+    transferLineId: string
+    contextLabel: string
+    bookedQty: string
+    costedQty: string
+    shortfallQty: string
+  }) {
+    super(params.message)
+    this.transferLineId = params.transferLineId
+    this.contextLabel = params.contextLabel
+    this.bookedQty = params.bookedQty
+    this.costedQty = params.costedQty
+    this.shortfallQty = params.shortfallQty
+  }
 }
 
 export type TransferLayerRecreationResult = {
@@ -130,22 +229,37 @@ export type TransferLayerRecreationResult = {
    * that has already committed a stock increment can measure its layers against THIS
    * rather than against the slice it passed in.
    *
-   * The manual receipt path's £0 balancing layer (cogs-audit scjz.5) is computed from
-   * this figure. It used to re-sum `snapshotSlice`, which counted any entry this
-   * helper declined as covered — the balancing step could not see the gap it existed
-   * to close.
+   * The £0 balancing layer (cogs-audit scjz.5) is computed from this figure. It used
+   * to re-sum `snapshotSlice`, which counted any entry this helper declined as
+   * covered — the balancing step could not see the gap it existed to close. It is
+   * now created HERE rather than by a caller, for the same reason.
    */
   recreatedQty: string
+  /**
+   * The £0-cost balancing layer this call created for the part of `bookedQty` the
+   * dispatch snapshot could not cost, or null when the snapshot covered all of it.
+   * Only ever set under `uncostedShortfall: 'BALANCE_AT_ZERO_COST'`.
+   */
+  balancingLayer: { costLayerId: string; qty: string } | null
+  /**
+   * TOTAL QUANTITY NOW BACKED BY A LAYER — recreated plus balancing. Equal to
+   * `target.bookedQty` by the postcondition below, which is the guarantee the
+   * caller's already-committed stock increment rests on (Codex round-8 HIGH-1).
+   */
+  bookedCoverageQty: string
 }
 
 export type TransferCostLayerRecreationDeps = {
   createCostLayer: typeof createCostLayer
   copyCostLayerSourceLinesProportionally: typeof copyCostLayerSourceLinesProportionally
+  /** Injected so the £0 balancing layer's WARNING can be asserted without a database. */
+  logActivity: typeof logActivity
 }
 
 const defaultDeps: TransferCostLayerRecreationDeps = {
   createCostLayer,
   copyCostLayerSourceLinesProportionally,
+  logActivity,
 }
 
 /**
@@ -365,8 +479,13 @@ async function assertLayerIsReachableByPropagation(
  * half of the registry contract that IS guaranteed today: every created layer is
  * reachable by propagateLandedCostToOutputs, so a landed-cost revaluation of the
  * source layer carries its delta onto these units — and that the layers created
- * cover the slice's whole quantity, so the caller's already-committed stock
+ * cover `target.bookedQty`, the stock the caller has already incremented, so that
  * increment is never left standing above Σ layer qty.
+ *
+ * `target.bookedQty` and `target.uncostedShortfall` are both REQUIRED (Codex
+ * round-8 HIGH-1). Measuring coverage against the SLICE instead of against the
+ * booked quantity is what let a ten-unit allocation ride on a six-unit slice; see
+ * the module comment.
  *
  * `snapshotSlice` must come from sliceTransferSnapshotForReceipt — it is the
  * unconsumed portion of the dispatch snapshot for the quantity now landing.
@@ -391,6 +510,18 @@ export async function recreateTransferCostLayersFromSnapshotSlice(
   const result: TransferLayerRecreationResult = {
     createdLayers: [],
     recreatedQty: toDecimal(0).toFixed(6),
+    balancingLayer: null,
+    bookedCoverageQty: toDecimal(0).toFixed(6),
+  }
+  // The caller's already-committed stock increment, read once, before anything is
+  // created. Negative is meaningless here and is floored rather than trusted.
+  const bookedQty = roundQuantity(toDecimal(target.bookedQty), 6)
+  if (bookedQty.lt(0)) {
+    throw new Error(
+      `recreateTransferCostLayersFromSnapshotSlice: bookedQty for transfer line ${target.transferLineId} ` +
+      `(${target.contextLabel}) is ${bookedQty.toFixed(6)}. This function only ever backs a POSITIVE stock ` +
+      'increment; a negative booked quantity means the caller is not doing what this function assumes.',
+    )
   }
 
   // FIRST, before anything is read or written: this helper's refusal is only a
@@ -526,6 +657,10 @@ export async function recreateTransferCostLayersFromSnapshotSlice(
     })
   const recreatedQty = persistedLayers.reduce((sum, layer) => addMoney(sum, layer.receivedQty), toDecimal(0))
   if (!roundQuantity(recreatedQty, 6).equals(roundQuantity(requestedQty, 6))) {
+    // Abort first, like every other refusal in this function. A plain throw here was
+    // catchable, and a caller that caught it committed the stock increment it had
+    // already made — the very thing this postcondition exists to prevent.
+    await abortEnclosingTransactionSoTheRefusalCannotBeSwallowed(tx)
     throw new Error(
       `recreateTransferCostLayersFromSnapshotSlice: snapshot slice for transfer line ` +
       `${target.transferLineId} (${target.contextLabel}) carried ${requestedQty.toFixed(6)} units but only ` +
@@ -535,6 +670,98 @@ export async function recreateTransferCostLayersFromSnapshotSlice(
     )
   }
   result.recreatedQty = roundQuantity(recreatedQty, 6).toFixed(6)
+
+  // THE COVERAGE POSTCONDITION (Codex round-8 HIGH-1).
+  //
+  // The check above polices THIS FUNCTION'S OWN LOOP: every positive entry of the
+  // slice it was handed became a layer. It says nothing about whether the slice was
+  // as large as the stock the caller booked, and it cannot — both of its figures are
+  // derived from the same slice, so they agree by construction whenever the loop is
+  // faithful. That is why a ten-unit allocation against a six-unit remaining
+  // snapshot passed it: six requested, six created, four units unlayered.
+  //
+  // This check is against the OTHER side, the one the caller committed: `bookedQty`.
+  // The two figures now come from genuinely different places — one from the stock
+  // increment the caller made, one re-read from the layers in the database — so they
+  // can only agree if the units really are backed.
+  const shortfallQty = roundQuantity(subtractMoney(bookedQty, recreatedQty), 6)
+  if (shortfallQty.gt('0.000001')) {
+    if (target.uncostedShortfall === 'REFUSE') {
+      // Abort FIRST, throw second, for the same reason the negative-cost refusal
+      // does: the caller has already incremented stock and must not be able to
+      // catch this and commit it.
+      await abortEnclosingTransactionSoTheRefusalCannotBeSwallowed(tx)
+      throw new UncostedBookedQuantityError({
+        transferLineId: target.transferLineId,
+        contextLabel: target.contextLabel,
+        bookedQty: bookedQty.toFixed(6),
+        costedQty: roundQuantity(recreatedQty, 6).toFixed(6),
+        shortfallQty: shortfallQty.toFixed(6),
+        message:
+          `recreateTransferCostLayersFromSnapshotSlice: REFUSING ${target.contextLabel} for transfer line ` +
+          `${target.transferLineId} (product ${target.productId}, warehouse ${target.warehouseId}) because the ` +
+          `caller booked ${bookedQty.toFixed(6)} units but the dispatch snapshot could only cost ` +
+          `${roundQuantity(recreatedQty, 6).toFixed(6)} of them, leaving ${shortfallQty.toFixed(6)} units that ` +
+          'would go on hand with no FIFO layer behind them. This target asked to REFUSE rather than balance the ' +
+          'shortfall at zero cost. Nothing has been created and this transaction has been aborted ' +
+          '(6oyu.19 / o3d-eiuo).',
+      })
+    }
+
+    // BALANCE_AT_ZERO_COST — conserve quantity with a £0 layer (cogs-audit scjz.5).
+    // Created HERE, not by the caller, so it cannot be forgotten by a call site that
+    // did not know it needed one: three of the four callers did not have one, and
+    // two of those (webhook book-in, dispatch cancellation) increment stock with no
+    // balancing step at all.
+    const balancingLayerId = await deps.createCostLayer(tx, {
+      productId: target.productId,
+      warehouseId: target.warehouseId,
+      qty: shortfallQty,
+      unitCostBase: 0,
+    })
+    result.balancingLayer = { costLayerId: balancingLayerId, qty: shortfallQty.toFixed(6) }
+    await deps.logActivity({
+      entityType: 'STOCK_ADJUSTMENT',
+      entityId: target.transferLineId,
+      tag: 'stock',
+      action: 'transfer_uncosted_balancing_layer',
+      level: 'WARNING',
+      description:
+        `${target.contextLabel}: booked ${bookedQty.toFixed(6)} units of ${target.productId} but the dispatch ` +
+        `snapshot only covered ${roundQuantity(recreatedQty, 6).toFixed(6)} costed units; created a £0-cost ` +
+        `balancing layer for the ${shortfallQty.toFixed(6)}-unit shortfall (source stock/cost-layer desync).`,
+      metadata: {
+        contextLabel: target.contextLabel,
+        transferLineId: target.transferLineId,
+        productId: target.productId,
+        warehouseId: target.warehouseId,
+        bookedQty: bookedQty.toFixed(6),
+        costedQty: roundQuantity(recreatedQty, 6).toFixed(6),
+        shortfall: shortfallQty.toFixed(6),
+      },
+    })
+  }
+
+  // Re-read the balancing layer too, for the same reason the recreated layers are
+  // re-read: a tally assembled by the statements it is meant to police cannot fail.
+  const balancingPersisted = result.balancingLayer === null
+    ? []
+    : await tx.costLayer.findMany({
+      where: { id: { in: [result.balancingLayer.costLayerId] } },
+      select: { receivedQty: true },
+    })
+  const coverageQty = balancingPersisted.reduce((sum, layer) => addMoney(sum, layer.receivedQty), recreatedQty)
+  if (!roundQuantity(coverageQty, 6).equals(bookedQty)) {
+    await abortEnclosingTransactionSoTheRefusalCannotBeSwallowed(tx)
+    throw new Error(
+      `recreateTransferCostLayersFromSnapshotSlice: ${target.contextLabel} booked ${bookedQty.toFixed(6)} units ` +
+      `for transfer line ${target.transferLineId} but ${roundQuantity(coverageQty, 6).toFixed(6)} units are ` +
+      'backed by a cost layer. The caller has already incremented stock, so returning would leave the ' +
+      'difference on hand with no FIFO layer behind it — or, if the coverage is the larger figure, would lay ' +
+      'down layers for stock nobody booked (6oyu.19 / o3d-eiuo).',
+    )
+  }
+  result.bookedCoverageQty = roundQuantity(coverageQty, 6).toFixed(6)
 
   return result
 }

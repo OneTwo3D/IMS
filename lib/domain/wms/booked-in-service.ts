@@ -989,6 +989,18 @@ export async function processBookedInEvent(
               // was never persisted as an obligation, so creating the layer does not
               // discharge it; the delta remains in the transit clearing account.
               // Open, tracked as o3d-nrl4.
+              //
+              // `bookedQty` is `stockQtyToAdd`, the increment made immediately
+              // above, and the helper's coverage postcondition is measured against
+              // IT rather than against the slice (Codex round-8 HIGH-1). The two
+              // differ whenever the dispatch snapshot has fewer unconsumed costed
+              // units than the WMS has booked in, and this path has no balancing
+              // step of its own, so the difference used to go on hand unlayered.
+              // BALANCE_AT_ZERO_COST rather than REFUSE because the goods are
+              // physically in the warehouse — refusing would fail a real receipt
+              // that Mintsoft has already completed — and because the movement
+              // written above already values them at the slice's total, i.e. it has
+              // already priced the shortfall at zero.
               await recreateTransferCostLayersFromSnapshotSlice(
                 tx,
                 {
@@ -996,6 +1008,8 @@ export async function processBookedInEvent(
                   warehouseId: transfer.toWarehouseId,
                   transferLineId: transferLine.id,
                   contextLabel: `transfer ${transfer.reference} WMS receipt`,
+                  bookedQty: receiptLine.stockQtyToAdd,
+                  uncostedShortfall: 'BALANCE_AT_ZERO_COST',
                 },
                 snapshotSlice,
               )

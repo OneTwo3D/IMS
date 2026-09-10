@@ -19,7 +19,9 @@ import {
 import { applyStockAdjustment } from '@/lib/domain/inventory/stock-adjustment-apply'
 import {
   isTransferUsableForWmsReceipt,
+  remainingCostableSnapshotQty,
   sliceTransferSnapshotForReceipt,
+  WMS_RECEIPT_QTY_EPSILON,
   WMS_RECEIPT_USABLE_TRANSFER_STATUSES,
 } from '@/lib/domain/wms/asn-reconciliation'
 import {
@@ -27,6 +29,7 @@ import {
   requireLandedQty,
   resolveTransferLineResidualQty,
   resolveWmsAsnLineResidualQty,
+  transferLineOutstandingQty,
   type TransferLineResidualQty,
   type WmsAsnLineResidualQty,
 } from '@/lib/domain/inventory/transfer-landed-quantity'
@@ -562,6 +565,14 @@ type RefusedAlignmentCandidate = {
   asnLineMapId: string
   externalAsnId: string
   reason: string
+  /**
+   * `unusable` — the ASN line cannot be used at all (its transfer is gone or is not
+   * in a status that may bring units to rest).
+   * `capped` — it is usable, but for less than its outstanding quantity, because the
+   * dispatch snapshot cannot cost the rest (Codex round-8 HIGH-1). The distinction
+   * matters to the operator-facing reason: only the first is about transfer status.
+   */
+  kind: 'unusable' | 'capped'
 }
 
 type AlignmentCandidateSet = {
@@ -572,11 +583,6 @@ type AlignmentCandidateSet = {
    * across the line's open ASN rows.
    */
   transferLineResiduals: Map<string, TransferLineResidualQty>
-  /**
-   * Every parent transfer of every transfer-backed ASN row seen — including the
-   * refused ones — so the caller knows which `stock_transfers` rows to lock.
-   */
-  parentTransferIds: string[]
   refused: RefusedAlignmentCandidate[]
 }
 
@@ -601,7 +607,6 @@ async function getAlignmentCandidateLines(
   tx: Prisma.TransactionClient,
   binding: SyncBinding,
   productId: string,
-  lockedTransferIds?: ReadonlySet<string>,
 ): Promise<AlignmentCandidateSet> {
   const lines = await tx.wmsAsnLineMap.findMany({
     where: {
@@ -649,6 +654,10 @@ async function getAlignmentCandidateLines(
         qty: true,
         qtyReceived: true,
         transferId: true,
+        // The dispatch snapshot, because "outstanding on the line" is not the same
+        // quantity as "still costable from the snapshot" and the plan must be capped
+        // by BOTH (6oyu.19, Codex round-8 HIGH-1).
+        costLayerSnapshot: true,
         transfer: { select: { reference: true, status: true } },
       },
     })
@@ -664,7 +673,6 @@ async function getAlignmentCandidateLines(
   const candidates: AlignmentCandidateLine[] = []
   const transferLineResiduals = new Map<string, TransferLineResidualQty>()
   const refused: RefusedAlignmentCandidate[] = []
-  const parentTransferIds = new Set<string>()
 
   for (const line of lines) {
     const asnResidualQty = resolveWmsAsnLineResidualQty({
@@ -694,33 +702,49 @@ async function getAlignmentCandidateLines(
         asnLineMapId: line.id,
         externalAsnId: line.asn.externalAsnId,
         reason: `transfer line ${line.sourceLineId} no longer exists`,
+        kind: 'unusable',
       })
       continue
     }
-    parentTransferIds.add(transferLine.transferId)
-
-    if (lockedTransferIds && !lockedTransferIds.has(transferLine.transferId)) {
-      refused.push({
-        asnLineMapId: line.id,
-        externalAsnId: line.asn.externalAsnId,
-        reason: `transfer ${transferLine.transfer.reference} appeared after this run took its transfer locks`,
-      })
-      continue
-    }
-
     if (!isTransferUsableForWmsReceipt(transferLine.transfer.status)) {
       refused.push({
         asnLineMapId: line.id,
         externalAsnId: line.asn.externalAsnId,
         reason: `transfer ${transferLine.transfer.reference} is ${transferLine.transfer.status}`,
+        kind: 'unusable',
       })
       continue
     }
 
-    transferLineResiduals.set(transferLine.id, resolveTransferLineResidualQty({
+    // BOTH caps, built from the same landed reading: what has not landed on the
+    // line, and what the dispatch snapshot can still cost. Capping only by the first
+    // is Codex round-8 HIGH-1 — the plan books ten units against a six-unit
+    // remaining snapshot, stock goes up by ten and the layers cover six.
+    const alignmentLanded = requireLandedQty(landedByTransferLineId, transferLine.id)
+    const costableRemainingQty = remainingCostableSnapshotQty({
+      snapshot: transferLine.costLayerSnapshot,
+      alreadyLanded: alignmentLanded,
+    })
+    const lineResidual = resolveTransferLineResidualQty({
       lineQty: transferLine.qty,
-      landed: requireLandedQty(landedByTransferLineId, transferLine.id),
-    }))
+      landed: alignmentLanded,
+      costableRemainingQty,
+    })
+    const outstandingQty = transferLineOutstandingQty(transferLine.qty, alignmentLanded).toNumber()
+    if (costableRemainingQty < outstandingQty - WMS_RECEIPT_QTY_EPSILON) {
+      // Not a refusal of this candidate — it can still absorb what the snapshot can
+      // cost — but the operator has to be able to tell a snapshot shortfall from a
+      // threshold problem when the delta comes back only partly explained.
+      refused.push({
+        asnLineMapId: line.id,
+        externalAsnId: line.asn.externalAsnId,
+        reason: `transfer ${transferLine.transfer.reference} has ${formatQuantity(outstandingQty)} outstanding but its `
+          + `dispatch snapshot can only cost ${formatQuantity(costableRemainingQty)} more unit`
+          + `${costableRemainingQty === 1 ? '' : 's'}`,
+        kind: 'capped',
+      })
+    }
+    transferLineResiduals.set(transferLine.id, lineResidual)
     candidates.push({
       id: line.id,
       sourceType: 'STOCK_TRANSFER_LINE',
@@ -736,7 +760,6 @@ async function getAlignmentCandidateLines(
   return {
     candidates,
     transferLineResiduals,
-    parentTransferIds: [...parentTransferIds],
     refused,
   }
 }
@@ -753,40 +776,13 @@ function describeRefusedAlignmentCandidates(refused: ReadonlyArray<RefusedAlignm
     .map((entry) => `ASN ${entry.externalAsnId} (${entry.reason})`)
     .join('; ')
   const more = refused.length > 3 ? ` and ${refused.length - 3} more` : ''
-  return ` Unusable open ASN line${refused.length === 1 ? '' : 's'} skipped: ${listed}${more}.` +
-    ` Alignment only uses an ASN whose transfer is ${WMS_RECEIPT_USABLE_TRANSFER_STATUSES.join(' or ')}.`
-}
-
-async function lockAlignmentCandidateLines(
-  tx: Prisma.TransactionClient,
-  candidateIds: string[],
-): Promise<void> {
-  if (candidateIds.length === 0) return
-  await tx.$queryRaw`SELECT id FROM wms_asn_line_maps WHERE id = ANY(${candidateIds}::text[]) ORDER BY id FOR UPDATE`
-}
-
-/**
- * Lock the PARENT transfers of the transfer-backed candidates (6oyu.19, Codex
- * round-7 HIGH-1).
- *
- * Alignment used to lock ASN rows only, while every cancellation and receipt path
- * locks `stock_transfers`. The two therefore interleaved: a cancellation could
- * commit between alignment's status read and its writes, so alignment added stock
- * and a linked layer at the destination for units the cancellation had just
- * recreated in full at the source. Taking the transfer lock makes the status the
- * candidate query reads a fact the same lock covers, so the ASN's usability cannot
- * change under this transaction.
- *
- * ORDER: ASN rows first, then transfers, then stock levels — the order
- * lib/domain/wms/booked-in-service.ts already uses, and cancellation takes
- * transfers before stock levels and never touches ASN rows, so no cycle exists.
- */
-async function lockAlignmentCandidateTransfers(
-  tx: Prisma.TransactionClient,
-  transferIds: string[],
-): Promise<void> {
-  if (transferIds.length === 0) return
-  await tx.$queryRaw`SELECT id FROM stock_transfers WHERE id = ANY(${transferIds}::text[]) ORDER BY id FOR UPDATE`
+  // The status sentence is only true of the `unusable` ones. Appending it to a
+  // snapshot cap would tell an operator to go and look at a transfer status that is
+  // perfectly fine (Codex round-8 HIGH-1).
+  const statusNote = refused.some((entry) => entry.kind === 'unusable')
+    ? ` Alignment only uses an ASN whose transfer is ${WMS_RECEIPT_USABLE_TRANSFER_STATUSES.join(' or ')}.`
+    : ''
+  return ` Open ASN line${refused.length === 1 ? '' : 's'} skipped or capped: ${listed}${more}.${statusNote}`
 }
 
 async function lockStockLevelForAlignment(
@@ -870,23 +866,30 @@ export async function applyMintsoftAlignmentForProduct(params: {
     }
   }
   const outcome = await db.$transaction(async (tx) => {
-    // First, unlocked read — enough to learn WHICH rows to lock.
-    const unlocked = await getAlignmentCandidateLines(tx, params.binding, params.productId)
-    if (unlocked.candidates.length === 0) {
-      return {
-        kind: 'unavailable' as const,
-        correctedQty: 0,
-        reason: `No open ASN line is available to absorb this WMS delta.${describeRefusedAlignmentCandidates(unlocked.refused)}`,
-      }
-    }
-
-    // Lock the ASN rows AND their parent transfers, then read again: every fact the
-    // plan is built on — the ASN counters and the parent transfer's status — is now
-    // covered by a lock this transaction holds (6oyu.19 Codex r7 HIGH-1).
-    await lockAlignmentCandidateLines(tx, unlocked.candidates.map((candidate) => candidate.id))
-    await lockAlignmentCandidateTransfers(tx, unlocked.parentTransferIds)
-    const lockedTransferIds = new Set(unlocked.parentTransferIds)
-    const candidateSet = await getAlignmentCandidateLines(tx, params.binding, params.productId, lockedTransferIds)
+    // NO ROW LOCKS ARE TAKEN HERE, AND THAT IS DELIBERATE (6oyu.19, Codex round-8).
+    //
+    // Round 7 added an ASN-rows-then-transfers `FOR UPDATE` pair and a post-lock
+    // re-read, so that the parent status the plan rests on would be a fact a lock
+    // covered. Round 7 also claimed no lock cycle existed. It was wrong: the
+    // transfer-ASN creation path in app/actions/mintsoft-sync.ts takes
+    // `stock_transfers FOR UPDATE` first (line 3690) and then writes the transfer's
+    // existing `wms_asn_line_maps` rows (deleteMany at 3892, update at 3904), which
+    // is TRANSFER-then-ASN — the exact opposite of the order alignment took. Two
+    // transactions over the same transfer in opposite orders is a deadlock, and
+    // PostgreSQL resolves it by aborting one of them.
+    //
+    // The whole locking addition has therefore been WITHDRAWN, along with the
+    // post-lock re-read and the "appeared after this run took its locks" refusal.
+    // What is KEPT is the parent-status guard below, which needs no lock to be worth
+    // having: it closes the SEQUENTIAL route of o3d-2y5u — a dispatch cancelled,
+    // then a later sweep aligning against the still-open ASN — which is the route
+    // that finding actually describes. The CONCURRENT route (a cancellation
+    // committing between this read and these writes) stays open, exactly as it is on
+    // `development`, which has no guard at all. Nothing regresses; the race is
+    // recorded on o3d-2y5u, and the cycle above is why closing it is not a small
+    // addition. Recover the withdrawn code with
+    // `git show 7723f229:lib/connectors/mintsoft/sync/stock-sync.ts`.
+    const candidateSet = await getAlignmentCandidateLines(tx, params.binding, params.productId)
     const candidates = candidateSet.candidates
 
     if (candidates.length === 0) {
@@ -1042,6 +1045,22 @@ export async function applyMintsoftAlignmentForProduct(params: {
         // still uncovered is a revaluation that landed while units were in transit:
         // nothing here discharges it and the delta stays in the transit clearing
         // account. Open, tracked as o3d-nrl4.
+        //
+        // `bookedQty` is `allocation.qty`, the stock increment made below, and the
+        // helper's coverage postcondition is measured against IT (Codex round-8
+        // HIGH-1). The old postcondition compared the created layers with the SLICE,
+        // and the slice is only as long as the snapshot allowed — a ten-unit
+        // allocation over a six-unit remaining snapshot compared six with six and
+        // passed, then incremented stock by ten.
+        //
+        // `REFUSE` rather than `BALANCE_AT_ZERO_COST`, and it is a backstop rather
+        // than a route: the plan above is already capped by
+        // `remainingCostableSnapshotQty`, so a shortfall here means the cap and the
+        // slicer have come to disagree. Alignment is an OPTIONAL auto-correction of
+        // a WMS/IMS discrepancy — unlike the three receipt paths, nothing is
+        // physically waiting to be booked — so inventing £0 units to push an
+        // optional correction through would be strictly worse than leaving the
+        // discrepancy where an operator can see it.
         await recreateTransferCostLayersFromSnapshotSlice(
           tx,
           {
@@ -1050,6 +1069,8 @@ export async function applyMintsoftAlignmentForProduct(params: {
             transferLineId: transferLine.id,
             adjustmentMovementId: movement.id,
             contextLabel: `transfer line ${transferLine.id} WMS stock-sync alignment`,
+            bookedQty: allocation.qty,
+            uncostedShortfall: 'REFUSE',
           },
           snapshotSlice,
         )

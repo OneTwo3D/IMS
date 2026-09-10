@@ -13,7 +13,6 @@ import { validateStockTransferStatusTransition } from '@/lib/domain/workflows/ac
 import type { Prisma } from '@/app/generated/prisma/client'
 import {
   consumeFifoLayersStrict,
-  createCostLayer,
 } from '@/lib/cost-layers'
 import { recreateTransferCostLayersFromSnapshotSlice } from '@/lib/domain/inventory/transfer-cost-layer-recreation'
 import { uniqueViolationTargetsField } from '@/lib/db/prisma-unique-violation'
@@ -31,7 +30,7 @@ import { planTransferPartialReceipt } from '@/lib/domain/inventory/transfer-part
 import { isStockMovementIdempotencyConflict } from '@/lib/domain/inventory/stock-movement-idempotency'
 import { toInventoryConstraintMessage } from '@/lib/domain/inventory/prisma-errors'
 import { canDispatchTransferQty, isCostLayerCoverageSufficient } from '@/lib/domain/inventory/transfer-availability'
-import { addMoney, floorQuantity, multiplyMoney, subtractMoney, toDecimal } from '@/lib/domain/math/decimal'
+import { addMoney, floorQuantity, multiplyMoney, toDecimal } from '@/lib/domain/math/decimal'
 import { serializeCostLayerSnapshot } from '@/lib/cost-layer-snapshots'
 import {
   buildStockMovementValueFieldsFromConsumed,
@@ -754,46 +753,25 @@ async function applyTransferLineReceipt(
   // and the delta is still sitting in the transit clearing account. That gap is
   // open and tracked as o3d-nrl4 — see the contract on
   // STOCK_TRANSFER_SOURCE_LAYER_CONSUMPTION.IN_TRANSIT.
-  const recreated = await recreateTransferCostLayersFromSnapshotSlice(
+  //
+  // `bookedQty` is the stock increment made immediately above, and the helper's
+  // coverage postcondition is measured against IT, not against the slice (Codex
+  // round-8 HIGH-1). cogs-audit scjz.5's £0 balancing layer for an under-recording
+  // dispatch snapshot is now the helper's `BALANCE_AT_ZERO_COST` policy: it used to
+  // be built here, and the three other call sites — which increment stock the same
+  // way — did not build one at all.
+  await recreateTransferCostLayersFromSnapshotSlice(
     tx,
     {
       productId,
       warehouseId: toWarehouseId,
       transferLineId,
       contextLabel: `transfer ${transferReference} receipt`,
+      bookedQty: qtyToReceive,
+      uncostedShortfall: 'BALANCE_AT_ZERO_COST',
     },
     snapshotSlice,
   )
-
-  // cogs-audit scjz.5: conserve quantity when the dispatch snapshot under-records
-  // costed units (source dispatched legacy/uncosted stock). Balance the shortfall
-  // with a £0 layer so on-hand never exceeds Σ layer remainingQty.
-  //
-  // Measured against the quantity the helper actually LAID DOWN, not against the
-  // slice handed to it (Codex round-4 HIGH). Re-summing the slice assumed every
-  // entry became a layer; when the helper declined one, this step counted the
-  // declined units as covered and the balancing layer it exists to create was never
-  // created. The helper now guarantees the two figures agree — reading its result
-  // is what keeps this step honest if that ever changes.
-  const sliceQtyTotal = toDecimal(recreated.recreatedQty)
-  const shortfall = subtractMoney(qtyToReceive, sliceQtyTotal)
-  if (shortfall.gt('0.000001')) {
-    await createCostLayer(tx, {
-      productId,
-      warehouseId: toWarehouseId,
-      qty: shortfall,
-      unitCostBase: 0,
-    })
-    await logActivity({
-      entityType: 'STOCK_ADJUSTMENT',
-      entityId: transferId,
-      tag: 'stock',
-      action: 'transfer_uncosted_balancing_layer',
-      level: 'WARNING',
-      description: `Transfer ${transferReference}: received ${qtyToReceive} of ${productId} but the dispatch snapshot only covered ${sliceQtyTotal.toString()} costed units; created a £0-cost balancing layer for the ${shortfall.toString()}-unit shortfall (source stock/cost-layer desync).`,
-      metadata: { transferId, productId, warehouseId: toWarehouseId, remainingQty: qtyToReceive.toString(), sliceQty: sliceQtyTotal.toString(), shortfall: shortfall.toString() },
-    })
-  }
 
   return { booked: true }
 }
@@ -1323,6 +1301,13 @@ export async function cancelDispatchedTransfer(id: string): Promise<TransferResu
         // landed mid-transit was never persisted as an obligation, so nothing here
         // discharges it and the delta stays in the transit clearing account. Open,
         // tracked as o3d-nrl4.
+        //
+        // `bookedQty` is the restore increment above (Codex round-8 HIGH-1). This
+        // path restores the FULL outstanding line quantity, and the snapshot can
+        // cover less than that — a source that dispatched legacy/uncosted stock is
+        // the ordinary case, and `linesMissingCostLayers` above counts only the
+        // TOTALLY uncovered one. A partial shortfall used to pass the helper's
+        // slice-scoped check and leave restored stock unlayered at the source.
         await recreateTransferCostLayersFromSnapshotSlice(
           tx,
           {
@@ -1330,6 +1315,8 @@ export async function cancelDispatchedTransfer(id: string): Promise<TransferResu
             warehouseId: transfer.fromWarehouseId,
             transferLineId: line.id,
             contextLabel: `transfer ${transfer.reference} dispatch cancellation`,
+            bookedQty: restoreQty,
+            uncostedShortfall: 'BALANCE_AT_ZERO_COST',
           },
           snapshotSlice,
         )

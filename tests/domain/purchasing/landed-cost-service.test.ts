@@ -1806,6 +1806,9 @@ function createLandedCostWorld(init: {
     // stubbing it would test the stub.
     createCostLayer,
     copyCostLayerSourceLinesProportionally,
+    // The balancing layer's WARNING is not what these tests are about, and this
+    // world has no activity-log table.
+    logActivity: async () => {},
   }
 
   return { tx, costLayers, sourceLines, transferLines, recreationDeps }
@@ -1910,7 +1913,7 @@ test('a WMS-received transfer layer is reachable by revaluation, so COGS stays z
 
   const recreated = await recreateTransferCostLayersFromSnapshotSlice(
     tx as never,
-    { productId: 'prod-1', warehouseId: 'wh-dest', transferLineId: 'tl-1', contextLabel: 'transfer TR-1 WMS receipt' },
+    { productId: 'prod-1', warehouseId: 'wh-dest', transferLineId: 'tl-1', contextLabel: 'transfer TR-1 WMS receipt', bookedQty: 100, uncostedShortfall: 'REFUSE' },
     [{ costLayerId: 'layer-a', qty: '100.000000', unitCostBase: '10.000000' }],
     world.recreationDeps as never,
   )
@@ -1949,6 +1952,8 @@ test('a WMS stock-sync ALIGNMENT layer is reachable by revaluation too (Codex r2
       transferLineId: 'tl-1',
       adjustmentMovementId: 'mv-align-1',
       contextLabel: 'transfer line tl-1 WMS stock-sync alignment',
+      bookedQty: 100,
+      uncostedShortfall: 'REFUSE',
     },
     [{ costLayerId: 'layer-a', qty: '100.000000', unitCostBase: '10.000000' }],
     world.recreationDeps as never,

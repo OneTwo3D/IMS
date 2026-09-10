@@ -338,7 +338,11 @@ export function isTransferLineFullyLanded(lineQty: DecimalInput, landed: Transfe
 declare const TRANSFER_LINE_RESIDUAL_QTY_BRAND: unique symbol
 declare const WMS_ASN_LINE_RESIDUAL_QTY_BRAND: unique symbol
 
-/** LINE SCOPE: how much of a transfer line has not landed anywhere yet. */
+/**
+ * LINE SCOPE: how much of a transfer line an allocator may still bring to rest —
+ * what has not landed anywhere yet AND can still be costed from the dispatch
+ * snapshot, whichever is the smaller (6oyu.19, Codex round-8 HIGH-1).
+ */
 export type TransferLineResidualQty = {
   readonly [TRANSFER_LINE_RESIDUAL_QTY_BRAND]: 'transfer-line-residual-qty'
   readonly transferLineId: string
@@ -359,12 +363,30 @@ export type WmsAsnLineResidualQty = {
  *
  * Takes the landed quantity rather than a number, so the line cap and the snapshot
  * offset provably come from the same reading of the same two columns.
+ *
+ * `costableRemainingQty` IS REQUIRED, and it is the round-8 half of this type
+ * (Codex round-8 HIGH-1). "Outstanding" and "costable" are different quantities and
+ * the second can be the smaller: a source warehouse that dispatched legacy or
+ * uncosted stock leaves a dispatch snapshot recording fewer units than the line
+ * shipped. An allocator capped only by the outstanding quantity plans to book units
+ * the snapshot cannot cost, the caller increments stock for all of them, and the
+ * layers cover only what the snapshot had. Taking the MINIMUM here means the
+ * allocation a plan produces is, by construction, a quantity the snapshot can back —
+ * so the two figures the cost-layer helper compares can never have been allowed to
+ * diverge in the first place.
+ *
+ * Build it with `remainingCostableSnapshotQty` over the SAME line and the SAME
+ * landed quantity. There is deliberately no default: a call site that does not know
+ * its snapshot capacity must go and read it.
  */
 export function resolveTransferLineResidualQty(input: {
   lineQty: DecimalInput
   landed: TransferLineLandedQty
+  costableRemainingQty: DecimalInput
 }): TransferLineResidualQty {
-  const qty = transferLineOutstandingQty(input.lineQty, input.landed)
+  const outstanding = transferLineOutstandingQty(input.lineQty, input.landed)
+  const costable = maxZero(roundQuantity(toDecimal(input.costableRemainingQty), 6))
+  const qty = outstanding.lt(costable) ? outstanding : costable
   return {
     transferLineId: input.landed.transferLineId,
     qty,

@@ -5,6 +5,7 @@ import {
   takeFromSnapshotEntries,
   type CostLayerSnapshotEntry,
 } from '@/lib/cost-layer-snapshots'
+import { addMoney, toDecimal } from '@/lib/domain/math/decimal'
 
 export const WMS_RECEIPT_QTY_EPSILON = 0.0001
 
@@ -252,4 +253,43 @@ export function sliceTransferSnapshotForReceipt(input: {
   )
 
   return takeFromSnapshotEntries(remaining, qtyReceived).taken
+}
+
+/**
+ * HOW MANY UNITS OF A DISPATCH SNAPSHOT ARE STILL COSTABLE — the total positive
+ * quantity `sliceTransferSnapshotForReceipt` could still return for this line, if
+ * asked for an unbounded amount (6oyu.19, Codex round-8 HIGH-1).
+ *
+ * WHY AN ALLOCATOR NEEDS THIS. A transfer line's outstanding quantity (`line.qty`
+ * less everything landed) and its snapshot's remaining costable quantity are
+ * different numbers, and the second can be the smaller: a source warehouse that
+ * dispatched legacy or otherwise uncosted stock produces a snapshot that under-
+ * records the units it shipped. An allocator that caps only by the outstanding
+ * quantity will happily plan to book ten units against six costable ones. The stock
+ * increment is for ten and the layers are for six.
+ *
+ * Same offset rule as the slicer, and the same branded `TransferLineLandedQty`, so
+ * the cap and the slice provably walk past the same units.
+ */
+export function remainingCostableSnapshotQty(input: {
+  snapshot: unknown
+  alreadyLanded: TransferLineLandedQty
+}): number {
+  const snapshot = parseCostLayerSnapshot(input.snapshot)
+  if (snapshot.length === 0) return 0
+
+  const alreadyReceivedQty = Math.max(0, input.alreadyLanded.qtyNumber)
+  const { taken: consumedBeforeThisReceipt } = takeFromSnapshotEntries(snapshot, alreadyReceivedQty)
+  const remaining = reduceSnapshotByCostLayer(
+    snapshot,
+    consumedBeforeThisReceipt.map((entry) => ({
+      costLayerId: entry.costLayerId,
+      qty: entry.qty,
+    })),
+  )
+
+  return remaining.reduce((sum, entry) => {
+    const qty = toDecimal(entry.qty)
+    return qty.gt(0) ? addMoney(sum, qty) : sum
+  }, toDecimal(0)).toNumber()
 }
