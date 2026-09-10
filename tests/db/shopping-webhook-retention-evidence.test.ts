@@ -68,7 +68,11 @@ import { withCleanup } from '../helpers/with-cleanup.ts'
 const skip = process.env.RUN_DB_RETENTION_TESTS !== '1'
 
 /**
- * THE TRIPWIRE, MODELLED ON `REQUIRE_DB_MIGRATION_TESTS` IN THE TWO SIBLING FILES (o3d-n3yt r19).
+ * THE TRIPWIRE, MODELLED ON `REQUIRE_DB_MIGRATION_TESTS` (o3d-n3yt r19). Do not go looking for that
+ * variable in this tree: the two files that carried it
+ * (tests/db/accounting-event-void-basis-backfill.test.ts and
+ * tests/db/reconciliation-void-mirror-contradictions.test.ts) live on o3d-11rf's branch and are not
+ * on this one, so this block is the only instance of the pattern here.
  *
  * `REQUIRE_DB_RETENTION_TESTS=1` means "this environment PROMISED a migrated database". A
  * `RUN_DB_RETENTION_TESTS` that is not also `1` in such an environment is a wiring defect, and the
@@ -79,7 +83,7 @@ const skip = process.env.RUN_DB_RETENTION_TESTS !== '1'
  * NOTHING KEEPS A *NEW* PAIR WIRED. This block is the whole of the enforcement, and it is about THIS
  * file's gate: it fires only once an invocation has already set `REQUIRE_DB_RETENTION_TESTS`. A
  * programmatic census that read the gates out of the process the runner starts was built alongside
- * this fix and withdrawn — see o3d-n3yt. So a new gated file in tests/db/ that invents a variable
+ * this fix and withdrawn — see o3d-dzsd. So a new gated file in tests/db/ that invents a variable
  * `npm run test:db` does not set still skips itself inside a green run, and only review catches it.
  */
 if (skip && process.env.REQUIRE_DB_RETENTION_TESTS === '1') {

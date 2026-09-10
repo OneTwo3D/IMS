@@ -183,17 +183,21 @@ jobs:
   # described the directory wrongly and the wrong sentence hid the defect it sat next to:
   #
   #   * ONE file gates on a `RUN_DB_*` variable — the retention evidence above. It is set below now.
-  #   * FOUR open a real connection whenever DATABASE_URL is set and skip themselves when it is not
-  #     (`connection-schema-pinning`, `guarded-pool-routing`, `session-lock-affinity`,
-  #     `startup-option-verdict-across-bundles`). They run here, against this job's database.
+  #   * FOUR open a real connection whenever DATABASE_URL is set and skip only those tests when it
+  #     is not (`connection-schema-pinning`, `guarded-pool-routing`, `session-lock-affinity`,
+  #     `startup-option-verdict-across-bundles`). Their live probes run here, against this job's
+  #     database; the rest of each file already ran under `test:unit`.
   #   * FOUR never open one (`advisory-lock-keys`, `pool-acquisition-bound`, `post-remote-persist`,
   #     `prisma-unique-violation`) and run identically under `test:unit`.
+  #
+  # So this tier is NOT held back from `test:unit` as a block: 101 of its 122 tests execute there,
+  # and 21 skip. docs/development.md carries the same census per file, with the counts.
   #
   # The lesson is not "count the files again": a prose census goes stale silently, and this one is
   # prose. NOTHING MECHANICAL ENFORCES IT. A programmatic census was built on o3d-n3yt and
   # WITHDRAWN — it answered a syntactic question (does this source text read a gate?) about an
   # open space (the ways a program can read an environment variable), and two implementations of
-  # it passed shapes their authors had not thought of while reporting healthy. o3d-n3yt carries
+  # it passed shapes their authors had not thought of while reporting healthy. o3d-dzsd carries
   # the replacement, which is a RUNTIME property: after the tier runs, require every collected
   # file to have executed at least one test and reported no skips. Until then, a NEW gated file
   # in tests/db/ that invents a variable this job does not set will skip itself green, exactly as
@@ -289,7 +293,7 @@ jobs:
       # `test:db` sets RUN_DB_RETENTION_TESTS=1 *and* REQUIRE_DB_RETENTION_TESTS=1. The second is the
       # tripwire for this job: if an edit ever drops the first, the suite refuses to load instead of
       # skipping itself into a green run again. That covers THIS pair only. Nothing stops the NEXT
-      # gate arriving without either half — see the comment above the job, and o3d-n3yt.
+      # gate arriving without either half — see the comment above the job, and o3d-dzsd.
       - name: Run the DB-backed regression suites
         env:
           # Scoped to THIS step. The steps above are migrating and generating against the same

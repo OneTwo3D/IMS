@@ -58,27 +58,79 @@ npx tsx --test tests/<relevant-file>.test.ts
 
 ### Database-backed tiers
 
-Two tiers need a real, migrated PostgreSQL and are therefore **not** part of `npm run test:unit`.
-Both are gated on environment variables, and the script named here is the invocation that sets them:
+Two tiers want a real, migrated PostgreSQL, and these are the invocations that give them one:
 
 ```bash
-npm run test:concurrency   # RUN_DB_CONCURRENCY_TESTS=1   -> tests/concurrency/**
-npm run test:db            # RUN_DB_RETENTION_TESTS=1      -> tests/db/**
+npm run test:concurrency   # RUN_DB_CONCURRENCY_TESTS=1                            -> tests/concurrency/**
+npm run test:db            # RUN_DB_RETENTION_TESTS=1 REQUIRE_DB_RETENTION_TESTS=1 -> tests/db/**
 ```
+
+**Neither tier is absent from `npm run test:unit`, and only one of the two is gated end to end.**
+`test:unit`'s glob is `tests/**/*.test.ts`, so it collects `tests/concurrency/**` and `tests/db/**`
+along with everything else. What they then DO under it differs, and the difference is what you need
+in order to read a green `test:unit` log correctly:
+
+* `tests/concurrency/**` — all 22 files gate every test on `RUN_DB_CONCURRENCY_TESTS`, so under
+  `test:unit` the tier is collected, reports `# SKIP`, and executes nothing.
+* `tests/db/**` — exactly ONE of the nine files is gated on a `RUN_DB_*` variable. The other eight
+  run under `test:unit`, four of them in full and four of them minus their live probes.
+
+MEASURED CENSUS OF `tests/db/**` — counted by running it, not by reading it. Each file under
+`npx tsx --test`, with `DATABASE_URL`, `RUN_DB_RETENTION_TESTS`, `REQUIRE_DB_RETENTION_TESTS` and
+`IMS_REQUIRE_BUILD_ARTIFACT` all unset, which is the environment `test:unit` gives it:
+
+| file in `tests/db/` | what gates it | executes | skips |
+| --- | --- | ---: | ---: |
+| `shopping-webhook-retention-evidence` | `RUN_DB_RETENTION_TESTS` — the whole file | 0 | 2 |
+| `connection-schema-pinning` | `DATABASE_URL` present — its live tests only | 33 | 13 |
+| `session-lock-affinity` | `DATABASE_URL` present — its live tests only | 26 | 4 |
+| `guarded-pool-routing` | `DATABASE_URL` present — its live test only | 7 | 1 |
+| `startup-option-verdict-across-bundles` | a `.next` build, then `DATABASE_URL` — see below | 3 | 1 |
+| `advisory-lock-keys` | nothing | 9 | 0 |
+| `post-remote-persist` | nothing | 12 | 0 |
+| `prisma-unique-violation` | nothing | 9 | 0 |
+| `pool-acquisition-bound` | nothing | 2 | 0 |
+| **total** | | **101** | **21** |
+
+101 of the tier's 122 tests therefore execute inside an ordinary `npm run test:unit`. What
+`npm run test:db` adds is the database: the four `DATABASE_URL` files switch their live probes on,
+and the one `RUN_DB_*` file stops skipping entirely.
+
+The 21 was then cross-checked against a WHOLE `npm run test:unit` run rather than left as a sum of
+per-file runs: that run reports 94 skips, of which 21 come from `tests/db/` — 13 schema-pinning, 4
+session-lock, 1 guarded-pool, 1 startup probe, 2 retention — and the remaining 73 are
+`tests/concurrency/**` (69) plus four unrelated `DATABASE_URL`/superuser skips elsewhere.
+
+Two qualifications on the row for `startup-option-verdict-across-bundles`, both read out of the file
+rather than measured, because the workspace this was counted in already held a build:
+
+* Of its four tests, two are unconditional, one needs `.next/BUILD_ID` to exist, and one needs both
+  that and `DATABASE_URL`. The 3/1 above is a workspace WITH a fresh build; a checkout that has not
+  run `npm run build` reports 2/2, and the extra skip is the build, not the database. A workspace
+  whose `.next` is present but STALE is a third state: both build-reading tests then execute and can
+  fail, which is what o3d-2g5y records against a `test:unit` baseline.
+* `IMS_REQUIRE_BUILD_ARTIFACT=1` turns every skip in that file into a failure. `test:db` does not set
+  it; `.github/workflows/production-readiness.yml` does, in the step that runs straight after
+  `npm run build`. So that one file is the only member of the tier whose skips are refused anywhere,
+  and the refusal comes from a different workflow than the one described here.
+
+**This census is prose, and nothing mechanical enforces it.** The same count is written above the
+`db-backed-regressions` job in `.github/workflows/schema-guardrails.yml`; the two are meant to be
+edited together, and a file added to or removed from `tests/db/` makes both wrong at once.
 
 `RUN_DB_RETENTION_TESTS` was invented by one file in `tests/db/` and set by nothing for as long as it
 existed, so that file skipped inside a green CI job (Codex r18, HIGH). `npm run test:db` above is the
 invocation that now sets it, and the `db-backed-regressions` job below is what runs that invocation.
 **Nothing mechanical stops the NEXT gate doing the same thing** — see the NOT ENFORCED list below,
-and o3d-n3yt.
+and o3d-dzsd.
 
-**Read the gate honestly.** `npm run test:unit`'s glob (`tests/**/*.test.ts`) **collects** the gated
-files anyway and reports them as skips, so a missing variable removes whole suites from a run that
-still reads as green. Both database tiers are run in CI by
-`.github/workflows/schema-guardrails.yml`: `tests/concurrency/**` by the `fresh-db-drift` job, and
-`npm run test:db` — which globs `tests/db/**` — by the `db-backed-regressions` job, which stands up
-its own `postgres:16` service, migrates it, and runs the script against it. The two jobs deliberately
-do not share a database; the reason is written out above the second job.
+**Read a skip honestly.** A gate that nothing sets does not fail; it reports `# SKIP` inside a run
+that still reads as green, which is precisely how the retention evidence went unexecuted. Both
+database tiers are run in CI by `.github/workflows/schema-guardrails.yml`: `tests/concurrency/**` by
+the `fresh-db-drift` job, and `npm run test:db` — which globs `tests/db/**` — by the
+`db-backed-regressions` job, which stands up its own `postgres:16` service, migrates it, and runs the
+script against it. The two jobs deliberately do not share a database; the reason is written out above
+the second job.
 
 WHAT THAT DOES AND DOES NOT BUY YOU. State it precisely, because the looser version of this sentence
 ("the job runs `tests/db/**`") was true of the glob and false of what executed:
@@ -92,20 +144,21 @@ WHAT THAT DOES AND DOES NOT BUY YOU. State it precisely, because the looser vers
   without its own. An edit that drops `RUN_DB_RETENTION_TESTS` from `test:db` therefore fails loudly
   instead of skipping into a green run. This is a property of that one pair, written in that one
   file. It says nothing about any other gate.
-* **NOT ENFORCED: that a NEW gate cannot hide.** There is no census. A file added to `tests/db/`
-  that gates itself on a variable `npm run test:db` does not set will report `# SKIP` inside a green
-  job, exactly as `RUN_DB_RETENTION_TESTS` did, and only review will catch it. o3d-n3yt r16-r20 built
-  two implementations of a guard against this and **withdrew both**: each asked a *syntactic*
+* **NOT ENFORCED: that a NEW gate cannot hide.** The census above is prose in two files and nothing
+  reads it. A file added to `tests/db/` that gates itself on a variable `npm run test:db` does not set
+  will report `# SKIP` inside a green job, exactly as `RUN_DB_RETENTION_TESTS` did, and only review
+  will catch it — including the review that should have noticed the census went stale. o3d-n3yt
+  r16-r20 built two implementations of a guard against this and **withdrew both**: each asked a *syntactic*
   question (does this source text read a gate?) about an *open* space (the ways a program can read an
   environment variable), so each passed shapes its author had not thought of while reporting a clean
-  run. A guard that reports enforcement it does not have is worse than none. o3d-n3yt carries the
+  run. A guard that reports enforcement it does not have is worse than none. o3d-dzsd carries the
   replacement, which asks a **runtime** question instead: after the tier runs, require every file the
   runner collected to have executed at least one test and reported no skips.
 * **NOT ENFORCED: that the job keeps existing.** o3d-11rf r13 through r16 attempted that with a
   standing guard that read the workflow to prove the job really invoked the script; the guard was
   withdrawn, because it kept admitting deterministic states in which the job was green and the suites
   never ran. An edit that deletes the job, renames the script, or drops `tests/db/**` from the
-  `paths:` filters is caught by review and by nothing else.
+  `paths:` filters is caught by review and by nothing else. **o3d-n3yt** carries this one.
 * **NOT ENFORCED: `tests/concurrency/**`.** Dropping `RUN_DB_CONCURRENCY_TESTS` from
   `test:concurrency` would silently skip that whole tier exactly as `RUN_DB_RETENTION_TESTS` did.
   That tier has no `REQUIRE_` counterpart in any file, so it does not even have the one-pair tripwire
@@ -113,7 +166,9 @@ WHAT THAT DOES AND DOES NOT BUY YOU. State it precisely, because the looser vers
 * **NOT ENFORCED: that a gated file's tests are non-vacuous.** Only a mutation proves the tests
   behind a gate assert anything.
 
-**o3d-n3yt** carries the remaining holes.
+The two open holes have separate homes, and neither is closed by this branch: **o3d-dzsd** is the
+census — where the two withdrawn implementations are recovered from and where the runtime replacement
+is designed — and **o3d-n3yt** is the job's continued existence. Do not cite one for the other.
 
 `test:db` sets **`REQUIRE_DB_RETENTION_TESTS=1`** alongside `RUN_DB_RETENTION_TESTS=1`. A gated file
 that finds the `REQUIRE_` half set and its own half not throws on load instead of skipping, so a
@@ -136,7 +191,9 @@ published port is behind docker-proxy, which that check refuses by design — so
 container's own address the way `fresh-db-drift` does and gives it to the suite step.
 
 To run either tier locally, point `DATABASE_URL` at a scratch database you do not mind writing to
-(the suites roll their probes back, but they do write).
+and use the script rather than the glob — `npm run test:db` is what un-skips the `RUN_DB_*` file, and
+`npx tsx --test "tests/db/**/*.test.ts"` on its own leaves that file skipping. The suites roll their
+probes back, but they do write.
 
 ### Full-chain E2E tier
 
