@@ -53,6 +53,31 @@ type PendingShipmentRow = {
 }
 
 const state = {
+  /**
+   * o3d-i0o6: THE SALES ORDER ROW AS THE REVERSAL READS IT.
+   *
+   * `postedUnitCostBase` on the allocation snapshot says how many pounds the orphaned units carried
+   * and nothing else. Whether a journal carried them, whether it settled, and into WHICH ledger and
+   * account, are facts only these columns hold — so the reverser reads them, and a double that
+   * hardcoded them would decide every proof below in the double rather than in production.
+   */
+  order: {
+    orderNumber: 'SO-1',
+    externalOrderNumber: null as string | null,
+    inventoryAllocatedDate: new Date('2026-01-01T00:00:00Z') as Date | null,
+    allocationBatchAmount: 40 as number | null,
+    allocationBatchSyncLogId: 'a2-log-1' as string | null,
+    allocationBatchConnector: 'xero' as string | null,
+    allocationBatchAccountCode: '631' as string | null,
+    allocationReversalAmount: null as number | null,
+  },
+  /** The A2 journal the attribution above resolves to: SETTLED, on xero, its own lines debiting 631. */
+  accountingSyncLogs: [{
+    id: 'a2-log-1',
+    status: 'SYNCED',
+    connector: 'xero' as string | null,
+    payload: { lines: [{ accountCode: '631', debit: 500 }, { accountCode: '630', credit: 500 }] } as unknown,
+  }],
   stockLevels: [] as StockLevelRow[],
   allocations: [] as AllocationRow[],
   shipmentLines: [] as ShipmentLineRow[],
@@ -163,6 +188,9 @@ mock.module('@/lib/accounting', {
     },
     isAccountingSyncTypeEnabled: async () => true,
     isDailyBatchPostingEnabled: async () => true,
+    // o3d-i0o6: the ledger the reversal would be raised on — the reverser refuses when it cannot be
+    // established, because a credit may not land in books A2's debit was never in.
+    getActiveAccountingConnectorInfo: async () => ({ id: 'xero' }),
   },
 })
 
@@ -250,6 +278,11 @@ const tx = {
       }
       return true
     }) ?? null,
+    // o3d-i0o6: the A2 journal probed by its own id. A missing row is retention, not "no journal",
+    // and the reversal refuses either way.
+    findUnique: async ({ where }: { where: { id: string } }) => (
+      state.accountingSyncLogs.find((row) => row.id === where.id) ?? null
+    ),
   },
   activityLog: {
     create: async ({ data }: { data: Record<string, unknown> }) => {
@@ -258,12 +291,16 @@ const tx = {
     },
   },
   salesOrder: {
-    findUnique: async () => ({
-      inventoryAllocatedDate: null,
-      orderNumber: 'SO-1',
-      externalOrderNumber: null,
-    }),
-    update: async () => ({}),
+    // o3d-i0o6: served from the fixture. TWO different reads land here — the un-stage's
+    // `inventoryAllocatedDate` probe and the reversal's attribution read — and both are answered
+    // from the same row, as they are in Postgres.
+    findUnique: async () => ({ ...state.order }),
+    update: async ({ data }: { data: { allocationReversalAmount?: number | null } }) => {
+      // o3d-i0o6: the running total the CAP is computed against. Ignoring this write would make the
+      // repeated-shrink assertions vacuous — which is the exact shape of the defect being capped.
+      if ('allocationReversalAmount' in data) state.order.allocationReversalAmount = data.allocationReversalAmount ?? null
+      return {}
+    },
   },
   shipment: {
     findFirst: async () => null,
@@ -609,6 +646,24 @@ function seedLines(qty: number) {
   accountingEnqueueOutcome = 'writes'
   state.lockedScopeRecords = null
   state.txCalls.length = 0
+  // o3d-i0o6: the A2 attribution and the running reversal total go back to a freshly-posted order.
+  // Without this the reversal recorded by one test becomes the CAP the next one is measured against
+  // — which is real production behaviour, and exactly why it must not leak between fixtures.
+  state.order.orderNumber = 'SO-1'
+  state.order.externalOrderNumber = null
+  state.order.inventoryAllocatedDate = new Date('2026-01-01T00:00:00Z')
+  state.order.allocationBatchAmount = 40
+  state.order.allocationBatchSyncLogId = 'a2-log-1'
+  state.order.allocationBatchConnector = 'xero'
+  state.order.allocationBatchAccountCode = '631'
+  state.order.allocationReversalAmount = null
+  state.accountingSyncLogs.length = 0
+  state.accountingSyncLogs.push({
+    id: 'a2-log-1',
+    status: 'SYNCED',
+    connector: 'xero',
+    payload: { lines: [{ accountCode: '631', debit: 500 }, { accountCode: '630', credit: 500 }] },
+  })
 }
 
 /**

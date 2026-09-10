@@ -5565,7 +5565,7 @@ test('the A2 amount is not evidence its journal POSTED — a CANCELLED A2 batch 
   const state = a2StagedFourUnitState()
   withRecordedA2Journal(state, { status: 'CANCELLED' })
 
-  const result = await createSalesOrderRefund(createClient(state), { orderId: 'order-1', accountingSettings, ...monetaryFullRefund() })
+  const result = await createSalesOrderRefund(createClient(state), { orderId: 'order-1', activeAccountingConnector: 'xero', accountingSettings, ...monetaryFullRefund() })
 
   assert.equal(result.success, true)
   assert.equal(state.orders[0].refundStatus, 'FULL')
@@ -5580,7 +5580,7 @@ test('a SYNCED A2 batch on the recorded ledger and account reverses the whole £
   const state = a2StagedFourUnitState()
   withRecordedA2Journal(state, { status: 'SYNCED' })
 
-  const result = await createSalesOrderRefund(createClient(state), { orderId: 'order-1', accountingSettings, ...monetaryFullRefund() })
+  const result = await createSalesOrderRefund(createClient(state), { orderId: 'order-1', activeAccountingConnector: 'xero', accountingSettings, ...monetaryFullRefund() })
 
   assert.equal(result.success, true)
   assert.equal(state.orders[0].refundStatus, 'FULL')
@@ -5595,7 +5595,7 @@ test('a PENDING A2 batch is queued, not posted, so nothing is reversed yet (o3d-
   const state = a2StagedFourUnitState()
   withRecordedA2Journal(state, { status: 'PENDING' })
 
-  const result = await createSalesOrderRefund(createClient(state), { orderId: 'order-1', accountingSettings, ...monetaryFullRefund() })
+  const result = await createSalesOrderRefund(createClient(state), { orderId: 'order-1', activeAccountingConnector: 'xero', accountingSettings, ...monetaryFullRefund() })
 
   assert.equal(result.success, true)
   assert.equal(state.orders[0].refundStatus, 'FULL')
@@ -5630,7 +5630,7 @@ test('the A2 record names WHICH ACCOUNT it debited, and a re-mapped account is n
   const state = a2StagedFourUnitState()
   withRecordedA2Journal(state, { status: 'SYNCED', accountCode: '1215' })
 
-  const result = await createSalesOrderRefund(createClient(state), { orderId: 'order-1', accountingSettings, ...monetaryFullRefund() })
+  const result = await createSalesOrderRefund(createClient(state), { orderId: 'order-1', activeAccountingConnector: 'xero', accountingSettings, ...monetaryFullRefund() })
 
   assert.equal(result.success, true)
   assert.equal(state.orders[0].refundStatus, 'FULL')
@@ -5681,7 +5681,7 @@ test("Group B's recorded relief survives stock-movement retention AND a revaluat
   state.costLayers[0].unitCostBase = 4
   // Retention has swept the dispatch movement and its CogsEntry rows: state.movements is empty.
 
-  const result = await createSalesOrderRefund(createClient(state), { orderId: 'order-1', accountingSettings, ...monetaryFullRefund() })
+  const result = await createSalesOrderRefund(createClient(state), { orderId: 'order-1', activeAccountingConnector: 'xero', accountingSettings, ...monetaryFullRefund() })
 
   assert.equal(result.success, true)
   assert.equal(state.orders[0].refundStatus, 'FULL')
@@ -5698,7 +5698,7 @@ test('a journaled shipment whose dispatch cost rows were swept and never recorde
   state.orders[0].allocationBatchAmount = 30
   state.lines[0].qty = 3
 
-  const result = await createSalesOrderRefund(createClient(state), { orderId: 'order-1', accountingSettings, ...monetaryFullRefund() })
+  const result = await createSalesOrderRefund(createClient(state), { orderId: 'order-1', activeAccountingConnector: 'xero', accountingSettings, ...monetaryFullRefund() })
 
   assert.equal(result.success, true)
   assert.equal(state.orders[0].refundStatus, 'FULL')
@@ -5719,7 +5719,7 @@ test("a prior refund's RECORDED relief survives sync-log retention (o3d-o97 r3)"
   state.refunds.find((refund) => refund.id === 'refund-prior')!.allocatedReliefAmount = 10
   // No accountingSyncLogs entry for refund-prior at all: retention has taken it.
 
-  const result = await createSalesOrderRefund(createClient(state), { orderId: 'order-1', accountingSettings, ...monetaryFullRefund(75) })
+  const result = await createSalesOrderRefund(createClient(state), { orderId: 'order-1', activeAccountingConnector: 'xero', accountingSettings, ...monetaryFullRefund(75) })
 
   assert.equal(result.success, true)
   assert.equal(state.orders[0].refundStatus, 'FULL')
@@ -5741,7 +5741,7 @@ test('a prior refund that claimed allocated units with no surviving record REFUS
   withRecordedA2Journal(state, { status: 'SYNCED' })
   seedPriorAllocationRefund(state)
 
-  const result = await createSalesOrderRefund(createClient(state), { orderId: 'order-1', accountingSettings, ...monetaryFullRefund(75) })
+  const result = await createSalesOrderRefund(createClient(state), { orderId: 'order-1', activeAccountingConnector: 'xero', accountingSettings, ...monetaryFullRefund(75) })
 
   assert.equal(result.success, true)
   assert.equal(state.orders[0].refundStatus, 'FULL')
@@ -5766,6 +5766,7 @@ test('a PARTIAL refund reverses the basis A2 POSTED, not the layers revalued sin
 
   const result = await createSalesOrderRefund(createClient(state), {
     orderId: 'order-1',
+    activeAccountingConnector: 'xero',
     lines: [{ lineId: 'line-1', productId: 'product-1', description: 'Product 1', qty: 3, totalBase: 40 }],
     reason: 'Three units back',
     creditNotePrefix: 'CN-',
@@ -5798,6 +5799,7 @@ test('a PARTIAL refund on a basis-less allocation row reverses the APPORTIONED A
 
   const result = await createSalesOrderRefund(createClient(state), {
     orderId: 'order-1',
+    activeAccountingConnector: 'xero',
     lines: [{ lineId: 'line-1', productId: 'product-1', description: 'Product 1', qty: 3, totalBase: 40 }],
     reason: 'Three units back',
     creditNotePrefix: 'CN-',
@@ -5829,6 +5831,7 @@ test('a basis-less partial UNDER the cap is no longer priced from the layer eith
 
   const partial = await createSalesOrderRefund(client, {
     orderId: 'order-1',
+    activeAccountingConnector: 'xero',
     lines: [{ lineId: 'line-1', productId: 'product-1', description: 'Product 1', qty: 2, totalBase: 25 }],
     reason: 'Two units back',
     creditNotePrefix: 'CN-',
@@ -5844,6 +5847,7 @@ test('a basis-less partial UNDER the cap is no longer priced from the layer eith
   // And the balance closes exactly: the full refund's residue takes the remaining £20, never £40.
   const full = await createSalesOrderRefund(client, {
     orderId: 'order-1',
+    activeAccountingConnector: 'xero',
     lines: [{ lineId: null, productId: null, description: 'Monetary refund', qty: 0, totalBase: 75, lineKind: 'sale' }],
     reason: 'Goodwill remainder',
     creditNotePrefix: 'CN-',
@@ -5874,7 +5878,7 @@ test("Group B's recorded relief is not relief until its journal POSTS — a queu
   withRecordedA2Journal(state, { status: 'SYNCED' })
   withRecordedGroupBRelief(state, { amount: 20, status: 'PENDING' })
 
-  const result = await createSalesOrderRefund(createClient(state), { orderId: 'order-1', accountingSettings, ...monetaryFullRefund() })
+  const result = await createSalesOrderRefund(createClient(state), { orderId: 'order-1', activeAccountingConnector: 'xero', accountingSettings, ...monetaryFullRefund() })
 
   assert.equal(result.success, true)
   assert.equal(state.orders[0].refundStatus, 'FULL')
@@ -5898,6 +5902,7 @@ test("a refusal WITHHOLDS the line reversal instead of un-capping it (o3d-o97 r4
 
   const result = await createSalesOrderRefund(createClient(state), {
     orderId: 'order-1',
+    activeAccountingConnector: 'xero',
     lines: [{ lineId: 'line-1', productId: 'product-1', description: 'Product 1', qty: 4, totalBase: 100 }],
     reason: 'All four units back',
     creditNotePrefix: 'CN-',
@@ -5929,7 +5934,7 @@ test("a CANCELLED Group B journal is NOT evidence of no relief — it refuses (o
   withRecordedA2Journal(state, { status: 'SYNCED' })
   withRecordedGroupBRelief(state, { amount: 20, status: 'CANCELLED' })
 
-  const result = await createSalesOrderRefund(createClient(state), { orderId: 'order-1', accountingSettings, ...monetaryFullRefund() })
+  const result = await createSalesOrderRefund(createClient(state), { orderId: 'order-1', activeAccountingConnector: 'xero', accountingSettings, ...monetaryFullRefund() })
 
   assert.equal(result.success, true)
   assert.equal(state.orders[0].refundStatus, 'FULL')
@@ -5945,7 +5950,7 @@ test("a SYNCED Group B journal on the recorded ledger nets its £20 exactly once
   withRecordedA2Journal(state, { status: 'SYNCED' })
   withRecordedGroupBRelief(state, { amount: 20, status: 'SYNCED' })
 
-  const result = await createSalesOrderRefund(createClient(state), { orderId: 'order-1', accountingSettings, ...monetaryFullRefund() })
+  const result = await createSalesOrderRefund(createClient(state), { orderId: 'order-1', activeAccountingConnector: 'xero', accountingSettings, ...monetaryFullRefund() })
 
   assert.equal(result.success, true)
   assert.equal(findAllocatedInventoryCredit(result), 20, '£40 debited less the £20 Group B actually credited')
@@ -5980,7 +5985,7 @@ test("a recorded relief of more than half a penny that names NO journal is refus
   withRecordedA2Journal(state, { status: 'SYNCED' })
   state.shipments[0].allocatedReliefAmount = 20
 
-  const result = await createSalesOrderRefund(createClient(state), { orderId: 'order-1', accountingSettings, ...monetaryFullRefund() })
+  const result = await createSalesOrderRefund(createClient(state), { orderId: 'order-1', activeAccountingConnector: 'xero', accountingSettings, ...monetaryFullRefund() })
 
   assert.equal(result.success, true)
   assert.equal(findAllocatedInventoryCredit(result), null)
@@ -5996,7 +6001,7 @@ test("a sub-penny relief with no journal is a relief of ZERO, not a refusal (o3d
   withRecordedA2Journal(state, { status: 'SYNCED' })
   state.shipments[0].allocatedReliefAmount = 0.004
 
-  const result = await createSalesOrderRefund(createClient(state), { orderId: 'order-1', accountingSettings, ...monetaryFullRefund() })
+  const result = await createSalesOrderRefund(createClient(state), { orderId: 'order-1', activeAccountingConnector: 'xero', accountingSettings, ...monetaryFullRefund() })
 
   assert.equal(result.success, true)
   assert.equal(findAllocatedInventoryCredit(result), 40, 'nothing was credited to Allocated Inventory, so all £40 is open')
@@ -6022,7 +6027,7 @@ test("a prior refund's QUEUED reversal is not relief either (o3d-o97 r4)", async
     payload: { lines: [{ accountCode: '1210', credit: 10 }] },
   })
 
-  const result = await createSalesOrderRefund(createClient(state), { orderId: 'order-1', accountingSettings, ...monetaryFullRefund(75) })
+  const result = await createSalesOrderRefund(createClient(state), { orderId: 'order-1', activeAccountingConnector: 'xero', accountingSettings, ...monetaryFullRefund(75) })
 
   assert.equal(result.success, true)
   assert.equal(state.orders[0].refundStatus, 'FULL')
@@ -6054,6 +6059,7 @@ test('an order whose rows PARTLY recorded their basis apportions only the unreco
 
   const result = await createSalesOrderRefund(createClient(state), {
     orderId: 'order-1',
+    activeAccountingConnector: 'xero',
     lines: [{ lineId: 'line-1', productId: 'product-1', description: 'Product 1', qty: 4, totalBase: 40 }],
     reason: 'All four units back',
     creditNotePrefix: 'CN-',
@@ -6086,7 +6092,7 @@ test("a SETTLED Group B journal whose lines credit Allocated Inventory NOTHING i
   withRecordedA2Journal(state, { status: 'SYNCED' })
   withRecordedGroupBRelief(state, { amount: 20, status: 'SYNCED', journalPayload: { lines: [{ accountCode: '4000', credit: 20 }] } })
 
-  const result = await createSalesOrderRefund(createClient(state), { orderId: 'order-1', accountingSettings, ...monetaryFullRefund() })
+  const result = await createSalesOrderRefund(createClient(state), { orderId: 'order-1', activeAccountingConnector: 'xero', accountingSettings, ...monetaryFullRefund() })
 
   assert.equal(result.success, true)
   assert.equal(state.orders[0].refundStatus, 'FULL')
@@ -6105,7 +6111,7 @@ test("a shipment recording MORE relief than its journal credited in total is ref
   withRecordedA2Journal(state, { status: 'SYNCED' })
   withRecordedGroupBRelief(state, { amount: 20, status: 'SYNCED', journalCredit: 6 })
 
-  const result = await createSalesOrderRefund(createClient(state), { orderId: 'order-1', accountingSettings, ...monetaryFullRefund() })
+  const result = await createSalesOrderRefund(createClient(state), { orderId: 'order-1', activeAccountingConnector: 'xero', accountingSettings, ...monetaryFullRefund() })
 
   assert.equal(result.success, true)
   assert.equal(findAllocatedInventoryCredit(result), null, 'not the £20 r4 subtracted from the £40')
@@ -6154,7 +6160,7 @@ test("a prior refund's relief is the pounds its journal CREDITED, not the pounds
     payload: { lines: [{ accountCode: '1200', debit: 4 }, { accountCode: '1210', credit: 4 }] },
   })
 
-  const result = await createSalesOrderRefund(createClient(state), { orderId: 'order-1', accountingSettings, ...monetaryFullRefund(75) })
+  const result = await createSalesOrderRefund(createClient(state), { orderId: 'order-1', activeAccountingConnector: 'xero', accountingSettings, ...monetaryFullRefund(75) })
 
   assert.equal(result.success, true)
   assert.equal(state.orders[0].refundStatus, 'FULL')
@@ -6170,7 +6176,7 @@ test("a SETTLED A2 journal whose lines debit Allocated Inventory NOTHING is refu
   const state = a2StagedFourUnitState()
   withRecordedA2Journal(state, { status: 'SYNCED', journalLines: [{ accountCode: '4000', debit: 40 }] })
 
-  const result = await createSalesOrderRefund(createClient(state), { orderId: 'order-1', accountingSettings, ...monetaryFullRefund() })
+  const result = await createSalesOrderRefund(createClient(state), { orderId: 'order-1', activeAccountingConnector: 'xero', accountingSettings, ...monetaryFullRefund() })
 
   assert.equal(result.success, true)
   assert.equal(state.orders[0].refundStatus, 'FULL')
@@ -6185,7 +6191,7 @@ test("an order claiming a bigger share than its A2 batch journal debited is refu
   const state = a2StagedFourUnitState()
   withRecordedA2Journal(state, { status: 'SYNCED', journalDebit: 25 })
 
-  const result = await createSalesOrderRefund(createClient(state), { orderId: 'order-1', accountingSettings, ...monetaryFullRefund() })
+  const result = await createSalesOrderRefund(createClient(state), { orderId: 'order-1', activeAccountingConnector: 'xero', accountingSettings, ...monetaryFullRefund() })
 
   assert.equal(result.success, true)
   assert.equal(findAllocatedInventoryCredit(result), null, 'not the £40 the order records')
@@ -6202,7 +6208,7 @@ test("a settled journal whose payload was COMPACTED off it still resolves to the
   withRecordedA2Journal(state, { status: 'SYNCED', journalPayload: null })
   withRecordedGroupBRelief(state, { amount: 20, status: 'SYNCED', journalPayload: null })
 
-  const result = await createSalesOrderRefund(createClient(state), { orderId: 'order-1', accountingSettings, ...monetaryFullRefund() })
+  const result = await createSalesOrderRefund(createClient(state), { orderId: 'order-1', activeAccountingConnector: 'xero', accountingSettings, ...monetaryFullRefund() })
 
   assert.equal(result.success, true)
   assert.equal(state.orders[0].refundStatus, 'FULL')
@@ -6293,6 +6299,7 @@ test('a PARTIAL refund whose apportionment pool spans two products refuses inste
 
   const result = await createSalesOrderRefund(createClient(state), {
     orderId: 'order-1',
+    activeAccountingConnector: 'xero',
     lines: [{ lineId: 'line-y', productId: 'product-y', description: 'Cheap Y', qty: 2, totalBase: 40 }],
     reason: 'Both cheap units back',
     creditNotePrefix: 'CN-',
@@ -6326,6 +6333,7 @@ test('the same two-product order on a FULL refund still closes to exactly the re
 
   const result = await createSalesOrderRefund(createClient(state), {
     orderId: 'order-1',
+    activeAccountingConnector: 'xero',
     lines: [
       { lineId: 'line-x', productId: 'product-x', description: 'Expensive X', qty: 2, totalBase: 60 },
       { lineId: 'line-y', productId: 'product-y', description: 'Cheap Y', qty: 2, totalBase: 40 },
@@ -6366,6 +6374,7 @@ test('a SINGLE-product apportionment pool still values a partial refund (o3d-o97
 
   const result = await createSalesOrderRefund(createClient(state), {
     orderId: 'order-1',
+    activeAccountingConnector: 'xero',
     lines: [{ lineId: 'line-1', productId: 'product-1', description: 'Product 1', qty: 2, totalBase: 25 }],
     reason: 'Two units back',
     creditNotePrefix: 'CN-',
@@ -6404,7 +6413,7 @@ test('an A2 journal that debits AND credits Allocated Inventory is bounded by th
     ],
   })
 
-  const result = await createSalesOrderRefund(createClient(state), { orderId: 'order-1', accountingSettings, ...monetaryFullRefund() })
+  const result = await createSalesOrderRefund(createClient(state), { orderId: 'order-1', activeAccountingConnector: 'xero', accountingSettings, ...monetaryFullRefund() })
 
   assert.equal(result.success, true)
   assert.equal(state.orders[0].refundStatus, 'FULL')
@@ -6434,7 +6443,7 @@ test("a Group B journal that debits Allocated Inventory back is bounded by its N
     },
   })
 
-  const result = await createSalesOrderRefund(createClient(state), { orderId: 'order-1', accountingSettings, ...monetaryFullRefund() })
+  const result = await createSalesOrderRefund(createClient(state), { orderId: 'order-1', activeAccountingConnector: 'xero', accountingSettings, ...monetaryFullRefund() })
 
   assert.equal(result.success, true)
   assert.equal(state.orders[0].refundStatus, 'FULL')
@@ -6462,7 +6471,7 @@ test("a shipment's relief counted after retention deleted its journal is REPORTE
   // a CANCELLED (never-posted) Group B journal reaches once it is past the retention cutoff.
   withRecordedGroupBRelief(state, { amount: 20, status: null })
 
-  const result = await createSalesOrderRefund(createClient(state), { orderId: 'order-1', accountingSettings, ...monetaryFullRefund() })
+  const result = await createSalesOrderRefund(createClient(state), { orderId: 'order-1', activeAccountingConnector: 'xero', accountingSettings, ...monetaryFullRefund() })
 
   assert.equal(result.success, true)
   assert.equal(state.orders[0].refundStatus, 'FULL')
@@ -6481,7 +6490,7 @@ test('a proved relief writes no such note — the report is about UNREADABLE evi
   withRecordedA2Journal(state, { status: 'SYNCED' })
   withRecordedGroupBRelief(state, { amount: 20, status: 'SYNCED' })
 
-  const result = await createSalesOrderRefund(createClient(state), { orderId: 'order-1', accountingSettings, ...monetaryFullRefund() })
+  const result = await createSalesOrderRefund(createClient(state), { orderId: 'order-1', activeAccountingConnector: 'xero', accountingSettings, ...monetaryFullRefund() })
 
   assert.equal(result.success, true)
   assert.equal(findAllocatedInventoryCredit(result), 20)
@@ -6560,6 +6569,7 @@ test('a PARTIAL refund apportioning across TWO rows of ONE product refuses inste
 
   const result = await createSalesOrderRefund(createClient(state), {
     orderId: 'order-1',
+    activeAccountingConnector: 'xero',
     lines: [{ lineId: 'line-1', productId: 'product-1', description: 'Product 1', qty: 1, totalBase: 10 }],
     reason: 'One unit back',
     creditNotePrefix: 'CN-',
@@ -6590,6 +6600,7 @@ test('a PARTIAL refund that empties the WHOLE pool still credits it — the tota
 
   const result = await createSalesOrderRefund(createClient(state), {
     orderId: 'order-1',
+    activeAccountingConnector: 'xero',
     lines: [{ lineId: 'line-1', productId: 'product-1', description: 'Product 1', qty: 4, totalBase: 40 }],
     reason: 'All four units back',
     creditNotePrefix: 'CN-',
@@ -6614,6 +6625,7 @@ test('the SAME inexact apportionment on a FULL refund is not refused — cap and
 
   const result = await createSalesOrderRefund(createClient(state), {
     orderId: 'order-1',
+    activeAccountingConnector: 'xero',
     lines: [
       { lineId: 'line-1', productId: 'product-1', description: 'Product 1', qty: 1, totalBase: 10 },
       { lineId: null, productId: null, description: 'Monetary remainder', qty: 0, totalBase: 90, lineKind: 'sale' as const },
@@ -6890,6 +6902,7 @@ test('o3d-ypkk: refunding a partially-shipped order finds a cost basis for the U
 
   const result = await createSalesOrderRefund(createClient(state), {
     orderId: 'order-1',
+    activeAccountingConnector: 'xero',
     accountingSettings,
     ...YPKK_WHOLE_LINE_REFUND,
   })
