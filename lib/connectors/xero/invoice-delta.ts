@@ -682,9 +682,57 @@ export type DeltaChunk = {
 /** `stop` leaves the cursor where the last successful chunk put it and ends the drain. */
 export type DeltaChunkHandler = (chunk: DeltaChunk) => Promise<'continue' | 'stop'>
 
+/**
+ * `requests` is what this drain actually SPENT of the tenant's Xero allowance (o3d-pzu0).
+ *
+ * The budget has always counted it and `spent()` was never surfaced anywhere, so "did this poll cost
+ * five calls or two hundred?" — and therefore "is the quota the problem?" — could not be answered
+ * from a run. Present on the failure arm too: a drain that errors has usually spent the MOST.
+ */
+/**
+ * WHAT A POLL LEARNED, FOR THE NEXT ONE TO REUSE (o3d-pzu0).
+ *
+ * Present only when this drain established that the window is OVERSIZED and did not finish it. The
+ * next poll uses it to establish the same fact for one sentinel request instead of an MAX_PAGES+1
+ * page walk. `spanMs` is the chunk width that was working when the poll ran out of chunks, so the
+ * resumed drain does not have to re-bisect from half the window down to it.
+ *
+ * NULL ON A COMPLETED DRAIN, deliberately: it must be CLEARED, not merely not-updated. A stale hint
+ * would make every later poll pay a probe for a window that has fitted whole for a week.
+ */
+export type DeltaDrainHint = { spanMs: number }
+
+/**
+ * Read a persisted hint, and REFUSE it unless it was written against exactly this cursor.
+ *
+ * The hint describes one window, identified by the cursor the drain started from. If the cursor has
+ * moved — another poll checkpointed, an operator reset it, the setting is left over from an older
+ * backlog — the width it carries is about a window that no longer exists. Acting on it would spend a
+ * probe to answer the wrong question, which is worse than having no hint at all.
+ *
+ * Everything unparseable, incomplete, or non-positive reads as ABSENT rather than as a default: the
+ * value is free-text in a Setting row, and the fallback (no hint) is the behaviour that was correct
+ * before this existed.
+ */
+export function parsePersistedDrainHint(value: string | null | undefined, expectedCursor: string): DeltaDrainHint | null {
+  if (typeof value !== 'string' || value.trim() === '') return null
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(value)
+  } catch {
+    return null
+  }
+  if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) return null
+  const record = parsed as Record<string, unknown>
+  if (typeof record.cursor !== 'string' || record.cursor !== expectedCursor) return null
+  const spanMs = record.spanMs
+  if (typeof spanMs !== 'number' || !Number.isFinite(spanMs) || spanMs <= 0) return null
+  return { spanMs }
+}
+
 export type DeltaDrainResult =
-  | { ok: true; chunks: number; complete: boolean; stopped: boolean }
-  | { ok: false; error: string; chunks: number }
+  | { ok: true; chunks: number; complete: boolean; stopped: boolean; requests: number; hint: DeltaDrainHint | null }
+  | { ok: false; error: string; chunks: number; requests: number; hint: DeltaDrainHint | null }
 
 /**
  * Read `[since, windowEnd)` in bounded pieces, handing each to `onChunk` before reading the next.
@@ -703,10 +751,20 @@ export type DeltaDrainResult =
  * SHAPE OF THE WALK:
  *  - The first attempt is the unbounded read a normal poll has always done — one request, no `where`
  *    clause, no behaviour change on the hot path. Only when THAT overflows does chunking begin, so
- *    the unverified `where` combination can never break an ordinary poll. The price is that a poll
- *    resuming a drain re-establishes the overflow at MAX_PAGES+1 calls before chunking; that is
- *    deliberate (no extra persisted state, and the common path stays one request) and it is bounded
- *    by how few polls a drain takes.
+ *    the unverified `where` combination can never break an ordinary poll.
+ *  - RESUMING NO LONGER RE-PAYS FOR THAT (o3d-pzu0). This used to cost a poll continuing a drain up
+ *    to MAX_PAGES+1 requests to re-establish what the previous poll had already found out, and the
+ *    note here called it deliberate: no extra persisted state, and the common path stays one
+ *    request. The first half of that stopped being true against a 950/day tenant budget — a drain
+ *    long enough to need continuing is exactly the one that cannot spare twenty requests a poll to
+ *    learn nothing. A caller that carries `hint` back gets ONE sentinel probe instead.
+ *
+ *    THE PROBE STILL DECIDES. The hint says which question is worth asking first, never what the
+ *    answer is. A backlog usually clears, and a drain that TRUSTED the hint would chunk a window
+ *    that now fits — which costs more than the single unbounded request it replaced, not less, and
+ *    moves the cursor in smaller steps. So the hot path is unchanged, a resumed drain over a still
+ *    oversized window pays 1 request instead of MAX_PAGES+1, and a resumed drain over a window that
+ *    has cleared pays 2 instead of 1.
  *  - A candidate chunk is sized by halving on overflow and doubling on success, and each candidate
  *    is settled with a single sentinel-page request rather than a full walk.
  *  - Chunks per poll are capped: an incomplete drain reports `complete: false` and resumes from the
@@ -738,6 +796,12 @@ export async function drainInvoicesModifiedSince(
    * tests whose fetcher makes exactly one call per invocation.
    */
   observeAttempts?: () => number,
+  /**
+   * What the PREVIOUS poll learned about this same window (o3d-pzu0). Supplying it replaces the
+   * MAX_PAGES+1-page rediscovery walk with ONE sentinel probe — and the probe still decides, so a
+   * backlog that has cleared since is read whole exactly as it would have been without a hint.
+   */
+  hint?: DeltaDrainHint,
 ): Promise<DeltaDrainResult> {
   // ONE budget for the whole poll — the unbounded probe, every chunk, every page, and every
   // saturated-second verification pass all count against it (o3d-8f9). Without this the nested
@@ -748,12 +812,38 @@ export async function drainInvoicesModifiedSince(
   // against the ceiling instead of hiding behind one invocation (o3d-8f9 r3).
   const counted = observeAttempts ? budgetedFetcher(get, budget, observeAttempts) : get
 
+  // RESUMING A KNOWN-OVERSIZED WINDOW (o3d-pzu0): ask the cheap question first.
+  //
+  // Without a hint this stays exactly as it was — one unbounded request on the hot path, and no
+  // behaviour change for the ordinary poll. With one, a single sentinel page answers "is this still
+  // oversized?" for one request instead of the MAX_PAGES+1 the walk below would spend to reach the
+  // same conclusion. The probe DECIDES; the hint only says which question is worth asking first, so
+  // a backlog that cleared between polls still takes the whole-window path.
+  let knownOversized = false
+  if (hint) {
+    const probe = await fitsUnderCap(since, windowEnd, counted, budget)
+    if (probe.status === 'error') {
+      return { ok: false, error: probe.error, chunks: 0, requests: budget.spent(), hint }
+    }
+    knownOversized = probe.status === 'overflow'
+  }
+
   // The ordinary poll: one unbounded read of the whole window, exactly as before chunking existed.
-  const whole = await walkPages(since, undefined, counted, budget)
-  if (whole.status === 'error') return { ok: false, error: whole.error, chunks: 0 }
-  if (whole.status === 'ok') {
-    const decision = await onChunk({ invoices: whole.invoices, through: windowEnd })
-    return { ok: true, chunks: 1, complete: decision === 'continue', stopped: decision === 'stop' }
+  if (!knownOversized) {
+    const whole = await walkPages(since, undefined, counted, budget)
+    if (whole.status === 'error') return { ok: false, error: whole.error, chunks: 0, requests: budget.spent(), hint: hint ?? null }
+    if (whole.status === 'ok') {
+      const decision = await onChunk({ invoices: whole.invoices, through: windowEnd })
+      return {
+        ok: true,
+        chunks: 1,
+        complete: decision === 'continue',
+        stopped: decision === 'stop',
+        requests: budget.spent(),
+        // The window fitted whole, so there is nothing left to resume and any hint is now stale.
+        hint: null,
+      }
+    }
   }
 
   // Oversized. Everything below reads bounded sub-windows only.
@@ -769,15 +859,26 @@ export async function drainInvoicesModifiedSince(
         `window ending ${windowEnd.toISOString()} is too short to subdivide. The cursor is held ` +
         `(o3d-zdh).`,
       chunks: 0,
+      requests: budget.spent(),
+      hint: null,
     }
   }
 
-  let span = Math.max(MIN_CHUNK_MS, Math.floor((end - watermark) / 2))
+  // Start from the width the PREVIOUS poll had narrowed to (o3d-pzu0), clamped into this window.
+  // Without it a resumed drain re-bisects from half the window down to the same answer, spending a
+  // probe on each halving — the other half of the rediscovery this issue is about.
+  const initialSpan = Math.max(MIN_CHUNK_MS, Math.floor((end - watermark) / 2))
+  let span = hint
+    ? Math.min(initialSpan, Math.max(MIN_CHUNK_MS, hint.spanMs))
+    : initialSpan
   let chunks = 0
   let probes = 0
 
   while (watermark < end) {
-    if (chunks >= MAX_CHUNKS_PER_POLL) return { ok: true, chunks, complete: false, stopped: false }
+    // Out of chunks, not out of window: hand the working width to the next poll.
+    if (chunks >= MAX_CHUNKS_PER_POLL) {
+      return { ok: true, chunks, complete: false, stopped: false, requests: budget.spent(), hint: { spanMs: span } }
+    }
 
     const floor = new Date(watermark - CHUNK_FLOOR_BACKOFF_MS)
     // The narrowest chunk that still moves the cursor a whole second forward. Anything smaller is
@@ -795,6 +896,10 @@ export async function drainInvoicesModifiedSince(
         `checkpointed; the cursor is held there rather than skipping invoices nobody read. This ` +
         `needs an operator: look for a bulk edit in Xero at that timestamp (o3d-zdh).`,
       chunks,
+      requests: budget.spent(),
+      // Still oversized, and the next poll will fail the same way — so let it establish that for one
+      // request rather than twenty-one while an operator works out what happened.
+      hint: { spanMs: span },
     })
 
     if (++probes > MAX_CHUNK_PROBES) {
@@ -805,6 +910,8 @@ export async function drainInvoicesModifiedSince(
           `${floor.toISOString()} to ${upper.toISOString()}). ${chunks} chunk(s) were processed and ` +
           `checkpointed; the cursor is held at ${new Date(watermark).toISOString()} (o3d-zdh).`,
         chunks,
+        requests: budget.spent(),
+        hint: { spanMs: span },
       }
     }
 
@@ -815,7 +922,7 @@ export async function drainInvoicesModifiedSince(
     const narrower = Math.max(MIN_CHUNK_MS, Math.floor(width / 2))
 
     const fit = await fitsUnderCap(floor, upper, counted, budget)
-    if (fit.status === 'error') return { ok: false, error: fit.error, chunks }
+    if (fit.status === 'error') return { ok: false, error: fit.error, chunks, requests: budget.spent(), hint: { spanMs: span } }
     if (fit.status === 'overflow') {
       if (upperMs <= narrowest) return undividable()
       span = narrower
@@ -823,7 +930,7 @@ export async function drainInvoicesModifiedSince(
     }
 
     const walked = await walkPages(floor, upper, counted, budget)
-    if (walked.status === 'error') return { ok: false, error: walked.error, chunks }
+    if (walked.status === 'error') return { ok: false, error: walked.error, chunks, requests: budget.spent(), hint: { spanMs: span } }
     if (walked.status === 'overflow') {
       // The window grew between the sentinel probe and the walk. Narrow and re-ask rather than
       // trust a half-read chunk.
@@ -835,13 +942,14 @@ export async function drainInvoicesModifiedSince(
     const decision = await onChunk({ invoices: walked.invoices, through: upper })
     chunks++
     watermark = upperMs
-    if (decision === 'stop') return { ok: true, chunks, complete: false, stopped: true }
+    if (decision === 'stop') return { ok: true, chunks, complete: false, stopped: true, requests: budget.spent(), hint: { spanMs: span } }
     // Grow back after a success: one dense stretch must not pin every later chunk to a second, or a
     // day-long backlog would need 86,400 of them.
     span = Math.min(Math.max(end - watermark, MIN_CHUNK_MS), width * 2)
   }
 
-  return { ok: true, chunks, complete: true, stopped: false }
+  // Drained to the window end: nothing to resume, so the hint is cleared rather than carried.
+  return { ok: true, chunks, complete: true, stopped: false, requests: budget.spent(), hint: null }
 }
 
 /** Invoice IDs of one type currently sitting at one of `statuses`. */

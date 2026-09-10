@@ -180,7 +180,9 @@ test('o3d-jit6 r3: the attempt counter is the statement immediately before the s
   // would say "sent" for a request that was not, or vice versa — and this is the only place that can
   // see it, because no unit test can observe a statement that is not there.
   const source = readFileSync('lib/connectors/xero/api.ts', 'utf8')
-  const note = source.indexOf('noteRequest(auth.tenantId)')
+  // Without the closing paren (o3d-11rf r3): the counter now also takes a caller-owned attempt
+  // meter, and what is being guarded is WHERE the statement sits, not its argument list.
+  const note = source.indexOf('noteRequest(auth.tenantId')
   const send = source.indexOf('await connectorFetch(url, init, ')
   assert.ok(note > -1 && send > note, 'noteRequest must precede the send')
   const between = source.slice(note, send)

@@ -27,7 +27,7 @@
  * notices. See drainInvoicesModifiedSince for the boundary rules that keep chunking lossless.
  */
 
-import { xeroHttpAttemptCount } from '@/lib/connectors/xero/api'
+import { createXeroAttemptMeter } from '@/lib/connectors/xero/api'
 import { db } from '@/lib/db'
 import { xeroGet } from './api'
 import { logActivity, logActivityPersisted } from '@/lib/activity-log'
@@ -50,12 +50,21 @@ import {
   WITHHELD_RECHECK_BATCH,
 } from '@/lib/domain/accounting/withheld-reversal-markers'
 import { withPaymentWriteLockOrSkip, isLockSkipped } from './payment-write-lock'
+import {
+  LAG_ALERT_FLOOR_MS,
+  MIN_LAG_PROGRESS_MS,
+  assessCursorLag,
+  describeLagDuration,
+  readCursorLagSetting,
+} from './payment-poll-lag'
 
 import {
   advanceCheckpoint,
   CURSOR_OVERLAP_MS,
   drainInvoicesModifiedSince,
   idsWhere,
+  MAX_REQUESTS_PER_POLL,
+  parsePersistedDrainHint,
   listedLedgerPaymentIds,
   parseLedgerAmount,
   xeroInvoiceCurrency,
@@ -709,6 +718,28 @@ type PollResult = {
    */
   withheldRechecked: number
   withheldResolved: number
+  /**
+   * o3d-pzu0 — WHAT THIS POLL COST, AND HOW FAR BEHIND IT LEFT THE CURSOR.
+   *
+   * The request budget has always counted the spend and `spent()` was surfaced nowhere, so "is the
+   * tenant's Xero quota the problem?" could not be answered from a run at all. `cursorLagMs` is the
+   * other half: the gap between the poll's own start and the cursor it leaves behind, which is the
+   * number that says whether the drain is keeping up. Both are reported rather than merely logged,
+   * because the issue's remaining ask — size the per-poll allocation above supported ingress — is a
+   * product decision that needs a few weeks of exactly these two figures.
+   */
+  xeroRequests: number
+  /**
+   * o3d-pzu0 r2 (Codex MEDIUM): the two halves of `xeroRequests`, kept apart because they are
+   * bounded by different things and answer different questions. `drainRequests` is what the delta
+   * drain spent and is the figure `MAX_REQUESTS_PER_POLL` caps; `recheckRequests` is what the
+   * withheld-reversal recheck spent AFTER the cursor was decided, and nothing here caps it.
+   * `xeroRequests` is their SUM — what the tenant's allowance actually paid for this run, which is
+   * the number a quota decision needs and the one that used to omit the recheck entirely.
+   */
+  drainRequests: number
+  recheckRequests: number
+  cursorLagMs: number
   errors: string[]
   skipped?: string
 }
@@ -1437,6 +1468,10 @@ export async function pollXeroPayments(): Promise<PollResult> {
       salesPaid: 0, billsPaid: 0, salesReversed: 0, billsReversed: 0,
       salesReversalsWithheld: 0, billReversalsWithheld: 0,
       withheldRechecked: 0, withheldResolved: 0,
+      // A skipped poll asked Xero nothing and moved no cursor, so it spent nothing and is
+      // responsible for no lag. Reported as zeros rather than omitted: an absent number would have
+      // to be guessed at by every reader.
+      xeroRequests: 0, drainRequests: 0, recheckRequests: 0, cursorLagMs: 0,
       errors: [], skipped: 'backlog reconcile held the payment-write lock',
     }
   }
@@ -1448,6 +1483,7 @@ async function pollXeroPaymentsLocked(): Promise<PollResult> {
     salesPaid: 0, billsPaid: 0, salesReversed: 0, billsReversed: 0,
     salesReversalsWithheld: 0, billReversalsWithheld: 0,
     withheldRechecked: 0, withheldResolved: 0,
+    xeroRequests: 0, drainRequests: 0, recheckRequests: 0, cursorLagMs: 0,
     errors: [] as string[],
   }
 
@@ -1511,10 +1547,36 @@ async function pollXeroPaymentsLocked(): Promise<PollResult> {
   }
 
   let checkpoint = lastPollDate
+
+  // o3d-pzu0 — WHAT THE LAST POLL LEARNED ABOUT THIS WINDOW.
+  //
+  // Every poll opened with an unbounded whole-window walk, and a poll RESUMING a drain spent up to
+  // MAX_PAGES+1 of them re-establishing what the previous one already knew: this window is
+  // oversized. Against the tenant's shared daily allowance that is pure waste on exactly the polls
+  // that can least afford it.
+  //
+  // Keyed to the cursor it was written against and refused otherwise, so a hint can never describe a
+  // window other than the one about to be read. The drain still PROBES rather than trusting it.
+  const drainHint = parsePersistedDrainHint(
+    (await db.setting.findUnique({ where: { key: 'xero_payment_poll_drain' }, select: { value: true } }))?.value,
+    lastPollDate.toISOString(),
+  )
+
+  // o3d-11rf r3 (Codex r2, MEDIUM) — THIS POLL'S OWN ATTEMPTS, AND NOBODY ELSE'S.
+  //
+  // The drain reconciles its per-poll budget against real transport attempts rather than fetcher
+  // invocations (o3d-8f9 r3), and it used to do that by differencing `xeroHttpAttemptCount()` — a
+  // PROCESS-WIDE counter. Main sync, the daily batch, a manual sync and the outbox all move it while
+  // this poll awaits its socket, and every attempt they made was charged to this poll's ceiling: the
+  // drain stopped early, held its cursor and reported a backlog it had not actually spent its budget
+  // on. The meter is owned here and handed only to the fetcher below, so it counts only what this
+  // drain issued. See createXeroAttemptMeter.
+  const drainMeter = createXeroAttemptMeter()
   const drain = await drainInvoicesModifiedSince(
     since,
     pollStartedAt,
-    (path, opts) => xeroGet<XeroInvoicesResponse>(path, opts),  // budget-reconciled inside the drain
+    // budget-reconciled inside the drain, against this poll's own meter
+    (path, opts) => xeroGet<XeroInvoicesResponse>(path, { ...opts, attemptMeter: drainMeter }),
     async ({ invoices, through }) => {
       const errorsBefore = result.errors.length
       await processDeltaChunk(invoices, result, {
@@ -1544,11 +1606,91 @@ async function pollXeroPaymentsLocked(): Promise<PollResult> {
       return 'continue'
     },
     // Real HTTP attempts, not fetcher invocations: xeroGet retries a 429 internally, so one
-    // invocation can be several tenant API calls (o3d-8f9 r3).
-    xeroHttpAttemptCount,
+    // invocation can be several tenant API calls (o3d-8f9 r3) — and REQUEST-LOCAL ones, so a
+    // concurrent job's traffic is not charged to this poll's ceiling (o3d-11rf r3).
+    () => drainMeter.attempts,
+    drainHint ?? undefined,
   )
 
   if (!drain.ok) result.errors.push(`Xero invoice fetch failed: ${drain.error}`)
+
+  // o3d-pzu0 — MEASURE THE POLL, THEN DECIDE WHETHER THE DRAIN IS CONVERGING.
+  //
+  // `checkpoint` is the cursor this poll leaves behind: `lastPollDate` if nothing advanced it, or
+  // the `through` of the last chunk that did. The gap between it and the moment the poll started is
+  // the backlog still owed — the one number that says whether the drain is keeping up, and the one
+  // nothing has ever recorded.
+  // The drain's own spend, and — until the withheld recheck below has run and added its own — the
+  // whole of what is known about this poll's cost. The activity rows emitted between here and there
+  // (the lag escalation, the cursor-held warning) therefore carry the drain figure, which is what
+  // they are about: `MAX_REQUESTS_PER_POLL` bounds the DRAIN. `xeroRequests` is finalised as the
+  // TOTAL after the recheck (o3d-pzu0 r2), which is what the poll summary and every quota reader see.
+  result.drainRequests = drain.requests
+  result.xeroRequests = drain.requests
+  result.cursorLagMs = Math.max(0, pollStartedAt.getTime() - checkpoint.getTime())
+
+  // Carry the hint forward, keyed to the cursor this poll is LEAVING — which is the cursor the next
+  // poll will read. Cleared when the drain finished, and only written when there is something to
+  // say: a healthy poll that never had a hint must not create a settings row per run.
+  if (drain.hint) {
+    const value = JSON.stringify({ cursor: checkpoint.toISOString(), spanMs: drain.hint.spanMs })
+    await db.setting.upsert({
+      where: { key: 'xero_payment_poll_drain' },
+      create: { key: 'xero_payment_poll_drain', value },
+      update: { value },
+    })
+  } else if (drainHint !== null) {
+    // The drain completed. Blanked rather than deleted so this needs no second Prisma verb on a path
+    // that already has one, and `parsePersistedDrainHint` reads a blank as absent.
+    await db.setting.upsert({
+      where: { key: 'xero_payment_poll_drain' },
+      create: { key: 'xero_payment_poll_drain', value: '' },
+      update: { value: '' },
+    })
+  }
+
+  const previousLag = readCursorLagSetting(
+    (await db.setting.findUnique({ where: { key: 'xero_payment_poll_lag' }, select: { value: true } }))?.value,
+  )
+  const lag = assessCursorLag(previousLag, result.cursorLagMs)
+
+  // Written unless there is genuinely nothing to remember: no history, and a lag inside the normal
+  // steady state. Persisting there would create a row per healthy poll saying only "all is well",
+  // and — because this runs on every poll — would make the cursor-write assertions elsewhere read a
+  // setting write that has nothing to do with the cursor.
+  if (previousLag !== null || lag.next.lagMs >= LAG_ALERT_FLOOR_MS) {
+    const value = JSON.stringify(lag.next)
+    await db.setting.upsert({
+      where: { key: 'xero_payment_poll_lag' },
+      create: { key: 'xero_payment_poll_lag', value },
+      update: { value },
+    })
+  }
+
+  if (lag.escalate) {
+    // A DIFFERENT ACTION AT A DIFFERENT LEVEL from `xero_payment_poll_backlog_draining`, which is
+    // the whole point. That one is emitted by a drain that is working through a bulk edit and will
+    // be finished in three polls, so an operator who has seen it before has learned it means "it is
+    // working" — and a drain that will NEVER finish was emitting the identical line.
+    await logActivity({
+      entityType: 'SYSTEM',
+      action: 'xero_payment_poll_lag_not_converging',
+      tag: 'sync',
+      level: 'ERROR',
+      description:
+        `Xero payment polling is running but NOT catching up: the cursor is ${describeLagDuration(lag.next.lagMs)} ` +
+        `behind and ${lag.next.stalledPolls} consecutive polls have failed to remove ` +
+        `${describeLagDuration(MIN_LAG_PROGRESS_MS)} of that. Payments are still being detected, but ` +
+        `${describeLagDuration(lag.next.lagMs)} late, and the delay is not shrinking on its own. The drain spent ` +
+        `${drain.requests} Xero request(s) of the ${MAX_REQUESTS_PER_POLL} it may use per run — the ` +
+        `withheld-reversal recheck runs after this line and spends more, so read xeroRequests on the ` +
+        `poll summary for the total (o3d-pzu0 r2). Either ` +
+        `invoice changes are arriving faster than one poll can drain, or the drain is failing and ` +
+        `holding the cursor — check for a companion cursor_held error (o3d-pzu0).`,
+      metadata: { ...result, stalledPolls: lag.next.stalledPolls, progressMs: lag.progressMs },
+      resolveUser: false,
+    })
+  }
 
   if (result.errors.length > 0) {
     await logActivity({
@@ -1581,11 +1723,45 @@ async function pollXeroPaymentsLocked(): Promise<PollResult> {
 
   // Reconsider withheld verdicts AFTER the drain, so a recheck failure can never be mistaken for a
   // reason to hold the poll cursor: by here the cursor has already been decided.
+  //
+  // o3d-pzu0 r2 (Codex MEDIUM) — AND ITS TRAFFIC IS PART OF WHAT THE POLL COST. `drain.requests` is
+  // the DRAIN's budget and nothing else; the recheck below calls `xeroGet` once per batch of due
+  // documents and `xeroGet` retries a 429 internally, so a poll with due withheld reversals spent
+  // more than the figure that was being reported as "what this poll spent" — under-reporting exactly
+  // the polls with the most work to do, and understating the tenant's real quota draw in the one
+  // number the quota decision is meant to rest on.
+  //
+  // MEASURED, NOT COUNTED BY HAND, AND REQUEST-LOCAL (o3d-11rf r3, Codex r2 MEDIUM). Every attempt
+  // the recheck's own fetcher makes is counted on the same statement the transport counts its
+  // process-wide total on, so a 429 retried inside one `xeroGet` is still counted as the several
+  // tenant calls it is.
+  //
+  // ROUND 2 MEASURED THIS AS A DELTA OF `xeroHttpAttemptCount()`, AND THAT WAS A DEFECT IN ITS OWN
+  // FIX: it replaced a number that EXCLUDED the recheck's traffic with one that INCLUDED other jobs'.
+  // The counter is process-wide, and the assumption written here — that "no OTHER Xero caller
+  // interleaves with this awaited tree, which is what the payment-write lock already establishes" —
+  // was simply untrue. That lock excludes the payment RECONCILE job and nothing else, so main sync,
+  // the daily batch, a manual sync and the outbox were all free to run during the await and have
+  // their attempts charged to `recheckRequests`, and thence to `xeroRequests` — the one number the
+  // quota decision is supposed to rest on. A meter this function owns cannot be written to by
+  // anything it did not hand itself to.
+  //
+  // READ AFTER THE CATCH rather than in a `finally`, for the reason round 2 gave and which is still
+  // right: a recheck that THREW still spent what it spent, and a poll reporting nothing for it would
+  // under-report the runs that went worst. The meter survives the throw precisely BECAUSE the caller
+  // owns it — a count carried back on a response would be lost along with the response.
+  const recheckMeter = createXeroAttemptMeter()
   try {
-    await recheckWithheldReversals(result, lastPollDate, (path) => xeroGet<XeroInvoicesResponse>(path))
+    await recheckWithheldReversals(
+      result,
+      lastPollDate,
+      (path) => xeroGet<XeroInvoicesResponse>(path, { attemptMeter: recheckMeter }),
+    )
   } catch (e) {
     result.errors.push(`Withheld-reversal recheck error: ${String(e)}`)
   }
+  result.recheckRequests = recheckMeter.attempts
+  result.xeroRequests = result.drainRequests + result.recheckRequests
 
   // `billReversalsWithheld` counts BOTH causes — a ledger amount that does not prove a reversal, and
   // a registration this read cannot speak for (o3d-a3wx round 4) — so this one summand covers both.

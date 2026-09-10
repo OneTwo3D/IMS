@@ -6,6 +6,7 @@ import {
   databaseLedgerFence,
   zeroPaidIsProvenReversal,
   drainInvoicesModifiedSince,
+  parsePersistedDrainHint,
   fetchInvoicesModifiedSince,
   idsWhere,
   ledgerAmountMagnitudeBound,
@@ -1738,5 +1739,175 @@ test('[o3d-1xq8] an UNSTATED currency is the scale rule\'s most permissive setti
     const minorUnit = toDecimal(`1e-${currency == null ? 4 : currencyMinorUnits(currency)}`)
     assert.ok(minorUnit.gte(ledgerAmountEpsilon(currency).mul(2)),
       `the smallest amount ${currency ?? 'an unstated currency'} can state is not swallowed by its own epsilon`)
+  }
+})
+
+// ---------------------------------------------------------------------------
+// o3d-pzu0 — a resumed drain must not re-pay for what the last one already learned
+// ---------------------------------------------------------------------------
+//
+// Every poll opened with an UNBOUNDED whole-window walk, and only chunked once THAT overflowed. On
+// the hot path that is one request and exactly right. On a resumed drain it is up to MAX_PAGES+1
+// requests spent to be told, again, what the previous poll already established: this window is
+// oversized. Against a 950/day tenant budget that is the difference between a backlog that drains
+// and one that exhausts the allowance first.
+//
+// THE FIX IS NOT TO SKIP THE CHECK — a backlog usually clears, and blindly chunking a window that
+// now fits costs MORE than the single unbounded request it replaced (a probe plus a walk per chunk).
+// It is to make the check CHEAP when we have reason to expect an overflow: one sentinel probe, the
+// same one the bisection already uses, which answers "does this fit?" for one request instead of
+// twenty-one. The hint is therefore always VERIFIED and never trusted.
+
+/** Enough rows in one window to overflow MAX_PAGES * PAGE_SIZE and force chunking. */
+function oversizedRows(count: number, spreadMs: number): Row[] {
+  return Array.from({ length: count }, (_, i) => row(`o${i}`, T0 + 1_000 + Math.floor((i / count) * spreadMs)))
+}
+
+test('o3d-pzu0: an incomplete oversized drain hands back a hint for the next poll', async () => {
+  // Denser than MAX_CHUNKS_PER_POLL * MAX_PAGES * PAGE_SIZE, so one poll genuinely cannot finish it
+  // — which is the state the hint exists for.
+  const rows = oversizedRows(MAX_CHUNKS_PER_POLL * MAX_PAGES * PAGE_SIZE * 3, 600_000)
+  const { get } = fakeTenant(rows)
+  const res = await drainInvoicesModifiedSince(new Date(T0), new Date(T0 + 900_000), get, async () => 'continue')
+
+  assert.equal(res.ok, true)
+  assert.ok(res.ok && !res.complete, 'this backlog needs more than one poll')
+  assert.ok(res.hint !== null, 'the poll that discovered the overflow must say so')
+  assert.ok(res.hint && res.hint.spanMs > 0, 'and carry the chunk width that worked')
+})
+
+test('o3d-pzu0: a completed drain hands back NO hint, so the next poll starts clean', async () => {
+  // The hint must be CLEARED, not left behind: a stale one would make every later poll pay a probe
+  // for a window that has fitted whole for a week.
+  const { get } = fakeTenant([row('a', T0 + 1_000)])
+  const res = await drainInvoicesModifiedSince(new Date(T0), new Date(T0 + 900_000), get, async () => 'continue')
+
+  assert.equal(res.ok, true)
+  assert.ok(res.ok && res.complete)
+  assert.equal(res.hint, null)
+})
+
+test('o3d-pzu0: a drain that CHUNKS its way to the end also clears the hint', async () => {
+  // The other completion path, and it was unpinned: the test above finishes on the whole-window
+  // branch, so returning a hint from the chunked one killed no test. An oversized window that still
+  // fits inside MAX_CHUNKS_PER_POLL exercises this one.
+  const rows = oversizedRows(MAX_PAGES * PAGE_SIZE + 500, 600_000)
+  const { get } = fakeTenant(rows)
+  const res = await drainInvoicesModifiedSince(new Date(T0), new Date(T0 + 900_000), get, async () => 'continue')
+
+  assert.equal(res.ok, true)
+  assert.ok(res.ok && res.complete, 'this backlog fits inside one poll of chunks')
+  assert.ok(res.ok && res.chunks > 1, 'and it genuinely CHUNKED rather than taking the whole-window path')
+  assert.equal(res.ok ? res.hint : undefined, null, 'nothing left to resume, so no hint')
+})
+
+test('o3d-pzu0: resuming WITH the hint costs one probe, not a whole re-walk', async () => {
+  const rows = oversizedRows(MAX_PAGES * PAGE_SIZE + 500, 600_000)
+
+  const cold = fakeTenant(rows)
+  const coldRes = await drainInvoicesModifiedSince(new Date(T0), new Date(T0 + 900_000), cold.get, async () => 'stop')
+  const coldRediscovery = cold.paths.length
+
+  const warm = fakeTenant(rows)
+  assert.ok(coldRes.ok && coldRes.hint)
+  const warmRes = await drainInvoicesModifiedSince(
+    new Date(T0), new Date(T0 + 900_000), warm.get, async () => 'stop',
+    undefined,
+    coldRes.ok ? coldRes.hint ?? undefined : undefined,
+  )
+
+  assert.equal(warmRes.ok, true)
+  assert.ok(
+    warm.paths.length < coldRediscovery,
+    `resuming must cost less than rediscovering: warm ${warm.paths.length} vs cold ${coldRediscovery}`,
+  )
+  // The saving IS the walk: the cold run pays MAX_PAGES+1 pages to establish the overflow, the warm
+  // one pays a single sentinel page.
+  assert.ok(
+    coldRediscovery - warm.paths.length >= MAX_PAGES - 1,
+    `expected to save about the ${MAX_PAGES + 1}-page walk, saved ${coldRediscovery - warm.paths.length}`,
+  )
+})
+
+test('o3d-pzu0: the hint is VERIFIED — a window that now fits is still read whole, in one request', async () => {
+  // THE CONTROL, and the reason this is a probe rather than a skip. The backlog cleared between
+  // polls; a drain that trusted the hint would chunk a window that fits, paying more than the
+  // unbounded request it replaced and moving the cursor in smaller steps.
+  const { get, paths } = fakeTenant([row('a', T0 + 1_000)])
+  const chunks: Date[] = []
+  const res = await drainInvoicesModifiedSince(
+    new Date(T0), new Date(T0 + 900_000), get, async (c) => { chunks.push(c.through); return 'continue' },
+    undefined,
+    { spanMs: 60_000 },
+  )
+
+  assert.equal(res.ok, true)
+  assert.ok(res.ok && res.complete, 'a window that fits is complete in one poll')
+  assert.equal(chunks.length, 1, 'and is handed over as ONE chunk')
+  assert.equal(chunks[0].getTime(), T0 + 900_000, 'through the FULL window end, not a floored chunk bound')
+  assert.equal(paths.length, 2, 'one sentinel probe, then the one unbounded request')
+})
+
+/** Drain to completion the way the poller does, optionally carrying the hint between polls. */
+async function drainToCompletion(rows: Row[], carryHint: boolean): Promise<{ seen: string[]; requests: number; polls: number }> {
+  const { get, paths } = fakeTenant(rows)
+  const seen: string[] = []
+  let cursorMs = T0
+  let hint: { spanMs: number } | undefined
+  let polls = 0
+  for (;;) {
+    polls++
+    assert.ok(polls <= 30, 'drain did not finish within 30 polls')
+    const res = await drainInvoicesModifiedSince(
+      new Date(cursorMs), new Date(T0 + 900_000), get,
+      async (c) => { for (const i of c.invoices) seen.push(i.InvoiceID); cursorMs = c.through.getTime(); return 'continue' },
+      undefined,
+      carryHint ? hint : undefined,
+    )
+    assert.equal(res.ok, true, res.ok ? '' : `drain failed: ${res.error}`)
+    if (!res.ok) break
+    hint = res.hint ?? undefined
+    if (res.complete) return { seen, requests: paths.length, polls }
+  }
+  return { seen, requests: paths.length, polls }
+}
+
+test('o3d-pzu0: resuming reads exactly the invoices rediscovering would — the hint is an optimisation, not a shortcut', async () => {
+  // THE SAFETY PROPERTY. A hint that changed WHICH rows were handed over would be silent payment
+  // loss, which is the failure this whole module is built around. Compared over the FULL drain, not
+  // one poll: a single poll of each stops at a different place by design.
+  const rows = oversizedRows(MAX_CHUNKS_PER_POLL * MAX_PAGES * PAGE_SIZE * 2, 600_000)
+
+  const cold = await drainToCompletion(rows, false)
+  const warm = await drainToCompletion(rows, true)
+
+  // COMPARED AS SETS, not as sequences. Consecutive chunk floors overlap by CHUNK_FLOOR_BACKOFF_MS
+  // on purpose, so a row on a boundary is handed over twice and the two runs chunk at different
+  // boundaries. Re-processing is idempotent; MISSING a row is the failure. So the property is
+  // "exactly the same invoices were covered", and the count below pins that neither run simply
+  // dropped the tail.
+  const coldSet = [...new Set(cold.seen)].sort()
+  const warmSet = [...new Set(warm.seen)].sort()
+  assert.deepEqual(warmSet, coldSet, 'the same work, however the overflow was established')
+  assert.equal(coldSet.length, rows.length, 'and both runs covered the whole fixture')
+  assert.ok(
+    warm.requests < cold.requests,
+    `and carrying the hint costs less overall: warm ${warm.requests} vs cold ${cold.requests}`,
+  )
+})
+
+test('o3d-pzu0: a persisted hint is refused unless it was written against THIS cursor', async () => {
+  // The hint describes ONE window. If the cursor moved — another poll checkpointed, an operator
+  // reset it, the setting is left over from a different backlog — the width it carries is about a
+  // window that no longer exists, and spending a probe to act on it is worse than not having it.
+  const cursor = new Date(T0).toISOString()
+  assert.deepEqual(parsePersistedDrainHint(JSON.stringify({ cursor, spanMs: 60_000 }), cursor), { spanMs: 60_000 })
+  assert.equal(
+    parsePersistedDrainHint(JSON.stringify({ cursor, spanMs: 60_000 }), new Date(T0 + 1_000).toISOString()),
+    null,
+    'a hint from a different cursor is not this window',
+  )
+  for (const bad of [null, undefined, '', 'not json', '{}', '[]', '7', JSON.stringify({ cursor }), JSON.stringify({ cursor, spanMs: 'x' }), JSON.stringify({ cursor, spanMs: 0 }), JSON.stringify({ cursor, spanMs: -5 })]) {
+    assert.equal(parsePersistedDrainHint(bad, cursor), null, `${String(bad)} must read as absent`)
   }
 })

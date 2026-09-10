@@ -489,12 +489,15 @@ test('the ONE evaluation site is inside the retry loop, after the budget wait an
   const loopAt = body.indexOf('for (let attempt =')
   const budgetAt = body.indexOf('await waitForBudget(')
   const checkAt = body.indexOf('await accountingEgressRefusal(')
-  const noteAt = body.indexOf('noteRequest(auth.tenantId)')
+  // Without the closing paren (o3d-11rf r3): see the comment on the same match in
+  // tests/accounting/xero-transport-not-sent-proof.test.ts.
+  const noteAt = body.indexOf('noteRequest(auth.tenantId')
   const fetchAt = body.indexOf('await connectorFetch(')
 
   assert.ok(loopAt >= 0 && budgetAt > loopAt, 'the budget wait is inside the retry loop')
   assert.ok(checkAt > budgetAt, 'the check must run AFTER the budget wait — the wait can sleep out the lease')
   assert.ok(checkAt > loopAt, 'and INSIDE the loop, or a retry spends a permission taken before the sleep')
+  assert.ok(noteAt > -1, 'the attempt counter is still there to be placed')
   assert.ok(noteAt > checkAt, 'a refusal must not consume Xero day budget')
   assert.ok(fetchAt > checkAt, 'and nothing may be sent before it')
 })

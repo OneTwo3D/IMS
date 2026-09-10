@@ -137,6 +137,21 @@ function reset() {
   egressThrows = null
 }
 
+/**
+ * WHERE THE TRANSPORT COUNTS AN ATTEMPT — the statement immediately before the socket, and the line
+ * every "provably pre-egress" claim in this file is measured against.
+ *
+ * Matched on the call WITHOUT its closing paren (o3d-11rf r3): the property is where the statement
+ * SITS, not what it is passed, and it now takes a caller-owned attempt meter alongside the tenant.
+ * Asserted found, because an unmatched `indexOf` returns -1 and both callers below feed it to
+ * `slice` — which turns a guard that should fail into one that silently measures the wrong region.
+ */
+function indexOfNoteRequest(source: string): number {
+  const at = source.indexOf('noteRequest(auth.tenantId')
+  assert.ok(at > -1, 'the attempt counter is still called with the request’s own tenant')
+  return at
+}
+
 /** The release decision, taken on a REAL transport outcome, for the attempt that minted the marker. */
 function verdictFor(outcome: { reachedTheWire: boolean; notSent?: string }) {
   return decideCreateDispatchRelease({ basis: 'first-dispatch', outcome })
@@ -195,7 +210,12 @@ test('o3d-gvzu: every rate-budget refusal is tagged, and each returns BEFORE `no
   // pattern-matched: a new untagged pre-egress 429 raises the first number without the second, and a
   // tag applied to one of the POST-egress 429s (which is the widening this must not permit) raises
   // the second without the first.
-  const aboveSocket = perform.slice(0, perform.indexOf('noteRequest(auth.tenantId)'))
+  // o3d-11rf r3: matched WITHOUT the closing paren, so the counter's ARGUMENT LIST is not part of
+  // the property being guarded (it gained a caller-owned attempt meter), and asserted FOUND before
+  // it is used — an unmatched `indexOf` returns -1, and `slice(0, -1)` quietly hands back almost the
+  // whole function, so this guard used to degrade into a different, weaker assertion rather than fail.
+  const noteAt = indexOfNoteRequest(perform)
+  const aboveSocket = perform.slice(0, noteAt)
   assert.equal((aboveSocket.match(/status: 429/g) ?? []).length, 3,
     'exactly three 429-producing sites sit above the socket')
   assert.equal((aboveSocket.match(/markNotSent\('rate-budget-refused'/g) ?? []).length, 3,
@@ -205,7 +225,7 @@ test('o3d-gvzu: every rate-budget refusal is tagged, and each returns BEFORE `no
   // reached from the top of the retry loop or from the pre-send re-read, both of which return before
   // the counter is bumped — the transport counts an ATTEMPT, and a refused attempt is not one.
   const budgetCheck = perform.indexOf('const remainingAtSend = budgetRemainingMs()')
-  const note = perform.indexOf('noteRequest(auth.tenantId)')
+  const note = indexOfNoteRequest(perform)
   const fetchCall = perform.indexOf('await connectorFetch(url, init,')
   assert.ok(budgetCheck > -1 && note > budgetCheck && fetchCall > note,
     'the last budget bound is checked, then the attempt is counted, then the socket is used')
@@ -535,7 +555,7 @@ test('o3d-gvzu: the tag is written at the refusal sites and never inferred downs
   // before `connectorFetch`. The behavioural control for this is the socket-throw test above; this
   // makes a new site below the line fail loudly rather than silently.
   const perform = api.slice(api.indexOf('async function performRequest('))
-  const belowTheLine = perform.slice(perform.indexOf('noteRequest(auth.tenantId)'))
+  const belowTheLine = perform.slice(indexOfNoteRequest(perform))
   assert.equal((belowTheLine.match(/markNotSent\(/g) ?? []).length, 0,
     'no refusal may be tagged at or after the statement that counts an attempt')
 
