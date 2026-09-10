@@ -39,10 +39,13 @@
  *      is the authority: it cannot succeed against a database somebody else made, and its `42P04`
  *      is the ONLY thing that establishes who owns the name. The probe that runs before it is a
  *      courtesy, not a claim: it can only report absence at the instant it ran.
+ *   5. a name THIS PROCESS STILL HOLDS A CLAIM ON — one for which an earlier handle could still
+ *      issue a `DROP DATABASE`. Two live handles on one name are two handles on two different
+ *      DATABASES, and each one's cleanup destroys the other's. See the r12 rule below.
  *
- * (1)-(3) are pure and are asserted by `tests/throwaway-database-guard.test.ts`, which runs on
- * every `npm run test:unit` with no database at all. (4) needs a server and is asserted by the
- * concurrency lane itself.
+ * (1)-(3) and (5) are pure and are asserted by `tests/throwaway-database-guard.test.ts`, which
+ * runs on every `npm run test:unit` with no database at all. (4) needs a server and is asserted
+ * by the concurrency lane itself.
  *
  * AND THE DROP IS UNCONDITIONAL FROM THE CALLER'S SIDE. `drop()` re-runs the whole guard before
  * it issues `DROP DATABASE`, so a corrupted or hand-built handle cannot be used to drop something
@@ -154,6 +157,74 @@
  * That is the whole file. Every site is above; there is no other place where a fact is recorded
  * after the operation it describes, and a fifth round looking for one should start by finding a
  * NEW await rather than re-reading these.
+ *
+ * ===========================================================================================
+ * THE IDENTITY-OF-GENERATION RULE (o3d-alnk r12). THE THIRD DISTINCT FORM IN THIS FAMILY, AFTER
+ * "record the fact BEFORE the operation" (r11) and "never INFER ownership after the fact" (r10):
+ *
+ *   A COMPLETED `CREATE DATABASE` PROVES OWNERSHIP OF THE DATABASE IT CREATED — A GENERATION —
+ *   AND NOT OF THE NAME. A NAME IS A SLOT. Once the database occupying it is gone, the next
+ *   database to occupy it is a DIFFERENT THING that answers to the same string, and a fact
+ *   recorded about the first one says nothing whatever about the second.
+ *
+ * r10 and r11 are both about WHEN a fact may be recorded. This one is about WHAT THE RECORDED
+ * FACT IDENTIFIES, which is why neither of them caught it and why it is worth its own rule.
+ *
+ * THE MECHANISM (Codex r12 HIGH). `dropOutcome` is private to ONE provisioning call, while
+ * `mintName` permits the same name to be provisioned AGAIN. If handle A's database is removed by
+ * a NON-PARTICIPANT — no lock, no cooperation, nothing this module can see — and handle B then
+ * provisions that name successfully, A is still `'not-issued'`: every check it makes passes,
+ * because every check it makes is about a NAME. `A.drop()` deletes B's database, and `B.drop()`
+ * afterwards issues a second DROP against a name that by then may be somebody else's again.
+ *
+ * THE FIX IS A PROCESS-LEVEL CLAIM ON THE NAME, AND IT IS DELIBERATELY NOT AN IDENTITY CHECK.
+ * `outstandingMintedNames` below holds every name for which THIS PROCESS COULD STILL ISSUE A
+ * `DROP DATABASE`. A second provision of a held name is refused BEFORE ANY STATEMENT IS ISSUED,
+ * so the two live handles the finding needs cannot both exist. It costs no round trip, asks the
+ * server nothing, and cannot be satisfied by anything a third party produces — the register is
+ * this process's own record of what it has done.
+ *
+ * WHEN A CLAIM IS RELEASED, AND WHY THAT IS NOT ANOTHER GUESS. A claim is released only on a fact
+ * this process established WITHOUT ASKING THE SERVER, and there are exactly two:
+ *
+ *   - the handle's `DROP DATABASE` has been ISSUED (`dropOutcome` has left `'not-issued'`), from
+ *     which point `dropDatabase` refuses every later call — so the handle can no longer reach any
+ *     database of that name, whatever the server did with the statement;
+ *   - the provision THREW, so no handle was ever returned and any drop it made on the way out is
+ *     already spent by the rule above.
+ *
+ * Neither waits for an answer that may never arrive, so the r11 rule is not being re-broken by
+ * the back door. And the failure direction is safe: a claim that is never released can only
+ * refuse a re-mint of one 64-bit name, which no lane asks for.
+ *
+ * WHAT WAS CONSIDERED AND DELIBERATELY NOT BUILT. A GENERATION IDENTITY — capturing
+ * `pg_database.oid` at CREATE and requiring it to match before the DROP. It is a REAL identity
+ * check rather than the ownership INFERENCE r10 withdrew, so it is not unsound in r10's way. It
+ * was rejected because it costs a round trip and REINTRODUCES A READ WHOSE ANSWER LICENSES A
+ * DESTRUCTIVE STATEMENT, with a window between the two that a non-participant can use — which is
+ * r10's finding wearing r12's clothes. The claim closes the whole of the in-process case with no
+ * statement at all, so the OID would buy only the residue below, at the price of the mechanism
+ * this module spent three rounds removing.
+ *
+ * THE RESIDUE, STATED PLAINLY AND ALONGSIDE THE OTHER TWO. TWO PROCESSES MINTING THE SAME NAME.
+ * `ims_throwaway_<label>_<16 hex>` is `randomBytes(8)` drawn per provision, so between processes
+ * that do not share this register that is a 2^64 coincidence, and a process-level claim cannot
+ * see across a process boundary. It is LEFT, and it joins the two residues already documented
+ * above: the SIGKILL that runs no cleanup at all (orphan 4), and the CREATE whose answer never
+ * arrived (orphan 1). All three are the same admission — THIS MODULE WOULD RATHER LEAK A DATABASE
+ * OR REFUSE THAN DESTROY ONE IT CANNOT PROVE IS ITS OWN.
+ *
+ * THE OTHER PLACE A NAME IS A SLOT, WRITTEN DOWN SO THE NEXT ROUND DOES NOT RE-FIND IT. The
+ * handle's `url` — and the `DATABASE_URL` handed to `prisma migrate deploy` — names the DATABASE
+ * and not the generation, so a connection opened after a non-participant removed and recreated
+ * the name would reach the new one. No URL can say otherwise: a connection resolves a name at
+ * connect time and that is what a connection is. What the claim above buys is that THIS PROCESS
+ * is never the recreator; the rest is the cross-process residue, unchanged.
+ *
+ * AND THE TWO PLACES THAT NAME A DATABASE AND GENUINELY MEAN THE NAME ARE RIGHT AS THEY ARE:
+ * `PROTECTED_DATABASE_NAMES` and the configured-database refusal are POLICY — "never touch
+ * anything called this, whatever is in it today" — which is the one thing a bare name IS the
+ * correct identity for.
  */
 
 import { execFile } from 'node:child_process'
@@ -319,9 +390,10 @@ type ProvisionOptions = {
   label: string
   /**
    * ONLY a test of this module overrides the minter, and it buys nothing: every name it returns
-   * still has to pass `assertThrowawayDatabaseName` and still has to not exist on the server. It
-   * exists so the two refusals that need a server — the configured database, and a name somebody
-   * else already created — are reachable from a proof.
+   * still has to pass `assertThrowawayDatabaseName`, still has to be one THIS PROCESS DOES NOT
+   * ALREADY HOLD (r12), and still has to not exist on the server. It exists so the two refusals
+   * that need a server — the configured database, and a name somebody else already created — are
+   * reachable from a proof.
    */
   mintName?: () => string
   /** Milliseconds allowed for `prisma migrate deploy`. 263 migrations against an empty database. */
@@ -337,6 +409,50 @@ type ProvisionOptions = {
    * that default.
    */
   runMigrations?: (laneDatabaseUrl: string) => Promise<void>
+}
+
+/**
+ * NAMES THIS PROCESS COULD STILL ISSUE A `DROP DATABASE` FOR (o3d-alnk r12).
+ *
+ * NOT a list of databases that exist, and not a claim about the server — this process cannot make
+ * one. It is this process's own record of the handles it has handed out, and it exists because a
+ * completed CREATE proves ownership of a DATABASE and not of a NAME: two live handles on one name
+ * are two handles on two different databases, and each one's `drop()` destroys the other's.
+ *
+ * MODULE-LEVEL ON PURPOSE, because the defect is not visible from inside a single provisioning
+ * call: `dropOutcome` is private to one, so nothing a call can see tells it that another call is
+ * still holding the name it was just handed.
+ */
+const outstandingMintedNames = new Set<string>()
+
+/**
+ * Take the name for this process, or refuse. SYNCHRONOUS AND BEFORE ANY STATEMENT IS ISSUED, so
+ * two provisions of one name cannot both get past it, however they are interleaved.
+ */
+function claimMintedName(name: string): void {
+  if (outstandingMintedNames.has(name)) {
+    throw new ThrowawayDatabaseError(
+      `refused ${name}: THIS PROCESS ALREADY HOLDS that name — an earlier provision's handle can `
+      + 'still issue a DROP DATABASE for it. A completed CREATE proves ownership of the DATABASE '
+      + 'THAT WAS CREATED and not of the name afterwards: if that database were removed by a '
+      + "non-participant, this call's database would take the name, the older handle's drop() "
+      + "would destroy IT, and this lane's own drop() would then issue a second DROP against "
+      + 'whatever held the name by then. A name is held by ONE live handle at a time',
+    )
+  }
+  outstandingMintedNames.add(name)
+}
+
+/**
+ * Give the name back — ONLY once this process can no longer issue a DROP for it.
+ *
+ * The two facts that license this are LOCAL and need no answer from the server: the handle's DROP
+ * has been ISSUED (so `dropDatabase` refuses every later call), or the provision threw and there
+ * is no handle at all. A release that waited on a server answer would be the r11 defect rebuilt
+ * one level out. Idempotent, because the spend path and the failure paths both reach it.
+ */
+function releaseMintedName(name: string): void {
+  outstandingMintedNames.delete(name)
 }
 
 function mintThrowawayName(label: string): string {
@@ -404,6 +520,10 @@ export async function provisionThrowawayDatabase(options: ProvisionOptions): Pro
   const configuredDatabase = decodeURIComponent(configured.pathname.replace(/^\//, ''))
   const name = (options.mintName ?? (() => mintThrowawayName(options.label)))()
   assertThrowawayDatabaseName(name, configuredDatabase)
+  // AFTER the name guard, so a protected or unminted name is still reported as protected or
+  // unminted rather than as contended, and BEFORE the maintenance connection is even built, so a
+  // refused claim issues nothing at all (r12).
+  claimMintedName(name)
 
   const maintenance = maintenanceUrl(configured)
 
@@ -446,6 +566,11 @@ export async function provisionThrowawayDatabase(options: ProvisionOptions): Pro
     // "the DROP may have run" is the most this process can honestly claim, and a second caller
     // reaching this function can only reach it after this assignment.
     dropOutcome = 'answer-unknown'
+    // AND THE NAME GOES BACK (r12). From this line on this handle refuses every further drop(), so
+    // it can no longer reach any database of this name and holding the claim would buy nothing.
+    // Released HERE, off a fact recorded before the await, rather than after an answer that may
+    // never arrive — a release that waited for the server would be the r11 defect one level out.
+    releaseMintedName(name)
     await withMaintenanceClient(maintenance, async (client) => {
       await client.query(`DROP DATABASE IF EXISTS ${quoteIdentifier(name)} WITH (FORCE)`)
       // The server answered. Recorded HERE rather than after `withMaintenanceClient` returns, so a
@@ -511,6 +636,9 @@ export async function provisionThrowawayDatabase(options: ProvisionOptions): Pro
     if (outcome === 'created') {
       // THE ONLY DROP ON A FAILED PROVISION, AND IT ASKS NOTHING. The server said yes; what failed
       // was afterwards. No probe, no stamp, no lock — there is nothing left to establish.
+      // `dropDatabase` releases the r12 claim as it spends the handle, so this path needs no
+      // release of its own — and must not have one, or a name could be given back while a handle
+      // that has not yet spent itself still holds it.
       let dropFailure: unknown = null
       try {
         await dropDatabase()
@@ -528,6 +656,10 @@ export async function provisionThrowawayDatabase(options: ProvisionOptions): Pro
     }
 
     if (outcome === 'answer-unknown') {
+      // NO HANDLE IS RETURNED, so nothing in this process can ever drop this name and the claim
+      // has no one left to protect (r12). The DATABASE may well be there; that is the leak below,
+      // and it is reported rather than registered.
+      releaseMintedName(name)
       // THE LEAK THIS MODULE ACCEPTS, SURFACED RATHER THAN GUESSED AT (r10).
       throw new ThrowawayDatabaseError(
         `could not create ${name}: ${String(error)}. The CREATE had already been ISSUED and NO ANSWER `
@@ -541,6 +673,8 @@ export async function provisionThrowawayDatabase(options: ProvisionOptions): Pro
     // `not-created` covers both refusals — the probe's and the `42P04` one — and every failure
     // before the CREATE was issued. Re-thrown UNCHANGED so those refusals keep the wording their
     // proofs match on, and, more to the point, WITHOUT ISSUING A DROP.
+    // Nothing was created and no handle is returned, so the claim is given back (r12).
+    releaseMintedName(name)
     throw error
   }
 
