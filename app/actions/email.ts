@@ -16,7 +16,10 @@ export async function sendSalesOrderEmail(orderId: string): Promise<{ success: b
     if (!session?.user?.id) return { success: false, error: 'Unauthorized' }
 
     const queued = await getSalesOrderConfirmationQueueData(orderId)
-    await queueEmail({
+    // o3d-alnk: a second click while the first row is still undelivered is refused by the
+    // partial unique index and comes back as `already_queued` — not an error. The email the
+    // operator asked for is already on its way; saying "queued" twice would be a lie.
+    const outcome = await queueEmail({
       kind: 'SALES_ORDER_CONFIRMATION',
       to: queued.to,
       subject: queued.subject,
@@ -30,7 +33,9 @@ export async function sendSalesOrderEmail(orderId: string): Promise<{ success: b
       action: 'email_queued',
       tag: 'sales',
       level: 'INFO',
-      description: `Queued order confirmation ${queued.reference}`,
+      description: outcome.queued
+        ? `Queued order confirmation ${queued.reference}`
+        : `Order confirmation ${queued.reference} was already queued and undelivered — not duplicated`,
       userId: session.user.id,
     })
     return { success: true }
@@ -46,7 +51,7 @@ export async function sendInvoiceEmail(orderId: string): Promise<{ success: bool
     if (!session?.user?.id) return { success: false, error: 'Unauthorized' }
 
     const queued = await getInvoiceQueueData(orderId)
-    await queueEmail({
+    const outcome = await queueEmail({
       kind: 'INVOICE',
       to: queued.to,
       subject: queued.subject,
@@ -60,7 +65,9 @@ export async function sendInvoiceEmail(orderId: string): Promise<{ success: bool
       action: 'invoice_email_queued',
       tag: 'sales',
       level: 'INFO',
-      description: `Queued invoice ${queued.reference}`,
+      description: outcome.queued
+        ? `Queued invoice ${queued.reference}`
+        : `Invoice ${queued.reference} was already queued and undelivered — not duplicated`,
       userId: session.user.id,
     })
     return { success: true }

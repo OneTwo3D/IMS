@@ -109,6 +109,21 @@ Emails are sent server-side using nodemailer via your configured SMTP settings (
 
 Both functions attach the generated PDF document to the email automatically.
 
+### The Email Queue
+
+Emails are not sent from the button click. They are written to an outbox and delivered by a
+background job, so a slow or unreachable SMTP server never blocks the screen you are on.
+
+- **One undelivered copy per document.** If you press the email button again while the first
+  copy is still waiting to go out, the system does **not** queue a second one — the activity log
+  records "already queued and undelivered — not duplicated". Once the email has actually been
+  sent (or has permanently failed), pressing the button again queues a fresh copy, so a
+  deliberate re-send after correcting an address still works.
+- **Retries.** A temporary SMTP failure is retried with a growing delay, up to five attempts,
+  after which the email is marked failed with the last error.
+- **Suppression.** A recipient the SMTP provider rejects as invalid is added to the suppression
+  list, and later emails to that address fail immediately instead of being retried.
+
 ### Dispatch Email (direct orders)
 
 Direct (non-storefront) sales orders can optionally email the customer a branded dispatch notification when the order ships. Storefront orders are always excluded — the storefront (e.g. WooCommerce) sends its own dispatch email once IMS pushes tracking back, so customers are never emailed twice.
