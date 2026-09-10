@@ -112,6 +112,22 @@ export function stripOtiBlocks(crontabText: string): string {
   return lines.filter((_, idx) => !drop[idx]).join('\n')
 }
 
+/**
+ * THE MANAGED REGION ITSELF — the exact complement of `stripOtiBlocks` (o3d-jjdm).
+ *
+ * Used to CONFIRM a write actually landed: `crontab -` exiting 0 says the command was issued, not
+ * that the schedule exists, and those are different facts on a hardened unit where the binary's
+ * setgid transition is suppressed (see deploy/systemd/ims-stage.service). The confirmation has to
+ * ask the same question the splice answered, so it shares `computeOtiDrops` rather than parsing the
+ * markers a second time: a second parser would be free to disagree with the writer about what the
+ * managed region is, and then the check would be confirming its own opinion.
+ */
+export function extractOtiBlock(crontabText: string): string[] {
+  const lines = crontabText.split('\n')
+  const { drop } = computeOtiDrops(lines)
+  return lines.filter((_, idx) => drop[idx])
+}
+
 // Strict cron expression validation: 5 fields, only digits / * / , / - / /
 const CRON_RE = /^(\*|(\*\/)?[0-9]+([,-][0-9]+)*)( (\*|(\*\/)?[0-9]+([,-][0-9]+)*)){4}$/
 

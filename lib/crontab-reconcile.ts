@@ -11,6 +11,7 @@ import { getCronSecret } from '@/lib/cron-secret'
 import {
   buildOtiCrontabBlock,
   emulateRuntimeSecretExtraction,
+  extractOtiBlock,
   isCronSafePath,
   isNoCrontabDiagnostic,
   spliceOtiBlock,
@@ -189,7 +190,63 @@ async function applyCrontabFromSettings(
   }
   const newCrontab = spliceOtiBlock(read.text, block.lines)
 
-  return writeCrontab(newCrontab, lock.fd)
+  const written = await writeCrontab(newCrontab, lock.fd)
+  if (!written.success) return written
+
+  // STILL UNDER THE LOCK, deliberately: a confirmation taken after the exclusion is released is
+  // reading a crontab any other writer is free to have replaced, so it could fail over somebody
+  // else's correct write, or pass over one that overwrote ours.
+  return confirmOtiBlockInstalled(block.lines)
+}
+
+/**
+ * READ THE CRONTAB BACK AND SAY WHETHER THE SCHEDULE IS ACTUALLY THERE (o3d-jjdm).
+ *
+ * `crontab -` exiting 0 establishes that the command was issued and did not complain. It does not
+ * establish that the schedule exists, and those two come apart on exactly the deployment this app
+ * ships a unit for: `/usr/bin/crontab` is setgid `crontab`, `NoNewPrivileges=true` in
+ * deploy/systemd/ims-stage.service makes the kernel ignore that setgid bit, and the spool is
+ * `drwx-wx--T root:crontab` — so the binary runs as the plain service user with no access to the
+ * spool at all. Measured on the deployment host: identical binary, identical user, `crontab -l`
+ * exits 0 under an ordinary exec and 1 with "Permission denied" under `--no-new-privs`. Trusting
+ * the exit status is proof of an adjacent property — that a command ran, not that a schedule exists.
+ *
+ * IT COMPARES THE MANAGED BLOCK, NOT THE WHOLE FILE. The block is the part this app owns and the
+ * part the question is about; a whole-file comparison would additionally be asserting that no
+ * `crontab` implementation anywhere normalises what it stores, and a false alarm over a crontab
+ * that is in fact correct is its own defect (Codex r20 MEDIUM).
+ *
+ * AN UNRESOLVED READ-BACK IS A FAILURE, not a warning, and that is the deliberate half. The write
+ * is not finished until it is confirmed, so "the confirmation did not resolve" and "the crontab is
+ * wrong" get the same answer: the scheduler is not known to be up to date, and the operator is told
+ * so. It is the same rule `readOwnCrontabResult` applies on the way in — an unreadable crontab is
+ * not an empty one — and the recovery it points at (Save & Apply again) is idempotent, so the cost
+ * of being wrong in this direction is one repeated save. Routing it through `followUpError` instead
+ * would render the sentence "the stored value is correct; the audit-log entry or the page cache may
+ * be missing", which is not what happened and names no recovery at all.
+ */
+async function confirmOtiBlockInstalled(expected: string[]): Promise<{ success: boolean; error?: string }> {
+  const readBack = await readOwnCrontabResult()
+  if (!readBack.resolved) {
+    return {
+      success: false,
+      error: '`crontab -` reported success, but the crontab could not be read back to confirm the '
+        + `schedule is there: ${readBack.reason}. The write may well have landed — this process `
+        + 'cannot say that it did, so it does not.',
+    }
+  }
+  const installed = extractOtiBlock(readBack.text)
+  if (installed.join('\n') !== expected.join('\n')) {
+    return {
+      success: false,
+      error: '`crontab -` reported success but the crontab does not contain the schedule that was '
+        + 'just written, so the scheduler is NOT up to date. A crontab command that exits 0 without '
+        + 'installing anything is what a sandboxed unit produces when it cannot reach the cron '
+        + 'spool — check SupplementaryGroups=crontab and ReadWritePaths=/var/spool/cron/crontabs on '
+        + 'the service unit.',
+    }
+  }
+  return { success: true }
 }
 
 /**
