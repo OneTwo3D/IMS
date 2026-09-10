@@ -267,8 +267,14 @@ export const REVALUATION_ACCEPTED_TRADEOFF_MOVEMENT_TYPES: StockMovementType[] =
  *
  * So for a partly-landed transfer the delta DOES reach the landed units by ordinary
  * propagation, and reaches nothing for the rest. The gap is real but it is a
- * LINE-LEVEL quantity (qty less qtyReceived), not a property of the status, and
- * nothing here should be read as saying otherwise. An earlier revision exported a
+ * LINE-LEVEL quantity — `qty` less the line's LANDED quantity, which is NOT
+ * `qtyReceived` (6oyu.19, Codex round-6 HIGH-1): a WMS stock-sync alignment lands
+ * units and credits `wms_asn_line_maps.qtyAccountedViaSnapshot` without ever
+ * touching the transfer line, so `qty − qtyReceived` overstates the residue for
+ * exactly the route this note was added to describe. The one definition is
+ * `resolveTransferLineLandedQty` in lib/domain/inventory/transfer-landed-quantity.
+ * It is not a property of the status, and nothing here should be read as saying
+ * otherwise. An earlier revision exported a
  * status-level `TRANSFER_STATUSES_WITH_NO_COMPLETION_PATH` asserting the opposite;
  * it was removed rather than corrected, because the question it answered cannot be
  * answered at this grain.
@@ -328,7 +334,7 @@ export const STOCK_TRANSFER_SOURCE_LAYER_CONSUMPTION: Record<StockTransferStatus
   },
   IN_TRANSIT: {
     consumption: 'OUTSTANDING_DESTINATION_LAYER_NOT_ASSURED',
-    note: 'Dispatched: consumeFifoLayersStrict reduced the source layer and froze the snapshot on the line. Whether a destination layer holds these units is NOT decided by this status and MUST NOT be inferred from it — a partial manual receipt, a WMS webhook book-in short of the full line, and a WMS stock-sync alignment all create linked destination layers and leave the transfer IN_TRANSIT, while a transfer that has landed nothing has none. The exclusion from COGS is right either way (the units moved warehouse, they were not sold). For whatever portion HAS landed the delta reaches it by ordinary propagation; for the portion still in transit a landed-cost revaluation has nowhere to send its delta and queues no journal, leaving it in the transit clearing account indefinitely. That residue is a line-level quantity (qty less qtyReceived), not a property of this status — open, o3d-nrl4.',
+    note: 'Dispatched: consumeFifoLayersStrict reduced the source layer and froze the snapshot on the line. Whether a destination layer holds these units is NOT decided by this status and MUST NOT be inferred from it — a partial manual receipt, a WMS webhook book-in short of the full line, and a WMS stock-sync alignment all create linked destination layers and leave the transfer IN_TRANSIT, while a transfer that has landed nothing has none. The exclusion from COGS is right either way (the units moved warehouse, they were not sold). For whatever portion HAS landed the delta reaches it by ordinary propagation; for the portion still in transit a landed-cost revaluation has nowhere to send its delta and queues no journal, leaving it in the transit clearing account indefinitely. That residue is a line-level quantity — qty less the LANDED quantity of the line per lib/domain/inventory/transfer-landed-quantity, which counts BOTH stock_transfer_lines.qtyReceived and any unabsorbed wms_asn_line_maps.qtyAccountedViaSnapshot credit (6oyu.19 Codex r6) — not a property of this status. Open, o3d-nrl4.',
   },
   RECEIVED: {
     consumption: 'OUTSTANDING_PROPAGATABLE',
@@ -375,8 +381,12 @@ const CONSUMPTION_IS_OUTSTANDING: Record<TransferSourceLayerConsumption, boolean
  *
  * They were removed rather than corrected because the question cannot be answered at
  * this grain at all. What is left uncovered is the portion of a line that has not
- * landed (qty less qtyReceived), which is where o3d-nrl4 has to measure it. Do not
- * reintroduce a status keyed version.
+ * landed — qty less the line's LANDED quantity, which
+ * lib/domain/inventory/transfer-landed-quantity defines once and which is NOT
+ * `qtyReceived`: the stock-sync alignment named two paragraphs up credits
+ * `wms_asn_line_maps.qtyAccountedViaSnapshot` and leaves the transfer line alone
+ * (6oyu.19 Codex r6). That is where o3d-nrl4 has to measure it. Do not reintroduce a
+ * status keyed version, and do not measure it with one column.
  */
 
 function transferStatusesWhere(

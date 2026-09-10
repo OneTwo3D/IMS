@@ -333,7 +333,9 @@ async function loadLayerConsumptionExclusions(
  * they moved warehouse, they were not sold — and for a RECEIVED or CANCELLED
  * transfer propagateLandedCostToOutputs then carries the delta to the layer holding
  * them. What is uncovered is the portion of a dispatched line that has NOT yet
- * landed anywhere (qty less qtyReceived): no layer holds it, so propagation finds
+ * landed anywhere — qty less the line's LANDED quantity, per
+ * lib/domain/inventory/transfer-landed-quantity, which counts a WMS stock-sync
+ * alignment credit that `qtyReceived` alone does not (6oyu.19 Codex r6): no layer holds it, so propagation finds
  * nothing, inventoryDelta is zero because the source layer's remainingQty is zero,
  * and this recalc queues NO journal for it. The freight debit stays in the transit
  * clearing account with inventory understated, and the 6oyu.4 transit-vs-GL sweep

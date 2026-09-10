@@ -19,6 +19,10 @@ import {
 import { applyStockAdjustment } from '@/lib/domain/inventory/stock-adjustment-apply'
 import { sliceTransferSnapshotForReceipt } from '@/lib/domain/wms/asn-reconciliation'
 import {
+  loadTransferLineLandedQty,
+  requireLandedQty,
+} from '@/lib/domain/inventory/transfer-landed-quantity'
+import {
   buildStockMovementValueFields,
   buildStockMovementValueFieldsFromTotal,
 } from '@/lib/domain/inventory/stock-movement-value'
@@ -533,6 +537,8 @@ type AlignmentCandidateLine = {
   expectedQty: number
   qtyAccountedViaSnapshot: number
   lastProcessedReceivedQty: number
+  /** How much of the SOURCE transfer line has already landed; null for a PO line. */
+  sourceLineLandedQty: number | null
   asn: {
     externalAsnId: string
     createdAt: Date
@@ -578,6 +584,20 @@ async function getAlignmentCandidateLines(
     ],
   })
 
+  // 6oyu.19 (Codex r6): a transfer line that has already landed — by a manual
+  // receipt, a webhook book-in or an earlier alignment — has no capacity left,
+  // whatever this ASN row's own counters say. One query for the whole candidate set.
+  const transferLineIds = lines
+    .filter((line) => line.sourceType === 'STOCK_TRANSFER_LINE')
+    .map((line) => line.sourceLineId)
+  const transferLines = transferLineIds.length === 0
+    ? []
+    : await tx.stockTransferLine.findMany({
+      where: { id: { in: transferLineIds } },
+      select: { id: true, qtyReceived: true },
+    })
+  const landedByTransferLineId = await loadTransferLineLandedQty(tx, transferLines)
+
   return lines.map((line) => ({
     id: line.id,
     sourceType: line.sourceType as 'PURCHASE_ORDER_LINE' | 'STOCK_TRANSFER_LINE',
@@ -587,6 +607,9 @@ async function getAlignmentCandidateLines(
     expectedQty: Number(line.expectedQty),
     qtyAccountedViaSnapshot: Number(line.qtyAccountedViaSnapshot),
     lastProcessedReceivedQty: Number(line.lastProcessedReceivedQty),
+    sourceLineLandedQty: line.sourceType === 'STOCK_TRANSFER_LINE'
+      ? (landedByTransferLineId.get(line.sourceLineId)?.qtyNumber ?? 0)
+      : null,
     asn: line.asn,
   }))
 }
@@ -689,6 +712,7 @@ async function applyMintsoftAlignmentForProduct(params: {
         expectedQty: candidate.expectedQty,
         qtyAccountedViaSnapshot: candidate.qtyAccountedViaSnapshot,
         lastProcessedReceivedQty: candidate.lastProcessedReceivedQty,
+        sourceLineLandedQty: candidate.sourceLineLandedQty,
         sortAt: candidate.asn.createdAt,
         sortId: candidate.id,
       })),
@@ -771,6 +795,7 @@ async function applyMintsoftAlignmentForProduct(params: {
           select: {
             id: true,
             productId: true,
+            qtyReceived: true,
             costLayerSnapshot: true,
           },
         })
@@ -778,9 +803,19 @@ async function applyMintsoftAlignmentForProduct(params: {
           throw new Error(`Transfer line ${candidate.sourceLineId} is missing for alignment.`)
         }
 
+        // 6oyu.19 (Codex round-6 HIGH-1): the offset used to be this ASN line's
+        // `qtyAccountedViaSnapshot` alone, which ignores every unit a MANUAL receipt
+        // or a webhook book-in already landed and layered — slicing from too low an
+        // offset re-lays those layers. It now comes from the one definition of
+        // "already landed", which counts both columns, so this path and the three in
+        // app/actions/transfers.ts cannot disagree about where the snapshot resumes.
+        const alreadyLanded = requireLandedQty(
+          await loadTransferLineLandedQty(tx, [transferLine]),
+          transferLine.id,
+        )
         const snapshotSlice = sliceTransferSnapshotForReceipt({
           snapshot: transferLine.costLayerSnapshot,
-          alreadyReceivedQty: candidate.qtyAccountedViaSnapshot,
+          alreadyLanded,
           qtyReceived: allocation.qty,
         })
 

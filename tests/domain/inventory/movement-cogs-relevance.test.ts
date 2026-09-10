@@ -16,6 +16,12 @@ import {
 } from '../../../lib/domain/inventory/movement-cogs-relevance.ts'
 import * as movementCogsRelevance from '../../../lib/domain/inventory/movement-cogs-relevance.ts'
 import { sliceTransferSnapshotForReceipt } from '../../../lib/domain/wms/asn-reconciliation.ts'
+import { resolveTransferLineLandedQty } from '../../../lib/domain/inventory/transfer-landed-quantity.ts'
+
+/** The slicer's offset is the branded landed quantity (6oyu.19 Codex r6). */
+function landedFromReceipts(qtyReceived: number) {
+  return resolveTransferLineLandedQty({ transferLineId: 'tl-1', qtyReceived, wmsAsnLines: [] })
+}
 import { STOCK_TRANSFER_TRANSITIONS } from '../../../lib/domain/workflows/stock-transfer-state.ts'
 import { REVALUATION_EXCLUSION_QUERY_MOVEMENT_TYPES } from '../../../lib/cost-layers.ts'
 
@@ -224,8 +230,8 @@ test('no status-level export may claim IN_TRANSIT has no destination layer (Code
   // what "still IN_TRANSIT with destination layers already created" means. If this
   // ever stopped being reachable the test below would be guarding nothing.
   const snapshot = [{ costLayerId: 'layer-src', qty: '10.000000', unitCostBase: '5.000000' }]
-  const firstReceipt = sliceTransferSnapshotForReceipt({ snapshot, alreadyReceivedQty: 0, qtyReceived: 4 })
-  const stillInTransit = sliceTransferSnapshotForReceipt({ snapshot, alreadyReceivedQty: 4, qtyReceived: 6 })
+  const firstReceipt = sliceTransferSnapshotForReceipt({ snapshot, alreadyLanded: landedFromReceipts(0), qtyReceived: 4 })
+  const stillInTransit = sliceTransferSnapshotForReceipt({ snapshot, alreadyLanded: landedFromReceipts(4), qtyReceived: 6 })
   assert.equal(
     firstReceipt.reduce((sum, entry) => sum + Number(entry.qty), 0),
     4,

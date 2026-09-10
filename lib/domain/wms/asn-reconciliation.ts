@@ -1,3 +1,4 @@
+import type { TransferLineLandedQty } from '@/lib/domain/inventory/transfer-landed-quantity'
 import {
   parseCostLayerSnapshot,
   reduceSnapshotByCostLayer,
@@ -188,15 +189,31 @@ export function buildBookedInDryRun(input: {
   }
 }
 
+/**
+ * The unconsumed slice of a dispatch snapshot for the next `qtyReceived` units.
+ *
+ * `alreadyLanded` IS THE OFFSET, and it is deliberately not a number (6oyu.19,
+ * Codex round-6 HIGH-1). Four paths call this — manual receipt, dispatch
+ * cancellation, WMS webhook book-in and WMS stock-sync alignment — and each used to
+ * compute the offset itself from whichever column it happened to have to hand:
+ * `stock_transfer_lines.qtyReceived` for the three in app/actions/transfers.ts,
+ * `wms_asn_line_maps.qtyAccountedViaSnapshot` for the alignment, and a max of the
+ * two for the webhook. Any two of those disagreeing re-lays cost layers that are
+ * already down, which is the double-count this branch exists to close.
+ *
+ * `TransferLineLandedQty` can only be produced by
+ * lib/domain/inventory/transfer-landed-quantity.ts, so the offset now has exactly
+ * one definition and a call site cannot supply its own.
+ */
 export function sliceTransferSnapshotForReceipt(input: {
   snapshot: unknown
-  alreadyReceivedQty: number
+  alreadyLanded: TransferLineLandedQty
   qtyReceived: number
 }): CostLayerSnapshotEntry[] {
   const snapshot = parseCostLayerSnapshot(input.snapshot)
   if (snapshot.length === 0) return []
 
-  const alreadyReceivedQty = Math.max(0, input.alreadyReceivedQty)
+  const alreadyReceivedQty = Math.max(0, input.alreadyLanded.qtyNumber)
   const qtyReceived = Math.max(0, input.qtyReceived)
   if (qtyReceived <= 0) return []
 

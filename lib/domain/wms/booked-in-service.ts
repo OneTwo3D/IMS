@@ -22,6 +22,11 @@ import {
 } from '@/lib/domain/inventory/stock-movement-value'
 import { addMoney, multiplyMoney, toDecimal } from '@/lib/domain/math/decimal'
 import { withSavepoint } from '@/lib/db/savepoint'
+import {
+  isTransferLineFullyLanded,
+  loadTransferLineLandedQty,
+  requireLandedQty,
+} from '@/lib/domain/inventory/transfer-landed-quantity'
 
 // Booked-in reconciliation mutates stock levels, FIFO layers, PO lines, and sync state in one unit.
 // The longer timeout avoids false rollback on large ASNs while preserving a bounded lock window.
@@ -867,6 +872,13 @@ export async function processBookedInEvent(
         }
 
         const lockedLineById = new Map(transfer.lines.map((line) => [line.id, line]))
+        // 6oyu.19 (Codex r6): the snapshot offset used to be a local
+        // `max(qtyReceived, qtyAccountedViaSnapshot)` computed here. Same intent,
+        // but it was one of four different formulas for the same question across the
+        // four paths that rebuild layers from a dispatch snapshot. It now comes from
+        // the one definition, which also gets a line spanning SEVERAL ASNs right —
+        // the local max silently under-counted that.
+        const landedByLineId = await loadTransferLineLandedQty(tx, transfer.lines)
         const reconciledLines = receiptLines.map((receiptLine) => {
           const transferLine = lockedLineById.get(receiptLine.transferLineId)
           if (!transferLine) {
@@ -889,10 +901,7 @@ export async function processBookedInEvent(
             coveredBySnapshotQty: reconciled.coveredBySnapshotQty,
             stockQtyToAdd: reconciled.stockQtyToAdd,
             newlyProcessedQty: reconciled.newlyProcessedQty,
-            alreadyReceivedQty: Math.max(
-              Number(transferLine.qtyReceived),
-              receiptLine.qtyAccountedViaSnapshot,
-            ),
+            alreadyLanded: requireLandedQty(landedByLineId, transferLine.id),
           }
         }).filter((receiptLine) => receiptLine.qtyReceived > 0 || receiptLine.reconciledManualQty > 0)
 
@@ -904,7 +913,7 @@ export async function processBookedInEvent(
             if (receiptLine.stockQtyToAdd > 0) {
               const snapshotSlice = sliceTransferSnapshotForReceipt({
                 snapshot: transferLine.costLayerSnapshot,
-                alreadyReceivedQty: receiptLine.alreadyReceivedQty,
+                alreadyLanded: receiptLine.alreadyLanded,
                 qtyReceived: receiptLine.stockQtyToAdd,
               })
               const totalValueBase = snapshotSlice.reduce(
@@ -1040,11 +1049,16 @@ export async function processBookedInEvent(
         const updatedLines = await tx.stockTransferLine.findMany({
           where: { transferId },
           select: {
+            id: true,
             qty: true,
             qtyReceived: true,
           },
         })
-        const allReceived = updatedLines.every((line) => Number(line.qtyReceived) >= Number(line.qty))
+        // Completion is a LANDED-quantity question (6oyu.19 Codex r6): a line the
+        // stock-sync alignment brought in has a qtyReceived of zero and is fully
+        // accounted for all the same.
+        const updatedLanded = await loadTransferLineLandedQty(tx, updatedLines)
+        const allReceived = updatedLines.every((line) => isTransferLineFullyLanded(line.qty, requireLandedQty(updatedLanded, line.id)))
         if (allReceived) {
           await tx.stockTransfer.update({
             where: { id: transferId },

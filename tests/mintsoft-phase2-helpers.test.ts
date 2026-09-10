@@ -230,3 +230,76 @@ test('collectMissingInWmsCandidates keeps feed omissions visible without zero-ze
     ],
   )
 })
+
+// ---------------------------------------------------------------------------
+// 6oyu.19 (Codex round-6 HIGH-1): ASN capacity must count what has LANDED
+// ---------------------------------------------------------------------------
+
+test('an ASN line whose transfer line has already been received offers no capacity (Codex r6)', () => {
+  // The two ASN counters are both zero here: a MANUAL receipt moves
+  // stock_transfer_lines.qtyReceived and touches neither of them. Capacity computed
+  // from the ASN row alone therefore reported the full ten units as absorbable, and
+  // an alignment would have booked stock in for units that were already received.
+  assert.deepEqual(
+    stockSyncHelpers.planMintsoftAlignmentAllocations({
+      delta: 10,
+      candidates: [
+        {
+          asnLineMapId: 'line-t',
+          expectedQty: 10,
+          qtyAccountedViaSnapshot: 0,
+          lastProcessedReceivedQty: 0,
+          sourceLineLandedQty: 10,
+          sortAt: '2026-04-22T10:00:00.000Z',
+          sortId: 'line-t',
+        },
+      ],
+    }),
+    { allocations: [], unallocatedQty: 10 },
+  )
+})
+
+test('a partly-landed transfer line offers only its genuine remainder (Codex r6 — not vacuous)', () => {
+  // Proves the field narrows capacity rather than zeroing it: the same candidate with
+  // four of ten landed still absorbs six.
+  assert.deepEqual(
+    stockSyncHelpers.planMintsoftAlignmentAllocations({
+      delta: 10,
+      candidates: [
+        {
+          asnLineMapId: 'line-t',
+          expectedQty: 10,
+          qtyAccountedViaSnapshot: 0,
+          lastProcessedReceivedQty: 0,
+          sourceLineLandedQty: 4,
+          sortAt: '2026-04-22T10:00:00.000Z',
+          sortId: 'line-t',
+        },
+      ],
+    }),
+    { allocations: [{ asnLineMapId: 'line-t', qty: 6 }], unallocatedQty: 4 },
+  )
+})
+
+test('a PURCHASE_ORDER_LINE candidate is unaffected — landed is null there (Codex r6 scope)', () => {
+  // The landed quantity is a question about a TRANSFER line. A PO candidate passes
+  // null and keeps the original capacity rule, so this change cannot narrow PO
+  // alignment by accident.
+  assert.deepEqual(
+    stockSyncHelpers.planMintsoftAlignmentAllocations({
+      delta: 10,
+      candidates: [
+        {
+          asnLineMapId: 'line-p',
+          expectedQty: 10,
+          qtyAccountedViaSnapshot: 0,
+          lastProcessedReceivedQty: 0,
+          sourceLineLandedQty: null,
+          sortAt: '2026-04-22T10:00:00.000Z',
+          sortId: 'line-p',
+        },
+      ],
+    }),
+    { allocations: [{ asnLineMapId: 'line-p', qty: 10 }], unallocatedQty: 0 },
+  )
+})

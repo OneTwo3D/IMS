@@ -4,8 +4,10 @@ import { join } from 'node:path'
 import test from 'node:test'
 
 import { consumeFifoLayers } from '@/lib/cost-layers'
+import { openSavepointDepth, withSavepoint } from '@/lib/db/savepoint'
 import {
   NegativeCostSnapshotEntryError,
+  TransferCostLayerRecreationContextError,
   recreateTransferCostLayersFromSnapshotSlice,
 } from '@/lib/domain/inventory/transfer-cost-layer-recreation'
 
@@ -55,7 +57,15 @@ type Store = {
  * the caller's rows (2 of 2 committed); the same swallow after this abort statement
  * rejects the transaction with 25P02 and commits 0.
  */
-function createStore(sourceLayerHasProvenance: boolean): { store: Store; tx: unknown } {
+function createStore(
+  sourceLayerHasProvenance: boolean,
+  context: { inTransaction?: boolean } = {},
+): { store: Store; tx: unknown } {
+  // The helper's entry precondition asks the CLIENT whether it is inside a
+  // transaction, so the double has to be able to answer both ways — otherwise the
+  // "refuses outside a transaction" test would be asserting something about a mock
+  // that cannot say no (Codex round-6 HIGH-2).
+  const inTransaction = context.inTransaction ?? true
   const store: Store = {
     layers: new Map(),
     sourceLines: [],
@@ -76,6 +86,20 @@ function createStore(sourceLayerHasProvenance: boolean): { store: Store; tx: unk
     if (store.aborted) throw new Error(ABORTED_TRANSACTION)
   }
   const tx = {
+    /**
+     * `SAVEPOINT` is how `isClientInsideTransaction` discriminates: PostgreSQL
+     * raises 25P01 for it on an autocommit connection and accepts it inside a
+     * transaction block. Modelled faithfully so both answers are reachable.
+     */
+    $executeRawUnsafe: async (sql: string) => {
+      store.operations.push(`$executeRawUnsafe:${sql}`)
+      store.rawStatements.push({ sql, params: [] })
+      if (/^SAVEPOINT /.test(sql) && !inTransaction) {
+        throw new Error('ERROR: SAVEPOINT can only be used in transaction blocks\ncode: 25P01')
+      }
+      if (store.aborted) throw new Error(ABORTED_TRANSACTION)
+      return 0
+    },
     // Tagged template, as Prisma's is. Faithful rather than unconditional: it fails
     // (and poisons the transaction) exactly when Postgres would — casting a
     // non-numeric bound parameter to int — so a test can also express the statement
@@ -132,6 +156,22 @@ function createStore(sourceLayerHasProvenance: boolean): { store: Store; tx: unk
     },
   }
   return { store, tx }
+}
+
+/**
+ * The statements the helper issued OTHER than its entry probe. The precondition
+ * added in round 6 issues `SAVEPOINT`/`RELEASE SAVEPOINT` on every call to establish
+ * that it is inside a transaction (see assertHelperCanRefuseEffectively), so the
+ * assertions about the ABORT statement have to name what they mean rather than
+ * counting every raw statement.
+ */
+function abortStatements(store: Store) {
+  return store.rawStatements.filter((statement) => !/SAVEPOINT/i.test(statement.sql))
+}
+
+/** Operations with the entry probe's two statements removed, in order. */
+function operationsAfterEntryProbe(store: Store) {
+  return store.operations.filter((operation) => !/^\$executeRawUnsafe:(SAVEPOINT|RELEASE SAVEPOINT)/i.test(operation))
 }
 
 const TARGET = {
@@ -270,6 +310,117 @@ for (const path of CALL_PATHS) {
   })
 }
 
+// ---------------------------------------------------------------------------
+// The entry precondition (Codex round-6 HIGH-2) — what replaced the static census
+// ---------------------------------------------------------------------------
+
+test('the helper REFUSES a client that is not inside a transaction, before touching anything (Codex r6)', async () => {
+  // THE HARM THE WITHDRAWN CENSUS WAS HIDING. Outside a transaction the caller's
+  // stock increment is already committed and the abort statement has nothing to
+  // abort, so a caught refusal commits stock with no cost layers. The census
+  // "passed" such a call site because it could not find a $transaction boundary —
+  // it accepted the absence of evidence as evidence. This asks the client instead.
+  const { store, tx } = createStore(false, { inTransaction: false })
+
+  await assert.rejects(
+    () => recreateTransferCostLayersFromSnapshotSlice(tx as never, TARGET, [
+      { costLayerId: 'layer-src', qty: '10.000000', unitCostBase: '5.000000' },
+    ]),
+    (error: unknown) => {
+      assert.ok(error instanceof TransferCostLayerRecreationContextError, `got ${String(error)}`)
+      assert.equal(error.reason, 'not_in_transaction')
+      assert.match(error.message, /25P01/)
+      assert.match(error.message, /tl-1/)
+      return true
+    },
+  )
+
+  // A PERFECTLY ORDINARY, POSITIVE-COST slice: the refusal is about the CONTEXT, not
+  // about this input, so it fires whether or not the rare negative case is present.
+  assert.deepEqual(store.created, [], 'no cost layer may be created')
+  assert.deepEqual(store.sourceLines, [], 'and no provenance link either')
+  assert.ok(
+    !store.operations.some((operation) => operation.startsWith('costLayer')),
+    `nothing may be attempted outside a transaction (saw ${store.operations.join(', ')})`,
+  )
+})
+
+test('the entry precondition is not vacuous: the SAME slice succeeds inside a transaction (Codex r6)', async () => {
+  // Proves the refusal above discriminates rather than always firing — the check
+  // could otherwise be "correct" while establishing nothing.
+  const { store, tx } = createStore(false, { inTransaction: true })
+  const result = await recreateTransferCostLayersFromSnapshotSlice(tx as never, TARGET, [
+    { costLayerId: 'layer-src', qty: '10.000000', unitCostBase: '5.000000' },
+  ])
+  assert.equal(result.createdLayers.length, 1)
+  assert.equal(store.created.length, 1)
+  // And it really did probe: a SAVEPOINT was issued and released.
+  const probes = store.rawStatements.filter((statement) => /SAVEPOINT/.test(statement.sql)).map((s) => s.sql)
+  assert.equal(probes.length, 2, `expected a SAVEPOINT + RELEASE probe, saw ${JSON.stringify(probes)}`)
+  assert.match(probes[0]!, /^SAVEPOINT /)
+  assert.match(probes[1]!, /^RELEASE SAVEPOINT /)
+})
+
+test('the helper REFUSES a client with an open savepoint, which would undo its abort (Codex r6)', async () => {
+  // ROLLBACK TO SAVEPOINT clears the aborted-transaction state, so a caller that
+  // wrapped this call in withSavepoint could turn the refusal back into a skip. The
+  // census tried to catch that by scanning for the identifier `withSavepoint`, which
+  // an alias or a wrapper walks straight past. This reads the savepoint module's own
+  // runtime state on the client, so HOW the savepoint was opened does not matter.
+  const { store, tx } = createStore(false, { inTransaction: true })
+
+  // Opened through an ALIAS, exactly the shape the scanner could not see.
+  const openSavepointUnderAnAlias = withSavepoint
+  await assert.rejects(
+    () => openSavepointUnderAnAlias(tx as object, () =>
+      recreateTransferCostLayersFromSnapshotSlice(tx as never, TARGET, [
+        { costLayerId: 'layer-src', qty: '10.000000', unitCostBase: '5.000000' },
+      ])),
+    (error: unknown) => {
+      assert.ok(error instanceof TransferCostLayerRecreationContextError, `got ${String(error)}`)
+      assert.equal(error.reason, 'open_savepoint')
+      return true
+    },
+  )
+  assert.deepEqual(store.created, [], 'no cost layer may be created under a savepoint')
+})
+
+test('the savepoint refusal is not vacuous: depth returns to zero after the wrapper (Codex r6)', async () => {
+  // If the depth counter never decremented, the test above would pass for the wrong
+  // reason and every later call would refuse. Prove it comes back down and the same
+  // call then succeeds on the same client.
+  const { store, tx } = createStore(false, { inTransaction: true })
+  await withSavepoint(tx as object, async () => {
+    assert.equal(openSavepointDepth(tx as object), 1, 'the depth must actually rise inside the wrapper')
+  })
+  assert.equal(openSavepointDepth(tx as object), 0, 'and fall again on the way out')
+
+  const result = await recreateTransferCostLayersFromSnapshotSlice(tx as never, TARGET, [
+    { costLayerId: 'layer-src', qty: '10.000000', unitCostBase: '5.000000' },
+  ])
+  assert.equal(result.createdLayers.length, 1)
+  assert.equal(store.created.length, 1)
+})
+
+test('a client with no raw escape hatch cannot prove the context, so it is refused (Codex r6)', async () => {
+  // The helper's guarantee is that refusing STOPS a commit. A client that cannot be
+  // asked has not established that, and running anyway is how a test double would
+  // quietly opt out of the whole property in production code.
+  const { tx } = createStore(false, { inTransaction: true })
+  const { $executeRawUnsafe: _dropped, ...withoutRaw } = tx as Record<string, unknown>
+
+  await assert.rejects(
+    () => recreateTransferCostLayersFromSnapshotSlice(withoutRaw as never, TARGET, [
+      { costLayerId: 'layer-src', qty: '10.000000', unitCostBase: '5.000000' },
+    ]),
+    (error: unknown) => {
+      assert.ok(error instanceof TransferCostLayerRecreationContextError, `got ${String(error)}`)
+      assert.equal(error.reason, 'no_raw_access')
+      return true
+    },
+  )
+})
+
 test('the refusal aborts the transaction FIRST, so a caller that swallows it commits nothing (o3d-gd2f)', async () => {
   // THE PROPERTY THAT MAKES THE REFUSAL SAFE. Every caller has already incremented
   // stock in this same transaction, so a plain throw is not enough: caught and
@@ -284,10 +435,15 @@ test('the refusal aborts the transaction FIRST, so a caller that swallows it com
   )
 
   // The abort statement was issued, with the sentinel BOUND rather than interpolated.
-  assert.equal(store.rawStatements.length, 1)
-  assert.match(store.rawStatements[0].sql, /CAST\(\?\s*AS\s+int\)/i)
-  assert.deepEqual(store.rawStatements[0].params, ['transfer_cost_layer_recreation_refused'])
-  assert.equal(store.operations[0], '$executeRaw', 'the abort must precede every other operation')
+  const aborts = abortStatements(store)
+  assert.equal(aborts.length, 1)
+  assert.match(aborts[0]!.sql, /CAST\(\?\s*AS\s+int\)/i)
+  assert.deepEqual(aborts[0]!.params, ['transfer_cost_layer_recreation_refused'])
+  assert.equal(
+    operationsAfterEntryProbe(store)[0],
+    '$executeRaw',
+    'the abort must precede every operation except the entry probe',
+  )
   assert.equal(store.aborted, true)
 
   // Now BE the caller that swallows it: the transaction is already unusable, so the
@@ -353,7 +509,7 @@ test('a mixed slice refuses BEFORE laying down its positive entries (o3d-gd2f)',
     NegativeCostSnapshotEntryError,
   )
   assert.deepEqual(store.created, [], 'the positive entry must not be written either')
-  assert.equal(store.operations[0], '$executeRaw')
+  assert.equal(operationsAfterEntryProbe(store)[0], '$executeRaw')
 })
 
 test('a negative cost on a ZERO-quantity entry is not refused (o3d-gd2f scope)', async () => {
@@ -371,7 +527,7 @@ test('a negative cost on a ZERO-quantity entry is not refused (o3d-gd2f scope)',
 
   assert.equal(result.recreatedQty, '10.000000')
   assert.equal(store.created.length, 1)
-  assert.equal(store.rawStatements.length, 0, 'nothing was refused, so nothing was aborted')
+  assert.deepEqual(abortStatements(store), [], 'nothing was refused, so nothing was aborted')
 })
 
 test('a recreated layer is consumable by the REAL FIFO consumer at the basis it carries (6oyu.19)', async () => {
@@ -542,131 +698,35 @@ test('copyCostLayerSourceLinesProportionally has no unguarded caller left (6oyu.
 })
 
 /**
- * Strip comments and string/template bodies, preserving offsets, so a brace/paren walk
- * cannot be fooled by a brace inside a comment or a string.
+ * THE STATIC CENSUS THAT USED TO LIVE HERE IS WITHDRAWN (Codex round-6 HIGH-2).
+ *
+ * It walked braces and parens backwards from each call site looking for a `try` or a
+ * `withSavepoint` before the enclosing `$transaction(`, and asserted there were none
+ * — the "belt" half of stopping a caller from turning the negative-cost refusal into
+ * a silent skip. It could not do that job:
+ *
+ *  - It recognised only the bare identifier `withSavepoint`. A qualified call
+ *    (`savepoints.withSavepoint`), an import alias, or any helper that wrapped it
+ *    passed the census while still clearing the transaction abort on rollback. A
+ *    name-based scanner over an open space is the shape that got a census withdrawn
+ *    from o3d-n3yt and a guard surface withdrawn from o3d-8td2; a cleverer scanner
+ *    would fail the same way, so this one is removed rather than improved.
+ *  - Worse, it PASSED a call site where it found no `$transaction` boundary at all,
+ *    which is what happens for the call inside `applyTransferLineReceipt`: that
+ *    function is handed its `tx` by `receiveTransfer` / `receiveTransferPartial`, so
+ *    the boundary is in the caller and no lexical walk can reach it. The census
+ *    reported "no offenders" for a call site about which it had established nothing.
+ *
+ * WHAT REPLACED IT is a runtime entry precondition inside the helper itself —
+ * `assertHelperCanRefuseEffectively` — which asks the CLIENT it was handed, not the
+ * source text: Postgres answers whether there is a transaction (25P01 on a probe
+ * SAVEPOINT), and the savepoint module answers whether it has one open on that
+ * client. Aliases, wrappers and interprocedural boundaries are all irrelevant to
+ * both questions, and a `try` around the call is covered because the abort survives
+ * the catch. Those checks are exercised against a real PostgreSQL in
+ * tests/concurrency/transfer-cost-layer-recreation-context.concurrent.test.ts and
+ * against doubles below.
  */
-function stripCommentsAndStrings(src: string): string {
-  let out = ''
-  let i = 0
-  while (i < src.length) {
-    const c = src[i]
-    const n = src[i + 1]
-    if (c === '/' && n === '/') { while (i < src.length && src[i] !== '\n') { out += ' '; i++ } continue }
-    if (c === '/' && n === '*') {
-      out += '  '; i += 2
-      while (i < src.length && !(src[i] === '*' && src[i + 1] === '/')) { out += src[i] === '\n' ? '\n' : ' '; i++ }
-      out += '  '; i += 2; continue
-    }
-    if (c === '\'' || c === '"' || c === '`') {
-      const quote = c
-      out += ' '; i++
-      while (i < src.length && src[i] !== quote) {
-        if (src[i] === '\\') { out += '  '; i += 2; continue }
-        out += src[i] === '\n' ? '\n' : ' '; i++
-      }
-      out += ' '; i++; continue
-    }
-    out += c; i++
-  }
-  return out
-}
-
-/**
- * Every construct lexically enclosing `callIndex`, outermost-last, up to and including
- * the `$transaction(` boundary. Real brace/paren matching, not a proximity regex: the
- * question "is this call inside a try" has an exact structural answer, and a pattern
- * that guessed at it would be the same open-space mistake the settlement guard made.
- */
-function enclosingGuards(source: string, callIndex: number): string[] {
-  const src = stripCommentsAndStrings(source)
-  const guards: string[] = []
-  let braceDepth = 0
-  let parenDepth = 0
-  for (let j = callIndex - 1; j >= 0; j--) {
-    const ch = src[j]
-    if (ch === '}') { braceDepth++; continue }
-    if (ch === ')') { parenDepth++; continue }
-    if (ch === '{') {
-      if (braceDepth > 0) { braceDepth--; continue }
-      if (/\btry$/.test(src.slice(0, j).replace(/\s+$/, ''))) guards.push('try')
-      continue
-    }
-    if (ch === '(') {
-      if (parenDepth > 0) { parenDepth--; continue }
-      const match = /([A-Za-z_$][\w$.]*)\s*$/.exec(src.slice(Math.max(0, j - 80), j))
-      const callee = match ? match[1] : ''
-      if (callee === 'withSavepoint') { guards.push('withSavepoint'); continue }
-      if (/\$transaction$/.test(callee)) { guards.push('$transaction') ; break }
-    }
-  }
-  return guards
-}
-
-test('the enclosing-guard scanner detects what it exists to detect (not vacuous)', () => {
-  // The census below can only be trusted if this walk can actually SEE a try and a
-  // savepoint. Three synthetic call sites, one of each shape plus a clean one — so a
-  // scanner change that silently stopped matching fails here rather than turning the
-  // census into a census of nothing.
-  const call = 'recreateTransferCostLayersFromSnapshotSlice('
-  const inTry = 'await db.$transaction(async (tx) => { try { await ' + call + 'tx, t, s) } catch { } })'
-  const inSavepointExpr = 'await db.$transaction(async (tx) => { await withSavepoint(tx, () => ' + call + 'tx, t, s)) })'
-  const inSavepointBlock = 'await db.$transaction(async (tx) => { await withSavepoint(tx, async () => { await ' + call + 'tx, t, s) }) })'
-  const clean = 'await db.$transaction(async (tx) => { await ' + call + 'tx, t, s) })'
-
-  assert.deepEqual(enclosingGuards(inTry, inTry.indexOf(call)), ['try', '$transaction'])
-  assert.deepEqual(enclosingGuards(inSavepointExpr, inSavepointExpr.indexOf(call)), ['withSavepoint', '$transaction'])
-  assert.deepEqual(enclosingGuards(inSavepointBlock, inSavepointBlock.indexOf(call)), ['withSavepoint', '$transaction'])
-  assert.deepEqual(enclosingGuards(clean, clean.indexOf(call)), ['$transaction'])
-})
-
-test('no call site can swallow the refusal or undo its transaction abort (Codex r5 HIGH)', () => {
-  // THE STATIC HALF of "the refusal cannot be swallowed". The runtime half is the
-  // deliberate abort statement, which stops a caller COMMITTING after a catch. It has
-  // one hole: ROLLBACK TO SAVEPOINT clears the aborted state, so a call wrapped in
-  // withSavepoint could undo the abort and carry on. A `try` is forbidden too — not
-  // because it defeats the abort, but because a catch-and-continue is the shape this
-  // whole finding is about, and it should fail here rather than at 25P02 in production.
-  //
-  // Both are structural questions with exact answers, so this walks braces and parens
-  // rather than matching a pattern near the call.
-  const files = SCAN_ROOTS.flatMap((root) => walkTypeScript(root))
-    .filter((file) => readFileSync(file, 'utf8').includes(CALL))
-    .filter((file) => !file.endsWith('transfer-cost-layer-recreation.ts'))
-    .sort()
-
-  assert.deepEqual(
-    files,
-    [
-      'app/actions/transfers.ts',
-      'lib/connectors/mintsoft/sync/stock-sync.ts',
-      'lib/domain/wms/booked-in-service.ts',
-    ],
-    'the set of caller files changed — a new one must also be checked for a swallowing wrapper',
-  )
-
-  const offenders: string[] = []
-  let callSites = 0
-  for (const file of files) {
-    const source = readFileSync(file, 'utf8')
-    const stripped = stripCommentsAndStrings(source)
-    let index = -1
-    while ((index = stripped.indexOf(CALL, index + 1)) !== -1) {
-      callSites += 1
-      const line = source.slice(0, index).split('\n').length
-      for (const guard of enclosingGuards(source, index)) {
-        if (guard === '$transaction') break
-        offenders.push(
-          `${file}:${line}: the call is inside a \`${guard}\`, which can turn the negative-cost refusal ` +
-          `into a silent skip (a catch continues; a savepoint rollback clears the transaction abort)`,
-        )
-      }
-    }
-  }
-
-  // Precondition: the walk reached every call site. A census over nothing passes.
-  assert.equal(callSites, 4, `precondition: all four call sites must be found (saw ${callSites})`)
-  assert.deepEqual(offenders, [], offenders.join('\n'))
-})
 
 // ---------------------------------------------------------------------------
 // What the call sites are allowed to SAY about the helper (Codex r4 + r5 LOW)

@@ -18,6 +18,18 @@ export type MintsoftAlignmentCandidate = {
   expectedQty: number
   qtyAccountedViaSnapshot: number
   lastProcessedReceivedQty: number
+  /**
+   * For a STOCK_TRANSFER_LINE candidate: how much of the SOURCE transfer line has
+   * already landed, from lib/domain/inventory/transfer-landed-quantity (6oyu.19,
+   * Codex round-6 HIGH-1). Null for a PURCHASE_ORDER_LINE candidate, whose landed
+   * quantity is not this question.
+   *
+   * Capacity used to be `expectedQty − max(snapshot, lastProcessed)`, which is blind
+   * to units a MANUAL receipt landed: `stock_transfer_lines.qtyReceived` moves and
+   * neither ASN column does, so a fully-received transfer line still looked like an
+   * open ASN line with room to absorb a WMS delta.
+   */
+  sourceLineLandedQty?: number | null
   sortAt: Date | string
   sortId: string
 }
@@ -191,7 +203,13 @@ export function planMintsoftAlignmentAllocations(input: {
 
     const alreadyCreditedQty = Math.max(
       0,
-      Math.max(candidate.qtyAccountedViaSnapshot, candidate.lastProcessedReceivedQty),
+      Math.max(
+        candidate.qtyAccountedViaSnapshot,
+        candidate.lastProcessedReceivedQty,
+        // A transfer line's landed quantity counts against this ASN line's capacity
+        // too — see the field's comment (6oyu.19 Codex r6).
+        candidate.sourceLineLandedQty ?? 0,
+      ),
     )
     const availableQty = Math.max(0, candidate.expectedQty - alreadyCreditedQty)
     if (availableQty <= 0) continue

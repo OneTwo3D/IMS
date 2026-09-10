@@ -18,6 +18,15 @@ import {
 import { recreateTransferCostLayersFromSnapshotSlice } from '@/lib/domain/inventory/transfer-cost-layer-recreation'
 import { uniqueViolationTargetsField } from '@/lib/db/prisma-unique-violation'
 import { sliceTransferSnapshotForReceipt } from '@/lib/domain/wms/asn-reconciliation'
+import {
+  absorbWmsSnapshotCreditIntoQtyReceived,
+  hasAnyLandedQty,
+  isTransferLineFullyLanded,
+  loadTransferLineLandedQty,
+  requireLandedQty,
+  transferLineOutstandingQty,
+  type TransferLineLandedQty,
+} from '@/lib/domain/inventory/transfer-landed-quantity'
 import { planTransferPartialReceipt } from '@/lib/domain/inventory/transfer-partial-receipt'
 import { isStockMovementIdempotencyConflict } from '@/lib/domain/inventory/stock-movement-idempotency'
 import { toInventoryConstraintMessage } from '@/lib/domain/inventory/prisma-errors'
@@ -75,6 +84,13 @@ export type TransferRow = {
     productName: string
     qty: number
     qtyReceived: number
+    /**
+     * How much of this line has already LANDED — `qtyReceived` plus any WMS
+     * stock-sync alignment credit that column does not carry. The UI's
+     * cancel-dispatch affordance asks THIS, not `qtyReceived`, so it agrees with the
+     * server-side precondition in `cancelDispatchedTransfer` (6oyu.19 Codex r6).
+     */
+    landedQty: number
   }[]
 }
 
@@ -128,6 +144,18 @@ async function validateTransferAvailability(
   }
 }
 
+/**
+ * Map several transfers at once, loading the landed quantity for every line in ONE
+ * query rather than one per transfer.
+ */
+async function mapRows(rows: Array<Parameters<typeof mapRow>[0]>): Promise<TransferRow[]> {
+  const landed = await loadTransferLineLandedQty(db, rows.flatMap((row) => row.lines).map((line) => ({
+    id: line.id,
+    qtyReceived: line.qtyReceived as never,
+  })))
+  return Promise.all(rows.map((row) => mapRow(row, landed)))
+}
+
 async function mapRow(t: {
   id: string
   reference: string
@@ -141,7 +169,11 @@ async function mapRow(t: {
   fromWarehouse: { code: string; name: string }
   toWarehouse: { code: string; name: string }
   lines: { id: string; productId: string; sku: string; productName: string; qty: unknown; qtyReceived: unknown }[]
-}): Promise<TransferRow> {
+}, landedByLineId?: ReadonlyMap<string, TransferLineLandedQty>): Promise<TransferRow> {
+  const landed = landedByLineId ?? await loadTransferLineLandedQty(db, t.lines.map((line) => ({
+    id: line.id,
+    qtyReceived: line.qtyReceived as never,
+  })))
   return {
     id: t.id,
     reference: t.reference,
@@ -163,6 +195,7 @@ async function mapRow(t: {
       productName: l.productName,
       qty: Number(l.qty),
       qtyReceived: Number(l.qtyReceived),
+      landedQty: requireLandedQty(landed, l.id).qtyNumber,
     })),
   }
 }
@@ -202,7 +235,7 @@ export async function getTransfers(limit = 200): Promise<TransferRow[]> {
     take: limit,
     select: TRANSFER_SELECT,
   })
-  return Promise.all(rows.map(mapRow))
+  return mapRows(rows)
 }
 
 // ---------------------------------------------------------------------------
@@ -647,17 +680,26 @@ async function applyTransferLineReceipt(
     toWarehouseId: string
     productId: string
     snapshot: Prisma.JsonValue | null | undefined
-    alreadyReceivedQty: number
+    /**
+     * How much of this line had ALREADY landed before this receipt — the offset
+     * into the dispatch snapshot. A `TransferLineLandedQty` rather than a number so
+     * that it can only have come from lib/domain/inventory/transfer-landed-quantity
+     * (6oyu.19 Codex r6): this path used to pass `qtyReceived` alone, which reads
+     * zero for a line the WMS stock-sync alignment has already landed and layered,
+     * and re-laid those layers.
+     */
+    alreadyLanded: TransferLineLandedQty
     qtyToReceive: number
     /** When set, makes the receipt movement idempotent (skips if already booked). */
     idempotencyKey?: string
   },
 ): Promise<{ booked: boolean }> {
-  const { transferId, transferLineId, transferReference, toWarehouseId, productId, snapshot, alreadyReceivedQty, qtyToReceive, idempotencyKey } = params
+  const { transferId, transferLineId, transferReference, toWarehouseId, productId, snapshot, alreadyLanded, qtyToReceive, idempotencyKey } = params
+  const alreadyReceivedQty = alreadyLanded.qtyNumber
 
   const snapshotSlice = sliceTransferSnapshotForReceipt({
     snapshot,
-    alreadyReceivedQty,
+    alreadyLanded,
     qtyReceived: qtyToReceive,
   })
   const totalValueBase = snapshotSlice.reduce(
@@ -796,19 +838,23 @@ export async function receiveTransfer(id: string): Promise<TransferResult> {
         `
       }
 
+      // 6oyu.19 (Codex r6): how much of each line has ALREADY landed, from the one
+      // definition. `qtyReceived` alone reads zero for a line the WMS stock-sync
+      // alignment has already brought into stock and laid into cost layers, and
+      // receiving from that offset re-lays every one of those layers.
+      const landedByLineId = await loadTransferLineLandedQty(tx, transfer.lines)
+
       for (const line of transfer.lines) {
-        // A WMS connector callback may already have booked in part of
-        // this line and stamped qtyReceived + cost layers + a TRANSFER_IN
-        // movement for that portion. Receive only the remaining quantity to
-        // avoid double-counting; skip the line entirely if it is already
-        // fully received via WMS.
-        // 4ve5: subtract the Decimal(12,4) qty/qtyReceived columns in the Decimal
-        // engine, not via JS floats, so the remaining qty persisted to the movement,
-        // stock level and value fields carries no last-place IEEE-754 drift.
-        const alreadyReceivedDecimal = toDecimal(line.qtyReceived ?? 0)
-        const alreadyReceived = alreadyReceivedDecimal.toNumber()
-        const remainingDecimal = subtractMoney(line.qty, alreadyReceivedDecimal)
-        const remainingQty = (remainingDecimal.lt(0) ? toDecimal(0) : remainingDecimal).toNumber()
+        // A WMS connector callback or a stock-sync alignment may already have
+        // booked in part of this line — cost layers and a TRANSFER_IN movement for
+        // that portion are already down. Receive only the outstanding quantity to
+        // avoid double-counting; skip the line entirely if it is already fully
+        // landed.
+        // 4ve5: subtract the Decimal(12,4) quantities in the Decimal engine, not via
+        // JS floats, so the remaining qty persisted to the movement, stock level and
+        // value fields carries no last-place IEEE-754 drift.
+        const alreadyLanded = requireLandedQty(landedByLineId, line.id)
+        const remainingQty = transferLineOutstandingQty(line.qty, alreadyLanded).toNumber()
 
         if (remainingQty > 0) {
           await applyTransferLineReceipt(tx, {
@@ -818,7 +864,7 @@ export async function receiveTransfer(id: string): Promise<TransferResult> {
             toWarehouseId: transfer.toWarehouseId,
             productId: line.productId,
             snapshot: snapshotByLineId.get(line.id),
-            alreadyReceivedQty: alreadyReceived,
+            alreadyLanded,
             qtyToReceive: remainingQty,
           })
         }
@@ -829,6 +875,13 @@ export async function receiveTransfer(id: string): Promise<TransferResult> {
           where: { id: line.id },
           data: { qtyReceived: line.qty },
         })
+        // Setting qtyReceived to the WHOLE line quantity swallows any alignment
+        // credit into that column, so the credit must stop counting through the
+        // snapshot arm or the line reads as over-landed for ever. See
+        // absorbWmsSnapshotCreditIntoQtyReceived — this is the manual-path
+        // equivalent of the qtyAccountedViaReceipt increment the WMS webhook has
+        // always made.
+        await absorbWmsSnapshotCreditIntoQtyReceived(tx, line.id, alreadyLanded.fromUnabsorbedWmsSnapshot)
       }
 
       // Conditional status update — only transitions from IN_TRANSIT
@@ -953,8 +1006,12 @@ export async function receiveTransferPartial(id: string, lineDeltas: unknown, su
         if (!lineById.has(item.lineId)) throw new Error(`Transfer line ${item.lineId} is not part of this transfer.`)
       }
 
+      // 6oyu.19 (Codex r6): cap against what has already LANDED, from the one
+      // definition — `qtyReceived` alone offers up quantity a WMS alignment has
+      // already booked in and layered.
+      const landedByLineId = await loadTransferLineLandedQty(tx, transfer.lines)
       const { plan } = planTransferPartialReceipt(
-        transfer.lines.map((l) => ({ id: l.id, qty: Number(l.qty), qtyReceived: Number(l.qtyReceived) })),
+        transfer.lines.map((l) => ({ id: l.id, qty: Number(l.qty), landed: requireLandedQty(landedByLineId, l.id) })),
         requested.map((r) => ({ lineId: r.lineId, qty: r.qty })),
       )
       // Empty plan = the selected lines are already fully received (e.g. an
@@ -978,7 +1035,8 @@ export async function receiveTransferPartial(id: string, lineDeltas: unknown, su
         // Exact-decimal cap against the locked remaining, so qtyReceived reaches
         // its line qty precisely (no JS-float drift on Decimal(12,4) quantities).
         const qtyReceivedDecimal = toDecimal(line.qtyReceived)
-        const remainingDecimal = subtractMoney(line.qty, qtyReceivedDecimal)
+        const alreadyLanded = requireLandedQty(landedByLineId, line.id)
+        const remainingDecimal = transferLineOutstandingQty(line.qty, alreadyLanded)
         let receiveDecimal = toDecimal(planLine.receiveQty)
         if (receiveDecimal.gt(remainingDecimal)) receiveDecimal = remainingDecimal
         // Floor to the transfer line's 4dp precision so the SAME value drives both
@@ -995,7 +1053,7 @@ export async function receiveTransferPartial(id: string, lineDeltas: unknown, su
           toWarehouseId: transfer.toWarehouseId,
           productId: line.productId,
           snapshot: line.costLayerSnapshot,
-          alreadyReceivedQty: qtyReceivedDecimal.toNumber(),
+          alreadyLanded,
           qtyToReceive: receiveDecimal.toNumber(),
           idempotencyKey: `transfer-partial:${token}:${line.id}`,
         })
@@ -1014,9 +1072,13 @@ export async function receiveTransferPartial(id: string, lineDeltas: unknown, su
       // than the float plan, so the RECEIVED flip is precise.
       const updatedLines = await tx.stockTransferLine.findMany({
         where: { transferId: id },
-        select: { qty: true, qtyReceived: true },
+        select: { id: true, qty: true, qtyReceived: true },
       })
-      const allReceived = updatedLines.every((l) => toDecimal(l.qtyReceived).gte(toDecimal(l.qty)))
+      // Completion is a question about LANDED quantity, not about one column: a line
+      // whose units arrived via a WMS stock-sync alignment has a qtyReceived of zero
+      // and is nonetheless fully accounted for (6oyu.19 Codex r6).
+      const updatedLanded = await loadTransferLineLandedQty(tx, updatedLines)
+      const allReceived = updatedLines.every((l) => isTransferLineFullyLanded(l.qty, requireLandedQty(updatedLanded, l.id)))
       if (allReceived) {
         const closed = await tx.stockTransfer.updateMany({
           where: { id, status: 'IN_TRANSIT' },
@@ -1162,12 +1224,22 @@ export async function cancelDispatchedTransfer(id: string): Promise<TransferResu
         select: { id: true, productId: true, qty: true, qtyReceived: true, costLayerSnapshot: true },
       })
 
-      // A partially-received transfer (WMS booked some units at the destination)
-      // cannot be cleanly cancel-dispatched: restoring the un-received remainder
-      // to source while leaving the received units at the destination would split
-      // the transfer across both warehouses under a CANCELLED status. Close such a
-      // transfer out via the receive path instead.
-      if (lines.some((line) => Number(line.qtyReceived ?? 0) > 0)) {
+      // A partly-landed transfer (a WMS webhook book-in, a manual partial receipt or
+      // a WMS stock-sync alignment has already brought some units to rest and laid
+      // their cost layers) cannot be cleanly cancel-dispatched: restoring the
+      // remainder to source while leaving the landed units where they are would
+      // split the transfer across both warehouses under a CANCELLED status. Close
+      // such a transfer out via the receive path instead.
+      //
+      // 6oyu.19 (Codex round-6 HIGH-1): this asked `qtyReceived > 0` alone, which is
+      // ZERO for a line the stock-sync ALIGNMENT landed — that path increments
+      // `wms_asn_line_maps.qtyAccountedViaSnapshot` and never touches the transfer
+      // line. The guard passed, the restore below created a SECOND replacement cost
+      // layer linked to the same source layer, and a later landed-cost revaluation
+      // propagated into both and posted the inventory reclassification twice. It now
+      // asks the one definition of "already landed", which counts both routes.
+      const landedByLineId = await loadTransferLineLandedQty(tx, lines)
+      if (lines.some((line) => hasAnyLandedQty(requireLandedQty(landedByLineId, line.id)))) {
         throw new Error('This transfer has already been partly received — finish receiving it instead of cancelling the dispatch.')
       }
 
@@ -1187,21 +1259,20 @@ export async function cancelDispatchedTransfer(id: string): Promise<TransferResu
       }
 
       for (const line of lines) {
-        // A WMS partial-receive may already have landed some units at the
-        // DESTINATION — those are not stranded. Restore only the portion that
-        // never arrived, using the same snapshot slice the receive path uses.
-        // 4ve5: subtract the Decimal(12,4) qty/qtyReceived columns in the Decimal
-        // engine, not via JS floats, so the restored qty persisted back to the
-        // source movement, stock level and value fields carries no IEEE-754 drift.
-        const alreadyReceivedDecimal = toDecimal(line.qtyReceived ?? 0)
-        const alreadyReceived = alreadyReceivedDecimal.toNumber()
-        const restoreDecimal = subtractMoney(line.qty, alreadyReceivedDecimal)
-        const restoreQty = (restoreDecimal.lt(0) ? toDecimal(0) : restoreDecimal).toNumber()
+        // Anything already landed is not stranded, so restore only the portion that
+        // never arrived — measured with the same landed definition the guard above
+        // uses, and sliced from the same offset, so the two can never disagree about
+        // which units are still in transit.
+        // 4ve5: subtract the Decimal(12,4) quantities in the Decimal engine, not via
+        // JS floats, so the restored qty persisted back to the source movement, stock
+        // level and value fields carries no IEEE-754 drift.
+        const alreadyLanded = requireLandedQty(landedByLineId, line.id)
+        const restoreQty = transferLineOutstandingQty(line.qty, alreadyLanded).toNumber()
         if (restoreQty <= 0) continue
 
         const snapshotSlice = sliceTransferSnapshotForReceipt({
           snapshot: line.costLayerSnapshot,
-          alreadyReceivedQty: alreadyReceived,
+          alreadyLanded,
           qtyReceived: restoreQty,
         })
         // No snapshot (dispatched before snapshot tracking, or source had no FIFO

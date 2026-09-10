@@ -1734,6 +1734,14 @@ function createLandedCostWorld(init: {
   }
 
   const tx = {
+    /**
+     * The transfer cost-layer helper refuses to run unless it can establish, from the
+     * client, that it is inside a transaction (6oyu.19 Codex r6) — a SAVEPOINT that
+     * does not raise 25P01 is the discriminator. This world models a transaction, so
+     * the probe succeeds; a double that omitted this would be refused, which is the
+     * point of the precondition.
+     */
+    $executeRawUnsafe: async (_sql: string) => 0,
     $queryRawUnsafe: async (sql: string, containment: string, statuses: unknown) => {
       const rows = snapshotRows(sql, containment, statuses)
       return rows.map((line) => ({ costLayerSnapshot: line.snapshot }))

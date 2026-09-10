@@ -92,6 +92,7 @@
 
 import type { Prisma } from '@/app/generated/prisma/client'
 import { createCostLayer, copyCostLayerSourceLinesProportionally } from '@/lib/cost-layers'
+import { isClientInsideTransaction, openSavepointDepth } from '@/lib/db/savepoint'
 import type { CostLayerSnapshotEntry } from '@/lib/cost-layer-snapshots'
 import { addMoney, multiplyMoney, roundQuantity, toDecimal } from '@/lib/domain/math/decimal'
 
@@ -198,16 +199,30 @@ const TRANSACTION_ABORT_SENTINEL = 'transfer_cost_layer_recreation_refused'
  * fails with 25P02 and the COMMIT degrades to a ROLLBACK, so a caller that swallows
  * the refusal cannot commit anything at all. Same measurement: 0 rows committed.
  *
+ * ONE THING IT DOES NOT DO, measured 2026-09-10 and easy to assume otherwise:
+ * `db.$transaction` still RESOLVES. Postgres turns the COMMIT into a ROLLBACK and
+ * Prisma does not raise, so a caller that swallowed the refusal is handed its own
+ * return value and believes it succeeded. The DATA is safe — nothing committed — but
+ * the caller is not told, which is a further reason no call site should catch this.
+ * Pinned by tests/concurrency/transfer-cost-layer-recreation-context.concurrent.test.ts.
+ *
  * THE PARAMETER IS BOUND, NOT INTERPOLATED. `$executeRaw` is a tagged template, so
  * the sentinel travels as a query parameter; the error text names it, which is what
  * makes a swallowed refusal legible in the logs rather than an anonymous 25P02.
  *
- * THIS DOES NOT SURVIVE A SAVEPOINT. `ROLLBACK TO SAVEPOINT` clears the aborted
- * state, so a caller that wrapped the call in `withSavepoint` would undo the abort
- * and be free to continue. That is why the census test in
- * tests/domain/inventory/transfer-cost-layer-recreation.test.ts forbids BOTH a `try`
- * and a `withSavepoint` between a call site and its `db.$transaction` boundary —
- * belt (static) and braces (runtime), because neither alone closes the hole.
+ * IT ONLY MEANS ANYTHING INSIDE A TRANSACTION, WHICH IS NOW CHECKED. On an
+ * autocommit connection each statement is its own transaction, so this abort has
+ * nothing to abort: the caller's stock increment committed the moment it ran, and a
+ * caught refusal leaves stock on hand with no cost layers — the exact harm. The
+ * entry precondition `assertHelperCanRefuseEffectively` establishes the transaction
+ * from the CLIENT, by asking Postgres, before anything is created.
+ *
+ * NOR DOES IT SURVIVE A SAVEPOINT. `ROLLBACK TO SAVEPOINT` clears the aborted state,
+ * so a caller that wrapped this call in `withSavepoint` would undo the abort and be
+ * free to continue. The same entry precondition refuses when this module's savepoint
+ * helper has one open on the client. Both halves are now runtime facts read from the
+ * client, replacing a source scanner that recognised only the bare identifier
+ * `withSavepoint` and passed anything else (Codex round-6 HIGH-2).
  */
 async function abortEnclosingTransactionSoTheRefusalCannotBeSwallowed(tx: TxClient): Promise<void> {
   // Checked OUTSIDE the try on purpose. Inside it, a `tx` with no `$executeRaw` would
@@ -234,6 +249,86 @@ async function abortEnclosingTransactionSoTheRefusalCannotBeSwallowed(tx: TxClie
       'could commit its stock increment. Refusing without that guarantee (6oyu.19 / o3d-gd2f).',
     )
   }
+}
+
+/**
+ * Thrown at ENTRY when this helper cannot guarantee that refusing will actually stop
+ * the caller committing (Codex round-6 HIGH-2). See
+ * `assertHelperCanRefuseEffectively`.
+ */
+export class TransferCostLayerRecreationContextError extends Error {
+  override readonly name = 'TransferCostLayerRecreationContextError'
+  readonly reason: 'no_raw_access' | 'not_in_transaction' | 'open_savepoint'
+
+  constructor(reason: 'no_raw_access' | 'not_in_transaction' | 'open_savepoint', message: string) {
+    super(message)
+    this.reason = reason
+  }
+}
+
+/**
+ * THE ENTRY PRECONDITION: this helper may only run where its refusal can actually
+ * refuse (Codex round-6 HIGH-2).
+ *
+ * The negative-cost refusal works by poisoning the enclosing transaction, so that a
+ * caller which catches the throw still cannot commit the stock increment it made
+ * just before calling. That mechanism has exactly two ways to be inert, and both are
+ * properties of the CLIENT rather than of where the call site sits in the source:
+ *
+ *  1. NOT IN A TRANSACTION. On an autocommit connection the caller's stock increment
+ *     is already committed and the abort statement poisons a transaction that
+ *     consists of itself. A caught refusal then commits stock with no cost layers —
+ *     the precise harm. This was previously "checked" by a source scanner looking
+ *     backwards from the call site for a `$transaction(` token; it found none for
+ *     the call inside `applyTransferLineReceipt`, because that function is handed
+ *     its `tx` by a caller, and ACCEPTED it. A scanner cannot answer an
+ *     interprocedural question, so the question is asked of Postgres instead.
+ *  2. UNDER AN OPEN SAVEPOINT. `ROLLBACK TO SAVEPOINT` clears the aborted state, so
+ *     a `withSavepoint` between the call and the transaction would let a caller undo
+ *     the abort and carry on. The scanner matched only the bare identifier
+ *     `withSavepoint` — `savepoints.withSavepoint`, an import alias, or any helper
+ *     that wrapped it passed. `openSavepointDepth` reads the savepoint module's own
+ *     runtime state on this client, so every one of those is seen, including one
+ *     opened several frames up the stack.
+ *
+ * Checked BEFORE anything is created, and unconditionally rather than only on the
+ * refusal path: a call site that cannot be refused effectively is a defect whether
+ * or not this particular snapshot happens to be negative, and finding out only on
+ * the rare negative input would be finding out in production.
+ */
+async function assertHelperCanRefuseEffectively(tx: TxClient, target: TransferLayerRecreationTarget): Promise<void> {
+  const where = `transfer line ${target.transferLineId} (${target.contextLabel})`
+  const depth = openSavepointDepth(tx)
+  if (depth > 0) {
+    throw new TransferCostLayerRecreationContextError(
+      'open_savepoint',
+      `recreateTransferCostLayersFromSnapshotSlice: refusing to run for ${where} because ${depth} savepoint` +
+      `${depth === 1 ? ' is' : 's are'} open on this client. Rolling back to a savepoint CLEARS the ` +
+      `aborted-transaction state this helper uses to stop a caller committing its stock increment after a ` +
+      `negative-cost refusal, so the refusal would be reducible to a skip. Call it directly on the ` +
+      `transaction client (6oyu.19 / o3d-gd2f).`,
+    )
+  }
+
+  const inTransaction = await isClientInsideTransaction(tx)
+  if (inTransaction === true) return
+  if (inTransaction === null) {
+    throw new TransferCostLayerRecreationContextError(
+      'no_raw_access',
+      `recreateTransferCostLayersFromSnapshotSlice: refusing to run for ${where} because the client exposes ` +
+      `no raw escape hatch, so it cannot be shown to be inside a transaction and a negative-cost refusal ` +
+      `could not abort anything. The caller increments stock before calling, so running without that ` +
+      `guarantee risks committing stock with no cost layers behind it (6oyu.19 / o3d-eiuo).`,
+    )
+  }
+  throw new TransferCostLayerRecreationContextError(
+    'not_in_transaction',
+    `recreateTransferCostLayersFromSnapshotSlice: refusing to run for ${where} because the client is NOT ` +
+    `inside a transaction (Postgres 25P01 on a probe SAVEPOINT). Every caller increments stock immediately ` +
+    `before calling, and on an autocommit connection that increment is already committed: a negative-cost ` +
+    `refusal would have nothing to abort and a caller that caught it would leave stock on hand with no ` +
+    `FIFO layer behind it. Call this inside db.$transaction (6oyu.19 / o3d-eiuo).`,
+  )
 }
 
 /**
@@ -276,6 +371,11 @@ async function assertLayerIsReachableByPropagation(
  * `snapshotSlice` must come from sliceTransferSnapshotForReceipt — it is the
  * unconsumed portion of the dispatch snapshot for the quantity now landing.
  *
+ * THROWS `TransferCostLayerRecreationContextError`, before reading or writing
+ * anything, if the client it is handed is not inside a transaction or has one of
+ * this codebase's savepoints open on it — the two ways the refusal below could be
+ * turned back into a skip (Codex round-6 HIGH-2).
+ *
  * THROWS `NegativeCostSnapshotEntryError`, having created nothing and having aborted
  * the enclosing transaction, if any entry that would become a layer carries a
  * negative unit cost. See the module comment for why that is refused rather than
@@ -292,6 +392,11 @@ export async function recreateTransferCostLayersFromSnapshotSlice(
     createdLayers: [],
     recreatedQty: toDecimal(0).toFixed(6),
   }
+
+  // FIRST, before anything is read or written: this helper's refusal is only a
+  // refusal inside a transaction with no savepoint over it. See the function's
+  // comment (Codex round-6 HIGH-2).
+  await assertHelperCanRefuseEffectively(tx, target)
 
   // THE NEGATIVE-COST REFUSAL (Codex round-5 HIGH; o3d-gd2f). A WHOLE-SLICE PRE-PASS,
   // deliberately not a per-entry check inside the loop below: a slice whose third
