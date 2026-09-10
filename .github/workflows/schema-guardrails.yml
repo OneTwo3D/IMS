@@ -19,9 +19,6 @@ on:
       - "scripts/fence-db-connections.mjs"
       - "scripts/run-migration-verifications.mjs"
       - "scripts/check-app-db-object-access.mjs"
-      - "scripts/check-db-test-gates.mjs"
-      - "scripts/db-test-gate-collection-probe.mjs"
-      - "scripts/db-test-gate-allowlist.json"
       - "tests/db/**"
       # The cleanup wrapper tests/db/shopping-webhook-retention-evidence.test.ts runs its probe rows
       # through. A change to it changes what happens to a failing assertion in that suite.
@@ -52,9 +49,6 @@ on:
       - "scripts/fence-db-connections.mjs"
       - "scripts/run-migration-verifications.mjs"
       - "scripts/check-app-db-object-access.mjs"
-      - "scripts/check-db-test-gates.mjs"
-      - "scripts/db-test-gate-collection-probe.mjs"
-      - "scripts/db-test-gate-allowlist.json"
       - "tests/db/**"
       # The cleanup wrapper tests/db/shopping-webhook-retention-evidence.test.ts runs its probe rows
       # through. A change to it changes what happens to a failing assertion in that suite.
@@ -195,8 +189,16 @@ jobs:
   #   * FOUR never open one (`advisory-lock-keys`, `pool-acquisition-bound`, `post-remote-persist`,
   #     `prisma-unique-violation`) and run identically under `test:unit`.
   #
-  # The lesson is not "count the files again". It is that a prose census goes stale silently, so the
-  # census is now a program: `scripts/check-db-test-gates.mjs`, run as a step of this job.
+  # The lesson is not "count the files again": a prose census goes stale silently, and this one is
+  # prose. NOTHING MECHANICAL ENFORCES IT. A programmatic census was built on o3d-n3yt and
+  # WITHDRAWN — it answered a syntactic question (does this source text read a gate?) about an
+  # open space (the ways a program can read an environment variable), and two implementations of
+  # it passed shapes their authors had not thought of while reporting healthy. o3d-n3yt carries
+  # the replacement, which is a RUNTIME property: after the tier runs, require every collected
+  # file to have executed at least one test and reported no skips. Until then, a NEW gated file
+  # in tests/db/ that invents a variable this job does not set will skip itself green, exactly as
+  # RUN_DB_RETENTION_TESTS did — the `REQUIRE_` tripwire below protects the pair that exists, not
+  # the next one. Review is what catches it.
   #
   # WHY A SIBLING JOB AND NOT MORE STEPS ON `fresh-db-drift`. Both were available; the deciding
   # facts are about the DATABASE and about what a red job means.
@@ -266,18 +268,6 @@ jobs:
           node-version: 22
           cache: npm
       - run: npm ci
-      # BEFORE the suites, because it is about whether they will actually run. It RUNS `npm run
-      # test:db` with a collection probe attached, which records every file that runner collects and
-      # the gate values that file's own process was started with, then requires every RUN_DB_* gate
-      # read in tests/db/ to be 1 there with a REQUIRE_ counterpart something reads. Codex r18 found
-      # RUN_DB_RETENTION_TESTS gating a real database test that no script set, so that test reported
-      # `# SKIP` inside a green job; this is what stops the NEXT gate doing the same.
-      #
-      # It needs no database and no Prisma client, which is why it can run before the two steps below:
-      # the probe exits each collected file's process BEFORE the test file is loaded, so nothing in
-      # the suite executes.
-      - name: Census the tests/db gates against the script this job runs
-        run: npm run check:db-test-gates
       - run: npx prisma generate --schema prisma/schema.prisma
       - run: npx prisma migrate deploy --schema prisma/schema.prisma
       # The bridge address, resolved exactly as `fresh-db-drift` resolves it, for the reason written
@@ -298,8 +288,8 @@ jobs:
           echo "url=${DATABASE_URL/@127.0.0.1:5432/@${ip}:5432}" >> "$GITHUB_OUTPUT"
       # `test:db` sets RUN_DB_RETENTION_TESTS=1 *and* REQUIRE_DB_RETENTION_TESTS=1. The second is the
       # tripwire for this job: if an edit ever drops the first, the suite refuses to load instead of
-      # skipping itself into a green run again. The census step above is what keeps the NEXT gate
-      # from arriving without either half.
+      # skipping itself into a green run again. That covers THIS pair only. Nothing stops the NEXT
+      # gate arriving without either half — see the comment above the job, and o3d-n3yt.
       - name: Run the DB-backed regression suites
         env:
           # Scoped to THIS step. The steps above are migrating and generating against the same

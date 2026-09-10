@@ -76,10 +76,11 @@ const skip = process.env.RUN_DB_RETENTION_TESTS !== '1'
  * what it did between the job being restored and this round. An unset pair is an ordinary local run
  * and still skips.
  *
- * `scripts/check-db-test-gates.mjs` is what keeps the pair wired: it RUNS `npm run test:db` with a
- * collection probe attached, and reads the gate values out of the process that runner starts for this
- * very file. If a gate a file here reads is not `1` there, with a `REQUIRE_` counterpart something
- * actually reads, the census fails. The counterpart being read is THIS block.
+ * NOTHING KEEPS A *NEW* PAIR WIRED. This block is the whole of the enforcement, and it is about THIS
+ * file's gate: it fires only once an invocation has already set `REQUIRE_DB_RETENTION_TESTS`. A
+ * programmatic census that read the gates out of the process the runner starts was built alongside
+ * this fix and withdrawn — see o3d-n3yt. So a new gated file in tests/db/ that invents a variable
+ * `npm run test:db` does not set still skips itself inside a green run, and only review catches it.
  */
 if (skip && process.env.REQUIRE_DB_RETENTION_TESTS === '1') {
   throw new Error(

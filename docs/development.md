@@ -67,30 +67,10 @@ npm run test:db            # RUN_DB_RETENTION_TESTS=1      -> tests/db/**
 ```
 
 `RUN_DB_RETENTION_TESTS` was invented by one file in `tests/db/` and set by nothing for as long as it
-existed, so that file skipped inside a green CI job (Codex r18, HIGH). `npm run check:db-test-gates`
-now enumerates the gates that files in `tests/db/` actually read and fails if the process `test:db`
-starts for the file that reads one does not have it set.
-
-**How it establishes that, since r20 (Codex r19, four HIGHs).** The first version answered every
-question from text — it recognised a fixed list of `process.env` shapes and contributed nothing for
-the rest, listed only the direct children of `tests/db/` while the command's glob was `**`, and
-accepted `command.includes('tests/db')` as proof the command ran the directory. Each of those PASSED
-what it could not model, and its one non-vacuity check ("some gate was found") stayed satisfied by the
-single gate that was already known. It now:
-
-* **fails on any `process.env` use it cannot resolve to a name**, naming the file and line — a
-  computed key, the whole object bound to a variable, a `RUN_DB_*` name standing alone as a string
-  literal (which is what a delegated `readGate('RUN_DB_NEW')` looks like);
-* **runs the npm script** with `scripts/db-test-gate-collection-probe.mjs` on `NODE_OPTIONS`, which
-  records each file the runner collects and the gate values that file's own process was started with,
-  and exits that process before the test file is loaded. Nothing in the suite executes. An empty
-  collection is a failure, so a script that merely mentions the directory fails;
-* **requires the set it collects and the recursive set of `*.test.ts` under the directory to be equal**;
-* **checks non-vacuity per file** — every file in the list was read and parsed — rather than counting
-  gates.
-
-`tests/scripts/db-test-gate-census.test.ts` is the census's own suite: it builds a throwaway
-repository for each of those shapes and requires a non-zero exit, with a wired fixture as the control.
+existed, so that file skipped inside a green CI job (Codex r18, HIGH). `npm run test:db` above is the
+invocation that now sets it, and the `db-backed-regressions` job below is what runs that invocation.
+**Nothing mechanical stops the NEXT gate doing the same thing** — see the NOT ENFORCED list below,
+and o3d-n3yt.
 
 **Read the gate honestly.** `npm run test:unit`'s glob (`tests/**/*.test.ts`) **collects** the gated
 files anyway and reports them as skips, so a missing variable removes whole suites from a run that
@@ -107,36 +87,39 @@ WHAT THAT DOES AND DOES NOT BUY YOU. State it precisely, because the looser vers
   against a freshly migrated database, and a failing suite turns the job red — proved by mutation,
   not by reading: set `PRESERVE_LEGACY_WC_ORDER_CURRENCY_EVIDENCE = false` in
   `lib/connectors/shopping-webhook-retention.ts` and `npm run test:db` exits non-zero.
-* **ENFORCED.** Every `RUN_DB_*` gate read by a file in `tests/db/` is set to `1` by `test:db`, with
-  a `REQUIRE_` counterpart that some file in that directory actually reads. That is
-  `npm run check:db-test-gates` (`scripts/check-db-test-gates.mjs`), which runs as a step of the same
-  job before the suites and is also in `npm run check:all`. A new gated file that invents a new
-  variable fails it until the variable is wired up, or written into
-  `scripts/db-test-gate-allowlist.json` with a reason.
+* **ENFORCED, for `RUN_DB_RETENTION_TESTS` ALONE.** `test:db` sets it together with
+  `REQUIRE_DB_RETENTION_TESTS`, and the gated file throws on load if it is handed the `REQUIRE_` half
+  without its own. An edit that drops `RUN_DB_RETENTION_TESTS` from `test:db` therefore fails loudly
+  instead of skipping into a green run. This is a property of that one pair, written in that one
+  file. It says nothing about any other gate.
+* **NOT ENFORCED: that a NEW gate cannot hide.** There is no census. A file added to `tests/db/`
+  that gates itself on a variable `npm run test:db` does not set will report `# SKIP` inside a green
+  job, exactly as `RUN_DB_RETENTION_TESTS` did, and only review will catch it. o3d-n3yt r16-r20 built
+  two implementations of a guard against this and **withdrew both**: each asked a *syntactic*
+  question (does this source text read a gate?) about an *open* space (the ways a program can read an
+  environment variable), so each passed shapes its author had not thought of while reporting a clean
+  run. A guard that reports enforcement it does not have is worse than none. o3d-n3yt carries the
+  replacement, which asks a **runtime** question instead: after the tier runs, require every file the
+  runner collected to have executed at least one test and reported no skips.
 * **NOT ENFORCED: that the job keeps existing.** o3d-11rf r13 through r16 attempted that with a
   standing guard that read the workflow to prove the job really invoked the script; the guard was
   withdrawn, because it kept admitting deterministic states in which the job was green and the suites
-  never ran, and a guard that reports enforcement it does not have is worse than none. An edit that
-  deletes the job, renames the script, or drops `tests/db/**` from the `paths:` filters is caught by
-  review and by nothing else. The census above deliberately does **not** read the workflow.
-* **NOT ENFORCED: `tests/concurrency/**`.** `RUN_DB_CONCURRENCY_TESTS` has no `REQUIRE_` counterpart
-  in any file, and the census covers only the directories in its own `SUITES` table, which today is
-  `tests/db` alone. Dropping that variable from `test:concurrency` would silently skip that whole
-  tier exactly as `RUN_DB_RETENTION_TESTS` did.
-* **NOT ENFORCED: that a gated file's tests are non-vacuous.** The census proves a gate is set; only
-  a mutation proves the tests behind it assert anything.
-* **NOT ENFORCED: a gate whose NAME never appears in the test file.** The census scans the collected
-  test files, so `readGate('RUN_DB_NEW')` fails it — the name is there — but a `runIfGated()` whose
-  gate name lives only in an imported helper does not. Following imports would mean applying the same
-  refusals to `lib/`, where `process.env` is legitimately read in shapes this census does not model.
+  never ran. An edit that deletes the job, renames the script, or drops `tests/db/**` from the
+  `paths:` filters is caught by review and by nothing else.
+* **NOT ENFORCED: `tests/concurrency/**`.** Dropping `RUN_DB_CONCURRENCY_TESTS` from
+  `test:concurrency` would silently skip that whole tier exactly as `RUN_DB_RETENTION_TESTS` did.
+  That tier has no `REQUIRE_` counterpart in any file, so it does not even have the one-pair tripwire
+  `tests/db` has.
+* **NOT ENFORCED: that a gated file's tests are non-vacuous.** Only a mutation proves the tests
+  behind a gate assert anything.
 
 **o3d-n3yt** carries the remaining holes.
 
 `test:db` sets **`REQUIRE_DB_RETENTION_TESTS=1`** alongside `RUN_DB_RETENTION_TESTS=1`. A gated file
 that finds the `REQUIRE_` half set and its own half not throws on load instead of skipping, so a
 future invocation that sets only half a pair fails loudly rather than quietly running nothing. An
-unset pair is an ordinary local run and still skips. The census is what makes a new gate arrive with
-both halves.
+unset pair is an ordinary local run and still skips. **This is per-pair and hand-written**: adding a
+new gate does not give it a tripwire, and nothing requires that it be given one.
 
 `tests/db/shopping-webhook-retention-evidence.test.ts` **seeds the two rows it probes** in a single
 transaction and removes them afterwards through `tests/helpers/with-cleanup.ts`. It used to select them
