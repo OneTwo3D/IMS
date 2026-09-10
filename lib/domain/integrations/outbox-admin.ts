@@ -302,11 +302,30 @@ async function requireRow(client: IntegrationOutboxClient, id: string): Promise<
  * cannot be made safe by choosing a quieter status; it must either verify the remote system directly
  * or require the operator to supply evidence the system cannot obtain for itself.
  *
- * Listing is a read and needs none of that, which is why it is what survived. The operator is not
- * left helpless: `permanentlyFailIntegrationOutboxAdminRow` (POST
- * /api/admin/outbox/[id]/permanent-fail) predates this branch, already accepts a stale PROCESSING
- * row, and carries its own established semantics — including, unchanged, the re-enqueue behaviour
- * above, which is the reason it is not offered as a button next to a row that merely looks stuck.
+ * Listing is a read and needs none of that, which is why it is what survived.
+ *
+ * AND THERE IS NO OTHER EXIT TO POINT AT — INCLUDING THE ONE THIS COMMENT USED TO POINT AT (round 7,
+ * Codex round 6 HIGH). Round 6 ended here with "the operator is not left helpless:
+ * `permanentlyFailIntegrationOutboxAdminRow` predates this branch and carries its own established
+ * semantics", and the exception inbox's copy said the same thing to operators. That is the withdrawn
+ * action with the button taken off. `permanentlyFailIntegrationOutboxAdminRow` writes the
+ * `integration_outbox` row and nothing else, so for Xero the `AccountingSyncLog` that owns the work
+ * is untouched and stays PENDING — or PROCESSING with an already-stale `processingStartedAt`, which
+ * is exactly the shape a park has. `ensureXeroOutboxForPendingSyncLogs` is the FIRST statement of
+ * every sweep, selects precisely those logs, and `scheduleXeroAccountingOutbox` resets the row it
+ * finds to PENDING with `attempts: 0`; `claimIntegrationOutboxWork` then takes it on the same sweep.
+ * Dead-lettering a park is therefore not a way to stop it, it is a slower way to replay it, and the
+ * operator's check of the remote system does not change that because no action here is conditioned
+ * on what they found.
+ *
+ * SO: ON A ROW THIS PREDICATE LISTS, THERE IS NO SAFE AUTOMATED REMEDY AT ALL — not in this module,
+ * not through the admin API, not anywhere in IMS. The two mutations this module exports keep their
+ * own pre-existing semantics for the rows they were built for; neither is a remedy for a park, and
+ * nothing may recommend them as one. What an operator has instead is a read of the remote system and
+ * a correction made THERE, outside the queue, where nothing can re-enqueue it. A remedy that does not
+ * rest on elapsed time is open as o3d-7qdb, and the operator-facing half of this is
+ * `app/(dashboard)/sync/exceptions/stalled-park-guidance.ts`, where the prohibition and the
+ * recommendation are separate fields so that a test can tell which is which.
  */
 export function stalledIntegrationOutboxParkWhere(options?: {
   now?: Date

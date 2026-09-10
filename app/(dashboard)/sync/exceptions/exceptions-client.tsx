@@ -43,6 +43,7 @@ import {
   type RefundParkAllocationTarget,
   type RefundSyncParkRow,
 } from '@/app/actions/sync-exceptions'
+import { stalledOutboxParkGuidanceDetail } from './stalled-park-guidance'
 
 type Props = {
   data: ExceptionInboxData
@@ -346,14 +347,26 @@ export function ExceptionsClient({ data }: Props) {
         ever being asked to check the remote system.
 
         Nothing about how long a lock has been held is evidence about whether its effect landed, so
-        the surface that rests on elapsed time is the surface that may only READ. The exit is the
-        pre-existing admin route, which carries its own semantics and is not one click from here.
+        the surface that rests on elapsed time is the surface that may only READ.
+
+        AND IT MAY NOT POINT AT THE WITHDRAWN ACT EITHER (round 7, Codex round 6 HIGH). Through
+        round 6 this section's own copy ended "...then use the admin outbox API to dead-letter or
+        replay the row deliberately" — the same act as the withdrawn button, minus the button. It
+        is not safer for being manual: `permanentlyFailIntegrationOutboxAdminRow` writes the outbox
+        row alone, Xero's work is owned by an `AccountingSyncLog` it does not touch, and
+        `ensureXeroOutboxForPendingSyncLogs` — the FIRST statement of every Xero sweep — rebuilds
+        and re-queues the row from that untouched log on the very next run. So the guidance is now
+        data rather than prose (./stalled-park-guidance.ts): the routes that can move a row live in
+        a prohibition slot proven exhaustive against `app/api/admin/outbox/[id]/`, the
+        recommendation slot is proven to name none of them, and what is recommended is a read of
+        the remote system and a correction made THERE, outside the queue. There is no safe
+        automated remedy to offer; o3d-7qdb is where one is being designed.
       */}
       {data.stalledOutboxParks.length > 0 ? (
         <Card className="p-4 space-y-3">
           <SectionHeading
             title={`Integration outbox — stalled parks (${data.summary.stalledOutboxParks})`}
-            detail="Rows still marked PROCESSING under a lock older than every drain lease, where handing the row to a second worker would be unsafe. Nothing retries these: no drain reclaims them and no reconcile drains them. For WooCommerce stock pushes every later change to the same product is folded into the parked row and waits behind it. THIS SECTION IS READ-ONLY ON PURPOSE, and the reason is not caution: IMS cannot tell from a stale lock whether the holder died or is merely paused, nor whether its effect already reached the remote system — and no status it could move the row to is inert, because both connectors' normal enqueue paths reset a dead-lettered row to PENDING on the next stock change or sweep. Check the remote system first (WooCommerce stock for that product, or the Xero invoice and its email), then use the admin outbox API to dead-letter or replay the row deliberately."
+            detail={stalledOutboxParkGuidanceDetail()}
             shown={data.stalledOutboxParks.length}
             total={data.summary.stalledOutboxParks}
           />

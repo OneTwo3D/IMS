@@ -1,7 +1,8 @@
 import assert from 'node:assert/strict'
-import { readFileSync } from 'node:fs'
+import { readdirSync, readFileSync } from 'node:fs'
 import path from 'node:path'
 import test from 'node:test'
+import ts from 'typescript'
 
 import { Prisma } from '@/app/generated/prisma/client'
 import { StockSyncReason } from '@/app/generated/prisma/enums'
@@ -32,6 +33,11 @@ import {
   parseIntegrationOutboxPayload,
   WcStockSyncOutboxPayloadSchema,
 } from '@/lib/domain/integrations/outbox-registry'
+import {
+  ADMIN_OUTBOX_ROW_MUTATION_ROUTES,
+  STALLED_OUTBOX_PARK_GUIDANCE,
+  stalledOutboxParkGuidanceDetail,
+} from '@/app/(dashboard)/sync/exceptions/stalled-park-guidance'
 import * as outboxAdminModule from '@/lib/domain/integrations/outbox-admin'
 import {
   ADMIN_OUTBOX_POST_LEASE_MARGIN_MS,
@@ -1394,59 +1400,230 @@ test('the listing refuses a live lease and refuses a row a drain will pick up by
   assert.equal(matchesStalledParkWhere(where, reclaimable), false)
 })
 
-test('nothing in the admin outbox module offers a write in response to a listed park', () => {
-  // PROOF 2 for the round-6 split, taken over the module's ACTUAL export surface rather than over
-  // its text: enumerate what `outbox-admin.ts` exports and assert the set is the expected one.
+/**
+ * The JSX a conditional branch renders, read from the PARSER rather than from the source text
+ * (o3d-8td2 r7, Codex r6 MEDIUM).
+ *
+ * Returns the set of element names, the set of attribute names, the count of spread attributes, and
+ * each attribute's initializer as written. Reading these from the AST rather than by regex is the
+ * whole point: `<form action={...}>`, `<Foo onSubmit={...}>` and `<Bar {...handlers}>` are all
+ * invisible to a token blacklist and all visible here, because the question stops being "does this
+ * text contain a banned string" and becomes "what does this JSX actually render".
+ */
+function readJsxBranch(sourceFile: ts.SourceFile, conditionText: string): {
+  tags: string[]
+  attributes: string[]
+  spreads: number
+  attributeInitializers: Record<string, string>
+} | null {
+  let branch: ts.Node | null = null
+  const findBranch = (node: ts.Node): void => {
+    if (branch) return
+    if (
+      ts.isConditionalExpression(node)
+      && node.condition.getText(sourceFile).replace(/\s+/g, ' ').trim() === conditionText
+    ) {
+      branch = node.whenTrue
+      return
+    }
+    ts.forEachChild(node, findBranch)
+  }
+  findBranch(sourceFile)
+  if (!branch) return null
+
+  const tags = new Set<string>()
+  const attributes = new Set<string>()
+  const attributeInitializers: Record<string, string> = {}
+  let spreads = 0
+
+  const walk = (node: ts.Node): void => {
+    if (ts.isJsxOpeningElement(node) || ts.isJsxSelfClosingElement(node)) {
+      tags.add(node.tagName.getText(sourceFile))
+      for (const property of node.attributes.properties) {
+        if (ts.isJsxSpreadAttribute(property)) {
+          spreads += 1
+          continue
+        }
+        const name = property.name.getText(sourceFile)
+        attributes.add(name)
+        const initializer = property.initializer
+        if (initializer && ts.isJsxExpression(initializer) && initializer.expression) {
+          attributeInitializers[name] = initializer.expression.getText(sourceFile)
+        } else if (initializer && ts.isStringLiteral(initializer)) {
+          attributeInitializers[name] = initializer.text
+        }
+      }
+    }
+    ts.forEachChild(node, walk)
+  }
+  walk(branch)
+
+  return { tags: [...tags].sort(), attributes: [...attributes].sort(), spreads, attributeInitializers }
+}
+
+test('the admin outbox module has exactly the exports it was reviewed with, and no other', () => {
+  // PROOF 2 FOR THE ROUND-6 SPLIT, REWRITTEN IN ROUND 7 (Codex round 6 MEDIUM).
+  //
+  // Round 6 asked this question by NAME: it looped over the exports and demanded that any whose name
+  // matched /park/i be the listing predicate. Codex's objection is exact and is the same one that got
+  // the census withdrawn from o3d-n3yt — a mutator called `resolveStalledOutbox` has no "park" in it
+  // and sails through, and the module's own `permanentlyFailIntegrationOutboxAdminRow` is the standing
+  // proof that a park-free name can still move a parked row. Semantics are not recoverable from a
+  // name, so this no longer tries: the assertion is CLOSED-WORLD SET EQUALITY over the module's
+  // actual runtime export surface. Whatever a new export is called, it is not in this list, so it
+  // fails here and has to be looked at by a human who must then answer the question below.
+  //
+  // THE QUESTION A FAILURE HERE ASKS: does the thing you are adding WRITE to a row that
+  // `stalledIntegrationOutboxParkWhere` would list? If it does, it belongs to o3d-7qdb and not to
+  // this module, because no status such a row can be moved to is inert (see the header of
+  // outbox-admin.ts). If it does not, add it to the list with that reasoning in the commit.
   const exported = Object.keys(outboxAdminModule).sort()
 
-  // NON-VACUITY: the enumeration reached a real module with the members it is supposed to have. If
-  // this ever reads an empty or stubbed namespace the absence assertion below would be trivially
-  // true, which is precisely the failure mode of a proof by absence.
-  for (const expected of [
+  const REVIEWED_EXPORTS = [
+    'ADMIN_OUTBOX_MAX_LIMIT',
+    'ADMIN_OUTBOX_POST_LEASE_MARGIN_MS',
+    'ADMIN_OUTBOX_STALE_PROCESSING_LOCK_MS',
+    'IntegrationOutboxAdminError',
+    'isSensitiveIntegrationOutboxPayloadKey',
     'listIntegrationOutboxAdminRows',
-    'stalledIntegrationOutboxParkWhere',
-    'replayIntegrationOutboxAdminRow',
+    // The two pre-existing row mutations. They are NOT park-scoped and they stay: they predate this
+    // branch, carry their own semantics, and the exception inbox no longer points an operator at
+    // either of them (see the guidance test below).
     'permanentlyFailIntegrationOutboxAdminRow',
-  ]) {
-    assert.ok(exported.includes(expected), `${expected} is missing, so this enumeration is not reading the real module`)
-  }
+    'replayIntegrationOutboxAdminRow',
+    'redactIntegrationOutboxPayload',
+    'stalledIntegrationOutboxParkWhere',
+    'toAdminIntegrationOutboxRow',
+  ].sort()
 
-  // THE ABSENCE. Every export naming the park is a read; there is no park-scoped mutator, and the
-  // withdrawn one is named here so a re-introduction under the same name fails rather than passes.
-  for (const name of exported) {
-    if (!/park/i.test(name)) continue
-    assert.ok(
-      name === 'stalledIntegrationOutboxParkWhere',
-      `${name} is a park-scoped export that is not the listing predicate. A write taken on a listed `
-      + 'park is what o3d-7qdb withdrew: PERMANENT_FAILED is not inert, so no status this could move '
-      + 'a row to is safe on elapsed time alone.',
-    )
-  }
-  assert.ok(!exported.includes('deadLetterStalledIntegrationOutboxPark'))
-  assert.ok(!exported.includes('stalledOutboxParkDeadLetterReason'))
+  // NON-VACUITY: a namespace that failed to load, or loaded as a stub, would make an "is absent"
+  // assertion trivially true. Equality cannot be satisfied that way — an empty namespace fails —
+  // but the explicit floor states the intent for a future reader.
+  assert.ok(exported.length >= 10, 'the enumeration is not reading the real module')
+
+  assert.deepEqual(
+    exported,
+    REVIEWED_EXPORTS,
+    'the admin outbox export surface changed. This test is a closed world on purpose: it does not '
+    + 'ask what the new export is CALLED, because a name cannot carry the property that matters. If '
+    + 'the addition can write to a row stalledIntegrationOutboxParkWhere would list, it is the '
+    + 'withdrawn recovery (o3d-7qdb) arriving under a new name and it does not belong here.',
+  )
 })
 
-test('the stalled-park section of the exception inbox renders no control', () => {
-  // The other half of proof 2, and it is a scan of one bounded region of one file — which is what
-  // "does this JSX render a button" actually is. Unlike the lease guard this replaces, the space is
-  // closed: there is exactly one such section, the test asserts it FOUND it, and it asserts the scan
-  // can see a control by finding plenty of them elsewhere in the same file.
+test('the withdrawn park recovery is prohibited by the guidance, and nothing is recommended in its place', () => {
+  // PROOF 1 FOR ROUND 7 (Codex round 6 HIGH). Round 6 removed the button and then told the operator,
+  // in the section's own copy, to go and do the same thing through the admin API. The defect was in
+  // the TEXT, so the first instinct is to test the text — and that test cannot be written soundly:
+  // honest copy has to NAME the dangerous routes in order to warn about them, so banning the
+  // substring is satisfied by deleting the warning, and "banned unless a negation is nearby" passes
+  // on a stale sentence sitting next to the one that corrects it.
+  //
+  // So the guidance is data, and the question is asked of its GRAMMAR: one slot for what must not be
+  // used, one for what to do, and the check is which slot a route appears in.
+  const guidance = STALLED_OUTBOX_PARK_GUIDANCE
+
+  // (a) THE PROHIBITION IS EXHAUSTIVE OVER WHAT ACTUALLY EXISTS. Not over a remembered list: the
+  // routes are enumerated from disk, so a third mutating admin route added tomorrow fails here until
+  // it is either named as prohibited or shown not to be a row mutation.
   const repoRoot = path.resolve(__dirname, '..', '..', '..')
-  const source = readFileSync(path.join(repoRoot, 'app/(dashboard)/sync/exceptions/exceptions-client.tsx'), 'utf8')
+  const routeParent = path.join(repoRoot, 'app/api/admin/outbox/[id]')
+  const routeDirs = readdirSync(routeParent, { withFileTypes: true })
+    .filter((entry) => entry.isDirectory())
+    .map((entry) => entry.name)
+    .sort()
+  assert.ok(routeDirs.length >= 2, 'the route enumeration found nothing, so this proof is scanning an empty directory')
+  for (const dir of routeDirs) {
+    const route = readFileSync(path.join(routeParent, dir, 'route.ts'), 'utf8')
+    assert.ok(/export\s+(?:async\s+)?(?:function|const|let|var)\s+POST\b/.test(route), `${dir} was counted as a POST route but does not export one`)
+  }
+  assert.deepEqual(
+    [...ADMIN_OUTBOX_ROW_MUTATION_ROUTES].sort(),
+    routeDirs.map((dir) => `POST /api/admin/outbox/[id]/${dir}`).sort(),
+    'the prohibition list and the admin API disagree about which routes can move an outbox row',
+  )
+  assert.deepEqual(
+    [...guidance.neverUseOnAListedPark].sort(),
+    [...ADMIN_OUTBOX_ROW_MUTATION_ROUTES].sort(),
+    'every route that can move a row must be named in the prohibition slot',
+  )
 
-  const start = source.indexOf('{data.stalledOutboxParks.length > 0 ? (')
-  assert.ok(start > 0, 'the stalled-park section was not found, so this test is scanning nothing')
-  const end = source.indexOf('{data.deadReceiptEvents.length > 0 ? (', start)
-  assert.ok(end > start, 'the section boundary was not found, so the slice below is not the section')
-  const section = source.slice(start, end)
+  // (b) THE RECOMMENDATION SLOT NAMES NONE OF THEM. This is the mutation that matters: move
+  // 'POST /api/admin/outbox/[id]/permanent-fail' from neverUseOnAListedPark into doInstead — which is
+  // exactly what round 6's prose did — and this fails.
+  for (const step of guidance.doInstead) {
+    const lowered = step.toLowerCase()
+    for (const token of ['/api/admin/outbox', 'permanent-fail', 'permanently fail', 'dead-letter', 'replay']) {
+      assert.ok(
+        !lowered.includes(token),
+        `the guidance recommends "${step}", which names ${token}. Every action this API offers on a `
+        + 'listed park can duplicate the remote effect: dead-lettering does not stop the row, because '
+        + 'the next Xero sweep rebuilds it from the untouched sync log and WooCommerce re-queues it on '
+        + 'the next stock change. There is no safe automated remedy to recommend (o3d-7qdb).',
+      )
+    }
+  }
+  assert.ok(guidance.doInstead.length >= 2, 'the operator is told nothing at all, which is not the intent')
+  assert.equal(guidance.trackedBy, 'o3d-7qdb')
 
-  assert.ok(source.includes('<Button'), 'the scan must be able to see a control at all')
-  assert.ok((source.match(/onClick=/g) ?? []).length >= 3, 'and there are controls in this file to see')
+  // (c) THE STRUCTURE IS WHAT THE OPERATOR ACTUALLY READS. Without this the fields could be perfect
+  // and the rendered paragraph could say anything.
+  const detail = stalledOutboxParkGuidanceDetail()
+  for (const route of guidance.neverUseOnAListedPark) {
+    assert.ok(detail.includes(route), `the rendered guidance omits the prohibition on ${route}`)
+  }
+  for (const step of guidance.doInstead) {
+    assert.ok(detail.includes(step), 'the rendered guidance omits a step from the recommendation slot')
+  }
+  assert.ok(detail.includes(guidance.trackedBy), 'the rendered guidance does not say where the missing remedy is tracked')
+})
 
-  assert.ok(!section.includes('<Button'), 'the stalled-park section must offer no button')
-  assert.ok(!section.includes('onClick='), 'and no click handler')
-  assert.ok(!section.includes('runAction('), 'and must not reach a mutating server action')
-  assert.ok(section.includes('READ-ONLY ON PURPOSE'), 'the section must say why, where an operator reads it')
+test('the stalled-park section renders only inert elements, and renders the guidance it was proven against', () => {
+  // THE OTHER HALF OF ROUND 6'S MEDIUM. That version banned three tokens — `<Button`, `onClick=` and
+  // `runAction(` — from a slice of source text, which is an OPEN world: Codex's `<form action={...}>`
+  // contains none of them, and neither does <AnythingElse onSubmit={...}>. A blacklist over a surface
+  // that can grow new members is not a proof.
+  //
+  // So this parses the file and closes the world twice over. Every JSX element the section renders
+  // must be one of a fixed set of presentational components, and every JSX attribute it passes must
+  // be one of a fixed set of inert props. A <form action={...}> fails BOTH: `form` is not an allowed
+  // element and `action` is not an allowed attribute. A spread is refused outright, since {...props}
+  // can carry a handler past any attribute list.
+  const repoRoot = path.resolve(__dirname, '..', '..', '..')
+  const filePath = path.join(repoRoot, 'app/(dashboard)/sync/exceptions/exceptions-client.tsx')
+  const sourceFile = ts.createSourceFile(filePath, readFileSync(filePath, 'utf8'), ts.ScriptTarget.Latest, true, ts.ScriptKind.TSX)
+
+  const park = readJsxBranch(sourceFile, 'data.stalledOutboxParks.length > 0')
+  assert.ok(park, 'the stalled-park branch was not found, so this test is scanning nothing')
+
+  // CALIBRATION — the collector can see a control when one is there. The sibling section three
+  // hundred lines up has a real Replay button, and the SAME code finds it. Without this the
+  // assertions below would pass just as happily on a walker that returned empty sets.
+  const failures = readJsxBranch(sourceFile, 'data.outboxFailures.length > 0')
+  assert.ok(failures, 'the calibration branch was not found')
+  assert.ok(failures.tags.includes('Button'), 'the walker cannot see a Button, so its silence proves nothing')
+  assert.ok(failures.attributes.includes('onClick'), 'the walker cannot see an onClick, so its silence proves nothing')
+
+  assert.deepEqual(park.tags, [
+    'Card', 'SectionHeading', 'Table', 'TableBody', 'TableCell', 'TableHead', 'TableHeader', 'TableRow',
+  ], 'the stalled-park section renders an element it was not reviewed with. It is a read and only a '
+    + 'read: no element that can invoke anything may appear here (o3d-7qdb).')
+
+  assert.deepEqual(park.attributes, [
+    'className', 'containerClassName', 'detail', 'key', 'shown', 'title', 'total',
+  ], 'the stalled-park section passes a prop it was not reviewed with. Anything that can carry a '
+    + 'callback — onClick, onSubmit, action, formAction — is a write on a row nothing may write to.')
+
+  assert.equal(park.spreads, 0, 'a JSX spread in this section could carry a handler past the attribute list')
+
+  // AND THE SECTION RENDERS THE GUIDANCE THAT WAS PROVEN, not a literal that could say anything. The
+  // test above establishes what the structured guidance says; this is what connects it to the page.
+  assert.equal(
+    park.attributeInitializers.detail,
+    'stalledOutboxParkGuidanceDetail()',
+    'the stalled-park heading must render the structured guidance, whose prohibition and '
+    + 'recommendation slots are asserted separately, rather than prose no test can reason about',
+  )
 })
 
 test('a stale PROCESSING lock is reclaimed per operation, not on elapsed time alone', async () => {
