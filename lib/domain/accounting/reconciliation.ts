@@ -8,7 +8,202 @@ import {
   isDocumentRevisionAccountingSyncType,
   isMirrorableAccountingSyncType,
 } from './accounting-event-mirror'
+// Read from the LEAF module rather than from accounting-event-mirror's re-export, for the reason
+// that module's own header gives: a great many suites replace accounting-event-mirror wholesale with
+// a partial `mock.module`, which turns everything it exports and the mock does not name into
+// `undefined`. A `text[]` parameter that silently became `undefined` would widen this query to every
+// sync type rather than fail.
+import { MIRRORED_ACCOUNTING_SYNC_TYPES } from './mirrored-sync-types'
 import { isOperatorAssertedSettlement } from './sync-row-settlement'
+
+/**
+ * o3d-11rf r3 — the sync-row statuses that CONTRADICT a VOID mirror, i.e. work still owed.
+ *
+ * Deliberately NOT `MIRROR_OWNING_SYNC_STATUSES`, which is the neighbouring set and is one member
+ * wider. That set answers "may this row still lay claim to the mirror?", for which SYNCED belongs:
+ * a SYNCED row owns its mirror. This one answers a different question — "is there posting work here
+ * that a VOID mirror is preventing?" — and a SYNCED row has already done its posting, so it is not
+ * work owed and reviving the mirror is not its remedy. Stated rather than derived by subtraction,
+ * because a set defined as another set minus a member reads as a variation on it, and these two are
+ * answers to different questions that happen to overlap.
+ */
+const MIRROR_CONTRADICTING_SYNC_STATUSES = ['PENDING', 'PROCESSING'] as const
+
+/**
+ * o3d-11rf r10 (Codex r10, HIGH) — EVERY CHARACTER `String.prototype.trim` STRIPS, AND ONLY THOSE.
+ *
+ * WHAT WENT WRONG. The contradiction join below decides, in SQL, the question `stringValue` decides
+ * in TypeScript: is this payload token BLANK? `stringValue` asks JavaScript `.trim()`. The statement
+ * asked `btrim(text)`, which strips ORDINARY SPACES AND NOTHING ELSE. So `_idempotencyKey: "\t"` —
+ * likewise a newline, a CR, an NBSP — read as PRESENT in SQL and ABSENT in TypeScript. The two
+ * derivations then took different branches: TypeScript fell through to the row key (and the legacy
+ * date key beside it), while SQL selected the payload branch, disabled both fallback arms, and then
+ * normalised the token itself to NULL — leaving the row with NO mirror key at all. A live row whose
+ * own mirror is an unexplained VOID vanished from reconciliation entirely. The battery that was
+ * supposed to prove the two derivations agree used ordinary spaces, which `btrim` happens to handle.
+ *
+ * THE SET IS ECMAScript's, ENUMERATED: WhiteSpace ∪ LineTerminator — tab, LF, VT, FF, CR, space,
+ * NBSP, BOM, the Unicode space separators, and the two line separators. Spelled out rather than
+ * described because NO SQL character class is this set — and worse, `[[:space:]]` (and `\s`, which is
+ * the same class) is not a FIXED set at all: it follows the database ctype. Measured on this estate's
+ * C-ctype SQL_ASCII databases it misses NBSP, the BOM, and every Unicode space separator, all of
+ * which JavaScript trims; under a glibc UTF-8 ctype it additionally picks up U+0085 NEL, which
+ * JavaScript does NOT trim. Wrong in both directions, and which way depends on the database it runs
+ * on. `tests/domain/accounting/reconciliation.test.ts` derives the
+ * set from the running engine and asserts the statement sends exactly this one, so a JavaScript that
+ * one day trims one more character cannot leave this list behind quietly.
+ */
+const ECMASCRIPT_TRIM_CHARACTERS = [
+  // WhiteSpace: the five format-control characters and the Unicode space separators (category Zs).
+  '\u0009', '\u000b', '\u000c', '\ufeff',
+  '\u0020', '\u00a0', '\u1680',
+  '\u2000', '\u2001', '\u2002', '\u2003', '\u2004', '\u2005', '\u2006',
+  '\u2007', '\u2008', '\u2009', '\u200a', '\u202f', '\u205f', '\u3000',
+  // LineTerminator: LF, CR, and the two Unicode separators. `trim` strips these too.
+  '\u000a', '\u000d', '\u2028', '\u2029',
+] as const
+
+/**
+ * "Every character of this value is one JavaScript would trim" — the blank test, as a POSIX regular
+ * expression, and it is an ALTERNATION OF WHOLE CHARACTERS rather than a bracket class or a `btrim`
+ * character set FOR A REASON.
+ *
+ * Every database in this estate is SQL_ASCII, where PostgreSQL's character operations are BYTE
+ * operations. A character set built from the list above contains the bytes `C2` (from NBSP) and `85`
+ * (from U+2005), so `btrim(v, set)` strips U+0085 NEL — which JavaScript does NOT trim — and eats
+ * U+201A `‚` (bytes `E2 80 9A`) down to nothing, calling a perfectly ordinary punctuation mark blank.
+ * An alternation of whole UTF-8 sequences cannot do that: UTF-8 is prefix-free and self-synchronising,
+ * so a byte string matches `^(a|b|…)*$` exactly when it decodes to a sequence of those characters.
+ * The same pattern is exact under a UTF8 database too, where each alternative is one character — and
+ * that is the property that lets ONE statement be right on both. Both claims are proved against a
+ * real database in `tests/db/reconciliation-void-mirror-contradictions.test.ts`, over the whole set
+ * and over the near-miss characters that separate these spellings.
+ *
+ * ALL-WHITESPACE rather than trims-to-empty on purpose: they are the same question — a string trims
+ * to empty exactly when every character in it is trimmable — and this spelling needs no trim.
+ */
+export const ECMASCRIPT_BLANK_PATTERN = `^(?:${ECMASCRIPT_TRIM_CHARACTERS.join('|')})*$`
+
+/**
+ * o3d-11rf r12 (Codex r12, HIGH) — WHICH `lower()`? THE ONE THE *DATABASE'S LOCALE* PICKS.
+ *
+ * r11 closed the difference between JavaScript's fold and PostgreSQL's by walking every one of the
+ * 1,114,111 code points — UNDER ONE LOCALE. It did not walk locales, and `lower()` takes its
+ * behaviour from the COLLATION of its argument, which for a bare column is whatever the database was
+ * created with. So the closure was conditional on a fact about this estate that nothing enforced.
+ *
+ * WHAT THAT COSTS, MEASURED ON A REAL DATABASE rather than reasoned about. On a PostgreSQL 17
+ * database created `LOCALE_PROVIDER icu ICU_LOCALE 'tr-TR'`, `lower('I')` is `ı` U+0131 DOTLESS I —
+ * not `i`. `ı` is outside `[a-z0-9._:-]`, so the collapse turns it into `-`, and an ordinary
+ * `referenceId` of `INV-101` derives `-nv-101` in SQL against `inv-101` in TypeScript. That is not
+ * two exotic characters: it is EVERY key containing a capital `I`, so the detector loses whole
+ * FAMILIES of mirrors — the false negative r11 named, at a scale r11 did not reach. Between the
+ * default collation and C, `lower()` disagrees on 1,153 characters of the BMP alone on that database.
+ *
+ * THE PIN, AND IT IS ON THE ARGUMENT. `COLLATE "C"` inside the call — `lower(x COLLATE "C")` — sets
+ * the collation `lower()` RESOLVES WITH. `lower(x) COLLATE "C"` labels the collation of the RESULT
+ * and is a no-op for the fold: on that same tr-TR database it still returns `ı`. Both forms parse,
+ * neither warns, and only one of them is the fix; the DB suite asserts the difference rather than
+ * describing it. The same trap sits one operator away in `l."payload" ->> 'k' COLLATE "C"`, which
+ * PostgreSQL parses as `->> ('k' COLLATE "C")` — the pin lands on the KEY NAME — which is why the
+ * two jsonb extractions below are NOT pinned at all (see the next paragraph) rather than pinned
+ * wrongly.
+ *
+ * `"C"` IS ALWAYS AVAILABLE, whatever the encoding: it is a built-in collation with no encoding of
+ * its own, so this one statement is accepted on the estate's SQL_ASCII databases and on a UTF8 one
+ * alike, and both are exercised by the DB suite. Under `"C"`, `lower()` folds `A`-`Z` and touches
+ * nothing else — which is precisely the ASCII-only fold ASCII_FOLD_EXCEPTIONS below was written
+ * against. The pin does not change what this estate computes today; it makes the estate's ctype stop
+ * being load-bearing, so ASCII_FOLD_EXCEPTIONS' exhaustive walk is a statement about the STATEMENT
+ * instead of about this installation.
+ *
+ * WHAT ELSE IN THIS STATEMENT RESOLVES A COLLATION, and what was done about each:
+ *
+ *   • THE FOLD — pinned. Locale-dependent, and demonstrably wrong without the pin (above).
+ *   • THE COLLAPSE `[^a-z0-9._:-]+` — pinned. PostgreSQL compiles a bracket RANGE from character
+ *     CODES, not from a collation's sort order, and that was measured too: across the whole BMP on
+ *     the tr-TR database, the collapse gives the same answer under the default collation and under
+ *     `"C"` for every character. So this pin buys nothing TODAY and is not claimed to; it is here so
+ *     that reading the collapse does not require knowing that, and so a later edit reaching for a
+ *     ctype-driven class (`[[:alpha:]]`, `\w`) cannot quietly make the alphabet the locale's.
+ *   • `l."externalTransactionId" ~ …` — pinned, and this one is load-bearing for a second reason.
+ *     It is a COLUMN, so it carries the collation that column was DECLARED with, and a
+ *     nondeterministic collation (`deterministic = false`, a legitimate thing to put on a
+ *     case-insensitive identifier column) makes PostgreSQL REFUSE the match outright: "nondeterministic
+ *     collations are not supported for regular expressions". Unpinned, the whole reconciliation run
+ *     would throw on such an installation rather than mis-read one row.
+ *   • THE TWO jsonb `->>` BLANK TESTS — NOT pinned, deliberately. A jsonb extraction yields text in
+ *     the DATABASE DEFAULT collation and can never inherit a column's, and a database default is
+ *     always deterministic (PostgreSQL will not create a database with a nondeterministic one). The
+ *     pattern is an alternation of whole literal characters with no class, no range and no
+ *     case-insensitive flag, so nothing in it consults a ctype. Pinning them would buy nothing and
+ *     would have to be written `(l."payload" ->> 'k') COLLATE "C"` to avoid the precedence trap above.
+ *
+ * WHAT THIS IS NOT. It is not an installation-wide locale contract: `install.sh` still does not
+ * dictate the database's `LC_CTYPE`, and every other statement in the tree still resolves the
+ * default collation. That is o3d-60v1, filed rather than folded in here, because a rule about how
+ * every IMS database is CREATED and CONNECTED TO is not a reconciliation change.
+ */
+export const COLLATION_PIN = 'COLLATE "C"'
+
+/**
+ * o3d-11rf r11 (Codex r11, HIGH) — THE OTHER HALF OF "THE SAME STRING FUNCTION": CASE.
+ *
+ * `buildAccountingEventIdempotencyKey` lowercases with JavaScript `toLowerCase()`, which is UNICODE
+ * case mapping. The statement below lowercases with PostgreSQL `lower()` — pinned by COLLATION_PIN
+ * to `"C"`, under which it is an ASCII operation: it folds `A`-`Z` and leaves every other character
+ * exactly as it found it. So the two functions do not compute the same thing, and r10's tab is the
+ * same defect in a different dress.
+ *
+ * MOST OF THAT DIFFERENCE IS HARMLESS AND IT IS WORTH SAYING WHY, because it is what makes the fix
+ * small enough to be exhaustive. After folding, the normaliser COLLAPSES every run of characters
+ * outside `[a-z0-9._:-]` to a single `-`. A difference between the two foldings can therefore only
+ * SURVIVE when one of them produces a character INSIDE that alphabet and the other does not: `Á`
+ * lowercases to `á` in JavaScript and stays `Á` in SQL, and both collapse to `-`, so nothing about
+ * the key changes. Case mappings never produce digits or punctuation, so "inside that alphabet"
+ * means "an ASCII letter" — and Unicode contains exactly TWO characters whose lowercase form
+ * contains an ASCII letter while the character itself is not ASCII:
+ *
+ *   • U+212A KELVIN SIGN, whose lowercase is `k`.
+ *   • U+0130 LATIN CAPITAL LETTER I WITH DOT ABOVE, whose FULL lowercase is `i` + U+0307 COMBINING
+ *     DOT ABOVE — two characters, which is why no 1:1 mapping (`translate`) can express it.
+ *
+ * THAT CLOSURE IS NOT ASSERTED FROM MEMORY. `tests/domain/accounting/reconciliation.test.ts` walks
+ * EVERY code point of the running engine, normalises it standalone and embedded under both foldings,
+ * and asserts the set that disagrees is exactly this table — so a future JavaScript, or a future
+ * Unicode, that adds a third goes RED here instead of quietly parting the two derivations again.
+ *
+ * WHAT IT COST TO GET WRONG, and it is the reason this is not a curiosity. `referenceId = 'İ'`
+ * builds the key part `i` in TypeScript and NOTHING in SQL — the part normalises to empty, `nullif`
+ * makes the whole concatenation NULL, and the row derives no key at all. Its unexplained VOID mirror
+ * then owns nothing, pairs with no live row, and drops out of the report: a FALSE NEGATIVE in a
+ * detector, which is the one failure a detector may not have.
+ *
+ * SUBSTITUTED BEFORE `lower()`, NOT AFTER, and with `replace()` rather than a character set.
+ *
+ * BEFORE, because it keeps the substitution independent of what `lower()` does — and the difference
+ * was measured, not reasoned. On a PostgreSQL 17 database created with `LOCALE_PROVIDER builtin
+ * BUILTIN_LOCALE 'C.UTF-8'`, an UNPINNED `lower()` folds U+212A to `k` on its own and U+0130 to a
+ * BARE `i` (simple case mapping, where JavaScript uses the full one and produces `i` + U+0307).
+ * Substituting AFTER the fold would hand `lower()` the two characters it gets wrong and then look
+ * for originals that are no longer there. r12's COLLATION_PIN now settles what `lower()` does on
+ * every installation, so the order is no longer what carries the property — but the order is still
+ * the one that does not depend on the pin being right, and the DB suite runs this against a
+ * SQL_ASCII database and a tr-TR UTF8 one alike.
+ *
+ * WITH `replace()`, because it matches a SUBSTRING: on a SQL_ASCII database the search is a byte
+ * string, and UTF-8 is prefix-free and self-synchronising, so a byte match can only land on a real
+ * character boundary — the same property that lets ECMASCRIPT_BLANK_PATTERN be an alternation of
+ * whole characters. `translate()` could not be used even if the mapping were 1:1: it is a BYTE set
+ * here and would tear these sequences apart.
+ */
+const ASCII_FOLD_EXCEPTIONS = [
+  ['\u212a', '\u006b'],
+  ['\u0130', '\u0069\u0307'],
+] as const
+
+/** The table above, flattened the way the statement sends it, for the test that reads it back. */
+export const ASCII_FOLD_EXCEPTION_PARAMETERS: readonly string[] = ASCII_FOLD_EXCEPTIONS.flat()
 
 export type AccountingReconciliationSeverity = 'warning' | 'critical'
 export type AccountingReconciliationRunStatus = 'COMPLETED' | 'FAILED' | 'PARTIAL'
@@ -107,6 +302,17 @@ type AccountingEventRow = {
   idempotencyKey: string
   externalSystem: string | null
   externalId: string | null
+  /**
+   * o3d-11rf r3 — WHY this event is VOID, when a writer said. NULL means NO WRITER SAID, which is
+   * never revivable (see lib/domain/accounting/accounting-event-void-basis.ts) — so a NULL here on a
+   * VOID row that a live sync row still contradicts is a document nothing will ever post and nothing
+   * else in the product reports. That is what `addUnclassifiedVoidMirrorFindings` below exists for.
+   *
+   * Optional so the pure-evaluator fixtures that predate the column still compile and still mean what
+   * they meant; `collectAccountingReconciliationRows` always selects it. Absent reads the same as
+   * NULL here, deliberately: both are "no writer said", which is the whole condition being reported.
+   */
+  voidBasis?: string | null
 }
 
 /**
@@ -127,6 +333,43 @@ type RevisionClaimLogRow = {
   createdAt: Date | string
 }
 
+/**
+ * o3d-11rf r4 (Codex r4, HIGH) — ONE CONTRADICTION, as the database found it.
+ *
+ * A VOID mirror no writer classified, together with EVERY live unposted sync row THAT OWNS IT — i.e.
+ * whose own `mirroredAccountingEventIdempotencyKeys` names this event, not merely rows that share the
+ * document. Both halves come out of a single grouped join, so the pairing is a property of the query
+ * rather than of what happened to survive two independent caps.
+ *
+ * o3d-11rf r9: "owns it" is the r9 repair. Sharing the document was what this used to mean, and a
+ * document has many attempts with many mirrors between them.
+ */
+type VoidMirrorContradictionRow = {
+  accountingEventId: string
+  /** The event's `externalSystem`, which is the sync row's `connector`. */
+  connector: string | null
+  /** The event's `type`, which is the sync row's `type`. */
+  syncType: string
+  /** The event's `sourceEntityType`/`sourceEntityId`, which are the sync row's reference pair. */
+  referenceType: string
+  referenceId: string
+  idempotencyKey: string
+  /** Every contradicting sync row, by id, ascending. */
+  syncLogIds: string[]
+  /** The distinct statuses those rows are in, ascending. */
+  syncLogStatuses: string[]
+}
+
+export type VoidMirrorContradictions = {
+  /** The bounded page — at most `MAX_VOID_MIRROR_CONTRADICTIONS` entries, one per VOID event. */
+  rows: VoidMirrorContradictionRow[]
+  /**
+   * How many contradicting VOID events EXIST — counted by the same statement that produced the page,
+   * over the same snapshot, so `total > rows.length` is exact rather than a "there may be more".
+   */
+  total: number
+}
+
 export type AccountingReconciliationRows = {
   salesOrders: SourceOrderRow[]
   shipments: SourceShipmentRow[]
@@ -140,9 +383,28 @@ export type AccountingReconciliationRows = {
    * — a dataset that was never read has not "returned zero rows".
    */
   revisionClaimLogs?: RevisionClaimLogRow[]
+  /**
+   * o3d-11rf r4 — the unclassified-VOID contradictions, ALREADY PAIRED BY THE DATABASE. Not a page of
+   * events and a page of sync rows for this file to pair up: see `collectVoidMirrorContradictions`.
+   *
+   * Optional for the same reason as `revisionClaimLogs` — the pure-evaluator fixtures predate it —
+   * and absent means THE DATASET WAS NOT READ, which is not the same as "there are none". The
+   * evaluator therefore reports nothing at all when it is absent rather than reporting zero
+   * contradictions, and `collectAccountingReconciliationRows` always provides it.
+   */
+  voidMirrorContradictions?: VoidMirrorContradictions
 }
 
 type AccountingReconciliationClient = {
+  /**
+   * o3d-11rf r4 (Codex r4, HIGH) — REQUIRED, not optional, and deliberately so.
+   *
+   * The unclassified-VOID contradictions are the one dataset here that CANNOT be assembled from the
+   * capped per-table pages below (see `collectVoidMirrorContradictions` for why). A client that did
+   * not offer this would silently produce a report with that check missing, which is the same defect
+   * one level up. Making it required means a caller has to say out loud that it cannot answer.
+   */
+  $queryRaw(query: TemplateStringsArray, ...values: unknown[]): Promise<unknown[]>
   salesOrder: {
     findMany(args: unknown): Promise<SourceOrderRow[]>
   }
@@ -187,6 +449,11 @@ type PersistedAccountingReconciliationRun = {
   warningCount: number
   criticalCount: number
   createdAt: Date | string
+  /**
+   * o3d-11rf r5: the run's truncation sentinels, or `null` for a run written before the column
+   * existed. `null` is UNKNOWN completeness, not "complete" — see the migration.
+   */
+  truncations?: unknown
   findings?: PersistedAccountingReconciliationFinding[]
   _count?: { findings: number }
 }
@@ -208,8 +475,139 @@ export const ACCOUNTING_RECONCILIATION_FINDING_STATUSES = ['OPEN', 'RESOLVED', '
 export const MAX_RECONCILIATION_LIST_RUNS = 100
 export const MAX_RECONCILIATION_FINDINGS_PER_RUN = 500
 
+/**
+ * o3d-11rf r5 (Codex r4, HIGH) — THE FINDINGS WHOSE WHOLE CONTENT IS "THIS REPORT IS INCOMPLETE",
+ * and why they may not be left to compete for the budget they describe.
+ *
+ * WHAT CODEX FOUND. r3 bounded the contradiction query at `MAX_RECONCILIATION_FINDINGS_PER_RUN`
+ * precisely so nothing is written that the run view cannot render — and then appended the truncation
+ * warning AFTER the loop, making 501 rows for a 500-row page. The row most likely to be dropped is
+ * the one saying the list is short. r3's stated guarantee — "a short list with no truncation finding
+ * beside it proves the list is complete" — is therefore FALSE at exactly the boundary it was written
+ * for, and a mechanism that can be discarded for being one row too many is not a mechanism.
+ *
+ * IT IS NOT FIXABLE BY ORDERING, WHICH IS WHY THE REMEDY IS STRUCTURAL. A run's findings are written
+ * by ONE `createMany` inside ONE transaction, and `createdAt` defaults to CURRENT_TIMESTAMP — in
+ * PostgreSQL, transaction start time. Every finding of a run shares one `createdAt`, so the reader's
+ * `orderBy: { createdAt: 'asc' }, take: 500` has nothing to order by and returns whichever 500 the
+ * plan emits. "Prioritise the sentinel" would need a priority column and an ORDER BY on it. Given a
+ * migration either way, the honest place for the fact is the RUN — where it is returned with the run
+ * row, including to the cheap list view that asks for no findings at all.
+ *
+ * A REGISTRY, AND THE PRODUCERS SPELL THEIR CODE FROM IT. Both `addRowCapFindings` and
+ * `addUnclassifiedVoidMirrorFindings` take their `code` from these constants, so the string at the
+ * push site IS the entry here and the two cannot drift apart. A NEW sentinel still has to be added
+ * by hand — no mechanism enforces that — which is why this note names the property to look for:
+ * a finding that describes the completeness of the report rather than a defect in the data.
+ */
+export const RECONCILIATION_ROW_CAP_REACHED = 'reconciliation_row_cap_reached'
+export const VOID_MIRROR_CONTRADICTIONS_TRUNCATED = 'void_mirror_basis_unknown_contradictions_truncated'
+export const RECONCILIATION_TRUNCATION_FINDING_CODES: ReadonlySet<string> = new Set([
+  RECONCILIATION_ROW_CAP_REACHED,
+  VOID_MIRROR_CONTRADICTIONS_TRUNCATED,
+])
+
+/** One truncation sentinel, lifted onto the run row. Carries the message so it needs no re-rendering. */
+export type AccountingReconciliationTruncation = {
+  code: string
+  message: string
+  details: unknown
+}
+
+/**
+ * The run-level incompleteness record. Returns `[]` — never `null` — when nothing was truncated:
+ * `[]` says "asked and answered", and only a run written before the column existed may say nothing.
+ */
+export function reconciliationTruncations(
+  findings: readonly AccountingReconciliationFinding[],
+): AccountingReconciliationTruncation[] {
+  return findings
+    .filter((finding) => RECONCILIATION_TRUNCATION_FINDING_CODES.has(finding.code))
+    .map((finding) => ({ code: finding.code, message: finding.message, details: finding.details }))
+}
+
+/**
+ * o3d-11rf r6 (Codex r5, HIGH) — THE ONE PLACE THE `truncations` COLUMN IS INTERPRETED.
+ *
+ * WHAT WENT WRONG WITHOUT IT. r5 gave the column a three-way meaning — NULL is "nobody recorded
+ * this", `[]` is "recorded, nothing was truncated", a non-empty array is "recorded, and here is what
+ * was lost" — and then left every reader to remember it. NULL is the state of EVERY row on the
+ * deploy that ships the column, and of every row a predecessor binary writes while it is still
+ * serving across that deploy, so a reader that treats NULL as "nothing was truncated" is not making
+ * a rare mistake: it is wrong about the ordinary case. That conflation — unknown completeness read
+ * as proven completeness — is what this function exists to make unavailable.
+ *
+ * WHY A FUNCTION AND NOT A CONVENTION. "Remember that NULL is not `[]`" is a rule enforced by
+ * whoever remembers it, and this branch missed it once already.
+ * The remedy is to delete the representation that allows the mistake: readers are handed this
+ * DISCRIMINATED UNION rather than the raw JSON, so `state` is not something they may skip past to
+ * get at an array — the array only exists on the branches where it means something, and `unknown`
+ * carries `null` in its place. A `switch` on `state` with a `never` default makes a reader that
+ * forgets the unknown case a COMPILE error rather than a silent green.
+ *
+ * AN UNREADABLE PAYLOAD IS UNKNOWN, NOT COMPLETE. The column is `Json?`, so a row can hold something
+ * that is neither NULL nor an array of sentinels — a shape from a future writer, or a corrupted
+ * value. Nothing about such a row proves the run was complete, so it fails closed to `unknown` with
+ * `reason: 'unreadable'` to distinguish it from an honestly-silent predecessor row. The one thing it
+ * may never do is answer "yes, complete".
+ */
+export type AccountingReconciliationCompleteness =
+  | {
+    readonly state: 'unknown'
+    /**
+     * `not-recorded`: NULL, a run predating the column. `unreadable`: a payload we cannot parse.
+     */
+    readonly reason: 'not-recorded' | 'unreadable'
+    readonly truncations: null
+  }
+  | { readonly state: 'complete'; readonly truncations: readonly [] }
+  | { readonly state: 'truncated'; readonly truncations: readonly AccountingReconciliationTruncation[] }
+
+/** Interpret a run row's `truncations` column. The ONLY sanctioned reading of that column. */
+export function readReconciliationCompleteness(raw: unknown): AccountingReconciliationCompleteness {
+  if (raw === null || raw === undefined) {
+    return { state: 'unknown', reason: 'not-recorded', truncations: null }
+  }
+  if (!Array.isArray(raw)) return { state: 'unknown', reason: 'unreadable', truncations: null }
+
+  const entries: AccountingReconciliationTruncation[] = []
+  for (const entry of raw) {
+    if (!entry || typeof entry !== 'object' || Array.isArray(entry)) {
+      return { state: 'unknown', reason: 'unreadable', truncations: null }
+    }
+    const { code, message, details } = entry as Record<string, unknown>
+    if (typeof code !== 'string' || code.length === 0 || typeof message !== 'string') {
+      return { state: 'unknown', reason: 'unreadable', truncations: null }
+    }
+    entries.push({ code, message, details })
+  }
+
+  return entries.length === 0
+    ? { state: 'complete', truncations: [] }
+    : { state: 'truncated', truncations: entries }
+}
+
 export const DEFAULT_RECONCILIATION_LOOKBACK_DAYS = 90
 const MAX_RECONCILIATION_ROWS = 10_000
+/**
+ * o3d-11rf r4 (Codex r4, HIGH) — THE BOUND ON THE CONTRADICTION QUERY, and why it is this number.
+ *
+ * Not `MAX_RECONCILIATION_ROWS`. That cap bounds a general page which is filtered afterwards, and
+ * spending 10,000 rows to find a handful is exactly the shape this replaced. This one bounds a set
+ * that is ALREADY only contradictions, so the question it answers is different: how many of these can
+ * a person actually be shown?
+ *
+ * The answer is `MAX_RECONCILIATION_FINDINGS_PER_RUN` — the number of findings the run view will
+ * display AT ALL. Past it, an extra row is not an extra finding an operator can read; it is a row
+ * that is written and then never rendered. So the bound is derived from that number rather than
+ * picked, and what sits beyond it is reported as an exact COUNT instead
+ * (`void_mirror_basis_unknown_contradictions_truncated`), which is information the operator can act
+ * on where a longer unreadable list is not.
+ *
+ * A run that fills this bound is a systemic breakage, not a work queue: 500 documents nothing will
+ * ever post is a decision about the backfill, not 500 individual judgements.
+ */
+export const MAX_VOID_MIRROR_CONTRADICTIONS = MAX_RECONCILIATION_FINDINGS_PER_RUN
 // Refunded orders are picked up by the refundStatus OR-branch in the source query;
 // this set is now purely terminal lifecycle statuses.
 const TERMINAL_SALES_ORDER_STATUSES = ['CANCELLED', 'COMPLETED', 'DELIVERED'] as const
@@ -614,7 +1012,7 @@ function addRowCapFindings(
     if (count < MAX_RECONCILIATION_ROWS) continue
     findings.push({
       severity: 'warning',
-      code: 'reconciliation_row_cap_reached',
+      code: RECONCILIATION_ROW_CAP_REACHED,
       message: `Accounting reconciliation reached the ${MAX_RECONCILIATION_ROWS} row cap for ${dataset}; report may be incomplete`,
       details: {
         dataset,
@@ -947,6 +1345,7 @@ export function evaluateAccountingReconciliationRows(
   }
 
   addAssumedRevisionOrderFindings(findings, rows)
+  addUnclassifiedVoidMirrorFindings(findings, rows)
 
   return findings
 }
@@ -970,6 +1369,108 @@ export function evaluateAccountingReconciliationRows(
  * being asked to confirm describes the document — with the row that released it, the document id and
  * the basis alongside, so the check can be made without opening the audit table.
  */
+/**
+ * o3d-11rf r3 (Codex r2, HIGH) — THE OPERATOR SURFACE FOR A VOID MIRROR NOBODY CAN CLASSIFY.
+ *
+ * WHAT THIS IS THE OTHER HALF OF. `voidBasis` records WHY a mirrored event is VOID so a new live
+ * attempt may take back a void that retired an ATTEMPT while never taking back one that retired the
+ * DOCUMENT. NULL means no writer said which, and NULL is never revived — the only safe reading, and
+ * the reason the column could be added with no default. The backfill migration
+ * (20260908170000_accounting_event_void_basis_backfill) then repairs every historical row where a
+ * NOT_POSTED settlement is PROVABLE from two independent witnesses.
+ *
+ * WHAT NEITHER OF THOSE REACHES. A void whose provenance is genuinely unrecoverable — both witnesses
+ * present so only an untrustworthy clock could order them, a settlement made before
+ * `accounting_sync_logs.settlement_basis` existed to record it, a row an administrator wrote by hand
+ * — stays NULL for ever. If a LIVE sync row is still working on that document, that pairing is the
+ * exact o3d-11rf defect, frozen: a PENDING row that will never post, against a mirror that will
+ * never be revived. Silently leaving those broken is what this exists to refuse. A migration that
+ * repairs what it can prove and says nothing about the rest has still abandoned the rest.
+ *
+ * IT IS THE PAIRING THAT IS REPORTED, NOT THE NULL. Almost every VOID row in a mature database is a
+ * legitimate cancellation from before the column existed, and reporting all of them would bury the
+ * handful that matter in thousands that do not — the failure mode `document_claim_moved_on_assumed_order`
+ * next door already names ("a finding that can never stop appearing stops being read at all"). So
+ * the condition is a VOID-with-no-basis event that a sync row OF ITS OWN still contradicts by being
+ * live and unposted. Nothing to do means nothing reported.
+ *
+ * AND "OF ITS OWN" IS LOAD-BEARING (o3d-11rf r9, Codex r9 HIGH). It used to read "in the SAME SCOPE",
+ * and the query matched that: four columns naming a DOCUMENT. A document has many attempts and each
+ * derives its own mirror key, so a settled attempt's VOID event was reported against a healthy live
+ * attempt that had a healthy PENDING mirror of its own. Those findings were FALSE — the named live
+ * row was never blocked by the named event — and they stop being emitted. The pairing is now the
+ * mirror key itself; see `collectVoidMirrorContradictions`.
+ *
+ * UNPOSTED, and that clause is load-bearing. A row carrying an `externalTransactionId` describes a
+ * document that EXISTS (o3d-ju8t), so it is not work owed and reviving its mirror is not the remedy;
+ * it is a different disagreement, and `posted_event_without_external_id` and the duplicate-reference
+ * findings are where that surfaces. Only PENDING/PROCESSING with no document id is work that will
+ * never be done.
+ *
+ * A WARNING, NOT A CRITICAL, for the same reason the assumed-order finding is one: nothing here is
+ * KNOWN to be wrong. The remedy is an operator judgement this report cannot make — re-settle the
+ * live row, or confirm the document was retired with its order — and both ids are in the finding so
+ * it can be made without opening the audit tables.
+ */
+function addUnclassifiedVoidMirrorFindings(
+  findings: AccountingReconciliationFinding[],
+  rows: AccountingReconciliationRows,
+): void {
+  const contradictions = rows.voidMirrorContradictions
+  // Absent is "not read", not "none found" — see the field's own note. Reporting nothing is right;
+  // reporting a clean bill would be a lie about a check that never ran.
+  if (!contradictions) return
+
+  for (const row of contradictions.rows) {
+    findings.push({
+      severity: 'warning',
+      code: 'void_mirror_basis_unknown_with_live_sync_row',
+      accountingEventId: row.accountingEventId,
+      message:
+        `Mirrored accounting event ${row.accountingEventId} is VOID for a reason no writer recorded, while `
+        + `${row.syncLogIds.length} live sync row(s) whose mirror IT IS are still working. It cannot be `
+        + 'revived automatically, so that work will never post until someone decides which is right',
+      details: {
+        connector: row.connector,
+        syncType: row.syncType,
+        referenceType: row.referenceType,
+        referenceId: row.referenceId,
+        // Both sides by id, so the judgement can be made without opening the audit tables.
+        syncLogIds: row.syncLogIds,
+        syncLogStatuses: row.syncLogStatuses,
+        idempotencyKey: row.idempotencyKey,
+      },
+    })
+  }
+
+  // THE BOUND, SAID OUT LOUD. `total` is counted by the statement that produced the page, over the
+  // same snapshot, so this is not "there may be more" — it is HOW MANY more.
+  //
+  // r5: THIS ROW IS NO LONGER THE ONLY WITNESS, AND MUST NOT BE. r3 claimed that a short list with
+  // no such finding beside it proves the list is COMPLETE. That was false at the one boundary it was
+  // written for: the loop above appends up to MAX_VOID_MIRROR_CONTRADICTIONS findings and this is one
+  // more, so on a run that truncates it is the 501st row of a 500-row page — the row saying "this
+  // list is short" dropped for being one row too many. It is still emitted, because next to the rows
+  // it describes is where it reads best; but the load-bearing copy is now lifted onto the RUN by
+  // `reconciliationTruncations`, which no findings page can drop. See
+  // RECONCILIATION_TRUNCATION_FINDING_CODES.
+  if (contradictions.total > contradictions.rows.length) {
+    findings.push({
+      severity: 'warning',
+      code: VOID_MIRROR_CONTRADICTIONS_TRUNCATED,
+      message:
+        `${contradictions.total} unclassified VOID mirrors have live sync rows still working on the same `
+        + `document; only the first ${contradictions.rows.length} are listed. The rest are not in this `
+        + 'report — at this scale it is the void-basis backfill that needs a decision, not the documents',
+      details: {
+        reported: contradictions.rows.length,
+        total: contradictions.total,
+        limit: MAX_VOID_MIRROR_CONTRADICTIONS,
+      },
+    })
+  }
+}
+
 function addAssumedRevisionOrderFindings(
   findings: AccountingReconciliationFinding[],
   rows: AccountingReconciliationRows,
@@ -1014,6 +1515,249 @@ function addAssumedRevisionOrderFindings(
   }
 }
 
+/**
+ * o3d-11rf r4 (Codex r4, HIGH) — THE CAP APPLIED BEFORE THE QUESTION, AND THE FIX FOR IT.
+ *
+ * WHAT WAS WRONG. Round 3 paired unclassified VOID mirrors against live sync rows IN MEMORY, over the
+ * two general pages the report already had. Both pages are `ORDER BY <date> DESC LIMIT 10,000`: a
+ * bound imposed on a broad load, with the filter that decides relevance applied AFTERWARDS. The event
+ * page is every non-POSTED event, which on a mature install is dominated by pre-column cancellation
+ * VOIDs — and those compete for the same 10,000 slots as the rows this check exists to find.
+ *
+ * That is not a rounding error, it is an inversion. The victims this warning was built for are BY
+ * DEFINITION old: a settlement made before `settlement_basis` existed, a row an administrator wrote
+ * by hand, a void whose two witnesses only an untrustworthy clock could order. The older a victim is,
+ * the further down a `businessDate DESC` page it sits, and the more likely it is dropped BEFORE the
+ * pairing that would have named it. The mechanism built to surface abandoned rows preferentially
+ * discarded the most abandoned ones — and did so silently, because the generic
+ * `reconciliation_row_cap_reached` warning names a dataset, not a stranded document.
+ *
+ * WHAT THIS DOES INSTEAD. It asks the database the actual question. The join IS the filter: live
+ * unposted sync rows against NULL-basis VOID events on the identity the mirror uses, so what comes
+ * back is contradictions rather than a page in which contradictions might be found. There is no date
+ * bound at all — the whole point of the finding is that its subjects are older than any lookback —
+ * and only THEN is a bound applied, to a set that is already nothing but answers.
+ *
+ * THE SCOPE, and it is the mirror's own: a sync log's (connector, type, referenceType, referenceId)
+ * is an event's (externalSystem, type, sourceEntityType, sourceEntityId). `connector` is NOT NULL and
+ * `externalSystem` is nullable, and SQL equality never matches a NULL — which is the same answer the
+ * in-memory pairing gave (it keyed a null `externalSystem` as the empty string, which no connector
+ * equals), reached by the language's own rule rather than by a sentinel.
+ *
+ * ================================================================================================
+ * o3d-11rf r9 (Codex r9, HIGH) — AND THE SCOPE IS NOT THE IDENTITY. THIS IS THE FIX FOR THAT.
+ * ================================================================================================
+ *
+ * WHAT WAS WRONG. Those four columns were the WHOLE join. They name a DOCUMENT; they do not name a
+ * MIRROR. One document has many attempts — a FAILED row and its live replacement, a revision and the
+ * revision after it — and each attempt derives its OWN `idempotencyKey`, which is the thing an
+ * `accounting_events` row actually is. So a VOID event belonging to attempt A was paired with a
+ * PENDING attempt B purely for sharing a document, and the report told an operator that B's work
+ * will never post when B's own mirror was sitting there PENDING and perfectly healthy. A false
+ * warning, with the wrong pair of ids on it, on precisely the surface built to be believed.
+ *
+ * OWNERSHIP IS `mirroredAccountingEventIdempotencyKeys`, AND NOTHING WEAKER. That function is the
+ * one definition of "which event is THIS row's mirror", and the join now asks it rather than
+ * approximating it. For a row it yields, in this order:
+ *
+ *   • the PAYLOAD key `accounting-sync:<connector>:<type>:<payload._idempotencyKey>` when the payload
+ *     carries a non-blank STRING `_idempotencyKey` — and then that is the ONLY key, because the
+ *     primary and the legacy derivation both stop there. Shared BY CONSTRUCTION across every attempt
+ *     that was handed the same token, which is exactly what makes attempts converge on one mirror.
+ *   • otherwise the ROW key `accounting-sync-log:<connector>:<syncLogId>` (the primary) and, when the
+ *     payload carries a non-blank string `date`, the LEGACY key
+ *     `accounting-sync:<connector>:<type>:<referenceType>:<referenceId>:<date>` beside it — the form
+ *     that predates the sync-log id and is shared by every attempt made on the same day.
+ *
+ * So a row has TWO keys, or ONE, or NONE: none when its type is not mirrored at all (nothing is
+ * mirrored, so nothing can be owned), which is why the live set is narrowed by
+ * MIRRORED_ACCOUNTING_SYNC_TYPES before a key is built.
+ *
+ * THE PARTS ARE NORMALISED THE WAY `buildAccountingEventIdempotencyKey` NORMALISES THEM — lowercased,
+ * every run of characters outside `[a-z0-9._:-]` collapsed to one `-`, leading and trailing `-`
+ * stripped, then joined on `:`. LOWERCASED means JavaScript `toLowerCase()` and not PostgreSQL
+ * `lower()`, which under the COLLATION_PIN this statement carries folds ASCII and nothing else on
+ * every installation rather than only on this estate's (o3d-11rf r12) — see
+ * ASCII_FOLD_EXCEPTIONS, which is the whole of o3d-11rf r11 and names the only two characters where
+ * the two can still differ once the collapse has run. NON-BLANK, in every one of those sentences, is JavaScript `trim()`'s
+ * sense of it and not `btrim`'s — see ECMASCRIPT_BLANK_PATTERN, which is the whole of o3d-11rf r10.
+ * The one deliberate divergence: TypeScript THROWS when a part
+ * normalises to blank, and this yields NO KEY instead (the `nullif(..., '')` makes the concatenation
+ * NULL and the key drops out). That direction is the safe one — a row whose key cannot be built owns
+ * nothing and is not reported — and it keeps a malformed row from taking down the reconciliation
+ * cron. `reconciliation-void-mirror-contradictions.test.ts` pins both halves of that against the
+ * TypeScript function itself, so the two derivations cannot drift apart unnoticed.
+ *
+ * THE FOUR SCOPE COLUMNS ARE KEPT ALONGSIDE the key, not replaced by it. The payload-key form does
+ * not carry `referenceType`/`referenceId`, so two different documents handed the same token would
+ * match on key alone; and the null-`externalSystem` exclusion described above is a property of the
+ * scope join. Ownership NARROWS the pairing; it does not license widening it.
+ *
+ * WHY BOTH SIDES ARE AGGREGATED HERE and not grouped by the caller: the finding is one per VOID
+ * event naming every live row it blocks, so the grouping is part of the question. Pulling pairs back
+ * and grouping them in TypeScript would put a bound on PAIRS, and a document with many attempts could
+ * then push a different document out of the page — the same defect wearing a different hat.
+ *
+ * THE COUNT IS FROM THE SAME STATEMENT. `count(*) OVER ()` is computed over the whole grouped set
+ * before `LIMIT` takes a page of it, so the total is exact and is a fact about the SAME SNAPSHOT the
+ * page came from. A second `COUNT` query would be a different snapshot and could disagree with the
+ * page it describes.
+ *
+ * PLANNING. The statement now drives from the LIVE side, which is the small one: PENDING/PROCESSING
+ * mirrored rows holding no document id are the working queue, whereas the VOID events are the whole
+ * history of the table. Each live row then probes `accounting_events` by `idempotencyKey`, which is
+ * UNIQUE, so the per-row lookup is an index hit rather than a scan. No partial index is added: this
+ * runs once per reconciliation cron, and an index carrying a predicate Prisma's schema cannot express
+ * would have to live in the drift allowlist for the life of the table.
+ */
+async function collectVoidMirrorContradictions(
+  client: AccountingReconciliationClient,
+): Promise<VoidMirrorContradictions> {
+  const rows = (await client.$queryRaw`
+    WITH live AS (
+      SELECT
+        l."id",
+        l."connector",
+        l."type"::text   AS "type",
+        l."referenceType",
+        l."referenceId",
+        l."status"::text AS "status",
+        -- EVERY key mirroredAccountingEventIdempotencyKeys would derive for this row, in its order:
+        -- the payload key alone, or the row key with the legacy date key beside it. A part that
+        -- normalises to blank makes its whole key NULL (concatenation with NULL is NULL) and the key
+        -- drops out here, where TypeScript would have thrown.
+        ARRAY(
+          SELECT k
+          FROM unnest(ARRAY[
+            CASE WHEN raw."payloadKey" IS NOT NULL
+                 THEN 'accounting-sync:' || n."connector" || ':' || n."type" || ':' || n."payloadKey" END,
+            CASE WHEN raw."payloadKey" IS NULL
+                 THEN 'accounting-sync-log:' || n."connector" || ':' || n."syncLogId" END,
+            CASE WHEN raw."payloadKey" IS NULL AND raw."payloadDate" IS NOT NULL
+                 THEN 'accounting-sync:' || n."connector" || ':' || n."type" || ':' || n."referenceType"
+                      || ':' || n."referenceId" || ':' || n."payloadDate" END
+          ]) AS k
+          WHERE k IS NOT NULL
+        ) AS "mirrorKeys"
+      FROM "accounting_sync_logs" l
+      -- The payload fields AS stringValue reads them: a JSON string, and non-blank. A number, a null,
+      -- a missing field, or a payload that is not an object at all is no value -- which is what
+      -- normalizePayload does by returning an empty record for anything that is not a record.
+      --
+      -- NON-BLANK IS JAVASCRIPT trim(), NOT btrim(). See ECMASCRIPT_BLANK_PATTERN: btrim(text)
+      -- strips ordinary spaces only, so a token of a single TAB read as PRESENT here and ABSENT in
+      -- stringValue, and the two derivations branched apart. The RAW value is what is carried
+      -- forward, exactly as stringValue returns the value it was given rather than a trimmed copy.
+      CROSS JOIN LATERAL (
+        SELECT
+          CASE WHEN jsonb_typeof(l."payload" -> '_idempotencyKey') = 'string'
+                AND l."payload" ->> '_idempotencyKey' !~ ${ECMASCRIPT_BLANK_PATTERN}
+               THEN l."payload" ->> '_idempotencyKey' END AS "payloadKey",
+          CASE WHEN jsonb_typeof(l."payload" -> 'date') = 'string'
+                AND l."payload" ->> 'date' !~ ${ECMASCRIPT_BLANK_PATTERN}
+               THEN l."payload" ->> 'date' END AS "payloadDate"
+      ) raw
+      -- buildAccountingEventIdempotencyKey's per-part normalisation, applied once per part and named
+      -- rather than repeated at each use. The two ARRAY literals below are positionally paired.
+      CROSS JOIN LATERAL (
+        SELECT parts[1] AS "connector", parts[2] AS "type", parts[3] AS "referenceType",
+               parts[4] AS "referenceId", parts[5] AS "syncLogId",
+               parts[6] AS "payloadKey", parts[7] AS "payloadDate"
+        FROM (
+          SELECT array_agg(
+                   nullif(regexp_replace(regexp_replace(folded.value COLLATE "C", '[^a-z0-9._:-]+', '-', 'g'), '^-+|-+$', '', 'g'), '')
+                   ORDER BY part.ord
+                 ) AS parts
+          FROM unnest(ARRAY[
+            l."connector", l."type"::text, l."referenceType", l."referenceId", l."id",
+            raw."payloadKey", raw."payloadDate"
+          ]) WITH ORDINALITY AS part(value, ord)
+          -- LOWERCASED THE WAY JavaScript toLowerCase() LOWERCASES, not the way this database's
+          -- locale lowercases. See COLLATION_PIN and ASCII_FOLD_EXCEPTIONS: the pin makes lower()
+          -- the ASCII fold on EVERY database rather than only on this estate's, and the two
+          -- characters whose difference can outlive the collapse below are substituted first.
+          -- A NULL part stays NULL through both, which is what makes an unbuildable key drop out.
+          --
+          -- THE PIN IS ON THE ARGUMENT, INSIDE THE CALL. A COLLATE outside the closing paren of
+          -- lower() labels the RESULT and folds with the database's locale anyway; measured on a
+          -- tr-TR database, that spelling still returns dotless U+0131 for an ordinary ASCII I.
+          CROSS JOIN LATERAL (
+            SELECT lower(replace(replace(part.value,
+                     ${ASCII_FOLD_EXCEPTIONS[0][0]}, ${ASCII_FOLD_EXCEPTIONS[0][1]}),
+                     ${ASCII_FOLD_EXCEPTIONS[1][0]}, ${ASCII_FOLD_EXCEPTIONS[1][1]}) COLLATE "C") AS value
+          ) folded
+        ) normalized
+      ) n
+      WHERE l."status"::text = ANY(${[...MIRROR_CONTRADICTING_SYNC_STATUSES]}::text[])
+        -- A type that is not mirrored has no mirror to own, so it can contradict nothing.
+        AND l."type"::text = ANY(${[...MIRRORED_ACCOUNTING_SYNC_TYPES]}::text[])
+        -- "Holds no document id", and blank means what trim() means here too: every TypeScript
+        -- reader of this column asks externalTransactionId?.trim(), so a tab-only id was work owed
+        -- everywhere except in this one statement, which read it as a document that exists and
+        -- dropped the row out of the live set.
+        -- COLLATE "C" for the reason COLLATION_PIN gives: this operand is a COLUMN, so unlike the two
+        -- jsonb extractions above it carries whatever collation that column was declared with, and a
+        -- nondeterministic one makes the match operator throw rather than answer.
+        AND (l."externalTransactionId" IS NULL OR l."externalTransactionId" COLLATE "C" ~ ${ECMASCRIPT_BLANK_PATTERN})
+    ),
+    contradiction AS (
+      SELECT
+        e."id"               AS "accountingEventId",
+        e."externalSystem"   AS "connector",
+        e."type"             AS "syncType",
+        e."sourceEntityType" AS "referenceType",
+        e."sourceEntityId"   AS "referenceId",
+        e."idempotencyKey"   AS "idempotencyKey",
+        array_agg(l."id" ORDER BY l."id")    AS "syncLogIds",
+        array_agg(DISTINCT l."status" ORDER BY l."status") AS "syncLogStatuses"
+      FROM "accounting_events" e
+      JOIN live l
+        ON l."connector"     = e."externalSystem"
+       AND l."type"          = e."type"
+       AND l."referenceType" = e."sourceEntityType"
+       AND l."referenceId"   = e."sourceEntityId"
+       -- OWNERSHIP, and it is the clause the four above cannot stand in for: this row's own mirror
+       -- is this event, not merely some event about the same document.
+       AND e."idempotencyKey" = ANY(l."mirrorKeys")
+      WHERE e."status" = 'VOID'
+        AND e."voidBasis" IS NULL
+      GROUP BY
+        e."id", e."externalSystem", e."type", e."sourceEntityType", e."sourceEntityId", e."idempotencyKey"
+    )
+    SELECT
+      "accountingEventId",
+      "connector",
+      "syncType",
+      "referenceType",
+      "referenceId",
+      "idempotencyKey",
+      "syncLogIds",
+      "syncLogStatuses",
+      (count(*) OVER ())::int AS "totalContradictions"
+    FROM contradiction
+    ORDER BY "accountingEventId"
+    LIMIT ${MAX_VOID_MIRROR_CONTRADICTIONS}
+  `) as Array<VoidMirrorContradictionRow & { totalContradictions: number }>
+
+  return {
+    // Named field by field rather than spread, for the reason the sync-log select next door gives:
+    // the window count rides on every row, and a spread would carry it into the finding's details as
+    // if it were something about THIS document's sync rows.
+    rows: rows.map((row) => ({
+      accountingEventId: row.accountingEventId,
+      connector: row.connector,
+      syncType: row.syncType,
+      referenceType: row.referenceType,
+      referenceId: row.referenceId,
+      idempotencyKey: row.idempotencyKey,
+      syncLogIds: row.syncLogIds,
+      syncLogStatuses: row.syncLogStatuses,
+    })),
+    // Zero rows means zero contradictions: the window count only exists where a row does.
+    total: rows[0]?.totalContradictions ?? 0,
+  }
+}
+
 export async function collectAccountingReconciliationRows(
   client: AccountingReconciliationClient = db as unknown as AccountingReconciliationClient,
   options: { lookbackDays?: number; toDate?: Date } = {},
@@ -1022,7 +1766,9 @@ export async function collectAccountingReconciliationRows(
     options.lookbackDays ?? DEFAULT_RECONCILIATION_LOOKBACK_DAYS,
     options.toDate,
   )
-  const [salesOrders, shipments, refunds, syncLogs, accountingEvents, revisionClaimLogs] = await Promise.all([
+  const [
+    salesOrders, shipments, refunds, syncLogs, accountingEvents, revisionClaimLogs, voidMirrorContradictions,
+  ] = await Promise.all([
     client.salesOrder.findMany({
       where: {
         OR: [
@@ -1122,6 +1868,9 @@ export async function collectAccountingReconciliationRows(
         idempotencyKey: true,
         externalSystem: true,
         externalId: true,
+        // o3d-11rf r3: read so a VOID mirror NO WRITER EXPLAINED can be told apart from one a
+        // cancellation or a settlement did explain. Only the unexplained ones are reported.
+        voidBasis: true,
       },
     }),
     // o3d-cvj9 r7: the handovers the live mirror made on an order nothing established. Selected on
@@ -1149,9 +1898,15 @@ export async function collectAccountingReconciliationRows(
         createdAt: true,
       },
     }),
+    // o3d-11rf r4: the ONE dataset here that is not a capped page of a table. It is asked as the
+    // question it answers — see collectVoidMirrorContradictions — because a page taken before the
+    // filter drops exactly the rows this check exists to find.
+    collectVoidMirrorContradictions(client),
   ])
 
-  return { salesOrders, shipments, refunds, syncLogs, accountingEvents, revisionClaimLogs }
+  return {
+    salesOrders, shipments, refunds, syncLogs, accountingEvents, revisionClaimLogs, voidMirrorContradictions,
+  }
 }
 
 export async function runAccountingReconciliationReport(options: {
@@ -1197,6 +1952,11 @@ export async function persistAccountingReconciliationReport(
         totalCount: report.summary.total,
         warningCount: report.summary.warning,
         criticalCount: report.summary.critical,
+        // o3d-11rf r5: the same sentinels are ALSO written as findings, because they are worth
+        // reading beside the rows they describe. But a finding is subject to the reader's page and
+        // this is not, and `totalCount` above cannot substitute: it counts findings, and says
+        // nothing about whether the DATASETS behind them were complete.
+        truncations: toJsonInputValue(reconciliationTruncations(report.findings)),
       },
     })
 
@@ -1228,12 +1988,24 @@ export async function persistAccountingReconciliationReport(
   return client.$transaction ? client.$transaction(persist) : persist(client)
 }
 
+/**
+ * A run as this reader hands it out: the row, plus the INTERPRETATION of its completeness column.
+ *
+ * o3d-11rf r6 — the raw `truncations` is still there, because the run view renders the sentinel
+ * messages, but nothing downstream has to know that NULL is not `[]` in order to be right about it.
+ * A caller that wants "was this run complete?" reads `completeness.state`; the only way left to get
+ * that wrong is to ignore this field and re-derive it from the raw column, which greps.
+ */
+export type ListedAccountingReconciliationRun = PersistedAccountingReconciliationRun & {
+  completeness: AccountingReconciliationCompleteness
+}
+
 export async function listAccountingReconciliationRuns(
   client: AccountingReconciliationPersistenceClient = db as unknown as AccountingReconciliationPersistenceClient,
   options: { limit?: number; includeFindings?: boolean } = {},
-): Promise<PersistedAccountingReconciliationRun[]> {
+): Promise<ListedAccountingReconciliationRun[]> {
   const take = Math.min(Math.max(options.limit ?? 25, 1), MAX_RECONCILIATION_LIST_RUNS)
-  return client.accountingReconciliationRun.findMany({
+  const runs = await client.accountingReconciliationRun.findMany({
     orderBy: { createdAt: 'desc' },
     take,
     include: options.includeFindings
@@ -1246,6 +2018,8 @@ export async function listAccountingReconciliationRuns(
         }
       : { _count: { select: { findings: true } } },
   })
+
+  return runs.map((run) => ({ ...run, completeness: readReconciliationCompleteness(run.truncations) }))
 }
 
 export type AccountingReconciliationFindingStatusUpdate = {

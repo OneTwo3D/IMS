@@ -2766,8 +2766,8 @@ model AccountingEvent {
   revisionOrderBasis String?
   // o3d-11rf r2: WHY this event is VOID, and so whether a later live attempt may take it back to
   // PENDING. Two voids used to be one bit: `source_cancelled` retires the DOCUMENT (the order was
-  // cancelled -- never revivable) and `attempt_settled_not_posted` retires ONE ATTEMPT (an operator
-  // settled a single sync row NOT_POSTED -- revivable, because re-queueing is the ordinary next
+  // cancelled — never revivable) and `attempt_settled_not_posted` retires ONE ATTEMPT (an operator
+  // settled a single sync row NOT_POSTED — revivable, because re-queueing is the ordinary next
   // step). NULL means no writer said which, and NULL is never revived: every row written before
   // this column, and any written by a predecessor binary serving across the migration, lands on
   // the safe side. Written only alongside a VOID status and cleared by any write that leaves the
@@ -2817,6 +2817,11 @@ model AccountingReconciliationRun {
   warningCount  Int
   criticalCount Int
   createdAt     DateTime @default(now())
+  /// o3d-11rf r5 — THE INCOMPLETENESS OF THIS RUN, RECORDED WHERE THE FINDINGS PAGE CANNOT DROP IT.
+  /// An array of the run's truncation sentinels ({ code, message, details }). NULL means the run
+  /// predates the column, i.e. its completeness is UNKNOWN; `[]` means it was recorded and nothing
+  /// was truncated. See RECONCILIATION_TRUNCATION_FINDING_CODES.
+  truncations   Json?
 
   findings      AccountingReconciliationFinding[]
 

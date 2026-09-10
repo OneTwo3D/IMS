@@ -6,12 +6,8 @@
 -- operator who settled a sync row NOT_POSTED under the predecessor binary, then re-queued the
 -- document, has a live PENDING sync row against a VOID mirror, and nothing will ever take that
 -- mirror back. The forward fix abandoned its own existing victims. This repairs the ones that can be
--- PROVED. It does NOT repair, and does not claim to repair, the rest: a void whose provenance is
--- genuinely unrecoverable stays NULL for ever, and today nothing reports that pairing to an
--- operator. Surfacing it is o3d-11rf's reconciliation half and lands on branch
--- o3d-11rf-reconciliation-contradictions, which builds on this one. A migration that repairs what
--- it can prove and says nothing about the rest has still abandoned the rest, so the gap is written
--- down here rather than left to be noticed.
+-- PROVED, and the rest are surfaced to an operator by the accounting reconciliation report's
+-- `void_mirror_basis_unknown_with_live_sync_row` finding rather than left silent.
 --
 -- ================================================================================================
 -- WHY A HISTORICAL NOT_POSTED SETTLEMENT IS PROVABLE, AND FROM WHAT.
