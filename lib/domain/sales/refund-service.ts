@@ -54,7 +54,6 @@ import {
   proveAllocationDebitPosting,
   proveJournalPosting,
 } from '@/lib/domain/accounting/allocation-debit-posting-proof'
-import { proveRevenueDeferralLedger } from '@/lib/domain/accounting/revenue-deferral-ledger-proof'
 import { withSavepoint } from '@/lib/db/savepoint'
 import { lockSalesOrder } from '@/lib/domain/sales/allocation-service'
 
@@ -321,14 +320,6 @@ function reconstructReplayLine(line: {
     reverseCharge: line.reverseCharge,
   }
 }
-
-/**
- * o3d-i0o6 r5: the connectors a staged request may be PINNED to — the two this build can route a
- * posting through. A proof that names anything else has established a ledger nothing here can post
- * to, which is reported as unestablished rather than pinned: a pin to an unroutable name would
- * refuse the posting for ever without saying why.
- */
-const REFUND_ROUTABLE_CONNECTORS = ['xero', 'quickbooks'] as const
 
 export type RefundAccountingSyncRequest = {
   type: AccountingSyncType
@@ -2388,13 +2379,6 @@ async function stageRefundAccountingReversals(
     const stagedA2 = await tx.salesOrder.findUnique({
       where: { id: params.orderId },
       select: {
-        // o3d-i0o6 r5 (Codex round 4, HIGH 3): GROUP A1'S OWN ATTRIBUTION, read in the same locked
-        // statement as A2's. The journal this staging produces can carry both reversals, and until
-        // r5 only one of them had a provenance — so the other rode the first one's pin into books it
-        // was never raised in. Read here, before the un-stage below clears the reference.
-        revenueDeferredDate: true,
-        revenueDeferredBatchRef: true,
-        unearnedRevenueAmount: true,
         inventoryAllocatedDate: true,
         allocationBatchAmount: true,
         // o3d-i0o6 r3: the PASSES behind that cumulative figure. Without them the three columns
@@ -2559,47 +2543,6 @@ async function stageRefundAccountingReversals(
       toDecimal(allocationReversalRelief),
     )
     const openBeforeRefusal = subtractMoney(toDecimal(provedAllocationDebit), relieved)
-    // o3d-i0o6 r5 (Codex round 4, HIGH 3) — THE A1 REVERSAL'S OWN PROVENANCE, ESTABLISHED
-    // INDEPENDENTLY OF A2'S.
-    //
-    // The journal this staging produces can carry BOTH reversals, and r3 pinned the whole of it to
-    // the ledger A2's debit was proved on. A1 defers when the order is PAID and A2 reclassifies when
-    // it is ALLOCATED, so a connector switch between the two makes that pin post the unearned
-    // -revenue debit into books that never credited the liability — while the original liability
-    // stands in the other ledger, for ever. One journal, two provenances: the assumption was that a
-    // journal has one.
-    //
-    // A1 records no per-order connector, only the batch REFERENCE it was staged into, so its ledger
-    // is established from that batch's own log row — see revenue-deferral-ledger-proof.ts. Where it
-    // cannot be established the reversal is WITHHELD rather than guessed at, exactly as an
-    // `unattributed` A2 debit is: an absent answer is not the permissive one.
-    const unearnedReversalOwed = Math.min(
-      remainingUnearned,
-      Math.round((unshippedQtyRevenue + nonQtyRevenue) * 100) / 100,
-    )
-    let unearnedBasisUnresolved: string | null = null
-    let unearnedProvedOnConnector: typeof REFUND_ROUTABLE_CONNECTORS[number] | null = null
-    if (unearnedReversalOwed > 0.005) {
-      const a1Ledger = await proveRevenueDeferralLedger(tx, stagedA2 ?? {
-        revenueDeferredDate: null,
-        revenueDeferredBatchRef: null,
-        unearnedRevenueAmount: null,
-      }, REFUND_ROUTABLE_CONNECTORS)
-      if (a1Ledger.kind === 'proved') {
-        unearnedProvedOnConnector = a1Ledger.connector
-      } else {
-        // `none` is unreachable with pounds owed — the amount owed is derived from the very figure
-        // that arm says is absent — but it is handled as a refusal rather than ignored, because the
-        // one way it becomes reachable is the order row disappearing under this transaction, and
-        // that is not a licence to post.
-        unearnedBasisUnresolved = a1Ledger.kind === 'unestablished'
-          ? a1Ledger.reason
-          : `this refund owes an unearned-revenue reversal of £${unearnedReversalOwed.toFixed(2)}, but ${a1Ledger.reason}`
-      }
-    }
-    /** Withheld to £0.00 where A1's ledger is not on record: a debit with no known books is not raised. */
-    const unearnedReversal = unearnedBasisUnresolved != null ? 0 : unearnedReversalOwed
-
     const openAllocatedContra: number = allocationBasisUnresolved != null
       ? 0
       : openBeforeRefusal.gt(0) ? roundQuantity(openBeforeRefusal, 2).toNumber() : 0
@@ -2697,21 +2640,10 @@ async function stageRefundAccountingReversals(
       || refusalWithheldLineReversal
       || capBitInto
       || assumedReliefCounted
-      // o3d-i0o6 r5: an A1 refusal ALWAYS costs something — the unearned-revenue reversal it
-      // withheld is pounds of liability left standing — so it is reported whenever it happened,
-      // full refund or partial. Unlike the allocation residue there is no later pass that raises
-      // it: A1 defers once, and a fully-refunded order is out of every daily-batch window.
-      || unearnedBasisUnresolved != null
       || (allocationRowBasisMissing && params.newStatus === 'REFUNDED')
     const unresolvedNote = withheldSomething
       ? [
           allocationBasisUnresolved,
-          // o3d-i0o6 r5: the GROUP A1 refusal, on the same row and under the same critical finding,
-          // because it is the same kind of fact — a reversal this refund owed and did not raise,
-          // named so an operator can post it by hand in the ledger that actually holds it.
-          unearnedBasisUnresolved
-            ? `£${unearnedReversalOwed.toFixed(2)} of unearned revenue was NOT reversed: ${unearnedBasisUnresolved}`
-            : null,
           // The pounds this refund did NOT credit because a relief it could not read was counted
           // against the debit. Listed per record, so an operator knows which journal to go and find.
           assumedReliefCounted
@@ -2769,15 +2701,8 @@ async function stageRefundAccountingReversals(
       await tx.salesOrder.update({
         where: { id: params.orderId },
         data: {
-          // o3d-i0o6 r5: the A1 stamp and its batch reference are the ONLY things that can say
-          // which ledger holds this order's unearned-revenue liability. Where the reversal was
-          // withheld because that could not be established, clearing them would destroy the
-          // evidence of the very liability the refusal is about — the same reason the A2
-          // attribution below survives its own refusal.
-          ...(unearnedBasisUnresolved ? {} : {
-            revenueDeferredDate: null,
-            revenueDeferredBatchRef: null,
-          }),
+          revenueDeferredDate: null,
+          revenueDeferredBatchRef: null,
           ...(allocationBasisUnresolved ? {} : {
             inventoryAllocatedDate: null,
             inventoryAllocatedBatchRef: null,
@@ -2795,11 +2720,10 @@ async function stageRefundAccountingReversals(
       // COGS reconciliation has an independent subledger source (the GL gets the 2dp
       // value above; the 6dp-vs-2dp residue is what the reconciliation sweeps).
       cogsReversalBase: roundQuantity(sumCostLayerSnapshot(shipmentRefundSnapshot), 6).toNumber(),
-      unearnedReversal,
-      // o3d-i0o6 r5 (Codex round 4, HIGH 3): the ledger the A1 liability was established in, carried
-      // out of the transaction that established it — the twin of `allocationProvedOnConnector`
-      // below, and deliberately a SEPARATE value, because the two reversals can differ.
-      unearnedProvedOnConnector,
+      unearnedReversal: Math.min(
+        remainingUnearned,
+        Math.round((unshippedQtyRevenue + nonQtyRevenue) * 100) / 100,
+      ),
       // o3d-o97: the lines' own allocation cost, capped by the open balance, PLUS — on a full
       // refund — the part of that balance no line reached. On a resolved full refund the two sum
       // to exactly the open balance.
@@ -2854,110 +2778,79 @@ async function stageRefundAccountingReversals(
     })
   }
 
-  /**
-   * o3d-i0o6 r5 (Codex round 4, HIGH 3) — TWO REVERSALS, TWO PROVENANCES, AND SEPARATE JOURNALS
-   * WHENEVER THEIR LEDGERS DIFFER.
-   *
-   * `UNEARNED_REV_REVERSAL` has always been able to carry both halves at once:
-   *
-   *   DR Unearned Revenue / CR Sales      the GROUP A1 deferral coming back
-   *   DR Inventory / CR Allocated Inv.    the GROUP A2 contra coming back
-   *
-   * r3 proved the A2 half against one connector and pinned THE WHOLE JOURNAL to it. That is right
-   * about the allocation credit and an assumption about everything beside it: A1 defers when the
-   * order is paid, A2 reclassifies when it is allocated, and a connector switch in between makes
-   * the two halves belong to two different sets of books. Pinned together, the A1 debit lands where
-   * the liability was never credited and the real liability stands in the other ledger for ever.
-   *
-   * So each half is built with its OWN pin, and they share a journal only when those pins agree —
-   * which is the ordinary case, and produces byte-for-byte the journal r3 produced. Where they
-   * disagree, two journals go out, each answering to the ledger its own evidence was established
-   * in; the one whose connector is no longer posting writes nothing and leaves
-   * `accountingRetryRequired` standing, which is what a reversal that cannot reach its own books
-   * should do.
-   */
-  type ReversalHalf = {
-    lines: Array<{ accountCode: string; description: string; debit?: number; credit?: number }>
-    /** The ledger this half's evidence was established in, or null where it was reckoned against none. */
-    connector: 'xero' | 'quickbooks' | null
+  const journalLines: Array<{ accountCode: string; description: string; debit?: number; credit?: number }> = []
+  if (reversalAmounts.unearnedReversal > 0) {
+    journalLines.push(
+      { accountCode: settings.unearnedRevenueAccount, description: `Unearned revenue reversal: ${params.orderRef}`, debit: reversalAmounts.unearnedReversal },
+      { accountCode: settings.salesAccount, description: `Unearned revenue reversal: ${params.orderRef}`, credit: reversalAmounts.unearnedReversal },
+    )
   }
-  const unearnedHalf: ReversalHalf | null = reversalAmounts.unearnedReversal > 0
-    ? {
-        lines: [
-          { accountCode: settings.unearnedRevenueAccount, description: `Unearned revenue reversal: ${params.orderRef}`, debit: reversalAmounts.unearnedReversal },
-          { accountCode: settings.salesAccount, description: `Unearned revenue reversal: ${params.orderRef}`, credit: reversalAmounts.unearnedReversal },
-        ],
-        connector: reversalAmounts.unearnedProvedOnConnector,
-      }
-    : null
-  const allocationHalf: ReversalHalf | null = reversalAmounts.allocationReversal > 0
-    ? {
-        lines: [
-          { accountCode: settings.inventoryAccount, description: `Allocation reversal: ${params.orderRef}`, debit: reversalAmounts.allocationReversal },
-          { accountCode: settings.allocatedInventoryAccount, description: `Allocation reversal: ${params.orderRef}`, credit: reversalAmounts.allocationReversal },
-        ],
-        connector: reversalAmounts.allocationProvedOnConnector,
-      }
-    : null
+  if (reversalAmounts.allocationReversal > 0) {
+    journalLines.push(
+      { accountCode: settings.inventoryAccount, description: `Allocation reversal: ${params.orderRef}`, debit: reversalAmounts.allocationReversal },
+      { accountCode: settings.allocatedInventoryAccount, description: `Allocation reversal: ${params.orderRef}`, credit: reversalAmounts.allocationReversal },
+    )
+  }
 
-  // ONE JOURNAL WHEN THE LEDGERS AGREE. Two halves reckoned against the same books are one posting,
-  // and splitting them anyway would double the rows every refund writes for no gain. `null` on a
-  // half means "reckoned against no particular ledger", which agrees with anything — an
-  // unearned-only reversal on a pre-reference order still goes out exactly as it did.
-  const sameLedger = !unearnedHalf || !allocationHalf
-    || unearnedHalf.connector === allocationHalf.connector
-    || unearnedHalf.connector === null || allocationHalf.connector === null
-  const groups: Array<{ suffix: string; unearned: ReversalHalf | null; allocation: ReversalHalf | null }> = sameLedger
-    ? [{ suffix: 'unearned-reversal', unearned: unearnedHalf, allocation: allocationHalf }]
-    : [
-        // The UNEARNED half keeps the historic idempotency key, because that is the key every
-        // existing row, retry and reader of this refund already carries; the allocation half, which
-        // is the one being separated OUT, takes the new one.
-        { suffix: 'unearned-reversal', unearned: unearnedHalf, allocation: null },
-        { suffix: 'allocation-reversal', unearned: null, allocation: allocationHalf },
-      ]
-
-  for (const group of groups) {
-    const halves = [group.unearned, group.allocation].filter((entry): entry is ReversalHalf => !!entry)
-    const journalLines = halves.flatMap((half) => half.lines)
-    if (journalLines.length === 0) continue
-    // o3d-o97: the label follows the LINES, so an allocation-only journal is not described as a
-    // debit to the unearned account it does not contain. It is reached when a full refund un-stages
-    // A2 on an order whose deferral is already fully recognised but whose allocation pin is not
-    // fully relieved — allocate 3, ship and journal 2, refund in full.
-    const hasUnearnedReversal = !!group.unearned
-    const hasInventoryReversal = !!group.allocation
+  if (journalLines.length > 0) {
+    // o3d-o97: this journal now has an ALLOCATION-ONLY shape. It is reached when a full refund
+    // un-stages A2 on an order whose deferral is already fully recognised (remainingUnearned 0)
+    // but whose allocation pin is not fully relieved — allocate 3, ship and journal 2, refund in
+    // full. Naming it "Unearned revenue + allocation reversal" would describe a debit to the
+    // unearned account that this journal does not contain, so the label follows the lines.
+    const hasInventoryReversal = reversalAmounts.allocationReversal > 0
+    const hasUnearnedReversal = reversalAmounts.unearnedReversal > 0
     const subject = hasUnearnedReversal && hasInventoryReversal
       ? 'Unearned revenue + allocation reversal'
       : hasUnearnedReversal
         ? 'Unearned revenue reversal'
         : 'Allocation reversal'
-    // THE PIN IS THE LEDGER EVERY HALF IN THIS JOURNAL WAS ESTABLISHED IN. With one half it is that
-    // half's; with both it is the value they agree on, and a half reckoned against no ledger never
-    // contributes one — an unearned-only reversal on an order with no establishable A1 ledger is
-    // withheld upstream, so a `null` here is only ever the allocation half's "nothing was proved".
-    const connector = halves.reduce<'xero' | 'quickbooks' | null>(
-      (pinned, half) => pinned ?? half.connector,
-      null,
-    )
     accountingSyncs.push({
       type: 'UNEARNED_REV_REVERSAL',
       referenceType: 'SalesOrderRefund',
       referenceId: params.refundId,
-      idempotencyKey: `sales-order-refund:${params.refundId}:${group.suffix}`,
-      // o3d-i0o6 r3 (Codex HIGH 1) — PINNED TO THE LEDGER THE EVIDENCE WAS ESTABLISHED ON.
+      idempotencyKey: `sales-order-refund:${params.refundId}:unearned-reversal`,
+      // o3d-i0o6 r3 (Codex HIGH 1) — PINNED TO THE LEDGER THE ALLOCATION DEBIT WAS PROVED ON.
       //
-      // Where this journal credits Allocated Inventory, the pounds it takes back were proved to be
-      // standing on one connector and nowhere else, and the account codes on those lines came from
-      // THAT connector's settings — so queueing it against whatever is active at hand-off time
-      // credits a ledger the debit was never in. Where it debits Unearned Revenue, the same is true
-      // of the A1 batch that raised the liability (r5). Pinned, the enqueue answers for that
-      // connector: if it is no longer the one posting this type, nothing is written and the
-      // obligation ledger leaves `accountingRetryRequired` standing for a human, which is the
-      // outcome a reversal that cannot post where it proved actually wants.
+      // This one journal carries BOTH reversals, and only one of them has a proof behind it. Where
+      // it credits Allocated Inventory, the pounds it is taking back were proved to be standing on
+      // `allocationProvedOnConnector` and nowhere else, and the account codes on those lines came
+      // from that connector's settings — so queueing it against whatever is active at hand-off time
+      // credits a ledger the debit was never in. Pinned, the enqueue answers for THAT connector: if
+      // it is no longer the one posting this type, nothing is written and the obligation ledger
+      // leaves `accountingRetryRequired` standing for a human, which is the outcome a refund that
+      // cannot post where it proved actually wants.
       //
-      // Unpinned only where NOTHING in the journal was reckoned against a particular ledger.
-      ...(connector ? { connector } : {}),
+      // Unpinned when no allocation credit is in the journal: an unearned-revenue-only reversal was
+      // reckoned against no particular ledger, and pinning it to a connector this proof happens to
+      // name would refuse postings that have nothing to do with the allocation contra.
+      //
+      // o3d-i0o6 r6 — AND THE PIN SAYS NOTHING ABOUT THE GROUP A1 HALF BESIDE IT, WHICH IS WHY IT
+      // IS SAFE TO CARRY IT.
+      //
+      // Round 4 read this as an assumption about the unearned-revenue lines: A1 defers when the
+      // order is PAID and A2 reclassifies when it is ALLOCATED, so a connector switch between the
+      // two would make one pin speak for two provenances, and the A1 debit would land in books that
+      // never credited the liability. r5 answered that by establishing A1's ledger independently.
+      // It is withdrawn, because the premise is false:
+      //
+      //   `proveAllocationDebitPosting` REFUSES any pass or journal whose connector is not
+      //   `target.activeConnector`, and returns `provedOnConnector: target.activeConnector` — the
+      //   target, never a re-read of A2's own record. So `allocationProvedOnConnector` is either
+      //   the connector this refund is being staged against or null. It can never be a historical
+      //   ledger, and a pin to the active connector routes the A1 lines to exactly the connector an
+      //   UNPINNED enqueue would resolve for them.
+      //
+      // The pin therefore cannot move the A1 half anywhere; the only behaviour it can add to that
+      // half is to WITHHOLD it when the active connector changes between this staging and the
+      // hand-off, and a reversal that is withheld with `accountingRetryRequired` standing is the
+      // fail-closed direction. Which ledger actually holds an A1 liability raised before a switch
+      // is a real and separate defect — it is answered the same wrong way with or without this pin,
+      // and on `development` too — and it is tracked as its own issue rather than carried here.
+      // See the invariant test `proveAllocationDebitPosting` never pins a historical ledger.
+      ...(reversalAmounts.allocationReversal > 0 && reversalAmounts.allocationProvedOnConnector
+        ? { connector: reversalAmounts.allocationProvedOnConnector }
+        : {}),
       payload: {
         date: new Date().toISOString().slice(0, 10),
         reference: hasUnearnedReversal

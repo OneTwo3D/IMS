@@ -57,6 +57,7 @@ import { buildCogsReconciliationSweepJournal, loadCogsGlReconciliation } from '@
 import { buildTransitReconciliationSweepJournal, loadTransitGlReconciliation } from '@/lib/domain/accounting/transit-gl-reconciliation'
 import {
   allocationDebitRecreateRefusal,
+  allocationDebitForeignLedgerReports,
   buildAllocationDebitOrderUpdate,
   foldA2RecreateOrder,
   newA2RecreateSummary,
@@ -71,9 +72,11 @@ import { cancelledClaimIsResolved } from '@/lib/domain/accounting/unresolved-aba
 import {
   dailyBatchLiveRefs,
   foldDailyBatchRow,
+  LIVE_DAILY_BATCH_STATUSES,
   type DailyBatchLiveRefs,
   type DailyBatchRecreateBucket,
 } from '@/lib/domain/accounting/daily-batch-reference'
+import { resolveScheduledDailyBatchSweep } from '@/lib/domain/accounting/daily-batch-sweep-schedule'
 import { calculateCoverageByLine } from '@/lib/products/fulfillment-coverage'
 import { isFullyShippedTerminalStatus, recognizeShipmentRevenue } from '@/lib/domain/accounting/revenue-recognition'
 import {
@@ -593,7 +596,6 @@ export function takeDailyBatchWindow<T>(
 }
 
 /** In the outbox or in the ledger: a log in any of these states blocks a recreate outright. */
-const LIVE_DAILY_BATCH_STATUSES = ['PENDING', 'PROCESSING', 'SYNCED'] as const
 
 /**
  * o3d-o97 r6 — MAY THIS BATCH BE POSTED AGAIN? AND THE ANSWER IS NEVER A STATUS.
@@ -904,7 +906,42 @@ export async function recreateMissingDailyBatchLogs(settings: Awaited<ReturnType
     })
   }
 
+  // o3d-i0o6 r6 (Codex round 5, HIGH 1) — WHO, IF ANYONE, IS COMING FOR THE OTHER LEDGER'S POUNDS.
+  //
+  // r5 stopped this sweep rebuilding another connector's share of a shared batch reference, which
+  // was right, and then reported the share it had declined as a positive £0.00, which was not: the
+  // cron runs ONE sweep, so after a switch the other connector's sweep never runs and its missing
+  // journal has no reader left. Two reads settle it, and only for batches that actually have a
+  // foreign pass, so the ordinary run makes no extra query:
+  //
+  //   * is that pass's own journal still a live row? (BY ID, with no connector filter — the question
+  //     is about the OTHER ledger's row, and this sweep's own probes deliberately exclude it.)
+  //   * is that ledger's sweep the one the cron runs? — from the schedule the cron route itself reads.
+  const foreignPasses = [...a2Batches.values()].flatMap((bucket) => bucket.summary.foreign)
+  const liveForeignJournalIds = new Set<string>()
+  let scheduledSweepConnector: string | null = null
+  if (foreignPasses.length > 0) {
+    scheduledSweepConnector = (await resolveScheduledDailyBatchSweep()).connector
+    const foreignJournalIds = [...new Set(foreignPasses.map((pass) => pass.syncLogId).filter((id): id is string => !!id))]
+    if (foreignJournalIds.length > 0) {
+      const rows = await db.accountingSyncLog.findMany({
+        where: { id: { in: foreignJournalIds }, status: { in: [...LIVE_DAILY_BATCH_STATUSES] } },
+        select: { id: true },
+      })
+      for (const row of rows) liveForeignJournalIds.add(row.id)
+    }
+  }
+
   for (const { referenceId, date, summary, ...batch } of a2Batches.values()) {
+    // o3d-i0o6 r6: reported BEFORE every skip below, because none of them is about these pounds. A
+    // batch whose own log is live, or whose own share rounds to zero, can still carry a foreign pass
+    // nobody will ever raise — and those are exactly the runs that would otherwise `continue` past it.
+    refusals.push(...allocationDebitForeignLedgerReports({
+      referenceId,
+      foreign: summary.foreign,
+      journalIsLive: (syncLogId) => syncLogId != null && liveForeignJournalIds.has(syncLogId),
+      scheduledSweepConnector,
+    }))
     // ROUNDED, like the live writer's own `totalAllocatedValueNumber > 0` guard: a batch whose total
     // rounds to £0.00 raised no journal when it ran and must raise none now (o3d-i0o6 r4). The
     // unattributed arm is still reached at zero, because a batch nothing can value is not a batch

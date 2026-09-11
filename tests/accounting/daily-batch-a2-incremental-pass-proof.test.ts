@@ -561,3 +561,40 @@ test('o3d-i0o6 r4: a journal row that names NO ledger is refused, not read as a 
   assert.equal(proof.kind, 'refused')
   assert.match(proof.reason, /names no ledger/)
 })
+
+/**
+ * o3d-i0o6 r6 — A `posted` VERDICT NEVER NAMES A LEDGER OTHER THAN THE ONE IT WAS ASKED ABOUT.
+ *
+ * This is the invariant the refund's connector pin rests on, and the reason the Group A1 ledger proof
+ * r5 built could be withdrawn (o3d-vr9j). Codex round 4 read the pin as an assumption about the A1
+ * half sharing the journal: a switch between A1's deferral and A2's reclassification would let one
+ * pin speak for two provenances and post the unearned-revenue debit into books that never credited
+ * the liability.
+ *
+ * It cannot, because `provedOnConnector` is the TARGET and every cross-ledger arm above it refuses:
+ * the pin is either the connector the refund is being staged against — where an unpinned enqueue
+ * would have sent the A1 lines anyway — or there is no pin. Asserted from BOTH sides of the same
+ * two-pass evidence, so a refusal that stopped refusing would show up here as a pin naming books
+ * this proof was never made on.
+ */
+test('o3d-i0o6 r6: a proved A2 debit is only ever proved on the connector it was ASKED about', async () => {
+  await twoPassIncrement()
+  for (const log of state.syncLogs) log.status = 'SYNCED'
+  assert.deepEqual(
+    [...new Set(state.syncLogs.map((log) => log.connector))],
+    ['xero'],
+    'precondition: this evidence was written by the XERO writer, on Xero journals',
+  )
+
+  const onXero = await prove('order-1', 'xero')
+  assert.equal(onXero.kind, 'posted', 'asked about the ledger it was posted in, it proves')
+  assert.equal(onXero.kind === 'posted' && onXero.provedOnConnector, 'xero', 'and names that ledger — never another')
+
+  // The books are switched. The SAME evidence is now evidence about somebody else's ledger, and the
+  // one thing it must not do is come back `posted` naming Xero: that verdict would pin a QuickBooks
+  // refund's journal — unearned-revenue lines and all — to books it is no longer posting to.
+  const onQuickBooks = await prove('order-1', 'quickbooks')
+  assert.notEqual(onQuickBooks.kind, 'posted', 'asked about a ledger it was NOT posted in, it proves nothing')
+  assert.equal(onQuickBooks.kind, 'refused')
+  assert.match(onQuickBooks.reason, /xero/, 'and says which ledger actually holds the pounds')
+})

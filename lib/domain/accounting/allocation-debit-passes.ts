@@ -216,10 +216,28 @@ function serializePass(pass: AllocationDebitPass): SerializedAllocationDebitPass
  * same reason, so one row cannot be unprovable to one path and self-evident to the other.
  */
 export type AllocationDebitBatchShare =
-  /** The pounds this order's recorded passes attribute to the batch it is stamped with. */
-  | { kind: 'known'; amount: number }
+  /**
+   * The pounds this order's recorded passes attribute to the batch it is stamped with, ON THE LEDGER
+   * ASKING. `foreign` is the rest: passes of the SAME batch that debited ANOTHER ledger, carried out
+   * rather than discarded, because whether those pounds are safe to ignore is a question about the
+   * cron's schedule that this pure function cannot answer (o3d-i0o6 r6).
+   */
+  | { kind: 'known'; amount: number; foreign: readonly AllocationDebitForeignPass[] }
   /** The history cannot divide this order's cumulative debit between batches. `reason` names it. */
   | { kind: 'unattributed'; reason: string }
+
+/** One order's A2 pass into this batch that debited a DIFFERENT ledger from the one rebuilding it. */
+export type AllocationDebitForeignPass = {
+  /** The order, for the report only — never part of a decision. */
+  order: string
+  /** The ledger those pounds were actually debited in. Never the sweep's own. */
+  connector: string
+  /** The Allocated Inventory account they were debited to THERE. */
+  accountCode: string
+  amount: number
+  /** The journal that pass named, or null where it raised none. */
+  syncLogId: string | null
+}
 
 export type AllocationDebitBatchRow = {
   /** Prisma Decimal | number | null. CUMULATIVE across every A2 pass this order has been through. */
@@ -284,7 +302,7 @@ export function allocationDebitShareOfBatch(
   // NO RECORDED DEBIT, NO SHARE — and no refusal either. A2 nulls this column on the paths that
   // withdraw an unposted staging, so "nothing recorded" is a POSITIVE answer of zero, not an
   // absence that has to be resolved by a human.
-  if (recorded <= 0) return { kind: 'known', amount: 0 }
+  if (recorded <= 0) return { kind: 'known', amount: 0, foreign: [] }
   const passes = parseAllocationDebitPasses(order.allocationBatchPasses)
   if (!passes) {
     return {
@@ -326,13 +344,57 @@ export function allocationDebitShareOfBatch(
       reason: `${describeBatchRow(order)} recorded its A2 debit for this batch against account ${otherAccount.accountCode} on ${ledger.connector}, but Allocated Inventory is configured as ${ledger.accountCode} today, so what this batch owes that account cannot be established`,
     }
   }
-  // A PASS ON ANOTHER LEDGER IS A POSITIVE ANSWER OF ZERO, NOT A REFUSAL. The pounds are in the
-  // other connector's books, its own sweep can see its own log, and this one has nothing to rebuild
-  // — so the honest share here is £0.00 and the batch is skipped in silence. Refusing instead would
-  // report every pre-switch batch in the retention window, every day, as a problem that is not one.
+  // A PASS THAT NAMES NO LEDGER IS NOT SOMEBODY ELSE'S — IT IS NOBODY'S (o3d-i0o6 r6).
+  // `passIsOfLedger` is an equality on two NULLABLE fields, so a contributing pass with a null
+  // connector or a null account fell out of the filter below and was subtracted from this batch in
+  // silence — the same silent-zero this round is here to remove, one field along.
+  //
+  // TODAY'S A2 WRITER CANNOT REACH THIS. `buildAllocationDebitOrderUpdate` nulls the connector and
+  // the account exactly when the pass raised NO journal, and a window raises no journal only when
+  // its ROUNDED total is not positive — while every order's share of that window is non-negative, so
+  // each of them is bounded by the same zero and falls under the half-penny threshold. It is written
+  // as a refusal anyway, for the same reason the posting proof spells out its own null-connector
+  // arm: "nobody writes null" is a fact about today's writers, and this is a money decision. It is
+  // the answer `proveAllocationDebitPosting` already gives such a pass on the credit side.
+  const unnamed = named.find((pass) => (
+    Math.abs(pass.amount) > 0.005 && (!pass.connector || !pass.accountCode)
+  ))
+  if (unnamed) {
+    return {
+      kind: 'unattributed',
+      reason: `${describeBatchRow(order)} recorded £${unnamed.amount.toFixed(2)} of its A2 debit for this batch naming ${unnamed.connector ? `no account (on ${unnamed.connector})` : 'no ledger'}, so whether those pounds are this rebuild's to raise cannot be established`,
+    }
+  }
+  // A PASS ON ANOTHER LEDGER IS NOT THIS SWEEP'S TO REBUILD — AND IS NOT AUTOMATICALLY SOMEBODY
+  // ELSE'S EITHER (o3d-i0o6 r6, Codex round 5 HIGH 1).
+  //
+  // r5 made it a positive share of £0.00 and said nothing, arguing that the other connector's own
+  // sweep can see its own log and will rebuild it. The daily-batch cron runs exactly ONE sweep — the
+  // first enabled plugin's — so after a switch that sweep never runs, and the pounds were abandoned
+  // in silence with this function's own verdict saying they were accounted for. Silent abandonment
+  // of money is worse than a refusal repeated daily.
+  //
+  // The share stays £0.00, because rebuilding another ledger's pounds into these accounts is the
+  // duplicate-debit defect this ledger filter exists for. What changes is that the pass is HANDED
+  // BACK instead of dropped, so the caller — which can see whether that ledger's journal is still
+  // standing and whether its sweep is the one the cron runs — can report the ones nobody is coming
+  // for. Anything this function decided on its own would be a scheduling rule written by a pure
+  // function with no way to read the schedule.
+  const foreign = named
+    .filter((pass) => !passIsOfLedger(pass, ledger) && Math.abs(pass.amount) > 0.005)
+    .map((pass) => ({
+      order: describeBatchRow(order),
+      // Non-null by the `unnamed` refusal above, and not `!`-asserted: a cast that survives a later
+      // edit to that refusal would put `undefined` into a report about money.
+      connector: pass.connector ?? '',
+      accountCode: pass.accountCode ?? '',
+      amount: pass.amount,
+      syncLogId: pass.syncLogId,
+    }))
   return {
     kind: 'known',
     amount: sumAllocationDebitPasses(named.filter((pass) => passIsOfLedger(pass, ledger))),
+    foreign,
   }
 }
 
@@ -422,11 +484,18 @@ export type A2RecreateSummary = {
   total: number
   unattributed: string[]
   orders: Array<{ id: string; batchRef: string; allocationBatchPasses: unknown }>
+  /**
+   * o3d-i0o6 r6: the passes of this batch that debited ANOTHER ledger. Not part of `total` — this
+   * sweep may not raise them — and not part of `unattributed` either, because "not mine" is not
+   * "unknowable". They are carried so the caller can ask the one question that decides whether they
+   * are abandoned: is their own ledger's journal still standing, and is its sweep the one that runs?
+   */
+  foreign: AllocationDebitForeignPass[]
 }
 
 /** A fresh, empty A2 recreate bucket. One spelling, so the two sweeps cannot seed different shapes. */
 export function newA2RecreateSummary(): A2RecreateSummary {
-  return { orderCount: 0, total: 0, unattributed: [], orders: [] }
+  return { orderCount: 0, total: 0, unattributed: [], orders: [], foreign: [] }
 }
 
 /**
@@ -448,6 +517,7 @@ export function foldA2RecreateOrder(
     return
   }
   summary.total += share.amount
+  summary.foreign.push(...share.foreign)
   if (order.inventoryAllocatedBatchRef) {
     summary.orders.push({
       id: order.id,
@@ -463,6 +533,61 @@ export function foldA2RecreateOrder(
  * Two spellings of one refusal is how the two sweeps drift apart, and this one has to say the same
  * thing on both because the defect it refuses is the same on both.
  */
+/**
+ * o3d-i0o6 r6 (Codex round 5, HIGH 1) — THE POUNDS NO SWEEP WILL EVER RAISE, REPORTED.
+ *
+ * A rebuild may only raise its OWN ledger's share of a batch. That leaves the other ledger's share,
+ * and r5 treated it as settled by somebody else's sweep. The daily-batch cron runs ONE sweep, so
+ * "somebody else's sweep" is often nobody at all, and the pounds were dropped in silence.
+ *
+ * Three states, and only one of them is loud:
+ *
+ *   the other ledger's journal is LIVE      nothing is missing there; silent, and the common case
+ *                                           after a switch — every pre-switch batch in the retention
+ *                                           window is in exactly this state, which is why an
+ *                                           unconditional report would be pure noise.
+ *   it is missing, but that ledger's sweep   it will be rebuilt on that ledger's next tick; silent.
+ *     is the one the cron runs
+ *   it is missing and nothing runs it        nobody is coming. REPORTED, every run, until a human
+ *                                           posts it or re-enables that sweep.
+ *
+ * Both sweeps call this, because the answer must not depend on which one happens to be running.
+ */
+export function allocationDebitForeignLedgerReports(input: {
+  /** The batch being rebuilt, for the report. */
+  referenceId: string
+  foreign: readonly AllocationDebitForeignPass[]
+  /** Whether the journal a foreign pass named is still a live row in its OWN ledger. */
+  journalIsLive: (syncLogId: string | null) => boolean
+  /** The connector whose daily-batch sweep the cron runs, or null when none runs at all. */
+  scheduledSweepConnector: string | null
+}): string[] {
+  const abandoned = input.foreign.filter((pass) => (
+    !input.journalIsLive(pass.syncLogId) && pass.connector !== input.scheduledSweepConnector
+  ))
+  if (abandoned.length === 0) return []
+  const byConnector = new Map<string, AllocationDebitForeignPass[]>()
+  for (const pass of abandoned) {
+    const entries = byConnector.get(pass.connector)
+    if (entries) entries.push(pass)
+    else byConnector.set(pass.connector, [pass])
+  }
+  return [...byConnector].map(([connector, entries]) => {
+    const total = entries.reduce((sum, entry) => sum + entry.amount, 0)
+    const detail = entries
+      .map((entry) => `${entry.order} £${entry.amount.toFixed(2)}${entry.syncLogId ? ` under journal ${entry.syncLogId}` : ', which raised no journal at all'} (account ${entry.accountCode})`)
+      .join('; ')
+    return (
+      `Daily batch DAILY_BATCH_INVENTORY_ALLOC not recreated in full: ${input.referenceId} — £${total.toFixed(2)} of it `
+      + `was debited to Allocated Inventory on ${connector}, and that journal is NOT on record: ${detail}. `
+      + 'This sweep must not rebuild another ledger\'s pounds into its own accounts — that is a duplicate '
+      + `debit no refund could ever reverse — and ${input.scheduledSweepConnector ? `the daily batch runs ${input.scheduledSweepConnector}'s sweep, not ${connector}'s` : 'no daily-batch sweep is scheduled at all'}, `
+      + `so nothing will ever raise it. Post it in ${connector} by hand from the orders' own pass history, `
+      + `or re-enable ${connector}'s daily batch long enough for its own sweep to rebuild it.`
+    )
+  })
+}
+
 export function allocationDebitRecreateRefusal(referenceId: string, reasons: readonly string[]): string {
   return (
     `Daily batch DAILY_BATCH_INVENTORY_ALLOC not recreated: ${referenceId} — ${reasons.join('; ')}. `

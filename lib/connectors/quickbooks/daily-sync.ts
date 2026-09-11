@@ -50,9 +50,11 @@ import { recreateJournaledDateFilter } from '@/lib/domain/accounting/daily-batch
 import {
   dailyBatchLiveRefs,
   foldDailyBatchRow,
+  LIVE_DAILY_BATCH_STATUSES,
   type DailyBatchLiveRefs,
   type DailyBatchRecreateBucket,
 } from '@/lib/domain/accounting/daily-batch-reference'
+import { resolveScheduledDailyBatchSweep } from '@/lib/domain/accounting/daily-batch-sweep-schedule'
 import { expandFulfillmentRequirementsDecimal, loadFulfillmentProductGraph } from '@/lib/products/kit-fulfillment'
 
 type MutableLayer = {
@@ -74,6 +76,7 @@ type AccountingMirrorClient = Pick<Prisma.TransactionClient, 'accountingSyncLog'
 import { QBO_DAILY_BATCH_LOCK_KEY } from '@/lib/db/advisory-locks'
 import { acquirePinnedAdvisoryLockOrNull } from '@/lib/db/pinned-advisory-lock'
 import {
+  allocationDebitForeignLedgerReports,
   allocationDebitRecreateRefusal,
   buildAllocationDebitOrderUpdate,
   foldA2RecreateOrder,
@@ -319,7 +322,9 @@ async function hasLiveDailyBatchLog(type: DailyBatchLogType, refs: DailyBatchLiv
       connector: QBO_CONNECTOR,
       type,
       referenceId: { in: referenceIds },
-      status: { in: ['PENDING', 'PROCESSING', 'SYNCED'] },
+      // o3d-i0o6 r6: the SHARED list, so this probe and the foreign-ledger probe below cannot
+      // disagree about what "still a journal" means.
+      status: { in: [...LIVE_DAILY_BATCH_STATUSES] },
     },
   })
   return count > 0
@@ -449,7 +454,32 @@ export async function recreateMissingDailyBatchLogs(settings: Awaited<ReturnType
     })
   }
 
+  // o3d-i0o6 r6 (Codex round 5, HIGH 1) — WHO, IF ANYONE, IS COMING FOR THE OTHER LEDGER'S POUNDS.
+  // Identical to the Xero twin because it IS the same question: the cron runs ONE sweep, so another
+  // ledger's missing A2 journal is only somebody else's problem while that somebody actually runs.
+  const foreignPasses = [...a2Batches.values()].flatMap((bucket) => bucket.summary.foreign)
+  const liveForeignJournalIds = new Set<string>()
+  let scheduledSweepConnector: string | null = null
+  if (foreignPasses.length > 0) {
+    scheduledSweepConnector = (await resolveScheduledDailyBatchSweep()).connector
+    const foreignJournalIds = [...new Set(foreignPasses.map((pass) => pass.syncLogId).filter((id): id is string => !!id))]
+    if (foreignJournalIds.length > 0) {
+      const rows = await db.accountingSyncLog.findMany({
+        where: { id: { in: foreignJournalIds }, status: { in: [...LIVE_DAILY_BATCH_STATUSES] } },
+        select: { id: true },
+      })
+      for (const row of rows) liveForeignJournalIds.add(row.id)
+    }
+  }
+
   for (const { referenceId, date, summary, ...batch } of a2Batches.values()) {
+    // o3d-i0o6 r6: reported BEFORE every skip below — none of them is about these pounds.
+    refusals.push(...allocationDebitForeignLedgerReports({
+      referenceId,
+      foreign: summary.foreign,
+      journalIsLive: (syncLogId) => syncLogId != null && liveForeignJournalIds.has(syncLogId),
+      scheduledSweepConnector,
+    }))
     // ROUNDED, like the live writer's own guard: a batch whose total rounds to £0.00 raised no
     // journal when it ran and must raise none now. The unattributed arm is still reached at zero —
     // a batch nothing can value is not a batch known to be worth nothing (o3d-i0o6 r4).

@@ -72,6 +72,13 @@ const state = {
   unitCostByProduct: {} as Record<string, number>,
   /** The connector whose writer is under test, so the created logs carry the right stamp. */
   connector: 'xero' as 'xero' | 'quickbooks',
+  /**
+   * o3d-i0o6 r6: the rows `resolveScheduledDailyBatchSweep` reads — the SAME two the cron route
+   * reads — so "whose sweep does the cron actually run?" is answered here by the real resolver
+   * rather than by a boolean the test hands the sweep.
+   */
+  settings: {} as Record<string, string>,
+  enabledPlugins: [] as Array<'xero' | 'quickbooks'>,
 }
 
 function newOrder(id: string): OrderRow {
@@ -101,6 +108,8 @@ function reset(connector: 'xero' | 'quickbooks'): void {
   state.syncLogs = []
   state.unitCostByProduct = {}
   state.connector = connector
+  state.settings = {}
+  state.enabledPlugins = []
 }
 
 /** The Group A2 window: deferred, not yet stamped. */
@@ -276,7 +285,9 @@ function matchesLog(row: SyncLog, where: LogWhere): boolean {
 mock.module('@/lib/db', {
   namedExports: {
     db: {
-      setting: { findUnique: async () => null },
+      setting: { findUnique: async ({ where }: { where: { key: string } }) => (
+        state.settings[where.key] != null ? { key: where.key, value: state.settings[where.key] } : null
+      ) },
       accountingToken: { findUnique: async () => ({ tenantId: 'tenant-A' }) },
       salesOrder: {
         findMany: async ({ where }: { where: OuterOrderWhere }) => {
@@ -346,15 +357,33 @@ mock.module('@/lib/db/pinned-advisory-lock', {
   },
 })
 
+/**
+ * o3d-i0o6 r6 — TWO CHARTS OF ACCOUNTS, BECAUSE THAT IS THE POINT.
+ *
+ * This file runs BOTH A2 writers and BOTH recreate sweeps over the same orders, and the rule under
+ * test — `passIsOfLedger` — is an equality on the pass's connector AND its account code. Giving both
+ * connectors the SAME codes makes the account arm a tautology across the whole file and leaves the
+ * connector arm carrying the cross-ledger tests alone, so "the QuickBooks sweep used Xero's Allocated
+ * Inventory account" would be indistinguishable from "…used its own".
+ *
+ * That is the shape of the masking fixture found twice already on this branch (the reused sync-log id,
+ * and the split test that gave two connectors one account map). `allocation-service.test.ts` already
+ * keeps two charts for the same reason; so does this now.
+ */
+const CHART = {
+  xero: { sales: '200', unearned: '830', inventory: '630', allocated: '631', moved: '632', cogs: '310' },
+  quickbooks: { sales: '400', unearned: '930', inventory: '730', allocated: '731', moved: '732', cogs: '510' },
+} as const
+
 mock.module('@/lib/connectors/xero/settings', {
   namedExports: {
     getXeroSettings: async () => ({
       xero_sync_enabled: 'true',
-      xero_sales_account: '200',
-      xero_unearned_revenue_account: '830',
-      xero_inventory_account: '630',
-      xero_allocated_inventory_account: '631',
-      xero_cogs_account: '310',
+      xero_sales_account: CHART.xero.sales,
+      xero_unearned_revenue_account: CHART.xero.unearned,
+      xero_inventory_account: CHART.xero.inventory,
+      xero_allocated_inventory_account: CHART.xero.allocated,
+      xero_cogs_account: CHART.xero.cogs,
       xero_rounding_difference_account: '',
       xero_transit_account: '',
     }),
@@ -364,15 +393,20 @@ mock.module('@/lib/connectors/quickbooks/settings', {
   namedExports: {
     getQuickBooksSettings: async () => ({
       quickbooks_sync_enabled: 'true',
-      quickbooks_sales_account: '200',
-      quickbooks_unearned_revenue_account: '830',
-      quickbooks_inventory_account: '630',
-      quickbooks_allocated_inventory_account: '631',
-      quickbooks_cogs_account: '310',
+      quickbooks_sales_account: CHART.quickbooks.sales,
+      quickbooks_unearned_revenue_account: CHART.quickbooks.unearned,
+      quickbooks_inventory_account: CHART.quickbooks.inventory,
+      quickbooks_allocated_inventory_account: CHART.quickbooks.allocated,
+      quickbooks_cogs_account: CHART.quickbooks.cogs,
     }),
   },
 })
 
+mock.module('@/lib/integration-plugins', {
+  namedExports: {
+    isIntegrationPluginEnabled: async (id: 'xero' | 'quickbooks') => state.enabledPlugins.includes(id),
+  },
+})
 mock.module('@/lib/base-currency', { namedExports: { getBaseCurrencyCode: async () => 'GBP' } })
 mock.module('@/lib/activity-log', { namedExports: { logActivity: async () => undefined } })
 mock.module('@/lib/domain/accounting/accounting-event-mirror', {
@@ -553,7 +587,7 @@ for (const connector of ['xero', 'quickbooks'] as const) {
     assert.equal(state.syncLogs[0].referenceId, dayOneRef)
     assert.notEqual(state.syncLogs[0].id, lostLogId, 'and the rebuild is a NEW row, not the one that vanished')
     const debit = (state.syncLogs[0].payload as { lines: Array<{ accountCode?: string; debit?: number }> })
-      .lines.find((line) => line.accountCode === '631' && line.debit != null)
+      .lines.find((line) => line.accountCode === CHART[connector].allocated && line.debit != null)
     assert.equal(debit?.debit, 50, 'for the £50 THAT batch carried, which here is all of the figure')
 
     // o3d-i0o6 r5: the DAY-ONE pass is re-pointed at the rebuilt journal, and the three latest-pass
@@ -587,14 +621,17 @@ for (const connector of ['xero', 'quickbooks'] as const) {
       inventoryAllocatedBatchRef: dayOneRef,
     }
 
-    const sameAccount = allocationDebitShareOfBatch(order, { connector, accountCode: '631' })
-    assert.deepEqual(sameAccount, { kind: 'known', amount: 50 }, 'the control: today\'s account still answers £50')
+    const sameAccount = allocationDebitShareOfBatch(order, { connector, accountCode: CHART[connector].allocated })
+    // o3d-i0o6 r6: `foreign` is part of the verdict now — the passes of this batch that debited
+    // ANOTHER ledger, carried out so the caller can report the ones nobody will rebuild. Empty here,
+    // which is the assertion that matters: a same-ledger control must produce no foreign share at all.
+    assert.deepEqual(sameAccount, { kind: 'known', amount: 50, foreign: [] }, 'the control: today\'s account still answers £50')
 
-    const movedAccount = allocationDebitShareOfBatch(order, { connector, accountCode: '632' })
+    const movedAccount = allocationDebitShareOfBatch(order, { connector, accountCode: CHART[connector].moved })
     assert.equal(movedAccount.kind, 'unattributed', 'a re-mapped account is not a share of zero')
     assert.match(
       movedAccount.kind === 'unattributed' ? movedAccount.reason : '',
-      /recorded its A2 debit for this batch against account 631 on .* configured as 632 today/,
+      new RegExp(`recorded its A2 debit for this batch against account ${CHART[connector].allocated} on ${connector}, but Allocated Inventory is configured as ${CHART[connector].moved} today`),
     )
   })
 }
@@ -606,6 +643,18 @@ for (const connector of ['xero', 'quickbooks'] as const) {
 /** Switch the writer/ledger under test WITHOUT discarding what the previous connector wrote. */
 function switchConnector(connector: 'xero' | 'quickbooks'): void {
   state.connector = connector
+}
+
+/**
+ * o3d-i0o6 r6: arrange the rows that decide WHOSE daily-batch sweep the cron runs, and let the real
+ * `resolveScheduledDailyBatchSweep` read them — the same function the cron route itself now calls.
+ * `null` is "no accounting plugin enabled", i.e. no sweep runs at all.
+ */
+function scheduleDailyBatchOn(connector: 'xero' | 'quickbooks' | null): void {
+  state.enabledPlugins = connector ? [connector] : []
+  state.settings = connector
+    ? { [`${connector}_daily_batch_enabled`]: 'true', [`${connector}_sync_enabled`]: 'true' }
+    : {}
 }
 
 /**
@@ -673,6 +722,11 @@ test('o3d-i0o6 r5: XERO\'s sweep does NOT rebuild a QuickBooks-attributed batch 
   // duplicate debit in books that never carried it, and one no refund could ever reverse, because
   // the pass history still proves only the QuickBooks journal.
   switchConnector('xero')
+  // o3d-i0o6 r6: and the cron runs XERO's sweep, so the "somebody else's sweep will do it" arm is
+  // NOT what keeps this quiet — QuickBooks' sweep is not scheduled. What keeps it quiet is that the
+  // QuickBooks journal is still standing, asserted below. Without this line the test would pass
+  // whichever of the two reasons held.
+  scheduleDailyBatchOn('xero')
   // NOT VACUOUS: the premise is that Xero's own probe sees no live log under this reference, so the
   // sweep really does reach the rebuild decision. If a live Xero log existed the assertions below
   // would pass for the wrong reason.
@@ -680,6 +734,11 @@ test('o3d-i0o6 r5: XERO\'s sweep does NOT rebuild a QuickBooks-attributed batch 
     state.syncLogs.filter((log) => log.connector === 'xero' && log.referenceId === dayTwoRef),
     [],
     'the batch really is invisible to Xero — which is what makes it look missing',
+  )
+  assert.deepEqual(
+    state.syncLogs.filter((log) => log.referenceId === dayTwoRef && log.status === 'SYNCED').map((log) => log.connector),
+    ['quickbooks'],
+    'and the QuickBooks journal carrying those pounds IS still standing — the reason nothing is owed',
   )
   const refusals = await runRecreate()
 
@@ -689,7 +748,7 @@ test('o3d-i0o6 r5: XERO\'s sweep does NOT rebuild a QuickBooks-attributed batch 
     [],
     'and specifically no Xero journal under the QuickBooks batch reference',
   )
-  assert.deepEqual(refusals, [], 'nor is it reported — the batch is not missing, it is somebody else\'s')
+  assert.deepEqual(refusals, [], 'nor is it reported — the batch is not missing, it is somebody else\'s AND IT IS THERE')
 })
 
 test('o3d-i0o6 r5: and the CONTROL — QuickBooks still rebuilds its OWN share of that batch', async () => {
@@ -710,7 +769,9 @@ test('o3d-i0o6 r5: and the CONTROL — QuickBooks still rebuilds its OWN share o
   assert.equal(rebuilt.length, 1, 'the genuinely missing QuickBooks batch is rebuilt')
   assert.equal(rebuilt[0].connector, 'quickbooks')
   const debit = (rebuilt[0].payload as { lines: Array<{ accountCode?: string; debit?: number }> })
-    .lines.find((line) => line.accountCode === '631' && line.debit != null)
+    // QUICKBOOKS' OWN Allocated Inventory account, which is not Xero's: the rebuild must use the
+    // chart of the ledger it is posting into, and with one shared chart that could not be said.
+    .lines.find((line) => line.accountCode === CHART.quickbooks.allocated && line.debit != null)
   assert.equal(debit?.debit, Math.round(qboShare * 100) / 100, 'for ITS OWN share, not the cumulative debit')
 })
 
@@ -760,7 +821,7 @@ for (const connector of ['xero', 'quickbooks'] as const) {
     assert.equal(passes[0].syncLogId, rebuiltId, 'and the pass now names the journal that actually carries its pounds')
     assert.equal(state.orders[0].allocationBatchSyncLogId, rebuiltId, 'as does the latest-pass column beside it')
     assert.equal(state.orders[0].allocationBatchConnector, connector)
-    assert.equal(state.orders[0].allocationBatchAccountCode, '631')
+    assert.equal(state.orders[0].allocationBatchAccountCode, CHART[connector].allocated)
     assert.equal(passes[0].connector, connector, 'and the ledger it was rebuilt into')
 
     // THE POINT, IN MONEY. The rebuilt journal settles, and a reversal can now be raised against it.
@@ -778,7 +839,7 @@ for (const connector of ['xero', 'quickbooks'] as const) {
         allocationBatchConnector: state.orders[0].allocationBatchConnector,
         allocationBatchAccountCode: state.orders[0].allocationBatchAccountCode,
       },
-      { activeConnector: connector, allocatedInventoryAccount: '631' },
+      { activeConnector: connector, allocatedInventoryAccount: CHART[connector].allocated },
     )
     assert.equal(proof.kind, 'posted', `the recreated debit is reversible: ${JSON.stringify(proof)}`)
     assert.equal(proof.kind === 'posted' ? proof.recordedDebit : null, 50)
@@ -786,3 +847,69 @@ for (const connector of ['xero', 'quickbooks'] as const) {
     assert.equal(batchRef, state.orders[0].inventoryAllocatedBatchRef, 'and the stamp was left alone')
   })
 }
+
+// ---------------------------------------------------------------------------
+// o3d-i0o6 r6 (Codex round 5, HIGH 1) — "ITS OWN SWEEP WILL REBUILD IT" IS A CLAIM ABOUT THE CRON.
+//
+// r5 stopped one sweep rebuilding another ledger's share of a shared batch reference — correct — and
+// then reported the share it had declined as a positive £0.00 on the argument that the other
+// connector's own sweep can see its own log and will rebuild it. `app/api/cron/accounting-daily-batch`
+// runs ONE sweep, the first ENABLED plugin's, and RETURNS; the second plugin's sweep never runs. So
+// after a QuickBooks → Xero switch a missing QuickBooks A2 journal was converted to £0.00 with no
+// refusal, no reader and no sweep coming for it — the debit abandoned in silence, for ever, while
+// the order's pass history goes on naming a journal that does not exist. Silent abandonment of
+// money is worse than a refusal repeated daily.
+//
+// Three states, and the tests below are one each: the journal is live (quiet), its own sweep is the
+// scheduled one (quiet), neither (REPORTED).
+// ---------------------------------------------------------------------------
+
+test('o3d-i0o6 r6: a batch whose pounds are in a ledger NO scheduled sweep will rebuild is REPORTED, not zeroed', async () => {
+  const { dayTwoRef } = await xeroThenQuickBooksUnderTwoBatches()
+  const qboShare = Number((state.orders[0].allocationBatchPasses as Array<{ amount: string }>)[1].amount)
+  const qboJournalId = (state.orders[0].allocationBatchPasses as Array<{ syncLogId: string }>)[1].syncLogId
+
+  // The QuickBooks journal for this batch is GONE — it never reached the ledger, or retention took
+  // the row. These pounds are recorded against an order and stand in no journal anywhere.
+  state.syncLogs = state.syncLogs.filter((log) => log.referenceId !== dayTwoRef)
+  assert.deepEqual(state.syncLogs.filter((log) => log.id === qboJournalId), [], 'precondition: the journal the pass names is really gone')
+
+  // And the books are on Xero: the cron runs Xero's sweep and returns, so QuickBooks' sweep — r5's
+  // entire reason for staying silent — never runs at all.
+  scheduleDailyBatchOn('xero')
+  switchConnector('xero')
+  const before = state.syncLogs.length
+  const refusals = await runRecreate()
+
+  // NOT VACUOUS, AND THE ORDERING IS THE POINT. Xero's own share of this batch is £0.00 — no Xero
+  // pass names it — and nothing about it is unattributed, so the sweep's very first `continue`
+  // applies to it. A report emitted anywhere after that `continue` would be invisible in exactly the
+  // state this finding is about, which is why it is pushed before every skip in the loop.
+  assert.deepEqual(
+    (state.orders[0].allocationBatchPasses as Array<{ connector: string; batchRef: string }>)
+      .filter((pass) => pass.batchRef === dayTwoRef).map((pass) => pass.connector),
+    ['quickbooks'],
+    'the only pass naming this batch is the QuickBooks one, so Xero\'s own share of it is £0.00',
+  )
+  assert.equal(state.syncLogs.length, before, 'Xero still raises NOTHING: another ledger\'s pounds are not its to post')
+  assert.equal(refusals.length, 1, `but it says so: ${JSON.stringify(refusals)}`)
+  assert.match(refusals[0], /debited to Allocated Inventory on quickbooks/, 'naming the ledger the pounds are in')
+  assert.ok(refusals[0].includes(`£${qboShare.toFixed(2)}`), `and the pounds: ${refusals[0]}`)
+  assert.ok(refusals[0].includes(dayTwoRef), 'and the batch')
+  assert.match(refusals[0], /the daily batch runs xero's sweep, not quickbooks's/, 'and why nobody is coming for it')
+})
+
+test('o3d-i0o6 r6: and it stays QUIET when that ledger\'s own sweep is the one the cron runs', async () => {
+  // The same abandoned journal, and the same Xero sweep — run by hand from the Xero daily-batch
+  // action while the CRON is scheduled on QuickBooks. QuickBooks' own sweep will rebuild it on its
+  // next tick, so reporting it here would be noise about a batch that is genuinely somebody else's.
+  const { dayTwoRef } = await xeroThenQuickBooksUnderTwoBatches()
+  state.syncLogs = state.syncLogs.filter((log) => log.referenceId !== dayTwoRef)
+  scheduleDailyBatchOn('quickbooks')
+  switchConnector('xero')
+  const before = state.syncLogs.length
+  const refusals = await runRecreate()
+
+  assert.equal(state.syncLogs.length, before, 'still nothing rebuilt into Xero')
+  assert.deepEqual(refusals, [], 'and nothing reported: QuickBooks\' own scheduled sweep is coming for it')
+})
