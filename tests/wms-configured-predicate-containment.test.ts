@@ -175,7 +175,11 @@ test('[round 10 HIGH 2] a framework REDIRECT thrown by the predicate is rethrown
 
   await assert.rejects(
     () => registry.isWmsConnectorConfigured('acme', {
-      findDef: () => ({ create: () => ({ isConfigured: async () => { throw redirectError } }) as never }),
+      // `id: 'acme'` — the id the caller asks for (o3d-remove-shiphero round 14, Codex HIGH 1).
+      // `findWmsConnector` now refuses a factory that builds a connector for a different id, and a
+      // connector with NO id is a shape production forbids; a stub without one would be rejected on
+      // identity before this predicate ran, and this case would assert about the WRONG throw.
+      findDef: () => ({ create: () => ({ id: 'acme', isConfigured: async () => { throw redirectError } }) as never }),
     }),
     (error: unknown) => {
       assert.equal((error as { digest?: string }).digest, 'NEXT_REDIRECT;replace;/login;307;')
@@ -187,7 +191,7 @@ test('[round 10 HIGH 2] a framework REDIRECT thrown by the predicate is rethrown
   // error from the same shape is still answered.
   assert.equal(
     await registry.isWmsConnectorConfigured('acme', {
-      findDef: () => ({ create: () => ({ isConfigured: async () => { throw new Error('boom') } }) as never }),
+      findDef: () => ({ create: () => ({ id: 'acme', isConfigured: async () => { throw new Error('boom') } }) as never }),
     }),
     false,
   )

@@ -29,7 +29,6 @@ import {
   MINTSOFT_DEFAULT_ADMIN_ORDER_URL_TEMPLATE,
   mintsoftDeltaScopeChanged,
   MintsoftAuthModeError,
-  mintsoftHasAuthMaterial,
   parseMintsoftAuthMode,
   resolveMintsoftAuthMode,
   testMintsoftConnectionSettings,
@@ -56,7 +55,7 @@ import {
 } from '@/lib/connectors/mintsoft/sync/returns-sync'
 import { enqueueMintsoftBookedInRecheckForAsn, replayMintsoftBookedInEventsForAsn } from '@/lib/jobs/wms/process-mintsoft-booked-in-event'
 import { WMS_INBOUND_EVENT_PROCESSING_STATUS } from '@/lib/domain/wms/booked-in-service'
-import { getWmsConnector } from '@/lib/connectors/wms/registry'
+import { getWmsConnector, isWmsConnectorConfigured } from '@/lib/connectors/wms/registry'
 import { getIntegrationPluginState, isIntegrationPluginEnabled } from '@/lib/integration-plugins'
 import { hasPermission } from '@/lib/permissions'
 import { getPublicAppUrl } from '@/lib/public-app-url'
@@ -176,8 +175,32 @@ export type MintsoftConnectionSettingsMasked = {
   connectionTest: IntegrationConnectionTestState
 }
 
+/**
+ * WHAT THE MINTSOFT SCREENS SHOW ABOUT THE CONNECTION — AND NOT WHETHER IT IS CONFIGURED
+ * (o3d-remove-shiphero round 14, Codex HIGH 2).
+ *
+ * `configured` USED TO BE THE FIRST FIELD HERE, and both builders below recomputed it as
+ * `Boolean(connection.baseUrl.trim() && mintsoftHasAuthMaterial(settings))`. That is a SECOND
+ * computation of a fact the WMS boundary had already decided: `isWmsConnectorConfigured('mintsoft')`
+ * → `MintsoftConnector.isConfigured()` → `isMintsoftConfigured()`, which is narrower on purpose —
+ * it reads `getMintsoftApiConfiguration().baseUrl`, the ONLY base URL a Mintsoft request is ever
+ * built from, so a stored value that fails `validateExternalBaseUrl` normalizes to `''` and the
+ * connection is correctly unusable.
+ *
+ * The two answers therefore DIVERGED on exactly the case round 12 fixed: a malformed stored base URL
+ * is non-blank, so the recomputation said `true`. `/sync` printed "Configured" and ENABLED Run
+ * Product Verify, Run Bundle Verify and Poll Returns off it; onboarding printed "Connected to
+ * <endpoint>" and "connection is already configured". Every one of those is read off the NESTED
+ * value, while the registry envelope beside it said the connection cannot make a single call. Round
+ * 10 fixed this exact shape at the facade; the DTO builders were the layer past it.
+ *
+ * THE FIX IS THE DELETION. There is one verdict, produced once, in
+ * `lib/connectors/mintsoft/api/auth.ts`, carried by the envelope
+ * (`WmsSyncDashboardData.configured` / `WmsOnboardingConnectionData.configured`) and handed to the
+ * Mintsoft renderers as a prop. This type does not restate it, so the renderers cannot read a
+ * second one: `data.status.configured` is a compile error, not a value that might agree.
+ */
 export type MintsoftConnectionStatus = {
-  configured: boolean
   active: boolean
   bindingCount: number
   lastAuthAt: string | null
@@ -1416,13 +1439,15 @@ export async function getMintsoftDashboardData(): Promise<MintsoftDashboardData>
 
   let externalWarehouses: MintsoftExternalWarehouseOption[] = []
   let warehouseLookupError: string | null = null
-  // Mode-aware. A fixed-key connection legitimately has NO username/password and
-  // has its cached rotating token cleared, so the old predicate reported it
-  // unconfigured — which silently skipped warehouse discovery and disabled
-  // product/bundle verification and returns polling on the dashboard.
-  const hasMintsoftAuthMaterial = mintsoftHasAuthMaterial(settings)
-
-  if ((connection?.baseUrl ?? '').trim() && hasMintsoftAuthMaterial) {
+  // WAREHOUSE DISCOVERY IS GATED ON THE ONE VERDICT TOO (o3d-remove-shiphero round 14, Codex HIGH 2).
+  //
+  // This gate was the same expression the deleted `configured` field was, and it drifted the same
+  // way: with a malformed stored base URL it said "go", and discovery then built a request from a
+  // URL nothing can send to. It now asks the boundary — the SAME function
+  // (`MintsoftConnector.isConfigured()` → `isMintsoftConfigured()`) whose answer the envelope
+  // carries, called through the registry's containment so an unanswerable predicate cannot reject
+  // this read. Not a second computation of the fact: the same one.
+  if (await isWmsConnectorConfigured('mintsoft')) {
     const warehouseLookup = await getMintsoftExternalWarehouses(
       connection?.baseUrl ?? '',
       settings.mintsoft_username,
@@ -1434,7 +1459,6 @@ export async function getMintsoftDashboardData(): Promise<MintsoftDashboardData>
   return {
     connection: sanitizedConnection,
     status: {
-      configured: Boolean((connection?.baseUrl ?? '').trim() && hasMintsoftAuthMaterial),
       active: connection?.active ?? true,
       bindingCount: connection?.bindings.length ?? 0,
       lastAuthAt: connection?.lastAuthAt?.toISOString() ?? null,
@@ -1503,16 +1527,11 @@ export async function getMintsoftOnboardingConnectionData(): Promise<MintsoftOnb
     select: { finishedAt: true },
   })
 
-  // Mode-aware. A fixed-key connection legitimately has NO username/password and
-  // has its cached rotating token cleared, so the old predicate reported it
-  // unconfigured — which silently skipped warehouse discovery and disabled
-  // product/bundle verification and returns polling on the dashboard.
-  const hasMintsoftAuthMaterial = mintsoftHasAuthMaterial(settings)
-
   return {
     connection: mapMintsoftConnection(connection, settings, connectionTest),
+    // No `configured` here either: the wizard's tick, its Continue gate and the form's "Connected"
+    // banner all read the envelope's one verdict (see MintsoftConnectionStatus).
     status: {
-      configured: Boolean((connection?.baseUrl ?? '').trim() && hasMintsoftAuthMaterial),
       active: connection?.active ?? true,
       bindingCount: connection?.bindings.length ?? 0,
       lastAuthAt: connection?.lastAuthAt?.toISOString() ?? null,

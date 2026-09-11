@@ -341,25 +341,35 @@ export class ZonelessDeltaAcmeWmsConnector extends AcmeWmsConnector {
   }
 }
 
-/** Acme's registration — the definition MINUS its id, which the registry supplies from the key. */
+/**
+ * Acme's registration — the definition MINUS its id, which the registry supplies from the key.
+ *
+ * TYPED TO ACME'S OWN ID, not to the seam union (o3d-remove-shiphero round 14, Codex HIGH 1).
+ * This fixture used to be `WmsConnectorRegistration<SeamWmsConnectorId>`, which is the very
+ * looseness the round-14 fix removed from production: with the union in the type parameter, `create`
+ * was `() => WmsRegistrableConnector<'mintsoft' | 'acme-wms'>` and this helper would happily have
+ * returned MINTSOFT'S connector under Acme's key — the fixture could hold the state production now
+ * forbids, so it could not have detected it. Per-id here, per-key there, and the `as unknown as`
+ * casts below narrowed with it.
+ */
 export function acmeWmsRegistration(
   warehouse: AcmeWarehouse = makeAcmeWarehouse(),
-  overrides: Partial<WmsConnectorRegistration<SeamWmsConnectorId>> = {},
-): WmsConnectorRegistration<SeamWmsConnectorId> {
+  overrides: Partial<WmsConnectorRegistration<typeof ACME_WMS_ID>> = {},
+): WmsConnectorRegistration<typeof ACME_WMS_ID> {
   return {
     label: ACME_WMS_LABEL,
     available: true,
     createReplayPolicy: 'client-side-dedupe-only',
-    create: () => new AcmeWmsConnector(warehouse) as unknown as WmsRegistrableConnector<SeamWmsConnectorId>,
+    create: () => new AcmeWmsConnector(warehouse) as unknown as WmsRegistrableConnector<typeof ACME_WMS_ID>,
     ...overrides,
   }
 }
 
 export function acmeWmsConnectorDef(
   warehouse: AcmeWarehouse = makeAcmeWarehouse(),
-  overrides: Partial<WmsConnectorRegistration<SeamWmsConnectorId>> = {},
+  overrides: Partial<WmsConnectorRegistration<typeof ACME_WMS_ID>> = {},
 ): WmsConnectorDef<SeamWmsConnectorId> {
-  return { id: ACME_WMS_ID, ...acmeWmsRegistration(warehouse, overrides) }
+  return { ...acmeWmsRegistration(warehouse, overrides), id: ACME_WMS_ID }
 }
 
 /**
@@ -371,7 +381,7 @@ export function acmeWmsConnectorDef(
  * the fixture instead of the code. Every OTHER method is absent, so a routing bug that reaches the
  * shipped connector still fails loudly instead of opening a database connection.
  */
-const seamMintsoftRegistration: WmsConnectorRegistration<SeamWmsConnectorId> = {
+const seamMintsoftRegistration: WmsConnectorRegistration<'mintsoft'> = {
   label: 'Mintsoft',
   available: true,
   createReplayPolicy: 'remote-refuses-duplicate',
@@ -379,7 +389,7 @@ const seamMintsoftRegistration: WmsConnectorRegistration<SeamWmsConnectorId> = {
     id: 'mintsoft',
     name: 'Mintsoft',
     isConfigured: async () => false,
-  }) as unknown as WmsRegistrableConnector<SeamWmsConnectorId>,
+  }) as unknown as WmsRegistrableConnector<'mintsoft'>,
 }
 
 /**
@@ -392,7 +402,7 @@ const seamMintsoftRegistration: WmsConnectorRegistration<SeamWmsConnectorId> = {
  */
 export function makeSeamRegistry(
   warehouse: AcmeWarehouse = makeAcmeWarehouse(),
-  overrides: Partial<WmsConnectorRegistration<SeamWmsConnectorId>> = {},
+  overrides: Partial<WmsConnectorRegistration<typeof ACME_WMS_ID>> = {},
 ): WmsConnectorRegistry<SeamWmsConnectorId> {
   return createRegisteredWmsConnectorRegistry<SeamWmsConnectorId>(SEAM_WMS_CONNECTOR_IDS, {
     mintsoft: seamMintsoftRegistration,

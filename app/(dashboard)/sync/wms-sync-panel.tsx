@@ -33,6 +33,26 @@ import { ambiguousWmsConnectorReason } from '@/lib/connectors/wms/enabled-connec
  * connector-specific.
  */
 
+/**
+ * WHAT A CONNECTOR'S PANEL IS GIVEN — the payload AND the envelope's verdict
+ * (o3d-remove-shiphero round 14, Codex HIGH 2).
+ *
+ * `render` used to take the payload alone, so a connector panel had nothing to read `configured`
+ * from but its OWN payload — and Mintsoft's duly carried a second copy of it, recomputed from the
+ * raw stored base URL. `/sync` then printed "Configured" and enabled three verification actions off
+ * that copy while `WmsSyncDashboardData.configured` — the one verdict, from the connector's own
+ * `isConfigured()` — said the connection could not make a call.
+ *
+ * `configured` is therefore handed IN, beside the payload, from the DTO field the unsupported states
+ * below already read. A panel that wants the fact takes the prop; there is nowhere else to get it.
+ */
+export type WmsPanelRenderProps = {
+  /** The facade's opaque per-connector payload. Narrowed by the connector's own `render`. */
+  payload: unknown
+  /** Whether the connection is set up, as the WMS boundary answered it. The only source. */
+  configured: boolean
+}
+
 export type WmsConnectorPanel = {
   /** User-visible name. Also the Integrations card's title. */
   label: string
@@ -40,7 +60,7 @@ export type WmsConnectorPanel = {
   description: string
   logo: React.ReactNode
   /** Narrows the facade's opaque payload and renders the connector's own screen. */
-  render: (payload: unknown) => React.ReactNode
+  render: (props: WmsPanelRenderProps) => React.ReactNode
 }
 
 export const WMS_PANELS: Record<WmsConnectorId, WmsConnectorPanel> = {
@@ -49,7 +69,9 @@ export const WMS_PANELS: Record<WmsConnectorId, WmsConnectorPanel> = {
     description: 'Bind Mintsoft warehouses, store credentials, and stage WMS callbacks',
     // eslint-disable-next-line @next/next/no-img-element
     logo: <img src="/images/mintsoft.svg" alt="Mintsoft" className="h-8 object-contain" />,
-    render: (payload) => <MintsoftClient data={payload as MintsoftDashboardData} />,
+    render: ({ payload, configured }) => (
+      <MintsoftClient data={payload as MintsoftDashboardData} configured={configured} />
+    ),
   },
 }
 
@@ -240,7 +262,10 @@ export function WmsSyncPanel({ connectorId, data, ambiguousConnectorIds = [], on
           configured={active.configured}
         />
       ) : (
-        panel.render(payload)
+        // The SAME `configured` the unsupported states above read, handed to the connector's own
+        // screen (round 14, Codex HIGH 2). The panel used to receive only the payload, and Mintsoft's
+        // carried a second, laxer copy of this fact.
+        panel.render({ payload, configured: active.configured })
       )}
     </div>
   )

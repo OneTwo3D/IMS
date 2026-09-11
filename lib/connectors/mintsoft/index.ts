@@ -235,7 +235,6 @@ export {
   MINTSOFT_DEFAULT_ADMIN_ORDER_URL_TEMPLATE,
   mintsoftDeltaScopeChanged,
   mintsoftDeltaScopeToken,
-  mintsoftHasAuthMaterial,
   MINTSOFT_SETTING_KEYS,
   MintsoftAuthModeError,
   parseMintsoftAuthMode,

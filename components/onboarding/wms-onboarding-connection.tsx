@@ -43,6 +43,17 @@ export type WmsConnectionFormProps = {
   /** The facade's opaque per-connector payload. Narrowed by the connector's own `render`. */
   payload: unknown
   connectorLabel: string
+  /**
+   * WHETHER THE CONNECTION IS SET UP, from the envelope (o3d-remove-shiphero round 14, Codex HIGH 2).
+   *
+   * A connector's form used to receive only its payload, so Mintsoft's read `data.status.configured`
+   * — a value its own DTO builder recomputed from the raw stored base URL. An unparseable base URL
+   * passes that test, so the wizard showed a green "Connected to <endpoint>" banner and
+   * "connection is already configured" for a connection `isMintsoftConfigured()` had just rejected.
+   * The nested field is deleted; every form reads this one, which is the same value
+   * {@link WmsConnectionUnavailable} and the wizard's Continue gate read.
+   */
+  configured: boolean
   busy: boolean
   availableOrderLookupConnectors: ShoppingLookupConnector[]
   withStepUp: <T extends MaybeFreshAuthFailure>(run: () => Promise<T>) => Promise<T>
@@ -151,6 +162,9 @@ export function WmsOnboardingConnection({
       : form.render({
         payload,
         connectorLabel: data.connectorLabel,
+        // The SAME verdict the two unavailable states above are given, and the same one the wizard
+        // ticks this step off (round 14, Codex HIGH 2).
+        configured: data.configured,
         busy,
         availableOrderLookupConnectors,
         withStepUp,
@@ -181,6 +195,8 @@ export function WmsOnboardingConnection({
 type MintsoftFormProps = {
   data: MintsoftOnboardingConnectionData
   connectorLabel: string
+  /** The envelope's verdict. `data.status` no longer carries one — see WmsConnectionFormProps. */
+  configured: boolean
   busy: boolean
   availableOrderLookupConnectors: ShoppingLookupConnector[]
   withStepUp: <T extends MaybeFreshAuthFailure>(run: () => Promise<T>) => Promise<T>
@@ -192,6 +208,7 @@ type MintsoftFormProps = {
 function MintsoftConnectionForm({
   data,
   connectorLabel,
+  configured,
   busy,
   availableOrderLookupConnectors,
   withStepUp,
@@ -227,7 +244,7 @@ function MintsoftConnectionForm({
   }, [onBusyChange])
 
   const orderLookupRequired = availableOrderLookupConnectors.length > 1
-  const connected = saved || data.status.configured
+  const connected = saved || configured
   const connectedLabel = username.trim() || baseUrl.trim() || `${connectorLabel} account`
 
   function handleSave() {
@@ -343,7 +360,7 @@ function MintsoftConnectionForm({
           {saved ? <><Check className="h-4 w-4 mr-1" />Verified</> : 'Save & Test Connection'}
         </Button>
         {message ? <span className="text-xs text-muted-foreground">{message}</span> : null}
-        {data.status.configured ? (
+        {configured ? (
           <span className="text-xs text-muted-foreground">{connectorLabel} connection is already configured.</span>
         ) : null}
       </div>

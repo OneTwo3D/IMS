@@ -180,3 +180,57 @@ test('[round 12 HIGH 3] an unparseable stored base URL is NOT configured either,
     SETTING_ROWS.mintsoft_api_key = WHITESPACE_TOKEN
   }
 })
+
+/**
+ * FIXED-KEY MODE, MOVED HERE WHEN `mintsoftHasAuthMaterial` WAS DELETED
+ * (o3d-remove-shiphero round 14, Codex HIGH 2).
+ *
+ * The deleted helper had its own mode-awareness test (tests/mintsoft-auth-mode.test.ts). The
+ * predicate that SURVIVES — and that everything now reads — had no case for its `api_key` arm at
+ * all. Deleting a duplicate computation must not delete the coverage the duplicate was carrying,
+ * so the three rules move here, asserted against the predicate production actually uses.
+ *
+ * The rules matter because of o3d-092: in fixed-key mode NOTHING may call `/api/Auth`, since a
+ * refresh mints a new tenant key and breaks the woocommerce-mintsoft-sync sweep and the
+ * shipping-label service that share it. So "configured" in this mode has to mean the FIXED key is
+ * there — falling back to credentials or to a stale cache would report a connection that is about
+ * to throw on every call, and imply the credentials are still load-bearing when the whole point is
+ * that they are not.
+ */
+test('[round 14 HIGH 2] fixed-key mode: the FIXED key alone decides, and it is trimmed', async () => {
+  const { isMintsoftConfigured } = await import('../lib/connectors/mintsoft/api/auth.ts')
+
+  SETTING_ROWS.mintsoft_auth_mode = 'api_key'
+  // Everything that counts in the OTHER mode, all present: the rotating cache and a full
+  // username/password pair. None of it may substitute for the fixed key.
+  SETTING_ROWS.mintsoft_api_key = REAL_TOKEN
+  SETTING_ROWS.mintsoft_username = 'ops'
+  SETTING_ROWS.mintsoft_password = 'ops-password'
+  try {
+    assert.equal(
+      await isMintsoftConfigured(), false,
+      'credentials and a cached token do NOT make a fixed-key connection configured — reporting'
+      + ' otherwise implies they are load-bearing, and in this mode nothing may use them',
+    )
+
+    SETTING_ROWS.mintsoft_static_api_key = WHITESPACE_TOKEN
+    assert.equal(
+      await isMintsoftConfigured(), false,
+      'and the trim rule holds in this branch too: a fixed key of spaces builds'
+      + " `Authorization: '   '`",
+    )
+
+    SETTING_ROWS.mintsoft_static_api_key = REAL_TOKEN
+    assert.equal(
+      await isMintsoftConfigured(), true,
+      'a real fixed key IS a configured connection — without this the two cases above would pass on'
+      + ' a mode that always refuses',
+    )
+  } finally {
+    delete SETTING_ROWS.mintsoft_static_api_key
+    delete SETTING_ROWS.mintsoft_username
+    delete SETTING_ROWS.mintsoft_password
+    SETTING_ROWS.mintsoft_auth_mode = 'credentials'
+    SETTING_ROWS.mintsoft_api_key = WHITESPACE_TOKEN
+  }
+})

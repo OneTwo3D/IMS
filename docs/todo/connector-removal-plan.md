@@ -119,7 +119,8 @@ layer short twice more:
 
 **Round 10 sharpened it a sixth, seventh and eighth time — and all three were
 consequences of round 8's own fixes; round 12 sharpened it three more, two of them
-consequences of rounds 6 and 8.** That is the pattern to expect here: a fix that
+consequences of rounds 6 and 8; round 14 sharpened it twice more, and BOTH were
+consequences of rounds 10 and 12.** That is the pattern to expect here: a fix that
 removes a way to be wrong tends to open a state nobody had asked about.
 
 - **A derived toggle needs a derived RULE.** Making the plugin switches
@@ -161,6 +162,47 @@ removes a way to be wrong tends to open a state nobody had asked about.
   not be able to take the screen down**, and the safe reading of an unanswerable predicate
   is the negative one. Before you move a field from one source to another, write the test
   that distinguishes them.
+- **A TOTAL record is not a CONSTRAINED one.** Round 14: round 12's
+  `Record<WmsConnectorId, WmsConnectorRegistration<WmsConnectorId>>` made the registration
+  list complete and left every entry typed over the *whole* id union, so an `acme-wms` key
+  could hold a factory returning the **Mintsoft** connector — `getConnector` would have
+  resolved Acme and sent every operation to Mintsoft's live warehouse under Acme's link rows.
+  `Record<K, V>` says "a value for each key"; a **mapped type** `{ [K in Id]: V<K> }` says
+  "a value *for that* key". For Shopify and QuickBooks: wherever a registry keys values by
+  id, check the value type mentions the key, not the union. And note where the check has to
+  live — a factory is opaque until it is invoked, so no load-time walk can see inside one;
+  the compiler is the only place a cross-wiring is visible before the first request, and the
+  runtime check belongs at **construction**, the moment every dispatch passes through.
+- **A key is only authoritative if it is applied LAST.** `{ id, ...registration }` let a
+  registration written outside `tsc`'s reach overwrite the id it was filed under, defeating
+  even the identity check (which compared against the smuggled value). Spread first, key last.
+- **Follow the fact to the outermost thing that RENDERS it, not to the facade.** Round 14's
+  second finding: round 10 made `configured` authoritative at the facade and the **DTO
+  builders one layer past it** kept recomputing it from the raw stored base URL, which the
+  connector's own panel then read. Deleting a second source at layer *n* is not finished
+  until you have asked who reads the same fact at layer *n+1* — and the answer is whichever
+  component an operator is actually looking at, not the server action above it. The test has
+  to render that component: the fixture that pinned the round-10 facade **mocked the DTO
+  builders**, which is precisely where the ninth layer was hiding.
+- **Delete the orphan too.** `mintsoftHasAuthMaterial` existed only to keep the two status
+  builders in step. With both callers gone it was a second, laxer "is this connector set up?"
+  predicate sitting exported in a shared module — the next layer, pre-installed. Removing a
+  duplicate computation means removing the helper it was built from, not just the call sites.
+- **THE TENTH LAYER, named rather than closed (o3d-6qub).** Round 14's review asked
+  whether there was one, and there is, in the same shape: round 8 extracted the
+  Integrations-step readiness rule to `lib/domain/onboarding/integrations-step-readiness.ts`
+  so it could be tested, and `app/(dashboard)/onboarding/onboarding-client.tsx` (lines
+  148-166) still writes the rule out again. The two are equivalent today, and the copy is
+  not dead: the shell prefers the child's `integrationsReadyOverride` only once it is
+  non-null, and that arrives from a `useEffect` — so on the first paint, and on SSR, the
+  shell's own copy is what enables Continue. Nothing tests it (no test mounts
+  `OnboardingClient`, and the harness runs no effects, so the override path is unreachable
+  too). Left filed because round 14's brief scoped the fix to `configured` and its sibling
+  recomputations, and this recomputes step READINESS — it reads `configured` from the
+  envelope correctly. Also filed: o3d-nlvy (the step's `useState` copy of `configured`,
+  which is a legitimate optimistic layer and therefore a coverage gap, not a duplicate) and
+  o3d-ynmg (the /sync page's `availableWmsConnectorIds` / `ambiguousWmsConnectorIds`
+  derivations, which every test supplies as literals).
 - **Copy a value object by construction, not by enumeration.** The boundary guard's
   `foldImported` listed the fields it carried across a module boundary and was written
   before the `binary` flag existed, so a `Buffer` constant lost it in transit and a closed

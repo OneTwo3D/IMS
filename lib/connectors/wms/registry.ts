@@ -145,6 +145,33 @@ export type WmsConnectorRegistry<Id extends string = WmsConnectorId> = {
   getConnector(id: Id): WmsConnector<Id>
 }
 
+/**
+ * A CONNECTOR MUST BE THE CONNECTOR THAT WAS ASKED FOR (o3d-remove-shiphero round 14, Codex HIGH 1).
+ *
+ * {@link WmsConnectorRegistrations} makes a mismatched factory uncompilable, and that is where this
+ * is meant to be caught. This is the backstop for the callers the compiler never sees: a JavaScript registration,
+ * a `mock.module` that widens the id list, a mixed-version deploy, a registry built through the
+ * structural `WmsConnectorInstanceSource`. It runs at CONSTRUCTION — the single moment every
+ * dispatch in the app passes through — rather than at load, because a factory body is opaque until
+ * it is invoked.
+ *
+ * IT THROWS, and loudly. The failure it prevents is silent: an operation routed to a warehouse
+ * nobody asked for, whose result is then recorded under the id that was asked for. There is no
+ * degraded behaviour that is better than refusing — a connector that is not the one requested
+ * cannot serve the request, and `isWmsConnectorConfigured` already turns a throw from this layer
+ * into "not configured", which is the honest answer for a build that cannot route the id.
+ */
+function assertWmsConnectorIdentity<C extends { id: string }>(requestedId: string, connector: C): C {
+  if (connector.id !== requestedId) {
+    throw new Error(
+      `WMS connector registration for "${requestedId}" built a connector whose id is`
+      + ` "${String(connector.id)}" — a registration's factory must return that connector, never`
+      + ' another warehouse\'s',
+    )
+  }
+  return connector
+}
+
 export function createWmsConnectorRegistry<Id extends string>(
   defs: readonly WmsConnectorDef<Id>[],
 ): WmsConnectorRegistry<Id> {
@@ -168,7 +195,7 @@ export function createWmsConnectorRegistry<Id extends string>(
     getConnector(id: Id): WmsConnector<Id> {
       const def = byId.get(id)
       if (!def) throw new Error(`Unknown WMS connector: ${id}`)
-      return def.create()
+      return assertWmsConnectorIdentity(id, def.create())
     },
   }
 }
@@ -181,6 +208,38 @@ export function createWmsConnectorRegistry<Id extends string>(
  * twice, so nobody can write it twice differently.
  */
 export type WmsConnectorRegistration<Id extends string = WmsConnectorId> = Omit<WmsConnectorDef<Id>, 'id'>
+
+/**
+ * THE REGISTRATION RECORD — every entry constrained to ITS OWN KEY, which is a MAPPED TYPE and not
+ * a `Record` over the union (o3d-remove-shiphero round 14, Codex HIGH 1).
+ *
+ * WHAT WENT WRONG. Round 12 made the record TOTAL over `WmsConnectorId`, which is what makes a
+ * registered id with no definition uncompilable, and that half was right. But it spelled the
+ * totality `Record<Id, WmsConnectorRegistration<Id>>`, and `Record` hands EVERY entry the WHOLE id
+ * union. With two ids the `acme-wms` entry's `create` was
+ * `() => WmsRegistrableConnector<'mintsoft' | 'acme-wms'>`, so a factory returning the MINTSOFT
+ * connector typechecked under Acme's key — and `getConnector('acme-wms')` handed it straight back.
+ * Production would have resolved Acme and sent every operation to Mintsoft: the order push, the
+ * ASNs, the stock reads, the dispatch poll, all against the wrong warehouse, recorded under Acme's
+ * link rows, cursors and audit trail. A key that does not constrain the thing it names is not a
+ * registry, it is a table of coincidences.
+ *
+ * SO EACH ENTRY IS KEYED TO ITSELF. `[K in Id]` binds `K` per member, so entry `K` may hold only
+ * `WmsConnectorRegistration<K>`; `WmsConnector`'s `readonly id: Id` then carries that same literal
+ * into the factory's RETURN TYPE. A registration whose factory returns a connector for a different
+ * id does not compile.
+ *
+ * WHY THE TYPE HAS TO BE THE PRIMARY ANSWER. Factories are NOT invoked until request time, so no
+ * load-time walk can look inside one: the round-12 load-time guard can see that an id has an entry
+ * and can never see whose connector that entry builds. The only place a mismatch is visible before
+ * a warehouse call is the compiler. `assertWmsConnectorIdentity` is the backstop for the callers
+ * `tsc` never sees — a JavaScript registration, a `mock.module` that widens the id list, a
+ * mixed-version deploy — and it fires when the connector is CONSTRUCTED, which every dispatch
+ * passes through.
+ */
+export type WmsConnectorRegistrations<Id extends string> = {
+  readonly [K in Id]: WmsConnectorRegistration<K>
+}
 
 /**
  * THE ONE DERIVATION: a registry is the canonical id list crossed with one definition per id
@@ -199,9 +258,10 @@ export type WmsConnectorRegistration<Id extends string = WmsConnectorId> = Omit<
  * SO THE LIST AND THE DEFINITIONS ARE NO LONGER TWO LISTS. `ids` is walked and each id is looked up
  * in a record that is TOTAL over those ids, which gives both halves:
  *
- *   - COMPILE TIME: `Record<Id, WmsConnectorRegistration<Id>>` is total, so an id in the list with
+ *   - COMPILE TIME: {@link WmsConnectorRegistrations} is total over `ids`, so an id in the list with
  *     no definition is a `tsc` error at the record, and a definition for an id that is not in the
- *     list is an excess-property error. Neither list can grow without the other;
+ *     list is an excess-property error. Neither list can grow without the other. It is also keyed
+ *     PER ENTRY (round 14, Codex HIGH 1), so an entry cannot hold another connector's factory;
  *   - LOAD TIME: the lookup is still checked, because a build can reach the runtime with the two
  *     disagreeing anyway — a `mock.module` that widens the id list, a JavaScript caller, a
  *     mixed-version deploy. It throws HERE, at module evaluation, naming the id. A build that
@@ -213,7 +273,7 @@ export type WmsConnectorRegistration<Id extends string = WmsConnectorId> = Omit<
  */
 export function createRegisteredWmsConnectorRegistry<Id extends string>(
   ids: readonly Id[],
-  registrations: Readonly<Record<Id, WmsConnectorRegistration<Id>>>,
+  registrations: WmsConnectorRegistrations<Id>,
 ): WmsConnectorRegistry<Id> {
   return createWmsConnectorRegistry(ids.map((id): WmsConnectorDef<Id> => {
     const registration = registrations[id]
@@ -223,7 +283,14 @@ export function createRegisteredWmsConnectorRegistry<Id extends string>(
         + ' every id in WMS_CONNECTOR_IDS must have an entry in the registration record',
       )
     }
-    return { id, ...registration }
+    // `id` LAST (o3d-remove-shiphero round 14, Codex HIGH 1). Spread first and the key wins; spread
+    // last — as this read `{ id, ...registration }` until round 14 — and a registration carrying an
+    // `id` of its own OVERWRITES the key it was filed under. `WmsConnectorRegistration` omits `id`,
+    // so `tsc` refuses to write one; a JavaScript caller, a `JSON.parse`d registration or a test
+    // fixture is under no such constraint, and the value it smuggled in would have become the
+    // definition's id everywhere downstream — including the identity check meant to catch exactly
+    // this. The key is authoritative because it is applied last, not because nobody wrote the field.
+    return { ...registration, id }
   }))
 }
 
@@ -231,9 +298,11 @@ export function createRegisteredWmsConnectorRegistry<Id extends string>(
  * The connectors this build ships, keyed by id.
  *
  * TOTAL over `WMS_CONNECTOR_IDS` (see {@link createRegisteredWmsConnectorRegistry}): registering an
- * id without writing its definition here does not compile.
+ * id without writing its definition here does not compile. And each entry is typed to ITS OWN KEY
+ * ({@link WmsConnectorRegistrations}), so `create` under a key must return the connector for THAT
+ * id — a factory returning another warehouse's connector does not compile either.
  */
-export const BUILT_IN_WMS_CONNECTOR_REGISTRATIONS: Readonly<Record<WmsConnectorId, WmsConnectorRegistration>> = {
+export const BUILT_IN_WMS_CONNECTOR_REGISTRATIONS: WmsConnectorRegistrations<WmsConnectorId> = {
   mintsoft: {
     label: 'Mintsoft',
     available: true,
@@ -377,7 +446,14 @@ export function findWmsConnector(
   id: string,
   source: WmsConnectorInstanceSource = wmsConnectorRegistry,
 ): WmsConnector<string> | null {
-  return source.findDef(id)?.create() ?? null
+  const def = source.findDef(id)
+  if (!def) return null
+  // The identity check again, and NOT because `getConnector` already does it — this function does
+  // not go through `getConnector` (round 14, Codex HIGH 1). `WmsConnectorInstanceSource` is
+  // STRUCTURAL, so it carries no `id` for the compiler to constrain, and this is the path
+  // `isWmsConnectorConfigured` takes: the /sync panel and the onboarding wizard would otherwise read
+  // "is it set up?" off whichever connector the factory happened to build.
+  return assertWmsConnectorIdentity(id, def.create())
 }
 
 /**
@@ -432,20 +508,31 @@ export function findWmsConnectorLabel(
  *
  * `findWmsConnector`, so an id left behind by a connector this build no longer ships is
  * unconfigurable rather than a throw from inside a read.
+ *
+ * RESOLUTION IS INSIDE THE TRY, not just the predicate (o3d-remove-shiphero round 14, Codex HIGH 1).
+ * `findWmsConnector` can now throw on its own account — a registration whose factory builds another
+ * warehouse's connector is refused there — and the round-10 rule covers that throw for exactly the
+ * same reason it covers the predicate's: these are the reads `/onboarding` gathers with
+ * `Promise.all` and `/sync` gathers with the other twenty-one, so a rejection here is not "the WMS
+ * panel is missing", it is the whole wizard and the whole dashboard. A build that cannot resolve the
+ * connector cannot say the connection is set up either, and `false` is the answer that leaves the
+ * screens up. The DISPATCH path is unchanged and still throws: `getWmsConnector` has an honest
+ * destination for a fault, and routing an order to a warehouse nobody asked for does not.
  */
 export async function isWmsConnectorConfigured(
   id: string,
   source: WmsConnectorInstanceSource = wmsConnectorRegistry,
 ): Promise<boolean> {
-  const connector = findWmsConnector(id, source)
-  if (!connector) return false
   try {
+    const connector = findWmsConnector(id, source)
+    if (!connector) return false
     return await connector.isConfigured()
   } catch (error) {
     unstable_rethrow(error)
-    // Logged, never swallowed silently: an unanswerable predicate is a real fault an operator has
-    // to fix, and `configured: false` is what the screen shows them while they do.
-    console.error(`[wms] ${id}.isConfigured() threw; treating the connection as NOT configured`, error)
+    // Logged, never swallowed silently: an unanswerable predicate — or a connector that cannot be
+    // resolved at all — is a real fault somebody has to fix, and `configured: false` is what the
+    // screen shows while they do.
+    console.error(`[wms] could not answer whether ${id} is configured; treating it as NOT configured`, error)
     return false
   }
 }

@@ -571,6 +571,78 @@ applied to everything except the one place it had to be applied to*.
    it** — the "SECOND enabled connector" case had only one connector enabled — so it is
    renamed to what it exercises and a real two-enabled case added beside it.
 
+## What round 14 closed (Codex, two HIGHs)
+
+Round 13's review found two HIGHs and one MEDIUM (`o3d-1wgz`, duplicate labels — ruled
+non-blocking and left filed). Both HIGHs are consequences of rounds 10 and 12: the pattern
+this branch keeps producing is *a fix that removes one way to be wrong opening a state nobody
+had asked about*.
+
+1. **A registration's key did not constrain its factory's connector.** Round 12's record was
+   `Record<WmsConnectorId, WmsConnectorRegistration<WmsConnectorId>>` — total, which was the
+   point, and `Record` hands **every** entry the whole id union. With two ids, an `acme-wms`
+   entry whose `create` returned the **Mintsoft** connector typechecked, and `getConnector`
+   handed it straight back without looking at what it had built. Production would have
+   resolved Acme and sent every operation to Mintsoft's live warehouse — the order push, the
+   ASN create, the stock read, the dispatch poll — recorded under Acme's link rows, cursors
+   and audit trail, and reported to the operator as Acme's. Nothing below the registry can
+   detect it: every layer under it is told which connector it is talking to *by* the registry.
+
+   Three holes, three closures:
+
+   - the record is now a **mapped type**, `WmsConnectorRegistrations<Id> = { [K in Id]:
+     WmsConnectorRegistration<K> }`, so entry `K` may hold only `K`'s registration and
+     `WmsConnector`'s `readonly id: Id` carries that literal into the factory's return type.
+     Cross-wiring **does not compile**;
+   - the compiler has to be the primary answer, because **a factory is not invoked until
+     request time**: the round-12 load-time walk can see that an id has an entry and can never
+     see whose connector that entry builds. (A test asserts exactly this — a cross-wired
+     registry *assembles* without complaint.) `assertWmsConnectorIdentity` is the backstop for
+     the callers `tsc` never sees, and it fires at **construction** — `getConnector` and
+     `findWmsConnector`, the two paths that instantiate — naming both ids. Its throw is
+     **contained** by `isWmsConnectorConfigured` under round 10's rule, since that predicate is
+     gathered into `/onboarding`'s `Promise.all` and `/sync`'s twenty-two reads; the dispatch
+     path still throws;
+   - the definition is assembled `{ ...registration, id }` — **id last**. It used to be
+     `{ id, ...registration }`, so a registration written outside `tsc`'s reach (JavaScript,
+     `JSON.parse`, a cast) could overwrite the key it was filed under, and thereby defeat the
+     identity check as well, which compares against the definition's id.
+
+   The seam fixtures had the same looseness — `acmeWmsRegistration` was typed over the seam
+   *union*, so the helper could itself have returned Mintsoft's connector under Acme's key —
+   and are now typed per id.
+
+2. **The authoritative `configured` verdict was thrown away before rendering.** Round 12 made
+   `isMintsoftConfigured()` reject an unparseable stored base URL, and round 10 had already
+   made that predicate authoritative for the envelope. Both Mintsoft **DTO builders** went on
+   recomputing the same fact as `Boolean(connection.baseUrl.trim() &&
+   mintsoftHasAuthMaterial(settings))` — which tests only that the stored string is non-blank
+   — and the Mintsoft screens read that nested copy. So on exactly the case round 12 fixed the
+   two diverged: `/sync` printed "Configured" and left **Run Product Verify, Run Bundle Verify
+   and Poll Returns enabled**, and the onboarding wizard printed "Connected to <endpoint>" and
+   "connection is already configured", while the envelope beside them said the connection could
+   not make one call. This is the ninth layer of the branch's central defect — the authoritative
+   answer computed, then a second computation of the same fact downstream overriding it — and
+   round 10 had fixed this exact shape one layer up.
+
+   Fixed by **deletion, not by syncing**: `MintsoftConnectionStatus` has no `configured` field,
+   so `data.status.configured` is a compile error. The envelope's verdict is handed to the
+   connector's own screen as a prop (`WmsPanelRenderProps.configured`,
+   `WmsConnectionFormProps.configured`). Warehouse discovery in the dashboard builder was gated
+   on the same expression and now asks `isWmsConnectorConfigured('mintsoft')`. And
+   `mintsoftHasAuthMaterial`, whose only documented reason to exist was keeping those two status
+   builders in step, is **deleted** — a second, laxer "is this connector set up?" predicate left
+   exported in a shared module is the next layer, pre-installed.
+
+   **The round-10 fixture stopped one layer short**: `tests/wms-configured-predicate-containment.test.ts`
+   mocks both DTO builders, so it could never see what the panel rendered.
+   `tests/wms-configured-verdict-renderers.test.ts` mocks no WMS and no Mintsoft code at all —
+   only Prisma, the settings rows, the session and the framework router/session hooks — and runs
+   `getWmsSyncDashboardData → registry → MintsoftConnector.isConfigured → isMintsoftConfigured →
+   getMintsoftDashboardData → WmsSyncPanel → WMS_PANELS.mintsoft.render → MintsoftClient`,
+   asserting on the Status tile's markup and on whether the three verification buttons carry
+   `disabled`. A positive control flips one character of the base URL and asserts the opposite.
+
 ## Leaks that remain, deliberately
 
 - `lib/domain/wms/booked-in-service.ts` is Mintsoft's booked-in webhook processor

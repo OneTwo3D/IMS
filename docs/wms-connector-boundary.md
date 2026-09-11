@@ -19,13 +19,28 @@ This mirrors the shopping (`shopping-registry.ts`) and accounting
 - **`lib/connectors/wms/registry.ts`** — `BUILT_IN_WMS_CONNECTOR_REGISTRATIONS` +
   `getWmsConnector(id)` (resolves the connector implementation). The registry is the id
   list **crossed with one definition each**: the record is
-  `Record<WmsConnectorId, WmsConnectorRegistration>` (a definition *minus* its id, which
-  the key supplies), and `createRegisteredWmsConnectorRegistry(ids, registrations)` walks
+  `WmsConnectorRegistrations<WmsConnectorId>` — a **mapped type**, `{ [K in Id]:
+  WmsConnectorRegistration<K> }`, over definitions *minus* their id, which the key supplies —
+  and `createRegisteredWmsConnectorRegistry(ids, registrations)` walks
   `WMS_CONNECTOR_IDS`. A registered id with no definition is a `tsc` error; a definition
   for an unregistered id is an excess-property error; and because a build can still reach
   the runtime with the two disagreeing (a `mock.module`, a JavaScript caller, a
   mixed-version deploy) the derivation **throws at module evaluation, naming the id**
   (round 12). `BUILT_IN_WMS_CONNECTORS` / `WMS_CONNECTORS` are the registry's own list.
+
+  **A key constrains its own factory** (round 14). The mapped type is not cosmetic:
+  `Record<Id, WmsConnectorRegistration<Id>>` hands *every* entry the whole id union, so an
+  `acme-wms` entry whose `create` returns the **Mintsoft** connector typechecked, and
+  `getConnector('acme-wms')` returned it — every push, ASN, stock read and dispatch poll for
+  Acme going to Mintsoft's warehouse, under Acme's link rows and audit trail. `[K in Id]`
+  binds the key per entry and `WmsConnector`'s `readonly id: Id` carries it into the
+  factory's return type, so cross-wiring **does not compile**. The compiler has to be the
+  answer because factories are not invoked until request time — the round-12 load-time walk
+  can see that an id *has* an entry and can never see whose connector it builds. For the
+  callers `tsc` never sees, `assertWmsConnectorIdentity` re-checks at **construction**
+  (`getConnector` and `findWmsConnector`, the two paths that instantiate) and throws naming
+  both ids. And the definition is assembled `{ ...registration, id }`, id **last**, so a
+  registration that smuggles an `id` of its own cannot overwrite the key it was filed under.
 - **`lib/connectors/wms/active-connector.ts`** — `getActiveWmsConnectorId()` (the
   enabled WMS connector, with a single-connector fallback),
   `getEnabledWmsConnectorId()` (no fallback) and
@@ -52,6 +67,24 @@ enabled".
 read from `WmsConnector.isConfigured()` — the one mandatory method on the contract —
 on every path, *before* the hook is looked up, and the hook result types carry no
 such field for a branch to write.
+
+**And the connector's own DTO does not restate it either** (round 14). Both Mintsoft DTO
+builders went on computing `configured` a second way —
+`Boolean(connection.baseUrl.trim() && mintsoftHasAuthMaterial(settings))`, which tests only
+that the stored string is non-blank — and the Mintsoft screens read *that* nested value.
+On the case round 12 fixed (an unparseable stored base URL) the two answers diverged:
+`/sync` printed "Configured" and left Run Product Verify / Run Bundle Verify / Poll Returns
+**enabled**, and onboarding printed "Connected to <endpoint>", while the envelope beside
+them said the connection could not make a single call. The fix is the **deletion**:
+`MintsoftConnectionStatus` has no `configured` field, so `data.status.configured` is a
+compile error; the envelope's verdict is handed to the connector's screen as a prop
+(`WmsPanelRenderProps.configured`, `WmsConnectionFormProps.configured`). Warehouse
+discovery inside the dashboard builder was gated on the same expression and now asks
+`isWmsConnectorConfigured('mintsoft')`. `mintsoftHasAuthMaterial` — whose only reason to
+exist was keeping those two status builders in step — is deleted, so there is one predicate
+to reach for. `tests/wms-configured-verdict-renderers.test.ts` drives the real facades, the
+real DTO builders and the **real `MintsoftClient` / onboarding form** and asserts on the
+markup and on whether the three verification buttons are disabled.
 
 **And it is read through `isWmsConnectorConfigured`, never called bare** (round 10).
 `isConfigured()` answers a question, and *a question that throws has not been

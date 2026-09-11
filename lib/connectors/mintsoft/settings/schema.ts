@@ -207,33 +207,21 @@ export async function getMintsoftSettings(): Promise<MintsoftSettings> {
   return result
 }
 
-/**
- * One mode-aware "is there usable auth material?" predicate, shared by the
- * dashboard and onboarding status so they cannot drift apart.
+/*
+ * `mintsoftHasAuthMaterial` WAS HERE, and is deleted (o3d-remove-shiphero round 14, Codex HIGH 2).
  *
- * Lives HERE and not in app/actions/mintsoft-sync.ts because that file is
- * `'use server'`, where every export must be an async server action — a
- * synchronous export there compiles under tsc but fails `next build`.
+ * Its own docstring said what it was for: "shared by the dashboard and onboarding status so they
+ * cannot drift apart". Those two status builders were its ONLY callers, and both have stopped
+ * computing `configured` at all — the one verdict is `isMintsoftConfigured()`, which answers the
+ * same question about auth material AND about the base URL, on the values a request is actually
+ * built from. Leaving a second, laxer predicate for "is Mintsoft set up?" lying about in an exported
+ * module is how this defect reached its ninth layer; there is now one function to reach for.
+ *
+ * ITS COVERAGE MOVED RATHER THAN VANISHED. The mode-awareness case it had in
+ * tests/mintsoft-auth-mode.test.ts is now asserted against `isMintsoftConfigured` in
+ * tests/wms-configured-predicate-whitespace.test.ts, whose `api_key` arm had no case at all before
+ * round 14 — deleting a duplicate must not delete the only coverage of the rule it duplicated.
  */
-export function mintsoftHasAuthMaterial(
-  settings: Pick<MintsoftSettings,
-    'mintsoft_auth_mode' | 'mintsoft_static_api_key' | 'mintsoft_api_key' | 'mintsoft_username' | 'mintsoft_password'>,
-): boolean {
-  let mode: MintsoftAuthMode
-  try {
-    mode = resolveMintsoftAuthMode(settings.mintsoft_auth_mode)
-  } catch {
-    // A malformed mode is a broken configuration, not a configured one.
-    return false
-  }
-
-  if (mode === 'api_key') return Boolean(settings.mintsoft_static_api_key.trim())
-
-  return Boolean(
-    settings.mintsoft_api_key.trim()
-      || (settings.mintsoft_username.trim() && settings.mintsoft_password.trim()),
-  )
-}
 
 /**
  * o3d-hl8l r5 (Codex r4 finding 2) — THE DELTA-RESET GENERATION.
