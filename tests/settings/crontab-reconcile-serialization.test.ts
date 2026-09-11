@@ -6175,9 +6175,13 @@ test('[o3d-batch-ret] a unit census that stopped part-way is REFUSED, rather tha
 //
 // `writeCrontab` resolved `{ success: true }` on `code === 0` and nothing read the crontab back, so
 // the whole route's evidence that the scheduler was up to date was the exit status of a command.
-// Those two facts come apart on the unit this repo ships: `/usr/bin/crontab` is setgid `crontab`,
-// `deploy/systemd/ims-stage.service` sets `NoNewPrivileges=true`, and the kernel therefore ignores
-// the setgid bit on exec — measured on the deployment host, same binary and same user:
+//
+// The suppressed setgid transition is NOT what makes those two facts come apart at the WRITE. A
+// unit that cannot reach the spool fails the read `reconcileCrontab` takes first and returns there,
+// never reaching `crontab -` at all — so it is the READ guard that case belongs to, and the
+// measurement below is what pins THAT. What the confirmation catches is a write accepted over a
+// spool holding something else: a writer outside this app's lock, or a `crontab` on PATH that is
+// not the client we think it is. Measured on the deployment host, same binary and same user:
 //
 //   ordinary exec                            `crontab -l` -> exit 0, crontab returned
 //   setpriv --no-new-privs                   `crontab -l` -> exit 1, "fopen: Permission denied"
