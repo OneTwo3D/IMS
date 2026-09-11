@@ -50,6 +50,11 @@
  * `resolveEmailOutboxDependencies` is the single check, before the first query, for the callers
  * tsc never sees (a cast, `any`, JavaScript). See `EmailOutboxHarness` for the full history.
  *
+ * AND THE CLIENT IN THAT HARNESS IS ONE THIS MODULE MINTED (r18). Identity against `db` decided a
+ * question next door to the real one — a structural wrapper of `db` is not `db` and writes to the
+ * same rows — so the decision is inverted: `createEmailOutboxHarnessClient` mints, a module-private
+ * `WeakSet` records, and the guard accepts nothing it did not mint.
+ *
  * AND THE CHECK READS EACH FACT EXACTLY ONCE (r7). It enumerates the caller's keys with
  * `Reflect.ownKeys` behind a plain-prototype rule, so the names it sees are exactly the names a
  * property read can resolve; and it returns a SNAPSHOT of the values it validated rather than the
@@ -140,6 +145,185 @@ export type EmailOutboxClient = {
   }
 }
 
+/**
+ * A HARNESS CLIENT IS MINTED, NOT RECOGNISED (o3d-alnk r18, Codex HIGH).
+ *
+ * THE HOLE THIS CLOSES, AND WHY THE PREVIOUS SHAPE COULD NOT CLOSE IT. Until r18 the guard asked
+ * ONE question of `harness.client`: `value === db`. That question is ADJACENT to the one that
+ * matters and is not the same question. `{ emailOutbox: db.emailOutbox, emailSuppression:
+ * db.emailSuppression }` is a different object — it fails the identity test and PASSES — while
+ * every read and every UPDATE it carries lands on the real `email_outbox` rows. Paired with the
+ * fake sender, fake preparer and fake logger that complete a harness, the drain then claims
+ * twenty-five genuine customer emails, delivers nothing, and stamps them SENT. That is precisely
+ * the production/test mixture the all-or-nothing shape exists to forbid, reached through the
+ * guard rather than around it.
+ *
+ * ENUMERATING WRAPPER SHAPES IS THE SAME MISTAKE ONE LEVEL OUT. A spread, a getter-backed
+ * forwarder, a `Proxy` over `db`, a subclass, a `$extends` client: each reaches the same rows and
+ * each is a different shape. A guard that must RECOGNISE production is a blacklist, and this
+ * surface has now spent eight HIGHs learning what blacklists do here.
+ *
+ * SO THE DECISION IS INVERTED: THE ONLY CLIENT THE DRAIN ACCEPTS IS ONE THIS MODULE MINTED.
+ * `createEmailOutboxHarnessClient` builds a fresh, frozen, two-delegate object and records it in a
+ * module-private `WeakSet`; `resolveEmailOutboxDependencies` accepts a client if and only if that
+ * set holds it. Nothing a caller constructs is in that set — not `db`, not a structural wrapper of
+ * it, not a spread of a minted client, not a `Proxy` around one, not an object that copies the
+ * brand property (the brand is a `WeakSet` membership, not a field to be copied). The capability
+ * has to be MINTED, and production has no way to mint it, so "is this the production client" stops
+ * being a question anyone has to answer correctly.
+ *
+ * THE TYPE CARRIES IT TOO. `EmailOutboxHarness['client']` is the branded `EmailOutboxHarnessClient`,
+ * which is not constructible by a type assertion from a plain object literal — so a caller who
+ * assembles a client by hand fails `tsc` first and the runtime refusal second.
+ *
+ * AND THE MINT IS NOT A RUBBER STAMP: IT ASKS WHERE THE WRITES LAND. A harness client is legitimately
+ * either a fixture the test drives in memory, or a REAL Prisma client pointed at a database the lane
+ * created (`tests/concurrency` does exactly that). Those are the two `writesTo` arms, and the second
+ * is CHECKED: a URL naming the database in `DATABASE_URL` — the live-served one on a dev box — is
+ * refused, because a real client aimed at the configured database is the accident that puts this
+ * drain on genuine rows without anybody writing `db` anywhere.
+ *
+ * WHAT IS STILL NOT CLOSED, SAID PLAINLY RATHER THAN IMPLIED. A caller who WANTS production rows in
+ * a harness can still write `createEmailOutboxHarnessClient({ emailOutbox: db.emailOutbox, ... ,
+ * writesTo: { kind: 'in-memory' } })` — a minted client wrapping production delegates, with a
+ * destination that is simply a lie. No in-process check can catch it: a delegate does not know which
+ * database it writes to, and Prisma delegates have no stable identity to compare against either
+ * (`db.emailOutbox` is a property read, not a singleton one can rely on). What HAS changed is that
+ * this is now a deliberate, single-line, greppable act at the ONE call site that can perform it,
+ * instead of an object shape that passes a guard by accident. The same residue applies to the three
+ * function members (`sendEmail: (m) => realMailer(m)` wraps rather than names), and it is filed as
+ * o3d-dhhd rather than papered over.
+ */
+declare const EMAIL_OUTBOX_HARNESS_CLIENT_BRAND: unique symbol
+
+/**
+ * A client `createEmailOutboxHarnessClient` minted. The brand is declare-only: it exists in the
+ * type system and on no runtime object, so it cannot be spelled by a caller and cannot be copied
+ * off a minted client either. The runtime authority is the `WeakSet` below; this is the compile-
+ * time half of the same rule.
+ */
+export type EmailOutboxHarnessClient = EmailOutboxClient & {
+  readonly [EMAIL_OUTBOX_HARNESS_CLIENT_BRAND]: 'minted by createEmailOutboxHarnessClient'
+}
+
+/**
+ * WHERE A HARNESS CLIENT'S WRITES LAND. Two arms, because there are two legitimate kinds of harness
+ * client and no third:
+ *
+ *   `in-memory` — delegates the caller implements over its own state. Nothing leaves the process.
+ *   `database`  — a real client on a database the lane created. The URL is checked against
+ *                 `DATABASE_URL`, so the configured (on this host, LIVE-SERVED) database is refused.
+ */
+export type EmailOutboxHarnessDestination =
+  | { kind: 'in-memory' }
+  | { kind: 'database'; url: string }
+
+/**
+ * THE MINT REGISTER. Module-private and a `WeakSet`, so membership is not a property of the object:
+ * it cannot be read off one, copied onto another, forged by a `Proxy` trap, or survive a spread.
+ */
+const MINTED_HARNESS_CLIENTS = new WeakSet<object>()
+
+function refuseHarnessClientMint(detail: string): never {
+  throw new Error(
+    `createEmailOutboxHarnessClient: ${detail}. A harness client is MINTED by this module and is the `
+    + 'only client `processPendingEmailOutbox` accepts, because no check can tell the production '
+    + 'client from a structural wrapper of it that reaches the same rows (o3d-alnk).',
+  )
+}
+
+/** The database a Postgres URL names, or `null` if it names none. */
+function databaseNameOf(url: string): string | null {
+  let parsed: URL
+  try {
+    parsed = new URL(url)
+  } catch {
+    refuseHarnessClientMint(`\`writesTo.url\` is not a URL: ${JSON.stringify(url)}`)
+  }
+  const name = decodeURIComponent(parsed.pathname.replace(/^\//, ''))
+  return name === '' ? null : name
+}
+
+/**
+ * MINT A CLIENT THE DRAIN WILL ACCEPT.
+ *
+ * Every field is read EXACTLY ONCE, for the reason the whole of `resolveEmailOutboxDependencies` is
+ * written that way (r7): what is validated is what is returned, so a getter has no second turn. The
+ * object handed back is FRESH and FROZEN — the caller cannot swap a delegate on it afterwards — and
+ * it is the object registered in the mint set, so a copy of it is not a minted client.
+ */
+export function createEmailOutboxHarnessClient(input: {
+  emailOutbox: EmailOutboxClient['emailOutbox']
+  emailSuppression: EmailOutboxClient['emailSuppression']
+  writesTo: EmailOutboxHarnessDestination
+}): EmailOutboxHarnessClient {
+  const candidate: unknown = input
+  if (candidate === null || typeof candidate !== 'object') {
+    refuseHarnessClientMint(`expected an object; received ${candidate === null ? 'null' : typeof candidate}`)
+  }
+  const fields = candidate as Record<string, unknown>
+
+  // THE ONLY READ of each field.
+  const emailOutbox = fields.emailOutbox
+  const emailSuppression = fields.emailSuppression
+  const writesTo = fields.writesTo
+
+  for (const [name, delegate] of [['emailOutbox', emailOutbox], ['emailSuppression', emailSuppression]] as const) {
+    if (delegate === null || typeof delegate !== 'object') {
+      refuseHarnessClientMint(
+        `\`${name}\` is ${delegate === null ? 'null' : typeof delegate}; a harness client carries both `
+        + 'delegates or it is not a client the drain can use',
+      )
+    }
+  }
+
+  if (writesTo === null || typeof writesTo !== 'object') {
+    refuseHarnessClientMint(
+      `\`writesTo\` is ${writesTo === null ? 'null' : typeof writesTo}; say where this client's writes `
+      + "land — `{ kind: 'in-memory' }` or `{ kind: 'database', url }`",
+    )
+  }
+  const destination = writesTo as Record<string, unknown>
+  const kind = destination.kind // THE ONLY READ.
+  if (kind === 'database') {
+    const url = destination.url // THE ONLY READ.
+    if (typeof url !== 'string') {
+      refuseHarnessClientMint(`\`writesTo.url\` must be a string; received ${typeof url}`)
+    }
+    const lane = databaseNameOf(url)
+    if (lane === null) {
+      refuseHarnessClientMint('`writesTo.url` names no database, so there is nothing to check it against')
+    }
+    // THE CHECK WITH TEETH. `DATABASE_URL` is the application's own database — on this host the
+    // LIVE-SERVED one — and a real client pointed at it drains real customer rows through whatever
+    // fake sender completes the harness. Compared by NAME alone, deliberately: that refuses MORE
+    // than a host-and-name comparison would, and refusing more is the safe direction here.
+    const configured = process.env.DATABASE_URL
+    const configuredName = configured === undefined || configured === '' ? null : databaseNameOf(configured)
+    if (configuredName !== null && configuredName === lane) {
+      refuseHarnessClientMint(
+        `\`writesTo.url\` names ${lane}, which is the database DATABASE_URL configures. A harness `
+        + 'client on the configured database is not a harness: its writes land on the real queue, and '
+        + 'the fake sender that completes the harness stamps genuine customer email SENT with nothing '
+        + 'delivered. Provision a database for the lane (tests/helpers/throwaway-database.ts)',
+      )
+    }
+  } else if (kind !== 'in-memory') {
+    refuseHarnessClientMint(
+      `\`writesTo.kind\` must be 'in-memory' or 'database'; received ${JSON.stringify(kind)}`,
+    )
+  }
+
+  // FRESH, FROZEN, AND THE OBJECT THAT IS REGISTERED. A spread of this is a different object and is
+  // therefore not minted, which is the property that makes the register meaningful.
+  const client = Object.freeze({
+    emailOutbox: emailOutbox as EmailOutboxClient['emailOutbox'],
+    emailSuppression: emailSuppression as EmailOutboxClient['emailSuppression'],
+  })
+  MINTED_HARNESS_CLIENTS.add(client)
+  return client as EmailOutboxHarnessClient
+}
+
 /** A claim this worker holds. The triple is the fencing token every terminal write repeats. */
 type EmailClaim = {
   id: string
@@ -190,13 +374,22 @@ type EmailClaim = {
  * JavaScript. `resolveEmailOutboxDependencies` now enumerates with `Reflect.ownKeys` behind a
  * plain-prototype rule and returns a SNAPSHOT of what it validated.
  *
- * WHAT IT STILL CANNOT FORBID, STATED PLAINLY. A caller can write `harness: { client: myDouble,
- * sendEmail: realMailer, ... }` by importing the real mailer and NAMING it. No type stops a
- * deliberate act of naming a production function. What is gone is the SILENT one — the missing
- * field that quietly became production. `assertEmailOutboxHarness` closes the two members where
- * naming production is destructive rather than merely odd (see there); the rest is documented,
- * not enforced, because pretending otherwise would be the same false comfort the option union
- * gave for three rounds.
+ * ROUND 18 TAKES THE CLIENT OUT OF THE GUARD'S HANDS ENTIRELY. `client` was refused by IDENTITY
+ * against `db`, which answers an ADJACENT question: `{ emailOutbox: db.emailOutbox,
+ * emailSuppression: db.emailSuppression }` is not `db`, so it passed — and it reaches the same
+ * customer rows. The client member is now a MINTED capability
+ * (`createEmailOutboxHarnessClient`, see there): the drain accepts a client if and only if this
+ * module built it, so no shape has to be recognised and no wrapper can be enumerated past it.
+ *
+ * WHAT IT STILL CANNOT FORBID, STATED PLAINLY. A caller can write `sendEmail: realMailer` by
+ * importing the real mailer and NAMING it, or hide it one call deep as `(m) => realMailer(m)`; and
+ * a caller can mint a client over production delegates while declaring an in-memory destination.
+ * No type and no runtime check stops a deliberate act of naming or wrapping a production value.
+ * What is gone is the SILENT one — the missing field that quietly became production, and the
+ * wrapper shape that passed an identity test. `resolveEmailOutboxDependencies` refuses the three
+ * function members by identity as a backstop; the rest is documented (o3d-dhhd), not enforced,
+ * because pretending otherwise would be the same false comfort the option union gave for three
+ * rounds.
  *
  * WHY EVERY MEMBER IS ON IT, INCLUDING THE THREE THAT LOOK HARMLESS:
  *
@@ -213,12 +406,27 @@ type EmailClaim = {
  * line it was already writing.
  */
 export type EmailOutboxHarness = {
-  client: EmailOutboxClient
+  /**
+   * MINTED, NEVER ASSEMBLED (r18). `EmailOutboxHarnessClient` carries a `declare`-only brand, so
+   * the only expression with this type is a `createEmailOutboxHarnessClient` call: an object
+   * literal — `{ emailOutbox: db.emailOutbox, emailSuppression: db.emailSuppression }`, the exact
+   * wrapper that used to pass the identity check — does not compile here, and is refused at
+   * runtime too because it is not in the mint register.
+   */
+  client: EmailOutboxHarnessClient
   sendEmail: typeof sendEmail
   prepareQueuedEmail: typeof prepareQueuedEmail
   logActivity: typeof logActivity
   now: () => Date
 }
+
+/**
+ * WHAT THE RESOLVER HANDS THE DRAIN. Identical to `EmailOutboxHarness` except that the client has
+ * lost its brand: the brand is an ADMISSION TICKET, checked once at the door, and the drain has no
+ * use for it afterwards. Keeping it would force the resolver to cast a snapshot INTO a brand it did
+ * not mint, which is exactly the "assert what you wish were true" move this file exists to avoid.
+ */
+export type ResolvedEmailOutboxDependencies = Omit<EmailOutboxHarness, 'client'> & { client: EmailOutboxClient }
 
 /**
  * The drain's ONLY option. One field, optional, all-or-nothing.
@@ -236,12 +444,26 @@ export type ProcessEmailOutboxResult = {
   sent: number
   failed: number
   /**
-   * Rows this worker claimed, acted on, and was then REFUSED the terminal write for, because
-   * another worker had reclaimed the row while this one was on the SMTP socket. Non-zero means
-   * a duplicate send almost certainly went out — it is the only signal that says so, and it
+   * Rows this worker claimed, HANDED TO THE SENDER, and was then refused the terminal write for,
+   * because another worker had reclaimed the row while this one was on the SMTP socket. Non-zero
+   * means a duplicate send almost certainly went out — it is the only signal that says so, and it
    * used to be silent (the unfenced `update` simply landed).
+   *
+   * ONLY POST-SEND REFUSALS ARE COUNTED HERE (r18, Codex MEDIUM). A claim can also be lost BEFORE
+   * any send is attempted — the suppression lookup sits between the claim and the sender, and both
+   * workers can settle (or be refused) FAILED with neither of them having touched SMTP. Counting
+   * that here said "a duplicate delivery is likely" about a path on which NOTHING WAS DELIVERED AT
+   * ALL. It is `conflictedWithoutSend` instead.
    */
   conflicted: number
+  /**
+   * Rows this worker claimed and lost BEFORE it attempted a send, so the terminal write was
+   * refused with nothing ever handed to the sender. THIS WORKER PUT NOTHING ON THE WIRE and no
+   * duplicate delivery follows from it; the row belongs to whoever settled it. Worth counting
+   * rather than dropping: it measures claim contention, which is the same signal `conflicted`
+   * carries minus the delivery consequence.
+   */
+  conflictedWithoutSend: number
 }
 
 function normalizeEmail(value: string): string {
@@ -340,13 +562,26 @@ async function settleClaimedEmail(
 const EMAIL_OUTBOX_HARNESS_MEMBERS = ['client', 'sendEmail', 'prepareQueuedEmail', 'logActivity', 'now'] as const
 
 /**
- * The production dependency each harness member REPLACES, for the identity refusal below.
+ * The production dependency each harness FUNCTION member REPLACES, for the identity refusal below.
+ *
  * `now` has no entry: production's clock is a fresh `() => new Date()` closure with no stable
  * identity to compare against, and a caller-supplied clock is not dangerous on its own — it is
  * dangerous combined with production ROWS, which the harness shape already makes impossible.
+ *
+ * AND `client` HAS NO ENTRY EITHER, SINCE r18 — THAT IS THE POINT OF THE MINT. `client: db` used to
+ * be refused here by identity, which answered the ADJACENT question: a structural wrapper such as
+ * `{ emailOutbox: db.emailOutbox, emailSuppression: db.emailSuppression }` is not `db`, passed, and
+ * reached the same rows. Identity is no longer consulted for the client at all; the only accepted
+ * client is one this module MINTED, which refuses `db` and every wrapper of it by the same rule.
+ *
+ * THESE THREE ARE STILL COMPARED BY IDENTITY, AND IT IS A BACKSTOP RATHER THAN A DECISION
+ * PROCEDURE. `sendEmail: realMailer` is caught; `sendEmail: (m) => realMailer(m)` is not, and
+ * cannot be — a function does not say what it closes over. It is kept because the value it does
+ * catch (the real mailer NAMED in a harness) is the one that puts a test message on the wire, and
+ * dropping a check that catches something real would be a different mistake. The residue is
+ * o3d-dhhd.
  */
 const EMAIL_OUTBOX_PRODUCTION_DEPENDENCIES: Record<string, unknown> = {
-  client: db,
   sendEmail,
   prepareQueuedEmail,
   logActivity,
@@ -474,7 +709,7 @@ function ownMemberNames(value: object, what: string): (string | symbol)[] {
  * THE PRODUCTION SET IS BUILT HERE AND ONLY HERE, in one object literal, from the module's own
  * imports. No caller value can reach it, because a caller value never enters this branch.
  */
-export function resolveEmailOutboxDependencies(options: ProcessEmailOutboxOptions): EmailOutboxHarness {
+export function resolveEmailOutboxDependencies(options: ProcessEmailOutboxOptions): ResolvedEmailOutboxDependencies {
   const candidate: unknown = options
   if (candidate === null || typeof candidate !== 'object') {
     refuseEmailOutboxOptions(`options must be an object or omitted; received ${candidate === null ? 'null' : typeof candidate}`)
@@ -536,16 +771,15 @@ export function resolveEmailOutboxDependencies(options: ProcessEmailOutboxOption
       )
     }
     // NOT THE PRODUCTION DEPENDENCY ITSELF. A complete harness is safe because it is the CALLER'S
-    // world; naming a production function inside it re-creates the mixture by hand. `client: db`
-    // with a fake sender is the r2 hazard rebuilt, and `sendEmail: realMailer` with a fixture
-    // client is its mirror — the one that actually puts a message on the wire. Applied to all four
-    // rather than to those two, because "which member is harmless" is the judgement that has been
-    // wrong in every round so far.
+    // world; naming a production function inside it re-creates the mixture by hand.
+    // `sendEmail: realMailer` with a fixture client is the case that actually puts a message on the
+    // wire. It covers the three FUNCTION members; `client` is not decided by identity any more (see
+    // EMAIL_OUTBOX_PRODUCTION_DEPENDENCIES) and `now` never was.
     //
-    // FIRST, BEFORE ANY PROPERTY OF THE VALUE IS READ. "Is this the production object?" is
-    // answerable by identity alone, and the shape probe below is NOT: reading `.emailOutbox` off
-    // the global Prisma client instantiates a delegate, and off a test's tripwire double it fires
-    // the tripwire — so a `client: db` refusal has to happen before anything touches it.
+    // FIRST, BEFORE ANY PROPERTY OF THE VALUE IS READ, for both this check and the mint-register
+    // check below. Neither reads a property: `===` and `WeakSet.has` touch nothing. That matters
+    // because reading `.emailOutbox` off the global Prisma client instantiates a delegate, and off
+    // a test's tripwire double it fires the tripwire — so the refusal has to land first.
     if (Object.hasOwn(EMAIL_OUTBOX_PRODUCTION_DEPENDENCIES, member) && value === EMAIL_OUTBOX_PRODUCTION_DEPENDENCIES[member]) {
       refuseEmailOutboxOptions(
         `\`harness.${member}\` IS the production dependency it replaces; a harness is the caller's own `
@@ -557,28 +791,32 @@ export function resolveEmailOutboxDependencies(options: ProcessEmailOutboxOption
       if (typeof value !== 'object') {
         refuseEmailOutboxOptions(`\`harness.client\` must be a client object; received ${typeof value}`)
       }
-      const clientValue = value as Record<string, unknown>
-      // The delegates are snapshotted for the same reason the members are. Without this,
-      // `settleClaimedEmail` re-reads `client.emailOutbox` on EVERY terminal write and the drain
-      // re-reads `client.emailSuppression` once per row — so a client whose delegate is an
-      // accessor could pass the probe as a fixture and then serve the production delegate to the
-      // writes. Same defect, one level down.
-      const readDelegate = (model: string): object => {
-        const delegate = clientValue[model] // THE ONLY READ of this delegate.
-        if (delegate === null || typeof delegate !== 'object') {
-          refuseEmailOutboxOptions(
-            `\`harness.client.${model}\` is missing; this is not a client the drain can use, and a `
-            + 'partial one fails at the first query rather than here',
-          )
-        }
-        return delegate as object
+      // THE WHOLE CLIENT DECISION, AND IT ASKS NOTHING ABOUT THE OBJECT (r18, Codex HIGH). Not its
+      // identity, not its shape, not its prototype: only whether THIS MODULE MINTED IT. `db` is
+      // refused, and so is `{ emailOutbox: db.emailOutbox, emailSuppression: db.emailSuppression }`
+      // — which passed the old identity check while reaching exactly the same customer rows — and
+      // so is a spread or a Proxy of a minted client, because neither is the registered object.
+      // `WeakSet.has` reads no property of `value`, so this lands before a tripwire double or a
+      // Prisma delegate getter can be touched.
+      if (!MINTED_HARNESS_CLIENTS.has(value as object)) {
+        refuseEmailOutboxOptions(
+          '`harness.client` was NOT MINTED by `createEmailOutboxHarnessClient`. This drain does not try '
+          + 'to RECOGNISE the production client, because it cannot: a structural wrapper such as '
+          + '`{ emailOutbox: db.emailOutbox, emailSuppression: db.emailSuppression }` is a different '
+          + 'object that reaches the same rows, and enumerating wrapper shapes is a blacklist. It '
+          + 'accepts only a client minted by this module for a caller that declared where its writes '
+          + 'land, and production has no way to mint one',
+        )
       }
-      // A TYPED LITERAL, not a bag of names. Add a third delegate to `EmailOutboxClient` and this
-      // stops compiling — which is the only thing that stops a new delegate being quietly re-read
-      // off the caller's client for ever, since the returned snapshot is cast.
+      // A minted client is FRESH, FROZEN and built from delegates this module read once, so the
+      // r7 time-of-check/time-of-use hazard one level down — an accessor that shows a fixture to the
+      // probe and the production delegate to the writes — is resolved at the mint rather than here.
+      // The snapshot is still rebuilt as a TYPED LITERAL: add a third delegate to `EmailOutboxClient`
+      // and this stops compiling, which is what stops a new delegate being quietly re-read for ever.
+      const minted = value as EmailOutboxHarnessClient
       const snapshotClient: EmailOutboxClient = {
-        emailOutbox: readDelegate('emailOutbox') as EmailOutboxClient['emailOutbox'],
-        emailSuppression: readDelegate('emailSuppression') as EmailOutboxClient['emailSuppression'],
+        emailOutbox: minted.emailOutbox,
+        emailSuppression: minted.emailSuppression,
       }
       validated[member] = snapshotClient
       continue
@@ -617,7 +855,7 @@ export async function processPendingEmailOutbox(
   } = resolveEmailOutboxDependencies(options)
 
   const staleCutoff = new Date(now().getTime() - EMAIL_CLAIM_STALE_MS)
-  const result: ProcessEmailOutboxResult = { processed: 0, sent: 0, failed: 0, conflicted: 0 }
+  const result: ProcessEmailOutboxResult = { processed: 0, sent: 0, failed: 0, conflicted: 0, conflictedWithoutSend: 0 }
 
   const pending = await client.emailOutbox.findMany({
     where: {
@@ -637,13 +875,32 @@ export async function processPendingEmailOutbox(
     take: EMAIL_OUTBOX_BATCH_SIZE,
   })
 
-  /** Record a refused terminal write. `sent` was already delivered when this fires on success. */
-  const recordConflict = (claim: EmailClaim, phase: string): void => {
-    result.conflicted++
+  /**
+   * Record a refused terminal write, SAYING WHETHER THIS WORKER HAD TOUCHED THE SMTP SOCKET.
+   *
+   * Those are different facts and they used to be reported as one (r18, Codex MEDIUM). The
+   * suppression lookup runs AFTER the claim and BEFORE the sender, so a worker can lose the row
+   * there having attempted no send whatever — and the old counter still said "a duplicate delivery
+   * is likely" and the old log still said the worker "was on the SMTP socket". Both were false on
+   * that path, and an operator reading either would go looking for a second copy of an email that
+   * this drain never sent.
+   */
+  const recordConflict = (claim: EmailClaim, phase: string, sendAttempted: boolean): void => {
+    if (sendAttempted) {
+      result.conflicted++
+      console.error(
+        `[email-outbox] row ${claim.id}: terminal write REFUSED after ${phase} — the claim ${claim.token} `
+        + 'was reclaimed by another worker while this one was on the SMTP socket (o3d-alnk). '
+        + 'A duplicate delivery is likely; the row was NOT re-armed.',
+      )
+      return
+    }
+    result.conflictedWithoutSend++
     console.error(
       `[email-outbox] row ${claim.id}: terminal write REFUSED after ${phase} — the claim ${claim.token} `
-      + 'was reclaimed by another worker while this one was on the SMTP socket (o3d-alnk). '
-      + 'A duplicate delivery is likely; the row was NOT re-armed.',
+      + 'was reclaimed by another worker BEFORE this one attempted any send (o3d-alnk). '
+      + 'THIS WORKER DELIVERED NOTHING, so no duplicate follows from it; the row was NOT re-armed '
+      + 'and belongs to the worker that settled it.',
     )
   }
 
@@ -691,8 +948,10 @@ export async function processPendingEmailOutbox(
         lastError: `Suppressed recipient: ${suppression.reason}`,
         processingStartedAt: null,
       })
+      // NO SEND WAS ATTEMPTED ON THIS PATH — the suppression branch returns before the sender is
+      // called at all, which is the whole reason it is counted apart.
       if (settled) result.failed++
-      else recordConflict(claim, 'a suppression check')
+      else recordConflict(claim, 'a suppression check', false)
       continue
     }
 
@@ -729,7 +988,7 @@ export async function processPendingEmailOutbox(
           processingStartedAt: null,
         })
         if (settled) result.sent++
-        else recordConflict(claim, 'a successful send')
+        else recordConflict(claim, 'a successful send', true)
         continue
       }
 
@@ -762,7 +1021,7 @@ export async function processPendingEmailOutbox(
       // This is the write the issue was raised for: unfenced, it re-armed a row another
       // worker had already settled to SENT, so the duplication was not bounded at two.
       if (settled) result.failed++
-      else recordConflict(claim, 'a failed send')
+      else recordConflict(claim, 'a failed send', true)
     } catch (error) {
       const attempts = email.attempts + 1
       const permanentFailure = attempts >= EMAIL_MAX_ATTEMPTS
@@ -774,7 +1033,7 @@ export async function processPendingEmailOutbox(
         processingStartedAt: null,
       })
       if (settled) result.failed++
-      else recordConflict(claim, 'a thrown send')
+      else recordConflict(claim, 'a thrown send', true)
     }
   }
 
@@ -783,7 +1042,8 @@ export async function processPendingEmailOutbox(
       entityType: 'SYSTEM',
       action: 'email_outbox_processed',
       tag: 'system',
-      description: `Email outbox: ${result.sent} sent, ${result.failed} failed, ${result.conflicted} fenced out of ${result.processed} processed`,
+      description: `Email outbox: ${result.sent} sent, ${result.failed} failed, ${result.conflicted} fenced after a send, `
+        + `${result.conflictedWithoutSend} fenced before one, out of ${result.processed} processed`,
       metadata: result,
       resolveUser: false,
     })

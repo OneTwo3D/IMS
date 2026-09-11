@@ -29,11 +29,13 @@ import { fileURLToPath } from 'node:url'
 
 import {
   EMAIL_OUTBOX_UNDELIVERED_REFERENCE_INDEX,
+  createEmailOutboxHarnessClient,
   isUndeliveredEmailCollision,
   processPendingEmailOutbox,
   queueEmail,
   type EmailOutboxClient,
   type EmailOutboxHarness,
+  type EmailOutboxHarnessClient,
   type EmailOutboxRow,
 } from '@/lib/email-outbox'
 
@@ -104,7 +106,7 @@ type MakeClientOptions = {
 }
 
 function makeClient(rows: EmailOutboxRow[], options: MakeClientOptions = {}): {
-  client: EmailOutboxClient
+  client: EmailOutboxHarnessClient
   rows: EmailOutboxRow[]
   updateManyCalls: UpdateManyCall[]
   created: Record<string, unknown>[]
@@ -113,7 +115,7 @@ function makeClient(rows: EmailOutboxRow[], options: MakeClientOptions = {}): {
   const updateManyCalls: UpdateManyCall[] = []
   const created: Record<string, unknown>[] = []
 
-  const client: EmailOutboxClient = {
+  const delegates: EmailOutboxClient = {
     emailOutbox: {
       async findMany(args: unknown) {
         const { where, orderBy, take } = args as { where: Where; orderBy?: unknown; take?: number }
@@ -151,6 +153,18 @@ function makeClient(rows: EmailOutboxRow[], options: MakeClientOptions = {}): {
       },
     },
   }
+
+  /**
+   * MINTED, NOT ASSEMBLED (r18). `harness.client` is the branded `EmailOutboxHarnessClient`, and the
+   * only expression that has that type is this call — an object literal does not compile there and
+   * is refused at runtime as well. The delegates are the same objects the double built, so a test
+   * that swaps one afterwards (the suppression race below) still reaches the drain.
+   */
+  const client = createEmailOutboxHarnessClient({
+    emailOutbox: delegates.emailOutbox,
+    emailSuppression: delegates.emailSuppression,
+    writesTo: { kind: 'in-memory' },
+  })
 
   return { client, rows: store, updateManyCalls, created }
 }
@@ -190,7 +204,7 @@ type PauseWorld = {
   /** The precondition this proof must reach: worker B actually got the row. */
   reclaimHappened: boolean
   /** Worker A's counters, after it resumed from the stalled socket. */
-  workerA: { processed: number; sent: number; failed: number; conflicted: number }
+  workerA: { processed: number; sent: number; failed: number; conflicted: number; conflictedWithoutSend: number }
   /** The row, after A resumed and after the third tick. */
   statusAfterAResumed: string
   deliveriesAfterThirdTick: string[]
@@ -401,9 +415,16 @@ for (const settlePath of ['a successful send', 'a failed send', 'a thrown send']
     assert.equal(reclaimHappened, true, 'the contended path was not reached')
     assert.deepEqual(deliveries, ['worker-A', 'worker-B'])
     assert.deepEqual(
-      { processed: workerA.processed, sent: workerA.sent, failed: workerA.failed, conflicted: workerA.conflicted },
-      { processed: 1, sent: 0, failed: 0, conflicted: 1 },
-      'a worker that no longer owns the row scores neither a send nor a failure OF THAT ROW',
+      {
+        processed: workerA.processed,
+        sent: workerA.sent,
+        failed: workerA.failed,
+        conflicted: workerA.conflicted,
+        conflictedWithoutSend: workerA.conflictedWithoutSend,
+      },
+      { processed: 1, sent: 0, failed: 0, conflicted: 1, conflictedWithoutSend: 0 },
+      'a worker that no longer owns the row scores neither a send nor a failure OF THAT ROW, and it '
+      + 'HAD touched the socket, so the refusal is the one that implies a duplicate delivery',
     )
     assert.equal(rows[0].status, 'SENT', "worker B's outcome stands")
     assert.equal(updateManyCalls.at(-1)?.count, 0, 'the terminal write was issued and refused')
@@ -426,7 +447,7 @@ test('REAL: a worker that still holds its claim settles normally', async () => {
     },
   })
 
-  assert.deepEqual(outcome, { processed: 1, sent: 1, failed: 0, conflicted: 0 })
+  assert.deepEqual(outcome, { processed: 1, sent: 1, failed: 0, conflicted: 0, conflictedWithoutSend: 0 })
   assert.deepEqual(deliveries, ['only-worker'])
   assert.equal(rows[0].status, 'SENT')
   assert.equal(rows[0].lockedBy, null)
@@ -473,7 +494,7 @@ test('the suppression write is fenced too, and no longer fires before the claim'
     },
   })
 
-  assert.deepEqual(outcome, { processed: 1, sent: 0, failed: 1, conflicted: 0 })
+  assert.deepEqual(outcome, { processed: 1, sent: 0, failed: 1, conflicted: 0, conflictedWithoutSend: 0 })
   assert.equal(rows[0].status, 'FAILED')
   // Order matters: the FIRST write is the claim, the SECOND is the suppression settlement.
   // Before o3d-alnk the suppression FAILED was written first, through an unfenced update on a
@@ -510,9 +531,45 @@ test('a reclaimed worker cannot write a suppression FAILED over the winner', asy
   })
 
   assert.equal(reclaimHappened, true, 'the contended path was not reached')
-  assert.equal(workerA.conflicted, 1)
   assert.equal(workerA.failed, 0)
   assert.equal(rows[0].lockedBy, null, "the row is settled and holds worker B's outcome, not A's")
+
+  // THE TELEMETRY, WHICH THIS PROOF USED TO LEAVE UNASSERTED (r18, Codex MEDIUM).
+  //
+  // NEITHER WORKER CALLED THE SENDER on this interleaving: the suppression lookup sits between the
+  // claim and the send, both workers took the suppressed branch, and A's `sendEmail` throws if it is
+  // ever reached. So A lost its claim having put NOTHING on the wire. Counting that as `conflicted`
+  // told an operator "a duplicate delivery is likely" about a drain that delivered nothing at all,
+  // and the log said this worker "was on the SMTP socket" when it had never opened one. The fact is
+  // real and worth counting — it is a lost claim — but it is a DIFFERENT fact, so it has its own
+  // counter and its own sentence.
+  assert.equal(
+    workerA.conflicted,
+    0,
+    'a claim lost BEFORE any send was attempted was reported as a probable duplicate delivery',
+  )
+  assert.equal(workerA.conflictedWithoutSend, 1, "worker A's lost claim is still recorded, not silent")
+})
+
+test('r18: the two conflict counters are told apart by whether the SMTP socket was touched', async () => {
+  // The mirror of the proof above, on the path that DID reach the sender. Same fence, same refusal,
+  // different fact — and the counters have to disagree, or neither of them means anything.
+  const { client, rows } = makeClient([makeRow()])
+  let sends = 0
+
+  const workerA = await drain({
+    client, now: () => T0, prepareQueuedEmail: noPrepare, logActivity: noLog,
+    async sendEmail() {
+      sends += 1
+      // Reclaimed while A is on the socket, exactly as in the pause proof.
+      rows[0].lockedBy = 'another-worker'
+      return { success: false, error: 'SMTP read timeout' }
+    },
+  })
+
+  assert.equal(sends, 1, 'the contended path was not reached: the sender was never called')
+  assert.equal(workerA.conflicted, 1, 'a claim lost AFTER the send is the one that implies a duplicate')
+  assert.equal(workerA.conflictedWithoutSend, 0)
 })
 
 // ---------------------------------------------------------------------------

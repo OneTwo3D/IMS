@@ -945,11 +945,17 @@ test('r11: the ordinary path drops EXACTLY ONCE, leaves nothing behind, and a fi
   assert.deepEqual(inferenceStatements(), [], 'an ownership-inference statement was issued')
 })
 
-test('r11: a DROP the server ANSWERED stays answered even when the teardown fails', async () => {
-  // THE MUTATION THIS EXISTS FOR: recording `'dropped'` after `withMaintenanceClient` RETURNS
+test('r11/r18: a DROP the server ANSWERED stays answered, and the CALL does not fail either', async () => {
+  // THE MUTATION r11 EXISTS FOR: recording `'dropped'` after `withMaintenanceClient` RETURNS
   // instead of the moment the server answers. A failing `client.end()` would then un-record a
   // completed DROP, and the handle would come back SPENT — reporting a possible leak over a
   // database that is provably gone. Same shape, one level out.
+  //
+  // AND THE r18 HALF (Codex LOW): r11 fixed the STATE and left the CALL lying. `client.end()` runs
+  // in `withMaintenanceClient`'s `finally`, so its failure REJECTED `drop()` even though the server
+  // had already confirmed the DROP — and every caller reads that rejection as a failed DROP. The
+  // state was right and the answer handed back was wrong. A teardown failure AFTER a confirmed DROP
+  // is not a failure of the drop, and it no longer reports as one.
   resetWire()
   const handle = await provisionHandle()
   wire.failEndAfterDrop = true
@@ -959,12 +965,71 @@ test('r11: a DROP the server ANSWERED stays answered even when the teardown fail
   // PRECONDITIONS: the DROP ran, the database is gone, and the failure under test is the teardown.
   assert.deepEqual(drops(), [dropStatement()])
   assert.equal(wire.databases.size, 0, 'the fake did not execute the DROP, so the teardown is not what failed')
-  assert.ok(first instanceof Error, 'the failing teardown did not surface at all')
 
-  // THE FINDING: the handle is DROPPED, not SPENT. A second call is a silent no-op.
+  // THE FINDING. `settle` hands back whatever came out; a rejection here is the module telling its
+  // caller that a database it has watched the server delete may still be on the server.
+  // `settle` maps FULFILMENT to null and hands a rejection back as the reason, so `null` here is
+  // "the call succeeded" and anything else is the module reporting a failure it does not have.
+  assert.equal(
+    first,
+    null,
+    `a CONFIRMED DROP was reported as a failure because the connection close failed: ${String(first)}`,
+  )
+
+  // AND the handle is DROPPED, not SPENT. A second call is a silent no-op.
   wire.failEndAfterDrop = false
   await handle.drop()
   assert.deepEqual(drops(), [dropStatement()], 'a completed DROP was un-recorded by a failing teardown')
+})
+
+test('r18: a teardown that fails BEFORE the server answers still rejects — only a CONFIRMED drop is silent', async () => {
+  // THE NON-VACUITY OF THE FIX ABOVE. Swallowing the teardown failure generally would hide the case
+  // that matters: a DROP whose answer never came back. That one must still reject, and the handle
+  // must still be SPENT, or the r11 rule is gone.
+  resetWire()
+  const handle = await provisionHandle()
+  wire.loseDropResponse = true
+
+  const first = await settle(handle.drop())
+  assert.ok(first instanceof Error, 'a DROP whose answer was lost was reported as a success')
+
+  // SPENT, not dropped: a second call is REFUSED BY NAME rather than being a no-op.
+  wire.loseDropResponse = false
+  const second = await settle(handle.drop())
+  assert.ok(second instanceof ThrowawayDatabaseError, 'a spent handle issued a SECOND DROP')
+  assert.match(String(second), /refused to issue a SECOND DROP DATABASE/)
+  assert.deepEqual(drops(), [dropStatement()], 'the spent handle issued a second DROP')
+})
+
+test('r18: a confirmed cleanup DROP is not reported as a database left on the server', async () => {
+  // THE CALLER-VISIBLE HALF OF THE LOW, driven end to end. The migration fails, the cleanup DROP is
+  // ISSUED AND CONFIRMED, and only the connection close fails afterwards. The old code turned that
+  // into "the DROP ... ALSO FAILED, so <name> IS LEFT ON THE SERVER and has to be dropped by hand" —
+  // sending an operator to hunt a database that is gone, and stating a leak as a fact on the one
+  // path where the opposite is established.
+  resetWire()
+  wire.failEndAfterDrop = true
+
+  const outcome = await capture({
+    label: 'alnkfence',
+    mintName: () => MINTED,
+    runMigrations: async () => { throw new Error('migrate refused') },
+  })
+
+  // PRECONDITIONS: the CREATE ran, the cleanup DROP ran, and the database really is gone.
+  assert.deepEqual(creates(), [createStatement()])
+  assert.deepEqual(drops(), [dropStatement()])
+  assert.equal(wire.databases.size, 0, `the cleanup left ${[...wire.databases].join(', ')} behind`)
+
+  assert.ok(outcome instanceof ThrowawayDatabaseError, `expected a named refusal, got ${String(outcome)}`)
+  assert.match(String(outcome), /could not migrate /)
+  assert.match(
+    String(outcome),
+    /The database this lane created was dropped; nothing was left behind/,
+    'a confirmed DROP was reported as a leak because the connection close failed afterwards',
+  )
+  assert.doesNotMatch(String(outcome), /IS LEFT ON THE SERVER/)
+  assert.doesNotMatch(String(outcome), /ALSO FAILED/)
 })
 
 test('r11: the migrator seam cannot reach the r10 rule — it never runs unless the CREATE completed', async () => {

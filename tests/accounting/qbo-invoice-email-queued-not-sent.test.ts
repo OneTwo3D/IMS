@@ -413,3 +413,76 @@ test('ROUND 7: the outbox really does terminalise a row FAILED for a suppressed 
   assert.match(sender, /const permanentFailure = reportedPermanent \|\| attempts >= EMAIL_MAX_ATTEMPTS/)
   assert.match(sender, /status: permanentFailure \? 'FAILED' : 'PENDING'/)
 })
+
+// ---------------------------------------------------------------------------
+// ROUND 18 (Codex MEDIUM) — THE CADENCE IN THAT SENTENCE IS READ OUT OF THE REPO.
+//
+// Round 16 replaced one false count ("one more PENDING row per sweep") with another: "the outbox
+// cron empties PENDING in minutes" and "each sweep finds nothing undelivered and queues one more".
+// Both were ASSERTED FROM MEMORY, and both are wrong the alarming way round — the accounting sweep
+// is the five-minute job and the outbox drain is the HOURLY one, so most sweeps queue nothing and
+// a further copy is paced by the DRAIN.
+//
+// A premise asserted rather than grepped is the defect this test exists to stop repeating, so the
+// two cadences are READ OUT OF THE FILES THAT CONFIGURE THEM and the sentence is checked against
+// what they say. Change either schedule and this fails rather than drifting: an unmapped cron
+// expression is a loud failure, because a new cadence means the sentence has to be read again.
+// ---------------------------------------------------------------------------
+
+/** The cron expressions this sentence has words for. An unmapped one must fail, not be guessed. */
+const SWEEP_CADENCE_WORDS: Record<string, string> = {
+  '*/5 * * * *': 'every five minutes',
+  '*/15 * * * *': 'every fifteen minutes',
+  '0 * * * *': 'hourly',
+}
+
+/** The same, for the documented cadence column of the outbox drain. */
+const DRAIN_CADENCE_WORDS: Record<string, string> = {
+  Hourly: 'hourly',
+  'Every 5 min': 'every five minutes',
+  'Every 15 min': 'every fifteen minutes',
+}
+
+test('r18: the sentence\'s cadences match the cron config and the cron doc, and are not recalled', async () => {
+  const { readFileSync } = await import('node:fs')
+  const { fileURLToPath } = await import('node:url')
+  const repoRoot = fileURLToPath(new URL('../../', import.meta.url))
+
+  // (1) THE SWEEP. `accounting-sync` is the job that drains the pending accounting queue and so is
+  // the job that re-runs this operation.
+  const cronJobs = readFileSync(`${repoRoot}lib/cron-jobs/xero.ts`, 'utf8')
+  const sweep = /slug: 'accounting-sync',[\s\S]*?defaultSchedule: '([^']+)'/.exec(cronJobs)
+  assert.ok(sweep, 'lib/cron-jobs/xero.ts no longer declares an accounting-sync defaultSchedule — the walk found nothing to read')
+  const sweepWords = SWEEP_CADENCE_WORDS[sweep[1]]
+  assert.ok(sweepWords, `accounting-sync now runs on '${sweep[1]}', which this sentence has no words for — re-read it`)
+
+  // (2) THE DRAIN. The email outbox is called by the operator's cron daemon and has no registry
+  // entry, so the repo's only statement of its cadence is the cron table in the settings doc.
+  const settingsDoc = readFileSync(`${repoRoot}help-docs/settings.md`, 'utf8')
+  const drain = /^\|\s*`\/api\/cron\/email-outbox`\s*\|[^|]*\|\s*([^|]+?)\s*\|/m.exec(settingsDoc)
+  assert.ok(drain, 'help-docs/settings.md no longer carries a cron-table row for /api/cron/email-outbox')
+  const drainWords = DRAIN_CADENCE_WORDS[drain[1]]
+  assert.ok(drainWords, `the outbox drain is now documented as '${drain[1]}', which this sentence has no words for — re-read it`)
+
+  // (3) THE SENTENCE, against those two readings.
+  const { describeUnpersistedQboPost } = await import('@/lib/domain/accounting/unrecorded-posted-document')
+  const description = describeUnpersistedQboPost(
+    { entry: { id: 'log-1', type: 'INVOICE_EMAIL', referenceType: 'SalesOrder', referenceId: 'order-1' }, postedExternalId: null },
+    new Error('write conflict'),
+  )
+  assert.match(
+    description,
+    new RegExp(`this sweep is scheduled ${sweepWords} and the outbox drain is scheduled ${drainWords}`),
+    `the record's cadences do not match the repo's: sweep ${sweep[1]}, drain ${drain[1]}`,
+  )
+
+  // And the two round-16 claims are gone rather than merely joined by a correction.
+  assert.doesNotMatch(description, /empties PENDING in minutes/)
+  assert.doesNotMatch(description, /each sweep finds nothing undelivered and queues one more/)
+  assert.doesNotMatch(description, /on every sweep that runs once the copy before it has been delivered/)
+
+  // THE VERDICT IS UNCHANGED AND MUST STAY: what makes this unsafe to replay is repetition after
+  // the row is settled, not the rate at which it repeats.
+  assert.match(description, /ANOTHER COPY OF THE INVOICE EMAIL IS QUEUED TO THE CUSTOMER/)
+  assert.match(description, /the refusal lifts only when a drain settles that row to SENT or FAILED/)
+})

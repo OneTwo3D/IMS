@@ -112,7 +112,10 @@ Both functions attach the generated PDF document to the email automatically.
 ### The Email Queue
 
 Emails are not sent from the button click. They are written to an outbox and delivered by a
-background job, so a slow or unreachable SMTP server never blocks the screen you are on.
+background job (`/api/cron/email-outbox`), so a slow or unreachable SMTP server never blocks the
+screen you are on. That job runs on whatever schedule your cron daemon calls it with — the
+expected cadence is in the cron table under **Settings > System** — so a queued email goes out on
+the job's next run, not immediately.
 
 - **One undelivered copy per document.** If you press the email button again while the first
   copy is still waiting to go out, the system does **not** queue a second one — the activity log
@@ -123,6 +126,13 @@ background job, so a slow or unreachable SMTP server never blocks the screen you
   after which the email is marked failed with the last error.
 - **Suppression.** A recipient the SMTP provider rejects as invalid is added to the suppression
   list, and later emails to that address fail immediately instead of being retried.
+- **What "fenced" means in the activity log.** Each run logs a line like `Email outbox: 3 sent, 0
+  failed, 0 fenced after a send, 0 fenced before one, out of 3 processed`. A *fenced* email is one
+  this run had claimed and another run took over before it finished. The two counts are different
+  facts and are worth reading apart: **fenced after a send** means the message had already been
+  handed to the SMTP server, so the customer has probably received two copies; **fenced before one**
+  means the claim was lost before anything was sent, so nothing went out twice. Neither leaves the
+  email stuck — the run that took the row over is the one that finishes it.
 
 ### Dispatch Email (direct orders)
 

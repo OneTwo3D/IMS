@@ -60,7 +60,7 @@ import { fileURLToPath } from 'node:url'
 import { promisify } from 'node:util'
 import { config } from 'dotenv'
 
-import type { EmailOutboxClient, EmailOutboxHarness } from '@/lib/email-outbox'
+import type { EmailOutboxClient, EmailOutboxHarness, EmailOutboxHarnessClient } from '@/lib/email-outbox'
 import {
   ThrowawayDatabaseError,
   provisionThrowawayDatabase,
@@ -104,6 +104,26 @@ const drainWith = (
   run: typeof import('@/lib/email-outbox').processPendingEmailOutbox,
   harness: EmailOutboxHarness,
 ) => run({ harness })
+
+/**
+ * THE LANE'S HARNESS CLIENT, MINTED AND DECLARED (o3d-alnk r18).
+ *
+ * `harness.client` is a branded type: `lane.db as unknown as EmailOutboxClient` no longer compiles
+ * there and would be refused at runtime as an unminted client. The mint is where this lane says
+ * WHERE ITS WRITES LAND — `lane.database.url`, the database it created — and the mint REFUSES a URL
+ * naming the database `DATABASE_URL` configures, which on this host is the live-served one. So the
+ * accident this whole file could have caused (a real Prisma client drained by a fake sender against
+ * the dev database) is now refused at the door rather than avoided by care.
+ */
+async function laneHarnessClient(lane: Lane): Promise<EmailOutboxHarnessClient> {
+  const { createEmailOutboxHarnessClient } = await import('@/lib/email-outbox')
+  const prisma = lane.db as unknown as EmailOutboxClient
+  return createEmailOutboxHarnessClient({
+    emailOutbox: prisma.emailOutbox,
+    emailSuppression: prisma.emailSuppression,
+    writesTo: { kind: 'database', url: lane.database.url },
+  })
+}
 
 /**
  * Pull one statement out of the SHIPPED migration by marker.
@@ -310,10 +330,11 @@ async function runShippedCollapse(lane: Lane): Promise<void> {
  */
 async function futureSends(lane: Lane, t0: Date): Promise<string[]> {
   const { processPendingEmailOutbox } = await import('@/lib/email-outbox')
+  const client = await laneHarnessClient(lane)
   const delivered: string[] = []
   for (const at of [t0, new Date(t0.getTime() + RECLAIM_AFTER_MS), new Date(t0.getTime() + 2 * RECLAIM_AFTER_MS)]) {
     await drainWith(processPendingEmailOutbox, {
-      client: lane.db as unknown as EmailOutboxClient,
+      client,
       now: () => at,
       prepareQueuedEmail: noPrepare,
       logActivity: noLog,
@@ -418,7 +439,7 @@ test(
           },
         })
 
-        const client = lane.db as unknown as EmailOutboxClient
+        const client = await laneHarnessClient(lane)
         const tReclaim = new Date(t0.getTime() + RECLAIM_AFTER_MS)
         let reclaimHappened = false
 
@@ -453,6 +474,10 @@ test(
         assert.deepEqual(deliveries, ['worker-A', 'worker-B'], 'the reclaim itself always costs one duplicate')
 
         assert.equal(workerA.conflicted, 1, "worker A's refusal is recorded rather than silent")
+        // AND IT IS THE POST-SEND COUNTER (r18): A was on the socket when it lost the row, so a
+        // duplicate delivery really is likely here — which is exactly what makes the suppression
+        // path, where nothing was sent, a different fact needing a different counter.
+        assert.equal(workerA.conflictedWithoutSend, 0, 'a send WAS attempted, so this is not the no-send refusal')
         assert.equal(workerA.failed, 0, 'and not scored against a row it no longer owns')
 
         const after = await lane.db.emailOutbox.findUniqueOrThrow({ where: { id: row.id } })

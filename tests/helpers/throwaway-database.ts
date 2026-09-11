@@ -705,13 +705,36 @@ export async function provisionThrowawayDatabase(options: ProvisionOptions): Pro
     // lands on THAT database. Codex r14 HIGH: the release ran before `withMaintenanceClient` had
     // even connected. See the r14 rule at the top of this file for why moving it later cannot
     // help and why waiting for the answer would re-break r11.
-    await withMaintenanceClient(maintenance, async (client) => {
-      await client.query(`DROP DATABASE IF EXISTS ${quoteIdentifier(name)} WITH (FORCE)`)
-      // The server answered. Recorded HERE rather than after `withMaintenanceClient` returns, so a
-      // failing `client.end()` cannot un-record a DROP the server had already confirmed — the same
-      // reasoning that makes a completed CREATE survive a failed teardown.
-      dropOutcome = 'dropped'
-    })
+    try {
+      await withMaintenanceClient(maintenance, async (client) => {
+        await client.query(`DROP DATABASE IF EXISTS ${quoteIdentifier(name)} WITH (FORCE)`)
+        // The server answered. Recorded HERE rather than after `withMaintenanceClient` returns, so a
+        // failing `client.end()` cannot un-record a DROP the server had already confirmed — the same
+        // reasoning that makes a completed CREATE survive a failed teardown.
+        dropOutcome = 'dropped'
+      })
+    } catch (error) {
+      // A CONFIRMED DROP IS NOT A LEAK, WHATEVER HAPPENED NEXT (r18, Codex LOW).
+      //
+      // Recording `'dropped'` inside the callback kept the STATE honest and left the CALL lying:
+      // `withMaintenanceClient` closes its connection in a `finally`, and a failing `client.end()`
+      // — a socket already reset, a server shutting down — rejects the whole call AFTER the server
+      // has confirmed the DROP. Every caller reads that rejection as a failed DROP: the provisioning
+      // catch reports "the DROP ALSO FAILED, so <name> IS LEFT ON THE SERVER and has to be dropped by
+      // hand", and the migration cleanup says the same. That sends an operator to hunt a database
+      // that is gone, and — worse for a module whose whole subject is what it does and does not
+      // know — it states a leak as a fact on the one path where the opposite is established.
+      //
+      // The teardown failure is not swallowed generally: it is swallowed EXACTLY when the server's
+      // own answer to the DROP has been recorded, which is the only fact that makes it irrelevant.
+      // Anything else — including a DROP that never came back — still rejects, and still reaches
+      // the callers that report the name.
+      // READ THROUGH THE UNION, not through control-flow narrowing. `dropOutcome` is assigned
+      // `'answer-unknown'` a few lines above and `'dropped'` inside the callback, and TypeScript's
+      // analysis does not account for the second — left to narrow it decides this comparison has no
+      // overlap. Same reason `outcome` below is annotated rather than inferred.
+      if ((dropOutcome as DropOutcome) !== 'dropped') throw error
+    }
   }
 
   /**

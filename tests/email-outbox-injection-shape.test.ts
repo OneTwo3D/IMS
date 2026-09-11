@@ -101,7 +101,20 @@ const loadOutbox = () => import('@/lib/email-outbox')
 
 type EmailOutboxClient = import('@/lib/email-outbox').EmailOutboxClient
 type EmailOutboxHarness = import('@/lib/email-outbox').EmailOutboxHarness
+type EmailOutboxHarnessClient = import('@/lib/email-outbox').EmailOutboxHarnessClient
 type ProcessEmailOutboxOptions = import('@/lib/email-outbox').ProcessEmailOutboxOptions
+
+/**
+ * MINT ONE, THROUGH THE SHIPPED FUNCTION. Dynamic, like everything else here: a static import would
+ * be hoisted above the `mock.module` calls and pull in the real `@/lib/db`.
+ */
+async function mintClient(delegates: {
+  emailOutbox: EmailOutboxClient['emailOutbox']
+  emailSuppression: EmailOutboxClient['emailSuppression']
+}): Promise<EmailOutboxHarnessClient> {
+  const { createEmailOutboxHarnessClient } = await loadOutbox()
+  return createEmailOutboxHarnessClient({ ...delegates, writesTo: { kind: 'in-memory' } })
+}
 
 /**
  * A TYPE-ONLY handle on the shipped function, for the negatives that must never be executed.
@@ -113,7 +126,7 @@ declare const processPendingEmailOutbox: typeof import('@/lib/email-outbox').pro
  * A client that records the first query it is asked for. It is the instrument for "before the
  * first query": the guard has to fire while this is still empty.
  */
-function spyClient(): { client: EmailOutboxClient; queries: string[] } {
+async function spyClient(): Promise<{ client: EmailOutboxHarnessClient; queries: string[] }> {
   const queries: string[] = []
   const record = (name: string) => async (): Promise<never> => {
     queries.push(name)
@@ -121,7 +134,7 @@ function spyClient(): { client: EmailOutboxClient; queries: string[] } {
   }
   return {
     queries,
-    client: {
+    client: await mintClient({
       emailOutbox: {
         findMany: record('emailOutbox.findMany'),
         updateMany: record('emailOutbox.updateMany'),
@@ -131,8 +144,26 @@ function spyClient(): { client: EmailOutboxClient; queries: string[] } {
         findUnique: record('emailSuppression.findUnique'),
         upsert: record('emailSuppression.upsert'),
       },
-    } as unknown as EmailOutboxClient,
+    } as unknown as EmailOutboxClient),
   }
+}
+
+/** The same delegates, NOT minted: a structurally perfect client that was never admitted (r18). */
+function unmintedClient(): EmailOutboxClient {
+  const record = (name: string) => async (): Promise<never> => {
+    throw new Error(`the guard did not fire: the drain issued ${name}`)
+  }
+  return {
+    emailOutbox: {
+      findMany: record('emailOutbox.findMany'),
+      updateMany: record('emailOutbox.updateMany'),
+      create: record('emailOutbox.create'),
+    },
+    emailSuppression: {
+      findUnique: record('emailSuppression.findUnique'),
+      upsert: record('emailSuppression.upsert'),
+    },
+  } as unknown as EmailOutboxClient
 }
 
 const fakeSender = async () => ({ success: true as const })
@@ -140,7 +171,7 @@ const fakePrepare = async () => null
 const fakeLog = async () => undefined
 
 /** A COMPLETE harness. Nothing in it is optional, which is the whole point of the type. */
-function completeHarness(client: EmailOutboxClient): EmailOutboxHarness {
+function completeHarness(client: EmailOutboxHarnessClient): EmailOutboxHarness {
   return {
     client,
     sendEmail: fakeSender,
@@ -151,8 +182,8 @@ function completeHarness(client: EmailOutboxClient): EmailOutboxHarness {
 }
 
 /** NEVER CALLED. Executing it is exactly the destructive act it exists to forbid. */
-function refusedShapes(): void {
-  const client = spyClient().client
+async function refusedShapes(): Promise<void> {
+  const client = (await spyClient()).client
 
   // --- THE EIGHT RECOMBINATIONS. None of them is a shape that exists any more: dependencies are
   // --- not spelled one per field, so each is an unknown property on the options type.
@@ -197,19 +228,26 @@ function refusedShapes(): void {
 
   // @ts-expect-error and the members cannot be smuggled alongside a harness either
   void processPendingEmailOutbox({ harness: completeHarness(client), sendEmail: fakeSender })
+
+  // --- AND THE CLIENT IS MINTED, NOT ASSEMBLED (r18, Codex HIGH). `EmailOutboxHarnessClient`
+  // --- carries a declare-only brand, so a hand-built client — including the structural wrapper of
+  // --- the production client that passed the old identity check — is not spellable here either.
+
+  // @ts-expect-error an assembled client is not a minted one, whatever it holds
+  void processPendingEmailOutbox({ harness: { ...completeHarness(client), client: unmintedClient() } })
 }
 
 /** ALSO NEVER CALLED: `acceptedShapes` would run a real drain. Only its TYPES are the proof. */
-function acceptedShapes(): void {
+async function acceptedShapes(): Promise<void> {
   // (a) THE CRON: nothing at all — the global client, the real sender, the real clock.
   void processPendingEmailOutbox()
   void processPendingEmailOutbox({})
 
-  // (b) A CALLER THAT BROUGHT ITS WHOLE WORLD.
-  void processPendingEmailOutbox({ harness: completeHarness(spyClient().client) })
+  // (b) A CALLER THAT BROUGHT ITS WHOLE WORLD — with a client this module MINTED for it.
+  void processPendingEmailOutbox({ harness: completeHarness((await spyClient()).client) })
 }
 
-test('the option type admits exactly two shapes, and no mixture is one of them', () => {
+test('the option type admits exactly two shapes, and no mixture is one of them', async () => {
   // The real proof is above and is enforced by `tsc --noEmit`; this body exists so the file is a
   // test rather than a comment, and so the two functions are REFERENCED (an unreferenced one is a
   // lint error away from being deleted, taking the proof with it).
@@ -218,7 +256,7 @@ test('the option type admits exactly two shapes, and no mixture is one of them',
 
   // Building the object first and passing it second does not help: there is one field to fill.
   const cron: ProcessEmailOutboxOptions = {}
-  const injected: ProcessEmailOutboxOptions = { harness: completeHarness(spyClient().client) }
+  const injected: ProcessEmailOutboxOptions = { harness: completeHarness((await spyClient()).client) }
   assert.equal(cron.harness, undefined)
   assert.equal(injected.harness?.sendEmail, fakeSender)
 })
@@ -249,7 +287,7 @@ const NAMED_RECOMBINATIONS: { name: string; options: unknown; expect: RegExp }[]
   },
   {
     name: '{ client: testClient, sendEmail: null } — Codex r5 HIGH 2 mirror',
-    options: { client: spyClient().client, sendEmail: null },
+    options: { client: unmintedClient(), sendEmail: null },
     expect: /unknown option\(s\) "client", "sendEmail"/,
   },
   {
@@ -277,7 +315,7 @@ for (const recombination of NAMED_RECOMBINATIONS) {
 test('a PARTIAL harness cast past the type is refused before the first query, by member name', async () => {
   const { processPendingEmailOutbox: drain } = await loadOutbox()
   reached.length = 0
-  const spy = spyClient()
+  const spy = await spyClient()
 
   // This is the shape a cast CAN still build, and it is the one the r4 union called legal.
   const refusal = await drain({ harness: { client: spy.client, sendEmail: fakeSender } } as unknown as ProcessEmailOutboxOptions)
@@ -294,7 +332,7 @@ test('a PARTIAL harness cast past the type is refused before the first query, by
 
 test('a NULL member is refused BY NAME, not read as "absent" and filled from production (r5 HIGH 2)', async () => {
   const { processPendingEmailOutbox: drain } = await loadOutbox()
-  const spy = spyClient()
+  const spy = await spyClient()
 
   for (const member of ['client', 'sendEmail', 'prepareQueuedEmail', 'logActivity', 'now'] as const) {
     reached.length = 0
@@ -321,7 +359,7 @@ test('a NULL member is refused BY NAME, not read as "absent" and filled from pro
 
 test('a harness may not NAME a production dependency, and the refusal beats the tripwire to it', async () => {
   const { processPendingEmailOutbox: drain } = await loadOutbox()
-  const spy = spyClient()
+  const spy = await spyClient()
   const [{ db }, { sendEmail }, { prepareQueuedEmail }, { logActivity }] = await Promise.all([
     import('@/lib/db'),
     import('@/lib/mailer'),
@@ -329,8 +367,12 @@ test('a harness may not NAME a production dependency, and the refusal beats the 
     import('@/lib/activity-log'),
   ])
 
+  // `client` IS NOT IN THIS LOOP ANY MORE (r18). It used to be refused by identity against `db`,
+  // which is the adjacent question rather than the right one — a structural wrapper of `db` is not
+  // `db` and reaches the same rows. It is refused by the MINT rule instead, which is proved on its
+  // own below against `db`, against a wrapper of it, and against a copy of a minted client.
+  void db
   const productionValues: Record<string, unknown> = {
-    client: db,
     sendEmail,
     prepareQueuedEmail,
     logActivity,
@@ -344,8 +386,6 @@ test('a harness may not NAME a production dependency, and the refusal beats the 
     const refusal = await drain({ harness } as unknown as ProcessEmailOutboxOptions)
       .then(() => null, (error: unknown) => error)
 
-    // The `client: db` case is the sharp one: the global db double tripwires on ANY property
-    // read, so this also proves the identity check runs before the value is touched at all.
     assert.deepEqual(reached, [], `${member}: the drain reached ${reached.join(', ')} before refusing`)
     assert.deepEqual(spy.queries, [], `${member}: the drain issued a query before refusing`)
     assert.ok(refusal instanceof Error, `${member}: a production dependency inside a harness was accepted`)
@@ -355,7 +395,7 @@ test('a harness may not NAME a production dependency, and the refusal beats the 
 
 test('NON-VACUITY: the legal shapes resolve, and to DIFFERENT dependency sets', async () => {
   const { resolveEmailOutboxDependencies } = await loadOutbox()
-  const spy = spyClient()
+  const spy = await spyClient()
   const harness = completeHarness(spy.client)
   reached.length = 0
 
@@ -415,10 +455,10 @@ test('NON-VACUITY: the legal shapes resolve, and to DIFFERENT dependency sets', 
  * "Refused before the first query" is not the property here — "the drain that ran never touched a
  * production dependency, even though the harness offered it one on the second read" is.
  */
-function workingClient(rows: { id: string; status: string }[]): {
-  client: EmailOutboxClient
+async function workingClient(rows: { id: string; status: string }[]): Promise<{
+  client: EmailOutboxHarnessClient
   store: Record<string, Record<string, unknown>>
-} {
+}> {
   const store: Record<string, Record<string, unknown>> = {}
   for (const row of rows) {
     store[row.id] = {
@@ -439,7 +479,7 @@ function workingClient(rows: { id: string; status: string }[]): {
   }
   return {
     store,
-    client: {
+    client: await mintClient({
       emailOutbox: {
         async findMany() {
           return Object.values(store)
@@ -462,7 +502,7 @@ function workingClient(rows: { id: string; status: string }[]): {
         async findUnique() { return null },
         async upsert() { return {} },
       },
-    } as unknown as EmailOutboxClient,
+    } as unknown as EmailOutboxClient),
   }
 }
 
@@ -508,7 +548,7 @@ test('r7 HIGH 2: a harness that flips to PRODUCTION on the second read is read o
   ])
   reached.length = 0
 
-  const fixture = workingClient([])
+  const fixture = await workingClient([])
   const { harness, reads } = twoFacedHarness(completeHarness(fixture.client), {
     client: db,
     sendEmail,
@@ -555,7 +595,7 @@ test('r7 HIGH 2: the DRAIN consumes only the snapshot — a two-faced harness ca
 
   // A real row to work on, so the drain runs its whole body: findMany, claim, suppression lookup,
   // prepare, send, terminal write, activity log. Every one of those is a chance to re-read.
-  const fixture = workingClient([{ id: 'row-1', status: 'PENDING' }])
+  const fixture = await workingClient([{ id: 'row-1', status: 'PENDING' }])
   const delivered: string[] = []
   const recordingSender = async (message: { to: string }) => {
     delivered.push(message.to)
@@ -581,7 +621,7 @@ test('r7 HIGH 2: the DRAIN consumes only the snapshot — a two-faced harness ca
 
   // NON-VACUITY: the drain really ran, against the FIXTURE, all the way to a delivery and a SENT
   // row. A green above with nothing processed would prove nothing at all.
-  assert.deepEqual(result, { processed: 1, sent: 1, failed: 0, conflicted: 0 })
+  assert.deepEqual(result, { processed: 1, sent: 1, failed: 0, conflicted: 0, conflictedWithoutSend: 0 })
   assert.deepEqual(delivered, ['fixture@example.invalid'])
   assert.equal(fixture.store['row-1'].status, 'SENT')
 })
@@ -594,7 +634,7 @@ test('r7 HIGH 2: the DRAIN consumes only the snapshot — a two-faced harness ca
  * harness", and ran the GLOBAL database through the REAL mailer — while the caller believed they
  * had injected a fake. The refusal must arrive instead, and it must arrive before any query.
  */
-const HIDDEN_MEMBER_SHAPES: { name: string; build: () => object; expect: RegExp }[] = [
+const HIDDEN_MEMBER_SHAPES: { name: string; build: () => object | Promise<object>; expect: RegExp }[] = [
   {
     name: 'Object.create({ sendEmail: fake }) — the member lives on the PROTOTYPE',
     build: () => Object.create({ sendEmail: fakeSender }) as object,
@@ -635,13 +675,13 @@ const HIDDEN_MEMBER_SHAPES: { name: string; build: () => object; expect: RegExp 
   },
   {
     name: 'a harness built on a PROTOTYPE carrying the members',
-    build: () => ({ harness: Object.create(completeHarness(spyClient().client)) as object }),
+    build: async () => ({ harness: Object.create(completeHarness((await spyClient()).client)) as object }),
     expect: /`harness` must be a PLAIN object/,
   },
   {
     name: 'a harness carrying a NON-ENUMERABLE extra member',
-    build: () => {
-      const harness: Record<string, unknown> = { ...completeHarness(spyClient().client) }
+    build: async () => {
+      const harness: Record<string, unknown> = { ...completeHarness((await spyClient()).client) }
       Object.defineProperty(harness, 'referenceIdPrefix', { value: 'alnk-', enumerable: false, configurable: true })
       return { harness }
     },
@@ -654,7 +694,7 @@ for (const shape of HIDDEN_MEMBER_SHAPES) {
     const { processPendingEmailOutbox: drain } = await loadOutbox()
     reached.length = 0
 
-    const refusal = await drain(shape.build() as unknown as ProcessEmailOutboxOptions)
+    const refusal = await drain(await shape.build() as unknown as ProcessEmailOutboxOptions)
       .then(() => null, (error: unknown) => error)
 
     // FIRST, AND IT IS THE POINT OF THE FINDING. The old failure was not "no throw" — it was the
@@ -672,7 +712,7 @@ for (const shape of HIDDEN_MEMBER_SHAPES) {
 test('r7 HIGH 1 NON-VACUITY: the plain-object rule refuses hidden members, not ordinary callers', async () => {
   const { resolveEmailOutboxDependencies } = await loadOutbox()
   reached.length = 0
-  const spy = spyClient()
+  const spy = await spyClient()
 
   // The two shapes every real caller uses: `{}` from the default parameter, and an object literal
   // carrying a literal harness. Both have `Object.prototype`, so both resolve.
@@ -696,11 +736,15 @@ test('r7 HIGH 2, one level down: the CLIENT DELEGATES are read once too', async 
   // `client.emailSuppression` once per row, so a client whose delegates are accessors is the same
   // time-of-check/time-of-use one level below the harness: pass the probe as a fixture, serve the
   // real delegate to the writes. The delegates the probe read are therefore snapshotted as well.
-  const fixture = workingClient([{ id: 'row-1', status: 'PENDING' }])
+  const fixture = await workingClient([{ id: 'row-1', status: 'PENDING' }])
   const delegateReads = { emailOutbox: 0, emailSuppression: 0 }
   const poison = (what: string): unknown => new Proxy({}, { get: () => tripwire(`a POISONED ${what} delegate`) })
 
-  const twoFacedClient = {
+  // The accessors are handed to the MINT (r18): that is now the one place a caller's delegates are
+  // read, and the client the drain receives is the frozen snapshot it built out of that single read.
+  // The measurement is unchanged and still the point — one read per delegate, so the second answer
+  // has no turn — it has simply moved to the door.
+  const twoFacedClient = await mintClient({
     get emailOutbox() {
       delegateReads.emailOutbox += 1
       return delegateReads.emailOutbox === 1 ? fixture.client.emailOutbox : poison('emailOutbox')
@@ -709,7 +753,7 @@ test('r7 HIGH 2, one level down: the CLIENT DELEGATES are read once too', async 
       delegateReads.emailSuppression += 1
       return delegateReads.emailSuppression === 1 ? fixture.client.emailSuppression : poison('emailSuppression')
     },
-  } as unknown as EmailOutboxClient
+  } as unknown as EmailOutboxClient)
 
   const delivered: string[] = []
   const result = await drain({
@@ -731,7 +775,189 @@ test('r7 HIGH 2, one level down: the CLIENT DELEGATES are read once too', async 
 
   // NON-VACUITY: the drain ran the whole body against the fixture — findMany, the claim, the
   // suppression lookup and the fenced terminal write are four separate delegate uses.
-  assert.deepEqual(result, { processed: 1, sent: 1, failed: 0, conflicted: 0 })
+  assert.deepEqual(result, { processed: 1, sent: 1, failed: 0, conflicted: 0, conflictedWithoutSend: 0 })
   assert.deepEqual(delivered, ['fixture@example.invalid'])
   assert.equal(fixture.store['row-1'].status, 'SENT')
+})
+
+// ===========================================================================================
+// ROUND 18 — A WRAPPED PRODUCTION CLIENT. Codex HIGH: the guard asked `value === db`, which is
+// ADJACENT to "is this the production client" and is not the same question. `{ emailOutbox:
+// db.emailOutbox, emailSuppression: db.emailSuppression }` is a different object that reaches the
+// same customer rows, so it PASSED — and with the fake sender, preparer and logger that complete a
+// harness, the drain then claimed genuine queued email, delivered nothing, and stamped it SENT.
+//
+// The fix does not recognise wrappers; it accepts only a client this module MINTED. These proofs
+// are therefore about a CLASS, not about the two or three shapes anybody has thought of: every
+// case below is structurally perfect and every one is refused, because none of them was minted.
+// ===========================================================================================
+
+/**
+ * THE DELEGATES A WRAPPER WOULD CARRY, READ LAZILY.
+ *
+ * `@/lib/db` is mocked here as a Proxy that tripwires on ANY property read, which is what makes
+ * "the refusal beat the tripwire to it" measurable. So the wrapper reads `db.emailOutbox` from a
+ * getter rather than eagerly: if the guard ever touches the delegates it was offered, `reached`
+ * names the global database and the test says so. It never should — `WeakSet.has` reads nothing.
+ */
+async function productionWrapper(): Promise<[object]> {
+  const { db } = await import('@/lib/db')
+  const production = db as unknown as Record<string, unknown>
+  return [{
+    get emailOutbox() { return production.emailOutbox },
+    get emailSuppression() { return production.emailSuppression },
+  }]
+}
+
+/**
+ * EACH CASE HANDS BACK A ONE-TUPLE, not the value itself. `return value` from an async function
+ * RESOLVES it, and resolving reads `.then` — which on the mocked `@/lib/db` Proxy fires the
+ * tripwire before the test has even started. The box keeps the client untouched until the drain
+ * touches it (which is the thing being measured).
+ */
+const UNMINTED_CLIENTS: { name: string; build: () => Promise<[unknown]> }[] = [
+  {
+    name: 'the bare production client (`client: db`) — refused by the MINT rule now, not by identity',
+    build: async () => [(await import('@/lib/db')).db],
+  },
+  {
+    name: 'THE FINDING: `{ emailOutbox: db.emailOutbox, emailSuppression: db.emailSuppression }` — a '
+      + 'structural wrapper that is not `db` and writes to the same rows',
+    build: productionWrapper,
+  },
+  {
+    name: 'a COPY of a minted client (`{ ...minted }`) — the brand is not a property that travels',
+    build: async () => [{ ...(await spyClient()).client }],
+  },
+  {
+    name: 'a Proxy over a minted client — same delegates, same answers, different object',
+    build: async () => [new Proxy((await spyClient()).client as object, {})],
+  },
+  {
+    name: 'a client that is structurally PERFECT and simply was never minted',
+    build: async () => [unmintedClient()],
+  },
+]
+
+for (const shape of UNMINTED_CLIENTS) {
+  test(`r18 HIGH: REFUSED, and nothing of it is read: ${shape.name}`, async () => {
+    const { processPendingEmailOutbox: drain } = await loadOutbox()
+    reached.length = 0
+    const spy = await spyClient()
+
+    const [client] = await shape.build()
+    const harness = { ...completeHarness(spy.client), client }
+    const refusal = await drain({ harness } as unknown as ProcessEmailOutboxOptions)
+      .then(() => null, (error: unknown) => error)
+
+    // FIRST, AND IT IS THE FINDING. Without the mint rule this call selects the twenty-five oldest
+    // eligible rows through the wrapped production delegates and stamps them SENT via `fakeSender`.
+    assert.deepEqual(
+      reached,
+      [],
+      `the drain reached ${reached.join(', ')} — the client it was handed was USED, not refused`,
+    )
+    assert.deepEqual(spy.queries, [], 'the drain issued a query before refusing')
+    assert.ok(refusal instanceof Error, 'an unminted client was accepted as a harness client')
+    assert.match(refusal.message, /`harness\.client` was NOT MINTED/)
+    assert.match(refusal.message, /ALL-OR-NOTHING/)
+  })
+}
+
+test('r18 NON-VACUITY: a MINTED client is accepted, and the drain runs to a SENT row through it', async () => {
+  // Without this the block above could be green because every client is refused, which would be a
+  // guard that forbids the harness rather than the mixture.
+  const { processPendingEmailOutbox: drain } = await loadOutbox()
+  reached.length = 0
+  const fixture = await workingClient([{ id: 'row-1', status: 'PENDING' }])
+  const delivered: string[] = []
+
+  const result = await drain({
+    harness: {
+      ...completeHarness(fixture.client),
+      sendEmail: async (message: { to: string }) => {
+        delivered.push(message.to)
+        return { success: true as const }
+      },
+    },
+  } as unknown as ProcessEmailOutboxOptions)
+
+  assert.deepEqual(reached, [], `the accepted drain reached ${reached.join(', ')}`)
+  assert.deepEqual(result, { processed: 1, sent: 1, failed: 0, conflicted: 0, conflictedWithoutSend: 0 })
+  assert.deepEqual(delivered, ['fixture@example.invalid'])
+  assert.equal(fixture.store['row-1'].status, 'SENT')
+})
+
+test('r18: the mint refuses a real client pointed at the CONFIGURED database', async () => {
+  // The mint is not a rubber stamp. A harness client is legitimately either an in-memory fixture or
+  // a real client on a database the lane created; the second arm names its URL, and a URL naming the
+  // database in DATABASE_URL — on this host the LIVE-SERVED one — is the accident that puts this
+  // drain on genuine customer rows without anybody writing `db` anywhere.
+  const { createEmailOutboxHarnessClient } = await loadOutbox()
+  const delegates = unmintedClient()
+  const previous = process.env.DATABASE_URL
+  process.env.DATABASE_URL = 'postgresql://ims:secret@127.0.0.1:5432/onetwo3d_ims_dev?schema=public'
+  try {
+    assert.throws(
+      () => createEmailOutboxHarnessClient({
+        emailOutbox: delegates.emailOutbox,
+        emailSuppression: delegates.emailSuppression,
+        writesTo: { kind: 'database', url: 'postgresql://ims:secret@127.0.0.1:5432/onetwo3d_ims_dev' },
+      }),
+      /names onetwo3d_ims_dev, which is the database DATABASE_URL configures/,
+    )
+
+    // NON-VACUITY: a database this lane would have created is minted without complaint, so the
+    // refusal above is about the DESTINATION and not about the arm.
+    const lane = createEmailOutboxHarnessClient({
+      emailOutbox: delegates.emailOutbox,
+      emailSuppression: delegates.emailSuppression,
+      writesTo: { kind: 'database', url: 'postgresql://ims:secret@127.0.0.1:5432/ims_throwaway_alnkfence_0123456789abcdef' },
+    })
+    assert.equal(lane.emailOutbox, delegates.emailOutbox)
+  } finally {
+    if (previous === undefined) delete process.env.DATABASE_URL
+    else process.env.DATABASE_URL = previous
+  }
+})
+
+test('r18: the mint refuses an incomplete or undeclared client', async () => {
+  const { createEmailOutboxHarnessClient } = await loadOutbox()
+  const delegates = unmintedClient()
+
+  assert.throws(
+    () => createEmailOutboxHarnessClient({
+      emailOutbox: delegates.emailOutbox,
+      emailSuppression: null as unknown as EmailOutboxClient['emailSuppression'],
+      writesTo: { kind: 'in-memory' },
+    }),
+    /`emailSuppression` is null/,
+  )
+  assert.throws(
+    () => createEmailOutboxHarnessClient({
+      emailOutbox: delegates.emailOutbox,
+      emailSuppression: delegates.emailSuppression,
+      writesTo: { kind: 'somewhere' } as unknown as { kind: 'in-memory' },
+    }),
+    /`writesTo\.kind` must be 'in-memory' or 'database'/,
+  )
+})
+
+test('r18: a minted client is FROZEN, so its delegates cannot be swapped after the door', async () => {
+  // The mint reads each delegate once and returns its own object. If that object were mutable, a
+  // caller could hand over a fixture, pass the check, and then assign the production delegate onto
+  // the very client the drain holds — the r7 time-of-check/time-of-use defect with an extra step.
+  const { createEmailOutboxHarnessClient } = await loadOutbox()
+  const delegates = unmintedClient()
+  const minted = createEmailOutboxHarnessClient({
+    emailOutbox: delegates.emailOutbox,
+    emailSuppression: delegates.emailSuppression,
+    writesTo: { kind: 'in-memory' },
+  })
+
+  assert.throws(() => {
+    'use strict'
+    ;(minted as unknown as Record<string, unknown>).emailOutbox = { findMany: async () => [] }
+  }, TypeError)
+  assert.equal(minted.emailOutbox, delegates.emailOutbox)
 })

@@ -671,13 +671,29 @@ export const QBO_OPERATIONS_WITHOUT_REQUEST_ID: Partial<Record<
     // `already_queued` — so a sweep landing inside that window queues NOTHING while still reporting
     // success. The repetition is real, but it is keyed to DELIVERY rather than to sweeps, and an
     // operator reading a per-sweep count would over-state what is outstanding. Said exactly.
+    //
+    // ROUND 18 (Codex MEDIUM): AND THE REPLACEMENT SENTENCE CARRIED ITS OWN FALSE CADENCE. Round 16
+    // wrote that "the outbox cron empties PENDING in minutes" and that "each sweep finds nothing
+    // undelivered and queues one more". Both were asserted rather than grepped, and both are wrong
+    // by an order of magnitude in the direction that alarms an operator. The cadences, from the
+    // repo: this sweep is the accounting sync queue, `defaultSchedule: '*/5 * * * *'`
+    // (lib/cron-jobs/xero.ts:11, `accounting-sync`, `defaultEnabled: true`; help-docs/settings.md:338
+    // lists it as "Every 5 min"), and the email outbox drain is `/api/cron/email-outbox`, documented
+    // Hourly (help-docs/settings.md:351 — the only cadence for it in the repo; it is called by the
+    // operator's cron daemon and has no cron-registry entry). So the undelivered refusal normally
+    // holds for a WHOLE HOUR, about twelve consecutive sweeps meet the same PENDING row and queue
+    // nothing, and a further copy becomes possible only after a drain settles that row. The verdict
+    // is unchanged and must stay: repetition after the row is settled is what makes this operation
+    // unsafe to replay. Only the RATE was wrong, and a rate is a thing to grep, not to recall.
     effect: 'ANOTHER COPY OF THE INVOICE EMAIL IS QUEUED TO THE CUSTOMER — a PENDING '
-      + 'accounting-invoice row in the email outbox — on every sweep that runs once the copy before '
-      + 'it has been delivered. COPIES DO NOT PILE UP UNDELIVERED: the email outbox refuses a second '
-      + 'undelivered row for this order, so a sweep that lands while one is still PENDING or '
-      + 'PROCESSING queues nothing and reports success anyway. THAT REFUSAL ENDS AT DELIVERY, and the '
-      + 'outbox cron empties PENDING in minutes while a stale claim takes fifteen, so in practice '
-      + 'each sweep finds nothing undelivered and queues one more',
+      + 'accounting-invoice row in the email outbox — on the next sweep that runs once the outbox has '
+      + 'FINISHED with the copy before it. COPIES DO NOT PILE UP UNDELIVERED: the email outbox refuses '
+      + 'a second undelivered row for this order, so a sweep that lands while one is still PENDING or '
+      + 'PROCESSING queues nothing and reports success anyway. THE REPETITION IS PACED BY THE OUTBOX '
+      + 'DRAIN, NOT BY THIS SWEEP: this sweep is scheduled every five minutes and the outbox drain is '
+      + 'scheduled hourly, so MOST SWEEPS QUEUE NOTHING — around a dozen in a row meet the same '
+      + 'undelivered row — and the refusal lifts only when a drain settles that row to SENT or FAILED. '
+      + 'Count copies against the OUTBOX cadence, never one per sweep',
     check: 'this operation succeeds by QUEUEING, not by sending, and IMS CANNOT CANCEL A QUEUED COPY. '
       + 'EmailOutbox has four states — PENDING, PROCESSING, SENT, FAILED — none of which means '
       + '"deliberately not delivered", and no action, route or screen removes an unsent row, so there '
