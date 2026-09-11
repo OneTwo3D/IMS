@@ -37,7 +37,7 @@ import * as realPlugins from '../lib/integration-plugins.ts'
 import * as realRegistry from '../lib/connectors/wms/registry.ts'
 import { createWmsConnectorRegistry, type WmsConnectorDef } from '../lib/connectors/wms/registry.ts'
 import type { WmsConnectorHooks } from '../lib/connectors/wms/connector-hooks.ts'
-import type { WmsOrderStatus } from '../lib/connectors/wms/types.ts'
+import type { WmsConnector, WmsOrderStatus } from '../lib/connectors/wms/types.ts'
 import { encodeWmsDeltaCursor } from '../lib/domain/wms/delta-cursor-generation.ts'
 
 // --- the fictitious connector, as far as the app is concerned ---------------------------------
@@ -300,4 +300,39 @@ test('seam/production: the connector’s delta ENABLE FLAG and TIMEZONE are its 
   // The timezone is the quiet one: the cursor is formatted as a wall-clock string in it, so
   // inheriting another warehouse's zone shifts the window by hours and loses whatever fell in the gap.
   assert.equal(acme.timeZone, `${ACME_WMS_ID}_api_timezone`)
+})
+
+// ---------------------------------------------------------------------------------------------
+// The seam audit's own finding: capability degradation must be DERIVED, not asserted by the test
+// ---------------------------------------------------------------------------------------------
+
+test('seam/production: the PRODUCTION deps derive capability degradation from the connector itself', async () => {
+  // tests/wms-second-connector-seam.test.ts asserts that the sweep CORE degrades when
+  // `partsSupported` is false and `fetchDelta` is absent — but it sets both by hand, with a comment
+  // saying so. That proves the core copes; it does not prove the production wiring ever reports the
+  // degradation, and the wiring is where a `connector.fetchOrderParts ? … : …` could quietly become
+  // an id comparison. So the derivation is checked HERE, on the real deps factory.
+  const { createPrismaDispatchDeps } = await import('../lib/domain/wms/dispatch-sweep.ts')
+
+  const plain = new AcmeWmsConnector(makeAcmeWarehouse())
+  assert.equal(
+    (plain as Partial<WmsConnector<typeof ACME_WMS_ID>>).fetchOrderParts,
+    undefined,
+    'precondition: this WMS cannot split-part',
+  )
+  const plainDeps = createPrismaDispatchDeps(ACME_WMS_ID as never, plain as never)
+  assert.equal(plainDeps.partsSupported, false, 'derived from the ABSENT method, not from the id')
+  assert.equal(plainDeps.fetchDelta, undefined, 'no bulk delta wired for a connector that has none')
+  assert.equal(plainDeps.getDeltaState, undefined, 'and therefore no cursor state either')
+  assert.equal(plainDeps.saveDeltaState, undefined)
+
+  // The contrast: the SAME connector id, one capability added, and the wiring follows the method.
+  const capable = Object.assign(new AcmeWmsConnector(makeAcmeWarehouse()), {
+    fetchOrderParts: async () => [],
+    fetchOrderDelta: async () => [],
+  })
+  const capableDeps = createPrismaDispatchDeps(ACME_WMS_ID as never, capable as never)
+  assert.equal(capableDeps.partsSupported, true)
+  assert.equal(typeof capableDeps.fetchDelta, 'function')
+  assert.equal(typeof capableDeps.getDeltaState, 'function')
 })

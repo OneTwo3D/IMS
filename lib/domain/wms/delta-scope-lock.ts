@@ -44,14 +44,18 @@ export const WMS_DELTA_SCOPE_UNBOUND = 'unbound'
  * `FOR UPDATE` locks only rows that EXIST, hence the materialise step. Inserting `''` is
  * semantically inert: every reader of a settings key treats an empty value exactly as an absent row.
  */
-export async function lockWmsSettingRows(tx: WmsDeltaScopeLockTx, keys: string[]): Promise<void> {
+export async function lockWmsSettingRows(
+  tx: WmsDeltaScopeLockTx,
+  keys: string[],
+): Promise<Map<string, string>> {
   const sorted = [...keys].sort()
   await tx.$executeRaw`
     INSERT INTO settings (key, value, "updatedAt")
     SELECT k, '', now() FROM unnest(${sorted}::text[]) AS k
     ON CONFLICT (key) DO NOTHING`
-  await tx.$queryRaw<Array<{ key: string; value: string | null }>>`
+  const rows = await tx.$queryRaw<Array<{ key: string; value: string | null }>>`
     SELECT key, value FROM settings WHERE key = ANY(${sorted}::text[]) ORDER BY key FOR UPDATE`
+  return new Map(rows.map((row) => [row.key, row.value ?? '']))
 }
 
 /**

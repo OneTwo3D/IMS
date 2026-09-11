@@ -199,17 +199,17 @@ makes **impossible**, not as what it checks.
 - `app/actions/wms-sync.ts` and `app/actions/wms-onboarding.ts` still return a DTO
   with a literal `mintsoft:` member that the sync dashboard and the onboarding
   wizard read **by name**, so their dispatch cannot move onto `hooks` until that
-  UI reads a connector-agnostic shape (**o3d-vp9n**). They are named-file entries
+  UI reads a connector-agnostic shape (**o3d-ph1y**). They are named-file entries
   in the guard's allowlist, not directory exemptions.
 - `lib/domain/wms/booked-in-service.ts` is Mintsoft's booked-in webhook processor
   misfiled under the generic directory; it belongs under
-  `lib/connectors/mintsoft/` (**o3d-vp9m**). Its connector-agnostic half — the
+  `lib/connectors/mintsoft/` (**o3d-c79v**). Its connector-agnostic half — the
   inbound-event processing lifecycle — was split out to
   `lib/domain/wms/inbound-event-status.ts` in round 2, which is what let the
   exception inbox and the retention sweep stop naming a connector at all.
 - A link parked at PENDING_VERIFY by finding 4's runtime fail-safe carries its
   reason on the link and in the audit timeline, but does not yet surface in the
-  exception inbox (**o3d-vp9p**).
+  exception inbox (**o3d-1rim**).
 
 ## Next
 

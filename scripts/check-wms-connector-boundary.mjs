@@ -140,11 +140,11 @@ const ALLOWLIST = [
   //
   // booked-in-service.ts IS Mintsoft's booked-in webhook processor (it queries
   // `connector: 'mintsoft'` and writes Mintsoft-worded receipts); it is misfiled under
-  // lib/domain/wms/ and belongs under lib/connectors/mintsoft/ — tracked in o3d-vp9m.
+  // lib/domain/wms/ and belongs under lib/connectors/mintsoft/ — tracked in o3d-c79v.
   'lib/domain/wms/booked-in-service.ts',
   // wms-sync.ts / wms-onboarding.ts still return a DTO with a literal `mintsoft:` member that the
   // sync dashboard and the onboarding wizard read BY NAME, so the dispatch cannot move onto
-  // `hooks` until that UI reads a connector-agnostic shape — tracked in o3d-vp9n. Everything else
+  // `hooks` until that UI reads a connector-agnostic shape — tracked in o3d-ph1y. Everything else
   // these two do already routes through the registry.
   'app/actions/wms-sync.ts',
   'app/actions/wms-onboarding.ts',

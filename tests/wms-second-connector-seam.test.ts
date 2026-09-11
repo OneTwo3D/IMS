@@ -248,8 +248,12 @@ function seamDispatchDeps(overrides: Partial<WmsDispatchSweepDeps>): WmsDispatch
     listCandidates: async () => [],
     fetchOrderStatus: async () => null,
     applyDispatch: async () => ({ success: true }),
-    // The fictitious connector has no fetchOrderParts, so the generic adapter would
-    // set this false. Stated explicitly here for the same reason.
+    // The fictitious connector has no fetchOrderParts, so the generic adapter would set this false.
+    // Stated explicitly here because these deps are hand-built — which means the tests below prove
+    // the sweep CORE degrades, and NOT that the production wiring derives the degradation. That
+    // second claim is the one that could rot into an id comparison, so it is checked against the
+    // real deps factory in tests/wms-second-connector-seam-production.test.ts ("the PRODUCTION deps
+    // derive capability degradation from the connector itself"). Do not read this line as evidence.
     partsSupported: false,
     fetchOrderParts: async () => {
       throw new Error('the fictitious connector does not support parts')
@@ -322,6 +326,10 @@ test('seam/errors: the error class is recognised by identity, not by connector n
 test('seam/dispatch: a WMS with no bulk delta still reconciles, per-order', async () => {
   // The `fetchOrderDelta?` capability check, exercised by a connector that genuinely
   // lacks it. Mintsoft implements it, so with one connector nothing reaches this.
+  // NOTE the division of labour (see seamDispatchDeps): this test proves the CORE reconciles
+  // per-order when no delta is wired. That the production deps actually LEAVE it unwired for such a
+  // connector — rather than wiring it on an id — is proved on the real deps factory in
+  // tests/wms-second-connector-seam-production.test.ts.
   const warehouse = makeAcmeWarehouse()
   warehouse.orders.set('SO-OK', {
     externalOrderId: 'ACME-1', externalOrderNumber: 'SO-OK', status: 'DESPATCHED',
