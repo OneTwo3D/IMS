@@ -211,8 +211,9 @@ test('the CSV’s two bound columns are the published verdict, not a re-derivati
 })
 
 test('a FILTERED subtotal adds the INTERVALS of the rows it actually contains (o3d-la3n)', async () => {
-  // One `upper` row and one `lower` row. Each is individually determinate; the subtotal is not, and
-  // no fold of the two MARKS could have told this subset from one whose lower row is exact.
+  // One `upper` row and one `lower` row. Each is individually determinate; the subtotal is not.
+  // What a fold over the two MARKS could not have produced is the WIDTH: `[-12, 0] + [0, 30]` is
+  // 12 below and 30 above, and `upper` + `lower` carries neither number.
   const { html } = (await renderPage(props([
     row('p1', 'Widget', fy(100, 40, { lower: -12, upper: 0 }, { gross: 12, unknown: 0 }), fy(0, 0, EXACT, { gross: 0, unknown: 0 })),
     row('p2', 'Gadget', fy(200, 50, { lower: 0, upper: 30 }, { gross: -30, unknown: 0 }), fy(0, 0, EXACT, { gross: 0, unknown: 0 })),
@@ -266,4 +267,84 @@ test('sub-cent rows do not sum into a ceiling below the truth (o3d-la3n r2, o3d-
   // the subtotal's (two footers and two cards).
   assert.equal(occurrences(html, '£0.02 ≤'), 6, 'per row: revenue cell and profit cell, rounded UP')
   assert.equal(occurrences(html, '£0.05 ≤'), 4, 'subtotal: revenue footer, profit footer, revenue card, profit card')
+})
+
+// ---------------------------------------------------------------------------
+// Codex round 2, HIGH: THE MARK IS A FACT ABOUT THE INTERVAL, NOT ABOUT THE AMOUNT
+// ---------------------------------------------------------------------------
+
+/**
+ * A row whose FY revenue and profit are both EXACTLY ZERO and still bounded.
+ *
+ * Round 2's redesign composed the amount and the mark into one string and then let the table cell
+ * decide whether to print the whole of it — `show={revenue > 0}` for revenue, `revenue > 0 || cogs >
+ * 0` for profit. So a value of the AMOUNT suppressed a fact about the INTERVAL, and the two table
+ * cells that carry a relation printed a bare em dash for every non-positive figure. The previous
+ * implementation appended the marker outside the amount predicate and did not have this defect: the
+ * redesign introduced it.
+ *
+ * It matters most exactly where it bites. A product with £100 of sales, a £100 NET-basis refund and
+ * no COGS reads as a flat zero; a gross-basis REVERSAL beside it cannot be placed, so the truth is
+ * up to £30 ABOVE that zero. "—" says the cell is empty. "— ≥" says the figure is a floor.
+ */
+function zeroFy(bound: Interval, disclose: { gross: number; unknown: number }) {
+  return props([row('p1', 'Widget',
+    fy(0, 0, bound, disclose),
+    fy(0, 0, EXACT, { gross: 0, unknown: 0 }),
+  )])
+}
+
+test('a zero revenue under a LOWER interval keeps its ≥ in the cells that hide the amount (o3d-la3n r3)', async () => {
+  const { html } = (await renderPage(zeroFy({ lower: 0, upper: 30 }, { gross: -30, unknown: 0 }))).render()
+
+  // THE REGRESSION. Both table cells decline to print the figure and must still print the relation.
+  assert.equal(occurrences(html, '— ≥'), 2, 'the revenue cell and the profit cell: no amount, and still a floor')
+  assert.equal(occurrences(html, '— ≤'), 0, 'and never the opposite relation')
+
+  // The sites that never suppressed anything are unchanged: revenue footer and card, profit footer
+  // and card. A fix that moved the defect rather than removing it would change this count.
+  assert.equal(occurrences(html, '£0.00 ≥'), 4, 'revenue and profit, footer and card')
+  assert.ok(html.includes('Not subtracted: up to £30.00 of NEGATIVE credit'))
+})
+
+test('a zero revenue under an UPPER interval keeps its ≤ the same way (o3d-la3n r3)', async () => {
+  const { html } = (await renderPage(zeroFy({ lower: -120, upper: 0 }, { gross: 120, unknown: 0 }))).render()
+
+  assert.equal(occurrences(html, '— ≤'), 2, 'positive unplaced credit lost its ≤ through the same branch')
+  assert.equal(occurrences(html, '— ≥'), 0)
+  assert.equal(occurrences(html, '£0.00 ≤'), 4, 'revenue and profit, footer and card')
+  assert.ok(html.includes('Not subtracted: up to £120.00 of credit'))
+})
+
+/**
+ * AND THE PROPERTY IS NOT ABOUT ZERO. `show` was `revenue > 0`, so it hides every non-positive
+ * amount, not merely the zero one. A NEGATIVE FY revenue — a period whose net-basis credit exceeds
+ * its sales — is hidden by the same predicate and is bounded by the same interval, so a fix that
+ * special-cased zero would still drop the relation here. This test is what makes the two above
+ * evidence for the rule rather than for one value of it.
+ */
+test('a NEGATIVE revenue hidden by the same predicate keeps its relation too (o3d-la3n r3)', async () => {
+  const { html } = (await renderPage(props([row('p1', 'Widget',
+    fy(-50, 0, { lower: 0, upper: 30 }, { gross: -30, unknown: 0 }),
+    fy(0, 0, EXACT, { gross: 0, unknown: 0 }),
+  )]))).render()
+
+  assert.equal(occurrences(html, '— ≥'), 2, 'revenue and profit cells: negative, hidden, still a floor')
+  // Revenue and profit are the same number here (COGS is zero), so the four unsuppressed sites —
+  // both footers and both cards — all print it.
+  assert.equal(occurrences(html, '-£50.00 ≥'), 4, 'the sites that print the figure print it marked')
+})
+
+/**
+ * The counterpart that keeps the two tests above honest: a hidden amount under an EXACT interval
+ * must print a BARE em dash. If `— ≥` appeared here the marker would have stopped being a fact
+ * about the interval in the other direction — printed where no relation is owed.
+ */
+test('a zero revenue under an EXACT interval prints a bare em dash, with no relation (o3d-la3n r3)', async () => {
+  const { html } = (await renderPage(zeroFy(EXACT, { gross: 40, unknown: 5 }))).render()
+
+  assert.equal(occurrences(html, '— ≥'), 0)
+  assert.equal(occurrences(html, '— ≤'), 0)
+  assert.equal(occurrences(html, '— ?'), 0)
+  assert.equal(occurrences(html, '£0.00 ≤'), 0, 'the fat bucket columns do not make an exact figure bounded')
 })

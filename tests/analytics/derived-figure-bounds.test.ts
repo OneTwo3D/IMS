@@ -1,7 +1,8 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 
-import { marginFigureBound, marginFigureBoundDecimal, netLinearFigureBound, netLinearFigureBoundDecimal, shareFigureBound, boundSuffix, unplacedCreditBoundFromParts } from '@/lib/domain/sales/refund-basis-analytics'
+import { toDecimal } from '@/lib/domain/math/decimal'
+import { collapseUnplacedCreditDecimal, marginFigureBound, marginFigureBoundDecimal, netLinearFigureBound, netLinearFigureBoundDecimal, shareFigureBound, boundSuffix, unplacedCreditBoundFromParts, type CollapsedUnplacedCreditDecimal } from '@/lib/domain/sales/refund-basis-analytics'
 import {
   EXACT_LINEAR_FIGURE_BOUND,
   classifyLinearFigureBound,
@@ -9,6 +10,7 @@ import {
   linearFigureBoundWidth,
   roundBoundedAmountForDisplay,
   sumLinearFigureBounds,
+  type CollapsedUnplacedCredit,
   type DerivedFigureBound,
   type LinearFigureBoundInterval,
 } from '@/lib/domain/sales/derived-figure-bound'
@@ -34,22 +36,41 @@ import {
  * claim. Marking a figure with the wrong relation is worse than not marking it at all.
  */
 
+/**
+ * A COLLAPSED SCALAR NAMED OUTRIGHT — WHICH ONLY A TEST MAY DO (o3d-la3n r3).
+ *
+ * `netLinearFigureBound` and `marginFigureBound` take a `CollapsedUnplacedCredit`, and the only
+ * public way to mint one is `unplacedCreditBoundFromParts`, which demands `Σ max(entry, 0)` beside
+ * each bucket's signed total. That is what makes `refundsGrossBasis + refundsUnknownBasis` fail to
+ * compile as a bound: a published row carries the totals and not the positives, so rebuilding the
+ * removed rule now means inventing a number nobody measured.
+ *
+ * These tests are ABOUT what the classifiers answer for a given scalar — including scalars no
+ * bucket could produce, like NaN — so they state the scalar and cast once, here. The tests that
+ * pin the MINT itself go through `unplacedCreditBoundFromParts` and do not use this.
+ */
+const collapsed = (value: number) => value as CollapsedUnplacedCredit
+
+/** The same, for the Decimal twins. `collapseUnplacedCreditDecimal` is the real mint. */
+const collapsedDecimal = (value: number): CollapsedUnplacedCreditDecimal =>
+  collapseUnplacedCreditDecimal({ lower: toDecimal(value), upper: toDecimal(value) })
+
 // ---------------------------------------------------------------------------
 // The figures that move one-for-one — the argument rounds 1-3 made, which holds for these
 // ---------------------------------------------------------------------------
 
 test('linear figures: a complete basis is exact, an incomplete one is a genuine upper bound (o3d-iigc r4)', () => {
-  assert.equal(netLinearFigureBound({ basisComplete: true, unplacedCredit: 0 }), 'exact')
-  assert.equal(netLinearFigureBound({ basisComplete: false, unplacedCredit: 120 }), 'upper')
+  assert.equal(netLinearFigureBound({ basisComplete: true, unplacedCredit: collapsed(0) }), 'exact')
+  assert.equal(netLinearFigureBound({ basisComplete: false, unplacedCredit: collapsed(120) }), 'upper')
 })
 
 test('linear figures: EXISTENCE comes from the flag, not the amount — a sub-penny credit still bounds (o3d-iigc r4)', () => {
   // The producers round their reported bucket totals to 2dp, so a £0.004 unstamped credit reports
   // as £0.00 while `refundBasisComplete` stays false. Reading existence off the amount would
   // publish that row as EXACT — a claim about a figure we just said we could not place.
-  assert.equal(netLinearFigureBound({ basisComplete: false, unplacedCredit: 0 }), 'upper')
+  assert.equal(netLinearFigureBound({ basisComplete: false, unplacedCredit: collapsed(0) }), 'upper')
   assert.equal(
-    marginFigureBound({ netRevenue: 100, cogs: 40, unplacedCredit: 0, basisComplete: false }),
+    marginFigureBound({ netRevenue: 100, cogs: 40, unplacedCredit: collapsed(0), basisComplete: false }),
     'upper',
   )
 })
@@ -58,9 +79,9 @@ test('linear figures: a NEGATIVE unplaced credit would bound the other way, so i
   // Not reachable today — the buckets are fed only by refund lines carrying a productId, and the one
   // refund line that is negative by construction (the mirrored order-discount line) carries none —
   // but the classification does not depend on that holding.
-  assert.equal(netLinearFigureBound({ basisComplete: false, unplacedCredit: -5 }), 'indeterminate')
+  assert.equal(netLinearFigureBound({ basisComplete: false, unplacedCredit: collapsed(-5) }), 'indeterminate')
   assert.equal(
-    marginFigureBound({ netRevenue: 100, cogs: 40, unplacedCredit: -5, basisComplete: false }),
+    marginFigureBound({ netRevenue: 100, cogs: 40, unplacedCredit: collapsed(-5), basisComplete: false }),
     'indeterminate',
   )
 })
@@ -70,9 +91,9 @@ test('linear figures: a NEGATIVE unplaced credit would bound the other way, so i
 // ---------------------------------------------------------------------------
 
 test('margin: a complete basis is exact and carries NO mark (o3d-iigc r4 control)', () => {
-  assert.equal(marginFigureBound({ netRevenue: 100, cogs: 40, unplacedCredit: 0, basisComplete: true }), 'exact')
+  assert.equal(marginFigureBound({ netRevenue: 100, cogs: 40, unplacedCredit: collapsed(0), basisComplete: true }), 'exact')
   // And the control is not vacuous: the SAME numbers with the flag flipped are marked.
-  assert.equal(marginFigureBound({ netRevenue: 100, cogs: 40, unplacedCredit: 0, basisComplete: false }), 'upper')
+  assert.equal(marginFigureBound({ netRevenue: 100, cogs: 40, unplacedCredit: collapsed(0), basisComplete: false }), 'upper')
 })
 
 test('margin case 3: the whole interval of possible revenues stays positive, so ≤ holds (o3d-iigc r4)', () => {
@@ -81,14 +102,14 @@ test('margin case 3: the whole interval of possible revenues stays positive, so 
   //   m(1000) = 100*(1 - 400/1000) = 60.0%   <- published
   //   m(880)  = 100*(1 - 400/880)  = 54.5%   <- the loosest the truth can be
   // 54.5 <= 60.0, so the published figure really is a ceiling.
-  assert.equal(marginFigureBound({ netRevenue: 1000, cogs: 400, unplacedCredit: 120, basisComplete: false }), 'upper')
+  assert.equal(marginFigureBound({ netRevenue: 1000, cogs: 400, unplacedCredit: collapsed(120), basisComplete: false }), 'upper')
 })
 
 test('margin case 4a: the interval straddles zero but the published margin is positive — still ≤ (o3d-iigc r4)', () => {
   // £100 net revenue, £40 COGS, a £120 gross credit. The true revenue could be as low as -£20, where
   // the report's own guard prints 0%. Published is 100*(1 - 40/100) = 60%, and every reachable value
   // — 0% from the guard, and everything below 60% for a positive revenue — is at most that.
-  assert.equal(marginFigureBound({ netRevenue: 100, cogs: 40, unplacedCredit: 120, basisComplete: false }), 'upper')
+  assert.equal(marginFigureBound({ netRevenue: 100, cogs: 40, unplacedCredit: collapsed(120), basisComplete: false }), 'upper')
 })
 
 test('margin case 4b: COGS above net revenue makes ≤ A FALSE CLAIM — the finding (o3d-iigc r4)', () => {
@@ -98,12 +119,12 @@ test('margin case 4b: COGS above net revenue makes ≤ A FALSE CLAIM — the fin
   //   place the credit at its £100 ex-VAT value and net revenue is 0, where the guard prints 0.0%
   //   0.0% is NOT "at most -50.0%".
   // Round 3 marked this `≤`. It is not a bound in that direction at all.
-  assert.equal(marginFigureBound({ netRevenue: 100, cogs: 150, unplacedCredit: 120, basisComplete: false }), 'indeterminate')
+  assert.equal(marginFigureBound({ netRevenue: 100, cogs: 150, unplacedCredit: collapsed(120), basisComplete: false }), 'indeterminate')
 
   // And the boundary is exactly `netRevenue >= cogs`, not a hand-wave: at COGS 100 the published
   // margin is 0%, which the guard's 0% ties rather than exceeds.
-  assert.equal(marginFigureBound({ netRevenue: 100, cogs: 100, unplacedCredit: 120, basisComplete: false }), 'upper')
-  assert.equal(marginFigureBound({ netRevenue: 100, cogs: 100.01, unplacedCredit: 120, basisComplete: false }), 'indeterminate')
+  assert.equal(marginFigureBound({ netRevenue: 100, cogs: 100, unplacedCredit: collapsed(120), basisComplete: false }), 'upper')
+  assert.equal(marginFigureBound({ netRevenue: 100, cogs: 100.01, unplacedCredit: collapsed(120), basisComplete: false }), 'indeterminate')
 })
 
 test('margin case 1: a NEGATIVE COGS inverts the direction entirely (o3d-iigc r4)', () => {
@@ -111,15 +132,15 @@ test('margin case 1: a NEGATIVE COGS inverts the direction entirely (o3d-iigc r4
   //   m(1000) = 100*(1 + 100/1000) = 110.0%   <- published
   //   m(900)  = 100*(1 + 100/900)  = 111.1%   <- higher than the "upper bound"
   // The published figure is a LOWER bound here, so `≤` is again the wrong relation.
-  assert.equal(marginFigureBound({ netRevenue: 1000, cogs: -100, unplacedCredit: 120, basisComplete: false }), 'indeterminate')
+  assert.equal(marginFigureBound({ netRevenue: 1000, cogs: -100, unplacedCredit: collapsed(120), basisComplete: false }), 'indeterminate')
 })
 
 test('margin case 2: a non-positive net revenue pins both readings to the guard, so it is EXACT (o3d-iigc r4)', () => {
   // The true revenue can only be lower than the published one, and the guard already prints 0% for
   // everything at or below zero. Both readings are 0%, so marking this would OVERSTATE the
   // uncertainty — the failure mode in the other direction.
-  assert.equal(marginFigureBound({ netRevenue: 0, cogs: 40, unplacedCredit: 120, basisComplete: false }), 'exact')
-  assert.equal(marginFigureBound({ netRevenue: -30, cogs: 40, unplacedCredit: 120, basisComplete: false }), 'exact')
+  assert.equal(marginFigureBound({ netRevenue: 0, cogs: 40, unplacedCredit: collapsed(120), basisComplete: false }), 'exact')
+  assert.equal(marginFigureBound({ netRevenue: -30, cogs: 40, unplacedCredit: collapsed(120), basisComplete: false }), 'exact')
 })
 
 test('a non-finite CREDIT is never silently classified as a bound (o3d-iigc r4)', () => {
@@ -127,12 +148,12 @@ test('a non-finite CREDIT is never silently classified as a bound (o3d-iigc r4)'
   // every comparison below and lands on `indeterminate` anyway, whereas a NaN credit makes
   // `netRevenue - unplacedCredit > 0` merely FALSE, which without the guard falls through to the
   // case-4 test and publishes `upper` — a bound asserted from an amount that is not a number.
-  assert.equal(marginFigureBound({ netRevenue: 100, cogs: 40, unplacedCredit: Number.NaN, basisComplete: false }), 'indeterminate')
-  assert.equal(marginFigureBound({ netRevenue: 100, cogs: 40, unplacedCredit: Number.POSITIVE_INFINITY, basisComplete: false }), 'indeterminate')
-  assert.equal(netLinearFigureBound({ basisComplete: false, unplacedCredit: Number.NaN }), 'indeterminate')
+  assert.equal(marginFigureBound({ netRevenue: 100, cogs: 40, unplacedCredit: collapsed(Number.NaN), basisComplete: false }), 'indeterminate')
+  assert.equal(marginFigureBound({ netRevenue: 100, cogs: 40, unplacedCredit: collapsed(Number.POSITIVE_INFINITY), basisComplete: false }), 'indeterminate')
+  assert.equal(netLinearFigureBound({ basisComplete: false, unplacedCredit: collapsed(Number.NaN) }), 'indeterminate')
 
   // And with a real credit the same shape IS a bound, so the assertion is not merely "always refuse".
-  assert.equal(marginFigureBound({ netRevenue: 100, cogs: 40, unplacedCredit: 120, basisComplete: false }), 'upper')
+  assert.equal(marginFigureBound({ netRevenue: 100, cogs: 40, unplacedCredit: collapsed(120), basisComplete: false }), 'upper')
 })
 
 // ---------------------------------------------------------------------------
@@ -179,12 +200,12 @@ test('the Decimal bound classifiers answer exactly what their number twins do (o
   const linear = new Set<string>()
   const margin = new Set<string>()
   for (const input of BOUND_CASES) {
-    const linearNumber = netLinearFigureBound({ basisComplete: input.basisComplete, unplacedCredit: input.unplacedCredit })
-    const linearDecimal = netLinearFigureBoundDecimal({ basisComplete: input.basisComplete, unplacedCredit: input.unplacedCredit })
+    const linearNumber = netLinearFigureBound({ basisComplete: input.basisComplete, unplacedCredit: collapsed(input.unplacedCredit) })
+    const linearDecimal = netLinearFigureBoundDecimal({ basisComplete: input.basisComplete, unplacedCredit: collapsedDecimal(input.unplacedCredit) })
     assert.equal(linearDecimal, linearNumber, `linear disagreed on ${JSON.stringify(input)}`)
     linear.add(linearNumber)
-    const marginNumber = marginFigureBound(input)
-    const marginDecimal = marginFigureBoundDecimal(input)
+    const marginNumber = marginFigureBound({ ...input, unplacedCredit: collapsed(input.unplacedCredit) })
+    const marginDecimal = marginFigureBoundDecimal({ ...input, unplacedCredit: collapsedDecimal(input.unplacedCredit) })
     assert.equal(marginDecimal, marginNumber, `margin disagreed on ${JSON.stringify(input)}`)
     margin.add(marginNumber)
   }
@@ -206,6 +227,48 @@ test('a share-of-total ratio is exact or it is indeterminate — never ≤ (o3d-
 })
 
 /**
+ * THE DOOR THE BRAND CLOSES, ASSERTED AT THE TYPE LEVEL (o3d-la3n r3).
+ *
+ * Round 2 removed the completeness boolean from the published row so the old unsound rule could not
+ * be rebuilt from it. It left the rest of the rule reachable: both SIGNED disclosure buckets are
+ * still published — they are columns an operator reads, on screen and in three CSVs, and removing
+ * them would hide the very credit the mark exists to disclose — completeness is recoverable from
+ * the interval, and all four classifiers took a plain number. So `gross + unknown` handed to any of
+ * them rebuilt the whole thing with no cast, which is a convention against it, not an absence of it.
+ *
+ * These four lines ARE the assertion. Each fails to compile today; widen any parameter back and tsc
+ * reports "Unused '@ts-expect-error' directive" on that line and the build goes red. `DecimalInput`
+ * admits a plain `number`, which is why the Decimal twins need the same brand — closing only the
+ * float door would have been a proof about the wrong door.
+ *
+ * The calls still RUN: the brand is type-only, so this also pins that nothing about it changes what
+ * the classifiers answer at runtime.
+ */
+test('a hand-rolled signed bucket sum is not a bound, at any of the four classifiers (o3d-la3n r3)', () => {
+  const gross = 60
+  const unknown = 0
+  const basisComplete = false
+
+  // @ts-expect-error a signed bucket sum is a plain number, never a CollapsedUnplacedCredit
+  netLinearFigureBound({ basisComplete, unplacedCredit: gross + unknown })
+  // @ts-expect-error the ratio classifier reads the same scalar for the same sign, so same door
+  marginFigureBound({ netRevenue: 100, cogs: 40, unplacedCredit: gross + unknown, basisComplete })
+  // @ts-expect-error DecimalInput admits a plain number; only the brand closes this one
+  netLinearFigureBoundDecimal({ basisComplete, unplacedCredit: gross + unknown })
+  // @ts-expect-error and the ratio's Decimal twin, for the same reason
+  marginFigureBoundDecimal({ netRevenue: 100, cogs: 40, unplacedCredit: gross + unknown, basisComplete })
+
+  // What the caller must write instead, and why it is not a formality: the mint demands
+  // Σ max(entry, 0) beside the signed total, and with that endpoint present the +£120/−£60 pair
+  // that summed to a harmless-looking £60 is correctly refused a direction.
+  assert.equal(
+    netLinearFigureBound({ basisComplete, unplacedCredit: unplacedCreditBoundFromParts([{ total: gross, positive: 120 }]) }),
+    'indeterminate',
+    'the endpoint the addition destroyed is exactly what changes the answer',
+  )
+})
+
+/**
  * o3d-7jfq: THE INTERVAL, OVER `number`, FOR THE PRODUCERS THAT ARE NOT DECIMAL.
  *
  * `unplacedCreditBoundFromParts` is what stops a signed bucket sum reaching the classifiers above.
@@ -217,12 +280,12 @@ test('the number-world interval keeps a negative entry visible through a zero bu
   // +120 and -120 of the same basis: total 0, positive 120, so the lower end is 0 - 120 = -120.
   assert.equal(unplacedCreditBoundFromParts([{ total: 0, positive: 120 }]), -120)
   // The signed sum this replaced. Zero is not negative, so the classifier said `upper` about it.
-  assert.equal(netLinearFigureBound({ basisComplete: false, unplacedCredit: 0 }), 'upper')
+  assert.equal(netLinearFigureBound({ basisComplete: false, unplacedCredit: collapsed(0) }), 'upper')
   assert.equal(netLinearFigureBound({ basisComplete: false, unplacedCredit: unplacedCreditBoundFromParts([{ total: 0, positive: 120 }]) }), 'indeterminate')
 
   // All entries non-negative: lower is 0, so the upper end is returned and the ceiling stands.
   assert.equal(unplacedCreditBoundFromParts([{ total: 240, positive: 240 }]), 240)
-  assert.equal(netLinearFigureBound({ basisComplete: false, unplacedCredit: 240 }), 'upper')
+  assert.equal(netLinearFigureBound({ basisComplete: false, unplacedCredit: collapsed(240) }), 'upper')
 
   // Two buckets summed as one interval, which is what every call site passes: gross +120/-120 and
   // unknown +5. Lower = -120 + 0 = -120, so it is negative and wins, even though the ARITHMETIC sum
@@ -321,7 +384,7 @@ test('non-finite and inverted intervals establish nothing (o3d-la3n r2)', () => 
 test('a RATIO bound cannot reach the linear fold, and the legitimate route still does (o3d-la3n r2)', () => {
   // A real ratio verdict, from the real classifier, on the worked case that makes margin move the
   // other way: revenue 100, COGS 150, £120 of unplaced credit.
-  const ratioVerdict: DerivedFigureBound = marginFigureBound({ netRevenue: 100, cogs: 150, unplacedCredit: 120, basisComplete: false })
+  const ratioVerdict: DerivedFigureBound = marginFigureBound({ netRevenue: 100, cogs: 150, unplacedCredit: collapsed(120), basisComplete: false })
   assert.equal(ratioVerdict, 'indeterminate', 'the ratio really is bounded differently from the linear figures beside it')
 
   // @ts-expect-error a ratio's VERDICT is not an interval; it carries no endpoints to add

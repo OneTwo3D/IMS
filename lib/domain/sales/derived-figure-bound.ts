@@ -11,26 +11,46 @@
  * and the only thing a future edit could take away.
  *
  * ---------------------------------------------------------------------------------------------
- * WHY THE INTERVAL IS THE REPRESENTATION AND THE VERDICT IS ONLY A RENDERING OF IT (o3d-la3n r2)
+ * WHY THE INTERVAL IS THE REPRESENTATION AND THE VERDICT IS ONLY A RENDERING OF IT (o3d-la3n r3)
  * ---------------------------------------------------------------------------------------------
  *
  * Round 1 of this branch replaced a two-valued boolean with a three-valued verdict and then folded
- * VERDICTS to bound a filtered subtotal. Codex round 1 showed that no set of verdict states can be
- * both sound and tight, because the fold needs the ENDPOINT MAGNITUDES the verdict throws away:
+ * VERDICTS to bound a filtered subtotal. The three-state model was genuinely short of a state: a row
+ * whose unplaced credit is negative-only has a delta interval of `[0, +30]`, so the true figure lies
+ * between the published one and published + 30. That is a determinate LOWER bound, and a model with
+ * no `lower` has to call it `indeterminate` — telling the reader the truth may be below a figure it
+ * provably cannot be below. FOUR states fix that, and `DerivedFigureBound` has four.
  *
- *   - a row whose unplaced credit is negative-only occupies `[-30, 0]`, so the true figure lies
- *     between the published one and published + 30. That is a determinate LOWER bound, and a
- *     three-state model that has no `lower` has to call it `indeterminate` — which tells the reader
- *     the truth may be below the published figure when it provably cannot be.
- *   - an `upper` row and a `lower` row in the same subset may or may not fold to something
- *     determinate. `[-30, 0] + [0, 5]` is `[-30, 5]`, indeterminate; but `[-30, 0] + [0, 0]` is
- *     still `lower`… and from the two verdicts alone, `upper` and `lower`, both subsets look
- *     identical. The verdicts do not carry enough to tell them apart.
+ * WHAT ROUNDS 1 AND 2 CLAIMED HERE AND WHAT IS ACTUALLY TRUE (corrected, Codex round 2). The
+ * argument written here was that four verdicts still cannot classify a SUM: that `upper + lower`
+ * might fold either way, with `[-30, 0] + [0, 0]` offered as the determinate case. THAT IS WRONG,
+ * and `[0, 0]` is `exact`, not `lower` — the pair in the "counterexample" is `upper + exact`. Every
+ * interval this module can mint CONTAINS ZERO: `EXACT_LINEAR_FIGURE_BOUND` is `[0, 0]`, and
+ * `linearFigureBoundFromUnplacedCredit` accumulates `creditLower <= 0 <= creditUpper` from
+ * `Σ min(e, 0)` and `Σ max(e, 0)`, whichever entries it is given. So an `upper` interval ENDS at
+ * zero, a `lower` interval STARTS at zero, and their sum has a negative lower end and a positive
+ * upper end — it straddles zero, always, and is always `indeterminate`. Under that invariant the
+ * four verdicts ARE sufficient to classify a sum, and no counterexample of that shape exists.
+ *
+ * THE INTERVAL IS STILL THE RIGHT REPRESENTATION, FOR TWO REASONS THAT DO NOT REST ON THAT BEING
+ * IMPOSSIBLE:
+ *
+ *   1. IT PRESERVES WIDTHS, AND THE VERDICT IS NOT THE ONLY THING READ OFF A BOUND. Product
+ *      Profitability prints "Not subtracted: up to £42.00 of credit" under a subtotal of two rows
+ *      bounded by £12 and £30. `linearFigureBoundWidth` gets that by adding endpoints; a fold over
+ *      the verdicts `upper` and `upper` has thrown both magnitudes away and can only say "up to
+ *      an unknown amount". A verdict fold is not merely awkward for the disclosure line, it cannot
+ *      produce it at all.
+ *   2. IT DOES NOT DEPEND ON THE CONSTRUCTOR INVARIANT HOLDING. "Every minted interval contains
+ *      zero" is a property of today's only public constructor, not of the type, and nothing in the
+ *      compiler enforces it. A verdict fold would be sound only for as long as that stayed true,
+ *      and would go silently wrong — publishing `upper` over a figure whose truth is above it — the
+ *      first time a producer mints `[-30, -5]`. Adding endpoints is correct for any intervals
+ *      whatever, so the soundness of the aggregate owes nothing to how the parts were built.
  *
  * So: carry `[lower, upper]` through aggregation, ADD endpoints when figures are summed, and
  * classify ONCE, at the point of display. `combineDerivedFigureBounds`-style verdict folding is not
- * offered by this module at all — the operation that was unsound is not merely discouraged, it has
- * no name to call.
+ * offered by this module at all — the operation that would carry that debt has no name to call.
  */
 
 /**
@@ -142,8 +162,9 @@ export function linearFigureBoundFromUnplacedCredit(
  * This is the operation Product Profitability's browser-side filtered subtotal needs: there is one
  * published bound per row and an unbounded number of subsets the operator may filter to, so the
  * producer cannot publish a marker for the subtotal and the page must combine. It combines
- * INTERVALS. Folding the verdicts instead loses the endpoint magnitudes, and an `upper` row beside
- * a `lower` row cannot be classified without them.
+ * INTERVALS. Folding the verdicts instead loses the endpoint magnitudes — which is what the
+ * disclosure line "up to £42.00 of credit" is made of — and stakes the aggregate's soundness on
+ * every part having been minted containing zero. See the header for both arguments.
  *
  * ONLY FOR A SUM. A RATIO is not covered — see the brand on `LinearFigureBoundInterval`, which is
  * what stops a ratio's bound arriving here in the first place.
@@ -226,6 +247,58 @@ export function roundBoundedAmountForDisplay(amount: number, bound: DerivedFigur
 // The collapsed-scalar entry point, for the producers not yet migrated
 // ---------------------------------------------------------------------------
 
+declare const COLLAPSED_UNPLACED_CREDIT: unique symbol
+
+/**
+ * A CREDIT BOUND THAT HAS ALREADY BEEN COLLAPSED TO ONE SIGNED NUMBER — and the only thing the
+ * collapsed-scalar classifiers will accept (o3d-la3n r3).
+ *
+ * THE BRAND IS WHAT REMOVES THE OLD UNSOUND RULE, NOT A COMMENT ASKING NOBODY TO WRITE IT. Round 2
+ * deleted `…RefundBasisComplete` from the wire so the broken classification could not be rebuilt
+ * from a published row — but the two SIGNED disclosure buckets are still published, and must be:
+ * `refundsGrossBasis` and `refundsUnknownBasis` are columns on the Product Profitability table, in
+ * its CSV, and in the sales-analytics exports, where an operator reads them to find the credit that
+ * was left out. What they may NOT do is become the input to a classifier, because adding them
+ * cancels a +£120 against a −£120 into a zero that is not negative, and every classifier downstream
+ * then answers `upper` about a figure whose truth can be £120 above the published one.
+ *
+ * `number` cannot say that, and completeness is still derivable (`classifyLinearFigureBound(bound)
+ * === 'exact'` reconstructs the removed flag exactly), so while these functions took a plain
+ * `number` the whole broken rule stayed one expression away for any consumer, with no cast needed.
+ * A plain `number` is not assignable to this type, so `gross + unknown` — or any other hand-rolled
+ * sum — no longer typechecks as a bound. The one public way to obtain one is
+ * `unplacedCreditBoundFromParts`, which demands `Σ max(entry, 0)` ALONGSIDE each bucket's signed
+ * total: precisely the endpoint the addition destroys, and precisely what a row's published
+ * disclosure columns do not carry. Producing one from a published row therefore means fabricating
+ * a `positive` that was never measured, not merely forgetting to read this paragraph.
+ *
+ * Type-only: at runtime this is the number it says it is.
+ */
+export type CollapsedUnplacedCredit = number & { readonly [COLLAPSED_UNPLACED_CREDIT]: 'collapsed' }
+
+/**
+ * The one place a collapsed scalar is minted. Kept here, beside the type, so the cast that creates
+ * the brand exists exactly once — `refund-basis-analytics.ts` calls this rather than casting again.
+ *
+ * `total` is a bucket's SIGNED sum and `positive` is `Σ max(entry, 0)` over the entries that fed it,
+ * so `Σ min(entry, 0)` is the difference. The collapse keeps the SIGN and throws one endpoint away:
+ * a negative result means some unplaced entry was negative, and a non-negative one means none was,
+ * which is the whole of what the collapsed classifiers read.
+ */
+export function collapseUnplacedCredit(
+  parts: ReadonlyArray<{ total: number; positive: number }>,
+): CollapsedUnplacedCredit {
+  let lower = 0
+  let upper = 0
+  for (const part of parts) {
+    lower += part.total - part.positive
+    upper += part.positive
+  }
+  // Below zero at the bottom is what both collapsed classifiers read as "no `≤` may be claimed";
+  // otherwise no unplaced entry was negative and the ceiling is the top of the credit interval.
+  return (lower < 0 ? lower : upper) as CollapsedUnplacedCredit
+}
+
 /**
  * `classifyLinearFigureBound` for a caller that has already collapsed its interval to one signed
  * number — Sales Statistics, the dashboard, and (through `netLinearFigureBoundDecimal`) the sales,
@@ -242,12 +315,17 @@ export function roundBoundedAmountForDisplay(amount: number, bound: DerivedFigur
  * `unplacedCredit` is the refund value the net figure could not absorb (gross-basis +
  * unproven-basis). Every figure of the form `netRevenue - k` for a basis-independent, non-negative
  * `k` (gross profit, average order value) moves with it one for one and carries the same relation.
+ *
+ * IT IS A `CollapsedUnplacedCredit` AND NOT A `number` ON PURPOSE (o3d-la3n r3). That is what makes
+ * the rule this branch removed — completeness off the published bound, credit off
+ * `refundsGrossBasis + refundsUnknownBasis` — fail to compile rather than merely fail to be
+ * mentioned. See the type.
  */
 export function netLinearFigureBound(params: {
   /** False when ANY credit could not be placed on the net basis — the producers' existing flag. */
   basisComplete: boolean
   /** The COLLAPSED credit bound. Negative means an entry was negative; the other endpoint is gone. */
-  unplacedCredit: number
+  unplacedCredit: CollapsedUnplacedCredit
 }): DerivedFigureBound {
   if (params.basisComplete) return 'exact'
   if (!Number.isFinite(params.unplacedCredit) || params.unplacedCredit < 0) return 'indeterminate'

@@ -214,6 +214,13 @@ test('a product with no sales at all is not reported as an upper bound (o3d-iigc
 function theOldRule(row: { basisComplete: boolean; gross: number; unknown: number }) {
   return linear.netLinearFigureBound({
     basisComplete: row.basisComplete,
+    // @ts-expect-error o3d-la3n r3: THIS LINE IS THE ASSERTION. A signed bucket sum is a `number`,
+    // and `unplacedCredit` is a `CollapsedUnplacedCredit` that only `unplacedCreditBoundFromParts`
+    // can mint — so the broken rule no longer typechecks for anyone, which is what "removed" has to
+    // mean when both of its ingredients are still on the wire for their own good reasons. The
+    // directive is load-bearing in both directions: widen the parameter back to `number` and tsc
+    // fails this file with "unused '@ts-expect-error' directive". The call still RUNS, because the
+    // tests below need the answer the old rule gave in order not to be vacuous.
     unplacedCredit: row.gross + row.unknown,
   })
 }

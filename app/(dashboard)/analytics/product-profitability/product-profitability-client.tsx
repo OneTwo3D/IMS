@@ -54,8 +54,9 @@ const PAGE_SIZE = 50
  * Round 2 went further and removed the ingredients. `ProfitabilityRow` no longer carries a
  * completeness boolean at all, and every bounded amount arrives paired with the INTERVAL its truth
  * occupies. A filtered subtotal adds those intervals (`sumLinearFigureBounds`) and classifies the
- * result once, here, at the point of display — because a subtotal containing an `upper` row and a
- * `lower` row cannot be classified from the two verdicts alone; it needs the endpoints.
+ * result once, here, at the point of display — because the endpoints are what add, and because the
+ * disclosure line under each card quotes a WIDTH that a fold over verdicts has already thrown away.
+ * See `derived-figure-bound.ts`, which states both arguments and corrects the one round 2 gave.
  */
 const UPPER_TITLE = 'Upper bound: some of this product\u2019s refunds in this FY are on the gross basis or have no proven basis, so they are not subtracted here'
 const UPPER_TITLE_SUMMARY = 'Upper bound: refunds on the gross basis or with no proven basis are not subtracted here'
@@ -84,9 +85,15 @@ function round2(value: number): number {
   return Math.round(value * 100) / 100
 }
 
+/** What this page prints where it declines to print an amount. Never a substitute for a RELATION. */
+const NO_AMOUNT = '—'
+
 type MarkedFigure = {
   bound: DerivedFigureBound
-  /** The amount rounded IN THE DIRECTION ITS RELATION ALLOWS, formatted, with the mark appended. */
+  /**
+   * What the cell says: the amount rounded IN THE DIRECTION ITS RELATION ALLOWS — or whatever the
+   * caller chose to print in its place — with the mark appended AFTER it, unconditionally.
+   */
   text: string
   tone: string
   title: string | undefined
@@ -98,17 +105,31 @@ type MarkedFigure = {
  * Classify, then round in the direction the classification allows, then mark. Rounding last and
  * rounding directionally are both load-bearing: a filtered subtotal of raw £0.024 displayed as the
  * nearest cent is £0.02, and "at most £0.02" is false of a truth that may be £0.024 (o3d-l4zz).
+ *
+ * THE MARK IS A FACT ABOUT THE INTERVAL, NOT ABOUT THE AMOUNT (o3d-la3n r3). Nothing about the
+ * amount's VALUE may suppress it: a row whose revenue and profit are both exactly zero — £100 of
+ * sales, a £100 net-basis refund, no COGS, and a negative gross-basis reversal beside them — still
+ * carries a `lower` interval, and `£0.00 ≥` and a bare `—` say opposite things to a reader. Round 2
+ * composed the amount and the mark into ONE string and let the caller decide whether to print it,
+ * which dropped the relation at two table cells for every non-positive amount.
+ *
+ * So `renderAmount` is the ONLY thing a caller may vary, and the mark is concatenated after it
+ * HERE — below any branch a caller can reach. A caller that wants to hide the figure returns
+ * `NO_AMOUNT` from its renderer and still gets `— ≥`; it has no way to obtain the mark separately
+ * and no way to obtain the amount without it. Handing back a struct of parts for the caller to
+ * reassemble would put the concatenation back on the caller's side of the branch, which is exactly
+ * what regressed.
  */
 function markFigure(
   amount: number,
   interval: LinearFigureBoundInterval,
-  fmt: (value: number) => string,
+  renderAmount: (value: number) => string,
   summary = false,
 ): MarkedFigure {
   const bound = classifyLinearFigureBound(interval)
   return {
     bound,
-    text: `${fmt(roundBoundedAmountForDisplay(amount, bound))}${boundSuffix(bound)}`,
+    text: `${renderAmount(roundBoundedAmountForDisplay(amount, bound))}${boundSuffix(bound)}`,
     tone: boundTone(bound),
     title: boundTitle(bound, summary),
   }
@@ -307,9 +328,11 @@ export function ProductProfitabilityClient({ data }: Props) {
    *
    * Two things this must not do, both of which it used to (o3d-la3n).
    *
-   * It must not fold VERDICTS. A subset holding one `≤` row and one `≥` row cannot be classified
-   * from those two marks: `[-30, 0] + [0, 0]` is still a lower bound and `[-30, 0] + [0, 5]` is not,
-   * and the verdicts are identical in both. The endpoints add; the verdicts do not.
+   * It must not fold VERDICTS. The endpoints add; the verdicts do not. Two `≤` rows bounded by £12
+   * and £30 give a subtotal bounded by £42, and that £42 is printed under the card — a fold over
+   * the two marks has thrown both magnitudes away and cannot produce it. (The stronger claim round
+   * 2 made here, that `≤` beside `≥` cannot even be CLASSIFIED from the marks, was wrong; see
+   * `derived-figure-bound.ts` for the correction and for the reason the interval still stands.)
    *
    * And it must not sum ROUNDED rows. Two products with raw revenue £0.014 and £0.001 of positive
    * unplaced credit each round to £0.01, sum to £0.02, and carry a `≤` over a true aggregate of at
@@ -425,34 +448,43 @@ export function ProductProfitabilityClient({ data }: Props) {
       // o3d-iigc/o3d-la3n: where the FY refunds could not all be placed on the net basis this
       // figure is bounded. The mark, the colour and the rounding all come out of `markFigure`,
       // which classifies the PRODUCER'S interval — the cells decide nothing.
-      case 'currentFyRevenue': return <BoundedMoney fy={r.currentFy} amount={r.currentFy.revenue} show={r.currentFy.revenue > 0} className="font-medium" />
+      case 'currentFyRevenue': return <BoundedMoney fy={r.currentFy} amount={r.currentFy.revenue} showAmount={r.currentFy.revenue > 0} className="font-medium" />
       case 'currentFyRefundsGrossBasis': return <DisclosedMoney amount={r.currentFy.refundsGrossBasis} title={GROSS_BUCKET_TITLE} />
       case 'currentFyRefundsUnknownBasis': return <DisclosedMoney amount={r.currentFy.refundsUnknownBasis} title={UNKNOWN_BUCKET_TITLE} />
       case 'currentFyCogs': return <span className="tabular-nums text-xs font-mono text-muted-foreground">{r.currentFy.cogs > 0 ? fmtBase(r.currentFy.cogs) : '—'}</span>
-      case 'currentFyProfit': return <BoundedMoney fy={r.currentFy} amount={r.currentFy.profit} show={r.currentFy.revenue > 0 || r.currentFy.cogs > 0} verdictTone />
+      case 'currentFyProfit': return <BoundedMoney fy={r.currentFy} amount={r.currentFy.profit} showAmount={r.currentFy.revenue > 0 || r.currentFy.cogs > 0} verdictTone />
       case 'currentFyQtySold': return <span className="tabular-nums text-xs">{r.currentFy.qtySold > 0 ? round2(r.currentFy.qtySold) : '—'}</span>
-      case 'previousFyRevenue': return <BoundedMoney fy={r.previousFy} amount={r.previousFy.revenue} show={r.previousFy.revenue > 0} />
+      case 'previousFyRevenue': return <BoundedMoney fy={r.previousFy} amount={r.previousFy.revenue} showAmount={r.previousFy.revenue > 0} />
       case 'previousFyRefundsGrossBasis': return <DisclosedMoney amount={r.previousFy.refundsGrossBasis} title={GROSS_BUCKET_TITLE} />
       case 'previousFyRefundsUnknownBasis': return <DisclosedMoney amount={r.previousFy.refundsUnknownBasis} title={UNKNOWN_BUCKET_TITLE} />
       case 'previousFyCogs': return <span className="tabular-nums text-xs font-mono text-muted-foreground">{r.previousFy.cogs > 0 ? fmtBase(r.previousFy.cogs) : '—'}</span>
-      case 'previousFyProfit': return <BoundedMoney fy={r.previousFy} amount={r.previousFy.profit} show={r.previousFy.revenue > 0 || r.previousFy.cogs > 0} verdictTone />
+      case 'previousFyProfit': return <BoundedMoney fy={r.previousFy} amount={r.previousFy.profit} showAmount={r.previousFy.revenue > 0 || r.previousFy.cogs > 0} verdictTone />
       case 'previousFyQtySold': return <span className="tabular-nums text-xs">{r.previousFy.qtySold > 0 ? round2(r.previousFy.qtySold) : '—'}</span>
     }
   }
 
-  /** A money cell that carries its FY's relation. `verdictTone` colours profit/loss when exact. */
-  function BoundedMoney({ fy, amount, show, verdictTone = false, className = '' }: {
+  /**
+   * A money cell that carries its FY's relation. `verdictTone` colours profit/loss when exact.
+   *
+   * o3d-la3n r3: `showAmount` decides WHICH AMOUNT is printed — the figure, or `NO_AMOUNT` in place
+   * of a figure this page does not consider worth showing — and it decides NOTHING ELSE. It is
+   * spent inside the renderer `markFigure` calls, underneath the point where the mark is appended,
+   * so there is no value of `showAmount` that can reach the relation. The component itself has no
+   * branch left around `m.text`: that is the property, and re-introducing one is the regression.
+   */
+  function BoundedMoney({ fy, amount, showAmount, verdictTone = false, className = '' }: {
     fy: ProfitabilityFyFigures
     amount: number
-    show: boolean
+    /** Whether the FIGURE is worth printing. Never whether the RELATION is. */
+    showAmount: boolean
     verdictTone?: boolean
     className?: string
   }) {
-    const m = markFigure(amount, fy.bound, fmtBase)
+    const m = markFigure(amount, fy.bound, (value) => (showAmount ? fmtBase(value) : NO_AMOUNT))
     const tone = m.bound !== 'exact'
       ? 'text-orange-600'
       : verdictTone ? (amount > 0 ? 'text-green-600' : amount < 0 ? 'text-destructive' : '') : ''
-    return <span className={`tabular-nums text-xs font-mono ${tone} ${className}`} title={m.title}>{show ? m.text : '—'}</span>
+    return <span className={`tabular-nums text-xs font-mono ${tone} ${className}`} title={m.title}>{m.text}</span>
   }
 
   /** An unplaced-credit bucket: a SIGNED total, disclosed. It carries no relation and gets no mark. */
