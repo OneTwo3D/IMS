@@ -85,9 +85,17 @@ function newOrder(id: string, overrides: Partial<OrderRow> = {}): OrderRow {
   }
 }
 
+/**
+ * o3d-i0o6 r5 — MONOTONIC, so an id is never reused inside one scenario. Derived from
+ * `state.syncLogs.length` this counter handed the SAME id back to a log created after one was
+ * removed, which is how a test can stop being able to see a pass still naming the row that vanished.
+ */
+let logSeq = 0
+
 function reset(): void {
   state.orders = []
   state.allocations = []
+  logSeq = 0
   state.syncLogs = []
   state.unitCostByProduct = {}
 }
@@ -186,7 +194,7 @@ const tx = {
     },
     create: async ({ data }: { data: { type: string; referenceType?: string; referenceId: string; payload: unknown } }) => {
       const log: SyncLog = {
-        id: `a2-log-${state.syncLogs.length + 1}`,
+        id: `a2-log-${(logSeq += 1)}`,
         type: data.type,
         referenceType: data.referenceType ?? 'DailyBatch',
         referenceId: data.referenceId,

@@ -75,9 +75,12 @@ import { QBO_DAILY_BATCH_LOCK_KEY } from '@/lib/db/advisory-locks'
 import { acquirePinnedAdvisoryLockOrNull } from '@/lib/db/pinned-advisory-lock'
 import {
   allocationDebitRecreateRefusal,
-  allocationDebitShareOfBatch,
   buildAllocationDebitOrderUpdate,
+  foldA2RecreateOrder,
+  newA2RecreateSummary,
+  repointAllocationDebitPassesToRecreatedJournal,
   type A2RecreateSummary,
+  type AllocationDebitBatchLedger,
 } from '@/lib/domain/accounting/allocation-debit-passes'
 const QBO_CONNECTOR = 'quickbooks'
 const DAILY_BATCH_TYPES = [
@@ -389,25 +392,25 @@ export async function recreateMissingDailyBatchLogs(settings: Awaited<ReturnType
     summary.total += Number(order.unearnedRevenueAmount ?? 0)
   }
 
+  // o3d-i0o6 r5 (Codex round 4, HIGH 1) — THE LEDGER THIS SWEEP WOULD POST INTO. The live-log probe
+  // filters by `connector`, so an Xero batch is invisible here and reads as missing; the evidence
+  // has to be filtered the same way or this sweep rebuilds Xero's pounds into QuickBooks accounts.
+  const a2Ledger: AllocationDebitBatchLedger = {
+    connector: QBO_CONNECTOR,
+    accountCode: settings.quickbooks_allocated_inventory_account,
+  }
   const a2Batches = new Map<string, DailyBatchRecreateBucket<A2RecreateSummary>>()
   for (const order of orphanA2Orders) {
     const summary = foldDailyBatchRow(
       a2Batches,
       'A2',
       { stagedAt: order.inventoryAllocatedDate, persistedRef: order.inventoryAllocatedBatchRef },
-      () => ({ orderCount: 0, total: 0, unattributed: [] as string[] }),
+      newA2RecreateSummary,
     )
     if (!summary) continue
-    summary.orderCount += 1
-    // o3d-i0o6 r4 (Codex round 3, HIGH 1) — THIS BATCH'S SHARE, NEVER THE RUNNING TOTAL. Identical
-    // to the Xero twin, from the same shared rule: summing the cumulative figure into one batch
-    // rebuilds it carrying pounds an EARLIER batch already posted.
-    const share = allocationDebitShareOfBatch(order)
-    if (share.kind === 'unattributed') {
-      summary.unattributed.push(share.reason)
-      continue
-    }
-    summary.total += share.amount
+    // o3d-i0o6 r4/r5 — THIS BATCH'S SHARE ON THIS LEDGER, never the running total and never another
+    // ledger's. Identical to the Xero twin because it IS the Xero twin: one shared fold.
+    foldA2RecreateOrder(summary, order, a2Ledger)
   }
 
   const bBatches = new Map<string, DailyBatchRecreateBucket<{ shipmentCount: number; revenue: number; cogs: number }>>()
@@ -458,7 +461,7 @@ export async function recreateMissingDailyBatchLogs(settings: Awaited<ReturnType
     }
     if (round2(summary.total) <= 0) continue
     await db.$transaction(async (tx) => {
-      await createPendingSyncLog(tx, {
+      const recreatedLogId = await createPendingSyncLog(tx, {
         type: 'DAILY_BATCH_INVENTORY_ALLOC',
         referenceId,
         currency: baseCurrency,
@@ -474,6 +477,32 @@ export async function recreateMissingDailyBatchLogs(settings: Awaited<ReturnType
           _recreatedFromStage: true,
         },
       })
+      // o3d-i0o6 r5 (Codex round 4, HIGH 2) — the evidence moves with the journal, in the same
+      // transaction. A pass still naming the log that went missing makes the recreated debit
+      // permanently irreversible: every later proof resolves a dead id and refuses.
+      for (const order of summary.orders) {
+        const repointed = repointAllocationDebitPassesToRecreatedJournal({
+          existingPasses: order.allocationBatchPasses,
+          batchRef: order.batchRef,
+          ledger: a2Ledger,
+          syncLogId: recreatedLogId,
+        })
+        if (!repointed) continue
+        await tx.salesOrder.update({
+          where: { id: order.id },
+          // Every column spelled out, not spread from the helper's return: o3d-psrx's write census
+          // resolves this literal to check no writer sets `paidAt` without its provenance, and a
+          // `data` it cannot read is a hole in that census rather than a pass.
+          data: {
+            allocationBatchPasses: repointed.allocationBatchPasses,
+            ...(repointed.latestPass ? {
+              allocationBatchSyncLogId: repointed.latestPass.syncLogId,
+              allocationBatchConnector: repointed.latestPass.connector,
+              allocationBatchAccountCode: repointed.latestPass.accountCode,
+            } : {}),
+          },
+        })
+      }
     })
   }
 

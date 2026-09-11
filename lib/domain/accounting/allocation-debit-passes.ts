@@ -233,6 +233,34 @@ export type AllocationDebitBatchRow = {
   id?: string | null
 }
 
+/**
+ * o3d-i0o6 r5 (Codex round 4, HIGH 1) — THE LEDGER A REBUILD WOULD POST INTO, WHICH IS THE HALF OF
+ * A BATCH'S IDENTITY THE REFERENCE ID DOES NOT CARRY.
+ *
+ * A batch reference is `<group>-<date>[-<digest>]`. It names no connector, because it was minted by
+ * one writer for one ledger and nothing needed to say which. Two things then made that omission a
+ * money defect:
+ *
+ *   * the recreate sweep probes for a live log with `connector` in the WHERE clause, so a batch that
+ *     posted on QuickBooks is INVISIBLE to Xero's sweep — it reads as missing;
+ *   * the share it rebuilt was every pass that named the reference, on ANY ledger.
+ *
+ * Put together: after a connector switch, one sweep rebuilds the OTHER ledger's journal into its
+ * own accounts. The QuickBooks debit stands, a duplicate Xero debit appears, and the pass history
+ * still proves only the QuickBooks one — so no refund will ever reverse the duplicate.
+ *
+ * The passes have carried `connector` and `accountCode` since r3. Using them is the whole fix: a
+ * sweep rebuilds THE POUNDS ITS OWN LEDGER'S PASSES PUT INTO THE BATCH, and nothing else. Each
+ * connector's sweep then answers for its own share of a shared reference, and neither can post the
+ * other's.
+ */
+export type AllocationDebitBatchLedger = {
+  /** The connector whose recreate sweep is asking — the ledger a rebuild would post into. */
+  connector: string
+  /** The Allocated Inventory account that rebuild would debit, as configured NOW. */
+  accountCode: string
+}
+
 function batchRowAmount(value: AllocationDebitBatchRow['allocationBatchAmount']): number {
   if (value === null || value === undefined) return 0
   const parsed = typeof value === 'number' ? value : Number(value.toString())
@@ -243,7 +271,15 @@ function describeBatchRow(order: AllocationDebitBatchRow): string {
   return order.orderNumber || order.id || 'an order'
 }
 
-export function allocationDebitShareOfBatch(order: AllocationDebitBatchRow): AllocationDebitBatchShare {
+/** A pass belongs to a rebuild when it named that batch AND the ledger the rebuild would post into. */
+function passIsOfLedger(pass: AllocationDebitPass, ledger: AllocationDebitBatchLedger): boolean {
+  return pass.connector === ledger.connector && pass.accountCode === ledger.accountCode
+}
+
+export function allocationDebitShareOfBatch(
+  order: AllocationDebitBatchRow,
+  ledger: AllocationDebitBatchLedger,
+): AllocationDebitBatchShare {
   const recorded = batchRowAmount(order.allocationBatchAmount)
   // NO RECORDED DEBIT, NO SHARE — and no refusal either. A2 nulls this column on the paths that
   // withdraw an unposted staging, so "nothing recorded" is a POSITIVE answer of zero, not an
@@ -276,10 +312,96 @@ export function allocationDebitShareOfBatch(order: AllocationDebitBatchRow): All
       reason: `${describeBatchRow(order)} records a cumulative A2 debit of £${recorded.toFixed(2)} and names no batch reference, so which batch carried which part of it cannot be established`,
     }
   }
-  const share = sumAllocationDebitPasses(
-    passes.filter((pass) => pass.batchRef === order.inventoryAllocatedBatchRef),
-  )
-  return { kind: 'known', amount: share }
+  const named = passes.filter((pass) => pass.batchRef === order.inventoryAllocatedBatchRef)
+  // SAME LEDGER, SAME BATCH, ANOTHER ACCOUNT — the one arm that is genuinely ambiguous rather than
+  // simply somebody else's. The rebuild would debit the account configured TODAY while the pass
+  // that owed the pounds names a different one in the SAME books, so neither figure describes the
+  // other and no rebuild can be right. Refused, like every other state the history cannot settle.
+  const otherAccount = named.find((pass) => (
+    pass.connector === ledger.connector && pass.accountCode !== null && pass.accountCode !== ledger.accountCode
+  ))
+  if (otherAccount) {
+    return {
+      kind: 'unattributed',
+      reason: `${describeBatchRow(order)} recorded its A2 debit for this batch against account ${otherAccount.accountCode} on ${ledger.connector}, but Allocated Inventory is configured as ${ledger.accountCode} today, so what this batch owes that account cannot be established`,
+    }
+  }
+  // A PASS ON ANOTHER LEDGER IS A POSITIVE ANSWER OF ZERO, NOT A REFUSAL. The pounds are in the
+  // other connector's books, its own sweep can see its own log, and this one has nothing to rebuild
+  // — so the honest share here is £0.00 and the batch is skipped in silence. Refusing instead would
+  // report every pre-switch batch in the retention window, every day, as a problem that is not one.
+  return {
+    kind: 'known',
+    amount: sumAllocationDebitPasses(named.filter((pass) => passIsOfLedger(pass, ledger))),
+  }
+}
+
+/**
+ * o3d-i0o6 r5 (Codex round 4, HIGH 2) — A REBUILT JOURNAL REPLACES THE EVIDENCE, NOT JUST THE ROW.
+ *
+ * `recreateMissingDailyBatchLogs` mints a NEW sync log for a batch whose own log went missing (or
+ * was cancelled and resolved). The orders in that batch still record the OLD id in their pass
+ * history — and that id is exactly what {@link proveAllocationDebitPosting} resolves before it will
+ * authorise a credit.
+ *
+ * So the rebuild used to post a debit that could never be reversed. The recreated journal settles,
+ * the pounds are genuinely in Allocated Inventory, and every later refund and orphan reversal reads
+ * a pass naming a row that is absent (retention) or CANCELLED, refuses, and withholds the credit —
+ * for ever, because nothing ever rewrites that id. Money in, no way out.
+ *
+ * The evidence therefore moves with the journal, inside the SAME transaction that creates it: every
+ * pass that named THIS batch on THIS ledger is re-pointed at the row that now carries its pounds.
+ * Only those passes — a pass on another ledger, or naming another batch, is about a journal this
+ * rebuild did not replace and must keep saying so.
+ *
+ * Returns null when nothing was re-pointed (an unreadable history, or no pass of this batch and
+ * ledger), so the caller writes nothing rather than an update that says the same as the row.
+ */
+export function repointAllocationDebitPassesToRecreatedJournal(input: {
+  /** The raw `SalesOrder.allocationBatchPasses` JSON. */
+  existingPasses: unknown
+  /** The batch reference the rebuild was raised under — the order's OWN persisted reference. */
+  batchRef: string
+  /** The ledger and account the rebuild posts into; only passes naming both are re-pointed. */
+  ledger: AllocationDebitBatchLedger
+  /** The id of the sync log just created for that batch. */
+  syncLogId: string
+}): {
+  allocationBatchPasses: SerializedAllocationDebitPass[]
+  /**
+   * The three latest-pass columns' new values, or NULL when the latest pass is not one of the ones
+   * that moved. Handed back as data rather than as a ready-made Prisma `data` object so the caller
+   * spells out every column it writes — o3d-psrx's write census reads those literals, and a write
+   * assembled elsewhere is a hole in it.
+   */
+  latestPass: { syncLogId: string; connector: string; accountCode: string } | null
+} | null {
+  const passes = parseAllocationDebitPasses(input.existingPasses)
+  if (!passes) return null
+  let changed = false
+  let lastChanged = false
+  const rewritten = passes.map((pass, index) => {
+    if (pass.batchRef !== input.batchRef || !passIsOfLedger(pass, input.ledger)) return pass
+    if (pass.syncLogId === input.syncLogId) return pass
+    changed = true
+    if (index === passes.length - 1) lastChanged = true
+    return { ...pass, syncLogId: input.syncLogId }
+  })
+  if (!changed) return null
+  return {
+    allocationBatchPasses: rewritten.map(serializePass),
+    // THE THREE LATEST-PASS COLUMNS FOLLOW THE LATEST PASS, and only when it is one of the ones
+    // that moved. They describe the pass that wrote them; re-pointing an EARLIER pass says nothing
+    // about the latest one, and rewriting them anyway would make this function a second writer of
+    // facts it did not establish.
+    latestPass: lastChanged
+      ? {
+          syncLogId: input.syncLogId,
+          connector: input.ledger.connector,
+          accountCode: input.ledger.accountCode,
+        }
+      : null,
+  }
 }
 
 /**
@@ -289,11 +411,50 @@ export function allocationDebitShareOfBatch(order: AllocationDebitBatchRow): All
  * `unattributed` is the reason, per order, that a share could not be established. The two are kept
  * apart because they lead to opposite acts — a total of zero means "raise no journal", an
  * unattributed entry means "raise no journal AND tell somebody".
+ *
+ * `orders` (o3d-i0o6 r5) is the rows whose evidence the rebuild must re-point at the journal it
+ * mints. It is carried on the bucket rather than re-queried after the fact because the re-point has
+ * to happen in the same transaction as the create — see
+ * {@link repointAllocationDebitPassesToRecreatedJournal}.
  */
 export type A2RecreateSummary = {
   orderCount: number
   total: number
   unattributed: string[]
+  orders: Array<{ id: string; batchRef: string; allocationBatchPasses: unknown }>
+}
+
+/** A fresh, empty A2 recreate bucket. One spelling, so the two sweeps cannot seed different shapes. */
+export function newA2RecreateSummary(): A2RecreateSummary {
+  return { orderCount: 0, total: 0, unattributed: [], orders: [] }
+}
+
+/**
+ * Fold one staged order into an A2 recreate bucket: its share of the batch, or the reason there
+ * is none to be had (o3d-i0o6 r5).
+ *
+ * Shared by both sweeps, because the rule is the same on both and a second spelling of it is how
+ * the two drift — which is the whole reason the ledger filter above exists.
+ */
+export function foldA2RecreateOrder(
+  summary: A2RecreateSummary,
+  order: AllocationDebitBatchRow & { id: string },
+  ledger: AllocationDebitBatchLedger,
+): void {
+  summary.orderCount += 1
+  const share = allocationDebitShareOfBatch(order, ledger)
+  if (share.kind === 'unattributed') {
+    summary.unattributed.push(share.reason)
+    return
+  }
+  summary.total += share.amount
+  if (order.inventoryAllocatedBatchRef) {
+    summary.orders.push({
+      id: order.id,
+      batchRef: order.inventoryAllocatedBatchRef,
+      allocationBatchPasses: order.allocationBatchPasses,
+    })
+  }
 }
 
 /**

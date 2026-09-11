@@ -57,9 +57,12 @@ import { buildCogsReconciliationSweepJournal, loadCogsGlReconciliation } from '@
 import { buildTransitReconciliationSweepJournal, loadTransitGlReconciliation } from '@/lib/domain/accounting/transit-gl-reconciliation'
 import {
   allocationDebitRecreateRefusal,
-  allocationDebitShareOfBatch,
   buildAllocationDebitOrderUpdate,
+  foldA2RecreateOrder,
+  newA2RecreateSummary,
+  repointAllocationDebitPassesToRecreatedJournal,
   type A2RecreateSummary,
+  type AllocationDebitBatchLedger,
 } from '@/lib/domain/accounting/allocation-debit-passes'
 import { recordCogsSubledgerMovement } from '@/lib/domain/accounting/cogs-subledger-movement'
 import { recreateJournaledDateFilter } from '@/lib/domain/accounting/daily-batch-retention'
@@ -833,27 +836,27 @@ export async function recreateMissingDailyBatchLogs(settings: Awaited<ReturnType
     summary.total += Number(order.unearnedRevenueAmount ?? 0)
   }
 
+  // o3d-i0o6 r5 (Codex round 4, HIGH 1) — THE LEDGER THIS SWEEP WOULD POST INTO, NAMED ONCE.
+  // The live-log probe below already filters by `connector`, so a batch that posted on QuickBooks
+  // is invisible to this sweep and reads as missing; without the same filter on the EVIDENCE, the
+  // rebuild carried QuickBooks-attributed pounds into Xero accounts.
+  const a2Ledger: AllocationDebitBatchLedger = {
+    connector: XERO_CONNECTOR,
+    accountCode: settings.xero_allocated_inventory_account,
+  }
   const a2Batches = new Map<string, DailyBatchRecreateBucket<A2RecreateSummary>>()
   for (const order of orphanA2Orders) {
     const summary = foldDailyBatchRow(
       a2Batches,
       'A2',
       { stagedAt: order.inventoryAllocatedDate, persistedRef: order.inventoryAllocatedBatchRef },
-      () => ({ orderCount: 0, total: 0, unattributed: [] as string[] }),
+      newA2RecreateSummary,
     )
     if (!summary) continue
-    summary.orderCount += 1
-    // o3d-i0o6 r4 (Codex round 3, HIGH 1) — THIS BATCH'S SHARE, NEVER THE RUNNING TOTAL.
-    // `allocationBatchAmount` accumulates across every A2 pass the order has been through, so
-    // summing it into one batch rebuilds that batch carrying pounds an EARLIER batch already
-    // posted. The pass history is the only thing that can say which batch carried what, and where
-    // it cannot say, the batch is refused rather than rebuilt on a guess.
-    const share = allocationDebitShareOfBatch(order)
-    if (share.kind === 'unattributed') {
-      summary.unattributed.push(share.reason)
-      continue
-    }
-    summary.total += share.amount
+    // o3d-i0o6 r4 (Codex round 3, HIGH 1) — THIS BATCH'S SHARE, NEVER THE RUNNING TOTAL, and
+    // (r5) never another ledger's share of it either. One shared fold, so the Xero and QuickBooks
+    // sweeps cannot answer the same question two ways.
+    foldA2RecreateOrder(summary, order, a2Ledger)
   }
 
   const bBatches = new Map<string, DailyBatchRecreateBucket<{ shipmentCount: number; revenue: number; cogs: number; shipments: Array<{ id: string; cogs: number }> }>>()
@@ -920,7 +923,7 @@ export async function recreateMissingDailyBatchLogs(settings: Awaited<ReturnType
     }
     if (round2(summary.total) <= 0) continue
     await db.$transaction(async (tx) => {
-      await createPendingSyncLog(tx, {
+      const recreatedLogId = await createPendingSyncLog(tx, {
         type: 'DAILY_BATCH_INVENTORY_ALLOC',
         referenceId,
         currency: baseCurrency,
@@ -936,6 +939,34 @@ export async function recreateMissingDailyBatchLogs(settings: Awaited<ReturnType
           _recreatedFromStage: true,
         },
       })
+      // o3d-i0o6 r5 (Codex round 4, HIGH 2) — AND THE EVIDENCE MOVES WITH THE JOURNAL. The passes
+      // that put these pounds into this batch name the log that went missing; left alone, every
+      // later refund and orphan reversal resolves that dead id, refuses, and the recreated debit
+      // can never be credited back out. Re-pointed in the SAME transaction as the create, so a row
+      // can never name a journal this sweep replaced but did not record.
+      for (const order of summary.orders) {
+        const repointed = repointAllocationDebitPassesToRecreatedJournal({
+          existingPasses: order.allocationBatchPasses,
+          batchRef: order.batchRef,
+          ledger: a2Ledger,
+          syncLogId: recreatedLogId,
+        })
+        if (!repointed) continue
+        await tx.salesOrder.update({
+          where: { id: order.id },
+          // Every column spelled out, not spread from the helper's return: o3d-psrx's write census
+          // resolves this literal to check no writer sets `paidAt` without its provenance, and a
+          // `data` it cannot read is a hole in that census rather than a pass.
+          data: {
+            allocationBatchPasses: repointed.allocationBatchPasses,
+            ...(repointed.latestPass ? {
+              allocationBatchSyncLogId: repointed.latestPass.syncLogId,
+              allocationBatchConnector: repointed.latestPass.connector,
+              allocationBatchAccountCode: repointed.latestPass.accountCode,
+            } : {}),
+          },
+        })
+      }
     })
   }
 

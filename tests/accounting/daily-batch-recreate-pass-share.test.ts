@@ -95,6 +95,7 @@ function newOrder(id: string): OrderRow {
 }
 
 function reset(connector: 'xero' | 'quickbooks'): void {
+  logSeq = 0
   state.orders = []
   state.allocations = []
   state.syncLogs = []
@@ -107,9 +108,21 @@ function inA2Window(where: { inventoryAllocatedDate?: unknown; revenueDeferredDa
   return !!where && where.inventoryAllocatedDate === null && where.revenueDeferredDate != null
 }
 
+/**
+ * o3d-i0o6 r5 (Codex round 4, HIGH 2) — IDS ARE NEVER REUSED, which is not a detail.
+ *
+ * This counter used to be `state.syncLogs.length + 1`. A test that takes a log AWAY and then makes
+ * the sweep rebuild it therefore got the SAME id back — so the order's pass history, still naming
+ * the id of the log that vanished, resolved to the replacement by accident, and a rebuild that
+ * re-pointed nothing at all looked exactly like one that did. The defect under test could not
+ * appear. Monotonic per scenario, so a replacement is always a different row.
+ */
+let logSeq = 0
+
 function createLog(data: { type: string; referenceType?: string; referenceId: string; payload: unknown }): { id: string } {
+  logSeq += 1
   const log: SyncLog = {
-    id: `a2-log-${state.syncLogs.length + 1}`,
+    id: `a2-log-${logSeq}`,
     type: data.type,
     referenceType: data.referenceType ?? 'DailyBatch',
     referenceId: data.referenceId,
@@ -524,16 +537,252 @@ for (const connector of ['xero', 'quickbooks'] as const) {
     const dayOneRef = (state.orders[0].allocationBatchPasses as Array<{ batchRef: string }>)[0].batchRef
     // Put the order back on the day-one batch, as an operator repairing the stamp would, and take
     // the day-one log away: the batch the sweep is now asked about is the one that owes £50.
+    //
+    // o3d-i0o6 r5: REMOVED BY ID, not `state.syncLogs = []`. Clearing the array reset the id
+    // counter, so the rebuilt log came back as `a2-log-1` — the very id the day-one pass already
+    // recorded — and the whole of HIGH 2 (a rebuild that leaves the evidence pointing at the log it
+    // replaced) was invisible to this test. See `logSeq`.
     state.orders[0].inventoryAllocatedBatchRef = dayOneRef
-    state.syncLogs = []
+    const lostLogId = state.syncLogs[0].id
+    state.syncLogs = state.syncLogs.filter((log) => log.id !== lostLogId)
 
     const refusals = await runRecreate()
 
     assert.deepEqual(refusals, [])
     assert.equal(state.syncLogs.length, 1, 'the genuinely missing batch is rebuilt')
     assert.equal(state.syncLogs[0].referenceId, dayOneRef)
+    assert.notEqual(state.syncLogs[0].id, lostLogId, 'and the rebuild is a NEW row, not the one that vanished')
     const debit = (state.syncLogs[0].payload as { lines: Array<{ accountCode?: string; debit?: number }> })
       .lines.find((line) => line.accountCode === '631' && line.debit != null)
     assert.equal(debit?.debit, 50, 'for the £50 THAT batch carried, which here is all of the figure')
+
+    // o3d-i0o6 r5: the DAY-ONE pass is re-pointed at the rebuilt journal, and the three latest-pass
+    // columns are NOT — they describe the day-TWO pass, which this rebuild did not replace. An
+    // earlier pass moving says nothing about the latest one, and rewriting the columns anyway would
+    // make the rebuild a second writer of a fact it did not establish.
+    const passes = state.orders[0].allocationBatchPasses as Array<{ syncLogId: string | null; batchRef: string }>
+    assert.equal(passes[0].syncLogId, state.syncLogs[0].id, 'the day-one pass names the rebuilt journal')
+    assert.equal(passes[1].syncLogId, null, 'the day-two pass still names none — it raised none')
+    assert.equal(
+      state.orders[0].allocationBatchSyncLogId,
+      null,
+      'and the latest-pass column is untouched: it is about day two, which was not rebuilt',
+    )
+  })
+
+  test(`${connector}: the same batch on the same ledger against ANOTHER account is refused, not rebuilt`, async () => {
+    // The one arm of the ledger filter that is an ambiguity rather than somebody else's pounds: the
+    // pass names this connector and an Allocated Inventory account that is NOT the one configured
+    // today. The rebuild would debit today's account for pounds recorded against another, and
+    // neither figure describes the other. Evidence produced by the REAL writer; only the account the
+    // rebuild would post to is varied, which is the thing under test.
+    await postedThenRoundedAwayUnderANewBatch(connector)
+    const { allocationDebitShareOfBatch } = await import('@/lib/domain/accounting/allocation-debit-passes')
+    const dayOneRef = (state.orders[0].allocationBatchPasses as Array<{ batchRef: string }>)[0].batchRef
+    const order = {
+      id: state.orders[0].id,
+      orderNumber: state.orders[0].orderNumber,
+      allocationBatchAmount: state.orders[0].allocationBatchAmount,
+      allocationBatchPasses: state.orders[0].allocationBatchPasses,
+      inventoryAllocatedBatchRef: dayOneRef,
+    }
+
+    const sameAccount = allocationDebitShareOfBatch(order, { connector, accountCode: '631' })
+    assert.deepEqual(sameAccount, { kind: 'known', amount: 50 }, 'the control: today\'s account still answers £50')
+
+    const movedAccount = allocationDebitShareOfBatch(order, { connector, accountCode: '632' })
+    assert.equal(movedAccount.kind, 'unattributed', 'a re-mapped account is not a share of zero')
+    assert.match(
+      movedAccount.kind === 'unattributed' ? movedAccount.reason : '',
+      /recorded its A2 debit for this batch against account 631 on .* configured as 632 today/,
+    )
+  })
+}
+
+// ---------------------------------------------------------------------------
+// o3d-i0o6 r5 (Codex round 4, HIGH 1 and HIGH 2)
+// ---------------------------------------------------------------------------
+
+/** Switch the writer/ledger under test WITHOUT discarding what the previous connector wrote. */
+function switchConnector(connector: 'xero' | 'quickbooks'): void {
+  state.connector = connector
+}
+
+/**
+ * o3d-i0o6 r5 (HIGH 1) — A REAL LEDGER SWITCH, BUILT BY RUNNING BOTH WRITERS.
+ *
+ * Day one: the XERO A2 pass values the order at £50, posts it, and settles.
+ * The declared rewrite adds quantity; the stamp comes off and the £50 stays.
+ * Day two: the books are switched, and the QUICKBOOKS A2 pass posts the increment under ITS OWN
+ * batch reference, into QuickBooks.
+ *
+ * The order now carries two passes on two ledgers and is stamped with the QuickBooks batch. No row
+ * here is written by hand: the cross-ledger state is what the two real writers leave behind.
+ */
+async function xeroThenQuickBooksUnderTwoBatches(): Promise<{ dayOneRef: string; dayTwoRef: string }> {
+  reset('xero')
+  mock.timers.enable({ apis: ['Date'], now: DAY_ONE })
+  let dayOneRef: string
+  let dayTwoRef: string
+  try {
+    state.unitCostByProduct = { 'prod-1': 12.5 }
+    state.orders = [newOrder('order-1')]
+    state.allocations = [
+      { id: 'alloc-1', orderId: 'order-1', lineId: 'line-1', productId: 'prod-1', warehouseId: 'wh-1', qty: 4, costLayerSnapshot: null, allocationBatchAmount: null },
+    ]
+    await runA2(1)
+    dayOneRef = state.orders[0].inventoryAllocatedBatchRef as string
+    assert.equal(state.syncLogs.length, 1, 'day one really did raise an Xero journal')
+    assert.equal(state.syncLogs[0].connector, 'xero')
+    state.syncLogs[0].status = 'SYNCED'
+
+    // The declared rewrite adds two units, so day two has REAL pounds to post rather than a
+    // rounding tail — the cross-ledger amount has to be big enough to see in a journal.
+    await declaredRewrite('order-1', 6)
+    assert.equal(state.orders[0].inventoryAllocatedDate, null, 'the stamp came off')
+
+    mock.timers.setTime(DAY_TWO.getTime())
+    switchConnector('quickbooks')
+    await runA2(1)
+    dayTwoRef = state.orders[0].inventoryAllocatedBatchRef as string
+  } finally {
+    mock.timers.reset()
+  }
+
+  assert.notEqual(dayTwoRef, dayOneRef, 'day two is a different batch')
+  const dayTwoLogs = state.syncLogs.filter((log) => log.referenceId === dayTwoRef)
+  assert.equal(dayTwoLogs.length, 1, 'and QuickBooks really did raise a journal for it')
+  assert.equal(dayTwoLogs[0].connector, 'quickbooks', 'ON QUICKBOOKS — this is the switch, not a relabel')
+  dayTwoLogs[0].status = 'SYNCED'
+
+  const passes = state.orders[0].allocationBatchPasses as Array<{ connector: string; batchRef: string; amount: string }>
+  assert.equal(passes.length, 2, 'two real passes')
+  assert.deepEqual(passes.map((pass) => pass.connector), ['xero', 'quickbooks'], 'one per ledger')
+  assert.equal(passes[1].batchRef, dayTwoRef)
+  assert.ok(Number(passes[1].amount) > 0.005, `the QuickBooks pass carries real pounds: ${passes[1].amount}`)
+  return { dayOneRef, dayTwoRef }
+}
+
+test('o3d-i0o6 r5: XERO\'s sweep does NOT rebuild a QuickBooks-attributed batch into Xero accounts', async () => {
+  const { dayTwoRef } = await xeroThenQuickBooksUnderTwoBatches()
+  const before = state.syncLogs.length
+
+  // Xero's live-log probe filters by `connector`, so the QuickBooks journal for this batch is
+  // invisible to it and the batch reads as MISSING. Before r5 the share it rebuilt was every pass
+  // that named the reference on ANY ledger, so it posted the QuickBooks pounds into Xero: a
+  // duplicate debit in books that never carried it, and one no refund could ever reverse, because
+  // the pass history still proves only the QuickBooks journal.
+  switchConnector('xero')
+  // NOT VACUOUS: the premise is that Xero's own probe sees no live log under this reference, so the
+  // sweep really does reach the rebuild decision. If a live Xero log existed the assertions below
+  // would pass for the wrong reason.
+  assert.deepEqual(
+    state.syncLogs.filter((log) => log.connector === 'xero' && log.referenceId === dayTwoRef),
+    [],
+    'the batch really is invisible to Xero — which is what makes it look missing',
+  )
+  const refusals = await runRecreate()
+
+  assert.equal(state.syncLogs.length, before, 'Xero raised NOTHING for a batch whose pounds are in QuickBooks')
+  assert.deepEqual(
+    state.syncLogs.filter((log) => log.referenceId === dayTwoRef && log.connector === 'xero'),
+    [],
+    'and specifically no Xero journal under the QuickBooks batch reference',
+  )
+  assert.deepEqual(refusals, [], 'nor is it reported — the batch is not missing, it is somebody else\'s')
+})
+
+test('o3d-i0o6 r5: and the CONTROL — QuickBooks still rebuilds its OWN share of that batch', async () => {
+  // The narrowing must not become a blanket refusal: the very same order, the very same batch, swept
+  // by the connector whose passes actually carried the pounds, still gets its missing log rebuilt —
+  // for the QuickBooks share alone, never the cumulative £75.
+  const { dayTwoRef } = await xeroThenQuickBooksUnderTwoBatches()
+  const cumulative = state.orders[0].allocationBatchAmount as number
+  const qboShare = Number((state.orders[0].allocationBatchPasses as Array<{ amount: string }>)[1].amount)
+  assert.ok(cumulative > qboShare + 0.005, `the cumulative figure is bigger than the share: ${cumulative} vs ${qboShare}`)
+
+  state.syncLogs = state.syncLogs.filter((log) => log.referenceId !== dayTwoRef)
+  switchConnector('quickbooks')
+  const refusals = await runRecreate()
+
+  assert.deepEqual(refusals, [])
+  const rebuilt = state.syncLogs.filter((log) => log.referenceId === dayTwoRef)
+  assert.equal(rebuilt.length, 1, 'the genuinely missing QuickBooks batch is rebuilt')
+  assert.equal(rebuilt[0].connector, 'quickbooks')
+  const debit = (rebuilt[0].payload as { lines: Array<{ accountCode?: string; debit?: number }> })
+    .lines.find((line) => line.accountCode === '631' && line.debit != null)
+  assert.equal(debit?.debit, Math.round(qboShare * 100) / 100, 'for ITS OWN share, not the cumulative debit')
+})
+
+/**
+ * o3d-i0o6 r5 (HIGH 2) — THE REBUILT JOURNAL IS THE ONE THE EVIDENCE NAMES AFTERWARDS.
+ *
+ * A rebuild mints a NEW sync log. The orders it rebuilt FROM still recorded the id of the log that
+ * went missing, and that id is precisely what `proveAllocationDebitPosting` resolves before it will
+ * authorise a credit. So the recreated debit used to be permanently irreversible: the pounds are in
+ * Allocated Inventory, and every refund and orphan reversal for the rest of the order's life
+ * resolves a dead id, refuses, and withholds the credit.
+ */
+for (const connector of ['xero', 'quickbooks'] as const) {
+  test(`${connector}: a rebuilt A2 batch re-points the evidence at the journal it minted (o3d-i0o6 r5)`, async () => {
+    reset(connector)
+    mock.timers.enable({ apis: ['Date'], now: DAY_ONE })
+    try {
+      state.unitCostByProduct = { 'prod-1': 12.5 }
+      state.orders = [newOrder('order-1')]
+      state.allocations = [
+        { id: 'alloc-1', orderId: 'order-1', lineId: 'line-1', productId: 'prod-1', warehouseId: 'wh-1', qty: 4, costLayerSnapshot: null, allocationBatchAmount: null },
+      ]
+      await runA2(1)
+    } finally {
+      mock.timers.reset()
+    }
+    assert.equal(state.orders[0].allocationBatchAmount, 50)
+    const batchRef = state.orders[0].inventoryAllocatedBatchRef as string
+    const lostLogId = state.syncLogs[0].id
+    assert.equal(
+      (state.orders[0].allocationBatchPasses as Array<{ syncLogId: string }>)[0].syncLogId,
+      lostLogId,
+      'the pass names the journal A2 raised',
+    )
+
+    // The log goes missing before it ever posted — the state this sweep exists for.
+    state.syncLogs = state.syncLogs.filter((log) => log.id !== lostLogId)
+
+    const refusals = await runRecreate()
+
+    assert.deepEqual(refusals, [])
+    assert.equal(state.syncLogs.length, 1, 'the batch is rebuilt')
+    const rebuiltId = state.syncLogs[0].id
+    assert.notEqual(rebuiltId, lostLogId, 'under a NEW id — which is the whole difficulty')
+
+    const passes = state.orders[0].allocationBatchPasses as Array<{ syncLogId: string; connector: string }>
+    assert.equal(passes[0].syncLogId, rebuiltId, 'and the pass now names the journal that actually carries its pounds')
+    assert.equal(state.orders[0].allocationBatchSyncLogId, rebuiltId, 'as does the latest-pass column beside it')
+    assert.equal(state.orders[0].allocationBatchConnector, connector)
+    assert.equal(state.orders[0].allocationBatchAccountCode, '631')
+    assert.equal(passes[0].connector, connector, 'and the ledger it was rebuilt into')
+
+    // THE POINT, IN MONEY. The rebuilt journal settles, and a reversal can now be raised against it.
+    // Before this fix the proof resolved the dead id, answered `refused`, and the £50 debit stood in
+    // Allocated Inventory with no way out for ever.
+    state.syncLogs[0].status = 'SYNCED'
+    const { proveAllocationDebitPosting } = await import('@/lib/domain/accounting/allocation-debit-posting-proof')
+    const proof = await proveAllocationDebitPosting(
+      tx as unknown as Parameters<typeof proveAllocationDebitPosting>[0],
+      {
+        inventoryAllocatedDate: state.orders[0].inventoryAllocatedDate,
+        allocationBatchAmount: state.orders[0].allocationBatchAmount,
+        allocationBatchPasses: state.orders[0].allocationBatchPasses,
+        allocationBatchSyncLogId: state.orders[0].allocationBatchSyncLogId,
+        allocationBatchConnector: state.orders[0].allocationBatchConnector,
+        allocationBatchAccountCode: state.orders[0].allocationBatchAccountCode,
+      },
+      { activeConnector: connector, allocatedInventoryAccount: '631' },
+    )
+    assert.equal(proof.kind, 'posted', `the recreated debit is reversible: ${JSON.stringify(proof)}`)
+    assert.equal(proof.kind === 'posted' ? proof.recordedDebit : null, 50)
+    assert.deepEqual(proof.kind === 'posted' ? proof.journalIds : null, [rebuiltId], 'against the rebuilt journal')
+    assert.equal(batchRef, state.orders[0].inventoryAllocatedBatchRef, 'and the stamp was left alone')
   })
 }

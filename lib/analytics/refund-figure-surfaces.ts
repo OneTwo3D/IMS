@@ -467,6 +467,13 @@ export const REFUND_FIGURE_SURFACES: readonly RefundFigureSurface[] = [
       'Ledger reconciliation codes.',
   },
   {
+    file: 'lib/domain/accounting/revenue-deferral-ledger-proof.ts',
+    figures: ['proveRevenueDeferralLedger', 'revenueDeferredBatchRef', 'revenueDeferredDate', 'unearnedRevenueAmount'],
+    treatment: 'not-refund-sensitive',
+    reason:
+      'o3d-i0o6 r5 — answers WHICH LEDGER holds an order\u2019s Group A1 unearned-revenue liability, from the batch reference A1 stamped and that batch log\u2019s own connector. It publishes no figure to any reader: the deferral amount is read only to tell \u201cnothing was deferred\u201d from \u201cthe books are not on record\u201d, and the answer is a connector name. Nothing here nets, renders or exports revenue.',
+  },
+  {
     file: 'lib/domain/accounting/revenue-recognition.ts',
     figures: ['proportionalRevenue', 'recognizeShipmentRevenue', 'runningRevenue'],
     treatment: 'not-refund-sensitive',

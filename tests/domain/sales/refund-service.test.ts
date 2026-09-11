@@ -364,7 +364,78 @@ function baseState(overrides: Partial<State> = {}): State {
   // Default seeded existing refunds to NET basis (the post-o3d-n8p norm); a test that exercises the
   // legacy/unknown-basis block pushes a refund with totalsBasis omitted AFTER baseState().
   state.refunds = state.refunds.map((refund) => ({ totalsBasis: 'NET' as const, ...refund }))
+  seedDefaultA1Provenance(state)
   return state
+}
+
+/**
+ * o3d-i0o6 r5 (Codex round 4, HIGH 3) — THE GROUP A1 EVIDENCE EVERY DEFERRED ORDER REALLY CARRIES.
+ *
+ * A refund's unearned-revenue reversal is now pinned to the ledger A1 raised the liability in, and
+ * that ledger is read from the batch A1 stamped on the order (`revenueDeferredBatchRef`) and that
+ * batch's own log row. An order with a deferral and neither of those is a row the A1 writer has not
+ * produced since o3d-0qoo — so defaulting them here is describing the ORDINARY case, exactly as
+ * `a2PassHistory` does for the A2 side, rather than weakening the rule.
+ *
+ * A fixture that means something else says so: set `revenueDeferredBatchRef` explicitly (including
+ * to `null`, the pre-reference row), or seed / remove the batch log by hand afterwards. Both are
+ * done by the r5 tests at the bottom of this file.
+ */
+function seedDefaultA1Provenance(state: State): void {
+  for (const order of state.orders) {
+    const deferred = Number(order.unearnedRevenueAmount ?? 0)
+    if (!order.revenueDeferredDate || !(deferred > 0)) continue
+    // An EXPLICIT null is the pre-reference row and keeps its own meaning: A1 deferred and recorded
+    // no batch reference, which is one of the states the proof refuses.
+    if ('revenueDeferredBatchRef' in order && order.revenueDeferredBatchRef == null) continue
+    const referenceId = order.revenueDeferredBatchRef
+      ?? `A1-2026-01-01-${order.id.replace(/[^a-z0-9]/g, '').slice(-8).padStart(8, '0')}`
+    order.revenueDeferredBatchRef = referenceId
+    if ((state.accountingSyncLogs ?? []).some((log) => log.referenceId === referenceId)) continue
+    state.accountingSyncLogs = [...(state.accountingSyncLogs ?? []), {
+      id: `a1-log-${order.id}`,
+      connector: 'xero',
+      type: 'DAILY_BATCH_REVENUE_DEFERRAL',
+      referenceType: 'DailyBatch',
+      referenceId,
+      status: 'SYNCED',
+      payload: { lines: [{ accountCode: accountingSettings.unearnedRevenueAccount, credit: deferred }] },
+    }]
+  }
+}
+
+/**
+ * o3d-i0o6 r5: rewrite (or remove) the Group A1 batch log `seedDefaultA1Provenance` put behind an
+ * order's deferral — the A1 twin of `withRecordedA2Journal`. `connector: null` removes the row,
+ * which is the "retention took the batch" state.
+ */
+function withRecordedA1Journal(
+  state: State,
+  overrides: { orderIndex?: number; connector?: string | null; status?: string; extraConnector?: string } = {},
+) {
+  const order = state.orders[overrides.orderIndex ?? 0]
+  const referenceId = order.revenueDeferredBatchRef
+  if (!referenceId) throw new Error('the order carries no A1 batch reference to rewrite')
+  const others = (state.accountingSyncLogs ?? []).filter((log) => log.referenceId !== referenceId)
+  const deferred = Number(order.unearnedRevenueAmount ?? 0)
+  const row = (connector: string, id: string) => ({
+    id,
+    connector,
+    type: 'DAILY_BATCH_REVENUE_DEFERRAL',
+    referenceType: 'DailyBatch',
+    referenceId,
+    status: overrides.status ?? 'SYNCED',
+    payload: { lines: [{ accountCode: accountingSettings.unearnedRevenueAccount, credit: deferred }] },
+  })
+  if (overrides.connector === null) {
+    state.accountingSyncLogs = others
+    return
+  }
+  state.accountingSyncLogs = [
+    ...others,
+    row(overrides.connector ?? 'xero', `a1-log-${order.id}`),
+    ...(overrides.extraConnector ? [row(overrides.extraConnector, `a1-log-${order.id}-2`)] : []),
+  ]
 }
 
 function createClient(state: State): RefundServiceClient {
@@ -655,17 +726,28 @@ function createClient(state: State): RefundServiceClient {
     accountingSyncLog: {
       // Honours the real query shape: connector (optional), type/status IN-lists, and the
       // SalesOrder-or-SalesOrderRefund reference OR. Returns only {type, payload}, as selected.
+      //
+      // o3d-i0o6 r5: and the SCALAR `type`/`referenceType`/`referenceId` shape the Group A1 ledger
+      // proof emits. Without it those three were simply not applied — the double answered "which
+      // ledger raised batch A1-x?" with every seeded log including the A2 ones, which is the
+      // defective-double shape this file's own comments warn about, in the one place where a wrong
+      // answer is a connector name a refund is pinned to.
       findMany: async ({ where }: {
         where: {
           connector?: string
-          type?: { in?: string[] }
+          type?: string | { in?: string[] }
           status?: { in?: string[] }
+          referenceType?: string
+          referenceId?: string
           OR?: Array<{ referenceType: string; referenceId: string | { in?: string[] } }>
         }
       }) => (state.accountingSyncLogs ?? []).filter((log) => {
         if (where.connector != null && log.connector !== where.connector) return false
-        if (where.type?.in != null && !where.type.in.includes(log.type)) return false
+        if (typeof where.type === 'string' && log.type !== where.type) return false
+        if (typeof where.type === 'object' && where.type.in != null && !where.type.in.includes(log.type)) return false
         if (where.status?.in != null && !where.status.in.includes(log.status)) return false
+        if (where.referenceType != null && log.referenceType !== where.referenceType) return false
+        if (where.referenceId != null && log.referenceId !== where.referenceId) return false
         if (where.OR == null) return true
         return where.OR.some((clause) => {
           if (clause.referenceType !== log.referenceType) return false
@@ -674,6 +756,7 @@ function createClient(state: State): RefundServiceClient {
         })
       }).map((log) => ({
         type: log.type,
+        connector: log.connector,
         status: log.status,
         referenceType: log.referenceType,
         referenceId: log.referenceId,
@@ -7973,10 +8056,12 @@ test('o3d-i0o6 r3: the staged allocation credit names the ledger its debit was P
   assert.equal(persistedReversal?.connector, 'xero', 'the retry replays it on the same ledger')
 })
 
-test('o3d-i0o6 r3: a journal carrying NO allocation credit is left unpinned', async () => {
-  // The UNEARNED_REV_REVERSAL carries both reversals and only one of them has a proof behind it.
-  // An unearned-revenue-only journal was reckoned against no particular ledger, and pinning it to
-  // one this proof happens to name would refuse postings the proof says nothing about.
+test('o3d-i0o6 r5: a journal carrying NO allocation credit is pinned to GROUP A1\'s ledger instead', async () => {
+  // r3 left this journal UNPINNED, reasoning that "an unearned-revenue-only journal was reckoned
+  // against no particular ledger". That was the same assumption r5 found in the other direction:
+  // the A1 half IS reckoned against a ledger — the one A1 raised the liability in — and leaving it
+  // unpinned queues it against whatever connector happens to be active at hand-off, which is how a
+  // deferral raised in Xero gets reversed in QuickBooks.
   const state = a2StagedAllocatedState()
   state.orders[0].allocationBatchAmount = 0
   state.orders[0].allocationBatchPasses = []
@@ -7995,5 +8080,214 @@ test('o3d-i0o6 r3: a journal carrying NO allocation credit is left unpinned', as
   const reversal = result.success && result.accountingSyncs.find((sync) => sync.type === 'UNEARNED_REV_REVERSAL')
   assert.ok(reversal, 'the unearned reversal is still staged')
   assert.equal(findAllocatedInventoryCredit(result), null, 'with no allocation credit in it')
-  assert.equal(reversal.connector, undefined, 'so nothing pins it')
+  assert.equal(
+    reversal.connector,
+    'xero',
+    'and it names the ledger A1 deferred in — established from A1\'s own batch, not from A2\'s proof',
+  )
+})
+
+/**
+ * o3d-i0o6 r5 (Codex round 4, HIGH 3) — TWO REVERSALS, TWO LEDGERS, TWO JOURNALS.
+ *
+ * `UNEARNED_REV_REVERSAL` can carry the Group A1 reversal (DR Unearned Revenue) and the Group A2
+ * reversal (CR Allocated Inventory) at once. r3 proved the A2 half against one connector and pinned
+ * the WHOLE journal to it. A1 defers when the order is paid and A2 reclassifies when it is
+ * allocated, so a connector switch in between makes the two halves belong to different books — and
+ * the pin then debits Unearned Revenue where that liability was never credited, while the real
+ * liability stands in the other ledger.
+ */
+function a1XeroA2QuickBooksState(): State {
+  const state = a2StagedAllocatedState()
+  // A1 deferred in XERO (the default `seedDefaultA1Provenance` writes), A2 posted in QUICKBOOKS
+  // after the switch — so the order's own two records name two ledgers.
+  withRecordedA2Journal(state, { connector: 'quickbooks', status: 'SYNCED' })
+  return state
+}
+
+test('o3d-i0o6 r5: a refund whose two reversals were raised in DIFFERENT ledgers stages TWO journals', async () => {
+  const state = a1XeroA2QuickBooksState()
+  assert.equal(state.orders[0].allocationBatchConnector, 'quickbooks', 'A2 is on QuickBooks')
+  assert.equal(
+    state.accountingSyncLogs?.find((log) => log.type === 'DAILY_BATCH_REVENUE_DEFERRAL')?.connector,
+    'xero',
+    'and A1 is on Xero — the premise, not the conclusion',
+  )
+
+  const result = await createSalesOrderRefund(createClient(state), {
+    orderId: 'order-1',
+    lines: [{ lineId: null, productId: null, description: 'Monetary refund', qty: 0, totalBase: 100, lineKind: 'sale' }],
+    reason: 'Goodwill full refund',
+    creditNotePrefix: 'CN-',
+    accountingSettings,
+    activeAccountingConnector: 'quickbooks',
+  })
+
+  assert.equal(result.success, true)
+  assert.equal(state.orders[0].refundStatus, 'FULL', 'it really is the full-refund path')
+  const reversals = result.success
+    ? result.accountingSyncs.filter((sync) => sync.type === 'UNEARNED_REV_REVERSAL')
+    : []
+  assert.equal(reversals.length, 2, 'two provenances cannot share one journal')
+
+  const unearned = reversals.find((sync) => (sync.payload.lines as Array<{ accountCode: string }>)
+    .some((line) => line.accountCode === accountingSettings.unearnedRevenueAccount))
+  const allocation = reversals.find((sync) => (sync.payload.lines as Array<{ accountCode: string }>)
+    .some((line) => line.accountCode === accountingSettings.allocatedInventoryAccount))
+  assert.ok(unearned && allocation, 'one journal per half')
+  assert.equal(unearned.connector, 'xero', 'the A1 reversal goes back to the ledger that holds the liability')
+  assert.equal(allocation.connector, 'quickbooks', 'and the A2 credit to the ledger its debit was proved in')
+  assert.equal(
+    (unearned.payload.lines as Array<{ accountCode: string }>)
+      .some((line) => line.accountCode === accountingSettings.allocatedInventoryAccount),
+    false,
+    'the Xero journal carries NO Allocated Inventory line — that account was debited in QuickBooks',
+  )
+  assert.equal(
+    (allocation.payload.lines as Array<{ accountCode: string }>)
+      .some((line) => line.accountCode === accountingSettings.unearnedRevenueAccount),
+    false,
+    'and the QuickBooks journal debits no Unearned Revenue, which was never credited there',
+  )
+  assert.notEqual(unearned.idempotencyKey, allocation.idempotencyKey, 'two rows need two keys')
+  // The split survives the persist/replay round trip, or a retry re-merges what staging separated.
+  const persisted = state.refunds[0].accountingRetrySyncs as Array<Record<string, unknown>>
+  assert.deepEqual(
+    persisted.filter((sync) => sync.type === 'UNEARNED_REV_REVERSAL').map((sync) => sync.connector).sort(),
+    ['quickbooks', 'xero'],
+  )
+})
+
+test('o3d-i0o6 r5: the CONTROL — one ledger for both halves is still ONE journal, pinned once', async () => {
+  // The split must be a narrowing, not a new shape for every refund. Same order, same amounts, A1
+  // and A2 both in Xero: byte-for-byte the journal r3 produced, under the historic key.
+  const state = a2StagedAllocatedState()
+  withRecordedA2Journal(state, { connector: 'xero', status: 'SYNCED' })
+
+  const result = await createSalesOrderRefund(createClient(state), {
+    orderId: 'order-1',
+    lines: [{ lineId: null, productId: null, description: 'Monetary refund', qty: 0, totalBase: 100, lineKind: 'sale' }],
+    reason: 'Goodwill full refund',
+    creditNotePrefix: 'CN-',
+    accountingSettings,
+    activeAccountingConnector: 'xero',
+  })
+
+  assert.equal(result.success, true)
+  const reversals = result.success
+    ? result.accountingSyncs.filter((sync) => sync.type === 'UNEARNED_REV_REVERSAL')
+    : []
+  assert.equal(reversals.length, 1, 'one ledger, one journal')
+  assert.equal(reversals[0].connector, 'xero')
+  assert.equal(reversals[0].idempotencyKey, `sales-order-refund:${state.refunds[0].id}:unearned-reversal`)
+  assert.equal(findAllocatedInventoryCredit(result), 20, 'and it still carries the allocation credit')
+  assert.ok(
+    (reversals[0].payload.lines as Array<{ accountCode: string; debit?: number }>)
+      .some((line) => line.accountCode === accountingSettings.unearnedRevenueAccount && (line.debit ?? 0) > 0),
+    'and the unearned debit, in the same journal',
+  )
+})
+
+test('o3d-i0o6 r5: an A1 deferral whose ledger is NOT on record reverses NOTHING, and keeps the evidence', async () => {
+  // Retention has taken the A1 batch log. There is a £100 liability on the order and nothing that
+  // can say which books it is in — so the debit is withheld rather than raised into whichever
+  // connector happens to be active, which is what the A2 pin used to do for it.
+  const state = a2StagedAllocatedState()
+  withRecordedA2Journal(state, { connector: 'xero', status: 'SYNCED' })
+  withRecordedA1Journal(state, { connector: null })
+
+  const result = await createSalesOrderRefund(createClient(state), {
+    orderId: 'order-1',
+    lines: [{ lineId: null, productId: null, description: 'Monetary refund', qty: 0, totalBase: 100, lineKind: 'sale' }],
+    reason: 'Goodwill full refund',
+    creditNotePrefix: 'CN-',
+    accountingSettings,
+    activeAccountingConnector: 'xero',
+  })
+
+  assert.equal(result.success, true)
+  assert.equal(state.orders[0].refundStatus, 'FULL')
+  const reversals = result.success
+    ? result.accountingSyncs.filter((sync) => sync.type === 'UNEARNED_REV_REVERSAL')
+    : []
+  assert.equal(reversals.length, 1, 'the allocation half is unaffected and still goes out')
+  assert.equal(
+    (reversals[0].payload.lines as Array<{ accountCode: string }>)
+      .some((line) => line.accountCode === accountingSettings.unearnedRevenueAccount),
+    false,
+    'with NO debit to Unearned Revenue in it',
+  )
+  assert.equal(findAllocatedInventoryCredit(result), 20, 'the A2 credit is proved and unaffected')
+  assert.match(
+    String(state.refunds[0].allocationBasisUnresolved),
+    /£100\.00 of unearned revenue was NOT reversed: .*is no longer on record \(retention\)/,
+    'and the operator is told what was withheld and why',
+  )
+  assert.notEqual(
+    state.orders[0].revenueDeferredDate,
+    null,
+    'the A1 stamp survives — it and the batch ref are the only things that can name the ledger',
+  )
+  assert.notEqual(state.orders[0].revenueDeferredBatchRef, null, 'ref and stamp together')
+})
+
+test('o3d-i0o6 r5: an A1 batch with rows on TWO ledgers is not a tie to break', async () => {
+  const state = a2StagedAllocatedState()
+  withRecordedA2Journal(state, { connector: 'xero', status: 'SYNCED' })
+  withRecordedA1Journal(state, { connector: 'xero', extraConnector: 'quickbooks' })
+
+  const result = await createSalesOrderRefund(createClient(state), {
+    orderId: 'order-1',
+    lines: [{ lineId: null, productId: null, description: 'Monetary refund', qty: 0, totalBase: 100, lineKind: 'sale' }],
+    reason: 'Goodwill full refund',
+    creditNotePrefix: 'CN-',
+    accountingSettings,
+    activeAccountingConnector: 'xero',
+  })
+
+  assert.equal(result.success, true)
+  const reversals = result.success
+    ? result.accountingSyncs.filter((sync) => sync.type === 'UNEARNED_REV_REVERSAL')
+    : []
+  assert.equal(
+    reversals.some((sync) => (sync.payload.lines as Array<{ accountCode: string }>)
+      .some((line) => line.accountCode === accountingSettings.unearnedRevenueAccount)),
+    false,
+    'neither ledger is picked',
+  )
+  assert.match(
+    String(state.refunds[0].allocationBasisUnresolved),
+    /has rows on xero and quickbooks/,
+    'and the ambiguity is named',
+  )
+})
+
+test('o3d-i0o6 r5: an A1 deferral that recorded NO batch reference reverses nothing either', async () => {
+  // The pre-o3d-0qoo row: a deferral amount and no reference to resolve it through. Same position as
+  // an A2 debit with no pass history, and the same answer.
+  const state = a2StagedAllocatedState()
+  state.orders[0].revenueDeferredBatchRef = null
+  withRecordedA2Journal(state, { connector: 'xero', status: 'SYNCED' })
+
+  const result = await createSalesOrderRefund(createClient(state), {
+    orderId: 'order-1',
+    lines: [{ lineId: null, productId: null, description: 'Monetary refund', qty: 0, totalBase: 100, lineKind: 'sale' }],
+    reason: 'Goodwill full refund',
+    creditNotePrefix: 'CN-',
+    accountingSettings,
+    activeAccountingConnector: 'xero',
+  })
+
+  assert.equal(result.success, true)
+  assert.equal(
+    (result.success ? result.accountingSyncs : [])
+      .filter((sync) => sync.type === 'UNEARNED_REV_REVERSAL')
+      .some((sync) => (sync.payload.lines as Array<{ accountCode: string }>)
+        .some((line) => line.accountCode === accountingSettings.unearnedRevenueAccount)),
+    false,
+  )
+  assert.match(
+    String(state.refunds[0].allocationBasisUnresolved),
+    /recorded no batch reference, so which ledger holds that unearned-revenue liability cannot be established/,
+  )
 })
