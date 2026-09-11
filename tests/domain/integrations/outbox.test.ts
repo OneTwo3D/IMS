@@ -1208,8 +1208,9 @@ test('a stale PROCESSING lock is reclaimed per operation, not on elapsed time al
 //     `db.emailOutbox.create`. `pushStockToWc` and `sendAccountingInvoiceEmailInternal`
 //     are NOT invoked and cannot be: the first writes to a live store, the second
 //     mails a customer. The ordering hazard itself is argued in the registry entries
-//     from the code; the database facts those arguments rest on — that EmailOutbox
-//     carries no uniqueness to collide with — are checked in the concurrency file.
+//     from the code; the database fact those arguments rest on — that EmailOutbox's
+//     uniqueness (o3d-alnk's partial index on the undelivered statuses) does not reach a
+//     replay whose predecessor is already SENT — is checked in the concurrency file.
 //   * ANYTHING ABOUT THE ARMS THAT USE `sales/refund.reservation-release`. That
 //     operation is a STAND-IN, used only because it is a declaration this build
 //     permits; nothing about a refund release is a stock push or an invoice email.
@@ -1327,13 +1328,16 @@ test('stock.push refuses the reclaim, so the pause interleaving cannot begin', a
 // PROOF 2 (Codex round 2, HIGH 2). The Xero INVOICE_EMAIL pause.
 //
 // `fenceBeforeRemoteWrite('invoice-email')` takes no dispatch record, and the effect
-// behind it — queueEmail -> db.emailOutbox.create — has no uniqueness guard of any
-// kind. So the fence proves ownership before the effect and cannot couple that
-// effect to the completion. Same two arms as proof 1.
+// behind it — queueEmail -> db.emailOutbox.create — carries no guard that survives
+// DELIVERY: o3d-alnk's partial unique index refuses a second UNDELIVERED row, and the
+// reclaim this models arrives after the first copy has been sent, when the predicate no
+// longer covers it. So the fence proves ownership before the effect and cannot couple
+// that effect to the completion. Same two arms as proof 1.
 // ---------------------------------------------------------------------------
 
 type EmailWorld = {
-  /** One entry per EmailOutbox row inserted. There is no unique key on that table to stop a second. */
+  /** One entry per EmailOutbox row inserted. The table's unique key stops a second only while the
+   * first is still undelivered, and this interleaving is a reclaim after delivery. */
   enqueued: string[]
   reclaimHappened: boolean
   loserFenced: boolean
@@ -1387,8 +1391,9 @@ test('the pause harness reaches its interleaving when a declaration permits the 
   assert.equal(world.reclaimHappened, true, 'the contended path was not reached: worker B never got the row')
   assert.equal(world.loserFenced, true, 'the slow worker is fenced out of the ROW, and too late')
   // MODELLED: two entries in an array standing in for two `db.emailOutbox.create` calls. That the
-  // table would accept both — no idempotency key, no unique constraint — is checked against the
-  // real catalogue in tests/concurrency/outbox-stale-park.concurrent.test.ts.
+  // table would accept both — because the first copy is SENT by then, and `email_outbox_undelivered_
+  // reference_uq` is scoped to PENDING/PROCESSING — is checked against the real catalogue, and driven
+  // as a real insert, in tests/concurrency/outbox-stale-park.concurrent.test.ts.
   assert.deepEqual(world.enqueued, ['worker-1', 'worker-2'], 'two enqueues in the MODEL: the customer is emailed twice')
 })
 

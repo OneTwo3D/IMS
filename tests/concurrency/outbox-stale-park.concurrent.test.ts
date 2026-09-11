@@ -36,7 +36,9 @@ import { INTEGRATION_OUTBOX_DRAIN_LEASES_MS } from '@/lib/domain/integrations/ou
  * absolute quantity arriving last, an invoice email delivered twice — is therefore argued in the
  * registry from the code, and what is PROVEN here is the gate in front of it: that no second worker
  * is ever handed the row, that the refusal comes from the declaration rather than from the clock,
- * and, for the email, that the queue it would land in carries no uniqueness to collide with.
+ * and, for the email, that the uniqueness the queue DOES now carry (o3d-alnk's partial index on the
+ * undelivered statuses) stops at delivery, so a replay that arrives after the first copy was sent
+ * is still accepted — which is what keeps `xero/accounting.post` unsafe-to-replay.
  *
  * ROUND 4 ADDED the row on an operation this build has never heard of, which round 3 had made
  * unreclaimable AND invisible.
@@ -549,20 +551,44 @@ test(
 )
 
 test(
-  '[o3d-8td2 r3] the invoice-email queue carries no uniqueness a replayed send could collide with',
+  "[o3d-8td2 r3 / o3d-alnk] the invoice-email queue's uniqueness stops at delivery, which is not where the hazard is",
   { skip: !RUN && 'set RUN_DB_CONCURRENCY_TESTS=1' },
-  async () => {
+  async (t) => {
     const { db } = await loadDeps()
 
     /**
-     * The `xero/accounting.post` entry rests on a claim about a table, not about a code path:
-     * INVOICE_EMAIL's fence writes no dispatch record, and the effect behind it lands in
-     * `EmailOutbox`, which "has no idempotency key and no unique constraint of any kind" — so a
-     * second worker's insert cannot collide with the first worker's and both are delivered.
+     * WHAT THIS TEST USED TO SAY, AND WHY IT HAD TO CHANGE (o3d-alnk).
      *
-     * Asked of the real catalogue rather than of the schema file, and asserted as a READ: this test
-     * sends no mail and writes no row, which is the only honest way to check it. If somebody adds
-     * the uniqueness the entry says is missing, this fails and the entry is due a re-read.
+     * Round 3 asserted that `email_outbox` carried NO uniqueness at all, and the `xero/accounting.post`
+     * entry leaned on exactly that: "`EmailOutbox` has no idempotency key and no unique constraint of
+     * any kind", so worker B's insert cannot collide with worker A's and both are delivered. It closed
+     * with a standing instruction — "if somebody adds the uniqueness the entry says is missing, this
+     * fails and the entry is due a re-read".
+     *
+     * Somebody did. o3d-alnk's `email_outbox_undelivered_reference_uq` is a PARTIAL unique index on
+     * (kind, referenceType, referenceId) WHERE status IN ('PENDING','PROCESSING'), and this is the
+     * re-read it asked for. THE VERDICT IS UNCHANGED, and it is important to be exact about why,
+     * because the old reason is now false and a false reason is not a reason:
+     *
+     *   THE INDEX REFUSES A DUPLICATE UNDELIVERED *ROW*. IT CANNOT REFUSE A DUPLICATE *SEND*.
+     *
+     * Those come apart at the only moment that matters. The window a stale-lock reclaim opens is
+     * ADMIN_OUTBOX_STALE_PROCESSING_LOCK_MS wide, and the email drain empties PENDING far faster than
+     * that — so when worker B replays, worker A's copy has typically already been DELIVERED. A SENT row
+     * is outside the index's predicate. B's insert is therefore accepted, and the customer is emailed a
+     * second time. The index closes the window in which no duplicate delivery had happened yet, and
+     * leaves open the one in which it has.
+     *
+     * And a send is not a database write, so no constraint on this table could have closed it: even
+     * inside the covered window, refusing a second ROW does not unsend a mail already on the wire.
+     * POST_EFFECT.INVOICE_EMAIL says the same thing — the email cannot be recalled.
+     *
+     * ASSERTED AS A READ PLUS ONE ROLLED-BACK WRITE. The old test would not write here at all, for a
+     * good reason: a committed PENDING row in this table is a mail the drain will send. That reason is
+     * respected. The rows this test commits are SENT, which `processPendingEmailOutbox`'s findMany
+     * never selects (it takes PENDING, or PROCESSING gone stale), and the one PENDING insert — the
+     * insert that carries the whole finding — happens inside a transaction that is always rolled back.
+     * No mail can leave, and the gap is PROVEN rather than described from the index definition.
      */
     const uniques = await db.$queryRaw<Array<{ indexname: string; indexdef: string }>>`
       SELECT i.relname AS indexname, pg_get_indexdef(i.oid) AS indexdef
@@ -579,16 +605,89 @@ test(
     const names = columns.map((column) => column.column_name)
     assert.ok(names.includes('status'), `email_outbox should carry a status column; got ${names.join(', ')}`)
 
+    // (1) THE UNIQUENESS THAT NOW EXISTS IS THE UNDELIVERED-REFERENCE INDEX, AND NOTHING ELSE. If a
+    // later branch adds a unique key this argument has not been told about — one covering SENT, or an
+    // idempotency key — this fails, and the entry is due the same re-read round 3 asked for.
     const nonPrimary = uniques.filter((index) => !index.indexname.endsWith('_pkey'))
     assert.deepEqual(
       nonPrimary.map((index) => index.indexname),
-      [],
-      'EmailOutbox has no uniqueness beyond its surrogate id — a duplicated invoice email cannot be '
-      + 'refused by the database, which is why xero/accounting.post is unsafe-to-replay',
+      ['email_outbox_undelivered_reference_uq'],
+      'the only uniqueness on email_outbox should be o3d-alnk\'s partial undelivered-reference index',
     )
 
-    // The other half of the same claim: no holder identity, so its own terminal writes are unfenced.
-    assert.ok(!names.includes('lockedBy') && !names.includes('locked_by'),
-      'EmailOutbox tracks processingStartedAt (a timestamp) and no holder, per o3d-alnk')
+    // (2) AND IT IS PARTIAL, SCOPED TO THE UNDELIVERED STATUSES. This is the claim the verdict rests
+    // on, so it is read off the catalogue rather than trusted from the migration file.
+    const [undeliveredIndex] = nonPrimary
+    assert.match(undeliveredIndex.indexdef, /WHERE .*status = ANY \(ARRAY\['PENDING'.*'PROCESSING'/,
+      `the index must be scoped to the undelivered statuses; got ${undeliveredIndex.indexdef}`)
+
+    /**
+     * (3) THE GAP ITSELF, DRIVEN. A delivered first copy, then the replay's insert — and the database
+     * accepts it. Asserting (2) alone would prove an ADJACENT property: that the index definition
+     * SAYS it is partial. What decides the verdict is what the table DOES with a second row once the
+     * first is SENT, and that is only knowable by trying it.
+     */
+    const reference = `o3d-8td2-replay-gap-${randomUUID()}`
+    t.after(() => db.emailOutbox.deleteMany({ where: { referenceId: reference } }))
+
+    const delivered = await db.emailOutbox.create({
+      data: {
+        kind: 'ACCOUNTING_INVOICE',
+        toEmail: 'nobody@example.invalid',
+        subject: 'the first copy, already delivered',
+        html: 'queued',
+        referenceType: 'SalesOrder',
+        referenceId: reference,
+        status: 'SENT',
+        sentAt: new Date(),
+      },
+    })
+    // THE PRECONDITION WAS REACHED: the first copy really is outside the index's predicate. Without
+    // this, a row that failed to reach SENT would make the insert below succeed for the wrong reason.
+    assert.equal(delivered.status, 'SENT', 'the first copy must be DELIVERED, or this proves nothing')
+
+    let secondRowWasAccepted = false
+    const ROLLBACK = new Error('o3d-alnk: deliberate rollback — this PENDING row must never commit')
+    await assert.rejects(
+      db.$transaction(async (tx) => {
+        // The replay's enqueue, verbatim in shape: same kind, same reference, PENDING because that is
+        // what a fresh enqueue is. If the index covered SENT this would raise P2002 instead.
+        await tx.emailOutbox.create({
+          data: {
+            kind: 'ACCOUNTING_INVOICE',
+            toEmail: 'nobody@example.invalid',
+            subject: 'the replay, which the customer would receive as a second invoice',
+            html: 'queued',
+            referenceType: 'SalesOrder',
+            referenceId: reference,
+            status: 'PENDING',
+          },
+        })
+        secondRowWasAccepted = true
+        throw ROLLBACK
+      }),
+      (error: unknown) => error === ROLLBACK,
+      'the transaction must fail with OUR rollback: any other error means the insert was refused, '
+      + 'and the whole finding would be the opposite of what is recorded',
+    )
+    assert.equal(secondRowWasAccepted, true,
+      'a replay after delivery must be ACCEPTED by email_outbox — this is why xero/accounting.post '
+      + 'is unsafe-to-replay: the index refuses a duplicate undelivered row, never a duplicate send')
+
+    // AND NOTHING COMMITTED. The rollback is the safety property this test rests on, so it is checked
+    // rather than assumed: one row for this reference, the delivered one, and nothing for the drain.
+    const survivors = await db.emailOutbox.findMany({ where: { referenceId: reference } })
+    assert.deepEqual(survivors.map((row) => row.status), ['SENT'],
+      'the rolled-back PENDING row must not have committed — a committed one is a mail that would be sent')
+
+    // (4) THE OTHER HALF OF THE OLD CLAIM IS ALSO GONE, AND IT DOES NOT CHANGE THE VERDICT EITHER.
+    // The entry used to add that EmailOutbox "has no holder identity — processingStartedAt is a
+    // timestamp, not a lockedBy — and every terminal write is an unfenced update({ where: { id } })".
+    // o3d-alnk gave it both: a per-claim `lockedBy` token and terminal writes that compare-and-set on
+    // it. That closes the queue's OWN re-arming race. It says nothing about a second row arriving
+    // after the first was delivered, which is the hazard above, and which no fence inside this queue
+    // can see — the two workers racing there are in the INTEGRATION outbox, one reclaim apart.
+    assert.ok(names.includes('lockedBy'),
+      `email_outbox must carry the o3d-alnk holder identity; got ${names.join(', ')}`)
   },
 )

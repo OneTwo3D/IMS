@@ -209,20 +209,47 @@ export const INTEGRATION_OUTBOX_REGISTRY = defineOutboxRegistry({
     //
     // INVOICE_EMAIL is the counterexample that decides the entry. Its fence is
     // `lease.fenceBeforeRemoteWrite('invoice-email')` with NO dispatch write, and the effect behind
-    // it is `sendAccountingInvoiceEmailInternal` -> `queueEmail` -> a bare `db.emailOutbox.create`.
-    // `EmailOutbox` has no idempotency key and no unique constraint of any kind. Worker A can insert
-    // the row and pause before completing its sync-log and outbox rows; fifteen minutes later worker
-    // B reclaims, passes its own fence honestly (A's lock is now stale), and inserts a SECOND row.
-    // Both are delivered. The processor's own comment at that call site says what that means: "a
-    // second worker here means the customer receives the invoice twice", and POST_EFFECT.INVOICE_EMAIL
-    // adds that the email CANNOT be recalled. A claim proof taken before the effect cannot couple
-    // that effect to the completion; only evidence that outlives the worker can.
+    // it is `sendAccountingInvoiceEmailInternal` -> `queueEmail` -> `db.emailOutbox.create`. Worker A
+    // can insert the row and pause before completing its sync-log and outbox rows; fifteen minutes
+    // later worker B reclaims, passes its own fence honestly (A's lock is now stale), and inserts a
+    // SECOND row. Both are delivered. The processor's own comment at that call site says what that
+    // means: "a second worker here means the customer receives the invoice twice", and
+    // POST_EFFECT.INVOICE_EMAIL adds that the email CANNOT be recalled. A claim proof taken before
+    // the effect cannot couple that effect to the completion; only evidence that outlives the worker
+    // can.
     //
-    // AND THE QUEUE IT ENQUEUES INTO CANNOT RESIST REPLAY EITHER (o3d-alnk, P1). That EmailOutbox
-    // has no holder identity — `processingStartedAt` is a timestamp, not a `lockedBy` — and every
-    // terminal write is an unfenced `update({ where: { id } })`. An effect whose downstream queue is
-    // itself unfenced cannot be declared replay-safe on the strength of the upstream fence, so even
-    // a dispatch record minted here would not on its own settle this entry.
+    // THE TWO DATABASE FACTS THIS USED TO REST ON ARE BOTH GONE, AND THE VERDICT IS UNCHANGED
+    // (o3d-alnk). Rounds 1-3 argued the above from two properties of the table, and o3d-alnk's fence
+    // branch removed both. They are restated here as what is TRUE AFTER BOTH BRANCHES, because a
+    // verdict standing on a false reason is a verdict nobody can re-check:
+    //
+    //   1. IT SAID `EmailOutbox` HAS "no idempotency key and no unique constraint of any kind".
+    //      It now has `email_outbox_undelivered_reference_uq`, a PARTIAL unique index on
+    //      (kind, referenceType, referenceId) WHERE status IN ('PENDING','PROCESSING'). That refuses
+    //      a duplicate UNDELIVERED ROW — and a duplicate undelivered row is not the hazard. The
+    //      reclaim window is `ADMIN_OUTBOX_STALE_PROCESSING_LOCK_MS` wide and the email drain empties
+    //      PENDING inside it, so by the time worker B replays, A's copy is typically already SENT —
+    //      outside the predicate. B's insert is accepted and the customer is emailed twice. The index
+    //      closes the window in which nothing had been delivered yet and leaves open the one in which
+    //      something has. Nor could any constraint here have closed it: a send is not a database
+    //      write, so refusing a second ROW cannot unsend a mail already on the wire.
+    //      Proven, not asserted, in tests/concurrency/outbox-stale-park.concurrent.test.ts: a SENT
+    //      first copy, then a second PENDING insert the database accepts (inside a rolled-back
+    //      transaction, so no mail can leave).
+    //
+    //   2. IT SAID THE QUEUE HAS "no holder identity — `processingStartedAt` is a timestamp, not a
+    //      `lockedBy`" — and every terminal write an unfenced `update({ where: { id } })`. It now has
+    //      a per-claim `lockedBy` token and terminal writes that compare-and-set on it. That closes
+    //      the queue's OWN re-arming race, and it does not touch this one: the two workers that
+    //      duplicate an invoice email here are one reclaim apart in the INTEGRATION outbox, and each
+    //      enqueues a row of its own that the email drain then handles correctly and separately. A
+    //      fence inside the downstream queue cannot see a duplicate that arrived as two legitimate
+    //      enqueues.
+    //
+    // So `unsafe-to-replay` stands on the argument above rather than on either removed fact — and it
+    // is over-determined in any case, because `effects.keyedBy` is 'sub-operation': INVOICE_EMAIL is
+    // only the WEAKEST known effect of an entry that also multiplexes the CREATE types, and the
+    // reclaim predicate cannot discriminate between them.
     'accounting.post': {
       name: 'postAccountingEvent',
       schema: XeroAccountingOutboxPayloadSchema,
