@@ -212,6 +212,7 @@ test(
       productId: product.id,
       sku: tag,
       delta: LINE_QTY,
+      imsQty: 0, // nothing has landed at the destination yet (Codex r12 HIGH-1)
       dryRun: false,
     })
 
@@ -248,6 +249,7 @@ test(
       productId: product.id,
       sku: tag,
       delta: LINE_QTY,
+      imsQty: 0, // nothing has landed at the destination yet (Codex r12 HIGH-1)
       dryRun: false,
     })
 

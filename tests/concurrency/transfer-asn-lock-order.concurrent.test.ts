@@ -647,6 +647,7 @@ test(
         productId: seeded.product.id,
         sku: seeded.tag,
         delta: LINE_QTY,
+        imsQty: 0, // the fixture materialises the stock level at zero (Codex r12 HIGH-1)
         dryRun: false,
       }),
     })
@@ -844,6 +845,7 @@ test(
           productId: seeded.product.id,
           sku: seeded.tag,
           delta: LINE_QTY,
+          imsQty: 0, // the fixture materialises the stock level at zero (Codex r12 HIGH-1)
           dryRun: false,
         }),
       }),
@@ -1025,6 +1027,7 @@ test(
         productId: seeded.product.id,
         sku: seeded.tag,
         delta: LINE_QTY,
+        imsQty: 0, // the fixture materialises the stock level at zero (Codex r12 HIGH-1)
         dryRun: false,
       }).then(
         (value) => { alignResult = value },
@@ -1145,6 +1148,7 @@ test(
         productId: seeded.product.id,
         sku: seeded.tag,
         delta: LINE_QTY,
+        imsQty: 0, // the fixture materialises the stock level at zero (Codex r12 HIGH-1)
         dryRun: false,
       }).then((value) => { alignResult = value })
       await waitForBlockedBackend(probe, {
@@ -1434,6 +1438,7 @@ test(
         productId: world.product.id,
         sku: world.tag,
         delta: 10,
+        imsQty: 0, // the fixture materialises the stock level at zero (Codex r12 HIGH-1)
         dryRun: false,
       }).then(
         (value) => { alignResult = value },
@@ -1642,6 +1647,7 @@ test(
         productId: world.product.id,
         sku: world.tag,
         delta: 10,
+        imsQty: 0, // the fixture materialises the stock level at zero (Codex r12 HIGH-1)
         dryRun: false,
       }).then(
         (value) => { alignResult = value },
@@ -1842,6 +1848,7 @@ test(
         productId: world.product.id,
         sku: world.tag,
         delta: 10,
+        imsQty: 0, // the fixture materialises the stock level at zero (Codex r12 HIGH-1)
         dryRun: false,
       }).then(
         (value) => { alignResult = value },
@@ -1896,5 +1903,364 @@ test(
     // header lock was never held across a plan that mattered.
     assert.equal(alignResult!.applied, true, `alignment must apply: ${JSON.stringify(alignResult)}`)
     assert.equal(alignResult!.correctedQty, 10)
+  },
+)
+
+/**
+ * ══════════════════════════════════════════════════════════════════════════════
+ * THE STALE-BASIS ROUTE (6oyu.19, Codex round-12 HIGH-1)
+ * ══════════════════════════════════════════════════════════════════════════════
+ *
+ * Every arm above is about a row alignment could not lock. This one is about the
+ * case where it locked EVERYTHING and planned on a stale number anyway — the half of
+ * round 11's own argument that round 11 did not reach.
+ *
+ * Round 11 made a raced row terminal and justified it like this: `delta` is
+ * `wmsQty - imsQty` from a stock read taken before the transaction; a raced ASN row
+ * means a receipt committed after that read; a receipt raises
+ * `stock_levels.quantity` as it lands; therefore the delta is stale. The premise is
+ * about THE STOCK MOVING. A new ASN row is only ONE way that announces itself. A
+ * receipt booked against an ASN line that ALREADY EXISTED moves the stock, is
+ * discovered, is locked, produces no `raced` entry at all — and the plan proceeds.
+ *
+ * THE FIXTURE MAKES THE TWO ASN LINES DO DIFFERENT JOBS so that no earlier refusal
+ * can stand in for the guard. The receipt lands wholly on transfer B's ASN, using up
+ * B's capacity, while transfer A's ASN keeps its full ten. The stale ten-unit delta
+ * is therefore fully allocatable against A and passes straight through every branch
+ * that could otherwise catch it: candidates exist, no parent is CANCELLED, capacity
+ * covers the delta in full, and `refused` holds no `raced` entry. A partial receipt
+ * against a SINGLE ASN row would have been caught by the capacity cap by coincidence
+ * and proved nothing about this guard.
+ *
+ * WHICH BRANCH THIS ARM EXERCISES: the `stockLevel.quantity !== params.imsQty`
+ * comparison taken under `lockStockLevelForAlignment`, reached with a COMPLETE plan.
+ * The assertions pin it to that branch and not the raced one by the refusal wording,
+ * which the two do not share.
+ *
+ * TRANSFER-BACKED, NOT PURCHASE-BACKED, for a reason worth writing down: the
+ * webhook book-in of a PURCHASE-backed ASN that actually adds stock is rejected
+ * outright by the `stock_movement_inbound_evidence` trigger — it writes its
+ * PURCHASE_RECEIPT movement with `referenceType: 'WmsAsnMap'` and the trigger only
+ * accepts `'PurchaseOrder'` — so no purchase-backed fixture can stage a real
+ * receipt. That is a separate defect, filed on its own; it is NOT what this arm is
+ * about. The transfer book-in writes TRANSFER_IN, which the trigger does not cover.
+ *
+ * SEQUENTIAL ON PURPOSE: the receipt commits BEFORE alignment begins, so there is no
+ * interleaving to force and nothing here depends on the scheduler. It still needs a
+ * real PostgreSQL — the money is read back off `cost_layers` and `stock_movements`.
+ */
+async function seedStaleBasisWorld(label: string) {
+  const { db } = await import('@/lib/db')
+
+  const uid = `${Date.now().toString(36)}${Math.floor(Math.random() * 1_679_616).toString(36).padStart(4, '0')}`.toUpperCase()
+  const tag = `R12SB-${label}-${process.pid}-${uid}`
+  const product = await db.product.create({
+    data: { sku: tag, name: `r12 stale basis ${label}`, type: 'SIMPLE', countryOfOrigin: 'CN' },
+    select: { id: true },
+  })
+  const source = await db.warehouse.create({
+    data: { code: `RB${uid}S`, name: `${tag} source`, type: 'STANDARD' },
+    select: { id: true, code: true, name: true },
+  })
+  const destination = await db.warehouse.create({
+    data: { code: `RB${uid}D`, name: `${tag} dest`, type: 'STANDARD' },
+    select: { id: true, code: true, name: true },
+  })
+  await db.stockLevel.create({
+    data: { productId: product.id, warehouseId: destination.id, quantity: '0', reservedQty: '0' },
+    select: { productId: true },
+  })
+
+  /** One dispatched transfer of `LINE_QTY` units, with its own OPEN ASN at the destination. */
+  async function addDispatchedTransferWithAsn(suffix: string) {
+    const reference = `${tag}-${suffix}`
+    const sourceLayer = await db.costLayer.create({
+      data: {
+        productId: product.id,
+        warehouseId: source.id,
+        receivedQty: `${LINE_QTY}.000000`,
+        remainingQty: '0.000000',
+        unitCostBase: UNIT_COST,
+      },
+      select: { id: true },
+    })
+    const transfer = await db.stockTransfer.create({
+      data: {
+        reference,
+        fromWarehouseId: source.id,
+        toWarehouseId: destination.id,
+        status: 'IN_TRANSIT',
+        dispatchedAt: new Date(),
+        lines: {
+          create: [{
+            productId: product.id,
+            sku: tag,
+            productName: `r12 stale basis ${label}`,
+            qty: `${LINE_QTY}.0000`,
+            qtyReceived: '0.0000',
+            costLayerSnapshot: [{
+              costLayerId: sourceLayer.id,
+              qty: `${LINE_QTY}.000000`,
+              unitCostBase: `${UNIT_COST}.000000`,
+            }],
+          }],
+        },
+      },
+      select: { id: true, lines: { select: { id: true } } },
+    })
+    const transferLineId = transfer.lines[0]!.id
+    const asn = await db.wmsAsnMap.create({
+      data: {
+        connector: 'mintsoft', // wms-connector-boundary-ok: 6oyu.19: a test fixture row, not a core flow branch
+        externalAsnId: reference,
+        sourceType: 'STOCK_TRANSFER',
+        sourceId: transfer.id,
+        warehouseId: destination.id,
+        status: 'OPEN',
+        lines: {
+          create: [{
+            externalAsnLineId: `${reference}-1`,
+            sourceType: 'STOCK_TRANSFER_LINE',
+            sourceLineId: transferLineId,
+            productId: product.id,
+            sku: tag,
+            expectedQty: `${LINE_QTY}.0000`,
+          }],
+        },
+      },
+      select: { id: true, lines: { select: { id: true, externalAsnLineId: true } } },
+    })
+    return {
+      reference,
+      transferId: transfer.id,
+      transferLineId,
+      sourceLayerId: sourceLayer.id,
+      asnId: asn.id,
+      asnLineMapId: asn.lines[0]!.id,
+      externalAsnLineId: asn.lines[0]!.externalAsnLineId,
+    }
+  }
+
+  /** The real webhook book-in for one of those ASNs, for its whole quantity. */
+  async function bookIn(asn: Awaited<ReturnType<typeof addDispatchedTransferWithAsn>>) {
+    const { processBookedInEvent } = await import('@/lib/domain/wms/booked-in-service')
+    const event = await db.wmsInboundReceiptEvent.create({
+      data: {
+        connector: 'mintsoft', // wms-connector-boundary-ok: 6oyu.19: a test fixture row, not a core flow branch
+        externalEventId: `${asn.reference}-evt-${Math.random().toString(36).slice(2, 8)}`,
+        externalAsnId: asn.reference,
+        payload: { asnId: asn.reference },
+      },
+      select: { id: true },
+    })
+    return processBookedInEvent(event.id, {
+      fetchRemoteAsn: async () => ({
+        externalAsnId: asn.reference,
+        status: 'RECEIVED',
+        lines: [{
+          externalLineId: asn.externalAsnLineId,
+          sourceLineId: asn.transferLineId,
+          externalProductId: null,
+          sku: tag,
+          quantity: LINE_QTY,
+          raw: null,
+        }],
+        raw: null,
+      }),
+    })
+  }
+
+  const binding = {
+    id: `binding-${tag}`,
+    connector: 'mintsoft', // wms-connector-boundary-ok: 6oyu.19: a test fixture value, not a core flow branch
+    active: true,
+    externalWarehouseId: '1',
+    stockSyncMode: 'ALIGN_TO_WMS' as const,
+    syncFrequencyMinutes: 60,
+    discrepancyThresholds: null,
+    reportRecipients: [],
+    alignmentConfirmedAt: new Date(),
+    alignDownReasonId: null,
+    warehouseId: destination.id,
+    lastStockSyncAt: null,
+    connection: { active: true },
+    warehouse: destination,
+  }
+
+  // BOTH ASNs exist before anything is measured, so neither can ever be `raced`:
+  // discovery sees them and the locks cover them.
+  const spare = await addDispatchedTransferWithAsn('spare')
+  const arriving = await addDispatchedTransferWithAsn('arriving')
+
+  return { db, tag, product, destination, binding, spare, arriving, bookIn }
+}
+
+/** Money on the shelf, read back off the rows rather than inferred. */
+async function destinationHoldings(
+  db: Awaited<ReturnType<typeof seedStaleBasisWorld>>['db'],
+  productId: string,
+  warehouseId: string,
+) {
+  const layers = await db.costLayer.findMany({
+    where: { productId, warehouseId },
+    select: { remainingQty: true, unitCostBase: true },
+  })
+  const movements = await db.stockMovement.findMany({
+    where: { productId, toWarehouseId: warehouseId },
+    select: { totalValueBase: true },
+  })
+  const level = await db.stockLevel.findUnique({
+    where: { productId_warehouseId: { productId, warehouseId } },
+    select: { quantity: true },
+  })
+  return {
+    quantity: Number(level?.quantity ?? 0),
+    layerCount: layers.length,
+    layerValue: layers.reduce((sum, l) => sum + Number(l.remainingQty) * Number(l.unitCostBase), 0),
+    movementValue: movements.reduce((sum, m) => sum + Number(m.totalValueBase ?? 0), 0),
+  }
+}
+
+test(
+  'a receipt on an ALREADY-LOCKED ASN line makes the delta stale with no raced row, and the units are not booked twice (Codex r12 HIGH-1)',
+  { skip: !RUN && 'set RUN_DB_CONCURRENCY_TESTS=1' },
+  async () => {
+    loadEnv()
+    const world = await seedStaleBasisWorld('stale')
+    const { db, product, destination } = world
+    const { applyMintsoftAlignmentForProduct } =
+      await import('@/lib/connectors/mintsoft/sync/stock-sync')
+
+    // (1) WHAT THE SWEEP MEASURED: IMS holds nothing, Mintsoft reports ten.
+    const measured = await destinationHoldings(db, product.id, destination.id)
+    assert.equal(measured.quantity, 0, 'precondition: the basis for this run is zero on hand')
+    const imsQty = measured.quantity
+    const delta = LINE_QTY - imsQty
+
+    // (2) THE RECEIPT — the ten units Mintsoft was reporting, arriving in IMS by the
+    //     ordinary webhook route, against an ASN line that already existed and will
+    //     therefore be discovered AND locked by the alignment below.
+    const bookedIn = await world.bookIn(world.arriving)
+    assert.equal(
+      (bookedIn as { status?: string }).status,
+      'processed',
+      `the book-in must process: ${JSON.stringify(bookedIn)}`,
+    )
+
+    // THE PRECONDITION, asserted rather than assumed: the gap the delta described is
+    // now closed, by units this alignment's own transaction can no longer attribute.
+    const settled = await destinationHoldings(db, product.id, destination.id)
+    assert.equal(settled.quantity, LINE_QTY, 'the book-in put the ten units on the shelf')
+    assert.equal(
+      settled.layerValue.toFixed(2),
+      (LINE_QTY * UNIT_COST).toFixed(2),
+      `and £${(LINE_QTY * UNIT_COST).toFixed(2)} of inventory behind them`,
+    )
+    // AND THE OTHER PRECONDITION: the spare ASN row still has its FULL capacity, so
+    // the stale delta really is allocatable and no capacity cap can refuse it for us.
+    const spareRow = await db.wmsAsnLineMap.findUniqueOrThrow({
+      where: { id: world.spare.asnLineMapId },
+      select: { expectedQty: true, qtyAccountedViaSnapshot: true, qtyAccountedViaReceipt: true },
+    })
+    assert.equal(Number(spareRow.expectedQty), LINE_QTY)
+    assert.equal(Number(spareRow.qtyAccountedViaSnapshot), 0)
+    assert.equal(Number(spareRow.qtyAccountedViaReceipt), 0)
+
+    // (3) THE SWEEP APPLIES ITS DELTA, measured before the receipt landed.
+    const aligned = await applyMintsoftAlignmentForProduct({
+      binding: world.binding as never,
+      jobId: `r12-stale-${Date.now()}`,
+      productId: product.id,
+      sku: world.tag,
+      delta,
+      imsQty,
+      dryRun: false,
+    })
+
+    assert.equal(
+      aligned.applied,
+      false,
+      `the delta was settled before this transaction began and must not be applied again: ${JSON.stringify(aligned)}`,
+    )
+    // THE BRANCH. The refusal must be the stock-basis comparison — nothing raced
+    // here, every row was discovered and locked.
+    assert.match(
+      aligned.reason,
+      /IMS stock moved during the sync run/,
+      `must refuse on the stock basis, got: ${aligned.reason}`,
+    )
+    assert.doesNotMatch(
+      aligned.reason,
+      /committed under this run/,
+      'the raced-row refusal must NOT be what caught this — that is the branch this arm exists '
+      + `to show cannot see it: ${aligned.reason}`,
+    )
+
+    // THE ASSERTION IS THE AMOUNT, read back off the rows.
+    const after = await destinationHoldings(db, product.id, destination.id)
+    assert.equal(after.quantity, LINE_QTY, `ten units arrived; IMS must hold ten, not ${after.quantity}`)
+    assert.equal(
+      after.layerValue.toFixed(2),
+      (LINE_QTY * UNIT_COST).toFixed(2),
+      `£${(LINE_QTY * UNIT_COST).toFixed(2)} of inventory must stand behind them, not `
+      + `£${after.layerValue.toFixed(2)} (${after.layerCount} layers)`,
+    )
+    assert.equal(after.layerCount, settled.layerCount, 'no second layer was laid for the same units')
+    assert.equal(
+      after.movementValue.toFixed(2),
+      settled.movementValue.toFixed(2),
+      'and no second inbound movement was posted',
+    )
+    assert.equal(
+      Number((await db.wmsAsnLineMap.findUniqueOrThrow({
+        where: { id: world.spare.asnLineMapId },
+        select: { qtyAccountedViaSnapshot: true },
+      })).qtyAccountedViaSnapshot),
+      0,
+      'and the spare ASN row was never credited',
+    )
+  },
+)
+
+test(
+  'the stock-basis refusal DISCRIMINATES: a delta measured against the settled quantity still applies (Codex r12 — not vacuous)',
+  { skip: !RUN && 'set RUN_DB_CONCURRENCY_TESTS=1' },
+  async () => {
+    // Without this arm, `return { kind: 'unavailable' }` placed where the guard is
+    // would satisfy every assertion in the test above.
+    loadEnv()
+    const world = await seedStaleBasisWorld('fresh')
+    const { db, product, destination } = world
+    const { applyMintsoftAlignmentForProduct } =
+      await import('@/lib/connectors/mintsoft/sync/stock-sync')
+
+    const bookedIn = await world.bookIn(world.arriving)
+    assert.equal((bookedIn as { status?: string }).status, 'processed', JSON.stringify(bookedIn))
+
+    // The SAME world and the SAME spare row as the test above. The only difference is
+    // that this sweep measured its basis AFTER the receipt, so its delta is live.
+    const settled = await destinationHoldings(db, product.id, destination.id)
+    assert.equal(settled.quantity, LINE_QTY)
+
+    const aligned = await applyMintsoftAlignmentForProduct({
+      binding: world.binding as never,
+      jobId: `r12-fresh-${Date.now()}`,
+      productId: product.id,
+      sku: world.tag,
+      delta: LINE_QTY, // Mintsoft now reports twenty against the ten IMS holds
+      imsQty: settled.quantity,
+      dryRun: false,
+    })
+
+    assert.equal(aligned.applied, true, `a delta on a current basis must apply: ${JSON.stringify(aligned)}`)
+    assert.equal(aligned.correctedQty, LINE_QTY)
+
+    const after = await destinationHoldings(db, product.id, destination.id)
+    assert.equal(after.quantity, LINE_QTY * 2, 'the aligned units were added')
+    assert.equal(
+      after.layerValue.toFixed(2),
+      (LINE_QTY * 2 * UNIT_COST).toFixed(2),
+      `and £${(LINE_QTY * 2 * UNIT_COST).toFixed(2)} of inventory stands behind them`,
+    )
   },
 )

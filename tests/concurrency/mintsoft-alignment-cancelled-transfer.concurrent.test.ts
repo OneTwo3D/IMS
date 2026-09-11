@@ -214,6 +214,9 @@ async function alignUp(binding: unknown, productId: string, sku: string) {
     productId,
     sku,
     delta: LINE_QTY,
+    // The IMS on-hand this delta is measured against: the fixture books no
+    // destination stock, so the basis is zero (Codex r12 HIGH-1).
+    imsQty: 0,
     dryRun: false,
   })
 }
@@ -460,6 +463,9 @@ test(
       productId: product.id,
       sku: tag,
       delta: 7,
+      // Three units already landed at the destination above, so THREE is the basis
+      // this seven-unit delta was measured against (Codex r12 HIGH-1).
+      imsQty: 3,
       dryRun: false,
     })
 

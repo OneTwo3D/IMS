@@ -998,6 +998,18 @@ export async function applyMintsoftAlignmentForProduct(params: {
   productId: string
   sku: string
   delta: number
+  /**
+   * The IMS on-hand quantity `delta` was computed FROM — `stock_levels.quantity`
+   * for this product and the binding's warehouse, as the sweep read it before this
+   * call (6oyu.19, Codex round-12 HIGH-1).
+   *
+   * REQUIRED, and deliberately not defaulted. `delta` alone cannot be checked for
+   * staleness: it is a difference, and a difference does not say what it was a
+   * difference FROM. A caller that cannot name the basis cannot be told whether its
+   * delta still holds, so it may not use this function. `applyMintsoftAlignDownForProduct`
+   * has taken the same pair since it was written.
+   */
+  imsQty: number
   dryRun: boolean
 }): Promise<{
   applied: boolean
@@ -1087,24 +1099,48 @@ export async function applyMintsoftAlignmentForProduct(params: {
       }
     }
 
-    // A RACED ROW IS TERMINAL FOR THIS PLAN, WHATEVER THE REMAINING CAPACITY
-    // (6oyu.19, Codex round-11 HIGH-1).
+    // A RACED ROW ENDS THIS PLAN — DEFENCE IN DEPTH, WITH NO CLAIM OF INDEPENDENT
+    // NECESSITY (6oyu.19, Codex round-10 HIGH-1; DEMOTED at round 12).
     //
-    // Round 10 built the refusal and then consulted it on ONE branch only: the
-    // `refused` list was read to EXPLAIN an incomplete plan. When the rows this
-    // transaction does hold happen to cover the whole delta, the plan completes, the
-    // raced row is dropped without a word, and the alignment applies in full.
+    // WHAT THIS CHECK WAS FOR, AND WHY THAT REASON IS NO LONGER ITS OWN. Round 10
+    // built the refusal and consulted it on one branch only — to EXPLAIN an
+    // incomplete plan — so a raced row was dropped without a word whenever the locked
+    // rows happened to cover the whole delta. Round 11 made it terminal and argued
+    // for it like this: `params.delta` is `wmsQty - imsQty` computed from a stock
+    // read taken before this transaction began, a raced ASN row means an inbound
+    // receipt committed after that read, and a receipt raises
+    // `stock_levels.quantity` as it lands — so the delta is stale and must not be
+    // applied.
     //
-    // THAT IS THE DOUBLE-COUNT, ONE ROUTE OVER. `params.delta` is `wmsQty - imsQty`
-    // (the sweep, ~line 1880), computed from a stock level read BEFORE this
-    // transaction began. A raced ASN row means an inbound receipt for this product
-    // and warehouse committed after that read — and a manual or webhook receipt
-    // raises `stock_levels.quantity` as it lands. So the gap the delta describes has
-    // already been closed, in part or in whole, by units this transaction cannot
-    // see. Allocating the stale delta against the OLD candidate lays a second set of
-    // layers for the same units: ten received units become twenty units of stock and
-    // £100 of inventory. Whether the old candidate had spare capacity is beside the
-    // point — capacity is a fact about the ASN row, and what moved was the stock.
+    // That argument is about THE STOCK MOVING. A new ASN row is one way to notice it.
+    // It is not the only way, and this check only ever saw that one: a receipt against
+    // an ASN line that already existed moves the stock while every candidate stays
+    // locked and no `raced` entry is produced. The general form of round 11's own
+    // argument is the comparison under the stock lock further down — locked quantity
+    // against `params.imsQty` — which catches BOTH shapes and over a wider window.
+    // That check is now the one carrying the stale-delta claim.
+    //
+    // HOW FAR THE SUBSUMPTION GOES, MEASURED RATHER THAN ASSERTED. Disabling this
+    // refusal (`if (false && racedRefusals.length > 0)`) and running
+    // tests/concurrency/transfer-asn-lock-order.concurrent.test.ts leaves BOTH raced
+    // proofs still refusing and still posting ten units and £50 — the r10 arm passes
+    // outright, and the r11 full-capacity arm fails on its refusal WORDING alone
+    // (`/measured before an ASN line committed under this run/` against `IMS stock
+    // moved during the sync run (0 → 10)…`). On the two routes anyone has been able
+    // to construct, the stock comparison is what makes them safe and this check owns
+    // only the sentence.
+    //
+    // WHY THE REFUSAL STAYS ANYWAY. What is left for it is narrow and stated plainly
+    // so nobody re-derives a larger claim from its presence: a raced row is a row
+    // whose parent, counters and `closedAt` this transaction holds NOTHING on, sitting
+    // in the window the plan was selected from, and the one shape the stock comparison
+    // cannot see is a raced row that arrived WITHOUT moving destination stock. No path
+    // reaches that today. Refusing to plan alongside one is therefore the same posture
+    // as the transfer-parent check in `getAlignmentCandidateLines` — kept because it
+    // fires before the planner and names the ASN rows for the operator, and because
+    // the cost is one deferred sweep in a window where something genuinely concurrent
+    // has already happened, NOT because a route through it is known to be open. If it
+    // is ever removed, the stock comparison below is what must not be.
     //
     // REFUSE, RATHER THAN RE-PLAN UNDER THE LOCKS. Re-planning would fix the
     // candidate set and not the input: the delta itself is the stale number, and it
@@ -1160,6 +1196,56 @@ export async function applyMintsoftAlignmentForProduct(params: {
 
     const candidateById = new Map(candidates.map((candidate) => [candidate.id, candidate]))
     const stockLevel = await lockStockLevelForAlignment(tx, params.productId, params.binding.warehouseId)
+
+    // THE DELTA IS ONLY GOOD WHILE THE QUANTITY IT WAS MEASURED FROM STILL STANDS
+    // (6oyu.19, Codex round-12 HIGH-1).
+    //
+    // `params.delta` is `wmsQty - imsQty`, and `params.imsQty` is the IMS side of
+    // that subtraction, read by `runStockSyncForBinding` below before this
+    // transaction existed. Everything between that read and this line is outside every lock this
+    // function takes, and a receipt landing in that window raises
+    // `stock_levels.quantity` — so the shortfall the delta describes has already been
+    // closed, in part or in whole, by units this plan cannot see. Applying it anyway
+    // lays a second set of layers for the same units.
+    //
+    // WHY THE RACED-ROW REFUSAL BELOW IS NOT THIS CHECK, though round 11 wrote it as
+    // if it were. Its argument was about the STOCK MOVING — "a receipt raises
+    // stock_levels.quantity as it lands" — but its trigger is a new ASN LINE
+    // appearing. A new line is one way a receipt announces itself and it is not the
+    // only one: a receipt against an ASN line that ALREADY EXISTED, and which this
+    // transaction therefore discovered and locked, moves the stock and leaves the
+    // candidate set untouched. Every row is locked, no `raced` entry exists, and the
+    // plan proceeds on the stale delta. Round 11 reached half of its own conclusion.
+    //
+    // THE GENERAL FORM IS THE QUANTITY ITSELF, and it is already in hand: the stock
+    // row is locked here, the locked read returns the current quantity, and comparing
+    // it with the basis costs one comparison. It subsumes the raced-row case (a raced
+    // row that mattered moved the stock) and the case Codex found (stock moved with no
+    // raced row), and its window is the WIDER one — from the sweep's read to this
+    // lock, rather than from discovery to the locks.
+    //
+    // REFUSE, DO NOT RE-DERIVE. The delta cannot be recomputed here: `wmsQty` comes
+    // from the Mintsoft API, above this seam and outside the transaction. The next
+    // sweep measures both sides afresh and the work is deferred by one pass, not lost.
+    //
+    // `applyMintsoftAlignDownForProduct` has made exactly this check since it was
+    // written (see its transaction below). Align-up simply never did.
+    //
+    // THE DRY RUN RETURNS ABOVE THIS AND IS NOT CHECKED, deliberately. It writes
+    // nothing, so there is nothing to double-count; its preview can be stale by the
+    // same window and an operator reading a preview is not committing to it. Taking a
+    // `FOR UPDATE` on the stock row to sharpen a report would put lock contention on
+    // a read-only path. Align-down's dry run returns before its transaction for the
+    // same reason.
+    if (stockLevel.quantity !== params.imsQty) {
+      return {
+        kind: 'unavailable' as const,
+        correctedQty: 0,
+        reason: `IMS stock moved during the sync run (${formatQuantity(params.imsQty)} → ${formatQuantity(stockLevel.quantity)}), `
+          + `so the ${formatQuantity(params.delta)} delta measured against it may already have been settled; `
+          + 'leaving stock unchanged.',
+      }
+    }
 
     for (const allocation of plan.allocations) {
       const candidate = candidateById.get(allocation.asnLineMapId)
@@ -1937,6 +2023,10 @@ export async function runStockSyncForBinding(
             productId: product.id,
             sku: product.sku,
             delta,
+            // The IMS side the delta was subtracted from, so the alignment can tell
+            // under its own lock whether that quantity still stands (Codex r12
+            // HIGH-1). Same pair the align-down call below passes.
+            imsQty,
             dryRun: alignmentDryRun,
           })
 
