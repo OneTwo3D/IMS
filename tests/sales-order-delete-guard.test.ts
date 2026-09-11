@@ -529,10 +529,17 @@ test('o3d-i0o6 r3: an EARLIER A2 pass still blocks when the latest pass rounded 
     'order-1',
     {
       ...STAMPS,
-      // Everything the latest pass left: a stamp with no ref, and NO journal id at all.
-      inventoryAllocatedDate: A2_STAGED_AT,
+      // Everything the second pass left: its OWN day's stamp and batch ref — that pass raised no
+      // journal, so the ref names a batch there is nothing to find under — and a NULL journal id.
+      // The derived `A2-<that day>` lookup therefore matches nothing, which is the whole point: the
+      // only thing that can still reach the first pass's SYNCED journal is the pass history.
+      inventoryAllocatedDate: new Date('2026-07-21T02:00:00.000Z'),
+      inventoryAllocatedBatchRef: 'A2-2026-07-21-5e6f7a8b',
       allocationBatchSyncLogId: null,
-      allocationBatchPasses: [a2Pass(), a2Pass({ amount: '0.0000', syncLogId: null })],
+      allocationBatchPasses: [
+        a2Pass({ batchRef: 'A2-2026-07-20-1a2b3c4d' }),
+        a2Pass({ amount: '0.0000', syncLogId: null, batchRef: 'A2-2026-07-21-5e6f7a8b' }),
+      ],
     },
   )
   assert.equal(blocker?.code, 'daily_batch_staged', 'the £50 journal still holds this order')
