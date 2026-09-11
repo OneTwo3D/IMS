@@ -108,8 +108,12 @@ push-verification contract.
 **`tests/wms-second-connector-seam-production.test.ts`** (added in round 2) does
 the thing the file above cannot: it starts at the **outside**. It registers
 `acme-wms`, makes it the active connector, and calls the real
-`app/actions/wms-asn.ts` server actions and the real
-`createPrismaDispatchDeps(...)` inbound-delta wiring.
+`app/actions/wms-asn.ts`, `app/actions/wms-sync.ts` and
+`app/actions/wms-onboarding.ts` server actions, the real product-sync dispatcher,
+and — since round 4 — the real `runWmsDispatchSweep` **wrapper** rather than its
+core. Round 2's version called the core and handed it `deltaTimeZone: 'UTC'`, so
+the value production *derives* was supplied by the test and the derivation was the
+one thing the test could not see; that is how the timezone default survived.
 
 **Why the second file had to exist.** Codex's round-1 review found that every
 test in the first file began *inside* the generic layer — handing the fictitious
@@ -166,24 +170,25 @@ makes **impossible**, not as what it checks.
    connector can fall off. "Cannot do ASNs" and "nothing is enabled" remain
    *distinct* refusals, and the first names the connector it resolved.
 2. **A connector cannot read another connector's delta cursor.** The three cursor
-   rows, the reset-generation chain, the enable flag and the API timezone are all
-   **derived from the connector id** (`wmsDeltaCursorKeys`,
+   rows, the reset-generation chain, the enable flag and the API-timezone *row*
+   are all **derived from the connector id** (`wmsDeltaCursorKeys`,
    `wmsDeltaSettingKeys`), and the scope lock is either the connector's own
    (`hooks.deltaScopeLock`) or a default over its own rows. There is no shared
    key for a stale watermark to travel through. This mattered because the failure
    was silent: a Mintsoft watermark made a second connector's first sweep skip its
    backlog and report a clean pass. For `mintsoft` the derived names are
-   byte-for-byte the existing rows, so nothing migrates.
+   byte-for-byte the existing rows, so nothing migrates. (The *default* behind the
+   timezone row was still Mintsoft's until round 4 — see below.)
 3. **The boundary guard no longer exempts the layer it protects.**
    `scripts/check-wms-connector-boundary.mjs` derives its literal list from
    `WMS_CONNECTOR_IDS` (a registration cannot add an unscanned literal), and
    `lib/domain/wms/`, `lib/jobs/wms/`, `lib/cron-jobs/wms.ts` and
    `app/actions/wms-asn.ts` are now **inside** the scan. Within the generic layer
-   it reads code with comments blanked — a comment has no behaviour, and the doc
-   comments there necessarily narrate which connector each rule was learned from;
-   the tokenizer falls back to a raw scan on any sign of a mis-parse, so a
-   mis-parse can only make the guard stricter. Turning it on lit up 145 real
-   lines, which is what findings 1 and 2 look like from the outside.
+   it reads code with comments excluded — a comment has no behaviour, and the doc
+   comments there necessarily narrate which connector each rule was learned from.
+   Turning it on lit up 145 real lines, which is what findings 1 and 2 look like
+   from the outside. (The hand-rolled tokenizer this shipped with was replaced in
+   round 4 — see finding 3 below.)
 4. **An explicitly unverified create cannot be called SYNCED.**
    `needsVerification: true` with no `verifyPushedOrder` was independently
    expressible and resolved to SYNCED — the state the update, hold, cancel and
@@ -194,13 +199,56 @@ makes **impossible**, not as what it checks.
    PENDING_VERIFY with the reason on the link, for a connector reached through a
    cast or written in JavaScript.
 
+## What round 4 closed (Codex, four HIGHs)
+
+Round 3's review found that two of round 2's fixes had been applied to the column
+in front of the defect rather than to the defect, and that the guard which is
+supposed to catch exactly that could not fail on three real inputs.
+
+1. **A connector's delta cursor timezone cannot come from another connector.**
+   Round 2 namespaced the `<id>_api_timezone` **row**; the *default behind it* was
+   still Mintsoft's `Europe/London`, and that row is absent on every fresh
+   install. The cursor is a wall-clock string, so a wrong zone shifts the window
+   by hours and the orders in the gap are never read — the same silent-backlog
+   defect, through a different column. `DISPATCH_DELTA_DEFAULT_TIMEZONE` is
+   **gone**; `WmsConnector.deltaCursorTimeZone` states it, and
+   `WmsRegistrableConnector` makes `fetchOrderDelta` **without** it untypeable at
+   the registry factory. The sweep core carries no default at all: with no zone it
+   formats in UTC, i.e. performs no conversion rather than somebody else's.
+2. **The last two one-arm facades are gone.** `app/actions/wms-sync.ts` and
+   `app/actions/wms-onboarding.ts` route on `hooks.syncDashboard` /
+   `hooks.onboarding`, and their DTOs are **keyed by connector**
+   (`connectorData[connectorId]`) rather than carrying a literal `mintsoft:`
+   member — that member, not the dispatch, was the actual obstacle, because a
+   second connector would have needed a second named member. Both files are out of
+   the guard's allowlist and neither spells a connector id. **o3d-ph1y is closed.**
+3. **The guard reads the real parse tree.** Rounds 2 and 3 hand-rolled the lexing:
+   a character state machine blanked comments, and a regex scraped the id list.
+   `const r = /[//]mintsoft/` and `<div>https://mintsoft</div>` both looked like
+   the start of a line comment, so the literal was blanked, the scanner reached
+   the newline in a normal state, the promised "mis-parse → raw scan" fallback
+   never fired, and the guard exited 0 with a live literal in a protected file.
+   It now walks TypeScript's own AST and inspects **leaf tokens**: comments are
+   trivia and drop out by construction; regex literals, JSX text and template
+   chunks are tokens and are scanned by construction. JSDoc, which the parser
+   models as nodes, is excluded explicitly. A file with any parse diagnostic is
+   scanned raw, which is strictly stricter.
+4. **The id list must resolve in full or the guard refuses to run.** The old
+   scraper pulled quoted strings out of the `WMS_CONNECTOR_IDS` initializer and
+   hard-failed only on **zero** — so `['mintsoft', ACME_WMS_ID] as const` yielded
+   one id and a registered `acme-wms` literal passed undetected, which is the
+   precise failure the "derived, not copied" list exists to prevent. Ids are now
+   resolved from the parse tree and any element that is not a string literal is a
+   hard failure. Matching is a case-insensitive **substring** test, not a regex, so
+   an id containing `+`, `.` or `|` matches itself and only itself.
+
+`tests/scripts/wms-connector-boundary-guard.test.ts` runs the real script against
+throwaway trees and asserts its **exit code** for each of those inputs, plus the
+negatives (a comment in the generic layer is not a finding; `acme+wms` does not
+match `acmewms`). Against the round-3 guard, five of those cases fail.
+
 ## Leaks that remain, deliberately
 
-- `app/actions/wms-sync.ts` and `app/actions/wms-onboarding.ts` still return a DTO
-  with a literal `mintsoft:` member that the sync dashboard and the onboarding
-  wizard read **by name**, so their dispatch cannot move onto `hooks` until that
-  UI reads a connector-agnostic shape (**o3d-ph1y**). They are named-file entries
-  in the guard's allowlist, not directory exemptions.
 - `lib/domain/wms/booked-in-service.ts` is Mintsoft's booked-in webhook processor
   misfiled under the generic directory; it belongs under
   `lib/connectors/mintsoft/` (**o3d-c79v**). Its connector-agnostic half — the

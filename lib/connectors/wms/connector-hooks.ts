@@ -75,11 +75,55 @@ export type WmsBookedInRecheckActions = {
  */
 export type WmsDispatchPrecondition = () => Promise<{ ok: true } | { ok: false; reason: string }>
 
+/**
+ * THE TWO UI READS, AND WHY THEIR PAYLOAD IS `unknown` (o3d-remove-shiphero round 4, Codex HIGH 2).
+ *
+ * `app/actions/wms-sync.ts` and `app/actions/wms-onboarding.ts` were the last two one-arm
+ * dispatchers: each compared the active connector to a literal and fell off the end of the `if`, so
+ * a second enabled registered connector got `null` dashboard data and was reported
+ * `configured: false` by onboarding — a working connection, described to the operator as absent.
+ *
+ * They could not move onto hooks while their DTOs carried a literal `mintsoft:` member that the
+ * dashboard and the wizard read BY NAME; a second named member would have been the same defect with
+ * one more arm. So the DTO is keyed BY CONNECTOR and the per-connector payload is opaque here.
+ *
+ * `unknown`, like `WmsBookedInRecheckActions.recheckAsn`'s return, is the point rather than a
+ * shortcut: the generic facade reads `configured` and nothing else, and the only code that knows
+ * what the payload IS is the connector's own panel/form — which narrows it, in the one file whose
+ * job is to be connector-specific. Typing it here would make the next connector's panel shape a
+ * compile error in the generic layer, which is the coupling this file exists to remove.
+ */
+export type WmsSyncDashboard = {
+  /** Whether this connector's own connection is configured. The generic dashboard's only read. */
+  configured: boolean
+  /** The payload the connector's own /sync panel renders. Opaque to everything else. */
+  panel: unknown
+}
+
+export type WmsSyncDashboardActions = {
+  getDashboardData(): Promise<WmsSyncDashboard>
+}
+
+export type WmsOnboardingConnection = {
+  /** Whether the connection is already set up — the wizard's "done" tick. */
+  configured: boolean
+  /** The payload the connector's own onboarding form renders. Opaque to everything else. */
+  form: unknown
+}
+
+export type WmsOnboardingActions = {
+  getConnectionData(): Promise<WmsOnboardingConnection>
+}
+
 export type WmsConnectorHooks = {
   asn?: () => Promise<WmsAsnActions>
   productSync?: () => Promise<WmsProductSyncActions>
   bookedInRecheck?: () => Promise<WmsBookedInRecheckActions>
   dispatchPrecondition?: WmsDispatchPrecondition
+  /** The /sync WMS panel's data. Omitted by a connector with no dashboard of its own. */
+  syncDashboard?: () => Promise<WmsSyncDashboardActions>
+  /** The onboarding wizard's connection step. Omitted by a connector with no setup form. */
+  onboarding?: () => Promise<WmsOnboardingActions>
   /**
    * Locks the rows that define this connector's inbound-delta SCOPE and returns a token for it.
    * Omitted by a connector whose delta has no configuration-dependent scope: it then gets the

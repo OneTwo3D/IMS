@@ -74,6 +74,32 @@ export type WmsRegistrableConnector<Id extends string> = WmsConnector<Id> &
       pushOrder?: (input: WmsOrderPushInput) => Promise<WmsOrderPushProvenResult>
     }
   )
+  & (
+    /**
+     * THE SECOND PAIRING THE CONTRACT CANNOT STATE ALONE (o3d-remove-shiphero round 4, Codex HIGH 1).
+     *
+     * `WmsConnector` makes `fetchOrderDelta` and `deltaCursorTimeZone` independently optional, so it
+     * admits a connector with a bulk delta and no statement of the zone its cursor is a wall-clock
+     * time in. There is no safe default for that: the sweep would have to pick somebody's zone, and
+     * whichever it picked would silently shift the window — the round-2 defect (a second connector
+     * inheriting Mintsoft's `Europe/London`) arriving through a different column.
+     *
+     * So registration requires one of two shapes:
+     *
+     *   - NO bulk delta, and the zone is meaningless — the sweep per-order polls; or
+     *   - a bulk delta AND the zone its cursor is compared in, stated by the warehouse's own
+     *     connector.
+     *
+     * Enforced at the registry for the same reason the verification pairing is: every production
+     * connector reaches the app through `getConnector`, so a connector that cannot satisfy this
+     * cannot be dispatched to at all.
+     */
+    | { fetchOrderDelta?: undefined }
+    | {
+      fetchOrderDelta: NonNullable<WmsConnector<Id>['fetchOrderDelta']>
+      deltaCursorTimeZone: string
+    }
+  )
 
 export type WmsConnectorDef<Id extends string = WmsConnectorId> = {
   id: Id
@@ -178,6 +204,27 @@ export const BUILT_IN_WMS_CONNECTORS: readonly WmsConnectorDef[] = [
           },
           syncBundle: async (productId, triggeredBy) => {
             await bundle.runBundleSyncForProduct(productId, triggeredBy)
+          },
+        }
+      },
+      // The /sync WMS panel and the onboarding connection step (o3d-remove-shiphero round 4,
+      // Codex HIGH 2). Both used to be an `if (connectorId === 'mintsoft')` inside the generic
+      // facade, with the connector's payload returned under a literal `mintsoft:` member.
+      syncDashboard: async () => {
+        const m = await import('@/app/actions/mintsoft-sync')
+        return {
+          getDashboardData: async () => {
+            const data = await m.getMintsoftDashboardData()
+            return { configured: Boolean(data.status.configured), panel: data }
+          },
+        }
+      },
+      onboarding: async () => {
+        const m = await import('@/app/actions/mintsoft-sync')
+        return {
+          getConnectionData: async () => {
+            const data = await m.getMintsoftOnboardingConnectionData()
+            return { configured: data.status.configured, form: data }
           },
         }
       },

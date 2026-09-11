@@ -392,6 +392,27 @@ export interface WmsConnector<Id extends string = WmsConnectorId> {
    * truncated/failed delta so the caller can fail safe to the per-order poll. */
   fetchOrderDelta?(sinceIso: string): Promise<WmsOrderStatus[]>
   /**
+   * THE ZONE `fetchOrderDelta`'s CURSOR IS A WALL-CLOCK TIME IN — a fact about the WAREHOUSE,
+   * which is why it lives on the connector and nowhere else (o3d-remove-shiphero round 4, Codex
+   * HIGH 1).
+   *
+   * The cursor is not an instant on the wire: it is a `YYYY-MM-DDTHH:MM:SS` string the warehouse
+   * compares against its own `LastUpdated`, in whatever zone that warehouse keeps. Get the zone
+   * wrong and the window is SHIFTED BY HOURS — and a window that starts late does not error, it
+   * returns fewer rows. The orders in the gap are simply never read, the sweep reports a clean
+   * pass, and the watermark advances past them. Silent non-fulfilment, exactly like the shared
+   * watermark this connector namespace replaced.
+   *
+   * So it is REQUIRED of any connector that has a delta: `WmsRegistrableConnector` refuses to
+   * register `fetchOrderDelta` without it, and the dispatch sweep carries no default of its own
+   * to fall back on. A tenant may still override it with the connector's own
+   * `<id>_api_timezone` setting row; there is no cross-connector fallback, and never a shipped
+   * connector's zone standing in for an unconfigured one.
+   *
+   * `'UTC'` is a legitimate value and means "no conversion".
+   */
+  deltaCursorTimeZone?: string
+  /**
    * Tri-state order-presence probe for reconciliation (q66in.4.4). Distinct from
    * fetchOrderStatus, whose null CONFLATES "definitively absent" with
    * "ambiguous match" (e.g. several merged candidates) — a reconcile that reads

@@ -26,6 +26,7 @@ import {
   ACME_WMS_LABEL,
   AcmeWmsConnector,
   UnverifiableAcmeWmsConnector,
+  ZonelessDeltaAcmeWmsConnector,
   acmeWmsConnectorDef,
   makeAcmeWarehouse,
   makeSeamRegistry,
@@ -476,6 +477,34 @@ test('seam/verify: a connector that asserts an unresolvable doubt CANNOT BE REGI
   }
   // And the registry still builds — the refusal is a TYPE refusal, at the one choke point every
   // production connector passes through, not a throw somebody could catch and ignore.
+  assert.equal(createWmsConnectorRegistry([def]).ids().length, 1)
+})
+
+/**
+ * THE SECOND UNREGISTRABLE COMBINATION (o3d-remove-shiphero round 4, Codex HIGH 1).
+ *
+ * `fetchOrderDelta` without `deltaCursorTimeZone`. The cursor a delta is asked for is a WALL-CLOCK
+ * string the warehouse compares against its own `LastUpdated`, so a connector that has a delta and
+ * does not say which zone that clock is in leaves the sweep no honest choice: it would have to
+ * format the cursor in somebody else's zone. Round 2 namespaced the SETTING ROW that overrides the
+ * zone and left the default behind it as the shipped connector's `Europe/London`, which is the same
+ * silent-backlog defect arriving through a different column — a window shifted by hours returns
+ * fewer rows, never an error.
+ *
+ * So the combination is removed rather than defaulted, at the registry choke point every production
+ * connector passes through.
+ */
+test('seam/delta: a connector with a bulk delta and NO cursor timezone CANNOT BE REGISTERED', () => {
+  const def: WmsConnectorDef<SeamWmsConnectorId> = {
+    id: ACME_WMS_ID,
+    label: ACME_WMS_LABEL,
+    available: true,
+    createReplayPolicy: 'client-side-dedupe-only',
+    // @ts-expect-error o3d-remove-shiphero r4 (Codex HIGH 1): `fetchOrderDelta` with no
+    // `deltaCursorTimeZone` is not a registrable connector. Deleting the delta/timezone union in
+    // WmsRegistrableConnector makes this line compile, and THAT is what this test detects.
+    create: () => new ZonelessDeltaAcmeWmsConnector(),
+  }
   assert.equal(createWmsConnectorRegistry([def]).ids().length, 1)
 })
 

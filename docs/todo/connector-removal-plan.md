@@ -56,6 +56,23 @@ fictitious connector ACTIVE — the server action, the cron entry, the dispatche
 and assert it *dispatched*. A test that constructs the port itself has proved an
 adjacent property.
 
+**Round 4 sharpened that rule, because round 2 obeyed the letter of it and still
+missed one.** The production seam test *did* call `createPrismaDispatchDeps`, but
+it then invoked `runWmsDispatchSweepCore` and passed `deltaTimeZone: 'UTC'` by
+hand. The zone is a value production **derives** (from the connector, with a
+per-connector setting override), and the derivation still defaulted every
+connector to Mintsoft's `Europe/London` — so a connector expecting UTC had its
+window shifted by an hour and silently skipped whatever changed in the gap. The
+test could not see it, because the test supplied the answer.
+
+So, concretely: **never pass a core a value the production wrapper computes.**
+Enumerate what each wrapper derives between the entrypoint and the core — the
+resolved connector, its capabilities, every setting read, every default behind an
+absent setting row — and make the seam test enter *above* all of it. If a core
+option exists only so tests can set it, that option is a bypass with a comment on
+it. Grep for the derived names in the test file; if any of them appear as literals
+there, the seam is one layer too low.
+
 Two mechanisms are worth copying rather than reinventing:
 
 - **`WmsConnectorDef.hooks`** (`lib/connectors/wms/connector-hooks.ts`) — the
@@ -70,12 +87,33 @@ Two mechanisms are worth copying rather than reinventing:
   through, rather than detecting it downstream.
 
 And the guard that keeps it honest:
-`scripts/check-wms-connector-boundary.mjs` now derives its literal list from
+`scripts/check-wms-connector-boundary.mjs` resolves its literal list from
 `WMS_CONNECTOR_IDS` (so a registration cannot add an unscanned literal) and
 **scans the generic layer itself**. Its earlier allowlist exempted
 `lib/domain/wms/` and the facades outright, which is precisely why all three
 defects above passed it for months. If you write an equivalent guard for
 shopping or accounting, do not exempt the layer you are protecting.
+
+**And do not hand-parse the source.** Rounds 2 and 3 of that guard used a
+character state machine to blank comments and a regex to scrape the id list, and
+both went blind in the permissive direction: a connector literal inside a regex
+literal or inside JSX text was read as the start of a `//` comment and silently
+dropped, and an id list with one non-literal element quietly shrank to the ids the
+regex happened to match (with the survivors interpolated into a pattern
+unescaped). Round 4 walks TypeScript's own AST and inspects **leaf tokens** —
+comments are trivia and vanish by construction, regex literals and JSX text are
+tokens and are scanned by construction — resolves the ids from the parse tree and
+hard-fails on any element that is not a string literal, and compares with
+`includes` rather than a regex. A shopping/accounting equivalent should start
+there; `ts.createSourceFile` is three lines and the compiler is already a
+dependency.
+
+**Finally, prove the guard can fail.** A guard nobody has watched fail is an
+assertion about itself, and this one printed "clean" for two rounds while a live
+literal sat in a protected file. `tests/scripts/wms-connector-boundary-guard.test.ts`
+runs the real script against throwaway trees and asserts its exit code for every
+blindness case *and* for the negatives (a comment in the generic layer must not
+be a finding). Copy that file's shape along with the guard.
 
 ## Do Shopify FIRST, then QuickBooks
 

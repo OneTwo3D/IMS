@@ -217,6 +217,81 @@ export class AcmeWmsConnector implements WmsConnector<typeof ACME_WMS_ID> {
   //   updateOrder, fetchAsnById, createBundle, fetchBundle, verifyWebhookSignature
 }
 
+/**
+ * THE ZONE ACME'S WAREHOUSE COMPARES ITS DELTA CURSOR IN — deliberately NOT Mintsoft's, and
+ * deliberately not UTC (o3d-remove-shiphero round 4, Codex HIGH 1).
+ *
+ * `America/Los_Angeles` is 8 hours BEHIND `Europe/London`. Send Acme a London wall-clock string and
+ * it reads it as a Los Angeles wall clock, so the window it actually applies starts EIGHT HOURS
+ * LATER than intended — and everything that changed in those eight hours is never returned. No
+ * error, no retry, just a clean-looking pass over a backlog it never saw. A zone AHEAD of London
+ * would widen the window instead, which is harmless and would prove nothing.
+ */
+export const ACME_DELTA_TIME_ZONE = 'America/Los_Angeles'
+
+/** Every `sinceIso` the delta was asked for, in order. */
+export type AcmeDeltaLog = { calls: string[] }
+
+/**
+ * A `YYYY-MM-DDTHH:MM:SS` wall clock in Acme's own zone.
+ *
+ * Written out here rather than imported from `lib/domain/wms/dispatch-sweep.ts` on purpose: this is
+ * the WAREHOUSE's side of the comparison, and a fixture that reused the production formatter to
+ * interpret what the production formatter produced would agree with it about the wrong zone just as
+ * readily as about the right one.
+ */
+export function acmeWallClock(instant: Date): string {
+  const parts = new Intl.DateTimeFormat('en-GB', {
+    timeZone: ACME_DELTA_TIME_ZONE,
+    year: 'numeric', month: '2-digit', day: '2-digit',
+    hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false,
+  }).formatToParts(instant)
+  const pick = (type: Intl.DateTimeFormatPart['type']): string =>
+    parts.find((part) => part.type === type)?.value ?? ''
+  const hour = pick('hour') === '24' ? '00' : pick('hour')
+  return `${pick('year')}-${pick('month')}-${pick('day')}T${hour}:${pick('minute')}:${pick('second')}`
+}
+
+/**
+ * ACME WITH A BULK DELTA — the capability that used to drag one shipped warehouse's cursor state,
+ * enable flag and TIMEZONE in behind it.
+ *
+ * It declares `deltaCursorTimeZone`, which `WmsRegistrableConnector` now REQUIRES of any connector
+ * that implements `fetchOrderDelta`, and its delta honours `sinceIso` the way a real WMS does: as a
+ * wall-clock string compared against its own `LastUpdated`, in its own zone. That comparison is what
+ * makes a test of this a test of the WINDOW rather than of the plumbing — a fixture that returned
+ * every row regardless would pass with any zone at all.
+ */
+export class DeltaAcmeWmsConnector extends AcmeWmsConnector {
+  readonly deltaCursorTimeZone = ACME_DELTA_TIME_ZONE
+
+  constructor(
+    private readonly rows: ReadonlyArray<{ changedAt: Date; row: WmsOrderStatus }>,
+    private readonly log: AcmeDeltaLog,
+    warehouse: AcmeWarehouse = makeAcmeWarehouse(),
+  ) {
+    super(warehouse)
+  }
+
+  async fetchOrderDelta(sinceIso: string): Promise<WmsOrderStatus[]> {
+    this.log.calls.push(sinceIso)
+    return this.rows.filter(({ changedAt }) => acmeWallClock(changedAt) >= sinceIso).map(({ row }) => row)
+  }
+}
+
+/**
+ * A connector with a bulk delta and NO statement of the zone its cursor is compared in.
+ *
+ * `WmsRegistrableConnector` refuses it — that refusal is the fix for Codex HIGH 1, and
+ * `tests/wms-second-connector-seam.test.ts` asserts it at COMPILE time. There is no honest default
+ * for this shape: the sweep would have to format the cursor in somebody else's zone.
+ */
+export class ZonelessDeltaAcmeWmsConnector extends AcmeWmsConnector {
+  async fetchOrderDelta(): Promise<WmsOrderStatus[]> {
+    return []
+  }
+}
+
 export function acmeWmsConnectorDef(
   warehouse: AcmeWarehouse = makeAcmeWarehouse(),
   overrides: Partial<WmsConnectorDef<SeamWmsConnectorId>> = {},

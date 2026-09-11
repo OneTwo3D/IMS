@@ -60,9 +60,11 @@ export function WmsOnboardingConnection({
           </p>
         </div>
       </label>
-      {enabled && data.connectorId === 'mintsoft' && data.mintsoft ? (
+      {/* o3d-remove-shiphero round 4: the facade's DTO is keyed BY CONNECTOR, so the payload is
+          opaque until the connector's own form narrows it — which is this file's whole job. */}
+      {enabled && data.connectorId === 'mintsoft' && data.connectorData.mintsoft ? (
         <MintsoftConnectionForm
-          data={data.mintsoft}
+          data={data.connectorData.mintsoft as MintsoftOnboardingConnectionData}
           connectorLabel={data.connectorLabel}
           busy={busy}
           availableOrderLookupConnectors={availableOrderLookupConnectors}

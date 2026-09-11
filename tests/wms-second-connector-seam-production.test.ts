@@ -24,13 +24,17 @@ import assert from 'node:assert/strict'
 import test, { mock } from 'node:test'
 
 import {
+  ACME_DELTA_TIME_ZONE,
   ACME_WMS_ID,
   ACME_WMS_LABEL,
   AcmeWmsConnector,
+  DeltaAcmeWmsConnector,
   acmeAsnActions,
+  acmeWallClock,
   acmeWmsConnectorDef,
   makeAcmeWarehouse,
   type AcmeAsnLog,
+  type AcmeDeltaLog,
 } from './helpers/fictitious-wms-connector.ts'
 import * as realTypes from '../lib/connectors/wms/types.ts'
 import * as realPlugins from '../lib/integration-plugins.ts'
@@ -38,6 +42,7 @@ import * as realRegistry from '../lib/connectors/wms/registry.ts'
 import { createWmsConnectorRegistry, type WmsConnectorDef } from '../lib/connectors/wms/registry.ts'
 import type { WmsConnectorHooks } from '../lib/connectors/wms/connector-hooks.ts'
 import type { WmsConnector, WmsOrderStatus } from '../lib/connectors/wms/types.ts'
+import * as realSettingsStore from '../lib/settings-store.ts'
 import { encodeWmsDeltaCursor } from '../lib/domain/wms/delta-cursor-generation.ts'
 
 // --- the fictitious connector, as far as the app is concerned ---------------------------------
@@ -46,8 +51,47 @@ const asnLog: AcmeAsnLog = { asnCalls: [] }
 const acmeWarehouse = makeAcmeWarehouse()
 const acmeConnector = new AcmeWmsConnector(acmeWarehouse)
 
-/** Acme's hooks: the ASN implementation, and nothing else. No delta scope, no precondition. */
-const acmeHooks: WmsConnectorHooks = { asn: async () => acmeAsnActions(acmeConnector, asnLog) }
+/** What Acme's /sync panel and onboarding form hand back. Opaque to the generic facades by design. */
+const ACME_PANEL = { warehouses: ['ACME-WH-1'], lastSyncAt: null }
+const ACME_FORM = { endpoint: 'https://acme.example/api', account: 'acme-ops' }
+
+/**
+ * Acme's hooks: the ASN implementation, the /sync dashboard and the onboarding connection step.
+ * No delta scope, no dispatch precondition — those absences are load-bearing elsewhere in this file.
+ */
+const acmeHooks: WmsConnectorHooks = {
+  asn: async () => acmeAsnActions(acmeConnector, asnLog),
+  syncDashboard: async () => ({ getDashboardData: async () => ({ configured: true, panel: ACME_PANEL }) }),
+  onboarding: async () => ({ getConnectionData: async () => ({ configured: true, form: ACME_FORM }) }),
+  productSync: async () => ({
+    syncProduct: async (productId, triggeredBy) => { productSyncLog.push(`product:${productId}:${triggeredBy}`) },
+    syncBundle: async (productId, triggeredBy) => { productSyncLog.push(`bundle:${productId}:${triggeredBy}`) },
+  }),
+}
+
+/** What Acme's product/bundle sync was asked to do — proves WHICH connector the dispatcher reached. */
+const productSyncLog: string[] = []
+
+/**
+ * Acme's delta rows and the cursor it was asked for. Declared up here because the connector the
+ * registry hands back must BE this one — the production wrapper reads `deltaCursorTimeZone` off
+ * whatever `getWmsConnector` returns, which is the seam under test.
+ */
+const deltaLog: AcmeDeltaLog = { calls: [] }
+/** Acme's own watermark, and a backlog row that changed 70 minutes ago — inside its real window. */
+const ACME_WATERMARK_AT = new Date(Date.now() - 60 * 60 * 1000)
+const ACME_BACKLOG_CHANGED_AT = new Date(Date.now() - 70 * 60 * 1000)
+const ACME_BACKLOG_ROW: WmsOrderStatus = {
+  externalOrderId: 'ACME-1', externalOrderNumber: 'SO-BACKLOG', status: 'DESPATCHED', statusLabel: 'DESPATCHED',
+  isSplit: false, partCount: null, isMerged: false, mergedOrderNumbers: [], deepLinkUrl: null,
+  tracking: [{ trackingNumber: 'ACME-TRACK-1', carrier: 'ACME-EXPRESS', despatchedAt: null }],
+  dispatched: true, raw: null,
+}
+const acmeDeltaConnector = new DeltaAcmeWmsConnector(
+  [{ changedAt: ACME_BACKLOG_CHANGED_AT, row: ACME_BACKLOG_ROW }],
+  deltaLog,
+  acmeWarehouse,
+)
 
 /** Which connector plugins are enabled. Mutated per test, read by the REAL getActiveWmsConnectorId. */
 let pluginState: Record<string, boolean> = { [ACME_WMS_ID]: true }
@@ -66,7 +110,13 @@ const seamDefs: WmsConnectorDef<string>[] = [
   // leaving the hooks on would let a routing bug reach the real server actions (and the real
   // database) instead of failing the assertion.
   { ...(realRegistry.BUILT_IN_WMS_CONNECTORS[0] as WmsConnectorDef<string>), hooks: undefined },
-  { ...(acmeWmsConnectorDef(acmeWarehouse) as unknown as WmsConnectorDef<string>), hooks: acmeHooks },
+  {
+    ...(acmeWmsConnectorDef(acmeWarehouse) as unknown as WmsConnectorDef<string>),
+    hooks: acmeHooks,
+    // The registry hands back the DELTA-CAPABLE Acme, so the production wrapper resolves its
+    // `deltaCursorTimeZone` the way it resolves the shipped connector's.
+    create: () => acmeDeltaConnector as never,
+  },
 ]
 const seamRegistry = createWmsConnectorRegistry<string>(seamDefs)
 
@@ -75,8 +125,23 @@ mock.module('@/lib/connectors/wms/registry', {
     ...realRegistry,
     findWmsConnectorLabel: (id: string) => seamRegistry.findDef(id)?.label ?? null,
     getWmsConnectorHooks: (id: string) => seamRegistry.findDef(id)?.hooks ?? {},
+    // The PRODUCTION dispatch-sweep entrypoint resolves its connector through this.
+    getWmsConnector: (id: string) => seamRegistry.getConnector(id),
   },
 })
+
+// The per-connector sweep lock is a session advisory lock on a real pg connection — a process
+// boundary, not code under test. Running the body inline is the only thing mocked about it.
+mock.module('@/lib/domain/wms/dispatch-sweep-lock', {
+  namedExports: {
+    DISPATCH_LOCK_SKIPPED: { lockSkipped: true },
+    DISPATCH_SWEEP_LOCK_NAMESPACE: 1,
+    dispatchSweepLockKey: (id: string) => id.length,
+    withDispatchSweepLockOrSkip: async <T>(_id: string, fn: () => Promise<T>): Promise<T> => fn(),
+  },
+})
+
+mock.module('@/lib/activity-log', { namedExports: { logActivity: async () => {} } })
 
 // Every action here takes its delegate's own permission. The seam is about ROUTING, so the session
 // is granted; tests/security/* is where the gates themselves are proved.
@@ -171,21 +236,151 @@ test('seam/production: with NO plugin enabled the facade falls back and still na
 })
 
 // ---------------------------------------------------------------------------------------------
-// HIGH 2 — a second connector's inbound delta cannot inherit Mintsoft's watermark
+// HIGH 2 (round 2) / HIGH 2 (round 4) — the /sync and onboarding facades dispatch to the ACTIVE
+// connector, and their DTO is keyed by it
 // ---------------------------------------------------------------------------------------------
 
-const NOW = new Date('2026-09-01T12:00:00.000Z')
-/** Two hours old: inside a 24h lookback, and OUTSIDE any window a fresh Mintsoft watermark allows. */
-const ACME_BACKLOG_CHANGED_AT = new Date(NOW.getTime() - 2 * 60 * 60 * 1000)
-/** One minute old. If Acme reads THIS, its window starts after its own backlog changed. */
-const MINTSOFT_WATERMARK = new Date(NOW.getTime() - 60 * 1000).toISOString()
+test('seam/production: the /sync dashboard facade dispatches to a registered non-Mintsoft connector', async () => {
+  const wmsSync = await import('../app/actions/wms-sync.ts')
 
-/** An in-memory `settings` table, driven through the production Prisma-shaped deps. */
+  // Before the fix this returned `null` — the SAME answer the facade gives when no WMS connector is
+  // enabled at all, so an enabled, registered, configured second connector was reported to the
+  // operator as "you have no WMS".
+  const data = await wmsSync.getWmsSyncDashboardData()
+  assert.notEqual(data, null, 'a WMS connector IS enabled; `null` is the no-connector answer')
+  assert.equal(data!.connectorId, ACME_WMS_ID)
+  assert.equal(data!.configured, true, 'the connector said it is configured, and the facade must carry that through')
+
+  // The DTO is keyed BY CONNECTOR. A literal `mintsoft:` member was the actual obstacle to routing
+  // on hooks — a second named member would have been the same one-arm defect with one more arm.
+  assert.deepEqual(
+    data!.connectorData[ACME_WMS_ID as never],
+    ACME_PANEL,
+    'the payload arrives under the id of the connector that produced it',
+  )
+  assert.equal(
+    Object.keys(data!.connectorData).length, 1,
+    'and only the active connector is represented — no named member for a connector that did not run',
+  )
+})
+
+test('seam/production: the onboarding facade reports a registered non-Mintsoft connector as CONFIGURED', async () => {
+  const wmsOnboarding = await import('../app/actions/wms-onboarding.ts')
+
+  // Before the fix the fall-through arm answered `configured: false` for every connector but one.
+  // That is not an empty answer, it is a wrong one: the wizard shows an unticked setup step for a
+  // connection that is already live.
+  const data = await wmsOnboarding.getWmsOnboardingConnectionData()
+  assert.equal(data.connectorId, ACME_WMS_ID)
+  assert.equal(data.connectorLabel, ACME_WMS_LABEL, 'named from the registry, not anonymised')
+  assert.equal(data.configured, true, 'the connector says it is set up, and the wizard must be told so')
+  assert.deepEqual(data.connectorData[ACME_WMS_ID as never], ACME_FORM)
+})
+
+test('seam/production: a connector that declares NEITHER facade degrades without claiming to be absent', async () => {
+  // The other half of routing by capability, for these two as for the ASN facade: "this connector
+  // has no panel / no setup form" must stay expressible and must stay DISTINCT from "nothing is
+  // enabled" — the /sync facade's `null`.
+  const previous = seamDefs[1].hooks
+  seamDefs[1].hooks = {}
+  try {
+    const wmsSync = await import('../app/actions/wms-sync.ts')
+    const wmsOnboarding = await import('../app/actions/wms-onboarding.ts')
+
+    const dashboard = await wmsSync.getWmsSyncDashboardData()
+    assert.notEqual(dashboard, null, 'a connector with no panel is still an enabled connector')
+    assert.equal(dashboard!.connectorId, ACME_WMS_ID)
+    assert.equal(dashboard!.configured, false)
+    assert.deepEqual(dashboard!.connectorData, {}, 'nothing is claimed on behalf of a connector that ran nothing')
+
+    const onboarding = await wmsOnboarding.getWmsOnboardingConnectionData()
+    assert.equal(onboarding.connectorLabel, ACME_WMS_LABEL, 'still named')
+    assert.equal(onboarding.configured, false)
+    assert.deepEqual(onboarding.connectorData, {})
+  } finally {
+    seamDefs[1].hooks = previous
+  }
+})
+
+test('seam/production: the product-sync dispatcher reaches a registered non-Mintsoft connector', async () => {
+  // Same class as the two facades above: `lib/domain/wms/product-sync-dispatch.ts` already routes on
+  // `hooks.productSync`, but nothing drove it from OUTSIDE with a second connector — and routing
+  // correctly when handed one is not the same as being reached with one.
+  const dispatch = await import('../lib/domain/wms/product-sync-dispatch.ts')
+  productSyncLog.length = 0
+
+  assert.equal(await dispatch.isAnyWmsConnectorEnabled(), true)
+  await dispatch.runWmsProductSyncForProduct('p-1', 'product_mutation')
+  await dispatch.runWmsBundleSyncForProduct('p-1', 'cron')
+  assert.deepEqual(
+    productSyncLog,
+    ['product:p-1:product_mutation', 'bundle:p-1:cron'],
+    'the mutation reached the ACTIVE connector’s own sync, with the trigger it was given',
+  )
+
+  // And a connector that declares no product sync is a silent no-op rather than a throw — the
+  // dispatcher is best-effort on the product-mutation path.
+  const previous = seamDefs[1].hooks
+  seamDefs[1].hooks = {}
+  try {
+    productSyncLog.length = 0
+    await dispatch.runWmsProductSyncForProduct('p-2', 'manual')
+    assert.deepEqual(productSyncLog, [])
+  } finally {
+    seamDefs[1].hooks = previous
+  }
+})
+
+test('seam/production: with NO plugin enabled the /sync facade answers null, and onboarding names the fallback', async () => {
+  const previous = pluginState
+  pluginState = {}
+  try {
+    const wmsSync = await import('../app/actions/wms-sync.ts')
+    const wmsOnboarding = await import('../app/actions/wms-onboarding.ts')
+    assert.equal(await wmsSync.getWmsSyncDashboardData(), null, '`null` now means exactly one thing')
+    // `getActiveWmsConnectorId` deliberately falls back to the FIRST registered connector, so the
+    // wizard still names the system it consulted rather than describing an anonymous absence.
+    const onboarding = await wmsOnboarding.getWmsOnboardingConnectionData()
+    assert.equal(onboarding.connectorId, 'mintsoft')
+    assert.equal(onboarding.connectorLabel, 'Mintsoft')
+  } finally {
+    pluginState = previous
+  }
+})
+
+// ---------------------------------------------------------------------------------------------
+// HIGH 2 (round 2) + HIGH 1 (round 4) — a second connector's inbound delta cannot inherit the
+// shipped connector's watermark, NOR its timezone
+//
+// DRIVEN THROUGH `runWmsDispatchSweep`, THE PRODUCTION ENTRYPOINT. Round 2's version of this test
+// called `runWmsDispatchSweepCore` and handed it `deltaTimeZone: 'UTC'` by hand. That is the
+// branch's recurring defect in its purest form: the value production DERIVES was supplied by the
+// test, so the derivation — which still defaulted every connector to the shipped connector's
+// `Europe/London` — was the one thing the test could not see. The wrapper is now what is called,
+// and the zone is not passed in from anywhere.
+// ---------------------------------------------------------------------------------------------
+
+/** A LIVE installation of the shipped connector: a recent watermark at its current generation. */
+const MINTSOFT_WATERMARK = new Date(Date.now() - 60 * 1000).toISOString()
+
+/**
+ * An in-memory Prisma double: the `settings` table the delta cursors live in, plus the sync-job
+ * bookkeeping the production wrapper writes around the core.
+ */
 type SettingsClient = {
   setting: {
+    findUnique(args: { where: { key: string } }): Promise<{ key: string; value: string } | null>
     findMany(args: { where: { key: { in: string[] } } }): Promise<Array<{ key: string; value: string | null }>>
     upsert(args: { where: { key: string }; create: { key: string; value: string }; update: { value: string } }): Promise<void>
     deleteMany(args: { where: { key: { in: string[] } } }): Promise<void>
+  }
+  wmsSyncJob: {
+    create(args: { data: Record<string, unknown> }): Promise<{ id: string }>
+    update(args: { where: { id: string }; data: Record<string, unknown> }): Promise<void>
+  }
+  wmsSyncLog: {
+    create(args: { data: Record<string, unknown> }): Promise<void>
+    createMany(args: { data: Array<Record<string, unknown>> }): Promise<void>
   }
   $executeRaw(): Promise<number>
   $queryRaw(): Promise<unknown[]>
@@ -194,8 +389,13 @@ type SettingsClient = {
 
 function settingsDouble(seed: Record<string, string>) {
   const rows = new Map<string, string>(Object.entries(seed))
+  const jobs: Array<Record<string, unknown>> = []
   const client: SettingsClient = {
     setting: {
+      async findUnique({ where }: { where: { key: string } }) {
+        const value = rows.get(where.key)
+        return value === undefined ? null : { key: where.key, value }
+      },
       async findMany({ where }: { where: { key: { in: string[] } } }) {
         return where.key.in.filter((k) => rows.has(k)).map((k) => ({ key: k, value: rows.get(k) ?? null }))
       },
@@ -206,87 +406,150 @@ function settingsDouble(seed: Record<string, string>) {
         for (const k of where.key.in) rows.delete(k)
       },
     },
+    wmsSyncJob: {
+      async create({ data }: { data: Record<string, unknown> }) {
+        jobs.push(data)
+        return { id: `job-${jobs.length}` }
+      },
+      async update() {},
+    },
+    wmsSyncLog: {
+      async create() {},
+      async createMany() {},
+    },
     async $executeRaw() { return 0 },
     async $queryRaw() { return [] },
     async $transaction<T>(fn: (tx: SettingsClient) => Promise<T>): Promise<T> { return fn(client) },
   }
-  return { rows, client }
+  return { rows, jobs, client }
 }
 
 const settings = settingsDouble({
-  // A LIVE Mintsoft installation: a recent watermark, stamped at its current generation.
   mintsoft_order_delta_since: encodeWmsDeltaCursor(0, MINTSOFT_WATERMARK),
   mintsoft_order_reconcile_at: encodeWmsDeltaCursor(0, MINTSOFT_WATERMARK),
   mintsoft_order_delta_generation: '0',
+  // Acme's OWN watermark, an hour old. Its window therefore starts one overlap (15 min) before it,
+  // which is a deterministic instant — so the cursor string this sweep must send is known exactly.
+  [`${ACME_WMS_ID}_order_delta_since`]: encodeWmsDeltaCursor(0, ACME_WATERMARK_AT.toISOString()),
+  [`${ACME_WMS_ID}_order_delta_generation`]: '0',
+  // NOTE WHAT IS NOT SEEDED: `acme-wms_api_timezone`. That row is absent on every fresh install,
+  // and its absence is the whole finding — the zone must come from the CONNECTOR, not from a
+  // default written for somebody else's warehouse.
 })
 mock.module('@/lib/db', { namedExports: { db: settings.client, prisma: settings.client } })
 
-test('seam/production: a second connector’s delta reads ITS OWN cursor, never Mintsoft’s', async () => {
-  const { createPrismaDispatchDeps, runWmsDispatchSweepCore } = await import('../lib/domain/wms/dispatch-sweep.ts')
+/**
+ * The SETTINGS READ is a database read, and it is the second process boundary this file has to
+ * stand in for.
+ *
+ * It is mocked rather than left real because `lib/settings-store.ts` is already loaded — the static
+ * `import * as realRegistry` at the top of this file pulls the registry in, which pulls the settings
+ * store in, which binds the REAL Prisma client before any `mock.module` here has run. The `db` mock
+ * therefore reaches every module imported dynamically below, but not that one.
+ *
+ * WHAT IS STILL UNDER TEST: the KEY. This reads the same in-memory row map the production cursor
+ * deps read, so a wrapper that asked for another connector's `_api_timezone` row — or for a row
+ * nobody namespaced — gets exactly what the database would have given it: the wrong value, or
+ * nothing.
+ */
+mock.module('@/lib/settings-store', {
+  namedExports: {
+    ...realSettingsStore,
+    getSettingValue: async (key: string) => settings.rows.get(key) ?? null,
+  },
+})
 
-  // Acme, WITH a bulk delta — the capability that used to drag Mintsoft's cursor state in behind it.
-  // It honours `sinceIso`, which is what makes this a test of the window and not of the plumbing:
-  // a connector that returned everything regardless would pass with the wrong watermark.
-  const deltaCalls: string[] = []
-  const backlogRow: WmsOrderStatus = {
-    externalOrderId: 'ACME-1', externalOrderNumber: 'SO-BACKLOG', status: 'DESPATCHED', statusLabel: 'DESPATCHED',
-    isSplit: false, partCount: null, isMerged: false, mergedOrderNumbers: [], deepLinkUrl: null,
-    tracking: [{ trackingNumber: 'ACME-TRACK-1', carrier: 'ACME-EXPRESS', despatchedAt: null }],
-    dispatched: true, raw: null,
-  }
-  const acmeWithDelta = Object.assign(new AcmeWmsConnector(makeAcmeWarehouse()), {
-    fetchOrderDelta: async (sinceIso: string) => {
-      deltaCalls.push(sinceIso)
-      return Date.parse(`${sinceIso}Z`) <= ACME_BACKLOG_CHANGED_AT.getTime() ? [backlogRow] : []
-    },
-  })
+/** The window this sweep must ask for: Acme's watermark less the 900s default overlap. */
+const EXPECTED_SINCE_AT = new Date(ACME_WATERMARK_AT.getTime() - 900 * 1000)
 
-  // The PRODUCTION deps for this connector id. Everything the delta touches — the cursor rows, the
-  // scope lock, the generation chain — is built here, which is exactly where the bug lived.
-  const prismaDeps = createPrismaDispatchDeps(ACME_WMS_ID as never, acmeWithDelta as never)
+test('seam/production: the sweep formats the delta cursor in THE CONNECTOR’S zone, not the shipped connector’s', async () => {
+  const { createPrismaDispatchDeps, runWmsDispatchSweep } = await import('../lib/domain/wms/dispatch-sweep.ts')
 
+  deltaLog.calls.length = 0
   const applied: string[] = []
-  const result = await runWmsDispatchSweepCore({
-    listCandidates: async () => [{ linkId: 'L1', orderId: 'O1', externalOrderNumber: 'SO-BACKLOG', externalOrderId: 'ACME-1' }],
-    fetchOrderStatus: async () => null,
-    applyDispatch: async (orderId) => { applied.push(orderId); return { success: true } },
-    partsSupported: false,
-    fetchOrderParts: async () => [],
-    fetchPartItems: async () => [],
-    pushPartialShipment: async () => ({ ok: true }),
-    repointLink: async () => {},
-    recordDispatchError: async () => ({ deadLettered: false }),
-    clearDispatchFailures: async () => {},
-    countLinksByOrderNumber: async (numbers) => new Map(numbers.map((n) => [n, 1])),
-    // THE THREE UNDER TEST, taken verbatim from the production deps.
-    fetchDelta: prismaDeps.fetchDelta,
-    getDeltaState: prismaDeps.getDeltaState,
-    saveDeltaState: prismaDeps.saveDeltaState,
-  }, {
-    now: NOW,
-    deltaEnabled: true,
-    deltaTimeZone: 'UTC',
-    deltaLookbackSeconds: 24 * 60 * 60,
-    deltaOverlapSeconds: 60,
+  // The THREE delta members are the production ones, built by the production factory for this
+  // connector id; the rest of the port is in-memory so the sweep has candidates to work on without
+  // a database. Everything this test asserts about — the cursor rows, the generation chain, the
+  // zone — is on the production path.
+  const prismaDeps = createPrismaDispatchDeps(ACME_WMS_ID as never, acmeDeltaConnector as never)
+  const result = await runWmsDispatchSweep('seam-test', {
+    deps: {
+      listCandidates: async () => [{ linkId: 'L1', orderId: 'O1', externalOrderNumber: 'SO-BACKLOG', externalOrderId: 'ACME-1' }],
+      fetchOrderStatus: async () => null,
+      applyDispatch: async (orderId: string) => { applied.push(orderId); return { success: true } },
+      partsSupported: false,
+      fetchOrderParts: async () => [],
+      fetchPartItems: async () => [],
+      pushPartialShipment: async () => ({ ok: true }),
+      repointLink: async () => {},
+      recordDispatchError: async () => ({ deadLettered: false }),
+      clearDispatchFailures: async () => {},
+      countLinksByOrderNumber: async (numbers: string[]) => new Map(numbers.map((n) => [n, 1])),
+      fetchDelta: prismaDeps.fetchDelta,
+      getDeltaState: prismaDeps.getDeltaState,
+      saveDeltaState: prismaDeps.saveDeltaState,
+    } as never,
   })
 
-  assert.equal(deltaCalls.length, 1, 'the delta ran')
-  assert.ok(
-    Date.parse(`${deltaCalls[0]}Z`) <= ACME_BACKLOG_CHANGED_AT.getTime(),
-    `Acme’s window must start from ITS OWN cold start (the lookback floor), not from Mintsoft’s `
-    + `watermark ${MINTSOFT_WATERMARK}; it started at ${deltaCalls[0]}`,
+  assert.equal(deltaLog.calls.length, 1, `the delta ran (sweep status ${result.status ?? 'n/a'})`)
+  // THE CURSOR ITSELF. A wall clock in Acme's zone, which differs from the shipped connector's by
+  // hours — so this equality fails outright if any cross-connector default survives.
+  assert.equal(
+    deltaLog.calls[0],
+    acmeWallClock(EXPECTED_SINCE_AT),
+    `the cursor must be a wall clock in ${ACME_DELTA_TIME_ZONE} — the zone Acme itself declares. `
+    + 'A cursor formatted in another warehouse’s zone is not an error the warehouse reports; it '
+    + 'silently starts the window hours late.',
   )
-  assert.equal(result.deltaRowCount, 1, 'the backlog row was inside the window')
-  assert.deepEqual(applied, ['O1'], 'and the backlogged order was actually despatched')
+  // AND THE CONSEQUENCE, which is the part an operator would ever see: an order that changed
+  // inside Acme's real window was despatched rather than skipped.
+  assert.deepEqual(applied, ['O1'], 'the backlogged order was inside the window and was despatched')
+  assert.equal(result.dispatched, 1)
 
-  // The cursor Acme WROTE is its own, and Mintsoft's is untouched. A shared row would show up as
-  // either a missing acme key or a moved mintsoft one.
-  assert.ok(settings.rows.has(`${ACME_WMS_ID}_order_delta_since`), 'Acme minted its own watermark row')
+  // The cursor Acme wrote is its own, and the shipped connector's is untouched.
+  assert.ok(settings.rows.has(`${ACME_WMS_ID}_order_delta_since`), 'Acme holds its own watermark row')
   assert.equal(
     settings.rows.get('mintsoft_order_delta_since'),
     encodeWmsDeltaCursor(0, MINTSOFT_WATERMARK),
-    'and Mintsoft’s watermark was not advanced by a sweep of a different warehouse',
+    'and the shipped connector’s watermark was not advanced by a sweep of a different warehouse',
   )
+})
+
+test('seam/production: the connector’s OWN timezone setting row still overrides its declared zone', async () => {
+  // The override is per-connector and additive, not a way back to a shared default: a tenant whose
+  // warehouse is configured differently sets ITS row, and nobody else's behaviour moves.
+  const { createPrismaDispatchDeps, runWmsDispatchSweep } = await import('../lib/domain/wms/dispatch-sweep.ts')
+  settings.rows.set(`${ACME_WMS_ID}_api_timezone`, 'UTC')
+  // Rewind Acme's watermark: the previous test advanced it on its clean pass, which is the correct
+  // behaviour and would otherwise make the window this test asserts on depend on test order.
+  settings.rows.set(`${ACME_WMS_ID}_order_delta_since`, encodeWmsDeltaCursor(0, ACME_WATERMARK_AT.toISOString()))
+  deltaLog.calls.length = 0
+  try {
+    const prismaDeps = createPrismaDispatchDeps(ACME_WMS_ID as never, acmeDeltaConnector as never)
+    await runWmsDispatchSweep('seam-test', {
+      deps: {
+        listCandidates: async () => [],
+        fetchOrderStatus: async () => null,
+        applyDispatch: async () => ({ success: true }),
+        partsSupported: false,
+        fetchOrderParts: async () => [],
+        fetchPartItems: async () => [],
+        pushPartialShipment: async () => ({ ok: true }),
+        repointLink: async () => {},
+        recordDispatchError: async () => ({ deadLettered: false }),
+        clearDispatchFailures: async () => {},
+        countLinksByOrderNumber: async () => new Map(),
+        fetchDelta: prismaDeps.fetchDelta,
+        getDeltaState: prismaDeps.getDeltaState,
+        saveDeltaState: prismaDeps.saveDeltaState,
+      } as never,
+    })
+    assert.equal(deltaLog.calls.length, 1)
+    const utcWallClock = EXPECTED_SINCE_AT.toISOString().slice(0, 19)
+    assert.equal(deltaLog.calls[0], utcWallClock, 'the connector’s own row wins over its declared zone')
+  } finally {
+    settings.rows.delete(`${ACME_WMS_ID}_api_timezone`)
+  }
 })
 
 test('seam/production: the connector’s delta ENABLE FLAG and TIMEZONE are its own keys', async () => {
@@ -297,8 +560,6 @@ test('seam/production: the connector’s delta ENABLE FLAG and TIMEZONE are its 
   assert.equal(mintsoft.timeZone, 'mintsoft_api_timezone')
   assert.notEqual(acme.enabled, mintsoft.enabled)
   assert.notEqual(acme.timeZone, mintsoft.timeZone)
-  // The timezone is the quiet one: the cursor is formatted as a wall-clock string in it, so
-  // inheriting another warehouse's zone shifts the window by hours and loses whatever fell in the gap.
   assert.equal(acme.timeZone, `${ACME_WMS_ID}_api_timezone`)
 })
 

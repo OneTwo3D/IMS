@@ -1,6 +1,7 @@
 'use client'
 
 import { MintsoftClient } from './mintsoft-client'
+import type { MintsoftDashboardData } from '@/app/actions/mintsoft-sync'
 import type { WmsSyncDashboardData } from '@/app/actions/wms-sync'
 
 /**
@@ -42,7 +43,11 @@ export function WmsSyncPanel({ data, onBack }: Props) {
           <p className="text-xs text-muted-foreground">Configure the WMS connection, webhook intake, and warehouse bindings.</p>
         </div>
       </div>
-      {data.connectorId === 'mintsoft' && data.mintsoft ? <MintsoftClient data={data.mintsoft} /> : null}
+      {/* o3d-remove-shiphero round 4: the facade's DTO is keyed BY CONNECTOR, so the payload is
+          opaque until the connector's own panel narrows it — which is this file's whole job. */}
+      {data.connectorId === 'mintsoft' && data.connectorData.mintsoft
+        ? <MintsoftClient data={data.connectorData.mintsoft as MintsoftDashboardData} />
+        : null}
     </div>
   )
 }

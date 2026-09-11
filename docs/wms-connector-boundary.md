@@ -30,11 +30,37 @@ This mirrors the shopping (`shopping-registry.ts`) and accounting
 - **`app/actions/wms-onboarding.ts`** — onboarding connection-data.
 - **`app/actions/wms-order-status.ts`** — live order status for the sales-order chip.
 
-Each resolves the active connector and dispatches to its implementation. The
-per-connector UI lives in dedicated dispatchers
+Each resolves the active connector and dispatches to **whatever that connector
+registered** — `hooks.asn`, `hooks.syncDashboard`, `hooks.onboarding` on its
+`WmsConnectorDef` (`lib/connectors/wms/connector-hooks.ts`). Routing is on the
+**presence** of a hook, never on the id: a connector that omits one is reported as
+"cannot do this", *named*, which is deliberately distinct from "nothing is
+enabled".
+
+The DTOs the first three return are **keyed by connector**
+(`connectorData[connectorId]`), not by a named member per connector. That shape is
+load-bearing: a literal `mintsoft:` member is what kept `wms-sync.ts` and
+`wms-onboarding.ts` as one-arm dispatchers for two review rounds, because a second
+connector would have needed a second named member. The per-connector UI narrows
+the opaque payload in its own dispatcher
 (`app/(dashboard)/sync/wms-sync-panel.tsx`,
 `components/onboarding/wms-onboarding-connection.tsx`) — adding a connector means a
 branch there, not in the page/step.
+
+## Connector facts the generic layer must not default
+
+Some values look like configuration but are facts about a particular warehouse.
+The generic layer must never carry a default for one, because the default is
+always some *other* warehouse's answer and getting it wrong is silent:
+
+- **`WmsConnector.deltaCursorTimeZone`** — the zone `fetchOrderDelta`'s cursor is a
+  wall clock in. `WmsRegistrableConnector` makes `fetchOrderDelta` without it
+  untypeable, and `lib/domain/wms/dispatch-sweep.ts` holds no default: with no zone
+  it formats in UTC (no conversion) rather than in somebody else's zone. A tenant
+  override lives in the connector's own `<id>_api_timezone` setting row.
+- **`WmsConnectorDef.createReplayPolicy`** — whether the warehouse's own create
+  refuses a duplicate. Required, so a new connector fails `tsc` until it is written
+  down.
 
 ## Where the `mintsoft` literal is allowed
 
@@ -49,9 +75,30 @@ probes + cosmetic/plugin-registry files. See the allowlist in the guard.
 ## Enforcement
 
 `scripts/check-wms-connector-boundary.mjs` (run by `npm run check:all` and the
-**WMS Connector Boundary Guard** CI workflow) fails the build if `mintsoft` appears
-in any scanned `app`/`lib`/`components` file outside that allowlist. For a genuinely
-connector-specific reference, add the path to the allowlist or add a per-line waiver:
+**WMS Connector Boundary Guard** CI workflow) fails the build if a registered
+connector id appears in any scanned `app`/`lib`/`components` file outside that
+allowlist. It reads the ids **and** the files through the TypeScript compiler:
+
+- the id list is resolved from the parse tree of `WMS_CONNECTOR_IDS`, and any
+  element that is not a string literal is a **hard failure** rather than a silently
+  shorter scan;
+- inside the generic WMS layer it inspects the parse tree's **leaf tokens**, so
+  comments (including JSDoc) are excluded by construction while regex literals, JSX
+  text and template chunks are included by construction;
+- outside that layer files are scanned raw, comments included;
+- a file with any parse diagnostic is scanned raw — a mis-parse can only make the
+  guard stricter;
+- matching is a case-insensitive substring test, never a regex, so an id containing
+  a metacharacter matches itself and only itself.
+
+`tests/scripts/wms-connector-boundary-guard.test.ts` runs the real script against
+throwaway trees and asserts its exit code for each of those behaviours. **Keep it
+passing and keep adding to it**: this guard printed "clean" for two review rounds
+with a live literal in a protected file, and a guard that cannot fail is worse than
+no guard because it is believed.
+
+For a genuinely connector-specific reference, add the path to the allowlist or add
+a per-line waiver:
 
 ```
 // wms-connector-boundary-ok: <ticket-or-date>: <reason>

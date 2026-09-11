@@ -59,14 +59,21 @@ const DISPATCH_DELTA_DEFAULT_OVERLAP_SECONDS = 900
 const DISPATCH_DELTA_DEFAULT_LOOKBACK_SECONDS = 24 * 60 * 60
 const DISPATCH_DELTA_DEFAULT_RECONCILE_INTERVAL_SECONDS = 30 * 60
 /**
- * Mintsoft compares SinceLastUpdated against LastUpdated in the tenant
- * DATABASE's timezone, NOT UTC (verified live: the tenant runs Europe/London,
- * so LastUpdated sits +1h under BST). The UTC cursor is converted into this
- * zone before it's formatted. Overridable per-tenant via the
- * `mintsoft_api_timezone` setting; `"UTC"` (or an invalid zone) disables the
- * conversion.
+ * THERE IS NO DEFAULT DELTA TIMEZONE HERE ANY MORE (o3d-remove-shiphero round 4, Codex HIGH 1).
+ *
+ * `DISPATCH_DELTA_DEFAULT_TIMEZONE = 'Europe/London'` used to sit on this line. It is one
+ * warehouse's fact — Mintsoft compares `SinceLastUpdated` against `LastUpdated` in the tenant
+ * DATABASE's timezone, not UTC — and it was the fallback EVERY connector's delta landed on when its
+ * own `<id>_api_timezone` row was absent, which on a fresh install is always. The cursor is a
+ * wall-clock string, so a connector whose warehouse compares in UTC would have had its window
+ * shifted a full hour and would have silently skipped whatever changed in the gap: the round-2
+ * shared-watermark defect, arriving through a different column.
+ *
+ * The zone is now stated by the connector that owns it (`WmsConnector.deltaCursorTimeZone`, required
+ * of anything that implements `fetchOrderDelta` — see `WmsRegistrableConnector`), and the production
+ * wrapper reads it from there. The CORE below carries no default at all: with no zone it formats the
+ * cursor in UTC, i.e. it performs no conversion, rather than performing somebody else's.
  */
-export const DISPATCH_DELTA_DEFAULT_TIMEZONE = 'Europe/London'
 
 /**
  * Format a UTC instant as a `YYYY-MM-DDTHH:MM:SS` wall-clock string in `timeZone`.
@@ -979,7 +986,9 @@ export async function runWmsDispatchSweepCore(
           'the window is clamped and cannot cover the gap; holding the watermark until the backlog clears',
       )
     }
-    const sinceIso = formatCursorInTimeZone(new Date(sinceMs), options?.deltaTimeZone ?? DISPATCH_DELTA_DEFAULT_TIMEZONE)
+    // No `??` fallback: a missing zone means "no conversion" (formatCursorInTimeZone renders UTC),
+    // never another connector's zone. See the note where the default constant used to live.
+    const sinceIso = formatCursorInTimeZone(new Date(sinceMs), options?.deltaTimeZone)
 
     try {
       const rows = await deps.fetchDelta!(sinceIso)
@@ -2755,6 +2764,12 @@ export async function runWmsDispatchSweep(
   // connector inherited Mintsoft's enable flag and Mintsoft's timezone. The timezone is the quieter
   // of the two — the delta cursor is formatted as a wall-clock string in it, so a wrong zone shifts
   // the window by hours and the orders in the gap are never re-read.
+  //
+  // round 4 (Codex HIGH 1): namespacing the ROW was only half of it. The row is absent on a fresh
+  // install, and the DEFAULT behind it was still Mintsoft's `Europe/London`. The default now comes
+  // from the connector itself — `connector.deltaCursorTimeZone`, which `WmsRegistrableConnector`
+  // requires of anything implementing `fetchOrderDelta` — so there is no cross-connector fallback
+  // left to inherit.
   const deltaSettings = wmsDeltaSettingKeys(connectorId)
   const [deltaEnabledSetting, deltaTimeZoneSetting] = await Promise.all([
     getSettingValue(deltaSettings.enabled),
@@ -2772,7 +2787,7 @@ export async function runWmsDispatchSweep(
   const coreOptions: WmsDispatchSweepCoreOptions = {
     batchSize: options?.batchSize,
     deltaEnabled: deltaEnabledSetting !== 'false',
-    deltaTimeZone: deltaTimeZoneSetting || DISPATCH_DELTA_DEFAULT_TIMEZONE,
+    deltaTimeZone: deltaTimeZoneSetting || connector.deltaCursorTimeZone,
   }
 
   // o3d-bjc.9: one sweep per connector at a time. Each run counts a link's
