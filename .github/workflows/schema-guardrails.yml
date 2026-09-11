@@ -19,6 +19,16 @@ on:
       - "scripts/fence-db-connections.mjs"
       - "scripts/run-migration-verifications.mjs"
       - "scripts/check-app-db-object-access.mjs"
+      - "tests/db/**"
+      # The cleanup wrapper tests/db/shopping-webhook-retention-evidence.test.ts runs its probe rows
+      # through. A change to it changes what happens to a failing assertion in that suite.
+      - "tests/helpers/with-cleanup.ts"
+      - "lib/db/**"
+      # The two modules that BUILD the shopping-inbox compaction predicate, which
+      # tests/db/shopping-webhook-retention-evidence.test.ts executes against a real Postgres. Without
+      # them a change to the predicate could not reach the only job that runs that evidence.
+      - "lib/connectors/shopping-webhook-retention.ts"
+      - "lib/connectors/shopping-webhook-inbox.ts"
   push:
     branches:
       - main
@@ -39,6 +49,16 @@ on:
       - "scripts/fence-db-connections.mjs"
       - "scripts/run-migration-verifications.mjs"
       - "scripts/check-app-db-object-access.mjs"
+      - "tests/db/**"
+      # The cleanup wrapper tests/db/shopping-webhook-retention-evidence.test.ts runs its probe rows
+      # through. A change to it changes what happens to a failing assertion in that suite.
+      - "tests/helpers/with-cleanup.ts"
+      - "lib/db/**"
+      # The two modules that BUILD the shopping-inbox compaction predicate, which
+      # tests/db/shopping-webhook-retention-evidence.test.ts executes against a real Postgres. Without
+      # them a change to the predicate could not reach the only job that runs that evidence.
+      - "lib/connectors/shopping-webhook-retention.ts"
+      - "lib/connectors/shopping-webhook-inbox.ts"
 
 jobs:
   migration-scope:
@@ -149,3 +169,135 @@ jobs:
           # design, so a job-wide value would break such a step rather than help it.
           DATABASE_SESSION_LOCK_URL: ${{ steps.direct-db.outputs.url }}
         run: npm run test:concurrency
+
+  # ===========================================================================================
+  # THE tests/db TIER, WHICH RAN NOWHERE (Codex r13/r18, HIGH)
+  # ===========================================================================================
+  # WHAT WAS WRONG. `tests/db/shopping-webhook-retention-evidence.test.ts` gates its one test on
+  # `RUN_DB_RETENTION_TESTS === '1'`, and NO checked-in workflow set it. `npm run test:unit`'s glob
+  # (`tests/**/*.test.ts`) collects the file on every CI run, so it reported a silent `# SKIP` inside
+  # a green suite — and that test is the only executable evidence that WooCommerce order payloads
+  # survive retention compaction. Nothing anywhere said it had not been executed.
+  #
+  # THE REST OF tests/db/, COUNTED RATHER THAN ASSERTED, because an earlier attempt at this comment
+  # described the directory wrongly and the wrong sentence hid the defect it sat next to:
+  #
+  #   * ONE file gates on a `RUN_DB_*` variable — the retention evidence above. It is set below now.
+  #   * FOUR open a real connection whenever DATABASE_URL is set and skip only those tests when it
+  #     is not (`connection-schema-pinning`, `guarded-pool-routing`, `session-lock-affinity`,
+  #     `startup-option-verdict-across-bundles`). Their live probes run here, against this job's
+  #     database; the rest of each file already ran under `test:unit`.
+  #   * FOUR never open one (`advisory-lock-keys`, `pool-acquisition-bound`, `post-remote-persist`,
+  #     `prisma-unique-violation`) and run identically under `test:unit`.
+  #
+  # So this tier is NOT held back from `test:unit` as a block: 101 of its 122 tests execute there,
+  # and 21 skip. docs/development.md carries the same census per file, with the counts.
+  #
+  # The lesson is not "count the files again": a prose census goes stale silently, and this one is
+  # prose. NOTHING MECHANICAL ENFORCES IT. A programmatic census was built on o3d-n3yt and
+  # WITHDRAWN — it answered a syntactic question (does this source text read a gate?) about an
+  # open space (the ways a program can read an environment variable), and two implementations of
+  # it passed shapes their authors had not thought of while reporting healthy. o3d-dzsd carries
+  # the replacement, which is a RUNTIME property: after the tier runs, require every collected
+  # file to have executed at least one test and reported no skips. Until then, a NEW gated file
+  # in tests/db/ that invents a variable this job does not set will skip itself green, exactly as
+  # RUN_DB_RETENTION_TESTS did — the `REQUIRE_` tripwire below protects the pair that exists, not
+  # the next one. Review is what catches it.
+  #
+  # WHY A SIBLING JOB AND NOT MORE STEPS ON `fresh-db-drift`. Both were available; the deciding
+  # facts are about the DATABASE and about what a red job means.
+  #
+  #   1. THE DATABASES MUST NOT BE THE SAME ONE. `fresh-db-drift`'s database IS its subject: it is
+  #      migrated and then compared against prisma/schema.prisma, and its later steps run the
+  #      migrations' own verification queries over it. This tier writes into transactions on the
+  #      database it is given, and future suites in it are expected to create scratch databases on
+  #      the same server. Sharing a service container would put a drift verdict downstream of a
+  #      domain suite's cleanup — the drift check would still be about a freshly migrated database
+  #      only for as long as that stayed true. A separate job gets a separate container and the
+  #      question stays clean.
+  #   2. A RED JOB SHOULD NAME ITS OWN SUBJECT. `fresh-db-drift` is already a five-link chain (drift
+  #      -> migration verifications -> object access -> direct-address resolution -> concurrency).
+  #      Appending a sixth means a domain regression is reported as a schema guardrail, and it means
+  #      this tier is reachable only after five other things pass — the mask that o3d-amy8 was
+  #      about, one workflow up.
+  #   3. IT COSTS NO WALL-CLOCK. The jobs run in parallel, so the duplicated `npm ci` +
+  #      `migrate deploy` is runner time and not time on the critical path.
+  #
+  # It is MODELLED ON `fresh-db-drift` and not on a new pattern: the same pinned action SHAs, the
+  # same `postgres:16` service with the same health check, the same generate-then-deploy prelude, and
+  # — as of r20 — the same direct-address resolution step, for the reason below.
+  #
+  # THE SUITES RUN AGAINST THE CONTAINER'S BRIDGE ADDRESS, NOT THE PUBLISHED PORT (Codex r19, HIGH).
+  # `tests/db/session-lock-affinity.test.ts` contains LIVE tests that build a deliberately interposed
+  # data path (a TCP relay of their own) and a deliberately DIRECT lock endpoint, and require
+  # `pgSessionLockConnectionConfig()` to admit the second. The direct endpoint is DATABASE_URL's own
+  # host and port. On `127.0.0.1:5432` that endpoint is not direct at all: it is carried by
+  # docker-proxy, which is the NAT the comment on `fresh-db-drift` above describes at length, and the
+  # affinity check refuses it. The job would then have gone RED on an unrelated false positive before
+  # ever reaching the retention verdict this whole tier exists to run — a red job that says nothing
+  # about its own subject. So the same `docker inspect` step resolves the service container's bridge
+  # address and the suites are given it as DATABASE_URL. Ordinary query traffic is indifferent to which
+  # of the two routes it takes; the affinity check is not, and it is the one with an opinion.
+  #
+  # It still deliberately does NOT take the DATABASE_SESSION_LOCK_URL override `fresh-db-drift` needs:
+  # nothing here reads that variable, and the live tests construct both of their endpoints themselves.
+  #
+  # SUPERUSER ON PURPOSE. The service's `POSTGRES_USER: postgres` is a superuser, which gives the
+  # connecting role CREATEDB and a route to the `postgres` maintenance database. Nothing in the tier
+  # needs that today; it is the shape a suite creating a scratch database will need, and taking it
+  # from the image costs nothing.
+  db-backed-regressions:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: ims_ci
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d ims_ci"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:5432/ims_ci?schema=public
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npx prisma generate --schema prisma/schema.prisma
+      - run: npx prisma migrate deploy --schema prisma/schema.prisma
+      # The bridge address, resolved exactly as `fresh-db-drift` resolves it, for the reason written
+      # above the job: the live session-lock tests in tests/db build their DIRECT endpoint out of
+      # DATABASE_URL, and the published port is not one.
+      - name: Resolve the postgres service's direct, non-NAT address
+        id: direct-db
+        run: |
+          ip="$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' '${{ job.services.postgres.id }}')"
+          if [ -z "$ip" ]; then
+            echo "could not read the postgres service container's bridge address" >&2
+            exit 1
+          fi
+          if ! timeout 10 bash -c "until </dev/tcp/${ip}/5432; do sleep 1; done" 2>/dev/null; then
+            echo "the postgres service container is not reachable at ${ip}:5432" >&2
+            exit 1
+          fi
+          echo "url=${DATABASE_URL/@127.0.0.1:5432/@${ip}:5432}" >> "$GITHUB_OUTPUT"
+      # `test:db` sets RUN_DB_RETENTION_TESTS=1 *and* REQUIRE_DB_RETENTION_TESTS=1. The second is the
+      # tripwire for this job: if an edit ever drops the first, the suite refuses to load instead of
+      # skipping itself into a green run again. That covers THIS pair only. Nothing stops the NEXT
+      # gate arriving without either half — see the comment above the job, and o3d-dzsd.
+      - name: Run the DB-backed regression suites
+        env:
+          # Scoped to THIS step. The steps above are migrating and generating against the same
+          # database through the published port, and re-pointing them would only add a way for the two
+          # to disagree. It is the SUITES that need the route the affinity check can accept.
+          DATABASE_URL: ${{ steps.direct-db.outputs.url }}
+        run: npm run test:db

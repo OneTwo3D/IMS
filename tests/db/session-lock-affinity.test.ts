@@ -431,14 +431,48 @@ test('o3d-a5zz: an unset or blank override changes nothing', () => {
 //     the witness was blocked and the override admitted.
 // ---------------------------------------------------------------------------
 
-/** The database name both URLs of a wrongly-pointed override agree on. */
+/**
+ * The database name both URLs of a wrongly-pointed override agree on — reached at DATABASE_URL's OWN
+ * endpoint, which is the DIRECT one. The data leg beside it goes through `startRelay`, so the two are
+ * still different endpoints, which is the whole point of the fixture.
+ *
+ * IT USED TO FORCE `127.0.0.1` HERE (o3d-n3yt r20, Codex r19 HIGH). That is only the direct route when
+ * DATABASE_URL is already on loopback. Under `services:` on a GitHub runner it is the OPPOSITE: a
+ * connection to 127.0.0.1:5432 is carried by docker-proxy, which terminates our socket and opens its
+ * own, and `pgSessionLockConnectionConfig()` refuses exactly that evidence — the refusal this
+ * repository's own workflow documents at length and works around with the service container's bridge
+ * address. So the live 'correct override is ADMITTED' test below built its supposedly direct endpoint
+ * out of the one address in the job that is not direct, and the tests/db job would have gone red on
+ * the NAT before it ever reached the retention verdict it exists to run. Taking the host from `base`
+ * means the override is whatever DATABASE_URL actually names, and the workflow's job is then simply to
+ * name the direct address — which it now does.
+ */
 function sameNamesDifferentEndpoint(base: string, port: number): string {
+  // The host is DATABASE_URL's own, deliberately left alone. See above.
   const url = new URL(base)
-  url.hostname = '127.0.0.1'
   url.port = String(port)
   url.searchParams.set('schema', ASCII_SCHEMA)
   return url.toString()
 }
+
+test('[o3d-n3yt r20] the live fixtures take their DIRECT endpoint from DATABASE_URL and not from 127.0.0.1', () => {
+  // WHY THIS IS A TEST AND NOT A COMMENT (Codex r19, HIGH). The live tests below hand
+  // `pgSessionLockConnectionConfig()` a data path they have interposed on purpose and an endpoint that
+  // must be admitted as DIRECT, and they require the second to be admitted. While this helper forced
+  // `127.0.0.1`, the "direct" endpoint was whatever sits on loopback at DATABASE_URL's port —
+  // regardless of where DATABASE_URL points. In the db-backed-regressions job that is docker-proxy,
+  // which this module refuses by design, so the job would have failed here, on a NAT, before reaching
+  // the retention verdict the job exists to produce.
+  //
+  // MUTATION ROUTE: put `url.hostname = '127.0.0.1'` back. This test fails; every other test in this
+  // file still passes, on this host, because here 127.0.0.1 IS the direct route — which is exactly why
+  // the defect survived a green local run.
+  const base = 'postgresql://app:pw@172.18.0.2:5432/ims?schema=public'
+  const override = new URL(sameNamesDifferentEndpoint(base, 5432))
+  assert.equal(override.hostname, '172.18.0.2', 'the override endpoint is the host DATABASE_URL names')
+  assert.equal(override.port, '5432')
+  assert.equal(override.pathname, '/ims', 'and it still names the same database, which is what the override check compares')
+})
 
 /** The one property a stand-in has to have: it answers, and it records what it was asked. */
 function standInConnector(answers: { taken?: unknown; acquired?: unknown }) {
