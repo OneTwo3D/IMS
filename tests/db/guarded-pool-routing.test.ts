@@ -118,21 +118,6 @@ const ALLOWED: ReadonlyArray<{ file: string; contains: string; because: string }
       'unsupported schema as "database connectivity failed", which is the wrong check failing; the schema ' +
       'is checkWmsPushStateSchema(), and that one IS guarded.',
   },
-  {
-    file: 'lib/lane-database-attestation.ts',
-    contains: 'new pg.Client({ connectionString: url }) as unknown as LaneSqlClient',
-    because:
-      'o3d-alnk r22. The whole question this module answers is WHERE THE GIVEN CONNECTION STRING LANDS — ' +
-      'it marks a database a test run just created and then reads that marker back over the same string the ' +
-      "harness client will use, so that `createEmailOutboxHarnessClient` can require the SERVER's word for " +
-      '"this is a throwaway" instead of comparing database names (which a pooler alias and an unset ' +
-      'DATABASE_URL both defeat). Routing it through pgConnectionConfig() would REWRITE that string and ' +
-      'answer the question about a different one, which is the opposite of the property. It reads ' +
-      'DATABASE_URL nowhere, is imported by no application code — its only shipped caller is ' +
-      'tests/helpers/throwaway-database.ts — and it touches no application table: two SELECTs to attest, ' +
-      'and one CREATE TABLE/INSERT of its own marker, refused unless current_database() over that very ' +
-      'connection is the database the caller says it created.',
-  },
 ]
 
 /** Every runtime source file — `lib/` and `app/`, the code that runs in the server process. */

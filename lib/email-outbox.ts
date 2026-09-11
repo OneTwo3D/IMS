@@ -53,7 +53,11 @@
  * AND THE CLIENT IN THAT HARNESS IS ONE THIS MODULE MINTED (r18). Identity against `db` decided a
  * question next door to the real one — a structural wrapper of `db` is not `db` and writes to the
  * same rows — so the decision is inverted: `createEmailOutboxHarnessClient` mints, a module-private
- * `WeakSet` records, and the guard accepts nothing it did not mint.
+ * `WeakSet` records, and the guard accepts nothing it did not mint. AND THE MINT ASKS THE DELEGATE,
+ * NOT THE CALLER (r26): it used to take a `writesTo: { kind: 'in-memory' }` field and believe it,
+ * so production delegates declared in-memory minted a client the drain accepted. An in-memory
+ * delegate now hands over the array its rows live in and answers a query about a row this module
+ * has just put into it — a property of the object that will be swept, not a word about it.
  *
  * AND THE CHECK READS EACH FACT EXACTLY ONCE (r7). It enumerates the caller's keys with
  * `Reflect.ownKeys` behind a plain-prototype rule, so the names it sees are exactly the names a
@@ -146,17 +150,16 @@ export type EmailOutboxClient = {
 }
 
 /**
- * A HARNESS CLIENT IS MINTED, NOT RECOGNISED (o3d-alnk r18, Codex HIGH).
+ * A HARNESS CLIENT IS MINTED, NOT RECOGNISED (o3d-alnk r18, Codex HIGH) — AND SINCE r26 THE MINT
+ * ASKS THE DELEGATES THEMSELVES WHERE THEY KEEP THEIR ROWS, INSTEAD OF ASKING THE CALLER.
  *
- * THE HOLE THIS CLOSES, AND WHY THE PREVIOUS SHAPE COULD NOT CLOSE IT. Until r18 the guard asked
+ * THE HOLE r18 CLOSED, AND WHY THE PREVIOUS SHAPE COULD NOT CLOSE IT. Until r18 the guard asked
  * ONE question of `harness.client`: `value === db`. That question is ADJACENT to the one that
  * matters and is not the same question. `{ emailOutbox: db.emailOutbox, emailSuppression:
  * db.emailSuppression }` is a different object — it fails the identity test and PASSES — while
  * every read and every UPDATE it carries lands on the real `email_outbox` rows. Paired with the
  * fake sender, fake preparer and fake logger that complete a harness, the drain then claims
- * twenty-five genuine customer emails, delivers nothing, and stamps them SENT. That is precisely
- * the production/test mixture the all-or-nothing shape exists to forbid, reached through the
- * guard rather than around it.
+ * twenty-five genuine customer emails, delivers nothing, and stamps them SENT.
  *
  * ENUMERATING WRAPPER SHAPES IS THE SAME MISTAKE ONE LEVEL OUT. A spread, a getter-backed
  * forwarder, a `Proxy` over `db`, a subclass, a `$extends` client: each reaches the same rows and
@@ -168,38 +171,62 @@ export type EmailOutboxClient = {
  * module-private `WeakSet`; `resolveEmailOutboxDependencies` accepts a client if and only if that
  * set holds it. Nothing a caller constructs is in that set — not `db`, not a structural wrapper of
  * it, not a spread of a minted client, not a `Proxy` around one, not an object that copies the
- * brand property (the brand is a `WeakSet` membership, not a field to be copied). The capability
- * has to be MINTED, and production has no way to mint it, so "is this the production client" stops
- * being a question anyone has to answer correctly.
+ * brand property (the brand is a `WeakSet` membership, not a field to be copied).
+ *
+ * =========================================================================================
+ * WHAT r26 FIXES, AND WHY IT IS THE WHOLE OF THE REMAINING HOLE (Codex r25 HIGH).
+ *
+ * Minting is necessary and it was not sufficient, because the mint ITSELF decided on the caller's
+ * word. It took a `writesTo: { kind: 'in-memory' | 'database' }` field and believed it. So this
+ * call — every field structurally perfect, every check satisfied — produced a REGISTERED client
+ * the drain accepted, over the live queue:
+ *
+ *   createEmailOutboxHarnessClient({
+ *     emailOutbox: db.emailOutbox,            // PRODUCTION
+ *     emailSuppression: db.emailSuppression,  // PRODUCTION
+ *     writesTo: { kind: 'in-memory' },        // A WORD, and the only thing that decided
+ *   })
+ *
+ * Rounds 22-24 spent three rounds hardening the OTHER arm — server-side attestation that a named
+ * database carried this run's marker — while this was the easier route the whole time, and it did
+ * not involve the attestation at all. That machinery is withdrawn (see the r26 note on
+ * `createEmailOutboxLaneClient`, and the issue it is filed under); this is the fix that stays.
+ *
+ * THE RULE NOW: A CALLER'S WORD DECIDES NOTHING, BECAUSE THERE IS NO WORD LEFT TO SAY.
+ * `writesTo` is GONE. What takes its place is a POSITIVE PROPERTY OF THE DELEGATE ITSELF: an
+ * in-memory delegate is one that can hand this module the live JavaScript array its rows live in
+ * and then ANSWER A QUERY OUT OF IT. The mint proves that by round trip, per delegate:
+ *
+ *   1. the delegate must carry `[EMAIL_OUTBOX_IN_MEMORY_ROWS]`, a function returning its store;
+ *   2. calling it twice must yield THE SAME array — a snapshot is not a store;
+ *   3. this module pushes a sentinel row of its own making into that array;
+ *   4. the delegate's own READ path (`emailOutbox.findMany`, `emailSuppression.findUnique`) must
+ *      return that sentinel;
+ *   5. the sentinel is removed, the same read must stop naming it, and the array must be back to
+ *      the length it had.
+ *
+ * `db.emailOutbox` fails at (1) — a Prisma delegate has no such member and cannot grow one — so
+ * THE r25 CALL IS REFUSED BEFORE ANY QUERY IS ISSUED TO ANYTHING. A wrapper that fabricates the
+ * member fails at (4): the sentinel exists only in this process, so a delegate reading a database
+ * cannot produce it. The proof is about the object that will be swept, not about a sibling field
+ * describing it.
+ *
+ * WHY THE READ PATH IS THE ONE THAT IS PROVEN. The drain is a SWEEP: `findMany` decides WHICH ROWS
+ * EXIST for this run, and every write afterwards is keyed on an id that came back from it. A
+ * delegate whose reads come out of an in-process array therefore hands the drain a working set
+ * that only exists in this process, and its settlement writes name ids from that set.
+ *
+ * WHAT THIS STILL DOES NOT ESTABLISH, SAID PLAINLY RATHER THAN IMPLIED. It does not prove where
+ * the delegate's WRITES land. A delegate that serves the probe (and the drain's SELECT) from
+ * memory while routing `updateMany` to a real database would pass — but that is a purpose-built
+ * two-faced object, not a one-line mistake, and it is the same residual class as
+ * `sendEmail: (m) => realMailer(m)`, which no in-process check can refuse either. That residue is
+ * filed (o3d-dhhd and the r26 withdrawal issue), not papered over. What is GONE is the accident
+ * and the one-liner: there is no field left whose value is simply taken at its word.
  *
  * THE TYPE CARRIES IT TOO. `EmailOutboxHarness['client']` is the branded `EmailOutboxHarnessClient`,
  * which is not constructible by a type assertion from a plain object literal — so a caller who
  * assembles a client by hand fails `tsc` first and the runtime refusal second.
- *
- * AND THIS FUNCTION MINTS ONLY IN-MEMORY CLIENTS (r24, Codex HIGH). It used to have a second arm:
- * `writesTo: { kind: 'database', attestation }`, carrying round-22 proof that some database had this
- * run's marker. The proof was real and it was spent on the wrong subject — it said nothing about the
- * `emailOutbox` and `emailSuppression` delegates passed BESIDE it, so a lane attestation next to
- * PRODUCTION delegates satisfied every check and the drain swept the real customer queue with a fake
- * sender. Rounds 18 to 21 had already shown that no property of a URL can be made to carry this
- * (an unset `DATABASE_URL` skipped the comparison entirely; a pooler routes two unequal names to one
- * queue), and r24 shows that no property of an ATTESTATION can either, as long as the delegates
- * arrive separately.
- *
- * So a database-backed client is not assembled at all. `createEmailOutboxLaneClient` (below) attests
- * a connection string and builds the delegates FROM THAT SAME STRING: the capability and its subject
- * are created together and there is no second object to swap. See its comment for the whole argument.
- *
- * WHAT IS STILL NOT CLOSED, SAID PLAINLY RATHER THAN IMPLIED. A caller who WANTS production rows in
- * a harness can still write `createEmailOutboxHarnessClient({ emailOutbox: db.emailOutbox, ... ,
- * writesTo: { kind: 'in-memory' } })` — a minted client wrapping production delegates, with a
- * destination that is simply a lie. No in-process check can catch it: a delegate does not know which
- * database it writes to, and Prisma delegates have no stable identity to compare against either
- * (`db.emailOutbox` is a property read, not a singleton one can rely on). What HAS changed is that
- * this is now a deliberate, single-line, greppable act at the ONE call site that can perform it,
- * instead of an object shape that passes a guard by accident. The same residue applies to the three
- * function members (`sendEmail: (m) => realMailer(m)` wraps rather than names), and it is filed as
- * o3d-dhhd rather than papered over.
  */
 declare const EMAIL_OUTBOX_HARNESS_CLIENT_BRAND: unique symbol
 
@@ -214,20 +241,25 @@ export type EmailOutboxHarnessClient = EmailOutboxClient & {
 }
 
 /**
- * WHERE A HARNESS CLIENT'S WRITES LAND. Two arms, because there are two legitimate kinds of harness
- * client and no third:
+ * THE MEMBER AN IN-MEMORY DELEGATE ANSWERS WITH ITS OWN STORE.
  *
- *   `in-memory` — delegates the caller implements over its own state. Nothing leaves the process.
- *
- * THERE IS NO `database` ARM ANY MORE (r24, Codex HIGH). It used to take a `LaneDatabaseAttestation`
- * and pair it with delegates the caller supplied — and NOTHING BOUND THE TWO. A valid throwaway-lane
- * attestation combined with PRODUCTION delegates passed every check, and the fake sender then
- * drained the real queue and stamped real rows SENT: the attested database was one nobody was
- * talking to. A database-backed harness client is now built by `createEmailOutboxLaneClient`, which
- * attests a connection string and then builds the delegates FROM THAT SAME STRING, so there is no
- * second object to swap and the wrong pairing is not a call anyone can write.
+ * A `Symbol`, so it cannot collide with a Prisma delegate member, cannot be spelled by accident,
+ * and has to be IMPORTED from here to be written at all. It is exported because a harness double
+ * is written in `tests/` and must implement it; it is not a secret and is not pretending to be one
+ * — its force is the ROUND TRIP the mint performs through it, not the difficulty of naming it.
  */
-export type EmailOutboxHarnessDestination = { kind: 'in-memory' }
+export const EMAIL_OUTBOX_IN_MEMORY_ROWS: unique symbol = Symbol('the delegate\'s own in-process row store')
+
+/** A delegate that keeps its rows in this process and will show them. */
+export type InMemoryEmailOutboxDelegate<D> = D & {
+  readonly [EMAIL_OUTBOX_IN_MEMORY_ROWS]: () => unknown[]
+}
+
+/** The two delegates of an in-memory harness client, each carrying its store. */
+export type InMemoryEmailOutboxDelegates = {
+  emailOutbox: InMemoryEmailOutboxDelegate<EmailOutboxClient['emailOutbox']>
+  emailSuppression: InMemoryEmailOutboxDelegate<EmailOutboxClient['emailSuppression']>
+}
 
 /**
  * THE MINT REGISTER. Module-private and a `WeakSet`, so membership is not a property of the object:
@@ -243,6 +275,182 @@ function refuseHarnessClientMint(detail: string): never {
   )
 }
 
+/**
+ * ONE DELEGATE'S PROOF THAT ITS ROWS LIVE HERE. Everything specific to a delegate is in these two
+ * descriptors, so the proof below is written once and neither copy can drift from the other.
+ */
+type InMemoryProof = {
+  readonly member: 'emailOutbox' | 'emailSuppression'
+  /** The row this mint puts into the store, and nothing else ever will: the id is fresh. */
+  sentinel(nonce: string): Record<string, unknown>
+  /** The delegate's OWN read path, asked for exactly that row. */
+  read(delegate: Record<string, unknown>, sentinel: Record<string, unknown>): Promise<unknown>
+  /** Does the answer name the sentinel? */
+  names(answer: unknown, nonce: string): boolean
+}
+
+const IN_MEMORY_PROOFS: readonly InMemoryProof[] = [
+  {
+    member: 'emailOutbox',
+    // PENDING and fully shaped, because a double is entitled to filter on status the way the real
+    // query does; a sentinel the delegate is entitled to hide would prove nothing either way.
+    sentinel: (nonce) => ({
+      id: nonce,
+      kind: 'HARNESS_MINT_PROBE',
+      toEmail: `${nonce}@probe.invalid`,
+      subject: 'harness mint probe',
+      html: '<p>harness mint probe</p>',
+      attachments: null,
+      referenceType: 'HarnessMintProbe',
+      referenceId: nonce,
+      status: 'PENDING',
+      attempts: 0,
+      availableAt: new Date(0),
+      processingStartedAt: null,
+      lockedBy: null,
+    }),
+    read: async (delegate, sentinel) => {
+      const findMany = delegate.findMany
+      if (typeof findMany !== 'function') return undefined
+      return await (findMany as (args: unknown) => Promise<unknown>).call(
+        delegate,
+        { where: { id: sentinel.id }, take: 1 },
+      )
+    },
+    names: (answer, nonce) => Array.isArray(answer)
+      && answer.some((row) => (row as Record<string, unknown> | null)?.id === nonce),
+  },
+  {
+    member: 'emailSuppression',
+    sentinel: (nonce) => ({ id: nonce, email: `${nonce}@probe.invalid`, reason: 'harness mint probe' }),
+    read: async (delegate, sentinel) => {
+      const findUnique = delegate.findUnique
+      if (typeof findUnique !== 'function') return undefined
+      return await (findUnique as (args: unknown) => Promise<unknown>).call(
+        delegate,
+        { where: { email: sentinel.email } },
+      )
+    },
+    names: (answer, nonce) => typeof answer === 'object' && answer !== null
+      && (answer as Record<string, unknown>).id === nonce,
+  },
+]
+
+/**
+ * PROVE ONE DELEGATE IS IN-MEMORY, OR REFUSE. Throws `refuseHarnessClientMint` on every path that
+ * is not a completed round trip — including a throw from the delegate itself, because a delegate
+ * that cannot answer a query about its own store has not demonstrated anything.
+ */
+async function proveDelegateIsInMemory(proof: InMemoryProof, delegate: Record<string, unknown>): Promise<void> {
+  // THE ONLY READ of the witness member.
+  const rowsOf = (delegate as unknown as Record<symbol, unknown>)[EMAIL_OUTBOX_IN_MEMORY_ROWS]
+  if (typeof rowsOf !== 'function') {
+    refuseHarnessClientMint(
+      `\`${proof.member}\` does not present an in-process row store: it carries no `
+      + '`[EMAIL_OUTBOX_IN_MEMORY_ROWS]` function. THIS IS THE CHECK THAT REFUSES '
+      + '`{ emailOutbox: db.emailOutbox, emailSuppression: db.emailSuppression }` (o3d-alnk r26, '
+      + 'Codex HIGH): a Prisma delegate has no store in this process to show, and the mint no '
+      + 'longer takes a caller\'s word — there is no `writesTo` field any more — for where its '
+      + 'writes land. A database-backed client comes from `createEmailOutboxLaneClient`',
+    )
+  }
+
+  const call = (): unknown => {
+    try {
+      return (rowsOf as () => unknown).call(delegate)
+    } catch (error) {
+      refuseHarnessClientMint(`\`${proof.member}[EMAIL_OUTBOX_IN_MEMORY_ROWS]()\` threw: ${String(error)}`)
+    }
+  }
+  const store = call()
+  if (!Array.isArray(store)) {
+    refuseHarnessClientMint(
+      `\`${proof.member}[EMAIL_OUTBOX_IN_MEMORY_ROWS]()\` returned ${store === null ? 'null' : typeof store}, `
+      + 'not the array its rows live in',
+    )
+  }
+  if (call() !== store) {
+    refuseHarnessClientMint(
+      `\`${proof.member}[EMAIL_OUTBOX_IN_MEMORY_ROWS]()\` returned a DIFFERENT array the second time. A `
+      + 'copy is not a store: the round trip below has to put a row where this delegate actually reads',
+    )
+  }
+
+  const nonce = `harness-mint-probe-${randomUUID()}`
+  const sentinel = proof.sentinel(nonce)
+  const lengthBefore = store.length
+  let pushed = false
+  let removed = false
+  try {
+    try {
+      store.push(sentinel)
+      pushed = true
+    } catch (error) {
+      refuseHarnessClientMint(
+        `\`${proof.member}\` reported a store this mint cannot write to (${String(error)}); a frozen or `
+        + 'sealed array cannot be shown to be the one the delegate reads',
+      )
+    }
+
+    let answer: unknown
+    try {
+      answer = await proof.read(delegate, sentinel)
+    } catch (error) {
+      refuseHarnessClientMint(
+        `\`${proof.member}\` threw when asked for the row this mint had just put into the store it `
+        + `reported: ${String(error)}`,
+      )
+    }
+    if (!proof.names(answer, nonce)) {
+      refuseHarnessClientMint(
+        `\`${proof.member}\` did not return the row this mint had just put into the store it reported. `
+        + 'THAT IS THE PROOF, AND IT FAILED: the sentinel exists only in this process, so a delegate '
+        + 'whose reads come from a database cannot produce it, and a delegate that reports an array it '
+        + 'does not read is not an in-memory delegate however it describes itself (o3d-alnk r26)',
+      )
+    }
+  } finally {
+    if (pushed) {
+      const at = store.lastIndexOf(sentinel)
+      if (at >= 0) {
+        store.splice(at, 1)
+        removed = true
+      }
+    }
+  }
+
+  // SAID ACCURATELY, NOT CONVENIENTLY. If the sentinel is not where this mint put it, the store was
+  // rebuilt underneath the probe and the checks below would be describing something else — so the
+  // refusal names THAT, rather than reporting "it is still there after removal" about a removal
+  // that never happened.
+  if (pushed && !removed) {
+    refuseHarnessClientMint(
+      `\`${proof.member}\` no longer holds the probe row this mint pushed into the store it reported, so `
+      + 'the store was replaced or rewritten during the round trip and this mint cannot put it back',
+    )
+  }
+
+  // THE PROBE LEAVES NOTHING BEHIND, and that is checked rather than assumed: a store that still
+  // names the sentinel would hand the drain a row this module invented.
+  let after: unknown
+  try {
+    after = await proof.read(delegate, sentinel)
+  } catch (error) {
+    refuseHarnessClientMint(`\`${proof.member}\` threw after the probe row was removed: ${String(error)}`)
+  }
+  if (proof.names(after, nonce)) {
+    refuseHarnessClientMint(
+      `\`${proof.member}\` still returns the probe row after it was removed from the store it reported, `
+      + 'so its reads do not follow that array and the round trip proved nothing',
+    )
+  }
+  if (store.length !== lengthBefore) {
+    refuseHarnessClientMint(
+      `\`${proof.member}\` reported a store of ${lengthBefore} rows and the probe left it at ${store.length}; `
+      + 'the mint refuses rather than hand back a client whose store it has disturbed',
+    )
+  }
+}
 
 /**
  * MINT A CLIENT THE DRAIN WILL ACCEPT.
@@ -251,22 +459,35 @@ function refuseHarnessClientMint(detail: string): never {
  * written that way (r7): what is validated is what is returned, so a getter has no second turn. The
  * object handed back is FRESH and FROZEN — the caller cannot swap a delegate on it afterwards — and
  * it is the object registered in the mint set, so a copy of it is not a minted client.
+ *
+ * ASYNC SINCE r26, because the proof is a round trip through the delegate's own read path and that
+ * path returns a promise. The cost is one `await` at each call site; the alternative is a
+ * synchronous check that can only read a field the caller filled in, which is exactly the defect.
  */
-export function createEmailOutboxHarnessClient(input: {
-  emailOutbox: EmailOutboxClient['emailOutbox']
-  emailSuppression: EmailOutboxClient['emailSuppression']
-  writesTo: EmailOutboxHarnessDestination
-}): EmailOutboxHarnessClient {
+export async function createEmailOutboxHarnessClient(
+  input: InMemoryEmailOutboxDelegates,
+): Promise<EmailOutboxHarnessClient> {
   const candidate: unknown = input
   if (candidate === null || typeof candidate !== 'object') {
     refuseHarnessClientMint(`expected an object; received ${candidate === null ? 'null' : typeof candidate}`)
   }
   const fields = candidate as Record<string, unknown>
 
-  // THE ONLY READ of each field.
+  // A STALE CALL FAILS LOUDLY. `writesTo` is gone (r26) and an ignored field would let a caller go
+  // on believing it had declared something; anything unknown here is refused by name.
+  const unknownKeys = Reflect.ownKeys(fields).filter((key) => key !== 'emailOutbox' && key !== 'emailSuppression')
+  if (unknownKeys.length > 0) {
+    refuseHarnessClientMint(
+      `unknown member(s) ${unknownKeys.map((key) => String(key)).join(', ')}. \`writesTo\` WAS REMOVED in `
+      + 'r26: it was a caller assertion, and a caller assertion is what let production delegates be '
+      + 'declared in-memory. A delegate now proves it is in-memory by showing the array its rows live '
+      + 'in and answering a query out of it',
+    )
+  }
+
+  // THE ONLY READ of each delegate.
   const emailOutbox = fields.emailOutbox
   const emailSuppression = fields.emailSuppression
-  const writesTo = fields.writesTo
 
   for (const [name, delegate] of [['emailOutbox', emailOutbox], ['emailSuppression', emailSuppression]] as const) {
     if (delegate === null || typeof delegate !== 'object') {
@@ -277,44 +498,12 @@ export function createEmailOutboxHarnessClient(input: {
     }
   }
 
-  if (writesTo === null || typeof writesTo !== 'object') {
-    refuseHarnessClientMint(
-      `\`writesTo\` is ${writesTo === null ? 'null' : typeof writesTo}; say where this client's writes `
-      + "land — `{ kind: 'in-memory' }` is the only arm this function mints; a client on a real "
-      + 'database comes from `createEmailOutboxLaneClient`',
-    )
-  }
-  const destination = writesTo as Record<string, unknown>
-  const kind = destination.kind // THE ONLY READ.
-  // THE `database` ARM IS GONE FROM THIS FUNCTION, AND THAT IS THE r24 FIX (Codex HIGH).
-  //
-  // It took a `LaneDatabaseAttestation` and checked that this run had minted it. That check was
-  // true and it established the WRONG THING: an attestation says a particular DATABASE carries this
-  // run's marker, and it said nothing whatever about the `emailOutbox` and `emailSuppression`
-  // delegates standing next to it in the same call. So a lane attestation could be paired with
-  // PRODUCTION delegates — a capability proving one subject, spent on another — and the drain then
-  // swept the real customer queue with a fake sender while the marker check was satisfied by a
-  // database nobody was talking to.
-  //
-  // Validating that pairing harder was never going to work, because the pairing itself is the
-  // defect. A database-backed client is therefore no longer something a caller ASSEMBLES: it comes
-  // from `createEmailOutboxLaneClient`, which attests a connection string and builds the delegates
-  // FROM THAT SAME STRING inside one call. There is no attestation object handed out, and no
-  // delegate parameter to put beside one.
-  if (kind === 'database') {
-    refuseHarnessClientMint(
-      "`writesTo` says `database`, and this function no longer mints that. It used to take an "
-      + 'attestation and whatever delegates were passed with it, and NOTHING bound the two: a lane '
-      + 'attestation next to production delegates passed, and the drain swept the real queue. Call '
-      + '`createEmailOutboxLaneClient({ url })` instead — it attests that connection string and '
-      + 'builds the client from the same string, so the capability and its subject cannot come '
-      + 'apart (o3d-alnk r24)',
-    )
-  }
-  if (kind !== 'in-memory') {
-    refuseHarnessClientMint(
-      `\`writesTo.kind\` must be 'in-memory'; received ${JSON.stringify(kind)}. A client on a real `
-      + 'database comes from `createEmailOutboxLaneClient`, not from here',
+  // THE PROOF, BEFORE ANYTHING IS REGISTERED. Both delegates or neither: a client with one proven
+  // delegate is the "mixture" this whole surface exists to forbid, one level down.
+  for (const proof of IN_MEMORY_PROOFS) {
+    await proveDelegateIsInMemory(
+      proof,
+      (proof.member === 'emailOutbox' ? emailOutbox : emailSuppression) as Record<string, unknown>,
     )
   }
 
@@ -329,48 +518,50 @@ export function createEmailOutboxHarnessClient(input: {
 }
 
 /**
- * A DATABASE-BACKED HARNESS CLIENT, WHOSE DELEGATES ARE BUILT FROM THE STRING THAT WAS ATTESTED.
+ * A DATABASE-BACKED HARNESS CLIENT, BUILT FROM THE ONE STRING IT IS GIVEN.
+ *
+ * `tests/concurrency` proves the claim fence against a REAL PostgreSQL — two workers, one row, the
+ * database's own concurrency — and that needs a real client. This is how it gets one.
  *
  * =========================================================================================
- * WHAT THIS MAKES IMPOSSIBLE (r24, Codex HIGH).
+ * WHAT THIS GUARANTEES, AND WHAT IT DOES NOT. Read both halves; the history of this function is a
+ * series of rounds in which the first half was written and the second was not.
  *
- * Round 22 replaced "recognise the production database by name" with "prove the lane database
- * positively", which was right and is not in question. What it did not do is BIND the proof to the
- * thing it permitted. `createEmailOutboxHarnessClient` took an attestation AND a pair of delegates
- * as two independent arguments and checked only the first, so:
+ * IT GUARANTEES THE PAIRING. There is ONE string, it is read ONCE, and the delegates handed back
+ * are those of a client built from THAT binding. There is no delegate parameter, so the shape r24
+ * found — a proof about database A standing next to delegates that write to database B — is not a
+ * call anyone can write here. That much is structural and it is cheap, and it is why this function
+ * still exists after the withdrawal below.
  *
- *   createEmailOutboxHarnessClient({
- *     emailOutbox: db.emailOutbox,            // PRODUCTION
- *     emailSuppression: db.emailSuppression,  // PRODUCTION
- *     writesTo: { kind: 'database', attestation: lane.attestation },  // A THROWAWAY LANE
- *   })
+ * IT DOES NOT PROVE WHICH DATABASE THAT STRING NAMES. The refusal below is a best-effort NEGATIVE
+ * check — the URL must not resolve to the database `DATABASE_URL` configures — and a negative check
+ * is a blacklist, with the weaknesses a blacklist has: a pooler can route two unequal names to one
+ * cluster, and a second cluster carrying a restored copy of production resolves to a name this
+ * function has never heard of. It fails CLOSED where it can (an unresolvable URL, an unset or
+ * unresolvable `DATABASE_URL`, and the configured name itself are all refused) and it claims
+ * nothing more.
  *
- * passed. Every check was satisfied by a database nobody was talking to, and the drain then claimed
- * twenty-five genuine customer emails, delivered nothing through the harness's fake sender, and
- * stamped them SENT. A capability that proves A and is spent on B is the defect this branch keeps
- * rediscovering, and the answer is not a better check — it is to remove the second argument.
+ * THE CALLER'S REAL GUARANTEE IS UPSTREAM, and it is not this function's to make: the only caller
+ * is `tests/helpers/throwaway-database.ts`, whose rule is that it hands out (and later drops) only
+ * a database THIS PROCESS WATCHED ITS OWN `CREATE` COMPLETE for. That rule (r10-r14) is where
+ * "this is not production" is actually established.
  *
- * SO THERE IS ONE STRING AND IT IS READ ONCE. This function attests `url` by round trip, and then
- * builds the Prisma client FROM THAT SAME LOCAL CONST. The delegates it mints are that client's.
- * There is no attestation object handed back for a caller to carry somewhere else, and no delegate
- * parameter to put beside one: the pairing is not expressible rather than rejected.
- *
- *   - pointed at a lane: the marker answers, the delegates are the lane's, the mint succeeds;
- *   - pointed at production: `attestLaneDatabase` refuses BEFORE any client is built, because
- *     production carries no marker — and no client is minted, so nothing reaches the queue.
- *
- * =========================================================================================
- * WHY THE CLIENT IS BUILT HERE AND NOT PASSED IN.
- *
- * A Prisma delegate does not know which database it writes to and has no stable identity to compare
- * against, so no check on a SUPPLIED delegate can establish where its writes land (that is the
- * o3d-dhhd residue, and it is why the previous shape could not be repaired in place). Building the
- * client is the only way to KNOW: the connection string that was attested is the connection string
- * the client is given, in the same expression, with nothing in between.
+ * WITHDRAWN IN r26, DELIBERATELY. Rounds 22-24 put a server-side attestation here: the lane
+ * database carried a marker written by this run, `attestLaneDatabase` read it back over the very
+ * URL the pool would use, and r24 made the attestation module issue the `CREATE DATABASE` itself so
+ * the capability rested on a fact PostgreSQL had confirmed rather than on a name a caller passed.
+ * Codex r25 found that (a) the attestation's connection closes before Prisma builds its pool, so
+ * attesting a URL does not bind the connections that follow, (b) a creation capability recorded
+ * only a name and a postmaster start time, so a database dropped and recreated under the same name
+ * on the same cluster still satisfied it — the name-versus-generation distinction this project's
+ * own throwaway-database work settled in ITS round 12 — and, decisively, (c) none of it mattered,
+ * because the in-memory arm above accepted production delegates on the caller's word and bypassed
+ * the whole edifice. The edifice was therefore removed rather than continued, and what it was
+ * reaching for is recorded in the withdrawal issue rather than half-built here.
  *
  * IT GOES THROUGH `pgConnectionConfig()` like every other pool in the process, so the lane inherits
  * the same `search_path` pin and startup-option verdict the application's own pool has. The string
- * it is given is the lane's, not `DATABASE_URL` — which this module reads nowhere.
+ * it is given is the lane's, not `DATABASE_URL` — which this module reads only to refuse it.
  *
  * NOTHING IN THE APPLICATION CALLS THIS. Its imports are dynamic so that the app's module graph is
  * unchanged by its presence, and its only callers are `tests/`.
@@ -378,7 +569,7 @@ export function createEmailOutboxHarnessClient(input: {
 export type EmailOutboxLaneClient = {
   /** The only client the drain will accept for this lane. */
   readonly client: EmailOutboxHarnessClient
-  /** The database the SERVER said answered, from the attestation round trip. */
+  /** The database node-postgres resolved the lane's URL to. */
   readonly database: string
   /** Release the pool this function opened. The lane must call it before dropping the database. */
   disconnect(): Promise<void>
@@ -387,9 +578,48 @@ export type EmailOutboxLaneClient = {
 function refuseLaneClientMint(detail: string): never {
   throw new Error(
     `createEmailOutboxLaneClient: ${detail}. This is the only way to obtain a harness client over a `
-    + 'real database, and it exists because the previous shape let a lane attestation be paired with '
+    + 'real database, and it exists because the previous shape let a destination be paired with '
     + 'delegates nobody had checked (o3d-alnk r24).',
   )
+}
+
+/**
+ * THE DATABASE A CLIENT BUILT ON THIS URL WOULD ACTUALLY CONNECT TO — ANSWERED BY THE DRIVER
+ * (r20, Codex HIGH).
+ *
+ * This used to read the URL's PATH and call a URL with no path "naming no database", which passed
+ * the comparison below. `postgresql://ims:pw@host` has no path AND IS NOT PATHLESS TO THE DRIVER:
+ * node-postgres defaults the database name to the USER when the URL omits it, so that URL connects
+ * to database `ims`. Spelling the live URL that way therefore reached the live queue through the
+ * very guard written to stop it. The same trapdoor is open for a trailing slash, for `PGDATABASE`
+ * and `PGUSER`, and for the OS user pg falls back to last — every one of them a field the TEXT of
+ * the URL does not contain.
+ *
+ * SO THE TEXT IS NOT READ AT ALL. `new Client({ connectionString })` builds the driver's own
+ * `ConnectionParameters` — the same object a real client would connect with, because it is the same
+ * constructor — and `client.database` is that resolution's answer. It costs no socket, no query and
+ * no DNS: a `pg.Client` is inert until `connect()`. Every equivalent spelling collapses into one
+ * answer BEFORE the comparison. AND ANYTHING IT CANNOT RESOLVE IS A REFUSAL, not a pass.
+ */
+type ResolvedDatabase = { readonly database: string } | { readonly unresolved: string }
+
+type PgClientConstructor = new (config: { connectionString: string }) => { database?: unknown }
+
+function effectiveDatabaseOf(PgClient: PgClientConstructor, url: string): ResolvedDatabase {
+  // An absent value is not a spelling of a destination. The driver would resolve `''` to the OS
+  // user's name, which is an answer to a question nobody asked.
+  if (url.trim() === '') return { unresolved: 'it is empty' }
+  let resolved: unknown
+  try {
+    // THE ONE READ, and it is the driver's. Nothing about `url` is parsed here.
+    resolved = new PgClient({ connectionString: url }).database
+  } catch (error) {
+    return { unresolved: `node-postgres could not read it as a connection string (${String(error)})` }
+  }
+  if (typeof resolved !== 'string' || resolved === '') {
+    return { unresolved: 'node-postgres resolved no database name from it' }
+  }
+  return { database: resolved }
 }
 
 export async function createEmailOutboxLaneClient(lane: { url: string }): Promise<EmailOutboxLaneClient> {
@@ -397,9 +627,9 @@ export async function createEmailOutboxLaneClient(lane: { url: string }): Promis
   if (candidate === null || typeof candidate !== 'object') {
     refuseLaneClientMint(`expected an object; received ${candidate === null ? 'null' : typeof candidate}`)
   }
-  // THE ONLY READ, and everything below uses THIS binding — the attestation and the client are
-  // built from one value, so a getter cannot show one destination to the proof and another to the
-  // pool (the r7 rule, applied to the one field that decides which queue is swept).
+  // THE ONLY READ, and everything below uses THIS binding — the check and the pool are built from
+  // one value, so a getter cannot show one destination to the check and another to the pool (the r7
+  // rule, applied to the one field that decides which queue is swept).
   const url = (candidate as Record<string, unknown>).url
   if (typeof url !== 'string' || url.trim() === '') {
     refuseLaneClientMint(
@@ -407,21 +637,53 @@ export async function createEmailOutboxLaneClient(lane: { url: string }): Promis
     )
   }
 
-  const { attestLaneDatabase, isLaneDatabaseAttestation: minted } = await import('@/lib/lane-database-attestation')
-  // REFUSES BEFORE ANYTHING IS BUILT. An unmarked database — production included — throws here, so
-  // no pool is opened to it and no client exists to reach it.
-  const attestation = await attestLaneDatabase(url)
-  if (!minted(attestation)) {
-    // Structural backstop: if a future edit made attesting return something it did not mint, the
-    // capability would stop being a capability and this says so instead of carrying on.
-    refuseLaneClientMint('the lane attestation was not minted by attestLaneDatabase')
-  }
-
-  const [{ PrismaClient }, { PrismaPg }, { pgConnectionConfig, prismaAdapterSchemaOptions }] = await Promise.all([
+  const [{ PrismaClient }, { PrismaPg }, { pgConnectionConfig, prismaAdapterSchemaOptions }, pg] = await Promise.all([
     import('@/app/generated/prisma/client'),
     import('@prisma/adapter-pg'),
     import('@/lib/db/database-url-schema.mjs'),
+    import('pg'),
   ])
+  const pgModule = pg as unknown as { Client?: unknown; default?: { Client?: unknown } }
+  const resolver = (pgModule.Client ?? pgModule.default?.Client) as PgClientConstructor | undefined
+  if (typeof resolver !== 'function') {
+    refuseLaneClientMint('node-postgres did not expose a `Client` constructor to resolve the destination with')
+  }
+
+  // THE BEST-EFFORT REFUSAL, AND IT FAILS CLOSED. Both sides are resolved the way the driver would
+  // connect them and compared by NAME alone — which refuses MORE than a host-and-port comparison
+  // would, since `localhost`, `127.0.0.1` and a second port onto the same cluster all resolve to
+  // the same name. What it cannot do is prove the remaining names are safe; see the comment above.
+  const destination = effectiveDatabaseOf(resolver, url)
+  if ('unresolved' in destination) {
+    refuseLaneClientMint(
+      `\`url\` cannot be resolved to the database a client would connect to: ${destination.unresolved}. `
+      + 'An unresolvable destination is REFUSED rather than passed, because a URL this module cannot '
+      + 'resolve is a URL it cannot hold up against the configured one. Spell the database out',
+    )
+  }
+  const configured = process.env.DATABASE_URL
+  if (configured === undefined || configured === '') {
+    refuseLaneClientMint(
+      'DATABASE_URL is not set, so there is no configured database to hold this lane up against, and '
+      + '"no comparison" must not read as "no match"',
+    )
+  }
+  const configuredDatabase = effectiveDatabaseOf(resolver, configured)
+  if ('unresolved' in configuredDatabase) {
+    refuseLaneClientMint(
+      `DATABASE_URL cannot be resolved to a database name: ${configuredDatabase.unresolved}. With nothing `
+      + 'to compare against, this function cannot establish that `url` is NOT the configured database',
+    )
+  }
+  if (configuredDatabase.database === destination.database) {
+    refuseLaneClientMint(
+      `\`url\` names ${destination.database}, which is the database DATABASE_URL configures. A harness `
+      + 'client on the configured database is not a harness: its writes land on the real queue, and the '
+      + 'fake sender that completes the harness stamps genuine customer email SENT with nothing '
+      + 'delivered. Provision a database for the lane (tests/helpers/throwaway-database.ts)',
+    )
+  }
+
   const prisma = new PrismaClient({
     adapter: new PrismaPg(pgConnectionConfig(url), prismaAdapterSchemaOptions(url)),
   })
@@ -436,7 +698,7 @@ export async function createEmailOutboxLaneClient(lane: { url: string }): Promis
 
   return Object.freeze({
     client: client as EmailOutboxHarnessClient,
-    database: attestation.database,
+    database: destination.database,
     disconnect: () => prisma.$disconnect(),
   })
 }
@@ -498,12 +760,20 @@ type EmailClaim = {
  * (`createEmailOutboxHarnessClient`, see there): the drain accepts a client if and only if this
  * module built it, so no shape has to be recognised and no wrapper can be enumerated past it.
  *
+ * ROUND 26 TAKES THE CLIENT OUT OF THE CALLER'S MOUTH TOO. Minting was not enough while the MINT
+ * itself decided on a `writesTo` field the caller filled in: `createEmailOutboxHarnessClient({
+ * emailOutbox: db.emailOutbox, emailSuppression: db.emailSuppression, writesTo: { kind:
+ * 'in-memory' } })` minted a registered client over the live queue. That field is gone, and an
+ * in-memory delegate now PROVES it is one — it shows the array its rows live in and answers a
+ * query about a row this module has just put there.
+ *
  * WHAT IT STILL CANNOT FORBID, STATED PLAINLY. A caller can write `sendEmail: realMailer` by
  * importing the real mailer and NAMING it, or hide it one call deep as `(m) => realMailer(m)`; and
- * a caller can mint a client over production delegates while declaring an in-memory destination.
- * No type and no runtime check stops a deliberate act of naming or wrapping a production value.
- * What is gone is the SILENT one — the missing field that quietly became production, and the
- * wrapper shape that passed an identity test. `resolveEmailOutboxDependencies` refuses the three
+ * a delegate purpose-built to serve reads from memory while sending its WRITES elsewhere would
+ * satisfy the mint's round trip. No type and no runtime check stops a deliberate act of naming or
+ * wrapping a production value. What is gone is the SILENT one — the missing field that quietly
+ * became production, the wrapper shape that passed an identity test, and the destination a caller
+ * simply asserted. `resolveEmailOutboxDependencies` refuses the three
  * function members by identity as a backstop; the rest is documented (o3d-dhhd), not enforced,
  * because pretending otherwise would be the same false comfort the option union gave for three
  * rounds.
@@ -928,8 +1198,9 @@ export function resolveEmailOutboxDependencies(options: ProcessEmailOutboxOption
           + 'to RECOGNISE the production client, because it cannot: a structural wrapper such as '
           + '`{ emailOutbox: db.emailOutbox, emailSuppression: db.emailSuppression }` is a different '
           + 'object that reaches the same rows, and enumerating wrapper shapes is a blacklist. It '
-          + 'accepts only a client minted by this module for a caller that declared where its writes '
-          + 'land, and production has no way to mint one',
+          + 'accepts only a client minted by this module — and since r26 the mint takes no word for '
+          + 'where the writes land: a delegate shows the in-process array its rows live in and '
+          + 'answers a query out of it, which production cannot do',
         )
       }
       // A minted client is FRESH, FROZEN and built from delegates this module read once, so the

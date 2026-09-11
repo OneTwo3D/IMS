@@ -113,8 +113,18 @@ async function mintClient(delegates: {
   emailSuppression: EmailOutboxClient['emailSuppression']
 }): Promise<EmailOutboxHarnessClient> {
   const { createEmailOutboxHarnessClient } = await loadOutbox()
-  return createEmailOutboxHarnessClient({ ...delegates, writesTo: { kind: 'in-memory' } })
+  return await createEmailOutboxHarnessClient(
+    delegates as unknown as Parameters<typeof createEmailOutboxHarnessClient>[0],
+  )
 }
+
+/**
+ * THE WITNESS EVERY MINTABLE DOUBLE IN THIS FILE CARRIES (r26). The mint no longer takes a
+ * `writesTo` field's word for where a client's writes land: it puts a row of its own into the
+ * array a delegate reports and asks the delegate to hand it back. A double that keeps its rows in
+ * this process can do that; `db.emailOutbox` cannot, which is the point.
+ */
+const witnessSymbol = async (): Promise<symbol> => (await loadOutbox()).EMAIL_OUTBOX_IN_MEMORY_ROWS
 
 /**
  * A TYPE-ONLY handle on the shipped function, for the negatives that must never be executed.
@@ -128,24 +138,69 @@ declare const processPendingEmailOutbox: typeof import('@/lib/email-outbox').pro
  */
 async function spyClient(): Promise<{ client: EmailOutboxHarnessClient; queries: string[] }> {
   const queries: string[] = []
+  const rows: Record<string, unknown>[] = []
+  const suppressions: Record<string, unknown>[] = []
   const record = (name: string) => async (): Promise<never> => {
     queries.push(name)
     throw new Error(`the guard did not fire: the drain issued ${name}`)
   }
+  const witness = await witnessSymbol()
+  // THE TWO READS THE MINT'S PROBE USES SERVE IT (r26) — a delegate that threw at the mint could
+  // never be minted at all, and this file needs minted clients to measure refusals with. Everything
+  // the DRAIN would issue still throws, and `queries` is cleared below so the probe's own reads are
+  // not mistaken for the drain's.
+  const client = await mintClient({
+    emailOutbox: {
+      async findMany(args: unknown) {
+        queries.push('emailOutbox.findMany')
+        const { where } = args as { where?: { id?: unknown } }
+        return rows.filter((row) => row.id === where?.id) as never
+      },
+      updateMany: record('emailOutbox.updateMany'),
+      create: record('emailOutbox.create'),
+      [witness]: () => rows,
+    },
+    emailSuppression: {
+      async findUnique(args: unknown) {
+        queries.push('emailSuppression.findUnique')
+        const { where } = args as { where?: { email?: unknown } }
+        return (suppressions.find((row) => row.email === where?.email) ?? null) as never
+      },
+      upsert: record('emailSuppression.upsert'),
+      [witness]: () => suppressions,
+    },
+  } as unknown as EmailOutboxClient)
+  queries.length = 0
+  return { queries, client }
+}
+
+/**
+ * DELEGATES THAT KEEP THEIR ROWS HERE AND WILL SHOW THEM — the shape the mint accepts (r26).
+ * Used by the tests below that need a mint to SUCCEED before they can measure anything else.
+ */
+async function mintableDelegates(): Promise<EmailOutboxClient> {
+  const rows: Record<string, unknown>[] = []
+  const suppressions: Record<string, unknown>[] = []
+  const witness = await witnessSymbol()
   return {
-    queries,
-    client: await mintClient({
-      emailOutbox: {
-        findMany: record('emailOutbox.findMany'),
-        updateMany: record('emailOutbox.updateMany'),
-        create: record('emailOutbox.create'),
+    emailOutbox: {
+      async findMany(args: unknown) {
+        const { where } = args as { where?: { id?: unknown } }
+        return rows.filter((row) => row.id === where?.id) as never
       },
-      emailSuppression: {
-        findUnique: record('emailSuppression.findUnique'),
-        upsert: record('emailSuppression.upsert'),
+      async updateMany() { return { count: 0 } },
+      async create() { return {} },
+      [witness]: () => rows,
+    },
+    emailSuppression: {
+      async findUnique(args: unknown) {
+        const { where } = args as { where?: { email?: unknown } }
+        return (suppressions.find((row) => row.email === where?.email) ?? null) as never
       },
-    } as unknown as EmailOutboxClient),
-  }
+      async upsert() { return {} },
+      [witness]: () => suppressions,
+    },
+  } as unknown as EmailOutboxClient
 }
 
 /** The same delegates, NOT minted: a structurally perfect client that was never admitted (r18). */
@@ -477,12 +532,17 @@ async function workingClient(rows: { id: string; status: string }[]): Promise<{
       lockedBy: null,
     }
   }
+  // THE SAME ROW OBJECTS, IN AN ARRAY (r26): `store` is what the assertions read by id, and this is
+  // what the delegate reads and what it hands the mint to prove its rows live in this process.
+  const rowList: Record<string, unknown>[] = Object.values(store)
+  const suppressions: Record<string, unknown>[] = []
+  const witness = await witnessSymbol()
   return {
     store,
     client: await mintClient({
       emailOutbox: {
         async findMany() {
-          return Object.values(store)
+          return rowList
             .filter((row) => row.status === 'PENDING')
             .map((row) => ({ ...row })) as never
         },
@@ -497,10 +557,15 @@ async function workingClient(rows: { id: string; status: string }[]): Promise<{
           return { count: 1 }
         },
         async create() { return {} },
+        [witness]: () => rowList,
       },
       emailSuppression: {
-        async findUnique() { return null },
+        async findUnique(args: unknown) {
+          const { where } = args as { where?: { email?: unknown } }
+          return (suppressions.find((row) => row.email === where?.email) ?? null) as never
+        },
         async upsert() { return {} },
+        [witness]: () => suppressions,
       },
     } as unknown as EmailOutboxClient),
   }
@@ -888,39 +953,113 @@ test('r18 NON-VACUITY: a MINTED client is accepted, and the drain runs to a SENT
   assert.equal(fixture.store['row-1'].status, 'SENT')
 })
 
-test('r24: this mint has no `database` arm at all, whatever is offered on it', async () => {
-  // WHY THE ARM IS GONE RATHER THAN STRICTER. Rounds 18-21 asked whether `writesTo.url` resolved to
-  // the same database NAME as `DATABASE_URL`; round 21 ended that (an unset `DATABASE_URL` SKIPPED
-  // the comparison, and a pooler routes two UNEQUAL names to one queue). Round 22 replaced the name
-  // with a `LaneDatabaseAttestation` — real, server-side proof — and round 24 found the defect one
-  // level up: the proof was about a DATABASE and the call also carried DELEGATES nobody had checked.
-  // A lane attestation beside `db.emailOutbox` passed, and the drain swept the live queue.
+test('r26 THE FINDING: production delegates are REFUSED, and no declaration can change that', async () => {
+  // CODEX r25 HIGH, BUILT. The mint used to take a `writesTo: { kind: 'in-memory' }` field and
+  // BELIEVE IT, so the call below — the real delegates, declared in-memory — produced a REGISTERED
+  // client the drain accepted, and the whole r22-r24 attestation edifice was bypassed without being
+  // touched. There is no such field any more: a delegate has to SHOW the array its rows live in and
+  // answer a query about a row the mint has just put there, which production cannot do.
   //
-  // A capability has to name what it authorises. So a database-backed client is not assembled from
-  // parts here at all: `createEmailOutboxLaneClient` attests a connection string and builds the
-  // delegates from that same string. The positive side of that needs a server to answer and lives in
-  // tests/lane-database-attestation.test.ts against a fake one; what belongs HERE is that this door
-  // no longer opens for any `database` destination whatsoever.
+  // `@/lib/db` is a tripwire Proxy in this file, so the delegates are modelled here by what the mint
+  // can see of a Prisma delegate: every method present, no store to show. The literal
+  // `db.emailOutbox` case is driven against the REAL client in
+  // tests/email-outbox-claim-fence.test.ts, where `@/lib/db` is not mocked.
   const { createEmailOutboxHarnessClient } = await loadOutbox()
-  const delegates = unmintedClient()
-  const mint = (attestation: unknown) => createEmailOutboxHarnessClient({
-    emailOutbox: delegates.emailOutbox,
-    emailSuppression: delegates.emailSuppression,
-    writesTo: { kind: 'database', attestation } as unknown as { kind: 'in-memory' },
-  })
+  const production = unmintedClient()
 
-  for (const [why, attestation] of [
-    ['the live URL, which is what this arm used to take', 'postgresql://ims:secret@127.0.0.1:5432/onetwo3d_ims_dev'],
-    ['a lane URL, which used to be enough', 'postgresql://ims:secret@127.0.0.1:5432/ims_throwaway_alnkfence_0123456789abcdef'],
-    ['an object with the right shape', { database: 'ims_throwaway_alnkfence_0123456789abcdef' }],
-    ['nothing at all', undefined],
-  ] as [string, unknown][]) {
-    assert.throws(
-      () => mint(attestation),
-      /`writesTo` says `database`, and this function no longer mints that/,
-      `the mint accepted ${why}`,
-    )
-  }
+  await assert.rejects(
+    () => createEmailOutboxHarnessClient(production as unknown as Parameters<typeof createEmailOutboxHarnessClient>[0]),
+    /does not present an in-process row store/,
+    'delegates with no store were minted',
+  )
+
+  // AND SAYING IT IS IN-MEMORY CHANGES NOTHING, because the word is not read: the field does not
+  // exist, and an unknown member is refused BY NAME so a stale caller cannot believe it declared
+  // something.
+  await assert.rejects(
+    () => createEmailOutboxHarnessClient({
+      ...production,
+      writesTo: { kind: 'in-memory' },
+    } as unknown as Parameters<typeof createEmailOutboxHarnessClient>[0]),
+    /unknown member\(s\) writesTo/,
+    'a `writesTo` declaration was accepted',
+  )
+})
+
+test('r26: a delegate that REPORTS a store it does not read is refused by the round trip', async () => {
+  // The second line of the fix, and the one that matters for a wrapper rather than a bare delegate.
+  // A caller can fabricate the witness member — it is exported, not secret — but the sentinel the
+  // mint pushes exists ONLY in this process, so a delegate whose reads come from anywhere else
+  // cannot hand it back. This double is exactly that: a real array is reported, and `findMany`
+  // answers out of a different one (which is what "it reads a database" looks like from here).
+  const { createEmailOutboxHarnessClient, EMAIL_OUTBOX_IN_MEMORY_ROWS } = await loadOutbox()
+  const reported: Record<string, unknown>[] = []
+  const elsewhere: Record<string, unknown>[] = []
+  const mintable = await mintableDelegates()
+
+  await assert.rejects(
+    () => createEmailOutboxHarnessClient({
+      emailOutbox: {
+        async findMany(args: unknown) {
+          const { where } = args as { where?: { id?: unknown } }
+          return elsewhere.filter((row) => row.id === where?.id) as never
+        },
+        async updateMany() { return { count: 0 } },
+        async create() { return {} },
+        [EMAIL_OUTBOX_IN_MEMORY_ROWS]: () => reported,
+      },
+      emailSuppression: mintable.emailSuppression,
+    } as unknown as Parameters<typeof createEmailOutboxHarnessClient>[0]),
+    /did not return the row this mint had just put into the store it reported/,
+    'a delegate that does not read the store it reported was minted',
+  )
+
+  // NON-VACUITY: the same shape, reading the array it reports, mints.
+  const honest = await createEmailOutboxHarnessClient(
+    mintable as unknown as Parameters<typeof createEmailOutboxHarnessClient>[0],
+  )
+  assert.equal(honest.emailOutbox, mintable.emailOutbox)
+})
+
+test('r26: a reported store must be THE store — a fresh copy each call is refused', async () => {
+  // A delegate that answers `[EMAIL_OUTBOX_IN_MEMORY_ROWS]` with a snapshot would let the mint push
+  // its sentinel into an array nobody reads, and the round trip would then be measuring nothing.
+  const { createEmailOutboxHarnessClient, EMAIL_OUTBOX_IN_MEMORY_ROWS } = await loadOutbox()
+  const rows: Record<string, unknown>[] = []
+  const mintable = await mintableDelegates()
+
+  await assert.rejects(
+    () => createEmailOutboxHarnessClient({
+      emailOutbox: {
+        async findMany(args: unknown) {
+          const { where } = args as { where?: { id?: unknown } }
+          return rows.filter((row) => row.id === where?.id) as never
+        },
+        async updateMany() { return { count: 0 } },
+        async create() { return {} },
+        [EMAIL_OUTBOX_IN_MEMORY_ROWS]: () => [...rows],
+      },
+      emailSuppression: mintable.emailSuppression,
+    } as unknown as Parameters<typeof createEmailOutboxHarnessClient>[0]),
+    /returned a DIFFERENT array the second time/,
+    'a snapshot was accepted as a store',
+  )
+})
+
+test('r26: the probe leaves the store exactly as it found it', async () => {
+  // The mint writes into a caller's array, which is only acceptable if it puts it back. A sentinel
+  // left behind would be a row the drain could claim and "send".
+  const { createEmailOutboxHarnessClient } = await loadOutbox()
+  const mintable = await mintableDelegates()
+  const { EMAIL_OUTBOX_IN_MEMORY_ROWS } = await loadOutbox()
+  const outboxStore = (mintable.emailOutbox as unknown as Record<symbol, () => unknown[]>)[EMAIL_OUTBOX_IN_MEMORY_ROWS]()
+  const suppressionStore = (mintable.emailSuppression as unknown as Record<symbol, () => unknown[]>)[EMAIL_OUTBOX_IN_MEMORY_ROWS]()
+  outboxStore.push({ id: 'pre-existing' })
+
+  await createEmailOutboxHarnessClient(mintable as unknown as Parameters<typeof createEmailOutboxHarnessClient>[0])
+
+  assert.deepEqual(outboxStore, [{ id: 'pre-existing' }], 'the probe left something behind in the outbox store')
+  assert.deepEqual(suppressionStore, [], 'the probe left something behind in the suppression store')
 })
 
 test('r24: the lane client refuses a destination that is not a string at all', async () => {
@@ -942,25 +1081,25 @@ test('r24: the lane client refuses a destination that is not a string at all', a
   }
 })
 
-test('r18: the mint refuses an incomplete or undeclared client', async () => {
+test('r18: the mint refuses an incomplete client, and r26 refuses one proven only in half', async () => {
   const { createEmailOutboxHarnessClient } = await loadOutbox()
-  const delegates = unmintedClient()
+  const mintable = await mintableDelegates()
 
-  assert.throws(
+  await assert.rejects(
     () => createEmailOutboxHarnessClient({
-      emailOutbox: delegates.emailOutbox,
-      emailSuppression: null as unknown as EmailOutboxClient['emailSuppression'],
-      writesTo: { kind: 'in-memory' },
-    }),
+      emailOutbox: mintable.emailOutbox,
+      emailSuppression: null,
+    } as unknown as Parameters<typeof createEmailOutboxHarnessClient>[0]),
     /`emailSuppression` is null/,
   )
-  assert.throws(
+  // BOTH DELEGATES OR NEITHER. A client proven in-memory on one side and taken on trust on the
+  // other is the production/harness mixture this surface exists to forbid, one level down.
+  await assert.rejects(
     () => createEmailOutboxHarnessClient({
-      emailOutbox: delegates.emailOutbox,
-      emailSuppression: delegates.emailSuppression,
-      writesTo: { kind: 'somewhere' } as unknown as { kind: 'in-memory' },
-    }),
-    /`writesTo\.kind` must be 'in-memory'/,
+      emailOutbox: mintable.emailOutbox,
+      emailSuppression: unmintedClient().emailSuppression,
+    } as unknown as Parameters<typeof createEmailOutboxHarnessClient>[0]),
+    /`emailSuppression` does not present an in-process row store/,
   )
 })
 
@@ -969,12 +1108,10 @@ test('r18: a minted client is FROZEN, so its delegates cannot be swapped after t
   // caller could hand over a fixture, pass the check, and then assign the production delegate onto
   // the very client the drain holds — the r7 time-of-check/time-of-use defect with an extra step.
   const { createEmailOutboxHarnessClient } = await loadOutbox()
-  const delegates = unmintedClient()
-  const minted = createEmailOutboxHarnessClient({
-    emailOutbox: delegates.emailOutbox,
-    emailSuppression: delegates.emailSuppression,
-    writesTo: { kind: 'in-memory' },
-  })
+  const delegates = await mintableDelegates()
+  const minted = await createEmailOutboxHarnessClient(
+    delegates as unknown as Parameters<typeof createEmailOutboxHarnessClient>[0],
+  )
 
   assert.throws(() => {
     'use strict'

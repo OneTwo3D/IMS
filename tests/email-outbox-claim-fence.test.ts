@@ -28,12 +28,14 @@ import test from 'node:test'
 import { fileURLToPath } from 'node:url'
 
 import {
+  EMAIL_OUTBOX_IN_MEMORY_ROWS,
   EMAIL_OUTBOX_UNDELIVERED_REFERENCE_INDEX,
   createEmailOutboxHarnessClient,
   isUndeliveredEmailCollision,
   processPendingEmailOutbox,
   queueEmail,
   type EmailOutboxClient,
+  type InMemoryEmailOutboxDelegates,
   type EmailOutboxHarness,
   type EmailOutboxHarnessClient,
   type EmailOutboxRow,
@@ -122,19 +124,26 @@ type MakeClientOptions = {
   throwOnFirstTerminalWrite?: () => void
 }
 
-function makeClient(rows: EmailOutboxRow[], options: MakeClientOptions = {}): {
+async function makeClient(rows: EmailOutboxRow[], options: MakeClientOptions = {}): Promise<{
   client: EmailOutboxHarnessClient
   rows: EmailOutboxRow[]
   updateManyCalls: UpdateManyCall[]
   created: Record<string, unknown>[]
-} {
+}> {
   const store = rows.map((row) => ({ ...row }))
+  /**
+   * THE SUPPRESSION ROWS, AS A STORE RATHER THAN A LOOKUP TABLE (r26). The mint proves a delegate
+   * is in-memory by putting a row into the array the delegate reports and asking the delegate for
+   * it, so both delegates have to READ an array this double can hand over.
+   */
+  const suppressionStore: Record<string, unknown>[] = Object.entries(options.suppressions ?? {})
+    .map(([email, suppression]) => ({ ...suppression, email }))
   const updateManyCalls: UpdateManyCall[] = []
   const created: Record<string, unknown>[] = []
   let terminalWriteFailed = false
   let suppressionUpsertFailed = false
 
-  const delegates: EmailOutboxClient = {
+  const delegates: InMemoryEmailOutboxDelegates = {
     emailOutbox: {
       async findMany(args: unknown) {
         const { where, orderBy, take } = args as { where: Where; orderBy?: unknown; take?: number }
@@ -166,11 +175,14 @@ function makeClient(rows: EmailOutboxRow[], options: MakeClientOptions = {}): {
         created.push(data)
         return data
       },
+      // THE WITNESS (r26). `store` IS where this delegate reads and writes; handing it over is what
+      // lets the mint prove that, instead of believing a `writesTo` field this file used to pass.
+      [EMAIL_OUTBOX_IN_MEMORY_ROWS]: () => store,
     },
     emailSuppression: {
       async findUnique(args: unknown) {
         const { where } = args as { where: { email: string } }
-        return options.suppressions?.[where.email] ?? null
+        return (suppressionStore.find((row) => row.email === where.email) ?? null) as never
       },
       async upsert() {
         if (options.throwOnFirstSuppressionUpsert && !suppressionUpsertFailed) {
@@ -180,23 +192,67 @@ function makeClient(rows: EmailOutboxRow[], options: MakeClientOptions = {}): {
         }
         return {}
       },
+      [EMAIL_OUTBOX_IN_MEMORY_ROWS]: () => suppressionStore,
     },
   }
 
   /**
-   * MINTED, NOT ASSEMBLED (r18). `harness.client` is the branded `EmailOutboxHarnessClient`, and the
-   * only expression that has that type is this call — an object literal does not compile there and
-   * is refused at runtime as well. The delegates are the same objects the double built, so a test
-   * that swaps one afterwards (the suppression race below) still reaches the drain.
+   * MINTED, NOT ASSEMBLED (r18), AND PROVEN RATHER THAN DECLARED (r26). `harness.client` is the
+   * branded `EmailOutboxHarnessClient`, and the only expression that has that type is this call —
+   * an object literal does not compile there and is refused at runtime as well. The mint now puts
+   * a row of its own into each store above and asks the delegate for it back, which is why this is
+   * awaited. The delegates are the same objects the double built, so a test that swaps one
+   * afterwards (the suppression race below) still reaches the drain.
    */
-  const client = createEmailOutboxHarnessClient({
+  const client = await createEmailOutboxHarnessClient({
     emailOutbox: delegates.emailOutbox,
     emailSuppression: delegates.emailSuppression,
-    writesTo: { kind: 'in-memory' },
   })
 
   return { client, rows: store, updateManyCalls, created }
 }
+
+/**
+ * r26 THE FINDING, DRIVEN AGAINST THE REAL CLIENT (Codex r25 HIGH).
+ *
+ * `@/lib/db` is NOT mocked in this file, so these are the genuine Prisma delegates — the exact pair
+ * the finding named. Until r26 this call minted: the mint read a `writesTo: { kind: 'in-memory' }`
+ * field, believed it, and handed back a REGISTERED client, so `processPendingEmailOutbox` would
+ * sweep the live queue with the harness's fake sender and stamp real customer email SENT. Three
+ * rounds of server-side attestation on the OTHER arm were bypassed by this one call, which never
+ * touched them.
+ *
+ * NO QUERY IS ISSUED HERE, by either arm: the refusal lands on a member a Prisma delegate does not
+ * have, before the mint asks the delegate anything.
+ */
+test('r26: the REAL production delegates cannot be minted, whatever the call declares', async () => {
+  const { db } = await import('@/lib/db')
+  const mint = createEmailOutboxHarnessClient as unknown as (input: unknown) => Promise<unknown>
+
+  await assert.rejects(
+    () => mint({ emailOutbox: db.emailOutbox, emailSuppression: db.emailSuppression }),
+    /`emailOutbox` does not present an in-process row store/,
+    'the production delegates were minted',
+  )
+
+  // THE CALL FROM THE FINDING, VERBATIM. The declaration is not merely disbelieved — there is no
+  // field to write, and an unknown member is refused by name so nobody can think they declared one.
+  await assert.rejects(
+    () => mint({
+      emailOutbox: db.emailOutbox,
+      emailSuppression: db.emailSuppression,
+      writesTo: { kind: 'in-memory' },
+    }),
+    /unknown member\(s\) writesTo/,
+    'a production client declared in-memory was minted',
+  )
+
+  // NON-VACUITY: the doubles this whole file drives are minted by the same function, so the rule
+  // refuses production rather than refusing everything.
+  const fixture = await makeClient([makeRow()])
+  assert.ok(fixture.client.emailOutbox, 'the in-memory double could not be minted either')
+})
+
 
 function makeRow(overrides: Partial<EmailOutboxRow> = {}): EmailOutboxRow {
   return {
@@ -253,7 +309,7 @@ type PauseWorld = {
  */
 async function runPauseInterleaving(options: MakeClientOptions): Promise<PauseWorld> {
   const deliveries: string[] = []
-  const { client, rows, updateManyCalls } = makeClient([makeRow()], options)
+  const { client, rows, updateManyCalls } = await makeClient([makeRow()], options)
   let reclaimHappened = false
 
   const workerA = await drain({
@@ -382,7 +438,7 @@ test('REAL: the fence refuses a writer whose TOKEN no longer matches, even when 
   // land. This is the state a future settlement that forgot to null `processingStartedAt` would
   // leave behind, and the reason the column exists rather than the timestamp being trusted as an
   // identity — a timestamp is not one.
-  const { client, rows, updateManyCalls } = makeClient([makeRow()])
+  const { client, rows, updateManyCalls } = await makeClient([makeRow()])
   const outcome = await drain({
     client, now: () => T0, prepareQueuedEmail: noPrepare, logActivity: noLog,
     async sendEmail() {
@@ -399,7 +455,7 @@ test('REAL: the fence refuses a writer whose TOKEN no longer matches, even when 
 
 test('REAL: the fence refuses a writer whose CLAIM INSTANT no longer matches, even when the token does', async () => {
   // The mirror image, making `processingStartedAt` independently load-bearing.
-  const { client, rows, updateManyCalls } = makeClient([makeRow()])
+  const { client, rows, updateManyCalls } = await makeClient([makeRow()])
   const outcome = await drain({
     client, now: () => T0, prepareQueuedEmail: noPrepare, logActivity: noLog,
     async sendEmail() {
@@ -423,7 +479,7 @@ test('REAL: the fence refuses a writer whose CLAIM INSTANT no longer matches, ev
 for (const settlePath of ['a successful send', 'a failed send', 'a thrown send'] as const) {
   test(`REAL: the fence refuses the terminal write of ${settlePath} too`, async () => {
     const deliveries: string[] = []
-    const { client, rows, updateManyCalls } = makeClient([makeRow()])
+    const { client, rows, updateManyCalls } = await makeClient([makeRow()])
     let reclaimHappened = false
 
     const workerA = await drain({
@@ -464,7 +520,7 @@ test('REAL: a worker that still holds its claim settles normally', async () => {
   // The fence must cost the uncontended path nothing, or the two arms above would be
   // indistinguishable from "terminal writes never work".
   const deliveries: string[] = []
-  const { client, rows } = makeClient([makeRow()])
+  const { client, rows } = await makeClient([makeRow()])
   const outcome = await drain({
     client,
     now: () => T0,
@@ -486,7 +542,7 @@ test('REAL: a worker that still holds its claim settles normally', async () => {
 test('REAL: each claim mints a distinct holder identity, so two runs of one cron are distinguishable', async () => {
   // The integration outbox's `lockedBy` is a per-DUTY constant ('xero-accounting-sync'), which
   // leaves `lockedAt` as the only discriminator. This queue's token is per CLAIM.
-  const { client, rows, updateManyCalls } = makeClient([makeRow()])
+  const { client, rows, updateManyCalls } = await makeClient([makeRow()])
   await drain({
     client, now: () => T0, prepareQueuedEmail: noPrepare, logActivity: noLog,
     async sendEmail() { return { success: false, error: 'retry me' } },
@@ -511,7 +567,7 @@ test('REAL: each claim mints a distinct holder identity, so two runs of one cron
 // ---------------------------------------------------------------------------
 
 test('the suppression write is fenced too, and no longer fires before the claim', async () => {
-  const { client, rows, updateManyCalls } = makeClient(
+  const { client, rows, updateManyCalls } = await makeClient(
     [makeRow()],
     { suppressions: { 'customer@example.test': { id: 'sup-1', reason: 'hard bounce' } } },
   )
@@ -537,7 +593,7 @@ test('the suppression write is fenced too, and no longer fires before the claim'
 test('a reclaimed worker cannot write a suppression FAILED over the winner', async () => {
   // Same shape as the pause proof, on the other terminal write: worker A claims, and the
   // suppression lookup is where it pauses.
-  const { client, rows } = makeClient(
+  const { client, rows } = await makeClient(
     [makeRow()],
     { suppressions: { 'customer@example.test': { id: 'sup-1', reason: 'hard bounce' } } },
   )
@@ -583,7 +639,7 @@ test('a reclaimed worker cannot write a suppression FAILED over the winner', asy
 test('r18: the two conflict counters are told apart by whether the SMTP socket was touched', async () => {
   // The mirror of the proof above, on the path that DID reach the sender. Same fence, same refusal,
   // different fact — and the counters have to disagree, or neither of them means anything.
-  const { client, rows } = makeClient([makeRow()])
+  const { client, rows } = await makeClient([makeRow()])
   let sends = 0
 
   const workerA = await drain({
@@ -606,7 +662,7 @@ test('r18: the two conflict counters are told apart by whether the SMTP socket w
 // ---------------------------------------------------------------------------
 
 test('queueEmail reports a duplicate undelivered row as already_queued rather than throwing', async () => {
-  const client = makeClient([]).client
+  const client = (await makeClient([])).client
   client.emailOutbox.create = async () => {
     throw adapterUniqueViolation(['kind', 'referenceType', 'referenceId'], {
       modelName: 'EmailOutbox',
@@ -624,7 +680,7 @@ test('queueEmail reports a duplicate undelivered row as already_queued rather th
 })
 
 test('queueEmail still succeeds, and normalises the recipient, when no duplicate exists', async () => {
-  const { client, created } = makeClient([])
+  const { client, created } = await makeClient([])
   assert.deepEqual(
     await queueEmail(
       { kind: 'INVOICE', to: '  Customer@Example.TEST ', subject: 's', html: 'h', referenceType: 'SalesOrder', referenceId: 'order-1' },
@@ -637,7 +693,7 @@ test('queueEmail still succeeds, and normalises the recipient, when no duplicate
 })
 
 test('queueEmail re-throws a unique violation that is not the undelivered-reference index', async () => {
-  const client = makeClient([]).client
+  const client = (await makeClient([])).client
   client.emailOutbox.create = async () => {
     throw adapterUniqueViolation(['id'], { modelName: 'EmailOutbox' })
   }
@@ -759,7 +815,7 @@ test('the migration changes NOTHING before its transaction begins (o3d-alnk r6)'
 // ---------------------------------------------------------------------------
 
 test('r20: a claim lost while PREPARING is not reported as a probable duplicate', async () => {
-  const { client, rows } = makeClient([makeRow()])
+  const { client, rows } = await makeClient([makeRow()])
   let sends = 0
 
   const workerA = await drain({
@@ -794,7 +850,7 @@ test('r20: a claim lost while DECODING ATTACHMENTS is not reported as a probable
   // The second statement inside the same `try`, and the second reader of the same rule. The row
   // carries an attachments value that is not an array, so the decode throws where the send would
   // otherwise have been called.
-  const { client, rows } = makeClient([
+  const { client, rows } = await makeClient([
     makeRow({ attachments: { notAnArray: true } as unknown as EmailOutboxRow['attachments'] }),
   ])
   let sends = 0
@@ -822,7 +878,7 @@ test('r20: a claim lost by a THROW OUT OF THE SENDER is still reported as a prob
   // NON-VACUITY for the two above: the same `catch`, entered from the other side. The worker really
   // was on the socket, so this one must still count as `conflicted` — if the fix had simply flipped
   // the catch to `false`, this fails.
-  const { client, rows } = makeClient([makeRow()])
+  const { client, rows } = await makeClient([makeRow()])
   let sends = 0
 
   const workerA = await drain({
@@ -927,7 +983,7 @@ test('r22: a POST-SEND SUPPRESSION WRITE that throws is not reported as a thrown
   // The sender RETURNED — with an invalid-recipient failure — and it was the `emailSuppression`
   // upsert that threw. Under the old phrase this row's conflict read "after a thrown send".
   let sends = 0
-  const { client, rows } = makeClient([makeRow()], {
+  const { client, rows } = await makeClient([makeRow()], {
     throwOnFirstSuppressionUpsert: () => {
       // Another worker takes the row in the same instant, so the catch's own settlement is refused
       // and `recordConflict` is reached at all.
@@ -967,7 +1023,7 @@ test('r22: a POST-SEND SUPPRESSION WRITE that throws is not reported as a thrown
 
 test('r22: a SETTLEMENT WRITE that throws after a DELIVERED email says so', async () => {
   let sends = 0
-  const { client, rows } = makeClient([makeRow()], {
+  const { client, rows } = await makeClient([makeRow()], {
     throwOnFirstTerminalWrite: () => {
       rows[0].lockedBy = 'another-worker'
     },
@@ -1002,7 +1058,7 @@ test('r22: a SETTLEMENT WRITE that throws after a FAILED send is a different inc
   // NON-VACUITY for the test above: the same statement, the same throw, a different answer from the
   // sender — so a phrase that ignored `delivered` would make these two indistinguishable.
   let sends = 0
-  const { client, rows } = makeClient([makeRow()], {
+  const { client, rows } = await makeClient([makeRow()], {
     throwOnFirstTerminalWrite: () => {
       rows[0].lockedBy = 'another-worker'
     },
@@ -1035,7 +1091,7 @@ test('r22: the two pre-existing arms keep their own phrases, so the enumeration 
   // Rounds 19 and 20 fixed these two. They are asserted HERE on the PHRASE — the earlier tests read
   // only the counters, which are identical whatever the phrase says — so a future `thrownPhase` that
   // answers one arm for all four fails rather than passes.
-  const beforeTheSend = makeClient([makeRow()])
+  const beforeTheSend = await makeClient([makeRow()])
   const before = await drainCapturingLog({
     client: beforeTheSend.client,
     now: () => T0,
@@ -1053,7 +1109,7 @@ test('r22: the two pre-existing arms keep their own phrases, so the enumeration 
   assert.match(beforeLine, /after a throw before the send/)
   assert.equal(before.result.conflictedWithoutSend, 1)
 
-  const outOfTheSender = makeClient([makeRow()])
+  const outOfTheSender = await makeClient([makeRow()])
   const thrown = await drainCapturingLog({
     client: outOfTheSender.client,
     now: () => T0,
@@ -1140,7 +1196,7 @@ test('r22: the SENTENCE around the phrase is true on the post-send arms too, not
     invalidRecipient?: boolean
     error?: string
   }>][]) {
-    const fixture = makeClient([makeRow()], {
+    const fixture = await makeClient([makeRow()], {
       throwOnFirstSuppressionUpsert: options.throwOnFirstSuppressionUpsert
         ? () => { fixture.rows[0].lockedBy = 'another-worker' }
         : undefined,
@@ -1180,7 +1236,7 @@ test('r22: the SENTENCE around the phrase is true on the post-send arms too, not
   // NON-VACUITY, BOTH WAYS. The clause is not simply absent everywhere: the genuinely-on-the-socket
   // path still reports a probable duplicate, and the no-send path still reports the opposite — so
   // this test cannot pass by the sentence having lost its meaning.
-  const thrownSend = makeClient([makeRow()])
+  const thrownSend = await makeClient([makeRow()])
   const thrown = await drainCapturingLog({
     client: thrownSend.client,
     now: () => T0,
@@ -1197,7 +1253,7 @@ test('r22: the SENTENCE around the phrase is true on the post-send arms too, not
   assert.match(thrownLine, /was reclaimed by another worker after this one had ENTERED the sender/)
   assert.match(thrownLine, /A duplicate delivery is likely/)
 
-  const beforeTheSend = makeClient([makeRow()])
+  const beforeTheSend = await makeClient([makeRow()])
   const before = await drainCapturingLog({
     client: beforeTheSend.client,
     now: () => T0,

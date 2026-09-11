@@ -988,43 +988,26 @@ function executableFiles(dir: string, found: string[] = []): string[] {
  *                             cannot read a row, let alone write one. It is discovered here because
  *                             its prose names `psql` while explaining which connection it has to
  *                             match. o3d-2sm1.5 r41.
- *   'lane-throwaway-marker' — builds its own `pg` client to MARK and then ATTEST a database that a
- *                             test run created moments earlier (o3d-alnk r22). It exists so
- *                             `createEmailOutboxHarnessClient` can require POSITIVE, server-side
- *                             proof that a harness destination is a throwaway rather than compare
- *                             its NAME with the configured one — a comparison round 21 showed can
- *                             never be made sound, since a pooler alias and an unset `DATABASE_URL`
- *                             both separate the name from the queue. Nothing in the application
- *                             imports it: its only shipped caller is
- *                             `tests/helpers/throwaway-database.ts`.
- *                             SINCE r24 IT ALSO ISSUES THE `CREATE DATABASE` ITSELF, and that is the
- *                             reason it can be trusted to write at all: the marker used to be
- *                             written on the strength of a `createdDatabaseName` STRING the caller
- *                             passed, which proved the DESTINATION'S NAME and not that the caller had
- *                             created it — so naming this database correctly wrote a marker into it.
- *                             The authority to mark is now the `LaneDatabaseCreation` minted when the
- *                             module watched its own CREATE complete, and PostgreSQL rejects a
- *                             `CREATE DATABASE` on a name that already exists (`42P04`), so no
- *                             argument names THIS database and comes back with authority over it.
- *                             The one remaining write is a `CREATE TABLE ims_lane_run_marker` plus a
- *                             row, in a database that did not exist a statement earlier, refused
- *                             unless `current_database()` and `pg_postmaster_start_time()` over that
- *                             very connection are the database and cluster the creation is about. It
- *                             touches no application table in any case, and attesting is SELECT-only,
- *                             asserted by tests/lane-database-attestation.test.ts.
  *   'lane-email-outbox-client'
- *                           — builds a Prisma client for ONE connection string, and only after
- *                             `lib/lane-database-attestation.ts` has attested that string by round
- *                             trip (o3d-alnk r24). It is discovered here because it constructs a
- *                             client; what it constructs it for is a TEST LANE's own database, and it
- *                             cannot be constructed for this one: an unmarked database — which the
- *                             configured database always is — is refused BEFORE any pool is opened.
- *                             It exists because the previous shape let a caller pair a lane
- *                             attestation with PRODUCTION delegates, so the delegates are now built
- *                             from the same string that was attested. No application code path calls
- *                             it (its imports are dynamic and its only callers are under tests/), it
- *                             writes only what `processPendingEmailOutbox` writes, and it holds no
- *                             plugin key.
+ *                           — builds a Prisma client for ONE connection string and hands its
+ *                             delegates to `processPendingEmailOutbox` as a harness client
+ *                             (o3d-alnk r24). It is discovered here because it constructs a client;
+ *                             what it constructs it for is a TEST LANE's own database. It exists
+ *                             because the previous shape let a caller pair a claim about the
+ *                             destination with PRODUCTION delegates, so the delegates are now built
+ *                             from the same string that was named, in one call, with no second
+ *                             argument to get wrong.
+ *                             WHAT KEEPS IT OFF THIS DATABASE IS TWO THINGS, and only the second is
+ *                             a guarantee (r26): it refuses a URL that resolves to the database
+ *                             `DATABASE_URL` configures, and — the real one — its only caller is
+ *                             `tests/helpers/throwaway-database.ts`, which hands out only a database
+ *                             this process watched its own CREATE complete for. Rounds 22-24 had a
+ *                             server-side attestation here instead; r25 showed it did not bind the
+ *                             pool that followed and was bypassable through the in-memory arm, and
+ *                             it was withdrawn.
+ *                             No application code path calls it (its imports are dynamic and its
+ *                             only callers are under tests/), it writes only what
+ *                             `processPendingEmailOutbox` writes, and it holds no plugin key.
  *   'seed'                  — a standalone client that WRITES this database, run from install.sh.
  *                             It takes no lock and cannot practically be made to (it runs before the
  *                             app is up); what keeps it safe is that it must not write a plugin key,
@@ -1047,7 +1030,6 @@ const DATABASE_EXECUTION_PATHS: Record<string,
   | 'deploy-connection-fence'
   | 'protocol-handshake-only'
   | 'compatibility-probe'
-  | 'lane-throwaway-marker'
   | 'lane-email-outbox-client'
   | 'seed'
 > = {
@@ -1165,12 +1147,6 @@ const DATABASE_EXECUTION_PATHS: Record<string,
   'lib/connectors/xero/payment-write-lock.ts': 'pinned-lock-session',
   'lib/domain/wms/dispatch-sweep-lock.ts': 'pinned-lock-session',
   'lib/ops/production-preflight.ts': 'pinned-lock-session',
-  // o3d-alnk r22. Discovered here because it builds its own `pg` client — deliberately, since the
-  // question it answers ("did THIS run create the database this connection string reaches?") can only
-  // be answered by the server over that connection. See the classification note above.
-  'lib/lane-database-attestation.ts': 'lane-throwaway-marker',
-  // o3d-alnk r24. Discovered here because it builds a Prisma client — deliberately, because that is
-  // the only way to KNOW where a harness client's delegates write. See the classification note above.
   'lib/email-outbox.ts': 'lane-email-outbox-client',
   'prisma/seed.ts': 'seed',
 }

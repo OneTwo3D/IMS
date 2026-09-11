@@ -326,13 +326,6 @@ import { randomBytes } from 'node:crypto'
 import { fileURLToPath } from 'node:url'
 import { promisify } from 'node:util'
 
-import {
-  attestLaneDatabase,
-  createLaneDatabase,
-  markLaneDatabase,
-  type LaneDatabaseCreation,
-} from '@/lib/lane-database-attestation'
-
 const execFileAsync = promisify(execFile)
 
 /** Resolved from this file, never from the caller's cwd. */
@@ -478,21 +471,6 @@ export type ThrowawayDatabase = {
   readonly url: string
   /** The database the configured `DATABASE_URL` names — never touched. */
   readonly configuredDatabase: string
-  /*
-   * THE HANDLE CARRIES NO ATTESTATION ANY MORE (o3d-alnk r24, Codex HIGH). This is a NOTE, not a
-   * member: there is no field here to document.
-   *
-   * It used to, and a lane passed it to `createEmailOutboxHarnessClient` alongside whatever
-   * delegates it liked — which is precisely the defect r24 closes: the attestation proved a DATABASE
-   * had this run's marker and authorised a pair of DELEGATES nobody had checked, so a lane
-   * attestation beside PRODUCTION delegates passed. A capability handed out as an object is a
-   * capability that can be carried somewhere else.
-   *
-   * A lane that wants a database-backed email-outbox client now calls
-   * `createEmailOutboxLaneClient({ url: lane.url })`, which attests that string and builds the
-   * client from the same string. This provision still marks and attests — below — so a lane that
-   * cannot be attested never returns a handle at all; what it no longer does is hand the proof out.
-   */
   /**
    * ISSUES AT MOST ONE `DROP DATABASE`, EVER. Re-runs the full name guard before issuing DDL, is a
    * no-op once the server has answered the DROP, and REFUSES BY NAME once one has been issued
@@ -809,17 +787,6 @@ export async function provisionThrowawayDatabase(options: ProvisionOptions): Pro
     releaseMintedName(name)
   }
 
-  /**
-   * THE CREATION THIS PROCESS WATCHED `lib/lane-database-attestation.ts` MAKE (r24, Codex HIGH).
-   *
-   * It is the authority to mark, and it is not something this file can construct: the attestation
-   * module issues the `CREATE DATABASE` itself, over its own connection, and mints this only on the
-   * server's yes. Round 22 passed a NAME to `markLaneDatabase` instead, and a name is a claim — a
-   * caller naming production correctly got this run's secret written into production and a valid
-   * capability over it afterwards.
-   */
-  let creation: LaneDatabaseCreation | null = null
-
   try {
     await withMaintenanceClient(maintenance, async (client) => {
       const existing = await client.query('SELECT 1 FROM pg_database WHERE datname = $1', [name])
@@ -843,43 +810,29 @@ export async function provisionThrowawayDatabase(options: ProvisionOptions): Pro
       // which licenses nothing: BOTH branches from here refuse, so this is not r10's "a read whose
       // answer permits a destructive statement" wearing new clothes.
       takeNameClaim()
-    })
-
-    // THE `CREATE DATABASE` IS NOT ISSUED HERE ANY MORE (r24). It is issued by
-    // `lib/lane-database-attestation.ts`, over a connection that module opened, because that is the
-    // module whose authority to WRITE A MARKER rests on having watched its own CREATE complete — and
-    // a module cannot rest on a fact it was merely told. The cost is one extra connection: the probe
-    // and the CREATE no longer share a session, which widens the gap this lane already answers with
-    // the `42P04` branch below.
-    //
-    // BEFORE the await, deliberately: from here until an answer arrives, "may exist" is the
-    // most this process can honestly claim, and it is the most it will ever claim.
-    outcome = 'answer-unknown'
-    const created = await createLaneDatabase({ maintenanceUrl: maintenance, name })
-    // The module's four shapes mapped onto this file's three. `created-but-failed` is the r9 case —
-    // the CREATE COMPLETED and the teardown after it did not — and it is `created` here, which is
-    // what licenses the drop in the catch below.
-    outcome = created.outcome === 'created' || created.outcome === 'created-but-failed'
-      ? 'created'
-      : created.outcome
-    if (created.outcome === 'created' || created.outcome === 'created-but-failed') {
-      creation = created.creation
-    }
-    if (created.outcome !== 'created') {
-      if (isDuplicateDatabaseError(created.error)) {
-        // The answer arrived and it was somebody else's name. Step BACK to not-created so this
-        // is re-thrown unchanged: the same refusal the probe makes, arriving one statement later
-        // because somebody else took the name in between.
-        outcome = 'not-created'
-        throw new ThrowawayDatabaseError(
-          `refused ${name}: the CREATE was REJECTED with SQLSTATE ${DUPLICATE_DATABASE_SQLSTATE} `
-          + '(duplicate_database), which is positive proof another provisioner created that database '
-          + "between this lane's existence probe and its CREATE. NOTHING WAS DROPPED: the database "
-          + 'of that name belongs to whoever won the race, and this lane never owned it',
-        )
+      // BEFORE the await, deliberately: from here until an answer arrives, "may exist" is the
+      // most this process can honestly claim, and it is the most it will ever claim.
+      outcome = 'answer-unknown'
+      try {
+        await client.query(`CREATE DATABASE ${quoteIdentifier(name)}`)
+      } catch (createError) {
+        if (isDuplicateDatabaseError(createError)) {
+          // The answer arrived and it was somebody else's name. Step BACK to not-created so this
+          // is re-thrown unchanged: the same refusal the probe makes, arriving one statement later
+          // because somebody else took the name in between.
+          outcome = 'not-created'
+          throw new ThrowawayDatabaseError(
+            `refused ${name}: the CREATE was REJECTED with SQLSTATE ${DUPLICATE_DATABASE_SQLSTATE} `
+            + '(duplicate_database), which is positive proof another provisioner created that database '
+            + "between this lane's existence probe and its CREATE. NOTHING WAS DROPPED: the database "
+            + 'of that name belongs to whoever won the race, and this lane never owned it',
+          )
+        }
+        throw createError
       }
-      throw created.error
-    }
+      // The server answered, and the answer was yes.
+      outcome = 'created'
+    })
   } catch (error) {
     if (outcome === 'created') {
       // THE ONLY DROP ON A FAILED PROVISION, AND IT ASKS NOTHING. The server said yes; what failed
@@ -971,51 +924,6 @@ export async function provisionThrowawayDatabase(options: ProvisionOptions): Pro
         : `could not migrate ${name}, so the lane has no database to run against: ${String(error)}. `
           + `The DROP that would have cleaned it up ALSO FAILED (${String(dropFailure)}), so ${name} `
           + 'IS LEFT ON THE SERVER and has to be dropped by hand',
-    )
-  }
-
-  /**
-   * MARK IT, THEN ASK IT (o3d-alnk r22). BOTH, AND IN THIS ORDER, AND BOTH DOWNSTREAM OF A CREATE
-   * THIS PROCESS WATCHED COMPLETE.
-   *
-   * `markLaneDatabase` writes this run's secret into the database — a WRITE, and therefore licensed
-   * by exactly the rule every other write in this module is: the server's own answer that THIS
-   * process created it. Since r24 that licence is not a string this file passes but the
-   * `LaneDatabaseCreation` the attestation module minted when IT saw its own CREATE complete, and
-   * the mark is refused unless `current_database()` and `pg_postmaster_start_time()` over the lane's
-   * connection are the database and the cluster that creation is about.
-   *
-   * `attestLaneDatabase` then CONNECTS AGAIN WITH `laneUrl` — the very string the lane's Prisma
-   * client will use — and reads the marker back. That second round trip is not ceremony: it is the
-   * one that ties the attestation to the ROUTE the harness client takes, rather than to the route
-   * this function happened to take a moment earlier.
-   *
-   * A failure in either is treated exactly as a migration failure: the lane has no usable database,
-   * so the database this process created is dropped and the refusal names it.
-   */
-  try {
-    if (creation === null) {
-      throw new ThrowawayDatabaseError(
-        'the provision reached the marking step with no creation from lib/lane-database-attestation.ts, '
-        + 'so nothing here has watched a CREATE DATABASE complete and nothing may be marked',
-      )
-    }
-    await markLaneDatabase(creation, laneUrl.toString())
-    await attestLaneDatabase(laneUrl.toString())
-  } catch (error) {
-    let dropFailure: unknown = null
-    try {
-      await dropDatabase()
-    } catch (dropError) {
-      dropFailure = dropError
-    }
-    throw new ThrowawayDatabaseError(
-      dropFailure === null
-        ? `could not attest ${name} as a database this run created: ${String(error)}. The database this `
-          + 'lane created was dropped; nothing was left behind'
-        : `could not attest ${name} as a database this run created: ${String(error)}. The DROP that would `
-          + `have cleaned it up ALSO FAILED (${String(dropFailure)}), so ${name} IS LEFT ON THE SERVER `
-          + 'and has to be dropped by hand',
     )
   }
 

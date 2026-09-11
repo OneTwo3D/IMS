@@ -106,23 +106,24 @@ const drainWith = (
 ) => run({ harness })
 
 /**
- * THE LANE'S HARNESS CLIENT, BUILT BY THE MODULE THAT ATTESTED THE DESTINATION (r18; the
- * destination re-founded in r22; the CAPABILITY BOUND TO ITS SUBJECT in r24).
+ * THE LANE'S HARNESS CLIENT, BUILT BY THE MODULE FROM THE ONE STRING IT WAS GIVEN (r18, r24).
  *
  * `harness.client` is a branded type: `lane.db as unknown as EmailOutboxClient` does not compile
  * there and would be refused at runtime as an unminted client.
  *
- * WHAT THIS FILE NO LONGER DOES IS ASSEMBLE ONE. Until r24 it passed `lane.db`'s delegates and
- * `lane.database.attestation` as two independent arguments, and the mint checked only the second —
- * so a lane attestation beside PRODUCTION delegates passed just as readily, and the drain (a SWEEP
- * over the globally oldest queued customer emails) would have stamped real rows SENT with nothing
- * delivered. `createEmailOutboxLaneClient` takes ONE string, attests it by round trip, and builds
- * the Prisma client from that same string: the proof and the delegates are made together, and this
- * file has no opportunity to put the wrong two beside each other.
+ * WHAT THIS FILE NO LONGER DOES IS ASSEMBLE ONE. Until r24 it passed `lane.db`'s delegates and a
+ * separate claim about the destination as two independent arguments, and the mint checked only the
+ * second — so a claim about the LANE standing beside PRODUCTION delegates passed just as readily,
+ * and the drain (a SWEEP over the globally oldest queued customer emails) would have stamped real
+ * rows SENT with nothing delivered. `createEmailOutboxLaneClient` takes ONE string and builds the
+ * Prisma client from it, so the delegates cannot belong to a database other than the one named.
  *
- * The accident this whole file could have caused — a real client drained by a fake sender against
- * the LIVE-SERVED dev database — is refused because the dev database carries no marker, not because
- * its name was recognised.
+ * WHAT PROTECTS THIS FILE FROM THE LIVE-SERVED DEV DATABASE IS NOT IN THAT FUNCTION (r26). Its own
+ * check is a best-effort refusal of a URL resolving to `DATABASE_URL`'s database; the guarantee is
+ * upstream, in `provisionThrowawayDatabase`, which hands out only a database THIS PROCESS WATCHED
+ * ITS OWN `CREATE` COMPLETE for. Rounds 22-24 tried to make the harness client prove that for
+ * itself with a server-side attestation; r25 showed the proof did not bind the pool that followed
+ * and, decisively, that the in-memory arm bypassed it entirely, so it was withdrawn.
  */
 function laneHarnessClient(lane: Lane): EmailOutboxHarnessClient {
   return lane.outbox.client
@@ -255,10 +256,10 @@ async function openLane(options: OpenLaneOptions = {}): Promise<Lane> {
     sql = new pg.Client({ connectionString: database.url }) as unknown as PgClient
     await sql.connect()
 
-    // THE DRAIN'S CLIENT IS NOT BUILT HERE (r24). `createEmailOutboxLaneClient` attests this
-    // string — the database has to answer with the marker this run wrote into it — and then builds
-    // its own pool from the same string. Pointed at the configured dev database it would refuse
-    // before opening anything, so this line cannot become the accident this file exists to prevent.
+    // THE DRAIN'S CLIENT IS NOT BUILT HERE (r24). `createEmailOutboxLaneClient` takes this string
+    // and builds its own pool from it, so there is no way to hand the drain delegates belonging to
+    // one database while naming another. Pointed at the configured dev database it refuses before
+    // opening anything; that `database.url` is a throwaway at all is the provisioner's rule (r26).
     const { createEmailOutboxLaneClient } = await import('@/lib/email-outbox')
     outbox = await createEmailOutboxLaneClient({ url: database.url })
   } catch (error) {
