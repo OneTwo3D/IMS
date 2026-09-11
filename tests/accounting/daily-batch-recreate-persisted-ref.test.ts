@@ -166,9 +166,12 @@ async function runXeroSweep(): Promise<string[]> {
   return recreateMissingDailyBatchLogs(XERO_SETTINGS, 'GBP')
 }
 
-async function runQboSweep() {
+async function runQboSweep(): Promise<string[]> {
   const { recreateMissingDailyBatchLogs } = await import('@/lib/connectors/quickbooks/daily-sync')
-  await recreateMissingDailyBatchLogs(QBO_SETTINGS, 'GBP')
+  // o3d-i0o6 r4: this sweep now RETURNS its refusals too, as the Xero twin already did, and the run
+  // pushes them onto `result.errors`. A test that threw the return value away could not tell a
+  // refused batch from a skipped one.
+  return recreateMissingDailyBatchLogs(QBO_SETTINGS, 'GBP')
 }
 
 function reset() {
@@ -188,6 +191,33 @@ const QBO_A1_REF = 'A1-2026-07-20'
 const QBO_A2_REF = 'A2-2026-07-20'
 const QBO_B_REF = 'B-2026-07-20'
 
+/**
+ * o3d-i0o6 r4 — THE PASS HISTORY THE REAL A2 WRITER LEAVES BESIDE THE STAMP.
+ *
+ * `buildAllocationDebitOrderUpdate` appends one entry per pass, each naming the batch reference that
+ * pass ran under, in the SAME statement that accumulates `allocationBatchAmount`. The recreate sweep
+ * now asks that history how much of the cumulative figure THIS batch carried, so a fixture that
+ * carries an amount and no history is not a row either writer can produce — it is a pre-column row,
+ * and those have their own tests below.
+ */
+function a2Passes(
+  ...entries: Array<{ amount: number; batchRef: string | null; syncLogId?: string | null }>
+): Array<Record<string, unknown>> {
+  return entries.map((entry, index) => ({
+    amount: entry.amount.toFixed(4),
+    syncLogId: entry.syncLogId === undefined ? `a2-log-${index + 1}` : entry.syncLogId,
+    connector: 'xero',
+    accountCode: '631',
+    batchRef: entry.batchRef,
+    at: '2026-07-20T09:00:00.000Z',
+  }))
+}
+
+/** The ordinary single-pass row: one pass, all of the amount, under this batch's own reference. */
+function onePass(batchRef: string, amount: number): Array<Record<string, unknown>> {
+  return a2Passes({ amount, batchRef })
+}
+
 // ---------------------------------------------------------------------------
 // Xero
 // ---------------------------------------------------------------------------
@@ -195,7 +225,7 @@ const QBO_B_REF = 'B-2026-07-20'
 test('Xero: a midnight-crossing A1/A2/B row whose log is live under the PERSISTED ref is NOT recreated (o3d-0qoo)', async () => {
   reset()
   salesOrderRows.a1 = [{ revenueDeferredDate: STAMP_NEXT_DAY, revenueDeferredBatchRef: XERO_A1_REF, unearnedRevenueAmount: 120 }]
-  salesOrderRows.a2 = [{ inventoryAllocatedDate: STAMP_NEXT_DAY, inventoryAllocatedBatchRef: XERO_A2_REF, allocationBatchAmount: 80 }]
+  salesOrderRows.a2 = [{ inventoryAllocatedDate: STAMP_NEXT_DAY, inventoryAllocatedBatchRef: XERO_A2_REF, allocationBatchAmount: 80, allocationBatchPasses: onePass(XERO_A2_REF, 80) }]
   shipmentRows = [{ id: 'ship-1', shipmentJournalDate: STAMP_NEXT_DAY, shipmentJournalBatchRef: XERO_B_REF, revenueRecognizedAmount: 60, cogsBatchAmount: 40 }]
   // The batches ARE in the ledger — under their own 2026-07-20 identity, not the stamp's.
   syncLogs = [
@@ -237,15 +267,46 @@ test('Xero: a recreated Group B journal dates its DISPATCH subledger row from th
     'the subledger row must not land a day after the GL journal it belongs to')
 })
 
-test('Xero: a legacy row with no persisted ref behaves exactly as before (o3d-0qoo)', async () => {
+test('Xero: a legacy A1 row with no persisted ref still derives its identity from the stamp (o3d-0qoo)', async () => {
   reset()
-  salesOrderRows.a2 = [{ inventoryAllocatedDate: STAMP_NEXT_DAY, inventoryAllocatedBatchRef: null, allocationBatchAmount: 80 }]
+  // A1 carries `unearnedRevenueAmount`, which is ONE batch's figure and not a running total, so the
+  // derive-from-stamp fallback is untouched for it. This test used to make the same assertion about
+  // an A2 row; see the test below for why that assertion was wrong.
+  salesOrderRows.a1 = [{ revenueDeferredDate: STAMP_NEXT_DAY, revenueDeferredBatchRef: null, unearnedRevenueAmount: 120 }]
 
   await runXeroSweep()
 
   assert.equal(created.length, 1)
-  assert.equal(created[0].referenceId, 'A2-2026-07-21', 'pre-migration rows still derive from the stamp')
+  assert.equal(created[0].referenceId, 'A1-2026-07-21', 'pre-migration rows still derive from the stamp')
   assert.equal(created[0].payload.date, '2026-07-21')
+})
+
+test('Xero: a legacy A2 row with a cumulative amount and no pass history is REFUSED, not rebuilt (o3d-i0o6 r4)', async () => {
+  // o3d-i0o6 r4 — AN EXISTING TEST THAT WAS PINNING THE DEFECT.
+  //
+  // This assertion used to read "a legacy row with no persisted ref behaves exactly as before",
+  // and it asserted that £80 of `allocationBatchAmount` becomes an £80 rebuilt A2 journal. The
+  // reasoning was wrong in one specific way: it treated `allocationBatchAmount` as this batch's
+  // figure. It is not, and has not been since o3d-0i5y r5 — it is the CUMULATIVE total of every A2
+  // pass the order has ever been through, and the accumulation predates the pass history that can
+  // divide it. So a legacy row whose £80 was actually £50 under one batch and £30 under another
+  // rebuilds a batch carrying pounds the other batch already posted, and nothing in the ledger ever
+  // takes them back out.
+  //
+  // The row is not rebuilt and is REPORTED instead, which is the same answer
+  // `proveAllocationDebitPosting` gives such a row on the credit side ('unattributed'). An
+  // understated ledger an operator has been told about is recoverable; a duplicated debit nobody is
+  // told about is not.
+  reset()
+  salesOrderRows.a2 = [{ id: 'so-legacy', orderNumber: 'SO-LEGACY', inventoryAllocatedDate: STAMP_NEXT_DAY, inventoryAllocatedBatchRef: null, allocationBatchAmount: 80 }]
+
+  const refusals = await runXeroSweep()
+
+  assert.deepEqual(created, [], 'a cumulative figure may not be rebuilt into one batch')
+  assert.equal(refusals.length, 1, 'and the operator has to be told, or the ledger is silently short')
+  assert.match(refusals[0], /DAILY_BATCH_INVENTORY_ALLOC not recreated/)
+  assert.match(refusals[0], /SO-LEGACY/, 'the refusal names the order a human has to go and check')
+  assert.match(refusals[0], /no pass history/)
 })
 
 test('Xero: a legacy row still sees a digest-suffixed live log for its derived date (scjz.37, o3d-0qoo)', async () => {
@@ -340,8 +401,8 @@ test('Xero: a SPLIT Group B batch recreates only the missing half, with only its
 test('Xero: a SPLIT A2 batch recreates only the missing half (o3d-0qoo r1)', async () => {
   reset()
   salesOrderRows.a2 = [
-    { inventoryAllocatedDate: new Date('2026-07-20T09:00:00.000Z'), inventoryAllocatedBatchRef: 'A2-2026-07-20-aaaaaaaa', allocationBatchAmount: 80 },
-    { inventoryAllocatedDate: new Date('2026-07-20T19:00:00.000Z'), inventoryAllocatedBatchRef: 'A2-2026-07-20-bbbbbbbb', allocationBatchAmount: 15 },
+    { inventoryAllocatedDate: new Date('2026-07-20T09:00:00.000Z'), inventoryAllocatedBatchRef: 'A2-2026-07-20-aaaaaaaa', allocationBatchAmount: 80, allocationBatchPasses: onePass('A2-2026-07-20-aaaaaaaa', 80) },
+    { inventoryAllocatedDate: new Date('2026-07-20T19:00:00.000Z'), inventoryAllocatedBatchRef: 'A2-2026-07-20-bbbbbbbb', allocationBatchAmount: 15, allocationBatchPasses: onePass('A2-2026-07-20-bbbbbbbb', 15) },
   ]
   syncLogs = [{ connector: 'xero', type: 'DAILY_BATCH_INVENTORY_ALLOC', referenceId: 'A2-2026-07-20-aaaaaaaa', status: 'PENDING' }]
 
@@ -439,7 +500,7 @@ test('Xero: rows of one split batch stay one journal, and a second batch keeps i
 test('QuickBooks: a midnight-crossing A1/A2/B row whose log is live under the PERSISTED ref is NOT recreated (o3d-0qoo)', async () => {
   reset()
   salesOrderRows.a1 = [{ revenueDeferredDate: STAMP_NEXT_DAY, revenueDeferredBatchRef: QBO_A1_REF, unearnedRevenueAmount: 120 }]
-  salesOrderRows.a2 = [{ inventoryAllocatedDate: STAMP_NEXT_DAY, inventoryAllocatedBatchRef: QBO_A2_REF, allocationBatchAmount: 80 }]
+  salesOrderRows.a2 = [{ inventoryAllocatedDate: STAMP_NEXT_DAY, inventoryAllocatedBatchRef: QBO_A2_REF, allocationBatchAmount: 80, allocationBatchPasses: onePass(QBO_A2_REF, 80) }]
   shipmentRows = [{ shipmentJournalDate: STAMP_NEXT_DAY, shipmentJournalBatchRef: QBO_B_REF, revenueRecognizedAmount: 60, cogsBatchAmount: 40 }]
   syncLogs = [
     { connector: 'quickbooks', type: 'DAILY_BATCH_REVENUE_DEFERRAL', referenceId: QBO_A1_REF, status: 'SYNCED' },
@@ -454,7 +515,7 @@ test('QuickBooks: a midnight-crossing A1/A2/B row whose log is live under the PE
 
 test('QuickBooks: a genuinely missing log is recreated under the PERSISTED ref, dated from it (o3d-0qoo)', async () => {
   reset()
-  salesOrderRows.a2 = [{ inventoryAllocatedDate: STAMP_NEXT_DAY, inventoryAllocatedBatchRef: QBO_A2_REF, allocationBatchAmount: 80 }]
+  salesOrderRows.a2 = [{ inventoryAllocatedDate: STAMP_NEXT_DAY, inventoryAllocatedBatchRef: QBO_A2_REF, allocationBatchAmount: 80, allocationBatchPasses: onePass(QBO_A2_REF, 80) }]
   shipmentRows = [{ shipmentJournalDate: STAMP_NEXT_DAY, shipmentJournalBatchRef: QBO_B_REF, revenueRecognizedAmount: 60, cogsBatchAmount: 40 }]
 
   await runQboSweep()
@@ -548,7 +609,7 @@ test('QuickBooks: a missing Group B batch is not vouched for by the next day\'s 
 
 test('QuickBooks: a missing A2 batch is not vouched for by the next day\'s live one (o3d-0qoo r1)', async () => {
   reset()
-  salesOrderRows.a2 = [{ inventoryAllocatedDate: STAMP_NEXT_DAY, inventoryAllocatedBatchRef: QBO_A2_REF, allocationBatchAmount: 80 }]
+  salesOrderRows.a2 = [{ inventoryAllocatedDate: STAMP_NEXT_DAY, inventoryAllocatedBatchRef: QBO_A2_REF, allocationBatchAmount: 80, allocationBatchPasses: onePass(QBO_A2_REF, 80) }]
   syncLogs = [{ connector: 'quickbooks', type: 'DAILY_BATCH_INVENTORY_ALLOC', referenceId: 'A2-2026-07-21', status: 'SYNCED' }]
 
   await runQboSweep()
@@ -637,6 +698,7 @@ test('o3d-o97 r3: a FULLY REFUNDED order never has its A2 journal recreated, on 
       inventoryAllocatedDate: STAMP_NEXT_DAY,
       inventoryAllocatedBatchRef: ref,
       allocationBatchAmount: 80,
+      allocationBatchPasses: onePass(ref, 80),
       refundStatus: 'FULL',
     }]
     syncLogs = [{ connector: label, type: 'DAILY_BATCH_INVENTORY_ALLOC', referenceId: ref, status: 'CANCELLED', abandonedBeforeRemoteCall: true }]
@@ -653,6 +715,7 @@ test('o3d-o97 r3: a FULLY REFUNDED order never has its A2 journal recreated, on 
     inventoryAllocatedDate: STAMP_NEXT_DAY,
     inventoryAllocatedBatchRef: XERO_A2_REF,
     allocationBatchAmount: 80,
+    allocationBatchPasses: onePass(XERO_A2_REF, 80),
     refundStatus: 'PARTIAL',
   }]
   syncLogs = [{ connector: 'xero', type: 'DAILY_BATCH_INVENTORY_ALLOC', referenceId: XERO_A2_REF, status: 'CANCELLED', abandonedBeforeRemoteCall: true }]
@@ -686,7 +749,7 @@ test('o3d-o97 r3: a FULLY REFUNDED order never has its A2 journal recreated, on 
 
 test('Xero: a CANCELLED A2 log blocks the rebuild and is REPORTED, not silently skipped (o3d-o97 r6)', async () => {
   reset()
-  salesOrderRows.a2 = [{ inventoryAllocatedDate: STAMP_NEXT_DAY, inventoryAllocatedBatchRef: XERO_A2_REF, allocationBatchAmount: 80 }]
+  salesOrderRows.a2 = [{ inventoryAllocatedDate: STAMP_NEXT_DAY, inventoryAllocatedBatchRef: XERO_A2_REF, allocationBatchAmount: 80, allocationBatchPasses: onePass(XERO_A2_REF, 80) }]
   // Cancelled with NO record of why: the row does not say the remote call was never made, so it may
   // already be in the ledger.
   syncLogs = [{ connector: 'xero', type: 'DAILY_BATCH_INVENTORY_ALLOC', referenceId: XERO_A2_REF, status: 'CANCELLED', id: 'log-a2-J' }]
@@ -714,7 +777,7 @@ test('Xero: a CANCELLED Group B log blocks the rebuild AND its DISPATCH subledge
 
 test('Xero: a CANCELLED log the orphan sweep recorded as PRE-CALL is still rebuilt, for its own amount (o3d-o97 r6)', async () => {
   reset()
-  salesOrderRows.a2 = [{ inventoryAllocatedDate: STAMP_NEXT_DAY, inventoryAllocatedBatchRef: XERO_A2_REF, allocationBatchAmount: 80 }]
+  salesOrderRows.a2 = [{ inventoryAllocatedDate: STAMP_NEXT_DAY, inventoryAllocatedBatchRef: XERO_A2_REF, allocationBatchAmount: 80, allocationBatchPasses: onePass(XERO_A2_REF, 80) }]
   // `abandonedBeforeRemoteCall` is written ONLY by cancelOrphanedRowsUnderLock, whose predicate is
   // `status = 'PENDING'` — provably pre-call, nothing was sent. That is positive evidence, so the
   // journal genuinely is in no ledger and the batch may be raised.
@@ -731,7 +794,7 @@ test('Xero: a CANCELLED log the orphan sweep recorded as PRE-CALL is still rebui
 
 test('Xero: an external transaction id outranks a pre-call claim written over the top of it (o3d-o97 r6)', async () => {
   reset()
-  salesOrderRows.a2 = [{ inventoryAllocatedDate: STAMP_NEXT_DAY, inventoryAllocatedBatchRef: XERO_A2_REF, allocationBatchAmount: 80 }]
+  salesOrderRows.a2 = [{ inventoryAllocatedDate: STAMP_NEXT_DAY, inventoryAllocatedBatchRef: XERO_A2_REF, allocationBatchAmount: 80, allocationBatchPasses: onePass(XERO_A2_REF, 80) }]
   // The id exists only because the remote call RETURNED, so it is the ledger's own receipt. A row
   // that carries one and also claims to be pre-call is contradicting itself, and the receipt wins.
   syncLogs = [{
@@ -780,7 +843,7 @@ test('Xero: one cancelled split blocks only ITS half — the other half still re
 
 test('o3d-jit6 r2#2: a SYNCED row settled BY HAND blocks the rebuild and is REPORTED, not silently skipped', async () => {
   reset()
-  salesOrderRows.a2 = [{ inventoryAllocatedDate: STAMP_NEXT_DAY, inventoryAllocatedBatchRef: XERO_A2_REF, allocationBatchAmount: 80 }]
+  salesOrderRows.a2 = [{ inventoryAllocatedDate: STAMP_NEXT_DAY, inventoryAllocatedBatchRef: XERO_A2_REF, allocationBatchAmount: 80, allocationBatchPasses: onePass(XERO_A2_REF, 80) }]
   syncLogs = [{
     connector: 'xero',
     type: 'DAILY_BATCH_INVENTORY_ALLOC',
@@ -808,7 +871,7 @@ test('o3d-jit6 r2#2: a SYNCED row the CONNECTOR wrote is still a silent skip', a
   // start reporting itself every day — a report every run for a batch that is genuinely fine is how a
   // real refusal stops being read.
   reset()
-  salesOrderRows.a2 = [{ inventoryAllocatedDate: STAMP_NEXT_DAY, inventoryAllocatedBatchRef: XERO_A2_REF, allocationBatchAmount: 80 }]
+  salesOrderRows.a2 = [{ inventoryAllocatedDate: STAMP_NEXT_DAY, inventoryAllocatedBatchRef: XERO_A2_REF, allocationBatchAmount: 80, allocationBatchPasses: onePass(XERO_A2_REF, 80) }]
   syncLogs = [{
     connector: 'xero',
     type: 'DAILY_BATCH_INVENTORY_ALLOC',
@@ -854,4 +917,33 @@ test('o3d-jit6 r2#2: one asserted row among the live ones is enough to report th
   assert.equal(refusals.length, 1, 'exactly the doubtful half is reported')
   assert.match(refusals[0], /log-a1-bbbb/)
   assert.doesNotMatch(refusals[0], /log-a1-aaaa/, 'the confirmed split is not dragged into the report')
+})
+
+test('o3d-i0o6 r4: an A2 batch worth less than a PENNY is not rebuilt as a £0.00 journal', async () => {
+  // The recreate path rounds every figure it writes to 2dp, so a batch whose share is a fraction of
+  // a penny used to clear the `> 0` guard and queue a journal of £0.00 — a real row, posted to a
+  // real ledger, for nothing. The live writers guard on their own ROUNDED total (`> 0` on
+  // `totalAllocatedValueNumber`) and raise no log at all in that case, so the rebuild now asks the
+  // same question the same way.
+  //
+  // Reachable on QuickBooks in particular: its A2 pass rounds the per-order figure to 2dp only on
+  // the unshipped branch, so an order valued from shipment snapshots can contribute a sub-penny
+  // tail. Xero rounds unconditionally today; the guard is the same on both because the rule is.
+  for (const [label, ref, run] of [
+    ['xero', XERO_A2_REF, runXeroSweep],
+    ['quickbooks', QBO_A2_REF, runQboSweep],
+  ] as const) {
+    reset()
+    salesOrderRows.a2 = [{
+      inventoryAllocatedDate: STAMP_NEXT_DAY,
+      inventoryAllocatedBatchRef: ref,
+      allocationBatchAmount: 0.004,
+      allocationBatchPasses: onePass(ref, 0.004),
+    }]
+
+    const refusals = await run()
+
+    assert.deepEqual(created, [], `${label}: a batch worth £0.00 must raise no journal`)
+    assert.deepEqual(refusals, [], `${label}: and nothing is refused — the history answered clearly`)
+  }
 })

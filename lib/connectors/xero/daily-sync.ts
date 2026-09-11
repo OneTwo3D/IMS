@@ -55,7 +55,12 @@ import { GL_BASE_PRECISION, roundToGlPrecisionNumber } from '@/lib/domain/math/p
 import { buildInventoryReconciliationSweepJournal, loadInventoryGlReconciliation } from '@/lib/domain/accounting/inventory-gl-reconciliation'
 import { buildCogsReconciliationSweepJournal, loadCogsGlReconciliation } from '@/lib/domain/accounting/cogs-gl-reconciliation'
 import { buildTransitReconciliationSweepJournal, loadTransitGlReconciliation } from '@/lib/domain/accounting/transit-gl-reconciliation'
-import { buildAllocationDebitOrderUpdate } from '@/lib/domain/accounting/allocation-debit-passes'
+import {
+  allocationDebitRecreateRefusal,
+  allocationDebitShareOfBatch,
+  buildAllocationDebitOrderUpdate,
+  type A2RecreateSummary,
+} from '@/lib/domain/accounting/allocation-debit-passes'
 import { recordCogsSubledgerMovement } from '@/lib/domain/accounting/cogs-subledger-movement'
 import { recreateJournaledDateFilter } from '@/lib/domain/accounting/daily-batch-retention'
 import { isOperatorAssertedSettlement } from '@/lib/domain/accounting/sync-row-settlement'
@@ -798,7 +803,17 @@ export async function recreateMissingDailyBatchLogs(settings: Awaited<ReturnType
       // no longer reads as "no journal" and no longer licenses a rebuild on its own.)
       refundStatus: { not: 'FULL' },
     },
-    select: { inventoryAllocatedDate: true, inventoryAllocatedBatchRef: true, allocationBatchAmount: true },
+    select: {
+      id: true,
+      orderNumber: true,
+      inventoryAllocatedDate: true,
+      inventoryAllocatedBatchRef: true,
+      allocationBatchAmount: true,
+      // o3d-i0o6 r4: the pass history is what divides a CUMULATIVE debit between the batches that
+      // carried it. Without it this sweep can only read the running total, and a batch rebuilt from
+      // the running total re-posts every earlier batch's pounds (see allocationDebitShareOfBatch).
+      allocationBatchPasses: true,
+    },
   })
   const orphanBShipments = await db.shipment.findMany({
     where: { shipmentJournalDate: journaledDateFilter },
@@ -818,17 +833,27 @@ export async function recreateMissingDailyBatchLogs(settings: Awaited<ReturnType
     summary.total += Number(order.unearnedRevenueAmount ?? 0)
   }
 
-  const a2Batches = new Map<string, DailyBatchRecreateBucket<{ orderCount: number; total: number }>>()
+  const a2Batches = new Map<string, DailyBatchRecreateBucket<A2RecreateSummary>>()
   for (const order of orphanA2Orders) {
     const summary = foldDailyBatchRow(
       a2Batches,
       'A2',
       { stagedAt: order.inventoryAllocatedDate, persistedRef: order.inventoryAllocatedBatchRef },
-      () => ({ orderCount: 0, total: 0 }),
+      () => ({ orderCount: 0, total: 0, unattributed: [] as string[] }),
     )
     if (!summary) continue
     summary.orderCount += 1
-    summary.total += Number(order.allocationBatchAmount ?? 0)
+    // o3d-i0o6 r4 (Codex round 3, HIGH 1) — THIS BATCH'S SHARE, NEVER THE RUNNING TOTAL.
+    // `allocationBatchAmount` accumulates across every A2 pass the order has been through, so
+    // summing it into one batch rebuilds that batch carrying pounds an EARLIER batch already
+    // posted. The pass history is the only thing that can say which batch carried what, and where
+    // it cannot say, the batch is refused rather than rebuilt on a guess.
+    const share = allocationDebitShareOfBatch(order)
+    if (share.kind === 'unattributed') {
+      summary.unattributed.push(share.reason)
+      continue
+    }
+    summary.total += share.amount
   }
 
   const bBatches = new Map<string, DailyBatchRecreateBucket<{ shipmentCount: number; revenue: number; cogs: number; shipments: Array<{ id: string; cogs: number }> }>>()
@@ -877,12 +902,23 @@ export async function recreateMissingDailyBatchLogs(settings: Awaited<ReturnType
   }
 
   for (const { referenceId, date, summary, ...batch } of a2Batches.values()) {
-    if (summary.total <= 0) continue
+    // ROUNDED, like the live writer's own `totalAllocatedValueNumber > 0` guard: a batch whose total
+    // rounds to £0.00 raised no journal when it ran and must raise none now (o3d-i0o6 r4). The
+    // unattributed arm is still reached at zero, because a batch nothing can value is not a batch
+    // known to be worth nothing.
+    if (round2(summary.total) <= 0 && summary.unattributed.length === 0) continue
     const verdict = await dailyBatchRecreateVerdict('DAILY_BATCH_INVENTORY_ALLOC', dailyBatchLiveRefs(batch))
     if (verdict.blocked) {
       if (verdict.refusal) refusals.push(verdict.refusal)
       continue
     }
+    // The batch's log really is missing AND at least one of its orders cannot say what it put into
+    // it. Reported, not skipped: this is the outcome a human has to resolve.
+    if (summary.unattributed.length > 0) {
+      refusals.push(allocationDebitRecreateRefusal(referenceId, summary.unattributed))
+      continue
+    }
+    if (round2(summary.total) <= 0) continue
     await db.$transaction(async (tx) => {
       await createPendingSyncLog(tx, {
         type: 'DAILY_BATCH_INVENTORY_ALLOC',

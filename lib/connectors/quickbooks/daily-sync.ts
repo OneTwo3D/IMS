@@ -73,7 +73,12 @@ type AccountingMirrorClient = Pick<Prisma.TransactionClient, 'accountingSyncLog'
 
 import { QBO_DAILY_BATCH_LOCK_KEY } from '@/lib/db/advisory-locks'
 import { acquirePinnedAdvisoryLockOrNull } from '@/lib/db/pinned-advisory-lock'
-import { buildAllocationDebitOrderUpdate } from '@/lib/domain/accounting/allocation-debit-passes'
+import {
+  allocationDebitRecreateRefusal,
+  allocationDebitShareOfBatch,
+  buildAllocationDebitOrderUpdate,
+  type A2RecreateSummary,
+} from '@/lib/domain/accounting/allocation-debit-passes'
 const QBO_CONNECTOR = 'quickbooks'
 const DAILY_BATCH_TYPES = [
   'DAILY_BATCH_REVENUE_DEFERRAL',
@@ -327,8 +332,14 @@ async function hasLiveDailyBatchLog(type: DailyBatchLogType, refs: DailyBatchLiv
  * ledger. The persisted reference is the batch's real identity, so it is what the sweep
  * probes for, recreates under, and dates the journal from. Rows staged before that column
  * existed have no persisted ref and keep the old derived-key behaviour exactly.
+ *
+ * o3d-i0o6 r4: returns the A2 batches it REFUSED to rebuild, for the same reason the Xero twin
+ * already did — a batch nothing can value is a decision for a human, not a silent skip. This
+ * connector is being retired, but it still ships and it still posts to a real ledger, so the
+ * money-duplicating half of the fix is not left behind in it.
  */
-export async function recreateMissingDailyBatchLogs(settings: Awaited<ReturnType<typeof getQuickBooksSettings>>, baseCurrency: string): Promise<void> {
+export async function recreateMissingDailyBatchLogs(settings: Awaited<ReturnType<typeof getQuickBooksSettings>>, baseCurrency: string): Promise<string[]> {
+  const refusals: string[] = []
   // scjz.36: only recreate within the sync-log retention window — beyond it, SYNCED
   // daily-batch logs are pruned by data-retention, so a "missing" log can't be told
   // apart from one that already posted, and rebuilding would double-post the journal.
@@ -349,7 +360,16 @@ export async function recreateMissingDailyBatchLogs(settings: Awaited<ReturnType
       // resolve would have a fresh, permanently unrelievable debit posted under them.
       refundStatus: { not: 'FULL' },
     },
-    select: { inventoryAllocatedDate: true, inventoryAllocatedBatchRef: true, allocationBatchAmount: true },
+    select: {
+      id: true,
+      orderNumber: true,
+      inventoryAllocatedDate: true,
+      inventoryAllocatedBatchRef: true,
+      allocationBatchAmount: true,
+      // o3d-i0o6 r4: the pass history is what divides a CUMULATIVE debit between the batches that
+      // carried it — see allocationDebitShareOfBatch.
+      allocationBatchPasses: true,
+    },
   })
   const orphanBShipments = await db.shipment.findMany({
     where: { shipmentJournalDate: journaledDateFilter },
@@ -369,17 +389,25 @@ export async function recreateMissingDailyBatchLogs(settings: Awaited<ReturnType
     summary.total += Number(order.unearnedRevenueAmount ?? 0)
   }
 
-  const a2Batches = new Map<string, DailyBatchRecreateBucket<{ orderCount: number; total: number }>>()
+  const a2Batches = new Map<string, DailyBatchRecreateBucket<A2RecreateSummary>>()
   for (const order of orphanA2Orders) {
     const summary = foldDailyBatchRow(
       a2Batches,
       'A2',
       { stagedAt: order.inventoryAllocatedDate, persistedRef: order.inventoryAllocatedBatchRef },
-      () => ({ orderCount: 0, total: 0 }),
+      () => ({ orderCount: 0, total: 0, unattributed: [] as string[] }),
     )
     if (!summary) continue
     summary.orderCount += 1
-    summary.total += Number(order.allocationBatchAmount ?? 0)
+    // o3d-i0o6 r4 (Codex round 3, HIGH 1) — THIS BATCH'S SHARE, NEVER THE RUNNING TOTAL. Identical
+    // to the Xero twin, from the same shared rule: summing the cumulative figure into one batch
+    // rebuilds it carrying pounds an EARLIER batch already posted.
+    const share = allocationDebitShareOfBatch(order)
+    if (share.kind === 'unattributed') {
+      summary.unattributed.push(share.reason)
+      continue
+    }
+    summary.total += share.amount
   }
 
   const bBatches = new Map<string, DailyBatchRecreateBucket<{ shipmentCount: number; revenue: number; cogs: number }>>()
@@ -419,7 +447,16 @@ export async function recreateMissingDailyBatchLogs(settings: Awaited<ReturnType
   }
 
   for (const { referenceId, date, summary, ...batch } of a2Batches.values()) {
-    if (summary.total <= 0 || await hasLiveDailyBatchLog('DAILY_BATCH_INVENTORY_ALLOC', dailyBatchLiveRefs(batch))) continue
+    // ROUNDED, like the live writer's own guard: a batch whose total rounds to £0.00 raised no
+    // journal when it ran and must raise none now. The unattributed arm is still reached at zero —
+    // a batch nothing can value is not a batch known to be worth nothing (o3d-i0o6 r4).
+    if (round2(summary.total) <= 0 && summary.unattributed.length === 0) continue
+    if (await hasLiveDailyBatchLog('DAILY_BATCH_INVENTORY_ALLOC', dailyBatchLiveRefs(batch))) continue
+    if (summary.unattributed.length > 0) {
+      refusals.push(allocationDebitRecreateRefusal(referenceId, summary.unattributed))
+      continue
+    }
+    if (round2(summary.total) <= 0) continue
     await db.$transaction(async (tx) => {
       await createPendingSyncLog(tx, {
         type: 'DAILY_BATCH_INVENTORY_ALLOC',
@@ -471,6 +508,7 @@ export async function recreateMissingDailyBatchLogs(settings: Awaited<ReturnType
       })
     })
   }
+  return refusals
 }
 
 export async function runDailyBatchSync(): Promise<{
@@ -501,7 +539,9 @@ export async function runDailyBatchSync(): Promise<{
     }
 
     await resetFailedDailyBatchLogs()
-    await recreateMissingDailyBatchLogs(settings, baseCurrency)
+    // o3d-i0o6 r4: a batch the sweep REFUSED to rebuild is reported on the run rather than skipped
+    // silently, matching the Xero twin — it is the one outcome where a human has to decide.
+    result.errors.push(...await recreateMissingDailyBatchLogs(settings, baseCurrency))
 
   // --- Group A1: Revenue Deferral ---
   try {

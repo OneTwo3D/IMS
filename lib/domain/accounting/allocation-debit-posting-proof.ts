@@ -415,13 +415,21 @@ export async function proveAllocationDebitPosting<C extends string = string>(
         reason: 'the A2 journal this order was staged into is no longer on record (retention), so whether it reached the ledger cannot be established',
       }
     }
-    if (journal.connector && journal.connector !== target.activeConnector) {
+    if (journal.connector !== target.activeConnector) {
       // o3d-o97 r5: the ROW's connector, not only the stamp beside the amount. The stamp is written by
       // the batch in the same statement as the figure; the row is the ledger's own record of which
       // books it was raised into, and they are two different assertions.
+      //
+      // o3d-i0o6 r4: `journal.connector &&` used to guard this, so a row whose connector was ABSENT
+      // skipped the comparison entirely and read as a match — an unknown ledger taken as the right
+      // one. The column is non-nullable in the schema and both writers set it explicitly, so nothing
+      // reaches this arm today; it is written as an equality anyway, because "nobody writes null"
+      // is a fact about today's writers and this is a money decision.
       return {
         kind: 'refused',
-        reason: `the A2 journal this order was staged into was raised on ${journal.connector}, but this reversal would be raised on ${target.activeConnector} — a credit there would move pounds that ledger never held`,
+        reason: journal.connector
+          ? `the A2 journal this order was staged into was raised on ${journal.connector}, but this reversal would be raised on ${target.activeConnector} — a credit there would move pounds that ledger never held`
+          : `the A2 journal this order was staged into names no ledger, so whether its pounds are in the books this ${target.activeConnector} reversal would credit cannot be established`,
       }
     }
     if (journal.status !== 'SYNCED') {
@@ -432,17 +440,37 @@ export async function proveAllocationDebitPosting<C extends string = string>(
     }
     // o3d-o97 r5 — AND SYNCED IS STILL NOT A STATEMENT ABOUT POUNDS. The batch journal covers a whole
     // day, so its DR to Allocated Inventory is the window's total and this order's recorded share must
-    // fit inside it. An ILLEGIBLE payload is not a contradiction — it is the recorded attribution being
-    // the only evidence left, which is the state every pre-column order is in already — so it falls
-    // through to the recorded figure.
+    // fit inside it.
+    //
+    // o3d-i0o6 r4 (Codex round 3, HIGH 2) — AND AN UNREADABLE JOURNAL IS NOT A JOURNAL THAT CHECKS
+    // OUT. r3 ran both figure checks under `proof.kind === 'proved'`, so an `illegible` verdict —
+    // `backReferenceEvidenceCompactedAt` compaction drops `payload` from a row it keeps — performed
+    // NO account check and NO amount check and walked straight on to `posted`. Compaction therefore
+    // turned a journal whose readable lines would CONTRADICT the recorded pass (wrong account, zero
+    // debit, a debit smaller than this order's share) into authority to credit the whole recorded
+    // amount. That is the defect class this module exists for, in its purest form: the absent answer
+    // taken as the permissive one.
+    //
+    // So the verdict is destructured the other way round — anything that is not a PROVED figure ends
+    // here. `posted` is now unreachable without a number that came off the journal's own lines,
+    // which is what the rule "every journal's own lines cover the passes attributed to it" says.
+    // Failing closed caps the caller at £0.00, the same ceiling `unattributed` already carries.
     const proof = proveJournalPosting([journal], target.allocatedInventoryAccount, 'debit')
-    if (proof.kind === 'proved' && proof.amount <= 0) {
+    if (proof.kind !== 'proved') {
+      return {
+        kind: 'refused',
+        reason: proof.kind === 'illegible'
+          ? `the A2 journal this order was staged into has settled but its lines are no longer readable (evidence compaction), so whether it debited Allocated Inventory (${target.allocatedInventoryAccount}) at all — let alone the £${share.toFixed(2)} recorded against this order — cannot be established`
+          : `the A2 journal this order was staged into cannot be read as evidence (${proof.statuses}), so the £${share.toFixed(2)} recorded against this order is not proved to have reached Allocated Inventory (${target.allocatedInventoryAccount})`,
+      }
+    }
+    if (proof.amount <= 0) {
       return {
         kind: 'refused',
         reason: `the A2 journal this order was staged into has settled, but its lines debit nothing to Allocated Inventory (${target.allocatedInventoryAccount}) — the £${share.toFixed(2)} recorded against this order is contradicted by the journal that was to carry it`,
       }
     }
-    if (proof.kind === 'proved' && share > proof.amount + 0.005) {
+    if (share > proof.amount + 0.005) {
       return {
         kind: 'refused',
         reason: `this order records a £${share.toFixed(2)} share of an A2 journal that debited Allocated Inventory only £${proof.amount.toFixed(2)} in total — a share cannot exceed its batch, so the pounds standing against this order cannot be established`,

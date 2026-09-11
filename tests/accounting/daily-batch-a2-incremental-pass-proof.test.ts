@@ -451,3 +451,105 @@ test('o3d-i0o6 r3: a pass that raised NO journal makes the whole cumulative debi
   assert.equal(proof.kind, 'refused')
   assert.match(proof.reason, /no longer on record \(retention\)/)
 })
+
+// ---------------------------------------------------------------------------
+// o3d-i0o6 r4 (Codex round 3, HIGH 2) — AN UNREADABLE JOURNAL IS NOT A JOURNAL THAT CHECKS OUT.
+//
+// r3 ran both of the proof's figure checks — "does this journal debit Allocated Inventory at all?"
+// and "is this order's share inside the batch's own debit?" — under `proof.kind === 'proved'`. An
+// `illegible` verdict therefore performed NEITHER, and fell through to `posted` for the whole
+// recorded amount. `backReferenceEvidenceTombstone` (lib/domain/accounting/back-reference-sweep.ts)
+// is what makes a settled row illegible: it replaces `payload` with `{}` on a row it KEEPS. So
+// evidence compaction turned a journal whose readable lines would have CONTRADICTED the recorded
+// pass into authority to credit all of it — the defect class this branch exists to close, in its
+// purest form: the absent answer taken as the permissive one.
+//
+// The pairing below is the argument. The SAME journal, in two states: readable and contradicting
+// (refused, before and after), then compacted (`posted` before the fix, refused after). Nothing
+// about the pounds changed between them — only whether anybody could see them.
+// ---------------------------------------------------------------------------
+
+/** The REAL compaction patch a retention sweep applies to a settled row it keeps. */
+async function compactJournalPayload(journalId: string): Promise<void> {
+  const { backReferenceEvidenceTombstone } = await import('@/lib/domain/accounting/back-reference-sweep')
+  const log = state.syncLogs.find((row) => row.id === journalId)!
+  Object.assign(log, backReferenceEvidenceTombstone(new Date('2026-03-01T00:00:00.000Z')))
+}
+
+test('o3d-i0o6 r4: a COMPACTED A2 journal proves nothing, where it used to prove everything', async () => {
+  await twoPassIncrement()
+  for (const log of state.syncLogs) log.status = 'SYNCED'
+
+  // THE CONTROL, restated here so the refusal below is known to be caused by the compaction alone.
+  const readable = await prove('order-1')
+  assert.equal(readable.kind, 'posted')
+  assert.equal(readable.kind === 'posted' && readable.recordedDebit, 55)
+
+  await compactJournalPayload('a2-log-1')
+
+  const proof = await prove('order-1')
+  assert.notEqual(proof.kind, 'posted', 'a journal nobody can read may not authorise a £55 credit')
+  assert.equal(proof.kind, 'refused')
+  assert.match(proof.reason, /no longer readable \(evidence compaction\)/)
+})
+
+test('o3d-i0o6 r4: compaction cannot turn a CONTRADICTING journal into a proved one', async () => {
+  await twoPassIncrement()
+  for (const log of state.syncLogs) log.status = 'SYNCED'
+
+  // The first pass's journal settled, but its lines debit Allocated Inventory NOTHING — the £50 the
+  // order records against it never reached account 631. (This payload is written by hand: no A2
+  // pass produces a journal that contradicts its own stamp, which is exactly why the contradiction
+  // only ever surfaces on a row something else has rewritten or netted.)
+  const contradicting = state.syncLogs.find((log) => log.id === 'a2-log-1')!
+  contradicting.payload = {
+    lines: [
+      { accountCode: '630', description: 'Daily inventory allocation', debit: 50 },
+      { accountCode: '631', description: 'reversed in the same journal', debit: 50, credit: 50 },
+    ],
+  }
+
+  const readable = await prove('order-1')
+  assert.equal(readable.kind, 'refused', 'while the lines are readable the contradiction is caught')
+  assert.match(readable.reason, /debit nothing to Allocated Inventory/)
+
+  // Now the SAME row is compacted. The pounds have not moved; only the evidence is gone.
+  await compactJournalPayload('a2-log-1')
+
+  const compacted = await prove('order-1')
+  assert.notEqual(compacted.kind, 'posted', 'compaction must not upgrade a contradiction into a credit')
+  assert.equal(compacted.kind, 'refused')
+  assert.match(compacted.reason, /no longer readable \(evidence compaction\)/)
+})
+
+test('o3d-i0o6 r4: a journal row that names NO ledger is refused, not read as a match', async () => {
+  // The other absent-is-permissive branch beside the compaction one. r3 guarded the row-level ledger
+  // comparison with `journal.connector &&`, so a row whose connector was MISSING skipped the
+  // comparison entirely and read as "the right ledger". `AccountingSyncLog.connector` is
+  // non-nullable with a default and both writers set it explicitly, so nothing produces this today —
+  // but the proof's own client interface types it `string | null`, which is the shape a caller can
+  // hand it, and this is a money decision. So it is asked as an equality and proved here through
+  // that interface rather than argued from what today's writers happen to do.
+  await twoPassIncrement()
+  for (const log of state.syncLogs) log.status = 'SYNCED'
+
+  const { proveAllocationDebitPosting } = await import('@/lib/domain/accounting/allocation-debit-posting-proof')
+  const ledgerlessClient = {
+    accountingSyncLog: {
+      findUnique: async ({ where }: { where: { id: string } }) => {
+        const log = state.syncLogs.find((row) => row.id === where.id)
+        if (!log) return null
+        return { status: log.status, connector: null, payload: log.payload }
+      },
+    },
+  }
+
+  const proof = await proveAllocationDebitPosting(ledgerlessClient, state.orders[0], {
+    activeConnector: 'xero' as const,
+    allocatedInventoryAccount: '631',
+  })
+
+  assert.notEqual(proof.kind, 'posted', 'an unknown ledger is not this ledger')
+  assert.equal(proof.kind, 'refused')
+  assert.match(proof.reason, /names no ledger/)
+})

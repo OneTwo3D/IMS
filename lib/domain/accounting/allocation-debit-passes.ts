@@ -185,3 +185,129 @@ function serializePass(pass: AllocationDebitPass): SerializedAllocationDebitPass
     at: pass.at,
   }
 }
+
+/**
+ * o3d-i0o6 r4 (Codex round 3, HIGH 1) — THE POUNDS ONE ORDER PUT INTO ONE BATCH, WHICH IS NEVER ITS
+ * CUMULATIVE FIGURE.
+ *
+ * `recreateMissingDailyBatchLogs` rebuilds a daily batch whose log went missing before it posted. It
+ * is keyed to ONE batch reference, and it summed `allocationBatchAmount` — the running total of
+ * EVERY A2 pass the order has ever been through — into that one batch. That is the same category
+ * error the pass history exists to close, seen from the writing side instead of the reading side:
+ *
+ *   A2 debits GBP 50 under batch R1, which posts and settles. An allocation edit un-stages the
+ *   order; A2 comes back under a NEW batch reference R2, values the order at nothing, and so creates
+ *   no journal at all — while the order keeps its cumulative GBP 50 and is re-stamped with R2. The
+ *   sweep then finds no log for R2, rebuilds it from the cumulative GBP 50, and the ledger carries
+ *   the same GBP 50 twice. The pass history still proves only the original GBP 50, so a later refund
+ *   reverses GBP 50 and the duplicate stands for ever.
+ *
+ * So the rebuild asks the history instead: how much did THIS order's passes attribute to THE BATCH
+ * IT IS STAMPED WITH? For a pass that rounded to zero that is GBP 0.00, and a batch of zero pounds
+ * is no journal at all — which is exactly what the live writer did when it declined to create the
+ * log in the first place.
+ *
+ * WHERE THE HISTORY CANNOT ANSWER, THE BATCH IS NOT REBUILT. A row staged before the history column
+ * existed carries a cumulative amount and nothing that can divide it between batches, and dividing
+ * it by guessing is the defect above. The recreate path POSTS A JOURNAL, so its fail-closed side is
+ * to post nothing and say so: the caller surfaces the refusal on the run, exactly as it already does
+ * for a batch whose only log is cancelled. That is the same answer
+ * {@link proveAllocationDebitPosting} gives such a row on the credit side ('unattributed'), for the
+ * same reason, so one row cannot be unprovable to one path and self-evident to the other.
+ */
+export type AllocationDebitBatchShare =
+  /** The pounds this order's recorded passes attribute to the batch it is stamped with. */
+  | { kind: 'known'; amount: number }
+  /** The history cannot divide this order's cumulative debit between batches. `reason` names it. */
+  | { kind: 'unattributed'; reason: string }
+
+export type AllocationDebitBatchRow = {
+  /** Prisma Decimal | number | null. CUMULATIVE across every A2 pass this order has been through. */
+  allocationBatchAmount: { toString(): string } | number | null
+  /** The raw `SalesOrder.allocationBatchPasses` JSON; parsed here, never trusted unparsed. */
+  allocationBatchPasses: unknown
+  /** The referenceId of the batch this order is CURRENTLY stamped with — the one being rebuilt. */
+  inventoryAllocatedBatchRef: string | null
+  /** For the refusal text only; never part of a decision. */
+  orderNumber?: string | null
+  id?: string | null
+}
+
+function batchRowAmount(value: AllocationDebitBatchRow['allocationBatchAmount']): number {
+  if (value === null || value === undefined) return 0
+  const parsed = typeof value === 'number' ? value : Number(value.toString())
+  return Number.isFinite(parsed) ? parsed : 0
+}
+
+function describeBatchRow(order: AllocationDebitBatchRow): string {
+  return order.orderNumber || order.id || 'an order'
+}
+
+export function allocationDebitShareOfBatch(order: AllocationDebitBatchRow): AllocationDebitBatchShare {
+  const recorded = batchRowAmount(order.allocationBatchAmount)
+  // NO RECORDED DEBIT, NO SHARE — and no refusal either. A2 nulls this column on the paths that
+  // withdraw an unposted staging, so "nothing recorded" is a POSITIVE answer of zero, not an
+  // absence that has to be resolved by a human.
+  if (recorded <= 0) return { kind: 'known', amount: 0 }
+  const passes = parseAllocationDebitPasses(order.allocationBatchPasses)
+  if (!passes) {
+    return {
+      kind: 'unattributed',
+      reason: `${describeBatchRow(order)} records a cumulative A2 debit of £${recorded.toFixed(2)} with no pass history, so how much of it this batch carried cannot be established`,
+    }
+  }
+  // THE HISTORY MUST ACCOUNT FOR THE FIGURE, the same test `proveAllocationDebitPosting` applies. A
+  // history that sums to less than the recorded amount has pounds in it no pass claims, so the share
+  // it reports for any one batch is a share of a figure it does not describe.
+  const passTotal = sumAllocationDebitPasses(passes)
+  if (Math.abs(passTotal - recorded) > 0.005) {
+    return {
+      kind: 'unattributed',
+      reason: `${describeBatchRow(order)} records a cumulative A2 debit of £${recorded.toFixed(2)} but its ${passes.length} recorded pass(es) account for £${passTotal.toFixed(2)}, so how much of it this batch carried cannot be established`,
+    }
+  }
+  // THE STAMP IS THE BATCH BEING REBUILT. The sweep folds this row into the bucket for the reference
+  // persisted beside its stamp, so the passes that named THAT reference are this order's share of
+  // it. A row with no persisted reference is a pre-column row: it is bucketed by a key derived from
+  // its stage stamp, which no pass can be matched against.
+  if (!order.inventoryAllocatedBatchRef) {
+    return {
+      kind: 'unattributed',
+      reason: `${describeBatchRow(order)} records a cumulative A2 debit of £${recorded.toFixed(2)} and names no batch reference, so which batch carried which part of it cannot be established`,
+    }
+  }
+  const share = sumAllocationDebitPasses(
+    passes.filter((pass) => pass.batchRef === order.inventoryAllocatedBatchRef),
+  )
+  return { kind: 'known', amount: share }
+}
+
+/**
+ * One A2 recreate bucket's accumulator, shared by both connectors (o3d-i0o6 r4).
+ *
+ * `total` is the sum of the orders' own SHARES of this batch and never of their cumulative debits;
+ * `unattributed` is the reason, per order, that a share could not be established. The two are kept
+ * apart because they lead to opposite acts — a total of zero means "raise no journal", an
+ * unattributed entry means "raise no journal AND tell somebody".
+ */
+export type A2RecreateSummary = {
+  orderCount: number
+  total: number
+  unattributed: string[]
+}
+
+/**
+ * The one wording both connectors report an unattributable A2 rebuild with (o3d-i0o6 r4).
+ *
+ * Two spellings of one refusal is how the two sweeps drift apart, and this one has to say the same
+ * thing on both because the defect it refuses is the same on both.
+ */
+export function allocationDebitRecreateRefusal(referenceId: string, reasons: readonly string[]): string {
+  return (
+    `Daily batch DAILY_BATCH_INVENTORY_ALLOC not recreated: ${referenceId} — ${reasons.join('; ')}. `
+    + '`allocationBatchAmount` is the CUMULATIVE total of every Group A2 pass an order has been '
+    + 'through, not this batch\'s share of it, so rebuilding the batch from it would re-post pounds '
+    + 'an EARLIER batch already carried. If this batch really is missing from the ledger, post it '
+    + 'there by hand from the orders it named and leave the stamps alone.'
+  )
+}
