@@ -21,6 +21,10 @@ import {
 } from '@/lib/domain/accounting/enqueue-order-guard'
 import { lockFollowUpScope } from '@/lib/domain/accounting/followup-scope-lock'
 import { pinnedLedgerIsServicedUnderLock } from '@/lib/integration-plugin-selection-lock'
+import {
+  connectorSyncGate,
+  notConfiguredUnderPinnedLedgerFence,
+} from '@/lib/domain/accounting/pinned-enqueue-fence'
 import { stampingCustodyOnCreate } from '@/lib/domain/accounting/money-attempt-provenance'
 import {
   classifyPriorAttempts,
@@ -73,6 +77,14 @@ export async function queueXeroSync(params: {
    * one step to every other writer.
    *
    * Absent, nothing changes for any of the unpinned callers: no lock is taken and no verdict is added.
+   *
+   * o3d-i0o6 r9 (Codex round 8, HIGH) — AND IT IS CONSULTED BEFORE ANY OTHER `not-configured` THIS
+   * QUEUE COULD GIVE. r8 put the verdict under the lock on the inserting transaction and left the
+   * settings gate above that transaction, so a pinned enqueue whose ledger had just been switched away
+   * answered `not-configured` from the toggle read and never reached the fence — and `not-configured`
+   * is the one no-op the refund obligation ledger may settle an obligation with. The gate now returns
+   * a value that cannot be an outcome, and the conversion asks the fence. See
+   * lib/domain/accounting/pinned-enqueue-fence.ts.
    */
   pinnedLedger?: 'xero' | 'quickbooks'
   // o3d-2sm1 r7: and it SAYS what it did — see ConnectorEnqueueOutcome. Every early return below
@@ -86,11 +98,19 @@ export async function queueXeroSync(params: {
   // QuickBooks pin.
   if (params.pinnedLedger && params.pinnedLedger !== 'xero') return { queued: false, reason: 'refused' }
   const settings = await getXeroSettings()
-  if (settings.xero_sync_enabled !== 'true') return { queued: false, reason: 'not-configured' }
-
   const settingKey = SYNC_TYPE_SETTING[params.type]
-  const postingMode = settingKey ? settings[settingKey] : 'submitted'
-  if (!postingMode || postingMode === 'off') return { queued: false, reason: 'not-configured' }
+  // o3d-i0o6 r9 (Codex round 8, HIGH) — THE SYNC VERDICT IS COMPUTED HERE AND ANSWERED UNDER THE
+  // FENCE. It used to be two early returns at this point, and each of them was a `not-configured`
+  // given BEFORE the transaction below ever opened — so on a pinned enqueue whose ledger had just
+  // been switched away, `pinnedLedgerIsServicedUnderLock` never ran at all and the refund obligation
+  // ledger settled an obligation with no reversal row anywhere. `connectorSyncGate` returns a type
+  // that is NOT a ConnectorEnqueueOutcome, so this gate cannot answer for a pinned enqueue however
+  // this call site is written; `notConfiguredUnderPinnedLedgerFence` is the one conversion, and it
+  // asks the fence first. An unpinned enqueue is answered immediately, with no lock and no
+  // transaction — see that module for the whole argument.
+  const gate = connectorSyncGate(settings.xero_sync_enabled, settingKey ? settings[settingKey] : 'submitted')
+  if (!gate.posts) return await notConfiguredUnderPinnedLedgerFence(params.pinnedLedger)
+  const postingMode = gate.postingMode
 
   // o3d-19gy: which CONNECTION this payload was composed for, recorded beside the posting mode because
   // it is the same kind of fact — something about the queueing, not about the document. Read here, at

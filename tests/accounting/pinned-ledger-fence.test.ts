@@ -74,6 +74,19 @@ mock.module('@/lib/integration-plugins', {
   },
 })
 
+/**
+ * o3d-i0o6 r9 (Codex round 8, HIGH) — THIS FIXTURE EXCLUDES A STATE, AND THE EXCLUSION HID A DEFECT.
+ *
+ * Freezing both master toggles ON is right for what THIS file asserts: it makes a refusal below
+ * attributable to the fence and to nothing else. But it also made the whole of "the queue answers
+ * from its own toggle read, BEFORE the transaction that takes the fence" unreachable here — and that
+ * was a live `not-configured`, the one no-op the refund obligation ledger may settle an obligation
+ * with. Codex round 8 found it; the fixture could not have.
+ *
+ * The toggle-off states live in `tests/accounting/pinned-enqueue-fence.test.ts`, whose toggles are
+ * mutable per test, and are raced in tests 4-5 of the concurrency file. Keep this file's toggles
+ * frozen on — do not "improve" it by making them mutable, or its refusals stop being attributable.
+ */
 mock.module('@/lib/connectors/xero/settings', {
   namedExports: {
     getXeroSettings: async () => ({ xero_sync_enabled: 'true' }),

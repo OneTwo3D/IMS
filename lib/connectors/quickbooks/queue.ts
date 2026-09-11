@@ -15,6 +15,10 @@ import {
 } from '@/lib/domain/accounting/enqueue-order-guard'
 import { lockFollowUpScope } from '@/lib/domain/accounting/followup-scope-lock'
 import { pinnedLedgerIsServicedUnderLock } from '@/lib/integration-plugin-selection-lock'
+import {
+  connectorSyncGate,
+  notConfiguredUnderPinnedLedgerFence,
+} from '@/lib/domain/accounting/pinned-enqueue-fence'
 import { stampingCustodyOnCreate } from '@/lib/domain/accounting/money-attempt-provenance'
 import {
   classifyPriorAttempts,
@@ -68,11 +72,13 @@ export async function queueQuickBooksSync(params: {
   // writes is a QuickBooks row. See the twin in lib/connectors/xero/queue.ts.
   if (params.pinnedLedger && params.pinnedLedger !== 'quickbooks') return { queued: false, reason: 'refused' }
   const settings = await getQuickBooksSettings()
-  if (settings.quickbooks_sync_enabled !== 'true') return { queued: false, reason: 'not-configured' }
-
   const settingKey = SYNC_TYPE_SETTING[params.type]
-  const postingMode = settingKey ? settings[settingKey] : 'submitted'
-  if (!postingMode || postingMode === 'off') return { queued: false, reason: 'not-configured' }
+  // o3d-i0o6 r9 (Codex round 8, HIGH) — the twin of the Xero queue's gate, cross-ported for the same
+  // reason: the defect is about ANY two connectors, and a fence with a gate in one side of it is not a
+  // fence. See lib/domain/accounting/pinned-enqueue-fence.ts.
+  const gate = connectorSyncGate(settings.quickbooks_sync_enabled, settingKey ? settings[settingKey] : 'submitted')
+  if (!gate.posts) return await notConfiguredUnderPinnedLedgerFence(params.pinnedLedger)
+  const postingMode = gate.postingMode
 
   const payload = {
     ...params.payload,

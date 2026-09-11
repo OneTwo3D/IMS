@@ -9,6 +9,7 @@ import { resolveAccountingEnqueueOrderScope } from '@/lib/domain/accounting/enqu
 import { hasLockedSalesOrder } from '@/lib/domain/sales/allocation-service'
 import { lockFollowUpScope } from '@/lib/domain/accounting/followup-scope-lock'
 import { stampingCustodyOnCreate } from '@/lib/domain/accounting/money-attempt-provenance'
+import { notConfiguredUnderPinnedLedgerFence } from '@/lib/domain/accounting/pinned-enqueue-fence'
 import { withSavepoint } from '@/lib/db/savepoint'
 import {
   classifyPriorAttempts,
@@ -324,6 +325,11 @@ export async function queueAccountingSync(params: {
   connector?: AccountingConnectorInfo['id']
 }): Promise<AccountingEnqueueOutcome> {
   const connector = params.connector ?? await getActiveAccountingConnectorId()
+  // o3d-i0o6 r9: the one pre-fence `not-configured` on this path a PIN CANNOT REACH, by construction
+  // rather than by luck — `connector` is `params.connector ?? <resolved>`, so a pinned enqueue always
+  // has one and this branch is dead for it. Left as a literal for that reason; every other pre-fence
+  // `not-configured` below and in the connector queues goes through
+  // `notConfiguredUnderPinnedLedgerFence`.
   if (!connector) return { queued: false, reason: 'not-configured', connector: null }
   // o3d-i0o6 r7 — AND THE PINNED LEDGER MUST STILL BE THE ONE THIS SYSTEM IS RUNNING. See
   // `pinnedLedgerIsServiced`: the pin establishes WHICH books the posting belongs in, the sync
@@ -348,8 +354,16 @@ export async function queueAccountingSync(params: {
   if (params.connector && !await pinnedLedgerIsServiced(params.connector)) {
     return { queued: false, reason: 'refused', connector }
   }
+  // o3d-i0o6 r9 (Codex round 8, HIGH) — AND THIS ONE IS FENCED TOO, for the same reason as the
+  // connector queues' sync gate. Xero never posts an FX journal, but "never" is a statement about
+  // XERO: if the pin has been retired, the ledger now being serviced is QuickBooks, which DOES post
+  // them — so this suppression rule may not settle an obligation on the retired ledger's behalf.
+  // Unreachable for today's pinned callers (the refund hand-off pins ALLOCATION_REVERSAL and
+  // UNEARNED_REV_REVERSAL, neither of which is an FX type), and fenced anyway: "not currently
+  // reachable" is what round 7's check was, and it was reached. Unpinned callers are unchanged and
+  // pay nothing.
   if (isFxGainLossJournalSuppressed(connector, params.type)) {
-    return { queued: false, reason: 'not-configured', connector }
+    return { ...await notConfiguredUnderPinnedLedgerFence(params.connector), connector }
   }
 
   // o3d-i0o6 r8: `pinnedLedger` is what makes the check above binding at the moment of the write. It

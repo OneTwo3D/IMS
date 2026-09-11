@@ -31,6 +31,14 @@ import { INTEGRATION_PLUGIN_SETTING_KEYS } from '../../lib/integration-plugin-ke
  * would be reassuring and unfalsifiable — it could be waiting on the follow-up scope lock, on the
  * order lock, on the connection pool, or on nothing at all.
  *
+ * o3d-i0o6 r9 (Codex round 8, HIGH) — TESTS 4 AND 5 RACE THE GATE ROUND 8 LEFT IN FRONT OF THE
+ * FENCE. Tests 1-3 all run with the connector's own `*_sync_enabled` ON, deliberately, so that a
+ * refusal can only have come from the fence. That choice also meant none of them could reach the
+ * state where the queue answered from its own toggle read BEFORE opening the fenced transaction —
+ * `not-configured`, which is the one no-op the refund obligation ledger may settle an obligation
+ * with. Test 4 is test 3's race with `xero_sync_enabled` set to `'false'` first, and test 5 is its
+ * uncontended control.
+ *
  * Gated behind RUN_DB_CONCURRENCY_TESTS=1: `npm run test:concurrency`.
  */
 
@@ -119,6 +127,11 @@ async function switchToQuickBooks(
     if (options.holdMs) await new Promise((resolve) => setTimeout(resolve, options.holdMs))
   }, TX)
   return Date.now() - startedAt
+}
+
+/** One setting row, for the tests that need a toggle the plugin switch does not touch. */
+async function setSetting(db: Db, key: string, value: string): Promise<void> {
+  await db.setting.upsert({ where: { key }, create: { key, value }, update: { value } })
 }
 
 /** `CogsEntry` is not an order-scoped reference type, so no hoisted sales-order row lock is needed. */
@@ -332,5 +345,130 @@ test(
       `the facade enqueue returned in ${elapsedMs}ms without waiting out the switch's ${HOLD_MS}ms `
       + 'hold, so its verdict was not taken under the selection lock',
     )
+  },
+)
+
+test(
+  '[o3d-i0o6 r9] a pinned enqueue whose SYNC TOGGLE IS OFF still waits for the fence, and refuses',
+  { skip: !RUN && 'set RUN_DB_CONCURRENCY_TESTS=1' },
+  async (t) => {
+    /**
+     * o3d-i0o6 r9 (Codex round 8, HIGH) — THE GATE ROUND 8 LEFT IN THE FENCE, RACED.
+     *
+     * r8's fence is real and the three tests above measure it. What it did not do is stop anything
+     * else answering FIRST. The connector queue read `xero_sync_enabled` BEFORE opening the
+     * transaction that takes the fence, and returned `not-configured` from there — so with the toggle
+     * off, `pinnedLedgerIsServicedUnderLock` was never reached at all, and `not-configured` is the ONE
+     * no-op `lib/domain/sales/refund-accounting-obligations.ts` lets SETTLE an obligation (it settles
+     * when the pinned connector's `willPost` verdict, taken as the hand-off opened, was already false
+     * — which is exactly the state below). The refund's reversal obligation was discharged with no row
+     * on any ledger, against a configuration the switch had retired.
+     *
+     * SAME RACE AS TEST 3, ONE SETTING DIFFERENT. The switch holds the selection uncommitted; the
+     * facade's pooled pre-check cannot see it under READ COMMITTED and still answers "xero is active",
+     * exactly as in production; and Xero's own master toggle is off before either side starts, which
+     * is what the r8 unit fixture could not express — it stubs both toggles to `'true'`.
+     *
+     * Fenced, the queue cannot answer from that toggle: it takes the selection lock, parks behind the
+     * switch, wakes after it commits, reads QuickBooks and refuses. Unfenced, it returns
+     * `not-configured` in a couple of milliseconds without waiting for anything — which is why the
+     * elapsed time is asserted as well as the reason. The timing is the part no fixture can fake.
+     */
+    const { db, queueAccountingSync, lockIntegrationPluginSelection } = await loadDeps()
+    await startFromXeroActive(db)
+    // THE PRECONDITION THE R8 FIXTURE EXCLUDED: the pinned connector's own sync is off.
+    await setSetting(db, 'xero_sync_enabled', 'false')
+    const referenceId = probeId('facade-toggle-off')
+    t.after(cleanup(db, referenceId))
+    t.after(() => startFromXeroActive(db))
+
+    const signal: { fire?: () => void } = {}
+    const switchHoldsTheLock = new Promise<void>((resolve) => { signal.fire = resolve })
+
+    const switcher = switchToQuickBooks(db, lockIntegrationPluginSelection, {
+      holdMs: HOLD_MS,
+      onLockHeld: () => signal.fire!(),
+    })
+
+    const enqueue = (async () => {
+      await switchHoldsTheLock
+      const startedAt = Date.now()
+      const outcome = await queueAccountingSync({
+        type: 'UNEARNED_REV_REVERSAL',
+        connector: 'xero',
+        referenceType: REFERENCE_TYPE,
+        referenceId,
+        payload: payloadFor(referenceId),
+      })
+      return { outcome, elapsedMs: Date.now() - startedAt }
+    })()
+
+    const [, { outcome, elapsedMs }] = await Promise.all([switcher, enqueue])
+
+    assert.deepEqual(
+      await db.accountingSyncLog.findMany({ where: { referenceId }, select: { connector: true } }),
+      [],
+      'nothing may be written — the toggle is off',
+    )
+    assert.equal(outcome.queued, false)
+    assert.equal(outcome.reason, 'refused',
+      '`not-configured` here SETTLES the refund obligation with no reversal row on any ledger, on a '
+      + 'configuration the switch has retired — while the ledger now being serviced would have taken '
+      + 'the posting. The posting is owed: `refused`')
+    assert.equal(outcome.connector, 'xero', 'and the answer is about the ledger the credit was proved on')
+
+    // AND IT WAITED. This is the half that separates a fenced answer from a lucky one: an unfenced
+    // queue answers from its own toggle read and never touches the selection lock, so it returns long
+    // before the switch has committed.
+    assert.ok(elapsedMs >= HOLD_MS - SLACK_MS,
+      `the enqueue answered in ${elapsedMs}ms without waiting out the switch's ${HOLD_MS}ms hold, so `
+      + 'its verdict was taken from the sync toggle rather than from under the selection lock',
+    )
+  },
+)
+
+test(
+  '[o3d-i0o6 r9] THE NARROWING — with no switch in flight, a toggled-off pinned enqueue is `not-configured` and does not hang',
+  { skip: !RUN && 'set RUN_DB_CONCURRENCY_TESTS=1' },
+  async (t) => {
+    /**
+     * The control for the test above, and it is load-bearing twice over.
+     *
+     * FIRST, it stops the fix being a blanket rename. A deliberately disabled connector must still
+     * produce `not-configured`, because that is the one answer that lets the refund obligation ledger
+     * settle a posting that will genuinely never exist — if this came back `refused`, no refund could
+     * be staged at all on a system with Xero sync switched off.
+     *
+     * SECOND, it is the liveness half. The fenced path now takes a real advisory lock and real row
+     * locks on a path that writes nothing; uncontended it must acquire them, answer and release
+     * immediately rather than waiting on anything.
+     */
+    const { db, queueAccountingSync } = await loadDeps()
+    await startFromXeroActive(db)
+    await setSetting(db, 'xero_sync_enabled', 'false')
+    const referenceId = probeId('facade-toggle-off-control')
+    t.after(cleanup(db, referenceId))
+    t.after(() => startFromXeroActive(db))
+
+    const startedAt = Date.now()
+    const outcome = await queueAccountingSync({
+      type: 'UNEARNED_REV_REVERSAL',
+      connector: 'xero',
+      referenceType: REFERENCE_TYPE,
+      referenceId,
+      payload: payloadFor(referenceId),
+    })
+    const elapsedMs = Date.now() - startedAt
+
+    assert.equal(outcome.reason, 'not-configured',
+      'the pinned ledger IS the one being serviced and its sync is off — no counterpart will ever '
+      + 'exist, so nothing is outstanding and the obligation may settle')
+    assert.equal(outcome.connector, 'xero')
+    assert.deepEqual(
+      await db.accountingSyncLog.findMany({ where: { referenceId }, select: { connector: true } }),
+      [],
+    )
+    assert.ok(elapsedMs < HOLD_MS,
+      `an uncontended fenced answer took ${elapsedMs}ms — it should acquire, read and release`)
   },
 )
