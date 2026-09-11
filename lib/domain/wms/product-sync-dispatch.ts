@@ -1,7 +1,8 @@
 import { after } from 'next/server'
 import { db } from '@/lib/db'
 import { getIntegrationPluginState } from '@/lib/integration-plugins'
-import { WMS_CONNECTOR_IDS, type WmsConnectorId } from '@/lib/connectors/wms/types'
+import { enabledWmsConnectorId } from '@/lib/connectors/wms/enabled-connector'
+import { type WmsConnectorId } from '@/lib/connectors/wms/types'
 import { getWmsConnectorHooks } from '@/lib/connectors/wms/registry'
 import type { WmsSyncTrigger } from '@/lib/connectors/wms/connector-hooks'
 
@@ -21,8 +22,10 @@ import type { WmsSyncTrigger } from '@/lib/connectors/wms/connector-hooks'
 type SyncTrigger = WmsSyncTrigger
 
 async function getEnabledWmsConnectorId(): Promise<WmsConnectorId | null> {
-  const state = await getIntegrationPluginState()
-  return WMS_CONNECTOR_IDS.find((id) => state[id]) ?? null
+  // Round 10, Codex HIGH 1. `null` on a contradictory enabled set as well as an empty one: a product
+  // mutation that is not mirrored is recoverable by a re-sync, and one mirrored into the wrong
+  // warehouse's catalogue is not.
+  return enabledWmsConnectorId(await getIntegrationPluginState())
 }
 
 export async function isAnyWmsConnectorEnabled(): Promise<boolean> {

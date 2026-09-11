@@ -4,7 +4,8 @@ import { revalidatePath } from 'next/cache'
 import { db } from '@/lib/db'
 import type { WmsOrderStatusView } from '@/app/actions/wms-order-status'
 import { getIntegrationPluginState } from '@/lib/integration-plugins'
-import { WMS_CONNECTOR_IDS, isWmsConnectorId } from '@/lib/connectors/wms/types'
+import { enabledWmsConnectorId } from '@/lib/connectors/wms/enabled-connector'
+import { isWmsConnectorId } from '@/lib/connectors/wms/types'
 import { getWmsConnector } from '@/lib/connectors/wms/registry'
 import { logActivity } from '@/lib/activity-log'
 import { entersFulfilment, reconcileAllocationBeforeFulfilment, recordShortfallUnderLock } from '@/lib/fulfillment/pre-fulfilment-reallocation'
@@ -727,7 +728,9 @@ export async function getSalesOrders(
     }),
     getIntegrationPluginState(),
   ])
-  const activeWmsConnector = WMS_CONNECTOR_IDS.find((id) => pluginState[id]) ?? null
+  // Round 10, Codex HIGH 1 — `null` on a contradictory enabled set too, which clears every cached
+  // chip. Showing a chip attributed to a guessed connector is worse than showing none.
+  const activeWmsConnector = enabledWmsConnectorId(pluginState)
   return orders.map((order) => {
     const row = mapSoRow(order)
     // Only surface a cached chip from the currently-active WMS connector, so

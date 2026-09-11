@@ -25,7 +25,7 @@ import {
 } from '@/app/actions/accounting-sync'
 import { getAccountingBatchHistory, getAccountingBatchPreview } from '@/app/actions/accounting-batch'
 import { getWmsSyncDashboardData } from '@/app/actions/wms-sync'
-import { WMS_CONNECTOR_IDS } from '@/lib/connectors/wms/types'
+import { resolveEnabledWmsConnector } from '@/lib/connectors/wms/enabled-connector'
 import { getPaymentMethodCombos } from '@/app/actions/accounting'
 import { getPaymentAccountMap } from '@/lib/accounting'
 import { getTaxRates } from '@/app/actions/settings'
@@ -155,9 +155,17 @@ export default async function SyncPage() {
   const pluginState = await getIntegrationPluginState()
   // Resolve the active WMS connector from this single plugin-state read and pass
   // it to getWmsSyncDashboardData so the facade doesn't read plugin state again.
-  const activeWmsConnector = WMS_CONNECTOR_IDS.find((id) => pluginState[id]) ?? null
+  const wmsResolution = resolveEnabledWmsConnector(pluginState)
+  const activeWmsConnector = wmsResolution.kind === 'one' ? wmsResolution.id : null
+  // AMBIGUOUS STILL COUNTS AS "A PLUGIN IS ENABLED" (o3d-remove-shiphero round 10, Codex HIGH 1).
+  // `activeWmsConnector` is null when two WMS connectors are enabled, because nothing may route to a
+  // guessed warehouse — but this flag decides whether the page redirects away as an install with no
+  // integrations at all. Folding the two together would make the screen that links to the Integration
+  // Plugins switches unreachable in precisely the state those switches caused, which is the same
+  // shape as HIGH 2: a misconfiguration that removes its own remedy.
   const anyIntegrationPluginEnabled = !!(
-    pluginState.woocommerce || pluginState.shopify || pluginState.xero || pluginState.quickbooks || activeWmsConnector
+    pluginState.woocommerce || pluginState.shopify || pluginState.xero || pluginState.quickbooks
+    || wmsResolution.kind !== 'none'
   )
 
   // o3d-osl8 item 1: the rows behind the orphan count, with identifying detail. Deliberately NOT

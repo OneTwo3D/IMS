@@ -2,8 +2,9 @@
 
 import { requirePermission } from '@/lib/auth/server'
 import { getIntegrationPluginState } from '@/lib/integration-plugins'
-import { findWmsConnector, findWmsConnectorLabel, getWmsConnectorHooks } from '@/lib/connectors/wms/registry'
-import { WMS_CONNECTOR_IDS, type WmsConnectorId } from '@/lib/connectors/wms/types'
+import { findWmsConnectorLabel, getWmsConnectorHooks, isWmsConnectorConfigured } from '@/lib/connectors/wms/registry'
+import { enabledWmsConnectorId } from '@/lib/connectors/wms/enabled-connector'
+import { type WmsConnectorId } from '@/lib/connectors/wms/types'
 
 /**
  * Connector-agnostic /sync WMS panel data.
@@ -74,8 +75,11 @@ export type WmsSyncDashboardData = {
 }
 
 async function resolveEnabledWmsConnectorId(): Promise<WmsConnectorId | null> {
-  const state = await getIntegrationPluginState()
-  return WMS_CONNECTOR_IDS.find((id) => state[id]) ?? null
+  // Round 10, Codex HIGH 1. `null` still means "do not render a panel", and it now covers the
+  // contradictory enabled set as well as the empty one — there is no connector this facade could
+  // name without guessing. The /sync PAGE keeps itself reachable in that state (see its own note)
+  // so the operator can get to the switches that caused it.
+  return enabledWmsConnectorId(await getIntegrationPluginState())
 }
 
 /**
@@ -96,10 +100,14 @@ export async function getWmsSyncDashboardData(
 
   // ONE READ, ON EVERY PATH, BEFORE THE CAPABILITY QUESTION IS ASKED AT ALL. Whether the connection
   // is set up does not depend on whether this build ships a panel for it, so it is not resolved
-  // inside either arm below. `findWmsConnector` rather than `getWmsConnector`: an id left behind by
-  // a connector this build no longer ships is unconfigurable, not a throw from inside a read.
-  const connector = findWmsConnector(connectorId)
-  const configured = connector !== null && await connector.isConfigured()
+  // inside either arm below.
+  //
+  // `isWmsConnectorConfigured`, NOT `findWmsConnector(...).isConfigured()` (round 10, Codex HIGH 2).
+  // Round 8's unguarded await is what let a malformed `mintsoft_auth_mode` throw out of a read that
+  // /sync gathers with the other twenty-one — and one rejection there makes the WHOLE dashboard
+  // unavailable, not just this panel. The containment lives on the registry so no screen has to
+  // remember it; see the note there for why an unanswered predicate reads as NOT configured.
+  const configured = await isWmsConnectorConfigured(connectorId)
 
   const hook = getWmsConnectorHooks(connectorId).syncDashboard
   if (!hook) return { connectorId, connectorLabel, configured, connectorData: {} }

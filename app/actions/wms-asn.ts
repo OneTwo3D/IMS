@@ -1,9 +1,10 @@
 'use server'
 
 import { requirePermission } from '@/lib/auth/server'
-import { getActiveWmsConnectorId } from '@/lib/connectors/wms/active-connector'
+import { resolveActiveWmsConnector } from '@/lib/connectors/wms/active-connector'
 import { findWmsConnectorLabel, getWmsConnectorHooks } from '@/lib/connectors/wms/registry'
 import { decorateWmsAsnState, unsupportedWmsAsnState } from '@/lib/connectors/wms/asn-types'
+import { ambiguousWmsConnectorReason } from '@/lib/connectors/wms/enabled-connector'
 import type { WmsAsnActions } from '@/lib/connectors/wms/connector-hooks'
 import type {
   WmsPurchaseOrderAsnState,
@@ -45,10 +46,20 @@ import type {
  * every arm, so it does not matter which arm a caller lands on.
  */
 
+/**
+ * `ambiguous` carries the ids when MORE THAN ONE WMS connector is enabled (round 10, Codex HIGH 1).
+ *
+ * It is not folded into the `connector: null` case, because after this round that case is reached
+ * by almost nothing else: `resolveActiveWmsConnector` falls back to the first registered connector
+ * when NOTHING is enabled, so "nothing resolved" now means either a build with no registered
+ * connector at all or — in practice — a contradictory selection. Answering both with "No WMS
+ * connector is enabled." would print the one sentence that is certainly false in the state that
+ * actually occurs.
+ */
 type ResolvedWmsAsn =
-  | { connector: string; label: string | null; actions: WmsAsnActions }
-  | { connector: string; label: string | null; actions: null }
-  | { connector: null; label: null; actions: null }
+  | { connector: string; label: string | null; actions: WmsAsnActions; ambiguous: null }
+  | { connector: string; label: string | null; actions: null; ambiguous: null }
+  | { connector: null; label: null; actions: null; ambiguous: readonly string[] | null }
 
 /**
  * The active connector, its display label, and its ASN implementation if it declares one.
@@ -57,16 +68,24 @@ type ResolvedWmsAsn =
  * ships degrades to the generic label instead of throwing inside a read.
  */
 async function resolveWmsAsn(): Promise<ResolvedWmsAsn> {
-  const connector = await getActiveWmsConnectorId()
-  if (connector === null) return { connector: null, label: null, actions: null }
+  const resolution = await resolveActiveWmsConnector()
+  if (resolution.kind === 'ambiguous') {
+    return { connector: null, label: null, actions: null, ambiguous: resolution.ids }
+  }
+  if (resolution.kind === 'none') return { connector: null, label: null, actions: null, ambiguous: null }
+  const connector = resolution.id
   const label = findWmsConnectorLabel(connector)
   const asn = getWmsConnectorHooks(connector).asn
-  if (!asn) return { connector, label, actions: null }
-  return { connector, label, actions: await asn() }
+  if (!asn) return { connector, label, actions: null, ambiguous: null }
+  return { connector, label, actions: await asn(), ambiguous: null }
 }
 
 /** The refusal for a connector that resolved but cannot do ASNs, versus nothing resolving at all. */
 function asnUnavailable(resolved: ResolvedWmsAsn): WmsCreateAsnResult {
+  // The contradiction gets its OWN sentence, and it names the remedy. "No WMS connector is
+  // enabled." in front of an operator looking at two enabled switches is a refusal they cannot act
+  // on (round 10, Codex HIGH 1).
+  if (resolved.ambiguous) return { success: false, error: ambiguousWmsConnectorReason(resolved.ambiguous) }
   if (resolved.connector === null) return { success: false, error: 'No WMS connector is enabled.' }
   return {
     success: false,

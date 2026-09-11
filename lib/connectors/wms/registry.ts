@@ -6,6 +6,7 @@ import type {
   WmsOrderPushProvenResult,
 } from './types'
 import type { WmsConnectorHooks } from './connector-hooks'
+import { unstable_rethrow } from 'next/navigation'
 import { MintsoftConnector } from '@/lib/connectors/mintsoft'
 import { isMintsoftDispatchClientScoped, mintsoftDeltaScopeToken } from '@/lib/connectors/mintsoft/settings/schema'
 import { lockMintsoftDispatchSettings } from '@/lib/connectors/mintsoft/settings/dispatch-settings-lock'
@@ -323,4 +324,62 @@ export function findWmsConnectorLabel(
   source: WmsConnectorDefSource = wmsConnectorRegistry,
 ): string | null {
   return source.findDef(id)?.label ?? null
+}
+
+/**
+ * WHETHER THIS CONNECTOR'S CONNECTION IS SET UP — and the ONE place `isConfigured()` may be called
+ * from a read (o3d-remove-shiphero round 10, Codex HIGH 2).
+ *
+ * THE DEFECT THIS CLOSES. Round 8 moved `configured` onto `WmsConnector.isConfigured()`, correctly:
+ * it is the one MANDATORY statement a connector makes about its own connection, and the hooks had
+ * been answering it from a branch that knew only what this BUILD ships. But the move was argued as
+ * behaviour-preserving by inspection and it was not. The hook-supplied value came from
+ * `mintsoftHasAuthMaterial`, which CATCHES `MintsoftAuthModeError` and reads a malformed auth mode
+ * as "not configured". `MintsoftConnector.isConfigured()` does not: it goes through
+ * `getMintsoftApiConfiguration()`, which THROWS on a malformed stored or environment auth mode.
+ *
+ * The facades then awaited it unguarded, in the reads that `/onboarding` gathers with `Promise.all`
+ * and `/sync` gathers with `Promise.allSettled`. So one bad `mintsoft_auth_mode` row — or one bad
+ * `MINTSOFT_AUTH_MODE` env var, which never passes through the validated settings action at all —
+ * took down the whole onboarding wizard and the whole /sync dashboard. Both are where an operator
+ * goes to CORRECT that value. A misconfiguration became unfixable through the UI, which is strictly
+ * worse than the wrong label round 8 set out to remove.
+ *
+ * THE RULE. `isConfigured()` answers a question, and a question that throws has not been answered.
+ * A connector that cannot say whether it is configured is NOT configured: that is the money-safe
+ * reading (nothing downstream treats an unanswered connection as live) and the operator-safe one
+ * (the corrective form stays reachable, showing exactly the "not set up" state that sends a person
+ * to fix it). The rule is enforced HERE rather than asked of each connector, because a contract
+ * cannot make a method total by writing it down — and because the facades are reads, where a throw
+ * has no honest destination.
+ *
+ * WHY THE FACADES DO NOT CALL `findWmsConnector(...).isConfigured()` THEMSELVES ANY MORE. A
+ * containment they have to remember is a containment the next screen will not have. This function
+ * is what they hold instead, so there is no unguarded call for a screen to make.
+ *
+ * `unstable_rethrow` FIRST, for the reason lib/domain/post-commit.ts states: Next signals
+ * `redirect()`/`notFound()` by throwing, and reading a redirect as "not configured" would leave an
+ * operator with an invalidated session on the wizard instead of at the challenge. An authorization
+ * denial is deliberately NOT special-cased: `isConfigured()` is a settings read that gates nothing,
+ * the facades run their own `requirePermission('sync')` before reaching this, and a connector whose
+ * predicate authorizes is violating the contract in a way no caller can repair.
+ *
+ * `findWmsConnector`, so an id left behind by a connector this build no longer ships is
+ * unconfigurable rather than a throw from inside a read.
+ */
+export async function isWmsConnectorConfigured(
+  id: string,
+  source: WmsConnectorInstanceSource = wmsConnectorRegistry,
+): Promise<boolean> {
+  const connector = findWmsConnector(id, source)
+  if (!connector) return false
+  try {
+    return await connector.isConfigured()
+  } catch (error) {
+    unstable_rethrow(error)
+    // Logged, never swallowed silently: an unanswerable predicate is a real fault an operator has
+    // to fix, and `configured: false` is what the screen shows them while they do.
+    console.error(`[wms] ${id}.isConfigured() threw; treating the connection as NOT configured`, error)
+    return false
+  }
 }

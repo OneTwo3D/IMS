@@ -10,7 +10,7 @@ import { enqueueStockSync } from '@/lib/shopping'
 import { isOperationalProductStatus } from '@/lib/products/lifecycle'
 import { classifyStockCountWmsPolicy, computeStockCountPostings, makeStockCountReference, type StockCountLineForPost } from '@/lib/domain/inventory/stock-count'
 import { getIntegrationPluginState } from '@/lib/integration-plugins'
-import { WMS_CONNECTOR_IDS } from '@/lib/connectors/wms/types'
+import { enabledWmsConnectorIds } from '@/lib/connectors/wms/enabled-connector'
 import { applyStockAdjustment } from '@/lib/domain/inventory/stock-adjustment-apply'
 
 const STOCK_TX_OPTIONS = { maxWait: 5000, timeout: 30000 }
@@ -280,7 +280,11 @@ export async function postStockCount(input: unknown): Promise<StockCountResult> 
       // Only ENABLED connectors' bindings apply (Codex r30): a stale binding of
       // a disabled/replaced WMS plugin must not block or warn on counts.
       const pluginState = await getIntegrationPluginState()
-      const enabledWmsConnectors = WMS_CONNECTOR_IDS.filter((id) => pluginState[id])
+      // A LIST, deliberately, and the one site that keeps one (round 10, Codex HIGH 1). This does
+      // not route anywhere — it screens a warehouse's bindings — so with a contradictory enabled set
+      // the conservative answer is to honour EVERY enabled connector's binding rather than to pick
+      // one or to ignore both. `find` would have silently dropped the second connector's block.
+      const enabledWmsConnectors = enabledWmsConnectorIds(pluginState)
       const binding = enabledWmsConnectors.length === 0 ? null : await tx.externalWmsBinding.findFirst({
         where: {
           warehouseId: count.warehouseId,

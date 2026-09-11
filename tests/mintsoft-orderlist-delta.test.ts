@@ -101,7 +101,7 @@ test('formatCursorInTimeZone converts a UTC instant into the tenant wall-clock (
 
 // --- Round-5 #3: unscoped Mintsoft must SKIP (not dead-letter) --------------
 
-test('[o3d-bjc #3] isDispatchClientScoped: Mintsoft needs a positive integer ClientId; other connectors are always scoped', () => {
+test('[o3d-bjc #3] isMintsoftDispatchClientScoped: a positive integer ClientId is required', () => {
   // Mintsoft, unconfigured → NOT scoped → the wrapper SKIPs the whole sweep
   // (no per-order reconcile that would throw + dead-letter every link).
   assert.equal(isMintsoftDispatchClientScoped(null), false)

@@ -2,7 +2,7 @@
 
 import { requirePermission } from '@/lib/auth/server'
 import { getActiveWmsConnectorId } from '@/lib/connectors/wms/active-connector'
-import { findWmsConnector, findWmsConnectorLabel, getWmsConnectorHooks } from '@/lib/connectors/wms/registry'
+import { findWmsConnectorLabel, getWmsConnectorHooks, isWmsConnectorConfigured } from '@/lib/connectors/wms/registry'
 import { WMS_CONNECTOR_IDS, type WmsConnectorId } from '@/lib/connectors/wms/types'
 
 /**
@@ -52,12 +52,26 @@ export type WmsOnboardingConnectionData = {
 
 export async function getWmsOnboardingConnectionData(): Promise<WmsOnboardingConnectionData> {
   await requirePermission('sync')
+  // `?? WMS_CONNECTOR_IDS[0]` NOW ALSO COVERS THE CONTRADICTORY ENABLED SET (round 10, Codex
+  // HIGH 1). `getActiveWmsConnectorId` answers null when more than one WMS connector is enabled
+  // rather than resolving the first — nothing may ROUTE to a guessed warehouse. This is not
+  // routing: it decides which setup form the wizard renders, and the wizard's job here is to be
+  // REACHABLE, so it names the first registered connector exactly as it does on an install that
+  // has enabled nothing. The contradiction itself is corrected on the Integration Plugins screen,
+  // which refuses to store it in the first place.
   const connectorId = (await getActiveWmsConnectorId()) ?? WMS_CONNECTOR_IDS[0]
   const connectorLabel = findWmsConnectorLabel(connectorId) ?? connectorId
 
   // Read on EVERY path, before the capability question, for the reason spelled out in wms-sync.ts.
-  const connector = findWmsConnector(connectorId)
-  const configured = connector !== null && await connector.isConfigured()
+  //
+  // AND THROUGH THE CONTAINED READER (round 10, Codex HIGH 2). `isConfigured()` can THROW —
+  // Mintsoft's goes through `getMintsoftApiConfiguration()`, which refuses a malformed stored or
+  // environment auth mode — and round 8 awaited it bare, inside the `Promise.all` that
+  // app/(dashboard)/onboarding/page.tsx gathers its reads with. One bad `mintsoft_auth_mode` row
+  // therefore failed the whole wizard render: the operator could not reach the very form that
+  // corrects the value, so a misconfiguration became unrecoverable through the UI. A connector that
+  // cannot say whether it is configured is not configured, and the form stays on screen.
+  const configured = await isWmsConnectorConfigured(connectorId)
 
   const hook = getWmsConnectorHooks(connectorId).onboarding
   if (!hook) return { connectorId, connectorLabel, configured, connectorData: {} }

@@ -2,7 +2,7 @@ import { Prisma } from '@/app/generated/prisma/client'
 import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
 import { getIntegrationPluginState } from '@/lib/integration-plugins'
-import { WMS_CONNECTOR_IDS } from '@/lib/connectors/wms/types'
+import { resolveEnabledWmsConnector, wmsResolutionSkipReason } from '@/lib/connectors/wms/enabled-connector'
 import { getWmsConnector } from '@/lib/connectors/wms/registry'
 import type { WmsConnector, WmsConnectorId, WmsOrderStatus } from '@/lib/connectors/wms/types'
 import { notify } from '@/lib/notifications'
@@ -476,7 +476,16 @@ export async function runWmsOrderReconcileSweep(
   const emptyCounters: WmsReconcileCounters = { intentChecked: 0, linksVerified: 0, cancelledVerified: 0, findings: 0, errors: 0 }
 
   const state = await getIntegrationPluginState()
-  const connectorId = WMS_CONNECTOR_IDS.find((id) => state[id])
+  const resolution = resolveEnabledWmsConnector(state)
+  // AMBIGUOUS SKIPS WITHOUT RETIRING ANYTHING (round 10, Codex HIGH 1). The no-connector arm below
+  // RESOLVES every open finding, on the reasoning that nothing can ever re-verify them. That
+  // reasoning does not hold when two connectors are enabled: the findings belong to a connector that
+  // IS enabled, they become actionable again the moment the selection is corrected, and closing them
+  // would discard real discrepancies over a settings mistake.
+  if (resolution.kind === 'ambiguous') {
+    return { jobId: null, status: 'SKIPPED', counters: emptyCounters, skippedReason: wmsResolutionSkipReason(resolution) }
+  }
+  const connectorId = resolution.kind === 'one' ? resolution.id : null
   if (!connectorId) {
     // No connector: every open finding is unactionable and can never re-verify
     // (Codex r27 P2 — the connector-retirement pass below would otherwise be

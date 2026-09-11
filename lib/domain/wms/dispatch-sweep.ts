@@ -2,7 +2,7 @@ import { Prisma } from '@/app/generated/prisma/client'
 import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
 import { getIntegrationPluginState } from '@/lib/integration-plugins'
-import { WMS_CONNECTOR_IDS } from '@/lib/connectors/wms/types'
+import { resolveEnabledWmsConnector, wmsResolutionSkipReason } from '@/lib/connectors/wms/enabled-connector'
 import { getWmsConnector, getWmsConnectorHooks } from '@/lib/connectors/wms/registry'
 import {
   decodeWmsDeltaCursor,
@@ -2747,8 +2747,11 @@ export async function runWmsDispatchSweep(
   const empty = { jobId: null as string | null, totalChecked: 0, dispatched: 0, pending: 0, errors: 0 }
 
   const state = await getIntegrationPluginState()
-  const connectorId = WMS_CONNECTOR_IDS.find((id) => state[id])
-  if (!connectorId) return { ...empty, status: 'SKIPPED', skippedReason: 'No WMS connector enabled' }
+  const resolution = resolveEnabledWmsConnector(state)
+  if (resolution.kind !== 'one') {
+    return { ...empty, status: 'SKIPPED', skippedReason: wmsResolutionSkipReason(resolution) }
+  }
+  const connectorId = resolution.id
   const connector = getWmsConnector(connectorId)
   if (!connector.fetchOrderStatus) {
     return { ...empty, status: 'SKIPPED', skippedReason: 'Active WMS connector has no order-status support' }

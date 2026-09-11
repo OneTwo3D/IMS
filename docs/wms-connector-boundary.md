@@ -40,7 +40,21 @@ enabled".
 **A hook states a payload and never a connection state** (round 8). `configured` is
 read from `WmsConnector.isConfigured()` — the one mandatory method on the contract —
 on every path, *before* the hook is looked up, and the hook result types carry no
-such field for a branch to write. Capability and state are different questions: round
+such field for a branch to write.
+
+**And it is read through `isWmsConnectorConfigured`, never called bare** (round 10).
+`isConfigured()` answers a question, and *a question that throws has not been
+answered*: Mintsoft's goes through `getMintsoftApiConfiguration()`, which refuses a
+malformed stored or environment auth mode rather than defaulting it. Round 8 awaited
+it unguarded inside the reads `/onboarding` gathers with `Promise.all` and `/sync`
+with `Promise.allSettled` — so one bad `mintsoft_auth_mode` row failed the whole
+wizard render and made the **entire** /sync dashboard unavailable (one rejection there
+drops all 22 panels, not just the WMS one). Both are the screens an operator uses to
+correct that value, so the misconfiguration removed its own remedy. **A connector that
+cannot say whether it is configured is NOT configured**: the containment lives on the
+registry (`lib/connectors/wms/registry.ts`), rethrows framework control flow first,
+logs, and answers `false` — which is exactly the state that keeps the corrective form
+on screen. No facade holds a connector instance to call the predicate on any more. Capability and state are different questions: round
 6's no-hook arms answered `configured: false`, i.e. a claim about the CONNECTION from
 a branch that had only established something about the BUILD. The consequence was not
 only misleading copy — `components/onboarding/integrations-step.tsx` gates the whole
@@ -107,6 +121,51 @@ It now renders the registry-derived catalogue in
 `lib/domain/integrations/plugin-catalog.ts` and spells no connector id, which is what
 lets it be scanned rather than exempted.
 
+## Exactly one WMS connector, and no silent winner
+
+`WMS_CONNECTOR_IDS` is a list, plugin state is a flag per id, and until round 10 the
+app had **no rule** that only one WMS flag may be on. Round 8's registry-derived
+Settings toggles are what made a second WMS switch exist; nothing added the rule. So
+enabling a second connector beside Mintsoft committed, reported success, and changed
+nothing — every routing site resolved the active connector as
+`WMS_CONNECTOR_IDS.find((id) => state[id])`, i.e. **first enabled wins, silently**.
+
+Two halves, and both are needed:
+
+- **Unwritable.** `INTEGRATION_PLUGIN_EXCLUSIVITY_GROUPS` /
+  `findIntegrationPluginExclusivityConflict` (`lib/integration-plugin-keys.ts`) hold
+  the shopping pair, the accounting pair and — spread from `WMS_CONNECTOR_IDS` — the
+  WMS group, so a newly registered connector is under the rule the day it is
+  registered rather than the day somebody remembers the table. Both plugin-state
+  writers (`saveIntegrationPluginState`, `saveOnboardingPluginState`) evaluate it
+  **under the connector-selection lock, against the state the write results in**,
+  which is what stops two *partial* writes assembling a state neither payload asked
+  for.
+- **Not guessed.** "This app cannot write it" is not "it cannot exist" — a restore or
+  a direct `UPDATE setting` still can. `lib/connectors/wms/enabled-connector.ts` is
+  the single reader: `resolveEnabledWmsConnector(state)` answers `none` / `one` /
+  `ambiguous`, and **`ambiguous` routes nowhere**, with its own reason, never folded
+  into "no WMS connector is enabled" while two switches are visibly on. Every
+  production resolution site reads it; the one exception is
+  `app/actions/stock-counts.ts`, which *screens* bindings rather than routing and
+  therefore honours every enabled connector's binding (`enabledWmsConnectorIds`).
+  `app/(dashboard)/sync/page.tsx` counts an ambiguous WMS as "a plugin is enabled" so
+  the page that links to the offending switches stays reachable. And
+  `app/actions/wms-asn.ts` refuses with the contradiction rather than with "No WMS
+  connector is enabled." — `getActiveWmsConnectorId` falls back to the first registered
+  connector when *nothing* is enabled, so that facade's "nothing resolved" arm is now
+  reached in practice only by a contradictory selection, and the no-connector sentence
+  would be the one statement that is certainly false there.
+
+`getWmsOnboardingConnectionData` is the deliberate exception on the other side: it keeps
+`?? WMS_CONNECTOR_IDS[0]`, so an ambiguous selection still renders the first registered
+connector's setup form. That is not routing — it decides which form appears, and the
+wizard's job in a broken state is to be *reachable*.
+
+`getActiveWmsConnectorId()`'s legacy fallback to the first registered connector still
+applies to **none**, and deliberately not to **ambiguous**: falling back there would be
+the winner-picking this removes.
+
 ## Enforcement
 
 `scripts/check-wms-connector-boundary.mjs` (run by `npm run check:all` and the
@@ -149,6 +208,7 @@ A leaf token is inspected on its own, so `const id = 'mint' + 'soft'` and
 | `'mint'.concat('soft')`, `'ab'.repeat(4)`, `.toLowerCase()`, `.trim()` | evaluated on folded receivers |
 | `atob('bWludHNvZnQ=')`, `decodeURIComponent('%6Dintsoft')` | single-literal decoders evaluated |
 | `Buffer.from('bWludHNvZnQ=', 'base64').toString('utf8')` | evaluated (round 8) — the same operation as `atob`, which was already modelled, under another name. An encoding the guard cannot resolve makes it a **reject**, not a pass |
+| `export const B = Buffer.from('bQBpAG4A…','base64')` in one module, `B.toString('utf16le')` in another | evaluated (round 10). `foldImported` copied `exact`/`opaque`/`numeric` **by name** and dropped the `binary` flag, so the bytes arrived as an ordinary latin1 string, the NULs survived the decode, and the guard exited 0 on a value that is a connector id at runtime. It now carries the remote fold **whole**, rewriting only the two fields that are meaningless outside their own `SourceFile` |
 | `import { TAIL } from './ids'; 'mint' + TAIL` | **followed across the module boundary** (round 8) and folded there. `./…`, `../…` and `@/…` specifiers resolve to repo files, through named and `*` re-exports, with an import cycle terminating as a reject |
 | `obj['mint' + 'soft']` | the computed key is itself a folded expression |
 | `'mint' + unknownVar + 'soft'` | **conservative**: an unknown operand reads as `''`, so this is a finding |
@@ -179,10 +239,11 @@ the line the expression starts on, so per-line waivers keep working on values
 stitched together over many lines.
 
 `tests/scripts/wms-connector-boundary-guard.test.ts` runs the real script against
-throwaway trees and asserts its exit code for each of those behaviours — 47 cases,
+throwaway trees and asserts its exit code for each of those behaviours — 50 cases,
 positives and negatives, 13 of them added in round 8 for the numeric fold, the
 cross-module fold, the unmodelled-operation reject, `Buffer.from` and an import
-cycle. **Keep it
+cycle, and 3 in round 10 for a `Buffer` constant crossing a module boundary in two
+encodings plus the negative that must still exit 0. **Keep it
 passing and keep adding to it**: this guard printed "clean" for two review rounds
 with a live literal in a protected file, and a guard that cannot fail is worse than
 no guard because it is believed.

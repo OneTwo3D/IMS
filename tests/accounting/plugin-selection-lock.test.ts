@@ -535,12 +535,23 @@ test('EVERY plugin key is locked, in one canonical order', async () => {
   // about which keys those are. What matters is that the lock set is EXACTLY the registry, so that
   // is what is asserted; the non-empty check is what stops the comparison passing vacuously if both
   // sides ever became empty.
+  // o3d-remove-shiphero round 10: this compared the lock order to `Object.values(SETTING_KEYS)`,
+  // and both are `INTEGRATION_PLUGIN_IDS.map(id => SETTING_KEYS[id])` — the SAME expression, so
+  // after `.sort()` they were equal by construction and the deepEqual could fail only on a
+  // duplicate id. The expectation is now re-derived from the ID list and the key RULE, which is an
+  // independent spelling: a lock set that drops an id, or a key rule that changes, fails here.
+  const { INTEGRATION_PLUGIN_IDS, integrationPluginSettingKey } = await import('@/lib/integration-plugin-keys')
   assert.deepEqual(
     [...INTEGRATION_PLUGIN_KEYS_IN_LOCK_ORDER],
-    [...Object.values(INTEGRATION_PLUGIN_SETTING_KEYS)].sort(),
+    INTEGRATION_PLUGIN_IDS.map((id) => integrationPluginSettingKey(id)).sort(),
     'every plugin key, sorted',
   )
-  assert.equal(INTEGRATION_PLUGIN_KEYS_IN_LOCK_ORDER.length, Object.keys(INTEGRATION_PLUGIN_SETTING_KEYS).length)
+  // And the map the writers index by must agree with it — a key in one and not the other is a row
+  // written outside the lock.
+  assert.deepEqual(
+    [...Object.values(INTEGRATION_PLUGIN_SETTING_KEYS)].sort(),
+    [...INTEGRATION_PLUGIN_KEYS_IN_LOCK_ORDER],
+  )
   assert.ok(INTEGRATION_PLUGIN_KEYS_IN_LOCK_ORDER.length > 0, 'and the lock set is not empty')
 })
 

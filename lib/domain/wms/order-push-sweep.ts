@@ -1,7 +1,7 @@
 import type { Prisma } from '@/app/generated/prisma/client'
 import { db } from '@/lib/db'
 import { getIntegrationPluginState } from '@/lib/integration-plugins'
-import { WMS_CONNECTOR_IDS } from '@/lib/connectors/wms/types'
+import { resolveEnabledWmsConnector, wmsResolutionSkipReason } from '@/lib/connectors/wms/enabled-connector'
 import { getWmsConnector } from '@/lib/connectors/wms/registry'
 import type { WmsConnector, WmsOrderAddress, WmsOrderPushInput, WmsOrderPushLine } from '@/lib/connectors/wms/types'
 import { decideWmsHeldRelease, wmsAmbiguousCreateMayBeReplayed, wmsAmbiguousCreateRefusal, wmsCreateReplayPolicy, type WmsCreateReplayPolicySource } from './create-replay-policy'
@@ -2691,8 +2691,9 @@ export async function runWmsOrderPushSweep(
   const empty: WmsOrderPushSweepResult = { created: 0, verified: 0, verifyQuarantined: 0, verifyUnresolved: 0, updated: 0, cancelled: 0, held: 0, released: 0, failed: 0, deadLettered: 0, validationFailed: 0, revalidated: 0, revalidateAmbiguous: 0, createClaimParked: 0, ambiguousCreateRequeued: 0 }
 
   const state = await getIntegrationPluginState()
-  const connectorId = WMS_CONNECTOR_IDS.find((id) => state[id])
-  if (!connectorId) return { ...empty, skipped: 'No WMS connector enabled' }
+  const resolution = resolveEnabledWmsConnector(state)
+  if (resolution.kind !== 'one') return { ...empty, skipped: wmsResolutionSkipReason(resolution) }
+  const connectorId = resolution.id
 
   const connector = getWmsConnector(connectorId)
   if (!connector.pushOrder) return { ...empty, skipped: 'Active WMS connector has no order-push support' }

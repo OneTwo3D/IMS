@@ -7,7 +7,7 @@ import { logActivity } from '@/lib/activity-log'
 import { requireAdmin } from '@/lib/auth/server'
 import { getSettingValue } from '@/lib/settings-store'
 import { getIntegrationPluginState, INTEGRATION_PLUGIN_SETTING_KEYS, type IntegrationPluginState } from '@/lib/integration-plugins'
-import { INTEGRATION_PLUGIN_IDS } from '@/lib/integration-plugin-keys'
+import { findIntegrationPluginExclusivityConflict, INTEGRATION_PLUGIN_IDS } from '@/lib/integration-plugin-keys'
 import { isBaseCurrencyLocked } from '@/lib/base-currency'
 import { completePluginSelectionSave, type PluginSelectionSaveResult } from '@/lib/domain/integrations/plugin-save-outcome'
 import { runPostCommit } from '@/lib/domain/post-commit'
@@ -289,13 +289,11 @@ export async function saveOnboardingPluginState(state: PluginStateInput): Promis
   await requireAdmin()
 
   // A cheap payload-only pre-check, so an obviously contradictory form never opens a transaction.
-  // It is NOT the guarantee — `resulting`, below, is (round 6, finding 1).
-  if (state.woocommerce && state.shopify) {
-    return { status: 'refused', error: 'Choose either WooCommerce or Shopify, not both.' }
-  }
-  if (state.xero && state.quickbooks) {
-    return { status: 'refused', error: 'Choose either Xero or QuickBooks, not both.' }
-  }
+  // It is NOT the guarantee — `resulting`, below, is (round 6, finding 1). Derived over every
+  // exclusivity group, WMS included (round 10, Codex HIGH 1): the wizard can turn WMS connectors on
+  // too, and a second one enabled here was accepted, stored and then routed nowhere.
+  const payloadConflict = findIntegrationPluginExclusivityConflict(state)
+  if (payloadConflict) return { status: 'refused', error: payloadConflict }
 
   // Lock, read, validate, write — in that order, inside one transaction (o3d-osl8 round 6,
   // finding 1). This step writes every exclusivity-bearing key, so the RESULTING state is
@@ -309,12 +307,8 @@ export async function saveOnboardingPluginState(state: PluginStateInput): Promis
     // miss (o3d-m0ad).
     const current = await lockIntegrationPluginSelection(tx)
     const resulting: IntegrationPluginState = { ...current, ...state }
-    if (resulting.woocommerce && resulting.shopify) {
-      return { conflict: 'Choose either WooCommerce or Shopify, not both.' }
-    }
-    if (resulting.xero && resulting.quickbooks) {
-      return { conflict: 'Choose either Xero or QuickBooks, not both.' }
-    }
+    const conflict = findIntegrationPluginExclusivityConflict(resulting)
+    if (conflict) return { conflict }
 
     // EVERY REGISTERED ID, walked from the registry's own list. The loop used to be a literal
     // five-entry tuple, which is what actually dropped a sixth connector: the state shape could

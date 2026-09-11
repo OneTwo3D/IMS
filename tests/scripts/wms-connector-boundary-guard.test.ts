@@ -619,6 +619,57 @@ test('guard: a Buffer.from of a constant in an encoding it cannot evaluate is RE
   assert.match(run.stderr, /cannot evaluate/)
 })
 
+test('guard: a Buffer constant EXPORTED from one module and decoded in another fails', (t) => {
+  // o3d-remove-shiphero round 10, Codex HIGH 3. `foldImported` copied `exact`, `opaque` and
+  // `numeric` out of the remote fold by NAME and dropped `binary` — the flag that says "these
+  // pieces are BYTES in latin1, re-encode them before reading them as a string". So the importing
+  // file's `.toString('utf16le')` took the latin1 spelling at face value, kept the interleaved
+  // NULs, matched nothing, and the guard exited 0 over a value that is the connector id at runtime.
+  //
+  // Splitting it across two files was the whole exploit: the SAME expression in one file has always
+  // failed (see the base64 case above), so this is not a new spelling, it is one already closed
+  // arriving through a module boundary.
+  const run = runGuard(t, {
+    'lib/domain/wms/parts.ts': "export const BYTES = Buffer.from('bQBpAG4AdABzAG8AZgB0AA==', 'base64')\n",
+    'lib/domain/wms/sweep.ts': "import { BYTES } from './parts'\nexport const id = BYTES.toString('utf16le')\n",
+  })
+  assert.equal(run.status, 1, run.stdout)
+  assert.match(run.stderr, /lib\/domain\/wms\/sweep\.ts:2/)
+})
+
+test('guard: the same cross-module Buffer in HEX, through a namespace import, fails', (t) => {
+  // A second encoding and a second import spelling, because one passing case is a coincidence.
+  //
+  // THE FIRST DRAFT OF THIS CASE WAS VACUOUS, and the mutation run is what showed it: it used
+  // `Buffer.from('6d696e74736f6674','hex').toString('utf8')`, whose latin1 byte spelling ALREADY
+  // reads `mintsoft`. So it passed with the `binary` flag dropped and proved only that imports are
+  // followed — a property two earlier cases already cover. The bytes here are `mintsoft` in
+  // UTF-16LE, whose latin1 spelling is NUL-interleaved and matches nothing: the finding depends on
+  // the flag surviving the module boundary and on nothing else.
+  const run = runGuard(t, {
+    'lib/domain/wms/parts.ts': "export const HEX = Buffer.from('6d0069006e00740073006f0066007400', 'hex')\n",
+    'lib/domain/wms/sweep.ts': "import * as p from './parts'\nexport const id = p.HEX.toString('utf16le')\n",
+  })
+  assert.equal(run.status, 1, run.stdout)
+  assert.match(run.stderr, /lib\/domain\/wms\/sweep\.ts:2/)
+})
+
+test('guard: a cross-module Buffer constant that does not spell an id is clean', (t) => {
+  // The negative the two above are worthless without. Carrying `binary` across the boundary must
+  // make the guard EVALUATE the bytes, not flag every re-exported Buffer — a rule that fires on
+  // ordinary code is a rule that gets allowlisted into silence.
+  const run = runGuard(t, {
+    'lib/domain/wms/parts.ts': "export const BYTES = Buffer.from('c3dlZXA=', 'base64')\n",
+    'lib/domain/wms/sweep.ts': [
+      "import { BYTES } from './parts'",
+      "export const seed = BYTES.toString('utf8')",
+      "export const wide = BYTES.toString('utf16le')",
+      '',
+    ].join('\n'),
+  })
+  assert.equal(run.status, 0, run.stderr)
+})
+
 test('guard: an import CYCLE terminates instead of recursing', (t) => {
   // Cross-module folding walks a graph, and the graph in this repo has cycles. A guard that hangs
   // or blows the stack on one is a guard that gets removed from `check:all`.

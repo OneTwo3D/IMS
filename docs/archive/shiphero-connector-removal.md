@@ -440,6 +440,65 @@ of the round-6 guard.
 re-export still has no runtime value to fold. Both are enumerated with their reasoning in
 `docs/wms-connector-boundary.md` and tracked in `o3d-lhjh`.
 
+## What round 10 closed (Codex, three HIGHs)
+
+Round 9's review returned three HIGHs and nothing else. Each one is a *consequence of a
+round-8 fix*, which is the pattern worth carrying into the Shopify and QuickBooks removals:
+the round-8 changes were right about what they set out to fix and each opened a state
+nobody had asked about.
+
+1. **Two WMS connectors could be enabled, and only the first was ever used.** Making the
+   Settings toggles registry-derived (round 8, item 2) is precisely what made a *second* WMS
+   switch exist — and nothing added the rule that only one may be on. Neither writer refused
+   it, and every routing site resolved the active connector with
+   `WMS_CONNECTOR_IDS.find((id) => state[id])`. So an operator could enable a second
+   warehouse, be told the save succeeded (it did), and watch every push, sweep and dispatch
+   keep going to Mintsoft. **The operator is told the thing they asked for happened; it did
+   not** — the quietest failure in the catalogue.
+
+   Fixed in two halves, because either alone is insufficient. The state is now **unwritable**:
+   `INTEGRATION_PLUGIN_EXCLUSIVITY_GROUPS` is a derived table (the WMS group is spread from
+   `WMS_CONNECTOR_IDS`) and both writers evaluate it **under the selection lock against the
+   state their write results in**, so two *partial* writes cannot assemble it either. And it
+   is **never guessed**: `lib/connectors/wms/enabled-connector.ts` is the one reader, it
+   answers `none`/`one`/`ambiguous`, and ambiguous routes nowhere with its own reason.
+   Sixteen inline `find(...)` call sites became one function — which also removes the shape
+   that bit this branch six times, a rule fixed in one reader and left in another.
+
+   **Why exclusivity rather than a persisted `active_wms_connector` row** (the reviewer
+   offered both): an explicit active row is a *second* source of truth beside the
+   `plugin_<id>_enabled` rows that the module-visibility check, the onboarding readiness
+   step, the /sync gate and the switches all read, and two sources can disagree. That is the
+   same defect class, one layer over.
+
+2. **The new `configured` predicate could make onboarding impossible to OPEN.** Round 8's
+   move of `configured` onto `isConfigured()` was argued behaviour-preserving *by
+   inspection*. It was not. The value it replaced came from the connector's own hook, where
+   `mintsoftHasAuthMaterial` **catches** `MintsoftAuthModeError`; `isConfigured()` goes
+   through `getMintsoftApiConfiguration()`, which **throws** on a malformed stored or
+   environment auth mode. Awaited bare inside `/onboarding`'s `Promise.all`, one bad
+   `mintsoft_auth_mode` row failed the whole wizard render — and one rejected read on `/sync`
+   drops all 22 panels. Both are where that value is corrected, so the misconfiguration
+   removed its own remedy.
+
+   The rule is now stated and enforced at the boundary: **a question that throws has not been
+   answered, and a connector that cannot say whether it is configured is not configured.**
+   `isWmsConnectorConfigured` (registry) rethrows framework control flow, logs, and answers
+   `false`; neither facade holds a connector instance to call the predicate on any more.
+
+3. **Cross-module `Buffer` constants walked past the guard.** `foldImported` copied `exact`,
+   `opaque` and `numeric` out of the remote fold **by name** and dropped `binary` — a flag
+   added in round 8, after that copy was written. So `Buffer.from('bQBpAG4A…','base64')`
+   exported from one module and `.toString('utf16le')`-ed in another arrived as an ordinary
+   latin1 string, the interleaved NULs survived, and the guard exited 0 on a value that is
+   the connector id at runtime. The same expression in *one* file had always failed, so this
+   was a closed spelling arriving through a module boundary.
+
+   It now carries the remote fold **whole** (`{...remote}`), rewriting only `pieces` and
+   `opaque`, which are the two fields that are meaningless outside their own `SourceFile`.
+   Enumerating fields is the bug; the next flag would have been dropped too. Guard suite: 47
+   cases → **50**, all 47 still passing.
+
 ## Leaks that remain, deliberately
 
 - `lib/domain/wms/booked-in-service.ts` is Mintsoft's booked-in webhook processor

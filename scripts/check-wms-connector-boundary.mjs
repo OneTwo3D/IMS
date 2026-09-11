@@ -994,11 +994,29 @@ function makeConstantFolder(sourceFile) {
       if (!folder) return foldOpaque(node)
       const remote = folder.exportFold(binding.exported, depth + 1)
       if (!remote) return foldOpaque(node)
+      // BY CONSTRUCTION, NOT BY ENUMERATION (o3d-remove-shiphero round 10, Codex HIGH 3).
+      //
+      // This used to list the fields it carried across — `exact`, `opaque`, `numeric` — and it
+      // listed them BEFORE `binary` existed. So `export const B = Buffer.from('…','base64')` folded
+      // correctly in its own module and arrived here as an ordinary string: `B.toString('utf16le')`
+      // in the importing file then re-read the latin1 byte spelling as a string, left the
+      // interleaved NULs in place, saw no id, and exited 0 over a live connector literal. A flag
+      // dropped in transit is the same defect as the blind spot this function was written to close,
+      // and an enumerated copy drops the NEXT flag too.
+      //
+      // So the remote fold is carried WHOLE, and only the two fields that are meaningless outside
+      // their own SourceFile are rewritten:
+      //   - `pieces` collapses to one piece attributed to the LOCAL node; the remote pieces carry
+      //     nodes from another file, and a line number read out of the wrong file puts the finding
+      //     (and every waiver that has to suppress it) on an unrelated line;
+      //   - `opaque` is re-pointed at the local node for the same reason — preserving whether the
+      //     remote had any opaque assembly in it, which is the only part of it that travels.
+      // Everything else — `exact`, `numeric`, `binary`, and whatever a later round adds — is the
+      // remote's answer and is reproduced unchanged.
       return {
+        ...remote,
         pieces: [{ text: foldText(remote), node }],
-        exact: remote.exact,
         opaque: remote.opaque.length > 0 ? [node] : [],
-        numeric: remote.numeric,
       }
     } finally {
       moduleResolutionStack.delete(key)

@@ -117,6 +117,34 @@ layer short twice more:
   derive them from the registry, and remove any cast that would suppress a
   missing-member error, because that cast is what makes the hole invisible.
 
+**Round 10 sharpened it a sixth, seventh and eighth time — and all three were
+consequences of round 8's own fixes.** That is the pattern to expect here: a fix that
+removes a way to be wrong tends to open a state nobody had asked about.
+
+- **A derived toggle needs a derived RULE.** Making the plugin switches
+  registry-derived gave every registered WMS connector a switch — and no rule that only
+  one may be on. Both writers refused only the two *hand-written* pairs, so a second WMS
+  connector saved successfully and routed nowhere: every site resolved the active
+  connector with `find(...)`, first enabled wins. **When you derive a control from a
+  registry, derive its constraint from the same registry**
+  (`INTEGRATION_PLUGIN_EXCLUSIVITY_GROUPS`), evaluate it under the selection lock against
+  the state the write *results in*, and make the readers refuse to pick
+  (`resolveEnabledWmsConnector` → `none`/`one`/`ambiguous`). A persisted "active
+  connector" row is the tempting alternative and is worse: it is a second source of truth
+  beside the enable flags every screen already reads.
+- **"Behaviour-preserving by inspection" is a claim, and it needs a test.** Replacing the
+  hook's `configured` with the contract's `isConfigured()` looked like a strict
+  improvement. The old value came from a predicate that **caught** a malformed-auth-mode
+  error; the new one **throws** it — into an unguarded `Promise.all` on the wizard that
+  corrects that very value. **A mandatory contract method awaited on a render path must
+  not be able to take the screen down**, and the safe reading of an unanswerable predicate
+  is the negative one. Before you move a field from one source to another, write the test
+  that distinguishes them.
+- **Copy a value object by construction, not by enumeration.** The boundary guard's
+  `foldImported` listed the fields it carried across a module boundary and was written
+  before the `binary` flag existed, so a `Buffer` constant lost it in transit and a closed
+  spelling reopened. Spread the whole result and override only what is genuinely local.
+
 So, concretely: **never pass a core a value the production wrapper computes.**
 Enumerate what each wrapper derives between the entrypoint and the core — the
 resolved connector, its capabilities, every setting read, every default behind an
@@ -236,10 +264,15 @@ from one another (`lib/jobs/shopping/drain-inbox.ts`,
 `shopping-registry.ts`), and the hardcoded `isShoppingConnectorId` predicate in
 `lib/fulfillment/shopping-order-lookup.ts`. Narrow them in lockstep.
 
-**Dead branches that must be deleted, not re-fixtured:** the
-WooCommerce/Shopify mutual-exclusivity guards in `app/actions/settings.ts:1209`
-and `app/actions/onboarding.ts:286` become unreachable, along with the tests in
-`tests/accounting/plugin-selection-lock.test.ts` that assert their refusal text.
+**Dead branches that must be deleted, not re-fixtured:** the WooCommerce/Shopify
+mutual-exclusivity rule becomes unreachable, along with the tests in
+`tests/accounting/plugin-selection-lock.test.ts` that assert its refusal text. Since
+round 10 that rule is no longer two hand-written `if`s in the writers — it is the
+`shopping` entry of `INTEGRATION_PLUGIN_EXCLUSIVITY_GROUPS`
+(`lib/integration-plugin-keys.ts`), so removing Shopify means **deleting that group
+entry**, and both writers and every test follow from the one table. Do not leave a
+one-member group behind: a group that can never conflict is a rule that reads as
+enforced and is not.
 
 **Watch:** `tests/connectors/shopping-contract.test.ts:123` asserts
 `SHOPPING_CONNECTORS.length >= 2` — the headline breakage. That file already

@@ -82,6 +82,15 @@ mock.module('@/lib/connectors/wms/registry', {
     // Where both facades now read the CONNECTION's state. Only the fictitious connector is
     // registered here: resolving the shipped one would construct it and read settings.
     findWmsConnector: (id: string) => (id === ACME_WMS_ID ? acmeConnector : null),
+    // THE REAL CONTAINMENT, over an injected registry (round 10, Codex HIGH 2). Not a stub: the
+    // shipped `isWmsConnectorConfigured` is what runs, over this file's own registry. Its try/catch
+    // is NOT exercised here — `AcmeWmsConnector.isConfigured()` returns a boolean and cannot throw —
+    // so the throwing-predicate cases live in tests/wms-second-connector-seam-production.test.ts
+    // (a registered connector whose predicate throws) and
+    // tests/wms-configured-predicate-containment.test.ts (the real MintsoftConnector).
+    isWmsConnectorConfigured: (id: string) => realRegistry.isWmsConnectorConfigured(id, {
+      findDef: (wanted: string) => (wanted === ACME_WMS_ID ? { create: () => acmeConnector } : null),
+    }),
   },
 })
 mock.module('@/lib/auth/server', {

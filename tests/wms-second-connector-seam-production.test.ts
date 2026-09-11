@@ -142,6 +142,9 @@ mock.module('@/lib/connectors/wms/registry', {
     // And the two UI facades read the connection's STATE through this — the registry is what turns
     // a registered id into the connector whose `isConfigured()` is the answer (round 8, HIGH 1).
     findWmsConnector: (id: string) => seamRegistry.findDef(id)?.create() ?? null,
+    // And they read it through the CONTAINED reader (round 10, Codex HIGH 2), which is given the
+    // seam's registry rather than replaced: the shipped try/catch is the code under test.
+    isWmsConnectorConfigured: (id: string) => realRegistry.isWmsConnectorConfigured(id, seamRegistry),
   },
 })
 
@@ -354,6 +357,39 @@ test('seam/production: the SAME no-panel connector reports unconfigured when its
   } finally {
     acmeWarehouse.configured = true
     seamDefs[1].hooks = previousHooks
+  }
+})
+
+test('seam/production: a connector whose isConfigured THROWS is reported unconfigured, not propagated', async () => {
+  // o3d-remove-shiphero round 10, Codex HIGH 2 — and the case the round-10 comment on the registry
+  // mock above would otherwise only CLAIM. `AcmeWmsConnector.isConfigured()` returns a boolean and
+  // cannot throw, so without this the contained reader and the bare `findWmsConnector(id)
+  // .isConfigured()` it replaced are indistinguishable in this file: the try/catch is never entered.
+  //
+  // A question that throws has not been answered, and an unanswered connection is NOT configured —
+  // which is what keeps the /sync panel and the onboarding form on screen for the operator who has
+  // to repair it. `null` here would mean "no WMS is enabled", which is a different and false claim.
+  const previousCreate = seamDefs[1].create
+  seamDefs[1].create = (() => ({
+    id: ACME_WMS_ID,
+    name: ACME_WMS_LABEL,
+    isConfigured: async () => { throw new Error('acme cannot resolve its auth mode') },
+  })) as never
+  try {
+    const wmsSync = await import('../app/actions/wms-sync.ts')
+    const wmsOnboarding = await import('../app/actions/wms-onboarding.ts')
+
+    const dashboard = await wmsSync.getWmsSyncDashboardData()
+    assert.notEqual(dashboard, null, 'the connector is still enabled and still named')
+    assert.equal(dashboard!.connectorId, ACME_WMS_ID)
+    assert.equal(dashboard!.configured, false, 'an unanswerable predicate is not a configured connection')
+    assert.deepEqual(dashboard!.connectorData[ACME_WMS_ID as never], ACME_PANEL, 'and the panel still renders')
+
+    const onboarding = await wmsOnboarding.getWmsOnboardingConnectionData()
+    assert.equal(onboarding.configured, false)
+    assert.deepEqual(onboarding.connectorData[ACME_WMS_ID as never], ACME_FORM, 'and so does the corrective form')
+  } finally {
+    seamDefs[1].create = previousCreate
   }
 })
 

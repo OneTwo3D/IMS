@@ -92,7 +92,7 @@ import { createPrismaDispatchDeps, reconcileOneOrder } from '@/lib/domain/wms/di
 import { bindWmsStatusToCandidate } from '@/lib/domain/wms/status-binding'
 import { releaseWithdrawalHold } from '@/app/actions/sales'
 import { getEnabledWmsConnectorId } from '@/lib/connectors/wms/active-connector'
-import { WMS_CONNECTOR_IDS } from '@/lib/connectors/wms/types'
+import { enabledWmsConnectorId, resolveEnabledWmsConnector, wmsResolutionSkipReason } from '@/lib/connectors/wms/enabled-connector'
 import type { FreshAuthFailureResult } from '@/lib/auth/session-gates'
 
 // q66in.4.2: the dead-letter / exception inbox. One aggregated read model over
@@ -694,7 +694,10 @@ async function loadOrderReconcileDrift(): Promise<OrderReconcileDriftRow[]> {
   // is the right answer — its warehouse cannot be asked anything, and the action refuses it too.
   const missing = rows.filter((row) => row.category === 'MISSING_IN_WMS')
   const pluginState = await getIntegrationPluginState()
-  const activeConnectorId = WMS_CONNECTOR_IDS.find((id) => pluginState[id])
+  // Round 10, Codex HIGH 1: no connector and an ambiguous enabled set both mean no control renders.
+  // The affordance offers to CREATE an order in a warehouse; offering it for a guessed warehouse is
+  // how the order is created in the wrong one.
+  const activeConnectorId = enabledWmsConnectorId(pluginState)
   const eligible = activeConnectorId
     ? await wmsCreateEligibleOrderIds(activeConnectorId, missing.map((row) => row.orderId))
     : new Set<string>()
@@ -2932,7 +2935,14 @@ export async function repushMissingWmsOrder(orderId: string): Promise<MutationRe
     // WMS since the sweep ran) — a reset would then make the push sweep create
     // a DUPLICATE. Revalidate absence live, and only for the active connector.
     const pluginState = await getIntegrationPluginState()
-    const activeConnectorId = WMS_CONNECTOR_IDS.find((id) => pluginState[id])
+    // Round 10, Codex HIGH 1: an ambiguous enabled set refuses with its own reason rather than being
+    // reported as "belongs to a connector that is no longer active" — the finding's connector may be
+    // perfectly active, just not alone, and the remedy differs.
+    const resolution = resolveEnabledWmsConnector(pluginState)
+    if (resolution.kind === 'ambiguous') {
+      return { success: false, error: wmsResolutionSkipReason(resolution) }
+    }
+    const activeConnectorId = resolution.kind === 'one' ? resolution.id : null
     const openFinding = await db.wmsOrderDiscrepancy.findFirst({
       where: { orderId, category: 'MISSING_IN_WMS', status: 'OPEN' },
       select: { connector: true },

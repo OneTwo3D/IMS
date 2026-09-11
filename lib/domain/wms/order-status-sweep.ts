@@ -1,6 +1,6 @@
 import { db } from '@/lib/db'
 import { getIntegrationPluginState } from '@/lib/integration-plugins'
-import { WMS_CONNECTOR_IDS } from '@/lib/connectors/wms/types'
+import { resolveEnabledWmsConnector, wmsResolutionSkipReason } from '@/lib/connectors/wms/enabled-connector'
 import { getWmsConnector, getWmsConnectorDef } from '@/lib/connectors/wms/registry'
 import { resolveWmsOrderLookupConnector } from '@/lib/connectors/wms/order-lookup'
 
@@ -66,8 +66,11 @@ export async function runWmsOrderStatusSweep(
   options?: { batchSize?: number; staleMinutes?: number },
 ): Promise<WmsOrderStatusSweepResult> {
   const state = await getIntegrationPluginState()
-  const connectorId = WMS_CONNECTOR_IDS.find((id) => state[id])
-  if (!connectorId) return { skipped: 'No WMS connector enabled', scanned: 0, updated: 0, failed: 0 }
+  const resolution = resolveEnabledWmsConnector(state)
+  if (resolution.kind !== 'one') {
+    return { skipped: wmsResolutionSkipReason(resolution), scanned: 0, updated: 0, failed: 0 }
+  }
+  const connectorId = resolution.id
 
   const connector = getWmsConnector(connectorId)
   if (!connector.fetchOrderStatus) {
