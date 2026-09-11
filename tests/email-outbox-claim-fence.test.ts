@@ -103,6 +103,23 @@ type MakeClientOptions = {
    */
   legacyUnfencedTerminalWrites?: boolean
   suppressions?: Record<string, { id: string; reason: string }>
+  /**
+   * MAKE THE `emailSuppression.upsert` THROW — ONCE, and only the first time (r22).
+   *
+   * That upsert runs INSIDE the drain's `try`, AFTER the sender has returned an invalid-recipient
+   * failure. It is one of the two post-send writes whose throw the `catch` used to label "a thrown
+   * send". The hook runs BEFORE the throw, so a test can hand the row to another worker in the same
+   * instant and make the `catch`'s own settlement land on a row it no longer owns.
+   */
+  throwOnFirstSuppressionUpsert?: () => void
+  /**
+   * MAKE THE FIRST TERMINAL `updateMany` THROW — the other post-send write (r22).
+   *
+   * "Terminal" means any updateMany that is not the claim, i.e. one whose `data.status` is not
+   * PROCESSING. Only the FIRST is failed, because the `catch` issues a terminal write of its own and
+   * a double that threw for that one too would abort the drain instead of reaching `recordConflict`.
+   */
+  throwOnFirstTerminalWrite?: () => void
 }
 
 function makeClient(rows: EmailOutboxRow[], options: MakeClientOptions = {}): {
@@ -114,6 +131,8 @@ function makeClient(rows: EmailOutboxRow[], options: MakeClientOptions = {}): {
   const store = rows.map((row) => ({ ...row }))
   const updateManyCalls: UpdateManyCall[] = []
   const created: Record<string, unknown>[] = []
+  let terminalWriteFailed = false
+  let suppressionUpsertFailed = false
 
   const delegates: EmailOutboxClient = {
     emailOutbox: {
@@ -125,6 +144,11 @@ function makeClient(rows: EmailOutboxRow[], options: MakeClientOptions = {}): {
       },
       async updateMany(args: unknown) {
         const { where, data } = args as { where: Where; data: Record<string, unknown> }
+        if (options.throwOnFirstTerminalWrite && data.status !== 'PROCESSING' && !terminalWriteFailed) {
+          terminalWriteFailed = true
+          options.throwOnFirstTerminalWrite()
+          throw new Error('the settlement write could not reach the database')
+        }
         const effectiveWhere: Where = options.legacyUnfencedTerminalWrites && 'lockedBy' in where
           ? { id: where.id }
           : where
@@ -149,6 +173,11 @@ function makeClient(rows: EmailOutboxRow[], options: MakeClientOptions = {}): {
         return options.suppressions?.[where.email] ?? null
       },
       async upsert() {
+        if (options.throwOnFirstSuppressionUpsert && !suppressionUpsertFailed) {
+          suppressionUpsertFailed = true
+          options.throwOnFirstSuppressionUpsert()
+          throw new Error('the suppression upsert could not reach the database')
+        }
         return {}
       },
     },
@@ -723,7 +752,7 @@ test('the migration changes NOTHING before its transaction begins (o3d-alnk r6)'
 // DUPLICATE DELIVERY was likely, from a worker that had never opened a socket.
 //
 // The fix is not a third boolean at a third site. The answer now comes off the wrapper that invokes
-// the sender (`openSmtpAttempt`), so it cannot be out of step with the send: there is no boolean for
+// the sender (`openRowProgress`), so it cannot be out of step with the send: there is no boolean for
 // a future branch to get wrong, and the raw sender has exactly one caller. These tests drive the two
 // paths that were wrong, the path that was right (so the counters still disagree), and the structure
 // that makes the fact underivable any other way.
@@ -824,11 +853,11 @@ test('r20: the injected sender has exactly one caller, and every conflict reads 
     senderCalls.length,
     1,
     `the injected sender is called ${senderCalls.length} times; exactly one call — the one inside `
-    + '`openSmtpAttempt` that flips `attempted` — is what keeps the reported fact tied to the send',
+    + '`openRowProgress` that flips `sendEntered` — is what keeps the reported fact tied to the send',
   )
   assert.match(
     source,
-    /attempted = true\n\s*return sendOverSmtp\(\.\.\.args\)/,
+    /sendEntered = true\n\s*const answer = await sendOverSmtp\(\.\.\.args\)/,
     'the flag is no longer set by the wrapper that performs the send',
   )
 
@@ -848,11 +877,233 @@ test('r20: the injected sender has exactly one caller, and every conflict reads 
       "'a suppression check'",
       "'a successful send'",
       "'a failed send'",
-      // The catch's PHRASE is derived from the same gate, because this `try` also covers the
-      // preparation and the attachment decode — so an operator never reads "a thrown send" about a
-      // worker that threw before reaching one.
-      "smtp.attempted ? 'a thrown send' : 'a throw before the send'",
+      // The catch's PHRASE is derived from the same progress record, because this `try` covers the
+      // preparation and the attachment decode BEFORE the sender and the suppression and settlement
+      // writes AFTER it — so an operator never reads "a thrown send" about a worker that threw
+      // before reaching one, nor about a DATABASE that threw once the send had finished (r22).
+      'smtp.thrownPhase',
     ],
     'the paths that reach recordConflict have changed — re-read which of them can have touched the socket',
+  )
+})
+
+// ---------------------------------------------------------------------------
+// ROUND 22 (Codex LOW) — THE `catch` NAMES WHAT ACTUALLY THREW, INCLUDING THE WRITES THAT RUN
+// AFTER THE SENDER HAS RETURNED.
+//
+// This is the THIRD consecutive round to find a mislabel on this one path. Round 19 found that the
+// `try` opens before `prepareQueuedEmail`, so a preparation failure was reported as a thrown send.
+// Round 21 found the other end of the same `try`: the SUPPRESSION UPSERT and the TERMINAL
+// SETTLEMENT WRITE both run AFTER the sender has returned, and when one of THEM throws, the log
+// said "a thrown send" about a worker whose send had completed. It was the DATABASE that threw, and
+// an operator reading that goes looking for a mail transport that was never the problem.
+//
+// THE FIX IS NOT A FOURTH BRANCH. `openRowProgress` records how far the row got, and `thrownPhase`
+// enumerates every outcome this `try` can hand the `catch` — before the sender, out of the sender,
+// out of the suppression upsert, out of the settlement write (split by what the sender answered),
+// and a residual arm for a statement nobody has added yet. These tests assert the PHRASE that is
+// LOGGED, not the counters: the counters were already right, and a test that only reads them cannot
+// tell a truthful label from the one this round is removing.
+// ---------------------------------------------------------------------------
+
+/** Run a drain with `console.error` captured, so the phrase an operator would read is assertable. */
+async function drainCapturingLog(harness: EmailOutboxHarness): Promise<{
+  result: Awaited<ReturnType<typeof drain>>
+  logged: string[]
+}> {
+  const logged: string[] = []
+  const original = console.error
+  console.error = (...args: unknown[]) => {
+    logged.push(args.map((arg) => String(arg)).join(' '))
+  }
+  try {
+    return { result: await drain(harness), logged }
+  } finally {
+    console.error = original
+  }
+}
+
+test('r22: a POST-SEND SUPPRESSION WRITE that throws is not reported as a thrown send', async () => {
+  // The sender RETURNED — with an invalid-recipient failure — and it was the `emailSuppression`
+  // upsert that threw. Under the old phrase this row's conflict read "after a thrown send".
+  let sends = 0
+  const { client, rows } = makeClient([makeRow()], {
+    throwOnFirstSuppressionUpsert: () => {
+      // Another worker takes the row in the same instant, so the catch's own settlement is refused
+      // and `recordConflict` is reached at all.
+      rows[0].lockedBy = 'another-worker'
+    },
+  })
+
+  const { result, logged } = await drainCapturingLog({
+    client,
+    now: () => T0,
+    prepareQueuedEmail: noPrepare,
+    logActivity: noLog,
+    async sendEmail() {
+      sends += 1
+      return { success: false, invalidRecipient: true, error: '550 5.1.1 unknown mailbox' }
+    },
+  })
+
+  // PRECONDITIONS, or the assertion below would be right for the wrong reason.
+  assert.equal(sends, 1, 'the sender must have RETURNED, or this is not the case under test')
+  assert.equal(result.processed, 1, 'the row must have been claimed, or no conflict can arise')
+  assert.equal(result.conflicted, 1, 'the terminal write must have been REFUSED, or nothing is logged')
+
+  const conflict = logged.find((line) => line.includes('terminal write REFUSED'))
+  assert.ok(conflict, `no conflict was logged; captured: ${JSON.stringify(logged)}`)
+  assert.match(
+    conflict,
+    /after a thrown suppression write, after the sender had returned an invalid-recipient failure/,
+    'the post-send suppression failure is still described as something other than what threw',
+  )
+  assert.doesNotMatch(
+    conflict,
+    /after a thrown send/,
+    'the sender RETURNED on this path; calling it a thrown send sends an operator after the wrong system',
+  )
+})
+
+test('r22: a SETTLEMENT WRITE that throws after a DELIVERED email says so', async () => {
+  let sends = 0
+  const { client, rows } = makeClient([makeRow()], {
+    throwOnFirstTerminalWrite: () => {
+      rows[0].lockedBy = 'another-worker'
+    },
+  })
+
+  const { result, logged } = await drainCapturingLog({
+    client,
+    now: () => T0,
+    prepareQueuedEmail: noPrepare,
+    logActivity: noLog,
+    async sendEmail() {
+      sends += 1
+      return { success: true }
+    },
+  })
+
+  assert.equal(sends, 1, 'the sender must have returned a DELIVERED answer, or this proves nothing')
+  assert.equal(result.processed, 1)
+  assert.equal(result.conflicted, 1, 'a worker that delivered and then lost the row is still a probable duplicate')
+
+  const conflict = logged.find((line) => line.includes('terminal write REFUSED'))
+  assert.ok(conflict, `no conflict was logged; captured: ${JSON.stringify(logged)}`)
+  assert.match(
+    conflict,
+    /after a thrown settlement write, after the sender had reported the email DELIVERED/,
+    'a database failure on a DELIVERED row is described as a mail failure',
+  )
+  assert.doesNotMatch(conflict, /after a thrown send/)
+})
+
+test('r22: a SETTLEMENT WRITE that throws after a FAILED send is a different incident, and says so', async () => {
+  // NON-VACUITY for the test above: the same statement, the same throw, a different answer from the
+  // sender — so a phrase that ignored `delivered` would make these two indistinguishable.
+  let sends = 0
+  const { client, rows } = makeClient([makeRow()], {
+    throwOnFirstTerminalWrite: () => {
+      rows[0].lockedBy = 'another-worker'
+    },
+  })
+
+  const { result, logged } = await drainCapturingLog({
+    client,
+    now: () => T0,
+    prepareQueuedEmail: noPrepare,
+    logActivity: noLog,
+    async sendEmail() {
+      sends += 1
+      return { success: false, error: '451 4.3.0 try again later' }
+    },
+  })
+
+  assert.equal(sends, 1)
+  assert.equal(result.conflicted, 1)
+
+  const conflict = logged.find((line) => line.includes('terminal write REFUSED'))
+  assert.ok(conflict, `no conflict was logged; captured: ${JSON.stringify(logged)}`)
+  assert.match(
+    conflict,
+    /after a thrown settlement write, after the sender had reported a delivery failure/,
+    'a settlement failure after an UNDELIVERED send is reported as though the email had gone out',
+  )
+})
+
+test('r22: the two pre-existing arms keep their own phrases, so the enumeration did not collapse', async () => {
+  // Rounds 19 and 20 fixed these two. They are asserted HERE on the PHRASE — the earlier tests read
+  // only the counters, which are identical whatever the phrase says — so a future `thrownPhase` that
+  // answers one arm for all four fails rather than passes.
+  const beforeTheSend = makeClient([makeRow()])
+  const before = await drainCapturingLog({
+    client: beforeTheSend.client,
+    now: () => T0,
+    logActivity: noLog,
+    async prepareQueuedEmail() {
+      beforeTheSend.rows[0].lockedBy = 'another-worker'
+      throw new Error('the invoice PDF could not be rendered')
+    },
+    async sendEmail() {
+      throw new Error('the sender must not be reached on this path')
+    },
+  })
+  const beforeLine = before.logged.find((line) => line.includes('terminal write REFUSED'))
+  assert.ok(beforeLine, `no conflict was logged; captured: ${JSON.stringify(before.logged)}`)
+  assert.match(beforeLine, /after a throw before the send/)
+  assert.equal(before.result.conflictedWithoutSend, 1)
+
+  const outOfTheSender = makeClient([makeRow()])
+  const thrown = await drainCapturingLog({
+    client: outOfTheSender.client,
+    now: () => T0,
+    prepareQueuedEmail: noPrepare,
+    logActivity: noLog,
+    async sendEmail() {
+      outOfTheSender.rows[0].lockedBy = 'another-worker'
+      throw new Error('the connection died mid-DATA')
+    },
+  })
+  const thrownLine = thrown.logged.find((line) => line.includes('terminal write REFUSED'))
+  assert.ok(thrownLine, `no conflict was logged; captured: ${JSON.stringify(thrown.logged)}`)
+  assert.match(thrownLine, /after a thrown send/)
+  assert.equal(thrown.result.conflicted, 1)
+})
+
+test('r22: `thrownPhase` enumerates the try, and every arm is distinct', () => {
+  // The structural half: five arms, five different phrases, and the residual arm present rather
+  // than the next statement inheriting arm 2's wording. A round that adds a sixth outcome without
+  // an arm for it leaves the residual phrase in an operator's log, which is honest; a round that
+  // deletes an arm fails here.
+  const source = readFileSync(fileURLToPath(new URL('../lib/email-outbox.ts', import.meta.url)), 'utf8')
+  const phase = /get thrownPhase\(\): string \{([\s\S]*?)\n      \},/.exec(source)
+  assert.ok(phase, 'lib/email-outbox.ts no longer derives the catch phrase in one place')
+
+  const phrases = [...phase[1].matchAll(/'(a [^']+)'/g)].map((match) => match[1])
+  assert.deepEqual(
+    phrases,
+    [
+      'a throw before the send',
+      'a thrown send',
+      'a thrown suppression write, after the sender had returned an invalid-recipient failure',
+      'a thrown settlement write, after the sender had reported the email DELIVERED',
+      'a thrown settlement write, after the sender had reported a delivery failure',
+      'a throw after the sender had returned, outside any write this drain names',
+    ],
+    'the outcomes the catch can distinguish have changed — re-read which statements the `try` covers',
+  )
+  assert.equal(new Set(phrases).size, phrases.length, 'two outcomes share a phrase, so they are not distinguishable')
+
+  // AND EVERY POST-SEND WRITE INSIDE THE `try` GOES THROUGH A WRAPPER. A write added without one
+  // would land in the residual arm — honest, but less useful — so this counts them.
+  assert.equal(
+    [...source.matchAll(/smtp\.settlementWrite\(/g)].length,
+    2,
+    'the settlement writes inside the `try` are no longer both routed through the progress record',
+  )
+  assert.equal(
+    [...source.matchAll(/smtp\.suppressionWrite\(/g)].length,
+    1,
+    'the suppression upsert inside the `try` is no longer routed through the progress record',
   )
 })

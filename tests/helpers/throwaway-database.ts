@@ -326,6 +326,12 @@ import { randomBytes } from 'node:crypto'
 import { fileURLToPath } from 'node:url'
 import { promisify } from 'node:util'
 
+import {
+  attestLaneDatabase,
+  markLaneDatabase,
+  type LaneDatabaseAttestation,
+} from '@/lib/lane-database-attestation'
+
 const execFileAsync = promisify(execFile)
 
 /** Resolved from this file, never from the caller's cwd. */
@@ -471,6 +477,18 @@ export type ThrowawayDatabase = {
   readonly url: string
   /** The database the configured `DATABASE_URL` names — never touched. */
   readonly configuredDatabase: string
+  /**
+   * SERVER-SIDE PROOF THAT THIS RUN CREATED THE DATABASE `url` REACHES (o3d-alnk r22).
+   *
+   * Minted by `attestLaneDatabase` after this provision marked the database and then CONNECTED WITH
+   * `url` AND READ THE MARKER BACK. It is the only thing `createEmailOutboxHarnessClient` accepts on
+   * its `database` arm, and it exists so a lane needs no ceremony at all: pass
+   * `writesTo: { kind: 'database', attestation: lane.database.attestation }` and there is no URL to
+   * spell and no environment to arrange. See lib/lane-database-attestation.ts for why a NAME could
+   * never have carried this — a pooler, an alias or a `PG*` fallback separates the name a client
+   * asks for from the queue its writes land in.
+   */
+  readonly attestation: LaneDatabaseAttestation
   /**
    * ISSUES AT MOST ONE `DROP DATABASE`, EVER. Re-runs the full name guard before issuing DDL, is a
    * no-op once the server has answered the DROP, and REFUSES BY NAME once one has been issued
@@ -927,5 +945,43 @@ export async function provisionThrowawayDatabase(options: ProvisionOptions): Pro
     )
   }
 
-  return { name, url: laneUrl.toString(), configuredDatabase, drop: dropDatabase }
+  /**
+   * MARK IT, THEN ASK IT (o3d-alnk r22). BOTH, AND IN THIS ORDER, AND BOTH DOWNSTREAM OF A CREATE
+   * THIS PROCESS WATCHED COMPLETE.
+   *
+   * `markLaneDatabase` writes this run's secret into the database — a WRITE, and therefore licensed
+   * by exactly the rule every other write in this module is: `outcome === 'created'`, the server's
+   * own answer that THIS process created it. It is also checked from the other side: the mark is
+   * refused unless `current_database()` over that connection equals `name`.
+   *
+   * `attestLaneDatabase` then CONNECTS AGAIN WITH `laneUrl` — the very string the lane's Prisma
+   * client will use — and reads the marker back. That second round trip is not ceremony: it is the
+   * one that ties the attestation to the ROUTE the harness client takes, rather than to the route
+   * this function happened to take a moment earlier.
+   *
+   * A failure in either is treated exactly as a migration failure: the lane has no usable database,
+   * so the database this process created is dropped and the refusal names it.
+   */
+  let attestation: LaneDatabaseAttestation
+  try {
+    await markLaneDatabase({ url: laneUrl.toString(), createdDatabaseName: name })
+    attestation = await attestLaneDatabase(laneUrl.toString())
+  } catch (error) {
+    let dropFailure: unknown = null
+    try {
+      await dropDatabase()
+    } catch (dropError) {
+      dropFailure = dropError
+    }
+    throw new ThrowawayDatabaseError(
+      dropFailure === null
+        ? `could not attest ${name} as a database this run created: ${String(error)}. The database this `
+          + 'lane created was dropped; nothing was left behind'
+        : `could not attest ${name} as a database this run created: ${String(error)}. The DROP that would `
+          + `have cleaned it up ALSO FAILED (${String(dropFailure)}), so ${name} IS LEFT ON THE SERVER `
+          + 'and has to be dropped by hand',
+    )
+  }
+
+  return { name, url: laneUrl.toString(), configuredDatabase, attestation, drop: dropDatabase }
 }

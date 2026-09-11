@@ -988,6 +988,21 @@ function executableFiles(dir: string, found: string[] = []): string[] {
  *                             cannot read a row, let alone write one. It is discovered here because
  *                             its prose names `psql` while explaining which connection it has to
  *                             match. o3d-2sm1.5 r41.
+ *   'lane-throwaway-marker' — builds its own `pg` client to MARK and then ATTEST a database that a
+ *                             test run created moments earlier (o3d-alnk r22). It exists so
+ *                             `createEmailOutboxHarnessClient` can require POSITIVE, server-side
+ *                             proof that a harness destination is a throwaway rather than compare
+ *                             its NAME with the configured one — a comparison round 21 showed can
+ *                             never be made sound, since a pooler alias and an unset `DATABASE_URL`
+ *                             both separate the name from the queue. Nothing in the application
+ *                             imports it: the only shipped caller is
+ *                             `tests/helpers/throwaway-database.ts`, immediately after its own
+ *                             `CREATE DATABASE` completed. Its one write is a `CREATE TABLE
+ *                             ims_lane_run_marker` plus one row, refused unless `current_database()`
+ *                             over that very connection equals the name the caller says it created —
+ *                             so it cannot be walked into this database through an alias — and it
+ *                             touches no application table in any case. Attesting is SELECT-only,
+ *                             asserted by tests/lane-database-attestation.test.ts.
  *   'seed'                  — a standalone client that WRITES this database, run from install.sh.
  *                             It takes no lock and cannot practically be made to (it runs before the
  *                             app is up); what keeps it safe is that it must not write a plugin key,
@@ -1010,6 +1025,7 @@ const DATABASE_EXECUTION_PATHS: Record<string,
   | 'deploy-connection-fence'
   | 'protocol-handshake-only'
   | 'compatibility-probe'
+  | 'lane-throwaway-marker'
   | 'seed'
 > = {
   'app/api/backup/restore/route.ts': 'replays-external-sql',
@@ -1126,6 +1142,10 @@ const DATABASE_EXECUTION_PATHS: Record<string,
   'lib/connectors/xero/payment-write-lock.ts': 'pinned-lock-session',
   'lib/domain/wms/dispatch-sweep-lock.ts': 'pinned-lock-session',
   'lib/ops/production-preflight.ts': 'pinned-lock-session',
+  // o3d-alnk r22. Discovered here because it builds its own `pg` client — deliberately, since the
+  // question it answers ("did THIS run create the database this connection string reaches?") can only
+  // be answered by the server over that connection. See the classification note above.
+  'lib/lane-database-attestation.ts': 'lane-throwaway-marker',
   'prisma/seed.ts': 'seed',
 }
 

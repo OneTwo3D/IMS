@@ -289,11 +289,28 @@ const wire = {
    * way to it was not a state this server could be in.
    */
   beforeDropLands: null as (() => Promise<void>) | null,
+  /**
+   * THE r22 MARKER, MODELLED (o3d-alnk). Provisioning now MARKS the database it created — a
+   * `CREATE TABLE ims_lane_run_marker` plus one row carrying this run's secret — and then ATTESTS it
+   * by connecting again and reading the secret back. Both statements land on this fake, so it has to
+   * hold the marker per database; without it every provision in this file would die on the
+   * unmodelled-statement guard below.
+   *
+   * Keyed by DATABASE NAME, because that is what a marker belongs to. The value is the secret the
+   * marking connection presented — this fake never invents one, so a database that was not marked
+   * has no entry and the attestation over it is refused for the reason the real server would refuse
+   * it.
+   */
+  markers: new Map<string, string>(),
+  /** The marking `CREATE TABLE`/`INSERT` fails, so the provision must drop what it created. */
+  failMarking: false,
 }
 
 /** Clear the SERVER but keep the current name — for arms that retry the same string. */
 function resetServer(): void {
   wire.databases.clear()
+  wire.markers.clear()
+  wire.failMarking = false
   wire.connections = 0
   wire.statements = []
   wire.liveSessions.clear()
@@ -327,8 +344,17 @@ class FakeMaintenanceClient {
   private issuedCreate = false
   private issuedDrop = false
   private readonly errorListeners: ((error: Error) => void)[] = []
+  /**
+   * WHICH DATABASE THIS CONNECTION REACHED (r22). The maintenance connections point at `postgres`;
+   * the marking and attesting connections point at the lane. The fake reads it off the URL's path
+   * because it models no pooler — `tests/lane-database-attestation.test.ts` is where the pooler
+   * case lives, and it says so.
+   */
+  private readonly reachedDatabase: string
 
-  constructor(_config: { connectionString: string }) { void _config }
+  constructor(config: { connectionString: string }) {
+    this.reachedDatabase = decodeURIComponent(new URL(config.connectionString).pathname.replace(/^\//, ''))
+  }
 
   /** `pg` emits `error` on an idle client whose socket fails. Kept so a listener cannot crash it. */
   on(event: string, listener: (error: Error) => void): this {
@@ -352,6 +378,40 @@ class FakeMaintenanceClient {
     if (!wire.liveSessions.has(this.backendPid)) {
       throw new Error('Client has encountered a connection error and is not queryable')
     }
+
+    // ---- r22: the marker protocol, modelled ------------------------------------------------
+    if (text.startsWith('SELECT current_database()')) {
+      return { rows: [{ database: this.reachedDatabase }] }
+    }
+
+    if (text.startsWith('CREATE TABLE "ims_lane_run_marker"')) {
+      if (wire.failMarking) throw new Error('permission denied for schema public')
+      if (wire.markers.has(this.reachedDatabase)) {
+        throw Object.assign(new Error('relation "ims_lane_run_marker" already exists'), { code: '42P07' })
+      }
+      // Recorded with a placeholder until the INSERT presents the secret, so a CREATE without an
+      // INSERT leaves a database that answers the attestation with nothing — which is what the real
+      // server would do.
+      wire.markers.set(this.reachedDatabase, '')
+      return { rows: [] }
+    }
+
+    if (text.startsWith('INSERT INTO "ims_lane_run_marker"')) {
+      if (!wire.markers.has(this.reachedDatabase)) {
+        throw Object.assign(new Error('relation "ims_lane_run_marker" does not exist'), { code: '42P01' })
+      }
+      wire.markers.set(this.reachedDatabase, String((values ?? [])[0]))
+      return { rows: [] }
+    }
+
+    if (text.startsWith('SELECT secret FROM "ims_lane_run_marker"')) {
+      const secret = wire.markers.get(this.reachedDatabase)
+      if (secret === undefined) {
+        throw Object.assign(new Error('relation "ims_lane_run_marker" does not exist'), { code: '42P01' })
+      }
+      return { rows: secret === '' ? [] : [{ secret }] }
+    }
+    // ---- end r22 ---------------------------------------------------------------------------
 
     if (text.startsWith('SELECT 1 FROM pg_database')) {
       const name = String((values ?? [])[0])
@@ -412,7 +472,11 @@ class FakeMaintenanceClient {
       // dying comes after it. A fake that died first could not express the case the finding is
       // about — "the DROP ran and the answer was lost" — and a proof that cannot express its own
       // failure mode is not a proof of anything.
-      wire.databases.delete(quotedName(text))
+      const dropped = quotedName(text)
+      wire.databases.delete(dropped)
+      // A dropped database takes its marker with it, or a later provision of the same name would
+      // find a marker it did not write (r22).
+      wire.markers.delete(dropped)
       if (wire.loseDropResponse) {
         this.kill()
         throw new Error('Connection terminated unexpectedly')
@@ -507,11 +571,13 @@ test('r10: a provision issues NO lock, NO stamp and NO ownership probe — the w
 
   // THE EXACT WIRE, in order. A stronger assertion than "does not contain X": anything ADDED here
   // has to be argued for, which is the property four rounds of added machinery needed and lacked.
-  assert.deepEqual(wire.statements, [
+  assert.deepEqual(databaseWire(), [
     'SELECT 1 FROM pg_database WHERE datname = $1',
     `CREATE DATABASE "${MINTED}"`,
     `DROP DATABASE IF EXISTS "${MINTED}" WITH (FORCE)`,
   ])
+  // This arm fails its MIGRATION, so it never reaches the marker protocol at all.
+  assert.deepEqual(markerWire(), [], 'a provision that never migrated still marked something')
 
   // Named individually so a failure says WHICH mechanism came back.
   assert.deepEqual(inferenceStatements(), [], 'an ownership-inference statement was issued')
@@ -830,6 +896,28 @@ const PROBE_STATEMENT = 'SELECT 1 FROM pg_database WHERE datname = $1'
 const createStatement = (name: string = MINTED) => `CREATE DATABASE "${name}"`
 
 /**
+ * THE r22 MARKER PROTOCOL'S OWN STATEMENTS, SEPARATED FROM THE DATABASE-LEVEL WIRE.
+ *
+ * The exact-wire assertions in this file exist to prove that NO LOCK, NO OWNERSHIP STAMP AND NO
+ * OWNERSHIP PROBE is issued about a DATABASE — the r10 property. Marking and attesting a lane are
+ * about its CONTENTS and issue no DDL against `pg_database` at all, so they are counted apart:
+ * `databaseWire()` keeps the r10 assertion exactly as strong as it was, and `markerWire()` asserts
+ * the marker traffic explicitly rather than letting it hide inside a filter.
+ */
+const MARKER_STATEMENT = /ims_lane_run_marker|current_database\(\)/
+const databaseWire = () => wire.statements.filter((statement) => !MARKER_STATEMENT.test(statement))
+const markerWire = () => wire.statements.filter((statement) => MARKER_STATEMENT.test(statement))
+/** What a lane that was marked and then attested puts on the wire, in order. */
+const MARKER_WIRE = [
+  'SELECT current_database() AS database',
+  'CREATE TABLE "ims_lane_run_marker" ( sole boolean PRIMARY KEY DEFAULT true CHECK (sole),'
+  + ' secret text NOT NULL, marked_by_pid integer NOT NULL, marked_at timestamptz NOT NULL DEFAULT now())',
+  'INSERT INTO "ims_lane_run_marker" (sole, secret, marked_by_pid) VALUES (true, $1, $2)',
+  'SELECT current_database() AS database',
+  'SELECT secret FROM "ims_lane_run_marker"',
+]
+
+/**
  * A provision that REACHES ITS RETURN, so the handle's own `drop()` is what the proofs below
  * drive. Every other test in this file stops at a refusal, which is why the drop path had only
  * ever been exercised from inside `provisionThrowawayDatabase` — and why a defect that needs TWO
@@ -941,8 +1029,12 @@ test('r11: the ordinary path drops EXACTLY ONCE, leaves nothing behind, and a fi
   assert.deepEqual(drops(), [dropStatement()], 'a repeated drop() on an ANSWERED handle issued another DROP')
 
   // THE EXACT WIRE, in order, for a provision that runs to completion and then drops.
-  assert.deepEqual(wire.statements, [PROBE_STATEMENT, createStatement(), dropStatement()])
+  assert.deepEqual(databaseWire(), [PROBE_STATEMENT, createStatement(), dropStatement()])
   assert.deepEqual(inferenceStatements(), [], 'an ownership-inference statement was issued')
+  // AND THE MARKER PROTOCOL, in full and in order (r22): marked once, then read back over a SECOND
+  // connection made with the LANE'S OWN URL — which is the connection the harness client will use,
+  // and the whole reason the attestation is a round trip rather than a name comparison.
+  assert.deepEqual(markerWire(), MARKER_WIRE)
 })
 
 test('r11/r18: a DROP the server ANSWERED stays answered, and the CALL does not fail either', async () => {
@@ -1126,7 +1218,7 @@ test('r12 HIGH: a name a live handle can still drop is NOT provisioned again', a
   // probe that decides whether this is the contended case or the already-exists one (r13) — and
   // then stops: no second CREATE, and above all no DROP.
   assert.deepEqual(
-    wire.statements,
+    databaseWire(),
     [PROBE_STATEMENT, createStatement(), PROBE_STATEMENT],
     'the refused provision issued something other than the one probe that chooses the refusal',
   )
@@ -1300,7 +1392,7 @@ test('r13: a held name whose database is STILL THERE is refused as ALREADY EXIST
 
   // IT IS STILL REFUSED BEFORE THE CREATE, and nothing was dropped: the reordering buys a better
   // sentence, not a weaker guard.
-  assert.deepEqual(wire.statements, [PROBE_STATEMENT, createStatement(), PROBE_STATEMENT])
+  assert.deepEqual(databaseWire(), [PROBE_STATEMENT, createStatement(), PROBE_STATEMENT])
   assert.deepEqual(creates(), [createStatement()], 'the refused provision issued a CREATE')
   assert.deepEqual(drops(), [], "the refused provision dropped the incumbent's database")
   assert.deepEqual([...wire.databases], [MINTED], "the incumbent's database did not survive the refusal")

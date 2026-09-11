@@ -67,11 +67,10 @@
 
 import { randomUUID } from 'node:crypto'
 
-import { Client as PgClient } from 'pg'
-
 import { logActivity } from '@/lib/activity-log'
 import { db } from '@/lib/db'
 import { uniqueConstraintFields } from '@/lib/db/prisma-unique-violation'
+import { isLaneDatabaseAttestation, type LaneDatabaseAttestation } from '@/lib/lane-database-attestation'
 import { sendEmail } from '@/lib/mailer'
 import { prepareQueuedEmail } from '@/lib/order-email'
 
@@ -178,14 +177,30 @@ export type EmailOutboxClient = {
  * which is not constructible by a type assertion from a plain object literal — so a caller who
  * assembles a client by hand fails `tsc` first and the runtime refusal second.
  *
- * AND THE MINT IS NOT A RUBBER STAMP: IT ASKS WHERE THE WRITES LAND. A harness client is legitimately
- * either a fixture the test drives in memory, or a REAL Prisma client pointed at a database the lane
- * created (`tests/concurrency` does exactly that). Those are the two `writesTo` arms, and the second
- * is CHECKED: a URL that RESOLVES to the database in `DATABASE_URL` — the live-served one on a dev
- * box — is refused, because a real client aimed at the configured database is the accident that puts
- * this drain on genuine rows without anybody writing `db` anywhere. Resolved, not read: r19 found
- * that `postgresql://ims:pw@host` names no database in its TEXT and connects to database `ims` all
- * the same, so the check now asks node-postgres what a client would connect to (`effectiveDatabaseOf`).
+ * AND THE MINT IS NOT A RUBBER STAMP: IT ASKS WHERE THE WRITES LAND — AND IT STOPPED ASKING A NAME
+ * (r22, Codex HIGH x2). A harness client is legitimately either a fixture the test drives in memory,
+ * or a REAL Prisma client pointed at a database the lane created (`tests/concurrency` does exactly
+ * that). Those are the two `writesTo` arms, and the second is CHECKED.
+ *
+ * ROUNDS 18 THROUGH 21 CHECKED IT BY COMPARING THE CANDIDATE URL'S DATABASE NAME WITH THE ONE
+ * `DATABASE_URL` CONFIGURES, and round 21 ended that approach with the two findings that show the
+ * comparison can never be made sound:
+ *
+ *   an UNSET OR EMPTY `DATABASE_URL` left nothing to compare against and the comparison was SKIPPED
+ *   — while the application's own pool still connects, through `PGDATABASE`, `PGUSER` or the OS-user
+ *   fallback. A client on the live queue was mintable with no `DATABASE_URL` set at all.
+ *
+ *   `PgClient.database` IS THE STARTUP NAME, NOT SERVER IDENTITY. A pooler maps a configured alias
+ *   onto a backend database of another name, so two URLs REACHING THE SAME QUEUE compare UNEQUAL and
+ *   the mint accepts one of them. (Advisory locks are not exclusive behind a transaction pooler
+ *   either, however exclusive they look on a bare connection; this repo has been here before.)
+ *
+ * So the `database` arm no longer carries a URL for this module to recognise. It carries a
+ * `LaneDatabaseAttestation` — proof, minted by `lib/lane-database-attestation.ts`, that a round trip
+ * over that very connection string ASKED THE DATABASE and the database answered with THIS RUN'S
+ * marker. An unknown database is refused by default instead of admitted by default, `DATABASE_URL` is
+ * not consulted at all, and a pooler alias is answered by the backend it routes to. See that module
+ * for the whole argument and for where the round trip goes, given that a mint cannot await one.
  *
  * WHAT IS STILL NOT CLOSED, SAID PLAINLY RATHER THAN IMPLIED. A caller who WANTS production rows in
  * a harness can still write `createEmailOutboxHarnessClient({ emailOutbox: db.emailOutbox, ... ,
@@ -215,15 +230,16 @@ export type EmailOutboxHarnessClient = EmailOutboxClient & {
  * client and no third:
  *
  *   `in-memory` — delegates the caller implements over its own state. Nothing leaves the process.
- *   `database`  — a real client on a database the lane created. The URL is RESOLVED the way
- *                 node-postgres would connect it — path, `PGDATABASE`, then the user, which is what
- *                 a pathless URL connects to — and compared with `DATABASE_URL` resolved the same
- *                 way, so the configured (on this host, LIVE-SERVED) database is refused however it
- *                 is spelled, and a URL that cannot be resolved is refused as well.
+ *   `database`  — a real client on a database THIS RUN CREATED, evidenced by a
+ *                 `LaneDatabaseAttestation`: an object `attestLaneDatabase` mints only after
+ *                 connecting with that lane's own connection string and reading back this process's
+ *                 marker. It is not a name, not a URL and not a string of any kind, so there is no
+ *                 spelling to get wrong and nothing for a pooler, an alias or a `PG*` fallback to
+ *                 come apart from (r22).
  */
 export type EmailOutboxHarnessDestination =
   | { kind: 'in-memory' }
-  | { kind: 'database'; url: string }
+  | { kind: 'database'; attestation: LaneDatabaseAttestation }
 
 /**
  * THE MINT REGISTER. Module-private and a `WeakSet`, so membership is not a property of the object:
@@ -239,49 +255,6 @@ function refuseHarnessClientMint(detail: string): never {
   )
 }
 
-/**
- * THE DATABASE A CLIENT BUILT ON THIS URL WOULD ACTUALLY CONNECT TO — ANSWERED BY THE DRIVER
- * (r20, Codex HIGH).
- *
- * This used to read the URL's PATH and call a URL with no path "naming no database", which passed
- * the comparison below. `postgresql://ims:pw@host` has no path AND IS NOT PATHLESS TO THE DRIVER:
- * node-postgres defaults the database name to the USER when the URL omits it, so that URL connects
- * to database `ims`. Spelling the live URL that way therefore reached the live queue through the
- * very guard written to stop it. The same trapdoor is open for a trailing slash, for `PGDATABASE`
- * and `PGUSER`, and for the OS user pg falls back to last — every one of them a field the TEXT of
- * the URL does not contain.
- *
- * SO THE TEXT IS NOT READ AT ALL ANY MORE. `new PgClient({ connectionString })` builds the driver's
- * own `ConnectionParameters` — the same object a real client would connect with, because it is the
- * same constructor — and `client.database` is that resolution's answer. It costs no socket, no
- * query and no DNS: a `pg.Client` is inert until `connect()`. Every equivalent spelling collapses
- * into one answer BEFORE the comparison, which is why this is a resolution step rather than a list
- * of spellings to recognise: `postgres://` and `postgresql://`, a percent-encoded path, a trailing
- * slash, a `?dbname=`/`?database=` query parameter (which pg-connection-string overwrites with the
- * path and so never honours), the `PG*` environment variables and the user-defaults-to-database
- * rule are all resolved by the driver, not matched by us.
- *
- * AND ANYTHING IT CANNOT RESOLVE IS A REFUSAL, not a pass. The cost of refusing a genuine harness
- * URL is a test that has to spell its database out; the cost of passing one is a customer email.
- */
-type ResolvedDatabase = { readonly database: string } | { readonly unresolved: string }
-
-function effectiveDatabaseOf(url: string): ResolvedDatabase {
-  // An absent value is not a spelling of a destination. The driver would resolve `''` to the OS
-  // user's name, which is an answer to a question nobody asked.
-  if (url.trim() === '') return { unresolved: 'it is empty' }
-  let resolved: unknown
-  try {
-    // THE ONE READ, and it is the driver's. Nothing about `url` is parsed here.
-    resolved = new PgClient({ connectionString: url }).database
-  } catch (error) {
-    return { unresolved: `node-postgres could not read it as a connection string (${String(error)})` }
-  }
-  if (typeof resolved !== 'string' || resolved === '') {
-    return { unresolved: 'node-postgres resolved no database name from it' }
-  }
-  return { database: resolved }
-}
 
 /**
  * MINT A CLIENT THE DRAIN WILL ACCEPT.
@@ -319,54 +292,37 @@ export function createEmailOutboxHarnessClient(input: {
   if (writesTo === null || typeof writesTo !== 'object') {
     refuseHarnessClientMint(
       `\`writesTo\` is ${writesTo === null ? 'null' : typeof writesTo}; say where this client's writes `
-      + "land — `{ kind: 'in-memory' }` or `{ kind: 'database', url }`",
+      + "land — `{ kind: 'in-memory' }` or `{ kind: 'database', attestation }`",
     )
   }
   const destination = writesTo as Record<string, unknown>
   const kind = destination.kind // THE ONLY READ.
   if (kind === 'database') {
-    const url = destination.url // THE ONLY READ.
-    if (typeof url !== 'string') {
-      refuseHarnessClientMint(`\`writesTo.url\` must be a string; received ${typeof url}`)
-    }
-    // THE CHECK WITH TEETH. `DATABASE_URL` is the application's own database — on this host the
-    // LIVE-SERVED one — and a real client pointed at it drains real customer rows through whatever
-    // fake sender completes the harness.
+    const attestation = destination.attestation // THE ONLY READ.
+    // THE CHECK WITH TEETH, AND IT IS NO LONGER A COMPARISON OF NAMES (r22, Codex HIGH x2).
     //
-    // BOTH SIDES ARE RESOLVED THE WAY THE DRIVER WOULD CONNECT THEM, then compared by NAME alone.
-    // The resolution is what closes the equivalent-spelling class (see `effectiveDatabaseOf`); the
-    // name-only comparison is deliberate on top of it, because it refuses MORE than a
-    // host-and-port-and-name comparison would — `localhost` vs `127.0.0.1` vs the machine name, and
-    // a second port onto the same cluster, are all refused by resolving to the same NAME, and no
-    // host spelling can smuggle a URL past a comparison that never looks at the host.
-    const lane = effectiveDatabaseOf(url)
-    if ('unresolved' in lane) {
+    // A `LaneDatabaseAttestation` is not a value a caller can construct: it is minted by
+    // `attestLaneDatabase` ONLY after that function connected with the lane's own connection string,
+    // asked the backend it actually reached for this process's marker, and got it back. Membership
+    // lives in a module-private `WeakSet` over there, so the attestation cannot be forged, copied off
+    // another object, spread, or faked by a `Proxy` — the same mechanism, and the same reason, as the
+    // mint register this function maintains for clients.
+    //
+    // WHAT THAT ENDS. The old check resolved `writesTo.url` and `DATABASE_URL` to database NAMES and
+    // compared them. Round 21 found that an unset or empty `DATABASE_URL` SKIPPED the comparison
+    // while the app's pool still connects via `PGDATABASE`/`PGUSER`/the OS user, and that a startup
+    // name is not server identity — a pooler can route two unequal names to one queue. Both are
+    // properties of comparing NAMES, and neither has a last case: the fix is to stop asking which
+    // database this is NOT, and require positive, server-side proof of which database it IS.
+    if (!isLaneDatabaseAttestation(attestation)) {
       refuseHarnessClientMint(
-        `\`writesTo.url\` cannot be resolved to the database a client would connect to: ${lane.unresolved}. `
-        + 'An unresolvable destination is REFUSED rather than passed, because a URL this module cannot '
-        + 'resolve is a URL it cannot prove is not the live queue. Spell the database out',
+        '`writesTo.attestation` is not an attestation this run minted. The `database` arm no longer '
+        + 'takes a URL: a name is a claim a client makes ABOUT a database, and an alias, a `PG*` '
+        + 'fallback or a pooler can make that claim come apart from the queue the writes land in. '
+        + 'Provision the lane with tests/helpers/throwaway-database.ts and pass the `attestation` on '
+        + 'its handle — `attestLaneDatabase` mints one only after the database itself answers with '
+        + "THIS RUN'S marker (o3d-alnk r22)",
       )
-    }
-    const configured = process.env.DATABASE_URL
-    if (configured !== undefined && configured !== '') {
-      // FAIL CLOSED ON THE CONFIGURED SIDE TOO. If DATABASE_URL cannot be resolved there is no
-      // name to compare against, and "no comparison" must not read as "no match".
-      const configuredDatabase = effectiveDatabaseOf(configured)
-      if ('unresolved' in configuredDatabase) {
-        refuseHarnessClientMint(
-          `DATABASE_URL cannot be resolved to a database name: ${configuredDatabase.unresolved}. `
-          + 'With nothing to compare against, this mint cannot establish that `writesTo.url` is NOT '
-          + 'the configured database, so it refuses',
-        )
-      }
-      if (configuredDatabase.database === lane.database) {
-        refuseHarnessClientMint(
-          `\`writesTo.url\` names ${lane.database}, which is the database DATABASE_URL configures. A harness `
-          + 'client on the configured database is not a harness: its writes land on the real queue, and '
-          + 'the fake sender that completes the harness stamps genuine customer email SENT with nothing '
-          + 'delivered. Provision a database for the lane (tests/helpers/throwaway-database.ts)',
-        )
-      }
     }
   } else if (kind !== 'in-memory') {
     refuseHarnessClientMint(
@@ -908,9 +864,9 @@ export async function processPendingEmailOutbox(
   // out of the caller's harness or all five came out of production.
   const {
     client,
-    // NAMED FOR ITS ONE CALLER. The drain never calls this directly — `openSmtpAttempt` below is
+    // NAMED FOR ITS ONE CALLER. The drain never calls this directly — `openRowProgress` below is
     // the only expression in this function that does, and `tests/email-outbox-claim-fence.test.ts`
-    // asserts that by counting the references. See `openSmtpAttempt` for why.
+    // asserts that by counting the references. See `openRowProgress` for why.
     sendEmail: sendOverSmtp,
     prepareQueuedEmail: prepare,
     logActivity: log,
@@ -921,39 +877,106 @@ export async function processPendingEmailOutbox(
   const result: ProcessEmailOutboxResult = { processed: 0, sent: 0, failed: 0, conflicted: 0, conflictedWithoutSend: 0 }
 
   /**
-   * THE ONE PLACE THAT KNOWS WHETHER A ROW'S SMTP SOCKET WAS TOUCHED (r20, Codex MEDIUM).
+   * HOW FAR THIS ROW GOT — THE ONE PLACE THAT KNOWS, AND THE ONLY THING THE `catch` IS ALLOWED TO
+   * ASK (r20 Codex MEDIUM; WIDENED IN r22, Codex LOW).
    *
-   * Round 18 fixed this as a FACT AT ONE SITE: the suppression branch stopped passing `true` to
-   * `recordConflict`. Round 19 found the second reader of the same rule — the `catch` passed `true`
-   * unconditionally, but the `try` opens BEFORE `prepareQueuedEmail` and before attachment decoding,
-   * so a preparation failure on a row another worker had reclaimed was reported as a probable
-   * DUPLICATE DELIVERY by a worker that had delivered nothing. One rule, several readers, one of
-   * them fixed — which is the shape of defect that comes back.
+   * WHY IT IS ASKED RATHER THAN TOLD. Round 18 fixed the "was a send attempted" fact AT ONE SITE:
+   * the suppression branch stopped passing `true` to `recordConflict`. Round 19 found the second
+   * reader of the same rule — the `catch` passed `true` unconditionally, though the `try` opens
+   * BEFORE `prepareQueuedEmail` and before attachment decoding. One rule, several readers, one of
+   * them fixed, which is the shape of defect that comes back. So no call site states it: every flag
+   * here flips INSIDE the wrapper that performs the act, each is a closure variable behind a getter,
+   * and there is no assignable property to set and no boolean argument to get wrong.
    *
-   * SO THE ANSWER IS NO LONGER SOMETHING A CALL SITE STATES. It is DERIVED, in one place, from the
-   * act itself: `attempted` flips inside the wrapper that invokes the sender, and nothing else can
-   * write it — the flag is a closure variable behind a getter, so there is no assignable property
-   * to set and no boolean argument for a future branch to get wrong. A conflict reported "after a
-   * send" is therefore a conflict on a row whose sender was really entered.
+   * WHY THERE ARE NOW FIVE FLAGS AND NOT ONE. Round 21 found the `catch` still mislabelling — for
+   * the third round running. `try` does not end at the sender: it also covers the SUPPRESSION UPSERT
+   * and the TERMINAL SETTLEMENT WRITE, both of which run AFTER the sender has returned. When one of
+   * those threw, the log said "a thrown send" about a worker whose send had completed — it was the
+   * DATABASE that threw, and an operator reading that goes hunting a mail transport that was never
+   * the problem. Rounds 19 and 21 each added a branch for the case they found; this adds none.
+   * Instead the `catch` is given the WHOLE state of the row's progress and one derivation
+   * (`thrownPhase`) that enumerates every outcome this `try` can produce, so the next statement added
+   * inside the `try` is either covered by an existing arm or falls into the residual arm — and the
+   * residual arm is honest rather than wrong.
    *
-   * IT FLIPS BEFORE THE `await`, DELIBERATELY. The question is "might this worker have put a
-   * message on the wire", and a send that is still in flight already might have. Flipping it after
-   * the await would answer a different, useless question.
+   * `sendEntered` FLIPS BEFORE THE `await`, DELIBERATELY. The question it answers is "might this
+   * worker have put a message on the wire", and a send still in flight already might have.
+   * `sendReturned` flips after, because that is a different question and the two came apart.
+   *
+   * THE SENDER'S ANSWER IS READ EXACTLY ONCE, HERE (r7). `send` returns a frozen SNAPSHOT of the
+   * four fields the drain acts on, taken inside the wrapper. So `delivered` below and the branching
+   * at the call site are the same reading of a caller-supplied object, not two.
    */
-  const openSmtpAttempt = () => {
-    let attempted = false
+  const openRowProgress = () => {
+    let sendEntered = false
+    let sendReturned = false
+    let delivered = false
+    let suppressionWriteEntered = false
+    let settlementWriteEntered = false
     return {
       /** Read-only by construction: the only writer is the wrapper below. */
       get attempted(): boolean {
-        return attempted
+        return sendEntered
       },
-      send: (...args: Parameters<typeof sendOverSmtp>) => {
-        attempted = true
-        return sendOverSmtp(...args)
+      send: async (...args: Parameters<typeof sendOverSmtp>) => {
+        sendEntered = true
+        const answer = await sendOverSmtp(...args)
+        // THE ONE READING of each field of the caller's result.
+        const snapshot = Object.freeze({
+          success: answer.success === true,
+          permanent: answer.permanent === true,
+          invalidRecipient: answer.invalidRecipient === true,
+          error: answer.error,
+        })
+        sendReturned = true
+        delivered = snapshot.success
+        return snapshot
+      },
+      /** The suppression upsert, which runs only after an UNSUCCESSFUL send has returned. */
+      suppressionWrite: async <T>(write: () => Promise<T>): Promise<T> => {
+        suppressionWriteEntered = true
+        return write()
+      },
+      /** A terminal settlement write issued from INSIDE the `try` — never the `catch`'s own. */
+      settlementWrite: async <T>(write: () => Promise<T>): Promise<T> => {
+        settlementWriteEntered = true
+        return write()
+      },
+      /**
+       * EVERY OUTCOME THIS `try` CAN HAND THE `catch`, AND THE PHRASE FOR EACH. Ordered by how far
+       * the row got, so each arm is reached only when the ones above it are false:
+       *
+       *   1. the sender was never entered        — `prepareQueuedEmail` or the attachment decode
+       *                                            threw. NOTHING WAS SENT.
+       *   2. entered and never returned          — the throw came OUT OF the sender. A message may
+       *                                            be on the wire.
+       *   3. returned, suppression write entered — the sender answered `invalidRecipient` and the
+       *                                            `emailSuppression.upsert` threw. THE SEND
+       *                                            COMPLETED; the DATABASE threw.
+       *   4. returned, settlement write entered  — the sender answered and the terminal write threw.
+       *                                            Split by the answer, because "the row could not be
+       *                                            settled after the customer was emailed" and "…
+       *                                            after a delivery failure" are different incidents.
+       *   5. returned, nothing else entered      — residual. Nothing in the `try` produces it today;
+       *                                            it exists so a statement added later is described
+       *                                            truthfully instead of inheriting arm 2's phrase.
+       */
+      get thrownPhase(): string {
+        if (!sendEntered) return 'a throw before the send'
+        if (!sendReturned) return 'a thrown send'
+        if (suppressionWriteEntered && !settlementWriteEntered) {
+          return 'a thrown suppression write, after the sender had returned an invalid-recipient failure'
+        }
+        if (settlementWriteEntered) {
+          return delivered
+            ? 'a thrown settlement write, after the sender had reported the email DELIVERED'
+            : 'a thrown settlement write, after the sender had reported a delivery failure'
+        }
+        return 'a throw after the sender had returned, outside any write this drain names'
       },
     }
   }
-  type SmtpAttempt = ReturnType<typeof openSmtpAttempt>
+  type RowProgress = ReturnType<typeof openRowProgress>
 
   const pending = await client.emailOutbox.findMany({
     where: {
@@ -984,20 +1007,22 @@ export async function processPendingEmailOutbox(
    * this drain never sent.
    *
    * IT IS NOW ASKED, NOT TOLD (r20, Codex MEDIUM). The parameter used to be a `boolean` each call
-   * site asserted, and round 19 found a site asserting it wrongly. It is the row's `SmtpAttempt`
+   * site asserted, and round 19 found a site asserting it wrongly. It is the row's `RowProgress`
    * instead, and the answer comes off the wrapper that performs the send. THE FOUR PATHS THAT REACH
    * HERE, and what each therefore reports:
    *
    *   a suppression check — `attempted` is false; the branch returns before the sender exists.
-   *   a successful send   — true; `smtp.send` returned.
-   *   a failed send       — true; `smtp.send` returned an unsuccessful result.
-   *   a throw             — WHICHEVER IS TRUE, and the PHRASE follows the same answer. The `try`
-   *                         also covers `prepare` and the attachment decode, so a throw from those
-   *                         reports false and logs "a throw before the send", while a throw out of
-   *                         `smtp.send` reports true and logs "a thrown send". The gate makes that
-   *                         distinction — not a branch that has to know where in the `try` it is.
+   *   a successful send   — true; `progress.send` returned.
+   *   a failed send       — true; `progress.send` returned an unsuccessful result.
+   *   a throw             — WHICHEVER IS TRUE, and the PHRASE comes from the same object:
+   *                         `progress.thrownPhase` enumerates every outcome the `try` can produce —
+   *                         a throw before the sender, out of the sender, out of the suppression
+   *                         upsert, or out of the terminal settlement write — so a POST-SEND
+   *                         DATABASE failure is no longer logged as a thrown send (r22, Codex LOW).
+   *                         The gate and the phrase are two readings of one progress record, not a
+   *                         branch that has to know where in the `try` it is.
    */
-  const recordConflict = (claim: EmailClaim, phase: string, smtp: SmtpAttempt): void => {
+  const recordConflict = (claim: EmailClaim, phase: string, smtp: RowProgress): void => {
     if (smtp.attempted) {
       result.conflicted++
       console.error(
@@ -1045,9 +1070,10 @@ export async function processPendingEmailOutbox(
     const claim: EmailClaim = { id: email.id, token, claimedAt }
     result.processed++
 
-    // ONE GATE PER ROW, opened before anything that could lose the row. Every `recordConflict`
-    // below reads its answer off this object, so no path can report a send this row never made.
-    const smtp = openSmtpAttempt()
+    // ONE PROGRESS RECORD PER ROW, opened before anything that could lose the row. Every
+    // `recordConflict` below reads its answer off this object, so no path can report a send this row
+    // never made — nor a thrown send for a write that threw after the sender had finished.
+    const smtp = openRowProgress()
 
     // The suppression check runs AFTER the claim, and its write is fenced like every other.
     // It used to run BEFORE, writing FAILED through an unfenced update on a row this worker
@@ -1086,23 +1112,23 @@ export async function processPendingEmailOutbox(
         attachments,
       })
 
-      // ONE READING OF THE SENDER'S ANSWER, for the same reason the harness is snapshotted above
-      // (r7 HIGH 2). `sendResult` is a value the CALLER'S sender built; `error` in particular used
-      // to be read three times, in three writes that must agree about what went wrong. A field
-      // that decides a branch and is then re-read to act on that branch is the shape this branch
-      // has spent a round removing, so it is not left standing here either.
+      // THE SENDER'S ANSWER WAS READ ONCE, INSIDE `smtp.send`, for the same reason the harness is
+      // snapshotted above (r7 HIGH 2). `sendResult` is that wrapper's FROZEN snapshot rather than the
+      // object the CALLER'S sender built, so these four reads cannot disagree with each other or with
+      // the `delivered` the progress record holds — `error` in particular used to be read three
+      // times, in three writes that must agree about what went wrong.
       const delivered = sendResult.success
-      const reportedPermanent = !!sendResult.permanent
-      const invalidRecipient = !!sendResult.invalidRecipient
+      const reportedPermanent = sendResult.permanent
+      const invalidRecipient = sendResult.invalidRecipient
       const sendError = sendResult.error
 
       if (delivered) {
-        const settled = await settleClaimedEmail(client, claim, {
+        const settled = await smtp.settlementWrite(() => settleClaimedEmail(client, claim, {
           status: 'SENT',
           sentAt: now(),
           lastError: null,
           processingStartedAt: null,
-        })
+        }))
         if (settled) result.sent++
         else recordConflict(claim, 'a successful send', smtp)
         continue
@@ -1112,7 +1138,7 @@ export async function processPendingEmailOutbox(
       const permanentFailure = reportedPermanent || attempts >= EMAIL_MAX_ATTEMPTS
       if (invalidRecipient) {
         const suppressionReason = sendError ?? 'Invalid recipient rejected by SMTP provider'
-        await client.emailSuppression.upsert({
+        await smtp.suppressionWrite(() => client.emailSuppression.upsert({
           where: { email: normalizedRecipient },
           create: {
             email: normalizedRecipient,
@@ -1125,15 +1151,15 @@ export async function processPendingEmailOutbox(
             source: 'smtp',
             lastHitAt: now(),
           },
-        })
+        }))
       }
-      const settled = await settleClaimedEmail(client, claim, {
+      const settled = await smtp.settlementWrite(() => settleClaimedEmail(client, claim, {
         status: permanentFailure ? 'FAILED' : 'PENDING',
         attempts,
         lastError: sendError ?? 'Unknown email error',
         availableAt: permanentFailure ? email.availableAt : new Date(now().getTime() + getBackoffMs(email.attempts)),
         processingStartedAt: null,
-      })
+      }))
       // This is the write the issue was raised for: unfenced, it re-armed a row another
       // worker had already settled to SENT, so the duplication was not bounded at two.
       if (settled) result.failed++
@@ -1149,10 +1175,13 @@ export async function processPendingEmailOutbox(
         processingStartedAt: null,
       })
       if (settled) result.failed++
-      // THE PHASE IS DERIVED TOO, for the same reason the flag is. This `catch` covers the
-      // preparation and the attachment decode as well as the send, so a fixed phrase here would put
-      // "a thrown send" in an operator's log for a worker that never reached the sender.
-      else recordConflict(claim, smtp.attempted ? 'a thrown send' : 'a throw before the send', smtp)
+      // THE PHASE IS DERIVED TOO, for the same reason the flag is — AND IT IS DERIVED FROM THE WHOLE
+      // OF THE ROW'S PROGRESS, not from one flag (r22, Codex LOW). This `catch` covers the
+      // preparation and the attachment decode BEFORE the sender, and the suppression upsert and the
+      // terminal settlement write AFTER it. A phrase chosen from `attempted` alone called all four
+      // "a thrown send" or "a throw before the send", so a database failure on a settled row was
+      // reported as a mail-transport failure. `thrownPhase` names each of them; see its enumeration.
+      else recordConflict(claim, smtp.thrownPhase, smtp)
     }
   }
 

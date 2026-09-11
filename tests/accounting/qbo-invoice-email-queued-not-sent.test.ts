@@ -409,7 +409,16 @@ test('ROUND 7: the outbox really does terminalise a row FAILED for a suppressed 
   // answer differently on the second read. The claim this guard makes is unchanged, so BOTH
   // halves are asserted: where the permanence flag comes FROM, and what it decides. Asserting
   // only the second would let the derivation be quietly dropped.
-  assert.match(sender, /const reportedPermanent = !!sendResult\.permanent/, "the sender's own permanence flag")
+  // r22 moved the coercion INTO the single reading: `smtp.send` freezes a snapshot of the four
+  // fields, so `sendResult` is this module's own object and `reportedPermanent` is a plain read of
+  // it. Both halves are still asserted — where the flag comes FROM, and where it was normalised —
+  // because asserting only the local would let the derivation be quietly dropped.
+  assert.match(sender, /const reportedPermanent = sendResult\.permanent/, "the sender's own permanence flag")
+  assert.match(
+    sender,
+    /permanent: answer\.permanent === true,/,
+    "the permanence flag is no longer normalised inside the wrapper that takes the sender's one reading",
+  )
   assert.match(sender, /const permanentFailure = reportedPermanent \|\| attempts >= EMAIL_MAX_ATTEMPTS/)
   assert.match(sender, /status: permanentFailure \? 'FAILED' : 'PENDING'/)
 })
@@ -494,7 +503,7 @@ test('r18: the sentence\'s cadences match the cron config and the cron doc, and 
 // SAME false premise still standing in `lib/domain/integrations/outbox-registry.ts` and in
 // `tests/concurrency/outbox-stale-park.concurrent.test.ts`: both said the email drain empties PENDING
 // inside the reclaim window, so worker A's copy is "typically already SENT" when B replays. It is the
-// other way round — the reclaim window is FIFTEEN MINUTES and the drain is HOURLY — so B's replay
+// other way round — the reclaim window is TWENTY MINUTES and the drain is HOURLY — so B's replay
 // usually meets a copy that is still PENDING, and the partial unique index refuses it. The verdict
 // (unsafe-to-replay) is unchanged; the operational story was wrong.
 //
@@ -508,10 +517,12 @@ test('r18: the sentence\'s cadences match the cron config and the cron doc, and 
 // anchors, and this test resolves every one of them in the file it names.
 // ---------------------------------------------------------------------------
 
-/** Milliseconds this rationale has words for. An unmapped lease must fail, not be guessed. */
+/** Milliseconds this rationale has words for. An unmapped window must fail, not be guessed. */
 const RECLAIM_WINDOW_WORDS: Record<string, string> = {
   '600000': 'TEN MINUTES',
   '900000': 'FIFTEEN MINUTES',
+  '1200000': 'TWENTY MINUTES',
+  '1500000': 'TWENTY-FIVE MINUTES',
   '3600000': 'ONE HOUR',
 }
 
@@ -559,15 +570,46 @@ const CITATIONS: Array<{ citedIn: string; citation: string; resolvesIn: string; 
   },
 ]
 
-test('r20: the reclaim window and the drain cadence are grepped, and BOTH copies of the rationale say so', async () => {
+test('r22: the reclaim window is the RESOLVED constant, and BOTH copies of the rationale say so', async () => {
   const { readFileSync } = await import('node:fs')
   const { fileURLToPath } = await import('node:url')
   const repoRoot = fileURLToPath(new URL('../../', import.meta.url))
   const read = (relative: string) => readFileSync(`${repoRoot}${relative}`, 'utf8')
 
-  // (1) THE RECLAIM WINDOW, out of the lease map the constant is derived from. The constant is
-  // `Math.max(...Object.values(INTEGRATION_OUTBOX_DRAIN_LEASES_MS))`, so the max of the map's
-  // literals is the same number by the same rule — read, not recalled.
+  // (1) THE RECLAIM WINDOW, AS A RESOLVED VALUE (Codex round 21, LOW).
+  //
+  // THIS USED TO BE A PREFIX MATCH, AND THAT IS THE DEFECT. It read
+  // `/ADMIN_OUTBOX_STALE_PROCESSING_LOCK_MS = INTEGRATION_OUTBOX_MAX_LEASE_MS/` out of the source and
+  // called the two constants the same number. They are not: the declaration continues
+  // `+ ADMIN_OUTBOX_POST_LEASE_MARGIN_MS` on the NEXT LINE, so the window is 1_200_000 ms and not
+  // 900_000. A regex anchored to the start of an expression passes over whatever the expression goes
+  // on to add, which means the one test written to stop this rationale drifting could not see the
+  // drift — it agreed with the wrong number twice.
+  //
+  // So the window is taken from the CONSTANT, evaluated, and the derivation is asserted as an
+  // EQUALITY of resolved values rather than as a shape of source text. A future edit that changes the
+  // margin, drops it, or adds another term changes `reclaimMs` and lands in the words table below.
+  const { ADMIN_OUTBOX_POST_LEASE_MARGIN_MS, ADMIN_OUTBOX_STALE_PROCESSING_LOCK_MS } =
+    await import('@/lib/domain/integrations/outbox-admin')
+  const { INTEGRATION_OUTBOX_MAX_LEASE_MS } = await import('@/lib/domain/integrations/outbox-leases')
+
+  const reclaimMs = ADMIN_OUTBOX_STALE_PROCESSING_LOCK_MS
+  assert.equal(
+    reclaimMs,
+    INTEGRATION_OUTBOX_MAX_LEASE_MS + ADMIN_OUTBOX_POST_LEASE_MARGIN_MS,
+    'the dead-letter gate is no longer the maximum lease plus the post-lease margin — re-read both copies '
+    + 'of the rationale, which state the window as a number',
+  )
+  assert.notEqual(
+    reclaimMs,
+    INTEGRATION_OUTBOX_MAX_LEASE_MS,
+    'ADMIN_OUTBOX_STALE_PROCESSING_LOCK_MS is once again EQUAL to the max lease. Round 20 asserted that '
+    + 'alias while the margin made it false; if the margin has genuinely gone to zero, both copies of the '
+    + 'rationale have to stop naming two numbers',
+  )
+
+  // AND THE MAXIMUM REALLY IS THE MAXIMUM OF THE DECLARED MAP — read out of the source, not recalled,
+  // so the constant cannot quietly stop being derived from the leases it is supposed to cover.
   const leases = read('lib/domain/integrations/outbox-leases.ts')
   const leaseLiterals = [...leases.matchAll(/^\s{2}(\w+):\s*([\d_]+),$/gm)].map((m) => ({
     name: m[1],
@@ -577,18 +619,16 @@ test('r20: the reclaim window and the drain cadence are grepped, and BOTH copies
     leaseLiterals.length >= 2,
     `the walk found ${leaseLiterals.length} lease literals in outbox-leases.ts — it read nothing, so nothing below is proven`,
   )
-  const reclaimMs = Math.max(...leaseLiterals.map((lease) => lease.ms))
+  assert.equal(
+    INTEGRATION_OUTBOX_MAX_LEASE_MS,
+    Math.max(...leaseLiterals.map((lease) => lease.ms)),
+    'INTEGRATION_OUTBOX_MAX_LEASE_MS is no longer the maximum of the declared lease map',
+  )
+
   const reclaimWords = RECLAIM_WINDOW_WORDS[String(reclaimMs)]
   assert.ok(
     reclaimWords,
     `the reclaim window is now ${reclaimMs}ms, which this rationale has no words for — re-read both copies of it`,
-  )
-
-  // The alias really is that constant, so the rationale may name either.
-  assert.match(
-    read('lib/domain/integrations/outbox-admin.ts'),
-    /ADMIN_OUTBOX_STALE_PROCESSING_LOCK_MS = INTEGRATION_OUTBOX_MAX_LEASE_MS/,
-    'ADMIN_OUTBOX_STALE_PROCESSING_LOCK_MS is no longer the max drain lease — the rationale names the wrong number',
   )
 
   // (2) THE DRAIN CADENCE, out of the cron table — the repo's only statement of it.
@@ -610,10 +650,38 @@ test('r20: the reclaim window and the drain cadence are grepped, and BOTH copies
     'tests/concurrency/outbox-stale-park.concurrent.test.ts',
   ]) {
     const text = read(relative)
+    // The number as this repo writes numbers — `1_200_000`, every three digits, not just the last
+    // group. The old expression only ever inserted ONE separator, which was right for 900_000 and
+    // silently wrong for anything seven digits long.
+    const grouped = String(reclaimMs).replace(/\B(?=(\d{3})+(?!\d))/g, '_')
+
+    // THE NUMBER, REQUIRED — NOT "THE NUMBER OR THE WORDS" (r22). This used to be
+    // `includes(grouped) || includes(reclaimWords)`, and round 22's own mutation showed what that
+    // buys: reverting the sentence to "900_000 ms, FIFTEEN MINUTES" left the NEXT paragraph's
+    // "TWENTY MINUTES IS INSIDE THE HOUR" standing, the `||` found the words there, and the test
+    // passed over a rationale that now stated the window twice with two different numbers. A stale
+    // claim sitting beside the text that corrects it is the shape this guard exists to catch, so
+    // BOTH halves are now required and the wrong ones are excluded.
     assert.ok(
-      text.includes(String(reclaimMs).replace(/(\d+)(\d{3})$/, '$1_$2')) || text.includes(reclaimWords),
-      `${relative} no longer states the reclaim window as ${reclaimWords} — re-read it against the lease map`,
+      text.includes(grouped),
+      `${relative} no longer states the reclaim window as ${grouped} ms — re-read it against `
+      + 'ADMIN_OUTBOX_STALE_PROCESSING_LOCK_MS, which is the max lease PLUS the post-lease margin',
     )
+    assert.ok(
+      text.includes(reclaimWords),
+      `${relative} no longer states the reclaim window as ${reclaimWords}`,
+    )
+    // AND NO OTHER WINDOW IS NAMED. Every value in the words table is a window this rationale could
+    // be about; exactly one of them may appear in a file that states it. (The LEASE is written in
+    // lower case in both copies precisely so the two claims cannot be confused for one another.)
+    for (const otherWords of Object.values(RECLAIM_WINDOW_WORDS)) {
+      if (otherWords === reclaimWords) continue
+      assert.ok(
+        !text.includes(otherWords),
+        `${relative} states the reclaim window as ${otherWords} as well as ${reclaimWords} — one of the `
+        + 'two is stale, and a reader has no way to tell which',
+      )
+    }
     assert.match(
       text,
       /HOURLY|documented HOURLY/,

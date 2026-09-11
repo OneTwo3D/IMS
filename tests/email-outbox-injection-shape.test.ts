@@ -888,36 +888,37 @@ test('r18 NON-VACUITY: a MINTED client is accepted, and the drain runs to a SENT
   assert.equal(fixture.store['row-1'].status, 'SENT')
 })
 
-test('r18: the mint refuses a real client pointed at the CONFIGURED database', async () => {
-  // The mint is not a rubber stamp. A harness client is legitimately either an in-memory fixture or
-  // a real client on a database the lane created; the second arm names its URL, and a URL naming the
-  // database in DATABASE_URL — on this host the LIVE-SERVED one — is the accident that puts this
-  // drain on genuine customer rows without anybody writing `db` anywhere.
+test('r22: the mint refuses a `database` destination that carries no attestation this run minted', async () => {
+  // WHAT REPLACED THE URL COMPARISON, AND WHY. Rounds 18-21 asked whether `writesTo.url` resolved to
+  // the same database NAME as `DATABASE_URL`. Round 21 ended that: an unset or empty `DATABASE_URL`
+  // SKIPPED the comparison while the app's pool still connects through `PGDATABASE`/`PGUSER`, and a
+  // pooler routes two UNEQUAL names to one queue. So the arm no longer takes a name of any kind — it
+  // takes a `LaneDatabaseAttestation`, minted only after `attestLaneDatabase` connected with the
+  // lane's own connection string and read back a marker only this run could have written.
+  //
+  // THE POSITIVE SIDE — that a genuine attestation MINTS, that a pooler alias onto the live database
+  // is refused, and that an unset `DATABASE_URL` changes nothing — needs a server to answer, so it
+  // lives in tests/lane-database-attestation.test.ts against a fake one. What belongs HERE is that
+  // the mint's door is a capability and not a shape.
   const { createEmailOutboxHarnessClient } = await loadOutbox()
   const delegates = unmintedClient()
-  const previous = process.env.DATABASE_URL
-  process.env.DATABASE_URL = 'postgresql://ims:secret@127.0.0.1:5432/onetwo3d_ims_dev?schema=public'
-  try {
-    assert.throws(
-      () => createEmailOutboxHarnessClient({
-        emailOutbox: delegates.emailOutbox,
-        emailSuppression: delegates.emailSuppression,
-        writesTo: { kind: 'database', url: 'postgresql://ims:secret@127.0.0.1:5432/onetwo3d_ims_dev' },
-      }),
-      /names onetwo3d_ims_dev, which is the database DATABASE_URL configures/,
-    )
+  const mint = (attestation: unknown) => createEmailOutboxHarnessClient({
+    emailOutbox: delegates.emailOutbox,
+    emailSuppression: delegates.emailSuppression,
+    writesTo: { kind: 'database', attestation } as unknown as { kind: 'in-memory' },
+  })
 
-    // NON-VACUITY: a database this lane would have created is minted without complaint, so the
-    // refusal above is about the DESTINATION and not about the arm.
-    const lane = createEmailOutboxHarnessClient({
-      emailOutbox: delegates.emailOutbox,
-      emailSuppression: delegates.emailSuppression,
-      writesTo: { kind: 'database', url: 'postgresql://ims:secret@127.0.0.1:5432/ims_throwaway_alnkfence_0123456789abcdef' },
-    })
-    assert.equal(lane.emailOutbox, delegates.emailOutbox)
-  } finally {
-    if (previous === undefined) delete process.env.DATABASE_URL
-    else process.env.DATABASE_URL = previous
+  for (const [why, attestation] of [
+    ['the live URL, which is what this arm used to take', 'postgresql://ims:secret@127.0.0.1:5432/onetwo3d_ims_dev'],
+    ['a lane URL, which used to be enough', 'postgresql://ims:secret@127.0.0.1:5432/ims_throwaway_alnkfence_0123456789abcdef'],
+    ['an object with the right shape', { database: 'ims_throwaway_alnkfence_0123456789abcdef' }],
+    ['nothing at all', undefined],
+  ] as [string, unknown][]) {
+    assert.throws(
+      () => mint(attestation),
+      /`writesTo\.attestation` is not an attestation this run minted/,
+      `the mint accepted ${why}`,
+    )
   }
 })
 
@@ -960,166 +961,4 @@ test('r18: a minted client is FROZEN, so its delegates cannot be swapped after t
     ;(minted as unknown as Record<string, unknown>).emailOutbox = { findMany: async () => [] }
   }, TypeError)
   assert.equal(minted.emailOutbox, delegates.emailOutbox)
-})
-
-// ---------------------------------------------------------------------------
-// ROUND 20 (Codex HIGH) — THE MINT COMPARES THE DATABASE A CLIENT WOULD CONNECT TO, NOT THE TEXT
-// OF THE URL.
-//
-// Round 18's check read the URL's PATH. `postgresql://ims:pw@host` has no path, so it "named no
-// database" — and node-postgres connects that URL to database `ims`, because it defaults the
-// database name to the USER when the URL omits it. The hole that opens is on the CONFIGURED side:
-// with `DATABASE_URL` spelled that way, `configuredName` was `null`, the comparison was skipped
-// entirely, and a real client on the live queue could be minted and handed to a fake sender that
-// stamps genuine customer rows SENT with nothing delivered.
-//
-// The fix is ONE RESOLUTION STEP rather than a list of spellings: both sides are handed to
-// `new pg.Client({ connectionString })` — the driver's own parameter resolution, no socket opened —
-// and its answer is compared. Every equivalent spelling below collapses before the comparison. An
-// unresolvable URL, on either side, is a REFUSAL: the cost of refusing a genuine harness URL is a
-// test that spells its database out; the cost of passing one is a customer email.
-// ---------------------------------------------------------------------------
-
-/** Run `body` with DATABASE_URL and the PG* variables set exactly as given, and restore them after. */
-async function withDatabaseEnv(
-  env: { DATABASE_URL?: string; PGDATABASE?: string; PGUSER?: string },
-  body: () => void | Promise<void>,
-): Promise<void> {
-  const keys = ['DATABASE_URL', 'PGDATABASE', 'PGUSER'] as const
-  const previous = Object.fromEntries(keys.map((key) => [key, process.env[key]]))
-  try {
-    for (const key of keys) {
-      const value = env[key]
-      if (value === undefined) delete process.env[key]
-      else process.env[key] = value
-    }
-    await body()
-  } finally {
-    for (const key of keys) {
-      const value = previous[key]
-      if (value === undefined) delete process.env[key]
-      else process.env[key] = value
-    }
-  }
-}
-
-/** The live database this whole guard exists to keep a harness off. */
-const LIVE = 'onetwo3d_ims_dev'
-
-/**
- * Spellings that all resolve to the LIVE database. Each is a URL a caller could plausibly write,
- * and every one of them must be refused by the same comparison.
- */
-const EQUIVALENT_SPELLINGS: Array<{ why: string; env: { DATABASE_URL: string; PGDATABASE?: string }; url: string }> = [
-  {
-    why: 'THE PATHLESS LIVE URL AS THE CONFIGURED SIDE — the round-19 hole exactly: no path, so the '
-      + 'old check compared nothing at all, and pg connects it to the database named by the USER',
-    env: { DATABASE_URL: `postgresql://${LIVE}:secret@127.0.0.1:5432` },
-    url: `postgresql://ims:secret@127.0.0.1:5432/${LIVE}`,
-  },
-  {
-    why: 'the pathless form as the CANDIDATE side: it resolves to the live database by the same rule',
-    env: { DATABASE_URL: `postgresql://ims:secret@127.0.0.1:5432/${LIVE}?schema=public` },
-    url: `postgresql://${LIVE}:secret@127.0.0.1:5432`,
-  },
-  {
-    why: 'postgres:// rather than postgresql://, over the pathless configured URL',
-    env: { DATABASE_URL: `postgres://${LIVE}:secret@127.0.0.1:5432` },
-    url: `postgres://ims:secret@127.0.0.1:5432/${LIVE}`,
-  },
-  {
-    why: 'a TRAILING SLASH on the configured URL, which is a path the old check read as empty',
-    env: { DATABASE_URL: `postgresql://${LIVE}:secret@127.0.0.1:5432/` },
-    url: `postgresql://ims:secret@db.internal:5432/${LIVE}`,
-  },
-  {
-    why: 'a PERCENT-ENCODED path',
-    env: { DATABASE_URL: `postgresql://ims:secret@127.0.0.1:5432/${LIVE}` },
-    url: 'postgresql://ims:secret@127.0.0.1:5432/onetwo3d%5Fims%5Fdev',
-  },
-  {
-    why: 'a HOST ALIAS — localhost for 127.0.0.1. The comparison never looks at the host, so every '
-      + 'alias of the machine is refused by resolving to the same NAME',
-    env: { DATABASE_URL: `postgresql://ims:secret@127.0.0.1:5432/${LIVE}` },
-    url: `postgresql://ims:secret@localhost:5432/${LIVE}`,
-  },
-  {
-    why: 'a DIFFERENT PORT onto the same cluster — refused for the same reason as the host alias',
-    env: { DATABASE_URL: `postgresql://ims:secret@127.0.0.1:5432/${LIVE}` },
-    url: `postgresql://ims:secret@127.0.0.1:6543/${LIVE}`,
-  },
-  {
-    why: 'PGDATABASE, which the driver reads when the URL omits the database and the TEXT never carries',
-    env: { DATABASE_URL: `postgresql://ims:secret@127.0.0.1:5432/${LIVE}`, PGDATABASE: LIVE },
-    url: 'postgresql://ims:secret@127.0.0.1:5432',
-  },
-]
-
-test('r20: every spelling that RESOLVES to the configured database is refused', async () => {
-  const { createEmailOutboxHarnessClient } = await loadOutbox()
-  const delegates = unmintedClient()
-
-  for (const spelling of EQUIVALENT_SPELLINGS) {
-    await withDatabaseEnv(spelling.env, () => {
-      assert.throws(
-        () => createEmailOutboxHarnessClient({
-          emailOutbox: delegates.emailOutbox,
-          emailSuppression: delegates.emailSuppression,
-          writesTo: { kind: 'database', url: spelling.url },
-        }),
-        // The MESSAGE is asserted, not merely the throw: the old check also threw for a pathless
-        // candidate, saying it "names no database", which is a refusal for the wrong reason and
-        // would leave the configured-side hole passing silently.
-        new RegExp(`names ${LIVE}, which is the database DATABASE_URL configures`),
-        `a harness client was minted over the live queue: ${spelling.why} (${spelling.url})`,
-      )
-    })
-  }
-})
-
-test('r20: a URL neither side can resolve is REFUSED rather than passed', async () => {
-  const { createEmailOutboxHarnessClient } = await loadOutbox()
-  const delegates = unmintedClient()
-  const mint = (url: string) => createEmailOutboxHarnessClient({
-    emailOutbox: delegates.emailOutbox,
-    emailSuppression: delegates.emailSuppression,
-    writesTo: { kind: 'database', url },
-  })
-
-  await withDatabaseEnv({ DATABASE_URL: `postgresql://ims:secret@127.0.0.1:5432/${LIVE}` }, () => {
-    assert.throws(() => mint('postgres://host:notaport/db'), /cannot be resolved to the database a client would connect to/)
-    assert.throws(() => mint(''), /cannot be resolved to the database a client would connect to/)
-  })
-
-  // AND THE CONFIGURED SIDE FAILS CLOSED TOO. "No comparison" must never read as "no match".
-  await withDatabaseEnv({ DATABASE_URL: 'postgres://host:notaport/db' }, () => {
-    assert.throws(
-      () => mint('postgresql://ims:secret@127.0.0.1:5432/ims_throwaway_alnkfence_0123456789abcdef'),
-      /DATABASE_URL cannot be resolved to a database name/,
-    )
-  })
-})
-
-test('r20: the refusals are about the DESTINATION, so a lane database still mints', async () => {
-  // NON-VACUITY for the table above: if this failed, every case there would pass for the wrong
-  // reason and the mint would simply be refusing the `database` arm outright.
-  const { createEmailOutboxHarnessClient } = await loadOutbox()
-  const delegates = unmintedClient()
-
-  await withDatabaseEnv({ DATABASE_URL: `postgresql://ims:secret@127.0.0.1:5432/${LIVE}` }, () => {
-    for (const url of [
-      // A lane database, spelled out.
-      'postgresql://ims:secret@127.0.0.1:5432/ims_throwaway_alnkfence_0123456789abcdef',
-      // And a PATHLESS lane URL: resolvable (it connects to the database named by the user) and
-      // not the configured one, so it mints. Resolution is what decides this, not the spelling.
-      'postgresql://ims_throwaway_alnkfence_0123456789abcdef:secret@127.0.0.1:5432',
-    ]) {
-      const lane = createEmailOutboxHarnessClient({
-        emailOutbox: delegates.emailOutbox,
-        emailSuppression: delegates.emailSuppression,
-        writesTo: { kind: 'database', url },
-      })
-      assert.equal(lane.emailOutbox, delegates.emailOutbox, `a lane URL was refused: ${url}`)
-    }
-  })
 })

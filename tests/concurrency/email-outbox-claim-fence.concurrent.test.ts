@@ -106,14 +106,20 @@ const drainWith = (
 ) => run({ harness })
 
 /**
- * THE LANE'S HARNESS CLIENT, MINTED AND DECLARED (o3d-alnk r18).
+ * THE LANE'S HARNESS CLIENT, MINTED AND DECLARED (o3d-alnk r18; the destination re-founded in r22).
  *
  * `harness.client` is a branded type: `lane.db as unknown as EmailOutboxClient` no longer compiles
- * there and would be refused at runtime as an unminted client. The mint is where this lane says
- * WHERE ITS WRITES LAND — `lane.database.url`, the database it created — and the mint REFUSES a URL
- * naming the database `DATABASE_URL` configures, which on this host is the live-served one. So the
- * accident this whole file could have caused (a real Prisma client drained by a fake sender against
- * the dev database) is now refused at the door rather than avoided by care.
+ * there and would be refused at runtime as an unminted client. The mint is also where this lane says
+ * WHERE ITS WRITES LAND — and what it says is no longer a URL for the mint to RECOGNISE.
+ *
+ * It is `lane.database.attestation`: an object `attestLaneDatabase` minted after CONNECTING with
+ * this lane's own connection string and reading back a marker only this run could have written.
+ * Rounds 18 to 21 compared the URL's database name with `DATABASE_URL`'s, and round 21 showed that
+ * comparison can never be made sound — an unset `DATABASE_URL` skipped it entirely while the app's
+ * pool still connects through `PGDATABASE`/`PGUSER`, and a pooler routes two unequal names to one
+ * queue. So the accident this whole file could have caused (a real Prisma client drained by a fake
+ * sender against the LIVE-SERVED dev database) is now refused because the dev database carries no
+ * marker — not because its name was recognised.
  */
 async function laneHarnessClient(lane: Lane): Promise<EmailOutboxHarnessClient> {
   const { createEmailOutboxHarnessClient } = await import('@/lib/email-outbox')
@@ -121,7 +127,7 @@ async function laneHarnessClient(lane: Lane): Promise<EmailOutboxHarnessClient> 
   return createEmailOutboxHarnessClient({
     emailOutbox: prisma.emailOutbox,
     emailSuppression: prisma.emailSuppression,
-    writesTo: { kind: 'database', url: lane.database.url },
+    writesTo: { kind: 'database', attestation: lane.database.attestation },
   })
 }
 

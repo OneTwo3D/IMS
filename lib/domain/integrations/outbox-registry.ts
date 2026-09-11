@@ -231,13 +231,16 @@ export const INTEGRATION_OUTBOX_REGISTRY = defineOutboxRegistry({
     //      corrected this same false premise in lib/domain/accounting/unrecorded-posted-document.ts
     //      and left THIS copy of it standing: one claim, two readers, one of them fixed. Both are now
     //      read out of the repo rather than recalled, and the cadence test walks both files.
-    //      The reclaim window is `ADMIN_OUTBOX_STALE_PROCESSING_LOCK_MS`, which is
+    //      The reclaim window is `ADMIN_OUTBOX_STALE_PROCESSING_LOCK_MS`, AND IT IS NOT AN ALIAS FOR
+    //      THE MAXIMUM LEASE (Codex round 21, LOW — round 20 asserted the alias and was wrong). It is
     //      `INTEGRATION_OUTBOX_MAX_LEASE_MS` — the largest lease any drain in this build may take,
-    //      900_000 ms, FIFTEEN MINUTES (`xeroAccountingEntry` in
-    //      lib/domain/integrations/outbox-leases.ts; aliased in lib/domain/integrations/outbox-admin.ts).
+    //      900_000 ms, fifteen minutes (`xeroAccountingEntry` in
+    //      lib/domain/integrations/outbox-leases.ts) — PLUS `ADMIN_OUTBOX_POST_LEASE_MARGIN_MS`, the
+    //      five-minute clock-skew margin declared beside it in
+    //      lib/domain/integrations/outbox-admin.ts. So the window is 1_200_000 ms, TWENTY MINUTES.
     //      The email drain is documented HOURLY (help-docs/settings.md, the `/api/cron/email-outbox`
     //      row of the cron table — the repo's only statement of its cadence).
-    //      FIFTEEN MINUTES IS INSIDE THE HOUR, so when worker B replays, worker A's copy is usually
+    //      TWENTY MINUTES IS INSIDE THE HOUR, so when worker B replays, worker A's copy is usually
     //      STILL PENDING — inside the predicate — and the index REFUSES B's insert. The duplicate
     //      arrives when the timing CROSSES A DRAIN: a drain settles A's copy to SENT, a SENT row is
     //      outside the predicate, B's insert is then accepted, and the customer is emailed twice.
