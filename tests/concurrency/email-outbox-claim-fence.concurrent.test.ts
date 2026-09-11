@@ -380,6 +380,22 @@ test(
         }
         const gone = await lane.sql.query('SELECT 1 FROM pg_database WHERE datname = $1', [spare.name])
         assert.equal(gone.rows.length, 0, 'drop() left the database behind')
+
+        // (c) AND THE DROPPED NAME IS NEVER HANDED OUT AGAIN (r14), against a REAL server: the
+        // database is provably gone — the query above just said so — and the name is still this
+        // process's, because an ISSUED DROP is not a LANDED one and the register cannot tell the
+        // difference without asking. Under r12 this provision SUCCEEDED, which is the window the
+        // r14 finding is about; the unit proofs stage the window itself with a fake wire.
+        await assert.rejects(
+          () => provisionThrowawayDatabase({ label: 'alnkspare', mintName: () => spare.name }),
+          (error: unknown) =>
+            error instanceof ThrowawayDatabaseError
+            && error.message.includes(spare.name)
+            && /THIS PROCESS ALREADY HOLDS/.test(error.message),
+          'a name this process had already issued a DROP for was provisioned again',
+        )
+        const stillGone = await lane.sql.query('SELECT 1 FROM pg_database WHERE datname = $1', [spare.name])
+        assert.equal(stillGone.rows.length, 0, 'the refused provision created a database at the dropped name')
       })
 
       await t.test('a worker reclaimed while on the SMTP socket is REFUSED its terminal write', async () => {
