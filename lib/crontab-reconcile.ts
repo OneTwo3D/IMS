@@ -203,15 +203,17 @@ async function applyCrontabFromSettings(
  * READ THE CRONTAB BACK AND SAY WHETHER THE SCHEDULE IS ACTUALLY THERE (o3d-jjdm).
  *
  * `crontab -` exiting 0 establishes that the command was issued and did not complain. It does not
- * establish that the schedule exists, and those two come apart on exactly the deployment this app
- * ships a HARDENED unit for (the units `scripts/install.sh` generates do not set
- * `NoNewPrivileges`, so the setgid transition carries them and this divergence does not arise
- * there): `/usr/bin/crontab` is setgid `crontab`, `NoNewPrivileges=true` in
- * deploy/systemd/ims-stage.service makes the kernel ignore that setgid bit, and the spool is
- * `drwx-wx--T root:crontab` — so the binary runs as the plain service user with no access to the
- * spool at all. Measured on the deployment host: identical binary, identical user, `crontab -l`
- * exits 0 under an ordinary exec and 1 with "Permission denied" under `--no-new-privs`. Trusting
- * the exit status is proof of an adjacent property — that a command ran, not that a schedule exists.
+ * establish that the schedule exists. Trusting the exit status is proof of an adjacent property —
+ * that a command ran, not that a schedule is there.
+ *
+ * THE SANDBOX IS NOT WHAT THIS CHECK CATCHES, and saying so was wrong twice before. A unit that
+ * cannot reach the spool fails `readOwnCrontabResult()` ABOVE, and `reconcileCrontab` returns
+ * there without ever spawning `crontab -` — so the no-access case can never reach this function.
+ * (It is also not the shipped hardened unit's case: `deploy/systemd/ims-stage.service` carries
+ * `SupplementaryGroups=crontab`, so its read resolves.) What CAN reach here is a write that was
+ * accepted over a spool holding something else: a writer outside this app's lock — a `crontab -e`
+ * by hand, a configuration-management run, an edit to the spool file as root — or a `crontab` on
+ * PATH that is not the client we think it is. Those are what the operator message names.
  *
  * IT COMPARES THE MANAGED BLOCK, NOT THE WHOLE FILE. The block is the part this app owns and the
  * part the question is about; a whole-file comparison would additionally be asserting that no
