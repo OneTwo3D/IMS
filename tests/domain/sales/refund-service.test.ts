@@ -6328,12 +6328,30 @@ test("an order claiming a bigger share than its A2 batch journal debited is refu
   assert.match(String(state.refunds[0].allocationBasisUnresolved), /records a £40\.00 share of an A2 journal that debited Allocated Inventory only £25\.00/)
 })
 
-test("a settled journal whose payload was COMPACTED off it still resolves to the recorded figure (o3d-o97 r5)", async () => {
-  // ILLEGIBLE is not the same as UNPROVED, and must not become a refusal. `backReferenceEvidence
-  // CompactedAt` compaction drops `payload` from a row it otherwise keeps, so a settled journal can
-  // be present with nothing readable on it — the same position as a row retention deleted outright,
-  // which this branch already resolves to the recorded amount. Refusing here would strand the whole
-  // £40 on every order old enough to have been compacted.
+test("a COMPACTED A2 DEBIT journal is REFUSED, where it used to authorise the whole recorded figure (o3d-i0o6 r4)", async () => {
+  // o3d-i0o6 r4 (Codex round 3, HIGH 2) — AN EXISTING TEST THAT WAS PINNING THE DEFECT.
+  //
+  // This test used to read "a settled journal whose payload was COMPACTED off it still resolves to
+  // the recorded figure", and it asserted that a compacted A2 DEBIT journal credits the whole
+  // recorded £40 (less relief). Its reasoning was that illegible is "the same position as a row
+  // retention deleted outright, which this branch already resolves to the recorded amount".
+  //
+  // BOTH HALVES OF THAT WERE WRONG, in one specific way: it imported a rule from the RELIEF side of
+  // the contra onto the DEBIT side, where the polarity is reversed.
+  //
+  //   * The parity it claimed does not exist. When the A2 journal row is ABSENT,
+  //     `proveAllocationDebitPosting` REFUSES ("no longer on record (retention) ... cannot be
+  //     established") — it has never resolved a missing DEBIT journal to the recorded amount. The
+  //     branch that does resolve an absence to the record is the one that counts RELIEF already
+  //     credited, and counting relief moves LESS money, not more.
+  //   * So "must not become a refusal" had the money-safety backwards. Refusing a compacted A2
+  //     journal STRANDS £40 in Allocated Inventory — an understatement, on the books, that an
+  //     operator is told about and can post by hand. Resolving it to the record CREDITS £40 out of
+  //     a real account on the strength of a journal whose readable lines might have debited that
+  //     account nothing, or a different account, or less than this order claims — and nobody is
+  //     told, because the verdict was `posted`.
+  //
+  // An unreadable journal is not a journal that checks out; it is one that cannot be checked.
   const state = a2StagedWithJournaledShipment()
   withRecordedA2Journal(state, { status: 'SYNCED', journalPayload: null })
   withRecordedGroupBRelief(state, { amount: 20, status: 'SYNCED', journalPayload: null })
@@ -6342,10 +6360,30 @@ test("a settled journal whose payload was COMPACTED off it still resolves to the
 
   assert.equal(result.success, true)
   assert.equal(state.orders[0].refundStatus, 'FULL')
-  assert.equal(findAllocatedInventoryCredit(result), 20, 'the recorded £40 less the recorded £20, exactly as when the rows are gone')
-  // o3d-o97 r6: the POUNDS are unchanged — illegible is still resolved to the recorded figure — but
-  // the refund now says the £20 of relief was counted WITHOUT its journal being readable. Silence
-  // here is what lets retention turn an unproved relief into a resolved posting.
+  assert.equal(findAllocatedInventoryCredit(result), null, 'not the £20 the record alone would have authorised')
+  assert.notEqual(state.orders[0].inventoryAllocatedDate, null, 'the stamp survives so the order stays reportable')
+  assert.match(
+    String(state.refunds[0].allocationBasisUnresolved),
+    /has settled but its lines are no longer readable \(evidence compaction\)/,
+  )
+})
+
+test("a compacted GROUP B RELIEF journal is still counted from the record — the fix is a narrowing (o3d-o97 r5, o3d-i0o6 r4)", async () => {
+  // THE HALF OF THE OLD TEST THAT WAS RIGHT, kept and made explicit. Relief is the other polarity:
+  // counting a relief nobody can read REDUCES what this refund may credit, so resolving it to the
+  // record is the money-safe reading and stays exactly as r5/r6 left it. Here the A2 DEBIT journal
+  // IS readable and carries the £40, so the debit is proved; only the Group B relief journal has
+  // been compacted, and its £20 is still counted — and still SAID to have been counted without the
+  // journal, because silence is what lets retention turn an unproved relief into a resolved one.
+  const state = a2StagedWithJournaledShipment()
+  withRecordedA2Journal(state, { status: 'SYNCED', journalDebit: 40 })
+  withRecordedGroupBRelief(state, { amount: 20, status: 'SYNCED', journalPayload: null })
+
+  const result = await createSalesOrderRefund(createClient(state), { orderId: 'order-1', activeAccountingConnector: 'xero', accountingSettings, ...monetaryFullRefund() })
+
+  assert.equal(result.success, true)
+  assert.equal(state.orders[0].refundStatus, 'FULL')
+  assert.equal(findAllocatedInventoryCredit(result), 20, 'the proved £40 less the recorded £20')
   assert.match(
     String(state.refunds[0].allocationBasisUnresolved),
     /£20\.00 of Allocated Inventory relief was counted against this order's A2 debit WITHOUT the journal/,

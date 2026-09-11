@@ -309,6 +309,49 @@ test('Xero: a legacy A2 row with a cumulative amount and no pass history is REFU
   assert.match(refusals[0], /no pass history/)
 })
 
+test('QuickBooks: a legacy A2 row with a cumulative amount and no pass history is REFUSED too (o3d-i0o6 r4)', async () => {
+  // THE TWIN OF THE TEST ABOVE, because the defect is the twin. QuickBooks is being retired, but
+  // while it ships it posts to a real ledger, and a refusal that exists on one connector and not the
+  // other is how the two sweeps drift back apart. Its sweep had no return value at all before this
+  // round, so a refusal there had nowhere to go: the batch was simply not rebuilt, silently.
+  reset()
+  salesOrderRows.a2 = [{ id: 'so-legacy-qbo', orderNumber: 'SO-LEGACY-QBO', inventoryAllocatedDate: STAMP_NEXT_DAY, inventoryAllocatedBatchRef: null, allocationBatchAmount: 80 }]
+
+  const refusals = await runQboSweep()
+
+  assert.deepEqual(created, [], 'a cumulative figure may not be rebuilt into one batch on QuickBooks either')
+  assert.equal(refusals.length, 1, 'and the operator has to be told there too')
+  assert.match(refusals[0], /DAILY_BATCH_INVENTORY_ALLOC not recreated/)
+  assert.match(refusals[0], /SO-LEGACY-QBO/, 'the refusal names the order a human has to go and check')
+  assert.match(refusals[0], /no pass history/)
+})
+
+test('QuickBooks: a pass history that does not ACCOUNT for the cumulative figure is refused (o3d-i0o6 r4)', async () => {
+  // The history is present and readable and still cannot answer the question: it accounts for £30 of
+  // an £80 recorded debit, so £50 was written by something that recorded no pass. Taking the £30 as
+  // "this batch's share" would rebuild a batch for a figure the row itself contradicts, and taking
+  // the £80 is the defect this round closes. Neither: the row is reported.
+  //
+  // Same test as `proveAllocationDebitPosting` applies to the same row on the credit side, so one
+  // row cannot be unprovable to the reader and self-evident to the writer.
+  reset()
+  salesOrderRows.a2 = [{
+    id: 'so-short-history',
+    orderNumber: 'SO-SHORT-HISTORY',
+    inventoryAllocatedDate: STAMP_NEXT_DAY,
+    inventoryAllocatedBatchRef: QBO_A2_REF,
+    allocationBatchAmount: 80,
+    allocationBatchPasses: onePass(QBO_A2_REF, 30),
+  }]
+
+  const refusals = await runQboSweep()
+
+  assert.deepEqual(created, [], 'a figure the history does not account for may not be rebuilt')
+  assert.equal(refusals.length, 1)
+  assert.match(refusals[0], /SO-SHORT-HISTORY/)
+  assert.match(refusals[0], /account for £30\.00/)
+})
+
 test('Xero: a legacy row still sees a digest-suffixed live log for its derived date (scjz.37, o3d-0qoo)', async () => {
   reset()
   salesOrderRows.a2 = [{ inventoryAllocatedDate: STAMP_NEXT_DAY, inventoryAllocatedBatchRef: null, allocationBatchAmount: 80 }]
