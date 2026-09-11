@@ -327,6 +327,24 @@ export type RefundAccountingSyncRequest = {
   referenceId: string
   payload: Record<string, unknown>
   idempotencyKey?: string
+  /**
+   * o3d-i0o6 r3 (Codex HIGH 1) — THE LEDGER THIS POSTING WAS RECKONED AGAINST, IF ONE WAS.
+   *
+   * Staging can establish a fact about a SPECIFIC connector — that the A2 debit this credit reverses
+   * posted there, against that connector's account codes — and the hand-off that queues the request
+   * runs later, outside that transaction, through an enqueue that resolves "the active connector"
+   * for itself. Between the two, a switch makes the proof and the write about two different ledgers:
+   * the credit is queued where the debit never stood, using the account codes of where it did.
+   *
+   * Carrying the connector ON THE REQUEST is what closes that, because the request is the only thing
+   * that crosses the gap — it is persisted to `accountingRetrySyncs` and replayed by the retry, so
+   * the pin has to live here rather than in a variable the retry path never sees.
+   *
+   * Absent means UNPINNED, which is the right answer for every posting whose staging proved nothing
+   * about a connector (the credit note, the COGS reversal): those keep the active-connector
+   * resolution they have always had.
+   */
+  connector?: 'xero' | 'quickbooks'
 }
 
 /**
@@ -2363,6 +2381,10 @@ async function stageRefundAccountingReversals(
       select: {
         inventoryAllocatedDate: true,
         allocationBatchAmount: true,
+        // o3d-i0o6 r3: the PASSES behind that cumulative figure. Without them the three columns
+        // below describe the latest instalment and the amount describes all of them, and proving
+        // the first against the second is how a credit was raised for pounds no journal carried.
+        allocationBatchPasses: true,
         allocationBatchSyncLogId: true,
         allocationBatchConnector: true,
         allocationBatchAccountCode: true,
@@ -2443,6 +2465,7 @@ async function stageRefundAccountingReversals(
     const basis = await proveAllocationDebitPosting(tx, stagedA2 ?? {
       inventoryAllocatedDate: null,
       allocationBatchAmount: null,
+      allocationBatchPasses: null,
       allocationBatchSyncLogId: null,
       allocationBatchConnector: null,
       allocationBatchAccountCode: null,
@@ -2450,11 +2473,26 @@ async function stageRefundAccountingReversals(
       activeConnector: params.activeConnector ?? null,
       allocatedInventoryAccount: settings.allocatedInventoryAccount,
     })
-    // `none` (a recorded £0.00) and `unattributed` (a pre-column order that names no journal) are
-    // not refusals HERE: a refund can fire years after the fact and legitimately meets orders
-    // staged before the attribution columns existed, and for those the recorded amount is the only
-    // evidence there is. The orphan reverser cannot meet one and refuses them — see its note.
-    if (basis.kind === 'refused') allocationBasisUnresolved = basis.reason
+    // o3d-i0o6 r3 — `unattributed` IS A REFUSAL HERE TOO, AND SAYING SO IS THE HONEST HALF OF
+    // CAPPING IT AT ZERO.
+    //
+    // r2 let it through as "not a refusal": a refund can fire years after the fact and legitimately
+    // meets orders staged before the attribution columns existed, and for those the recorded amount
+    // was the only evidence there was — so it kept the older amount-implies-posting inference and
+    // credited the figure. r3 stops crediting it (the verdict carries no figure to credit), which
+    // leaves the question of what an operator is TOLD.
+    //
+    // Left out of `allocationBasisUnresolved`, the answer would be: nothing true. The cap note below
+    // would fire instead and print "an open balance of £0.00" — a FABRICATED FIGURE for a state
+    // whose whole content is that the balance cannot be established, which is precisely the defect
+    // o3d-o97 r6 removed from the refusal path. Worse, the un-stage at the bottom of this block is
+    // conditional on this variable, so a silent `unattributed` would clear the A2 stamp and its
+    // attribution on a full refund and destroy the evidence of the very debit it declined to credit.
+    //
+    // So an unprovable basis is reported as one, in the proof's own words, which name the recorded
+    // figure for the human who has to go and post it by hand. `none` (a recorded £0.00) stays a
+    // non-refusal: that is POSITIVE evidence there is nothing to reverse, not an absence of evidence.
+    if (basis.kind === 'refused' || basis.kind === 'unattributed') allocationBasisUnresolved = basis.reason
     if (!allocationBasisUnresolved) {
       // o3d-0i5y r12: the reversal relief refuses on the same terms as the other two. It is last
       // only because it is the newest source; the order of the three carries no meaning beyond
@@ -2489,12 +2527,17 @@ async function stageRefundAccountingReversals(
     // reversal; the cleared-stamp rewrite above failed the first.
     //
     // The debit now comes from the PROOF rather than from the row, so there is nothing left to gate
-    // on: `posted` and `unattributed` carry the recorded figure, `none` means A2 debited nothing,
-    // and a refusal means nothing may be credited. All four answers are a number, the cap below can
-    // no longer be absent, and the largest an unproved state can authorise is £0.00.
-    const provedAllocationDebit = basis.kind === 'posted' || basis.kind === 'unattributed'
-      ? basis.recordedDebit
-      : 0
+    // on: `posted` carries the proved figure, `none` means A2 debited nothing, and every other
+    // answer means nothing may be credited. All four answers are a number, the cap below can no
+    // longer be absent, and the largest an unproved state can authorise is £0.00.
+    //
+    // o3d-i0o6 r3 — AND `unattributed` IS NO LONGER ONE OF THE TWO THAT CARRY A FIGURE. r2 wrote
+    // this as `posted || unattributed`, which let the verdict whose own definition is "the posting
+    // and the ledger CANNOT be established" set a POSITIVE ceiling while a plain refusal set none —
+    // two unprovable states, two ceilings, and the more ignorant one the more permissive. The union
+    // itself now gives `recordedDebit` to `posted` alone, so this reads the only field there is and
+    // the old shape does not compile.
+    const provedAllocationDebit = basis.kind === 'posted' ? basis.recordedDebit : 0
     const relieved = addMoney(
       addMoney(postedGroupBAllocationRelief, toDecimal(priorRefundAllocationRelief)),
       toDecimal(allocationReversalRelief),
@@ -2685,6 +2728,22 @@ async function stageRefundAccountingReversals(
       // refund — the part of that balance no line reached. On a resolved full refund the two sum
       // to exactly the open balance.
       allocationReversal,
+      // o3d-i0o6 r3 (Codex HIGH 1) — THE LEDGER THE ALLOCATION CREDIT WAS PROVED AGAINST, CARRIED
+      // OUT OF THE TRANSACTION THAT PROVED IT.
+      //
+      // r2 pinned `queueAccountingSyncTx` and left this value inside the staging transaction, which
+      // made the pin unreachable from the route that matters: the UNEARNED_REV_REVERSAL this staging
+      // produces is queued through the UNPINNED facade (`queueAccountingSync`, in
+      // `queueRefundAccountingActions`), which resolves the active connector all over again. A
+      // connector switch between staging and the hand-off therefore queued the allocation CREDIT on
+      // one ledger using the account codes and the proof of ANOTHER — and the obligation ledger, whose
+      // own pin is taken at the start of the hand-off, saw two agreeing reads of the NEW connector and
+      // cleared the retry flag over it.
+      //
+      // So the connector travels with the request. `null` where nothing was proved, which is every
+      // path that credits no allocation at all — the journal below is then an unearned-revenue
+      // reversal, about which this proof says nothing and must not pin anything.
+      allocationProvedOnConnector: basis.kind === 'posted' ? basis.provedOnConnector : null,
     }
   })
 
@@ -2751,6 +2810,23 @@ async function stageRefundAccountingReversals(
       referenceType: 'SalesOrderRefund',
       referenceId: params.refundId,
       idempotencyKey: `sales-order-refund:${params.refundId}:unearned-reversal`,
+      // o3d-i0o6 r3 (Codex HIGH 1) — PINNED TO THE LEDGER THE ALLOCATION DEBIT WAS PROVED ON.
+      //
+      // This one journal carries BOTH reversals, and only one of them has a proof behind it. Where
+      // it credits Allocated Inventory, the pounds it is taking back were proved to be standing on
+      // `allocationProvedOnConnector` and nowhere else, and the account codes on those lines came
+      // from that connector's settings — so queueing it against whatever is active at hand-off time
+      // credits a ledger the debit was never in. Pinned, the enqueue answers for THAT connector: if
+      // it is no longer the one posting this type, nothing is written and the obligation ledger
+      // leaves `accountingRetryRequired` standing for a human, which is the outcome a refund that
+      // cannot post where it proved actually wants.
+      //
+      // Unpinned when no allocation credit is in the journal: an unearned-revenue-only reversal was
+      // reckoned against no particular ledger, and pinning it to a connector this proof happens to
+      // name would refuse postings that have nothing to do with the allocation contra.
+      ...(reversalAmounts.allocationReversal > 0 && reversalAmounts.allocationProvedOnConnector
+        ? { connector: reversalAmounts.allocationProvedOnConnector }
+        : {}),
       payload: {
         date: new Date().toISOString().slice(0, 10),
         reference: hasUnearnedReversal
@@ -2850,6 +2926,19 @@ function parseRefundAccountingRetrySyncs(
       referenceId: entry.referenceId,
       payload: entry.payload,
       idempotencyKey: typeof entry.idempotencyKey === 'string' ? entry.idempotencyKey : undefined,
+      // o3d-i0o6 r3: THE PIN SURVIVES THE ROUND TRIP. This parser rebuilds the request field by
+      // field and silently drops anything it does not name, so a `connector` written at staging and
+      // not read back here would leave the RETRY queueing the allocation credit unpinned — the same
+      // credit on the same order, against whatever ledger happens to be active when someone presses
+      // retry. Narrowed to the two known ids rather than passed through as a string: a value this
+      // build cannot route is not a pin, and treating it as one would refuse every retry for ever.
+      // SPREAD, so an unpinned sync comes back without the key at all rather than with an explicit
+      // `undefined` — `{...}` and `{connector: undefined}` are the same request to every consumer
+      // but not to a structural comparison, and one of those consumers is the persisted JSON this
+      // very function round-trips.
+      ...(entry.connector === 'xero' || entry.connector === 'quickbooks'
+        ? { connector: entry.connector }
+        : {}),
     }]
   })
 }

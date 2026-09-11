@@ -117,6 +117,8 @@ const STAMPS = {
   // o3d-i0o6 r2: the A2 journal id. Null here, i.e. "this order names no A2 journal", so every
   // pre-existing case below is unchanged and the new lookup contributes nothing to them.
   allocationBatchSyncLogId: null,
+  // o3d-i0o6 r3: and no recorded pass history, for the same reason.
+  allocationBatchPasses: null,
 }
 const A2_STAGED_AT = new Date('2026-07-20T23:15:00.000Z')
 /** o3d-0qoo: stamped just after midnight by a run whose batch was keyed on the previous day. */
@@ -484,6 +486,143 @@ test('o3d-i0o6 r2: and it is a lookup, not a blanket refusal — a retired A2 jo
     { ...STAMPS, allocationBatchSyncLogId: 'a2-log-1' },
   )
   assert.equal(blocker, null)
+})
+
+/**
+ * o3d-i0o6 r3 (Codex round 2, HIGH 4) — THE GUARD REMEMBERS EVERY A2 PASS, NOT THE LAST ONE.
+ *
+ * An incremental A2 pass OVERWRITES both `inventoryAllocatedBatchRef` and
+ * `allocationBatchSyncLogId`, so an order debited £50 under J1 and £5 under J2 carries only J2. Let
+ * J2 be cancelled, absent, or never raised at all — a pass whose window total rounds to zero NULLS
+ * the id — and r2's two alternatives looked for nothing, while J1 sat SYNCED in the ledger carrying
+ * £50 of this order's value. The order was hard-deletable, and the delete takes the only local
+ * record of that £50 with it.
+ *
+ * The pass history answers it, and it is the same evidence the proof uses — not a second predicate
+ * that can drift from it. Nothing here reads a cost snapshot, so a connector whose A2 snapshots
+ * carry no posted unit cost is covered by exactly the same lookup.
+ */
+function a2Pass(overrides: { amount?: string; syncLogId?: string | null; batchRef?: string | null } = {}) {
+  return {
+    amount: overrides.amount ?? '50.0000',
+    syncLogId: 'syncLogId' in overrides ? overrides.syncLogId : 'a2-log-1',
+    connector: 'xero',
+    accountCode: '631',
+    batchRef: 'batchRef' in overrides ? overrides.batchRef : null,
+    at: null,
+  }
+}
+
+test('o3d-i0o6 r3: an EARLIER A2 pass still blocks when the latest pass rounded its journal away', async () => {
+  // The reachable shape, end to end: pass 1 debited £50 under a SYNCED J1; pass 2 valued the
+  // increment at nothing, raised no journal, and NULLED the id and the batch ref beside it.
+  const blocker = await findSalesOrderDeleteBlocker(
+    makeTx({
+      syncLogs: [syncLog({
+        id: 'a2-log-1',
+        type: 'DAILY_BATCH_INVENTORY_ALLOC',
+        status: 'SYNCED',
+        referenceType: 'DailyBatch',
+        referenceId: 'A2-2026-07-20-1a2b3c4d',
+      })],
+    }),
+    'order-1',
+    {
+      ...STAMPS,
+      // Everything the latest pass left: a stamp with no ref, and NO journal id at all.
+      inventoryAllocatedDate: A2_STAGED_AT,
+      allocationBatchSyncLogId: null,
+      allocationBatchPasses: [a2Pass(), a2Pass({ amount: '0.0000', syncLogId: null })],
+    },
+  )
+  assert.equal(blocker?.code, 'daily_batch_staged', 'the £50 journal still holds this order')
+  assert.match(blocker!.message, /A2 inventory allocation/)
+})
+
+test('o3d-i0o6 r3: an EARLIER A2 pass still blocks when the LATEST journal was cancelled', async () => {
+  // Two live-looking alternatives and only one live row. r2 asked about J2 alone, found it
+  // CANCELLED, and let the order go while J1 was SYNCED in the ledger.
+  const blocker = await findSalesOrderDeleteBlocker(
+    makeTx({
+      syncLogs: [
+        syncLog({
+          id: 'a2-log-1', type: 'DAILY_BATCH_INVENTORY_ALLOC', status: 'SYNCED',
+          referenceType: 'DailyBatch', referenceId: 'A2-2026-07-20-1a2b3c4d',
+        }),
+        syncLog({
+          id: 'a2-log-2', type: 'DAILY_BATCH_INVENTORY_ALLOC', status: 'CANCELLED',
+          referenceType: 'DailyBatch', referenceId: 'A2-2026-07-21-9f8e7d6c',
+        }),
+      ],
+    }),
+    'order-1',
+    {
+      ...STAMPS,
+      allocationBatchSyncLogId: 'a2-log-2',
+      allocationBatchPasses: [a2Pass(), a2Pass({ amount: '5.0000', syncLogId: 'a2-log-2' })],
+    },
+  )
+  assert.equal(blocker?.code, 'daily_batch_staged')
+})
+
+test("o3d-i0o6 r3: an earlier pass's BATCH REFERENCE is an alternative too, for a journal re-created under a new id", async () => {
+  const blocker = await findSalesOrderDeleteBlocker(
+    makeTx({
+      syncLogs: [syncLog({
+        id: 'a2-log-recreated',
+        type: 'DAILY_BATCH_INVENTORY_ALLOC',
+        status: 'SYNCED',
+        referenceType: 'DailyBatch',
+        referenceId: 'A2-2026-07-20-1a2b3c4d',
+      })],
+    }),
+    'order-1',
+    {
+      ...STAMPS,
+      allocationBatchSyncLogId: null,
+      allocationBatchPasses: [a2Pass({ syncLogId: 'a2-log-swept', batchRef: 'A2-2026-07-20-1a2b3c4d' })],
+    },
+  )
+  assert.equal(blocker?.code, 'daily_batch_staged')
+})
+
+test('o3d-i0o6 r3: THE CONTROL — a pass history whose every journal is retired lets the order go', async () => {
+  // Without this the three above would pass for an order that merely carries a pass history.
+  const blocker = await findSalesOrderDeleteBlocker(
+    makeTx({
+      syncLogs: [
+        syncLog({
+          id: 'a2-log-1', type: 'DAILY_BATCH_INVENTORY_ALLOC', status: 'CANCELLED',
+          referenceType: 'DailyBatch', referenceId: 'A2-2026-07-20-1a2b3c4d',
+        }),
+        syncLog({
+          id: 'a2-log-2', type: 'DAILY_BATCH_INVENTORY_ALLOC', status: 'CANCELLED',
+          referenceType: 'DailyBatch', referenceId: 'A2-2026-07-21-9f8e7d6c',
+        }),
+      ],
+    }),
+    'order-1',
+    {
+      ...STAMPS,
+      allocationBatchSyncLogId: 'a2-log-2',
+      allocationBatchPasses: [a2Pass(), a2Pass({ amount: '5.0000', syncLogId: 'a2-log-2' })],
+    },
+  )
+  assert.equal(blocker, null)
+})
+
+test('o3d-i0o6 r3: an ILLEGIBLE pass history costs nothing — the latest-pass lookup still runs', async () => {
+  const blocker = await findSalesOrderDeleteBlocker(
+    makeTx({
+      syncLogs: [syncLog({
+        id: 'a2-log-1', type: 'DAILY_BATCH_INVENTORY_ALLOC', status: 'SYNCED',
+        referenceType: 'DailyBatch', referenceId: 'A2-2026-07-20-1a2b3c4d',
+      })],
+    }),
+    'order-1',
+    { ...STAMPS, allocationBatchSyncLogId: 'a2-log-1', allocationBatchPasses: 'not a list at all' },
+  )
+  assert.equal(blocker?.code, 'daily_batch_staged')
 })
 
 test('an A2 stamp with no matching batch log does not block (batch never queued)', async () => {

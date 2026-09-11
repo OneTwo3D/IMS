@@ -226,8 +226,31 @@ export async function queueAccountingSync(params: {
   referenceId: string
   payload: Record<string, unknown>
   idempotencyKey?: string
+  /**
+   * PIN THE LEDGER (o3d-i0o6 r3, Codex HIGH 1) — the same parameter, with the same meaning, as the
+   * one {@link queueAccountingSyncTx} takes.
+   *
+   * r2 added the pin to the TRANSACTIONAL enqueue only and filed the facade as follow-up work. That
+   * filing did not hold: the route that actually carries the proved allocation credit — refund
+   * staging, whose `UNEARNED_REV_REVERSAL` goes through `queueRefundAccountingActions` — comes
+   * through HERE, so the pin round 2 added was bypassed on the one path it was added for. A caller
+   * that has established a fact about a connector (that a debit posted there; that these account
+   * codes are that connector's) and then lets the enqueue resolve "the active connector" for itself
+   * is a caller whose proof and whose write are about two independently-read things, and no
+   * re-checking afterwards can pull back a credit already queued to the wrong books.
+   *
+   * Passed, this does not resolve the active connector at all: the row is queued through the NAMED
+   * connector's own queue, which applies that connector's enabled/posting-mode verdict and returns
+   * `not-configured` — writing nothing — when it does not post this type. The reported `connector`
+   * is then the pinned one, so an obligation ledger that pinned a DIFFERENT connector for the
+   * hand-off sees the disagreement and leaves the obligation unmet instead of settling it.
+   *
+   * Deliberately not defaulted: every existing caller keeps the active-connector resolution by
+   * simply not passing it.
+   */
+  connector?: AccountingConnectorInfo['id']
 }): Promise<AccountingEnqueueOutcome> {
-  const connector = await getActiveAccountingConnectorId()
+  const connector = params.connector ?? await getActiveAccountingConnectorId()
   if (!connector) return { queued: false, reason: 'not-configured', connector: null }
   if (isFxGainLossJournalSuppressed(connector, params.type)) {
     return { queued: false, reason: 'not-configured', connector }

@@ -70,6 +70,20 @@ const state = {
     allocationBatchConnector: 'xero' as string | null,
     allocationBatchAccountCode: '631' as string | null,
     allocationReversalAmount: null as number | null,
+    /**
+     * o3d-i0o6 r3: the PASS HISTORY behind the amount. The three columns above describe the LATEST
+     * A2 pass while `allocationBatchAmount` is the sum of all of them, so the proof asks this — one
+     * pass here, for the whole £40, under the journal named above. A double that omitted it would
+     * make every reversal below measure a refusal.
+     */
+    allocationBatchPasses: [{
+      amount: '40.0000',
+      syncLogId: 'a2-log-1',
+      connector: 'xero',
+      accountCode: '631',
+      batchRef: null,
+      at: null,
+    }] as unknown,
   },
   /** The A2 journal the attribution above resolves to: SETTLED, on xero, its own lines debiting 631. */
   accountingSyncLogs: [{

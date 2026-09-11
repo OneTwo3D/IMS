@@ -55,6 +55,7 @@ import { GL_BASE_PRECISION, roundToGlPrecisionNumber } from '@/lib/domain/math/p
 import { buildInventoryReconciliationSweepJournal, loadInventoryGlReconciliation } from '@/lib/domain/accounting/inventory-gl-reconciliation'
 import { buildCogsReconciliationSweepJournal, loadCogsGlReconciliation } from '@/lib/domain/accounting/cogs-gl-reconciliation'
 import { buildTransitReconciliationSweepJournal, loadTransitGlReconciliation } from '@/lib/domain/accounting/transit-gl-reconciliation'
+import { buildAllocationDebitOrderUpdate } from '@/lib/domain/accounting/allocation-debit-passes'
 import { recordCogsSubledgerMovement } from '@/lib/domain/accounting/cogs-subledger-movement'
 import { recreateJournaledDateFilter } from '@/lib/domain/accounting/daily-batch-retention'
 import { isOperatorAssertedSettlement } from '@/lib/domain/accounting/sync-row-settlement'
@@ -1180,6 +1181,9 @@ export async function runDailyBatchSync(): Promise<XeroDailyBatchResult> {
           // running total rather than the latest instalment. Read under the same lock as everything
           // else A2 plans from.
           allocationBatchAmount: true,
+          // o3d-i0o6 r3: and the pass history that figure is the sum of, read in the same statement
+          // so this pass appends to what it actually planned from.
+          allocationBatchPasses: true,
           allocations: {
             select: {
               id: true,
@@ -1478,20 +1482,24 @@ export async function runDailyBatchSync(): Promise<XeroDailyBatchResult> {
             // declared set leaves NEW quantity, and A2 then posts that increment alone. Replacing
             // the figure would leave the order recording £20 of a £70 debit, and the refund's open
             // balance would strand the other £50 permanently.
-            allocationBatchAmount: roundQuantity(
-              addMoney(
-                toDecimal(order.allocationBatchAmount ?? 0),
-                toDecimal(orderValues.get(order.id) ?? 0),
-              ),
-              4,
-            ).toNumber(),
-            // o3d-o97 r3: the journal's identity and DESTINATION, recorded with the amount it
-            // carried. All three stay null when no journal was raised, so a refund reading them
-            // back can tell "A2 debited £x on ledger L, account A" from "A2 valued this order at
-            // £x and posted nothing".
-            allocationBatchSyncLogId: a2SyncLogId,
-            allocationBatchConnector: a2SyncLogId ? XERO_CONNECTOR : null,
-            allocationBatchAccountCode: a2SyncLogId ? settings.xero_allocated_inventory_account : null,
+            //
+            // o3d-i0o6 r3 — AND THE ATTRIBUTION IS ACCUMULATED WITH IT, BY THE SAME CALL. The amount
+            // was cumulative while the journal id, connector and account code beside it were
+            // REPLACED by this pass, so the row said "£55, carried by the £5 journal" and a proof
+            // read the second half as covering the first. `buildAllocationDebitOrderUpdate` produces
+            // the running total, the appended pass history and those three columns TOGETHER — there
+            // is no way to write the figure here without recording the pass that made it, which is
+            // what stops the next connector from reintroducing the same gap by omission.
+            ...buildAllocationDebitOrderUpdate({
+              existingAmount: order.allocationBatchAmount,
+              existingPasses: order.allocationBatchPasses,
+              passAmount: orderValues.get(order.id) ?? 0,
+              syncLogId: a2SyncLogId,
+              connector: XERO_CONNECTOR,
+              accountCode: settings.xero_allocated_inventory_account,
+              batchRef: referenceId,
+              at: new Date(),
+            }),
           },
         })
       }

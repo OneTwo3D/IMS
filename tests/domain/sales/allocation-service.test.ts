@@ -230,7 +230,35 @@ type OrderRow = {
   // o3d-xlk7: the running total an ALLOCATION_REVERSAL credits back out of Allocated Inventory for
   // this order. The refund's open balance nets it off; without it the same units are credited twice.
   allocationReversalAmount?: number | null
+  /**
+   * o3d-i0o6 r3: the PASS HISTORY behind `allocationBatchAmount`, which accumulates across A2
+   * passes while the three columns above are replaced by the latest one. Unset, `a2PassHistory`
+   * derives the single-pass history the fixture is describing.
+   */
+  allocationBatchPasses?: unknown
   lines: OrderLineRow[]
+}
+
+/**
+ * o3d-i0o6 r3 — THE PASS HISTORY A FIXTURE IS DESCRIBING WHEN IT DOES NOT DESCRIBE ONE.
+ *
+ * `proveAllocationDebitPosting` reads `SalesOrder.allocationBatchPasses` because the recorded amount
+ * is the sum of every A2 pass while the attribution columns describe only the last. These fixtures
+ * describe an order A2 staged ONCE, so the one-entry list is derived — and ONLY where the fixture
+ * names a journal, because an amount with no journal id is the pre-attribution row those fixtures
+ * model and synthesising a pass for it would invent an attribution it has never had.
+ */
+function a2PassHistory(order: OrderRow): unknown {
+  if (order.allocationBatchPasses !== undefined) return order.allocationBatchPasses
+  if (!order.allocationBatchSyncLogId) return null
+  return [{
+    amount: String(order.allocationBatchAmount ?? 0),
+    syncLogId: order.allocationBatchSyncLogId,
+    connector: order.allocationBatchConnector ?? null,
+    accountCode: order.allocationBatchAccountCode ?? null,
+    batchRef: null,
+    at: null,
+  }]
 }
 
 type WarehouseRow = {
@@ -417,7 +445,7 @@ function createClient(state: MemoryState): AllocationServiceClient {
     salesOrder: {
       findUnique: async ({ where }: { where: { id: string } }) => {
         if (where.id !== state.order.id) return null
-        return { ...state.order }
+        return { ...state.order, allocationBatchPasses: a2PassHistory(state.order) }
       },
       update: async ({ data }: {
         data: {

@@ -1,3 +1,4 @@
+import { parseAllocationDebitPasses } from '@/lib/domain/accounting/allocation-debit-passes'
 import type { Prisma } from '@/app/generated/prisma/client'
 import { WMS_LOOKUP_CONFIRMED_ABSENT } from '@/lib/domain/wms/order-status-sweep'
 import { provesNoRemoteWmsCall } from '@/lib/domain/wms/order-push-sweep'
@@ -183,6 +184,28 @@ export type SalesOrderDeleteStageStamps = {
    * it must fail to compile rather than silently fall back to the stamp-derived path.
    */
   allocationBatchSyncLogId: string | null
+  /**
+   * o3d-i0o6 r3 (Codex HIGH 4) — AND THE JOURNALS OF EVERY *EARLIER* A2 PASS, WHICH THE TWO FIELDS
+   * ABOVE FORGET.
+   *
+   * r2 closed the case where the stamp and the batch ref come off and the recorded journal id stays.
+   * It did not close the one where there are SEVERAL journals: an incremental A2 pass OVERWRITES
+   * both the batch ref and the journal id, so an order debited £50 under J1 and then £5 under J2
+   * carries only J2. Let J2 be cancelled, rounded away (a pass whose window total was not positive
+   * records no journal at all and NULLS the id) or simply absent, and the A2 blocker looked for
+   * nothing — while J1 sits SYNCED in the ledger carrying £50 of this order's value. The order was
+   * hard-deletable, and the delete takes the only local record of that £50 with it.
+   *
+   * This is the r3 root defect wearing a different hat — the latest pass overwriting the history —
+   * so it is answered with the same evidence rather than a second predicate: every pass's own
+   * journal id and batch reference, from `SalesOrder.allocationBatchPasses`. Nothing here reads a
+   * snapshot field, so it does not matter that one connector's A2 snapshots carry a posted unit cost
+   * and another's do not; the blocker is about journals, and every connector records those.
+   *
+   * Required, not optional, for the same reason the batch refs are: a caller that forgets to select
+   * it must fail to compile rather than silently fall back to the latest-pass path.
+   */
+  allocationBatchPasses: unknown
 }
 
 /**
@@ -535,6 +558,17 @@ export async function findSalesOrderDeleteBlocker(
   // cannot be un-posted from here. Its stage stamp lives on the shipments rather than the
   // order, and its FK cascades, so deleting the order erases the only local record of what
   // the journal was built from.
+  // o3d-i0o6 r3 (Codex HIGH 4): the journals and batch references of EVERY recorded A2 pass. An
+  // unreadable history yields nothing extra rather than throwing — this guard's job is to add
+  // alternatives to a lookup, and the latest-pass columns beside it are unaffected.
+  const a2Passes = parseAllocationDebitPasses(stamps.allocationBatchPasses) ?? []
+  const a2PassJournalIds = [...new Set(
+    a2Passes.map((pass) => pass.syncLogId).filter((id): id is string => !!id),
+  )]
+  const a2PassBatchRefs = [...new Set(
+    a2Passes.map((pass) => pass.batchRef).filter((ref): ref is string => !!ref),
+  )]
+
   const stagedBatches: Array<{
     group: 'A1' | 'A2' | 'B'
     type: string
@@ -547,6 +581,10 @@ export async function findSalesOrderDeleteBlocker(
      * somewhere to put it rather than a second lookup beside this one.
      */
     persistedLogId?: string | null
+    /** o3d-i0o6 r3: every journal id this order's recorded A2 passes named, earlier ones included. */
+    passJournalIds?: readonly string[]
+    /** o3d-i0o6 r3: every batch reference those passes named, for a journal found by name not id. */
+    passBatchRefs?: readonly string[]
   }> = [
     {
       group: 'A1',
@@ -563,6 +601,10 @@ export async function findSalesOrderDeleteBlocker(
       persistedRef: stamps.inventoryAllocatedBatchRef,
       // Survives the un-stage that clears the two above (o3d-i0o6 r2).
       persistedLogId: stamps.allocationBatchSyncLogId,
+      // o3d-i0o6 r3: and every EARLIER pass's journal and batch reference, which the single columns
+      // beside them were overwritten by. See `SalesOrderDeleteStageStamps.allocationBatchPasses`.
+      passJournalIds: a2PassJournalIds,
+      passBatchRefs: a2PassBatchRefs,
     },
     // One entry per journalled shipment: two shipments of the same order can be staged into
     // two different Group B batches (they are staged as they ship), so a single stamp cannot
@@ -581,16 +623,33 @@ export async function findSalesOrderDeleteBlocker(
   // otherwise repeat an identical query and push an identical blocker.
   const seenBatchKeys = new Set<string>()
   for (const batch of stagedBatches) {
-    const batchKey = `${batch.group}|${batch.persistedRef ?? ''}|${batch.persistedLogId ?? ''}|${dailyBatchDateKey(batch.stagedAt) ?? ''}`
+    const batchKey = `${batch.group}|${batch.persistedRef ?? ''}|${batch.persistedLogId ?? ''}`
+      + `|${(batch.passJournalIds ?? []).join(',')}|${(batch.passBatchRefs ?? []).join(',')}`
+      + `|${dailyBatchDateKey(batch.stagedAt) ?? ''}`
     if (seenBatchKeys.has(batchKey)) continue
     seenBatchKeys.add(batchKey)
     const referenceWhere = dailyBatchReferenceWhere(batch.group, batch.stagedAt, batch.persistedRef)
     // o3d-i0o6 r2: the recorded row id is a THIRD alternative, and the only one that survives an
     // un-stage. A group with neither a reference nor an id has nothing to look for; one with only
     // the id looks by the id alone, which is the post-rewrite shape.
-    const batchWhere: Prisma.AccountingSyncLogWhereInput | null = batch.persistedLogId
-      ? { OR: [...(referenceWhere ? [referenceWhere] : []), { id: batch.persistedLogId }] }
-      : referenceWhere
+    //
+    // o3d-i0o6 r3: FOUR alternatives now, and they are a UNION for the reason the original two were
+    // (see `dailyBatchReferenceWhere`) — under-matching costs a journal nothing can take back out,
+    // over-matching costs a false blocker an operator can investigate. The two added ones are every
+    // EARLIER pass's journal id and batch reference, which the single columns were overwritten by.
+    const logIds = [...new Set([
+      ...(batch.persistedLogId ? [batch.persistedLogId] : []),
+      ...(batch.passJournalIds ?? []),
+    ])]
+    const passRefs = (batch.passBatchRefs ?? []).filter((ref) => ref !== batch.persistedRef)
+    const alternatives: Prisma.AccountingSyncLogWhereInput[] = [
+      ...(referenceWhere ? [referenceWhere] : []),
+      ...(logIds.length > 0 ? [{ id: { in: logIds } }] : []),
+      ...(passRefs.length > 0 ? [{ referenceId: { in: passRefs } }] : []),
+    ]
+    const batchWhere: Prisma.AccountingSyncLogWhereInput | null = alternatives.length === 0
+      ? null
+      : alternatives.length === 1 ? alternatives[0] : { OR: alternatives }
     if (!batchWhere) continue
     const liveBatch = await tx.accountingSyncLog.findFirst({
       where: {

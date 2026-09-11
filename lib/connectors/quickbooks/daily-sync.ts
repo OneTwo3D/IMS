@@ -73,6 +73,7 @@ type AccountingMirrorClient = Pick<Prisma.TransactionClient, 'accountingSyncLog'
 
 import { QBO_DAILY_BATCH_LOCK_KEY } from '@/lib/db/advisory-locks'
 import { acquirePinnedAdvisoryLockOrNull } from '@/lib/db/pinned-advisory-lock'
+import { buildAllocationDebitOrderUpdate } from '@/lib/domain/accounting/allocation-debit-passes'
 const QBO_CONNECTOR = 'quickbooks'
 const DAILY_BATCH_TYPES = [
   'DAILY_BATCH_REVENUE_DEFERRAL',
@@ -633,6 +634,8 @@ export async function runDailyBatchSync(): Promise<{
         // o3d-0i5y r5 (rebase onto o3d-o97): what earlier A2 passes already recorded posting for
         // this order — the running total the write below adds to. See the Xero batch.
         allocationBatchAmount: true,
+        // o3d-i0o6 r3: and the pass history that figure is the sum of. See the Xero batch.
+        allocationBatchPasses: true,
         allocations: {
           select: {
             id: true,
@@ -744,17 +747,20 @@ export async function runDailyBatchSync(): Promise<{
               // o3d-o97 r3 + o3d-0i5y r5: ACCUMULATED, not replaced — a stamped order can be handed
               // back for an INCREMENT now, so the order-level record is the running total of what
               // A2 has debited. See the Xero batch for the worked strand.
-              allocationBatchAmount: roundQuantity(
-                addMoney(
-                  toDecimal(order.allocationBatchAmount ?? 0),
-                  toDecimal(orderValues.get(order.id) ?? 0),
-                ),
-                4,
-              ).toNumber(),
-              // o3d-o97 r3: the journal's identity and DESTINATION. See the Xero batch.
-              allocationBatchSyncLogId: a2SyncLogId,
-              allocationBatchConnector: a2SyncLogId ? QBO_CONNECTOR : null,
-              allocationBatchAccountCode: a2SyncLogId ? settings.quickbooks_allocated_inventory_account : null,
+              //
+              // o3d-i0o6 r3: and the pass history is accumulated with it, by the same call, so this
+              // connector cannot record a cumulative figure attributed to its latest instalment. See
+              // the Xero batch, and `buildAllocationDebitOrderUpdate` for why the write is one call.
+              ...buildAllocationDebitOrderUpdate({
+                existingAmount: order.allocationBatchAmount,
+                existingPasses: order.allocationBatchPasses,
+                passAmount: orderValues.get(order.id) ?? 0,
+                syncLogId: a2SyncLogId,
+                connector: QBO_CONNECTOR,
+                accountCode: settings.quickbooks_allocated_inventory_account,
+                batchRef: referenceId,
+                at: new Date(),
+              }),
             },
           })
         }

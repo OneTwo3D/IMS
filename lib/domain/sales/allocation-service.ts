@@ -1164,6 +1164,9 @@ export async function reverseOrphanedAllocationPosting(
       allocationReversalAmount: true,
       inventoryAllocatedDate: true,
       allocationBatchAmount: true,
+      // o3d-i0o6 r3: the PASSES that cumulative figure is the sum of. The three columns below are
+      // the LATEST pass's, and proving one instalment does not prove the total (see the proof).
+      allocationBatchPasses: true,
       allocationBatchSyncLogId: true,
       allocationBatchConnector: true,
       allocationBatchAccountCode: true,
@@ -1181,6 +1184,7 @@ export async function reverseOrphanedAllocationPosting(
   const proof = await proveAllocationDebitPosting(tx, order ?? {
     inventoryAllocatedDate: null,
     allocationBatchAmount: null,
+    allocationBatchPasses: null,
     allocationBatchSyncLogId: null,
     allocationBatchConnector: null,
     allocationBatchAccountCode: null,

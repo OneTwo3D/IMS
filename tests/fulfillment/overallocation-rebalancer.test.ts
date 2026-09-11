@@ -51,6 +51,9 @@ type AllocationRow = {
     allocationBatchConnector?: string | null
     allocationBatchAccountCode?: string | null
     allocationReversalAmount?: number | null
+    // o3d-i0o6 r3: the PASS HISTORY the proof reads, because the amount above is cumulative across
+    // A2 passes while the three columns beside it describe the latest one.
+    allocationBatchPasses?: unknown
   }
 }
 
@@ -310,6 +313,10 @@ const tx = {
         allocationBatchSyncLogId: row.allocationBatchSyncLogId ?? null,
         allocationBatchConnector: row.allocationBatchConnector ?? null,
         allocationBatchAccountCode: row.allocationBatchAccountCode ?? null,
+        // o3d-i0o6 r3: the pass history the proof reads. Dropped here, every fixture would look
+        // like an order with no recorded passes and every reversal assertion would measure a
+        // refusal — the defective-double shape this file's own notes warn about.
+        allocationBatchPasses: row.allocationBatchPasses ?? null,
         allocationReversalAmount: row.allocationReversalAmount ?? null,
       }
     },
@@ -560,6 +567,23 @@ function buildOrder(
     allocationBatchConnector: overrides.allocationBatchConnector ?? null,
     allocationBatchAccountCode: overrides.allocationBatchAccountCode ?? null,
     allocationReversalAmount: overrides.allocationReversalAmount ?? null,
+    // o3d-i0o6 r3 — THE PASS HISTORY, WHICH IS WHAT THE PROOF READS.
+    //
+    // `allocationBatchAmount` accumulates across A2 passes while the three columns above are
+    // replaced by the latest, so a verdict of `posted` for the cumulative figure is only available
+    // where every pass is on record. These fixtures describe an order A2 staged ONCE, so the
+    // one-entry history is derived — and only where a journal is named, because an amount with no
+    // journal is the pre-attribution row some of them model.
+    allocationBatchPasses: overrides.allocationBatchSyncLogId
+      ? [{
+          amount: String(overrides.allocationBatchAmount ?? 0),
+          syncLogId: overrides.allocationBatchSyncLogId,
+          connector: overrides.allocationBatchConnector ?? null,
+          accountCode: overrides.allocationBatchAccountCode ?? null,
+          batchRef: null,
+          at: null,
+        }]
+      : null,
   }
 }
 

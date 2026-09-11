@@ -1858,6 +1858,33 @@ model SalesOrder {
   allocationBatchSyncLogId   String?            @map("accounting_allocation_batch_sync_log_id")
   allocationBatchConnector   String?            @map("accounting_allocation_batch_connector")
   allocationBatchAccountCode String?            @map("accounting_allocation_batch_account_code")
+  /// o3d-i0o6 r3 — THE WHOLE PASS HISTORY, BECAUSE THE AMOUNT IS CUMULATIVE AND THE THREE COLUMNS
+  /// ABOVE ARE NOT.
+  ///
+  /// `allocationBatchAmount` ACCUMULATES across incremental A2 passes: the declared allocation
+  /// rewrite hands a stamped order back with its debit standing, A2 posts the increment alone, and
+  /// the figure becomes £50 + £5. The three attribution columns are REPLACED by that same statement,
+  /// so they describe the LATEST pass only. A fact about the latest pass was then being read as a
+  /// fact about the whole debit: a £50 first pass that failed, or posted on another ledger, followed
+  /// by a £5 increment inside a large SYNCED batch, proved `posted` for the entire £55 — and the
+  /// refund and orphan-reversal paths credited the unproved £50 back out of a real account.
+  ///
+  /// So every pass records ITSELF here, appended in the SAME UPDATE that accumulates the amount: its
+  /// own contribution, the journal it raised (or null where it raised none), that journal's
+  /// connector, account code and batch reference. The proof then asks whether EVERY pass making up
+  /// the cumulative figure is SYNCED, on ONE ledger, against ONE account — which is the only
+  /// question a credit for the cumulative figure may be raised on.
+  ///
+  /// Written by ONE function (`buildAllocationDebitOrderUpdate`), which produces the amount and this
+  /// list together, so a connector that accumulates the amount without recording the pass cannot be
+  /// written by accident. A row whose passes do not sum to the amount is NOT provable — it fails
+  /// closed, to the safe side, rather than falling back on the latest pass.
+  ///
+  /// NULL on rows staged before this column existed. Nothing can reconstruct the pass history of a
+  /// 2025 batch, so those rows are unprovable and cap every credit at £0.00 — deliberately NOT
+  /// backfilled from the three columns above, which would be the database vouching for exactly the
+  /// single-pass assumption this column exists to stop making.
+  allocationBatchPasses      Json?              @map("accounting_allocation_batch_passes")
   // o3d-0i5y r12 — THE POUNDS ALREADY CREDITED BACK OUT OF ALLOCATED INVENTORY BY AN
   // ALLOCATION_REVERSAL, ON A ROW RETENTION CANNOT REACH.
   //
