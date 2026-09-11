@@ -4,21 +4,32 @@ import {
   runWmsDispatchSweepCore,
   formatCursorInTimeZone,
   resolveDispatchJobOutcome,
-  isDispatchClientScoped,
   coherentSplitPartIds,
   SPLIT_PROBE_BUDGET_PER_SWEEP,
   isUnresolvedDriftSystemic,
-  saveMintsoftDeltaCursors,
-  readMintsoftDeltaCursors,
-  resetMintsoftDeltaCursors,
+  saveWmsDeltaCursors,
+  readWmsDeltaCursors,
+  resetWmsDeltaCursors,
 } from '../lib/domain/wms/dispatch-sweep.ts'
 import {
-  decodeMintsoftDeltaCursor,
-  encodeMintsoftDeltaCursor,
+  decodeWmsDeltaCursor,
+  encodeWmsDeltaCursor,
+  nextWmsDeltaGeneration,
+  parseWmsDeltaGeneration,
+  wmsDeltaCursorKeys,
+} from '../lib/domain/wms/delta-cursor-generation.ts'
+import {
+  isMintsoftDispatchClientScoped,
   mintsoftDeltaScopeToken,
-  nextMintsoftDeltaGeneration,
-  parseMintsoftDeltaGeneration,
 } from '../lib/connectors/mintsoft/settings/schema.ts'
+
+/**
+ * o3d-remove-shiphero round 2 (Codex HIGH 2): the cursor rows are now DERIVED FROM THE CONNECTOR ID,
+ * so every call below names the connector whose cursors it is talking about. For `mintsoft` these
+ * are byte-for-byte the three keys that already exist in every deployment, which is why the
+ * literal key names in the fixtures below are unchanged.
+ */
+const MINTSOFT_DELTA_KEYS = wmsDeltaCursorKeys('mintsoft')
 import type { WmsDispatchSweepDeps, WmsDispatchCandidate } from '../lib/domain/wms/dispatch-sweep.ts'
 import type { WmsOrderStatus, WmsOrderTracking, WmsOrderPart } from '../lib/connectors/wms/types.ts'
 
@@ -93,19 +104,23 @@ test('formatCursorInTimeZone converts a UTC instant into the tenant wall-clock (
 test('[o3d-bjc #3] isDispatchClientScoped: Mintsoft needs a positive integer ClientId; other connectors are always scoped', () => {
   // Mintsoft, unconfigured → NOT scoped → the wrapper SKIPs the whole sweep
   // (no per-order reconcile that would throw + dead-letter every link).
-  assert.equal(isDispatchClientScoped('mintsoft', null), false)
-  assert.equal(isDispatchClientScoped('mintsoft', ''), false)
-  assert.equal(isDispatchClientScoped('mintsoft', '   '), false)
-  assert.equal(isDispatchClientScoped('mintsoft', '0'), false)
-  assert.equal(isDispatchClientScoped('mintsoft', '-5'), false)
-  assert.equal(isDispatchClientScoped('mintsoft', 'abc'), false)
-  assert.equal(isDispatchClientScoped('mintsoft', '12x'), false)
+  assert.equal(isMintsoftDispatchClientScoped(null), false)
+  assert.equal(isMintsoftDispatchClientScoped(''), false)
+  assert.equal(isMintsoftDispatchClientScoped('   '), false)
+  assert.equal(isMintsoftDispatchClientScoped('0'), false)
+  assert.equal(isMintsoftDispatchClientScoped('-5'), false)
+  assert.equal(isMintsoftDispatchClientScoped('abc'), false)
+  assert.equal(isMintsoftDispatchClientScoped('12x'), false)
   // Mintsoft, configured → scoped → the sweep runs.
-  assert.equal(isDispatchClientScoped('mintsoft', '1234'), true)
-  assert.equal(isDispatchClientScoped('mintsoft', ' 1234 '), true)
-  // A different WMS (e.g. a second WMS) carries no shared-tenant scope → always ok.
-  assert.equal(isDispatchClientScoped('acme-wms', null), true)
-  assert.equal(isDispatchClientScoped('acme-wms', ''), true)
+  assert.equal(isMintsoftDispatchClientScoped('1234'), true)
+  assert.equal(isMintsoftDispatchClientScoped(' 1234 '), true)
+  // o3d-remove-shiphero round 2 (Codex HIGH 2): the "a different WMS is always scoped" assertions
+  // that used to sit here were of a GENERIC function whose first line was `if (connectorId !==
+  // 'mintsoft') return true` — i.e. they proved that a Mintsoft rule exempts non-Mintsoft ids,
+  // which is a fact about this function and not about any second connector. The gate is now
+  // `hooks.dispatchPrecondition` on Mintsoft's own registry definition, so a connector without one
+  // is not exempted from a gate: there is no gate of anyone else's for it to be measured against.
+  // That property is driven end to end in tests/wms-second-connector-seam.test.ts.
 })
 
 // --- Sweep-core delta behaviour --------------------------------------------
@@ -2082,12 +2097,12 @@ function settingsStore(initial: Record<string, string> = {}) {
     transaction,
     get scope() { return scope },
     /** Stands in for lockMintsoftDispatchSettings: the row lock, then the scope those rows define. */
-    lockScope: async () => scope,
+    lockScope: async () => mintsoftDeltaScopeToken(scope),
     /** Exactly what the settings save does when the scope moves: retarget, then reset. */
     async commitScopeChange(next: typeof OLD_SCOPE, label: string) {
       return transaction(label, async (client) => {
         scope = next
-        return resetMintsoftDeltaCursors(client)
+        return resetWmsDeltaCursors(client, MINTSOFT_DELTA_KEYS)
       })
     },
   }
@@ -2099,8 +2114,8 @@ test('o3d-hl8l r5: a scope corrected AND CORRECTED BACK still refuses the in-fli
     // Stamped at generation 0 — an installation that has never reset. An UNSTAMPED value would be
     // ignored by the reader (see the r6 tests below), which would quietly change what this test is
     // about.
-    mintsoft_order_delta_since: encodeMintsoftDeltaCursor(0, '2026-07-15T11:00:00Z'),
-    mintsoft_order_reconcile_at: encodeMintsoftDeltaCursor(0, '2026-07-15T11:00:00Z'),
+    mintsoft_order_delta_since: encodeWmsDeltaCursor(0, '2026-07-15T11:00:00Z'),
+    mintsoft_order_reconcile_at: encodeWmsDeltaCursor(0, '2026-07-15T11:00:00Z'),
   })
   let saved: unknown = null
 
@@ -2114,9 +2129,9 @@ test('o3d-hl8l r5: a scope corrected AND CORRECTED BACK still refuses the in-fli
         await store.commitScopeChange(OLD_SCOPE, 'reset-back-to-89')
         return []
       },
-      getDeltaState: () => store.transaction('sweep-read', (tx) => readMintsoftDeltaCursors(tx, store.lockScope)),
+      getDeltaState: () => store.transaction('sweep-read', (tx) => readWmsDeltaCursors(tx, MINTSOFT_DELTA_KEYS, store.lockScope)),
       saveDeltaState: async (state) => {
-        saved = await store.transaction('sweep-save', (tx) => saveMintsoftDeltaCursors(tx, state, store.lockScope))
+        saved = await store.transaction('sweep-save', (tx) => saveWmsDeltaCursors(tx, MINTSOFT_DELTA_KEYS, state, store.lockScope))
       },
     }),
     { now: NOW },
@@ -2159,7 +2174,7 @@ test('o3d-hl8l r5: a scope corrected AND CORRECTED BACK still refuses the in-fli
 })
 
 test('o3d-hl8l r5: ONE reset landing mid-pass is refused too, and the cursors stay cleared', async () => {
-  const store = settingsStore({ mintsoft_order_delta_since: encodeMintsoftDeltaCursor(0, '2026-07-15T11:00:00Z') })
+  const store = settingsStore({ mintsoft_order_delta_since: encodeWmsDeltaCursor(0, '2026-07-15T11:00:00Z') })
   let saved: unknown = null
 
   await runWmsDispatchSweepCore(
@@ -2169,9 +2184,9 @@ test('o3d-hl8l r5: ONE reset landing mid-pass is refused too, and the cursors st
         await store.commitScopeChange(NEW_SCOPE, 'reset-to-101')
         return []
       },
-      getDeltaState: () => store.transaction('sweep-read', (tx) => readMintsoftDeltaCursors(tx, store.lockScope)),
+      getDeltaState: () => store.transaction('sweep-read', (tx) => readWmsDeltaCursors(tx, MINTSOFT_DELTA_KEYS, store.lockScope)),
       saveDeltaState: async (state) => {
-        saved = await store.transaction('sweep-save', (tx) => saveMintsoftDeltaCursors(tx, state, store.lockScope))
+        saved = await store.transaction('sweep-save', (tx) => saveWmsDeltaCursors(tx, MINTSOFT_DELTA_KEYS, state, store.lockScope))
       },
     }),
     { now: NOW },
@@ -2184,16 +2199,16 @@ test('o3d-hl8l r5: ONE reset landing mid-pass is refused too, and the cursors st
 
 test('o3d-hl8l r5: with NO reset in the window the sweep’s advance is written, at the value it computed', async () => {
   // The fence must not become a way for the cursors to stop advancing at all.
-  const store = settingsStore({ mintsoft_order_delta_since: encodeMintsoftDeltaCursor(0, '2026-07-15T11:00:00Z') })
+  const store = settingsStore({ mintsoft_order_delta_since: encodeWmsDeltaCursor(0, '2026-07-15T11:00:00Z') })
   let saved: unknown = null
 
   await runWmsDispatchSweepCore(
     deps({
       listCandidates: async () => [candidate({ linkId: 'l1', orderId: 'o1' })],
       fetchDelta: async () => [],
-      getDeltaState: () => store.transaction('sweep-read', (tx) => readMintsoftDeltaCursors(tx, store.lockScope)),
+      getDeltaState: () => store.transaction('sweep-read', (tx) => readWmsDeltaCursors(tx, MINTSOFT_DELTA_KEYS, store.lockScope)),
       saveDeltaState: async (state) => {
-        saved = await store.transaction('sweep-save', (tx) => saveMintsoftDeltaCursors(tx, state, store.lockScope))
+        saved = await store.transaction('sweep-save', (tx) => saveWmsDeltaCursors(tx, MINTSOFT_DELTA_KEYS, state, store.lockScope))
       },
     }),
     { now: NOW },
@@ -2202,7 +2217,7 @@ test('o3d-hl8l r5: with NO reset in the window the sweep’s advance is written,
   assert.deepEqual(saved, { written: true })
   assert.equal(
     store.rows.get('mintsoft_order_delta_since'),
-    encodeMintsoftDeltaCursor(0, NOW.toISOString()),
+    encodeWmsDeltaCursor(0, NOW.toISOString()),
     'and it is written STAMPED with the generation it was established under, so a later reader can place it',
   )
 })
@@ -2211,12 +2226,12 @@ test('o3d-hl8l r5: with NO reset in the window the sweep’s advance is written,
 
 test('o3d-hl8l r5: the reset clears both cursors AND mints the next generation, in one operation', async () => {
   const store = settingsStore({
-    mintsoft_order_delta_since: encodeMintsoftDeltaCursor(4, '2026-07-15T11:00:00Z'),
-    mintsoft_order_reconcile_at: encodeMintsoftDeltaCursor(4, '2026-07-15T11:00:00Z'),
+    mintsoft_order_delta_since: encodeWmsDeltaCursor(4, '2026-07-15T11:00:00Z'),
+    mintsoft_order_reconcile_at: encodeWmsDeltaCursor(4, '2026-07-15T11:00:00Z'),
     mintsoft_order_delta_generation: '4',
   })
 
-  const result = await store.transaction('reset', (tx) => resetMintsoftDeltaCursors(tx))
+  const result = await store.transaction('reset', (tx) => resetWmsDeltaCursors(tx, MINTSOFT_DELTA_KEYS))
 
   assert.deepEqual(result, { generation: 5 })
   assert.equal(store.rows.get('mintsoft_order_delta_since'), undefined)
@@ -2227,7 +2242,7 @@ test('o3d-hl8l r5: the reset clears both cursors AND mints the next generation, 
 test('o3d-hl8l r5: the first reset on an installation that has never reset mints generation 1', async () => {
   const store = settingsStore({ mintsoft_order_delta_since: '2026-07-15T11:00:00Z' })
 
-  const result = await store.transaction('reset', (tx) => resetMintsoftDeltaCursors(tx))
+  const result = await store.transaction('reset', (tx) => resetWmsDeltaCursors(tx, MINTSOFT_DELTA_KEYS))
 
   assert.deepEqual(result, { generation: 1 }, 'no row means no reset has ever committed — a fact, not a gap')
   assert.equal(store.rows.get('mintsoft_order_delta_generation'), '1')
@@ -2236,7 +2251,7 @@ test('o3d-hl8l r5: the first reset on an installation that has never reset mints
 test('o3d-hl8l r5: an unreadable generation restarts the chain at 1 rather than propagating garbage', async () => {
   const store = settingsStore({ mintsoft_order_delta_generation: 'not-a-number' })
 
-  const result = await store.transaction('reset', (tx) => resetMintsoftDeltaCursors(tx))
+  const result = await store.transaction('reset', (tx) => resetWmsDeltaCursors(tx, MINTSOFT_DELTA_KEYS))
 
   assert.deepEqual(result, { generation: 1 })
   assert.equal(store.rows.get('mintsoft_order_delta_generation'), '1')
@@ -2273,10 +2288,11 @@ test('o3d-hl8l r5: the cursor write is REFUSED when the generation moved, and th
   const { tx, upserts } = cursorTx({ mintsoft_order_delta_generation: '7' })
   let locked = 0
 
-  const result = await saveMintsoftDeltaCursors(
+  const result = await saveWmsDeltaCursors(
     tx,
+    MINTSOFT_DELTA_KEYS,
     { watermark: NOW.toISOString(), lastReconcile: NOW.toISOString(), scope: mintsoftDeltaScopeToken(OLD_SCOPE), generation: 6 },
-    async () => { locked += 1; return OLD_SCOPE },
+    async () => { locked += 1; return mintsoftDeltaScopeToken(OLD_SCOPE) },
   )
 
   assert.deepEqual(result, { written: false, reason: 'cursors_reset' })
@@ -2287,30 +2303,32 @@ test('o3d-hl8l r5: the cursor write is REFUSED when the generation moved, and th
 test('o3d-hl8l r5: the cursor write goes ahead when the generation is the one the pass read', async () => {
   const { tx, upserts } = cursorTx({ mintsoft_order_delta_generation: '6' })
 
-  const result = await saveMintsoftDeltaCursors(
+  const result = await saveWmsDeltaCursors(
     tx,
+    MINTSOFT_DELTA_KEYS,
     { watermark: NOW.toISOString(), lastReconcile: NOW.toISOString(), scope: mintsoftDeltaScopeToken(OLD_SCOPE), generation: 6 },
-    async () => OLD_SCOPE,
+    async () => mintsoftDeltaScopeToken(OLD_SCOPE),
   )
 
   assert.deepEqual(result, { written: true })
   assert.deepEqual(upserts, [
-    { key: 'mintsoft_order_delta_since', value: encodeMintsoftDeltaCursor(6, NOW.toISOString()) },
-    { key: 'mintsoft_order_reconcile_at', value: encodeMintsoftDeltaCursor(6, NOW.toISOString()) },
+    { key: 'mintsoft_order_delta_since', value: encodeWmsDeltaCursor(6, NOW.toISOString()) },
+    { key: 'mintsoft_order_reconcile_at', value: encodeWmsDeltaCursor(6, NOW.toISOString()) },
   ])
 })
 
 test('o3d-hl8l r5: generation 0 against a store that has never reset is current, not stale', async () => {
   const { tx, upserts } = cursorTx()
 
-  const result = await saveMintsoftDeltaCursors(
+  const result = await saveWmsDeltaCursors(
     tx,
+    MINTSOFT_DELTA_KEYS,
     { watermark: NOW.toISOString(), scope: mintsoftDeltaScopeToken(OLD_SCOPE), generation: 0 },
-    async () => OLD_SCOPE,
+    async () => mintsoftDeltaScopeToken(OLD_SCOPE),
   )
 
   assert.deepEqual(result, { written: true }, 'an absent generation row is zero on BOTH sides — the fence must not wedge a fresh install')
-  assert.deepEqual(upserts, [{ key: 'mintsoft_order_delta_since', value: encodeMintsoftDeltaCursor(0, NOW.toISOString()) }])
+  assert.deepEqual(upserts, [{ key: 'mintsoft_order_delta_since', value: encodeWmsDeltaCursor(0, NOW.toISOString()) }])
 })
 
 test('o3d-hl8l r5: a write carrying a scope but NO generation applies no change at all', async () => {
@@ -2320,10 +2338,11 @@ test('o3d-hl8l r5: a write carrying a scope but NO generation applies no change 
   const { tx, upserts } = cursorTx({ mintsoft_order_delta_generation: '3' })
   let locked = 0
 
-  const result = await saveMintsoftDeltaCursors(
+  const result = await saveWmsDeltaCursors(
     tx,
+    MINTSOFT_DELTA_KEYS,
     { watermark: NOW.toISOString(), scope: mintsoftDeltaScopeToken(OLD_SCOPE) },
-    async () => { locked += 1; return OLD_SCOPE },
+    async () => { locked += 1; return mintsoftDeltaScopeToken(OLD_SCOPE) },
   )
 
   assert.deepEqual(result, { written: false, reason: 'generation_unknown' })
@@ -2336,14 +2355,14 @@ test('o3d-hl8l r5: an unreadable stored generation refuses the write rather than
   const store2 = cursorTx({ mintsoft_order_delta_generation: 'garbage' })
 
   assert.deepEqual(
-    await saveMintsoftDeltaCursors(tx, { watermark: NOW.toISOString(), generation: 0 }, async () => OLD_SCOPE),
+    await saveWmsDeltaCursors(tx, MINTSOFT_DELTA_KEYS, { watermark: NOW.toISOString(), generation: 0 }, async () => mintsoftDeltaScopeToken(OLD_SCOPE)),
     { written: true },
     'an EMPTY row means the same as an absent one — zero — which is what every other reader of these keys does',
   )
-  assert.deepEqual(upserts, [{ key: 'mintsoft_order_delta_since', value: encodeMintsoftDeltaCursor(0, NOW.toISOString()) }])
+  assert.deepEqual(upserts, [{ key: 'mintsoft_order_delta_since', value: encodeWmsDeltaCursor(0, NOW.toISOString()) }])
 
   assert.deepEqual(
-    await saveMintsoftDeltaCursors(store2.tx, { watermark: NOW.toISOString(), generation: 0 }, async () => OLD_SCOPE),
+    await saveWmsDeltaCursors(store2.tx, MINTSOFT_DELTA_KEYS, { watermark: NOW.toISOString(), generation: 0 }, async () => mintsoftDeltaScopeToken(OLD_SCOPE)),
     { written: false, reason: 'cursors_reset' },
     'a value nobody can order cannot establish that a cursor write is current',
   )
@@ -2356,14 +2375,15 @@ test('o3d-hl8l r5: a caller that supplies neither scope nor generation asks for 
   const { tx, upserts } = cursorTx({ mintsoft_order_delta_generation: '9' })
   let locked = 0
 
-  const result = await saveMintsoftDeltaCursors(
+  const result = await saveWmsDeltaCursors(
     tx,
+    MINTSOFT_DELTA_KEYS,
     { watermark: NOW.toISOString() },
-    async () => { locked += 1; return NEW_SCOPE },
+    async () => { locked += 1; return mintsoftDeltaScopeToken(NEW_SCOPE) },
   )
 
   assert.deepEqual(result, { written: true })
-  assert.deepEqual(upserts, [{ key: 'mintsoft_order_delta_since', value: encodeMintsoftDeltaCursor(9, NOW.toISOString()) }])
+  assert.deepEqual(upserts, [{ key: 'mintsoft_order_delta_since', value: encodeWmsDeltaCursor(9, NOW.toISOString()) }])
   assert.equal(
     locked,
     1,
@@ -2426,7 +2446,7 @@ test('o3d-hl8l r5: a deps pair with no delta state sends NO generation rather th
 
 test('o3d-hl8l r5: the cursors and the generation are read in ONE statement, under the lock, after it', async () => {
   const store = settingsStore({
-    mintsoft_order_delta_since: encodeMintsoftDeltaCursor(3, '2026-07-15T11:00:00Z'),
+    mintsoft_order_delta_since: encodeWmsDeltaCursor(3, '2026-07-15T11:00:00Z'),
     mintsoft_order_delta_generation: '3',
   })
   const seen: string[][] = []
@@ -2445,10 +2465,10 @@ test('o3d-hl8l r5: the cursors and the generation are read in ONE statement, und
     async $queryRaw<T>(_q: TemplateStringsArray, ..._v: unknown[]) { trace.push('locked-read'); return [] as unknown as T },
   }
 
-  const state = await readMintsoftDeltaCursors(tx, async (client) => {
+  const state = await readWmsDeltaCursors(tx, MINTSOFT_DELTA_KEYS, async (client) => {
     await client.$executeRaw`materialise`
     await client.$queryRaw`FOR UPDATE`
-    return OLD_SCOPE
+    return mintsoftDeltaScopeToken(OLD_SCOPE)
   })
 
   assert.equal(state.watermark, '2026-07-15T11:00:00Z')
@@ -2469,9 +2489,9 @@ test('o3d-hl8l r5: the cursors and the generation are read in ONE statement, und
 })
 
 test('o3d-hl8l r5: a store that has never reset reads generation 0, not null', async () => {
-  const store = settingsStore({ mintsoft_order_delta_since: encodeMintsoftDeltaCursor(0, '2026-07-15T11:00:00Z') })
+  const store = settingsStore({ mintsoft_order_delta_since: encodeWmsDeltaCursor(0, '2026-07-15T11:00:00Z') })
 
-  const state = await store.transaction('read', (tx) => readMintsoftDeltaCursors(tx, store.lockScope))
+  const state = await store.transaction('read', (tx) => readWmsDeltaCursors(tx, MINTSOFT_DELTA_KEYS, store.lockScope))
 
   assert.equal(state.generation, 0)
 })
@@ -2479,22 +2499,22 @@ test('o3d-hl8l r5: a store that has never reset reads generation 0, not null', a
 test('o3d-hl8l r5: an unreadable generation row reads as null, so the run cannot be attributed', async () => {
   const store = settingsStore({ mintsoft_order_delta_generation: 'x' })
 
-  const state = await store.transaction('read', (tx) => readMintsoftDeltaCursors(tx, store.lockScope))
+  const state = await store.transaction('read', (tx) => readWmsDeltaCursors(tx, MINTSOFT_DELTA_KEYS, store.lockScope))
 
   assert.equal(state.generation, null)
 })
 
 test('o3d-hl8l r5: the generation parser and the minter agree on what absent, empty and garbage mean', () => {
-  assert.equal(parseMintsoftDeltaGeneration(null), 0)
-  assert.equal(parseMintsoftDeltaGeneration(''), 0)
-  assert.equal(parseMintsoftDeltaGeneration('  '), 0)
-  assert.equal(parseMintsoftDeltaGeneration('12'), 12)
-  assert.equal(parseMintsoftDeltaGeneration('-1'), null)
-  assert.equal(parseMintsoftDeltaGeneration('1.5'), null)
-  assert.equal(parseMintsoftDeltaGeneration('9007199254740993'), null, 'past the safe-integer range equality stops meaning anything')
-  assert.equal(nextMintsoftDeltaGeneration(0), 1)
-  assert.equal(nextMintsoftDeltaGeneration(12), 13)
-  assert.equal(nextMintsoftDeltaGeneration(null), 1)
+  assert.equal(parseWmsDeltaGeneration(null), 0)
+  assert.equal(parseWmsDeltaGeneration(''), 0)
+  assert.equal(parseWmsDeltaGeneration('  '), 0)
+  assert.equal(parseWmsDeltaGeneration('12'), 12)
+  assert.equal(parseWmsDeltaGeneration('-1'), null)
+  assert.equal(parseWmsDeltaGeneration('1.5'), null)
+  assert.equal(parseWmsDeltaGeneration('9007199254740993'), null, 'past the safe-integer range equality stops meaning anything')
+  assert.equal(nextWmsDeltaGeneration(0), 1)
+  assert.equal(nextWmsDeltaGeneration(12), 13)
+  assert.equal(nextWmsDeltaGeneration(null), 1)
 })
 
 // ---------------------------------------------------------------------------------------------
@@ -2517,7 +2537,7 @@ test('o3d-hl8l r6: a cursor written by an instance that does not stamp is IGNORE
     mintsoft_order_delta_generation: '5',
   })
 
-  const state = await store.transaction('read', (tx) => readMintsoftDeltaCursors(tx, store.lockScope))
+  const state = await store.transaction('read', (tx) => readWmsDeltaCursors(tx, MINTSOFT_DELTA_KEYS, store.lockScope))
 
   assert.equal(
     state.watermark,
@@ -2539,9 +2559,9 @@ test('o3d-hl8l r6: an unstamped cursor makes the sweep restart from the LOOKBACK
       deps({
         listCandidates: async () => [candidate({ linkId: 'l1', orderId: 'o1' })],
         fetchDelta: async (sinceIso: string) => { since.push(sinceIso); return [] },
-        getDeltaState: () => store.transaction('sweep-read', (tx) => readMintsoftDeltaCursors(tx, store.lockScope)),
+        getDeltaState: () => store.transaction('sweep-read', (tx) => readWmsDeltaCursors(tx, MINTSOFT_DELTA_KEYS, store.lockScope)),
         saveDeltaState: async (state) => {
-          await store.transaction('sweep-save', (tx) => saveMintsoftDeltaCursors(tx, state, store.lockScope))
+          await store.transaction('sweep-save', (tx) => saveWmsDeltaCursors(tx, MINTSOFT_DELTA_KEYS, state, store.lockScope))
         },
       }),
       { now: NOW },
@@ -2551,7 +2571,7 @@ test('o3d-hl8l r6: an unstamped cursor makes the sweep restart from the LOOKBACK
   }
 
   const coldStart = await sweepFrom({})
-  const stamped = await sweepFrom({ mintsoft_order_delta_since: encodeMintsoftDeltaCursor(0, '2026-07-15T11:00:00Z') })
+  const stamped = await sweepFrom({ mintsoft_order_delta_since: encodeWmsDeltaCursor(0, '2026-07-15T11:00:00Z') })
   // Exactly what a pre-fence build leaves behind: the raw ISO string.
   const unstamped = await sweepFrom({ mintsoft_order_delta_since: '2026-07-15T11:00:00Z' })
 
@@ -2568,39 +2588,39 @@ test('o3d-hl8l r6: an unstamped cursor makes the sweep restart from the LOOKBACK
   )
   assert.equal(
     unstamped.store.rows.get('mintsoft_order_delta_since'),
-    encodeMintsoftDeltaCursor(0, NOW.toISOString()),
+    encodeWmsDeltaCursor(0, NOW.toISOString()),
     'and the row it leaves behind IS stamped, so the very next reader can place it',
   )
 })
 
 test('o3d-hl8l r6: the decoder names every way a cursor can fail to be attributable', () => {
-  assert.deepEqual(decodeMintsoftDeltaCursor(null, 3), { value: null, refusal: 'absent' })
-  assert.deepEqual(decodeMintsoftDeltaCursor('   ', 3), { value: null, refusal: 'absent' })
+  assert.deepEqual(decodeWmsDeltaCursor(null, 3), { value: null, refusal: 'absent' })
+  assert.deepEqual(decodeWmsDeltaCursor('   ', 3), { value: null, refusal: 'absent' })
   assert.deepEqual(
-    decodeMintsoftDeltaCursor('2026-07-15T11:00:00Z', 3),
+    decodeWmsDeltaCursor('2026-07-15T11:00:00Z', 3),
     { value: null, refusal: 'unstamped' },
     'a bare ISO timestamp is what every build before this fence wrote',
   )
-  assert.deepEqual(decodeMintsoftDeltaCursor('[1,2]', 3), { value: null, refusal: 'unstamped' })
-  assert.deepEqual(decodeMintsoftDeltaCursor('{"g":"3","at":"x"}', 3), { value: null, refusal: 'unreadable' })
-  assert.deepEqual(decodeMintsoftDeltaCursor('{"g":3}', 3), { value: null, refusal: 'unreadable' })
-  assert.deepEqual(decodeMintsoftDeltaCursor('{"g":3.5,"at":"x"}', 3), { value: null, refusal: 'unreadable' })
+  assert.deepEqual(decodeWmsDeltaCursor('[1,2]', 3), { value: null, refusal: 'unstamped' })
+  assert.deepEqual(decodeWmsDeltaCursor('{"g":"3","at":"x"}', 3), { value: null, refusal: 'unreadable' })
+  assert.deepEqual(decodeWmsDeltaCursor('{"g":3}', 3), { value: null, refusal: 'unreadable' })
+  assert.deepEqual(decodeWmsDeltaCursor('{"g":3.5,"at":"x"}', 3), { value: null, refusal: 'unreadable' })
   assert.deepEqual(
-    decodeMintsoftDeltaCursor(encodeMintsoftDeltaCursor(2, '2026-07-15T11:00:00Z'), 3),
+    decodeWmsDeltaCursor(encodeWmsDeltaCursor(2, '2026-07-15T11:00:00Z'), 3),
     { value: null, refusal: 'superseded' },
     'a stamp the reset chain has moved past',
   )
   assert.deepEqual(
-    decodeMintsoftDeltaCursor(encodeMintsoftDeltaCursor(3, '2026-07-15T11:00:00Z'), null),
+    decodeWmsDeltaCursor(encodeWmsDeltaCursor(3, '2026-07-15T11:00:00Z'), null),
     { value: null, refusal: 'superseded' },
     'a generation row nobody can order cannot establish that a cursor is current — the same rule the write side applies',
   )
   assert.deepEqual(
-    decodeMintsoftDeltaCursor(encodeMintsoftDeltaCursor(3, '2026-07-15T11:00:00Z'), 3),
+    decodeWmsDeltaCursor(encodeWmsDeltaCursor(3, '2026-07-15T11:00:00Z'), 3),
     { value: '2026-07-15T11:00:00Z', refusal: null },
   )
   assert.deepEqual(
-    decodeMintsoftDeltaCursor(encodeMintsoftDeltaCursor(0, '2026-07-15T11:00:00Z'), 0),
+    decodeWmsDeltaCursor(encodeWmsDeltaCursor(0, '2026-07-15T11:00:00Z'), 0),
     { value: '2026-07-15T11:00:00Z', refusal: null },
     'generation 0 is a real generation — a fresh install must not be wedged',
   )
@@ -2611,18 +2631,19 @@ test('o3d-hl8l r6: what this build writes is what this build reads back', async 
   // that proves they agree about the format rather than each about its own.
   const { tx, rows } = cursorTx({ mintsoft_order_delta_generation: '11' })
 
-  await saveMintsoftDeltaCursors(
+  await saveWmsDeltaCursors(
     tx,
+    MINTSOFT_DELTA_KEYS,
     { watermark: '2026-08-01T00:00:00.000Z', lastReconcile: '2026-08-01T00:00:00.000Z', scope: mintsoftDeltaScopeToken(OLD_SCOPE), generation: 11 },
-    async () => OLD_SCOPE,
+    async () => mintsoftDeltaScopeToken(OLD_SCOPE),
   )
 
   assert.deepEqual(
-    decodeMintsoftDeltaCursor(rows.get('mintsoft_order_delta_since') ?? null, 11),
+    decodeWmsDeltaCursor(rows.get('mintsoft_order_delta_since') ?? null, 11),
     { value: '2026-08-01T00:00:00.000Z', refusal: null },
   )
   assert.deepEqual(
-    decodeMintsoftDeltaCursor(rows.get('mintsoft_order_reconcile_at') ?? null, 12),
+    decodeWmsDeltaCursor(rows.get('mintsoft_order_reconcile_at') ?? null, 12),
     { value: null, refusal: 'superseded' },
     'and one reset later the same row no longer vouches for anything',
   )
@@ -2634,7 +2655,7 @@ test('o3d-hl8l r6: an unreadable generation row refuses the write rather than wr
   // advances — so the refusal happens here, where the reason is visible.
   const { tx, upserts } = cursorTx({ mintsoft_order_delta_generation: 'garbage' })
 
-  const result = await saveMintsoftDeltaCursors(tx, { watermark: NOW.toISOString() }, async () => OLD_SCOPE)
+  const result = await saveWmsDeltaCursors(tx, MINTSOFT_DELTA_KEYS, { watermark: NOW.toISOString() }, async () => mintsoftDeltaScopeToken(OLD_SCOPE))
 
   assert.deepEqual(result, { written: false, reason: 'generation_unknown' })
   assert.deepEqual(upserts, [])

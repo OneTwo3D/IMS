@@ -3,20 +3,20 @@ import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
 import { getIntegrationPluginState } from '@/lib/integration-plugins'
 import { WMS_CONNECTOR_IDS } from '@/lib/connectors/wms/types'
-import { getWmsConnector } from '@/lib/connectors/wms/registry'
+import { getWmsConnector, getWmsConnectorHooks } from '@/lib/connectors/wms/registry'
 import {
-  MINTSOFT_DELTA_GENERATION_KEY,
-  decodeMintsoftDeltaCursor,
-  encodeMintsoftDeltaCursor,
-  mintsoftDeltaScopeToken,
-  nextMintsoftDeltaGeneration,
-  parseMintsoftDeltaGeneration,
-  type MintsoftDeltaScope,
-} from '@/lib/connectors/mintsoft/settings/schema'
+  decodeWmsDeltaCursor,
+  encodeWmsDeltaCursor,
+  nextWmsDeltaGeneration,
+  parseWmsDeltaGeneration,
+  wmsDeltaCursorKeys,
+  wmsDeltaSettingKeys,
+  type WmsDeltaCursorKeys,
+} from '@/lib/domain/wms/delta-cursor-generation'
 import {
-  lockMintsoftDispatchSettings,
-  type MintsoftDispatchSettingsLockTx,
-} from '@/lib/connectors/mintsoft/settings/dispatch-settings-lock'
+  defaultWmsDeltaScopeLock,
+  type WmsDeltaScopeLockTx,
+} from '@/lib/domain/wms/delta-scope-lock'
 import type { WmsConnector, WmsConnectorId, WmsOrderStatus, WmsOrderTracking } from '@/lib/connectors/wms/types'
 import { isWmsUnresolvableRecordError } from '@/lib/connectors/wms/errors'
 import { withDispatchSweepLockOrSkip } from '@/lib/domain/wms/dispatch-sweep-lock'
@@ -240,11 +240,14 @@ export function isUnresolvedDriftSystemic(unresolvedLinks: number, linksTouched:
  * integer `mintsoft_client_id` is required; other WMS connectors carry no such
  * scope and are always considered scoped.
  */
-export function isDispatchClientScoped(connectorId: string, clientIdRaw: string | null | undefined): boolean {
-  if (connectorId !== 'mintsoft') return true
-  const raw = (clientIdRaw ?? '').trim()
-  return /^\d+$/.test(raw) && Number.parseInt(raw, 10) > 0
-}
+/**
+ * o3d-remove-shiphero round 2 (Codex HIGH 2). This used to be `isDispatchClientScoped(connectorId,
+ * clientIdRaw)` right here, and its first line was `if (connectorId !== 'mintsoft') return true` —
+ * a Mintsoft precondition wearing a generic signature, reading a Mintsoft setting key, in the
+ * generic sweep. It is now `hooks.dispatchPrecondition` on the connector DEFINITION (see
+ * lib/connectors/wms/connector-hooks.ts): a connector states its own precondition or has none, and
+ * the sweep neither knows nor can accidentally apply one warehouse's gate to another's.
+ */
 
 /**
  * Job-outcome mapping (o3d-bjc finding 3a): a delta-fetch failure is a degraded
@@ -1852,7 +1855,7 @@ export type WmsDispatchSweepResult = {
  * `scope == null` means the caller asked for no check — a connector with no scope, or a test double
  * that supplies no token — and the cursors are written unconditionally, as before.
  */
-export type MintsoftDeltaCursorTx = MintsoftDispatchSettingsLockTx & {
+export type WmsDeltaCursorTx = WmsDeltaScopeLockTx & {
   setting: {
     upsert(args: {
       where: { key: string }
@@ -1867,7 +1870,7 @@ export type MintsoftDeltaCursorTx = MintsoftDispatchSettingsLockTx & {
 }
 
 /** What the RESET needs on top of the write side: it removes the cursor rows outright. */
-export type MintsoftDeltaResetTx = MintsoftDeltaCursorTx & {
+export type WmsDeltaResetTx = WmsDeltaCursorTx & {
   setting: { deleteMany(args: { where: { key: { in: string[] } } }): Promise<unknown> }
 }
 
@@ -1875,7 +1878,7 @@ export type MintsoftDeltaResetTx = MintsoftDeltaCursorTx & {
  * The read side needs `findMany` and the write side needs `upsert`; kept as separate structural
  * types so neither's doubles have to grow a delegate that path never calls.
  */
-export type MintsoftDeltaCursorReadTx = MintsoftDispatchSettingsLockTx & {
+export type WmsDeltaCursorReadTx = WmsDeltaScopeLockTx & {
   setting: {
     findMany(args: {
       where: { key: { in: string[] } }
@@ -1884,8 +1887,17 @@ export type MintsoftDeltaCursorReadTx = MintsoftDispatchSettingsLockTx & {
   }
 }
 
-/** The two Setting keys the inbound-delta cursors live in, in the order both sides touch them. */
-export const MINTSOFT_DELTA_CURSOR_KEYS = ['mintsoft_order_delta_since', 'mintsoft_order_reconcile_at'] as const
+/**
+ * The two cursor rows, in the order both sides touch them — DERIVED FROM THE CONNECTOR ID.
+ *
+ * o3d-remove-shiphero round 2 (Codex HIGH 2). These were two fixed strings naming ONE warehouse,
+ * and every connector that implements `fetchOrderDelta` was wired to them. A second connector
+ * therefore started life holding the first one's watermark, which does not fail — it makes the new
+ * connector's first sweep skip its entire backlog and report a clean pass.
+ */
+export function wmsDeltaCursorRowKeys(keys: WmsDeltaCursorKeys): readonly string[] {
+  return [keys.since, keys.reconcile]
+}
 
 /**
  * The cursor rows PLUS the generation row, read as one set.
@@ -1896,7 +1908,9 @@ export const MINTSOFT_DELTA_CURSOR_KEYS = ['mintsoft_order_delta_since', 'mintso
  * never existed. One statement, inside the transaction that already holds the dispatch rows
  * `FOR UPDATE`, cannot straddle a reset.
  */
-export const MINTSOFT_DELTA_STATE_KEYS = [...MINTSOFT_DELTA_CURSOR_KEYS, MINTSOFT_DELTA_GENERATION_KEY] as const
+export function wmsDeltaStateRowKeys(keys: WmsDeltaCursorKeys): readonly string[] {
+  return [...wmsDeltaCursorRowKeys(keys), keys.generation]
+}
 
 /**
  * q66in.7.2 r4 (Codex r3 finding 2) — READ THE CURSORS AND THE SCOPE THEY BELONG TO ATOMICALLY.
@@ -1919,17 +1933,18 @@ export const MINTSOFT_DELTA_STATE_KEYS = [...MINTSOFT_DELTA_CURSOR_KEYS, MINTSOF
  * LOCK ORDER is the same on every path that touches these rows — the five dispatch keys, then the
  * two cursor keys — so the read, the save and the settings write cannot cycle.
  */
-export async function readMintsoftDeltaCursors(
-  tx: MintsoftDeltaCursorReadTx,
-  lockScope: (tx: MintsoftDeltaCursorReadTx) => Promise<MintsoftDeltaScope>,
+export async function readWmsDeltaCursors(
+  tx: WmsDeltaCursorReadTx,
+  keys: WmsDeltaCursorKeys,
+  lockScope: (tx: WmsDeltaCursorReadTx) => Promise<string>,
 ): Promise<{ watermark: string | null; lastReconcile: string | null; scope: string; generation: number | null }> {
-  const scope = mintsoftDeltaScopeToken(await lockScope(tx))
+  const scope = await lockScope(tx)
   const rows = await tx.setting.findMany({
-    where: { key: { in: [...MINTSOFT_DELTA_STATE_KEYS] } },
+    where: { key: { in: [...wmsDeltaStateRowKeys(keys)] } },
     select: { key: true, value: true },
   })
   const map = new Map(rows.map((row) => [row.key, row.value]))
-  const generation = parseMintsoftDeltaGeneration(map.get(MINTSOFT_DELTA_GENERATION_KEY) ?? null)
+  const generation = parseWmsDeltaGeneration(map.get(keys.generation) ?? null)
 
   // o3d-hl8l r6 (Codex r5 finding 3). THE CAS AT SAVE TIME ONLY BINDS WRITERS THAT RUN IT. A
   // mixed-version deployment — a rolling restart, or a rollback — puts an instance from before the
@@ -1938,8 +1953,8 @@ export async function readMintsoftDeltaCursors(
   // a cursor that cannot be placed in the current reset chain is treated as ABSENT, which restarts
   // the delta from the lookback window instead of resuming from a claim nobody can vouch for.
   const decoded = {
-    watermark: decodeMintsoftDeltaCursor(map.get('mintsoft_order_delta_since') ?? null, generation),
-    lastReconcile: decodeMintsoftDeltaCursor(map.get('mintsoft_order_reconcile_at') ?? null, generation),
+    watermark: decodeWmsDeltaCursor(map.get(keys.since) ?? null, generation),
+    lastReconcile: decodeWmsDeltaCursor(map.get(keys.reconcile) ?? null, generation),
   }
   for (const [name, result] of Object.entries(decoded)) {
     // 'absent' is the ordinary cold start and says nothing worth a line in the log.
@@ -1974,24 +1989,27 @@ export async function readMintsoftDeltaCursors(
  * re-taken here, because taking it twice in one transaction would say the ordering is this
  * function's to establish when it is the caller's.
  */
-export async function resetMintsoftDeltaCursors(tx: MintsoftDeltaResetTx): Promise<{ generation: number }> {
+export async function resetWmsDeltaCursors(
+  tx: WmsDeltaResetTx,
+  keys: WmsDeltaCursorKeys,
+): Promise<{ generation: number }> {
   const rows = await tx.setting.findMany({
-    where: { key: { in: [MINTSOFT_DELTA_GENERATION_KEY] } },
+    where: { key: { in: [keys.generation] } },
     select: { key: true, value: true },
   })
-  const current = parseMintsoftDeltaGeneration(rows[0]?.value ?? null)
-  const generation = nextMintsoftDeltaGeneration(current)
+  const current = parseWmsDeltaGeneration(rows[0]?.value ?? null)
+  const generation = nextWmsDeltaGeneration(current)
 
-  await tx.setting.deleteMany({ where: { key: { in: [...MINTSOFT_DELTA_CURSOR_KEYS] } } })
+  await tx.setting.deleteMany({ where: { key: { in: [...wmsDeltaCursorRowKeys(keys)] } } })
   await tx.setting.upsert({
-    where: { key: MINTSOFT_DELTA_GENERATION_KEY },
-    create: { key: MINTSOFT_DELTA_GENERATION_KEY, value: String(generation) },
+    where: { key: keys.generation },
+    create: { key: keys.generation, value: String(generation) },
     update: { value: String(generation) },
   })
   return { generation }
 }
 
-export type MintsoftDeltaCursorWriteResult =
+export type WmsDeltaCursorWriteResult =
   | { written: true }
   | { written: false; reason: 'cursors_reset' | 'generation_unknown' }
 
@@ -2028,11 +2046,12 @@ export type MintsoftDeltaCursorWriteResult =
  * the lock too: a stamp read outside it could name a generation the reset had already moved past,
  * which would write a cursor that is a lie rather than a refusal.
  */
-export async function saveMintsoftDeltaCursors(
-  tx: MintsoftDeltaCursorTx,
+export async function saveWmsDeltaCursors(
+  tx: WmsDeltaCursorTx,
+  keys: WmsDeltaCursorKeys,
   state: { watermark?: string; lastReconcile?: string; scope?: string | null; generation?: number | null },
-  lockScope: (tx: MintsoftDeltaCursorTx) => Promise<MintsoftDeltaScope>,
-): Promise<MintsoftDeltaCursorWriteResult> {
+  lockScope: (tx: WmsDeltaCursorTx) => Promise<string>,
+): Promise<WmsDeltaCursorWriteResult> {
   if (state.scope != null && state.generation == null) {
     console.warn(
       '[wms-dispatch-sweep] the inbound delta cursor write carries no reset generation, so it '
@@ -2045,10 +2064,10 @@ export async function saveMintsoftDeltaCursors(
   // what makes the generation read below and the reset that would move it mutually exclusive.
   await lockScope(tx)
   const rows = await tx.setting.findMany({
-    where: { key: { in: [MINTSOFT_DELTA_GENERATION_KEY] } },
+    where: { key: { in: [keys.generation] } },
     select: { key: true, value: true },
   })
-  const current = parseMintsoftDeltaGeneration(rows[0]?.value ?? null)
+  const current = parseWmsDeltaGeneration(rows[0]?.value ?? null)
 
   if (state.generation != null) {
     if (current === null || current !== state.generation) {
@@ -2073,18 +2092,18 @@ export async function saveMintsoftDeltaCursors(
 
   const stamp = current ?? 0
   if (state.watermark !== undefined) {
-    const value = encodeMintsoftDeltaCursor(stamp, state.watermark)
+    const value = encodeWmsDeltaCursor(stamp, state.watermark)
     await tx.setting.upsert({
-      where: { key: 'mintsoft_order_delta_since' },
-      create: { key: 'mintsoft_order_delta_since', value },
+      where: { key: keys.since },
+      create: { key: keys.since, value },
       update: { value },
     })
   }
   if (state.lastReconcile !== undefined) {
-    const value = encodeMintsoftDeltaCursor(stamp, state.lastReconcile)
+    const value = encodeWmsDeltaCursor(stamp, state.lastReconcile)
     await tx.setting.upsert({
-      where: { key: 'mintsoft_order_reconcile_at' },
-      create: { key: 'mintsoft_order_reconcile_at', value },
+      where: { key: keys.reconcile },
+      create: { key: keys.reconcile, value },
       update: { value },
     })
   }
@@ -2096,6 +2115,12 @@ export function createPrismaDispatchDeps(connectorId: WmsConnectorId, connector:
   // Per-connector so one WMS drifting cannot suppress (or unsuppress) another's
   // quarantine bound.
   const unresolvedStreakKey = unresolvedDriftStateKey(connectorId)
+  // ...and so is the inbound-delta state: this connector's three cursor rows, and either the scope
+  // lock its own definition declares or the default lock over those same rows. There is no path by
+  // which one connector's delta state can be reached with another connector's id.
+  const deltaKeys = wmsDeltaCursorKeys(connectorId)
+  const deltaScopeLock = getWmsConnectorHooks(connectorId).deltaScopeLock
+    ?? defaultWmsDeltaScopeLock(wmsDeltaStateRowKeys(deltaKeys))
   return {
     async listCandidates(limit) {
       const rows = await db.wmsOrderPushLink.findMany({
@@ -2241,14 +2266,19 @@ export function createPrismaDispatchDeps(connectorId: WmsConnectorId, connector:
       ? {
           fetchDelta: (sinceIso: string) => connector.fetchOrderDelta!(sinceIso),
           async getDeltaState() {
-            // The cursors AND the scope they belong to, read in one transaction under the same
-            // five-row lock the save takes (q66in.7.2 r4). Two separate unlocked reads could pair
-            // an old-scope watermark with a new-scope token, which is exactly what makes the CAS
-            // at save time wave the stale advance through — see readMintsoftDeltaCursors.
-            return db.$transaction((tx) => readMintsoftDeltaCursors(tx, lockMintsoftDispatchSettings))
+            // The cursors AND the scope they belong to, read in one transaction under the SAME lock
+            // the save takes (q66in.7.2 r4). Two separate unlocked reads could pair an old-scope
+            // watermark with a new-scope token, which is exactly what makes the CAS at save time
+            // wave the stale advance through — see readWmsDeltaCursors.
+            //
+            // o3d-remove-shiphero round 2 (Codex HIGH 2): BOTH the rows and the lock are THIS
+            // CONNECTOR'S. They used to be one warehouse's, for every connector that implemented a
+            // bulk delta, so switching connectors handed the new one a watermark it never earned
+            // and its backlog was skipped in silence.
+            return db.$transaction((tx) => readWmsDeltaCursors(tx, deltaKeys, deltaScopeLock))
           },
           async saveDeltaState(state: { watermark?: string; lastReconcile?: string; scope?: string | null; generation?: number | null }) {
-            await db.$transaction((tx) => saveMintsoftDeltaCursors(tx, state, lockMintsoftDispatchSettings))
+            await db.$transaction((tx) => saveWmsDeltaCursors(tx, deltaKeys, state, deltaScopeLock))
           },
         }
       : {}),
@@ -2717,39 +2747,31 @@ export async function runWmsDispatchSweep(
 
   const deps = options?.deps ?? createPrismaDispatchDeps(connectorId, connector)
 
-  // Resolve the inbound Order/List delta config from settings (o3d-bjc). The
-  // flag defaults ON; `mintsoft_inbound_delta_enabled === 'false'` turns it off
-  // (behaves exactly as pre-delta). The cursor is sent in the tenant timezone.
-  const [deltaEnabledSetting, deltaTimeZoneSetting, deltaClientIdSetting] = await Promise.all([
-    getSettingValue('mintsoft_inbound_delta_enabled'),
-    getSettingValue('mintsoft_api_timezone'),
-    getSettingValue('mintsoft_client_id'),
+  // Resolve the inbound Order/List delta config from THIS CONNECTOR'S OWN settings (o3d-bjc). The
+  // flag defaults ON; `<connector>_inbound_delta_enabled === 'false'` turns it off (behaves exactly
+  // as pre-delta). The cursor is sent in the connector's tenant timezone.
+  //
+  // o3d-remove-shiphero round 2 (Codex HIGH 2): both keys used to be Mintsoft's, so a second
+  // connector inherited Mintsoft's enable flag and Mintsoft's timezone. The timezone is the quieter
+  // of the two — the delta cursor is formatted as a wall-clock string in it, so a wrong zone shifts
+  // the window by hours and the orders in the gap are never re-read.
+  const deltaSettings = wmsDeltaSettingKeys(connectorId)
+  const [deltaEnabledSetting, deltaTimeZoneSetting] = await Promise.all([
+    getSettingValue(deltaSettings.enabled),
+    getSettingValue(deltaSettings.timeZone),
   ])
-  // FAIL CLOSED: the Mintsoft inbound delta returns EVERY client's orders on the
-  // shared 3PL tenant unless it's scoped by our ClientId — an order-number
-  // collision could otherwise mark OUR order shipped off a FOREIGN despatch.
-  // Without a valid, positive mintsoft_client_id we keep the delta INERT (never
-  // call it) and fall back to the per-order reconcile (unchanged pre-delta
-  // behaviour). Only Mintsoft carries this scope; other WMS connectors have no
-  // delta wired, so this gate is a no-op for them. (Mirrors parseMintsoftPositiveId.)
-  const clientScoped = isDispatchClientScoped(connectorId, deltaClientIdSetting)
-  // Round-5 #3 regression fix: on the shared Mintsoft tenant EVERY per-order
-  // lookup (Search/detail/parts) now requires a ClientId and throws without one.
-  // The old "delta off, fall back to per-order reconcile" path would therefore
-  // throw for every candidate, accrue consecutive-failure strikes, and
-  // dead-letter every active link. So when Mintsoft is unscoped we SKIP the whole
-  // sweep (no candidates touched, no strikes) rather than run a reconcile that
-  // can only fail — a blank ClientId cleanly DISABLES Mintsoft dispatch sync.
-  if (!clientScoped) {
-    return {
-      ...empty,
-      status: 'SKIPPED',
-      skippedReason: 'Mintsoft dispatch sync is disabled until mintsoft_client_id is configured (Sync settings) — skipped to avoid unscoped cross-client lookups',
-    }
+
+  // A precondition the connector states for itself, if it has one. Mintsoft's is its ClientId
+  // scope; see lib/connectors/wms/registry.ts. A connector with none runs unconditionally, rather
+  // than being measured against a gate written for somebody else's warehouse.
+  const precondition = await getWmsConnectorHooks(connectorId).dispatchPrecondition?.()
+  if (precondition && !precondition.ok) {
+    return { ...empty, status: 'SKIPPED', skippedReason: precondition.reason }
   }
+
   const coreOptions: WmsDispatchSweepCoreOptions = {
     batchSize: options?.batchSize,
-    deltaEnabled: deltaEnabledSetting !== 'false' && clientScoped,
+    deltaEnabled: deltaEnabledSetting !== 'false',
     deltaTimeZone: deltaTimeZoneSetting || DISPATCH_DELTA_DEFAULT_TIMEZONE,
   }
 

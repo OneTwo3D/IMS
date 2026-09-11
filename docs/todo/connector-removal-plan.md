@@ -30,6 +30,53 @@ development system.
 
 ---
 
+## What the ShipHero seam actually proves (read this first)
+
+Both removals below say "model it on the WMS seam test". As of round 2 of
+`o3d-remove-shiphero` that pattern is **two** files, and the split is the whole
+lesson.
+
+`tests/wms-second-connector-seam.test.ts` drives the generic layer with a
+fictitious connector — but every one of its tests starts *inside* that layer,
+handing the connector to a decorator, a policy function or a sweep core. Codex
+found that this proves the generic code is generic and says nothing about
+whether a second connector can ever **reach** it. Three real defects lived on
+exactly that path: the ASN facade dispatched on `connector === 'mintsoft'`, the
+dispatch sweep wired every connector's delta cursors to Mintsoft's setting rows,
+and the post-maintenance recheck returned early unless the id was `mintsoft`. A
+seam test that starts past the dispatcher cannot see any of them.
+
+`tests/wms-second-connector-seam-production.test.ts` is the half that does:
+it registers `acme-wms`, marks it the active connector, and calls the **real
+server actions** and the **real Prisma-backed deps**.
+
+**So the rule for the Shopify and QuickBooks seam tests is:** at least one test
+per removed capability must enter through the production entrypoint with the
+fictitious connector ACTIVE — the server action, the cron entry, the dispatcher —
+and assert it *dispatched*. A test that constructs the port itself has proved an
+adjacent property.
+
+Two mechanisms are worth copying rather than reinventing:
+
+- **`WmsConnectorDef.hooks`** (`lib/connectors/wms/connector-hooks.ts`) — the
+  per-connector server-side wiring the generic layer routes to by *presence*.
+  This is what replaced the `if (id === 'mintsoft')` dispatchers. The accounting
+  plan's step 2 below ("turn the `(id === 'quickbooks')` stubs into definition
+  fields") is the same move; the shopping plan's thirteen `switch (connector)`
+  statements are the same problem.
+- **A registrable-connector type** (`WmsRegistrableConnector`) — where two
+  independently-optional members combine into a state the system cannot honour,
+  make the combination untypeable at the registry factory every connector passes
+  through, rather than detecting it downstream.
+
+And the guard that keeps it honest:
+`scripts/check-wms-connector-boundary.mjs` now derives its literal list from
+`WMS_CONNECTOR_IDS` (so a registration cannot add an unscanned literal) and
+**scans the generic layer itself**. Its earlier allowlist exempted
+`lib/domain/wms/` and the facades outright, which is precisely why all three
+defects above passed it for months. If you write an equivalent guard for
+shopping or accounting, do not exempt the layer you are protecting.
+
 ## Do Shopify FIRST, then QuickBooks
 
 **Shopify is the easier removal and the safer one to do now.** QuickBooks is
@@ -108,7 +155,11 @@ and `app/actions/onboarding.ts:286` become unreachable, along with the tests in
 `SHOPPING_CONNECTORS.length >= 2` — the headline breakage. That file already
 proves genericity with a hypothetical `'newshop'` connector, so it is most of a
 second-connector seam test already; finish that job rather than weakening the
-assertion. `tests/connectors/shopping-webhook-empty-body.test.ts` loses its only
+assertion. **But "most of" is the trap**: like the round-1 WMS seam, it hands
+`'newshop'` to the generic code directly. The thirteen `switch (connector)`
+statements are on the path *before* that, so a `'newshop'` test that starts
+inside cannot see a switch that silently has no arm for it. At least one test
+must route `'newshop'` through the real dispatcher. `tests/connectors/shopping-webhook-empty-body.test.ts` loses its only
 non-WooCommerce subject (the czuf4 default-deny behaviour). And
 `scripts/documented-env-var-allowlist.json` **errors on stale entries**, so the
 `SHOPIFY_STORE_DOMAIN` waiver, `.env.example:289-305` and
@@ -187,12 +238,17 @@ So the honest plan is **not** "preserve the abstraction as it stands" — it is:
 3. **Turn `getAccountingConnector` into a factory map** keyed by the registry,
    and collapse the four duplicate unions into the one in
    `accounting-registry.ts`.
-4. **Then add the fictitious-connector seam test**, modelled on
-   `tests/wms-second-connector-seam.test.ts`: register a fictitious accounting
-   connector with a different capability profile and drive
+4. **Then add the fictitious-connector seam test**, modelled on **both**
+   `tests/wms-second-connector-seam.test.ts` and
+   `tests/wms-second-connector-seam-production.test.ts`: register a fictitious
+   accounting connector with a different capability profile and drive
    `accounting-id-provenance`, `accounting-connection-provenance`,
    `accounting-posting-intent`, `accounting-egress-authorization` and
-   `connector-orphans` through it.
+   `connector-orphans` through it — and drive at least the posting and egress
+   paths from the **production entrypoints** with that connector ACTIVE. See
+   "What the ShipHero seam actually proves" above: the first file alone is what
+   Codex rejected, because the defects sat between the registry and the generic
+   code rather than inside it.
 
 **What must survive regardless of any of that:**
 `accounting-id-provenance.ts` **is not a two-connector artefact**. Its

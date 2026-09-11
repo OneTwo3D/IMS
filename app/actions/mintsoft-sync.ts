@@ -9,7 +9,8 @@ import { logActivity } from '@/lib/activity-log'
 import { recordWmsMutationEvent } from '@/lib/domain/wms/mutation-audit'
 import { alignmentDryRunEvidenceQuery } from '@/lib/domain/wms/alignment-dry-run'
 import { lockMintsoftCourierServiceMap, lockMintsoftDispatchSettings } from '@/lib/connectors/mintsoft/settings/dispatch-settings-lock'
-import { resetMintsoftDeltaCursors } from '@/lib/domain/wms/dispatch-sweep'
+import { resetWmsDeltaCursors } from '@/lib/domain/wms/dispatch-sweep'
+import { wmsDeltaCursorKeys } from '@/lib/domain/wms/delta-cursor-generation'
 import {
   configChangeMetadata,
   describeConfigChange,
@@ -54,7 +55,7 @@ import {
   type MintsoftReturnsInboxRow,
 } from '@/lib/connectors/mintsoft/sync/returns-sync'
 import { enqueueMintsoftBookedInRecheckForAsn, replayMintsoftBookedInEventsForAsn } from '@/lib/jobs/wms/process-mintsoft-booked-in-event'
-import { MINTSOFT_WEBHOOK_PROCESSING_STATUS } from '@/lib/domain/wms/booked-in-service'
+import { WMS_INBOUND_EVENT_PROCESSING_STATUS } from '@/lib/domain/wms/booked-in-service'
 import { getWmsConnector } from '@/lib/connectors/wms/registry'
 import { getIntegrationPluginState, isIntegrationPluginEnabled } from '@/lib/integration-plugins'
 import { hasPermission } from '@/lib/permissions'
@@ -1019,12 +1020,12 @@ export async function saveMintsoftOrderDispatchSettings(input: {
     // running under the old scope re-upserts them from its own run and the reset is silently undone
     // — which r3 tried to stop with a scope-token compare-and-swap at the write, and could not,
     // because a scope corrected and then corrected BACK (89 → 101 → 89) leaves the token exactly
-    // where it started while both resets really happened. `resetMintsoftDeltaCursors` mints a
+    // where it started while both resets really happened. `resetWmsDeltaCursors` mints a
     // monotonic generation in the same transaction, under the five-row lock already held above, and
     // the cursor write is judged against THAT: it never returns to a value an in-flight sweep can be
     // carrying, so neither reset can be written over.
     if (changed) {
-      await resetMintsoftDeltaCursors(tx)
+      await resetWmsDeltaCursors(tx, wmsDeltaCursorKeys('mintsoft'))
     }
 
     return {
@@ -1203,7 +1204,7 @@ export async function getMintsoftDashboardData(): Promise<MintsoftDashboardData>
   const receiptReviewWhere = {
     connector: 'mintsoft',
     processedAt: null,
-    processingStatus: MINTSOFT_WEBHOOK_PROCESSING_STATUS.requiresReview,
+    processingStatus: WMS_INBOUND_EVENT_PROCESSING_STATUS.requiresReview,
   }
 
   const [connection, settings, connectionTest, warehouses, bindings, recentStockSyncJobs, dryRunReadyJobs, openDiscrepancies, bundleLinks, returnsInbox, receiptReviewEventCount, receiptReviewEvents, pluginState] = await Promise.all([

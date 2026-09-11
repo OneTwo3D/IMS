@@ -288,24 +288,54 @@ export type WmsOrderPushInput = {
   lines: WmsOrderPushLine[]
 }
 
-export type WmsOrderPushResult = {
+type WmsOrderPushResultBase = {
   externalOrderId: string
   externalOrderNumber: string | null
   status: string
-  /**
-   * o3d-bjc.8: this id was MINTED by a create we did not read back, so it is
-   * bound on the connector's word alone. The link is persisted PENDING_VERIFY
-   * and a later sweep proves ownership with a scoped read — it must never be
-   * re-pushed, because the order already exists in the warehouse.
-   *
-   * Absent/false means the id came from a read that already proved ownership
-   * (the dedupe path asserts the ClientId on the row it selects).
-   */
-  needsVerification?: boolean
   /** True when the order's shipping service didn't resolve and the WMS fell back to a
    *  default courier — the warehouse should verify the courier before despatch. */
   courierFallback?: boolean
 }
+
+/**
+ * A push whose id came from a read that ALREADY PROVED OWNERSHIP — Mintsoft's dedupe path asserts
+ * the ClientId on the row it selects, for instance. Nothing further is owed, so the link goes
+ * straight to SYNCED.
+ *
+ * o3d-remove-shiphero round 2 (Codex HIGH 4): `needsVerification` is pinned to `false` here, rather
+ * than merely omitted, so this type is NOT satisfied by a push that might assert doubt. That is what
+ * lets `WmsRegistrableConnector` refuse the combination described below.
+ */
+export type WmsOrderPushProvenResult = WmsOrderPushResultBase & {
+  needsVerification?: false
+}
+
+/**
+ * o3d-bjc.8: this id was MINTED by a create we did not read back, so it is bound on the connector's
+ * word alone. The link is persisted PENDING_VERIFY and a later sweep proves ownership with a scoped
+ * read — it must never be re-pushed, because the order already exists in the warehouse.
+ */
+export type WmsOrderPushUnverifiedResult = WmsOrderPushResultBase & {
+  needsVerification: true
+}
+
+/**
+ * THE COMBINATION THIS TYPE USED TO PERMIT (o3d-remove-shiphero round 2, Codex HIGH 4).
+ *
+ * `needsVerification?: boolean` and `verifyPushedOrder?` were INDEPENDENTLY optional, so a connector
+ * could say "I minted this id and cannot prove it is ours" while offering no way to ever prove it.
+ * The push sweep resolved that combination to SYNCED — and SYNCED is what the update, hold, cancel
+ * and dispatch passes act on. IMS would then amend, cancel or mark shipped an order under an id the
+ * connector had explicitly disclaimed; against a real warehouse that is somebody else's order.
+ *
+ * It is not enough to detect it. A connector asserting a doubt it cannot resolve is asking for a
+ * state that does not exist, so the contract now refuses to express it: see
+ * `WmsRegistrableConnector` in ./registry.ts, which a connector cannot be registered without
+ * satisfying. The sweep keeps a runtime fail-safe as well, because a connector reached through a
+ * cast (or written in JavaScript) can still produce the shape at runtime — but the fail-safe is a
+ * second line, not the fix.
+ */
+export type WmsOrderPushResult = WmsOrderPushProvenResult | WmsOrderPushUnverifiedResult
 
 export type WmsOrderCancelResult = {
   cancelled: boolean

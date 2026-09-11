@@ -25,11 +25,15 @@ import {
   ACME_WMS_ID,
   ACME_WMS_LABEL,
   AcmeWmsConnector,
+  UnverifiableAcmeWmsConnector,
   acmeWmsConnectorDef,
   makeAcmeWarehouse,
   makeSeamRegistry,
+  type SeamWmsConnectorId,
 } from './helpers/fictitious-wms-connector.ts'
-import { createWmsConnectorRegistry } from '../lib/connectors/wms/registry.ts'
+import { createWmsConnectorRegistry, type WmsConnectorDef } from '../lib/connectors/wms/registry.ts'
+import { runWmsOrderPushSweepCore } from '../lib/domain/wms/order-push-sweep.ts'
+import type { WmsOrderPushPort, WmsPushCandidate } from '../lib/domain/wms/order-push-sweep.ts'
 import {
   decideWmsHeldRelease,
   wmsAmbiguousCreateMayBeReplayed,
@@ -430,4 +434,116 @@ test('seam/order-lookup: the type guard accepts only registered ids', async () =
   // seam is the injected registry, never a fixture id leaking into production.
   assert.equal(isWmsConnectorId(ACME_WMS_ID), false)
   assert.equal(isWmsConnectorId(null), false)
+})
+
+// ---------------------------------------------------------------------------
+// 7. THE VERIFICATION CONTRACT — a doubt a connector cannot resolve (Codex HIGH 4)
+// ---------------------------------------------------------------------------
+
+/**
+ * WHAT WAS REACHABLE. `WmsOrderPushResult.needsVerification` and `WmsConnector.verifyPushedOrder`
+ * were independently optional, so a connector could say "I minted this id and cannot prove it is
+ * ours" and offer no way to ever prove it. The push sweep resolved that to SYNCED — the state the
+ * update, hold, cancel and dispatch passes act on — so IMS would go on to amend, cancel or mark
+ * despatched an order under an id the connector had explicitly disclaimed.
+ *
+ * THE FIX REMOVES THE COMBINATION rather than reacting to it: `WmsRegistrableConnector` (the type
+ * of `WmsConnectorDef.create`) admits a connector that can verify, or one that only ever returns
+ * PROVEN push results, and nothing in between. The runtime guard below is the second line, for a
+ * connector reached through a cast or written in JavaScript.
+ */
+test('seam/verify: a connector that asserts an unresolvable doubt CANNOT BE REGISTERED', () => {
+  const warehouse = makeAcmeWarehouse()
+  // The whole assertion is the `@ts-expect-error`: if this ever compiles, the combination is
+  // expressible again and the runtime guard below is the only thing left standing.
+  const def: WmsConnectorDef<SeamWmsConnectorId> = {
+    id: ACME_WMS_ID,
+    label: ACME_WMS_LABEL,
+    available: true,
+    createReplayPolicy: 'client-side-dedupe-only',
+    // @ts-expect-error o3d-remove-shiphero r2 (Codex HIGH 4): `needsVerification: true` with no
+    // `verifyPushedOrder` is not a registrable connector. Deleting the union in
+    // WmsRegistrableConnector makes this line compile, and THAT is what this test detects.
+    create: () => new UnverifiableAcmeWmsConnector(warehouse),
+  }
+  // And the registry still builds — the refusal is a TYPE refusal, at the one choke point every
+  // production connector passes through, not a throw somebody could catch and ignore.
+  assert.equal(createWmsConnectorRegistry([def]).ids().length, 1)
+})
+
+/** The minimum port the create pass needs, recording what it was asked to persist. */
+function seamPushPort(candidates: WmsPushCandidate[]) {
+  const upserts: Array<{ orderId: string; create: Record<string, unknown>; update: Record<string, unknown> }> = []
+  const port: WmsOrderPushPort = {
+    activeBindings: async () => [{ warehouseId: 'wh-1', externalWarehouseId: 'ACME-WH-1' }],
+    releasableHeldOrders: async () => [],
+    createCandidates: async () => candidates,
+    revalidatableLinks: async () => ({ links: [], total: 0 }),
+    recordValidationFailure: async () => true,
+    claimForCreate: async () => 'CLAIMED',
+    verifiableLinks: async () => [],
+    updatableLinks: async () => [],
+    holdableLinks: async () => [],
+    cancellableLinks: async () => [],
+    upsertByOrder: async (orderId, create, update) => { upserts.push({ orderId, create, update }) },
+    updateLink: async () => {},
+    updateLinkIfState: async () => true,
+    recordEvent: async () => {},
+  }
+  return { port, upserts }
+}
+
+function seamPushCandidate(): WmsPushCandidate {
+  return {
+    id: 'so-1', orderNumber: 'SO-1', externalOrderNumber: null, currency: 'GBP',
+    customerName: 'Jane Doe', customerEmail: 'jane@example.com', customerVatNumber: null,
+    shippingAddress: { line1: '1 St', city: 'Leeds', postcode: 'LS1', country: 'GB' },
+    shippingService: null, subtotalForeign: 10, shippingForeign: 0, taxForeign: 0,
+    taxRatePercent: null, pricesIncludeVat: false, discountAmount: 0, totalForeign: 10,
+    shipFromWarehouseId: 'wh-1', pushAttempts: 0,
+    lines: [{ sku: 'A', qty: 1, taxForeign: 0, totalForeign: 10, description: 'Widget' }],
+  }
+}
+
+test('seam/verify: an UNVERIFIABLE create is never SYNCED, even reached past the type', async () => {
+  // The cast is the point: this is a connector that a JavaScript implementation, a mixed-version
+  // build or a deliberate `as` can still produce, and the sweep must not depend on the type system
+  // having been consulted.
+  const connector = new UnverifiableAcmeWmsConnector(makeAcmeWarehouse())
+  const { port, upserts } = seamPushPort([seamPushCandidate()])
+
+  const result = await runWmsOrderPushSweepCore(
+    connector as unknown as Parameters<typeof runWmsOrderPushSweepCore>[0],
+    ACME_WMS_ID as never,
+    port,
+    { now: () => new Date('2026-09-01T00:00:00.000Z') },
+  )
+
+  assert.equal(result.created, 1, 'the order WAS created in the warehouse — it must never be re-pushed')
+  assert.equal(upserts.length, 1)
+  assert.equal(upserts[0].create.state, 'PENDING_VERIFY', 'an id the connector disclaimed is not SYNCED')
+  assert.equal(upserts[0].update.state, 'PENDING_VERIFY')
+  // And the reason is ON THE LINK, because nothing will ever promote it: this connector has no
+  // verifier, so the verify pass does not even run. A silent PENDING_VERIFY would be a stuck order
+  // with no explanation.
+  assert.match(String(upserts[0].update.lastError), /UNVERIFIED/)
+  assert.match(String(upserts[0].update.lastError), /will not amend, cancel or mark it despatched/i)
+})
+
+test('seam/verify: the SAME connector returning a PROVEN id is SYNCED — the contrast that makes it a test', async () => {
+  // Acme proper: no verifier either, but its create reads the order back, so the id arrives proved.
+  // Identical sweep, identical port; only the connector's claim about its own id differs.
+  const connector = new AcmeWmsConnector(makeAcmeWarehouse())
+  const { port, upserts } = seamPushPort([seamPushCandidate()])
+
+  const result = await runWmsOrderPushSweepCore(
+    connector as unknown as Parameters<typeof runWmsOrderPushSweepCore>[0],
+    ACME_WMS_ID as never,
+    port,
+    { now: () => new Date('2026-09-01T00:00:00.000Z') },
+  )
+
+  assert.equal(result.created, 1)
+  assert.equal(upserts[0].create.state, 'SYNCED')
+  assert.equal(upserts[0].update.lastError, null, 'nothing is owed, so nothing is flagged')
 })

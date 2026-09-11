@@ -1,4 +1,8 @@
 import { db } from '@/lib/db'
+import {
+  WMS_INBOUND_EVENT_PROCESSING_STATUS,
+  type WmsInboundEventProcessingStatus,
+} from '@/lib/domain/wms/inbound-event-status'
 import { logActivity } from '@/lib/activity-log'
 import { recordWmsMutationEvent } from '@/lib/domain/wms/mutation-audit'
 import type { WmsAsnRef } from '@/lib/connectors/wms/types'
@@ -34,14 +38,12 @@ const FAILED_RETRY_BASE_MS = 5 * 60 * 1000
 const MAX_PENDING_RETRY_MS = 30 * 60 * 1000
 const MAX_FAILED_RETRY_MS = 60 * 60 * 1000
 
-export const MINTSOFT_WEBHOOK_PROCESSING_STATUS = {
-  pending: 'PENDING',
-  pendingRetry: 'PENDING_RETRY',
-  failedRetry: 'FAILED_RETRY',
-  requiresReview: 'REQUIRES_REVIEW',
-  dead: 'DEAD',
-  processed: 'PROCESSED',
-} as const
+// The lifecycle values live in their own connector-agnostic module (see there for why); re-exported
+// here because this file's own callers have always imported them from it.
+export {
+  WMS_INBOUND_EVENT_PROCESSING_STATUS,
+  type WmsInboundEventProcessingStatus,
+} from '@/lib/domain/wms/inbound-event-status'
 
 // Approval-blocking warnings are structural mismatches that admin acknowledgement alone cannot
 // resolve; the underlying IMS/Mintsoft data must be corrected. `received_over_expected` is a
@@ -53,12 +55,11 @@ const APPROVAL_BLOCKED_WARNING_CODES = new Set<BookedInDryRunWarningCode>([
   'cost_layer_snapshot_missing',
 ])
 
-type MintsoftWebhookProcessingStatus = typeof MINTSOFT_WEBHOOK_PROCESSING_STATUS[keyof typeof MINTSOFT_WEBHOOK_PROCESSING_STATUS]
 
 type WebhookRetryKind = 'pending' | 'failed'
 
 type WebhookRetryUpdate = {
-  processingStatus: MintsoftWebhookProcessingStatus
+  processingStatus: WmsInboundEventProcessingStatus
   processingAttempts: number
   nextRetryAt: Date | null
   deadLetteredAt: Date | null
@@ -183,7 +184,7 @@ export function buildMintsoftWebhookRetryUpdate(
 
   if (attempts >= maxAttempts) {
     return {
-      processingStatus: MINTSOFT_WEBHOOK_PROCESSING_STATUS.dead,
+      processingStatus: WMS_INBOUND_EVENT_PROCESSING_STATUS.dead,
       processingAttempts: attempts,
       nextRetryAt: null,
       deadLetteredAt: now,
@@ -193,8 +194,8 @@ export function buildMintsoftWebhookRetryUpdate(
 
   return {
     processingStatus: kind === 'pending'
-      ? MINTSOFT_WEBHOOK_PROCESSING_STATUS.pendingRetry
-      : MINTSOFT_WEBHOOK_PROCESSING_STATUS.failedRetry,
+      ? WMS_INBOUND_EVENT_PROCESSING_STATUS.pendingRetry
+      : WMS_INBOUND_EVENT_PROCESSING_STATUS.failedRetry,
     processingAttempts: attempts,
     nextRetryAt: new Date(now.getTime() + buildNextRetryDelayMs(kind, attempts, random)),
     deadLetteredAt: null,
@@ -207,12 +208,12 @@ export function buildMintsoftWebhookSweepWhere(now = new Date()) {
     connector: 'mintsoft',
     processedAt: null,
     OR: [
-      { processingStatus: MINTSOFT_WEBHOOK_PROCESSING_STATUS.pending },
+      { processingStatus: WMS_INBOUND_EVENT_PROCESSING_STATUS.pending },
       {
         processingStatus: {
           in: [
-            MINTSOFT_WEBHOOK_PROCESSING_STATUS.pendingRetry,
-            MINTSOFT_WEBHOOK_PROCESSING_STATUS.failedRetry,
+            WMS_INBOUND_EVENT_PROCESSING_STATUS.pendingRetry,
+            WMS_INBOUND_EVENT_PROCESSING_STATUS.failedRetry,
           ],
         },
         nextRetryAt: { lte: now },
@@ -500,7 +501,7 @@ export async function processBookedInEvent(
         await tx.wmsInboundReceiptEvent.update({
           where: { id: lockedEvent.id },
           data: {
-            processingStatus: MINTSOFT_WEBHOOK_PROCESSING_STATUS.requiresReview,
+            processingStatus: WMS_INBOUND_EVENT_PROCESSING_STATUS.requiresReview,
             nextRetryAt: null,
             deadLetteredAt: null,
             lastError: reviewErrorMessage(dryRun),
@@ -524,7 +525,7 @@ export async function processBookedInEvent(
         await tx.wmsInboundReceiptEvent.update({
           where: { id: lockedEvent.id },
           data: {
-            processingStatus: MINTSOFT_WEBHOOK_PROCESSING_STATUS.requiresReview,
+            processingStatus: WMS_INBOUND_EVENT_PROCESSING_STATUS.requiresReview,
             nextRetryAt: null,
             deadLetteredAt: null,
             lastError: message,
@@ -1066,7 +1067,7 @@ export async function processBookedInEvent(
         where: { id: lockedEvent.id },
         data: {
           processedAt: now,
-          processingStatus: MINTSOFT_WEBHOOK_PROCESSING_STATUS.processed,
+          processingStatus: WMS_INBOUND_EVENT_PROCESSING_STATUS.processed,
           nextRetryAt: null,
           deadLetteredAt: null,
           lastError: null,

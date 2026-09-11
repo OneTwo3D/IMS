@@ -11,4 +11,7 @@ import './wms-order-status' // connector-agnostic (module 'wms')
 import './wms-order-push'
 import './wms-order-reconcile'
 import './wms-watchdog' // connector-agnostic (module 'wms')
+// The cron registry loads each connector's own job module; a registry that could not name what it
+// registers would not be one.
+// wms-connector-boundary-ok: o3d-remove-shiphero: per-connector job module load, at the registry.
 import './wms-mintsoft' // Mintsoft connector jobs

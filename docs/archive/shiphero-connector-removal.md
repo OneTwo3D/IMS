@@ -93,14 +93,33 @@ implementation, and it is worth knowing before the next removal.
 
 ## How the abstraction is protected now
 
-`tests/wms-second-connector-seam.test.ts` registers a **fictitious** WMS
+Two test files, and they cover different halves of the same claim.
+
+**`tests/wms-second-connector-seam.test.ts`** registers a **fictitious** WMS
 connector (`acme-wms`, `tests/helpers/fictitious-wms-connector.ts`) — a complete
 in-memory warehouse written only against the `WmsConnector` contract — and drives
 the generic layer through it: registry construction, create-replay policy and
 every refusal that turns on it, the held-release rule, the exception inbox's
 replay affordance, `WmsUnresolvableRecordError` → UNRESOLVED mapping inside the
 real dispatch sweep, per-order reconciliation for a WMS with no bulk delta, ASN
-label decoration, and the WMS→shopping order-lookup resolver.
+label decoration, the WMS→shopping order-lookup resolver, and the
+push-verification contract.
+
+**`tests/wms-second-connector-seam-production.test.ts`** (added in round 2) does
+the thing the file above cannot: it starts at the **outside**. It registers
+`acme-wms`, makes it the active connector, and calls the real
+`app/actions/wms-asn.ts` server actions and the real
+`createPrismaDispatchDeps(...)` inbound-delta wiring.
+
+**Why the second file had to exist.** Codex's round-1 review found that every
+test in the first file began *inside* the generic layer — handing the fictitious
+connector to a decorator, a policy function or the sweep core directly. Behaving
+generically when you are handed a second connector is not the same as being
+*reached* with one, and the defects were all on the path in between: the ASN
+facade dispatched on `connector === 'mintsoft'`, and the dispatch sweep wired
+every connector's delta cursors to Mintsoft's setting rows. Both were invisible
+to a test that started past them. That is the proof-of-an-adjacent-property
+shape — sound, and about the wrong thing.
 
 Supporting changes that made that possible, and that are the seam itself:
 
@@ -109,6 +128,15 @@ Supporting changes that made that possible, and that are the seam itself:
 - `createWmsConnectorRegistry` builds a registry from definitions; dispatch is a
   map of factories, not a `switch`. `createReplayPolicy` is a required field on
   the definition, so a new connector fails `tsc` until somebody writes it down.
+- **`WmsConnectorDef.hooks`** (round 2, `lib/connectors/wms/connector-hooks.ts`)
+  carries the server-side flows built *around* the warehouse calls — the ASN
+  state machine, product/bundle sync, the booked-in recheck, the dispatch
+  precondition, the inbound-delta scope lock. The generic layer routes on the
+  **presence** of a hook and never on the id, so adding a connector is a
+  registration in `registry.ts` and not an edit to three dispatchers.
+- **`WmsRegistrableConnector`** (round 2) is the type of `WmsConnectorDef.create`.
+  It admits a connector that can verify a minted id, or one that only ever
+  returns proven push results, and **nothing in between** — see below.
 - `wmsCreateReplayPolicy` / `wmsAmbiguousCreateMayBeReplayed` /
   `wmsAmbiguousCreateRefusal` / `decideWmsHeldRelease` / `decideWmsPushReplay` /
   `decideWmsMissingRepush` / `runWmsOrderPushSweepCore` all take the registry as
@@ -125,23 +153,63 @@ kept passing against a build in which the policy value had been deleted
 outright. A registered fictitious connector is the only way to attribute the
 refusal to the policy rather than to ignorance.
 
-## Known abstraction leaks, left as they are
+## What round 2 closed (Codex, four HIGHs)
 
-Worth knowing before the next removal — none of these are caused by this change,
-but all of them are now un-pressured:
+The round-1 version of this document listed three "known abstraction leaks, left
+as they are". They were not incidental: they were the reason the seam claim did
+not hold. All four findings are fixed, and each fix is stated below as what it
+makes **impossible**, not as what it checks.
 
-- `runWmsDispatchSweep` reads `mintsoft_inbound_delta_enabled`,
-  `mintsoft_api_timezone` and `mintsoft_client_id` by name, and calls
-  `isDispatchClientScoped(connectorId, …)`, inside the *generic* entrypoint.
-- `app/actions/wms-asn.ts` dispatches on `if (connector === 'mintsoft')`, so
-  adding a WMS with ASN support **does** require editing the facade, contrary to
-  the promise in its own doc comment.
-- `lib/domain/wms/post-maintenance-recheck.ts` returns early unless the connector
-  is `mintsoft`.
+1. **The ASN facade cannot resolve to one connector.** `app/actions/wms-asn.ts`
+   routes on `hooks.asn`, which is declared by the connector's own registry
+   definition. There is no id comparison left in it, so there is no arm a second
+   connector can fall off. "Cannot do ASNs" and "nothing is enabled" remain
+   *distinct* refusals, and the first names the connector it resolved.
+2. **A connector cannot read another connector's delta cursor.** The three cursor
+   rows, the reset-generation chain, the enable flag and the API timezone are all
+   **derived from the connector id** (`wmsDeltaCursorKeys`,
+   `wmsDeltaSettingKeys`), and the scope lock is either the connector's own
+   (`hooks.deltaScopeLock`) or a default over its own rows. There is no shared
+   key for a stale watermark to travel through. This mattered because the failure
+   was silent: a Mintsoft watermark made a second connector's first sweep skip its
+   backlog and report a clean pass. For `mintsoft` the derived names are
+   byte-for-byte the existing rows, so nothing migrates.
+3. **The boundary guard no longer exempts the layer it protects.**
+   `scripts/check-wms-connector-boundary.mjs` derives its literal list from
+   `WMS_CONNECTOR_IDS` (a registration cannot add an unscanned literal), and
+   `lib/domain/wms/`, `lib/jobs/wms/`, `lib/cron-jobs/wms.ts` and
+   `app/actions/wms-asn.ts` are now **inside** the scan. Within the generic layer
+   it reads code with comments blanked — a comment has no behaviour, and the doc
+   comments there necessarily narrate which connector each rule was learned from;
+   the tokenizer falls back to a raw scan on any sign of a mis-parse, so a
+   mis-parse can only make the guard stricter. Turning it on lit up 145 real
+   lines, which is what findings 1 and 2 look like from the outside.
+4. **An explicitly unverified create cannot be called SYNCED.**
+   `needsVerification: true` with no `verifyPushedOrder` was independently
+   expressible and resolved to SYNCED — the state the update, hold, cancel and
+   dispatch passes act on — so IMS would amend or cancel an order under an id the
+   connector had just disclaimed. `WmsRegistrableConnector` makes the combination
+   **untypeable at the registry's factory**, which every production connector
+   passes through; the push sweep additionally parks any such create at
+   PENDING_VERIFY with the reason on the link, for a connector reached through a
+   cast or written in JavaScript.
 
-These are legitimate today (Mintsoft is the only connector that implements those
-capabilities) but each is a hardcoded connector literal in a module the boundary
-guard allowlists, so nothing will flag them.
+## Leaks that remain, deliberately
+
+- `app/actions/wms-sync.ts` and `app/actions/wms-onboarding.ts` still return a DTO
+  with a literal `mintsoft:` member that the sync dashboard and the onboarding
+  wizard read **by name**, so their dispatch cannot move onto `hooks` until that
+  UI reads a connector-agnostic shape (**o3d-vp9n**). They are named-file entries
+  in the guard's allowlist, not directory exemptions.
+- `lib/domain/wms/booked-in-service.ts` is Mintsoft's booked-in webhook processor
+  misfiled under the generic directory; it belongs under
+  `lib/connectors/mintsoft/` (**o3d-vp9m**). Its connector-agnostic half — the
+  inbound-event processing lifecycle — was split out to
+  `lib/domain/wms/inbound-event-status.ts` in round 2, which is what let the
+  exception inbox and the retention sweep stop naming a connector at all.
+- A link parked at PENDING_VERIFY by finding 4's runtime fail-safe carries its
+  reason on the link and in the audit timeline, but does not yet surface in the
+  exception inbox (**o3d-vp9p**).
 
 ## Next
 

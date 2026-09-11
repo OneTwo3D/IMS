@@ -2,15 +2,23 @@ import { after } from 'next/server'
 import { db } from '@/lib/db'
 import { getIntegrationPluginState } from '@/lib/integration-plugins'
 import { WMS_CONNECTOR_IDS, type WmsConnectorId } from '@/lib/connectors/wms/types'
+import { getWmsConnectorHooks } from '@/lib/connectors/wms/registry'
+import type { WmsSyncTrigger } from '@/lib/connectors/wms/connector-hooks'
 
 /**
  * Connector-agnostic dispatch of product/bundle sync triggered by IMS product
  * mutations. Resolves the active (enabled) WMS connector and forwards to its
  * implementation, so a 2nd WMS connector picks up product-mutation sync without
  * editing the product server actions. Best-effort: never throws.
+ *
+ * o3d-remove-shiphero round 2: the forward is by CAPABILITY (`hooks.productSync` on the
+ * connector's registry definition), not by `connectorId === 'mintsoft'`. The old form claimed to be
+ * connector-agnostic in its own doc comment while being a one-armed switch — a second connector's
+ * product mutations went nowhere, silently, which is the failure mode this whole layer exists to
+ * prevent.
  */
 
-type SyncTrigger = 'cron' | 'product_mutation' | 'manual'
+type SyncTrigger = WmsSyncTrigger
 
 async function getEnabledWmsConnectorId(): Promise<WmsConnectorId | null> {
   const state = await getIntegrationPluginState()
@@ -21,20 +29,19 @@ export async function isAnyWmsConnectorEnabled(): Promise<boolean> {
   return (await getEnabledWmsConnectorId()) !== null
 }
 
-export async function runWmsProductSyncForProduct(productId: string, triggeredBy: SyncTrigger): Promise<void> {
+async function activeWmsProductSync() {
   const connectorId = await getEnabledWmsConnectorId()
-  if (connectorId === 'mintsoft') {
-    const { runMintsoftProductSyncForProduct } = await import('@/lib/connectors/mintsoft/sync/product-sync')
-    await runMintsoftProductSyncForProduct(productId, triggeredBy)
-  }
+  if (!connectorId) return null
+  const hook = getWmsConnectorHooks(connectorId).productSync
+  return hook ? hook() : null
+}
+
+export async function runWmsProductSyncForProduct(productId: string, triggeredBy: SyncTrigger): Promise<void> {
+  await (await activeWmsProductSync())?.syncProduct(productId, triggeredBy)
 }
 
 export async function runWmsBundleSyncForProduct(productId: string, triggeredBy: SyncTrigger): Promise<void> {
-  const connectorId = await getEnabledWmsConnectorId()
-  if (connectorId === 'mintsoft') {
-    const { runBundleSyncForProduct } = await import('@/lib/connectors/mintsoft/sync/bundle-sync')
-    await runBundleSyncForProduct(productId, triggeredBy)
-  }
+  await (await activeWmsProductSync())?.syncBundle(productId, triggeredBy)
 }
 
 async function syncWmsProductBestEffort(productId: string): Promise<void> {

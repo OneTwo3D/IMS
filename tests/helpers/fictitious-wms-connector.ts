@@ -28,7 +28,11 @@
  * IF YOU ARE HERE BECAUSE A CHANGE BROKE THIS: the fixture is not the thing to fix.
  * Something in the generic layer started depending on Mintsoft.
  */
-import type { WmsConnectorDef, WmsConnectorRegistry } from '../../lib/connectors/wms/registry.ts'
+import type {
+  WmsConnectorDef,
+  WmsConnectorRegistry,
+  WmsRegistrableConnector,
+} from '../../lib/connectors/wms/registry.ts'
 import { createWmsConnectorRegistry } from '../../lib/connectors/wms/registry.ts'
 import type {
   WmsAsnInput,
@@ -37,7 +41,7 @@ import type {
   WmsConnector,
   WmsOrderCancelResult,
   WmsOrderPushInput,
-  WmsOrderPushResult,
+  WmsOrderPushProvenResult,
   WmsOrderStatus,
   WmsProductDto,
   WmsProductRef,
@@ -45,6 +49,9 @@ import type {
   WmsStockLine,
   WmsWarehouseRef,
 } from '../../lib/connectors/wms/types.ts'
+import type { WmsOrderPushUnverifiedResult } from '../../lib/connectors/wms/types.ts'
+import type { WmsAsnActions } from '../../lib/connectors/wms/connector-hooks.ts'
+import type { WmsPurchaseOrderAsnStateCore } from '../../lib/connectors/wms/asn-types.ts'
 import { WmsUnresolvableRecordError } from '../../lib/connectors/wms/errors.ts'
 
 export const ACME_WMS_ID = 'acme-wms'
@@ -177,8 +184,15 @@ export class AcmeWmsConnector implements WmsConnector<typeof ACME_WMS_ID> {
    * The unsafe create this fixture exists to model: it does NOT refuse a duplicate.
    * Called twice for one order number, it mints two warehouse orders — which is why
    * the registry definition below declares `client-side-dedupe-only`.
+   *
+   * The result is a PROVEN one (o3d-remove-shiphero round 2, Codex HIGH 4). Acme has no
+   * `verifyPushedOrder`, and `WmsRegistrableConnector` will not register a connector that both
+   * asserts `needsVerification: true` and offers no verifier — the combination the push sweep used
+   * to resolve to SYNCED. Acme reads the created order back, so its id is proved on the way out;
+   * `UnverifiableAcmeWmsConnector` below is the fixture for a connector that does NOT, and it
+   * exists to show that such a connector cannot be registered at all.
    */
-  async pushOrder(input: WmsOrderPushInput): Promise<WmsOrderPushResult> {
+  async pushOrder(input: WmsOrderPushInput): Promise<WmsOrderPushProvenResult> {
     this.warehouse.creates.push(input.orderNumber)
     const externalOrderId = `ACME-${this.warehouse.creates.length}`
     this.warehouse.orders.set(input.orderNumber, {
@@ -188,7 +202,7 @@ export class AcmeWmsConnector implements WmsConnector<typeof ACME_WMS_ID> {
       dispatched: false,
       trackingNumber: null,
     })
-    return { externalOrderId, externalOrderNumber: input.orderNumber, status: 'NEW', needsVerification: true }
+    return { externalOrderId, externalOrderNumber: input.orderNumber, status: 'NEW', needsVerification: false }
   }
 
   async cancelOrder(externalOrderId: string): Promise<WmsOrderCancelResult> {
@@ -212,7 +226,7 @@ export function acmeWmsConnectorDef(
     label: ACME_WMS_LABEL,
     available: true,
     createReplayPolicy: 'client-side-dedupe-only',
-    create: () => new AcmeWmsConnector(warehouse) as WmsConnector<SeamWmsConnectorId>,
+    create: () => new AcmeWmsConnector(warehouse) as unknown as WmsRegistrableConnector<SeamWmsConnectorId>,
     ...overrides,
   }
 }
@@ -234,9 +248,107 @@ export function makeSeamRegistry(
     createReplayPolicy: 'remote-refuses-duplicate',
     // Never constructed by the seam tests — they only ever build the Acme connector.
     // Kept so the registry has the same shape production has.
-    create: () => {
+    create: (): WmsRegistrableConnector<SeamWmsConnectorId> => {
       throw new Error('seam registry: the Mintsoft connector is not constructed in these tests')
     },
   }
   return createWmsConnectorRegistry<SeamWmsConnectorId>([mintsoft, acmeWmsConnectorDef(warehouse, overrides)])
 }
+
+
+/**
+ * A CONNECTOR THAT ASSERTS A DOUBT IT CANNOT RESOLVE — the shape Codex HIGH 4 found reachable.
+ *
+ * It mints an id from a create it never reads back (`needsVerification: true`) and declares no
+ * `verifyPushedOrder`. `WmsRegistrableConnector` refuses it, which is the fix; this fixture exists
+ * so the seam can (a) demonstrate that refusal at compile time and (b) drive the shape through the
+ * real push sweep anyway — via a cast, exactly as a JavaScript connector or a mixed-version build
+ * could — and prove the sweep still refuses to call it SYNCED.
+ */
+export class UnverifiableAcmeWmsConnector implements Omit<WmsConnector<typeof ACME_WMS_ID>, 'pushOrder'> {
+  private readonly inner: AcmeWmsConnector
+
+  readonly id = ACME_WMS_ID
+  readonly name = ACME_WMS_LABEL
+
+  constructor(warehouse: AcmeWarehouse = makeAcmeWarehouse()) {
+    this.inner = new AcmeWmsConnector(warehouse)
+  }
+
+  isConfigured() { return this.inner.isConfigured() }
+  validateConnection() { return this.inner.validateConnection() }
+  fetchWarehouses() { return this.inner.fetchWarehouses() }
+  fetchStockLevels(id: string) { return this.inner.fetchStockLevels(id) }
+  fetchProduct(id: string) { return this.inner.fetchProduct(id) }
+  fetchProductBySku(sku: string) { return this.inner.fetchProductBySku(sku) }
+  upsertProduct(product: WmsProductDto) { return this.inner.upsertProduct(product) }
+  createAsn(input: WmsAsnInput) { return this.inner.createAsn(input) }
+  pollReturns() { return this.inner.pollReturns() }
+  fetchOrderStatus(orderNumber: string) { return this.inner.fetchOrderStatus(orderNumber) }
+  probeOrderPresence(orderNumber: string) { return this.inner.probeOrderPresence(orderNumber) }
+  cancelOrder(externalOrderId: string) { return this.inner.cancelOrder(externalOrderId) }
+  async addOrderComment(): Promise<void> {}
+
+  /** The whole point: an id minted by a create nobody read back, and no way to prove it. */
+  async pushOrder(input: WmsOrderPushInput): Promise<WmsOrderPushUnverifiedResult> {
+    const proven = await this.inner.pushOrder(input)
+    return { ...proven, needsVerification: true }
+  }
+
+  // ...and NO `verifyPushedOrder`. That absence is the second half of the combination.
+}
+
+/**
+ * The ASN implementation Acme registers, built ONLY on `WmsConnector.createAsn`.
+ *
+ * This is what `app/actions/wms-asn.ts` dispatches to when `acme-wms` is the active connector — the
+ * real server action, the real facade, no Mintsoft anywhere on the path. It is deliberately thin:
+ * the point is not that Acme has a rich ASN flow, it is that a REGISTERED connector's ASN flow is
+ * reachable at all, which it was not while the facade compared the id to a literal.
+ */
+export function acmeAsnActions(connector: AcmeWmsConnector, warehouse: AcmeAsnLog): WmsAsnActions {
+  const core = (): WmsPurchaseOrderAsnStateCore => ({
+    pluginEnabled: true,
+    canCreate: true,
+    canManage: true,
+    blockedReason: null,
+    destinationWarehouseCode: 'ACME-MAIN',
+    bindingExternalWarehouseId: 'ACME-WH-1',
+    existingAsns: [],
+  })
+  return {
+    async getPurchaseOrderAsnState(poId) {
+      warehouse.asnCalls.push(`po-state:${poId}`)
+      return core()
+    },
+    async getTransferAsnStates(transferIds) {
+      warehouse.asnCalls.push(`transfer-states:${transferIds.join(',')}`)
+      return Object.fromEntries(transferIds.map((id) => [id, core()]))
+    },
+    async createPurchaseOrderAsn(poId) {
+      warehouse.asnCalls.push(`po-create:${String(poId)}`)
+      const ref = await connector.createAsn({
+        externalWarehouseId: 'ACME-WH-1',
+        reference: String(poId),
+        lines: [{ sourceLineId: 'l1', externalProductId: 'p1', sku: 'SKU-1', quantity: 1 }],
+      })
+      return { success: true, externalAsnId: ref.externalAsnId }
+    },
+    async createTransferAsn(transferId) {
+      warehouse.asnCalls.push(`transfer-create:${String(transferId)}`)
+      const ref = await connector.createAsn({
+        externalWarehouseId: 'ACME-WH-1',
+        reference: String(transferId),
+        lines: [{ sourceLineId: 'l1', externalProductId: 'p1', sku: 'SKU-1', quantity: 1 }],
+      })
+      return { success: true, externalAsnId: ref.externalAsnId }
+    },
+    async recheckAsnBookedIn(externalAsnId) {
+      warehouse.asnCalls.push(`recheck:${String(externalAsnId)}`)
+      return { success: true, message: `${ACME_WMS_LABEL} re-checked ${String(externalAsnId)}` }
+    },
+  }
+}
+
+/** What the seam's ASN implementation records, so a test can see WHICH connector was dispatched to. */
+export type AcmeAsnLog = { asnCalls: string[] }

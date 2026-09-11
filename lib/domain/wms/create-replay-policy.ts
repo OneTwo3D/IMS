@@ -69,6 +69,10 @@ export type WmsCreateReplayPolicySource = {
  * what stops them drifting apart now that they are declared separately.
  */
 export const WMS_CREATE_REPLAY_POLICY: Record<WmsConnectorId, WmsCreateReplayPolicy> = {
+  // This IS the id→policy table, and a `Record<WmsConnectorId, …>` precisely so a new connector
+  // fails `tsc` here until its answer is written down. It cannot import the registry (see the note
+  // above on WmsCreateReplayPolicySource), so the key has to be spelled out.
+  // wms-connector-boundary-ok: o3d-remove-shiphero: the id→policy table's own key.
   mintsoft: 'remote-refuses-duplicate',
 }
 

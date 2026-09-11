@@ -4,7 +4,7 @@ import test from 'node:test'
 import { NextRequest } from 'next/server'
 
 import { createAdminWmsReceiptReviewHandlers } from '../../app/api/admin/wms/receipt-events/[id]/review/route.ts'
-import { MINTSOFT_WEBHOOK_PROCESSING_STATUS } from '../../lib/domain/wms/booked-in-service.ts'
+import { WMS_INBOUND_EVENT_PROCESSING_STATUS } from '../../lib/domain/wms/booked-in-service.ts'
 import { ADMIN_MUTATION_HEADER, ADMIN_MUTATION_HEADER_VALUE } from '../../lib/security/admin-mutation.ts'
 
 type MockEvent = {
@@ -27,7 +27,7 @@ function makeEvent(overrides: Partial<MockEvent> = {}): MockEvent {
     connector: 'mintsoft',
     externalEventId: 'webhook-1',
     externalAsnId: 'asn-1',
-    processingStatus: MINTSOFT_WEBHOOK_PROCESSING_STATUS.requiresReview,
+    processingStatus: WMS_INBOUND_EVENT_PROCESSING_STATUS.requiresReview,
     processedAt: null,
     lastError: 'Mintsoft booked-in review required: received_over_expected',
     reviewDetails: {
@@ -237,7 +237,7 @@ test('admin WMS receipt review POST approves review and reruns processor in appr
 
 test('admin WMS receipt review POST rejects events not waiting for review', async () => {
   const { client, calls } = makeClient(makeEvent({
-    processingStatus: MINTSOFT_WEBHOOK_PROCESSING_STATUS.processed,
+    processingStatus: WMS_INBOUND_EVENT_PROCESSING_STATUS.processed,
     processedAt: new Date('2026-05-27T12:00:00.000Z'),
   }))
   const handlers = createAdminWmsReceiptReviewHandlers({
@@ -342,7 +342,7 @@ test('admin WMS receipt review POST does not stamp reviewed fields when processi
 
   assert.equal(response.status, 500)
   assert.equal(body.code, 'wms_receipt_review_approval_failed')
-  assert.equal(mock.event?.processingStatus, MINTSOFT_WEBHOOK_PROCESSING_STATUS.requiresReview)
+  assert.equal(mock.event?.processingStatus, WMS_INBOUND_EVENT_PROCESSING_STATUS.requiresReview)
   assert.equal(mock.event?.lastError, 'database timeout')
   assert.equal(mock.event?.reviewedAt, null)
   assert.equal(mock.event?.reviewedBy, null)
@@ -379,7 +379,7 @@ test('admin WMS receipt review POST reports approval attempts that still require
   assert.equal(response.status, 409)
   assert.equal(body.approved, false)
   assert.equal(body.result.status, 'requires_review')
-  assert.equal(mock.event?.processingStatus, MINTSOFT_WEBHOOK_PROCESSING_STATUS.requiresReview)
+  assert.equal(mock.event?.processingStatus, WMS_INBOUND_EVENT_PROCESSING_STATUS.requiresReview)
   assert.equal(mock.event?.reviewedAt, null)
   assert.equal(mock.event?.reviewedBy, null)
   const log = activityLogs[0] as { action: string; metadata: { outcome: string; resultStatus: string } }

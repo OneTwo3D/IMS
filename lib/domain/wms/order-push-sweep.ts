@@ -1562,10 +1562,36 @@ export async function runWmsOrderPushSweepCore(
         // not SYNCED. It is also emphatically not PENDING_CREATE — the order
         // exists in the warehouse now, and re-pushing would duplicate it — so
         // it gets its own state, and only the scoped verification is retried.
-        // A connector that cannot verify (no verifyPushedOrder) keeps the old
-        // behaviour rather than parking every order it creates.
-        const createdState: PushState =
-          push.needsVerification && connector.verifyPushedOrder ? 'PENDING_VERIFY' : 'SYNCED'
+        //
+        // o3d-remove-shiphero round 2 (Codex HIGH 4) — AND THAT IS TRUE WHETHER OR NOT THE
+        // CONNECTOR CAN VERIFY. This read `push.needsVerification && connector.verifyPushedOrder`,
+        // so a connector that declared the doubt and offered no resolver got SYNCED — the state
+        // the update, hold, cancel and dispatch passes act on. IMS would then amend or cancel an
+        // order under an id the connector had just disclaimed; at a real warehouse that is
+        // somebody else's order. The missing verifier makes the doubt PERMANENT, which is a reason
+        // to trust the id less, never more.
+        //
+        // `WmsRegistrableConnector` (lib/connectors/wms/registry.ts) now refuses that combination
+        // outright, so it cannot be registered. This is the runtime half: a connector reached
+        // through a cast, or written in JavaScript, can still produce the shape, and the answer
+        // here must not depend on the type system having been consulted. The link parks at
+        // PENDING_VERIFY — out of the create pass (it must never be re-pushed) and out of every
+        // pass that mutates the remote — carrying the reason on the link.
+        const canVerify = typeof connector.verifyPushedOrder === 'function'
+        const createdState: PushState = push.needsVerification ? 'PENDING_VERIFY' : 'SYNCED'
+        const unverifiable = push.needsVerification === true && !canVerify
+        if (unverifiable) {
+          console.error(
+            `[wms-order-push] connector ${connectorId} returned needsVerification for order `
+            + `${order.orderNumber ?? order.id} but implements no verifyPushedOrder — the link is `
+            + 'held at PENDING_VERIFY and will NOT be treated as synced; verify and resolve it by hand',
+          )
+        }
+        const unverifiableError = unverifiable
+          ? `The WMS created this order as ${push.externalOrderId} but reported the id UNVERIFIED, and this `
+            + 'connector provides no way to prove it. IMS will not amend, cancel or mark it despatched. '
+            + 'Confirm the order in the WMS and resolve the link by hand.'
+          : null
         // Penny-precision guard (G6): record (never block) when the order's own totals
         // don't reconcile to the penny, so an operator can investigate a mis-totalled order.
         const driftPence = orderTotalDriftPence(order)
@@ -1575,14 +1601,14 @@ export async function runWmsOrderPushSweepCore(
         }
         await port.upsertByOrder(
           order.id,
-          { connector: connectorId, externalOrderId: push.externalOrderId, externalOrderNumber: push.externalOrderNumber, state: createdState, attempts: 0, pushedAt: ts, lastAttemptAt: ts, courierPending, totalMismatchPence },
+          { connector: connectorId, externalOrderId: push.externalOrderId, externalOrderNumber: push.externalOrderNumber, state: createdState, attempts: 0, pushedAt: ts, lastAttemptAt: ts, courierPending, totalMismatchPence, ...(unverifiableError ? { lastError: unverifiableError } : {}) },
           // attempts: 0 on BOTH sides (o3d-bjc.8). claimForCreate has usually
           // created the link already, so the update side is what runs — and the
           // verification budget reads this counter. Left carrying four failed
           // create attempts, a create that finally succeeded would be
           // quarantined on its FIRST transient unknown, putting a live WMS order
           // outside the update, cancel and dispatch passes.
-          { connector: connectorId, externalOrderId: push.externalOrderId, externalOrderNumber: push.externalOrderNumber, state: createdState, attempts: 0, lastError: null, pushedAt: ts, lastAttemptAt: ts, cancelledAt: null, courierPending, totalMismatchPence, ...RESET_DISPATCH_FAILURES },
+          { connector: connectorId, externalOrderId: push.externalOrderId, externalOrderNumber: push.externalOrderNumber, state: createdState, attempts: 0, lastError: unverifiableError, pushedAt: ts, lastAttemptAt: ts, cancelledAt: null, courierPending, totalMismatchPence, ...RESET_DISPATCH_FAILURES },
         )
         // o3d-6x66: the claim's withdrawal re-check committed BEFORE this
         // remote push, so a withdrawal landing in between still gets its order
@@ -1711,7 +1737,11 @@ export async function runWmsOrderPushSweepCore(
         await audit({
           action: 'order_create', outcome: 'SUCCEEDED', entityType: 'SALES_ORDER', entityId: order.id, externalId: push.externalOrderId,
           summary: `Order ${order.orderNumber ?? order.id} created in WMS as ${push.externalOrderNumber ?? push.externalOrderId}`
-            + (createdState === 'PENDING_VERIFY' ? ' (pending ownership verification)' : ''),
+            + (createdState === 'PENDING_VERIFY'
+              ? (unverifiable
+                ? ' (id reported UNVERIFIED and this connector cannot prove it — held, not synced)'
+                : ' (pending ownership verification)')
+              : ''),
           before: beforeCreate,
           after: { state: createdState, externalOrderId: push.externalOrderId, externalOrderNumber: push.externalOrderNumber, courierPending, totalMismatchPence, intent: pushIntentSummary(input) },
         })
