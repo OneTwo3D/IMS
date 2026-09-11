@@ -37,7 +37,7 @@ import {
   buildStockMovementValueFields,
   buildStockMovementValueFieldsFromTotal,
 } from '@/lib/domain/inventory/stock-movement-value'
-import { lockStockTransfers, lockWmsAsnLineMaps } from '@/lib/domain/wms/transfer-asn-lock-order'
+import { lockStockTransfers, lockWmsAsnLineMaps, lockWmsAsnMaps } from '@/lib/domain/wms/transfer-asn-lock-order'
 import { addMoney, multiplyMoney, toDecimal } from '@/lib/domain/math/decimal'
 import { enqueueStockSync } from '@/lib/shopping'
 
@@ -613,6 +613,15 @@ type AlignmentCandidateSet = {
    * choose the lock set from the answer the lock is meant to produce.
    */
   parentTransferIds: string[]
+  /**
+   * Every `wms_asn_maps` header the discovered rows sit on, so the caller can take
+   * step 3 of the global lock order before it re-reads (6oyu.19, Codex round-11
+   * MEDIUM-1). The `closedAt: null` predicate below is a fact about THIS row, and
+   * three paths move it — see the header note above `getAlignmentCandidateLines`.
+   * Refused rows are in for the same reason `parentTransferIds` includes them: a
+   * status or a `closedAt` read BEFORE the lock is exactly what the lock settles.
+   */
+  asnMapIds: string[]
   refused: RefusedAlignmentCandidate[]
 }
 
@@ -643,21 +652,61 @@ type AlignmentCandidateSet = {
  *   · `transferIds` — the `stock_transfers` rows held FOR UPDATE. A transfer-backed
  *     candidate whose parent is not in it is refused: its status could be changing
  *     underneath this read, and a cancellation that interleaves with an alignment is
- *     exactly the concurrent form of the same defect. Kept alongside the row-id check
- *     rather than folded into it, because the two answer different questions — one
- *     is about the row, the other about the parent a locked row points AT, and a row
- *     can be repointed by `createMintsoftTransferAsn` between the two reads.
+ *     exactly the concurrent form of the same defect.
+ *
+ *     DEFENCE IN DEPTH, WITH NO CLAIM OF INDEPENDENT NECESSITY (6oyu.19, Codex
+ *     round-11 LOW-1). Round 10's comment justified keeping this alongside the
+ *     row-id check by saying a locked row `can be repointed by
+ *     `createMintsoftTransferAsn` between the two reads`. THAT PATH DOES NOT EXIST.
+ *     `createMintsoftTransferAsn` (app/actions/mintsoft-sync.ts:3900-3924) updates
+ *     an existing `wms_asn_line_maps` row's `productId`, `sku` and `expectedQty`
+ *     ONLY; lines that drop out are DELETED and replacements are CREATED with fresh
+ *     cuids, which the row-id refusal above already catches. Verified, not recalled:
+ *       $ grep -rn 'wmsAsnLineMap\.\(update\|updateMany\|upsert\)' --include=*.ts app lib
+ *       → 9 sites (mintsoft-sync 2976/3299/3904/4227, stock-sync 1215,
+ *         transfer-landed-quantity 280, booked-in-service 914/1158/1213); NOT ONE
+ *         has `asnMapId` or `sourceLineId` in its `data:` payload, and there is no
+ *         raw `UPDATE wms_asn_line_maps` anywhere. Both columns are write-once.
+ *       $ grep -rn 'stockTransferLine\.\(update\|updateMany\|upsert\)' …
+ *       → 4 sites (transfers 577/867/1062, booked-in-service 1137); none writes
+ *         `transferId`. So a locked row's parent transfer is write-once too.
+ *     What is left for this check is the one shape the id check cannot see: an ASN
+ *     row whose `sourceLineId` did not RESOLVE at discovery (refused `unusable`, so
+ *     its parent never entered the lock set) but resolves at the re-read. No current
+ *     path creates a transfer line after the ASN row that references it, so this is
+ *     a tripwire for a future one — kept because it costs a set lookup, NOT because
+ *     anything today reaches it.
  *
  * WHY NOT LOCK THE MISSING PARENTS INSTEAD (the other half of the round-10 finding).
- * Locking `purchase_orders` and `wms_asn_maps` here would be in-order and legal, but
- * it would not close this: a parent that does not exist at step 2 cannot be locked at
- * step 2, so a row created afterwards still arrives unlocked and the re-read still
- * has to refuse it. The refusal is therefore the whole fix and the locks would be
- * decoration — and every extra lock is contention plus a new pair to keep ordered.
- * `wms_asn_maps` is left alone for a second reason: nothing in this codebase ever
- * sets `closedAt`, so the `closedAt: null` filter above cannot change under this
- * transaction. If a close path is ever added, this comment is wrong and the header
- * belongs in the lock set.
+ * Locking `purchase_orders` here would be in-order and legal, but it would not close
+ * this: a parent that does not exist at step 2 cannot be locked at step 2, so a row
+ * created afterwards still arrives unlocked and the re-read still has to refuse it.
+ * The refusal is therefore the whole fix for the RACED row and the parent lock would
+ * be decoration — and every extra lock is contention plus a new pair to keep ordered.
+ *
+ * `wms_asn_maps` IS NOW LOCKED, AND ROUND 10'S REASON FOR NOT LOCKING IT WAS FALSE
+ * (6oyu.19, Codex round-11 MEDIUM-1). That comment said `nothing in this codebase
+ * ever sets closedAt, so the closedAt: null filter above cannot change under this
+ * transaction`. It was asserted from memory and it was wrong the day it was written:
+ *       $ grep -rn 'closedAt' --include=*.ts app lib | grep -v generated
+ *       → THREE writers — lib/domain/wms/booked-in-service.ts:1208 (the webhook
+ *         book-in closes the header once every line is fully processed), and both
+ *         ASN finalizers, app/actions/mintsoft-sync.ts:3294 and :4222 (a Mintsoft
+ *         ASN that comes back already BOOKED_IN is stamped closed on creation).
+ * So the `closedAt: null` predicate IS mutable while this transaction runs, and the
+ * candidate set was resting on an unlocked row. The header is therefore taken at
+ * step 3 of the global order (`lockWmsAsnMaps`, between the step-2 parents and the
+ * step-4 line rows) before the re-read, which is where the predicate is evaluated.
+ * The three writers all take the header before the line rows too, so the added lock
+ * introduces no new pair: booked-in-service locks 2→3→4→5, and both finalizers
+ * `SELECT id FROM wms_asn_maps … FOR UPDATE` (3255, 4183) before updating their line
+ * rows.
+ *
+ * NO HEADER CHECK ACCOMPANIES THE HEADER LOCK, and that is deliberate rather than an
+ * oversight. `asnMapId` is write-once (the grep above), so a row that survives the
+ * row-id refusal necessarily still points at the header this transaction locked — a
+ * `locks.asnMapIds.has(line.asnMapId)` test could not fail, and a guard that cannot
+ * fail proves nothing. The LOCK is the fix; a check would be scenery.
  */
 async function getAlignmentCandidateLines(
   tx: Prisma.TransactionClient,
@@ -679,6 +728,8 @@ async function getAlignmentCandidateLines(
     },
     select: {
       id: true,
+      // The step-3 lock target (6oyu.19, Codex round-11 MEDIUM-1).
+      asnMapId: true,
       sourceType: true,
       sourceLineId: true,
       productId: true,
@@ -731,6 +782,7 @@ async function getAlignmentCandidateLines(
   const transferLineResiduals = new Map<string, TransferLineResidualQty>()
   const refused: RefusedAlignmentCandidate[] = []
   const parentTransferIds = new Set<string>()
+  const asnMapIds = new Set<string>(lines.map((line) => line.asnMapId))
 
   for (const line of lines) {
     // FIRST, BEFORE ANY FACT ABOUT THIS ROW IS READ. Under the locks, a row this
@@ -850,6 +902,7 @@ async function getAlignmentCandidateLines(
     candidates,
     transferLineResiduals,
     parentTransferIds: [...parentTransferIds],
+    asnMapIds: [...asnMapIds],
     refused,
   }
 }
@@ -994,8 +1047,18 @@ export async function applyMintsoftAlignmentForProduct(params: {
       }
     }
 
-    // STEP 2, then STEP 4 — never the other way about.
+    // STEP 2, then STEP 3, then STEP 4 — never any other way about.
+    //
+    // STEP 3 IS HERE BECAUSE ROUND 10'S REASON FOR SKIPPING IT WAS FALSE (6oyu.19,
+    // Codex round-11 MEDIUM-1). The candidate query selects on `asn.closedAt IS
+    // NULL`; round 10 left the header unlocked on the written claim that nothing in
+    // the codebase ever sets `closedAt`. Three paths do — booked-in-service.ts:1208
+    // and the two ASN finalizers at mintsoft-sync.ts:3294 and :4222 — so the
+    // predicate the plan rests on was a fact about a row this transaction did not
+    // hold. It holds it now, from before the re-read that evaluates the predicate
+    // until commit.
     const lockedTransferIds = new Set(await lockStockTransfers(tx, discovery.parentTransferIds))
+    await lockWmsAsnMaps(tx, discovery.asnMapIds)
     const lockedAsnLineMapIds = new Set(
       await lockWmsAsnLineMaps(tx, discovery.candidates.map((candidate) => candidate.id)),
     )
@@ -1021,6 +1084,44 @@ export async function applyMintsoftAlignmentForProduct(params: {
         kind: 'unavailable' as const,
         correctedQty: 0,
         reason: `No open ASN line is available to absorb this WMS delta.${describeRefusedAlignmentCandidates(candidateSet.refused)}`,
+      }
+    }
+
+    // A RACED ROW IS TERMINAL FOR THIS PLAN, WHATEVER THE REMAINING CAPACITY
+    // (6oyu.19, Codex round-11 HIGH-1).
+    //
+    // Round 10 built the refusal and then consulted it on ONE branch only: the
+    // `refused` list was read to EXPLAIN an incomplete plan. When the rows this
+    // transaction does hold happen to cover the whole delta, the plan completes, the
+    // raced row is dropped without a word, and the alignment applies in full.
+    //
+    // THAT IS THE DOUBLE-COUNT, ONE ROUTE OVER. `params.delta` is `wmsQty - imsQty`
+    // (the sweep, ~line 1880), computed from a stock level read BEFORE this
+    // transaction began. A raced ASN row means an inbound receipt for this product
+    // and warehouse committed after that read — and a manual or webhook receipt
+    // raises `stock_levels.quantity` as it lands. So the gap the delta describes has
+    // already been closed, in part or in whole, by units this transaction cannot
+    // see. Allocating the stale delta against the OLD candidate lays a second set of
+    // layers for the same units: ten received units become twenty units of stock and
+    // £100 of inventory. Whether the old candidate had spare capacity is beside the
+    // point — capacity is a fact about the ASN row, and what moved was the stock.
+    //
+    // REFUSE, RATHER THAN RE-PLAN UNDER THE LOCKS. Re-planning would fix the
+    // candidate set and not the input: the delta itself is the stale number, and it
+    // cannot be recomputed here without re-reading Mintsoft, which is above this
+    // seam and outside the transaction. Locking the raced row instead is also not
+    // open — its parent may sit at step 2 while this transaction is already past it,
+    // which is the inversion the global order exists to prevent. The next sweep
+    // recomputes the delta from the settled stock level and the work is not lost; it
+    // is deferred by one pass, which is what `kind: 'raced'` has always meant.
+    const racedRefusals = candidateSet.refused.filter((entry) => entry.kind === 'raced')
+    if (racedRefusals.length > 0) {
+      return {
+        kind: 'unavailable' as const,
+        correctedQty: 0,
+        reason: `This product's WMS delta was measured before ${racedRefusals.length === 1 ? 'an ASN line' : `${racedRefusals.length} ASN lines`} `
+          + 'committed under this run, so the delta may already have been settled by a receipt this run cannot see; '
+          + `leaving stock unchanged.${describeRefusedAlignmentCandidates(candidateSet.refused)}`,
       }
     }
 

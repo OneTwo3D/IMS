@@ -1389,9 +1389,19 @@ test(
     // £100 of layers stand for the fourteen that were ordered and the ten that
     // arrived.
     //
-    // AFTER THE FIX row B is not in the locked set, so the re-read refuses it. What
-    // is left covers 4 of the 10-unit delta, alignment applies nothing rather than
-    // part of a plan, and the ten units on the shelf stay ten.
+    // AFTER THE FIX row B is not in the locked set, so the re-read refuses it and the
+    // ten units on the shelf stay ten.
+    //
+    // WHICH BRANCH THIS ARM EXERCISES (6oyu.19, Codex round-11 HIGH-1). ASN-A holds
+    // FOUR units against a TEN-unit delta, so once row B is refused the plan cannot
+    // complete. Until round 11 that was the ONLY branch that consulted `refused`,
+    // which meant this arm could not reach — and therefore could not prove anything
+    // about — the case where the surviving candidate covers the delta on its own.
+    // Round 11 made a raced row terminal BEFORE the planner runs, so this arm now
+    // exits through `racedRefusals`; the incomplete-plan branch it used to exit
+    // through is exercised by `transfer-snapshot-shortfall.concurrent.test.ts`. The
+    // full-capacity case — the one this arm was structurally unable to reach — is
+    // the test immediately below.
     const databaseUrl = loadEnv()
     const world = await seedPurchaseAsnWorld('raced')
     const first = await world.addPurchaseOrderAsn('a', 4)
@@ -1557,5 +1567,334 @@ test(
     // not because the fixture failed to give it anything to do.
     assert.match(alignResult!.reason ?? '', new RegExp(second!.reference))
     assert.match(alignResult!.reason ?? '', /created after this run took its row locks/)
+  },
+)
+
+// ---------------------------------------------------------------------------
+// A RACED ROW IS TERMINAL EVEN WHEN THE LOCKED CANDIDATE COVERS THE WHOLE DELTA
+// (Codex round-11 HIGH-1)
+// ---------------------------------------------------------------------------
+
+test(
+  'ALIGNMENT refuses a raced ASN line when the locked candidate covers the FULL delta (Codex r11 HIGH-1)',
+  { skip: !RUN && 'set RUN_DB_CONCURRENCY_TESTS=1' },
+  async () => {
+    // THE BRANCH THIS ARM EXERCISES, stated because the last three proofs on this
+    // branch were built so they could not reach the case they claimed to cover.
+    //
+    // The arm above holds FOUR units against a TEN-unit delta: once the raced row is
+    // refused the plan is incomplete, so it exits through the incomplete-plan branch
+    // and the `refused` list is consulted only to EXPLAIN that. THIS arm holds TEN
+    // against TEN. The surviving candidate covers the delta on its own, the planner
+    // returns a complete plan, and every consultation of `refused` that existed
+    // before round 11 is therefore skipped. Before the fix that is the silent drop:
+    // the raced row is noted and thrown away, and the stale delta is applied in full.
+    //
+    // It is the SAME choreography as the arm above, deliberately — only the capacity
+    // of ASN-A differs, so the one thing this test varies is the thing the finding is
+    // about.
+    //
+    //  (1) Alignment discovers ASN-A (ten units of capacity) and parks on its
+    //      `wms_asn_line_maps` row lock, its lock set already chosen.
+    //  (2) ASN-B is created and committed for the SAME product and warehouse, its
+    //      ten units already on the shelf and layered — a manual receipt with the WMS
+    //      callback still outstanding. Stock is now ten. Alignment's `delta` of ten
+    //      was measured when stock was zero, so it is now entirely stale.
+    //  (3) The real webhook book-in for ASN-B starts, parked at ASN-B's header.
+    //  (4) Alignment is released. It locks A, re-reads, and sees row B unlocked.
+    //  (5) The book-in commits.
+    //  (6) The stock level is released.
+    //
+    // BEFORE THE FIX: ASN-A's ten units of capacity absorb the whole stale delta, the
+    // plan completes, `refused` is never read, and alignment adds ten more units to
+    // the ten already on the shelf — twenty units and £100 of layers for ten
+    // received. AFTER: the raced row ends the plan before the planner runs.
+    const databaseUrl = loadEnv()
+    const world = await seedPurchaseAsnWorld('fullcap')
+    // TEN, not four. This single number is what makes the bypass reachable.
+    const first = await world.addPurchaseOrderAsn('a', 10)
+    const { applyMintsoftAlignmentForProduct } =
+      await import('@/lib/connectors/mintsoft/sync/stock-sync')
+
+    const holdAsnA = await rawSession(databaseUrl)
+    const holdAsnBHeader = await rawSession(databaseUrl)
+    const holdStock = await rawSession(databaseUrl)
+    const probe = await rawSession(databaseUrl)
+    let alignResult: { applied?: boolean; correctedQty?: number; reason?: string } | null = null
+    let alignError: unknown = null
+    let bookedInOutcome: unknown = null
+    let bookedInError: unknown = null
+    let alignmentReachedStock = false
+    let second: Awaited<ReturnType<typeof world.addPurchaseOrderAsn>> | null = null
+
+    try {
+      const holdAsnAPid = await backendPid(holdAsnA)
+      const holdAsnBHeaderPid = await backendPid(holdAsnBHeader)
+      const holdStockPid = await backendPid(holdStock)
+
+      // (1)
+      await holdAsnA.query('BEGIN')
+      await holdAsnA.query('SELECT id FROM wms_asn_line_maps WHERE id = $1 FOR UPDATE', [first.asnLineMapId])
+
+      const aligning = applyMintsoftAlignmentForProduct({
+        binding: world.binding as never,
+        jobId: `r11-fullcap-${Date.now()}`,
+        productId: world.product.id,
+        sku: world.tag,
+        delta: 10,
+        dryRun: false,
+      }).then(
+        (value) => { alignResult = value },
+        (error) => { alignError = error },
+      )
+      await waitForBlockedBackend(probe, {
+        blockedBy: [holdAsnAPid],
+        waitingOn: /wms_asn_line_maps/i,
+        describe: 'alignment parked at its ASN row lock, discovery done',
+      })
+
+      // (2)
+      second = await world.addPurchaseOrderAsn('b', 10, { alreadyReceived: true })
+
+      // (3)
+      await holdAsnBHeader.query('BEGIN')
+      await holdAsnBHeader.query('SELECT id FROM wms_asn_maps WHERE id = $1 FOR UPDATE', [second.asnId])
+      const bookingIn = world.runBookedInFor(second).then(
+        (value) => { bookedInOutcome = value },
+        (error) => { bookedInError = error },
+      )
+      await waitForBlockedBackend(probe, {
+        blockedBy: [holdAsnBHeaderPid],
+        waitingOn: /wms_asn_maps/i,
+        describe: 'parking the book-in of the raced ASN at its header',
+      })
+
+      await holdStock.query('BEGIN')
+      await holdStock.query(
+        'SELECT id FROM stock_levels WHERE "productId" = $1 AND "warehouseId" = $2 FOR UPDATE',
+        [world.product.id, world.warehouse.id],
+      )
+
+      // (4)
+      await holdAsnA.query('ROLLBACK')
+      alignmentReachedStock = await Promise.race([
+        waitForBlockedBackend(probe, {
+          blockedBy: [holdStockPid],
+          waitingOn: /stock_levels/i,
+          describe: 'alignment parked at the stock level with the stale delta already planned',
+        }).then(() => true),
+        aligning.then(() => false),
+      ])
+
+      // (5)
+      await holdAsnBHeader.query('ROLLBACK')
+      await bookingIn
+
+      // (6)
+      await holdStock.query('ROLLBACK')
+      await aligning
+    } finally {
+      await holdAsnA.end().catch(() => {})
+      await holdAsnBHeader.end().catch(() => {})
+      await holdStock.end().catch(() => {})
+      await probe.end().catch(() => {})
+    }
+
+    assert.equal(alignError, null, `alignment must refuse cleanly, not throw: ${String(alignError)}`)
+    assert.equal(bookedInError, null, `the book-in must succeed: ${String(bookedInError)}`)
+
+    const { db } = world
+
+    // THE PRECONDITION THAT MAKES THE BYPASS REACHABLE, asserted rather than assumed:
+    // the candidate alignment KEPT really did have room for the entire delta. Without
+    // this the test could pass through the incomplete-plan branch — the branch the
+    // arm above already covers — and prove nothing new.
+    const keptRow = await db.wmsAsnLineMap.findUnique({
+      where: { id: first.asnLineMapId },
+      select: { expectedQty: true, qtyAccountedViaSnapshot: true, lastProcessedReceivedQty: true },
+    })
+    assert.equal(
+      Number(keptRow?.expectedQty ?? 0) - Number(keptRow?.lastProcessedReceivedQty ?? 0),
+      10,
+      'the surviving candidate must have capacity for the WHOLE 10-unit delta, or this arm is the '
+      + 'incomplete-plan branch again and the bypass is unreachable from it',
+    )
+
+    // AND THE SECOND PRECONDITION: the world really did move.
+    const racedRow = await db.wmsAsnLineMap.findUnique({
+      where: { id: second!.asnLineMapId },
+      select: { qtyAccountedViaSnapshot: true, lastProcessedReceivedQty: true },
+    })
+    assert.equal(
+      Number(racedRow?.lastProcessedReceivedQty ?? 0),
+      10,
+      'the book-in did not credit the raced row, so nothing made alignment’s delta stale',
+    )
+
+    // THE MONEY. Ten units arrived; ten units and £50 must stand for them.
+    const stock = await db.stockLevel.findUnique({
+      where: { productId_warehouseId: { productId: world.product.id, warehouseId: world.warehouse.id } },
+      select: { quantity: true },
+    })
+    assert.equal(
+      Number(stock?.quantity ?? 0),
+      10,
+      'alignment applied a delta measured before a receipt it could not see, on a candidate that happened '
+      + `to have room for all of it (alignment reached the stock lock: ${alignmentReachedStock})`,
+    )
+
+    const layers = await db.costLayer.findMany({
+      where: { productId: world.product.id, warehouseId: world.warehouse.id },
+      select: { receivedQty: true, unitCostBase: true },
+    })
+    assert.equal(
+      layers.reduce((sum, layer) => sum + Number(layer.receivedQty), 0),
+      10,
+      'and the cost layers must cover those ten units once, not twice',
+    )
+    assert.equal(
+      layers.reduce((sum, layer) => sum + Number(layer.receivedQty) * Number(layer.unitCostBase), 0),
+      10 * UNIT_COST,
+      'the money: £50 for the ten units at £5 that arrived, not £100 for twenty',
+    )
+
+    assert.equal(
+      Number(keptRow?.qtyAccountedViaSnapshot ?? 0),
+      0,
+      'alignment credited the candidate it kept, which means it applied the stale delta',
+    )
+
+    assert.equal(alignResult!.applied, false, `alignment must not apply: ${JSON.stringify(alignResult)}`)
+    assert.equal(alignResult!.correctedQty, 0)
+    // NOT VACUOUS: it must refuse for the RACED reason specifically — the terminal
+    // branch added in round 11 — and not because the fixture starved it of capacity.
+    assert.match(alignResult!.reason ?? '', /measured before an ASN line committed under this run/)
+    assert.match(alignResult!.reason ?? '', new RegExp(second!.reference))
+    assert.match(alignResult!.reason ?? '', /created after this run took its row locks/)
+    assert.doesNotMatch(
+      alignResult!.reason ?? '',
+      /only explain/,
+      'this arm must NOT exit through the incomplete-plan branch — that is the arm above',
+    )
+  },
+)
+
+// ---------------------------------------------------------------------------
+// THE ASN HEADER IS HELD, SO `closedAt` CANNOT MOVE UNDER THE PLAN
+// (Codex round-11 MEDIUM-1)
+// ---------------------------------------------------------------------------
+
+test(
+  'ALIGNMENT holds wms_asn_maps, so a real book-in cannot close the header under it (Codex r11 MEDIUM-1)',
+  { skip: !RUN && 'set RUN_DB_CONCURRENCY_TESTS=1' },
+  async () => {
+    // WHAT ROUND 10 ASSERTED AND WHY IT WAS WRONG. The candidate query selects on
+    // `asn.closedAt IS NULL`. Round 10 left `wms_asn_maps` out of the lock set on the
+    // written grounds that "nothing in this codebase ever sets closedAt". Three paths
+    // do: lib/domain/wms/booked-in-service.ts:1208 closes the header once every line
+    // is fully processed, and the two ASN finalizers (app/actions/mintsoft-sync.ts
+    // :3294 and :4222) stamp it closed when Mintsoft returns an already-BOOKED_IN
+    // ASN. So the predicate was mutable for the whole of alignment's transaction.
+    //
+    // THE ROUTE TAKEN: the header is locked at step 3 of the global order, between
+    // the step-2 parents and the step-4 line rows — not "serialised through the line
+    // locks". A line-lock argument would have had to say that EVERY closedAt writer
+    // also touches a line row of that ASN, which is another premise of the shape that
+    // just expired twice. The lock is the fact.
+    //
+    // THE EVIDENCE, and it is a fact about locks rather than about source text: the
+    // REAL webhook book-in — the code at booked-in-service.ts:1208 that does the
+    // closing — is observed blocked on `wms_asn_maps`, with alignment named as the
+    // blocking backend, while alignment's plan is already made. And while it is
+    // blocked, a third session reads the header and sees `closedAt` still NULL.
+    //
+    // WHICH BRANCH THIS ARM EXERCISES: the APPLIED branch. Alignment plans, reaches
+    // its stock-level lock and writes — no refusal of any kind is involved. That is
+    // deliberate: the header lock has to hold for a run that goes all the way to the
+    // write, which is the run whose predicate matters.
+    const databaseUrl = loadEnv()
+    const world = await seedPurchaseAsnWorld('hdrlock')
+    const only = await world.addPurchaseOrderAsn('a', 10)
+    const { applyMintsoftAlignmentForProduct } =
+      await import('@/lib/connectors/mintsoft/sync/stock-sync')
+
+    const holdStock = await rawSession(databaseUrl)
+    const probe = await rawSession(databaseUrl)
+    let alignResult: { applied?: boolean; correctedQty?: number; reason?: string } | null = null
+    let alignError: unknown = null
+    let bookedInError: unknown = null
+    let closedAtWhileBlocked: unknown = 'never read'
+
+    try {
+      const holdStockPid = await backendPid(holdStock)
+
+      // Hold the LAST lock alignment takes, so it stops with its header and line
+      // locks held and its plan made.
+      await holdStock.query('BEGIN')
+      await holdStock.query(
+        'SELECT id FROM stock_levels WHERE "productId" = $1 AND "warehouseId" = $2 FOR UPDATE',
+        [world.product.id, world.warehouse.id],
+      )
+
+      const aligning = applyMintsoftAlignmentForProduct({
+        binding: world.binding as never,
+        jobId: `r11-hdrlock-${Date.now()}`,
+        productId: world.product.id,
+        sku: world.tag,
+        delta: 10,
+        dryRun: false,
+      }).then(
+        (value) => { alignResult = value },
+        (error) => { alignError = error },
+      )
+
+      // This returns ALIGNMENT'S OWN backend pid, which is the identity the next link
+      // of the chain is tied to. No count, no sleep.
+      const alignmentBackend = await waitForBlockedBackend(probe, {
+        blockedBy: [holdStockPid],
+        waitingOn: /stock_levels/i,
+        describe: 'alignment parked at the stock level, holding its ASN header and line locks',
+      })
+
+      // The real closer. It locks its purchase order at step 2 and then reaches for
+      // the ASN header at step 3 — the row alignment now holds.
+      const bookingIn = world.runBookedInFor(only).then(
+        () => {},
+        (error) => { bookedInError = error },
+      )
+
+      // THE PROOF. Without the step-3 lock this wait exhausts its budget and fails:
+      // the book-in closes the header immediately and is never blocked at all.
+      await waitForBlockedBackend(probe, {
+        blockedBy: [alignmentBackend.pid],
+        waitingOn: /wms_asn_maps/i,
+        describe: 'the book-in blocked on the ASN header that alignment holds',
+      })
+
+      // AND THE CONSEQUENCE, not just the lock: while the closer is queued, the
+      // predicate alignment planned on still reads the way alignment read it.
+      const { rows } = await probe.query('SELECT "closedAt" FROM wms_asn_maps WHERE id = $1', [only.asnId])
+      closedAtWhileBlocked = rows[0]?.closedAt ?? null
+
+      await holdStock.query('ROLLBACK')
+      await aligning
+      await bookingIn
+    } finally {
+      await holdStock.end().catch(() => {})
+      await probe.end().catch(() => {})
+    }
+
+    assert.equal(alignError, null, `alignment must complete, not throw: ${String(alignError)}`)
+    assert.equal(bookedInError, null, `the book-in must succeed once released: ${String(bookedInError)}`)
+    assert.equal(
+      closedAtWhileBlocked,
+      null,
+      'the ASN header was closed while alignment was mid-transaction — the closedAt predicate the plan '
+      + 'rests on moved under it, which is exactly what the step-3 lock exists to stop',
+    )
+    // NOT VACUOUS: alignment must actually have gone through to its write, or the
+    // header lock was never held across a plan that mattered.
+    assert.equal(alignResult!.applied, true, `alignment must apply: ${JSON.stringify(alignResult)}`)
+    assert.equal(alignResult!.correctedQty, 10)
   },
 )
