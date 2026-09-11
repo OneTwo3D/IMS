@@ -102,6 +102,21 @@ guarantee.
   Dropping `StateDirectory=` from the unit does not fail at deploy time; it fails
   at the first scheduler save, which then refuses and reports that the scheduler
   may be behind.
+- **The Scheduler needs the `crontab` group, and `NoNewPrivileges` can stay**:
+  `/usr/bin/crontab` is setgid `crontab` and the spool is `drwx-wx--T root:crontab`,
+  so the binary reaches the spool only through that group. `NoNewPrivileges=true`
+  makes the kernel ignore setuid/setgid bits on exec, so without help the service
+  user runs `crontab` as plain `User=`/`Group=` and gets `Permission denied` on
+  both `crontab -l` and `crontab -`. The unit therefore carries
+  `SupplementaryGroups=crontab` and `ReadWritePaths=/var/spool/cron/crontabs`.
+  A supplementary group is *granted* by systemd before the exec rather than
+  *gained* by it, which is why `NoNewPrivileges=true` stays — it is not the thing
+  being relaxed. What is conceded is that the service can create files in the
+  shared cron spool; it still cannot read or replace another user's crontab (no
+  `r` on the directory, and it is sticky), and Debian cron refuses a spool file
+  whose owner does not match the user it is named for. Remove both lines on an
+  install that does not use Settings → System → Scheduler and let
+  `scripts/install.sh` own the crontab instead.
 - **Sandbox validation**: `systemd-analyze security ims-stage` scores the unit;
   aim to keep it in the "OK"/"exposed" range or better.
 - Do **not** add `MemoryDenyWriteExecute=true` — it breaks the V8 JIT and the
