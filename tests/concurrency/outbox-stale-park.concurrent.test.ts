@@ -579,9 +579,18 @@ test(
      * second time. The index closes the window in which no duplicate delivery had happened yet, and
      * leaves open the one in which it has.
      *
-     * And a send is not a database write, so no constraint on this table could have closed it: even
-     * inside the covered window, refusing a second ROW does not unsend a mail already on the wire.
-     * POST_EFFECT.INVOICE_EMAIL says the same thing — the email cannot be recalled.
+     * AND NO CONSTRAINT IN THE CURRENT SCHEMA CLOSES THE REMAINDER — a fact about this schema, not
+     * about constraints (Codex round 16, MEDIUM). This paragraph used to say that no constraint on
+     * this table COULD have closed it, because a send is not a database write and refusing a second
+     * ROW does not unsend a mail already on the wire. That is true of the index we HAVE, whose
+     * predicate ends at delivery; it is false as a general claim. A LIFETIME uniqueness key on
+     * (kind, referenceType, referenceId), or an upstream-effect idempotency key written at the
+     * enqueue, would refuse worker B's ENQUEUE — and an enqueue refused before it happens needs
+     * nothing unsent. Neither is taken here: the invoice-email fence passes no `createDispatchWrite`,
+     * the gap o3d-8td2's audit recorded and o3d-scyw now carries. What this test establishes is
+     * therefore the schema as it stands, and nothing about what a schema could do.
+     * POST_EFFECT.INVOICE_EMAIL is still right about the OTHER half — a mail already handed to the
+     * transport cannot be recalled, whatever is written afterwards.
      *
      * ASSERTED AS A READ PLUS ONE ROLLED-BACK WRITE. The old test would not write here at all, for a
      * good reason: a committed PENDING row in this table is a mail the drain will send. That reason is

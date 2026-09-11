@@ -1706,11 +1706,15 @@ const RECORD_PROSE: readonly string[] = [
   ", but sync row {syncRowId} already named a DIFFERENT draft journal (unknown) — a newer claim posted while this attempt was on the wire.",
   "THIS RECORD DOES NOT NAME THE BILL THE PDF WENT ONTO, so it cannot send you to the duplicates and nothing kept here derives the bill.",
   ", but sync row {syncRowId} already named a DIFFERENT external id (unknown) — a newer claim posted while this attempt was on the wire.",
-  "ANOTHER COPY OF THE INVOICE EMAIL IS QUEUED TO THE CUSTOMER — one more PENDING accounting-invoice row in the email outbox per sweep",
+  // ROUND 16 (Codex MEDIUM): re-read because o3d-alnk's partial unique index made the old
+  // per-sweep count false. It names no act; it says what happens and what does not.
+  "ANOTHER COPY OF THE INVOICE EMAIL IS QUEUED TO THE CUSTOMER — a PENDING accounting-invoice row in the email outbox — on every sweep that runs once the copy before it has been delivered. COPIES DO NOT PILE UP UNDELIVERED: the email outbox refuses a second undelivered row for this order, so a sweep that lands while one is still PENDING or PROCESSING queues nothing and reports success anyway. THAT REFUSAL ENDS AT DELIVERY, and the outbox cron empties PENDING in minutes while a stale claim takes fifteen, so in practice each sweep finds nothing undelivered and queues one more",
   ", but sync row {syncRowId} already named a DIFFERENT document (unknown) — a newer claim posted while this attempt was on the wire.",
   ", but sync row {syncRowId} already named a DIFFERENT payment (unknown) — a newer claim posted while this attempt was on the wire.",
   ", but sync row {syncRowId} already named a DIFFERENT journal (unknown) — a newer claim posted while this attempt was on the wire.",
-  "it QUEUED an invoice email to the customer — one PENDING row in the local email outbox. It succeeds by QUEUEING, not by sending",
+  // ROUND 16 (Codex MEDIUM): the same count on the reset-record side. A successful attempt may
+  // have written no row at all, and this sentence now says so instead of promising one.
+  "it QUEUED an invoice email to the customer, or found one already queued and undelivered and wrote no second row, and THIS RECORD DOES NOT SAY WHICH OF THE TWO. Either way it succeeds by QUEUEING, not by sending",
   ", but sync row {syncRowId} already named a DIFFERENT draft (unknown) — a newer claim posted while this attempt was on the wire.",
   "The row was left naming the first one. ONE OF THE TWO IDS IS NOT RECORDED HERE, so they cannot both be opened. REMEDY:",
   "The draft it changed is in {ledger} all the same, it stood there before this attempt ran, and it moved no balances.",

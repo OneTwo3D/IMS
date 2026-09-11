@@ -665,8 +665,19 @@ export const QBO_OPERATIONS_WITHOUT_REQUEST_ID: Partial<Record<
     // say "STOP THE REPLAY FIRST", then inspect. The only lever is the sync toggle, which this same
     // record already says is an admission check and not a fence, so that ordering cannot be
     // established: the query is a snapshot that can still grow, and it says so.
-    effect: 'ANOTHER COPY OF THE INVOICE EMAIL IS QUEUED TO THE CUSTOMER — one more PENDING '
-      + 'accounting-invoice row in the email outbox per sweep',
+    // ROUND 16 (Codex MEDIUM): "ONE MORE PENDING ROW PER SWEEP" IS A COUNT o3d-alnk MADE FALSE.
+    // `email_outbox_undelivered_reference_uq` refuses a second (kind, referenceType, referenceId)
+    // row while one is still PENDING or PROCESSING, and `queueEmail` swallows that P2002 and returns
+    // `already_queued` — so a sweep landing inside that window queues NOTHING while still reporting
+    // success. The repetition is real, but it is keyed to DELIVERY rather than to sweeps, and an
+    // operator reading a per-sweep count would over-state what is outstanding. Said exactly.
+    effect: 'ANOTHER COPY OF THE INVOICE EMAIL IS QUEUED TO THE CUSTOMER — a PENDING '
+      + 'accounting-invoice row in the email outbox — on every sweep that runs once the copy before '
+      + 'it has been delivered. COPIES DO NOT PILE UP UNDELIVERED: the email outbox refuses a second '
+      + 'undelivered row for this order, so a sweep that lands while one is still PENDING or '
+      + 'PROCESSING queues nothing and reports success anyway. THAT REFUSAL ENDS AT DELIVERY, and the '
+      + 'outbox cron empties PENDING in minutes while a stale claim takes fifteen, so in practice '
+      + 'each sweep finds nothing undelivered and queues one more',
     check: 'this operation succeeds by QUEUEING, not by sending, and IMS CANNOT CANCEL A QUEUED COPY. '
       + 'EmailOutbox has four states — PENDING, PROCESSING, SENT, FAILED — none of which means '
       + '"deliberately not delivered", and no action, route or screen removes an unsent row, so there '
@@ -1598,7 +1609,12 @@ export const NON_DOCUMENT_INCIDENT_WORDING: Readonly<Record<
     },
     INVOICE_EMAIL: {
       stands: NOTHING_CREATED_STANDS,
-      did: 'it QUEUED an invoice email to the customer — one PENDING row in the local email outbox. It '
+      // ROUND 16 (Codex MEDIUM), THE SAME COUNT ONE TABLE OVER: "one PENDING row" was guaranteed
+      // before o3d-alnk and is not now. A successful attempt writes a row OR finds one already
+      // queued and undelivered and writes none — `queueEmail` returns `already_queued` and the
+      // caller still returns success — and nothing kept here says which happened.
+      did: 'it QUEUED an invoice email to the customer, or found one already queued and undelivered '
+        + 'and wrote no second row, and THIS RECORD DOES NOT SAY WHICH OF THE TWO. Either way it '
         + 'succeeds by QUEUEING, not by sending',
       remedy: 'REMEDY: IMS CANNOT CANCEL A QUEUED COPY — EmailOutbox has four states (PENDING, '
         + 'PROCESSING, SENT, FAILED), none of which means "deliberately not delivered", and no action, '

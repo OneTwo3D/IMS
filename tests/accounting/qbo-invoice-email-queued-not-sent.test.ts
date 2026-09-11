@@ -10,15 +10,20 @@ import test, { mock } from 'node:test'
 // settle the row" leaves nothing outstanding.
 //
 // `INVOICE_EMAIL` IS NOT ONE OF THOSE THREE. It succeeds by writing a PENDING row into the email
-// outbox; a separate cron delivers it later. Every sweep therefore leaves another queued copy behind,
-// and settling the sync row stops the SWEEP while cancelling NONE of the copies already queued. An
-// operator told to "check what was sent" would look at a mail log, see one delivery, settle the row,
-// and the rest would arrive afterwards — the settlement reading as the end of the incident when it is
-// not.
+// outbox; a separate cron delivers it later. So more of the effect is still coming when the operator
+// reads the record, and settling the sync row stops the SWEEP while reaching none of what is queued.
+// An operator told to "check what was sent" would look at a mail log, see one delivery, settle the
+// row, and another copy would arrive afterwards — the settlement reading as the end of the incident
+// when it is not.
 //
-// This file pins the PREMISE (success means queued, one row per call, nothing sent) and then pins that
-// the operator-facing wording names the exact row shape that premise produces, so the query it tells
-// somebody to run actually selects the rows the replay created.
+// ROUND 16 (Codex MEDIUM) NARROWED THE PREMISE, AND THE FILE SAYS SO RATHER THAN CARRYING THE OLD
+// ONE. It used to pin "one row per call", and o3d-alnk's `email_outbox_undelivered_reference_uq`
+// makes that false: a call made while an undelivered copy already exists writes NOTHING and
+// `queueEmail` answers `already_queued`. What is true is narrower and is what the tests below pin —
+// success means QUEUED-OR-ALREADY-QUEUED, never SENT; at most one UNDELIVERED copy exists at a time;
+// and the index's predicate ends at delivery, so a sweep landing after the drain queues another one.
+// The operator-facing wording is then pinned against the row shape that premise really produces, so
+// the query it tells somebody to run selects the rows the replay actually created.
 // ---------------------------------------------------------------------------
 
 type OutboxRow = Record<string, unknown>
@@ -26,6 +31,60 @@ type OutboxRow = Record<string, unknown>
 const state = {
   outbox: [] as OutboxRow[],
   sends: 0,
+}
+
+// ---------------------------------------------------------------------------
+// ROUND 16 (Codex MEDIUM): THE DOUBLE USED TO ACCEPT WHAT THE DATABASE REFUSES.
+//
+// `emailOutbox.create` here blindly appended every row, so this file "proved" three simultaneous
+// PENDING copies — a state that can no longer exist. o3d-alnk's `email_outbox_undelivered_reference_uq`
+// is a PARTIAL UNIQUE INDEX on (kind, referenceType, referenceId) WHERE status IN
+// ('PENDING','PROCESSING') AND referenceType IS NOT NULL AND referenceId IS NOT NULL, and `queueEmail`
+// catches the P2002 it raises and answers `already_queued`. A double that accepts what the real table
+// refuses cannot prove anything about production, so it models the index instead.
+//
+// MODELLED EXACTLY AS THE INDEX IS WRITTEN, including the two halves that are easy to drop:
+//   * the PREDICATE is the undelivered statuses only — a SENT or FAILED row does not occupy the slot;
+//   * the model default is PENDING, so a row that writes no `status` (which is what `queueEmail`
+//     does) is UNDELIVERED and does occupy it;
+//   * a NULL referenceType or referenceId is outside the index entirely and never collides.
+// ---------------------------------------------------------------------------
+
+const UNDELIVERED_UNIQUE_INDEX = 'email_outbox_undelivered_reference_uq'
+const UNDELIVERED_STATUSES = new Set(['PENDING', 'PROCESSING'])
+
+/** The index's key for a row, or null when the row falls outside its partial predicate. */
+function undeliveredSlot(row: OutboxRow): string | null {
+  const status = typeof row.status === 'string' ? row.status : 'PENDING'
+  if (!UNDELIVERED_STATUSES.has(status)) return null
+  if (row.referenceType == null || row.referenceId == null) return null
+  return [row.kind, row.referenceType, row.referenceId].map(String).join('\u0000')
+}
+
+/** The P2002 the pg driver adapter raises for that index — the shape `isUndeliveredEmailCollision` reads. */
+function undeliveredReferenceCollision(): Error {
+  const error = new Error(
+    `duplicate key value violates unique constraint "${UNDELIVERED_UNIQUE_INDEX}"`,
+  ) as Error & { code: string; meta: unknown }
+  error.code = 'P2002'
+  error.meta = {
+    modelName: 'EmailOutbox',
+    driverAdapterError: {
+      name: 'DriverAdapterError',
+      cause: {
+        originalCode: '23505',
+        kind: 'UniqueConstraintViolation',
+        constraint: { index: UNDELIVERED_UNIQUE_INDEX },
+      },
+    },
+  }
+  return error
+}
+
+/** What the outbox drain does to a row, so a test can reach the post-delivery window on purpose. */
+function deliver(row: OutboxRow): void {
+  row.status = 'SENT'
+  row.sentAt = new Date()
 }
 
 mock.module('@/lib/db', {
@@ -43,6 +102,10 @@ mock.module('@/lib/db', {
       },
       emailOutbox: {
         create: async ({ data }: { data: OutboxRow }) => {
+          const slot = undeliveredSlot(data)
+          if (slot !== null && state.outbox.some((row) => undeliveredSlot(row) === slot)) {
+            throw undeliveredReferenceCollision()
+          }
           state.outbox.push(data)
           return { id: `outbox-${state.outbox.length}`, ...data }
         },
@@ -86,20 +149,63 @@ test('Codex MEDIUM: an INVOICE_EMAIL success QUEUES a pending row — it does no
   assert.ok(!('sentAt' in row), 'and nothing is stamped sent, because nothing has been')
 })
 
-test('Codex MEDIUM: every replay adds ANOTHER pending copy — settling the row cancels none of them', async () => {
-  // THE CONTROL FOR THE WORDING. Three sweeps of the unfenced replay leave three PENDING rows. There
-  // is nothing in this path that supersedes, dedupes or cancels an earlier one, so the count is also
-  // the number of emails a customer receives if an operator settles the sync row and stops there.
+test('ROUND 16: the double refuses the second undelivered row exactly as the shipped index does', async () => {
+  // THE DOUBLE IS ONLY WORTH ANYTHING IF ITS REFUSAL IS THE ONE PRODUCTION CLASSIFIES. Both halves
+  // are checked against the shipped code rather than assumed: the index name, and the fact that
+  // `queueEmail`'s own predicate reads this error as its collision. Without this, the fake could
+  // refuse for a reason `queueEmail` would rethrow, and every test below would be proving the wrong
+  // control flow.
+  const { EMAIL_OUTBOX_UNDELIVERED_REFERENCE_INDEX, isUndeliveredEmailCollision } =
+    await import('@/lib/email-outbox')
+  assert.equal(UNDELIVERED_UNIQUE_INDEX, EMAIL_OUTBOX_UNDELIVERED_REFERENCE_INDEX)
+  assert.equal(isUndeliveredEmailCollision(undeliveredReferenceCollision()), true)
+
+  // And the predicate really is partial: a SENT row frees the slot, a null reference never took one.
+  assert.equal(undeliveredSlot({ kind: 'ACCOUNTING_INVOICE', referenceType: 'SalesOrder', referenceId: 'o' }) !== null, true)
+  assert.equal(undeliveredSlot({ kind: 'ACCOUNTING_INVOICE', referenceType: 'SalesOrder', referenceId: 'o', status: 'SENT' }), null)
+  assert.equal(undeliveredSlot({ kind: 'ACCOUNTING_INVOICE', referenceType: null, referenceId: null }), null)
+})
+
+test('ROUND 16: a replay while the first copy is UNDELIVERED adds nothing — the copies come after delivery', async () => {
+  // WHAT THIS TEST USED TO SAY: three sweeps, three simultaneous PENDING rows, and that count was
+  // also the number of emails the customer would receive. THE DOUBLE MADE THAT UP. The shipped table
+  // refuses calls two and three with P2002 and `queueEmail` answers `already_queued`, so the premise
+  // — and the operator guidance built on it — was stale while this file stayed green. It is the
+  // defect class this branch exists for, so the conclusion is restated rather than the count patched.
+  //
+  // THE CONCLUSION CHANGED. Copies do NOT pile up undelivered; a sweep that lands while one is still
+  // PENDING or PROCESSING queues nothing at all. What survives is the hazard the verdict rests on:
+  // the predicate ENDS AT DELIVERY, so the first sweep after the drain has sent a copy queues
+  // another one, and nothing bounds how often that repeats.
   state.outbox = []
   state.sends = 0
 
   const { sendAccountingInvoiceEmailInternal } = await import('@/lib/accounting-email')
-  await sendAccountingInvoiceEmailInternal('order-1')
-  await sendAccountingInvoiceEmailInternal('order-1')
-  await sendAccountingInvoiceEmailInternal('order-1')
+  const first = await sendAccountingInvoiceEmailInternal('order-1')
+  const second = await sendAccountingInvoiceEmailInternal('order-1')
+  const third = await sendAccountingInvoiceEmailInternal('order-1')
 
-  assert.equal(state.outbox.length, 3, 'one queued copy per sweep, all of them still pending')
-  assert.equal(state.sends, 0, 'and none of them delivered yet — which is exactly why they can still be cancelled')
+  assert.deepEqual(
+    [first.success, second.success, third.success],
+    [true, true, true],
+    'all three sweeps still report SUCCESS — the refusal is invisible to the caller, which is why '
+    + 'nothing upstream can be built on it',
+  )
+  assert.equal(state.outbox.length, 1, 'and only ONE row exists: the index refused the other two')
+  assert.equal(state.sends, 0, 'still nothing reached the mailer')
+
+  // THE PRECONDITION WAS REACHED, not assumed: the surviving row is the undelivered one, so the two
+  // refusals were the index doing its job rather than the fake never being called.
+  assert.equal(undeliveredSlot(state.outbox[0]) !== null, true, 'the surviving row occupies the index slot')
+
+  // NOW THE DRAIN RUNS. The slot is freed by DELIVERY, and the very next sweep queues another copy —
+  // this is the window the partial predicate leaves open, and the whole reason xero/accounting.post
+  // is unsafe-to-replay.
+  deliver(state.outbox[0])
+  const afterDelivery = await sendAccountingInvoiceEmailInternal('order-1')
+  assert.equal(afterDelivery.success, true)
+  assert.equal(state.outbox.length, 2, 'a sweep after delivery queues a SECOND copy — the customer is emailed twice')
+
   assert.deepEqual(
     [...new Set(state.outbox.map((row) => `${String(row.referenceType)}:${String(row.referenceId)}`))],
     ['SalesOrder:order-1'],
@@ -228,6 +334,13 @@ test('ROUND 7: the manual send writes the identical row shape, so the query cann
   const { sendAccountingInvoiceEmailInternal } = await import('@/lib/accounting-email')
   await sendAccountingInvoiceEmailInternal('order-1')
   const replayed = { ...state.outbox[0] }
+
+  // ROUND 16: THE DRAIN RUNS BETWEEN THEM, AND IT HAS TO. Both writes are the identical shape, so
+  // `email_outbox_undelivered_reference_uq` refuses the second while the first is still undelivered
+  // — this test would otherwise be asserting about a row the database never accepted. Delivering the
+  // first is also the realistic case: the finding is that the two are indistinguishable in a query
+  // an operator runs AFTER the fact, and by then a queued copy has long since been sent.
+  deliver(state.outbox[0])
 
   // The operator's own send, through the SHIPPED authenticated action.
   const { sendAccountingInvoiceEmail } = await import('@/app/actions/email')

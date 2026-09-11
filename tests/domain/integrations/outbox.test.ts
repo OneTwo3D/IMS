@@ -947,8 +947,12 @@ test('the six verdicts are the round-3 corrected ones', () => {
     // Codex round 2 HIGH 1: absolute-value writes are safe against repetition, NOT against a
     // reordering, and WooCommerce offers no token to reject a regression with.
     'woocommerce/stock.push': 'unsafe-to-replay',
-    // Codex round 2 HIGH 2: multiplexes AccountingSyncType; INVOICE_EMAIL enqueues an unguarded
-    // EmailOutbox row (whose own queue is unfenced — o3d-alnk).
+    // Codex round 2 HIGH 2: multiplexes AccountingSyncType; INVOICE_EMAIL enqueues an EmailOutbox
+    // row that no fence couples to this worker's completion. ROUND 16: this line used to add "whose
+    // own queue is unfenced — o3d-alnk", and o3d-alnk is the branch that stopped it being true. The
+    // queue now has a per-claim `lockedBy` and terminal compare-and-set writes, plus a partial unique
+    // index on the undelivered statuses. The verdict is unchanged because none of that reaches a
+    // replay whose predecessor is already SENT — see the registry entry, which states the reason.
     'xero/accounting.post': 'unsafe-to-replay',
     // Codex round 3 MEDIUM 1: not one guarded effect but a guarded receipt followed by three
     // unguarded ones, so a crash in the tail strands them BECAUSE the guard commits `processedAt`.

@@ -231,8 +231,20 @@ export const INTEGRATION_OUTBOX_REGISTRY = defineOutboxRegistry({
     //      PENDING inside it, so by the time worker B replays, A's copy is typically already SENT —
     //      outside the predicate. B's insert is accepted and the customer is emailed twice. The index
     //      closes the window in which nothing had been delivered yet and leaves open the one in which
-    //      something has. Nor could any constraint here have closed it: a send is not a database
-    //      write, so refusing a second ROW cannot unsend a mail already on the wire.
+    //      something has. NO CONSTRAINT IN THE CURRENT SCHEMA CLOSES THE REMAINDER — and that is a
+    //      statement about THIS SCHEMA, not about constraints (Codex round 16, MEDIUM). Rounds 1-3
+    //      wrote that no constraint COULD have closed it, reasoning that a send is not a database
+    //      write so refusing a second ROW cannot unsend a mail already on the wire. That is true of
+    //      the index we have, whose predicate ends at delivery, and false as a general claim: a
+    //      LIFETIME uniqueness key on (kind, referenceType, referenceId), or an upstream-effect
+    //      idempotency key written at the enqueue, would refuse worker B's ENQUEUE — and an enqueue
+    //      refused before it happens needs nothing unsent, so neither needs worker A's mail recalled.
+    //      THAT ROUTE EXISTS AND IS NOT TAKEN HERE: the durable dispatch key this fence would need is
+    //      the `createDispatchWrite` that `lease.fenceBeforeRemoteWrite('invoice-email')` does not
+    //      pass — the gap o3d-8td2's audit recorded, now carried as o3d-scyw, which also sets out
+    //      why a LIFETIME key is not free: the authenticated accounting-invoice action writes this
+    //      same row shape deliberately. So the verdict is decided by the schema as it stands, not by
+    //      an impossibility.
     //      Proven, not asserted, in tests/concurrency/outbox-stale-park.concurrent.test.ts: a SENT
     //      first copy, then a second PENDING insert the database accepts (inside a rolled-back
     //      transaction, so no mail can leave).
