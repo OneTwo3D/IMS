@@ -572,12 +572,18 @@ test(
      *
      *   THE INDEX REFUSES A DUPLICATE UNDELIVERED *ROW*. IT CANNOT REFUSE A DUPLICATE *SEND*.
      *
-     * Those come apart at the only moment that matters. The window a stale-lock reclaim opens is
-     * ADMIN_OUTBOX_STALE_PROCESSING_LOCK_MS wide, and the email drain empties PENDING far faster than
-     * that — so when worker B replays, worker A's copy has typically already been DELIVERED. A SENT row
-     * is outside the index's predicate. B's insert is therefore accepted, and the customer is emailed a
-     * second time. The index closes the window in which no duplicate delivery had happened yet, and
-     * leaves open the one in which it has.
+     * Those come apart at the only moment that matters — AND NOT AS OFTEN AS THIS USED TO SAY
+     * (Codex round 19, MEDIUM). This paragraph used to have the drain emptying the queue well inside
+     * the reclaim window, and worker A's copy therefore delivered by the time worker B replays. The
+     * cadences are the other way round, and they are in the repo: the reclaim window
+     * is ADMIN_OUTBOX_STALE_PROCESSING_LOCK_MS = INTEGRATION_OUTBOX_MAX_LEASE_MS = 900_000 ms,
+     * FIFTEEN MINUTES (`xeroAccountingEntry` in lib/domain/integrations/outbox-leases.ts), and the
+     * email drain is documented HOURLY (help-docs/settings.md, the `/api/cron/email-outbox` cron-table
+     * row). Fifteen minutes is INSIDE the hour, so B's replay usually meets a copy that is still
+     * PENDING and the index REFUSES it. What the index leaves open is the timing that
+     * CROSSES A DRAIN: once a drain settles A's copy to SENT, a SENT row is outside the predicate, B's
+     * insert is accepted, and the customer is emailed a second time. That gap is what this test
+     * drives below, and it is what decides the verdict; the RATE was the only thing wrong.
      *
      * AND NO CONSTRAINT IN THE CURRENT SCHEMA CLOSES THE REMAINDER — a fact about this schema, not
      * about constraints (Codex round 16, MEDIUM). This paragraph used to say that no constraint on

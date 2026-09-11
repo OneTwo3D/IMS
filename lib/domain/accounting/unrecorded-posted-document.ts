@@ -677,10 +677,18 @@ export const QBO_OPERATIONS_WITHOUT_REQUEST_ID: Partial<Record<
     // undelivered and queues one more". Both were asserted rather than grepped, and both are wrong
     // by an order of magnitude in the direction that alarms an operator. The cadences, from the
     // repo: this sweep is the accounting sync queue, `defaultSchedule: '*/5 * * * *'`
-    // (lib/cron-jobs/xero.ts:11, `accounting-sync`, `defaultEnabled: true`; help-docs/settings.md:338
-    // lists it as "Every 5 min"), and the email outbox drain is `/api/cron/email-outbox`, documented
-    // Hourly (help-docs/settings.md:351 — the only cadence for it in the repo; it is called by the
-    // operator's cron daemon and has no cron-registry entry). So the undelivered refusal normally
+    // (lib/cron-jobs/xero.ts, the `slug: 'accounting-sync'` entry, `defaultEnabled: true`;
+    // help-docs/settings.md lists its `/api/cron/accounting-sync` cron-table row as "Every 5 min"),
+    // and the email outbox drain is `/api/cron/email-outbox`, documented Hourly (help-docs/settings.md,
+    // the `/api/cron/email-outbox` cron-table row — the only cadence for it in the repo; it is called
+    // by the operator's cron daemon and has no cron-registry entry).
+    // NOTE WHAT THESE CITATIONS NO LONGER CARRY: A LINE NUMBER (Codex round 19, LOW). Round 18 cited
+    // the settings-doc row by line, and named a line two below the one the row was actually on; any
+    // edit above it would have falsified the number again. A citation that decays silently is worse
+    // than none, because it reads as precision. Each one now names a string that can be GREPPED, and the cadence test in
+    // tests/accounting/qbo-invoice-email-queued-not-sent.test.ts resolves every one of them in the
+    // file it names, so a citation that stops resolving fails the gate instead of drifting.
+    // So the undelivered refusal normally
     // holds for a WHOLE HOUR, about twelve consecutive sweeps meet the same PENDING row and queue
     // nothing, and a further copy becomes possible only after a drain settles that row. The verdict
     // is unchanged and must stay: repetition after the row is settled is what makes this operation

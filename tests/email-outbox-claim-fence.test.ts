@@ -712,3 +712,147 @@ test('the migration changes NOTHING before its transaction begins (o3d-alnk r6)'
   // guard is deliberately outside it. What it claims is what is true — nothing was applied.
   assert.match(FENCE_MIGRATION_SQL, /HINT = '[^']*Nothing was applied: this check is the migration''s first statement/)
 })
+
+// ---------------------------------------------------------------------------
+// ROUND 20 (Codex MEDIUM) — "DID THIS WORKER TOUCH THE SMTP SOCKET" IS DERIVED, NOT DECLARED.
+//
+// Round 18 made that fact its own counter and fixed the ONE site that was stating it wrongly: the
+// suppression branch. Round 19 found the second reader of the same rule. The `try` opens BEFORE
+// `prepareQueuedEmail` and before the attachment decode, so a failure in either — on a row another
+// worker had meanwhile reclaimed — reached `recordConflict(..., true)` and told an operator that a
+// DUPLICATE DELIVERY was likely, from a worker that had never opened a socket.
+//
+// The fix is not a third boolean at a third site. The answer now comes off the wrapper that invokes
+// the sender (`openSmtpAttempt`), so it cannot be out of step with the send: there is no boolean for
+// a future branch to get wrong, and the raw sender has exactly one caller. These tests drive the two
+// paths that were wrong, the path that was right (so the counters still disagree), and the structure
+// that makes the fact underivable any other way.
+// ---------------------------------------------------------------------------
+
+test('r20: a claim lost while PREPARING is not reported as a probable duplicate', async () => {
+  const { client, rows } = makeClient([makeRow()])
+  let sends = 0
+
+  const workerA = await drain({
+    client,
+    now: () => T0,
+    logActivity: noLog,
+    async prepareQueuedEmail() {
+      // Worker B reclaims while A is still building the message — before any socket exists.
+      rows[0].lockedBy = 'another-worker'
+      throw new Error('the invoice PDF could not be rendered')
+    },
+    async sendEmail() {
+      sends += 1
+      return { success: true }
+    },
+  })
+
+  // THE PRECONDITION, or the counters below would be right for the wrong reason.
+  assert.equal(sends, 0, 'the sender must NOT have been called on this path, or this proves nothing')
+  assert.equal(workerA.processed, 1, 'worker A must have claimed the row, or no conflict can arise')
+  assert.equal(rows[0].lockedBy, 'another-worker', "the row must belong to worker B when A's write lands")
+
+  assert.equal(
+    workerA.conflicted,
+    0,
+    'a claim lost while PREPARING was reported as a probable duplicate delivery by a worker that sent nothing',
+  )
+  assert.equal(workerA.conflictedWithoutSend, 1, "worker A's lost claim is still recorded, not silent")
+})
+
+test('r20: a claim lost while DECODING ATTACHMENTS is not reported as a probable duplicate', async () => {
+  // The second statement inside the same `try`, and the second reader of the same rule. The row
+  // carries an attachments value that is not an array, so the decode throws where the send would
+  // otherwise have been called.
+  const { client, rows } = makeClient([
+    makeRow({ attachments: { notAnArray: true } as unknown as EmailOutboxRow['attachments'] }),
+  ])
+  let sends = 0
+
+  const workerA = await drain({
+    client,
+    now: () => T0,
+    logActivity: noLog,
+    async prepareQueuedEmail() {
+      rows[0].lockedBy = 'another-worker'
+      return null
+    },
+    async sendEmail() {
+      sends += 1
+      return { success: true }
+    },
+  })
+
+  assert.equal(sends, 0, 'the decode must have thrown before the sender, or this proves nothing')
+  assert.equal(workerA.conflicted, 0, 'a claim lost while decoding attachments implies no duplicate delivery')
+  assert.equal(workerA.conflictedWithoutSend, 1)
+})
+
+test('r20: a claim lost by a THROW OUT OF THE SENDER is still reported as a probable duplicate', async () => {
+  // NON-VACUITY for the two above: the same `catch`, entered from the other side. The worker really
+  // was on the socket, so this one must still count as `conflicted` — if the fix had simply flipped
+  // the catch to `false`, this fails.
+  const { client, rows } = makeClient([makeRow()])
+  let sends = 0
+
+  const workerA = await drain({
+    client,
+    now: () => T0,
+    prepareQueuedEmail: noPrepare,
+    logActivity: noLog,
+    async sendEmail() {
+      sends += 1
+      rows[0].lockedBy = 'another-worker'
+      throw new Error('the connection died mid-DATA')
+    },
+  })
+
+  assert.equal(sends, 1, 'the sender must have been entered, or this proves nothing')
+  assert.equal(workerA.conflicted, 1, 'a claim lost AFTER the socket was touched is the one that implies a duplicate')
+  assert.equal(workerA.conflictedWithoutSend, 0)
+})
+
+test('r20: the injected sender has exactly one caller, and every conflict reads its answer off that gate', () => {
+  // The structural half. The two tests above are about behaviour on two paths; this is about there
+  // being no third path that can answer the question differently, which is what made round 18's fix
+  // survivable-but-incomplete.
+  const source = readFileSync(fileURLToPath(new URL('../lib/email-outbox.ts', import.meta.url)), 'utf8')
+
+  const senderCalls = [...source.matchAll(/\bsendOverSmtp\(/g)]
+  assert.equal(
+    senderCalls.length,
+    1,
+    `the injected sender is called ${senderCalls.length} times; exactly one call — the one inside `
+    + '`openSmtpAttempt` that flips `attempted` — is what keeps the reported fact tied to the send',
+  )
+  assert.match(
+    source,
+    /attempted = true\n\s*return sendOverSmtp\(\.\.\.args\)/,
+    'the flag is no longer set by the wrapper that performs the send',
+  )
+
+  // No call site declares the answer any more: every one passes the gate.
+  const conflictCalls = [...source.matchAll(/recordConflict\(claim, (.+?), (\w+)\)/g)]
+  assert.equal(conflictCalls.length, 4, `expected the four settlement paths; found ${conflictCalls.length}`)
+  for (const call of conflictCalls) {
+    assert.equal(
+      call[2],
+      'smtp',
+      `recordConflict is told '${call[2]}' at the ${call[1]} path instead of being handed the row's gate`,
+    )
+  }
+  assert.deepEqual(
+    conflictCalls.map((call) => call[1]),
+    [
+      "'a suppression check'",
+      "'a successful send'",
+      "'a failed send'",
+      // The catch's PHRASE is derived from the same gate, because this `try` also covers the
+      // preparation and the attachment decode — so an operator never reads "a thrown send" about a
+      // worker that threw before reaching one.
+      "smtp.attempted ? 'a thrown send' : 'a throw before the send'",
+    ],
+    'the paths that reach recordConflict have changed — re-read which of them can have touched the socket',
+  )
+})

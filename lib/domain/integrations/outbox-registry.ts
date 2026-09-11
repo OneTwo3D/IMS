@@ -226,12 +226,24 @@ export const INTEGRATION_OUTBOX_REGISTRY = defineOutboxRegistry({
     //   1. IT SAID `EmailOutbox` HAS "no idempotency key and no unique constraint of any kind".
     //      It now has `email_outbox_undelivered_reference_uq`, a PARTIAL unique index on
     //      (kind, referenceType, referenceId) WHERE status IN ('PENDING','PROCESSING'). That refuses
-    //      a duplicate UNDELIVERED ROW — and a duplicate undelivered row is not the hazard. The
-    //      reclaim window is `ADMIN_OUTBOX_STALE_PROCESSING_LOCK_MS` wide and the email drain empties
-    //      PENDING inside it, so by the time worker B replays, A's copy is typically already SENT —
-    //      outside the predicate. B's insert is accepted and the customer is emailed twice. The index
-    //      closes the window in which nothing had been delivered yet and leaves open the one in which
-    //      something has. NO CONSTRAINT IN THE CURRENT SCHEMA CLOSES THE REMAINDER — and that is a
+    //      a duplicate UNDELIVERED ROW — and a duplicate undelivered row is not the hazard.
+    //      THE CADENCES IN THIS PARAGRAPH WERE THE WRONG WAY ROUND (Codex round 19, MEDIUM). Round 18
+    //      corrected this same false premise in lib/domain/accounting/unrecorded-posted-document.ts
+    //      and left THIS copy of it standing: one claim, two readers, one of them fixed. Both are now
+    //      read out of the repo rather than recalled, and the cadence test walks both files.
+    //      The reclaim window is `ADMIN_OUTBOX_STALE_PROCESSING_LOCK_MS`, which is
+    //      `INTEGRATION_OUTBOX_MAX_LEASE_MS` — the largest lease any drain in this build may take,
+    //      900_000 ms, FIFTEEN MINUTES (`xeroAccountingEntry` in
+    //      lib/domain/integrations/outbox-leases.ts; aliased in lib/domain/integrations/outbox-admin.ts).
+    //      The email drain is documented HOURLY (help-docs/settings.md, the `/api/cron/email-outbox`
+    //      row of the cron table — the repo's only statement of its cadence).
+    //      FIFTEEN MINUTES IS INSIDE THE HOUR, so when worker B replays, worker A's copy is usually
+    //      STILL PENDING — inside the predicate — and the index REFUSES B's insert. The duplicate
+    //      arrives when the timing CROSSES A DRAIN: a drain settles A's copy to SENT, a SENT row is
+    //      outside the predicate, B's insert is then accepted, and the customer is emailed twice.
+    //      So the index closes the window in which nothing had been delivered yet and leaves open the
+    //      one in which something has — which is what decides the verdict. Only the RATE was wrong,
+    //      and a rate is a thing to grep. NO CONSTRAINT IN THE CURRENT SCHEMA CLOSES THE REMAINDER — and that is a
     //      statement about THIS SCHEMA, not about constraints (Codex round 16, MEDIUM). Rounds 1-3
     //      wrote that no constraint COULD have closed it, reasoning that a send is not a database
     //      write so refusing a second ROW cannot unsend a mail already on the wire. That is true of

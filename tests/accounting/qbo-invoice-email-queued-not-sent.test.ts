@@ -486,3 +486,180 @@ test('r18: the sentence\'s cadences match the cron config and the cron doc, and 
   assert.match(description, /ANOTHER COPY OF THE INVOICE EMAIL IS QUEUED TO THE CUSTOMER/)
   assert.match(description, /the refusal lifts only when a drain settles that row to SENT or FAILED/)
 })
+
+// ---------------------------------------------------------------------------
+// ROUND 20 (Codex MEDIUM) — THE SAME RATIONALE, IN THE OTHER TWO FILES THAT STATE IT.
+//
+// The round-18 test above walks ONE sentence, in `unrecorded-posted-document.ts`. Round 19 found the
+// SAME false premise still standing in `lib/domain/integrations/outbox-registry.ts` and in
+// `tests/concurrency/outbox-stale-park.concurrent.test.ts`: both said the email drain empties PENDING
+// inside the reclaim window, so worker A's copy is "typically already SENT" when B replays. It is the
+// other way round — the reclaim window is FIFTEEN MINUTES and the drain is HOURLY — so B's replay
+// usually meets a copy that is still PENDING, and the partial unique index refuses it. The verdict
+// (unsafe-to-replay) is unchanged; the operational story was wrong.
+//
+// The reason the round-18 test exists is that a premise asserted from memory drifts. This MEDIUM is
+// that drift happening in files the test did not walk, so the walk is widened to reach them, and it
+// ASSERTS IT REACHED THEM: a renamed file or a rewritten paragraph fails here rather than passing by
+// finding nothing.
+//
+// It also resolves the CITATIONS. Round 19's LOW was a comment citing `help-docs/settings.md:338`
+// for a row at 336 — a line number falsified by any edit above it. Those citations are now greppable
+// anchors, and this test resolves every one of them in the file it names.
+// ---------------------------------------------------------------------------
+
+/** Milliseconds this rationale has words for. An unmapped lease must fail, not be guessed. */
+const RECLAIM_WINDOW_WORDS: Record<string, string> = {
+  '600000': 'TEN MINUTES',
+  '900000': 'FIFTEEN MINUTES',
+  '3600000': 'ONE HOUR',
+}
+
+/** The documented drain cadence, as milliseconds, so the two can be compared as durations. */
+const DRAIN_CADENCE_MS: Record<string, number> = {
+  Hourly: 3_600_000,
+  'Every 5 min': 300_000,
+  'Every 15 min': 900_000,
+}
+
+/**
+ * A citation the cadence comment makes: the file that makes it, the file it names, and the string
+ * that must exist there. No line numbers — that is the point.
+ */
+const CITATIONS: Array<{ citedIn: string; citation: string; resolvesIn: string; anchor: string }> = [
+  {
+    citedIn: 'lib/domain/accounting/unrecorded-posted-document.ts',
+    citation: 'lib/cron-jobs/xero.ts, the `slug: \'accounting-sync\'` entry',
+    resolvesIn: 'lib/cron-jobs/xero.ts',
+    anchor: "slug: 'accounting-sync',",
+  },
+  {
+    citedIn: 'lib/domain/accounting/unrecorded-posted-document.ts',
+    citation: 'help-docs/settings.md lists its `/api/cron/accounting-sync` cron-table row as "Every 5 min"',
+    resolvesIn: 'help-docs/settings.md',
+    anchor: '| `/api/cron/accounting-sync` | Drain pending accounting sync queue | Every 5 min |',
+  },
+  {
+    citedIn: 'lib/domain/accounting/unrecorded-posted-document.ts',
+    citation: 'the `/api/cron/email-outbox` cron-table row — the only cadence for it in the repo',
+    resolvesIn: 'help-docs/settings.md',
+    anchor: '| `/api/cron/email-outbox` | Send queued emails | Hourly |',
+  },
+  {
+    citedIn: 'lib/domain/integrations/outbox-registry.ts',
+    citation: '`xeroAccountingEntry` in\n    //      lib/domain/integrations/outbox-leases.ts',
+    resolvesIn: 'lib/domain/integrations/outbox-leases.ts',
+    anchor: 'xeroAccountingEntry:',
+  },
+  {
+    citedIn: 'tests/concurrency/outbox-stale-park.concurrent.test.ts',
+    citation: '`xeroAccountingEntry` in lib/domain/integrations/outbox-leases.ts',
+    resolvesIn: 'lib/domain/integrations/outbox-leases.ts',
+    anchor: 'xeroAccountingEntry:',
+  },
+]
+
+test('r20: the reclaim window and the drain cadence are grepped, and BOTH copies of the rationale say so', async () => {
+  const { readFileSync } = await import('node:fs')
+  const { fileURLToPath } = await import('node:url')
+  const repoRoot = fileURLToPath(new URL('../../', import.meta.url))
+  const read = (relative: string) => readFileSync(`${repoRoot}${relative}`, 'utf8')
+
+  // (1) THE RECLAIM WINDOW, out of the lease map the constant is derived from. The constant is
+  // `Math.max(...Object.values(INTEGRATION_OUTBOX_DRAIN_LEASES_MS))`, so the max of the map's
+  // literals is the same number by the same rule — read, not recalled.
+  const leases = read('lib/domain/integrations/outbox-leases.ts')
+  const leaseLiterals = [...leases.matchAll(/^\s{2}(\w+):\s*([\d_]+),$/gm)].map((m) => ({
+    name: m[1],
+    ms: Number(m[2].replace(/_/g, '')),
+  }))
+  assert.ok(
+    leaseLiterals.length >= 2,
+    `the walk found ${leaseLiterals.length} lease literals in outbox-leases.ts — it read nothing, so nothing below is proven`,
+  )
+  const reclaimMs = Math.max(...leaseLiterals.map((lease) => lease.ms))
+  const reclaimWords = RECLAIM_WINDOW_WORDS[String(reclaimMs)]
+  assert.ok(
+    reclaimWords,
+    `the reclaim window is now ${reclaimMs}ms, which this rationale has no words for — re-read both copies of it`,
+  )
+
+  // The alias really is that constant, so the rationale may name either.
+  assert.match(
+    read('lib/domain/integrations/outbox-admin.ts'),
+    /ADMIN_OUTBOX_STALE_PROCESSING_LOCK_MS = INTEGRATION_OUTBOX_MAX_LEASE_MS/,
+    'ADMIN_OUTBOX_STALE_PROCESSING_LOCK_MS is no longer the max drain lease — the rationale names the wrong number',
+  )
+
+  // (2) THE DRAIN CADENCE, out of the cron table — the repo's only statement of it.
+  const drainRow = /^\|\s*`\/api\/cron\/email-outbox`\s*\|[^|]*\|\s*([^|]+?)\s*\|/m.exec(read('help-docs/settings.md'))
+  assert.ok(drainRow, 'help-docs/settings.md no longer carries a cron-table row for /api/cron/email-outbox')
+  const drainMs = DRAIN_CADENCE_MS[drainRow[1]]
+  assert.ok(drainMs, `the drain is now documented as '${drainRow[1]}', which this rationale has no words for`)
+
+  // (3) THE ORDERING THE RATIONALE RESTS ON. Everything below is prose about this one inequality.
+  assert.ok(
+    reclaimMs < drainMs,
+    `the rationale says the reclaim window (${reclaimMs}ms) is INSIDE the drain interval (${drainMs}ms); it is not, so both copies are wrong again`,
+  )
+
+  // (4) BOTH COPIES, CHECKED AGAINST THAT READING — and the reversed premise gone rather than
+  // merely contradicted somewhere further down.
+  for (const relative of [
+    'lib/domain/integrations/outbox-registry.ts',
+    'tests/concurrency/outbox-stale-park.concurrent.test.ts',
+  ]) {
+    const text = read(relative)
+    assert.ok(
+      text.includes(String(reclaimMs).replace(/(\d+)(\d{3})$/, '$1_$2')) || text.includes(reclaimWords),
+      `${relative} no longer states the reclaim window as ${reclaimWords} — re-read it against the lease map`,
+    )
+    assert.match(
+      text,
+      /HOURLY|documented HOURLY/,
+      `${relative} no longer states the drain cadence — the sentence this MEDIUM corrected has been rewritten`,
+    )
+    assert.doesNotMatch(
+      text,
+      /the email drain empties\s*\n?\s*(\*|\/\/)?\s*PENDING inside it/,
+      `${relative} still says the drain empties PENDING inside the reclaim window`,
+    )
+    assert.doesNotMatch(
+      text,
+      /empties PENDING far faster than/,
+      `${relative} still says the drain empties PENDING faster than the reclaim window`,
+    )
+    assert.doesNotMatch(
+      text,
+      /A's copy is typically already SENT|has typically already been DELIVERED/,
+      `${relative} still claims the first copy is typically delivered by the time the replay lands`,
+    )
+    assert.match(
+      text,
+      /crosses a drain|CROSSES A DRAIN/,
+      `${relative} no longer says the duplicate needs the timing to cross a drain, which is the corrected claim`,
+    )
+  }
+
+  // (5) EVERY CITATION RESOLVES, AND NONE OF THEM IS A LINE NUMBER. A line number is falsified by
+  // any edit above it and cannot be checked; an anchor can be, so it is.
+  for (const citation of CITATIONS) {
+    const citing = read(citation.citedIn)
+    assert.ok(
+      citing.includes(citation.citation),
+      `${citation.citedIn} no longer carries the citation "${citation.citation}" — the walk is reading a paragraph that has moved`,
+    )
+    assert.ok(
+      read(citation.resolvesIn).includes(citation.anchor),
+      `${citation.citedIn} cites ${citation.resolvesIn} for "${citation.anchor}", which is not there any more`,
+    )
+  }
+
+  // And no line-numbered citation has crept back into the paragraph that had one.
+  const cadenceComment = read('lib/domain/accounting/unrecorded-posted-document.ts')
+  assert.doesNotMatch(
+    cadenceComment,
+    /help-docs\/[\w-]+\.md:\d+|lib\/cron-jobs\/xero\.ts:\d+/,
+    'a file:line citation is back in unrecorded-posted-document.ts — cite a greppable anchor instead',
+  )
+})
