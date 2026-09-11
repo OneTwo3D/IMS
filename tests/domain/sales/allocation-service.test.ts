@@ -120,7 +120,17 @@ mock.module('@/lib/accounting', {
       // the posting context: a connector that does not post this type writes nothing and throws
       // nothing, exactly as `getAccountingPostingContextFor` returning null does.
       const connector = params.connector ?? activeAccountingConnector?.id ?? null
-      if (!connector || !accountingConnectorsThatPost.has(connector)) return false
+      if (!connector) return false
+      // o3d-i0o6 r7 (Codex round 6, HIGH 1) — AND THE PINNED LEDGER MUST STILL BE THE ACTIVE ONE.
+      //
+      // THIS DOUBLE WAS THE MASK. It modelled `<connector>_sync_enabled` (accountingConnectorsThatPost)
+      // and nothing else, which is exactly the gate production asked and exactly the gate that is
+      // insufficient: the active connector comes from the PLUGIN flags, the sync toggle is a separate
+      // setting a switch does not touch, so a pin to a retired ledger passed. Modelled here because a
+      // fixture that answers a question production no longer asks cannot fail when production is
+      // wrong — the whole of HIGH 1 was invisible to this file.
+      if (params.connector && params.connector !== activeAccountingConnector?.id) return false
+      if (!accountingConnectorsThatPost.has(connector)) return false
       accountingSyncRows.push({ ...params, connector })
       return true
     },
@@ -5516,7 +5526,27 @@ test('o3d-i0o6: NOTHING is credited when the ledger this credit would land in is
 // against the refund's open balance. The reversal is now PINNED to the connector the verdict names.
 // ---------------------------------------------------------------------------------------------
 
-test('o3d-i0o6 r2: a connector that switches after the proof cannot move the credit to the other ledger', async () => {
+test('o3d-i0o6 r7: a connector that switches after the proof queues NOTHING — and claims no relief', async () => {
+  // r2 WROTE THIS TEST THE OTHER WAY ROUND, and r7 (Codex round 6, HIGH 1) reverses its assertion.
+  //
+  // r2's finding was real and is unchanged: an UNPINNED enqueue here writes a QuickBooks credit
+  // against a Xero debit — money out of an account that never held it. The pin fixed that. What r2
+  // then asserted was that the pinned row IS WRITTEN, to Xero, and that £16 of relief is recorded
+  // against it. Both halves are the defect r7 closes:
+  //
+  //   `xero_sync_enabled` is a different setting from `plugin_xero_enabled`, and a switch moves only
+  //   the second. So the pinned enqueue passed its own gate and wrote a PENDING Xero row, while
+  //   `app/api/cron/accounting-sync` had already taken the QuickBooks branch and returned. Nothing
+  //   SCHEDULED drains it. `assertAllocationReversalQueued` then asked the database for the row —
+  //   the right question — found it, and the caller added £16 to `allocationReversalAmount`, which
+  //   is what a later refund nets its open Allocated Inventory balance against. Unposted pounds read
+  //   as relief; every later refund under-credits Allocated Inventory by that much.
+  //
+  // The pin still does the job r2 gave it — it is what stops the credit landing in QuickBooks — but
+  // it may not also license a write to a ledger nothing scheduled is servicing. See
+  // `pinnedLedgerIsServiced` in lib/accounting.ts for why this refuses rather than queueing and
+  // declining to count it (the manual Sync button can still drain such a row, so not counting it
+  // would create the symmetric double-credit).
   const state = withA2Journal(shrunkState({ lineQty: 6, record: POSTED_TEN_AT_FOUR }), { status: 'SYNCED' })
   resetAccountingQueue()
   // The setting moves to quickbooks the instant the proof has read it — the window nothing closes.
@@ -5524,15 +5554,42 @@ test('o3d-i0o6 r2: a connector that switches after the proof cannot move the cre
 
   await allocateSalesOrder(createClient(state), { orderId: 'order-1' })
 
-  assert.equal(accountingSyncRows.length, 1, 'the reversal is still raised — the debit is proved and xero still posts')
-  assert.equal(
-    accountingSyncRows[0].connector,
-    'xero',
-    'and it is written in the books A2 debited, not in whichever connector was active by the time the '
-    + 'enqueue ran. Unpinned, this row is a quickbooks credit against a xero debit: money out of an '
-    + 'account that never held it, and the xero debit still standing',
+  assert.equal(queuedAccountingSyncs.length, 1, 'the enqueue was attempted, pinned to the proved ledger')
+  assert.equal(queuedAccountingSyncs[0].connector, 'xero', 'and to xero — never to whichever connector is active now')
+  assert.deepEqual(
+    accountingSyncRows,
+    [],
+    'but NOTHING was written: xero is no longer the active connector, so no scheduled drain services '
+    + 'the queue this row would sit in',
   )
+  assert.equal(
+    state.order.allocationReversalAmount ?? 0,
+    0,
+    'and no relief is claimed. £16 recorded here against an unposted row is £16 a later refund nets '
+    + 'off its open Allocated Inventory balance and never credits back',
+  )
+  const dropped = activityLogWrites.filter((row) => row.action === 'allocation_reversal_unqueued')
+  assert.equal(dropped.length, 1, 'the amount is reported for a human to post by hand instead')
+  assert.match(String(dropped[0].description), /£16\.00/)
+})
+
+test('o3d-i0o6 r7: THE CONTROL — no switch, and the reversal is queued and its relief recorded', async () => {
+  // The guard must be a narrowing, not a blanket refusal: the same order, the same proof, with the
+  // connector left where it was, still raises the credit on xero and still records the £16 of relief.
+  // Without this the test above would pass for a fix that simply stopped raising reversals.
+  const state = withA2Journal(shrunkState({ lineQty: 6, record: POSTED_TEN_AT_FOUR }), { status: 'SYNCED' })
+  resetAccountingQueue()
+
+  await allocateSalesOrder(createClient(state), { orderId: 'order-1' })
+
+  assert.equal(accountingSyncRows.length, 1, 'the reversal IS raised when the proved ledger is still the active one')
+  assert.equal(accountingSyncRows[0].connector, 'xero')
   assert.equal(state.order.allocationReversalAmount, 16, 'and the relief recorded matches the row that was written')
+  assert.deepEqual(
+    activityLogWrites.filter((row) => row.action === 'allocation_reversal_unqueued'),
+    [],
+    'and nothing is reported as un-queued',
+  )
 })
 
 test('o3d-i0o6 r2: a switch AWAY from the proved ledger queues nothing and claims NO relief', async () => {

@@ -16,7 +16,7 @@ import type { Prisma } from '@/app/generated/prisma/client'
 // `dailyBatchRecreateVerdict` (lib/connectors/xero/daily-sync.ts, and the QuickBooks twin) reads its
 // `rows.length === 0` arm as "the journal never posted" and re-raises it — which a deleted SYNCED
 // batch row would turn into a DUPLICATE JOURNAL. It does not, because scjz.36 already bounded the
-// recreate sweep to the same retention window: `recreateJournaledDateFilter`
+// recreate sweep to the same retention window: `recreateRetentionWindow`
 // (lib/domain/accounting/daily-batch-retention.ts) restricts its candidates to stage stamps at or
 // after the cutoff, and a batch log is never created BEFORE the date it is staged for, so any log
 // old enough to be deleted (`createdAt < cutoff`) belongs to a stage date the sweep has already

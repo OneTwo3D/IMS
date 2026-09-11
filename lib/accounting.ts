@@ -126,6 +126,53 @@ async function getActiveAccountingConnectorId(): Promise<AccountingConnectorInfo
   return null
 }
 
+/**
+ * o3d-i0o6 r7 (Codex round 6, HIGH 1) — A PIN NAMES THE LEDGER A CREDIT BELONGS TO. IT SAYS NOTHING
+ * ABOUT WHETHER THAT LEDGER IS STILL BEING SERVICED, AND BOTH ENQUEUES ASKED NEITHER QUESTION.
+ *
+ * Rounds 2-6 built the pin to answer ONE question: which books does this credit belong in? The
+ * enqueue then asked a THIRD question — is `<connector>_sync_enabled` on? — and treated a yes as
+ * licence to write. Those are not the same fact. The active accounting connector is resolved from
+ * the PLUGIN flags (`getActiveAccountingConnectorId`, Xero-first); the per-connector sync toggle is
+ * a separate setting that a switch does not touch. So after Xero -> QuickBooks, a reversal pinned to
+ * Xero — because that is where its debit was proved to stand — passed `xero_sync_enabled === 'true'`
+ * and a PENDING Xero row was written, while `app/api/cron/accounting-sync` had already taken the
+ * QuickBooks branch and returned. Nothing scheduled drains it.
+ *
+ * WHY THAT COSTS MONEY RATHER THAN JUST BEING UNTIDY. `assertAllocationReversalQueued` asks the
+ * database for the row — the right question, because the enqueue's boolean lies — and the stranded
+ * row answers yes. The orphan path then adds the amount to `SalesOrder.allocationReversalAmount`,
+ * which is exactly what a later refund nets its open Allocated Inventory balance against. Unposted
+ * pounds are read as relief, and every later refund under-credits Allocated Inventory by that much.
+ *
+ * DECIDED: REFUSE THE ENQUEUE, rather than queue it and stop counting it as relief.
+ *
+ *   Refusing is the only one of the two that is safe in BOTH directions. A queued row on a
+ *   non-active connector is NOT undrainable — `triggerXeroSync` / `triggerQuickBooksSync`, the
+ *   manual Sync buttons, gate on `<connector>_sync_enabled` AND NOTHING ELSE and never resolve the
+ *   active connector at all (this is established, and pinned by a test, in
+ *   lib/domain/accounting/sync-row-claimability.ts). So "a row nobody will process" is a claim about
+ *   the cron, not about the row: one press posts it. Declining to count such a row as relief would
+ *   therefore create the SYMMETRIC error — the credit posts in Xero, IMS never records the relief,
+ *   and the later refund credits the same pounds a second time.
+ *
+ *   Refusing has no such twin. Nothing is written, `assertAllocationReversalQueued` finds no row,
+ *   `allocationReversalAmount` is not moved, and the ERROR-level activity record that already exists
+ *   for the un-queued case names the amount and both account codes for a human. The debit stays
+ *   open, which is true, and the refund's own residue still reverses it.
+ *
+ * `refused`, NEVER `not-configured`. `not-configured` means "no counterpart will ever exist, so
+ * nothing is outstanding" and is the ONE no-op the refund obligation ledger allows to settle an
+ * obligation. This posting is still owed — it just may not go here, now — so it must leave the
+ * obligation standing and `accountingRetryRequired` set.
+ *
+ * A NO-OP FOR EVERY UNPINNED CALLER by construction: an unpinned enqueue takes its connector FROM
+ * `getActiveAccountingConnectorId`, so the equality it would be asked to satisfy already holds.
+ */
+async function pinnedLedgerIsServiced(connector: AccountingConnectorInfo['id']): Promise<boolean> {
+  return (await getActiveAccountingConnectorId()) === connector
+}
+
 export async function getActiveAccountingConnectorInfo(): Promise<AccountingConnectorInfo | null> {
   const connector = await getActiveAccountingConnectorId()
   if (!connector) return null
@@ -247,11 +294,24 @@ export async function queueAccountingSync(params: {
    *
    * Deliberately not defaulted: every existing caller keeps the active-connector resolution by
    * simply not passing it.
+   *
+   * o3d-i0o6 r7 — AND THE PIN IS HONOURED ONLY WHILE THE NAMED CONNECTOR IS THE ACTIVE ONE. See
+   * `pinnedLedgerIsServiced`: naming the ledger a credit belongs to does not establish that the
+   * ledger is still being serviced, and a row written into a queue no scheduled drain reads is one
+   * `assertAllocationReversalQueued` finds and counts as relief. Otherwise: `refused`, which leaves
+   * the posting owed.
    */
   connector?: AccountingConnectorInfo['id']
 }): Promise<AccountingEnqueueOutcome> {
   const connector = params.connector ?? await getActiveAccountingConnectorId()
   if (!connector) return { queued: false, reason: 'not-configured', connector: null }
+  // o3d-i0o6 r7 — AND THE PINNED LEDGER MUST STILL BE THE ONE THIS SYSTEM IS RUNNING. See
+  // `pinnedLedgerIsServiced`: the pin establishes WHICH books the posting belongs in, the sync
+  // toggle establishes whether that connector posts at all, and neither of them establishes that
+  // the scheduled drain is this connector's. Refused, not `not-configured`: the posting is owed.
+  if (params.connector && !await pinnedLedgerIsServiced(params.connector)) {
+    return { queued: false, reason: 'refused', connector }
+  }
   if (isFxGainLossJournalSuppressed(connector, params.type)) {
     return { queued: false, reason: 'not-configured', connector }
   }
@@ -465,6 +525,14 @@ export async function queueAccountingSyncTx(
   // already queued. Callers that must stay consistent with the queue decision (e.g. the
   // COGS subledger ledger writes, bcz9.2/bcz9.4) should record based on THIS result, not
   // a separate settings recheck — avoiding a TOCTOU if the connector/setting flips.
+  // o3d-i0o6 r7 (Codex round 6, HIGH 1) — THE PINNED LEDGER MUST STILL BE THE ACTIVE ONE. Checked
+  // BEFORE the posting context, because `getAccountingPostingContextFor` answers from the named
+  // connector's own sync toggle and would say "yes, it posts" for a connector the cron stopped
+  // servicing when the plugin was switched away. See `pinnedLedgerIsServiced` for why this refuses
+  // rather than queueing-and-not-counting. `refused`, so the obligation stays owed.
+  if (params.connector && !await pinnedLedgerIsServiced(params.connector)) {
+    return answer({ queued: false, reason: 'refused' }, params.connector)
+  }
   // o3d-i0o6: the PIN wins where one was given. `getAccountingPostingContextFor` asks the same
   // question of the named connector that `getAccountingPostingContext` asks of whichever is active,
   // so a pinned caller gets the same verdict about the ledger it proved against — and a `null` here

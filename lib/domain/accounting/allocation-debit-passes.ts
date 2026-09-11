@@ -41,6 +41,7 @@
  */
 
 import { addMoney, roundQuantity, toDecimal, type DecimalInput } from '@/lib/domain/math/decimal'
+import { parseDailyBatchReference } from '@/lib/domain/accounting/daily-batch-reference'
 
 /** One Group A2 pass's own contribution to an order's cumulative Allocated Inventory debit. */
 export type AllocationDebitPass = {
@@ -244,8 +245,14 @@ export type AllocationDebitBatchRow = {
   allocationBatchAmount: { toString(): string } | number | null
   /** The raw `SalesOrder.allocationBatchPasses` JSON; parsed here, never trusted unparsed. */
   allocationBatchPasses: unknown
-  /** The referenceId of the batch this order is CURRENTLY stamped with — the one being rebuilt. */
+  /**
+   * The referenceId of the batch this order is CURRENTLY stamped with — the LATEST pass's, and
+   * therefore NOT on its own the set of batches this order contributed to (o3d-i0o6 r7). It is one
+   * of the recreate targets {@link allocationDebitRecreateTargets} enumerates, never the filter.
+   */
   inventoryAllocatedBatchRef: string | null
+  /** The stage stamp beside it, for the legacy derived-key bucket. */
+  inventoryAllocatedDate?: Date | null
   /** For the refusal text only; never part of a decision. */
   orderNumber?: string | null
   id?: string | null
@@ -297,6 +304,19 @@ function passIsOfLedger(pass: AllocationDebitPass, ledger: AllocationDebitBatchL
 export function allocationDebitShareOfBatch(
   order: AllocationDebitBatchRow,
   ledger: AllocationDebitBatchLedger,
+  /**
+   * THE BATCH BEING REBUILT (o3d-i0o6 r7, Codex round 6 HIGH 2).
+   *
+   * Was `order.inventoryAllocatedBatchRef`, read from the row inside this function. That column is
+   * the LATEST pass's stamp and the A2 writer OVERWRITES it on every pass, so keying the share off
+   * it discarded every earlier pass — the exact substitution of "the latest pass" for "the whole
+   * debit" the pass history was added to end, reintroduced by the reader.
+   *
+   * It is now a PARAMETER, so the caller enumerates the batches an order actually contributed to
+   * (see {@link allocationDebitRecreateTargets}) and asks about each one. `null` is the legacy
+   * derived-key bucket — a row with no persisted reference on any pass — and is refused below.
+   */
+  batchRef: string | null,
 ): AllocationDebitBatchShare {
   const recorded = batchRowAmount(order.allocationBatchAmount)
   // NO RECORDED DEBIT, NO SHARE — and no refusal either. A2 nulls this column on the paths that
@@ -320,17 +340,16 @@ export function allocationDebitShareOfBatch(
       reason: `${describeBatchRow(order)} records a cumulative A2 debit of £${recorded.toFixed(2)} but its ${passes.length} recorded pass(es) account for £${passTotal.toFixed(2)}, so how much of it this batch carried cannot be established`,
     }
   }
-  // THE STAMP IS THE BATCH BEING REBUILT. The sweep folds this row into the bucket for the reference
-  // persisted beside its stamp, so the passes that named THAT reference are this order's share of
-  // it. A row with no persisted reference is a pre-column row: it is bucketed by a key derived from
-  // its stage stamp, which no pass can be matched against.
-  if (!order.inventoryAllocatedBatchRef) {
+  // THE CALLER NAMES THE BATCH BEING REBUILT, and the passes that named THAT reference are this
+  // order's share of it. A bucket with no persisted reference is a pre-column row: it is bucketed by
+  // a key derived from its stage stamp, which no pass can be matched against.
+  if (!batchRef) {
     return {
       kind: 'unattributed',
       reason: `${describeBatchRow(order)} records a cumulative A2 debit of £${recorded.toFixed(2)} and names no batch reference, so which batch carried which part of it cannot be established`,
     }
   }
-  const named = passes.filter((pass) => pass.batchRef === order.inventoryAllocatedBatchRef)
+  const named = passes.filter((pass) => pass.batchRef === batchRef)
   // SAME LEDGER, SAME BATCH, ANOTHER ACCOUNT — the one arm that is genuinely ambiguous rather than
   // simply somebody else's. The rebuild would debit the account configured TODAY while the pass
   // that owed the pounds names a different one in the SAME books, so neither figure describes the
@@ -509,22 +528,97 @@ export function foldA2RecreateOrder(
   summary: A2RecreateSummary,
   order: AllocationDebitBatchRow & { id: string },
   ledger: AllocationDebitBatchLedger,
+  /** The batch this bucket is, from {@link allocationDebitRecreateTargets} (o3d-i0o6 r7). */
+  batchRef: string | null,
 ): void {
   summary.orderCount += 1
-  const share = allocationDebitShareOfBatch(order, ledger)
+  const share = allocationDebitShareOfBatch(order, ledger, batchRef)
   if (share.kind === 'unattributed') {
     summary.unattributed.push(share.reason)
     return
   }
   summary.total += share.amount
   summary.foreign.push(...share.foreign)
-  if (order.inventoryAllocatedBatchRef) {
+  if (batchRef) {
     summary.orders.push({
       id: order.id,
-      batchRef: order.inventoryAllocatedBatchRef,
+      batchRef,
       allocationBatchPasses: order.allocationBatchPasses,
     })
   }
+}
+
+/** One batch an order contributed A2 pounds to, as the recreate sweep must bucket it. */
+export type AllocationDebitRecreateTarget = {
+  /** The batch's own referenceId, or null for the legacy stamp-derived bucket. */
+  batchRef: string | null
+  /** What `foldDailyBatchRow` derives its fallback key and date from. */
+  stagedAt: Date | null
+}
+
+/**
+ * o3d-i0o6 r7 (Codex round 6, HIGH 2) — EVERY BATCH THIS ORDER PUT POUNDS INTO, NOT JUST THE LAST.
+ *
+ * THE DEFECT. The recreate sweep bucketed each staged order by `inventoryAllocatedBatchRef` alone.
+ * That column is written by EVERY A2 pass and describes only the latest one, so an order with a
+ * cumulative debit across two batches appeared in exactly one bucket — the newest — and the earlier
+ * batch existed nowhere in the run:
+ *
+ *   Day one, on Xero: batch R1, journal J1, £50.
+ *   The declared rewrite un-stages the order; the £50 stands.
+ *   Day two, after a switch to QuickBooks: batch R2, journal J2, £25. The order is re-stamped R2.
+ *
+ *   J1 now goes missing. NEITHER sweep does anything about it. Xero's builds no R1 bucket at all
+ *   (the order's stamp says R2), so there is nothing to rebuild and nothing to report; QuickBooks'
+ *   builds only R2, and `allocationDebitShareOfBatch` filtered the passes to R2 as well, so the Xero
+ *   pass was not in `foreign` either. Round 6 added "report on every run" for pounds nobody will
+ *   rebuild, and it was blind in precisely the cumulative cross-ledger history the whole branch
+ *   exists to handle, because the reader it hangs off keyed on a latest-pass column.
+ *
+ * THE FIX IS TO ASK THE HISTORY WHICH BATCHES EXIST, which is the same move r3 made for the amount
+ * and r4 made for the share. Every distinct `batchRef` the passes name is a target; the order is
+ * folded into each, and each asks for ITS OWN share.
+ *
+ * THE CURRENT STAMP IS ALWAYS A TARGET TOO, and not as a belt-and-braces duplicate: it is the ONLY
+ * target for a row whose history is absent or illegible, and folding those rows is what produces the
+ * `unattributed` refusal that keeps a legacy batch loud instead of silently unrebuilt.
+ *
+ * RETENTION BOUNDS THE HISTORICAL ONES. The sweep's own query bounds the ORDER by its current stage
+ * stamp; an earlier pass can be older than that. Beyond the cutoff a SYNCED daily-batch log has been
+ * hard-deleted, so "missing" cannot be told from "posted then pruned" and a rebuild would re-post it
+ * (scjz.36) — the same reason the query is bounded at all. A historical target is therefore dropped
+ * when the BATCH'S OWN DATE falls before the cutoff. That date is read from the batch REFERENCE and
+ * never from the pass's `at`, which is documented as narrative and used in no decision — and the
+ * reference is the thing the probe and the rebuild are keyed on anyway. Midnight UTC of that day is
+ * compared against the cutoff, so a batch dated ON the cutoff day is dropped: erring towards not
+ * rebuilding is the safe direction here, because the cost of the other one is a duplicate journal.
+ * The current stamp is never dropped: the sweep's own query already admitted it.
+ *
+ * A pass whose `batchRef` does not parse as an A2 reference names a batch this codebase cannot
+ * identify — it can be probed for under no id and dated to no day — so it yields no target. Today's
+ * writers cannot produce one: both stamp the exact referenceId they hand to `createPendingSyncLog`,
+ * and a row from before the column existed has no history at all (which is the `unattributed` arm,
+ * reached through the current stamp above).
+ */
+export function allocationDebitRecreateTargets(
+  order: AllocationDebitBatchRow,
+  options: { retentionCutoff: Date | null },
+): AllocationDebitRecreateTarget[] {
+  const targets: AllocationDebitRecreateTarget[] = [{
+    batchRef: order.inventoryAllocatedBatchRef,
+    stagedAt: order.inventoryAllocatedDate ?? null,
+  }]
+  const seen = new Set<string>(order.inventoryAllocatedBatchRef ? [order.inventoryAllocatedBatchRef] : [])
+  for (const pass of parseAllocationDebitPasses(order.allocationBatchPasses) ?? []) {
+    if (!pass.batchRef || seen.has(pass.batchRef)) continue
+    const parsed = parseDailyBatchReference(pass.batchRef, 'A2')
+    if (!parsed) continue
+    const batchDate = new Date(`${parsed.date}T00:00:00.000Z`)
+    if (options.retentionCutoff && batchDate.getTime() < options.retentionCutoff.getTime()) continue
+    seen.add(pass.batchRef)
+    targets.push({ batchRef: pass.batchRef, stagedAt: batchDate })
+  }
+  return targets
 }
 
 /**
@@ -553,36 +647,77 @@ export function foldA2RecreateOrder(
  *
  * Both sweeps call this, because the answer must not depend on which one happens to be running.
  */
+/**
+ * o3d-i0o6 r7 (Codex round 6, MEDIUM) — WHAT IS KNOWN ABOUT A FOREIGN PASS'S JOURNAL.
+ *
+ *   'live'       PENDING / PROCESSING / SYNCED. Queued, in flight, or in the ledger: nothing owed.
+ *   'absent'     no row at all, or the pass named no journal to begin with. Inside the retention
+ *                window — which is the only window this sweep runs in — a daily-batch log that is
+ *                absent never posted, so posting it by hand is SAFE.
+ *   'unsettled'  a row exists and is FAILED or CANCELLED. NOT the same fact as absent, and this is
+ *                the finding: the probe selected only the three live statuses, so a FAILED row came
+ *                back indistinguishable from a deleted one and the report told an operator the
+ *                journal was "not on record" and to post it by hand. A status is not a posting. A
+ *                FAILED attempt can have reached the remote ledger and failed afterwards (the
+ *                unrecorded-post case this codebase has met before), and CANCELLED is a local
+ *                decision that says nothing about the remote side at all. Following that advice can
+ *                post a SECOND journal for pounds already in the books.
+ */
+export type ForeignJournalState = 'live' | 'absent' | 'unsettled'
+
 export function allocationDebitForeignLedgerReports(input: {
   /** The batch being rebuilt, for the report. */
   referenceId: string
   foreign: readonly AllocationDebitForeignPass[]
-  /** Whether the journal a foreign pass named is still a live row in its OWN ledger. */
-  journalIsLive: (syncLogId: string | null) => boolean
+  /**
+   * What is known about the journal a foreign pass named, in its OWN ledger — see
+   * {@link ForeignJournalState}. r6 asked this as a boolean (`journalIsLive`), which folded
+   * 'unsettled' into 'absent' and produced an unsafe recommendation for it.
+   */
+  journalState: (syncLogId: string | null) => ForeignJournalState
   /** The connector whose daily-batch sweep the cron runs, or null when none runs at all. */
   scheduledSweepConnector: string | null
 }): string[] {
-  const abandoned = input.foreign.filter((pass) => (
-    !input.journalIsLive(pass.syncLogId) && pass.connector !== input.scheduledSweepConnector
-  ))
+  const abandoned = input.foreign
+    .map((pass) => ({ pass, state: input.journalState(pass.syncLogId) }))
+    .filter((entry) => entry.state !== 'live' && entry.pass.connector !== input.scheduledSweepConnector)
   if (abandoned.length === 0) return []
-  const byConnector = new Map<string, AllocationDebitForeignPass[]>()
-  for (const pass of abandoned) {
-    const entries = byConnector.get(pass.connector)
-    if (entries) entries.push(pass)
-    else byConnector.set(pass.connector, [pass])
+  const byConnector = new Map<string, Array<{ pass: AllocationDebitForeignPass; state: ForeignJournalState }>>()
+  for (const entry of abandoned) {
+    const entries = byConnector.get(entry.pass.connector)
+    if (entries) entries.push(entry)
+    else byConnector.set(entry.pass.connector, [entry])
   }
   return [...byConnector].map(([connector, entries]) => {
-    const total = entries.reduce((sum, entry) => sum + entry.amount, 0)
+    const total = entries.reduce((sum, entry) => sum + entry.pass.amount, 0)
     const detail = entries
-      .map((entry) => `${entry.order} £${entry.amount.toFixed(2)}${entry.syncLogId ? ` under journal ${entry.syncLogId}` : ', which raised no journal at all'} (account ${entry.accountCode})`)
+      .map(({ pass, state }) => (
+        `${pass.order} £${pass.amount.toFixed(2)}`
+        + (pass.syncLogId
+          ? ` under journal ${pass.syncLogId}${state === 'unsettled' ? ', whose row is on record but never reached SYNCED' : ''}`
+          : ', which raised no journal at all')
+        + ` (account ${pass.accountCode})`
+      ))
       .join('; ')
+    // AMBIGUOUS IF ANY OF THEM IS. One unsettled row in the group is enough to make "post it by
+    // hand" unsafe for the group, and the safe instruction is the one that costs an operator a look
+    // in the other ledger rather than a duplicate journal.
+    const ambiguous = entries.some((entry) => entry.state === 'unsettled')
+    const standing = ambiguous
+      ? `and that journal did NOT settle in IMS: ${detail}. A row that is FAILED or CANCELLED is not `
+        + 'evidence that nothing reached the ledger — a failed attempt can have posted before it '
+        + 'failed, and a cancellation is a local decision about the row, not about the remote books'
+      : `and that journal is NOT on record: ${detail}`
+    const remedy = ambiguous
+      ? `CHECK ${connector} FIRST for a journal covering this batch, and post DR Allocated Inventory `
+        + `by hand there ONLY if it is genuinely absent`
+      : `Post it in ${connector} by hand from the orders' own pass history`
     return (
       `Daily batch DAILY_BATCH_INVENTORY_ALLOC not recreated in full: ${input.referenceId} — £${total.toFixed(2)} of it `
-      + `was debited to Allocated Inventory on ${connector}, and that journal is NOT on record: ${detail}. `
+      + `was debited to Allocated Inventory on ${connector}, ${standing}. `
       + 'This sweep must not rebuild another ledger\'s pounds into its own accounts — that is a duplicate '
       + `debit no refund could ever reverse — and ${input.scheduledSweepConnector ? `the daily batch runs ${input.scheduledSweepConnector}'s sweep, not ${connector}'s` : 'no daily-batch sweep is scheduled at all'}, `
-      + `so nothing will ever raise it. Post it in ${connector} by hand from the orders' own pass history, `
+      + `so nothing will ever raise it. ${remedy}, `
       + `or re-enable ${connector}'s daily batch long enough for its own sweep to rebuild it.`
     )
   })

@@ -46,7 +46,7 @@ import {
   isFullyShippedNetOfRefunds,
   batchContainsFinalUnjournaledShipment,
 } from '@/lib/domain/accounting/deferred-trueup'
-import { recreateJournaledDateFilter } from '@/lib/domain/accounting/daily-batch-retention'
+import { recreateRetentionWindow } from '@/lib/domain/accounting/daily-batch-retention'
 import {
   dailyBatchLiveRefs,
   foldDailyBatchRow,
@@ -78,12 +78,14 @@ import { acquirePinnedAdvisoryLockOrNull } from '@/lib/db/pinned-advisory-lock'
 import {
   allocationDebitForeignLedgerReports,
   allocationDebitRecreateRefusal,
+  allocationDebitRecreateTargets,
   buildAllocationDebitOrderUpdate,
   foldA2RecreateOrder,
   newA2RecreateSummary,
   repointAllocationDebitPassesToRecreatedJournal,
   type A2RecreateSummary,
   type AllocationDebitBatchLedger,
+  type ForeignJournalState,
 } from '@/lib/domain/accounting/allocation-debit-passes'
 const QBO_CONNECTOR = 'quickbooks'
 const DAILY_BATCH_TYPES = [
@@ -351,7 +353,9 @@ export async function recreateMissingDailyBatchLogs(settings: Awaited<ReturnType
   // scjz.36: only recreate within the sync-log retention window — beyond it, SYNCED
   // daily-batch logs are pruned by data-retention, so a "missing" log can't be told
   // apart from one that already posted, and rebuilding would double-post the journal.
-  const journaledDateFilter = await recreateJournaledDateFilter()
+  // o3d-i0o6 r7: the cutoff as well as the filter. The filter bounds which ORDERS are read;
+  // the cutoff bounds which of the batches their pass histories name may be rebuilt.
+  const { cutoff: retentionCutoff, dateFilter: journaledDateFilter } = await recreateRetentionWindow()
   const orphanA1Orders = await db.salesOrder.findMany({
     where: { revenueDeferredDate: journaledDateFilter },
     select: { revenueDeferredDate: true, revenueDeferredBatchRef: true, unearnedRevenueAmount: true },
@@ -406,16 +410,22 @@ export async function recreateMissingDailyBatchLogs(settings: Awaited<ReturnType
   }
   const a2Batches = new Map<string, DailyBatchRecreateBucket<A2RecreateSummary>>()
   for (const order of orphanA2Orders) {
-    const summary = foldDailyBatchRow(
-      a2Batches,
-      'A2',
-      { stagedAt: order.inventoryAllocatedDate, persistedRef: order.inventoryAllocatedBatchRef },
-      newA2RecreateSummary,
-    )
-    if (!summary) continue
-    // o3d-i0o6 r4/r5 — THIS BATCH'S SHARE ON THIS LEDGER, never the running total and never another
-    // ledger's. Identical to the Xero twin because it IS the Xero twin: one shared fold.
-    foldA2RecreateOrder(summary, order, a2Ledger)
+    // o3d-i0o6 r7 (Codex round 6, HIGH 2) — ONE BUCKET PER BATCH THIS ORDER PUT POUNDS INTO, read
+    // from the PASS HISTORY. Bucketing on `inventoryAllocatedBatchRef` alone made the latest pass
+    // stand for the whole debit again: an earlier batch whose journal went missing existed in no
+    // bucket, so no sweep rebuilt it and no sweep reported it either.
+    for (const target of allocationDebitRecreateTargets(order, { retentionCutoff })) {
+      const summary = foldDailyBatchRow(
+        a2Batches,
+        'A2',
+        { stagedAt: target.stagedAt, persistedRef: target.batchRef },
+        newA2RecreateSummary,
+      )
+      if (!summary) continue
+      // o3d-i0o6 r4/r5 — THIS BATCH'S SHARE ON THIS LEDGER, never the running total and never
+      // another ledger's. Identical to the Xero twin because it IS the Xero twin: one shared fold.
+      foldA2RecreateOrder(summary, order, a2Ledger, target.batchRef)
+    }
   }
 
   const bBatches = new Map<string, DailyBatchRecreateBucket<{ shipmentCount: number; revenue: number; cogs: number }>>()
@@ -458,18 +468,30 @@ export async function recreateMissingDailyBatchLogs(settings: Awaited<ReturnType
   // Identical to the Xero twin because it IS the same question: the cron runs ONE sweep, so another
   // ledger's missing A2 journal is only somebody else's problem while that somebody actually runs.
   const foreignPasses = [...a2Batches.values()].flatMap((bucket) => bucket.summary.foreign)
-  const liveForeignJournalIds = new Set<string>()
+  // o3d-i0o6 r7 (Codex round 6, MEDIUM) — EVERY STATUS, NOT JUST THE LIVE THREE. The probe used to
+  // filter `status in (PENDING, PROCESSING, SYNCED)`, so a FAILED or CANCELLED row came back exactly
+  // like a deleted one and the report told an operator the journal was not on record and to post it
+  // by hand. Neither status establishes that nothing reached the remote ledger, so that advice can
+  // duplicate a posting. The status is carried instead, and the report distinguishes the two.
+  const foreignJournalStatusById = new Map<string, string>()
   let scheduledSweepConnector: string | null = null
   if (foreignPasses.length > 0) {
     scheduledSweepConnector = (await resolveScheduledDailyBatchSweep()).connector
     const foreignJournalIds = [...new Set(foreignPasses.map((pass) => pass.syncLogId).filter((id): id is string => !!id))]
     if (foreignJournalIds.length > 0) {
       const rows = await db.accountingSyncLog.findMany({
-        where: { id: { in: foreignJournalIds }, status: { in: [...LIVE_DAILY_BATCH_STATUSES] } },
-        select: { id: true },
+        where: { id: { in: foreignJournalIds } },
+        select: { id: true, status: true },
       })
-      for (const row of rows) liveForeignJournalIds.add(row.id)
+      for (const row of rows) foreignJournalStatusById.set(row.id, row.status)
     }
+  }
+  const foreignJournalState = (syncLogId: string | null): ForeignJournalState => {
+    // A pass that named no journal raised none: unambiguously nothing in the other ledger.
+    if (syncLogId == null) return 'absent'
+    const status = foreignJournalStatusById.get(syncLogId)
+    if (status === undefined) return 'absent'
+    return (LIVE_DAILY_BATCH_STATUSES as readonly string[]).includes(status) ? 'live' : 'unsettled'
   }
 
   for (const { referenceId, date, summary, ...batch } of a2Batches.values()) {
@@ -477,7 +499,7 @@ export async function recreateMissingDailyBatchLogs(settings: Awaited<ReturnType
     refusals.push(...allocationDebitForeignLedgerReports({
       referenceId,
       foreign: summary.foreign,
-      journalIsLive: (syncLogId) => syncLogId != null && liveForeignJournalIds.has(syncLogId),
+      journalState: foreignJournalState,
       scheduledSweepConnector,
     }))
     // ROUNDED, like the live writer's own guard: a batch whose total rounds to £0.00 raised no
