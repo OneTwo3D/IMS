@@ -24,11 +24,13 @@ import { loadFulfillmentProductGraph } from '@/lib/products/kit-fulfillment'
 import { lineFulfillmentRequirements } from '@/lib/products/fulfillment-requirement-snapshot'
 import { isStockTrackedProductType } from '@/lib/domain/inventory/backorder-policy'
 import {
+  collapseUnplacedCreditDecimal,
   creditPlacement,
   marginFigureBoundDecimal,
   netLinearFigureBoundDecimal,
   refundTotalsBasis,
   shareFigureBound,
+  type CollapsedUnplacedCreditDecimal,
   type DerivedFigureBound,
 } from '@/lib/domain/sales/refund-basis-analytics'
 import {
@@ -525,12 +527,12 @@ function addUnplacedIntervals(a: UnplacedCreditInterval, b: UnplacedCreditInterv
  * handed straight to them and produces `indeterminate`; otherwise the credit provably cannot be
  * negative and the ceiling is the interval's upper end.
  */
-function unplacedCreditBound(interval: UnplacedCreditInterval): Prisma.Decimal {
-  return interval.lower.lt(0) ? interval.lower : interval.upper
+function unplacedCreditBound(interval: UnplacedCreditInterval): CollapsedUnplacedCreditDecimal {
+  return collapseUnplacedCreditDecimal(interval)
 }
 
 /** The bound input for the credit a figure on `basis` could not absorb. */
-function unplacedCredit(buckets: CreditBuckets, basis: 'NET' | 'GROSS'): Prisma.Decimal {
+function unplacedCredit(buckets: CreditBuckets, basis: 'NET' | 'GROSS'): CollapsedUnplacedCreditDecimal {
   return unplacedCreditBound(unplacedCreditInterval(buckets, basis))
 }
 
