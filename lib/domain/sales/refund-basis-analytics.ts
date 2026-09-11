@@ -1,4 +1,4 @@
-import { toDecimal, type DecimalInput } from '@/lib/domain/math/decimal'
+import { toDecimal, type Decimal, type DecimalInput } from '@/lib/domain/math/decimal'
 
 /**
  * o3d-lvk (analytics half): read the STAMPED refund basis in the sales-stats reports.
@@ -213,14 +213,10 @@ export function creditPlacement(
  * unplaced entry was negative at all, which is why a caller may still describe the result as the
  * width of the bound when the classification comes back `upper`.
  */
-export function unplacedCreditBoundFromParts(parts: ReadonlyArray<{ total: number; positive: number }>): number {
-  let lower = 0
-  let upper = 0
-  for (const part of parts) {
-    lower += part.total - part.positive
-    upper += part.positive
-  }
-  return lower < 0 ? lower : upper
+export function unplacedCreditBoundFromParts(
+  parts: ReadonlyArray<{ total: number; positive: number }>,
+): CollapsedUnplacedCredit {
+  return collapseUnplacedCredit(parts)
 }
 
 function round2(value: ReturnType<typeof toDecimal>): number {
@@ -241,8 +237,8 @@ function round2(value: ReturnType<typeof toDecimal>): number {
  * - `indeterminate`— the true figure may be either side of the published one. Publishing `≤` here
  *                    would be a FALSE CLAIM, which is worse than publishing no claim at all.
  */
-export { boundSuffix, netLinearFigureBound, type DerivedFigureBound } from '@/lib/domain/sales/derived-figure-bound'
-import type { DerivedFigureBound } from '@/lib/domain/sales/derived-figure-bound'
+export { boundSuffix, netLinearFigureBound, type CollapsedUnplacedCredit, type DerivedFigureBound } from '@/lib/domain/sales/derived-figure-bound'
+import { collapseUnplacedCredit, type CollapsedUnplacedCredit, type DerivedFigureBound } from '@/lib/domain/sales/derived-figure-bound'
 
 
 /**
@@ -290,8 +286,12 @@ export function marginFigureBound(params: {
    * Never used to decide WHETHER a bound exists — `basisComplete` does that. A sub-penny unstamped
    * credit rounds this to 0 while still bounding the figure, and reading existence off the amount
    * would publish that as exact.
+   *
+   * Branded for the reason `netLinearFigureBound`'s is (o3d-la3n r3): the ratio classifier reads
+   * this for its SIGN in exactly the same way, so handing it a hand-rolled `gross + unknown` would
+   * rebuild the same unsound rule one classifier over. It has to be minted from the parts.
    */
-  unplacedCredit: number
+  unplacedCredit: CollapsedUnplacedCredit
   /** False when ANY credit could not be placed on the net basis — the producers' existing flag. */
   basisComplete: boolean
 }): DerivedFigureBound {
@@ -339,17 +339,51 @@ export function marginFigureBound(params: {
  */
 export function netLinearFigureBoundDecimal(params: {
   basisComplete: boolean
-  unplacedCredit: DecimalInput
+  unplacedCredit: CollapsedUnplacedCreditDecimal
 }): DerivedFigureBound {
   if (params.basisComplete) return 'exact'
   return toDecimal(params.unplacedCredit).lt(0) ? 'indeterminate' : 'upper'
+}
+
+declare const COLLAPSED_UNPLACED_CREDIT_DECIMAL: unique symbol
+
+/**
+ * `CollapsedUnplacedCredit` FOR THE DECIMAL-PURE PRODUCERS, AND FOR THE SAME REASON (o3d-la3n r3).
+ *
+ * Branding only the float classifiers would have been a proof about the wrong door: `DecimalInput`
+ * admits a plain `number`, so `netLinearFigureBoundDecimal({ basisComplete, unplacedCredit: gross +
+ * unknown })` would have rebuilt the removed rule one function to the left, with no cast and no
+ * Decimal in sight. Both doors take a minted value or nothing.
+ *
+ * Type-only: at runtime this is the `Prisma.Decimal` it says it is.
+ */
+export type CollapsedUnplacedCreditDecimal = Decimal & {
+  readonly [COLLAPSED_UNPLACED_CREDIT_DECIMAL]: 'collapsed'
+}
+
+/**
+ * The one place a Decimal collapsed scalar is minted — from BOTH ENDPOINTS of a credit interval.
+ *
+ * The Decimal producers do not hold a list of buckets at the point they classify: Gross Margin adds
+ * the row interval to the off-row one before collapsing, so the mint has to accept an interval
+ * rather than parts. Both endpoints are still required, which is the property that matters: a
+ * caller holding only `refundsGrossBasis + refundsUnknownBasis` has one number and would have to
+ * invent the other.
+ *
+ * Below zero at the bottom means some unplaced entry was negative and no `≤` may be claimed;
+ * otherwise none was, and the ceiling is the top of the interval.
+ */
+export function collapseUnplacedCreditDecimal(
+  interval: { lower: Decimal; upper: Decimal },
+): CollapsedUnplacedCreditDecimal {
+  return (interval.lower.lt(0) ? interval.lower : interval.upper) as CollapsedUnplacedCreditDecimal
 }
 
 /** `marginFigureBound`'s case analysis, over Decimal. Same five branches, in the same order. */
 export function marginFigureBoundDecimal(params: {
   netRevenue: DecimalInput
   cogs: DecimalInput
-  unplacedCredit: DecimalInput
+  unplacedCredit: CollapsedUnplacedCreditDecimal
   basisComplete: boolean
 }): DerivedFigureBound {
   if (params.basisComplete) return 'exact'
