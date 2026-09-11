@@ -513,6 +513,13 @@ test('NON-VACUITY: the legal shapes resolve, and to DIFFERENT dependency sets', 
 async function workingClient(rows: { id: string; status: string }[]): Promise<{
   client: EmailOutboxHarnessClient
   store: Record<string, Record<string, unknown>>
+  /**
+   * THE DELEGATES THE MINT WAS GIVEN, kept because a minted client no longer holds them (r28): it
+   * holds frozen facades over methods captured at mint time. A test that needs a caller's delegate
+   * — to read it through an accessor, or to swap a method on it after the door — has to hold the
+   * original, which is the only thing a real caller has too.
+   */
+  delegates: { emailOutbox: Record<string, unknown>; emailSuppression: Record<string, unknown> }
 }> {
   const store: Record<string, Record<string, unknown>> = {}
   for (const row of rows) {
@@ -537,37 +544,39 @@ async function workingClient(rows: { id: string; status: string }[]): Promise<{
   const rowList: Record<string, unknown>[] = Object.values(store)
   const suppressions: Record<string, unknown>[] = []
   const witness = await witnessSymbol()
+  const delegates = {
+    emailOutbox: {
+      async findMany() {
+        return rowList
+          .filter((row) => row.status === 'PENDING')
+          .map((row) => ({ ...row })) as never
+      },
+      async updateMany(args: unknown) {
+        const { where, data } = args as { where: Record<string, unknown>; data: Record<string, unknown> }
+        const row = store[String(where.id)]
+        if (!row) return { count: 0 }
+        // Only the fencing columns matter for these proofs; the full predicate is exercised by
+        // tests/email-outbox-claim-fence.test.ts.
+        if ('lockedBy' in where && row.lockedBy !== where.lockedBy) return { count: 0 }
+        Object.assign(row, data)
+        return { count: 1 }
+      },
+      async create() { return {} },
+      [witness]: () => rowList,
+    },
+    emailSuppression: {
+      async findUnique(args: unknown) {
+        const { where } = args as { where?: { email?: unknown } }
+        return (suppressions.find((row) => row.email === where?.email) ?? null) as never
+      },
+      async upsert() { return {} },
+      [witness]: () => suppressions,
+    },
+  }
   return {
     store,
-    client: await mintClient({
-      emailOutbox: {
-        async findMany() {
-          return rowList
-            .filter((row) => row.status === 'PENDING')
-            .map((row) => ({ ...row })) as never
-        },
-        async updateMany(args: unknown) {
-          const { where, data } = args as { where: Record<string, unknown>; data: Record<string, unknown> }
-          const row = store[String(where.id)]
-          if (!row) return { count: 0 }
-          // Only the fencing columns matter for these proofs; the full predicate is exercised by
-          // tests/email-outbox-claim-fence.test.ts.
-          if ('lockedBy' in where && row.lockedBy !== where.lockedBy) return { count: 0 }
-          Object.assign(row, data)
-          return { count: 1 }
-        },
-        async create() { return {} },
-        [witness]: () => rowList,
-      },
-      emailSuppression: {
-        async findUnique(args: unknown) {
-          const { where } = args as { where?: { email?: unknown } }
-          return (suppressions.find((row) => row.email === where?.email) ?? null) as never
-        },
-        async upsert() { return {} },
-        [witness]: () => suppressions,
-      },
-    } as unknown as EmailOutboxClient),
+    delegates: delegates as unknown as { emailOutbox: Record<string, unknown>; emailSuppression: Record<string, unknown> },
+    client: await mintClient(delegates as unknown as EmailOutboxClient),
   }
 }
 
@@ -812,11 +821,11 @@ test('r7 HIGH 2, one level down: the CLIENT DELEGATES are read once too', async 
   const twoFacedClient = await mintClient({
     get emailOutbox() {
       delegateReads.emailOutbox += 1
-      return delegateReads.emailOutbox === 1 ? fixture.client.emailOutbox : poison('emailOutbox')
+      return delegateReads.emailOutbox === 1 ? fixture.delegates.emailOutbox : poison('emailOutbox')
     },
     get emailSuppression() {
       delegateReads.emailSuppression += 1
-      return delegateReads.emailSuppression === 1 ? fixture.client.emailSuppression : poison('emailSuppression')
+      return delegateReads.emailSuppression === 1 ? fixture.delegates.emailSuppression : poison('emailSuppression')
     },
   } as unknown as EmailOutboxClient)
 
@@ -1018,7 +1027,11 @@ test('r26: a delegate that REPORTS a store it does not read is refused by the ro
   const honest = await createEmailOutboxHarnessClient(
     mintable as unknown as Parameters<typeof createEmailOutboxHarnessClient>[0],
   )
-  assert.equal(honest.emailOutbox, mintable.emailOutbox)
+  // AND WHAT IT MINTS IS NOT THE CALLER'S OBJECT (r28): the delegate on a minted client is a frozen
+  // facade over methods captured at mint time. It still answers out of the same store, which is the
+  // half that has to keep working.
+  assert.notEqual(honest.emailOutbox as unknown, mintable.emailOutbox as unknown)
+  assert.deepEqual(await honest.emailOutbox.findMany({ where: { id: 'nothing-is-in-there' }, take: 1 }), [])
 })
 
 test('r26: a reported store must be THE store — a fresh copy each call is refused', async () => {
@@ -1103,10 +1116,14 @@ test('r18: the mint refuses an incomplete client, and r26 refuses one proven onl
   )
 })
 
-test('r18: a minted client is FROZEN, so its delegates cannot be swapped after the door', async () => {
+test('r18/r28: a minted client is FROZEN AT BOTH LEVELS, and holds no delegate of the caller\'s', async () => {
   // The mint reads each delegate once and returns its own object. If that object were mutable, a
   // caller could hand over a fixture, pass the check, and then assign the production delegate onto
   // the very client the drain holds — the r7 time-of-check/time-of-use defect with an extra step.
+  //
+  // r28 ADDS THE SECOND LEVEL (Codex r27 HIGH 2). `Object.freeze` is shallow, so freezing the client
+  // said nothing about the DELEGATES on it, and the delegates on it used to be the caller's own
+  // objects. Both levels are frozen now and the delegates are facades over captured methods.
   const { createEmailOutboxHarnessClient } = await loadOutbox()
   const delegates = await mintableDelegates()
   const minted = await createEmailOutboxHarnessClient(
@@ -1117,5 +1134,138 @@ test('r18: a minted client is FROZEN, so its delegates cannot be swapped after t
     'use strict'
     ;(minted as unknown as Record<string, unknown>).emailOutbox = { findMany: async () => [] }
   }, TypeError)
-  assert.equal(minted.emailOutbox, delegates.emailOutbox)
+  assert.throws(() => {
+    'use strict'
+    ;(minted.emailOutbox as unknown as Record<string, unknown>).findMany = async () => []
+  }, TypeError)
+  assert.notEqual(minted.emailOutbox as unknown, delegates.emailOutbox as unknown)
+  assert.notEqual(minted.emailSuppression as unknown, delegates.emailSuppression as unknown)
+})
+
+/**
+ * A DELEGATE THAT READS ITS OWN STORE **AND** A DATABASE — Codex r27 HIGH 1, built.
+ *
+ * `extra` stands for the rows of the live `email_outbox` table. Everything else about this double is
+ * honest: it reports a real array and it really reads it. That is precisely what made the r26 proof
+ * insufficient — the sentinel APPEARED in the answer, so the mint said yes, and the drain's sweep
+ * then selected `extra` for the harness's fake sender to stamp SENT.
+ */
+function readThroughDelegate(
+  witness: symbol,
+  reported: Record<string, unknown>[],
+  extra: Record<string, unknown>[],
+  asked: unknown[],
+): Record<string, unknown> {
+  return {
+    async findMany(args: unknown) {
+      asked.push(args)
+      const { where } = args as { where?: { id?: unknown } }
+      const local = reported.filter((row) => row.id === where?.id)
+      // LOCAL MATCHES **PLUS** THE DATABASE'S. A narrow lookup by the mint's fresh nonce finds
+      // nothing out there, which is exactly why r26 could not see this: only a BROAD read can.
+      const remote = where?.id === undefined ? extra : extra.filter((row) => row.id === where.id)
+      return [...local, ...remote] as never
+    },
+    async updateMany() { return { count: 0 } },
+    async create() { return {} },
+    [witness]: () => reported,
+  } as unknown as Record<string, unknown>
+}
+
+test('r28 HIGH 1: a delegate that answers with its store PLUS a database\'s rows is REFUSED', async () => {
+  const { createEmailOutboxHarnessClient, EMAIL_OUTBOX_IN_MEMORY_ROWS } = await loadOutbox()
+  const mintable = await mintableDelegates()
+  const asked: unknown[] = []
+  const customerRows = [{
+    id: 'a-real-queued-email',
+    status: 'PENDING',
+    attempts: 0,
+    availableAt: new Date('2026-01-01T00:00:00.000Z'),
+    processingStartedAt: null,
+  }]
+
+  const refusal = await createEmailOutboxHarnessClient({
+    emailOutbox: readThroughDelegate(EMAIL_OUTBOX_IN_MEMORY_ROWS, [], customerRows, asked),
+    emailSuppression: mintable.emailSuppression,
+  } as unknown as Parameters<typeof createEmailOutboxHarnessClient>[0]).then(() => null, (error: unknown) => error)
+
+  assert.ok(refusal instanceof Error, 'a read-through delegate that also serves a database was MINTED')
+  assert.match(refusal.message, /WHILE THE STORE IT REPORTED WAS EMPTY/)
+  // AND IT WAS CAUGHT ON THE DRAIN'S OWN QUERY. The first thing asked is the sweep, so the refusal
+  // does not depend on the delegate being asked anything a real drain would not ask.
+  assert.deepEqual(
+    (asked[0] as { orderBy?: unknown; take?: unknown }).orderBy,
+    { createdAt: 'asc' },
+    'the provenance phase did not issue the sweep the drain issues',
+  )
+
+  // AND THE OTHER HALF OF THE SAME FINDING: A DELEGATE THAT PASSES THE EMPTY-STORE PHASE AND THEN
+  // APPENDS THE DATABASE'S ROWS TO ITS OWN. This one answers nothing while its array is empty — so
+  // phase 1 is satisfied — and returns the sentinel PLUS a customer row once it has something to say.
+  // r26 accepted that: the sentinel was in there. The answer must now be the WHOLE of what the array
+  // holds, so two rows out of a one-row store is a refusal.
+  const appended: Record<string, unknown>[] = []
+  const alsoRefused = await createEmailOutboxHarnessClient({
+    emailOutbox: {
+      async findMany(args: unknown) {
+        const { where } = args as { where?: { id?: unknown } }
+        const local = appended.filter((row) => row.id === where?.id)
+        return (local.length > 0 ? [...local, ...customerRows] : []) as never
+      },
+      async updateMany() { return { count: 0 } },
+      async create() { return {} },
+      [EMAIL_OUTBOX_IN_MEMORY_ROWS]: () => appended,
+    },
+    emailSuppression: (await mintableDelegates()).emailSuppression,
+  } as unknown as Parameters<typeof createEmailOutboxHarnessClient>[0]).then(() => null, (error: unknown) => error)
+
+  assert.ok(alsoRefused instanceof Error, 'a delegate that appends a database\'s rows to its own was MINTED')
+  assert.match(alsoRefused.message, /as the WHOLE of its answer/)
+  assert.match(alsoRefused.message, /it answered 2 row\(s\)/)
+
+  // NON-VACUITY, AND IT IS THE WHOLE POINT: the SAME double with nothing behind it mints. So the
+  // refusal above is about the extra rows, not about the shape of this double.
+  const honest = await createEmailOutboxHarnessClient({
+    emailOutbox: readThroughDelegate(EMAIL_OUTBOX_IN_MEMORY_ROWS, [], [], []),
+    emailSuppression: (await mintableDelegates()).emailSuppression,
+  } as unknown as Parameters<typeof createEmailOutboxHarnessClient>[0])
+  assert.ok(honest.emailOutbox, 'the same delegate with an empty database was refused too')
+})
+
+test('r28 HIGH 2: a method swapped onto the caller\'s delegate AFTER the mint never reaches the drain', async () => {
+  // CODEX r27 HIGH 2, BUILT AND DRIVEN THROUGH THE DRAIN. The client is minted, the proof has
+  // passed, the WeakSet has accepted it — and THEN the caller replaces the three methods the drain
+  // calls. Before r28 the minted client held these very objects, so the drain called the
+  // replacements with the register still vouching for the client; a production `findMany` there is
+  // the whole finding.
+  const { processPendingEmailOutbox: drain } = await loadOutbox()
+  reached.length = 0
+  const fixture = await workingClient([{ id: 'row-1', status: 'PENDING' }])
+
+  const swapped = async (): Promise<never> => tripwire('a method SWAPPED ONTO THE DELEGATE AFTER THE MINT')
+  fixture.delegates.emailOutbox.findMany = swapped
+  fixture.delegates.emailOutbox.updateMany = swapped
+  fixture.delegates.emailOutbox.create = swapped
+  fixture.delegates.emailSuppression.findUnique = swapped
+  fixture.delegates.emailSuppression.upsert = swapped
+
+  const delivered: string[] = []
+  const result = await drain({
+    harness: {
+      ...completeHarness(fixture.client),
+      sendEmail: async (message: { to: string }) => {
+        delivered.push(message.to)
+        return { success: true as const }
+      },
+    },
+  } as unknown as ProcessEmailOutboxOptions)
+
+  // FIRST, AND IT IS THE FINDING: the drain called what the mint captured, not what the caller
+  // assigned afterwards.
+  assert.deepEqual(reached, [], `the drain called a post-mint replacement: ${reached.join(', ')}`)
+  // AND NON-VACUITY: it ran the whole body through the captured methods — sweep, claim, suppression
+  // lookup and fenced settlement — rather than refusing everything.
+  assert.deepEqual(result, { processed: 1, sent: 1, failed: 0, conflicted: 0, conflictedWithoutSend: 0 })
+  assert.deepEqual(delivered, ['fixture@example.invalid'])
+  assert.equal(fixture.store['row-1'].status, 'SENT')
 })

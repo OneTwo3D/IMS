@@ -59,6 +59,14 @@
  * delegate now hands over the array its rows live in and answers a query about a row this module
  * has just put into it — a property of the object that will be swept, not a word about it.
  *
+ * AND THE ANSWER HAS TO BE THE WHOLE OF WHAT THAT ARRAY HOLDS, NOT MERELY CONTAIN THE ROW (r28).
+ * The proof empties the array and asks the delegate THE DRAIN'S OWN SWEEP: an in-memory delegate has
+ * nothing to answer with, and one that also reads a database answers with that database's rows and
+ * is refused. The minted client also holds METHODS CAPTURED AT MINT TIME rather than the caller's
+ * delegate objects, because `Object.freeze` is shallow and a caller could otherwise swap `findMany`
+ * onto its own delegate after the proof had passed. The mint states in its own words what that does
+ * and does not establish — it is a BEST-EFFORT check with four named residues, not a guarantee.
+ *
  * AND THE CHECK READS EACH FACT EXACTLY ONCE (r7). It enumerates the caller's keys with
  * `Reflect.ownKeys` behind a plain-prototype rule, so the names it sees are exactly the names a
  * property read can resolve; and it returns a SNAPSHOT of the values it validated rather than the
@@ -199,17 +207,40 @@ export type EmailOutboxClient = {
  *
  *   1. the delegate must carry `[EMAIL_OUTBOX_IN_MEMORY_ROWS]`, a function returning its store;
  *   2. calling it twice must yield THE SAME array — a snapshot is not a store;
- *   3. this module pushes a sentinel row of its own making into that array;
- *   4. the delegate's own READ path (`emailOutbox.findMany`, `emailSuppression.findUnique`) must
- *      return that sentinel;
- *   5. the sentinel is removed, the same read must stop naming it, and the array must be back to
- *      the length it had.
+ *   3. the caller's rows are moved aside and THE DRAIN'S OWN SWEEP must come back EMPTY (r28);
+ *   4. a sentinel row of this module's making becomes the array's ONLY row, and the delegate's own
+ *      READ path (`emailOutbox.findMany`, `emailSuppression.findUnique`) must answer with EXACTLY
+ *      that row;
+ *   5. the sentinel is removed, the same read must stop naming it, and the caller's rows go back —
+ *      object by object, checked rather than assumed.
  *
  * `db.emailOutbox` fails at (1) — a Prisma delegate has no such member and cannot grow one — so
  * THE r25 CALL IS REFUSED BEFORE ANY QUERY IS ISSUED TO ANYTHING. A wrapper that fabricates the
  * member fails at (4): the sentinel exists only in this process, so a delegate reading a database
  * cannot produce it. The proof is about the object that will be swept, not about a sibling field
  * describing it.
+ *
+ * =========================================================================================
+ * WHAT r28 FIXES (Codex r27 HIGH x2), AND IT IS BOTH HALVES OF "THE PROOF DESCRIBES THE OBJECT THE
+ * DRAIN WILL CALL".
+ *
+ * (1) PRESENCE WAS NOT PROVENANCE. Step (4) used to require only that the sentinel APPEAR in the
+ * answer. A delegate that returns its own local matches PLUS a database's rows appears to pass —
+ * and the drain's sweep then reads real customer rows while the harness's fake sender stamps them
+ * SENT. So step (3) is new: with the reported array EMPTIED, the delegate is asked the query the
+ * drain issues, and the only correct answer is none. And step (4) now compares the WHOLE answer
+ * against the one row the array holds, rather than looking for a marker inside it.
+ *
+ * (2) `Object.freeze` IS SHALLOW. The minted client used to hold the caller's delegate OBJECTS, so
+ * `delegates.emailOutbox.findMany = production.findMany` AFTER a successful mint turned an accepted
+ * client into a production one with the WeakSet still vouching for it. The five methods the drain
+ * and `queueEmail` call are now CAPTURED at mint time into frozen facades the caller has no handle
+ * on; a post-mint swap reaches nothing.
+ *
+ * AND THE MINT NOW SAYS IT IS BEST-EFFORT, IN THOSE WORDS, over `createEmailOutboxHarnessClient`:
+ * three checkable properties it establishes, and four residues (write destinations, a probe-aware
+ * delegate, a single-key suppression fallback, and state on the caller's delegate) that no
+ * in-process check can decide. Read that contract before adding a round nine.
  *
  * WHY THE READ PATH IS THE ONE THAT IS PROVEN. The drain is a SWEEP: `findMany` decides WHICH ROWS
  * EXIST for this run, and every write afterwards is keyed on an id that came back from it. A
@@ -221,8 +252,9 @@ export type EmailOutboxClient = {
  * memory while routing `updateMany` to a real database would pass — but that is a purpose-built
  * two-faced object, not a one-line mistake, and it is the same residual class as
  * `sendEmail: (m) => realMailer(m)`, which no in-process check can refuse either. That residue is
- * filed (o3d-dhhd and the r26 withdrawal issue), not papered over. What is GONE is the accident
- * and the one-liner: there is no field left whose value is simply taken at its word.
+ * filed (o3d-dhhd, o3d-fii2), not papered over, and the full list of four is over the mint itself.
+ * What is GONE is the accident and the one-liner: there is no field left whose value is simply
+ * taken at its word, and no reading taken by the proof that the caller can still change.
  *
  * THE TYPE CARRIES IT TOO. `EmailOutboxHarness['client']` is the branded `EmailOutboxHarnessClient`,
  * which is not constructible by a type assertion from a plain object literal — so a caller who
@@ -276,17 +308,72 @@ function refuseHarnessClientMint(detail: string): never {
 }
 
 /**
- * ONE DELEGATE'S PROOF THAT ITS ROWS LIVE HERE. Everything specific to a delegate is in these two
- * descriptors, so the proof below is written once and neither copy can drift from the other.
+ * ONE DELEGATE'S PROOF THAT ITS READS ARE ANSWERED OUT OF THE ARRAY IT REPORTED, AND OUT OF
+ * NOTHING ELSE (r28, Codex r27 HIGH 1).
+ *
+ * WHAT r26 PROVED, AND WHY IT WAS NOT ENOUGH. r26 pushed a sentinel into the reported array and
+ * required the delegate's read to CONTAIN it. Containment is PRESENCE, NOT PROVENANCE: a delegate
+ * that answers with its own local matches PLUS a database's rows contains the sentinel too, and so
+ * passed. Paired with an `updateMany` that forwards to that database, the drain's sweep then
+ * selected real customer rows and the harness's fake sender stamped them SENT — the exact damage
+ * this surface exists to prevent, through a proof that said yes.
+ *
+ * SO THE PROOF IS NOW ABOUT THE WHOLE ANSWER, IN TWO PHASES, AND THE FIRST IS THE NEW ONE:
+ *
+ *   PHASE 1 — THE ARRAY IS EMPTIED, AND THE DRAIN'S OWN SWEEP MUST COME BACK EMPTY. Every row the
+ *   caller had is moved aside, and the delegate is asked THE QUERY THE DRAIN ISSUES: the same
+ *   where, orderBy and take, with a clock far enough forward that no date predicate excludes
+ *   anything. An in-memory delegate has nothing to answer with, so the only correct answer is NONE
+ *   — whatever it understands of the where-clause, filtering an empty array yields an empty result,
+ *   so this costs an honest double nothing. A delegate that ALSO reads a database answers with that
+ *   database's eligible rows and is REFUSED. This is what replaces "the sentinel is in there":
+ *   what the array holds is nothing, so the whole result must be nothing.
+ *
+ *   PHASE 2 — ONE ROW IS IN THE ARRAY, AND THE ANSWER MUST BE THAT ONE ROW AND NO OTHER. The
+ *   sentinel is pushed into the now-empty array and the delegate is asked for it: the answer must
+ *   be EXACTLY ONE row naming this run's nonce, not an answer that contains one. Then the sentinel
+ *   is removed and the same read must come back empty, so the reads follow the array in both
+ *   directions instead of happening to hold a copy of it.
+ *
+ * THEN THE CALLER'S ROWS GO BACK, object by object and in order, and that is CHECKED: the mint
+ * moved a harness's store, so it owes it back exactly as it found it.
+ *
+ * WHAT THIS ESTABLISHES AND WHAT IT DOES NOT — BOTH HALVES, because the history of this file is
+ * rounds that wrote only the first. IT ESTABLISHES that the delegate's sweep read is answered out
+ * of an array this module emptied and refilled under it. IT DOES NOT establish where that
+ * delegate's WRITES land; it cannot catch a delegate that RECOGNISES the probe and answers it
+ * differently from the drain; and on the suppression side, whose only read is a single-key
+ * `findUnique`, it cannot catch a delegate that answers from the array when the key is present and
+ * from a database when it is not — there is no key this module knows a database would answer for,
+ * and it will not go looking through customer data to find one. Those three are named in the
+ * mint's contract below and filed (o3d-fii2), not implied away.
  */
+
+/** Far enough forward that no date predicate in the sweep excludes a row the array holds. */
+const PROBE_UNBOUNDED_CLOCK = new Date('9999-12-31T23:59:59.999Z')
+
+/** One query the proof issues, with a phrase for the refusal that names it. */
+type ProbeRead = { readonly what: string; readonly args: unknown }
+
 type InMemoryProof = {
   readonly member: 'emailOutbox' | 'emailSuppression'
   /** The row this mint puts into the store, and nothing else ever will: the id is fresh. */
   sentinel(nonce: string): Record<string, unknown>
-  /** The delegate's OWN read path, asked for exactly that row. */
-  read(delegate: Record<string, unknown>, sentinel: Record<string, unknown>): Promise<unknown>
-  /** Does the answer name the sentinel? */
-  names(answer: unknown, nonce: string): boolean
+  /**
+   * THE QUERIES WHOSE ANSWER MUST BE EMPTY WHILE THE REPORTED ARRAY IS EMPTY. The drain's OWN sweep
+   * is one of them, because that is the read whose provenance decides which rows this run touches.
+   */
+  emptyStoreReads(sentinel: Record<string, unknown>): readonly ProbeRead[]
+  /** The query that must come back as EXACTLY the sentinel once it is the array's only row. */
+  sentinelRead(sentinel: Record<string, unknown>): ProbeRead
+  /** The delegate's OWN read path — the one the drain uses, not a member invented for the proof. */
+  read(delegate: Record<string, unknown>, args: unknown): Promise<unknown>
+  /** Is this answer "no rows at all"? */
+  isEmpty(answer: unknown): boolean
+  /** Is this answer exactly one row, and is that row the sentinel? */
+  isExactlySentinel(answer: unknown, nonce: string): boolean
+  /** The answer, said plainly enough for a refusal message. */
+  describe(answer: unknown): string
 }
 
 const IN_MEMORY_PROOFS: readonly InMemoryProof[] = [
@@ -309,37 +396,79 @@ const IN_MEMORY_PROOFS: readonly InMemoryProof[] = [
       processingStartedAt: null,
       lockedBy: null,
     }),
-    read: async (delegate, sentinel) => {
+    emptyStoreReads: (sentinel) => [
+      {
+        // THE DRAIN'S QUERY, SPELLED AS `processPendingEmailOutbox` SPELLS IT. A delegate that
+        // answers this out of a database answers it with rows a real drain would then claim, which
+        // is why this is the read the provenance phase asks for.
+        what: 'the drain\'s own sweep',
+        args: {
+          where: {
+            attempts: { lt: EMAIL_MAX_ATTEMPTS },
+            OR: [
+              { status: 'PENDING', availableAt: { lte: PROBE_UNBOUNDED_CLOCK } },
+              { status: 'PROCESSING', processingStartedAt: { lt: PROBE_UNBOUNDED_CLOCK } },
+            ],
+          },
+          orderBy: { createdAt: 'asc' },
+          take: EMAIL_OUTBOX_BATCH_SIZE,
+        },
+      },
+      { what: 'the probe row by id', args: { where: { id: sentinel.id }, take: 1 } },
+    ],
+    sentinelRead: (sentinel) => ({ what: 'the probe row by id', args: { where: { id: sentinel.id }, take: 1 } }),
+    read: async (delegate, args) => {
       const findMany = delegate.findMany
-      if (typeof findMany !== 'function') return undefined
-      return await (findMany as (args: unknown) => Promise<unknown>).call(
-        delegate,
-        { where: { id: sentinel.id }, take: 1 },
-      )
+      if (typeof findMany !== 'function') {
+        refuseHarnessClientMint(
+          '`emailOutbox.findMany` is not a function, so the delegate has no read path for this mint to '
+          + 'prove anything about',
+        )
+      }
+      return await (findMany as (args: unknown) => Promise<unknown>).call(delegate, args)
     },
-    names: (answer, nonce) => Array.isArray(answer)
-      && answer.some((row) => (row as Record<string, unknown> | null)?.id === nonce),
+    isEmpty: (answer) => Array.isArray(answer) && answer.length === 0,
+    isExactlySentinel: (answer, nonce) => Array.isArray(answer)
+      && answer.length === 1
+      && (answer[0] as Record<string, unknown> | null)?.id === nonce,
+    describe: (answer) => (Array.isArray(answer)
+      ? `${answer.length} row(s)`
+      : `${answer === null ? 'null' : typeof answer}, which is not an array of rows at all`),
   },
   {
     member: 'emailSuppression',
     sentinel: (nonce) => ({ id: nonce, email: `${nonce}@probe.invalid`, reason: 'harness mint probe' }),
-    read: async (delegate, sentinel) => {
+    // ONE READ, BECAUSE THE DELEGATE HAS ONE. `findUnique` is the only read the drain makes here and
+    // the only one this proof is entitled to reason about; see the "what it does not establish"
+    // paragraph above for the consequence.
+    emptyStoreReads: (sentinel) => [
+      { what: 'the probe suppression by email', args: { where: { email: sentinel.email } } },
+    ],
+    sentinelRead: (sentinel) => ({
+      what: 'the probe suppression by email',
+      args: { where: { email: sentinel.email } },
+    }),
+    read: async (delegate, args) => {
       const findUnique = delegate.findUnique
-      if (typeof findUnique !== 'function') return undefined
-      return await (findUnique as (args: unknown) => Promise<unknown>).call(
-        delegate,
-        { where: { email: sentinel.email } },
-      )
+      if (typeof findUnique !== 'function') {
+        refuseHarnessClientMint(
+          '`emailSuppression.findUnique` is not a function, so the delegate has no read path for this '
+          + 'mint to prove anything about',
+        )
+      }
+      return await (findUnique as (args: unknown) => Promise<unknown>).call(delegate, args)
     },
-    names: (answer, nonce) => typeof answer === 'object' && answer !== null
+    isEmpty: (answer) => answer === null || answer === undefined,
+    isExactlySentinel: (answer, nonce) => typeof answer === 'object' && answer !== null
       && (answer as Record<string, unknown>).id === nonce,
+    describe: (answer) => (answer === null || answer === undefined ? 'nothing' : 'a row'),
   },
 ]
 
 /**
  * PROVE ONE DELEGATE IS IN-MEMORY, OR REFUSE. Throws `refuseHarnessClientMint` on every path that
- * is not a completed round trip — including a throw from the delegate itself, because a delegate
- * that cannot answer a query about its own store has not demonstrated anything.
+ * is not a completed two-phase proof — including a throw from the delegate itself, because a
+ * delegate that cannot answer a query about its own store has not demonstrated anything.
  */
 async function proveDelegateIsInMemory(proof: InMemoryProof, delegate: Record<string, unknown>): Promise<void> {
   // THE ONLY READ of the witness member.
@@ -378,78 +507,188 @@ async function proveDelegateIsInMemory(proof: InMemoryProof, delegate: Record<st
 
   const nonce = `harness-mint-probe-${randomUUID()}`
   const sentinel = proof.sentinel(nonce)
-  const lengthBefore = store.length
-  let pushed = false
-  let removed = false
-  try {
+  /** THE CALLER'S ROWS, BY IDENTITY AND IN ORDER. Moved aside for the proof, and put back after it. */
+  const held: unknown[] = [...store]
+  let movedAside = false
+
+  const refuseUnwritable = (error: unknown): never => refuseHarnessClientMint(
+    `\`${proof.member}\` reported a store this mint cannot write to (${String(error)}); a frozen or `
+    + 'sealed array cannot be shown to be the one the delegate reads',
+  )
+
+  const ask = async (probe: ProbeRead, when: string): Promise<unknown> => {
     try {
-      store.push(sentinel)
-      pushed = true
+      return await proof.read(delegate, probe.args)
     } catch (error) {
       refuseHarnessClientMint(
-        `\`${proof.member}\` reported a store this mint cannot write to (${String(error)}); a frozen or `
-        + 'sealed array cannot be shown to be the one the delegate reads',
+        `\`${proof.member}\` threw when asked for ${probe.what} ${when}: ${String(error)}`,
+      )
+    }
+  }
+
+  try {
+    try {
+      store.length = 0
+      movedAside = true
+    } catch (error) {
+      refuseUnwritable(error)
+    }
+
+    // PHASE 1 — PROVENANCE (r28, Codex r27 HIGH 1). The array holds nothing, so nothing may come
+    // back. This is the phase the sentinel could not do: presence is not provenance.
+    for (const probe of proof.emptyStoreReads(sentinel)) {
+      const answer = await ask(probe, 'while the store it reported was EMPTY')
+      if (!proof.isEmpty(answer)) {
+        refuseHarnessClientMint(
+          `\`${proof.member}\` answered ${proof.describe(answer)} for ${probe.what} WHILE THE STORE IT `
+          + 'REPORTED WAS EMPTY, so that array is not the only thing its reads come out of. The r26 proof '
+          + 'required only that the sentinel APPEAR in the answer, which a delegate serving its own rows '
+          + 'PLUS a database\'s satisfies — and the drain\'s sweep then hands real customer rows to a fake '
+          + 'sender to stamp SENT. An in-memory delegate with an empty store has nothing to answer with',
+        )
+      }
+    }
+
+    // PHASE 2 — THE ROUND TRIP, AND THE ANSWER MUST BE THE WHOLE OF WHAT THE ARRAY HOLDS.
+    try {
+      store.push(sentinel)
+    } catch (error) {
+      refuseUnwritable(error)
+    }
+    const answer = await ask(proof.sentinelRead(sentinel), 'after this mint had made it the store\'s ONLY row')
+    if (!proof.isExactlySentinel(answer, nonce)) {
+      refuseHarnessClientMint(
+        `\`${proof.member}\` did not return the row this mint had just put into the store it reported as `
+        + `the WHOLE of its answer — it answered ${proof.describe(answer)}. THAT IS THE PROOF, AND IT `
+        + 'FAILED: the sentinel exists only in this process, so a delegate whose reads come from a '
+        + 'database cannot produce it, and a delegate that reports an array it does not read is not an '
+        + 'in-memory delegate however it describes itself (o3d-alnk r26, tightened to the whole answer '
+        + 'in r28)',
       )
     }
 
-    let answer: unknown
-    try {
-      answer = await proof.read(delegate, sentinel)
-    } catch (error) {
+    // AND THE READS FOLLOW THE ARRAY IN BOTH DIRECTIONS: take the row out again, and it must be gone.
+    const at = store.lastIndexOf(sentinel)
+    if (at < 0) {
       refuseHarnessClientMint(
-        `\`${proof.member}\` threw when asked for the row this mint had just put into the store it `
-        + `reported: ${String(error)}`,
+        `\`${proof.member}\` no longer holds the probe row this mint pushed into the store it reported, so `
+        + 'the store was replaced or rewritten during the round trip and this mint cannot put it back',
       )
     }
-    if (!proof.names(answer, nonce)) {
+    store.splice(at, 1)
+    if (store.length !== 0) {
       refuseHarnessClientMint(
-        `\`${proof.member}\` did not return the row this mint had just put into the store it reported. `
-        + 'THAT IS THE PROOF, AND IT FAILED: the sentinel exists only in this process, so a delegate '
-        + 'whose reads come from a database cannot produce it, and a delegate that reports an array it '
-        + 'does not read is not an in-memory delegate however it describes itself (o3d-alnk r26)',
+        `\`${proof.member}\` gained ${store.length} row(s) in the store it reported while the probe was `
+        + 'running, so the array the checks above were about is not the array they ended on',
+      )
+    }
+    const after = await ask(proof.sentinelRead(sentinel), 'after the probe row was removed')
+    if (!proof.isEmpty(after)) {
+      refuseHarnessClientMint(
+        `\`${proof.member}\` still returns the probe row after it was removed from the store it reported, `
+        + 'so its reads do not follow that array and the round trip proved nothing',
       )
     }
   } finally {
-    if (pushed) {
-      const at = store.lastIndexOf(sentinel)
-      if (at >= 0) {
-        store.splice(at, 1)
-        removed = true
+    // THE CALLER'S ROWS GO BACK, ON EVERY PATH INCLUDING A REFUSAL. Nothing is minted when a refusal
+    // is thrown, but the harness's own store is not this module's to keep.
+    if (movedAside) {
+      try {
+        store.length = 0
+        for (const row of held) store.push(row)
+      } catch {
+        // A refusal may already be on its way out of here and masking it with this one would report
+        // the symptom instead of the finding. The success path is covered by the check below.
       }
     }
   }
 
-  // SAID ACCURATELY, NOT CONVENIENTLY. If the sentinel is not where this mint put it, the store was
-  // rebuilt underneath the probe and the checks below would be describing something else — so the
-  // refusal names THAT, rather than reporting "it is still there after removal" about a removal
-  // that never happened.
-  if (pushed && !removed) {
+  // RESTORED, AND CHECKED RATHER THAN ASSUMED.
+  if (store.length !== held.length || held.some((row, index) => store[index] !== row)) {
     refuseHarnessClientMint(
-      `\`${proof.member}\` no longer holds the probe row this mint pushed into the store it reported, so `
-      + 'the store was replaced or rewritten during the round trip and this mint cannot put it back',
+      `\`${proof.member}\` reported a store of ${held.length} row(s) and this mint could not put them back `
+      + `as it found them (it now holds ${store.length}); the mint refuses rather than hand back a client `
+      + 'whose store it has disturbed',
     )
   }
+}
 
-  // THE PROBE LEAVES NOTHING BEHIND, and that is checked rather than assumed: a store that still
-  // names the sentinel would hand the drain a row this module invented.
-  let after: unknown
-  try {
-    after = await proof.read(delegate, sentinel)
-  } catch (error) {
-    refuseHarnessClientMint(`\`${proof.member}\` threw after the probe row was removed: ${String(error)}`)
-  }
-  if (proof.names(after, nonce)) {
+/**
+ * THE MINTED CLIENT HOLDS NOTHING THE CALLER CAN STILL REACH AND CHANGE (r28, Codex r27 HIGH 2).
+ *
+ * `Object.freeze` IS SHALLOW, and until r28 the minted client held the caller's own delegate
+ * OBJECTS. Freezing the client stopped `minted.emailOutbox = production` and did nothing whatever
+ * about `delegates.emailOutbox.findMany = production.findMany`, which a caller can do AFTER the
+ * proof has passed and AFTER the register has accepted the client. Time of check, time of use, with
+ * the entire proof standing in between and no longer describing the object the drain calls.
+ *
+ * So the five methods the drain and `queueEmail` actually call are CAPTURED HERE, at mint time,
+ * into frozen facades the caller has no handle on. Replacing `findMany`, `updateMany`, `create`,
+ * `findUnique` or `upsert` on the caller's delegate afterwards changes nothing the drain calls: the
+ * function each facade forwards to was taken before the register accepted anything.
+ *
+ * THE RECEIVER IS STILL THE CALLER'S DELEGATE, because a Prisma delegate's methods need it. So a
+ * delegate whose method reads MUTABLE STATE OFF ITSELF can still change its own answers. That is
+ * not the defect this closes and it is not reachable by accident — it is the same purpose-built
+ * two-faced object as a delegate that serves reads from memory and sends its writes elsewhere, and
+ * it is filed with it (o3d-fii2) rather than implied away here.
+ *
+ * SPELLED OUT MEMBER BY MEMBER rather than looped over a name list, so adding a method to
+ * `EmailOutboxClient` fails to compile here instead of being quietly forwarded uncaptured.
+ */
+function captureDelegateMethod(
+  member: string,
+  delegate: Record<string, unknown>,
+  method: string,
+): (args: unknown) => unknown {
+  // THE ONLY READ of this method, and what is captured is what will be called.
+  const fn = delegate[method]
+  if (typeof fn !== 'function') {
     refuseHarnessClientMint(
-      `\`${proof.member}\` still returns the probe row after it was removed from the store it reported, `
-      + 'so its reads do not follow that array and the round trip proved nothing',
+      `\`${member}.${method}\` is ${fn === undefined ? 'missing' : typeof fn}. The mint CAPTURES the five `
+      + 'methods the drain and `queueEmail` call, so all five have to be there at mint time: a client '
+      + 'that grows one afterwards is a client whose behaviour was decided after the proof',
     )
   }
-  if (store.length !== lengthBefore) {
-    refuseHarnessClientMint(
-      `\`${proof.member}\` reported a store of ${lengthBefore} rows and the probe left it at ${store.length}; `
-      + 'the mint refuses rather than hand back a client whose store it has disturbed',
-    )
-  }
+  const captured = fn as (this: unknown, args: unknown) => unknown
+  return (args: unknown) => captured.call(delegate, args)
+}
+
+function captureOutboxDelegate(delegate: Record<string, unknown>): EmailOutboxClient['emailOutbox'] {
+  const findMany = captureDelegateMethod('emailOutbox', delegate, 'findMany')
+  const updateMany = captureDelegateMethod('emailOutbox', delegate, 'updateMany')
+  const create = captureDelegateMethod('emailOutbox', delegate, 'create')
+  return Object.freeze({
+    findMany: async (args: unknown) => (await findMany(args)) as EmailOutboxRow[],
+    updateMany: async (args: unknown) => (await updateMany(args)) as { count: number },
+    create: async (args: unknown) => await create(args),
+  })
+}
+
+function captureSuppressionDelegate(delegate: Record<string, unknown>): EmailOutboxClient['emailSuppression'] {
+  const findUnique = captureDelegateMethod('emailSuppression', delegate, 'findUnique')
+  const upsert = captureDelegateMethod('emailSuppression', delegate, 'upsert')
+  return Object.freeze({
+    findUnique: async (args: unknown) => (await findUnique(args)) as { id: string; reason: string } | null,
+    upsert: async (args: unknown) => await upsert(args),
+  })
+}
+
+/**
+ * THE ONE PLACE A CLIENT ENTERS THE REGISTER, for both arms. Fresh, frozen at both levels, built
+ * only out of functions captured above — and it is the object registered, so a copy of it is not a
+ * minted client.
+ */
+function mintEmailOutboxClient(
+  emailOutbox: Record<string, unknown>,
+  emailSuppression: Record<string, unknown>,
+): EmailOutboxHarnessClient {
+  const client = Object.freeze({
+    emailOutbox: captureOutboxDelegate(emailOutbox),
+    emailSuppression: captureSuppressionDelegate(emailSuppression),
+  })
+  MINTED_HARNESS_CLIENTS.add(client)
+  return client as EmailOutboxHarnessClient
 }
 
 /**
@@ -457,12 +696,58 @@ async function proveDelegateIsInMemory(proof: InMemoryProof, delegate: Record<st
  *
  * Every field is read EXACTLY ONCE, for the reason the whole of `resolveEmailOutboxDependencies` is
  * written that way (r7): what is validated is what is returned, so a getter has no second turn. The
- * object handed back is FRESH and FROZEN — the caller cannot swap a delegate on it afterwards — and
- * it is the object registered in the mint set, so a copy of it is not a minted client.
+ * object handed back is FRESH, FROZEN AT BOTH LEVELS, and built only out of methods captured at
+ * mint time (r28) — so neither the client nor its delegates are a handle on anything the caller can
+ * still change — and it is the object registered in the mint set, so a copy of it is not a minted
+ * client.
  *
  * ASYNC SINCE r26, because the proof is a round trip through the delegate's own read path and that
  * path returns a promise. The cost is one `await` at each call site; the alternative is a
  * synchronous check that can only read a field the caller filled in, which is exactly the defect.
+ *
+ * =========================================================================================
+ * THIS IS A BEST-EFFORT CHECK, AND HERE IS EXACTLY WHERE THE LINE FALLS. It is labelled that way
+ * deliberately: this guard has been through identity (r17), a WeakSet mint (r18), a URL comparison
+ * (r20), a server-side attestation (r22), a creation witness (r24) and a sentinel round trip (r26),
+ * and every round a reviewer found the guarantee it implied was not one it held. So it claims what
+ * it can check and no more.
+ *
+ * WHAT IT ESTABLISHES, and these are checkable properties of the object the drain will use, not
+ * descriptions of an intention:
+ *
+ *   1. THE CLIENT WAS MINTED HERE. `db`, a structural wrapper of it, a spread or a Proxy of a minted
+ *      client: none of them is in the register, and membership is not a field that can be copied.
+ *   2. EACH DELEGATE SHOWED THE ARRAY ITS ROWS LIVE IN, AND THE DRAIN'S OWN SWEEP CAME BACK EMPTY
+ *      WHILE THAT ARRAY WAS EMPTY. A delegate that also serves a database's rows is refused here —
+ *      that is r28's phase 1, and it is why "the sentinel appeared in the answer" is no longer the
+ *      question (Codex r27 HIGH 1).
+ *   3. WHAT THE DRAIN CALLS WAS FIXED BEFORE THE REGISTER ACCEPTED ANYTHING. The five methods are
+ *      captured into frozen facades; replacing one on the caller's delegate afterwards reaches
+ *      nothing (Codex r27 HIGH 2).
+ *
+ * WHAT IT DOES NOT ESTABLISH, AND THEREFORE WHAT "BEST-EFFORT" MEANS HERE. An in-process check
+ * cannot decide how an object handed to it will behave later, and these four are the residue:
+ *
+ *   a. WHERE THE WRITES GO. `updateMany`, `create` and `upsert` are captured, not proven: a delegate
+ *      that answers every read out of its array and forwards its writes to a real database satisfies
+ *      everything above. Nothing in this process can refuse that, for the same reason it cannot
+ *      refuse `sendEmail: (m) => realMailer(m)`.
+ *   b. A PROBE-AWARE DELEGATE. The proof empties the array it was shown; a delegate written to
+ *      notice that and answer differently from how it answers the drain defeats it.
+ *   c. THE SUPPRESSION LOOKUP FOR A KEY THE ARRAY DOES NOT HOLD. `findUnique` is single-key, so a
+ *      delegate that answers from the array when the key is there and from a database when it is not
+ *      passes: this module has no key it knows a database would answer for, and it will not read
+ *      customer data to find one.
+ *   d. STATE ON THE CALLER'S DELEGATE. The captured methods are still called with that delegate as
+ *      their receiver (a Prisma delegate needs it), so a delegate whose method reads mutable state
+ *      off itself can still change its own answers.
+ *
+ * NONE OF (a)-(d) IS REACHABLE BY ACCIDENT OR IN ONE LINE — each is a purpose-built object whose
+ * author is working to defeat this function — and all four are filed under o3d-fii2. What IS closed
+ * is every shape that got here by mistake: the missing field that quietly became production, the
+ * wrapper that passed an identity test, the destination a caller merely asserted, the "in-memory"
+ * delegate that was a database delegate with a word attached, and the honest delegate that became a
+ * production one after the door had shut.
  */
 export async function createEmailOutboxHarnessClient(
   input: InMemoryEmailOutboxDelegates,
@@ -507,14 +792,13 @@ export async function createEmailOutboxHarnessClient(
     )
   }
 
-  // FRESH, FROZEN, AND THE OBJECT THAT IS REGISTERED. A spread of this is a different object and is
-  // therefore not minted, which is the property that makes the register meaningful.
-  const client = Object.freeze({
-    emailOutbox: emailOutbox as EmailOutboxClient['emailOutbox'],
-    emailSuppression: emailSuppression as EmailOutboxClient['emailSuppression'],
-  })
-  MINTED_HARNESS_CLIENTS.add(client)
-  return client as EmailOutboxHarnessClient
+  // FRESH, FROZEN, AND BUILT ONLY OUT OF FUNCTIONS CAPTURED HERE (r28) — the caller's delegate
+  // OBJECTS are not on the client at all, so a method swapped onto one of them after this line
+  // cannot reach the drain. See `mintEmailOutboxClient`.
+  return mintEmailOutboxClient(
+    emailOutbox as Record<string, unknown>,
+    emailSuppression as Record<string, unknown>,
+  )
 }
 
 /**
@@ -688,16 +972,19 @@ export async function createEmailOutboxLaneClient(lane: { url: string }): Promis
     adapter: new PrismaPg(pgConnectionConfig(url), prismaAdapterSchemaOptions(url)),
   })
 
-  // FRESH, FROZEN, AND THE OBJECT THAT IS REGISTERED — the same register and the same rule as the
-  // in-memory mint above, so a spread or a Proxy of this is not a client the drain accepts.
-  const client = Object.freeze({
-    emailOutbox: prisma.emailOutbox as unknown as EmailOutboxClient['emailOutbox'],
-    emailSuppression: prisma.emailSuppression as unknown as EmailOutboxClient['emailSuppression'],
-  })
-  MINTED_HARNESS_CLIENTS.add(client)
+  // THE SAME MINT AND THE SAME CAPTURE AS THE IN-MEMORY ARM (r28, Codex r27 HIGH 2). `mintEmailOutboxClient`
+  // reads each delegate's five methods once, holds them in frozen facades, and registers the object
+  // it built — so a spread or a Proxy of this is not a client the drain accepts, and nothing on the
+  // returned client is a handle on `prisma` or its delegates. The lane's caller never had one
+  // (the client is created in this function), so this arm had no time-of-check gap to close; it is
+  // written the same way because two mints with two shapes is how the last several rounds began.
+  const client = mintEmailOutboxClient(
+    prisma.emailOutbox as unknown as Record<string, unknown>,
+    prisma.emailSuppression as unknown as Record<string, unknown>,
+  )
 
   return Object.freeze({
-    client: client as EmailOutboxHarnessClient,
+    client,
     database: destination.database,
     disconnect: () => prisma.$disconnect(),
   })

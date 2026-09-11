@@ -122,6 +122,24 @@ type MakeClientOptions = {
    * a double that threw for that one too would abort the drain instead of reaching `recordConflict`.
    */
   throwOnFirstTerminalWrite?: () => void
+  /**
+   * PAUSE INSIDE THE FIRST `emailSuppression.findUnique` — the read that sits between the claim and
+   * the sender (r28).
+   *
+   * This used to be done by ASSIGNING over `client.emailSuppression.findUnique` after the mint, which
+   * is precisely the time-of-check/time-of-use hole Codex r27 HIGH 2 named: a minted client no longer
+   * holds the caller's delegate objects, so a post-mint swap reaches nothing. A double's own hook is
+   * the honest way to say "answer, but let another worker in first", and it is how the two other
+   * pause points in this file already work.
+   */
+  pauseOnFirstSuppressionLookup?: () => Promise<void>
+  /**
+   * MAKE `emailOutbox.create` THROW — for the `queueEmail` collision proofs (r28).
+   *
+   * Also formerly an assignment onto the minted client. The double calls this instead, so the failure
+   * is built into the delegate the mint proved rather than bolted onto the client afterwards.
+   */
+  createThrows?: () => never
 }
 
 async function makeClient(rows: EmailOutboxRow[], options: MakeClientOptions = {}): Promise<{
@@ -142,6 +160,13 @@ async function makeClient(rows: EmailOutboxRow[], options: MakeClientOptions = {
   const created: Record<string, unknown>[] = []
   let terminalWriteFailed = false
   let suppressionUpsertFailed = false
+  let suppressionLookupPaused = false
+  /**
+   * THE MINT'S PROBE IS NOT A DRAIN, so no interleaving hook may fire inside it. The proof reads
+   * `findUnique` three times (empty store, sentinel, sentinel removed), and a pause that fired there
+   * would run a drain against a client that does not exist yet.
+   */
+  let minting = true
 
   const delegates: InMemoryEmailOutboxDelegates = {
     emailOutbox: {
@@ -171,6 +196,7 @@ async function makeClient(rows: EmailOutboxRow[], options: MakeClientOptions = {
         return { count }
       },
       async create(args: unknown) {
+        if (options.createThrows) options.createThrows()
         const { data } = args as { data: Record<string, unknown> }
         created.push(data)
         return data
@@ -182,6 +208,10 @@ async function makeClient(rows: EmailOutboxRow[], options: MakeClientOptions = {
     emailSuppression: {
       async findUnique(args: unknown) {
         const { where } = args as { where: { email: string } }
+        if (options.pauseOnFirstSuppressionLookup && !minting && !suppressionLookupPaused) {
+          suppressionLookupPaused = true
+          await options.pauseOnFirstSuppressionLookup()
+        }
         return (suppressionStore.find((row) => row.email === where.email) ?? null) as never
       },
       async upsert() {
@@ -201,13 +231,15 @@ async function makeClient(rows: EmailOutboxRow[], options: MakeClientOptions = {
    * branded `EmailOutboxHarnessClient`, and the only expression that has that type is this call —
    * an object literal does not compile there and is refused at runtime as well. The mint now puts
    * a row of its own into each store above and asks the delegate for it back, which is why this is
-   * awaited. The delegates are the same objects the double built, so a test that swaps one
-   * afterwards (the suppression race below) still reaches the drain.
+   * awaited. SINCE r28 THE CLIENT DOES NOT HOLD THESE OBJECTS: it holds frozen facades over the five
+   * methods, captured at mint time, so a test cannot swap a method on afterwards and have the drain
+   * call it — every interleaving hook this file needs is therefore a hook INSIDE the double above.
    */
   const client = await createEmailOutboxHarnessClient({
     emailOutbox: delegates.emailOutbox,
     emailSuppression: delegates.emailSuppression,
   })
+  minting = false
 
   return { client, rows: store, updateManyCalls, created }
 }
@@ -593,22 +625,23 @@ test('the suppression write is fenced too, and no longer fires before the claim'
 test('a reclaimed worker cannot write a suppression FAILED over the winner', async () => {
   // Same shape as the pause proof, on the other terminal write: worker A claims, and the
   // suppression lookup is where it pauses.
+  let reclaimHappened = false
+  // THE PAUSE IS A HOOK IN THE DOUBLE, NOT A SWAP ON THE CLIENT (r28). It fires on the FIRST
+  // suppression lookup only, so worker B — started from inside it — takes the suppressed branch
+  // normally and settles the row it has just reclaimed.
   const { client, rows } = await makeClient(
     [makeRow()],
-    { suppressions: { 'customer@example.test': { id: 'sup-1', reason: 'hard bounce' } } },
+    {
+      suppressions: { 'customer@example.test': { id: 'sup-1', reason: 'hard bounce' } },
+      pauseOnFirstSuppressionLookup: async () => {
+        const workerB = await drain({
+          client, now: () => T_RECLAIM, prepareQueuedEmail: noPrepare, logActivity: noLog,
+          async sendEmail() { return { success: true } },
+        })
+        reclaimHappened = workerB.processed === 1
+      },
+    },
   )
-  let reclaimHappened = false
-  const original = client.emailSuppression.findUnique.bind(client.emailSuppression)
-  client.emailSuppression.findUnique = async (args: unknown) => {
-    client.emailSuppression.findUnique = original
-    const workerB = await drain({
-      client, now: () => T_RECLAIM, prepareQueuedEmail: noPrepare, logActivity: noLog,
-      async sendEmail() { return { success: true } },
-    })
-    // B's own suppression lookup has been restored, so B settles FAILED and owns the row.
-    reclaimHappened = workerB.processed === 1
-    return original(args)
-  }
 
   const workerA = await drain({
     client, now: () => T0, prepareQueuedEmail: noPrepare, logActivity: noLog,
@@ -662,13 +695,14 @@ test('r18: the two conflict counters are told apart by whether the SMTP socket w
 // ---------------------------------------------------------------------------
 
 test('queueEmail reports a duplicate undelivered row as already_queued rather than throwing', async () => {
-  const client = (await makeClient([])).client
-  client.emailOutbox.create = async () => {
-    throw adapterUniqueViolation(['kind', 'referenceType', 'referenceId'], {
-      modelName: 'EmailOutbox',
-      constraintName: EMAIL_OUTBOX_UNDELIVERED_REFERENCE_INDEX,
-    })
-  }
+  const client = (await makeClient([], {
+    createThrows: () => {
+      throw adapterUniqueViolation(['kind', 'referenceType', 'referenceId'], {
+        modelName: 'EmailOutbox',
+        constraintName: EMAIL_OUTBOX_UNDELIVERED_REFERENCE_INDEX,
+      })
+    },
+  })).client
 
   assert.deepEqual(
     await queueEmail(
@@ -693,10 +727,11 @@ test('queueEmail still succeeds, and normalises the recipient, when no duplicate
 })
 
 test('queueEmail re-throws a unique violation that is not the undelivered-reference index', async () => {
-  const client = (await makeClient([])).client
-  client.emailOutbox.create = async () => {
-    throw adapterUniqueViolation(['id'], { modelName: 'EmailOutbox' })
-  }
+  const client = (await makeClient([], {
+    createThrows: () => {
+      throw adapterUniqueViolation(['id'], { modelName: 'EmailOutbox' })
+    },
+  })).client
   await assert.rejects(
     () => queueEmail({ kind: 'INVOICE', to: 'c@example.test', subject: 's', html: 'h' }, { client }),
     /Unique constraint failed/,
