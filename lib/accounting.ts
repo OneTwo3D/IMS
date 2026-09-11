@@ -4,6 +4,7 @@
 
 import type { AccountingSyncType, Prisma } from '@/app/generated/prisma/client'
 import { isIntegrationPluginEnabled } from '@/lib/integration-plugins'
+import { pinnedLedgerIsServicedUnderLock } from '@/lib/integration-plugin-selection-lock'
 import { resolveAccountingEnqueueOrderScope } from '@/lib/domain/accounting/enqueue-order-guard'
 import { hasLockedSalesOrder } from '@/lib/domain/sales/allocation-service'
 import { lockFollowUpScope } from '@/lib/domain/accounting/followup-scope-lock'
@@ -168,6 +169,25 @@ async function getActiveAccountingConnectorId(): Promise<AccountingConnectorInfo
  *
  * A NO-OP FOR EVERY UNPINNED CALLER by construction: an unpinned enqueue takes its connector FROM
  * `getActiveAccountingConnectorId`, so the equality it would be asked to satisfy already holds.
+ *
+ * o3d-i0o6 r8 (Codex round 7, HIGH) — THIS FUNCTION IS AN UNLOCKED SNAPSHOT, AND IS NO LONGER WHAT
+ * ENFORCES THE RULE ABOVE.
+ *
+ * Everything r7 wrote about WHICH outcome is correct stands. What it got wrong is that a pooled read
+ * cannot make it hold: both enqueue paths await further work before their INSERT, so a switch
+ * committing between this answer and that write put the row on the retired ledger anyway — and the
+ * orphan path then read its amount as posted relief, which is the money consequence r7 set out to
+ * make impossible.
+ *
+ * The enforcement is `pinnedLedgerIsServicedUnderLock`, which asks the same question through the
+ * transaction that does the insert, holding the plugin-selection lock across both. This one survives
+ * on the facade ONLY to fix the precedence of `refused` over `not-configured` (see the call site),
+ * and it is the same predicate over the pooled source rather than a second rule: `resolveActive-
+ * AccountingConnector` and `getActiveAccountingConnectorId` are one Xero-first rule with two sources,
+ * which `tests/accounting/orphan-cancel-fence.test.ts` already pins.
+ *
+ * NOT used by the in-transaction enqueue at all any more: there is a transaction in hand there, so
+ * there is no reason to ask unfenced.
  */
 async function pinnedLedgerIsServiced(connector: AccountingConnectorInfo['id']): Promise<boolean> {
   return (await getActiveAccountingConnectorId()) === connector
@@ -309,6 +329,22 @@ export async function queueAccountingSync(params: {
   // `pinnedLedgerIsServiced`: the pin establishes WHICH books the posting belongs in, the sync
   // toggle establishes whether that connector posts at all, and neither of them establishes that
   // the scheduled drain is this connector's. Refused, not `not-configured`: the posting is owed.
+  //
+  // o3d-i0o6 r8 (Codex round 7, HIGH) — THIS READ IS NOT THE ENFORCEMENT, AND IT NO LONGER CLAIMS TO
+  // BE. It is unlocked, and the INSERT it guards happens several awaits later inside the connector
+  // queue's own transaction, so a switch committing in between wrote the row to the retired ledger
+  // regardless. The enforcement moved to where the write is: `pinnedLedger` below hands the pin to
+  // the connector queue, which re-asks this question UNDER the plugin-selection lock, inside the
+  // transaction that inserts, and refuses there.
+  //
+  // WHY THIS ONE IS KEPT rather than deleted, given it decides nothing the fenced check does not
+  // re-decide: PRECEDENCE. It runs before the connector's own enabled/posting-mode verdict, so a pin
+  // to a retired ledger whose sync toggle is ALSO off still answers `refused` — the posting is owed —
+  // instead of `not-configured`, which is the one no-op the refund obligation ledger is allowed to
+  // settle an obligation with. That ordering is r7's decision and it is preserved. It cannot drift
+  // from the fenced check because it is the SAME PREDICATE over a different source: "is the pinned
+  // connector the active one", Xero-first, pooled here and locked there. It can only refuse earlier,
+  // never permit something the fence would refuse.
   if (params.connector && !await pinnedLedgerIsServiced(params.connector)) {
     return { queued: false, reason: 'refused', connector }
   }
@@ -316,12 +352,15 @@ export async function queueAccountingSync(params: {
     return { queued: false, reason: 'not-configured', connector }
   }
 
+  // o3d-i0o6 r8: `pinnedLedger` is what makes the check above binding at the moment of the write. It
+  // is `params.connector` verbatim — never `connector`, which is the resolved-or-pinned value and
+  // would silently turn EVERY unpinned enqueue into a pinned one.
   if (connector === 'quickbooks') {
     const { queueQuickBooksSync } = await import('@/lib/connectors/quickbooks/queue')
-    return { ...await queueQuickBooksSync(params), connector }
+    return { ...await queueQuickBooksSync({ ...params, pinnedLedger: params.connector }), connector }
   }
   const { queueXeroSync } = await import('@/lib/connectors/xero/queue')
-  return { ...await queueXeroSync(params), connector }
+  return { ...await queueXeroSync({ ...params, pinnedLedger: params.connector }), connector }
 }
 
 async function getAccountingPostingContext(type: AccountingSyncType): Promise<{
@@ -530,7 +569,21 @@ export async function queueAccountingSyncTx(
   // connector's own sync toggle and would say "yes, it posts" for a connector the cron stopped
   // servicing when the plugin was switched away. See `pinnedLedgerIsServiced` for why this refuses
   // rather than queueing-and-not-counting. `refused`, so the obligation stays owed.
-  if (params.connector && !await pinnedLedgerIsServiced(params.connector)) {
+  //
+  // o3d-i0o6 r8 (Codex round 7, HIGH) — AND IT IS FENCED, NOT SAMPLED. r7 asked this question through
+  // the POOLED client and then awaited five more things before its INSERT (the posting context, the
+  // id-provenance read, the base currency, the follow-up scope lock, the prior-attempt query). A
+  // switch committing anywhere in that window wrote the row onto the now-inactive connector anyway —
+  // the precise outcome r7 set out to make impossible, reached through the gap between its check and
+  // its write. `pinnedLedgerIsServicedUnderLock` takes the plugin-selection lock THROUGH `tx`, so the
+  // advisory lock and the `FOR UPDATE` row locks are held to the CALLER's COMMIT, which is after the
+  // create below. There is no window left: while this transaction lives, the selection cannot move.
+  //
+  // Taken HERE, before anything else this function locks, so the order is sales-order row lock
+  // (hoisted by the caller, asserted above) -> plugin selection -> follow-up scope. The connector
+  // queues take the same three in the same order, and no plugin-selection writer holds a sales-order
+  // row, so nothing can cycle.
+  if (params.connector && !await pinnedLedgerIsServicedUnderLock(tx, params.connector)) {
     return answer({ queued: false, reason: 'refused' }, params.connector)
   }
   // o3d-i0o6: the PIN wins where one was given. `getAccountingPostingContextFor` asks the same

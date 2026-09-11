@@ -20,6 +20,7 @@ import {
   logStaleOrderDiscountEnqueue,
 } from '@/lib/domain/accounting/enqueue-order-guard'
 import { lockFollowUpScope } from '@/lib/domain/accounting/followup-scope-lock'
+import { pinnedLedgerIsServicedUnderLock } from '@/lib/integration-plugin-selection-lock'
 import { stampingCustodyOnCreate } from '@/lib/domain/accounting/money-attempt-provenance'
 import {
   classifyPriorAttempts,
@@ -56,10 +57,34 @@ export async function queueXeroSync(params: {
   referenceId: string
   payload: Record<string, unknown>
   idempotencyKey?: string
+  /**
+   * o3d-i0o6 r8 (Codex round 7, HIGH) — THE PIN, SO THE ACTIVE-LEDGER CHECK CAN BE HELD THROUGH THIS
+   * QUEUE'S INSERT.
+   *
+   * Set by the facade to the connector a CALLER pinned — the ledger a proof was established in. The
+   * facade already refuses an unpinned-from-active mismatch before it gets here, but it refuses on a
+   * POOLED read, and this queue then opens its own transaction and awaits an order lock, a scope lock
+   * and a stale-discount check before inserting. A connector switch committing in that window left a
+   * PENDING row on a queue no scheduled drain reads, and `assertAllocationReversalQueued` counted its
+   * amount as posted relief — so every later refund under-credited Allocated Inventory by it.
+   *
+   * Passed, this queue re-asks the question INSIDE the inserting transaction and under the
+   * plugin-selection lock, which is held to that transaction's COMMIT. The check and the write become
+   * one step to every other writer.
+   *
+   * Absent, nothing changes for any of the unpinned callers: no lock is taken and no verdict is added.
+   */
+  pinnedLedger?: 'xero' | 'quickbooks'
   // o3d-2sm1 r7: and it SAYS what it did — see ConnectorEnqueueOutcome. Every early return below
   // wrote nothing, and a caller discharging an obligation has to be able to tell which of them was a
   // decision that nothing will ever post and which left the posting owed.
 }): Promise<ConnectorEnqueueOutcome> {
+  // o3d-i0o6 r8: a pin naming a DIFFERENT ledger cannot be satisfied by this queue at all — every row
+  // it writes is a Xero row. Refused rather than ignored, and refused rather than thrown: the posting
+  // is owed somewhere this queue is not. Unreachable through the facade, which routes by the pin; it
+  // exists so that a future caller reaching this queue directly cannot get a Xero row out of a
+  // QuickBooks pin.
+  if (params.pinnedLedger && params.pinnedLedger !== 'xero') return { queued: false, reason: 'refused' }
   const settings = await getXeroSettings()
   if (settings.xero_sync_enabled !== 'true') return { queued: false, reason: 'not-configured' }
 
@@ -113,6 +138,10 @@ export async function queueXeroSync(params: {
   try {
     let mirrorErrorMessage: string | null = null
     let deletedOrder = false
+    // o3d-i0o6 r8: the pinned ledger stopped being the active one while this enqueue was in flight.
+    // Reported after the transaction, like the other two refusals, because the decision is taken
+    // inside it and nothing may be written for it.
+    let pinnedLedgerRetired = false
     let staleDiscount: { payloadDiscount: number; liveDiscount: number } | null = null
     await db.$transaction(async (tx) => {
       // o3d-hrak: join the sales-order delete protocol. The hard delete locks the order and
@@ -124,6 +153,22 @@ export async function queueXeroSync(params: {
         referenceType: params.referenceType,
         referenceId: params.referenceId,
       })
+      // o3d-i0o6 r8 (Codex round 7, HIGH) — AND THE PINNED LEDGER IS STILL THE ACTIVE ONE, VERIFIED
+      // UNDER THE LOCK THAT KEEPS IT SO.
+      //
+      // The facade asked this already, unlocked, several awaits ago; that answer could not survive to
+      // here. This one takes the plugin-selection lock through `tx`, so it is held to the COMMIT that
+      // makes the row below durable — there is no instant at which the selection can move between
+      // the verdict and the insert. Nothing is written on a refusal: the transaction returns early
+      // before the create, and the lock is released by the rollback.
+      //
+      // ORDER: sales-order row lock (just above) -> plugin selection -> follow-up scope. The same
+      // three, in the same order, as the in-transaction enqueue in lib/accounting.ts; and no
+      // plugin-selection writer holds a sales-order row, so neither pair can cycle.
+      if (params.pinnedLedger && !await pinnedLedgerIsServicedUnderLock(tx, 'xero')) {
+        pinnedLedgerRetired = true
+        return
+      }
       // o3d-0m56: and the accounting scope lock, so this enqueue cannot land between the manual
       // retry's sibling snapshot and its reset. Taken AFTER the order lock, the same order every
       // other enqueue writer takes them in, so the pair cannot deadlock.
@@ -206,9 +251,11 @@ export async function queueXeroSync(params: {
         description: mirrorErrorMessage,
       })
     }
-    // NEITHER of these is a decision that nothing will post: the order went away under this enqueue,
-    // or the payload it was built from had been superseded. The posting is still owed.
-    if (deletedOrder || staleDiscount) return { queued: false, reason: 'refused' }
+    // NONE of these is a decision that nothing will post: the order went away under this enqueue, the
+    // payload it was built from had been superseded, or the ledger it was pinned to is no longer the
+    // one being serviced. The posting is still owed in every case — `refused`, never
+    // `not-configured`, which is the one no-op allowed to settle an obligation.
+    if (deletedOrder || staleDiscount || pinnedLedgerRetired) return { queued: false, reason: 'refused' }
     return { queued: true }
   } catch (error) {
     // A concurrent insert already queued this posting, so the counterpart exists — already present.

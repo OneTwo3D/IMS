@@ -1,6 +1,8 @@
 import assert from 'node:assert/strict'
 import test, { mock } from 'node:test'
 
+import { INTEGRATION_PLUGIN_IDS, INTEGRATION_PLUGIN_SETTING_KEYS } from '@/lib/integration-plugin-keys'
+
 /**
  * o3d-i0o6 r3 (Codex round 2, HIGH 1) — THE FACADE ENQUEUE TAKES THE PIN TOO, BECAUSE THAT IS THE
  * ROUTE THE PROVED ALLOCATION CREDIT ACTUALLY TAKES.
@@ -165,7 +167,13 @@ test('o3d-i0o6 r3: an UNPINNED enqueue still resolves the active connector, exac
 // `<connector>_sync_enabled` and nothing else, which is the gate that is insufficient).
 //
 // `PurchaseInvoice` is not an order-scoped reference type, so `resolveAccountingEnqueueOrderScope`
-// answers `none` and the pin guard is reached with no sales-order row, no lock and no database.
+// answers `none` and the pin guard is reached with no sales-order row.
+//
+// o3d-i0o6 r8 (Codex round 7, HIGH) — AND THE GUARD NOW ASKS THE TRANSACTION, because that is the
+// only way its answer can survive to the insert. It takes the plugin-selection lock through `tx` and
+// reads the plugin rows `FOR UPDATE`, so these two tests supply a `tx` that serves exactly those two
+// statements and throws on everything else. See `fenceOnlyTx`, and see
+// tests/accounting/pinned-ledger-fence.test.ts for the ordering and window assertions.
 // ---------------------------------------------------------------------------------------------
 
 const TX_REQUEST = {
@@ -175,12 +183,47 @@ const TX_REQUEST = {
   payload: { lines: [{ accountCode: '631', credit: 20 }, { accountCode: '630', debit: 20 }] },
 }
 
-/** Nothing below the guard may be reached; any touch of the transaction is a failure of the test. */
-const refusingTx = new Proxy({}, {
-  get(_target, prop) {
-    throw new Error(`o3d-i0o6 r7: the pinned refusal must come BEFORE any transaction work (tx.${String(prop)})`)
-  },
-})
+/**
+ * o3d-i0o6 r8 (Codex round 7, HIGH) — THIS DOUBLE USED TO FORBID THE FENCE, AND THAT IS WHY IT IS
+ * DIFFERENT NOW.
+ *
+ * r7 wrote it as a Proxy that threw on EVERY property access, under the banner "the pinned refusal
+ * must come BEFORE any transaction work". That was the wrong invariant, and it was wrong in the
+ * direction that hid the finding: answering the pinned-ledger question WITHOUT touching the
+ * transaction is precisely what makes the answer an unlocked snapshot, and a snapshot is what the
+ * switch commits behind. A fixture that refuses to be asked cannot be asked under a lock, so it could
+ * not have failed for the missing fence — it would have failed for the FIX.
+ *
+ * What r7 actually wanted to assert is narrower and still asserted: NOTHING IS WRITTEN, and nothing
+ * below the guard is reached. So the two statements the fence legitimately issues are served — the
+ * advisory lock and the `FOR UPDATE` read of the plugin rows — and every other member, `accountingSyncLog`
+ * included, still throws.
+ *
+ * AND IT SERVES THEM FROM `enabledPlugins`, the same variable the pooled `isIntegrationPluginEnabled`
+ * double reads. One source, so the fixture cannot answer the locked read and the pooled read
+ * differently and let a bug hide in the disagreement. (The file that deliberately makes them
+ * disagree — because production does, inside the window — is
+ * tests/accounting/pinned-ledger-fence.test.ts, and it says so.)
+ */
+function fenceOnlyTx(): unknown {
+  const served = {
+    $executeRaw: async () => 1,
+    $queryRaw: async () => (
+      INTEGRATION_PLUGIN_IDS
+        .filter((id) => enabledPlugins.includes(id))
+        .map((id) => ({ key: INTEGRATION_PLUGIN_SETTING_KEYS[id], value: 'true' }))
+    ),
+  }
+  return new Proxy(served, {
+    get(target, prop) {
+      if (prop in target) return target[prop as keyof typeof target]
+      throw new Error(
+        `o3d-i0o6 r7/r8: nothing below the pinned-ledger guard may be reached, and nothing may be `
+        + `written (tx.${String(prop)})`,
+      )
+    },
+  })
+}
 
 test('o3d-i0o6 r7: the IN-TRANSACTION enqueue refuses a pin that is not the active connector', async () => {
   reset()
@@ -190,7 +233,7 @@ test('o3d-i0o6 r7: the IN-TRANSACTION enqueue refuses a pin that is not the acti
   const { queueAccountingSyncTx } = await import('@/lib/accounting')
   let reported: { queued: boolean; reason?: string; connector: string | null } | null = null
   const wrote = await queueAccountingSyncTx(
-    refusingTx as never,
+    fenceOnlyTx() as never,
     {
       ...TX_REQUEST,
       connector: 'xero',
@@ -218,7 +261,7 @@ test('o3d-i0o6 r7: THE CONTROL — an ACTIVE pin passes the guard and reaches th
   const { queueAccountingSyncTx } = await import('@/lib/accounting')
   let reported: { queued: boolean; reason?: string; connector: string | null } | null = null
   const wrote = await queueAccountingSyncTx(
-    refusingTx as never,
+    fenceOnlyTx() as never,
     {
       ...TX_REQUEST,
       connector: 'xero',

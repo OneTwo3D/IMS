@@ -14,6 +14,7 @@ import {
   logStaleOrderDiscountEnqueue,
 } from '@/lib/domain/accounting/enqueue-order-guard'
 import { lockFollowUpScope } from '@/lib/domain/accounting/followup-scope-lock'
+import { pinnedLedgerIsServicedUnderLock } from '@/lib/integration-plugin-selection-lock'
 import { stampingCustodyOnCreate } from '@/lib/domain/accounting/money-attempt-provenance'
 import {
   classifyPriorAttempts,
@@ -49,9 +50,23 @@ export async function queueQuickBooksSync(params: {
   referenceId: string
   payload: Record<string, unknown>
   idempotencyKey?: string
+  /**
+   * o3d-i0o6 r8 (Codex round 7, HIGH) — the twin of the Xero queue's `pinnedLedger`, for the same
+   * reason and enforced at the same point. See lib/connectors/xero/queue.ts: the facade's pinned-ledger
+   * check is a pooled read taken several awaits before the insert, so it has to be re-asked inside the
+   * transaction that inserts, under the plugin-selection lock, which is held to that transaction's
+   * commit.
+   *
+   * Cross-ported deliberately rather than left as "Xero is the one that matters today": the defect is
+   * about ANY two connectors, and a fence on one of them is not a fence.
+   */
+  pinnedLedger?: 'xero' | 'quickbooks'
   // o3d-2sm1 r7: and it SAYS what it did — the twin of the Xero queue's contract, for the same
   // reason. See ConnectorEnqueueOutcome.
 }): Promise<ConnectorEnqueueOutcome> {
+  // o3d-i0o6 r8: a pin naming a different ledger cannot be satisfied here — every row this queue
+  // writes is a QuickBooks row. See the twin in lib/connectors/xero/queue.ts.
+  if (params.pinnedLedger && params.pinnedLedger !== 'quickbooks') return { queued: false, reason: 'refused' }
   const settings = await getQuickBooksSettings()
   if (settings.quickbooks_sync_enabled !== 'true') return { queued: false, reason: 'not-configured' }
 
@@ -99,6 +114,8 @@ export async function queueQuickBooksSync(params: {
   try {
     let mirrorErrorMessage: string | null = null
     let deletedOrder = false
+    // o3d-i0o6 r8: the pinned ledger stopped being the active one while this enqueue was in flight.
+    let pinnedLedgerRetired = false
     let staleDiscount: { payloadDiscount: number; liveDiscount: number } | null = null
     await db.$transaction(async (tx) => {
       // o3d-hrak: join the sales-order delete protocol. The hard delete locks the order and
@@ -110,6 +127,14 @@ export async function queueQuickBooksSync(params: {
         referenceType: params.referenceType,
         referenceId: params.referenceId,
       })
+      // o3d-i0o6 r8 (Codex round 7, HIGH) — AND THE PINNED LEDGER IS STILL THE ACTIVE ONE, verified
+      // under the lock that keeps it so, inside the transaction that inserts. The twin of the check in
+      // lib/connectors/xero/queue.ts; the order is sales-order row lock -> plugin selection ->
+      // follow-up scope, identical on both queues and identical to the in-transaction enqueue.
+      if (params.pinnedLedger && !await pinnedLedgerIsServicedUnderLock(tx, 'quickbooks')) {
+        pinnedLedgerRetired = true
+        return
+      }
       // o3d-0m56: and the accounting scope lock, so this enqueue cannot land between the manual
       // retry's sibling snapshot and its reset. Taken AFTER the order lock, the same order every
       // other enqueue writer takes them in, so the pair cannot deadlock.
@@ -180,9 +205,10 @@ export async function queueQuickBooksSync(params: {
         description: mirrorErrorMessage,
       })
     }
-    // NEITHER of these is a decision that nothing will post: the order went away under this enqueue,
-    // or the payload it was built from had been superseded. The posting is still owed.
-    if (deletedOrder || staleDiscount) return { queued: false, reason: 'refused' }
+    // NONE of these is a decision that nothing will post: the order went away under this enqueue, the
+    // payload it was built from had been superseded, or the ledger it was pinned to is no longer the
+    // one being serviced. The posting is still owed in every case.
+    if (deletedOrder || staleDiscount || pinnedLedgerRetired) return { queued: false, reason: 'refused' }
     return { queued: true }
   } catch (error) {
     // A concurrent insert already queued this posting, so the counterpart exists — already present.
