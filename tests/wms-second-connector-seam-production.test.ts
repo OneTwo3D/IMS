@@ -61,8 +61,10 @@ const ACME_FORM = { endpoint: 'https://acme.example/api', account: 'acme-ops' }
  */
 const acmeHooks: WmsConnectorHooks = {
   asn: async () => acmeAsnActions(acmeConnector, asnLog),
-  syncDashboard: async () => ({ getDashboardData: async () => ({ configured: true, panel: ACME_PANEL }) }),
-  onboarding: async () => ({ getConnectionData: async () => ({ configured: true, form: ACME_FORM }) }),
+  // NEITHER HOOK STATES `configured` (round 8, Codex HIGH 1): a hook supplies its screen's payload,
+  // and whether the connection is set up is `isConfigured()` — see connector-hooks.ts.
+  syncDashboard: async () => ({ getDashboardData: async () => ({ panel: ACME_PANEL }) }),
+  onboarding: async () => ({ getConnectionData: async () => ({ form: ACME_FORM }) }),
   productSync: async () => ({
     syncProduct: async (productId, triggeredBy) => { productSyncLog.push(`product:${productId}:${triggeredBy}`) },
     syncBundle: async (productId, triggeredBy) => { productSyncLog.push(`bundle:${productId}:${triggeredBy}`) },
@@ -106,10 +108,20 @@ mock.module('@/lib/integration-plugins', {
 })
 
 const seamDefs: WmsConnectorDef<string>[] = [
-  // Mintsoft's real definition, minus its hooks: these tests never dispatch to Mintsoft, and
-  // leaving the hooks on would let a routing bug reach the real server actions (and the real
-  // database) instead of failing the assertion.
-  { ...(realRegistry.BUILT_IN_WMS_CONNECTORS[0] as WmsConnectorDef<string>), hooks: undefined },
+  // Mintsoft's real definition, minus its hooks AND minus its factory: these tests never dispatch
+  // to Mintsoft, and leaving either on would let a routing bug reach the real server actions and
+  // the real database instead of failing the assertion. The factory matters as much as the hooks
+  // now that the UI facades resolve `isConfigured()` through it (round 8, Codex HIGH 1) — the
+  // fallback path, with no plugin enabled, resolves Mintsoft and would otherwise read settings.
+  {
+    ...(realRegistry.BUILT_IN_WMS_CONNECTORS[0] as WmsConnectorDef<string>),
+    hooks: undefined,
+    create: (() => ({
+      id: 'mintsoft',
+      name: 'Mintsoft',
+      isConfigured: async () => false,
+    })) as never,
+  },
   {
     ...(acmeWmsConnectorDef(acmeWarehouse) as unknown as WmsConnectorDef<string>),
     hooks: acmeHooks,
@@ -127,6 +139,9 @@ mock.module('@/lib/connectors/wms/registry', {
     getWmsConnectorHooks: (id: string) => seamRegistry.findDef(id)?.hooks ?? {},
     // The PRODUCTION dispatch-sweep entrypoint resolves its connector through this.
     getWmsConnector: (id: string) => seamRegistry.getConnector(id),
+    // And the two UI facades read the connection's STATE through this — the registry is what turns
+    // a registered id into the connector whose `isConfigured()` is the answer (round 8, HIGH 1).
+    findWmsConnector: (id: string) => seamRegistry.findDef(id)?.create() ?? null,
   },
 })
 
@@ -282,10 +297,25 @@ test('seam/production: the onboarding facade reports a registered non-Mintsoft c
   assert.deepEqual(data.connectorData[ACME_WMS_ID as never], ACME_FORM)
 })
 
-test('seam/production: a connector that declares NEITHER facade degrades without claiming to be absent', async () => {
-  // The other half of routing by capability, for these two as for the ASN facade: "this connector
-  // has no panel / no setup form" must stay expressible and must stay DISTINCT from "nothing is
-  // enabled" — the /sync facade's `null`.
+/**
+ * THE TEST THAT USED TO PIN THE DEFECT (o3d-remove-shiphero round 8, Codex HIGH 1).
+ *
+ * WHAT IT ASSERTED, AND WHY THAT WAS WRONG. Until round 8 this case ended
+ * `assert.equal(dashboard!.configured, false)` — for a connector whose `isConfigured()` returns
+ * TRUE. Its reasoning was that a connector declaring no panel "has nothing configured here", so
+ * `false` was read as a statement about the SCREEN. But `configured` is not about the screen: it is
+ * what the /sync card renders as CONFIGURED and what the onboarding wizard ticks its setup step
+ * off, and both of those are claims about the CONNECTION. So the assertion agreed with the facade's
+ * hard-coded `configured: false` while the fixture standing in for the warehouse said the
+ * connection was live — and the fixture was right. A test that blesses the wrong answer is why this
+ * survived round 6, which audited these two files specifically.
+ *
+ * WHAT IT ASSERTS NOW. Capability and state are read SEPARATELY and vary independently: a live
+ * connection with no panel is `configured: true` with an empty payload, and the same connector with
+ * its connection taken away is `configured: false` — from the same code path, so the value is
+ * plainly being read rather than written by the branch.
+ */
+test('seam/production: a connector with NO panel and a LIVE connection is not reported as unconfigured', async () => {
   const previous = seamDefs[1].hooks
   seamDefs[1].hooks = {}
   try {
@@ -295,15 +325,50 @@ test('seam/production: a connector that declares NEITHER facade degrades without
     const dashboard = await wmsSync.getWmsSyncDashboardData()
     assert.notEqual(dashboard, null, 'a connector with no panel is still an enabled connector')
     assert.equal(dashboard!.connectorId, ACME_WMS_ID)
-    assert.equal(dashboard!.configured, false)
+    assert.equal(
+      dashboard!.configured, true,
+      'the connector says its connection is set up; shipping no panel does not unsay it',
+    )
     assert.deepEqual(dashboard!.connectorData, {}, 'nothing is claimed on behalf of a connector that ran nothing')
 
     const onboarding = await wmsOnboarding.getWmsOnboardingConnectionData()
     assert.equal(onboarding.connectorLabel, ACME_WMS_LABEL, 'still named')
-    assert.equal(onboarding.configured, false)
+    assert.equal(onboarding.configured, true, 'and the wizard does not ask for credentials that are already stored')
     assert.deepEqual(onboarding.connectorData, {})
   } finally {
     seamDefs[1].hooks = previous
+  }
+})
+
+test('seam/production: the SAME no-panel connector reports unconfigured when its connection really is absent', async () => {
+  // THE CONTRAST THAT MAKES THE CASE ABOVE A TEST OF A READ. Without it, a facade that hard-coded
+  // `configured: true` would pass everything above — the same shape of mistake, mirrored.
+  const previousHooks = seamDefs[1].hooks
+  seamDefs[1].hooks = {}
+  acmeWarehouse.configured = false
+  try {
+    const wmsSync = await import('../app/actions/wms-sync.ts')
+    const wmsOnboarding = await import('../app/actions/wms-onboarding.ts')
+    assert.equal((await wmsSync.getWmsSyncDashboardData())!.configured, false)
+    assert.equal((await wmsOnboarding.getWmsOnboardingConnectionData()).configured, false)
+  } finally {
+    acmeWarehouse.configured = true
+    seamDefs[1].hooks = previousHooks
+  }
+})
+
+test('seam/production: a connector WITH a panel is still reported from its own isConfigured, not its hook', async () => {
+  // The hook cannot state `configured` any more, so the value on the hooked path must come from the
+  // same place as on the hook-less path. Taking the connection away while the panel keeps returning
+  // its payload proves it: a facade still reading a hook-supplied flag would answer `true` here.
+  acmeWarehouse.configured = false
+  try {
+    const wmsSync = await import('../app/actions/wms-sync.ts')
+    const data = await wmsSync.getWmsSyncDashboardData()
+    assert.equal(data!.configured, false, 'the connection is gone even though the panel still renders')
+    assert.deepEqual(data!.connectorData[ACME_WMS_ID as never], ACME_PANEL, 'and the panel payload is unaffected')
+  } finally {
+    acmeWarehouse.configured = true
   }
 })
 

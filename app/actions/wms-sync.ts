@@ -2,7 +2,7 @@
 
 import { requirePermission } from '@/lib/auth/server'
 import { getIntegrationPluginState } from '@/lib/integration-plugins'
-import { findWmsConnectorLabel, getWmsConnectorHooks } from '@/lib/connectors/wms/registry'
+import { findWmsConnector, findWmsConnectorLabel, getWmsConnectorHooks } from '@/lib/connectors/wms/registry'
 import { WMS_CONNECTOR_IDS, type WmsConnectorId } from '@/lib/connectors/wms/types'
 
 /**
@@ -17,8 +17,13 @@ import { WMS_CONNECTOR_IDS, type WmsConnectorId } from '@/lib/connectors/wms/typ
  * note on app/actions/wms-asn.ts.
  *
  * It now routes on CAPABILITY: does the active connector declare a sync dashboard? A connector that
- * does not is reported as resolved-but-unconfigured rather than as absent, because those call for
- * different things from an operator (enable a WMS / finish setting this one up).
+ * does not is reported as resolved-but-panel-less rather than as absent, because those call for
+ * different things from an operator (enable a WMS / administer this one elsewhere).
+ *
+ * o3d-remove-shiphero round 8 (Codex HIGH 1) — AND CAPABILITY IS NOT STATE. Round 6's no-hook arm
+ * answered `configured: false`, which is a claim about the CONNECTION, from a branch that had only
+ * established something about the BUILD. `configured` is now read from `isConfigured()` — the one
+ * mandatory method on the connector contract — on every path, before the hook is even looked up.
  *
  * THE DTO IS KEYED BY CONNECTOR, not by a named member. It used to carry `mintsoft: … | null`,
  * which the sync dashboard read by name — and that member, not the dispatch, was what actually
@@ -46,6 +51,20 @@ export type WmsSyncDashboardData = {
    * than throwing from inside a read.
    */
   connectorLabel: string
+  /**
+   * Whether the ACTIVE CONNECTOR'S CONNECTION is set up — a fact about STATE, read from the one
+   * mandatory statement a connector makes about itself (o3d-remove-shiphero round 8, Codex HIGH 1).
+   *
+   * It is NOT a fact about capability, and round 6 shipped it conflated with one: the no-hook arm
+   * below answered `configured: false` for a connector that simply declares no dashboard, so a
+   * live, correctly configured warehouse was described to the operator as "not set up" — beside a
+   * header naming it and under an enable switch that was on. The remedy an operator takes from
+   * "not set up" is to re-enter credentials that were never missing.
+   *
+   * `connectorData` is the capability statement: empty means "this connector ran no panel". The two
+   * facts are now carried by two fields with two sources, and neither branch of this file writes
+   * this one.
+   */
   configured: boolean
   /**
    * The active connector's own panel payload, under its own id. Read only by the matching panel in
@@ -74,14 +93,21 @@ export async function getWmsSyncDashboardData(
   if (!connectorId) return null
 
   const connectorLabel = findWmsConnectorLabel(connectorId) ?? connectorId
-  const hook = getWmsConnectorHooks(connectorId).syncDashboard
-  if (!hook) return { connectorId, connectorLabel, configured: false, connectorData: {} }
 
-  const dashboard = await (await hook()).getDashboardData()
+  // ONE READ, ON EVERY PATH, BEFORE THE CAPABILITY QUESTION IS ASKED AT ALL. Whether the connection
+  // is set up does not depend on whether this build ships a panel for it, so it is not resolved
+  // inside either arm below. `findWmsConnector` rather than `getWmsConnector`: an id left behind by
+  // a connector this build no longer ships is unconfigurable, not a throw from inside a read.
+  const connector = findWmsConnector(connectorId)
+  const configured = connector !== null && await connector.isConfigured()
+
+  const hook = getWmsConnectorHooks(connectorId).syncDashboard
+  if (!hook) return { connectorId, connectorLabel, configured, connectorData: {} }
+
   return {
     connectorId,
     connectorLabel,
-    configured: dashboard.configured,
-    connectorData: { [connectorId]: dashboard.panel },
+    configured,
+    connectorData: { [connectorId]: (await (await hook()).getDashboardData()).panel },
   }
 }

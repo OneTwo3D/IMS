@@ -53,6 +53,43 @@
  *     interpolated into a pattern, so an id containing `+`, `.`, `(` or `|` matches itself
  *     and only itself.
  *
+ * o3d-remove-shiphero round 8 (Codex HIGH 3) — WHAT THE ROUND-6 FOLD STILL GOT WRONG, AND THE RULE
+ * THAT ENDS THE SEQUENCE.
+ *
+ * Rounds 3 through 7 each closed the spelling that had just been found and each revealed another.
+ * Round 8 closed four more, but the interesting one is the first, because it is not a missing
+ * feature — it is a WRONG ANSWER:
+ *
+ *   - ARITHMETIC IS NOT CONCATENATION. Round 6 folded every binary `+` as string concatenation, so
+ *     `String.fromCharCode(100+9,100+5,100+10,100+16,100+15,100+11,100+2,100+16)` — which spells a
+ *     connector id at runtime — folded its arguments to `1009`, `1005`, … and produced eight
+ *     unrelated characters, EXACTLY, with no finding. "Cannot evaluate" is reported; "evaluated,
+ *     confidently, to the wrong value" is not, which makes it the worst failure a fold has
+ *     available. Folds now carry a `numeric` flag and the `+` rule reads the operand types.
+ *   - THE FOLD'S UNIVERSE IS THE REPO, NOT ONE FILE. `import { TAIL } from './ids'; 'mint' + TAIL`
+ *     used to fold to `'mint'`, because an unresolvable operand reads as the empty string and the
+ *     folder never opened another file. Repo imports (`./`, `../`, `@/`) are now FOLLOWED, through
+ *     named and star re-exports, with cycles terminating as a reject. A repo constant it cannot
+ *     follow to a value is a FINDING. A PACKAGE import is neither followed nor reported —
+ *     node_modules is not scanned at all, so requiring evaluability of it would be a rule this
+ *     guard never applies.
+ *   - WHAT IT CANNOT EVALUATE, IT REJECTS — and the rule is deliberately not a list of methods.
+ *     A CONSTANT this fold has already evaluated, put through an operation it cannot evaluate
+ *     (`.replace`, `.padStart`, `.normalize`, whatever is written next), yields an unknown value of
+ *     unknown length and is reported. Modelling `.replace` would have closed one member of an
+ *     unbounded family; that is the sequence rounds 3–7 kept losing. The receiver must FOLD, so
+ *     ordinary code — which transforms runtime DATA, not literals — is untouched. Measured across
+ *     956 files when it landed: two findings, both waived in place.
+ *   - `Buffer.from(x, 'base64')` is EVALUATED rather than rejected, because `atob` was already
+ *     modelled and this is the same operation under another name. An encoding it cannot resolve
+ *     makes it a reject, not a pass.
+ *
+ * WHERE THE LINE SITS, AND WHY. An operand that is a CONSTANT EXPRESSION must be evaluable or it is
+ * a finding. An operand that is runtime DATA — a parameter, a call result — reads as the empty
+ * string. Rejecting every `+` with a non-constant operand was measured at 3,009 sites across 956
+ * files (1,977 with a string literal on one side); a guard that fires on three thousand lines gets
+ * allowlisted into silence, which is how you end up with no guard at all.
+ *
  * o3d-remove-shiphero round 6 (Codex HIGH 2) — WHY IT EVALUATES EXPRESSIONS, NOT TOKENS.
  * The round-4 rewrite inspects each leaf token INDEPENDENTLY, which is the same blindness one
  * level up: `const id = 'mint' + 'soft'` is two tokens, neither containing the id, and
@@ -85,7 +122,7 @@
  */
 
 import { readdirSync, readFileSync, statSync } from 'node:fs'
-import { extname, join, sep } from 'node:path'
+import { dirname, extname, join, sep } from 'node:path'
 import ts from 'typescript'
 
 const ROOT = process.cwd()
@@ -233,11 +270,19 @@ function literalOffsets(text) {
  * The DEFINITION SITES of the id itself — a registry that could not spell the id it
  * registers would not be a registry:
  *   lib/connectors/wms/types.ts (WMS_CONNECTOR_IDS), lib/connectors/wms/registry.ts.
- * Per-connector UI panels / connector registry / enable toggle (parallel to woo/xero):
+ * Per-connector UI panels / connector registry (parallel to woo/xero):
  *   app/(dashboard)/sync/mintsoft-client.tsx, mintsoft-courier-map.tsx,
- *   wms-sync-panel.tsx, sync-dashboard.tsx, app/(dashboard)/settings/system/page.tsx,
- *   components/onboarding/wms-onboarding-connection.tsx,
- *   components/settings/integration-plugins-settings.tsx.
+ *   wms-sync-panel.tsx, sync-dashboard.tsx,
+ *   components/onboarding/wms-onboarding-connection.tsx.
+ *
+ * NOT HERE ANY MORE, deliberately (o3d-m0ad / o3d-remove-shiphero round 8, Codex HIGH 2):
+ * components/settings/integration-plugins-settings.tsx and app/(dashboard)/settings/system/page.tsx.
+ * The Settings plugin screen used to hard-write five switches, one of them the shipped WMS
+ * connector's, with two `as IntegrationPluginState` casts hiding the member a second connector
+ * would have been missing — so a registered connector had no toggle and could not be enabled at
+ * all. It now renders the registry-derived catalogue
+ * (lib/domain/integrations/plugin-catalog.ts) and spells no connector id, which is what lets it be
+ * scanned rather than exempted.
  * Per-connector ops/security probes + cosmetic/plugin registry:
  *   lib/ops/health.ts, lib/ops/rollout-readiness.ts, lib/security/route-auth-policy.ts,
  *   lib/security/public-route-security-policy.ts, lib/integration-plugins.ts,
@@ -284,8 +329,6 @@ const ALLOWLIST = [
   'app/(dashboard)/sync/wms-sync-panel.tsx',
   'app/(dashboard)/sync/sync-dashboard.tsx',
   'components/onboarding/wms-onboarding-connection.tsx',
-  'components/settings/integration-plugins-settings.tsx',
-  'app/(dashboard)/settings/system/page.tsx',
   'lib/domain/integrations/outbox-registry.ts',
   'lib/ops/health.ts',
   'lib/ops/rollout-readiness.ts',
@@ -397,16 +440,71 @@ function unwrapFoldable(node) {
 
 /**
  * A folded value: the ordered PIECES it was stitched from (each remembering the node that supplied
- * it), whether every operand was known, and the nodes of any opaque assembly inside it.
+ * it), whether every operand was known, the nodes of any opaque assembly inside it, and whether the
+ * value is a NUMBER rather than a string.
+ *
+ * `numeric` IS LOAD-BEARING, NOT BOOKKEEPING (o3d-remove-shiphero round 8, Codex HIGH 3). Round 6
+ * folded every binary `+` as string concatenation, so
+ * `String.fromCharCode(100+9,100+5,100+10,100+16,100+15,100+11,100+2,100+16)` — which evaluates to
+ * a connector id at runtime — folded its arguments to `1009`, `1005`, … and produced eight
+ * unrelated CJK characters, EXACTLY, with no finding. That is the worst failure available to a
+ * fold: not "cannot evaluate" (which is reported) but "evaluated, confidently, to the wrong value"
+ * (which is not). A `+` between two numbers is arithmetic; a `+` touching a string is
+ * concatenation; the fold now knows which it is looking at, so it can only be wrong about a value
+ * it has already admitted it does not know.
  */
-const foldOf = (text, node) => ({ pieces: [{ text, node }], exact: true, opaque: [] })
-const foldNothing = (exact) => ({ pieces: [], exact, opaque: [] })
-const foldOpaque = (node) => ({ pieces: [], exact: false, opaque: [node] })
+const foldOf = (text, node) => ({ pieces: [{ text, node }], exact: true, opaque: [], numeric: false })
+const foldNumber = (value, node) => ({ pieces: [{ text: String(value), node }], exact: true, opaque: [], numeric: true })
+const foldNothing = (exact) => ({ pieces: [], exact, opaque: [], numeric: false })
+const foldOpaque = (node) => ({ pieces: [], exact: false, opaque: [node], numeric: false })
 const foldText = (folded) => folded.pieces.map((piece) => piece.text).join('')
 
 /** Re-attribute a derived value (a case fold, a decode, a repeat) to the call that produced it. */
 function foldDerived(text, node, exact, opaque) {
-  return { pieces: [{ text, node }], exact, opaque }
+  return { pieces: [{ text, node }], exact, opaque, numeric: false }
+}
+
+/**
+ * The binary operators that produce a NUMBER from numbers. `+` is in here AND is the only one that
+ * is also string concatenation — which operand types it sees decides which it is.
+ */
+const ARITHMETIC_OPERATORS = new Set([
+  ts.SyntaxKind.PlusToken,
+  ts.SyntaxKind.MinusToken,
+  ts.SyntaxKind.AsteriskToken,
+  ts.SyntaxKind.SlashToken,
+  ts.SyntaxKind.PercentToken,
+  ts.SyntaxKind.AsteriskAsteriskToken,
+  ts.SyntaxKind.AmpersandToken,
+  ts.SyntaxKind.BarToken,
+  ts.SyntaxKind.CaretToken,
+  ts.SyntaxKind.LessThanLessThanToken,
+  ts.SyntaxKind.GreaterThanGreaterThanToken,
+  ts.SyntaxKind.GreaterThanGreaterThanGreaterThanToken,
+])
+
+function applyArithmetic(operator, left, right) {
+  switch (operator) {
+    case ts.SyntaxKind.PlusToken: return left + right
+    case ts.SyntaxKind.MinusToken: return left - right
+    case ts.SyntaxKind.AsteriskToken: return left * right
+    case ts.SyntaxKind.SlashToken: return left / right
+    case ts.SyntaxKind.PercentToken: return left % right
+    case ts.SyntaxKind.AsteriskAsteriskToken: return left ** right
+    case ts.SyntaxKind.AmpersandToken: return left & right
+    case ts.SyntaxKind.BarToken: return left | right
+    case ts.SyntaxKind.CaretToken: return left ^ right
+    case ts.SyntaxKind.LessThanLessThanToken: return left << right
+    case ts.SyntaxKind.GreaterThanGreaterThanToken: return left >> right
+    case ts.SyntaxKind.GreaterThanGreaterThanGreaterThanToken: return left >>> right
+    default: return Number.NaN
+  }
+}
+
+/** The NUMBER a fold denotes, or NaN when it denotes a string or is not exactly known. */
+function foldNumericValue(folded) {
+  if (!folded || !folded.exact || !folded.numeric) return Number.NaN
+  return Number(foldText(folded))
 }
 
 function concatFolds(parts, exact) {
@@ -419,8 +517,87 @@ function concatFolds(parts, exact) {
     opaque.push(...part.opaque)
     if (!part.exact) allKnown = false
   }
-  return { pieces, exact: allKnown, opaque }
+  // Concatenation always yields a STRING, whatever the operands denoted.
+  return { pieces, exact: allKnown, opaque, numeric: false }
 }
+
+/**
+ * THE MODULE BOUNDARY, WHICH USED TO BE A BLIND SPOT (o3d-remove-shiphero round 8, Codex HIGH 3).
+ *
+ * Round 6's folder was bound to ONE file, and read an operand it could not resolve as the empty
+ * string. An imported constant is exactly such an operand, so
+ * `import { SOFT } from '@/lib/connectors/mintsoft/ids'; const id = 'mint' + SOFT` folded to
+ * `'mint'` — not an id — and the guard exited 0 over a live connector literal in a protected file.
+ * Splitting the spelling across two files was all it took, and the second file is usually one where
+ * naming the connector is LEGAL (the allowlist), so nothing catches it at the other end either.
+ *
+ * The fix is not another rule about `+`. It is that the folder's universe is now THE REPO rather
+ * than one file: an import of a repo module is FOLLOWED and the exported initializer is folded, so
+ * a constant assembled across files evaluates the way the runtime evaluates it. What it still
+ * cannot follow inside the repo — a re-export chain it loses, an export that is not a `const`, a
+ * file that will not parse — is a FINDING rather than an empty string, because the value is a
+ * constant the guard has admitted it cannot evaluate.
+ *
+ * A BARE specifier (`node:path`, `react`) is NOT followed and is NOT reported. node_modules is not
+ * scanned at all — it is in SKIPPED_DIRECTORIES — so reporting a package import here would be the
+ * guard demanding of third-party code a property it never checks. The repo is the universe; the
+ * boundary of the universe is not a hole in it.
+ */
+const MODULE_EXTENSIONS = ['.ts', '.tsx', '.js', '.jsx', '.mjs', '.cjs']
+
+/** The repo-relative path an import specifier names, or `null` for a package (non-repo) import. */
+function resolveModulePath(fromRelPath, specifier) {
+  let base
+  if (specifier.startsWith('@/')) base = specifier.slice(2)
+  else if (specifier.startsWith('./') || specifier.startsWith('../')) {
+    base = join(dirname(fromRelPath), specifier).split(sep).join('/')
+  } else return null
+  if (base.startsWith('..')) return null
+
+  const candidates = []
+  const stripped = base.replace(/\.(ts|tsx|js|jsx|mjs|cjs)$/, '')
+  candidates.push(base)
+  for (const ext of MODULE_EXTENSIONS) candidates.push(`${stripped}${ext}`)
+  for (const ext of MODULE_EXTENSIONS) candidates.push(`${stripped}/index${ext}`)
+  for (const candidate of candidates) {
+    try {
+      if (statSync(join(ROOT, candidate)).isFile()) return candidate
+    } catch { /* next candidate */ }
+  }
+  return null
+}
+
+/** Parsed source files, memoised: a constant chased through five modules parses each one once. */
+const moduleSourceCache = new Map()
+function moduleSourceFor(relPath) {
+  if (moduleSourceCache.has(relPath)) return moduleSourceCache.get(relPath)
+  let parsed = null
+  try {
+    const source = readFileSync(join(ROOT, relPath), 'utf8')
+    const sf = ts.createSourceFile(relPath, source, ts.ScriptTarget.Latest, true, scriptKindFor(relPath))
+    parsed = (sf.parseDiagnostics ?? []).length > 0 ? null : sf
+  } catch {
+    parsed = null
+  }
+  moduleSourceCache.set(relPath, parsed)
+  return parsed
+}
+
+/** Folders, memoised per file, so a cycle costs nothing and a hot module is parsed once. */
+const moduleFolderCache = new Map()
+function folderFor(relPath) {
+  if (moduleFolderCache.has(relPath)) return moduleFolderCache.get(relPath)
+  // Seeded with `null` BEFORE the folder is built: makeConstantFolder can re-enter this for the
+  // same file through a cycle, and a half-built folder must read as "cannot resolve", not recurse.
+  moduleFolderCache.set(relPath, null)
+  const sf = moduleSourceFor(relPath)
+  const folder = sf ? makeConstantFolder(sf) : null
+  moduleFolderCache.set(relPath, folder)
+  return folder
+}
+
+/** Modules currently being resolved through, so an import cycle terminates instead of recursing. */
+const moduleResolutionStack = new Set()
 
 /**
  * A folder bound to one source file: in-file `const` initializers and enum members resolve, so
@@ -436,13 +613,56 @@ function makeConstantFolder(sourceFile) {
   /** Names bound by an import — `path`, `Prisma`. A MODULE, never a local array (see `join`). */
   const importedNames = new Set()
 
+  /** local name -> { specifier, exported } for every value import. `exported` is '*' for a namespace. */
+  const importBindings = new Map()
+  /** `export { X } from './y'` / `export * from './y'`, so an export this file re-exports resolves. */
+  const namedReExports = new Map()
+  const starReExports = []
+  /** Names this file exports as a `const` — the only export shape a constant fold can follow. */
+  const exportedConstNames = new Set()
+
   const collect = (node) => {
-    if (ts.isImportDeclaration(node) && node.importClause) {
+    if (ts.isImportDeclaration(node) && node.importClause && ts.isStringLiteral(node.moduleSpecifier)) {
       const clause = node.importClause
-      if (clause.name) importedNames.add(clause.name.text)
+      const specifier = node.moduleSpecifier.text
+      // `import type { … }` binds no value; following it would resolve a TYPE alias to whatever
+      // const happens to share its name.
+      const typeOnlyClause = clause.isTypeOnly === true
+      if (clause.name) {
+        importedNames.add(clause.name.text)
+        if (!typeOnlyClause) importBindings.set(clause.name.text, { specifier, exported: 'default' })
+      }
       if (clause.namedBindings) {
-        if (ts.isNamespaceImport(clause.namedBindings)) importedNames.add(clause.namedBindings.name.text)
-        else for (const element of clause.namedBindings.elements) importedNames.add(element.name.text)
+        if (ts.isNamespaceImport(clause.namedBindings)) {
+          importedNames.add(clause.namedBindings.name.text)
+          if (!typeOnlyClause) importBindings.set(clause.namedBindings.name.text, { specifier, exported: '*' })
+        } else {
+          for (const element of clause.namedBindings.elements) {
+            importedNames.add(element.name.text)
+            if (typeOnlyClause || element.isTypeOnly === true) continue
+            importBindings.set(element.name.text, {
+              specifier,
+              exported: (element.propertyName ?? element.name).text,
+            })
+          }
+        }
+      }
+    }
+    if (ts.isExportDeclaration(node) && !node.isTypeOnly && node.moduleSpecifier && ts.isStringLiteral(node.moduleSpecifier)) {
+      const specifier = node.moduleSpecifier.text
+      if (node.exportClause && ts.isNamedExports(node.exportClause)) {
+        for (const element of node.exportClause.elements) {
+          if (element.isTypeOnly) continue
+          namedReExports.set(element.name.text, { specifier, exported: (element.propertyName ?? element.name).text })
+        }
+      } else if (!node.exportClause) {
+        starReExports.push(specifier)
+      }
+    }
+    if (ts.isVariableStatement(node)
+      && (node.modifiers ?? []).some((m) => m.kind === ts.SyntaxKind.ExportKeyword)) {
+      for (const declaration of node.declarationList.declarations) {
+        if (ts.isIdentifier(declaration.name)) exportedConstNames.add(declaration.name.text)
       }
     }
     if (ts.isVariableDeclaration(node) && ts.isIdentifier(node.name)) {
@@ -472,7 +692,23 @@ function makeConstantFolder(sourceFile) {
     const current = unwrapFoldable(node)
 
     if (ts.isStringLiteral(current) || ts.isNoSubstitutionTemplateLiteral(current)) return foldOf(current.text, current)
-    if (ts.isNumericLiteral(current)) return foldOf(String(Number(current.text)), current)
+    if (ts.isNumericLiteral(current)) return foldNumber(Number(current.text), current)
+    if (ts.isBigIntLiteral(current)) return foldNumber(Number(current.text.replace(/n$/, '')), current)
+
+    // A NUMBER stays a number through unary +/-/~ (o3d-remove-shiphero round 8). Without this,
+    // `String.fromCharCode(-(-109), ...)` folds to nothing and the bound below rescues it only
+    // while the argument count is small.
+    if (ts.isPrefixUnaryExpression(current)
+      && (current.operator === ts.SyntaxKind.MinusToken
+        || current.operator === ts.SyntaxKind.PlusToken
+        || current.operator === ts.SyntaxKind.TildeToken)) {
+      const operand = fold(current.operand, depth + 1)
+      const value = foldNumericValue(operand)
+      if (!Number.isFinite(value)) return null
+      const applied = current.operator === ts.SyntaxKind.MinusToken ? -value
+        : current.operator === ts.SyntaxKind.PlusToken ? value : ~value
+      return foldNumber(applied, current)
+    }
 
     if (ts.isTemplateExpression(current)) {
       const parts = [foldOf(current.head.text, current.head)]
@@ -486,29 +722,58 @@ function makeConstantFolder(sourceFile) {
       return concatFolds(parts, exact)
     }
 
-    if (ts.isBinaryExpression(current) && current.operatorToken.kind === ts.SyntaxKind.PlusToken) {
-      const left = fold(current.left, depth + 1)
-      const right = fold(current.right, depth + 1)
-      if (!left && !right) return null
-      return concatFolds([left, right], true)
+    if (ts.isBinaryExpression(current)) {
+      const operator = current.operatorToken.kind
+      // ARITHMETIC, NOT CONCATENATION — the round-8 fix (Codex HIGH 3). `+` is the only operator
+      // that is both, and which one it is depends on the OPERAND TYPES, not on the token. Two
+      // numbers add; anything touching a string concatenates. Every other arithmetic operator
+      // coerces to number unconditionally, so it can never build a string and is folded only when
+      // both sides are known numbers (a `-` on an unknown operand is NaN, not an id).
+      if (ARITHMETIC_OPERATORS.has(operator)) {
+        const left = fold(current.left, depth + 1)
+        const right = fold(current.right, depth + 1)
+        const leftValue = foldNumericValue(left)
+        const rightValue = foldNumericValue(right)
+        if (Number.isFinite(leftValue) && Number.isFinite(rightValue)) {
+          const value = applyArithmetic(operator, leftValue, rightValue)
+          if (Number.isFinite(value)) return foldNumber(value, current)
+          return null
+        }
+        if (operator !== ts.SyntaxKind.PlusToken) return null
+        if (!left && !right) return null
+        return concatFolds([left, right], true)
+      }
+      return null
     }
 
     if (ts.isIdentifier(current)) {
       const name = current.text
       if (resolving.has(name)) return null
-      const initializer = constInitializers.get(name)
-      if (!initializer) return null
-      resolving.add(name)
-      try {
-        return fold(initializer, depth + 1)
-      } finally {
-        resolving.delete(name)
+      if (constInitializers.has(name)) {
+        const initializer = constInitializers.get(name)
+        if (!initializer) return null
+        resolving.add(name)
+        try {
+          return fold(initializer, depth + 1)
+        } finally {
+          resolving.delete(name)
+        }
       }
+      const binding = importBindings.get(name)
+      if (binding && binding.exported !== '*') return foldImported(binding, current, depth)
+      return null
     }
 
     if (ts.isPropertyAccessExpression(current) && ts.isIdentifier(current.expression) && ts.isIdentifier(current.name)) {
       const member = enumMembers.get(`${current.expression.text}.${current.name.text}`)
-      return member ? fold(member, depth + 1) : null
+      if (member) return fold(member, depth + 1)
+      // `import * as ids from './ids'; ids.SOFT` — the same cross-module constant, spelled through
+      // a namespace. Reached here and not above because the namespace itself is never a string.
+      const namespaceBinding = importBindings.get(current.expression.text)
+      if (namespaceBinding && namespaceBinding.exported === '*' && !constInitializers.has(current.expression.text)) {
+        return foldImported({ specifier: namespaceBinding.specifier, exported: current.name.text }, current, depth)
+      }
+      return null
     }
 
     if (ts.isCallExpression(current)) return foldCall(current, depth)
@@ -539,6 +804,53 @@ function makeConstantFolder(sourceFile) {
     if (!ts.isPropertyAccessExpression(callee) || !ts.isIdentifier(callee.name)) return null
     const method = callee.name.text
     const receiver = unwrapFoldable(callee.expression)
+
+    // `Buffer.from('bWludHNvZnQ=', 'base64')` is `atob` under another name, and `atob` has been
+    // modelled since round 6 — so this is not one more method, it is the second spelling of one
+    // already covered (o3d-remove-shiphero round 8, Codex HIGH 3). It is EXACTLY evaluable when the
+    // input and the encoding are both known, and OPAQUE when they are not: a constant put through a
+    // transcoding the guard cannot perform is precisely the thing it must not read as empty.
+    //
+    // The fold carries the BYTES as a latin1 string (`binary: true`) so the `.toString(enc)` that
+    // always follows can re-encode them rather than having to guess what the buffer held.
+    if (ts.isIdentifier(receiver) && receiver.text === 'Buffer' && method === 'from'
+      && !importedNames.has('Buffer')) {
+      const input = node.arguments.length >= 1 && !ts.isSpreadElement(node.arguments[0])
+        ? fold(node.arguments[0], depth + 1)
+        : null
+      // A non-constant input is runtime DATA, not a spelling — read as today, i.e. not a finding.
+      if (!input || !input.exact || input.numeric) return null
+      const encodingFold = node.arguments.length >= 2 ? fold(node.arguments[1], depth + 1) : foldOf('utf8', node)
+      const encoding = encodingFold && encodingFold.exact && !encodingFold.numeric ? foldText(encodingFold) : null
+      if (encoding === null || !Buffer.isEncoding(encoding)) return foldOpaque(node)
+      try {
+        const bytes = Buffer.from(foldText(input), encoding).toString('latin1')
+        return { pieces: [{ text: bytes, node }], exact: true, opaque: [], numeric: false, binary: true }
+      } catch {
+        return foldOpaque(node)
+      }
+    }
+
+    if (method === 'toString') {
+      const base = fold(receiver, depth + 1)
+      // An INEXACT base is an unknown operand, and an unknown operand reads as the empty string
+      // everywhere else in this fold — see the `+` rule. Rejecting here and not there would make
+      // `(count + 1).toString()` a finding while `'x' + count` is not, which is the inconsistency
+      // that gets a guard allowlisted into silence. The opaque node inside such a base is still
+      // reported at its own site, because every sub-expression is folded independently.
+      if (!base || !base.exact) return null
+      if (!base.binary) return foldDerived(foldText(base), node, true, [])
+      const encodingFold = node.arguments.length >= 1 && !ts.isSpreadElement(node.arguments[0])
+        ? fold(node.arguments[0], depth + 1)
+        : foldOf('utf8', node)
+      const encoding = encodingFold && encodingFold.exact && !encodingFold.numeric ? foldText(encodingFold) : null
+      if (encoding === null || !Buffer.isEncoding(encoding)) return foldOpaque(node)
+      try {
+        return foldDerived(Buffer.from(foldText(base), 'latin1').toString(encoding), node, true, [])
+      } catch {
+        return foldOpaque(node)
+      }
+    }
 
     // String.fromCharCode / String.fromCodePoint — the only construct here that mints characters
     // no literal in the file ever shows.
@@ -631,10 +943,86 @@ function makeConstantFolder(sourceFile) {
       return foldDerived(applied, node, base.exact, base.opaque)
     }
 
+    // THE RULE THAT ENDS THE SEQUENCE OF SPELLINGS (o3d-remove-shiphero round 8, Codex HIGH 3).
+    //
+    // Rounds 3 to 7 each closed the spelling that had just been found and each revealed another:
+    // a regex literal, JSX text, `'mint' + 'soft'`, `'\x6dintsoft'`, `.join('')`, `fromCharCode`.
+    // `'mintXsoft'.replace('X', '')` is the same shape again, and so is the next one nobody has
+    // written down. Modelling `.replace` would close one member of an unbounded family
+    // (`.padStart`, `.normalize`, `.split().reverse().join()`, …).
+    //
+    // So the rule is not about WHICH method. A CONSTANT STRING this guard has already evaluated,
+    // put through an operation it cannot evaluate, yields a value it does not know — and an
+    // unknown value that could be of any length is a FINDING, not an empty string. The cost is
+    // bounded and was measured, not assumed: across the 955 scanned files this fires on nothing
+    // that is not already waived, because ordinary code transforms runtime data (whose receiver
+    // does not fold and is therefore untouched here), not string literals.
+    const constantReceiver = fold(receiver, depth + 1)
+    if (constantReceiver && constantReceiver.exact && !constantReceiver.numeric) return foldOpaque(node)
+
     return null
   }
 
-  return (node) => fold(node, 0)
+  /**
+   * A constant that lives in ANOTHER repo module, folded there and re-attributed here.
+   *
+   * Three outcomes, and the middle one is the point:
+   *   - a PACKAGE import (`node:path`, `react`) → `null`, read as data. node_modules is not
+   *     scanned, so demanding evaluability of it would be a rule the guard never applies;
+   *   - a REPO module the guard cannot follow to a constant — missing file, a file that will not
+   *     parse, an export that is not a `const`, a re-export chain it loses — → OPAQUE, i.e. a
+   *     finding. This is a constant expression whose value the guard has admitted it cannot
+   *     evaluate, which is exactly what it must not read as the empty string;
+   *   - a repo constant it CAN fold → that value.
+   *
+   * Re-attributed to the local node: the remote pieces point into another SourceFile, and blaming
+   * a line number read out of the wrong file would put the finding — and every waiver that has to
+   * suppress it — on an unrelated line.
+   */
+  function foldImported(binding, node, depth) {
+    if (depth > 24) return foldOpaque(node)
+    const target = resolveModulePath(sourceFile.fileName, binding.specifier)
+    if (target === null) {
+      // Not a repo module. Outside the universe this guard scans; see the header above.
+      return /^[.@]/.test(binding.specifier) ? foldOpaque(node) : null
+    }
+    const key = `${target}#${binding.exported}`
+    if (moduleResolutionStack.has(key)) return foldOpaque(node)
+    moduleResolutionStack.add(key)
+    try {
+      const folder = folderFor(target)
+      if (!folder) return foldOpaque(node)
+      const remote = folder.exportFold(binding.exported, depth + 1)
+      if (!remote) return foldOpaque(node)
+      return {
+        pieces: [{ text: foldText(remote), node }],
+        exact: remote.exact,
+        opaque: remote.opaque.length > 0 ? [node] : [],
+        numeric: remote.numeric,
+      }
+    } finally {
+      moduleResolutionStack.delete(key)
+    }
+  }
+
+  /** The fold of `export const <name> = …` in THIS module, following named/star re-exports. */
+  function exportFold(name, depth) {
+    if (depth > 24) return null
+    if (exportedConstNames.has(name) && constInitializers.get(name)) {
+      return fold(constInitializers.get(name), depth + 1)
+    }
+    const reExport = namedReExports.get(name)
+    if (reExport) return foldImported(reExport, sourceFile, depth + 1)
+    for (const specifier of starReExports) {
+      const folded = foldImported({ specifier, exported: name }, sourceFile, depth + 1)
+      if (folded && folded.exact) return folded
+    }
+    return null
+  }
+
+  const folder = (node) => fold(node, 0)
+  folder.exportFold = exportFold
+  return folder
 }
 
 /** Node kinds a constant string expression can START at. Everything else is reached recursively. */

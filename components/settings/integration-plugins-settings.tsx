@@ -6,33 +6,35 @@ import { Button } from '@/components/ui/button'
 import { Switch } from '@/components/ui/switch'
 import { saveIntegrationPluginState } from '@/app/actions/settings'
 import { resolvePluginSelectionSaveView } from '@/lib/domain/integrations/plugin-save-outcome'
-import type { IntegrationPluginState } from '@/lib/integration-plugins'
+import type { IntegrationPluginDescriptor } from '@/lib/domain/integrations/plugin-catalog'
+import {
+  buildIntegrationPluginState,
+  type IntegrationPluginId,
+  type IntegrationPluginState,
+} from '@/lib/integration-plugin-keys'
 
+/**
+ * THE PLUGIN SWITCHES, ONE PER REGISTERED PLUGIN (o3d-m0ad, o3d-remove-shiphero round 8 HIGH 2).
+ *
+ * This screen used to take five named boolean props, hold five `useState` hooks, render five
+ * hard-written `<Switch>` blocks, and assemble its selection with two `as IntegrationPluginState`
+ * casts. Every one of those five was a place a SIXTH registered connector would be missing, and the
+ * casts are what made the absence invisible: without them the object literals would not have
+ * satisfied `IntegrationPluginState` and `tsc` would have named the missing member.
+ *
+ * So the switches are now DATA. `plugins` comes from the registry-derived catalogue
+ * (lib/domain/integrations/plugin-catalog.ts), built on the server because the WMS registry cannot
+ * be imported into a client bundle, and the selection is a `Record<IntegrationPluginId, boolean>`
+ * built by `buildIntegrationPluginState` — which walks the id union rather than listing it. There
+ * is no cast left, and no member for a connector to be missing from.
+ */
 type Props = {
-  woocommerceEnabled: boolean
-  shopifyEnabled: boolean
-  xeroEnabled: boolean
-  quickbooksEnabled: boolean
-  mintsoftEnabled: boolean
+  /** Every registered plugin, with its copy and its server-rendered value. */
+  plugins: IntegrationPluginDescriptor[]
 }
 
-export function IntegrationPluginsSettings({
-  woocommerceEnabled: initialWooCommerceEnabled,
-  shopifyEnabled: initialShopifyEnabled,
-  xeroEnabled: initialXeroEnabled,
-  quickbooksEnabled: initialQuickBooksEnabled,
-  mintsoftEnabled: initialMintsoftEnabled,
-}: Props) {
+export function IntegrationPluginsSettings({ plugins }: Props) {
   const [isPending, startTransition] = useTransition()
-  const [woocommerceEnabled, setWooCommerceEnabled] = useState(initialWooCommerceEnabled)
-  const [shopifyEnabled, setShopifyEnabled] = useState(initialShopifyEnabled)
-  const [xeroEnabled, setXeroEnabled] = useState(initialXeroEnabled)
-  const [quickbooksEnabled, setQuickBooksEnabled] = useState(initialQuickBooksEnabled)
-  const [mintsoftEnabled, setMintsoftEnabled] = useState(initialMintsoftEnabled)
-  const [saved, setSaved] = useState(false)
-  const [error, setError] = useState('')
-  /** Saved, but the scheduler is behind. Not an error — see handleSave. */
-  const [schedulerWarning, setSchedulerWarning] = useState('')
 
   /**
    * What the switches showed before this page's session of edits — the server-rendered selection.
@@ -41,31 +43,17 @@ export function IntegrationPluginsSettings({
    * this screen can name is the one it was rendered with. Using the pre-click switch values instead
    * would restore an intermediate the database never saw.
    */
-  const previous = {
-    woocommerce: initialWooCommerceEnabled,
-    shopify: initialShopifyEnabled,
-    xero: initialXeroEnabled,
-    quickbooks: initialQuickBooksEnabled,
-    mintsoft: initialMintsoftEnabled,
-  } as IntegrationPluginState
+  const rendered = new Map(plugins.map((plugin) => [plugin.id, plugin.enabled]))
+  const previous: IntegrationPluginState = buildIntegrationPluginState((id) => rendered.get(id) ?? false)
 
-  /** The switches, as one value, so the shared resolver can decide what they must show next. */
-  function currentSelection(): IntegrationPluginState {
-    return {
-      woocommerce: woocommerceEnabled,
-      shopify: shopifyEnabled,
-      xero: xeroEnabled,
-      quickbooks: quickbooksEnabled,
-      mintsoft: mintsoftEnabled,
-    } as IntegrationPluginState
-  }
+  const [selection, setSelection] = useState<IntegrationPluginState>(previous)
+  const [saved, setSaved] = useState(false)
+  const [error, setError] = useState('')
+  /** Saved, but the scheduler is behind. Not an error — see handleSave. */
+  const [schedulerWarning, setSchedulerWarning] = useState('')
 
-  function applySelection(plugins: IntegrationPluginState) {
-    setWooCommerceEnabled(plugins.woocommerce)
-    setShopifyEnabled(plugins.shopify)
-    setXeroEnabled(plugins.xero)
-    setQuickBooksEnabled(plugins.quickbooks)
-    setMintsoftEnabled(plugins.mintsoft)
+  function setPlugin(id: IntegrationPluginId, value: boolean) {
+    setSelection((current) => ({ ...current, [id]: value }))
   }
 
   function handleSave() {
@@ -76,7 +64,7 @@ export function IntegrationPluginsSettings({
     // What is on screen right now — the operator's request. On the ONE outcome that committed
     // nothing (`refused`) the resolver replaces this with `previous`; on every other outcome the
     // switches stay where they are, or move to what the server read back under the lock.
-    const requested = currentSelection()
+    const requested = selection
 
     startTransition(async () => {
       // ONE decision, made by the SAME resolver the onboarding wizard uses (o3d-osl8 round 8,
@@ -96,13 +84,10 @@ export function IntegrationPluginsSettings({
           // to be five parallel setSetting calls, so switching accounting connectors was observable
           // mid-flight as both-off or both-on — and a concurrent orphan cancel could discard the
           // incoming connector's queue from inside that window.
-          const result = await saveIntegrationPluginState({
-            woocommerce: requested.woocommerce,
-            shopify: requested.shopify,
-            xero: requested.xero,
-            quickbooks: requested.quickbooks,
-            mintsoft: requested.mintsoft,
-          })
+          //
+          // THE WHOLE SELECTION, not a listed subset (o3d-m0ad): the payload used to name five
+          // members, so a registered connector's switch could have existed and still not been sent.
+          const result = await saveIntegrationPluginState(requested)
           return resolvePluginSelectionSaveView({ attempt: { kind: 'result', result }, requested, previous })
         } catch (e) {
           // A REJECTION, which is not a refusal: a permission gate throwing, a transaction
@@ -112,7 +97,7 @@ export function IntegrationPluginsSettings({
         }
       })()
 
-      applySelection(view.plugins)
+      setSelection(view.plugins)
       setError(view.error)
       setSchedulerWarning(view.schedulerWarning)
       if (view.committed) {
@@ -124,55 +109,18 @@ export function IntegrationPluginsSettings({
 
   return (
     <div className="space-y-5">
-      <label className="flex items-start gap-3 cursor-pointer">
-        <Switch checked={woocommerceEnabled} onCheckedChange={setWooCommerceEnabled} />
-        <div>
-          <div className="text-sm font-medium">WooCommerce plugin</div>
-          <p className="text-xs text-muted-foreground">
-            Enables the shopping connector, webhooks, sync UI, and WooCommerce-specific scheduler jobs.
-          </p>
-        </div>
-      </label>
-
-      <label className="flex items-start gap-3 cursor-pointer">
-        <Switch checked={shopifyEnabled} onCheckedChange={setShopifyEnabled} />
-        <div>
-          <div className="text-sm font-medium">Shopify plugin</div>
-          <p className="text-xs text-muted-foreground">
-            Reserves the shopping connector slot, settings, and sync/dashboard wiring for Shopify.
-          </p>
-        </div>
-      </label>
-
-      <label className="flex items-start gap-3 cursor-pointer">
-        <Switch checked={xeroEnabled} onCheckedChange={setXeroEnabled} />
-        <div>
-          <div className="text-sm font-medium">Xero plugin</div>
-          <p className="text-xs text-muted-foreground">
-            Enables the accounting connector, callback flow, sync UI, and accounting scheduler jobs backed by Xero.
-          </p>
-        </div>
-      </label>
-
-      <label className="flex items-start gap-3 cursor-pointer">
-        <Switch checked={quickbooksEnabled} onCheckedChange={setQuickBooksEnabled} />
-        <div>
-          <div className="text-sm font-medium">QuickBooks plugin</div>
-          <p className="text-xs text-muted-foreground">
-            Reserves the accounting connector slot, settings, and sync/dashboard wiring for QuickBooks.
-          </p>
-        </div>
-      </label>
-
-      <label className="flex items-start gap-3 cursor-pointer">
-        <Switch checked={mintsoftEnabled} onCheckedChange={setMintsoftEnabled} />
-        <div>
-          <div className="text-sm font-medium">Mintsoft plugin</div>
-          <p className="text-xs text-muted-foreground">
-            Enables Mintsoft WMS settings, webhook intake, sync UI, and Mintsoft-specific scheduler jobs.
-          </p>
-        </div>
-      </label>
+      {plugins.map((plugin) => (
+        <label key={plugin.id} className="flex items-start gap-3 cursor-pointer">
+          <Switch
+            checked={selection[plugin.id]}
+            onCheckedChange={(value) => setPlugin(plugin.id, value)}
+          />
+          <div>
+            <div className="text-sm font-medium">{plugin.label}</div>
+            <p className="text-xs text-muted-foreground">{plugin.description}</p>
+          </div>
+        </label>
+      ))}
 
       <div className="flex items-center gap-2 pt-2 border-t">
         <Button size="sm" onClick={handleSave} disabled={isPending}>

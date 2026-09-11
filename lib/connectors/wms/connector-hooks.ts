@@ -88,14 +88,27 @@ export type WmsDispatchPrecondition = () => Promise<{ ok: true } | { ok: false; 
  * one more arm. So the DTO is keyed BY CONNECTOR and the per-connector payload is opaque here.
  *
  * `unknown`, like `WmsBookedInRecheckActions.recheckAsn`'s return, is the point rather than a
- * shortcut: the generic facade reads `configured` and nothing else, and the only code that knows
+ * shortcut: the generic facade never reads inside the payload, and the only code that knows
  * what the payload IS is the connector's own panel/form — which narrows it, in the one file whose
  * job is to be connector-specific. Typing it here would make the next connector's panel shape a
  * compile error in the generic layer, which is the coupling this file exists to remove.
  */
+/**
+ * A HOOK STATES A PAYLOAD AND NEVER A STATE (o3d-remove-shiphero round 8, Codex HIGH 1).
+ *
+ * These two carried `configured` until round 8, which gave the fact two sources: the hook's, and
+ * `WmsConnector.isConfigured()` — the one MANDATORY statement a connector makes about its own
+ * connection. The facades' no-hook branches then wrote the second source themselves, hard-coding
+ * `configured: false` for a connector that simply ships no panel. Two different questions —
+ * "does this connector have a screen?" and "is this connector set up?" — were answered with one
+ * value, so an operator with a live warehouse connection was told to re-enter credentials that
+ * were never missing.
+ *
+ * Removing the field is the fix rather than correcting the branch: with nowhere to write it, the
+ * facades cannot state a connection state at all except by asking the connector, and the wrong
+ * answer stops being expressible.
+ */
 export type WmsSyncDashboard = {
-  /** Whether this connector's own connection is configured. The generic dashboard's only read. */
-  configured: boolean
   /** The payload the connector's own /sync panel renders. Opaque to everything else. */
   panel: unknown
 }
@@ -104,9 +117,8 @@ export type WmsSyncDashboardActions = {
   getDashboardData(): Promise<WmsSyncDashboard>
 }
 
+/** As {@link WmsSyncDashboard}: a payload, never a statement about the connection's state. */
 export type WmsOnboardingConnection = {
-  /** Whether the connection is already set up — the wizard's "done" tick. */
-  configured: boolean
   /** The payload the connector's own onboarding form renders. Opaque to everything else. */
   form: unknown
 }

@@ -123,6 +123,14 @@ two files that render their DTOs matching one id and returning `null` for any
 other — a blank configuration screen beneath a header naming the connector and a
 card reading CONFIGURED.
 
+**`tests/wms-second-connector-seam-plugin-state.test.ts`** (added in round 8) starts
+one step earlier than any of them: somebody has to switch the connector **on**. It
+moves the fictitious connector's switch on the real Settings screen, presses Save,
+and follows the value through the real onboarding writer into the stored settings
+row and back out through `getIntegrationPluginState` — the read every WMS enable gate
+performs. Rounds 2–6 all began after that step had somehow succeeded, and it could
+not: see `o3d-m0ad` below.
+
 **Why the second file had to exist.** Codex's round-1 review found that every
 test in the first file began *inside* the generic layer — handing the fictitious
 connector to a decorator, a policy function or the sweep core directly. Behaving
@@ -331,12 +339,106 @@ just removed.
    `tests/scripts/wms-connector-boundary-guard.test.ts` grew from 15 real-script
    cases to 34. Thirteen of the new ones fail against the round-4 guard.
 
-**What no test covers.** The fold is a fold, not an interpreter. A value that
-arrives from **another module** (`'mint' + suffixFromElsewhere()`), or through a
-runtime transform the fold does not model (`.replace`, `.slice`, `.split` +
-`.reverse`, `Buffer.from(…, 'base64').toString()`, a `Proxy`, a JSON payload), is
-still out of reach — and a `.d.ts` re-export has no runtime value to fold at all.
-Those are enumerated in `docs/wms-connector-boundary.md`.
+**What round 6 left out of reach.** The fold was a fold, not an interpreter. A
+value that arrived from **another module**, or through a transform it did not model
+(`.replace`, `Buffer.from(…, 'base64').toString()`), was out of reach — and so, as
+it turned out, was a `+` between two numbers. Round 8 closed all of those; what
+remains is below.
+
+## What round 8 closed (Codex, three HIGHs)
+
+Round 7's review found the seam proving a property one layer short **for the fifth
+consecutive round** — this time in the server actions — plus two executable bypasses
+of the round-6 guard.
+
+1. **Capability is not state: `configured` has one source.** `app/actions/wms-sync.ts`
+   and `app/actions/wms-onboarding.ts` answered `configured: false` from their
+   *absent-hook* branch — a claim about the CONNECTION, made by a branch that had only
+   established something about the BUILD. A live, correctly configured connector that
+   simply ships no dashboard or no setup form was described to the operator as "not set
+   up", whose remedy is to re-enter credentials that were never missing.
+
+   `configured` is now read from `WmsConnector.isConfigured()` — the one **mandatory**
+   method on the contract — on **every path, before the hook is looked up**, and
+   `WmsSyncDashboard` / `WmsOnboardingConnection` no longer carry the field at all, so
+   there is nowhere for a branch to write one. Capability is stated separately, by an
+   empty `connectorData`.
+
+   **The tests were pinning the wrong answer.** `tests/wms-second-connector-seam-production.test.ts`
+   asserted `configured === false` for a hook-less connector whose fixture `isConfigured()`
+   returned `true`, and the UI file asserted the markup read *"is not set up yet"* for the
+   same connector. The fixture and the assertions disagreed about one connector and the
+   assertions won — which is how this survived round 6, a round that audited exactly these
+   two files. Both are rewritten, each now paired with the opposite case (a genuinely
+   unconfigured connector must still be reported as such), and the fixture's
+   `isConfigured()` is settable so the value can be driven rather than blessed.
+
+   **One layer further out**, the re-audit found the consequence that mattered most.
+   `components/onboarding/integrations-step.tsx` seeds `wmsConnected` from this value and
+   gates the whole Integrations step on it, so the defect did not merely mislead: a
+   registered connector with a live connection and no setup form made the wizard
+   **impossible to complete**. That rule was an expression inside a `useEffect`, which the
+   render harness never runs, so nothing could exercise it; it is now
+   `lib/domain/onboarding/integrations-step-readiness.ts`, driven by the seam.
+
+2. **A second connector can be ENABLED (`o3d-m0ad`).** `saveOnboardingPluginState` took a
+   five-member object literal, overwrote five named members and upserted five named keys.
+   `IntegrationPluginState` is *structurally assignable* to that literal, so passing the
+   whole state compiled and a sixth id was silently dropped and handed back at whatever
+   value the database already held. The Settings screen had one hard-written switch per
+   plugin and two `as IntegrationPluginState` casts that suppressed the missing-member
+   errors. Net effect: a connector could satisfy every totality check round 6 added and
+   still be impossible to turn on through either production UI.
+
+   The plugin id union, the setting-key map and the lock set are now **derived from
+   `WMS_CONNECTOR_IDS`** (`lib/integration-plugin-keys.ts`); the wizard's writer takes
+   `IntegrationPluginState` itself and walks `INTEGRATION_PLUGIN_IDS`; and the Settings
+   screen renders the registry-derived catalogue
+   (`lib/domain/integrations/plugin-catalog.ts`) with no casts left. Both the Settings
+   toggle and `app/(dashboard)/settings/system/page.tsx` **came off the guard's allowlist**,
+   because neither spells a connector id any more.
+   `tests/wms-second-connector-seam-plugin-state.test.ts` moves the fictitious connector's
+   switch, presses Save, and follows the value into the stored row and back out through
+   `getIntegrationPluginState`.
+
+3. **The guard folds arithmetic, follows imports, and rejects what it cannot evaluate
+   (`o3d-lhjh`).** Round 6 folded **every** binary `+` as string concatenation, so
+   `String.fromCharCode(100+9,100+5,…)` — which spells the connector id at runtime — folded
+   its arguments to `1009`, `1005`, … and exited 0. That is the one failure mode worse than
+   "cannot evaluate": *evaluated, confidently, to the wrong value*, which is never reported.
+   A `+` between two numbers is now arithmetic, and the fold knows which it is looking at.
+
+   Three of the four residues filed as `o3d-lhjh` were executable bypasses and are closed:
+
+   - **cross-module concatenation** — the fold's universe is now the **repo**, not one file.
+     `./…`, `../…` and `@/…` imports are followed (through named and `*` re-exports, with
+     cycles terminating), and a *repo* constant it cannot follow to a value is a finding
+     rather than an empty string. A **package** import is neither followed nor reported,
+     because `node_modules` is not scanned at all;
+   - **a constant `.replace`** — and `.padStart`, `.normalize`, and whatever is written next.
+     The rule is deliberately not about the method: a constant string the fold has already
+     evaluated, put through an operation it cannot evaluate, is a finding. Modelling
+     `.replace` would close one member of an unbounded family, which is the sequence rounds
+     3–7 kept losing;
+   - **`Buffer.from(…, 'base64')`** — the same operation as `atob`, which round 6 already
+     modelled, under another name. It is exactly evaluable, so it is evaluated; an encoding
+     the guard cannot resolve makes it a reject.
+
+   Only the **declaration-file re-export** remains, and it is genuinely runtime-harmless: a
+   type cannot spell an id at runtime.
+
+   **The cost was measured, not assumed.** Across 956 scanned files the new rules produce
+   **two** findings, both waived in place with a reason (a `Math.max` the fold cannot
+   evaluate, and a constant GUC name split on `.`). The rule the reviewer asked about —
+   rejecting *every* `+` with a non-constant operand — was measured at **3,009** findings
+   (1,977 with a string literal on one side), which is not a usable guard; the line therefore
+   sits at *constants*, and a function body is not one. The guard suite grew from 34 cases to
+   **47**; all 34 existing cases still pass.
+
+**What no test covers.** A value produced by a **function defined in the same file**
+(`function tail() { return 'soft' }; 'mint' + tail()`) is still read as data, and a `.d.ts`
+re-export still has no runtime value to fold. Both are enumerated with their reasoning in
+`docs/wms-connector-boundary.md` and tracked in `o3d-lhjh`.
 
 ## Leaks that remain, deliberately
 

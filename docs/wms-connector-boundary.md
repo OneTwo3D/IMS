@@ -37,6 +37,19 @@ registered** — `hooks.asn`, `hooks.syncDashboard`, `hooks.onboarding` on its
 "cannot do this", *named*, which is deliberately distinct from "nothing is
 enabled".
 
+**A hook states a payload and never a connection state** (round 8). `configured` is
+read from `WmsConnector.isConfigured()` — the one mandatory method on the contract —
+on every path, *before* the hook is looked up, and the hook result types carry no
+such field for a branch to write. Capability and state are different questions: round
+6's no-hook arms answered `configured: false`, i.e. a claim about the CONNECTION from
+a branch that had only established something about the BUILD. The consequence was not
+only misleading copy — `components/onboarding/integrations-step.tsx` gates the whole
+Integrations step on that value, so a registered connector with a live connection and
+no setup form in this build made the wizard **impossible to complete**, offering a
+remedy (finish setting it up) that no screen could perform. That rule now lives in
+`lib/domain/onboarding/integrations-step-readiness.ts` as a pure function, because
+inside a `useEffect` in a 700-line client component nothing could exercise it.
+
 The DTOs the first three return are **keyed by connector**
 (`connectorData[connectorId]`), not by a named member per connector. That shape is
 load-bearing: a literal `mintsoft:` member is what kept `wms-sync.ts` and
@@ -84,8 +97,15 @@ The literal is legitimate only in: the Mintsoft connector itself
 ingress (`app/api/cron/mintsoft-*`, `app/api/webhooks/mintsoft/**`,
 `app/api/e2e/mintsoft/**`, `app/api/export/mintsoft-sync/**`, `lib/cron-jobs/wms-mintsoft.ts`),
 the WMS dispatch facades/registry/panels above, the UI connector registry
-(`/sync` `CONNECTORS`, the settings enable toggle), and per-connector ops/security
-probes + cosmetic/plugin-registry files. See the allowlist in the guard.
+(`/sync` `CONNECTORS`), and per-connector ops/security probes + cosmetic/plugin-registry
+files. See the allowlist in the guard.
+
+The Settings plugin toggle is **no longer** on that list (round 8, `o3d-m0ad`). It used
+to hard-write one switch per plugin — one of them the shipped WMS connector's — behind
+two `as IntegrationPluginState` casts, so a registered connector had no toggle at all.
+It now renders the registry-derived catalogue in
+`lib/domain/integrations/plugin-catalog.ts` and spells no connector id, which is what
+lets it be scanned rather than exempted.
 
 ## Enforcement
 
@@ -124,25 +144,30 @@ A leaf token is inspected on its own, so `const id = 'mint' + 'soft'` and
 | `const a = 'mint'; a + 'soft'` | in-file `const` initializers resolved (a name declared twice resolves to nothing) |
 | `enum W { A = 'mint' } W.A + 'soft'` | in-file string enum members resolved |
 | `['mint','soft'].join('')` | array-literal join with a constant separator |
-| `String.fromCharCode(109, …)` / `fromCodePoint` | evaluated when every argument is a numeric literal |
+| `String.fromCharCode(109, …)` / `fromCodePoint` | evaluated when every argument folds to a number |
+| `100 + 9`, `0x41 + 1`, `60 * 60 * 1000`, `-(-109)` | **arithmetic, not concatenation** (round 8). A `+` between two numbers adds; a `+` touching a string concatenates. Round 6 folded every `+` as concatenation, so `String.fromCharCode(100+9, …)` folded to `'1009'` and produced unrelated characters *exactly* — the one failure worse than "cannot evaluate", because it is not reported |
 | `'mint'.concat('soft')`, `'ab'.repeat(4)`, `.toLowerCase()`, `.trim()` | evaluated on folded receivers |
 | `atob('bWludHNvZnQ=')`, `decodeURIComponent('%6Dintsoft')` | single-literal decoders evaluated |
+| `Buffer.from('bWludHNvZnQ=', 'base64').toString('utf8')` | evaluated (round 8) — the same operation as `atob`, which was already modelled, under another name. An encoding the guard cannot resolve makes it a **reject**, not a pass |
+| `import { TAIL } from './ids'; 'mint' + TAIL` | **followed across the module boundary** (round 8) and folded there. `./…`, `../…` and `@/…` specifiers resolve to repo files, through named and `*` re-exports, with an import cycle terminating as a reject |
 | `obj['mint' + 'soft']` | the computed key is itself a folded expression |
 | `'mint' + unknownVar + 'soft'` | **conservative**: an unknown operand reads as `''`, so this is a finding |
 | `parts.join('')`, `String.fromCharCode(...codes)` | **conservative REJECT** — can glue or mint characters out of nothing, and no literal exists for a text scan to find. Waive it if it provably cannot spell an id |
+| `'mintXsoft'.replace('X','')`, `'soft'.padStart(8,'mint')`, `.normalize()`, any unmodelled method **on a constant the fold already evaluated** | **conservative REJECT** (round 8). The rule is about the shape, not the method: modelling `.replace` would close one member of an unbounded family. Measured cost across 956 scanned files: **two** waivers, both numeric |
+| a **repo** import the fold cannot follow to a `const` — a missing file, a file that will not parse, an export that is a function | **conservative REJECT** (round 8). It is a constant expression the guard has admitted it cannot evaluate; reading it as `''` is exactly what let the split spelling through |
 | `String.fromCharCode(byte)`, `items.join(', ')` | **not** rejected — one argument cannot produce eight characters, and no id contains `, `, so such a separator cannot glue two non-ids into one |
+| `input.replace(…)`, `Buffer.from(body, 'utf8')` on a **runtime** value | **not** rejected — the receiver does not fold, so there is no constant the guard has failed to evaluate. Ordinary code transforms data, not literals, which is why the rule above costs almost nothing |
+| `import path from 'node:path'; 'wms' + path.sep` | **not** followed and **not** rejected — `node_modules` is not scanned at all, so demanding evaluability of a package import would be the guard requiring of third-party code a property it never checks |
 
 **What it does not reach**, deliberately, and what happens instead:
 
-- a value that arrives from **another module** — `'mint' + suffixFrom('./elsewhere')`,
-  or a bare imported identifier. Not folded, not rejected: rejecting every `+` with
-  a non-constant operand would fire on most of the repo, and a guard that fires on
-  everything gets allowlisted into silence. The fragments in the *other* module are
-  still scanned there;
-- runtime transforms the fold does not model — `.replace`, `.slice`, `.split(…)` +
-  `.reverse()`, `Buffer.from(…, 'base64').toString()`, `Array.from`, a `Proxy`, a
-  value read out of JSON or a database row. A `.join('')` at the end of such a chain
-  IS rejected; a transform that ends some other way is not;
+- a value produced by a **function defined in the same file** —
+  `function tail() { return 'soft' } const id = 'mint' + tail()`. A call is runtime
+  data as far as the fold is concerned, and reading every call as unbounded would
+  reject most of the repo. Measured: rejecting every `+` with a non-constant operand
+  produces **3,009** findings across 956 files (1,977 of them with a string literal
+  on one side), which is not a usable guard — so the line sits at *constants*, and a
+  function body is not one. Tracked in `o3d-lhjh`;
 - a **declaration file re-export** (`export { X } from './ids'` in a `.d.ts`) — a
   type has no runtime value to fold. The `.d.ts` is still scanned as text;
 - `'mintsof'.repeat(2)`-style splices where an id is formed *across* a repetition
@@ -154,8 +179,10 @@ the line the expression starts on, so per-line waivers keep working on values
 stitched together over many lines.
 
 `tests/scripts/wms-connector-boundary-guard.test.ts` runs the real script against
-throwaway trees and asserts its exit code for each of those behaviours — 34 cases,
-positives and negatives. **Keep it
+throwaway trees and asserts its exit code for each of those behaviours — 47 cases,
+positives and negatives, 13 of them added in round 8 for the numeric fold, the
+cross-module fold, the unmodelled-operation reject, `Buffer.from` and an import
+cycle. **Keep it
 passing and keep adding to it**: this guard printed "clean" for two review rounds
 with a live literal in a protected file, and a guard that cannot fail is worse than
 no guard because it is believed.

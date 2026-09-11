@@ -1,6 +1,7 @@
 import { getSettingValues } from '@/lib/settings-store'
 import { WMS_CONNECTOR_IDS } from '@/lib/connectors/wms/types'
 import {
+  buildIntegrationPluginState,
   INTEGRATION_PLUGIN_SETTING_KEYS as PLUGIN_SETTING_KEYS,
   parseIntegrationPluginEnabled as parseEnabled,
   type IntegrationPluginId,
@@ -13,24 +14,16 @@ import {
 // from this module and one canonical name per concept is the point of the split.
 export type { IntegrationPluginId, IntegrationPluginState }
 
-const DEFAULT_PLUGIN_STATE: IntegrationPluginState = {
-  woocommerce: false,
-  shopify: false,
-  xero: false,
-  quickbooks: false,
-  mintsoft: false,
-}
+/**
+ * Every registered plugin, off. Built over the id union rather than listed (o3d-m0ad): a listed
+ * default silently omits a newly registered connector, and an omitted member reads as `undefined`,
+ * which is not `false` — it is "this plugin does not exist".
+ */
+const DEFAULT_PLUGIN_STATE: IntegrationPluginState = buildIntegrationPluginState(() => false)
 
 export async function getIntegrationPluginState(): Promise<IntegrationPluginState> {
   const values = await getSettingValues(Object.values(PLUGIN_SETTING_KEYS))
-
-  return {
-    woocommerce: parseEnabled(values.get(PLUGIN_SETTING_KEYS.woocommerce)),
-    shopify: parseEnabled(values.get(PLUGIN_SETTING_KEYS.shopify)),
-    xero: parseEnabled(values.get(PLUGIN_SETTING_KEYS.xero)),
-    quickbooks: parseEnabled(values.get(PLUGIN_SETTING_KEYS.quickbooks)),
-    mintsoft: parseEnabled(values.get(PLUGIN_SETTING_KEYS.mintsoft)),
-  }
+  return buildIntegrationPluginState((id) => parseEnabled(values.get(PLUGIN_SETTING_KEYS[id])))
 }
 
 export async function isIntegrationPluginEnabled(id: IntegrationPluginId): Promise<boolean> {

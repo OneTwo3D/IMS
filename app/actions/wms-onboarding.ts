@@ -2,7 +2,7 @@
 
 import { requirePermission } from '@/lib/auth/server'
 import { getActiveWmsConnectorId } from '@/lib/connectors/wms/active-connector'
-import { findWmsConnectorLabel, getWmsConnectorHooks } from '@/lib/connectors/wms/registry'
+import { findWmsConnector, findWmsConnectorLabel, getWmsConnectorHooks } from '@/lib/connectors/wms/registry'
 import { WMS_CONNECTOR_IDS, type WmsConnectorId } from '@/lib/connectors/wms/types'
 
 /**
@@ -16,9 +16,15 @@ import { WMS_CONNECTOR_IDS, type WmsConnectorId } from '@/lib/connectors/wms/typ
  * dispatcher telling every connector but one that it does not exist.
  *
  * It now routes on CAPABILITY: does the active connector declare an onboarding step? A connector
- * with no setup form of its own reports `configured: false` and renders no form — which is the
- * truthful answer for a connector that has nothing to configure here, rather than a claim about a
- * connection nobody asked.
+ * with no setup form of its own renders no form.
+ *
+ * o3d-remove-shiphero round 8 (Codex HIGH 1) — AND IT NO LONGER ANSWERS `configured: false` WHILE
+ * DOING SO. Round 4 replaced one wrong answer with a narrower one: the no-hook arm still reported
+ * an unset connection for a connector whose connection is live and merely has no setup form in this
+ * build. The wizard therefore showed an unticked step, and the operator's remedy for an unticked
+ * step is to re-enter credentials that were never missing — the exact failure the round-4 note
+ * above describes, surviving the round-4 fix. `configured` is now read from `isConfigured()`, the
+ * one mandatory statement a connector makes about its own connection, on every path.
  *
  * THE DTO IS KEYED BY CONNECTOR. It used to carry `mintsoft: … | null`, read by name in
  * components/onboarding/wms-onboarding-connection.tsx; see app/actions/wms-sync.ts for why a second
@@ -35,6 +41,7 @@ import { WMS_CONNECTOR_IDS, type WmsConnectorId } from '@/lib/connectors/wms/typ
 export type WmsOnboardingConnectionData = {
   connectorId: WmsConnectorId
   connectorLabel: string
+  /** Whether the CONNECTION is set up. State, not capability — see the note above and wms-sync.ts. */
   configured: boolean
   /**
    * The active connector's own connection payload, under its own id. Read only by the matching form
@@ -48,14 +55,17 @@ export async function getWmsOnboardingConnectionData(): Promise<WmsOnboardingCon
   const connectorId = (await getActiveWmsConnectorId()) ?? WMS_CONNECTOR_IDS[0]
   const connectorLabel = findWmsConnectorLabel(connectorId) ?? connectorId
 
-  const hook = getWmsConnectorHooks(connectorId).onboarding
-  if (!hook) return { connectorId, connectorLabel, configured: false, connectorData: {} }
+  // Read on EVERY path, before the capability question, for the reason spelled out in wms-sync.ts.
+  const connector = findWmsConnector(connectorId)
+  const configured = connector !== null && await connector.isConfigured()
 
-  const connection = await (await hook()).getConnectionData()
+  const hook = getWmsConnectorHooks(connectorId).onboarding
+  if (!hook) return { connectorId, connectorLabel, configured, connectorData: {} }
+
   return {
     connectorId,
     connectorLabel,
-    configured: connection.configured,
-    connectorData: { [connectorId]: connection.form },
+    configured,
+    connectorData: { [connectorId]: (await (await hook()).getConnectionData()).form },
   }
 }

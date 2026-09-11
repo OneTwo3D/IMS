@@ -3,6 +3,12 @@ import test, { mock } from 'node:test'
 
 import { mountClientComponent } from '@/tests/fixtures/render-client-component'
 import type { PluginSelectionSaveResult } from '@/lib/domain/integrations/plugin-save-outcome'
+import { listIntegrationPluginDescriptors } from '@/lib/domain/integrations/plugin-catalog'
+import {
+  buildIntegrationPluginState,
+  INTEGRATION_PLUGIN_IDS,
+  type IntegrationPluginId,
+} from '@/lib/integration-plugin-keys'
 
 // ---------------------------------------------------------------------------
 // o3d-osl8 round 8, finding 2 — the SETTINGS screen still reported committed writes as failed
@@ -48,24 +54,34 @@ mock.module('@/app/actions/cron', {
   },
 })
 
-/** The server-rendered selection: WooCommerce + Xero. */
-const serverRendered = {
-  woocommerceEnabled: true,
-  shopifyEnabled: false,
-  xeroEnabled: true,
-  quickbooksEnabled: false,
-  mintsoftEnabled: false,
-}
+/**
+ * The server-rendered selection: WooCommerce + Xero.
+ *
+ * ONE ROW PER REGISTERED PLUGIN, derived (o3d-m0ad, o3d-remove-shiphero round 8). This used to be
+ * five named boolean props, handed to the component through
+ * `as unknown as (props: typeof serverRendered) => unknown` — and that cast is why `tsc` had
+ * nothing to say when a sixth registered connector had no switch at all. The props are now the
+ * catalogue the Settings page builds from the registry, so the component takes the same shape here
+ * as in production and the count below is derived rather than written down.
+ */
+const ENABLED_BY_DEFAULT = new Set(['woocommerce', 'xero'])
 
-async function mountSettings() {
-  const { IntegrationPluginsSettings } = await import('@/components/settings/integration-plugins-settings')
-  return mountClientComponent(
-    IntegrationPluginsSettings as unknown as (props: typeof serverRendered) => unknown,
-    serverRendered,
+function serverRenderedPlugins() {
+  return listIntegrationPluginDescriptors(
+    buildIntegrationPluginState((id) => ENABLED_BY_DEFAULT.has(id)),
   )
 }
 
-/** Every Switch's checked state, in render order: woocommerce, shopify, xero, quickbooks, mintsoft. */
+/** The ids, in the order the screen renders them — what `switchStates`/`toggle` index into. */
+const PLUGIN_ORDER = INTEGRATION_PLUGIN_IDS
+const indexOfPlugin = (id: IntegrationPluginId) => PLUGIN_ORDER.indexOf(id)
+
+async function mountSettings() {
+  const { IntegrationPluginsSettings } = await import('@/components/settings/integration-plugins-settings')
+  return mountClientComponent(IntegrationPluginsSettings, { plugins: serverRenderedPlugins() })
+}
+
+/** Every Switch's checked state, in render order — one per registered plugin. */
 function switchStates(tree: unknown): boolean[] {
   const found: boolean[] = []
   const walk = (node: unknown) => {
@@ -78,7 +94,11 @@ function switchStates(tree: unknown): boolean[] {
     if (element.props && 'children' in element.props) walk(element.props.children)
   }
   walk(tree)
-  assert.equal(found.length, 5, 'all five switches were found — an empty sweep would assert nothing')
+  assert.equal(
+    found.length, PLUGIN_ORDER.length,
+    'a switch for every REGISTERED plugin was found — an empty sweep would assert nothing, and a '
+      + 'count written down here would not notice a registered connector losing its control',
+  )
   return found
 }
 
@@ -95,7 +115,7 @@ function toggle(tree: unknown, index: number, value: boolean): void {
     if (element.props && 'children' in element.props) walk(element.props.children)
   }
   walk(tree)
-  assert.equal(setters.length, 5, 'all five switches are operable')
+  assert.equal(setters.length, PLUGIN_ORDER.length, 'every registered plugin has an operable switch')
   setters[index](value)
 }
 
@@ -115,9 +135,7 @@ test('a scheduler failure is shown as SAVED with a warning, never as a failed sa
   state.result = {
     status: 'scheduler-failed',
     error: 'crontab write failed: no crontab for ims',
-    pluginState: {
-      woocommerce: true, shopify: false, xero: false, quickbooks: true, mintsoft: false,
-    } as never,
+    pluginState: buildIntegrationPluginState((id) => id === 'woocommerce' || id === 'quickbooks'),
   }
   const screen = await mountSettings()
 
@@ -130,7 +148,7 @@ test('a scheduler failure is shown as SAVED with a warning, never as a failed sa
   assert.ok(!/text-destructive/.test(html), 'and nothing is rendered as a failure')
   assert.deepEqual(
     switchStates(tree),
-    [true, false, false, true, false],
+    PLUGIN_ORDER.map((id) => id === 'woocommerce' || id === 'quickbooks'),
     'the switches show the COMMITTED state read back under the lock — QuickBooks, not the Xero the '
       + 'page was rendered with',
   )
@@ -143,8 +161,12 @@ test('a REFUSAL rolls the switches back and states the reason', async () => {
   // QuickBooks ON while Xero is already on — the illegal combination the action refuses. Moving a
   // switch first is what makes the rollback observable: requested and previous must differ, or the
   // assertion below passes for a screen that never rolls back at all.
-  toggle(screen.render().tree, 3, true)
-  assert.deepEqual(switchStates(screen.render().tree), [true, false, true, true, false], 'the operator moved it')
+  toggle(screen.render().tree, indexOfPlugin('quickbooks'), true)
+  assert.deepEqual(
+    switchStates(screen.render().tree),
+    PLUGIN_ORDER.map((id) => ENABLED_BY_DEFAULT.has(id) || id === 'quickbooks'),
+    'the operator moved it',
+  )
 
   await screen.click(screen.render().controls.find((c) => c.label.includes('Save')))
 
@@ -152,7 +174,11 @@ test('a REFUSAL rolls the switches back and states the reason', async () => {
   assert.match(html, /Enable either Xero or QuickBooks/)
   assert.ok(!/>Saved</.test(html), 'nothing was saved, so nothing says it was')
   assert.ok(!/was SAVED, but the scheduler/.test(html))
-  assert.deepEqual(switchStates(tree), [true, false, true, false, false], 'back to the stored selection')
+  assert.deepEqual(
+    switchStates(tree),
+    PLUGIN_ORDER.map((id) => ENABLED_BY_DEFAULT.has(id)),
+    'back to the stored selection',
+  )
 })
 
 test('a REJECTION does not roll back, and reports the outcome as unknown', async () => {
@@ -161,14 +187,14 @@ test('a REJECTION does not roll back, and reports the outcome as unknown', async
   // the first two; this screen cannot tell them apart, so it asserts neither.
   state.rejectWith = new Error('Failed to fetch')
   const screen = await mountSettings()
-  toggle(screen.render().tree, 3, true)
+  toggle(screen.render().tree, indexOfPlugin('quickbooks'), true)
 
   await screen.click(screen.render().controls.find((c) => c.label.includes('Save')))
 
   const { html, tree } = screen.render()
   assert.deepEqual(
     switchStates(tree),
-    [true, false, true, true, false],
+    PLUGIN_ORDER.map((id) => ENABLED_BY_DEFAULT.has(id) || id === 'quickbooks'),
     'the switches are NOT rolled back over an outcome nobody knows',
   )
   assert.match(html, /NOT known whether this selection was stored/)

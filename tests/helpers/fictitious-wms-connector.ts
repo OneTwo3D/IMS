@@ -76,6 +76,17 @@ export type AcmeWarehouse = {
   creates: string[]
   presence: Map<string, 'FOUND' | 'MISSING' | 'AMBIGUOUS'>
   cancelResult: (id: string) => WmsOrderCancelResult
+  /**
+   * What `isConfigured()` answers — MUTABLE, and that is the point
+   * (o3d-remove-shiphero round 8, Codex HIGH 1).
+   *
+   * It used to be hard-coded `true` while the seam tests asserted that a hook-less connector was
+   * reported `configured: false`. The fixture and the assertions therefore disagreed about the same
+   * connector, and the assertions won — which is how "capability-less means unconfigured" survived
+   * a round that audited exactly those two files. A test can now make the connection genuinely
+   * absent and watch the answer change, instead of blessing an answer the fixture contradicts.
+   */
+  configured: boolean
 }
 
 export function makeAcmeWarehouse(seed: Partial<AcmeWarehouse> = {}): AcmeWarehouse {
@@ -84,6 +95,7 @@ export function makeAcmeWarehouse(seed: Partial<AcmeWarehouse> = {}): AcmeWareho
     creates: seed.creates ?? [],
     presence: seed.presence ?? new Map(),
     cancelResult: seed.cancelResult ?? ((id) => ({ cancelled: true, status: `CANCELLED:${id}` })),
+    configured: seed.configured ?? true,
   }
 }
 
@@ -99,7 +111,7 @@ export class AcmeWmsConnector implements WmsConnector<typeof ACME_WMS_ID> {
   constructor(private readonly warehouse: AcmeWarehouse = makeAcmeWarehouse()) {}
 
   async isConfigured(): Promise<boolean> {
-    return true
+    return this.warehouse.configured
   }
 
   async validateConnection(): Promise<WmsConnectionCheck> {

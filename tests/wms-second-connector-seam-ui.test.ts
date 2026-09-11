@@ -23,11 +23,18 @@
 import assert from 'node:assert/strict'
 import test, { mock } from 'node:test'
 
-import { ACME_WMS_ID, ACME_WMS_LABEL } from './helpers/fictitious-wms-connector.ts'
+import {
+  ACME_WMS_ID,
+  ACME_WMS_LABEL,
+  AcmeWmsConnector,
+  makeAcmeWarehouse,
+} from './helpers/fictitious-wms-connector.ts'
 import { mountClientComponent } from './fixtures/render-client-component.ts'
 import * as realTypes from '../lib/connectors/wms/types.ts'
 import * as realPlugins from '../lib/integration-plugins.ts'
 import * as realRegistry from '../lib/connectors/wms/registry.ts'
+// Statically, and deliberately with the SHIPPED id list: see `pluginStateWithAcme`.
+import { buildIntegrationPluginState, type IntegrationPluginState } from '../lib/integration-plugin-keys.ts'
 import type { WmsConnectorHooks } from '../lib/connectors/wms/connector-hooks.ts'
 import type { WmsConnectorId } from '../lib/connectors/wms/types.ts'
 // Type-only, so neither module is loaded before the mocks below are installed.
@@ -39,9 +46,19 @@ const ACME_PANEL = { warehouses: ['ACME-WH-1'], lastSyncAt: null }
 const ACME_FORM = { endpoint: 'https://acme.example/api', account: 'acme-ops' }
 
 const acmeHooks: WmsConnectorHooks = {
-  syncDashboard: async () => ({ getDashboardData: async () => ({ configured: true, panel: ACME_PANEL }) }),
-  onboarding: async () => ({ getConnectionData: async () => ({ configured: true, form: ACME_FORM }) }),
+  syncDashboard: async () => ({ getDashboardData: async () => ({ panel: ACME_PANEL }) }),
+  onboarding: async () => ({ getConnectionData: async () => ({ form: ACME_FORM }) }),
 }
+
+/**
+ * The fictitious warehouse the facades read `isConfigured()` from (round 8, Codex HIGH 1).
+ *
+ * The REAL connector fixture, not a `{ isConfigured: async () => true }` stand-in: `configured` is
+ * now sourced from the connector contract, so a stand-in would be the test supplying the value
+ * production derives — this branch's recurring defect, in the one place it is being fixed.
+ */
+const acmeWarehouse = makeAcmeWarehouse()
+const acmeConnector = new AcmeWmsConnector(acmeWarehouse)
 
 let hooks: Record<string, WmsConnectorHooks> = { [ACME_WMS_ID]: acmeHooks }
 let labels: Record<string, string> = { mintsoft: 'Mintsoft', [ACME_WMS_ID]: ACME_WMS_LABEL }
@@ -62,6 +79,9 @@ mock.module('@/lib/connectors/wms/registry', {
     ...realRegistry,
     getWmsConnectorHooks: (id: string) => hooks[id] ?? {},
     findWmsConnectorLabel: (id: string) => labels[id] ?? null,
+    // Where both facades now read the CONNECTION's state. Only the fictitious connector is
+    // registered here: resolving the shipped one would construct it and read settings.
+    findWmsConnector: (id: string) => (id === ACME_WMS_ID ? acmeConnector : null),
   },
 })
 mock.module('@/lib/auth/server', {
@@ -133,6 +153,22 @@ test('seam/ui: the /sync panel tells the operator a registered connector has no 
   assert.doesNotMatch(text, /is not set up yet/i)
 })
 
+/**
+ * THE UI HALF OF THE TEST THAT PINNED THE DEFECT (o3d-remove-shiphero round 8, Codex HIGH 1).
+ *
+ * WHAT IT ASSERTED, AND WHY THAT WAS WRONG. Until round 8 the second half of this case read
+ * `assert.match(visibleText(html), /is not set up yet/i, 'and an unconfigured connector is not
+ * described as running')`. Its reasoning was sound as far as it went — an unconfigured connector
+ * must not be described as running — but the connector it was applied to was NOT unconfigured: the
+ * markup said "not set up yet" only because the facade hard-coded `configured: false` whenever a
+ * connector declared no dashboard hook, and the fixture's `isConfigured()` said the opposite. So
+ * the assertion checked the right SENTENCE against the wrong CONNECTOR, and pinned in place the
+ * exact copy that sends an operator to re-enter credentials that were never missing.
+ *
+ * It is now split: the no-data state with a LIVE connection must say the connection is fine, and
+ * the no-data state with an ABSENT connection must say it is not. The second half is what keeps
+ * the first from being satisfiable by simply deleting the sentence.
+ */
 test('seam/ui: a connector WITH a panel but no payload is told apart from one with no panel', async () => {
   const wmsSync = await import('../app/actions/wms-sync.ts')
   const { WmsSyncPanel } = await import('../app/(dashboard)/sync/wms-sync-panel.tsx')
@@ -140,10 +176,11 @@ test('seam/ui: a connector WITH a panel but no payload is told apart from one wi
   const previous = hooks
   hooks = { [ACME_WMS_ID]: {} }
   try {
-    // A connector that declares no dashboard hook: the facade answers with an EMPTY payload map
-    // and `configured: false`, which is a different thing from "this build has no panel".
+    // A connector that declares no dashboard hook: the facade answers with an EMPTY payload map.
+    // That is a statement about the BUILD; whether the connection is set up is a separate read.
     const data = await wmsSync.getWmsSyncDashboardData()
     assert.deepEqual(data!.connectorData, {})
+    assert.equal(data!.configured, true, 'the connection is live — declaring no panel does not unsay it')
 
     // Rendered for the SHIPPED connector, which does have a panel, so the miss is the payload.
     const mounted = mountClientComponent(WmsSyncPanel, {
@@ -154,8 +191,36 @@ test('seam/ui: a connector WITH a panel but no payload is told apart from one wi
     const { html } = mounted.render()
     assert.match(html, /data-wms-panel-state="no-data"/)
     assert.match(visibleText(html), /returned no configuration data/i)
-    assert.match(visibleText(html), /is not set up yet/i, 'and an unconfigured connector is not described as running')
+    assert.match(
+      visibleText(html), /set up and running/i,
+      'a live connection is never described as needing credentials — the remedy for "not set up yet" is'
+      + ' to re-enter credentials that are already stored',
+    )
+    assert.doesNotMatch(visibleText(html), /is not set up yet/i)
   } finally {
+    hooks = previous
+  }
+})
+
+test('seam/ui: the SAME no-data state DOES say "not set up" when the connection really is absent', async () => {
+  const wmsSync = await import('../app/actions/wms-sync.ts')
+  const { WmsSyncPanel } = await import('../app/(dashboard)/sync/wms-sync-panel.tsx')
+
+  const previous = hooks
+  hooks = { [ACME_WMS_ID]: {} }
+  acmeWarehouse.configured = false
+  try {
+    const data = await wmsSync.getWmsSyncDashboardData()
+    assert.equal(data!.configured, false)
+    const mounted = mountClientComponent(WmsSyncPanel, {
+      connectorId: 'mintsoft' as WmsConnectorId,
+      data: { ...data!, connectorId: 'mintsoft' as WmsConnectorId },
+      onBack: noop,
+    })
+    const { html } = mounted.render()
+    assert.match(visibleText(html), /is not set up yet/i, 'the sentence still exists, for the connector it is true of')
+  } finally {
+    acmeWarehouse.configured = true
     hooks = previous
   }
 })
@@ -252,8 +317,99 @@ test('seam/ui: an onboarding connector with no connection payload is told apart 
     assert.deepEqual(data.connectorData, {}, 'the facade claims nothing for a connector that ran nothing')
     assert.match(html, /data-wms-connection-state="no-form"/)
     assert.match(visibleText(html), new RegExp(ACME_WMS_LABEL), 'still named from the registry')
+    // The wizard's setup tick is this value, so a connector with a live connection and no form in
+    // this build must not be presented as a step the operator still has to complete (round 8).
+    assert.equal(data.configured, true)
+    assert.match(visibleText(html), /already set up/i)
+    assert.doesNotMatch(visibleText(html), /is not set up, and cannot be set up/i)
   } finally {
     hooks = previous
+  }
+})
+
+test('seam/ui: the onboarding step DOES say the connection is missing when it really is', async () => {
+  const previous = hooks
+  hooks = { [ACME_WMS_ID]: {} }
+  acmeWarehouse.configured = false
+  try {
+    const { data, html } = await renderOnboarding()
+    assert.equal(data.configured, false)
+    assert.match(visibleText(html), /is not set up, and cannot be set up/i)
+  } finally {
+    acmeWarehouse.configured = true
+    hooks = previous
+  }
+})
+
+/**
+ * The shipped plugin record with the fictitious connector overlaid.
+ *
+ * `tsc` knows only the SHIPPED id union, so the extra member is added through `Record<string,
+ * boolean>` — the widened union exists at runtime, under this file's `mock.module`. The DERIVATION
+ * (that registering a connector puts it in the union, the key map and the lock set) is proved in
+ * tests/wms-second-connector-seam-plugin-state.test.ts, which installs its mocks before the keys
+ * module loads; here the state is just an input to the rule under test.
+ */
+function pluginStateWithAcme(enabled: boolean): IntegrationPluginState {
+  const base: Record<string, boolean> = { ...buildIntegrationPluginState(() => false), [ACME_WMS_ID]: enabled }
+  return base as IntegrationPluginState
+}
+
+/**
+ * ONE LAYER OUT AGAIN (o3d-remove-shiphero round 8, Codex HIGH 1).
+ *
+ * The re-audit asked what READS `WmsOnboardingConnectionData.configured`. The wizard's step does —
+ * it seeds `wmsConnected` from it and gates Continue on `wmsEnabled ? wmsConnected : true`. So the
+ * round-6 behaviour did not merely print misleading copy: with a registered connector enabled and
+ * no onboarding form in this build, the Integrations step could never be completed, and the remedy
+ * the screen named (finish setting this connector up) was one no screen could perform.
+ *
+ * Nothing could test it while the rule lived inside a `useEffect` in a 700-line client component —
+ * the render harness runs no effects. It is now `isIntegrationsStepReady`, driven here with the
+ * `configured` the REAL facade produced for the fictitious connector.
+ */
+test('seam/ui: the wizard CAN be completed with a registered connector that has no setup form', async () => {
+  const wmsOnboarding = await import('../app/actions/wms-onboarding.ts')
+  const { isIntegrationsStepReady } = await import('../lib/domain/onboarding/integrations-step-readiness.ts')
+
+  const previous = hooks
+  hooks = { [ACME_WMS_ID]: {} }
+  try {
+    const data = await wmsOnboarding.getWmsOnboardingConnectionData()
+    // The plugin state the wizard would hold. Built by overlaying the fictitious connector onto the
+    // shipped record rather than by `buildIntegrationPluginState(id => id === ACME_WMS_ID)`: this
+    // file's static imports load lib/integration-plugin-keys BEFORE its `mock.module` calls run, so
+    // that builder here walks the SHIPPED id list. The derivation itself is proved in
+    // tests/wms-second-connector-seam-plugin-state.test.ts, which mocks the ids first.
+    const plugins = pluginStateWithAcme(true)
+    assert.equal(
+      isIntegrationsStepReady(plugins, {
+        woocommerce: false, shopify: false, accounting: false, wms: data.configured,
+      }),
+      true,
+      'the connection is live, so the step is complete — it used to be permanently blocked',
+    )
+  } finally {
+    hooks = previous
+  }
+})
+
+test('seam/ui: and it still CANNOT be completed when that connector is genuinely unconfigured', async () => {
+  const wmsOnboarding = await import('../app/actions/wms-onboarding.ts')
+  const { isIntegrationsStepReady } = await import('../lib/domain/onboarding/integrations-step-readiness.ts')
+
+  acmeWarehouse.configured = false
+  try {
+    const data = await wmsOnboarding.getWmsOnboardingConnectionData()
+    assert.equal(
+      isIntegrationsStepReady(pluginStateWithAcme(true), {
+        woocommerce: false, shopify: false, accounting: false, wms: data.configured,
+      }),
+      false,
+      'an enabled WMS with no connection is still an incomplete step — the gate was not removed',
+    )
+  } finally {
+    acmeWarehouse.configured = true
   }
 })
 

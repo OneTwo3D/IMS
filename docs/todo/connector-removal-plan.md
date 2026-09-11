@@ -87,6 +87,36 @@ path that renders nothing. `tests/wms-second-connector-seam-ui.test.ts` drives
 the real components from the real facades with `acme-wms` active and asserts on
 the **markup an operator reads**, not on the DTO.
 
+**Round 8 sharpened it a fourth and a fifth time, and these are the two to copy
+next.** Round 6's fix made the renderers total — and the seam still stopped one
+layer short twice more:
+
+- **The value the renderer reads was wrong at its source.** The two UI facades'
+  *absent-hook* branches wrote `configured: false` themselves, instead of asking
+  the connector's mandatory `isConfigured()`. Two different questions — *does this
+  build have a screen for it?* and *is this connection set up?* — were answered
+  with one value, so a live connector with no panel was reported as not set up.
+  Worse, **the seam tests asserted the wrong answer**: the fixture's
+  `isConfigured()` returned `true` while the tests pinned `false`. So the rule has
+  a third half: **when a DTO field restates a fact the contract already states,
+  delete the second source** — and check that the fixture and the assertion agree
+  about the same connector, because when they disagree the assertion wins silently.
+  Then follow the field *out*: this one gated the onboarding wizard's Continue
+  button, so the bug made the wizard impossible to complete, which no copy-reading
+  test would have found.
+
+- **Nothing had ever turned the fictitious connector ON.** Every seam test from
+  rounds 2–6 began *after* the connector was enabled, and enabling it was
+  impossible: the plugin-state writer enumerated five names, and
+  `IntegrationPluginState` was structurally assignable to that literal, so a sixth
+  id compiled and was silently dropped; the Settings screen had five hard-written
+  switches and casts that hid the missing member. **For Shopify and QuickBooks,
+  start the seam at the switch**: move the control on the real screen, press Save,
+  and follow the value into the stored row and back out through the reader every
+  gate uses. Enumerated state shapes (`{a, b, c, d, e}`) are the specific hazard —
+  derive them from the registry, and remove any cast that would suppress a
+  missing-member error, because that cast is what makes the hole invisible.
+
 So, concretely: **never pass a core a value the production wrapper computes.**
 Enumerate what each wrapper derives between the entrypoint and the core — the
 resolved connector, its capabilities, every setting read, every default behind an

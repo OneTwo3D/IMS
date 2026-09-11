@@ -452,3 +452,181 @@ test('guard: an allowlisted file may still assemble its own id', (t) => {
   })
   assert.equal(run.status, 0, run.stderr)
 })
+
+// ---------------------------------------------------------------------------------------------
+// o3d-lhjh / o3d-remove-shiphero round 8 (Codex HIGH 3) — THE FOUR SPELLINGS THE ROUND-6 FOLD
+// EXITED 0 ON, and the negatives that keep the new rules usable.
+//
+// Each of the first four was run against the shipped guard before the fix and printed "clean".
+// ---------------------------------------------------------------------------------------------
+
+test('guard: a NUMERIC-arithmetic String.fromCharCode spelling fails', (t) => {
+  // THE ROUND-6 DEFECT IN ONE LINE. Every binary `+` was folded as string concatenation, so
+  // `100+9` became `'1009'` — a valid, out-of-range-ish code point that produced an unrelated
+  // character — and the fold reported EXACT. Not "cannot evaluate" (which is reported) but
+  // "evaluated, confidently, to the wrong value" (which is not).
+  const run = runGuard(t, {
+    'lib/domain/wms/sweep.ts':
+      'export const id = String.fromCharCode(100+9,100+5,100+10,100+16,100+15,100+11,100+2,100+16)\n',
+  })
+  assert.equal(run.status, 1, run.stdout)
+  assert.match(run.stderr, /lib\/domain\/wms\/sweep\.ts:1/)
+})
+
+test('guard: arithmetic that is NOT a spelling stays clean', (t) => {
+  // The negative for the rule above. Making `+` arithmetic-aware must not make ordinary numbers a
+  // finding, and `fromCharCode` over real character codes must still evaluate to what it evaluates
+  // to — a guard that fired on every sum would be turned off within a week.
+  const run = runGuard(t, {
+    'lib/domain/wms/sweep.ts': [
+      'export const batch = 100 + 9',
+      'export const window = (60 * 60 * 1000) - 250',
+      'export const initials = String.fromCharCode(65, 66, 67)',
+      'export const shifted = String.fromCharCode(0x41 + 1)',
+      // An unknown operand reads as the empty string in a `+`, so it must read the same way through
+      // a `.toString()` on the result. Rejecting one and not the other is the inconsistency that
+      // gets a guard allowlisted into silence.
+      'declare const offset: number',
+      'export const page = (offset + 1).toString()',
+      '',
+    ].join('\n'),
+  })
+  assert.equal(run.status, 0, run.stderr)
+})
+
+test('guard: a connector id CONCATENATED ACROSS MODULES fails', (t) => {
+  // The fold used to be bound to ONE file and read an unresolvable operand as the empty string, so
+  // splitting the id over two files was enough: `'mint'` is not an id, and the other half lived in
+  // a module the guard never opened. It now follows repo imports and evaluates the whole thing.
+  const run = runGuard(t, {
+    'lib/domain/wms/parts.ts': "export const SOFT = 'soft'\n",
+    'lib/domain/wms/sweep.ts': "import { SOFT } from './parts'\nexport const id = 'mint' + SOFT\n",
+  })
+  assert.equal(run.status, 1, run.stdout)
+  assert.match(run.stderr, /lib\/domain\/wms\/sweep\.ts:2/)
+})
+
+test('guard: the same concatenation through an `@/` import and a NAMESPACE import fails', (t) => {
+  const run = runGuard(t, {
+    'lib/connectors/mintsoft/ids.ts': "export const TAIL = 'soft'\n",
+    'lib/domain/wms/a.ts': "import { TAIL } from '@/lib/connectors/mintsoft/ids'\nexport const a = 'mint' + TAIL\n",
+    'lib/domain/wms/b.ts': "import * as ids from '@/lib/connectors/mintsoft/ids'\nexport const b = `mint${ids.TAIL}`\n",
+  })
+  assert.equal(run.status, 1, run.stdout)
+  assert.match(run.stderr, /lib\/domain\/wms\/a\.ts:2/)
+  assert.match(run.stderr, /lib\/domain\/wms\/b\.ts:2/)
+})
+
+test('guard: a repo import it CANNOT follow to a constant is a finding, not an empty string', (t) => {
+  // The rule that makes cross-module folding sound rather than best-effort: an operand the guard
+  // knows is a CONSTANT EXPRESSION but cannot evaluate is reported. Reading it as empty is what
+  // let the split spelling through in the first place.
+  const run = runGuard(t, {
+    'lib/domain/wms/parts.ts': 'export function tail() { return String(Date.now()) }\n',
+    'lib/domain/wms/sweep.ts': "import { tail } from './parts'\nexport const id = 'prefix-' + tail\n",
+  })
+  assert.equal(run.status, 1, run.stdout)
+  assert.match(run.stderr, /lib\/domain\/wms\/sweep\.ts:2/)
+})
+
+test('guard: a cross-module constant that does not spell an id is clean', (t) => {
+  // The negative for cross-module folding: following imports must ANSWER questions, not raise them.
+  const run = runGuard(t, {
+    'lib/domain/wms/parts.ts': "export const PREFIX = 'wms'\nexport const LIMIT = 100\n",
+    'lib/domain/wms/sweep.ts': [
+      "import { LIMIT, PREFIX } from './parts'",
+      "export const label = PREFIX + '-sweep'",
+      'export const page = LIMIT + 1',
+      '',
+    ].join('\n'),
+  })
+  assert.equal(run.status, 0, run.stderr)
+})
+
+test('guard: a PACKAGE import is not followed and is not reported', (t) => {
+  // node_modules is not scanned at all, so demanding evaluability of a package import would be the
+  // guard requiring of third-party code a property it never checks — and would fire on `path.sep`
+  // in every file that builds a filesystem path.
+  const run = runGuard(t, {
+    'lib/domain/wms/sweep.ts': [
+      "import path from 'node:path'",
+      "import { randomUUID } from 'node:crypto'",
+      "export const dir = 'wms' + path.sep",
+      "export const ref = 'ref-' + randomUUID()",
+      '',
+    ].join('\n'),
+  })
+  assert.equal(run.status, 0, run.stderr)
+})
+
+test('guard: a CONSTANT put through .replace is REJECTED rather than passed', (t) => {
+  // `'mintXsoft'.replace('X','')` — no token contains the id and the round-6 fold modelled no
+  // `.replace`, so it folded to nothing at all. Modelling `.replace` would close one member of an
+  // unbounded family (`.padStart`, `.normalize`, `.split().reverse().join()`, …), so the rule is
+  // about the SHAPE: a constant string through an operation the guard cannot evaluate is a finding.
+  const run = runGuard(t, {
+    'lib/domain/wms/sweep.ts': "export const id = 'mintXsoft'.replace('X', '')\n",
+  })
+  assert.equal(run.status, 1, run.stdout)
+  assert.match(run.stderr, /cannot evaluate/)
+})
+
+test('guard: the same method on a RUNTIME value is clean', (t) => {
+  // The negative that keeps the rule above usable. Ordinary code transforms data, not literals —
+  // the receiver does not fold, so nothing here is a constant the guard has failed to evaluate.
+  const run = runGuard(t, {
+    'lib/domain/wms/sweep.ts': [
+      'export function normalise(input: string, pad: string) {',
+      "  return input.replace(/\\s+/g, ' ').padStart(8, pad).split(',').map((s) => s.trim())",
+      '}',
+      '',
+    ].join('\n'),
+  })
+  assert.equal(run.status, 0, run.stderr)
+})
+
+test('guard: a base64 Buffer.from spelling fails', (t) => {
+  // `atob` has been modelled since round 6; `Buffer.from(x, 'base64')` is the same operation under
+  // another name, and it was not. It is EXACTLY evaluable, so it is evaluated — and this one
+  // evaluates to the connector id.
+  const run = runGuard(t, {
+    'lib/domain/wms/sweep.ts': "export const id = Buffer.from('bWludHNvZnQ=', 'base64').toString('utf8')\n",
+  })
+  assert.equal(run.status, 1, run.stdout)
+  assert.match(run.stderr, /lib\/domain\/wms\/sweep\.ts:1/)
+})
+
+test('guard: an ordinary Buffer.from of a non-id constant, and of runtime data, is clean', (t) => {
+  const run = runGuard(t, {
+    'lib/domain/wms/sweep.ts': [
+      "export const seed = Buffer.from('c3dlZXA=', 'base64').toString('utf8')",
+      "export const digest = (body: string) => Buffer.from(body, 'utf8').toString('hex')",
+      '',
+    ].join('\n'),
+  })
+  assert.equal(run.status, 0, run.stderr)
+})
+
+test('guard: a Buffer.from of a constant in an encoding it cannot evaluate is REJECTED', (t) => {
+  const run = runGuard(t, {
+    'lib/domain/wms/sweep.ts': [
+      'declare const enc: BufferEncoding',
+      "export const decoded = Buffer.from('bWludHNvZnQ=', enc).toString('utf8')",
+      '',
+    ].join('\n'),
+  })
+  assert.equal(run.status, 1, run.stdout)
+  assert.match(run.stderr, /cannot evaluate/)
+})
+
+test('guard: an import CYCLE terminates instead of recursing', (t) => {
+  // Cross-module folding walks a graph, and the graph in this repo has cycles. A guard that hangs
+  // or blows the stack on one is a guard that gets removed from `check:all`.
+  const run = runGuard(t, {
+    'lib/domain/wms/a.ts': "import { B } from './b'\nexport const A = B + 'a'\n",
+    'lib/domain/wms/b.ts': "import { A } from './a'\nexport const B = A + 'b'\n",
+  })
+  assert.notEqual(run.status, -1, 'the guard terminated')
+  assert.equal(run.status, 1, run.stdout)
+  assert.match(run.stderr, /cannot evaluate/)
+})

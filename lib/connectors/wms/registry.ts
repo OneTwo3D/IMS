@@ -210,23 +210,17 @@ export const BUILT_IN_WMS_CONNECTORS: readonly WmsConnectorDef[] = [
       // The /sync WMS panel and the onboarding connection step (o3d-remove-shiphero round 4,
       // Codex HIGH 2). Both used to be an `if (connectorId === 'mintsoft')` inside the generic
       // facade, with the connector's payload returned under a literal `mintsoft:` member.
+      // NEITHER HOOK STATES `configured` (o3d-remove-shiphero round 8, Codex HIGH 1). A hook
+      // supplies the PAYLOAD its own screen renders; whether the connection is set up is
+      // `isConfigured()`, which every connector must implement, and the facades read it there. A
+      // second source for one fact is what let the no-hook branch answer `false` on its own.
       syncDashboard: async () => {
         const m = await import('@/app/actions/mintsoft-sync')
-        return {
-          getDashboardData: async () => {
-            const data = await m.getMintsoftDashboardData()
-            return { configured: Boolean(data.status.configured), panel: data }
-          },
-        }
+        return { getDashboardData: async () => ({ panel: await m.getMintsoftDashboardData() }) }
       },
       onboarding: async () => {
         const m = await import('@/app/actions/mintsoft-sync')
-        return {
-          getConnectionData: async () => {
-            const data = await m.getMintsoftOnboardingConnectionData()
-            return { configured: data.status.configured, form: data }
-          },
-        }
+        return { getConnectionData: async () => ({ form: await m.getMintsoftOnboardingConnectionData() }) }
       },
       bookedInRecheck: async () => {
         const m = await import('@/lib/jobs/wms/process-mintsoft-booked-in-event')
@@ -288,6 +282,35 @@ export function getWmsConnectorHooks(
   source: WmsConnectorDefSource = wmsConnectorRegistry,
 ): WmsConnectorHooks {
   return source.findDef(id)?.hooks ?? {}
+}
+
+/**
+ * Where a connector INSTANCE is read from, for generic flows holding an id that may not be one this
+ * build ships. Structural for the same reason {@link WmsConnectorDefSource} is.
+ */
+export type WmsConnectorInstanceSource = {
+  findDef(id: string): { create: () => WmsConnector<string> } | null
+}
+
+/**
+ * The connector with this id, or `null` for an id this build does not ship.
+ *
+ * `findDef`, not `getDef`, and therefore NOT `getWmsConnector`: the callers are generic reads
+ * holding an id that came out of plugin state or a link row, and an id from a connector this build
+ * no longer ships must degrade rather than throw from inside a read.
+ *
+ * WHAT THIS EXISTS FOR (o3d-remove-shiphero round 8, Codex HIGH 1). `isConfigured()` is the one
+ * MANDATORY statement a connector makes about its own connection. The two UI facades used to
+ * answer `configured: false` from their own no-hook branch instead of asking it, which conflated
+ * "this connector ships no panel" (a CAPABILITY) with "this connector is not set up" (its STATE) —
+ * and told an operator with a live warehouse connection to go and re-enter credentials that were
+ * never missing. The facades now read the state here and nowhere else.
+ */
+export function findWmsConnector(
+  id: string,
+  source: WmsConnectorInstanceSource = wmsConnectorRegistry,
+): WmsConnector<string> | null {
+  return source.findDef(id)?.create() ?? null
 }
 
 /**
