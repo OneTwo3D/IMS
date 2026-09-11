@@ -11,6 +11,7 @@ import { getCronSecret } from '@/lib/cron-secret'
 import {
   buildOtiCrontabBlock,
   emulateRuntimeSecretExtraction,
+  extractOtiBlock,
   isCronSafePath,
   isNoCrontabDiagnostic,
   spliceOtiBlock,
@@ -189,7 +190,70 @@ async function applyCrontabFromSettings(
   }
   const newCrontab = spliceOtiBlock(read.text, block.lines)
 
-  return writeCrontab(newCrontab, lock.fd)
+  const written = await writeCrontab(newCrontab, lock.fd)
+  if (!written.success) return written
+
+  // STILL UNDER THE LOCK, deliberately: a confirmation taken after the exclusion is released is
+  // reading a crontab any other writer is free to have replaced, so it could fail over somebody
+  // else's correct write, or pass over one that overwrote ours.
+  return confirmOtiBlockInstalled(block.lines)
+}
+
+/**
+ * READ THE CRONTAB BACK AND SAY WHETHER THE SCHEDULE IS ACTUALLY THERE (o3d-jjdm).
+ *
+ * `crontab -` exiting 0 establishes that the command was issued and did not complain. It does not
+ * establish that the schedule exists. Trusting the exit status is proof of an adjacent property —
+ * that a command ran, not that a schedule is there.
+ *
+ * THE SANDBOX IS NOT WHAT THIS CHECK CATCHES, and saying so was wrong twice before. A unit that
+ * cannot reach the spool fails `readOwnCrontabResult()` ABOVE, and `reconcileCrontab` returns
+ * there without ever spawning `crontab -` — so the no-access case can never reach this function.
+ * (It is also not the shipped hardened unit's case: `deploy/systemd/ims-stage.service` carries
+ * `SupplementaryGroups=crontab`, so its read resolves.) What CAN reach here is a write that was
+ * accepted over a spool holding something else: a writer outside this app's lock — a `crontab -e`
+ * by hand, a configuration-management run, an edit to the spool file as root — or a `crontab` on
+ * PATH that is not the client we think it is. Those are what the operator message names.
+ *
+ * IT COMPARES THE MANAGED BLOCK, NOT THE WHOLE FILE. The block is the part this app owns and the
+ * part the question is about; a whole-file comparison would additionally be asserting that no
+ * `crontab` implementation anywhere normalises what it stores, and a false alarm over a crontab
+ * that is in fact correct is its own defect (Codex r20 MEDIUM).
+ *
+ * AN UNRESOLVED READ-BACK IS A FAILURE, not a warning, and that is the deliberate half. The write
+ * is not finished until it is confirmed, so "the confirmation did not resolve" and "the crontab is
+ * wrong" get the same answer: the scheduler is not known to be up to date, and the operator is told
+ * so. It is the same rule `readOwnCrontabResult` applies on the way in — an unreadable crontab is
+ * not an empty one — and the recovery it points at (Save & Apply again) is idempotent, so the cost
+ * of being wrong in this direction is one repeated save. Routing it through `followUpError` instead
+ * would render the sentence "the stored value is correct; the audit-log entry or the page cache may
+ * be missing", which is not what happened and names no recovery at all.
+ */
+async function confirmOtiBlockInstalled(expected: string[]): Promise<{ success: boolean; error?: string }> {
+  const readBack = await readOwnCrontabResult()
+  if (!readBack.resolved) {
+    return {
+      success: false,
+      error: '`crontab -` reported success, but the crontab could not be read back to confirm the '
+        + `schedule is there: ${readBack.reason}. The write may well have landed — this process `
+        + 'cannot say that it did, so it does not.',
+    }
+  }
+  const installed = extractOtiBlock(readBack.text)
+  if (installed.join('\n') !== expected.join('\n')) {
+    return {
+      success: false,
+      error: '`crontab -` reported success but the crontab does not contain the schedule that was '
+        + 'just written, so the scheduler is NOT up to date. This is NOT the sandboxed-unit case: a '
+        + 'unit that cannot reach the spool fails the read this function performs before the write, '
+        + 'and the reconciliation stops there. Reaching HERE means the read worked, the write was '
+        + 'accepted, and the spool still holds something else — so look at what else writes this '
+        + "crontab outside the app's lock (a `crontab -e` by hand, a configuration-management run, "
+        + 'an edit to the spool file as root), and at whether `crontab` on PATH is the client you '
+        + 'think it is.',
+    }
+  }
+  return { success: true }
 }
 
 /**

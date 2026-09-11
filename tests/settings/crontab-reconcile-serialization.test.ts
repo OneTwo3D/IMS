@@ -125,6 +125,8 @@ const WRITE_GATE = join(HARNESS, 'gate-armed')
 const READY_FIFO = join(HARNESS, 'ready.fifo')
 const GO_FIFO = join(HARNESS, 'go.fifo')
 const LOCK_FILE = join(HARNESS, 'crontab-reconcile.lock')
+/** Marker for the shim's `ok-then-denied` read mode: present once the first read has been answered. */
+const READ_ONCE = join(HARNESS, 'read-once')
 
 // `$STATE_DIRECTORY` is systemd's answer and outranks the test-only override, so it must be absent
 // here — otherwise every test below would silently lock a file in a real state directory.
@@ -152,9 +154,21 @@ if [ "$1" = "-l" ]; then
   # names the CALLING user because that is the user the application's own \`crontab -l\` asks about.
   case "\${OTI_TEST_CRONTAB_READ:-ok}" in
     ok)      if [ -f '${CRONTAB_FILE}' ]; then cat '${CRONTAB_FILE}'; fi; exit 0 ;;
-    absent)  echo "no crontab for $(id -un)" >&2; exit 1 ;;
+    # ABSENT UNTIL SOMETHING WRITES ONE, which is what a real crontab does. A fixed "absent" answer
+    # would keep saying so after \`crontab -\` had installed the block, and the read-back that
+    # confirms the write (o3d-jjdm) would then be reading a state no host can be in.
+    absent)  if [ -f '${CRONTAB_FILE}' ]; then cat '${CRONTAB_FILE}'; exit 0; fi
+             echo "no crontab for $(id -un)" >&2; exit 1 ;;
     denied)  echo "must be privileged to use -u" >&2; exit 1 ;;
     silent)  exit 1 ;;
+    # ONE reconciliation reads the crontab TWICE — once to splice into, once to confirm the write
+    # landed (o3d-jjdm). This mode answers the first and fails the second, which is the only way to
+    # reach the confirmation's unresolved branch: a mode that failed every read would abort before
+    # the write ever happened.
+    ok-then-denied)
+             if [ -f '${READ_ONCE}' ]; then echo "must be privileged to use -u" >&2; exit 1; fi
+             : > '${READ_ONCE}'
+             if [ -f '${CRONTAB_FILE}' ]; then cat '${CRONTAB_FILE}'; fi; exit 0 ;;
     *)       echo "unmodelled read mode" >&2; exit 1 ;;
   esac
 fi
@@ -174,7 +188,15 @@ if [ -f '${WRITE_GATE}' ]; then
   echo parked > '${READY_FIFO}'
   head -n 1 '${GO_FIFO}' > /dev/null
 fi
-cat > '${CRONTAB_FILE}'
+# \$OTI_TEST_CRONTAB_WRITE puts the WRITE into the states a real crontab reaches, unset meaning the
+# ordinary one so every test written before this knob behaves exactly as it did. \`drop\` is the
+# state o3d-jjdm is about: stdin is consumed, EXIT 0 IS REPORTED, and nothing is installed — which
+# is what an exit-status check alone cannot tell apart from a successful write.
+case "\${OTI_TEST_CRONTAB_WRITE:-ok}" in
+  ok)   cat > '${CRONTAB_FILE}' ;;
+  drop) cat > /dev/null ;;
+  *)    echo "unmodelled write mode" >&2; exit 1 ;;
+esac
 echo "write-end" >> '${JOURNAL}'
 `)
 chmodSync(join(HARNESS, 'crontab'), 0o755)
@@ -1457,6 +1479,9 @@ test('[o3d-batch-ret] the lock path is writable under every sandboxing directive
     ['ReadWritePaths', 'the app-tree exceptions to ProtectSystem=strict; the state directory needs no entry because systemd adds it implicitly'],
     ['User', 'ims — the identity systemd gives the StateDirectory to, and the identity that opens the root-owned lock file read-only'],
     ['Group', 'ims — likewise; the lock file is world-readable, so group membership is not load-bearing'],
+    ['SupplementaryGroups', 'crontab (o3d-jjdm) — grants the group /usr/bin/crontab is setgid to, which '
+      + 'NoNewPrivileges would otherwise suppress on exec. It adds a group, never a path: the lock lives '
+      + 'under the StateDirectory, which is reached as User= and needs no group at all'],
     ['WorkingDirectory', 'the app tree — the cwd fallback in crontabReconcileLockPath(), which $STATE_DIRECTORY outranks under this unit'],
     ['Environment', 'NODE_ENV=production is what makes OTI_CRONTAB_LOCK_PATH refuse to split the exclusion; no lock variable is set here'],
     ['EnvironmentFile', 'the .env may set OTI_CRONTAB_LOCK_WAIT_MS (bounded, validated); a lock PATH set there is refused in production'],
@@ -3723,7 +3748,10 @@ test('[o3d-batch-ret] MUTATION: the pre-fix reader turns that failure into an em
   assert.equal(shipped.resolved, false,
     `the shipped reader must refuse where the pre-fix one fabricated:\n${JSON.stringify(shipped)}`)
 
-  // …while the benign absence still resolves, which is the boundary the whole rule turns on.
+  // …while the benign absence still resolves, which is the boundary the whole rule turns on. The
+  // shim's `absent` mode is absent only while there is no crontab, so this asks the question over a
+  // host that genuinely has none rather than over a fixed answer.
+  rmSync(CRONTAB_FILE, { force: true })
   const absent = await withReadMode('absent', () => readOwnCrontabResult())
   assert.deepEqual(absent, { resolved: true, text: '', present: false },
     `and an absent crontab resolves as an empty one:\n${JSON.stringify(absent)}`)
@@ -6140,4 +6168,209 @@ test('[o3d-batch-ret] a unit census that stopped part-way is REFUSED, rather tha
     assert.match(preFix.stdout, /^UNITS=ims-one\.service$/m,
       `THE LOSS (${why}): ims-two.service is never fenced, stopped or restarted, and writes across the migration`)
   }
+})
+
+// ---------------------------------------------------------------------------
+// o3d-jjdm — A WRITE THAT EXITS 0 IS NOT A SCHEDULE THAT EXISTS.
+//
+// `writeCrontab` resolved `{ success: true }` on `code === 0` and nothing read the crontab back, so
+// the whole route's evidence that the scheduler was up to date was the exit status of a command.
+//
+// The suppressed setgid transition is NOT what makes those two facts come apart at the WRITE. A
+// unit that cannot reach the spool fails the read `reconcileCrontab` takes first and returns there,
+// never reaching `crontab -` at all — so it is the READ guard that case belongs to, and the
+// measurement below is what pins THAT. What the confirmation catches is a write accepted over a
+// spool holding something else: a writer outside this app's lock, or a `crontab` on PATH that is
+// not the client we think it is. Measured on the deployment host, same binary and same user:
+//
+//   ordinary exec                            `crontab -l` -> exit 0, crontab returned
+//   setpriv --no-new-privs                   `crontab -l` -> exit 1, "fopen: Permission denied"
+//   setpriv --no-new-privs --groups crontab  `crontab -l` -> exit 0, crontab returned
+//
+// WHAT THESE PIN, and the route each takes:
+//   1. LOAD-BEARING. A `crontab -` that exits 0 and installs nothing is reported as a FAILED
+//      reconciliation, naming the scheduler
+//                     (backup-schedule.tsx -> saveBackupScheduleSettings -> reconcileCrontab
+//                      -> applyCrontabFromSettings -> confirmOtiBlockInstalled)
+//   2. MUTATION. The shipped predicate — `code === 0` — evaluated against the SAME shim in the SAME
+//      state, showing it answers "success" over a crontab that did not change   (the shim, run raw)
+//   3. LOAD-BEARING. A confirmation that cannot resolve is a failure too, not a warning  (same route)
+//   4. LOAD-BEARING. The ordinary save still passes the confirmation, so 1 and 3 are decisions
+//      rather than a check that refuses everything                                       (same route)
+//   5. The unit carries what makes the write possible at all, with NoNewPrivileges intact
+//                                                                (deploy/systemd/ims-stage.service)
+// ---------------------------------------------------------------------------
+
+async function withWriteMode<T>(mode: string | null, fn: () => Promise<T>): Promise<T> {
+  const saved = process.env.OTI_TEST_CRONTAB_WRITE
+  if (mode === null) delete process.env.OTI_TEST_CRONTAB_WRITE
+  else process.env.OTI_TEST_CRONTAB_WRITE = mode
+  try {
+    return await fn()
+  } finally {
+    if (saved === undefined) delete process.env.OTI_TEST_CRONTAB_WRITE
+    else process.env.OTI_TEST_CRONTAB_WRITE = saved
+  }
+}
+
+test('[o3d-jjdm] a `crontab -` that exits 0 and installs nothing is reported as a failed reconciliation', async () => {
+  writeFileSync(CRONTAB_FILE, `${APP_OPERATOR_LINE}\n`)
+  rmSync(JOURNAL, { force: true })
+  rmSync(READ_ONCE, { force: true })
+
+  // CONTROL, FIRST. The ordinary write reconciles and the confirmation passes, so the failure below
+  // is about the dropped write and not about the fixture or the new check.
+  const control = await withWriteMode(null, () => saveBackup(true))
+  assert.deepEqual(control, { status: 'saved' },
+    `precondition: an ordinary save must still reconcile:\n${JSON.stringify(control)}`)
+  assert.ok(backupLineInstalled(), 'precondition: and the managed job is actually scheduled')
+  const preserved = crontabText()
+
+  // THE PROPERTY. `crontab -` consumes the whole crontab and exits 0 without installing it.
+  const dropped = await withWriteMode('drop', () => saveBackup(false))
+  assert.equal(dropped.status, 'post-commit-failed',
+    `a write that installed nothing must not report success:\n${JSON.stringify(dropped)}`)
+  assert.equal(dropped.status === 'post-commit-failed' && dropped.step, 'scheduler',
+    'and the operator must be told it is the SCHEDULER that is behind, which has a named recovery')
+  assert.match(dropped.status === 'post-commit-failed' ? dropped.error : '',
+    /does not contain the schedule that was just written/,
+    `and it must say what was checked, not just that something failed:\n${JSON.stringify(dropped)}`)
+
+  // The write really was invoked and really did exit 0 — otherwise this would be re-testing the
+  // non-zero path that was already handled.
+  assert.ok(journal().includes('write-end'),
+    `the shim must have run to completion, i.e. exited 0:\n${journal().join('\n')}`)
+  assert.equal(crontabText(), preserved,
+    `and the crontab is untouched, which is the whole point:\n${crontabText()}`)
+})
+
+test('[o3d-jjdm] MUTATION: the shipped exit-status predicate answers "success" over that same unchanged crontab', async () => {
+  // THE ROUTE, RUN. Not a description of the old code: `code === 0` is evaluated here against the
+  // same shim in the same state, and the crontab is inspected on either side of it.
+  writeFileSync(CRONTAB_FILE, `${APP_OPERATOR_LINE}\n`)
+  const before = crontabText()
+
+  const exitCode = await withWriteMode('drop', () => new Promise<number | null>((resolve) => {
+    const proc = spawn('crontab', ['-'], { stdio: ['pipe', 'ignore', 'pipe'] })
+    proc.on('close', (code) => resolve(code))
+    proc.stdin?.write('# --- OTI CRON START ---\n0 1 * * * /usr/bin/managed\n# --- OTI CRON END ---\n')
+    proc.stdin?.end()
+  }))
+
+  assert.equal(exitCode, 0,
+    'THE FINDING: `code === 0` — the predicate the write path used as its ONLY evidence of success '
+    + '— is satisfied here')
+  assert.equal(crontabText(), before,
+    `THE LOSS: and the crontab is byte-for-byte unchanged, with no managed block in it:\n${crontabText()}`)
+  assert.ok(!/OTI CRON START/.test(crontabText()), 'the schedule the save reported as applied is absent')
+
+  // …and the shipped confirmation, given the identical state, refuses.
+  const { extractOtiBlock } = await crontabSync()
+  assert.deepEqual(extractOtiBlock(crontabText()), [],
+    'the confirmation reads no managed block back, which is what turns the exit status into a failure')
+})
+
+test('[o3d-jjdm] a confirmation that cannot resolve is a failure, not a silent success', async () => {
+  writeFileSync(CRONTAB_FILE, `${APP_OPERATOR_LINE}\n`)
+  rmSync(JOURNAL, { force: true })
+  rmSync(READ_ONCE, { force: true })
+
+  // The first read answers (so the splice happens and the write runs), the second one fails.
+  const unconfirmed = await withReadMode('ok-then-denied', () => saveBackup(true))
+  assert.equal(unconfirmed.status, 'post-commit-failed',
+    `an unconfirmable write must not be reported as applied:\n${JSON.stringify(unconfirmed)}`)
+  assert.equal(unconfirmed.status === 'post-commit-failed' && unconfirmed.step, 'scheduler',
+    'and it is the scheduler that is unconfirmed, which is the step with a recovery')
+  assert.match(unconfirmed.status === 'post-commit-failed' ? unconfirmed.error : '',
+    /could not be read back to confirm/,
+    `and it must distinguish "unconfirmed" from "wrong":\n${JSON.stringify(unconfirmed)}`)
+
+  // The write DID happen — this is the post-write branch, not the pre-write refusal.
+  assert.ok(journal().includes('write-start'),
+    `the write must have been attempted, or this is the read-refusal test again:\n${journal().join('\n')}`)
+  assert.ok(backupLineInstalled(),
+    `and the crontab does in fact hold the job — the failure is about not KNOWING that:\n${crontabText()}`)
+
+  // AND THE OTHER DIRECTION, so the check above is a decision rather than a refusal of everything:
+  // with both reads answering, the same save reports success.
+  rmSync(READ_ONCE, { force: true })
+  const ok = await withReadMode(null, () => saveBackup(true))
+  assert.deepEqual(ok, { status: 'saved' },
+    `a confirmable write must still report success:\n${JSON.stringify(ok)}`)
+})
+
+test('[o3d-jjdm] the shipped unit grants the cron spool WITHOUT relaxing NoNewPrivileges', async () => {
+  const unit = readFileSync(join(REPO_ROOT, 'deploy/systemd/ims-stage.service'), 'utf8')
+
+  // The two directives that make the write possible at all under ProtectSystem=strict.
+  assert.match(unit, /^SupplementaryGroups=crontab$/m,
+    'the service user must be granted the group /usr/bin/crontab is setgid to')
+  assert.match(unit, /^ReadWritePaths=\/var\/spool\/cron\/crontabs$/m,
+    'and ProtectSystem=strict makes /var read-only, so the spool needs an explicit exception')
+
+  // AND THE HARDENING IS NOT WHAT WAS TRADED. A supplementary group is granted by systemd before
+  // the exec; NoNewPrivileges only forbids privileges GAINED by one. If a later round "fixes" this
+  // by turning the sandbox off instead, this fails.
+  assert.match(unit, /^NoNewPrivileges=true$/m,
+    'NoNewPrivileges must stay on — the group is granted, not gained, so nothing required relaxing it')
+  assert.match(unit, /^ProtectSystem=strict$/m, 'and the filesystem stays read-only by default')
+
+  // The e2e unit must NOT have been given the same grant: it runs the full-chain suite against the
+  // real host's crontab, so a scheduler save there failing is the wanted behaviour.
+  const e2e = readFileSync(join(REPO_ROOT, 'deploy/systemd/ims-e2e-dev.service'), 'utf8')
+  assert.doesNotMatch(e2e, /^SupplementaryGroups=crontab$/m,
+    'the e2e unit must not be able to rewrite the host crontab')
+  assert.match(e2e, /o3d-jjdm/,
+    'and the omission must be recorded as deliberate, or someone will copy the stage unit over it')
+})
+
+test('[o3d-jjdm] every unit this repo ships that hardens with NoNewPrivileges has DECIDED about the cron spool', async () => {
+  // THE REGRESSION THIS EXISTS FOR. The defect is not a bug in a line of code — it is a unit that
+  // gained a hardening directive without anybody working out that the directive silently disarms
+  // `/usr/bin/crontab`'s setgid bit. There is more than one unit source here, and the one the
+  // installer WRITES is not a file anybody reviews as a unit, so the rule is applied to the text
+  // that becomes a unit rather than to the files under deploy/systemd.
+  const sources = new Map<string, string>()
+  for (const name of readdirSync(join(REPO_ROOT, 'deploy/systemd'))) {
+    if (name.endsWith('.service')) {
+      sources.set(`deploy/systemd/${name}`, readFileSync(join(REPO_ROOT, 'deploy/systemd', name), 'utf8'))
+    }
+  }
+  // The installer's heredoc, extracted rather than described.
+  const installer = readFileSync(join(REPO_ROOT, 'scripts/install.sh'), 'utf8')
+  const open = installer.indexOf('cat > "/etc/systemd/system/${APP_NAME}.service" <<EOF')
+  assert.ok(open > 0, 'the installer must still write a unit through that heredoc, or this walk is aimed at nothing')
+  const bodyStart = installer.indexOf('\n', open) + 1
+  const bodyEnd = installer.indexOf('\nEOF\n', bodyStart)
+  assert.ok(bodyEnd > bodyStart, 'the installer heredoc must terminate')
+  sources.set('scripts/install.sh (generated unit)', installer.slice(bodyStart, bodyEnd))
+
+  // THE WALK MUST HAVE REACHED THE UNITS. Without this the loop below is satisfied by an empty map.
+  assert.ok(sources.size >= 4, `expected the three shipped units plus the installer's, saw ${sources.size}`)
+  assert.ok([...sources.values()].every((t) => /^\[Service\]$/m.test(t)),
+    'every source collected must actually be a unit body')
+
+  const offenders: string[] = []
+  for (const [name, text] of sources) {
+    // Only units that BOTH run as a non-root user and set NoNewPrivileges can be bitten: root owns
+    // the spool outright, and without NoNewPrivileges the setgid bit does its job.
+    const nonRoot = /^User=(?!root$)\S+/m.test(text)
+    if (!nonRoot || !/^NoNewPrivileges=(true|yes|1)$/m.test(text)) continue
+    const grants = /^SupplementaryGroups=.*\bcrontab\b/m.test(text)
+    const decided = text.includes('o3d-jjdm')
+    if (!grants && !decided) offenders.push(name)
+  }
+  assert.deepEqual(offenders, [],
+    'these units run the app as a non-root user under NoNewPrivileges=true, which makes the kernel '
+    + 'ignore the setgid bit on /usr/bin/crontab, so the in-app Scheduler cannot read or write the '
+    + 'crontab under them. Either grant SupplementaryGroups=crontab (plus ReadWritePaths for the '
+    + 'spool if ProtectSystem is strict), or record the decision not to by naming o3d-jjdm in the '
+    + `unit — do not leave it undecided:\n${offenders.join('\n')}`)
+
+  // AND THE RULE IS NOT VACUOUS: it must actually have examined units, and at least one of them
+  // must be in scope, or an empty `offenders` proves nothing.
+  const inScope = [...sources.values()].filter((t) =>
+    /^User=(?!root$)\S+/m.test(t) && /^NoNewPrivileges=(true|yes|1)$/m.test(t))
+  assert.ok(inScope.length >= 2,
+    `at least two shipped units must be in scope for this rule, saw ${inScope.length}`)
 })

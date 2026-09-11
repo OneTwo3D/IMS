@@ -74,5 +74,12 @@ RestrictRealtime=true
 LockPersonality=true
 # NOTE: no MemoryDenyWriteExecute (breaks the V8 JIT).
 
+# DELIBERATELY NOT `SupplementaryGroups=crontab` (o3d-jjdm). ims-stage.service carries that so the
+# in-app Scheduler can write the crontab; this box must NOT, because it runs the full-chain e2e
+# suite and the crontab it would reach is the real host's. Under NoNewPrivileges=true the setgid
+# transition on /usr/bin/crontab does not happen, so a scheduler save here fails with a permission
+# error rather than rewriting the host's schedule — which is the wanted behaviour, not a defect to
+# be fixed by copying the stage unit's two lines over.
+
 [Install]
 WantedBy=multi-user.target

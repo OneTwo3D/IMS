@@ -90,5 +90,38 @@ ReadWritePaths=/opt/ims/onetwo3d-ims/.next
 ReadWritePaths=/opt/ims/onetwo3d-ims/uploads
 ReadWritePaths=/opt/ims/onetwo3d-ims/public/uploads
 
+# --- The cron spool the Scheduler writes (o3d-jjdm) ---
+#
+# WITHOUT THESE TWO LINES THE SCHEDULER CANNOT READ OR WRITE THE CRONTAB UNDER THIS UNIT, and every
+# Settings -> System -> Scheduler save fails. Measured on the deployment host, same binary, three
+# runs differing only in the credentials, `crontab -l` as the service user:
+#
+#   ordinary exec                                     -> exit 0, crontab returned
+#   setpriv --no-new-privs (this unit)                -> exit 1, "crontabs/ims/: fopen: Permission denied"
+#   setpriv --no-new-privs --groups crontab (below)   -> exit 0, crontab returned
+#
+# Why: /usr/bin/crontab is `-rwxr-sr-x root crontab` and the spool is `drwx-wx--T root crontab`, so
+# the binary reaches the spool only through the group its setgid bit confers. `NoNewPrivileges=true`
+# makes the kernel IGNORE setuid/setgid bits on exec, so that transition does not happen and the
+# binary runs as plain ims:ims, which has no access to the spool whatsoever.
+#
+# NoNewPrivileges STAYS TRUE, and that is the point of fixing it this way. A supplementary group is
+# GRANTED by systemd while it is still root, before the exec — it is not GAINED by the exec, which
+# is the only thing NoNewPrivileges forbids. So the sandbox keeps the property that matters (nothing
+# this service execs can ever acquire more than the service already has) and loses nothing.
+#
+# THE TRADE-OFF, stated rather than assumed. Group `crontab` has `-wx` on the spool directory, so
+# this service can now create files there. It CANNOT read other users' crontabs (no `r` on the
+# directory, and the files are 0600), and it cannot delete or rename anyone else's (the directory is
+# sticky). It can create a file named after another user — but Debian cron (3.0pl1) refuses to run a
+# spool file whose owner does not match the user it is named for, logging WRONG FILE OWNER, so this
+# is not a route to running code as anyone else. What is genuinely conceded is that a compromise of
+# this service can write into a directory shared with every other user's schedule. That is a real
+# widening of the blast radius and it buys the Scheduler feature; an install that does not use the
+# in-app Scheduler should delete both lines and let the root-side installer own the crontab.
+SupplementaryGroups=crontab
+# ProtectSystem=strict makes /var read-only too, so the group alone is not enough.
+ReadWritePaths=/var/spool/cron/crontabs
+
 [Install]
 WantedBy=multi-user.target
