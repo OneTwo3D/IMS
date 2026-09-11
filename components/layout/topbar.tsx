@@ -155,6 +155,7 @@ export function Topbar({ userName, userEmail, userPictureUrl, onMenuClick }: Top
   // Prefer client-side session pictureUrl (updates instantly after upload)
   const pictureUrl = (session?.user as { pictureUrl?: string | null } | undefined)?.pictureUrl ?? userPictureUrl
 
+  // wms-connector-boundary-ok: o3d-remove-shiphero: joins first characters of the user's own name.
   const initials = userName
     .split(' ')
     .map((n) => n[0])

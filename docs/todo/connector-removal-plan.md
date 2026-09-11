@@ -65,6 +65,28 @@ connector to Mintsoft's `Europe/London` — so a connector expecting UTC had its
 window shifted by an hour and silently skipped whatever changed in the gap. The
 test could not see it, because the test supplied the answer.
 
+**Round 6 sharpened it a third time, and this is the one to copy.** Round 4 moved
+the two UI facades (`app/actions/wms-sync.ts`, `app/actions/wms-onboarding.ts`)
+off `id === 'mintsoft'` and keyed their DTOs by connector — and the seam test
+proved exactly that, at the facade. The files that **read** those DTOs were not
+touched: the `/sync` panel and the onboarding step still matched one id and
+rendered `null` for any other, beneath a header naming the connector, a card
+reading CONFIGURED and an enable switch that was on. A second connector got a
+**blank screen that looks like a working one**, which is worse than an error
+because nothing on it invites doubt. Four rounds running, the seam proved a
+property one layer short of where production decides.
+
+So the rule has a second half: **follow the DTO to the last thing that renders
+it.** For every envelope a dispatch facade returns, list every consumer and ask
+what each one does with an id it does not recognise. The fix is structural, not
+another arm — the per-connector renderer is a `Record<ConnectorId, …>` that is
+**total over the id union**, so a registered connector with no UI is a compile
+error, and the runtime miss (a link row or plugin state from a connector this
+build no longer ships) renders a named, visible unsupported state. There is no
+path that renders nothing. `tests/wms-second-connector-seam-ui.test.ts` drives
+the real components from the real facades with `acme-wms` active and asserts on
+the **markup an operator reads**, not on the DTO.
+
 So, concretely: **never pass a core a value the production wrapper computes.**
 Enumerate what each wrapper derives between the entrypoint and the core — the
 resolved connector, its capabilities, every setting read, every default behind an

@@ -5,7 +5,7 @@ import { Table, TableHeader, TableBody, TableRow, TableHead, TableCell } from '@
 import { useRouter, useSearchParams } from 'next/navigation'
 import { SyncClient } from './sync-client'
 import { ShopifySyncClient } from './shopify-sync-client'
-import { WmsSyncPanel } from './wms-sync-panel'
+import { WMS_PANEL_ENTRIES, WmsSyncPanel } from './wms-sync-panel'
 import { AccountingConnectorPanel, isAccountingConnectorUiId } from './accounting-connector-panel'
 import { isWmsConnectorId } from '@/lib/connectors/wms/types'
 import type { WmsSyncDashboardData } from '@/app/actions/wms-sync'
@@ -98,14 +98,21 @@ const CONNECTORS: ConnectorDef[] = [
     category: 'shopping',
     available: true,
   },
-  {
-    id: 'mintsoft',
-    name: 'Mintsoft',
-    description: 'Bind Mintsoft warehouses, store credentials, and stage WMS callbacks',
-    logo: '/images/mintsoft.svg',
+  // o3d-remove-shiphero round 6 (Codex HIGH 1) — THE WMS CARDS ARE DERIVED, NOT LISTED.
+  // A hand-written entry per connector is the same one-arm shape as the panel dispatch it sits
+  // next to: a registered, enabled second connector that nobody remembered to add here gets no
+  // card at all, so the Warehouse Management section is empty and the connector is unreachable
+  // from the UI — silently, with nothing on screen to say so. `WMS_PANEL_ENTRIES` is built from
+  // the total `Record<WmsConnectorId, …>` in wms-sync-panel.tsx, so every registered id has a card
+  // and a panel or the build does not compile.
+  ...WMS_PANEL_ENTRIES.map((entry): ConnectorDef => ({
+    id: entry.id,
+    name: entry.label,
+    description: entry.description,
+    logo: '',
     category: 'wms',
     available: true,
-  },
+  })),
   {
     id: 'xero',
     name: 'Xero',
@@ -137,8 +144,8 @@ const CONNECTOR_LOGOS: Record<string, React.ReactNode> = {
       <span className="text-base font-bold tracking-tight">REST API</span>
     </div>
   ),
-  // eslint-disable-next-line @next/next/no-img-element
-  mintsoft: <img src="/images/mintsoft.svg" alt="Mintsoft" className="h-8 object-contain" />,
+  // The WMS logos come from the same total record the cards and panels do.
+  ...Object.fromEntries(WMS_PANEL_ENTRIES.map((entry) => [entry.id, entry.logo])),
   // eslint-disable-next-line @next/next/no-img-element
   xero: <img src="/images/xero.svg" alt="Xero" className="h-8 object-contain" />,
   // eslint-disable-next-line @next/next/no-img-element
@@ -287,8 +294,12 @@ export function SyncDashboard({ pluginState, shoppingSettings, shoppingTaxMappin
     )
   }
 
-  if (activeConnector && isWmsConnectorId(activeConnector) && wmsData && wmsData.connectorId === activeConnector) {
-    return <WmsSyncPanel data={wmsData} onBack={() => setActiveConnector(null)} />
+  // EVERY WMS card opens its panel. The old guard also required the DTO to belong to the card that
+  // was clicked, so a second enabled connector's card fell through to the grid — a click that did
+  // nothing and explained nothing. The panel is total over the cases now, so the mismatch is a
+  // state it renders rather than a branch that vanishes (o3d-remove-shiphero round 6, Codex HIGH 1).
+  if (activeConnector && isWmsConnectorId(activeConnector)) {
+    return <WmsSyncPanel connectorId={activeConnector} data={wmsData} onBack={() => setActiveConnector(null)} />
   }
 
   if (activeConnector === 'shopify') {

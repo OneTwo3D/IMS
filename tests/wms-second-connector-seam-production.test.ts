@@ -249,6 +249,11 @@ test('seam/production: the /sync dashboard facade dispatches to a registered non
   const data = await wmsSync.getWmsSyncDashboardData()
   assert.notEqual(data, null, 'a WMS connector IS enabled; `null` is the no-connector answer')
   assert.equal(data!.connectorId, ACME_WMS_ID)
+  assert.equal(
+    data!.connectorLabel, ACME_WMS_LABEL,
+    'the /sync panel is a CLIENT component and cannot read the registry, so the label travels in the DTO'
+    + ' (o3d-remove-shiphero round 6) — without it an unknown connector is shown to an operator as a raw id',
+  )
   assert.equal(data!.configured, true, 'the connector said it is configured, and the facade must carry that through')
 
   // The DTO is keyed BY CONNECTOR. A literal `mintsoft:` member was the actual obstacle to routing

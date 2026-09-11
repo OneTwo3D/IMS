@@ -53,6 +53,19 @@
  *     interpolated into a pattern, so an id containing `+`, `.`, `(` or `|` matches itself
  *     and only itself.
  *
+ * o3d-remove-shiphero round 6 (Codex HIGH 2) — WHY IT EVALUATES EXPRESSIONS, NOT TOKENS.
+ * The round-4 rewrite inspects each leaf token INDEPENDENTLY, which is the same blindness one
+ * level up: `const id = 'mint' + 'soft'` is two tokens, neither containing the id, and
+ * `'\x6dintsoft'` is one token whose SOURCE TEXT is not the id while its VALUE is. Both exited 0
+ * with a live connector literal in a protected generic file. So a second, purely ADDITIVE pass
+ * folds CONSTANT STRING EXPRESSIONS — concatenation, templates, escapes, in-file consts and enum
+ * members, `[...].join()`, `String.fromCharCode`, `atob`/`decodeURIComponent` — and matches the
+ * VALUE. What it cannot evaluate it treats conservatively: an unknown operand reads as the empty
+ * string (so `'mint' + x + 'soft'` is a finding), and a construct that can glue or mint characters
+ * out of pieces the guard cannot see at all is REJECTED on its own (five waivers in this tree).
+ * See the block above `scriptKindFor` for the full rule, and docs/wms-connector-boundary.md for
+ * the spellings that remain out of reach.
+ *
  * WHAT IS SCANNED THERE, AND WHAT IS NOT. Inside the generic layer the guard reads CODE
  * only: the parse tree's tokens, which excludes comments. A comment has no behaviour — it
  * cannot pin a generic code path to one warehouse — and the doc comments in that layer
@@ -308,6 +321,379 @@ const COMMENT_EXEMPT_PREFIXES = [
   'app/actions/wms-onboarding.ts',
 ]
 
+// ---------------------------------------------------------------------------------------------
+// CONSTANT STRING EXPRESSIONS, FOLDED TO THEIR VALUE (o3d-remove-shiphero round 6, Codex HIGH 2)
+//
+// WHY TOKENS ARE NOT ENOUGH. Round 4 replaced the hand-rolled tokenizer with the real parse tree
+// and scanned every LEAF TOKEN. That fixed the blind spots it was aimed at and left one of exactly
+// the same shape: a leaf token is inspected ON ITS OWN, so an id assembled out of tokens that
+// individually do not contain it is invisible. `const id = 'mint' + 'soft'` is a live connector
+// literal in a protected file that the token scan exits 0 on — and so is `'\x6dintsoft'`, whose
+// RAW token text (which is what the scan slices out of the source) spells `\x6dintsoft` while its
+// VALUE is the id.
+//
+// WHAT THIS ADDS. A second, purely ADDITIVE pass that evaluates CONSTANT STRING EXPRESSIONS and
+// matches their VALUE. It never suppresses a token or raw finding; it can only add lines.
+//
+// HOW UNKNOWNS ARE TREATED — the conservative direction, stated once:
+//
+//   - an operand that does not fold contributes the EMPTY STRING and marks the result inexact, so
+//     `'mint' + suffix + 'soft'` is a finding. Reading a hole as possibly-empty is the strict
+//     reading that is also usable: the alternative (reading it as "some string") makes every
+//     concatenation in the repo a finding, since an unknown operand could be the whole id by
+//     itself, and a guard that fires on everything gets allowlisted into silence;
+//   - a construct that ASSEMBLES A STRING OUT OF PIECES THE GUARD CANNOT SEE AT ALL, where no
+//     literal exists anywhere for the token or raw scan to fall back on, is OPAQUE and is reported
+//     on its own — `String.fromCharCode(...codes)` mints characters and `parts.join('')` glues
+//     fragments out of nothing. That is the "reject what you cannot fold" half, kept narrow enough
+//     to stay believed: `String.fromCharCode(byte)` cannot produce eight characters, and
+//     `items.join(', ')` cannot glue two non-ids into an id because no id contains `, `.
+//
+// WHERE A FINDING IS REPORTED. At the line of the LITERAL PIECE that supplied the match, not at
+// the line the expression starts on. A folded value is stitched together from pieces scattered
+// over many lines (and, through an in-file `const`, over many parts of the file); blaming the
+// first line would move findings away from the text that caused them and would silently invalidate
+// every per-line waiver already in the tree.
+//
+// It is a FOLD, not an interpreter. What it cannot evaluate is enumerated in
+// docs/wms-connector-boundary.md next to what happens to it.
+// ---------------------------------------------------------------------------------------------
+
+/** The shortest id: a construct that cannot produce this many characters cannot produce an id. */
+const SHORTEST_ID_LENGTH = Math.min(...CONNECTOR_LITERALS_LOWER.map((id) => id.length))
+
+/**
+ * Whether a join separator could GLUE two non-id fragments into an id.
+ *
+ * `''` can. So can any string an id contains (`-`, under an `acme-wms` build). Nothing else can:
+ * an id in the joined result would have to sit wholly inside ONE element, and an element that
+ * spells an id either does so as a literal (which the token/raw scan reads) or assembles it itself
+ * (which this pass reads at that element's own site).
+ */
+function separatorCanGlue(separator) {
+  if (separator === '') return true
+  const lower = separator.toLowerCase()
+  return CONNECTOR_LITERALS_LOWER.some((id) => id.includes(lower))
+}
+
+function unwrapFoldable(node) {
+  let current = node
+  for (;;) {
+    if (ts.isParenthesizedExpression(current) || ts.isAsExpression(current) || ts.isNonNullExpression(current)) {
+      current = current.expression
+      continue
+    }
+    if (typeof ts.isSatisfiesExpression === 'function' && ts.isSatisfiesExpression(current)) {
+      current = current.expression
+      continue
+    }
+    if (typeof ts.isTypeAssertionExpression === 'function' && ts.isTypeAssertionExpression(current)) {
+      current = current.expression
+      continue
+    }
+    return current
+  }
+}
+
+/**
+ * A folded value: the ordered PIECES it was stitched from (each remembering the node that supplied
+ * it), whether every operand was known, and the nodes of any opaque assembly inside it.
+ */
+const foldOf = (text, node) => ({ pieces: [{ text, node }], exact: true, opaque: [] })
+const foldNothing = (exact) => ({ pieces: [], exact, opaque: [] })
+const foldOpaque = (node) => ({ pieces: [], exact: false, opaque: [node] })
+const foldText = (folded) => folded.pieces.map((piece) => piece.text).join('')
+
+/** Re-attribute a derived value (a case fold, a decode, a repeat) to the call that produced it. */
+function foldDerived(text, node, exact, opaque) {
+  return { pieces: [{ text, node }], exact, opaque }
+}
+
+function concatFolds(parts, exact) {
+  const pieces = []
+  const opaque = []
+  let allKnown = exact
+  for (const part of parts) {
+    if (!part) { allKnown = false; continue }
+    pieces.push(...part.pieces)
+    opaque.push(...part.opaque)
+    if (!part.exact) allKnown = false
+  }
+  return { pieces, exact: allKnown, opaque }
+}
+
+/**
+ * A folder bound to one source file: in-file `const` initializers and enum members resolve, so
+ * `const a = 'mint'; const b = 'soft'; const id = a + b` folds the way the runtime evaluates it.
+ *
+ * A name declared more than once in the file resolves to NOTHING rather than to a guess — the fold
+ * must never be confidently wrong about which declaration is live.
+ */
+function makeConstantFolder(sourceFile) {
+  const constInitializers = new Map()
+  const enumMembers = new Map()
+  const declaredNames = new Set()
+  /** Names bound by an import — `path`, `Prisma`. A MODULE, never a local array (see `join`). */
+  const importedNames = new Set()
+
+  const collect = (node) => {
+    if (ts.isImportDeclaration(node) && node.importClause) {
+      const clause = node.importClause
+      if (clause.name) importedNames.add(clause.name.text)
+      if (clause.namedBindings) {
+        if (ts.isNamespaceImport(clause.namedBindings)) importedNames.add(clause.namedBindings.name.text)
+        else for (const element of clause.namedBindings.elements) importedNames.add(element.name.text)
+      }
+    }
+    if (ts.isVariableDeclaration(node) && ts.isIdentifier(node.name)) {
+      const name = node.name.text
+      const list = node.parent
+      const isConst = list && ts.isVariableDeclarationList(list) && (list.flags & ts.NodeFlags.Const) !== 0
+      if (declaredNames.has(name)) constInitializers.set(name, null)
+      else {
+        declaredNames.add(name)
+        constInitializers.set(name, isConst && node.initializer ? node.initializer : null)
+      }
+    }
+    if (ts.isEnumDeclaration(node) && ts.isIdentifier(node.name)) {
+      for (const member of node.members) {
+        const memberName = ts.isIdentifier(member.name) || ts.isStringLiteral(member.name) ? member.name.text : null
+        if (memberName && member.initializer) enumMembers.set(`${node.name.text}.${memberName}`, member.initializer)
+      }
+    }
+    ts.forEachChild(node, collect)
+  }
+  collect(sourceFile)
+
+  const resolving = new Set()
+
+  function fold(node, depth) {
+    if (!node || depth > 48) return null
+    const current = unwrapFoldable(node)
+
+    if (ts.isStringLiteral(current) || ts.isNoSubstitutionTemplateLiteral(current)) return foldOf(current.text, current)
+    if (ts.isNumericLiteral(current)) return foldOf(String(Number(current.text)), current)
+
+    if (ts.isTemplateExpression(current)) {
+      const parts = [foldOf(current.head.text, current.head)]
+      let exact = true
+      for (const span of current.templateSpans) {
+        const part = fold(span.expression, depth + 1)
+        if (!part) exact = false
+        else parts.push(part)
+        parts.push(foldOf(span.literal.text, span.literal))
+      }
+      return concatFolds(parts, exact)
+    }
+
+    if (ts.isBinaryExpression(current) && current.operatorToken.kind === ts.SyntaxKind.PlusToken) {
+      const left = fold(current.left, depth + 1)
+      const right = fold(current.right, depth + 1)
+      if (!left && !right) return null
+      return concatFolds([left, right], true)
+    }
+
+    if (ts.isIdentifier(current)) {
+      const name = current.text
+      if (resolving.has(name)) return null
+      const initializer = constInitializers.get(name)
+      if (!initializer) return null
+      resolving.add(name)
+      try {
+        return fold(initializer, depth + 1)
+      } finally {
+        resolving.delete(name)
+      }
+    }
+
+    if (ts.isPropertyAccessExpression(current) && ts.isIdentifier(current.expression) && ts.isIdentifier(current.name)) {
+      const member = enumMembers.get(`${current.expression.text}.${current.name.text}`)
+      return member ? fold(member, depth + 1) : null
+    }
+
+    if (ts.isCallExpression(current)) return foldCall(current, depth)
+    return null
+  }
+
+  function foldCall(node, depth) {
+    const callee = unwrapFoldable(node.expression)
+
+    // atob('bWludHNvZnQ=') / decodeURIComponent('%6Dintsoft') — one-argument decoders whose whole
+    // job is to turn one literal into a different string.
+    if (ts.isIdentifier(callee)
+      && (callee.text === 'atob' || callee.text === 'decodeURIComponent' || callee.text === 'unescape')) {
+      const arg = node.arguments.length === 1 ? fold(node.arguments[0], depth + 1) : null
+      if (!arg || !arg.exact) return null
+      try {
+        const text = callee.text === 'atob'
+          ? Buffer.from(foldText(arg), 'base64').toString('binary')
+          : callee.text === 'decodeURIComponent'
+            ? decodeURIComponent(foldText(arg))
+            : unescape(foldText(arg))
+        return foldDerived(text, node, true, [])
+      } catch {
+        return null
+      }
+    }
+
+    if (!ts.isPropertyAccessExpression(callee) || !ts.isIdentifier(callee.name)) return null
+    const method = callee.name.text
+    const receiver = unwrapFoldable(callee.expression)
+
+    // String.fromCharCode / String.fromCodePoint — the only construct here that mints characters
+    // no literal in the file ever shows.
+    if (ts.isIdentifier(receiver) && receiver.text === 'String'
+      && (method === 'fromCharCode' || method === 'fromCodePoint')) {
+      const codes = []
+      let exact = true
+      let spread = false
+      for (const arg of node.arguments) {
+        if (ts.isSpreadElement(arg)) { spread = true; exact = false; continue }
+        const folded = fold(arg, depth + 1)
+        const value = folded && folded.exact ? Number(foldText(folded)) : Number.NaN
+        if (!Number.isFinite(value)) { exact = false; continue }
+        codes.push(value)
+      }
+      if (exact) {
+        try {
+          const text = method === 'fromCharCode' ? String.fromCharCode(...codes) : String.fromCodePoint(...codes)
+          return foldDerived(text, node, true, [])
+        } catch {
+          return foldOpaque(node)
+        }
+      }
+      // Unevaluable — but BOUNDED by the argument count unless a spread widens it. A code point is
+      // at most two UTF-16 units, so N arguments cannot produce more than 2N characters.
+      const maxLength = spread ? Number.POSITIVE_INFINITY : node.arguments.length * 2
+      return maxLength >= SHORTEST_ID_LENGTH ? foldOpaque(node) : foldNothing(false)
+    }
+
+    if (method === 'join') {
+      // `Array.prototype.join` takes AT MOST ONE argument, and its receiver is an array — never a
+      // module. `path.join(a, b, c)` and `Prisma.join(rows)` are different functions that happen to
+      // share a name, and reading them as string assembly produced 68 of the 70 findings on the
+      // first run of this pass. Noise is how a guard gets allowlisted into silence.
+      if (node.arguments.length > 1) return null
+      if (ts.isIdentifier(receiver) && importedNames.has(receiver.text)) return null
+
+      const separatorFold = node.arguments.length === 0 ? foldOf(',', node) : fold(node.arguments[0], depth + 1)
+      const separator = separatorFold && separatorFold.exact ? foldText(separatorFold) : null
+
+      if (ts.isArrayLiteralExpression(receiver)) {
+        if (separator === null) return foldOpaque(node)
+        const parts = []
+        let exact = true
+        receiver.elements.forEach((element, index) => {
+          if (index > 0) parts.push(foldOf(separator, node))
+          if (ts.isSpreadElement(element)) { exact = false; return }
+          const folded = fold(element, depth + 1)
+          if (!folded) { exact = false; return }
+          parts.push(folded)
+        })
+        const joined = concatFolds(parts, exact)
+        if (!joined.exact && separatorCanGlue(separator)) joined.opaque.push(node)
+        return joined
+      }
+      // The elements are entirely out of view. Only a gluing separator can build an id out of
+      // pieces that are not ids; anything else cannot, so it is not reported.
+      if (separator !== null && !separatorCanGlue(separator)) return null
+      return foldOpaque(node)
+    }
+
+    if (method === 'concat') {
+      // Buffer.concat returns a Buffer, not a string, and is the only `.concat` in this tree.
+      if (ts.isIdentifier(receiver) && importedNames.has(receiver.text)) return null
+      if (ts.isIdentifier(receiver) && receiver.text === 'Buffer') return null
+      const parts = [fold(receiver, depth + 1)]
+      for (const arg of node.arguments) parts.push(ts.isSpreadElement(arg) ? null : fold(arg, depth + 1))
+      return concatFolds(parts, true)
+    }
+
+    if (method === 'repeat') {
+      const base = fold(receiver, depth + 1)
+      const count = node.arguments.length === 1 ? fold(node.arguments[0], depth + 1) : null
+      if (!base || !base.exact || !count || !count.exact) return null
+      const times = Number(foldText(count))
+      const unit = foldText(base)
+      if (!Number.isInteger(times) || times < 0 || times * unit.length > 4096) return null
+      return foldDerived(unit.repeat(times), node, true, [])
+    }
+
+    if (method === 'toLowerCase' || method === 'toUpperCase'
+      || method === 'trim' || method === 'trimStart' || method === 'trimEnd') {
+      const base = fold(receiver, depth + 1)
+      if (!base) return null
+      const text = foldText(base)
+      const applied = method === 'toLowerCase' ? text.toLowerCase()
+        : method === 'toUpperCase' ? text.toUpperCase()
+          : method === 'trim' ? text.trim()
+            : method === 'trimStart' ? text.trimStart() : text.trimEnd()
+      return foldDerived(applied, node, base.exact, base.opaque)
+    }
+
+    return null
+  }
+
+  return (node) => fold(node, 0)
+}
+
+/** Node kinds a constant string expression can START at. Everything else is reached recursively. */
+function isFoldCandidate(node) {
+  return ts.isStringLiteral(node)
+    || ts.isNoSubstitutionTemplateLiteral(node)
+    || ts.isTemplateExpression(node)
+    || ts.isBinaryExpression(node)
+    || ts.isCallExpression(node)
+    || ts.isPropertyAccessExpression(node)
+}
+
+/**
+ * Lines carrying a constant string expression whose VALUE contains a connector id, plus the lines
+ * of the opaque assembly constructs described above.
+ *
+ * A match is blamed on the PIECE that supplied it (see the header). JSDoc is skipped for the same
+ * reason the token scan skips it: it is a comment that arrives wearing node kinds.
+ */
+function foldedLinesWithLiteral(sourceFile, source) {
+  const lines = new Set()
+  const opaqueLines = new Set()
+  const fold = makeConstantFolder(sourceFile)
+  const lineOf = (node) => sourceFile.getLineAndCharacterOfPosition(node.getStart(sourceFile)).line
+
+  const blame = (folded) => {
+    const text = foldText(folded)
+    const offsets = literalOffsets(text)
+    if (offsets.length === 0) return
+    for (const offset of offsets) {
+      let cursor = 0
+      let blamed = folded.pieces[0]
+      for (const piece of folded.pieces) {
+        if (offset < cursor + piece.text.length) { blamed = piece; break }
+        cursor += piece.text.length
+      }
+      if (blamed) lines.add(lineOf(blamed.node))
+    }
+  }
+
+  const visit = (node) => {
+    if (node.kind >= ts.SyntaxKind.FirstJSDocNode && node.kind <= ts.SyntaxKind.LastJSDocNode) return
+    if (isFoldCandidate(node)) {
+      const folded = fold(node)
+      if (folded) {
+        blame(folded)
+        for (const opaqueNode of folded.opaque) {
+          const line = lineOf(opaqueNode)
+          lines.add(line)
+          opaqueLines.add(line)
+        }
+      }
+    }
+    ts.forEachChild(node, visit)
+  }
+  visit(sourceFile)
+  return { lines, opaqueLines }
+}
+
 function scriptKindFor(relPath) {
   switch (extname(relPath)) {
     case '.tsx': return ts.ScriptKind.TSX
@@ -328,10 +714,13 @@ function scriptKindFor(relPath) {
  * by construction. Neither behaviour is a special case any more, which is why neither can be
  * forgotten.
  */
-function codeLinesWithLiteral(relPath, source) {
+function parseCleanly(relPath, source) {
   const sourceFile = ts.createSourceFile(relPath, source, ts.ScriptTarget.Latest, true, scriptKindFor(relPath))
   if ((sourceFile.parseDiagnostics ?? []).length > 0) return null
+  return sourceFile
+}
 
+function codeLinesWithLiteral(sourceFile, source) {
   const lines = new Set()
   const visit = (node) => {
     // A JSDoc block is a COMMENT that the parser happens to model as nodes (and hangs off the
@@ -394,13 +783,30 @@ const isCommentExempt = (relPath) => COMMENT_EXEMPT_PREFIXES.some((entry) => mat
 function findLeaks(relPath) {
   const source = readFileSync(join(ROOT, relPath), 'utf8')
   const rawLines = source.split(/\r?\n/)
+  const sourceFile = parseCleanly(relPath, source)
   // The generic layer is read as CODE; everywhere else, and anywhere the parser reported a
   // syntax diagnostic for, is read whole.
-  let matchedLines = isCommentExempt(relPath) ? codeLinesWithLiteral(relPath, source) : null
+  let matchedLines = sourceFile && isCommentExempt(relPath) ? codeLinesWithLiteral(sourceFile, source) : null
   if (matchedLines === null) {
     matchedLines = new Set()
     for (let i = 0; i < rawLines.length; i += 1) {
       if (literalOffsets(rawLines[i]).length > 0) matchedLines.add(i)
+    }
+  }
+
+  // THE CONSTANT-EXPRESSION FOLD, IN EVERY PATH AND ONLY EVER ADDITIVE (round 6, Codex HIGH 2).
+  // Both scans above read TEXT — a token's source slice, or the raw line. A constant expression's
+  // VALUE is not its text, so `'mint' + 'soft'` and `'\x6dintsoft'` are invisible to both. This
+  // adds the lines whose value spells an id; it removes nothing, so a file it cannot parse or
+  // cannot fold keeps everything the scan above found.
+  let opaqueLines = new Set()
+  if (sourceFile) {
+    try {
+      const folded = foldedLinesWithLiteral(sourceFile, source)
+      for (const line of folded.lines) matchedLines.add(line)
+      opaqueLines = folded.opaqueLines
+    } catch {
+      // A fold that throws must never leave the guard blinder than the scan above already made it.
     }
   }
 
@@ -409,7 +815,15 @@ function findLeaks(relPath) {
     const onLine = WAIVER_RE.test(rawLines[i] ?? '')
     const onPrev = i > 0 && WAIVER_RE.test(rawLines[i - 1] ?? '')
     if (onLine || onPrev) continue
-    findings.push({ path: relPath, line: i + 1, text: (rawLines[i] ?? '').trim() })
+    findings.push({
+      path: relPath,
+      line: i + 1,
+      text: (rawLines[i] ?? '').trim(),
+      note: opaqueLines.has(i)
+        ? 'assembles a string this guard cannot evaluate and cannot bound below the shortest '
+          + 'connector id — waive it if it provably cannot spell one'
+        : null,
+    })
   }
   return findings
 }
@@ -428,6 +842,7 @@ if (findings.length > 0) {
   console.error('')
   for (const finding of findings) {
     console.error(`${finding.path}:${finding.line}: ${finding.text}`)
+    if (finding.note) console.error(`  ↳ ${finding.note}`)
   }
   process.exit(1)
 }

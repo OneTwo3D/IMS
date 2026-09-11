@@ -2,7 +2,7 @@
 
 import { requirePermission } from '@/lib/auth/server'
 import { getIntegrationPluginState } from '@/lib/integration-plugins'
-import { getWmsConnectorHooks } from '@/lib/connectors/wms/registry'
+import { findWmsConnectorLabel, getWmsConnectorHooks } from '@/lib/connectors/wms/registry'
 import { WMS_CONNECTOR_IDS, type WmsConnectorId } from '@/lib/connectors/wms/types'
 
 /**
@@ -35,6 +35,17 @@ import { WMS_CONNECTOR_IDS, type WmsConnectorId } from '@/lib/connectors/wms/typ
  */
 export type WmsSyncDashboardData = {
   connectorId: WmsConnectorId
+  /**
+   * The active connector's registered display name (o3d-remove-shiphero round 6, Codex HIGH 1).
+   *
+   * Carried in the DTO, as the onboarding envelope already carries it, because the /sync panel is
+   * a CLIENT component and cannot read the registry: without this it had nothing but the raw id to
+   * put in front of an operator when the connector is one it ships no panel for — which is
+   * precisely the case in which a human-readable name matters most. `findWmsConnectorLabel`, not
+   * `getDef`, so an id from a connector this build no longer ships degrades to its own id rather
+   * than throwing from inside a read.
+   */
+  connectorLabel: string
   configured: boolean
   /**
    * The active connector's own panel payload, under its own id. Read only by the matching panel in
@@ -62,12 +73,14 @@ export async function getWmsSyncDashboardData(
     : await resolveEnabledWmsConnectorId()
   if (!connectorId) return null
 
+  const connectorLabel = findWmsConnectorLabel(connectorId) ?? connectorId
   const hook = getWmsConnectorHooks(connectorId).syncDashboard
-  if (!hook) return { connectorId, configured: false, connectorData: {} }
+  if (!hook) return { connectorId, connectorLabel, configured: false, connectorData: {} }
 
   const dashboard = await (await hook()).getDashboardData()
   return {
     connectorId,
+    connectorLabel,
     configured: dashboard.configured,
     connectorData: { [connectorId]: dashboard.panel },
   }

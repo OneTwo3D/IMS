@@ -93,7 +93,7 @@ implementation, and it is worth knowing before the next removal.
 
 ## How the abstraction is protected now
 
-Two test files, and they cover different halves of the same claim.
+Three test files, and they cover different halves of the same claim.
 
 **`tests/wms-second-connector-seam.test.ts`** registers a **fictitious** WMS
 connector (`acme-wms`, `tests/helpers/fictitious-wms-connector.ts`) — a complete
@@ -114,6 +114,14 @@ and — since round 4 — the real `runWmsDispatchSweep` **wrapper** rather than
 core. Round 2's version called the core and handed it `deltaTimeZone: 'UTC'`, so
 the value production *derives* was supplied by the test and the derivation was the
 one thing the test could not see; that is how the timezone default survived.
+
+**`tests/wms-second-connector-seam-ui.test.ts`** (added in round 6) carries the
+same claim the last layer: it calls the real `/sync` and onboarding facades with
+`acme-wms` active and feeds their real output into the **real components**,
+asserting on the markup an operator reads. Round 4 fixed the facades and left the
+two files that render their DTOs matching one id and returning `null` for any
+other — a blank configuration screen beneath a header naming the connector and a
+card reading CONFIGURED.
 
 **Why the second file had to exist.** Codex's round-1 review found that every
 test in the first file began *inside* the generic layer — handing the fictitious
@@ -246,6 +254,89 @@ supposed to catch exactly that could not fail on three real inputs.
 throwaway trees and asserts its **exit code** for each of those inputs, plus the
 negatives (a comment in the generic layer is not a finding; `acme+wms` does not
 match `acmewms`). Against the round-3 guard, five of those cases fail.
+
+## What round 6 closed (Codex, two HIGHs)
+
+Round 5's review found that round 4 had, for the fourth consecutive round, proved
+a property **one layer short of where production decides** — and that the guard
+rewritten in round 4 had acquired a new blind spot of exactly the shape it had
+just removed.
+
+1. **The renderer is now total over registered connectors, not one-arm.** Round 4
+   moved `app/actions/wms-sync.ts` and `app/actions/wms-onboarding.ts` onto hooks
+   and keyed their DTOs by connector. The files that *read* those DTOs were not
+   changed: `app/(dashboard)/sync/wms-sync-panel.tsx` and
+   `components/onboarding/wms-onboarding-connection.tsx` compared the id to a
+   literal and rendered `null` otherwise — beneath a header naming the connector,
+   beside an Integrations card reading **CONFIGURED**, under an enable switch that
+   was on. A second registered connector got a blank configuration screen that
+   looks like a working one, which is worse than an error because nothing on it
+   invites doubt.
+
+   Both dispatchers are now `Record<WmsConnectorId, …>`, **total over the id
+   union**: adding an id to `WMS_CONNECTOR_IDS` without writing a panel and a form
+   does not compile. Where a build can still hold an unknown id — a link row or a
+   plugin-state row written by a connector this build no longer ships, a
+   mixed-version deploy — the miss renders a NAMED, visible unsupported state, and
+   it distinguishes *this build has no screen* from *the connector returned no
+   data* from *this is not the active connector*, because those call for different
+   things from an operator. `configured` is stated in words, so an operator with a
+   live connection is never told to re-enter credentials.
+
+   Two adjacent consumers went the same way. The `/sync` Integrations grid built
+   its WMS cards from a **hand-written list**, so a registered, enabled connector
+   nobody had added there got no card at all and was unreachable from the UI; the
+   cards are now derived from the same total record as the panels. And the
+   dashboard's WMS branch required the DTO to belong to the card that was clicked,
+   so a *second* enabled connector's card fell through to the grid — a click that
+   did nothing and said nothing. That is now the panel's `not-active` state.
+   `WmsSyncDashboardData` gained `connectorLabel` (the onboarding envelope already
+   had one) because the panel is a client component and cannot read the registry:
+   without it, the one case where a human-readable name matters most showed a raw
+   id.
+
+   `tests/wms-second-connector-seam-ui.test.ts` drives the real components from
+   the real facades with `acme-wms` active and asserts on the markup.
+
+2. **The boundary guard evaluates constant string EXPRESSIONS, not tokens.** The
+   round-4 rewrite inspects every leaf token of the parse tree — each one *on its
+   own*, which is the same blindness one level up. `const id = 'mint' + 'soft'` is
+   two tokens, neither containing the id; `'\x6dintsoft'` is one token whose
+   source text is not the id while its value is. Both exited 0 with a live
+   connector literal in a protected generic file.
+
+   A second, purely **additive** pass now folds constant string expressions —
+   concatenation to any depth, template literals (with and without substitutions),
+   escape sequences, in-file `const` initializers and string enum members,
+   `[…].join()`, `String.fromCharCode`/`fromCodePoint`, `.concat`, `.repeat`, case
+   folds, `atob`/`decodeURIComponent` — and matches the **value**. It runs in every
+   path (the token scan in the generic layer *and* the raw scan outside it, both of
+   which read text rather than value) and it removes nothing, so a file it cannot
+   parse keeps whatever the scan above found.
+
+   What it cannot evaluate it treats conservatively. An unknown operand reads as
+   the empty string, so `'mint' + suffix + 'soft'` is a finding. A construct that
+   can glue or mint characters out of pieces the guard cannot see at all — an
+   unfoldable `parts.join('')`, `String.fromCharCode(...codes)` — is **rejected on
+   its own**, because no literal exists anywhere for a text scan to fall back on.
+   That reject is bounded so it stays believable: `String.fromCharCode(byte)`
+   cannot produce eight characters, and `items.join(', ')` cannot glue two non-ids
+   into an id because no id contains `, `. Five sites in the tree carry a waiver.
+
+   A folded finding is blamed on the **piece that supplied it**, not on the line
+   the expression starts on: values are stitched from literals scattered over many
+   lines, and blaming the first would move findings away from their cause and
+   silently invalidate every per-line waiver already in the tree.
+
+   `tests/scripts/wms-connector-boundary-guard.test.ts` grew from 15 real-script
+   cases to 34. Thirteen of the new ones fail against the round-4 guard.
+
+**What no test covers.** The fold is a fold, not an interpreter. A value that
+arrives from **another module** (`'mint' + suffixFromElsewhere()`), or through a
+runtime transform the fold does not model (`.replace`, `.slice`, `.split` +
+`.reverse`, `Buffer.from(…, 'base64').toString()`, a `Proxy`, a JSON payload), is
+still out of reach — and a `.d.ts` re-export has no runtime value to fold at all.
+Those are enumerated in `docs/wms-connector-boundary.md`.
 
 ## Leaks that remain, deliberately
 

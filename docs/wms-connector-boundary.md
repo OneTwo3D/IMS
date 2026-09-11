@@ -44,8 +44,23 @@ load-bearing: a literal `mintsoft:` member is what kept `wms-sync.ts` and
 connector would have needed a second named member. The per-connector UI narrows
 the opaque payload in its own dispatcher
 (`app/(dashboard)/sync/wms-sync-panel.tsx`,
-`components/onboarding/wms-onboarding-connection.tsx`) — adding a connector means a
-branch there, not in the page/step.
+`components/onboarding/wms-onboarding-connection.tsx`) — adding a connector means an
+entry there, not an edit to the page/step.
+
+Those two dispatchers are **`Record<WmsConnectorId, …>`, total over the id union**
+(round 6). A one-arm `if` there was the same defect as a one-arm facade and one
+layer harder to see: it rendered `null` for every other connector, beneath a header
+naming it, a card reading CONFIGURED and an enable switch that was on — a blank
+configuration screen that looks like a working one. Totality means a registered
+connector with no UI **does not compile**; a build that nevertheless holds an
+unknown id (a link row or plugin state from a connector this build no longer ships)
+renders a NAMED unsupported state, distinguishing *no screen in this build* from
+*the connector returned no data* from *not the active connector*, and saying in
+words whether the connection is configured. **No path renders nothing.** The
+`/sync` Integrations cards and their logos are derived from the same record, so a
+registered connector cannot be missing a card either.
+`tests/wms-second-connector-seam-ui.test.ts` drives the real components from the
+real facades with `acme-wms` active and asserts on the markup.
 
 ## Connector facts the generic layer must not default
 
@@ -89,10 +104,58 @@ allowlist. It reads the ids **and** the files through the TypeScript compiler:
 - a file with any parse diagnostic is scanned raw — a mis-parse can only make the
   guard stricter;
 - matching is a case-insensitive substring test, never a regex, so an id containing
-  a metacharacter matches itself and only itself.
+  a metacharacter matches itself and only itself;
+- and a second, purely **additive** pass folds **constant string expressions** and
+  matches their **value**, because both scans above read *text* and a constant
+  expression's value is not its text (round 6).
+
+### What the constant-expression fold evaluates
+
+A leaf token is inspected on its own, so `const id = 'mint' + 'soft'` and
+`'\x6dintsoft'` were both invisible to the round-4 guard. The fold resolves:
+
+| Spelling | Handled how |
+| --- | --- |
+| `'mintsoft'` | literal — the cooked value, so escapes (`'\x6dintsoft'`, `'mint\u0073oft'`) fold |
+| `` `mintsoft` `` | no-substitution template — cooked value |
+| `'mint' + 'soft'`, any depth | folded to the concatenation |
+| `` `mint${'soft'}` `` | template spans folded when the substitution is constant |
+| `('mint' as const) + ('soft' satisfies string)` | wrappers (`as`, `satisfies`, parens, `!`) unwrapped |
+| `const a = 'mint'; a + 'soft'` | in-file `const` initializers resolved (a name declared twice resolves to nothing) |
+| `enum W { A = 'mint' } W.A + 'soft'` | in-file string enum members resolved |
+| `['mint','soft'].join('')` | array-literal join with a constant separator |
+| `String.fromCharCode(109, …)` / `fromCodePoint` | evaluated when every argument is a numeric literal |
+| `'mint'.concat('soft')`, `'ab'.repeat(4)`, `.toLowerCase()`, `.trim()` | evaluated on folded receivers |
+| `atob('bWludHNvZnQ=')`, `decodeURIComponent('%6Dintsoft')` | single-literal decoders evaluated |
+| `obj['mint' + 'soft']` | the computed key is itself a folded expression |
+| `'mint' + unknownVar + 'soft'` | **conservative**: an unknown operand reads as `''`, so this is a finding |
+| `parts.join('')`, `String.fromCharCode(...codes)` | **conservative REJECT** — can glue or mint characters out of nothing, and no literal exists for a text scan to find. Waive it if it provably cannot spell an id |
+| `String.fromCharCode(byte)`, `items.join(', ')` | **not** rejected — one argument cannot produce eight characters, and no id contains `, `, so such a separator cannot glue two non-ids into one |
+
+**What it does not reach**, deliberately, and what happens instead:
+
+- a value that arrives from **another module** — `'mint' + suffixFrom('./elsewhere')`,
+  or a bare imported identifier. Not folded, not rejected: rejecting every `+` with
+  a non-constant operand would fire on most of the repo, and a guard that fires on
+  everything gets allowlisted into silence. The fragments in the *other* module are
+  still scanned there;
+- runtime transforms the fold does not model — `.replace`, `.slice`, `.split(…)` +
+  `.reverse()`, `Buffer.from(…, 'base64').toString()`, `Array.from`, a `Proxy`, a
+  value read out of JSON or a database row. A `.join('')` at the end of such a chain
+  IS rejected; a transform that ends some other way is not;
+- a **declaration file re-export** (`export { X } from './ids'` in a `.d.ts`) — a
+  type has no runtime value to fold. The `.d.ts` is still scanned as text;
+- `'mintsof'.repeat(2)`-style splices where an id is formed *across* a repetition
+  boundary from a unit that is not itself an id. `repeat` folds when both operands
+  are constant, so this is caught in the constant case only.
+
+A folded finding is reported at the line of the **piece that supplied it**, not at
+the line the expression starts on, so per-line waivers keep working on values
+stitched together over many lines.
 
 `tests/scripts/wms-connector-boundary-guard.test.ts` runs the real script against
-throwaway trees and asserts its exit code for each of those behaviours. **Keep it
+throwaway trees and asserts its exit code for each of those behaviours — 34 cases,
+positives and negatives. **Keep it
 passing and keep adding to it**: this guard printed "clean" for two review rounds
 with a live literal in a protected file, and a guard that cannot fail is worse than
 no guard because it is believed.
