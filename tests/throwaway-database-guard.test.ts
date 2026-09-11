@@ -339,6 +339,9 @@ function quotedName(statement: string): string {
 
 let nextBackendPid = 1000
 
+/** One cluster, one boot instant. `pg_postmaster_start_time()` as this fake renders it. */
+const FAKE_CLUSTER_STARTED_AT = '2026-01-01 00:00:00.000001+00'
+
 class FakeMaintenanceClient {
   readonly backendPid = (nextBackendPid += 1)
   private issuedCreate = false
@@ -380,8 +383,13 @@ class FakeMaintenanceClient {
     }
 
     // ---- r22: the marker protocol, modelled ------------------------------------------------
+    // r24: and WHICH CLUSTER answered. One fake server means one start time; the cross-cluster
+    // refusal needs two, and it lives in tests/lane-database-attestation.test.ts where it says so.
     if (text.startsWith('SELECT current_database()')) {
-      return { rows: [{ database: this.reachedDatabase }] }
+      return { rows: [{ database: this.reachedDatabase, cluster_started_at: FAKE_CLUSTER_STARTED_AT }] }
+    }
+    if (text.startsWith('SELECT pg_postmaster_start_time()')) {
+      return { rows: [{ cluster_started_at: FAKE_CLUSTER_STARTED_AT }] }
     }
 
     if (text.startsWith('CREATE TABLE "ims_lane_run_marker"')) {
@@ -573,6 +581,7 @@ test('r10: a provision issues NO lock, NO stamp and NO ownership probe — the w
   // has to be argued for, which is the property four rounds of added machinery needed and lacked.
   assert.deepEqual(databaseWire(), [
     'SELECT 1 FROM pg_database WHERE datname = $1',
+    'SELECT pg_postmaster_start_time()::text AS cluster_started_at',
     `CREATE DATABASE "${MINTED}"`,
     `DROP DATABASE IF EXISTS "${MINTED}" WITH (FORCE)`,
   ])
@@ -590,7 +599,10 @@ test('r10: a provision issues NO lock, NO stamp and NO ownership probe — the w
   // AND THE CONNECTION BUDGET, which is the same fact counted a different way. r9 opened four on
   // the lost-response path (lock session, create session, re-probe, drop); a provision that
   // creates and drops now opens two, and the failing paths below open ONE.
-  assert.equal(wire.connections, 2, `a provision opened ${wire.connections} connections`)
+  // r24: THREE, not two. The probe keeps its own maintenance session, the `CREATE DATABASE` is now
+  // issued by lib/lane-database-attestation.ts over a session THAT module opened — which is the
+  // whole of its authority to write a marker afterwards — and the DROP opens the third.
+  assert.equal(wire.connections, 3, `a provision opened ${wire.connections} connections`)
 })
 
 test('r10: the module exports no lock id and no ownership stamp', async () => {
@@ -635,9 +647,9 @@ test('r10 HIGH: a CREATE whose response is LOST is LEFT ON THE SERVER, and no DR
   assert.deepEqual(drops(), [], 'the lost-response path issued a DROP for a CREATE it never saw complete')
   assert.deepEqual(inferenceStatements(), [], 'the cleanup went looking for evidence of ownership again')
 
-  // ONE connection: the probe-and-create session. r9 opened four here. Nothing re-probes and
-  // nothing drops, so nothing else is opened.
-  assert.equal(wire.connections, 1, `the lost-response path opened ${wire.connections} connections`)
+  // TWO connections since r24: the probe session and the attestation module's create session. r9
+  // opened four here. Nothing re-probes and nothing drops, so nothing else is opened.
+  assert.equal(wire.connections, 2, `the lost-response path opened ${wire.connections} connections`)
 
   // AND THE LEAK IS SURFACED. An operator has to be able to find it, so the refusal names it.
   assert.ok(outcome instanceof ThrowawayDatabaseError, `expected a named refusal, got ${String(outcome)}`)
@@ -894,6 +906,14 @@ test('r10: a licensed DROP that ALSO fails says the database is left, and names 
 const dropStatement = (name: string = MINTED) => `DROP DATABASE IF EXISTS "${name}" WITH (FORCE)`
 const PROBE_STATEMENT = 'SELECT 1 FROM pg_database WHERE datname = $1'
 const createStatement = (name: string = MINTED) => `CREATE DATABASE "${name}"`
+/**
+ * r24: the CREATE is issued by lib/lane-database-attestation.ts, over its own connection, and it
+ * reads WHICH CLUSTER it is about to create on before issuing it. That read is part of the create
+ * path rather than of the marker protocol, so it is counted in `databaseWire()` — and it is in the
+ * exact lists below rather than filtered away, because anything ADDED to this wire has to be
+ * argued for.
+ */
+const CLUSTER_STATEMENT = 'SELECT pg_postmaster_start_time()::text AS cluster_started_at'
 
 /**
  * THE r22 MARKER PROTOCOL'S OWN STATEMENTS, SEPARATED FROM THE DATABASE-LEVEL WIRE.
@@ -909,11 +929,11 @@ const databaseWire = () => wire.statements.filter((statement) => !MARKER_STATEME
 const markerWire = () => wire.statements.filter((statement) => MARKER_STATEMENT.test(statement))
 /** What a lane that was marked and then attested puts on the wire, in order. */
 const MARKER_WIRE = [
-  'SELECT current_database() AS database',
+  'SELECT current_database() AS database, pg_postmaster_start_time()::text AS cluster_started_at',
   'CREATE TABLE "ims_lane_run_marker" ( sole boolean PRIMARY KEY DEFAULT true CHECK (sole),'
   + ' secret text NOT NULL, marked_by_pid integer NOT NULL, marked_at timestamptz NOT NULL DEFAULT now())',
   'INSERT INTO "ims_lane_run_marker" (sole, secret, marked_by_pid) VALUES (true, $1, $2)',
-  'SELECT current_database() AS database',
+  'SELECT current_database() AS database, pg_postmaster_start_time()::text AS cluster_started_at',
   'SELECT secret FROM "ims_lane_run_marker"',
 ]
 
@@ -1029,7 +1049,7 @@ test('r11: the ordinary path drops EXACTLY ONCE, leaves nothing behind, and a fi
   assert.deepEqual(drops(), [dropStatement()], 'a repeated drop() on an ANSWERED handle issued another DROP')
 
   // THE EXACT WIRE, in order, for a provision that runs to completion and then drops.
-  assert.deepEqual(databaseWire(), [PROBE_STATEMENT, createStatement(), dropStatement()])
+  assert.deepEqual(databaseWire(), [PROBE_STATEMENT, CLUSTER_STATEMENT, createStatement(), dropStatement()])
   assert.deepEqual(inferenceStatements(), [], 'an ownership-inference statement was issued')
   // AND THE MARKER PROTOCOL, in full and in order (r22): marked once, then read back over a SECOND
   // connection made with the LANE'S OWN URL — which is the connection the harness client will use,
@@ -1219,7 +1239,7 @@ test('r12 HIGH: a name a live handle can still drop is NOT provisioned again', a
   // then stops: no second CREATE, and above all no DROP.
   assert.deepEqual(
     databaseWire(),
-    [PROBE_STATEMENT, createStatement(), PROBE_STATEMENT],
+    [PROBE_STATEMENT, CLUSTER_STATEMENT, createStatement(), PROBE_STATEMENT],
     'the refused provision issued something other than the one probe that chooses the refusal',
   )
   assert.deepEqual(drops(), [], 'a DROP was issued for a database this process did not create')
@@ -1392,7 +1412,7 @@ test('r13: a held name whose database is STILL THERE is refused as ALREADY EXIST
 
   // IT IS STILL REFUSED BEFORE THE CREATE, and nothing was dropped: the reordering buys a better
   // sentence, not a weaker guard.
-  assert.deepEqual(databaseWire(), [PROBE_STATEMENT, createStatement(), PROBE_STATEMENT])
+  assert.deepEqual(databaseWire(), [PROBE_STATEMENT, CLUSTER_STATEMENT, createStatement(), PROBE_STATEMENT])
   assert.deepEqual(creates(), [createStatement()], 'the refused provision issued a CREATE')
   assert.deepEqual(drops(), [], "the refused provision dropped the incumbent's database")
   assert.deepEqual([...wire.databases], [MINTED], "the incumbent's database did not survive the refusal")

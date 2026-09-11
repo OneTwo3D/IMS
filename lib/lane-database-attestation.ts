@@ -40,9 +40,15 @@
  * That is a POSITIVE property, it is not a property of any string, and — crucially — the only
  * party who can answer it is THE DATABASE ITSELF:
  *
- *   `markLaneDatabase` writes a marker row into a database THIS PROCESS HAS JUST WATCHED ITSELF
- *   CREATE, carrying a secret drawn once per process from `randomBytes` and never exported,
- *   written down, logged or sent anywhere else.
+ *   `createLaneDatabase` ISSUES THE `CREATE DATABASE` ITSELF and mints a `LaneDatabaseCreation`
+ *   only when the server answers that statement with success. That object is the whole of this
+ *   module's authority to write: it is minted nowhere else, it cannot be spelled, copied or
+ *   forged, and there is no argument by which a caller can ask for one over a database that
+ *   already exists — PostgreSQL answers `CREATE DATABASE` on a name that is taken with `42P04`.
+ *
+ *   `markLaneDatabase` takes that creation — not a NAME — and writes a marker row into the
+ *   database it names, carrying a secret drawn once per process from `randomBytes` and never
+ *   exported, written down, logged or sent anywhere else.
  *
  *   `attestLaneDatabase` CONNECTS with the very connection string the harness client will use,
  *   ASKS the backend it actually reaches for that marker, and mints an attestation only if the
@@ -102,19 +108,17 @@
  * =========================================================================================
  * WHAT IS STILL NOT CLOSED, SAID PLAINLY RATHER THAN IMPLIED.
  *
- *   1. `markLaneDatabase` WRITES. A caller who points it at production, and who also tells it that
- *      production's database name is the name it just created, gets a marker table in production
- *      and can then attest it. That is not preventable in process — no connection can prove it was
- *      opened moments after a `CREATE DATABASE` — and it is not the same hazard as the one this
- *      module removes. The default moved: it used to be that an unrecognised spelling was ADMITTED
- *      and the guard had to catch it; it is now that an unmarked database is REFUSED and a caller
- *      has to deliberately write a table called `ims_lane_run_marker` INTO PRODUCTION, naming
- *      production, at one greppable call site, to change that. It also leaves evidence an operator
- *      can find afterwards, which a spelling never did.
- *   2. THE DELEGATES CAN STILL LIE. A minted client's `emailOutbox` delegate is whatever the caller
- *      passed; an attested destination says nothing about it, because a Prisma delegate does not
- *      know which database it writes to. That is the r18 residue, unchanged, and it is filed as
- *      o3d-dhhd rather than papered over.
+ *   1. A CLUSTER THAT RESTARTS BETWEEN THE CREATE AND THE MARK IS REFUSED. The creation carries the
+ *      server's `pg_postmaster_start_time()`, and `markLaneDatabase` requires the lane connection to
+ *      report the same one — which is how the creation is pinned to a CLUSTER and not merely to a
+ *      NAME. A restart in that millisecond-wide window therefore fails a provision closed. That is
+ *      the safe direction and it is stated rather than discovered.
+ *   2. A NAME THAT IS FREE ON THIS CLUSTER CAN BE CREATED. If production's database did not exist,
+ *      `createLaneDatabase` could create a database of its name — and it would then be an EMPTY
+ *      database this run made, not production. What cannot happen is acquiring authority over a
+ *      database that is ALREADY THERE, which is what every real production database is.
+ *   3. DROPPING IS NOT THIS MODULE'S BUSINESS. `CREATE DATABASE` is the only DDL here; the
+ *      throwaway helper owns `DROP DATABASE` and its own rules about when one is licensed.
  */
 
 import { randomBytes, timingSafeEqual } from 'node:crypto'
@@ -210,11 +214,7 @@ type LaneSqlClient = {
  * therefore operator-controlled and not attacker-controlled — but it is not TRUSTED either, which
  * is why it is wrapped rather than argued about.
  */
-async function withLaneConnection<T>(
-  url: unknown,
-  what: string,
-  run: (client: LaneSqlClient, reachedDatabase: string) => Promise<T>,
-): Promise<T> {
+async function openLaneConnection(url: unknown, what: string): Promise<LaneSqlClient> {
   if (typeof url !== 'string' || url.trim() === '') {
     refuse(`${what}: a connection string is required; received ${typeof url === 'string' ? 'an empty string' : typeof url}`)
   }
@@ -240,9 +240,18 @@ async function withLaneConnection<T>(
       + 'that never opened has not answered it',
     )
   }
+  return client
+}
+
+async function withLaneConnection<T>(
+  url: unknown,
+  what: string,
+  run: (client: LaneSqlClient, reached: LaneDestination) => Promise<T>,
+): Promise<T> {
+  const client = await openLaneConnection(url, what)
 
   try {
-    const reached = await currentDatabaseOf(client, what)
+    const reached = await destinationIdentityOf(client, what)
     return await run(client, reached)
   } finally {
     // A failed socket close cannot retract a statement the server already answered, so it is not
@@ -257,16 +266,33 @@ async function withLaneConnection<T>(
 }
 
 /**
- * WHAT THE SERVER CALLS THE DATABASE THIS CONNECTION ACTUALLY REACHED.
+ * WHERE A CONNECTION LANDED, IN THE SERVER'S OWN WORDS. TWO FACTS, ONE ROUND TRIP.
  *
  * `current_database()` is the BACKEND's answer, which is the whole point of HIGH B: a pooler can
  * present one name to the client and route to another, and the client-side startup parameter is
  * the name that was ASKED for. This is the name that was GOT.
+ *
+ * `pg_postmaster_start_time()` is WHICH SERVER answered, to the microsecond it booted. A database
+ * NAME is unique only within one cluster, so a creation that carried a name alone would license a
+ * mark on a same-named database on ANY other reachable cluster. Pinning the cluster is what makes
+ * `markLaneDatabase` a statement about the database this run created rather than about its name.
+ * It is `pg_postmaster_start_time()` and not `pg_control_system()` because the latter is REVOKEd
+ * from PUBLIC and a lane runs as an ordinary application role.
  */
-async function currentDatabaseOf(client: LaneSqlClient, what: string): Promise<string> {
+type LaneDestination = {
+  /** The name the SERVER gave — `current_database()`, not the URL. */
+  readonly database: string
+  /** The cluster that answered, as `pg_postmaster_start_time()` renders it. */
+  readonly clusterStartedAt: string
+}
+
+const DESTINATION_IDENTITY_SQL =
+  'SELECT current_database() AS database, pg_postmaster_start_time()::text AS cluster_started_at'
+
+async function destinationIdentityOf(client: LaneSqlClient, what: string): Promise<LaneDestination> {
   let rows: Record<string, unknown>[]
   try {
-    ;({ rows } = await client.query('SELECT current_database() AS database'))
+    ;({ rows } = await client.query(DESTINATION_IDENTITY_SQL))
   } catch (error) {
     refuse(`${what}: the server would not say which database this connection reached (${String(error)})`)
   }
@@ -274,7 +300,28 @@ async function currentDatabaseOf(client: LaneSqlClient, what: string): Promise<s
   if (typeof reached !== 'string' || reached === '') {
     refuse(`${what}: the server answered no database name for this connection`)
   }
-  return reached
+  const clusterStartedAt = rows[0]?.cluster_started_at
+  if (typeof clusterStartedAt !== 'string' || clusterStartedAt === '') {
+    refuse(`${what}: the server answered no start time, so which CLUSTER answered is unestablished`)
+  }
+  return Object.freeze({ database: reached, clusterStartedAt })
+}
+
+/** The same fact, read off a connection that is not pointed at the database in question. */
+const CLUSTER_IDENTITY_SQL = 'SELECT pg_postmaster_start_time()::text AS cluster_started_at'
+
+async function clusterIdentityOf(client: LaneSqlClient, what: string): Promise<string> {
+  let rows: Record<string, unknown>[]
+  try {
+    ;({ rows } = await client.query(CLUSTER_IDENTITY_SQL))
+  } catch (error) {
+    refuse(`${what}: the server would not say which cluster this connection reached (${String(error)})`)
+  }
+  const clusterStartedAt = rows[0]?.cluster_started_at
+  if (typeof clusterStartedAt !== 'string' || clusterStartedAt === '') {
+    refuse(`${what}: the server answered no start time, so which CLUSTER answered is unestablished`)
+  }
+  return clusterStartedAt
 }
 
 /** Constant-time, and length-safe: `timingSafeEqual` throws on a length mismatch. */
@@ -285,34 +332,207 @@ function secretMatchesThisRun(candidate: string): boolean {
   return timingSafeEqual(mine, theirs)
 }
 
+declare const LANE_DATABASE_CREATION_BRAND: unique symbol
+
 /**
- * WRITE THIS RUN'S MARKER INTO A DATABASE THIS PROCESS HAS JUST WATCHED ITSELF CREATE.
+ * PROOF THAT *THIS MODULE* ISSUED A `CREATE DATABASE` AND THE SERVER SAID YES.
  *
- * `createdDatabaseName` is not decoration and it is not trust: the marker is written only if
- * `current_database()` — the SERVER's answer over this very connection — equals it. So a pooler
- * cannot be used to mark through an alias either, and a caller who wants to mark something other
- * than what it created has to type that something's real name in as the name it created. The one
- * shipped call site passes a name that has already been through `assertThrowawayDatabaseName`,
- * which refuses every protected name and the configured database besides.
+ * THE ONE FACT THAT REPLACES A CALLER'S WORD (r24, Codex HIGH). Until r24 the marker writer took a
+ * `createdDatabaseName` STRING and checked it against `current_database()`. That check is sound and
+ * it establishes THE DESTINATION'S NAME — not that the caller created the destination. So
+ * `markLaneDatabase({ url: productionUrl, createdDatabaseName: 'onetwo3d_ims_dev' })` wrote this
+ * run's secret INTO production, and `attestLaneDatabase` then minted a perfectly valid capability
+ * over it: the exported minting authority could be aimed at anything the caller could name.
+ *
+ * A NAME CHECK IS NOT THE FIX, ONLY A NARROWER VOCABULARY — it still takes the caller's word about
+ * WHICH database, just from a shorter list. What ends it is that the authority to write is no longer
+ * something a caller can describe. `createLaneDatabase` is the only mint, it mints ONLY when the
+ * server answered its own `CREATE DATABASE` with success, and PostgreSQL answers `CREATE DATABASE`
+ * on a name that is already taken with `42P04`. A database that EXISTS therefore cannot be the
+ * subject of a creation — and every production database exists.
+ *
+ * The brand is declare-only and the runtime authority is a module-private `WeakSet`, so a creation
+ * cannot be spelled, read off another object, copied by a spread, or faked by a `Proxy` — the same
+ * mechanism as the attestation register below, for the same reason.
+ */
+export type LaneDatabaseCreation = {
+  /** The name this module passed to `CREATE DATABASE` and the server accepted. */
+  readonly database: string
+  readonly [LANE_DATABASE_CREATION_BRAND]: 'minted by createLaneDatabase'
+}
+
+const MINTED_CREATIONS = new WeakSet<object>()
+
+/**
+ * WHICH CLUSTER EACH CREATION WAS MADE ON. Held beside the creation rather than on it, so the
+ * public shape stays one field and nothing can be re-pointed by handing back an edited copy.
+ */
+const CREATION_CLUSTERS = new WeakMap<object, string>()
+
+/** Is this a creation THIS RUN minted? The only question `markLaneDatabase` asks. */
+export function isLaneDatabaseCreation(value: unknown): value is LaneDatabaseCreation {
+  return typeof value === 'object' && value !== null && MINTED_CREATIONS.has(value)
+}
+
+/**
+ * WHAT THE SERVER SAID ABOUT A `CREATE DATABASE` THIS MODULE ISSUED.
+ *
+ * The three answers are the throwaway helper's `CreateOutcome`, reported as a VALUE rather than as
+ * thrown-versus-returned, because the difference between them decides whether a `DROP DATABASE` is
+ * licensed and that decision must not rest on reading an exception. `created-but-failed` is the
+ * fourth shape and it is not a fourth answer: the CREATE COMPLETED and the teardown afterwards did
+ * not, which is the r9 case — a completed CREATE survives a failed `client.end()`.
+ */
+export type LaneDatabaseCreateResult =
+  | { outcome: 'created'; creation: LaneDatabaseCreation }
+  | { outcome: 'created-but-failed'; creation: LaneDatabaseCreation; error: unknown }
+  | { outcome: 'not-created'; error: unknown }
+  | { outcome: 'answer-unknown'; error: unknown }
+
+/**
+ * ISSUE THE `CREATE DATABASE`, AND MINT AUTHORITY OVER WHAT IT CREATED.
+ *
+ * WHY THIS IS HERE AND NOT IN THE HELPER THAT CALLS IT. The rule this module rests on is the one
+ * round 10 of the throwaway helper established — "this process SAW ITS OWN `CREATE DATABASE`
+ * COMPLETE" — and a module cannot rest on a fact it was TOLD. It has to have watched. So the
+ * statement is issued here, over a connection this function opened, and the creation it hands back
+ * is minted on that statement's success and on nothing else.
+ *
+ * IT CANNOT BE AIMED AT PRODUCTION, and the reason is PostgreSQL's rather than ours: `CREATE
+ * DATABASE` on a name that exists is rejected with SQLSTATE `42P04`, so a call naming the live
+ * database returns `answer-unknown`/`not-created` carrying that rejection and mints nothing. There
+ * is no argument to this function that names an EXISTING database and comes back with authority
+ * over it. What it can do is create a database — which is the act the throwaway helper's own name
+ * guard, register and drop rules govern, and which leaves an empty database rather than reaching
+ * into a full one.
+ *
+ * THE TEARDOWN IS NOT SWALLOWED, unlike `withLaneConnection`'s. A CREATE that completed and a
+ * `client.end()` that then failed is a real database on the server, and reporting it as "not
+ * created" is exactly the leak round 9 caught. It comes back as `created-but-failed` so the caller
+ * can drop what it now owns.
+ */
+export async function createLaneDatabase(request: {
+  maintenanceUrl: string
+  name: string
+}): Promise<LaneDatabaseCreateResult> {
+  const maintenanceUrl = request.maintenanceUrl // THE ONLY READ.
+  const name = request.name // THE ONLY READ.
+  if (typeof name !== 'string' || name.trim() === '') {
+    return {
+      outcome: 'not-created',
+      error: new LaneDatabaseAttestationError(
+        'createLaneDatabase: `name` must be the database to CREATE; this function does not take an '
+        + 'existing database and never acquires authority over one',
+      ),
+    }
+  }
+
+  let client: LaneSqlClient
+  try {
+    client = await openLaneConnection(maintenanceUrl, 'createLaneDatabase')
+  } catch (error) {
+    // Nothing was issued, so nothing was created. The strongest true statement.
+    return { outcome: 'not-created', error }
+  }
+
+  let creation: LaneDatabaseCreation | null = null
+  let result: LaneDatabaseCreateResult | null = null
+  try {
+    // WHICH CLUSTER, ASKED BEFORE THE CREATE. It has to be read over the connection that issues the
+    // statement, because that is the server the database comes into existence on; reading it later,
+    // over the lane's own connection, would be reading it off the thing being checked.
+    const clusterStartedAt = await clusterIdentityOf(client, 'createLaneDatabase')
+    let answered = false
+    try {
+      await client.query(`CREATE DATABASE ${quoteIdentifier(name)}`)
+      answered = true
+    } catch (error) {
+      // The statement was ISSUED and this process does not know whether it ran. `42P04` arrives
+      // here too, and the caller keys on the SQLSTATE: this module does not interpret it, because
+      // what it means for a DROP is the throwaway helper's rule and not this one's.
+      result = { outcome: 'answer-unknown', error }
+    }
+    if (answered) {
+      const minted = Object.freeze({ database: name })
+      MINTED_CREATIONS.add(minted)
+      CREATION_CLUSTERS.set(minted, clusterStartedAt)
+      creation = minted as unknown as LaneDatabaseCreation
+      result = { outcome: 'created', creation }
+    }
+  } catch (error) {
+    // The cluster read refused, so the CREATE was never issued.
+    result = { outcome: 'not-created', error }
+  }
+
+  try {
+    await client.end()
+  } catch (closeError) {
+    // A COMPLETED CREATE SURVIVES A FAILED TEARDOWN (the r9 rule). Reporting this as "not created"
+    // is what leaked a freshly created database, so the creation is handed back WITH the failure.
+    if (creation !== null) return { outcome: 'created-but-failed', creation, error: closeError }
+    // Nothing was created, so a failed close is just a failed call — except where the CREATE's own
+    // answer was already lost, which is the stronger fact and is kept.
+    if (result !== null && result.outcome === 'answer-unknown') return result
+    return { outcome: 'not-created', error: closeError }
+  }
+  return result ?? {
+    outcome: 'not-created',
+    error: new LaneDatabaseAttestationError('createLaneDatabase: no outcome was recorded for the CREATE'),
+  }
+}
+
+/**
+ * WRITE THIS RUN'S MARKER INTO A DATABASE THIS MODULE CREATED.
+ *
+ * THE SUBJECT IS THE CREATION, NOT A NAME (r24, Codex HIGH). There is no `createdDatabaseName`
+ * parameter any more, because a parameter is a caller's word and the whole finding was that the
+ * exported minting authority would act on it. The only way to name a database here is to hold the
+ * `LaneDatabaseCreation` `createLaneDatabase` minted for it — which requires a `CREATE DATABASE`
+ * this module issued and the server accepted, and therefore requires that the database did not
+ * exist a moment ago.
+ *
+ * AND THE CREATION IS CHECKED FROM THE OTHER SIDE TOO. The marker is written only if
+ * `current_database()` — the SERVER's answer over this very connection — equals the created name
+ * AND `pg_postmaster_start_time()` equals the cluster the CREATE ran on. So a pooler cannot be used
+ * to mark through an alias, and a same-named database on a DIFFERENT reachable cluster is not the
+ * database this creation is about.
  *
  * THE TABLE IS CREATED WITHOUT `IF NOT EXISTS`, deliberately. A database that already carries a
  * marker is not a database this call has just created, and the `42P07` that comes back says so
  * rather than silently overwriting somebody else's evidence with ours.
  */
-export async function markLaneDatabase(lane: { url: string; createdDatabaseName: string }): Promise<void> {
-  const url = lane.url // THE ONLY READ.
-  const createdDatabaseName = lane.createdDatabaseName // THE ONLY READ.
-  if (typeof createdDatabaseName !== 'string' || createdDatabaseName === '') {
-    refuse('markLaneDatabase: `createdDatabaseName` must be the name of the database this process created')
+export async function markLaneDatabase(creation: LaneDatabaseCreation, laneUrl: string): Promise<void> {
+  if (!isLaneDatabaseCreation(creation)) {
+    refuse(
+      'markLaneDatabase: the first argument is not a creation this run minted. This function no '
+      + 'longer takes the NAME of a database the caller says it created — a name is a claim, and '
+      + 'acting on it let an exported entry point write this run\'s secret into ANY database the '
+      + 'caller could spell, production included. Obtain a `LaneDatabaseCreation` from '
+      + '`createLaneDatabase`, which mints one only for a `CREATE DATABASE` this module issued and '
+      + 'the server accepted (o3d-alnk r24)',
+    )
+  }
+  const created = (creation as unknown as { database: string }).database
+  const createdOnCluster = CREATION_CLUSTERS.get(creation as unknown as object)
+  if (typeof createdOnCluster !== 'string') {
+    refuse('markLaneDatabase: that creation carries no cluster, so which server it was made on is unestablished')
   }
 
-  await withLaneConnection(url, 'markLaneDatabase', async (client, reached) => {
-    if (reached !== createdDatabaseName) {
+  await withLaneConnection(laneUrl, 'markLaneDatabase', async (client, reached) => {
+    if (reached.database !== created) {
       refuse(
-        `markLaneDatabase: this connection reaches ${reached}, not ${createdDatabaseName}. The marker is `
+        `markLaneDatabase: this connection reaches ${reached.database}, not ${created}. The marker is `
         + 'written ONLY into the database this process watched itself CREATE, so a connection that '
         + 'lands somewhere else — through a pooler alias, a PG* fallback, or a mistyped URL — is '
         + 'refused rather than marked',
+      )
+    }
+    if (reached.clusterStartedAt !== createdOnCluster) {
+      refuse(
+        `markLaneDatabase: ${reached.database} is on a DIFFERENT server from the one this run created `
+        + `${created} on (the cluster that answered started at ${reached.clusterStartedAt}). A database `
+        + 'NAME is unique only within one cluster, so a same-named database somewhere else is not the '
+        + 'database this creation is about',
       )
     }
 
@@ -327,7 +547,7 @@ export async function markLaneDatabase(lane: { url: string; createdDatabaseName:
       )
     } catch (error) {
       refuse(
-        `markLaneDatabase: could not create ${LANE_RUN_MARKER_TABLE} in ${reached} (${String(error)}). `
+        `markLaneDatabase: could not create ${LANE_RUN_MARKER_TABLE} in ${reached.database} (${String(error)}). `
         + 'If the table is already there, this database was marked before and is NOT one this call '
         + 'just created',
       )
@@ -339,7 +559,7 @@ export async function markLaneDatabase(lane: { url: string; createdDatabaseName:
         [RUN_MARKER_SECRET, process.pid],
       )
     } catch (error) {
-      refuse(`markLaneDatabase: could not write the marker row into ${reached} (${String(error)})`)
+      refuse(`markLaneDatabase: could not write the marker row into ${reached.database} (${String(error)})`)
     }
   })
 }
@@ -363,28 +583,28 @@ export async function attestLaneDatabase(url: string): Promise<LaneDatabaseAttes
       ;({ rows } = await client.query(`SELECT secret FROM ${quoteIdentifier(LANE_RUN_MARKER_TABLE)}`))
     } catch (error) {
       refuse(
-        `attestLaneDatabase: the database this connection string REACHES (${reached}) does not carry a `
+        `attestLaneDatabase: the database this connection string REACHES (${reached.database}) does not carry a `
         + `readable ${LANE_RUN_MARKER_TABLE} (${String(error)}), so it is not a database this run created. `
         + 'Provision one with tests/helpers/throwaway-database.ts and use the attestation on its handle',
       )
     }
     if (rows.length !== 1) {
       refuse(
-        `attestLaneDatabase: ${reached} carries ${rows.length} marker rows, not 1, so nothing here `
+        `attestLaneDatabase: ${reached.database} carries ${rows.length} marker rows, not 1, so nothing here `
         + 'establishes which run created it',
       )
     }
     const secret = rows[0]?.secret
     if (typeof secret !== 'string' || !secretMatchesThisRun(secret)) {
       refuse(
-        `attestLaneDatabase: ${reached} carries a lane marker THIS RUN DID NOT WRITE. The secret is drawn `
+        `attestLaneDatabase: ${reached.database} carries a lane marker THIS RUN DID NOT WRITE. The secret is drawn `
         + 'once per process, so a marker from another run — or from another process still running — is '
         + 'not evidence that THIS run may drain that database',
       )
     }
 
     // FRESH, FROZEN, AND THE OBJECT THAT IS REGISTERED. A copy of it is not an attestation.
-    const attestation = Object.freeze({ database: reached })
+    const attestation = Object.freeze({ database: reached.database })
     MINTED_ATTESTATIONS.add(attestation)
     return attestation as unknown as LaneDatabaseAttestation
   })

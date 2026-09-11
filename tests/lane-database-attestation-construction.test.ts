@@ -22,11 +22,13 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 
-import { attestLaneDatabase, markLaneDatabase } from '@/lib/lane-database-attestation'
+import { attestLaneDatabase, createLaneDatabase, markLaneDatabase } from '@/lib/lane-database-attestation'
+
+const LANE = 'ims_throwaway_alnkfence_0123456789abcdef'
 
 /** A path that does not exist. The read fails at CONSTRUCTION, before anything is connected. */
 const UNREADABLE_SSL_URL =
-  'postgresql://ims:secret@127.0.0.1:5432/ims_throwaway_alnkfence_0123456789abcdef'
+  `postgresql://ims:secret@127.0.0.1:5432/${LANE}`
   + '?sslcert=/nonexistent/o3d-alnk-r22/client.crt'
 
 test('r22: an `sslcert` the driver cannot read is a NAMED refusal, not a raw ENOENT', async () => {
@@ -43,14 +45,22 @@ test('r22: an `sslcert` the driver cannot read is a NAMED refusal, not a raw ENO
 })
 
 test('r22: the same is true of the marking side, which builds its client the same way', async () => {
+  // THE CREATION IS REAL (r24): `createLaneDatabase` is pointed at a maintenance URL with the same
+  // unreadable `sslcert`, so it cannot connect and mints nothing — which is the only way to reach
+  // the marking side's own construction failure without a server. Both halves therefore exercise
+  // the wrapped `new pg.Client`, which is the subject of this file.
+  const created = await createLaneDatabase({ maintenanceUrl: UNREADABLE_SSL_URL, name: LANE })
+  assert.equal(created.outcome, 'not-created')
+  assert.ok(created.error instanceof Error)
+  assert.match(created.error.message, /node-postgres could not build a client for that connection string/)
+
   await assert.rejects(
-    () => markLaneDatabase({
-      url: UNREADABLE_SSL_URL,
-      createdDatabaseName: 'ims_throwaway_alnkfence_0123456789abcdef',
-    }),
+    () => markLaneDatabase({ database: LANE } as never, UNREADABLE_SSL_URL),
     (error: Error) => {
       assert.equal(error.name, 'LaneDatabaseAttestationError', `an unwrapped ${error.name} escaped: ${error.message}`)
-      assert.match(error.message, /node-postgres could not build a client for that connection string/)
+      // The creation guard fires FIRST now, before any client is built — which is the r24 fix, and
+      // it is asserted here so this file cannot silently stop covering the construction it is about.
+      assert.match(error.message, /not a creation this run minted/)
       return true
     },
   )

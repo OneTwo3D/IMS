@@ -26,6 +26,33 @@
  * faithful to the one property HIGH B turns on — a client's `database` field and
  * `current_database()` can disagree — and it models nothing else about a pooler, because nothing
  * else is load-bearing here.
+ *
+ * =========================================================================================
+ * ROUND 24 (Codex HIGH x2) — THE CAPABILITY NOW NAMES WHAT IT AUTHORISES.
+ *
+ * Round 22 was right that a lane database must be proved POSITIVELY. What it did not do is BIND
+ * either proof to the thing it permitted, and Codex found both halves of that:
+ *
+ *   HIGH 1 — AN ATTESTATION WAS REPLAYABLE ACROSS UNRELATED CLIENTS. The mint checked that the
+ *   attestation object was one this run produced and NOTHING ELSE. The `emailOutbox` and
+ *   `emailSuppression` delegates arrived as separate arguments, so a throwaway-lane attestation
+ *   paired with PRODUCTION delegates passed every check: a fake sender then drained the real queue
+ *   and stamped real rows SENT, while the marker check was satisfied by a database nobody was
+ *   talking to.
+ *
+ *   HIGH 2 — THE MARKER WRITER TOOK THE CALLER'S WORD FOR WHICH DATABASE. `createdDatabaseName` was
+ *   a STRING, and its equality with `current_database()` proved the DESTINATION'S NAME — not that
+ *   the caller had created the destination. `markLaneDatabase({ url: productionUrl,
+ *   createdDatabaseName: 'onetwo3d_ims_dev' })` therefore wrote this run's secret INTO production
+ *   and `attestLaneDatabase` minted a valid capability over it afterwards. The protected-name list
+ *   lived one level up, in the throwaway helper, so the EXPORTED minting authority had none.
+ *
+ * BOTH ARE FIXED BY REMOVING THE PAIRING, NOT BY CHECKING IT. `createLaneDatabase` issues the
+ * `CREATE DATABASE` itself and mints the only object `markLaneDatabase` accepts — and PostgreSQL
+ * answers a CREATE on a name that exists with `42P04`, so no argument to it names an EXISTING
+ * database and comes back with authority over one. `createEmailOutboxLaneClient` attests a
+ * connection string and builds the delegates FROM THAT SAME STRING, so there is no second object to
+ * swap. The `database` arm of the synchronous mint is gone.
  */
 
 import assert from 'node:assert/strict'
@@ -37,6 +64,12 @@ import { fileURLToPath } from 'node:url'
 // THE FAKE SERVER.
 // ===========================================================================================
 
+/** The database this whole guard exists to keep a harness off. */
+const LIVE = 'onetwo3d_ims_dev'
+const LANE = 'ims_throwaway_alnkfence_0123456789abcdef'
+const url = (database: string, cluster = '127.0.0.1:5432') => `postgresql://ims:secret@${cluster}/${database}`
+const maintenanceUrl = (cluster = '127.0.0.1:5432') => url('postgres', cluster)
+
 const server = {
   /**
    * Backend database name -> the marker it carries.
@@ -45,6 +78,14 @@ const server = {
    *   a string    — the table holds one row carrying that secret.
    */
   markers: new Map<string, string | null>(),
+  /**
+   * WHAT EXISTS ON EACH CLUSTER, keyed by `host:port`. `CREATE DATABASE` is answered against this
+   * and nothing else, which is the whole reason r24's authority cannot be aimed at production: a
+   * name that is here already comes back `42P04`, and a rejected CREATE mints nothing.
+   */
+  databases: new Map<string, Set<string>>(),
+  /** `host:port` -> the instant that cluster booted, as `pg_postmaster_start_time()` renders it. */
+  clusters: new Map<string, string>(),
   /**
    * THE POOLER. Startup database name (what the URL asks for) -> the backend database the
    * connection actually reaches. A name absent from here reaches itself, which is a direct
@@ -56,20 +97,44 @@ const server = {
   failConnect: false,
 }
 
+/** The cluster every URL in these tests points at unless it says otherwise. */
+const HOME = '127.0.0.1:5432'
+/** A SECOND reachable Postgres. Only the cross-cluster proof uses it. */
+const ELSEWHERE = '127.0.0.1:5433'
+
 function resetServer(): void {
   server.markers.clear()
+  server.databases.clear()
+  server.clusters.clear()
   server.routes.clear()
   server.statements = []
   server.failConnect = false
+  // PRODUCTION EXISTS. Every refusal below that turns on "that name is taken" is vacuous without
+  // this line, so it is part of the reset rather than part of a test.
+  server.databases.set(HOME, new Set([LIVE, 'postgres']))
+  server.clusters.set(HOME, '2026-01-01 00:00:00.000001+00')
+  server.databases.set(ELSEWHERE, new Set(['postgres']))
+  server.clusters.set(ELSEWHERE, '2026-02-02 00:00:00.000002+00')
+}
+
+function databasesOn(cluster: string): Set<string> {
+  const existing = server.databases.get(cluster)
+  if (existing) return existing
+  const fresh = new Set<string>()
+  server.databases.set(cluster, fresh)
+  return fresh
 }
 
 class FakePgClient {
   private readonly asked: string
   private readonly reached: string
+  private readonly cluster: string
 
   constructor(config: { connectionString: string }) {
-    this.asked = decodeURIComponent(new URL(config.connectionString).pathname.replace(/^\//, ''))
+    const parsed = new URL(config.connectionString)
+    this.asked = decodeURIComponent(parsed.pathname.replace(/^\//, ''))
     this.reached = server.routes.get(this.asked) ?? this.asked
+    this.cluster = `${parsed.hostname}:${parsed.port}`
   }
 
   async connect(): Promise<void> {
@@ -78,11 +143,28 @@ class FakePgClient {
 
   async query(text: string, values?: unknown[]): Promise<{ rows: Record<string, unknown>[] }> {
     server.statements.push({ database: this.reached, text })
+    const startedAt = server.clusters.get(this.cluster) ?? 'unknown cluster'
 
     // THE FACT HIGH B IS ABOUT: the SERVER answers with the backend it routed to, not with the
-    // name the client asked for.
+    // name the client asked for. And, since r24, WHICH SERVER answered.
     if (text.startsWith('SELECT current_database()')) {
-      return { rows: [{ database: this.reached }] }
+      return { rows: [{ database: this.reached, cluster_started_at: startedAt }] }
+    }
+    if (text.startsWith('SELECT pg_postmaster_start_time()')) {
+      return { rows: [{ cluster_started_at: startedAt }] }
+    }
+
+    if (text.startsWith('CREATE DATABASE')) {
+      const name = /"((?:[^"]|"")*)"/.exec(text)?.[1].replace(/""/g, '"')
+      if (name === undefined) throw new Error(`the fake server could not read a name out of: ${text}`)
+      const here = databasesOn(this.cluster)
+      // WHAT POSTGRESQL ACTUALLY DOES, with the SQLSTATE it actually sets. This one line is what
+      // makes r24's authority unaimable at anything that already exists.
+      if (here.has(name)) {
+        throw Object.assign(new Error(`database "${name}" already exists`), { code: '42P04' })
+      }
+      here.add(name)
+      return { rows: [] }
     }
 
     if (text.startsWith('CREATE TABLE "ims_lane_run_marker"')) {
@@ -122,10 +204,18 @@ mock.module('pg', { defaultExport: { Client: FakePgClient } })
 const load = () => import('@/lib/lane-database-attestation')
 const loadOutbox = () => import('@/lib/email-outbox')
 
-/** The database this whole guard exists to keep a harness off. */
-const LIVE = 'onetwo3d_ims_dev'
-const LANE = 'ims_throwaway_alnkfence_0123456789abcdef'
-const url = (database: string) => `postgresql://ims:secret@127.0.0.1:5432/${database}`
+/**
+ * MINT A LANE THE WAY THE SHIPPED PATH DOES: the module issues its own `CREATE DATABASE` and hands
+ * back the creation that is the sole authority to mark. No test can build one by hand, which is the
+ * property r24 is about.
+ */
+async function createLane(name: string = LANE, cluster: string = HOME) {
+  const { createLaneDatabase } = await load()
+  const result = await createLaneDatabase({ maintenanceUrl: maintenanceUrl(cluster), name })
+  assert.equal(result.outcome, 'created', `the fixture could not create ${name}: ${JSON.stringify(result)}`)
+  assert.ok(result.outcome === 'created')
+  return result.creation
+}
 
 /** Run `body` with `DATABASE_URL` in a stated state, and restore it afterwards. */
 async function withDatabaseUrl(value: string | undefined, body: () => Promise<void>): Promise<void> {
@@ -168,25 +258,20 @@ function delegates(): {
 // CONTROL — the happy path, first, so nothing below can pass by refusing everything.
 // ===========================================================================================
 
-test('CONTROL: a database this run marked attests, and the attestation mints a harness client', async () => {
+test('CONTROL: a database this run CREATED can be marked and attested', async () => {
   resetServer()
   const { markLaneDatabase, attestLaneDatabase, isLaneDatabaseAttestation } = await load()
-  const { createEmailOutboxHarnessClient } = await loadOutbox()
 
-  // The server has BOTH databases. Only one of them is this run's lane.
-  server.markers.delete(LIVE)
-
-  await markLaneDatabase({ url: url(LANE), createdDatabaseName: LANE })
+  // The server has BOTH databases. Only one of them is this run's lane, and the difference is not
+  // its name: it is that this process watched itself create it a statement ago.
+  const creation = await createLane()
+  await markLaneDatabase(creation, url(LANE))
   const attestation = await attestLaneDatabase(url(LANE))
 
   assert.equal(attestation.database, LANE)
   assert.ok(isLaneDatabaseAttestation(attestation))
-
-  const client = createEmailOutboxHarnessClient({
-    ...delegates(),
-    writesTo: { kind: 'database', attestation },
-  })
-  assert.ok(client, 'the mint refused an attestation this run produced, so every refusal below is vacuous')
+  assert.ok(typeof server.markers.get(LANE) === 'string', 'the CONTROL never wrote a marker, so every refusal below is vacuous')
+  assert.equal(server.markers.has(LIVE), false, 'the CONTROL marked the live database, which is the thing this file forbids')
 })
 
 test('CONTROL: attesting is READ-ONLY, so pointing it somewhere cannot MAKE that place attestable', async () => {
@@ -194,7 +279,7 @@ test('CONTROL: attesting is READ-ONLY, so pointing it somewhere cannot MAKE that
   // the very property it is checking for, and the guard would manufacture its own answer.
   resetServer()
   const { markLaneDatabase, attestLaneDatabase } = await load()
-  await markLaneDatabase({ url: url(LANE), createdDatabaseName: LANE })
+  await markLaneDatabase(await createLane(), url(LANE))
   server.statements = []
   await attestLaneDatabase(url(LANE))
 
@@ -206,6 +291,145 @@ test('CONTROL: attesting is READ-ONLY, so pointing it somewhere cannot MAKE that
       `attestLaneDatabase issued a non-SELECT (${statement.text}); a guard that writes creates what it checks for`,
     )
   }
+})
+
+// ===========================================================================================
+// r24 HIGH 2 — THE MINTING AUTHORITY CANNOT BE AIMED AT PRODUCTION, AND NOT BECAUSE IT KNOWS ITS
+// NAME.
+// ===========================================================================================
+
+test('r24 HIGH 2: markLaneDatabase refuses the configured production database, correctly named', async () => {
+  // THE FINDING, EXACTLY. Round 22's writer took `createdDatabaseName` — a STRING — and wrote the
+  // marker if `current_database()` equalled it. A caller who named production CORRECTLY therefore
+  // got this run's secret written INTO production, and `attestLaneDatabase` minted a valid
+  // capability over it on the next line. The protected-name list lived in the throwaway helper, one
+  // level above, so the EXPORTED function had none.
+  //
+  // MUTATION ROUTE: in lib/lane-database-attestation.ts, drop the `isLaneDatabaseCreation(creation)`
+  // guard at the top of `markLaneDatabase` (or make it `if (false)`). The first arm below then walks
+  // straight through and production is marked.
+  resetServer()
+  const { markLaneDatabase, createLaneDatabase, attestLaneDatabase } = await load()
+
+  // 1. A hand-built creation naming production. This is round 22's call, written in r24's shape.
+  await assert.rejects(
+    () => markLaneDatabase({ database: LIVE } as never, url(LIVE)),
+    /not a creation this run minted/,
+    'a plain object naming production was accepted as authority over it',
+  )
+
+  // 2. ASKING FOR THE AUTHORITY DIRECTLY. This is the route a caller would take now, and the refusal
+  //    is PostgreSQL's, not a list of ours: production EXISTS, so its CREATE is rejected `42P04`.
+  const aimed = await createLaneDatabase({ maintenanceUrl: maintenanceUrl(), name: LIVE })
+  assert.notEqual(aimed.outcome, 'created', 'CREATE DATABASE on an existing database minted authority over it')
+  assert.ok(aimed.outcome !== 'created' && aimed.outcome !== 'created-but-failed')
+  assert.equal((aimed.error as { code?: string }).code, '42P04', `expected duplicate_database, got ${String(aimed.error)}`)
+
+  // 3. A REAL creation, re-pointed. The one thing a caller genuinely holds cannot be spent
+  //    elsewhere, because the mark asks the destination who it is.
+  const lane = await createLane()
+  await assert.rejects(
+    () => markLaneDatabase(lane, url(LIVE)),
+    new RegExp(`this connection reaches ${LIVE}, not ${LANE}`),
+    'a lane creation was spent on production',
+  )
+
+  // 4. And copies of a real creation are not creations.
+  for (const [why, forgery] of [
+    ['a spread', { ...(lane as unknown as object) }],
+    ['a frozen copy', Object.freeze({ database: LANE })],
+    ['a Proxy', new Proxy(lane as unknown as object, {})],
+    ['nothing at all', undefined],
+    ['null', null],
+  ] as [string, unknown][]) {
+    await assert.rejects(
+      () => markLaneDatabase(forgery as never, url(LANE)),
+      /not a creation this run minted/,
+      `the marker writer accepted ${why}`,
+    )
+  }
+
+  // THE POINT OF ALL FOUR: production carries no marker, so nothing can attest it.
+  assert.equal(server.markers.has(LIVE), false, 'this run wrote its secret into the live database')
+  await assert.rejects(() => attestLaneDatabase(url(LIVE)), /does not carry a readable ims_lane_run_marker/)
+})
+
+test('r24 HIGH 2: a creation is pinned to the CLUSTER it was made on, not to the name it carries', async () => {
+  // A database NAME is unique within one cluster and nowhere else. Without the cluster pin, a
+  // creation of `onetwo3d_ims_dev` on a SECOND reachable Postgres — where that name is free —
+  // would license marking the live database of that name on THIS one.
+  //
+  // MUTATION ROUTE: delete the `reached.clusterStartedAt !== createdOnCluster` branch in
+  // `markLaneDatabase`. The mark below then lands on the live database.
+  resetServer()
+  const { markLaneDatabase } = await load()
+
+  const elsewhere = await createLane(LIVE, ELSEWHERE)
+  assert.ok(server.databases.get(ELSEWHERE)?.has(LIVE), 'PRECONDITION: the second cluster really took that name')
+
+  await assert.rejects(
+    () => markLaneDatabase(elsewhere, url(LIVE)),
+    /is on a DIFFERENT server from the one this run created/,
+    'a creation made on another cluster licensed a mark on this one',
+  )
+  assert.equal(server.markers.has(LIVE), false, 'the live database was marked through a same-named database elsewhere')
+})
+
+// ===========================================================================================
+// r24 HIGH 1 — THE CAPABILITY AND ITS SUBJECT ARE MADE TOGETHER, SO THEY CANNOT BE RECOMBINED.
+// ===========================================================================================
+
+test('r24 HIGH 1: a lane attestation cannot be paired with production delegates', async () => {
+  // THE FINDING, EXACTLY. `createEmailOutboxHarnessClient` checked that `writesTo.attestation` was
+  // one this run minted and NOTHING about the delegates beside it. So a throwaway-lane attestation
+  // and PRODUCTION delegates passed together, and the drain — a SWEEP over the globally oldest
+  // queued customer emails — claimed real rows, delivered nothing through the harness's fake sender,
+  // and stamped them SENT. The marker check was satisfied by a database nobody was talking to.
+  //
+  // MUTATION ROUTE: restore the `database` arm in `createEmailOutboxHarnessClient` (accept
+  // `writesTo: { kind: 'database', attestation }` when `isLaneDatabaseAttestation(attestation)`).
+  // The first assertion below then mints a client over production delegates.
+  resetServer()
+  const { markLaneDatabase, attestLaneDatabase } = await load()
+  const { createEmailOutboxHarnessClient, createEmailOutboxLaneClient } = await loadOutbox()
+
+  await markLaneDatabase(await createLane(), url(LANE))
+  const attestation = await attestLaneDatabase(url(LANE))
+  assert.equal(attestation.database, LANE, 'PRECONDITION: the lane really did attest')
+
+  // 1. THE PAIRING IS NOT A CALL ANYONE CAN WRITE ANY MORE. `delegates()` stands in for
+  //    `db.emailOutbox`/`db.emailSuppression`: production's, reaching the real queue.
+  assert.throws(
+    () => createEmailOutboxHarnessClient({
+      ...delegates(),
+      writesTo: { kind: 'database', attestation } as unknown as { kind: 'in-memory' },
+    }),
+    /`writesTo` says `database`, and this function no longer mints that/,
+    'a lane attestation minted a client over production delegates',
+  )
+
+  // 2. AND THE ROUTE THAT REPLACED IT CANNOT BE POINTED AT PRODUCTION EITHER — even here, where a
+  //    lane attestation demonstrably exists in this very process.
+  await assert.rejects(
+    () => createEmailOutboxLaneClient({ url: url(LIVE) }),
+    /does not carry a readable ims_lane_run_marker/,
+    'the lane client was built over the live database',
+  )
+
+  // 3. NON-VACUITY. The same call against the LANE gets PAST the attestation — it fails later, at
+  //    the Prisma adapter, because `pg` is a fake here and there is no `Pool` on it. If it were
+  //    refused for the same reason as (2), (2) would be proving nothing.
+  await assert.rejects(
+    () => createEmailOutboxLaneClient({ url: url(LANE) }),
+    (error: Error) => {
+      assert.doesNotMatch(
+        error.message,
+        /does not carry a readable ims_lane_run_marker|is not an attestation/,
+        'the LANE was refused by the attestation too, so the refusal above is not about the destination',
+      )
+      return true
+    },
+  )
 })
 
 // ===========================================================================================
@@ -241,7 +465,7 @@ test('r22 HIGH A: a LANE still attests with DATABASE_URL unset, so the refusal a
   resetServer()
   const { markLaneDatabase, attestLaneDatabase } = await load()
   await withDatabaseUrl(undefined, async () => {
-    await markLaneDatabase({ url: url(LANE), createdDatabaseName: LANE })
+    await markLaneDatabase(await createLane(), url(LANE))
     const attestation = await attestLaneDatabase(url(LANE))
     assert.equal(attestation.database, LANE)
   })
@@ -295,18 +519,18 @@ test('r22 HIGH B: an alias a pooler routes to the LIVE database is refused, and 
 
 test('r22 HIGH B: a pooler alias cannot be MARKED either, so the marker cannot be walked into production', async () => {
   // The write side of the same fact. If marking followed the name the caller asked for, a lane
-  // whose alias routes to production would put this run's secret INTO production and everything
+  // whose URL is routed to production would put this run's secret INTO production and everything
   // afterwards would be correct about a database that is not a lane.
   resetServer()
-  server.routes.set('lane_alias', LIVE)
   const { markLaneDatabase } = await load()
+  const creation = await createLane()
+  // The route is set AFTER the CREATE, so this is a genuine lane whose connection string later
+  // lands somewhere else — which is exactly what a pooler reconfiguration does.
+  server.routes.set(LANE, LIVE)
 
   await assert.rejects(
-    () => markLaneDatabase({ url: url('lane_alias'), createdDatabaseName: 'lane_alias' }),
-    (error: Error) => {
-      assert.match(error.message, new RegExp(`this connection reaches ${LIVE}, not lane_alias`))
-      return true
-    },
+    () => markLaneDatabase(creation, url(LANE)),
+    new RegExp(`this connection reaches ${LIVE}, not ${LANE}`),
   )
   assert.equal(server.markers.has(LIVE), false, 'the refused mark still wrote a marker into the live database')
 })
@@ -316,10 +540,10 @@ test('r22 HIGH B: two unequal startup names reaching ONE marked backend give ONE
   // attestation says so — because the name it records is the one the SERVER gave, not the one the
   // URL asked for. A name comparison had no way to notice this at all.
   resetServer()
-  server.routes.set('lane_alias', LANE)
   const { markLaneDatabase, attestLaneDatabase } = await load()
+  await markLaneDatabase(await createLane(), url(LANE))
+  server.routes.set('lane_alias', LANE)
 
-  await markLaneDatabase({ url: url(LANE), createdDatabaseName: LANE })
   const direct = await attestLaneDatabase(url(LANE))
   const viaPooler = await attestLaneDatabase(url('lane_alias'))
 
@@ -365,47 +589,65 @@ test('r22: marking refuses a database that is ALREADY marked', async () => {
   // A database carrying a marker is not one this call has just created, whoever wrote the marker.
   resetServer()
   const { markLaneDatabase } = await load()
-  await markLaneDatabase({ url: url(LANE), createdDatabaseName: LANE })
+  const creation = await createLane()
+  await markLaneDatabase(creation, url(LANE))
   await assert.rejects(
-    () => markLaneDatabase({ url: url(LANE), createdDatabaseName: LANE }),
+    () => markLaneDatabase(creation, url(LANE)),
     /could not create ims_lane_run_marker/,
   )
 })
 
+test('r24: a CREATE that the server never answered mints nothing', async () => {
+  // The third outcome, and the one that must not mint: an issued statement whose answer was lost is
+  // not a database this process knows it created.
+  resetServer()
+  const { createLaneDatabase, markLaneDatabase } = await load()
+  server.failConnect = true
+  const lost = await createLaneDatabase({ maintenanceUrl: maintenanceUrl(), name: LANE })
+  server.failConnect = false
+
+  assert.equal(lost.outcome, 'not-created')
+  await assert.rejects(
+    () => markLaneDatabase({ database: LANE } as never, url(LANE)),
+    /not a creation this run minted/,
+  )
+})
+
 // ===========================================================================================
-// THE MINT — the attestation is a CAPABILITY, not a shape.
+// THE MINT — a `database` destination is not a shape this function has any more.
 // ===========================================================================================
 
-test('r22: the mint accepts an attestation and nothing that merely looks like one', async () => {
+test('r24: the synchronous mint refuses every `database` destination, attested or not', async () => {
   resetServer()
   const { markLaneDatabase, attestLaneDatabase } = await load()
   const { createEmailOutboxHarnessClient } = await loadOutbox()
 
-  await markLaneDatabase({ url: url(LANE), createdDatabaseName: LANE })
+  await markLaneDatabase(await createLane(), url(LANE))
   const real = await attestLaneDatabase(url(LANE))
 
   const mint = (attestation: unknown) => createEmailOutboxHarnessClient({
     ...delegates(),
-    writesTo: { kind: 'database', attestation } as unknown as { kind: 'database'; attestation: typeof real },
+    writesTo: { kind: 'database', attestation } as unknown as { kind: 'in-memory' },
   })
 
-  // The real one, so the refusals below are about the ARGUMENT and not about the arm.
-  assert.ok(mint(real))
-
-  const forgeries: [string, unknown][] = [
+  // The REAL one first, because that is the r24 finding: a genuine capability over a lane, spent on
+  // delegates nobody checked. If this line ever mints again, the replay is back.
+  for (const [why, attestation] of [
+    ['a genuine attestation over a real lane — the r24 HIGH itself', real],
     ['a hand-built object with the same shape', { database: LANE }],
-    ['a SPREAD of a real attestation — a different object, so not in the register', { ...real }],
-    ['a frozen copy', Object.freeze({ database: real.database })],
+    ['a SPREAD of a real attestation', { ...real }],
     ['a Proxy wrapping a real attestation', new Proxy(real, {})],
     ['a URL, which is what this arm used to take', url(LANE)],
     ['nothing at all', undefined],
     ['null', null],
-  ]
-  for (const [why, forgery] of forgeries) {
+  ] as [string, unknown][]) {
     assert.throws(
-      () => mint(forgery),
-      /`writesTo\.attestation` is not an attestation this run minted/,
+      () => mint(attestation),
+      /`writesTo` says `database`, and this function no longer mints that/,
       `the mint accepted ${why}`,
     )
   }
+
+  // AND IN-MEMORY STILL MINTS, so the refusals above are about the arm and not about the function.
+  assert.ok(createEmailOutboxHarnessClient({ ...delegates(), writesTo: { kind: 'in-memory' } }))
 })

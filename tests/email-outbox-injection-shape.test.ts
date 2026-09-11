@@ -888,18 +888,19 @@ test('r18 NON-VACUITY: a MINTED client is accepted, and the drain runs to a SENT
   assert.equal(fixture.store['row-1'].status, 'SENT')
 })
 
-test('r22: the mint refuses a `database` destination that carries no attestation this run minted', async () => {
-  // WHAT REPLACED THE URL COMPARISON, AND WHY. Rounds 18-21 asked whether `writesTo.url` resolved to
-  // the same database NAME as `DATABASE_URL`. Round 21 ended that: an unset or empty `DATABASE_URL`
-  // SKIPPED the comparison while the app's pool still connects through `PGDATABASE`/`PGUSER`, and a
-  // pooler routes two UNEQUAL names to one queue. So the arm no longer takes a name of any kind — it
-  // takes a `LaneDatabaseAttestation`, minted only after `attestLaneDatabase` connected with the
-  // lane's own connection string and read back a marker only this run could have written.
+test('r24: this mint has no `database` arm at all, whatever is offered on it', async () => {
+  // WHY THE ARM IS GONE RATHER THAN STRICTER. Rounds 18-21 asked whether `writesTo.url` resolved to
+  // the same database NAME as `DATABASE_URL`; round 21 ended that (an unset `DATABASE_URL` SKIPPED
+  // the comparison, and a pooler routes two UNEQUAL names to one queue). Round 22 replaced the name
+  // with a `LaneDatabaseAttestation` — real, server-side proof — and round 24 found the defect one
+  // level up: the proof was about a DATABASE and the call also carried DELEGATES nobody had checked.
+  // A lane attestation beside `db.emailOutbox` passed, and the drain swept the live queue.
   //
-  // THE POSITIVE SIDE — that a genuine attestation MINTS, that a pooler alias onto the live database
-  // is refused, and that an unset `DATABASE_URL` changes nothing — needs a server to answer, so it
-  // lives in tests/lane-database-attestation.test.ts against a fake one. What belongs HERE is that
-  // the mint's door is a capability and not a shape.
+  // A capability has to name what it authorises. So a database-backed client is not assembled from
+  // parts here at all: `createEmailOutboxLaneClient` attests a connection string and builds the
+  // delegates from that same string. The positive side of that needs a server to answer and lives in
+  // tests/lane-database-attestation.test.ts against a fake one; what belongs HERE is that this door
+  // no longer opens for any `database` destination whatsoever.
   const { createEmailOutboxHarnessClient } = await loadOutbox()
   const delegates = unmintedClient()
   const mint = (attestation: unknown) => createEmailOutboxHarnessClient({
@@ -916,8 +917,27 @@ test('r22: the mint refuses a `database` destination that carries no attestation
   ] as [string, unknown][]) {
     assert.throws(
       () => mint(attestation),
-      /`writesTo\.attestation` is not an attestation this run minted/,
+      /`writesTo` says `database`, and this function no longer mints that/,
       `the mint accepted ${why}`,
+    )
+  }
+})
+
+test('r24: the lane client refuses a destination that is not a string at all', async () => {
+  // The door to the replacement, checked here because it needs no server: a call that names no
+  // destination cannot be attested and must not reach a pool.
+  const { createEmailOutboxLaneClient } = await loadOutbox()
+  for (const [why, url] of [
+    ['nothing at all', undefined],
+    ['null', null],
+    ['an empty string', ''],
+    ['whitespace', '   '],
+    ['a number', 5],
+  ] as [string, unknown][]) {
+    await assert.rejects(
+      () => createEmailOutboxLaneClient({ url } as { url: string }),
+      /`url` must be the lane's connection string/,
+      `the lane client accepted ${why}`,
     )
   }
 })
@@ -940,7 +960,7 @@ test('r18: the mint refuses an incomplete or undeclared client', async () => {
       emailSuppression: delegates.emailSuppression,
       writesTo: { kind: 'somewhere' } as unknown as { kind: 'in-memory' },
     }),
-    /`writesTo\.kind` must be 'in-memory' or 'database'/,
+    /`writesTo\.kind` must be 'in-memory'/,
   )
 })
 

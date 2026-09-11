@@ -106,29 +106,26 @@ const drainWith = (
 ) => run({ harness })
 
 /**
- * THE LANE'S HARNESS CLIENT, MINTED AND DECLARED (o3d-alnk r18; the destination re-founded in r22).
+ * THE LANE'S HARNESS CLIENT, BUILT BY THE MODULE THAT ATTESTED THE DESTINATION (r18; the
+ * destination re-founded in r22; the CAPABILITY BOUND TO ITS SUBJECT in r24).
  *
- * `harness.client` is a branded type: `lane.db as unknown as EmailOutboxClient` no longer compiles
- * there and would be refused at runtime as an unminted client. The mint is also where this lane says
- * WHERE ITS WRITES LAND — and what it says is no longer a URL for the mint to RECOGNISE.
+ * `harness.client` is a branded type: `lane.db as unknown as EmailOutboxClient` does not compile
+ * there and would be refused at runtime as an unminted client.
  *
- * It is `lane.database.attestation`: an object `attestLaneDatabase` minted after CONNECTING with
- * this lane's own connection string and reading back a marker only this run could have written.
- * Rounds 18 to 21 compared the URL's database name with `DATABASE_URL`'s, and round 21 showed that
- * comparison can never be made sound — an unset `DATABASE_URL` skipped it entirely while the app's
- * pool still connects through `PGDATABASE`/`PGUSER`, and a pooler routes two unequal names to one
- * queue. So the accident this whole file could have caused (a real Prisma client drained by a fake
- * sender against the LIVE-SERVED dev database) is now refused because the dev database carries no
- * marker — not because its name was recognised.
+ * WHAT THIS FILE NO LONGER DOES IS ASSEMBLE ONE. Until r24 it passed `lane.db`'s delegates and
+ * `lane.database.attestation` as two independent arguments, and the mint checked only the second —
+ * so a lane attestation beside PRODUCTION delegates passed just as readily, and the drain (a SWEEP
+ * over the globally oldest queued customer emails) would have stamped real rows SENT with nothing
+ * delivered. `createEmailOutboxLaneClient` takes ONE string, attests it by round trip, and builds
+ * the Prisma client from that same string: the proof and the delegates are made together, and this
+ * file has no opportunity to put the wrong two beside each other.
+ *
+ * The accident this whole file could have caused — a real client drained by a fake sender against
+ * the LIVE-SERVED dev database — is refused because the dev database carries no marker, not because
+ * its name was recognised.
  */
-async function laneHarnessClient(lane: Lane): Promise<EmailOutboxHarnessClient> {
-  const { createEmailOutboxHarnessClient } = await import('@/lib/email-outbox')
-  const prisma = lane.db as unknown as EmailOutboxClient
-  return createEmailOutboxHarnessClient({
-    emailOutbox: prisma.emailOutbox,
-    emailSuppression: prisma.emailSuppression,
-    writesTo: { kind: 'database', attestation: lane.database.attestation },
-  })
+function laneHarnessClient(lane: Lane): EmailOutboxHarnessClient {
+  return lane.outbox.client
 }
 
 /**
@@ -197,6 +194,8 @@ type Lane = {
     $disconnect: () => Promise<void>
   }
   sql: PgClient
+  /** The email-outbox client this lane drains with, built by lib/email-outbox.ts from `database.url`. */
+  outbox: import('@/lib/email-outbox').EmailOutboxLaneClient
   close: () => Promise<void>
 }
 
@@ -239,6 +238,7 @@ async function openLane(options: OpenLaneOptions = {}): Promise<Lane> {
 
   let db: { $disconnect: () => Promise<void> } | null = null
   let sql: PgClient | null = null
+  let outbox: import('@/lib/email-outbox').EmailOutboxLaneClient | null = null
   try {
     options.failAfterProvision?.(database)
 
@@ -254,7 +254,15 @@ async function openLane(options: OpenLaneOptions = {}): Promise<Lane> {
     db = new PrismaClient({ adapter: new PrismaPg({ connectionString: database.url, max: 5 }) })
     sql = new pg.Client({ connectionString: database.url }) as unknown as PgClient
     await sql.connect()
+
+    // THE DRAIN'S CLIENT IS NOT BUILT HERE (r24). `createEmailOutboxLaneClient` attests this
+    // string — the database has to answer with the marker this run wrote into it — and then builds
+    // its own pool from the same string. Pointed at the configured dev database it would refuse
+    // before opening anything, so this line cannot become the accident this file exists to prevent.
+    const { createEmailOutboxLaneClient } = await import('@/lib/email-outbox')
+    outbox = await createEmailOutboxLaneClient({ url: database.url })
   } catch (error) {
+    await outbox?.disconnect().catch(() => undefined)
     await sql?.end().catch(() => undefined)
     await db?.$disconnect().catch(() => undefined)
     await database.drop()
@@ -263,13 +271,16 @@ async function openLane(options: OpenLaneOptions = {}): Promise<Lane> {
 
   const openedDb = db as NonNullable<typeof db>
   const openedSql = sql as NonNullable<typeof sql>
+  const openedOutbox = outbox as NonNullable<typeof outbox>
 
   return {
     database,
     db: openedDb as unknown as Lane['db'],
     sql: openedSql,
+    outbox: openedOutbox,
     close: async () => {
       // Ordered: let go of every connection before DROP DATABASE, even though it is FORCEd.
+      await openedOutbox.disconnect().catch(() => undefined)
       await openedSql.end().catch(() => undefined)
       await openedDb.$disconnect().catch(() => undefined)
       await database.drop()
@@ -336,7 +347,7 @@ async function runShippedCollapse(lane: Lane): Promise<void> {
  */
 async function futureSends(lane: Lane, t0: Date): Promise<string[]> {
   const { processPendingEmailOutbox } = await import('@/lib/email-outbox')
-  const client = await laneHarnessClient(lane)
+  const client = laneHarnessClient(lane)
   const delivered: string[] = []
   for (const at of [t0, new Date(t0.getTime() + RECLAIM_AFTER_MS), new Date(t0.getTime() + 2 * RECLAIM_AFTER_MS)]) {
     await drainWith(processPendingEmailOutbox, {
@@ -445,7 +456,7 @@ test(
           },
         })
 
-        const client = await laneHarnessClient(lane)
+        const client = laneHarnessClient(lane)
         const tReclaim = new Date(t0.getTime() + RECLAIM_AFTER_MS)
         let reclaimHappened = false
 
