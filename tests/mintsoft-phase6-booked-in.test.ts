@@ -7,6 +7,7 @@ import {
   buildMintsoftWebhookSweepWhere,
   MINTSOFT_WEBHOOK_PROCESSING_STATUS,
 } from '../lib/domain/wms/booked-in-service.ts'
+import { resolveTransferLineLandedQty } from '../lib/domain/inventory/transfer-landed-quantity.ts'
 import {
   buildBookedInDryRun,
   reconcileBookedInQuantities,
@@ -79,7 +80,7 @@ test('sliceTransferSnapshotForReceipt takes the next cost-layer slice after prio
         { costLayerId: 'layer-a', qty: 3, unitCostBase: 10 },
         { costLayerId: 'layer-b', qty: 4, unitCostBase: 12 },
       ],
-      alreadyReceivedQty: 2,
+      alreadyLanded: resolveTransferLineLandedQty({ transferLineId: 'tl-1', qtyReceived: 2, wmsAsnLines: [] }),
       qtyReceived: 3,
     }),
     [

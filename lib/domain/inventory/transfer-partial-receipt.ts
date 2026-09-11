@@ -4,11 +4,22 @@
  * `'use server'` action file may only export async functions.
  */
 
+import { transferLineOutstandingQty, type TransferLineLandedQty } from '@/lib/domain/inventory/transfer-landed-quantity'
+
 export type TransferReceiptPlanLine = { lineId: string; receiveQty: number }
 
-/** Cap each requested per-line delta to its remaining (qty − qtyReceived). */
+/**
+ * Cap each requested per-line delta to what has NOT yet landed.
+ *
+ * Takes `landed` rather than `qtyReceived` (6oyu.19, Codex round-6 HIGH-1): a line
+ * the WMS stock-sync alignment has already brought into stock has a `qtyReceived` of
+ * zero, so capping on that column offered its units up to be received — and layered
+ * — a second time. `TransferLineLandedQty` can only be built by
+ * lib/domain/inventory/transfer-landed-quantity, so this planner and the paths that
+ * act on its output cannot answer the question differently.
+ */
 export function planTransferPartialReceipt(
-  lines: ReadonlyArray<{ id: string; qty: number; qtyReceived: number }>,
+  lines: ReadonlyArray<{ id: string; qty: number; landed: TransferLineLandedQty }>,
   requested: ReadonlyArray<{ lineId: string; qty: number }>,
 ): { plan: TransferReceiptPlanLine[]; fullyReceivedAfter: boolean } {
   const lineById = new Map(lines.map((line) => [line.id, line]))
@@ -22,14 +33,14 @@ export function planTransferPartialReceipt(
   const plan: TransferReceiptPlanLine[] = []
   for (const [lineId, requestedQty] of requestedById) {
     const line = lineById.get(lineId)!
-    const remaining = Math.max(0, line.qty - line.qtyReceived)
+    const remaining = transferLineOutstandingQty(line.qty, line.landed).toNumber()
     const receiveQty = Math.min(requestedQty, remaining)
     if (receiveQty > 0) plan.push({ lineId, receiveQty })
   }
 
   const receivedById = new Map(plan.map((p) => [p.lineId, p.receiveQty]))
   const fullyReceivedAfter = lines.every(
-    (line) => line.qtyReceived + (receivedById.get(line.id) ?? 0) >= line.qty,
+    (line) => line.landed.qtyNumber + (receivedById.get(line.id) ?? 0) >= line.qty,
   )
   return { plan, fullyReceivedAfter }
 }

@@ -1,6 +1,8 @@
 import assert from 'node:assert/strict'
+import { readFileSync, readdirSync, type Dirent } from 'node:fs'
+import { join } from 'node:path'
 import test from 'node:test'
-import { StockMovementType } from '../../../app/generated/prisma/client.ts'
+import { StockMovementType, StockTransferStatus } from '../../../app/generated/prisma/client.ts'
 import {
   COGS_ENTRY_EXCLUDED_MOVEMENT_TYPES,
   LAYER_CONSUMING_MOVEMENT_TYPES_WITHOUT_COGS_ENTRIES,
@@ -8,11 +10,23 @@ import {
   REVALUATION_ACCEPTED_TRADEOFF_MOVEMENT_TYPES,
   REVALUATION_EXCLUDED_MOVEMENT_TYPES,
   REVALUATION_KNOWN_GAP_MOVEMENT_TYPES,
+  STOCK_TRANSFER_SOURCE_LAYER_CONSUMPTION,
   TRANSFER_SNAPSHOT_EXCLUDED_MOVEMENT_TYPES,
+  TRANSFER_STATUSES_WITH_OUTSTANDING_SOURCE_CONSUMPTION,
 } from '../../../lib/domain/inventory/movement-cogs-relevance.ts'
+import * as movementCogsRelevance from '../../../lib/domain/inventory/movement-cogs-relevance.ts'
+import { sliceTransferSnapshotForReceipt } from '../../../lib/domain/wms/asn-reconciliation.ts'
+import { resolveTransferLineLandedQty } from '../../../lib/domain/inventory/transfer-landed-quantity.ts'
+
+/** The slicer's offset is the branded landed quantity (6oyu.19 Codex r6). */
+function landedFromReceipts(qtyReceived: number) {
+  return resolveTransferLineLandedQty({ transferLineId: 'tl-1', qtyReceived, wmsAsnLines: [] })
+}
+import { STOCK_TRANSFER_TRANSITIONS } from '../../../lib/domain/workflows/stock-transfer-state.ts'
 import { REVALUATION_EXCLUSION_QUERY_MOVEMENT_TYPES } from '../../../lib/cost-layers.ts'
 
 const ALL_MOVEMENT_TYPES = Object.values(StockMovementType) as StockMovementType[]
+const ALL_TRANSFER_STATUSES = Object.values(StockTransferStatus) as StockTransferStatus[]
 
 test('every StockMovementType is classified against customer COGS (6oyu.7)', () => {
   // The registry is typed Record<StockMovementType, ...>, so an unclassified new
@@ -135,4 +149,272 @@ test('accepted trade-offs are exactly the ones decided (6oyu.20)', () => {
   for (const type of REVALUATION_ACCEPTED_TRADEOFF_MOVEMENT_TYPES) {
     assert.ok(!REVALUATION_EXCLUDED_MOVEMENT_TYPES.includes(type), `${type}: accepted into COGS, so it must not be excluded`)
   }
+})
+
+test('every StockTransferStatus is classified for source-layer consumption (6oyu.19)', () => {
+  // Typed Record<StockTransferStatus, ...>, so an unclassified new status is a
+  // compile error. Asserted at runtime too, to catch the generated client and the
+  // registry drifting apart after a DB enum change.
+  const missing = ALL_TRANSFER_STATUSES.filter((status) => !(status in STOCK_TRANSFER_SOURCE_LAYER_CONSUMPTION))
+  assert.deepEqual(missing, [], `unclassified transfer statuses: ${missing.join(', ')}`)
+
+  const extra = Object.keys(STOCK_TRANSFER_SOURCE_LAYER_CONSUMPTION).filter(
+    (status) => !ALL_TRANSFER_STATUSES.includes(status as StockTransferStatus),
+  )
+  assert.deepEqual(extra, [], `registry classifies non-existent transfer statuses: ${extra.join(', ')}`)
+
+  for (const status of ALL_TRANSFER_STATUSES) {
+    assert.ok(
+      STOCK_TRANSFER_SOURCE_LAYER_CONSUMPTION[status].note.trim().length > 0,
+      `${status}: must say WHY, since this list is what the exclusion query filters on`,
+    )
+  }
+})
+
+test('a cancelled dispatch still counts as outstanding source consumption (6oyu.19)', () => {
+  // The load-bearing entry. cancelDispatchedTransfer (IN_TRANSIT -> CANCELLED,
+  // audit-C5) does NOT un-consume the original source layers: it creates
+  // REPLACEMENT layers and links them back with a costLayerSourceLine, so
+  // propagateLandedCostToOutputs carries the revaluation delta onto the
+  // replacement exactly as it does onto a transfer destination. Leaving CANCELLED
+  // out of this list posts the delta as COGS on the original layer as well —
+  // 6oyu.19's double count, reached through the cancel path instead of receipt.
+  assert.deepEqual(TRANSFER_STATUSES_WITH_OUTSTANDING_SOURCE_CONSUMPTION, ['CANCELLED', 'IN_TRANSIT', 'RECEIVED'])
+  assert.equal(STOCK_TRANSFER_SOURCE_LAYER_CONSUMPTION.CANCELLED.consumption, 'OUTSTANDING_PROPAGATABLE')
+  // DRAFT never dispatched, so it consumed nothing and wrote no snapshot.
+  assert.equal(STOCK_TRANSFER_SOURCE_LAYER_CONSUMPTION.DRAFT.consumption, 'NOT_DISPATCHED')
+  assert.ok(!TRANSFER_STATUSES_WITH_OUTSTANDING_SOURCE_CONSUMPTION.includes('DRAFT'))
+})
+
+test('IN_TRANSIT is outstanding, and the registry does NOT claim a destination layer either way (Codex r4 MEDIUM)', () => {
+  // The whole point of splitting OUTSTANDING. The old single value justified the
+  // COGS exclusion by "the delta reaches the units through a replacement or
+  // destination layer" — true for RECEIVED and CANCELLED, and NOT ASSURED for
+  // IN_TRANSIT. Both halves are asserted, because either alone misstates the
+  // contract: dropping IN_TRANSIT from the exclusion list is 6oyu.19 (spurious
+  // COGS), and calling it OUTSTANDING_PROPAGATABLE is the overstatement this split
+  // exists to remove.
+  assert.equal(
+    STOCK_TRANSFER_SOURCE_LAYER_CONSUMPTION.IN_TRANSIT.consumption,
+    'OUTSTANDING_DESTINATION_LAYER_NOT_ASSURED',
+  )
+  assert.ok(
+    TRANSFER_STATUSES_WITH_OUTSTANDING_SOURCE_CONSUMPTION.includes('IN_TRANSIT'),
+    'IN_TRANSIT units were moved, not sold — they must still be excluded from retrospective COGS',
+  )
+
+  // The statuses that stayed OUTSTANDING_PROPAGATABLE must genuinely have a layer to
+  // propagate into — asserted by name so that reclassifying one without giving it a
+  // destination layer fails here rather than silently stranding value.
+  for (const status of TRANSFER_STATUSES_WITH_OUTSTANDING_SOURCE_CONSUMPTION) {
+    if (status === 'IN_TRANSIT') continue
+    assert.equal(
+      STOCK_TRANSFER_SOURCE_LAYER_CONSUMPTION[status].consumption,
+      'OUTSTANDING_PROPAGATABLE',
+      `${status}: excluded from COGS, so a linked layer MUST already exist to carry the delta`,
+    )
+  }
+})
+
+test('no status-level export may claim IN_TRANSIT has no destination layer (Codex r4 MEDIUM)', () => {
+  // THE FINDING. A partial receipt leaves the transfer IN_TRANSIT after creating
+  // linked destination layers, and a WMS stock-sync alignment creates them without
+  // touching the status at all. The withdrawn
+  // CONSUMPTION_HAS_NO_COMPLETION_PATH / TRANSFER_STATUSES_WITH_NO_COMPLETION_PATH
+  // pair answered `true` for IN_TRANSIT regardless, so any future consumer reusing
+  // them would classify already-landed units as having nowhere to send a delta. The
+  // SQL was unharmed only because both outstanding categories map to `true`.
+  //
+  // Precondition, established with the REAL slicer rather than asserted: a receipt of
+  // part of a line consumes part of the snapshot and leaves the rest behind, which is
+  // what "still IN_TRANSIT with destination layers already created" means. If this
+  // ever stopped being reachable the test below would be guarding nothing.
+  const snapshot = [{ costLayerId: 'layer-src', qty: '10.000000', unitCostBase: '5.000000' }]
+  const firstReceipt = sliceTransferSnapshotForReceipt({ snapshot, alreadyLanded: landedFromReceipts(0), qtyReceived: 4 })
+  const stillInTransit = sliceTransferSnapshotForReceipt({ snapshot, alreadyLanded: landedFromReceipts(4), qtyReceived: 6 })
+  assert.equal(
+    firstReceipt.reduce((sum, entry) => sum + Number(entry.qty), 0),
+    4,
+    'precondition: a partial receipt draws a real slice — those units get linked destination layers',
+  )
+  assert.equal(
+    stillInTransit.reduce((sum, entry) => sum + Number(entry.qty), 0),
+    6,
+    'precondition: and 6 units are still in transit under the SAME IN_TRANSIT status',
+  )
+
+  const exported = Object.keys(movementCogsRelevance)
+  assert.ok(exported.length > 5, `precondition: the module really was loaded (saw ${exported.length} exports)`)
+  for (const name of ['CONSUMPTION_HAS_NO_COMPLETION_PATH', 'TRANSFER_STATUSES_WITH_NO_COMPLETION_PATH']) {
+    assert.ok(
+      !exported.includes(name),
+      `${name} keys a per-line fact (qty less qtyReceived) on the transfer STATUS, which cannot express it`,
+    )
+  }
+
+  // And no OTHER status-keyed export may quietly reintroduce the same claim by
+  // singling IN_TRANSIT out as the one status with something missing.
+  for (const [name, value] of Object.entries(movementCogsRelevance)) {
+    if (!Array.isArray(value)) continue
+    if (name === 'TRANSFER_STATUSES_WITH_OUTSTANDING_SOURCE_CONSUMPTION') continue
+    assert.notDeepEqual(
+      [...value].sort(),
+      ['IN_TRANSIT'],
+      `${name}: an IN_TRANSIT-only status list is the invariant this finding removed`,
+    )
+  }
+
+  // The note must not assert the absence either — a test pinning prose that is wrong
+  // pins the error, which is why the old /KNOWN GAP/ match was replaced by this.
+  const note = STOCK_TRANSFER_SOURCE_LAYER_CONSUMPTION.IN_TRANSIT.note
+  assert.doesNotMatch(
+    note,
+    /NO layer holds these units/,
+    'a partly-received transfer is IN_TRANSIT with some of its units fully layered',
+  )
+  assert.match(note, /o3d-nrl4/, 'the residue that IS uncovered must still be named and tracked')
+})
+
+test('the transfer-status list is NOT derived from the transfer state machine (6oyu.19)', () => {
+  // Why this test exists: STOCK_TRANSFER_TRANSITIONS models the plain cancel path
+  // only and states IN_TRANSIT -> RECEIVED as the sole exit from IN_TRANSIT.
+  // cancelDispatchedTransfer deliberately performs IN_TRANSIT -> CANCELLED outside
+  // the machine. The first fix for 6oyu.19 trusted the map and hard-coded
+  // ('IN_TRANSIT', 'RECEIVED'), which is precisely how the cancelled-dispatch case
+  // stayed broken. Assert the divergence so that "just derive it from the state
+  // machine" is never a tidy-up someone makes.
+  assert.deepEqual(STOCK_TRANSFER_TRANSITIONS.IN_TRANSIT, ['RECEIVED'])
+  const reachableFromInTransit = new Set<string>(STOCK_TRANSFER_TRANSITIONS.IN_TRANSIT)
+  assert.ok(
+    !reachableFromInTransit.has('CANCELLED'),
+    'if the machine ever models IN_TRANSIT -> CANCELLED, re-read this test before deriving the list from it',
+  )
+  assert.ok(
+    TRANSFER_STATUSES_WITH_OUTSTANDING_SOURCE_CONSUMPTION.includes('CANCELLED'),
+    'CANCELLED is only reachable post-dispatch via a path the state machine does not model',
+  )
+})
+
+// ---------------------------------------------------------------------------
+// The retired claim, wherever it appears (Codex r5 LOW)
+// ---------------------------------------------------------------------------
+
+/**
+ * The classification value IN_TRANSIT used to carry. Assembled from parts so that
+ * this file is not itself an offender and needs no self-exemption — a census that
+ * excuses itself is one edit away from excusing the thing it is looking for.
+ */
+const RETIRED_IN_TRANSIT_CONSUMPTION = 'OUTSTANDING' + '_AWAITING_DESTINATION_LAYER'
+
+/** The vocabulary the registry actually defines today, DERIVED rather than restated. */
+const LIVE_CONSUMPTION_VALUES = new Set(
+  Object.values(STOCK_TRANSFER_SOURCE_LAYER_CONSUMPTION).map((entry) => entry.consumption as string),
+)
+
+const CLAIM_CENSUS_ROOTS = ['app', 'lib', 'components', 'docs', 'help-docs', 'prisma', 'scripts', 'tests', 'e2e']
+const CLAIM_CENSUS_EXTENSIONS = ['.ts', '.tsx', '.md', '.mdx', '.mjs', '.sql']
+const IMPROVEMENT_PLAN = join('docs', 'todo', 'ims-improvement-plan-2026-07.md')
+
+function walkTextFiles(dir: string, out: string[] = []): string[] {
+  let entries: Dirent[]
+  try {
+    entries = readdirSync(dir, { withFileTypes: true })
+  } catch {
+    return out
+  }
+  for (const entry of entries) {
+    if (entry.name === 'node_modules' || entry.name === 'generated' || entry.name === '.next') continue
+    // Skip symlinks rather than following them: docs/ is a symlink farm into
+    // help-docs/, which this walk visits directly, so following would double-count
+    // and could escape the repository entirely.
+    if (entry.isSymbolicLink()) continue
+    const full = join(dir, entry.name)
+    if (entry.isDirectory()) walkTextFiles(full, out)
+    else if (CLAIM_CENSUS_EXTENSIONS.some((extension) => full.endsWith(extension))) out.push(full)
+  }
+  return out
+}
+
+test('no file anywhere classifies IN_TRANSIT under the retired value (Codex r5 LOW)', () => {
+  // WHY THE SUBJECT MOVED OFF THE EXPORT LIST. The round-4 test asked this module what
+  // it exports and asked one note for one exact phrase. Both passed while
+  // docs/todo/ims-improvement-plan-2026-07.md still named the deleted classification
+  // and still asserted, in prose, that an IN_TRANSIT transfer has no destination
+  // layer — the invariant the change existed to remove. A test whose subject is one
+  // module cannot police a claim the repository makes somewhere else.
+  //
+  // WHAT THE SUBJECT IS INSTEAD, and why it is not a third pattern over English: the
+  // classification VOCABULARY is a closed set, derived above from the registry itself.
+  // A file naming a value the registry no longer defines is stale by construction,
+  // with no proximity rule and no grammar to argue about.
+  //
+  // WHAT IT DELIBERATELY DOES NOT COVER, stated rather than implied. The two retired
+  // EXPORT names (CONSUMPTION_HAS_… / TRANSFER_STATUSES_WITH_…) are NOT banned
+  // repo-wide, because the tombstone comments in movement-cogs-relevance.ts and the
+  // plan document legitimately name them to record that they were removed and why —
+  // and those tombstones are worth more than the rule would be. Their absence from
+  // the module is asserted separately, above. Free prose that re-asserts the claim
+  // without naming any value at all is not caught by anything here.
+  assert.ok(
+    !LIVE_CONSUMPTION_VALUES.has(RETIRED_IN_TRANSIT_CONSUMPTION),
+    'precondition: the banned value must be genuinely retired, not one the registry still uses',
+  )
+  assert.equal(
+    STOCK_TRANSFER_SOURCE_LAYER_CONSUMPTION.IN_TRANSIT.consumption,
+    'OUTSTANDING_DESTINATION_LAYER_NOT_ASSURED',
+    'precondition: the value that replaced it',
+  )
+
+  const files = CLAIM_CENSUS_ROOTS.flatMap((root) => walkTextFiles(root))
+  assert.ok(files.length > 500, `precondition: the walk must reach the repository (saw ${files.length} files)`)
+  assert.ok(
+    files.includes(IMPROVEMENT_PLAN),
+    'precondition: the walk must reach the improvement plan — the document that carried the stale claim',
+  )
+
+  const offenders = files
+    .filter((file) => readFileSync(file, 'utf8').includes(RETIRED_IN_TRANSIT_CONSUMPTION))
+    .map((file) => {
+      const source = readFileSync(file, 'utf8')
+      return `${file}:${source.slice(0, source.indexOf(RETIRED_IN_TRANSIT_CONSUMPTION)).split('\n').length}`
+    })
+
+  assert.deepEqual(
+    offenders,
+    [],
+    `${RETIRED_IN_TRANSIT_CONSUMPTION} no longer exists. A transfer STATUS cannot say whether ` +
+    'destination layers exist: a partial receipt and the WMS stock-sync alignment both leave a transfer ' +
+    'IN_TRANSIT with linked destination layers already created, and the uncovered residue is a ' +
+    `LINE-LEVEL quantity (qty less qtyReceived), tracked as o3d-nrl4. Say ` +
+    `${STOCK_TRANSFER_SOURCE_LAYER_CONSUMPTION.IN_TRANSIT.consumption} instead — including in a ` +
+    `tombstone, which can record the rename without re-using the dead value:\n${offenders.join('\n')}`,
+  )
+})
+
+test('the improvement plan describes IN_TRANSIT as the registry does (Codex r5 LOW)', () => {
+  // The specific document the finding was about, tied to the registry rather than to a
+  // phrase. It named the retired value and asserted no destination layer exists; it
+  // must now name the live one, so that a rename cannot leave it silently stale again.
+  const plan = readFileSync(IMPROVEMENT_PLAN, 'utf8')
+  assert.ok(plan.length > 5_000, `precondition: the plan was really read (saw ${plan.length} chars)`)
+  assert.ok(
+    plan.includes(STOCK_TRANSFER_SOURCE_LAYER_CONSUMPTION.IN_TRANSIT.consumption),
+    `${IMPROVEMENT_PLAN}: must name the classification IN_TRANSIT actually carries ` +
+    `(${STOCK_TRANSFER_SOURCE_LAYER_CONSUMPTION.IN_TRANSIT.consumption})`,
+  )
+  assert.ok(
+    plan.includes('o3d-nrl4'),
+    `${IMPROVEMENT_PLAN}: must still name the gap that IS open`,
+  )
+})
+
+test('the retired-value census would FAIL if the value came back (not vacuous)', () => {
+  // Proof the matcher and the walk both work, without reintroducing the value.
+  const revived = `> IN_TRANSIT is classified ${RETIRED_IN_TRANSIT_CONSUMPTION}, where no layer exists yet.`
+  assert.ok(revived.includes(RETIRED_IN_TRANSIT_CONSUMPTION))
+  // And that the banned string is the real retired value rather than a typo that could
+  // never match: it is the live value's own stem under the old, wrong ordering.
+  assert.ok(RETIRED_IN_TRANSIT_CONSUMPTION.startsWith('OUTSTANDING_'))
+  assert.ok(RETIRED_IN_TRANSIT_CONSUMPTION.endsWith('_DESTINATION_LAYER'))
+  assert.notEqual(RETIRED_IN_TRANSIT_CONSUMPTION, STOCK_TRANSFER_SOURCE_LAYER_CONSUMPTION.IN_TRANSIT.consumption)
 })

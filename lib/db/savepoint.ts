@@ -78,6 +78,69 @@ function isNoActiveTransaction(error: unknown): boolean {
 let savepointSeq = 0
 
 /**
+ * How many savepoints THIS module currently has open on a given client.
+ *
+ * Exported (through `openSavepointDepth`) for one caller: a helper whose refusal
+ * works by putting Postgres into aborted-transaction state, which `ROLLBACK TO
+ * SAVEPOINT` would clear. Runtime state on the client object rather than a static
+ * scan for the identifier `withSavepoint`, so an alias, a re-export, or a savepoint
+ * opened three frames up the stack is seen just the same.
+ *
+ * A WeakMap keyed on the client: transaction clients are short-lived and this must
+ * not keep them alive.
+ */
+const OPEN_SAVEPOINT_DEPTH = new WeakMap<object, number>()
+
+/** Savepoints this module has open on `client` right now. */
+export function openSavepointDepth(client: object): number {
+  return OPEN_SAVEPOINT_DEPTH.get(client) ?? 0
+}
+
+function pushSavepointDepth(client: object): void {
+  OPEN_SAVEPOINT_DEPTH.set(client, openSavepointDepth(client) + 1)
+}
+
+function popSavepointDepth(client: object): void {
+  const next = openSavepointDepth(client) - 1
+  if (next <= 0) OPEN_SAVEPOINT_DEPTH.delete(client)
+  else OPEN_SAVEPOINT_DEPTH.set(client, next)
+}
+
+/**
+ * Is `client` running inside an explicit transaction block?
+ *
+ * ASKED OF THE DATABASE, not inferred from the object. Prisma's TYPE for a
+ * transaction client omits `$transaction`, but the runtime object still exposes it
+ * as a function (see `withSavepoint`'s comment), so there is no structural test —
+ * and a test based on where the CALL SITE sits in the source cannot see a boundary
+ * that lives in the caller, which is why the static census this replaced accepted
+ * `applyTransferLineReceipt`'s call as unguarded.
+ *
+ * `SAVEPOINT` is the discriminator: PostgreSQL raises 25P01
+ * (`no_active_sql_transaction`) for it outside a transaction block and accepts it
+ * inside one. The probe savepoint is released immediately, so it leaves nothing for
+ * a later `ROLLBACK TO SAVEPOINT` to reach and does not change what an abort means.
+ *
+ * Returns `null` when the client exposes no raw escape hatch at all — the caller
+ * decides whether "cannot tell" is fatal. It is for the transfer cost-layer helper.
+ */
+export async function isClientInsideTransaction(client: object): Promise<boolean | null> {
+  const raw = asRawCapable(client)
+  if (typeof raw.$executeRawUnsafe !== 'function') return null
+  const runRaw = (sql: string) => raw.$executeRawUnsafe!(sql)
+  const name = `ims_txprobe_${++savepointSeq}`
+  try {
+    await runRaw(`SAVEPOINT ${name}`)
+  } catch (error) {
+    if (isNoActiveTransaction(error)) return false
+    // Any other failure is a real problem and must not be read as "in a transaction".
+    throw error
+  }
+  await runRaw(`RELEASE SAVEPOINT ${name}`)
+  return true
+}
+
+/**
  * Run `fn` so that a failure inside it does NOT poison the surrounding transaction.
  *
  * On success the savepoint is released; on failure the transaction is rolled back to it and the
@@ -114,6 +177,9 @@ export async function withSavepoint<T>(client: object, fn: () => Promise<T>): Pr
     return fn()
   }
 
+  // Recorded only once the savepoint actually EXISTS, and dropped in `finally` however
+  // `fn` ends, so `openSavepointDepth` answers for savepoints that are really open.
+  pushSavepointDepth(client)
   try {
     const result = await fn()
     // Releasing keeps the savepoint stack from growing across a long loop of guarded inserts.
@@ -124,5 +190,7 @@ export async function withSavepoint<T>(client: object, fn: () => Promise<T>): Pr
     await runRaw(`ROLLBACK TO SAVEPOINT ${name}`)
     await runRaw(`RELEASE SAVEPOINT ${name}`)
     throw error
+  } finally {
+    popSavepointDepth(client)
   }
 }
