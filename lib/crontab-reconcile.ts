@@ -204,7 +204,9 @@ async function applyCrontabFromSettings(
  *
  * `crontab -` exiting 0 establishes that the command was issued and did not complain. It does not
  * establish that the schedule exists, and those two come apart on exactly the deployment this app
- * ships a unit for: `/usr/bin/crontab` is setgid `crontab`, `NoNewPrivileges=true` in
+ * ships a HARDENED unit for (the units `scripts/install.sh` generates do not set
+ * `NoNewPrivileges`, so the setgid transition carries them and this divergence does not arise
+ * there): `/usr/bin/crontab` is setgid `crontab`, `NoNewPrivileges=true` in
  * deploy/systemd/ims-stage.service makes the kernel ignore that setgid bit, and the spool is
  * `drwx-wx--T root:crontab` — so the binary runs as the plain service user with no access to the
  * spool at all. Measured on the deployment host: identical binary, identical user, `crontab -l`
@@ -240,10 +242,13 @@ async function confirmOtiBlockInstalled(expected: string[]): Promise<{ success: 
     return {
       success: false,
       error: '`crontab -` reported success but the crontab does not contain the schedule that was '
-        + 'just written, so the scheduler is NOT up to date. A crontab command that exits 0 without '
-        + 'installing anything is what a sandboxed unit produces when it cannot reach the cron '
-        + 'spool — check SupplementaryGroups=crontab and ReadWritePaths=/var/spool/cron/crontabs on '
-        + 'the service unit.',
+        + 'just written, so the scheduler is NOT up to date. This is NOT the sandboxed-unit case: a '
+        + 'unit that cannot reach the spool fails the read this function performs before the write, '
+        + 'and the reconciliation stops there. Reaching HERE means the read worked, the write was '
+        + 'accepted, and the spool still holds something else — so look at what else writes this '
+        + "crontab outside the app's lock (a `crontab -e` by hand, a configuration-management run, "
+        + 'an edit to the spool file as root), and at whether `crontab` on PATH is the client you '
+        + 'think it is.',
     }
   }
   return { success: true }
