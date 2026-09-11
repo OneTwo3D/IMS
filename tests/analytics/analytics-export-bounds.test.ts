@@ -218,21 +218,20 @@ test('profitability CSV: Profit gets its own bound column instead of borrowing R
     const { ProductProfitabilityClient } = await import('@/app/(dashboard)/analytics/product-profitability/product-profitability-client')
     const mounted = mountClientComponent(ProductProfitabilityClient as unknown as (props: unknown) => unknown, {
       data: {
+        // o3d-la3n r2: the FY block is the public view model — each amount unrounded, paired with
+        // the INTERVAL its truth occupies, and with no completeness boolean for a reader to rebuild
+        // the old `!complete && gross + unknown >= 0 ⇒ ≤` rule from.
         rows: [{
           productId: 'p1', sku: 'SKU-1', name: 'Widget', type: 'SIMPLE', lifecycleStatus: 'ACTIVE',
           totalStock: 0, salesPrice: null, salePrice: null, latestCogs: null,
           unitMargin: null, unitMarginPct: null,
-          currentFyRevenue: 100, currentFyRefundsGrossBasis: 120, currentFyRefundsUnknownBasis: 0,
-          currentFyRefundBasisComplete: false, currentFyCogs: 40, currentFyProfit: 60, currentFyQtySold: 1,
-          previousFyRevenue: 50, previousFyRefundsGrossBasis: 0, previousFyRefundsUnknownBasis: 0,
-          previousFyRefundBasisComplete: true, previousFyCogs: 20, previousFyProfit: 30, previousFyQtySold: 1,
+          currentFy: { revenue: 100, cogs: 40, profit: 60, qtySold: 1, bound: { lower: -120, upper: 0 }, refundsGrossBasis: 120, refundsUnknownBasis: 0 },
+          previousFy: { revenue: 50, cogs: 20, profit: 30, qtySold: 1, bound: { lower: 0, upper: 0 }, refundsGrossBasis: 0, refundsUnknownBasis: 0 },
         }],
         summary: {
           totalProducts: 1,
-          currentFyRevenue: 100, currentFyRefundsGrossBasis: 120, currentFyRefundsUnknownBasis: 0,
-          currentFyRefundBasisComplete: false, currentFyCogs: 40, currentFyProfit: 60,
-          previousFyRevenue: 50, previousFyRefundsGrossBasis: 0, previousFyRefundsUnknownBasis: 0,
-          previousFyRefundBasisComplete: true, previousFyCogs: 20, previousFyProfit: 30,
+          currentFy: { revenue: 100, cogs: 40, profit: 60, qtySold: 1, bound: { lower: -120, upper: 0 }, refundsGrossBasis: 120, refundsUnknownBasis: 0 },
+          previousFy: { revenue: 50, cogs: 20, profit: 30, qtySold: 1, bound: { lower: 0, upper: 0 }, refundsGrossBasis: 0, refundsUnknownBasis: 0 },
           fyLabel: 'FY26', prevFyLabel: 'FY25',
         },
       },
