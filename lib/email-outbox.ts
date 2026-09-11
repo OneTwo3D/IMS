@@ -461,9 +461,16 @@ export type ProcessEmailOutboxResult = {
   failed: number
   /**
    * Rows this worker claimed, HANDED TO THE SENDER, and was then refused the terminal write for,
-   * because another worker had reclaimed the row while this one was on the SMTP socket. Non-zero
+   * because another worker had reclaimed the row AFTER this one had entered the sender. Non-zero
    * means a duplicate send almost certainly went out — it is the only signal that says so, and it
    * used to be silent (the unfenced `update` simply landed).
+   *
+   * "AFTER IT ENTERED THE SENDER", NOT "WHILE IT WAS ON THE SMTP SOCKET" (r22). Both readings used
+   * to be written here, and the second is false on the two paths r22 added arms for: the suppression
+   * upsert and the terminal settlement write both run once the sender has RETURNED, so a row counted
+   * here can have lost its claim while this worker was in a DATABASE call and not on a socket at all.
+   * What the counter actually means is unchanged and is the weaker of the two claims — this worker
+   * may have put a message on the wire — so it is the one stated.
    *
    * ONLY POST-SEND REFUSALS ARE COUNTED HERE (r18, Codex MEDIUM). A claim can also be lost BEFORE
    * any send is attempted — the suppression lookup sits between the claim and the sender, and both
@@ -997,7 +1004,7 @@ export async function processPendingEmailOutbox(
   })
 
   /**
-   * Record a refused terminal write, SAYING WHETHER THIS WORKER HAD TOUCHED THE SMTP SOCKET.
+   * Record a refused terminal write, SAYING WHETHER THIS WORKER HAD ENTERED THE SENDER.
    *
    * Those are different facts and they used to be reported as one (r18, Codex MEDIUM). The
    * suppression lookup runs AFTER the claim and BEFORE the sender, so a worker can lose the row
@@ -1027,7 +1034,13 @@ export async function processPendingEmailOutbox(
       result.conflicted++
       console.error(
         `[email-outbox] row ${claim.id}: terminal write REFUSED after ${phase} — the claim ${claim.token} `
-        + 'was reclaimed by another worker while this one was on the SMTP socket (o3d-alnk). '
+        // NOT "while this one was on the SMTP socket" (r22). That sentence was written when the only
+        // `attempted` outcomes were a send that returned or a send that threw; the two arms r22 added
+        // — a suppression upsert and a settlement write that throw ONCE THE SENDER HAS RETURNED —
+        // lose the claim while this worker is in a DATABASE call, so the socket clause contradicted
+        // the very `phase` printed two words earlier. The claim that holds on all four is the one the
+        // counter is actually about: the sender was ENTERED, so a message may be on the wire.
+        + 'was reclaimed by another worker after this one had ENTERED the sender (o3d-alnk). '
         + 'A duplicate delivery is likely; the row was NOT re-armed.',
       )
       return

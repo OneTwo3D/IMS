@@ -1107,3 +1107,111 @@ test('r22: `thrownPhase` enumerates the try, and every arm is distinct', () => {
     'the suppression upsert inside the `try` is no longer routed through the progress record',
   )
 })
+
+test('r22: the SENTENCE around the phrase is true on the post-send arms too, not just the phrase', async () => {
+  // THE HALF THE PHRASE FIX LEFT STANDING. `recordConflict` prints `${phase}` inside a fixed
+  // sentence, and that sentence said the claim "was reclaimed by another worker while this one was
+  // ON THE SMTP SOCKET". That was written when the only `attempted` outcomes were a send that
+  // returned and a send that threw. The two arms this round added — a suppression upsert and a
+  // settlement write that throw once the sender HAS RETURNED — lose the claim while this worker is
+  // in a DATABASE call, so the sentence contradicted the phrase printed two words earlier in the
+  // same line: "…after a thrown settlement write, after the sender had reported the email
+  // DELIVERED — the claim … was reclaimed while this one was on the SMTP socket".
+  //
+  // An operator reads ONE line, not a phrase. Fixing the phrase and leaving the sentence is the
+  // same defect this path has now produced four rounds running: one rule, several readers, one of
+  // them fixed. So the clause states what is true on ALL FOUR `attempted` outcomes — the sender was
+  // ENTERED — which is also exactly what the counter means.
+  const onTheSocket: string[] = []
+
+  for (const [why, options, sender] of [
+    [
+      'a suppression upsert that threw AFTER an invalid-recipient answer',
+      { throwOnFirstSuppressionUpsert: true },
+      async () => ({ success: false, invalidRecipient: true, error: '550 5.1.1 unknown mailbox' }),
+    ],
+    [
+      'a settlement write that threw AFTER a DELIVERED answer',
+      { throwOnFirstTerminalWrite: true },
+      async () => ({ success: true }),
+    ],
+  ] as [string, { throwOnFirstSuppressionUpsert?: boolean; throwOnFirstTerminalWrite?: boolean }, () => Promise<{
+    success: boolean
+    invalidRecipient?: boolean
+    error?: string
+  }>][]) {
+    const fixture = makeClient([makeRow()], {
+      throwOnFirstSuppressionUpsert: options.throwOnFirstSuppressionUpsert
+        ? () => { fixture.rows[0].lockedBy = 'another-worker' }
+        : undefined,
+      throwOnFirstTerminalWrite: options.throwOnFirstTerminalWrite
+        ? () => { fixture.rows[0].lockedBy = 'another-worker' }
+        : undefined,
+    })
+
+    const { result, logged } = await drainCapturingLog({
+      client: fixture.client,
+      now: () => T0,
+      prepareQueuedEmail: noPrepare,
+      logActivity: noLog,
+      sendEmail: sender,
+    })
+
+    // PRECONDITION: this really is a post-send refusal, or the assertions below prove nothing.
+    assert.equal(result.conflicted, 1, `${why}: the terminal write was not refused, so nothing was logged`)
+
+    const conflict = logged.find((line) => line.includes('terminal write REFUSED'))
+    assert.ok(conflict, `${why}: no conflict was logged; captured: ${JSON.stringify(logged)}`)
+    if (/on the SMTP socket/.test(conflict)) onTheSocket.push(`${why}: ${conflict}`)
+    assert.match(
+      conflict,
+      /was reclaimed by another worker after this one had ENTERED the sender/,
+      `${why}: the sentence no longer states the claim that is true on every \`attempted\` outcome`,
+    )
+  }
+
+  assert.deepEqual(
+    onTheSocket,
+    [],
+    'a conflict whose THROW came from a database call after the sender returned still tells an operator '
+    + 'the worker was on the SMTP socket, which sends them after a mail transport that was never involved',
+  )
+
+  // NON-VACUITY, BOTH WAYS. The clause is not simply absent everywhere: the genuinely-on-the-socket
+  // path still reports a probable duplicate, and the no-send path still reports the opposite — so
+  // this test cannot pass by the sentence having lost its meaning.
+  const thrownSend = makeClient([makeRow()])
+  const thrown = await drainCapturingLog({
+    client: thrownSend.client,
+    now: () => T0,
+    prepareQueuedEmail: noPrepare,
+    logActivity: noLog,
+    async sendEmail() {
+      thrownSend.rows[0].lockedBy = 'another-worker'
+      throw new Error('the connection died mid-DATA')
+    },
+  })
+  const thrownLine = thrown.logged.find((line) => line.includes('terminal write REFUSED'))
+  assert.ok(thrownLine, 'no conflict was logged for a thrown send')
+  assert.match(thrownLine, /after a thrown send/)
+  assert.match(thrownLine, /was reclaimed by another worker after this one had ENTERED the sender/)
+  assert.match(thrownLine, /A duplicate delivery is likely/)
+
+  const beforeTheSend = makeClient([makeRow()])
+  const before = await drainCapturingLog({
+    client: beforeTheSend.client,
+    now: () => T0,
+    logActivity: noLog,
+    async prepareQueuedEmail() {
+      beforeTheSend.rows[0].lockedBy = 'another-worker'
+      throw new Error('the invoice PDF could not be rendered')
+    },
+    async sendEmail() {
+      throw new Error('the sender must not be reached on this path')
+    },
+  })
+  const beforeLine = before.logged.find((line) => line.includes('terminal write REFUSED'))
+  assert.ok(beforeLine, 'no conflict was logged for a throw before the send')
+  assert.match(beforeLine, /BEFORE this one attempted any send/)
+  assert.match(beforeLine, /THIS WORKER DELIVERED NOTHING/)
+})
