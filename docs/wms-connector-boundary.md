@@ -16,10 +16,21 @@ This mirrors the shopping (`shopping-registry.ts`) and accounting
   `WMS_CONNECTOR_IDS` / `WmsConnectorId` (the single source of truth for connector
   ids) and `isWmsConnectorId`. This module is server-free so client components can
   import the id guard.
-- **`lib/connectors/wms/registry.ts`** — `WMS_CONNECTORS` descriptors +
-  `getWmsConnector(id)` (resolves the connector implementation).
+- **`lib/connectors/wms/registry.ts`** — `BUILT_IN_WMS_CONNECTOR_REGISTRATIONS` +
+  `getWmsConnector(id)` (resolves the connector implementation). The registry is the id
+  list **crossed with one definition each**: the record is
+  `Record<WmsConnectorId, WmsConnectorRegistration>` (a definition *minus* its id, which
+  the key supplies), and `createRegisteredWmsConnectorRegistry(ids, registrations)` walks
+  `WMS_CONNECTOR_IDS`. A registered id with no definition is a `tsc` error; a definition
+  for an unregistered id is an excess-property error; and because a build can still reach
+  the runtime with the two disagreeing (a `mock.module`, a JavaScript caller, a
+  mixed-version deploy) the derivation **throws at module evaluation, naming the id**
+  (round 12). `BUILT_IN_WMS_CONNECTORS` / `WMS_CONNECTORS` are the registry's own list.
 - **`lib/connectors/wms/active-connector.ts`** — `getActiveWmsConnectorId()` (the
-  enabled WMS connector, with a single-connector fallback).
+  enabled WMS connector, with a single-connector fallback),
+  `getEnabledWmsConnectorId()` (no fallback) and
+  `resolveEnabledWmsConnectorSelection()` (the same answer with its *reason*, for the
+  callers that put a sentence in front of an operator).
 - **`lib/connectors/wms/asn-types.ts`** — connector-agnostic ASN view-models.
 - **`lib/connectors/wms/order-lookup.ts`** — `resolveWmsOrderLookupConnector`.
 
@@ -103,6 +114,43 @@ always some *other* warehouse's answer and getting it wrong is silent:
 - **`WmsConnectorDef.createReplayPolicy`** — whether the warehouse's own create
   refuses a duplicate. Required, so a new connector fails `tsc` until it is written
   down.
+- **`WmsConnectorDef.available`** — whether this build **offers** the connector to
+  operators. See below.
+
+## `available`: registered, and not offered
+
+`available: false` means "registered but not offered to operators yet". Until round 12
+**nothing read it**: the registry-derived Settings toggles (round 8) and the
+registry-derived `/sync` cards (round 6) walked every registered id, and the `/sync` grid
+wrote `available: true` into every WMS card itself — a second source for a fact the
+definition already states. A staged connector got a live switch, could be enabled by
+either writer, and became the connector every push, sweep and dispatch routed to.
+
+It is consulted in exactly one place, `isIntegrationPluginAvailable`
+(`lib/domain/integrations/plugin-catalog.ts`), and read from there by:
+
+- **the Settings catalogue** — `listIntegrationPluginDescriptors` omits an unavailable
+  plugin's switch;
+- **the `/sync` Integrations grid** — `listAvailableWmsConnectorIds()` is resolved on the
+  server (the registry cannot enter a client bundle) and passed to
+  `listWmsIntegrationCards`, which is now the only place that decides a card's
+  `available`. The hardcoded `true` is **gone**, not kept in step;
+- **the `/sync` `?connector=` deep link**, so greying a card out does not leave the URL
+  live;
+- **both plugin-state writers**, through `findIntegrationPluginWriteConflict` — ONE
+  function that holds exclusivity *and* availability, so a writer cannot hold half the
+  ruleset.
+
+**Only the ids being turned ON are checked**, and an unavailable plugin that is somehow
+enabled keeps its switch (flagged `available: false`, copy saying to switch it off).
+Otherwise the rule would remove its own remedy — a row can say enabled after a restore, a
+direct `UPDATE setting`, or a build that withdrew a connector that was on.
+
+Non-WMS plugins answer `true` by construction: the four of them are enumerated because
+there is no registry to derive them from, so there is no staged-registration state for one
+to be in. (The `available` flags on the shopping and accounting registries govern
+connector *selection* in the Numbering and Company screens, a different question; both
+ship `true`.)
 
 ## Where the `mintsoft` literal is allowed
 
@@ -111,8 +159,8 @@ The literal is legitimate only in: the Mintsoft connector itself
 ingress (`app/api/cron/mintsoft-*`, `app/api/webhooks/mintsoft/**`,
 `app/api/e2e/mintsoft/**`, `app/api/export/mintsoft-sync/**`, `lib/cron-jobs/wms-mintsoft.ts`),
 the WMS dispatch facades/registry/panels above, the UI connector registry
-(`/sync` `CONNECTORS`), and per-connector ops/security probes + cosmetic/plugin-registry
-files. See the allowlist in the guard.
+(`/sync` `NON_WMS_CONNECTORS` — the WMS cards are derived, never listed), and
+per-connector ops/security probes + cosmetic/plugin-registry files. See the allowlist in the guard.
 
 The Settings plugin toggle is **no longer** on that list (round 8, `o3d-m0ad`). It used
 to hard-write one switch per plugin — one of them the shipped WMS connector's — behind
@@ -156,6 +204,19 @@ Two halves, and both are needed:
   connector when *nothing* is enabled, so that facade's "nothing resolved" arm is now
   reached in practice only by a contradictory selection, and the no-connector sentence
   would be the one statement that is certainly false there.
+
+**Round 12 finished the callers.** Three of them still turned the three-valued answer back
+into two by taking `getEnabledWmsConnectorId()` and testing it for null:
+`recordWithdrawnDespatch` said "No WMS connector is enabled", and
+`isolateUnresolvedDriftCohort` / `retryUnresolvedDriftCohort` said the connector "is not
+enabled" — while it was enabled, just not alone, and the remedy is the opposite one (turn a
+switch *off*, not on). They take `resolveEnabledWmsConnectorSelection()` and report the
+reason; the wording for the `none` state is unchanged, and each case is paired with its
+`none` contrast so "says the ambiguity" cannot be satisfied by a message that stopped
+mentioning the enabled state at all. The `/sync` WMS panel likewise gained `ambiguous` and
+`none-active` states: it used to render both as `not-active`, whose sentence ("another
+connector currently does") claims some other connector is serving the app in the two states
+where none is.
 
 `getWmsOnboardingConnectionData` is the deliberate exception on the other side: it keeps
 `?? WMS_CONNECTOR_IDS[0]`, so an ambiguous selection still renders the first registered

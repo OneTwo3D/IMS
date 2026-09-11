@@ -7,7 +7,8 @@ import { logActivity } from '@/lib/activity-log'
 import { requireAdmin } from '@/lib/auth/server'
 import { getSettingValue } from '@/lib/settings-store'
 import { getIntegrationPluginState, INTEGRATION_PLUGIN_SETTING_KEYS, type IntegrationPluginState } from '@/lib/integration-plugins'
-import { findIntegrationPluginExclusivityConflict, INTEGRATION_PLUGIN_IDS } from '@/lib/integration-plugin-keys'
+import { INTEGRATION_PLUGIN_IDS } from '@/lib/integration-plugin-keys'
+import { findIntegrationPluginWriteConflict } from '@/lib/domain/integrations/plugin-catalog'
 import { isBaseCurrencyLocked } from '@/lib/base-currency'
 import { completePluginSelectionSave, type PluginSelectionSaveResult } from '@/lib/domain/integrations/plugin-save-outcome'
 import { runPostCommit } from '@/lib/domain/post-commit'
@@ -289,10 +290,11 @@ export async function saveOnboardingPluginState(state: PluginStateInput): Promis
   await requireAdmin()
 
   // A cheap payload-only pre-check, so an obviously contradictory form never opens a transaction.
-  // It is NOT the guarantee — `resulting`, below, is (round 6, finding 1). Derived over every
-  // exclusivity group, WMS included (round 10, Codex HIGH 1): the wizard can turn WMS connectors on
-  // too, and a second one enabled here was accepted, stored and then routed nowhere.
-  const payloadConflict = findIntegrationPluginExclusivityConflict(state)
+  // It is NOT the guarantee — `resulting`, below, is (round 6, finding 1). The SAME ruleset the
+  // Settings writer applies, in one call (rounds 10 and 12): every exclusivity group, WMS included,
+  // and no switching on a connector this build does not offer. The wizard can turn WMS connectors
+  // on too, and a second one enabled here was accepted, stored and then routed nowhere.
+  const payloadConflict = findIntegrationPluginWriteConflict(state)
   if (payloadConflict) return { status: 'refused', error: payloadConflict }
 
   // Lock, read, validate, write — in that order, inside one transaction (o3d-osl8 round 6,
@@ -307,7 +309,7 @@ export async function saveOnboardingPluginState(state: PluginStateInput): Promis
     // miss (o3d-m0ad).
     const current = await lockIntegrationPluginSelection(tx)
     const resulting: IntegrationPluginState = { ...current, ...state }
-    const conflict = findIntegrationPluginExclusivityConflict(resulting)
+    const conflict = findIntegrationPluginWriteConflict(resulting)
     if (conflict) return { conflict }
 
     // EVERY REGISTERED ID, walked from the registry's own list. The loop used to be a literal

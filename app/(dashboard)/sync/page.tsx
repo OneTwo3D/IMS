@@ -26,6 +26,7 @@ import {
 import { getAccountingBatchHistory, getAccountingBatchPreview } from '@/app/actions/accounting-batch'
 import { getWmsSyncDashboardData } from '@/app/actions/wms-sync'
 import { resolveEnabledWmsConnector } from '@/lib/connectors/wms/enabled-connector'
+import { listAvailableWmsConnectorIds } from '@/lib/domain/integrations/plugin-catalog'
 import { getPaymentMethodCombos } from '@/app/actions/accounting'
 import { getPaymentAccountMap } from '@/lib/accounting'
 import { getTaxRates } from '@/app/actions/settings'
@@ -157,6 +158,16 @@ export default async function SyncPage() {
   // it to getWmsSyncDashboardData so the facade doesn't read plugin state again.
   const wmsResolution = resolveEnabledWmsConnector(pluginState)
   const activeWmsConnector = wmsResolution.kind === 'one' ? wmsResolution.id : null
+  // The registry's own `available` flag, resolved HERE because the WMS registry statically imports
+  // the shipped connector (and Prisma behind it) and cannot enter a client bundle. The Integrations
+  // grid used to write `available: true` for every WMS card itself, which is a second source for a
+  // fact the connector's definition already states (round 12, Codex HIGH 2).
+  const availableWmsConnectorIds = listAvailableWmsConnectorIds()
+  // Empty unless MORE THAN ONE WMS connector is enabled. Ambiguity resolves to NO active connector,
+  // so the WMS panel gets a `null` DTO; without these ids it could only say that some other
+  // connector "currently" serves the app, which is exactly the claim that is false here
+  // (round 12, Codex MEDIUM).
+  const ambiguousWmsConnectorIds = wmsResolution.kind === 'ambiguous' ? wmsResolution.ids : []
   // AMBIGUOUS STILL COUNTS AS "A PLUGIN IS ENABLED" (o3d-remove-shiphero round 10, Codex HIGH 1).
   // `activeWmsConnector` is null when two WMS connectors are enabled, because nothing may route to a
   // guessed warehouse — but this flag decides whether the page redirects away as an install with no
@@ -390,6 +401,8 @@ export default async function SyncPage() {
           accountingBatchPreview={dashboard.accountingBatchPreview}
           accountingBatchHistory={dashboard.accountingBatchHistory}
           wmsData={dashboard.wmsData}
+          availableWmsConnectorIds={availableWmsConnectorIds}
+          ambiguousWmsConnectorIds={ambiguousWmsConnectorIds}
         />
       )}
     </div>

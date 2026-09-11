@@ -4,6 +4,7 @@ import { MintsoftClient } from './mintsoft-client'
 import type { MintsoftDashboardData } from '@/app/actions/mintsoft-sync'
 import type { WmsSyncDashboardData } from '@/app/actions/wms-sync'
 import type { WmsConnectorId } from '@/lib/connectors/wms/types'
+import { ambiguousWmsConnectorReason } from '@/lib/connectors/wms/enabled-connector'
 
 /**
  * THE WMS PANEL REGISTRY — the /sync detail screen for whichever WMS connector is active.
@@ -63,6 +64,28 @@ export const WMS_PANEL_ENTRIES: ReadonlyArray<{ id: WmsConnectorId } & WmsConnec
   (Object.entries(WMS_PANELS) as Array<[WmsConnectorId, WmsConnectorPanel]>)
     .map(([id, panel]) => ({ id, ...panel }))
 
+/**
+ * The registered WMS connectors as the Integrations grid lists them, WITH the registry's own
+ * `available` flag (o3d-remove-shiphero round 12, Codex HIGH 2).
+ *
+ * The grid used to build these entries itself and write `available: true` into every one — a second
+ * source for a fact the connector's definition already states, so a connector registered
+ * `available: false` ("registered but not offered to operators yet") got a live, clickable card.
+ * The offered ids are resolved from the registry on the SERVER (the registry statically imports the
+ * shipped connector, and Prisma behind it, so it cannot enter a client bundle) and handed in here;
+ * this is the one place that turns them into cards, so there is no second place to forget.
+ */
+export function listWmsIntegrationCards(
+  availableWmsConnectorIds: readonly WmsConnectorId[],
+): ReadonlyArray<{ id: WmsConnectorId; name: string; description: string; available: boolean }> {
+  return WMS_PANEL_ENTRIES.map((entry) => ({
+    id: entry.id,
+    name: entry.label,
+    description: entry.description,
+    available: availableWmsConnectorIds.includes(entry.id),
+  }))
+}
+
 function lookupWmsPanel(connectorId: string): WmsConnectorPanel | null {
   return (WMS_PANELS as Record<string, WmsConnectorPanel | undefined>)[connectorId] ?? null
 }
@@ -70,41 +93,65 @@ function lookupWmsPanel(connectorId: string): WmsConnectorPanel | null {
 /**
  * WHAT AN OPERATOR SEES INSTEAD OF NOTHING.
  *
- * Two distinct states, because they call for different things:
+ * Four distinct states, because they call for different things:
  *   - `no-panel`: this build has no screen for the connector that is enabled. Nothing here can be
  *     fixed by re-entering credentials; the build is the problem;
  *   - `no-data`: this build HAS a screen, and the connector returned nothing for it — it declares
  *     no dashboard of its own, or its read came back empty. Whether the connection itself is set
  *     up is stated separately, so "configured but nothing to show" is never mistaken for
- *     "not set up".
+ *     "not set up";
+ *   - `not-active`: another connector is the one serving the app, and this screen can name it;
+ *   - `ambiguous`: MORE THAN ONE WMS connector is enabled, so nothing is active
+ *     (o3d-remove-shiphero round 12, Codex MEDIUM). This used to render as `not-active` with no
+ *     `activeLabel`, which printed "another connector currently does" — a claim that some other
+ *     connector is serving the app, in the one state where NONE is. The remedy is on the
+ *     Integration Plugins screen and the reason names the rows that are fighting, so it is the
+ *     shared `ambiguousWmsConnectorReason` rather than a sentence written again here.
+ *
+ * `not-active` keeps a separate `none-active` sibling for the same reason: with no connector
+ * enabled at all there is no "another connector" either.
  */
-function WmsPanelUnavailable({ reason, connectorLabel, connectorId, configured, activeLabel }: {
-  reason: 'no-panel' | 'no-data' | 'not-active'
+type WmsPanelUnavailableReason = 'no-panel' | 'no-data' | 'not-active' | 'none-active' | 'ambiguous'
+
+function WmsPanelUnavailable({ reason, connectorLabel, connectorId, configured, activeLabel, ambiguousConnectorIds }: {
+  reason: WmsPanelUnavailableReason
   connectorLabel: string
   connectorId: string
   configured: boolean
   activeLabel?: string
+  ambiguousConnectorIds?: readonly string[]
 }) {
+  const headline = reason === 'no-panel'
+    ? `This build has no configuration screen for ${connectorLabel}.`
+    : reason === 'ambiguous'
+      ? 'More than one WMS connector is enabled, so none of them is serving the app.'
+      : reason === 'none-active'
+        ? 'No WMS connector is currently serving the app.'
+        : reason === 'not-active'
+          ? `${connectorLabel} is not the active WMS connector.`
+          : `${connectorLabel} returned no configuration data.`
+
+  const body = reason === 'ambiguous'
+    ? ambiguousWmsConnectorReason(ambiguousConnectorIds ?? [])
+    : reason === 'none-active'
+      ? `Enable ${connectorLabel} on the Integration Plugins screen (Settings → Integration Plugins)`
+        + ' to configure it here.'
+      : reason === 'not-active'
+        ? `Only one WMS connector serves the app at a time, and ${activeLabel} currently does.`
+          + ` Disable that one to configure ${connectorLabel} here.`
+        : configured
+          ? `The ${connectorLabel} connection is set up and running — nothing here needs re-entering.`
+          : `The ${connectorLabel} connection is not set up yet, and cannot be set up from this screen.`
+
   return (
     <div
       role="status"
       data-wms-panel-state={reason}
       className="rounded-lg border border-amber-300 bg-amber-50 p-4 text-sm text-amber-900 dark:border-amber-800 dark:bg-amber-950 dark:text-amber-100"
     >
-      <p className="font-medium">
-        {reason === 'no-panel'
-          ? `This build has no configuration screen for ${connectorLabel}.`
-          : reason === 'not-active'
-            ? `${connectorLabel} is not the active WMS connector.`
-            : `${connectorLabel} returned no configuration data.`}
-      </p>
+      <p className="font-medium">{headline}</p>
       <p className="mt-1">
-        {reason === 'not-active'
-          ? `Only one WMS connector serves the app at a time, and ${activeLabel ?? 'another connector'} currently does.`
-            + ` Disable that one to configure ${connectorLabel} here.`
-          : configured
-            ? `The ${connectorLabel} connection is set up and running — nothing here needs re-entering.`
-            : `The ${connectorLabel} connection is not set up yet, and cannot be set up from this screen.`}
+        {body}
         {' '}
         {reason === 'no-panel'
           ? `Connector id ${connectorId} is enabled but this build ships no panel for it; upgrade, or administer it where it lives.`
@@ -126,10 +173,19 @@ type Props = {
    * `if` and silently re-render the Integrations grid, so the click did nothing and said nothing.
    */
   data: WmsSyncDashboardData | null
+  /**
+   * The enabled WMS connectors when MORE THAN ONE is enabled; empty otherwise
+   * (o3d-remove-shiphero round 12, Codex MEDIUM).
+   *
+   * `data` is `null` in that state because the resolver refuses to pick a winner, and `null` alone
+   * cannot tell "nothing is enabled" from "too much is" — so the panel said the same false thing
+   * about both.
+   */
+  ambiguousConnectorIds?: readonly string[]
   onBack: () => void
 }
 
-export function WmsSyncPanel({ connectorId, data, onBack }: Props) {
+export function WmsSyncPanel({ connectorId, data, ambiguousConnectorIds = [], onBack }: Props) {
   const panel = lookupWmsPanel(connectorId)
   const active = data && data.connectorId === connectorId ? data : null
   const payload = active ? (active.connectorData as Record<string, unknown>)[connectorId] : undefined
@@ -137,6 +193,12 @@ export function WmsSyncPanel({ connectorId, data, onBack }: Props) {
   // component cannot read the registry; failing that the raw id, which is still an answer.
   const connectorLabel = panel?.label ?? (active ? active.connectorLabel : connectorId)
   const activeLabel = data ? (lookupWmsPanel(data.connectorId)?.label ?? data.connectorLabel) : undefined
+  // WHY AMBIGUITY OUTRANKS "not active" AND "none active": all three arrive as a missing DTO, and
+  // only this one has a cause the operator can act on. `> 1`, not `> 0`, because one enabled
+  // connector is not an ambiguity however the caller filled the list in.
+  const inactiveReason: WmsPanelUnavailableReason = ambiguousConnectorIds.length > 1
+    ? 'ambiguous'
+    : activeLabel === undefined ? 'none-active' : 'not-active'
 
   return (
     <div className="space-y-4">
@@ -163,11 +225,12 @@ export function WmsSyncPanel({ connectorId, data, onBack }: Props) {
         />
       ) : active === null ? (
         <WmsPanelUnavailable
-          reason="not-active"
+          reason={inactiveReason}
           connectorLabel={connectorLabel}
           connectorId={connectorId}
           configured={false}
           activeLabel={activeLabel}
+          ambiguousConnectorIds={ambiguousConnectorIds}
         />
       ) : payload === undefined ? (
         <WmsPanelUnavailable

@@ -29,17 +29,18 @@ import {
   ACME_WMS_LABEL,
   AcmeWmsConnector,
   DeltaAcmeWmsConnector,
+  SEAM_WMS_CONNECTOR_IDS,
   acmeAsnActions,
   acmeWallClock,
-  acmeWmsConnectorDef,
+  acmeWmsRegistration,
   makeAcmeWarehouse,
   type AcmeAsnLog,
   type AcmeDeltaLog,
 } from './helpers/fictitious-wms-connector.ts'
+import { seamRegistryExports, seamWmsTypesExports } from './helpers/fictitious-wms-connector.ts'
 import * as realTypes from '../lib/connectors/wms/types.ts'
 import * as realPlugins from '../lib/integration-plugins.ts'
-import * as realRegistry from '../lib/connectors/wms/registry.ts'
-import { createWmsConnectorRegistry, type WmsConnectorDef } from '../lib/connectors/wms/registry.ts'
+import { createRegisteredWmsConnectorRegistry } from '../lib/connectors/wms/registry.ts'
 import type { WmsConnectorHooks } from '../lib/connectors/wms/connector-hooks.ts'
 import type { WmsConnector, WmsOrderStatus } from '../lib/connectors/wms/types.ts'
 import * as realSettingsStore from '../lib/settings-store.ts'
@@ -100,53 +101,47 @@ let pluginState: Record<string, boolean> = { [ACME_WMS_ID]: true }
 
 // The id list the resolver walks. This is the ONE thing registering a second connector changes
 // about the shipped build, and the real `getActiveWmsConnectorId` is then left to do its own work.
-mock.module('@/lib/connectors/wms/types', {
-  namedExports: { ...realTypes, WMS_CONNECTOR_IDS: ['mintsoft', ACME_WMS_ID] },
-})
+//
+// THE ID LIST AND THE REGISTRY ARE ONE FIXTURE NOW (round 12, Codex HIGH 1). They used to be two
+// independent mocks — a widened `WMS_CONNECTOR_IDS` here and a hand-built array of definitions
+// below — so the seam could hold the state production forbids and the round-12 defect (a registered
+// id with no definition) was invisible to four green suites. `SEAM_WMS_CONNECTOR_IDS` feeds both,
+// and the registry is assembled by the SHIPPED derivation.
+mock.module('@/lib/connectors/wms/types', { namedExports: seamWmsTypesExports(realTypes) })
 mock.module('@/lib/integration-plugins', {
   namedExports: { ...realPlugins, getIntegrationPluginState: async () => pluginState },
 })
 
-const seamDefs: WmsConnectorDef<string>[] = [
-  // Mintsoft's real definition, minus its hooks AND minus its factory: these tests never dispatch
-  // to Mintsoft, and leaving either on would let a routing bug reach the real server actions and
-  // the real database instead of failing the assertion. The factory matters as much as the hooks
-  // now that the UI facades resolve `isConfigured()` through it (round 8, Codex HIGH 1) — the
-  // fallback path, with no plugin enabled, resolves Mintsoft and would otherwise read settings.
-  {
-    ...(realRegistry.BUILT_IN_WMS_CONNECTORS[0] as WmsConnectorDef<string>),
-    hooks: undefined,
+const seamRegistry = createRegisteredWmsConnectorRegistry<string>([...SEAM_WMS_CONNECTOR_IDS], {
+  // Mintsoft, registered but inert: these tests never dispatch to it, and leaving its hooks or its
+  // real factory on would let a routing bug reach the real server actions and the real database
+  // instead of failing the assertion. The factory matters as much as the hooks now that the UI
+  // facades resolve `isConfigured()` through it (round 8, Codex HIGH 1) — the fallback path, with
+  // no plugin enabled, resolves Mintsoft and would otherwise read settings.
+  mintsoft: {
+    label: 'Mintsoft',
+    available: true,
+    createReplayPolicy: 'remote-refuses-duplicate',
     create: (() => ({
       id: 'mintsoft',
       name: 'Mintsoft',
       isConfigured: async () => false,
     })) as never,
   },
-  {
-    ...(acmeWmsConnectorDef(acmeWarehouse) as unknown as WmsConnectorDef<string>),
+  [ACME_WMS_ID]: {
+    ...acmeWmsRegistration(acmeWarehouse),
     hooks: acmeHooks,
     // The registry hands back the DELTA-CAPABLE Acme, so the production wrapper resolves its
     // `deltaCursorTimeZone` the way it resolves the shipped connector's.
     create: () => acmeDeltaConnector as never,
   },
-]
-const seamRegistry = createWmsConnectorRegistry<string>(seamDefs)
-
-mock.module('@/lib/connectors/wms/registry', {
-  namedExports: {
-    ...realRegistry,
-    findWmsConnectorLabel: (id: string) => seamRegistry.findDef(id)?.label ?? null,
-    getWmsConnectorHooks: (id: string) => seamRegistry.findDef(id)?.hooks ?? {},
-    // The PRODUCTION dispatch-sweep entrypoint resolves its connector through this.
-    getWmsConnector: (id: string) => seamRegistry.getConnector(id),
-    // And the two UI facades read the connection's STATE through this — the registry is what turns
-    // a registered id into the connector whose `isConfigured()` is the answer (round 8, HIGH 1).
-    findWmsConnector: (id: string) => seamRegistry.findDef(id)?.create() ?? null,
-    // And they read it through the CONTAINED reader (round 10, Codex HIGH 2), which is given the
-    // seam's registry rather than replaced: the shipped try/catch is the code under test.
-    isWmsConnectorConfigured: (id: string) => realRegistry.isWmsConnectorConfigured(id, seamRegistry),
-  },
 })
+
+// The shipped registry module with its DEFAULT SOURCE re-bound to the seam registry — the real
+// `findWmsConnectorLabel`, `getWmsConnectorHooks`, `findWmsConnector` and the real CONTAINED
+// `isWmsConnectorConfigured` (round 10, Codex HIGH 2) all run unmodified over it, rather than being
+// re-implemented here as one-liners the production rule could drift away from.
+mock.module('@/lib/connectors/wms/registry', { namedExports: seamRegistryExports(() => seamRegistry) })
 
 // The per-connector sweep lock is a session advisory lock on a real pg connection — a process
 // boundary, not code under test. Running the body inline is the only thing mocked about it.
@@ -217,7 +212,7 @@ test('seam/production: a registered connector that declares NO ASN support is re
   // The other half of routing by capability: "cannot" must stay expressible, and must not be
   // reported as "nothing is enabled" — those call for different things from an operator.
   const previous = seamRegistry.findDef(ACME_WMS_ID)!.hooks
-  seamDefs[1].hooks = {}
+  seamRegistry.getDef(ACME_WMS_ID).hooks = {}
   try {
     const actions = await import('../app/actions/wms-asn.ts')
     const state = await actions.getWmsPurchaseOrderAsnState('po-1')
@@ -229,7 +224,7 @@ test('seam/production: a registered connector that declares NO ASN support is re
     assert.match(create.error ?? '', new RegExp(ACME_WMS_LABEL))
     assert.doesNotMatch(create.error ?? '', /No WMS connector is enabled/)
   } finally {
-    seamDefs[1].hooks = previous
+    seamRegistry.getDef(ACME_WMS_ID).hooks = previous
   }
 })
 
@@ -319,8 +314,8 @@ test('seam/production: the onboarding facade reports a registered non-Mintsoft c
  * plainly being read rather than written by the branch.
  */
 test('seam/production: a connector with NO panel and a LIVE connection is not reported as unconfigured', async () => {
-  const previous = seamDefs[1].hooks
-  seamDefs[1].hooks = {}
+  const previous = seamRegistry.getDef(ACME_WMS_ID).hooks
+  seamRegistry.getDef(ACME_WMS_ID).hooks = {}
   try {
     const wmsSync = await import('../app/actions/wms-sync.ts')
     const wmsOnboarding = await import('../app/actions/wms-onboarding.ts')
@@ -339,15 +334,15 @@ test('seam/production: a connector with NO panel and a LIVE connection is not re
     assert.equal(onboarding.configured, true, 'and the wizard does not ask for credentials that are already stored')
     assert.deepEqual(onboarding.connectorData, {})
   } finally {
-    seamDefs[1].hooks = previous
+    seamRegistry.getDef(ACME_WMS_ID).hooks = previous
   }
 })
 
 test('seam/production: the SAME no-panel connector reports unconfigured when its connection really is absent', async () => {
   // THE CONTRAST THAT MAKES THE CASE ABOVE A TEST OF A READ. Without it, a facade that hard-coded
   // `configured: true` would pass everything above — the same shape of mistake, mirrored.
-  const previousHooks = seamDefs[1].hooks
-  seamDefs[1].hooks = {}
+  const previousHooks = seamRegistry.getDef(ACME_WMS_ID).hooks
+  seamRegistry.getDef(ACME_WMS_ID).hooks = {}
   acmeWarehouse.configured = false
   try {
     const wmsSync = await import('../app/actions/wms-sync.ts')
@@ -356,7 +351,7 @@ test('seam/production: the SAME no-panel connector reports unconfigured when its
     assert.equal((await wmsOnboarding.getWmsOnboardingConnectionData()).configured, false)
   } finally {
     acmeWarehouse.configured = true
-    seamDefs[1].hooks = previousHooks
+    seamRegistry.getDef(ACME_WMS_ID).hooks = previousHooks
   }
 })
 
@@ -369,8 +364,8 @@ test('seam/production: a connector whose isConfigured THROWS is reported unconfi
   // A question that throws has not been answered, and an unanswered connection is NOT configured —
   // which is what keeps the /sync panel and the onboarding form on screen for the operator who has
   // to repair it. `null` here would mean "no WMS is enabled", which is a different and false claim.
-  const previousCreate = seamDefs[1].create
-  seamDefs[1].create = (() => ({
+  const previousCreate = seamRegistry.getDef(ACME_WMS_ID).create
+  seamRegistry.getDef(ACME_WMS_ID).create = (() => ({
     id: ACME_WMS_ID,
     name: ACME_WMS_LABEL,
     isConfigured: async () => { throw new Error('acme cannot resolve its auth mode') },
@@ -389,7 +384,7 @@ test('seam/production: a connector whose isConfigured THROWS is reported unconfi
     assert.equal(onboarding.configured, false)
     assert.deepEqual(onboarding.connectorData[ACME_WMS_ID as never], ACME_FORM, 'and so does the corrective form')
   } finally {
-    seamDefs[1].create = previousCreate
+    seamRegistry.getDef(ACME_WMS_ID).create = previousCreate
   }
 })
 
@@ -426,14 +421,14 @@ test('seam/production: the product-sync dispatcher reaches a registered non-Mint
 
   // And a connector that declares no product sync is a silent no-op rather than a throw — the
   // dispatcher is best-effort on the product-mutation path.
-  const previous = seamDefs[1].hooks
-  seamDefs[1].hooks = {}
+  const previous = seamRegistry.getDef(ACME_WMS_ID).hooks
+  seamRegistry.getDef(ACME_WMS_ID).hooks = {}
   try {
     productSyncLog.length = 0
     await dispatch.runWmsProductSyncForProduct('p-2', 'manual')
     assert.deepEqual(productSyncLog, [])
   } finally {
-    seamDefs[1].hooks = previous
+    seamRegistry.getDef(ACME_WMS_ID).hooks = previous
   }
 })
 
@@ -549,9 +544,10 @@ mock.module('@/lib/db', { namedExports: { db: settings.client, prisma: settings.
  * stand in for.
  *
  * It is mocked rather than left real because `lib/settings-store.ts` is already loaded — the static
- * `import * as realRegistry` at the top of this file pulls the registry in, which pulls the settings
- * store in, which binds the REAL Prisma client before any `mock.module` here has run. The `db` mock
- * therefore reaches every module imported dynamically below, but not that one.
+ * import of `./helpers/fictitious-wms-connector.ts` at the top of this file pulls the registry in,
+ * which pulls the settings store in, which binds the REAL Prisma client before any `mock.module`
+ * here has run. The `db` mock therefore reaches every module imported dynamically below, but not
+ * that one.
  *
  * WHAT IS STILL UNDER TEST: the KEY. This reads the same in-memory row map the production cursor
  * deps read, so a wrapper that asked for another connector's `_api_timezone` row — or for a row

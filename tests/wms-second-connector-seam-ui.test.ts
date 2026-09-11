@@ -30,9 +30,15 @@ import {
   makeAcmeWarehouse,
 } from './helpers/fictitious-wms-connector.ts'
 import { mountClientComponent } from './fixtures/render-client-component.ts'
+import {
+  SEAM_WMS_CONNECTOR_IDS,
+  acmeWmsRegistration,
+  seamRegistryExports,
+  seamWmsTypesExports,
+} from './helpers/fictitious-wms-connector.ts'
 import * as realTypes from '../lib/connectors/wms/types.ts'
 import * as realPlugins from '../lib/integration-plugins.ts'
-import * as realRegistry from '../lib/connectors/wms/registry.ts'
+import { createRegisteredWmsConnectorRegistry } from '../lib/connectors/wms/registry.ts'
 // Statically, and deliberately with the SHIPPED id list: see `pluginStateWithAcme`.
 import { buildIntegrationPluginState, type IntegrationPluginState } from '../lib/integration-plugin-keys.ts'
 import type { WmsConnectorHooks } from '../lib/connectors/wms/connector-hooks.ts'
@@ -61,38 +67,45 @@ const acmeWarehouse = makeAcmeWarehouse()
 const acmeConnector = new AcmeWmsConnector(acmeWarehouse)
 
 let hooks: Record<string, WmsConnectorHooks> = { [ACME_WMS_ID]: acmeHooks }
-let labels: Record<string, string> = { mintsoft: 'Mintsoft', [ACME_WMS_ID]: ACME_WMS_LABEL }
 let pluginState: Record<string, boolean> = { [ACME_WMS_ID]: true }
 
-mock.module('@/lib/connectors/wms/types', {
-  namedExports: {
-    ...realTypes,
-    WMS_CONNECTOR_IDS: ['mintsoft', ACME_WMS_ID],
-    isWmsConnectorId: (value: string | null | undefined) => value === 'mintsoft' || value === ACME_WMS_ID,
+/**
+ * THE ID LIST AND THE REGISTRY ARE ONE FIXTURE (round 12, Codex HIGH 1).
+ *
+ * This file used to widen `WMS_CONNECTOR_IDS` inline and, separately, hand-write the three registry
+ * lookups (`getWmsConnectorHooks`, `findWmsConnectorLabel`, `findWmsConnector`) as one-liners over
+ * ad-hoc maps. Both halves could drift from what production derives, and one of them did: a
+ * registered id with no definition is a state production forbids and this fixture could hold.
+ * `SEAM_WMS_CONNECTOR_IDS` now feeds the types mock AND the registry, which is assembled by the
+ * shipped derivation, and the registry mock re-binds the DEFAULT SOURCE of the real lookups rather
+ * than replacing them — including the real CONTAINED `isWmsConnectorConfigured` (round 10, HIGH 2),
+ * whose try/catch is not exercised here because `AcmeWmsConnector.isConfigured()` cannot throw (the
+ * throwing-predicate cases are in tests/wms-second-connector-seam-production.test.ts and
+ * tests/wms-configured-predicate-containment.test.ts).
+ *
+ * A THUNK, because several cases re-register Acme with different hooks mid-file.
+ */
+const seamRegistry = () => createRegisteredWmsConnectorRegistry<string>([...SEAM_WMS_CONNECTOR_IDS], {
+  // Registered, and inert: resolving the shipped connector for real would construct it and read
+  // settings. Only `isConfigured()` exists, and it answers "no connection".
+  mintsoft: {
+    label: 'Mintsoft',
+    available: true,
+    createReplayPolicy: 'remote-refuses-duplicate',
+    create: (() => ({ id: 'mintsoft', name: 'Mintsoft', isConfigured: async () => false })) as never,
+  },
+  [ACME_WMS_ID]: {
+    ...acmeWmsRegistration(acmeWarehouse),
+    hooks: hooks[ACME_WMS_ID],
+    create: () => acmeConnector as never,
   },
 })
+
+mock.module('@/lib/connectors/wms/types', { namedExports: seamWmsTypesExports(realTypes) })
 mock.module('@/lib/integration-plugins', {
   namedExports: { ...realPlugins, getIntegrationPluginState: async () => pluginState },
 })
-mock.module('@/lib/connectors/wms/registry', {
-  namedExports: {
-    ...realRegistry,
-    getWmsConnectorHooks: (id: string) => hooks[id] ?? {},
-    findWmsConnectorLabel: (id: string) => labels[id] ?? null,
-    // Where both facades now read the CONNECTION's state. Only the fictitious connector is
-    // registered here: resolving the shipped one would construct it and read settings.
-    findWmsConnector: (id: string) => (id === ACME_WMS_ID ? acmeConnector : null),
-    // THE REAL CONTAINMENT, over an injected registry (round 10, Codex HIGH 2). Not a stub: the
-    // shipped `isWmsConnectorConfigured` is what runs, over this file's own registry. Its try/catch
-    // is NOT exercised here — `AcmeWmsConnector.isConfigured()` returns a boolean and cannot throw —
-    // so the throwing-predicate cases live in tests/wms-second-connector-seam-production.test.ts
-    // (a registered connector whose predicate throws) and
-    // tests/wms-configured-predicate-containment.test.ts (the real MintsoftConnector).
-    isWmsConnectorConfigured: (id: string) => realRegistry.isWmsConnectorConfigured(id, {
-      findDef: (wanted: string) => (wanted === ACME_WMS_ID ? { create: () => acmeConnector } : null),
-    }),
-  },
-})
+mock.module('@/lib/connectors/wms/registry', { namedExports: seamRegistryExports(seamRegistry) })
 mock.module('@/lib/auth/server', {
   namedExports: {
     requirePermission: async () => ({ id: 'u1', role: 'ADMIN' }),
@@ -234,10 +247,17 @@ test('seam/ui: the SAME no-data state DOES say "not set up" when the connection 
   }
 })
 
-test('seam/ui: opening a SECOND enabled connector says why it has no panel, instead of doing nothing', async () => {
-  // The /sync dashboard used to require the DTO to belong to the card that was clicked; a second
-  // enabled connector's card therefore fell through to the grid. The click did nothing, and said
-  // nothing about why.
+test('seam/ui: opening a card that is NOT the active connector says why, instead of doing nothing', async () => {
+  // The /sync dashboard used to require the DTO to belong to the card that was clicked; another
+  // connector's card therefore fell through to the grid. The click did nothing, and said nothing
+  // about why.
+  //
+  // NOTE WHAT THIS CASE IS AND IS NOT (round 12, Codex MEDIUM). It used to be called "a SECOND
+  // enabled connector" while the fixture had only Acme enabled — it never reached that state at
+  // all, so the name described a scenario nothing here exercised. Two ENABLED connectors is the
+  // AMBIGUOUS state, and it is exercised by its own case below, where the DTO is null because the
+  // resolver refuses to pick a winner. This case is the other one: a DTO that belongs to somebody
+  // else, which the panel must name rather than render blank.
   const wmsSync = await import('../app/actions/wms-sync.ts')
   const { WmsSyncPanel } = await import('../app/(dashboard)/sync/wms-sync-panel.tsx')
 
@@ -253,6 +273,71 @@ test('seam/ui: opening a SECOND enabled connector says why it has no panel, inst
   assert.match(visibleText(html), new RegExp(ACME_WMS_LABEL), 'and it names the one that IS active')
 })
 
+/**
+ * TWO ENABLED CONNECTORS — the state the case above was NAMED for and never reached
+ * (o3d-remove-shiphero round 12, Codex MEDIUM).
+ *
+ * With more than one WMS connector enabled the resolver answers `ambiguous`, so the facade returns
+ * NO dashboard DTO: there is no connector it could name without guessing. The panel then had only
+ * `data === null` to go on and said "Only one WMS connector serves the app at a time, and another
+ * connector currently does" — a claim that some other connector is serving the app, in the one
+ * state where none is, and it pointed the remedy away from the two switches that caused it.
+ */
+test('seam/ui: with TWO WMS connectors enabled the panel says AMBIGUOUS, not "another connector currently does"', async () => {
+  const wmsSync = await import('../app/actions/wms-sync.ts')
+  const { WmsSyncPanel } = await import('../app/(dashboard)/sync/wms-sync-panel.tsx')
+
+  const previous = pluginState
+  pluginState = { mintsoft: true, [ACME_WMS_ID]: true }
+  try {
+    const data = await wmsSync.getWmsSyncDashboardData()
+    assert.equal(data, null, 'ambiguity routes NOWHERE — the facade must not pick a winner')
+
+    const { html } = mountClientComponent(WmsSyncPanel, {
+      connectorId: 'mintsoft' as WmsConnectorId,
+      data,
+      ambiguousConnectorIds: ['mintsoft', ACME_WMS_ID],
+      onBack: noop,
+    }).render()
+
+    assert.match(html, /data-wms-panel-state="ambiguous"/)
+    const text = visibleText(html)
+    assert.match(text, new RegExp(ACME_WMS_ID), 'the rows that are fighting are named')
+    assert.match(text, /mintsoft/i)
+    assert.match(text, /Integration Plugins/i, 'and the remedy points at the screen that caused it')
+    assert.doesNotMatch(
+      text, /currently does/i,
+      'nothing "currently" serves the app when the selection is contradictory',
+    )
+  } finally {
+    pluginState = previous
+  }
+})
+
+/**
+ * THE INTEGRATIONS GRID READS `available` FROM THE REGISTRY, NOT FROM ITSELF
+ * (o3d-remove-shiphero round 12, Codex HIGH 2).
+ *
+ * The WMS cards are derived from the panel record (round 6), and the derivation wrote
+ * `available: true` into every one of them — a second source for a fact the connector's own
+ * definition states. A connector registered "not offered to operators yet" therefore got a card
+ * that was fully clickable, opening the panel and the enable path behind it. The offered ids are
+ * resolved from the registry on the server and handed in; this is the only place that turns them
+ * into cards.
+ */
+test('seam/ui: a WMS card is unavailable when the registry does not offer the connector', async () => {
+  const { listWmsIntegrationCards } = await import('../app/(dashboard)/sync/wms-sync-panel.tsx')
+
+  const offered = listWmsIntegrationCards(['mintsoft'] as never)
+  assert.deepEqual(offered.map((card) => card.id), ['mintsoft'], 'every registered id still gets a card')
+  assert.equal(offered[0].available, true)
+
+  // THE DEFECT: this used to be `true` regardless, because the grid wrote the flag itself.
+  const withheld = listWmsIntegrationCards([])
+  assert.deepEqual(withheld.map((card) => card.id), ['mintsoft'], 'the card is still listed…')
+  assert.equal(withheld[0].available, false, '…and greyed out rather than silently missing')
+})
+
 test('seam/ui: with NO WMS connector enabled the panel still explains itself', async () => {
   const { WmsSyncPanel } = await import('../app/(dashboard)/sync/wms-sync-panel.tsx')
   const mounted = mountClientComponent(WmsSyncPanel, {
@@ -261,7 +346,11 @@ test('seam/ui: with NO WMS connector enabled the panel still explains itself', a
     onBack: noop,
   })
   const { html } = mounted.render()
-  assert.match(html, /data-wms-panel-state="not-active"/, 'a null DTO renders a state, never nothing')
+  assert.match(html, /data-wms-panel-state="none-active"/, 'a null DTO renders a state, never nothing')
+  // And it does not invent an incumbent: round 12 split this off `not-active`, whose sentence
+  // ("another connector currently does") is false with nothing enabled just as it is under
+  // ambiguity.
+  assert.doesNotMatch(visibleText(mounted.render().html), /currently does/i)
 })
 
 test('seam/ui: the SHIPPED connector still renders its own panel', async () => {

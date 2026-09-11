@@ -5,9 +5,9 @@ import { Table, TableHeader, TableBody, TableRow, TableHead, TableCell } from '@
 import { useRouter, useSearchParams } from 'next/navigation'
 import { SyncClient } from './sync-client'
 import { ShopifySyncClient } from './shopify-sync-client'
-import { WMS_PANEL_ENTRIES, WmsSyncPanel } from './wms-sync-panel'
+import { WMS_PANEL_ENTRIES, WmsSyncPanel, listWmsIntegrationCards } from './wms-sync-panel'
 import { AccountingConnectorPanel, isAccountingConnectorUiId } from './accounting-connector-panel'
-import { isWmsConnectorId } from '@/lib/connectors/wms/types'
+import { isWmsConnectorId, type WmsConnectorId } from '@/lib/connectors/wms/types'
 import type { WmsSyncDashboardData } from '@/app/actions/wms-sync'
 import type {
   ShopifyConnectorCredentials,
@@ -61,6 +61,26 @@ type Props = {
   accountingBatchPreview: AccountingBatchPreview
   accountingBatchHistory: AccountingBatchHistoryDay[]
   wmsData: WmsSyncDashboardData | null
+  /**
+   * The WMS connectors this build OFFERS — read from `WmsConnectorDef.available` on the server
+   * (o3d-remove-shiphero round 12, Codex HIGH 2).
+   *
+   * The WMS cards used to be built with `available: true` written out here, which is a SECOND
+   * source for a fact the registry already states: a connector staged as not-offered got a live,
+   * clickable card anyway. It is a prop rather than an import because the registry statically pulls
+   * the shipped connector (and Prisma behind it) and cannot enter a client bundle — the same reason
+   * the plugin descriptors are passed down.
+   */
+  availableWmsConnectorIds: readonly WmsConnectorId[]
+  /**
+   * The WMS connectors that are enabled when MORE THAN ONE is (o3d-remove-shiphero round 12,
+   * Codex MEDIUM) — empty in every other state.
+   *
+   * Ambiguity resolves to no active connector on purpose, so `wmsData` is `null`; without the ids
+   * the panel could only say "another connector currently does", which is the one sentence that is
+   * certainly false in the one state that reaches it.
+   */
+  ambiguousWmsConnectorIds: readonly string[]
 }
 
 type ConnectorDef = {
@@ -73,7 +93,7 @@ type ConnectorDef = {
   available: boolean
 }
 
-const CONNECTORS: ConnectorDef[] = [
+const NON_WMS_CONNECTORS: ConnectorDef[] = [
   {
     id: 'woocommerce',
     name: 'WooCommerce',
@@ -98,21 +118,6 @@ const CONNECTORS: ConnectorDef[] = [
     category: 'shopping',
     available: true,
   },
-  // o3d-remove-shiphero round 6 (Codex HIGH 1) — THE WMS CARDS ARE DERIVED, NOT LISTED.
-  // A hand-written entry per connector is the same one-arm shape as the panel dispatch it sits
-  // next to: a registered, enabled second connector that nobody remembered to add here gets no
-  // card at all, so the Warehouse Management section is empty and the connector is unreachable
-  // from the UI — silently, with nothing on screen to say so. `WMS_PANEL_ENTRIES` is built from
-  // the total `Record<WmsConnectorId, …>` in wms-sync-panel.tsx, so every registered id has a card
-  // and a panel or the build does not compile.
-  ...WMS_PANEL_ENTRIES.map((entry): ConnectorDef => ({
-    id: entry.id,
-    name: entry.label,
-    description: entry.description,
-    logo: '',
-    category: 'wms',
-    available: true,
-  })),
   {
     id: 'xero',
     name: 'Xero',
@@ -130,6 +135,29 @@ const CONNECTORS: ConnectorDef[] = [
     available: true,
   },
 ]
+
+/**
+ * o3d-remove-shiphero round 6 (Codex HIGH 1) — THE WMS CARDS ARE DERIVED, NOT LISTED.
+ * A hand-written entry per connector is the same one-arm shape as the panel dispatch it sits next
+ * to: a registered, enabled second connector that nobody remembered to add here gets no card at
+ * all, so the Warehouse Management section is empty and the connector is unreachable from the UI —
+ * silently, with nothing on screen to say so. `WMS_PANEL_ENTRIES` is built from the total
+ * `Record<WmsConnectorId, …>` in wms-sync-panel.tsx, so every registered id has a card and a panel
+ * or the build does not compile.
+ *
+ * ROUND 12 (Codex HIGH 2) — AND `available` COMES FROM THE REGISTRY. It was written out as
+ * `available: true` here, a second source for a fact the connector's own definition already states,
+ * so a connector registered `available: false` — "registered but not offered to operators yet" —
+ * got a live, clickable card. The list of offered ids is resolved on the server and passed in; this
+ * file no longer holds an opinion about it.
+ */
+function wmsConnectorCards(availableWmsConnectorIds: readonly WmsConnectorId[]): ConnectorDef[] {
+  return listWmsIntegrationCards(availableWmsConnectorIds).map((card): ConnectorDef => ({
+    ...card,
+    logo: '',
+    category: 'wms',
+  }))
+}
 
 const CONNECTOR_LOGOS: Record<string, React.ReactNode> = {
   // eslint-disable-next-line @next/next/no-img-element
@@ -152,7 +180,7 @@ const CONNECTOR_LOGOS: Record<string, React.ReactNode> = {
   quickbooks: <img src="/images/qb-logo-stacked.svg" alt="QuickBooks" className="h-8 object-contain" />,
 }
 
-export function SyncDashboard({ pluginState, shoppingSettings, shoppingTaxMappings, shoppingStatusMappings, shoppingLogs, taxRates, imsTaxRates, accountingTaxRates, shoppingCredentials, shopifySettings, shopifyCredentials, shopifyLogs, accountingSettings, accountingConnected, accountingTenantName, accountingBlockedReason, accountingHasStoredToken, accountingConnectionTest, accountingAccounts, accountingLogs, paymentMethodCombos, paymentAccountMap, currencies, shoppingPaymentMethods, accountingReadiness, accountingBatchPreview, accountingBatchHistory, wmsData }: Props) {
+export function SyncDashboard({ pluginState, shoppingSettings, shoppingTaxMappings, shoppingStatusMappings, shoppingLogs, taxRates, imsTaxRates, accountingTaxRates, shoppingCredentials, shopifySettings, shopifyCredentials, shopifyLogs, accountingSettings, accountingConnected, accountingTenantName, accountingBlockedReason, accountingHasStoredToken, accountingConnectionTest, accountingAccounts, accountingLogs, paymentMethodCombos, paymentAccountMap, currencies, shoppingPaymentMethods, accountingReadiness, accountingBatchPreview, accountingBatchHistory, wmsData, availableWmsConnectorIds, ambiguousWmsConnectorIds }: Props) {
   const router = useRouter()
   const searchParams = useSearchParams()
   const requestedConnector = searchParams.get('connector')
@@ -165,7 +193,12 @@ export function SyncDashboard({ pluginState, shoppingSettings, shoppingTaxMappin
   ) || (
     requestedConnector === 'quickbooks' && !pluginState.quickbooks
   ) || (
-    isWmsConnectorId(requestedConnector) && !pluginState[requestedConnector]
+    // A connector this build does not OFFER has no panel to open, however the URL was arrived at
+    // (round 12, Codex HIGH 2). `?connector=` is operator-supplied, and the grid is not the only
+    // way in — greying the card out while leaving the deep link live would be the same
+    // availability check missing from the second of two places.
+    isWmsConnectorId(requestedConnector)
+      && (!pluginState[requestedConnector] || !availableWmsConnectorIds.includes(requestedConnector))
   )
     ? null
     : requestedConnector
@@ -181,7 +214,8 @@ export function SyncDashboard({ pluginState, shoppingSettings, shoppingTaxMappin
   const woocommerceConnected = pluginState.woocommerce && !!shoppingCredentials.url && !!shoppingCredentials.key && !!shoppingCredentials.secret
   const shopifyConnected = pluginState.shopify && !!shopifyCredentials.storeDomain && !!shopifyCredentials.adminApiAccessToken
   const wmsConfigured = Boolean(wmsData?.configured)
-  const visibleConnectors = CONNECTORS.filter((connector) => {
+  const connectors = [...NON_WMS_CONNECTORS, ...wmsConnectorCards(availableWmsConnectorIds)]
+  const visibleConnectors = connectors.filter((connector) => {
     if (connector.id === 'woocommerce') return pluginState.woocommerce
     if (connector.id === 'shopify') return pluginState.shopify
     if (connector.id === 'xero') return pluginState.xero
@@ -299,7 +333,14 @@ export function SyncDashboard({ pluginState, shoppingSettings, shoppingTaxMappin
   // nothing and explained nothing. The panel is total over the cases now, so the mismatch is a
   // state it renders rather than a branch that vanishes (o3d-remove-shiphero round 6, Codex HIGH 1).
   if (activeConnector && isWmsConnectorId(activeConnector)) {
-    return <WmsSyncPanel connectorId={activeConnector} data={wmsData} onBack={() => setActiveConnector(null)} />
+    return (
+      <WmsSyncPanel
+        connectorId={activeConnector}
+        data={wmsData}
+        ambiguousConnectorIds={ambiguousWmsConnectorIds}
+        onBack={() => setActiveConnector(null)}
+      />
+    )
   }
 
   if (activeConnector === 'shopify') {

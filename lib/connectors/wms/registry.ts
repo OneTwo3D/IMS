@@ -5,6 +5,7 @@ import type {
   WmsOrderPushInput,
   WmsOrderPushProvenResult,
 } from './types'
+import { WMS_CONNECTOR_IDS } from './types'
 import type { WmsConnectorHooks } from './connector-hooks'
 import { unstable_rethrow } from 'next/navigation'
 import { MintsoftConnector } from '@/lib/connectors/mintsoft'
@@ -40,9 +41,10 @@ import { getSettingValue } from '@/lib/settings-store'
  *     `tsc` until somebody has written down whether its create is replay-safe.
  *     See lib/domain/wms/create-replay-policy.ts for what the answer means.
  *
- * To add a WMS connector: add its id to WMS_CONNECTOR_IDS (lib/connectors/wms/types.ts),
- * add a definition below, add an IntegrationPluginId + setting key, and add its
- * cron/webhook ingress. Core flows need no edits — that is the promise this
+ * To add a WMS connector: add its id to WMS_CONNECTOR_IDS (lib/connectors/wms/types.ts) and a
+ * definition under that id in BUILT_IN_WMS_CONNECTOR_REGISTRATIONS below — neither half compiles
+ * without the other — then add a panel and its cron/webhook ingress. The IntegrationPluginId, the
+ * setting key and the toggle are derived. Core flows need no edits: that is the promise this
  * registry makes, and the second-connector test is what checks it is still true.
  */
 /**
@@ -171,10 +173,68 @@ export function createWmsConnectorRegistry<Id extends string>(
   }
 }
 
-/** The connectors this build ships. Order matches WMS_CONNECTOR_IDS. */
-export const BUILT_IN_WMS_CONNECTORS: readonly WmsConnectorDef[] = [
-  {
-    id: 'mintsoft',
+/**
+ * A DEFINITION WITHOUT ITS ID — the id comes from the key it is registered under.
+ *
+ * Dropping `id` from the value is not tidiness: it is what makes "the definition's id disagrees
+ * with the id it is registered as" unrepresentable rather than merely wrong. Nobody writes the id
+ * twice, so nobody can write it twice differently.
+ */
+export type WmsConnectorRegistration<Id extends string = WmsConnectorId> = Omit<WmsConnectorDef<Id>, 'id'>
+
+/**
+ * THE ONE DERIVATION: a registry is the canonical id list crossed with one definition per id
+ * (o3d-remove-shiphero round 12, Codex HIGH 1).
+ *
+ * WHAT WENT WRONG. `BUILT_IN_WMS_CONNECTORS` was a hand-written array typed
+ * `readonly WmsConnectorDef[]`. Rounds 6 and 8 made the PANELS and the plugin TOGGLES total over
+ * `WMS_CONNECTOR_IDS` — so a registered id with no screen does not compile — and never applied the
+ * same rule to the DEFINITIONS, which is the one list that actually has to be complete. Adding an
+ * id, a panel and a form while omitting the definition typechecked: the settings screen then
+ * offered the connector, the writer persisted it, the resolver selected it, and every route that
+ * reached `getWmsConnector` threw `Unknown WMS connector` at REQUEST time — in the order push, the
+ * dispatch sweep, the ASN actions. A registration that is half-done is worse than one that is
+ * missing, because the operator is told it worked.
+ *
+ * SO THE LIST AND THE DEFINITIONS ARE NO LONGER TWO LISTS. `ids` is walked and each id is looked up
+ * in a record that is TOTAL over those ids, which gives both halves:
+ *
+ *   - COMPILE TIME: `Record<Id, WmsConnectorRegistration<Id>>` is total, so an id in the list with
+ *     no definition is a `tsc` error at the record, and a definition for an id that is not in the
+ *     list is an excess-property error. Neither list can grow without the other;
+ *   - LOAD TIME: the lookup is still checked, because a build can reach the runtime with the two
+ *     disagreeing anyway — a `mock.module` that widens the id list, a JavaScript caller, a
+ *     mixed-version deploy. It throws HERE, at module evaluation, naming the id. A build that
+ *     cannot route a registered connector must fail where a deploy sees it, not on the first order
+ *     that happens to need the warehouse.
+ *
+ * Order is `ids` order, which is what `getActiveWmsConnectorId`'s legacy fallback depends on — one
+ * list decides it rather than an array literal that has to be kept "matching" by hand.
+ */
+export function createRegisteredWmsConnectorRegistry<Id extends string>(
+  ids: readonly Id[],
+  registrations: Readonly<Record<Id, WmsConnectorRegistration<Id>>>,
+): WmsConnectorRegistry<Id> {
+  return createWmsConnectorRegistry(ids.map((id): WmsConnectorDef<Id> => {
+    const registration = registrations[id]
+    if (!registration) {
+      throw new Error(
+        `WMS connector "${id}" is a registered id with no definition —`
+        + ' every id in WMS_CONNECTOR_IDS must have an entry in the registration record',
+      )
+    }
+    return { id, ...registration }
+  }))
+}
+
+/**
+ * The connectors this build ships, keyed by id.
+ *
+ * TOTAL over `WMS_CONNECTOR_IDS` (see {@link createRegisteredWmsConnectorRegistry}): registering an
+ * id without writing its definition here does not compile.
+ */
+export const BUILT_IN_WMS_CONNECTOR_REGISTRATIONS: Readonly<Record<WmsConnectorId, WmsConnectorRegistration>> = {
+  mintsoft: {
     label: 'Mintsoft',
     available: true,
     createReplayPolicy: 'remote-refuses-duplicate',
@@ -245,9 +305,15 @@ export const BUILT_IN_WMS_CONNECTORS: readonly WmsConnectorDef[] = [
       deltaScopeLock: async (tx) => mintsoftDeltaScopeToken(await lockMintsoftDispatchSettings(tx)),
     },
   },
-] as const
+}
 
-export const wmsConnectorRegistry = createWmsConnectorRegistry(BUILT_IN_WMS_CONNECTORS)
+export const wmsConnectorRegistry = createRegisteredWmsConnectorRegistry(
+  WMS_CONNECTOR_IDS,
+  BUILT_IN_WMS_CONNECTOR_REGISTRATIONS,
+)
+
+/** The connectors this build ships, in `WMS_CONNECTOR_IDS` order — the registry's own list. */
+export const BUILT_IN_WMS_CONNECTORS: readonly WmsConnectorDef[] = wmsConnectorRegistry.list()
 
 /** Back-compat view of the shipped registry. Prefer `wmsConnectorRegistry.list()`. */
 export const WMS_CONNECTORS: readonly WmsConnectorDef[] = wmsConnectorRegistry.list()

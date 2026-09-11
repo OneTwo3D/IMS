@@ -30,10 +30,12 @@
  */
 import type {
   WmsConnectorDef,
+  WmsConnectorRegistration,
   WmsConnectorRegistry,
   WmsRegistrableConnector,
 } from '../../lib/connectors/wms/registry.ts'
-import { createWmsConnectorRegistry } from '../../lib/connectors/wms/registry.ts'
+import { createRegisteredWmsConnectorRegistry } from '../../lib/connectors/wms/registry.ts'
+import * as realWmsRegistry from '../../lib/connectors/wms/registry.ts'
 import type {
   WmsAsnInput,
   WmsAsnRef,
@@ -59,6 +61,41 @@ export const ACME_WMS_LABEL = 'Acme Fulfilment'
 
 /** Ids the seam registry knows about: the shipped one plus the fictitious one. */
 export type SeamWmsConnectorId = 'mintsoft' | typeof ACME_WMS_ID
+
+/**
+ * THE ID LIST A SEAM BUILD REGISTERS — ONE constant, for BOTH halves
+ * (o3d-remove-shiphero round 12, Codex HIGH 1).
+ *
+ * WHY THIS IS A CONSTANT AND NOT TWO LITERALS. Every seam file used to widen `WMS_CONNECTOR_IDS`
+ * with its own inline `['mintsoft', ACME_WMS_ID]` and, separately, hand-build a registry from a
+ * hand-written array of definitions. Production requires those two to agree — the registry is the
+ * id list crossed with a definition each — and the fixture let them disagree, which is exactly why
+ * the missing-definition defect the round-12 review found could exist while four seam suites were
+ * green. Two things production keeps in step were kept apart by the test.
+ *
+ * So this list is what the `WMS_CONNECTOR_IDS` mock is given AND what {@link makeSeamRegistry}
+ * derives the registry from, through the SHIPPED derivation
+ * (`createRegisteredWmsConnectorRegistry`). A seam id with no registration now fails in the fixture
+ * the same way it fails in a build.
+ */
+export const SEAM_WMS_CONNECTOR_IDS: readonly SeamWmsConnectorId[] = ['mintsoft', ACME_WMS_ID]
+
+/**
+ * The `@/lib/connectors/wms/types` mock a seam file installs: the shipped module with the id list
+ * widened by exactly one connector, and the type guard derived from THAT list rather than
+ * re-spelled. A guard written as `v === 'mintsoft' || v === ACME_WMS_ID` is a third copy of the
+ * same fact.
+ */
+export function seamWmsTypesExports(
+  realTypes: typeof import('../../lib/connectors/wms/types.ts'),
+): Record<string, unknown> {
+  return {
+    ...realTypes,
+    WMS_CONNECTOR_IDS: SEAM_WMS_CONNECTOR_IDS,
+    isWmsConnectorId: (value: string | null | undefined): boolean =>
+      value != null && (SEAM_WMS_CONNECTOR_IDS as readonly string[]).includes(value),
+  }
+}
 
 type AcmeOrder = {
   externalOrderId: string
@@ -304,12 +341,12 @@ export class ZonelessDeltaAcmeWmsConnector extends AcmeWmsConnector {
   }
 }
 
-export function acmeWmsConnectorDef(
+/** Acme's registration — the definition MINUS its id, which the registry supplies from the key. */
+export function acmeWmsRegistration(
   warehouse: AcmeWarehouse = makeAcmeWarehouse(),
-  overrides: Partial<WmsConnectorDef<SeamWmsConnectorId>> = {},
-): WmsConnectorDef<SeamWmsConnectorId> {
+  overrides: Partial<WmsConnectorRegistration<SeamWmsConnectorId>> = {},
+): WmsConnectorRegistration<SeamWmsConnectorId> {
   return {
-    id: ACME_WMS_ID,
     label: ACME_WMS_LABEL,
     available: true,
     createReplayPolicy: 'client-side-dedupe-only',
@@ -318,28 +355,81 @@ export function acmeWmsConnectorDef(
   }
 }
 
+export function acmeWmsConnectorDef(
+  warehouse: AcmeWarehouse = makeAcmeWarehouse(),
+  overrides: Partial<WmsConnectorRegistration<SeamWmsConnectorId>> = {},
+): WmsConnectorDef<SeamWmsConnectorId> {
+  return { id: ACME_WMS_ID, ...acmeWmsRegistration(warehouse, overrides) }
+}
+
 /**
- * A registry containing the shipped Mintsoft definition AND the fictitious connector.
+ * Mintsoft's SEAM registration: registered, never the connector under test, and never talking to
+ * anything.
  *
- * Mintsoft's real definition is reused rather than re-declared, so this registry
- * differs from production in exactly one way: it has a second entry.
+ * `isConfigured()` answers `false` rather than throwing, because the UI facades legitimately reach
+ * `findWmsConnector('mintsoft').isConfigured()` on the fallback path and a throw there would test
+ * the fixture instead of the code. Every OTHER method is absent, so a routing bug that reaches the
+ * shipped connector still fails loudly instead of opening a database connection.
+ */
+const seamMintsoftRegistration: WmsConnectorRegistration<SeamWmsConnectorId> = {
+  label: 'Mintsoft',
+  available: true,
+  createReplayPolicy: 'remote-refuses-duplicate',
+  create: () => ({
+    id: 'mintsoft',
+    name: 'Mintsoft',
+    isConfigured: async () => false,
+  }) as unknown as WmsRegistrableConnector<SeamWmsConnectorId>,
+}
+
+/**
+ * A registry over {@link SEAM_WMS_CONNECTOR_IDS} — the shipped connector plus the fictitious one.
+ *
+ * Built by the SHIPPED derivation, from the SAME id list the seam files widen `WMS_CONNECTOR_IDS`
+ * to, so this registry differs from production in exactly one way: the list has a second entry and
+ * so does the record. It cannot differ in the way that mattered — an id registered with no
+ * definition — because that is the thing the derivation refuses.
  */
 export function makeSeamRegistry(
   warehouse: AcmeWarehouse = makeAcmeWarehouse(),
-  overrides: Partial<WmsConnectorDef<SeamWmsConnectorId>> = {},
+  overrides: Partial<WmsConnectorRegistration<SeamWmsConnectorId>> = {},
 ): WmsConnectorRegistry<SeamWmsConnectorId> {
-  const mintsoft: WmsConnectorDef<SeamWmsConnectorId> = {
-    id: 'mintsoft',
-    label: 'Mintsoft',
-    available: true,
-    createReplayPolicy: 'remote-refuses-duplicate',
-    // Never constructed by the seam tests — they only ever build the Acme connector.
-    // Kept so the registry has the same shape production has.
-    create: (): WmsRegistrableConnector<SeamWmsConnectorId> => {
-      throw new Error('seam registry: the Mintsoft connector is not constructed in these tests')
-    },
+  return createRegisteredWmsConnectorRegistry<SeamWmsConnectorId>(SEAM_WMS_CONNECTOR_IDS, {
+    mintsoft: seamMintsoftRegistration,
+    [ACME_WMS_ID]: acmeWmsRegistration(warehouse, overrides),
+  })
+}
+
+/**
+ * The `@/lib/connectors/wms/registry` mock a seam file installs.
+ *
+ * The shipped module with its DEFAULT SOURCE re-bound to the seam registry — not a set of
+ * hand-written lookups. Three seam files used to re-implement `findWmsConnectorLabel`,
+ * `getWmsConnectorHooks` and `findWmsConnector` as one-liners over their own registry, which is a
+ * fixture re-stating what production derives: a change to the real degradation rule (`findDef` not
+ * `getDef`, `?? {}` not a throw) would leave all three copies green. Only the two functions with no
+ * injectable source — `getWmsConnector` and `getWmsConnectorDef` — are replaced, and they are
+ * replaced with the registry's own methods.
+ *
+ * `registry` is taken as a THUNK so a file can swap the registry between cases (the UI suite
+ * re-registers Acme with and without hooks) without re-installing a module mock.
+ */
+export function seamRegistryExports(
+  registry: () => WmsConnectorRegistry<string>,
+): Record<string, unknown> {
+  return {
+    ...realWmsRegistry,
+    wmsConnectorRegistry: new Proxy({} as WmsConnectorRegistry<string>, {
+      get: (_target, prop: string) => (registry() as unknown as Record<string, unknown>)[prop],
+    }),
+    getWmsConnectorDef: (id: string) => registry().getDef(id),
+    getWmsConnector: (id: string) => registry().getConnector(id),
+    getWmsConnectorHooks: (id: string, source = registry()) => realWmsRegistry.getWmsConnectorHooks(id, source),
+    findWmsConnectorLabel: (id: string, source = registry()) => realWmsRegistry.findWmsConnectorLabel(id, source),
+    findWmsConnector: (id: string, source = registry()) => realWmsRegistry.findWmsConnector(id, source),
+    isWmsConnectorConfigured: (id: string, source = registry()) =>
+      realWmsRegistry.isWmsConnectorConfigured(id, source),
   }
-  return createWmsConnectorRegistry<SeamWmsConnectorId>([mintsoft, acmeWmsConnectorDef(warehouse, overrides)])
 }
 
 

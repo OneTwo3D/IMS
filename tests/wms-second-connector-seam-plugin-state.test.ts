@@ -24,10 +24,15 @@
 import assert from 'node:assert/strict'
 import test, { mock } from 'node:test'
 
-import { ACME_WMS_ID, ACME_WMS_LABEL } from './helpers/fictitious-wms-connector.ts'
+import {
+  ACME_WMS_ID,
+  ACME_WMS_LABEL,
+  makeSeamRegistry,
+  seamRegistryExports,
+  seamWmsTypesExports,
+} from './helpers/fictitious-wms-connector.ts'
 import { mountClientComponent } from './fixtures/render-client-component.ts'
 import * as realTypes from '../lib/connectors/wms/types.ts'
-import * as realRegistry from '../lib/connectors/wms/registry.ts'
 import * as realSettingsStore from '../lib/settings-store.ts'
 
 /** The setting key the derived map must mint for a registered connector, spelled independently. */
@@ -42,27 +47,13 @@ const SHIPPED_KEYS = [
 ]
 const ALL_KEYS = [...SHIPPED_KEYS, ACME_SETTING_KEY]
 
-// The ONE thing a second connector's existence changes about the shipped build.
-mock.module('@/lib/connectors/wms/types', {
-  namedExports: {
-    ...realTypes,
-    WMS_CONNECTOR_IDS: ['mintsoft', ACME_WMS_ID],
-    isWmsConnectorId: (value: string | null | undefined) => value === 'mintsoft' || value === ACME_WMS_ID,
-  },
-})
-
-// The registry, for the catalogue's label lookup. `create` is never called here.
-mock.module('@/lib/connectors/wms/registry', {
-  namedExports: {
-    ...realRegistry,
-    wmsConnectorRegistry: {
-      ...realRegistry.wmsConnectorRegistry,
-      findDef: (id: string) => (id === ACME_WMS_ID
-        ? { id, label: ACME_WMS_LABEL, available: true, createReplayPolicy: 'remote-refuses-duplicate', create: () => { throw new Error('not used') } }
-        : realRegistry.wmsConnectorRegistry.findDef(id)),
-    },
-  },
-})
+// The ONE thing a second connector's existence changes about the shipped build — and it changes the
+// id list and the registry TOGETHER (round 12, Codex HIGH 1). The two used to be mocked
+// independently here, so the fixture could hold a state production cannot: an id registered with no
+// definition. Both now come from one constant, through the shipped derivation.
+mock.module('@/lib/connectors/wms/types', { namedExports: seamWmsTypesExports(realTypes) })
+const seamRegistry = makeSeamRegistry()
+mock.module('@/lib/connectors/wms/registry', { namedExports: seamRegistryExports(() => seamRegistry) })
 
 // --- the database, serialized the way the selection lock serializes writers ---------------------
 

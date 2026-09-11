@@ -54,3 +54,23 @@ export async function resolveActiveWmsConnector(): Promise<WmsConnectorResolutio
 export async function getEnabledWmsConnectorId(): Promise<WmsConnectorId | null> {
   return enabledWmsConnectorId(await getIntegrationPluginState())
 }
+
+/**
+ * The same answer, WITH ITS REASON (o3d-remove-shiphero round 12, Codex MEDIUM).
+ *
+ * `getEnabledWmsConnectorId` returns `null` for BOTH "none enabled" and "more than one enabled",
+ * and round 10 gave the resolver a three-valued answer only to have its callers collapse it back to
+ * two: the exception inbox told an operator "No WMS connector is enabled, so there is no warehouse
+ * to confirm the despatch against" and the drift actions told them the connector "is not enabled",
+ * while two switches were visibly on and the connector in question was one of them. The remedy for
+ * the two states is different — enable one, versus turn one of two off — so a caller that puts a
+ * sentence in front of an operator takes this and passes the resolution to `wmsResolutionSkipReason`
+ * (or to `ambiguousWmsConnectorReason`). Callers that only need an id, and behave identically on
+ * both, keep the helper above.
+ *
+ * No fallback, exactly like {@link getEnabledWmsConnectorId}: this answers "is a sweep maintaining
+ * this?", and with every plugin disabled no sweep runs.
+ */
+export async function resolveEnabledWmsConnectorSelection(): Promise<WmsConnectorResolution> {
+  return resolveEnabledWmsConnector(await getIntegrationPluginState())
+}

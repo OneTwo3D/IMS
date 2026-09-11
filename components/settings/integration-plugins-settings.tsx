@@ -109,11 +109,15 @@ export function IntegrationPluginsSettings({ plugins }: Props) {
 
   return (
     <div className="space-y-5">
+      {/* An UNAVAILABLE plugin only reaches this list while it is switched ON (see the catalogue),
+          and the only move it may make is off: `value && plugin.available` cannot turn one on, so
+          the screen cannot ask for a write the server would refuse. */}
       {plugins.map((plugin) => (
         <label key={plugin.id} className="flex items-start gap-3 cursor-pointer">
           <Switch
             checked={selection[plugin.id]}
-            onCheckedChange={(value) => setPlugin(plugin.id, value)}
+            disabled={!plugin.available && !selection[plugin.id]}
+            onCheckedChange={(value) => setPlugin(plugin.id, value && plugin.available)}
           />
           <div>
             <div className="text-sm font-medium">{plugin.label}</div>

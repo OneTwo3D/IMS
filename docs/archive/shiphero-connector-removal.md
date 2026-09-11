@@ -499,6 +499,78 @@ nobody had asked about.
    Enumerating fields is the bug; the next flag would have been dropped too. Guard suite: 47
    cases → **50**, all 47 still passing.
 
+## What round 12 closed (Codex, three HIGHs and a MEDIUM)
+
+Round 11's review found three HIGHs and one MEDIUM. Two of the three are, again, *a rule
+applied to everything except the one place it had to be applied to*.
+
+1. **The canonical id list did not make the registry exhaustive.** Round 6 made the
+   `/sync` panels a total `Record<WmsConnectorId, …>` and round 8 made the plugin toggles
+   registry-derived, so a registered id with no *screen* stopped compiling. Nothing did the
+   same for the **definitions** — `BUILT_IN_WMS_CONNECTORS` was `readonly WmsConnectorDef[]`
+   — and that is the one list that actually has to be complete. Adding an id, a panel and a
+   form while omitting the definition typechecked: the settings screen offered the connector,
+   the writer persisted it, the resolver selected it, and every route reaching
+   `getWmsConnector` threw `Unknown WMS connector` **at request time**.
+
+   The registry is now the id list crossed with one definition each.
+   `BUILT_IN_WMS_CONNECTOR_REGISTRATIONS` is `Record<WmsConnectorId, WmsConnectorRegistration>`
+   (the definition *minus* its id, which the key supplies — so the id cannot be written twice
+   differently), and `createRegisteredWmsConnectorRegistry(ids, registrations)` walks the list.
+   Missing definition: a `tsc` error. Extra definition: an excess-property error. And because
+   a build can still reach the runtime with the two disagreeing — a `mock.module`, a
+   JavaScript caller, a mixed-version deploy — the derivation **throws at module evaluation**,
+   naming the id, where a deploy sees it.
+
+   **The seam missed it because the fixture mocked the two independently.** Every seam file
+   widened `WMS_CONNECTOR_IDS` inline *and*, separately, hand-built a registry from an array
+   of definitions — so the fixture could hold the exact state production forbids, and four
+   green suites proved nothing about it. One constant (`SEAM_WMS_CONNECTOR_IDS`) now feeds
+   both, through the shipped derivation, and the registry mock **re-binds the default source**
+   of the real lookups instead of re-implementing them as one-liners.
+
+2. **`WmsConnectorDef.available` was read by nothing.** It is documented as "false for a
+   connector that is registered but not offered to operators yet". The registry-derived
+   toggles (round 8) and the registry-derived `/sync` cards (round 6) both walked *every*
+   registered id, and the `/sync` grid wrote `available: true` into every WMS card itself — a
+   second source for a fact the definition already states. A staged connector therefore got a
+   live switch, could be enabled by either writer, and became the connector every push, sweep
+   and dispatch routed to.
+
+   `available` is consulted in one place (`isIntegrationPluginAvailable`,
+   `lib/domain/integrations/plugin-catalog.ts`) and read from there by the settings catalogue,
+   the `/sync` grid (the ids are resolved server-side and passed down; the hardcoded `true` is
+   gone, not synced), the `?connector=` deep link, and **both** plugin-state writers — which
+   now call ONE rule function, `findIntegrationPluginWriteConflict`, so neither can hold half
+   the ruleset. Availability is checked only on the ids being turned **on**: an unavailable
+   connector that is somehow enabled keeps its switch, or the misconfiguration removes its own
+   remedy again.
+
+3. **The authoritative `configured` predicate accepted an unusable whitespace token.**
+   Round 10 made `isMintsoftConfigured` the source for the onboarding tick and the `/sync`
+   badge. Its credentials branch tested the cached `mintsoft_api_key` **without trimming**,
+   while the `mintsoftHasAuthMaterial` it replaced trimmed. A whitespace-only row — or a
+   `MINTSOFT_API_KEY` environment variable of spaces, which never passes through the validated
+   settings action — reported a set-up connection while every request failed. Filed as
+   `o3d-pow3` in round 11 and ruled BLOCKS in round 12, correctly: the divergence was cosmetic
+   until round 10 made the path decide what operators see.
+
+   Both divergences on `o3d-pow3` resolve the same way — **this predicate is true only of a
+   connection something could actually be sent over**. The cached key is trimmed; and the
+   *narrowed* base-URL answer (an unparseable stored URL now reads as absent, where the old
+   predicate accepted any non-empty string) is **kept and declared**, because the normalised
+   value is the only base URL a Mintsoft request is ever built from.
+
+4. (MEDIUM) **Ambiguity still produced false operator messages.** Round 10 gave the resolver a
+   three-valued answer and three callers collapsed it back to two: the exception inbox said
+   "No WMS connector is enabled" and the drift isolate/retry actions said the connector "is not
+   enabled", with two switches visibly on; `/sync` said another connector "currently" serves
+   the app, in the one state where none does. Each now takes
+   `resolveEnabledWmsConnectorSelection()` and reports the reason, and the WMS panel has
+   `ambiguous` and `none-active` states of its own. **The UI test named for this never reached
+   it** — the "SECOND enabled connector" case had only one connector enabled — so it is
+   renamed to what it exercises and a real two-enabled case added beside it.
+
 ## Leaks that remain, deliberately
 
 - `lib/domain/wms/booked-in-service.ts` is Mintsoft's booked-in webhook processor

@@ -31,7 +31,12 @@
 import assert from 'node:assert/strict'
 import test, { mock } from 'node:test'
 
-import { ACME_WMS_ID } from './helpers/fictitious-wms-connector.ts'
+import {
+  ACME_WMS_ID,
+  makeSeamRegistry,
+  seamRegistryExports,
+  seamWmsTypesExports,
+} from './helpers/fictitious-wms-connector.ts'
 import * as realTypes from '../lib/connectors/wms/types.ts'
 
 const ACME_SETTING_KEY = `plugin_${ACME_WMS_ID}_enabled`
@@ -45,14 +50,13 @@ const ALL_KEYS = [
   ACME_SETTING_KEY,
 ]
 
-// The ONE thing a second registered connector changes about the shipped build.
-mock.module('@/lib/connectors/wms/types', {
-  namedExports: {
-    ...realTypes,
-    WMS_CONNECTOR_IDS: ['mintsoft', ACME_WMS_ID],
-    isWmsConnectorId: (value: string | null | undefined) => value === 'mintsoft' || value === ACME_WMS_ID,
-  },
-})
+// The ONE thing a second registered connector changes about the shipped build — and it changes BOTH
+// halves together (round 12, Codex HIGH 1): the id list and the registry come from one fixture
+// constant, through the shipped derivation, because production requires them to agree.
+mock.module('@/lib/connectors/wms/types', { namedExports: seamWmsTypesExports(realTypes) })
+/** MUTABLE: the availability cases re-register Acme as a connector this build does not offer. */
+let seamRegistry = makeSeamRegistry()
+mock.module('@/lib/connectors/wms/registry', { namedExports: seamRegistryExports(() => seamRegistry) })
 
 // --- the settings rows, serialized the way the selection lock serializes writers ----------------
 
@@ -162,6 +166,24 @@ function forceStoredState(enabled: string[]) {
   for (const id of enabled) store.set(`plugin_${id}_enabled`, 'true')
   writes.length = 0
 }
+
+/**
+ * THE FIXTURE ITSELF, CHECKED (o3d-remove-shiphero round 12, fixture audit).
+ *
+ * `ALL_KEYS` is this file's statement of "every plugin row", and the settings double uses it to
+ * decide which rows `lockIntegrationPluginSelection` may read. Production's statement is
+ * `INTEGRATION_PLUGIN_KEYS_IN_LOCK_ORDER`, derived from the id list. If they drift — a seventh
+ * plugin, a renamed key — the double would serve the writer an INCOMPLETE state, the exclusivity
+ * check would evaluate against rows that are not all there, and every case below would keep
+ * passing while testing less. Nothing tied them together, so they are tied here.
+ */
+test('[round 12 fixture audit] the settings double covers exactly the rows the selection lock takes', async () => {
+  const keys = await import('../lib/integration-plugin-keys.ts')
+  assert.deepEqual(
+    [...ALL_KEYS].sort(), [...keys.INTEGRATION_PLUGIN_KEYS_IN_LOCK_ORDER].sort(),
+    'the fixture and production must name the same plugin rows, or this suite silently shrinks',
+  )
+})
 
 // ---------------------------------------------------------------------------------------------
 // 1. UNWRITABLE — through both writers, and across the race between them
@@ -355,4 +377,113 @@ test('[round 10 HIGH 1] the ASN facade refuses with the CONTRADICTION, not with 
   assert.doesNotMatch(String(result.error), /No WMS connector is enabled/)
   assert.match(String(result.error), /More than one WMS connector is enabled/)
   assert.match(String(result.error), /Integration Plugins/, 'and it names where the remedy is')
+})
+
+// ---------------------------------------------------------------------------------------------
+// 3. NOT OFFERED — `WmsConnectorDef.available`, which nothing used to read
+// (o3d-remove-shiphero round 12, Codex HIGH 2)
+//
+// `available` is documented on the definition as "false for a connector that is registered but not
+// offered to operators yet", and NOTHING consulted it. Round 8's registry-derived toggles and round
+// 6's registry-derived /sync cards both walked every registered id, so a staged connector got a
+// live switch, could be enabled by either writer, and then became the connector every push, sweep
+// and dispatch routed to. The two plugin-write rules are ONE function now
+// (`findIntegrationPluginWriteConflict`) precisely so a writer cannot hold half of them.
+// ---------------------------------------------------------------------------------------------
+
+/** Re-register Acme as a connector this build does not offer, for the body of one test. */
+async function withUnavailableAcme<T>(body: () => Promise<T>): Promise<T> {
+  const previous = seamRegistry
+  seamRegistry = makeSeamRegistry(undefined, { available: false })
+  try {
+    return await body()
+  } finally {
+    seamRegistry = previous
+  }
+}
+
+test('[round 12 HIGH 2] the Settings writer refuses to enable a connector this build does not offer', async () => {
+  const { saveIntegrationPluginState } = await import('../app/actions/settings.ts')
+
+  await withUnavailableAcme(async () => {
+    // THE DEFECT: before the fix this returned `saved` and wrote the row, and the resolver then
+    // selected a connector the build had deliberately withheld.
+    const result = await saveIntegrationPluginState({ [ACME_WMS_ID]: true } as never)
+
+    assert.equal(result.status, 'refused', JSON.stringify(result))
+    assert.match((result as { error: string }).error, /not offered by this build/i)
+    assert.match((result as { error: string }).error, new RegExp(ACME_WMS_ID))
+    assert.deepEqual(writes, [], 'a refusal commits nothing')
+    assert.notEqual(store.get(ACME_SETTING_KEY), 'true')
+  })
+})
+
+test('[round 12 HIGH 2] the onboarding wizard refuses it too — the ruleset is one function', async () => {
+  const keys = await import('../lib/integration-plugin-keys.ts')
+  const { saveOnboardingPluginState } = await import('../app/actions/onboarding.ts')
+
+  await withUnavailableAcme(async () => {
+    const result = await saveOnboardingPluginState(keys.buildIntegrationPluginState((id) => isAcme(id)))
+
+    assert.equal(result.status, 'refused', JSON.stringify(result))
+    assert.match((result as { error: string }).error, /not offered by this build/i)
+    assert.deepEqual(writes, [], 'and the wizard commits nothing either')
+  })
+})
+
+test('[round 12 HIGH 2] the SAME save is accepted once the connector is offered', async () => {
+  // The contrast that makes the two cases above about the FLAG rather than about a writer that
+  // started refusing Acme for some other reason.
+  const { saveIntegrationPluginState } = await import('../app/actions/settings.ts')
+  const result = await saveIntegrationPluginState({ [ACME_WMS_ID]: true } as never)
+  assert.equal(result.status, 'saved', JSON.stringify(result))
+  assert.equal(store.get(ACME_SETTING_KEY), 'true')
+})
+
+test('[round 12 HIGH 2] an unavailable connector that is ON can still be switched OFF', async () => {
+  // A rule that removed its own remedy would be the defect this branch keeps re-inventing: a row
+  // can say enabled (a restore, a direct UPDATE, a build that withdrew a connector that was on),
+  // and an operator must be able to turn it off. Availability is checked only on the ids being
+  // turned ON.
+  forceStoredState([ACME_WMS_ID])
+  const { saveIntegrationPluginState } = await import('../app/actions/settings.ts')
+
+  await withUnavailableAcme(async () => {
+    const result = await saveIntegrationPluginState({ [ACME_WMS_ID]: false } as never)
+    assert.equal(result.status, 'saved', JSON.stringify(result))
+    assert.equal(store.get(ACME_SETTING_KEY), 'false')
+  })
+})
+
+test('[round 12 HIGH 2] the settings screen offers no switch for an unavailable connector — unless it is on', async () => {
+  const catalogue = await import('../lib/domain/integrations/plugin-catalog.ts')
+  const keys = await import('../lib/integration-plugin-keys.ts')
+
+  await withUnavailableAcme(async () => {
+    assert.equal(
+      catalogue.isIntegrationPluginAvailable(ACME_WMS_ID as never), false,
+      'the flag is read from the connector\'s own definition',
+    )
+    assert.deepEqual(
+      catalogue.listAvailableWmsConnectorIds(), ['mintsoft'],
+      'and the /sync grid is offered the same answer, from the same place',
+    )
+
+    const off = catalogue.listIntegrationPluginDescriptors(keys.buildIntegrationPluginState(() => false))
+    assert.equal(
+      off.some((plugin) => isAcme(plugin.id)), false,
+      'a connector this build does not offer has no switch at all',
+    )
+
+    const on = catalogue.listIntegrationPluginDescriptors(keys.buildIntegrationPluginState((id) => isAcme(id)))
+    const acme = on.find((plugin) => isAcme(plugin.id))
+    assert.ok(acme, 'but one that is somehow ENABLED is listed, or nothing can turn it off')
+    assert.equal(acme.available, false, 'flagged, so the screen can offer the one legal move')
+    assert.match(acme.description, /Switch it off/i)
+  })
+
+  // And with the flag back on, the switch returns — so the omission above is the flag's doing.
+  const listed = catalogue.listIntegrationPluginDescriptors(keys.buildIntegrationPluginState(() => false))
+  assert.equal(listed.some((plugin) => isAcme(plugin.id)), true)
+  assert.deepEqual(catalogue.listAvailableWmsConnectorIds().sort(), ['mintsoft', ACME_WMS_ID].sort())
 })

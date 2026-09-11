@@ -32,7 +32,15 @@ import {
   makeSeamRegistry,
   type SeamWmsConnectorId,
 } from './helpers/fictitious-wms-connector.ts'
-import { createWmsConnectorRegistry, type WmsConnectorDef } from '../lib/connectors/wms/registry.ts'
+import {
+  BUILT_IN_WMS_CONNECTOR_REGISTRATIONS,
+  createRegisteredWmsConnectorRegistry,
+  createWmsConnectorRegistry,
+  wmsConnectorRegistry,
+  type WmsConnectorDef,
+  type WmsConnectorRegistration,
+} from '../lib/connectors/wms/registry.ts'
+import { WMS_CONNECTOR_IDS, type WmsConnectorId } from '../lib/connectors/wms/types.ts'
 import { runWmsOrderPushSweepCore } from '../lib/domain/wms/order-push-sweep.ts'
 import type { WmsOrderPushPort, WmsPushCandidate } from '../lib/domain/wms/order-push-sweep.ts'
 import {
@@ -119,6 +127,63 @@ test('seam/policy: a REGISTERED unsafe connector is distinguishable from an unkn
   // 'client-side-dedupe-only' arm as "unreachable", the first assertion above fails
   // while every `no-such-wms` assertion in this file keeps passing.
   assert.notEqual(wmsCreateReplayPolicy(ACME_WMS_ID, registry), wmsCreateReplayPolicy('no-such-wms', registry))
+})
+
+/**
+ * THE SHIPPED REGISTRY IS EXHAUSTIVE OVER THE CANONICAL ID LIST
+ * (o3d-remove-shiphero round 12, Codex HIGH 1).
+ *
+ * `BUILT_IN_WMS_CONNECTORS` was a hand-written array typed `readonly WmsConnectorDef[]` while the
+ * panels (round 6) and the plugin toggles (round 8) had both been made total over
+ * `WMS_CONNECTOR_IDS`. So the one list that actually has to be complete was the one list that was
+ * not: an id with a panel, a form and no DEFINITION compiled, was offered by the settings screen,
+ * was persisted by the writer, was selected by the resolver, and threw `Unknown WMS connector` at
+ * the first order push, dispatch sweep or ASN create that reached it.
+ *
+ * Three statements, because one of them alone is satisfiable by an accident:
+ *   - the TYPE is total, checked by `tsc` on the annotation below;
+ *   - the RUNTIME registry covers the list and is in its order, which is what the legacy fallback
+ *     in `getActiveWmsConnectorId` depends on;
+ *   - and the DERIVATION refuses the bad pair rather than producing a half-built definition —
+ *     tests/wms-registry-exhaustive.test.ts drives that through the shipped module itself.
+ */
+test('seam/registry: every registered id has a definition, in the id list’s own order', () => {
+  // COMPILE TIME. Delete an entry from the registration record and this annotation is the error;
+  // add one that is not a registered id and the object literal is.
+  const total: { [K in WmsConnectorId]: WmsConnectorRegistration } = BUILT_IN_WMS_CONNECTOR_REGISTRATIONS
+  assert.deepEqual(Object.keys(total).sort(), [...WMS_CONNECTOR_IDS].sort())
+
+  // RUNTIME. `ids()` is the list, not a copy of it, and every id resolves to a definition and a
+  // connector rather than to a throw from inside a request.
+  assert.deepEqual([...wmsConnectorRegistry.ids()], [...WMS_CONNECTOR_IDS])
+  for (const id of WMS_CONNECTOR_IDS) {
+    assert.ok(wmsConnectorRegistry.findDef(id), `${id} is registered but has no definition`)
+    assert.equal(wmsConnectorRegistry.getDef(id).id, id, 'and the definition carries the id it is registered under')
+  }
+})
+
+test('seam/registry: the derivation REFUSES an id with no definition instead of half-building one', () => {
+  // The runtime half of the compile-time rule, for the builds that can still reach it: a
+  // `mock.module` that widens the id list, a JavaScript caller, a mixed-version deploy. Without
+  // this the spread would produce `{ id }` with no `create`, and the failure would surface as
+  // "def.create is not a function" on the first order that needed the warehouse.
+  assert.throws(
+    () => createRegisteredWmsConnectorRegistry(
+      ['mintsoft', 'ghost-wms'],
+      { mintsoft: BUILT_IN_WMS_CONNECTOR_REGISTRATIONS.mintsoft } as never,
+    ),
+    /ghost-wms/,
+    'and the message names the id, because that is the only thing the deploy can act on',
+  )
+
+  // The contrast that keeps the case above from passing on a derivation that always throws.
+  assert.deepEqual(
+    createRegisteredWmsConnectorRegistry(
+      ['mintsoft'],
+      { mintsoft: BUILT_IN_WMS_CONNECTOR_REGISTRATIONS.mintsoft },
+    ).ids(),
+    ['mintsoft'],
+  )
 })
 
 test('seam/policy: the SHIPPED registry does not know the fictitious connector', () => {

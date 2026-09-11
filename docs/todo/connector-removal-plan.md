@@ -118,7 +118,8 @@ layer short twice more:
   missing-member error, because that cast is what makes the hole invisible.
 
 **Round 10 sharpened it a sixth, seventh and eighth time — and all three were
-consequences of round 8's own fixes.** That is the pattern to expect here: a fix that
+consequences of round 8's own fixes; round 12 sharpened it three more, two of them
+consequences of rounds 6 and 8.** That is the pattern to expect here: a fix that
 removes a way to be wrong tends to open a state nobody had asked about.
 
 - **A derived toggle needs a derived RULE.** Making the plugin switches
@@ -132,6 +133,26 @@ removes a way to be wrong tends to open a state nobody had asked about.
   (`resolveEnabledWmsConnector` → `none`/`one`/`ambiguous`). A persisted "active
   connector" row is the tempting alternative and is worse: it is a second source of truth
   beside the enable flags every screen already reads.
+- **Derive the CONTROL and the CONSTRAINT, and then check the LIST is complete.** Round 12
+  found the other half of the same shape: the panels and the toggles were made total over
+  `WMS_CONNECTOR_IDS`, and the `WmsConnectorDef` list — the one list that has to be complete
+  for anything to route — was left as a plain array. An id with a panel, a form and no
+  definition compiled, was offered, was persisted, was selected, and threw
+  `Unknown WMS connector` per request. **When a registry is derived from a list, derive it
+  from that list** (`createRegisteredWmsConnectorRegistry(ids, registrations)`) so the
+  totality is a type error, and make the same derivation throw at load for the builds that
+  can still reach the runtime with the two disagreeing.
+- **A registration flag nothing reads is decoration.** `WmsConnectorDef.available` existed
+  from the start, documented as "not offered to operators yet", and until round 12 no screen
+  and no writer consulted it — while the `/sync` grid wrote `available: true` into every WMS
+  card itself. For Shopify and QuickBooks: when you stage a connector behind a flag, grep for
+  the flag and make sure something in each of the three places reads it (the catalogue, the
+  UI, the writers), and that the UI is not holding a *second* copy of the fact.
+- **Seam fixtures must keep in step whatever production keeps in step.** Four suites widened
+  `WMS_CONNECTOR_IDS` inline and hand-built a registry beside it, so the fixture could hold
+  the exact state production forbids — which is why the missing-definition hole survived four
+  green rounds. One constant now feeds both, through the shipped derivation. Ask of every
+  fixture: *does this let two things drift that production requires to agree?*
 - **"Behaviour-preserving by inspection" is a claim, and it needs a test.** Replacing the
   hook's `configured` with the contract's `isConfigured()` looked like a strict
   improvement. The old value came from a predicate that **caught** a malformed-auth-mode

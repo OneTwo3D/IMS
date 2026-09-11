@@ -394,6 +394,31 @@ export async function getMintsoftAccessToken(options?: { forceRefresh?: boolean 
   return mintsoftAuthRefreshInFlight
 }
 
+/**
+ * WHETHER THIS CONNECTION IS SET UP — and the one predicate the WMS boundary now answers with
+ * (o3d-pow3 / o3d-remove-shiphero round 12, Codex HIGH 3).
+ *
+ * EVERY TOKEN THIS READS IS TRIMMED, because a whitespace-only token is not a credential. Round 10
+ * made this predicate AUTHORITATIVE for the `configured` flag on the onboarding wizard and the
+ * /sync panel (`isWmsConnectorConfigured` → `MintsoftConnector.isConfigured()` → here), and it
+ * replaced `mintsoftHasAuthMaterial`, which trimmed. `getMintsoftApiConfiguration` trims the four
+ * settings-backed values, but the CACHED key was read raw straight from `getSettingValue`: a
+ * whitespace-only `mintsoft_api_key` row therefore ticked the onboarding step and painted /sync
+ * "Configured" while every request built `Authorization: ' '` and failed. Nothing downstream can
+ * recover from that, because the screens that say it is fine are the screens an operator would use
+ * to fix it.
+ *
+ * WHY THE baseUrl ANSWER IS THE NARROW ONE, DELIBERATELY (the second divergence on o3d-pow3).
+ * `config.baseUrl` is `normalizeMintsoftBaseUrl(stored) ?? ''`, so an UNPARSEABLE stored base URL
+ * reads as absent here, where the predicate this replaced accepted any non-empty string. The narrow
+ * answer is the correct one and it is kept: `getMintsoftApiConfiguration().baseUrl` is the ONLY
+ * base URL any Mintsoft request is ever built from, so a value that fails
+ * `validateExternalBaseUrl` is a connection that cannot make a single call. Reporting it
+ * "configured" describes a connection that does not exist — the same lie as the whitespace key, and
+ * it removes the same remedy, since "set up" is what stops an operator re-entering the endpoint.
+ * The two divergences therefore resolve the same way: this predicate is true only of a connection
+ * something could actually be sent over.
+ */
 export async function isMintsoftConfigured(): Promise<boolean> {
   const [config, cachedApiKey] = await Promise.all([
     getMintsoftApiConfiguration(),
@@ -411,7 +436,7 @@ export async function isMintsoftConfigured(): Promise<boolean> {
     return Boolean(config.staticApiKey)
   }
 
-  return Boolean((config.username && config.password) || cachedApiKey)
+  return Boolean((config.username && config.password) || cachedApiKey?.trim())
 }
 
 /**
