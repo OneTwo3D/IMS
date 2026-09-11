@@ -1,11 +1,38 @@
+import type { TransferLineLandedQty } from '@/lib/domain/inventory/transfer-landed-quantity'
 import {
   parseCostLayerSnapshot,
   reduceSnapshotByCostLayer,
   takeFromSnapshotEntries,
   type CostLayerSnapshotEntry,
 } from '@/lib/cost-layer-snapshots'
+import { addMoney, toDecimal } from '@/lib/domain/math/decimal'
 
 export const WMS_RECEIPT_QTY_EPSILON = 0.0001
+
+/**
+ * The parent transfer statuses under which a `wms_asn_line_maps` row may still be
+ * used to bring units into stock (6oyu.19, Codex round-7 HIGH-1).
+ *
+ * WHY THIS IS SHARED. The WMS webhook book-in has always checked this — an ASN
+ * callback for a transfer that is not IN_TRANSIT or RECEIVED is refused. The WMS
+ * stock-sync ALIGNMENT path never did, and nothing closes a transfer's ASN when its
+ * dispatch is cancelled: `cancelDispatchedTransfer` restores the FULL line quantity
+ * and its cost layers to the SOURCE and leaves the ASN open. A later automatic
+ * align-up could then use that cancelled line, add stock at the DESTINATION and
+ * create a second replacement layer linked to the same source layer, so one
+ * subsequent landed-cost revaluation propagated into both live layers and posted
+ * the inventory reclassification twice. That is the same double-count this branch
+ * exists to close, reached from a route the branch did not touch — it predates the
+ * branch (see o3d-1mga for production prevalence).
+ *
+ * DRAFT is excluded as well as CANCELLED: nothing has been dispatched, so there is
+ * no cost-layer snapshot to slice and no units to bring to rest.
+ */
+export const WMS_RECEIPT_USABLE_TRANSFER_STATUSES = ['IN_TRANSIT', 'RECEIVED'] as const
+
+export function isTransferUsableForWmsReceipt(status: string): boolean {
+  return (WMS_RECEIPT_USABLE_TRANSFER_STATUSES as ReadonlyArray<string>).includes(status)
+}
 
 export type BookedInDryRunWarningCode =
   | 'remote_regression'
@@ -188,15 +215,31 @@ export function buildBookedInDryRun(input: {
   }
 }
 
+/**
+ * The unconsumed slice of a dispatch snapshot for the next `qtyReceived` units.
+ *
+ * `alreadyLanded` IS THE OFFSET, and it is deliberately not a number (6oyu.19,
+ * Codex round-6 HIGH-1). Four paths call this — manual receipt, dispatch
+ * cancellation, WMS webhook book-in and WMS stock-sync alignment — and each used to
+ * compute the offset itself from whichever column it happened to have to hand:
+ * `stock_transfer_lines.qtyReceived` for the three in app/actions/transfers.ts,
+ * `wms_asn_line_maps.qtyAccountedViaSnapshot` for the alignment, and a max of the
+ * two for the webhook. Any two of those disagreeing re-lays cost layers that are
+ * already down, which is the double-count this branch exists to close.
+ *
+ * `TransferLineLandedQty` can only be produced by
+ * lib/domain/inventory/transfer-landed-quantity.ts, so the offset now has exactly
+ * one definition and a call site cannot supply its own.
+ */
 export function sliceTransferSnapshotForReceipt(input: {
   snapshot: unknown
-  alreadyReceivedQty: number
+  alreadyLanded: TransferLineLandedQty
   qtyReceived: number
 }): CostLayerSnapshotEntry[] {
   const snapshot = parseCostLayerSnapshot(input.snapshot)
   if (snapshot.length === 0) return []
 
-  const alreadyReceivedQty = Math.max(0, input.alreadyReceivedQty)
+  const alreadyReceivedQty = Math.max(0, input.alreadyLanded.qtyNumber)
   const qtyReceived = Math.max(0, input.qtyReceived)
   if (qtyReceived <= 0) return []
 
@@ -210,4 +253,43 @@ export function sliceTransferSnapshotForReceipt(input: {
   )
 
   return takeFromSnapshotEntries(remaining, qtyReceived).taken
+}
+
+/**
+ * HOW MANY UNITS OF A DISPATCH SNAPSHOT ARE STILL COSTABLE — the total positive
+ * quantity `sliceTransferSnapshotForReceipt` could still return for this line, if
+ * asked for an unbounded amount (6oyu.19, Codex round-8 HIGH-1).
+ *
+ * WHY AN ALLOCATOR NEEDS THIS. A transfer line's outstanding quantity (`line.qty`
+ * less everything landed) and its snapshot's remaining costable quantity are
+ * different numbers, and the second can be the smaller: a source warehouse that
+ * dispatched legacy or otherwise uncosted stock produces a snapshot that under-
+ * records the units it shipped. An allocator that caps only by the outstanding
+ * quantity will happily plan to book ten units against six costable ones. The stock
+ * increment is for ten and the layers are for six.
+ *
+ * Same offset rule as the slicer, and the same branded `TransferLineLandedQty`, so
+ * the cap and the slice provably walk past the same units.
+ */
+export function remainingCostableSnapshotQty(input: {
+  snapshot: unknown
+  alreadyLanded: TransferLineLandedQty
+}): number {
+  const snapshot = parseCostLayerSnapshot(input.snapshot)
+  if (snapshot.length === 0) return 0
+
+  const alreadyReceivedQty = Math.max(0, input.alreadyLanded.qtyNumber)
+  const { taken: consumedBeforeThisReceipt } = takeFromSnapshotEntries(snapshot, alreadyReceivedQty)
+  const remaining = reduceSnapshotByCostLayer(
+    snapshot,
+    consumedBeforeThisReceipt.map((entry) => ({
+      costLayerId: entry.costLayerId,
+      qty: entry.qty,
+    })),
+  )
+
+  return remaining.reduce((sum, entry) => {
+    const qty = toDecimal(entry.qty)
+    return qty.gt(0) ? addMoney(sum, qty) : sum
+  }, toDecimal(0)).toNumber()
 }

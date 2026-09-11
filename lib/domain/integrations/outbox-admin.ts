@@ -5,10 +5,47 @@ import {
   type IntegrationOutboxRow,
   type IntegrationOutboxStatus,
 } from '@/lib/domain/integrations/outbox'
+import { INTEGRATION_OUTBOX_MAX_LEASE_MS } from '@/lib/domain/integrations/outbox-leases'
 
 const ADMIN_OUTBOX_DEFAULT_LIMIT = 50
 export const ADMIN_OUTBOX_MAX_LIMIT = 100
-export const ADMIN_OUTBOX_STALE_PROCESSING_LOCK_MS = 10 * 60 * 1000
+/**
+ * How long past the LONGEST lease a lock has to sit before this file will touch it (o3d-8td2 r4).
+ *
+ * A margin, not a safety property. Nothing about elapsed time proves a holder died — that is the
+ * finding this whole issue turns on — so the margin buys no belief about the EFFECT. What it does
+ * buy is the narrower claim `permanentlyFailIntegrationOutboxAdminRow`'s gate actually makes: that
+ * the row is past the point where any worker could still consider it its own. Five minutes covers
+ * clock skew between app instances (each stamps `lockedAt` from its own clock) and a drain tick that
+ * began a moment before its lease expired.
+ */
+export const ADMIN_OUTBOX_POST_LEASE_MARGIN_MS = 5 * 60 * 1000
+
+/**
+ * THE DEAD-LETTER GATE'S STALENESS THRESHOLD, DERIVED FROM THE LEASES IT OVERRIDES (o3d-zdvn;
+ * o3d-8td2 round 4, Codex HIGH 1).
+ *
+ * The one thing this constant gates is `permanentlyFailIntegrationOutboxAdminRow`: how old a
+ * PROCESSING lock must be before an admin may dead-letter the row under it. On `development` it is
+ * its own `10 * 60 * 1000`, which reads as agreement with the outbox default lease and silently
+ * DISAGREES with the only lease that differs — `xero/accounting.post` is drained under FIFTEEN
+ * minutes, so between minute 10 and minute 15 this gate would let an admin bury a Xero claim whose
+ * worker was still comfortably inside its lease. That is o3d-zdvn, and it is a defect in the
+ * pre-existing mutation rather than anything to do with the stalled-park surface withdrawn in round
+ * 8 — which is why the derivation stays after that withdrawal.
+ *
+ * So it is computed rather than restated: the maximum over every lease
+ * `INTEGRATION_OUTBOX_DRAIN_LEASES_MS` declares, plus a margin. A future drain that takes a
+ * longer lease raises this threshold in the same edit, and `tests/domain/integrations/outbox.test.ts`
+ * asserts the inequality over the map rather than over a copied number.
+ *
+ * IT BUYS NO BELIEF ABOUT THE EFFECT, and nothing here may pretend otherwise. Past this threshold
+ * the row is past the point where a worker could still consider it its own; whether that worker's
+ * WRITE already reached WooCommerce or Xero is a question elapsed time cannot answer at all. See the
+ * `unsafe-to-replay` prose in `outbox-replay-policy.ts` for what follows from that.
+ */
+export const ADMIN_OUTBOX_STALE_PROCESSING_LOCK_MS = INTEGRATION_OUTBOX_MAX_LEASE_MS
+  + ADMIN_OUTBOX_POST_LEASE_MARGIN_MS
 const REDACTED_VALUE = '[redacted]'
 const SENSITIVE_SINGLE_KEYS = new Set(['authorization', 'secret', 'password', 'token', 'bearer', 'creds', 'cred', 'pwd', 'salt', 'hmac', 'signature'])
 const SENSITIVE_KEY_PAIRS = new Set([

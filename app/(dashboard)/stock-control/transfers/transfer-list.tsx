@@ -703,7 +703,11 @@ function TransferCard({
                   onClick={handleReceive} disabled={actioning}>
                   <PackageCheck className="h-3 w-3" /> Mark Received
                 </Button>
-                {!transfer.lines.some((l) => Number(l.qtyReceived ?? 0) > 0) && (
+                {/* 6oyu.19 (Codex r6): LANDED, not qtyReceived — a line the WMS stock-sync
+                    alignment brought in has a qtyReceived of zero, and offering to cancel
+                    its dispatch is what let the same units be layered twice. Mirrors the
+                    server-side precondition in cancelDispatchedTransfer. */}
+                {!transfer.lines.some((l) => Number(l.landedQty ?? 0) > 0) && (
                   <Button size="icon" variant="ghost" className="h-7 w-7 opacity-0 group-hover:opacity-100 text-muted-foreground hover:text-destructive"
                     title="Cancel dispatch (return stranded stock to source)" onClick={handleCancelDispatch} disabled={actioning}>
                     <Ban className="h-3 w-3" />

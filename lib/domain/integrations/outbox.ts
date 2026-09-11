@@ -1,10 +1,17 @@
 import { db } from '@/lib/db'
 import {
+  INTEGRATION_OUTBOX_DRAIN_LEASES_MS,
+  type IntegrationOutboxDrainLeaseMs,
+} from '@/lib/domain/integrations/outbox-leases'
+import {
   isUniqueConstraintViolation,
   uniqueConstraintFields,
   uniqueViolationTargetsField,
 } from '@/lib/db/prisma-unique-violation'
-import { parseIntegrationOutboxPayload } from '@/lib/domain/integrations/outbox-registry'
+import {
+  integrationOutboxStaleReclaimScope,
+  parseIntegrationOutboxPayload,
+} from '@/lib/domain/integrations/outbox-registry'
 import { withSavepoint } from '@/lib/db/savepoint'
 
 export const INTEGRATION_OUTBOX_STATUS = {
@@ -60,7 +67,16 @@ export type ClaimIntegrationOutboxOptions = {
   limit?: number
   workerId: string
   now?: Date
-  staleLockMs?: number
+  /**
+   * o3d-8td2 r6 (Codex MEDIUM): a lease this claim may take, and NOT `number`.
+   *
+   * The listing threshold in `outbox-admin.ts` is the maximum over
+   * `INTEGRATION_OUTBOX_DRAIN_LEASES_MS`, so a lease that map does not contain would let the
+   * exception inbox call a row stalled while its holder was still inside its lease. Typing the
+   * parameter as the map's literal union makes that unrepresentable at every call site — including
+   * the shorthand and spread forms a source scan cannot see — instead of asking a regex to notice it.
+   */
+  staleLockMs?: IntegrationOutboxDrainLeaseMs
   maxAttempts?: number
 }
 
@@ -97,7 +113,8 @@ const CLAIMABLE_STATUSES = [
   INTEGRATION_OUTBOX_STATUS.RETRYABLE_FAILED,
 ] as const
 const DEFAULT_CLAIM_LIMIT = 25
-const DEFAULT_STALE_LOCK_MS = 10 * 60 * 1000
+/** @see INTEGRATION_OUTBOX_DRAIN_LEASES_MS — the one place every lease in this build is declared. */
+const DEFAULT_STALE_LOCK_MS = INTEGRATION_OUTBOX_DRAIN_LEASES_MS.default
 /**
  * First-retry backoff floor. Exported because it is what an automatic connector retry is scheduled
  * against, and therefore what decides whether a remote idempotency key is still alive when the retry
@@ -225,6 +242,25 @@ function unlockedOrStale(now: Date, staleLockMs: number): unknown {
   return { OR: [{ lockedAt: null }, { lockedAt: { lt: new Date(now.getTime() - staleLockMs) } }] }
 }
 
+/**
+ * THE ARM THAT TAKES WORK FROM SOMEBODY ELSE (o3d-8td2).
+ *
+ * The first OR arm claims rows NOBODY is executing: PENDING / RETRYABLE_FAILED, which every
+ * completion path reaches only after nulling `lockedAt`, so its own staleness clause is a repair for
+ * an orphaned lock stamp on a row whose worker has already let go of it.
+ *
+ * The second arm is different in kind. It takes a PROCESSING row — one a worker claimed and may
+ * still be executing — on the strength of nothing but elapsed time, which cannot tell a dead holder
+ * from a slow one. The HANDOVER is sound: the update below compare-and-sets on the exact `lockedAt`
+ * and `lockedBy` this candidate was read with (re-checking its status and attempt cap in the same
+ * statement), and every completion helper fences on that same pair, so a previous holder that comes
+ * back cannot write the row at all.
+ *
+ * What none of that can make safe is the operation's EFFECT, which the previous holder may already
+ * have produced. Whether a second execution of that effect is harmless is a property of the
+ * OPERATION, declared on the registry entry — see lib/domain/integrations/outbox-replay-policy.ts
+ * — and this arm is offered only where that declaration says yes.
+ */
 function claimableWhere(options: {
   connector?: string
   operation?: string
@@ -232,6 +268,8 @@ function claimableWhere(options: {
   now: Date
   staleLockMs: number
   maxAttempts: number
+  /** {@link integrationOutboxStaleReclaimScope}: the extra predicate, or `null` for no arm at all. */
+  staleReclaimScope: Record<string, unknown> | null
 }): unknown {
   const staleLockedBefore = new Date(options.now.getTime() - options.staleLockMs)
   return {
@@ -249,10 +287,13 @@ function claimableWhere(options: {
           unlockedOrStale(options.now, options.staleLockMs),
         ],
       },
-      {
-        status: INTEGRATION_OUTBOX_STATUS.PROCESSING,
-        lockedAt: { lt: staleLockedBefore },
-      },
+      ...(options.staleReclaimScope
+        ? [{
+          status: INTEGRATION_OUTBOX_STATUS.PROCESSING,
+          lockedAt: { lt: staleLockedBefore },
+          ...options.staleReclaimScope,
+        }]
+        : []),
     ],
   }
 }
@@ -372,6 +413,7 @@ export async function claimIntegrationOutboxWork(
       now,
       staleLockMs,
       maxAttempts,
+      staleReclaimScope: integrationOutboxStaleReclaimScope(options.connector, options.operation),
     }),
     orderBy: { createdAt: 'asc' },
     take: positiveLimit(options.limit),

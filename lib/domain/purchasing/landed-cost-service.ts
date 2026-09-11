@@ -100,17 +100,44 @@ type DistributionLine = {
   product: { weight: Prisma.Decimal | null }
 }
 
-type CostLayerAdjustmentInput = {
-  oldUnitCost: Prisma.Decimal | number | string
-  newUnitCost: Prisma.Decimal | number | string
-  receivedQty: Prisma.Decimal | number | string
-  remainingQty: Prisma.Decimal | number | string
-  returnedQty: Prisma.Decimal | number | string
-  supplierReturnedQty: Prisma.Decimal | number | string
-  manufacturingConsumedQty: Prisma.Decimal | number | string
-  reversalConsumedQty?: Prisma.Decimal | number | string
-  transferConsumedQty?: Prisma.Decimal | number | string
+type DecimalInput = Prisma.Decimal | number | string
+
+/**
+ * Every quantity a cost layer's raw consumedQty must be netted against before the
+ * remainder is treated as customer COGS. One type, one loader
+ * (loadLayerConsumptionExclusions), one subtraction site
+ * (calculateLayerAdjustmentDeltas) — because the recurring defect in this area is
+ * an exclusion that reaches some revaluation entry points and not others
+ * (audit-jz9i, scjz.14, 6oyu.19 all had this shape).
+ *
+ * Every field is REQUIRED, deliberately. An omitted exclusion silently defaults to
+ * "there is nothing to exclude" — the permissive answer, and the one that posts
+ * spurious COGS — so optionality here would be a bug that compiles.
+ *
+ * supplierReturnedQty is carried but NOT subtracted (scjz.10: supplier returns ride
+ * the same COGS-adjustment journal as sold goods). It lives here because it is
+ * loaded per layer alongside the others and reported in the adjustment audit
+ * context.
+ */
+type LayerConsumptionExclusions = {
+  returnedQty: DecimalInput
+  supplierReturnedQty: DecimalInput
+  manufacturingConsumedQty: DecimalInput
+  reversalConsumedQty: DecimalInput
+  transferConsumedQty: DecimalInput
 }
+
+/** What loadLayerConsumptionExclusions returns: the same fields, already Decimal. */
+type LoadedLayerConsumptionExclusions = {
+  [K in keyof LayerConsumptionExclusions]: Prisma.Decimal
+}
+
+type CostLayerAdjustmentInput = {
+  oldUnitCost: DecimalInput
+  newUnitCost: DecimalInput
+  receivedQty: DecimalInput
+  remainingQty: DecimalInput
+} & LayerConsumptionExclusions
 
 type PropagatedOutputLayerAudit = {
   sourceCostLayerId: string
@@ -249,8 +276,8 @@ export function calculateLayerAdjustmentDeltas(input: CostLayerAdjustmentInput):
     consumedQty
       .sub(decimal(input.returnedQty))
       .sub(decimal(input.manufacturingConsumedQty))
-      .sub(decimal(input.reversalConsumedQty ?? 0))
-      .sub(decimal(input.transferConsumedQty ?? 0)),
+      .sub(decimal(input.reversalConsumedQty))
+      .sub(decimal(input.transferConsumedQty)),
   )
   return {
     costDelta,
@@ -264,6 +291,69 @@ export function calculateLayerAdjustmentDeltas(input: CostLayerAdjustmentInput):
       : new Prisma.Decimal(0),
   }
 }
+
+/**
+ * Load every exclusion quantity for one cost layer. The ONLY place the exclusion
+ * queries are enumerated: recalculateLandedCosts, recalculateDirectLandedCosts and
+ * propagateLandedCostToOutputs all revalue layers and all must net off the same
+ * set, so adding a new exclusion must be a one-line change here rather than three
+ * edits, two of which get made.
+ *
+ * `consumedQty <= 0` short-circuits to zeros: netConsumedQty is floored at 0, so
+ * the result is identical and the per-layer queries are skipped.
+ */
+async function loadLayerConsumptionExclusions(
+  tx: Prisma.TransactionClient,
+  deps: LandedCostServiceDeps,
+  costLayerId: string,
+  consumedQty: Prisma.Decimal,
+): Promise<LoadedLayerConsumptionExclusions> {
+  if (consumedQty.lte(LANDED_COST_DELTA_EPSILON)) {
+    return {
+      returnedQty: new Prisma.Decimal(0),
+      supplierReturnedQty: new Prisma.Decimal(0),
+      manufacturingConsumedQty: new Prisma.Decimal(0),
+      reversalConsumedQty: new Prisma.Decimal(0),
+      transferConsumedQty: new Prisma.Decimal(0),
+    }
+  }
+  return {
+    returnedQty: decimal(await deps.getReturnedQtyForCostLayer(tx, costLayerId)),
+    supplierReturnedQty: decimal(await deps.getSupplierReturnedQtyForCostLayer(tx, costLayerId)),
+    manufacturingConsumedQty: decimal(await deps.getManufacturingConsumedQtyForCostLayer(tx, costLayerId)),
+    reversalConsumedQty: decimal(await deps.getReversalConsumedQtyForCostLayer(tx, costLayerId)),
+    transferConsumedQty: decimal(await deps.getTransferConsumedQtyForCostLayer(tx, costLayerId)),
+  }
+}
+
+/**
+ * KNOWN GAP, recorded here rather than silently absent (o3d-nrl4, ex-6oyu.19).
+ *
+ * calculateLayerAdjustmentDeltas correctly keeps transferred units out of COGS —
+ * they moved warehouse, they were not sold — and for a RECEIVED or CANCELLED
+ * transfer propagateLandedCostToOutputs then carries the delta to the layer holding
+ * them. What is uncovered is the portion of a dispatched line that has NOT yet
+ * landed anywhere — qty less the line's LANDED quantity, per
+ * lib/domain/inventory/transfer-landed-quantity, which counts a WMS stock-sync
+ * alignment credit that `qtyReceived` alone does not (6oyu.19 Codex r6): no layer holds it, so propagation finds
+ * nothing, inventoryDelta is zero because the source layer's remainingQty is zero,
+ * and this recalc queues NO journal for it. The freight debit stays in the transit
+ * clearing account with inventory understated, and the 6oyu.4 transit-vs-GL sweep
+ * cannot see it because a MISSING posting is absent from both sides of the
+ * comparison it makes.
+ *
+ * Note this is NOT "every transfer whose status is IN_TRANSIT" (Codex round-4
+ * MEDIUM): a partial receipt or a WMS book-in/alignment creates fully linked
+ * destination layers without moving the status off IN_TRANSIT, and the delta does
+ * reach those units.
+ *
+ * Closing it needs an obligation persisted at revaluation time and discharged by the
+ * receipt or dispatch cancellation that creates the layer. That was implemented,
+ * reviewed and withdrawn from this branch on four HIGH findings; it is tracked as
+ * o3d-nrl4 and preserved on `o3d-6oyu19-deferred-transit-reclass-withdrawn`
+ * (commit 89a124f5). The classification that names the gap is
+ * STOCK_TRANSFER_SOURCE_LAYER_CONSUMPTION.IN_TRANSIT.
+ */
 
 // BOM nesting is shallow in practice; this is a runaway/cycle backstop only.
 const MAX_LANDED_COST_PROPAGATION_DEPTH = 20
@@ -356,21 +446,19 @@ export async function propagateLandedCostToOutputs(
       reason: 'landed_cost_output_propagation',
     })
 
-    const returnedQty = decimal(await deps.getReturnedQtyForCostLayer(tx, outputCostLayerId))
-    const supplierReturnedQty = decimal(await deps.getSupplierReturnedQtyForCostLayer(tx, outputCostLayerId))
-    const manufacturingConsumedQty = decimal(await deps.getManufacturingConsumedQtyForCostLayer(tx, outputCostLayerId))
-    const reversalConsumedQty = decimal(await deps.getReversalConsumedQtyForCostLayer(tx, outputCostLayerId))
-    const transferConsumedQty = decimal(await deps.getTransferConsumedQtyForCostLayer(tx, outputCostLayerId))
+    const outputRemainingQty = decimal(output.remainingQty)
+    const outputExclusions = await loadLayerConsumptionExclusions(
+      tx,
+      deps,
+      outputCostLayerId,
+      outputReceivedQty.sub(outputRemainingQty),
+    )
     const outDeltas = calculateLayerAdjustmentDeltas({
       oldUnitCost: oldOutputUnitCost,
       newUnitCost: newOutputUnitCost,
       receivedQty: outputReceivedQty,
-      remainingQty: decimal(output.remainingQty),
-      returnedQty,
-      supplierReturnedQty,
-      manufacturingConsumedQty,
-      reversalConsumedQty,
-      transferConsumedQty,
+      remainingQty: outputRemainingQty,
+      ...outputExclusions,
     })
     // Reflect the new output cost in finished goods already sold from this layer,
     // FIRST, so its COGS revaluation can be removed from the cascade's COGS
@@ -1026,31 +1114,14 @@ export async function recalculateLandedCosts(
         const receivedQty = decimal(cl.receivedQty)
         const remainingQty = decimal(cl.remainingQty)
         const consumedQty = receivedQty.sub(remainingQty)
-        const returnedQty = consumedQty.gt(LANDED_COST_DELTA_EPSILON)
-          ? decimal(await serviceDeps.getReturnedQtyForCostLayer(tx, cl.id))
-          : new Prisma.Decimal(0)
-        const supplierReturnedQty = consumedQty.gt(LANDED_COST_DELTA_EPSILON)
-          ? decimal(await serviceDeps.getSupplierReturnedQtyForCostLayer(tx, cl.id))
-          : new Prisma.Decimal(0)
-        const manufacturingConsumedQty = consumedQty.gt(LANDED_COST_DELTA_EPSILON)
-          ? decimal(await serviceDeps.getManufacturingConsumedQtyForCostLayer(tx, cl.id))
-          : new Prisma.Decimal(0)
-        const reversalConsumedQty = consumedQty.gt(LANDED_COST_DELTA_EPSILON)
-          ? decimal(await serviceDeps.getReversalConsumedQtyForCostLayer(tx, cl.id))
-          : new Prisma.Decimal(0)
-        const transferConsumedQty = consumedQty.gt(LANDED_COST_DELTA_EPSILON)
-          ? decimal(await serviceDeps.getTransferConsumedQtyForCostLayer(tx, cl.id))
-          : new Prisma.Decimal(0)
+        const exclusions = await loadLayerConsumptionExclusions(tx, serviceDeps, cl.id, consumedQty)
+        const { returnedQty, supplierReturnedQty, manufacturingConsumedQty } = exclusions
         const deltas = calculateLayerAdjustmentDeltas({
           oldUnitCost,
           newUnitCost,
           receivedQty,
           remainingQty,
-          returnedQty,
-          supplierReturnedQty,
-          manufacturingConsumedQty,
-          reversalConsumedQty,
-          transferConsumedQty,
+          ...exclusions,
         })
         totalCogsDelta = totalCogsDelta.add(deltas.cogsDelta)
         totalInventoryDelta = totalInventoryDelta.add(deltas.inventoryDelta)
@@ -1371,31 +1442,14 @@ export async function recalculateDirectLandedCosts(
       const receivedQty = decimal(cl.receivedQty)
       const remainingQty = decimal(cl.remainingQty)
       const consumedQty = receivedQty.sub(remainingQty)
-      const returnedQty = consumedQty.gt(LANDED_COST_DELTA_EPSILON)
-        ? decimal(await serviceDeps.getReturnedQtyForCostLayer(tx, cl.id))
-        : new Prisma.Decimal(0)
-      const supplierReturnedQty = consumedQty.gt(LANDED_COST_DELTA_EPSILON)
-        ? decimal(await serviceDeps.getSupplierReturnedQtyForCostLayer(tx, cl.id))
-        : new Prisma.Decimal(0)
-      const manufacturingConsumedQty = consumedQty.gt(LANDED_COST_DELTA_EPSILON)
-        ? decimal(await serviceDeps.getManufacturingConsumedQtyForCostLayer(tx, cl.id))
-        : new Prisma.Decimal(0)
-      const reversalConsumedQty = consumedQty.gt(LANDED_COST_DELTA_EPSILON)
-        ? decimal(await serviceDeps.getReversalConsumedQtyForCostLayer(tx, cl.id))
-        : new Prisma.Decimal(0)
-      const transferConsumedQty = consumedQty.gt(LANDED_COST_DELTA_EPSILON)
-        ? decimal(await serviceDeps.getTransferConsumedQtyForCostLayer(tx, cl.id))
-        : new Prisma.Decimal(0)
+      const exclusions = await loadLayerConsumptionExclusions(tx, serviceDeps, cl.id, consumedQty)
+      const { returnedQty, supplierReturnedQty, manufacturingConsumedQty } = exclusions
       const deltas = calculateLayerAdjustmentDeltas({
         oldUnitCost,
         newUnitCost,
         receivedQty,
         remainingQty,
-        returnedQty,
-        supplierReturnedQty,
-        manufacturingConsumedQty,
-        reversalConsumedQty,
-        transferConsumedQty,
+        ...exclusions,
       })
       totalCogsDelta = totalCogsDelta.add(deltas.cogsDelta)
       totalInventoryDelta = totalInventoryDelta.add(deltas.inventoryDelta)
