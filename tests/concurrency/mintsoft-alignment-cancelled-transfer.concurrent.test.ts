@@ -1,0 +1,771 @@
+import assert from 'node:assert/strict'
+import test, { mock } from 'node:test'
+import { config } from 'dotenv'
+
+/**
+ * 6oyu.19 / Codex round-7 HIGH-1 — THE CANCELLED-PARENT ROUTE.
+ *
+ * THE SEQUENCE: a dispatched transfer has its dispatch CANCELLED, which restores the
+ * full line and a replacement cost layer to the SOURCE — and leaves the transfer's
+ * ASN OPEN, because nothing closes it. A later automatic align-up then finds that
+ * still-open ASN line, brings the units into stock at the DESTINATION and lays a
+ * second replacement layer linked back to the same source layer. One landed-cost
+ * change afterwards reaches BOTH live layers and posts the inventory
+ * reclassification twice for one dispatch.
+ *
+ * PRE-EXISTING, NOT INTRODUCED HERE. The alignment path has never validated the
+ * parent transfer's status — see the merge-base version of
+ * lib/connectors/mintsoft/sync/stock-sync.ts, whose `getAlignmentCandidateLines`
+ * selects on the ASN alone. It is closed on this branch anyway: the branch exists to
+ * stop transit units being counted twice, and shipping it with a known open
+ * double-count route would undercut its own claim. Production prevalence is tracked
+ * on o3d-1mga.
+ *
+ * THE FIX IS THE GUARD ALONE, and this file proves the SEQUENTIAL route: the
+ * candidate query refuses an ASN whose parent transfer is not IN_TRANSIT or
+ * RECEIVED — the same predicate the WMS webhook book-in has always applied.
+ *
+ * THE LOCK: WITHDRAWN IN ROUND 8, RESTORED IN ROUND 9 — IN THE OTHER ORDER.
+ *
+ * Round 7 had alignment take `stock_transfers FOR UPDATE` AFTER the ASN rows, plus a
+ * post-lock re-read, and claimed no cycle existed. Round 8 found one — the
+ * transfer-ASN creation path in app/actions/mintsoft-sync.ts locks `stock_transfers`
+ * first (3690) and then rewrites that transfer's `wms_asn_line_maps` rows (3892,
+ * 3904) — and withdrew the lock entirely, leaving the concurrent route open on the
+ * grounds that `development` has no guard at all.
+ *
+ * Round 9 settled it: the cycle was never a property of alignment, it was that the
+ * codebase had no ONE order for these two tables. It has one now
+ * (lib/domain/wms/transfer-asn-lock-order.ts — TRANSFER, then ASN), the single
+ * violator (booked-in reconciliation) obeys it, and alignment takes the lock in that
+ * order. So BOTH routes of o3d-2y5u are closed.
+ *
+ * WHAT THIS FILE PROVES, and what it does not. It proves the SEQUENTIAL route: the
+ * candidate query refuses an ASN whose parent transfer is not IN_TRANSIT or RECEIVED
+ * — the same predicate the WMS webhook book-in has always applied — which needs no
+ * lock to be worth having. The CONCURRENT route is proved in
+ * tests/concurrency/transfer-asn-lock-order.concurrent.test.ts, which is also where
+ * the lock order itself is proved by observing which row each path blocks on.
+ *
+ * The round-7 race proof that stood here is NOT what came back. It used
+ * `Promise.all`, which does not force the critical sections to overlap, and its own
+ * lock-removal mutation survived one run in five — a proof that admits it cannot
+ * prove its claim. Its replacement parks the cancellation mid-transaction and waits
+ * on `pg_stat_activity` for the server's own report that a backend is lock-blocked,
+ * so the interleaving is a fact of the sequence rather than of the scheduler.
+ *
+ * Needs a real PostgreSQL: the propagation walks `cost_layer_source_lines` in SQL.
+ */
+
+const RUN = process.env.RUN_DB_CONCURRENCY_TESTS === '1'
+const TX = { timeout: 20000, maxWait: 10000 }
+
+mock.module('@/lib/auth/server', {
+  namedExports: {
+    requirePermission: async () => ({ user: { id: 'test-user', role: 'ADMIN' } }),
+    requireInternalUser: async () => ({ user: { id: 'test-user', role: 'ADMIN' } }),
+  },
+})
+mock.module('next/cache', { namedExports: { revalidatePath: () => {}, revalidateTag: () => {} } })
+mock.module('@/lib/activity-log', { namedExports: { logActivity: async () => {}, logActivityInTransaction: async () => {} } })
+mock.module('@/lib/shopping', { namedExports: { enqueueStockSync: async () => {} } })
+mock.module('@/lib/domain/wms/mutation-audit', {
+  namedExports: { recordWmsMutationEvent: async () => {} },
+})
+mock.module('@/lib/notifications', { namedExports: { notify: async () => {} } })
+mock.module('@/lib/fulfillment/backorder-allocator', {
+  namedExports: { allocateBackordersForProducts: async () => ({}) },
+})
+mock.module('@/lib/fulfillment/overallocation-rebalancer', {
+  namedExports: { releaseOverallocations: async () => ({}) },
+})
+
+function loadEnv() {
+  config({ path: '.env.local', quiet: true })
+  config({ quiet: true })
+  if (!process.env.DATABASE_URL) {
+    throw new Error('DATABASE_URL is required when RUN_DB_CONCURRENCY_TESTS=1')
+  }
+}
+
+const LINE_QTY = 10
+const UNIT_COST = 5
+const LANDED_COST_DELTA_PER_UNIT = 1
+
+/**
+ * A dispatched (IN_TRANSIT) transfer with a frozen cost-layer snapshot and an OPEN
+ * ASN at the destination — the state a WMS-fulfilled transfer sits in between
+ * dispatch and book-in. NOTHING has landed.
+ */
+async function seedDispatchedTransferWithOpenAsn(label: string) {
+  const { db } = await import('@/lib/db')
+
+  // A short, collision-free warehouse code: `code` is UNIQUE and the fixture rows
+  // outlive the run, so a truncated prefix of the tag would collide on a re-run.
+  const uid = `${Date.now().toString(36)}${Math.floor(Math.random() * 1_679_616).toString(36).padStart(4, '0')}`.toUpperCase()
+  const tag = `R7CX-${label}-${process.pid}-${uid}`
+  const product = await db.product.create({
+    data: { sku: tag, name: `r7 cancelled-parent ${label}`, type: 'SIMPLE', countryOfOrigin: 'CN' },
+    select: { id: true },
+  })
+  const source = await db.warehouse.create({
+    data: { code: `R7${uid}S`, name: `${tag} source`, type: 'STANDARD' },
+    select: { id: true, code: true, name: true },
+  })
+  const destination = await db.warehouse.create({
+    data: { code: `R7${uid}D`, name: `${tag} dest`, type: 'STANDARD' },
+    select: { id: true, code: true, name: true },
+  })
+
+  const sourceLayer = await db.costLayer.create({
+    data: {
+      productId: product.id,
+      warehouseId: source.id,
+      receivedQty: `${LINE_QTY}.000000`,
+      remainingQty: '0.000000',
+      unitCostBase: UNIT_COST,
+    },
+    select: { id: true },
+  })
+  const snapshot = [{ costLayerId: sourceLayer.id, qty: `${LINE_QTY}.000000`, unitCostBase: `${UNIT_COST}.000000` }]
+
+  const transfer = await db.stockTransfer.create({
+    data: {
+      reference: tag,
+      fromWarehouseId: source.id,
+      toWarehouseId: destination.id,
+      status: 'IN_TRANSIT',
+      dispatchedAt: new Date(),
+      lines: {
+        create: [{
+          productId: product.id,
+          sku: tag,
+          productName: `r7 cancelled-parent ${label}`,
+          qty: `${LINE_QTY}.0000`,
+          qtyReceived: '0.0000',
+          costLayerSnapshot: snapshot,
+        }],
+      },
+    },
+    select: { id: true, lines: { select: { id: true } } },
+  })
+  const transferLineId = transfer.lines[0]!.id
+
+  const asn = await db.wmsAsnMap.create({
+    data: {
+      connector: 'mintsoft', // wms-connector-boundary-ok: 6oyu.19: a test fixture row, not a core flow branch
+      externalAsnId: tag,
+      sourceType: 'STOCK_TRANSFER',
+      sourceId: transfer.id,
+      warehouseId: destination.id,
+      status: 'OPEN',
+      lines: {
+        create: [{
+          externalAsnLineId: `${tag}-1`,
+          sourceType: 'STOCK_TRANSFER_LINE',
+          sourceLineId: transferLineId,
+          productId: product.id,
+          sku: tag,
+          expectedQty: `${LINE_QTY}.0000`,
+        }],
+      },
+    },
+    select: { id: true, lines: { select: { id: true } } },
+  })
+
+  const binding = {
+    id: `binding-${tag}`,
+    connector: 'mintsoft', // wms-connector-boundary-ok: 6oyu.19: a test fixture value, not a core flow branch
+    active: true,
+    externalWarehouseId: '1',
+    stockSyncMode: 'ALIGN_TO_WMS' as const,
+    syncFrequencyMinutes: 60,
+    discrepancyThresholds: null,
+    reportRecipients: [],
+    alignmentConfirmedAt: new Date(),
+    alignDownReasonId: null,
+    warehouseId: destination.id,
+    lastStockSyncAt: null,
+    connection: { active: true },
+    warehouse: destination,
+  }
+
+  return {
+    db,
+    product,
+    source,
+    destination,
+    sourceLayer,
+    transfer,
+    transferLineId,
+    asnLineMapId: asn.lines[0]!.id,
+    externalAsnId: tag,
+    binding,
+    tag,
+  }
+}
+
+async function alignUp(binding: unknown, productId: string, sku: string) {
+  const { applyMintsoftAlignmentForProduct } =
+    await import('@/lib/connectors/mintsoft/sync/stock-sync')
+  return applyMintsoftAlignmentForProduct({
+    binding: binding as never,
+    jobId: `r7-proof-${Date.now()}`,
+    productId,
+    sku,
+    delta: LINE_QTY,
+    // The IMS on-hand this delta is measured against: the fixture books no
+    // destination stock, so the basis is zero (Codex r12 HIGH-1).
+    imsQty: 0,
+    dryRun: false,
+  })
+}
+
+/**
+ * `alignUp` with the delta and its basis spelled out, for the mixed-world proofs
+ * that sweep the same product more than once (6oyu.19, Codex round-13 MEDIUM-1).
+ */
+async function applyAlignment(
+  binding: unknown,
+  productId: string,
+  sku: string,
+  amounts: { delta: number; imsQty: number },
+) {
+  const { applyMintsoftAlignmentForProduct } =
+    await import('@/lib/connectors/mintsoft/sync/stock-sync')
+  return applyMintsoftAlignmentForProduct({
+    binding: binding as never,
+    jobId: `r13-proof-${Date.now()}`,
+    productId,
+    sku,
+    delta: amounts.delta,
+    imsQty: amounts.imsQty,
+    dryRun: false,
+  })
+}
+
+async function landedCostDeps() {
+  const costLayers = await import('@/lib/cost-layers')
+  return {
+    getReturnedQtyForCostLayer: costLayers.getReturnedQtyForCostLayer,
+    getSupplierReturnedQtyForCostLayer: costLayers.getSupplierReturnedQtyForCostLayer,
+    getManufacturingConsumedQtyForCostLayer: costLayers.getManufacturingConsumedQtyForCostLayer,
+    getReversalConsumedQtyForCostLayer: costLayers.getReversalConsumedQtyForCostLayer,
+    getTransferConsumedQtyForCostLayer: costLayers.getTransferConsumedQtyForCostLayer,
+    getDependentOutputSourceLines: costLayers.getDependentOutputSourceLines,
+    updateSnapshotsForCostLayerChange: costLayers.updateSnapshotsForCostLayerChange,
+    refreshShipmentCogsForCostLayerChange: costLayers.refreshShipmentCogsForCostLayerChange,
+    refreshSalesOrderLineCogsForCostLayerChange: costLayers.refreshSalesOrderLineCogsForCostLayerChange,
+    recordCostLayerRevaluation: costLayers.recordCostLayerRevaluation,
+    warnWeightFallback: () => undefined,
+    warnWeightZeroLines: () => undefined,
+  }
+}
+
+async function applyLandedCostChange(sourceCostLayerId: string) {
+  const { db } = await import('@/lib/db')
+  const { Prisma } = await import('@/app/generated/prisma/client')
+  const { propagateLandedCostToOutputs } = await import('@/lib/domain/purchasing/landed-cost-service')
+  const deps = await landedCostDeps()
+
+  const posted: Array<{ outputCostLayerId: string; inventoryDelta: string }> = []
+  await db.$transaction(async (tx) => {
+    await propagateLandedCostToOutputs(
+      tx,
+      deps as never,
+      sourceCostLayerId,
+      new Prisma.Decimal(LANDED_COST_DELTA_PER_UNIT),
+      (_cogsDelta, inventoryDelta, audit) => {
+        posted.push({ outputCostLayerId: audit.outputCostLayerId, inventoryDelta: inventoryDelta.toFixed(2) })
+      },
+      new Set<string>(),
+      0,
+      `r7-proof-${Date.now()}`,
+      new Date(),
+    )
+  }, TX)
+
+  return { posted, totalInventory: posted.reduce((sum, row) => sum + Number(row.inventoryDelta), 0) }
+}
+
+test(
+  'THE PRECONDITION: cancelling a dispatch leaves the ASN OPEN and still pointing at the line (Codex r7 HIGH-1)',
+  { skip: !RUN && 'set RUN_DB_CONCURRENCY_TESTS=1' },
+  async () => {
+    // If cancellation closed the ASN there would be no route at all, and the guard
+    // below would be guarding nothing. Read off the real rows.
+    loadEnv()
+    const { db, transfer, asnLineMapId, source } = await seedDispatchedTransferWithOpenAsn('precondition')
+    const { cancelDispatchedTransfer } = await import('@/app/actions/transfers')
+
+    const result = await cancelDispatchedTransfer(transfer.id)
+    assert.equal(result.success, true, `nothing landed, so the cancel must succeed: ${JSON.stringify(result)}`)
+
+    const cancelled = await db.stockTransfer.findUniqueOrThrow({
+      where: { id: transfer.id },
+      select: { status: true },
+    })
+    assert.equal(cancelled.status, 'CANCELLED')
+    assert.equal(
+      await db.costLayer.count({ where: { warehouseId: source.id, remainingQty: { gt: 0 } } }),
+      1,
+      'the full line came back to source in a replacement layer',
+    )
+
+    const asnLine = await db.wmsAsnLineMap.findUniqueOrThrow({
+      where: { id: asnLineMapId },
+      select: { asn: { select: { closedAt: true, status: true } } },
+    })
+    assert.equal(asnLine.asn.closedAt, null, 'and its ASN is STILL OPEN — this is the route')
+    assert.equal(asnLine.asn.status, 'OPEN')
+  },
+)
+
+test(
+  'cancel dispatch → align-up must NOT create a second layer; the reclassification posts ONCE (Codex r7 HIGH-1)',
+  { skip: !RUN && 'set RUN_DB_CONCURRENCY_TESTS=1' },
+  async () => {
+    loadEnv()
+    const { db, transfer, sourceLayer, destination, product, binding, tag } =
+      await seedDispatchedTransferWithOpenAsn('sequential')
+    const { cancelDispatchedTransfer } = await import('@/app/actions/transfers')
+
+    const cancel = await cancelDispatchedTransfer(transfer.id)
+    assert.equal(cancel.success, true, `cancel must succeed: ${JSON.stringify(cancel)}`)
+
+    // THE ALIGN-UP, against the still-open ASN of a CANCELLED transfer.
+    const aligned = await alignUp(binding, product.id, tag)
+
+    assert.equal(aligned.applied, false, `alignment must refuse a cancelled parent, got ${JSON.stringify(aligned)}`)
+    assert.match(
+      aligned.reason,
+      /CANCELLED/,
+      `the refusal must name the reason an operator can act on, got: ${aligned.reason}`,
+    )
+
+    assert.equal(
+      await db.costLayer.count({ where: { warehouseId: destination.id } }),
+      0,
+      'no destination layer may exist — the units are back at source',
+    )
+    assert.equal(
+      await db.stockLevel.count({ where: { warehouseId: destination.id, quantity: { gt: 0 } } }),
+      0,
+      'and no destination stock was booked in',
+    )
+    assert.equal(
+      await db.costLayerSourceLine.count({ where: { sourceCostLayerId: sourceLayer.id } }),
+      1,
+      'exactly ONE live layer descends from the source layer',
+    )
+
+    // THE ASSERTION IS THE AMOUNT.
+    const { posted, totalInventory } = await applyLandedCostChange(sourceLayer.id)
+    assert.equal(
+      posted.length,
+      1,
+      `the reclassification must reach exactly one layer, reached ${posted.length}: ${JSON.stringify(posted)}`,
+    )
+    assert.equal(
+      totalInventory.toFixed(2),
+      (LANDED_COST_DELTA_PER_UNIT * LINE_QTY).toFixed(2),
+      `£${LANDED_COST_DELTA_PER_UNIT}/unit on ${LINE_QTY} units must post ` +
+      `£${(LANDED_COST_DELTA_PER_UNIT * LINE_QTY).toFixed(2)}, not £${totalInventory.toFixed(2)} ` +
+      `(${JSON.stringify(posted)})`,
+    )
+  },
+)
+
+test(
+  'an IN_TRANSIT parent still aligns — the refusal discriminates (Codex r7 — not vacuous)',
+  { skip: !RUN && 'set RUN_DB_CONCURRENCY_TESTS=1' },
+  async () => {
+    // Without this, changing the candidate query to "refuse everything" would satisfy
+    // every assertion above.
+    loadEnv()
+    const { db, sourceLayer, destination, product, binding, tag, asnLineMapId } =
+      await seedDispatchedTransferWithOpenAsn('positive')
+
+    const aligned = await alignUp(binding, product.id, tag)
+    assert.equal(aligned.applied, true, `an IN_TRANSIT parent must align, got ${JSON.stringify(aligned)}`)
+    assert.equal(aligned.correctedQty, LINE_QTY)
+
+    assert.equal(
+      await db.costLayer.count({ where: { warehouseId: destination.id, remainingQty: { gt: 0 } } }),
+      1,
+      'the aligned units land in exactly one destination layer',
+    )
+    const asnRow = await db.wmsAsnLineMap.findUniqueOrThrow({
+      where: { id: asnLineMapId },
+      select: { qtyAccountedViaSnapshot: true },
+    })
+    assert.equal(Number(asnRow.qtyAccountedViaSnapshot), LINE_QTY, 'and the ASN credit was recorded')
+
+    const { posted, totalInventory } = await applyLandedCostChange(sourceLayer.id)
+    assert.equal(posted.length, 1)
+    assert.equal(totalInventory.toFixed(2), (LANDED_COST_DELTA_PER_UNIT * LINE_QTY).toFixed(2))
+  },
+)
+
+test(
+  'a follow-up ASN absorbs its whole remainder after an earlier ASN closed (Codex r7 HIGH-2, end to end)',
+  { skip: !RUN && 'set RUN_DB_CONCURRENCY_TESTS=1' },
+  async () => {
+    // The round-6 regression, driven through the real alignment against real rows: a
+    // ten-unit line, three units absorbed on a first ASN which is then CLOSED, and a
+    // follow-up ASN raised for the remaining seven. Round 6 charged the line-wide
+    // three against the follow-up ASN's own seven, exposed four, and rejected the
+    // seven-unit delta outright — leaving IMS seven units short.
+    loadEnv()
+    const { db, sourceLayer, destination, product, binding, tag, transferLineId, asnLineMapId } =
+      await seedDispatchedTransferWithOpenAsn('multi-asn')
+
+    // First ASN: expect three, absorb three, then close it.
+    await db.wmsAsnLineMap.update({
+      where: { id: asnLineMapId },
+      data: { expectedQty: '3.0000', qtyAccountedViaSnapshot: '3.0000' },
+    })
+    const firstAsn = await db.wmsAsnLineMap.findUniqueOrThrow({
+      where: { id: asnLineMapId },
+      select: { asnMapId: true },
+    })
+    await db.wmsAsnMap.update({
+      where: { id: firstAsn.asnMapId },
+      data: { status: 'BOOKED_IN', closedAt: new Date() },
+    })
+    // The three units really are on the shelf at the destination.
+    const { recreateTransferCostLayersFromSnapshotSlice } =
+      await import('@/lib/domain/inventory/transfer-cost-layer-recreation')
+    await db.$transaction(async (tx) => {
+      await tx.stockLevel.create({
+        data: { productId: product.id, warehouseId: destination.id, quantity: '3', reservedQty: '0' },
+      })
+      await recreateTransferCostLayersFromSnapshotSlice(
+        tx,
+        {
+          productId: product.id,
+          warehouseId: destination.id,
+          transferLineId,
+          contextLabel: `transfer line ${transferLineId} WMS stock-sync alignment`,
+          bookedQty: 3,
+          uncostedShortfall: 'REFUSE',
+        },
+        [{ costLayerId: sourceLayer.id, qty: '3.000000', unitCostBase: `${UNIT_COST}.000000` }],
+      )
+    }, TX)
+
+    // The follow-up ASN, raised for the remaining seven.
+    await db.wmsAsnMap.create({
+      data: {
+        connector: 'mintsoft', // wms-connector-boundary-ok: 6oyu.19: a test fixture row, not a core flow branch
+        externalAsnId: `${tag}-2`,
+        sourceType: 'STOCK_TRANSFER',
+        sourceId: (await db.stockTransferLine.findUniqueOrThrow({
+          where: { id: transferLineId }, select: { transferId: true },
+        })).transferId,
+        warehouseId: destination.id,
+        status: 'OPEN',
+        lines: {
+          create: [{
+            externalAsnLineId: `${tag}-2-1`,
+            sourceType: 'STOCK_TRANSFER_LINE',
+            sourceLineId: transferLineId,
+            productId: product.id,
+            sku: tag,
+            expectedQty: '7.0000',
+          }],
+        },
+      },
+    })
+
+    const { applyMintsoftAlignmentForProduct } =
+      await import('@/lib/connectors/mintsoft/sync/stock-sync')
+    const aligned = await applyMintsoftAlignmentForProduct({
+      binding: binding as never,
+      jobId: `r7-h2-${Date.now()}`,
+      productId: product.id,
+      sku: tag,
+      delta: 7,
+      // Three units already landed at the destination above, so THREE is the basis
+      // this seven-unit delta was measured against (Codex r12 HIGH-1).
+      imsQty: 3,
+      dryRun: false,
+    })
+
+    assert.equal(
+      aligned.applied,
+      true,
+      `all seven remaining units must allocate, got ${JSON.stringify(aligned)} ` +
+      '(round 6 rejected this with three unallocated)',
+    )
+    assert.equal(aligned.correctedQty, 7)
+
+    const stock = await db.stockLevel.findFirstOrThrow({
+      where: { productId: product.id, warehouseId: destination.id },
+      select: { quantity: true },
+    })
+    assert.equal(Number(stock.quantity), LINE_QTY, 'IMS destination stock is the full ten, not three')
+  },
+)
+
+/**
+ * A SECOND dispatched transfer for the SAME product, warehouses and SKU as `base`,
+ * with its own source layer, its own frozen snapshot and its own OPEN ASN.
+ *
+ * It exists so one product can have TWO open ASN rows whose parents differ in
+ * status, which is the world the mixed-world proof below needs and which no fixture
+ * on this branch could build before (6oyu.19, Codex round-13 MEDIUM-1).
+ */
+async function seedSiblingDispatchedTransferWithOpenAsn(
+  base: Awaited<ReturnType<typeof seedDispatchedTransferWithOpenAsn>>,
+  label: string,
+) {
+  const { db, product, source, destination, tag } = base
+  const siblingTag = `${tag}-${label}`
+
+  const sourceLayer = await db.costLayer.create({
+    data: {
+      productId: product.id,
+      warehouseId: source.id,
+      receivedQty: `${LINE_QTY}.000000`,
+      remainingQty: '0.000000',
+      unitCostBase: UNIT_COST,
+    },
+    select: { id: true },
+  })
+  const snapshot = [{ costLayerId: sourceLayer.id, qty: `${LINE_QTY}.000000`, unitCostBase: `${UNIT_COST}.000000` }]
+
+  const transfer = await db.stockTransfer.create({
+    data: {
+      reference: siblingTag,
+      fromWarehouseId: source.id,
+      toWarehouseId: destination.id,
+      status: 'IN_TRANSIT',
+      dispatchedAt: new Date(),
+      lines: {
+        create: [{
+          productId: product.id,
+          sku: tag,
+          productName: `r13 sibling ${label}`,
+          qty: `${LINE_QTY}.0000`,
+          qtyReceived: '0.0000',
+          costLayerSnapshot: snapshot,
+        }],
+      },
+    },
+    select: { id: true, lines: { select: { id: true } } },
+  })
+
+  const asn = await db.wmsAsnMap.create({
+    data: {
+      connector: 'mintsoft', // wms-connector-boundary-ok: 6oyu.19: a test fixture row, not a core flow branch
+      externalAsnId: siblingTag,
+      sourceType: 'STOCK_TRANSFER',
+      sourceId: transfer.id,
+      warehouseId: destination.id,
+      status: 'OPEN',
+      lines: {
+        create: [{
+          externalAsnLineId: `${siblingTag}-1`,
+          sourceType: 'STOCK_TRANSFER_LINE',
+          sourceLineId: transfer.lines[0]!.id,
+          productId: product.id,
+          // The SAME sku as `base` — the discovery query keys on productId, so both
+          // rows land in one candidate set.
+          sku: tag,
+          expectedQty: `${LINE_QTY}.0000`,
+        }],
+      },
+    },
+    select: { id: true, lines: { select: { id: true } } },
+  })
+
+  return {
+    transferId: transfer.id,
+    transferLineId: transfer.lines[0]!.id,
+    sourceLayerId: sourceLayer.id,
+    asnMapId: asn.id,
+    asnLineMapId: asn.lines[0]!.id,
+    externalAsnId: siblingTag,
+  }
+}
+
+test(
+  'THE MIXED WORLD: a CANCELLED parent beside a healthy candidate must not block the healthy one, ever (Codex r13 MEDIUM-1)',
+  { skip: !RUN && 'set RUN_DB_CONCURRENCY_TESTS=1' },
+  async () => {
+    // THE REGRESSION THIS PINS, introduced by round 11 and found by Codex round 13.
+    //
+    // Discovery refuses the cancelled row and locks only `discovery.candidates`, so
+    // the cancelled row is absent from the lock set for a reason that has nothing to
+    // do with racing. The locked re-read reads that absence as "committed after the
+    // locks", labels the row `raced`, and round 11's terminal guard throws the WHOLE
+    // plan away — including the healthy candidate. And because nothing closes a
+    // cancelled transfer's ASN (proved by the PRECONDITION test above), the row is
+    // there again on the next sweep, and the one after: the deferral never expires.
+    //
+    // Both existing arms miss it. The cancelled-ONLY world returns at the FIRST
+    // `discovery.candidates.length === 0` and never reaches the re-read; the
+    // raced-only worlds in transfer-asn-lock-order.concurrent.test.ts have no
+    // refused row to mislabel. It takes both in one product to reach the branch.
+    loadEnv()
+    const base = await seedDispatchedTransferWithOpenAsn('mixed')
+    const { db, product, destination, sourceLayer, binding, tag } = base
+    const dead = await seedSiblingDispatchedTransferWithOpenAsn(base, 'dead')
+    const { cancelDispatchedTransfer } = await import('@/app/actions/transfers')
+
+    const cancel = await cancelDispatchedTransfer(dead.transferId)
+    assert.equal(cancel.success, true, `the sibling cancel must succeed: ${JSON.stringify(cancel)}`)
+
+    // THE PRECONDITION, ASSERTED SO THIS CANNOT PASS VACUOUSLY. Both ASN rows must
+    // still be discoverable — same product, same destination, both ASNs OPEN — and
+    // the parents must differ in status. If either row dropped out of the candidate
+    // query the assertions below would hold for the wrong reason.
+    const discoverable = await db.wmsAsnLineMap.findMany({
+      where: {
+        productId: product.id,
+        asn: { connector: 'mintsoft', warehouseId: destination.id, closedAt: null },
+        sourceType: { in: ['PURCHASE_ORDER_LINE', 'STOCK_TRANSFER_LINE'] },
+      },
+      select: { id: true },
+    })
+    assert.equal(
+      discoverable.length,
+      2,
+      'the discovery query must see BOTH rows — one healthy, one cancelled — or this proof reaches nothing',
+    )
+    assert.ok(
+      discoverable.some((row) => row.id === dead.asnLineMapId),
+      'and the CANCELLED parent’s ASN row must be one of them',
+    )
+    assert.equal(
+      (await db.stockTransfer.findUniqueOrThrow({
+        where: { id: dead.transferId }, select: { status: true },
+      })).status,
+      'CANCELLED',
+    )
+    assert.equal(
+      (await db.stockTransfer.findUniqueOrThrow({
+        where: { id: base.transfer.id }, select: { status: true },
+      })).status,
+      'IN_TRANSIT',
+    )
+
+    // SWEEP ONE — six of the healthy line's ten units.
+    const first = await applyAlignment(binding, product.id, tag, { delta: 6, imsQty: 0 })
+    assert.doesNotMatch(
+      first.reason,
+      /measured before an ASN line committed under this run/,
+      'the cancelled row is not a race — mislabelling it as one is the defect: ' + first.reason,
+    )
+    assert.equal(
+      first.applied,
+      true,
+      `the healthy candidate must still absorb its delta, got ${JSON.stringify(first)}`,
+    )
+    assert.equal(first.correctedQty, 6)
+
+    // SWEEP TWO — the remaining four, with the cancelled row STILL sitting there.
+    // This is the half that separates "deferred by one sweep" from "deferred for
+    // ever": the row that broke sweep one has not gone anywhere and cannot.
+    const second = await applyAlignment(binding, product.id, tag, { delta: 4, imsQty: 6 })
+    assert.equal(
+      second.applied,
+      true,
+      `a repeat sweep must work too — the cancelled row never closes, so a block here is permanent: ${JSON.stringify(second)}`,
+    )
+    assert.equal(second.correctedQty, 4)
+
+    // THE AMOUNTS. Ten units at the destination, none of them from the cancelled
+    // transfer, and the reclassification that this branch exists to keep single
+    // still posts once per unit.
+    assert.equal(
+      Number((await db.stockLevel.findFirstOrThrow({
+        where: { productId: product.id, warehouseId: destination.id }, select: { quantity: true },
+      })).quantity),
+      LINE_QTY,
+      'the destination holds the healthy line’s ten units',
+    )
+    // The cancelled transfer's source layer has exactly ONE descendant — the
+    // replacement layer the cancellation put back at the SOURCE — and none at the
+    // destination. A second descendant at the destination is the double-count this
+    // whole branch exists to prevent.
+    assert.equal(
+      await db.costLayerSourceLine.count({
+        where: { sourceCostLayerId: dead.sourceLayerId, costLayer: { warehouseId: destination.id } },
+      }),
+      0,
+      'NOTHING at the destination descends from the cancelled transfer’s source layer',
+    )
+    assert.equal(
+      await db.costLayerSourceLine.count({
+        where: { sourceCostLayerId: dead.sourceLayerId, costLayer: { warehouseId: base.source.id } },
+      }),
+      1,
+      'its units went back to source, in exactly one replacement layer',
+    )
+    assert.equal(
+      Number((await db.wmsAsnLineMap.findUniqueOrThrow({
+        where: { id: dead.asnLineMapId }, select: { qtyAccountedViaSnapshot: true },
+      })).qtyAccountedViaSnapshot),
+      0,
+      'the cancelled ASN row was never credited',
+    )
+
+    const { posted, totalInventory } = await applyLandedCostChange(sourceLayer.id)
+    assert.equal(
+      totalInventory.toFixed(2),
+      (LANDED_COST_DELTA_PER_UNIT * LINE_QTY).toFixed(2),
+      `£${LANDED_COST_DELTA_PER_UNIT}/unit on ${LINE_QTY} units must post once, not twice ` +
+      `(${JSON.stringify(posted)})`,
+    )
+  },
+)
+
+test(
+  'and the mixed world still REFUSES when the healthy candidate cannot cover the delta (Codex r13 — not vacuous)',
+  { skip: !RUN && 'set RUN_DB_CONCURRENCY_TESTS=1' },
+  async () => {
+    // Without this, "stop treating the cancelled row as terminal" could have been
+    // implemented as "stop refusing anything", and every assertion above would hold.
+    // The cancelled row must still be EXCLUDED from capacity, not merely tolerated:
+    // ten healthy units plus ten cancelled ones must explain ten, never twenty.
+    loadEnv()
+    const base = await seedDispatchedTransferWithOpenAsn('mixed-cap')
+    const { db, product, destination, binding, tag } = base
+    const dead = await seedSiblingDispatchedTransferWithOpenAsn(base, 'dead')
+    const { cancelDispatchedTransfer } = await import('@/app/actions/transfers')
+    assert.equal((await cancelDispatchedTransfer(dead.transferId)).success, true)
+
+    const aligned = await applyAlignment(binding, product.id, tag, { delta: LINE_QTY * 2, imsQty: 0 })
+
+    assert.equal(
+      aligned.applied,
+      false,
+      `only the healthy line’s ten units are available, so a twenty-unit delta must be refused, got ${JSON.stringify(aligned)}`,
+    )
+    assert.match(
+      aligned.reason,
+      /only explain 10/,
+      `the refusal must say the healthy line covers ten of the twenty, got: ${aligned.reason}`,
+    )
+    assert.match(aligned.reason, /CANCELLED/, `and name the cancelled row, got: ${aligned.reason}`)
+    assert.equal(
+      await db.stockLevel.count({ where: { warehouseId: destination.id, quantity: { gt: 0 } } }),
+      0,
+      'nothing was booked in',
+    )
+  },
+)
+
+/*
+ * WITHDRAWN (Codex round-8): the round-7 race proof for the transfer lock.
+ *
+ * It asserted that a cancellation and an alignment cannot both succeed. With the
+ * lock withdrawn that is no longer claimed — the concurrent route is open, and
+ * saying so on o3d-2y5u is more honest than a test that could not establish it
+ * anyway. `Promise.all` starts two promises; it does not make their critical
+ * sections overlap, and the mutation that removed the lock still passed one run in
+ * five. Recover it with
+ * `git show 7723f229:tests/concurrency/mintsoft-alignment-cancelled-transfer.concurrent.test.ts`.
+ */
