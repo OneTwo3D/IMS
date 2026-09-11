@@ -221,6 +221,29 @@ async function alignUp(binding: unknown, productId: string, sku: string) {
   })
 }
 
+/**
+ * `alignUp` with the delta and its basis spelled out, for the mixed-world proofs
+ * that sweep the same product more than once (6oyu.19, Codex round-13 MEDIUM-1).
+ */
+async function applyAlignment(
+  binding: unknown,
+  productId: string,
+  sku: string,
+  amounts: { delta: number; imsQty: number },
+) {
+  const { applyMintsoftAlignmentForProduct } =
+    await import('@/lib/connectors/mintsoft/sync/stock-sync')
+  return applyMintsoftAlignmentForProduct({
+    binding: binding as never,
+    jobId: `r13-proof-${Date.now()}`,
+    productId,
+    sku,
+    delta: amounts.delta,
+    imsQty: amounts.imsQty,
+    dryRun: false,
+  })
+}
+
 async function landedCostDeps() {
   const costLayers = await import('@/lib/cost-layers')
   return {
@@ -482,6 +505,256 @@ test(
       select: { quantity: true },
     })
     assert.equal(Number(stock.quantity), LINE_QTY, 'IMS destination stock is the full ten, not three')
+  },
+)
+
+/**
+ * A SECOND dispatched transfer for the SAME product, warehouses and SKU as `base`,
+ * with its own source layer, its own frozen snapshot and its own OPEN ASN.
+ *
+ * It exists so one product can have TWO open ASN rows whose parents differ in
+ * status, which is the world the mixed-world proof below needs and which no fixture
+ * on this branch could build before (6oyu.19, Codex round-13 MEDIUM-1).
+ */
+async function seedSiblingDispatchedTransferWithOpenAsn(
+  base: Awaited<ReturnType<typeof seedDispatchedTransferWithOpenAsn>>,
+  label: string,
+) {
+  const { db, product, source, destination, tag } = base
+  const siblingTag = `${tag}-${label}`
+
+  const sourceLayer = await db.costLayer.create({
+    data: {
+      productId: product.id,
+      warehouseId: source.id,
+      receivedQty: `${LINE_QTY}.000000`,
+      remainingQty: '0.000000',
+      unitCostBase: UNIT_COST,
+    },
+    select: { id: true },
+  })
+  const snapshot = [{ costLayerId: sourceLayer.id, qty: `${LINE_QTY}.000000`, unitCostBase: `${UNIT_COST}.000000` }]
+
+  const transfer = await db.stockTransfer.create({
+    data: {
+      reference: siblingTag,
+      fromWarehouseId: source.id,
+      toWarehouseId: destination.id,
+      status: 'IN_TRANSIT',
+      dispatchedAt: new Date(),
+      lines: {
+        create: [{
+          productId: product.id,
+          sku: tag,
+          productName: `r13 sibling ${label}`,
+          qty: `${LINE_QTY}.0000`,
+          qtyReceived: '0.0000',
+          costLayerSnapshot: snapshot,
+        }],
+      },
+    },
+    select: { id: true, lines: { select: { id: true } } },
+  })
+
+  const asn = await db.wmsAsnMap.create({
+    data: {
+      connector: 'mintsoft', // wms-connector-boundary-ok: 6oyu.19: a test fixture row, not a core flow branch
+      externalAsnId: siblingTag,
+      sourceType: 'STOCK_TRANSFER',
+      sourceId: transfer.id,
+      warehouseId: destination.id,
+      status: 'OPEN',
+      lines: {
+        create: [{
+          externalAsnLineId: `${siblingTag}-1`,
+          sourceType: 'STOCK_TRANSFER_LINE',
+          sourceLineId: transfer.lines[0]!.id,
+          productId: product.id,
+          // The SAME sku as `base` — the discovery query keys on productId, so both
+          // rows land in one candidate set.
+          sku: tag,
+          expectedQty: `${LINE_QTY}.0000`,
+        }],
+      },
+    },
+    select: { id: true, lines: { select: { id: true } } },
+  })
+
+  return {
+    transferId: transfer.id,
+    transferLineId: transfer.lines[0]!.id,
+    sourceLayerId: sourceLayer.id,
+    asnMapId: asn.id,
+    asnLineMapId: asn.lines[0]!.id,
+    externalAsnId: siblingTag,
+  }
+}
+
+test(
+  'THE MIXED WORLD: a CANCELLED parent beside a healthy candidate must not block the healthy one, ever (Codex r13 MEDIUM-1)',
+  { skip: !RUN && 'set RUN_DB_CONCURRENCY_TESTS=1' },
+  async () => {
+    // THE REGRESSION THIS PINS, introduced by round 11 and found by Codex round 13.
+    //
+    // Discovery refuses the cancelled row and locks only `discovery.candidates`, so
+    // the cancelled row is absent from the lock set for a reason that has nothing to
+    // do with racing. The locked re-read reads that absence as "committed after the
+    // locks", labels the row `raced`, and round 11's terminal guard throws the WHOLE
+    // plan away — including the healthy candidate. And because nothing closes a
+    // cancelled transfer's ASN (proved by the PRECONDITION test above), the row is
+    // there again on the next sweep, and the one after: the deferral never expires.
+    //
+    // Both existing arms miss it. The cancelled-ONLY world returns at the FIRST
+    // `discovery.candidates.length === 0` and never reaches the re-read; the
+    // raced-only worlds in transfer-asn-lock-order.concurrent.test.ts have no
+    // refused row to mislabel. It takes both in one product to reach the branch.
+    loadEnv()
+    const base = await seedDispatchedTransferWithOpenAsn('mixed')
+    const { db, product, destination, sourceLayer, binding, tag } = base
+    const dead = await seedSiblingDispatchedTransferWithOpenAsn(base, 'dead')
+    const { cancelDispatchedTransfer } = await import('@/app/actions/transfers')
+
+    const cancel = await cancelDispatchedTransfer(dead.transferId)
+    assert.equal(cancel.success, true, `the sibling cancel must succeed: ${JSON.stringify(cancel)}`)
+
+    // THE PRECONDITION, ASSERTED SO THIS CANNOT PASS VACUOUSLY. Both ASN rows must
+    // still be discoverable — same product, same destination, both ASNs OPEN — and
+    // the parents must differ in status. If either row dropped out of the candidate
+    // query the assertions below would hold for the wrong reason.
+    const discoverable = await db.wmsAsnLineMap.findMany({
+      where: {
+        productId: product.id,
+        asn: { connector: 'mintsoft', warehouseId: destination.id, closedAt: null },
+        sourceType: { in: ['PURCHASE_ORDER_LINE', 'STOCK_TRANSFER_LINE'] },
+      },
+      select: { id: true },
+    })
+    assert.equal(
+      discoverable.length,
+      2,
+      'the discovery query must see BOTH rows — one healthy, one cancelled — or this proof reaches nothing',
+    )
+    assert.ok(
+      discoverable.some((row) => row.id === dead.asnLineMapId),
+      'and the CANCELLED parent’s ASN row must be one of them',
+    )
+    assert.equal(
+      (await db.stockTransfer.findUniqueOrThrow({
+        where: { id: dead.transferId }, select: { status: true },
+      })).status,
+      'CANCELLED',
+    )
+    assert.equal(
+      (await db.stockTransfer.findUniqueOrThrow({
+        where: { id: base.transfer.id }, select: { status: true },
+      })).status,
+      'IN_TRANSIT',
+    )
+
+    // SWEEP ONE — six of the healthy line's ten units.
+    const first = await applyAlignment(binding, product.id, tag, { delta: 6, imsQty: 0 })
+    assert.doesNotMatch(
+      first.reason,
+      /measured before an ASN line committed under this run/,
+      'the cancelled row is not a race — mislabelling it as one is the defect: ' + first.reason,
+    )
+    assert.equal(
+      first.applied,
+      true,
+      `the healthy candidate must still absorb its delta, got ${JSON.stringify(first)}`,
+    )
+    assert.equal(first.correctedQty, 6)
+
+    // SWEEP TWO — the remaining four, with the cancelled row STILL sitting there.
+    // This is the half that separates "deferred by one sweep" from "deferred for
+    // ever": the row that broke sweep one has not gone anywhere and cannot.
+    const second = await applyAlignment(binding, product.id, tag, { delta: 4, imsQty: 6 })
+    assert.equal(
+      second.applied,
+      true,
+      `a repeat sweep must work too — the cancelled row never closes, so a block here is permanent: ${JSON.stringify(second)}`,
+    )
+    assert.equal(second.correctedQty, 4)
+
+    // THE AMOUNTS. Ten units at the destination, none of them from the cancelled
+    // transfer, and the reclassification that this branch exists to keep single
+    // still posts once per unit.
+    assert.equal(
+      Number((await db.stockLevel.findFirstOrThrow({
+        where: { productId: product.id, warehouseId: destination.id }, select: { quantity: true },
+      })).quantity),
+      LINE_QTY,
+      'the destination holds the healthy line’s ten units',
+    )
+    // The cancelled transfer's source layer has exactly ONE descendant — the
+    // replacement layer the cancellation put back at the SOURCE — and none at the
+    // destination. A second descendant at the destination is the double-count this
+    // whole branch exists to prevent.
+    assert.equal(
+      await db.costLayerSourceLine.count({
+        where: { sourceCostLayerId: dead.sourceLayerId, costLayer: { warehouseId: destination.id } },
+      }),
+      0,
+      'NOTHING at the destination descends from the cancelled transfer’s source layer',
+    )
+    assert.equal(
+      await db.costLayerSourceLine.count({
+        where: { sourceCostLayerId: dead.sourceLayerId, costLayer: { warehouseId: base.source.id } },
+      }),
+      1,
+      'its units went back to source, in exactly one replacement layer',
+    )
+    assert.equal(
+      Number((await db.wmsAsnLineMap.findUniqueOrThrow({
+        where: { id: dead.asnLineMapId }, select: { qtyAccountedViaSnapshot: true },
+      })).qtyAccountedViaSnapshot),
+      0,
+      'the cancelled ASN row was never credited',
+    )
+
+    const { posted, totalInventory } = await applyLandedCostChange(sourceLayer.id)
+    assert.equal(
+      totalInventory.toFixed(2),
+      (LANDED_COST_DELTA_PER_UNIT * LINE_QTY).toFixed(2),
+      `£${LANDED_COST_DELTA_PER_UNIT}/unit on ${LINE_QTY} units must post once, not twice ` +
+      `(${JSON.stringify(posted)})`,
+    )
+  },
+)
+
+test(
+  'and the mixed world still REFUSES when the healthy candidate cannot cover the delta (Codex r13 — not vacuous)',
+  { skip: !RUN && 'set RUN_DB_CONCURRENCY_TESTS=1' },
+  async () => {
+    // Without this, "stop treating the cancelled row as terminal" could have been
+    // implemented as "stop refusing anything", and every assertion above would hold.
+    // The cancelled row must still be EXCLUDED from capacity, not merely tolerated:
+    // ten healthy units plus ten cancelled ones must explain ten, never twenty.
+    loadEnv()
+    const base = await seedDispatchedTransferWithOpenAsn('mixed-cap')
+    const { db, product, destination, binding, tag } = base
+    const dead = await seedSiblingDispatchedTransferWithOpenAsn(base, 'dead')
+    const { cancelDispatchedTransfer } = await import('@/app/actions/transfers')
+    assert.equal((await cancelDispatchedTransfer(dead.transferId)).success, true)
+
+    const aligned = await applyAlignment(binding, product.id, tag, { delta: LINE_QTY * 2, imsQty: 0 })
+
+    assert.equal(
+      aligned.applied,
+      false,
+      `only the healthy line’s ten units are available, so a twenty-unit delta must be refused, got ${JSON.stringify(aligned)}`,
+    )
+    assert.match(
+      aligned.reason,
+      /only explain 10/,
+      `the refusal must say the healthy line covers ten of the twenty, got: ${aligned.reason}`,
+    )
+    assert.match(aligned.reason, /CANCELLED/, `and name the cancelled row, got: ${aligned.reason}`)
+    assert.equal(
+      await db.stockLevel.count({ where: { warehouseId: destination.id, quantity: { gt: 0 } } }),
+      0,
+      'nothing was booked in',
+    )
   },
 )
 

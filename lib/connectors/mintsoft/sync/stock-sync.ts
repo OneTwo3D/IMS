@@ -593,7 +593,28 @@ type RefusedAlignmentCandidate = {
 type AlignmentLockSet = {
   /** `stock_transfers` rows held FOR UPDATE (step 2a of the global order). */
   transferIds: ReadonlySet<string>
-  /** `wms_asn_line_maps` rows held FOR UPDATE (step 4 of the global order). */
+  /**
+   * `wms_asn_line_maps` rows held FOR UPDATE (step 4 of the global order).
+   *
+   * THIS IS DISCOVERY'S WHOLE ROW SET, NOT THE USABLE SLICE OF IT (6oyu.19, Codex
+   * round-13 MEDIUM-1). The caller locks every row the discovery read RETURNED —
+   * candidates and refused rows alike — so membership here answers one question and
+   * only one: *did this row exist when the plan was discovered?* That is a fact about
+   * row identity, it cannot change under this transaction, and it is exactly the
+   * moved-versus-unusable distinction the `raced` refusal needs.
+   *
+   * WHY IT USED TO BE THE CANDIDATES ONLY, AND WHY THAT WAS A BUG. Rounds 10-12
+   * locked `discovery.candidates`, so a row discovery had already REFUSED — almost
+   * always a cancelled parent — was absent from this set for a reason that had
+   * nothing to do with racing. The re-read then relabelled it `raced`, and round 11's
+   * terminal guard rejected the whole plan on the strength of it. Nothing closes a
+   * cancelled transfer's ASN, so that row never goes away: one cancelled transfer
+   * beside a healthy candidate for the same SKU turned "defer this sweep" into
+   * "defer for ever". Locking the refused rows too carries discovery's own refusal
+   * forward — the row comes back through the re-read and is refused again, under a
+   * lock, by the same stable predicate — instead of re-deriving a different answer
+   * from its absence.
+   */
   asnLineMapIds: ReadonlySet<string>
 }
 
@@ -622,6 +643,16 @@ type AlignmentCandidateSet = {
    * status or a `closedAt` read BEFORE the lock is exactly what the lock settles.
    */
   asnMapIds: string[]
+  /**
+   * EVERY `wms_asn_line_maps` row this read returned — candidates AND refused rows —
+   * in the order the query produced them, so the caller's step-4 lock can cover
+   * discovery's whole row set (6oyu.19, Codex round-13 MEDIUM-1). See
+   * `AlignmentLockSet.asnLineMapIds` for why the usable slice was the wrong set to
+   * lock. Refused rows are in for the same reason `parentTransferIds` and
+   * `asnMapIds` include them: the facts that refused them were read BEFORE the lock,
+   * and re-reading them under one is the whole point of the second pass.
+   */
+  discoveredLineIds: string[]
   refused: RefusedAlignmentCandidate[]
 }
 
@@ -790,6 +821,16 @@ async function getAlignmentCandidateLines(
     // refused whatever its source type, which is what makes a raced PURCHASE_ORDER
     // line — the case round 10 found, and the one no parent lock on this path would
     // have covered — refused by the same statement as a raced transfer line.
+    //
+    // AND IT NOW MEANS ONLY ONE THING (6oyu.19, Codex round-13 MEDIUM-1). The lock
+    // set is discovery's ENTIRE row set, so this test is `!discovered(line)` — the
+    // row was committed between the discovery read and the step-4 lock. It no longer
+    // fires for a row discovery saw and refused; that row is locked, comes back
+    // through this loop, and is refused below by the predicate that refused it the
+    // first time, now evaluated under a lock. `raced` therefore means MOVED, and
+    // `unusable` means UNUSABLE, which is what makes the terminal guard on `raced`
+    // in `applyMintsoftAlignmentForProduct` a one-sweep deferral rather than a
+    // permanent block.
     if (locks && !locks.asnLineMapIds.has(line.id)) {
       refused.push({
         asnLineMapId: line.id,
@@ -903,6 +944,7 @@ async function getAlignmentCandidateLines(
     transferLineResiduals,
     parentTransferIds: [...parentTransferIds],
     asnMapIds: [...asnMapIds],
+    discoveredLineIds: lines.map((line) => line.id),
     refused,
   }
 }
@@ -1071,8 +1113,25 @@ export async function applyMintsoftAlignmentForProduct(params: {
     // until commit.
     const lockedTransferIds = new Set(await lockStockTransfers(tx, discovery.parentTransferIds))
     await lockWmsAsnMaps(tx, discovery.asnMapIds)
+    // STEP 4 COVERS EVERY ROW DISCOVERY SAW, NOT JUST THE USABLE ONES (6oyu.19,
+    // Codex round-13 MEDIUM-1). Rounds 10-12 locked `discovery.candidates`, and the
+    // re-read below reads `!locks.asnLineMapIds.has(id)` as "this row raced in".
+    // Those two statements only agree if the unlocked rows are the new ones — and
+    // they were not: a row discovery REFUSED, chiefly for a cancelled parent, was
+    // also absent, so the re-read relabelled a stable refusal as a race and round
+    // 11's terminal guard threw the whole plan away. Nothing closes a cancelled
+    // transfer's ASN (proved in
+    // tests/concurrency/mintsoft-alignment-cancelled-transfer.concurrent.test.ts),
+    // so that row is there again next sweep and every sweep after: one cancelled
+    // transfer permanently blocked align-up for its SKU.
+    //
+    // Locking discovery's whole row set is the smallest change that makes the two
+    // statements agree, and it is in-order: same table, same step, more ids, taken
+    // ascending by `lockWmsAsnLineMaps`, and every transfer-backed row's parent is
+    // already in `parentTransferIds` (which has always included the refused ones) so
+    // step 2 already covered them.
     const lockedAsnLineMapIds = new Set(
-      await lockWmsAsnLineMaps(tx, discovery.candidates.map((candidate) => candidate.id)),
+      await lockWmsAsnLineMaps(tx, discovery.discoveredLineIds),
     )
 
     // Read again UNDER the locks, AND ONLY WITHIN THEM. Every fact the plan rests on
@@ -1099,8 +1158,11 @@ export async function applyMintsoftAlignmentForProduct(params: {
       }
     }
 
-    // A RACED ROW ENDS THIS PLAN — DEFENCE IN DEPTH, WITH NO CLAIM OF INDEPENDENT
-    // NECESSITY (6oyu.19, Codex round-10 HIGH-1; DEMOTED at round 12).
+    // A RACED ROW ENDS THIS PLAN (6oyu.19, Codex round-10 HIGH-1; demoted to defence
+    // in depth at round 12, and PARTLY RESTORED at round 13 — see the two paragraphs
+    // headed WHY THE REFUSAL STAYS ANYWAY and WHAT MUTATION D ACTUALLY ESTABLISHED,
+    // which correct round 12's claim that the stock comparison below covers
+    // everything this does).
     //
     // WHAT THIS CHECK WAS FOR, AND WHY THAT REASON IS NO LONGER ITS OWN. Round 10
     // built the refusal and consulted it on one branch only — to EXPLAIN an
@@ -1126,21 +1188,56 @@ export async function applyMintsoftAlignmentForProduct(params: {
     // proofs still refusing and still posting ten units and £50 — the r10 arm passes
     // outright, and the r11 full-capacity arm fails on its refusal WORDING alone
     // (`/measured before an ASN line committed under this run/` against `IMS stock
-    // moved during the sync run (0 → 10)…`). On the two routes anyone has been able
-    // to construct, the stock comparison is what makes them safe and this check owns
-    // only the sentence.
+    // moved during the sync run (0 → 10)…`). On THOSE TWO ROUTES the stock comparison
+    // is what makes them safe and this check owns only the sentence. Read no further
+    // than that: both are races that also move stock, so the measurement says nothing
+    // about a race that does not — and one of those exists, immediately below.
     //
-    // WHY THE REFUSAL STAYS ANYWAY. What is left for it is narrow and stated plainly
-    // so nobody re-derives a larger claim from its presence: a raced row is a row
-    // whose parent, counters and `closedAt` this transaction holds NOTHING on, sitting
-    // in the window the plan was selected from, and the one shape the stock comparison
-    // cannot see is a raced row that arrived WITHOUT moving destination stock. No path
-    // reaches that today. Refusing to plan alongside one is therefore the same posture
-    // as the transfer-parent check in `getAlignmentCandidateLines` — kept because it
-    // fires before the planner and names the ASN rows for the operator, and because
-    // the cost is one deferred sweep in a window where something genuinely concurrent
-    // has already happened, NOT because a route through it is known to be open. If it
-    // is ever removed, the stock comparison below is what must not be.
+    // WHY THE REFUSAL STAYS ANYWAY — AND THE ROUND-12 VERSION OF THIS PARAGRAPH WAS
+    // WRONG ABOUT WHY (6oyu.19, Codex round-13 LOW-1). It said the one shape the
+    // stock comparison cannot see is a raced row that arrived WITHOUT moving
+    // destination stock, and then that "no path reaches that today". A PATH REACHES
+    // IT. ASN creation commits new `wms_asn_line_maps` rows and moves no stock while
+    // doing it — grepped this round rather than recalled, because that claim was the
+    // fourth premise on this branch asserted from memory:
+    //       $ grep -n 'wmsAsnLineMap\.\(create\|createMany\|upsert\)' app/actions/mintsoft-sync.ts
+    //       → 2985 (PO ASN) and 3913 (transfer ASN), the per-line creates on the
+    //         reconcile-pending path; the first ASN of each kind is created with its
+    //         lines nested inside `wmsAsnMap.create` at 3073 and 4001.
+    //       $ grep -c 'stockLevel' app/actions/mintsoft-sync.ts
+    //       → 0. The whole file never touches a `stock_levels` row, so neither
+    //         creation transaction can move the quantity the comparison below reads.
+    // So a raced row that moves no stock is reachable, the stock comparison cannot
+    // see it, and this check is the only thing that does.
+    //
+    // WHAT MUTATION D ACTUALLY ESTABLISHED, stated no wider than the measurement.
+    // Disabling this refusal left both raced proofs refusing, which says: ON THE
+    // ROUTES THOSE TWO PROOFS STAGE, the stock comparison is what refuses. It does
+    // NOT say those are the only routes — both proofs stage a race that also moves
+    // stock, so they could not have exercised the shape above even if it were open.
+    // The subsumption is over the staged routes, not over the space of races.
+    //
+    // So this check is kept on its own merits, not as scenery: it fires before the
+    // planner, it names the ASN rows for the operator, and it covers a race the
+    // quantity comparison is blind to. If it is ever removed, the stock comparison
+    // below is what must not be — and the reverse now holds too.
+    //
+    // TERMINAL COSTS ONE SWEEP, AND ONLY BECAUSE `raced` NOW MEANS MOVED (6oyu.19,
+    // Codex round-13 MEDIUM-1). Round 11 made this rejection terminal on the
+    // argument that a raced row means the world moved. It did — but the set it
+    // rejected on was not only moved rows. The step-4 lock covered
+    // `discovery.candidates`, so a row discovery had REFUSED for a stable reason —
+    // a cancelled parent, overwhelmingly — was unlocked too, and the re-read
+    // relabelled it `raced`. Nothing closes a cancelled transfer's ASN, so the
+    // deferral had no next sweep to be deferred to: one cancelled transfer beside a
+    // healthy candidate for the same SKU blocked align-up for that SKU for ever.
+    // The lock now covers discovery's whole row set (see the step-4 call above), so
+    // a refused row is re-refused as `unusable` and this guard sees only rows that
+    // genuinely arrived in the window. Both halves are proved in
+    // tests/concurrency/mintsoft-alignment-cancelled-transfer.concurrent.test.ts —
+    // the mixed world aligns and keeps aligning, and a genuinely raced row is still
+    // terminal in
+    // tests/concurrency/transfer-asn-lock-order.concurrent.test.ts.
     //
     // REFUSE, RATHER THAN RE-PLAN UNDER THE LOCKS. Re-planning would fix the
     // candidate set and not the input: the delta itself is the stale number, and it
