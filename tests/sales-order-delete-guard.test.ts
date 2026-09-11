@@ -114,6 +114,9 @@ const STAMPS = {
   inventoryAllocatedDate: null,
   revenueDeferredBatchRef: null,
   inventoryAllocatedBatchRef: null,
+  // o3d-i0o6 r2: the A2 journal id. Null here, i.e. "this order names no A2 journal", so every
+  // pre-existing case below is unchanged and the new lookup contributes nothing to them.
+  allocationBatchSyncLogId: null,
 }
 const A2_STAGED_AT = new Date('2026-07-20T23:15:00.000Z')
 /** o3d-0qoo: stamped just after midnight by a run whose batch was keyed on the previous day. */
@@ -436,6 +439,51 @@ test('a still-queued A2 batch blocks too — the order value is already inside t
     { ...STAMPS, inventoryAllocatedDate: A2_STAGED_AT },
   )
   assert.equal(blocker?.code, 'daily_batch_staged')
+})
+
+test('o3d-i0o6 r2: an order whose A2 STAMP was cleared by a declared rewrite is still blocked by the journal it named', async () => {
+  // THE SHAPE `resetAllocationAccountingIfStaged` LEAVES BEHIND on its declared path: the stamp and
+  // the batch ref are cleared ON PURPOSE, so Group A2 comes back and posts the increment, while the
+  // recorded debit and the journal's own id are deliberately KEPT. Both of the guard's previous
+  // alternatives are derived from what was cleared, so `dailyBatchReferenceWhere` returned null and
+  // the A2 blocker was skipped entirely — a hard delete of an order sitting inside a SYNCED batch
+  // journal, taking the only local record of the debit with it.
+  const blocker = await findSalesOrderDeleteBlocker(
+    makeTx({
+      syncLogs: [syncLog({
+        id: 'a2-log-1',
+        type: 'DAILY_BATCH_INVENTORY_ALLOC',
+        status: 'SYNCED',
+        referenceType: 'DailyBatch',
+        referenceId: 'A2-2026-07-20-1a2b3c4d',
+      })],
+    }),
+    'order-1',
+    // No stamp, no batch ref — exactly what the rewrite leaves — and the journal id it kept.
+    { ...STAMPS, allocationBatchSyncLogId: 'a2-log-1' },
+  )
+  assert.equal(blocker?.code, 'daily_batch_staged')
+  assert.match(blocker!.message, /A2 inventory allocation/)
+})
+
+test('o3d-i0o6 r2: and it is a lookup, not a blanket refusal — a retired A2 journal still lets the order go', async () => {
+  // The control. The id is present and names a row that is CANCELLED, which is not a live claim on
+  // this order's value, so nothing is blocked. Without this the test above would pass for an order
+  // that merely carries an id.
+  const blocker = await findSalesOrderDeleteBlocker(
+    makeTx({
+      syncLogs: [syncLog({
+        id: 'a2-log-1',
+        type: 'DAILY_BATCH_INVENTORY_ALLOC',
+        status: 'CANCELLED',
+        referenceType: 'DailyBatch',
+        referenceId: 'A2-2026-07-20-1a2b3c4d',
+      })],
+    }),
+    'order-1',
+    { ...STAMPS, allocationBatchSyncLogId: 'a2-log-1' },
+  )
+  assert.equal(blocker, null)
 })
 
 test('an A2 stamp with no matching batch log does not block (batch never queued)', async () => {

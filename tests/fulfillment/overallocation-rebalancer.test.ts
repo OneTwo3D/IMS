@@ -160,6 +160,8 @@ type QueuedAccountingSync = {
   type: string
   referenceType: string
   referenceId: string
+  /** o3d-i0o6: the ledger the caller pinned this row to, if it pinned one. */
+  connector?: string
   payload: {
     _reversalToken?: string
     lines?: Array<{ accountCode: string; debit?: number; credit?: number }>
@@ -170,10 +172,22 @@ const accountingSyncRows: QueuedAccountingSync[] = []
 
 mock.module('@/lib/accounting', {
   namedExports: {
-    getAccountingSettings: async () => ({ inventoryAccount: '630', allocatedInventoryAccount: '631' }),
+    // o3d-i0o6: the reversal reads settings FOR the connector it proved and pinned, never for
+    // whichever is active at the moment of the read — a third independent resolution in a function
+    // that already has one. The no-arg form refuses so a regression to it fails by name.
+    getAccountingSettings: async () => {
+      throw new Error('o3d-i0o6: use getAccountingSettingsFor(provedConnector), not the active-connector form')
+    },
+    getAccountingSettingsFor: async (connector: string | null) => (
+      connector === 'xero'
+        ? { inventoryAccount: '630', allocatedInventoryAccount: '631' }
+        : { inventoryAccount: '', allocatedInventoryAccount: '' }
+    ),
     queueAccountingSyncTx: async (_tx: unknown, params: QueuedAccountingSync) => {
       queuedAccountingSyncs.push(params)
-      accountingSyncRows.push(params)
+      // o3d-i0o6: written under the PIN where one was given — an unpinned enqueue resolves the
+      // active connector for itself, which is the race the pin closes.
+      accountingSyncRows.push({ ...params, connector: params.connector ?? 'xero' })
       return true
     },
     isAccountingSyncTypeEnabled: async () => true,
@@ -248,12 +262,17 @@ const tx = {
   accountingSyncLog: {
     findFirst: async ({ where }: {
       where: {
+        connector?: string
         type?: string
         referenceType?: string
         referenceId?: string
         payload?: { path: string[]; equals: unknown }
       }
     }) => accountingSyncRows.find((row) => {
+      // o3d-i0o6: the connector is part of the predicate — a row written under another ledger is
+      // not this reversal, and answering "queued" for one is how relief gets claimed in books that
+      // never held the debit.
+      if (where.connector != null && row.connector !== where.connector) return false
       if (where.type != null && row.type !== where.type) return false
       if (where.referenceType != null && row.referenceType !== where.referenceType) return false
       if (where.referenceId != null && row.referenceId !== where.referenceId) return false

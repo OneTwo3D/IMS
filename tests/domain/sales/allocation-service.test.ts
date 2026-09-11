@@ -10,11 +10,21 @@ type QueuedAccountingSync = {
   type: string
   referenceType: string
   referenceId: string
+  /**
+   * o3d-i0o6: the PIN — the ledger the caller says this row must be written under, or undefined
+   * where the caller leaves the enqueue to resolve the active connector for itself. The double
+   * below reproduces that choice faithfully, because reproducing it is the only way a test can
+   * observe a credit being queued against a connector its proof was not made on.
+   */
+  connector?: string
   payload: {
     _reversalToken?: string
     lines?: Array<{ accountCode: string; debit?: number; credit?: number }>
   }
 }
+
+/** The row as the enqueue WROTE it, carrying the connector it was actually written under. */
+type WrittenAccountingSync = QueuedAccountingSync & { connector: string }
 
 /** Every enqueue ATTEMPT, whether or not it ended up writing a row. */
 const queuedAccountingSyncs: QueuedAccountingSync[] = []
@@ -28,7 +38,7 @@ const queuedAccountingSyncs: QueuedAccountingSync[] = []
  * none of those cases. A double whose enqueue could only ever succeed can neither exercise the
  * verification nor observe its absence, so it is settable per test.
  */
-const accountingSyncRows: QueuedAccountingSync[] = []
+const accountingSyncRows: WrittenAccountingSync[] = []
 
 /**
  * What the enqueue DOES this test. `'writes'` is production's happy path; `'silent-no-op'` is the
@@ -44,31 +54,88 @@ let accountingEnqueueOutcome: 'writes' | 'silent-no-op' = 'writes'
  */
 let activeAccountingConnector: { id: string } | null = { id: 'xero' }
 
+/**
+ * o3d-i0o6: THE SWITCH ITSELF, not a connector that was already different.
+ *
+ * The defect being guarded is a connector that changes BETWEEN the proof and the enqueue, so a
+ * fixture where the connector is simply wrong from the start cannot express it — the proof would
+ * refuse and nothing would reach the enqueue. Set this and the next read of the active connector
+ * answers with today's value and THEN moves the setting, which is exactly the window nothing
+ * serialises in production.
+ */
+let activeConnectorSwitchesAfterNextReadTo: { id: string } | null | undefined
+
+/**
+ * Which connectors actually post. `queueAccountingSyncTx` resolves a posting context for the
+ * connector it is about to write under and writes NOTHING when that connector does not post the
+ * type — so a connector switched away from is typically not in here, and a pinned enqueue to it
+ * writes nothing rather than writing to the other ledger.
+ */
+let accountingConnectorsThatPost = new Set(['xero', 'quickbooks'])
+
+/** Each connector's own chart of accounts. Two different charts, because that is the point. */
+const ACCOUNTING_ACCOUNTS: Record<string, { inventoryAccount: string; allocatedInventoryAccount: string }> = {
+  xero: { inventoryAccount: '630', allocatedInventoryAccount: '631' },
+  quickbooks: { inventoryAccount: '730', allocatedInventoryAccount: '731' },
+}
+
 function resetAccountingQueue(outcome: 'writes' | 'silent-no-op' = 'writes'): void {
   queuedAccountingSyncs.length = 0
   accountingSyncRows.length = 0
   accountingEnqueueOutcome = outcome
   activeAccountingConnector = { id: 'xero' }
+  activeConnectorSwitchesAfterNextReadTo = undefined
+  accountingConnectorsThatPost = new Set(['xero', 'quickbooks'])
   lockedAllocationRecords = null
 }
 
 mock.module('@/lib/accounting', {
   namedExports: {
-    getAccountingSettings: async () => ({
-      inventoryAccount: '630',
-      allocatedInventoryAccount: '631',
-    }),
+    /**
+     * o3d-i0o6: NOT AVAILABLE TO THIS PATH, and that is the assertion.
+     *
+     * The account codes a reversal posts against are one connector's chart, so reading them through
+     * a helper that resolves "whichever connector is active NOW" is the same defect as enqueueing
+     * that way — a third independent resolution, in a function that already proved and pinned one.
+     * Nothing in `allocation-service` or `overallocation-rebalancer` may call it, so the double
+     * refuses rather than answering: put the no-arg form back and every reversal test below fails by
+     * name instead of quietly passing on codes that happened to match.
+     */
+    getAccountingSettings: async () => {
+      throw new Error(
+        'o3d-i0o6: this path must read settings FOR the connector it proved and pinned '
+        + '(getAccountingSettingsFor), never for whichever connector is active at the moment of the read',
+      )
+    },
+    getAccountingSettingsFor: async (connector: string | null) => (
+      connector ? ACCOUNTING_ACCOUNTS[connector] ?? { inventoryAccount: '', allocatedInventoryAccount: '' }
+        : { inventoryAccount: '', allocatedInventoryAccount: '' }
+    ),
     queueAccountingSyncTx: async (_tx: unknown, params: QueuedAccountingSync) => {
       queuedAccountingSyncs.push(params)
       if (accountingEnqueueOutcome === 'silent-no-op') return false
-      accountingSyncRows.push(params)
+      // o3d-i0o6 — THE RESOLUTION PRODUCTION MAKES, MADE HERE. A PINNED caller names the ledger and
+      // the row is written under it; an UNPINNED one leaves the enqueue to resolve the active
+      // connector AT THIS MOMENT, which is after the caller's own read and is the whole race. Then
+      // the posting context: a connector that does not post this type writes nothing and throws
+      // nothing, exactly as `getAccountingPostingContextFor` returning null does.
+      const connector = params.connector ?? activeAccountingConnector?.id ?? null
+      if (!connector || !accountingConnectorsThatPost.has(connector)) return false
+      accountingSyncRows.push({ ...params, connector })
       return true
     },
     isAccountingSyncTypeEnabled: async () => true,
     isDailyBatchPostingEnabled: async () => true,
     // o3d-i0o6: WHICH LEDGER this reversal would be raised on. The reversal refuses when it cannot
     // be established, so a double that omitted it would make every reversal test assert a refusal.
-    getActiveAccountingConnectorInfo: async () => activeAccountingConnector,
+    getActiveAccountingConnectorInfo: async () => {
+      const answer = activeAccountingConnector
+      if (activeConnectorSwitchesAfterNextReadTo !== undefined) {
+        activeAccountingConnector = activeConnectorSwitchesAfterNextReadTo
+        activeConnectorSwitchesAfterNextReadTo = undefined
+      }
+      return answer
+    },
   },
 })
 
@@ -784,6 +851,7 @@ function createClient(state: MemoryState): AllocationServiceClient {
       //     is what every pre-existing cancellation test assumes.
       findFirst: async (args?: {
         where?: {
+          connector?: string
           type?: string
           referenceType?: string
           referenceId?: string
@@ -793,6 +861,10 @@ function createClient(state: MemoryState): AllocationServiceClient {
         const where = args?.where ?? {}
         if (where.payload == null) return state.syncPostingClaim ?? null
         return accountingSyncRows.find((row) => {
+          // o3d-i0o6: the connector is part of the predicate when the caller asks for it. A double
+          // that ignored it would answer "yes, queued" for a row written under another ledger, which
+          // is precisely the relief-claiming defect the caller's new predicate closes.
+          if (where.connector != null && row.connector !== where.connector) return false
           if (where.type != null && row.type !== where.type) return false
           if (where.referenceType != null && row.referenceType !== where.referenceType) return false
           if (where.referenceId != null && row.referenceId !== where.referenceId) return false
@@ -5403,6 +5475,60 @@ test('o3d-i0o6: NOTHING is credited when the ledger this credit would land in is
 
   assert.deepEqual(queuedAccountingSyncs.map((sync) => sync.type), [])
   assert.match(String(reversalRefusals()[0]?.description), /cannot be established/)
+})
+
+// ---------------------------------------------------------------------------------------------
+// o3d-i0o6 r2 — AND THE LEDGER CANNOT MOVE BETWEEN THE PROOF AND THE ENQUEUE.
+//
+// The proof above establishes "A2's debit posted on THIS connector". r1 then handed the credit to
+// `queueAccountingSyncTx`, which resolved the active connector AGAIN, for itself, from a setting
+// nothing had locked. Two reads, no serialisation: the proof could pass for one ledger and the
+// credit be written for another — and the post-enqueue check asked for the row by token alone, so
+// it found the foreign row, answered "queued", and the caller recorded those pounds as relief
+// against the refund's open balance. The reversal is now PINNED to the connector the verdict names.
+// ---------------------------------------------------------------------------------------------
+
+test('o3d-i0o6 r2: a connector that switches after the proof cannot move the credit to the other ledger', async () => {
+  const state = withA2Journal(shrunkState({ lineQty: 6, record: POSTED_TEN_AT_FOUR }), { status: 'SYNCED' })
+  resetAccountingQueue()
+  // The setting moves to quickbooks the instant the proof has read it — the window nothing closes.
+  activeConnectorSwitchesAfterNextReadTo = { id: 'quickbooks' }
+
+  await allocateSalesOrder(createClient(state), { orderId: 'order-1' })
+
+  assert.equal(accountingSyncRows.length, 1, 'the reversal is still raised — the debit is proved and xero still posts')
+  assert.equal(
+    accountingSyncRows[0].connector,
+    'xero',
+    'and it is written in the books A2 debited, not in whichever connector was active by the time the '
+    + 'enqueue ran. Unpinned, this row is a quickbooks credit against a xero debit: money out of an '
+    + 'account that never held it, and the xero debit still standing',
+  )
+  assert.equal(state.order.allocationReversalAmount, 16, 'and the relief recorded matches the row that was written')
+})
+
+test('o3d-i0o6 r2: a switch AWAY from the proved ledger queues nothing and claims NO relief', async () => {
+  // The switch that took xero out of service altogether. There is now no connector that both posts
+  // this type and holds the debit, so the only honest outcome is to raise nothing and report it —
+  // never to credit the ledger that happens to be switched on.
+  const state = withA2Journal(shrunkState({ lineQty: 6, record: POSTED_TEN_AT_FOUR }), { status: 'SYNCED' })
+  resetAccountingQueue()
+  activeConnectorSwitchesAfterNextReadTo = { id: 'quickbooks' }
+  accountingConnectorsThatPost = new Set(['quickbooks'])
+
+  await allocateSalesOrder(createClient(state), { orderId: 'order-1' })
+
+  assert.equal(queuedAccountingSyncs.length, 1, 'the enqueue was attempted')
+  assert.deepEqual(accountingSyncRows, [], 'and wrote nothing — the pinned ledger does not post this type')
+  assert.equal(
+    state.order.allocationReversalAmount ?? 0,
+    0,
+    'so NO relief is claimed. Unpinned, £16 lands in quickbooks and is recorded as relief against a '
+    + 'xero debit — which then shrinks the refund\'s open balance and strands the real £16 for ever',
+  )
+  const dropped = activityLogWrites.filter((row) => row.action === 'allocation_reversal_unqueued')
+  assert.equal(dropped.length, 1, 'and the amount is reported for a human to post by hand')
+  assert.match(String(dropped[0].description), /£16\.00/)
 })
 
 test('o3d-i0o6: repeated shrinks together cannot credit more than A2 debited', async () => {

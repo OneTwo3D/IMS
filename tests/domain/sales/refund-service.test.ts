@@ -23,6 +23,11 @@ import type { AccountingSettings } from '@/lib/accounting'
 import { adapterUniqueViolation } from '@/tests/helpers/prisma-unique-error'
 import { takeShipmentAccountedEntries } from '@/lib/connectors/xero/daily-sync'
 import { toDecimal } from '@/lib/domain/math/decimal'
+// o3d-i0o6 r2: the DECLARED allocation rewrite, imported so the cleared-stamp state below is
+// PRODUCED by the code that produces it in production rather than written onto a fixture by hand.
+// A hand-written row would prove the refund handles a shape; driving the rewrite proves the shape
+// is one an ordinary allocation edit actually leaves behind.
+import { resetAllocationAccountingIfStaged } from '@/lib/domain/sales/allocation-service'
 
 type Order = {
   id: string
@@ -7521,4 +7526,174 @@ test('o3d-2sm1 Codex r1: a staging that rolls back leaves the witness at NOT_STA
     accountingSettings,
   })
   assert.equal(retry.success, true, 'a witnessed never-staged row is recoverable, not refused')
+})
+
+// ---------------------------------------------------------------------------------------------
+// o3d-i0o6 r2 — THE STAMP IS A LIFECYCLE MARKER, NOT EVIDENCE THAT A DEBIT POSTED.
+//
+// `inventoryAllocatedDate` says "Group A2 still has work to do on this order". The DECLARED
+// allocation rewrite CLEARS IT ON PURPOSE — so A2 comes back and posts the increment — and
+// deliberately KEEPS `allocationBatchAmount` and the whole journal attribution, because those are
+// the record of what A2 has already debited. r1 gated both the proof and the open-balance
+// calculation on that stamp, so in the state the rewrite leaves behind:
+//
+//   * the proof never ran, and a FAILED / CANCELLED / cross-ledger A2 journal produced a
+//     full-value credit against a debit that never posted in these books; and
+//   * the open balance was never computed, so the cap was ABSENT — and an absent cap is not a
+//     smaller ceiling, it is no ceiling, so even a VALID journal could be over-credited.
+//
+// The state is reached below by running `resetAllocationAccountingIfStaged` itself.
+// ---------------------------------------------------------------------------------------------
+
+/**
+ * Put `state` through the DECLARED allocation rewrite — the caller states the set it is about to
+ * write, that set holds quantity nothing has accounted, so A2 is handed the order back.
+ *
+ * Everything here is a double for the transaction, never for the decision: the rewrite reads the
+ * order's own stamp and attribution, the persisted rows' pinned layers and the A2 journal's status
+ * out of `state`, and whatever it decides to write is applied back onto `state`.
+ */
+async function unstageThroughDeclaredAllocationRewrite(state: State, declaredQty: number): Promise<void> {
+  const order = state.orders[0]
+  const tx = {
+    salesOrder: {
+      findUnique: async () => ({
+        inventoryAllocatedDate: order.inventoryAllocatedDate,
+        allocationBatchAmount: order.allocationBatchAmount,
+        allocationBatchSyncLogId: order.allocationBatchSyncLogId ?? null,
+      }),
+      update: async ({ data }: { data: Record<string, unknown> }) => {
+        Object.assign(order, data)
+        return {}
+      },
+    },
+    shipment: { findFirst: async () => null },
+    shipmentLine: { findMany: async () => [] },
+    accountingSyncLog: {
+      findUnique: async ({ where }: { where: { id: string } }) => (
+        (state.accountingSyncLogs ?? []).find((row) => (row as { id?: string }).id === where.id) ?? null
+      ),
+    },
+    activityLog: { create: async ({ data }: { data: Record<string, unknown> }) => data },
+    orderAllocation: {
+      findMany: async () => state.allocations.map((row) => ({
+        lineId: row.lineId,
+        productId: row.productId,
+        warehouseId: row.warehouseId,
+        costLayerSnapshot: row.costLayerSnapshot,
+      })),
+      updateMany: async () => ({ count: 0 }),
+    },
+  }
+  await resetAllocationAccountingIfStaged(
+    tx as unknown as Parameters<typeof resetAllocationAccountingIfStaged>[0],
+    'order-1',
+    {
+      nextAllocations: state.allocations.map((row) => ({
+        lineId: row.lineId,
+        productId: row.productId,
+        warehouseId: row.warehouseId,
+        qty: toDecimal(declaredQty),
+      })),
+    },
+  )
+}
+
+/** Everything the rewrite is supposed to have done, asserted so the tests below cannot go vacuous. */
+function assertStampClearedAttributionKept(state: State): void {
+  assert.equal(
+    state.orders[0].inventoryAllocatedDate,
+    null,
+    'the declared rewrite really did clear the A2 stamp — if it did not, the tests below are about nothing',
+  )
+  assert.equal(state.orders[0].allocationBatchAmount, 40, 'and really did keep the recorded debit')
+  assert.equal(state.orders[0].allocationBatchSyncLogId, 'a2-log-1', 'and the journal the debit was staged into')
+  assert.equal(state.orders[0].allocationBatchConnector, 'xero', 'and the ledger it was raised on')
+  assert.equal(state.orders[0].allocationBatchAccountCode, accountingSettings.allocatedInventoryAccount)
+}
+
+/** The refund's own lines, valuing all four allocated units — so there is a line basis to over-credit. */
+function fourUnitLineRefund() {
+  return {
+    lines: [{ lineId: 'line-1', productId: 'product-1', description: 'Product 1', qty: 4, totalBase: 100 }],
+    reason: 'All four units back',
+    creditNotePrefix: 'CN-',
+  }
+}
+
+test('o3d-i0o6 r2: a rewrite that cleared the A2 stamp does not waive the PROOF — a CANCELLED journal still reverses nothing', async () => {
+  // A2 recorded £40 under journal a2-log-1, and that journal was CANCELLED: nothing was debited to
+  // Allocated Inventory for this order. An ordinary allocation edit then added quantity, which
+  // cleared the stamp and kept the record. Gated on the stamp, the refund asked no question at all
+  // and credited the lines' whole £40 to an account that never held a penny of it.
+  const state = a2StagedFourUnitState()
+  withRecordedA2Journal(state, { status: 'CANCELLED' })
+  await unstageThroughDeclaredAllocationRewrite(state, 6)
+  assertStampClearedAttributionKept(state)
+
+  const result = await createSalesOrderRefund(createClient(state), {
+    orderId: 'order-1',
+    activeAccountingConnector: 'xero',
+    accountingSettings,
+    ...fourUnitLineRefund(),
+  })
+
+  assert.equal(result.success, true)
+  assert.equal(state.orders[0].refundStatus, 'FULL')
+  assert.equal(
+    findAllocatedInventoryCredit(result),
+    null,
+    'nothing is credited — the question is asked of the ATTRIBUTION, which the rewrite kept, not of the stamp it cleared',
+  )
+  assert.equal(findInventoryReversalDebit(result), null)
+  assert.match(String(state.refunds[0].allocationBasisUnresolved), /is CANCELLED, not SYNCED/)
+})
+
+test('o3d-i0o6 r2: a rewrite that cleared the A2 stamp does not waive the CAP either', async () => {
+  // The other half, and the one a VALID journal reaches. A2 debited £24 for this order; the
+  // allocation row still records the £40 basis an earlier, larger pass wrote, so the refund's lines
+  // value £40. Gated on the stamp, the open balance was never computed — and an absent cap is not a
+  // higher ceiling, it is none, so all £40 went out against a £24 debit.
+  const state = a2StagedFourUnitState()
+  state.orders[0].allocationBatchAmount = 24
+  withRecordedA2Journal(state, { status: 'SYNCED' })
+  await unstageThroughDeclaredAllocationRewrite(state, 6)
+  assert.equal(state.orders[0].inventoryAllocatedDate, null, 'the rewrite cleared the stamp')
+  assert.equal(state.orders[0].allocationBatchAmount, 24, 'and kept the £24 A2 actually debited')
+
+  const result = await createSalesOrderRefund(createClient(state), {
+    orderId: 'order-1',
+    activeAccountingConnector: 'xero',
+    accountingSettings,
+    ...fourUnitLineRefund(),
+  })
+
+  assert.equal(result.success, true)
+  assert.equal(state.orders[0].refundStatus, 'FULL')
+  assert.equal(
+    findAllocatedInventoryCredit(result),
+    24,
+    'capped at what A2 debited and nothing has relieved — never the £40 the lines valued',
+  )
+  assert.equal(findInventoryReversalDebit(result), 24, 'and the contra matches it')
+})
+
+test('o3d-i0o6 r2: the CONTROL — the same rewrite still lets a fully proved debit reverse in full', async () => {
+  // The gate is a gate. Same cleared stamp, same preserved attribution, a SYNCED journal on the
+  // recorded ledger and account, and the whole £40 comes back out.
+  const state = a2StagedFourUnitState()
+  withRecordedA2Journal(state, { status: 'SYNCED' })
+  await unstageThroughDeclaredAllocationRewrite(state, 6)
+  assertStampClearedAttributionKept(state)
+
+  const result = await createSalesOrderRefund(createClient(state), {
+    orderId: 'order-1',
+    activeAccountingConnector: 'xero',
+    accountingSettings,
+    ...fourUnitLineRefund(),
+  })
+
+  assert.equal(result.success, true)
+  assert.equal(findAllocatedInventoryCredit(result), 40)
+  assert.equal(state.refunds[0].allocationBasisUnresolved ?? null, null, 'and nothing is withheld')
 })

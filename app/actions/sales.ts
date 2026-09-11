@@ -3114,6 +3114,9 @@ export async function deleteSalesOrder(id: string): Promise<{ success: boolean; 
           inventoryAllocatedDate: true,
           revenueDeferredBatchRef: true,
           inventoryAllocatedBatchRef: true,
+          // o3d-i0o6 r2: the A2 journal's own id — the one piece of the A2 attribution a declared
+          // allocation rewrite leaves behind when it clears the stamp and the batch ref.
+          allocationBatchSyncLogId: true,
           lines: { select: { productId: true, qty: true } },
           _count: { select: { refunds: true, payments: true } },
         },
@@ -3129,6 +3132,8 @@ export async function deleteSalesOrder(id: string): Promise<{ success: boolean; 
         // batch by identity instead of re-deriving one from the stamps above.
         revenueDeferredBatchRef: so.revenueDeferredBatchRef,
         inventoryAllocatedBatchRef: so.inventoryAllocatedBatchRef,
+        // o3d-i0o6 r2: and the journal id, which outlives both of the A2 stamps above.
+        allocationBatchSyncLogId: so.allocationBatchSyncLogId,
       })
       if (blocker) return { error: blocker.message }
 

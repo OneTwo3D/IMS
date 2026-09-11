@@ -142,14 +142,21 @@ export type AllocationDebitAttribution = {
  * caller that cannot say which ledger it is about to post into has not established the one fact this
  * proof is for, so `null` is a REFUSAL and not a pass.
  */
-export type AllocationDebitCreditTarget = {
-  /** The connector the credit would be raised on, or null when that cannot be established. */
-  activeConnector: string | null
+export type AllocationDebitCreditTarget<C extends string = string> = {
+  /**
+   * The connector the credit would be raised on, or null when that cannot be established.
+   *
+   * o3d-i0o6: parameterised so a caller whose connector is a UNION (`'xero' | 'quickbooks'`) gets
+   * that union back out of a `posted` verdict, and can hand it straight to an enqueue that demands
+   * one. Widening it to `string` here would force a cast at the pin site, and a cast is exactly the
+   * place a re-resolution creeps back in.
+   */
+  activeConnector: C | null
   /** The Allocated Inventory account the credit would be raised against, as configured NOW. */
   allocatedInventoryAccount: string
 }
 
-export type AllocationDebitPostingProof =
+export type AllocationDebitPostingProof<C extends string = string> =
   /**
    * POSITIVE evidence that no A2 debit stands: A2 never staged this order, or staged it and
    * recorded a debit of exactly £0.00. "Nothing to reverse" is a different fact from "we do not
@@ -163,8 +170,18 @@ export type AllocationDebitPostingProof =
    * OWN NAME so each caller decides whether it is good enough for what it is about to do.
    */
   | { kind: 'unattributed'; recordedDebit: number; reason: string }
-  /** The journal is on record, settled, on this connector, against this account, and its own lines carry the debit. */
-  | { kind: 'posted'; recordedDebit: number; journalId: string; connector: string | null; accountCode: string | null; reason: string }
+  /**
+   * The journal is on record, settled, on this connector, against this account, and its own lines
+   * carry the debit.
+   *
+   * `provedOnConnector` is THE LEDGER THIS VERDICT IS ABOUT (o3d-i0o6), carried out of the proof so
+   * a caller cannot go and resolve "the active connector" a second time to act on it. It is
+   * non-nullable because the proof refuses outright on a null target, so a `posted` verdict always
+   * names one — which is what lets the type system, rather than a comment, stop the credit being
+   * queued against a connector the proof was never made on. `connector` beside it is a DIFFERENT
+   * fact: what A2's own record says it debited, which is null on a pre-attribution row.
+   */
+  | { kind: 'posted'; recordedDebit: number; journalId: string; provedOnConnector: C; connector: string | null; accountCode: string | null; reason: string }
   /** The fact cannot be established. `reason` is written for an operator who has to repair it by hand. */
   | { kind: 'refused'; reason: string }
 
@@ -190,11 +207,11 @@ function recordedAmount(value: AllocationDebitAttribution['allocationBatchAmount
  * same order and in the same words, because they are the same refusals — a second wording would be a
  * second rule.
  */
-export async function proveAllocationDebitPosting(
+export async function proveAllocationDebitPosting<C extends string = string>(
   client: AllocationDebitPostingProofClient,
   order: AllocationDebitAttribution,
-  target: AllocationDebitCreditTarget,
-): Promise<AllocationDebitPostingProof> {
+  target: AllocationDebitCreditTarget<C>,
+): Promise<AllocationDebitPostingProof<C>> {
   // THE STAMP IS NOT THE DISCRIMINATOR, and this is the one place the two questions could have been
   // confused again. `inventoryAllocatedDate` is a claim about work A2 still has TO DO — the DECLARED
   // un-stage in `resetAllocationAccountingIfStaged` clears it, on an order whose debit is standing,
@@ -290,6 +307,9 @@ export async function proveAllocationDebitPosting(
     kind: 'posted',
     recordedDebit: recorded,
     journalId: order.allocationBatchSyncLogId,
+    // The target, not a re-resolution of it: every refusal above compared A2's record against THIS
+    // value, so this is the only connector the verdict says anything about.
+    provedOnConnector: target.activeConnector,
     connector: recordedConnector,
     accountCode: recordedAccount,
     reason: `Group A2 debited Allocated Inventory £${recorded.toFixed(2)} for this order under journal ${order.allocationBatchSyncLogId} (SYNCED)`,

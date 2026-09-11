@@ -164,6 +164,25 @@ export type SalesOrderDeleteStageStamps = {
   // derive-from-stamp path this issue exists to stop relying on.
   revenueDeferredBatchRef: string | null
   inventoryAllocatedBatchRef: string | null
+  /**
+   * o3d-i0o6 r2 — THE A2 JOURNAL'S OWN ROW ID, BECAUSE THE STAMP AND THE REF BOTH COME OFF.
+   *
+   * The A2 batch is DailyBatch-keyed, so it can only be reached from here through something the
+   * order still carries — and until now that was the stamp and the batch ref, which are cleared
+   * TOGETHER by the declared allocation rewrite (`resetAllocationAccountingIfStaged`) on an order
+   * whose debit is standing. It clears them on purpose, so Group A2 comes back and posts the
+   * increment, and it deliberately keeps the amount and this id. In that state the two-alternative
+   * lookup below matched nothing at all, `dailyBatchReferenceWhere` returned null, the A2 blocker
+   * was skipped, and an order whose value is sitting in a SYNCED batch journal could be HARD
+   * DELETED — taking with it the only local record of the debit.
+   *
+   * The stamp says whether A2 still has work to do. WHICH JOURNAL CARRIES THIS ORDER'S POUNDS is a
+   * different fact and this is the column that holds it, so it is what the blocker asks.
+   *
+   * Required, not optional, for the same reason the batch refs are: a caller that forgets to select
+   * it must fail to compile rather than silently fall back to the stamp-derived path.
+   */
+  allocationBatchSyncLogId: string | null
 }
 
 /**
@@ -522,6 +541,12 @@ export async function findSalesOrderDeleteBlocker(
     label: string
     stagedAt: Date | null
     persistedRef: string | null
+    /**
+     * o3d-i0o6 r2: the sync row's own PRIMARY KEY, where the order records one. Only Group A2 has
+     * such a column today; it is on the shared shape so the next group that records one has
+     * somewhere to put it rather than a second lookup beside this one.
+     */
+    persistedLogId?: string | null
   }> = [
     {
       group: 'A1',
@@ -536,6 +561,8 @@ export async function findSalesOrderDeleteBlocker(
       label: 'A2 inventory allocation',
       stagedAt: stamps.inventoryAllocatedDate,
       persistedRef: stamps.inventoryAllocatedBatchRef,
+      // Survives the un-stage that clears the two above (o3d-i0o6 r2).
+      persistedLogId: stamps.allocationBatchSyncLogId,
     },
     // One entry per journalled shipment: two shipments of the same order can be staged into
     // two different Group B batches (they are staged as they ship), so a single stamp cannot
@@ -554,17 +581,23 @@ export async function findSalesOrderDeleteBlocker(
   // otherwise repeat an identical query and push an identical blocker.
   const seenBatchKeys = new Set<string>()
   for (const batch of stagedBatches) {
-    const batchKey = `${batch.group}|${batch.persistedRef ?? ''}|${dailyBatchDateKey(batch.stagedAt) ?? ''}`
+    const batchKey = `${batch.group}|${batch.persistedRef ?? ''}|${batch.persistedLogId ?? ''}|${dailyBatchDateKey(batch.stagedAt) ?? ''}`
     if (seenBatchKeys.has(batchKey)) continue
     seenBatchKeys.add(batchKey)
     const referenceWhere = dailyBatchReferenceWhere(batch.group, batch.stagedAt, batch.persistedRef)
-    if (!referenceWhere) continue
+    // o3d-i0o6 r2: the recorded row id is a THIRD alternative, and the only one that survives an
+    // un-stage. A group with neither a reference nor an id has nothing to look for; one with only
+    // the id looks by the id alone, which is the post-rewrite shape.
+    const batchWhere: Prisma.AccountingSyncLogWhereInput | null = batch.persistedLogId
+      ? { OR: [...(referenceWhere ? [referenceWhere] : []), { id: batch.persistedLogId }] }
+      : referenceWhere
+    if (!batchWhere) continue
     const liveBatch = await tx.accountingSyncLog.findFirst({
       where: {
         status: { in: [...LIVE_ACCOUNTING_SYNC_STATUSES] },
         type: batch.type as Prisma.AccountingSyncLogWhereInput['type'],
         referenceType: DAILY_BATCH_REFERENCE_TYPE,
-        ...referenceWhere,
+        ...batchWhere,
       },
       select: { id: true, connector: true, referenceId: true, status: true },
     })

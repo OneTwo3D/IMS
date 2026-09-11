@@ -335,6 +335,28 @@ export async function queueAccountingSyncTx(
     payload: Record<string, unknown>
     idempotencyKey?: string
     /**
+     * PIN THE LEDGER (o3d-i0o6). The connector this row MUST be written under — not "which
+     * connector is switched on when this line runs".
+     *
+     * Without it this function resolves the active connector for itself, which makes every caller
+     * that established a fact about a connector BEFORE calling — that a debit posted there, that an
+     * obligation was reckoned against it, that an account code came from its settings — a caller
+     * whose proof and whose write are about two independently-resolved things. Nothing serialises a
+     * connector switch between the two reads, so the proof can pass for one ledger and the row be
+     * written for another, and no amount of re-checking AFTERWARDS can undo a credit already
+     * queued against the wrong books.
+     *
+     * Passed, the connector cannot move underneath the caller: the enabled/posting-mode verdict is
+     * taken for the PINNED connector ({@link getAccountingPostingContextFor}), the row is written
+     * under it, and if that connector is no longer the one posting this type the enqueue refuses
+     * `not-configured` and writes NOTHING — which is the outcome a caller that cannot post where it
+     * proved wants, and the one it can report.
+     *
+     * Deliberately not defaulted and deliberately generic: it is about ANY two connectors, and
+     * every existing caller keeps the active-connector resolution by simply not passing it.
+     */
+    connector?: AccountingConnectorInfo['id']
+    /**
      * Acknowledge that this call site CANNOT hoist the sales-order row lock, with the reason
      * (o3d-3zgy). Only for paths where hoisting is structurally impossible today — passing it keeps
      * the o3d-hrak delete race open for that path, so it must be justified and tracked.
@@ -376,7 +398,12 @@ export async function queueAccountingSyncTx(
     if (params.reportOutcome) {
       params.reportOutcome({
         ...outcome,
-        connector: connector === undefined ? await getActiveAccountingConnectorId() : connector,
+        // o3d-i0o6: a PINNED caller is answered about its own connector even on the two paths that
+        // refuse before resolving one. Falling back to the active connector there would report a
+        // ledger this call was never about.
+        connector: connector === undefined
+          ? (params.connector ?? await getActiveAccountingConnectorId())
+          : connector,
       })
     }
     return outcome.queued
@@ -415,7 +442,13 @@ export async function queueAccountingSyncTx(
   // already queued. Callers that must stay consistent with the queue decision (e.g. the
   // COGS subledger ledger writes, bcz9.2/bcz9.4) should record based on THIS result, not
   // a separate settings recheck — avoiding a TOCTOU if the connector/setting flips.
-  const context = await getAccountingPostingContext(params.type)
+  // o3d-i0o6: the PIN wins where one was given. `getAccountingPostingContextFor` asks the same
+  // question of the named connector that `getAccountingPostingContext` asks of whichever is active,
+  // so a pinned caller gets the same verdict about the ledger it proved against — and a `null` here
+  // means THAT connector does not post this type, never "some other connector does".
+  const context = params.connector
+    ? await getAccountingPostingContextFor(params.connector, params.type)
+    : await getAccountingPostingContext(params.type)
   // A DECISION: there is no connector, or its sync (or this type) is switched off. No counterpart
   // will ever exist for this posting, so nothing is left outstanding.
   if (!context) return answer({ queued: false, reason: 'not-configured' })
@@ -624,6 +657,27 @@ export async function queueAccountingSyncTxWithOutcome(
 }
 
 export async function getAccountingSettings(): Promise<AccountingSettings> {
+  return getAccountingSettingsFor(await getActiveAccountingConnectorId())
+}
+
+/**
+ * THE SAME SETTINGS, FOR A CONNECTOR THE CALLER NAMES (o3d-i0o6).
+ *
+ * Every account code in here is a CONNECTOR'S account code — `allocatedInventoryAccount` is Xero's
+ * or QuickBooks's, never "the business's". So a caller that has pinned a connector and then reads
+ * {@link getAccountingSettings} is reading one connector's chart of accounts through a second,
+ * independent resolution of "which connector is active", and a switch in between hands it an account
+ * code from books it is not posting to. That is the same defect as resolving the connector twice
+ * around an enqueue, one layer down, and it is closed the same way: the connector is resolved ONCE
+ * and everything downstream is derived from that one value.
+ *
+ * `null` is the same answer the active-connector form gives when nothing is switched on: the
+ * defaults, whose account codes are empty strings, so a caller that demands a configured account
+ * refuses on its own terms.
+ */
+export async function getAccountingSettingsFor(
+  connector: AccountingConnectorInfo['id'] | null,
+): Promise<AccountingSettings> {
   // Read connector-agnostic settings directly from the core settings table.
   const { db } = await import('@/lib/db')
   const [invoiceUrlSetting, billUrlSetting, paymentMapSetting, reverseChargeSalesSetting, reverseChargePurchaseSetting] = await Promise.all([
@@ -636,7 +690,6 @@ export async function getAccountingSettings(): Promise<AccountingSettings> {
   const reverseChargeSalesTaxType = reverseChargeSalesSetting?.value?.trim() ?? ''
   const reverseChargePurchaseTaxType = reverseChargePurchaseSetting?.value?.trim() ?? ''
 
-  const connector = await getActiveAccountingConnectorId()
   if (!connector) {
     return {
       ...DEFAULT_ACCOUNTING_SETTINGS,
