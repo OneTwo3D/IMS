@@ -231,6 +231,14 @@ export type EmailOutboxClient = {
  * drain issues, and the only correct answer is none. And step (4) now compares the WHOLE answer
  * against the one row the array holds, rather than looking for a marker inside it.
  *
+ * AND STEP (3) IS A SAMPLE, NOT A PROPERTY — r30 (Codex r29 HIGH) STATES THAT WHERE r28 DID NOT. It
+ * establishes that the delegate had nothing to answer with WHILE THE ARRAY WAS EMPTY AT MINT TIME.
+ * A read-through delegate whose database is empty at that instant therefore mints, and if that
+ * database later receives an eligible row the captured `findMany` will hand it over. So the drain
+ * asks the same question about the rows THEMSELVES, at sweep time, before it claims any of them:
+ * see `refuseSweptRowsFromOutsideTheStore`. The mint's claim was corrected to what it checks, and
+ * the check that covers the rest is in the path that merges.
+ *
  * (2) `Object.freeze` IS SHALLOW. The minted client used to hold the caller's delegate OBJECTS, so
  * `delegates.emailOutbox.findMany = production.findMany` AFTER a successful mint turned an accepted
  * client into a production one with the WeakSet still vouching for it. The five methods the drain
@@ -299,6 +307,28 @@ export type InMemoryEmailOutboxDelegates = {
  */
 const MINTED_HARNESS_CLIENTS = new WeakSet<object>()
 
+/**
+ * THE IN-MEMORY STORE EACH MINTED CLIENT'S OUTBOX DELEGATE SHOWED, SO THE DRAIN CAN ASK AGAIN AT
+ * THE MOMENT THAT MATTERS (r30, Codex r29 HIGH).
+ *
+ * The mint's provenance phase is a POINT-IN-TIME sample: it empties the array a delegate reports and
+ * requires the drain's own sweep to come back empty. A read-through delegate whose backing source
+ * happened to hold nothing right then passes it — and if that source later receives an eligible row,
+ * the captured `findMany` hands a real row to the harness's fake sender. The mint cannot know that;
+ * the DRAIN can, because by then the rows exist and it is holding them.
+ *
+ * So the witness function each delegate presented (read ONCE, at mint time, inside
+ * `proveDelegateIsInMemory`) is kept here, keyed by the client that was minted. Module-private, and a
+ * `WeakMap`, for the same reasons the register above is a `WeakSet`: membership is not a field that
+ * can be copied onto another object.
+ *
+ * ONLY THE IN-MEMORY ARM HAS AN ENTRY. `createEmailOutboxLaneClient` mints over a real PostgreSQL
+ * database on purpose, so it has no in-process array to hold its answers up against and registers
+ * none — its guarantee is the throwaway-database rule upstream of it, which is stated over that
+ * function.
+ */
+const MINTED_CLIENT_OUTBOX_ROWS = new WeakMap<object, () => unknown>()
+
 function refuseHarnessClientMint(detail: string): never {
   throw new Error(
     `createEmailOutboxHarnessClient: ${detail}. A harness client is MINTED by this module and is the `
@@ -340,13 +370,16 @@ function refuseHarnessClientMint(detail: string): never {
  *
  * WHAT THIS ESTABLISHES AND WHAT IT DOES NOT — BOTH HALVES, because the history of this file is
  * rounds that wrote only the first. IT ESTABLISHES that the delegate's sweep read is answered out
- * of an array this module emptied and refilled under it. IT DOES NOT establish where that
- * delegate's WRITES land; it cannot catch a delegate that RECOGNISES the probe and answers it
- * differently from the drain; and on the suppression side, whose only read is a single-key
- * `findUnique`, it cannot catch a delegate that answers from the array when the key is present and
- * from a database when it is not — there is no key this module knows a database would answer for,
- * and it will not go looking through customer data to find one. Those three are named in the
- * mint's contract below and filed (o3d-fii2), not implied away.
+ * of an array this module emptied and refilled under it, AT THE INSTANT THE MINT ASKED. IT DOES NOT
+ * establish where that delegate's WRITES land; it cannot catch a delegate that RECOGNISES the probe
+ * and answers it differently from the drain; on the suppression side, whose only read is a
+ * single-key `findUnique`, it cannot catch a delegate that answers from the array when the key is
+ * present and from a database when it is not — there is no key this module knows a database would
+ * answer for, and it will not go looking through customer data to find one; AND IT CANNOT SEE A
+ * SOURCE THAT IS EMPTY NOW AND NOT EMPTY LATER, which is why phase 1 alone does not entitle anyone
+ * to say "a database-serving delegate is refused" (r30). Those four are named in the mint's
+ * contract below and filed (o3d-fii2), not implied away; the last of them is what the drain's own
+ * sweep-time check exists for.
  */
 
 /** Far enough forward that no date predicate in the sweep excludes a row the array holds. */
@@ -469,8 +502,15 @@ const IN_MEMORY_PROOFS: readonly InMemoryProof[] = [
  * PROVE ONE DELEGATE IS IN-MEMORY, OR REFUSE. Throws `refuseHarnessClientMint` on every path that
  * is not a completed two-phase proof — including a throw from the delegate itself, because a
  * delegate that cannot answer a query about its own store has not demonstrated anything.
+ *
+ * RETURNS THE WITNESS IT VALIDATED — the one function it read off the delegate, bound to that
+ * delegate — so the drain can ask the same array again at sweep time (r30). Nothing else may read
+ * the member: one read, one binding, and the drain uses the binding this proof was about.
  */
-async function proveDelegateIsInMemory(proof: InMemoryProof, delegate: Record<string, unknown>): Promise<void> {
+async function proveDelegateIsInMemory(
+  proof: InMemoryProof,
+  delegate: Record<string, unknown>,
+): Promise<() => unknown> {
   // THE ONLY READ of the witness member.
   const rowsOf = (delegate as unknown as Record<symbol, unknown>)[EMAIL_OUTBOX_IN_MEMORY_ROWS]
   if (typeof rowsOf !== 'function') {
@@ -611,6 +651,9 @@ async function proveDelegateIsInMemory(proof: InMemoryProof, delegate: Record<st
       + 'whose store it has disturbed',
     )
   }
+
+  // THE WITNESS THIS PROOF WAS ABOUT, for the drain-time check. `rowsOf` was read once, above.
+  return () => (rowsOf as () => unknown).call(delegate)
 }
 
 /**
@@ -682,12 +725,20 @@ function captureSuppressionDelegate(delegate: Record<string, unknown>): EmailOut
 function mintEmailOutboxClient(
   emailOutbox: Record<string, unknown>,
   emailSuppression: Record<string, unknown>,
+  /**
+   * The outbox delegate's own row store, for the drain-time provenance check — or `null` for the
+   * lane arm, which is a real database by design and has no in-process array to be held up against.
+   * SPELLED AT BOTH CALL SITES rather than defaulted, so a third mint cannot acquire "no check"
+   * by omission.
+   */
+  outboxRows: (() => unknown) | null,
 ): EmailOutboxHarnessClient {
   const client = Object.freeze({
     emailOutbox: captureOutboxDelegate(emailOutbox),
     emailSuppression: captureSuppressionDelegate(emailSuppression),
   })
   MINTED_HARNESS_CLIENTS.add(client)
+  if (outboxRows !== null) MINTED_CLIENT_OUTBOX_ROWS.set(client, outboxRows)
   return client as EmailOutboxHarnessClient
 }
 
@@ -718,15 +769,23 @@ function mintEmailOutboxClient(
  *   1. THE CLIENT WAS MINTED HERE. `db`, a structural wrapper of it, a spread or a Proxy of a minted
  *      client: none of them is in the register, and membership is not a field that can be copied.
  *   2. EACH DELEGATE SHOWED THE ARRAY ITS ROWS LIVE IN, AND THE DRAIN'S OWN SWEEP CAME BACK EMPTY
- *      WHILE THAT ARRAY WAS EMPTY. A delegate that also serves a database's rows is refused here —
- *      that is r28's phase 1, and it is why "the sentinel appeared in the answer" is no longer the
- *      question (Codex r27 HIGH 1).
+ *      WHILE THAT ARRAY WAS EMPTY — AT THIS MOMENT, AND THE TIME IS PART OF THE CLAIM (r30, Codex
+ *      r29 HIGH). What is refused is a delegate whose backing source HAS AN ELIGIBLE ROW AT MINT
+ *      TIME. This does NOT say "a database-serving delegate is refused", which is what r28 wrote
+ *      here and is more than the evidence carries: phase 1 is a NEGATIVE SAMPLE taken once, so a
+ *      read-through delegate whose source happens to be empty right now passes it and is minted.
+ *      See residue (e) for what that leaves, and (4) for what the drain does about it.
  *   3. WHAT THE DRAIN CALLS WAS FIXED BEFORE THE REGISTER ACCEPTED ANYTHING. The five methods are
  *      captured into frozen facades; replacing one on the caller's delegate afterwards reaches
  *      nothing (Codex r27 HIGH 2).
+ *   4. AND THEN, AT SWEEP TIME, EVERY ROW THE DRAIN IS ABOUT TO ACT ON CARRIES AN ID THE DELEGATE'S
+ *      OWN STORE HOLDS. That check is not this function's — it is
+ *      `refuseSweptRowsFromOutsideTheStore`, run by `processPendingEmailOutbox` before the first
+ *      claim — and it is named here because it is what keeps (2) from being the whole of the
+ *      protection. The mint samples once, before the rows exist; the drain checks the rows it got.
  *
  * WHAT IT DOES NOT ESTABLISH, AND THEREFORE WHAT "BEST-EFFORT" MEANS HERE. An in-process check
- * cannot decide how an object handed to it will behave later, and these four are the residue:
+ * cannot decide how an object handed to it will behave later, and these five are the residue:
  *
  *   a. WHERE THE WRITES GO. `updateMany`, `create` and `upsert` are captured, not proven: a delegate
  *      that answers every read out of its array and forwards its writes to a real database satisfies
@@ -741,9 +800,21 @@ function mintEmailOutboxClient(
  *   d. STATE ON THE CALLER'S DELEGATE. The captured methods are still called with that delegate as
  *      their receiver (a Prisma delegate needs it), so a delegate whose method reads mutable state
  *      off itself can still change its own answers.
+ *   e. A READ-THROUGH DELEGATE WHOSE BACKING SOURCE IS EMPTY WHEN IT IS MINTED (r30, Codex r29
+ *      HIGH). Phase 1 is a POINT-IN-TIME negative sample and this is the case it cannot see: a
+ *      delegate that answers from its array AND from a database mints successfully whenever that
+ *      database has no eligible row at that instant. Nothing about it is probe-aware, it mutates no
+ *      receiver state, and it is not a write-destination trick, so (a)-(d) do not cover it — the
+ *      module's own control test
+ *      (`tests/email-outbox-injection-shape.test.ts`, "r30 HIGH: the empty-source read-through
+ *      delegate") mints exactly this delegate on purpose. WHAT STOPS IT IS NOT THIS FUNCTION: it is
+ *      (4) above, the drain's sweep-time check, which refuses the run when the rows that delegate
+ *      returns are not rows its own store holds. The residue AFTER that is narrow and stated where
+ *      the check lives: a delegate whose store carries rows with the SAME IDS as the ones its source
+ *      serves.
  *
- * NONE OF (a)-(d) IS REACHABLE BY ACCIDENT OR IN ONE LINE — each is a purpose-built object whose
- * author is working to defeat this function — and all four are filed under o3d-fii2. What IS closed
+ * NONE OF (a)-(e) IS REACHABLE BY ACCIDENT OR IN ONE LINE — each is a purpose-built object whose
+ * author is working to defeat this function — and all five are filed under o3d-fii2. What IS closed
  * is every shape that got here by mistake: the missing field that quietly became production, the
  * wrapper that passed an identity test, the destination a caller merely asserted, the "in-memory"
  * delegate that was a database delegate with a word attached, and the honest delegate that became a
@@ -785,10 +856,21 @@ export async function createEmailOutboxHarnessClient(
 
   // THE PROOF, BEFORE ANYTHING IS REGISTERED. Both delegates or neither: a client with one proven
   // delegate is the "mixture" this whole surface exists to forbid, one level down.
+  let outboxRows: (() => unknown) | null = null
   for (const proof of IN_MEMORY_PROOFS) {
-    await proveDelegateIsInMemory(
+    const rows = await proveDelegateIsInMemory(
       proof,
       (proof.member === 'emailOutbox' ? emailOutbox : emailSuppression) as Record<string, unknown>,
+    )
+    if (proof.member === 'emailOutbox') outboxRows = rows
+  }
+  // FAIL CLOSED IF THE PROOF LIST STOPS COVERING THE OUTBOX DELEGATE. The drain-time check is only
+  // as good as the witness it holds, and a client minted WITHOUT one is a client the drain would
+  // sweep unchecked — so the absence is a refusal rather than a skipped check.
+  if (outboxRows === null) {
+    refuseHarnessClientMint(
+      'no in-memory proof ran for `emailOutbox`, so this mint holds no row store for the drain to '
+      + 'check its sweep against (IN_MEMORY_PROOFS no longer covers the delegate the drain sweeps)',
     )
   }
 
@@ -798,6 +880,7 @@ export async function createEmailOutboxHarnessClient(
   return mintEmailOutboxClient(
     emailOutbox as Record<string, unknown>,
     emailSuppression as Record<string, unknown>,
+    outboxRows,
   )
 }
 
@@ -981,6 +1064,11 @@ export async function createEmailOutboxLaneClient(lane: { url: string }): Promis
   const client = mintEmailOutboxClient(
     prisma.emailOutbox as unknown as Record<string, unknown>,
     prisma.emailSuppression as unknown as Record<string, unknown>,
+    // NO IN-PROCESS STORE, AND THAT IS THE POINT OF THIS ARM: these rows live in PostgreSQL. The
+    // drain therefore performs no store-provenance check on a lane client, and what stands in its
+    // place is the rule above — the lane's database is one this process watched its own CREATE
+    // complete for, and it is refused outright if it resolves to the configured one.
+    null,
   )
 
   return Object.freeze({
@@ -1100,7 +1188,20 @@ export type EmailOutboxHarness = {
  * use for it afterwards. Keeping it would force the resolver to cast a snapshot INTO a brand it did
  * not mint, which is exactly the "assert what you wish were true" move this file exists to avoid.
  */
-export type ResolvedEmailOutboxDependencies = Omit<EmailOutboxHarness, 'client'> & { client: EmailOutboxClient }
+export type ResolvedEmailOutboxDependencies = Omit<EmailOutboxHarness, 'client'> & {
+  client: EmailOutboxClient
+  /**
+   * THE ARRAY THE DRAIN'S SWEEP MUST HAVE COME OUT OF, or `null` when there is no such array to
+   * compare against (r30, Codex r29 HIGH).
+   *
+   * It is `null` on exactly two paths, and neither is a check that was skipped by accident:
+   * PRODUCTION, whose rows are the real ones and whose sweep is the thing being protected rather
+   * than checked; and a LANE client, which is a real database on purpose. It is a function rather
+   * than the array because the array is the delegate's own, and the drain asks for it at the moment
+   * it needs the answer.
+   */
+  inMemoryOutboxRows: (() => unknown) | null
+}
 
 /**
  * The drain's ONLY option. One field, optional, all-or-nothing.
@@ -1221,6 +1322,13 @@ export async function queueEmail(
  * zero rows and the write is refused — `false` — so the reclaimer's SENT is never overwritten
  * with a re-armed PENDING. `lockedBy` is cleared by every settlement, which is what makes a
  * later CAS from the previous holder fail on identity as well as on status.
+ *
+ * AND THE CONVERSE DOES NOT HOLD — `false` DOES NOT MEAN A RECLAIM (r30, Codex r29 MEDIUM 2). The
+ * clause above is true in one direction only: a taken-over claim matches zero rows. Zero rows has
+ * other causes, and the one that matters is this function's own previous call COMMITTING and losing
+ * its answer — it cleared `lockedBy` too, so a second CAS from the same worker is refused for a
+ * reason that is entirely its own. Anything reporting a `false` from here must therefore ask the row
+ * which happened rather than assume; that is what `diagnoseClaimLoss` is for.
  */
 async function settleClaimedEmail(
   client: EmailOutboxClient,
@@ -1417,6 +1525,11 @@ export function resolveEmailOutboxDependencies(options: ProcessEmailOutboxOption
       prepareQueuedEmail,
       logActivity,
       now: () => new Date(),
+      // PRODUCTION HAS NO IN-PROCESS STORE TO BE CHECKED AGAINST, and saying so here is the honest
+      // form of that: the real queue's rows come from PostgreSQL, which is the whole point of the
+      // drain. The check below exists to stop a HARNESS sweeping those rows, not to second-guess
+      // the production client.
+      inMemoryOutboxRows: null,
     }
   }
 
@@ -1439,6 +1552,9 @@ export function resolveEmailOutboxDependencies(options: ProcessEmailOutboxOption
    * copied into the returned literal; the caller's `harness` is not read again after this loop.
    */
   const validated: Record<string, unknown> = {}
+
+  /** Filled by the `client` branch below, from this module's own register — never from the caller. */
+  let inMemoryOutboxRows: (() => unknown) | null = null
 
   for (const member of EMAIL_OUTBOX_HARNESS_MEMBERS) {
     // THE ONLY READ. Every check below interrogates `value`, and `value` is what is returned —
@@ -1501,6 +1617,12 @@ export function resolveEmailOutboxDependencies(options: ProcessEmailOutboxOption
         emailSuppression: minted.emailSuppression,
       }
       validated[member] = snapshotClient
+      // AND THE STORE THAT CLIENT'S OUTBOX DELEGATE SHOWED AT MINT TIME, taken from the module's own
+      // register rather than from anything the caller passed (r30). `undefined` means "this mint
+      // registered none", which today is only the lane arm; it becomes `null` — no check — rather
+      // than a refusal, because a lane client over a real database has no array to be checked
+      // against and is accepted for a different reason entirely.
+      inMemoryOutboxRows = MINTED_CLIENT_OUTBOX_ROWS.get(minted) ?? null
       continue
     }
 
@@ -1519,6 +1641,82 @@ export function resolveEmailOutboxDependencies(options: ProcessEmailOutboxOption
     prepareQueuedEmail: validated.prepareQueuedEmail as EmailOutboxHarness['prepareQueuedEmail'],
     logActivity: validated.logActivity as EmailOutboxHarness['logActivity'],
     now: validated.now as EmailOutboxHarness['now'],
+    inMemoryOutboxRows,
+  }
+}
+
+function refuseEmailOutboxSweep(detail: string): never {
+  throw new Error(
+    `processPendingEmailOutbox: ${detail}. REFUSED BEFORE ANY ROW WAS CLAIMED AND BEFORE ANY MESSAGE `
+    + 'WAS SENT. A harness client is accepted because its outbox delegate showed this module the '
+    + 'in-process array its rows live in and answered the drain\'s own sweep out of it; a sweep that '
+    + 'returns rows that array does not hold is answering from somewhere else, and the rows it '
+    + 'returned would be claimed, handed to the harness\'s sender and stamped SENT (o3d-alnk r30).',
+  )
+}
+
+/**
+ * THE ROWS THIS RUN WILL ACT ON CAME OUT OF THE ARRAY THE DELEGATE SHOWED — ASKED AT SWEEP TIME,
+ * WHICH IS THE MOMENT THAT MATTERS (r30, Codex r29 HIGH).
+ *
+ * WHY THE MINT'S OWN PROOF IS NOT ENOUGH, STATED AS THE DEFECT IT IS. The mint's provenance phase
+ * (`proveDelegateIsInMemory`, phase 1) empties the reported array and requires the drain's sweep to
+ * come back empty. That is a POINT-IN-TIME NEGATIVE SAMPLE. A read-through delegate whose backing
+ * source held nothing at that instant satisfies it — `tests/email-outbox-injection-shape.test.ts`
+ * mints exactly such a delegate as its non-vacuity control — and the source can receive an eligible
+ * row a millisecond later, at which point the captured `findMany` hands a REAL row to the harness's
+ * fake sender. Nothing at mint time can see that row, because it does not exist yet.
+ *
+ * WHAT THIS CHECKS, AND IT IS ONE SENTENCE. Every row the sweep returned carries an id the
+ * delegate's own store holds RIGHT NOW. So the working set this run will claim, send and settle is a
+ * set of ids that exist in this process, which is the property the whole harness surface is for.
+ *
+ * WHY NOT RE-RUN PHASE 1 ITSELF HERE, which would be the obvious reading of "do it at drain time".
+ * Phase 1 MUTATES the array: it empties it, asks, and refills it. At mint time that is safe, because
+ * a mint happens before any drain. At DRAIN time it is not: two drains over ONE store is the
+ * interleaving these tests are built on, and a second drain that swept while the first had the array
+ * emptied would see NO ROWS AT ALL — worse, two overlapping empty-and-refill windows can hand each
+ * other an array they then restore to the wrong contents, destroying the harness's rows and
+ * producing a refusal about nothing. A check that corrupts the state it is checking is not a check.
+ * Comparing the ANSWER against the array asks the same question — where did these rows come from —
+ * and touches nothing.
+ *
+ * WHAT IT STILL DOES NOT ESTABLISH. A delegate whose store carries rows with THE SAME IDS as the
+ * ones its backing source serves passes: the ids are there, and the contents came from elsewhere.
+ * That is the same purpose-built two-faced object as the write-destination residue, and it is filed
+ * with it (o3d-fii2) rather than implied away. What is closed is the honest read-through delegate
+ * whose source was empty when it was minted and is not empty when it is swept.
+ */
+function refuseSweptRowsFromOutsideTheStore(swept: EmailOutboxRow[], rows: () => unknown): void {
+  if (swept.length === 0) return
+  let store: unknown
+  try {
+    store = rows()
+  } catch (error) {
+    refuseEmailOutboxSweep(
+      `the outbox delegate's row store threw when this drain asked for it (${String(error)}), so the `
+      + `${swept.length} row(s) the sweep returned cannot be shown to have come from it`,
+    )
+  }
+  if (!Array.isArray(store)) {
+    refuseEmailOutboxSweep(
+      `the outbox delegate now reports ${store === null ? 'null' : typeof store} as its row store, not the `
+      + 'array its rows live in, so the sweep\'s answer cannot be held up against it',
+    )
+  }
+  const heldIds = new Set<unknown>()
+  for (const row of store) {
+    if (row !== null && typeof row === 'object') heldIds.add((row as Record<string, unknown>).id)
+  }
+  const foreign = swept.filter((row) => !heldIds.has(row.id)).map((row) => row.id)
+  if (foreign.length > 0) {
+    refuseEmailOutboxSweep(
+      `the sweep returned ${foreign.length} of ${swept.length} row(s) whose ids the outbox delegate's own `
+      + `store does not hold (${foreign.slice(0, 3).join(', ')}${foreign.length > 3 ? ', …' : ''}). The `
+      + 'mint proved that delegate answers out of an array in this process, but that proof was a '
+      + 'point-in-time sample: a delegate that also reads a database passes it whenever the database '
+      + 'happens to be empty, and these rows are what such a delegate returns once it is not',
+    )
   }
 }
 
@@ -1537,6 +1735,10 @@ export async function processPendingEmailOutbox(
     prepareQueuedEmail: prepare,
     logActivity: log,
     now,
+    // NULL FOR PRODUCTION AND FOR A LANE CLIENT, and a witness for an in-memory harness — see the
+    // check below the sweep, and the field's own documentation for why those two are not the same
+    // kind of absence.
+    inMemoryOutboxRows,
   } = resolveEmailOutboxDependencies(options)
 
   const staleCutoff = new Date(now().getTime() - EMAIL_CLAIM_STALE_MS)
@@ -1554,7 +1756,7 @@ export async function processPendingEmailOutbox(
    * here flips INSIDE the wrapper that performs the act, each is a closure variable behind a getter,
    * and there is no assignable property to set and no boolean argument to get wrong.
    *
-   * WHY THERE ARE NOW FIVE FLAGS AND NOT ONE. Round 21 found the `catch` still mislabelling — for
+   * WHY THERE ARE SEVERAL FLAGS AND NOT ONE. Round 21 found the `catch` still mislabelling — for
    * the third round running. `try` does not end at the sender: it also covers the SUPPRESSION UPSERT
    * and the TERMINAL SETTLEMENT WRITE, both of which run AFTER the sender has returned. When one of
    * those threw, the log said "a thrown send" about a worker whose send had completed — it was the
@@ -1577,8 +1779,11 @@ export async function processPendingEmailOutbox(
     let sendEntered = false
     let sendReturned = false
     let delivered = false
+    let suppressionLookupEntered = false
+    let suppressionLookupReturned = false
     let suppressionWriteEntered = false
     let settlementWriteEntered = false
+    let settlementWriteReturned = false
     return {
       /** Read-only by construction: the only writer is the wrapper below. */
       get attempted(): boolean {
@@ -1598,37 +1803,84 @@ export async function processPendingEmailOutbox(
         delivered = snapshot.success
         return snapshot
       },
+      /**
+       * THE SUPPRESSION LOOKUP — the read between the claim and the sender, which since r30 runs
+       * INSIDE the `try` (Codex r29 MEDIUM 1). Entered AND returned are both recorded, because a
+       * lookup that never came back is a different outcome from a preparation that threw after it
+       * did, and the `catch` has to be able to tell an operator which.
+       */
+      suppressionLookup: async <T>(read: () => Promise<T>): Promise<T> => {
+        suppressionLookupEntered = true
+        const answer = await read()
+        suppressionLookupReturned = true
+        return answer
+      },
       /** The suppression upsert, which runs only after an UNSUCCESSFUL send has returned. */
       suppressionWrite: async <T>(write: () => Promise<T>): Promise<T> => {
         suppressionWriteEntered = true
         return write()
       },
-      /** A terminal settlement write issued from INSIDE the `try` — never the `catch`'s own. */
+      /**
+       * A terminal settlement write issued from INSIDE the `try` — never the `catch`'s own.
+       *
+       * `settlementWriteReturned` FLIPS AFTER THE AWAIT, and that pair is what `settlementOutcomeUnknown`
+       * below is for (r30, Codex r29 MEDIUM 2).
+       */
       settlementWrite: async <T>(write: () => Promise<T>): Promise<T> => {
         settlementWriteEntered = true
-        return write()
+        const answer = await write()
+        settlementWriteReturned = true
+        return answer
+      },
+      /**
+       * DID A TERMINAL WRITE GO OUT AND NEVER COME BACK? — the one fact that decides whether a
+       * later zero-row CAS can be explained BY THIS WORKER (r30, Codex r29 MEDIUM 2).
+       *
+       * A write that RETURNED zero matched nothing, and nothing this worker did can account for
+       * that. A write that THREW may nevertheless have COMMITTED — a lost response, a reset socket
+       * after the commit record was written — and it clears `lockedBy`, so the `catch`'s own CAS
+       * then matches nothing FOR A REASON THAT IS THIS WORKER'S OWN. The two are not the same
+       * event and must not be reported as one: see `diagnoseClaimLoss`.
+       */
+      get settlementOutcomeUnknown(): boolean {
+        return settlementWriteEntered && !settlementWriteReturned
       },
       /**
        * EVERY OUTCOME THIS `try` CAN HAND THE `catch`, AND THE PHRASE FOR EACH. Ordered by how far
        * the row got, so each arm is reached only when the ones above it are false:
        *
-       *   1. the sender was never entered        — `prepareQueuedEmail` or the attachment decode
+       *   1. the suppression LOOKUP never returned — the read between the claim and the sender threw
+       *                                            (r30: it is inside the `try` now). NOTHING WAS
+       *                                            SENT, and the DATABASE is what failed.
+       *   2. a settlement write, still before any  — the lookup found a SUPPRESSED recipient and the
+       *      send                                   write that settles the row FAILED threw. Nothing
+       *                                            was sent on this path either.
+       *   3. the sender was never entered          — `prepareQueuedEmail` or the attachment decode
        *                                            threw. NOTHING WAS SENT.
-       *   2. entered and never returned          — the throw came OUT OF the sender. A message may
+       *   4. entered and never returned            — the throw came OUT OF the sender. A message may
        *                                            be on the wire.
-       *   3. returned, suppression write entered — the sender answered `invalidRecipient` and the
+       *   5. returned, suppression write entered   — the sender answered `invalidRecipient` and the
        *                                            `emailSuppression.upsert` threw. THE SEND
        *                                            COMPLETED; the DATABASE threw.
-       *   4. returned, settlement write entered  — the sender answered and the terminal write threw.
+       *   6. returned, settlement write entered    — the sender answered and the terminal write threw.
        *                                            Split by the answer, because "the row could not be
        *                                            settled after the customer was emailed" and "…
        *                                            after a delivery failure" are different incidents.
-       *   5. returned, nothing else entered      — residual. Nothing in the `try` produces it today;
+       *   7. returned, nothing else entered        — residual. Nothing in the `try` produces it today;
        *                                            it exists so a statement added later is described
-       *                                            truthfully instead of inheriting arm 2's phrase.
+       *                                            truthfully instead of inheriting arm 4's phrase.
        */
       get thrownPhase(): string {
-        if (!sendEntered) return 'a throw before the send'
+        if (!sendEntered) {
+          // THE TWO PRE-SEND STATEMENTS r30 MOVED INSIDE THE `try`, each named for itself. The
+          // lookup pair is read rather than `suppressionLookupEntered` alone, because by the time
+          // `prepareQueuedEmail` runs the lookup has ALREADY been entered — and returned.
+          if (suppressionLookupEntered && !suppressionLookupReturned) {
+            return 'a thrown suppression LOOKUP, before any send'
+          }
+          if (settlementWriteEntered) return 'a thrown settlement write for a SUPPRESSED recipient, before any send'
+          return 'a throw before the send'
+        }
         if (!sendReturned) return 'a thrown send'
         if (suppressionWriteEntered && !settlementWriteEntered) {
           return 'a thrown suppression write, after the sender had returned an invalid-recipient failure'
@@ -1662,6 +1914,10 @@ export async function processPendingEmailOutbox(
     take: EMAIL_OUTBOX_BATCH_SIZE,
   })
 
+  // THE PROVENANCE OF THIS WORKING SET, CHECKED BEFORE THE FIRST CLAIM (r30). The mint's own proof
+  // was taken before these rows existed; this is the same question asked about the rows themselves.
+  if (inMemoryOutboxRows !== null) refuseSweptRowsFromOutsideTheStore(pending, inMemoryOutboxRows)
+
   /**
    * Record a refused terminal write, SAYING WHETHER THIS WORKER HAD ENTERED THE SENDER.
    *
@@ -1688,28 +1944,138 @@ export async function processPendingEmailOutbox(
    *                         The gate and the phrase are two readings of one progress record, not a
    *                         branch that has to know where in the `try` it is.
    */
-  const recordConflict = (claim: EmailClaim, phase: string, smtp: RowProgress): void => {
+  /**
+   * WHY THE TERMINAL WRITE MATCHED NO ROW — ASKED OF THE ROW, NOT INFERRED FROM THE ZERO (r30,
+   * Codex r29 MEDIUM 2).
+   *
+   * A ZERO-ROW CAS HAS MORE THAN ONE CAUSE, and until r30 this path reported only one of them. The
+   * case it got wrong: a terminal `updateMany` COMMITS and then rejects because its answer was lost
+   * on the way back — a reset connection, a pool timeout after the commit record was written. Every
+   * settlement clears `lockedBy`, so the `catch`'s own CAS then matches nothing, and the old sentence
+   * announced "reclaimed by another worker" plus "a duplicate delivery is likely" WHEN NO OTHER
+   * WORKER HAD EVER TOUCHED THE ROW. A lost response is not evidence of a rival.
+   *
+   * THE ROW ITSELF CAN TELL THEM APART, and it is one read:
+   *
+   *   `lockedBy` HOLDS SOMEONE ELSE'S TOKEN — another worker holds the claim NOW. A rival is a fact.
+   *   `lockedBy` IS NULL, AND THIS WORKER'S SETTLEMENT WRITE NEVER ANSWERED — indeterminate, and the
+   *     honest answer: this worker's own write may be the one that settled it. No rival is implied.
+   *   `lockedBy` IS NULL, AND EVERY WRITE THIS WORKER ISSUED ANSWERED — the row carries no claim at
+   *     all, and nothing this worker issued can have released it (each of its writes came back), so
+   *     another holder of the claim did. Note the careful form: what is established is that the
+   *     CLAIM IS GONE, not that the row reached a terminal status — a reclaimer that re-armed the row
+   *     to PENDING looks the same from here, and the message says only what the read supports.
+   *   `lockedBy` STILL HOLDS THIS WORKER'S OWN TOKEN — the row was rewritten under the claim by
+   *     something that kept the token; reported as what it is rather than as a reclaim.
+   *   THE ROW IS GONE, or the read FAILS — said plainly, because "I could not tell" is a better
+   *     operator message than a confident wrong one.
+   *
+   * THE COUNTERS ARE UNCHANGED AND SO IS WHAT THEY COUNT: a terminal write that matched no row,
+   * split by whether the sender had been ENTERED. Neither counter asserts that a rival existed —
+   * that claim lives in the sentence, and the sentence now only makes it when the row says so.
+   */
+  type ClaimLoss =
+    | { kind: 'held-by-another'; holder: string }
+    | { kind: 'settled-by-another' }
+    | { kind: 'settled-outcome-unknown' }
+    | { kind: 'still-carries-this-claim' }
+    | { kind: 'row-gone' }
+    | { kind: 'unreadable'; why: string }
+
+  const diagnoseClaimLoss = async (claim: EmailClaim, smtp: RowProgress): Promise<ClaimLoss> => {
+    let rows: EmailOutboxRow[]
+    try {
+      // THE ROW AS IT IS NOW, through the same delegate every other read uses. A failure here is an
+      // ANSWER ('unreadable'), never a throw: this function runs on a path that is already handling
+      // a lost claim, and a diagnostic that aborts the batch would be a worse defect than the one
+      // it was added to fix.
+      rows = await client.emailOutbox.findMany({ where: { id: claim.id }, take: 1 })
+    } catch (error) {
+      return { kind: 'unreadable', why: String(error) }
+    }
+    const row = rows[0]
+    if (row === undefined) return { kind: 'row-gone' }
+    const holder = typeof row.lockedBy === 'string' && row.lockedBy !== '' ? row.lockedBy : null
+    if (holder === claim.token) return { kind: 'still-carries-this-claim' }
+    if (holder !== null) return { kind: 'held-by-another', holder }
+    return smtp.settlementOutcomeUnknown ? { kind: 'settled-outcome-unknown' } : { kind: 'settled-by-another' }
+  }
+
+  /**
+   * WHAT HAPPENED TO THE CLAIM — one clause per verdict, and none of them guesses.
+   *
+   * `when` is the r22 clause — the one statement that is true on every `attempted` outcome — and it
+   * stays welded to the reclaim it qualifies, so "reclaimed by another worker" is never printed
+   * without the evidence that a reclaim is what happened.
+   */
+  const describeClaimLoss = (claim: EmailClaim, loss: ClaimLoss, when: string): string => {
+    switch (loss.kind) {
+      case 'held-by-another':
+        return `the claim ${claim.token} was reclaimed by another worker ${when}, and that worker holds `
+          + `the row now (lockedBy ${loss.holder})`
+      case 'settled-by-another':
+        return `the claim ${claim.token} was reclaimed by another worker ${when}: the row carries no claim `
+          + 'at all now, and every write this worker issued came back, so none of them can be what '
+          + 'released it'
+      case 'settled-outcome-unknown':
+        return `the claim ${claim.token} is no longer on the row and NO RECLAIM IS ESTABLISHED (${when}): `
+          + 'this worker\'s OWN terminal write was issued and never answered, so that write may be what '
+          + 'settled this row. A lost response is not evidence of a rival, and a second CAS matching '
+          + 'nothing is exactly what a lost response looks like from here'
+      case 'still-carries-this-claim':
+        return `the row still carries this worker's claim token ${claim.token} (${when}) but no longer `
+          + 'matches the rest of the claim, so it was rewritten without the lock changing hands: NOT a '
+          + 'reclaim'
+      case 'row-gone':
+        return `the claim ${claim.token} cannot be resolved (${when}) because the row is no longer there `
+          + 'at all, so this worker cannot say who settled it'
+      case 'unreadable':
+        return `the claim ${claim.token} could not be checked (${when}) — reading the row back failed `
+          + `(${loss.why}) — so whether another worker holds it, or this worker's own write committed `
+          + 'and lost its answer, is UNKNOWN'
+    }
+  }
+
+  /** WHETHER A SECOND COPY OF THE EMAIL FOLLOWS — which only a confirmed rival makes likely. */
+  const describeDuplicateRisk = (loss: ClaimLoss): string => {
+    switch (loss.kind) {
+      case 'held-by-another':
+      case 'settled-by-another':
+        return 'A duplicate delivery is likely; the row was NOT re-armed.'
+      case 'settled-outcome-unknown':
+        return 'The sender WAS entered, so a message may be on the wire; whether a SECOND copy follows '
+          + 'depends on whether any other worker ever held this row, which nothing here establishes. '
+          + 'The row was NOT re-armed.'
+      case 'still-carries-this-claim':
+      case 'row-gone':
+      case 'unreadable':
+        return 'The sender WAS entered, so a message may be on the wire; a duplicate CANNOT be ruled '
+          + 'in or out from here. The row was NOT re-armed.'
+    }
+  }
+
+  const recordConflict = async (claim: EmailClaim, phase: string, smtp: RowProgress): Promise<void> => {
+    const loss = await diagnoseClaimLoss(claim, smtp)
     if (smtp.attempted) {
       result.conflicted++
       console.error(
-        `[email-outbox] row ${claim.id}: terminal write REFUSED after ${phase} — the claim ${claim.token} `
+        `[email-outbox] row ${claim.id}: terminal write REFUSED after ${phase} — `
         // NOT "while this one was on the SMTP socket" (r22). That sentence was written when the only
         // `attempted` outcomes were a send that returned or a send that threw; the two arms r22 added
         // — a suppression upsert and a settlement write that throw ONCE THE SENDER HAS RETURNED —
         // lose the claim while this worker is in a DATABASE call, so the socket clause contradicted
-        // the very `phase` printed two words earlier. The claim that holds on all four is the one the
-        // counter is actually about: the sender was ENTERED, so a message may be on the wire.
-        + 'was reclaimed by another worker after this one had ENTERED the sender (o3d-alnk). '
-        + 'A duplicate delivery is likely; the row was NOT re-armed.',
+        // the very `phase` printed two words earlier. The clause that holds on all of them is the one
+        // the counter is about: the sender was ENTERED, so a message may be on the wire.
+        + `${describeClaimLoss(claim, loss, 'after this one had ENTERED the sender')} (o3d-alnk). `
+        + describeDuplicateRisk(loss),
       )
       return
     }
     result.conflictedWithoutSend++
     console.error(
-      `[email-outbox] row ${claim.id}: terminal write REFUSED after ${phase} — the claim ${claim.token} `
-      + 'was reclaimed by another worker BEFORE this one attempted any send (o3d-alnk). '
-      + 'THIS WORKER DELIVERED NOTHING, so no duplicate follows from it; the row was NOT re-armed '
-      + 'and belongs to the worker that settled it.',
+      `[email-outbox] row ${claim.id}: terminal write REFUSED after ${phase} — `
+      + `${describeClaimLoss(claim, loss, 'BEFORE this one attempted any send')} (o3d-alnk). `
+      + 'THIS WORKER DELIVERED NOTHING, so no duplicate follows from it; the row was NOT re-armed.',
     )
   }
 
@@ -1747,29 +2113,44 @@ export async function processPendingEmailOutbox(
     // never made — nor a thrown send for a write that threw after the sender had finished.
     const smtp = openRowProgress()
 
-    // The suppression check runs AFTER the claim, and its write is fenced like every other.
-    // It used to run BEFORE, writing FAILED through an unfenced update on a row this worker
-    // had not claimed at all — the one writer that could clobber another worker's PROCESSING
-    // row without ever having held it.
-    const normalizedRecipient = normalizeEmail(email.toEmail)
-    const suppression = await client.emailSuppression.findUnique({
-      where: { email: normalizedRecipient },
-      select: { id: true, reason: true },
-    })
-    if (suppression) {
-      const settled = await settleClaimedEmail(client, claim, {
-        status: 'FAILED',
-        lastError: `Suppressed recipient: ${suppression.reason}`,
-        processingStartedAt: null,
-      })
-      // NO SEND WAS ATTEMPTED ON THIS PATH — the suppression branch returns before the sender is
-      // called at all, which is the whole reason it is counted apart.
-      if (settled) result.failed++
-      else recordConflict(claim, 'a suppression check', smtp)
-      continue
-    }
-
     try {
+      // THE SUPPRESSION CHECK RUNS AFTER THE CLAIM, AND SINCE r30 INSIDE THE FENCED REGION (Codex
+      // r29 MEDIUM 1).
+      //
+      // It used to run BEFORE the claim, writing FAILED through an unfenced update on a row this
+      // worker had not claimed at all — the one writer that could clobber another worker's
+      // PROCESSING row without ever having held it. r28 moved it after the claim and left it OUTSIDE
+      // the `try`, which traded that defect for a smaller one: a transient database rejection of
+      // THIS lookup escaped `processPendingEmailOutbox` entirely. The row stayed PROCESSING until
+      // stale reclamation minutes later, EVERY REMAINING ROW IN THE BATCH was skipped, and the
+      // `email_outbox_processed` activity record — written after the loop — never happened, so the
+      // run left no trace of what it had done before it died.
+      //
+      // Inside the `try` all three of those are answered by machinery that already exists: the
+      // `catch` settles the row under its own claim (PENDING with backoff, or FAILED at the attempt
+      // ceiling), the loop moves to the next row, and the activity record is written as usual. The
+      // lookup goes through the progress record so the `catch` can name it: a thrown LOOKUP is not
+      // a thrown send and not a preparation failure.
+      const normalizedRecipient = normalizeEmail(email.toEmail)
+      const suppression = await smtp.suppressionLookup(() => client.emailSuppression.findUnique({
+        where: { email: normalizedRecipient },
+        select: { id: true, reason: true },
+      }))
+      if (suppression) {
+        // FENCED LIKE EVERY OTHER TERMINAL WRITE, and routed through the progress record (r30) so a
+        // throw HERE is not described as a throw before the lookup.
+        const settled = await smtp.settlementWrite(() => settleClaimedEmail(client, claim, {
+          status: 'FAILED',
+          lastError: `Suppressed recipient: ${suppression.reason}`,
+          processingStartedAt: null,
+        }))
+        // NO SEND WAS ATTEMPTED ON THIS PATH — the suppression branch returns before the sender is
+        // called at all, which is the whole reason it is counted apart.
+        if (settled) result.failed++
+        else await recordConflict(claim, 'a suppression check', smtp)
+        continue
+      }
+
       const prepared = await prepare(email.kind, email.referenceType, email.referenceId)
       const attachments = prepared?.attachments ?? ((email.attachments as QueuedAttachment[] | null) ?? []).map((attachment) => ({
         filename: attachment.filename,
@@ -1802,7 +2183,7 @@ export async function processPendingEmailOutbox(
           processingStartedAt: null,
         }))
         if (settled) result.sent++
-        else recordConflict(claim, 'a successful send', smtp)
+        else await recordConflict(claim, 'a successful send', smtp)
         continue
       }
 
@@ -1835,7 +2216,7 @@ export async function processPendingEmailOutbox(
       // This is the write the issue was raised for: unfenced, it re-armed a row another
       // worker had already settled to SENT, so the duplication was not bounded at two.
       if (settled) result.failed++
-      else recordConflict(claim, 'a failed send', smtp)
+      else await recordConflict(claim, 'a failed send', smtp)
     } catch (error) {
       const attempts = email.attempts + 1
       const permanentFailure = attempts >= EMAIL_MAX_ATTEMPTS
@@ -1853,7 +2234,7 @@ export async function processPendingEmailOutbox(
       // terminal settlement write AFTER it. A phrase chosen from `attempted` alone called all four
       // "a thrown send" or "a throw before the send", so a database failure on a settled row was
       // reported as a mail-transport failure. `thrownPhase` names each of them; see its enumeration.
-      else recordConflict(claim, smtp.thrownPhase, smtp)
+      else await recordConflict(claim, smtp.thrownPhase, smtp)
     }
   }
 

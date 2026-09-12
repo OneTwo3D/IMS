@@ -1223,13 +1223,138 @@ test('r28 HIGH 1: a delegate that answers with its store PLUS a database\'s rows
   assert.match(alsoRefused.message, /as the WHOLE of its answer/)
   assert.match(alsoRefused.message, /it answered 2 row\(s\)/)
 
-  // NON-VACUITY, AND IT IS THE WHOLE POINT: the SAME double with nothing behind it mints. So the
-  // refusal above is about the extra rows, not about the shape of this double.
+  // NON-VACUITY, AND IT IS ALSO THE LIMIT OF WHAT PHASE 1 ESTABLISHES (r30, Codex r29 HIGH).
+  //
+  // The SAME read-through double with NOTHING BEHIND IT mints. That is what makes the refusal above
+  // about the extra rows rather than about the shape of this double — and it is why the mint may not
+  // be described as refusing "a delegate that also serves a database". What phase 1 establishes is
+  // narrower and time-bound: A DELEGATE WHOSE BACKING SOURCE HELD AN ELIGIBLE ROW AT MINT TIME IS
+  // REFUSED. This delegate reads through to a source exactly like the refused one; the only
+  // difference is that its source is empty at this instant, and nothing in the mint can see a row
+  // that does not exist yet. The residue is declared as limitation (e) over
+  // `createEmailOutboxHarnessClient`, and what covers it is the DRAIN'S sweep-time check — proven by
+  // the test immediately below, which takes this very client and lets its source fill up.
   const honest = await createEmailOutboxHarnessClient({
     emailOutbox: readThroughDelegate(EMAIL_OUTBOX_IN_MEMORY_ROWS, [], [], []),
     emailSuppression: (await mintableDelegates()).emailSuppression,
   } as unknown as Parameters<typeof createEmailOutboxHarnessClient>[0])
   assert.ok(honest.emailOutbox, 'the same delegate with an empty database was refused too')
+})
+
+/**
+ * r30 HIGH (Codex r29): THE EMPTY-SOURCE READ-THROUGH DELEGATE — WHAT THE MINT CANNOT SEE, AND WHAT
+ * THE DRAIN DOES ABOUT IT.
+ *
+ * The control above mints a read-through delegate whose backing source is empty. This test is the
+ * consequence the mint's claim used to write off: the source RECEIVES A GENUINE QUEUED EMAIL after
+ * the door has shut. The delegate is not probe-aware, holds no mutable state the mint disturbed, and
+ * routes its writes to the same place it routes its reads — it evades every one of limitations
+ * (a)-(d) — so the sweep hands a real customer row to the harness's sender, which stamps it SENT.
+ *
+ * The double's `updateMany` really works on the source rows, so this is NOT a test that passes
+ * because the claim would have failed anyway: the assertions below check that the row was neither
+ * claimed nor delivered, and both are reachable without the fix.
+ */
+test('r30 HIGH: a read-through delegate whose source FILLS UP after the mint is refused AT THE SWEEP', async () => {
+  const { createEmailOutboxHarnessClient, processPendingEmailOutbox: drain, EMAIL_OUTBOX_IN_MEMORY_ROWS } = await loadOutbox()
+
+  /** The delegate's own store — empty at mint, and still empty when the drain runs. */
+  const store: Record<string, unknown>[] = []
+  /** The database behind it. Empty at mint; a real queued email arrives afterwards. */
+  const source: Record<string, unknown>[] = []
+  const rowsOf = (): Record<string, unknown>[] => [...store, ...source]
+
+  const delegates = {
+    emailOutbox: {
+      async findMany(args: unknown) {
+        const { where, take } = args as { where?: { id?: unknown }; take?: number }
+        const matched = where?.id === undefined
+          ? rowsOf().filter((row) => row.status === 'PENDING')
+          : rowsOf().filter((row) => row.id === where.id)
+        return matched.slice(0, take ?? matched.length) as never
+      },
+      async updateMany(args: unknown) {
+        // A WORKING WRITE, over BOTH arrays. Without it the claim would fail for a reason that has
+        // nothing to do with provenance and this test would prove nothing.
+        const { where, data } = args as { where: Record<string, unknown>; data: Record<string, unknown> }
+        let count = 0
+        for (const row of rowsOf()) {
+          if (row.id !== where.id) continue
+          if ('lockedBy' in where && row.lockedBy !== where.lockedBy) continue
+          Object.assign(row, data)
+          count += 1
+        }
+        return { count }
+      },
+      async create() { return {} },
+      [EMAIL_OUTBOX_IN_MEMORY_ROWS]: () => store,
+    },
+    emailSuppression: (await mintableDelegates()).emailSuppression,
+  }
+
+  // IT MINTS. That is the point of the round: the mint's negative sample sees an empty source.
+  const client = await createEmailOutboxHarnessClient(
+    delegates as unknown as Parameters<typeof createEmailOutboxHarnessClient>[0],
+  )
+
+  // AND NOW A REAL CUSTOMER EMAIL IS QUEUED IN THE DATABASE THIS DELEGATE READS THROUGH TO.
+  source.push({
+    id: 'a-real-queued-email',
+    kind: 'ACCOUNTING_INVOICE',
+    toEmail: 'a.real.customer@example.test',
+    subject: 'Invoice INV-9001',
+    html: '<p>a real invoice</p>',
+    attachments: null,
+    referenceType: 'SalesOrder',
+    referenceId: 'order-9001',
+    status: 'PENDING',
+    attempts: 0,
+    availableAt: new Date('2026-01-01T00:00:00.000Z'),
+    processingStartedAt: null,
+    lockedBy: null,
+  })
+
+  const delivered: string[] = []
+  const refusal = await drain({
+    harness: {
+      ...completeHarness(client),
+      sendEmail: async (message: { to: string }) => {
+        delivered.push(message.to)
+        return { success: true as const }
+      },
+    },
+  } as unknown as ProcessEmailOutboxOptions).then(() => null, (error: unknown) => error)
+
+  // (1) THE RUN IS REFUSED, and the message names what was wrong rather than something adjacent.
+  assert.ok(refusal instanceof Error, 'the drain swept a row the delegate\'s own store does not hold')
+  assert.match(refusal.message, /whose ids the outbox delegate's own store does not hold/)
+  assert.match(refusal.message, /a-real-queued-email/)
+  assert.match(refusal.message, /REFUSED BEFORE ANY ROW WAS CLAIMED AND BEFORE ANY MESSAGE WAS SENT/)
+
+  // (2) AND IT IS REFUSED BEFORE ANYTHING HAPPENED TO THE ROW: not claimed, not delivered, not
+  // stamped. These are the three facts the finding is actually about.
+  // `assert.deepEqual(delivered, [])` would NARROW `delivered` to `never[]` for the rest of this
+  // test (node's strict assertions are assertion functions), and arm (3) below has to push to it.
+  assert.equal(delivered.length, 0, `a real queued email was handed to the harness sender: ${delivered.join(', ')}`)
+  assert.equal(source[0].status, 'PENDING', 'the real row was claimed by a harness drain')
+  assert.equal(source[0].lockedBy, null, 'the real row still carries a harness claim')
+  assert.equal(source[0].processingStartedAt, null)
+
+  // (3) NON-VACUITY: the same delegate, the same drain, with the row IN ITS OWN STORE instead of
+  // behind it, runs to completion. So the refusal is about provenance, not about this double.
+  store.push({ ...(source.shift() as Record<string, unknown>), id: 'a-fixture-row' })
+  const result = await drain({
+    harness: {
+      ...completeHarness(client),
+      sendEmail: async (message: { to: string }) => {
+        delivered.push(message.to)
+        return { success: true as const }
+      },
+    },
+  } as unknown as ProcessEmailOutboxOptions)
+  assert.deepEqual(result, { processed: 1, sent: 1, failed: 0, conflicted: 0, conflictedWithoutSend: 0 })
+  assert.deepEqual(delivered, ['a.real.customer@example.test'])
+  assert.equal(store[0].status, 'SENT')
 })
 
 test('r28 HIGH 2: a method swapped onto the caller\'s delegate AFTER the mint never reaches the drain', async () => {
@@ -1269,3 +1394,76 @@ test('r28 HIGH 2: a method swapped onto the caller\'s delegate AFTER the mint ne
   assert.deepEqual(delivered, ['fixture@example.invalid'])
   assert.equal(fixture.store['row-1'].status, 'SENT')
 })
+
+/**
+ * r30: THE DRAIN-TIME CHECK FAILS CLOSED WHEN THERE IS NOTHING TO CHECK AGAINST.
+ *
+ * The witness is read ONCE, at mint time, and the drain calls that same function when it needs the
+ * array. A delegate whose witness answered honestly for the proof and then stops — returning
+ * something that is not an array, or throwing — leaves the sweep's answer with nothing to be held up
+ * against, and that is a refusal rather than a skipped check.
+ */
+for (const [how, misbehave] of [
+  ['reports something that is not an array', () => null as unknown as Record<string, unknown>[]],
+  ['throws', () => { throw new Error('the store is gone') }],
+] as [string, () => Record<string, unknown>[]][]) {
+  test(`r30: a store witness that ${how} after the mint refuses the sweep`, async () => {
+    const { createEmailOutboxHarnessClient, processPendingEmailOutbox: drain, EMAIL_OUTBOX_IN_MEMORY_ROWS } = await loadOutbox()
+    const store: Record<string, unknown>[] = []
+    let honest = true
+
+    const delegates = {
+      emailOutbox: {
+        async findMany(args: unknown) {
+          const { where } = args as { where?: { id?: unknown } }
+          return (where?.id === undefined
+            ? store.filter((row) => row.status === 'PENDING')
+            : store.filter((row) => row.id === where.id)) as never
+        },
+        async updateMany() { return { count: 1 } },
+        async create() { return {} },
+        [EMAIL_OUTBOX_IN_MEMORY_ROWS]: () => (honest ? store : misbehave()),
+      },
+      emailSuppression: (await mintableDelegates()).emailSuppression,
+    }
+
+    const client = await createEmailOutboxHarnessClient(
+      delegates as unknown as Parameters<typeof createEmailOutboxHarnessClient>[0],
+    )
+
+    // A row the delegate really does hold, so the sweep has something to answer with — the check is
+    // skipped outright on an empty sweep, and that must not be why this passes.
+    store.push({
+      id: 'fixture-row',
+      kind: 'ACCOUNTING_INVOICE',
+      toEmail: 'fixture@example.invalid',
+      subject: 'fixture',
+      html: '<p>fixture</p>',
+      attachments: null,
+      referenceType: 'SalesOrder',
+      referenceId: 'fixture-row',
+      status: 'PENDING',
+      attempts: 0,
+      availableAt: new Date('2026-01-01T00:00:00.000Z'),
+      processingStartedAt: null,
+      lockedBy: null,
+    })
+    honest = false
+
+    const delivered: string[] = []
+    const refusal = await drain({
+      harness: {
+        ...completeHarness(client),
+        sendEmail: async (message: { to: string }) => {
+          delivered.push(message.to)
+          return { success: true as const }
+        },
+      },
+    } as unknown as ProcessEmailOutboxOptions).then(() => null, (error: unknown) => error)
+
+    assert.ok(refusal instanceof Error, `a witness that ${how} was worked around instead of refused`)
+    assert.match(refusal.message, /row store/)
+    assert.equal(delivered.length, 0, 'the drain sent before it could check the sweep it had')
+    assert.equal(store[0].status, 'PENDING', 'the row was claimed before the check')
+  })
+}

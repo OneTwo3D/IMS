@@ -123,6 +123,27 @@ type MakeClientOptions = {
    */
   throwOnFirstTerminalWrite?: () => void
   /**
+   * MAKE THE FIRST `emailSuppression.findUnique` THROW — the read between the claim and the sender
+   * (r30, Codex r29 MEDIUM 1).
+   *
+   * Until r30 that read sat OUTSIDE the drain's `try`, so this hook aborted the whole batch: the
+   * rejection escaped `processPendingEmailOutbox`, the claimed row stayed PROCESSING until stale
+   * reclamation, and no activity record was written. The hook runs BEFORE the throw so a test can
+   * also hand the row to another worker in the same instant.
+   */
+  throwOnFirstSuppressionLookup?: () => void
+  /**
+   * COMMIT THE FIRST TERMINAL `updateMany` AND THEN THROW — a LOST RESPONSE (r30, Codex r29
+   * MEDIUM 2).
+   *
+   * `throwOnFirstTerminalWrite` above throws INSTEAD of writing, which is the easy half: the row is
+   * untouched, so a later CAS from the `catch` still finds the claim. This option is the half no test
+   * reached — the write LANDS (status settled, `lockedBy` cleared) and only its ANSWER is lost. The
+   * `catch`'s own CAS then matches zero rows because THIS worker already settled the row, and a
+   * telemetry line that reads a reclaim out of that zero is inventing a rival.
+   */
+  commitThenThrowOnFirstTerminalWrite?: () => void
+  /**
    * PAUSE INSIDE THE FIRST `emailSuppression.findUnique` — the read that sits between the claim and
    * the sender (r28).
    *
@@ -133,6 +154,16 @@ type MakeClientOptions = {
    * pause points in this file already work.
    */
   pauseOnFirstSuppressionLookup?: () => Promise<void>
+  /**
+   * MAKE THE CLAIM READ-BACK THROW — the one-row lookup `diagnoseClaimLoss` issues when a terminal
+   * write matched nothing (r30).
+   *
+   * It is identified the way the double can identify it: a `findMany` with an `id` and no `orderBy`,
+   * which is not the sweep. The mint's own probes have that shape too, so this is off while minting.
+   * A diagnostic that THROWS would abort the batch — the very defect MEDIUM 1 was about — so the
+   * failure has to become an ANSWER instead.
+   */
+  throwOnClaimReadBack?: () => void
   /**
    * MAKE `emailOutbox.create` THROW — for the `queueEmail` collision proofs (r28).
    *
@@ -159,8 +190,10 @@ async function makeClient(rows: EmailOutboxRow[], options: MakeClientOptions = {
   const updateManyCalls: UpdateManyCall[] = []
   const created: Record<string, unknown>[] = []
   let terminalWriteFailed = false
+  let terminalWriteCommitLost = false
   let suppressionUpsertFailed = false
   let suppressionLookupPaused = false
+  let suppressionLookupFailed = false
   /**
    * THE MINT'S PROBE IS NOT A DRAIN, so no interleaving hook may fire inside it. The proof reads
    * `findUnique` three times (empty store, sentinel, sentinel removed), and a pause that fired there
@@ -172,12 +205,30 @@ async function makeClient(rows: EmailOutboxRow[], options: MakeClientOptions = {
     emailOutbox: {
       async findMany(args: unknown) {
         const { where, orderBy, take } = args as { where: Where; orderBy?: unknown; take?: number }
+        if (options.throwOnClaimReadBack && !minting && orderBy === undefined && where.id !== undefined) {
+          options.throwOnClaimReadBack()
+          throw new Error('the row could not be read back')
+        }
         void orderBy
         const matched = store.filter((row) => matchesWhere(row, where))
         return matched.slice(0, take ?? matched.length).map((row) => ({ ...row }))
       },
       async updateMany(args: unknown) {
         const { where, data } = args as { where: Where; data: Record<string, unknown> }
+        if (options.commitThenThrowOnFirstTerminalWrite && data.status !== 'PROCESSING' && !terminalWriteCommitLost) {
+          terminalWriteCommitLost = true
+          // THE WRITE LANDS — this models a COMMIT whose answer was lost, not a write that never
+          // happened. `settleClaimedEmail` clears `lockedBy`, so the row stops matching the claim.
+          let committed = 0
+          for (const row of store) {
+            if (!matchesWhere(row, where)) continue
+            Object.assign(row, data)
+            committed += 1
+          }
+          updateManyCalls.push({ where, data, count: committed })
+          options.commitThenThrowOnFirstTerminalWrite()
+          throw new Error('the settlement write committed and its answer was lost')
+        }
         if (options.throwOnFirstTerminalWrite && data.status !== 'PROCESSING' && !terminalWriteFailed) {
           terminalWriteFailed = true
           options.throwOnFirstTerminalWrite()
@@ -208,6 +259,11 @@ async function makeClient(rows: EmailOutboxRow[], options: MakeClientOptions = {
     emailSuppression: {
       async findUnique(args: unknown) {
         const { where } = args as { where: { email: string } }
+        if (options.throwOnFirstSuppressionLookup && !minting && !suppressionLookupFailed) {
+          suppressionLookupFailed = true
+          options.throwOnFirstSuppressionLookup()
+          throw new Error('the suppression lookup could not reach the database')
+        }
         if (options.pauseOnFirstSuppressionLookup && !minting && !suppressionLookupPaused) {
           suppressionLookupPaused = true
           await options.pauseOnFirstSuppressionLookup()
@@ -1174,6 +1230,10 @@ test('r22: `thrownPhase` enumerates the try, and every arm is distinct', () => {
   assert.deepEqual(
     phrases,
     [
+      // r30 MOVED TWO STATEMENTS INSIDE THE `try` (Codex r29 MEDIUM 1), so the enumeration grew by
+      // two arms rather than letting a suppression-lookup failure borrow arm 3's wording.
+      'a thrown suppression LOOKUP, before any send',
+      'a thrown settlement write for a SUPPRESSED recipient, before any send',
       'a throw before the send',
       'a thrown send',
       'a thrown suppression write, after the sender had returned an invalid-recipient failure',
@@ -1189,13 +1249,28 @@ test('r22: `thrownPhase` enumerates the try, and every arm is distinct', () => {
   // would land in the residual arm — honest, but less useful — so this counts them.
   assert.equal(
     [...source.matchAll(/smtp\.settlementWrite\(/g)].length,
-    2,
-    'the settlement writes inside the `try` are no longer both routed through the progress record',
+    3,
+    'the settlement writes inside the `try` are no longer all routed through the progress record '
+    + '(r30 brought the SUPPRESSED-recipient settlement inside the fenced region, which makes three)',
   )
   assert.equal(
     [...source.matchAll(/smtp\.suppressionWrite\(/g)].length,
     1,
     'the suppression upsert inside the `try` is no longer routed through the progress record',
+  )
+  assert.equal(
+    [...source.matchAll(/smtp\.suppressionLookup\(/g)].length,
+    1,
+    'the suppression LOOKUP inside the `try` is no longer routed through the progress record, so a '
+    + 'lookup that throws cannot be told apart from a preparation that threw after it returned (r30)',
+  )
+  // AND THE LOOKUP IS INSIDE THE `try` AT ALL — the whole of r29 MEDIUM 1. A lookup before it
+  // escapes the fenced region, and this is the cheapest statement of that: the only
+  // `emailSuppression.findUnique` in the drain is the one the progress record wraps.
+  assert.equal(
+    [...source.matchAll(/client\.emailSuppression\.findUnique\(/g)].length,
+    1,
+    'the drain reads emailSuppression.findUnique somewhere other than inside the fenced lookup',
   )
 })
 
@@ -1305,4 +1380,286 @@ test('r22: the SENTENCE around the phrase is true on the post-send arms too, not
   assert.ok(beforeLine, 'no conflict was logged for a throw before the send')
   assert.match(beforeLine, /BEFORE this one attempted any send/)
   assert.match(beforeLine, /THIS WORKER DELIVERED NOTHING/)
+})
+
+// ---------------------------------------------------------------------------
+// ROUND 30 (Codex r29 MEDIUM 1) — THE SUPPRESSION LOOKUP IS INSIDE THE FENCED REGION.
+//
+// r28 moved that lookup AFTER the claim, which fixed an unfenced write, and left it OUTSIDE the
+// `try`. A transient database rejection there therefore escaped `processPendingEmailOutbox`
+// altogether: the claimed row sat PROCESSING until stale reclamation, EVERY LATER ROW IN THE BATCH
+// was skipped, and the `email_outbox_processed` activity record — written after the loop — never
+// happened, so the run left no record of what it had already done.
+//
+// The fix is not a new mechanism. Inside the `try`, the machinery that already exists answers all
+// three: the `catch` settles the row under its own claim, the loop continues, and the activity
+// record is written.
+// ---------------------------------------------------------------------------
+
+test('r30: a suppression lookup that FAILS settles its own row and the batch carries on', async () => {
+  const activity: { action: string; metadata: unknown }[] = []
+  const delivered: string[] = []
+  const { client, rows } = await makeClient(
+    [makeRow({ id: 'email-1' }), makeRow({ id: 'email-2', referenceId: 'order-2' })],
+    { throwOnFirstSuppressionLookup: () => {} },
+  )
+
+  const result = await drain({
+    client,
+    now: () => T0,
+    prepareQueuedEmail: noPrepare,
+    async logActivity(entry: { action: string; metadata?: unknown }) {
+      activity.push({ action: entry.action, metadata: entry.metadata })
+    },
+    async sendEmail(message: { to: string }) {
+      delivered.push(message.to)
+      return { success: true }
+    },
+  } as unknown as EmailOutboxHarness)
+
+  // (1) THE DRAIN RETURNED. Before r30 this call REJECTED, and everything below was unreachable.
+  assert.deepEqual(
+    result,
+    { processed: 2, sent: 1, failed: 1, conflicted: 0, conflictedWithoutSend: 0 },
+    'the batch did not survive a failed suppression lookup',
+  )
+
+  // (2) THE ROW WHOSE LOOKUP FAILED IS SETTLED UNDER ITS OWN CLAIM — not left PROCESSING for the
+  // stale sweep to find fifteen minutes later.
+  const failedRow = rows.find((row) => row.id === 'email-1')
+  assert.ok(failedRow, 'the row vanished')
+  assert.equal(failedRow.status, 'PENDING', 'the row was left PROCESSING by an escaping rejection')
+  assert.equal(failedRow.attempts, 1, 'the failed attempt was not counted')
+  assert.equal(failedRow.lockedBy, null, 'the claim was not released')
+  assert.equal(failedRow.processingStartedAt, null)
+  assert.match(
+    String((failedRow as unknown as Record<string, unknown>).lastError),
+    /the suppression lookup could not reach the database/,
+  )
+  assert.equal(
+    failedRow.availableAt.getTime(),
+    T0.getTime() + 60_000,
+    'the row was not re-armed with the ordinary backoff',
+  )
+
+  // (3) AND THE REST OF THE BATCH RAN. This is the part the escaping rejection silently cancelled.
+  const nextRow = rows.find((row) => row.id === 'email-2')
+  assert.equal(nextRow?.status, 'SENT', 'a later row in the batch was skipped')
+  assert.deepEqual(delivered, ['customer@example.test'])
+
+  // (4) AND THE RUN IS ON THE RECORD. The activity write is after the loop, so an escaping rejection
+  // took it with it.
+  assert.deepEqual(
+    activity.map((entry) => entry.action),
+    ['email_outbox_processed'],
+    'the processing activity record was bypassed',
+  )
+  assert.deepEqual(activity[0].metadata, result)
+})
+
+test('r30: a suppression lookup failure that ALSO loses the claim is named for what threw', async () => {
+  // The same relocation, on the contended path: the lookup throws AND another worker takes the row
+  // in the same instant, so the `catch`'s settlement is refused and `recordConflict` is reached.
+  // The phrase must name the LOOKUP — not "a throw before the send", which is true but says nothing,
+  // and certainly not a thrown send.
+  const fixture = await makeClient([makeRow()], {
+    throwOnFirstSuppressionLookup: () => {
+      fixture.rows[0].lockedBy = 'another-worker'
+    },
+  })
+
+  const { result, logged } = await drainCapturingLog({
+    client: fixture.client,
+    now: () => T0,
+    prepareQueuedEmail: noPrepare,
+    logActivity: noLog,
+    async sendEmail() {
+      throw new Error('the sender must not be reached on this path')
+    },
+  })
+
+  assert.equal(result.processed, 1, 'the row must have been claimed, or no conflict can arise')
+  assert.equal(result.conflictedWithoutSend, 1, 'a lookup failure that lost the claim sent nothing')
+  assert.equal(result.conflicted, 0, 'no send was attempted, so no duplicate is implied')
+
+  const conflict = logged.find((line) => line.includes('terminal write REFUSED'))
+  assert.ok(conflict, `no conflict was logged; captured: ${JSON.stringify(logged)}`)
+  assert.match(conflict, /after a thrown suppression LOOKUP, before any send/)
+  assert.doesNotMatch(conflict, /after a thrown send/)
+  assert.match(conflict, /THIS WORKER DELIVERED NOTHING/)
+})
+
+// ---------------------------------------------------------------------------
+// ROUND 30 (Codex r29 MEDIUM 2) — A ZERO-ROW CAS IS NOT EVIDENCE OF A RIVAL.
+//
+// Every conflict test above reclaims the row from another worker and then measures the sentence. That
+// is one cause of a zero-row terminal write. THE OTHER: this worker's own settlement write COMMITS
+// and its answer is lost. The commit cleared `lockedBy`, so the `catch`'s CAS matches nothing — and
+// the old sentence read that zero as "reclaimed by another worker … a duplicate delivery is likely"
+// when no other worker had ever touched the row. The row's own state tells the two apart, so the
+// telemetry asks it.
+// ---------------------------------------------------------------------------
+
+test('r30: a terminal write that COMMITS and loses its answer is not reported as a reclaim', async () => {
+  let sends = 0
+  const { client, rows, updateManyCalls } = await makeClient([makeRow()], {
+    // NO RIVAL ANYWHERE IN THIS TEST. The only thing that happens to the row is this worker's own
+    // write landing.
+    commitThenThrowOnFirstTerminalWrite: () => {},
+  })
+
+  const { result, logged } = await drainCapturingLog({
+    client,
+    now: () => T0,
+    prepareQueuedEmail: noPrepare,
+    logActivity: noLog,
+    async sendEmail() {
+      sends += 1
+      return { success: true }
+    },
+  })
+
+  // PRECONDITIONS. Without these the assertions below could be right for the wrong reason: the
+  // sender ran, the FIRST terminal write matched the row, and the SECOND (the catch's) matched none.
+  assert.equal(sends, 1, 'the sender was not entered, so this is not the case under test')
+  const terminal = updateManyCalls.filter((call) => call.data.status !== 'PROCESSING')
+  assert.equal(terminal.length, 2, `expected the lost write and the catch's own; got ${terminal.length}`)
+  assert.equal(terminal[0].count, 1, 'the write that was supposed to COMMIT matched no row')
+  assert.equal(terminal[1].count, 0, "the catch's CAS matched a row, so the overclaim is not reachable")
+  assert.equal(rows[0].status, 'SENT', 'the committed write did not land, so nothing was lost')
+  assert.equal(rows[0].lockedBy, null)
+  assert.equal(result.conflicted, 1, 'the refused terminal write was not counted')
+
+  const conflict = logged.find((line) => line.includes('terminal write REFUSED'))
+  assert.ok(conflict, `no conflict was logged; captured: ${JSON.stringify(logged)}`)
+
+  // THE FINDING: no rival existed, so neither claim may be made.
+  assert.doesNotMatch(
+    conflict,
+    /was reclaimed by another worker/,
+    'a lost response was reported as another worker reclaiming the row, and no other worker existed',
+  )
+  assert.doesNotMatch(
+    conflict,
+    /A duplicate delivery is likely/,
+    'a lost response was reported as a likely duplicate delivery, which sends an operator looking for '
+    + 'a second copy of an email only one worker ever sent',
+  )
+  // AND WHAT IT SAYS INSTEAD names the cause it can actually establish.
+  assert.match(conflict, /NO RECLAIM IS ESTABLISHED/)
+  assert.match(conflict, /OWN terminal write was issued and never answered/)
+  assert.match(conflict, /A lost response is not evidence of a rival/)
+  assert.match(conflict, /after a thrown settlement write, after the sender had reported the email DELIVERED/)
+})
+
+test('r30: NON-VACUITY — the same lost write WITH a real rival still reports the reclaim', async () => {
+  // The mirror of the test above, and the reason it cannot pass by the sentence having lost its
+  // meaning. Identical mechanics — the write commits and its answer is lost — except that another
+  // worker really does hold the row when the catch looks. The reclaim sentence must come back.
+  const fixture = await makeClient([makeRow()], {
+    commitThenThrowOnFirstTerminalWrite: () => {
+      fixture.rows[0].lockedBy = 'another-worker'
+    },
+  })
+
+  const { result, logged } = await drainCapturingLog({
+    client: fixture.client,
+    now: () => T0,
+    prepareQueuedEmail: noPrepare,
+    logActivity: noLog,
+    async sendEmail() {
+      return { success: true }
+    },
+  })
+
+  assert.equal(result.conflicted, 1)
+  const conflict = logged.find((line) => line.includes('terminal write REFUSED'))
+  assert.ok(conflict, `no conflict was logged; captured: ${JSON.stringify(logged)}`)
+  assert.match(conflict, /was reclaimed by another worker after this one had ENTERED the sender/)
+  assert.match(conflict, /lockedBy another-worker/)
+  assert.match(conflict, /A duplicate delivery is likely/)
+  assert.doesNotMatch(conflict, /NO RECLAIM IS ESTABLISHED/)
+})
+
+test('r30: the mint claims what phase 1 establishes and no more, and declares the fifth residue', () => {
+  // Codex r29's HIGH was not a missing mechanism — it was a SENTENCE that outran its evidence. r28
+  // wrote that the mint refuses "a delegate that also serves a database's rows", while its own
+  // control test minted exactly such a delegate whenever the database happened to be empty. A
+  // sentence is what the next reader trusts, so the sentence is under test.
+  const source = readFileSync(fileURLToPath(new URL('../lib/email-outbox.ts', import.meta.url)), 'utf8')
+  /** The doc blocks with their comment furniture removed, so a claim can be matched as prose. */
+  const prose = source.replace(/\n\s*\*/g, ' ').replace(/\s+/g, ' ')
+
+  // (1) THE OVERCLAIM IS GONE, and it cannot return without this failing.
+  assert.ok(
+    !prose.includes('A delegate that also serves a database\'s rows is refused'),
+    'the mint again claims it refuses a database-serving delegate, which its own control test disproves',
+  )
+
+  // (2) WHAT REPLACED IT IS TIME-BOUND, because the evidence is a single negative sample.
+  assert.ok(
+    prose.includes('What is refused is a delegate whose backing source HAS AN ELIGIBLE ROW AT MINT TIME'),
+    'the mint no longer states the time-bound claim phase 1 actually establishes',
+  )
+
+  // (3) THE RESIDUE IS DECLARED, AND THE EMPTY-SOURCE CASE IS NAMED IN IT.
+  assert.ok(
+    prose.includes('these five are the residue'),
+    'the residue list no longer says how many residues there are',
+  )
+  assert.ok(
+    prose.includes('e. A READ-THROUGH DELEGATE WHOSE BACKING SOURCE IS EMPTY WHEN IT IS MINTED'),
+    'the fifth limitation — the case Codex r29 found — is no longer declared',
+  )
+  assert.ok(
+    prose.includes('NONE OF (a)-(e) IS REACHABLE BY ACCIDENT OR IN ONE LINE'),
+    'the closing summary still counts four residues',
+  )
+
+  // (4) AND THE CHECK THAT COVERS IT IS NAMED WHERE THE LIMITATION IS DECLARED, so a reader who
+  // reaches (e) is told what stands between it and a real customer row.
+  assert.ok(
+    prose.includes('refuseSweptRowsFromOutsideTheStore'),
+    'the mint contract no longer points at the drain-time check that covers residue (e)',
+  )
+  assert.equal(
+    [...source.matchAll(/refuseSweptRowsFromOutsideTheStore\(/g)].length,
+    2,
+    'the sweep-time provenance check is not called exactly once (plus its own definition)',
+  )
+})
+
+test('r30: a claim read-back that FAILS is an answer, not a thrown diagnostic', async () => {
+  // The verdict read is issued on a path that is already handling a lost claim. If it threw, the
+  // batch would die exactly as it died before MEDIUM 1 was fixed — so the failure becomes a verdict
+  // of its own, and the line says which question is unanswered rather than picking an answer.
+  let readBacks = 0
+  const { client, rows } = await makeClient(
+    [makeRow({ id: 'email-1' }), makeRow({ id: 'email-2', referenceId: 'order-2' })],
+    {
+      commitThenThrowOnFirstTerminalWrite: () => {},
+      throwOnClaimReadBack: () => { readBacks += 1 },
+    },
+  )
+
+  const { result, logged } = await drainCapturingLog({
+    client,
+    now: () => T0,
+    prepareQueuedEmail: noPrepare,
+    logActivity: noLog,
+    async sendEmail() {
+      return { success: true }
+    },
+  })
+
+  assert.equal(readBacks, 1, 'the read-back was not attempted, so this is not the case under test')
+  assert.equal(result.conflicted, 1, 'the refused terminal write was not counted')
+  assert.equal(rows.find((row) => row.id === 'email-2')?.status, 'SENT', 'the batch died on a failed read-back')
+
+  const conflict = logged.find((line) => line.includes('terminal write REFUSED'))
+  assert.ok(conflict, `no conflict was logged; captured: ${JSON.stringify(logged)}`)
+  assert.match(conflict, /could not be checked/)
+  assert.match(conflict, /is UNKNOWN/)
+  assert.doesNotMatch(conflict, /was reclaimed by another worker/)
+  assert.doesNotMatch(conflict, /A duplicate delivery is likely/)
 })
