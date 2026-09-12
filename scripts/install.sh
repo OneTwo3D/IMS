@@ -1163,14 +1163,30 @@ publish_privileged_helper_set || {
 # docs/installation.md says so. What is gone is root executing a deployment driver that the service
 # account could have replaced in the interval since the previous run.
 #
+# AND WHAT IT REFUSES TO DO (o3d-z5be r2, Codex HIGH). The operator's choice of tree is the trust
+# root for THIS run, and it is not a trust root for every run after it. A checkout an account other
+# than root can write — this installer chowns ${APP_DIR} to ${APP_USER}, so a re-run out of the
+# application directory is exactly that case — may therefore be run, but not PROMOTED into the copy
+# the next privileged run is launched from: that would turn one operator decision into a standing
+# arrangement where root executes bytes ${APP_USER} chose. Status 2 is that refusal, and it is a
+# WARNING here rather than a `die`: nothing has been changed, the run is not compromised by it, and
+# the two ways to get a refreshed driver are in the message. A refusal would stop installs that are
+# entitled to proceed. Any other failure is still fatal — a root that cannot create or seal its own
+# directory under /etc is a host this installer must not build on.
+#
 # The EUID test is here rather than inside the function because install.sh's own root check is in
 # section 1, hundreds of lines below, and it prints the sentence an operator needs. A non-root run
 # reaching this line is `--help`-shaped and publishes nothing.
 if [[ "$(id -u)" == "0" ]]; then
-  publish_privileged_driver "$(dirname "${IMS_SCRIPT_LIB_DIR}")" || {
+  DRIVER_PUBLISH_RC=0
+  publish_privileged_driver "$(dirname "${IMS_SCRIPT_LIB_DIR}")" || DRIVER_PUBLISH_RC=$?
+  if (( DRIVER_PUBLISH_RC == 2 )); then
+    echo "WARNING: the root-owned deployment driver at ${IMS_DRIVER_PROGRAM_DIR} was NOT published from this checkout, and whatever copy was already there is unchanged: ${IMS_DRIVER_REASON:-no reason was recorded}" >&2
+    echo "WARNING: this install continues. Until a vouched-for driver stands there, the documented update command has nothing to run and updates have to be typed out of the checkout, which is the unprotected form." >&2
+  elif (( DRIVER_PUBLISH_RC != 0 )); then
     echo "FATAL: the root-owned deployment driver could not be published to ${IMS_DRIVER_PROGRAM_DIR}: ${IMS_DRIVER_REASON:-no reason was recorded}. The next privileged run would then have to be launched out of a tree the service account owns, which is what this publication exists to stop. Nothing has been changed." >&2
     exit 1
-  }
+  fi
 fi
 crontab_lock_paths "${DATA_DIR}"
 DB_OBJECT_ACCESS_SCRIPT="${APP_DIR}/scripts/check-app-db-object-access.mjs"

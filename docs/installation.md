@@ -1192,10 +1192,42 @@ operator had started a run they had reason to believe was clean. See
 *The bytes a privileged run executes* below for what is published where, who owns it and what is
 verified before anything is executed.
 
-`/etc/ims-cutover-driver/driver/` holds the release that was **last successfully deployed**, which is
-one release behind the one an update is installing: this run uses the previous driver to deploy the
-new code, and refreshes the copy at the end. That lag is deliberate — a driver that re-executed
-code it had fetched itself minutes earlier would be exactly the defect this arrangement closes.
+`/etc/ims-cutover-driver/driver/` holds the release that was **last successfully deployed and vouched
+for**, which is at most one release behind the one an update is installing: this run uses the previous
+driver to deploy the new code, and refreshes the copy at the end. That lag is deliberate — a driver
+that re-executed code it had fetched itself minutes earlier would be exactly the defect this
+arrangement closes.
+
+**And the end-of-update refresh only happens when something outside `imsapp`'s control vouched for the
+release.** `update.sh` deploys into `/opt/one-two-inventory`, which it chowns to `imsapp` itself, so by
+the time the refresh is reached the tree it would copy is one that account could have rewritten
+*after* every check the run performed — and what lands in `driver/` is what the **next** `sudo bash
+/etc/ims-cutover-driver/driver/update.sh` executes as root. Copying it unvouched would postpone a
+privilege escalation by one release rather than close it, so the run **refuses** and says so:
+
+```bash
+# Refresh the root-owned driver as part of the update, with the release's own digest.
+# The digest comes from the RELEASE (published with its checksums, or computed from a
+# clean checkout on another host) — never from the box being updated, where it is only
+# what the tree under question says about itself.
+IMS_DRIVER_SHA256=<64 hex> sudo -E bash /etc/ims-cutover-driver/driver/update.sh
+```
+
+The digest is taken over the tree that would be published — the three entrypoints and `lib/` — with:
+
+```bash
+d="$(mktemp -d)" && mkdir "${d}/lib" \
+  && cp scripts/install.sh scripts/update.sh scripts/deploy.sh "${d}/" \
+  && cp scripts/lib/* "${d}/lib/" \
+  && ( cd "${d}" && find . -type f -printf '%P\0' | LC_ALL=C sort -z | xargs -0 -r sha256sum -- | sha256sum ) \
+  ; rm -rf "${d}"
+```
+
+Without it the deployment still completes and the previous release's driver stands, which is a
+supported state: the warning at the end of the run names it and names this remedy. The other way to
+refresh it needs no digest at all — install the release tree somewhere only `root` can write, take
+group and other write off it, and run `install.sh` from there; then nobody else could have chosen
+those bytes and nothing has to vouch for them.
 
 Running `bash scripts/update.sh` from the checkout still works and is still supported for a host
 that has not been installed by a release carrying this change; it is the unprotected form, and the
@@ -3060,6 +3092,64 @@ to refresh is a **warning**, not a refusal: everything is up, the schema has mov
 nothing left for a refusal to protect — but the run names the copy that is standing, so it cannot
 pass in silence.
 
+**Only bytes something outside `imsapp`'s control vouched for may enter it** (o3d-z5be r2). This is
+the finding that produced the rule, and it is worth stating as the escalation it was: the refresh
+copied `APP_DIR/scripts` — an `imsapp`-owned tree — into `driver/` *after* the fetch, the build, the
+migration and the health check, with no external digest, and the next documented update executed those
+bytes as root. Root ownership of the destination and the one-release lag did not remove that; they
+postponed it by one release, and the publication was itself a late read of application-owned bytes,
+which is the one thing this whole arrangement forbids.
+
+So the publication asks what vouches, and the rule is the one this repository already reached for the
+fence artefact (o3d-2sm1.5 r33/r34) applied to the tree it had never been applied to:
+
+| the source | what vouches for the bytes | what happens |
+| --- | --- | --- |
+| owned by the publishing account (root), not writable by group or other, under a parent chain only root can rename — and the same objects after the copy as before it | the kernel: no unprivileged account could have written them | published |
+| anything else, with `IMS_DRIVER_SHA256=<64 hex>` on the privileged invocation | the operator, out of band: the assembled tree must hash to that value | published if it matches, refused if it does not |
+| anything else, with no digest | **nothing** | **nothing is published**; the copy standing there is untouched, the run warns and names both remedies |
+
+The ownership half is asked of the scripts directory, of `lib`, of the three entrypoints and of every
+file in `lib` — write permission on an existing file belongs to the file, not to its directory, so a
+mode `0664` file owned by `imsapp` inside a root-owned directory is one `imsapp` can rewrite — and of
+every directory from the source's parent up to `/`, because rename permission belongs to the
+containing directory. The source is then re-examined **after** the copy, device and inode included: a
+rename changes no path, no owner and no mode, only which object a path names, so asking "who can write
+this?" twice cannot see it.
+
+**What that means on the documented deployment, said plainly.** `APP_DIR` belongs to `imsapp`, so the
+end-of-update refresh publishes only when the operator supplies `IMS_DRIVER_SHA256`. There is no
+in-band mechanism that could close this and none is implied: every byte in that tree arrived through an
+account that owns it, and no digest computed *on this box* is evidence about it — that value can
+**confirm** a digest that came from the release and must never stand in for one. The out-of-band digest
+is the path, and the *Updating* section above documents it as the path, with the recipe an operator
+runs against the release to get it.
+
+**Why the run snapshot is not held to the same rule.** `helpers/` is executed by **this** run, whose
+bytes the operator accepted when they typed the command, which is why an optional
+`IMS_HELPER_SET_SHA256` is enough there: the snapshot's job is immutability-after-start. `driver/` is
+executed by runs whose operator has accepted nothing yet, so publishing unvouched bytes into it turns
+one operator's one-time decision into a standing arrangement in which root executes bytes `imsapp`
+chose. That asymmetry is the whole reason the two publications no longer take the same permission.
+
+**Every publication assembles in its own directory** (o3d-z5be r2). Each one used to stage at a single
+fixed name beside its target — `helpers.staged` — and remove whatever was there first. Two privileged
+runs can overlap (the shared cutover lock is taken later than the startup publication), so a second run
+could empty and refill the first run's staging tree in the window between the first run assembling it
+and the first run *hashing* it; the first then hashed, renamed and recorded the second run's bytes **as
+its own**, its in-memory digest matched them, and `privileged_helper_path` handed them out. Staging now
+happens inside a `mktemp -d` directory per publication, named for the kind and the publishing shell, so
+two overlapping runs share no object but the final name — where the rename is atomic and the run that
+did not perform the last publication is refused by the digest it holds, which is the behaviour this
+section claims. A directory left behind by a run that was killed mid-publication is swept by the next
+publication, and only when the pid in its name is no longer alive. The publication is deliberately
+**not** moved under the cutover lock: it exists so that nothing root executes after startup comes out of
+the checkout, and acquiring that lock is itself work a run does before it holds any lock — and
+`--dry-run`, `--print-fence-digest` and a fresh `install.sh` take it at different points or not at all,
+so a publication that were only safe while it was held would be unsafe in exactly the runs that do not
+hold it. Per-run staging makes the isolation structural instead; a lock would make it a property of
+scheduling.
+
 `deploy.sh` deliberately does **not** refresh it. It publishes the run snapshot like the other two,
 so its own late executions are covered, but it deploys whatever is already in `APP_DIR` rather than
 fetching a release — so it has no "release just deployed" to publish, and taking the driver from
@@ -3082,11 +3172,20 @@ this release — and it **announces** the fall back, naming the remedy. An unnot
 file this change exists to stop reading would be the same finding with a longer code path.
 
 **What this still does not protect against, stated rather than papered over.** It does not
-authenticate the checkout. An account that can write `APP_DIR/scripts` *before* a run starts can
-still choose what an operator launches from there, and on the documented command it can still choose
-what a future update deploys by rewriting the tree that `update.sh` will publish as the next driver.
-What is gone is the late window: the bytes root executes at minute twenty are the bytes that were on
-disk at minute zero, and only root can have touched them in between.
+authenticate the checkout. An account that can write `APP_DIR/scripts` *before* a run starts can still
+choose what an operator launches **from there** — `bash scripts/update.sh` out of the application
+directory is the unprotected form, it remains supported, and the run says so. What is gone is the late
+window: the bytes root executes at minute twenty are the bytes that were on disk at minute zero, and
+only root can have touched them in between.
+
+**And it no longer lets that account choose what a future update runs.** Until o3d-z5be r2 this
+paragraph conceded exactly that: the end-of-update refresh promoted the `imsapp`-owned tree into
+`driver/`, so rewriting the checkout chose the program the next privileged run executed as root. That
+is refused now — see the table above — and the residual that replaces it is a narrower and different
+statement: an operator who supplies `IMS_DRIVER_SHA256` is trusting the release they took the digest
+from, and an operator who publishes from a root-owned tree is trusting the tree they installed. Both
+are choices made outside this box by the person invoking `sudo`, which is where this repository has
+always put its trust root, and neither is a window `imsapp` can reach.
 
 ### An absent `.env` is not permission to mint (o3d-xf9m)
 

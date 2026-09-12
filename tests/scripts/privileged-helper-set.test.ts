@@ -770,6 +770,375 @@ test('[o3d-z5be] the documented update command is the root-owned driver', () => 
 })
 
 // ---------------------------------------------------------------------------
+// 3b. WHAT VOUCHES FOR THE BYTES THAT ENTER THE ROOT-OWNED DRIVER
+//     (o3d-z5be r2, Codex HIGH 1)
+//
+// THE FINDING. update.sh refreshed ${IMS_DRIVER_PROGRAM_DIR} at the END of a successful run
+// from ${APP_DIR}/scripts — a tree ${APP_USER} owns — so that account could replace
+// update.sh there after every fetch and build check and before the copy. Root then copied
+// those bytes into the root-owned driver with no external digest, and the next documented
+// `sudo bash ${IMS_DRIVER_PROGRAM_DIR}/update.sh` executed them AS ROOT. Root ownership and
+// the one-release lag postponed the escalation; they did not remove it.
+//
+// THE RULE NOW, and it is the one this repository already reached for the fence artefact: a
+// source only the publishing account can write vouches for itself; otherwise the operator
+// vouches out of band with IMS_DRIVER_SHA256; otherwise NOTHING is published and the copy
+// standing there is untouched. Every case below runs the shipped publication.
+// ---------------------------------------------------------------------------
+
+/** A scratch release tree — scripts/{install,update,deploy}.sh and scripts/lib — beside a scratch
+ *  publication root. Everything is created by this process, so "owned by the publishing account and
+ *  writable by nobody else" holds until a case below deliberately breaks it. */
+function scratchRelease(t: TestContext, prefix = 'privileged-driver-vouch-'): {
+  root: string; scripts: string; dirs: { root: string; src: string; work: string }
+} {
+  const base = createTempDirSync(prefix, t)
+  const root = join(base, 'root')
+  const scripts = join(base, 'scripts')
+  const work = join(base, 'work')
+  mkdirSync(root); mkdirSync(join(scripts, 'lib'), { recursive: true }); mkdirSync(work)
+  for (const name of ['install.sh', 'update.sh', 'deploy.sh']) writeFileSync(join(scripts, name), `# ${name}\n`)
+  writeFileSync(join(scripts, 'lib', 'chown-tree.mjs'), '// chown-tree.mjs\nprocess.exit(0)\n')
+  return { root, scripts, dirs: { root, src: join(scripts, 'lib'), work } }
+}
+
+/** Verbatim from docs/installation.md — asserted to be verbatim by the test below, so this constant
+ *  and the document cannot drift into two different recipes. */
+const DOCUMENTED_DRIVER_RECIPE = 'd="$(mktemp -d)" && mkdir "${d}/lib" \\\n'
+  + '  && cp scripts/install.sh scripts/update.sh scripts/deploy.sh "${d}/" \\\n'
+  + '  && cp scripts/lib/* "${d}/lib/" \\\n'
+  + '  && ( cd "${d}" && find . -type f -printf \'%P\\0\' | LC_ALL=C sort -z | xargs -0 -r sha256sum -- | sha256sum ) \\\n'
+  + '  ; rm -rf "${d}"'
+
+/** The digest the documented recipe produces for the tree a driver publication WOULD publish: the
+ *  three entrypoints and lib, and nothing else that happens to sit in scripts/. An operator who
+ *  cannot compute this cannot use IMS_DRIVER_SHA256, so it is computed here the way the document
+ *  says to and compared against what the shipped publication records. */
+function documentedDriverDigest(scripts: string): string {
+  const recipe = DOCUMENTED_DRIVER_RECIPE.replaceAll('scripts/', `${scripts}/`)
+  return execFileSync('bash', ['-c', recipe], { encoding: 'utf8' }).trim().split(' ')[0]
+}
+
+test('[o3d-z5be] a driver source an unprivileged account could rewrite publishes NOTHING, and the standing copy is untouched', (t) => {
+  // THE SHAPES ARE MODE-BASED, not owner-based, and the two are the same question: this harness
+  // cannot chown a file to another account, and "writable by somebody who is not the publisher" is
+  // what the gate asks. In production the publisher is root and ${APP_DIR}/scripts fails the OWNER
+  // half of exactly this check; here it fails the MODE half of exactly this check.
+  for (const shape of [
+    {
+      name: 'an entrypoint the group can write',
+      offender: (scripts: string) => join(scripts, 'update.sh'),
+      break_: (scripts: string) => chmodSync(join(scripts, 'update.sh'), 0o664),
+      mend: (scripts: string) => chmodSync(join(scripts, 'update.sh'), 0o644),
+    },
+    {
+      name: 'a library helper the world can write',
+      offender: (scripts: string) => join(scripts, 'lib', 'chown-tree.mjs'),
+      break_: (scripts: string) => chmodSync(join(scripts, 'lib', 'chown-tree.mjs'), 0o666),
+      mend: (scripts: string) => chmodSync(join(scripts, 'lib', 'chown-tree.mjs'), 0o644),
+    },
+    {
+      name: 'a scripts directory anybody can write',
+      offender: (scripts: string) => scripts,
+      break_: (scripts: string) => chmodSync(scripts, 0o777),
+      mend: (scripts: string) => chmodSync(scripts, 0o755),
+    },
+    {
+      name: 'a lib directory the group can write',
+      offender: (scripts: string) => join(scripts, 'lib'),
+      break_: (scripts: string) => chmodSync(join(scripts, 'lib'), 0o775),
+      mend: (scripts: string) => chmodSync(join(scripts, 'lib'), 0o755),
+    },
+  ]) {
+    const { root, scripts, dirs } = scratchRelease(t)
+
+    // PRECONDITION: the same source, unbroken, publishes. Without this the refusal below could be a
+    // rig that never reached the publication at all.
+    const control = run(dirs, [
+      `publish_privileged_driver ${JSON.stringify(scripts)}; echo "RC=$?"`,
+      'echo "DIGEST=${IMS_DRIVER_PUBLISHED_DIGEST}"',
+    ].join('\n'))
+    assert.match(control.stdout, /^RC=0$/m, `${shape.name}: ${control.stdout}${control.stderr}`)
+    const published = /^DIGEST=([0-9a-f]{64})$/m.exec(control.stdout)
+    assert.ok(published, `${shape.name}: ${control.stdout}${control.stderr}`)
+    const standing = readFileSync(join(root, 'driver', 'update.sh'), 'utf8')
+
+    // THE HAZARD. The bytes change too, because that is what an account with write access does —
+    // and it is the substitution that must not reach ${IMS_DRIVER_PROGRAM_DIR}.
+    shape.break_(scripts)
+    writeFileSync(join(scripts, 'update.sh'), '# update.sh\nexec /bin/sh\n')
+    const refused = run(dirs, `publish_privileged_driver ${JSON.stringify(scripts)}; echo "RC=$?"`)
+    assert.match(refused.stdout, /^RC=2$/m,
+      `${shape.name}: an unvouched source must be refused with status 2:\n${refused.stdout}${refused.stderr}`)
+    assert.match(refused.stderr, /NOTHING VOUCHES FOR THE BYTES/, `${shape.name}:\n${refused.stderr}`)
+    assert.ok(refused.stderr.includes(shape.offender(scripts)),
+      `${shape.name}: the refusal must NAME the path an operator has to act on; it said:\n${refused.stderr}`)
+    assert.match(refused.stderr, /IMS_DRIVER_SHA256=/, `${shape.name}: and the out-of-band way out`)
+    assert.match(refused.stderr, /install the release tree as root/, `${shape.name}: and the other one`)
+
+    // AND THE COPY STANDING THERE IS THE ONE THE CONTROL PUBLISHED, byte for byte.
+    assert.equal(readFileSync(join(root, 'driver', 'update.sh'), 'utf8'), standing,
+      `${shape.name}: a refused publication must replace nothing`)
+    assert.match(readFileSync(join(root, 'driver.sha256'), 'utf8'),
+      new RegExp(`^tree_sha256=${published[1]}$`, 'm'), `${shape.name}: nor the record`)
+    assert.deepEqual(readdirSync(root).filter((name) => name.startsWith('.publish-')), [],
+      `${shape.name}: and a refused publication leaves no staging directory behind`)
+
+    // NOT VACUOUS IN THE OTHER DIRECTION: mend the one thing this case broke — the hostile bytes are
+    // still there — and the same call publishes them, because the tree now vouches for itself.
+    shape.mend(scripts)
+    const mended = run(dirs, `publish_privileged_driver ${JSON.stringify(scripts)}; echo "RC=$?"`)
+    assert.match(mended.stdout, /^RC=0$/m,
+      `${shape.name}: mending the mode must be the whole difference:\n${mended.stdout}${mended.stderr}`)
+    assert.match(readFileSync(join(root, 'driver', 'update.sh'), 'utf8'), /exec \/bin\/sh/,
+      `${shape.name}: and it publishes what is there, which is why the gate is about who could write it`)
+  }
+})
+
+test('[o3d-z5be] IMS_DRIVER_SHA256 is what an operator vouches with, and it refuses the tree it does not describe', (t) => {
+  const { root, scripts, dirs } = scratchRelease(t)
+
+  // The digest of the tree AS THE RELEASE SHIPS IT, taken while the source still vouches for itself.
+  const control = run(dirs, [
+    `publish_privileged_driver ${JSON.stringify(scripts)} >/dev/null 2>&1; echo "RC=$?"`,
+    'echo "DIGEST=${IMS_DRIVER_PUBLISHED_DIGEST}"',
+  ].join('\n'))
+  const digest = /^DIGEST=([0-9a-f]{64})$/m.exec(control.stdout)
+  assert.ok(digest, `${control.stdout}${control.stderr}`)
+  assert.equal(documentedDriverDigest(scripts), digest[1],
+    'the documented recipe must reproduce the digest the shipped publication records, or no operator can use the pin')
+  rmSync(join(root, 'driver'), { recursive: true })
+  rmSync(join(root, 'driver.sha256'))
+  rmSync(join(root, 'driver.manifest'))
+
+  // NOW THE SOURCE IS ONE SOMEBODY ELSE CAN WRITE, and the content is unchanged — so the release's
+  // digest still describes it, and the operator's statement is what lets it through.
+  chmodSync(join(scripts, 'update.sh'), 0o664)
+  const unpinned = run(dirs, `publish_privileged_driver ${JSON.stringify(scripts)}; echo "RC=$?"`)
+  assert.match(unpinned.stdout, /^RC=2$/m, `${unpinned.stdout}${unpinned.stderr}`)
+  assert.equal(existsSync(join(root, 'driver')), false, 'nothing may be published without a voucher')
+
+  const pinned = run(dirs, [
+    `publish_privileged_driver ${JSON.stringify(scripts)}; echo "RC=$?"`,
+    'echo "DIGEST=${IMS_DRIVER_PUBLISHED_DIGEST}"',
+  ].join('\n'), { IMS_DRIVER_SHA256: digest[1] })
+  assert.match(pinned.stdout, /^RC=0$/m,
+    `the operator's digest must publish the tree it describes:\n${pinned.stdout}${pinned.stderr}`)
+  assert.match(pinned.stdout, new RegExp(`^DIGEST=${digest[1]}$`, 'm'), pinned.stdout)
+  assert.ok(existsSync(join(root, 'driver', 'update.sh')))
+
+  // AND A DIGEST THAT DESCRIBES SOMETHING ELSE REFUSES — naming IMS_DRIVER_SHA256 and not the
+  // helper set's variable, which is a different pin on a different tree.
+  writeFileSync(join(scripts, 'update.sh'), '# update.sh\nexec /bin/sh\n')
+  const wrong = run(dirs, `publish_privileged_driver ${JSON.stringify(scripts)}; echo "RC=$?"`,
+    { IMS_DRIVER_SHA256: digest[1] })
+  assert.match(wrong.stdout, /^RC=1$/m,
+    `a pin that does not match is a failure and not the "nothing vouched" answer:\n${wrong.stdout}${wrong.stderr}`)
+  assert.match(wrong.stderr, new RegExp(`IMS_DRIVER_SHA256 expects ${digest[1]} but the root-owned deployment driver`), wrong.stderr)
+  assert.doesNotMatch(wrong.stderr, /IMS_HELPER_SET_SHA256/, 'the refusal must name the variable the operator would set')
+  assert.doesNotMatch(readFileSync(join(root, 'driver', 'update.sh'), 'utf8'), /exec \/bin\/sh/,
+    'and the tree that was there is still there')
+})
+
+test('[o3d-z5be] the documented driver-digest recipe is the one in docs/installation.md, verbatim', () => {
+  const doc = readFileSync(join(REPO, 'docs/installation.md'), 'utf8')
+  assert.ok(doc.includes(DOCUMENTED_DRIVER_RECIPE),
+    `docs/installation.md must print the driver-digest recipe verbatim; looked for:\n${DOCUMENTED_DRIVER_RECIPE}`)
+  assert.ok(doc.includes('IMS_DRIVER_SHA256'),
+    'and it must document the variable the operator sets it on')
+})
+
+test('[o3d-z5be] a source renamed UNDER the copy is refused, though its trust answer was clean', (t) => {
+  // THE WINDOW THE TRUST WALK ALONE DOES NOT CLOSE. A rename changes no path, no owner and no mode —
+  // only which object a path names — so asking "who can write this?" twice cannot see it. The shipped
+  // filler takes the kernel's view of the source before the copy and again after it.
+  //
+  // THE SWAP IS DRIVEN THROUGH `cat`, which is the command the shipped filler copies WITH: a shell
+  // function shadows it for the whole program, so the source changes between the first entrypoint and
+  // the end of the copy without this harness reimplementing any part of the publication.
+  const { root, scripts, dirs } = scratchRelease(t, 'privileged-driver-ident-')
+  const swap = [
+    'swapped=0',
+    'cat() {',
+    '  command cat "$@"',
+    '  if (( swapped == 0 )); then',
+    '    swapped=1',
+    `    command mv ${JSON.stringify(join(scripts, 'lib'))} ${JSON.stringify(join(scripts, 'lib.moved'))}`,
+    `    command mkdir ${JSON.stringify(join(scripts, 'lib'))}`,
+    `    printf '// other bytes\\n' > ${JSON.stringify(join(scripts, 'lib', 'chown-tree.mjs'))}`,
+    '  fi',
+    '}',
+  ].join('\n')
+
+  const refused = run(dirs, [
+    swap,
+    `publish_privileged_driver ${JSON.stringify(scripts)}; echo "RC=$?"`,
+    'echo "SWAPPED=${swapped}"',
+  ].join('\n'))
+  assert.match(refused.stdout, /^SWAPPED=1$/m,
+    `the harness must actually have swapped the source:\n${refused.stdout}${refused.stderr}`)
+  assert.match(refused.stdout, /^RC=1$/m, `${refused.stdout}${refused.stderr}`)
+  assert.match(refused.stderr, /was not the same tree after the copy as before it/, refused.stderr)
+  assert.equal(existsSync(join(root, 'driver')), false, 'and nothing may be published')
+
+  // NOT VACUOUS: the same source, the same call, no swap.
+  rmSync(join(scripts, 'lib'), { recursive: true })
+  rmSync(join(scripts, 'lib.moved'), { recursive: true, force: true })
+  mkdirSync(join(scripts, 'lib'))
+  writeFileSync(join(scripts, 'lib', 'chown-tree.mjs'), '// chown-tree.mjs\n')
+  const ok = run(dirs, `publish_privileged_driver ${JSON.stringify(scripts)}; echo "RC=$?"`)
+  assert.match(ok.stdout, /^RC=0$/m, `${ok.stdout}${ok.stderr}`)
+})
+
+// ---------------------------------------------------------------------------
+// 3c. TWO OVERLAPPING RUNS SHARE NO STAGING TREE (o3d-z5be r2, Codex HIGH 2)
+// ---------------------------------------------------------------------------
+
+test('[o3d-kyqa] a concurrent publication cannot substitute its bytes into the tree THIS run is about to hash', (t) => {
+  // THE FINDING. Every publication of a kind used to assemble at ONE name — `${target}.staged` — and
+  // the publication happens before the shared cutover lock, so a second privileged run could empty
+  // and refill the first run's staging tree in the window between the first run assembling it and the
+  // first run HASHING it. The first then hashed, renamed and recorded the SECOND run's bytes as its
+  // own: its readonly digest matched them, privileged_helper_path() handed them out, and the
+  // substitution the design calls "a refusal in every run that did not perform it" was undetected.
+  //
+  // THE INTERLEAVING IS DRIVEN AT THE EXACT POINT THE WINDOW OPENED: `chmod -R u=rwX,go=rX` is the
+  // shipped statement between the fill and the digest, and shadowing that command puts the second run
+  // there without reimplementing anything. The assertion is about the BYTES that end up resolvable,
+  // which is what the whole mechanism is for.
+  const dirs = scratch(t)
+  const mine = readFileSync(join(dirs.src, 'chown-tree.mjs'), 'utf8')
+  const theirs = '// THE SECOND RUN\nprocess.exit(1)\n'
+  const shared = join(dirs.root, 'helpers.staged')
+
+  const out = run(dirs, [
+    'injected=0',
+    'chmod() {',
+    '  command chmod "$@"',
+    '  if [[ "$*" == *u=rwX* ]] && (( injected == 0 )); then',
+    '    injected=1',
+    `    echo "ROOT_DURING=$(command ls -A ${JSON.stringify(dirs.root)} | LC_ALL=C sort | tr '\\n' ' ')"`,
+    `    command rm -rf ${JSON.stringify(shared)}`,
+    `    command mkdir -p ${JSON.stringify(shared)}`,
+    `    printf ${JSON.stringify(theirs)} > ${JSON.stringify(join(shared, 'chown-tree.mjs'))}`,
+    '  fi',
+    '}',
+    'publish_privileged_helper_set; echo "PUBLISH_RC=$?"',
+    'echo "INJECTED=${injected}"',
+    'echo "DIGEST=${IMS_DRIVER_HELPER_SHA256}"',
+    'p="$(privileged_helper_path chown-tree.mjs)"; echo "RESOLVE_RC=$?"',
+    'echo "RESOLVED=${p}"',
+  ].join('\n'))
+
+  // PRECONDITIONS, so a pass cannot be a rig that never reached the window.
+  assert.match(out.stdout, /^INJECTED=1$/m,
+    `the second run must have run inside the window:\n${out.stdout}${out.stderr}`)
+  assert.match(out.stdout, /^PUBLISH_RC=0$/m, `${out.stdout}${out.stderr}`)
+  assert.match(out.stdout, /^RESOLVE_RC=0$/m, `${out.stdout}${out.stderr}`)
+
+  // THE STAGING TREE THIS RUN ASSEMBLED IN WAS ITS OWN, and it was not the shared name.
+  const during = /^ROOT_DURING=(.*)$/m.exec(out.stdout)
+  assert.ok(during, out.stdout)
+  const staging = during[1].trim().split(/\s+/).filter((name) => name.startsWith('.publish-'))
+  assert.equal(staging.length, 1, `the publication must assemble in exactly one private directory: ${during[1]}`)
+  assert.match(staging[0], /^\.publish-helpers\.[0-9]+\.[A-Za-z0-9]+$/,
+    `and its name must carry the kind and the publishing shell: ${staging[0]}`)
+  assert.ok(!during[1].split(/\s+/).includes('helpers.staged'),
+    `nothing may be assembled at a name a second run would use: ${during[1]}`)
+
+  // AND THE BYTES ROOT WOULD EXECUTE ARE THIS RUN'S. This is the assertion the shared name failed:
+  // the second run's tree is still sitting there, and it is not what was published or resolved.
+  const resolved = /^RESOLVED=(.+)$/m.exec(out.stdout)
+  assert.ok(resolved, out.stdout)
+  assert.equal(readFileSync(resolved[1], 'utf8'), mine,
+    'the resolution must hand back the bytes THIS run published, not the bytes a concurrent run staged')
+  assert.notEqual(readFileSync(resolved[1], 'utf8'), theirs)
+  assert.equal(readFileSync(join(shared, 'chown-tree.mjs'), 'utf8'), theirs,
+    'precondition: the second run really did write a different tree at the shared name')
+
+  // AND THE RECORDED DIGEST DESCRIBES THIS RUN'S SOURCE, measured with the documented recipe over the
+  // source directory — so "it published something" cannot pass for "it published the right thing".
+  const measured = execFileSync('bash', ['-c',
+    `cd ${JSON.stringify(dirs.src)} && find . -type f -printf '%P\\0' | LC_ALL=C sort -z | xargs -0 -r sha256sum -- | sha256sum`,
+  ], { encoding: 'utf8' }).split(' ')[0]
+  assert.match(out.stdout, new RegExp(`^DIGEST=${measured}$`, 'm'),
+    `the digest this run holds must describe its own source:\n${out.stdout}`)
+})
+
+test('[o3d-kyqa] a staging directory whose run is gone is swept, and a live one is left alone', (t) => {
+  // THE COST OF PER-RUN NAMES, PAID RATHER THAN LEFT: a run killed between the `mktemp` and the
+  // rename leaves a root-owned copy of an old release under /etc that nothing will ever finish
+  // publishing. The sweep takes those and only those, and "only those" is the half that has to be
+  // measured — a sweep that took a LIVE run's tree would be the substitution bug again.
+  const dirs = scratch(t)
+  const dead = join(dirs.root, '.publish-helpers.999999999.aaaaaa')
+  mkdirSync(dead); writeFileSync(join(dead, 'x'), 'x\n')
+
+  const out = run(dirs, [
+    // A directory named for THIS program's own shell, which is alive for as long as the publication
+    // runs — so if the sweep asked no question about liveness it would take this one too.
+    `live=${JSON.stringify(join(dirs.root, '.publish-helpers'))}.$$.bbbbbb`,
+    'command mkdir -p "${live}"',
+    'publish_privileged_helper_set; echo "PUBLISH_RC=$?"',
+    'echo "LIVE_KEPT=$( [[ -d "${live}" ]] && echo yes || echo no )"',
+    `echo "DEAD_SWEPT=$( [[ -d ${JSON.stringify(dead)} ]] && echo no || echo yes )"`,
+  ].join('\n'))
+
+  assert.match(out.stdout, /^PUBLISH_RC=0$/m, `${out.stdout}${out.stderr}`)
+  assert.match(out.stdout, /^DEAD_SWEPT=yes$/m,
+    `an orphan whose publisher is gone must be removed:\n${out.stdout}${out.stderr}`)
+  assert.match(out.stdout, /^LIVE_KEPT=yes$/m,
+    `and a directory whose publisher is alive must be left alone:\n${out.stdout}${out.stderr}`)
+  // The publication's own directory is gone too: nothing is left behind on the success path.
+  const leftovers = readdirSync(dirs.root).filter((name) => name.startsWith('.publish-') && !name.includes('bbbbbb'))
+  assert.deepEqual(leftovers, [], `a completed publication must leave no staging directory: ${leftovers.join(', ')}`)
+})
+
+test('[o3d-z5be] the three-valued status is the shipped contract, and both entrypoints read all three', () => {
+  const body = shellFunction(LIB_SOURCE, 'driver_fill_program', LIB_REL)
+
+  // THE ORDER IS THE CLAIM: the provenance question is asked, answered and acted on BEFORE any byte
+  // is copied. A gate after the copy would be a gate over bytes already in /etc.
+  const trust = body.indexOf('driver_source_trust "${scripts_dir}"')
+  const refuse = body.indexOf('return 2')
+  const copy = body.indexOf('cat < "${scripts_dir}/${name}"')
+  const identBefore = body.indexOf('before="$(driver_source_ident)"')
+  const identAfter = body.indexOf('after="$(driver_source_ident)"')
+  const positions: Array<[string, number]> = [
+    ['the trust question', trust], ['the refusal', refuse], ['the copy', copy],
+    ['the ident before', identBefore], ['the ident after', identAfter],
+  ]
+  for (const [what, at] of positions) {
+    assert.notEqual(at, -1, `${what} must be in driver_fill_program():\n${body}`)
+  }
+  assert.ok(trust < refuse && refuse < identBefore && identBefore < copy && copy < identAfter,
+    `the order must be trust, refuse, ident, copy, ident — got ${JSON.stringify({ trust, refuse, identBefore, copy, identAfter })}`)
+  assert.equal(body.split('return 2').length - 1, 1, 'there must be exactly one "nothing vouched" answer')
+
+  // AND THE LISTS THE `find` IS AIMED AT ARE THIS FRAME'S, so no other path can empty them and make
+  // the question vacuous — the lesson lib/db-fence-protected.sh records above its own path lists.
+  assert.match(body, /local -a _DRIVER_SRC_DIRS=\(\) _DRIVER_SRC_FILES=\(\) _DRIVER_SRC_TREES=\(\) _DRIVER_SRC_PARENTS=\(\)/,
+    `the path lists must be locals of the frame that consumes the answer:\n${body}`)
+  assert.match(body, /local IMS_DRIVER_SOURCE_UNTRUSTED_PATH=""/, `and so must the answer:\n${body}`)
+  const libCode = LIB_SOURCE.split('\n').filter((line) => !/^\s*#/.test(line))
+  assert.deepEqual(libCode.filter((line) => /^(_DRIVER_SRC_|IMS_DRIVER_SOURCE_UNTRUSTED_PATH=)/.test(line)), [],
+    'and neither may exist at script scope, where another path could pre-set it')
+
+  // BOTH ENTRYPOINTS DISTINGUISH 2 FROM EVERY OTHER FAILURE. Collapsing them would either abort a
+  // deployment over a driver refresh or report a publication that did not happen.
+  const install = codeLines(ENTRYPOINT_SOURCE.get('scripts/install.sh')!).map((l) => l.text).join('\n')
+  const update = codeLines(ENTRYPOINT_SOURCE.get('scripts/update.sh')!).map((l) => l.text).join('\n')
+  assert.match(install, /DRIVER_PUBLISH_RC=0\n\s*publish_privileged_driver "\$\(dirname "\$\{IMS_SCRIPT_LIB_DIR\}"\)" \|\| DRIVER_PUBLISH_RC=\$\?/,
+    'install.sh must capture the status rather than treating every non-zero the same')
+  assert.match(install, /if \(\( DRIVER_PUBLISH_RC == 2 \)\); then/, 'install.sh must warn on the vouch refusal')
+  assert.match(install, /elif \(\( DRIVER_PUBLISH_RC != 0 \)\); then/, 'and still refuse on every other failure')
+  assert.match(update, /DRIVER_PUBLISH_RC=0\n\s*publish_privileged_driver "\$\{APP_DIR\}\/scripts" \|\| DRIVER_PUBLISH_RC=\$\?/,
+    'update.sh must capture the status too')
+  assert.match(update, /if \(\( DRIVER_PUBLISH_RC == 2 \)\); then/, 'and say what would refresh the driver')
+  assert.match(update, /IMS_DRIVER_SHA256=/, 'naming the digest an operator supplies')
+})
+
+// ---------------------------------------------------------------------------
 // 4. AN ABSENT .env IS NOT PERMISSION TO MINT (o3d-xf9m)
 // ---------------------------------------------------------------------------
 

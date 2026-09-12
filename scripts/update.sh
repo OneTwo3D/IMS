@@ -5613,6 +5613,19 @@ FENCE_ARMED=false
 # would report failure for a deployment that succeeded. What it must not do is pass in silence, so
 # the warning says exactly which command the next update should be typed as.
 #
+# AND ON THE DOCUMENTED DEPLOYMENT THIS NORMALLY PUBLISHES NOTHING, WHICH IS THE FIX AND NOT A
+# REGRESSION (o3d-z5be r2, Codex HIGH). ${APP_DIR} belongs to ${APP_USER} — this script chowns it
+# there itself — so by the time this line is reached the tree below it is one that account could have
+# rewritten AFTER the fetch, the build, the migration and the health check: every check this run
+# performed is upstream of the copy. Promoting those bytes into the driver would hand the NEXT
+# `sudo bash ${IMS_DRIVER_PROGRAM_DIR}/update.sh` a program that account chose, which is the same
+# privilege escalation this whole change closes, one release later. publish_privileged_driver()
+# therefore returns 2 — nothing vouched for the source, nothing published — unless the operator
+# supplied IMS_DRIVER_SHA256 for the release being deployed, and the previous release's driver stands.
+# That is a supported state and the documented one; docs/installation.md's *Updating* section says how
+# to refresh it and where the digest comes from. The alternative would be to keep copying unvouched
+# bytes into /etc, and no in-band check can make those bytes evidence about anything.
+#
 # AND YES, ON THE DOCUMENTED PATH THIS REPLACES THE TREE THIS SCRIPT WAS LAUNCHED FROM. The
 # publication renames the old ${IMS_DRIVER_PROGRAM_DIR} aside and removes it, and this shell's own
 # file is inside it. That is safe and is safe for a reason rather than by luck: bash holds an open
@@ -5623,13 +5636,24 @@ FENCE_ARMED=false
 # goes through, and it was taken before this.
 CURRENT_STEP="publish-driver"
 if ! $DRY_RUN; then
-  if publish_privileged_driver "${APP_DIR}/scripts"; then
+  DRIVER_PUBLISH_RC=0
+  publish_privileged_driver "${APP_DIR}/scripts" || DRIVER_PUBLISH_RC=$?
+  if (( DRIVER_PUBLISH_RC == 0 )); then
     success "The root-owned deployment driver at ${IMS_DRIVER_PROGRAM_DIR} now holds this release (${IMS_DRIVER_PUBLISHED_DIGEST})."
   else
     warn "The root-owned deployment driver at ${IMS_DRIVER_PROGRAM_DIR} was NOT refreshed: ${IMS_DRIVER_REASON:-the reason is printed above}."
     warn "This deployment is complete and serving. The copy standing there is the previous release's,"
     warn "which is what the next update will run; that is supported, and running the next update out of"
     warn "${APP_DIR} instead is what this publication exists to avoid."
+    if (( DRIVER_PUBLISH_RC == 2 )); then
+      # THE EXPECTED OUTCOME ON THE DOCUMENTED DEPLOYMENT, NOT AN ERROR TO BE CHASED. ${APP_DIR} is
+      # owned by ${APP_USER}, so nothing here can vouch for what is in it; the run says what would.
+      warn "That is the ordinary outcome when the release was deployed into ${APP_DIR}, which ${APP_USER} owns:"
+      warn "nothing on this box can vouch for bytes that account could have replaced after this run's checks."
+      warn "To refresh it, re-run with IMS_DRIVER_SHA256=<the release's driver digest, taken from the release"
+      warn "and not from this box>, or run install.sh from a release tree only root can write. See the"
+      warn "*Updating* section of docs/installation.md."
+    fi
   fi
 fi
 
