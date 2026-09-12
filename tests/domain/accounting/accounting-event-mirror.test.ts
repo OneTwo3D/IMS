@@ -373,9 +373,13 @@ test('terminal sync failure updates mirrored refund reversal event to failed', a
 
   // NOTHING was posted, so the mirrored body is left exactly as it was queued — the rebuild is a
   // POSTED-only concern (o3d-m26g).
+  //
+  // o3d-11rf r2: and `voidBasis: null` travels with EVERY write that does not leave the row VOID.
+  // The column is a permission a later enqueue reads, so a row that is not retired must not carry
+  // one — the clearing is part of the write rather than a separate tidy-up that could be skipped.
   assert.deepEqual(updates, [{
     where: { idempotencyKey: 'accounting-sync:quickbooks:cogs_reversal:sales-order-refund:refund-1:cogs-reversal' },
-    data: { status: 'FAILED' },
+    data: { status: 'FAILED', voidBasis: null },
     select: { id: true },
   }])
   assert.deepEqual(logs, [{
