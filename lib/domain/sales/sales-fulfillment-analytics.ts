@@ -41,6 +41,7 @@ import {
   emptyCredits,
   mergeCredits,
   offRowCreditSummary,
+  refundLinesRaisedInPeriodWhere,
   unplacedCredit,
   unplacedCreditBound,
   unplacedCreditInterval,
@@ -1974,7 +1975,9 @@ export async function getMarginAnalyticsReport(filters: SalesAnalyticsFilters = 
   // against a dispatch from an earlier period consequently reduces this period's revenue, which is
   // the same thing a credit note does to a month's accounts.
   const marginRefundLines = await client.salesOrderRefundLine.findMany({
-    where: { refund: { refundedAt: { gte: window.dateFrom, lt: window.dateToExclusive } } },
+    // The shared period clause (`refund-credit-buckets.ts`), so this report and the COGS report cannot
+    // drift on which period a credit belongs to. o3d-rv4a r2 is what that drift looks like.
+    where: refundLinesRaisedInPeriodWhere(window.dateFrom, window.dateToExclusive),
     select: {
       productId: true,
       totalBase: true,
@@ -2210,7 +2213,8 @@ export async function getReturnsAnalyticsReport(filters: SalesAnalyticsFilters =
   const window = period(filters, generatedAt)
   const [refundLines, shippedMovements] = await Promise.all([
     client.salesOrderRefundLine.findMany({
-      where: { refund: { refundedAt: { gte: window.dateFrom, lt: window.dateToExclusive } } },
+      // Same shared period clause as Gross Margin and COGS: one rule, one expression.
+      where: refundLinesRaisedInPeriodWhere(window.dateFrom, window.dateToExclusive),
       select: {
         id: true,
         refundId: true,

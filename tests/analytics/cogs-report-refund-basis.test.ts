@@ -108,6 +108,15 @@ let COGS_ROWS: unknown[] = []
 let ORDERS: unknown[] = []
 let CREDIT_LINES: unknown[] = []
 let CREDIT_WHERE: Record<string, unknown> | null = null
+let PRODUCT_WHERE: Record<string, unknown> | null = null
+/**
+ * THE PRODUCTS THE REPORT'S OWN FILTER ADMITS — what `db.product.findMany({ where: productWhere })`
+ * answers. `FILTERS` carries `product: 'Widget'`, so the filter is ACTIVE in every test in this file
+ * and the report resolves this set on every run; the default admits every product the fixtures use,
+ * and the one test about a filtered-out sibling narrows it deliberately.
+ */
+const ALL_FIXTURE_PRODUCTS = ['p1', 'p2', 'p9', 'other']
+let FILTER_PRODUCT_IDS: string[] = [...ALL_FIXTURE_PRODUCTS]
 
 mock.module('@/lib/db', {
   namedExports: {
@@ -115,12 +124,27 @@ mock.module('@/lib/db', {
       cogsEntry: { findMany: async () => COGS_ROWS },
       salesOrder: { findMany: async () => ORDERS },
       salesOrderRefundLine: {
+        /**
+         * THE STAND-IN HONOURS THE `WHERE` IT IS GIVEN, because the defect under test is IN the where.
+         *
+         * A stub that returns its fixture whatever it is asked cannot fail when the query narrows —
+         * and the narrowing that dropped in-period credit against earlier-period orders (Codex round
+         * 2, HIGH 1) is exactly that kind of change. Postgres would have dropped those rows, so this
+         * drops them too: the row set a test observes is the row set the real query would return.
+         */
         findMany: async (args?: { where?: Record<string, unknown> }) => {
           CREDIT_WHERE = args?.where ?? null
-          return CREDIT_LINES
+          const scope = (args?.where as { refund?: { orderId?: { in?: string[] } } } | undefined)?.refund?.orderId?.in
+          if (!scope) return CREDIT_LINES
+          return (CREDIT_LINES as Array<{ refund: { orderId: string } }>).filter((line) => scope.includes(line.refund.orderId))
         },
       },
-      product: { findMany: async () => [] },
+      product: {
+        findMany: async (args?: { where?: Record<string, unknown> }) => {
+          PRODUCT_WHERE = args?.where ?? null
+          return FILTER_PRODUCT_IDS.map((id) => ({ id }))
+        },
+      },
     },
   },
 })
@@ -153,6 +177,7 @@ function workedExample(credit: unknown[], cost = '40') {
   COGS_ROWS = [cogsEntry({ id: 'c1', orderId: 'O1', productId: 'p1', qty: '1', cost, line: { id: 'L1', productId: 'p1', totalBase: '100' } })]
   ORDERS = [order('O1', [{ productId: 'p1', totalBase: '100' }])]
   CREDIT_LINES = credit
+  FILTER_PRODUCT_IDS = [...ALL_FIXTURE_PRODUCTS]
 }
 
 async function report() {
@@ -184,6 +209,20 @@ async function pageCells(): Promise<{ cell: (key: string) => string; cellOf: (ke
     summary: new Map(summary.map((item) => [item.label, item.value])),
     notices,
   }
+}
+
+/**
+ * THE NUMBER AS AN OPERATOR READS IT OFF THE SCREEN — currency symbol, thousands separators, percent
+ * sign and bound marker stripped, and nothing else touched.
+ *
+ * Tests about display rounding have to compare the PRINTED figure with the truth. Re-deriving the
+ * figure from the producer would test the producer twice and leave `Intl.NumberFormat` unexamined,
+ * which is precisely where Codex round 2 found the broken ≤.
+ */
+function printedNumber(text: string): Prisma.Decimal {
+  const cleaned = text.replace(/[\u00a3,%\s]/g, '').replace(/[\u2264\u2265?]/g, '')
+  assert.match(cleaned, /^-?\d+(\.\d+)?$/, `no number could be read out of ${JSON.stringify(text)}`)
+  return D(cleaned)
 }
 
 async function csvRows(): Promise<{ rows: Record<string, string>[]; header: string[]; metadata: Map<string, string> }> {
@@ -502,17 +541,269 @@ test('a line split across two warehouses shares its credit by the same qty propo
   assert.equal(totals.refundsNetBasis, '300.000000')
 })
 
-test('the credit window is the refund date, scoped to this report’s own orders (o3d-rv4a)', async () => {
-  // Two facts about the query, asserted because both are decisions: the period rule is the refund's
-  // own `refundedAt` (the same rule Gross Margin uses, so the two reports cannot answer one question
-  // two ways), and the scope is the orders behind THIS report's dispatches — an unrestricted load
-  // would fill the off-report totals with credit the operator's own filters excluded.
+// ---------------------------------------------------------------------------------------------
+// THE PERIOD AND THE SCOPE (Codex round 2, HIGH 1)
+//
+// Round 1 restricted the credit load to `sourceOrderIds` — the orders behind this window's
+// dispatches — and round 1's own test asserted that restriction as a decision. Codex round 2 tested
+// the decision instead of reading it, and it is wrong IN BOTH DIRECTIONS, which is why widening one
+// filter is not the fix:
+//
+//   - it DROPS credit it must load: an in-period credit against an earlier period's order, which
+//     Gross Margin loads and deducts, so COGS published exact revenue over a period with a credit
+//     note missing from it; and
+//   - it LOADS credit it must exclude: a credit for a sibling product the operator's own filter
+//     removed from every row, which landed in `outsideReport` and marked the filtered view bounded
+//     for a reason that is not about the view.
+//
+// The period rule is now Gross Margin's, to the byte — both reports build the same WHERE from one
+// shared helper — and the PRODUCT filter is applied to the credit lines separately, because the
+// period and the filter are two different questions and round 1 answered them with one clause.
+// ---------------------------------------------------------------------------------------------
+
+test('the credit window is the refund date, and nothing else narrows the query (o3d-rv4a, Codex r2 HIGH 1)', async () => {
+  // The period rule is the refund's own `refundedAt`, and it is now the ONLY clause: an order-id
+  // restriction here is the round-1 defect, so its absence is asserted universally rather than by
+  // listing the keys that happen to be present today.
   workedExample([creditAgainstLine('L1', 'O1', 'p1', '100', 'NET')])
   await report()
-  const refund = (CREDIT_WHERE as { refund: { orderId: { in: string[] }; refundedAt: { gte: Date; lt: Date } } }).refund
-  assert.deepEqual(refund.orderId.in, ['O1'])
-  assert.equal(refund.refundedAt.gte.toISOString(), '2026-06-01T00:00:00.000Z')
-  assert.equal(refund.refundedAt.lt.toISOString(), '2026-07-01T00:00:00.000Z')
+  const where = CREDIT_WHERE as { refund: { refundedAt: { gte: Date; lt: Date } } }
+  assert.deepEqual(Object.keys(where), ['refund'], 'the refund-line query carries the period clause and nothing else')
+  assert.deepEqual(Object.keys(where.refund), ['refundedAt'])
+  assert.equal(where.refund.refundedAt.gte.toISOString(), '2026-06-01T00:00:00.000Z')
+  assert.equal(where.refund.refundedAt.lt.toISOString(), '2026-07-01T00:00:00.000Z')
+})
+
+test('an in-period credit against an EARLIER period’s order is loaded, not dropped (Codex r2 HIGH 1)', async () => {
+  // Codex round 2, verbatim: "Restricting refunds to `sourceOrderIds` drops in-period credits against
+  // earlier-period orders, while Gross Margin loads every refund raised in the period. With a current
+  // dispatch of the same product, Gross Margin deducts that credit but COGS reports healthy, exact
+  // revenue and margin."
+  //
+  // The fixture is that sentence. June holds one dispatch of p1 on order O1 — 100 ex-VAT, 40 of cost.
+  // A 30 NET credit was RAISED IN JUNE against order O0, May's dispatch of the same product, for which
+  // this window holds no revenue row. Gross Margin's rows are products, so it puts that 30 on p1's row
+  // and publishes 70. This report keys credit by order and by sales line, so no row of THIS window
+  // owns O0's revenue and the 30 cannot be deducted anywhere — but it is real credit raised in the
+  // period, so what the report may NOT do is publish the period as exact. Round 1 never saw the row:
+  // the query asked only for O1.
+  workedExample([creditAgainstLine('L0', 'O0', 'p1', '30', 'NET')])
+  const { rows, totals } = await report()
+  assert.equal(rows[0]!.revenueBase, '100.000000', 'June’s own dispatch is not reduced by May’s credit')
+  assert.equal(rows[0]!.revenueBaseBound, 'exact', 'and no credit reached this row')
+  assert.equal(totals.refundsOutsideReportNetBasis, '30.000000', 'the credit is LOADED and published')
+  assert.equal(totals.revenueBaseBound, 'upper', 'so the period figures are bounded, not exact')
+  assert.equal(totals.grossMarginBaseBound, 'upper')
+})
+
+test('a filtered-out sibling product’s credit does not pollute the filtered totals (Codex r2 HIGH 1)', async () => {
+  // Codex round 2, verbatim: "Conversely, a refund for a filtered-out sibling product on an included
+  // order is loaded into `outsideReport`, polluting filtered totals and bounds."
+  //
+  // The operator's filter admits p1 and nothing else. Order O1 carries two lines: p1, dispatched and
+  // reported here, and sibling p2, which that filter removed from every row of this report. A 25 NET
+  // credit against p2's line is not credit against anything this view publishes. Loading it would put
+  // 25 in the off-report bucket and stamp the view `≤` for a reason that has nothing to do with the
+  // view — and a marker that shows up on every filtered view is a marker that stops being read.
+  FILTER_PRODUCT_IDS = ['p1']
+  COGS_ROWS = [cogsEntry({ id: 'c1', orderId: 'O1', productId: 'p1', qty: '1', cost: '40', line: { id: 'L1', productId: 'p1', totalBase: '100' } })]
+  ORDERS = [order('O1', [{ productId: 'p1', totalBase: '100' }, { productId: 'p2', totalBase: '80' }])]
+  CREDIT_LINES = [creditAgainstLine('L2', 'O1', 'p2', '25', 'NET')]
+  const { totals } = await report()
+  // The filter query actually ran, and it ran with the report's own product filter — asserted so a
+  // future edit cannot satisfy this test by resolving an empty scope that admits nothing.
+  assert.ok(PRODUCT_WHERE, 'the report never asked which products its filter admits')
+  assert.deepEqual(PRODUCT_WHERE, { OR: [{ sku: { contains: 'Widget', mode: 'insensitive' } }, { name: { contains: 'Widget', mode: 'insensitive' } }] })
+  assert.equal(totals.refundsOutsideReportNetBasis, '0.000000', 'p2 is outside the FILTER, not outside the report')
+  assert.equal(totals.refundsUnattributedNetBasis, '0.000000')
+  assert.equal(totals.refundsNetBasis, '0.000000')
+  assert.equal(totals.revenueBase, '100.000000')
+  assert.equal(totals.revenueBaseBound, 'exact', 'nothing this view publishes is missing a credit')
+  assert.equal(totals.grossMarginBaseBound, 'exact')
+})
+
+test('a credit naming NO product is kept under a product filter — fail closed (Codex r2 HIGH 1 control)', async () => {
+  // The exclusion above is allowed only because p2 is PROVABLY another product. A shipping or
+  // monetary-only credit line names no product at all, so it cannot be shown to be about something
+  // the filter removed — and on an order that contains the filtered product it is partly about it.
+  // The same fail-closed rule the basis buckets apply to an unstamped credit: what cannot be proved
+  // out is kept in, and it bounds the totals. Without this control, "exclude what does not match" is
+  // one edit away from excluding everything unkeyable and quietly restoring the exactness claim.
+  FILTER_PRODUCT_IDS = ['p1']
+  COGS_ROWS = [cogsEntry({ id: 'c1', orderId: 'O1', productId: 'p1', qty: '1', cost: '40', line: { id: 'L1', productId: 'p1', totalBase: '100' } })]
+  ORDERS = [order('O1', [{ productId: 'p1', totalBase: '100' }])]
+  CREDIT_LINES = [creditNamingNothing('O1', '7', 'GROSS')]
+  const { totals } = await report()
+  assert.equal(totals.refundsUnattributedGrossBasis, '7.000000', 'an unkeyable credit is never filtered away')
+  assert.equal(totals.revenueBaseBound, 'upper')
+})
+
+test('COGS and Gross Margin load the SAME period of credit, from the query each actually issues (Codex r2 HIGH 1)', async () => {
+  // Consistency with Gross Margin is the entire basis of this design, so where the two must agree it
+  // is PROVED, not documented. Both wheres are captured from the queries the two reports really run,
+  // over the same window, and compared whole. Re-adding an order-id restriction to either side — or
+  // moving one report's period anchor off `refundedAt` — turns this red; a comment claiming agreement
+  // could not.
+  workedExample([])
+  await report()
+  const cogsWhere = CREDIT_WHERE
+  assert.ok(cogsWhere, 'the COGS report issued no refund-line query')
+
+  let marginWhere: unknown = null
+  const empty = { findMany: async () => [] }
+  const marginClient = {
+    product: { findMany: async (args?: unknown) => ((args as { where: { id: { in: string[] } } }).where.id.in.map((id) => ({ id, type: 'SIMPLE', productComponents: [] }))) },
+    salesOrder: empty,
+    salesOrderRefund: empty,
+    salesOrderRefundLine: {
+      findMany: async (args?: { where?: unknown }) => {
+        marginWhere = args?.where ?? null
+        return []
+      },
+    },
+    cogsEntry: empty,
+    stockMovement: empty,
+    shipment: empty,
+    activityLog: empty,
+  }
+  const { getMarginAnalyticsReport } = await import('@/lib/domain/sales/sales-fulfillment-analytics')
+  await getMarginAnalyticsReport({ ...WINDOW }, {
+    client: marginClient,
+    now: () => new Date('2026-06-30T00:00:00.000Z'),
+  } as unknown as Parameters<typeof getMarginAnalyticsReport>[1])
+  assert.ok(marginWhere, 'the Gross Margin report issued no refund-line query')
+  assert.deepEqual(cogsWhere, marginWhere, 'the two reports must ask for one and the same period of credit')
+})
+
+// ---------------------------------------------------------------------------------------------
+// AN UPPER BOUND BELOW THE TRUTH IS NOT A BOUND (Codex round 2, HIGH 2 and HIGH 3)
+//
+// Both findings are one error: a bound was rounded and aggregated as if it were an ordinary number.
+// o3d-la3n settled the rule for figures that are summed — endpoints ADD, the verdict is derived LAST,
+// and rounding happens ONCE, at the end, IN THE DIRECTION THE RELATION ALLOWS. Round 1 of this branch
+// broke both halves: it reconstructed the period totals from the rows' six-decimal STRINGS while
+// taking the verdict from the unrounded interval, and then let `Intl.NumberFormat` round the result
+// to the NEAREST penny under a `≤`.
+// ---------------------------------------------------------------------------------------------
+
+test('the period total is summed UNROUNDED, so its upper bound is not below the truth (Codex r2 HIGH 2)', async () => {
+  // Codex round 2, verbatim: "A £1 line split across 300 groups with £0.0001 GROSS credit produces
+  // `0.999900 upper`, although at 20% VAT the true completed-basis total is `0.999916667`; the
+  // advertised upper bound is below the truth."
+  //
+  // That example, exactly. ONE sales line of 1.00 ex-VAT, dispatched a single unit from each of 300
+  // warehouses, grouped by warehouse. Revenue is allocated by quantity share, so every row's share is
+  // 1/300 = 0.003333333…, which the six-decimal money string rounds to 0.003333 — and 300 × 0.003333
+  // is 0.999900. Round 1 rebuilt the total by adding those 300 strings back up, so it published
+  // 0.999900 and took the ≤ from the unrounded credit interval.
+  //
+  // The 0.0001 credit is stamped GROSS, so it is not this figure's unit and nothing is subtracted. At
+  // 20% VAT its ex-VAT value is 0.0001 / 1.2 = 0.0000833333…, so the true completed-basis total is
+  // 1 - 0.0000833333… = 0.9999166666… — ABOVE the 0.999900 the report advertised as a ceiling.
+  const line = { id: 'L1', productId: 'p1', totalBase: '1' }
+  COGS_ROWS = Array.from({ length: 300 }, (_unused, index) => {
+    const entry = cogsEntry({ id: `c${index}`, orderId: 'O1', productId: 'p1', qty: '1', cost: '0', line })
+    return { ...entry, movement: { ...entry.movement, fromWarehouseId: `wh-${index}`, fromWarehouse: { id: `wh-${index}`, code: `W${index}`, name: `Warehouse ${index}` } } }
+  })
+  ORDERS = [order('O1', [{ productId: 'p1', totalBase: '1' }])]
+  CREDIT_LINES = [creditAgainstLine('L1', 'O1', 'p1', '0.0001', 'GROSS')]
+  FILTER_PRODUCT_IDS = [...ALL_FIXTURE_PRODUCTS]
+  const { getCogsReport } = await import('@/lib/domain/inventory/inventory-costing-reports')
+  const { rows, totals } = await getCogsReport({ ...FILTERS, groupBy: 'warehouse' }, { paginate: false })
+  assert.equal(rows.length, 300, 'the 300 groups the example needs')
+  assert.equal(totals.revenueBaseBound, 'upper', 'a ceiling is being claimed, so the claim has to hold')
+
+  // THE ASSERTION IS THE BOUND PROPERTY ITSELF, not a golden string: the published figure must be at
+  // or above the true completed-basis one. A golden string would go green again the moment someone
+  // rounded it back the wrong way by the same amount in both places.
+  const trueTotal = D('1').sub(D('0.0001').div(D('1.2')))
+  assert.equal(trueTotal.toFixed(9), '0.999916667', 'the reviewer\u2019s own figure for the truth')
+  assert.ok(
+    D(totals.revenueBase).gte(trueTotal),
+    `published upper bound ${totals.revenueBase} is BELOW the truth ${trueTotal.toFixed(12)}`,
+  )
+  assert.equal(totals.revenueBase, '1.000000')
+  // Margin is revenue less zero cost here, so the same claim rides on the same sum.
+  assert.ok(D(totals.grossMarginBase).gte(trueTotal), `published margin ceiling ${totals.grossMarginBase} is below the truth`)
+})
+
+test('a displayed upper bound rounds UP, so the printed figure is not below the truth (Codex r2 HIGH 3)', async () => {
+  // Codex round 2, verbatim: "`Intl.NumberFormat` rounds bounded money to nearest cents, and
+  // `grossMarginPct` has already been rounded to nearest hundredth before its marker is appended. For
+  // £100.004 revenue with £0.0001 GROSS credit and £40 COGS, the page prints `£100.00 ≤`, `£60.00 ≤`,
+  // and `60% ≤`, while the corresponding true values at 20% VAT can exceed all three displayed
+  // figures."
+  //
+  // That example, exactly. PUBLISHED: revenue 100.004 (the GROSS credit is not this figure's unit, so
+  // nothing comes off it), margin 100.004 - 40 = 60.004, and margin % = 100 × (1 - 40/100.004) =
+  // 60.0015999…%. TRUE, at 20% VAT, where the credit is worth 0.0001/1.2 = 0.0000833333… ex-VAT:
+  //   revenue  100.004   - 0.0000833333… = 100.0039166666…
+  //   margin    60.004   - 0.0000833333… =  60.0039166666…
+  //   margin %  100 × (1 - 40/100.0039166666…) = 60.0015666…%
+  // Rounded to the NEAREST penny and hundredth those print as 100.00, 60.00 and 60 — every one of them
+  // strictly BELOW the truth it carries a ≤ over. An upper bound has to round UP.
+  COGS_ROWS = [cogsEntry({ id: 'c1', orderId: 'O1', productId: 'p1', qty: '1', cost: '40', line: { id: 'L1', productId: 'p1', totalBase: '100.004' } })]
+  ORDERS = [order('O1', [{ productId: 'p1', totalBase: '100.004' }])]
+  CREDIT_LINES = [creditAgainstLine('L1', 'O1', 'p1', '0.0001', 'GROSS')]
+  FILTER_PRODUCT_IDS = [...ALL_FIXTURE_PRODUCTS]
+  const { rows } = await report()
+  assert.equal(rows[0]!.revenueBaseBound, 'upper')
+  assert.equal(rows[0]!.grossMarginBaseBound, 'upper')
+  assert.equal(rows[0]!.grossMarginPctBound, 'upper')
+
+  const netCredit = D('0.0001').div(D('1.2'))
+  const trueRevenue = D('100.004').sub(netCredit)
+  const trueMargin = trueRevenue.sub(D('40'))
+  const truePct = D('1').sub(D('40').div(trueRevenue)).mul(100)
+  assert.equal(trueRevenue.toFixed(7), '100.0039167')
+  assert.equal(trueMargin.toFixed(7), '60.0039167')
+  assert.equal(truePct.toFixed(7), '60.0015666')
+
+  const page = await pageCells()
+  // Every printed figure carries the relation, and every one of them must honour it. These read the
+  // NUMBER BACK OFF THE SCREEN, which is the only place the display rounding can be caught.
+  for (const [key, truth] of [['revenue', trueRevenue], ['margin', trueMargin], ['marginPct', truePct]] as const) {
+    const printed = page.cell(key)
+    assert.match(printed, / ≤$/, `${key} must still carry its relation`)
+    assert.ok(
+      printedNumber(printed).gte(truth),
+      `${key} prints ${printed}, which is BELOW the true ${truth.toFixed(9)} it claims to be at or above`,
+    )
+  }
+  assert.equal(page.cell('revenue'), '£100.01 ≤')
+  assert.equal(page.cell('margin'), '£60.01 ≤')
+  assert.equal(page.cell('marginPct'), '60.01% ≤')
+  // And the same claim in the footer and the summary card, which are the period figures.
+  assert.ok(printedNumber(page.footer('revenue')).gte(trueRevenue), `the footer prints ${page.footer('revenue')}`)
+  assert.ok(printedNumber(page.summary.get('Revenue (GBP, net of credit)') ?? '').gte(trueRevenue))
+})
+
+test('the CSV rounds a bounded column UP at its own precision too (Codex r2 HIGH 3)', async () => {
+  // "A CSV column that rounds a bound the wrong way is the same defect in a different skin." The file
+  // publishes six decimals rather than two, so the example has to bite at the SEVENTH: a line of
+  // 100.0000004 ex-VAT with a 0.0000001 GROSS credit.
+  //
+  // PUBLISHED revenue is 100.0000004. Rounded to the nearest six decimals that is 100.000000. TRUE, at
+  // 20% VAT: 100.0000004 - 0.0000001/1.2 = 100.0000004 - 0.0000000833… = 100.0000003166…, which is
+  // ABOVE 100.000000. Rounded UP the column reads 100.000001 and the ≤ in the column beside it holds.
+  COGS_ROWS = [cogsEntry({ id: 'c1', orderId: 'O1', productId: 'p1', qty: '1', cost: '40', line: { id: 'L1', productId: 'p1', totalBase: '100.0000004' } })]
+  ORDERS = [order('O1', [{ productId: 'p1', totalBase: '100.0000004' }])]
+  CREDIT_LINES = [creditAgainstLine('L1', 'O1', 'p1', '0.0000001', 'GROSS')]
+  FILTER_PRODUCT_IDS = [...ALL_FIXTURE_PRODUCTS]
+  const { rows } = await csvRows()
+  const row = rows[0]!
+  const trueRevenue = D('100.0000004').sub(D('0.0000001').div(D('1.2')))
+  assert.equal(trueRevenue.toFixed(10), '100.0000003167')
+  assert.equal(row.revenueBaseBound, 'upper', 'the file claims a ceiling in its own column')
+  assert.ok(
+    D(row.revenueBase!).gte(trueRevenue),
+    `the CSV publishes ${row.revenueBase} under a ≤ over a true ${trueRevenue.toFixed(10)}`,
+  )
+  assert.equal(row.revenueBase, '100.000001')
+  // The period total travels as metadata and carries the same relation, so it owes the same direction.
+  const { metadata } = await csvRows()
+  assert.equal(metadata.get('totals.revenueBaseBound'), 'upper')
+  assert.ok(D(metadata.get('totals.revenueBase')!).gte(trueRevenue), `the metadata total ${metadata.get('totals.revenueBase')} is below the truth`)
 })
 
 // ---------------------------------------------------------------------------------------------

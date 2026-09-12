@@ -16,8 +16,9 @@ import { assertSourceLimit, SourceScanTooLargeError } from '@/lib/security/sourc
 import { getAccountingSettings, getActiveAccountingConnectorInfo, syncAccountingAccountBalanceSnapshots } from '@/lib/accounting'
 import { cache } from 'react'
 import { REFUND_BASIS_NOTICE_COGS_MARGIN } from '@/lib/analytics/refund-figure-surfaces'
-import type { DerivedFigureBound } from '@/lib/domain/sales/derived-figure-bound'
+import type { BoundedFigureString, DerivedFigureBound } from '@/lib/domain/sales/derived-figure-bound'
 import {
+  boundedFigureString,
   marginFigureBoundDecimal,
   netLinearFigureBoundDecimal,
 } from '@/lib/domain/sales/refund-basis-analytics'
@@ -29,6 +30,7 @@ import {
   emptyCredits,
   mergeCredits,
   offRowCreditSummary,
+  refundLinesRaisedInPeriodWhere,
   scaleCredits,
   unabsorbedCreditInterval,
   unplacedCreditBound,
@@ -45,6 +47,7 @@ const SOURCE_SCAN_PAGE_SIZE = 1000
 const INVENTORY_TURNOVER_COGS_SOURCE_ROW_LIMIT = 100000
 const INVENTORY_TURNOVER_SNAPSHOT_SOURCE_ROW_LIMIT = 100000
 const COGS_REFUND_SOURCE_ROW_LIMIT = 100000
+const COGS_REFUND_PRODUCT_SCOPE_LIMIT = 100000
 const NEAR_ZERO_LANDED_GOODS_UNIT_COST_BASE = '0.01'
 const DATE_ONLY_RE = /^\d{4}-\d{2}-\d{2}$/
 
@@ -151,16 +154,16 @@ export type CogsReportRow = {
    * the null-not-zero discipline this report already had, now also covering the credit that
    * therefore had nothing to be subtracted from.
    */
-  revenueBase: string | null
+  revenueBase: BoundedFigureString | null
   /**
    * WHAT THE FIGURE BESIDE IT IS, not a decoration on it. `null` travels with a `null` amount: a
    * withheld figure bears no relation to anything, and `'exact'` there would read as a measurement.
    * See lib/domain/sales/derived-figure-bound.ts for what each verdict claims.
    */
   revenueBaseBound: DerivedFigureBound | null
-  grossMarginBase: string | null
+  grossMarginBase: BoundedFigureString | null
   grossMarginBaseBound: DerivedFigureBound | null
-  grossMarginPct: string | null
+  grossMarginPct: BoundedFigureString | null
   /**
    * Separate from the two linear bounds ON PURPOSE. Margin is a RATIO, so unsubtracted credit moves
    * the numerator and the denominator together and the direction is decided case by case — a row
@@ -185,9 +188,15 @@ export type CogsReport = {
   totals: {
     qty: string
     cogsBase: string
-    revenueBase: string
+    /**
+     * THE THREE FIGURES ON THIS REPORT THAT CARRY A RELATION ARE TYPED SO THEY CANNOT BE ROUNDED THE
+     * WRONG WAY (o3d-rv4a r2). `BoundedFigureString` is mintable only by `boundedFigureString`, which
+     * demands the bound and rounds toward it; `moneyString` returns a plain `string` and no longer
+     * typechecks here. Round 1 published these through ROUND_HALF_UP under a `≤`.
+     */
+    revenueBase: BoundedFigureString
     revenueBaseBound: DerivedFigureBound
-    grossMarginBase: string
+    grossMarginBase: BoundedFigureString
     grossMarginBaseBound: DerivedFigureBound
     refundsNetBasis: string
     refundsGrossBasis: string
@@ -499,6 +508,30 @@ function decimalString(value: DecimalInput, places = 4): string {
 
 function moneyString(value: DecimalInput): string {
   return roundQuantity(value, 6).toFixed(6)
+}
+
+/**
+ * `moneyString` FOR A FIGURE THAT CARRIES A RELATION — same six decimals, rounded toward the bound
+ * rather than to nearest (o3d-rv4a r2, Codex round 2 HIGH 3).
+ *
+ * The file this feeds publishes six decimals, so the defect bites at the seventh: a true revenue of
+ * 100.0000003167 under a `≤` printed as `100.000000` is a ceiling below the truth, in a CSV column,
+ * where the reader has no tooltip and no page to compare it against. A CSV column that rounds a bound
+ * the wrong way is the same defect as the page's, in a different skin.
+ */
+function boundedMoneyString(value: DecimalInput, bound: DerivedFigureBound): BoundedFigureString {
+  return boundedFigureString(value, bound, 6)
+}
+
+/**
+ * The margin RATIO, at the two decimals this report has always published it to, rounded toward its
+ * OWN bound — which is not always the bound on the amounts beside it (`marginFigureBoundDecimal`).
+ *
+ * `trailingZeros: false` keeps `decimalString`'s trimmed shape, so an exact 60% still reads `60` and
+ * not `60.00`. The trimming is cosmetic; the direction above it is not.
+ */
+function boundedPctString(value: DecimalInput, bound: DerivedFigureBound): BoundedFigureString {
+  return boundedFigureString(value, bound, 2, false)
 }
 
 function decimalZero(): Decimal {
@@ -848,11 +881,38 @@ export function aggregateCogsRows(inputs: CogsAggregationInput[], groupBy: CogsG
   return aggregateCogsReport(inputs, groupBy, credits).rows
 }
 
+/**
+ * THE PERIOD TOTALS, UNROUNDED — the only shape in which they can be summed soundly (o3d-rv4a r2,
+ * Codex round 2 HIGH 2).
+ *
+ * o3d-la3n (#678) settled this rule and round 1 of this branch broke it: endpoints ADD when figures
+ * are summed, and the verdict is derived LAST, from the unrounded interval. Round 1 derived the
+ * verdict from the unrounded interval and then rebuilt the AMOUNTS by parsing the rows' own
+ * six-decimal strings back into Decimals — so the `≤` was about one number and the figure beside it
+ * was another. Codex's counterexample: a £1 line split across 300 groups rounds to 0.003333 per row,
+ * whose 300 strings sum to 0.999900, while the true completed-basis total with £0.0001 of gross-basis
+ * credit is 0.999916667. The published ceiling sat BELOW the truth — which is not a loose bound, it is
+ * a false statement wearing a `≤`.
+ *
+ * So the aggregate travels as Decimal and is rounded exactly once, by the caller, toward its bound.
+ * A consequence worth stating because it looks like a defect and is not: the rows no longer add up to
+ * the total on screen. Each row is rounded toward its own ceiling and the total is rounded toward the
+ * total's, so a column of ceilings can exceed the ceiling of the sum. Both figures are sound bounds;
+ * the alternative — making them tally — is precisely the arithmetic that produced a false one.
+ */
+export type CogsUnroundedTotals = {
+  qty: Decimal
+  cogsBase: Decimal
+  revenueBase: Decimal
+  grossMarginBase: Decimal
+  revenueCapturedRows: number
+}
+
 export function aggregateCogsReport(
   inputs: CogsAggregationInput[],
   groupBy: CogsGroupBy,
   credits: CogsCreditInput = emptyCogsCreditInput(),
-): { rows: CogsReportRow[]; credits: CogsCreditSummary } {
+): { rows: CogsReportRow[]; credits: CogsCreditSummary; totals: CogsUnroundedTotals } {
   // A sales-order line (revenueKey = orderId:productId) can be fulfilled from
   // more than one group (e.g. split-warehouse dispatch produces two COGS
   // movements with the same revenueKey in different warehouse groups). Counting
@@ -909,6 +969,15 @@ export function aggregateCogsReport(
   // o3d-rv4a: the credit that reached a row, and the interval of credit nothing subtracted.
   const attributed = emptyCredits()
   const unaccounted: UnplacedCreditInterval[] = []
+  // The period totals, accumulated from the UNROUNDED group figures as each row is built — never
+  // reconstructed afterwards from the rows' published strings (Codex round 2 HIGH 2, above).
+  const totals: CogsUnroundedTotals = {
+    qty: decimalZero(),
+    cogsBase: decimalZero(),
+    revenueBase: decimalZero(),
+    grossMarginBase: decimalZero(),
+    revenueCapturedRows: 0,
+  }
   const rows = [...groups.entries()]
     .map(([key, group]) => {
       // Sum this group's qty-proportional share of each line's revenue. When a
@@ -959,6 +1028,16 @@ export function aggregateCogsReport(
       }
       const unplaced = unplacedCreditBound(unplacedCreditInterval(groupCredits, COGS_FIGURE_BASIS))
       const linearBound = netLinearFigureBoundDecimal({ basisComplete, unplacedCredit: unplaced })
+      const pctBound = grossMarginPct == null
+        ? null
+        : marginFigureBoundDecimal({ netRevenue: revenueBase!, cogs: group.cogsBase, unplacedCredit: unplaced, basisComplete })
+      totals.qty = totals.qty.add(group.qty)
+      totals.cogsBase = totals.cogsBase.add(group.cogsBase)
+      // A withheld figure contributes NOTHING, which is what its null has always meant to the totals —
+      // and the credit that reached it is carried in `unaccounted` above, so it bounds them instead.
+      if (revenueBase) totals.revenueBase = totals.revenueBase.add(revenueBase)
+      if (grossMarginBase) totals.grossMarginBase = totals.grossMarginBase.add(grossMarginBase)
+      if (group.revenueCaptured) totals.revenueCapturedRows += 1
       return {
         groupKey: key,
         groupLabel: cogsGroupLabel(group.first, groupBy),
@@ -971,14 +1050,13 @@ export function aggregateCogsReport(
         channel: groupBy === 'channel' ? group.first.channel : null,
         qty: decimalString(group.qty, 4),
         cogsBase: moneyString(group.cogsBase),
-        revenueBase: revenueBase ? moneyString(revenueBase) : null,
+        // Each figure is rendered toward ITS OWN bound, and the ratio's bound is not the amounts'.
+        revenueBase: revenueBase ? boundedMoneyString(revenueBase, linearBound) : null,
         revenueBaseBound: revenueBase ? linearBound : null,
-        grossMarginBase: grossMarginBase ? moneyString(grossMarginBase) : null,
+        grossMarginBase: grossMarginBase ? boundedMoneyString(grossMarginBase, linearBound) : null,
         grossMarginBaseBound: grossMarginBase ? linearBound : null,
-        grossMarginPct: grossMarginPct ? decimalString(grossMarginPct, 2) : null,
-        grossMarginPctBound: grossMarginPct
-          ? marginFigureBoundDecimal({ netRevenue: revenueBase!, cogs: group.cogsBase, unplacedCredit: unplaced, basisComplete })
-          : null,
+        grossMarginPct: grossMarginPct ? boundedPctString(grossMarginPct, pctBound!) : null,
+        grossMarginPctBound: pctBound,
         refundsNetBasis: moneyString(groupCredits.net),
         refundsGrossBasis: moneyString(groupCredits.gross),
         refundsUnknownBasis: moneyString(groupCredits.unknown),
@@ -1003,6 +1081,7 @@ export function aggregateCogsReport(
     .reduce(addUnplacedIntervals, { lower: decimalZero(), upper: decimalZero() })
   return {
     rows,
+    totals,
     credits: {
       attributed,
       unattributed: credits.unattributed,
@@ -1431,6 +1510,47 @@ export type CogsRefundLineInput = {
 }
 
 /**
+ * THE PRODUCTS THIS VIEW IS ABOUT — `null` when no product filter is set, so everything is in scope
+ * (o3d-rv4a r2, Codex round 2 HIGH 1).
+ *
+ * Round 1 tried to keep an operator's own filters out of the off-report credit buckets by narrowing
+ * the refund QUERY to the orders behind the window's dispatches, and that conflated two questions.
+ * The period is one question, answered identically for every basis-aware report by
+ * `refundLinesRaisedInPeriodWhere`. WHICH PRODUCTS the view covers is the other, and the order test
+ * could not answer it: a credit for a filtered-out sibling product sits on an INCLUDED order, so it
+ * passed and landed in `outsideReport`, stamping a filtered view `≤` for a reason that has nothing to
+ * do with the view. A marker that appears on every filtered view is a marker that stops being read.
+ *
+ * It is the set of product ids the filter ADMITS, resolved from `productWhere` — not the set of
+ * products with a row in this window, which is a different and much smaller set. The difference is
+ * load-bearing: a credit raised in this period against a product whose only dispatch was LAST period
+ * has no row here and must still be loaded, because it is real credit against this view's subject
+ * matter that this view's figures do not reflect. That is the other half of Codex's finding.
+ */
+export type CogsRefundProductScope = ReadonlySet<string> | null
+
+/**
+ * KEEP A CREDIT LINE UNLESS ITS PRODUCT IS PROVABLY ONE THE FILTER EXCLUDED — fail closed.
+ *
+ * The effective product is the SALES LINE's, falling back to the refund line's own, exactly as
+ * `resolveCogsRefundCreditKeys` and `resolveCogsRevenueKeys` resolve it: for a kit the two differ, and
+ * the sales line's is the one the reversed revenue was booked into.
+ *
+ * WHEN NO PRODUCT CAN BE RESOLVED THE LINE IS KEPT. A shipping or monetary-only credit line names no
+ * product, so it cannot be shown to be about something the filter removed — and on an order holding
+ * the filtered product it is partly about it. Only what is PROVABLY another product is dropped; what
+ * cannot be proved out stays in and bounds the totals as `unattributed`. The same fail-closed rule the
+ * basis buckets apply to a credit whose basis was never stamped, and the reason this is a named
+ * function with its own test rather than a condition inside a loop.
+ */
+export function cogsRefundLineInProductScope(line: CogsRefundLineInput, scope: CogsRefundProductScope): boolean {
+  if (scope == null) return true
+  const productId = line.salesOrderLine?.productId ?? line.productId
+  if (productId == null) return true
+  return scope.has(productId)
+}
+
+/**
  * PUT EACH REFUND LINE IN THE BUCKET THE REVENUE IT REVERSES IS IN — or say it reached no bucket.
  *
  * `reportKeys` is the set of keys `resolveCogsRevenueKeys` actually produced for rows that carry
@@ -1450,9 +1570,13 @@ export type CogsRefundLineInput = {
 export function resolveCogsRefundCreditKeys(
   lines: CogsRefundLineInput[],
   reportKeys: ReadonlySet<string>,
+  productScope: CogsRefundProductScope,
 ): CogsCreditInput {
   const result = emptyCogsCreditInput()
   for (const line of lines) {
+    // The report's own product filter, applied BEFORE attribution. A required parameter rather than an
+    // optional one: round 1's whole failure was a scope decision nobody had to state.
+    if (!cogsRefundLineInProductScope(line, productScope)) continue
     const lineKey = line.salesOrderLine ? `L:${line.salesOrderLine.id}` : null
     const productId = line.salesOrderLine?.productId ?? line.productId
     const orderId = line.salesOrderLine?.orderId ?? line.refund.orderId
@@ -1481,26 +1605,23 @@ type CogsRefundLineRow = {
 /**
  * The period's credit, on the SAME window boundary the report's COGS entries use.
  *
- * ANCHORED TO `refundedAt`, NOT TO THE DISPATCH DATE, and deliberately the same PERIOD rule Gross
- * Margin applies (o3d-kyey): a credit belongs to the period it was raised in, which is what a credit
- * note does to a month's accounts. A credit raised in this window against an earlier dispatch
- * therefore reduces this window's revenue; one raised later against a dispatch in this window is not
- * loaded, and this window's figures are the figures as they stood.
+ * ANCHORED TO `refundedAt`, NOT TO THE DISPATCH DATE, and the same PERIOD rule Gross Margin applies
+ * (o3d-kyey) — literally the same expression, `refundLinesRaisedInPeriodWhere`, because round 1 of
+ * o3d-rv4a claimed that agreement in a docstring and then broke it on the line below.
  *
- * THE SCOPE IS NARROWER THAN GROSS MARGIN'S, AND THE DIFFERENCE IS DELIBERATE. Gross Margin's rows
- * are products, so every credit raised in the period can reach one. This report's revenue keys are
- * per ORDER and per SALES LINE, so a credit against an order this report does not cover could never
- * reach a row whatever we did with it — loading it would only ever inflate the off-report buckets.
- * Worse, this report has product/warehouse/category/supplier filters, so an unrestricted load would
- * fill those buckets with credit the operator deliberately filtered out and mark every filtered view
- * bounded for that reason alone, which is how a bound marker becomes noise and stops being read.
- * What remains off-report is credit against THESE orders that no row of this report could place.
+ * EVERY REFUND RAISED IN THE PERIOD IS LOADED, and nothing else narrows this query. Round 1 added
+ * `orderId: { in: sourceOrderIds }` — the orders behind this window's dispatches — reasoning that a
+ * credit against any other order could never reach a row. It could not, and that is not the point: it
+ * is still credit raised in this period that this period's published revenue does not reflect, so what
+ * the report owes it is a BOUND, not silence. With that clause the report answered `exact` over a
+ * period holding a credit note it had never loaded, while Gross Margin deducted the same credit from
+ * the same product. The clause also failed at the job it was added for, since a credit for a
+ * filtered-out sibling product rides on an INCLUDED order; the product filter is applied separately,
+ * by `cogsRefundLineInProductScope`, where it can actually see the product.
  */
-async function loadCogsRefundLines(from: Date, toExclusive: Date, orderIds: string[]): Promise<CogsRefundLineRow[]> {
-  const ids = [...new Set(orderIds)]
-  if (ids.length === 0) return []
+async function loadCogsRefundLines(from: Date, toExclusive: Date): Promise<CogsRefundLineRow[]> {
   const rows = await db.salesOrderRefundLine.findMany({
-    where: { refund: { orderId: { in: ids }, refundedAt: { gte: from, lt: toExclusive } } },
+    where: refundLinesRaisedInPeriodWhere(from, toExclusive),
     select: {
       totalBase: true,
       productId: true,
@@ -1515,6 +1636,36 @@ async function loadCogsRefundLines(from: Date, toExclusive: Date, orderIds: stri
   // and a bound marker that says it is exact.
   assertSourceLimit(rows.length, COGS_REFUND_SOURCE_ROW_LIMIT, 'COGS report refund source rows')
   return rows
+}
+
+/**
+ * WHICH PRODUCTS THE REPORT'S OWN FILTER ADMITS, for scoping the period's credit to the view.
+ *
+ * Resolved from `productWhere(filters)` — the SAME predicate the COGS-entry query applies to its
+ * movements — so the credit and the cost are scoped by one expression and cannot disagree about what
+ * the operator asked for. `null` when no product filter is set, which is the common case and costs no
+ * query at all.
+ *
+ * IT IS NOT THE SET OF PRODUCTS WITH A ROW IN THIS WINDOW. A credit raised this period against a
+ * product last dispatched in an earlier one has no row here and must still be loaded; scoping to the
+ * rows would reinstate exactly the blindness Codex round 2 found. The `warehouseId` filter has no
+ * counterpart here because a credit line records no warehouse: a warehouse-filtered view can
+ * therefore carry off-report credit for a dispatch from another warehouse, which makes its bound
+ * WIDER than necessary. That is the safe direction — a loose bound is still a bound — and it is stated
+ * rather than silently narrowed, which is the mistake round 1 made.
+ */
+async function cogsRefundProductScope(filters: InventoryCostingFilters): Promise<CogsRefundProductScope> {
+  const where = productWhere(filters)
+  if (Object.keys(where).length === 0) return null
+  const rows = await db.product.findMany({
+    where,
+    select: { id: true },
+    take: COGS_REFUND_PRODUCT_SCOPE_LIMIT + 1,
+  })
+  // Refuse rather than truncate, for the reason the refund-line load does: a product silently missing
+  // from this set drops its credit, which is a revenue figure that is too high under an `exact`.
+  assertSourceLimit(rows.length, COGS_REFUND_PRODUCT_SCOPE_LIMIT, 'COGS report refund product scope rows')
+  return new Set(rows.map((row) => row.id))
 }
 
 export async function getCogsReport(filters: InventoryCostingFilters = {}, options: ReportOptions = {}): Promise<CogsReport> {
@@ -1627,9 +1778,13 @@ export async function getCogsReport(filters: InventoryCostingFilters = {}, optio
       revenueBase,
     }
   })
-  // o3d-rv4a: the credit against these very orders, keyed through the SAME revenue keys the rows are
-  // built from, so a credit lands in the bucket of the revenue it reverses.
-  const refundLines = await loadCogsRefundLines(from, toExclusive, sourceOrderIds)
+  // o3d-rv4a: the period's credit, keyed through the SAME revenue keys the rows are built from, so a
+  // credit lands in the bucket of the revenue it reverses. The PERIOD decides what is loaded and the
+  // report's own product filter decides what is in scope — two questions, two mechanisms (Codex r2).
+  const [refundLines, productScope] = await Promise.all([
+    loadCogsRefundLines(from, toExclusive),
+    cogsRefundProductScope(filters),
+  ])
   // ONLY the keys that actually carry revenue. A key whose revenue could not be resolved holds no
   // figure for a credit to reduce, so credit naming it belongs in the off-report buckets, not on a
   // row that would then publish a bounded number it never computed.
@@ -1638,18 +1793,12 @@ export async function getCogsReport(filters: InventoryCostingFilters = {}, optio
       .filter((resolved) => resolved.revenueKey != null && resolved.revenueBase != null)
       .map((resolved) => resolved.revenueKey!),
   )
-  const credits = resolveCogsRefundCreditKeys(refundLines, reportRevenueKeys)
-  const { rows: allRows, credits: creditSummary } = aggregateCogsReport(inputs, groupBy, credits)
-  const totals = allRows.reduce(
-    (sum, row) => ({
-      qty: sum.qty.add(toDecimal(row.qty)),
-      cogsBase: sum.cogsBase.add(toDecimal(row.cogsBase)),
-      revenueBase: sum.revenueBase.add(row.revenueBase == null ? 0 : row.revenueBase),
-      grossMarginBase: sum.grossMarginBase.add(row.grossMarginBase == null ? 0 : row.grossMarginBase),
-      revenueCapturedRows: sum.revenueCapturedRows + (row.revenueCaptured ? 1 : 0),
-    }),
-    { qty: decimalZero(), cogsBase: decimalZero(), revenueBase: decimalZero(), grossMarginBase: decimalZero(), revenueCapturedRows: 0 },
-  )
+  const credits = resolveCogsRefundCreditKeys(refundLines, reportRevenueKeys, productScope)
+  // THE TOTALS COME UP UNROUNDED (Codex round 2 HIGH 2). They used to be rebuilt here by parsing the
+  // rows' own six-decimal strings back into Decimals, so the amount was a sum of 300 roundings while
+  // the `≤` beside it was derived from the unrounded credit interval — and the advertised ceiling came
+  // out below the truth. o3d-la3n's rule, applied: sum unrounded, derive the verdict last, round once.
+  const { rows: allRows, credits: creditSummary, totals } = aggregateCogsReport(inputs, groupBy, credits)
   // The verdict is derived HERE, once, from the interval the rows carried up unrounded — not folded
   // from the rows' own verdicts and not rebuilt from their published (signed, rounded) credit
   // columns. That is o3d-la3n's whole finding: endpoints add, magnitudes matter, classify last.
@@ -1673,9 +1822,10 @@ export async function getCogsReport(filters: InventoryCostingFilters = {}, optio
     totals: {
       qty: decimalString(totals.qty, 4),
       cogsBase: moneyString(totals.cogsBase),
-      revenueBase: moneyString(totals.revenueBase),
+      // Rounded ONCE, here, toward the relation the verdict beside it claims.
+      revenueBase: boundedMoneyString(totals.revenueBase, totalsBound),
       revenueBaseBound: totalsBound,
-      grossMarginBase: moneyString(totals.grossMarginBase),
+      grossMarginBase: boundedMoneyString(totals.grossMarginBase, totalsBound),
       grossMarginBaseBound: totalsBound,
       refundsNetBasis: moneyString(reportCredits.net),
       refundsGrossBasis: moneyString(reportCredits.gross),

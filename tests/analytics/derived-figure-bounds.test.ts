@@ -2,7 +2,7 @@ import assert from 'node:assert/strict'
 import test from 'node:test'
 
 import { toDecimal } from '@/lib/domain/math/decimal'
-import { collapseUnplacedCreditDecimal, marginFigureBound, marginFigureBoundDecimal, netLinearFigureBound, netLinearFigureBoundDecimal, shareFigureBound, boundSuffix, unplacedCreditBoundFromParts, type CollapsedUnplacedCreditDecimal } from '@/lib/domain/sales/refund-basis-analytics'
+import { boundedFigureString, collapseUnplacedCreditDecimal, marginFigureBound, marginFigureBoundDecimal, netLinearFigureBound, netLinearFigureBoundDecimal, shareFigureBound, boundSuffix, unplacedCreditBoundFromParts, type CollapsedUnplacedCreditDecimal } from '@/lib/domain/sales/refund-basis-analytics'
 import {
   EXACT_LINEAR_FIGURE_BOUND,
   classifyLinearFigureBound,
@@ -422,4 +422,41 @@ test('a bounded amount rounds in the direction its relation allows (o3d-la3n r2)
   assert.equal(roundBoundedAmountForDisplay(0.29, 'upper'), 0.29)
   assert.equal(roundBoundedAmountForDisplay(-0.145, 'lower'), -0.15)
   assert.equal(roundBoundedAmountForDisplay(100, 'upper'), 100, 'an exact-cent figure is not nudged')
+})
+
+/**
+ * THE SAME RULE OVER DECIMAL, AT THE PRECISION A PRODUCER PUBLISHES (o3d-rv4a r2, Codex round 2).
+ *
+ * `roundBoundedAmountForDisplay` covers the client half at two decimal places. `boundedFigureString`
+ * is the producer half, and it is where the CEIL-versus-UP distinction actually bites: this report
+ * publishes NEGATIVE bounded figures routinely now (a fully credited line shows minus its own cost as
+ * margin), and `ROUND_UP` in decimal.js is away from zero, which moves a negative ceiling DOWN.
+ */
+test('a bounded figure string rounds toward its bound, including below zero (o3d-rv4a r2)', () => {
+  // Positive: a ceiling goes up, a floor goes down, an unrelated figure goes to nearest.
+  assert.equal(boundedFigureString('100.0000004', 'upper', 6), '100.000001')
+  assert.equal(boundedFigureString('100.0000004', 'lower', 6), '100.000000')
+  assert.equal(boundedFigureString('100.0000004', 'exact', 6), '100.000000')
+  assert.equal(boundedFigureString('100.0000006', 'indeterminate', 6), '100.000001')
+
+  // BELOW ZERO IS WHERE ROUND_UP AND ROUND_CEIL PART COMPANY, and only one of them is a bound.
+  // -40.0000004 is at most -40.000000 and is NOT at most -40.000001; ROUND_UP (away from zero) would
+  // publish the latter, which excludes the truth. ROUND_CEIL goes toward +infinity and is correct.
+  assert.equal(boundedFigureString('-40.0000004', 'upper', 6), '-40.000000', 'a negative ceiling rounds TOWARD ZERO')
+  assert.equal(boundedFigureString('-40.0000004', 'lower', 6), '-40.000001', 'a negative floor rounds AWAY from zero')
+  for (const [value, bound, compare] of [
+    ['100.0000004', 'upper', 'gte'],
+    ['-40.0000004', 'upper', 'gte'],
+    ['100.0000004', 'lower', 'lte'],
+    ['-40.0000004', 'lower', 'lte'],
+  ] as const) {
+    const published = toDecimal(boundedFigureString(value, bound, 6))
+    assert.ok(published[compare](toDecimal(value)), `${value} published as ${published.toString()} breaks its ${bound} bound`)
+  }
+
+  // The trimmed shape the ratio columns use, and the sign normalisation: a ceiling applied to a tiny
+  // negative leaves decimal.js holding -0, and "-0.000000" reads as a signed figure to an operator.
+  assert.equal(boundedFigureString('60.001', 'upper', 2, false), '60.01')
+  assert.equal(boundedFigureString('60', 'exact', 2, false), '60')
+  assert.equal(boundedFigureString('-0.0000001', 'upper', 6), '0.000000')
 })

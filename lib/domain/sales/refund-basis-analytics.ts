@@ -1,3 +1,4 @@
+import { Prisma } from '@/app/generated/prisma/client'
 import { toDecimal, type Decimal, type DecimalInput } from '@/lib/domain/math/decimal'
 
 /**
@@ -237,8 +238,8 @@ function round2(value: ReturnType<typeof toDecimal>): number {
  * - `indeterminate`— the true figure may be either side of the published one. Publishing `≤` here
  *                    would be a FALSE CLAIM, which is worse than publishing no claim at all.
  */
-export { boundSuffix, netLinearFigureBound, type CollapsedUnplacedCredit, type DerivedFigureBound } from '@/lib/domain/sales/derived-figure-bound'
-import { collapseUnplacedCredit, type CollapsedUnplacedCredit, type DerivedFigureBound } from '@/lib/domain/sales/derived-figure-bound'
+export { boundSuffix, netLinearFigureBound, type BoundedFigureString, type CollapsedUnplacedCredit, type DerivedFigureBound } from '@/lib/domain/sales/derived-figure-bound'
+import { collapseUnplacedCredit, type BoundedFigureString, type CollapsedUnplacedCredit, type DerivedFigureBound } from '@/lib/domain/sales/derived-figure-bound'
 
 
 /**
@@ -419,6 +420,50 @@ export function marginFigureBoundDecimal(params: {
  * IT IS REPORT-WIDE, NOT PER ROW. A row with no unplaced credit of its own is still bounded, because
  * its DENOMINATOR moved; classifying from the row's own flag would publish that row as exact.
  */
+/**
+ * RENDER A FIGURE THAT CARRIES A RELATION, ROUNDING IN THE ONLY DIRECTION THAT RELATION ALLOWS
+ * (o3d-rv4a r2, Codex round 2 HIGH 2 + HIGH 3). The one place a `BoundedFigureString` is minted.
+ *
+ * `roundBoundedAmountForDisplay` is the same rule over `number` at two decimal places, for the client
+ * components; this is it over Decimal at whatever precision the producer publishes. Both exist
+ * because the rounding happens TWICE on the way to a screen — the producer rounds to its six-decimal
+ * money string and the page rounds that to pennies — and a chain of roundings preserves a `≤` only if
+ * EVERY link does. Round 1 got neither link right: it published `moneyString` (ROUND_HALF_UP) under a
+ * ceiling, and then let `Intl.NumberFormat` round that to the nearest penny.
+ *
+ *   - `upper` (`≤`) → ROUND_CEIL. Toward +infinity, so the rendered figure is at or above the exact
+ *     one, which is at or above the truth. Deliberately NOT ROUND_UP: that is away from zero, which
+ *     rounds a NEGATIVE ceiling DOWNWARD and breaks exactly the figures this report newly produces
+ *     (a fully credited line reads -40 of margin).
+ *   - `lower` (`≥`) → ROUND_FLOOR, by the mirror argument, and not ROUND_DOWN for the mirror reason.
+ *   - `exact` / `indeterminate` → ROUND_HALF_UP, the repo's ordinary money rounding. Neither claims a
+ *     relation for a rounding to falsify.
+ *
+ * `trailingZeros` picks between the two shapes this repo's reports already publish: `moneyString`'s
+ * fixed six decimals and `decimalString`'s trimmed form. It is a rendering choice with no bearing on
+ * the direction, which is decided above it.
+ */
+export function boundedFigureString(
+  value: DecimalInput,
+  bound: DerivedFigureBound,
+  places: number,
+  trailingZeros = true,
+): BoundedFigureString {
+  const rounded = toDecimal(value).toDecimalPlaces(places, boundedRoundingMode(bound))
+  // A ceiling applied to a tiny negative leaves decimal.js holding -0, which renders as "-0.000000"
+  // and reads to an operator as a figure with a sign. Zero has no sign and no direction, so
+  // normalising it cannot weaken or strengthen any claim.
+  const signed = rounded.isZero() ? rounded.abs() : rounded
+  return (trailingZeros ? signed.toFixed(places) : signed.toString()) as BoundedFigureString
+}
+
+/** Return type inferred: `Decimal.Rounding` is not reachable as a namespace through `Prisma`. */
+function boundedRoundingMode(bound: DerivedFigureBound) {
+  if (bound === 'upper') return Prisma.Decimal.ROUND_CEIL
+  if (bound === 'lower') return Prisma.Decimal.ROUND_FLOOR
+  return Prisma.Decimal.ROUND_HALF_UP
+}
+
 export function shareFigureBound(params: { reportBasisComplete: boolean }): DerivedFigureBound {
   return params.reportBasisComplete ? 'exact' : 'indeterminate'
 }

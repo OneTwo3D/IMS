@@ -22,6 +22,35 @@ import {
  */
 
 /**
+ * WHICH PERIOD A CREDIT BELONGS TO — the one clause every basis-aware report builds its refund query
+ * from (o3d-rv4a r2, Codex round 2 HIGH 1).
+ *
+ * A credit belongs to the period it was RAISED in, by its own `refundedAt`, which is what a credit
+ * note does to a month's accounts: one raised now against an earlier dispatch reduces this period,
+ * and one raised later against a dispatch in this period is not loaded, so a closed period's figures
+ * stay the figures as they stood.
+ *
+ * IT IS A SHARED FUNCTION RATHER THAN A SHARED CONVENTION BECAUSE ROUND 1 PROVED THE CONVENTION DOES
+ * NOT HOLD. The COGS report claimed this rule in a docstring and then added `orderId: { in:
+ * sourceOrderIds }` beside it — narrowing the load to the orders behind the window's own dispatches.
+ * That looked like a tightening and was a defect in BOTH directions: it dropped in-period credit
+ * against earlier-period orders, which Gross Margin loads and deducts, so COGS published exact
+ * revenue over a period with a credit note missing from it; and it was no help at all against the
+ * thing it was reaching for, since credit for a FILTERED-OUT sibling product on an included order
+ * passed the order test and landed in the off-report bucket, marking a filtered view bounded for a
+ * reason that was not about the view.
+ *
+ * The lesson is that the PERIOD and the report's own FILTERS are two different questions and one
+ * clause cannot answer both. This function answers only the first, identically for every caller;
+ * a report that must also apply its filters does that separately and visibly.
+ */
+export type RefundPeriodWhere = { refund: { refundedAt: { gte: Date; lt: Date } } }
+
+export function refundLinesRaisedInPeriodWhere(from: Date, toExclusive: Date): RefundPeriodWhere {
+  return { refund: { refundedAt: { gte: from, lt: toExclusive } } }
+}
+
+/**
  * o3d-kyey: WHAT A PERIOD'S CREDIT IS, SPLIT BY THE BASIS IT WAS RECORDED ON.
  *
  * Every one of these three reports subtracts credit from a revenue figure, and each figure is on a

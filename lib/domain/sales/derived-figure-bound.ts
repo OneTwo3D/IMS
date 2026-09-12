@@ -243,6 +243,37 @@ export function roundBoundedAmountForDisplay(amount: number, bound: DerivedFigur
   return Math.round(cents) / 100
 }
 
+declare const BOUNDED_FIGURE_STRING: unique symbol
+
+/**
+ * A PUBLISHED FIGURE THAT CARRIES A RELATION, RENDERED AT A PRECISION THAT CANNOT BREAK IT
+ * (o3d-rv4a r2, Codex round 2 HIGH 2 + HIGH 3).
+ *
+ * THE BRAND IS HERE BECAUSE ALL THREE OF ROUND 1'S FINDINGS WERE ONE MISTAKE: a bound was handled as
+ * an ordinary number — filtered like one, summed like one, and rounded like one. Comments asking for
+ * care did not stop it; two of the three sites had a comment about bounds directly above the line
+ * that broke one. So the DIRECTION is made a precondition of producing the string at all:
+ *
+ *   - `moneyString(value)` and `decimalString(value, places)` return a plain `string`, which is NOT
+ *     assignable to this type. A row field or totals field declared `BoundedFigureString` therefore
+ *     cannot be filled by a rounder that was never told which way to go — that is a type error, not
+ *     a review note.
+ *   - The one way to obtain one is `boundedFigureString` (`refund-basis-analytics.ts`), which takes
+ *     the figure's `DerivedFigureBound` as a required argument and rounds toward +infinity for an
+ *     `upper`, toward -infinity for a `lower`, and to nearest only for the two verdicts that claim no
+ *     relation at all.
+ *
+ * Exactly the mechanism `CollapsedUnplacedCredit` below uses against a different unsound expression,
+ * and for the same stated reason: what must not be written should not typecheck.
+ *
+ * A `≤` over a figure rounded to NEAREST is not a weaker claim, it is a false one. £100.004 of
+ * revenue against £0.0001 of gross-basis credit is truly at most £100.0039167 at 20% VAT, and
+ * "≤ £100.00" excludes the truth. Half a penny of politeness inverts the relation.
+ *
+ * Type-only: at runtime this is the string it says it is.
+ */
+export type BoundedFigureString = string & { readonly [BOUNDED_FIGURE_STRING]: 'rounded-toward-its-bound' }
+
 // ---------------------------------------------------------------------------
 // The collapsed-scalar entry point, for the producers not yet migrated
 // ---------------------------------------------------------------------------
