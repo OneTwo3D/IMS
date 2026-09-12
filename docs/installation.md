@@ -1178,8 +1178,10 @@ above is the single enforcement point.
 To update to a newer version:
 
 ```bash
-# The root-owned copy of the driver, published by install.sh and refreshed by every
-# successful update. This is the documented command (o3d-z5be).
+# The root-owned copy of the driver, published by install.sh. An update refreshes it
+# only when something outside imsapp's control vouched for the release, so it can be
+# many releases older than the code it is deploying — see below. This is the
+# documented command (o3d-z5be).
 sudo bash /etc/ims-cutover-driver/driver/update.sh
 ```
 
@@ -1192,11 +1194,24 @@ operator had started a run they had reason to believe was clean. See
 *The bytes a privileged run executes* below for what is published where, who owns it and what is
 verified before anything is executed.
 
-`/etc/ims-cutover-driver/driver/` holds the release that was **last successfully deployed and vouched
-for**, which is at most one release behind the one an update is installing: this run uses the previous
-driver to deploy the new code, and refreshes the copy at the end. That lag is deliberate — a driver
-that re-executed code it had fetched itself minutes earlier would be exactly the defect this
-arrangement closes.
+`/etc/ims-cutover-driver/driver/` holds the release that was **last vouched for**, which is *at least*
+one release behind the one an update is installing — and the lag is **not bounded at one**. An update
+uses the standing driver to deploy the new code and refreshes the copy at the end only when something
+outside `imsapp`'s control vouched for that release (next paragraph). On the documented deployment that
+means the operator supplied `IMS_DRIVER_SHA256`; **an update run without it completes normally and
+refreshes nothing**, so ten such updates leave the driver ten releases behind and the eleventh is run
+by deployment logic from before any of them. That is a supported state, but it is a state to know you
+are in: each run that declines to refresh prints how old the standing copy is and what it hashes to.
+The one-release minimum is deliberate — a driver that re-executed code it had fetched itself minutes
+earlier would be exactly the defect this arrangement closes. The unbounded part is a consequence of
+refusing to promote bytes nothing vouched for, and the remedy is the digest below, not a shorter lag.
+
+To see what is standing before deciding, read its record — which lives beside the tree the pointer
+names, so this always reports the copy that is actually in use:
+
+```bash
+cat /etc/ims-cutover-driver/driver/../driver.sha256
+```
 
 **And the end-of-update refresh only happens when something outside `imsapp`'s control vouched for the
 release.** `update.sh` deploys into `/opt/one-two-inventory`, which it chowns to `imsapp` itself, so by
@@ -1223,8 +1238,10 @@ d="$(mktemp -d)" && mkdir "${d}/lib" \
   ; rm -rf "${d}"
 ```
 
-Without it the deployment still completes and the previous release's driver stands, which is a
-supported state: the warning at the end of the run names it and names this remedy. The other way to
+Without it the deployment still completes and the driver that last vouched for itself goes on standing —
+the previous release only if that release was vouched for, and otherwise something older. That is a
+supported state: the warning at the end of the run names it, says how old the standing copy is, and
+names this remedy. The other way to
 refresh it needs no digest at all — install the release tree somewhere only `root` can write, take
 group and other write off it, and run `install.sh` from there; then nobody else could have chosen
 those bytes and nothing has to vouch for them.
@@ -3004,14 +3021,38 @@ and a drain, out of a directory the run has itself handed to the service account
 
 ```
 /etc/ims-cutover-driver/              root:root 0755   created and owned by root only
-├── helpers/                          root:root 0755   THIS RUN's copy of scripts/lib
-├── helper-set.sha256                 root:root 0644   its whole-tree digest, recipe and sentinel
-├── helper-set.manifest               root:root 0644   per-file digests, for naming what moved
-├── driver/                           root:root 0755   install.sh, update.sh, deploy.sh, lib/
-│   └── lib/                          root:root 0755
-├── driver.sha256  driver.manifest    root:root 0644
+├── helpers -> .version-helpers.<pid>.<rand>/helpers    THIS RUN's copy of scripts/lib
+├── driver  -> .version-driver.<pid>.<rand>/driver      install.sh, update.sh, deploy.sh, lib/
+├── .version-helpers.<pid>.<rand>/    root:root 0755   one publication, complete and immutable
+│   ├── helpers/                      root:root 0755     the tree the pointer names
+│   ├── helper-set.sha256             root:root 0644     its whole-tree digest, recipe, date, sentinel
+│   └── helper-set.manifest           root:root 0644     per-file digests, for naming what moved
+├── .version-driver.<pid>.<rand>/     root:root 0755   likewise, with driver.sha256 / driver.manifest
 └── deploy-meta                       root:root 0600   GIT_REPO_URL, GIT_BRANCH, deploy-key flag
 ```
+
+**`helpers` and `driver` are symbolic links, and that is what makes a publication atomic.** Each is the
+single mutable object of its publication: a run assembles a whole new `.version-…` directory — the tree,
+its digest record and its manifest together — and then replaces one link with a single `rename(2)`. At
+every instant, from every other process, the documented name resolves to exactly one **complete**,
+sealed, digested, vouched-for publication; there is no interval in which it resolves to nothing, to half
+a tree, or to two trees at once, and no lock is involved. The record lives *beside* the tree rather than
+inside it (a record inside the tree would be part of its own digest) and *inside* the versioned directory
+rather than at a fixed path (a record at a fixed path would be a second mutable object, and two objects
+cannot be updated together without a lock). `/etc/ims-cutover-driver/driver/../driver.sha256` is
+therefore always the record of the driver that is standing: the kernel resolves `..` from the directory
+the link landed in.
+
+Superseded `.version-…` directories are left standing and removed by a later run's sweep, once no
+pointer names them and the shell that published them is gone — so a run already executing out of one
+keeps its bytes. The same sweep collects `.publish-…` staging trees abandoned by a killed run.
+
+What this replaced, and why: until o3d-z5be r3 a publication moved the standing tree aside and then
+renamed its own into place. Between those two steps the documented name did not exist, so a second
+privileged run could take it — and `mv src dst` where `dst` is an existing **directory** moves `src`
+*inside* `dst` and reports success, so the loser left its tree nested at `driver/staged`, recorded its
+own digest, and announced a publication while `sudo bash /etc/ims-cutover-driver/driver/update.sh` ran
+the winner's files. A rename over a symbolic link cannot nest and cannot half-happen.
 
 Inside `helpers/` and `driver/` every file is mode `0644` and every directory `0755`, and everything
 in the whole root is owned by `root` — `imsapp` can read it and change none of it. `deploy-meta` is
@@ -3043,8 +3084,12 @@ recipe the fence artefact uses, and the digest is recorded twice: on disk beside
 the running shell as a `readonly` variable**.
 
 `privileged_helper_path <name>` is the only way anything names a helper it is about to execute. It
-re-checks the seal, re-takes the whole-tree digest, and compares it against the value *this run*
-published before it hands back a path. The in-memory copy is what a second on-disk record could not
+resolves the `helpers` pointer — validating the link text rather than merely following it, so it can
+only ever name one versioned publication directory beneath the root whose ownership has been
+established — re-checks the seal, re-takes the whole-tree digest, and compares it against the value
+*this run* published before it hands back a path. What it hands back is the resolved path, so the bytes
+`node` opens are the bytes that were just sealed and digested even if another privileged run flips the
+pointer in the interval. The in-memory copy is what a second on-disk record could not
 do: two privileged runs can overlap (the shared cutover lock is taken later than this), so without
 it a run could verify a tree another run had just published and execute its bytes. With it, a
 republication by anybody is a refusal in every run that did not perform it, and `readonly` means

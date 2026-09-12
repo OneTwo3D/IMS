@@ -5603,10 +5603,15 @@ FENCE_ARMED=false
 # this run can say it serves: ${NEW_BUILD_SERVING} was false until the build on disk was shown to be
 # the process answering the port.
 #
-# SO THE DRIVER IS ALWAYS ONE RELEASE BEHIND WHAT IT DEPLOYS, deliberately and documented in
-# docs/installation.md. This run used the previous release's driver to install this one; the next run
-# uses this one. That is the price of not letting a privileged run re-exec bytes it fetched itself a
-# few minutes earlier, which is the defect this whole change is about.
+# SO THE DRIVER IS AT LEAST ONE RELEASE BEHIND WHAT IT DEPLOYS, AND THE LAG IS NOT BOUNDED AT ONE
+# (o3d-z5be r3, Codex MEDIUM 2). This run used the standing driver to install this release, and the
+# refresh below is what would make the next run use this one — but the refresh only happens when
+# something outside ${APP_USER}'s control vouched for the release, which on the documented deployment
+# means the operator supplied ${IMS_DRIVER_SHA256}. An operator who never supplies it gets a correct,
+# complete update every time and a driver that is refreshed NEVER: after seven such updates the program
+# root runs the eighth one with is seven releases old. That is a supported state and this file used to
+# call it "one release behind", which concealed it. The warning path below therefore prints the standing
+# driver's age, because the only thing worse than an old driver is an old driver nobody can see.
 #
 # AND A FAILURE HERE IS A WARNING, NOT A REFUSAL. Everything is up, the schema has moved and the
 # point of no return is behind us; there is nothing left that a `die` would protect, and the run
@@ -5621,19 +5626,21 @@ FENCE_ARMED=false
 # `sudo bash ${IMS_DRIVER_PROGRAM_DIR}/update.sh` a program that account chose, which is the same
 # privilege escalation this whole change closes, one release later. publish_privileged_driver()
 # therefore returns 2 — nothing vouched for the source, nothing published — unless the operator
-# supplied IMS_DRIVER_SHA256 for the release being deployed, and the previous release's driver stands.
+# supplied IMS_DRIVER_SHA256 for the release being deployed, and whatever driver last vouched for itself
+# goes on standing; that is the previous release only if the previous release was vouched for.
 # That is a supported state and the documented one; docs/installation.md's *Updating* section says how
 # to refresh it and where the digest comes from. The alternative would be to keep copying unvouched
 # bytes into /etc, and no in-band check can make those bytes evidence about anything.
 #
-# AND YES, ON THE DOCUMENTED PATH THIS REPLACES THE TREE THIS SCRIPT WAS LAUNCHED FROM. The
-# publication renames the old ${IMS_DRIVER_PROGRAM_DIR} aside and removes it, and this shell's own
-# file is inside it. That is safe and is safe for a reason rather than by luck: bash holds an open
-# descriptor on the script it is executing, and an unlinked inode stays alive until its last
-# descriptor closes — so this run goes on reading the bytes it started with, which is the same
-# property the whole change rests on. The five libraries were read in full at startup. NOTHING BELOW
-# THIS LINE READS ${IMS_SCRIPT_LIB_DIR} AGAIN; the startup snapshot is what every later resolution
-# goes through, and it was taken before this.
+# AND YES, ON THE DOCUMENTED PATH THIS REPLACES THE TREE THIS SCRIPT WAS LAUNCHED FROM — by moving the
+# name, not the bytes (o3d-z5be r3). ${IMS_DRIVER_PROGRAM_DIR} is a symbolic link, and a publication
+# flips it to a new versioned directory; the directory THIS shell's own file is in is left standing and
+# is removed by a later run's sweep, once no pointer names it and its publisher is gone. So this run
+# goes on reading the bytes it started with for two independent reasons: the directory is still there,
+# and bash holds an open descriptor on the script it is executing so an unlinked inode would outlive
+# its last close anyway. The five libraries were read in full at startup. NOTHING BELOW THIS LINE
+# READS ${IMS_SCRIPT_LIB_DIR} AGAIN; the startup snapshot is what every later resolution goes through,
+# and it was taken before this.
 CURRENT_STEP="publish-driver"
 if ! $DRY_RUN; then
   DRIVER_PUBLISH_RC=0
@@ -5642,9 +5649,14 @@ if ! $DRY_RUN; then
     success "The root-owned deployment driver at ${IMS_DRIVER_PROGRAM_DIR} now holds this release (${IMS_DRIVER_PUBLISHED_DIGEST})."
   else
     warn "The root-owned deployment driver at ${IMS_DRIVER_PROGRAM_DIR} was NOT refreshed: ${IMS_DRIVER_REASON:-the reason is printed above}."
-    warn "This deployment is complete and serving. The copy standing there is the previous release's,"
-    warn "which is what the next update will run; that is supported, and running the next update out of"
-    warn "${APP_DIR} instead is what this publication exists to avoid."
+    warn "This deployment is complete and serving. The copy standing there is whatever release last"
+    warn "vouched for itself — NOT necessarily the previous one — and it is what the next update will"
+    warn "run; that is supported, and running the next update out of ${APP_DIR} instead is what this"
+    warn "publication exists to avoid."
+    # HOW OLD, IN A NUMBER (o3d-z5be r3, Codex MEDIUM 2). A refusal that says only "the copy standing
+    # there is unchanged" reads the same on the first update that skips the refresh as on the tenth, so
+    # an operator who never supplies a digest had nothing to notice. This names the age and the digest.
+    warn "$(privileged_driver_age_note)"
     if (( DRIVER_PUBLISH_RC == 2 )); then
       # THE EXPECTED OUTCOME ON THE DOCUMENTED DEPLOYMENT, NOT AN ERROR TO BE CHASED. ${APP_DIR} is
       # owned by ${APP_USER}, so nothing here can vouch for what is in it; the run says what would.

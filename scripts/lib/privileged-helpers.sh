@@ -44,33 +44,52 @@
 # compares it against the value THIS RUN published before it hands back a path.
 #
 # THAT IN-MEMORY DIGEST IS THE PART A SECOND ON-DISK RECORD COULD NOT DO. Two privileged runs can
-# overlap (the shared cutover lock is taken later than this), and the swap below is atomic — so
-# without it a run could verify a tree ANOTHER run had just published and execute its bytes. With
-# it, a republication by anybody is a REFUSAL in every run that did not perform it. `readonly`
-# is what makes that unspoofable from inside the run: nothing later in the script can restate it.
+# overlap (the shared cutover lock is taken later than this), so without it a run could verify a tree
+# ANOTHER run had just published and execute its bytes. With it, a republication by anybody is a
+# REFUSAL in every run that did not perform it. `readonly` is what makes that unspoofable from inside
+# the run: nothing later in the script can restate it.
 #
-# AND THAT SENTENCE WAS ONLY TRUE ONCE THE STAGING NAMES BECAME PER-RUN (o3d-z5be r2, Codex HIGH).
-# Every publication of a given kind used to assemble at ONE fixed name beside its target —
-# `${target}.staged` — and remove whatever was there first. So a second run could empty and refill
-# the FIRST run's staging tree in the interval between the first run assembling it and the first run
-# HASHING it, after which the first run hashed, renamed and recorded the second run's bytes AS ITS
-# OWN: its readonly digest matched, privileged_helper_path() accepted them, and the substitution the
-# paragraph above calls a refusal was an UNDETECTED SWAP. Each publication now assembles inside its
-# own `mktemp -d` directory under the root, so two overlapping runs share no object but the FINAL
-# name — where the rename is atomic and the loser is refused by the digest it holds.
+# AND IT TOOK THREE ROUNDS TO MAKE THE PUBLICATION ITSELF WORTH THAT SENTENCE. Both defects were in
+# the machinery, not in the digest, and both are worth recording because each was argued away once:
 #
-# WHY THE PUBLICATION IS STILL NOT UNDER THE SHARED CUTOVER LOCK, since that is the other way to
-# serialise it and the reviewer is right that its absence is what made the race reachable. Three
-# reasons, and the first is decisive: this publication exists so that NOTHING root executes after
-# startup comes out of the checkout, and acquiring the cutover lock is itself work a run does before
-# it holds any lock — moving the snapshot after it would put root-side code before the snapshot that
-# is supposed to cover root-side code. Second, the lock does not span the population: `--dry-run` and
-# `--print-fence-digest` publish nothing and take no lock, install.sh takes it at a different point
-# on a fresh box, and a publication that is only safe while a lock is held would be unsafe in exactly
-# the runs that do not hold one. Third, and the reason this is not a trade: with per-run staging the
-# isolation is STRUCTURAL — there is no shared object left to race over — while a lock would make it
-# a property of scheduling, and the in-memory digest would still be needed for the unlocked runs. A
-# lock is how you serialise writers to one object; the fix here was to stop sharing the object.
+#   * r2 (Codex HIGH). Every publication of a kind assembled at ONE fixed name beside its target,
+#     `${target}.staged`, and removed whatever was there first — so a second run could empty and
+#     refill the FIRST run's staging tree between the first run assembling it and the first run
+#     HASHING it, after which the first hashed, renamed and recorded the second's bytes AS ITS OWN.
+#     Fixed by giving every publication its own `mktemp -d` directory.
+#   * r3 (Codex HIGH). That fixed the staging and left the FINAL name, and r2's own summary — "two
+#     overlapping runs share no object but the final name, where the rename is atomic" — was wrong
+#     about the half it did not change. The sequence was retire-then-rename: `mv ${target} retired`
+#     then `mv staged ${target}`. Between those two the documented name did not exist, so a second
+#     run could put its tree there first; and `mv src dst` where `dst` IS AN EXISTING DIRECTORY moves
+#     src INSIDE dst and RETURNS SUCCESS. The loser therefore left its tree nested at
+#     `${target}/staged`, recorded its own digest, and reported a publication — while the documented
+#     command executed the winner's top-level files. Fixed by publishing through a POINTER: see THE
+#     PUBLICATION IS ONE RENAME above driver_publish_tree(), which is now the only statement in this
+#     file that changes what a documented name resolves to.
+#
+# WHY THE PUBLICATION IS NOT UNDER A LOCK — neither the shared cutover lock nor a narrow one over the
+# critical section, which is what the r3 reviewer proposed and which would have been a real
+# improvement over the sequence it protected. Four reasons, and the last is the one that decides it:
+#
+#   * this publication exists so that NOTHING root executes after startup comes out of the checkout,
+#     and acquiring the cutover lock is itself work a run does before it holds any lock — moving the
+#     snapshot after it would put root-side code before the snapshot meant to cover root-side code;
+#   * the cutover lock does not span the population: `--dry-run` and `--print-fence-digest` publish
+#     nothing and take no lock, and install.sh takes it at a different point on a fresh box. (This
+#     objection does NOT apply to a narrow lock scoped to the publication — a run that publishes
+#     nothing needs no such lock — and it was wrong to carry it over to that proposal in r2.);
+#   * a lock is how you serialise writers to one object, and the fix here was to make the object one
+#     that needs no serialising: `rename(2)` over a symbolic link is atomic in the kernel, so there
+#     is no critical section left to hold a lock across;
+#   * AND THE OTHER PUBLISHER MAY BE A DIFFERENT RELEASE. The standing driver can be arbitrarily many
+#     releases old — that is the documented consequence of refusing to publish unvouched bytes — so
+#     `update.sh` from release N-7 can be publishing while `install.sh` from release N publishes.
+#     Mutual exclusion requires every participant to have heard of the lock; only one of them was
+#     written after it existed. A rename requires nothing of the other participant. That is the
+#     difference between structural atomicity and a scheduling property, and it is why a lock is not
+#     even kept as a belt on top: a lock some publishers do not take invites a reader to believe the
+#     critical section is protected when it is not.
 #
 # WHAT THIS DOES NOT CLAIM, STATED HERE RATHER THAN DISCOVERED LATER. It does not authenticate the
 # CHECKOUT. An account that can write ${APP_DIR}/scripts before a run starts can still choose what
@@ -164,17 +183,32 @@
 # an unprivileged caller could choose is not a root.
 readonly IMS_DRIVER_ROOT="/etc/ims-cutover-driver"
 
-# THE RUN SNAPSHOT: this run's scripts/lib, and the record that says what it hashes to. The record
-# lives BESIDE the tree and not inside it, because a record inside the tree would be part of its
-# own digest.
+# THE TWO NAMES ROOT IS DOCUMENTED TO RUN THINGS OUT OF, AND WHAT THEY ACTUALLY ARE: SYMBOLIC LINKS
+# TO A VERSIONED DIRECTORY, FLIPPED BY ONE `rename()` (o3d-z5be r3, Codex HIGH).
+#
+# Each is the SINGLE MUTABLE OBJECT of its publication. Nothing else under the root is ever rewritten
+# in place: a publication assembles a whole new versioned directory — tree, record and manifest
+# together — and then replaces one symbolic link. `rename(2)` over an existing symbolic link is
+# atomic and total, so at every instant, from any other process, these names resolve to exactly one
+# COMPLETE, sealed, digested, vouched-for publication. There is no interval in which they resolve to
+# nothing, to half a tree, or to two trees at once. See THE PUBLICATION IS ONE RENAME below for why
+# the retire-then-rename sequence this replaces could not say that, and why a lock could not either.
 readonly IMS_DRIVER_HELPER_DIR="${IMS_DRIVER_ROOT}/helpers"
-readonly IMS_DRIVER_HELPER_RECORD="${IMS_DRIVER_ROOT}/helper-set.sha256"
-readonly IMS_DRIVER_HELPER_MANIFEST="${IMS_DRIVER_ROOT}/helper-set.manifest"
-
-# THE INSTALLED DRIVER: the three entrypoints and their library, root-owned, and the record for it.
 readonly IMS_DRIVER_PROGRAM_DIR="${IMS_DRIVER_ROOT}/driver"
-readonly IMS_DRIVER_PROGRAM_RECORD="${IMS_DRIVER_ROOT}/driver.sha256"
-readonly IMS_DRIVER_PROGRAM_MANIFEST="${IMS_DRIVER_ROOT}/driver.manifest"
+
+# AND THE RECORDS, EXPRESSED RELATIVE TO THE POINTER — which is what makes them part of the same
+# commit (o3d-z5be r3, Codex HIGH). They used to be fixed paths beside the trees, written AFTER the
+# swap: two mutable objects, updated in sequence, so two overlapping runs could leave the pointer
+# naming one run's bytes and the record naming the other's, and a failure between the two left a
+# record that described a tree nobody was running. The record now lives inside the versioned
+# directory, one level up from the tree, and `${pointer}/../<name>` reaches it: the kernel resolves
+# `..` from the directory the link landed in, so THIS PATH ALWAYS NAMES THE RECORD OF THE TREE THAT
+# IS STANDING, and one rename commits both. It is still outside the tree, so it is still not part of
+# its own digest.
+readonly IMS_DRIVER_HELPER_RECORD="${IMS_DRIVER_HELPER_DIR}/../helper-set.sha256"
+readonly IMS_DRIVER_HELPER_MANIFEST="${IMS_DRIVER_HELPER_DIR}/../helper-set.manifest"
+readonly IMS_DRIVER_PROGRAM_RECORD="${IMS_DRIVER_PROGRAM_DIR}/../driver.sha256"
+readonly IMS_DRIVER_PROGRAM_MANIFEST="${IMS_DRIVER_PROGRAM_DIR}/../driver.manifest"
 
 # THE DEPLOYMENT METADATA (o3d-z5be). Root-owned and 0600: update.sh reads GIT_REPO_URL,
 # GIT_BRANCH and GIT_DEPLOY_KEY_ENABLED out of it AS ROOT, at startup, as DATA through
@@ -182,14 +216,33 @@ readonly IMS_DRIVER_PROGRAM_MANIFEST="${IMS_DRIVER_ROOT}/driver.manifest"
 # stops being a value the application account chooses.
 readonly IMS_DRIVER_DEPLOY_META="${IMS_DRIVER_ROOT}/deploy-meta"
 
-# WHERE A PUBLICATION IS ASSEMBLED: A DIRECTORY THIS CALL CREATED, WHOSE NAME NO OTHER RUN KNOWS
-# (o3d-z5be r2, Codex HIGH). It was two FIXED names beside the target, `${target}.staged` and
-# `${target}.retired`, and the header records what that cost. Both now live inside one `mktemp -d`
-# directory per publication: the kernel creates it atomically under a root the ancestry check has
-# already cleared, the name carries the kind and this shell's pid so an operator reading `/etc` can
-# tell what it was, and everything in it is removed on every exit path. The previous tree is still
-# moved aside rather than deleted, so a failed swap leaves the OLD tree standing rather than none.
+# THE FOUR NAMES ONE PUBLICATION USES, ALL DERIVED FROM ONE `mktemp -d` SUFFIX so that no two
+# publications — overlapping or not — can ever share an object:
+#
+#   .publish-<kind>.<pid>.<rand>   where the tree is assembled, sealed, digested and recorded.
+#                                  `mktemp -d` creates it atomically, so no second run is assembling
+#                                  in the same place (o3d-z5be r2, Codex HIGH). It BECOMES the
+#                                  versioned directory by rename, so nothing is copied twice.
+#   .version-<kind>.<pid>.<rand>   the committed publication: the tree, and the record and manifest
+#                                  beside it. Immutable from the instant it exists under this name.
+#   .pointer-<kind>.<pid>.<rand>   the new symbolic link, before it takes the documented name. It is
+#                                  created here so that the step which makes it visible is a rename
+#                                  and not an unlink-then-symlink, which is what `ln -sf` does and
+#                                  which has a window in which the name resolves to NOTHING.
+#   .retired-<kind>.<pid>.<rand>   used on ONE path only: an installation whose documented name is
+#                                  still a REAL DIRECTORY from a release that predates the pointer
+#                                  scheme. `rename()` cannot put a symbolic link over a non-empty
+#                                  directory, so that one directory is moved to this unique name
+#                                  first. A unique destination is the point: `mv src dst` with `dst`
+#                                  an existing directory moves src INSIDE it, which is the trap the
+#                                  previous sequence fell into.
+#
+# The pid is the publishing shell's, so an operator reading `/etc` can tell what each directory was
+# and the sweep can tell a publication in flight from the residue of one that was killed.
 readonly IMS_DRIVER_PUBLISH_PREFIX=".publish-"
+readonly IMS_DRIVER_VERSION_PREFIX=".version-"
+readonly IMS_DRIVER_POINTER_PREFIX=".pointer-"
+readonly IMS_DRIVER_RETIRE_PREFIX=".retired-"
 
 # The three files that ARE the driver. Enumerated, because "every .sh beside install.sh" would
 # publish the development helpers as well and the digest is a statement about what root may run.
@@ -229,6 +282,12 @@ IMS_DRIVER_PUBLISH_NOTE=""
 # publishes from the release it is installing; update.sh publishes from the release it has just
 # deployed, which is a different directory and the reason this is a parameter at all.
 IMS_DRIVER_FILL_SOURCE=""
+
+# THE VERSIONED DIRECTORY A DOCUMENTED NAME CURRENTLY RESOLVES TO. Written by driver_standing_tree()
+# and read in the same frame: in a variable rather than on stdout for the reason the block below gives —
+# a caller reading it through `$(...)` would lose ${IMS_DRIVER_REASON} with the subshell, which is how
+# the first version of this library reported every refusal as an empty sentence.
+IMS_DRIVER_STANDING_TREE=""
 
 # THE DIGEST THE LAST PUBLICATION TOOK, HANDED BACK IN A VARIABLE AND NOT ON STDOUT (the lesson
 # _fence_vendor_closure() records above itself in lib/db-fence-protected.sh). A caller reading it
@@ -486,23 +545,59 @@ driver_source_ident() {
   } | LC_ALL=C sort
 }
 
-# A STAGING DIRECTORY WHOSE RUN IS GONE, AND NOTHING ELSE. Every exit path below removes its own, so
-# what this collects is the residue of a run that was killed between the `mktemp` and the rename —
-# root-owned copies of an old release that nothing will ever finish publishing, accumulating under
-# /etc where an operator has to wonder what they are.
+# WHAT A PUBLICATION LEAVES BEHIND THAT NOTHING WILL EVER USE AGAIN, AND NOTHING ELSE.
 #
-# IT CANNOT TAKE A LIVE RUN'S TREE, and the argument is not "the name is unguessable": the pid in the
-# name is the publishing shell's, and a tree whose publisher is gone will never be renamed into place
-# by anybody. A pid that is alive — including one a live unrelated process has reused — is SKIPPED,
-# so every ambiguity resolves towards leaving the directory alone. And the worst case if it were ever
-# wrong is a refused publication in the other run (its `mv` fails, the standing tree is untouched),
-# never a substitution: this deletes, and deleting cannot put bytes anywhere.
-driver_sweep_orphan_publish_dirs() {
-  local keep="$1" entry base rest pid
-  for entry in "${IMS_DRIVER_ROOT}/${IMS_DRIVER_PUBLISH_PREFIX}"*; do
-    [[ -d "${entry}" ]] || continue
+# Three kinds of residue accumulate under the root, and an operator should not have to wonder what
+# any of them are:
+#
+#   * a staging directory whose run was killed between the `mktemp` and the rename;
+#   * a SUPERSEDED versioned directory — the previous release, still complete and still root-owned,
+#     but no longer named by any pointer. These are the cost of publishing by pointer flip instead of
+#     by overwriting, and leaving them forever would fill /etc with every release ever deployed;
+#   * a leftover `.pointer-` symbolic link, and a `.retired-` directory from an interrupted migration.
+#
+# TWO QUESTIONS, BOTH OF WHICH MUST ANSWER "REAPABLE", and either one alone would be wrong:
+#
+#   1. IS ANY POINTER NAMING IT? A versioned directory the documented name resolves to is the standing
+#      publication and is never touched, whatever the pid in its name says — the run that published it
+#      is normally long gone, which is exactly why liveness alone cannot protect it.
+#   2. IS ITS PUBLISHER GONE? The pid in the name is the publishing shell's. A live pid — including
+#      one a live unrelated process has reused — is SKIPPED, so a publication in flight (its versioned
+#      directory exists, its pointer has not been flipped yet) is never taken, and every ambiguity
+#      resolves towards leaving the directory alone.
+#
+# AND THE WORST CASE IS STILL NOT A SUBSTITUTION. This only ever DELETES, and deleting cannot put
+# bytes anywhere: were both questions somehow answered wrongly, the outcome is a refused publication
+# in another run or a resolution that refuses because the tree is gone — never root executing bytes it
+# did not check. A run already executing out of a directory swept here keeps its own bytes: bash holds
+# an open descriptor on the script it is running and node has already read its helper, and an unlinked
+# inode outlives its last descriptor.
+driver_sweep_orphans() {
+  local keep="$1" entry base rest pid link referenced=0
+  local -a standing=()
+  # WHAT IS STANDING, READ OFF THE POINTERS THEMSELVES rather than assumed from a name. Only the first
+  # component matters: the link is `<version dir>/<tree>`, and it is the version dir that is at risk.
+  for link in "${IMS_DRIVER_HELPER_DIR}" "${IMS_DRIVER_PROGRAM_DIR}"; do
+    [[ -L "${link}" ]] || continue
+    base="$(readlink -- "${link}" 2>/dev/null)" || continue
+    [[ -n "${base}" ]] || continue
+    standing+=("${base%%/*}")
+  done
+  for entry in "${IMS_DRIVER_ROOT}/${IMS_DRIVER_PUBLISH_PREFIX}"* \
+               "${IMS_DRIVER_ROOT}/${IMS_DRIVER_VERSION_PREFIX}"* \
+               "${IMS_DRIVER_ROOT}/${IMS_DRIVER_RETIRE_PREFIX}"* \
+               "${IMS_DRIVER_ROOT}/${IMS_DRIVER_POINTER_PREFIX}"*; do
+    # A symbolic link is reaped as a link and never followed; anything else must be a directory.
+    if [[ ! -L "${entry}" ]] && [[ ! -d "${entry}" ]]; then
+      continue
+    fi
     [[ "${entry}" != "${keep}" ]] || continue
     base="${entry##*/}"
+    referenced=0
+    for link in "${standing[@]+"${standing[@]}"}"; do
+      [[ "${base}" != "${link}" ]] || referenced=1
+    done
+    (( referenced == 0 )) || continue
     rest="${base%.*}"
     pid="${rest##*.}"
     [[ "${pid}" =~ ^[1-9][0-9]*$ ]] || continue
@@ -515,11 +610,118 @@ driver_sweep_orphan_publish_dirs() {
 }
 
 # ---------------------------------------------------------------------------
+# READING A POINTER
+# ---------------------------------------------------------------------------
+
+# WHICH VERSIONED DIRECTORY IS STANDING AT A DOCUMENTED NAME — in a variable and not on stdout, so a
+# caller does not have to lose ${IMS_DRIVER_REASON} to a subshell to find out.
+#
+# THE LINK TEXT IS VALIDATED RATHER THAN RESOLVED, and that is the whole of the safety argument. A
+# `realpath` would tell us where we landed; this says where we are ALLOWED to land: exactly one
+# `.version-<kind>.<pid>.<rand>` component and one tree component beneath the root, so there is no
+# absolute path, no `..` and no second directory level a link could use to leave ${IMS_DRIVER_ROOT} —
+# which is the only directory in the chain whose ownership and modes have been established. Only root
+# can write that directory, so only root can have created this link at all; this is what makes a
+# malformed one a refusal with a reason instead of a path handed to `node`.
+driver_standing_tree() {
+  local pointer="$1" what="$2" link owner
+  IMS_DRIVER_STANDING_TREE=""
+  if [[ ! -L "${pointer}" ]]; then
+    if [[ -d "${pointer}" ]]; then
+      driver_refuse "${pointer} is a directory and not the symbolic link a publication commits, so it was put there by a release that predates the pointer scheme or by hand. Nothing is resolved through it: run install.sh to republish ${what}" || return 1
+    fi
+    driver_refuse "there is no ${what} published at ${pointer}" || return 1
+  fi
+  owner="$(LC_ALL=C stat -c '%u' "${pointer}" 2>/dev/null)" || {
+    driver_refuse "${pointer} could not be inspected, so this run cannot say who published ${what}" || return 1
+  }
+  if [[ "${owner}" != "$(id -u)" ]]; then
+    driver_refuse "${pointer} is owned by uid ${owner} and not by this account, so it is not a pointer this publication mechanism wrote. Nothing is resolved through it" || return 1
+  fi
+  link="$(readlink -- "${pointer}" 2>/dev/null)" || link=""
+  if [[ ! "${link}" =~ ^\.version-[a-z]+\.[1-9][0-9]*\.[A-Za-z0-9]+/[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; then
+    driver_refuse "${pointer} names '${link:-nothing}', which is not one versioned publication directory and one tree beneath ${IMS_DRIVER_ROOT}. A pointer that could name anything else could name a tree outside the only directory whose ownership this run has established, so it is refused rather than followed" || return 1
+  fi
+  if [[ ! -d "${IMS_DRIVER_ROOT}/${link}" ]]; then
+    driver_refuse "${pointer} names ${link}, which is not a directory under ${IMS_DRIVER_ROOT}: the publication it pointed at has been removed. Nothing will be executed out of ${pointer}" || return 1
+  fi
+  IMS_DRIVER_STANDING_TREE="${IMS_DRIVER_ROOT}/${link}"
+  return 0
+}
+
+# ---------------------------------------------------------------------------
 # THE PUBLICATION
 # ---------------------------------------------------------------------------
 
-# Stage, seal, digest, authenticate, swap, record — in that order, and the record LAST so a digest
-# is never on disk ahead of the tree it describes.
+# UNDOING A PUBLICATION THAT HAS NOT COMMITTED YET. Called from the failure paths between the
+# versioned directory existing and the pointer being flipped — the only interval in which this run has
+# created anything under the root that it must take away again.
+#
+# THE MIGRATION TREE IS PUT BACK ONLY IF NOTHING HAS TAKEN THE NAME. A concurrent publication that
+# flipped its own pointer in while this one was failing owns that name now, and moving an old directory
+# over it would be this mechanism destroying a good publication on its way out.
+driver_publish_unwind() {
+  local version_dir="$1" pointer_tmp="$2" retire_dir="$3" target="$4" migrated="$5"
+  if (( migrated == 1 )) && [[ ! -e "${target}" ]] && [[ ! -L "${target}" ]] && [[ -d "${retire_dir}" ]]; then
+    mv -T "${retire_dir}" "${target}" 2>/dev/null || true
+  fi
+  rm -rf "${version_dir}" "${retire_dir}" 2>/dev/null || true
+  rm -f "${pointer_tmp}" 2>/dev/null || true
+  return 0
+}
+
+# THE PUBLICATION IS ONE RENAME (o3d-z5be r3, Codex HIGH and MEDIUM).
+#
+# Assemble, seal, digest, authenticate, RECORD, make the whole thing durable, and only then FLIP ONE
+# SYMBOLIC LINK. The flip is the last mutation of the publication and it is a single `rename(2)`.
+#
+# WHAT THE PREVIOUS SEQUENCE WAS AND WHY IT COULD NOT BE FIXED BY NARROWING. It was: move the standing
+# tree aside, then `mv staged target`, then write the record. Two defects, and they are the same defect
+# seen from two sides:
+#
+#   * BETWEEN the retire and the rename the documented name did not exist, so a second run could put
+#     ITS tree there first. `mv src dst` with `dst` an existing DIRECTORY does not replace dst — it
+#     moves src INSIDE it, as `dst/staged`, AND RETURNS SUCCESS. The first run then recorded its own
+#     digest for a target whose top-level files were the second run's: the documented command executed
+#     bytes nobody intended and the run reported that it had published its own.
+#   * the record was written AFTER the swap, and the retired tree was deleted BEFORE the record. A
+#     failure writing the record therefore returned nonzero — callers say "the driver was NOT
+#     refreshed" — with the NEW tree already standing and nothing left to restore. Driver execution
+#     does not consult the record, so the next documented invocation ran the new bytes anyway.
+#
+# WHY THIS IS ATOMIC AND NOT MERELY NARROWER. There is no interval to narrow. The versioned directory
+# is built under a name no other run can hold and is complete before it is reachable from any
+# documented name; the pointer is then replaced by `rename(2)`, which the kernel performs as one
+# operation. A reader of ${target} at any instant — including an instant during this publication — gets
+# either the previous publication or this one, never neither and never a mixture, and the `mv` cannot
+# silently nest because its destination is a symbolic link and not a directory. The RECORD moved inside
+# the versioned directory for the same reason: one commit point can only commit one object, so the
+# record had to become part of the object the rename commits rather than a second thing updated after
+# it. And a `rename()` that returns EEXIST-free success has no "succeeded into a state nobody intended"
+# case left to report.
+#
+# WHY NOT A NARROW LOCK OVER THE RETIRE-AND-RENAME, which is the other answer and the one the reviewer
+# proposed. It would be a real improvement over the sequence it protects, and the objection this file
+# raised to the CUTOVER lock — that unlocked runs exist — does not apply to a lock scoped to the
+# critical section, because a run that publishes nothing needs no lock. The reason it is not the answer
+# here is specific to this mechanism: THE OTHER PUBLISHER MAY BE A DIFFERENT RELEASE. That is not a
+# hypothetical — it is the whole purpose of ${IMS_DRIVER_PROGRAM_DIR} and the subject of the update
+# documentation: the standing driver can be arbitrarily many releases old, so `update.sh` from release
+# N-7 can be publishing while `install.sh` from release N publishes. Mutual exclusion requires every
+# participant to agree on the protocol, and only one of them was written after the lock existed. A
+# rename requires nothing of the other participant: the kernel serialises it whether the loser has ever
+# heard of this scheme or not. That is the difference between structural atomicity and a scheduling
+# property, and it is why the lock is not even kept as a belt on top — a lock that some publishers do
+# not take would invite the reader to believe the critical section is protected when it is not.
+#
+# AND THE LOSER OF A RACE LOSES CLEANLY. Two runs that flip within the same instant both publish
+# complete, sealed, separately-vouched-for trees; the later rename decides which one stands, exactly as
+# the later of two writes to any single object does. The loser then finds, by reading the pointer back,
+# that the name does not resolve to the tree it published, and REFUSES rather than reporting a
+# publication: ${IMS_DRIVER_PUBLISHED_DIGEST} stays empty, so no caller can announce a digest for bytes
+# the documented command will not execute. For the helper snapshot that refusal is the same refusal the
+# in-memory digest has always produced, arriving at startup with a name attached instead of at minute
+# twenty.
 #
 # WHICH TREE is a `kind` and not a function name passed in. An indirect call would be one more
 # construct a reader of this file cannot resolve statically, in a file whose whole subject is which
@@ -533,9 +735,28 @@ driver_publish_tree() {
   # Two publications now take a digest from two different names, and a message that named the wrong
   # one would send an operator to set a variable that decides nothing.
   local pin_name="${7:-IMS_HELPER_SET_SHA256}"
-  local run_dir staged retired tree_manifest="" digest="" filled=0
+  local run_dir suffix version_dir version_name pointer_tmp retire_dir staged link
+  local tree_name record_name manifest_name tree_manifest="" digest="" filled=0 migrated=0
+  local published_at published_utc
   IMS_DRIVER_REASON=""
   IMS_DRIVER_PUBLISHED_DIGEST=""
+
+  # THE THREE NAMES INSIDE ONE PUBLICATION, TAKEN FROM THE CALLER'S PATHS RATHER THAN RESTATED. The
+  # tree keeps the pointer's own basename inside the versioned directory, so `${pointer}/../<record>`
+  # reaches the record of the tree that is standing and the two publications need no second table of
+  # names to stay in step.
+  tree_name="${target##*/}"
+  record_name="${record##*/}"
+  manifest_name="${manifest##*/}"
+  # AND THE RECORD MUST BE A PATH THE FLIP COMMITS. A record anywhere else would be a second mutable
+  # object, which is the defect this shape exists to remove; a caller that passes one is a bug in these
+  # scripts and is refused here rather than publishing something whose record can disagree with it.
+  if [[ "${record}" != "${target}/../${record_name}" ]] || [[ "${manifest}" != "${target}/../${manifest_name}" ]]; then
+    driver_refuse "the record and manifest for ${what} must be named relative to ${target} so that one rename commits them with the tree; '${record}' and '${manifest}' are not. This is a bug in these scripts, not an operator error" || return 1
+  fi
+  if [[ "${target%/*}" != "${IMS_DRIVER_ROOT}" ]]; then
+    driver_refuse "${target} is not directly under ${IMS_DRIVER_ROOT}, which is the only directory whose ownership this run has established. This is a bug in these scripts, not an operator error" || return 1
+  fi
   driver_root_ready || return 1
 
   # THE PER-RUN STAGING DIRECTORY (o3d-z5be r2, Codex HIGH). `mktemp -d` creates it atomically, so no
@@ -544,9 +765,16 @@ driver_publish_tree() {
   run_dir="$(mktemp -d "${IMS_DRIVER_ROOT}/${IMS_DRIVER_PUBLISH_PREFIX}${kind}.$$.XXXXXX" 2>/dev/null)" || {
     driver_refuse "a private staging directory for ${what} could not be created under ${IMS_DRIVER_ROOT}, so nothing has been published" || return 1
   }
-  driver_sweep_orphan_publish_dirs "${run_dir}"
-  staged="${run_dir}/staged"
-  retired="${run_dir}/retired"
+  # EVERY OTHER NAME THIS PUBLICATION USES COMES OFF THAT ONE SUFFIX, so all four are unique to this
+  # call by the same argument that makes the `mktemp` unique — no second `mktemp`, and no name that
+  # another run could be holding.
+  suffix="${run_dir##*.}"
+  version_name="${IMS_DRIVER_VERSION_PREFIX}${kind}.$$.${suffix}"
+  version_dir="${IMS_DRIVER_ROOT}/${version_name}"
+  pointer_tmp="${IMS_DRIVER_ROOT}/${IMS_DRIVER_POINTER_PREFIX}${kind}.$$.${suffix}"
+  retire_dir="${IMS_DRIVER_ROOT}/${IMS_DRIVER_RETIRE_PREFIX}${kind}.$$.${suffix}"
+  driver_sweep_orphans "${run_dir}"
+  staged="${run_dir}/${tree_name}"
   mkdir -p "${staged}" || { rm -rf "${run_dir}"; return 1; }
 
   # THE FILLER'S STATUS IS CARRIED, NOT COLLAPSED. `|| filled=$?` rather than a bare call: under
@@ -572,6 +800,13 @@ driver_publish_tree() {
 
   chown -R "$(id -u):$(id -g)" "${staged}" 2>/dev/null || true
   chmod -R u=rwX,go=rX "${staged}" || { rm -rf "${run_dir}"; return 1; }
+  # AND THE VERSIONED DIRECTORY ITSELF, which this one becomes. `mktemp -d` makes it 0700, and a 0700
+  # directory above the tree would make the driver unreachable by every account but root — the reason
+  # driver_root_ready() takes ${IMS_DRIVER_ROOT} to 0755 rather than the 0711 the cutover root uses is
+  # that the driver is code every account may READ and none but root may write. The record beside the
+  # tree is published 0644 for the same reason and would be behind a closed door otherwise.
+  chown "$(id -u):$(id -g)" "${run_dir}" 2>/dev/null || true
+  chmod 755 "${run_dir}" || { rm -rf "${run_dir}"; return 1; }
 
   if ! _fence_tree_is_sealed "${staged}"; then
     rm -rf "${run_dir}"
@@ -586,21 +821,86 @@ driver_publish_tree() {
     driver_refuse "${pin_name} expects ${expected} but ${what} assembled from this checkout hashes to ${digest}, so NOTHING was published to ${target} and nothing will be executed out of it. The digest is taken with: ${DB_FENCE_ARTEFACT_RECIPE}" || return 1
   fi
 
-  if [[ -e "${target}" ]]; then
-    mv -f "${target}" "${retired}" || { rm -rf "${run_dir}"; return 1; }
-  fi
-  if ! mv -f "${staged}" "${target}"; then
-    [[ -e "${retired}" ]] && mv -f "${retired}" "${target}" 2>/dev/null
+  # THE RECORD AND THE MANIFEST, WRITTEN BESIDE THE TREE AND BEFORE ANYTHING IS REACHABLE (o3d-z5be
+  # r3, Codex MEDIUM). They used to be written after the swap, so a failure here left the new tree
+  # standing while the caller reported that nothing had been refreshed. Here they are inside the
+  # directory the flip commits: a failure at this point has nothing to undo but this run's own staging
+  # tree, and the previous publication is still the one every documented name resolves to.
+  #
+  # AND THE PUBLICATION DATE IS IN THE RECORD (o3d-z5be r3, Codex MEDIUM 2). A deployment that never
+  # supplies a digest refreshes nothing, release after release, and had no way to say how far behind
+  # the standing driver had drifted. This is what privileged_driver_age_note() reads.
+  published_at="$(date -u +%s 2>/dev/null)" || published_at=""
+  published_utc="$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null)" || published_utc=""
+  if ! printf 'tree_sha256=%s\ntree_recipe=%s\ntree_published_at=%s\ntree_published_utc=%s\ntree_complete=1\n' \
+    "${digest}" "${DB_FENCE_ARTEFACT_RECIPE}" "${published_at}" "${published_utc}" \
+    | _fence_publish_file "${run_dir}/${record_name}"; then
     rm -rf "${run_dir}"
-    driver_refuse "${what} could not be renamed into ${target}; the tree that was there is still there" || return 1
+    driver_refuse "the digest record for ${what} could not be written, so nothing was published to ${target} and the copy standing there is unchanged" || return 1
   fi
-  rm -rf "${run_dir}"
+  if ! printf '%s\n' "${tree_manifest}" | _fence_publish_file "${run_dir}/${manifest_name}"; then
+    rm -rf "${run_dir}"
+    driver_refuse "the per-file manifest for ${what} could not be written, so nothing was published to ${target} and the copy standing there is unchanged" || return 1
+  fi
+  chown "$(id -u):$(id -g)" "${run_dir}/${record_name}" "${run_dir}/${manifest_name}" 2>/dev/null || true
+  if ! _fence_fsync_path "${run_dir}"; then
+    rm -rf "${run_dir}"
+    driver_refuse "${what} could not be made durable before publication, so nothing was published to ${target} and the copy standing there is unchanged" || return 1
+  fi
 
-  printf 'tree_sha256=%s\ntree_recipe=%s\ntree_complete=1\n' "${digest}" "${DB_FENCE_ARTEFACT_RECIPE}" \
-    | _fence_publish_file "${record}" || return 1
-  printf '%s\n' "${tree_manifest}" | _fence_publish_file "${manifest}" || return 1
-  chown "$(id -u):$(id -g)" "${record}" "${manifest}" 2>/dev/null || true
-  _fence_fsync_path "${IMS_DRIVER_ROOT}" || return 1
+  # THE PUBLICATION BECOMES A VERSION. One rename, into a name nothing else can hold, after which the
+  # directory is immutable: every later step only reads it. The staging name is retired by this rename
+  # rather than copied out of, so there is no second copy to keep in step.
+  if ! mv -T "${run_dir}" "${version_dir}"; then
+    rm -rf "${run_dir}"
+    driver_refuse "${what} could not be moved to ${version_dir}, so nothing was published to ${target} and the copy standing there is unchanged" || return 1
+  fi
+  if ! _fence_fsync_path "${IMS_DRIVER_ROOT}"; then
+    driver_publish_unwind "${version_dir}" "${pointer_tmp}" "${retire_dir}" "${target}" "${migrated}"
+    driver_refuse "${IMS_DRIVER_ROOT} could not be made durable, so nothing was published to ${target} and the copy standing there is unchanged" || return 1
+  fi
+
+  # THE ONE MIGRATION: A DOCUMENTED NAME THAT IS STILL A REAL DIRECTORY. `rename()` will not put a
+  # symbolic link over a non-empty directory, so an installation last touched by a release that
+  # published trees directly has to have that directory moved away once. The destination is a name
+  # unique to this publication, which is the whole point — a destination that already existed as a
+  # directory is what let the previous sequence nest one tree inside another and call it success.
+  if [[ ! -L "${target}" ]] && [[ -e "${target}" ]]; then
+    if ! mv -T "${target}" "${retire_dir}"; then
+      driver_publish_unwind "${version_dir}" "${pointer_tmp}" "${retire_dir}" "${target}" 0
+      driver_refuse "${target} is a directory from a release that published trees directly and it could not be moved aside, so nothing was published and it is still there" || return 1
+    fi
+    migrated=1
+  fi
+
+  # THE POINTER, BUILT UNDER ITS OWN NAME AND THEN RENAMED. `ln -sf` would unlink the documented name
+  # and create it again, and between the two it resolves to nothing at all — for a name root is
+  # documented to run a program out of, that is a window this scheme exists to not have.
+  if ! ln -s -- "${version_name}/${tree_name}" "${pointer_tmp}"; then
+    driver_publish_unwind "${version_dir}" "${pointer_tmp}" "${retire_dir}" "${target}" "${migrated}"
+    driver_refuse "the pointer for ${what} could not be created under ${IMS_DRIVER_ROOT}, so nothing was published to ${target} and the copy standing there is unchanged" || return 1
+  fi
+
+  # THE COMMIT. Everything above this line is invisible to every documented name; everything below it
+  # only reads. One `rename(2)`: the name resolves to the previous publication before it and to this
+  # one after it, with no third state and no possibility of nesting, because the destination is a
+  # symbolic link and not a directory.
+  if ! mv -T "${pointer_tmp}" "${target}"; then
+    driver_publish_unwind "${version_dir}" "${pointer_tmp}" "${retire_dir}" "${target}" "${migrated}"
+    driver_refuse "${what} could not be published at ${target}; the copy that was there is still there" || return 1
+  fi
+  _fence_fsync_path "${IMS_DRIVER_ROOT}" || true
+
+  # AND THE POINTER IS READ BACK, so a run that lost a race says so instead of announcing a digest for
+  # bytes the documented command will not execute. The tree standing here is another run's complete,
+  # separately vouched-for publication — this is not a corruption to repair, it is a later write to the
+  # one object, and what must not happen is this run claiming the outcome.
+  link="$(readlink -- "${target}" 2>/dev/null)" || link=""
+  if [[ "${link}" != "${version_name}/${tree_name}" ]]; then
+    rm -rf "${retire_dir}" 2>/dev/null || true
+    driver_refuse "${target} names ${link:-a tree this publication did not create} and this run published ${version_name}/${tree_name}: another privileged run published ${what} at the same moment and its copy is the one standing there. Nothing of this run's is being reported as published; that run's tree was vouched for by its own operator and is complete, and re-running this one will publish over it" || return 1
+  fi
+  rm -rf "${retire_dir}" 2>/dev/null || true
   IMS_DRIVER_PUBLISHED_DIGEST="${digest}"
   return 0
 }
@@ -803,14 +1103,25 @@ privileged_deploy_meta_path() {
 #   1. the name is a single component — no `/`, no `..` — so a caller cannot walk out of the tree;
 #   2. this run published a snapshot at all (an unprivileged run, or a privileged one whose
 #      publication failed, has no value here and is refused);
-#   3. the tree is still SEALED: root-owned, no group or other write, regular files and directories
-#      only. Without this a symbolic link planted inside it would be followed by node while the
-#      manifest, which hashes regular files only, would not see it;
-#   4. the tree still hashes to what THIS RUN published — not to what the record on disk says, which
+#   3. the pointer resolves to one versioned publication directory under ${IMS_DRIVER_ROOT} and to
+#      nothing else. THE PATH IS VALIDATED, NOT MERELY RESOLVED, because ${IMS_DRIVER_ROOT} is the only
+#      directory in the chain whose ownership and modes this run has established;
+#   4. the tree it names is still SEALED: root-owned, no group or other write, regular files and
+#      directories only. Without this a symbolic link planted inside it would be followed by node while
+#      the manifest, which hashes regular files only, would not see it;
+#   5. that tree still hashes to what THIS RUN published — not to what the record on disk says, which
 #      another privileged run could have rewritten along with the tree;
-#   5. the named file is there.
+#   6. the named file is there.
+#
+# AND WHAT IS HANDED BACK IS THE RESOLVED PATH, not the pointer (o3d-z5be r3). The tree inside a
+# versioned directory is immutable for as long as that directory exists, so the bytes sealed and
+# digested above are the bytes `node` opens even if another privileged run flips the pointer in the
+# interval. Through the pointer they would not have been. The REFUSAL above is unchanged and is still
+# the answer to a concurrent republication: a run whose pointer no longer names the tree it published
+# stops here rather than quietly carrying on with its own copy, which is the property this file has
+# claimed since it was written.
 privileged_helper_path() {
-  local name="$1" actual
+  local name="$1" actual tree
   IMS_DRIVER_REASON=""
   if [[ ! "${name}" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; then
     driver_refuse "'${name}' is not a single file name, so it will not be resolved inside ${IMS_DRIVER_HELPER_DIR}" || return 1
@@ -818,16 +1129,67 @@ privileged_helper_path() {
   if [[ -z "${IMS_DRIVER_HELPER_SHA256}" ]]; then
     driver_refuse "no root-owned snapshot of the helper set was published by this run, so there are no bytes it may execute as root: a helper read out of the checkout now could have been replaced since this run started. ${IMS_DRIVER_PUBLISH_NOTE:-no reason was recorded}" || return 1
   fi
-  if ! _fence_tree_is_sealed "${IMS_DRIVER_HELPER_DIR}"; then
+  driver_standing_tree "${IMS_DRIVER_HELPER_DIR}" "the privileged helper set" || return 1
+  tree="${IMS_DRIVER_STANDING_TREE}"
+  if ! _fence_tree_is_sealed "${tree}"; then
     driver_refuse "the root-owned helper set at ${IMS_DRIVER_HELPER_DIR} is no longer sealed, so nothing will be executed out of it: ${DB_FENCE_SEAL_REASON}" || return 1
   fi
-  actual="$(_fence_tree_digest "${IMS_DRIVER_HELPER_DIR}")" || actual=""
+  actual="$(_fence_tree_digest "${tree}")" || actual=""
   if [[ "${actual}" != "${IMS_DRIVER_HELPER_SHA256}" ]]; then
     driver_refuse "${IMS_DRIVER_HELPER_DIR} hashes to ${actual:-nothing readable} and this run published ${IMS_DRIVER_HELPER_SHA256}. Only root can write that directory, so something privileged has rewritten it while this run was in flight; refusing to execute bytes this run did not publish. ${IMS_DRIVER_HELPER_MANIFEST} lists the per-file digests: \`cd ${IMS_DRIVER_HELPER_DIR} && sha256sum -c ${IMS_DRIVER_HELPER_MANIFEST}\` names which file moved" || return 1
   fi
-  if [[ ! -f "${IMS_DRIVER_HELPER_DIR}/${name}" ]]; then
+  if [[ ! -f "${tree}/${name}" ]]; then
     driver_refuse "${IMS_DRIVER_HELPER_DIR}/${name} is not in the snapshot this run published from ${IMS_SCRIPT_LIB_DIR}, so this release does not ship it. Restore the checkout and run again" || return 1
   fi
-  printf '%s' "${IMS_DRIVER_HELPER_DIR}/${name}"
+  printf '%s' "${tree}/${name}"
+  return 0
+}
+
+# ---------------------------------------------------------------------------
+# HOW OLD THE STANDING DRIVER IS (o3d-z5be r3, Codex MEDIUM 2)
+# ---------------------------------------------------------------------------
+
+# ONE SENTENCE ABOUT THE COPY THAT WILL RUN THE NEXT UPDATE, or nothing at all.
+#
+# WHY THIS EXISTS. A deployment whose operator never supplies ${IMS_DRIVER_SHA256} refreshes the driver
+# NEVER — not once per release, never — because the tree it would copy from belongs to ${APP_USER} and
+# nothing can vouch for it. That is the correct behaviour and it is documented, but the run said only
+# "the previous release's driver stands", which is true after one such update and progressively less
+# true after ten. The standing driver can be arbitrarily many releases old, and the operator had no
+# way to notice: the same warning appears every time and names no age. So the record now carries the
+# date it was published and this reads it back.
+#
+# IT NEVER REFUSES AND NEVER FAILS A CALLER. It is a sentence for an operator; a missing or unreadable
+# record means an older release published the standing copy, which is itself the answer to "how old is
+# it" and is printed as such.
+privileged_driver_age_note() {
+  local record published digest days now
+  driver_standing_tree "${IMS_DRIVER_PROGRAM_DIR}" "the root-owned deployment driver" 2>/dev/null || {
+    IMS_DRIVER_REASON=""
+    printf 'There is no root-owned deployment driver standing at %s.' "${IMS_DRIVER_PROGRAM_DIR}"
+    return 0
+  }
+  IMS_DRIVER_REASON=""
+  record="$(dirname -- "${IMS_DRIVER_STANDING_TREE}")/${IMS_DRIVER_PROGRAM_RECORD##*/}"
+  if [[ ! -f "${record}" ]] || ! grep -qE '^tree_complete=1$' "${record}" 2>/dev/null; then
+    printf 'The driver standing at %s carries no complete publication record, so it was published by a release that predates this one and its age cannot be read off the box.' "${IMS_DRIVER_PROGRAM_DIR}"
+    return 0
+  fi
+  digest="$(grep -m1 -E '^tree_sha256=' "${record}" 2>/dev/null)" || digest=""
+  digest="${digest#tree_sha256=}"
+  published="$(grep -m1 -E '^tree_published_at=' "${record}" 2>/dev/null)" || published=""
+  published="${published#tree_published_at=}"
+  if [[ ! "${published}" =~ ^[1-9][0-9]*$ ]]; then
+    printf 'The driver standing at %s hashes to %s and records no publication date, so it predates the release that started recording one.' "${IMS_DRIVER_PROGRAM_DIR}" "${digest:-an unreadable digest}"
+    return 0
+  fi
+  now="$(date -u +%s 2>/dev/null)" || now=""
+  if [[ ! "${now}" =~ ^[1-9][0-9]*$ ]] || (( now < published )); then
+    printf 'The driver standing at %s hashes to %s and was published at %s UTC.' "${IMS_DRIVER_PROGRAM_DIR}" "${digest:-an unreadable digest}" "${published}"
+    return 0
+  fi
+  days=$(( (now - published) / 86400 ))
+  printf 'The driver standing at %s hashes to %s and was published %s day(s) ago. It is NOT one release behind — it is whatever release last vouched for itself, and it is the program that will run every future update until one does.' \
+    "${IMS_DRIVER_PROGRAM_DIR}" "${digest:-an unreadable digest}" "${days}"
   return 0
 }

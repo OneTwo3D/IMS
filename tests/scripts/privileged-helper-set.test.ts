@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import { execFileSync, spawnSync } from 'node:child_process'
-import { chmodSync, existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs'
+import { chmodSync, existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, readlinkSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { test, type TestContext } from 'node:test'
 
@@ -144,6 +144,41 @@ function run(dirs: { root: string; src: string; work: string }, program: string,
 }
 
 /**
+ * THE VERSIONED DIRECTORY A DOCUMENTED NAME RESOLVES TO (o3d-z5be r3).
+ *
+ * ASSERTING THE SHAPE IS THE POINT, not a step on the way to a path: the whole of the r3 fix is that
+ * `helpers` and `driver` are SYMBOLIC LINKS flipped by one `rename(2)`, so a test that read them as
+ * plain directories would pass just as well against the sequence that could nest one publication
+ * inside another.
+ */
+function standingVersionDir(root: string, pointer: 'helpers' | 'driver'): string {
+  const st = lstatSync(join(root, pointer))
+  assert.ok(st.isSymbolicLink(),
+    `${pointer} must be the symbolic link a publication commits, not a directory a publication overwrote`)
+  const link = readlinkSync(join(root, pointer))
+  assert.match(link, new RegExp(`^\\.version-[a-z]+\\.[1-9][0-9]*\\.[A-Za-z0-9]+/${pointer}$`),
+    `${pointer} must name one versioned publication directory and one tree beneath the root: ${link}`)
+  return join(root, link.split('/')[0])
+}
+
+/** The record or manifest OF THE PUBLICATION THAT IS STANDING. It lives inside the versioned directory
+ *  rather than at a fixed path precisely so that one rename commits it with the tree. */
+function standingFile(root: string, pointer: 'helpers' | 'driver', name: string): string {
+  return join(standingVersionDir(root, pointer), name)
+}
+
+/** Take a publication away entirely — the pointer and every versioned directory — so a following run
+ *  starts from nothing. A test that removed only the pointer would leave a tree the sweep would find. */
+function clearStanding(root: string, pointer: 'helpers' | 'driver'): void {
+  rmSync(join(root, pointer), { force: true })
+  for (const name of readdirSync(root)) {
+    if (name.startsWith('.version-') || name.startsWith('.publish-')) {
+      rmSync(join(root, name), { recursive: true, force: true })
+    }
+  }
+}
+
+/**
  * WHAT A REFUSED PUBLICATION LOOKS LIKE FROM OUTSIDE, and why it is not read off the return code.
  *
  * publish_privileged_helper_set() TOLERATES a failure when the account running it is not root —
@@ -164,7 +199,12 @@ function assertPublishedNothing(out: Run, root: string, what: string): void {
   assert.match(out.stdout, /^DIGEST=$/m,
     `${what}: no digest may be recorded in the run:\n${out.stdout}${out.stderr}`)
   assert.equal(existsSync(join(root, 'helpers')), false, `${what}: no tree may be left at the destination`)
-  assert.equal(existsSync(join(root, 'helper-set.sha256')), false, `${what}: and no record either`)
+  assert.equal(lstatSync(join(root, 'helpers'), { throwIfNoEntry: false }), undefined,
+    `${what}: and not a dangling pointer either`)
+  // The root itself need not exist — a refusal on the ancestry walk never creates it — and "there is
+  // no root" is a stronger form of "nothing was published", not an exception to it.
+  assert.deepEqual(existsSync(root) ? readdirSync(root).filter((name) => name.startsWith('.version-')) : [], [],
+    `${what}: and no versioned publication, which is where the record now lives`)
 }
 
 /** The program every refusal test runs: attempt the publication, report the digest, attempt a
@@ -388,7 +428,12 @@ test('[o3d-kyqa] the shipped publication leaves a sealed tree the shipped resolu
   const digest = /^DIGEST=([0-9a-f]{64})$/m.exec(out.stdout)
   assert.ok(digest, `the publication must record a digest in the run:\n${out.stdout}${out.stderr}`)
   assert.match(out.stdout, /^RESOLVE_RC=0$/m, `${out.stdout}${out.stderr}`)
-  assert.match(out.stdout, new RegExp(`^RESOLVED=${dirs.root}/helpers/chown-tree\\.mjs$`, 'm'), out.stdout)
+  // THE RESOLVED PATH IS THE VERSIONED ONE, not the pointer (o3d-z5be r3): the tree inside a versioned
+  // directory is immutable for as long as it exists, so the bytes sealed and digested by the resolution
+  // are the bytes `node` opens even if another privileged run flips the pointer in the interval.
+  assert.match(out.stdout,
+    new RegExp(`^RESOLVED=${dirs.root}/\\.version-helpers\\.[1-9][0-9]*\\.[A-Za-z0-9]+/helpers/chown-tree\\.mjs$`, 'm'),
+    out.stdout)
   assert.doesNotMatch(out.stdout, /^REASSIGN_RC=0$/m,
     `the published digest must be readonly for the rest of the run:\n${out.stdout}${out.stderr}`)
   assert.match(out.stdout, new RegExp(`^AFTER=${digest[1]}$`, 'm'), out.stdout)
@@ -399,6 +444,14 @@ test('[o3d-kyqa] the shipped publication leaves a sealed tree the shipped resolu
   const walk = (dir: string): string[] => readdirSync(dir).flatMap((name) => {
     const path = join(dir, name)
     const st = lstatSync(path)
+    // THE ONLY SYMBOLIC LINKS UNDER THE ROOT ARE THE TWO POINTERS, and each names a versioned
+    // publication and nothing else. A link anywhere else would be executable surface no digest covers.
+    if (st.isSymbolicLink()) {
+      assert.ok(name === 'helpers' || name === 'driver', `${path} is a symbolic link that is not a pointer`)
+      assert.equal(st.uid, uid, `${path} must be owned by the publishing account`)
+      standingVersionDir(dir, name as 'helpers' | 'driver')
+      return []
+    }
     assert.ok(st.isFile() || st.isDirectory(), `${path} must be a regular file or a directory`)
     assert.equal(st.uid, uid, `${path} must be owned by the publishing account`)
     assert.equal(st.mode & 0o022, 0, `${path} must not be writable by group or other (mode ${(st.mode & 0o7777).toString(8)})`)
@@ -406,10 +459,15 @@ test('[o3d-kyqa] the shipped publication leaves a sealed tree the shipped resolu
   })
   const files = walk(dirs.root)
   assert.ok(files.length >= 4, `the publication must have produced the tree, the record and the manifest: ${files.join(', ')}`)
-  const record = readFileSync(join(dirs.root, 'helper-set.sha256'), 'utf8')
+  const record = readFileSync(standingFile(dirs.root, 'helpers', 'helper-set.sha256'), 'utf8')
   assert.match(record, new RegExp(`^tree_sha256=${digest[1]}$`, 'm'), record)
   assert.match(record, /^tree_complete=1$/m, 'the record must carry its completion sentinel last')
-  assert.match(readFileSync(join(dirs.root, 'helper-set.manifest'), 'utf8'), /\bchown-tree\.mjs$/m)
+  assert.match(readFileSync(standingFile(dirs.root, 'helpers', 'helper-set.manifest'), 'utf8'), /\bchown-tree\.mjs$/m)
+  // AND THE RECORD IS REACHABLE BY THE PATH THE LIBRARY AND THE DOCS NAME — `${pointer}/../<name>`,
+  // which the kernel resolves from the directory the link landed in, so it always names the record of
+  // the tree that is standing. That is what makes one rename commit the tree and its record together.
+  assert.equal(readFileSync(`${join(dirs.root, 'helpers')}/../helper-set.sha256`, 'utf8'), record,
+    'the record must be reachable through the pointer, which is how the library and docs/installation.md name it')
 })
 
 test('[o3d-kyqa] the resolution refuses a tree THIS RUN did not publish, which is what the on-disk record alone cannot detect', (t) => {
@@ -436,7 +494,9 @@ test('[o3d-kyqa] the resolution refuses a tree THIS RUN did not publish, which i
   // the digest comparison talking and not a rig that never resolved anything.
   assert.match(out.stdout, /^PUBLISH_RC=0$/m, `${out.stdout}${out.stderr}`)
   assert.match(out.stdout, /^BEFORE_RC=0$/m, `${out.stdout}${out.stderr}`)
-  assert.match(out.stdout, new RegExp(`^BEFORE=${dirs.root}/helpers/chown-tree\\.mjs$`, 'm'), out.stdout)
+  assert.match(out.stdout,
+    new RegExp(`^BEFORE=${dirs.root}/\\.version-helpers\\.[1-9][0-9]*\\.[A-Za-z0-9]+/helpers/chown-tree\\.mjs$`, 'm'),
+    out.stdout)
   assert.match(out.stdout, /^SECOND_RC=0$/m, `the second publication must succeed:\n${out.stdout}${out.stderr}`)
   assert.doesNotMatch(out.stdout, /^AFTER_RC=0$/m,
     `the resolution must refuse a tree this run did not publish:\n${out.stdout}${out.stderr}`)
@@ -446,7 +506,7 @@ test('[o3d-kyqa] the resolution refuses a tree THIS RUN did not publish, which i
   assert.match(out.stderr, /refusing to execute bytes this run did not publish/, out.stderr)
   assert.match(out.stderr, /sha256sum -c .*helper-set\.manifest/, out.stderr)
   // The RECORD on disk now matches the tampered tree, which is the point of the in-memory digest.
-  const record = readFileSync(join(dirs.root, 'helper-set.sha256'), 'utf8')
+  const record = readFileSync(standingFile(dirs.root, 'helpers', 'helper-set.sha256'), 'utf8')
   const recorded = /^tree_sha256=([0-9a-f]{64})$/m.exec(record)![1]
   const measured = execFileSync('bash', ['-c',
     `cd ${JSON.stringify(join(dirs.root, 'helpers'))} && find . -type f -printf '%P\\0' | LC_ALL=C sort -z | xargs -0 -r sha256sum -- | sha256sum`,
@@ -487,7 +547,7 @@ test('[o3d-kyqa] a published tree made hostile after the publication is refused,
     // THE HAZARD: the tree is made hostile AFTER it was published, and this run's digest is the one
     // it was published with — which is what the second line supplies, since a fresh shell has none.
     shape.plant(dirs.root)
-    const digest = /^tree_sha256=([0-9a-f]{64})$/m.exec(readFileSync(join(dirs.root, 'helper-set.sha256'), 'utf8'))![1]
+    const digest = /^tree_sha256=([0-9a-f]{64})$/m.exec(readFileSync(standingFile(dirs.root, 'helpers', 'helper-set.sha256'), 'utf8'))![1]
     const refused = run(dirs, [
       `IMS_DRIVER_HELPER_SHA256=${JSON.stringify(digest)}`,
       'p="$(privileged_helper_path chown-tree.mjs)"; echo "RESOLVE_RC=$?"',
@@ -599,9 +659,7 @@ test('[o3d-kyqa] IMS_HELPER_SET_SHA256 refuses a tree it does not describe, and 
   const measured = run(dirs, 'publish_privileged_helper_set >/dev/null 2>&1\necho "DIGEST=${IMS_DRIVER_HELPER_SHA256}"')
   const digest = /^DIGEST=([0-9a-f]{64})$/m.exec(measured.stdout)
   assert.ok(digest, measured.stdout + measured.stderr)
-  rmSync(join(dirs.root, 'helpers'), { recursive: true })
-  rmSync(join(dirs.root, 'helper-set.sha256'))
-  rmSync(join(dirs.root, 'helper-set.manifest'))
+  clearStanding(dirs.root, 'helpers')
 
   const wrong = 'f'.repeat(64)
   const refused = run(dirs, PUBLISH_THEN_RESOLVE, { IMS_HELPER_SET_SHA256: wrong })
@@ -677,9 +735,13 @@ test('[o3d-z5be] the driver is published root-owned, with the three entrypoints 
   ].join('\n'))
   assert.match(out.stdout, /^RC=0$/m, `${out.stdout}${out.stderr}`)
   assert.match(out.stdout, /^DIGEST=[0-9a-f]{64}$/m, out.stdout)
-  for (const rel of ['driver/install.sh', 'driver/update.sh', 'driver/deploy.sh', 'driver/lib/chown-tree.mjs', 'driver.sha256', 'driver.manifest']) {
-    assert.ok(existsSync(join(root, rel)), `${rel} must be published`)
-    const st = statSync(join(root, rel))
+  for (const rel of [
+    join(root, 'driver/install.sh'), join(root, 'driver/update.sh'), join(root, 'driver/deploy.sh'),
+    join(root, 'driver/lib/chown-tree.mjs'),
+    standingFile(root, 'driver', 'driver.sha256'), standingFile(root, 'driver', 'driver.manifest'),
+  ]) {
+    assert.ok(existsSync(rel), `${rel} must be published`)
+    const st = statSync(rel)
     assert.equal(st.uid, process.getuid!(), `${rel} must be owned by the publishing account`)
     assert.equal(st.mode & 0o022, 0, `${rel} must not be writable by group or other`)
   }
@@ -879,7 +941,7 @@ test('[o3d-z5be] a driver source an unprivileged account could rewrite publishes
     // AND THE COPY STANDING THERE IS THE ONE THE CONTROL PUBLISHED, byte for byte.
     assert.equal(readFileSync(join(root, 'driver', 'update.sh'), 'utf8'), standing,
       `${shape.name}: a refused publication must replace nothing`)
-    assert.match(readFileSync(join(root, 'driver.sha256'), 'utf8'),
+    assert.match(readFileSync(standingFile(root, 'driver', 'driver.sha256'), 'utf8'),
       new RegExp(`^tree_sha256=${published[1]}$`, 'm'), `${shape.name}: nor the record`)
     assert.deepEqual(readdirSync(root).filter((name) => name.startsWith('.publish-')), [],
       `${shape.name}: and a refused publication leaves no staging directory behind`)
@@ -907,9 +969,7 @@ test('[o3d-z5be] IMS_DRIVER_SHA256 is what an operator vouches with, and it refu
   assert.ok(digest, `${control.stdout}${control.stderr}`)
   assert.equal(documentedDriverDigest(scripts), digest[1],
     'the documented recipe must reproduce the digest the shipped publication records, or no operator can use the pin')
-  rmSync(join(root, 'driver'), { recursive: true })
-  rmSync(join(root, 'driver.sha256'))
-  rmSync(join(root, 'driver.manifest'))
+  clearStanding(root, 'driver')
 
   // NOW THE SOURCE IS ONE SOMEBODY ELSE CAN WRITE, and the content is unchanged — so the release's
   // digest still describes it, and the operator's statement is what lets it through.
@@ -1092,6 +1152,359 @@ test('[o3d-kyqa] a staging directory whose run is gone is swept, and a live one 
   // The publication's own directory is gone too: nothing is left behind on the success path.
   const leftovers = readdirSync(dirs.root).filter((name) => name.startsWith('.publish-') && !name.includes('bbbbbb'))
   assert.deepEqual(leftovers, [], `a completed publication must leave no staging directory: ${leftovers.join(', ')}`)
+})
+
+// ---------------------------------------------------------------------------
+// 3d. TWO PUBLISHERS RACING OVER THE FINAL NAME (o3d-z5be r3, Codex HIGH)
+// ---------------------------------------------------------------------------
+
+/**
+ * A SECOND PUBLISHER, AS A SHELL FRAGMENT: a shadow of `mv` that plants a COMPLETE publication of its
+ * own at the documented name at every instant that name is free, and counts how many instants it found.
+ *
+ * WHY `mv` IS THE SEAM. It is the command every version of this publication has used to change what a
+ * documented name resolves to, so the rig needs to know nothing about the sequence around it — which is
+ * what lets the same test measure the shape that raced and the shape that cannot.
+ */
+function secondPublisherAtEveryFreeInstant(root: string, target: string, bytes: string): string {
+  const theirs = join(root, '.theirs')
+  return [
+    'planted=0',
+    // TAKE THE NAME IF IT IS FREE, and say so. A whole publication of the second run's own: the
+    // interloper is not a marker file, because what the trap turned on was the destination being a
+    // populated DIRECTORY.
+    'take_the_name_if_free() {',
+    `  if [[ -e ${JSON.stringify(target)} ]] || [[ -L ${JSON.stringify(target)} ]]; then return 0; fi`,
+    '  planted=$(( planted + 1 ))',
+    `  command rm -rf ${JSON.stringify(theirs)}`,
+    `  command mkdir -p ${JSON.stringify(theirs)}`,
+    `  printf ${JSON.stringify(bytes)} > ${JSON.stringify(join(theirs, 'chown-tree.mjs'))}`,
+    `  printf ${JSON.stringify(bytes)} > ${JSON.stringify(join(theirs, 'pg-auth-request.mjs'))}`,
+    `  command cp -r ${JSON.stringify(theirs)} ${JSON.stringify(target)}`,
+    '}',
+    // SAMPLED ON BOTH SIDES OF THE RENAME, which is the difference between measuring the window and
+    // measuring one end of it. A sequence that frees the name with something other than `mv` —
+    // `rm -rf ${target}` immediately before the rename, say — opens exactly the window this is about,
+    // and an exit-only sample would never see it.
+    'mv() {',
+    '  take_the_name_if_free',
+    '  command mv "$@"',
+    '  local rc=$?',
+    '  take_the_name_if_free',
+    '  return $rc',
+    '}',
+  ].join('\n')
+}
+
+test('[o3d-z5be] two publishers racing over the FINAL name: no tree is nested inside another and no digest is recorded for bytes the driver will not run', (t) => {
+  // THE FINDING (Codex HIGH, r3). Per-run staging fixed the wrong half. The publication still did
+  // `mv ${target} retired` and then `mv staged ${target}`, and BETWEEN those two the documented name did
+  // not exist — so a second privileged run could take it. `mv src dst` where `dst` is an existing
+  // DIRECTORY does not replace dst: it moves src INSIDE it, as `dst/staged`, and RETURNS SUCCESS. The
+  // loser therefore recorded its own digest, reported a publication, and left its tree nested inside the
+  // winner's, while the documented command executed the winner's top-level files.
+  //
+  // THE FIX UNDER TEST is that the documented name is a symbolic link flipped by one `rename(2)`, so
+  // there is no instant at which it is free and no destination a rename could nest into.
+  const dirs = scratch(t)
+  const target = join(dirs.root, 'helpers')
+  const mine = readFileSync(join(dirs.src, 'chown-tree.mjs'), 'utf8')
+  const theirs = '// THE SECOND PUBLISHER\nprocess.exit(1)\n'
+  const rig = secondPublisherAtEveryFreeInstant(dirs.root, target, theirs)
+
+  // ---- THE RIG CAN FIRE, PROVED WITHOUT THE PUBLICATION IN THE PICTURE. A race test whose interloper
+  // never ran would pass against anything, and this is the only way to know it CAN run that does not
+  // depend on the very sequence under test.
+  const capable = run(dirs, [
+    rig,
+    `mv ${JSON.stringify(join(dirs.work, 'a'))} ${JSON.stringify(join(dirs.work, 'b'))} 2>/dev/null`,
+    'echo "PLANTED=${planted}"',
+    `echo "TOOK_THE_NAME=$( [[ -d ${JSON.stringify(target)} ]] && echo yes || echo no )"`,
+  ].join('\n'))
+  assert.match(capable.stdout, /^PLANTED=1$/m,
+    `the rig must plant when the documented name is free, or it proves nothing below:\n${capable.stdout}${capable.stderr}`)
+  assert.match(capable.stdout, /^TOOK_THE_NAME=yes$/m,
+    `and what it plants must really occupy the name:\n${capable.stdout}${capable.stderr}`)
+  rmSync(target, { recursive: true, force: true })
+
+  // ---- A PUBLICATION IS STANDING, which is the state every box is in after an install. This is what
+  // makes the retire step reachable in the shape that raced.
+  const first = run(dirs, 'publish_privileged_helper_set; echo "RC=$?"')
+  assert.match(first.stdout, /^RC=0$/m, `${first.stdout}${first.stderr}`)
+
+  // ---- AND NOW THE RACE, over the final name, with the second publisher taking it at every instant it
+  // is free.
+  const raced = run(dirs, [
+    rig,
+    'publish_privileged_helper_set; echo "PUBLISH_RC=$?"',
+    'echo "PLANTED=${planted}"',
+    'echo "DIGEST=${IMS_DRIVER_HELPER_SHA256}"',
+  ].join('\n'))
+
+  // NOTHING IS NESTED. This is the assertion the retire-then-rename sequence failed: it left OUR tree at
+  // `helpers/staged/` inside the second publisher's directory.
+  const entries = readdirSync(target, { withFileTypes: true })
+  assert.deepEqual(entries.filter((e) => e.isDirectory()).map((e) => e.name), [],
+    `no publication may end up nested inside another at ${target}: ${entries.map((e) => e.name).join(', ')}`)
+  assert.deepEqual(entries.map((e) => e.name).sort(), ['chown-tree.mjs', 'pg-auth-request.mjs'],
+    `the documented name must hold exactly one flat publication: ${entries.map((e) => e.name).join(', ')}`)
+
+  // AND THE BYTES AT THE DOCUMENTED NAME ARE THE ONES WHOSE DIGEST WAS RECORDED. On the shape that
+  // raced these two disagreed, which is the whole finding.
+  const standingBytes = readFileSync(join(target, 'chown-tree.mjs'), 'utf8')
+  assert.equal(standingBytes, mine,
+    `the documented name must resolve to the publication that reported success:\n${raced.stdout}${raced.stderr}`)
+  assert.notEqual(standingBytes, theirs)
+  assert.match(raced.stdout, /^PUBLISH_RC=0$/m, `${raced.stdout}${raced.stderr}`)
+  const digest = /^DIGEST=([0-9a-f]{64})$/m.exec(raced.stdout)
+  assert.ok(digest, `${raced.stdout}${raced.stderr}`)
+  const measured = execFileSync('bash', ['-c',
+    `cd ${JSON.stringify(target)} && find . -type f -printf '%P\\0' | LC_ALL=C sort -z | xargs -0 -r sha256sum -- | sha256sum`,
+  ], { encoding: 'utf8' }).split(' ')[0]
+  assert.equal(digest[1], measured,
+    'the digest reported as published must be the digest of the tree the documented name resolves to')
+  assert.match(readFileSync(standingFile(dirs.root, 'helpers', 'helper-set.sha256'), 'utf8'),
+    new RegExp(`^tree_sha256=${digest[1]}$`, 'm'),
+    'and the record committed beside that tree must describe it, because one rename committed both')
+
+  // AND THERE WAS NEVER AN INSTANT TO RACE FOR. The rig plants whenever the documented name is free and
+  // it has just been proved able to; that it found no instant is the atomicity claim, measured.
+  assert.match(raced.stdout, /^PLANTED=0$/m,
+    `the publication must never leave the documented name unoccupied:\n${raced.stdout}${raced.stderr}`)
+})
+
+test('[o3d-z5be] the name a publication commits and the name the resolution will follow are the same name', () => {
+  // WHY THIS IS NOT TIDINESS. The versioned directory name is BUILT from ${IMS_DRIVER_VERSION_PREFIX} and
+  // VALIDATED by a literal regular expression inside driver_standing_tree(), because a pointer whose text
+  // is merely followed could name a tree outside the one directory whose ownership this run established.
+  // Two spellings of one name is a silent break: change the constant and every publication still commits,
+  // while every resolution refuses what it just committed — and the failure lands minutes later, as root,
+  // on a box mid-cutover.
+  const prefix = /^readonly IMS_DRIVER_VERSION_PREFIX="([^"]+)"$/
+    .exec(shellConstant(LIB_SOURCE, 'IMS_DRIVER_VERSION_PREFIX', LIB_REL))
+  assert.ok(prefix, 'the version prefix must be one quoted literal')
+  const resolve = shellFunction(LIB_SOURCE, 'driver_standing_tree', LIB_REL)
+  const escaped = prefix[1].replace(/\./g, '\\.')
+  assert.ok(resolve.includes(`^${escaped}`),
+    `driver_standing_tree() must validate the prefix it is committed under (^${escaped}); it says:\n${resolve}`)
+  // AND THE SWEEP MUST KNOW THE SAME THREE NAMES, or residue accumulates under /etc unexamined.
+  const sweep = shellFunction(LIB_SOURCE, 'driver_sweep_orphans', LIB_REL)
+  for (const name of ['IMS_DRIVER_PUBLISH_PREFIX', 'IMS_DRIVER_VERSION_PREFIX', 'IMS_DRIVER_RETIRE_PREFIX', 'IMS_DRIVER_POINTER_PREFIX']) {
+    assert.ok(sweep.includes(name), `driver_sweep_orphans() must collect ${name} residue`)
+  }
+})
+
+test('[o3d-z5be] a publication another run overtakes at the final name reports NOTHING published', (t) => {
+  // THE OTHER HALF OF THE SAME RACE. Whichever rename lands last decides what stands — that is what a
+  // single mutable object means, and both candidates are complete, sealed, separately vouched-for trees.
+  // What must not happen is the loser announcing a digest for bytes the documented command will not run.
+  const dirs = scratch(t)
+  const target = join(dirs.root, 'helpers')
+  const theirs = '// THE RUN THAT LANDED LAST\nprocess.exit(1)\n'
+  const overtake = [
+    'overtaken=0',
+    'mv() {',
+    '  command mv "$@"',
+    '  local rc=$?',
+    `  if (( rc == 0 )) && [[ "\${!#}" == ${JSON.stringify(target)} ]] && (( overtaken == 0 )); then`,
+    '    overtaken=1',
+    `    command rm -rf ${JSON.stringify(join(dirs.root, '.theirs'))} ${JSON.stringify(target)}`,
+    `    command mkdir -p ${JSON.stringify(join(dirs.root, '.theirs'))}`,
+    `    printf ${JSON.stringify(theirs)} > ${JSON.stringify(join(dirs.root, '.theirs', 'chown-tree.mjs'))}`,
+    `    command cp -r ${JSON.stringify(join(dirs.root, '.theirs'))} ${JSON.stringify(target)}`,
+    '  fi',
+    '  return $rc',
+    '}',
+  ].join('\n')
+
+  const out = run(dirs, [
+    overtake,
+    'publish_privileged_helper_set; echo "PUBLISH_RC=$?"',
+    'echo "OVERTAKEN=${overtaken}"',
+    'echo "DIGEST=${IMS_DRIVER_HELPER_SHA256}"',
+    'p="$(privileged_helper_path chown-tree.mjs)"; echo "RESOLVE_RC=$?"',
+  ].join('\n'))
+
+  // PRECONDITION: the rig really did take the name after this run's own rename landed.
+  assert.match(out.stdout, /^OVERTAKEN=1$/m,
+    `the second run must have taken the name after this one committed:\n${out.stdout}${out.stderr}`)
+  assert.equal(readFileSync(join(target, 'chown-tree.mjs'), 'utf8'), theirs,
+    'precondition: the tree standing at the documented name is the other run\'s')
+
+  // MEASURED ON THE DIGEST AND THE REASON, NOT ON THE RETURN CODE — the same reason
+  // assertPublishedNothing() gives: publish_privileged_helper_set() TOLERATES a failure when the account
+  // running it is not root, and this harness is not root, so a return code would be measuring the
+  // tolerance. ${IMS_DRIVER_HELPER_SHA256} is what actually gates every later execution.
+  assert.match(out.stdout, /^DIGEST=$/m,
+    `no digest may be recorded for bytes the documented name does not resolve to:\n${out.stdout}${out.stderr}`)
+  assert.match(out.stderr, /another privileged run published/, out.stderr)
+  assert.doesNotMatch(out.stdout, /^RESOLVE_RC=0$/m,
+    'and nothing may be resolved out of a snapshot this run does not hold the digest of')
+})
+
+test('[o3d-z5be] a publication that fails after its tree is built leaves the PREVIOUS one standing, which is what the caller reports', (t) => {
+  // THE FINDING (Codex MEDIUM 1, r3). The retired tree was deleted, and the record, manifest and final
+  // fsync were written, AFTER the swap. A failure in any of them returned nonzero — callers say "the
+  // driver was NOT refreshed" — with the NEW tree already standing and nothing left to restore, and
+  // driver execution consults no record, so the next documented invocation ran the new bytes anyway.
+  //
+  // THE FIX UNDER TEST is that the record is written beside the tree inside the staging directory and the
+  // pointer flip is the LAST mutation, so every failure path is upstream of anything becoming visible.
+  //
+  // THE INJECTION IS AT A SHIPPED SEAM: `_fence_publish_file` takes its temporary through `mktemp
+  // "${target}.XXXXXX"`, so refusing that one `mktemp` fails exactly the record write, wherever in the
+  // sequence it happens to be.
+  const dirs = scratch(t, ['chown-tree.mjs'])
+  writeFileSync(join(dirs.src, 'chown-tree.mjs'), '// THE PUBLICATION THAT STANDS\n')
+  const first = run(dirs, 'publish_privileged_helper_set; echo "RC=$?"')
+  assert.match(first.stdout, /^RC=0$/m, `${first.stdout}${first.stderr}`)
+  const standing = readFileSync(join(dirs.root, 'helpers', 'chown-tree.mjs'), 'utf8')
+  // THE RECORD NAMED THE WAY THE LIBRARY AND THE DOCS NAME IT, through the pointer. This path reaches the
+  // record of the standing publication whichever way a release keeps it — `helpers/..` is the root itself
+  // when `helpers` is a plain directory — so the assertions below are about the ORDERING and not about
+  // the layout, which is what lets the same test fail against the sequence it was written for.
+  const standingRecordPath = `${join(dirs.root, 'helpers')}/../helper-set.sha256`
+  const standingRecord = readFileSync(standingRecordPath, 'utf8')
+
+  // The next release's bytes, and a record write that cannot complete.
+  writeFileSync(join(dirs.src, 'chown-tree.mjs'), '// THE PUBLICATION THAT MUST NOT LAND\n')
+  // THE COUNT GOES TO A FILE, NOT A VARIABLE. `_fence_publish_file` takes its temporary through
+  // `tmp="$(mktemp ...)"` — a command substitution — and a variable incremented inside one dies with the
+  // subshell, so a counter would read zero however many times the shadow fired.
+  const marks = join(dirs.work, 'record-writes-refused')
+  const failed = run(dirs, [
+    'mktemp() {',
+    `  if [[ "$*" == *helper-set.sha256.XXXXXX* ]]; then echo x >> ${JSON.stringify(marks)}; return 1; fi`,
+    '  command mktemp "$@"',
+    '}',
+    'publish_privileged_helper_set; echo "PUBLISH_RC=$?"',
+    `echo "REFUSED=$( [[ -f ${JSON.stringify(marks)} ]] && wc -l < ${JSON.stringify(marks)} || echo 0 )"`,
+    'echo "DIGEST=${IMS_DRIVER_HELPER_SHA256}"',
+  ].join('\n'))
+
+  // PRECONDITION: the record write really was the thing that failed, once.
+  assert.match(failed.stdout, /^REFUSED=1$/m,
+    `the record write must have been reached and refused:\n${failed.stdout}${failed.stderr}`)
+  // AND THE REPORT IS THE REFUSAL, not the return code: publish_privileged_helper_set() tolerates a
+  // failure off root and this harness is not root, so the digest and the reason are the measurement.
+  assert.match(failed.stdout, /^DIGEST=$/m, failed.stdout)
+
+  // AND THE STATE MATCHES THE REPORT. This is the assertion the previous ordering failed: it reported
+  // "not refreshed" while the new tree was the one the documented command would execute.
+  assert.equal(readFileSync(join(dirs.root, 'helpers', 'chown-tree.mjs'), 'utf8'), standing,
+    'the tree the documented name resolves to must be the one the caller was told is still standing')
+  assert.equal(readFileSync(standingRecordPath, 'utf8'), standingRecord,
+    'and its record must be untouched, so the record still describes the tree that is running')
+  assert.deepEqual(readdirSync(dirs.root).filter((name) => name.startsWith('.publish-')), [],
+    'and the abandoned staging tree must be gone')
+  assert.equal(readdirSync(dirs.root).filter((name) => name.startsWith('.version-')).length, 1,
+    'and no half-published version may be left under the root')
+  // AND THE REASON SAYS WHICH STEP FAILED, on stderr, where a caller reading this library through a
+  // command substitution can see it.
+  assert.match(failed.stderr, /the digest record for the privileged helper set could not be written/,
+    `the caller must be told the record could not be written:\n${failed.stderr}`)
+})
+
+test('[o3d-z5be] a superseded publication is swept once nothing names it, and the standing one never is', (t) => {
+  // THE COST OF PUBLISHING BY POINTER FLIP, PAID RATHER THAN LEFT. Every publication is a new directory,
+  // so without a sweep /etc accumulates every release ever deployed. And "only the superseded ones" is
+  // the half that has to be measured: a sweep that took the STANDING tree would break the documented
+  // command, and one that took a LIVE publisher's would be the substitution bug again.
+  const dirs = scratch(t, ['chown-tree.mjs'])
+  const versions: string[] = []
+  for (let i = 0; i < 3; i += 1) {
+    writeFileSync(join(dirs.src, 'chown-tree.mjs'), `// release ${i}\n`)
+    const out = run(dirs, [
+      // A versioned directory named for THIS program's own shell, alive for as long as the publication
+      // runs — so a sweep that asked no question about liveness would take it.
+      `live=${JSON.stringify(join(dirs.root, '.version-helpers'))}.$$.zzzzzz`,
+      'command mkdir -p "${live}"',
+      'publish_privileged_helper_set; echo "RC=$?"',
+      'echo "LIVE_KEPT=$( [[ -d "${live}" ]] && echo yes || echo no )"',
+    ].join('\n'))
+    assert.match(out.stdout, /^RC=0$/m, `publication ${i}: ${out.stdout}${out.stderr}`)
+    assert.match(out.stdout, /^LIVE_KEPT=yes$/m,
+      `publication ${i}: a versioned directory whose publisher is alive must be left alone:\n${out.stdout}`)
+    // The live decoy is this test's, not a publication: take it away so the next round measures the
+    // sweep against real versions only.
+    for (const name of readdirSync(dirs.root)) {
+      if (name.endsWith('.zzzzzz')) rmSync(join(dirs.root, name), { recursive: true, force: true })
+    }
+    versions.push(standingVersionDir(dirs.root, 'helpers'))
+  }
+
+  // PRECONDITION: three distinct publications really happened.
+  assert.equal(new Set(versions).size, 3, `each publication must be its own directory: ${versions.join(', ')}`)
+  // THE STANDING ONE IS THERE, and the oldest — superseded twice over, its publisher gone — is not.
+  assert.ok(existsSync(versions[2]), 'the standing publication must never be swept')
+  assert.equal(readFileSync(join(dirs.root, 'helpers', 'chown-tree.mjs'), 'utf8'), '// release 2\n')
+  assert.equal(existsSync(versions[0]), false,
+    `a publication nothing names, whose publisher is gone, must be swept: ${versions[0]} is still there`)
+})
+
+// ---------------------------------------------------------------------------
+// 3e. HOW STALE THE STANDING DRIVER CAN GET, AND SAYING SO (o3d-z5be r3, Codex MEDIUM 2)
+// ---------------------------------------------------------------------------
+
+test('[o3d-z5be] the documented lag is unbounded rather than "one release", and the standing driver reports its own age', (t) => {
+  // THE FINDING (Codex MEDIUM 2). A no-digest update deliberately leaves the driver untouched, so
+  // repeated successful updates leave it arbitrarily many releases behind — while three statements said
+  // otherwise: docs/installation.md called the copy "refreshed by every successful update" and "at most
+  // one release behind", and update.sh called it the previous release.
+  const doc = readFileSync(join(REPO, 'docs/installation.md'), 'utf8')
+  const upd = ENTRYPOINT_SOURCE.get('scripts/update.sh')!
+  // PRECONDITIONS, so a walk that stopped reaching the files cannot pass as a walk that found the
+  // claims corrected. Both files, and the section each claim lives in.
+  assert.ok(doc.length > 100_000 && upd.length > 100_000, 'both files must have been read in full')
+  assert.ok(doc.includes('sudo bash /etc/ims-cutover-driver/driver/update.sh'),
+    'the documented update command must still be in installation.md, or this test is reading the wrong text')
+  assert.ok(upd.includes('publish_privileged_driver "${APP_DIR}/scripts"'),
+    'and update.sh must still refresh the driver at the end of a successful run')
+
+  // THE THREE CORRECTED STATEMENTS. Each is asserted as a claim about the bound, not by proximity to a
+  // paragraph that could sit next to the text correcting it.
+  for (const [where, text, stale] of [
+    ['docs/installation.md', doc, 'at most one release behind'],
+    ['docs/installation.md', doc, 'refreshed by every'],
+    ['scripts/update.sh', upd, 'ALWAYS ONE RELEASE BEHIND'],
+    ['scripts/update.sh', upd, "The copy standing there is the previous release's"],
+  ] as const) {
+    assert.ok(!text.includes(stale), `${where} must no longer claim "${stale}": the lag is not bounded at one`)
+  }
+  assert.ok(doc.includes('not bounded at one'), 'installation.md must say what is true instead')
+  assert.ok(doc.includes('refreshes nothing'),
+    'and that an update without the digest completes while refreshing nothing')
+  assert.ok(upd.includes('AT LEAST ONE RELEASE BEHIND WHAT IT DEPLOYS, AND THE LAG IS NOT BOUNDED AT ONE'),
+    'and update.sh must say the same about the copy it declines to refresh')
+
+  // AND THE STANDING DRIVER CAN SAY HOW OLD IT IS, which is what gives an operator who never supplies a
+  // digest something to notice. Measured for real: publish, backdate the record, read the note.
+  const { root, scripts, dirs } = scratchRelease(t, 'privileged-driver-age-')
+  const published = run(dirs, [
+    `publish_privileged_driver ${JSON.stringify(scripts)}; echo "RC=$?"`,
+    'echo "NOTE=$(privileged_driver_age_note)"',
+  ].join('\n'))
+  assert.match(published.stdout, /^RC=0$/m, `${published.stdout}${published.stderr}`)
+  assert.match(published.stdout, /^NOTE=.*was published 0 day\(s\) ago/m,
+    `a driver published just now must report an age of zero:\n${published.stdout}${published.stderr}`)
+
+  const record = standingFile(root, 'driver', 'driver.sha256')
+  const backdated = readFileSync(record, 'utf8')
+    .replace(/^tree_published_at=\d+$/m, `tree_published_at=${Math.floor(Date.now() / 1000) - 400 * 86_400}`)
+  assert.match(backdated, /^tree_published_at=\d+$/m, 'the record must carry a publication date to backdate')
+  writeFileSync(record, backdated)
+  const aged = run(dirs, 'echo "NOTE=$(privileged_driver_age_note)"')
+  assert.match(aged.stdout, /^NOTE=.*was published 400 day\(s\) ago.*NOT one release behind/m,
+    `the note must read the date off the standing record:\n${aged.stdout}${aged.stderr}`)
+
+  // AND UPDATE.SH PRINTS IT ON THE PATH WHERE THE REFRESH DID NOT HAPPEN, which is the only path an
+  // operator who never supplies a digest ever takes.
+  const warnBlock = upd.slice(upd.indexOf('DRIVER_PUBLISH_RC == 0'))
+  const elseBranch = warnBlock.slice(0, warnBlock.indexOf('DEPLOY_OK=true'))
+  assert.ok(elseBranch.includes('privileged_driver_age_note'),
+    'update.sh must print the standing driver\'s age where it reports that the refresh did not happen')
+  assert.ok(elseBranch.indexOf('was NOT refreshed') < elseBranch.indexOf('privileged_driver_age_note'),
+    'and it must print it as part of that report rather than somewhere unrelated')
 })
 
 test('[o3d-z5be] the three-valued status is the shipped contract, and both entrypoints read all three', () => {
