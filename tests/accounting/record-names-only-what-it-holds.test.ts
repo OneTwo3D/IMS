@@ -1706,11 +1706,19 @@ const RECORD_PROSE: readonly string[] = [
   ", but sync row {syncRowId} already named a DIFFERENT draft journal (unknown) — a newer claim posted while this attempt was on the wire.",
   "THIS RECORD DOES NOT NAME THE BILL THE PDF WENT ONTO, so it cannot send you to the duplicates and nothing kept here derives the bill.",
   ", but sync row {syncRowId} already named a DIFFERENT external id (unknown) — a newer claim posted while this attempt was on the wire.",
-  "ANOTHER COPY OF THE INVOICE EMAIL IS QUEUED TO THE CUSTOMER — one more PENDING accounting-invoice row in the email outbox per sweep",
+  // ROUND 16 (Codex MEDIUM): re-read because o3d-alnk's partial unique index made the old
+  // per-sweep count false. It names no act; it says what happens and what does not.
+  // ROUND 18 (Codex MEDIUM): re-read AGAIN, because round 16's replacement asserted a CADENCE
+  // instead of grepping one. The two schedules are in the repo — accounting-sync `*/5 * * * *`
+  // (lib/cron-jobs/xero.ts) and `/api/cron/email-outbox` Hourly (help-docs/settings.md) — and they
+  // are the opposite way round from what it said. Still prose, still naming no act.
+  "ANOTHER COPY OF THE INVOICE EMAIL IS QUEUED TO THE CUSTOMER — a PENDING accounting-invoice row in the email outbox — on the next sweep that runs once the outbox has FINISHED with the copy before it. COPIES DO NOT PILE UP UNDELIVERED: the email outbox refuses a second undelivered row for this order, so a sweep that lands while one is still PENDING or PROCESSING queues nothing and reports success anyway. THE REPETITION IS PACED BY THE OUTBOX DRAIN, NOT BY THIS SWEEP: this sweep is scheduled every five minutes and the outbox drain is scheduled hourly, so MOST SWEEPS QUEUE NOTHING — around a dozen in a row meet the same undelivered row — and the refusal lifts only when a drain settles that row to SENT or FAILED. Count copies against the OUTBOX cadence, never one per sweep",
   ", but sync row {syncRowId} already named a DIFFERENT document (unknown) — a newer claim posted while this attempt was on the wire.",
   ", but sync row {syncRowId} already named a DIFFERENT payment (unknown) — a newer claim posted while this attempt was on the wire.",
   ", but sync row {syncRowId} already named a DIFFERENT journal (unknown) — a newer claim posted while this attempt was on the wire.",
-  "it QUEUED an invoice email to the customer — one PENDING row in the local email outbox. It succeeds by QUEUEING, not by sending",
+  // ROUND 16 (Codex MEDIUM): the same count on the reset-record side. A successful attempt may
+  // have written no row at all, and this sentence now says so instead of promising one.
+  "it QUEUED an invoice email to the customer, or found one already queued and undelivered and wrote no second row, and THIS RECORD DOES NOT SAY WHICH OF THE TWO. Either way it succeeds by QUEUEING, not by sending",
   ", but sync row {syncRowId} already named a DIFFERENT draft (unknown) — a newer claim posted while this attempt was on the wire.",
   "The row was left naming the first one. ONE OF THE TWO IDS IS NOT RECORDED HERE, so they cannot both be opened. REMEDY:",
   "The draft it changed is in {ledger} all the same, it stood there before this attempt ran, and it moved no balances.",

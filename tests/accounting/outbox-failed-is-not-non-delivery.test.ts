@@ -40,6 +40,7 @@ type OutboxRow = {
   lastError: string | null
   availableAt: Date
   processingStartedAt: Date | null
+  lockedBy: string | null
   sentAt: Date | null
   createdAt: Date
 }
@@ -59,6 +60,7 @@ function outboxRow(overrides: Partial<OutboxRow> = {}): OutboxRow {
     lastError: null,
     availableAt: new Date(0),
     processingStartedAt: null,
+    lockedBy: null,
     sentAt: null,
     createdAt: new Date(0),
     ...overrides,
@@ -79,23 +81,28 @@ mock.module('@/lib/db', {
     db: {
       emailOutbox: {
         findMany: async () => state.rows.filter((row) => row.attempts < 5 && row.status === 'PENDING'),
-        updateMany: async ({ where }: { where: { id: string } }) => {
+        // o3d-alnk: every write is now an updateMany — the claim, and each FENCED terminal write.
+        // The two are told apart the way Postgres tells them apart: a terminal write repeats the
+        // claim (`lockedBy`) in its WHERE, and matches nothing when this worker no longer holds it.
+        updateMany: async (
+          { where, data }: { where: { id: string; lockedBy?: string }; data: Record<string, unknown> },
+        ) => {
           const row = state.rows.find((candidate) => candidate.id === where.id)
           if (!row) return { count: 0 }
-          row.status = 'PROCESSING'
-          row.processingStartedAt = new Date()
-          return { count: 1 }
-        },
-        update: async ({ where, data }: { where: { id: string }; data: Record<string, unknown> }) => {
-          const row = state.rows.find((candidate) => candidate.id === where.id)
-          if (!row) throw new Error('row gone')
+          if (where.lockedBy === undefined) {
+            row.status = 'PROCESSING'
+            row.processingStartedAt = data.processingStartedAt as Date
+            row.lockedBy = data.lockedBy as string
+            return { count: 1 }
+          }
+          if (where.lockedBy !== row.lockedBy) return { count: 0 }
           // THE INTERLEAVING. The SENT stamp is the write that fails; every other write lands, so
           // the row that comes out of this is the row the shipped catch decided on.
           if (state.failSentStamp && data.status === 'SENT') {
             throw new Error('could not write SENT: connection terminated')
           }
           Object.assign(row, data)
-          return row
+          return { count: 1 }
         },
       },
       emailSuppression: {

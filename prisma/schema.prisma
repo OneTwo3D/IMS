@@ -4000,11 +4000,22 @@ model EmailOutbox {
   attempts            Int              @default(0)
   lastError           String?
   availableAt         DateTime         @default(now())
+  /// o3d-alnk: (lockedBy, processingStartedAt) is the claim fence. `lockedBy` is a
+  /// per-CLAIM random token — NOT a per-duty constant like the integration outbox's
+  /// lockedBy — so two runs of the same cron are distinguishable even when they claim
+  /// in the same millisecond. Every terminal write in processPendingEmailOutbox is an
+  /// updateMany whose WHERE repeats this pair, so a worker whose row was reclaimed
+  /// while it was on the SMTP socket matches zero rows and cannot re-arm the row.
   processingStartedAt DateTime?
+  lockedBy            String?
   sentAt              DateTime?
   createdAt           DateTime         @default(now())
   updatedAt           DateTime         @updatedAt
 
+  /// A DB-native PARTIAL UNIQUE INDEX `email_outbox_undelivered_reference_uq` on
+  /// (kind, referenceType, referenceId) WHERE status IN ('PENDING','PROCESSING') also
+  /// guards this table. Prisma cannot express a filtered unique, so it lives only in
+  /// prisma/migrations/20260910120000_email_outbox_claim_fence/migration.sql.
   @@index([status, availableAt])
   @@index([referenceType, referenceId])
   @@map("email_outbox")

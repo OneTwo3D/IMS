@@ -73,7 +73,7 @@ export const LandedCostJournalOutboxPayloadSchema = z.object({
 })
 
 /**
- * WHAT MAKES A SECOND EXECUTION OF THIS OPERATION SAFE (o3d-8td2). Both fields are REQUIRED, so
+ * WHAT MAKES A REPEAT EXECUTION OF THIS OPERATION SAFE (o3d-8td2). Both fields are REQUIRED, so
  * `tsc` refuses a new registered operation until somebody has answered — see
  * `lib/domain/integrations/outbox-replay-policy.ts` for what each answer asserts, and for why the
  * outbox's own compare-and-set cannot answer it. Every entry's answer must be justified in a
@@ -126,7 +126,13 @@ export const INTEGRATION_OUTBOX_REGISTRY = defineOutboxRegistry({
     //
     //   worker A resolves stock_quantity = 10 (resolvePushStockQuantity, ~line 1093) and pauses
     //   before `pushBatchWithFence` reaches the socket; stock falls to 0 and enqueues its own row —
-    //   which, sharing this product's idempotency key, IS this row; ten minutes later worker B
+    //   which, sharing this product's idempotency key, IS this row; ONE RECLAIM WINDOW later — TEN
+    //   MINUTES, which is `INTEGRATION_OUTBOX_DRAIN_LEASES_MS.default`, because this drain's
+    //   `claimIntegrationOutboxWork` call (lib/connectors/woocommerce/sync/stock-sync-jobs.ts) passes
+    //   no `staleLockMs` and so takes that default (round 33 struck this number out as "no window this
+    //   build has", and r34's duration audit found it IS one — the default lease; the ordering hazard
+    //   does not depend on the number, but a number this build does have should be named with its
+    //   source rather than deleted) — worker B
     //   reclaims it, computes 0, pushes 0 and completes it SUCCEEDED; A then resumes and pushes 10.
     //
     // A is fenced out of the ROW (its `completeClaimedJob` CAS fails and it throws), but WooCommerce
@@ -154,8 +160,10 @@ export const INTEGRATION_OUTBOX_REGISTRY = defineOutboxRegistry({
     //   (lib/connectors/woocommerce/sync/reconcile.ts) calls `pushStockToWc({ forceAll: true })`
     //   DIRECTLY. It never enqueues, never claims, never completes an outbox row. So it re-pushes
     //   the correct quantity once a day and leaves the park untouched — which means the park
-    //   survives every reconcile, and between two of them a change made a minute after the crash
-    //   waits up to 24 hours. For a stock quantity that is an oversell window, not a delay.
+    //   survives every reconcile, and between two of them a change made immediately after the crash
+    //   waits up to 24 hours — the reconcile is documented Daily (help-docs/settings.md, the
+    //   `/api/cron/wc-reconcile` cron-table row, the repo's only statement of its cadence). For a
+    //   stock quantity that is an oversell window, not a delay.
     //
     //   THE PARK WAS NOT VISIBLE WHERE ANYBODY LOOKS. The exception inbox listed `PERMANENT_FAILED`
     //   and nothing else, so a stalled PROCESSING row appeared on no operator surface at all; the
@@ -175,12 +183,13 @@ export const INTEGRATION_OUTBOX_REGISTRY = defineOutboxRegistry({
     // SO THE HONEST POSITION IS WORSE THAN ROUND 2 CLAIMED AND IS WRITTEN DOWN AS SUCH: a row parked
     // here is invisible on the exception inbox (the admin outbox API can still list PROCESSING rows
     // to somebody who already suspects one), the daily reconcile corrects the QUANTITY once a day
-    // without touching the row, and every stock change in between is folded into the park and waits.
+    // (the `/api/cron/wc-reconcile` cron-table row, as above) without touching the row, and every
+    // stock change in between is folded into the park and waits.
     // What this branch does fix is the VERDICT — `unsafe-to-replay` here and on `xero/accounting.post`
     // — so no second worker is handed the row at all. o3d-22jw tracks the black hole; o3d-7qdb tracks
     // an operator remedy that does not rest on elapsed time.
     //
-    // THE PARK IS STILL A PARK, and that is deliberate. An automatic drain would be a second worker
+    // THE PARK IS STILL A PARK, and that is deliberate. An automatic drain would be another worker
     // executing the same absolute push, which is the exact reordering hazard this entry is
     // `unsafe-to-replay` for; a self-healing sweep here would reintroduce the defect while looking
     // like the fix. The real fix is the monotonic push generation named above.
@@ -209,20 +218,110 @@ export const INTEGRATION_OUTBOX_REGISTRY = defineOutboxRegistry({
     //
     // INVOICE_EMAIL is the counterexample that decides the entry. Its fence is
     // `lease.fenceBeforeRemoteWrite('invoice-email')` with NO dispatch write, and the effect behind
-    // it is `sendAccountingInvoiceEmailInternal` -> `queueEmail` -> a bare `db.emailOutbox.create`.
-    // `EmailOutbox` has no idempotency key and no unique constraint of any kind. Worker A can insert
-    // the row and pause before completing its sync-log and outbox rows; fifteen minutes later worker
-    // B reclaims, passes its own fence honestly (A's lock is now stale), and inserts a SECOND row.
-    // Both are delivered. The processor's own comment at that call site says what that means: "a
-    // second worker here means the customer receives the invoice twice", and POST_EFFECT.INVOICE_EMAIL
-    // adds that the email CANNOT be recalled. A claim proof taken before the effect cannot couple
-    // that effect to the completion; only evidence that outlives the worker can.
+    // it is `sendAccountingInvoiceEmailInternal` -> `queueEmail` -> `db.emailOutbox.create`. Worker A
+    // can insert the row and pause before completing its sync-log and outbox rows; ONE RECLAIM
+    // WINDOW later — FIFTEEN MINUTES, which is
+    // `INTEGRATION_OUTBOX_DRAIN_LEASES_MS.xeroAccountingEntry`, derived in item 1 below rather than
+    // recalled here — worker B reclaims, passes its own fence honestly (A's lock is now stale), and
+    // ATTEMPTS ANOTHER row.
+    // THE RECLAIM ALONE DOES NOT MAKE THAT SECOND ROW EXIST (Codex round 33, HIGH; this
+    // sentence used to end "Both are delivered" while item 1 below established the condition — a
+    // stale claim sitting beside its own correction, which is the shape the cadence guard now checks
+    // paragraph by paragraph). ROUND 33 ALSO RE-NUMBERED THIS WINDOW FROM FIFTEEN TO TWENTY AND THAT
+    // WAS ITSELF WRONG (Codex round 34, HIGH 1): it took the number from
+    // `ADMIN_OUTBOX_STALE_PROCESSING_LOCK_MS`, which is 1_200_000 ms and gates only an admin
+    // DEAD-LETTERING a row by hand, whereas the window a reclaim waits is the `staleLockMs` the Xero
+    // drain passes to `claimIntegrationOutboxWork`. B's insert
+    // is REFUSED while A's copy is still undelivered, and ACCEPTED once a drain has settled A's copy
+    // out of the index's predicate — so the duplicate, and with it the extra delivery, arrives only
+    // when the replay CROSSES A DRAIN. Item 1 works that condition out from the cadences; what it
+    // does NOT soften is the consequence when it is met. The processor's own comment at that call
+    // site now agrees, in the same words: a reclaiming worker there
+    // "does NOT by itself mail a further copy", because the enqueue answers `already_queued` and
+    // writes nothing while A's copy is undelivered. That comment used to say the opposite ("a second worker
+    // here means the customer receives the invoice twice"), which THIS branch made false, and Codex
+    // round 35 found it still standing one call frame away from the change that falsified it.
+    // POST_EFFECT.INVOICE_EMAIL adds that the email CANNOT be recalled once a copy does go, and it no
+    // longer claims the attempt SENT one. A claim proof taken before the effect cannot couple that
+    // effect to the completion; only evidence that outlives the worker can.
     //
-    // AND THE QUEUE IT ENQUEUES INTO CANNOT RESIST REPLAY EITHER (o3d-alnk, P1). That EmailOutbox
-    // has no holder identity — `processingStartedAt` is a timestamp, not a `lockedBy` — and every
-    // terminal write is an unfenced `update({ where: { id } })`. An effect whose downstream queue is
-    // itself unfenced cannot be declared replay-safe on the strength of the upstream fence, so even
-    // a dispatch record minted here would not on its own settle this entry.
+    // THE TWO DATABASE FACTS THIS USED TO REST ON ARE BOTH GONE, AND THE VERDICT IS UNCHANGED
+    // (o3d-alnk). Rounds 1-3 argued the above from two properties of the table, and o3d-alnk's fence
+    // branch removed both. They are restated here as what is TRUE AFTER BOTH BRANCHES, because a
+    // verdict standing on a false reason is a verdict nobody can re-check:
+    //
+    //   1. IT SAID `EmailOutbox` HAS "no idempotency key and no unique constraint of any kind".
+    //      It now has `email_outbox_undelivered_reference_uq`, a PARTIAL unique index on
+    //      (kind, referenceType, referenceId) WHERE status IN ('PENDING','PROCESSING'). That refuses
+    //      a duplicate UNDELIVERED ROW — and a duplicate undelivered row is not the hazard.
+    //      THE CADENCES IN THIS PARAGRAPH WERE THE WRONG WAY ROUND (Codex round 19, MEDIUM). Round 18
+    //      corrected this same false premise in lib/domain/accounting/unrecorded-posted-document.ts
+    //      and left THIS copy of it standing: one claim, two readers, one of them fixed. Both are now
+    //      read out of the repo rather than recalled, and the cadence test walks both files.
+    //      THE RECLAIM WINDOW IS THE `staleLockMs` THE XERO DRAIN PASSES, AND NOT THE DEAD-LETTER
+    //      GATE (Codex round 34, HIGH 1 — round 21 named the gate here and round 33 propagated its
+    //      number, and both were wrong about WHICH window this paragraph is about). What re-takes a
+    //      PROCESSING `xero/accounting.post` row is `claimIntegrationOutboxWork`, and the only
+    //      `staleLockMs` it is ever given for this operation is `CLAIM_STALE_MS` in
+    //      lib/connectors/xero/sync-processor.ts, which is
+    //      `INTEGRATION_OUTBOX_DRAIN_LEASES_MS.xeroAccountingEntry` — 900_000 ms, FIFTEEN MINUTES
+    //      (`xeroAccountingEntry` in
+    //      lib/domain/integrations/outbox-leases.ts). That is the window, and it is the one number
+    //      this paragraph rests on.
+    //      THE OTHER WINDOW, NAMED SO IT CANNOT BE MISTAKEN FOR THIS ONE A FOURTH TIME:
+    //      `ADMIN_OUTBOX_STALE_PROCESSING_LOCK_MS` is `INTEGRATION_OUTBOX_MAX_LEASE_MS` (the largest
+    //      lease any drain in this build may take) PLUS `ADMIN_OUTBOX_POST_LEASE_MARGIN_MS` (the
+    //      five-minute clock-skew margin declared beside it in
+    //      lib/domain/integrations/outbox-admin.ts), so `ADMIN_OUTBOX_STALE_PROCESSING_LOCK_MS` is
+    //      1_200_000 ms, TWENTY MINUTES — and its one consumer is
+    //      `permanentlyFailIntegrationOutboxAdminRow`, i.e. how old a lock must be before an admin may
+    //      DEAD-LETTER the row under it. It gates a manual burial and it reclaims nothing, so it is
+    //      longer than the reclaim window by construction and has no part in the duplication story
+    //      below. Both windows are described in the same English — "a PROCESSING row goes stale after
+    //      N minutes" — which is exactly how the wrong one got substituted for the right one twice.
+    //      The email drain is documented HOURLY (help-docs/settings.md, the `/api/cron/email-outbox`
+    //      row of the cron table — the repo's only statement of its cadence).
+    //      FIFTEEN MINUTES (`INTEGRATION_OUTBOX_DRAIN_LEASES_MS.xeroAccountingEntry`, above) IS
+    //      INSIDE THE HOUR (the `/api/cron/email-outbox` cron-table row, above), so when worker B
+    //      replays, worker A's copy is usually STILL PENDING — inside the predicate — and the index
+    //      REFUSES B's insert. Both durations are sourced again here on purpose (Codex round 35,
+    //      HIGH 1): this is the sentence the whole ordering rests on, and it named two windows and
+    //      attributed neither. The duplicate
+    //      arrives when the timing CROSSES A DRAIN: a drain settles A's copy to SENT, a SENT row is
+    //      outside the predicate, B's insert is then accepted, and the customer is emailed twice.
+    //      So the index closes the window in which nothing had been delivered yet and leaves open the
+    //      one in which something has — which is what decides the verdict. Only the RATE was wrong,
+    //      and a rate is a thing to grep. NO CONSTRAINT IN THE CURRENT SCHEMA CLOSES THE REMAINDER — and that is a
+    //      statement about THIS SCHEMA, not about constraints (Codex round 16, MEDIUM). Rounds 1-3
+    //      wrote that no constraint COULD have closed it, reasoning that a send is not a database
+    //      write so refusing a duplicate ROW cannot unsend a mail already on the wire. That is true of
+    //      the index we have, whose predicate ends at delivery, and false as a general claim: a
+    //      LIFETIME uniqueness key on (kind, referenceType, referenceId), or an upstream-effect
+    //      idempotency key written at the enqueue, would refuse worker B's ENQUEUE — and an enqueue
+    //      refused before it happens needs nothing unsent, so neither needs worker A's mail recalled.
+    //      THAT ROUTE EXISTS AND IS NOT TAKEN HERE: the durable dispatch key this fence would need is
+    //      the `createDispatchWrite` that `lease.fenceBeforeRemoteWrite('invoice-email')` does not
+    //      pass — the gap o3d-8td2's audit recorded, now carried as o3d-scyw, which also sets out
+    //      why a LIFETIME key is not free: the authenticated accounting-invoice action writes this
+    //      same row shape deliberately. So the verdict is decided by the schema as it stands, not by
+    //      an impossibility.
+    //      Proven, not asserted, in tests/concurrency/outbox-stale-park.concurrent.test.ts: a SENT
+    //      first copy, then a further PENDING insert the database accepts (inside a rolled-back
+    //      transaction, so no mail can leave).
+    //
+    //   2. IT SAID THE QUEUE HAS "no holder identity — `processingStartedAt` is a timestamp, not a
+    //      `lockedBy`" — and every terminal write an unfenced `update({ where: { id } })`. It now has
+    //      a per-claim `lockedBy` token and terminal writes that compare-and-set on it. That closes
+    //      the queue's OWN re-arming race, and it does not touch this one: the two workers that
+    //      duplicate an invoice email here are one reclaim apart in the INTEGRATION outbox, and each
+    //      enqueues a row of its own that the email drain then handles correctly and separately. A
+    //      fence inside the downstream queue cannot see a duplicate that arrived as two legitimate
+    //      enqueues.
+    //
+    // So `unsafe-to-replay` stands on the argument above rather than on either removed fact — and it
+    // is over-determined in any case, because `effects.keyedBy` is 'sub-operation': INVOICE_EMAIL is
+    // only the WEAKEST known effect of an entry that also multiplexes the CREATE types, and the
+    // reclaim predicate cannot discriminate between them.
     'accounting.post': {
       name: 'postAccountingEvent',
       schema: XeroAccountingOutboxPayloadSchema,
@@ -242,7 +341,7 @@ export const INTEGRATION_OUTBOX_REGISTRY = defineOutboxRegistry({
     // the guarded part needs no more than this: `processBookedInEvent`
     // (lib/domain/wms/booked-in-service.ts) reads the WMS with a GET only, takes
     // `SELECT ... FOR UPDATE` on `wms_inbound_receipt_events`, re-reads `processedAt` inside the
-    // same transaction, and applies a DELTA over each line's `lastProcessedReceivedQty`. A second
+    // same transaction, and applies a DELTA over each line's `lastProcessedReceivedQty`. Another
     // worker BLOCKS on the row lock and then returns `duplicate` with nothing left to book in, and
     // because the delta is recomputed inside the lock a slow worker cannot apply one it computed
     // before it slept. For the RECEIPT, the guard sits between the resume and the effect.
@@ -267,7 +366,7 @@ export const INTEGRATION_OUTBOX_REGISTRY = defineOutboxRegistry({
     // line ~674 is inside the transaction but is issued through `logActivity`, which writes on the
     // GLOBAL `db` client, not on `tx` (lib/activity-log.ts — `logActivityInTransaction` is the one
     // that takes a client, and it is not the one used here). So it commits on its own connection: a
-    // rollback of the receipt work leaves the warning standing, and the retry writes a second one.
+    // rollback of the receipt work leaves the warning standing, and the retry writes another one.
     // The same operation therefore both loses effects and duplicates them.
     //
     // STILL NOT ENQUEUED TODAY — nothing enqueues or claims this operation, and the schema above
@@ -303,7 +402,7 @@ export const INTEGRATION_OUTBOX_REGISTRY = defineOutboxRegistry({
     // and not from the wall clock, so a replay months later still collides with the original.
     //
     // ORDERING, re-checked in round 2: the effect is create-if-absent, never an absolute assignment,
-    // so "which one lands last" has no meaning — the second create finds or collides with the first
+    // so "which one lands last" has no meaning — the later create finds or collides with the first
     // whichever order they run in, and neither overwrites the other. MULTIPLEXING, re-checked: the
     // payload carries two arrays (inventory-transit and COGS adjustments), but they are two
     // populations of the SAME effect under the SAME guard and the same key derivation, not two kinds
@@ -423,7 +522,7 @@ function reclaimableOperationsOf(connector: string): string[] {
  *
  * FAILS CLOSED on anything this build cannot identify. An operation missing from this registry is
  * one whose effects this binary knows nothing about, and "we have never heard of it" is not a reason
- * to believe a second execution is harmless. It costs nothing today — every drain claims its own
+ * to believe a repeat execution is harmless. It costs nothing today — every drain claims its own
  * registered operation.
  *
  * AND WHERE IT DOES BITE, THERE IS NO EXIT TO NAME (o3d-8td2 r7 MEDIUM, corrected r8). Until round 7

@@ -1964,11 +1964,18 @@ test('[o3d-qn21] a no-identifier operation is escalated as a REPLAY, never as a 
   )
 })
 
-test('[o3d-qn21] the replay that message warns about is real — three sweeps, three emails', async () => {
+test('[o3d-qn21] the replay that message warns about is real — three sweeps, three dispatches', async () => {
   // THE CONTROL THAT MAKES THE WORDING TRUE RATHER THAN MERELY DIFFERENT. If the row were somehow
   // settled or fenced, "the sweep WILL run the operation again outright" would be a new falsehood
-  // replacing the old one. It is not fenced — rounds 6 and 7 are reverted — so the customer is
-  // mailed once per sweep, and this is the defect o3d-qn21 records as still open.
+  // replacing the old one. It is not fenced — rounds 6 and 7 are reverted — so the operation is
+  // DISPATCHED once per sweep, and this is the defect o3d-qn21 records as still open.
+  //
+  // ROUND 16: DISPATCHED, NOT QUEUED, AND THE DISTINCTION IS o3d-alnk'S. `sendAccountingInvoiceEmailInternal`
+  // is mocked away here, so what this file can see is how often the processor CALLS it. Whether a
+  // call queues a row is decided one layer down by `email_outbox_undelivered_reference_uq`, which
+  // refuses a second undelivered copy — the sweeps here are a stale claim apart, by which time the
+  // drain has delivered, but this test does not establish that and must not claim it. The queue-side
+  // count is pinned where it can be driven, in tests/accounting/qbo-invoice-email-queued-not-sent.test.ts.
   reset('quickbooks')
   state.syncRows = [emailRow()]
   state.failSyncedWriteFor.add('log-1')
@@ -1979,7 +1986,7 @@ test('[o3d-qn21] the replay that message warns about is real — three sweeps, t
   ageTheClaim()
   await runQuickBooks()
 
-  assert.equal(emailsSent, 3, 'one queued copy per sweep — the replay the record now warns about, unbounded')
+  assert.equal(emailsSent, 3, 'one DISPATCH per sweep — the replay the record now warns about, unbounded')
   assert.equal(subject().status, 'PROCESSING', 'the row never leaves PROCESSING, which is why it recurs')
   assert.equal(subject().retryCount, 0, 'and no retry is consumed, so nothing bounds it')
 })

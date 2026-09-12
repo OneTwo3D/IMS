@@ -36,7 +36,11 @@ All PDF routes now correctly load and render the full set of template fields:
 Invoice and credit-note PDFs are served behind **single-use, time-limited tokens** rather than direct file paths. When you click "View PDF" or "Email PDF":
 
 1. The system generates a token bound to your current session **and your IP address**.
-2. The token is valid for a short TTL (default 15 minutes).
+2. The token is short-lived. Its lifetime comes from `INVOICE_PDF_TOKEN_TTL_SECONDS`; with that
+   unset the code default is `DEFAULT_INVOICE_PDF_TOKEN_TTL_SECONDS` in `lib/invoice-pdf.ts`,
+   which is ten minutes (the sample `.env` ships `259200`, 72 hours). Whatever is configured is
+   capped at `INVOICE_PDF_TOKEN_MAX_TTL_SECONDS`, thirty days. Documented as "15 minutes" until
+   r34's duration audit, which matched no constant in the file.
 3. The PDF route checks the token, the bound session, and the requesting IP before streaming the file.
 
 A token issued on one network cannot be replayed from another, and tokens cannot be shared between users. If a customer needs the PDF, use the **Email PDF** action — the recipient receives the file as an attachment, not a link.
@@ -102,12 +106,58 @@ When you email a document (e.g. sending a purchase order to a supplier or an inv
 
 ### SMTP Sending
 
-Emails are sent server-side using nodemailer via your configured SMTP settings (see **Settings > Company > Email/SMTP**). The email buttons on sales orders and invoices send directly via SMTP rather than opening a mailto link. The following email functions are available:
+Emails are sent server-side using nodemailer via your configured SMTP settings (see **Settings > Company > Email/SMTP**) rather than by opening a mailto link in your browser. The email buttons on sales orders and invoices do **not** reach SMTP themselves — they add the email to the outbox described under [The Email Queue](#the-email-queue) below, and the background job is what connects to your SMTP server. The following email functions are available:
 
-- **sendSalesOrderEmail** — sends the sales order PDF to the customer
-- **sendInvoiceEmail** — sends the invoice PDF to the customer
+- **sendSalesOrderEmail** — queues the sales order PDF for delivery to the customer
+- **sendInvoiceEmail** — queues the invoice PDF for delivery to the customer
 
-Both functions attach the generated PDF document to the email automatically.
+Both functions attach the generated PDF document to the queued email automatically.
+
+### The Email Queue
+
+Emails are not sent from the button click. They are written to an outbox and delivered by a
+background job (`/api/cron/email-outbox`), so a slow or unreachable SMTP server never blocks the
+screen you are on. That job runs on whatever schedule your cron daemon calls it with — the
+expected cadence is in the cron table under **Settings > System** — so a queued email goes out on
+the job's next run, not immediately.
+
+- **One undelivered copy per document.** If you press the email button again while the first
+  copy is still waiting to go out, the system does **not** queue a second one — the activity log
+  records "already queued and undelivered — not duplicated". Once the email has actually been
+  sent (or has permanently failed), pressing the button again queues a fresh copy, so a
+  deliberate re-send after correcting an address still works.
+- **Retries.** A temporary SMTP failure is retried with a growing delay, up to five attempts,
+  after which the email is marked failed with the last error.
+- **Suppression.** A recipient the SMTP provider rejects as invalid is added to the suppression
+  list, and later emails to that address fail immediately instead of being retried.
+- **What the four contention counts in the activity log mean.** Each run logs a line like
+  `Email outbox: 3 sent, 0 failed, 0 reclaimed after a send, 0 reclaimed before one, 0 unresolved
+  after a send, 0 unresolved before one, out of 3 processed`. All four count a row this run had
+  claimed and was then refused the final write on. They split along two questions, and the split
+  matters because only one corner means a customer may have got two emails.
+
+  *Was another run's takeover actually established?* **Reclaimed** means yes: the row was read back
+  afterwards and it was either holding another run's claim, or holding no claim at all when every
+  write this run issued had come back — so something else released it. **Unresolved** means no: the
+  row could not be read, or it was gone, or it still carried this run's own claim, or this run's own
+  final write never answered and may itself be what settled the row. An unresolved count is a count
+  of *missing evidence*, not of contention — a rising "unresolved" with "reclaimed" at zero points at
+  a database connection problem, not at two runs fighting.
+
+  *Had this run already entered the sender?* **After a send** means yes — the send call had been
+  made, so a copy may be on the wire. It is not proof the message reached SMTP: if SMTP is not
+  configured, or the from-address is rejected, the send call returns an error without contacting a
+  mail server at all, and it is counted here just the same. **Before one** means the send was never
+  called, so this run put nothing on the wire whatever the cause.
+
+  So **reclaimed after a send** is the one that means the customer may have received two copies —
+  *may*, because it rests on the send having actually reached a mail server, which is not something
+  the run records: with SMTP unconfigured, or a rejected from-address, both runs can be counted here
+  having delivered nothing at all. It is a duplicate that is *possible*, not one that is "likely".
+  **Unresolved after a send** means a copy may be on the wire but nothing establishes that a second
+  one follows — it is not a duplicate report. The server log line for each row names the specific
+  diagnosis behind it. None of the four leaves the email stuck: whichever run settled the row is the
+  one that finished it.
 
 ### Dispatch Email (direct orders)
 
