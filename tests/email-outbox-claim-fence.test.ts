@@ -1901,8 +1901,9 @@ function axisSentences(prose: string): string[] {
 // duplicate sentence to a blacklist of forbidden words. So a site reading "A duplicate delivery is
 // possible. A duplicate delivery follows." PASSED: the first sentence satisfied the `some`, and
 // `follows` was not a word anybody had thought to blacklist. An unhedged production claim sat beside
-// its own hedge and the guard called that compliance — the existential/universal mistake this file has
-// now made in three separate axes.
+// its own hedge and the guard called that compliance — the existential/universal mistake this branch
+// has had to remove from one guard after another (a whole-file `includes` is the same error in a
+// different dress: a correction sitting beside a stale claim satisfies it).
 //
 // SO THE STRENGTH TEST IS POSITIVE AND PER-SENTENCE: each sentence that mentions a duplicate has to
 // carry the weaker word ITSELF, and a hedge somewhere else in the paragraph does not lend it one. That

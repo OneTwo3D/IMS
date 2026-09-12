@@ -728,9 +728,9 @@ function windowSentences(prose: string): string[] {
 // away by the same test. So the exemption was a hole of precisely the kind this branch has spent a
 // dozen rounds closing — a real unsourced duration could sit in this prose and be discarded before it
 // was ever checked. THE NON-VACUITY FLOOR IN (4g) DOES NOT CLOSE IT EITHER, and that is the part
-// worth remembering: the other nineteen durations clear the floor on their own, so the sweep still
-// reports plenty of work while silently dropping the one sentence that mattered. A floor proves the
-// pattern matches SOMETHING; it can never prove an exemption is sound.
+// worth remembering: the twenty durations this prose really states clear that floor of fifteen on
+// their own, so the sweep still reports plenty of work while silently dropping the one sentence that
+// mattered. A floor proves the pattern matches SOMETHING; it can never prove an exemption is sound.
 //
 // IT COULD NOT BE REPAIRED IN PLACE. Ordinal "second" is an adjective before the noun it modifies and
 // unit "second" is the head of its own noun phrase, so telling them apart means deciding whether the
@@ -1291,9 +1291,9 @@ test('r22: the reclaim window is the RESOLVED constant, and BOTH copies of the r
   //
   // WHAT THIS FLOOR CANNOT DO, said here because round 35 relied on it to (Codex round 35, HIGH 1):
   // it cannot make an EXEMPTION sound. The round-35 ordinal exemption silently discarded any sentence
-  // matching "a second", real durations included, and the remaining nineteen durations cleared this
-  // floor on their own — so the sweep reported a healthy match count while dropping the one sentence
-  // that mattered. A floor proves the pattern matches SOMETHING; only removing the exemption (round
+  // matching "a second", real durations included, and the twenty durations this prose really states
+  // cleared this floor on their own — so the sweep reported a healthy match count while dropping the
+  // one sentence that mattered. A floor proves the pattern matches SOMETHING; only removing the exemption (round
   // 36, see the block over `durationsNamedIn`) proves nothing is being dropped.
   assert.ok(
     durationsChecked >= 15,
