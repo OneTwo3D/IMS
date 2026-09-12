@@ -131,7 +131,7 @@ test('product incoming stock breakdown sums only remaining inbound quantities', 
     },
     stockTransferLine: {
       findMany: async () => [
-        { qty: decimal('5'), qtyReceived: decimal('1.5') },
+        { id: 'transfer-line-1', qty: decimal('5'), qtyReceived: decimal('1.5') },
       ],
     },
     productionOrder: {
@@ -139,11 +139,22 @@ test('product incoming stock breakdown sums only remaining inbound quantities', 
         { qtyPlanned: decimal('8'), qtyProduced: decimal('2') },
       ],
     },
+    // o3d-zzgp: two DIFFERENT queries now land here — the reader's own status-filtered
+    // one, and the landed-quantity loader's, keyed on sourceType + sourceLineId. The ASN
+    // row is PO-sourced, so the transfer arm's new exclusion does not apply to it and
+    // every figure below is unchanged from before that change.
     wmsAsnLineMap: {
       findMany: async (args?: unknown) => {
-        wmsAsnStatusFilter = (args as { where: { asn: { status: { in: string[] } } } }).where.asn.status.in
+        const where = (args as { where: { asn?: { status: { in: string[] } }; sourceType?: string } }).where
+        if (!where.asn) {
+          assert.equal(where.sourceType, 'STOCK_TRANSFER_LINE')
+          return []
+        }
+        wmsAsnStatusFilter = where.asn.status.in
         return [
           {
+            sourceType: 'PURCHASE_ORDER_LINE',
+            sourceLineId: 'po-line-1',
             expectedQty: decimal('7'),
             qtyAccountedViaSnapshot: decimal('2'),
             qtyAccountedViaReceipt: decimal('1.25'),

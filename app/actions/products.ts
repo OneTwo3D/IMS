@@ -26,6 +26,15 @@ import { blocksClearingInvalidOrigin } from '@/lib/products/country-of-origin'
 import { productSchema } from '@/lib/products/product-schema'
 import { ProductSkuTakenError, ProductStructureChangedError, lockProductSkusForWrite } from '@/lib/products/sku-write-lock'
 import { COMPONENT_GRAPH_WRITE_LOCK_KEY } from '@/lib/db/advisory-locks'
+// o3d-zzgp: every incoming-stock badge below asks "how much of this transfer line is
+// still coming", and the answer is `qty − LANDED`, not `qty − qtyReceived`. The WMS
+// stock-sync alignment lands units by crediting
+// `wms_asn_line_maps.qtyAccountedViaSnapshot` and never writes `qtyReceived`, so the
+// old expression showed units that were already on the shelf as still in transit.
+import {
+  loadTransferLineOutstandingQty,
+  requireOutstandingQty,
+} from '@/lib/domain/inventory/transfer-landed-quantity'
 import {
   ComponentGraphInFlightSalesError,
   bumpFulfillmentGraphVersions,
@@ -224,10 +233,11 @@ export async function listProducts(params: {
 
   // Batch query incoming stock (transfers + POs) grouped by product
   const [incomingTransfers, incomingPOs] = await Promise.all([
-    db.stockTransferLine.groupBy({
-      by: ['productId'],
+    // Not a groupBy: the landed quantity is a per-LINE fact (it needs each line's own
+    // ASN rows), so an aggregate over the two columns cannot express it (o3d-zzgp).
+    db.stockTransferLine.findMany({
       where: { productId: { in: allProductIds }, transfer: { status: 'IN_TRANSIT' } },
-      _sum: { qty: true, qtyReceived: true },
+      select: { id: true, productId: true, qty: true, qtyReceived: true },
     }),
     db.purchaseOrderLine.groupBy({
       by: ['productId'],
@@ -239,9 +249,10 @@ export async function listProducts(params: {
     }),
   ])
 
+  const incomingTransferOutstanding = await loadTransferLineOutstandingQty(db, incomingTransfers)
   const incomingByProduct = new Map<string, number>()
   for (const t of incomingTransfers) {
-    const remaining = Math.max(0, Number(t._sum.qty ?? 0) - Number(t._sum.qtyReceived ?? 0))
+    const remaining = requireOutstandingQty(incomingTransferOutstanding, t.id).qtyNumber
     if (remaining > 0) incomingByProduct.set(t.productId, (incomingByProduct.get(t.productId) ?? 0) + remaining)
   }
   for (const po of incomingPOs) {
@@ -372,7 +383,7 @@ export async function getProduct(id: string): Promise<ProductDetail | null> {
     // Incoming via stock transfers (in-transit, arriving at destination warehouse)
     db.stockTransferLine.findMany({
       where: { productId: id, transfer: { status: 'IN_TRANSIT' } },
-      select: { qty: true, qtyReceived: true, transfer: { select: { toWarehouseId: true, toWarehouse: { select: { id: true, code: true, name: true } } } } },
+      select: { id: true, qty: true, qtyReceived: true, transfer: { select: { toWarehouseId: true, toWarehouse: { select: { id: true, code: true, name: true } } } } },
     }),
     // Incoming from open POs (grouped by destination warehouse)
     db.purchaseOrderLine.findMany({
@@ -396,11 +407,12 @@ export async function getProduct(id: string): Promise<ProductDetail | null> {
     allocatedByWarehouse.set(wid, (allocatedByWarehouse.get(wid) ?? 0) + Number(line.qty))
   }
 
+  const inTransferOutstanding = await loadTransferLineOutstandingQty(db, inTransferLines)
   const incomingTransferByWarehouse = new Map<string, number>()
   const warehouseInfoMap = new Map<string, { id: string; code: string; name: string }>()
   for (const line of inTransferLines) {
     const wid = line.transfer.toWarehouseId
-    const remaining = Number(line.qty) - Number(line.qtyReceived)
+    const remaining = requireOutstandingQty(inTransferOutstanding, line.id).qtyNumber
     if (remaining > 0) {
       incomingTransferByWarehouse.set(wid, (incomingTransferByWarehouse.get(wid) ?? 0) + remaining)
       if (line.transfer.toWarehouse) warehouseInfoMap.set(wid, line.transfer.toWarehouse)
@@ -432,10 +444,10 @@ export async function getProduct(id: string): Promise<ProductDetail | null> {
   const variantIncomingMap = new Map<string, number>()
   if (variantIds.length > 0) {
     const [vTransfers, vPOs] = await Promise.all([
-      db.stockTransferLine.groupBy({
-        by: ['productId'],
+      // Per-line, not an aggregate, for the same reason as in `listProducts` above.
+      db.stockTransferLine.findMany({
         where: { productId: { in: variantIds }, transfer: { status: 'IN_TRANSIT' } },
-        _sum: { qty: true, qtyReceived: true },
+        select: { id: true, productId: true, qty: true, qtyReceived: true },
       }),
       db.purchaseOrderLine.groupBy({
         by: ['productId'],
@@ -446,8 +458,9 @@ export async function getProduct(id: string): Promise<ProductDetail | null> {
         _sum: { qty: true, qtyReceived: true },
       }),
     ])
+    const vTransferOutstanding = await loadTransferLineOutstandingQty(db, vTransfers)
     for (const t of vTransfers) {
-      const rem = Math.max(0, Number(t._sum.qty ?? 0) - Number(t._sum.qtyReceived ?? 0))
+      const rem = requireOutstandingQty(vTransferOutstanding, t.id).qtyNumber
       if (rem > 0) variantIncomingMap.set(t.productId, (variantIncomingMap.get(t.productId) ?? 0) + rem)
     }
     for (const po of vPOs) {
@@ -2107,6 +2120,7 @@ export async function getIncomingDetails(productId: string, warehouseId: string)
         },
       },
       select: {
+        id: true,
         qty: true,
         qtyReceived: true,
         transfer: { select: { id: true, reference: true, status: true } },
@@ -2130,8 +2144,9 @@ export async function getIncomingDetails(productId: string, warehouseId: string)
     }
   }
 
+  const transferOutstanding = await loadTransferLineOutstandingQty(db, transferLines)
   for (const line of transferLines) {
-    const remaining = Number(line.qty) - Number(line.qtyReceived)
+    const remaining = requireOutstandingQty(transferOutstanding, line.id).qtyNumber
     if (remaining > 0) {
       results.push({
         type: 'transfer',

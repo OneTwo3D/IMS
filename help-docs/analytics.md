@@ -39,7 +39,7 @@ Warehouse users can access the stock-position report family. Broader analytics r
 |---|---|
 | **Stock Movement Ledger** | Full movement history with opening and closing quantity/value reconciliation. |
 | **Stock Adjustments** | Adjustment movements grouped by reason, product, user, and value impact. |
-| **Stock Transfers** | Transfer dispatch, receipt, in-transit, overdue, and drift evidence. |
+| **Stock Transfers** | Transfer dispatch, receipt, in-transit, overdue, and drift evidence. **Received** is what has come to rest by any route — a manual receipt, a WMS book-in, or a WMS stock-sync alignment (which raises stock without recording a receipt on the line) — so **Drift** is requested less that figure. A transfer the WMS accounted for entirely no longer reports as 100% drift. |
 | **Stock Counts** | Stocktake/count variance, book versus counted quantity/value, and resulting adjustment links. |
 | **Inventory Valuation** | IMS stock value by product, category, warehouse, and as-of date. When accounting balance snapshots exist, the report shows GL variance. |
 | **COGS Report** | COGS from `CogsEntry` rows, with revenue and gross margin where sales-order-line links are available. |

@@ -442,3 +442,130 @@ export function requireTransferLineResidualQty(
   }
   return residual
 }
+
+// ---------------------------------------------------------------------------
+// THE THIRD QUESTION: "HOW MUCH IS STILL COMING?" (o3d-zzgp)
+// ---------------------------------------------------------------------------
+
+/**
+ * `TransferLineLandedQty` answers "how much has come to rest", and
+ * `TransferLineResidualQty` answers "how much may an ALLOCATOR still bring to rest"
+ * — the second is capped by the dispatch snapshot, because an allocator that plans
+ * beyond it books units it cannot cost.
+ *
+ * Four readers ask a THIRD question and round 6 left every one of them computing it
+ * by hand as `qty − qtyReceived` (o3d-zzgp):
+ *
+ *   · `getProductIncomingStock` — is anything still due in, so the EOL auto-archive
+ *     must wait?
+ *   · `app/actions/products.ts` — the incoming-stock badges.
+ *   · `getStockTransferReport` — the received and drift columns.
+ *   · the WMS connector's transfer-ASN create and its state gate — how many units to
+ *     tell a LIVE warehouse to expect.
+ *
+ * None of them allocates and none has a snapshot in hand, so `TransferLineResidualQty`
+ * is the wrong type for them: its `costableRemainingQty` is required precisely so an
+ * allocator cannot skip it, and a reader forced to invent one would pass something
+ * meaningless and hollow the brand out. They need the UNCAPPED line-scope figure,
+ * `max(0, qty − landed)`, and they need it to be a value they cannot fabricate.
+ *
+ * Hence a third brand. `TransferLineResidualQty` is deliberately NOT assignable from
+ * it: an allocator handed an outstanding quantity would be missing the snapshot cap
+ * that round 8 added, which is how the ASN planner came to book uncostable units.
+ *
+ * WHAT THE BRAND DOES AND DOES NOT BUY. It makes the value unconstructible outside
+ * this module, and `sumTransferLineOutstandingQty` / `sumTransferLineLandedQty`
+ * accept nothing else — so a reader that wants a total cannot feed a hand-rolled
+ * number into one. It cannot stop a future call site writing its own
+ * `Number(line.qty) − Number(line.qtyReceived)` and using that number directly;
+ * TypeScript has no construct that forbids an expression. The behavioural regression
+ * tests in tests/domain/inventory/transfer-outstanding-readers.test.ts are the guard
+ * for that, and they are written against a line the WMS stock-sync alignment landed
+ * WITHOUT touching `qtyReceived` — the one fixture the old arithmetic gets wrong.
+ */
+
+declare const TRANSFER_LINE_OUTSTANDING_QTY_BRAND: unique symbol
+
+/**
+ * LINE SCOPE, UNCAPPED: how much of a transfer line has not landed anywhere yet.
+ * `max(0, lineQty − landed)`, where `landed` counts BOTH counters.
+ */
+export type TransferLineOutstandingQty = {
+  readonly [TRANSFER_LINE_OUTSTANDING_QTY_BRAND]: 'transfer-line-outstanding-qty'
+  readonly transferLineId: string
+  readonly qty: Decimal
+  readonly qtyNumber: number
+  /** The landed quantity this was derived from, so a diagnostic can name both arms. */
+  readonly landed: TransferLineLandedQty
+}
+
+/** THE ONLY constructor of `TransferLineOutstandingQty`. */
+export function resolveTransferLineOutstandingQty(input: {
+  lineQty: DecimalInput
+  landed: TransferLineLandedQty
+}): TransferLineOutstandingQty {
+  const qty = transferLineOutstandingQty(input.lineQty, input.landed)
+  return {
+    transferLineId: input.landed.transferLineId,
+    qty,
+    qtyNumber: qty.toNumber(),
+    landed: input.landed,
+  } as TransferLineOutstandingQty
+}
+
+/**
+ * Outstanding quantity for a set of transfer lines, in ONE extra query.
+ *
+ * Pass EVERY line the caller is about to iterate; `requireOutstandingQty` throws for
+ * one that was not loaded rather than answering zero.
+ */
+export async function loadTransferLineOutstandingQty(
+  client: TransferLandedQtyClient,
+  lines: ReadonlyArray<{ id: string; qty: DecimalInput; qtyReceived: DecimalInput }>,
+): Promise<Map<string, TransferLineOutstandingQty>> {
+  const landedByLineId = await loadTransferLineLandedQty(client, lines)
+  const result = new Map<string, TransferLineOutstandingQty>()
+  for (const line of lines) {
+    result.set(line.id, resolveTransferLineOutstandingQty({
+      lineQty: line.qty,
+      landed: requireLandedQty(landedByLineId, line.id),
+    }))
+  }
+  return result
+}
+
+/** As `requireLandedQty`, for the outstanding map. Throws rather than defaulting. */
+export function requireOutstandingQty(
+  outstandingByLineId: ReadonlyMap<string, TransferLineOutstandingQty>,
+  transferLineId: string,
+): TransferLineOutstandingQty {
+  const outstanding = outstandingByLineId.get(transferLineId)
+  if (!outstanding) {
+    throw new Error(
+      `requireOutstandingQty: no outstanding quantity was loaded for transfer line ${transferLineId}. ` +
+      'Load it with loadTransferLineOutstandingQty over the SAME set of lines being iterated (o3d-zzgp).',
+    )
+  }
+  return outstanding
+}
+
+/**
+ * Total outstanding over a set of lines. Takes the branded values and nothing else,
+ * so a caller cannot mix a hand-rolled `qty − qtyReceived` into a total.
+ */
+export function sumTransferLineOutstandingQty(
+  values: Iterable<TransferLineOutstandingQty>,
+): Decimal {
+  let total = toDecimal(0)
+  for (const value of values) total = addMoney(total, value.qty)
+  return roundQuantity(total, 6)
+}
+
+/** Total LANDED over a set of lines — the received column, by the one definition. */
+export function sumTransferLineLandedQty(
+  values: Iterable<TransferLineLandedQty>,
+): Decimal {
+  let total = toDecimal(0)
+  for (const value of values) total = addMoney(total, value.qty)
+  return roundQuantity(total, 6)
+}

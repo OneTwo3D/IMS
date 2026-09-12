@@ -55,6 +55,10 @@ import {
 } from '@/lib/connectors/mintsoft/sync/returns-sync'
 import { enqueueMintsoftBookedInRecheckForAsn, replayMintsoftBookedInEventsForAsn } from '@/lib/jobs/wms/process-mintsoft-booked-in-event'
 import { WMS_INBOUND_EVENT_PROCESSING_STATUS } from '@/lib/domain/wms/booked-in-service'
+import {
+  loadTransferLineOutstandingQty,
+  requireOutstandingQty,
+} from '@/lib/domain/inventory/transfer-landed-quantity'
 import { getWmsConnector, isWmsConnectorConfigured } from '@/lib/connectors/wms/registry'
 import { getIntegrationPluginState, isIntegrationPluginEnabled } from '@/lib/integration-plugins'
 import { hasPermission } from '@/lib/permissions'
@@ -1724,6 +1728,13 @@ export async function getMintsoftTransferAsnStates(
 
   const canManage = session?.user ? hasPermission(session.user.role, 'stock_control.transfer') : false
   const transfersById = new Map(transfers.map((transfer) => [transfer.id, transfer]))
+  // o3d-zzgp: "outstanding" is `qty − LANDED`, and landed counts the WMS stock-sync
+  // alignment credit as well as `qtyReceived`. This gate used `qty − qtyReceived`, so
+  // a transfer the alignment had already brought in still offered "create an ASN".
+  const outstandingByTransferLineId = await loadTransferLineOutstandingQty(
+    db,
+    transfers.flatMap((transfer) => transfer.lines),
+  )
   const productIds = Array.from(new Set(
     transfers.flatMap((transfer) => transfer.lines.map((line) => line.productId)),
   ))
@@ -1781,7 +1792,9 @@ export async function getMintsoftTransferAsnStates(
     }
 
     const binding = bindingByWarehouseId.get(transfer.toWarehouseId) ?? null
-    const outstandingLines = transfer.lines.filter((line) => Number(line.qty) > Number(line.qtyReceived))
+    const outstandingLines = transfer.lines.filter(
+      (line) => requireOutstandingQty(outstandingByTransferLineId, line.id).qtyNumber > 0,
+    )
     const unmappedOutstandingCount = outstandingLines.filter((line) => !hasMintsoftProductLink.get(line.productId)).length
     const mappedAsns = (existingAsnsByTransferId.get(transfer.id) ?? []).map(mapMintsoftPurchaseOrderAsnRow)
 
@@ -3875,13 +3888,23 @@ export async function createMintsoftTransferAsn(
         },
       })
 
+      // o3d-zzgp: THE ASN IS SIZED FROM THIS NUMBER AND IT GOES TO A LIVE WMS.
+      // It used to be `qty − qtyReceived`, which ignores every unit the WMS
+      // stock-sync alignment has already brought into stock — that path credits
+      // `wms_asn_line_maps.qtyAccountedViaSnapshot` and never touches `qtyReceived`.
+      // A retry after a failed push (the row is left CREATE_PENDING, its line maps
+      // are still alignment candidates because they are only filtered on
+      // `asn.closedAt IS NULL`) therefore told Mintsoft to expect units that were
+      // already on its own shelves. Read under the `FOR UPDATE` above, from `tx`, so
+      // a concurrent alignment cannot land between the lock and this read.
+      const outstandingByTransferLineId = await loadTransferLineOutstandingQty(tx, transfer.lines)
       const outstandingLines = transfer.lines
         .map((line) => ({
           sourceLineId: line.id,
           productId: line.productId,
           sku: line.sku,
           externalProductId: externalProductIdByProductId.get(line.productId) ?? null,
-          expectedQty: Number(line.qty) - Number(line.qtyReceived),
+          expectedQty: requireOutstandingQty(outstandingByTransferLineId, line.id).qtyNumber,
         }))
         .filter((line) => line.expectedQty > 0)
 
@@ -4094,9 +4117,14 @@ export async function createMintsoftTransferAsn(
         return 'Transfer no longer exists.'
       }
 
+      // o3d-zzgp: MUST use the same definition as `reserveAsn` above. If these two
+      // disagree the revalidation refuses every create with "Outstanding quantities
+      // changed after reservation" — and if both used `qty − qtyReceived` they agree
+      // on the wrong number, which is how the over-sized ASN got through.
+      const outstandingByTransferLineId = await loadTransferLineOutstandingQty(tx, transfer.lines)
       const outstandingBySourceLineId = new Map<string, number>()
       for (const line of transfer.lines) {
-        const outstanding = Number(line.qty) - Number(line.qtyReceived)
+        const outstanding = requireOutstandingQty(outstandingByTransferLineId, line.id).qtyNumber
         if (outstanding > 0) {
           outstandingBySourceLineId.set(line.id, outstanding)
         }

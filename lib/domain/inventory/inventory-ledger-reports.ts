@@ -3,6 +3,11 @@ import { db } from '@/lib/db'
 import { roundQuantity, toDecimal, type Decimal } from '@/lib/domain/math/decimal'
 import { startOfNextUtcDay } from '@/lib/domain/math/date-window'
 import type { PageInfo } from '@/lib/domain/inventory/stock-position-reports'
+import {
+  loadTransferLineLandedQty,
+  requireLandedQty,
+  sumTransferLineLandedQty,
+} from '@/lib/domain/inventory/transfer-landed-quantity'
 
 const DEFAULT_PAGE_SIZE = 100
 const MIN_PAGE_SIZE = 50
@@ -66,7 +71,10 @@ type InventoryLedgerFilterParseOptions = {
   includeMinValue?: boolean
 }
 
-type InventoryLedgerReportClient = Pick<typeof db, 'stockMovement' | 'adjustmentReason' | 'product' | 'stockTransfer' | 'stockTransferLine' | 'stockCount' | 'stockCountLine'>
+// `wmsAsnLineMap` is here because the transfer report's received column is a LANDED
+// quantity, and landed counts the WMS alignment credit on the line's ASN rows as well
+// as `qtyReceived` (o3d-zzgp). A test client that omits it no longer type-checks.
+type InventoryLedgerReportClient = Pick<typeof db, 'stockMovement' | 'adjustmentReason' | 'product' | 'stockTransfer' | 'stockTransferLine' | 'stockCount' | 'stockCountLine' | 'wmsAsnLineMap'>
 
 type InventoryLedgerReportOptions = {
   paginate?: boolean
@@ -691,7 +699,8 @@ export async function getStockTransferReport(
     include: {
       fromWarehouse: { select: { code: true, name: true } },
       toWarehouse: { select: { code: true, name: true } },
-      lines: { select: { qty: true, qtyReceived: true, sku: true, productName: true } },
+      // `id` so the landed quantity can be loaded for these exact lines (o3d-zzgp).
+      lines: { select: { id: true, qty: true, qtyReceived: true, sku: true, productName: true } },
     },
   })
   const ids = transfers.map((transfer) => transfer.id)
@@ -709,7 +718,7 @@ export async function getStockTransferReport(
   const [allTransferLines, allMovements] = await Promise.all([
     client.stockTransferLine.findMany({
       where: { transfer: where },
-      select: { qty: true, qtyReceived: true },
+      select: { id: true, qty: true, qtyReceived: true },
     }),
     allIds.length
       ? client.stockMovement.findMany({
@@ -718,6 +727,15 @@ export async function getStockTransferReport(
         })
       : Promise.resolve([]),
   ])
+  // o3d-zzgp: the received and drift columns are a LANDED-quantity question. They
+  // read `qtyReceived` alone, so a transfer the WMS stock-sync alignment brought in
+  // entirely — that path credits `wms_asn_line_maps.qtyAccountedViaSnapshot` and never
+  // touches `qtyReceived` — reported nothing received and 100% drift. Loaded for the
+  // page's lines and, separately, for every line behind the totals, because the
+  // totals are computed over the unpaginated set.
+  const landedByPageLineId = await loadTransferLineLandedQty(client, transfers.flatMap((transfer) => transfer.lines))
+  const landedByAllLineId = await loadTransferLineLandedQty(client, allTransferLines)
+
   const movementByTransfer = new Map<string, { outQty: Decimal; inQty: Decimal; valueBase: Decimal }>()
   for (const movement of movements) {
     if (!movement.referenceId) continue
@@ -730,7 +748,9 @@ export async function getStockTransferReport(
 
   const rows = transfers.map((transfer): StockTransferReportRow => {
     const requestedQty = transfer.lines.reduce((sum, line) => sum.add(toDecimal(line.qty)), ZERO)
-    const receivedQty = transfer.lines.reduce((sum, line) => sum.add(toDecimal(line.qtyReceived)), ZERO)
+    const receivedQty = sumTransferLineLandedQty(
+      transfer.lines.map((line) => requireLandedQty(landedByPageLineId, line.id)),
+    )
     const movement = movementByTransfer.get(transfer.id) ?? { outQty: ZERO, inQty: ZERO, valueBase: ZERO }
     const start = transfer.dispatchedAt ?? transfer.createdAt
     const end = transfer.completedAt ?? now
@@ -761,7 +781,9 @@ export async function getStockTransferReport(
   })
 
   const totalRequested = allTransferLines.reduce((sum, row) => sum.add(toDecimal(row.qty)), ZERO)
-  const totalReceived = allTransferLines.reduce((sum, row) => sum.add(toDecimal(row.qtyReceived)), ZERO)
+  const totalReceived = sumTransferLineLandedQty(
+    allTransferLines.map((row) => requireLandedQty(landedByAllLineId, row.id)),
+  )
   const totalValue = allMovements.reduce((sum, row) => sum.add(row.totalValueBase == null ? ZERO : toDecimal(row.totalValueBase)), ZERO)
   const inTransitCount = await client.stockTransfer.count({ where: transferWhere(filters, { in: ['DRAFT', 'IN_TRANSIT'] }) })
   return {

@@ -75,6 +75,14 @@ Applied corrections log `mintsoft_align_down_applied` (WARNING) with before/afte
 ## ASN Flow
 
 - IMS creates outbound ASN payloads for purchase orders and transfer lines.
+- A **transfer** ASN line's expected quantity is the line quantity less what has already **landed**,
+  by the one definition in `lib/domain/inventory/transfer-landed-quantity.ts`: `qtyReceived` plus any
+  `wms_asn_line_maps.qtyAccountedViaSnapshot` credit a receipt has not yet absorbed. It is deliberately
+  NOT `qty - qtyReceived` (o3d-zzgp): the stock-sync alignment above raises stock and lays cost layers
+  without writing `qtyReceived`, so that subtraction asked a live warehouse to expect units already on
+  its own shelves. The reservation and its pre-push revalidation read the same figure under the
+  transfer's row lock, so they cannot disagree and refuse every create. Purchase-order ASN lines are
+  still sized as `qty - qtyReceived`; a PO line has no landed-quantity definition yet (see below).
 - Mintsoft callback metadata preserves the source type, source line, product, and expected quantity.
 - Booked-in webhook receipt is idempotent via `wms_inbound_receipt_events`.
 - Accepted webhooks are persisted and acknowledged with `202 Accepted`; stock and purchase-order mutations run later through `/api/cron/mintsoft-webhook-sweeper`.
