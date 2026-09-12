@@ -105,6 +105,56 @@ async function readScript(): Promise<string> {
 }
 
 /**
+ * THE TWO WITNESSES AN ABSENT `.env` HAS TO PRODUCE BEFORE MINTING IS PERMITTED (o3d-xf9m).
+ *
+ * `require_preserved_secrets()` used to return 0 on `absent` without asking anything, and `absent`
+ * is exactly what an `rm` by ${APP_USER} produces on a file in a directory that account owns — so
+ * the state the defended-against account can author was the state that authorised minting a fresh
+ * SETTINGS_ENCRYPTION_KEY over a live database. It now calls
+ * `require_absent_env_is_a_first_install()`, which demands two positive answers neither of which
+ * that account can write.
+ *
+ * BOTH ARE SUPPLIED HERE AT THE LEVEL THE SHIPPED GATE ASKS THEM, and nothing else in this rig is
+ * stubbed: the gate itself is the shipped text, lifted like every other slice.
+ */
+type FirstInstallWitnesses = {
+  /**
+   * `upgrade_in_place()`'s answer. STUBBED, and it has to be: the real function's decisive evidence
+   * is `/etc/systemd/system/one-two-inventory.service` and the ${APP_USER} crontab, so the real one
+   * would make every test in this file answer according to whether the machine running the suite
+   * happens to have an installation on it. A stub makes the witness a property of the test.
+   */
+  installationOnHost?: boolean
+  /**
+   * `DB_CREATED_BY_THIS_RUN` — what the SERVER said about whether the database existed an instant
+   * before this run (an unconditional `CREATE DATABASE` that exited 0; SQLSTATE 42P04 means it was
+   * already there). A plain variable in the shipped script too, set by exactly one statement.
+   */
+  databaseCreatedByThisRun?: boolean
+}
+
+/**
+ * THE DEFAULT IS THE SUPPORTED FROM-SCRATCH INSTALL: nothing on the host, and this run created the
+ * database — which is what `INSTALL_POSTGRES=y` produces, and the one combination that is asked
+ * nothing. Every other test in this file begins with an absent `.env`, so every one of them now runs
+ * the gate for real on its first run rather than skipping it; none of them is stubbed past it.
+ */
+function firstInstallWitnessBlock(source: string, witnesses: FirstInstallWitnesses): string {
+  const onHost = witnesses.installationOnHost ?? false
+  const created = witnesses.databaseCreatedByThisRun ?? true
+  // The refusal quotes ${DB_NEWNESS_FINDING}, and the sentence it quotes is the SHIPPED default —
+  // taken from the script rather than restated here, so a rig assertion about the wording cannot
+  // pass against a message install.sh no longer prints.
+  const newnessFinding = /^DB_NEWNESS_FINDING=.*$/m.exec(source)?.[0] ?? ''
+  return [
+    `upgrade_in_place() { return ${onHost ? 0 : 1}; }`,
+    newnessFinding,
+    `DB_CREATED_BY_THIS_RUN=${created}`,
+    sliceOptionalBlock(source, 'require_absent_env_is_a_first_install() {') ?? '',
+  ].join('\n')
+}
+
+/**
  * Everything the `.env` heredoc interpolates that is not under test here. Declared empty so the
  * heredoc runs as shipped under `set -u` without this rig having an opinion about it.
  */
@@ -126,8 +176,13 @@ const UNRELATED_VARS = [
  * reverting the change under test runs the OLD code and the test fails on what the second run
  * PRODUCED — a rerun test that only proved a marker moved would prove nothing.
  */
-async function runInstaller(source: string, appDir: string, env: string): Promise<Record<string, string>> {
-  return (await runInstallerCapturing(source, appDir, env)).values
+async function runInstaller(
+  source: string,
+  appDir: string,
+  env: string,
+  witnesses: FirstInstallWitnesses = {},
+): Promise<Record<string, string>> {
+  return (await runInstallerCapturing(source, appDir, env, witnesses)).values
 }
 
 /** The same run, when what the operator was TOLD matters as much as what was written. */
@@ -135,6 +190,7 @@ async function runInstallerCapturing(
   source: string,
   appDir: string,
   env: string,
+  witnesses: FirstInstallWitnesses = {},
 ): Promise<{ values: Record<string, string>; stderr: string }> {
   const hasEnvTable = source.includes('declare -A EXISTING_ENV=()')
   const script = `
@@ -146,6 +202,10 @@ async function runInstallerCapturing(
     die() { echo "DIE: $*" >&2; exit 9; }
     APP_DIR=${JSON.stringify(appDir)}
     APP_NAME=one-two-inventory
+    # Named by the o3d-xf9m refusal, which says whose directory an absent .env is a state OF. Set
+    # here rather than in the witness block because it is the rig's own idea of the installation, not
+    # a witness: the account the installer would create.
+    APP_USER=imsapp
     DATA_DIR="\${APP_DIR}/data"
     BACKUP_DIR="\${DATA_DIR}/backups"
     UPLOAD_STORAGE_DIR="\${DATA_DIR}/uploads"
@@ -166,6 +226,7 @@ async function runInstallerCapturing(
     ${sliceOptionalBlock(source, 'unquote_env_value() {') ?? ''}
     ${sliceOptionalBlock(source, 'existing_env() {') ?? ''}
     ${sliceOptionalBlock(source, 'require_preserved_secrets() {') ?? ''}
+    ${firstInstallWitnessBlock(source, witnesses)}
     ${sliceOptionalBlock(source, 'prompt() {') ?? ''}
     ${sliceOptionalBlock(source, 'prompt_yn() {') ?? ''}
     ${source.includes('\nload_existing_env "${APP_DIR}/.env"') ? 'load_existing_env "${APP_DIR}/.env"' : ''}
@@ -298,19 +359,142 @@ test('re-running the installer keeps the key prefix and the secrets that cannot 
   assert.ok(first.AUTH_SECRET.length > 0 && first.CRON_SECRET.length > 0, 'a FIRST install still mints them')
 })
 
-test('a first install on a machine with no .env mints fresh secrets rather than reusing anything', async () => {
-  // A GUARD, NOT A WITNESS: this passes with the production change reverted, because reverting removes
-  // preservation entirely. It is here because the preservation must not become "the same secret on
-  // every install" — two independent first installs have to differ, or one leaked .env is every
-  // instance's .env.
-  const source = await readScript()
-  const one = await runInstaller(source, await appDirectory(), 'INSTALL_REDIS=y; REDIS_PORT=6379; REDIS_PASSWORD=')
-  const two = await runInstaller(source, await appDirectory(), 'INSTALL_REDIS=y; REDIS_PORT=6379; REDIS_PASSWORD=')
+/**
+ * Run the installer expecting it to REFUSE, and hand back what the operator was told.
+ *
+ * A refusal here is `die`, which this rig renders as `DIE: …` on stderr and exit 9. The assertion
+ * that it refused is not "the promise rejected" — a rig that fell over on an unset variable also
+ * rejects — so the caller is given the exit status and the text and asserts on both.
+ */
+async function runInstallerExpectingRefusal(
+  source: string,
+  appDir: string,
+  env: string,
+  witnesses: FirstInstallWitnesses,
+): Promise<{ status: number; stderr: string }> {
+  try {
+    await runInstallerCapturing(source, appDir, env, witnesses)
+  } catch (error) {
+    const failure = error as { code?: number; stderr?: string }
+    return { status: failure.code ?? -1, stderr: String(failure.stderr ?? error) }
+  }
+  throw new assert.AssertionError({
+    message: 'the installer completed and wrote a .env, minting a fresh SETTINGS_ENCRYPTION_KEY; it was supposed to refuse',
+  })
+}
 
+/** Is there a file at that path at all? Asked after a refusal, where the answer must be no. */
+async function envFileExists(appDir: string): Promise<boolean> {
+  return access(path.join(appDir, '.env'), constants.F_OK).then(() => true, () => false)
+}
+
+test('a first install on a machine with no .env mints fresh secrets rather than reusing anything', async () => {
+  // WHAT THIS TEST IS NOW ABOUT (o3d-xf9m). It used to be a bare guard — "two independent first
+  // installs must differ" — that passed with preservation reverted, because reverting removed
+  // preservation entirely. An absent `.env` is now the input to a GATE rather than a free pass, and
+  // this test is the gate's supported-path half: the one combination that mints, and the fact that
+  // it mints WITHOUT ASKING THE OPERATOR ANYTHING.
+  //
+  // THE COMBINATION: no installation on this host, and this run created the database. That is
+  // `INSTALL_POSTGRES=y` on a fresh box, which is the documented from-scratch path.
+  //
+  // IT IS NOT VACUOUS, and the proof is in this file rather than asserted about it: the refusal test
+  // below runs the SAME rig with ONE witness flipped and the run dies before writing anything. The
+  // only difference between minting and refusing is the witness, which is what makes this a decision.
+  const source = await readScript()
+  const fromScratch: FirstInstallWitnesses = { installationOnHost: false, databaseCreatedByThisRun: true }
+
+  // PRECONDITION: the gate really is reached on this path — the rig lifted it, and the shipped
+  // preservation gate really does delegate to it rather than returning on `absent`.
+  const preservation = sliceOptionalBlock(source, 'require_preserved_secrets() {') ?? ''
+  assert.match(
+    preservation,
+    /require_absent_env_is_a_first_install/,
+    'an absent .env must be handed to the first-install witnesses, not treated as permission to mint',
+  )
+  assert.ok(
+    (sliceOptionalBlock(source, 'require_absent_env_is_a_first_install() {') ?? '').includes('DB_CREATED_BY_THIS_RUN'),
+    'precondition: the gate this rig lifts is the shipped one and asks the database question',
+  )
+
+  const oneDir = await appDirectory()
+  const { values: one, stderr: firstRunSaid } = await runInstallerCapturing(
+    source,
+    oneDir,
+    'INSTALL_REDIS=y; REDIS_PORT=6379; REDIS_PASSWORD=',
+    fromScratch,
+  )
+  const two = await runInstaller(source, await appDirectory(), 'INSTALL_REDIS=y; REDIS_PORT=6379; REDIS_PASSWORD=', fromScratch)
+
+  // The original property, kept: preservation must not become "the same secret on every install",
+  // or one leaked .env is every instance's .env.
   assert.notEqual(one.AUTH_SECRET, two.AUTH_SECRET)
   assert.notEqual(one.SETTINGS_ENCRYPTION_KEY, two.SETTINGS_ENCRYPTION_KEY)
   assert.notEqual(one.CRON_SECRET, two.CRON_SECRET)
   assert.equal(one.REDIS_URL, 'redis://localhost:6379', 'and a first install with no password still gets a bare URL')
+
+  // AND THE SUPPORTED PATH PAYS NOTHING FOR THE GATE. No refusal, and no override demanded: a
+  // from-scratch install that had to set IMS_INSTALL_REMINT_SECRETS to proceed would be a security
+  // fix that broke the documented install.
+  assert.ok(!firstRunSaid.includes('IMS_INSTALL_REMINT_SECRETS'), `a genuine first install must not be asked for the override:\n${firstRunSaid}`)
+  assert.ok(!firstRunSaid.includes('is ABSENT'), `nor told its absent .env is suspicious:\n${firstRunSaid}`)
+})
+
+test('o3d-xf9m: an absent .env on a host that is NOT a first install refuses before anything is written', async () => {
+  // THE FINDING, END TO END. ${APP_DIR} belongs to ${APP_USER}, so `rm .env` is a state that account
+  // can produce for free — and it used to be the state that authorised minting a fresh
+  // SETTINGS_ENCRYPTION_KEY over a live database, which makes every encrypted Setting already in it
+  // permanently undecryptable. Absence is now the question, not the answer.
+  //
+  // WHAT THIS TEST ADDS TO THE UNIT-LEVEL COVERAGE in tests/scripts/privileged-helper-set.test.ts,
+  // which runs the gate function in isolation over all four combinations: it runs the gate inside a
+  // COMPLETE configure-and-write pass, so what it establishes is that the refusal lands BEFORE the
+  // heredoc — the file is never created, so there is nothing to undo.
+  const source = await readScript()
+
+  // WITNESS 1: a unit file in a root-owned directory. ${APP_USER} can clear its own crontab, delete
+  // ${APP_DIR}/.pm2 and exit its processes; it cannot remove this.
+  const hostDir = await appDirectory()
+  const onHost = await runInstallerExpectingRefusal(
+    source,
+    hostDir,
+    'INSTALL_REDIS=y; REDIS_PORT=6379',
+    { installationOnHost: true, databaseCreatedByThisRun: true },
+  )
+  assert.equal(onHost.status, 9, `an existing installation must be a refusal:\n${onHost.stderr}`)
+  assert.match(onHost.stderr, /DIE: .*\.env is ABSENT/, onHost.stderr)
+  assert.match(onHost.stderr, /an existing installation was found on this host/, 'the refusal must name what it found')
+  assert.match(onHost.stderr, /PERMANENTLY undecryptable/, 'and what is at stake')
+  assert.match(onHost.stderr, /IMS_INSTALL_REMINT_SECRETS=yes/, 'and the deliberate way out, so it is not a dead end')
+  assert.equal(await envFileExists(hostDir), false, 'nothing may be written on the refusal path — the mint is gated before the heredoc')
+
+  // WITNESS 2: the database this run did not create. An install against an EXTERNAL database creates
+  // nothing, so it cannot earn the exemption, and it is told so rather than silently minting.
+  const dbDir = await appDirectory()
+  const externalDb = await runInstallerExpectingRefusal(
+    source,
+    dbDir,
+    'INSTALL_REDIS=y; REDIS_PORT=6379',
+    { installationOnHost: false, databaseCreatedByThisRun: false },
+  )
+  assert.equal(externalDb.status, 9, `a database this run did not create must be a refusal:\n${externalDb.stderr}`)
+  assert.match(externalDb.stderr, /DIE: .*\.env is ABSENT/, externalDb.stderr)
+  assert.match(externalDb.stderr, /this run created no database/, 'the refusal must quote the database finding')
+  assert.equal(await envFileExists(dbDir), false, 'and it too must write nothing')
+
+  // AND THE ONE DELIBERATE STATEMENT THAT PROCEEDS ANYWAY, which is the override that already
+  // existed for the same irreversible act rather than a second one.
+  const forcedDir = await appDirectory()
+  const { values: forced, stderr: warned } = await runInstallerCapturing(
+    source,
+    forcedDir,
+    'IMS_INSTALL_REMINT_SECRETS=yes; INSTALL_REDIS=y; REDIS_PORT=6379',
+    { installationOnHost: true, databaseCreatedByThisRun: false },
+  )
+  assert.ok(forced.SETTINGS_ENCRYPTION_KEY, 'the escape hatch really does mint')
+  assert.match(warned, /WARN: IMS_INSTALL_REMINT_SECRETS=yes/, 'and it says out loud what it just destroyed')
+  assert.match(warned, /permanently undecryptable/, warned)
+  assert.match(warned, /an existing installation was found on this host/, 'naming the witnesses it overrode')
 })
 
 test('an explicit value given to a re-run still wins over the preserved one', async () => {
