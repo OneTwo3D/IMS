@@ -1,4 +1,4 @@
-import { MINTSOFT_WEBHOOK_PROCESSING_STATUS } from '@/lib/domain/wms/booked-in-service'
+import { WMS_INBOUND_EVENT_PROCESSING_STATUS } from '@/lib/domain/wms/inbound-event-status'
 
 // q66in.4.2: pure builders for the exception-inbox replay transitions, exported
 // so the compare-and-set semantics are unit-testable without a database.
@@ -8,7 +8,7 @@ import { MINTSOFT_WEBHOOK_PROCESSING_STATUS } from '@/lib/domain/wms/booked-in-s
  * app flows can query it without referencing a connector-named constant
  * (wms-connector boundary). The status values themselves are generic.
  */
-export const DEAD_RECEIPT_EVENT_STATUS = MINTSOFT_WEBHOOK_PROCESSING_STATUS.dead
+export const DEAD_RECEIPT_EVENT_STATUS = WMS_INBOUND_EVENT_PROCESSING_STATUS.dead
 
 /**
  * Where-clause for replaying a dead-lettered inbound event: only a row still
@@ -21,7 +21,7 @@ export const DEAD_RECEIPT_EVENT_STATUS = MINTSOFT_WEBHOOK_PROCESSING_STATUS.dead
 export function buildDeadReceiptEventReplayWhere(id: string) {
   return {
     id,
-    processingStatus: MINTSOFT_WEBHOOK_PROCESSING_STATUS.dead,
+    processingStatus: WMS_INBOUND_EVENT_PROCESSING_STATUS.dead,
     processedAt: null,
   }
 }
@@ -33,7 +33,7 @@ export function buildDeadReceiptEventReplayWhere(id: string) {
  */
 export function buildDeadReceiptEventReplayData() {
   return {
-    processingStatus: MINTSOFT_WEBHOOK_PROCESSING_STATUS.pending,
+    processingStatus: WMS_INBOUND_EVENT_PROCESSING_STATUS.pending,
     processingAttempts: 0,
     nextRetryAt: null,
     deadLetteredAt: null,

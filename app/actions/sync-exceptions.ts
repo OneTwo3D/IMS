@@ -91,8 +91,13 @@ import { getWmsConnector } from '@/lib/connectors/wms/registry'
 import { createPrismaDispatchDeps, reconcileOneOrder } from '@/lib/domain/wms/dispatch-sweep'
 import { bindWmsStatusToCandidate } from '@/lib/domain/wms/status-binding'
 import { releaseWithdrawalHold } from '@/app/actions/sales'
-import { getEnabledWmsConnectorId } from '@/lib/connectors/wms/active-connector'
-import { WMS_CONNECTOR_IDS } from '@/lib/connectors/wms/types'
+import { getEnabledWmsConnectorId, resolveEnabledWmsConnectorSelection } from '@/lib/connectors/wms/active-connector'
+import {
+  ambiguousWmsConnectorReason,
+  enabledWmsConnectorId,
+  resolveEnabledWmsConnector,
+  wmsResolutionSkipReason,
+} from '@/lib/connectors/wms/enabled-connector'
 import type { FreshAuthFailureResult } from '@/lib/auth/session-gates'
 
 // q66in.4.2: the dead-letter / exception inbox. One aggregated read model over
@@ -694,7 +699,10 @@ async function loadOrderReconcileDrift(): Promise<OrderReconcileDriftRow[]> {
   // is the right answer — its warehouse cannot be asked anything, and the action refuses it too.
   const missing = rows.filter((row) => row.category === 'MISSING_IN_WMS')
   const pluginState = await getIntegrationPluginState()
-  const activeConnectorId = WMS_CONNECTOR_IDS.find((id) => pluginState[id])
+  // Round 10, Codex HIGH 1: no connector and an ambiguous enabled set both mean no control renders.
+  // The affordance offers to CREATE an order in a warehouse; offering it for a guessed warehouse is
+  // how the order is created in the wrong one.
+  const activeConnectorId = enabledWmsConnectorId(pluginState)
   const eligible = activeConnectorId
     ? await wmsCreateEligibleOrderIds(activeConnectorId, missing.map((row) => row.orderId))
     : new Set<string>()
@@ -2621,10 +2629,21 @@ export async function replayStuckDispatch(orderId: string): Promise<MutationResu
 export async function recordWithdrawnDespatch(orderId: string): Promise<MutationResult> {
   try {
     const session = await requireFreshPermission('sync')
-    const connectorId = await getEnabledWmsConnectorId()
-    if (!connectorId) {
-      return { success: false, error: 'No WMS connector is enabled, so there is no warehouse to confirm the despatch against.' }
+    // THE REASON, NOT JUST THE ABSENCE (round 12, Codex MEDIUM). `null` covered both "none enabled"
+    // and "more than one enabled", and this printed the "none" sentence for both — telling an
+    // operator no connector is enabled while two switches are on, and pointing the remedy at the
+    // wrong action. The none wording is unchanged; ambiguity gets the reason that names the rows.
+    const resolution = await resolveEnabledWmsConnectorSelection()
+    if (resolution.kind !== 'one') {
+      return {
+        success: false,
+        error: wmsResolutionSkipReason(
+          resolution,
+          'No WMS connector is enabled, so there is no warehouse to confirm the despatch against.',
+        ),
+      }
     }
+    const connectorId = resolution.id
 
     const outcome = await withDispatchSweepLockOrSkip(connectorId, async (): Promise<MutationResult> => {
       // Everything below is re-read UNDER the lock: the page may have been open for a while, and
@@ -2932,7 +2951,14 @@ export async function repushMissingWmsOrder(orderId: string): Promise<MutationRe
     // WMS since the sweep ran) — a reset would then make the push sweep create
     // a DUPLICATE. Revalidate absence live, and only for the active connector.
     const pluginState = await getIntegrationPluginState()
-    const activeConnectorId = WMS_CONNECTOR_IDS.find((id) => pluginState[id])
+    // Round 10, Codex HIGH 1: an ambiguous enabled set refuses with its own reason rather than being
+    // reported as "belongs to a connector that is no longer active" — the finding's connector may be
+    // perfectly active, just not alone, and the remedy differs.
+    const resolution = resolveEnabledWmsConnector(pluginState)
+    if (resolution.kind === 'ambiguous') {
+      return { success: false, error: wmsResolutionSkipReason(resolution) }
+    }
+    const activeConnectorId = resolution.kind === 'one' ? resolution.id : null
     const openFinding = await db.wmsOrderDiscrepancy.findFirst({
       where: { orderId, category: 'MISSING_IN_WMS', status: 'OPEN' },
       select: { connector: true },
@@ -3174,8 +3200,14 @@ export async function isolateUnresolvedDriftCohort(connector: string, version: s
     // connector that has since been switched off leaves its last incident
     // behind; acting on that would quarantine dormant links on evidence nothing
     // is refreshing.
-    const enabledConnector = await getEnabledWmsConnectorId()
-    if (!enabledConnector || connector !== enabledConnector) {
+    // AMBIGUITY IS NOT DISABLEMENT (round 12, Codex MEDIUM). With two WMS connectors enabled this
+    // connector may well be one of them, and "its incident is no longer being updated by any sweep"
+    // is then simply false — the sweep is refusing to run, for a reason the operator can fix.
+    const resolution = await resolveEnabledWmsConnectorSelection()
+    if (resolution.kind === 'ambiguous') {
+      return { success: false, error: ambiguousWmsConnectorReason(resolution.ids) }
+    }
+    if (resolution.kind !== 'one' || connector !== resolution.id) {
       return { success: false, error: 'That WMS connector is not enabled — its incident is no longer being updated by any sweep.' }
     }
     // The SAME lock the sweep takes (o3d-bjc.12). Without it this reads cohort A
@@ -3186,8 +3218,11 @@ export async function isolateUnresolvedDriftCohort(connector: string, version: s
       // held anything, and connector enablement is not serialized by this lock,
       // so it can flip in between. Reading it again here shrinks the window to
       // the transaction, and the transaction closes the rest.
-      const stillEnabled = await getEnabledWmsConnectorId()
-      if (stillEnabled !== connector) {
+      const stillEnabled = await resolveEnabledWmsConnectorSelection()
+      if (stillEnabled.kind === 'ambiguous') {
+        return { success: false, error: ambiguousWmsConnectorReason(stillEnabled.ids) }
+      }
+      if (stillEnabled.kind !== 'one' || stillEnabled.id !== connector) {
         return { success: false, error: 'That WMS connector was switched off while this page was open — nothing was isolated.' }
       }
       const raw = await readRawDriftState(connector)
@@ -3324,8 +3359,14 @@ export async function retryUnresolvedDriftCohort(connector: string, version: str
     // connector that has since been switched off leaves its last incident
     // behind; acting on that would quarantine dormant links on evidence nothing
     // is refreshing.
-    const enabledConnector = await getEnabledWmsConnectorId()
-    if (!enabledConnector || connector !== enabledConnector) {
+    // AMBIGUITY IS NOT DISABLEMENT (round 12, Codex MEDIUM). With two WMS connectors enabled this
+    // connector may well be one of them, and "its incident is no longer being updated by any sweep"
+    // is then simply false — the sweep is refusing to run, for a reason the operator can fix.
+    const resolution = await resolveEnabledWmsConnectorSelection()
+    if (resolution.kind === 'ambiguous') {
+      return { success: false, error: ambiguousWmsConnectorReason(resolution.ids) }
+    }
+    if (resolution.kind !== 'one' || connector !== resolution.id) {
       return { success: false, error: 'That WMS connector is not enabled — its incident is no longer being updated by any sweep.' }
     }
     const outcome = await withDispatchSweepLockOrSkip(connector, async (): Promise<MutationResult> => {

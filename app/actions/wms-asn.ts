@@ -1,8 +1,11 @@
 'use server'
 
 import { requirePermission } from '@/lib/auth/server'
-import { getActiveWmsConnectorId } from '@/lib/connectors/wms/active-connector'
-import { getWmsConnectorDef } from '@/lib/connectors/wms/registry'
+import { resolveActiveWmsConnector } from '@/lib/connectors/wms/active-connector'
+import { findWmsConnectorLabel, getWmsConnectorHooks } from '@/lib/connectors/wms/registry'
+import { decorateWmsAsnState, unsupportedWmsAsnState } from '@/lib/connectors/wms/asn-types'
+import { ambiguousWmsConnectorReason } from '@/lib/connectors/wms/enabled-connector'
+import type { WmsAsnActions } from '@/lib/connectors/wms/connector-hooks'
 import type {
   WmsPurchaseOrderAsnState,
   WmsTransferAsnState,
@@ -10,49 +13,92 @@ import type {
 } from '@/lib/connectors/wms/asn-types'
 
 /**
- * Connector-agnostic ASN server-action facade. Core PO/transfer flows call
- * these; the facade resolves the active WMS connector and dispatches to that
- * connector's implementation. Adding a new WMS connector means registering its
- * implementation here (one case), not editing the PO/transfer views.
+ * Connector-agnostic ASN server-action facade. Core PO/transfer flows call these; the facade
+ * resolves the ACTIVE WMS connector and dispatches to whatever ASN implementation that connector
+ * registered. Adding a WMS connector means adding `hooks.asn` to its registry definition — not
+ * editing this file, and not editing the PO/transfer views.
  *
- * o3d-512h round 3 — GUARDS, not an allowlist wildcard. These four carried no gate
- * of their own and sat behind `'wms-asn.ts:*'` in
- * tests/security/server-action-guard-coverage.test.ts, on a reason that said in as
- * many words that the no-connector arm returns unguarded. It is the accounting-sync
- * defect verbatim: `getActiveWmsConnectorId` is a plugin-state DATABASE READ, and on
- * the arm where no WMS connector is enabled the answer comes back from this module
- * with no delegate anywhere on the path. Every principal — including SUPPLIER —
- * could POST these to learn whether the tenant runs a WMS.
+ * o3d-remove-shiphero round 2 (Codex HIGH 1) — WHY THIS IS NOT AN `id === 'mintsoft'` CHECK.
+ * Every action here used to dispatch only when the active connector was literally `mintsoft`, and
+ * fall through otherwise. The fall-through arms are not harmless defaults: a registered connector
+ * that can perfectly well create an ASN — `createAsn` is REQUIRED by `WmsConnector`, so every
+ * connector can — got the "unsupported" state on the reads and the flat lie "No WMS connector is
+ * enabled." on the creates. The facade was a dispatcher with one arm, which is a switch that
+ * compiles fine and makes the id meaningless.
+ *
+ * It now routes on CAPABILITY: does the active connector declare an ASN implementation? The two
+ * "no" answers are kept DISTINCT, because they call for different things from the operator —
+ * nothing is enabled (enable a WMS), versus this warehouse cannot do ASNs (receive by hand). The
+ * second is NAMED, so nobody is told an anonymous system is unavailable.
+ *
+ * o3d-512h round 3 — GUARDS, not an allowlist wildcard. These five carried no gate of their own and
+ * sat behind `'wms-asn.ts:*'` in tests/security/server-action-guard-coverage.test.ts, on a reason
+ * that said in as many words that the no-connector arm returns unguarded. It is the accounting-sync
+ * defect verbatim: `getActiveWmsConnectorId` is a plugin-state DATABASE READ, and on the arm where
+ * no WMS connector is enabled the answer comes back from this module with no delegate anywhere on
+ * the path. Every principal — including SUPPLIER — could POST these to learn whether the tenant
+ * runs a WMS.
  *
  * Each takes ITS OWN delegate's gate, not one gate for the file: the two reads go to
- * requireMintsoftReadAccess (= 'sync'), the PO ASN create to 'purchasing.receive' and
- * the transfer ASN create to 'stock_control.transfer'. Copying a single permission
- * across all four would have locked WAREHOUSE out of an ASN it is entitled to create.
+ * requireMintsoftReadAccess (= 'sync'), the PO ASN create to 'purchasing.receive' and the transfer
+ * ASN create to 'stock_control.transfer'. Copying a single permission across all five would have
+ * locked WAREHOUSE out of an ASN it is entitled to create. The gate is taken BEFORE the resolve, on
+ * every arm, so it does not matter which arm a caller lands on.
  */
 
-function disabledAsnState(): WmsPurchaseOrderAsnState {
+/**
+ * `ambiguous` carries the ids when MORE THAN ONE WMS connector is enabled (round 10, Codex HIGH 1).
+ *
+ * It is not folded into the `connector: null` case, because after this round that case is reached
+ * by almost nothing else: `resolveActiveWmsConnector` falls back to the first registered connector
+ * when NOTHING is enabled, so "nothing resolved" now means either a build with no registered
+ * connector at all or — in practice — a contradictory selection. Answering both with "No WMS
+ * connector is enabled." would print the one sentence that is certainly false in the state that
+ * actually occurs.
+ */
+type ResolvedWmsAsn =
+  | { connector: string; label: string | null; actions: WmsAsnActions; ambiguous: null }
+  | { connector: string; label: string | null; actions: null; ambiguous: null }
+  | { connector: null; label: null; actions: null; ambiguous: readonly string[] | null }
+
+/**
+ * The active connector, its display label, and its ASN implementation if it declares one.
+ *
+ * `findWmsConnectorLabel` (not `getDef`) so a link row written by a connector this build no longer
+ * ships degrades to the generic label instead of throwing inside a read.
+ */
+async function resolveWmsAsn(): Promise<ResolvedWmsAsn> {
+  const resolution = await resolveActiveWmsConnector()
+  if (resolution.kind === 'ambiguous') {
+    return { connector: null, label: null, actions: null, ambiguous: resolution.ids }
+  }
+  if (resolution.kind === 'none') return { connector: null, label: null, actions: null, ambiguous: null }
+  const connector = resolution.id
+  const label = findWmsConnectorLabel(connector)
+  const asn = getWmsConnectorHooks(connector).asn
+  if (!asn) return { connector, label, actions: null, ambiguous: null }
+  return { connector, label, actions: await asn(), ambiguous: null }
+}
+
+/** The refusal for a connector that resolved but cannot do ASNs, versus nothing resolving at all. */
+function asnUnavailable(resolved: ResolvedWmsAsn): WmsCreateAsnResult {
+  // The contradiction gets its OWN sentence, and it names the remedy. "No WMS connector is
+  // enabled." in front of an operator looking at two enabled switches is a refusal they cannot act
+  // on (round 10, Codex HIGH 1).
+  if (resolved.ambiguous) return { success: false, error: ambiguousWmsConnectorReason(resolved.ambiguous) }
+  if (resolved.connector === null) return { success: false, error: 'No WMS connector is enabled.' }
   return {
-    pluginEnabled: false,
-    canCreate: false,
-    canManage: false,
-    blockedReason: null,
-    destinationWarehouseCode: null,
-    bindingExternalWarehouseId: null,
-    existingAsns: [],
-    connectorLabel: 'WMS',
+    success: false,
+    error: `${resolved.label ?? 'The active WMS connector'} does not support advance shipment notices.`,
   }
 }
 
 export async function getWmsPurchaseOrderAsnState(poId: string): Promise<WmsPurchaseOrderAsnState> {
   // mintsoft-sync.ts:getMintsoftPurchaseOrderAsnState → requireMintsoftReadAccess() → requirePermission('sync')
   await requirePermission('sync')
-  const connector = await getActiveWmsConnectorId()
-  if (connector === 'mintsoft') {
-    const { getMintsoftPurchaseOrderAsnState } = await import('@/app/actions/mintsoft-sync')
-    const core = await getMintsoftPurchaseOrderAsnState(poId)
-    return { ...core, connectorLabel: getWmsConnectorDef(connector).label }
-  }
-  return disabledAsnState()
+  const resolved = await resolveWmsAsn()
+  if (!resolved.actions) return unsupportedWmsAsnState(resolved.label)
+  return decorateWmsAsnState(await resolved.actions.getPurchaseOrderAsnState(poId), resolved.label)
 }
 
 export async function getWmsTransferAsnStates(
@@ -60,16 +106,12 @@ export async function getWmsTransferAsnStates(
 ): Promise<Record<string, WmsTransferAsnState>> {
   // mintsoft-sync.ts:getMintsoftTransferAsnStates → requireMintsoftReadAccess() → requirePermission('sync')
   await requirePermission('sync')
-  const connector = await getActiveWmsConnectorId()
-  if (connector === 'mintsoft') {
-    const { getMintsoftTransferAsnStates } = await import('@/app/actions/mintsoft-sync')
-    const states = await getMintsoftTransferAsnStates(transferIds)
-    const connectorLabel = getWmsConnectorDef(connector).label
-    return Object.fromEntries(
-      Object.entries(states).map(([id, state]) => [id, { ...state, connectorLabel }]),
-    )
-  }
-  return {}
+  const resolved = await resolveWmsAsn()
+  if (!resolved.actions) return {}
+  const states = await resolved.actions.getTransferAsnStates(transferIds)
+  return Object.fromEntries(
+    Object.entries(states).map(([id, state]) => [id, decorateWmsAsnState(state, resolved.label)]),
+  )
 }
 
 export async function createWmsPurchaseOrderAsn(
@@ -78,12 +120,9 @@ export async function createWmsPurchaseOrderAsn(
 ): Promise<WmsCreateAsnResult> {
   // mintsoft-sync.ts:createMintsoftPurchaseOrderAsn → requirePermission('purchasing.receive')
   await requirePermission('purchasing.receive')
-  const connector = await getActiveWmsConnectorId()
-  if (connector === 'mintsoft') {
-    const { createMintsoftPurchaseOrderAsn } = await import('@/app/actions/mintsoft-sync')
-    return createMintsoftPurchaseOrderAsn(poId, input)
-  }
-  return { success: false, error: 'No WMS connector is enabled.' }
+  const resolved = await resolveWmsAsn()
+  if (!resolved.actions) return asnUnavailable(resolved)
+  return resolved.actions.createPurchaseOrderAsn(poId, input)
 }
 
 export async function createWmsTransferAsn(
@@ -92,12 +131,9 @@ export async function createWmsTransferAsn(
 ): Promise<WmsCreateAsnResult> {
   // mintsoft-sync.ts:createMintsoftTransferAsn → requirePermission('stock_control.transfer')
   await requirePermission('stock_control.transfer')
-  const connector = await getActiveWmsConnectorId()
-  if (connector === 'mintsoft') {
-    const { createMintsoftTransferAsn } = await import('@/app/actions/mintsoft-sync')
-    return createMintsoftTransferAsn(transferId, input)
-  }
-  return { success: false, error: 'No WMS connector is enabled.' }
+  const resolved = await resolveWmsAsn()
+  if (!resolved.actions) return asnUnavailable(resolved)
+  return resolved.actions.createTransferAsn(transferId, input)
 }
 
 /**
@@ -122,10 +158,7 @@ export async function recheckWmsAsnBookedIn(
   // The gate is the DELEGATE'S OWN, not a convenient one:
   // mintsoft-sync.ts:recheckMintsoftAsnBookedIn → requirePermission('purchasing.receive').
   await requirePermission('purchasing.receive')
-  const connector = await getActiveWmsConnectorId()
-  if (connector === 'mintsoft') {
-    const { recheckMintsoftAsnBookedIn } = await import('@/app/actions/mintsoft-sync')
-    return recheckMintsoftAsnBookedIn(externalAsnId)
-  }
-  return { success: false, error: 'No WMS connector is enabled.' }
+  const resolved = await resolveWmsAsn()
+  if (!resolved.actions) return asnUnavailable(resolved)
+  return resolved.actions.recheckAsnBookedIn(externalAsnId)
 }

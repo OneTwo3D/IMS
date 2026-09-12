@@ -227,8 +227,13 @@ test('o3d-2k5r r3 replay: a dead letter belonging to a connector that is not act
   // Probing the WRONG warehouse and getting MISSING is not evidence about this order at all.
   // mintsoft's create IS replay-safe, so the only thing that can refuse here is the active-connector
   // check — which is what keeps this test about that check rather than about the replay policy.
+  //
+  // o3d-remove-shiphero: with one shipped connector, enabling a plugin the registered-id list does
+  // not contain resolves to NO active connector rather than to a different one. Same door, same
+  // refusal, narrower premise — stated so a later reader does not mistake it for the two-connector
+  // case it was originally written as.
   reset([deadLetter({ connector: 'mintsoft' })])
-  state.activePlugins = { shiphero: true }
+  state.activePlugins = { 'acme-wms': true }
   const result = await (await loadAction())('so-1')
 
   assert.equal(result.success, false)
@@ -238,10 +243,17 @@ test('o3d-2k5r r3 replay: a dead letter belonging to a connector that is not act
 })
 
 test('o3d-2k5r r4 replay: a connector whose create cannot be repeated safely is refused before anything is asked', async () => {
-  // ShipHero's order_create does not enforce partner_order_id uniqueness, so its only dedupe is a
-  // preflight lookup that cannot see a request still on the wire. No answer the warehouse could
-  // give would licence this replay, so nothing is asked and the refusal names WMS-side actions.
-  reset([deadLetter({ connector: 'shiphero' })])
+  // A create that is not known to refuse a duplicate can never be repeated automatically: no answer
+  // the warehouse could give would licence the replay, so nothing is asked and the refusal names
+  // WMS-side actions.
+  //
+  // ROUTE, HONESTLY. `decideWmsPushReplay` runs BEFORE the active-connector check (see the action),
+  // so this really does reach the policy gate. But `acme-wms` is not in the SHIPPED registry, so the
+  // gate refuses it as "no policy" rather than as `client-side-dedupe-only` — and those two produce
+  // the same refusal by design. What is proved here is the ACTION: no probe spent, nothing written.
+  // Attributing the refusal to the policy needs a registry that really carries one, which is
+  // tests/wms-second-connector-seam.test.ts.
+  reset([deadLetter({ connector: 'acme-wms' })])
   const result = await (await loadAction())('so-1')
 
   assert.equal(result.success, false)
@@ -260,9 +272,9 @@ async function loadReadAction() {
 
 test('o3d-2k5r r4 chip: canRetry is FALSE for a park the action would refuse every time', async () => {
   // The "remedy that cannot be performed" class, caught at the point it would be advertised. A
-  // ShipHero park can never be re-queued by this action, so offering the button would be a lie —
+  // Such a park can never be re-queued by this action, so offering the button would be a lie —
   // and the operator would press it, be refused, and learn nothing they could act on.
-  reset([ambiguousCreate({ connector: 'shiphero' })])
+  reset([ambiguousCreate({ connector: 'acme-wms' })])
   const view = await (await loadReadAction())('so-1')
   assert.equal(view!.state, 'AMBIGUOUS_CREATE')
   assert.equal(view!.canRetry, false)

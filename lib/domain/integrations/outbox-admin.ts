@@ -44,6 +44,10 @@ export const ADMIN_OUTBOX_POST_LEASE_MARGIN_MS = 5 * 60 * 1000
  * WRITE already reached WooCommerce or Xero is a question elapsed time cannot answer at all. See the
  * `unsafe-to-replay` prose in `outbox-replay-policy.ts` for what follows from that.
  */
+// The WMS boundary guard follows this import into outbox-leases.ts and finds `Math.max(...)`,
+// which its constant fold cannot evaluate; an unevaluable constant is reported rather than read as
+// empty. Both operands are millisecond counts, and a number cannot spell a connector id.
+// wms-connector-boundary-ok: o3d-lhjh: millisecond arithmetic over an unfoldable Math.max
 export const ADMIN_OUTBOX_STALE_PROCESSING_LOCK_MS = INTEGRATION_OUTBOX_MAX_LEASE_MS
   + ADMIN_OUTBOX_POST_LEASE_MARGIN_MS
 const REDACTED_VALUE = '[redacted]'

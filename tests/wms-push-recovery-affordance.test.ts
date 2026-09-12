@@ -11,7 +11,7 @@ import {
  *
  * The exception inbox rendered Replay for every blocked state except VALIDATION_FAILED, from a
  * condition written in the client. `replayWmsOrderPush` refuses on four things, and the client knew
- * about one of them — so a ShipHero AMBIGUOUS_CREATE row got a button the action refuses every
+ * about one of them — so an AMBIGUOUS_CREATE row on such a connector got a button the action refuses every
  * single time, under a label ("Push failed") naming the one thing that row is not. The order-detail
  * chip had its own third version of the same condition, which omitted the externalOrderId refusal.
  *
@@ -22,8 +22,17 @@ import {
 const AMBIGUOUS = { attempts: 3, externalOrderId: null, pushedAt: null }
 const NOTHING_SENT = { attempts: 0, externalOrderId: null, pushedAt: null }
 
-test('o3d-2k5r r5 affordance: a ShipHero park is NOT replayable — the row the inbox used to give a button', () => {
-  const decision = decideWmsPushReplay({ connector: 'shiphero', state: 'AMBIGUOUS_CREATE', ...AMBIGUOUS }, 'SO-1')
+/**
+ * o3d-remove-shiphero: `acme-wms` stands in for the connector whose create cannot be repeated. It is
+ * NOT in the shipped registry, so these calls refuse it as "no policy" rather than as
+ * `client-side-dedupe-only` — the same refusal, reached by the adjacent route. That is adequate for
+ * what this file measures (which affordance the inbox renders, and what the guidance says), and it
+ * is deliberately NOT adequate for "the policy value still exists": that is asserted in
+ * tests/wms-second-connector-seam.test.ts, against a registry that really carries the policy.
+ */
+
+test('o3d-2k5r r5 affordance: an unsafe-create park is NOT replayable — the row the inbox used to give a button', () => {
+  const decision = decideWmsPushReplay({ connector: 'acme-wms', state: 'AMBIGUOUS_CREATE', ...AMBIGUOUS }, 'SO-1')
   assert.equal(decision.replayable, false)
   assert.equal(decision.replayable === false && decision.reason, 'create-not-repeatable')
   // And the guidance is WMS-side work a person can actually perform, not "try again".
@@ -69,7 +78,7 @@ test('o3d-2k5r r5 affordance: an unknown connector fails CLOSED', () => {
 test('o3d-2k5r r5 affordance: the Why column is derived from the evidence, not the state name', () => {
   // "Push failed" on an AMBIGUOUS_CREATE row is precisely wrong: nothing is known to have failed,
   // and the hazard is that the create SUCCEEDED and IMS never heard.
-  assert.equal(describeBlockedWmsPush({ connector: 'shiphero', state: 'AMBIGUOUS_CREATE', ...AMBIGUOUS }), 'Create outcome unknown')
+  assert.equal(describeBlockedWmsPush({ connector: 'acme-wms', state: 'AMBIGUOUS_CREATE', ...AMBIGUOUS }), 'Create outcome unknown')
   assert.equal(describeBlockedWmsPush({ connector: 'mintsoft', state: 'VALIDATION_FAILED', ...NOTHING_SENT }), 'Payload invalid')
   assert.equal(describeBlockedWmsPush({ connector: 'mintsoft', state: 'DEAD_LETTER', ...AMBIGUOUS }), 'Push failed')
   assert.equal(
@@ -81,10 +90,10 @@ test('o3d-2k5r r5 affordance: the Why column is derived from the evidence, not t
 test('o3d-2k5r r5 affordance: the MISSING_IN_WMS re-push takes the same connector contract', () => {
   // A lookup that came back empty is not proof the order is gone — it is the same lookup whose
   // answer is in doubt. Only the remote's own contract covers the case where it was wrong.
-  const shiphero = decideWmsMissingRepush({ connector: 'shiphero', reference: 'SO-1', createEligible: true })
-  assert.equal(shiphero.repushable, false)
-  assert.match(shiphero.repushable === false ? shiphero.guidance : '', /does not refuse a duplicate/)
-  assert.match(shiphero.repushable === false ? shiphero.guidance : '', /second order under the same reference/)
+  const unsafe = decideWmsMissingRepush({ connector: 'acme-wms', reference: 'SO-1', createEligible: true })
+  assert.equal(unsafe.repushable, false)
+  assert.match(unsafe.repushable === false ? unsafe.guidance : '', /does not refuse a duplicate/)
+  assert.match(unsafe.repushable === false ? unsafe.guidance : '', /second order under the same reference/)
   assert.deepEqual(decideWmsMissingRepush({ connector: 'mintsoft', reference: 'SO-1', createEligible: true }), { repushable: true })
   // Fails closed on a connector this build does not know, like every other reader of the policy.
   assert.equal(decideWmsMissingRepush({ connector: '', reference: 'SO-1', createEligible: true }).repushable, false)
@@ -92,13 +101,13 @@ test('o3d-2k5r r5 affordance: the MISSING_IN_WMS re-push takes the same connecto
 
 // --- the ROW the client receives -------------------------------------------------------
 
-test('o3d-2k5r r5 row: a ShipHero park reaches the inbox with NO replay affordance and the guidance instead', async () => {
+test('o3d-2k5r r5 row: an unsafe-create park reaches the inbox with NO replay affordance and the guidance instead', async () => {
   // The finding, at the point it is observable: the client renders `replayable`, so if the row says
   // true the button is on screen whatever the action does. This is the row that used to get one.
   const { buildBlockedWmsPushRow } = await import('../lib/domain/wms/push-recovery-affordance.ts')
   const row = buildBlockedWmsPushRow({
     orderId: 'so-1',
-    connector: 'shiphero',
+    connector: 'acme-wms',
     state: 'AMBIGUOUS_CREATE',
     attempts: 1,
     externalOrderId: null,
@@ -134,7 +143,7 @@ test('o3d-2k5r r5 row: a MISSING_IN_WMS drift row carries the re-push affordance
   const { buildOrderReconcileDriftRow } = await import('../lib/domain/wms/push-recovery-affordance.ts')
   const base = {
     orderId: 'so-1',
-    connector: 'shiphero',
+    connector: 'acme-wms',
     detail: null,
     externalOrderNumber: 'WMS-1',
     lastSeenAt: new Date('2026-08-20T09:00:00.000Z'),
@@ -186,11 +195,11 @@ test('o3d-2k5r r6 row: an INELIGIBLE order gets no Re-push control, even on a re
   assert.match(row.repushRefusal!, /ACTIVE binding/)
   assert.match(row.repushRefusal!, /SO-1/, 'and it names the order the operator has to go and fix')
 
-  // The connector contract is still asked FIRST, so a ShipHero row says the duplicate thing rather
+  // The connector contract is still asked FIRST, so such a row says the duplicate thing rather
   // than the eligibility thing — the two refusals have different remedies.
-  const shiphero = decideWmsMissingRepush({ connector: 'shiphero', reference: 'SO-1', createEligible: false })
-  assert.equal(shiphero.repushable, false)
-  assert.equal(shiphero.repushable === false ? shiphero.reason : '', 'create-not-repeatable')
+  const unsafe = decideWmsMissingRepush({ connector: 'acme-wms', reference: 'SO-1', createEligible: false })
+  assert.equal(unsafe.repushable, false)
+  assert.equal(unsafe.repushable === false ? unsafe.reason : '', 'create-not-repeatable')
 })
 
 test('o3d-2k5r r6 wiring: the inbox feeds the row the DATABASE\'s eligibility verdict, not a default', async () => {

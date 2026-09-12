@@ -1,7 +1,7 @@
 import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
 import { getIntegrationPluginState } from '@/lib/integration-plugins'
-import { WMS_CONNECTOR_IDS } from '@/lib/connectors/wms/types'
+import { resolveEnabledWmsConnector, wmsResolutionSkipReason } from '@/lib/connectors/wms/enabled-connector'
 
 
 /**
@@ -180,8 +180,11 @@ export function buildAsnOverdueAlertMessage(input: {
 
 export async function runWmsWatchdog(): Promise<WmsWatchdogResult> {
   const state = await getIntegrationPluginState()
-  const connectorId = WMS_CONNECTOR_IDS.find((id) => state[id])
-  if (!connectorId) return { status: 'SKIPPED', overdueAsnAlerts: 0, staleBindingAlerts: 0, reason: 'No WMS connector enabled' }
+  const resolution = resolveEnabledWmsConnector(state)
+  if (resolution.kind !== 'one') {
+    return { status: 'SKIPPED', overdueAsnAlerts: 0, staleBindingAlerts: 0, reason: wmsResolutionSkipReason(resolution) }
+  }
+  const connectorId = resolution.id
 
   // Zero active admins is NOT delivery (Codex r5/r6): claiming breaches with
   // nowhere to send them would either lose alerts or (rolled back per entity)

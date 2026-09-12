@@ -41,6 +41,43 @@ export type WmsTransferAsnStateCore = WmsAsnStateCore
 export type WmsPurchaseOrderAsnState = WmsAsnStateCore & { connectorLabel: string }
 export type WmsTransferAsnState = WmsAsnStateCore & { connectorLabel: string }
 
+/** The fallback label when no WMS connector resolves at all. Never a connector name. */
+export const WMS_GENERIC_CONNECTOR_LABEL = 'WMS'
+
+/**
+ * The ONE place a connector-agnostic ASN core becomes a labelled view-model.
+ *
+ * Extracted from app/actions/wms-asn.ts so it can be driven without a server action —
+ * tests/wms-second-connector-seam.test.ts decorates a core with a FICTITIOUS connector's
+ * label and asserts nothing Mintsoft-shaped survives. Inline this back into the facade
+ * and the only thing checking the label promise disappears with it.
+ */
+export function decorateWmsAsnState<T extends WmsAsnStateCore>(
+  core: T,
+  connectorLabel: string | null,
+): T & { connectorLabel: string } {
+  return { ...core, connectorLabel: connectorLabel ?? WMS_GENERIC_CONNECTOR_LABEL }
+}
+
+/**
+ * The state a PO/transfer view gets when the resolved connector cannot do ASNs at all
+ * — including when no connector resolves. It is still LABELLED with whatever did
+ * resolve, so the dialog says "Acme Fulfilment ASN unavailable" rather than the
+ * anonymous "WMS": telling an operator that an unnamed system is unavailable is the
+ * kind of copy that generates a support ticket.
+ */
+export function unsupportedWmsAsnState(connectorLabel: string | null): WmsPurchaseOrderAsnState {
+  return decorateWmsAsnState({
+    pluginEnabled: false,
+    canCreate: false,
+    canManage: false,
+    blockedReason: null,
+    destinationWarehouseCode: null,
+    bindingExternalWarehouseId: null,
+    existingAsns: [],
+  }, connectorLabel)
+}
+
 export type WmsCreateAsnInput = {
   packagingType?: WmsAsnPackagingType | null
   packageCount?: number | null

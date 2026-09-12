@@ -24,7 +24,7 @@
  *      "Warehouse" column. Read-only; WMS-neutral.
  *   3. Partial-Shipment Receiver — signed REST endpoint
  *      POST /wp-json/oti/v1/order/{id}/partial-shipment that IMS posts each
- *      despatched part of a split fulfilment to (WMS-neutral: Mintsoft, ShipHero,
+ *      despatched part of a split fulfilment to (WMS-neutral: Mintsoft or any future WMS,
  *      ...). Mirrors the part into the wphub-partial-shipment tables (storefront
  *      partial-shipment UI + customer emails) and transitions the order to
  *      partial-shipped / completed.
@@ -387,7 +387,7 @@ if (!function_exists('oti_ps_parts_done')) {
 if (!function_exists('oti_handle_partial_shipment')) {
     /**
      * WMS-neutral partial-shipment writeback. IMS posts each despatched part of a
-     * split fulfilment here (Mintsoft, ShipHero, ... — the route does not care
+     * split fulfilment here (Mintsoft or any future WMS — the route does not care
      * which WMS produced it). We mirror the part into the wphub-partial-shipment
      * tables (the storefront's partial-shipment UI + customer emails), stamp split
      * metadata, and transition the WC order to partial-shipped / completed.

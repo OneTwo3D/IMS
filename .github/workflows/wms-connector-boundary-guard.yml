@@ -30,4 +30,11 @@ jobs:
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: 22
+          cache: npm
+      # The guard parses TypeScript with the compiler's own scanner rather than
+      # hand-rolling a tokenizer, so it imports `typescript` and needs the dev
+      # dependencies installed. It only walks leaf tokens - no TypeChecker and no
+      # generated Prisma client - so unlike check:server-action-guards it does not
+      # need `prisma generate`.
+      - run: npm ci
       - run: npm run check:wms-connector-boundary

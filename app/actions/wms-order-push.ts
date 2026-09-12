@@ -6,7 +6,7 @@ import { logActivity } from '@/lib/activity-log'
 import { requireInternalUser, requirePermission } from '@/lib/auth/server'
 import { getIntegrationPluginState } from '@/lib/integration-plugins'
 import { getWmsConnector } from '@/lib/connectors/wms/registry'
-import { WMS_CONNECTOR_IDS } from '@/lib/connectors/wms/types'
+import { resolveEnabledWmsConnector, wmsResolutionSkipReason } from '@/lib/connectors/wms/enabled-connector'
 import { decideWmsPushReplay } from '@/lib/domain/wms/push-recovery-affordance'
 import { wmsCreateOutcomeIsAmbiguous, wmsPushOrderReference } from '@/lib/domain/wms/order-push-sweep'
 
@@ -128,7 +128,15 @@ export async function replayWmsOrderPush(salesOrderId: string): Promise<{ succes
     // The connector's replay policy has already been applied by `decideWmsPushReplay` above — this
     // branch is only ever reached on a connector whose create refuses a duplicate.
     const pluginState = await getIntegrationPluginState()
-    const activeConnectorId = WMS_CONNECTOR_IDS.find((id) => pluginState[id])
+    // ROUND 10, Codex HIGH 1 — the resolution, not `find`. ONLY the ambiguous arm is new: "that
+    // connector is not the active one" would be a lie when the connector this push belongs to is
+    // enabled and merely not alone, and the remedy it names (re-enable it) is not the remedy. The
+    // no-connector case keeps the wording it already had. Either way nothing is dispatched.
+    const resolution = resolveEnabledWmsConnector(pluginState)
+    if (resolution.kind === 'ambiguous') {
+      return { success: false, error: wmsResolutionSkipReason(resolution) }
+    }
+    const activeConnectorId = resolution.kind === 'one' ? resolution.id : null
     if (!activeConnectorId || activeConnectorId !== link.connector) {
       return {
         success: false,

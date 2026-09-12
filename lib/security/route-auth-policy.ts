@@ -198,18 +198,6 @@ export const apiRouteAuthPolicy = {
     access: 'cron-secret',
     reason: 'Cron endpoint guarded by verifyCron.',
   },
-  '/api/cron/shiphero-webhook-sweeper': {
-    access: 'cron-secret',
-    reason: 'Cron endpoint guarded by verifyCron.',
-  },
-  '/api/cron/shiphero-reconcile': {
-    access: 'cron-secret',
-    reason: 'Cron endpoint guarded by verifyCron.',
-  },
-  '/api/cron/shiphero-stock-sync': {
-    access: 'cron-secret',
-    reason: 'Cron endpoint guarded by verifyCron.',
-  },
   '/api/cron/shopping-webhook-inbox': {
     access: 'cron-secret',
     reason: 'Cron endpoint guarded by verifyCron.',
@@ -405,10 +393,6 @@ export const apiRouteAuthPolicy = {
   '/api/webhooks/mintsoft/asn-booked-in': {
     access: 'public-webhook',
     reason: 'Public Mintsoft webhook endpoint; verifies plugin enablement, shared signature, and fresh signed timestamp.',
-  },
-  '/api/webhooks/shiphero/[event]': {
-    access: 'public-webhook',
-    reason: 'Public ShipHero webhook endpoint; verifies plugin enablement, event type, and shared HMAC before idempotent staging.',
   },
   '/api/webhooks/shopping/[connector]/[resource]': {
     access: 'public-webhook',

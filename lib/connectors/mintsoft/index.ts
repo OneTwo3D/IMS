@@ -94,6 +94,21 @@ export class MintsoftConnector implements WmsConnector {
     return fetchMintsoftOrderStatus(orderNumber, await getRequiredMintsoftClientId())
   }
 
+  /**
+   * Mintsoft compares `SinceLastUpdated` against `LastUpdated` in the tenant DATABASE'S timezone,
+   * NOT UTC (verified live: the tenant runs Europe/London, so `LastUpdated` sits +1h under BST).
+   *
+   * It lives HERE, on the connector, because it is a fact about this warehouse — o3d-remove-shiphero
+   * round 4 (Codex HIGH 1) moved it off `DISPATCH_DELTA_DEFAULT_TIMEZONE` in the generic sweep, where
+   * it was the default EVERY connector's delta fell back to. A second connector whose cursor is
+   * compared in UTC (or in any other tenant zone) would have had its window shifted by an hour and
+   * silently skipped whatever changed in the gap.
+   *
+   * Overridable per-tenant by the `mintsoft_api_timezone` setting row; `"UTC"` (or an invalid zone)
+   * disables the conversion.
+   */
+  readonly deltaCursorTimeZone = 'Europe/London'
+
   async fetchOrderDelta(sinceIso: string): Promise<WmsOrderStatus[]> {
     // FAIL CLOSED: the delta MUST be scoped to our own ClientId. Mintsoft is a
     // shared 3PL tenant, so an unscoped Order/List returns every client's orders
@@ -220,7 +235,6 @@ export {
   MINTSOFT_DEFAULT_ADMIN_ORDER_URL_TEMPLATE,
   mintsoftDeltaScopeChanged,
   mintsoftDeltaScopeToken,
-  mintsoftHasAuthMaterial,
   MINTSOFT_SETTING_KEYS,
   MintsoftAuthModeError,
   parseMintsoftAuthMode,

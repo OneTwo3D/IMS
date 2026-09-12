@@ -10,7 +10,7 @@ import type { WmsAsnRef, WmsConnector } from '@/lib/connectors/wms/types'
 import {
   buildMintsoftWebhookReplayForAsnWhere,
   buildMintsoftWebhookSweepWhere,
-  MINTSOFT_WEBHOOK_PROCESSING_STATUS,
+  WMS_INBOUND_EVENT_PROCESSING_STATUS,
   processBookedInEvent,
   type ProcessMintsoftBookedInResult,
 } from '@/lib/domain/wms/booked-in-service'
@@ -77,7 +77,7 @@ function getConnectorName(connector: Pick<WmsConnector, 'fetchAsnById'>): string
 export function shouldLogMintsoftWebhookRetryStateReset(
   previous: MintsoftWebhookRetryResetSnapshot,
 ): boolean {
-  return previous.processingStatus !== MINTSOFT_WEBHOOK_PROCESSING_STATUS.pending
+  return previous.processingStatus !== WMS_INBOUND_EVENT_PROCESSING_STATUS.pending
     || previous.processingAttempts > 0
     || previous.nextRetryAt != null
     || previous.deadLetteredAt != null
@@ -111,7 +111,7 @@ export function createMintsoftWebhookEventRepository(
           externalEventId: input.externalEventId,
           externalAsnId: input.externalAsnId,
           payload: input.payload,
-          processingStatus: MINTSOFT_WEBHOOK_PROCESSING_STATUS.pending,
+          processingStatus: WMS_INBOUND_EVENT_PROCESSING_STATUS.pending,
           processingAttempts: 0,
           nextRetryAt: null,
           deadLetteredAt: null,
@@ -151,7 +151,7 @@ export function createMintsoftWebhookEventRepository(
         data: {
           externalAsnId: input.externalAsnId,
           payload: input.payload,
-          processingStatus: MINTSOFT_WEBHOOK_PROCESSING_STATUS.pending,
+          processingStatus: WMS_INBOUND_EVENT_PROCESSING_STATUS.pending,
           processingAttempts: 0,
           nextRetryAt: null,
           deadLetteredAt: null,

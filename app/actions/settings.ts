@@ -11,6 +11,7 @@ import {
   type IntegrationPluginId,
   type IntegrationPluginState,
 } from '@/lib/integration-plugins'
+import { findIntegrationPluginWriteConflict } from '@/lib/domain/integrations/plugin-catalog'
 import { lockIntegrationPluginSelection } from '@/lib/integration-plugin-selection-lock'
 import { completePluginSelectionSave, type PluginSelectionSaveResult } from '@/lib/domain/integrations/plugin-save-outcome'
 import { runPostCommit } from '@/lib/domain/post-commit'
@@ -1203,12 +1204,18 @@ export async function saveIntegrationPluginState(
   const outcome = await db.$transaction(async (tx): Promise<{ conflict: string } | { committed: IntegrationPluginState }> => {
     const resulting = { ...(await lockIntegrationPluginSelection(tx)) }
     for (const [id, enabled] of entries) resulting[id] = enabled
-    if (resulting.xero && resulting.quickbooks) {
-      return { conflict: 'Enable either Xero or QuickBooks, not both — accounting dispatch is single-connector.' }
-    }
-    if (resulting.woocommerce && resulting.shopify) {
-      return { conflict: 'Enable either WooCommerce or Shopify, not both.' }
-    }
+    // EVERY RULE, IN ONE CALL (o3d-remove-shiphero rounds 10 and 12). Exclusivity was two
+    // hand-written pairs — accounting and shopping — and round 8's registry-derived toggles then
+    // gave the WMS connectors a switch apiece with no rule over them. Enabling a second WMS beside
+    // the first committed, reported success, and changed nothing: every routing site resolved the
+    // active connector as "the first enabled one", so the warehouse the operator just selected was
+    // never reached. The groups live in lib/integration-plugin-keys.ts and the WMS one is spread
+    // from WMS_CONNECTOR_IDS, so a connector is under the rule the day it is registered. Round 12
+    // adds the second rule — a connector registered `available: false` may not be switched on —
+    // and the two are ONE function precisely so this writer and the wizard's cannot hold different
+    // halves of the ruleset.
+    const conflict = findIntegrationPluginWriteConflict(resulting)
+    if (conflict) return { conflict }
 
     for (const [id, enabled] of entries) {
       const key = INTEGRATION_PLUGIN_SETTING_KEYS[id]

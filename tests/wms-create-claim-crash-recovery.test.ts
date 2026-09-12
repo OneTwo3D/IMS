@@ -10,6 +10,14 @@ import {
   type WmsPushCandidate,
 } from '../lib/domain/wms/order-push-sweep.ts'
 import { wmsAmbiguousCreateRefusal } from '../lib/domain/wms/create-replay-policy.ts'
+import { ACME_WMS_ID, makeSeamRegistry } from './helpers/fictitious-wms-connector.ts'
+
+/**
+ * o3d-remove-shiphero: the unsafe-create warehouse these cases contrast against Mintsoft was
+ * ShipHero. It is now the REGISTERED fictitious connector, driven through the sweep's registry
+ * seam — an unregistered id would fail closed for a different reason and prove less.
+ */
+const SEAM_REGISTRY = makeSeamRegistry()
 import type { WmsOrderPushInput, WmsOrderPushResult } from '../lib/connectors/wms/types.ts'
 import type { WmsMutationEventInput } from '../lib/domain/wms/mutation-audit.ts'
 
@@ -211,12 +219,12 @@ function makeLinkStore(options: { connectorId: string; failLinkWrites?: boolean;
 }
 
 /**
- * A ShipHero-shaped warehouse: `order_create` does NOT enforce partner_order_id uniqueness, so the
+ * A `client-side-dedupe-only` warehouse: its create does NOT enforce reference uniqueness, so the
  * only dedupe is the connector's own preflight lookup — and a preflight cannot see a request that
  * is still ON THE WIRE. `dispatchInFlight` / `land` model exactly that window, which is the reason
  * "the probe says MISSING" is not evidence that a create can be replayed.
  */
-function shipheroWarehouse() {
+function unsafeCreateWarehouse() {
   const created: string[] = []
   const inFlight: string[] = []
   const probes: string[] = []
@@ -295,15 +303,15 @@ function quiet<T>(run: () => Promise<T>): Promise<T> {
 }
 
 test('o3d-2k5r r4 create: a crashed create is NOT re-dispatched when the lease expires — valid payload, create-pass route', async () => {
-  const wms = shipheroWarehouse()
+  const wms = unsafeCreateWarehouse()
   const conn = connectorFor(wms)
 
   // SWEEP 1 — the create leaves and the worker is killed before the writeback. The request is
   // still on the wire when the process dies, so the warehouse has not recorded it YET.
-  const dying = makeLinkStore({ connectorId: 'shiphero', failLinkWrites: true })
+  const dying = makeLinkStore({ connectorId: ACME_WMS_ID, failLinkWrites: true })
   const first = await quiet(() => runWmsOrderPushSweepCore(
     { ...conn, pushOrder: async (input: WmsOrderPushInput) => { wms.dispatchInFlight(input.externalReference); return { externalOrderId: 'sh-inflight', externalOrderNumber: 'SH-inflight', status: 'pending' } } },
-    'shiphero', dying.port, { now: () => T0 },
+    ACME_WMS_ID, dying.port, { now: () => T0, registry: SEAM_REGISTRY },
   ))
   assert.equal(first.created, 0, 'IMS recorded nothing about the create')
   const stale = dying.links.get('so-1')!
@@ -314,9 +322,9 @@ test('o3d-2k5r r4 create: a crashed create is NOT re-dispatched when the lease e
   // SWEEP 2 — six minutes later. The payload is UNCHANGED and still valid, so the order is a
   // create candidate on state alone and reaches claimForCreate. This is the route the r3 ladder
   // never sees.
-  const second = makeLinkStore({ connectorId: 'shiphero' })
+  const second = makeLinkStore({ connectorId: ACME_WMS_ID })
   second.links.set('so-1', { ...stale })
-  const r = await quiet(() => runWmsOrderPushSweepCore(conn, 'shiphero', second.port, { now: () => T1 }))
+  const r = await quiet(() => runWmsOrderPushSweepCore(conn, ACME_WMS_ID, second.port, { now: () => T1, registry: SEAM_REGISTRY }))
 
   // ROUTE ASSERTIONS: this scenario reached the guard through the create pass and nothing else.
   assert.deepEqual(second.validationFailureCalls, [], 'no validation-failure route was taken')
@@ -344,22 +352,22 @@ test('o3d-2k5r r4 create: a crashed create is NOT re-dispatched when the lease e
  */
 
 /** Run the crash (sweep 1) and the park (sweep 2), and hand back the parked link store. */
-async function crashThenPark(connectorId: string, wms: ReturnType<typeof shipheroWarehouse> | ReturnType<typeof mintsoftWarehouse>) {
+async function crashThenPark(connectorId: string, wms: ReturnType<typeof unsafeCreateWarehouse> | ReturnType<typeof mintsoftWarehouse>) {
   const conn = connectorFor(wms)
   const dying = makeLinkStore({ connectorId, failLinkWrites: true })
   await quiet(() => runWmsOrderPushSweepCore(
     {
       ...conn,
       pushOrder: async (input: WmsOrderPushInput) => {
-        wms.dispatchInFlight('externalReference' in input && connectorId === 'shiphero' ? input.externalReference : input.orderNumber)
+        wms.dispatchInFlight('externalReference' in input && connectorId === ACME_WMS_ID ? input.externalReference : input.orderNumber)
         return { externalOrderId: 'inflight', externalOrderNumber: 'INFLIGHT', status: 'NEW' }
       },
     },
-    connectorId, dying.port, { now: () => T0 },
+    connectorId, dying.port, { now: () => T0, registry: SEAM_REGISTRY },
   ))
   const parking = makeLinkStore({ connectorId })
   parking.links.set('so-1', { ...dying.links.get('so-1')! })
-  await quiet(() => runWmsOrderPushSweepCore(conn, connectorId, parking.port, { now: () => T1 }))
+  await quiet(() => runWmsOrderPushSweepCore(conn, connectorId, parking.port, { now: () => T1, registry: SEAM_REGISTRY }))
   assert.equal(parking.links.get('so-1')!.state, 'AMBIGUOUS_CREATE', 'precondition: the claim was parked')
   return parking.links.get('so-1')!
 }
@@ -373,7 +381,7 @@ test('o3d-2k5r r4 reconcile: the park RE-OPENS when the connector refuses duplic
 
   const third = makeLinkStore({ connectorId: 'mintsoft' })
   third.links.set('so-1', { ...parked })
-  const r = await quiet(() => runWmsOrderPushSweepCore(connectorFor(wms), 'mintsoft', third.port, { now: () => T2 }))
+  const r = await quiet(() => runWmsOrderPushSweepCore(connectorFor(wms), 'mintsoft', third.port, { now: () => T2, registry: SEAM_REGISTRY }))
 
   // ROUTE: the reconciliation pass re-queued it and the CREATE pass then pushed it, in one sweep.
   assert.deepEqual(third.validationFailureCalls, [], 'not the validation-failure route')
@@ -395,7 +403,7 @@ test('o3d-2k5r r4 reconcile: the park STAYS SHUT while the warehouse still holds
 
   const third = makeLinkStore({ connectorId: 'mintsoft' })
   third.links.set('so-1', { ...parked })
-  const r = await quiet(() => runWmsOrderPushSweepCore(connectorFor(wms), 'mintsoft', third.port, { now: () => T2 }))
+  const r = await quiet(() => runWmsOrderPushSweepCore(connectorFor(wms), 'mintsoft', third.port, { now: () => T2, registry: SEAM_REGISTRY }))
 
   assert.equal(r.ambiguousCreateRequeued, 0)
   assert.equal(r.created, 0)
@@ -407,18 +415,18 @@ test('o3d-2k5r r4 reconcile: the park STAYS SHUT while the warehouse still holds
   assert.deepEqual(still.lastAttemptAt, T2)
 })
 
-test('o3d-2k5r r4 reconcile: a ShipHero park is NEVER re-opened, even when the warehouse says MISSING', async () => {
-  // THE FINDING'S OWN SENTENCE, as a test. ShipHero's create key is not unique, so "absent right
+test('o3d-2k5r r4 reconcile: an unsafe-create park is NEVER re-opened, even when the warehouse says MISSING', async () => {
+  // THE FINDING'S OWN SENTENCE, as a test. This connector's create key is not unique, so "absent right
   // now" cannot licence a replay — the crashed worker's request is still on the wire, and a second
   // create would be a second warehouse order. Same crash, same MISSING probe, opposite outcome to
   // the Mintsoft test above, and the ONLY difference is the connector.
-  const wms = shipheroWarehouse()
-  const parked = await crashThenPark('shiphero', wms)
+  const wms = unsafeCreateWarehouse()
+  const parked = await crashThenPark(ACME_WMS_ID, wms)
   assert.deepEqual(wms.created, [], 'precondition: the warehouse has nothing yet, so a probe would say MISSING')
 
-  const third = makeLinkStore({ connectorId: 'shiphero' })
+  const third = makeLinkStore({ connectorId: ACME_WMS_ID })
   third.links.set('so-1', { ...parked })
-  const r = await quiet(() => runWmsOrderPushSweepCore(connectorFor(wms), 'shiphero', third.port, { now: () => T2 }))
+  const r = await quiet(() => runWmsOrderPushSweepCore(connectorFor(wms), ACME_WMS_ID, third.port, { now: () => T2, registry: SEAM_REGISTRY }))
 
   assert.equal(r.ambiguousCreateRequeued, 0)
   assert.equal(r.created, 0)
@@ -445,7 +453,7 @@ test('o3d-2k5r r4 release: a HELD order re-opened for create is CLAIMED, not par
     id: 'link-1', orderId: 'so-1', connector: 'mintsoft', state: 'HELD', attempts: 0,
     lastError: null, lastAttemptAt: T0, pushedAt: null, externalOrderId: null, externalOrderNumber: null,
   })
-  const r = await quiet(() => runWmsOrderPushSweepCore(connectorFor(wms), 'mintsoft', store.port, { now: () => T1 }))
+  const r = await quiet(() => runWmsOrderPushSweepCore(connectorFor(wms), 'mintsoft', store.port, { now: () => T1, registry: SEAM_REGISTRY }))
 
   assert.equal(r.released, 1)
   assert.equal(r.createClaimParked, 0, 'the release must not be swallowed by the park')
@@ -463,7 +471,7 @@ test('o3d-2k5r r4: a claim that is still LIVE is left alone — the park is for 
     lastError: null, lastAttemptAt: new Date(T0.getTime() + 30_000), pushedAt: null,
     externalOrderId: null, externalOrderNumber: null,
   })
-  const r = await quiet(() => runWmsOrderPushSweepCore(connectorFor(wms), 'mintsoft', store.port, { now: () => new Date(T0.getTime() + 60_000) }))
+  const r = await quiet(() => runWmsOrderPushSweepCore(connectorFor(wms), 'mintsoft', store.port, { now: () => new Date(T0.getTime() + 60_000), registry: SEAM_REGISTRY }))
 
   assert.equal(r.createClaimParked, 0)
   assert.equal(r.created, 0)

@@ -40,6 +40,18 @@ import { Textarea } from '@/components/ui/textarea'
 
 type Props = {
   data: MintsoftDashboardData
+  /**
+   * WHETHER THE MINTSOFT CONNECTION IS SET UP — a PROP, not a field of `data`
+   * (o3d-remove-shiphero round 14, Codex HIGH 2).
+   *
+   * It used to be `data.status.configured`, recomputed by the DTO builder from the raw stored base
+   * URL. A malformed base URL is non-blank, so that copy said "Configured" and left Run Product
+   * Verify / Run Bundle Verify / Poll Returns ENABLED for a connection that could not make one call
+   * — while the registry envelope right beside it said the opposite. The field is gone; this is the
+   * envelope's own verdict (`WmsSyncDashboardData.configured` → `isWmsConnectorConfigured` →
+   * `MintsoftConnector.isConfigured()`), handed in by app/(dashboard)/sync/wms-sync-panel.tsx.
+   */
+  configured: boolean
 }
 
 const RECEIPT_REVIEW_WARNING_LABELS: Record<string, string> = {
@@ -108,7 +120,7 @@ function ReceiptReviewWarnings({ warnings }: { warnings: string[] }) {
   )
 }
 
-export function MintsoftClient({ data }: Props) {
+export function MintsoftClient({ data, configured }: Props) {
   const formatDateTime = useFormatDateTime()
   const router = useRouter()
   const { promptReauth, stepUpDialog } = useStepUpReauth()
@@ -480,7 +492,7 @@ export function MintsoftClient({ data }: Props) {
           <div className="rounded-lg border bg-muted/20 p-3">
             <div className="text-xs text-muted-foreground">Status</div>
             <div className="mt-1 text-sm font-medium">
-              {data.status.configured ? 'Configured' : 'Not configured'}
+              {configured ? 'Configured' : 'Not configured'}
             </div>
           </div>
           <div className="rounded-lg border bg-muted/20 p-3">
@@ -504,15 +516,15 @@ export function MintsoftClient({ data }: Props) {
         </div>
 
         <div className="flex flex-wrap gap-2">
-          <Button type="button" variant="outline" onClick={handleRunProductVerify} disabled={isPending || !data.status.configured}>
+          <Button type="button" variant="outline" onClick={handleRunProductVerify} disabled={isPending || !configured}>
             <RefreshCw className="mr-2 h-4 w-4" />
             Run Product Verify
           </Button>
-          <Button type="button" variant="outline" onClick={handleRunBundleVerify} disabled={isPending || !data.status.configured}>
+          <Button type="button" variant="outline" onClick={handleRunBundleVerify} disabled={isPending || !configured}>
             <RefreshCw className="mr-2 h-4 w-4" />
             Run Bundle Verify
           </Button>
-          <Button type="button" variant="outline" onClick={handleRunReturnsSync} disabled={isPending || !data.status.configured}>
+          <Button type="button" variant="outline" onClick={handleRunReturnsSync} disabled={isPending || !configured}>
             <RefreshCw className="mr-2 h-4 w-4" />
             Poll Returns
           </Button>

@@ -123,7 +123,7 @@ test('Next control-flow throws are RETHROWN, not classified as a post-commit fai
 test('the plugin-selection guard inherits the rethrow rather than owning a second catch', async () => {
   // It used to have its own catch-all, which is where finding 4 landed. It now delegates, so there
   // is one place where framework control flow is recognised and one place to get it wrong.
-  const committed = { woocommerce: true, shopify: false, xero: true, quickbooks: false, mintsoft: false, shiphero: false }
+  const committed = { woocommerce: true, shopify: false, xero: true, quickbooks: false, mintsoft: false }
   const redirectError = Object.assign(new Error('NEXT_REDIRECT'), { digest: 'NEXT_REDIRECT;replace;/login;307;' })
 
   await assert.rejects(

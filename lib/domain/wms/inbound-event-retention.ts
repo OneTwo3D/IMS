@@ -1,4 +1,4 @@
-import { MINTSOFT_WEBHOOK_PROCESSING_STATUS } from '@/lib/domain/wms/booked-in-service'
+import { WMS_INBOUND_EVENT_PROCESSING_STATUS } from '@/lib/domain/wms/inbound-event-status'
 
 /**
  * q66in.7.4: RETENTION FOR THE INBOUND WMS EVENT TABLES.
@@ -39,18 +39,18 @@ import { MINTSOFT_WEBHOOK_PROCESSING_STATUS } from '@/lib/domain/wms/booked-in-s
  */
 
 /** The one terminal state: the event's effect has been applied. */
-export const RESOLVED_INBOUND_EVENT_STATUS = MINTSOFT_WEBHOOK_PROCESSING_STATUS.processed
+export const RESOLVED_INBOUND_EVENT_STATUS = WMS_INBOUND_EVENT_PROCESSING_STATUS.processed
 
 /**
  * Every state that is NOT resolved. Exported so a test can assert the compaction predicate against
  * the whole vocabulary rather than the two or three cases someone happened to think of.
  */
 export const UNRESOLVED_INBOUND_EVENT_STATUSES = [
-  MINTSOFT_WEBHOOK_PROCESSING_STATUS.pending,
-  MINTSOFT_WEBHOOK_PROCESSING_STATUS.pendingRetry,
-  MINTSOFT_WEBHOOK_PROCESSING_STATUS.failedRetry,
-  MINTSOFT_WEBHOOK_PROCESSING_STATUS.requiresReview,
-  MINTSOFT_WEBHOOK_PROCESSING_STATUS.dead,
+  WMS_INBOUND_EVENT_PROCESSING_STATUS.pending,
+  WMS_INBOUND_EVENT_PROCESSING_STATUS.pendingRetry,
+  WMS_INBOUND_EVENT_PROCESSING_STATUS.failedRetry,
+  WMS_INBOUND_EVENT_PROCESSING_STATUS.requiresReview,
+  WMS_INBOUND_EVENT_PROCESSING_STATUS.dead,
 ] as const
 
 /**

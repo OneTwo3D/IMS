@@ -7,6 +7,7 @@ import {
   type WmsPushReleasableLink,
 } from '../lib/domain/wms/order-push-sweep.ts'
 import { decideWmsHeldRelease } from '../lib/domain/wms/create-replay-policy.ts'
+import { ACME_WMS_ID, makeSeamRegistry } from './helpers/fictitious-wms-connector.ts'
 import type { WmsOrderCancelResult, WmsOrderPushResult } from '../lib/connectors/wms/types.ts'
 import type { WmsMutationEventInput } from '../lib/domain/wms/mutation-audit.ts'
 
@@ -18,17 +19,24 @@ import type { WmsMutationEventInput } from '../lib/domain/wms/mutation-audit.ts'
  * stated reasoning that "its WMS order was cancelled when it was held".
  *
  * The hold pass does not establish that. It parks a link HELD when `cancelOrder` answers
- * `cancelled: true` AND when it answers `NOT_FOUND` — and on ShipHero NOT_FOUND is only a lookup
- * result. `order_cancel` there is a mutation over an order the connector first has to FIND; a
- * renumbering, a client-scope change or an eventually-consistent index makes the lookup miss an
- * order that is alive and being picked. Release it, re-create it, and ShipHero's `order_create`
- * does not refuse the duplicate: two warehouse orders under one reference, both picked. The state
- * compare-and-set the release already had prevents a stale LOCAL write and says nothing about the
- * warehouse.
+ * `cancelled: true` AND when it answers `NOT_FOUND` — and on a `client-side-dedupe-only` connector
+ * NOT_FOUND is only a lookup result. `order_cancel` there is a mutation over an order the connector
+ * first has to FIND; a renumbering, a client-scope change or an eventually-consistent index makes
+ * the lookup miss an order that is alive and being picked. Release it, re-create it, and such a
+ * connector's create does not refuse the duplicate: two warehouse orders under one reference, both
+ * picked. The state compare-and-set the release already had prevents a stale LOCAL write and says
+ * nothing about the warehouse.
  *
- * So the release takes the two keys the rest of the branch takes, and this suite is the ShipHero
- * regression Codex asked for plus the shape of both keys.
+ * So the release takes the two keys the rest of the branch takes, and this suite is that regression
+ * plus the shape of both keys.
+ *
+ * o3d-remove-shiphero: the unsafe connector these cases are driven through was ShipHero. It is now
+ * the REGISTERED fictitious connector from tests/helpers/fictitious-wms-connector.ts, passed in as
+ * a registry. Substituting a bare unknown id would have kept every assertion below green while
+ * proving something weaker — an unknown id fails closed for a different reason.
  */
+
+const SEAM_REGISTRY = makeSeamRegistry()
 
 const NOW = () => new Date('2026-08-27T10:00:00.000Z')
 const CONFIRMED_AT = new Date('2026-08-26T09:00:00.000Z')
@@ -87,19 +95,19 @@ function harness(seed: Seed) {
 const release = (updates: Array<{ id: string; data: Record<string, unknown> }>) =>
   updates.find((u) => u.data.state === 'PENDING_CREATE')
 
-// --- the ShipHero regression: NOT_FOUND is not a cancellation -----------------------------
+// --- the client-side-dedupe-only regression: NOT_FOUND is not a cancellation -----------------------------
 
-test('o3d-2k5r r6 release: a ShipHero hold whose cancellation was NEVER confirmed is not re-created', async () => {
+test('o3d-2k5r r6 release: an unsafe-create hold whose cancellation was NEVER confirmed is not re-created', async () => {
   // THE REGRESSION. Route: releasableHeldOrders returns a HELD link with NO cancellation stamp ->
-  // decideWmsHeldRelease finds neither key (no confirmed cancellation; shiphero is
-  // client-side-dedupe-only) -> the link is PARKED, not released.
+  // decideWmsHeldRelease finds neither key (no confirmed cancellation; the fictitious
+  // connector is client-side-dedupe-only) -> the link is PARKED, not released.
   //
   // Mutation: make decideWmsHeldRelease return `{ release: true }` for the unconfirmed case, or
   // delete the `if (!gate.release)` branch from the release pass, and this fails on the
-  // PENDING_CREATE assertion — the pre-fix behaviour, which clears the id of an order ShipHero may
+  // PENDING_CREATE assertion — the pre-fix behaviour, which clears the id of an order the warehouse may
   // still be picking and hands it back to the create pass.
   const h = harness({ releasable: [heldLink({ cancelledAt: null })] })
-  const result = await runWmsOrderPushSweepCore(h.connector, 'shiphero', h.port, { now: NOW })
+  const result = await runWmsOrderPushSweepCore(h.connector, ACME_WMS_ID, h.port, { now: NOW, registry: SEAM_REGISTRY })
 
   assert.equal(release(h.updates), undefined, 'nothing was re-queued for create')
   assert.equal(result.released, 0)
@@ -112,7 +120,7 @@ test('o3d-2k5r r6 release: a ShipHero hold whose cancellation was NEVER confirme
   assert.equal(parked!.data.externalOrderId, undefined)
 })
 
-test('o3d-2k5r r6 hold: a ShipHero NOT_FOUND is parked at the HOLD, and stamps no cancellation', async () => {
+test('o3d-2k5r r6 hold: an unsafe-create NOT_FOUND is parked at the HOLD, and stamps no cancellation', async () => {
   // The same rule, asked where the ambiguity is CREATED. Route: holdableLinks -> cancelOrder
   // answers NOT_FOUND -> decideWmsHeldRelease refuses -> DEAD_LETTER with the guidance.
   //
@@ -124,7 +132,7 @@ test('o3d-2k5r r6 hold: a ShipHero NOT_FOUND is parked at the HOLD, and stamps n
     holdable: [{ id: 'link-1', orderId: 'so-1', externalOrderId: 'wms-7' }],
     cancelOrder: async () => ({ cancelled: false, status: 'NOT_FOUND' }),
   })
-  const result = await runWmsOrderPushSweepCore(h.connector, 'shiphero', h.port, { now: NOW })
+  const result = await runWmsOrderPushSweepCore(h.connector, ACME_WMS_ID, h.port, { now: NOW, registry: SEAM_REGISTRY })
 
   assert.equal(result.held, 0)
   const write = h.updates.find((u) => u.id === 'link-1')!
@@ -135,18 +143,18 @@ test('o3d-2k5r r6 hold: a ShipHero NOT_FOUND is parked at the HOLD, and stamps n
   assert.equal((audit.after as Record<string, unknown>).remoteCancellationConfirmed, false)
 })
 
-test('o3d-2k5r r6 hold: a CONFIRMED ShipHero cancellation still parks HELD and stamps the evidence', async () => {
+test('o3d-2k5r r6 hold: a CONFIRMED cancellation on an unsafe-create connector still parks HELD and stamps the evidence', async () => {
   // The legitimate cycle has to keep working, or the fix is a different outage. Route: cancelOrder
   // answers `cancelled: true` -> key 1 -> HELD with the stamp.
   //
   // Mutation: gate the hold on the connector policy alone (drop the `remoteCancellationConfirmed`
-  // arm from decideWmsHeldRelease) and this fails — every ShipHero hold would dead-letter, and an
+  // arm from decideWmsHeldRelease) and this fails — every hold on such a connector would dead-letter, and an
   // operator holding an order would be told to reconcile it by hand.
   const h = harness({
     holdable: [{ id: 'link-1', orderId: 'so-1', externalOrderId: 'wms-7' }],
     cancelOrder: async () => ({ cancelled: true, status: 'CANCELLED' }),
   })
-  const result = await runWmsOrderPushSweepCore(h.connector, 'shiphero', h.port, { now: NOW })
+  const result = await runWmsOrderPushSweepCore(h.connector, ACME_WMS_ID, h.port, { now: NOW, registry: SEAM_REGISTRY })
 
   assert.equal(result.held, 1)
   const write = h.updates.find((u) => u.id === 'link-1')!
@@ -154,7 +162,7 @@ test('o3d-2k5r r6 hold: a CONFIRMED ShipHero cancellation still parks HELD and s
   assert.deepEqual(write.data.cancelledAt, NOW())
 })
 
-test('o3d-2k5r r6 release: a CONFIRMED cancellation releases on ShipHero, and spends no probe', async () => {
+test('o3d-2k5r r6 release: a CONFIRMED cancellation releases even on an unsafe-create connector, and spends no probe', async () => {
   // Route: cancelledAt present -> evidence `remote-cancellation-confirmed` -> probeRequired false
   // -> released.
   //
@@ -162,7 +170,7 @@ test('o3d-2k5r r6 release: a CONFIRMED cancellation releases on ShipHero, and sp
   // fails on the probe count. It would also be wrong in production: a cancelled order that the WMS
   // still LISTS answers FOUND, so an unconditional probe blocks every legitimate release for ever.
   const h = harness({ releasable: [heldLink()], probeOrderPresence: async () => 'FOUND' })
-  const result = await runWmsOrderPushSweepCore(h.connector, 'shiphero', h.port, { now: NOW })
+  const result = await runWmsOrderPushSweepCore(h.connector, ACME_WMS_ID, h.port, { now: NOW, registry: SEAM_REGISTRY })
 
   assert.equal(result.released, 1)
   assert.deepEqual(h.probed, [])
@@ -183,7 +191,7 @@ test('o3d-2k5r r6 release: an unconfirmed Mintsoft hold is released only once th
   // FOUND case below; this one exists to prove the path is reachable at all and that the reference
   // asked about is the one a re-create would use, not the WMS id.
   const h = harness({ releasable: [heldLink({ cancelledAt: null })], probeOrderPresence: async () => 'MISSING' })
-  const result = await runWmsOrderPushSweepCore(h.connector, 'mintsoft', h.port, { now: NOW })
+  const result = await runWmsOrderPushSweepCore(h.connector, 'mintsoft', h.port, { now: NOW, registry: SEAM_REGISTRY })
 
   assert.equal(result.released, 1)
   assert.deepEqual(h.probed, ['SO-1'])
@@ -200,7 +208,7 @@ test('o3d-2k5r r6 release: the warehouse FINDING the order refuses the release a
   // even where a remote duplicate-refusal stops a second pick it would bind the link to an order
   // that was supposed to be held.
   const h = harness({ releasable: [heldLink({ cancelledAt: null })], probeOrderPresence: async () => 'FOUND' })
-  const result = await runWmsOrderPushSweepCore(h.connector, 'mintsoft', h.port, { now: NOW })
+  const result = await runWmsOrderPushSweepCore(h.connector, 'mintsoft', h.port, { now: NOW, registry: SEAM_REGISTRY })
 
   assert.equal(result.released, 0)
   assert.equal(release(h.updates), undefined)
@@ -217,7 +225,7 @@ test('o3d-2k5r r6 release: a connector that cannot probe is not an absent order'
   // repository keeps finding) and this fails on `released` — "we could not ask" would license the
   // create that the asking was supposed to authorise.
   const h = harness({ releasable: [heldLink({ cancelledAt: null })] })
-  const result = await runWmsOrderPushSweepCore(h.connector, 'mintsoft', h.port, { now: NOW })
+  const result = await runWmsOrderPushSweepCore(h.connector, 'mintsoft', h.port, { now: NOW, registry: SEAM_REGISTRY })
 
   assert.equal(result.released, 0)
   const note = h.updates.find((u) => u.ifState === 'HELD')!
@@ -230,7 +238,7 @@ test('o3d-2k5r r6 release: an AMBIGUOUS match is not absence either', async () =
   // Mutation: fold AMBIGUOUS in with MISSING in probeWarehouseAbsence and this fails on
   // `released` — a merged or duplicated warehouse record is the LEAST safe thing to re-create over.
   const h = harness({ releasable: [heldLink({ cancelledAt: null })], probeOrderPresence: async () => 'AMBIGUOUS' })
-  const result = await runWmsOrderPushSweepCore(h.connector, 'mintsoft', h.port, { now: NOW })
+  const result = await runWmsOrderPushSweepCore(h.connector, 'mintsoft', h.port, { now: NOW, registry: SEAM_REGISTRY })
 
   assert.equal(result.released, 0)
 })
@@ -245,18 +253,18 @@ test('o3d-2k5r r6 rule: the two keys, and an unknown connector supplies neither'
   // the connector that wrote it — a renamed plugin, a row restored from a backup — and that is not
   // a reason to believe its warehouse refuses duplicates.
   assert.deepEqual(
-    decideWmsHeldRelease({ connector: 'shiphero', remoteCancellationConfirmed: true, reference: 'SO-1' }),
+    decideWmsHeldRelease({ connector: ACME_WMS_ID, registry: SEAM_REGISTRY, remoteCancellationConfirmed: true, reference: 'SO-1' }),
     { release: true, evidence: 'remote-cancellation-confirmed', probeRequired: false },
   )
   assert.deepEqual(
-    decideWmsHeldRelease({ connector: 'mintsoft', remoteCancellationConfirmed: false, reference: 'SO-1' }),
+    decideWmsHeldRelease({ connector: 'mintsoft', registry: SEAM_REGISTRY, remoteCancellationConfirmed: false, reference: 'SO-1' }),
     { release: true, evidence: 'create-refused-remotely', probeRequired: true },
   )
-  const refused = decideWmsHeldRelease({ connector: 'shiphero', remoteCancellationConfirmed: false, reference: 'SO-1' })
+  const refused = decideWmsHeldRelease({ connector: ACME_WMS_ID, registry: SEAM_REGISTRY, remoteCancellationConfirmed: false, reference: 'SO-1' })
   assert.equal(refused.release, false)
   assert.match(refused.release === false ? refused.guidance : '', /search for SO-1/)
   assert.equal(
-    decideWmsHeldRelease({ connector: 'warehouse-of-the-future', remoteCancellationConfirmed: false, reference: 'SO-1' }).release,
+    decideWmsHeldRelease({ connector: 'warehouse-of-the-future', registry: SEAM_REGISTRY, remoteCancellationConfirmed: false, reference: 'SO-1' }).release,
     false,
   )
 })

@@ -1,4 +1,11 @@
 import { getEnvFallback } from '@/lib/settings-store'
+/**
+ * o3d-remove-shiphero round 2: the materialise-then-`FOR UPDATE` primitive moved to the generic WMS
+ * layer, because the DEFAULT inbound-delta scope lock (for a connector with no configured scope)
+ * needs exactly the same three statements in exactly the same canonical order. Two copies of a lock
+ * that establishes an ordering is how two orderings appear.
+ */
+import { lockWmsSettingRows as lockSettingRows } from '@/lib/domain/wms/delta-scope-lock'
 import { MINTSOFT_DEFAULT_ADMIN_ORDER_URL_TEMPLATE } from './schema'
 
 /**
@@ -84,33 +91,6 @@ export async function lockMintsoftDispatchSettings(
     if (value) snapshot[key] = value
   }
   return snapshot
-}
-
-/**
- * Materialise the named settings rows, lock them `FOR UPDATE`, and return what they hold.
- *
- * Shared by every Mintsoft configuration writer that audits a before-image, so the materialise step
- * (`FOR UPDATE` locks only rows that EXIST), the canonical sorted lock order and the empty-string
- * convention are stated once rather than re-derived per call site. Callers resolve defaults and env
- * overrides themselves, because "what the row holds" and "what the connector will use" are different
- * questions and only the second one is diffable against what is about to be written.
- */
-async function lockSettingRows(
-  tx: MintsoftDispatchSettingsLockTx,
-  keys: string[],
-): Promise<Map<string, string>> {
-  const sorted = [...keys].sort()
-
-  // Make the rows exist so they can be row-locked. `''` is what an absent row already means.
-  await tx.$executeRaw`
-    INSERT INTO settings (key, value, "updatedAt")
-    SELECT k, '', now() FROM unnest(${sorted}::text[]) AS k
-    ON CONFLICT (key) DO NOTHING`
-
-  const rows = await tx.$queryRaw<Array<{ key: string; value: string | null }>>`
-    SELECT key, value FROM settings WHERE key = ANY(${sorted}::text[]) ORDER BY key FOR UPDATE`
-
-  return new Map(rows.map((row) => [row.key, row.value ?? '']))
 }
 
 /**

@@ -45,7 +45,7 @@ let nextRowId = 0
 mock.module('@/lib/activity-log', { namedExports: { logActivity: async () => {} } })
 mock.module('@/lib/domain/wms/booked-in-service', {
   namedExports: {
-    MINTSOFT_WEBHOOK_PROCESSING_STATUS: {
+    WMS_INBOUND_EVENT_PROCESSING_STATUS: {
       pending: 'PENDING',
       pendingRetry: 'PENDING_RETRY',
       failedRetry: 'FAILED_RETRY',

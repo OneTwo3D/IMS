@@ -1,7 +1,7 @@
 import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
 import { getEnabledWmsConnectorId } from '@/lib/connectors/wms/active-connector'
-import { enqueueMintsoftBookedInRecheckForAsn } from '@/lib/jobs/wms/process-mintsoft-booked-in-event'
+import { getWmsConnectorHooks } from '@/lib/connectors/wms/registry'
 import { MAINTENANCE_ENABLED_KEY, WMS_BOOKED_IN_RECHECK_DUE_KEY } from '@/lib/maintenance-mode'
 import { clearPostMaintenanceRecheckMarker } from '@/lib/domain/system/maintenance-recovery'
 import type { WmsConnectorId } from '@/lib/connectors/wms/types'
@@ -221,12 +221,16 @@ export async function runPostMaintenanceRecheckForActiveConnector(
   options: { pageSize?: number } = {},
 ): Promise<(PostMaintenanceRecheckResult & { connector: WmsConnectorId }) | null> {
   const connectorId = await getEnabledWmsConnectorId()
-  // Only the Mintsoft connector implements a booked-in re-check; ShipHero's inbound path does not go
-  // through this trigger at all, so there is nothing to reconstruct for it.
-  if (connectorId !== 'mintsoft') return null
+  if (!connectorId) return null
+  // o3d-remove-shiphero round 2 (Codex HIGH 3): this used to read `if (connectorId !== 'mintsoft')
+  // return null`, justified by "only Mintsoft implements a booked-in re-check". That justification
+  // is a fact about today's registry, asserted in the generic layer, where it silently becomes a
+  // rule about every future connector. The capability is now DECLARED — a connector with an ASN
+  // poll model registers `hooks.bookedInRecheck`; a push-primary WMS does not, and gets the same
+  // `null` for a reason that is its own rather than this file's.
+  const hook = getWmsConnectorHooks(connectorId).bookedInRecheck
+  if (!hook) return null
 
-  const result = await runPostMaintenanceBookedInRecheck(connectorId, {
-    recheckAsn: (externalAsnId, recheckOptions) => enqueueMintsoftBookedInRecheckForAsn(externalAsnId, recheckOptions),
-  }, options)
+  const result = await runPostMaintenanceBookedInRecheck(connectorId, await hook(), options)
   return { ...result, connector: connectorId }
 }

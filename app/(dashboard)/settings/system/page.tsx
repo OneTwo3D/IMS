@@ -18,6 +18,7 @@ import { PublicAppUrlSettings } from '@/components/settings/public-app-url-setti
 import type { CronJobState } from '@/components/settings/cron-jobs-settings'
 import { getAllCronJobs } from '@/lib/cron-jobs'
 import { getIntegrationPluginState, isIntegrationModuleVisible } from '@/lib/integration-plugins'
+import { listIntegrationPluginDescriptors } from '@/lib/domain/integrations/plugin-catalog'
 import { detectPublicAppUrlFromHeaders, getPublicAppUrlInfo } from '@/lib/public-app-url'
 import { CURRENT_RELEASE, RELEASES } from '@/lib/releases'
 
@@ -127,13 +128,10 @@ export default async function SystemSettingsPage({
           <p className="text-sm text-muted-foreground mb-4">
             Disable connector plugins without deleting their saved credentials or mappings. Disabled plugins are hidden from shared menus and their webhook or scheduler entry points stop running until re-enabled.
           </p>
-          <IntegrationPluginsSettings
-            woocommerceEnabled={pluginState.woocommerce}
-            shopifyEnabled={pluginState.shopify}
-            xeroEnabled={pluginState.xero}
-            quickbooksEnabled={pluginState.quickbooks}
-            mintsoftEnabled={pluginState.mintsoft}
-          />
+          {/* One row per REGISTERED plugin, built here because the WMS registry (and the Prisma
+              client behind it) cannot be imported into a client bundle. Listing the five by name
+              is what left a second WMS connector with no toggle at all — o3d-m0ad. */}
+          <IntegrationPluginsSettings plugins={listIntegrationPluginDescriptors(pluginState)} />
         </Card>
       )}
 

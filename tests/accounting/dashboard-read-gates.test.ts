@@ -102,13 +102,13 @@ mock.module('@/lib/integration-plugins', {
   namedExports: {
     isIntegrationPluginEnabled: async (id: string) => state.plugins[id] === true,
     getIntegrationPluginState: async () => ({
-      woocommerce: false, shopify: false, xero: false, quickbooks: false, mintsoft: false, shiphero: false,
+      woocommerce: false, shopify: false, xero: false, quickbooks: false, mintsoft: false,
       ...state.plugins,
     }),
     INTEGRATION_PLUGIN_SETTING_KEYS: {
       woocommerce: 'plugin_woocommerce_enabled', shopify: 'plugin_shopify_enabled',
       xero: 'plugin_xero_enabled', quickbooks: 'plugin_quickbooks_enabled',
-      mintsoft: 'plugin_mintsoft_enabled', shiphero: 'plugin_shiphero_enabled',
+      mintsoft: 'plugin_mintsoft_enabled',
     },
     isIntegrationModuleVisible: () => true,
   },

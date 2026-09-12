@@ -5,7 +5,7 @@ import {
   buildMintsoftWebhookReplayForAsnWhere,
   buildMintsoftWebhookRetryUpdate,
   buildMintsoftWebhookSweepWhere,
-  MINTSOFT_WEBHOOK_PROCESSING_STATUS,
+  WMS_INBOUND_EVENT_PROCESSING_STATUS,
 } from '../lib/domain/wms/booked-in-service.ts'
 import { resolveTransferLineLandedQty } from '../lib/domain/inventory/transfer-landed-quantity.ts'
 import {
@@ -303,7 +303,7 @@ test('buildMintsoftWebhookRetryUpdate schedules pending retry state in typed col
   assert.deepEqual(
     buildMintsoftWebhookRetryUpdate('pending', 'ASN not mapped yet', 0, now, () => 0.5),
     {
-      processingStatus: MINTSOFT_WEBHOOK_PROCESSING_STATUS.pendingRetry,
+      processingStatus: WMS_INBOUND_EVENT_PROCESSING_STATUS.pendingRetry,
       processingAttempts: 1,
       nextRetryAt: new Date('2026-05-14T10:01:00.000Z'),
       deadLetteredAt: null,
@@ -328,7 +328,7 @@ test('buildMintsoftWebhookRetryUpdate schedules failed retry state with failed b
   assert.deepEqual(
     buildMintsoftWebhookRetryUpdate('failed', 'remote API failed', 1, now, () => 0.5),
     {
-      processingStatus: MINTSOFT_WEBHOOK_PROCESSING_STATUS.failedRetry,
+      processingStatus: WMS_INBOUND_EVENT_PROCESSING_STATUS.failedRetry,
       processingAttempts: 2,
       nextRetryAt: new Date('2026-05-14T10:10:00.000Z'),
       deadLetteredAt: null,
@@ -343,7 +343,7 @@ test('buildMintsoftWebhookRetryUpdate dead-letters after max attempts', () => {
   assert.deepEqual(
     buildMintsoftWebhookRetryUpdate('pending', 'ASN never finalized', 11, now),
     {
-      processingStatus: MINTSOFT_WEBHOOK_PROCESSING_STATUS.dead,
+      processingStatus: WMS_INBOUND_EVENT_PROCESSING_STATUS.dead,
       processingAttempts: 12,
       nextRetryAt: null,
       deadLetteredAt: now,
@@ -361,12 +361,12 @@ test('buildMintsoftWebhookSweepWhere selects only pending or due retry events', 
       connector: 'mintsoft',
       processedAt: null,
       OR: [
-        { processingStatus: MINTSOFT_WEBHOOK_PROCESSING_STATUS.pending },
+        { processingStatus: WMS_INBOUND_EVENT_PROCESSING_STATUS.pending },
         {
           processingStatus: {
             in: [
-              MINTSOFT_WEBHOOK_PROCESSING_STATUS.pendingRetry,
-              MINTSOFT_WEBHOOK_PROCESSING_STATUS.failedRetry,
+              WMS_INBOUND_EVENT_PROCESSING_STATUS.pendingRetry,
+              WMS_INBOUND_EVENT_PROCESSING_STATUS.failedRetry,
             ],
           },
           nextRetryAt: { lte: now },

@@ -1074,15 +1074,22 @@ export async function sweepDispatchEligibleWithdrawals(limit = WDRAW_DISPATCH_RE
 
   // Dynamic, like the rest of this file's cross-module reads: the WMS side must not be pulled into
   // every module that imports a withdrawal helper.
-  const [{ dispatchCandidateWhere }, { WMS_CONNECTOR_IDS }, { getIntegrationPluginState }] = await Promise.all([
+  const [{ dispatchCandidateWhere }, { resolveEnabledWmsConnector, wmsResolutionSkipReason }, { getIntegrationPluginState }] = await Promise.all([
     import('@/lib/domain/wms/dispatch-sweep'),
-    import('@/lib/connectors/wms/types'),
+    import('@/lib/connectors/wms/enabled-connector'),
     import('@/lib/integration-plugins'),
   ])
   const pluginState = await getIntegrationPluginState()
-  const connectorId = WMS_CONNECTOR_IDS.find((id) => pluginState[id])
-  // No warehouse connector, no dispatch path to get ahead of.
-  if (!connectorId) return { ...result, skipped: 'no active WMS connector' }
+  // Round 10, Codex HIGH 1. This screens the set the DISPATCH SWEEP would act on, so it has to
+  // resolve the connector the way that sweep does — including declining, with a reason, when the
+  // enabled set is contradictory and the sweep therefore runs against nothing.
+  const resolution = resolveEnabledWmsConnector(pluginState)
+  // No warehouse connector, no dispatch path to get ahead of. This screen's own "none" wording is
+  // kept verbatim — round 10 adds the ambiguity reason and re-words nothing.
+  if (resolution.kind !== 'one') {
+    return { ...result, skipped: wmsResolutionSkipReason(resolution, 'no active WMS connector') }
+  }
+  const connectorId = resolution.id
 
   // THE SWEEP'S OWN ELIGIBILITY, called rather than copied (the o3d-0gzr rule). Screening a set
   // that had drifted from the set that dispatches is the same defect as screening nothing.
