@@ -1494,7 +1494,7 @@ test('r30: a suppression lookup that FAILS settles its own row and the batch car
   )
 
   // (2) THE ROW WHOSE LOOKUP FAILED IS SETTLED UNDER ITS OWN CLAIM — not left PROCESSING for the
-  // stale sweep to find fifteen minutes later.
+  // stale sweep to find `EMAIL_CLAIM_STALE_MS` (fifteen minutes, lib/email-outbox.ts) later.
   const failedRow = rows.find((row) => row.id === 'email-1')
   assert.ok(failedRow, 'the row vanished')
   assert.equal(failedRow.status, 'PENDING', 'the row was left PROCESSING by an escaping rejection')
@@ -1823,12 +1823,89 @@ test('r33 LOW: the two places the docs describe pressing an email button agree',
   )
 })
 
-test('r33: the three places that state what these counts mean state the same thing', () => {
+// ---------------------------------------------------------------------------
+// THE SEND AXIS, ADDED IN r34 (Codex HIGH 2) — THE ONE THE THREE-SITE GUARD WAS NOT CHECKING.
+//
+// r33's guard checked the RECLAIMED/UNRESOLVED axis at all three sites and nothing checked the other
+// one. So while that axis was being corrected, the second axis quietly made a stronger claim than the
+// code can support: the help documentation asked "Had the message already been handed to SMTP?" and
+// answered "After a send means yes". It does not mean yes. `sendEntered` flips BEFORE the `await`, and
+// `sendEmail` (lib/mailer.ts) returns `SMTP not configured` — or a from-address validation error —
+// before `nodemailer.createTransport` runs at all. Entering the sender is not reaching SMTP.
+//
+// The three sites are now asked about BOTH axes, and the send axis is asked as three things rather
+// than one word, because every site has to be able to NAME the stronger claim in order to deny it:
+//
+//   * THE WEAKER FACT IS STATED — the sender was ENTERED;
+//   * THE DISCLAIMER IS STATED — that this is not proof SMTP was reached;
+//   * AND NO SENTENCE AT THE SITE ASSERTS THE TRANSPORT WAS REACHED WITHOUT HEDGING IT IN THAT SAME
+//     SENTENCE. This last one is the weakest of the three (a hedge word anywhere in the sentence
+//     satisfies it) and it is the one that catches the exact shape r34 found, because "Had the message
+//     already been handed to SMTP?" is a whole sentence with no hedge in it. The first two are what
+//     make the check non-vacuous: an empty or silent site fails them.
+// ---------------------------------------------------------------------------
+
+/** What `sendEntered` actually establishes, as each site has to say it. */
+const SENDER_WAS_ENTERED = /sender (?:was|WAS) (?:entered|ENTERED)|(?:entered|ENTERED) the sender/i
+/** …and the negative of it, which is what the two "before one" counts establish. */
+const SENDER_WAS_NEVER_ENTERED =
+  /never (?:entered|ENTERED)|never called|nothing (?:was )?handed to the sender|PUT NOTHING ON THE WIRE/i
+/** The disclaimer: entering the sender is not proof the transport was reached. */
+const NOT_PROOF_OF_SMTP =
+  /not (?:proof|the same)[\s\S]{0,90}?(?:SMTP|mail server|transport)|without (?:contacting|reaching) a mail server|without constructing a transport|SMTP not configured/i
+/** A sentence that talks about the transport at all, and so may not assert reaching it bare. */
+const TALKS_ABOUT_THE_TRANSPORT = /SMTP|mail server|on the wire|the transport/i
+/**
+ * Any of the hedges that turn such a sentence into the weaker fact. Deliberately generous: the teeth
+ * of this check are the two POSITIVE requirements above, and a blacklist that tried to enumerate
+ * assertive phrasings would be the proximity rule this branch has already learnt is vacuous.
+ */
+const HEDGED =
+  /\bmay\b|\bmight\b|\bnot\b|\bno\b|nothing|neither|never|cannot|without|unless|provided|probably|likely|weaker|only|depends|rests on|whether|\bif\b/i
+
+/**
+ * Sentences of a flattened prose block, split on end punctuation so a QUESTION is its own sentence —
+ * which matters, because the false claim r34 found was a question ("Had the message already been
+ * handed to SMTP?") answered by the next sentence. Double-quoted spans are NOT stripped here: on this
+ * axis the quotes are how a site names the stronger claim in order to deny it, and stripping them
+ * would remove the words the check is about.
+ */
+function axisSentences(prose: string): string[] {
+  return prose
+    .split(/(?<=[.?!])\s+/)
+    .map((sentence) => sentence.trim())
+    .filter((sentence) => sentence.length > 0)
+}
+
+/** The send axis, asked of one site's prose. */
+function assertSendAxis(where: string, prose: string, entryFact: RegExp): void {
+  assert.match(
+    prose,
+    entryFact,
+    `${where}: does not state what the send axis actually establishes — that the SENDER WAS ENTERED (or, `
+    + 'for a "before one" count, that it was not). That is the weaker fact, and the only one `sendEntered` '
+    + 'supports: it flips before the `await`, and `sendEmail` can answer "SMTP not configured" without '
+    + 'building a transport',
+  )
+  const bare = axisSentences(prose).filter(
+    (sentence) => TALKS_ABOUT_THE_TRANSPORT.test(sentence) && !HEDGED.test(sentence),
+  )
+  assert.deepEqual(
+    bare,
+    [],
+    `${where}: ${bare.length} sentence(s) here assert something about SMTP or the wire with no hedge in `
+    + 'the same sentence. This is the r34 shape: "Had the message already been handed to SMTP?" answered '
+    + `"means yes" — a definite claim the drain cannot make: ${JSON.stringify(bare)}`,
+  )
+}
+
+test('r33/r34: the three places that state what these counts mean state the same thing, on BOTH axes', () => {
   // THIS IS THE GUARD THE MEDIUM ASKED FOR BY NAME: "a counter whose meaning is stated in three places
   // and corrected in one is how this branch got here." The three places are the exported contract, the
   // activity-log summary an operator reads, and the help documentation. Each is located as its own
   // site — the field's doc comment, the template literal, the documentation section — so a correction
-  // made in one of them and not the others fails here.
+  // made in one of them and not the others fails here. r34 adds the SEND axis to all three: see the
+  // block above for why the axis nobody was checking is the one that ended up making a false claim.
   const source = readFileSync(fileURLToPath(new URL('../lib/email-outbox.ts', import.meta.url)), 'utf8')
   const doc = readFileSync(fileURLToPath(new URL('../help-docs/documents-email.md', import.meta.url)), 'utf8')
 
@@ -1865,11 +1942,48 @@ test('r33: the three places that state what these counts mean state the same thi
     )
   }
 
+  // (1b) AND THE SECOND AXIS, AT THE SAME SITE (r34, Codex HIGH 2). The two "after a send" counters
+  // state the ENTRY fact; the two "before one" counters state its negative, which is the one corner
+  // where this axis is decisive — a sender never entered cannot have reached SMTP.
+  for (const counter of ['conflicted', 'unresolvedAfterSend']) {
+    assertSendAxis(`the exported contract's ${counter}`, contract.get(counter)!, SENDER_WAS_ENTERED)
+  }
+  for (const counter of ['conflictedWithoutSend', 'unresolvedWithoutSend']) {
+    assertSendAxis(`the exported contract's ${counter}`, contract.get(counter)!, SENDER_WAS_NEVER_ENTERED)
+  }
+  // AND THE DISCLAIMER IS STATED WHERE THE STRONGER READING IS TEMPTING — on the counter that is read
+  // as "a duplicate went out". Asserted of `conflicted` because that is the one an operator acts on.
+  assert.match(
+    contract.get('conflicted')!,
+    NOT_PROOF_OF_SMTP,
+    "the exported contract's `conflicted` no longer says that entering the sender is NOT proof SMTP was "
+    + 'reached. Without that sentence the counter reads as "the message went out", which is false '
+    + 'whenever SMTP is unconfigured or the from-address is rejected — `sendEmail` returns before it '
+    + 'builds a transport on both paths',
+  )
+
   // (2) THE ACTIVITY SUMMARY. Located as the one template that names these counters, and every counter
   // in the contract must appear in it — a count nobody logs is a count nobody reads.
   const summary = /description: `Email outbox:([\s\S]*?)`,\n/.exec(source)
   assert.ok(summary, 'the activity summary template for the email outbox is no longer where this reads it')
   const label = summary[1]
+  // THE SITE IS THE TEMPLATE *PLUS* THE COMMENT THAT SAYS WHAT ITS WORDS MEAN (r34). A label of four
+  // short phrases cannot carry a claim on its own; what it can do is be spelled in the weaker words,
+  // and say beside itself why. Located as one region so neither half can be read from somewhere else.
+  const summarySite = /action: 'email_outbox_processed',([\s\S]*?)resolveUser: false,/.exec(source)
+  assert.ok(summarySite, 'the email-outbox activity-log call is no longer the shape this guard locates')
+  const summaryProse = summarySite[1]
+    .split('\n')
+    .filter((line) => /^\s*\/\//.test(line))
+    .map((line) => line.replace(/^\s*\/\/\s?/, ''))
+    .join(' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+  assert.ok(
+    summaryProse.length > 300,
+    `the comment over the activity summary is ${summaryProse.length} characters, which is not the `
+    + 'rationale this guard reads — a stub would satisfy the checks below by holding no prose at all',
+  )
   assert.doesNotMatch(
     label,
     /fenced/,
@@ -1884,6 +1998,25 @@ test('r33: the three places that state what these counts mean state the same thi
   }
   assert.match(label, /reclaimed after a send/, 'the summary no longer distinguishes the established reclaims')
   assert.match(label, /unresolved after a send/, 'the summary no longer distinguishes the unattributed refusals')
+
+  // (2b) AND THE SEND AXIS, AT THIS SITE (r34, Codex HIGH 2). The LABEL may not name SMTP — "after
+  // SMTP" would assert of every row here something true of only some — and the comment beside it must
+  // say what "after a send" does establish, and that it is not proof the transport was reached.
+  assert.doesNotMatch(
+    label,
+    /SMTP|mail server/i,
+    'the activity summary now labels these counts by SMTP. What the drain records is that the SENDER WAS '
+    + 'ENTERED; `sendEmail` can answer "SMTP not configured" without building a transport, so an '
+    + 'SMTP-named label asserts of every row something true of only some',
+  )
+  assertSendAxis('the activity-summary site', summaryProse, SENDER_WAS_ENTERED)
+  assert.match(
+    summaryProse,
+    NOT_PROOF_OF_SMTP,
+    'the comment over the activity summary no longer says that "after a send" is not proof SMTP was '
+    + 'reached, so the one place an operator meets these words has nothing telling them what the words '
+    + 'stop short of',
+  )
 
   // (3) THE HELP DOCUMENTATION, as its own section — from its bullet to the next top-level bullet, so
   // the claims below are read off the paragraphs that describe these counts and not off the whole file.
@@ -1918,6 +2051,24 @@ test('r33: the three places that state what these counts mean state the same thi
       `"${words}" is not in both the documented sample line and the template that writes it`,
     )
   }
+
+  // (3b) AND THE SEND AXIS, AT THIS SITE (r34, Codex HIGH 2) — the site the false claim was actually
+  // made at. It asked "Had the message already been handed to SMTP?" and answered "After a send means
+  // yes", which is a definite claim about a fact the drain does not have.
+  assertSendAxis('the help documentation', flat, SENDER_WAS_ENTERED)
+  assert.match(
+    flat,
+    SENDER_WAS_NEVER_ENTERED,
+    'the documentation no longer says what "before one" establishes — that the sender was never entered, '
+    + 'which is the one corner of this axis that is decisive',
+  )
+  assert.match(
+    flat,
+    NOT_PROOF_OF_SMTP,
+    'the documentation no longer tells a reader that "after a send" is NOT proof the message reached '
+    + 'SMTP. That sentence is the whole of r34\'s HIGH 2: the section used to ask "Had the message '
+    + 'already been handed to SMTP?" and answer "means yes"',
+  )
 })
 
 // ---------------------------------------------------------------------------

@@ -575,14 +575,23 @@ test(
      * Those come apart at the only moment that matters — AND NOT AS OFTEN AS THIS USED TO SAY
      * (Codex round 19, MEDIUM). This paragraph used to have the drain emptying the queue well inside
      * the reclaim window, and worker A's copy therefore delivered by the time worker B replays. The
-     * cadences are the other way round, and they are in the repo: the reclaim window is
-     * ADMIN_OUTBOX_STALE_PROCESSING_LOCK_MS, which is NOT an alias for the maximum lease (Codex round
-     * 21, LOW — round 20 asserted that alias and was wrong). It is INTEGRATION_OUTBOX_MAX_LEASE_MS
-     * (900_000 ms, fifteen minutes — `xeroAccountingEntry` in lib/domain/integrations/outbox-leases.ts)
-     * PLUS ADMIN_OUTBOX_POST_LEASE_MARGIN_MS (five minutes, declared beside it in
-     * lib/domain/integrations/outbox-admin.ts), so it is 1_200_000 ms, TWENTY MINUTES. And the
+     * cadences are the other way round, and they are in the repo. THE RECLAIM WINDOW IS THE
+     * `staleLockMs` THE XERO DRAIN PASSES, AND NOT THE DEAD-LETTER GATE (Codex round 34, HIGH 1 —
+     * round 21 named the gate here, round 33 propagated its number, and the window this paragraph is
+     * about was never either of those things). What re-takes a PROCESSING `xero/accounting.post` row
+     * is `claimIntegrationOutboxWork`, and the only `staleLockMs` it is given for that operation is
+     * `CLAIM_STALE_MS` in lib/connectors/xero/sync-processor.ts, which is
+     * INTEGRATION_OUTBOX_DRAIN_LEASES_MS.xeroAccountingEntry — 900_000 ms, FIFTEEN MINUTES
+     * (`xeroAccountingEntry` in lib/domain/integrations/outbox-leases.ts).
+     * THE OTHER WINDOW, NAMED SO THE TWO CANNOT BE SWAPPED A FOURTH TIME:
+     * ADMIN_OUTBOX_STALE_PROCESSING_LOCK_MS is INTEGRATION_OUTBOX_MAX_LEASE_MS plus
+     * ADMIN_OUTBOX_POST_LEASE_MARGIN_MS (five minutes, declared beside it in
+     * lib/domain/integrations/outbox-admin.ts), so ADMIN_OUTBOX_STALE_PROCESSING_LOCK_MS is
+     * 1_200_000 ms, TWENTY MINUTES — and its one consumer is
+     * `permanentlyFailIntegrationOutboxAdminRow`, how old a lock must be before an admin may
+     * DEAD-LETTER the row under it. It reclaims nothing and has no part in the story below. And the
      * email drain is documented HOURLY (help-docs/settings.md, the `/api/cron/email-outbox` cron-table
-     * row). Twenty minutes is INSIDE the hour, so B's replay usually meets a copy that is still
+     * row). Fifteen minutes is INSIDE the hour, so B's replay usually meets a copy that is still
      * PENDING and the index REFUSES it. What the index leaves open is the timing that
      * CROSSES A DRAIN: once a drain settles A's copy to SENT, a SENT row is outside the predicate, B's
      * insert is accepted, and the customer is emailed a second time. That gap is what this test

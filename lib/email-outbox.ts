@@ -1246,8 +1246,10 @@ export type ProcessEmailOutboxResult = {
    * Rows this worker claimed, HANDED TO THE SENDER, and was then refused the terminal write for
    * WITH ANOTHER WORKER'S RECLAIM ESTABLISHED — the row read back holding someone else's token, or
    * holding no claim at all when every write this worker issued had answered. Non-zero means a
-   * duplicate send almost certainly went out — it is the only signal that says so, and it used to be
-   * silent (the unfenced `update` simply landed).
+   * duplicate send is LIKELY — it is the only signal that says so, and it used to be silent (the
+   * unfenced `update` simply landed). Likely rather than certain, and for a reason spelled out two
+   * paragraphs down: what this counter establishes is that the SENDER WAS ENTERED, which is not the
+   * same fact as SMTP having been reached.
    *
    * "ESTABLISHED", AND THAT IS THE WHOLE OF ROUND 33's MEDIUM. This counter used to be incremented
    * for every refused post-send terminal write, including the four diagnoses that establish NO
@@ -1266,6 +1268,26 @@ export type ProcessEmailOutboxResult = {
    * What the counter actually means is unchanged and is the weaker of the two claims — this worker
    * may have put a message on the wire — so it is the one stated.
    *
+   * AND "ENTERED THE SENDER" IS NOT "REACHED SMTP" EITHER (r34, Codex HIGH 2). The flag behind this
+   * counter, `sendEntered`, flips immediately BEFORE the `await`, so what it establishes is that this
+   * worker CALLED the injected sender — nothing further. The production sender is `sendEmail` in
+   * lib/mailer.ts, and it can answer without contacting a mail server at all: no host or no
+   * from-address configured returns `SMTP not configured`, a rejected from/to/reply-to address returns
+   * a validation error, and both of those return BEFORE `nodemailer.createTransport`. So a row counted
+   * here may have reached no transport whatever, and a rising count on a system whose SMTP settings are
+   * missing is a claim-contention signal and not a duplicate-delivery one.
+   *
+   * WHY THE WEAKER WORDING RATHER THAN A STRONGER FLAG. The drain cannot see inside the sender: it is
+   * injected, and it answers with a `SendEmailResult` whose four fields say nothing about whether a
+   * socket was opened. Distinguishing the two would mean the SENDER reporting it — a field set in
+   * `sendEmailWithSmtpSettings` immediately before `transport.sendMail` — which is a change to a result
+   * type many call sites read, and even then it would only move the boundary from "entered the sender"
+   * to "entered the transport": a connection that stalls mid-DATA is indistinguishable from one that
+   * delivered. The question this counter exists to answer is "might a duplicate have gone out", and
+   * for that the entry fact is the honest one. So the WORDING matches it, here and in the activity-log
+   * summary and in help-docs/documents-email.md, and `tests/email-outbox-claim-fence.test.ts` checks
+   * all three for this axis as well as the reclaimed/unresolved one.
+   *
    * ONLY POST-SEND REFUSALS ARE COUNTED HERE (r18, Codex MEDIUM). A claim can also be lost BEFORE
    * any send is attempted — the suppression lookup sits between the claim and the sender, and both
    * workers can settle (or be refused) FAILED with neither of them having touched SMTP. Counting
@@ -1282,7 +1304,8 @@ export type ProcessEmailOutboxResult = {
   conflictedWithoutSend: number
   /**
    * Rows this worker claimed, HANDED TO THE SENDER, and was then refused the terminal write for
-   * WITH NO RECLAIM ESTABLISHED. A message may be on the wire — the sender was entered — and
+   * WITH NO RECLAIM ESTABLISHED. A message may be on the wire — the sender was ENTERED, which is as
+   * much as this drain can establish and is not proof SMTP was reached (see `conflicted`) — and
    * whether a SECOND copy follows is UNKNOWN from here, which is exactly why these are not counted
    * as reclaims: nothing read back says another worker was ever involved.
    *
@@ -1295,8 +1318,10 @@ export type ProcessEmailOutboxResult = {
    */
   unresolvedAfterSend: number
   /**
-   * The same, for a claim lost BEFORE any send was attempted: NO RECLAIM ESTABLISHED, and nothing was
-   * handed to the sender either, so no duplicate delivery follows from it whatever the cause.
+   * The same, for a claim lost BEFORE any send was attempted: NO RECLAIM ESTABLISHED, and the sender
+   * was never ENTERED either, so no duplicate delivery follows from it whatever the cause. This is the
+   * one corner of the four where the send axis is decisive rather than merely possible: not entering
+   * the sender cannot have reached SMTP, whereas entering it does not establish that it did.
    *
    * THE QUIETEST OF THE FOUR, AND STILL WORTH ITS OWN COUNT. Nothing was delivered and nothing was
    * attributed, so there is no incident here to chase — which is precisely why it must not be added
@@ -2352,6 +2377,12 @@ export async function processPendingEmailOutbox(
       // "another worker took this row over", which is what `conflicted*` now means and what the other
       // two counts explicitly do NOT. The label says which is which, in the same words as
       // `ProcessEmailOutboxResult` and help-docs/documents-email.md.
+      //
+      // AND THE SEND AXIS IS SPELLED "after a send", NOT "after SMTP" (r34, Codex HIGH 2). What the
+      // drain records is that the SENDER WAS ENTERED; `sendEmail` can answer "SMTP not configured"
+      // without reaching a mail server, so a label naming SMTP would assert of every row here something
+      // true of only some. The weaker phrase is the accurate one, and the other two statements of these
+      // counts — `ProcessEmailOutboxResult` above and help-docs/documents-email.md — define it that way.
       description: `Email outbox: ${result.sent} sent, ${result.failed} failed, `
         + `${result.conflicted} reclaimed after a send, ${result.conflictedWithoutSend} reclaimed before one, `
         + `${result.unresolvedAfterSend} unresolved after a send, ${result.unresolvedWithoutSend} unresolved before one, `

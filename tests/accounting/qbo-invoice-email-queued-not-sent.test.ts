@@ -520,7 +520,9 @@ test('r18: the sentence\'s cadences match the cron config and the cron doc, and 
 // SAME false premise still standing in `lib/domain/integrations/outbox-registry.ts` and in
 // `tests/concurrency/outbox-stale-park.concurrent.test.ts`: both said the email drain empties PENDING
 // inside the reclaim window, so worker A's copy is "typically already SENT" when B replays. It is the
-// other way round — the reclaim window is TWENTY MINUTES and the drain is HOURLY — so B's replay
+// other way round — the reclaim window is FIFTEEN MINUTES (`INTEGRATION_OUTBOX_DRAIN_LEASES_MS`
+// `.xeroAccountingEntry`, the `staleLockMs` the Xero drain passes) and the drain is HOURLY — so B's
+// replay
 // usually meets a copy that is still PENDING, and the partial unique index refuses it. The verdict
 // (unsafe-to-replay) is unchanged; the operational story was wrong.
 //
@@ -592,9 +594,11 @@ const CITATIONS: Array<{ citedIn: string; citation: string; resolvesIn: string; 
 //
 // Section (4) below used to be a loop of `text.includes(...)` over each file ENTIRE. So it passed
 // while `outbox-registry.ts` said, in the INVOICE_EMAIL counterexample paragraph, that worker B
-// reclaims after FIFTEEN MINUTES and that "Both are delivered" — because the SAME FILE, forty lines
-// further down, established the window as TWENTY MINUTES and established that the partial index
-// refuses B unless the timing crosses a drain. A whole-file `includes` cannot tell "the file states
+// reclaims after fifteen minutes and that "Both are delivered" — because the SAME FILE, forty lines
+// further down, established the drain condition the first paragraph had dropped.
+// (ROUND 33 ALSO DECIDED THE TWO PARAGRAPHS DISAGREED ABOUT THE NUMBER AND "CORRECTED" THE WRONG ONE
+// — see round 34 below: fifteen was right.)
+// A whole-file `includes` cannot tell "the file states
 // the corrected claim" from "the file states the corrected claim SOMEWHERE, next to the stale one":
 // the stale claim and its own correction both live in the file, and every assertion was satisfied by
 // the correction while a reader met the staleness first. That is the third round in a row this exact
@@ -610,14 +614,33 @@ const CITATIONS: Array<{ citedIn: string; citation: string; resolvesIn: string; 
 //   * NO SENTENCE THERE ASSERTS AN UNCONDITIONAL SECOND DELIVERY. "Both are delivered", with no
 //     drain condition in the same sentence, is refused AT THAT SITE rather than excused by a
 //     correction elsewhere in the file;
-//   * NO SENTENCE THERE NAMES A RECLAIM WINDOW OTHER THAN THE RESOLVED ONE, in either case. The
-//     LEASE is legitimately fifteen minutes, so the exception is stated as a property of the
-//     sentence: a sentence naming other-window words must be a sentence about the LEASE.
+//   * NO SENTENCE THERE NAMES A DURATION OTHER THAN THE RESOLVED WINDOW WITHOUT NAMING THE SOURCE
+//     THAT DURATION RESOLVES FROM, in either case (round 34; until then the exception was the WORD
+//     "lease", and that is what let the dead-letter gate in).
 //
 // AND THE CLAIM IS MADE ONLY AT THOSE SITES. A file-wide sweep requires every paragraph of these two
-// files that names ANY reclaim-window words to be one of the located sites (or to be about the
-// lease), so a window claim that drifts into an unwatched paragraph fails here instead of being a
-// fourth round of the same finding.
+// files that names ANY duration this rationale has words for to be one of the located sites, or to
+// name the source that duration resolves from, so a window claim that drifts into an unwatched
+// paragraph fails here instead of being a fourth round of the same finding.
+//
+// ---------------------------------------------------------------------------
+// ROUND 34 (Codex HIGH 1) — THE GUARD ROUND 33 ADDED WAS ENFORCING A NUMBER NOTHING PRODUCES.
+//
+// Round 33 sourced `reclaimMs` from `ADMIN_OUTBOX_STALE_PROCESSING_LOCK_MS` and rewrote both copies of
+// the prose to TWENTY MINUTES to match. That constant's own contract says its exclusive consumer is
+// `permanentlyFailIntegrationOutboxAdminRow` — an admin DEAD-LETTERING a row by hand. It reclaims
+// nothing. The window worker B waits is the `staleLockMs` handed to `claimIntegrationOutboxWork`, and
+// for `xero/accounting.post` that is `CLAIM_STALE_MS` =
+// `INTEGRATION_OUTBOX_DRAIN_LEASES_MS.xeroAccountingEntry` = 900_000 ms = FIFTEEN MINUTES. So the
+// pre-round-33 statement was CORRECT, and for one round this guard REQUIRED the false number and would
+// have REJECTED the true one. A guard enforcing a wrong value is worse than no guard.
+//
+// TWO WINDOWS DESCRIBED IN IDENTICAL ENGLISH IS THE ROOT CAUSE, AND IT HAS NOW DONE THIS THREE TIMES
+// ON THIS BRANCH. `lib/email-outbox.ts` has its own fifteen minutes (`EMAIL_CLAIM_STALE_MS`, and
+// correct); the leases map has fifteen; the dead-letter gate has twenty. All three read as "a row goes
+// stale after N minutes". So the rule this round installs is not about any number: EVERY duration the
+// prose asserts must name the constant it comes from IN THE PROSE, and this guard resolves that
+// constant rather than trusting the number beside it. See `assertDurationsAreSourced`.
 //
 // WHAT THIS DOES NOT ESTABLISH, stated because that is what this round is about. (i) Double-quoted
 // spans are removed before sentences are examined, because quoting is how these files DISOWN a claim
@@ -672,8 +695,27 @@ const DRAIN_CONDITION = /crosses a drain|once a drain|after a drain|when the tim
 const CROSSES_A_DRAIN = /crosses a drain/i
 /** A sentence that is about the duplicate, whatever words it uses. */
 const ABOUT_THE_DUPLICATE = /duplicate|second (?:row|copy|email|time)|emailed a second|invoice twice/i
-/** A sentence whose subject is the LEASE rather than the reclaim window. */
-const ABOUT_THE_LEASE = /lease/i
+/**
+ * ROUND 34 (Codex HIGH 1) — THE EXCEPTION USED TO BE A WORD, AND THAT IS WHY THE WRONG NUMBER GOT IN.
+ *
+ * Until this round a sentence was allowed to name a duration other than the resolved reclaim window
+ * if the sentence mentioned the word "lease". That let round 33 do the damage it did: it re-sourced
+ * `reclaimMs` from `ADMIN_OUTBOX_STALE_PROCESSING_LOCK_MS` — whose own contract says its ONE consumer
+ * is `permanentlyFailIntegrationOutboxAdminRow`, an admin dead-lettering a row by hand — and then
+ * made this guard enforce that twenty-minute number across both copies of the rationale. The window
+ * a reclaim actually waits is the `staleLockMs` the Xero drain passes to `claimIntegrationOutboxWork`,
+ * which is `INTEGRATION_OUTBOX_DRAIN_LEASES_MS.xeroAccountingEntry`: FIFTEEN minutes. The original
+ * fifteen-minute statement was right, the "correction" was wrong, and a guard enforcing a wrong value
+ * is worse than no guard — it REQUIRED the false sentence and REJECTED the true one.
+ *
+ * Both windows are stated in identical English ("a PROCESSING row goes stale after N minutes"), which
+ * is the third time on this branch that two windows so described have produced a wrong edit. So the
+ * rule is no longer about a word: EVERY duration a sentence names must name, in that same sentence,
+ * the constant (or documented row) it comes from — and that source must really RESOLVE to the
+ * duration named, because the resolved value is what supplies the words. A number with no named
+ * source is refused, and a number with the wrong named source is refused too.
+ */
+const DEAD_LETTER_GATE = /dead-letter|dead-lettering|DEAD-LETTER/i
 
 /**
  * The PARAGRAPHS that state this rationale. Two copies of it, three paragraphs: the counterexample
@@ -733,36 +775,81 @@ test('r22: the reclaim window is the RESOLVED constant, and BOTH copies of the r
   const repoRoot = fileURLToPath(new URL('../../', import.meta.url))
   const read = (relative: string) => readFileSync(`${repoRoot}${relative}`, 'utf8')
 
-  // (1) THE RECLAIM WINDOW, AS A RESOLVED VALUE (Codex round 21, LOW).
+  // (1) THE RECLAIM WINDOW, TAKEN FROM THE CONSTANT THE WORKER ACTUALLY PASSES (round 34, Codex HIGH 1).
   //
-  // THIS USED TO BE A PREFIX MATCH, AND THAT IS THE DEFECT. It read
-  // `/ADMIN_OUTBOX_STALE_PROCESSING_LOCK_MS = INTEGRATION_OUTBOX_MAX_LEASE_MS/` out of the source and
-  // called the two constants the same number. They are not: the declaration continues
-  // `+ ADMIN_OUTBOX_POST_LEASE_MARGIN_MS` on the NEXT LINE, so the window is 1_200_000 ms and not
-  // 900_000. A regex anchored to the start of an expression passes over whatever the expression goes
-  // on to add, which means the one test written to stop this rationale drifting could not see the
-  // drift — it agreed with the wrong number twice.
+  // ROUNDS 21 AND 33 BOTH TOOK IT FROM `ADMIN_OUTBOX_STALE_PROCESSING_LOCK_MS`, AND THAT IS THE DEFECT
+  // THIS ROUND REMOVES. That constant's own contract says its one consumer is
+  // `permanentlyFailIntegrationOutboxAdminRow`: how old a PROCESSING lock must be before an ADMIN may
+  // DEAD-LETTER the row under it. It reclaims nothing. What re-takes a PROCESSING
+  // `xero/accounting.post` row is `claimIntegrationOutboxWork`, and the `staleLockMs` it is given for
+  // that operation is `CLAIM_STALE_MS` in lib/connectors/xero/sync-processor.ts — which is
+  // `INTEGRATION_OUTBOX_DRAIN_LEASES_MS.xeroAccountingEntry`, 900_000 ms, FIFTEEN MINUTES. So the
+  // ORIGINAL fifteen-minute statement in both copies of the rationale was CORRECT, round 33's
+  // twenty-minute "correction" was not, and this guard spent a round requiring the false number and
+  // rejecting the true one.
   //
-  // So the window is taken from the CONSTANT, evaluated, and the derivation is asserted as an
-  // EQUALITY of resolved values rather than as a shape of source text. A future edit that changes the
-  // margin, drops it, or adds another term changes `reclaimMs` and lands in the words table below.
+  // The window is therefore taken from the lease map, and the coupling to the worker is asserted out
+  // of the worker's own source below — because "which value reaches that parameter" is the fact the
+  // prose asserts, and importing a constant cannot establish it: a future edit that gives the Xero
+  // drain a `staleLockMs` of its own would leave this number right and both copies of the prose wrong.
   const { ADMIN_OUTBOX_POST_LEASE_MARGIN_MS, ADMIN_OUTBOX_STALE_PROCESSING_LOCK_MS } =
     await import('@/lib/domain/integrations/outbox-admin')
-  const { INTEGRATION_OUTBOX_MAX_LEASE_MS } = await import('@/lib/domain/integrations/outbox-leases')
+  const { INTEGRATION_OUTBOX_DRAIN_LEASES_MS, INTEGRATION_OUTBOX_MAX_LEASE_MS } =
+    await import('@/lib/domain/integrations/outbox-leases')
 
-  const reclaimMs = ADMIN_OUTBOX_STALE_PROCESSING_LOCK_MS
+  const reclaimMs: number = INTEGRATION_OUTBOX_DRAIN_LEASES_MS.xeroAccountingEntry
+
+  // THE WORKER REALLY PASSES IT. One declaration of `CLAIM_STALE_MS`, sourced from the lease map, and
+  // one `claimIntegrationOutboxWork` call that hands it over as `staleLockMs`.
+  const worker = read('lib/connectors/xero/sync-processor.ts')
   assert.equal(
-    reclaimMs,
+    [...worker.matchAll(/^const CLAIM_STALE_MS = INTEGRATION_OUTBOX_DRAIN_LEASES_MS\.xeroAccountingEntry$/gm)].length,
+    1,
+    'lib/connectors/xero/sync-processor.ts no longer declares exactly one `CLAIM_STALE_MS` sourced from '
+    + '`INTEGRATION_OUTBOX_DRAIN_LEASES_MS.xeroAccountingEntry`, so the window both copies of the '
+    + 'rationale state is no longer derived from the constant the drain passes — which is exactly how '
+    + 'rounds 21 and 33 came to state the DEAD-LETTER GATE instead',
+  )
+  const claimCalls = [...worker.matchAll(/await claimIntegrationOutboxWork\(\{([\s\S]*?)\n  \}\)/g)]
+  assert.equal(
+    claimCalls.length,
+    1,
+    `lib/connectors/xero/sync-processor.ts makes ${claimCalls.length} claimIntegrationOutboxWork calls, `
+    + 'not 1, so the lease this rationale rests on is no longer the only one this worker takes',
+  )
+  assert.match(
+    claimCalls[0][1],
+    /staleLockMs: CLAIM_STALE_MS,/,
+    'the Xero drain no longer passes `CLAIM_STALE_MS` as its `staleLockMs`, so the reclaim window both '
+    + 'copies of the rationale state is not the one a reclaim waits',
+  )
+  assert.match(
+    claimCalls[0][1],
+    /operation: XERO_ACCOUNTING_POST_OPERATION,/,
+    'that claim is no longer scoped to `xero/accounting.post`, which is the operation the rationale is about',
+  )
+
+  // AND THE DEAD-LETTER GATE IS STILL A DIFFERENT, LONGER WINDOW. Kept — its derivation is a real
+  // check, it was simply never the reclaim window. Both copies of the prose now name it as the other
+  // window on purpose, so that it cannot be substituted for this one a fourth time.
+  const deadLetterMs = ADMIN_OUTBOX_STALE_PROCESSING_LOCK_MS
+  assert.equal(
+    deadLetterMs,
     INTEGRATION_OUTBOX_MAX_LEASE_MS + ADMIN_OUTBOX_POST_LEASE_MARGIN_MS,
     'the dead-letter gate is no longer the maximum lease plus the post-lease margin — re-read both copies '
-    + 'of the rationale, which state the window as a number',
+    + 'of the rationale, which name it as a number',
+  )
+  assert.ok(
+    deadLetterMs > reclaimMs,
+    `the dead-letter gate (${deadLetterMs}ms) is no longer LONGER than the reclaim window (${reclaimMs}ms), `
+    + 'so an admin can bury a row whose worker is still inside its lease (o3d-zdvn) — and both copies of '
+    + 'the prose say the gate is the longer of the two',
   )
   assert.notEqual(
     reclaimMs,
-    INTEGRATION_OUTBOX_MAX_LEASE_MS,
-    'ADMIN_OUTBOX_STALE_PROCESSING_LOCK_MS is once again EQUAL to the max lease. Round 20 asserted that '
-    + 'alias while the margin made it false; if the margin has genuinely gone to zero, both copies of the '
-    + 'rationale have to stop naming two numbers',
+    deadLetterMs,
+    'the reclaim window and the dead-letter gate are now the SAME number, so nothing here can tell round '
+    + "33's mistake from the truth any more, and both copies of the prose describe two windows that are one",
   )
 
   // AND THE MAXIMUM REALLY IS THE MAXIMUM OF THE DECLARED MAP — read out of the source, not recalled,
@@ -803,10 +890,71 @@ test('r22: the reclaim window is the RESOLVED constant, and BOTH copies of the r
   // (4) BOTH COPIES, CHECKED AGAINST THAT READING — SITE BY SITE, NOT WHOLE-FILE (round 33 HIGH).
   //
   // See the block above WINDOW_CLAIM_SITES for why this is a walk over paragraphs: the whole-file
-  // version of this loop passed over a paragraph that said FIFTEEN MINUTES and "Both are delivered"
-  // because a later paragraph in the same file said twenty and named the drain condition.
-  const grouped = String(reclaimMs).replace(/\B(?=(\d{3})+(?!\d))/g, '_')
-  const otherWindowWords = Object.values(RECLAIM_WINDOW_WORDS).filter((words) => words !== reclaimWords)
+  // version of this loop passed over a paragraph that asserted an unconditional second delivery
+  // because a later paragraph in the same file named the drain condition.
+  const groupOf = (ms: number) => String(ms).replace(/\B(?=(\d{3})+(?!\d))/g, '_')
+  const grouped = groupOf(reclaimMs)
+  const allWindowWords = Object.values(RECLAIM_WINDOW_WORDS)
+  const otherWindowWords = allWindowWords.filter((words) => words !== reclaimWords)
+
+  // EVERY DURATION THIS PROSE MAY NAME, PAIRED WITH THE TOKEN THAT NAMES ITS SOURCE (round 34, HIGH 1).
+  //
+  // The ms come from the constants and the cron table, never from this list, so the pairing cannot
+  // drift: change a constant and the words it supplies change with it. `reclaimMs` is here too, so the
+  // file-wide sweep in (4f) can hold an unanchored sentence to the same rule as an anchored one.
+  const namedDurations: Array<{ token: string; ms: number }> = [
+    { token: 'xeroAccountingEntry', ms: reclaimMs },
+    // The DEFAULT lease, because `outbox-registry.ts` states it too: the WooCommerce stock entry's
+    // reclaim waits it, since that drain passes no `staleLockMs` at all. r34's duration audit found
+    // round 33 had struck that ten minutes out as "no window this build has".
+    { token: 'INTEGRATION_OUTBOX_DRAIN_LEASES_MS.default', ms: INTEGRATION_OUTBOX_DRAIN_LEASES_MS.default },
+    { token: 'ADMIN_OUTBOX_STALE_PROCESSING_LOCK_MS', ms: deadLetterMs },
+    { token: 'ADMIN_OUTBOX_POST_LEASE_MARGIN_MS', ms: ADMIN_OUTBOX_POST_LEASE_MARGIN_MS },
+    { token: 'INTEGRATION_OUTBOX_MAX_LEASE_MS', ms: INTEGRATION_OUTBOX_MAX_LEASE_MS },
+    { token: '/api/cron/email-outbox', ms: drainMs },
+  ]
+  /** The tokens whose RESOLVED value is the duration those words name. Read out, not listed. */
+  const sourcesOf = (words: string) => namedDurations
+    .filter((duration) => RECLAIM_WINDOW_WORDS[String(duration.ms)] === words)
+    .map((duration) => duration.token)
+  /** …and the same for a duration written as digits, the way this repo groups them. */
+  const sourcesOfNumeral = (numeral: string) => namedDurations
+    .filter((duration) => groupOf(duration.ms) === numeral)
+    .map((duration) => duration.token)
+
+  /**
+   * ONE SENTENCE, EVERY DURATION IT NAMES, EACH ONE SOURCED IN THAT SAME SENTENCE.
+   *
+   * This replaced "…unless the sentence says the word lease", which is what let the DEAD-LETTER GATE's
+   * twenty minutes be asserted as the reclaim window for a whole round. `words` is what the caller
+   * requires to be sourced: at a site the resolved window is stated on purpose and is exempt, in the
+   * file-wide sweep nothing is.
+   */
+  const assertDurationsAreSourced = (where: string, sentence: string, words: readonly string[]) => {
+    const upper = sentence.toUpperCase()
+    for (const named of words) {
+      if (!upper.includes(named)) continue
+      const sources = sourcesOf(named)
+      const how = sources.length === 0
+        ? 'and NOTHING in this build resolves to that duration at all'
+        : 'name one of: ' + sources.join(', ')
+      assert.ok(
+        sources.some((token) => sentence.includes(token)),
+        where + ': names ' + named + ', which is not the resolved reclaim window (' + reclaimWords
+        + '), without naming what it comes from — ' + how + '. Round 34: a duration with no named '
+        + 'source is how the dead-letter gate got asserted as the reclaim window: ' + JSON.stringify(sentence),
+      )
+    }
+    for (const numeral of [...new Set(namedDurations.map((duration) => groupOf(duration.ms)))]) {
+      if (numeral === grouped || !sentence.includes(numeral)) continue
+      const sources = sourcesOfNumeral(numeral)
+      assert.ok(
+        sources.some((token) => sentence.includes(token)),
+        where + ': writes ' + numeral + ' ms without naming ' + sources.join(' or ')
+        + ', the source it comes from: ' + JSON.stringify(sentence),
+      )
+    }
+  }
 
   for (const site of WINDOW_CLAIM_SITES) {
     const { prose, sentences } = locateWindowSite(read(site.file), site)
@@ -842,20 +990,14 @@ test('r22: the reclaim window is the RESOLVED constant, and BOTH copies of the r
       + `while A's copy is undelivered: ${JSON.stringify(unconditional)}`,
     )
 
-    // (4c) AND NO SENTENCE HERE NAMES A WINDOW THAT IS NOT THE RESOLVED ONE. The LEASE is genuinely
-    // fifteen minutes, so the exception is a property of the SENTENCE — it has to be about the lease
-    // — and not a case-sensitivity trick that a lower-case stale claim walks straight through, which
-    // is how "fifteen minutes later worker B reclaims" survived rounds 19 to 32.
-    for (const words of otherWindowWords) {
-      const naming = sentences.filter((sentence) => sentence.toUpperCase().includes(words))
-      for (const sentence of naming) {
-        assert.match(
-          sentence,
-          ABOUT_THE_LEASE,
-          `${site.name}: names ${words} in a sentence that is not about the lease, so it is naming a `
-          + `reclaim window that is not the resolved ${reclaimWords}: ${JSON.stringify(sentence)}`,
-        )
-      }
+    // (4c) AND EVERY OTHER DURATION NAMED HERE NAMES ITS OWN SOURCE (round 34, HIGH 1). The old rule
+    // exempted any sentence containing the word "lease", which is how the DEAD-LETTER GATE's twenty
+    // minutes came to be enforced here as the reclaim window. A sentence may name another duration —
+    // both copies now name the gate deliberately, so that the two stop being confusable — but only by
+    // naming the constant it resolves from, in that sentence. Case-insensitive, so a lower-case stale
+    // claim cannot walk through the way "fifteen minutes later worker B reclaims" did in rounds 19-32.
+    for (const sentence of sentences) {
+      assertDurationsAreSourced(site.name, sentence, otherWindowWords)
     }
     assert.ok(
       prose.toUpperCase().includes(reclaimWords),
@@ -874,15 +1016,40 @@ test('r22: the reclaim window is the RESOLVED constant, and BOTH copies of the r
       `${site.name}: still claims the first copy is typically delivered by the time the replay lands`,
     )
 
-    // (4e) AND THE DERIVING SITES DERIVE IT: the number as this repo writes numbers, and the drain
-    // cadence that the ordering in (3) rests on. The counterexample paragraph is not required to
-    // restate either — it is required to point at the paragraph that does, which (4a) covers by
-    // making it carry the conclusion.
+    // (4e) AND THE DERIVING SITES DERIVE IT: the number as this repo writes numbers, the SOURCE that
+    // number comes from, and the drain cadence that the ordering in (3) rests on. The counterexample
+    // paragraph is not required to restate any of it — it is required to point at the paragraph that
+    // does, which (4a) covers by making it carry the conclusion.
     if (!site.derivesTheWindow) continue
     assert.ok(
       prose.includes(grouped),
       `${site.name}: no longer states the reclaim window as ${grouped} ms — re-read it against `
-      + 'ADMIN_OUTBOX_STALE_PROCESSING_LOCK_MS, which is the max lease PLUS the post-lease margin',
+      + '`INTEGRATION_OUTBOX_DRAIN_LEASES_MS.xeroAccountingEntry`, which is the `staleLockMs` the Xero '
+      + 'drain passes to `claimIntegrationOutboxWork`',
+    )
+    // AND IT NAMES WHERE THAT NUMBER COMES FROM (round 34, HIGH 1). Round 33 changed the number here
+    // without changing what it was attributed to, and an unattributed number is what drifted.
+    for (const token of ['xeroAccountingEntry', 'CLAIM_STALE_MS', 'claimIntegrationOutboxWork']) {
+      assert.ok(
+        prose.includes(token),
+        `${site.name}: no longer names ${token}, so the reclaim window it states is not attributed to the `
+        + 'thing that takes it — which is how the dead-letter gate was substituted for it twice',
+      )
+    }
+    // AND IT NAMES THE OTHER WINDOW AS THE OTHER WINDOW, so the next reader meets the distinction at
+    // the site rather than having to rediscover it. The sentence that names the gate must say what the
+    // gate is FOR.
+    const gateSentences = sentences.filter((sentence) => sentence.includes('ADMIN_OUTBOX_STALE_PROCESSING_LOCK_MS'))
+    assert.ok(
+      gateSentences.length > 0,
+      `${site.name}: no longer names ADMIN_OUTBOX_STALE_PROCESSING_LOCK_MS at all. It is named here on `
+      + 'purpose: it is the twenty-minute window rounds 21 and 33 mistook for this one, and a reader who '
+      + 'is not told the two are different is the reader who makes that edit a fourth time',
+    )
+    assert.ok(
+      gateSentences.some((sentence) => DEAD_LETTER_GATE.test(sentence)),
+      `${site.name}: names ADMIN_OUTBOX_STALE_PROCESSING_LOCK_MS without saying, in that sentence, that `
+      + `what it gates is DEAD-LETTERING. Sentences naming it: ${JSON.stringify(gateSentences)}`,
     )
     assert.match(
       prose,
@@ -893,25 +1060,20 @@ test('r22: the reclaim window is the RESOLVED constant, and BOTH copies of the r
   }
 
   // (4f) AND THE CLAIM IS MADE ONLY AT THOSE SITES. Every paragraph of these two files that names any
-  // window this rationale has words for must be one of the located sites, or be about the lease. A
-  // window claim that drifts into a paragraph nobody anchored is what rounds 19, 21 and 33 each were.
+  // duration this rationale has words for must be one of the located sites, or must name the source
+  // that duration resolves from. A window claim that drifts into a paragraph nobody anchored is what
+  // rounds 19, 21 and 33 each were — and round 34 is the one where the anchored paragraphs were
+  // "corrected" to a number nothing in the code produces, so an unanchored sentence is held to the
+  // STRICTER rule here: even the resolved window has to say where it came from.
   const anchors = WINDOW_CLAIM_SITES.map((site) => site.anchor)
   for (const file of [...new Set(WINDOW_CLAIM_SITES.map((site) => site.file))]) {
     for (const prose of commentParagraphs(read(file))) {
       if (anchors.some((anchor) => prose.includes(anchor))) continue
       // SENTENCE BY SENTENCE, and with quoted spans stripped, for the SAME two reasons the site
-      // checks above use: the lease exception is a property of the sentence naming the words, and a
-      // paragraph that QUOTES a window in order to disown it is not stating one.
+      // checks above use: sourcing is a property of the sentence naming the duration, and a paragraph
+      // that QUOTES a window in order to disown it is not stating one.
       for (const sentence of windowSentences(prose)) {
-        const upper = sentence.toUpperCase()
-        const named = Object.values(RECLAIM_WINDOW_WORDS).filter((words) => upper.includes(words))
-        if (named.length === 0) continue
-        assert.match(
-          sentence,
-          ABOUT_THE_LEASE,
-          `${file}: an unanchored sentence names ${named.join(' and ')} without being about the lease, so `
-          + `it states a reclaim window that no site guard reads: ${JSON.stringify(sentence)}`,
-        )
+        assertDurationsAreSourced(`${file}: an unanchored sentence`, sentence, allWindowWords)
       }
     }
   }

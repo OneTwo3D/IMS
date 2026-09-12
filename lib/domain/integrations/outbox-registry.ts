@@ -126,9 +126,13 @@ export const INTEGRATION_OUTBOX_REGISTRY = defineOutboxRegistry({
     //
     //   worker A resolves stock_quantity = 10 (resolvePushStockQuantity, ~line 1093) and pauses
     //   before `pushBatchWithFence` reaches the socket; stock falls to 0 and enqueues its own row —
-    //   which, sharing this product's idempotency key, IS this row; ONE RECLAIM WINDOW later (round
-    //   33: this said "ten minutes", which is no window this build has — the ordering hazard does not
-    //   depend on the number, so it no longer names one) worker B
+    //   which, sharing this product's idempotency key, IS this row; ONE RECLAIM WINDOW later — TEN
+    //   MINUTES, which is `INTEGRATION_OUTBOX_DRAIN_LEASES_MS.default`, because this drain's
+    //   `claimIntegrationOutboxWork` call (lib/connectors/woocommerce/sync/stock-sync-jobs.ts) passes
+    //   no `staleLockMs` and so takes that default (round 33 struck this number out as "no window this
+    //   build has", and r34's duration audit found it IS one — the default lease; the ordering hazard
+    //   does not depend on the number, but a number this build does have should be named with its
+    //   source rather than deleted) — worker B
     //   reclaims it, computes 0, pushes 0 and completes it SUCCEEDED; A then resumes and pushes 10.
     //
     // A is fenced out of the ROW (its `completeClaimedJob` CAS fails and it throws), but WooCommerce
@@ -157,7 +161,9 @@ export const INTEGRATION_OUTBOX_REGISTRY = defineOutboxRegistry({
     //   DIRECTLY. It never enqueues, never claims, never completes an outbox row. So it re-pushes
     //   the correct quantity once a day and leaves the park untouched — which means the park
     //   survives every reconcile, and between two of them a change made a minute after the crash
-    //   waits up to 24 hours. For a stock quantity that is an oversell window, not a delay.
+    //   waits up to 24 hours — the reconcile is documented Daily (help-docs/settings.md, the
+    //   `/api/cron/wc-reconcile` cron-table row, the repo's only statement of its cadence). For a
+    //   stock quantity that is an oversell window, not a delay.
     //
     //   THE PARK WAS NOT VISIBLE WHERE ANYBODY LOOKS. The exception inbox listed `PERMANENT_FAILED`
     //   and nothing else, so a stalled PROCESSING row appeared on no operator surface at all; the
@@ -213,12 +219,18 @@ export const INTEGRATION_OUTBOX_REGISTRY = defineOutboxRegistry({
     // `lease.fenceBeforeRemoteWrite('invoice-email')` with NO dispatch write, and the effect behind
     // it is `sendAccountingInvoiceEmailInternal` -> `queueEmail` -> `db.emailOutbox.create`. Worker A
     // can insert the row and pause before completing its sync-log and outbox rows; ONE RECLAIM
-    // WINDOW later — TWENTY MINUTES, derived from the constants in item 1 below rather than recalled
-    // here — worker B reclaims, passes its own fence honestly (A's lock is now stale), and ATTEMPTS a
+    // WINDOW later — FIFTEEN MINUTES, which is
+    // `INTEGRATION_OUTBOX_DRAIN_LEASES_MS.xeroAccountingEntry`, derived in item 1 below rather than
+    // recalled here — worker B reclaims, passes its own fence honestly (A's lock is now stale), and
+    // ATTEMPTS a
     // SECOND row. THE RECLAIM ALONE DOES NOT MAKE THAT SECOND ROW EXIST (Codex round 33, HIGH; this
-    // sentence used to name the window as fifteen and to end "Both are delivered", while item 1 below
-    // established twenty and established the condition — a stale claim sitting beside its own
-    // correction, which is the shape the cadence guard now checks paragraph by paragraph). B's insert
+    // sentence used to end "Both are delivered" while item 1 below established the condition — a
+    // stale claim sitting beside its own correction, which is the shape the cadence guard now checks
+    // paragraph by paragraph). ROUND 33 ALSO RE-NUMBERED THIS WINDOW FROM FIFTEEN TO TWENTY AND THAT
+    // WAS ITSELF WRONG (Codex round 34, HIGH 1): it took the number from
+    // `ADMIN_OUTBOX_STALE_PROCESSING_LOCK_MS`, which is 1_200_000 ms and gates only an admin
+    // DEAD-LETTERING a row by hand, whereas the window a reclaim waits is the `staleLockMs` the Xero
+    // drain passes to `claimIntegrationOutboxWork`. B's insert
     // is REFUSED while A's copy is still undelivered, and ACCEPTED once a drain has settled A's copy
     // out of the index's predicate — so the duplicate, and with it the second delivery, arrives only
     // when the replay CROSSES A DRAIN. Item 1 works that condition out from the cadences; what it
@@ -241,16 +253,30 @@ export const INTEGRATION_OUTBOX_REGISTRY = defineOutboxRegistry({
     //      corrected this same false premise in lib/domain/accounting/unrecorded-posted-document.ts
     //      and left THIS copy of it standing: one claim, two readers, one of them fixed. Both are now
     //      read out of the repo rather than recalled, and the cadence test walks both files.
-    //      The reclaim window is `ADMIN_OUTBOX_STALE_PROCESSING_LOCK_MS`, AND IT IS NOT AN ALIAS FOR
-    //      THE MAXIMUM LEASE (Codex round 21, LOW — round 20 asserted the alias and was wrong). It is
-    //      `INTEGRATION_OUTBOX_MAX_LEASE_MS` — the largest lease any drain in this build may take,
-    //      900_000 ms, fifteen minutes (`xeroAccountingEntry` in
-    //      lib/domain/integrations/outbox-leases.ts) — PLUS `ADMIN_OUTBOX_POST_LEASE_MARGIN_MS`, the
+    //      THE RECLAIM WINDOW IS THE `staleLockMs` THE XERO DRAIN PASSES, AND NOT THE DEAD-LETTER
+    //      GATE (Codex round 34, HIGH 1 — round 21 named the gate here and round 33 propagated its
+    //      number, and both were wrong about WHICH window this paragraph is about). What re-takes a
+    //      PROCESSING `xero/accounting.post` row is `claimIntegrationOutboxWork`, and the only
+    //      `staleLockMs` it is ever given for this operation is `CLAIM_STALE_MS` in
+    //      lib/connectors/xero/sync-processor.ts, which is
+    //      `INTEGRATION_OUTBOX_DRAIN_LEASES_MS.xeroAccountingEntry` — 900_000 ms, FIFTEEN MINUTES
+    //      (`xeroAccountingEntry` in
+    //      lib/domain/integrations/outbox-leases.ts). That is the window, and it is the one number
+    //      this paragraph rests on.
+    //      THE OTHER WINDOW, NAMED SO IT CANNOT BE MISTAKEN FOR THIS ONE A FOURTH TIME:
+    //      `ADMIN_OUTBOX_STALE_PROCESSING_LOCK_MS` is `INTEGRATION_OUTBOX_MAX_LEASE_MS` (the largest
+    //      lease any drain in this build may take) PLUS `ADMIN_OUTBOX_POST_LEASE_MARGIN_MS` (the
     //      five-minute clock-skew margin declared beside it in
-    //      lib/domain/integrations/outbox-admin.ts. So the window is 1_200_000 ms, TWENTY MINUTES.
+    //      lib/domain/integrations/outbox-admin.ts), so `ADMIN_OUTBOX_STALE_PROCESSING_LOCK_MS` is
+    //      1_200_000 ms, TWENTY MINUTES — and its one consumer is
+    //      `permanentlyFailIntegrationOutboxAdminRow`, i.e. how old a lock must be before an admin may
+    //      DEAD-LETTER the row under it. It gates a manual burial and it reclaims nothing, so it is
+    //      longer than the reclaim window by construction and has no part in the duplication story
+    //      below. Both windows are described in the same English — "a PROCESSING row goes stale after
+    //      N minutes" — which is exactly how the wrong one got substituted for the right one twice.
     //      The email drain is documented HOURLY (help-docs/settings.md, the `/api/cron/email-outbox`
     //      row of the cron table — the repo's only statement of its cadence).
-    //      TWENTY MINUTES IS INSIDE THE HOUR, so when worker B replays, worker A's copy is usually
+    //      FIFTEEN MINUTES IS INSIDE THE HOUR, so when worker B replays, worker A's copy is usually
     //      STILL PENDING — inside the predicate — and the index REFUSES B's insert. The duplicate
     //      arrives when the timing CROSSES A DRAIN: a drain settles A's copy to SENT, a SENT row is
     //      outside the predicate, B's insert is then accepted, and the customer is emailed twice.

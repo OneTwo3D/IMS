@@ -1109,8 +1109,15 @@ test('the dead-letter gate\'s staleness threshold exceeds every declared drain l
   const aliasIsNarrow: IntegrationOutboxDrainLeaseMs = INTEGRATION_OUTBOX_DRAIN_LEASES_MS.default
   void aliasIsNarrow
 
-  // ARITHMETIC OVER A DECLARED LEASE — the round-5 bypass, verbatim. It is `number`, and a lease of
-  // twenty minutes would sit five minutes past a threshold derived from a fifteen-minute maximum.
+  // ARITHMETIC OVER A DECLARED LEASE — the round-5 bypass, verbatim. It is `number`, and the lease it
+  // produces is twenty minutes: longer than `INTEGRATION_OUTBOX_MAX_LEASE_MS` (900_000 ms, the
+  // fifteen-minute `xeroAccountingEntry`) and so exhausting the WHOLE of
+  // `ADMIN_OUTBOX_STALE_PROCESSING_LOCK_MS` (1_200_000 ms = that maximum plus
+  // `ADMIN_OUTBOX_POST_LEASE_MARGIN_MS`), leaving no post-lease margin at all before an admin may
+  // dead-letter a row whose worker is still inside its lease. (r34's duration audit: this used to say
+  // it sat "five minutes past a threshold derived from a fifteen-minute maximum", which is true only
+  // if "threshold" means the maximum rather than the gate derived from it — two readings, five minutes
+  // apart, in the sentence that exists to explain why the union is narrow.)
   const doubled: ClaimIntegrationOutboxOptions = {
     workerId: 'w',
     // @ts-expect-error a lease the declared map does not contain is not a lease this build may take

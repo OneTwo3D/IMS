@@ -36,7 +36,11 @@ All PDF routes now correctly load and render the full set of template fields:
 Invoice and credit-note PDFs are served behind **single-use, time-limited tokens** rather than direct file paths. When you click "View PDF" or "Email PDF":
 
 1. The system generates a token bound to your current session **and your IP address**.
-2. The token is valid for a short TTL (default 15 minutes).
+2. The token is short-lived. Its lifetime comes from `INVOICE_PDF_TOKEN_TTL_SECONDS`; with that
+   unset the code default is `DEFAULT_INVOICE_PDF_TOKEN_TTL_SECONDS` in `lib/invoice-pdf.ts`,
+   which is ten minutes (the sample `.env` ships `259200`, 72 hours). Whatever is configured is
+   capped at `INVOICE_PDF_TOKEN_MAX_TTL_SECONDS`, thirty days. Documented as "15 minutes" until
+   r34's duration audit, which matched no constant in the file.
 3. The PDF route checks the token, the bound session, and the requesting IP before streaming the file.
 
 A token issued on one network cannot be replayed from another, and tokens cannot be shared between users. If a customer needs the PDF, use the **Email PDF** action — the recipient receives the file as an attachment, not a link.
@@ -140,11 +144,15 @@ the job's next run, not immediately.
   of *missing evidence*, not of contention — a rising "unresolved" with "reclaimed" at zero points at
   a database connection problem, not at two runs fighting.
 
-  *Had the message already been handed to SMTP?* **After a send** means yes, so a copy may be on the
-  wire. **Before one** means nothing was sent by this run, so nothing went out twice whatever the
-  cause.
+  *Had this run already entered the sender?* **After a send** means yes — the send call had been
+  made, so a copy may be on the wire. It is not proof the message reached SMTP: if SMTP is not
+  configured, or the from-address is rejected, the send call returns an error without contacting a
+  mail server at all, and it is counted here just the same. **Before one** means the send was never
+  called, so this run put nothing on the wire whatever the cause.
 
-  So **reclaimed after a send** is the one that means the customer has probably received two copies.
+  So **reclaimed after a send** is the one that means the customer has probably received two copies —
+  probably, because it rests on the send having actually reached a mail server, which is not
+  something the run records.
   **Unresolved after a send** means a copy may be on the wire but nothing establishes that a second
   one follows — it is not a duplicate report. The server log line for each row names the specific
   diagnosis behind it. None of the four leaves the email stuck: whichever run settled the row is the
