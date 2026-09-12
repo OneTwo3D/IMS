@@ -54,15 +54,49 @@ export function formatMoney(
   return `${sign}${symbol}${abs}`
 }
 
+type MoneyCodeOptions = {
+  locale?: string
+  minimumFractionDigits?: number
+  maximumFractionDigits?: number
+  notation?: 'standard' | 'compact'
+}
+
 export function formatMoneyCode(
   amount: number,
   currencyCode: string,
-  options?: {
-    locale?: string
-    minimumFractionDigits?: number
-    maximumFractionDigits?: number
-    notation?: 'standard' | 'compact'
-  },
+  options?: MoneyCodeOptions,
+): string {
+  return formatMoneyCodeOfValue(amount, currencyCode, options)
+}
+
+/**
+ * `formatMoneyCode` FOR A FIGURE THAT MUST NOT PASS THROUGH FLOAT64 (o3d-rv4a r3, Codex round 3 HIGH).
+ *
+ * `Intl.NumberFormat#format` accepts a DECIMAL STRING and reads it as an exact mathematical value
+ * (Intl.NumberFormat v3, ES2023). `Number(...)` on the same text first snaps it to the nearest double,
+ * and NEAREST is the one direction a bounded figure cannot survive: `Number('90071992547409.990000')`
+ * is 90071992547409.984375, so a COGS row whose true completed-basis revenue is 90071992547409.989917
+ * printed a ceiling of 90071992547409.98 — below the truth it claimed to be at or above. The defect is
+ * invisible below 2^53 and unavoidable above it, because there the gap between representable doubles
+ * (0.015625 at 9e13) is wider than the penny being rounded to.
+ *
+ * THE VALUE MUST ARRIVE ALREADY ROUNDED TO THE TWO DECIMALS THIS PRINTS, IN THE DIRECTION ITS RELATION
+ * ALLOWS. `boundedFigureString(value, bound, 2)` is what does that. `Intl` rounds anything longer to
+ * nearest itself, so handing it an unrounded string moves the defect one step later rather than fixing
+ * it; handing it a correctly directed one leaves it nothing to round.
+ */
+export function formatMoneyCodeExact(
+  amount: string,
+  currencyCode: string,
+  options?: { locale?: string },
+): string {
+  return formatMoneyCodeOfValue(amount, currencyCode, options)
+}
+
+function formatMoneyCodeOfValue(
+  amount: number | string,
+  currencyCode: string,
+  options?: MoneyCodeOptions,
 ): string {
   const formatter = new Intl.NumberFormat(options?.locale ?? 'en-GB', {
     style: 'currency',
@@ -72,7 +106,10 @@ export function formatMoneyCode(
     maximumFractionDigits: options?.maximumFractionDigits,
     notation: options?.notation,
   })
-  return formatter.format(amount)
+  // The cast is TypeScript's and not the runtime's: `StringNumericLiteral` is a template-literal type
+  // that no value merely typed `string` can satisfy, while the runtime reads any numeric string
+  // exactly. Kept to this one site so no caller has to write it.
+  return formatter.format(typeof amount === 'string' ? (amount as `${number}`) : amount)
 }
 
 export function formatCompactMoneyCode(

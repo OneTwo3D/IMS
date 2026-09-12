@@ -14,12 +14,12 @@ import {
 } from '@/lib/domain/inventory/stock-position-reports'
 import {
   boundSuffix,
-  roundBoundedAmountForDisplay,
   type BoundedFigureString,
   type DerivedFigureBound,
 } from '@/lib/domain/sales/derived-figure-bound'
+import { boundedFigureString } from '@/lib/domain/sales/refund-basis-analytics'
 import { requireInventoryCostingReportAccess } from '@/lib/security/inventory-costing-access'
-import { formatMoneyCode } from '@/lib/utils'
+import { formatMoneyCodeExact } from '@/lib/utils'
 import {
   InventoryCostingReportPage,
   type InventoryCostingColumn,
@@ -29,6 +29,9 @@ export const metadata: Metadata = { title: 'COGS Report' }
 
 /** What the report prints where a dispatch could not be tied to a sales line at all. */
 const NO_AMOUNT = 'Unmatched'
+
+/** Pennies for money, hundredths for the ratio — the precision every cell on this page renders at. */
+const DISPLAY_PLACES = 2
 
 /**
  * THE MARK IS APPENDED AFTER THE AMOUNT RENDERER, NEVER INSIDE IT (o3d-la3n r3, o3d-rv4a) — AND THE
@@ -45,20 +48,39 @@ const NO_AMOUNT = 'Unmatched'
  * `Intl.NumberFormat`, which rounds to the NEAREST penny — under a `≤`. For £100.004 of revenue
  * against £0.0001 of gross-basis credit the true figure is £100.0039167 at 20% VAT, and the cell
  * printed `£100.00 ≤`, a ceiling the truth exceeds. So the caller no longer gets the chance: it
- * receives a NUMBER that `roundBoundedAmountForDisplay` has already moved in the direction the
- * relation allows (up for `≤`, down for `≥`, nearest for the two verdicts that claim neither), and it
- * has no way to obtain the unrounded one. That helper is o3d-la3n r2 / o3d-l4zz's, unchanged and
- * shared with Product Profitability — a second copy of a rounding rule is how two surfaces drift.
+ * receives a figure this function has already moved in the direction the relation allows (up for
+ * `≤`, down for `≥`, nearest for the two verdicts that claim neither), and it has no way to obtain
+ * the unrounded one.
+ *
+ * AND ROUND 3 KEEPS IT A DECIMAL STRING THE WHOLE WAY, BECAUSE THE FLOAT WAS THE SAME DEFECT ONE
+ * LAYER OUT (Codex round 3 HIGH). Round 2 rounded with `roundBoundedAmountForDisplay`, which takes a
+ * `number` — so the producer's decimal string was converted with `Number(...)` BEFORE the directed
+ * rounding ran. Above 2^53 that conversion rounds to NEAREST and the representable doubles are
+ * 0.015625 apart, wider than the penny being rounded to: the schema-valid `90071992547409.990000`
+ * becomes 90071992547409.984375, and a ceiling applied to that prints …409.98 over a true
+ * …409.989917. Directed rounding cannot repair a value that a conversion has already moved the wrong
+ * way, so there is no conversion. `boundedFigureString` rounds the STRING at two places in the
+ * direction the bound allows — the same helper, at the same single site, the producer used at six —
+ * and `formatMoneyCodeExact` hands that string to `Intl.NumberFormat`, which reads a decimal string
+ * exactly. `roundBoundedAmountForDisplay` is unchanged and still right for Product Profitability,
+ * whose figures are `number`s on the wire and never had a decimal string to lose.
  *
  * `bound === null` is the producer saying there is no published figure here at all, so there is no
  * relation to state — distinct from `'exact'`, which is a claim that the figure IS the figure.
+ *
+ * `trailingZeros` is a rendering shape and nothing else: money goes through `Intl`, which prints two
+ * decimals whatever it is handed, and the ratio keeps `decimalString`'s trimmed form. The DIRECTION is
+ * decided above it, from the bound, and no caller can reach it.
  */
 function markFigure(
   amount: BoundedFigureString | null,
   bound: DerivedFigureBound | null,
-  renderAmount: (value: number) => string,
+  renderAmount: (value: BoundedFigureString) => string,
+  trailingZeros = true,
 ): string {
-  const text = amount == null ? NO_AMOUNT : renderAmount(roundBoundedAmountForDisplay(Number(amount), bound ?? 'exact'))
+  const text = amount == null
+    ? NO_AMOUNT
+    : renderAmount(boundedFigureString(amount, bound ?? 'exact', DISPLAY_PLACES, trailingZeros))
   return `${text}${bound == null ? '' : boundSuffix(bound)}`
 }
 
@@ -72,9 +94,13 @@ export default async function CogsPage({ searchParams }: { searchParams: Promise
     getOrganisation(),
   ])
   const currency = organisation.baseCurrency
-  const money = (value: string) => formatMoneyCode(Number(value), currency)
-  /** The same formatter over a number the bound-preserving rounder has already placed. */
-  const moneyOf = (value: number) => formatMoneyCode(value, currency)
+  // EVERY FIGURE ON THIS PAGE IS A DECIMAL STRING AND NONE OF THEM BECOMES A FLOAT (Codex r3 HIGH).
+  // These columns carry no relation, so nearest rounding is the right rule for them — but `Number`
+  // is not nearest-to-a-penny, it is nearest-to-a-double, and at 9e13 those are 1.5 pennies apart.
+  // `Intl` reads the string exactly and rounds to the penny itself.
+  const money = (value: string) => formatMoneyCodeExact(value, currency)
+  /** The same formatter over a string the bound-preserving rounder has already placed. */
+  const moneyOf = (value: BoundedFigureString) => formatMoneyCodeExact(value, currency)
   const columns: Array<InventoryCostingColumn<CogsReportRow>> = [
     {
       key: 'group',
@@ -113,7 +139,7 @@ export default async function CogsPage({ searchParams }: { searchParams: Promise
       // The producer already rounded the ratio toward its own bound at two decimals, so this second
       // rounding at the same precision is a no-op — which is the point: a chain of bound-preserving
       // roundings is bound-preserving, and a nearest one anywhere in it is not.
-      render: (row) => markFigure(row.grossMarginPct, row.grossMarginPctBound, (value) => `${value}%`),
+      render: (row) => markFigure(row.grossMarginPct, row.grossMarginPctBound, (value) => `${value}%`, false),
     },
     // The credit, on the basis it was recorded on. Three columns and never one sum: adding a NET to a
     // GROSS amount gives a figure on neither basis, and only the NET one was taken off revenue.

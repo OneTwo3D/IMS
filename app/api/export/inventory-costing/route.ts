@@ -1,7 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { requireApiAuth } from '@/lib/auth/server'
 import { csvBufferedStreamResponse } from '@/lib/csv'
-import { REFUND_BASIS_NOTICE_COGS_MARGIN } from '@/lib/analytics/refund-figure-surfaces'
+import { BOUNDED_FIGURE_ROUNDING_NOTICE_COGS, REFUND_BASIS_NOTICE_COGS_MARGIN } from '@/lib/analytics/refund-figure-surfaces'
 import { db } from '@/lib/db'
 import {
   getCogsReport,
@@ -145,6 +145,12 @@ export async function getInventoryCostingExportResponse(
           groupBy: report.groupBy,
           generatedAt: report.generatedAt,
           refundTreatment: REFUND_BASIS_NOTICE_COGS_MARGIN,
+          // THE FILE NEEDS IT MORE THAN THE PAGE DOES, and for the reason the block above gives: a
+          // spreadsheet reader is the one who puts `=SUM()` under the column and compares it with
+          // `totals.revenueBase` two rows down. Same constant as the page's notice, so the two cannot
+          // drift; a column header could not say it, because the discrepancy is BETWEEN the rows and
+          // the totals metadata rather than inside any one column.
+          roundingReconciliation: BOUNDED_FIGURE_ROUNDING_NOTICE_COGS,
           ...Object.fromEntries(Object.entries(report.totals).map(([key, value]) => [`totals.${key}`, value])),
         },
       )

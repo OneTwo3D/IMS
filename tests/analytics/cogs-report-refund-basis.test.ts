@@ -186,7 +186,7 @@ async function report() {
 }
 
 /** The page's OWN cells and footers, read out of the element it returns. This is what is on screen. */
-async function pageCells(): Promise<{ cell: (key: string) => string; cellOf: (key: string, row: unknown) => string; footer: (key: string) => string; summary: Map<string, string>; notices: string[] }> {
+async function pageCells(): Promise<{ cell: (key: string) => string; cellOf: (key: string, row: unknown) => string; footer: (key: string) => string; rows: unknown[]; summary: Map<string, string>; notices: string[] }> {
   const { default: CogsPage } = await import('@/app/(dashboard)/analytics/cogs/page')
   const element = await CogsPage({ searchParams: Promise.resolve({ ...FILTERS }) }) as {
     props: {
@@ -206,6 +206,9 @@ async function pageCells(): Promise<{ cell: (key: string) => string; cellOf: (ke
     cell: (key: string) => String(column(key).render(rows[0])),
     cellOf: (key: string, row: unknown) => String(column(key).render(row)),
     footer: (key: string) => String(column(key).footer),
+    // The rows the page actually rendered — needed by the one test that adds a COLUMN up and compares
+    // it with the footer, which is the reader's check and cannot be done one row at a time.
+    rows,
     summary: new Map(summary.map((item) => [item.label, item.value])),
     notices,
   }
@@ -804,6 +807,158 @@ test('the CSV rounds a bounded column UP at its own precision too (Codex r2 HIGH
   const { metadata } = await csvRows()
   assert.equal(metadata.get('totals.revenueBaseBound'), 'upper')
   assert.ok(D(metadata.get('totals.revenueBase')!).gte(trueRevenue), `the metadata total ${metadata.get('totals.revenueBase')} is below the truth`)
+})
+
+test('a displayed upper bound survives the FLOAT BOUNDARY, not only the formatter (Codex r3 HIGH)', async () => {
+  // Codex round 3, verbatim: "`Number(amount)` loses precision before directed rounding. For
+  // schema-valid `90071992547409.990000` with a true completed-basis value of `90071992547409.989917`,
+  // the page displays `90071992547409.98 <=`, which is below the truth. The bound-preserving producer
+  // and CSV remain sound, but the on-screen upper bound does not."
+  //
+  // Round 2 moved the rounding to the producer and made it directed; the page then handed the
+  // producer's decimal STRING to `Number(...)` before the ceiling was applied. Above 2^53 that
+  // conversion rounds to NEAREST, and the representable doubles there are 0.015625 apart — wider than
+  // the penny being rounded to — so the ceiling was applied to a value that was already below the
+  // truth and had nothing left to fix. Directed rounding cannot undo a conversion.
+  //
+  // PUBLISHED revenue is the line's 90071992547409.99: the credit is stamped GROSS, so it is not this
+  // figure's unit and nothing comes off it. TRUE, at 20% VAT, where the 0.0001 credit is worth
+  // 0.0001 / 1.2 = 0.0000833333… ex-VAT:
+  //   90071992547409.99 - 0.0000833333… = 90071992547409.9899166666…
+  // which is the reviewer's own 90071992547409.989917.
+  COGS_ROWS = [cogsEntry({ id: 'c1', orderId: 'O1', productId: 'p1', qty: '1', cost: '40', line: { id: 'L1', productId: 'p1', totalBase: '90071992547409.99' } })]
+  ORDERS = [order('O1', [{ productId: 'p1', totalBase: '90071992547409.99' }])]
+  CREDIT_LINES = [creditAgainstLine('L1', 'O1', 'p1', '0.0001', 'GROSS')]
+  FILTER_PRODUCT_IDS = [...ALL_FIXTURE_PRODUCTS]
+  const { rows } = await report()
+  // THE REVIEWER'S EXACT SCHEMA-VALID STRING has to be the thing the producer published, or this test
+  // is about a different number than the finding was.
+  assert.equal(rows[0]!.revenueBase, '90071992547409.990000')
+  assert.equal(rows[0]!.revenueBaseBound, 'upper')
+
+  const trueRevenue = D('90071992547409.99').sub(D('0.0001').div(D('1.2')))
+  assert.equal(trueRevenue.toFixed(6), '90071992547409.989917', 'the reviewer’s own figure for the truth')
+  // THE CONVERSION THE PAGE USED TO MAKE, NAMED. Without this the test would not say what it defends
+  // against, and a reader could not tell the example still bites on today's floating point.
+  assert.equal(Number(rows[0]!.revenueBase), 90071992547409.984375, 'float64 still loses the ninth digit')
+  assert.ok(D(Number(rows[0]!.revenueBase)).lt(trueRevenue), 'and what it loses is the bound itself')
+
+  const page = await pageCells()
+  const printed = page.cell('revenue')
+  assert.match(printed, / ≤$/, 'revenue must still carry its relation')
+  assert.ok(
+    printedNumber(printed).gte(trueRevenue),
+    `revenue prints ${printed}, which is BELOW the true ${trueRevenue.toFixed(12)} it claims to be at or above`,
+  )
+  assert.equal(printed, '£90,071,992,547,409.99 ≤')
+  // The footer and the summary card are the same figure through the same helper, so they owe the same.
+  assert.ok(printedNumber(page.footer('revenue')).gte(trueRevenue), `the footer prints ${page.footer('revenue')}`)
+  assert.ok(printedNumber(page.summary.get('Revenue (GBP, net of credit)') ?? '').gte(trueRevenue))
+})
+
+test('the float boundary on a NEGATIVE ceiling and on a floor, the two signs ROUND_CEIL splits (Codex r3 HIGH)', async () => {
+  // ROUND_CEIL over a NEGATIVE figure is the case round 2's own test did not cover, and the float
+  // conversion breaks it in the mirror direction. `Number('-90071992547409.995000')` is exactly
+  // -90071992547410 — BELOW the published figure — so a ceiling computed from it printed
+  // -£90,071,992,547,410.00 over a truth that is at or above -…409.995. A floor has the same defect at
+  // the same magnitude with the signs swapped: `Number('90071992547409.995000')` is 90071992547410,
+  // ABOVE the published figure, so a `≥` printed a floor the truth can be below.
+  //
+  // ASSERTED ON THE RENDERER, through a synthetic row, exactly as the withheld-amount test below is and
+  // for the reason stated there: the property has to hold for whatever the producer publishes, and
+  // building a margin of this magnitude out of a revenue line and a cost would make the test about the
+  // fixture rather than about the display. Both strings are what a schema-valid Decimal(20, 6) holds.
+  workedExample([])
+  const page = await pageCells()
+
+  // A CEILING OVER A NEGATIVE FIGURE. The truth is at or below the published -90071992547409.995, so
+  // the printed figure must be at or above it; toward +infinity at two decimals that is -…409.99.
+  assert.equal(Number('-90071992547409.995000'), -90071992547410, 'float64 moves it the wrong way')
+  const printedCeiling = page.cellOf('margin', { grossMarginBase: '-90071992547409.995000', grossMarginBaseBound: 'upper' })
+  assert.match(printedCeiling, / ≤$/)
+  assert.ok(
+    printedNumber(printedCeiling).gte(D('-90071992547409.995')),
+    `a ≤ over a negative prints ${printedCeiling}, below the -90071992547409.995 it is a ceiling for`,
+  )
+  assert.equal(printedCeiling, '-£90,071,992,547,409.99 ≤')
+
+  // THE MIRROR: a floor, where the truth is at or ABOVE the published figure and the printed number
+  // must therefore be at or below it. Toward -infinity that is …409.99, never …410.00.
+  assert.equal(Number('90071992547409.995000'), 90071992547410, 'float64 moves it the wrong way')
+  const printedFloor = page.cellOf('margin', { grossMarginBase: '90071992547409.995000', grossMarginBaseBound: 'lower' })
+  assert.match(printedFloor, / ≥$/)
+  assert.ok(
+    printedNumber(printedFloor).lte(D('90071992547409.995')),
+    `a ≥ prints ${printedFloor}, above the 90071992547409.995 it is a floor for`,
+  )
+  assert.equal(printedFloor, '£90,071,992,547,409.99 ≥')
+})
+
+test('the report itself explains why the rows do not add up to the total (Codex r3 MEDIUM)', async () => {
+  // Codex round 3, verbatim: "`report.notices` contains no rounding/reconciliation notice, so operators
+  // only see individually ceiled rows that may not sum to the independently ceiled total. The help
+  // document explains this, but the report itself does not; across 500 rows the visible discrepancy can
+  // approach £5 and look like a calculation defect."
+  //
+  // THE DISCREPANCY IS DELIBERATE AND NEITHER FIGURE IS WRONG. Each row is ceiled to its own penny and
+  // the total is ceiled ONCE from the unrounded sum — which is what makes both of them sound bounds —
+  // so the column misses the footer by up to a penny per row. Reconciling them the way o3d-8u4h's
+  // supplier-ageing bands were reconciled is not available here: there the parent was a measurement and
+  // the residue could be pushed into the largest component, while here both figures are bounds and
+  // moving either to make them tally is what would make it false. So the only thing owed is the
+  // explanation, and it has to travel WITH the figures.
+  //
+  // THE FIXTURE MAKES THE DISCREPANCY REAL rather than asserting a sentence into an empty report: three
+  // products, each with an ex-VAT line of 1.001 and a 0.0001 GROSS credit of its own so each row is
+  // bounded. Nothing is deducted (the credit is not the figure's unit), so each row publishes 1.001 and
+  // ceils to 1.01 — 3.03 down the column — while the period publishes 3.003 and ceils once to 3.01.
+  const line = (id: string, productId: string) => ({ id, productId, totalBase: '1.001' })
+  COGS_ROWS = [
+    cogsEntry({ id: 'c1', orderId: 'O1', productId: 'p1', qty: '1', cost: '0', line: line('L1', 'p1') }),
+    cogsEntry({ id: 'c2', orderId: 'O1', productId: 'p2', qty: '1', cost: '0', line: line('L2', 'p2') }),
+    cogsEntry({ id: 'c3', orderId: 'O1', productId: 'p9', qty: '1', cost: '0', line: line('L9', 'p9') }),
+  ]
+  ORDERS = [order('O1', [{ productId: 'p1', totalBase: '1.001' }, { productId: 'p2', totalBase: '1.001' }, { productId: 'p9', totalBase: '1.001' }])]
+  CREDIT_LINES = [
+    creditAgainstLine('L1', 'O1', 'p1', '0.0001', 'GROSS'),
+    creditAgainstLine('L2', 'O1', 'p2', '0.0001', 'GROSS'),
+    creditAgainstLine('L9', 'O1', 'p9', '0.0001', 'GROSS'),
+  ]
+  FILTER_PRODUCT_IDS = [...ALL_FIXTURE_PRODUCTS]
+
+  const page = await pageCells()
+  assert.equal(page.rows.length, 3, 'the three groups the example needs')
+  // THE READER'S CHECK, at the precision the reader sees: add the column up and compare it with the
+  // footer. Asserted as a real inequality, because a notice explaining a discrepancy that does not
+  // happen would be noise, and this test would then be proof of nothing.
+  const columnSum = page.rows
+    .map((row) => printedNumber(page.cellOf('revenue', row)))
+    .reduce((total, value) => total.add(value), D(0))
+  const footer = printedNumber(page.footer('revenue'))
+  assert.equal(columnSum.toString(), '3.03', 'three rows of 1.001, each ceiled to its own penny')
+  assert.equal(footer.toString(), '3.01', 'and the period ceiled once from the unrounded 3.003')
+  assert.ok(columnSum.gt(footer), 'the fixture must actually show the discrepancy the notice explains')
+  // Both are sound over the unrounded 3.003, which is why neither may be moved to make them tally.
+  assert.ok(footer.gte(D('3.003')) && columnSum.gte(D('3.003')))
+
+  // AND THE EXPLANATION IS IN THE PAYLOAD THE PAGE RENDERS — the constant itself, not a paraphrase, so
+  // the page and the CSV cannot drift apart on what it says.
+  const { BOUNDED_FIGURE_ROUNDING_NOTICE_COGS } = await import('@/lib/analytics/refund-figure-surfaces')
+  assert.ok(
+    page.notices.includes(BOUNDED_FIGURE_ROUNDING_NOTICE_COGS),
+    `the rounding notice never reached the page; notices were: ${JSON.stringify(page.notices)}`,
+  )
+  // It has to say the USEFUL thing, not merely exist: that the two are not expected to sum, and how
+  // large the visible gap can get. A notice that only said "figures are rounded" would leave the
+  // operator exactly where the finding found them.
+  assert.match(BOUNDED_FIGURE_ROUNDING_NOTICE_COGS, /not expected to add up/)
+  assert.match(BOUNDED_FIGURE_ROUNDING_NOTICE_COGS, /penny per row/)
+
+  // THE FILE READER IS THE ONE WHO PUTS `=SUM()` UNDER THE COLUMN, so the CSV carries the same
+  // sentence in the only channel it has. Untruncated, for the reason the metadata test below gives.
+  const { metadata } = await csvRows()
+  assert.equal(metadata.get('metadataTruncated'), undefined, 'the metadata must still fit; see headerMetadata in lib/csv.ts')
+  assert.equal(metadata.get('roundingReconciliation'), BOUNDED_FIGURE_ROUNDING_NOTICE_COGS)
 })
 
 // ---------------------------------------------------------------------------------------------

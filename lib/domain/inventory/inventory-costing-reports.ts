@@ -15,7 +15,7 @@ import { dateOnly as utcDateOnly, exclusiveEndOfUtcDay, parseDateOnly as parseUt
 import { assertSourceLimit, SourceScanTooLargeError } from '@/lib/security/source-scan-error'
 import { getAccountingSettings, getActiveAccountingConnectorInfo, syncAccountingAccountBalanceSnapshots } from '@/lib/accounting'
 import { cache } from 'react'
-import { REFUND_BASIS_NOTICE_COGS_MARGIN } from '@/lib/analytics/refund-figure-surfaces'
+import { BOUNDED_FIGURE_ROUNDING_NOTICE_COGS, REFUND_BASIS_NOTICE_COGS_MARGIN } from '@/lib/analytics/refund-figure-surfaces'
 import type { BoundedFigureString, DerivedFigureBound } from '@/lib/domain/sales/derived-figure-bound'
 import {
   boundedFigureString,
@@ -1849,6 +1849,12 @@ export async function getCogsReport(filters: InventoryCostingFilters = {}, optio
       // revenue LESS the net-basis credit raised in the period; the gross-basis and unproven-basis
       // credit is published beside it and bounds the figures rather than being converted or guessed.
       REFUND_BASIS_NOTICE_COGS_MARGIN,
+      // o3d-rv4a r3, Codex round 3 MEDIUM: and the screen now explains the discrepancy it deliberately
+      // creates. Rows are ceiled one by one and the total is ceiled once from the unrounded sum, so the
+      // column does not tally with the footer — by up to a penny per row, which across 500 rows looks
+      // like a defect. UNCONDITIONAL, because independent rounding does not distribute over addition
+      // for the nearest mode either: a report whose every figure is `exact` can miss by the same penny.
+      BOUNDED_FIGURE_ROUNDING_NOTICE_COGS,
     ].filter(Boolean),
   }
 }
