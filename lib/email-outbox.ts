@@ -62,10 +62,14 @@
  * AND THE ANSWER HAS TO BE THE WHOLE OF WHAT THAT ARRAY HOLDS, NOT MERELY CONTAIN THE ROW (r28).
  * The proof empties the array and asks the delegate THE DRAIN'S OWN SWEEP: an in-memory delegate has
  * nothing to answer with, and one that also reads a database answers with that database's rows and
- * is refused. The minted client also holds METHODS CAPTURED AT MINT TIME rather than the caller's
+ * is refused WHENEVER THAT DATABASE HOLDS AN ELIGIBLE ROW AT MINT TIME — the qualifier is the whole
+ * of the claim (r30, Codex r29 HIGH), because phase 1 is ONE negative sample: a read-through
+ * delegate whose source is empty at that instant answers nothing and is minted. What covers THAT
+ * delegate once its source fills up is not the mint but `refuseSweptRowsFromOutsideTheStore`, at
+ * sweep time. The minted client also holds METHODS CAPTURED AT MINT TIME rather than the caller's
  * delegate objects, because `Object.freeze` is shallow and a caller could otherwise swap `findMany`
  * onto its own delegate after the proof had passed. The mint states in its own words what that does
- * and does not establish — it is a BEST-EFFORT check with four named residues, not a guarantee.
+ * and does not establish — it is a BEST-EFFORT check with five named residues, not a guarantee.
  *
  * AND THE CHECK READS EACH FACT EXACTLY ONCE (r7). It enumerates the caller's keys with
  * `Reflect.ownKeys` behind a plain-prototype rule, so the names it sees are exactly the names a
@@ -118,9 +122,18 @@ type QueueEmailInput = {
 }
 
 /**
- * `already_queued` is not a failure: an undelivered row for this exact logical email already
- * exists and WILL be delivered. Returned rather than thrown so a caller can say so instead of
- * reporting an error for a duplicate click or a replayed outbox row.
+ * `already_queued` is not a failure: A DELIVERY FOR THIS EXACT LOGICAL EMAIL IS ALREADY QUEUED — an
+ * undelivered row (PENDING or PROCESSING) exists, which is what the partial unique index refused
+ * the second of. Returned rather than thrown so a caller can say so instead of reporting an error
+ * for a duplicate click or a replayed outbox row.
+ *
+ * IT IS NOT A PROMISE OF DELIVERY, and this contract used to read as one. All the row establishes
+ * is that a delivery is QUEUED: a PROCESSING row may already be on the wire, and any undelivered
+ * row may still end FAILED — the recipient is suppressed, the send fails permanently, or
+ * `EMAIL_MAX_ATTEMPTS` is exhausted. Same overclaim this branch removed from the operator-facing
+ * incident records (see `tests/accounting/qbo-invoice-email-queued-not-sent.test.ts`), so it is
+ * removed from the enqueue contract too rather than left as the one place it still reads as a
+ * guarantee.
  */
 export type QueueEmailOutcome = { queued: true } | { queued: false; reason: 'already_queued' }
 
@@ -233,9 +246,10 @@ export type EmailOutboxClient = {
  *
  * AND STEP (3) IS A SAMPLE, NOT A PROPERTY — r30 (Codex r29 HIGH) STATES THAT WHERE r28 DID NOT. It
  * establishes that the delegate had nothing to answer with WHILE THE ARRAY WAS EMPTY AT MINT TIME.
- * A read-through delegate whose database is empty at that instant therefore mints, and if that
- * database later receives an eligible row the captured `findMany` will hand it over. So the drain
- * asks the same question about the rows THEMSELVES, at sweep time, before it claims any of them:
+ * What step (3) refuses is a read-through delegate whose database HOLDS AN ELIGIBLE ROW AT MINT
+ * TIME; one whose database is empty at that instant therefore mints, and if that database later
+ * receives an eligible row the captured `findMany` will hand it over. So the drain asks the same
+ * question about the rows THEMSELVES, at sweep time, before it claims any of them:
  * see `refuseSweptRowsFromOutsideTheStore`. The mint's claim was corrected to what it checks, and
  * the check that covers the rest is in the path that merges.
  *
@@ -246,9 +260,11 @@ export type EmailOutboxClient = {
  * on; a post-mint swap reaches nothing.
  *
  * AND THE MINT NOW SAYS IT IS BEST-EFFORT, IN THOSE WORDS, over `createEmailOutboxHarnessClient`:
- * three checkable properties it establishes, and four residues (write destinations, a probe-aware
- * delegate, a single-key suppression fallback, and state on the caller's delegate) that no
- * in-process check can decide. Read that contract before adding a round nine.
+ * four checkable properties — the fourth of them the DRAIN's sweep-time check rather than the mint's
+ * own, which is why the contract numbers it and then says so — and five residues (write destinations,
+ * a probe-aware delegate, a single-key suppression fallback, state on the caller's delegate, and a
+ * read-through delegate whose backing source holds no eligible row at mint time) that no in-process
+ * check can decide. Read that contract before adding a round nine.
  *
  * WHY THE READ PATH IS THE ONE THAT IS PROVEN. The drain is a SWEEP: `findMany` decides WHICH ROWS
  * EXIST for this run, and every write afterwards is keyed on an id that came back from it. A
@@ -260,7 +276,7 @@ export type EmailOutboxClient = {
  * memory while routing `updateMany` to a real database would pass — but that is a purpose-built
  * two-faced object, not a one-line mistake, and it is the same residual class as
  * `sendEmail: (m) => realMailer(m)`, which no in-process check can refuse either. That residue is
- * filed (o3d-dhhd, o3d-fii2), not papered over, and the full list of four is over the mint itself.
+ * filed (o3d-dhhd, o3d-fii2), not papered over, and the full list of five is over the mint itself.
  * What is GONE is the accident and the one-liner: there is no field left whose value is simply
  * taken at its word, and no reading taken by the proof that the caller can still change.
  *
@@ -356,8 +372,12 @@ function refuseHarnessClientMint(detail: string): never {
  *   anything. An in-memory delegate has nothing to answer with, so the only correct answer is NONE
  *   — whatever it understands of the where-clause, filtering an empty array yields an empty result,
  *   so this costs an honest double nothing. A delegate that ALSO reads a database answers with that
- *   database's eligible rows and is REFUSED. This is what replaces "the sentinel is in there":
- *   what the array holds is nothing, so the whole result must be nothing.
+ *   database's eligible rows and is REFUSED — WHENEVER THAT DATABASE HOLDS AN ELIGIBLE ROW AT MINT
+ *   TIME, and not otherwise (r30, Codex r29 HIGH). This phase is a NEGATIVE SAMPLE taken once, so a
+ *   read-through delegate whose source happens to be empty at that instant answers nothing here and
+ *   is minted; residue (e) over the mint names that case and `refuseSweptRowsFromOutsideTheStore` is
+ *   what covers it. This is what replaces "the sentinel is in there": what the array holds is
+ *   nothing, so the whole result must be nothing.
  *
  *   PHASE 2 — ONE ROW IS IN THE ARRAY, AND THE ANSWER MUST BE THAT ONE ROW AND NO OTHER. The
  *   sentinel is pushed into the now-empty array and the delegate is asked for it: the answer must
@@ -375,11 +395,12 @@ function refuseHarnessClientMint(detail: string): never {
  * and answers it differently from the drain; on the suppression side, whose only read is a
  * single-key `findUnique`, it cannot catch a delegate that answers from the array when the key is
  * present and from a database when it is not — there is no key this module knows a database would
- * answer for, and it will not go looking through customer data to find one; AND IT CANNOT SEE A
- * SOURCE THAT IS EMPTY NOW AND NOT EMPTY LATER, which is why phase 1 alone does not entitle anyone
- * to say "a database-serving delegate is refused" (r30). Those four are named in the mint's
- * contract below and filed (o3d-fii2), not implied away; the last of them is what the drain's own
- * sweep-time check exists for.
+ * answer for, and it will not go looking through customer data to find one; it cannot stop a
+ * delegate whose captured method reads MUTABLE STATE OFF ITS OWN RECEIVER from changing its later
+ * answers; AND IT CANNOT SEE A SOURCE THAT IS EMPTY NOW AND NOT EMPTY LATER, which is why phase 1
+ * alone does not entitle anyone to say "a database-serving delegate is refused" (r30). Those five
+ * are named in the mint's contract below and filed (o3d-fii2), not implied away; the last of them
+ * is what the drain's own sweep-time check exists for.
  */
 
 /** Far enough forward that no date predicate in the sweep excludes a row the array holds. */
@@ -763,8 +784,9 @@ function mintEmailOutboxClient(
  * and every round a reviewer found the guarantee it implied was not one it held. So it claims what
  * it can check and no more.
  *
- * WHAT IT ESTABLISHES, and these are checkable properties of the object the drain will use, not
- * descriptions of an intention:
+ * WHAT IS ESTABLISHED ABOUT THE CLIENT THIS RETURNS — the first three BY THIS FUNCTION and the
+ * fourth BY THE DRAIN, which (4) states rather than leaves to be noticed — and these are checkable
+ * properties of the object the drain will use, not descriptions of an intention:
  *
  *   1. THE CLIENT WAS MINTED HERE. `db`, a structural wrapper of it, a spread or a Proxy of a minted
  *      client: none of them is in the register, and membership is not a field that can be copied.

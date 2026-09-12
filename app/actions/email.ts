@@ -17,8 +17,9 @@ export async function sendSalesOrderEmail(orderId: string): Promise<{ success: b
 
     const queued = await getSalesOrderConfirmationQueueData(orderId)
     // o3d-alnk: a second click while the first row is still undelivered is refused by the
-    // partial unique index and comes back as `already_queued` — not an error. The email the
-    // operator asked for is already on its way; saying "queued" twice would be a lie.
+    // partial unique index and comes back as `already_queued` — not an error. A delivery of the
+    // email the operator asked for is already QUEUED (not necessarily delivered — see
+    // `QueueEmailOutcome`); saying "queued" twice would be a lie.
     const outcome = await queueEmail({
       kind: 'SALES_ORDER_CONFIRMATION',
       to: queued.to,

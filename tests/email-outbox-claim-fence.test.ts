@@ -1581,52 +1581,355 @@ test('r30: NON-VACUITY — the same lost write WITH a real rival still reports t
   assert.doesNotMatch(conflict, /NO RECLAIM IS ESTABLISHED/)
 })
 
-test('r30: the mint claims what phase 1 establishes and no more, and declares the fifth residue', () => {
-  // Codex r29's HIGH was not a missing mechanism — it was a SENTENCE that outran its evidence. r28
-  // wrote that the mint refuses "a delegate that also serves a database's rows", while its own
-  // control test minted exactly such a delegate whenever the database happened to be empty. A
-  // sentence is what the next reader trusts, so the sentence is under test.
-  const source = readFileSync(fileURLToPath(new URL('../lib/email-outbox.ts', import.meta.url)), 'utf8')
-  /** The doc blocks with their comment furniture removed, so a claim can be matched as prose. */
-  const prose = source.replace(/\n\s*\*/g, ' ').replace(/\s+/g, ' ')
+// ---------------------------------------------------------------------------
+// r31 (Codex r30 HIGH): THE FOUR PLACES THIS MODULE STATES WHAT THE MINT'S PROOF ESTABLISHES,
+// CHECKED ONE AT A TIME.
+//
+// r30 corrected the mint's claim and said in its own commit that it had made the same correction in
+// four places. It had not. The MODULE HEADER still said a delegate that also reads a database "is
+// refused" full stop, and still called the check one with FOUR named residues; the text over
+// `IN_MEMORY_PROOFS` said the same thing in phase 1 and counted "those four" as well. The r30 guard
+// passed anyway, because it searched THE WHOLE SOURCE for one corrected sentence and excluded ONE
+// exact bad spelling — so a single good sentence anywhere satisfied it while two sites contradicted
+// it a few hundred lines away. That is precisely the vacuous shape this branch has spent thirty
+// rounds removing from its production guards, reproduced in a guard about the guards.
+//
+// So the wording is checked PER SITE, and each site is its own test. For each one, independently:
+//
+//   * THE CORRECTED CLAIM MUST BE THERE — one sentence that asserts a refusal AND carries the
+//     mint-time bound, in that same sentence, so the qualifier cannot be stranded in a different
+//     paragraph from the claim it qualifies;
+//   * NO SENTENCE MAY ASSERT THE UNBOUNDED CLAIM — a sentence about a database-reading delegate that
+//     says it is refused must carry the bound, whatever words it uses to say it;
+//   * EVERY RESIDUE COUNT THE SITE STATES MUST EQUAL THE LENGTH OF THE RESIDUE LIST ITSELF, which is
+//     read off the lettered items rather than written down here — so adding residue (f) turns every
+//     site that still says "five" red instead of leaving four sites to drift apart again.
+//
+// A ZERO MATCH IS NEVER A PASS. Each site is located by an anchor that must match exactly one doc
+// comment, the block must be a substantial one, and the positive assertions above mean an empty or
+// claim-free block fails rather than passes silently.
+//
+// WHAT THIS GUARD DOES NOT ESTABLISH, stated because this round is about claims outrunning their
+// evidence. (i) DOUBLE-QUOTED TEXT IS REMOVED before the sentences are examined: both remaining
+// mentions of the old sentence are CITATIONS of it inside quotes ("This does NOT say ..."), and
+// quoting is how this file disowns a claim. An overclaim written inside double quotes would pass.
+// (ii) It is a check on WORDING ONLY. It cannot tell whether the sentence it approves is true of the
+// code; what establishes that is the control test that mints exactly the delegate residue (e)
+// describes (`tests/email-outbox-injection-shape.test.ts`, "r30 HIGH: the empty-source read-through
+// delegate").
 
-  // (1) THE OVERCLAIM IS GONE, and it cannot return without this failing.
-  assert.ok(
-    !prose.includes('A delegate that also serves a database\'s rows is refused'),
-    'the mint again claims it refuses a database-serving delegate, which its own control test disproves',
-  )
+/** Every doc comment in a source file, in order. */
+function docComments(source: string): string[] {
+  return [...source.matchAll(/\/\*\*[\s\S]*?\*\//g)].map((match) => match[0])
+}
 
-  // (2) WHAT REPLACED IT IS TIME-BOUND, because the evidence is a single negative sample.
-  assert.ok(
-    prose.includes('What is refused is a delegate whose backing source HAS AN ELIGIBLE ROW AT MINT TIME'),
-    'the mint no longer states the time-bound claim phase 1 actually establishes',
-  )
+/** A doc block with its comment furniture removed, so a claim can be matched as prose. */
+function asProse(block: string): string {
+  return block.replace(/\n\s*\*/g, ' ').replace(/\s+/g, ' ').trim()
+}
 
-  // (3) THE RESIDUE IS DECLARED, AND THE EMPTY-SOURCE CASE IS NAMED IN IT.
-  assert.ok(
-    prose.includes('these five are the residue'),
-    'the residue list no longer says how many residues there are',
-  )
-  assert.ok(
-    prose.includes('e. A READ-THROUGH DELEGATE WHOSE BACKING SOURCE IS EMPTY WHEN IT IS MINTED'),
-    'the fifth limitation — the case Codex r29 found — is no longer declared',
-  )
-  assert.ok(
-    prose.includes('NONE OF (a)-(e) IS REACHABLE BY ACCIDENT OR IN ONE LINE'),
-    'the closing summary still counts four residues',
-  )
-
-  // (4) AND THE CHECK THAT COVERS IT IS NAMED WHERE THE LIMITATION IS DECLARED, so a reader who
-  // reaches (e) is told what stands between it and a real customer row.
-  assert.ok(
-    prose.includes('refuseSweptRowsFromOutsideTheStore'),
-    'the mint contract no longer points at the drain-time check that covers residue (e)',
-  )
+/**
+ * The one doc comment carrying `anchor`. Exactly one: an anchor that matches none means the site
+ * was renamed or deleted (which must fail, not silently check nothing), and one that matches
+ * several means the anchor no longer identifies a site.
+ */
+function locateClaimSiteBlock(source: string, site: { name: string; anchor: string }): string {
+  const matching = docComments(source).filter((block) => block.includes(site.anchor))
   assert.equal(
-    [...source.matchAll(/refuseSweptRowsFromOutsideTheStore\(/g)].length,
+    matching.length,
+    1,
+    `${site.name}: its anchor (${site.anchor}) matched ${matching.length} doc comments, not 1 — the site `
+    + 'was renamed, moved or deleted, so nothing below checked the claim it is supposed to state',
+  )
+  assert.ok(
+    asProse(matching[0]).length > 600,
+    `${site.name}: its doc block is only ${asProse(matching[0]).length} characters, which is not the `
+    + 'contract this guard is reading — a stub would satisfy the absence checks below by holding no '
+    + 'prose at all',
+  )
+  return matching[0]
+}
+
+function locateClaimSite(source: string, site: { name: string; anchor: string }): string {
+  return asProse(locateClaimSiteBlock(source, site))
+}
+
+/**
+ * The ONE comment carrying `anchor` — the enclosing doc block, or the contiguous run of `//` lines.
+ * Structural, not a character window: a promise two comments away is a different statement.
+ */
+function commentContaining(source: string, anchor: string): string {
+  const enclosing = docComments(source).filter((block) => block.includes(anchor))
+  if (enclosing.length === 1) return asProse(enclosing[0])
+  assert.equal(enclosing.length, 0, `the anchor "${anchor}" is in ${enclosing.length} doc comments`)
+  const lines = source.split('\n')
+  const at = lines.findIndex((line) => line.includes(anchor))
+  assert.notEqual(at, -1, `the anchor "${anchor}" is in no comment and no line of the file`)
+  const isComment = (line: string | undefined) => line !== undefined && /^\s*\/\//.test(line)
+  assert.ok(isComment(lines[at]), `the anchor "${anchor}" is not on a comment line`)
+  let first = at
+  while (isComment(lines[first - 1])) first -= 1
+  let last = at
+  while (isComment(lines[last + 1])) last += 1
+  return lines.slice(first, last + 1).join(' ').replace(/\s*\/\/\s*/g, ' ').replace(/\s+/g, ' ').trim()
+}
+
+/** Sentences, with double-quoted spans removed — see (i) above for why. */
+function claimSentences(prose: string): string[] {
+  return prose
+    .replace(/"[^"]*"/g, ' ')
+    .split(/(?<=\.)\s+(?=[A-Z"`([])/)
+    .map((sentence) => sentence.trim())
+    .filter((sentence) => sentence.length > 0)
+}
+
+/** A sentence whose subject is a delegate that reads a database as well as its array. */
+const DATABASE_READING_DELEGATE = /also (?:reads|serves) a database|database-serving delegate|read-through delegate/i
+/** A sentence that says such a delegate does not get through. */
+const ASSERTS_A_REFUSAL = /refus/i
+/** The bound r30 added and r31 is making agree everywhere: the sample is taken once, at mint time. */
+const MINT_TIME_BOUND = /at mint time|at that instant|right now|negative sample|point-in-time/i
+/** The corrected claim, stated positively. Every site must carry it. */
+const CORRECTED_CLAIM = /(?:has|holds) an eligible row at mint time/i
+
+const COUNT_WORDS = new Map<string, number>([
+  ['one', 1], ['two', 2], ['three', 3], ['four', 4], ['five', 5],
+  ['six', 6], ['seven', 7], ['eight', 8], ['nine', 9],
+])
+/** Words that make a nearby number a statement about HOW MANY RESIDUES there are. */
+const RESIDUE_COUNT_CONTEXT = /residues?\b|limitations?\b|\(a\)-\(|are named in the mint|full list of|are filed\b/i
+/** …and about how many properties the mint establishes. */
+const PROPERTY_COUNT_CONTEXT = /checkable propert/i
+
+/** Every number word in `prose` whose immediate surroundings make it a count of `context`. */
+function statedCounts(prose: string, context: RegExp): { value: number; quote: string }[] {
+  const words = [...COUNT_WORDS.keys()].join('|')
+  return [...prose.matchAll(new RegExp(`\\b(${words})\\b`, 'gi'))].flatMap((match) => {
+    const at = match.index
+    const window = prose.slice(Math.max(0, at - 30), at + match[0].length + 30)
+    if (!context.test(window)) return []
+    return [{ value: COUNT_WORDS.get(match[0].toLowerCase())!, quote: window.trim() }]
+  })
+}
+
+const OUTBOX_SOURCE = readFileSync(fileURLToPath(new URL('../lib/email-outbox.ts', import.meta.url)), 'utf8')
+
+/**
+ * The four sites, each anchored on words from its own heading. The mint contract is the one that
+ * carries the lettered residue list, so it is also where the expected COUNT comes from.
+ */
+const CLAIM_SITES = [
+  { name: 'the module header', anchor: 'WHY THE CLAIM CARRIES A TOKEN AND EVERY TERMINAL WRITE IS AN updateMany' },
+  { name: 'the `EmailOutboxHarness` design history', anchor: 'AND THE MINT NOW SAYS IT IS BEST-EFFORT, IN THOSE WORDS' },
+  { name: 'the `IN_MEMORY_PROOFS` contract', anchor: 'ONE DELEGATE\'S PROOF THAT ITS READS ARE ANSWERED OUT OF' },
+  { name: 'the `createEmailOutboxHarnessClient` contract', anchor: 'THIS IS A BEST-EFFORT CHECK, AND HERE IS EXACTLY WHERE THE LINE FALLS' },
+] as const
+
+const MINT_CONTRACT_SITE = CLAIM_SITES[3]
+
+/** The residue list read off itself: its lettered items, in order, from the mint contract. */
+function residueListLetters(): string[] {
+  const prose = locateClaimSite(OUTBOX_SOURCE, MINT_CONTRACT_SITE)
+  const from = prose.indexOf('are the residue:')
+  const to = prose.indexOf('NONE OF (')
+  assert.ok(from !== -1, 'the mint contract no longer introduces its residue list with "are the residue:"')
+  assert.ok(to > from, 'the mint contract no longer closes its residue list with a "NONE OF (…)" summary')
+  const list = prose.slice(from, to)
+  const letters = [...list.matchAll(/(?:^|\s)([a-z])\. [A-Z]/g)].map((match) => match[1])
+  assert.ok(letters.length > 0, 'no lettered residue items were found, so the expected count came from nowhere')
+  assert.deepEqual(
+    letters,
+    letters.map((_, index) => String.fromCharCode(97 + index)),
+    `the residue items are lettered ${letters.join(', ')} — not a contiguous run from "a", so "how many `
+    + 'residues are there" has no single answer for the other sites to agree with',
+  )
+  return letters
+}
+
+/** …and the numbered establishments, the same way. */
+function establishmentNumbers(): number[] {
+  const prose = locateClaimSite(OUTBOX_SOURCE, MINT_CONTRACT_SITE)
+  const from = prose.indexOf('not descriptions of an intention:')
+  const to = prose.indexOf('WHAT IT DOES NOT ESTABLISH')
+  assert.ok(from !== -1 && to > from, 'the mint contract no longer delimits its list of what it establishes')
+  const numbers = [...prose.slice(from, to).matchAll(/(?:^|\s)(\d)\. [A-Z]/g)].map((match) => Number(match[1]))
+  assert.deepEqual(numbers, numbers.map((_, index) => index + 1), `the establishments are numbered ${numbers.join(', ')}`)
+  assert.ok(numbers.length > 0, 'no numbered establishments were found')
+  return numbers
+}
+
+for (const site of CLAIM_SITES) {
+  test(`r31: ${site.name} states the mint-time bound, and overclaims nowhere in it`, () => {
+    const prose = locateClaimSite(OUTBOX_SOURCE, site)
+    const sentences = claimSentences(prose)
+    assert.ok(sentences.length > 3, `${site.name}: only ${sentences.length} sentence(s) were parsed out of it`)
+
+    // (1) THE CORRECTED CLAIM IS HERE — and it is a REFUSAL sentence, not a stray qualifier sitting
+    // in a paragraph of its own while the claim it bounds is stated unbounded somewhere else.
+    const corrected = sentences.filter((sentence) => CORRECTED_CLAIM.test(sentence))
+    assert.ok(
+      corrected.length > 0,
+      `${site.name}: does not state the corrected claim ("…has/holds an eligible row at mint time"). `
+      + `Sentences searched: ${sentences.length}`,
+    )
+    for (const sentence of corrected) {
+      assert.match(
+        sentence,
+        ASSERTS_A_REFUSAL,
+        `${site.name}: states the mint-time bound in a sentence that does not say what it bounds `
+        + `(a refusal): ${JSON.stringify(sentence)}`,
+      )
+    }
+
+    // (2) AND NO SENTENCE HERE ASSERTS THE UNBOUNDED CLAIM. This is the shape r30 left in two of the
+    // four sites: the subject is a delegate that also reads a database, the predicate is that it is
+    // refused, and there is no "at mint time" anywhere in the sentence.
+    const unbounded = sentences.filter(
+      (sentence) => DATABASE_READING_DELEGATE.test(sentence)
+        && ASSERTS_A_REFUSAL.test(sentence)
+        && !MINT_TIME_BOUND.test(sentence),
+    )
+    assert.deepEqual(
+      unbounded,
+      [],
+      `${site.name}: ${unbounded.length} sentence(s) here say a database-reading delegate is refused `
+      + 'without the mint-time bound, which is more than phase 1 establishes — it is ONE negative '
+      + `sample: ${JSON.stringify(unbounded)}`,
+    )
+
+    // (3) AND EVERY RESIDUE COUNT IT STATES AGREES WITH THE LIST. The expected number is read off the
+    // lettered items in the mint contract, so the four sites cannot drift apart: they are all
+    // checked against the same list, and the list is the thing being described.
+    const expected = residueListLetters().length
+    const counts = statedCounts(prose, RESIDUE_COUNT_CONTEXT)
+    assert.ok(
+      counts.length > 0,
+      `${site.name}: states no residue count at all, so a reader here is not told how many there are `
+      + 'and this assertion checked nothing',
+    )
+    for (const count of counts) {
+      assert.equal(
+        count.value,
+        expected,
+        `${site.name}: states ${count.value} residue(s) where the list itself has ${expected} `
+        + `(a–${String.fromCharCode(96 + expected)}): "${count.quote}"`,
+      )
+    }
+  })
+}
+
+test('r31: the residue list, the establishment list and every count of them agree across the module', () => {
+  // The per-site counts above are checked against this list, so the four sites cannot drift apart from
+  // each other. THIS test pins the list's own length, once and in one place, so that adding or
+  // dropping a residue is a decision somebody makes here rather than a number that quietly disagrees
+  // with four paragraphs. It also covers the statements of the count that are not number words: the
+  // "(a)-(x)" ranges and the count of properties the contract numbers.
+  const letters = residueListLetters()
+  assert.equal(letters.length, 5, `the residue list has ${letters.length} items; r30 declared the fifth`)
+  const lastLetter = letters[letters.length - 1]
+
+  // EVERY "(a)-(x)" RANGE IN THE MODULE, and each is one of exactly two legitimate things: a summary
+  // of the WHOLE list (so x is its last letter), or, inside residue (n), a reference to the items
+  // BEFORE it (so x is n's predecessor — residue (e) says "(a)-(d) do not cover it"). Which one a
+  // range is, is decided by the residue item it stands in, read off the headings rather than guessed
+  // from how near it sits to one.
+  const block = locateClaimSiteBlock(OUTBOX_SOURCE, MINT_CONTRACT_SITE)
+  const headings = [...block.matchAll(/\n\s*\*\s+([a-z])\. [A-Z]/g)].map((match) => ({ letter: match[1], at: match.index }))
+  assert.deepEqual(headings.map((heading) => heading.letter), letters, 'the residue headings do not agree with the list')
+  const ranges = [...OUTBOX_SOURCE.matchAll(/\(a\)-\(([a-z])\)/g)]
+  assert.ok(ranges.length > 0, 'no "(a)-(x)" range over the residue list was found anywhere in the module')
+  for (const range of ranges) {
+    const inBlock = block.indexOf(range[0])
+    assert.notEqual(
+      inBlock,
+      -1,
+      `a range "${range[0]}" appears outside the mint contract, where the list it describes is not `
+      + 'declared, so nothing keeps it in step with the list',
+    )
+    const standsIn = headings.filter((heading) => heading.at < inBlock).pop()
+    const namesPrecedingItems = standsIn !== undefined
+      && standsIn.letter === String.fromCharCode(range[1].charCodeAt(0) + 1)
+    assert.ok(
+      range[1] === lastLetter || namesPrecedingItems,
+      `"${range[0]}" in residue (${standsIn?.letter ?? 'none'}) is neither a summary of the whole list `
+      + `(which runs a–${lastLetter}) nor a reference to the items before the one it stands in`,
+    )
+  }
+
+  const properties = establishmentNumbers().length
+  const stated = statedCounts(asProse(OUTBOX_SOURCE), PROPERTY_COUNT_CONTEXT)
+  assert.ok(stated.length > 0, 'nothing in the module states how many properties the mint establishes')
+  for (const count of stated) {
+    assert.equal(
+      count.value,
+      properties,
+      `a site states ${count.value} checkable propert(ies) where the mint contract lists ${properties}: "${count.quote}"`,
+    )
+  }
+
+  // AND THE FIFTH RESIDUE IS STILL THE CASE CODEX r29 FOUND, named where it is declared, with the
+  // drain-time check that covers it pointed at from there. A renamed residue (e) that no longer
+  // describes the empty-at-mint read-through delegate would satisfy the counts above and nothing else.
+  const mintContract = locateClaimSite(OUTBOX_SOURCE, MINT_CONTRACT_SITE)
+  assert.match(mintContract, /e\. A READ-THROUGH DELEGATE WHOSE BACKING SOURCE IS EMPTY WHEN IT IS MINTED/)
+  assert.match(mintContract, /refuseSweptRowsFromOutsideTheStore/)
+  assert.equal(
+    [...OUTBOX_SOURCE.matchAll(/refuseSweptRowsFromOutsideTheStore\(/g)].length,
     2,
     'the sweep-time provenance check is not called exactly once (plus its own definition)',
   )
+})
+
+test('r31: the enqueue contract says a delivery is QUEUED, not that one will happen', () => {
+  // Codex r30 MEDIUM 1. `already_queued` establishes only that a matching PENDING or PROCESSING row
+  // exists. That row may already be on the wire, and it may still end FAILED — the recipient is
+  // suppressed, the send fails permanently, or the attempt budget is spent. "WILL be delivered" was
+  // therefore the same overclaim this branch removed from the operator-facing incident records
+  // (tests/accounting/qbo-invoice-email-queued-not-sent.test.ts asserts its absence there), left
+  // standing in the enqueue contract and in the action comment that quotes it.
+  const sites = [
+    {
+      name: 'the `QueueEmailOutcome` contract',
+      file: '../lib/email-outbox.ts',
+      anchor: '`already_queued` is not a failure',
+      required: [/IS ALREADY QUEUED/, /NOT A PROMISE OF DELIVERY/, /may still end FAILED/],
+    },
+    {
+      name: 'the operator action that reports it',
+      file: '../app/actions/email.ts',
+      anchor: 'comes back as `already_queued`',
+      required: [/already QUEUED/, /not necessarily delivered/],
+    },
+  ]
+  // THE EXACT OVERCLAIM IS FORBIDDEN IN THE WHOLE FILE; the looser phrasings are forbidden IN THE
+  // COMMENT THAT DOCUMENTS THE OUTCOME, because elsewhere in these files they are about other
+  // subjects entirely (a refusal "on its way out of here", for one).
+  const nowhereInTheFile = [/will be delivered/i, /guaranteed to be delivered/i]
+  const notInThisComment = [/on its way/i, /is already (?:being )?sent/i]
+
+  for (const site of sites) {
+    const source = readFileSync(fileURLToPath(new URL(site.file, import.meta.url)), 'utf8')
+    const comment = commentContaining(source, site.anchor)
+    assert.ok(
+      comment.length > 120,
+      `${site.name}: the comment carrying its anchor is ${comment.length} characters, which is not the `
+      + 'contract this guard is reading',
+    )
+    for (const required of site.required) {
+      assert.match(comment, required, `${site.name}: no longer says what the row actually establishes`)
+    }
+    for (const promise of [...nowhereInTheFile, ...notInThisComment]) {
+      assert.doesNotMatch(
+        comment,
+        promise,
+        `${site.name}: promises delivery from an enqueue outcome that establishes only that a delivery `
+        + 'is QUEUED — the row may already be on the wire, and it may still end FAILED',
+      )
+    }
+    for (const promise of nowhereInTheFile) {
+      assert.doesNotMatch(source, promise, `${site.file}: promises an enqueued email's delivery somewhere in it`)
+    }
+  }
 })
 
 test('r30: a claim read-back that FAILS is an answer, not a thrown diagnostic', async () => {
