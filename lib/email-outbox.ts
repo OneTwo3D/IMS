@@ -1243,10 +1243,21 @@ export type ProcessEmailOutboxResult = {
   sent: number
   failed: number
   /**
-   * Rows this worker claimed, HANDED TO THE SENDER, and was then refused the terminal write for,
-   * because another worker had reclaimed the row AFTER this one had entered the sender. Non-zero
-   * means a duplicate send almost certainly went out — it is the only signal that says so, and it
-   * used to be silent (the unfenced `update` simply landed).
+   * Rows this worker claimed, HANDED TO THE SENDER, and was then refused the terminal write for
+   * WITH ANOTHER WORKER'S RECLAIM ESTABLISHED — the row read back holding someone else's token, or
+   * holding no claim at all when every write this worker issued had answered. Non-zero means a
+   * duplicate send almost certainly went out — it is the only signal that says so, and it used to be
+   * silent (the unfenced `update` simply landed).
+   *
+   * "ESTABLISHED", AND THAT IS THE WHOLE OF ROUND 33's MEDIUM. This counter used to be incremented
+   * for every refused post-send terminal write, including the four diagnoses that establish NO
+   * rival: a settlement write whose answer was lost (this worker's own write may be what settled the
+   * row), a row still carrying this worker's own token (rewritten under the claim — explicitly not a
+   * reclaim), a row that is gone, and a read-back that failed. `describeClaimLoss` has said so in
+   * WORDS since r30; the NUMBER went on asserting a takeover, so an operator reading telemetry was
+   * told a rival existed and a duplicate was probable where the diagnosis refused to say either.
+   * Those four are counted in `unresolvedAfterSend` now. `establishesAReclaim` is the single
+   * decision, and it is an exhaustive switch, so a new `ClaimLoss` kind cannot default into here.
    *
    * "AFTER IT ENTERED THE SENDER", NOT "WHILE IT WAS ON THE SMTP SOCKET" (r22). Both readings used
    * to be written here, and the second is false on the two paths r22 added arms for: the suppression
@@ -1263,13 +1274,37 @@ export type ProcessEmailOutboxResult = {
    */
   conflicted: number
   /**
-   * Rows this worker claimed and lost BEFORE it attempted a send, so the terminal write was
-   * refused with nothing ever handed to the sender. THIS WORKER PUT NOTHING ON THE WIRE and no
-   * duplicate delivery follows from it; the row belongs to whoever settled it. Worth counting
-   * rather than dropping: it measures claim contention, which is the same signal `conflicted`
-   * carries minus the delivery consequence.
+   * Rows this worker claimed and lost BEFORE it attempted a send, WITH ANOTHER WORKER'S RECLAIM
+   * ESTABLISHED the same way. THIS WORKER PUT NOTHING ON THE WIRE and no duplicate delivery follows
+   * from it; the row belongs to whoever settled it. Worth counting rather than dropping: it measures
+   * claim contention, which is the same signal `conflicted` carries minus the delivery consequence.
    */
   conflictedWithoutSend: number
+  /**
+   * Rows this worker claimed, HANDED TO THE SENDER, and was then refused the terminal write for
+   * WITH NO RECLAIM ESTABLISHED. A message may be on the wire — the sender was entered — and
+   * whether a SECOND copy follows is UNKNOWN from here, which is exactly why these are not counted
+   * as reclaims: nothing read back says another worker was ever involved.
+   *
+   * WHAT IT IS HONESTLY A COUNT OF: refused post-send terminal writes whose cause this drain could
+   * not attribute. It is a count of MISSING EVIDENCE, not of contention, and it is worth having for
+   * that reason — a rising `unresolvedAfterSend` with `conflicted` at zero is a connection or
+   * read-back problem, and reporting it as a takeover hid exactly that. Each one is logged with the
+   * diagnosis that produced it (`describeClaimLoss`), so the four cases stay distinguishable in the
+   * log even though they share a counter.
+   */
+  unresolvedAfterSend: number
+  /**
+   * The same, for a claim lost BEFORE any send was attempted: NO RECLAIM ESTABLISHED, and nothing was
+   * handed to the sender either, so no duplicate delivery follows from it whatever the cause.
+   *
+   * THE QUIETEST OF THE FOUR, AND STILL WORTH ITS OWN COUNT. Nothing was delivered and nothing was
+   * attributed, so there is no incident here to chase — which is precisely why it must not be added
+   * to either `conflicted*`: folding it in would inflate the contention signal with rows on which no
+   * contention was observed, and folding it into `unresolvedAfterSend` would claim a message may be
+   * on the wire when none was. Its own diagnosis is in the log line for each row.
+   */
+  unresolvedWithoutSend: number
 }
 
 function normalizeEmail(value: string): string {
@@ -1766,7 +1801,15 @@ export async function processPendingEmailOutbox(
   } = resolveEmailOutboxDependencies(options)
 
   const staleCutoff = new Date(now().getTime() - EMAIL_CLAIM_STALE_MS)
-  const result: ProcessEmailOutboxResult = { processed: 0, sent: 0, failed: 0, conflicted: 0, conflictedWithoutSend: 0 }
+  const result: ProcessEmailOutboxResult = {
+    processed: 0,
+    sent: 0,
+    failed: 0,
+    conflicted: 0,
+    conflictedWithoutSend: 0,
+    unresolvedAfterSend: 0,
+    unresolvedWithoutSend: 0,
+  }
 
   /**
    * HOW FAR THIS ROW GOT — THE ONE PLACE THAT KNOWS, AND THE ONLY THING THE `catch` IS ALLOWED TO
@@ -1994,9 +2037,14 @@ export async function processPendingEmailOutbox(
    *   THE ROW IS GONE, or the read FAILS — said plainly, because "I could not tell" is a better
    *     operator message than a confident wrong one.
    *
-   * THE COUNTERS ARE UNCHANGED AND SO IS WHAT THEY COUNT: a terminal write that matched no row,
-   * split by whether the sender had been ENTERED. Neither counter asserts that a rival existed —
-   * that claim lives in the sentence, and the sentence now only makes it when the row says so.
+   * AND SINCE ROUND 33 THE COUNTERS READ THIS DIAGNOSIS TOO. r30 left them alone and said so here:
+   * "a terminal write that matched no row, split by whether the sender had been ENTERED. Neither
+   * counter asserts that a rival existed — that claim lives in the sentence." The first half was
+   * true and the second was not, because `ProcessEmailOutboxResult` and the activity summary and the
+   * help documentation all DID define those counts as another worker taking over. One meaning stated
+   * in three places and corrected in one is how that survived. So the split is now two-dimensional
+   * — sender ENTERED or not, reclaim ESTABLISHED or not — and `establishesAReclaim` below is the one
+   * place that decides the second axis, off the same five readings listed above.
    */
   type ClaimLoss =
     | { kind: 'held-by-another'; holder: string }
@@ -2005,6 +2053,31 @@ export async function processPendingEmailOutbox(
     | { kind: 'still-carries-this-claim' }
     | { kind: 'row-gone' }
     | { kind: 'unreadable'; why: string }
+
+  /**
+   * DOES THIS DIAGNOSIS ESTABLISH THAT ANOTHER WORKER HOLDS OR HELD THIS CLAIM? (round 33, Codex
+   * MEDIUM.) The one place that answers, for the sentence AND for the counters, so the two cannot
+   * disagree the way they did between r30 and r33.
+   *
+   * EXHAUSTIVE ON PURPOSE — a `switch` with no `default`, returning from every arm, so adding a
+   * seventh `ClaimLoss` kind is a TYPE ERROR here rather than a silent `false` or a silent takeover
+   * count. The two `true` arms are the two readings in which the ROW ITSELF names a rival: someone
+   * else's token is on it, or no token is on it and every write this worker issued came back (so
+   * nothing this worker did can be what released it). The four `false` arms are the ones the
+   * diagnosis above explicitly refuses to attribute.
+   */
+  const establishesAReclaim = (loss: ClaimLoss): boolean => {
+    switch (loss.kind) {
+      case 'held-by-another':
+      case 'settled-by-another':
+        return true
+      case 'settled-outcome-unknown':
+      case 'still-carries-this-claim':
+      case 'row-gone':
+      case 'unreadable':
+        return false
+    }
+  }
 
   const diagnoseClaimLoss = async (claim: EmailClaim, smtp: RowProgress): Promise<ClaimLoss> => {
     let rows: EmailOutboxRow[]
@@ -2082,8 +2155,13 @@ export async function processPendingEmailOutbox(
 
   const recordConflict = async (claim: EmailClaim, phase: string, smtp: RowProgress): Promise<void> => {
     const loss = await diagnoseClaimLoss(claim, smtp)
+    // WHICH COUNTER, decided by the diagnosis and not by the refusal (round 33, Codex MEDIUM). A
+    // refused terminal write is one fact; "another worker took the row" is a different one, and only
+    // two of the six readings establish it. The sentence printed below has said so since r30.
+    const reclaimed = establishesAReclaim(loss)
     if (smtp.attempted) {
-      result.conflicted++
+      if (reclaimed) result.conflicted++
+      else result.unresolvedAfterSend++
       console.error(
         `[email-outbox] row ${claim.id}: terminal write REFUSED after ${phase} — `
         // NOT "while this one was on the SMTP socket" (r22). That sentence was written when the only
@@ -2097,7 +2175,8 @@ export async function processPendingEmailOutbox(
       )
       return
     }
-    result.conflictedWithoutSend++
+    if (reclaimed) result.conflictedWithoutSend++
+    else result.unresolvedWithoutSend++
     console.error(
       `[email-outbox] row ${claim.id}: terminal write REFUSED after ${phase} — `
       + `${describeClaimLoss(claim, loss, 'BEFORE this one attempted any send')} (o3d-alnk). `
@@ -2269,8 +2348,14 @@ export async function processPendingEmailOutbox(
       entityType: 'SYSTEM',
       action: 'email_outbox_processed',
       tag: 'system',
-      description: `Email outbox: ${result.sent} sent, ${result.failed} failed, ${result.conflicted} fenced after a send, `
-        + `${result.conflictedWithoutSend} fenced before one, out of ${result.processed} processed`,
+      // "FENCED" WAS THE WRONG WORD FOR FOUR OF THE SIX OUTCOMES (round 33, Codex MEDIUM). It read as
+      // "another worker took this row over", which is what `conflicted*` now means and what the other
+      // two counts explicitly do NOT. The label says which is which, in the same words as
+      // `ProcessEmailOutboxResult` and help-docs/documents-email.md.
+      description: `Email outbox: ${result.sent} sent, ${result.failed} failed, `
+        + `${result.conflicted} reclaimed after a send, ${result.conflictedWithoutSend} reclaimed before one, `
+        + `${result.unresolvedAfterSend} unresolved after a send, ${result.unresolvedWithoutSend} unresolved before one, `
+        + `out of ${result.processed} processed`,
       metadata: result,
       resolveUser: false,
     })

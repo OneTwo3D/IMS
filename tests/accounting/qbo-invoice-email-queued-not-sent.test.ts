@@ -485,6 +485,23 @@ test('r18: the sentence\'s cadences match the cron config and the cron doc, and 
     `the record's cadences do not match the repo's: sweep ${sweep[1]}, drain ${drain[1]}`,
   )
 
+  // AND NO OTHER CADENCE IS NAMED ANYWHERE IN THE RECORD (round 33). The match above is EXISTENTIAL:
+  // it finds the corrected sentence and says nothing about a second cadence sentence sitting beside
+  // it, which is the whole-file weakness round 33's HIGH was about. This arm is UNIVERSAL over the
+  // rendered record — every cadence this walk has words for, other than the two it resolved, must be
+  // absent — so a stale "the drain runs every five minutes" added elsewhere in the record fails here
+  // instead of being excused by the corrected sentence.
+  const namedCadences = new Set([sweepWords, drainWords])
+  for (const words of new Set([...Object.values(SWEEP_CADENCE_WORDS), ...Object.values(DRAIN_CADENCE_WORDS)])) {
+    if (namedCadences.has(words)) continue
+    assert.doesNotMatch(
+      description,
+      new RegExp(words),
+      `the record names the cadence "${words}", which is neither the sweep's (${sweepWords}) nor the `
+      + `drain's (${drainWords}) — one of the two statements in it is stale and a reader cannot tell which`,
+    )
+  }
+
   // And the two round-16 claims are gone rather than merely joined by a correction.
   assert.doesNotMatch(description, /empties PENDING in minutes/)
   assert.doesNotMatch(description, /each sweep finds nothing undelivered and queues one more/)
@@ -570,6 +587,146 @@ const CITATIONS: Array<{ citedIn: string; citation: string; resolvesIn: string; 
   },
 ]
 
+// ---------------------------------------------------------------------------
+// ROUND 33 (Codex HIGH) — THE CADENCE GUARD WAS WHOLE-FILE, WHICH IS THE DEFECT IT EXISTS TO CATCH.
+//
+// Section (4) below used to be a loop of `text.includes(...)` over each file ENTIRE. So it passed
+// while `outbox-registry.ts` said, in the INVOICE_EMAIL counterexample paragraph, that worker B
+// reclaims after FIFTEEN MINUTES and that "Both are delivered" — because the SAME FILE, forty lines
+// further down, established the window as TWENTY MINUTES and established that the partial index
+// refuses B unless the timing crosses a drain. A whole-file `includes` cannot tell "the file states
+// the corrected claim" from "the file states the corrected claim SOMEWHERE, next to the stale one":
+// the stale claim and its own correction both live in the file, and every assertion was satisfied by
+// the correction while a reader met the staleness first. That is the third round in a row this exact
+// shape has got through, so the guard is converted rather than patched.
+//
+// SO THE UNIT OF CHECKING IS THE PARAGRAPH, NOT THE FILE — the same treatment round 31 gave the
+// four-site residue claims in tests/email-outbox-claim-fence.test.ts. Each site is one comment
+// PARAGRAPH, located by an anchor that must match EXACTLY ONE paragraph and whose block must be a
+// substantial one, and at that site:
+//   * A SENTENCE THERE STATES THE CORRECTED CLAIM — the duplicate needs the timing to CROSS A DRAIN
+//     — and every sentence that says "crosses a drain" is a sentence about the duplicate, so the
+//     qualifier cannot be stranded in a paragraph away from the claim it qualifies;
+//   * NO SENTENCE THERE ASSERTS AN UNCONDITIONAL SECOND DELIVERY. "Both are delivered", with no
+//     drain condition in the same sentence, is refused AT THAT SITE rather than excused by a
+//     correction elsewhere in the file;
+//   * NO SENTENCE THERE NAMES A RECLAIM WINDOW OTHER THAN THE RESOLVED ONE, in either case. The
+//     LEASE is legitimately fifteen minutes, so the exception is stated as a property of the
+//     sentence: a sentence naming other-window words must be a sentence about the LEASE.
+//
+// AND THE CLAIM IS MADE ONLY AT THOSE SITES. A file-wide sweep requires every paragraph of these two
+// files that names ANY reclaim-window words to be one of the located sites (or to be about the
+// lease), so a window claim that drifts into an unwatched paragraph fails here instead of being a
+// fourth round of the same finding.
+//
+// WHAT THIS DOES NOT ESTABLISH, stated because that is what this round is about. (i) Double-quoted
+// spans are removed before sentences are examined, because quoting is how these files DISOWN a claim
+// ("This used to say …"); an overclaim written inside double quotes would pass. (ii) The sweep is
+// over WINDOW WORDS only, not over delivery claims, so a paragraph outside the three sites that
+// asserts an unconditional second delivery while naming no window at all is not reached — the
+// stale-park test's own "Round 3 asserted that … and both are delivered" paragraph is exactly that
+// shape, and it is past-tense disowning rather than asserting. (iii) It is a check on WORDING. That
+// the wording is TRUE of the code is what sections (1)-(3) above establish, out of the constants.
+
+/** Every PARAGRAPH of comment prose in a file: a run of comment lines, split on blank comment lines. */
+function commentParagraphs(source: string): string[] {
+  const paragraphs: string[] = []
+  let current: string[] = []
+  const flush = () => {
+    const prose = current.join(' ').replace(/\s+/g, ' ').trim()
+    if (prose.length > 0) paragraphs.push(prose)
+    current = []
+  }
+  for (const line of source.split('\n')) {
+    const comment = /^\s*(?:\/\/+|\/\*\*?|\*\/|\*)\s?(.*)$/.exec(line)
+    if (!comment) {
+      flush()
+      continue
+    }
+    const text = comment[1].replace(/\*\/\s*$/, '').trim()
+    if (text.length === 0) {
+      flush()
+      continue
+    }
+    current.push(text)
+  }
+  flush()
+  return paragraphs
+}
+
+/** Sentences of a paragraph, with double-quoted spans removed — see (i) above for why. */
+function windowSentences(prose: string): string[] {
+  return prose
+    .replace(/"[^"]*"/g, ' ')
+    .split(/(?<=\.)\s+(?=[A-Z"`([])/)
+    .map((sentence) => sentence.trim())
+    .filter((sentence) => sentence.length > 0)
+}
+
+/** A sentence that says a second copy of the email goes out. */
+const ASSERTS_A_SECOND_DELIVERY =
+  /both are delivered|both were delivered|both get delivered|delivered twice|emailed twice|emailed a second time|a second (?:copy|email) (?:is|was) delivered/i
+/** …and the condition the corrected claim puts on it. */
+const DRAIN_CONDITION = /crosses a drain|once a drain|after a drain|when the timing|outside the predicate/i
+/** The corrected claim itself, as both copies state it. */
+const CROSSES_A_DRAIN = /crosses a drain/i
+/** A sentence that is about the duplicate, whatever words it uses. */
+const ABOUT_THE_DUPLICATE = /duplicate|second (?:row|copy|email|time)|emailed a second|invoice twice/i
+/** A sentence whose subject is the LEASE rather than the reclaim window. */
+const ABOUT_THE_LEASE = /lease/i
+
+/**
+ * The PARAGRAPHS that state this rationale. Two copies of it, three paragraphs: the counterexample
+ * that tells the duplication story, and — in each file — the paragraph that derives the window from
+ * the constants. The story paragraph is the one round 33 found stale; it is a site precisely because
+ * it makes the claim, and a paragraph that makes the claim has to carry the bound on it.
+ */
+const WINDOW_CLAIM_SITES = [
+  {
+    name: 'outbox-registry.ts, the INVOICE_EMAIL counterexample paragraph',
+    file: 'lib/domain/integrations/outbox-registry.ts',
+    anchor: 'INVOICE_EMAIL is the counterexample that decides the entry',
+    derivesTheWindow: false,
+  },
+  {
+    name: 'outbox-registry.ts, the cadence derivation (database fact 1)',
+    file: 'lib/domain/integrations/outbox-registry.ts',
+    anchor: 'THE CADENCES IN THIS PARAGRAPH WERE THE WRONG WAY ROUND',
+    derivesTheWindow: true,
+  },
+  {
+    name: 'outbox-stale-park.concurrent.test.ts, the cadence derivation',
+    file: 'tests/concurrency/outbox-stale-park.concurrent.test.ts',
+    anchor: 'Those come apart at the only moment that matters',
+    derivesTheWindow: true,
+  },
+] as const
+
+/** The one paragraph of `source` carrying `anchor`. Exactly one, and a substantial one. */
+function locateWindowSite(
+  source: string,
+  site: { name: string; anchor: string },
+): { prose: string; sentences: string[] } {
+  const matching = commentParagraphs(source).filter((prose) => prose.includes(site.anchor))
+  assert.equal(
+    matching.length,
+    1,
+    `${site.name}: its anchor (${site.anchor}) matched ${matching.length} comment paragraphs, not 1 — the `
+    + 'paragraph was rewritten, split or deleted, so nothing below checked the claim it is supposed to make',
+  )
+  assert.ok(
+    matching[0].length > 400,
+    `${site.name}: its paragraph is only ${matching[0].length} characters, which is not the rationale this `
+    + 'guard reads — a stub would satisfy the absence checks below by holding no prose at all',
+  )
+  const sentences = windowSentences(matching[0])
+  assert.ok(
+    sentences.length > 2,
+    `${site.name}: only ${sentences.length} sentence(s) were parsed out of it`,
+  )
+  return { prose: matching[0], sentences }
+}
+
 test('r22: the reclaim window is the RESOLVED constant, and BOTH copies of the rationale say so', async () => {
   const { readFileSync } = await import('node:fs')
   const { fileURLToPath } = await import('node:url')
@@ -643,70 +800,120 @@ test('r22: the reclaim window is the RESOLVED constant, and BOTH copies of the r
     `the rationale says the reclaim window (${reclaimMs}ms) is INSIDE the drain interval (${drainMs}ms); it is not, so both copies are wrong again`,
   )
 
-  // (4) BOTH COPIES, CHECKED AGAINST THAT READING — and the reversed premise gone rather than
-  // merely contradicted somewhere further down.
-  for (const relative of [
-    'lib/domain/integrations/outbox-registry.ts',
-    'tests/concurrency/outbox-stale-park.concurrent.test.ts',
-  ]) {
-    const text = read(relative)
-    // The number as this repo writes numbers — `1_200_000`, every three digits, not just the last
-    // group. The old expression only ever inserted ONE separator, which was right for 900_000 and
-    // silently wrong for anything seven digits long.
-    const grouped = String(reclaimMs).replace(/\B(?=(\d{3})+(?!\d))/g, '_')
+  // (4) BOTH COPIES, CHECKED AGAINST THAT READING — SITE BY SITE, NOT WHOLE-FILE (round 33 HIGH).
+  //
+  // See the block above WINDOW_CLAIM_SITES for why this is a walk over paragraphs: the whole-file
+  // version of this loop passed over a paragraph that said FIFTEEN MINUTES and "Both are delivered"
+  // because a later paragraph in the same file said twenty and named the drain condition.
+  const grouped = String(reclaimMs).replace(/\B(?=(\d{3})+(?!\d))/g, '_')
+  const otherWindowWords = Object.values(RECLAIM_WINDOW_WORDS).filter((words) => words !== reclaimWords)
 
-    // THE NUMBER, REQUIRED — NOT "THE NUMBER OR THE WORDS" (r22). This used to be
-    // `includes(grouped) || includes(reclaimWords)`, and round 22's own mutation showed what that
-    // buys: reverting the sentence to "900_000 ms, FIFTEEN MINUTES" left the NEXT paragraph's
-    // "TWENTY MINUTES IS INSIDE THE HOUR" standing, the `||` found the words there, and the test
-    // passed over a rationale that now stated the window twice with two different numbers. A stale
-    // claim sitting beside the text that corrects it is the shape this guard exists to catch, so
-    // BOTH halves are now required and the wrong ones are excluded.
+  for (const site of WINDOW_CLAIM_SITES) {
+    const { prose, sentences } = locateWindowSite(read(site.file), site)
+
+    // (4a) THE CORRECTED CLAIM IS STATED HERE, AND IT IS A SENTENCE ABOUT THE DUPLICATE. A "crosses a
+    // drain" qualifier in a sentence that is not about the duplicate bounds nothing.
+    const corrected = sentences.filter((sentence) => CROSSES_A_DRAIN.test(sentence))
     assert.ok(
-      text.includes(grouped),
-      `${relative} no longer states the reclaim window as ${grouped} ms — re-read it against `
-      + 'ADMIN_OUTBOX_STALE_PROCESSING_LOCK_MS, which is the max lease PLUS the post-lease margin',
+      corrected.length > 0,
+      `${site.name}: does not say the duplicate needs the timing to CROSS A DRAIN, which is the corrected `
+      + `claim. Sentences searched: ${sentences.length}`,
     )
-    assert.ok(
-      text.includes(reclaimWords),
-      `${relative} no longer states the reclaim window as ${reclaimWords}`,
-    )
-    // AND NO OTHER WINDOW IS NAMED. Every value in the words table is a window this rationale could
-    // be about; exactly one of them may appear in a file that states it. (The LEASE is written in
-    // lower case in both copies precisely so the two claims cannot be confused for one another.)
-    for (const otherWords of Object.values(RECLAIM_WINDOW_WORDS)) {
-      if (otherWords === reclaimWords) continue
-      assert.ok(
-        !text.includes(otherWords),
-        `${relative} states the reclaim window as ${otherWords} as well as ${reclaimWords} — one of the `
-        + 'two is stale, and a reader has no way to tell which',
+    for (const sentence of corrected) {
+      assert.match(
+        sentence,
+        ABOUT_THE_DUPLICATE,
+        `${site.name}: names the drain crossing in a sentence that is not about the duplicate, so the `
+        + `condition is stranded from the claim it conditions: ${JSON.stringify(sentence)}`,
       )
     }
-    assert.match(
-      text,
-      /HOURLY|documented HOURLY/,
-      `${relative} no longer states the drain cadence — the sentence this MEDIUM corrected has been rewritten`,
+
+    // (4b) AND NO SENTENCE HERE ASSERTS A SECOND DELIVERY UNCONDITIONALLY. This is the exact shape
+    // round 33 found: "…inserts a SECOND row. Both are delivered." — true only once a drain has
+    // settled the first copy, asserted here as though the reclaim alone did it.
+    const unconditional = sentences.filter(
+      (sentence) => ASSERTS_A_SECOND_DELIVERY.test(sentence) && !DRAIN_CONDITION.test(sentence),
+    )
+    assert.deepEqual(
+      unconditional,
+      [],
+      `${site.name}: ${unconditional.length} sentence(s) here assert a second delivery with no drain `
+      + 'condition in the same sentence, which is more than the partial index allows — it REFUSES B '
+      + `while A's copy is undelivered: ${JSON.stringify(unconditional)}`,
+    )
+
+    // (4c) AND NO SENTENCE HERE NAMES A WINDOW THAT IS NOT THE RESOLVED ONE. The LEASE is genuinely
+    // fifteen minutes, so the exception is a property of the SENTENCE — it has to be about the lease
+    // — and not a case-sensitivity trick that a lower-case stale claim walks straight through, which
+    // is how "fifteen minutes later worker B reclaims" survived rounds 19 to 32.
+    for (const words of otherWindowWords) {
+      const naming = sentences.filter((sentence) => sentence.toUpperCase().includes(words))
+      for (const sentence of naming) {
+        assert.match(
+          sentence,
+          ABOUT_THE_LEASE,
+          `${site.name}: names ${words} in a sentence that is not about the lease, so it is naming a `
+          + `reclaim window that is not the resolved ${reclaimWords}: ${JSON.stringify(sentence)}`,
+        )
+      }
+    }
+    assert.ok(
+      prose.toUpperCase().includes(reclaimWords),
+      `${site.name}: no longer states the reclaim window as ${reclaimWords}`,
+    )
+
+    // (4d) THE REVERSED PREMISE IS GONE FROM THIS SITE — not merely contradicted further down it.
+    assert.doesNotMatch(
+      prose,
+      /the email drain empties PENDING inside it|empties PENDING far faster than/,
+      `${site.name}: still says the drain empties PENDING inside the reclaim window`,
     )
     assert.doesNotMatch(
-      text,
-      /the email drain empties\s*\n?\s*(\*|\/\/)?\s*PENDING inside it/,
-      `${relative} still says the drain empties PENDING inside the reclaim window`,
-    )
-    assert.doesNotMatch(
-      text,
-      /empties PENDING far faster than/,
-      `${relative} still says the drain empties PENDING faster than the reclaim window`,
-    )
-    assert.doesNotMatch(
-      text,
+      prose,
       /A's copy is typically already SENT|has typically already been DELIVERED/,
-      `${relative} still claims the first copy is typically delivered by the time the replay lands`,
+      `${site.name}: still claims the first copy is typically delivered by the time the replay lands`,
+    )
+
+    // (4e) AND THE DERIVING SITES DERIVE IT: the number as this repo writes numbers, and the drain
+    // cadence that the ordering in (3) rests on. The counterexample paragraph is not required to
+    // restate either — it is required to point at the paragraph that does, which (4a) covers by
+    // making it carry the conclusion.
+    if (!site.derivesTheWindow) continue
+    assert.ok(
+      prose.includes(grouped),
+      `${site.name}: no longer states the reclaim window as ${grouped} ms — re-read it against `
+      + 'ADMIN_OUTBOX_STALE_PROCESSING_LOCK_MS, which is the max lease PLUS the post-lease margin',
     )
     assert.match(
-      text,
-      /crosses a drain|CROSSES A DRAIN/,
-      `${relative} no longer says the duplicate needs the timing to cross a drain, which is the corrected claim`,
+      prose,
+      /HOURLY|hourly/,
+      `${site.name}: no longer states the drain cadence — the sentence round 19's MEDIUM corrected has `
+      + 'been rewritten',
     )
+  }
+
+  // (4f) AND THE CLAIM IS MADE ONLY AT THOSE SITES. Every paragraph of these two files that names any
+  // window this rationale has words for must be one of the located sites, or be about the lease. A
+  // window claim that drifts into a paragraph nobody anchored is what rounds 19, 21 and 33 each were.
+  const anchors = WINDOW_CLAIM_SITES.map((site) => site.anchor)
+  for (const file of [...new Set(WINDOW_CLAIM_SITES.map((site) => site.file))]) {
+    for (const prose of commentParagraphs(read(file))) {
+      if (anchors.some((anchor) => prose.includes(anchor))) continue
+      // SENTENCE BY SENTENCE, and with quoted spans stripped, for the SAME two reasons the site
+      // checks above use: the lease exception is a property of the sentence naming the words, and a
+      // paragraph that QUOTES a window in order to disown it is not stating one.
+      for (const sentence of windowSentences(prose)) {
+        const upper = sentence.toUpperCase()
+        const named = Object.values(RECLAIM_WINDOW_WORDS).filter((words) => upper.includes(words))
+        if (named.length === 0) continue
+        assert.match(
+          sentence,
+          ABOUT_THE_LEASE,
+          `${file}: an unanchored sentence names ${named.join(' and ')} without being about the lease, so `
+          + `it states a reclaim window that no site guard reads: ${JSON.stringify(sentence)}`,
+        )
+      }
+    }
   }
 
   // (5) EVERY CITATION RESOLVES, AND NONE OF THEM IS A LINE NUMBER. A line number is falsified by

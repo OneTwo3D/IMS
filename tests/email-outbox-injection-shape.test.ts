@@ -695,7 +695,15 @@ test('r7 HIGH 2: the DRAIN consumes only the snapshot — a two-faced harness ca
 
   // NON-VACUITY: the drain really ran, against the FIXTURE, all the way to a delivery and a SENT
   // row. A green above with nothing processed would prove nothing at all.
-  assert.deepEqual(result, { processed: 1, sent: 1, failed: 0, conflicted: 0, conflictedWithoutSend: 0 })
+  assert.deepEqual(result, {
+    processed: 1,
+    sent: 1,
+    failed: 0,
+    conflicted: 0,
+    conflictedWithoutSend: 0,
+    unresolvedAfterSend: 0,
+    unresolvedWithoutSend: 0,
+  })
   assert.deepEqual(delivered, ['fixture@example.invalid'])
   assert.equal(fixture.store['row-1'].status, 'SENT')
 })
@@ -849,7 +857,15 @@ test('r7 HIGH 2, one level down: the CLIENT DELEGATES are read once too', async 
 
   // NON-VACUITY: the drain ran the whole body against the fixture — findMany, the claim, the
   // suppression lookup and the fenced terminal write are four separate delegate uses.
-  assert.deepEqual(result, { processed: 1, sent: 1, failed: 0, conflicted: 0, conflictedWithoutSend: 0 })
+  assert.deepEqual(result, {
+    processed: 1,
+    sent: 1,
+    failed: 0,
+    conflicted: 0,
+    conflictedWithoutSend: 0,
+    unresolvedAfterSend: 0,
+    unresolvedWithoutSend: 0,
+  })
   assert.deepEqual(delivered, ['fixture@example.invalid'])
   assert.equal(fixture.store['row-1'].status, 'SENT')
 })
@@ -957,7 +973,15 @@ test('r18 NON-VACUITY: a MINTED client is accepted, and the drain runs to a SENT
   } as unknown as ProcessEmailOutboxOptions)
 
   assert.deepEqual(reached, [], `the accepted drain reached ${reached.join(', ')}`)
-  assert.deepEqual(result, { processed: 1, sent: 1, failed: 0, conflicted: 0, conflictedWithoutSend: 0 })
+  assert.deepEqual(result, {
+    processed: 1,
+    sent: 1,
+    failed: 0,
+    conflicted: 0,
+    conflictedWithoutSend: 0,
+    unresolvedAfterSend: 0,
+    unresolvedWithoutSend: 0,
+  })
   assert.deepEqual(delivered, ['fixture@example.invalid'])
   assert.equal(fixture.store['row-1'].status, 'SENT')
 })
@@ -1352,7 +1376,15 @@ test('r30 HIGH: a read-through delegate whose source FILLS UP after the mint is 
       },
     },
   } as unknown as ProcessEmailOutboxOptions)
-  assert.deepEqual(result, { processed: 1, sent: 1, failed: 0, conflicted: 0, conflictedWithoutSend: 0 })
+  assert.deepEqual(result, {
+    processed: 1,
+    sent: 1,
+    failed: 0,
+    conflicted: 0,
+    conflictedWithoutSend: 0,
+    unresolvedAfterSend: 0,
+    unresolvedWithoutSend: 0,
+  })
   assert.deepEqual(delivered, ['a.real.customer@example.test'])
   assert.equal(store[0].status, 'SENT')
 })
@@ -1390,7 +1422,15 @@ test('r28 HIGH 2: a method swapped onto the caller\'s delegate AFTER the mint ne
   assert.deepEqual(reached, [], `the drain called a post-mint replacement: ${reached.join(', ')}`)
   // AND NON-VACUITY: it ran the whole body through the captured methods — sweep, claim, suppression
   // lookup and fenced settlement — rather than refusing everything.
-  assert.deepEqual(result, { processed: 1, sent: 1, failed: 0, conflicted: 0, conflictedWithoutSend: 0 })
+  assert.deepEqual(result, {
+    processed: 1,
+    sent: 1,
+    failed: 0,
+    conflicted: 0,
+    conflictedWithoutSend: 0,
+    unresolvedAfterSend: 0,
+    unresolvedWithoutSend: 0,
+  })
   assert.deepEqual(delivered, ['fixture@example.invalid'])
   assert.equal(fixture.store['row-1'].status, 'SENT')
 })

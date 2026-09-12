@@ -126,7 +126,9 @@ export const INTEGRATION_OUTBOX_REGISTRY = defineOutboxRegistry({
     //
     //   worker A resolves stock_quantity = 10 (resolvePushStockQuantity, ~line 1093) and pauses
     //   before `pushBatchWithFence` reaches the socket; stock falls to 0 and enqueues its own row —
-    //   which, sharing this product's idempotency key, IS this row; ten minutes later worker B
+    //   which, sharing this product's idempotency key, IS this row; ONE RECLAIM WINDOW later (round
+    //   33: this said "ten minutes", which is no window this build has — the ordering hazard does not
+    //   depend on the number, so it no longer names one) worker B
     //   reclaims it, computes 0, pushes 0 and completes it SUCCEEDED; A then resumes and pushes 10.
     //
     // A is fenced out of the ROW (its `completeClaimedJob` CAS fails and it throws), but WooCommerce
@@ -210,10 +212,18 @@ export const INTEGRATION_OUTBOX_REGISTRY = defineOutboxRegistry({
     // INVOICE_EMAIL is the counterexample that decides the entry. Its fence is
     // `lease.fenceBeforeRemoteWrite('invoice-email')` with NO dispatch write, and the effect behind
     // it is `sendAccountingInvoiceEmailInternal` -> `queueEmail` -> `db.emailOutbox.create`. Worker A
-    // can insert the row and pause before completing its sync-log and outbox rows; fifteen minutes
-    // later worker B reclaims, passes its own fence honestly (A's lock is now stale), and inserts a
-    // SECOND row. Both are delivered. The processor's own comment at that call site says what that
-    // means: "a second worker here means the customer receives the invoice twice", and
+    // can insert the row and pause before completing its sync-log and outbox rows; ONE RECLAIM
+    // WINDOW later — TWENTY MINUTES, derived from the constants in item 1 below rather than recalled
+    // here — worker B reclaims, passes its own fence honestly (A's lock is now stale), and ATTEMPTS a
+    // SECOND row. THE RECLAIM ALONE DOES NOT MAKE THAT SECOND ROW EXIST (Codex round 33, HIGH; this
+    // sentence used to name the window as fifteen and to end "Both are delivered", while item 1 below
+    // established twenty and established the condition — a stale claim sitting beside its own
+    // correction, which is the shape the cadence guard now checks paragraph by paragraph). B's insert
+    // is REFUSED while A's copy is still undelivered, and ACCEPTED once a drain has settled A's copy
+    // out of the index's predicate — so the duplicate, and with it the second delivery, arrives only
+    // when the replay CROSSES A DRAIN. Item 1 works that condition out from the cadences; what it
+    // does NOT soften is the consequence when it is met. The processor's own comment at that call
+    // site says what that means: "a second worker here means the customer receives the invoice twice", and
     // POST_EFFECT.INVOICE_EMAIL adds that the email CANNOT be recalled. A claim proof taken before
     // the effect cannot couple that effect to the completion; only evidence that outlives the worker
     // can.

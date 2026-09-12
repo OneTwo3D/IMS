@@ -102,12 +102,12 @@ When you email a document (e.g. sending a purchase order to a supplier or an inv
 
 ### SMTP Sending
 
-Emails are sent server-side using nodemailer via your configured SMTP settings (see **Settings > Company > Email/SMTP**). The email buttons on sales orders and invoices send directly via SMTP rather than opening a mailto link. The following email functions are available:
+Emails are sent server-side using nodemailer via your configured SMTP settings (see **Settings > Company > Email/SMTP**) rather than by opening a mailto link in your browser. The email buttons on sales orders and invoices do **not** reach SMTP themselves — they add the email to the outbox described under [The Email Queue](#the-email-queue) below, and the background job is what connects to your SMTP server. The following email functions are available:
 
-- **sendSalesOrderEmail** — sends the sales order PDF to the customer
-- **sendInvoiceEmail** — sends the invoice PDF to the customer
+- **sendSalesOrderEmail** — queues the sales order PDF for delivery to the customer
+- **sendInvoiceEmail** — queues the invoice PDF for delivery to the customer
 
-Both functions attach the generated PDF document to the email automatically.
+Both functions attach the generated PDF document to the queued email automatically.
 
 ### The Email Queue
 
@@ -126,13 +126,29 @@ the job's next run, not immediately.
   after which the email is marked failed with the last error.
 - **Suppression.** A recipient the SMTP provider rejects as invalid is added to the suppression
   list, and later emails to that address fail immediately instead of being retried.
-- **What "fenced" means in the activity log.** Each run logs a line like `Email outbox: 3 sent, 0
-  failed, 0 fenced after a send, 0 fenced before one, out of 3 processed`. A *fenced* email is one
-  this run had claimed and another run took over before it finished. The two counts are different
-  facts and are worth reading apart: **fenced after a send** means the message had already been
-  handed to the SMTP server, so the customer has probably received two copies; **fenced before one**
-  means the claim was lost before anything was sent, so nothing went out twice. Neither leaves the
-  email stuck — the run that took the row over is the one that finishes it.
+- **What the four contention counts in the activity log mean.** Each run logs a line like
+  `Email outbox: 3 sent, 0 failed, 0 reclaimed after a send, 0 reclaimed before one, 0 unresolved
+  after a send, 0 unresolved before one, out of 3 processed`. All four count a row this run had
+  claimed and was then refused the final write on. They split along two questions, and the split
+  matters because only one corner means a customer probably got two emails.
+
+  *Was another run's takeover actually established?* **Reclaimed** means yes: the row was read back
+  afterwards and it was either holding another run's claim, or holding no claim at all when every
+  write this run issued had come back — so something else released it. **Unresolved** means no: the
+  row could not be read, or it was gone, or it still carried this run's own claim, or this run's own
+  final write never answered and may itself be what settled the row. An unresolved count is a count
+  of *missing evidence*, not of contention — a rising "unresolved" with "reclaimed" at zero points at
+  a database connection problem, not at two runs fighting.
+
+  *Had the message already been handed to SMTP?* **After a send** means yes, so a copy may be on the
+  wire. **Before one** means nothing was sent by this run, so nothing went out twice whatever the
+  cause.
+
+  So **reclaimed after a send** is the one that means the customer has probably received two copies.
+  **Unresolved after a send** means a copy may be on the wire but nothing establishes that a second
+  one follows — it is not a duplicate report. The server log line for each row names the specific
+  diagnosis behind it. None of the four leaves the email stuck: whichever run settled the row is the
+  one that finished it.
 
 ### Dispatch Email (direct orders)
 

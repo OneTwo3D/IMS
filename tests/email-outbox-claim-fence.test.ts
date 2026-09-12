@@ -377,7 +377,15 @@ type PauseWorld = {
   /** The precondition this proof must reach: worker B actually got the row. */
   reclaimHappened: boolean
   /** Worker A's counters, after it resumed from the stalled socket. */
-  workerA: { processed: number; sent: number; failed: number; conflicted: number; conflictedWithoutSend: number }
+  workerA: {
+    processed: number
+    sent: number
+    failed: number
+    conflicted: number
+    conflictedWithoutSend: number
+    unresolvedAfterSend: number
+    unresolvedWithoutSend: number
+  }
   /** The row, after A resumed and after the third tick. */
   statusAfterAResumed: string
   deliveriesAfterThirdTick: string[]
@@ -552,7 +560,13 @@ test('REAL: the fence refuses a writer whose CLAIM INSTANT no longer matches, ev
     },
   })
 
-  assert.equal(outcome.conflicted, 1)
+  // ROUND 33 (Codex MEDIUM): THIS IS NOT A RECLAIM AND THE COUNTERS NO LONGER SAY IT IS. The row
+  // still carries THIS worker's token — that is the whole point of the case — so nothing here
+  // establishes that another worker ever held it, and `describeClaimLoss` has said "NOT a reclaim"
+  // in words since r30 while `conflicted` went on asserting one. The refusal is still counted; what
+  // changed is which count it lands in.
+  assert.equal(outcome.conflicted, 0, 'a row rewritten under this worker\'s own token is not a takeover')
+  assert.equal(outcome.unresolvedAfterSend, 1, 'the refused terminal write was not counted at all')
   assert.equal(outcome.failed, 0)
   assert.equal(updateManyCalls.at(-1)?.count, 0, 'the terminal write was issued and refused')
 })
@@ -594,8 +608,18 @@ for (const settlePath of ['a successful send', 'a failed send', 'a thrown send']
         failed: workerA.failed,
         conflicted: workerA.conflicted,
         conflictedWithoutSend: workerA.conflictedWithoutSend,
+        unresolvedAfterSend: workerA.unresolvedAfterSend,
+        unresolvedWithoutSend: workerA.unresolvedWithoutSend,
       },
-      { processed: 1, sent: 0, failed: 0, conflicted: 1, conflictedWithoutSend: 0 },
+      {
+        processed: 1,
+        sent: 0,
+        failed: 0,
+        conflicted: 1,
+        conflictedWithoutSend: 0,
+        unresolvedAfterSend: 0,
+        unresolvedWithoutSend: 0,
+      },
       'a worker that no longer owns the row scores neither a send nor a failure OF THAT ROW, and it '
       + 'HAD touched the socket, so the refusal is the one that implies a duplicate delivery',
     )
@@ -620,7 +644,15 @@ test('REAL: a worker that still holds its claim settles normally', async () => {
     },
   })
 
-  assert.deepEqual(outcome, { processed: 1, sent: 1, failed: 0, conflicted: 0, conflictedWithoutSend: 0 })
+  assert.deepEqual(outcome, {
+    processed: 1,
+    sent: 1,
+    failed: 0,
+    conflicted: 0,
+    conflictedWithoutSend: 0,
+    unresolvedAfterSend: 0,
+    unresolvedWithoutSend: 0,
+  })
   assert.deepEqual(deliveries, ['only-worker'])
   assert.equal(rows[0].status, 'SENT')
   assert.equal(rows[0].lockedBy, null)
@@ -667,7 +699,15 @@ test('the suppression write is fenced too, and no longer fires before the claim'
     },
   })
 
-  assert.deepEqual(outcome, { processed: 1, sent: 0, failed: 1, conflicted: 0, conflictedWithoutSend: 0 })
+  assert.deepEqual(outcome, {
+    processed: 1,
+    sent: 0,
+    failed: 1,
+    conflicted: 0,
+    conflictedWithoutSend: 0,
+    unresolvedAfterSend: 0,
+    unresolvedWithoutSend: 0,
+  })
   assert.equal(rows[0].status, 'FAILED')
   // Order matters: the FIRST write is the claim, the SECOND is the suppression settlement.
   // Before o3d-alnk the suppression FAILED was written first, through an unfenced update on a
@@ -886,7 +926,19 @@ test('the migration changes NOTHING before its transaction begins (o3d-alnk r6)'
 
   // And the HINT no longer claims the whole migration is one transaction, because it is not: the
   // guard is deliberately outside it. What it claims is what is true — nothing was applied.
-  assert.match(FENCE_MIGRATION_SQL, /HINT = '[^']*Nothing was applied: this check is the migration''s first statement/)
+  //
+  // READ OFF THE PRE-TRANSACTION SLICE, NOT THE WHOLE FILE (round 33). Whole-file, this passed as
+  // long as SOME hint anywhere in the migration said so — including one inside the transaction,
+  // where it would be false — while the guard that actually prints on a refusal said something
+  // else. The claim belongs to the statement that makes it, so it is checked there.
+  const refusalBlock = FENCE_MIGRATION_SQL.slice(0, begin)
+  assert.match(refusalBlock, /HINT = '[^']*Nothing was applied: this check is the migration''s first statement/)
+  assert.equal(
+    [...FENCE_MIGRATION_SQL.matchAll(/Nothing was applied: this check is the migration''s first statement/g)].length,
+    1,
+    'that claim is made more than once in the migration, and only the copy before BEGIN is true of the '
+    + 'statement it is attached to',
+  )
 })
 
 // ---------------------------------------------------------------------------
@@ -1223,6 +1275,15 @@ test('r22: `thrownPhase` enumerates the try, and every arm is distinct', () => {
   // an arm for it leaves the residual phrase in an operator's log, which is honest; a round that
   // deletes an arm fails here.
   const source = readFileSync(fileURLToPath(new URL('../lib/email-outbox.ts', import.meta.url)), 'utf8')
+  // EXACTLY ONE region, asserted (round 33): `.exec` takes the FIRST match, so a second
+  // `thrownPhase` getter added anywhere below would leave this walk reading the wrong one and
+  // reporting on a list nobody ships.
+  assert.equal(
+    [...source.matchAll(/get thrownPhase\(\): string \{/g)].length,
+    1,
+    'lib/email-outbox.ts declares more than one `thrownPhase` getter, so the enumeration below is '
+    + 'reading whichever comes first rather than the one the drain uses',
+  )
   const phase = /get thrownPhase\(\): string \{([\s\S]*?)\n      \},/.exec(source)
   assert.ok(phase, 'lib/email-outbox.ts no longer derives the catch phrase in one place')
 
@@ -1420,7 +1481,15 @@ test('r30: a suppression lookup that FAILS settles its own row and the batch car
   // (1) THE DRAIN RETURNED. Before r30 this call REJECTED, and everything below was unreachable.
   assert.deepEqual(
     result,
-    { processed: 2, sent: 1, failed: 1, conflicted: 0, conflictedWithoutSend: 0 },
+    {
+    processed: 2,
+    sent: 1,
+    failed: 1,
+    conflicted: 0,
+    conflictedWithoutSend: 0,
+    unresolvedAfterSend: 0,
+    unresolvedWithoutSend: 0,
+  },
     'the batch did not survive a failed suppression lookup',
   )
 
@@ -1528,7 +1597,13 @@ test('r30: a terminal write that COMMITS and loses its answer is not reported as
   assert.equal(terminal[1].count, 0, "the catch's CAS matched a row, so the overclaim is not reachable")
   assert.equal(rows[0].status, 'SENT', 'the committed write did not land, so nothing was lost')
   assert.equal(rows[0].lockedBy, null)
-  assert.equal(result.conflicted, 1, 'the refused terminal write was not counted')
+  // ROUND 33 (Codex MEDIUM): AND THE NUMBER SAYS THE SAME AS THE SENTENCE. `conflicted` used to be
+  // incremented here, so the telemetry reported a takeover and a probable duplicate on the very path
+  // whose message refuses to assert either. The two counters are now split by the diagnosis
+  // (`establishesAReclaim`), and BOTH halves are pinned: reintroducing the takeover count for this
+  // outcome makes the first of these red, and dropping the count altogether makes the second red.
+  assert.equal(result.conflicted, 0, 'a lost response was counted as another worker taking the row over')
+  assert.equal(result.unresolvedAfterSend, 1, 'the refused terminal write was not counted at all')
 
   const conflict = logged.find((line) => line.includes('terminal write REFUSED'))
   assert.ok(conflict, `no conflict was logged; captured: ${JSON.stringify(logged)}`)
@@ -1572,13 +1647,277 @@ test('r30: NON-VACUITY — the same lost write WITH a real rival still reports t
     },
   })
 
+  // AND THE COUNTERS MOVE WITH THE SENTENCE (round 33). The two tests differ in ONE fact — whether a
+  // rival holds the row — so if the counters did not differ too, `conflicted` would not be measuring
+  // that fact, which is exactly what the MEDIUM said.
   assert.equal(result.conflicted, 1)
+  assert.equal(result.unresolvedAfterSend, 0, 'an ESTABLISHED reclaim was filed as unattributable')
   const conflict = logged.find((line) => line.includes('terminal write REFUSED'))
   assert.ok(conflict, `no conflict was logged; captured: ${JSON.stringify(logged)}`)
   assert.match(conflict, /was reclaimed by another worker after this one had ENTERED the sender/)
   assert.match(conflict, /lockedBy another-worker/)
   assert.match(conflict, /A duplicate delivery is likely/)
   assert.doesNotMatch(conflict, /NO RECLAIM IS ESTABLISHED/)
+})
+
+// ---------------------------------------------------------------------------
+// ROUND 33 (Codex MEDIUM) — THE COUNTERS ASSERTED A TAKEOVER THE DIAGNOSIS REFUSES TO ASSERT.
+//
+// r30 split `describeClaimLoss` into six readings and was careful that only two of them say another
+// worker held the row. It left the COUNTERS alone and wrote that down as safe: "Neither counter
+// asserts that a rival existed — that claim lives in the sentence." That was false, and the proof of
+// it was already in this file — the r30 tests above show `conflicted === 1` with NO RIVAL ANYWHERE IN
+// THE TEST, in their own words. `ProcessEmailOutboxResult` defines the count as another worker having
+// reclaimed the row, help-docs/documents-email.md defines it as another run taking over, and the
+// activity summary called it "fenced". So an operator was told a takeover and a probable duplicate had
+// happened on four outcomes that establish neither.
+//
+// The fix is `establishesAReclaim`, and the tests below pin it from both ends.
+// ---------------------------------------------------------------------------
+
+test('r33: a row that is GONE when the claim is checked is not reported as a takeover', async () => {
+  // The fourth non-establishing outcome, driven rather than argued (the other three are driven by the
+  // r30 tests above, which now pin their counters too). The row vanishes between the terminal write
+  // and the read-back, so the drain cannot say who settled it — and "I cannot say" is not "someone
+  // else did".
+  const fixture = await makeClient([makeRow()], {
+    commitThenThrowOnFirstTerminalWrite: () => {
+      fixture.rows.splice(0, fixture.rows.length)
+    },
+  })
+
+  const { result, logged } = await drainCapturingLog({
+    client: fixture.client,
+    now: () => T0,
+    prepareQueuedEmail: noPrepare,
+    logActivity: noLog,
+    async sendEmail() {
+      return { success: true }
+    },
+  })
+
+  assert.equal(result.processed, 1, 'the row was never claimed, so this is not the case under test')
+  assert.equal(fixture.rows.length, 0, 'the row is still there, so the read-back did not hit the gone case')
+
+  const conflict = logged.find((line) => line.includes('terminal write REFUSED'))
+  assert.ok(conflict, `no conflict was logged; captured: ${JSON.stringify(logged)}`)
+  assert.match(conflict, /the row is no longer there/, 'this drove some other diagnosis, not row-gone')
+
+  assert.equal(result.conflicted, 0, 'a vanished row was counted as another worker taking it over')
+  assert.equal(result.unresolvedAfterSend, 1, 'the refused terminal write was not counted at all')
+})
+
+test('r33: `establishesAReclaim` decides every ClaimLoss kind, and the switch cannot grow a default', () => {
+  // WHY THIS IS READ OUT OF THE SOURCE. The behavioural tests drive four of the six kinds and could
+  // drive the other two, and they would still not establish the property that matters: that a SEVENTH
+  // kind cannot be added without somebody deciding which side it falls on. That property is carried by
+  // the switch being exhaustive and having no `default`, which is a fact about the text.
+  const source = readFileSync(fileURLToPath(new URL('../lib/email-outbox.ts', import.meta.url)), 'utf8')
+
+  // (1) THE UNION, read off itself — not a list repeated here that could agree with a copy of itself.
+  const union = /type ClaimLoss =\n([\s\S]*?)\n\n/.exec(source)
+  assert.ok(union, 'lib/email-outbox.ts no longer declares a `ClaimLoss` union, so nothing below read it')
+  const kinds = [...union[1].matchAll(/\{ kind: '([a-z-]+)'/g)].map((match) => match[1])
+  assert.ok(kinds.length >= 6, `the walk found ${kinds.length} ClaimLoss kinds — it read nothing useful`)
+  assert.equal(new Set(kinds).size, kinds.length, 'a ClaimLoss kind is declared twice')
+
+  // (2) THE SWITCH, located as exactly one region so `.exec` cannot be reading a different one.
+  assert.equal(
+    [...source.matchAll(/const establishesAReclaim = /g)].length,
+    1,
+    '`establishesAReclaim` is declared more than once, so the body checked below may not be the one used',
+  )
+  const decision = /const establishesAReclaim = \(loss: ClaimLoss\): boolean => \{\n([\s\S]*?)\n  \}/.exec(source)
+  assert.ok(decision, '`establishesAReclaim` no longer has the shape this guard reads')
+  const body = decision[1]
+  assert.doesNotMatch(
+    body,
+    /\bdefault:/,
+    'the decision grew a `default:`, so a new ClaimLoss kind now gets an answer nobody chose — which is '
+    + 'exactly how the counters came to assert a takeover for four outcomes that establish none',
+  )
+
+  // (3) EVERY KIND IS DECIDED, AND ON THE SIDE THE DIAGNOSIS SUPPORTS. Each `case` label is attributed
+  // to the answer that FOLLOWS it, by walking the body in order — not by splitting on the first
+  // `return true`, which silently mis-attributes a kind moved above one and reports the wrong reason.
+  const decided = new Map<string, boolean>()
+  let pending: string[] = []
+  for (const token of body.matchAll(/case '([a-z-]+)':|return (true|false)/g)) {
+    if (token[1] !== undefined) pending.push(token[1])
+    else {
+      assert.ok(pending.length > 0, `a \`return ${token[2]}\` in the decision follows no case label`)
+      for (const kind of pending) decided.set(kind, token[2] === 'true')
+      pending = []
+    }
+  }
+  assert.equal(pending.length, 0, `these ClaimLoss kinds fall through to no answer: ${pending.join(', ')}`)
+  const arms = (answer: boolean) => [...decided].filter(([, value]) => value === answer).map(([kind]) => kind)
+  assert.deepEqual(
+    arms(true),
+    ['held-by-another', 'settled-by-another'],
+    'the outcomes counted as another worker holding or having held the claim have changed. Only two '
+    + 'readings establish that: someone else\'s token is on the row, or no token is and every write '
+    + 'this worker issued came back',
+  )
+  assert.deepEqual(
+    [...decided.keys()].sort(),
+    [...kinds].sort(),
+    'a ClaimLoss kind is not decided by `establishesAReclaim`, or one is decided that the union no '
+    + 'longer declares',
+  )
+
+  // (4) AND IT IS THE ONLY DECISION: one definition, one caller, so no branch can count a conflict
+  // without going through it.
+  assert.equal(
+    [...source.matchAll(/establishesAReclaim\(/g)].length,
+    1,
+    '`establishesAReclaim` is called more than once (plus its own definition), so the two axes of the '
+    + 'split are decided in more than one place',
+  )
+  for (const counter of ['conflicted', 'conflictedWithoutSend', 'unresolvedAfterSend', 'unresolvedWithoutSend']) {
+    assert.equal(
+      [...source.matchAll(new RegExp(`result\\.${counter}\\+\\+`, 'g'))].length,
+      1,
+      `result.${counter} is incremented in more than one place, so one of them can drift from the diagnosis`,
+    )
+  }
+})
+
+test('r33 LOW: the two places the docs describe pressing an email button agree', () => {
+  // Codex r33 LOW. The "SMTP Sending" section said the buttons "send directly via SMTP" and the
+  // "Email Queue" section immediately below said emails "are not sent from the button click" — two
+  // mutually incompatible descriptions of ONE action, in adjoining sections. Both sections are located
+  // and each is asked about the SAME claim, because the defect is not a wrong sentence but a
+  // DISAGREEMENT, and only a guard that reads both sites can see one.
+  const doc = readFileSync(fileURLToPath(new URL('../help-docs/documents-email.md', import.meta.url)), 'utf8')
+  const sectionAfter = (heading: string) => {
+    const from = doc.indexOf(heading)
+    assert.notEqual(from, -1, `help-docs/documents-email.md no longer has a "${heading}" section`)
+    const rest = doc.slice(from + heading.length)
+    const to = rest.search(/\n#{2,3} /)
+    const body = (to === -1 ? rest : rest.slice(0, to)).replace(/\s+/g, ' ').trim()
+    assert.ok(body.length > 200, `"${heading}" is ${body.length} characters, which is not the section this reads`)
+    return body
+  }
+
+  const smtp = sectionAfter('### SMTP Sending')
+  const queue = sectionAfter('### The Email Queue')
+
+  // THE QUEUE SECTION IS THE ONE THAT IS TRUE OF THE CODE (`queueEmail` writes a row; the cron sends).
+  assert.match(queue, /not sent from the button click/, 'the queue section no longer states what the button does')
+
+  // SO THE SMTP SECTION MAY NOT CONTRADICT IT. Asserted as an absence AT THAT SITE — the whole-file
+  // version of this check is satisfied by the queue section's correct sentence, which is the whole
+  // reason a reader could meet both claims.
+  assert.doesNotMatch(
+    smtp,
+    /buttons[^.]*send directly via SMTP|buttons[^.]*sends? (?:the|an) [^.]*(?:directly|immediately)/i,
+    'the SMTP section says the email buttons reach SMTP themselves, which the queue section below '
+    + 'contradicts — a reader is given two incompatible accounts of one click',
+  )
+  assert.match(
+    smtp,
+    /do \*\*not\*\* reach SMTP themselves/,
+    'the SMTP section no longer says what the buttons do NOT do, so a reader arriving there first is '
+    + 'left with the mailto contrast and no correction until the next section',
+  )
+})
+
+test('r33: the three places that state what these counts mean state the same thing', () => {
+  // THIS IS THE GUARD THE MEDIUM ASKED FOR BY NAME: "a counter whose meaning is stated in three places
+  // and corrected in one is how this branch got here." The three places are the exported contract, the
+  // activity-log summary an operator reads, and the help documentation. Each is located as its own
+  // site — the field's doc comment, the template literal, the documentation section — so a correction
+  // made in one of them and not the others fails here.
+  const source = readFileSync(fileURLToPath(new URL('../lib/email-outbox.ts', import.meta.url)), 'utf8')
+  const doc = readFileSync(fileURLToPath(new URL('../help-docs/documents-email.md', import.meta.url)), 'utf8')
+
+  // (1) THE EXPORTED CONTRACT. Each field's OWN doc comment, taken as the text between the previous
+  // field and it, so a claim made about `conflicted` cannot be satisfied by prose about another field.
+  const result = /export type ProcessEmailOutboxResult = \{\n([\s\S]*?)\n\}/.exec(source)
+  assert.ok(result, 'lib/email-outbox.ts no longer declares `ProcessEmailOutboxResult`')
+  const fields = [...result[1].matchAll(/\/\*\*([\s\S]*?)\*\/\s*\n\s*(\w+): number/g)]
+    .map((match) => ({ name: match[2], prose: match[1].replace(/\n\s*\*/g, ' ').replace(/\s+/g, ' ').trim() }))
+  const contract = new Map(fields.map((field) => [field.name, field.prose]))
+  for (const counter of ['conflicted', 'conflictedWithoutSend', 'unresolvedAfterSend', 'unresolvedWithoutSend']) {
+    const prose = contract.get(counter)
+    assert.ok(prose, `${counter} has no doc comment of its own in the exported contract`)
+    assert.ok(prose.length > 200, `${counter}: its doc comment is ${prose.length} characters, not a contract`)
+  }
+  // THE TWO THAT CLAIM A RECLAIM SAY IT IS ESTABLISHED…
+  for (const counter of ['conflicted', 'conflictedWithoutSend']) {
+    assert.match(
+      contract.get(counter)!,
+      /RECLAIM ESTABLISHED/,
+      `${counter}: does not say the reclaim is ESTABLISHED, which is the only thing that separates it `
+      + 'from the unresolved counts',
+    )
+  }
+  // …AND THE TWO THAT DO NOT, SAY SO, and do not describe themselves as a takeover.
+  for (const counter of ['unresolvedAfterSend', 'unresolvedWithoutSend']) {
+    const prose = contract.get(counter)!
+    assert.match(prose, /NO RECLAIM ESTABLISHED|no reclaim established/, `${counter}: does not say what it is not`)
+    assert.doesNotMatch(
+      prose,
+      /another worker (?:had )?(?:reclaimed|took over|holds)/i,
+      `${counter}: describes itself as another worker taking the row over, which is what it exists to `
+      + 'stop claiming',
+    )
+  }
+
+  // (2) THE ACTIVITY SUMMARY. Located as the one template that names these counters, and every counter
+  // in the contract must appear in it — a count nobody logs is a count nobody reads.
+  const summary = /description: `Email outbox:([\s\S]*?)`,\n/.exec(source)
+  assert.ok(summary, 'the activity summary template for the email outbox is no longer where this reads it')
+  const label = summary[1]
+  assert.doesNotMatch(
+    label,
+    /fenced/,
+    'the summary still labels these counts "fenced", which reads as "another run took this row over" — '
+    + 'true of two of the six outcomes and asserted of all of them',
+  )
+  for (const counter of ['conflicted', 'conflictedWithoutSend', 'unresolvedAfterSend', 'unresolvedWithoutSend']) {
+    assert.ok(
+      label.includes(`result.${counter}`),
+      `the activity summary does not report result.${counter}, so that outcome is invisible to an operator`,
+    )
+  }
+  assert.match(label, /reclaimed after a send/, 'the summary no longer distinguishes the established reclaims')
+  assert.match(label, /unresolved after a send/, 'the summary no longer distinguishes the unattributed refusals')
+
+  // (3) THE HELP DOCUMENTATION, as its own section — from its bullet to the next top-level bullet, so
+  // the claims below are read off the paragraphs that describe these counts and not off the whole file.
+  const from = doc.indexOf('- **What the four contention counts in the activity log mean.**')
+  assert.notEqual(from, -1, 'help-docs/documents-email.md no longer documents the contention counts')
+  const rest = doc.slice(from + 1)
+  const to = rest.search(/\n(?:- \*\*|#)/)
+  const section = to === -1 ? rest : rest.slice(0, to)
+  assert.ok(section.length > 600, `the documented section is ${section.length} characters, not an explanation`)
+  // WHITESPACE COLLAPSED before any claim is matched: markdown wraps its paragraphs, so a phrase that
+  // straddles a line break is present to a reader and absent to `includes`. Matching the wrapped text
+  // would make every check below pass or fail on where the line happened to break.
+  const flat = section.replace(/\s+/g, ' ')
+  assert.doesNotMatch(
+    flat,
+    /A \*fenced\* email is one\s+this run had claimed and another run took over/,
+    'the documentation still defines every one of these counts as another run taking the row over',
+  )
+  assert.match(flat, /\*\*Reclaimed\*\* means yes/, 'the documentation no longer says what "reclaimed" establishes')
+  assert.match(flat, /\*\*Unresolved\*\* means no/, 'the documentation no longer says what "unresolved" does not')
+  assert.match(
+    flat,
+    /missing evidence/,
+    'the documentation no longer tells a reader that an unresolved count is missing evidence rather than '
+    + 'contention, which is the operational difference the MEDIUM was about',
+  )
+  // AND THE SAMPLE LINE IT QUOTES IS THE LINE THE CODE ACTUALLY WRITES. A documented example that has
+  // drifted from the template is a fourth statement of the meaning, disagreeing with the other three.
+  for (const words of ['reclaimed after a send', 'reclaimed before one', 'unresolved after a send', 'unresolved before one']) {
+    assert.ok(
+      flat.includes(words) && label.includes(words),
+      `"${words}" is not in both the documented sample line and the template that writes it`,
+    )
+  }
 })
 
 // ---------------------------------------------------------------------------
@@ -1981,7 +2320,13 @@ test('r30: a claim read-back that FAILS is an answer, not a thrown diagnostic', 
   })
 
   assert.equal(readBacks, 1, 'the read-back was not attempted, so this is not the case under test')
-  assert.equal(result.conflicted, 1, 'the refused terminal write was not counted')
+  // ROUND 33 (Codex MEDIUM): AND THE NUMBER SAYS THE SAME AS THE SENTENCE. `conflicted` used to be
+  // incremented here, so the telemetry reported a takeover and a probable duplicate on the very path
+  // whose message refuses to assert either. The two counters are now split by the diagnosis
+  // (`establishesAReclaim`), and BOTH halves are pinned: reintroducing the takeover count for this
+  // outcome makes the first of these red, and dropping the count altogether makes the second red.
+  assert.equal(result.conflicted, 0, 'a failed read-back was counted as another worker taking the row over')
+  assert.equal(result.unresolvedAfterSend, 1, 'the refused terminal write was not counted at all')
   assert.equal(rows.find((row) => row.id === 'email-2')?.status, 'SENT', 'the batch died on a failed read-back')
 
   const conflict = logged.find((line) => line.includes('terminal write REFUSED'))
