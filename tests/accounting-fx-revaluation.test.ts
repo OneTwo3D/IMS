@@ -5,13 +5,38 @@ import { selectPriorRevaluationsToReverse } from '@/lib/accounting-fx-revaluatio
 
 const LINES = [{ accountCode: '800', description: 'Unrealised FX', debit: 5, credit: 0 }]
 
-function revaluation(id: string, valuationDate: string, side: 'receivable' | 'payable' = 'receivable') {
-  return { id, payload: { kind: 'revaluation', side, valuationDate, lines: LINES } }
+// o3d-j625 r2: the row's own `connector`. `selectPriorRevaluationsToReverse` now carries it through so
+// the reversal can be routed by the books its account codes came out of rather than by the settings
+// object beside the enqueue — see the o3d-j625 tests for what that changes.
+function revaluation(
+  id: string,
+  valuationDate: string,
+  side: 'receivable' | 'payable' = 'receivable',
+  connector = 'xero',
+) {
+  return { id, connector, payload: { kind: 'revaluation', side, valuationDate, lines: LINES } }
 }
 
-function reversal(id: string, sourceEntryId: string) {
-  return { id, payload: { kind: 'reversal', sourceEntryId, lines: LINES } }
+function reversal(id: string, sourceEntryId: string, connector = 'xero') {
+  return { id, connector, payload: { kind: 'reversal', sourceEntryId, lines: LINES } }
 }
+
+test('o3d-j625: the selection carries each prior revaluation\u2019s OWN connector', () => {
+  // The whole point of the MEDIUM 1 fix: a revaluation posted under QuickBooks, read back after a
+  // switch to Xero, must still say QuickBooks — its AR/AP control and unrealised-FX codes are
+  // QuickBooks's, and a reversal of them cannot be posted to Xero.
+  const result = selectPriorRevaluationsToReverse(
+    [revaluation('reval-qbo', '2026-06-01', 'receivable', 'quickbooks')],
+    '2026-06-02',
+  )
+  assert.equal(result.length, 1, 'precondition: the prior was selected at all')
+  assert.equal(
+    result[0].connector,
+    'quickbooks',
+    'the reversal must be attributable to the connector the SOURCE ROW was written under, not to '
+    + 'whichever chart the caller happens to hold',
+  )
+})
 
 test('a prior revaluation whose reversal failed is retried even when a same-date revaluation exists', () => {
   // logs are pre-filtered to ACTIVE statuses, so a FAILED reversal of reval-1 is
@@ -48,7 +73,7 @@ test('same-date and future revaluations are never selected as priors to reverse'
 
 test('revaluations without parseable journal lines are skipped', () => {
   const logs = [
-    { id: 'reval-empty', payload: { kind: 'revaluation', side: 'receivable', valuationDate: '2026-06-01', lines: [] } },
+    { id: 'reval-empty', connector: 'xero', payload: { kind: 'revaluation', side: 'receivable', valuationDate: '2026-06-01', lines: [] } },
   ]
 
   assert.deepEqual(selectPriorRevaluationsToReverse(logs, '2026-06-02'), [])

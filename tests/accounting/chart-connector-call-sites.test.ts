@@ -35,11 +35,21 @@ import { balancedFrom, blankNonCode, productionSources, SHORTHAND } from './paid
  * interleaving. Read this as "no facade enqueue is unattributed", never as "every attribution is
  * correct".
  *
- * THE IN-TRANSACTION ENQUEUE (`queueAccountingSyncTx`) IS OUT OF SCOPE HERE and is NOT swept: it takes
- * the same parameter (and this branch threads it on the refund's COGS reversal), but its other callers
- * — cost-layers, manufacturing, the purchase-invoice and landed-cost paths — have the same defect
- * through a different seam and their own set of behaviour consequences. Tracked separately rather than
- * half-swept here, because a census that excused most of its subjects would be worse than no census.
+ * THE IN-TRANSACTION FAMILY IS SWEPT TOO, AND r1's DECISION NOT TO WAS OVERRULED (r2, Codex HIGH 1).
+ *
+ * r1 wrote, in this very comment, that `queueAccountingSyncTx`'s other callers "have the same defect
+ * through a different seam" and filed them as o3d-jndi — while also writing that "a census that excused
+ * most of its subjects would be worse than no census". Both halves cannot be true at once, and the
+ * reviewer resolved it the other way: eleven swept sites and sixteen excused ones IS a census that
+ * excuses most of its subjects, and "the same defect through a different seam" is the same defect. So
+ * the transactional family — `queueAccountingSyncTx`, `queueAccountingSyncTxWithOutcome`, and the
+ * injected form in lib/cost-layers.ts — is swept by the same rule below, and o3d-jndi's content is here.
+ *
+ * AND THE PARAMETER IS REQUIRED ON BOTH DECLARATIONS, which is the guard this census cannot be. A
+ * source-text sweep says "every call I can see names it"; it cannot say "a call that does not name it is
+ * impossible". A required parameter can, and the declaration test below is what keeps it required —
+ * because the moment a `?` goes back on, every site this census reads becomes optional again and the
+ * detector's own fixtures are the only thing left proving it could ever have fired.
  */
 
 /**
@@ -418,4 +428,334 @@ test('[o3d-j625] the SITE detectors can fire: a re-resolved pin and a foreign ch
   assert.equal(chartObjectOf("'xero'"), null)
   assert.equal(chartObjectOf('await resolveConnector()'), null)
   assert.equal(chartObjectOf(null), null)
+})
+
+// ---------------------------------------------------------------------------------------------
+// o3d-j625 r2 (Codex HIGH 1) — THE TRANSACTIONAL FAMILY, SWEPT BY THE SAME RULE
+//
+// `queueAccountingSyncTx` writes the sync row inside a CALLER's transaction; it takes the same
+// `chartConnector`, with the same meaning, and its callers had the same defect. Three call shapes
+// exist and all three are production shapes, so all three are needles:
+//
+//   queueAccountingSyncTx(tx, { … })                            direct, and `deps.`/`params.deps.`-
+//                                                               qualified (the injected form in
+//                                                               cancellation-service and
+//                                                               purchase-invoice-update-sync)
+//   queueAccountingSyncTxWithOutcome(tx, { … })                 the outcome-reporting adapter
+//   (options.queueAccountingSync ?? queueAccountingSyncTx)(tx, …)  lib/cost-layers.ts's injected form
+//
+// The third one is why the needles are not simply "an identifier followed by (": the callee there is a
+// parenthesised expression, so the argument list opens after a `)`. A sweep that missed it would have
+// silently excused the site with the WIDEST window in the whole family — a landed-cost recalculation
+// that has already taken cost-layer and stock locks and enqueues once per affected shipment.
+// ---------------------------------------------------------------------------------------------
+
+const TX_CALLS = [
+  'queueAccountingSyncTxWithOutcome(',
+  'queueAccountingSyncTx(',
+  // The parenthesised-callee form. Listed as its own needle rather than handled by a cleverer parser:
+  // one more literal is cheaper to read, and cheaper to be sure of, than a callee-expression grammar.
+  'queueAccountingSyncTx)(',
+] as const
+
+/**
+ * The SECOND argument of an argument list `(a, b, …)`, or null when there is no second argument.
+ *
+ * Both transactional enqueues take the transaction first and the request second, so unlike the facade
+ * the object of interest is not the first thing inside the parens. Top-level commas only — a comma
+ * inside the transaction expression or inside the request object is not an argument separator.
+ */
+export function secondArgument(argumentList: string): string | null {
+  let depth = 0
+  let firstEnded = -1
+  for (let i = 0; i < argumentList.length; i++) {
+    const ch = argumentList[i]
+    if ('({['.includes(ch)) { depth++; continue }
+    if (')}]'.includes(ch)) {
+      depth--
+      if (depth === 0) break
+      continue
+    }
+    if (depth === 1 && ch === ',') { firstEnded = i; break }
+  }
+  if (firstEnded === -1) return null
+  let j = firstEnded + 1
+  while (j < argumentList.length && /\s/.test(argumentList[j])) j++
+  if (argumentList[j] !== '{') return null
+  return balancedFrom(argumentList, j)
+}
+
+function txCallSites(file: string, source: string): Site[] {
+  const code = blankNonCode(source)
+  const sites: Site[] = []
+  for (const needle of TX_CALLS) {
+    let from = 0
+    for (;;) {
+      const at = code.indexOf(needle, from)
+      if (at === -1) break
+      from = at + needle.length
+      // `queueAccountingSyncTxWithOutcome(` starts with neither of the other needles' text followed by
+      // `(`, so the three cannot double-count one call. A qualified callee (`deps.`, `params.deps.`) IS
+      // counted — that is the real enqueue in production — but the DECLARATIONS in lib/accounting.ts are
+      // not calls, and are recognised by the `function` keyword rather than by excluding the file.
+      if (/(?:^|[^\w$])function\s+$/.test(code.slice(0, at))) continue
+      const line = source.slice(0, at).split('\n').length
+      const open = at + needle.length - 1
+      const argumentList = balancedFrom(code, open)
+      const objectText = secondArgument(argumentList)
+      sites.push({
+        file,
+        line,
+        argument: objectText,
+        raw: objectText === null
+          ? null
+          : source.slice(open + argumentList.indexOf(objectText), open + argumentList.indexOf(objectText) + objectText.length),
+        namesChart: objectText !== null && ownProperty(objectText, 'chartConnector') !== null,
+        namesPin: objectText !== null && ownProperty(objectText, 'connector') !== null,
+      })
+    }
+  }
+  return sites
+}
+
+function allTxCallSites(): Site[] {
+  return productionSources().flatMap(([file, source]) => txCallSites(file, source))
+}
+
+test('[o3d-j625 r2] every IN-TRANSACTION accounting enqueue in app/ and lib/ names the chart its account codes came from', () => {
+  const sites = allTxCallSites()
+
+  // THE PRECONDITION, ASSERTED, AND THE FLOOR IS THE REAL TOTAL. r1's floor of 11 was the facade alone;
+  // the transactional sweep found SIXTEEN more — five in app/actions/purchase-orders.ts, two in
+  // app/actions/manufacturing.ts, two in lib/domain/purchasing/landed-cost-service.ts, and one each in
+  // app/actions/sales.ts, lib/accounting.ts, lib/cost-layers.ts,
+  // lib/domain/accounting/invoice-payment-enqueue.ts, lib/domain/purchasing/cancellation-service.ts,
+  // lib/domain/purchasing/purchase-invoice-update-sync.ts and lib/domain/sales/allocation-service.ts.
+  // A floor rather than an equality so a new enqueue does not fail this test for the wrong reason.
+  assert.ok(
+    sites.length >= 16,
+    `expected at least the 16 in-transaction enqueue call sites the o3d-j625 r2 sweep enumerated, found `
+    + `${sites.length}. The detector is not examining the source it claims to.`,
+  )
+
+  const unreadable = sites.filter((site) => site.argument === null)
+  assert.deepEqual(
+    unreadable.map((site) => `${site.file}:${site.line}`),
+    [],
+    'the detector could not read the request argument of these calls. FAIL CLOSED: a call this cannot '
+    + 'parse is a hole in the census, not a passing site.',
+  )
+
+  const unattributed = sites
+    .filter((site) => !site.namesChart)
+    .map((site) => `${site.file}:${site.line}`)
+  assert.deepEqual(
+    unattributed,
+    [],
+    'these in-transaction enqueues do not say whose chart of accounts their payload was built from '
+    + '(o3d-j625). Pass `chartConnector: <settings>.connector`. NOTE: unlike the facade rule above, a '
+    + '`connector` PIN does not excuse a missing chart here — the pin is a proof about a LEDGER and '
+    + 'says nothing about whose account NUMBERS are on the page, and `refuseUnattributableChart` '
+    + 'refuses the two when they disagree, so naming both is what makes the agreement checked rather '
+    + 'than assumed.',
+  )
+})
+
+test('[o3d-j625 r2] the whole census — facade plus transactional — is at least 27 sites', () => {
+  // The number r1's scoping decision turned into "11 fixed, 16 filed". It is asserted as ONE total so
+  // that shrinking either half is visible even if the other half grows.
+  const total = allFacadeCallSites().length + allTxCallSites().length
+  assert.ok(
+    total >= 27,
+    `the o3d-j625 sweep covers 27 accounting enqueue call sites (11 facade + 16 in-transaction); the `
+    + `census now sees ${total}. A census that stops seeing its subjects proves nothing about them.`,
+  )
+})
+
+test('[o3d-j625 r2] the transactional census names the files it examined, so a shrinking sweep is visible', () => {
+  const files = [...new Set(allTxCallSites().map((site) => site.file))].sort()
+  for (const expected of [
+    'app/actions/manufacturing.ts',
+    'app/actions/purchase-orders.ts',
+    'app/actions/sales.ts',
+    'lib/accounting.ts',
+    'lib/cost-layers.ts',
+    'lib/domain/accounting/invoice-payment-enqueue.ts',
+    'lib/domain/purchasing/cancellation-service.ts',
+    'lib/domain/purchasing/landed-cost-service.ts',
+    'lib/domain/purchasing/purchase-invoice-update-sync.ts',
+    'lib/domain/sales/allocation-service.ts',
+  ]) {
+    assert.ok(files.includes(expected), `the census no longer examines ${expected}. Files: ${files.join(', ')}`)
+  }
+})
+
+// ---------------------------------------------------------------------------------------------
+// THE TRANSACTIONAL DETECTOR CAN FIRE
+// ---------------------------------------------------------------------------------------------
+
+test('[o3d-j625 r2] the transactional detector FIRES on an unattributed in-transaction enqueue', () => {
+  const sites = txCallSites('fixture.ts', `
+    const settings = await getAccountingSettings()
+    await queueAccountingSyncTx(tx, {
+      type: 'COGS_JOURNAL',
+      referenceType: 'PurchaseOrder',
+      referenceId: po.id,
+      payload: { lines: [{ accountCode: settings.cogsAccount }] },
+    })
+  `)
+  assert.equal(sites.length, 1)
+  assert.equal(sites[0].namesChart, false)
+})
+
+test('[o3d-j625 r2] it reads all three call shapes, including the parenthesised callee', () => {
+  const direct = txCallSites('fixture.ts', `
+    await queueAccountingSyncTx(tx, { type: 'COGS_JOURNAL', payload, chartConnector: settings.connector })
+  `)
+  assert.equal(direct.length, 1)
+  assert.equal(direct[0].namesChart, true, 'the direct call')
+
+  const adapter = txCallSites('fixture.ts', `
+    await queueAccountingSyncTxWithOutcome(tx, { ...sync, chartConnector })
+  `)
+  assert.equal(adapter.length, 1, 'the adapter is one site, not two — the needles must not double-count')
+  assert.equal(adapter[0].namesChart, true, 'and shorthand is still an attribution')
+
+  const injected = txCallSites('fixture.ts', `
+    await (options.queueAccountingSync ?? queueAccountingSyncTx)(tx, {
+      type: 'COGS_REVERSAL',
+      chartConnector: settings.connector,
+    })
+  `)
+  assert.equal(injected.length, 1, 'lib/cost-layers.ts’s parenthesised callee is a call site')
+  assert.equal(injected[0].namesChart, true)
+
+  const qualified = txCallSites('fixture.ts', `
+    await deps.queueAccountingSyncTx(tx, { type: 'INVENTORY_ADJUSTMENT', chartConnector: s.connector })
+    await params.deps.queueAccountingSyncTx(params.tx, { type: 'PURCHASE_INVOICE_UPDATE', chartConnector })
+  `)
+  assert.equal(qualified.length, 2, 'an injected dependency IS the enqueue in production')
+  assert.deepEqual(qualified.map((site) => site.namesChart), [true, true])
+})
+
+test('[o3d-j625 r2] the parenthesised-callee needle really is load-bearing', () => {
+  // The hole a needle set of only `queueAccountingSyncTx(` would have had: lib/cost-layers.ts's call is
+  // `…queueAccountingSyncTx)(tx, {…})`, where the name is followed by `)`, not `(`. Proved by removing
+  // the needle from the picture rather than argued.
+  const source = "await (options.queueAccountingSync ?? queueAccountingSyncTx)(tx, { type: 'COGS_REVERSAL' })"
+  assert.equal(source.includes('queueAccountingSyncTx('), false, 'the plain needle does not occur at all')
+  assert.equal(source.includes('queueAccountingSyncTx)('), true, 'only this one does')
+  assert.equal(txCallSites('fixture.ts', source).length, 1, 'and the sweep finds it')
+})
+
+test('[o3d-j625 r2] the transactional detector ignores declarations, types and prose', () => {
+  const sites = txCallSites('lib/accounting.ts', `
+    export async function queueAccountingSyncTx(
+      tx: Prisma.TransactionClient,
+      params: { type: AccountingSyncType },
+    ): Promise<boolean> { return false }
+    export async function queueAccountingSyncTxWithOutcome(
+      tx: Prisma.TransactionClient,
+      params: Omit<Parameters<typeof queueAccountingSyncTx>[1], 'reportOutcome'>,
+    ): Promise<AccountingEnqueueOutcome> { return { queued: false, reason: 'refused', connector: null } }
+    type Deps = {
+      queueAccountingSyncTx: typeof queueAccountingSyncTx
+      other: (tx: Tx, params: QueueAccountingSyncTxParams) => Promise<boolean>
+    }
+    const deps = { queueAccountingSyncTx, recordTransitSubledgerMovement }
+    // await queueAccountingSyncTx(tx, { type: 'COGS_JOURNAL' }) in a comment
+    const prose = 'queueAccountingSyncTx(tx, {})'
+  `)
+  assert.deepEqual(sites, [], `nothing here is a call: ${JSON.stringify(sites)}`)
+})
+
+test('[o3d-j625 r2] the transactional detector FAILS CLOSED where the request is not a literal', () => {
+  const sites = txCallSites('fixture.ts', 'await queueAccountingSyncTxWithOutcome(tx, sync)')
+  assert.equal(sites.length, 1)
+  assert.equal(sites[0].argument, null, 'a non-literal request is a hole, and must be reported as one')
+  assert.equal(sites[0].namesChart, false)
+
+  // And a call with no second argument at all is also a hole rather than a pass.
+  assert.equal(secondArgument('(tx)'), null)
+  assert.equal(secondArgument('(tx, sync)'), null)
+  assert.equal(secondArgument('(tx, { a: 1 })'), '{ a: 1 }')
+  // A comma inside the FIRST argument is not an argument separator.
+  assert.equal(secondArgument('(db.tx(a, b), { a: 1 })'), '{ a: 1 }')
+})
+
+// ---------------------------------------------------------------------------------------------
+// o3d-j625 r2 — THE PARAMETER IS REQUIRED, WHICH IS THE HALF NO CENSUS CAN ESTABLISH
+//
+// A census reads the calls that exist. It cannot say that a call omitting the parameter is
+// IMPOSSIBLE, and "an optional parameter is not a seam, it is the defect with a default" is the
+// reviewer's ruling on why that matters: r1 made the census the whole rule, so any new call site — or
+// any site a refactor rewrote — could silently take the old behaviour back and the census would only
+// notice if someone remembered to keep it passing. The type system notices without being remembered.
+// ---------------------------------------------------------------------------------------------
+
+test('[o3d-j625 r2] `chartConnector` is declared REQUIRED on both enqueues and on the chart itself', () => {
+  const source = productionSources().find(([file]) => file === 'lib/accounting.ts')
+  assert.ok(source, 'lib/accounting.ts was not scanned')
+  const code = blankNonCode(source[1])
+
+  // AN ABSENCE CHECK, DELIBERATELY. An existential "the required form appears" would be satisfied by
+  // one required declaration sitting beside an optional one; this cannot be.
+  const optional = code.match(/chartConnector\s*\?\s*:/g) ?? []
+  assert.deepEqual(
+    optional,
+    [],
+    `chartConnector is declared OPTIONAL ${optional.length} time(s) in lib/accounting.ts. An optional `
+    + 'parameter lets a caller silently get the second-resolution behaviour back, which is the defect '
+    + 'o3d-j625 closes (Codex r1 HIGH 1). Declare it required; `null` is how a caller says "no '
+    + 'connector was switched on when I read the chart".',
+  )
+
+  // And it really is declared, three times: the shared guard, the facade, the in-transaction enqueue.
+  // Counted so that DELETING a declaration cannot pass the absence check above by vacuity.
+  // Matched on the BLANKED code, so a doc comment describing the shape cannot stand in for a
+  // declaration — and with a wildcard inside the index, because `blankNonCode` empties string bodies:
+  // `AccountingConnectorInfo['id']` reads as `AccountingConnectorInfo['  ']` there.
+  const required = code.match(/chartConnector:\s*AccountingConnectorInfo\[[^\]]*\]\s*\|\s*null/g) ?? []
+  assert.equal(
+    required.length,
+    3,
+    'expected the required declaration on refuseUnattributableChart, queueAccountingSync and '
+    + `queueAccountingSyncTx — found ${required.length}. ${JSON.stringify(required)}`,
+  )
+
+  // The chart object's own connector, which is what every site above passes. Required for the same
+  // reason: an optional field on `AccountingSettings` would make `settings.connector` an `undefined`
+  // that type-checks straight through the required parameter.
+  // Scoped to the AccountingSettings declaration itself rather than to the whole file: the PIN
+  // (`connector?: AccountingConnectorInfo['id']`) IS legitimately optional on both enqueues, so a
+  // file-wide absence check on `connector?:` would be red for the wrong reason — and green only if
+  // someone deleted the pin.
+  const settingsAt = code.indexOf('export type AccountingSettings = {')
+  assert.ok(settingsAt > 0, 'the AccountingSettings declaration was not found')
+  const settingsBody = balancedFrom(code, code.indexOf('{', settingsAt))
+  assert.ok(
+    /\n  connector: AccountingConnectorInfo\[[^\]]*\] \| null\n/.test(settingsBody),
+    'AccountingSettings.connector must be a REQUIRED field naming the chart’s own connector',
+  )
+  assert.equal(
+    /connector\s*\?\s*:/.test(settingsBody),
+    false,
+    'AccountingSettings.connector must not be optional: `settings.connector` would then be an '
+    + '`undefined` that type-checks straight through the required enqueue parameter',
+  )
+})
+
+test('[o3d-j625 r2] the required-declaration check can fire', () => {
+  // The pre-r2 text, verbatim from the branch this replaced, and the shape a "fix" would regress to.
+  for (const optional of [
+    "    chartConnector?: AccountingConnectorInfo['id'] | null",
+    '  chartConnector ?: string | null',
+  ]) {
+    assert.match(optional, /chartConnector\s*\?\s*:/, 'the absence check would not have seen this')
+  }
+  // ...and the required form is NOT matched by it, so the check is not simply always-red.
+  assert.equal(
+    /chartConnector\s*\?\s*:/.test("  chartConnector: AccountingConnectorInfo['id'] | null"),
+    false,
+  )
 })

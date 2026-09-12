@@ -949,6 +949,13 @@ export async function updateManufacturingOrderStatus(
                 type: 'MANUFACTURING_JOURNAL',
                 referenceType: 'ProductionOrder',
                 referenceId: id,
+                // o3d-j625 r2: every line of this journal is `settings.*` — `settings.inventoryAccount`
+                // on the debit, and `settings.manufacturingOverheadAccount` as the fallback account on
+                // each credit line (and written BACK onto the cost lines just above, which makes the
+                // attribution durable rather than incidental). The transaction that encloses this
+                // consumes components, creates output cost layers and recovers disassembly cost first,
+                // so the window between the chart read and the enqueue spans the whole completion.
+                chartConnector: settings.connector,
                 idempotencyKey: `MFG_JOURNAL:${id}:${stableHash({
                   completedAt: now.toISOString(),
                   lines,
@@ -1726,6 +1733,17 @@ export async function updateManufacturingCostLines(
               type: 'MANUFACTURING_RECLASS',
               referenceType: 'ProductionOrder',
               referenceId: productionOrderId,
+              // o3d-j625 r2: `settings.inventoryAccount` and `settings.cogsAccount` are the
+              // capitalisation legs and the overhead legs are the cost lines' own stored
+              // `accountCode`s — which were themselves defaulted from `settings
+              // .manufacturingOverheadAccount` when the order completed.
+              //
+              // `settings` is read exactly when `shouldPostReclass` is true and this whole block is
+              // inside `if (shouldPostReclass)`, so the `null` arm is unreachable. Written as a fallback
+              // rather than a `!` assertion because the two facts are three nested blocks apart — and
+              // `null` is the fail-closed answer anyway: it writes nothing instead of posting a reclass
+              // whose chart nobody read.
+              chartConnector: settings?.connector ?? null,
               idempotencyKey: reclassIdempotencyKey,
               payload: {
                 date: new Date().toISOString().slice(0, 10),

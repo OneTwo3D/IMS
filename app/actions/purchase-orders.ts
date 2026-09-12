@@ -5,7 +5,7 @@ import { z } from 'zod'
 import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
 import { requirePermission } from '@/lib/auth/server'
-import { queueAccountingSync, queueAccountingSyncTx, getAccountingSettings, getActiveAccountingConnectorInfo, isAccountingSyncTypeEnabled, listAccountingBankAccounts, type AccountingBankAccount } from '@/lib/accounting'
+import { queueAccountingSync, queueAccountingSyncTx, getAccountingSettings, getActiveAccountingConnectorInfo, isAccountingSyncTypeEnabled, listAccountingBankAccounts, listAccountingBankAccountsWithChart, type AccountingBankAccount } from '@/lib/accounting'
 import { accountingPayloadKey } from '@/lib/accounting/payload-key'
 import { multiComponentTaxRateNames } from '@/lib/accounting/multi-component-warning'
 import { enqueueStockSync } from '@/lib/shopping'
@@ -2079,6 +2079,13 @@ export async function receivePurchaseOrder(
           referenceId: id,
           payload,
           idempotencyKey: receiptIdempotencyKey,
+          // o3d-j625 r2: the row is routed by the SAME `accountingSettings` object whose
+          // `inventoryAccount` and `transitAccount` are the two lines of `payload` above. That read
+          // happens before the receipt transaction opens and the transaction posts stock, updates
+          // freight POs and recomputes landed cost in between, so the window is wide; routing by the
+          // chart means a connector switch inside it refuses the enqueue instead of writing the new
+          // connector's row with the old connector's codes.
+          chartConnector: accountingSettings.connector,
         })
         // 6oyu.4 (khdw): receipt DR inventory / CR transit → CREDITS the transit
         // clearing account (drains goods-in-transit into inventory). Record the transit
@@ -2573,6 +2580,9 @@ export async function returnPurchaseOrder(
           referenceId: purchaseReturn.id,
           payload,
           idempotencyKey: returnIdempotencyKey,
+          // o3d-j625 r2: `payload.lines` are `accountingSettings.transitAccount` and
+          // `accountingSettings.inventoryAccount`, so the row goes through that chart's connector.
+          chartConnector: accountingSettings.connector,
         })
         // 6oyu.4 (khdw): a supplier return reverses received stock DR transit / CR
         // inventory → DEBITS the transit clearing account (+amount). Record the transit
@@ -3018,6 +3028,12 @@ export async function createInvoice(
           referenceId: createdInvoice.id,
           payload: accountingPayload,
           idempotencyKey: billIdempotencyKey,
+          // o3d-j625 r2: `accountingPayload` is built by `buildPurchaseInvoiceAccountingPayload` from
+          // `accountingSettings.transitAccount` and `accountingSettings.reverseChargePurchaseTaxType`
+          // — one connector's clearing account and one connector's tax-type code. A bill posted to the
+          // other connector's books against a transit account that does not exist there is rejected or,
+          // worse, matched to an unrelated account of the same number.
+          chartConnector: accountingSettings.connector,
         })
         // 6oyu.4 (khdw): the bill DEBITS the transit clearing account by its NET
         // subtotal (the ACCPAY bill posts EXCLUSIVE — all product + cost lines are
@@ -3406,11 +3422,15 @@ export async function updateInvoice(
         poReference: invoice.po.reference,
         accountingInvoiceId: invoice.accountingInvoiceId,
         accountingPayload,
+        // o3d-j625 r2: `accountingPayload` above carries `accountingSettings.transitAccount` on every
+        // line and `accountingSettings.reverseChargePurchaseTaxType` on its tax code, so the update is
+        // routed by THAT chart's connector — and `maybeQueuePurchaseInvoiceUpdate` now takes its
+        // Xero-only verdict from this value instead of resolving the connector for itself.
+        chartConnector: accountingSettings.connector,
         idempotencyKey,
         previousSubtotalBase: Number(lockedInvoice.subtotalBase),
         newSubtotalBase: Number(invoiceCalculation.subtotalBase),
         deps: {
-          getActiveAccountingConnectorInfo,
           isAccountingSyncTypeEnabled,
           queueAccountingSyncTx,
           recordTransitSubledgerMovement,
@@ -3517,7 +3537,11 @@ export async function markBillPaid(
     if (!input.paymentDate) return { success: false, error: 'Payment date is required' }
 
     // Resolve bank account name for snapshot (connector-agnostic).
-    const accounts = await listAccountingBankAccounts()
+    // o3d-j625 r2: AND WHOSE ACCOUNTS THESE ARE, from the same read. `input.bankAccountId` is validated
+    // against this list and then goes into the BILL_PAYMENT payload verbatim — it is the CONNECTOR'S OWN
+    // account id, not a chart code, so it is meaningless in the other connector's books. `chartConnector`
+    // below is this connector, so the enqueue cannot write the payment under the other one.
+    const { connector: bankAccountChartConnector, accounts } = await listAccountingBankAccountsWithChart()
     const account = accounts.find((a) => a.id === input.bankAccountId)
     if (!account) return { success: false, error: 'Unknown bank account' }
 
@@ -3617,6 +3641,14 @@ export async function markBillPaid(
               currency: invoice.po.currency,
               reference: input.reference ?? undefined,
             },
+            // o3d-j625 r2: the connector that answered the bank-account list this payment's
+            // `bankAccountId` was validated against. `accountingInvoiceId` is likewise that connector's
+            // own document id. Neither is a chart CODE, which makes the mis-attribution worse rather
+            // than better: a payment queued to the other ledger names two primary keys it does not hold.
+            // A refusal here rolls the whole transaction back through `BillPaymentEnqueueDeclined`, so
+            // the bill is not left marked PAID with nothing queued — which is the invariant this
+            // in-transaction enqueue exists to hold.
+            chartConnector: bankAccountChartConnector,
           })
           if (!queued) throw new BillPaymentEnqueueDeclined(invoice.accountingInvoiceId)
         }
@@ -3939,7 +3971,12 @@ export async function postSupplierCreditNote(id: string): Promise<{ success: boo
 
     // Resolve connector/settings BEFORE the transaction (Codex review: a lookup
     // failure must not occur after the row is already POSTED).
-    const connector = await getActiveAccountingConnectorInfo()
+    //
+    // o3d-j625 r2: ONE resolution, not two. This used to call `getActiveAccountingConnectorInfo()`
+    // beside `getAccountingSettings()`, which resolves the active connector for itself — so the
+    // Xero-only gate below and the account codes in the payload were two independent answers to the
+    // same question, and the enqueue made it three. `settings.connector` is the connector the chart
+    // came from, and it is now what the gate reads and what routes the row.
     const settings = await getAccountingSettings()
 
     // Mirror the bill's tax treatment, derived from the PO LINES' effective tax
@@ -3973,7 +4010,7 @@ export async function postSupplierCreditNote(id: string): Promise<{ success: boo
     // Xero-only: the ACCPAYCREDIT poster exists for Xero. For other connectors the
     // credit note still records as POSTED in IMS (consistent with sync being off).
     const shouldQueueXero =
-      connector?.id === 'xero' && settings.syncEnabled && (await isAccountingSyncTypeEnabled('PURCHASE_CREDIT_NOTE'))
+      settings.connector === 'xero' && settings.syncEnabled && (await isAccountingSyncTypeEnabled('PURCHASE_CREDIT_NOTE'))
 
     // CRITICAL (Codex review): claim DRAFT->POSTED and enqueue the sync in ONE
     // transaction. If the queue insert fails, the whole tx rolls back and the row
@@ -4015,6 +4052,11 @@ export async function postSupplierCreditNote(id: string): Promise<{ success: boo
             allocateAmount: Number(cn.amountForeign),
           }),
           idempotencyKey: `supplier-credit-note:${cn.id}`,
+          // o3d-j625 r2: `settings.transitAccount` is on every line of the payload above and
+          // `settings.reverseChargePurchaseTaxType` decides its tax code, so the row is routed by that
+          // chart's own connector. The gate above already requires it to be Xero; naming it here is what
+          // makes the row and the codes ONE read rather than two that happen to agree.
+          chartConnector: settings.connector,
         })
         // 6oyu.4 (khdw): the ACCPAYCREDIT CREDITS the transit clearing account by its
         // NET (the credit posts INCLUSIVE, so Xero splits net→transit + VAT→tax) —

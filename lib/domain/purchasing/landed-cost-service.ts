@@ -812,6 +812,13 @@ export async function queueLandedCostAdjustmentJournals(
         referenceId: adj.primaryPoId,
         payload,
         idempotencyKey: reclassIdempotencyKey,
+        // o3d-j625 r2: `payload`'s two lines are `settings.inventoryAccount` and
+        // `settings.transitAccount` from the ONE `getAccountingSettings()` at the top of
+        // `queueLandedCostAdjustmentJournals`. That read is outside the loop, and each iteration opens
+        // its OWN transaction — so a connector switch part-way through a multi-PO recalculation used to
+        // split one run's journals across two ledgers while every one of them carried the first
+        // connector's codes. Routed by the chart, the later ones refuse instead.
+        chartConnector: settings.connector,
       })
       if (queued) {
         await recordTransitSubledgerMovement(tx, {
@@ -866,6 +873,9 @@ export async function queueLandedCostAdjustmentJournals(
         referenceId: adj.primaryPoId,
         payload,
         idempotencyKey: cogsIdempotencyKey,
+        // o3d-j625 r2: `settings.cogsAccount` and `resolveConsumedCogsOffsetAccount(settings)` — the
+        // same `settings` object as the reclass loop above, and the same per-iteration transaction.
+        chartConnector: settings.connector,
       })
       if (queued) {
         await recordCogsSubledgerMovement(tx, {

@@ -165,6 +165,11 @@ const REVERSAL = {
   referenceType: 'SalesOrderRefund',
   referenceId: 'refund-1',
   payload: { lines: [{ accountCode: '630', debit: 16 }, { accountCode: '631', credit: 16 }] },
+  // o3d-j625 r2: required on the enqueue now, and it names the same ledger as the pin — a pin and a
+  // chart that disagree are refused, so that is the only combination a pinned request can have. The
+  // chart check is POOLED, so in the window tests below it sees `stalePooled`'s "xero is still active"
+  // and passes; the refusal that follows is still the locked fence's.
+  chartConnector: 'xero' as const,
 }
 
 /**

@@ -262,10 +262,40 @@ test('o3d-2sm1 r7: every enqueue in the refund hand-off is accounted for, and it
   // r8: THROUGH THE ADAPTER, which is what carries the enqueue's own resolved connector out to the
   // ledger. A bare `queueAccountingSyncTx` here would hand back a boolean again and the pinned check
   // would have nothing to check.
-  assert.match(handoff, /queueAccountingSyncTxWithOutcome\(tx, sync\)/)
+  // o3d-j625 r2: the request is no longer passed bare — `chartConnector` is restated as an own property
+  // so the o3d-j625 census can see this site, and because TypeScript drops the narrowing that
+  // distinguishes a staged `null` chart from an absent one once the property is read inside this
+  // closure. The fact being asserted is unchanged: the ADAPTER, carrying `sync`, not a bare boolean.
+  assert.match(handoff, /queueAccountingSyncTxWithOutcome\(tx, \{\n\s*\.\.\.sync,\n\s*chartConnector,\n\s*\}\)/)
   assert.ok(
-    !/await queueAccountingSyncTx\(tx, sync\)/.test(handoff),
+    !/await queueAccountingSyncTx\(tx, /.test(handoff),
     'the bare-boolean enqueue must not be what this hand-off accounts for',
+  )
+
+  // o3d-j625 r2 (Codex HIGH 2) — A STAGED REQUEST THAT CANNOT NAME ITS CHART IS REFUSED BEFORE ANY
+  // ENQUEUE, AND ACCOUNTED AS OWED.
+  //
+  // Three states cross the `accountingRetrySyncs` round trip: an id, `null` ("nothing was switched on
+  // when the codes were read" — write nothing), and ABSENT (persisted before the field existed —
+  // unattributable). The third cannot be routed and cannot be called `null` either, because
+  // `not-configured` is the one no-op the obligation ledger may settle with. So it is accounted
+  // `refused`, which leaves `accountingRetryRequired` set, and it must happen BEFORE either enqueue.
+  const uncharteredAt = handoff.indexOf('if (sync.chartConnector === undefined) {')
+  assert.ok(uncharteredAt > -1, 'the hand-off must refuse a staged request that names no chart')
+  assert.ok(
+    uncharteredAt < handoff.indexOf('queueAccountingSyncTxWithOutcome('),
+    'and it must refuse BEFORE any enqueue — after one, the row is already written',
+  )
+  assert.match(
+    handoff.slice(uncharteredAt, uncharteredAt + 2000),
+    /ledger\.account\(sync, \{ queued: false, reason: 'refused', connector: null \}\)/,
+    'the refusal must be ACCOUNTED as owed, not skipped: a `continue` that told the ledger nothing '
+    + 'would let settle() discharge an obligation nobody met',
+  )
+  assert.match(
+    handoff.slice(uncharteredAt, uncharteredAt + 2000),
+    /action: 'refund_accounting_replay_unchartered'/,
+    'and it must leave a record naming what has to be decided by hand',
   )
   assert.match(handoff, /ledger\.accountInTransaction\(sync, outcomeInTx\)/)
   // And the COGS subledger row is still recorded on the queue's OWN decision, not a second recheck.
@@ -290,7 +320,8 @@ test('o3d-2sm1 r7: no enqueue path returns without saying what it did', () => {
    * ledger. The capability is unchanged; it now runs through the one fenced conversion, and what is
    * asserted for them is that conversion WITH THE PIN PASSED (dropping the pin silently restores the
    * unfenced answer). The facade keeps a literal for its `!connector` exit, which a pin cannot reach
-   * by construction — `connector` is `params.connector ?? <resolved>`.
+   * by construction — `connector` is `params.connector ?? params.chartConnector`, and a `null` chart is
+   * answered before it (o3d-j625 r2 deleted the `?? <resolved>` tail that used to end that chain).
    */
   for (const [file, fn, saysNothingWillPost] of [
     [

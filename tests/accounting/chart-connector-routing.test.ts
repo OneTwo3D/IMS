@@ -255,7 +255,7 @@ function salesInvoiceRequest(salesAccount: string) {
 // 1. THE RIG CAN FIND THE DEFECT
 // --------------------------------------------------------------------------------------------
 
-test('[o3d-j625] THE DEFECT, AS PRODUCTION PRODUCES IT: an UNCHARTERED enqueue writes QuickBooks’s row carrying Xero’s account codes', async () => {
+test('[o3d-j625] THE RIG CAN SEE THE DEFECT: a QuickBooks row carrying Xero’s account codes is observable through this fixture', async () => {
   reset(['xero'])
   const { getAccountingSettings, queueAccountingSync } = await import('@/lib/accounting')
 
@@ -269,13 +269,59 @@ test('[o3d-j625] THE DEFECT, AS PRODUCTION PRODUCES IT: an UNCHARTERED enqueue w
   // line map. Nothing in the unpinned path serialises against it and nothing is meant to.
   enabledPlugins = ['quickbooks']
 
-  const outcome = await queueAccountingSync(salesInvoiceRequest(settings.salesAccount))
+  // o3d-j625 r2 — WHY THIS CONTROL CHANGED SHAPE, AND WHAT IT STILL ESTABLISHES.
+  //
+  // r1's control reproduced the defect by OMITTING `chartConnector`, because omitting it meant "resolve
+  // the connector again". As of r2 the parameter is required and an omission is REFUSED at runtime too
+  // (see refuseUnattributableChart), so that state no longer produces a row at all — the test below
+  // pins that. What this control still has to establish is that the mis-attributed row is OBSERVABLE
+  // through this fixture: without it, every "nothing was written" assertion in this file could be
+  // passing because the fixture cannot write anything.
+  //
+  // So it is produced the only way left: a caller that NAMES A CHART THAT IS NOT ITS OWN. The payload's
+  // one account code is Xero's `X-SALES`, the call claims QuickBooks, QuickBooks is active — and the
+  // facade dutifully writes a QuickBooks row carrying a Xero account code. That is exactly the row the
+  // defect produced, and it is a reminder of what this mechanism does NOT prove: it proves every
+  // enqueue is ATTRIBUTED, never that the attribution is TRUE. The truth of each attribution is
+  // established per site by the SITE tests at the foot of
+  // tests/accounting/chart-connector-call-sites.test.ts.
+  const outcome = await queueAccountingSync({
+    ...salesInvoiceRequest(settings.salesAccount),
+    chartConnector: 'quickbooks',
+  })
 
   // The mis-attribution, in one assertion: the row is QuickBooks's, the code on it is Xero's.
   assert.equal(outcome.queued, true)
   assert.equal(routed.length, 1)
-  assert.equal(routed[0].queue, 'quickbooks', 'the row is written under the LAST resolution')
-  assert.equal(routed[0].salesAccount, 'X-SALES', 'while its account code came from the FIRST')
+  assert.equal(routed[0].queue, 'quickbooks', 'the row is written under the connector the call NAMED')
+  assert.equal(routed[0].salesAccount, 'X-SALES', 'while its account code came from Xero’s chart')
+})
+
+test('[o3d-j625 r2] an UNCHARTERED enqueue — reachable only by a cast now — is REFUSED, not resolved again', async () => {
+  reset(['xero'])
+  const { getAccountingSettings, queueAccountingSync } = await import('@/lib/accounting')
+  const settings = await getAccountingSettings()
+  assert.equal(settings.connector, 'xero', 'precondition: the chart read resolved Xero')
+  enabledPlugins = ['quickbooks']
+
+  // THE r1 BEHAVIOUR, ASSERTED AWAY. r1 returned `null` from the chart guard for an absent chart and
+  // carried on to `params.connector ?? params.chartConnector ?? await getActiveAccountingConnectorId()`
+  // — the second resolution, which wrote the row above. The cast is what a JS caller, an `as never` in
+  // a test, or a future refactor that loosened the type would look like, and none of them may get the
+  // old behaviour back.
+  const outcome = await queueAccountingSync(
+    salesInvoiceRequest(settings.salesAccount) as unknown as Parameters<typeof queueAccountingSync>[0],
+  )
+
+  assert.equal(routed.length, 0, 'NOTHING may be written for a payload whose chart nobody named')
+  assert.equal(outcome.queued, false)
+  assert.equal(
+    outcome.reason,
+    'refused',
+    'and the posting is OWED — `not-configured` is the one no-op an obligation ledger may settle with, '
+    + 'and nothing here established that no counterpart will ever exist',
+  )
+  assert.equal(outcome.connector, null, 'no connector can be named, because none was')
 })
 
 // --------------------------------------------------------------------------------------------
@@ -401,6 +447,49 @@ test('[o3d-j625] the refusal is RECORDED, because almost every site it protects 
   assert.match(refusals[0].description, /still OUTSTANDING/)
   assert.match(refusals[0].description, /SALES_INVOICE for SalesOrder order-1/)
   assert.equal(refusals[0].metadata?.chartConnector, 'xero')
+
+  // o3d-j625 r2 (Codex MEDIUM 2) — AND IT NAMES THE CONNECTOR IT WAS REFUSED IN FAVOUR OF.
+  //
+  // r1 recorded only the chart. So the record said "built from Xero's chart, and Xero is no longer the
+  // active connector" and could not say what IS active — which is the half that decides what an
+  // operator does next (switch the selection back, or raise the posting in the other books). The
+  // reviewer's note is sharper than untidiness: no application consumer reads this action, the generic
+  // Activity page is the only reader, so whatever is not IN the record is not available anywhere.
+  assert.equal(
+    refusals[0].metadata?.activeConnector,
+    'quickbooks',
+    'the refusal must name the connector that is active NOW, not only the retired chart',
+  )
+  assert.match(
+    refusals[0].description,
+    /active accounting connector is now quickbooks/,
+    `the description must name both ends of the switch. Got: ${refusals[0].description}`,
+  )
+})
+
+test('[o3d-j625 r2] and when NOTHING is active, the refusal says that rather than naming a connector', async () => {
+  // The other end of MEDIUM 2: `activeConnector` is nullable, and a record whose only statement about
+  // it is an omitted field is indistinguishable from r1's record. `null` in the metadata and a sentence
+  // that reads as English in the description.
+  reset(['xero'])
+  const { getAccountingSettings, queueAccountingSync } = await import('@/lib/accounting')
+  const settings = await getAccountingSettings()
+  enabledPlugins = []
+
+  const outcome = await queueAccountingSync({
+    ...salesInvoiceRequest(settings.salesAccount),
+    chartConnector: settings.connector,
+  })
+
+  assert.equal(outcome.reason, 'refused', 'the posting is owed: the chart was real, the ledger is gone')
+  const refusals = activity.filter((entry) => entry.action === 'accounting_enqueue_refused_retired_chart')
+  assert.equal(refusals.length, 1)
+  assert.ok(
+    'activeConnector' in (refusals[0].metadata ?? {}),
+    'the field must be PRESENT and null, not absent — absent is what r1 wrote',
+  )
+  assert.equal(refusals[0].metadata?.activeConnector, null)
+  assert.match(refusals[0].description, /no accounting connector at all/)
 })
 
 test('[o3d-j625] a chartered enqueue reads the plugin selection ONCE — there is no second resolution left to disagree', async () => {
@@ -463,21 +552,46 @@ const TX_REQUEST = {
   unlockedOrderScopeReason: 'test harness: the order guard is doubled to a non-order scope',
 }
 
-test('[o3d-j625] the in-transaction enqueue routes by the chart too — and the unchartered control shows the same mis-attribution', async () => {
+test('[o3d-j625] the in-transaction rig can see the mis-attributed row too', async () => {
   reset(['xero'])
   const { getAccountingSettings, queueAccountingSyncTx } = await import('@/lib/accounting')
   const settings = await getAccountingSettings()
   enabledPlugins = ['quickbooks']
 
+  // The same control, and the same reason for its shape, as the facade one above: the row that must be
+  // OBSERVABLE for the refusal assertions below to mean anything — a QuickBooks row carrying Xero's
+  // `X-INV`. Produced by naming a chart that is not this payload's.
   const control = await queueAccountingSyncTx(transactionDouble() as never, {
     ...TX_REQUEST,
     payload: { lines: [{ accountCode: settings.inventoryAccount, debit: 10 }] },
+    chartConnector: 'quickbooks',
   })
 
   assert.equal(control, true)
   assert.equal(insertedInTx.length, 1)
-  assert.equal(insertedInTx[0].connector, 'quickbooks', 'the control: the row goes to the LAST resolution')
-  assert.equal(insertedInTx[0].salesAccount, 'X-INV', 'carrying the FIRST resolution’s inventory account')
+  assert.equal(insertedInTx[0].connector, 'quickbooks', 'the row goes to the connector the call NAMED')
+  assert.equal(insertedInTx[0].salesAccount, 'X-INV', 'carrying Xero’s inventory account')
+})
+
+test('[o3d-j625 r2] the in-transaction enqueue REFUSES an unchartered request as well', async () => {
+  reset(['xero'])
+  const { getAccountingSettings, queueAccountingSyncTx } = await import('@/lib/accounting')
+  const settings = await getAccountingSettings()
+  enabledPlugins = ['quickbooks']
+
+  const answered: { outcome?: { queued: boolean; reason?: string; connector: string | null } } = {}
+  const queued = await queueAccountingSyncTx(transactionDouble() as never, {
+    ...TX_REQUEST,
+    payload: { lines: [{ accountCode: settings.inventoryAccount, debit: 10 }] },
+    reportOutcome: (outcome: { queued: boolean; reason?: string; connector: string | null }) => {
+      answered.outcome = outcome
+    },
+  } as unknown as Parameters<typeof queueAccountingSyncTx>[1])
+
+  assert.equal(queued, false)
+  assert.deepEqual(insertedInTx, [], 'the in-transaction path must fail closed on an absent chart too')
+  assert.equal(answered.outcome?.reason, 'refused')
+  assert.equal(answered.outcome?.connector, null)
 })
 
 test('[o3d-j625] the in-transaction enqueue refuses a retired chart, and reports it as owed', async () => {

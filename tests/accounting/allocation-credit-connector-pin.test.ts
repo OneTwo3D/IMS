@@ -47,6 +47,15 @@ mock.module('@/lib/integration-plugins', {
   },
 })
 
+/**
+ * o3d-j625 r2: the chart refusal writes a WARNING activity. This file has no database double, and the
+ * refusal swallows a logging failure — so without this the test would pass for the wrong reason (a
+ * failed connection caught by `.catch`). Doubled so the write is a no-op that cannot fail.
+ */
+mock.module('@/lib/activity-log', {
+  namedExports: { logActivity: async () => undefined },
+})
+
 mock.module('@/lib/connectors/xero/queue', {
   namedExports: {
     queueXeroSync: async (params: { type: string; referenceId: string }) => {
@@ -102,7 +111,10 @@ test('o3d-i0o6 r3: a PINNED facade enqueue is answered BY the named connector, n
   enabledPlugins = ['xero', 'quickbooks']
 
   const { queueAccountingSync } = await import('@/lib/accounting')
-  const outcome = await queueAccountingSync({ ...REQUEST, connector: 'xero' })
+  // o3d-j625 r2: the chart is REQUIRED now and names the same ledger as the pin — the only combination
+  // a pinned enqueue can have. Xero is the active connector here, so the chart check passes and what is
+  // being asserted is still the pin.
+  const outcome = await queueAccountingSync({ ...REQUEST, connector: 'xero', chartConnector: 'xero' })
 
   assert.equal(outcome.connector, 'xero', 'the answer is about the PROVED ledger')
   assert.equal(outcome.queued, true)
@@ -118,7 +130,14 @@ test('o3d-i0o6 r7: a pin to a ledger that is no longer the ACTIVE connector writ
   assert.equal(xeroSyncEnabled, 'true', 'the premise: the pinned connector still posts, on its own gate')
 
   const { queueAccountingSync } = await import('@/lib/accounting')
-  const outcome = await queueAccountingSync({ ...REQUEST, connector: 'xero' })
+  // o3d-j625 r2: THE REFUSAL IS NOW TAKEN ONE STEP EARLIER, AND THE CONTRACT IS UNCHANGED.
+  //
+  // With the chart required and naming the same retired ledger as the pin, `refuseUnattributableChart`
+  // answers first — pooled, and with the same outcome the r7 pin check gave: nothing written,
+  // `refused`, reported against the pinned ledger. The r7/r8 check the chart check does NOT subsume is
+  // the LOCKED one taken inside the inserting transaction, and that is asserted where a fixture can
+  // make the pooled and locked reads disagree: tests/accounting/pinned-ledger-fence.test.ts.
+  const outcome = await queueAccountingSync({ ...REQUEST, connector: 'xero', chartConnector: 'xero' })
 
   assert.equal(outcome.queued, false, 'nothing is queued anywhere')
   assert.deepEqual(queued, [], 'and specifically NOT into the pinned connector\'s own queue')
@@ -138,19 +157,26 @@ test('o3d-i0o6 r3: a pinned enqueue whose connector does not post this type writ
   xeroSyncEnabled = 'false'
 
   const { queueAccountingSync } = await import('@/lib/accounting')
-  const outcome = await queueAccountingSync({ ...REQUEST, connector: 'xero' })
+  // o3d-j625 r2: chart = pin = the ACTIVE connector, so neither the chart check nor the r7 pin check
+  // can fire and the refusal below can only have come from the connector's own sync toggle. That
+  // separation is the reason this arm exists.
+  const outcome = await queueAccountingSync({ ...REQUEST, connector: 'xero', chartConnector: 'xero' })
 
   assert.equal(outcome.queued, false, 'nothing is queued anywhere')
   assert.equal(outcome.connector, 'xero', 'and the refusal is reported against the pinned ledger')
   assert.deepEqual(queued, [], 'it did NOT fall back to the active connector')
 })
 
-test('o3d-i0o6 r3: an UNPINNED enqueue still resolves the active connector, exactly as before', async () => {
+test('o3d-i0o6 r3 / o3d-j625 r2: an UNPINNED enqueue is answered by its CHART\u2019s connector', async () => {
   reset()
   enabledPlugins = ['quickbooks']
 
   const { queueAccountingSync } = await import('@/lib/accounting')
-  const outcome = await queueAccountingSync(REQUEST)
+  // o3d-j625 r2: "unpinned AND unchartered" no longer exists — `chartConnector` is required, so there
+  // is no caller left that makes the enqueue resolve the connector for itself. What "unpinned" now
+  // means is exactly this: no PROOF about a ledger, but still a statement about whose account codes are
+  // in the payload, and the row follows that statement.
+  const outcome = await queueAccountingSync({ ...REQUEST, chartConnector: 'quickbooks' })
 
   assert.equal(outcome.connector, 'quickbooks')
   assert.deepEqual(queued.map((row) => row.queue), ['quickbooks'])
@@ -237,6 +263,9 @@ test('o3d-i0o6 r7: the IN-TRANSACTION enqueue refuses a pin that is not the acti
     {
       ...TX_REQUEST,
       connector: 'xero',
+      // o3d-j625 r2: same ledger as the pin — see the facade arm above for why the refusal is now the
+      // chart check's and why the contract is unchanged.
+      chartConnector: 'xero',
       reportOutcome: (outcome) => { reported = outcome },
     },
   )
@@ -265,6 +294,9 @@ test('o3d-i0o6 r7: THE CONTROL — an ACTIVE pin passes the guard and reaches th
     {
       ...TX_REQUEST,
       connector: 'xero',
+      // o3d-j625 r2: chart = pin = ACTIVE, so this control still reaches the posting context — which is
+      // the whole point of it: `not-configured` here can only have come from BELOW both guards.
+      chartConnector: 'xero',
       reportOutcome: (outcome) => { reported = outcome },
     },
   )

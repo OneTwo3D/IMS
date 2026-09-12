@@ -1147,6 +1147,44 @@ async function releaseHeldWcSalesInvoice(
 
   const held = row.payload
   const idempotencyKey = `wc-held-sales-invoice:${orderId}:${invoiceNumber}`
+  // o3d-j625 r2 (Codex HIGH 1/HIGH 2) — A HOLD THAT CANNOT NAME ITS CHART IS NOT RELEASED.
+  //
+  // `chartConnector` is now REQUIRED on the enqueue, and `undefined` here means exactly one thing: the
+  // hold was parked before IMS recorded which connector's account codes were frozen into it (or it
+  // carries a value this build cannot route). The frozen payload has real account codes in it, so the
+  // two substitutes are both wrong — resolving the active connector at release time is the o3d-j625
+  // defect over a gap that can be DAYS wide, and `null` would claim the codes were the empty defaults.
+  //
+  // Left PENDING with the reason rather than marked FAILED: the three FAILED sentences check 6 of
+  // `verify.sql` keys on are fixed in a migration, and adding a fourth is a schema change this does not
+  // need. The sweep re-reads the row, writes the same note and changes nothing, so the retry is
+  // idempotent; what it is NOT is silent.
+  const heldChartConnector = heldSalesInvoiceChartConnector(held)
+  if (heldChartConnector === undefined) {
+    await noteHeldReleaseFailure(
+      row.id,
+      `WooCommerce numbered this invoice ${invoiceNumber}, but this hold was parked before IMS recorded `
+      + 'which accounting connector its frozen account codes came from, so releasing it could post one '
+      + 'ledger\u2019s codes into the other\u2019s books. NOTHING was queued and nothing will be: queue the '
+      + 'sales invoice from the order instead.',
+    )
+    if (logFailure) {
+      await logActivity({
+        entityType: 'SALES_ORDER',
+        entityId: orderId,
+        action: 'sales_invoice_release_failed',
+        tag: 'accounting',
+        level: 'WARNING',
+        description:
+          `WooCommerce order ${wcOrder.externalOrderNumber} has its invoice number (${invoiceNumber}) but the held `
+          + 'accounting payload does not say which connector\u2019s chart of accounts it was built from, so the '
+          + 'sales invoice was NOT queued. Queue it from the order.',
+        metadata: { connector: 'woocommerce', externalOrderId: wcOrder.externalOrderId, invoiceNumber },
+        resolveUser: false,
+      }).catch(() => {})
+    }
+    return 'not-queued'
+  }
   try {
     const { queueAccountingSync } = await import('@/lib/accounting')
     await queueAccountingSync({
@@ -1156,9 +1194,8 @@ async function releaseHeldWcSalesInvoice(
       payload: buildReleasedSalesInvoicePayload(held, invoiceNumber),
       idempotencyKey,
       // o3d-j625: route by the chart FROZEN with this payload, not by whatever is active at release
-      // time. `undefined` for a hold parked before the field existed, which keeps that hold's old
-      // behaviour rather than refusing it for ever — see heldSalesInvoiceChartConnector.
-      chartConnector: heldSalesInvoiceChartConnector(held),
+      // time. A hold that cannot name one never gets here — it is refused above.
+      chartConnector: heldChartConnector,
     })
   } catch (error) {
     // Left PENDING on purpose — the release sweep retries it (see retryHeldWcSalesInvoiceReleases).

@@ -28,6 +28,18 @@ type ShipmentCogsRevaluationSyncOptions = {
   accountingSettings?: {
     inventoryAccount?: string | null
     cogsAccount?: string | null
+    /**
+     * o3d-j625 r2 (Codex HIGH 1) — WHOSE CHART THE TWO ACCOUNTS ABOVE ARE, and REQUIRED even though
+     * they are not.
+     *
+     * This narrow shape exists so a test can inject a chart without a database. The two account fields
+     * are optional because the function's own guard treats a missing one as "cannot post"; the
+     * connector is NOT, because a missing connector is not a missing account code — it is the second
+     * resolution coming back. An injected chart that does not say which connector it is cannot be
+     * routed, and the enqueue is now declared to require an answer. `null` is the answer for "no
+     * connector was switched on", which writes nothing.
+     */
+    connector: 'xero' | 'quickbooks' | null
   }
   queueAccountingSync?: typeof queueAccountingSyncTx
   /**
@@ -185,6 +197,13 @@ async function queueShipmentCogsRevaluationSync(
     unlockedOrderScopeReason:
       'landed-cost revaluation discovers affected shipments mid-transaction, after stock locks; the order is '
       + 'provably undeletable (accountingInvoiceId asserted above) so no lock is needed (o3d-zpa7)',
+    // o3d-j625 r2: `payload`'s four lines are `settings.inventoryAccount` and `settings.cogsAccount`,
+    // from the `settings` read at the top of this function — either the injected chart or
+    // `getAccountingSettings()`. This site has the widest window of the transactional family: it runs
+    // inside a landed-cost recalculation that has already locked cost layers and stock rows and is
+    // walking a mid-transaction query of every affected shipment, enqueueing once per shipment. Routing
+    // by the chart is what makes each of those rows describe the books it is written into.
+    chartConnector: settings.connector,
   })
   // khdw: record the net COGS-account movement of this revaluation (reverse old +
   // repost new → net debit = newCogs − oldCogs, both 2dp) in the COGS subledger

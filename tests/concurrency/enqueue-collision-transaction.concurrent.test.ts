@@ -156,6 +156,9 @@ test(
           referenceId,
           payload: { ...payloadFor(key, 'enqueue'), _probeWriter: writer },
           idempotencyKey: key,
+          // o3d-j625 r2: required now. `plugin_xero_enabled` is set to 'true' by this file's setup, so
+          // the chart check passes and the collision below is still what is being raced.
+          chartConnector: 'xero',
         })
         const enqueueMs = Date.now() - startedAt
         // Both racers must be told the counterpart is queued: one wrote it, the other collided with it.

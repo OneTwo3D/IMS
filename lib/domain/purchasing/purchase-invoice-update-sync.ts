@@ -32,6 +32,13 @@ type QueueAccountingSyncTxParams = {
   referenceId: string
   payload: Record<string, unknown>
   idempotencyKey: string
+  /**
+   * o3d-j625 r2 — THE CONNECTOR WHOSE CHART `payload` WAS BUILT FROM. Required, mirroring
+   * `queueAccountingSyncTx`'s own declaration: this local type is what the injected enqueue is checked
+   * against, so leaving it optional here would let the real required parameter be satisfied by a
+   * `undefined` that type-checks at the injection site.
+   */
+  chartConnector: 'xero' | 'quickbooks' | null
 }
 
 // 6oyu.4 (khdw): a bill edit reposts to Xero, changing the NET (transit) leg from the
@@ -45,7 +52,6 @@ type TransitSubledgerUpdateInput = {
 }
 
 export type PurchaseInvoiceUpdateSyncDeps<Tx extends PurchaseInvoiceUpdateSyncTx> = {
-  getActiveAccountingConnectorInfo: () => Promise<AccountingConnectorInfo>
   isAccountingSyncTypeEnabled: (type: 'PURCHASE_INVOICE_UPDATE') => Promise<boolean>
   queueAccountingSyncTx: (tx: Tx, params: QueueAccountingSyncTxParams) => Promise<boolean>
   recordTransitSubledgerMovement: (tx: Tx, input: TransitSubledgerUpdateInput) => Promise<void>
@@ -59,6 +65,18 @@ export async function maybeQueuePurchaseInvoiceUpdate<Tx extends PurchaseInvoice
   poReference: string
   accountingInvoiceId: string | null
   accountingPayload: PurchaseInvoiceAccountingPayload
+  /**
+   * o3d-j625 r2 (Codex HIGH 1) — THE CONNECTOR THE CALLER'S CHART READ RESOLVED, PASSED IN RATHER THAN
+   * RESOLVED AGAIN HERE.
+   *
+   * `accountingPayload` is built by the caller from ITS `getAccountingSettings()` read —
+   * `transitAccount` on every line, `reverseChargePurchaseTaxType` on the tax code. This function used
+   * to call `getActiveAccountingConnectorInfo()` for its Xero-only gate, and the enqueue then resolved
+   * the connector a THIRD time, so "the payload's codes", "the gate's verdict" and "the row's
+   * connector" were three independent answers to one question with a full bill recalculation and a
+   * line-by-line update between them. There is one answer now and it comes from the caller.
+   */
+  chartConnector: 'xero' | 'quickbooks' | null
   idempotencyKey: string | null
   // 6oyu.4 (khdw): the bill's NET (transit) subtotal before and after this edit, in
   // base currency, so the transit subledger records the signed movement (new − old).
@@ -69,7 +87,11 @@ export async function maybeQueuePurchaseInvoiceUpdate<Tx extends PurchaseInvoice
   if (!params.accountingInvoiceId || !params.idempotencyKey) return 'skipped-no-external-id'
   if (!params.syncEnabled) return 'skipped-disabled'
 
-  const connector = await params.deps.getActiveAccountingConnectorInfo()
+  // o3d-j625 r2: the CALLER's chart connector, not a fresh resolution. The name is derived from the id
+  // rather than read off a second lookup for the same reason.
+  const connector: AccountingConnectorInfo = params.chartConnector
+    ? { id: params.chartConnector, name: params.chartConnector === 'xero' ? 'Xero' : 'QuickBooks' }
+    : null
   if (connector?.id !== 'xero') {
     await params.tx.activityLog.create({
       data: {
@@ -102,6 +124,9 @@ export async function maybeQueuePurchaseInvoiceUpdate<Tx extends PurchaseInvoice
     referenceId: params.poId,
     payload: params.accountingPayload,
     idempotencyKey: params.idempotencyKey,
+    // o3d-j625 r2: the same connector the gate above just required to be Xero, and the one the caller
+    // read the transit account and tax-type code from. One resolution, carried to the write.
+    chartConnector: params.chartConnector,
   })
   // 6oyu.4 (khdw): the Xero update REPLACES the bill, so the transit GL debit moves
   // from the old net subtotal to the new one — record the signed delta (new − old).

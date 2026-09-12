@@ -2059,6 +2059,40 @@ async function queueRefundAccountingActions(input: {
   }))
 
   for (const sync of input.accountingSyncs) {
+    // o3d-j625 r2 (Codex HIGH 2) — A REQUEST THAT CANNOT NAME ITS CHART IS REFUSED HERE, NOT ROUTED.
+    //
+    // Every request THIS build stages carries `chartConnector` — an id, or `null` for "nothing was
+    // switched on when the codes were read". Absent is the third state and it means only one thing: the
+    // request was persisted to `accountingRetrySyncs` before the field existed, so nothing knows which
+    // connector's account codes are in its payload. Both substitutes are wrong — resolving the active
+    // connector is the defect o3d-j625 closes, and `null` would claim the codes were the empty defaults
+    // when they were not (and `not-configured` is the one no-op the obligation ledger may settle with).
+    //
+    // So it is accounted as REFUSED without being handed to an enqueue: nothing is written, the
+    // obligation stays unmet, `ledger.settle()` throws, `accountingRetryRequired` stays set, and the
+    // record below tells an operator what has to be decided by hand.
+    if (sync.chartConnector === undefined) {
+      await logActivity({
+        entityType: 'SALES_ORDER',
+        entityId: input.orderId,
+        action: 'refund_accounting_replay_unchartered',
+        tag: 'accounting',
+        level: 'WARNING',
+        description:
+          `NOTHING WAS QUEUED. The staged ${sync.type} for refund ${input.refundId} was persisted before `
+          + 'IMS recorded which accounting connector a staged journal’s account codes came from, so its '
+          + 'chart cannot be established and routing it by whatever connector is active now could post '
+          + 'one ledger’s codes into the other’s books. This posting is still OUTSTANDING: check '
+          + 'whether it already posted, and if not raise it by hand from the refund’s own snapshots.',
+        metadata: { refundId: input.refundId, type: sync.type, referenceId: sync.referenceId },
+      }).catch(() => { /* the refusal below is what the ledger acts on; logging must not throw */ })
+      ledger.account(sync, { queued: false, reason: 'refused', connector: null })
+      continue
+    }
+    // Bound OUTSIDE the transaction callback below: TypeScript discards the narrowing above once the
+    // property is read inside a closure, and the point of the guard is that the three states are
+    // distinguished exactly once.
+    const chartConnector: 'xero' | 'quickbooks' | null = sync.chartConnector
     if (sync.type === 'COGS_REVERSAL') {
       // r8: the WHOLE answer, not a bare boolean — see queueAccountingSyncTxWithOutcome. The default
       // is a refusal because an obligation whose enqueue never answered is owed, not settled; it is
@@ -2083,7 +2117,13 @@ async function queueRefundAccountingActions(input: {
         // row is written under — so the ledger can apply the same pinned-connector check it applies
         // to every facade answer. `queued` is the identical boolean the other call sites read, so the
         // COGS subledger row is still recorded on the queue's OWN decision.
-        const outcome = await queueAccountingSyncTxWithOutcome(tx, sync)
+        // o3d-j625 r2: `chartConnector` restated rather than left inside the spread — the staged
+        // request's own value (staging's chart read, possibly days old), never this hand-off's
+        // `settings.connector`. Named as an own property so the o3d-j625 census can see this site.
+        const outcome = await queueAccountingSyncTxWithOutcome(tx, {
+          ...sync,
+          chartConnector,
+        })
         outcomeInTx = outcome
         await recordRefundCogsReversalFromSync(tx, sync, outcome.queued)
       })
@@ -2093,7 +2133,7 @@ async function queueRefundAccountingActions(input: {
       // own `accountingSettings` read, which is a different read from this hand-off's and may be days
       // older on a retry. `sync.chartConnector`, never `settings.connector`: this journal's lines were
       // not built from the chart read at the top of this function.
-      ledger.account(sync, await queueAccountingSync({ ...sync, chartConnector: sync.chartConnector }))
+      ledger.account(sync, await queueAccountingSync({ ...sync, chartConnector }))
     }
   }
 

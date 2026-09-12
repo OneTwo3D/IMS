@@ -359,9 +359,22 @@ export type RefundAccountingSyncRequest = {
    * so a journal staged against Xero's chart and retried a week later must still be routed to Xero's
    * queue, or refused, rather than written into whatever is active when someone presses retry.
    *
-   * Optional because a request persisted before this field existed does not have one, and inventing a
-   * value for those would be this code vouching for a read it never saw; absent means the enqueue keeps
-   * the active-connector resolution it has always had.
+   * THREE STATES, AND ALL THREE ARE DISTINCT (o3d-j625 r2, Codex HIGH 2):
+   *
+   *   'xero' / 'quickbooks'  the chart these codes came from. Route the row through that connector.
+   *   `null`                 NOTHING WAS SWITCHED ON WHEN THE CODES WERE READ, so they are the
+   *                          empty-string defaults. Write nothing — `not-configured`. This is a
+   *                          POSITIVE STATEMENT and must survive the round trip through
+   *                          `accountingRetrySyncs` as itself; collapsing it into the case below is
+   *                          exactly the bug Codex HIGH 2 found, and its consequence is a row of empty
+   *                          account codes queued to a connector that came on afterwards, with the
+   *                          obligation ledger free to settle over it.
+   *   absent                 a request PERSISTED BEFORE THIS FIELD EXISTED. Nothing here knows which
+   *                          chart it was staged from, and both alternatives are wrong — resolving the
+   *                          active connector is the original defect, and `null` claims the codes were
+   *                          empty when they were not. The hand-off therefore REFUSES it, leaves the
+   *                          obligation unmet, and says why (see `queueRefundAccountingActions`). It is
+   *                          the only state that does not reach an enqueue at all.
    */
   chartConnector?: 'xero' | 'quickbooks' | null
 }
@@ -2994,11 +3007,27 @@ function parseRefundAccountingRetrySyncs(
       // o3d-j625: AND THE CHART SURVIVES THE ROUND TRIP, for exactly the reason above — this parser
       // rebuilds the request field by field and drops anything it does not name, so a `chartConnector`
       // written at staging and not read back here would leave the RETRY routing the journal by a fresh
-      // resolution while its account codes stayed the staged connector's. Narrowed to the two known ids
-      // and spread, like the pin: `null` is not carried because a request staged with no connector at
-      // all staged no account codes worth routing, and `{chartConnector: undefined}` is not the same
-      // object as `{}` to the persisted JSON this function round-trips.
-      ...(entry.chartConnector === 'xero' || entry.chartConnector === 'quickbooks'
+      // resolution while its account codes stayed the staged connector's.
+      //
+      // o3d-j625 r2 (Codex HIGH 2) — AND `null` SURVIVES AS `null`, BECAUSE `null` AND ABSENT MEAN
+      // DIFFERENT THINGS HERE.
+      //
+      // r1 narrowed to the two known ids only, on the argument that "a request staged with no connector
+      // at all staged no account codes worth routing". That reasoning is right about the CODES and wrong
+      // about the ROUND TRIP: staging with no active connector persists `chartConnector: null`, r1's
+      // parser turned that into an absent property, and absent was "unchartered" — the original defect.
+      // So if the first hand-off failed and a connector was switched ON before the retry, the replay
+      // resolved that new connector and queued the stored EMPTY account codes into its books; the
+      // obligation ledger then had a real queued row to settle against, and `accountingRetryRequired`
+      // was cleared over a document that can never post. `null` is a statement ("nothing was on when I
+      // read the chart") and it is carried as one, where it answers `not-configured` and writes nothing.
+      //
+      // Still a SPREAD, and the third state is still meaningful: a key MISSING from the stored JSON is a
+      // request staged before this field existed, which nothing here can attribute. It stays absent and
+      // the hand-off refuses it rather than inventing either of the other two answers.
+      ...(entry.chartConnector === 'xero'
+        || entry.chartConnector === 'quickbooks'
+        || entry.chartConnector === null
         ? { chartConnector: entry.chartConnector }
         : {}),
     }]

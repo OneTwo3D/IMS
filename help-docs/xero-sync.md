@@ -2172,6 +2172,33 @@ switched to hours ago, is unaffected — the document is built and written under
 before. A refund or order posted while no accounting connector was enabled at all is unchanged too: as
 before, nothing is queued, because there is nothing for it to post to.
 
+**Which postings this covers.** All of them. The rule applies to every accounting document IMS queues,
+not only to the sales invoice and credit note: stock receipts and supplier returns, purchase bills and
+bill edits, supplier credit notes, bill payments and invoice payments, manufacturing overhead and
+manufacturing reclass journals, landed-cost reclass and COGS journals, shipment COGS revaluations,
+inventory adjustments, allocation and unearned-revenue reversals, tax-rate syncs and the unrealised FX
+revaluation. Every one of them now records which connector's chart of accounts it was built from, and
+every one of them is refused rather than mis-routed.
+
+**Three postings behave slightly differently, and it is worth knowing why.**
+
+* **Reversing a previous FX revaluation.** The reversal's account numbers are copied from the journal it
+  reverses, which may have been posted under the *other* connector. So the reversal is routed by the
+  connector that journal was posted under — not by whichever is active now — and it is refused if that
+  connector is no longer the active one. You cannot reverse a QuickBooks journal by posting to Xero: if
+  the unrealised FX from an earlier period needs unwinding after a connector switch, it has to be
+  unwound in the accounting system that holds it.
+* **A sales invoice held waiting for a WooCommerce invoice number.** These holds can sit for days, and
+  the account numbers are frozen when the order is imported. A hold parked by an older version of IMS,
+  before it recorded which connector those numbers came from, cannot be released automatically: the
+  hold stays PENDING, the reason is shown on the row and in the activity log
+  (`sales_invoice_release_failed`), and the remedy is to queue the sales invoice from the order.
+* **Retrying a refund's accounting.** A refund whose reversals were staged by an older version of IMS,
+  before it recorded the chart, cannot be replayed automatically either. **Retry accounting** reports
+  the refund as still owing, logs `refund_accounting_replay_unchartered`, and leaves the flag set —
+  check whether the reversal already posted and, if not, raise it by hand from the refund's own cost
+  snapshots.
+
 ### Rows stranded on a connector you switched away from
 
 Because the sync log is scoped to the active connector, unresolved rows left behind on a connector that has since been turned off appear in **no** sync log. They are listed instead in the amber banner at the top of **Integrations**, which shows each row's connector, type, reference, status, age in days, and last error — plus the external transaction ID if the row already posted something before it stalled.

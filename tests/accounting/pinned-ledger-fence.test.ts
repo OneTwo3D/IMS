@@ -200,6 +200,17 @@ const TX_REQUEST = {
   referenceId: 'order-1',
   payload: { lines: [{ accountCode: '630', debit: 16 }, { accountCode: '631', credit: 16 }] },
   unlockedOrderScopeReason: 'test harness: the order guard is doubled to a non-order scope',
+  // o3d-j625 r2: `chartConnector` is now REQUIRED on both enqueues, so every request carries one. It
+  // names the SAME ledger as the pin in the pinned tests below, which is the only combination a
+  // pinned enqueue can have — `refuseUnattributableChart` refuses a pin and a chart that disagree.
+  //
+  // THIS DOES NOT MAKE THE FENCE TESTS VACUOUS, and that is worth stating because it nearly does. The
+  // chart check is POOLED, so in the window tests below (`stalePooledSelection`) it sees the stale
+  // 'xero is active' and PASSES — which is exactly the production shape — and the refusal that follows
+  // can only have come from the LOCKED read the fence takes. Were the chart check to refuse first,
+  // these tests would be about the chart check; the stale pooled fixture is what keeps them about the
+  // fence.
+  chartConnector: 'xero' as const,
 }
 
 const FACADE_REQUEST = {
@@ -207,6 +218,8 @@ const FACADE_REQUEST = {
   referenceType: 'SalesOrderRefund',
   referenceId: 'refund-1',
   payload: { lines: [{ accountCode: '630', debit: 20 }, { accountCode: '631', credit: 20 }] },
+  // o3d-j625 r2 — see the note on TX_REQUEST above.
+  chartConnector: 'xero' as const,
 }
 
 function reset(selection: { xero: boolean; quickbooks: boolean }): void {

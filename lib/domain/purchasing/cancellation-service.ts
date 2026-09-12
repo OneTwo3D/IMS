@@ -210,6 +210,11 @@ export async function cancelPurchaseOrderService(
             referenceId: id,
             payload,
             idempotencyKey: cancelIdempotencyKey,
+            // o3d-j625 r2: `payload`'s two lines are `accountingSettings.transitAccount` and
+            // `accountingSettings.inventoryAccount`, read a few statements above inside this same
+            // cancellation transaction — but that transaction has already reversed every cost layer and
+            // recalculated landed cost on the linked goods PO, so the read is not adjacent to the write.
+            chartConnector: accountingSettings.connector,
           })
           // 6oyu.4 (khdw): this reversal DR transit / CR inventory, so it DEBITS the
           // transit clearing account (+amount). Record the transit subledger row

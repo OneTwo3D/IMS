@@ -59,6 +59,9 @@ function heldRow(overrides: Partial<HeldRow> & { id: string; entityId: string })
       orderNumber: 'WC-164981',
       metaKey: '_wcpdf_invoice_number',
       accountingPayload: { contactName: 'A Customer', date: '2026-08-01', currency: 'GBP', lines: [] },
+      // o3d-j625: whose chart the frozen account codes are. Present on every hold this build parks, and
+      // the release REFUSES a hold that cannot name one (o3d-j625 r2) — see the legacy-hold test below.
+      chartConnector: 'xero',
     },
     ...overrides,
   }
@@ -178,6 +181,45 @@ test('the failure that has no other driver — connector off — is retried on t
   assert.equal(second.released, 1)
   assert.equal(state.held[0].status, 'SYNCED')
   assert.equal(state.queued.length, 1, 'the deterministic key means the retry adds one row, not two')
+})
+
+/**
+ * o3d-j625 r2 (Codex HIGH 1/HIGH 2) — A HOLD THAT CANNOT NAME ITS CHART IS NOT RELEASED.
+ *
+ * The gap between parking a hold and releasing it is not a race: it is however long WooCommerce takes
+ * to number the order, which can be days. A hold parked before `chartConnector` was recorded has REAL
+ * account codes frozen in it and no way to say whose they are, so both substitutes are wrong —
+ * resolving the active connector at release time is the o3d-j625 defect across a days-wide window, and
+ * `null` would claim the codes were the empty defaults. Nothing is queued and the reason is recorded.
+ */
+test('o3d-j625 r2: a LEGACY hold that cannot name its chart is NOT released, and says why', async () => {
+  reset()
+  const row = heldRow({ id: 'hold-legacy', entityId: 'so-1' })
+  delete (row.payload as { chartConnector?: unknown }).chartConnector
+  state.held.push(row)
+  state.orders.push({ id: 'so-1', invoiceNumber: '164981', accountingInvoiceId: null })
+
+  const result = await sweep()
+
+  assert.equal(state.queued.length, 0, 'NOTHING may be queued for a payload whose chart nobody recorded')
+  assert.equal(result.released, 0)
+  assert.equal(result.stillStuck, 1, 'it is owed, and must be counted as owed')
+  assert.equal(state.held[0].status, 'PENDING', 'left PENDING \u2014 not silently marked released')
+  assert.match(
+    state.held[0].errorMessage ?? '',
+    /which accounting connector its frozen account codes came from/,
+    `the row must say what is undecidable about it. Got: ${state.held[0].errorMessage}`,
+  )
+  assert.match(state.held[0].errorMessage ?? '', /queue the\s+sales invoice from the order instead/)
+
+  // THE CONTROL: the same row WITH a chart releases. Without it this test would pass for a sweep that
+  // released nothing at all.
+  reset()
+  state.held.push(heldRow({ id: 'hold-chartered', entityId: 'so-1' }))
+  state.orders.push({ id: 'so-1', invoiceNumber: '164981', accountingInvoiceId: null })
+  const control = await sweep()
+  assert.equal(control.released, 1, 'the control: a hold that DOES name its chart is released')
+  assert.equal(state.queued.length, 1)
 })
 
 test('a stuck hold raises ONE warning naming the total, not one per order per run', async () => {

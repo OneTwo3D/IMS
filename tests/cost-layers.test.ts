@@ -218,7 +218,7 @@ test('refreshShipmentCogsForCostLayerChange queues COGS revaluation sync for pos
   }
 
   const updated = await refreshShipmentCogsForCostLayerChange(tx as never, 'layer-1', {
-    accountingSettings: { inventoryAccount: '120', cogsAccount: '500' },
+    accountingSettings: { inventoryAccount: '120', cogsAccount: '500', connector: 'xero' },
     isReversalPostingEnabled: async () => true,
     queueAccountingSync: async (_tx, params) => {
       queued.push(params)
@@ -238,6 +238,10 @@ test('refreshShipmentCogsForCostLayerChange queues COGS revaluation sync for pos
     referenceType: 'Shipment',
     referenceId: 'shipment-1',
     idempotencyKey: 'shipment-cogs-revalue:shipment-1:layer-1:20:27.5',
+    // o3d-j625 r2: whose chart the two account codes below are — the SAME settings object the payload
+    // was built from, injected by this test. Asserted in the deep-equal rather than separately, so a
+    // change that stopped threading it here cannot pass by the property simply being absent.
+    chartConnector: 'xero',
     // o3d-3zgy: this enqueue is order-scoped (a Shipment resolves through to its sales order) but
     // CANNOT hoist the order row lock — it runs inside a landed-cost transaction that discovers the
     // affected shipments mid-flight, after stock locks are held, so locking the order there inverts
@@ -289,7 +293,7 @@ test('refreshShipmentCogsForCostLayerChange stamps the recalc-run nonce into the
   }
 
   await refreshShipmentCogsForCostLayerChange(tx as never, 'layer-1', {
-    accountingSettings: { inventoryAccount: '120', cogsAccount: '500' },
+    accountingSettings: { inventoryAccount: '120', cogsAccount: '500', connector: 'xero' },
     isReversalPostingEnabled: async () => true,
     recalcRunId: 'run-abc',
     queueAccountingSync: async (_tx, params) => { queued.push(params); return true },
@@ -323,7 +327,7 @@ test('refreshShipmentCogsForCostLayerChange does not claim the delta when COGS_R
     },
   }
   const result = await refreshShipmentCogsForCostLayerChange(tx as never, 'layer-1', {
-    accountingSettings: { inventoryAccount: '120', cogsAccount: '500' },
+    accountingSettings: { inventoryAccount: '120', cogsAccount: '500', connector: 'xero' },
     isReversalPostingEnabled: async () => false,
     queueAccountingSync: async (_tx, params) => { queued.push(params); return true },
   })
@@ -348,7 +352,7 @@ test('refreshShipmentCogsForCostLayerChange does not queue COGS revaluation sync
   }
 
   const result = await refreshShipmentCogsForCostLayerChange(tx as never, 'layer-1', {
-    accountingSettings: { inventoryAccount: '120', cogsAccount: '500' },
+    accountingSettings: { inventoryAccount: '120', cogsAccount: '500', connector: 'xero' },
     isDailyBatchPostingEnabled: async () => true,
     queueAccountingSync: async (_tx, params) => {
       queued.push(params)
@@ -378,7 +382,7 @@ test('refreshShipmentCogsForCostLayerChange keeps the un-journaled delta in the 
     },
   }
   const result = await refreshShipmentCogsForCostLayerChange(tx as never, 'layer-1', {
-    accountingSettings: { inventoryAccount: '120', cogsAccount: '500' },
+    accountingSettings: { inventoryAccount: '120', cogsAccount: '500', connector: 'xero' },
     isDailyBatchPostingEnabled: async () => false,
     queueAccountingSync: async (_tx, params) => { queued.push(params); return true },
   })

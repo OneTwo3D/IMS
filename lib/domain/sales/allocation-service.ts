@@ -1285,6 +1285,17 @@ export async function reverseOrphanedAllocationPosting(
     // amount for a human instead of claiming relief. Verifying AFTERWARDS was the weaker option —
     // by then the row exists.
     connector: proof.provedOnConnector,
+    // o3d-j625 r2 — AND, SEPARATELY FROM THE PIN, WHOSE ACCOUNT NUMBERS ARE ON THE PAGE.
+    //
+    // The two lines below are `settings.inventoryAccount` and `settings.allocatedInventoryAccount`, and
+    // `settings` is `getAccountingSettingsFor(activeConnector)` — the ONE resolution this function makes.
+    // The pin above is the ledger the DEBIT was proved to stand in, which is a different fact: this path
+    // takes care to derive both from `activeConnector`, so they agree here by construction, and naming
+    // the chart states that rather than leaving it to be re-derived by a reader. If they ever diverge,
+    // `refuseUnattributableChart` refuses the enqueue rather than honouring either — which is right,
+    // because a credit posted where the debit stands using the other books' account numbers is wrong
+    // whichever half you believe.
+    chartConnector: settings.connector,
     referenceType: 'SalesOrder',
     referenceId: orderId,
     payload: {

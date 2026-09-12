@@ -351,15 +351,20 @@ test('[o3d-j625] the parked payload records whose chart its frozen account codes
   assert.equal(lines[0].accountCode, '200')
 })
 
-test('[o3d-j625] a LEGACY hold, parked before the chart was recorded, keeps its old behaviour rather than being refused for ever', () => {
+test('[o3d-j625 r2] a LEGACY hold, parked before the chart was recorded, is UNCHARTERED \u2014 and the release refuses it', () => {
   const legacy = { ...held() }
   delete (legacy as { chartConnector?: unknown }).chartConnector
 
+  // r1's comment here said `undefined` "keeps its old behaviour", i.e. the enqueue resolves the active
+  // connector. That was the defect, and r2 (Codex HIGH 1) made `chartConnector` a REQUIRED enqueue
+  // parameter, so `undefined` is no longer a behaviour an enqueue can have. What it means now is
+  // "unattributable", and `releaseHeldWcSalesInvoice` refuses such a hold with the reason on the row
+  // instead of routing it \u2014 see tests/connectors/wc-held-release-sweep.test.ts for that half.
   assert.equal(
     heldSalesInvoiceChartConnector(legacy),
     undefined,
-    'undefined means "unchartered", which is what the enqueue has always been for these rows \u2014 '
-    + 'inventing a connector here would be this code vouching for a chart read it never saw',
+    'undefined means UNCHARTERED: inventing a connector here would be this code vouching for a chart '
+    + 'read it never saw, and the release must refuse rather than guess',
   )
   assert.equal(
     isHeldSalesInvoicePayload(legacy),

@@ -37,6 +37,23 @@ type OpenBalance = {
 
 type PriorRevaluation = {
   id: string
+  /**
+   * o3d-j625 r2 (Codex MEDIUM 1) — THE CONNECTOR THE SOURCE ROW WAS WRITTEN UNDER.
+   *
+   * The reversal below is built from `prior.lines`, which are the ACCOUNT CODES OF A HISTORIC JOURNAL
+   * read back out of `AccountingSyncLog.payload`. r1 attributed that reversal to `settings.connector`
+   * — this run's chart — which is a statement about a different read entirely: `getPriorRevaluations`
+   * neither selected nor filtered the source row's connector, so a revaluation posted under
+   * QuickBooks before a switch to Xero would have had its reversal routed to XERO carrying
+   * QuickBooks's AR/AP control and unrealised-FX codes. That is the very mis-attribution o3d-j625 is
+   * about, arrived at through the one site whose codes do not come from the settings object beside it.
+   *
+   * Carried off the row, therefore, and used as the reversal's `chartConnector`. Kept as a raw
+   * `string` because the column is a plain string with a default and a build that does not know the
+   * value must NOT guess: an unroutable connector is refused (see the reversal loop), never narrowed
+   * to whatever this build happens to support.
+   */
+  connector: string
   valuationDate: string
   side: FxSettlementSide
   lines: JournalLine[]
@@ -100,7 +117,7 @@ function parseJournalLines(value: unknown): JournalLine[] {
  * unique index is partial on active statuses.
  */
 export function selectPriorRevaluationsToReverse(
-  logs: Array<{ id: string; payload: unknown }>,
+  logs: Array<{ id: string; connector: string; payload: unknown }>,
   valuationDate: string,
 ): PriorRevaluation[] {
   const reversalSources = new Set<string>()
@@ -120,6 +137,9 @@ export function selectPriorRevaluationsToReverse(
     if (payload.side !== 'receivable' && payload.side !== 'payable') continue
     prior.push({
       id: log.id,
+      // o3d-j625 r2: off the ROW, so the reversal is attributed to the books its codes came out of
+      // rather than to whichever connector is active when the reversal is raised.
+      connector: log.connector,
       valuationDate: payload.valuationDate,
       side: payload.side,
       lines: parseJournalLines(payload.lines),
@@ -136,7 +156,9 @@ async function getPriorRevaluations(valuationDate: string): Promise<PriorRevalua
       status: { in: [...ACTIVE_SYNC_STATUSES] },
     },
     orderBy: { createdAt: 'asc' },
-    select: { id: true, payload: true },
+    // o3d-j625 r2 (Codex MEDIUM 1): `connector` is SELECTED. Without it the reversal had no way to say
+    // whose chart of accounts its lines were, and attributed them to the current settings object.
+    select: { id: true, connector: true, payload: true },
   })
   return selectPriorRevaluationsToReverse(logs, valuationDate)
 }
@@ -313,6 +335,39 @@ export async function runArApFxRevaluation(input?: {
   for (const prior of priorRevaluations) {
     const lines = reverseJournalLines(prior.lines, `(reversal for ${prior.valuationDate})`)
     if (lines.length === 0) continue
+    // o3d-j625 r2 (Codex MEDIUM 1) — A CONNECTOR THIS BUILD CANNOT ROUTE IS REFUSED, NOT GUESSED AT.
+    //
+    // `prior.connector` is a raw column value. Every row this build writes carries 'xero' or
+    // 'quickbooks', but a row written by another build (or a connector since removed — see the
+    // ShipHero removal in #680) can carry something else, and there is no safe substitute for it:
+    // naming this run's connector is the mis-attribution being fixed, and `null` would answer
+    // `not-configured`, which is the one no-op an obligation ledger is allowed to settle with. So the
+    // reversal is left OUTSTANDING and said to be outstanding.
+    const chartConnector = prior.connector === 'xero' || prior.connector === 'quickbooks'
+      ? prior.connector
+      : null
+    if (chartConnector === null) {
+      const { logActivity } = await import('@/lib/activity-log')
+      await logActivity({
+        entityType: 'SYSTEM',
+        action: 'unrealised_fx_reversal_unroutable_source_connector',
+        tag: 'accounting',
+        level: 'WARNING',
+        description:
+          `NOTHING WAS QUEUED. The unrealised FX revaluation of ${prior.valuationDate} (sync log `
+          + `${prior.id}) was posted under accounting connector '${prior.connector}', which this build `
+          + 'cannot route, so its reversal cannot be raised in the books its account codes belong to. '
+          + 'This reversal is still OUTSTANDING and the unrealised FX from that date is still carried: '
+          + 'reverse it by hand in that connector, or cancel the source row if it never posted.',
+        metadata: {
+          sourceEntryId: prior.id,
+          sourceConnector: prior.connector,
+          sourceValuationDate: prior.valuationDate,
+          valuationDate,
+        },
+      }).catch(() => { /* a report that cannot be written must not abort the rest of the run */ })
+      continue
+    }
     await queueAccountingSync({
       type: 'UNREALISED_FX_JOURNAL',
       referenceType: 'FxRevaluation',
@@ -329,14 +384,19 @@ export async function runArApFxRevaluation(input?: {
         lines,
       },
       idempotencyKey: `unrealised-fx:reversal:${valuationDate}:${prior.id}`,
-      // o3d-j625: `lines` are a reversal of a PRIOR journal's account codes, and every account code
-      // reachable from here — the AR/AP control accounts and the unrealised FX account this run
-      // validated above — came from the single `getAccountingSettings()` at the top of this function.
-      // The window is the widest of any enqueue site in the sweep: `getPriorRevaluations`,
-      // `getOpenReceivables`, `getOpenPayables` and a per-document build all run inside it, and the
-      // loop enqueues once per prior revaluation. Routed by the chart's own connector, so a switch
-      // during the run cannot write one ledger's reversal into the other's books.
-      chartConnector: settings.connector,
+      // o3d-j625 r2 (Codex MEDIUM 1) — THE SOURCE ROW'S CONNECTOR, NOT THIS RUN'S SETTINGS OBJECT.
+      //
+      // `lines` is `reverseJournalLines(prior.lines, …)`: every account code on this journal was read
+      // out of a HISTORIC `AccountingSyncLog.payload`, not off the `settings` read at the top of this
+      // function. r1 wrote `settings.connector` here and argued that "every account code reachable from
+      // here came from the single getAccountingSettings()" — which is true of the REVALUATION enqueue
+      // below and false of this one. Attributing a QuickBooks-era journal's codes to a now-active Xero
+      // chart is the mis-routing of an existing cross-connector row, so it is routed by the row.
+      //
+      // A prior whose connector is no longer the active one is therefore REFUSED by the facade (and
+      // recorded as owed) instead of being reversed into the wrong books — which is the correct answer:
+      // you cannot reverse a QuickBooks journal by posting to Xero.
+      chartConnector,
     })
     reversed += 1
   }

@@ -8129,6 +8129,108 @@ test('o3d-j625: a retry replays the staged chart, so it re-queues on the connect
   )
 })
 
+/**
+ * o3d-j625 r2 (Codex HIGH 2) — `null` AND ABSENT MEAN DIFFERENT THINGS, AND THE ROUND TRIP MUST NOT
+ * COLLAPSE ONE INTO THE OTHER.
+ *
+ * Staging with no active accounting connector persists `chartConnector: null` — a POSITIVE STATEMENT
+ * that nothing was switched on when the codes were read, so the codes are the empty-string defaults and
+ * the enqueue must write nothing. r1's parser narrowed to the two known ids only, which turned that
+ * `null` into an ABSENT property on the way back — and absent meant "unchartered", i.e. resolve the
+ * active connector again. The consequence is the one that costs money: if the first hand-off failed and
+ * a connector was switched ON before the retry, the replay resolved the NEW connector and queued the
+ * stored EMPTY account codes into its books; the obligation ledger then had a real queued row to settle
+ * against and `accountingRetryRequired` was cleared over a document that can never post.
+ *
+ * THIS DRIVES THE PERSISTED ROUND TRIP, which is the half r1's own M7 mutation was green on: its test
+ * asserted the WRITE (`accountingRetrySyncs` carries the chart) and said nothing about the READ, so a
+ * mutation deleting the chart from the parser left it passing.
+ */
+test('o3d-j625 r2: a staged `null` chart survives the persisted round trip AS `null`, not as an absence', async () => {
+  const persistedSyncs = [{
+    type: 'UNEARNED_REV_REVERSAL' as const,
+    referenceType: 'SalesOrderRefund',
+    referenceId: 'refund-1',
+    idempotencyKey: 'sales-order-refund:refund-1:unearned-reversal',
+    // STAGED WITH NO ACTIVE CONNECTOR. Hence the empty account codes below: there was no chart to read.
+    chartConnector: null,
+    payload: {
+      date: '2026-01-03',
+      reference: 'Unearned reversal: SO-1',
+      lines: [
+        { accountCode: '', description: 'Unearned reversal: SO-1', debit: 100 },
+        { accountCode: '', description: 'Unearned reversal: SO-1', credit: 100 },
+      ],
+    },
+  }]
+  const state = baseState({
+    orders: [{
+      id: 'order-1',
+      externalOrderNumber: null,
+      orderNumber: 'SO-1',
+      status: 'REFUNDED',
+      fxRateToBase: 1,
+      totalBase: 100,
+      revenueDeferredDate: null,
+      unearnedRevenueAmount: 100,
+      inventoryAllocatedDate: null,
+      allocationBatchAmount: 20,
+    }],
+    refunds: [{
+      id: 'refund-1',
+      orderId: 'order-1',
+      creditNoteNumber: 'CN-2026-00001',
+      externalRefundId: null,
+      reason: 'Full return',
+      totalForeign: 100,
+      totalBase: 100,
+      returnWarehouseId: null,
+      accountingRetryRequired: true,
+      accountingWarning: 'Previous accounting queueing failed',
+      accountingRetrySyncs: persistedSyncs,
+    }],
+    refundLines: [{
+      id: 'refund-line-1',
+      refundId: 'refund-1',
+      salesOrderLineId: 'line-1',
+      productId: 'product-1',
+      description: 'Product 1',
+      qty: 2,
+      unitPriceForeign: 50,
+      unitPriceBase: 50,
+      totalForeign: 100,
+      totalBase: 100,
+    }],
+  })
+  withRecordedA2Journal(state, { status: 'SYNCED' })
+
+  // A CONNECTOR IS SWITCHED ON BEFORE THE RETRY — which is the whole scenario. Under r1 this is where
+  // the empty codes went.
+  const result = await retrySalesOrderRefundAccounting(createClient(state), {
+    refundId: 'refund-1',
+    accountingSettings,
+    activeAccountingConnector: 'xero',
+  })
+
+  assert.equal(result.success, true)
+  const replayed = result.success ? result.accountingSyncs : []
+  assert.equal(replayed.length, 1, 'precondition: the persisted sync was read back at all')
+  // THE PROPERTY MUST BE PRESENT. `assert.equal(x, null)` under node:assert/strict already rejects
+  // `undefined`, but the key's PRESENCE is the fact the enqueue's required parameter turns on, and an
+  // absent key is exactly what r1 produced — so it is asserted directly rather than inferred.
+  assert.ok(
+    'chartConnector' in replayed[0],
+    'the parser dropped `chartConnector` entirely. Absent means "unchartered" to the enqueue, which '
+    + 'resolves the active connector again and queues these EMPTY account codes into its books',
+  )
+  assert.equal(
+    replayed[0].chartConnector,
+    null,
+    '`null` must come back as `null`: it says nothing was switched on when the codes were read, so the '
+    + 'enqueue writes nothing. Any other value is a claim about a chart that was never read.',
+  )
+})
+
 test('o3d-j625: an UNPINNED journal still carries a chart \u2014 the two facts are independent', async () => {
   // The pin is absent because nothing was proved; the account codes are still Xero's. Before this, that
   // combination was the one with no attribution at all.

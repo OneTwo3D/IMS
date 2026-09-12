@@ -1504,6 +1504,24 @@ export async function registerInvoicePaymentWithLedger(params: {
         },
         // Exactly once per recorded receipt AND DOCUMENT, however many times this runs.
         idempotencyKey: invoicePaymentEnqueueKey(params.paymentId, accountingInvoiceId),
+        // o3d-j625 r2 (Codex HIGH 1) — THE ONE RESOLUTION THIS WHOLE PASS IS BUILT ON, CARRIED TO THE
+        // WRITE.
+        //
+        // `connectorId` is `pinned.connector` where a post pinned one and otherwise a SINGLE
+        // `getActiveAccountingConnectorInfo()` read; every fact this enqueue rests on was taken for it —
+        // the INVOICE_PAYMENT posting verdict (`isAccountingSyncTypeEnabledFor`), the ledger settlement
+        // probe, the capacity arithmetic over `loadInvoicePaymentSyncRows(..., connectorId, ...)` and the
+        // follow-up scope lock. `accountingInvoiceId` is that connector's own document id and
+        // `underLock.bankAccountId` is that connector's own account id. Letting the enqueue resolve the
+        // connector a second time is what made the row's ledger independent of every one of those.
+        //
+        // WHAT THIS CHANGES ABOUT `PinnedConnectorMoved` BELOW: it detected the mis-attribution AFTER the
+        // row had been written and undid it by throwing. Routing by the chart means the row is not
+        // written at all — the enqueue answers `refused`, which surfaces as POSTING_CONTEXT_CHANGED, and
+        // the facade's own `accounting_enqueue_refused_retired_chart` WARNING names both the chart's
+        // connector and the one now active. The throw is KEPT as a backstop rather than deleted: it is
+        // the assertion that the routing did what it says, and if it ever fires the routing is broken.
+        chartConnector: connectorId,
       })
       // THE ROW IS WRITTEN UNDER THE CONNECTOR THE ENQUEUE RESOLVED FOR ITSELF (o3d-ekn8 r2). A clean
       // `queued` says a row exists; `connector` is the only thing that says which ledger it is for. The

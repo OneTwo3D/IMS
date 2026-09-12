@@ -192,6 +192,9 @@ test(
         referenceType: REFERENCE_TYPE,
         referenceId,
         payload: payloadFor(referenceId),
+        // o3d-j625 r2: required now. Every test here starts from XERO ACTIVE, so the pooled chart check
+        // passes and the refusal under test is still the LOCKED fence's.
+        chartConnector: 'xero',
       })
       signal.fire!()
       // Held open, so the switch is demonstrably parked rather than merely losing a coin toss.
@@ -257,6 +260,9 @@ test(
         referenceType: REFERENCE_TYPE,
         referenceId,
         payload: payloadFor(referenceId),
+        // o3d-j625 r2: required now. Every test here starts from XERO ACTIVE, so the pooled chart check
+        // passes and the refusal under test is still the LOCKED fence's.
+        chartConnector: 'xero',
       })
       signal.fire!()
       await new Promise((resolve) => setTimeout(resolve, HOLD_MS))
@@ -320,6 +326,9 @@ test(
         referenceType: REFERENCE_TYPE,
         referenceId,
         payload: payloadFor(referenceId),
+        // o3d-j625 r2: required now. Every test here starts from XERO ACTIVE, so the pooled chart check
+        // passes and the refusal under test is still the LOCKED fence's.
+        chartConnector: 'xero',
       })
       return { outcome, elapsedMs: Date.now() - startedAt }
     })()
@@ -399,6 +408,9 @@ test(
         referenceType: REFERENCE_TYPE,
         referenceId,
         payload: payloadFor(referenceId),
+        // o3d-j625 r2: required now. Every test here starts from XERO ACTIVE, so the pooled chart check
+        // passes and the refusal under test is still the LOCKED fence's.
+        chartConnector: 'xero',
       })
       return { outcome, elapsedMs: Date.now() - startedAt }
     })()
@@ -457,6 +469,9 @@ test(
       referenceType: REFERENCE_TYPE,
       referenceId,
       payload: payloadFor(referenceId),
+      // o3d-j625 r2: required now. Every test here starts from XERO ACTIVE, so the pooled chart check
+      // passes and the refusal under test is still the LOCKED fence's.
+      chartConnector: 'xero',
     })
     const elapsedMs = Date.now() - startedAt
 

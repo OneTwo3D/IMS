@@ -246,11 +246,17 @@ export function buildReleasedSalesInvoicePayload(
  * o3d-j625: the chart the frozen payload's account codes belong to, narrowed to a routable id.
  *
  * `undefined` for a legacy hold (no field) AND for a stored value this build cannot route — a value
- * that names no queue is not a chart, and treating it as one would refuse that hold for ever. It
- * deliberately does NOT collapse a stored `null` into `undefined`: `null` was written by an import that
- * had no accounting connector at all, so the frozen codes are the empty-string defaults, and the
- * release must answer `not-configured` rather than posting blank accounts into a connector that has
- * since been switched on.
+ * that names no queue is not a chart. It deliberately does NOT collapse a stored `null` into
+ * `undefined`: `null` was written by an import that had no accounting connector at all, so the frozen
+ * codes are the empty-string defaults, and the release must answer `not-configured` rather than posting
+ * blank accounts into a connector that has since been switched on.
+ *
+ * o3d-j625 r2 (Codex HIGH 1) — WHAT `undefined` NOW COSTS. r1 wrote that it "keeps that hold's old
+ * behaviour rather than refusing it for ever", where the old behaviour was the enqueue resolving the
+ * active connector. That behaviour no longer exists: `chartConnector` is a required enqueue parameter.
+ * `undefined` therefore means UNATTRIBUTABLE, and `releaseHeldWcSalesInvoice` refuses such a hold —
+ * left PENDING with the reason on the row and a WARNING naming the manual remedy, because a days-wide
+ * gap between the frozen codes and the release is the widest window in the whole issue.
  */
 export function heldSalesInvoiceChartConnector(
   held: HeldSalesInvoicePayload,

@@ -87,6 +87,10 @@ const params = {
   payload: { amount: 100 },
   idempotencyKey: 'invoice-payment:payment:pay-1:invoice:INV-1',
   unlockedOrderScopeReason: 'test harness: the order guard is stubbed to a non-order scope',
+  // o3d-j625 r2: required on the enqueue now, and 'xero' is the only connector this file's plugin
+  // double has switched on — so the chart check passes and every outcome below still comes from the
+  // idempotency classification it is about.
+  chartConnector: 'xero' as const,
 }
 
 test.beforeEach(() => {
