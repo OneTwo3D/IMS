@@ -4,7 +4,6 @@ import {
   MINTSOFT_AUTH_MODES,
   MintsoftAuthModeError,
   parseMintsoftAuthMode,
-  mintsoftHasAuthMaterial,
   resolveMintsoftAuthMode,
 } from '../lib/connectors/mintsoft/settings/schema.ts'
 import { SENSITIVE_SETTING_KEYS } from '../lib/settings-store.ts'
@@ -91,41 +90,4 @@ test('resolveMintsoftAuthMode treats only absent/blank as the credentials defaul
   assert.equal(resolveMintsoftAuthMode('   '), 'credentials')
   assert.equal(resolveMintsoftAuthMode('api_key'), 'api_key')
   assert.equal(resolveMintsoftAuthMode('credentials'), 'credentials')
-})
-
-test('mintsoftHasAuthMaterial is mode-aware', () => {
-  const base = {
-    mintsoft_api_key: '',
-    mintsoft_static_api_key: '',
-    mintsoft_username: '',
-    mintsoft_password: '',
-  }
-
-  // Fixed-key mode: the fixed key alone is enough. The old predicate looked
-  // only at the rotating cache / username+password, so a valid key-only
-  // connection reported UNCONFIGURED — which skipped warehouse discovery and
-  // disabled product/bundle verification and returns polling.
-  assert.equal(
-    mintsoftHasAuthMaterial({ ...base, mintsoft_auth_mode: 'api_key', mintsoft_static_api_key: 'k' }),
-    true,
-  )
-  // ...and credentials do NOT substitute for it in that mode.
-  assert.equal(
-    mintsoftHasAuthMaterial({ ...base, mintsoft_auth_mode: 'api_key', mintsoft_username: 'u', mintsoft_password: 'p' }),
-    false,
-  )
-  // Credentials mode is unchanged.
-  assert.equal(
-    mintsoftHasAuthMaterial({ ...base, mintsoft_auth_mode: 'credentials', mintsoft_username: 'u', mintsoft_password: 'p' }),
-    true,
-  )
-  assert.equal(
-    mintsoftHasAuthMaterial({ ...base, mintsoft_auth_mode: 'credentials', mintsoft_api_key: 'cached' }),
-    true,
-  )
-  // A malformed mode is a broken configuration, not a configured one.
-  assert.equal(
-    mintsoftHasAuthMaterial({ ...base, mintsoft_auth_mode: 'api-key', mintsoft_static_api_key: 'k' }),
-    false,
-  )
 })

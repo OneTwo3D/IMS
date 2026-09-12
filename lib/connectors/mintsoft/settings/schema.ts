@@ -207,33 +207,21 @@ export async function getMintsoftSettings(): Promise<MintsoftSettings> {
   return result
 }
 
-/**
- * One mode-aware "is there usable auth material?" predicate, shared by the
- * dashboard and onboarding status so they cannot drift apart.
+/*
+ * `mintsoftHasAuthMaterial` WAS HERE, and is deleted (o3d-remove-shiphero round 14, Codex HIGH 2).
  *
- * Lives HERE and not in app/actions/mintsoft-sync.ts because that file is
- * `'use server'`, where every export must be an async server action — a
- * synchronous export there compiles under tsc but fails `next build`.
+ * Its own docstring said what it was for: "shared by the dashboard and onboarding status so they
+ * cannot drift apart". Those two status builders were its ONLY callers, and both have stopped
+ * computing `configured` at all — the one verdict is `isMintsoftConfigured()`, which answers the
+ * same question about auth material AND about the base URL, on the values a request is actually
+ * built from. Leaving a second, laxer predicate for "is Mintsoft set up?" lying about in an exported
+ * module is how this defect reached its ninth layer; there is now one function to reach for.
+ *
+ * ITS COVERAGE MOVED RATHER THAN VANISHED. The mode-awareness case it had in
+ * tests/mintsoft-auth-mode.test.ts is now asserted against `isMintsoftConfigured` in
+ * tests/wms-configured-predicate-whitespace.test.ts, whose `api_key` arm had no case at all before
+ * round 14 — deleting a duplicate must not delete the only coverage of the rule it duplicated.
  */
-export function mintsoftHasAuthMaterial(
-  settings: Pick<MintsoftSettings,
-    'mintsoft_auth_mode' | 'mintsoft_static_api_key' | 'mintsoft_api_key' | 'mintsoft_username' | 'mintsoft_password'>,
-): boolean {
-  let mode: MintsoftAuthMode
-  try {
-    mode = resolveMintsoftAuthMode(settings.mintsoft_auth_mode)
-  } catch {
-    // A malformed mode is a broken configuration, not a configured one.
-    return false
-  }
-
-  if (mode === 'api_key') return Boolean(settings.mintsoft_static_api_key.trim())
-
-  return Boolean(
-    settings.mintsoft_api_key.trim()
-      || (settings.mintsoft_username.trim() && settings.mintsoft_password.trim()),
-  )
-}
 
 /**
  * o3d-hl8l r5 (Codex r4 finding 2) — THE DELTA-RESET GENERATION.
@@ -261,113 +249,41 @@ export function mintsoftHasAuthMaterial(
 export const MINTSOFT_DELTA_GENERATION_KEY = 'mintsoft_order_delta_generation'
 
 /**
- * The stored generation as a number.
+ * o3d-remove-shiphero round 2 (Codex HIGH 2) — THE CURSOR MACHINERY MOVED OUT, THE NAMES STAYED.
  *
- * ABSENT (or empty) IS ZERO, not unknown: only the reset writes this row, so no row means no reset
- * has ever committed, which is a fact and not a gap. A row that is present but NOT a non-negative
- * integer is `null` — genuinely unattributable — and every caller treats that as "apply no change",
- * because a value nobody can order cannot establish that a cursor write is current.
+ * `parse`/`next` generation and `encode`/`decode` cursor were never Mintsoft-specific; they were
+ * Mintsoft-NAMED, and living here is what let the generic dispatch sweep import a connector module
+ * to do its own bookkeeping. They now live in lib/domain/wms/delta-cursor-generation.ts, which also
+ * derives the three cursor Setting keys FROM THE CONNECTOR ID so a second connector cannot inherit
+ * this one's watermark. The aliases below keep Mintsoft's own call sites and tests reading in
+ * Mintsoft's vocabulary; they are one implementation, not two.
  */
-export function parseMintsoftDeltaGeneration(raw: string | null | undefined): number | null {
-  if (raw == null) return 0
-  const trimmed = String(raw).trim()
-  if (trimmed === '') return 0
-  if (!/^\d+$/.test(trimmed)) return null
-  const parsed = Number.parseInt(trimmed, 10)
-  return Number.isSafeInteger(parsed) ? parsed : null
-}
+export {
+  parseWmsDeltaGeneration as parseMintsoftDeltaGeneration,
+  nextWmsDeltaGeneration as nextMintsoftDeltaGeneration,
+  encodeWmsDeltaCursor as encodeMintsoftDeltaCursor,
+  decodeWmsDeltaCursor as decodeMintsoftDeltaCursor,
+} from '@/lib/domain/wms/delta-cursor-generation'
+export type {
+  WmsDeltaCursorRefusal as MintsoftDeltaCursorRefusal,
+  WmsDeltaCursorDecode as MintsoftDeltaCursorDecode,
+} from '@/lib/domain/wms/delta-cursor-generation'
 
 /**
- * The generation a committing reset writes. An unreadable current value starts the chain again at 1
- * rather than propagating the garbage — every run holding the unreadable value is refused anyway
- * (it carries `null`), and every run holding a real number disagrees with 1 unless the chain really
- * is that short.
+ * MINTSOFT'S OWN DISPATCH PRECONDITION — the fail-closed ClientId scope gate (o3d-bjc #3).
+ *
+ * The shared 3PL tenant returns EVERY client's orders unless the call is scoped by our ClientId, so
+ * an order-number collision could mark OUR order shipped off a FOREIGN despatch. Worse, since
+ * round 5 every per-order lookup also requires a ClientId and throws without one, so the old
+ * "delta off, fall back to per-order reconcile" path would strike and dead-letter every active
+ * link. A blank ClientId therefore cleanly DISABLES Mintsoft dispatch sync.
+ *
+ * It lives here, beside the setting it reads, rather than in the generic sweep: it used to be
+ * `isDispatchClientScoped(connectorId, …)` in lib/domain/wms/dispatch-sweep.ts, whose first line was
+ * `if (connectorId !== 'mintsoft') return true` — a connector-specific rule wearing a generic
+ * signature, which is exactly the shape that makes a second connector's gate unreachable.
  */
-export function nextMintsoftDeltaGeneration(current: number | null): number {
-  return (current ?? 0) + 1
-}
-
-/**
- * o3d-hl8l r6 (Codex r5 finding 3) — THE GENERATION HAS TO TRAVEL WITH THE CLAIM.
- *
- * WHAT ROUND 5 STILL COULD NOT SEE. The fence `saveMintsoftDeltaCursors` arms is a compare-and-swap
- * inside our own code: a run hands back the generation it read, the write re-reads it under the
- * dispatch row lock, and a mismatch discards the advance. That works for every writer that RUNS THAT
- * CODE. A rolling deploy — or a rollback — puts a second instance in front of the SAME database
- * running a BUILD FROM BEFORE THE FENCE, and that instance does not merely fail to attribute its
- * write: it never asks the question at all. It executes its own `saveMintsoftDeltaCursors`, which
- * upserts `mintsoft_order_delta_since` unconditionally, and no amount of checking on our side is
- * reached. Round 5 treated the "carries a scope but no generation" payload as that instance; it is
- * not — it is a payload shape that only OUR code can produce.
- *
- * SO THE CHECK MOVES INTO THE VALUE. A cursor row now stores the generation it was written under
- * alongside the instant it claims, and the READER refuses a cursor it cannot attribute to the
- * generation currently in force. An older instance writes a bare timestamp, exactly as it always
- * did; the next reader sees a value with no stamp, cannot place it in the chain, and treats it as
- * ABSENT — which restarts the delta from the lookback window rather than trusting a watermark that
- * may have been established under a scope this installation has since abandoned.
- *
- * WHY "TREAT AS ABSENT" IS THE SAFE SIDE, and the only one. A watermark is one claim — "every
- * changed order up to this instant has been applied". Discarding it costs a single wider Order/List
- * window, which is idempotent: the sweep re-reads orders it has already applied and applies nothing.
- * Trusting it costs the opposite and unrecoverable thing — if the stale value is LATER than what the
- * current scope has ever fetched, every order changed in between is skipped and nothing ever says
- * so. The asymmetry is why this refuses rather than merges, in the same words the write side uses.
- *
- * THE ONE-TIME COST OF ADOPTING IT is exactly that: on the first sweep after this ships, the
- * existing unstamped cursors read as absent and the delta starts once from the lookback window. That
- * is the same work a reset asks for, and it happens once.
- */
-export type MintsoftDeltaCursorRefusal = 'absent' | 'unstamped' | 'unreadable' | 'superseded'
-
-export type MintsoftDeltaCursorDecode =
-  | { value: string; refusal: null }
-  | { value: null; refusal: MintsoftDeltaCursorRefusal }
-
-/**
- * The stored form of a cursor: the instant it claims, and the reset generation in force when the
- * run that claimed it started. JSON rather than a delimiter because the instant is operator-visible
- * in `settings` and a delimiter would have to be one an ISO timestamp can never contain.
- */
-export function encodeMintsoftDeltaCursor(generation: number, at: string): string {
-  return JSON.stringify({ g: generation, at })
-}
-
-/**
- * Decode a stored cursor against the generation currently in force.
- *
- * Every "no" is NAMED, because they mean different things to whoever reads the log: `unstamped` is
- * an instance that does not participate in the scheme (a pre-fence build, or the one-time migration
- * above); `unreadable` is a stamped value nobody can order; `superseded` is a stamp from a
- * generation the reset chain has moved past. All four produce the same conservative answer.
- */
-export function decodeMintsoftDeltaCursor(
-  raw: string | null | undefined,
-  currentGeneration: number | null,
-): MintsoftDeltaCursorDecode {
-  const trimmed = typeof raw === 'string' ? raw.trim() : ''
-  if (!trimmed) return { value: null, refusal: 'absent' }
-
-  let parsed: unknown
-  try {
-    parsed = JSON.parse(trimmed)
-  } catch {
-    // A bare ISO timestamp lands here: it is what every build before this fence wrote.
-    return { value: null, refusal: 'unstamped' }
-  }
-  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
-    return { value: null, refusal: 'unstamped' }
-  }
-
-  const record = parsed as Record<string, unknown>
-  const at = typeof record.at === 'string' ? record.at.trim() : ''
-  const stamped = typeof record.g === 'number' && Number.isSafeInteger(record.g) && record.g >= 0 ? record.g : null
-  if (!at || stamped === null) return { value: null, refusal: 'unreadable' }
-
-  // A generation row nobody can order cannot establish that a cursor is current, which is the same
-  // rule `saveMintsoftDeltaCursors` applies to the write side.
-  if (currentGeneration === null || stamped !== currentGeneration) {
-    return { value: null, refusal: 'superseded' }
-  }
-  return { value: at, refusal: null }
+export function isMintsoftDispatchClientScoped(clientIdRaw: string | null | undefined): boolean {
+  const raw = (clientIdRaw ?? '').trim()
+  return /^\d+$/.test(raw) && Number.parseInt(raw, 10) > 0
 }

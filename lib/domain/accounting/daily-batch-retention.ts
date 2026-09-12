@@ -38,10 +38,24 @@ export async function recreateRetentionCutoff(now: Date = new Date()): Promise<D
   return computeRetentionCutoff(resolveRetentionMonths(row?.value), now)
 }
 
-/** Prisma date filter for recreate's journaled-shipment/order queries: within the
- *  retention window when set ({ gte } also excludes nulls), else any non-null marker. */
-export async function recreateJournaledDateFilter(now?: Date): Promise<{ gte: Date } | { not: null }> {
-  const cutoff = await recreateRetentionCutoff(now)
-  return cutoff ? { gte: cutoff } : { not: null }
-}
 
+
+/**
+ * o3d-i0o6 r7 — THE CUTOFF AND THE FILTER, FROM ONE READ.
+ *
+ * The recreate sweeps need both: the filter bounds the rows they SELECT, and the cutoff bounds the
+ * historical batches those rows' pass histories name (see `allocationDebitRecreateTargets` — an
+ * order inside the window can carry an earlier pass that is outside it, and rebuilding that one
+ * would re-post a journal retention has already pruned). Taken together so the two can never be
+ * computed from two different `now`s, which would admit a batch the filter had excluded.
+ */
+export async function recreateRetentionWindow(now?: Date): Promise<{
+  cutoff: Date | null
+  dateFilter: { gte: Date } | { not: null }
+}> {
+  const cutoff = await recreateRetentionCutoff(now ?? new Date())
+  // `{ gte }` also excludes nulls; with retention disabled nothing is pruned, so any non-null
+  // marker is in scope. This is `recreateJournaledDateFilter` verbatim, which r7 folded in here so
+  // the filter cannot be taken from one read of the setting and the cutoff from another.
+  return { cutoff, dateFilter: cutoff ? { gte: cutoff } : { not: null } }
+}

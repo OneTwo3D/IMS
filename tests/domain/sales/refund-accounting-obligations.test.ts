@@ -280,10 +280,34 @@ test('o3d-2sm1 r7: every enqueue in the refund hand-off is accounted for, and it
 test('o3d-2sm1 r7: no enqueue path returns without saying what it did', () => {
   // The defect was a `return` that wrote nothing and reported nothing. A bare `return` anywhere in
   // these functions reintroduces it — the caller cannot tell that path from a queued row.
-  for (const [file, fn] of [
-    ['lib/connectors/xero/queue.ts', 'export async function queueXeroSync('],
-    ['lib/connectors/quickbooks/queue.ts', 'export async function queueQuickBooksSync('],
-    ['lib/accounting.ts', 'export async function queueAccountingSync('],
+  /**
+   * The third element is HOW that function is entitled to say "nothing will post".
+   *
+   * o3d-i0o6 r9 (Codex round 8, HIGH): the connector queues no longer PHRASE that outcome, and may
+   * not. Every `not-configured` they could give is given BEFORE the transaction that takes the
+   * plugin-selection fence, and on a pinned enqueue an unfenced `not-configured` settles a refund
+   * obligation against a ledger the selection has already moved off — with no reversal row on any
+   * ledger. The capability is unchanged; it now runs through the one fenced conversion, and what is
+   * asserted for them is that conversion WITH THE PIN PASSED (dropping the pin silently restores the
+   * unfenced answer). The facade keeps a literal for its `!connector` exit, which a pin cannot reach
+   * by construction — `connector` is `params.connector ?? <resolved>`.
+   */
+  for (const [file, fn, saysNothingWillPost] of [
+    [
+      'lib/connectors/xero/queue.ts',
+      'export async function queueXeroSync(',
+      /notConfiguredUnderPinnedLedgerFence\(params\.pinnedLedger\)/,
+    ],
+    [
+      'lib/connectors/quickbooks/queue.ts',
+      'export async function queueQuickBooksSync(',
+      /notConfiguredUnderPinnedLedgerFence\(params\.pinnedLedger\)/,
+    ],
+    [
+      'lib/accounting.ts',
+      'export async function queueAccountingSync(',
+      /reason: 'not-configured'/,
+    ],
   ] as const) {
     const source = readFileSync(join(process.cwd(), file), 'utf8')
     const at = source.indexOf(fn)
@@ -298,7 +322,7 @@ test('o3d-2sm1 r7: no enqueue path returns without saying what it did', () => {
       return indent <= 6 && /(?:^|[ )])return$/.test(line.trimEnd())
     })
     assert.deepEqual(bare, [], `${file}: every exit of the enqueue must report an outcome`)
-    assert.match(body, /reason: 'not-configured'/, `${file}: and it must be able to say "nothing will post"`)
+    assert.match(body, saysNothingWillPost, `${file}: and it must be able to say "nothing will post"`)
   }
 })
 

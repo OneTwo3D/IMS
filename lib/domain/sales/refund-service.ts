@@ -48,6 +48,12 @@ import {
 } from '@/lib/domain/inventory/stock-movement-idempotency'
 import { buildStockMovementValueFields } from '@/lib/domain/inventory/stock-movement-value'
 import { recordCogsSubledgerMovement } from '@/lib/domain/accounting/cogs-subledger-movement'
+import {
+  extractPayloadNetMovement,
+  payloadLinesLegible,
+  proveAllocationDebitPosting,
+  proveJournalPosting,
+} from '@/lib/domain/accounting/allocation-debit-posting-proof'
 import { withSavepoint } from '@/lib/db/savepoint'
 import { lockSalesOrder } from '@/lib/domain/sales/allocation-service'
 
@@ -321,6 +327,24 @@ export type RefundAccountingSyncRequest = {
   referenceId: string
   payload: Record<string, unknown>
   idempotencyKey?: string
+  /**
+   * o3d-i0o6 r3 (Codex HIGH 1) — THE LEDGER THIS POSTING WAS RECKONED AGAINST, IF ONE WAS.
+   *
+   * Staging can establish a fact about a SPECIFIC connector — that the A2 debit this credit reverses
+   * posted there, against that connector's account codes — and the hand-off that queues the request
+   * runs later, outside that transaction, through an enqueue that resolves "the active connector"
+   * for itself. Between the two, a switch makes the proof and the write about two different ledgers:
+   * the credit is queued where the debit never stood, using the account codes of where it did.
+   *
+   * Carrying the connector ON THE REQUEST is what closes that, because the request is the only thing
+   * that crosses the gap — it is persisted to `accountingRetrySyncs` and replayed by the retry, so
+   * the pin has to live here rather than in a variable the retry path never sees.
+   *
+   * Absent means UNPINNED, which is the right answer for every posting whose staging proved nothing
+   * about a connector (the credit note, the COGS reversal): those keep the active-connector
+   * resolution they have always had.
+   */
+  connector?: 'xero' | 'quickbooks'
 }
 
 /**
@@ -1416,21 +1440,9 @@ async function stageRefundAccountingReversals(
     //
     // An empty account code is not a match — an unconfigured account would otherwise sum every line
     // whose own accountCode is blank (o3d-o97 r2).
-    const extractPayloadNetMovement = (
-      payload: unknown,
-      accountCode: string,
-      side: 'credit' | 'debit',
-    ): number => {
-      if (!accountCode) return 0
-      const linesPayload = (payload as { lines?: Array<{ accountCode?: string; debit?: number; credit?: number }> } | null)?.lines
-      if (!Array.isArray(linesPayload)) return 0
-      return linesPayload.reduce((sum, line) => {
-        if (line.accountCode !== accountCode) return sum
-        const debit = refundBoundaryNumber(line.debit ?? 0)
-        const credit = refundBoundaryNumber(line.credit ?? 0)
-        return sum + (side === 'credit' ? credit - debit : debit - credit)
-      }, 0)
-    }
+    // o3d-i0o6: moved to `@/lib/domain/accounting/allocation-debit-posting-proof` beside the proof it
+    // feeds, unchanged, so the reverser on the other side of this contra reads the same lines the
+    // same way.
 
     const priorUnearnedReversed = livePriorReversals
       .filter((row) => row.type === 'UNEARNED_REV_REVERSAL')
@@ -1464,39 +1476,11 @@ async function stageRefundAccountingReversals(
     // readable on it. That is the same epistemic position as a row retention has deleted outright —
     // "finished, outcome no longer legible" — and it is resolved the same way, by the caller, to
     // whichever side moves the least money.
-    type JournalLedgerProof =
-      | { kind: 'proved'; amount: number }
-      | { kind: 'illegible' }
-      | { kind: 'unproved'; statuses: string }
-
-    const payloadLinesLegible = (payload: unknown): boolean => (
-      Array.isArray((payload as { lines?: unknown } | null)?.lines)
-    )
-
-    const proveJournalPosting = (
-      rows: Array<{ status: string; payload: unknown }>,
-      accountCode: string,
-      side: 'credit' | 'debit',
-    ): JournalLedgerProof => {
-      if (rows.length === 0) return { kind: 'unproved', statuses: 'absent' }
-      if (rows.some((row) => row.status !== 'SYNCED')) {
-        return { kind: 'unproved', statuses: rows.map((row) => row.status).join('/') }
-      }
-      if (rows.some((row) => !payloadLinesLegible(row.payload))) return { kind: 'illegible' }
-      if (!accountCode) return { kind: 'unproved', statuses: 'no Allocated Inventory account configured' }
-      return {
-        kind: 'proved',
-        // o3d-o97 r6: the account's NET movement across the journal's own lines, not the gross of
-        // whichever side the caller expects — see `extractPayloadNetMovement`. Floored at zero
-        // because a negative net is the account moving the OTHER WAY, which is not a smaller
-        // relief/debit but none of one, and letting it go negative would make several journals sum
-        // to a figure no single one of them can be held to.
-        amount: Math.max(0, rows.reduce(
-          (sum, row) => sum + extractPayloadNetMovement(row.payload, accountCode, side),
-          0,
-        )),
-      }
-    }
+    // o3d-i0o6: the rule this block spells out is now STATED ONCE, in
+    // `lib/domain/accounting/allocation-debit-posting-proof.ts`, and imported by both readers of it —
+    // this path and `allocation-service.reverseOrphanedAllocationPosting`, which used to answer the
+    // same question off a different field and get a different answer. Nothing about the rule changed
+    // here; it moved so there is one copy of it to be right.
 
     // o3d-o97 r4 — WHAT MAKES A RELIEF FIGURE *POSTED* RATHER THAN *QUEUED*.
     //
@@ -2397,6 +2381,10 @@ async function stageRefundAccountingReversals(
       select: {
         inventoryAllocatedDate: true,
         allocationBatchAmount: true,
+        // o3d-i0o6 r3: the PASSES behind that cumulative figure. Without them the three columns
+        // below describe the latest instalment and the amount describes all of them, and proving
+        // the first against the second is how a credit was raised for pounds no journal carried.
+        allocationBatchPasses: true,
         allocationBatchSyncLogId: true,
         allocationBatchConnector: true,
         allocationBatchAccountCode: true,
@@ -2405,7 +2393,12 @@ async function stageRefundAccountingReversals(
     // NULL and ZERO are different facts and must not collapse into one. A recorded £0 is A2
     // saying it valued this order at nothing — a KNOWN debit of zero, nothing to reverse and
     // nothing to refuse over. A NULL is A2 having recorded no figure at all.
-    const hasRecordedAllocationAmount = stagedA2?.allocationBatchAmount != null
+    //
+    // o3d-i0o6 r2: that distinction is drawn inside `proveAllocationDebitPosting` now, and the
+    // `hasRecordedAllocationAmount` flag that used to draw it here is GONE rather than merely
+    // unused — it was one of the three conditions guarding the open balance, and a second copy of a
+    // rule the proof already applies is how the two came to disagree. What stays is the raw recorded
+    // figure, used only to TELL AN OPERATOR what A2 put on the row; nothing decides on it.
     const postedAllocationDebit = refundBoundaryNumber(stagedA2?.allocationBatchAmount ?? 0)
 
     // o3d-o97 r3 — WHAT THE A2 AMOUNT PROVES, AND ABOUT WHICH LEDGER.
@@ -2436,47 +2429,70 @@ async function stageRefundAccountingReversals(
     // inference, unchanged. Nothing can retroactively prove a 2025 batch posted; what is available
     // is that every batch from here on says so itself.
     let allocationBasisUnresolved: string | null = null
-    let openAllocatedContra: number | null = null
-    if (stagedA2?.inventoryAllocatedDate && !hasRecordedAllocationAmount) {
-      allocationBasisUnresolved = 'the order carries an A2 stamp with no recorded allocation amount, so the pounds A2 debited to Allocated Inventory are not on record and cannot be reversed automatically'
-    } else if (stagedA2?.inventoryAllocatedDate && postedAllocationDebit > 0 && stagedA2.allocationBatchSyncLogId) {
-      const recordedConnector = stagedA2.allocationBatchConnector
-      const recordedAccount = stagedA2.allocationBatchAccountCode
-      const a2Journal = await tx.accountingSyncLog.findUnique({
-        where: { id: stagedA2.allocationBatchSyncLogId },
-        select: { status: true, connector: true, payload: true },
-      })
-      if (params.activeConnector && recordedConnector && recordedConnector !== params.activeConnector) {
-        allocationBasisUnresolved = `A2 debited Allocated Inventory on ${recordedConnector}, but this reversal would be raised on ${params.activeConnector} — crediting it there would leave the ${recordedConnector} debit standing and move pounds a ${params.activeConnector} ledger never held`
-      } else if (recordedAccount && recordedAccount !== settings.allocatedInventoryAccount) {
-        allocationBasisUnresolved = `A2 debited account ${recordedAccount}, but Allocated Inventory is configured as ${settings.allocatedInventoryAccount} today — the reversal would credit an account that was never debited for this order`
-      } else if (!a2Journal) {
-        allocationBasisUnresolved = 'the A2 journal this order was staged into is no longer on record (retention), so whether it reached the ledger cannot be established'
-      } else if (params.activeConnector && a2Journal.connector && a2Journal.connector !== params.activeConnector) {
-        // o3d-o97 r5: the ROW's connector, not only the stamp beside the amount. The stamp is
-        // written by the batch in the same statement as the figure; the row is the ledger's own
-        // record of which books it was raised into, and they are two different assertions.
-        allocationBasisUnresolved = `the A2 journal this order was staged into was raised on ${a2Journal.connector}, but this reversal would be raised on ${params.activeConnector} — a credit there would move pounds that ledger never held`
-      } else if (a2Journal.status !== 'SYNCED') {
-        allocationBasisUnresolved = `the A2 journal this order was staged into is ${a2Journal.status}, not SYNCED — nothing has been debited to Allocated Inventory for this order to reverse`
-      } else {
-        // o3d-o97 r5 — AND SYNCED IS STILL NOT A STATEMENT ABOUT POUNDS. The batch journal covers a
-        // whole day, so its DR to Allocated Inventory is the window's total and this order's
-        // recorded share must fit inside it. A journal that debits that account NOTHING, or less
-        // than this one order claims, cannot be what put `postedAllocationDebit` there — and the
-        // residue would otherwise credit an account off a figure the journal contradicts.
-        //
-        // An ILLEGIBLE payload (compacted off a settled row) is not a contradiction: it is the
-        // recorded three-part attribution being the only evidence left, which is the state every
-        // pre-column order is in already, so it falls through to the recorded figure.
-        const proof = proveJournalPosting([a2Journal], settings.allocatedInventoryAccount, 'debit')
-        if (proof.kind === 'proved' && proof.amount <= 0) {
-          allocationBasisUnresolved = `the A2 journal this order was staged into has settled, but its lines debit nothing to Allocated Inventory (${settings.allocatedInventoryAccount}) — the £${postedAllocationDebit.toFixed(2)} recorded against this order is contradicted by the journal that was to carry it`
-        } else if (proof.kind === 'proved' && postedAllocationDebit > proof.amount + 0.005) {
-          allocationBasisUnresolved = `this order records a £${postedAllocationDebit.toFixed(2)} share of an A2 journal that debited Allocated Inventory only £${proof.amount.toFixed(2)} in total — a share cannot exceed its batch, so the pounds standing against this order cannot be established`
-        }
-      }
-    }
+    //
+    // o3d-i0o6 — AND THE SIX REFUSALS ABOVE ARE NOW A FUNCTION, NOT A BLOCK, BECAUSE THIS WAS NEVER
+    // THE ONLY READER. `allocation-service.reverseOrphanedAllocationPosting` credits this same
+    // account, for units ORPHANED off an order rather than refunded, and it was deciding whether A2
+    // had posted by reading `postedUnitCostBase` off the allocation snapshot — the per-entry twin of
+    // `allocationBatchAmount`, written by the same statement, and disproved as evidence by the very
+    // paragraphs above. One rule with two readers is one rule that gets fixed once and stays wrong
+    // in the other place, so the rule moved to
+    // `@/lib/domain/accounting/allocation-debit-posting-proof` and both readers import it. The
+    // refusals, their order and their wording are unchanged.
+    //
+    // The one thing that IS different is that the connector is no longer optional. `if
+    // (params.activeConnector && ...)` silently deleted the whole cross-ledger check whenever the
+    // caller could not name the active connector, which is the permissive-default shape twice over
+    // — so `null` now refuses on its own terms instead of waving the rest of the gate through.
+    //
+    // o3d-i0o6 r2 — AND IT IS ASKED UNCONDITIONALLY, BECAUSE THE STAMP IS NOT WHAT SAYS A DEBIT
+    // POSTED.
+    //
+    // r1 ran the proof only `if (stagedA2?.inventoryAllocatedDate)`. That is the stamp deciding
+    // whether the question about the ATTRIBUTION gets asked at all — the proof module's own opening
+    // paragraph says the stamp must not be the discriminator, and the caller put it back one level
+    // out. `inventoryAllocatedDate` is a lifecycle marker meaning "A2 still has work to do here",
+    // and `resetAllocationAccountingIfStaged` CLEARS IT ON PURPOSE, on the declared-rewrite path,
+    // while DELIBERATELY PRESERVING `allocationBatchAmount` and the whole journal attribution — so
+    // that A2 comes back and posts the increment. That state is ordinary, reachable by any
+    // allocation edit that adds quantity, and in it r1 skipped the proof entirely: a FAILED, a
+    // CANCELLED or a CROSS-LEDGER A2 journal produced a full-value credit against a debit that never
+    // posted in these books.
+    //
+    // So the question is asked of the attribution, always, and the stamp is left to the one job it
+    // is evidence for — inside the proof, telling "A2 never ran" from "A2 ran and recorded no
+    // figure" when there is no amount to read.
+    const basis = await proveAllocationDebitPosting(tx, stagedA2 ?? {
+      inventoryAllocatedDate: null,
+      allocationBatchAmount: null,
+      allocationBatchPasses: null,
+      allocationBatchSyncLogId: null,
+      allocationBatchConnector: null,
+      allocationBatchAccountCode: null,
+    }, {
+      activeConnector: params.activeConnector ?? null,
+      allocatedInventoryAccount: settings.allocatedInventoryAccount,
+    })
+    // o3d-i0o6 r3 — `unattributed` IS A REFUSAL HERE TOO, AND SAYING SO IS THE HONEST HALF OF
+    // CAPPING IT AT ZERO.
+    //
+    // r2 let it through as "not a refusal": a refund can fire years after the fact and legitimately
+    // meets orders staged before the attribution columns existed, and for those the recorded amount
+    // was the only evidence there was — so it kept the older amount-implies-posting inference and
+    // credited the figure. r3 stops crediting it (the verdict carries no figure to credit), which
+    // leaves the question of what an operator is TOLD.
+    //
+    // Left out of `allocationBasisUnresolved`, the answer would be: nothing true. The cap note below
+    // would fire instead and print "an open balance of £0.00" — a FABRICATED FIGURE for a state
+    // whose whole content is that the balance cannot be established, which is precisely the defect
+    // o3d-o97 r6 removed from the refusal path. Worse, the un-stage at the bottom of this block is
+    // conditional on this variable, so a silent `unattributed` would clear the A2 stamp and its
+    // attribution on a full refund and destroy the evidence of the very debit it declined to credit.
+    //
+    // So an unprovable basis is reported as one, in the proof's own words, which name the recorded
+    // figure for the human who has to go and post it by hand. `none` (a recorded £0.00) stays a
+    // non-refusal: that is POSITIVE evidence there is nothing to reverse, not an absence of evidence.
+    if (basis.kind === 'refused' || basis.kind === 'unattributed') allocationBasisUnresolved = basis.reason
     if (!allocationBasisUnresolved) {
       // o3d-0i5y r12: the reversal relief refuses on the same terms as the other two. It is last
       // only because it is the newest source; the order of the three carries no meaning beyond
@@ -2494,21 +2510,42 @@ async function stageRefundAccountingReversals(
     if (!allocationBasisUnresolved && allocationRowBasisMissing && apportionmentIsInexact && params.newStatus !== 'REFUNDED') {
       allocationBasisUnresolved = `some refunded units came from allocation rows carrying no posted A2 basis of their own, and this refund reverses ${unrecordedQtyRefunded} of the ${unrecordedRowQtyTotal} such unit(s) spread across ${unrecordedRowCount} separately-valued allocation rows (${unrecordedRowProductIds.size} product(s)) that share this order's remaining A2 debit of £${residualDebitForUnrecordedRows.toFixed(2)} — apportioning that debit by unit prices them at a blended rate A2 applied to no row, and a partial refund has neither the open-balance cap nor the full refund's residue to correct it`
     }
-    if (stagedA2?.inventoryAllocatedDate && hasRecordedAllocationAmount && !allocationBasisUnresolved) {
-      // THE LEDGER BALANCE: what A2 debited, less every relief already credited against it. This
-      // is a per-order figure derived from records the postings wrote — not a pool of entries
-      // netted to choose units, which is the sibling's rule and would be the wrong shape here.
-      // o3d-0i5y r12 / o3d-xlk7: THREE relief sources now, not two — Group B for what dispatched,
-      // earlier refunds for what they took back, and ALLOCATION_REVERSAL for what was ORPHANED off
-      // the order and will never reach either of the first two. Omitting the third is what credited
-      // the same units twice on a cancelled-then-refunded order.
-      const relieved = addMoney(
-        addMoney(postedGroupBAllocationRelief, toDecimal(priorRefundAllocationRelief)),
-        toDecimal(allocationReversalRelief),
-      )
-      const open = subtractMoney(toDecimal(postedAllocationDebit), relieved)
-      openAllocatedContra = open.gt(0) ? roundQuantity(open, 2).toNumber() : 0
-    }
+    // THE LEDGER BALANCE: what A2 debited, less every relief already credited against it. This
+    // is a per-order figure derived from records the postings wrote — not a pool of entries
+    // netted to choose units, which is the sibling's rule and would be the wrong shape here.
+    // o3d-0i5y r12 / o3d-xlk7: THREE relief sources now, not two — Group B for what dispatched,
+    // earlier refunds for what they took back, and ALLOCATION_REVERSAL for what was ORPHANED off
+    // the order and will never reach either of the first two. Omitting the third is what credited
+    // the same units twice on a cancelled-then-refunded order.
+    //
+    // o3d-i0o6 r2 — AND IT IS A NUMBER, ALWAYS, WHICH IS THE WHOLE POINT.
+    //
+    // It used to be `number | null`, computed only under the stamp, and the cap below read `null` as
+    // NO CEILING. So every state that skipped this block did not merely lose the balance — it
+    // removed the bound on what the refund's own lines could credit, which is the opposite of what a
+    // missing fact should buy. Three conditions guarded it and any one of them failing un-capped the
+    // reversal; the cleared-stamp rewrite above failed the first.
+    //
+    // The debit now comes from the PROOF rather than from the row, so there is nothing left to gate
+    // on: `posted` carries the proved figure, `none` means A2 debited nothing, and every other
+    // answer means nothing may be credited. All four answers are a number, the cap below can no
+    // longer be absent, and the largest an unproved state can authorise is £0.00.
+    //
+    // o3d-i0o6 r3 — AND `unattributed` IS NO LONGER ONE OF THE TWO THAT CARRY A FIGURE. r2 wrote
+    // this as `posted || unattributed`, which let the verdict whose own definition is "the posting
+    // and the ledger CANNOT be established" set a POSITIVE ceiling while a plain refusal set none —
+    // two unprovable states, two ceilings, and the more ignorant one the more permissive. The union
+    // itself now gives `recordedDebit` to `posted` alone, so this reads the only field there is and
+    // the old shape does not compile.
+    const provedAllocationDebit = basis.kind === 'posted' ? basis.recordedDebit : 0
+    const relieved = addMoney(
+      addMoney(postedGroupBAllocationRelief, toDecimal(priorRefundAllocationRelief)),
+      toDecimal(allocationReversalRelief),
+    )
+    const openBeforeRefusal = subtractMoney(toDecimal(provedAllocationDebit), relieved)
+    const openAllocatedContra: number = allocationBasisUnresolved != null
+      ? 0
+      : openBeforeRefusal.gt(0) ? roundQuantity(openBeforeRefusal, 2).toNumber() : 0
 
     // o3d-o97 r3 — THE DEBIT CAP. The line-driven reversal reverses whatever the refund's lines
     // consumed; nothing bounded it by what the account actually holds. Even at the posted basis a
@@ -2523,11 +2560,16 @@ async function stageRefundAccountingReversals(
     // is computed only when the basis resolved, and it is the cap — so under r3 a refusal did not
     // withhold the line reversal at all, it removed its ceiling and sent the whole uncapped figure.
     // The refusal now means what it says: nothing is credited to an account whose open balance this
-    // refund could not establish. The residue below is already null-guarded, so the two agree.
+    // refund could not establish.
+    //
+    // o3d-i0o6 r2: and there is no longer a THIRD arm. `openAllocatedContra != null` was the
+    // remaining escape — an absent balance clamped nothing — and it cannot be written now, because a
+    // balance is always a number. A refusal and an unprovable state both cap at £0.00 rather than at
+    // infinity.
     const lineAllocationBasis = sumCostLayerSnapshot(allocationRefundSnapshot)
     const cappedLineBasis = allocationBasisUnresolved != null
       ? toDecimal(0)
-      : openAllocatedContra != null && lineAllocationBasis.gt(toDecimal(openAllocatedContra))
+      : lineAllocationBasis.gt(toDecimal(openAllocatedContra))
         ? toDecimal(openAllocatedContra)
         : lineAllocationBasis
     const lineAllocationReversal = roundQuantity(lineAllocationBasis, 2).toNumber()
@@ -2535,7 +2577,7 @@ async function stageRefundAccountingReversals(
     // A full refund closes BOTH batch windows for ever (`refundStatus: { not: 'FULL' }` on Group A2
     // and Group B), so this is the last moment anything will look at the order's A2 posting: the
     // part of the open balance no line reached has to come out now or never.
-    const residualAllocationBasis = params.newStatus === 'REFUNDED' && openAllocatedContra != null
+    const residualAllocationBasis = params.newStatus === 'REFUNDED'
       ? subtractMoney(toDecimal(openAllocatedContra), cappedLineBasis)
       : toDecimal(0)
     const allocationReversal = roundQuantity(
@@ -2608,7 +2650,7 @@ async function stageRefundAccountingReversals(
             ? `£${assumedReliefTotal.toFixed(2)} of Allocated Inventory relief was counted against this order's A2 debit WITHOUT the journal that was to carry it being legible, so the open balance may be overstated as relieved by up to that much: ${assumedReliefNotes.join('; ')}`
             : null,
           capBitInto
-            ? `the refund's own lines valued £${lineAllocationReversal.toFixed(2)} of allocated basis against an open balance of £${(openAllocatedContra ?? 0).toFixed(2)} and were capped to it`
+            ? `the refund's own lines valued £${lineAllocationReversal.toFixed(2)} of allocated basis against an open balance of £${openAllocatedContra.toFixed(2)} and were capped to it`
             : null,
           // o3d-o97 r5: what the refusal actually cost, in pounds, on the row an operator reads.
           refusalWithheldLineReversal
@@ -2686,6 +2728,22 @@ async function stageRefundAccountingReversals(
       // refund — the part of that balance no line reached. On a resolved full refund the two sum
       // to exactly the open balance.
       allocationReversal,
+      // o3d-i0o6 r3 (Codex HIGH 1) — THE LEDGER THE ALLOCATION CREDIT WAS PROVED AGAINST, CARRIED
+      // OUT OF THE TRANSACTION THAT PROVED IT.
+      //
+      // r2 pinned `queueAccountingSyncTx` and left this value inside the staging transaction, which
+      // made the pin unreachable from the route that matters: the UNEARNED_REV_REVERSAL this staging
+      // produces is queued through the UNPINNED facade (`queueAccountingSync`, in
+      // `queueRefundAccountingActions`), which resolves the active connector all over again. A
+      // connector switch between staging and the hand-off therefore queued the allocation CREDIT on
+      // one ledger using the account codes and the proof of ANOTHER — and the obligation ledger, whose
+      // own pin is taken at the start of the hand-off, saw two agreeing reads of the NEW connector and
+      // cleared the retry flag over it.
+      //
+      // So the connector travels with the request. `null` where nothing was proved, which is every
+      // path that credits no allocation at all — the journal below is then an unearned-revenue
+      // reversal, about which this proof says nothing and must not pin anything.
+      allocationProvedOnConnector: basis.kind === 'posted' ? basis.provedOnConnector : null,
     }
   })
 
@@ -2752,6 +2810,47 @@ async function stageRefundAccountingReversals(
       referenceType: 'SalesOrderRefund',
       referenceId: params.refundId,
       idempotencyKey: `sales-order-refund:${params.refundId}:unearned-reversal`,
+      // o3d-i0o6 r3 (Codex HIGH 1) — PINNED TO THE LEDGER THE ALLOCATION DEBIT WAS PROVED ON.
+      //
+      // This one journal carries BOTH reversals, and only one of them has a proof behind it. Where
+      // it credits Allocated Inventory, the pounds it is taking back were proved to be standing on
+      // `allocationProvedOnConnector` and nowhere else, and the account codes on those lines came
+      // from that connector's settings — so queueing it against whatever is active at hand-off time
+      // credits a ledger the debit was never in. Pinned, the enqueue answers for THAT connector: if
+      // it is no longer the one posting this type, nothing is written and the obligation ledger
+      // leaves `accountingRetryRequired` standing for a human, which is the outcome a refund that
+      // cannot post where it proved actually wants.
+      //
+      // Unpinned when no allocation credit is in the journal: an unearned-revenue-only reversal was
+      // reckoned against no particular ledger, and pinning it to a connector this proof happens to
+      // name would refuse postings that have nothing to do with the allocation contra.
+      //
+      // o3d-i0o6 r6 — AND THE PIN SAYS NOTHING ABOUT THE GROUP A1 HALF BESIDE IT, WHICH IS WHY IT
+      // IS SAFE TO CARRY IT.
+      //
+      // Round 4 read this as an assumption about the unearned-revenue lines: A1 defers when the
+      // order is PAID and A2 reclassifies when it is ALLOCATED, so a connector switch between the
+      // two would make one pin speak for two provenances, and the A1 debit would land in books that
+      // never credited the liability. r5 answered that by establishing A1's ledger independently.
+      // It is withdrawn, because the premise is false:
+      //
+      //   `proveAllocationDebitPosting` REFUSES any pass or journal whose connector is not
+      //   `target.activeConnector`, and returns `provedOnConnector: target.activeConnector` — the
+      //   target, never a re-read of A2's own record. So `allocationProvedOnConnector` is either
+      //   the connector this refund is being staged against or null. It can never be a historical
+      //   ledger, and a pin to the active connector routes the A1 lines to exactly the connector an
+      //   UNPINNED enqueue would resolve for them.
+      //
+      // The pin therefore cannot move the A1 half anywhere; the only behaviour it can add to that
+      // half is to WITHHOLD it when the active connector changes between this staging and the
+      // hand-off, and a reversal that is withheld with `accountingRetryRequired` standing is the
+      // fail-closed direction. Which ledger actually holds an A1 liability raised before a switch
+      // is a real and separate defect — it is answered the same wrong way with or without this pin,
+      // and on `development` too — and it is tracked as its own issue rather than carried here.
+      // See the invariant test `proveAllocationDebitPosting` never pins a historical ledger.
+      ...(reversalAmounts.allocationReversal > 0 && reversalAmounts.allocationProvedOnConnector
+        ? { connector: reversalAmounts.allocationProvedOnConnector }
+        : {}),
       payload: {
         date: new Date().toISOString().slice(0, 10),
         reference: hasUnearnedReversal
@@ -2851,6 +2950,19 @@ function parseRefundAccountingRetrySyncs(
       referenceId: entry.referenceId,
       payload: entry.payload,
       idempotencyKey: typeof entry.idempotencyKey === 'string' ? entry.idempotencyKey : undefined,
+      // o3d-i0o6 r3: THE PIN SURVIVES THE ROUND TRIP. This parser rebuilds the request field by
+      // field and silently drops anything it does not name, so a `connector` written at staging and
+      // not read back here would leave the RETRY queueing the allocation credit unpinned — the same
+      // credit on the same order, against whatever ledger happens to be active when someone presses
+      // retry. Narrowed to the two known ids rather than passed through as a string: a value this
+      // build cannot route is not a pin, and treating it as one would refuse every retry for ever.
+      // SPREAD, so an unpinned sync comes back without the key at all rather than with an explicit
+      // `undefined` — `{...}` and `{connector: undefined}` are the same request to every consumer
+      // but not to a structural comparison, and one of those consumers is the persisted JSON this
+      // very function round-trips.
+      ...(entry.connector === 'xero' || entry.connector === 'quickbooks'
+        ? { connector: entry.connector }
+        : {}),
     }]
   })
 }
@@ -4638,10 +4750,11 @@ export async function retrySalesOrderRefundAccounting(
       // decided by `reversalRecordVerdict`, never by the missing date on its own.
       if (!refund.order.revenueDeferredDate) {
         // Re-staging is not the alternative on either branch below, and the omission is worth
-        // stating: every reversal amount is derived from the stamps the un-stage removed.
-        // `openAllocatedContra` is computed only under `stagedA2?.inventoryAllocatedDate`, so a
-        // re-stage here would credit the lines' allocated basis UNCAPPED, take no residue and
-        // record no refusal — a fabricated figure in place of a missing one. Failing instead leaves
+        // stating: every reversal amount is derived from the stamps the un-stage removed. A re-stage
+        // here would take no residue and record no refusal — a fabricated figure in place of a
+        // missing one. (o3d-i0o6 r2: it would no longer also credit the lines' basis UNCAPPED, which
+        // is what this note used to warn about — the cap is now derived from the proof and cannot be
+        // absent — but a re-staged stamp is still an assertion nothing here can support.) Failing instead leaves
         // `accountingRetryRequired` set (nothing on this path clears it), so the refund keeps its
         // retry affordance and its standing reversal-evidence findings, and a human raises the
         // reversal from records that still exist.

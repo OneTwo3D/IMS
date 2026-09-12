@@ -42,6 +42,7 @@ import {
   type RetiredPendingShipment,
 } from '@/lib/domain/sales/pending-shipment-reconciliation'
 import { resolveStagedAllocationDebit } from '@/lib/domain/accounting/allocated-inventory-debit'
+import { proveAllocationDebitPosting } from '@/lib/domain/accounting/allocation-debit-posting-proof'
 import {
   assertNoSalesInvoicePostingInFlight,
   cancelPendingSalesInvoiceSyncForOrder,
@@ -52,7 +53,7 @@ import {
   validateSalesOrderStatusTransition,
 } from '@/lib/domain/workflows/action-guards'
 import type { SalesOrderStatus } from '@/lib/domain/workflows/status-types'
-import { addMoney, roundQuantity, toDecimal, type DecimalInput } from '@/lib/domain/math/decimal'
+import { addMoney, roundQuantity, subtractMoney, toDecimal, type DecimalInput } from '@/lib/domain/math/decimal'
 import {
   accountedAllocationQty,
   parseCostLayerSnapshot,
@@ -995,14 +996,37 @@ async function recordStandingAllocationDebitOnCancel(
  * both halves of it apply here:
  *
  *   * A reversal posted wrongly is as bad as the original, so this needs POSITIVE evidence that
- *     the original posted — never the absence of evidence against it, and never a stamp. The
- *     evidence used here is `postedUnitCostBase`: an amount A2 WROTE onto the entry, in the same
- *     statement that wrote the entry and the same transaction that raised the journal for it. An
- *     entry that carries one was valued by a pass whose batch total was therefore positive, which
- *     is a pass that created a journal. An entry WITHOUT one — every entry written before r9, and
- *     any entry a future path forgets to stamp — says nothing about what was posted, so it
- *     contributes NOTHING and is reported instead, exactly as the sibling reports a stamp with no
- *     recorded amount.
+ *     the original posted — never the absence of evidence against it, and never a stamp. An entry
+ *     WITHOUT a `postedUnitCostBase` — every entry written before r9, and any entry a future path
+ *     forgets to stamp — says nothing about what was posted, so it contributes NOTHING and is
+ *     reported instead, exactly as the sibling reports a stamp with no recorded amount.
+ *
+ *     o3d-i0o6 — AND AN ENTRY *WITH* ONE IS NOT PROOF EITHER, WHICH IS WHAT THIS USED TO SAY.
+ *     r9 argued: "an entry that carries one was valued by a pass whose batch total was therefore
+ *     positive, which is a pass that created a journal". o3d-o97 r3 had already disproved exactly
+ *     that inference ON THIS CONTRA, about `allocationBatchAmount` — the per-order twin of this
+ *     field, written by the same statement — and the three reasons transfer verbatim, because
+ *     `withPostedUnitCost` stamps every entry the pass values BEFORE the guard that decides whether
+ *     a batch log exists at all:
+ *
+ *       no journal      the log is created only when the window's ROUNDED total is positive, while
+ *                       the per-entry amount is written unconditionally;
+ *       never posted    the log is created PENDING inside the batch transaction and the remote call
+ *                       is a DIFFERENT transaction, which can end FAILED or CANCELLED as a
+ *                       cross-connector orphan;
+ *       no destination  the amount NAMES NO LEDGER AND NO ACCOUNT, while this credit is raised on
+ *                       the connector active NOW against the account configured NOW.
+ *
+ *     So `postedUnitCostBase` answers only HOW MANY POUNDS these particular units carried — which is
+ *     the one thing the order-level record cannot say, and the reason it is still read. WHETHER, and
+ *     WHERE, is a different question and is now asked of the order's three-part A2 attribution
+ *     through {@link proveAllocationDebitPosting}, the same rule and the same words the refund side
+ *     of this contra already refuses on. Anything short of "a settled journal, on this connector,
+ *     against this account, whose own lines carry the debit" raises NOTHING and reports.
+ *
+ *     AND THE CREDIT IS CAPPED AT WHAT IS STILL OPEN. One order can be trimmed many times, and each
+ *     shrink's snapshot arithmetic knows only its own units; nothing bounded their sum by what A2
+ *     actually debited. `allocationBatchAmount` less `allocationReversalAmount` is that bound.
  *   * It reverses what was recorded, never the pin revalued since. `unitCostBase` on these very
  *     entries is rewritten in place by `updateSnapshotsForCostLayerChange` when a landed cost
  *     arrives late, and that revaluation posts to COGS/Inventory and never to Allocated Inventory.
@@ -1057,14 +1081,55 @@ export async function reverseOrphanedAllocationPosting(
     })
   }
 
-  const amount = roundQuantity(posted, 2).toNumber()
-  if (amount <= 0) return
+  const snapshotAmount = roundQuantity(posted, 2).toNumber()
+  if (snapshotAmount <= 0) return
 
-  const { getAccountingSettings, queueAccountingSyncTx } = await import('@/lib/accounting')
+  const { getAccountingSettingsFor, getActiveAccountingConnectorInfo, queueAccountingSyncTx } = await import('@/lib/accounting')
+  // o3d-i0o6 — THE LEDGER IS RESOLVED ONCE, AND EVERYTHING AFTER IT IS DERIVED FROM THAT ONE VALUE.
+  //
+  // This path used to resolve "the active connector" THREE separate times: `getAccountingSettings`
+  // took the account codes from whichever connector was active when it ran, the proof below compared
+  // A2's record against whichever was active when IT ran, and `queueAccountingSyncTx` wrote the row
+  // for whichever was active when the enqueue ran. Nothing serialises a connector switch between
+  // those reads, so a proof could pass for one ledger and the credit be queued against another —
+  // against an Allocated Inventory account code taken from a third. The post-enqueue assertion could
+  // not see it either: it looked the row up by token alone, found the one written for the other
+  // connector, and recorded the amount as relief.
+  //
+  // So: one read, held in `activeConnector`, and the settings, the proof and the enqueue are all
+  // taken FOR it. A switch during this transaction can now only make the enqueue refuse — never make
+  // it post somewhere the debit was not proved to stand. Generic by construction: nothing here names
+  // a connector, so it holds for any two.
+  const activeConnector = (await getActiveAccountingConnectorInfo().catch(() => null))?.id ?? null
   // Caught, not thrown, exactly as `queueShipmentCogsRevaluationSync` catches it: a settings read
   // that fails must not roll back the ALLOCATION. The un-postable branch below then reports the
   // orphaned amount instead of losing it silently.
-  const settings = await getAccountingSettings().catch(() => null)
+  // o3d-i0o6: NO LEDGER IS ITS OWN REFUSAL, and it is reported as one. With nothing active there is
+  // also no chart of accounts, so the "accounts are not configured" branch below would swallow this
+  // and tell an operator to go and map an account — when the fact that is missing is WHICH BOOKS.
+  // The reason is the proof's, verbatim, because it is the same refusal: a caller that cannot say
+  // which ledger it is about to credit has not established the one thing a credit needs.
+  if (!activeConnector) {
+    await tx.activityLog.create({
+      data: {
+        entityType: 'SALES_ORDER',
+        entityId: orderId,
+        action: 'allocation_reversal_unproved',
+        tag: 'accounting',
+        level: 'ERROR',
+        description:
+          `Re-allocation removed ${sumCostLayerSnapshotQty(orphaned).toString()} recorded unit(s) from order `
+          + `${orderId} carrying £${snapshotAmount.toFixed(2)} of what Group A2 recorded posting for them, but `
+          + `NO Allocated Inventory reversal was raised: the accounting connector this reversal would be `
+          + `raised on cannot be established, so there is no way to tell whether it is the ledger A2 debited. `
+          + `Post the DR Inventory / CR Allocated Inventory reversal by hand if the debit is real and in these `
+          + `books.`,
+      },
+    })
+    return
+  }
+
+  const settings = await getAccountingSettingsFor(activeConnector).catch(() => null)
   if (!settings?.allocatedInventoryAccount || !settings.inventoryAccount) {
     await tx.activityLog.create({
       data: {
@@ -1074,7 +1139,7 @@ export async function reverseOrphanedAllocationPosting(
         tag: 'accounting',
         level: 'WARNING',
         description:
-          `Re-allocation orphaned £${amount.toFixed(2)} of Group A2 Allocated Inventory on order `
+          `Re-allocation orphaned £${snapshotAmount.toFixed(2)} of Group A2 Allocated Inventory on order `
           + `${orderId}, but the allocated-inventory/inventory accounts are not configured, so no `
           + 'reversal journal could be raised.',
       },
@@ -1087,9 +1152,123 @@ export async function reverseOrphanedAllocationPosting(
     // o3d-0i5y r12: the running total of pounds earlier reversals have already credited back out
     // of Allocated Inventory for this order. Read here, inside the caller's transaction and under
     // the order row lock it already holds, so the read-modify-write below cannot interleave.
-    select: { orderNumber: true, externalOrderNumber: true, allocationReversalAmount: true },
+    //
+    // o3d-i0o6: and, in the SAME read, the three-part attribution A2 writes with the amount it
+    // debited — the journal's own id, the connector it was raised on, and the account it landed on.
+    // The snapshot entries beside them can say how many pounds these units carried and nothing else;
+    // whether a journal exists, whether it settled, and which books it settled in are facts only
+    // these columns hold, and every one of them is needed before a credit may be raised.
+    select: {
+      orderNumber: true,
+      externalOrderNumber: true,
+      allocationReversalAmount: true,
+      inventoryAllocatedDate: true,
+      allocationBatchAmount: true,
+      // o3d-i0o6 r3: the PASSES that cumulative figure is the sum of. The three columns below are
+      // the LATEST pass's, and proving one instalment does not prove the total (see the proof).
+      allocationBatchPasses: true,
+      allocationBatchSyncLogId: true,
+      allocationBatchConnector: true,
+      allocationBatchAccountCode: true,
+    },
   })
   const orderRef = order?.orderNumber ?? order?.externalOrderNumber ?? orderId
+
+  // o3d-i0o6 — REFUSE AND REPORT UNLESS THE DEBIT IS PROVED TO HAVE POSTED WHERE THIS CREDIT LANDS.
+  //
+  // The ledger this credit would move is `activeConnector`, resolved ONCE at the top of this function
+  // and pinned through the enqueue below, so "where this credit lands" and "what the proof is about"
+  // are the same value rather than two reads of a setting that can change between them. It is passed
+  // as `string | null` and a null REFUSES — an optional connector reads as the permissive answer when
+  // absent, which silently deletes the whole cross-ledger check (see `AllocationDebitCreditTarget`).
+  const proof = await proveAllocationDebitPosting(tx, order ?? {
+    inventoryAllocatedDate: null,
+    allocationBatchAmount: null,
+    allocationBatchPasses: null,
+    allocationBatchSyncLogId: null,
+    allocationBatchConnector: null,
+    allocationBatchAccountCode: null,
+  }, { activeConnector, allocatedInventoryAccount: settings.allocatedInventoryAccount })
+
+  // A REFUSAL IS THE GOOD OUTCOME HERE, not a degraded one. Every branch below is a case where the
+  // units really did leave the order but the pounds standing against them cannot be established, or
+  // cannot be established IN THESE BOOKS — and a credit raised anyway takes real money out of a real
+  // account. What the operator gets instead is everything needed to post it by hand: the units, the
+  // layers, the amount the snapshot carried, both account codes, and why the automatic path stopped.
+  //
+  // `unattributed` is refused too, and that is not the same call the refund side makes. A refund can
+  // fire years after the fact and legitimately meets orders staged before the attribution columns
+  // existed, so it keeps the older amount-implies-posting inference for them. This path cannot meet
+  // one: `postedUnitCostBase` and the attribution columns are written by the same A2 pass, so an
+  // orphaned entry that carries the first and an order that lacks the second is not a legacy row —
+  // it is a pass that recorded pounds and raised NO journal, which is o3d-o97 r3's first reason.
+  if (proof.kind !== 'posted') {
+    await tx.activityLog.create({
+      data: {
+        entityType: 'SALES_ORDER',
+        entityId: orderId,
+        action: 'allocation_reversal_unproved',
+        tag: 'accounting',
+        level: 'ERROR',
+        description:
+          `Re-allocation removed ${sumCostLayerSnapshotQty(orphaned).toString()} recorded unit(s) from order `
+          + `${orderRef} carrying £${snapshotAmount.toFixed(2)} of what Group A2 recorded posting for them `
+          + `(cost layer(s) ${[...new Set(orphaned.map((entry) => entry.costLayerId))].join(', ')}), but NO `
+          + `Allocated Inventory reversal was raised: ${proof.reason}. An amount recorded beside the units `
+          + `says how many pounds they carried, never that a journal posted them or which ledger it posted `
+          + `them to (o3d-o97 r3), and a credit raised on that alone moves money that was never there. `
+          + `Post CR ${settings.allocatedInventoryAccount} / DR ${settings.inventoryAccount} £`
+          + `${snapshotAmount.toFixed(2)} by hand if the debit is real and in these books.`,
+      },
+    })
+    return
+  }
+
+  // o3d-i0o6 — AND NO MORE THAN IS STILL OPEN. `postedUnitCostBase` is per-entry and every shrink
+  // computes its own sum, so nothing stopped repeated orphanings of one order from together
+  // crediting more than A2 ever debited. The bound is the order's own record: what A2 posted, less
+  // what earlier reversals have already credited back out. Read under the same order row lock as the
+  // running total it is netted against, so the cap and the increment cannot see different states.
+  const openAllocatedContra = roundQuantity(
+    subtractMoney(toDecimal(proof.recordedDebit), toDecimal(order?.allocationReversalAmount ?? 0)),
+    2,
+  ).toNumber()
+  if (openAllocatedContra <= 0) {
+    await tx.activityLog.create({
+      data: {
+        entityType: 'SALES_ORDER',
+        entityId: orderId,
+        action: 'allocation_reversal_unproved',
+        tag: 'accounting',
+        level: 'ERROR',
+        description:
+          `Re-allocation removed ${sumCostLayerSnapshotQty(orphaned).toString()} recorded unit(s) from order `
+          + `${orderRef} carrying £${snapshotAmount.toFixed(2)} of recorded Group A2 basis, but the whole of `
+          + `the £${proof.recordedDebit.toFixed(2)} A2 debited to Allocated Inventory for this order has `
+          + `already been credited back by earlier reversals. No further reversal was raised — crediting `
+          + `again would move pounds the account never held.`,
+      },
+    })
+    return
+  }
+  const amount = Math.min(snapshotAmount, openAllocatedContra)
+  if (amount < snapshotAmount) {
+    await tx.activityLog.create({
+      data: {
+        entityType: 'SALES_ORDER',
+        entityId: orderId,
+        action: 'allocation_reversal_capped',
+        tag: 'accounting',
+        level: 'WARNING',
+        description:
+          `Re-allocation orphaned units carrying £${snapshotAmount.toFixed(2)} of recorded Group A2 basis on `
+          + `order ${orderRef}, but only £${openAllocatedContra.toFixed(2)} of the £`
+          + `${proof.recordedDebit.toFixed(2)} A2 debited is still open after earlier reversals. The `
+          + `reversal was capped at the open balance; the difference was never in Allocated Inventory to `
+          + `credit back.`,
+      },
+    })
+  }
 
   // o3d-0i5y r10: a fresh identity for THIS enqueue, so the row it is supposed to create can be
   // asked for by name afterwards. Deliberately NOT `_idempotencyKey`: a key would make two
@@ -1099,6 +1278,13 @@ export async function reverseOrphanedAllocationPosting(
 
   await queueAccountingSyncTx(tx, {
     type: 'ALLOCATION_REVERSAL',
+    // o3d-i0o6 — PINNED TO THE LEDGER THE PROOF WAS MADE ON, carried out of the verdict itself
+    // rather than re-resolved here. The enqueue therefore cannot write this credit under a connector
+    // the debit was never proved to stand in: if the setting has moved, the pinned connector no
+    // longer posts this type, nothing is written, and `assertAllocationReversalQueued` reports the
+    // amount for a human instead of claiming relief. Verifying AFTERWARDS was the weaker option —
+    // by then the row exists.
+    connector: proof.provedOnConnector,
     referenceType: 'SalesOrder',
     referenceId: orderId,
     payload: {
@@ -1115,7 +1301,7 @@ export async function reverseOrphanedAllocationPosting(
     },
   })
 
-  const wasQueued = await assertAllocationReversalQueued(tx, orderId, reversalToken, amount, orphaned)
+  const wasQueued = await assertAllocationReversalQueued(tx, orderId, reversalToken, amount, orphaned, proof.provedOnConnector)
   if (!wasQueued) return
 
   // o3d-0i5y r12 / o3d-xlk7 — AND THE CREDIT IS RECORDED WHERE THE REFUND'S OPEN BALANCE LOOKS.
@@ -1158,9 +1344,10 @@ export async function reverseOrphanedAllocationPosting(
  * A REVERSAL THAT WAS NOT QUEUED IS NOT A REVERSAL (o3d-0i5y r10 — Codex round 10, finding 3).
  *
  * `queueAccountingSyncTx` does nothing at all under three ordinary, non-exceptional conditions:
- * the order was deleted while we were enqueuing (`scope: 'deleted'`), no active connector posts
- * this type (`getAccountingPostingContext` returns null), or the posting is suppressed for the
- * connector. It throws in none of them. So `await queueAccountingSyncTx(...)` followed by nothing
+ * the order was deleted while we were enqueuing (`scope: 'deleted'`), the PINNED connector does not
+ * post this type (`getAccountingPostingContextFor` returns null — which since o3d-i0o6 includes the
+ * connector having been switched away from the one the reversal was proved against), or the posting
+ * is suppressed for that connector. It throws in none of them. So `await queueAccountingSyncTx(...)` followed by nothing
  * is the shape that treats all three as "reversed" — and this is the worst place in the codebase
  * to make that assumption, because the caller has already trimmed or deleted the very rows that
  * carried the evidence. The debit is stranded AND the record it could have been reconstructed
@@ -1185,9 +1372,17 @@ async function assertAllocationReversalQueued(
   reversalToken: string,
   amount: number,
   orphaned: CostLayerSnapshotEntry[],
+  /**
+   * o3d-i0o6: the connector the reversal was PROVED and PINNED to. Part of the predicate, not
+   * decoration — a row is only this reversal if it is in the books the debit stands in. Without it
+   * the token alone would answer "yes, queued" for a row written under another connector, and the
+   * caller records that amount as relief against the refund's open balance.
+   */
+  connector: string,
 ): Promise<boolean> {
   const queued = await tx.accountingSyncLog.findFirst({
     where: {
+      connector,
       type: 'ALLOCATION_REVERSAL',
       referenceType: 'SalesOrder',
       referenceId: orderId,

@@ -124,7 +124,6 @@ function pluginRows() {
   return [
     { key: 'plugin_mintsoft_enabled', value: 'false' },
     { key: 'plugin_quickbooks_enabled', value: String(state.activeConnector === 'quickbooks') },
-    { key: 'plugin_shiphero_enabled', value: 'false' },
     { key: 'plugin_shopify_enabled', value: 'false' },
     { key: 'plugin_woocommerce_enabled', value: 'false' },
     { key: 'plugin_xero_enabled', value: String(state.activeConnector === 'xero') },

@@ -55,6 +55,7 @@ export function ProfileForm({ user }: { user: UserData }) {
     setHeaderSlot(document.getElementById('profile-actions'))
   }, [])
 
+  // wms-connector-boundary-ok: o3d-remove-shiphero: joins first characters of the user's own name.
   const initials = name
     .split(' ')
     .map((n) => n[0])

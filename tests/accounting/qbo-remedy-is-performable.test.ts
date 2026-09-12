@@ -789,13 +789,18 @@ test('STEP 7: and retrying really does not stamp an attempt — the row is still
 })
 
 test('STEP 7 (round 7): the plugin guard still refuses both connectors — and the record no longer walks anyone into that save', async () => {
-  const { readFile } = await import('node:fs/promises')
-  const path = await import('node:path')
-
-  const settings = await readFile(path.join(process.cwd(), 'app/actions/settings.ts'), 'utf8')
-  const guard = /if \(resulting\.xero && resulting\.quickbooks\) \{\s*return \{ conflict: '([^']+)' \}/.exec(settings)
-  assert.ok(guard, 'the resulting-state exclusivity guard must still be the thing that decides this')
-  const refusal = guard![1]
+  // BEHAVIOURAL, not a source scan (o3d-remove-shiphero round 10). This used to regex
+  // `app/actions/settings.ts` for a literal `if (resulting.xero && resulting.quickbooks)`, which
+  // pinned the guard's SHAPE rather than its effect — so replacing the two hand-written pairs with
+  // the derived exclusivity table broke it while making the rule strictly stronger. What this test
+  // actually needs is the refusal TEXT and the fact that something still produces it.
+  const { findIntegrationPluginExclusivityConflict } = await import('@/lib/integration-plugin-keys')
+  const refusal = findIntegrationPluginExclusivityConflict({ xero: true, quickbooks: true })
+  assert.ok(refusal, 'the resulting-state exclusivity rule must still be the thing that decides this')
+  assert.equal(
+    findIntegrationPluginExclusivityConflict({ xero: true, quickbooks: false }), null,
+    'and it must refuse the PAIR, not accounting connectors in general',
+  )
 
   // ROUND 7: the guard is unchanged and still refuses that state — which is why the assertion above
   // stays. What went is the record's INSTRUCTION to perform that save: retiring QuickBooks was step

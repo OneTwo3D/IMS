@@ -56,7 +56,7 @@ test('falls back to prefix + order reference only when nothing is recorded', () 
 
 test('WooCommerce orders take their invoice number from the storefront', () => {
   assert.equal(invoiceNumberIsExternallySupplied(['woocommerce']), true)
-  assert.equal(invoiceNumberIsExternallySupplied(['shiphero', 'woocommerce']), true)
+  assert.equal(invoiceNumberIsExternallySupplied(['acme-wms', 'woocommerce']), true)
 })
 
 test('orders with no storefront link, or a connector that supplies no number, still mint', () => {

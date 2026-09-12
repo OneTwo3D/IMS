@@ -22,6 +22,7 @@ import {
 } from '@/lib/domain/integrations/plugin-save-outcome'
 import { WmsOnboardingConnection } from '@/components/onboarding/wms-onboarding-connection'
 import type { IntegrationPluginState } from '@/lib/integration-plugins'
+import { isIntegrationsStepReady } from '@/lib/domain/onboarding/integrations-step-readiness'
 import { WMS_CONNECTOR_IDS } from '@/lib/connectors/wms/types'
 import type { ShoppingConnectorCredentials, ShopifyConnectorCredentials } from '@/app/actions/shopping-sync'
 import type { AccountingConnectionStatus, AccountingConnectorId, AccountingConnectorSettingsMasked } from '@/app/actions/accounting-sync'
@@ -389,13 +390,16 @@ export function IntegrationsStep({
   const accountingConnectedLabel = initialAccountingStatus.tenantName || accountingLabel
 
   useEffect(() => {
-    const ready =
-      (plugins.woocommerce ? wcConnected : true)
-      && (plugins.shopify ? shopifyConnected : true)
-      && ((plugins.xero || plugins.quickbooks) ? accountingConnected : true)
-      && (wmsEnabled ? wmsConnected : true)
-      && (plugins.woocommerce || plugins.shopify || plugins.xero || plugins.quickbooks || wmsEnabled)
-    onReadyChange(ready)
+    // THE RULE LIVES IN lib/domain/onboarding/integrations-step-readiness.ts (round 8, Codex HIGH 1,
+    // one layer out). It was written out here, inside an effect the render harness never runs, so
+    // nothing could exercise it — and the WMS arm of it is what turned a mis-reported `configured`
+    // into a wizard that could not be completed at all.
+    onReadyChange(isIntegrationsStepReady(plugins, {
+      woocommerce: wcConnected,
+      shopify: shopifyConnected,
+      accounting: accountingConnected,
+      wms: wmsConnected,
+    }))
   }, [
     accountingConnected,
     wmsConnected,

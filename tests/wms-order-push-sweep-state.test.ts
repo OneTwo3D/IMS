@@ -1085,7 +1085,7 @@ test('claim: a link that has never been pushed is claimable (o3d-38gl)', () => {
 
 test('claim: a FRESH PENDING_CREATE is refused — another worker holds it (o3d-38gl)', () => {
   // The defect: worker A wrote PENDING_CREATE and committed; worker B then acquired the order
-  // lock, saw PENDING_CREATE, passed the check and also called pushOrder. Worst on ShipHero,
+  // lock, saw PENDING_CREATE, passed the check and also called pushOrder. Worst on a client-side-dedupe-only connector,
   // where preflight and create are separate and partner_order_id is not unique — two winners
   // can create and then fulfil DUPLICATE warehouse orders.
   const held = { state: 'PENDING_CREATE', lastAttemptAt: new Date('2026-07-20T12:00:00Z') }
@@ -1182,9 +1182,18 @@ test('[o3d-bjc.8] a minted-but-unverified id lands PENDING_VERIFY, not SYNCED', 
   assert.equal(upserts[0].create.externalOrderId, 'wms-1', 'the minted id is KEPT — the order exists')
 })
 
-test('[o3d-bjc.8] a connector that cannot verify still gets the old behaviour', async () => {
-  // Otherwise enabling the state machine would park every order a
-  // non-verifying connector creates, forever.
+test('[o3d-bjc.8 / o3d-remove-shiphero r2] a connector that CANNOT verify does not get SYNCED', async () => {
+  // THIS TEST USED TO ASSERT THE OPPOSITE, and it was pinning the defect Codex found (HIGH 4).
+  // Its reasoning was "otherwise enabling the state machine would park every order a non-verifying
+  // connector creates, forever" — true of a connector that returns `needsVerification: false`, and
+  // that connector is unaffected (see the SYNCED assertions elsewhere in this file). It is NOT true
+  // of one that explicitly says the id is unproved: there, SYNCED is a claim of ownership the
+  // connector has just disclaimed, and SYNCED is what the update, hold, cancel and dispatch passes
+  // act on. IMS would amend or cancel an order under an id nobody vouches for.
+  //
+  // The combination is now untypeable at the registry factory (`WmsRegistrableConnector`), so no
+  // registered connector can reach here; this is the runtime fail-safe for one reached past the
+  // type — which is why the fixture below has to state the shape by hand.
   const { port, upserts } = makePort({ createCandidates: [candidate()] })
   await runWmsOrderPushSweepCore(
     connector({
@@ -1193,7 +1202,10 @@ test('[o3d-bjc.8] a connector that cannot verify still gets the old behaviour', 
     }),
     'mintsoft', port, { now: NOW },
   )
-  assert.equal(upserts[0].create.state, 'SYNCED')
+  assert.equal(upserts[0].create.state, 'PENDING_VERIFY')
+  assert.equal(upserts[0].create.externalOrderId, 'wms-1', 'the minted id is KEPT — the order exists and must never be re-pushed')
+  // Nothing will ever promote it (there is no verifier), so the reason has to be ON the link.
+  assert.match(String(upserts[0].update.lastError), /UNVERIFIED/)
 })
 
 test('[o3d-bjc.8] verification promotes to SYNCED and never re-pushes', async () => {

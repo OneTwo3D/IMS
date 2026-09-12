@@ -56,7 +56,7 @@ test('[o3d-bjc.12] the incident is read from the key the sweep writes', () => {
   // One key, two owners: the sweep persists its drift state here and the inbox
   // reads it. A mismatch would show an empty inbox next to a stalled sweep.
   assert.equal(unresolvedDriftStateKey('mintsoft'), 'wms_dispatch_unresolved_streak:mintsoft')
-  assert.notEqual(unresolvedDriftStateKey('mintsoft'), unresolvedDriftStateKey('shiphero'))
+  assert.notEqual(unresolvedDriftStateKey('mintsoft'), unresolvedDriftStateKey('acme-wms'))
 })
 
 test('[o3d-bjc.12] isolation eligibility is the SWEEP\'s predicate, not an approximation', async () => {
@@ -98,7 +98,7 @@ test('[o3d-bjc.12] the action token follows the COHORT, not the counters', async
   // ...and the same cohort on a different connector is a different decision.
   assert.notEqual(
     driftDecisionVersion({ connector: 'mintsoft', cohortKey: 'k', linkIds: ['a'], firstSeenAt: null }),
-    driftDecisionVersion({ connector: 'shiphero', cohortKey: 'k', linkIds: ['a'], firstSeenAt: null }),
+    driftDecisionVersion({ connector: 'acme-wms', cohortKey: 'k', linkIds: ['a'], firstSeenAt: null }),
   )
 })
 

@@ -2456,10 +2456,12 @@ test('the unconfirmed-restore message describes only the protection that exists'
   // only as good as the measurement behind the wording, so the classification itself is now
   // measured from the route files in 'the webhook fencing claim is measured FROM THE ROUTES'.
   assert.match(message, /Scheduled jobs \(app\/api\/cron\/\*\), WooCommerce webhooks and the Mintsoft ASN webhook are stopped by maintenance mode/)
-  // o3d-hl8l: was /MINTSOFT AND SHIPHERO WEBHOOK ROUTES/. The Mintsoft half is now fenced, so a
-  // message still naming it as unstopped would be the same class of false claim round 12 removed —
-  // only inverted. ShipHero stays, because the ShipHero route was deliberately left unfenced.
-  assert.match(message, /SHIPHERO WEBHOOK ROUTE[\s\S]*?NOT STOPPED BY ANYTHING/)
+  // o3d-hl8l: was /MINTSOFT AND SHIPHERO WEBHOOK ROUTES/, then /SHIPHERO WEBHOOK ROUTE/ alone once
+  // the Mintsoft half was fenced. o3d-remove-shiphero removed the ShipHero route outright, so the
+  // message must no longer name ANY WMS webhook route as unstopped — naming a route that does not
+  // exist is the same class of false claim, just pointing the other way.
+  assert.match(message, /THE ACCOUNTING OAUTH CALLBACK AND ALL[\s\S]*?NOT STOPPED BY ANYTHING/)
+  assert.doesNotMatch(message, /SHIPHERO/i, 'the ShipHero route no longer exists')
   assert.doesNotMatch(message, /MINTSOFT[\s\S]*?NOT STOPPED BY ANYTHING/, 'the Mintsoft route IS stopped now')
   assert.match(message, /INTERACTIVE WRITES FROM THE DASHBOARD ARE NOT STOPPED BY ANYTHING/)
   assert.match(message, /Backend pid 4242, started 2026-08-18 09:00:00\.123456\+00/, 'the operator is told what to look for')
@@ -2488,7 +2490,9 @@ test('the webhook fencing claim is measured FROM THE ROUTES, not from the flag r
   // callers answers "what consults the flag?"; it can only ever confirm the routes that do,
   // because a route that does not contains nothing to grep for. The unfenced Mintsoft and ShipHero
   // webhook entry points were invisible to it by construction, and the operator message told
-  // whoever read it that they were stopped.
+  // whoever read it that they were stopped. (The ShipHero route is gone as of
+  // o3d-remove-shiphero; the enumeration below is what makes its absence a fact rather than a
+  // memory, because a re-added unfenced route would fail here.)
   //
   // So this test starts from the ROUTE FILES and classifies every one of them. A new webhook route
   // fails here until it is classified, which is the property the reader-enumeration lacked.
@@ -2535,11 +2539,19 @@ test('the webhook fencing claim is measured FROM THE ROUTES, not from the flag r
     )
   }
 
-  // ...and the ShipHero row is deliberately still 'no' (owner-scoped out of o3d-hl8l). Pinned so a
-  // later reader cannot mistake an unfenced route for one nobody has measured.
+  // ...and no WMS webhook route is classified 'no' any more. The ShipHero route was the only one,
+  // and o3d-remove-shiphero removed it rather than fencing it — a real change in reach, so it is
+  // pinned as such. The enumeration above is what proves the inventory still matches the tree;
+  // this asserts what the inventory now SAYS.
   assert.equal(
-    MAINTENANCE_MODE_REACH.inboundWebhooks.find((w) => w.route === 'app/api/webhooks/shiphero/[event]')?.fenced,
-    'no',
+    MAINTENANCE_MODE_REACH.inboundWebhooks.some((w) => /shiphero/i.test(w.route)),
+    false,
+    'the ShipHero webhook route was removed, not merely reclassified',
+  )
+  assert.deepEqual(
+    MAINTENANCE_MODE_REACH.inboundWebhooks.filter((w) => w.fenced === 'no').map((w) => w.route),
+    ['app/api/accounting/callback'],
+    'the accounting OAuth callback is the only remaining wholly unfenced inbound webhook',
   )
 
   // The shopping route is the one that is fenced for ONE connector and not another. Pinned by
@@ -2557,5 +2569,5 @@ test('the webhook fencing claim is measured FROM THE ROUTES, not from the flag r
     'the false claim ("inbound webhooks are stopped") must not come back',
   )
   assert.match(routeSrc, /WooCommerce webhooks and the Mintsoft ASN webhook are stopped by /, 'it says which connectors specifically')
-  assert.match(routeSrc, /SHIPHERO WEBHOOK ROUTE[\s\S]{0,120}NOT STOPPED BY ANYTHING/, 'and names what is NOT stopped')
+  assert.match(routeSrc, /THE ACCOUNTING OAUTH CALLBACK AND ALL[\s\S]{0,120}NOT STOPPED BY ANYTHING/, 'and names what is NOT stopped')
 })

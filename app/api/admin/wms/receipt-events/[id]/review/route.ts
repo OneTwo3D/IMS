@@ -3,7 +3,7 @@ import { NextRequest, NextResponse } from 'next/server'
 import { logActivity } from '@/lib/activity-log'
 import { requireApiFreshAdmin } from '@/lib/auth/server'
 import { db } from '@/lib/db'
-import { MINTSOFT_WEBHOOK_PROCESSING_STATUS } from '@/lib/domain/wms/booked-in-service'
+import { WMS_INBOUND_EVENT_PROCESSING_STATUS } from '@/lib/domain/wms/booked-in-service'
 import { processMintsoftBookedInEvent } from '@/lib/jobs/wms/process-mintsoft-booked-in-event'
 import { requireAdminMutationHeader } from '@/lib/security/admin-mutation'
 
@@ -161,7 +161,7 @@ export function createAdminWmsReceiptReviewHandlers(deps: AdminWmsReceiptReviewH
       if (!event) return notFoundResponse()
       if (
         event.processedAt != null
-        || event.processingStatus !== MINTSOFT_WEBHOOK_PROCESSING_STATUS.requiresReview
+        || event.processingStatus !== WMS_INBOUND_EVENT_PROCESSING_STATUS.requiresReview
       ) {
         return notReviewableResponse()
       }
@@ -180,10 +180,10 @@ export function createAdminWmsReceiptReviewHandlers(deps: AdminWmsReceiptReviewH
         where: {
           id,
           processedAt: null,
-          processingStatus: MINTSOFT_WEBHOOK_PROCESSING_STATUS.requiresReview,
+          processingStatus: WMS_INBOUND_EVENT_PROCESSING_STATUS.requiresReview,
         },
         data: {
-          processingStatus: MINTSOFT_WEBHOOK_PROCESSING_STATUS.pending,
+          processingStatus: WMS_INBOUND_EVENT_PROCESSING_STATUS.pending,
           nextRetryAt: null,
           lastError: 'Mintsoft booked-in review approval in progress',
         },
@@ -200,7 +200,7 @@ export function createAdminWmsReceiptReviewHandlers(deps: AdminWmsReceiptReviewH
         await client.wmsInboundReceiptEvent.updateMany({
           where: { id, processedAt: null },
           data: {
-            processingStatus: MINTSOFT_WEBHOOK_PROCESSING_STATUS.requiresReview,
+            processingStatus: WMS_INBOUND_EVENT_PROCESSING_STATUS.requiresReview,
             lastError: message,
             reviewedAt: null,
             reviewedBy: null,
@@ -224,7 +224,7 @@ export function createAdminWmsReceiptReviewHandlers(deps: AdminWmsReceiptReviewH
         await client.wmsInboundReceiptEvent.updateMany({
           where: { id, processedAt: null },
           data: {
-            processingStatus: MINTSOFT_WEBHOOK_PROCESSING_STATUS.requiresReview,
+            processingStatus: WMS_INBOUND_EVENT_PROCESSING_STATUS.requiresReview,
             reviewedAt: null,
             reviewedBy: null,
           },

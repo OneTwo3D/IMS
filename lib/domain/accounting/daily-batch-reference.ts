@@ -22,6 +22,18 @@
  * where group is A1 (revenue deferral), A2 (inventory allocation) or B (shipment COGS).
  */
 
+/**
+ * The statuses in which a daily-batch log row is STILL A JOURNAL — queued, in flight, or in the
+ * ledger. Anything else (FAILED, CANCELLED, or no row at all) means the batch's pounds are not on
+ * their way anywhere.
+ *
+ * o3d-i0o6 r6: stated ONCE. Both sweeps' live-log probes spelled it out separately, and r6 added a
+ * third reader — the probe that asks whether ANOTHER ledger's journal is still standing before this
+ * sweep decides whether to report its pounds as abandoned. Three spellings of "live" is how one of
+ * them silently starts answering a different question from the other two.
+ */
+export const LIVE_DAILY_BATCH_STATUSES = ['PENDING', 'PROCESSING', 'SYNCED'] as const
+
 export type DailyBatchGroupCode = 'A1' | 'A2' | 'B'
 
 export type ParsedDailyBatchReference = {

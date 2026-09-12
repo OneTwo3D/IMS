@@ -4,7 +4,8 @@ import { revalidatePath } from 'next/cache'
 import { db } from '@/lib/db'
 import type { WmsOrderStatusView } from '@/app/actions/wms-order-status'
 import { getIntegrationPluginState } from '@/lib/integration-plugins'
-import { WMS_CONNECTOR_IDS, isWmsConnectorId } from '@/lib/connectors/wms/types'
+import { enabledWmsConnectorId } from '@/lib/connectors/wms/enabled-connector'
+import { isWmsConnectorId } from '@/lib/connectors/wms/types'
 import { getWmsConnector } from '@/lib/connectors/wms/registry'
 import { logActivity } from '@/lib/activity-log'
 import { entersFulfilment, reconcileAllocationBeforeFulfilment, recordShortfallUnderLock } from '@/lib/fulfillment/pre-fulfilment-reallocation'
@@ -727,7 +728,9 @@ export async function getSalesOrders(
     }),
     getIntegrationPluginState(),
   ])
-  const activeWmsConnector = WMS_CONNECTOR_IDS.find((id) => pluginState[id]) ?? null
+  // Round 10, Codex HIGH 1 — `null` on a contradictory enabled set too, which clears every cached
+  // chip. Showing a chip attributed to a guessed connector is worse than showing none.
+  const activeWmsConnector = enabledWmsConnectorId(pluginState)
   return orders.map((order) => {
     const row = mapSoRow(order)
     // Only surface a cached chip from the currently-active WMS connector, so
@@ -3114,6 +3117,12 @@ export async function deleteSalesOrder(id: string): Promise<{ success: boolean; 
           inventoryAllocatedDate: true,
           revenueDeferredBatchRef: true,
           inventoryAllocatedBatchRef: true,
+          // o3d-i0o6 r2: the A2 journal's own id — the one piece of the A2 attribution a declared
+          // allocation rewrite leaves behind when it clears the stamp and the batch ref.
+          allocationBatchSyncLogId: true,
+          // o3d-i0o6 r3: and every EARLIER pass's journal, which that single column was overwritten
+          // by. An order can sit in several A2 batches; one column names one of them.
+          allocationBatchPasses: true,
           lines: { select: { productId: true, qty: true } },
           _count: { select: { refunds: true, payments: true } },
         },
@@ -3129,6 +3138,10 @@ export async function deleteSalesOrder(id: string): Promise<{ success: boolean; 
         // batch by identity instead of re-deriving one from the stamps above.
         revenueDeferredBatchRef: so.revenueDeferredBatchRef,
         inventoryAllocatedBatchRef: so.inventoryAllocatedBatchRef,
+        // o3d-i0o6 r2: and the journal id, which outlives both of the A2 stamps above.
+        allocationBatchSyncLogId: so.allocationBatchSyncLogId,
+        // o3d-i0o6 r3: and the whole pass history, because that journal id is the LATEST pass's.
+        allocationBatchPasses: so.allocationBatchPasses,
       })
       if (blocker) return { error: blocker.message }
 

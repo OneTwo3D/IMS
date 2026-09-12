@@ -55,16 +55,30 @@ import { GL_BASE_PRECISION, roundToGlPrecisionNumber } from '@/lib/domain/math/p
 import { buildInventoryReconciliationSweepJournal, loadInventoryGlReconciliation } from '@/lib/domain/accounting/inventory-gl-reconciliation'
 import { buildCogsReconciliationSweepJournal, loadCogsGlReconciliation } from '@/lib/domain/accounting/cogs-gl-reconciliation'
 import { buildTransitReconciliationSweepJournal, loadTransitGlReconciliation } from '@/lib/domain/accounting/transit-gl-reconciliation'
+import {
+  allocationDebitRecreateRefusal,
+  allocationDebitRecreateTargets,
+  allocationDebitForeignLedgerReports,
+  buildAllocationDebitOrderUpdate,
+  foldA2RecreateOrder,
+  newA2RecreateSummary,
+  repointAllocationDebitPassesToRecreatedJournal,
+  type A2RecreateSummary,
+  type AllocationDebitBatchLedger,
+  type ForeignJournalState,
+} from '@/lib/domain/accounting/allocation-debit-passes'
 import { recordCogsSubledgerMovement } from '@/lib/domain/accounting/cogs-subledger-movement'
-import { recreateJournaledDateFilter } from '@/lib/domain/accounting/daily-batch-retention'
+import { recreateRetentionWindow } from '@/lib/domain/accounting/daily-batch-retention'
 import { isOperatorAssertedSettlement } from '@/lib/domain/accounting/sync-row-settlement'
 import { cancelledClaimIsResolved } from '@/lib/domain/accounting/unresolved-abandoned-claim'
 import {
   dailyBatchLiveRefs,
   foldDailyBatchRow,
+  LIVE_DAILY_BATCH_STATUSES,
   type DailyBatchLiveRefs,
   type DailyBatchRecreateBucket,
 } from '@/lib/domain/accounting/daily-batch-reference'
+import { resolveScheduledDailyBatchSweep } from '@/lib/domain/accounting/daily-batch-sweep-schedule'
 import { calculateCoverageByLine } from '@/lib/products/fulfillment-coverage'
 import { isFullyShippedTerminalStatus, recognizeShipmentRevenue } from '@/lib/domain/accounting/revenue-recognition'
 import {
@@ -584,7 +598,6 @@ export function takeDailyBatchWindow<T>(
 }
 
 /** In the outbox or in the ledger: a log in any of these states blocks a recreate outright. */
-const LIVE_DAILY_BATCH_STATUSES = ['PENDING', 'PROCESSING', 'SYNCED'] as const
 
 /**
  * o3d-o97 r6 — MAY THIS BATCH BE POSTED AGAIN? AND THE ANSWER IS NEVER A STATUS.
@@ -779,7 +792,9 @@ export async function recreateMissingDailyBatchLogs(settings: Awaited<ReturnType
   // scjz.36: only recreate within the sync-log retention window — beyond it, SYNCED
   // daily-batch logs are pruned by data-retention, so a "missing" log can't be told
   // apart from one that already posted, and rebuilding would double-post the journal.
-  const journaledDateFilter = await recreateJournaledDateFilter()
+  // o3d-i0o6 r7: the cutoff as well as the filter. The filter bounds which ORDERS are read;
+  // the cutoff bounds which of the batches their pass histories name may be rebuilt.
+  const { cutoff: retentionCutoff, dateFilter: journaledDateFilter } = await recreateRetentionWindow()
   const orphanA1Orders = await db.salesOrder.findMany({
     where: { revenueDeferredDate: journaledDateFilter },
     select: { revenueDeferredDate: true, revenueDeferredBatchRef: true, unearnedRevenueAmount: true },
@@ -797,7 +812,17 @@ export async function recreateMissingDailyBatchLogs(settings: Awaited<ReturnType
       // no longer reads as "no journal" and no longer licenses a rebuild on its own.)
       refundStatus: { not: 'FULL' },
     },
-    select: { inventoryAllocatedDate: true, inventoryAllocatedBatchRef: true, allocationBatchAmount: true },
+    select: {
+      id: true,
+      orderNumber: true,
+      inventoryAllocatedDate: true,
+      inventoryAllocatedBatchRef: true,
+      allocationBatchAmount: true,
+      // o3d-i0o6 r4: the pass history is what divides a CUMULATIVE debit between the batches that
+      // carried it. Without it this sweep can only read the running total, and a batch rebuilt from
+      // the running total re-posts every earlier batch's pounds (see allocationDebitShareOfBatch).
+      allocationBatchPasses: true,
+    },
   })
   const orphanBShipments = await db.shipment.findMany({
     where: { shipmentJournalDate: journaledDateFilter },
@@ -817,17 +842,33 @@ export async function recreateMissingDailyBatchLogs(settings: Awaited<ReturnType
     summary.total += Number(order.unearnedRevenueAmount ?? 0)
   }
 
-  const a2Batches = new Map<string, DailyBatchRecreateBucket<{ orderCount: number; total: number }>>()
+  // o3d-i0o6 r5 (Codex round 4, HIGH 1) — THE LEDGER THIS SWEEP WOULD POST INTO, NAMED ONCE.
+  // The live-log probe below already filters by `connector`, so a batch that posted on QuickBooks
+  // is invisible to this sweep and reads as missing; without the same filter on the EVIDENCE, the
+  // rebuild carried QuickBooks-attributed pounds into Xero accounts.
+  const a2Ledger: AllocationDebitBatchLedger = {
+    connector: XERO_CONNECTOR,
+    accountCode: settings.xero_allocated_inventory_account,
+  }
+  const a2Batches = new Map<string, DailyBatchRecreateBucket<A2RecreateSummary>>()
   for (const order of orphanA2Orders) {
-    const summary = foldDailyBatchRow(
-      a2Batches,
-      'A2',
-      { stagedAt: order.inventoryAllocatedDate, persistedRef: order.inventoryAllocatedBatchRef },
-      () => ({ orderCount: 0, total: 0 }),
-    )
-    if (!summary) continue
-    summary.orderCount += 1
-    summary.total += Number(order.allocationBatchAmount ?? 0)
+    // o3d-i0o6 r7 (Codex round 6, HIGH 2) — ONE BUCKET PER BATCH THIS ORDER PUT POUNDS INTO, read
+    // from the PASS HISTORY. Bucketing on `inventoryAllocatedBatchRef` alone made the latest pass
+    // stand for the whole debit again: an earlier batch whose journal went missing existed in no
+    // bucket, so no sweep rebuilt it and no sweep reported it either.
+    for (const target of allocationDebitRecreateTargets(order, { retentionCutoff })) {
+      const summary = foldDailyBatchRow(
+        a2Batches,
+        'A2',
+        { stagedAt: target.stagedAt, persistedRef: target.batchRef },
+        newA2RecreateSummary,
+      )
+      if (!summary) continue
+      // o3d-i0o6 r4 (Codex round 3, HIGH 1) — THIS BATCH'S SHARE, NEVER THE RUNNING TOTAL, and
+      // (r5) never another ledger's share of it either. One shared fold, so the Xero and QuickBooks
+      // sweeps cannot answer the same question two ways.
+      foldA2RecreateOrder(summary, order, a2Ledger, target.batchRef)
+    }
   }
 
   const bBatches = new Map<string, DailyBatchRecreateBucket<{ shipmentCount: number; revenue: number; cogs: number; shipments: Array<{ id: string; cogs: number }> }>>()
@@ -875,15 +916,73 @@ export async function recreateMissingDailyBatchLogs(settings: Awaited<ReturnType
     })
   }
 
+  // o3d-i0o6 r6 (Codex round 5, HIGH 1) — WHO, IF ANYONE, IS COMING FOR THE OTHER LEDGER'S POUNDS.
+  //
+  // r5 stopped this sweep rebuilding another connector's share of a shared batch reference, which
+  // was right, and then reported the share it had declined as a positive £0.00, which was not: the
+  // cron runs ONE sweep, so after a switch the other connector's sweep never runs and its missing
+  // journal has no reader left. Two reads settle it, and only for batches that actually have a
+  // foreign pass, so the ordinary run makes no extra query:
+  //
+  //   * is that pass's own journal still a live row? (BY ID, with no connector filter — the question
+  //     is about the OTHER ledger's row, and this sweep's own probes deliberately exclude it.)
+  //   * is that ledger's sweep the one the cron runs? — from the schedule the cron route itself reads.
+  const foreignPasses = [...a2Batches.values()].flatMap((bucket) => bucket.summary.foreign)
+  // o3d-i0o6 r7 (Codex round 6, MEDIUM) — EVERY STATUS, NOT JUST THE LIVE THREE. The probe used to
+  // filter `status in (PENDING, PROCESSING, SYNCED)`, so a FAILED or CANCELLED row came back exactly
+  // like a deleted one and the report told an operator the journal was not on record and to post it
+  // by hand. Neither status establishes that nothing reached the remote ledger, so that advice can
+  // duplicate a posting. The status is carried instead, and the report distinguishes the two.
+  const foreignJournalStatusById = new Map<string, string>()
+  let scheduledSweepConnector: string | null = null
+  if (foreignPasses.length > 0) {
+    scheduledSweepConnector = (await resolveScheduledDailyBatchSweep()).connector
+    const foreignJournalIds = [...new Set(foreignPasses.map((pass) => pass.syncLogId).filter((id): id is string => !!id))]
+    if (foreignJournalIds.length > 0) {
+      const rows = await db.accountingSyncLog.findMany({
+        where: { id: { in: foreignJournalIds } },
+        select: { id: true, status: true },
+      })
+      for (const row of rows) foreignJournalStatusById.set(row.id, row.status)
+    }
+  }
+  const foreignJournalState = (syncLogId: string | null): ForeignJournalState => {
+    // A pass that named no journal raised none: unambiguously nothing in the other ledger.
+    if (syncLogId == null) return 'absent'
+    const status = foreignJournalStatusById.get(syncLogId)
+    if (status === undefined) return 'absent'
+    return (LIVE_DAILY_BATCH_STATUSES as readonly string[]).includes(status) ? 'live' : 'unsettled'
+  }
+
   for (const { referenceId, date, summary, ...batch } of a2Batches.values()) {
-    if (summary.total <= 0) continue
+    // o3d-i0o6 r6: reported BEFORE every skip below, because none of them is about these pounds. A
+    // batch whose own log is live, or whose own share rounds to zero, can still carry a foreign pass
+    // nobody will ever raise — and those are exactly the runs that would otherwise `continue` past it.
+    refusals.push(...allocationDebitForeignLedgerReports({
+      referenceId,
+      foreign: summary.foreign,
+      journalState: foreignJournalState,
+      scheduledSweepConnector,
+    }))
+    // ROUNDED, like the live writer's own `totalAllocatedValueNumber > 0` guard: a batch whose total
+    // rounds to £0.00 raised no journal when it ran and must raise none now (o3d-i0o6 r4). The
+    // unattributed arm is still reached at zero, because a batch nothing can value is not a batch
+    // known to be worth nothing.
+    if (round2(summary.total) <= 0 && summary.unattributed.length === 0) continue
     const verdict = await dailyBatchRecreateVerdict('DAILY_BATCH_INVENTORY_ALLOC', dailyBatchLiveRefs(batch))
     if (verdict.blocked) {
       if (verdict.refusal) refusals.push(verdict.refusal)
       continue
     }
+    // The batch's log really is missing AND at least one of its orders cannot say what it put into
+    // it. Reported, not skipped: this is the outcome a human has to resolve.
+    if (summary.unattributed.length > 0) {
+      refusals.push(allocationDebitRecreateRefusal(referenceId, summary.unattributed))
+      continue
+    }
+    if (round2(summary.total) <= 0) continue
     await db.$transaction(async (tx) => {
-      await createPendingSyncLog(tx, {
+      const recreatedLogId = await createPendingSyncLog(tx, {
         type: 'DAILY_BATCH_INVENTORY_ALLOC',
         referenceId,
         currency: baseCurrency,
@@ -899,6 +998,34 @@ export async function recreateMissingDailyBatchLogs(settings: Awaited<ReturnType
           _recreatedFromStage: true,
         },
       })
+      // o3d-i0o6 r5 (Codex round 4, HIGH 2) — AND THE EVIDENCE MOVES WITH THE JOURNAL. The passes
+      // that put these pounds into this batch name the log that went missing; left alone, every
+      // later refund and orphan reversal resolves that dead id, refuses, and the recreated debit
+      // can never be credited back out. Re-pointed in the SAME transaction as the create, so a row
+      // can never name a journal this sweep replaced but did not record.
+      for (const order of summary.orders) {
+        const repointed = repointAllocationDebitPassesToRecreatedJournal({
+          existingPasses: order.allocationBatchPasses,
+          batchRef: order.batchRef,
+          ledger: a2Ledger,
+          syncLogId: recreatedLogId,
+        })
+        if (!repointed) continue
+        await tx.salesOrder.update({
+          where: { id: order.id },
+          // Every column spelled out, not spread from the helper's return: o3d-psrx's write census
+          // resolves this literal to check no writer sets `paidAt` without its provenance, and a
+          // `data` it cannot read is a hole in that census rather than a pass.
+          data: {
+            allocationBatchPasses: repointed.allocationBatchPasses,
+            ...(repointed.latestPass ? {
+              allocationBatchSyncLogId: repointed.latestPass.syncLogId,
+              allocationBatchConnector: repointed.latestPass.connector,
+              allocationBatchAccountCode: repointed.latestPass.accountCode,
+            } : {}),
+          },
+        })
+      }
     })
   }
 
@@ -1180,6 +1307,9 @@ export async function runDailyBatchSync(): Promise<XeroDailyBatchResult> {
           // running total rather than the latest instalment. Read under the same lock as everything
           // else A2 plans from.
           allocationBatchAmount: true,
+          // o3d-i0o6 r3: and the pass history that figure is the sum of, read in the same statement
+          // so this pass appends to what it actually planned from.
+          allocationBatchPasses: true,
           allocations: {
             select: {
               id: true,
@@ -1478,20 +1608,24 @@ export async function runDailyBatchSync(): Promise<XeroDailyBatchResult> {
             // declared set leaves NEW quantity, and A2 then posts that increment alone. Replacing
             // the figure would leave the order recording £20 of a £70 debit, and the refund's open
             // balance would strand the other £50 permanently.
-            allocationBatchAmount: roundQuantity(
-              addMoney(
-                toDecimal(order.allocationBatchAmount ?? 0),
-                toDecimal(orderValues.get(order.id) ?? 0),
-              ),
-              4,
-            ).toNumber(),
-            // o3d-o97 r3: the journal's identity and DESTINATION, recorded with the amount it
-            // carried. All three stay null when no journal was raised, so a refund reading them
-            // back can tell "A2 debited £x on ledger L, account A" from "A2 valued this order at
-            // £x and posted nothing".
-            allocationBatchSyncLogId: a2SyncLogId,
-            allocationBatchConnector: a2SyncLogId ? XERO_CONNECTOR : null,
-            allocationBatchAccountCode: a2SyncLogId ? settings.xero_allocated_inventory_account : null,
+            //
+            // o3d-i0o6 r3 — AND THE ATTRIBUTION IS ACCUMULATED WITH IT, BY THE SAME CALL. The amount
+            // was cumulative while the journal id, connector and account code beside it were
+            // REPLACED by this pass, so the row said "£55, carried by the £5 journal" and a proof
+            // read the second half as covering the first. `buildAllocationDebitOrderUpdate` produces
+            // the running total, the appended pass history and those three columns TOGETHER — there
+            // is no way to write the figure here without recording the pass that made it, which is
+            // what stops the next connector from reintroducing the same gap by omission.
+            ...buildAllocationDebitOrderUpdate({
+              existingAmount: order.allocationBatchAmount,
+              existingPasses: order.allocationBatchPasses,
+              passAmount: orderValues.get(order.id) ?? 0,
+              syncLogId: a2SyncLogId,
+              connector: XERO_CONNECTOR,
+              accountCode: settings.xero_allocated_inventory_account,
+              batchRef: referenceId,
+              at: new Date(),
+            }),
           },
         })
       }

@@ -1858,6 +1858,33 @@ model SalesOrder {
   allocationBatchSyncLogId   String?            @map("accounting_allocation_batch_sync_log_id")
   allocationBatchConnector   String?            @map("accounting_allocation_batch_connector")
   allocationBatchAccountCode String?            @map("accounting_allocation_batch_account_code")
+  /// o3d-i0o6 r3 — THE WHOLE PASS HISTORY, BECAUSE THE AMOUNT IS CUMULATIVE AND THE THREE COLUMNS
+  /// ABOVE ARE NOT.
+  ///
+  /// `allocationBatchAmount` ACCUMULATES across incremental A2 passes: the declared allocation
+  /// rewrite hands a stamped order back with its debit standing, A2 posts the increment alone, and
+  /// the figure becomes £50 + £5. The three attribution columns are REPLACED by that same statement,
+  /// so they describe the LATEST pass only. A fact about the latest pass was then being read as a
+  /// fact about the whole debit: a £50 first pass that failed, or posted on another ledger, followed
+  /// by a £5 increment inside a large SYNCED batch, proved `posted` for the entire £55 — and the
+  /// refund and orphan-reversal paths credited the unproved £50 back out of a real account.
+  ///
+  /// So every pass records ITSELF here, appended in the SAME UPDATE that accumulates the amount: its
+  /// own contribution, the journal it raised (or null where it raised none), that journal's
+  /// connector, account code and batch reference. The proof then asks whether EVERY pass making up
+  /// the cumulative figure is SYNCED, on ONE ledger, against ONE account — which is the only
+  /// question a credit for the cumulative figure may be raised on.
+  ///
+  /// Written by ONE function (`buildAllocationDebitOrderUpdate`), which produces the amount and this
+  /// list together, so a connector that accumulates the amount without recording the pass cannot be
+  /// written by accident. A row whose passes do not sum to the amount is NOT provable — it fails
+  /// closed, to the safe side, rather than falling back on the latest pass.
+  ///
+  /// NULL on rows staged before this column existed. Nothing can reconstruct the pass history of a
+  /// 2025 batch, so those rows are unprovable and cap every credit at £0.00 — deliberately NOT
+  /// backfilled from the three columns above, which would be the database vouching for exactly the
+  /// single-pass assumption this column exists to stop making.
+  allocationBatchPasses      Json?              @map("accounting_allocation_batch_passes")
   // o3d-0i5y r12 — THE POUNDS ALREADY CREDITED BACK OUT OF ALLOCATED INVENTORY BY AN
   // ALLOCATION_REVERSAL, ON A ROW RETENTION CANNOT REACH.
   //
@@ -3784,11 +3811,28 @@ model WmsInboundReceiptEvent {
   @@map("wms_inbound_receipt_events")
 }
 
-/// Generic inbound webhook event staging for push-primary WMS connectors (ShipHero).
-/// Distinct from WmsInboundReceiptEvent (Mintsoft's ASN-specific poll model): ShipHero
-/// pushes order/shipment/inventory webhooks, staged here by event type with idempotent
-/// dedupe on (connector, externalEventId), retry/dead-letter state, and a monotonic
-/// status rank guarding the writeback against out-of-order delivery.
+/// Generic inbound webhook event staging for push-primary WMS connectors.
+/// Distinct from WmsInboundReceiptEvent (Mintsoft's ASN-specific poll model): a
+/// push-primary WMS sends order/shipment/inventory webhooks, staged here by event type
+/// with idempotent dedupe on (connector, externalEventId), retry/dead-letter state, and
+/// a monotonic status rank guarding the writeback against out-of-order delivery.
+///
+/// NO CONNECTOR WRITES TO THIS TABLE TODAY (o3d-remove-shiphero). ShipHero was the only
+/// push-primary WMS and was removed; Mintsoft is poll-primary and uses
+/// wms_inbound_receipt_events. The table and its generic READERS are kept deliberately:
+///  - the `connector` column, the dedupe key and the status-rank guard are not
+///    ShipHero-shaped — they are what any push-primary 3PL needs, and re-deriving them
+///    is how out-of-order webhook writebacks get re-invented wrongly;
+///  - its readers are shared multi-source aggregators (the sync-exception dead-letter
+///    inbox in app/actions/sync-exceptions.ts, and lib/data-retention.ts), not a
+///    ShipHero code path, so dropping the table would mean amputating one arm of two
+///    generic surfaces for no gain;
+///  - dropping it needs a destructive migration against a live-served development
+///    database whose rows nothing else can reconstruct.
+/// It is EMPTY-BY-DESIGN infrastructure, not dead code behind a flag: nothing branches
+/// on whether it has rows, and the moment a push-primary connector is registered it is
+/// written to with no schema change. If no such connector has landed by the time the
+/// other connector removals are done, drop it then and say so.
 model WmsWebhookEvent {
   id                 String    @id @default(cuid())
   connector          String

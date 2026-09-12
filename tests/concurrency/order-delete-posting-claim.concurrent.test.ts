@@ -87,6 +87,8 @@ test(
               inventoryAllocatedDate: null,
               revenueDeferredBatchRef: null,
               inventoryAllocatedBatchRef: null,
+              allocationBatchSyncLogId: null,
+              allocationBatchPasses: null,
             })
             if (blocker) return 'refused' as const
             await tx.salesOrder.delete({ where: { id: order.id } })

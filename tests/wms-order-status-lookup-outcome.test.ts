@@ -179,7 +179,7 @@ test('an already CONFIRMED-absent order is not re-probed every sweep (o3d-eu0r)'
   const { WMS_LOOKUP_CONFIRMED_ABSENT } = await import('@/lib/domain/wms/order-status-sweep')
 
   // Both connectors re-run the same underlying search inside the probe — Mintsoft repeats
-  // Order/Search, ShipHero repeats a credit-consuming GraphQL query — so a batch of missing
+  // Order/Search, and a metered 3PL API bills for it — so a batch of missing
   // orders would otherwise double its remote requests every cycle, against a quota.
   hasProbe = true
   presenceThrows = null

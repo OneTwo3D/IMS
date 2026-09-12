@@ -5,14 +5,62 @@
  * connector literal. Add a new id here (plus a registry entry, an
  * IntegrationPluginId + setting key, and per-connector cron/webhook ingress)
  * when a new WMS connector lands; core sales/PO/transfer/stock flows need no edits.
+ *
+ * ONE ENTRY TODAY. ShipHero was removed (o3d-remove-shiphero); Mintsoft is the
+ * only shipped WMS. A one-element tuple reads like a constant begging to be
+ * inlined — it is not. Everything downstream (the registry, the create-replay
+ * policy table, the plugin-enabled resolution order) derives from this list, and
+ * `tests/wms-second-connector-seam.test.ts` registers a fictitious connector and
+ * drives those generic paths through it precisely so the second-connector case
+ * stays exercised while only one connector ships.
  */
-export const WMS_CONNECTOR_IDS = ['mintsoft', 'shiphero'] as const
+export const WMS_CONNECTOR_IDS = ['mintsoft'] as const
 
 export type WmsConnectorId = (typeof WMS_CONNECTOR_IDS)[number]
 
 export function isWmsConnectorId(value: string | null | undefined): value is WmsConnectorId {
   return value != null && (WMS_CONNECTOR_IDS as readonly string[]).includes(value)
 }
+
+/**
+ * Whether a connector's own create refuses a duplicate — a property of the REMOTE,
+ * not of any sweep, and the only property that makes an automatic re-push safe.
+ *
+ * Declared here, on the connector contract, because it is a fact about the warehouse
+ * API the connector wraps. The reasoning that consumes it — why a presence probe and
+ * a lease expiry cannot substitute for it — lives with the policy functions in
+ * lib/domain/wms/create-replay-policy.ts, which re-exports this type.
+ */
+export type WmsCreateReplayPolicy =
+  /**
+   * The REMOTE refuses a duplicate and the connector reconciles to the order that already exists.
+   *
+   * True of Mintsoft: `PUT /api/Order` answers `{Success:false, Message:'Order already exists'}`
+   * for an order number it already holds, and `pushMintsoftOrder` then resolves the existing order
+   * through a ClientId-scoped `Order/Search` and binds THAT id (proved by a read, so it does not
+   * even need the ownership verification a fresh create does). A replay is therefore self-healing:
+   * whichever request loses the race is refused, and the link ends up pointing at the one order the
+   * warehouse holds. When the lookup cannot resolve exactly one row it THROWS rather than creating,
+   * so the failure mode is a retry, never a duplicate.
+   */
+  | 'remote-refuses-duplicate'
+  /**
+   * The only dedupe is a lookup the CONNECTOR performs immediately before its own create, and the
+   * two are separate operations. A preflight cannot see a request that is still on the wire, and
+   * the create it guards is accepted regardless — so two winners create two warehouse orders under
+   * one reference, and both get picked.
+   *
+   * A create whose outcome is unknown is therefore NEVER re-dispatched automatically on such a
+   * connector. The park is the outcome, and the resolution is a person who can look at the WMS.
+   *
+   * NO SHIPPED CONNECTOR TAKES THIS VALUE TODAY. ShipHero did (its `order_create` does not enforce
+   * `partner_order_id` uniqueness) and was removed. The value stays because it is a real property
+   * of real 3PL APIs and because every refusal path in the push sweep, the held-release rule and
+   * the exception inbox is built on it; `tests/wms-second-connector-seam.test.ts` registers a
+   * fictitious connector that takes it, so those paths keep being executed rather than merely
+   * compiled.
+   */
+  | 'client-side-dedupe-only'
 
 export type WmsConnectionSettings = {
   baseUrl: string
@@ -181,7 +229,8 @@ export type WmsOrderStatus = {
 }
 
 /**
- * One part of a (possibly split) WMS order — a Mintsoft split part or a ShipHero shipment.
+ * One part of a (possibly split) WMS order — e.g. a Mintsoft split part, or a per-shipment
+ * record on a WMS that models fulfilment as shipments.
  * Used by the generic dispatch sweep to reconcile per-part despatch.
  */
 export type WmsOrderPart = {
@@ -239,24 +288,54 @@ export type WmsOrderPushInput = {
   lines: WmsOrderPushLine[]
 }
 
-export type WmsOrderPushResult = {
+type WmsOrderPushResultBase = {
   externalOrderId: string
   externalOrderNumber: string | null
   status: string
-  /**
-   * o3d-bjc.8: this id was MINTED by a create we did not read back, so it is
-   * bound on the connector's word alone. The link is persisted PENDING_VERIFY
-   * and a later sweep proves ownership with a scoped read — it must never be
-   * re-pushed, because the order already exists in the warehouse.
-   *
-   * Absent/false means the id came from a read that already proved ownership
-   * (the dedupe path asserts the ClientId on the row it selects).
-   */
-  needsVerification?: boolean
   /** True when the order's shipping service didn't resolve and the WMS fell back to a
    *  default courier — the warehouse should verify the courier before despatch. */
   courierFallback?: boolean
 }
+
+/**
+ * A push whose id came from a read that ALREADY PROVED OWNERSHIP — Mintsoft's dedupe path asserts
+ * the ClientId on the row it selects, for instance. Nothing further is owed, so the link goes
+ * straight to SYNCED.
+ *
+ * o3d-remove-shiphero round 2 (Codex HIGH 4): `needsVerification` is pinned to `false` here, rather
+ * than merely omitted, so this type is NOT satisfied by a push that might assert doubt. That is what
+ * lets `WmsRegistrableConnector` refuse the combination described below.
+ */
+export type WmsOrderPushProvenResult = WmsOrderPushResultBase & {
+  needsVerification?: false
+}
+
+/**
+ * o3d-bjc.8: this id was MINTED by a create we did not read back, so it is bound on the connector's
+ * word alone. The link is persisted PENDING_VERIFY and a later sweep proves ownership with a scoped
+ * read — it must never be re-pushed, because the order already exists in the warehouse.
+ */
+export type WmsOrderPushUnverifiedResult = WmsOrderPushResultBase & {
+  needsVerification: true
+}
+
+/**
+ * THE COMBINATION THIS TYPE USED TO PERMIT (o3d-remove-shiphero round 2, Codex HIGH 4).
+ *
+ * `needsVerification?: boolean` and `verifyPushedOrder?` were INDEPENDENTLY optional, so a connector
+ * could say "I minted this id and cannot prove it is ours" while offering no way to ever prove it.
+ * The push sweep resolved that combination to SYNCED — and SYNCED is what the update, hold, cancel
+ * and dispatch passes act on. IMS would then amend, cancel or mark shipped an order under an id the
+ * connector had explicitly disclaimed; against a real warehouse that is somebody else's order.
+ *
+ * It is not enough to detect it. A connector asserting a doubt it cannot resolve is asking for a
+ * state that does not exist, so the contract now refuses to express it: see
+ * `WmsRegistrableConnector` in ./registry.ts, which a connector cannot be registered without
+ * satisfying. The sweep keeps a runtime fail-safe as well, because a connector reached through a
+ * cast (or written in JavaScript) can still produce the shape at runtime — but the fail-safe is a
+ * second line, not the fix.
+ */
+export type WmsOrderPushResult = WmsOrderPushProvenResult | WmsOrderPushUnverifiedResult
 
 export type WmsOrderCancelResult = {
   cancelled: boolean
@@ -270,8 +349,23 @@ export type WmsOrderUpdateResult = {
   status: string
 }
 
-export interface WmsConnector {
-  readonly id: WmsConnectorId
+/**
+ * The contract every WMS/3PL connector implements. Core flows depend on THIS and
+ * never on a connector module.
+ *
+ * Generic over the id so a connector can be written for an id this build does not
+ * ship — which is the only way `tests/wms-second-connector-seam.test.ts` can register
+ * a fictitious warehouse and drive the generic layer through it. Production code uses
+ * the default (`WmsConnector` = `WmsConnector<WmsConnectorId>`) and is unaffected.
+ *
+ * OPTIONAL METHODS ARE A CAPABILITY NEGOTIATION, NOT A TODO LIST. A connector that
+ * cannot do something omits the method, and the generic layer must degrade — skip the
+ * bulk delta, report "unsupported" for split parts, refuse a push — rather than
+ * assume. That degradation is what the seam test exercises, because with one shipped
+ * connector implementing nearly everything, no other test can reach those branches.
+ */
+export interface WmsConnector<Id extends string = WmsConnectorId> {
+  readonly id: Id
   readonly name: string
 
   isConfigured(): Promise<boolean>
@@ -292,10 +386,32 @@ export interface WmsConnector {
    * Bulk delta: every order changed since `sinceIso` (already expressed in the
    * WMS tenant's timezone), for the dispatch sweep's Order/List hot-path. One
    * (paginated) call replaces N per-order status polls. Optional — a WMS with
-   * no delta endpoint (ShipHero) omits it and the sweep per-order polls as
-   * before. Implementations MUST throw (never return a partial list) on a
+   * no bulk-delta endpoint omits it and the sweep per-order polls as before, a
+   * degradation the second-connector seam test exercises directly.
+   * Implementations MUST throw (never return a partial list) on a
    * truncated/failed delta so the caller can fail safe to the per-order poll. */
   fetchOrderDelta?(sinceIso: string): Promise<WmsOrderStatus[]>
+  /**
+   * THE ZONE `fetchOrderDelta`'s CURSOR IS A WALL-CLOCK TIME IN — a fact about the WAREHOUSE,
+   * which is why it lives on the connector and nowhere else (o3d-remove-shiphero round 4, Codex
+   * HIGH 1).
+   *
+   * The cursor is not an instant on the wire: it is a `YYYY-MM-DDTHH:MM:SS` string the warehouse
+   * compares against its own `LastUpdated`, in whatever zone that warehouse keeps. Get the zone
+   * wrong and the window is SHIFTED BY HOURS — and a window that starts late does not error, it
+   * returns fewer rows. The orders in the gap are simply never read, the sweep reports a clean
+   * pass, and the watermark advances past them. Silent non-fulfilment, exactly like the shared
+   * watermark this connector namespace replaced.
+   *
+   * So it is REQUIRED of any connector that has a delta: `WmsRegistrableConnector` refuses to
+   * register `fetchOrderDelta` without it, and the dispatch sweep carries no default of its own
+   * to fall back on. A tenant may still override it with the connector's own
+   * `<id>_api_timezone` setting row; there is no cross-connector fallback, and never a shipped
+   * connector's zone standing in for an unconfigured one.
+   *
+   * `'UTC'` is a legitimate value and means "no conversion".
+   */
+  deltaCursorTimeZone?: string
   /**
    * Tri-state order-presence probe for reconciliation (q66in.4.4). Distinct from
    * fetchOrderStatus, whose null CONFLATES "definitively absent" with

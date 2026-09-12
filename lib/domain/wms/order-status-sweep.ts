@@ -1,6 +1,6 @@
 import { db } from '@/lib/db'
 import { getIntegrationPluginState } from '@/lib/integration-plugins'
-import { WMS_CONNECTOR_IDS } from '@/lib/connectors/wms/types'
+import { resolveEnabledWmsConnector, wmsResolutionSkipReason } from '@/lib/connectors/wms/enabled-connector'
 import { getWmsConnector, getWmsConnectorDef } from '@/lib/connectors/wms/registry'
 import { resolveWmsOrderLookupConnector } from '@/lib/connectors/wms/order-lookup'
 
@@ -66,8 +66,11 @@ export async function runWmsOrderStatusSweep(
   options?: { batchSize?: number; staleMinutes?: number },
 ): Promise<WmsOrderStatusSweepResult> {
   const state = await getIntegrationPluginState()
-  const connectorId = WMS_CONNECTOR_IDS.find((id) => state[id])
-  if (!connectorId) return { skipped: 'No WMS connector enabled', scanned: 0, updated: 0, failed: 0 }
+  const resolution = resolveEnabledWmsConnector(state)
+  if (resolution.kind !== 'one') {
+    return { skipped: wmsResolutionSkipReason(resolution), scanned: 0, updated: 0, failed: 0 }
+  }
+  const connectorId = resolution.id
 
   const connector = getWmsConnector(connectorId)
   if (!connector.fetchOrderStatus) {
@@ -126,10 +129,9 @@ export async function runWmsOrderStatusSweep(
       // Only on the null path, so a found order costs no extra call. A connector without
       // probeOrderPresence stays on the conservative reading: unresolved, so the guard blocks.
       //
-      // COST: both current connectors re-run the same underlying search inside the probe —
-      // Mintsoft repeats Order/Search, ShipHero repeats a credit-consuming GraphQL query — so a
-      // batch of missing orders would otherwise double its remote requests every sweep, against a
-      // quota. An order already CONFIRMED absent and still absent has nothing new to learn, so it
+      // COST: a connector re-runs the same underlying search inside the probe — Mintsoft repeats
+      // Order/Search, and on a metered 3PL API that is billed — so a batch of missing orders would
+      // otherwise double its remote requests every sweep, against a quota. An order already CONFIRMED absent and still absent has nothing new to learn, so it
       // is not re-probed; the steady state (a stable set of orders the WMS has never held) costs
       // one probe each, once, instead of one per sweep.
       //

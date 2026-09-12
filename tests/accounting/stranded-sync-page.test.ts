@@ -894,11 +894,25 @@ test('every read is made with the arguments it claims, and every result reaches 
     'accountingAccounts', 'accountingBatchHistory', 'accountingBatchPreview', 'accountingBlockedReason',
     'accountingConnected', 'accountingConnectionTest', 'accountingHasStoredToken', 'accountingLogs',
     'accountingReadiness', 'accountingSettings',
-    'accountingTaxRates', 'accountingTenantName', 'currencies', 'imsTaxRates', 'paymentAccountMap',
+    'accountingTaxRates', 'accountingTenantName', 'ambiguousWmsConnectorIds', 'availableWmsConnectorIds',
+    'currencies', 'imsTaxRates', 'paymentAccountMap',
     'paymentMethodCombos', 'pluginState', 'shopifyCredentials', 'shopifyLogs', 'shopifySettings',
     'shoppingCredentials', 'shoppingLogs', 'shoppingPaymentMethods', 'shoppingSettings',
     'shoppingStatusMappings', 'shoppingTaxMappings', 'taxRates', 'wmsData',
   ], 'the dashboard prop set is pinned: a new prop must be wired here deliberately')
+
+  // o3d-remove-shiphero round 12. Both are facts the CLIENT grid cannot read for itself — the WMS
+  // registry statically imports the shipped connector (and Prisma behind it) — so the page is where
+  // they are resolved, and both used to be written by the grid: `available: true` on every WMS card,
+  // and "another connector currently does" inferred from a missing DTO.
+  assert.deepEqual(
+    props.availableWmsConnectorIds, ['mintsoft'],
+    'the offered WMS connectors come from the registry\'s own `available` flag, not from the grid',
+  )
+  assert.deepEqual(
+    props.ambiguousWmsConnectorIds, [],
+    'and the ambiguity list is empty with exactly one WMS connector enabled',
+  )
 
   assert.equal(props.pluginState, state.plugins)
   assert.equal(props.shoppingSettings, s.shoppingSettings)

@@ -6,7 +6,7 @@ Goal: core app flows (sales / PO / transfer / stock / settings / sync UI / order
 **not** `mintsoft`-specific branches — mirroring the shopping (`shopping-registry.ts`)
 and accounting (`accounting-registry.ts`) boundaries.
 
-Acceptance: a ShipHero connector can be added by implementing the contract + registering
+Acceptance: a second WMS connector can be added by implementing the contract + registering
 it (registry entry + plugin-id + setting key + per-connector cron/webhook ingress), with
 **no edits to sales/PO/transfer/stock/settings core flows**.
 
@@ -46,7 +46,7 @@ the schema.
 ### COSMETIC — not a leak
 
 - `lib/releases.ts` (changelog text), `lib/settings-store.ts` (`mintsoft_*` setting keys — stable, connector-scoped), `lib/integration-connection-test-gate.ts` (union type member)
-- `app/(dashboard)/settings/system/page.tsx` `mintsoftEnabled` prop — the per-connector **enable toggle**, parallel to `woocommerceEnabled`/`xeroEnabled`. Adding `shipheroEnabled` is "registering a connector", not a core-flow edit. (A later data-driven `IntegrationPluginsSettings` refactor is optional polish.)
+- `app/(dashboard)/settings/system/page.tsx` `mintsoftEnabled` prop — the per-connector **enable toggle**, parallel to `woocommerceEnabled`/`xeroEnabled`. Adding a second `<connector>Enabled` prop is "registering a connector", not a core-flow edit. (A later data-driven `IntegrationPluginsSettings` refactor is optional polish.)
 
 ## Distinct refactors (deduped) → sub-issues
 

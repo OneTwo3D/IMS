@@ -1,6 +1,8 @@
 import assert from 'node:assert/strict'
 import test, { mock } from 'node:test'
 
+import type { WmsConnectorResolution } from '../lib/connectors/wms/enabled-connector.ts'
+
 /**
  * o3d-rbyg round 2, Codex finding 3: ALREADY-DESPATCHED GOODS HAD NO SUPPORTED RECONCILIATION PATH.
  *
@@ -18,7 +20,17 @@ type Row = Record<string, unknown>
 const state = {
   link: null as Row | null,
   linkUpdates: [] as Row[],
-  connectorId: 'mintsoft' as string | null,
+  /**
+   * WHICH WMS CONNECTOR IS ENABLED — ONE field, three-valued, and the two-valued helper DERIVED
+   * from it (o3d-remove-shiphero round 12, Codex MEDIUM).
+   *
+   * The fixture used to hold `connectorId: string | null` and answer both
+   * `resolveEnabledWmsConnectorSelection` and `getEnabledWmsConnectorId` from it, which cannot
+   * express the state this round is about — more than one connector enabled — so no case here
+   * could reach the branch that reports it. Production derives the nullable id from the resolution
+   * (`kind === 'one' ? id : null`); so does the mock below, in one line, so the two cannot disagree.
+   */
+  wmsResolution: { kind: 'one', id: 'mintsoft' } as WmsConnectorResolution,
   /** What the WMS says about the order when asked. */
   wmsStatus: null as Row | null,
   /** What reconcileOneOrder reports. */
@@ -37,7 +49,7 @@ const state = {
 function reset() {
   state.link = null
   state.linkUpdates = []
-  state.connectorId = 'mintsoft'
+  state.wmsResolution = { kind: 'one', id: 'mintsoft' }
   state.wmsStatus = { externalOrderId: 'M-1', externalOrderNumber: 'WMS-1', status: 'DESPATCHED', dispatched: true, isSplit: false }
   state.reconcile = { action: 'dispatched', reason: 'DESPATCHED' }
   state.reconcileCalls = []
@@ -58,10 +70,12 @@ mock.module('@/lib/auth/server', {
   },
 })
 mock.module('@/lib/activity-log', { namedExports: { logActivity: async (entry: Row) => { state.activity.push(entry) } } })
+const enabledIdFromResolution = () => (state.wmsResolution.kind === 'one' ? state.wmsResolution.id : null)
 mock.module('@/lib/connectors/wms/active-connector', {
   namedExports: {
-    getEnabledWmsConnectorId: async () => state.connectorId,
-    getActiveWmsConnectorId: async () => state.connectorId,
+    resolveEnabledWmsConnectorSelection: async () => state.wmsResolution,
+    getEnabledWmsConnectorId: async () => enabledIdFromResolution(),
+    getActiveWmsConnectorId: async () => enabledIdFromResolution(),
   },
 })
 mock.module('@/lib/connectors/wms/registry', { namedExports: { getWmsConnector: () => ({ id: 'mintsoft' }) } })
@@ -459,4 +473,110 @@ test('o3d-rbyg r4: the same-number answer on a link with no stable id is accepte
   const result = await recordWithdrawnDespatch('so-1')
 
   assert.equal(result.success, true, result.success ? '' : String(result.error))
+})
+
+// ---------------------------------------------------------------------------------------------
+// AMBIGUITY IS NOT ABSENCE — the exception inbox's three WMS actions
+// (o3d-remove-shiphero round 12, Codex MEDIUM)
+//
+// Round 10 gave the resolver a three-valued answer precisely so "none enabled" and "more than one
+// enabled" would stop being the same answer, and then these three callers collapsed it back to two
+// by taking `getEnabledWmsConnectorId()` and testing it for null. So with two WMS switches visibly
+// on, the inbox said "No WMS connector is enabled" and the drift actions said the connector "is not
+// enabled" — both false, and both pointing the remedy at the opposite of the fix (turn one ON,
+// when the fix is to turn one OFF).
+//
+// Each case below is paired with its NONE contrast, so "says the ambiguity" cannot be satisfied by
+// a message that simply stopped mentioning the enabled state at all.
+// ---------------------------------------------------------------------------------------------
+
+const AMBIGUOUS: WmsConnectorResolution = { kind: 'ambiguous', ids: ['mintsoft', 'acme-wms'] as never }
+
+test('[round 12 MEDIUM] recordWithdrawnDespatch names the CONTRADICTION, not "no WMS connector is enabled"', async () => {
+  reset()
+  state.link = parkedLink()
+  state.wmsResolution = AMBIGUOUS
+  const { recordWithdrawnDespatch } = await actions()
+
+  const result = await recordWithdrawnDespatch('so-1')
+
+  assert.equal(result.success, false)
+  const error = result.success ? '' : String(result.error)
+  assert.doesNotMatch(error, /No WMS connector is enabled/, 'two are, and one of them despatched these goods')
+  assert.match(error, /More than one WMS connector is enabled/)
+  assert.match(error, /mintsoft/, 'naming the rows that are fighting')
+  assert.match(error, /acme-wms/)
+  assert.match(error, /Integration Plugins/, 'and where the remedy is')
+  assert.deepEqual(state.releases, [], 'and nothing was released')
+  assert.deepEqual(state.reconcileCalls, [], 'and nothing was dispatched')
+})
+
+test('[round 12 MEDIUM] with NONE enabled recordWithdrawnDespatch keeps its own wording', async () => {
+  reset()
+  state.link = parkedLink()
+  state.wmsResolution = { kind: 'none' }
+  const { recordWithdrawnDespatch } = await actions()
+
+  const result = await recordWithdrawnDespatch('so-1')
+
+  assert.equal(result.success, false)
+  assert.match(
+    result.success ? '' : String(result.error),
+    /No WMS connector is enabled, so there is no warehouse to confirm the despatch against\./,
+    'the sentence that was already right for THIS state is unchanged',
+  )
+})
+
+test('[round 12 MEDIUM] the drift ISOLATE action distinguishes ambiguity from a switched-off connector', async () => {
+  reset()
+  state.wmsResolution = AMBIGUOUS
+  const { isolateUnresolvedDriftCohort } = await actions()
+
+  const result = await isolateUnresolvedDriftCohort('mintsoft', 'v1', 'v1')
+
+  assert.equal(result.success, false)
+  const error = result.success ? '' : String(result.error)
+  assert.doesNotMatch(
+    error, /not enabled/,
+    'mintsoft IS enabled here — it is just not alone, and "no sweep is updating it" is a different'
+    + ' fault with a different remedy',
+  )
+  assert.match(error, /More than one WMS connector is enabled/)
+  assert.match(error, /acme-wms/)
+})
+
+test('[round 12 MEDIUM] the drift ISOLATE action still says "not enabled" when it really is off', async () => {
+  reset()
+  state.wmsResolution = { kind: 'none' }
+  const { isolateUnresolvedDriftCohort } = await actions()
+
+  const result = await isolateUnresolvedDriftCohort('mintsoft', 'v1', 'v1')
+
+  assert.equal(result.success, false)
+  assert.match(result.success ? '' : String(result.error), /not enabled/)
+})
+
+test('[round 12 MEDIUM] the drift RETRY action distinguishes ambiguity from a switched-off connector', async () => {
+  reset()
+  state.wmsResolution = AMBIGUOUS
+  const { retryUnresolvedDriftCohort } = await actions()
+
+  const result = await retryUnresolvedDriftCohort('mintsoft', 'v1')
+
+  assert.equal(result.success, false)
+  const error = result.success ? '' : String(result.error)
+  assert.doesNotMatch(error, /not enabled/)
+  assert.match(error, /More than one WMS connector is enabled/)
+  assert.match(error, /acme-wms/)
+})
+
+test('[round 12 MEDIUM] the drift RETRY action still says "not enabled" when it really is off', async () => {
+  reset()
+  state.wmsResolution = { kind: 'none' }
+  const { retryUnresolvedDriftCohort } = await actions()
+
+  const result = await retryUnresolvedDriftCohort('mintsoft', 'v1')
+
+  assert.equal(result.success, false)
+  assert.match(result.success ? '' : String(result.error), /not enabled/)
 })

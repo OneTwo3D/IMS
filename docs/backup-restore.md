@@ -140,7 +140,7 @@ write fence**. It is consulted by:
 - the WooCommerce webhook entry point, and
 - the Mintsoft ASN booked-in webhook.
 
-It is **not** consulted by interactive server actions, by the ShipHero webhook route, by the
+It is **not** consulted by interactive server actions, by the
 accounting OAuth callback, by any other API route, or by anything holding a direct database
 connection. Ordinary dashboard writes continue during a restore.
 

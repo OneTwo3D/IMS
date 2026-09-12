@@ -18,7 +18,8 @@ export async function GET(request: Request) {
     return NextResponse.json({ skipped: true, reason: 'Mintsoft plugin disabled' })
   }
 
-  // The dispatch poll is Mintsoft's path (ShipHero ingests despatch via webhooks); the
+  // The dispatch poll is Mintsoft's path (a push-primary WMS would ingest despatch via
+  // webhooks instead); the
   // sweep itself is connector-agnostic and resolves the active WMS.
   return NextResponse.json(await runWmsDispatchSweep('cron'))
 }

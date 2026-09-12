@@ -17,13 +17,33 @@ export { isWmsConnectorId } from './types'
  * row for the connector (no active filter) so an explicitly configured
  * orderLookupConnector is honoured regardless of the connection's active flag.
  */
-export async function resolveWmsOrderLookupConnector(
-  connector: WmsConnectorId,
-): Promise<ShoppingConnectorId | null> {
-  const connection = await db.wmsConnection.findFirst({
+export type WmsOrderLookupPort = {
+  /** The earliest-created connection row for this connector id, or null. */
+  findConnection(connector: string): Promise<{ orderLookupConnector: string | null } | null>
+}
+
+const prismaPort: WmsOrderLookupPort = {
+  findConnection: (connector) => db.wmsConnection.findFirst({
     where: { connector },
     orderBy: [{ createdAt: 'asc' }],
     select: { orderLookupConnector: true },
-  })
+  }),
+}
+
+/**
+ * `connector` is a plain string, not `WmsConnectorId`: a WmsConnection row can name a connector
+ * this build no longer ships, and the answer for such a row is "no configured lookup", not a
+ * type error at the call site that reads it.
+ *
+ * `port` exists so this can be driven without a database — the second-connector seam test asks it
+ * about a FICTITIOUS connector and asserts the query is filtered on the id it was ASKED about. The
+ * failure mode that guards against is a resolver pinned to Mintsoft's row, which would link a
+ * second warehouse's fulfilments to the wrong storefront.
+ */
+export async function resolveWmsOrderLookupConnector(
+  connector: WmsConnectorId | string,
+  port: WmsOrderLookupPort = prismaPort,
+): Promise<ShoppingConnectorId | null> {
+  const connection = await port.findConnection(connector)
   return inferShoppingOrderLookupConnector(connection?.orderLookupConnector ?? null)
 }

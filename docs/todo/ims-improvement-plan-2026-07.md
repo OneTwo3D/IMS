@@ -70,7 +70,7 @@ The through-line: when the 3PL holds **less** than IMS believes (shrinkage, alre
 - **Plugin-retirement coexistence hazard:** while IMS and the legacy woo-mintsoft bridge are both live, only ONE may write back to WC or customers get double partial-shipment rows / double despatch emails. Cutover rule + AST Pro despatch-email confirmation (G5 ◐) in `docs/todo/woo-mintsoft-plugin-parity-gap.md`. Operational checklist, not code.
 - KIT/bundle SKUs are pushed to the WMS verbatim; fulfilment silently depends on bundle-sync lockstep → **6oyu.16 (P3)**.
 - `MISSING_IN_IMS` discrepancy category defined but never emitted → **6oyu.17 (P4)**.
-- ShipHero items stay parked behind a live tenant: outbound-push verification (h02x.11), ALIGN auto-correction (ku89), product/kit/returns/ASN sync (h02x.5–.8).
+- ~~ShipHero items stay parked behind a live tenant~~ — **the ShipHero connector was REMOVED** (`o3d-remove-shiphero`, 2026-09). h02x.11, ku89 and h02x.5–.8 are moot; the code is at tag `archive/shiphero-connector`. See [`../archive/shiphero-connector-removal.md`](../archive/shiphero-connector-removal.md).
 
 ---
 

@@ -3,7 +3,7 @@
 import { db } from '@/lib/db'
 import { requireInternalUser } from '@/lib/auth/server'
 import { getIntegrationPluginState } from '@/lib/integration-plugins'
-import { WMS_CONNECTOR_IDS } from '@/lib/connectors/wms/types'
+import { enabledWmsConnectorId } from '@/lib/connectors/wms/enabled-connector'
 import { getWmsConnector, getWmsConnectorDef } from '@/lib/connectors/wms/registry'
 import { resolveWmsOrderLookupConnector } from '@/lib/connectors/wms/order-lookup'
 import type { WmsOrderStatus } from '@/lib/connectors/wms/types'
@@ -25,7 +25,11 @@ export async function getWmsOrderStatusForSalesOrder(salesOrderId: string): Prom
   await requireInternalUser()
 
   const state = await getIntegrationPluginState()
-  const connectorId = WMS_CONNECTOR_IDS.find((id) => state[id])
+  // `enabledWmsConnectorId`, not "the first enabled one" (round 10, Codex HIGH 1). This read has one
+  // way to decline — no chip — and it is the right answer both when no connector is enabled and
+  // when the enabled set is contradictory: a chip resolved from a guessed connector would name a
+  // warehouse that is not fulfilling the order.
+  const connectorId = enabledWmsConnectorId(state)
   if (!connectorId) return null
 
   const connector = getWmsConnector(connectorId)
