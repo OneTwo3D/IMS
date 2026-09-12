@@ -344,8 +344,79 @@ load_existing_env() {
 # values back (they are in the backup, or in the running service's environment), or — if this really
 # is a fresh start and the database is expendable — set IMS_INSTALL_REMINT_SECRETS=yes, which is a
 # deliberate statement rather than a default.
+# AND AN ABSENT .env IS NOT AN ANSWER EITHER (o3d-xf9m).
+#
+# THE FINDING. load_existing_env() refuses every hostile shape at ${APP_DIR}/.env — a non-regular
+# file, an unreadable one, even a dangling symlink — except the one shape the service account can
+# produce for free, which is unlink(). ${APP_DIR} belongs to ${APP_USER} and .env is its own file, so
+# `rm .env` set ENV_FILE_STATE=absent, require_preserved_secrets() returned without checking
+# anything, and the heredoc below wrote a FRESH SETTINGS_ENCRYPTION_KEY over a live database. Every
+# encrypted Setting already in it — Xero tokens, connector secrets — is then permanently
+# undecryptable. Not a wrong value: a destroyed one. This is the same shape as the r12 finding about
+# the connection-fence state file: AN ABSENCE TREATED AS AN ANSWER, authored by the account being
+# defended against.
+#
+# WHY IT CANNOT SIMPLY REFUSE. Absence is LEGITIMATE on a first install, and minting is correct
+# there and only there. A refusal on absence would make a from-scratch install impossible.
+#
+# SO MINTING IS EARNED RATHER THAN INFERRED FROM WHAT IS MISSING, and it takes TWO positive answers,
+# neither of which the application account authors:
+#
+#   1. IS THERE AN INSTALLATION ON THIS HOST?  upgrade_in_place(), which this run asks again below to
+#      decide whether to fence. Its decisive evidence is /etc/systemd/system/${APP_NAME}.service —
+#      a file in a ROOT-OWNED directory, which ${APP_USER} can neither create nor remove. They can
+#      clear their own crontab, delete ${APP_DIR}/.pm2 and exit their processes, and all that buys is
+#      an answer of "nothing here"; question 2 still has to be answered, and an unreadable crontab is
+#      a refusal in that function rather than either answer.
+#
+#   2. DID THIS RUN BRING THE DATABASE INTO BEING?  DB_CREATED_BY_THIS_RUN, which only
+#      create_database_and_record_newness() can set, and only because THE SERVER answered: an exit 0
+#      from an unconditional CREATE DATABASE, with the server's own identity read back on the same
+#      connection. SQLSTATE 42P04 means the database was already there, and an existing database is
+#      exactly the thing whose encrypted rows a fresh key destroys.
+#
+# WHY THE DATABASE ANSWER CANNOT BE SPOOFED BY THE SAME ACCOUNT. It is not a file anywhere; it is
+# what PostgreSQL said about whether the database existed an instant before this run. The application
+# role cannot make the server answer "created" for a database that is there. The ONE way to change
+# that answer is to DROP the database — which destroys the encrypted settings this guard is about, so
+# the evidence can only be falsified by performing the harm it exists to prevent. That is the
+# strongest form this evidence can take on a host where the same account owns the application's data.
+#
+# THE OVERRIDE IS THE ONE THAT ALREADY EXISTS. IMS_INSTALL_REMINT_SECRETS=yes is the deliberate
+# statement for "this really is a fresh start and the existing data is expendable", and it is used
+# here rather than a second variable: two overrides for one irreversible act is two things to get
+# wrong. It comes from the root invocation, so the service account cannot set it.
+#
+# WHAT THIS COSTS A GENUINE FIRST INSTALL: nothing on the supported path. INSTALL_POSTGRES=y creates
+# the database, so question 2 answers "this run made it", there is no unit and no crontab, and the
+# run mints without being asked anything. An install against an EXTERNAL database creates nothing and
+# therefore cannot earn the exemption — that path is told so, and one deliberate variable is a fair
+# price for the alternative being silent and irreversible.
+require_absent_env_is_a_first_install() {
+  local -a witnesses=()
+  if upgrade_in_place; then
+    witnesses+=("an existing installation was found on this host: a service unit, a live crontab, a PM2 instance or a process running in ${APP_DIR}")
+  fi
+  if ! ${DB_CREATED_BY_THIS_RUN}; then
+    witnesses+=("${DB_NEWNESS_FINDING}")
+  fi
+  (( ${#witnesses[@]} )) || return 0
+  if [[ "${IMS_INSTALL_REMINT_SECRETS:-}" == "yes" ]]; then
+    warn "IMS_INSTALL_REMINT_SECRETS=yes: minting a fresh AUTH_SECRET, SETTINGS_ENCRYPTION_KEY and CRON_SECRET even though ${APP_DIR}/.env is ABSENT on a host that is not a first install. Every encrypted setting written under the previous SETTINGS_ENCRYPTION_KEY becomes permanently undecryptable, and every existing session is invalidated. Why this run is not a first install: ${witnesses[*]}"
+    return 0
+  fi
+  die "${APP_DIR}/.env is ABSENT, and this run cannot show that this is a first install, so it refuses to mint AUTH_SECRET, SETTINGS_ENCRYPTION_KEY and CRON_SECRET. A new SETTINGS_ENCRYPTION_KEY makes every encrypted setting already in the database PERMANENTLY undecryptable, a new AUTH_SECRET invalidates every session, and a new CRON_SECRET makes the crontab this script wrote unauthorised. ${APP_DIR} belongs to ${APP_USER}, so an absent .env is a state that account can produce by deleting a file it owns — it is not evidence of a fresh host. What this run found instead: ${witnesses[*]}. Restore .env from your backup, or from the running service's environment (systemctl show -p Environment ${APP_NAME}.service), and run this again. If this really is a fresh start and the existing data is expendable, say so deliberately: IMS_INSTALL_REMINT_SECRETS=yes. NOTHING HAS BEEN STOPPED AND NOTHING HAS BEEN MIGRATED."
+}
+
 require_preserved_secrets() {
-  [[ "${ENV_FILE_STATE:-absent}" == "read" ]] || return 0
+  # ENV_FILE_STATE has two values by the time this runs — "read" or "absent" — because every path
+  # that could not read the file dies inside load_existing_env(). The two are different questions and
+  # each has its own answer: what a file that WAS read has to contain, and what has to be true of the
+  # host for a file that is not there to mean a first install.
+  if [[ "${ENV_FILE_STATE:-absent}" != "read" ]]; then
+    require_absent_env_is_a_first_install
+    return 0
+  fi
   # The three values this installer generates that CANNOT be re-minted without breaking the install
   # they belong to.
   local -a IRREVERSIBLE_SECRET_KEYS=(AUTH_SECRET SETTINGS_ENCRYPTION_KEY CRON_SECRET)
@@ -1050,6 +1121,57 @@ source "${IMS_SCRIPT_LIB_DIR}/unit-environment.sh" || {
   echo "FATAL: ${IMS_SCRIPT_LIB_DIR}/unit-environment.sh could not be sourced. It is the only thing in this repository that asks systemd what composes a service's environment, and without it this run cannot establish that the file it read is what gives the application its DATABASE_URL. Nothing has been changed." >&2
   exit 1
 }
+# AND THE BYTES THIS RUN MAY EXECUTE AFTER IT HAS STARTED (o3d-kyqa / o3d-z5be). Sourced LAST of
+# the five, because it reuses lib/db-fence-protected.sh's publication primitives rather than
+# restating them: the seal test, the whole-tree manifest, the tree digest and the atomic publisher
+# are that file's, and a second implementation of any of them would be the "one rule, several
+# readers" defect this repository keeps finding.
+# shellcheck source=lib/privileged-helpers.sh
+source "${IMS_SCRIPT_LIB_DIR}/privileged-helpers.sh" || {
+  echo "FATAL: ${IMS_SCRIPT_LIB_DIR}/privileged-helpers.sh could not be sourced. It is the only thing in this repository that publishes a root-owned copy of the helpers a privileged run executes, and without it this run would have to resolve them out of a checkout the service account owns. Nothing has been changed." >&2
+  exit 1
+}
+# AND THE SNAPSHOT IS TAKEN HERE — in the same instant as the four libraries above and as the body
+# of this file, which is the instant the operator accepted when they typed the command. Everything
+# this run executes as root later is resolved out of that snapshot by privileged_helper_path() and
+# re-checked against the digest recorded on this line, so no replacement made after it can reach a
+# privileged exec. An unprivileged run publishes nothing and returns 0 (it executes nothing
+# privileged, so it has nothing to refuse); a privileged run that could NOT publish stops here,
+# before it has changed anything at all.
+publish_privileged_helper_set || {
+  echo "FATAL: the root-owned copy of ${IMS_SCRIPT_LIB_DIR} could not be published to ${IMS_DRIVER_HELPER_DIR}: ${IMS_DRIVER_REASON:-no reason was recorded}. Every node helper this run would otherwise execute as root would have to be read back out of a directory the service account owns, minutes from now; it will not do that. Nothing has been changed." >&2
+  exit 1
+}
+# AND THE ROOT-OWNED DEPLOYMENT DRIVER, FROM THE RELEASE THIS RUN IS INSTALLING (o3d-z5be).
+#
+# THE FINDING WAS NOT ABOUT A HELPER. root ran scripts/update.sh itself out of wherever the operator
+# kept it, which the documented commands made ${APP_DIR} — so an account that can rewrite the
+# checkout rewrites the script root is about to run, and reading .env safely does not help if the
+# reader is application-writable. So the three entrypoints and the library beside them are copied
+# into ${IMS_DRIVER_PROGRAM_DIR}, root-owned and writable by nobody else, and docs/installation.md's
+# update command is that copy. On that path even the five `source`s above are read out of a tree
+# ${APP_USER} cannot touch.
+#
+# IT IS PUBLISHED HERE, at startup, and not in a later section: this file may itself have been run
+# out of an application-owned release checkout, and a copy taken in section 14 would be a copy of
+# whatever that tree held in section 14. update.sh refreshes it at the END of a successful update
+# from the release it has just deployed, so the copy tracks what is deployed rather than freezing at
+# install time; see the block above publish_privileged_driver() there.
+#
+# WHAT IT DOES NOT CLAIM: it does not authenticate the release. install.sh is run by an operator out
+# of a tree they chose, and that choice is the trust root this repository has always had —
+# docs/installation.md says so. What is gone is root executing a deployment driver that the service
+# account could have replaced in the interval since the previous run.
+#
+# The EUID test is here rather than inside the function because install.sh's own root check is in
+# section 1, hundreds of lines below, and it prints the sentence an operator needs. A non-root run
+# reaching this line is `--help`-shaped and publishes nothing.
+if [[ "$(id -u)" == "0" ]]; then
+  publish_privileged_driver "$(dirname "${IMS_SCRIPT_LIB_DIR}")" || {
+    echo "FATAL: the root-owned deployment driver could not be published to ${IMS_DRIVER_PROGRAM_DIR}: ${IMS_DRIVER_REASON:-no reason was recorded}. The next privileged run would then have to be launched out of a tree the service account owns, which is what this publication exists to stop. Nothing has been changed." >&2
+    exit 1
+  }
+fi
 crontab_lock_paths "${DATA_DIR}"
 DB_OBJECT_ACCESS_SCRIPT="${APP_DIR}/scripts/check-app-db-object-access.mjs"
 # THE APPLICATION'S CONNECTION IDENTITY, WHICH THIS INSTALLER OWNS OUTRIGHT (o3d-2sm1.5 r19).
@@ -3802,12 +3924,30 @@ chown_state_tree() {
   gid="$(id -g "${owner}" 2>/dev/null)" || gid=""
   [[ "${uid}" =~ ^[0-9]+$ && "${gid}" =~ ^[0-9]+$ ]] || die \
     "the account '${owner}' could not be resolved to a numeric uid and gid, so this run cannot set the ownership of ${root} — ${what}. Nothing has been started."
-  # WHERE THE HELPER LIVES: THIS SCRIPT'S OWN lib directory, resolved from BASH_SOURCE at startup —
-  # the release being installed, not ${APP_DIR}. Same rule as db-fence-protected.sh and
-  # pg-auth-request.mjs, and for the same reason. IMS_CHOWN_TREE_HELPER exists for the regressions,
-  # which run the shipped functions outside the shipped file and so have no BASH_SOURCE to resolve
-  # from; pointing it somewhere else produces a different program, not an exemption.
-  helper="${IMS_CHOWN_TREE_HELPER:-${IMS_SCRIPT_LIB_DIR:-}/chown-tree.mjs}"
+  # WHERE THE HELPER LIVES: THE ROOT-OWNED SNAPSHOT THIS RUN PUBLISHED AT STARTUP (o3d-kyqa).
+  #
+  # IT USED TO BE `${IMS_SCRIPT_LIB_DIR}/chown-tree.mjs` — this script's own lib directory, resolved
+  # from BASH_SOURCE — and the argument for that was that the installer is run from the release
+  # being installed rather than from ${APP_DIR}. The argument is about the wrong instant. This line
+  # is reached in section 9, and on the documented update path the tree it resolved from belongs to
+  # ${APP_USER}: install.sh and update.sh both `chown -R` the application directory to the service
+  # account, and docs/installation.md's update command was typed inside it. So root read these bytes
+  # AFTER a build, a stop and a drain, out of a directory the account this very walk is defending
+  # against could write. privileged_helper_path() hands back a path inside a root-owned tree whose
+  # whole-tree digest is re-checked, on this line, against the value published in the same instant as
+  # this file was read. See lib/privileged-helpers.sh for why a pin computed here would not do.
+  #
+  # IMS_CHOWN_TREE_HELPER still exists for the regressions, which run the shipped functions outside
+  # the shipped file and so have no BASH_SOURCE and no startup publication to resolve from. It comes
+  # from the ROOT INVOCATION, like IMS_FENCE_ARTEFACT_SHA256 and for the same reason — `sudo` does
+  # not carry it unless an operator deliberately arranges that — so pointing it somewhere else is a
+  # deliberate operator statement producing a different program, not an exemption.
+  if [[ -n "${IMS_CHOWN_TREE_HELPER:-}" ]]; then
+    helper="${IMS_CHOWN_TREE_HELPER}"
+  else
+    helper="$(privileged_helper_path chown-tree.mjs)" || die \
+      "this run has no root-owned copy of chown-tree.mjs it is willing to execute, so it cannot set the ownership of ${root} — ${what} — and it will not fall back to reading the helper out of a directory the service account owns; the reason is printed above. Nothing has been started."
+  fi
   [[ -f "${helper}" ]] || die \
     "${helper} is missing, so this run cannot set the ownership of ${root} — ${what} — without re-resolving pathnames a compromised service account can rename. It will not do that. Restore the checkout and run the installer again; nothing has been started."
   command -v node >/dev/null 2>&1 || die \
@@ -4511,19 +4651,33 @@ db_endpoint_accepts_password() {
 DB_ROTATION_PROBE_DATABASE=""
 DB_PROBE_REPORT=""
 
-# WHERE THE AUTHENTICATION-REQUEST READER LIVES (o3d-2sm1.5 r41, Codex HIGH).
+# WHERE THE AUTHENTICATION-REQUEST READER LIVES (o3d-2sm1.5 r41, Codex HIGH; o3d-kyqa).
 #
-# ${IMS_SCRIPT_LIB_DIR} is THIS SCRIPT'S OWN lib directory, resolved from BASH_SOURCE at startup —
-# the release being installed, not ${APP_DIR}. That distinction is the whole of r31's finding and
-# it is why db-fence-protected.sh is sourced from there; this helper is held to the same rule. It
-# is also handed NO credential of any kind: it reads one message and drops the connection, so even
-# the hazard that made the fence helper's provenance load-bearing does not arise here.
+# IT USED TO BE ${IMS_SCRIPT_LIB_DIR} — this script's own lib directory, resolved from BASH_SOURCE
+# at startup — on the argument that the installer is run from the release being installed rather
+# than from ${APP_DIR}. r41 was right that the release tree is the more trustworthy of the two and
+# wrong that the distinction is enough: this reader is EXECUTED AS ROOT inside the database gates,
+# a long way into the run, and on the documented update path the tree it resolved from is
+# ${APP_USER}'s. A file read at startup and a file read in section 7 are different statements about
+# who could have written it, and o3d-kyqa is that finding. It now comes out of the root-owned
+# snapshot this run published in the same instant as it read this file, with the whole-tree digest
+# re-checked before the path is handed back.
+#
+# WHAT HAS NOT CHANGED: the reader is handed NO credential of any kind — it reads one message and
+# drops the connection — so the hazard that made the fence helper's provenance load-bearing still
+# does not arise here. What it CAN do is decide whether a credential rotation goes ahead, and that
+# is reason enough not to read it out of a directory the account being questioned owns.
 #
 # IMS_AUTH_REQUEST_PROBE exists for the regressions, which run the shipped functions outside the
-# shipped file and so have no BASH_SOURCE to resolve from. It cannot weaken anything: pointing it
-# somewhere else does not produce an exemption, it produces the refusal below.
+# shipped file and so have no BASH_SOURCE and no startup publication to resolve from. It comes from
+# the root invocation and cannot weaken anything: pointing it somewhere else does not produce an
+# exemption, it produces the refusal at the call site.
 db_auth_request_probe_path() {
-  printf '%s' "${IMS_AUTH_REQUEST_PROBE:-${IMS_SCRIPT_LIB_DIR:-}/pg-auth-request.mjs}"
+  if [[ -n "${IMS_AUTH_REQUEST_PROBE:-}" ]]; then
+    printf '%s' "${IMS_AUTH_REQUEST_PROBE}"
+    return 0
+  fi
+  privileged_helper_path pg-auth-request.mjs
 }
 
 # THE MATCHED METHOD, AS THE SERVER STATED IT — AND THE ROUTE IT WAS STATED ON.
@@ -4561,10 +4715,14 @@ db_endpoint_checks_role_verifier() {
   - '${database}' was not asked which pg_hba rule matches it, because this run cannot say which TRANSPORT the application's own connection takes: ${route}. A pg_hba rule is matched per transport — hostssl and hostnossl are different records — so a method read over an unknown route is not evidence about the connection the application makes."
     return 1
   fi
-  probe="$(db_auth_request_probe_path)"
-  if [[ ! -f "${probe}" ]]; then
+  probe=""
+  # THE STATUS IS CAPTURED, NOT DISCARDED. privileged_helper_path() refuses rather than returning a
+  # path when the snapshot this run published is not standing, and a bare command substitution would
+  # turn that refusal into an empty string and then into a message naming no file at all.
+  probe="$(db_auth_request_probe_path)" || probe=""
+  if [[ -z "${probe}" || ! -f "${probe}" ]]; then
     DB_PROBE_REPORT+="
-  - '${database}' was not asked which pg_hba rule matches it, because the reader that asks — ${probe} — is not there. Without it this run cannot tell a 'scram-sha-256' endpoint from an 'ldap' one, and an ldap endpoint answers about a directory rather than about the password ALTER ROLE writes. Re-run the installer from a complete release checkout."
+  - '${database}' was not asked which pg_hba rule matches it, because the reader that asks — ${probe:-a root-owned copy of pg-auth-request.mjs, which this run could not establish for the reason printed above} — is not there. Without it this run cannot tell a 'scram-sha-256' endpoint from an 'ldap' one, and an ldap endpoint answers about a directory rather than about the password ALTER ROLE writes. Re-run the installer from a complete release checkout."
     return 1
   fi
   if ! command -v node >/dev/null 2>&1; then
@@ -8235,6 +8393,24 @@ readonly DEPLOY_META_FILE="${APP_DIR}/.deploy-meta"
 } | publish_durable_file "${DEPLOY_META_FILE}" "${APP_USER}:${APP_USER}" 600 || die \
   "${DEPLOY_META_FILE} could not be written. Nothing has been stopped and nothing has been migrated; the file at that path is whatever the previous run left there, complete and unchanged — it is published by rename."
 
+# AND THE SAME FACTS, ROOT-OWNED, WHICH IS THE COPY THAT DECIDES (o3d-z5be).
+#
+# ${DEPLOY_META_FILE} supplies the RE-CLONE SOURCE of a production update. update.sh reads it as
+# root, at startup, as data — so no privilege is crossed at the read and none at the clone, which
+# runs as ${APP_USER} — and the account that owns the file still chose where a privileged update
+# fetches the code it is about to install. That is not a thing the application may decide, so the
+# authoritative copy is ${IMS_DRIVER_DEPLOY_META}: root-owned, mode 0600, in a directory nobody but
+# root may write. update.sh prefers it and says so; the file written just above stays for
+# installations whose last install.sh run predates this release, and update.sh names it out loud
+# when it has to fall back to it.
+{
+  echo "INSTALL_FROM_GIT=${INSTALL_FROM_GIT}"
+  echo "GIT_REPO_URL=${GIT_REPO_URL:-}"
+  echo "GIT_BRANCH=${GIT_BRANCH:-}"
+  echo "GIT_DEPLOY_KEY_ENABLED=${GIT_DEPLOY_KEY_ENABLED:-n}"
+} | publish_privileged_deploy_meta || die \
+  "${IMS_DRIVER_DEPLOY_META} could not be written: ${IMS_DRIVER_REASON:-no reason was recorded}. That file is where the NEXT update reads the repository it re-clones from, and the alternative is a file the service account owns. Nothing has been stopped and nothing has been migrated; whatever is at that path is a previous run's copy, complete and unchanged — it is published by rename."
+
 # ---------------------------------------------------------------------------
 # 10. Write .env file
 # ---------------------------------------------------------------------------
@@ -8257,6 +8433,10 @@ CRON_SECRET="$(existing_env CRON_SECRET "$(openssl rand -hex 32)")"
 # silently deletes; losing this one now makes the NEXT upgrade refuse to migrate at all
 # (there is no snapshot-only fallback any more). An explicit value in the environment
 # still wins.
+# AND THE INVOCATION WINS, WHICH IS SAID HERE RATHER THAN LEFT TO BE READ OFF THE `:-` (o3d-xf9m).
+# update.sh states this precedence in words and warns when the two disagree; this line had the same
+# behaviour and no sentence. The order is deliberate: the file is application-owned, and the
+# privileged connection is the one input a recovery is told to supply by hand.
 DEPLOY_ADMIN_DATABASE_URL="$(unquote_env_value "${DEPLOY_ADMIN_DATABASE_URL:-$(existing_env DEPLOY_ADMIN_DATABASE_URL)}")"
 # The last moment before the mint becomes a FACT. Nothing above has been written anywhere — the
 # three values are still only shell variables — and the heredoc below is what commits them. A `.env`

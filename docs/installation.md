@@ -713,8 +713,10 @@ environment variable under `--non-interactive` — still overrides the preserved
 as before. A preserved credential is never echoed as the prompt default: the URL is shown redacted and
 a preserved password is shown as `[unchanged]`.
 
-**A `.env` the installer cannot read is not a `.env` with no secrets.** Only a path with *nothing* at
-all on it is a first install. If `${APP_DIR}/.env` exists but is a directory, a dangling symlink, or
+**A `.env` the installer cannot read is not a `.env` with no secrets, and an absent one is not proof
+of a fresh host either.** A path with nothing at all on it is a first install only when the host and
+the database agree that it is — see *An absent `.env` is not permission to mint* below, which is the
+o3d-xf9m gate. If `${APP_DIR}/.env` exists but is a directory, a dangling symlink, or
 a file this process cannot open or read to the end, the installer **stops** rather than minting fresh
 secrets over a live database. The same applies to a `.env` that was read but is missing any of
 `AUTH_SECRET`, `SETTINGS_ENCRYPTION_KEY` or `CRON_SECRET`: this installer writes all three on every
@@ -1176,11 +1178,28 @@ above is the single enforcement point.
 To update to a newer version:
 
 ```bash
-cd /opt/one-two-inventory
-
-# Preferred: run the bundled update script
-bash scripts/update.sh
+# The root-owned copy of the driver, published by install.sh and refreshed by every
+# successful update. This is the documented command (o3d-z5be).
+sudo bash /etc/ims-cutover-driver/driver/update.sh
 ```
+
+**Run it from there, not from `/opt/one-two-inventory`.** The command used to be
+`cd /opt/one-two-inventory && bash scripts/update.sh`, and that made `root` execute a script — and
+the four shell libraries and two node helpers beside it — out of a directory `imsapp` owns:
+`install.sh` and `update.sh` both `chown -R imsapp /opt/one-two-inventory`. An account that can
+rewrite that checkout rewrote the program `root` was about to run, and could do so *after* the
+operator had started a run they had reason to believe was clean. See
+*The bytes a privileged run executes* below for what is published where, who owns it and what is
+verified before anything is executed.
+
+`/etc/ims-cutover-driver/driver/` holds the release that was **last successfully deployed**, which is
+one release behind the one an update is installing: this run uses the previous driver to deploy the
+new code, and refreshes the copy at the end. That lag is deliberate — a driver that re-executed
+code it had fetched itself minutes earlier would be exactly the defect this arrangement closes.
+
+Running `bash scripts/update.sh` from the checkout still works and is still supported for a host
+that has not been installed by a release carrying this change; it is the unprotected form, and the
+run says so.
 
 **There is no manual equivalent, and this document deliberately no longer offers one.**
 
@@ -1213,9 +1232,10 @@ is adopted by any other. **If an update fails, re-run one of those scripts; do n
 the sequence.** The failure banner names the marker, the fences that are standing and the
 command that releases each, and the next run adopts what the failed one left behind.
 
-To see what a run would do without doing it, `bash scripts/update.sh --dry-run` prints the
-whole plan and changes nothing (and works unprivileged); `bash scripts/deploy.sh --dry-run`
-does the same for a deploy.
+To see what a run would do without doing it, `bash /etc/ims-cutover-driver/driver/update.sh --dry-run`
+prints the whole plan and changes nothing (and works unprivileged — an unprivileged run publishes no
+root-owned snapshot and executes nothing that would need one); `bash scripts/update.sh --dry-run` from
+the checkout does the same. `bash scripts/deploy.sh --dry-run` does the same for a deploy.
 
 ### Deploy order, and what happens on a rollback
 
@@ -2926,13 +2946,182 @@ is classified, the shape's trailing-backslash tail is gone because a logical lin
 one, and the bypass corpus runs through the whole pipeline — scan included — rather than through
 the classifier alone, so a bypass the scan never sees counts as accepted.
 
-**What this does not protect against.** The privileged driver is still `scripts/update.sh` itself,
-run by root from wherever the operator keeps it, and `APP_DIR/.deploy-meta` still supplies the
-re-clone URL — which is data the application account already controls, used only as an argument to
-a `git clone` that runs **as the application user** (passed after `--`, so a value starting with
-`-` cannot become a git option). Neither is a privilege crossing, but neither is a root-owned
-configuration input either. Moving the deployment metadata into a root-owned, non-writable
-location is filed as follow-up work, not done here.
+**The privileged driver and its metadata are now root-owned (o3d-z5be).** This paragraph used to
+record the opposite as a known limitation: `scripts/update.sh` was run by root from wherever the
+operator kept it — which the documented command made `APP_DIR` — and `APP_DIR/.deploy-meta` supplied
+the re-clone URL. Neither was a privilege *crossing* (the clone runs as the application user, with
+`--` before the URL so a value starting with `-` cannot become a git option), and neither was a
+root-owned configuration input either. Both are now published into `/etc/ims-cutover-driver`; see
+*The bytes a privileged run executes* immediately below.
+
+### The bytes a privileged run executes (o3d-kyqa, o3d-z5be)
+
+The rule, stated as a property:
+
+> **No privileged run may execute bytes that an unprivileged account could have changed after the
+> run began.**
+
+That is narrower than "root must only run trusted code", and the narrowing is the point. `install.sh`
+is run by an operator out of a tree they chose, and that choice has always been this repository's
+trust root — nothing on the box can authenticate a checkout, and
+`scripts/lib/pin-source-file.mjs` was deleted in o3d-secops r22 precisely because it claimed to.
+What the rule forbids is the *second* window: bytes read minutes into a run, after a build, a stop
+and a drain, out of a directory the run has itself handed to the service account.
+
+**What is published where.**
+
+```
+/etc/ims-cutover-driver/              root:root 0755   created and owned by root only
+├── helpers/                          root:root 0755   THIS RUN's copy of scripts/lib
+├── helper-set.sha256                 root:root 0644   its whole-tree digest, recipe and sentinel
+├── helper-set.manifest               root:root 0644   per-file digests, for naming what moved
+├── driver/                           root:root 0755   install.sh, update.sh, deploy.sh, lib/
+│   └── lib/                          root:root 0755
+├── driver.sha256  driver.manifest    root:root 0644
+└── deploy-meta                       root:root 0600   GIT_REPO_URL, GIT_BRANCH, deploy-key flag
+```
+
+Inside `helpers/` and `driver/` every file is mode `0644` and every directory `0755`, and everything
+in the whole root is owned by `root` — `imsapp` can read it and change none of it. `deploy-meta` is
+the one exception to the mode, at `0600`: the directory has to be traversable so an operator can
+reach the driver copy, and the metadata is the one thing in there that is nobody else's business.
+
+The root directory's whole ancestry is checked from its parent up to `/` before anything is written.
+Each component must be a real directory, owned by **root or by the account doing the publishing**
+(in production those are the same account — every entrypoint refuses to run as anything but root;
+the disjunction is what lets the test suite exercise the shipped function under a scratch root), and
+not writable by group or other. The **sticky** bit is credited on an *ancestor* and never on the
+immediate parent — sticky means an entry can be renamed only by its owner, so a sticky ancestor
+cannot be used to move our root, while a sticky parent would still let anybody create that name
+first. A host that fails is told **which** component and what to do about it rather than published
+into.
+
+`/etc` is used rather than `/usr/local/lib`, which o3d-z5be proposed, because Debian and Ubuntu ship
+`/usr/local/lib` as `root:staff 2775` — group-writable, which would fail that check on a stock host
+and turn a security fix into an installer that does not run — and because this repository already
+keeps its root-owned executable artefacts under `/etc` (`/etc/ims-cutover-recovery` holds the
+protected fence artefact and the operator wrappers).
+
+**`helpers/` — the run snapshot, and what verifies it.** Each of the three entrypoints copies its own
+`scripts/lib` into `helpers/` **at startup**, in the same instant it reads its own body and sources
+the five shell libraries — the instant the operator accepted when they typed the command. The copy is
+sealed (root-owned, no group or other write, regular files and directories only — a symlink is
+refused, because the manifest hashes regular files and `node` follows links), digested with the same
+recipe the fence artefact uses, and the digest is recorded twice: on disk beside the tree, and **in
+the running shell as a `readonly` variable**.
+
+`privileged_helper_path <name>` is the only way anything names a helper it is about to execute. It
+re-checks the seal, re-takes the whole-tree digest, and compares it against the value *this run*
+published before it hands back a path. The in-memory copy is what a second on-disk record could not
+do: two privileged runs can overlap (the shared cutover lock is taken later than this), so without
+it a run could verify a tree another run had just published and execute its bytes. With it, a
+republication by anybody is a refusal in every run that did not perform it, and `readonly` means
+nothing later in the run can restate the expected value.
+
+Two call sites resolve through it today, and they are the two `o3d-kyqa` named:
+
+| what | when | as whom | resolved from |
+| --- | --- | --- | --- |
+| `chown-tree.mjs` | `install.sh` section 9, after the tree has been `chown -R`'d to `imsapp` | root | `helpers/` |
+| `pg-auth-request.mjs` | `install.sh`, inside the credential-rotation gates | root | `helpers/` |
+
+`IMS_CHOWN_TREE_HELPER` and `IMS_AUTH_REQUEST_PROBE` still override each one. They come from the
+**root invocation** — `sudo` does not carry them unless an operator deliberately arranges it — which
+is the same source of trust as `IMS_FENCE_SCRIPT_SHA256`: pointing one somewhere else is a
+deliberate operator statement producing a different program, not an exemption.
+
+**Everything else the three entrypoints run, and why it is not in that table.** Every other node
+helper they invoke — `check-db-writers.mjs`, `check-prisma-drift.mjs`,
+`check-app-db-object-access.mjs`, `run-migration-verifications.mjs`, `check-wms-push-state-enum.mjs`,
+`provision-instance.mjs` — runs **as the application user** (`run_as_user "$APP_USER"` in
+`install.sh` and `update.sh`, `as_app_user` / `as_app_user_db` in `deploy.sh`), so no privilege is
+crossed however those bytes got there. `fence-db-connections.mjs` runs as the application user *and*
+out of the protected root-owned artefact at `/etc/ims-cutover-recovery/app`. `npm`, `npx prisma` and
+`next` likewise run as the application user. The five `source`s at the top of each entrypoint are
+read at startup, in the same instant as the entrypoint's own body, so they add no window the operator
+did not already accept — and on the documented update command they are read out of a root-owned tree
+in any case.
+
+**An optional pin.** `IMS_HELPER_SET_SHA256=<64 hex>` on the privileged invocation makes the
+publication *authenticate* as well as freeze: the assembled tree must hash to that value or nothing
+is published and nothing is executed. The digest is taken exactly as the fence artefact's is:
+
+```bash
+cd scripts/lib && find . -type f -printf '%P\0' | LC_ALL=C sort -z | xargs -0 -r sha256sum -- | sha256sum
+```
+
+It is optional because the snapshot's job is immutability-after-start, which needs no operator input;
+the pin is how an operator who wants provenance as well gets it, from outside the checkout.
+
+**`driver/` — the deployment driver.** `install.sh` publishes it at startup from the release it is
+installing; a successful `update.sh` refreshes it at the end from the release it has just deployed
+(only once `NEW_BUILD_SERVING` proves the build on disk is the process answering the port). A failure
+to refresh is a **warning**, not a refusal: everything is up, the schema has moved, and there is
+nothing left for a refusal to protect — but the run names the copy that is standing, so it cannot
+pass in silence.
+
+`deploy.sh` deliberately does **not** refresh it. It publishes the run snapshot like the other two,
+so its own late executions are covered, but it deploys whatever is already in `APP_DIR` rather than
+fetching a release — so it has no "release just deployed" to publish, and taking the driver from
+`APP_DIR/scripts` on a deploy would promote bytes nothing had fetched into the copy the next
+privileged run is launched from. The driver moves when a release lands, which is `install.sh` or
+`update.sh`.
+
+On the documented path the refresh **replaces the tree the running `update.sh` was read from**. That
+is safe for a stated reason rather than by luck: bash holds an open descriptor on the script it is
+executing and an unlinked inode stays alive until its last descriptor closes, the five libraries were
+read in full at startup, and nothing below that line reads `IMS_SCRIPT_LIB_DIR` again.
+
+**`deploy-meta` — who reads it, when, and as whom.** `update.sh` reads `GIT_REPO_URL`, `GIT_BRANCH`
+and `GIT_DEPLOY_KEY_ENABLED` out of it **as root, at startup**, key by key through
+`env_file_value()` — as data, never by sourcing it. The `git clone` those values steer runs **as
+`imsapp`**, with `--` before the URL. `install.sh` is the only writer; nothing else on the box reads
+it. `update.sh` prefers the root-owned file and falls back to `APP_DIR/.deploy-meta` only when there
+is no root-owned one — which is the case for an installation whose last `install.sh` run predates
+this release — and it **announces** the fall back, naming the remedy. An unnoticed fall back to the
+file this change exists to stop reading would be the same finding with a longer code path.
+
+**What this still does not protect against, stated rather than papered over.** It does not
+authenticate the checkout. An account that can write `APP_DIR/scripts` *before* a run starts can
+still choose what an operator launches from there, and on the documented command it can still choose
+what a future update deploys by rewriting the tree that `update.sh` will publish as the next driver.
+What is gone is the late window: the bytes root executes at minute twenty are the bytes that were on
+disk at minute zero, and only root can have touched them in between.
+
+### An absent `.env` is not permission to mint (o3d-xf9m)
+
+`load_existing_env()` refuses every hostile shape at `APP_DIR/.env` — a directory, a dangling
+symlink, an unreadable file, a file that could not be read to the end. It used to accept exactly one
+shape as benign: plain **absence**, which is what `rm` produces, on a file `imsapp` owns in a
+directory `imsapp` owns. Absence set `ENV_FILE_STATE=absent`, the preservation gate returned without
+checking anything, and the run minted a fresh `SETTINGS_ENCRYPTION_KEY` over a live database. Every
+encrypted Setting in it is then permanently undecryptable — not a wrong value, a destroyed one.
+
+Absence is nevertheless *legitimate* on a first install, so the fix cannot be a refusal. Minting over
+an absent `.env` is now **earned**, and it takes two positive answers, neither of which the
+application account authors:
+
+1. **Is there an installation on this host?** The same `upgrade_in_place()` this run asks later to
+   decide whether to fence. Its decisive evidence is `/etc/systemd/system/one-two-inventory.service`,
+   a file in a root-owned directory that `imsapp` can neither create nor remove. That account *can*
+   clear its own crontab, delete `APP_DIR/.pm2` and exit its processes — and all that buys is an
+   answer of "nothing here", which is not enough on its own.
+2. **Did this run bring the database into being?** `create_database_and_record_newness()` issues
+   `CREATE DATABASE` unconditionally and lets **the server** answer, reading the server's own identity
+   back on the same connection. `SQLSTATE 42P04` means it was already there.
+
+Why the second answer cannot be spoofed by the same account: it is not a file anywhere, it is what
+PostgreSQL said about whether the database existed an instant before this run. The application role
+cannot make the server answer "created" for a database that is there. The one way to change that
+answer is to **drop the database** — which destroys the encrypted settings this gate exists to
+protect, so the evidence can only be falsified by performing the harm. That is the strongest form
+this evidence can take on a host where one account owns the application's data.
+
+Anything else — including an install against an **external** database, which creates nothing and so
+cannot earn the exemption — is a refusal naming what it found, with the override that already exists
+for the same irreversible act: `IMS_INSTALL_REMINT_SECRETS=yes`. On the supported from-scratch path
+nothing is asked of the operator: `INSTALL_POSTGRES=y` creates the database, there is no unit and no
+crontab, and the run mints.
 
 The binding is **removed on every exit path**: on the success path once the health check is behind
 it, and in the failure trap. A drop-in left standing would override `APP_DIR/.env` for every

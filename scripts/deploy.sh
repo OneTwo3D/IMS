@@ -662,6 +662,27 @@ source "${IMS_SCRIPT_LIB_DIR}/unit-environment.sh" || {
   echo "FATAL: ${IMS_SCRIPT_LIB_DIR}/unit-environment.sh could not be sourced. It is the only thing in this repository that asks systemd what composes a service's environment, and without it this run cannot establish that the file it read is what gives the application its DATABASE_URL. Nothing has been changed." >&2
   exit 1
 }
+# AND THE BYTES THIS RUN MAY EXECUTE AFTER IT HAS STARTED (o3d-kyqa / o3d-z5be). Sourced LAST of
+# the five, because it reuses lib/db-fence-protected.sh's publication primitives rather than
+# restating them: the seal test, the whole-tree manifest, the tree digest and the atomic publisher
+# are that file's, and a second implementation of any of them would be the "one rule, several
+# readers" defect this repository keeps finding.
+# shellcheck source=lib/privileged-helpers.sh
+source "${IMS_SCRIPT_LIB_DIR}/privileged-helpers.sh" || {
+  echo "FATAL: ${IMS_SCRIPT_LIB_DIR}/privileged-helpers.sh could not be sourced. It is the only thing in this repository that publishes a root-owned copy of the helpers a privileged run executes, and without it this run would have to resolve them out of a checkout the service account owns. Nothing has been changed." >&2
+  exit 1
+}
+# AND THE SNAPSHOT IS TAKEN HERE — in the same instant as the four libraries above and as the body
+# of this file, which is the instant the operator accepted when they typed the command. Everything
+# this run executes as root later is resolved out of that snapshot by privileged_helper_path() and
+# re-checked against the digest recorded on this line, so no replacement made after it can reach a
+# privileged exec. An unprivileged run publishes nothing and returns 0 (it executes nothing
+# privileged, so it has nothing to refuse); a privileged run that could NOT publish stops here,
+# before it has changed anything at all.
+publish_privileged_helper_set || {
+  echo "FATAL: the root-owned copy of ${IMS_SCRIPT_LIB_DIR} could not be published to ${IMS_DRIVER_HELPER_DIR}: ${IMS_DRIVER_REASON:-no reason was recorded}. Every node helper this run would otherwise execute as root would have to be read back out of a directory the service account owns, minutes from now; it will not do that. Nothing has been changed." >&2
+  exit 1
+}
 # The lock lives inside the service's systemd StateDirectory, which is the same directory this
 # script already resolves as its cutover state directory — and the same one the application is
 # handed as $STATE_DIRECTORY. The two components come from the library, so no entrypoint has a path

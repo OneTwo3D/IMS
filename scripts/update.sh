@@ -400,11 +400,6 @@ if [[ -n "${_invocation_admin_url}" && -n "${_env_file_admin_url}" && "${_invoca
 fi
 unset _env_file_admin_url _invocation_admin_url
 
-if [[ -f "${DEPLOY_META_FILE}" ]]; then
-  GIT_REPO_URL="$(env_file_value GIT_REPO_URL "${DEPLOY_META_FILE}")"
-  GIT_BRANCH="$(env_file_value GIT_BRANCH "${DEPLOY_META_FILE}")"
-  GIT_DEPLOY_KEY_ENABLED="$(env_file_value GIT_DEPLOY_KEY_ENABLED "${DEPLOY_META_FILE}")"
-fi
 
 # ---------------------------------------------------------------------------
 # THE PORT THE HEALTH CHECK WILL POLL — READ EARLY, DECIDED BY THE UNIT (o3d-2sm1.5 r27,
@@ -802,6 +797,64 @@ source "${IMS_SCRIPT_LIB_DIR}/unit-environment.sh" || {
   echo "FATAL: ${IMS_SCRIPT_LIB_DIR}/unit-environment.sh could not be sourced. It is the only thing in this repository that asks systemd what composes a service's environment, and without it this run cannot establish that the file it read is what gives the application its DATABASE_URL. Nothing has been changed." >&2
   exit 1
 }
+# AND THE BYTES THIS RUN MAY EXECUTE AFTER IT HAS STARTED (o3d-kyqa / o3d-z5be). Sourced LAST of
+# the five, because it reuses lib/db-fence-protected.sh's publication primitives rather than
+# restating them: the seal test, the whole-tree manifest, the tree digest and the atomic publisher
+# are that file's, and a second implementation of any of them would be the "one rule, several
+# readers" defect this repository keeps finding.
+# shellcheck source=lib/privileged-helpers.sh
+source "${IMS_SCRIPT_LIB_DIR}/privileged-helpers.sh" || {
+  echo "FATAL: ${IMS_SCRIPT_LIB_DIR}/privileged-helpers.sh could not be sourced. It is the only thing in this repository that publishes a root-owned copy of the helpers a privileged run executes, and without it this run would have to resolve them out of a checkout the service account owns. Nothing has been changed." >&2
+  exit 1
+}
+# AND THE SNAPSHOT IS TAKEN HERE — in the same instant as the four libraries above and as the body
+# of this file, which is the instant the operator accepted when they typed the command. Everything
+# this run executes as root later is resolved out of that snapshot by privileged_helper_path() and
+# re-checked against the digest recorded on this line, so no replacement made after it can reach a
+# privileged exec. An unprivileged run publishes nothing and returns 0 (it executes nothing
+# privileged, so it has nothing to refuse); a privileged run that could NOT publish stops here,
+# before it has changed anything at all.
+publish_privileged_helper_set || {
+  echo "FATAL: the root-owned copy of ${IMS_SCRIPT_LIB_DIR} could not be published to ${IMS_DRIVER_HELPER_DIR}: ${IMS_DRIVER_REASON:-no reason was recorded}. Every node helper this run would otherwise execute as root would have to be read back out of a directory the service account owns, minutes from now; it will not do that. Nothing has been changed." >&2
+  exit 1
+}
+
+# AND THE DEPLOYMENT METADATA IS RESOLVED HERE, not three hundred lines above (o3d-z5be). The read
+# used to sit beside the .env reads at the top of this file, and it has to move down to here for one
+# reason: privileged_deploy_meta_path() is defined by the library sourced immediately above, so a
+# call before that line is `command not found` — which this file's `|| DEPLOY_META_SOURCE=""` would
+# have turned into a silent fall back to the application-owned file, i.e. into the defect wearing the
+# fix's clothes. Nothing between the old position and this one reads GIT_REPO_URL, GIT_BRANCH or
+# GIT_DEPLOY_KEY_ENABLED; the clone that does is four thousand lines below.
+# WHICH FILE ANSWERS, AND IT IS A DECISION RATHER THAN A FALLBACK (o3d-z5be).
+#
+# These three values steer the RE-CLONE of a production update: GIT_REPO_URL is the repository the
+# code being installed comes from. They are read as DATA through env_file_value(), key by key, and
+# never by sourcing — and the clone runs as ${APP_USER} with `--` before the URL, so no privilege is
+# crossed at either step. What was still wrong is WHOSE ANSWER IT IS: ${APP_DIR}/.deploy-meta is in a
+# directory ${APP_USER} owns, so the account the update is installing over chose where the update
+# fetched from.
+#
+# install.sh now writes the same facts to ${IMS_DRIVER_DEPLOY_META}, root-owned and 0600, and that is
+# the copy read here. The application-owned file is still read when there is no root-owned one — an
+# installation whose last install.sh run predates this release has none, and refusing it would strand
+# every such host — but the fall back is ANNOUNCED. An unnoticed fall back to the file this change
+# exists to stop reading would be the finding with a longer code path.
+DEPLOY_META_SOURCE=""
+DEPLOY_META_SOURCE="$(privileged_deploy_meta_path)" || DEPLOY_META_SOURCE=""
+if [[ -z "${DEPLOY_META_SOURCE}" ]]; then
+  if [[ -f "${DEPLOY_META_FILE}" ]]; then
+    DEPLOY_META_SOURCE="${DEPLOY_META_FILE}"
+    warn "Reading the re-clone source from ${DEPLOY_META_FILE}, which ${APP_USER} owns. Why there is no root-owned copy is printed above."
+    warn "Re-run scripts/install.sh from the release once and this becomes ${IMS_DRIVER_DEPLOY_META},"
+    warn "which only root can write. Until then GIT_REPO_URL is a value the application account can change."
+  fi
+fi
+if [[ -n "${DEPLOY_META_SOURCE}" ]]; then
+  GIT_REPO_URL="$(env_file_value GIT_REPO_URL "${DEPLOY_META_SOURCE}")"
+  GIT_BRANCH="$(env_file_value GIT_BRANCH "${DEPLOY_META_SOURCE}")"
+  GIT_DEPLOY_KEY_ENABLED="$(env_file_value GIT_DEPLOY_KEY_ENABLED "${DEPLOY_META_SOURCE}")"
+fi
 # The lock lives inside the service's systemd StateDirectory, which is ${DATA_DIR} — the same path
 # scripts/install.sh writes into the unit as StateDirectory= and the same one the application is
 # handed as $STATE_DIRECTORY. The two components come from the library.
@@ -4889,7 +4942,7 @@ if ! $NO_GIT; then
         --oneline --max-count 20 "${CURRENT_COMMIT}..${NEW_COMMIT}"
     fi
   else
-    [[ -n "${GIT_REPO_URL:-}" ]] || die "No git checkout and no GIT_REPO_URL in ${DEPLOY_META_FILE}. Use --no-git to skip."
+    [[ -n "${GIT_REPO_URL:-}" ]] || die "No git checkout and no GIT_REPO_URL in ${DEPLOY_META_SOURCE:-${IMS_DRIVER_DEPLOY_META} or ${DEPLOY_META_FILE}}. Use --no-git to skip."
     GIT_BRANCH="${GIT_BRANCH:-main}"
 
     TMP_CLONE_DIR="$(mktemp -d -t ims-update.XXXXXX)"
@@ -5540,6 +5593,45 @@ run rm -f "${FENCE_FILE}"
 
 # The cleanup this flag covered is complete, so it stands down — and only now.
 FENCE_ARMED=false
+
+# THE ROOT-OWNED DRIVER IS REFRESHED FROM THE RELEASE THAT HAS JUST BEEN DEPLOYED (o3d-z5be).
+#
+# HERE AND NOT EARLIER, and never from the tree this run was launched out of. The documented update
+# command is ${IMS_DRIVER_PROGRAM_DIR}/update.sh, so a run that published at startup would publish
+# the copy it is already running and the root-owned driver would freeze at the release install.sh
+# last saw. What tracks the deployment is the checkout that is now serving, and it is only now that
+# this run can say it serves: ${NEW_BUILD_SERVING} was false until the build on disk was shown to be
+# the process answering the port.
+#
+# SO THE DRIVER IS ALWAYS ONE RELEASE BEHIND WHAT IT DEPLOYS, deliberately and documented in
+# docs/installation.md. This run used the previous release's driver to install this one; the next run
+# uses this one. That is the price of not letting a privileged run re-exec bytes it fetched itself a
+# few minutes earlier, which is the defect this whole change is about.
+#
+# AND A FAILURE HERE IS A WARNING, NOT A REFUSAL. Everything is up, the schema has moved and the
+# point of no return is behind us; there is nothing left that a `die` would protect, and the run
+# would report failure for a deployment that succeeded. What it must not do is pass in silence, so
+# the warning says exactly which command the next update should be typed as.
+#
+# AND YES, ON THE DOCUMENTED PATH THIS REPLACES THE TREE THIS SCRIPT WAS LAUNCHED FROM. The
+# publication renames the old ${IMS_DRIVER_PROGRAM_DIR} aside and removes it, and this shell's own
+# file is inside it. That is safe and is safe for a reason rather than by luck: bash holds an open
+# descriptor on the script it is executing, and an unlinked inode stays alive until its last
+# descriptor closes — so this run goes on reading the bytes it started with, which is the same
+# property the whole change rests on. The five libraries were read in full at startup. NOTHING BELOW
+# THIS LINE READS ${IMS_SCRIPT_LIB_DIR} AGAIN; the startup snapshot is what every later resolution
+# goes through, and it was taken before this.
+CURRENT_STEP="publish-driver"
+if ! $DRY_RUN; then
+  if publish_privileged_driver "${APP_DIR}/scripts"; then
+    success "The root-owned deployment driver at ${IMS_DRIVER_PROGRAM_DIR} now holds this release (${IMS_DRIVER_PUBLISHED_DIGEST})."
+  else
+    warn "The root-owned deployment driver at ${IMS_DRIVER_PROGRAM_DIR} was NOT refreshed: ${IMS_DRIVER_REASON:-the reason is printed above}."
+    warn "This deployment is complete and serving. The copy standing there is the previous release's,"
+    warn "which is what the next update will run; that is supported, and running the next update out of"
+    warn "${APP_DIR} instead is what this publication exists to avoid."
+  fi
+fi
 
 DEPLOY_OK=true
 

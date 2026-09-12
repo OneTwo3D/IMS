@@ -8367,6 +8367,11 @@ test('update.sh never reads a shell variable that only the deleted `source` coul
     // ENV_VAR_SOURCE_REASON, BUS_STRINGS, BUS_ENV_IGNORE_FLAGS and DB_IDENTITY_REQUIRE_SNAPSHOT,
     // which update.sh expands with no default — so leaving it out reports them as unsupplied.
     ...readFileSync(join(process.cwd(), 'scripts/lib/unit-environment.sh'), 'utf8').split(/\r?\n/),
+    // …and the privileged-helper publication, sourced by all three since o3d-kyqa. It assigns
+    // IMS_DRIVER_HELPER_DIR, IMS_DRIVER_PROGRAM_DIR, IMS_DRIVER_DEPLOY_META, IMS_DRIVER_REASON and
+    // IMS_DRIVER_PUBLISHED_DIGEST, which update.sh expands with no default in its refusals and its
+    // driver-refresh report — so leaving it out reports five names as unsupplied.
+    ...readFileSync(join(process.cwd(), 'scripts/lib/privileged-helpers.sh'), 'utf8').split(/\r?\n/),
   ]
   const label = 'update.sh'
   const code = [...UPDATE_LINES, ...LIBRARY_LINES].filter((line) => !/^\s*#/.test(line))
@@ -8439,7 +8444,10 @@ test('every entrypoint defines what the shared fence library reads', () => {
   // BOTH shared libraries, for the same reason (o3d-p9dq added the second): each is sourced by
   // all three entrypoints and each expands names the entrypoint must supply — DB_FENCE_SCRIPT for
   // the fence, APP_USER for the crontab lock's refusal messages.
-  const libCode = ['scripts/lib/db-fence-protected.sh', 'scripts/lib/crontab-lock.sh', 'scripts/lib/unit-environment.sh']
+  // …and the privileged-helper publication (o3d-kyqa), which expands ${IMS_SCRIPT_LIB_DIR} — the
+  // one thing it must not decide for itself, exactly as the fence library must not decide
+  // ${DB_FENCE_SCRIPT}.
+  const libCode = ['scripts/lib/db-fence-protected.sh', 'scripts/lib/crontab-lock.sh', 'scripts/lib/unit-environment.sh', 'scripts/lib/privileged-helpers.sh']
     .flatMap((rel) => readFileSync(join(process.cwd(), rel), 'utf8').split(/\r?\n/))
     .filter((line) => !/^\s*#/.test(line))
 
