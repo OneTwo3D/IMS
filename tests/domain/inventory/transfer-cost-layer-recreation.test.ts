@@ -278,10 +278,12 @@ for (const path of CALL_PATHS) {
   test(`a negative-cost snapshot entry is REFUSED on the ${path.name} path, with nothing created (o3d-gd2f)`, async () => {
     // Round 3 skipped the entry, leaving the caller's already-committed stock
     // increment unlayered. Round 4 created the layer at the negative cost, which the
-    // downstream cannot represent: buildStockMovementValueFieldsFromTotal abs()es the
-    // movement total (stock-movement-value.ts:75), so a -£4 layer books a +£4
-    // TRANSFER_IN, and both connector daily syncs emit the COGS pair only when the
-    // batch total is above zero (xero/daily-sync.ts:1970, quickbooks/daily-sync.ts:1197).
+    // downstream cannot represent. Two of the three reasons are now fixed: the movement
+    // builder used to abs() the total (so a -£4 layer booked a +£4 TRANSFER_IN) and now
+    // refuses a negative implied unit cost instead, on the from-total and from-consumed
+    // forms alike (o3d-gd2f). The third stands: both connector daily syncs emit the COGS
+    // pair only when the batch total is above zero (xero/daily-sync.ts:2104 and :2144,
+    // quickbooks/daily-sync.ts:1324 and :1354), and log no skip when they do not.
     // Round 5 refuses, and refusing is only safe because NOTHING is written.
     const { store, tx } = createStore(false)
 

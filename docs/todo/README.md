@@ -20,6 +20,10 @@ For plans that have shipped end-to-end, see `docs/completed/`.
 - [`WC-followup-plan.md`](WC-followup-plan.md) — WooCommerce work remaining after the webhook-first shift. **Phases 1–4 closed; Phase 5 (sweep `wc_*` bindings behind generic selectors) open.**
 - [`xero-followup-plan.md`](xero-followup-plan.md) — Xero connector boundary work needed before a clean swap to a different accounting connector. **Items 1–3 in progress, 5–7 open.**
 
+### Inventory costing / landed cost
+
+- [`negative-basis-cost-layers-decision.md`](negative-basis-cost-layers-decision.md) — whether to support credit-derived (negative-basis) FIFO cost layers end to end, so movement value, FIFO, COGS and both connector journals agree on sign (`o3d-gd2f`, blocking P1 `o3d-eiuo`). **Decision document only — awaiting owner authorisation. The narrow sign defect in the movement-value builder is fixed; the connector-journal half is deliberately not implemented.**
+
 ### Future modules
 
 - [`voucher-credit-system-plan.md`](voucher-credit-system-plan.md) — unified gift card / store credit / loyalty module with external ledger sync. **Design baseline only; no code yet.**

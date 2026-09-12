@@ -117,6 +117,84 @@ test('stock movement value fields normalize negative quantities to movement magn
   )
 })
 
+// o3d-gd2f. Four subsystems disagreed about the sign of a credit-derived
+// (negative-basis) cost layer: the movement value absolutised it, cogs_entries kept it,
+// and both connector journals emit a COGS pair only above zero. These pin the ONE thing
+// that is well-defined without deciding how a negative basis should behave: the builder
+// must not silently discard the sign the caller established. The sibling
+// buildStockMovementValueFields has always thrown on a negative unit cost; the
+// from-total form now enforces the same invariant.
+
+test('o3d-gd2f: a positive quantity with a negative total is REFUSED, not absolutised', () => {
+  // On the pre-fix builder this returned { unitCostBase: '2.500000', totalValueBase:
+  // '10.000000' } — a -£10 basis booked as a +£10 movement that looks entirely ordinary.
+  assert.throws(
+    () => buildStockMovementValueFieldsFromTotal({ qty: 4, totalValueBase: -10 }),
+    (error: unknown) => {
+      assert.ok(error instanceof Error, `expected an Error, got ${String(error)}`)
+      assert.match(error.message, /unit cost must be zero or greater/)
+      // The message must name the offending pair, or an operator cannot act on it.
+      assert.match(error.message, /-10\.000000/)
+      assert.match(error.message, /4\.000000/)
+      return true
+    },
+  )
+})
+
+test('o3d-gd2f: an inconsistent negative-quantity/positive-total pair is REFUSED', () => {
+  // The mirror of the case above. qty is a magnitude (a negative stored qty is itself a
+  // CRITICAL stock_movement_negative_quantity invariant finding), so this pair is
+  // incoherent rather than an outbound convention, and the implied unit cost is negative.
+  assert.throws(
+    () => buildStockMovementValueFieldsFromTotal({ qty: -4, totalValueBase: 10 }),
+    /unit cost must be zero or greater/,
+  )
+})
+
+test('o3d-gd2f: FIFO consumption of a negative-cost layer is REFUSED at the shared builder', () => {
+  // The path the round-5 transfer-receipt refusal never covered: a layer already carrying
+  // a negative unitCostBase (recalculateLandedCosts distributes credit freight lines with
+  // no positivity filter and grossUnitCostBase has no floor) being consumed by an ordinary
+  // sale, TRANSFER_OUT, supplier return, manufacturing run or stock adjustment. Pre-fix
+  // this produced a POSITIVE movement value while cogsEntryDataFromConsumed wrote the same
+  // consumption NEGATIVE into cogs_entries.
+  assert.throws(
+    () => buildStockMovementValueFieldsFromConsumed([
+      { qty: new Prisma.Decimal('4'), unitCostBase: new Prisma.Decimal('-1') },
+    ], new Prisma.Decimal('4')),
+    /unit cost must be zero or greater/,
+  )
+})
+
+test('o3d-gd2f: a mixed-cost consumption that still NETS positive is unaffected', () => {
+  // The refusal must be about the net basis, not about any negative appearing anywhere:
+  // this is the precondition that proves the guard is not simply rejecting everything.
+  const fields = buildStockMovementValueFieldsFromConsumed([
+    { qty: new Prisma.Decimal('4'), unitCostBase: new Prisma.Decimal('3') },
+    { qty: new Prisma.Decimal('1'), unitCostBase: new Prisma.Decimal('-1') },
+  ], new Prisma.Decimal('5'))
+  // net total 11 over 5 units → 2.200000, and the DB CHECK still holds.
+  assert.deepEqual(fields, { unitCostBase: '2.200000', totalValueBase: '11.000000' })
+  const dbCheck = new Prisma.Decimal('5').mul(fields.unitCostBase).toDecimalPlaces(6).toFixed(6)
+  assert.equal(fields.totalValueBase, dbCheck)
+})
+
+test('o3d-gd2f: zero-value and zero-cost movements are still accepted', () => {
+  // The other half of "the guard is not vacuous the other way": a £0 balancing layer
+  // (the transfer helper's BALANCE_AT_ZERO_COST policy) and the historical-import
+  // zero-cost sentinel must both keep working.
+  assert.deepEqual(
+    buildStockMovementValueFieldsFromTotal({ qty: 7, totalValueBase: 0 }),
+    { unitCostBase: '0.000000', totalValueBase: '0.000000' },
+  )
+  assert.deepEqual(
+    buildStockMovementValueFieldsFromConsumed([
+      { qty: new Prisma.Decimal('2'), unitCostBase: new Prisma.Decimal('0') },
+    ], new Prisma.Decimal('2')),
+    { unitCostBase: '0.000000', totalValueBase: '0.000000' },
+  )
+})
+
 test('stock movement value fields reject negative unit costs', () => {
   assert.throws(
     () => buildStockMovementValueFields({ qty: 1, unitCostBase: -1 }),

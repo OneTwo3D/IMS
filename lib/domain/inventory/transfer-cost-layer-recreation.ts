@@ -73,21 +73,36 @@
  *  - But NOTHING DOWNSTREAM CAN CARRY THE SIGN. Round 4 created the layer at the
  *    negative cost to conserve basis as well as quantity. That conserves the layer
  *    and corrupts the ledger, more quietly than the skip did:
- *      · `buildStockMovementValueFieldsFromTotal`
- *        (lib/domain/inventory/stock-movement-value.ts:75) applies `.abs()` to the
+ *      · `buildStockMovementValueFieldsFromTotal` used to apply `.abs()` to the
  *        requested total, and all four callers hand it the matching negative
- *        snapshot total. A −£4 layer therefore books a +£4 TRANSFER_IN movement,
- *        which looks entirely ordinary.
+ *        snapshot total, so a −£4 layer booked a +£4 TRANSFER_IN movement that
+ *        looked entirely ordinary. THAT PART IS NOW FIXED: the builder REFUSES a
+ *        negative implied unit cost instead of absolutising it (o3d-gd2f, see
+ *        `buildStockMovementValueFieldsFromTotal` in
+ *        lib/domain/inventory/stock-movement-value.ts). It is the same refusal as
+ *        this one, at the choke point every costed movement passes through — which
+ *        matters because THIS helper only ever guarded the transfer-receipt
+ *        re-layering path, and a negative layer written directly by
+ *        `recalculateLandedCosts` reaches FIFO consumption (sales dispatch,
+ *        TRANSFER_OUT, supplier return, manufacturing, adjustment) without coming
+ *        anywhere near here.
  *      · A later FIFO consumption of that layer goes through the same builder via
- *        `buildStockMovementValueFieldsFromConsumed`, so the movement value is
- *        positive while the shipment's own COGS stays negative.
- *      · Both connector journal paths emit the COGS pair only when the batch total
- *        is greater than zero (lib/connectors/xero/daily-sync.ts:1970,
- *        lib/connectors/quickbooks/daily-sync.ts:1197), so a credit-derived COGS is
- *        mis-stated or dropped entirely rather than posted.
+ *        `buildStockMovementValueFieldsFromConsumed`, which now refuses too. Before
+ *        that, the movement value was positive while the `cogs_entries` rows written
+ *        for the same consumption kept the negative sign.
+ *      · STILL OPEN, and the reason a negative basis must not exist yet: both
+ *        connector journal paths emit the COGS pair only when the batch total is
+ *        greater than zero (lib/connectors/xero/daily-sync.ts:2104 and :2144,
+ *        lib/connectors/quickbooks/daily-sync.ts:1324 and :1354), so a credit-derived
+ *        COGS is dropped entirely rather than posted, and no sync-log row records the
+ *        skip. A landed-cost recalc can drive an ALREADY-SHIPPED line's
+ *        `costLayerSnapshot` negative (`updateSnapshotsForCostLayerChange` patches
+ *        `shipment_lines` too), so the daily batch can meet a negative total with no
+ *        movement builder in the path at all — neither refusal covers that.
  *    Supporting a negative basis means making the movement, FIFO, COGS and both
  *    connector-journal paths agree on sign. That is a large change to money code and
- *    is not this branch's subject; it is filed as o3d-gd2f with these findings.
+ *    is not this branch's subject; it is filed as o3d-gd2f with these findings, and
+ *    scoped in docs/todo/negative-basis-cost-layers-decision.md.
  *  - So the helper REFUSES. It commits nothing, so it cannot leave unlayered stock
  *    (the round-4 defect), cannot book a wrong movement and cannot suppress a
  *    journal line. It fails where an operator can see it, and the action is real:
@@ -593,10 +608,9 @@ export async function recreateTransferCostLayersFromSnapshotSlice(
           .map((offender) => `entry #${offender.index} from source layer ${offender.sourceCostLayerId} — ` +
             `${offender.qty} units at ${offender.unitCostBase}/unit`)
           .join('; ') +
-        `. A negative basis cannot be represented downstream: buildStockMovementValueFieldsFromTotal ` +
-        `absolutises the movement total, so the layer would book a POSITIVE TRANSFER_IN, and the Xero and ` +
-        `QuickBooks daily syncs emit a COGS journal pair only when the batch total is above zero, so the ` +
-        `credit would be mis-stated or dropped. Nothing has been created and this transaction has been ` +
+        `. A negative basis cannot be represented downstream: the Xero and QuickBooks daily syncs emit a ` +
+        `COGS journal pair only when the batch total is above zero, so a credit-derived COGS would be ` +
+        `dropped with no sync-log row recording the skip. Nothing has been created and this transaction has been ` +
         `aborted. The thing to correct is the credit freight line that drove this layer's cost negative ` +
         `(6oyu.19 / o3d-gd2f; production prevalence is o3d-e65p).`,
     })

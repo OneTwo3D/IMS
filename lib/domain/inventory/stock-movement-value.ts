@@ -67,14 +67,61 @@ export function buildStockMovementValueFields(params: {
   }
 }
 
+/**
+ * REFUSES A NEGATIVE IMPLIED UNIT COST rather than absolutising it (o3d-gd2f).
+ *
+ * A movement's `qty` is a MAGNITUDE — direction lives in `fromWarehouseId` /
+ * `toWarehouseId`, and a negative stored qty is itself a CRITICAL inventory-invariant
+ * finding (`stock_movement_negative_quantity`, lib/domain/inventory/invariants.ts:824).
+ * So `qty` is absolutised here, as it always was, and a caller may still express an
+ * outbound movement as the CONSISTENT pair (negative qty, negative total): the implied
+ * unit cost is then positive and the result is unchanged.
+ *
+ * What used to happen, and was wrong, is the INCONSISTENT pair — a positive qty with a
+ * negative total, i.e. a genuinely negative basis. `.abs()` on the total silently
+ * discarded that sign, so a −£4 layer booked a +£4 movement that looked entirely
+ * ordinary, while the `cogs_entries` rows written for the SAME consumption kept the
+ * negative sign (`cogsEntryDataFromConsumed`, lib/cost-layers.ts:280-281). The movement
+ * ledger and the COGS subledger disagreed in sign, silently.
+ *
+ * The sibling `buildStockMovementValueFields` above has always REFUSED a negative unit
+ * cost outright. This form now enforces the same invariant instead of hiding a
+ * violation of it: it is the same refusal the transfer-receipt re-layering helper makes
+ * (`NegativeCostSnapshotEntryError` in lib/domain/inventory/transfer-cost-layer-recreation.ts),
+ * applied at the choke point EVERY costed movement passes through, so the paths that
+ * helper never covered — sales dispatch, TRANSFER_OUT, supplier return, manufacturing
+ * consumption, stock adjustment — fail loudly rather than mis-state.
+ *
+ * THIS IS NOT NEGATIVE-BASIS SUPPORT and deliberately does not decide what one should
+ * mean. Representing a credit-derived basis end to end (signed movement values, a
+ * credit COGS journal pair in both connectors) is o3d-gd2f / docs/todo/
+ * negative-basis-cost-layers-decision.md, and is not authorised. Until it is, the
+ * correct outcome for a negative basis is a visible failure where an operator can act
+ * on the credit cost line that caused it.
+ */
 export function buildStockMovementValueFieldsFromTotal(params: {
   qty: DecimalInput
   totalValueBase: DecimalInput
 }): StockMovementValueFields {
-  const qty = toDecimal(params.qty).abs()
-  const requestedTotal = roundMovementValue(params.totalValueBase).abs()
+  const signedQty = toDecimal(params.qty)
+  const signedTotal = roundMovementValue(params.totalValueBase)
+  const qty = signedQty.abs()
+  const requestedTotal = signedTotal.abs()
   if (qty.isZero() && !requestedTotal.isZero()) {
     throw new Error('Stock movement total value requires a non-zero quantity')
+  }
+  // Derived from the SIGNED operands, so the sign the caller established survives long
+  // enough to be judged. Both-negative (an outbound pair) divides to a positive cost and
+  // passes; a sign disagreement is a negative basis and is refused.
+  if (qty.gt(0) && signedTotal.div(signedQty).lt(0)) {
+    throw new Error(
+      'Stock movement unit cost must be zero or greater: total value ' +
+      `${signedTotal.toFixed(6)} over quantity ${signedQty.toFixed(6)} implies a NEGATIVE unit cost. ` +
+      'A credit-derived (negative-basis) cost layer cannot be represented downstream — the movement ' +
+      'ledger would carry the positive absolute value while cogs_entries keeps the negative sign, and ' +
+      'the Xero and QuickBooks daily syncs emit a COGS journal pair only when the batch total is above ' +
+      'zero. Correct the credit cost line that drove the basis negative (o3d-gd2f).',
+    )
   }
   const unitCostBase = qty.gt(0)
     ? roundMovementValue(requestedTotal.div(qty))
@@ -101,6 +148,14 @@ export function buildStockMovementValueFieldsFromConsumed(
   // FIFO consumption normally supplies positive quantities. Empty input is a
   // valid legacy-stock path and records zero value; mixed-sign entries are
   // treated as net weighted cost for defensive correction callers.
+  //
+  // o3d-gd2f: a consumed layer whose unitCostBase is NEGATIVE makes the net total
+  // negative, and the delegation below therefore REFUSES it rather than absolutising
+  // it. That is deliberate: this function's callers write `cogs_entries` from the same
+  // `consumed` array via `cogsEntryDataFromConsumed`, which keeps the sign, so
+  // absolutising here put the movement ledger and the COGS subledger in disagreement
+  // for one consumption. The refusal lives in the delegate so every caller of either
+  // form gets it.
   const totalQty = consumed.reduce((sum, entry) => sum.add(entry.qty), toDecimal(0))
   const totalValueBase = consumed.reduce(
     (sum, entry) => sum.add(multiplyMoney(entry.qty, entry.unitCostBase)),
