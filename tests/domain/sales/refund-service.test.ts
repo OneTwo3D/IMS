@@ -23,6 +23,11 @@ import type { AccountingSettings } from '@/lib/accounting'
 import { adapterUniqueViolation } from '@/tests/helpers/prisma-unique-error'
 import { takeShipmentAccountedEntries } from '@/lib/connectors/xero/daily-sync'
 import { toDecimal } from '@/lib/domain/math/decimal'
+// o3d-i0o6 r2: the DECLARED allocation rewrite, imported so the cleared-stamp state below is
+// PRODUCED by the code that produces it in production rather than written onto a fixture by hand.
+// A hand-written row would prove the refund handles a shape; driving the rewrite proves the shape
+// is one an ordinary allocation edit actually leaves behind.
+import { resetAllocationAccountingIfStaged } from '@/lib/domain/sales/allocation-service'
 
 type Order = {
   id: string
@@ -63,11 +68,45 @@ type Order = {
   allocationBatchSyncLogId?: string | null
   allocationBatchConnector?: string | null
   allocationBatchAccountCode?: string | null
+  /**
+   * o3d-i0o6 r3: the PASS HISTORY behind `allocationBatchAmount`, which is cumulative across A2
+   * passes while the three columns above describe the latest one. Left unset, `a2PassHistory` below
+   * derives the single-pass history the fixture is describing; set it explicitly (including to
+   * `null`) for the multi-pass and no-history cases.
+   */
+  allocationBatchPasses?: unknown
   // o3d-0i5y r12 / o3d-xlk7: the running total of pounds ALLOCATION_REVERSAL journals have already
   // credited back out of Allocated Inventory for this order — units orphaned off it, which neither
   // Group B nor a refund will ever describe. Optional, because it is null on every order until one
   // is raised.
   allocationReversalAmount?: number | null
+}
+
+/**
+ * o3d-i0o6 r3 — THE PASS HISTORY A FIXTURE IS DESCRIBING WHEN IT DOES NOT DESCRIBE ONE.
+ *
+ * Production reads `SalesOrder.allocationBatchPasses` — one entry per Group A2 pass — because
+ * `allocationBatchAmount` accumulates across passes while the three attribution columns beside it
+ * are replaced by the latest. Almost every fixture in this file describes an order A2 staged ONCE,
+ * and spelling the one-entry list out at each of them would say the same thing thirty times.
+ *
+ * So it is derived, and ONLY where the fixture names a journal: an order with an amount and no
+ * journal id is the pre-attribution legacy row those fixtures exist to model, and synthesising a
+ * pass for it would invent an attribution the row has never had. An explicit
+ * `allocationBatchPasses` (including `null`) always wins, which is how the multi-pass cases below
+ * say something this default cannot.
+ */
+function a2PassHistory(order: Order): unknown {
+  if (order.allocationBatchPasses !== undefined) return order.allocationBatchPasses
+  if (!order.allocationBatchSyncLogId) return null
+  return [{
+    amount: String(order.allocationBatchAmount ?? 0),
+    syncLogId: order.allocationBatchSyncLogId,
+    connector: order.allocationBatchConnector ?? null,
+    accountCode: order.allocationBatchAccountCode ?? null,
+    batchRef: order.inventoryAllocatedBatchRef ?? null,
+    at: null,
+  }]
 }
 
 type LineTaxRate = { accountingTaxType: string | null; reverseCharge: boolean | null }
@@ -513,7 +552,27 @@ function createClient(state: State): RefundServiceClient {
             })),
           }
         }
-        return order
+        // o3d-i0o6 r6 — AND THIS BRANCH HONOURS THE SELECT TOO, for the same reason the one above
+        // it does. It used to hand back the whole fixture row whatever was asked for, so "the query
+        // selected the column" and "the query did not" were the same answer — and this is the branch
+        // the A2 attribution read (`stagedA2`) lands on. Deleting `allocationBatchPasses: true` from
+        // that select would make every refund's allocation credit silently withheld in production
+        // (undefined -> no history -> `unattributed`) and fail nothing here.
+        //
+        // A selected scalar the fixture does not carry reads as NULL (absent), never as undefined,
+        // which is the same rule the allocations branch above states.
+        const projected = Object.fromEntries(
+          Object.entries(select ?? {})
+            .filter(([, value]) => value === true)
+            .map(([key]) => [key, (order as unknown as Record<string, unknown>)[key] ?? null]),
+        )
+        const selectedNothing = Object.keys(projected).length === 0
+        return {
+          ...(selectedNothing ? order : projected),
+          ...('allocationBatchPasses' in projected || selectedNothing
+            ? { allocationBatchPasses: a2PassHistory(order) }
+            : {}),
+        }
       },
       update: async ({ where, data }: { where: { id: string }; data: Partial<Order> }) => {
         const order = state.orders.find((row) => row.id === where.id)
@@ -2931,12 +2990,19 @@ test('createSalesOrderRefund clears accounting deferral dates for full refunds',
     payload: { lines: [{ accountCode: '1210', credit: 20 }] },
   })
 
+  // o3d-i0o6 r3: this fixture's A2 debit is a PROVED one — one pass, one SYNCED journal, this
+  // ledger. Before r3 it leaned on `unattributed` handing back the recorded figure, which no
+  // longer authorises a credit.
+  withRecordedA2Journal(state, { status: 'SYNCED' })
   const result = await createSalesOrderRefund(createClient(state), {
     orderId: 'order-1',
     lines: [{ lineId: 'line-1', productId: 'product-1', description: 'Product 1', qty: 2, totalBase: 100 }],
     reason: 'Full return',
     creditNotePrefix: 'CN-',
     accountingSettings,
+    // o3d-i0o6 r3: the ledger this refund would post to. The A2 proof refuses without one, and
+    // these fixtures describe a debit proved to stand in these books.
+    activeAccountingConnector: 'xero',
   })
 
   assert.equal(result.success, true)
@@ -3117,6 +3183,14 @@ function a2StagedAllocatedState(): State {
   })
   // Uniform tax identity, so the monetary-only shape below is allowed rather than parked (o3d-w00).
   state.lines[0].taxRate = { accountingTaxType: 'OUTPUT2', reverseCharge: false }
+  // o3d-i0o6 r3 — THE ATTRIBUTION THAT MAKES "A2 POSTED £20" ABOVE A PROVED FACT.
+  //
+  // These fixtures predate the attribution columns and were leaning on the `unattributed` verdict's
+  // recorded figure, which r3 stops authorising anything at all — an unprovable state and a refusal
+  // now cap at the same £0.00. So they say what they always meant: ONE A2 pass, under a SYNCED
+  // journal, on this ledger, against this account. The tests that are ABOUT the attribution
+  // override it with `withRecordedA2Journal`.
+  withRecordedA2Journal(state, { status: 'SYNCED' })
   return state
 }
 
@@ -3133,6 +3207,9 @@ test('a MONETARY-ONLY full refund reverses the whole A2 allocated contra it un-s
     reason: 'Goodwill full refund',
     creditNotePrefix: 'CN-',
     accountingSettings,
+    // o3d-i0o6 r3: the ledger this refund would post to. The A2 proof refuses without one, and
+    // these fixtures describe a debit proved to stand in these books.
+    activeAccountingConnector: 'xero',
   })
 
   assert.equal(result.success, true)
@@ -3158,6 +3235,9 @@ test('a full-by-amount refund whose LINES cover only part of the allocation stil
     reason: 'Full value, partial quantity',
     creditNotePrefix: 'CN-',
     accountingSettings,
+    // o3d-i0o6 r3: the ledger this refund would post to. The A2 proof refuses without one, and
+    // these fixtures describe a debit proved to stand in these books.
+    activeAccountingConnector: 'xero',
   })
 
   assert.equal(result.success, true)
@@ -3180,6 +3260,9 @@ test('a full refund whose lines cover EVERY allocated unit reverses £20 once, n
     reason: 'Full return',
     creditNotePrefix: 'CN-',
     accountingSettings,
+    // o3d-i0o6 r3: the ledger this refund would post to. The A2 proof refuses without one, and
+    // these fixtures describe a debit proved to stand in these books.
+    activeAccountingConnector: 'xero',
   })
 
   assert.equal(result.success, true)
@@ -3226,7 +3309,10 @@ function a2StagedWithOrphanReversalState(): State {
 
 /** The SYNCED reversal journal itself: CR Allocated Inventory £10 / DR Inventory £10. */
 function seedPostedAllocationReversal(state: State, status = 'SYNCED'): void {
-  state.accountingSyncLogs = [{
+  // o3d-i0o6 r3: APPENDED, not assigned over the top. Assigning discarded the A2 batch journal the
+  // order's attribution names, so the proof refused on a missing journal and every assertion below
+  // about NETTING was measuring a refusal instead.
+  state.accountingSyncLogs = [...(state.accountingSyncLogs ?? []), {
     id: 'alloc-reversal-1',
     connector: 'xero',
     type: 'ALLOCATION_REVERSAL',
@@ -3262,6 +3348,9 @@ test('a full refund does NOT re-credit units an ALLOCATION_REVERSAL already cred
     reason: 'Goodwill full refund',
     creditNotePrefix: 'CN-',
     accountingSettings,
+    // o3d-i0o6 r3: the ledger this refund would post to. The A2 proof refuses without one, and
+    // these fixtures describe a debit proved to stand in these books.
+    activeAccountingConnector: 'xero',
   })
 
   assert.equal(result.success, true)
@@ -3283,7 +3372,10 @@ test('an ALLOCATION_REVERSAL journal retention has swept is still counted, and s
   // money: it can only UNDER-reverse, which leaves a visible standing debit), and the refund row
   // says the figure rests on a record rather than on a journal.
   const state = a2StagedWithOrphanReversalState()
-  state.accountingSyncLogs = []
+  // o3d-i0o6 r3: the REVERSAL's journals are what retention swept here. The A2 batch journal is
+  // kept, because an A2 debit that cannot be proved is a different test (and a different refusal).
+  state.accountingSyncLogs = (state.accountingSyncLogs ?? [])
+    .filter((log) => log.type === 'DAILY_BATCH_INVENTORY_ALLOC')
 
   const result = await createSalesOrderRefund(createClient(state), {
     orderId: 'order-1',
@@ -3291,6 +3383,9 @@ test('an ALLOCATION_REVERSAL journal retention has swept is still counted, and s
     reason: 'Goodwill full refund',
     creditNotePrefix: 'CN-',
     accountingSettings,
+    // o3d-i0o6 r3: the ledger this refund would post to. The A2 proof refuses without one, and
+    // these fixtures describe a debit proved to stand in these books.
+    activeAccountingConnector: 'xero',
   })
 
   assert.equal(result.success, true)
@@ -3317,6 +3412,9 @@ test('an ALLOCATION_REVERSAL that has not settled makes the refund REFUSE rather
     reason: 'Goodwill full refund',
     creditNotePrefix: 'CN-',
     accountingSettings,
+    // o3d-i0o6 r3: the ledger this refund would post to. The A2 proof refuses without one, and
+    // these fixtures describe a debit proved to stand in these books.
+    activeAccountingConnector: 'xero',
   })
 
   assert.equal(result.success, true)
@@ -3361,6 +3459,9 @@ test('a PARTIAL refund leaves the A2 stamp and reverses only what its lines cons
     reason: 'Partial return',
     creditNotePrefix: 'CN-',
     accountingSettings,
+    // o3d-i0o6 r3: the ledger this refund would post to. The A2 proof refuses without one, and
+    // these fixtures describe a debit proved to stand in these books.
+    activeAccountingConnector: 'xero',
   })
 
   assert.equal(result.success, true)
@@ -3438,12 +3539,19 @@ test('an ALLOCATION-ONLY reversal journal is labelled for what it contains (o3d-
   })
   state.lines[0].taxRate = { accountingTaxType: 'OUTPUT2', reverseCharge: false }
 
+  // o3d-i0o6 r3: this fixture's A2 debit is a PROVED one — one pass, one SYNCED journal, this
+  // ledger. Before r3 it leaned on `unattributed` handing back the recorded figure, which no
+  // longer authorises a credit.
+  withRecordedA2Journal(state, { status: 'SYNCED' })
   const result = await createSalesOrderRefund(createClient(state), {
     orderId: 'order-1',
     lines: [{ lineId: null, productId: null, description: 'Monetary refund', qty: 0, totalBase: 100, lineKind: 'sale' }],
     reason: 'Goodwill full refund',
     creditNotePrefix: 'CN-',
     accountingSettings,
+    // o3d-i0o6 r3: the ledger this refund would post to. The A2 proof refuses without one, and
+    // these fixtures describe a debit proved to stand in these books.
+    activeAccountingConnector: 'xero',
   })
 
   assert.equal(result.success, true)
@@ -3507,6 +3615,8 @@ function a2StagedFourUnitState(): State {
     costLayers: [{ id: 'layer-1', productId: 'product-1', poLineId: 'po-line-1', receivedQty: 4, unitCostBase: 10 }],
   })
   state.lines[0].taxRate = { accountingTaxType: 'OUTPUT2', reverseCharge: false }
+  // o3d-i0o6 r3: one A2 pass, proved — see `a2StagedAllocatedState`.
+  withRecordedA2Journal(state, { status: 'SYNCED' })
   return state
 }
 
@@ -3555,7 +3665,9 @@ test('a full refund does not treat a prior refund SNAPSHOT as a posted reversal 
   // every stamp on the order.
   const state = a2StagedFourUnitState()
   seedPriorAllocationRefund(state)
-  state.accountingSyncLogs = [{
+  // o3d-i0o6 r3: APPENDED. Assigning over the top discarded the A2 batch journal the order's
+  // attribution names, which turns every assertion below into a measurement of a refusal.
+  state.accountingSyncLogs = [...(state.accountingSyncLogs ?? []), {
     connector: 'xero',
     type: 'UNEARNED_REV_REVERSAL',
     referenceType: 'SalesOrderRefund',
@@ -3570,6 +3682,9 @@ test('a full refund does not treat a prior refund SNAPSHOT as a posted reversal 
     reason: 'Goodwill full refund',
     creditNotePrefix: 'CN-',
     accountingSettings,
+    // o3d-i0o6 r3: the ledger this refund would post to. The A2 proof refuses without one, and
+    // these fixtures describe a debit proved to stand in these books.
+    activeAccountingConnector: 'xero',
   })
 
   assert.equal(result.success, true)
@@ -3593,7 +3708,9 @@ test('a full refund DOES net a prior refund reversal that actually posted (o3d-o
   // journal is live, so £10 of the £40 is already out of Allocated Inventory and only £30 is owed.
   const state = a2StagedFourUnitState()
   seedPriorAllocationRefund(state)
-  state.accountingSyncLogs = [{
+  // o3d-i0o6 r3: APPENDED. Assigning over the top discarded the A2 batch journal the order's
+  // attribution names, which turns every assertion below into a measurement of a refusal.
+  state.accountingSyncLogs = [...(state.accountingSyncLogs ?? []), {
     connector: 'xero',
     type: 'UNEARNED_REV_REVERSAL',
     referenceType: 'SalesOrderRefund',
@@ -3608,6 +3725,9 @@ test('a full refund DOES net a prior refund reversal that actually posted (o3d-o
     reason: 'Goodwill full refund',
     creditNotePrefix: 'CN-',
     accountingSettings,
+    // o3d-i0o6 r3: the ledger this refund would post to. The A2 proof refuses without one, and
+    // these fixtures describe a debit proved to stand in these books.
+    activeAccountingConnector: 'xero',
   })
 
   assert.equal(result.success, true)
@@ -3627,6 +3747,9 @@ test('a partial refund then a full one credit the A2 debit exactly once, end to 
     reason: 'One unit back',
     creditNotePrefix: 'CN-',
     accountingSettings,
+    // o3d-i0o6 r3: the ledger this refund would post to. The A2 proof refuses without one, and
+    // these fixtures describe a debit proved to stand in these books.
+    activeAccountingConnector: 'xero',
   })
   assert.equal(partial.success, true)
   assert.notEqual(state.orders[0].refundStatus, 'FULL')
@@ -3659,6 +3782,9 @@ test('a partial refund then a full one credit the A2 debit exactly once, end to 
     reason: 'Goodwill remainder',
     creditNotePrefix: 'CN-',
     accountingSettings,
+    // o3d-i0o6 r3: the ledger this refund would post to. The A2 proof refuses without one, and
+    // these fixtures describe a debit proved to stand in these books.
+    activeAccountingConnector: 'xero',
   })
 
   assert.equal(full.success, true)
@@ -3691,6 +3817,9 @@ test('the residue is the RECORDED A2 debit, not the pins revalued since it poste
     reason: 'Goodwill full refund',
     creditNotePrefix: 'CN-',
     accountingSettings,
+    // o3d-i0o6 r3: the ledger this refund would post to. The A2 proof refuses without one, and
+    // these fixtures describe a debit proved to stand in these books.
+    activeAccountingConnector: 'xero',
   })
 
   assert.equal(result.success, true)
@@ -3752,6 +3881,9 @@ test("Group B's relief is the dispatch COGS it POSTED, not the revalued shipment
     reason: 'Goodwill full refund',
     creditNotePrefix: 'CN-',
     accountingSettings,
+    // o3d-i0o6 r3: the ledger this refund would post to. The A2 proof refuses without one, and
+    // these fixtures describe a debit proved to stand in these books.
+    activeAccountingConnector: 'xero',
   })
 
   assert.equal(result.success, true)
@@ -4630,9 +4762,16 @@ test('retrySalesOrderRefundAccounting replays persisted syncs after full refund 
     }],
   })
 
+  // o3d-i0o6 r3: this fixture's A2 debit is a PROVED one — one pass, one SYNCED journal, this
+  // ledger. Before r3 it leaned on `unattributed` handing back the recorded figure, which no
+  // longer authorises a credit.
+  withRecordedA2Journal(state, { status: 'SYNCED' })
   const result = await retrySalesOrderRefundAccounting(createClient(state), {
     refundId: 'refund-1',
     accountingSettings,
+    // o3d-i0o6 r3: the ledger this refund would post to. The A2 proof refuses without one, and
+    // these fixtures describe a debit proved to stand in these books.
+    activeAccountingConnector: 'xero',
   })
 
   assert.equal(result.success, true)
@@ -5478,7 +5617,7 @@ function withRecordedA2Journal(
       accountCode: overrides.accountCode ?? accountingSettings.allocatedInventoryAccount,
       debit: overrides.journalDebit ?? 500,
     }]
-    state.accountingSyncLogs?.push({
+    state.accountingSyncLogs = [...withoutSyncLog(state, syncLogId), {
       id: syncLogId,
       connector: overrides.connector ?? 'xero',
       type: 'DAILY_BATCH_INVENTORY_ALLOC',
@@ -5486,8 +5625,19 @@ function withRecordedA2Journal(
       referenceId: 'A2-2026-01-01-deadbeef',
       status: overrides.status,
       payload: 'journalPayload' in overrides ? overrides.journalPayload : { lines },
-    })
+    }]
+    return
   }
+  // o3d-i0o6 r3: NO STATUS means the journal row is ABSENT — retention swept it. The base fixtures
+  // now seed a SYNCED A2 journal (an order whose debit is proved is the ordinary case), so "absent"
+  // has to REMOVE that row rather than merely decline to add one, or the case under test never
+  // arises and the assertion measures the fixture instead of the code.
+  state.accountingSyncLogs = withoutSyncLog(state, syncLogId)
+}
+
+/** Every seeded sync log except the one with this id. */
+function withoutSyncLog(state: State, syncLogId: string) {
+  return (state.accountingSyncLogs ?? []).filter((log) => log.id !== syncLogId)
 }
 
 /**
@@ -5565,7 +5715,7 @@ test('the A2 amount is not evidence its journal POSTED — a CANCELLED A2 batch 
   const state = a2StagedFourUnitState()
   withRecordedA2Journal(state, { status: 'CANCELLED' })
 
-  const result = await createSalesOrderRefund(createClient(state), { orderId: 'order-1', accountingSettings, ...monetaryFullRefund() })
+  const result = await createSalesOrderRefund(createClient(state), { orderId: 'order-1', activeAccountingConnector: 'xero', accountingSettings, ...monetaryFullRefund() })
 
   assert.equal(result.success, true)
   assert.equal(state.orders[0].refundStatus, 'FULL')
@@ -5580,7 +5730,7 @@ test('a SYNCED A2 batch on the recorded ledger and account reverses the whole £
   const state = a2StagedFourUnitState()
   withRecordedA2Journal(state, { status: 'SYNCED' })
 
-  const result = await createSalesOrderRefund(createClient(state), { orderId: 'order-1', accountingSettings, ...monetaryFullRefund() })
+  const result = await createSalesOrderRefund(createClient(state), { orderId: 'order-1', activeAccountingConnector: 'xero', accountingSettings, ...monetaryFullRefund() })
 
   assert.equal(result.success, true)
   assert.equal(state.orders[0].refundStatus, 'FULL')
@@ -5595,7 +5745,7 @@ test('a PENDING A2 batch is queued, not posted, so nothing is reversed yet (o3d-
   const state = a2StagedFourUnitState()
   withRecordedA2Journal(state, { status: 'PENDING' })
 
-  const result = await createSalesOrderRefund(createClient(state), { orderId: 'order-1', accountingSettings, ...monetaryFullRefund() })
+  const result = await createSalesOrderRefund(createClient(state), { orderId: 'order-1', activeAccountingConnector: 'xero', accountingSettings, ...monetaryFullRefund() })
 
   assert.equal(result.success, true)
   assert.equal(state.orders[0].refundStatus, 'FULL')
@@ -5630,7 +5780,7 @@ test('the A2 record names WHICH ACCOUNT it debited, and a re-mapped account is n
   const state = a2StagedFourUnitState()
   withRecordedA2Journal(state, { status: 'SYNCED', accountCode: '1215' })
 
-  const result = await createSalesOrderRefund(createClient(state), { orderId: 'order-1', accountingSettings, ...monetaryFullRefund() })
+  const result = await createSalesOrderRefund(createClient(state), { orderId: 'order-1', activeAccountingConnector: 'xero', accountingSettings, ...monetaryFullRefund() })
 
   assert.equal(result.success, true)
   assert.equal(state.orders[0].refundStatus, 'FULL')
@@ -5681,7 +5831,7 @@ test("Group B's recorded relief survives stock-movement retention AND a revaluat
   state.costLayers[0].unitCostBase = 4
   // Retention has swept the dispatch movement and its CogsEntry rows: state.movements is empty.
 
-  const result = await createSalesOrderRefund(createClient(state), { orderId: 'order-1', accountingSettings, ...monetaryFullRefund() })
+  const result = await createSalesOrderRefund(createClient(state), { orderId: 'order-1', activeAccountingConnector: 'xero', accountingSettings, ...monetaryFullRefund() })
 
   assert.equal(result.success, true)
   assert.equal(state.orders[0].refundStatus, 'FULL')
@@ -5698,7 +5848,7 @@ test('a journaled shipment whose dispatch cost rows were swept and never recorde
   state.orders[0].allocationBatchAmount = 30
   state.lines[0].qty = 3
 
-  const result = await createSalesOrderRefund(createClient(state), { orderId: 'order-1', accountingSettings, ...monetaryFullRefund() })
+  const result = await createSalesOrderRefund(createClient(state), { orderId: 'order-1', activeAccountingConnector: 'xero', accountingSettings, ...monetaryFullRefund() })
 
   assert.equal(result.success, true)
   assert.equal(state.orders[0].refundStatus, 'FULL')
@@ -5719,7 +5869,7 @@ test("a prior refund's RECORDED relief survives sync-log retention (o3d-o97 r3)"
   state.refunds.find((refund) => refund.id === 'refund-prior')!.allocatedReliefAmount = 10
   // No accountingSyncLogs entry for refund-prior at all: retention has taken it.
 
-  const result = await createSalesOrderRefund(createClient(state), { orderId: 'order-1', accountingSettings, ...monetaryFullRefund(75) })
+  const result = await createSalesOrderRefund(createClient(state), { orderId: 'order-1', activeAccountingConnector: 'xero', accountingSettings, ...monetaryFullRefund(75) })
 
   assert.equal(result.success, true)
   assert.equal(state.orders[0].refundStatus, 'FULL')
@@ -5741,7 +5891,7 @@ test('a prior refund that claimed allocated units with no surviving record REFUS
   withRecordedA2Journal(state, { status: 'SYNCED' })
   seedPriorAllocationRefund(state)
 
-  const result = await createSalesOrderRefund(createClient(state), { orderId: 'order-1', accountingSettings, ...monetaryFullRefund(75) })
+  const result = await createSalesOrderRefund(createClient(state), { orderId: 'order-1', activeAccountingConnector: 'xero', accountingSettings, ...monetaryFullRefund(75) })
 
   assert.equal(result.success, true)
   assert.equal(state.orders[0].refundStatus, 'FULL')
@@ -5766,6 +5916,7 @@ test('a PARTIAL refund reverses the basis A2 POSTED, not the layers revalued sin
 
   const result = await createSalesOrderRefund(createClient(state), {
     orderId: 'order-1',
+    activeAccountingConnector: 'xero',
     lines: [{ lineId: 'line-1', productId: 'product-1', description: 'Product 1', qty: 3, totalBase: 40 }],
     reason: 'Three units back',
     creditNotePrefix: 'CN-',
@@ -5798,6 +5949,7 @@ test('a PARTIAL refund on a basis-less allocation row reverses the APPORTIONED A
 
   const result = await createSalesOrderRefund(createClient(state), {
     orderId: 'order-1',
+    activeAccountingConnector: 'xero',
     lines: [{ lineId: 'line-1', productId: 'product-1', description: 'Product 1', qty: 3, totalBase: 40 }],
     reason: 'Three units back',
     creditNotePrefix: 'CN-',
@@ -5829,6 +5981,7 @@ test('a basis-less partial UNDER the cap is no longer priced from the layer eith
 
   const partial = await createSalesOrderRefund(client, {
     orderId: 'order-1',
+    activeAccountingConnector: 'xero',
     lines: [{ lineId: 'line-1', productId: 'product-1', description: 'Product 1', qty: 2, totalBase: 25 }],
     reason: 'Two units back',
     creditNotePrefix: 'CN-',
@@ -5844,6 +5997,7 @@ test('a basis-less partial UNDER the cap is no longer priced from the layer eith
   // And the balance closes exactly: the full refund's residue takes the remaining £20, never £40.
   const full = await createSalesOrderRefund(client, {
     orderId: 'order-1',
+    activeAccountingConnector: 'xero',
     lines: [{ lineId: null, productId: null, description: 'Monetary refund', qty: 0, totalBase: 75, lineKind: 'sale' }],
     reason: 'Goodwill remainder',
     creditNotePrefix: 'CN-',
@@ -5874,7 +6028,7 @@ test("Group B's recorded relief is not relief until its journal POSTS — a queu
   withRecordedA2Journal(state, { status: 'SYNCED' })
   withRecordedGroupBRelief(state, { amount: 20, status: 'PENDING' })
 
-  const result = await createSalesOrderRefund(createClient(state), { orderId: 'order-1', accountingSettings, ...monetaryFullRefund() })
+  const result = await createSalesOrderRefund(createClient(state), { orderId: 'order-1', activeAccountingConnector: 'xero', accountingSettings, ...monetaryFullRefund() })
 
   assert.equal(result.success, true)
   assert.equal(state.orders[0].refundStatus, 'FULL')
@@ -5898,6 +6052,7 @@ test("a refusal WITHHOLDS the line reversal instead of un-capping it (o3d-o97 r4
 
   const result = await createSalesOrderRefund(createClient(state), {
     orderId: 'order-1',
+    activeAccountingConnector: 'xero',
     lines: [{ lineId: 'line-1', productId: 'product-1', description: 'Product 1', qty: 4, totalBase: 100 }],
     reason: 'All four units back',
     creditNotePrefix: 'CN-',
@@ -5929,7 +6084,7 @@ test("a CANCELLED Group B journal is NOT evidence of no relief — it refuses (o
   withRecordedA2Journal(state, { status: 'SYNCED' })
   withRecordedGroupBRelief(state, { amount: 20, status: 'CANCELLED' })
 
-  const result = await createSalesOrderRefund(createClient(state), { orderId: 'order-1', accountingSettings, ...monetaryFullRefund() })
+  const result = await createSalesOrderRefund(createClient(state), { orderId: 'order-1', activeAccountingConnector: 'xero', accountingSettings, ...monetaryFullRefund() })
 
   assert.equal(result.success, true)
   assert.equal(state.orders[0].refundStatus, 'FULL')
@@ -5945,7 +6100,7 @@ test("a SYNCED Group B journal on the recorded ledger nets its £20 exactly once
   withRecordedA2Journal(state, { status: 'SYNCED' })
   withRecordedGroupBRelief(state, { amount: 20, status: 'SYNCED' })
 
-  const result = await createSalesOrderRefund(createClient(state), { orderId: 'order-1', accountingSettings, ...monetaryFullRefund() })
+  const result = await createSalesOrderRefund(createClient(state), { orderId: 'order-1', activeAccountingConnector: 'xero', accountingSettings, ...monetaryFullRefund() })
 
   assert.equal(result.success, true)
   assert.equal(findAllocatedInventoryCredit(result), 20, '£40 debited less the £20 Group B actually credited')
@@ -5980,7 +6135,7 @@ test("a recorded relief of more than half a penny that names NO journal is refus
   withRecordedA2Journal(state, { status: 'SYNCED' })
   state.shipments[0].allocatedReliefAmount = 20
 
-  const result = await createSalesOrderRefund(createClient(state), { orderId: 'order-1', accountingSettings, ...monetaryFullRefund() })
+  const result = await createSalesOrderRefund(createClient(state), { orderId: 'order-1', activeAccountingConnector: 'xero', accountingSettings, ...monetaryFullRefund() })
 
   assert.equal(result.success, true)
   assert.equal(findAllocatedInventoryCredit(result), null)
@@ -5996,7 +6151,7 @@ test("a sub-penny relief with no journal is a relief of ZERO, not a refusal (o3d
   withRecordedA2Journal(state, { status: 'SYNCED' })
   state.shipments[0].allocatedReliefAmount = 0.004
 
-  const result = await createSalesOrderRefund(createClient(state), { orderId: 'order-1', accountingSettings, ...monetaryFullRefund() })
+  const result = await createSalesOrderRefund(createClient(state), { orderId: 'order-1', activeAccountingConnector: 'xero', accountingSettings, ...monetaryFullRefund() })
 
   assert.equal(result.success, true)
   assert.equal(findAllocatedInventoryCredit(result), 40, 'nothing was credited to Allocated Inventory, so all £40 is open')
@@ -6022,7 +6177,7 @@ test("a prior refund's QUEUED reversal is not relief either (o3d-o97 r4)", async
     payload: { lines: [{ accountCode: '1210', credit: 10 }] },
   })
 
-  const result = await createSalesOrderRefund(createClient(state), { orderId: 'order-1', accountingSettings, ...monetaryFullRefund(75) })
+  const result = await createSalesOrderRefund(createClient(state), { orderId: 'order-1', activeAccountingConnector: 'xero', accountingSettings, ...monetaryFullRefund(75) })
 
   assert.equal(result.success, true)
   assert.equal(state.orders[0].refundStatus, 'FULL')
@@ -6054,6 +6209,7 @@ test('an order whose rows PARTLY recorded their basis apportions only the unreco
 
   const result = await createSalesOrderRefund(createClient(state), {
     orderId: 'order-1',
+    activeAccountingConnector: 'xero',
     lines: [{ lineId: 'line-1', productId: 'product-1', description: 'Product 1', qty: 4, totalBase: 40 }],
     reason: 'All four units back',
     creditNotePrefix: 'CN-',
@@ -6086,7 +6242,7 @@ test("a SETTLED Group B journal whose lines credit Allocated Inventory NOTHING i
   withRecordedA2Journal(state, { status: 'SYNCED' })
   withRecordedGroupBRelief(state, { amount: 20, status: 'SYNCED', journalPayload: { lines: [{ accountCode: '4000', credit: 20 }] } })
 
-  const result = await createSalesOrderRefund(createClient(state), { orderId: 'order-1', accountingSettings, ...monetaryFullRefund() })
+  const result = await createSalesOrderRefund(createClient(state), { orderId: 'order-1', activeAccountingConnector: 'xero', accountingSettings, ...monetaryFullRefund() })
 
   assert.equal(result.success, true)
   assert.equal(state.orders[0].refundStatus, 'FULL')
@@ -6105,7 +6261,7 @@ test("a shipment recording MORE relief than its journal credited in total is ref
   withRecordedA2Journal(state, { status: 'SYNCED' })
   withRecordedGroupBRelief(state, { amount: 20, status: 'SYNCED', journalCredit: 6 })
 
-  const result = await createSalesOrderRefund(createClient(state), { orderId: 'order-1', accountingSettings, ...monetaryFullRefund() })
+  const result = await createSalesOrderRefund(createClient(state), { orderId: 'order-1', activeAccountingConnector: 'xero', accountingSettings, ...monetaryFullRefund() })
 
   assert.equal(result.success, true)
   assert.equal(findAllocatedInventoryCredit(result), null, 'not the £20 r4 subtracted from the £40')
@@ -6154,7 +6310,7 @@ test("a prior refund's relief is the pounds its journal CREDITED, not the pounds
     payload: { lines: [{ accountCode: '1200', debit: 4 }, { accountCode: '1210', credit: 4 }] },
   })
 
-  const result = await createSalesOrderRefund(createClient(state), { orderId: 'order-1', accountingSettings, ...monetaryFullRefund(75) })
+  const result = await createSalesOrderRefund(createClient(state), { orderId: 'order-1', activeAccountingConnector: 'xero', accountingSettings, ...monetaryFullRefund(75) })
 
   assert.equal(result.success, true)
   assert.equal(state.orders[0].refundStatus, 'FULL')
@@ -6170,7 +6326,7 @@ test("a SETTLED A2 journal whose lines debit Allocated Inventory NOTHING is refu
   const state = a2StagedFourUnitState()
   withRecordedA2Journal(state, { status: 'SYNCED', journalLines: [{ accountCode: '4000', debit: 40 }] })
 
-  const result = await createSalesOrderRefund(createClient(state), { orderId: 'order-1', accountingSettings, ...monetaryFullRefund() })
+  const result = await createSalesOrderRefund(createClient(state), { orderId: 'order-1', activeAccountingConnector: 'xero', accountingSettings, ...monetaryFullRefund() })
 
   assert.equal(result.success, true)
   assert.equal(state.orders[0].refundStatus, 'FULL')
@@ -6185,31 +6341,69 @@ test("an order claiming a bigger share than its A2 batch journal debited is refu
   const state = a2StagedFourUnitState()
   withRecordedA2Journal(state, { status: 'SYNCED', journalDebit: 25 })
 
-  const result = await createSalesOrderRefund(createClient(state), { orderId: 'order-1', accountingSettings, ...monetaryFullRefund() })
+  const result = await createSalesOrderRefund(createClient(state), { orderId: 'order-1', activeAccountingConnector: 'xero', accountingSettings, ...monetaryFullRefund() })
 
   assert.equal(result.success, true)
   assert.equal(findAllocatedInventoryCredit(result), null, 'not the £40 the order records')
   assert.match(String(state.refunds[0].allocationBasisUnresolved), /records a £40\.00 share of an A2 journal that debited Allocated Inventory only £25\.00/)
 })
 
-test("a settled journal whose payload was COMPACTED off it still resolves to the recorded figure (o3d-o97 r5)", async () => {
-  // ILLEGIBLE is not the same as UNPROVED, and must not become a refusal. `backReferenceEvidence
-  // CompactedAt` compaction drops `payload` from a row it otherwise keeps, so a settled journal can
-  // be present with nothing readable on it — the same position as a row retention deleted outright,
-  // which this branch already resolves to the recorded amount. Refusing here would strand the whole
-  // £40 on every order old enough to have been compacted.
+test("a COMPACTED A2 DEBIT journal is REFUSED, where it used to authorise the whole recorded figure (o3d-i0o6 r4)", async () => {
+  // o3d-i0o6 r4 (Codex round 3, HIGH 2) — AN EXISTING TEST THAT WAS PINNING THE DEFECT.
+  //
+  // This test used to read "a settled journal whose payload was COMPACTED off it still resolves to
+  // the recorded figure", and it asserted that a compacted A2 DEBIT journal credits the whole
+  // recorded £40 (less relief). Its reasoning was that illegible is "the same position as a row
+  // retention deleted outright, which this branch already resolves to the recorded amount".
+  //
+  // BOTH HALVES OF THAT WERE WRONG, in one specific way: it imported a rule from the RELIEF side of
+  // the contra onto the DEBIT side, where the polarity is reversed.
+  //
+  //   * The parity it claimed does not exist. When the A2 journal row is ABSENT,
+  //     `proveAllocationDebitPosting` REFUSES ("no longer on record (retention) ... cannot be
+  //     established") — it has never resolved a missing DEBIT journal to the recorded amount. The
+  //     branch that does resolve an absence to the record is the one that counts RELIEF already
+  //     credited, and counting relief moves LESS money, not more.
+  //   * So "must not become a refusal" had the money-safety backwards. Refusing a compacted A2
+  //     journal STRANDS £40 in Allocated Inventory — an understatement, on the books, that an
+  //     operator is told about and can post by hand. Resolving it to the record CREDITS £40 out of
+  //     a real account on the strength of a journal whose readable lines might have debited that
+  //     account nothing, or a different account, or less than this order claims — and nobody is
+  //     told, because the verdict was `posted`.
+  //
+  // An unreadable journal is not a journal that checks out; it is one that cannot be checked.
   const state = a2StagedWithJournaledShipment()
   withRecordedA2Journal(state, { status: 'SYNCED', journalPayload: null })
   withRecordedGroupBRelief(state, { amount: 20, status: 'SYNCED', journalPayload: null })
 
-  const result = await createSalesOrderRefund(createClient(state), { orderId: 'order-1', accountingSettings, ...monetaryFullRefund() })
+  const result = await createSalesOrderRefund(createClient(state), { orderId: 'order-1', activeAccountingConnector: 'xero', accountingSettings, ...monetaryFullRefund() })
 
   assert.equal(result.success, true)
   assert.equal(state.orders[0].refundStatus, 'FULL')
-  assert.equal(findAllocatedInventoryCredit(result), 20, 'the recorded £40 less the recorded £20, exactly as when the rows are gone')
-  // o3d-o97 r6: the POUNDS are unchanged — illegible is still resolved to the recorded figure — but
-  // the refund now says the £20 of relief was counted WITHOUT its journal being readable. Silence
-  // here is what lets retention turn an unproved relief into a resolved posting.
+  assert.equal(findAllocatedInventoryCredit(result), null, 'not the £20 the record alone would have authorised')
+  assert.notEqual(state.orders[0].inventoryAllocatedDate, null, 'the stamp survives so the order stays reportable')
+  assert.match(
+    String(state.refunds[0].allocationBasisUnresolved),
+    /has settled but its lines are no longer readable \(evidence compaction\)/,
+  )
+})
+
+test("a compacted GROUP B RELIEF journal is still counted from the record — the fix is a narrowing (o3d-o97 r5, o3d-i0o6 r4)", async () => {
+  // THE HALF OF THE OLD TEST THAT WAS RIGHT, kept and made explicit. Relief is the other polarity:
+  // counting a relief nobody can read REDUCES what this refund may credit, so resolving it to the
+  // record is the money-safe reading and stays exactly as r5/r6 left it. Here the A2 DEBIT journal
+  // IS readable and carries the £40, so the debit is proved; only the Group B relief journal has
+  // been compacted, and its £20 is still counted — and still SAID to have been counted without the
+  // journal, because silence is what lets retention turn an unproved relief into a resolved one.
+  const state = a2StagedWithJournaledShipment()
+  withRecordedA2Journal(state, { status: 'SYNCED', journalDebit: 40 })
+  withRecordedGroupBRelief(state, { amount: 20, status: 'SYNCED', journalPayload: null })
+
+  const result = await createSalesOrderRefund(createClient(state), { orderId: 'order-1', activeAccountingConnector: 'xero', accountingSettings, ...monetaryFullRefund() })
+
+  assert.equal(result.success, true)
+  assert.equal(state.orders[0].refundStatus, 'FULL')
+  assert.equal(findAllocatedInventoryCredit(result), 20, 'the proved £40 less the recorded £20')
   assert.match(
     String(state.refunds[0].allocationBasisUnresolved),
     /£20\.00 of Allocated Inventory relief was counted against this order's A2 debit WITHOUT the journal/,
@@ -6293,6 +6487,7 @@ test('a PARTIAL refund whose apportionment pool spans two products refuses inste
 
   const result = await createSalesOrderRefund(createClient(state), {
     orderId: 'order-1',
+    activeAccountingConnector: 'xero',
     lines: [{ lineId: 'line-y', productId: 'product-y', description: 'Cheap Y', qty: 2, totalBase: 40 }],
     reason: 'Both cheap units back',
     creditNotePrefix: 'CN-',
@@ -6326,6 +6521,7 @@ test('the same two-product order on a FULL refund still closes to exactly the re
 
   const result = await createSalesOrderRefund(createClient(state), {
     orderId: 'order-1',
+    activeAccountingConnector: 'xero',
     lines: [
       { lineId: 'line-x', productId: 'product-x', description: 'Expensive X', qty: 2, totalBase: 60 },
       { lineId: 'line-y', productId: 'product-y', description: 'Cheap Y', qty: 2, totalBase: 40 },
@@ -6366,6 +6562,7 @@ test('a SINGLE-product apportionment pool still values a partial refund (o3d-o97
 
   const result = await createSalesOrderRefund(createClient(state), {
     orderId: 'order-1',
+    activeAccountingConnector: 'xero',
     lines: [{ lineId: 'line-1', productId: 'product-1', description: 'Product 1', qty: 2, totalBase: 25 }],
     reason: 'Two units back',
     creditNotePrefix: 'CN-',
@@ -6404,7 +6601,7 @@ test('an A2 journal that debits AND credits Allocated Inventory is bounded by th
     ],
   })
 
-  const result = await createSalesOrderRefund(createClient(state), { orderId: 'order-1', accountingSettings, ...monetaryFullRefund() })
+  const result = await createSalesOrderRefund(createClient(state), { orderId: 'order-1', activeAccountingConnector: 'xero', accountingSettings, ...monetaryFullRefund() })
 
   assert.equal(result.success, true)
   assert.equal(state.orders[0].refundStatus, 'FULL')
@@ -6434,7 +6631,7 @@ test("a Group B journal that debits Allocated Inventory back is bounded by its N
     },
   })
 
-  const result = await createSalesOrderRefund(createClient(state), { orderId: 'order-1', accountingSettings, ...monetaryFullRefund() })
+  const result = await createSalesOrderRefund(createClient(state), { orderId: 'order-1', activeAccountingConnector: 'xero', accountingSettings, ...monetaryFullRefund() })
 
   assert.equal(result.success, true)
   assert.equal(state.orders[0].refundStatus, 'FULL')
@@ -6462,7 +6659,7 @@ test("a shipment's relief counted after retention deleted its journal is REPORTE
   // a CANCELLED (never-posted) Group B journal reaches once it is past the retention cutoff.
   withRecordedGroupBRelief(state, { amount: 20, status: null })
 
-  const result = await createSalesOrderRefund(createClient(state), { orderId: 'order-1', accountingSettings, ...monetaryFullRefund() })
+  const result = await createSalesOrderRefund(createClient(state), { orderId: 'order-1', activeAccountingConnector: 'xero', accountingSettings, ...monetaryFullRefund() })
 
   assert.equal(result.success, true)
   assert.equal(state.orders[0].refundStatus, 'FULL')
@@ -6481,7 +6678,7 @@ test('a proved relief writes no such note — the report is about UNREADABLE evi
   withRecordedA2Journal(state, { status: 'SYNCED' })
   withRecordedGroupBRelief(state, { amount: 20, status: 'SYNCED' })
 
-  const result = await createSalesOrderRefund(createClient(state), { orderId: 'order-1', accountingSettings, ...monetaryFullRefund() })
+  const result = await createSalesOrderRefund(createClient(state), { orderId: 'order-1', activeAccountingConnector: 'xero', accountingSettings, ...monetaryFullRefund() })
 
   assert.equal(result.success, true)
   assert.equal(findAllocatedInventoryCredit(result), 20)
@@ -6560,6 +6757,7 @@ test('a PARTIAL refund apportioning across TWO rows of ONE product refuses inste
 
   const result = await createSalesOrderRefund(createClient(state), {
     orderId: 'order-1',
+    activeAccountingConnector: 'xero',
     lines: [{ lineId: 'line-1', productId: 'product-1', description: 'Product 1', qty: 1, totalBase: 10 }],
     reason: 'One unit back',
     creditNotePrefix: 'CN-',
@@ -6590,6 +6788,7 @@ test('a PARTIAL refund that empties the WHOLE pool still credits it — the tota
 
   const result = await createSalesOrderRefund(createClient(state), {
     orderId: 'order-1',
+    activeAccountingConnector: 'xero',
     lines: [{ lineId: 'line-1', productId: 'product-1', description: 'Product 1', qty: 4, totalBase: 40 }],
     reason: 'All four units back',
     creditNotePrefix: 'CN-',
@@ -6614,6 +6813,7 @@ test('the SAME inexact apportionment on a FULL refund is not refused — cap and
 
   const result = await createSalesOrderRefund(createClient(state), {
     orderId: 'order-1',
+    activeAccountingConnector: 'xero',
     lines: [
       { lineId: 'line-1', productId: 'product-1', description: 'Product 1', qty: 1, totalBase: 10 },
       { lineId: null, productId: null, description: 'Monetary remainder', qty: 0, totalBase: 90, lineKind: 'sale' as const },
@@ -6890,6 +7090,7 @@ test('o3d-ypkk: refunding a partially-shipped order finds a cost basis for the U
 
   const result = await createSalesOrderRefund(createClient(state), {
     orderId: 'order-1',
+    activeAccountingConnector: 'xero',
     accountingSettings,
     ...YPKK_WHOLE_LINE_REFUND,
   })
@@ -7508,4 +7709,388 @@ test('o3d-2sm1 Codex r1: a staging that rolls back leaves the witness at NOT_STA
     accountingSettings,
   })
   assert.equal(retry.success, true, 'a witnessed never-staged row is recoverable, not refused')
+})
+
+// ---------------------------------------------------------------------------------------------
+// o3d-i0o6 r2 — THE STAMP IS A LIFECYCLE MARKER, NOT EVIDENCE THAT A DEBIT POSTED.
+//
+// `inventoryAllocatedDate` says "Group A2 still has work to do on this order". The DECLARED
+// allocation rewrite CLEARS IT ON PURPOSE — so A2 comes back and posts the increment — and
+// deliberately KEEPS `allocationBatchAmount` and the whole journal attribution, because those are
+// the record of what A2 has already debited. r1 gated both the proof and the open-balance
+// calculation on that stamp, so in the state the rewrite leaves behind:
+//
+//   * the proof never ran, and a FAILED / CANCELLED / cross-ledger A2 journal produced a
+//     full-value credit against a debit that never posted in these books; and
+//   * the open balance was never computed, so the cap was ABSENT — and an absent cap is not a
+//     smaller ceiling, it is no ceiling, so even a VALID journal could be over-credited.
+//
+// The state is reached below by running `resetAllocationAccountingIfStaged` itself.
+// ---------------------------------------------------------------------------------------------
+
+/**
+ * Put `state` through the DECLARED allocation rewrite — the caller states the set it is about to
+ * write, that set holds quantity nothing has accounted, so A2 is handed the order back.
+ *
+ * Everything here is a double for the transaction, never for the decision: the rewrite reads the
+ * order's own stamp and attribution, the persisted rows' pinned layers and the A2 journal's status
+ * out of `state`, and whatever it decides to write is applied back onto `state`.
+ */
+async function unstageThroughDeclaredAllocationRewrite(state: State, declaredQty: number): Promise<void> {
+  const order = state.orders[0]
+  const tx = {
+    salesOrder: {
+      findUnique: async () => ({
+        inventoryAllocatedDate: order.inventoryAllocatedDate,
+        allocationBatchAmount: order.allocationBatchAmount,
+        allocationBatchSyncLogId: order.allocationBatchSyncLogId ?? null,
+      }),
+      update: async ({ data }: { data: Record<string, unknown> }) => {
+        Object.assign(order, data)
+        return {}
+      },
+    },
+    shipment: { findFirst: async () => null },
+    shipmentLine: { findMany: async () => [] },
+    accountingSyncLog: {
+      findUnique: async ({ where }: { where: { id: string } }) => (
+        (state.accountingSyncLogs ?? []).find((row) => (row as { id?: string }).id === where.id) ?? null
+      ),
+    },
+    activityLog: { create: async ({ data }: { data: Record<string, unknown> }) => data },
+    orderAllocation: {
+      findMany: async () => state.allocations.map((row) => ({
+        lineId: row.lineId,
+        productId: row.productId,
+        warehouseId: row.warehouseId,
+        costLayerSnapshot: row.costLayerSnapshot,
+      })),
+      updateMany: async () => ({ count: 0 }),
+    },
+  }
+  await resetAllocationAccountingIfStaged(
+    tx as unknown as Parameters<typeof resetAllocationAccountingIfStaged>[0],
+    'order-1',
+    {
+      nextAllocations: state.allocations.map((row) => ({
+        lineId: row.lineId,
+        productId: row.productId,
+        warehouseId: row.warehouseId,
+        qty: toDecimal(declaredQty),
+      })),
+    },
+  )
+}
+
+/** Everything the rewrite is supposed to have done, asserted so the tests below cannot go vacuous. */
+function assertStampClearedAttributionKept(state: State): void {
+  assert.equal(
+    state.orders[0].inventoryAllocatedDate,
+    null,
+    'the declared rewrite really did clear the A2 stamp — if it did not, the tests below are about nothing',
+  )
+  assert.equal(state.orders[0].allocationBatchAmount, 40, 'and really did keep the recorded debit')
+  assert.equal(state.orders[0].allocationBatchSyncLogId, 'a2-log-1', 'and the journal the debit was staged into')
+  assert.equal(state.orders[0].allocationBatchConnector, 'xero', 'and the ledger it was raised on')
+  assert.equal(state.orders[0].allocationBatchAccountCode, accountingSettings.allocatedInventoryAccount)
+}
+
+/** The refund's own lines, valuing all four allocated units — so there is a line basis to over-credit. */
+function fourUnitLineRefund() {
+  return {
+    lines: [{ lineId: 'line-1', productId: 'product-1', description: 'Product 1', qty: 4, totalBase: 100 }],
+    reason: 'All four units back',
+    creditNotePrefix: 'CN-',
+  }
+}
+
+test('o3d-i0o6 r2: a rewrite that cleared the A2 stamp does not waive the PROOF — a CANCELLED journal still reverses nothing', async () => {
+  // A2 recorded £40 under journal a2-log-1, and that journal was CANCELLED: nothing was debited to
+  // Allocated Inventory for this order. An ordinary allocation edit then added quantity, which
+  // cleared the stamp and kept the record. Gated on the stamp, the refund asked no question at all
+  // and credited the lines' whole £40 to an account that never held a penny of it.
+  const state = a2StagedFourUnitState()
+  withRecordedA2Journal(state, { status: 'CANCELLED' })
+  await unstageThroughDeclaredAllocationRewrite(state, 6)
+  assertStampClearedAttributionKept(state)
+
+  const result = await createSalesOrderRefund(createClient(state), {
+    orderId: 'order-1',
+    activeAccountingConnector: 'xero',
+    accountingSettings,
+    ...fourUnitLineRefund(),
+  })
+
+  assert.equal(result.success, true)
+  assert.equal(state.orders[0].refundStatus, 'FULL')
+  assert.equal(
+    findAllocatedInventoryCredit(result),
+    null,
+    'nothing is credited — the question is asked of the ATTRIBUTION, which the rewrite kept, not of the stamp it cleared',
+  )
+  assert.equal(findInventoryReversalDebit(result), null)
+  assert.match(String(state.refunds[0].allocationBasisUnresolved), /is CANCELLED, not SYNCED/)
+})
+
+test('o3d-i0o6 r2: a rewrite that cleared the A2 stamp does not waive the CAP either', async () => {
+  // The other half, and the one a VALID journal reaches. A2 debited £24 for this order; the
+  // allocation row still records the £40 basis an earlier, larger pass wrote, so the refund's lines
+  // value £40. Gated on the stamp, the open balance was never computed — and an absent cap is not a
+  // higher ceiling, it is none, so all £40 went out against a £24 debit.
+  const state = a2StagedFourUnitState()
+  state.orders[0].allocationBatchAmount = 24
+  withRecordedA2Journal(state, { status: 'SYNCED' })
+  await unstageThroughDeclaredAllocationRewrite(state, 6)
+  assert.equal(state.orders[0].inventoryAllocatedDate, null, 'the rewrite cleared the stamp')
+  assert.equal(state.orders[0].allocationBatchAmount, 24, 'and kept the £24 A2 actually debited')
+
+  const result = await createSalesOrderRefund(createClient(state), {
+    orderId: 'order-1',
+    activeAccountingConnector: 'xero',
+    accountingSettings,
+    ...fourUnitLineRefund(),
+  })
+
+  assert.equal(result.success, true)
+  assert.equal(state.orders[0].refundStatus, 'FULL')
+  assert.equal(
+    findAllocatedInventoryCredit(result),
+    24,
+    'capped at what A2 debited and nothing has relieved — never the £40 the lines valued',
+  )
+  assert.equal(findInventoryReversalDebit(result), 24, 'and the contra matches it')
+})
+
+test('o3d-i0o6 r2: the CONTROL — the same rewrite still lets a fully proved debit reverse in full', async () => {
+  // The gate is a gate. Same cleared stamp, same preserved attribution, a SYNCED journal on the
+  // recorded ledger and account, and the whole £40 comes back out.
+  const state = a2StagedFourUnitState()
+  withRecordedA2Journal(state, { status: 'SYNCED' })
+  await unstageThroughDeclaredAllocationRewrite(state, 6)
+  assertStampClearedAttributionKept(state)
+
+  const result = await createSalesOrderRefund(createClient(state), {
+    orderId: 'order-1',
+    activeAccountingConnector: 'xero',
+    accountingSettings,
+    ...fourUnitLineRefund(),
+  })
+
+  assert.equal(result.success, true)
+  assert.equal(findAllocatedInventoryCredit(result), 40)
+  assert.equal(state.refunds[0].allocationBasisUnresolved ?? null, null, 'and nothing is withheld')
+})
+
+/**
+ * o3d-i0o6 r3 (Codex round 2, HIGH 2) — AN UNPROVABLE ATTRIBUTION AUTHORISES NOTHING.
+ *
+ * r2's stated achievement was that "a refusal and an unprovable state both cap at £0.00". The
+ * `unattributed` verdict contradicted it: its own definition is that the posting and the ledger
+ * CANNOT be established, and the cap read its `recordedDebit` as a ceiling. Two unprovable states,
+ * two different ceilings, and the more ignorant one was the more permissive.
+ *
+ * r3 removes the figure from the verdict rather than removing the read: `recordedDebit` now exists
+ * on `posted` and on nothing else, so a caller that caps on an unprovable verdict does not compile.
+ * What is testable at runtime is the consequence — nothing credited, and the reason on the row.
+ */
+test('o3d-i0o6 r3: an A2 debit whose passes are not on record credits NOTHING, and says why', async () => {
+  const state = a2StagedAllocatedState()
+  // The pre-history row: an amount, no recorded passes, no journal named. Reachable two ways — an
+  // order staged before either set of columns existed, and (see the daily-batch incremental-pass
+  // suite) a later A2 pass whose window rounded to zero and nulled the attribution beside it.
+  state.orders[0].allocationBatchPasses = null
+  state.orders[0].allocationBatchSyncLogId = null
+  state.orders[0].allocationBatchConnector = null
+  state.orders[0].allocationBatchAccountCode = null
+
+  const result = await createSalesOrderRefund(createClient(state), {
+    orderId: 'order-1',
+    lines: [{ lineId: null, productId: null, description: 'Monetary refund', qty: 0, totalBase: 100, lineKind: 'sale' }],
+    reason: 'Goodwill full refund',
+    creditNotePrefix: 'CN-',
+    accountingSettings,
+    activeAccountingConnector: 'xero',
+  })
+
+  assert.equal(result.success, true)
+  assert.equal(state.orders[0].refundStatus, 'FULL')
+  assert.equal(
+    findAllocatedInventoryCredit(result),
+    null,
+    'NOT £20: an amount whose passes nobody recorded is not evidence any of it reached a ledger',
+  )
+  assert.match(
+    String(state.refunds[0].allocationBasisUnresolved),
+    /named no journal, so whether that debit reached a ledger — and which ledger — cannot be established/,
+    'and the operator is told the truth rather than shown a fabricated £0.00 open balance',
+  )
+  assert.notEqual(
+    state.orders[0].inventoryAllocatedDate,
+    null,
+    'the A2 stamp and its attribution survive, so the standing invariants keep reporting the order',
+  )
+})
+
+test('o3d-i0o6 r3: a partial refund on an unprovable A2 debit reverses nothing either', async () => {
+  // The cap, not just the residue. A partial refund's LINES valued £10 of allocated basis here, and
+  // under r2 the unprovable verdict's recorded figure was the ceiling those £10 fitted inside.
+  const state = a2StagedAllocatedState()
+  state.orders[0].allocationBatchPasses = null
+  state.orders[0].allocationBatchSyncLogId = null
+
+  const result = await createSalesOrderRefund(createClient(state), {
+    orderId: 'order-1',
+    lines: [{ lineId: 'line-1', productId: 'product-1', description: 'Product 1', qty: 1, totalBase: 40 }],
+    reason: 'Partial return',
+    creditNotePrefix: 'CN-',
+    accountingSettings,
+    activeAccountingConnector: 'xero',
+  })
+
+  assert.equal(result.success, true)
+  assert.notEqual(state.orders[0].refundStatus, 'FULL')
+  assert.equal(findAllocatedInventoryCredit(result), null, 'the £10 the lines valued is withheld, not credited')
+  assert.match(
+    String(state.refunds[0].allocationBasisUnresolved),
+    /valued £10\.00 of allocated basis and NONE of it was credited/,
+    'and the refusal names what it cost, on the row an operator reconciles against',
+  )
+})
+
+/**
+ * o3d-i0o6 r3 (Codex round 2, HIGH 1) — THE PIN TRAVELS ON THE REQUEST.
+ *
+ * The proof establishes the debit against ONE connector and the journal's account codes come from
+ * that connector's settings. The request is the only thing that crosses from staging to the
+ * hand-off that queues it — and, through `accountingRetrySyncs`, to a retry days later — so the
+ * connector has to be on the request or the enqueue resolves it again for itself.
+ */
+test('o3d-i0o6 r3: the staged allocation credit names the ledger its debit was PROVED on', async () => {
+  const state = a2StagedAllocatedState()
+
+  const result = await createSalesOrderRefund(createClient(state), {
+    orderId: 'order-1',
+    lines: [{ lineId: null, productId: null, description: 'Monetary refund', qty: 0, totalBase: 100, lineKind: 'sale' }],
+    reason: 'Goodwill full refund',
+    creditNotePrefix: 'CN-',
+    accountingSettings,
+    activeAccountingConnector: 'xero',
+  })
+
+  assert.equal(result.success, true)
+  const reversal = result.success && result.accountingSyncs.find((sync) => sync.type === 'UNEARNED_REV_REVERSAL')
+  assert.ok(reversal, 'the allocation credit was staged')
+  assert.equal(findAllocatedInventoryCredit(result), 20, 'and it really does credit Allocated Inventory')
+  assert.equal(
+    reversal.connector,
+    'xero',
+    'pinned to the proved ledger, so the facade enqueue cannot resolve a different one later',
+  )
+  // And it SURVIVES the persist/replay round trip, which is where a field a parser does not name
+  // silently disappears.
+  const persisted = state.refunds[0].accountingRetrySyncs as Array<Record<string, unknown>>
+  const persistedReversal = persisted.find((sync) => sync.type === 'UNEARNED_REV_REVERSAL')
+  assert.equal(persistedReversal?.connector, 'xero', 'the retry replays it on the same ledger')
+})
+
+test('o3d-i0o6 r3: a journal carrying NO allocation credit is left unpinned', async () => {
+  // The UNEARNED_REV_REVERSAL carries both reversals and only one of them has a proof behind it.
+  // An unearned-revenue-only journal was reckoned against no particular ledger, and pinning it to
+  // one this proof happens to name would refuse postings the proof says nothing about.
+  const state = a2StagedAllocatedState()
+  state.orders[0].allocationBatchAmount = 0
+  state.orders[0].allocationBatchPasses = []
+  state.allocations = []
+
+  const result = await createSalesOrderRefund(createClient(state), {
+    orderId: 'order-1',
+    lines: [{ lineId: null, productId: null, description: 'Monetary refund', qty: 0, totalBase: 100, lineKind: 'sale' }],
+    reason: 'Goodwill full refund',
+    creditNotePrefix: 'CN-',
+    accountingSettings,
+    activeAccountingConnector: 'xero',
+  })
+
+  assert.equal(result.success, true)
+  const reversal = result.success && result.accountingSyncs.find((sync) => sync.type === 'UNEARNED_REV_REVERSAL')
+  assert.ok(reversal, 'the unearned reversal is still staged')
+  assert.equal(findAllocatedInventoryCredit(result), null, 'with no allocation credit in it')
+  assert.equal(reversal.connector, undefined, 'so nothing pins it')
+})
+
+/**
+ * o3d-i0o6 r6 — WHAT THE PIN IS, AND WHAT IT IS NOT, NOW THAT THE GROUP A1 LEDGER PROOF IS WITHDRAWN.
+ *
+ * Codex round 4 read the r3 pin as an assumption about the GROUP A1 half beside the allocation
+ * credit: A1 defers when the order is PAID and A2 reclassifies when it is ALLOCATED, so a connector
+ * switch in between would make one pin speak for two provenances and send the unearned-revenue debit
+ * into books that never credited the liability. r5 answered it by establishing A1's ledger on its own
+ * evidence. That is withdrawn (o3d-vr9j), because the premise does not hold:
+ *
+ *   `proveAllocationDebitPosting` REFUSES every pass and every journal whose connector is not the
+ *   `activeConnector` it was asked about, and returns that same target as `provedOnConnector`. So the
+ *   pin is the connector this refund is being staged against, or there is no pin. It can never be a
+ *   historical ledger, and pinning to the ACTIVE connector routes the A1 lines to exactly the
+ *   connector an unpinned enqueue would have resolved for them.
+ *
+ * These two tests are that claim: the A2 side of it lives in
+ * `daily-batch-a2-incremental-pass-proof.test.ts` ("a `posted` verdict never names a ledger other
+ * than the one it was asked about"), and this is the refund-shaped half of it.
+ */
+test('o3d-i0o6 r6: a journal carrying BOTH reversals is ONE journal, pinned to the ACTIVE connector, with the unearned half in full', async () => {
+  const state = a2StagedAllocatedState()
+
+  const result = await createSalesOrderRefund(createClient(state), {
+    orderId: 'order-1',
+    lines: [{ lineId: null, productId: null, description: 'Monetary refund', qty: 0, totalBase: 100, lineKind: 'sale' }],
+    reason: 'Goodwill full refund',
+    creditNotePrefix: 'CN-',
+    accountingSettings,
+    activeAccountingConnector: 'xero',
+  })
+
+  assert.equal(result.success, true)
+  const reversals = result.success ? result.accountingSyncs.filter((sync) => sync.type === 'UNEARNED_REV_REVERSAL') : []
+  assert.equal(reversals.length, 1, 'ONE journal — the two halves are not split apart')
+  assert.equal(reversals[0].idempotencyKey, 'sales-order-refund:refund-1:unearned-reversal', 'under the key every existing row and retry already carries')
+  assert.equal(reversals[0].connector, 'xero', 'pinned to the ledger the allocation debit was proved on, which IS the active one')
+
+  const lines = (reversals[0].payload as { lines: Array<{ accountCode: string; debit?: number; credit?: number }> }).lines
+  const unearnedDebit = lines.find((line) => line.accountCode === accountingSettings.unearnedRevenueAccount && line.debit != null)
+  assert.equal(unearnedDebit?.debit, 100, 'the A1 half is reversed IN FULL — the pin withholds nothing from it')
+  assert.equal(findAllocatedInventoryCredit(result), 20, 'and the A2 half is in the same journal')
+  assert.equal(state.orders[0].revenueDeferredDate, null, 'the A1 stamp comes off, because the liability really was taken back')
+  assert.equal(
+    state.refunds[0].allocationBasisUnresolved,
+    null,
+    'and nothing is reported as withheld: there is no A1 refusal to raise, only an A1 reversal that posted',
+  )
+})
+
+test('o3d-i0o6 r6: a refund staged against the connector A2 did NOT post on stages no pin and no credit', async () => {
+  // The other half of the claim, from the refund's side: there is no path that produces a pin naming
+  // a ledger other than `activeAccountingConnector`. A2's journal is on Xero; the books are now
+  // QuickBooks; the proof refuses rather than handing back a Xero pin, so the allocation credit is
+  // withheld and the journal that goes out is pinned to nothing at all.
+  const state = a2StagedAllocatedState()
+
+  const result = await createSalesOrderRefund(createClient(state), {
+    orderId: 'order-1',
+    lines: [{ lineId: null, productId: null, description: 'Monetary refund', qty: 0, totalBase: 100, lineKind: 'sale' }],
+    reason: 'Goodwill full refund',
+    creditNotePrefix: 'CN-',
+    accountingSettings,
+    activeAccountingConnector: 'quickbooks',
+  })
+
+  assert.equal(result.success, true)
+  const reversals = result.success ? result.accountingSyncs.filter((sync) => sync.type === 'UNEARNED_REV_REVERSAL') : []
+  assert.equal(reversals.length, 1)
+  assert.equal(reversals[0].connector, undefined, 'NOT pinned to xero — a pin is only ever the connector the proof was asked about')
+  assert.equal(findAllocatedInventoryCredit(result), null, 'and the allocation credit is withheld, not moved to another ledger')
+  assert.match(
+    String(state.refunds[0].allocationBasisUnresolved),
+    /debited Allocated Inventory on xero, but this reversal would be raised on quickbooks/,
+    'with the cross-ledger refusal named for an operator',
+  )
 })

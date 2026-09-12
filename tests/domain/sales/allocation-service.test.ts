@@ -10,11 +10,21 @@ type QueuedAccountingSync = {
   type: string
   referenceType: string
   referenceId: string
+  /**
+   * o3d-i0o6: the PIN — the ledger the caller says this row must be written under, or undefined
+   * where the caller leaves the enqueue to resolve the active connector for itself. The double
+   * below reproduces that choice faithfully, because reproducing it is the only way a test can
+   * observe a credit being queued against a connector its proof was not made on.
+   */
+  connector?: string
   payload: {
     _reversalToken?: string
     lines?: Array<{ accountCode: string; debit?: number; credit?: number }>
   }
 }
+
+/** The row as the enqueue WROTE it, carrying the connector it was actually written under. */
+type WrittenAccountingSync = QueuedAccountingSync & { connector: string }
 
 /** Every enqueue ATTEMPT, whether or not it ended up writing a row. */
 const queuedAccountingSyncs: QueuedAccountingSync[] = []
@@ -28,7 +38,7 @@ const queuedAccountingSyncs: QueuedAccountingSync[] = []
  * none of those cases. A double whose enqueue could only ever succeed can neither exercise the
  * verification nor observe its absence, so it is settable per test.
  */
-const accountingSyncRows: QueuedAccountingSync[] = []
+const accountingSyncRows: WrittenAccountingSync[] = []
 
 /**
  * What the enqueue DOES this test. `'writes'` is production's happy path; `'silent-no-op'` is the
@@ -37,27 +47,105 @@ const accountingSyncRows: QueuedAccountingSync[] = []
  */
 let accountingEnqueueOutcome: 'writes' | 'silent-no-op' = 'writes'
 
+/**
+ * o3d-i0o6: the connector the ALLOCATION_REVERSAL would be raised on, as `@/lib/accounting` reports
+ * it. Settable so a test can model the connector being SWITCHED between A2's debit and the
+ * orphaning — the case where the credit lands in books that never held the debit.
+ */
+let activeAccountingConnector: { id: string } | null = { id: 'xero' }
+
+/**
+ * o3d-i0o6: THE SWITCH ITSELF, not a connector that was already different.
+ *
+ * The defect being guarded is a connector that changes BETWEEN the proof and the enqueue, so a
+ * fixture where the connector is simply wrong from the start cannot express it — the proof would
+ * refuse and nothing would reach the enqueue. Set this and the next read of the active connector
+ * answers with today's value and THEN moves the setting, which is exactly the window nothing
+ * serialises in production.
+ */
+let activeConnectorSwitchesAfterNextReadTo: { id: string } | null | undefined
+
+/**
+ * Which connectors actually post. `queueAccountingSyncTx` resolves a posting context for the
+ * connector it is about to write under and writes NOTHING when that connector does not post the
+ * type — so a connector switched away from is typically not in here, and a pinned enqueue to it
+ * writes nothing rather than writing to the other ledger.
+ */
+let accountingConnectorsThatPost = new Set(['xero', 'quickbooks'])
+
+/** Each connector's own chart of accounts. Two different charts, because that is the point. */
+const ACCOUNTING_ACCOUNTS: Record<string, { inventoryAccount: string; allocatedInventoryAccount: string }> = {
+  xero: { inventoryAccount: '630', allocatedInventoryAccount: '631' },
+  quickbooks: { inventoryAccount: '730', allocatedInventoryAccount: '731' },
+}
+
 function resetAccountingQueue(outcome: 'writes' | 'silent-no-op' = 'writes'): void {
   queuedAccountingSyncs.length = 0
   accountingSyncRows.length = 0
   accountingEnqueueOutcome = outcome
+  activeAccountingConnector = { id: 'xero' }
+  activeConnectorSwitchesAfterNextReadTo = undefined
+  accountingConnectorsThatPost = new Set(['xero', 'quickbooks'])
   lockedAllocationRecords = null
 }
 
 mock.module('@/lib/accounting', {
   namedExports: {
-    getAccountingSettings: async () => ({
-      inventoryAccount: '630',
-      allocatedInventoryAccount: '631',
-    }),
+    /**
+     * o3d-i0o6: NOT AVAILABLE TO THIS PATH, and that is the assertion.
+     *
+     * The account codes a reversal posts against are one connector's chart, so reading them through
+     * a helper that resolves "whichever connector is active NOW" is the same defect as enqueueing
+     * that way — a third independent resolution, in a function that already proved and pinned one.
+     * Nothing in `allocation-service` or `overallocation-rebalancer` may call it, so the double
+     * refuses rather than answering: put the no-arg form back and every reversal test below fails by
+     * name instead of quietly passing on codes that happened to match.
+     */
+    getAccountingSettings: async () => {
+      throw new Error(
+        'o3d-i0o6: this path must read settings FOR the connector it proved and pinned '
+        + '(getAccountingSettingsFor), never for whichever connector is active at the moment of the read',
+      )
+    },
+    getAccountingSettingsFor: async (connector: string | null) => (
+      connector ? ACCOUNTING_ACCOUNTS[connector] ?? { inventoryAccount: '', allocatedInventoryAccount: '' }
+        : { inventoryAccount: '', allocatedInventoryAccount: '' }
+    ),
     queueAccountingSyncTx: async (_tx: unknown, params: QueuedAccountingSync) => {
       queuedAccountingSyncs.push(params)
       if (accountingEnqueueOutcome === 'silent-no-op') return false
-      accountingSyncRows.push(params)
+      // o3d-i0o6 — THE RESOLUTION PRODUCTION MAKES, MADE HERE. A PINNED caller names the ledger and
+      // the row is written under it; an UNPINNED one leaves the enqueue to resolve the active
+      // connector AT THIS MOMENT, which is after the caller's own read and is the whole race. Then
+      // the posting context: a connector that does not post this type writes nothing and throws
+      // nothing, exactly as `getAccountingPostingContextFor` returning null does.
+      const connector = params.connector ?? activeAccountingConnector?.id ?? null
+      if (!connector) return false
+      // o3d-i0o6 r7 (Codex round 6, HIGH 1) — AND THE PINNED LEDGER MUST STILL BE THE ACTIVE ONE.
+      //
+      // THIS DOUBLE WAS THE MASK. It modelled `<connector>_sync_enabled` (accountingConnectorsThatPost)
+      // and nothing else, which is exactly the gate production asked and exactly the gate that is
+      // insufficient: the active connector comes from the PLUGIN flags, the sync toggle is a separate
+      // setting a switch does not touch, so a pin to a retired ledger passed. Modelled here because a
+      // fixture that answers a question production no longer asks cannot fail when production is
+      // wrong — the whole of HIGH 1 was invisible to this file.
+      if (params.connector && params.connector !== activeAccountingConnector?.id) return false
+      if (!accountingConnectorsThatPost.has(connector)) return false
+      accountingSyncRows.push({ ...params, connector })
       return true
     },
     isAccountingSyncTypeEnabled: async () => true,
     isDailyBatchPostingEnabled: async () => true,
+    // o3d-i0o6: WHICH LEDGER this reversal would be raised on. The reversal refuses when it cannot
+    // be established, so a double that omitted it would make every reversal test assert a refusal.
+    getActiveAccountingConnectorInfo: async () => {
+      const answer = activeAccountingConnector
+      if (activeConnectorSwitchesAfterNextReadTo !== undefined) {
+        activeAccountingConnector = activeConnectorSwitchesAfterNextReadTo
+        activeConnectorSwitchesAfterNextReadTo = undefined
+      }
+      return answer
+    },
   },
 })
 
@@ -144,10 +232,43 @@ type OrderRow = {
   // o3d-o97 r4: the A2 journal the order was staged into. Whether the un-stage may clear the stamp
   // now depends on whether that journal's debit is still standing.
   allocationBatchSyncLogId?: string | null
+  // o3d-i0o6: WHICH LEDGER and WHICH ACCOUNT that journal debited. A reversal is raised on the
+  // connector active NOW against the account configured NOW, so without these a credit can land in
+  // books the debit was never in.
+  allocationBatchConnector?: string | null
+  allocationBatchAccountCode?: string | null
   // o3d-xlk7: the running total an ALLOCATION_REVERSAL credits back out of Allocated Inventory for
   // this order. The refund's open balance nets it off; without it the same units are credited twice.
   allocationReversalAmount?: number | null
+  /**
+   * o3d-i0o6 r3: the PASS HISTORY behind `allocationBatchAmount`, which accumulates across A2
+   * passes while the three columns above are replaced by the latest one. Unset, `a2PassHistory`
+   * derives the single-pass history the fixture is describing.
+   */
+  allocationBatchPasses?: unknown
   lines: OrderLineRow[]
+}
+
+/**
+ * o3d-i0o6 r3 — THE PASS HISTORY A FIXTURE IS DESCRIBING WHEN IT DOES NOT DESCRIBE ONE.
+ *
+ * `proveAllocationDebitPosting` reads `SalesOrder.allocationBatchPasses` because the recorded amount
+ * is the sum of every A2 pass while the attribution columns describe only the last. These fixtures
+ * describe an order A2 staged ONCE, so the one-entry list is derived — and ONLY where the fixture
+ * names a journal, because an amount with no journal id is the pre-attribution row those fixtures
+ * model and synthesising a pass for it would invent an attribution it has never had.
+ */
+function a2PassHistory(order: OrderRow): unknown {
+  if (order.allocationBatchPasses !== undefined) return order.allocationBatchPasses
+  if (!order.allocationBatchSyncLogId) return null
+  return [{
+    amount: String(order.allocationBatchAmount ?? 0),
+    syncLogId: order.allocationBatchSyncLogId,
+    connector: order.allocationBatchConnector ?? null,
+    accountCode: order.allocationBatchAccountCode ?? null,
+    batchRef: null,
+    at: null,
+  }]
 }
 
 type WarehouseRow = {
@@ -223,7 +344,9 @@ type MemoryState = {
   shipmentLines?: ShipmentLineRow[]
   refundLines?: RefundLineRow[]
   /** o3d-o97 r4: A2 journal rows, so a test can say whether the debit reached a ledger. */
-  accountingSyncLogs?: Array<{ id: string; status: string }>
+  // o3d-i0o6: `connector` and `payload` too — a status is not a statement about pounds, and the
+  // proof the reversal now demands is read off the journal's OWN LINES.
+  accountingSyncLogs?: Array<{ id: string; status: string; connector?: string | null; payload?: unknown }>
   /**
    * o3d-7o0: a LIVE invoice-posting claim for this order, if any. A fresh PROCESSING SALES_INVOICE
    * sync row means a worker is mid-post, and a cancellation must be refused rather than committed
@@ -332,7 +455,7 @@ function createClient(state: MemoryState): AllocationServiceClient {
     salesOrder: {
       findUnique: async ({ where }: { where: { id: string } }) => {
         if (where.id !== state.order.id) return null
-        return { ...state.order }
+        return { ...state.order, allocationBatchPasses: a2PassHistory(state.order) }
       },
       update: async ({ data }: {
         data: {
@@ -766,6 +889,7 @@ function createClient(state: MemoryState): AllocationServiceClient {
       //     is what every pre-existing cancellation test assumes.
       findFirst: async (args?: {
         where?: {
+          connector?: string
           type?: string
           referenceType?: string
           referenceId?: string
@@ -775,6 +899,10 @@ function createClient(state: MemoryState): AllocationServiceClient {
         const where = args?.where ?? {}
         if (where.payload == null) return state.syncPostingClaim ?? null
         return accountingSyncRows.find((row) => {
+          // o3d-i0o6: the connector is part of the predicate when the caller asks for it. A double
+          // that ignored it would answer "yes, queued" for a row written under another ledger, which
+          // is precisely the relief-claiming defect the caller's new predicate closes.
+          if (where.connector != null && row.connector !== where.connector) return false
           if (where.type != null && row.type !== where.type) return false
           if (where.referenceType != null && row.referenceType !== where.referenceType) return false
           if (where.referenceId != null && row.referenceId !== where.referenceId) return false
@@ -2381,13 +2509,21 @@ function shrunkState(options: {
   record: Array<Record<string, string>> | null
 }): ReturnType<typeof baseState> {
   const product = { id: 'product-1', sku: 'SKU-1', type: 'SIMPLE' as const, oversellAllowed: false }
-  return baseState({
+  const state = baseState({
     order: {
       ...baseState().order,
       status: 'ALLOCATED',
       // A2 has run and posted: 10 units, £40.
       inventoryAllocatedDate: new Date('2026-01-01T00:00:00Z'),
       allocationBatchAmount: 40,
+      // o3d-i0o6: "A2 has run and POSTED" is not a thing an amount can say on its own, and the
+      // reversal no longer takes it on trust — so the fixture states the whole fact A2 records with
+      // the amount: the journal it staged this order into, the ledger that journal was raised on,
+      // and the account it debited. Without these the tests below would be asserting the amount of a
+      // reversal that (rightly) never happens.
+      allocationBatchSyncLogId: 'a2-log-1',
+      allocationBatchConnector: 'xero',
+      allocationBatchAccountCode: '631',
       lines: [{ id: 'line-1', productId: 'product-1', qty: options.lineQty, sku: 'SKU-1', description: 'Product 1', product }],
     },
     warehouses: [
@@ -2406,6 +2542,15 @@ function shrunkState(options: {
       costLayerSnapshot: options.record,
     }],
   })
+  // The A2 journal itself: SETTLED, on xero, and its own lines really do debit 631 — the whole
+  // day's window, of which this order's £40 is one member.
+  state.accountingSyncLogs = [{
+    id: 'a2-log-1',
+    status: 'SYNCED',
+    connector: 'xero',
+    payload: { lines: [{ accountCode: '631', debit: 500 }, { accountCode: '630', credit: 500 }] },
+  }]
+  return state
 }
 
 /** What A2 wrote when it posted: the pin, AND the amount it posted for each unit. */
@@ -5195,4 +5340,309 @@ test('o3d-aqke: an exact availability is still allocated in full', async () => {
   assert.equal(result.success, true)
   assert.equal((state.allocations ?? [])[0]?.qty, 3)
   assert.equal(state.stockLevels[0].reservedQty, 3)
+})
+
+// ---------------------------------------------------------------------------------------------
+// o3d-i0o6 — A REVERSAL MAY ONLY BE RAISED ON PROOF THAT THE DEBIT POSTED, WHERE THIS CREDIT LANDS.
+//
+// `postedUnitCostBase` is an amount A2 WROTE onto the entry. o3d-o97 r3 established, on this exact
+// contra and about the per-order twin of that field, that an amount written beside a stamp proves
+// NEITHER POSTING NOR DESTINATION: the batch log is created only when the window's rounded total is
+// positive while the amounts are stamped unconditionally; the log is created PENDING and the remote
+// call is a different transaction that can end FAILED or CANCELLED; and the amount names no ledger
+// and no account.
+//
+// These tests are about the direction of that error that MOVES MONEY THAT WAS NEVER THERE.
+// ---------------------------------------------------------------------------------------------
+
+/** A2 staged this order into journal `a2-log-1` on xero, account 631, and the journal did X. */
+function withA2Journal(
+  state: ReturnType<typeof baseState>,
+  options: { status?: string | null; connector?: string; accountCode?: string; journalDebit?: number } = {},
+): ReturnType<typeof baseState> {
+  const connector = options.connector ?? 'xero'
+  const accountCode = options.accountCode ?? '631'
+  state.order.allocationBatchSyncLogId = 'a2-log-1'
+  state.order.allocationBatchConnector = connector
+  state.order.allocationBatchAccountCode = accountCode
+  state.accountingSyncLogs = options.status == null ? [] : [{
+    id: 'a2-log-1',
+    status: options.status,
+    connector,
+    // The WINDOW's debit — this order's £40 is one member of a whole day's batch.
+    payload: { lines: [{ accountCode, debit: options.journalDebit ?? 500 }, { accountCode: '630', credit: options.journalDebit ?? 500 }] },
+  }]
+  return state
+}
+
+function reversalRefusals(): Array<Record<string, unknown>> {
+  return activityLogWrites.filter((row) => row.action === 'allocation_reversal_unproved')
+}
+
+test('o3d-i0o6: the CONTROL — a proved A2 journal still gets its £16 reversal', async () => {
+  const state = withA2Journal(shrunkState({ lineQty: 6, record: POSTED_TEN_AT_FOUR }), { status: 'SYNCED' })
+  resetAccountingQueue()
+
+  await allocateSalesOrder(createClient(state), { orderId: 'order-1' })
+
+  assert.equal(queuedAccountingSyncs.length, 1, 'the reversal is raised where the debit is proved')
+  assert.deepEqual(
+    queuedAccountingSyncs[0].payload.lines?.map((line) => [line.accountCode, line.debit ?? null, line.credit ?? null]),
+    [['630', 16, null], ['631', null, 16]],
+  )
+  assert.deepEqual(reversalRefusals(), [], 'and nothing is refused')
+  assert.equal(state.order.allocationReversalAmount, 16, 'the relief is recorded for the refund to net off')
+})
+
+test('o3d-i0o6: NOTHING is credited when the A2 journal never posted (FAILED)', async () => {
+  // A2 valued 10 units at £4 and stamped `postedUnitCostBase` inside the batch transaction. The
+  // remote call is a DIFFERENT transaction and it failed — a locked period, an archived account, an
+  // expired token. Allocated Inventory holds NOTHING for this order.
+  //
+  // MONEY: shrinking the row to 6 units orphans 4. On the old rule that is CR Allocated Inventory
+  // £16 / DR Inventory £16 against a £0 debit — £16 taken out of an account that never received it,
+  // and Inventory overstated by the same £16, permanently, with no refund able to notice.
+  const state = withA2Journal(shrunkState({ lineQty: 6, record: POSTED_TEN_AT_FOUR }), { status: 'FAILED' })
+  resetAccountingQueue()
+
+  await allocateSalesOrder(createClient(state), { orderId: 'order-1' })
+
+  assert.deepEqual(
+    queuedAccountingSyncs.map((sync) => sync.type),
+    [],
+    'no journal at all — a credit against a debit that never posted moves money that was never there',
+  )
+  const refused = reversalRefusals()
+  assert.equal(refused.length, 1, 'and it is REPORTED, loudly, rather than dropped')
+  assert.equal(refused[0].level, 'ERROR')
+  assert.match(String(refused[0].description), /£16\.00/, 'the amount an operator would have to post by hand')
+  assert.match(String(refused[0].description), /is FAILED, not SYNCED/)
+  assert.equal(state.order.allocationReversalAmount ?? null, null, 'and NO relief is claimed for a journal nobody raised')
+})
+
+test('o3d-i0o6: NOTHING is credited when the A2 journal is still PENDING', async () => {
+  const state = withA2Journal(shrunkState({ lineQty: 6, record: POSTED_TEN_AT_FOUR }), { status: 'PENDING' })
+  resetAccountingQueue()
+
+  await allocateSalesOrder(createClient(state), { orderId: 'order-1' })
+
+  assert.deepEqual(queuedAccountingSyncs.map((sync) => sync.type), [])
+  assert.match(String(reversalRefusals()[0]?.description), /is PENDING, not SYNCED/)
+})
+
+test('o3d-i0o6: NOTHING is credited when the A2 journal was CANCELLED', async () => {
+  // o3d-o97 r5: CANCELLED is an abandonment written by a sweep or an operator who cannot see whether
+  // the call had already landed. It is not proof the debit posted, and it is not proof it did not —
+  // so a reversal may not be raised on it either way, and a human decides.
+  const state = withA2Journal(shrunkState({ lineQty: 6, record: POSTED_TEN_AT_FOUR }), { status: 'CANCELLED' })
+  resetAccountingQueue()
+
+  await allocateSalesOrder(createClient(state), { orderId: 'order-1' })
+
+  assert.deepEqual(queuedAccountingSyncs.map((sync) => sync.type), [])
+  assert.match(String(reversalRefusals()[0]?.description), /is CANCELLED, not SYNCED/)
+})
+
+test('o3d-i0o6: NOTHING is credited on a connector that never held the debit', async () => {
+  // A2 debited Allocated Inventory on XERO. The connector has since been switched to QuickBooks, and
+  // `queueAccountingSyncTx` raises on whatever is active NOW. The old rule would credit QuickBooks
+  // £16 for a debit that is sitting in Xero — TWO errors in one journal: £16 moved in books that
+  // never held it, and the Xero £16 left standing for ever.
+  const state = withA2Journal(shrunkState({ lineQty: 6, record: POSTED_TEN_AT_FOUR }), { status: 'SYNCED', connector: 'xero' })
+  resetAccountingQueue()
+  activeAccountingConnector = { id: 'quickbooks' }
+
+  await allocateSalesOrder(createClient(state), { orderId: 'order-1' })
+
+  assert.deepEqual(queuedAccountingSyncs.map((sync) => sync.type), [])
+  assert.match(String(reversalRefusals()[0]?.description), /A2 debited Allocated Inventory on xero, but this reversal would be raised on quickbooks/)
+})
+
+test('o3d-i0o6: NOTHING is credited against an account A2 never debited', async () => {
+  // The Allocated Inventory setting was re-mapped from 632 to 631 after A2 ran. The credit would land
+  // on 631; the debit is on 632.
+  const state = withA2Journal(shrunkState({ lineQty: 6, record: POSTED_TEN_AT_FOUR }), { status: 'SYNCED', accountCode: '632' })
+  resetAccountingQueue()
+
+  await allocateSalesOrder(createClient(state), { orderId: 'order-1' })
+
+  assert.deepEqual(queuedAccountingSyncs.map((sync) => sync.type), [])
+  assert.match(String(reversalRefusals()[0]?.description), /A2 debited account 632, but Allocated Inventory is configured as 631 today/)
+})
+
+test('o3d-i0o6: NOTHING is credited when retention has swept the A2 journal', async () => {
+  const state = withA2Journal(shrunkState({ lineQty: 6, record: POSTED_TEN_AT_FOUR }), { status: null })
+  resetAccountingQueue()
+
+  await allocateSalesOrder(createClient(state), { orderId: 'order-1' })
+
+  assert.deepEqual(queuedAccountingSyncs.map((sync) => sync.type), [])
+  assert.match(String(reversalRefusals()[0]?.description), /no longer on record \(retention\)/)
+})
+
+test('o3d-i0o6: NOTHING is credited when the settled journal debited that account nothing', async () => {
+  // SYNCED says the ROW settled, never what it credited. A journal whose own lines put nothing into
+  // Allocated Inventory cannot be what put £40 there.
+  const state = withA2Journal(shrunkState({ lineQty: 6, record: POSTED_TEN_AT_FOUR }), { status: 'SYNCED', journalDebit: 0 })
+  resetAccountingQueue()
+
+  await allocateSalesOrder(createClient(state), { orderId: 'order-1' })
+
+  assert.deepEqual(queuedAccountingSyncs.map((sync) => sync.type), [])
+  assert.match(String(reversalRefusals()[0]?.description), /its lines debit nothing to Allocated Inventory/)
+})
+
+test('o3d-i0o6: NOTHING is credited when the order claims a bigger share than its batch carried', async () => {
+  const state = withA2Journal(shrunkState({ lineQty: 6, record: POSTED_TEN_AT_FOUR }), { status: 'SYNCED', journalDebit: 25 })
+  resetAccountingQueue()
+
+  await allocateSalesOrder(createClient(state), { orderId: 'order-1' })
+
+  assert.deepEqual(queuedAccountingSyncs.map((sync) => sync.type), [])
+  assert.match(String(reversalRefusals()[0]?.description), /a share cannot exceed its batch/)
+})
+
+test('o3d-i0o6: NOTHING is credited when the ledger this credit would land in is unknown', async () => {
+  // An OPTIONAL connector reads as the permissive answer when absent. It is not optional here: a
+  // caller that cannot say which books it is about to post into has not established the fact.
+  const state = withA2Journal(shrunkState({ lineQty: 6, record: POSTED_TEN_AT_FOUR }), { status: 'SYNCED' })
+  resetAccountingQueue()
+  activeAccountingConnector = null
+
+  await allocateSalesOrder(createClient(state), { orderId: 'order-1' })
+
+  assert.deepEqual(queuedAccountingSyncs.map((sync) => sync.type), [])
+  assert.match(String(reversalRefusals()[0]?.description), /cannot be established/)
+})
+
+// ---------------------------------------------------------------------------------------------
+// o3d-i0o6 r2 — AND THE LEDGER CANNOT MOVE BETWEEN THE PROOF AND THE ENQUEUE.
+//
+// The proof above establishes "A2's debit posted on THIS connector". r1 then handed the credit to
+// `queueAccountingSyncTx`, which resolved the active connector AGAIN, for itself, from a setting
+// nothing had locked. Two reads, no serialisation: the proof could pass for one ledger and the
+// credit be written for another — and the post-enqueue check asked for the row by token alone, so
+// it found the foreign row, answered "queued", and the caller recorded those pounds as relief
+// against the refund's open balance. The reversal is now PINNED to the connector the verdict names.
+// ---------------------------------------------------------------------------------------------
+
+test('o3d-i0o6 r7: a connector that switches after the proof queues NOTHING — and claims no relief', async () => {
+  // r2 WROTE THIS TEST THE OTHER WAY ROUND, and r7 (Codex round 6, HIGH 1) reverses its assertion.
+  //
+  // r2's finding was real and is unchanged: an UNPINNED enqueue here writes a QuickBooks credit
+  // against a Xero debit — money out of an account that never held it. The pin fixed that. What r2
+  // then asserted was that the pinned row IS WRITTEN, to Xero, and that £16 of relief is recorded
+  // against it. Both halves are the defect r7 closes:
+  //
+  //   `xero_sync_enabled` is a different setting from `plugin_xero_enabled`, and a switch moves only
+  //   the second. So the pinned enqueue passed its own gate and wrote a PENDING Xero row, while
+  //   `app/api/cron/accounting-sync` had already taken the QuickBooks branch and returned. Nothing
+  //   SCHEDULED drains it. `assertAllocationReversalQueued` then asked the database for the row —
+  //   the right question — found it, and the caller added £16 to `allocationReversalAmount`, which
+  //   is what a later refund nets its open Allocated Inventory balance against. Unposted pounds read
+  //   as relief; every later refund under-credits Allocated Inventory by that much.
+  //
+  // The pin still does the job r2 gave it — it is what stops the credit landing in QuickBooks — but
+  // it may not also license a write to a ledger nothing scheduled is servicing. See
+  // `pinnedLedgerIsServiced` in lib/accounting.ts for why this refuses rather than queueing and
+  // declining to count it (the manual Sync button can still drain such a row, so not counting it
+  // would create the symmetric double-credit).
+  const state = withA2Journal(shrunkState({ lineQty: 6, record: POSTED_TEN_AT_FOUR }), { status: 'SYNCED' })
+  resetAccountingQueue()
+  // The setting moves to quickbooks the instant the proof has read it — the window nothing closes.
+  activeConnectorSwitchesAfterNextReadTo = { id: 'quickbooks' }
+
+  await allocateSalesOrder(createClient(state), { orderId: 'order-1' })
+
+  assert.equal(queuedAccountingSyncs.length, 1, 'the enqueue was attempted, pinned to the proved ledger')
+  assert.equal(queuedAccountingSyncs[0].connector, 'xero', 'and to xero — never to whichever connector is active now')
+  assert.deepEqual(
+    accountingSyncRows,
+    [],
+    'but NOTHING was written: xero is no longer the active connector, so no scheduled drain services '
+    + 'the queue this row would sit in',
+  )
+  assert.equal(
+    state.order.allocationReversalAmount ?? 0,
+    0,
+    'and no relief is claimed. £16 recorded here against an unposted row is £16 a later refund nets '
+    + 'off its open Allocated Inventory balance and never credits back',
+  )
+  const dropped = activityLogWrites.filter((row) => row.action === 'allocation_reversal_unqueued')
+  assert.equal(dropped.length, 1, 'the amount is reported for a human to post by hand instead')
+  assert.match(String(dropped[0].description), /£16\.00/)
+})
+
+test('o3d-i0o6 r7: THE CONTROL — no switch, and the reversal is queued and its relief recorded', async () => {
+  // The guard must be a narrowing, not a blanket refusal: the same order, the same proof, with the
+  // connector left where it was, still raises the credit on xero and still records the £16 of relief.
+  // Without this the test above would pass for a fix that simply stopped raising reversals.
+  const state = withA2Journal(shrunkState({ lineQty: 6, record: POSTED_TEN_AT_FOUR }), { status: 'SYNCED' })
+  resetAccountingQueue()
+
+  await allocateSalesOrder(createClient(state), { orderId: 'order-1' })
+
+  assert.equal(accountingSyncRows.length, 1, 'the reversal IS raised when the proved ledger is still the active one')
+  assert.equal(accountingSyncRows[0].connector, 'xero')
+  assert.equal(state.order.allocationReversalAmount, 16, 'and the relief recorded matches the row that was written')
+  assert.deepEqual(
+    activityLogWrites.filter((row) => row.action === 'allocation_reversal_unqueued'),
+    [],
+    'and nothing is reported as un-queued',
+  )
+})
+
+test('o3d-i0o6 r2: a switch AWAY from the proved ledger queues nothing and claims NO relief', async () => {
+  // The switch that took xero out of service altogether. There is now no connector that both posts
+  // this type and holds the debit, so the only honest outcome is to raise nothing and report it —
+  // never to credit the ledger that happens to be switched on.
+  const state = withA2Journal(shrunkState({ lineQty: 6, record: POSTED_TEN_AT_FOUR }), { status: 'SYNCED' })
+  resetAccountingQueue()
+  activeConnectorSwitchesAfterNextReadTo = { id: 'quickbooks' }
+  accountingConnectorsThatPost = new Set(['quickbooks'])
+
+  await allocateSalesOrder(createClient(state), { orderId: 'order-1' })
+
+  assert.equal(queuedAccountingSyncs.length, 1, 'the enqueue was attempted')
+  assert.deepEqual(accountingSyncRows, [], 'and wrote nothing — the pinned ledger does not post this type')
+  assert.equal(
+    state.order.allocationReversalAmount ?? 0,
+    0,
+    'so NO relief is claimed. Unpinned, £16 lands in quickbooks and is recorded as relief against a '
+    + 'xero debit — which then shrinks the refund\'s open balance and strands the real £16 for ever',
+  )
+  const dropped = activityLogWrites.filter((row) => row.action === 'allocation_reversal_unqueued')
+  assert.equal(dropped.length, 1, 'and the amount is reported for a human to post by hand')
+  assert.match(String(dropped[0].description), /£16\.00/)
+})
+
+test('o3d-i0o6: repeated shrinks together cannot credit more than A2 debited', async () => {
+  // £40 debited; £30 of it already credited back by an earlier orphaning. Only £10 is open, and this
+  // shrink's own snapshot arithmetic says £16. Uncapped, the two reversals credit £46 against a £40
+  // debit — £6 of an account that never held it.
+  const state = withA2Journal(shrunkState({ lineQty: 6, record: POSTED_TEN_AT_FOUR }), { status: 'SYNCED' })
+  state.order.allocationReversalAmount = 30
+  resetAccountingQueue()
+
+  await allocateSalesOrder(createClient(state), { orderId: 'order-1' })
+
+  assert.equal(queuedAccountingSyncs.length, 1)
+  assert.deepEqual(
+    queuedAccountingSyncs[0].payload.lines?.map((line) => [line.accountCode, line.debit ?? null, line.credit ?? null]),
+    [['630', 10, null], ['631', null, 10]],
+    'capped at the £10 still open, not the £16 the snapshot alone would have credited',
+  )
+  assert.equal(state.order.allocationReversalAmount, 40, 'and the running total lands exactly on what A2 debited')
+})
+
+test('o3d-i0o6: a shrink on a fully-reversed order credits nothing at all', async () => {
+  const state = withA2Journal(shrunkState({ lineQty: 6, record: POSTED_TEN_AT_FOUR }), { status: 'SYNCED' })
+  state.order.allocationReversalAmount = 40
+  resetAccountingQueue()
+
+  await allocateSalesOrder(createClient(state), { orderId: 'order-1' })
+
+  assert.deepEqual(queuedAccountingSyncs.map((sync) => sync.type), [])
+  assert.match(String(reversalRefusals()[0]?.description), /already been credited back/)
+  assert.equal(state.order.allocationReversalAmount, 40, 'the running total does not move')
 })

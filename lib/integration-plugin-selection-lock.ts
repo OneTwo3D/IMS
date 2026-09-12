@@ -119,3 +119,46 @@ export function resolveActiveAccountingConnector(
   if (state.quickbooks) return 'quickbooks'
   return null
 }
+
+/**
+ * o3d-i0o6 r8 (Codex round 7, HIGH) — THE PINNED-LEDGER CHECK, FENCED.
+ *
+ * Round 7 established the rule: a credit may be queued only to a ledger something still drains, so
+ * a pinned enqueue whose connector is no longer the ACTIVE one refuses instead of writing. What it
+ * enforced the rule with was an UNLOCKED snapshot — `getActiveAccountingConnectorId()` over the
+ * pooled client — and then both enqueue paths awaited more work before their INSERT: the posting
+ * context, the id-provenance read, the follow-up scope lock, the prior-attempt query. A connector
+ * switch committing anywhere in that window put the row onto the now-inactive connector anyway, and
+ * the orphan path then found that row and recorded its amount as posted relief, so every later
+ * refund under-credits Allocated Inventory by it. The rule was right and its enforcement had a
+ * window; this closes the window.
+ *
+ * ONE MECHANISM, NOT A SECOND ONE. This is `lockIntegrationPluginSelection` — the lock the
+ * plugin-selection writers already take, the advisory key plus the `FOR UPDATE` row locks — applied
+ * to the question the enqueue asks. Taken through the CALLER'S transaction, which is the whole
+ * point: a transactional advisory lock and a row lock are held to COMMIT, so from the moment this
+ * returns `true` until the transaction that asked ends, no writer can commit a change to the plugin
+ * rows. The insert that follows is therefore inside the fence rather than after a check. A
+ * compensating re-check afterwards was the alternative and is strictly worse: by then the row
+ * exists, and nothing un-writes a queued credit.
+ *
+ * THE RULE IS `resolveActiveAccountingConnector`, the same Xero-first function
+ * `cancelOrphanedAccountingSyncRows` resolves its own locked read through — so the fenced verdict
+ * and the pooled one are the same rule over two sources, never two rules. The pooled form
+ * (`pinnedLedgerIsServiced` in lib/accounting.ts) survives only as an EARLY refusal on the facade,
+ * where it fixes the precedence of `refused` over `not-configured`; it decides nothing this does not
+ * re-decide under the lock.
+ *
+ * LOCK ORDER: sales-order row lock FIRST, this SECOND, follow-up scope lock THIRD. Every enqueue
+ * writer already took the order lock (hoisted by the caller for the in-transaction enqueue, taken by
+ * `lockOrderForAccountingEnqueue` for the connector queues) before reaching here, and no
+ * plugin-selection writer anywhere takes a sales-order lock at all — `resetDatabase` takes this lock
+ * first inside its own transaction and never holds an order row — so no pair of transactions can take
+ * these two in opposite orders.
+ */
+export async function pinnedLedgerIsServicedUnderLock(
+  tx: PluginSelectionLockTx,
+  connector: NonNullable<AccountingConnectorSelection>,
+): Promise<boolean> {
+  return resolveActiveAccountingConnector(await lockIntegrationPluginSelection(tx)) === connector
+}

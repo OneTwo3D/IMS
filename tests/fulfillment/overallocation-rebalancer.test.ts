@@ -44,6 +44,16 @@ type AllocationRow = {
     status: string
     createdAt: string
     inventoryAllocatedDate: Date | null
+    // o3d-i0o6: what A2 recorded posting, and WHERE. The reversal proves the debit from these, so a
+    // row type that omitted them would make every proof in this file answer the same way.
+    allocationBatchAmount?: number | null
+    allocationBatchSyncLogId?: string | null
+    allocationBatchConnector?: string | null
+    allocationBatchAccountCode?: string | null
+    allocationReversalAmount?: number | null
+    // o3d-i0o6 r3: the PASS HISTORY the proof reads, because the amount above is cumulative across
+    // A2 passes while the three columns beside it describe the latest one.
+    allocationBatchPasses?: unknown
   }
 }
 
@@ -74,7 +84,14 @@ const state = {
    * `logActivity` mock) so a test can tell the two apart — that distinction is the whole point.
    */
   txActivity: [] as Row[],
-  accountingSyncLogs: [] as Array<{ id: string; status: string }>,
+  accountingSyncLogs: [] as Array<{ id: string; status: string; connector?: string | null; payload?: unknown }>,
+  /**
+   * o3d-i0o6: the SALES ORDER rows, held apart from the allocation rows that reference them. The
+   * whole-row release DELETES the allocation and then raises the reversal, so a double that found
+   * the order only through its allocations answered `null` for the one path that destroys the most
+   * evidence — and the reversal would refuse for a reason production never has.
+   */
+  orderRows: {} as Record<string, ReturnType<typeof order>>,
   /** o3d-4kfh r5 (finding 4): what the post-release FIFO pass was actually asked to repair. */
   backorderCalls: [] as Array<{ productIds: string[] }>,
   stockLevels: [] as StockLevelRow[],
@@ -108,6 +125,7 @@ function reset() {
   state.activity.length = 0
   state.txActivity.length = 0
   state.accountingSyncLogs.length = 0
+  state.orderRows = {}
   state.backorderCalls.length = 0
   state.allocations.length = 0
   state.shipments.length = 0
@@ -145,6 +163,8 @@ type QueuedAccountingSync = {
   type: string
   referenceType: string
   referenceId: string
+  /** o3d-i0o6: the ledger the caller pinned this row to, if it pinned one. */
+  connector?: string
   payload: {
     _reversalToken?: string
     lines?: Array<{ accountCode: string; debit?: number; credit?: number }>
@@ -155,14 +175,29 @@ const accountingSyncRows: QueuedAccountingSync[] = []
 
 mock.module('@/lib/accounting', {
   namedExports: {
-    getAccountingSettings: async () => ({ inventoryAccount: '630', allocatedInventoryAccount: '631' }),
+    // o3d-i0o6: the reversal reads settings FOR the connector it proved and pinned, never for
+    // whichever is active at the moment of the read — a third independent resolution in a function
+    // that already has one. The no-arg form refuses so a regression to it fails by name.
+    getAccountingSettings: async () => {
+      throw new Error('o3d-i0o6: use getAccountingSettingsFor(provedConnector), not the active-connector form')
+    },
+    getAccountingSettingsFor: async (connector: string | null) => (
+      connector === 'xero'
+        ? { inventoryAccount: '630', allocatedInventoryAccount: '631' }
+        : { inventoryAccount: '', allocatedInventoryAccount: '' }
+    ),
     queueAccountingSyncTx: async (_tx: unknown, params: QueuedAccountingSync) => {
       queuedAccountingSyncs.push(params)
-      accountingSyncRows.push(params)
+      // o3d-i0o6: written under the PIN where one was given — an unpinned enqueue resolves the
+      // active connector for itself, which is the race the pin closes.
+      accountingSyncRows.push({ ...params, connector: params.connector ?? 'xero' })
       return true
     },
     isAccountingSyncTypeEnabled: async () => true,
     isDailyBatchPostingEnabled: async () => true,
+    // o3d-i0o6: the ledger the reversal would be raised on. A credit may not be raised on a
+    // connector A2's debit was never in, so the reverser resolves it and REFUSES when it cannot.
+    getActiveAccountingConnectorInfo: async () => ({ id: 'xero' }),
   },
 })
 
@@ -230,12 +265,17 @@ const tx = {
   accountingSyncLog: {
     findFirst: async ({ where }: {
       where: {
+        connector?: string
         type?: string
         referenceType?: string
         referenceId?: string
         payload?: { path: string[]; equals: unknown }
       }
     }) => accountingSyncRows.find((row) => {
+      // o3d-i0o6: the connector is part of the predicate — a row written under another ledger is
+      // not this reversal, and answering "queued" for one is how relief gets claimed in books that
+      // never held the debit.
+      if (where.connector != null && row.connector !== where.connector) return false
       if (where.type != null && row.type !== where.type) return false
       if (where.referenceType != null && row.referenceType !== where.referenceType) return false
       if (where.referenceId != null && row.referenceId !== where.referenceId) return false
@@ -258,11 +298,26 @@ const tx = {
     create: async ({ data }: { data: Row }) => { state.txActivity.push(data); return data },
   },
   salesOrder: {
+    // o3d-i0o6: the WHOLE row the reverser selects, from the fixture — not two hardcoded fields.
+    // A double that answered the A2 attribution with `undefined` would make every proof in this file
+    // decide the same way regardless of what the test seeded.
     findUnique: async ({ where }: { where: { id: string } }) => {
-      const alloc = state.allocations.find((row) => row.orderId === where.id)
+      const row = state.allocations.find((entry) => entry.orderId === where.id)?.order
+        ?? state.orderRows[where.id]
+      if (!row) return null
       return {
-        orderNumber: alloc?.order.orderNumber ?? null,
-        externalOrderNumber: alloc?.order.externalOrderNumber ?? null,
+        orderNumber: row.orderNumber ?? null,
+        externalOrderNumber: row.externalOrderNumber ?? null,
+        inventoryAllocatedDate: row.inventoryAllocatedDate ?? null,
+        allocationBatchAmount: row.allocationBatchAmount ?? null,
+        allocationBatchSyncLogId: row.allocationBatchSyncLogId ?? null,
+        allocationBatchConnector: row.allocationBatchConnector ?? null,
+        allocationBatchAccountCode: row.allocationBatchAccountCode ?? null,
+        // o3d-i0o6 r3: the pass history the proof reads. Dropped here, every fixture would look
+        // like an order with no recorded passes and every reversal assertion would measure a
+        // refusal — the defective-double shape this file's own notes warn about.
+        allocationBatchPasses: row.allocationBatchPasses ?? null,
+        allocationReversalAmount: row.allocationReversalAmount ?? null,
       }
     },
     update: async ({ data }: { data: Row }) => {
@@ -483,7 +538,7 @@ async function loadRebalancer() {
   return import('@/lib/fulfillment/overallocation-rebalancer')
 }
 
-function order(
+function buildOrder(
   id: string,
   overrides: {
     status?: string
@@ -493,6 +548,11 @@ function order(
     // may clear the stamp or must keep it.
     allocationBatchAmount?: number | null
     allocationBatchSyncLogId?: string | null
+    // o3d-i0o6: WHICH ledger and WHICH account that journal debited. The reversal credits the
+    // connector active NOW against the account configured NOW, so it refuses unless these agree.
+    allocationBatchConnector?: string | null
+    allocationBatchAccountCode?: string | null
+    allocationReversalAmount?: number | null
   } = {},
 ) {
   return {
@@ -504,6 +564,55 @@ function order(
     inventoryAllocatedDate: overrides.inventoryAllocatedDate ?? null,
     allocationBatchAmount: overrides.allocationBatchAmount ?? null,
     allocationBatchSyncLogId: overrides.allocationBatchSyncLogId ?? null,
+    allocationBatchConnector: overrides.allocationBatchConnector ?? null,
+    allocationBatchAccountCode: overrides.allocationBatchAccountCode ?? null,
+    allocationReversalAmount: overrides.allocationReversalAmount ?? null,
+    // o3d-i0o6 r3 — THE PASS HISTORY, WHICH IS WHAT THE PROOF READS.
+    //
+    // `allocationBatchAmount` accumulates across A2 passes while the three columns above are
+    // replaced by the latest, so a verdict of `posted` for the cumulative figure is only available
+    // where every pass is on record. These fixtures describe an order A2 staged ONCE, so the
+    // one-entry history is derived — and only where a journal is named, because an amount with no
+    // journal is the pre-attribution row some of them model.
+    allocationBatchPasses: overrides.allocationBatchSyncLogId
+      ? [{
+          amount: String(overrides.allocationBatchAmount ?? 0),
+          syncLogId: overrides.allocationBatchSyncLogId,
+          connector: overrides.allocationBatchConnector ?? null,
+          accountCode: overrides.allocationBatchAccountCode ?? null,
+          batchRef: null,
+          at: null,
+        }]
+      : null,
+  }
+}
+
+function order(id: string, overrides: Parameters<typeof buildOrder>[1] = {}) {
+  const row = buildOrder(id, overrides)
+  state.orderRows[id] = row
+  return row
+}
+
+/**
+ * o3d-i0o6: A2 POSTED for this order, and can prove it — the whole three-part attribution plus the
+ * settled journal row its id resolves to. `postedUnitCostBase` on the snapshot says how many pounds
+ * the units carried; only this says a journal carried them, and into which books.
+ */
+function postedA2Debit(amount = 40, overrides: { status?: string; connector?: string; accountCode?: string } = {}) {
+  const connector = overrides.connector ?? 'xero'
+  const accountCode = overrides.accountCode ?? '631'
+  state.accountingSyncLogs.push({
+    id: 'a2-log-1',
+    status: overrides.status ?? 'SYNCED',
+    connector,
+    payload: { lines: [{ accountCode, debit: 500 }, { accountCode: '630', credit: 500 }] },
+  })
+  return {
+    inventoryAllocatedDate: new Date('2026-01-01T00:00:00Z'),
+    allocationBatchAmount: amount,
+    allocationBatchSyncLogId: 'a2-log-1',
+    allocationBatchConnector: connector,
+    allocationBatchAccountCode: accountCode,
   }
 }
 
@@ -1121,7 +1230,7 @@ test('o3d-0i5y r11: a PARTIAL over-allocation release reverses the A2 debit of t
     warehouseId: 'warehouse-1',
     qty: 10,
     costLayerSnapshot: POSTED_AT_FOUR('10.000000'),
-    order: order('order-1', { inventoryAllocatedDate: new Date('2026-01-01T00:00:00Z') }),
+    order: order('order-1', postedA2Debit()),
   }]
   state.lines = [{ id: 'line-1', orderId: 'order-1' }]
   const { releaseOverallocations } = await loadRebalancer()
@@ -1167,7 +1276,10 @@ test('o3d-0i5y r11: a WHOLE-ROW release reverses the whole posted debit', async 
     warehouseId: 'warehouse-1',
     qty: 10,
     costLayerSnapshot: POSTED_AT_FOUR('10.000000'),
-    order: order('order-1'),
+    // o3d-i0o6: no stamp, but the ATTRIBUTION A2 wrote with the amount survives — which is exactly
+    // the state r10's stamp-only clear leaves behind, and the reason the proof is asked of the
+    // attribution rather than of the stamp.
+    order: order('order-1', { ...postedA2Debit(), inventoryAllocatedDate: null }),
   }]
   state.lines = [{ id: 'line-1', orderId: 'order-1' }]
   const { releaseOverallocations } = await loadRebalancer()
@@ -1213,7 +1325,7 @@ test('o3d-0i5y r11: the sweep hoists the order lock through lockSalesOrder, whic
     warehouseId: 'warehouse-1',
     qty: 10,
     costLayerSnapshot: POSTED_AT_FOUR('10.000000'),
-    order: order('order-lock'),
+    order: order('order-lock', postedA2Debit()),
   }]
   state.lines = [{ id: 'line-1', orderId: 'order-lock' }]
   const { releaseOverallocations } = await loadRebalancer()

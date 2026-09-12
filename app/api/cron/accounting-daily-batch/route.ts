@@ -1,9 +1,8 @@
 import { NextResponse } from 'next/server'
 import { verifyCron } from '@/lib/cron-auth'
 import { enforceCronRateLimit } from '@/lib/cron-rate-limit'
-import { db } from '@/lib/db'
 import { getMaintenanceModeResponse } from '@/lib/maintenance-mode'
-import { isIntegrationPluginEnabled } from '@/lib/integration-plugins'
+import { resolveScheduledDailyBatchSweep } from '@/lib/domain/accounting/daily-batch-sweep-schedule'
 import { appendCronRunId, cronRunResponseInit, runCronWithLogging } from '@/lib/ops/cron-run'
 
 export async function GET(request: Request) {
@@ -17,29 +16,19 @@ export async function GET(request: Request) {
   const { runId, result } = await runCronWithLogging({
     jobName: 'accounting-daily-batch',
     run: async () => {
-      if (await isIntegrationPluginEnabled('xero')) {
-        const [batchEnabled, syncEnabled] = await Promise.all([
-          db.setting.findUnique({ where: { key: 'xero_daily_batch_enabled' } }),
-          db.setting.findUnique({ where: { key: 'xero_sync_enabled' } }),
-        ])
-        if (batchEnabled?.value !== 'true') return { skipped: true, reason: 'Xero daily batch disabled' }
-        if (syncEnabled?.value !== 'true') return { skipped: true, reason: 'Xero sync disabled' }
+      // o3d-i0o6 r6: which sweep runs — and the skip reasons — come from the SHARED definition, not
+      // from an if-chain only this file can see. The sweeps themselves have to answer the same
+      // question (`resolveScheduledDailyBatchSweep`) to tell "another ledger's missing journal that
+      // its own sweep will rebuild" from "one nobody is coming for", and two spellings of it would
+      // let them silence pounds this route had stopped scheduling.
+      const schedule = await resolveScheduledDailyBatchSweep()
+      if (schedule.connector === null) return { skipped: true, reason: schedule.reason }
+      if (schedule.connector === 'xero') {
         const { runDailyBatchSync } = await import('@/lib/connectors/xero/daily-sync')
         return await runDailyBatchSync() as Record<string, unknown>
       }
-
-      if (await isIntegrationPluginEnabled('quickbooks')) {
-        const [batchEnabled, syncEnabled] = await Promise.all([
-          db.setting.findUnique({ where: { key: 'quickbooks_daily_batch_enabled' } }),
-          db.setting.findUnique({ where: { key: 'quickbooks_sync_enabled' } }),
-        ])
-        if (batchEnabled?.value !== 'true') return { skipped: true, reason: 'QuickBooks daily batch disabled' }
-        if (syncEnabled?.value !== 'true') return { skipped: true, reason: 'QuickBooks sync disabled' }
-        const { runDailyBatchSync } = await import('@/lib/connectors/quickbooks/daily-sync')
-        return await runDailyBatchSync() as Record<string, unknown>
-      }
-
-      return { skipped: true, reason: 'No accounting plugin enabled' }
+      const { runDailyBatchSync } = await import('@/lib/connectors/quickbooks/daily-sync')
+      return await runDailyBatchSync() as Record<string, unknown>
     },
   })
 

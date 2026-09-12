@@ -1,0 +1,23 @@
+-- o3d-i0o6 r3 — THE PASS HISTORY BEHIND A CUMULATIVE A2 DEBIT.
+--
+-- `accounting_allocation_batch_amount` ACCUMULATES across incremental Group A2 passes; the three
+-- attribution columns beside it (`..._sync_log_id`, `..._connector`, `..._account_code`) are
+-- REPLACED by the same UPDATE and therefore describe the LATEST pass only. Every reader that proved
+-- "this cumulative amount posted" from those columns was reading a fact about one pass as a fact
+-- about the whole debit, and crediting the difference back out of a real account.
+--
+-- This column records every pass: its own contribution, the journal it raised (null where it raised
+-- none), and that journal's connector, account code and batch reference. The proof requires the
+-- passes to SUM to the recorded amount and every contributing pass to be SYNCED on one ledger.
+--
+-- NULLABLE, NO DEFAULT, NOT BACKFILLED — deliberately, three times over:
+--   * a row staged before this column existed has no recoverable pass history, and synthesising one
+--     from the three columns above would be the database asserting the single-pass assumption this
+--     column exists to stop making;
+--   * NULL therefore reads as "the passes making up this amount are not on record", which is
+--     UNPROVABLE and caps every automatic credit at GBP 0.00 — the safe side, and repairable by hand;
+--   * a predecessor binary serving across the deploy window accumulates the amount and writes no
+--     passes, which lands in exactly that same unprovable state rather than in a wrong one. No
+--     post-migration verification is owed (see prisma/migrations/verification-required.txt): nothing
+--     here is decided by which binary was serving, only how much is provable afterwards.
+ALTER TABLE "sales_orders" ADD COLUMN "accounting_allocation_batch_passes" JSONB;
