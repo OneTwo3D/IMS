@@ -1891,11 +1891,31 @@ function axisSentences(prose: string): string[] {
 // because "likely" is exactly what will come back otherwise — it was written three times already.
 //
 // AT EVERY SITE, INDEPENDENTLY:
-//   * NO SENTENCE ABOUT A DUPLICATE MAY CARRY A MODALITY STRONGER THAN THE EVIDENCE — likely,
-//     probable/probably, almost certainly, certainly, definitely, "went out", "will follow";
-//   * AND ONE SENTENCE ABOUT A DUPLICATE MUST CARRY THE WEAKER ONE — possible, may, might, cannot be
-//     ruled in or out. That positive half is what stops the check being satisfied by a site that says
-//     nothing about duplicates at all.
+//   * EVERY SENTENCE ABOUT A DUPLICATE MUST CARRY THE WEAKER MODALITY — possible, may, might, cannot
+//     be ruled in or out, unknown, not proof. UNIVERSAL, one sentence at a time;
+//   * AND NO SENTENCE ABOUT A DUPLICATE MAY CARRY A MODALITY STRONGER THAN THE EVIDENCE — likely,
+//     probable/probably, almost certainly, certainly, definitely, "went out", "will follow".
+//
+// r36 (Codex r35, HIGH 2) — THE POSITIVE HALF USED TO BE EXISTENTIAL, WHICH IS THE DEFECT THIS BRANCH
+// KEEPS RE-WRITING. r35 asked only that `sentences.some(...)` carry a hedge, and left every OTHER
+// duplicate sentence to a blacklist of forbidden words. So a site reading "A duplicate delivery is
+// possible. A duplicate delivery follows." PASSED: the first sentence satisfied the `some`, and
+// `follows` was not a word anybody had thought to blacklist. An unhedged production claim sat beside
+// its own hedge and the guard called that compliance — the existential/universal mistake this file has
+// now made in three separate axes.
+//
+// SO THE STRENGTH TEST IS POSITIVE AND PER-SENTENCE: each sentence that mentions a duplicate has to
+// carry the weaker word ITSELF, and a hedge somewhere else in the paragraph does not lend it one. That
+// is the direction a blacklist cannot be fixed in — a blacklist can only ever catch the assertive
+// words its author enumerated, and "follows" is the proof of that. The blacklist is KEPT, because it
+// still earns its place as a SECOND filter in the other direction: "a duplicate is likely, though it
+// may not happen" carries a hedge and is still an overclaim, and only the blacklist catches it.
+//
+// IT IS DELIBERATELY OVER-INCLUSIVE, AND THAT IS THE SAFE DIRECTION. `ABOUT_A_DUPLICATE` matches any
+// sentence naming a duplicate, including a cross-reference that names `describeDuplicateRisk` rather
+// than claiming anything. Narrowing it to "sentences that make a claim" would mean enumerating the
+// verbs that constitute a claim — the same enumeration `follows` already escaped. So such a sentence
+// has to carry the weaker word too; it costs a word, whereas the other error costs a false claim.
 //
 // DOUBLE-QUOTED SPANS ARE STRIPPED, for the reason every other wording guard in this file strips
 // them: quoting is how these files cite a claim in order to disown it, and two of these sites quote
@@ -1931,6 +1951,23 @@ function assertDuplicateStrength(where: string, prose: string): void {
     + 'cannot be checked here — and this is one of the four places a reader is told what these counts '
     + 'mean for the customer',
   )
+  // (i) EVERY sentence, not one of them (r36, Codex r35 HIGH 2). A hedge in the sentence BEFORE an
+  // unhedged claim is not a hedge on that claim; `sentences.some(...)` treated it as one.
+  const unhedged = sentences.filter((sentence) => !DUPLICATE_IS_POSSIBLE.test(sentence))
+  assert.deepEqual(
+    unhedged,
+    [],
+    `${where}: ${unhedged.length} of ${sentences.length} sentence(s) here name a duplicate WITHOUT `
+    + 'carrying the weaker modality in that same sentence (possible / may / might / cannot be ruled in '
+    + 'or out / unknown / not proof). Entering the sender is not reaching SMTP: with no SMTP host '
+    + 'configured, or a from-address the mailer rejects, both workers are reclaimed-after-send having '
+    + 'delivered nothing, so POSSIBLE is the strongest honest word — and it has to be in the sentence '
+    + 'that makes the claim. r35 asked only that ONE sentence carry it, which let "A duplicate delivery '
+    + 'is possible. A duplicate delivery follows." pass whole: '
+    + `${JSON.stringify(unhedged)}`,
+  )
+  // (ii) AND THE BLACKLIST STAYS, as the filter in the other direction: a sentence can carry the
+  // weaker word and still overclaim ("likely, though it may not happen"), and only this catches that.
   const overstated = sentences.filter((sentence) => OVERSTATES_THE_DUPLICATE.test(sentence))
   assert.deepEqual(
     overstated,
@@ -1939,12 +1976,6 @@ function assertDuplicateStrength(where: string, prose: string): void {
     + 'sender is not reaching SMTP: with no SMTP host configured, or a from-address the mailer rejects, '
     + 'both workers are reclaimed-after-send having delivered nothing, so the strongest honest word is '
     + `POSSIBLE (r35, Codex HIGH 2): ${JSON.stringify(overstated)}`,
-  )
-  assert.ok(
-    sentences.some((sentence) => DUPLICATE_IS_POSSIBLE.test(sentence)),
-    `${where}: never says a duplicate is POSSIBLE (or may/might follow, or cannot be ruled in or out). `
-    + 'Without that word the site either overstates the risk or states nothing, and "likely" is what has '
-    + `come back three times. Sentences about a duplicate here: ${JSON.stringify(sentences)}`,
   )
 }
 

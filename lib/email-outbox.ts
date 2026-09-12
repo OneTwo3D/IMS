@@ -1259,7 +1259,8 @@ export type ProcessEmailOutboxResult = {
    * row), a row still carrying this worker's own token (rewritten under the claim — explicitly not a
    * reclaim), a row that is gone, and a read-back that failed. `describeClaimLoss` has said so in
    * WORDS since r30; the NUMBER went on asserting a takeover, so an operator reading telemetry was
-   * told a rival existed and a duplicate was "probable" where the diagnosis refused to say either.
+   * told a rival existed and a duplicate was "probable" where the diagnosis refused to say more than
+   * that one is POSSIBLE.
    * Those four are counted in `unresolvedAfterSend` now. `establishesAReclaim` is the single
    * decision, and it is an exhaustive switch, so a new `ClaimLoss` kind cannot default into here.
    *
@@ -2403,8 +2404,9 @@ export async function processPendingEmailOutbox(
       // NOT THAT ONE IS "likely" (r35, Codex HIGH 2). Entering the sender is not reaching SMTP, so when
       // SMTP is unconfigured or the from-address is rejected BOTH workers can be counted here having
       // delivered nothing at all; what an operator may take from this line is that a second copy is
-      // POSSIBLE, and no more than that. The same word is used in `ProcessEmailOutboxResult`, in the
-      // per-row log line (`describeDuplicateRisk`) and in help-docs/documents-email.md.
+      // POSSIBLE, and no more than that. That same weaker word — POSSIBLE, never "likely" — is what
+      // states this in `ProcessEmailOutboxResult`, in the per-row log line (`describeDuplicateRisk`)
+      // and in help-docs/documents-email.md.
       description: `Email outbox: ${result.sent} sent, ${result.failed} failed, `
         + `${result.conflicted} reclaimed after a send, ${result.conflictedWithoutSend} reclaimed before one, `
         + `${result.unresolvedAfterSend} unresolved after a send, ${result.unresolvedWithoutSend} unresolved before one, `

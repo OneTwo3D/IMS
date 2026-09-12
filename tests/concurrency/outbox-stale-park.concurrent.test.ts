@@ -31,7 +31,7 @@ import { INTEGRATION_OUTBOX_DRAIN_LEASES_MS } from '@/lib/domain/integrations/ou
  *
  * WHAT IS STILL NOT TESTED HERE, said plainly rather than implied by a test name. `pushStockToWc`
  * and `sendAccountingInvoiceEmailInternal` are NOT driven: the first writes to a live WooCommerce
- * store and the second sends mail to a customer, and neither has a seam that stops short of the
+ * store and the other sends mail to a customer, and neither has a seam that stops short of the
  * wire. The ORDERING hazard those two entries are declared `unsafe-to-replay` for — an older
  * absolute quantity arriving last, an invoice email delivered twice — is therefore argued in the
  * registry from the code, and what is PROVEN here is the gate in front of it: that no second worker
@@ -94,7 +94,7 @@ type BlockedBackend = { pid: number; query: string; wait_event_type: string | nu
  *
  * The distinction is load-bearing and it is the first thing the barrier caught. `pg_blocking_pids`
  * for a tuple-lock waiter returns the processes holding conflicting locks AND the processes ahead of
- * it in the wait queue — so the SECOND claimant is reported as blocked by the FIRST claimant, which
+ * it in the wait queue — so the LATER claimant is reported as blocked by the FIRST claimant, which
  * itself holds nothing. Asking only "who does the holder block?" therefore finds one claimant and
  * misses the other, and a barrier that gave up there would have re-created the very hole it exists
  * to close, one level further down. The closure below follows the chain instead.
@@ -535,7 +535,7 @@ test(
     })
 
     // (3) NO WORKER WILL EVER TAKE IT BACK: the stale-reclaim scope fails an unknown operation
-    // closed, deliberately, because "we have never heard of it" is not a reason to believe a second
+    // closed, deliberately, because "we have never heard of it" is not a reason to believe a repeat
     // execution is harmless.
     assert.equal(deps.integrationOutboxStaleReclaimScope(connector, operation), null)
     const refused = await raceForRow(deps, { connector, operation, idempotencyKey: key })
@@ -597,12 +597,12 @@ test(
      * sentence on purpose (Codex round 35, HIGH 1): it is the sentence the ordering rests on, and it
      * named two windows and attributed neither. What the index leaves open is the timing that
      * CROSSES A DRAIN: once a drain settles A's copy to SENT, a SENT row is outside the predicate, B's
-     * insert is accepted, and the customer is emailed a second time. That gap is what this test
-     * drives below, and it is what decides the verdict; the RATE was the only thing wrong.
+     * insert is accepted, and the duplicate is delivered: the customer is emailed twice. That gap is
+     * what this test drives below, and it is what decides the verdict; the RATE was the only thing wrong.
      *
      * AND NO CONSTRAINT IN THE CURRENT SCHEMA CLOSES THE REMAINDER — a fact about this schema, not
      * about constraints (Codex round 16, MEDIUM). This paragraph used to say that no constraint on
-     * this table COULD have closed it, because a send is not a database write and refusing a second
+     * this table COULD have closed it, because a send is not a database write and refusing a duplicate
      * ROW does not unsend a mail already on the wire. That is true of the index we HAVE, whose
      * predicate ends at delivery; it is false as a general claim. A LIFETIME uniqueness key on
      * (kind, referenceType, referenceId), or an upstream-effect idempotency key written at the
@@ -654,7 +654,7 @@ test(
     /**
      * (3) THE GAP ITSELF, DRIVEN. A delivered first copy, then the replay's insert — and the database
      * accepts it. Asserting (2) alone would prove an ADJACENT property: that the index definition
-     * SAYS it is partial. What decides the verdict is what the table DOES with a second row once the
+     * SAYS it is partial. What decides the verdict is what the table DOES with a further row once the
      * first is SENT, and that is only knowable by trying it.
      */
     const reference = `o3d-8td2-replay-gap-${randomUUID()}`
@@ -714,7 +714,7 @@ test(
     // The entry used to add that EmailOutbox "has no holder identity — processingStartedAt is a
     // timestamp, not a lockedBy — and every terminal write is an unfenced update({ where: { id } })".
     // o3d-alnk gave it both: a per-claim `lockedBy` token and terminal writes that compare-and-set on
-    // it. That closes the queue's OWN re-arming race. It says nothing about a second row arriving
+    // it. That closes the queue's OWN re-arming race. It says nothing about a further row arriving
     // after the first was delivered, which is the hazard above, and which no fence inside this queue
     // can see — the two workers racing there are in the INTEGRATION outbox, one reclaim apart.
     assert.ok(names.includes('lockedBy'),

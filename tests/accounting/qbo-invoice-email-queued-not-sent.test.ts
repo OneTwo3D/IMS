@@ -582,6 +582,17 @@ const CITATIONS: Array<{ citedIn: string; citation: string; resolvesIn: string; 
     resolvesIn: 'lib/domain/integrations/outbox-leases.ts',
     anchor: 'xeroAccountingEntry:',
   },
+  // ROUND 36 (Codex round 35, MEDIUM). The registry QUOTES the processor's call-site comment, so the
+  // two are one claim with two readers — and round 35 found the quoted half still asserting that
+  // reaching a second worker is enough to mail a second copy, one call frame from the fence branch
+  // that made it false. Pinned as a citation so the quote cannot drift from the words it quotes: the
+  // registry must carry them and the processor must still say them.
+  {
+    citedIn: 'lib/domain/integrations/outbox-registry.ts',
+    citation: 'does NOT by itself mail a further copy',
+    resolvesIn: 'lib/connectors/xero/sync-processor.ts',
+    anchor: 'does NOT by itself mail a further copy',
+  },
   {
     citedIn: 'tests/concurrency/outbox-stale-park.concurrent.test.ts',
     citation: '`xeroAccountingEntry` in lib/domain/integrations/outbox-leases.ts',
@@ -708,13 +719,34 @@ function windowSentences(prose: string): string[] {
 // no source at all, and a number this build does produce fails unless the sentence says which
 // constant — or which documented cron row — it came from.
 //
-// THE TWO EXEMPTIONS ARE KEYED ON GRAMMAR AND NEVER ON A VALUE. (i) An article plus the SINGULAR
-// "second" ("a second row", "the second claimant", "emailed a second time") is the English ORDINAL,
-// not one thousand milliseconds: "second" is the only unit noun in this vocabulary that is also an
-// ordinal, the prose uses it that way about fifteen times, and nothing in these two files states a
-// duration in seconds. (ii) An article plus a PLURAL unit ("the minutes the comments claim") is a
-// noun phrase, not a quantity. "one second", "two seconds", "an hour", "a day" and "the hour" all
-// remain durations, and every numeral form is checked whatever its value.
+// ROUND 36 (Codex ROUND 35, HIGH 1) — THE ORDINAL EXEMPTION IS GONE, BECAUSE IT WAS NOT STRUCTURAL.
+//
+// Round 35 exempted an article plus the singular "second" ("a second row", "the second claimant") as
+// the English ORDINAL rather than one thousand milliseconds, and called that an exemption on the
+// SHAPE. IT IS NOT ONE. "A second" is not structurally always an ordinal: "the worker waited for a
+// second" and "a second-long delay" are durations with exactly the same shape, and both were thrown
+// away by the same test. So the exemption was a hole of precisely the kind this branch has spent a
+// dozen rounds closing — a real unsourced duration could sit in this prose and be discarded before it
+// was ever checked. THE NON-VACUITY FLOOR IN (4g) DOES NOT CLOSE IT EITHER, and that is the part
+// worth remembering: the other nineteen durations clear the floor on their own, so the sweep still
+// reports plenty of work while silently dropping the one sentence that mattered. A floor proves the
+// pattern matches SOMETHING; it can never prove an exemption is sound.
+//
+// IT COULD NOT BE REPAIRED IN PLACE. Ordinal "second" is an adjective before the noun it modifies and
+// unit "second" is the head of its own noun phrase, so telling them apart means deciding whether the
+// NEXT WORD is a noun — and "waited for a second before retrying" defeats every rule short of a
+// lexicon. Any such rule would be a list of words somebody thought of, which is the shape that has
+// failed here repeatedly. So the exemption was DROPPED and the seventeen ordinal occurrences in these
+// two files were REWORDED instead ("another row", "the LATER claimant", "a repeat execution",
+// "emailed twice"): the vocabulary lost nothing, and "a second" in this prose is now a duration with
+// no source, which fails. The cost is real and accepted — a future writer who types "a second worker"
+// here gets a duration failure — so the message below says so in as many words.
+//
+// ONE SHAPE EXEMPTION REMAINS, and it is structural in the grammar and not in a vocabulary: an
+// article plus a PLURAL unit ("the minutes the comments claim", "the days this took") is a noun
+// phrase, because English has no quantity reading of "a minutes". "one second", "two seconds", "an
+// hour", "a day" and "the hour" all remain durations, and every numeral form is checked whatever its
+// value.
 
 /** Unit nouns a duration may be written in, and what ONE of each is in milliseconds. */
 const DURATION_UNIT_MS: Record<string, number> = {
@@ -758,12 +790,12 @@ const DURATION_QUANTITIES = [
 const NUMERAL_DURATION = new RegExp(String.raw`\b(\d[\d_,]*)[- ]?(${DURATION_UNITS})\b`, 'gi')
 /** "fifteen minutes", "an hour", "five-minute", "twenty-five minutes". */
 const SPELLED_DURATION = new RegExp(String.raw`\b(${DURATION_QUANTITIES})[- ](${DURATION_UNITS})\b`, 'gi')
-/** The ordinal, which is not a duration — an exemption on the SHAPE, never on a value. */
-const ORDINAL_SECOND = /^(?:a|an|the)[- ]second$/i
 /**
  * An article with a PLURAL unit is a noun phrase and not a quantity: "the minutes the comments
- * claim", "the days this took". The second and last shape exemption, and like the first it is keyed
- * on grammar rather than on any number — "an hour", "a day" and "the hour" are all still durations.
+ * claim", "the days this took". THE ONLY shape exemption left (round 36): English has no quantity
+ * reading of "a minutes", so this one is a fact about the grammar rather than a list of phrases. The
+ * ordinal-"second" exemption that used to sit beside it was removed — see the block above for why a
+ * rule that cannot tell "a second row" from "waited for a second" is a hole and not an exemption.
  */
 const ARTICLE_PLUS_PLURAL = /^(?:a|an|the)[- ](?:milliseconds|secs|seconds|mins|minutes|hrs|hours|days)$/i
 
@@ -775,7 +807,7 @@ function durationsNamedIn(sentence: string): Array<{ text: string; ms: number }>
     found.push({ text: match[0], ms: Number(match[1].replace(/[_,]/g, '')) * scale })
   }
   for (const match of sentence.matchAll(SPELLED_DURATION)) {
-    if (ORDINAL_SECOND.test(match[0]) || ARTICLE_PLUS_PLURAL.test(match[0])) continue
+    if (ARTICLE_PLUS_PLURAL.test(match[0])) continue
     let quantity = 0
     for (const word of match[1].toLowerCase().split(/[- ]/)) quantity += DURATION_QUANTITY[word] ?? 0
     found.push({ text: match[0], ms: quantity * DURATION_UNIT_MS[match[2].toLowerCase()] })
@@ -1050,13 +1082,20 @@ test('r22: the reclaim window is the RESOLVED constant, and BOTH copies of the r
       const how = sources.length === 0
         ? 'and NOTHING in this build resolves to that duration at all'
         : 'name one of: ' + sources.join(', ')
+      // ROUND 36: the ordinal exemption was removed rather than repaired, so the ONE phrasing that
+      // now fails for a reason a writer will not expect gets told what to write instead.
+      const ordinalHint = /\bsecond\b/i.test(named.text)
+        ? ' NOTE (round 36, Codex round 35 HIGH 1): this prose no longer exempts "a second"/"the '
+          + 'second" as an ordinal, because that exemption also discarded real durations ("the worker '
+          + 'waited for a second"). Write "another", "a further", "the later" or "twice" instead.'
+        : ''
       assert.ok(
         sources.some((token) => sentence.includes(token)),
         where + ': names the duration ' + JSON.stringify(named.text) + ' (' + named.ms + ' ms) without '
         + 'naming, in that same sentence, what it resolves from — ' + how + '. Rounds 21 and 33: a '
         + 'duration with no named source is how the dead-letter gate got asserted as the reclaim '
         + 'window twice. Round 35: the rule said EVERY duration and the sweep only knew the ones it '
-        + 'had listed: ' + JSON.stringify(sentence),
+        + 'had listed: ' + JSON.stringify(sentence) + ordinalHint,
       )
     }
   }
@@ -1183,10 +1222,79 @@ test('r22: the reclaim window is the RESOLVED constant, and BOTH copies of the r
     }
   }
 
+  // (4h) AND THE PROCESSOR'S OWN CALL-SITE COMMENT — THE READER ROUND 35's MEDIUM FOUND STANDING
+  // (round 36). `sendAccountingInvoiceEmailInternal` was changed ON THIS BRANCH so that a worker
+  // meeting an undelivered row returns success WITHOUT inserting one, and the comment over the fence
+  // that calls it went on saying "a second worker here means the customer receives the invoice twice".
+  // Reaching a second worker is no longer sufficient for anything: the duplicate needs the FIRST copy
+  // to have left the partial index before the second enqueue.
+  //
+  // CHECKED POSITIVELY AND THEN UNIVERSALLY. Positively, because deleting the false sentence would
+  // satisfy any absence check while leaving an operator with no statement at all: the paragraph must
+  // name the refusal (`already_queued`, and the index that produces it) and must condition the
+  // duplicate on crossing a drain, in a sentence that is about the duplicate. Universally, because a
+  // correction that sits beside the claim it corrects is the shape this whole file exists for: NO
+  // sentence in EITHER reader may state the sufficiency form, quoted spans stripped, so the history
+  // may be quoted (both readers quote it) and may not be asserted.
+  const processorParagraphs = commentParagraphs(worker).filter(
+    (prose) => prose.includes('Not a Xero call, but an external side effect all the same'),
+  )
+  assert.equal(
+    processorParagraphs.length,
+    1,
+    `the INVOICE_EMAIL fence comment in lib/connectors/xero/sync-processor.ts matched `
+    + `${processorParagraphs.length} comment paragraphs, not 1 — it was rewritten or deleted, so nothing `
+    + 'below checks the claim it makes, and outbox-registry.ts quotes it',
+  )
+  const processorSentences = windowSentences(processorParagraphs[0])
+  assert.ok(
+    processorSentences.length > 2,
+    `the INVOICE_EMAIL fence comment parsed into ${processorSentences.length} sentence(s) — it is back to `
+    + 'the one-line claim round 35 found, which had room to assert a consequence and none to qualify it',
+  )
+  for (const token of ['already_queued', 'email_outbox_undelivered_reference_uq']) {
+    assert.ok(
+      processorParagraphs[0].includes(token),
+      `the INVOICE_EMAIL fence comment no longer names ${token}, so it does not say WHY a second worker `
+      + 'is insufficient — and a reader with no mechanism in front of them writes the sufficiency claim '
+      + 'back, which is what round 35 caught',
+    )
+  }
+  assert.ok(
+    processorSentences.some((sentence) => CROSSES_A_DRAIN.test(sentence) && ABOUT_THE_DUPLICATE.test(sentence)),
+    'the INVOICE_EMAIL fence comment no longer conditions the duplicate on the replay CROSSING A DRAIN in '
+    + `a sentence about the duplicate. Sentences: ${JSON.stringify(processorSentences)}`,
+  )
+  // THE SUFFICIENCY FORM ITSELF, ABSENT FROM BOTH READERS. A pattern on the claim's GRAMMAR — a worker
+  // as the subject, `means`/`so`, and a delivery consequence — and not on a list of adjectives.
+  const ASSERTS_SUFFICIENCY =
+    /(?:a (?:second|further|reclaiming)|another) worker[^.]*\b(?:means|so)\b[^.]*(?:invoice twice|emailed twice|receives? the invoice|gets? the invoice|two copies)/i
+  for (const file of ['lib/connectors/xero/sync-processor.ts', 'lib/domain/integrations/outbox-registry.ts']) {
+    const asserting = commentParagraphs(read(file)).flatMap(windowSentences).filter(
+      (sentence) => ASSERTS_SUFFICIENCY.test(sentence),
+    )
+    assert.deepEqual(
+      asserting,
+      [],
+      `${file}: ${asserting.length} sentence(s) here state that a second worker is BY ITSELF enough for the `
+      + 'customer to receive the invoice twice. It is not, since this branch: `queueEmail` refuses the row '
+      + 'while the first is undelivered and the caller answers success having written nothing, so a '
+      + 'duplicate needs the first copy out of the partial index FIRST (round 36, Codex round 35 MEDIUM). '
+      + `Quote the old wording if the history matters; do not assert it: ${JSON.stringify(asserting)}`,
+    )
+  }
+
   // (4g) AND THE SWEEP ACTUALLY FOUND DURATIONS. A pattern that matches nothing passes every
   // assertion above while checking nothing at all, which is the failure mode the round-34 sweep had in
   // a different form. The two files state around twenty durations between them; the floor is set well
   // under that so ordinary editing does not trip it, and far over zero so a broken pattern does.
+  //
+  // WHAT THIS FLOOR CANNOT DO, said here because round 35 relied on it to (Codex round 35, HIGH 1):
+  // it cannot make an EXEMPTION sound. The round-35 ordinal exemption silently discarded any sentence
+  // matching "a second", real durations included, and the remaining nineteen durations cleared this
+  // floor on their own — so the sweep reported a healthy match count while dropping the one sentence
+  // that mattered. A floor proves the pattern matches SOMETHING; only removing the exemption (round
+  // 36, see the block over `durationsNamedIn`) proves nothing is being dropped.
   assert.ok(
     durationsChecked >= 15,
     `the duration sweep found only ${durationsChecked} durations across ${WINDOW_CLAIM_SITES.length} sites `
