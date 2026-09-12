@@ -1984,6 +1984,20 @@ posting, and a settlement that reported success over a contradiction would leave
 disagreeing with nobody told. Check both ids in Xero: if the one already recorded is the real one
 there is nothing to settle, and if it is not, reverse it in Xero before recording the other.
 
+**Settling "it did not post" retires that attempt, not the document — and re-queueing brings the
+mirrored event back.** A "did not post" settlement marks the shared accounting event **Void**, which
+is what stops a finished row leaving work that reconciliation reads as still owed. It is not a
+statement that the document is no longer wanted: settling a row this way is exactly what lets the
+same posting be queued again. When it is, the new attempt takes that Void event back to **Pending**,
+so the ledger view shows the work that is now in flight rather than an abandonment that is no longer
+true. The revival is recorded against the event in its own history.
+
+Two things are deliberately **not** brought back. An event that already names a Xero document is
+never revived, whatever its status says — a document that exists is not queued work. And an event
+voided because **the order was cancelled** stays voided: that retires the document itself, and a
+later enqueue does not overrule the cancellation. If you see a cancelled order's invoice event still
+Void while a live sync row exists for it, the sync row is the thing to look at, not the event.
+
 **And the back-reference repair sweep now asks the same question itself.** It is the sweep — not the row that fed it — that actually restarts a sale's work: it writes the Xero id onto the order and re-enqueues the invoice's PDF, email, WooCommerce note and **payment**. Gating only the paths that *produce* its candidate rows could never be complete, because the ordinary success path reads no sales order at all: an invoice that posted and then failed its back-reference or its follow-up enqueue is marked `FAILED` with its Xero id intact, which is precisely the sweep's candidate shape, with nobody having asked about the sale. So before it releases anything, the sweep reads the sales order under that order's row lock and:
 
 - **live** — repairs it, exactly as before;

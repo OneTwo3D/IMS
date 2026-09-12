@@ -13,51 +13,34 @@ import {
 import type { AccountingEventDraft, AccountingEventLine, AccountingEventStatus } from './accounting-event-types'
 import { isExternalAccountingReferenceUniqueError, isIdempotencyKeyUniqueError } from './prisma-errors'
 import { withSavepoint } from '@/lib/db/savepoint'
+import {
+  isMirrorableAccountingSyncType,
+  isMirrorableJournalAccountingSyncType,
+} from './mirrored-sync-types'
+import type { MirroredAccountingSyncType } from './mirrored-sync-types'
+import { REVIVABLE_VOID_BASES, SOURCE_CANCELLED_VOID_BASIS } from './accounting-event-void-basis'
 
-export type MirroredJournalAccountingSyncType =
-  | 'DAILY_BATCH_REVENUE_DEFERRAL'
-  | 'DAILY_BATCH_INVENTORY_ALLOC'
-  | 'DAILY_BATCH_GROUP_B'
-  | 'COGS_REVERSAL'
-  | 'UNEARNED_REV_REVERSAL'
-
-export type MirroredDocumentAccountingSyncType =
-  | 'SALES_INVOICE'
-  | 'SALES_INVOICE_UPDATE'
-  | 'CREDIT_NOTE'
-  | 'PURCHASE_INVOICE'
-  | 'PURCHASE_INVOICE_UPDATE'
-
-export type MirroredAccountingSyncType = MirroredJournalAccountingSyncType | MirroredDocumentAccountingSyncType
+// o3d-11rf: the mirrored TYPE LIST now lives in the leaf module ./mirrored-sync-types, because
+// followup-scope-lock.ts needs it too and this module is mocked wholesale by dozens of tests — a
+// partial mock would have handed it `undefined`. Re-exported here so every existing importer, and
+// the reading order of this file, are unchanged.
+export type {
+  MirroredJournalAccountingSyncType,
+  MirroredDocumentAccountingSyncType,
+  MirroredAccountingSyncType,
+} from './mirrored-sync-types'
+export { MIRRORED_JOURNAL_ACCOUNTING_SYNC_TYPES, MIRRORED_ACCOUNTING_SYNC_TYPES, isMirrorableAccountingSyncType } from './mirrored-sync-types'
+// o3d-11rf r2: the void-basis vocabulary lives in its own leaf module for the same reason the type
+// list does (a partial mock of THIS module would hand its readers `undefined`); re-exported here so
+// a reader of the mirror sees the whole contract in one place.
+export {
+  SOURCE_CANCELLED_VOID_BASIS,
+  ATTEMPT_SETTLED_VOID_BASIS,
+  REVIVABLE_VOID_BASES,
+  isRevivableVoidBasis,
+} from './accounting-event-void-basis'
 
 export type AccountingEventMirrorTransactionClient = Pick<Prisma.TransactionClient, 'accountingEvent' | 'accountingEventLog'>
-
-export const MIRRORED_JOURNAL_ACCOUNTING_SYNC_TYPES = [
-  'DAILY_BATCH_REVENUE_DEFERRAL',
-  'DAILY_BATCH_INVENTORY_ALLOC',
-  'DAILY_BATCH_GROUP_B',
-  // cogs-audit scjz.60.4: mirror the inventory rounding-difference sweep so the
-  // internal accounting-event ledger reflects the same correction posted to Xero.
-  'DAILY_BATCH_INVENTORY_RECONCILIATION',
-  // khdw: mirror the COGS rounding-difference sweep on the same basis.
-  'DAILY_BATCH_COGS_RECONCILIATION',
-  // 6oyu.4 (khdw): mirror the STOCK_IN_TRANSIT rounding-difference sweep likewise.
-  'DAILY_BATCH_TRANSIT_RECONCILIATION',
-  'COGS_REVERSAL',
-  'UNEARNED_REV_REVERSAL',
-] as const
-
-export const MIRRORED_ACCOUNTING_SYNC_TYPES = [
-  ...MIRRORED_JOURNAL_ACCOUNTING_SYNC_TYPES,
-  'SALES_INVOICE',
-  'SALES_INVOICE_UPDATE',
-  'CREDIT_NOTE',
-  'PURCHASE_INVOICE',
-  'PURCHASE_INVOICE_UPDATE',
-] as const
-
-const MIRRORED_JOURNAL_TYPES = new Set<string>(MIRRORED_JOURNAL_ACCOUNTING_SYNC_TYPES)
-const MIRRORED_TYPES = new Set<string>(MIRRORED_ACCOUNTING_SYNC_TYPES)
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value)
@@ -152,10 +135,6 @@ export function buildMirroredAccountingEventIdempotencyKey(params: {
   ])
 }
 
-export function isMirrorableAccountingSyncType(type: string): type is MirroredAccountingSyncType {
-  return MIRRORED_TYPES.has(type)
-}
-
 /**
  * EVERY idempotency key `updateMirroredAccountingEventStatus` would try for these params, in the
  * order it tries them: the primary key (which prefers the payload's `_idempotencyKey`, then the
@@ -181,9 +160,7 @@ export function mirroredAccountingEventIdempotencyKeys(params: {
   return [...new Set([primary, legacy].filter((key): key is string => typeof key === 'string' && key.length > 0))]
 }
 
-function isMirrorableJournalAccountingSyncType(type: string): type is MirroredJournalAccountingSyncType {
-  return MIRRORED_JOURNAL_TYPES.has(type)
-}
+
 
 export function buildMirroredAccountingEventDraft(params: {
   syncLogId?: string
@@ -283,9 +260,112 @@ export async function mirrorAccountingSyncLogToEvent(
       })
     })
   } catch (error) {
-    if (isIdempotencyKeyUniqueError(error)) return
+    if (isIdempotencyKeyUniqueError(error)) {
+      // o3d-11rf r2 — THE COLLISION IS NOT NOTHING: A LIVE ATTEMPT HAS JUST TAKEN OVER THIS MIRROR.
+      //
+      // Mirror identity is logical, so this key already existing means a PREVIOUS attempt at the
+      // SAME document built this event. Returning silently was right for the case this was written
+      // for (a concurrent enqueue of the same work, whose event is already PENDING) and wrong for
+      // the one o3d-11rf's own serialisation leaves behind: a settlement that ran FIRST, saw no
+      // sibling, and committed the shared event VOID. The row this call is mirroring is PENDING and
+      // will post; its mirror said the work was abandoned, and nothing repaired that until it did.
+      //
+      // Serialising the two writers made their order deterministic. It could not make BOTH orders
+      // end correctly, and this is the half that did not — see accounting-event-void-basis.ts for
+      // why the other half already does, and for what separates a void that retired ONE ATTEMPT
+      // from one that retired THE DOCUMENT.
+      //
+      // ONLY FOR AN ARRIVAL THAT IS ITSELF LIVE. `event.status` is what the create would have
+      // written (`mapStatus` of the sync row's own status), and only a PENDING one describes work
+      // that is now owed. An attempt mirrored straight to FAILED or POSTED has no claim to take a
+      // retired event back, so it is refused rather than guessed at — every production caller
+      // enqueues PENDING, and a future one that does not must decide this question for itself.
+      if (event.status === 'PENDING') {
+        await reviveMirroredEventForNewAttempt(client, event.idempotencyKey, params)
+      }
+      return
+    }
     throw error
   }
+}
+
+/**
+ * Take an unposted mirrored event back to PENDING for a NEW LIVE ATTEMPT at the same document.
+ *
+ * A COMPARE-AND-SWAP, never a read-then-write: the predicate is the whole permission, and it is
+ * re-asserted in the UPDATE itself so a concurrent writer that posts (or legitimately retires) this
+ * event between any read and here cannot be clobbered. `count === 0` is the ordinary answer and is
+ * not an error — the event is already PENDING, or it is one this attempt may not touch.
+ *
+ * WHAT MAY BE REVIVED, and why each:
+ *
+ *  • VOID with `attempt_settled_not_posted` — an operator retired ONE attempt, having established
+ *    under the scope lock that nothing else owned the mirror. This enqueue is the something else,
+ *    arriving after. Revivable. Every other basis, and a NULL basis, is refused: see
+ *    `isRevivableVoidBasis` for why unknown provenance must answer no.
+ *  • FAILED — an attempt outcome, never a retirement. `resetMirroredAccountingEventsToPending`
+ *    already moves exactly these to PENDING when the retry path revives their sync row, so a fresh
+ *    live attempt doing the same thing is the established rule and not a new one.
+ *
+ * AND `externalId` MUST BE NULL, on both arms. An event naming a document is a document that exists
+ * (o3d-ju8t), whatever status the row carries; returning it to PENDING would put a real ledger
+ * document back into the queue's "work still owed" set. That conjunct is what keeps this from
+ * becoming the mirror-image of the defect it fixes.
+ *
+ * POSTED, SUPERSEDED and REVERSED are absent from the predicate entirely, so no reachable input
+ * touches them.
+ *
+ * WHAT A REVIVED EVENT LOOKS LIKE TO THE READERS THAT COUNT PENDING WORK, stated because it is a
+ * real consequence and not an accident. `createdAt` is the ORIGINAL attempt's, so the health check's
+ * "oldest pending accounting event" can jump backwards the moment a document is re-queued, and the
+ * reconciliation report's `status != POSTED` scan picks the event up again. Both are TRUE of the
+ * situation: the document has been owed since the first attempt, the settlement retired an attempt
+ * and not the obligation, and the row is now live again. The state this replaces — a VOID event
+ * beside a live sync row — was counted by neither, which is the under-reporting rather than the
+ * quiet option.
+ */
+async function reviveMirroredEventForNewAttempt(
+  client: AccountingEventMirrorTransactionClient,
+  idempotencyKey: string,
+  params: Parameters<typeof buildMirroredAccountingEventDraft>[0],
+): Promise<void> {
+  const revived = await client.accountingEvent.updateMany({
+    where: {
+      idempotencyKey,
+      externalId: null,
+      OR: [
+        { status: 'FAILED' },
+        // Derived from the same list `isRevivableVoidBasis` tests, never restated beside it.
+        { status: 'VOID', voidBasis: { in: [...REVIVABLE_VOID_BASES] } },
+      ],
+    },
+    // The basis is SPENT by the revival. It described a state the row is no longer in, and a row
+    // that later posts must not carry a stale "this was settled NOT_POSTED" beside its document id.
+    data: { status: 'PENDING', voidBasis: null },
+  })
+  if (revived.count === 0) return
+
+  // Read purely to hang the audit entry off the right row. The CAS above, not this read, decided it.
+  const event = await client.accountingEvent.findUnique({ where: { idempotencyKey }, select: { id: true } })
+  if (!event) return
+
+  await client.accountingEventLog.create({
+    data: buildAccountingEventLog({
+      accountingEventId: event.id,
+      action: 'revived_for_new_attempt',
+      message:
+        'A new live attempt at this document was queued while the shared mirrored event was '
+        + 'unposted and retired, so the event was returned to PENDING to describe the work that is '
+        + 'now owed.',
+      metadata: {
+        connector: params.connector,
+        ...(params.syncLogId ? { syncLogId: params.syncLogId } : {}),
+        syncType: params.type,
+        referenceType: params.referenceType,
+        referenceId: params.referenceId,
+      },
+    }) as never,
+  })
 }
 
 /**
@@ -934,10 +1014,29 @@ export type MirroredEventUpdateOutcome =
  * Mirror identity is logical, not per-row: buildMirroredAccountingEventIdempotencyKey prefers the
  * payload's `_idempotencyKey`, and the legacy fallback key is shared by every attempt on the same
  * day — so one AccountingEvent can be the mirror of several AccountingSyncLog rows. Reading the
- * siblings first tells a caller who else might own it, but that read is not a lock: a sibling can
- * post between the read and the write. Guarding the write itself makes both interleavings safe —
+ * siblings first tells a caller who else might own it, but that read is not itself a lock: a sibling
+ * can post between the read and the write. Guarding the write itself makes both interleavings safe —
  * the late poster overwrites a VOID with its POSTED, and the late VOID is refused against an
- * already-POSTED event — without any caller having to serialise on the mirror key.
+ * already-POSTED event.
+ *
+ * WHAT THE GUARD DOES NOT DO, stated because this block used to end "...without any caller having to
+ * serialise on the mirror key", and a caller read that as permission not to (o3d-11rf). The guard is
+ * a fence around an event that ALREADY EXISTS in a state it can recognise. A replacement attempt
+ * enqueued after the sibling read is PENDING and names no document, which is exactly what
+ * `settlementMirrorGuard` ALLOWS a write through — so a settlement voids the shared mirror of a live
+ * row it never saw, and nothing repairs that until the replacement itself posts. Closing that needs
+ * serialisation, not a CAS, because the row in question does not exist when the read runs and
+ * PostgreSQL has no predicate locks. `settleAccountingSyncRow` therefore takes `lockFollowUpScope`,
+ * which every enqueue writer in the scope already takes.
+ *
+ * AND SERIALISATION IS NOT SUFFICIENT EITHER (o3d-11rf r2, Codex HIGH). The lock establishes that
+ * the two writers are ORDERED. It does not establish that both orders end somewhere right, and one
+ * does not: settlement-then-enqueue leaves the settlement's VOID on a mirror the enqueue then
+ * collides with by idempotency key. The enqueue's own collision handler is the other half of the
+ * fix — see `reviveMirroredEventForNewAttempt` — and it needs the row to say WHAT the void retired,
+ * which is what `voidBasis` records. Neither half works alone: without the lock the settlement can
+ * void a mirror the enqueue has already created and the revive has nothing left to run against;
+ * without the revive the surviving order is deterministic and wrong.
  */
 export type MirroredEventWriteGuard = {
   /** Write only while the event is in one of these statuses. */
@@ -1023,6 +1122,17 @@ export async function updateMirroredAccountingEventStatus(
     externalRevisionAt?: Date | null
     message?: string | null
     /**
+     * o3d-11rf r2: WHAT A `VOID` WRITE IS RETIRING — one ATTEMPT, or the DOCUMENT. Read by the
+     * enqueue side to decide whether a later live attempt may take the event back to PENDING; see
+     * accounting-event-void-basis.ts for why the two are not the same fact and why an unrecorded
+     * one is never revived.
+     *
+     * Written ONLY beside a VOID status and CLEARED by every write that leaves the row in any other
+     * status, exactly as `revisionOrderBasis` is: a basis that outlived the state it describes would
+     * be a permission granted by a row that no longer means it.
+     */
+    voidBasis?: string
+    /**
      * Optional. Absent = the historical unconditional write, which is what the connectors' own
      * success/failure writeback wants: it owns the attempt it is reporting on. Present = the write
      * lands only while the guard holds, and `'refused'` is returned instead of overwriting.
@@ -1100,11 +1210,18 @@ export async function updateMirroredAccountingEventStatus(
     // because a newer revision already holds it. Both overrides are set together and only there.
     override?: { status: AccountingEventStatus; claimExternalId: false },
   ) {
+    const status = override?.status ?? params.status
     return {
-        status: override?.status ?? params.status,
+        status,
         ...(params.externalId !== undefined && override?.claimExternalId !== false
           ? { externalId: params.externalId }
           : {}),
+        // o3d-11rf r2: the void basis, and its clearing. Written unconditionally rather than only
+        // when the caller supplied one, because the ABSENCE of a value on a non-VOID write is
+        // itself the fact to record: this row is no longer retired, so no basis describes it. A
+        // VOID write with no basis stores NULL, which `isRevivableVoidBasis` refuses — a writer
+        // that does not say what it retired does not get the benefit of the doubt.
+        voidBasis: status === 'VOID' ? (params.voidBasis ?? null) : null,
         // The stamp is a true fact about THIS row's write whether or not the row keeps the claim,
         // so the stale path records it too — it is what a later comparison against this row needs.
         //
@@ -1495,7 +1612,12 @@ export async function voidMirroredAccountingEventsForOrder(
   const voidableIds = events.map((event) => event.id)
   const updated = await client.accountingEvent.updateMany({
     where: { id: { in: voidableIds }, status: { in: ['PENDING', 'FAILED'] } },
-    data: { status: 'VOID', externalId: null },
+    // o3d-11rf r2: THIS VOID RETIRES THE DOCUMENT, not an attempt. The order is cancelled, so no
+    // later enqueue may take these events back to PENDING — and the enqueue side can only refuse
+    // that if the row says so. Recorded here rather than inferred from the audit action below,
+    // because `accounting_event_logs.createdAt` is transaction-start time and cannot order two
+    // entries written in one transaction.
+    data: { status: 'VOID', externalId: null, voidBasis: SOURCE_CANCELLED_VOID_BASIS },
   })
   if (updated.count === 0) return
 

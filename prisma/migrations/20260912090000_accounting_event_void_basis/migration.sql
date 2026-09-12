@@ -1,0 +1,13 @@
+-- o3d-11rf r2 — WHY A MIRRORED ACCOUNTING EVENT IS VOID.
+--
+-- A shared mirrored event recorded one bit for two different facts: an order CANCELLATION retiring
+-- the document for good, and an operator settling ONE sync row NOT_POSTED for a document that may
+-- still be owed and re-queued. The enqueue side has to tell them apart before it may take a VOID
+-- event back to PENDING for a new live attempt, and it could not.
+--
+-- NULLABLE WITH NO DEFAULT, AND NULL IS THE SAFE ANSWER. `isRevivableVoidBasis` revives only on the
+-- explicit attempt-settled value, so every row that exists today, and every row a predecessor
+-- binary writes while it is still serving across this deploy, is NOT revivable. The column can only
+-- ever grant a permission, and only where the writer recorded one — which is why this migration
+-- needs no verification of which binary was serving.
+ALTER TABLE "accounting_events" ADD COLUMN "voidBasis" TEXT;

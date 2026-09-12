@@ -182,6 +182,14 @@ function makeTx(hooks: { onCount?: () => Promise<void> | void } = {}) {
       },
     },
     shipment: { findUnique: async () => null },
+    // o3d-11rf: the scope lock now covers MIRRORED types, and this fixture queues SALES_INVOICE /
+    // SALES_INVOICE_UPDATE. Recorded into the same event log the rest of the fixture uses, so the
+    // lock's position relative to the read and the insert stays visible to these tests rather than
+    // being quietly absorbed.
+    $executeRaw: async () => {
+      world.events.push('producer:scope-lock')
+      return 1
+    },
   })
   return tx
 }
@@ -308,7 +316,10 @@ test('a producer that SNAPSHOTTED before blocking on the lock cannot queue the s
   assert.equal(world.syncLogs.length, 0, 'and NO invoice job carrying the superseded 10 was queued')
   assert.deepEqual(
     world.events,
-    ['backfill:lock', 'producer:start', 'backfill:write', 'producer:done'],
+    // 'producer:scope-lock' is the o3d-11rf follow-up scope lock, which now covers MIRRORED types
+    // and so applies to SALES_INVOICE. Its position is the point: the producer reaches it only
+    // AFTER the backfill's write, which is what "the producer really did run second" means here.
+    ['backfill:lock', 'producer:start', 'backfill:write', 'producer:scope-lock', 'producer:done'],
     'the producer really did run second, after the lock was released — the interleaving under test',
   )
 

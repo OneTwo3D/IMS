@@ -28,6 +28,15 @@ const state = {
 }
 
 const tx = {
+  // o3d-11rf: queueXeroSync takes the follow-up scope lock, and SALES_INVOICE is a MIRRORED type, so
+  // the lock now applies to the rows this fixture queues (it used to gate on money-moving types
+  // only). Recorded rather than ignored: a fixture that silently swallowed the lock would keep
+  // passing if the lock were dropped.
+  scopeLocks: [] as unknown[][],
+  async $executeRaw(_strings: TemplateStringsArray, ...values: unknown[]) {
+    tx.scopeLocks.push(values)
+    return 1
+  },
   accountingSyncLog: {
     async create(args: { data: Record<string, unknown> }) {
       state.created.push(args.data)
