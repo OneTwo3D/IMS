@@ -299,12 +299,35 @@ unproven, and the remedy is a test like the two above, not a longer list.
 `tests/concurrency/wms-default-delta-scope-lock.concurrent.test.ts` races
 `defaultWmsDeltaScopeLock` on a real Postgres (gated on `RUN_DB_CONCURRENCY_TESTS=1`,
 throwaway keys only). The docstring's happens-before claim is about what two concurrent
-transactions can do to each other, which no in-memory double can decide. It also runs the
-**same interleaving without the lock** and asserts the stale read, so the locked case cannot
-pass by favourable timing alone. What it does *not* prove, and says so: that the generation
-chain alone is a sufficient fence for a connector with no scope binding. The default's token
-is the constant `unbound`, so a save-time scope comparison over it is unconditional — that
-premise is asserted; its sufficiency is a question about `saveWmsDeltaCursors`.
+transactions can do to each other, which no in-memory double can decide.
+
+**The fixture is PRE-EXISTING, COMMITTED cursor rows, and that detail is the whole test.**
+The first version of the file raced two transactions over keys that did not exist yet, and
+`lockWmsSettingRows` materialises its rows with `INSERT ... ON CONFLICT DO NOTHING` — an
+`ON CONFLICT` insert *waits* for a conflicting speculative insertion from an uncommitted
+transaction. So the second pass parked on the first pass's **INSERT**, not on its row lock:
+measured, with `FOR UPDATE` deleted, it still blocked, `pg_blocking_pids` still named the
+first backend, and it still read the committed value. The serialization was real and the
+attribution was wrong, and the only thing left detecting the deletion was a `/FOR UPDATE/`
+match on the SQL string — which an inert `/* FOR UPDATE */` comment satisfies while the rows
+are no longer serialized at all. Pre-committing the rows is what removes the unique index
+from the picture: the materialisation is then inert (asserted: the lock reports **zero** rows
+written), so `SELECT ... FOR UPDATE` is the only statement that can make the second pass wait.
+
+Three cells share one harness and each differs from the subject in exactly one argument:
+the subject (pre-existing rows, the real lock) serializes; the **negative control**
+(pre-existing rows, the same SQL with only `FOR UPDATE` removed) loses the first pass's
+advance; and a labelled **cold-start** cell (absent rows, the real lock) asserts that what
+serializes a first-ever cursor write is the *unique index*, so it stays green when the row
+lock is deleted — deliberately, because it is not evidence about the lock. The lock's
+**extent** is measured from a third connection with `FOR UPDATE NOWAIT` (55P03 means held)
+rather than inferred from timing, which is also what makes "it did not lock the other
+connector's rows" non-vacuous: the same probe first proves it *did* lock its own.
+
+What it does *not* prove, and says so: that the generation chain alone is a sufficient fence
+for a connector with no scope binding. The default's token is the constant `unbound`, so a
+save-time scope comparison over it is unconditional — that premise is asserted; its
+sufficiency is a question about `saveWmsDeltaCursors` (o3d-x343).
 
 ## Enforcement
 
