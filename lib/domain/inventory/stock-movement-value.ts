@@ -87,10 +87,23 @@ export function buildStockMovementValueFields(params: {
  * The sibling `buildStockMovementValueFields` above has always REFUSED a negative unit
  * cost outright. This form now enforces the same invariant instead of hiding a
  * violation of it: it is the same refusal the transfer-receipt re-layering helper makes
- * (`NegativeCostSnapshotEntryError` in lib/domain/inventory/transfer-cost-layer-recreation.ts),
- * applied at the choke point EVERY costed movement passes through, so the paths that
- * helper never covered — sales dispatch, TRANSFER_OUT, supplier return, manufacturing
- * consumption, stock adjustment — fail loudly rather than mis-state.
+ * (`NegativeCostSnapshotEntryError` in lib/domain/inventory/transfer-cost-layer-recreation.ts).
+ *
+ * THIS FUNCTION IS NOT A CHOKE POINT for every costed movement, and must not be described
+ * as one. It is one of TWO builders. The sibling above is called directly by THIRTEEN
+ * production writers that never reach this one — opening stock, purchase receipt, PO
+ * cancellation reversal, customer-return inbound, the positive half of a stock adjustment,
+ * the adjustment-edit addition branch, the WooCommerce and CSV historical imports, the
+ * Mintsoft allocation sync, and three WMS booked-in paths. Negative-basis cover comes from
+ * BOTH builders refusing (25 production call sites between them), not from this one being a
+ * funnel. The TWELVE call sites that do reach here — five direct, seven via
+ * `buildStockMovementValueFieldsFromConsumed` — are the FIFO-consumption and
+ * snapshot-valued paths the transfer helper never covered: sales dispatch, TRANSFER_OUT,
+ * TRANSFER_IN, supplier return, manufacturing consumption and recovery, stock-adjustment
+ * removal and adjustment edit. Those now fail loudly rather than mis-state. The exact
+ * per-file census is ASSERTED (not merely asserted to exist) by the call-site census test
+ * in tests/domain/inventory/stock-movement-value.test.ts, so adding, moving or removing a
+ * call site anywhere under app/ or lib/ fails that test until the census is updated.
  *
  * THIS IS NOT NEGATIVE-BASIS SUPPORT and deliberately does not decide what one should
  * mean. Representing a credit-derived basis end to end (signed movement values, a
@@ -117,10 +130,13 @@ export function buildStockMovementValueFieldsFromTotal(params: {
     throw new Error(
       'Stock movement unit cost must be zero or greater: total value ' +
       `${signedTotal.toFixed(6)} over quantity ${signedQty.toFixed(6)} implies a NEGATIVE unit cost. ` +
-      'A credit-derived (negative-basis) cost layer cannot be represented downstream — the movement ' +
-      'ledger would carry the positive absolute value while cogs_entries keeps the negative sign, and ' +
-      'the Xero and QuickBooks daily syncs emit a COGS journal pair only when the batch total is above ' +
-      'zero. Correct the credit cost line that drove the basis negative (o3d-gd2f).',
+      'This movement value is REFUSED rather than absolutised, so the caller cannot store it; any row ' +
+      'the caller already created rolls back with its enclosing transaction. A credit-derived ' +
+      '(negative-basis) cost ' +
+      'layer cannot be represented downstream: cogs_entries would keep the negative sign for this same ' +
+      'consumption, and the Xero and QuickBooks daily syncs emit a COGS journal pair only when the ' +
+      'batch total is above zero, so the journal would be dropped silently. Correct the credit cost ' +
+      'line that drove the basis negative (o3d-gd2f).',
     )
   }
   const unitCostBase = qty.gt(0)
@@ -149,9 +165,15 @@ export function buildStockMovementValueFieldsFromConsumed(
   // valid legacy-stock path and records zero value; mixed-sign entries are
   // treated as net weighted cost for defensive correction callers.
   //
-  // o3d-gd2f: a consumed layer whose unitCostBase is NEGATIVE makes the net total
-  // negative, and the delegation below therefore REFUSES it rather than absolutising
-  // it. That is deliberate: this function's callers write `cogs_entries` from the same
+  // o3d-gd2f: what is judged is the NET basis, NOT the presence of a negative layer. A
+  // negative `unitCostBase` on one consumed layer does NOT by itself make the net total
+  // negative: a mix that still nets positive (4 @ +3 together with 1 @ −1 → +11 over 5
+  // units) is accepted unchanged, and that is pinned by the mixed-net-positive test in
+  // tests/domain/inventory/stock-movement-value.test.ts. Only when the net total and the
+  // row qty DISAGREE IN SIGN — i.e. the net implied unit cost is negative — does the
+  // delegation below REFUSE rather than absolutise.
+  //
+  // That refusal is deliberate: this function's callers write `cogs_entries` from the same
   // `consumed` array via `cogsEntryDataFromConsumed`, which keeps the sign, so
   // absolutising here put the movement ledger and the COGS subledger in disagreement
   // for one consumption. The refusal lives in the delegate so every caller of either
