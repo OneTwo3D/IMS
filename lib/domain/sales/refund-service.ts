@@ -345,6 +345,25 @@ export type RefundAccountingSyncRequest = {
    * resolution they have always had.
    */
   connector?: 'xero' | 'quickbooks'
+  /**
+   * o3d-j625 — THE CONNECTOR WHOSE CHART THE ACCOUNT CODES IN `payload` CAME FROM.
+   *
+   * A DIFFERENT FACT FROM `connector` ABOVE, and the two are not interchangeable. `connector` is a
+   * PROOF: this credit reverses a debit that was established to stand in those books, and it buys the
+   * o3d-i0o6 r8 lock-held fence. This is a statement about the PAYLOAD: `settings.inventoryAccount`,
+   * `settings.cogsAccount`, `settings.unearnedRevenueAccount` and `settings.allocatedInventoryAccount`
+   * on the journal lines below are ONE connector's codes, read once at staging.
+   *
+   * Carried on the request for the same reason the pin is: the request is the only thing that crosses
+   * the gap to the hand-off, and it is persisted to `accountingRetrySyncs` and replayed by the retry —
+   * so a journal staged against Xero's chart and retried a week later must still be routed to Xero's
+   * queue, or refused, rather than written into whatever is active when someone presses retry.
+   *
+   * Optional because a request persisted before this field existed does not have one, and inventing a
+   * value for those would be this code vouching for a read it never saw; absent means the enqueue keeps
+   * the active-connector resolution it has always had.
+   */
+  chartConnector?: 'xero' | 'quickbooks' | null
 }
 
 /**
@@ -2760,6 +2779,9 @@ async function stageRefundAccountingReversals(
       referenceType: 'SalesOrderRefund',
       referenceId: params.refundId,
       idempotencyKey: `sales-order-refund:${params.refundId}:cogs-reversal`,
+      // o3d-j625: the two `accountCode`s below are `settings.*` — this staging's own chart read. Named
+      // here so the hand-off (and a retry days later) writes the row under the same connector.
+      chartConnector: settings.connector,
       payload: {
         date: cogsReversalJournalDate,
         reference: `COGS reversal: ${params.orderRef}`,
@@ -2851,6 +2873,12 @@ async function stageRefundAccountingReversals(
       ...(reversalAmounts.allocationReversal > 0 && reversalAmounts.allocationProvedOnConnector
         ? { connector: reversalAmounts.allocationProvedOnConnector }
         : {}),
+      // o3d-j625: and, separately from the pin above, whose chart `journalLines` was built from —
+      // `settings.unearnedRevenueAccount`, `settings.salesAccount`, `settings.inventoryAccount`,
+      // `settings.allocatedInventoryAccount`. The pin is about where the DEBIT stood; this is about
+      // whose account numbers are on the page. An unpinned unearned-only reversal has no proof behind
+      // it and previously had nothing at all naming its chart.
+      chartConnector: settings.connector,
       payload: {
         date: new Date().toISOString().slice(0, 10),
         reference: hasUnearnedReversal
@@ -2962,6 +2990,16 @@ function parseRefundAccountingRetrySyncs(
       // very function round-trips.
       ...(entry.connector === 'xero' || entry.connector === 'quickbooks'
         ? { connector: entry.connector }
+        : {}),
+      // o3d-j625: AND THE CHART SURVIVES THE ROUND TRIP, for exactly the reason above — this parser
+      // rebuilds the request field by field and drops anything it does not name, so a `chartConnector`
+      // written at staging and not read back here would leave the RETRY routing the journal by a fresh
+      // resolution while its account codes stayed the staged connector's. Narrowed to the two known ids
+      // and spread, like the pin: `null` is not carried because a request staged with no connector at
+      // all staged no account codes worth routing, and `{chartConnector: undefined}` is not the same
+      // object as `{}` to the persisted JSON this function round-trips.
+      ...(entry.chartConnector === 'xero' || entry.chartConnector === 'quickbooks'
+        ? { chartConnector: entry.chartConnector }
         : {}),
     }]
   })

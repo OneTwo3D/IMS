@@ -298,6 +298,8 @@ function restoreTestState(state: State, snapshot: State) {
 }
 
 const accountingSettings: AccountingSettings = {
+  // o3d-j625: the chart names its own connector, so a fixture has to say which one it is.
+  connector: 'xero',
   syncEnabled: true,
   salesAccount: '4000',
   shippingAccount: '4010',
@@ -7991,6 +7993,163 @@ test('o3d-i0o6 r3: the staged allocation credit names the ledger its debit was P
   const persisted = state.refunds[0].accountingRetrySyncs as Array<Record<string, unknown>>
   const persistedReversal = persisted.find((sync) => sync.type === 'UNEARNED_REV_REVERSAL')
   assert.equal(persistedReversal?.connector, 'xero', 'the retry replays it on the same ledger')
+})
+
+/**
+ * o3d-j625 — AND THE CHART TRAVELS TOO, WHICH IS A DIFFERENT FACT FROM THE PIN.
+ *
+ * The pin says which BOOKS the credit belongs in and is present only where a debit was proved. The
+ * chart says whose ACCOUNT NUMBERS are on the page, and that is true of every staged journal —
+ * `settings.inventoryAccount`, `settings.cogsAccount`, `settings.unearnedRevenueAccount`,
+ * `settings.allocatedInventoryAccount` are one connector's codes, read once at staging. An unpinned
+ * unearned-only reversal had NOTHING at all naming its chart, so the hand-off (or a retry days later)
+ * resolved the active connector afresh and wrote one connector's row carrying the other's codes.
+ */
+test('o3d-j625: every staged reversal names the chart its account codes came from, pinned or not', async () => {
+  // `sm1StagedState` is the fixture that stages BOTH reversal types. A fixture that stages only one of
+  // them would let a "for every staged sync" loop pass while examining a single type, which is how this
+  // test first passed under a mutation that stripped the COGS reversal's chart.
+  const state = sm1StagedState()
+
+  const result = await createSalesOrderRefund(createClient(state), {
+    orderId: 'order-1',
+    lines: [{ lineId: 'line-1', productId: 'product-1', description: 'Product 1', qty: 2, totalBase: 100 }],
+    reason: 'Customer cancelled',
+    creditNotePrefix: 'CN-',
+    accountingSettings,
+    activeAccountingConnector: 'xero',
+  })
+
+  assert.equal(result.success, true)
+  const staged = result.success ? result.accountingSyncs : []
+  // THE PRECONDITION, ASSERTED: both account-code-bearing reversals are really in this list.
+  assert.deepEqual(
+    staged.map((sync) => sync.type).sort(),
+    ['COGS_REVERSAL', 'UNEARNED_REV_REVERSAL'],
+    'the fixture must stage both reversal types, or the loop below examines one of them',
+  )
+  for (const sync of staged) {
+    assert.equal(
+      sync.chartConnector,
+      'xero',
+      `${sync.type} was staged from Xero's chart and must say so \u2014 otherwise the hand-off resolves the `
+      + 'connector again and can write the other one\u2019s row with these codes',
+    )
+  }
+
+  // AND IT IS PERSISTED. `accountingRetrySyncs` is what crosses to a retry days later.
+  const persisted = state.refunds[0].accountingRetrySyncs as Array<Record<string, unknown>>
+  assert.equal(persisted.length, 2)
+  for (const sync of persisted) {
+    assert.equal(sync.chartConnector, 'xero', `${String(sync.type)} lost its chart on the way to the database`)
+  }
+})
+
+/**
+ * o3d-j625 — AND THE CHART SURVIVES THE READ BACK, WHICH IS A DIFFERENT ASSERTION FROM THE WRITE.
+ *
+ * The test above proves the chart is WRITTEN to `accountingRetrySyncs`. It says nothing about the read:
+ * `parseRefundAccountingRetrySyncs` rebuilds each request field by field and silently drops anything it
+ * does not name, and that half is only reached by the RETRY. A mutation that deleted the chart from the
+ * parser left the write-side test green — this is the assertion that catches it, and its absence is why
+ * the round-trip claim was, for one round, a claim about the wrong half.
+ */
+test('o3d-j625: a retry replays the staged chart, so it re-queues on the connector the codes came from', async () => {
+  const persistedSyncs = [{
+    type: 'COGS_REVERSAL' as const,
+    referenceType: 'SalesOrderRefund',
+    referenceId: 'refund-1',
+    idempotencyKey: 'sales-order-refund:refund-1:cogs-reversal',
+    // Staged from Xero's chart, days ago. The two account codes below are Xero's.
+    chartConnector: 'xero' as const,
+    payload: {
+      date: '2026-01-03',
+      reference: 'COGS reversal: SO-1',
+      lines: [
+        { accountCode: '1200', description: 'COGS reversal: SO-1', debit: 20 },
+        { accountCode: '5000', description: 'COGS reversal: SO-1', credit: 20 },
+      ],
+    },
+  }]
+  const state = baseState({
+    orders: [{
+      id: 'order-1',
+      externalOrderNumber: null,
+      orderNumber: 'SO-1',
+      status: 'REFUNDED',
+      fxRateToBase: 1,
+      totalBase: 100,
+      revenueDeferredDate: null,
+      unearnedRevenueAmount: 100,
+      inventoryAllocatedDate: null,
+      allocationBatchAmount: 20,
+    }],
+    refunds: [{
+      id: 'refund-1',
+      orderId: 'order-1',
+      creditNoteNumber: 'CN-2026-00001',
+      externalRefundId: null,
+      reason: 'Full return',
+      totalForeign: 100,
+      totalBase: 100,
+      returnWarehouseId: null,
+      accountingRetryRequired: true,
+      accountingWarning: 'Previous accounting queueing failed',
+      accountingRetrySyncs: persistedSyncs,
+    }],
+    refundLines: [{
+      id: 'refund-line-1',
+      refundId: 'refund-1',
+      salesOrderLineId: 'line-1',
+      productId: 'product-1',
+      description: 'Product 1',
+      qty: 2,
+      unitPriceForeign: 50,
+      unitPriceBase: 50,
+      totalForeign: 100,
+      totalBase: 100,
+    }],
+  })
+  withRecordedA2Journal(state, { status: 'SYNCED' })
+
+  const result = await retrySalesOrderRefundAccounting(createClient(state), {
+    refundId: 'refund-1',
+    accountingSettings,
+    activeAccountingConnector: 'xero',
+  })
+
+  assert.equal(result.success, true)
+  const replayed = result.success ? result.accountingSyncs : []
+  assert.equal(replayed.length, 1, 'precondition: the persisted sync was read back at all')
+  assert.equal(
+    replayed[0].chartConnector,
+    'xero',
+    'the parser must name the chart, or the retry queues this journal by whatever connector is active '
+    + 'when someone presses the button while its account codes stay Xero\u2019s',
+  )
+})
+
+test('o3d-j625: an UNPINNED journal still carries a chart \u2014 the two facts are independent', async () => {
+  // The pin is absent because nothing was proved; the account codes are still Xero's. Before this, that
+  // combination was the one with no attribution at all.
+  const state = a2StagedAllocatedState()
+  state.orders[0].allocationBatchAmount = 0
+  state.orders[0].allocationBatchPasses = []
+  state.allocations = []
+
+  const result = await createSalesOrderRefund(createClient(state), {
+    orderId: 'order-1',
+    lines: [{ lineId: null, productId: null, description: 'Monetary refund', qty: 0, totalBase: 100, lineKind: 'sale' }],
+    reason: 'Goodwill full refund',
+    creditNotePrefix: 'CN-',
+    accountingSettings,
+    activeAccountingConnector: 'xero',
+  })
+
+  const reversal = result.success && result.accountingSyncs.find((sync) => sync.type === 'UNEARNED_REV_REVERSAL')
+  assert.ok(reversal)
+  assert.equal(reversal.connector, undefined, 'nothing pins it: no debit was proved')
+  assert.equal(reversal.chartConnector, 'xero', 'but its account codes are still Xero\u2019s, and it says so')
 })
 
 test('o3d-i0o6 r3: a journal carrying NO allocation credit is left unpinned', async () => {

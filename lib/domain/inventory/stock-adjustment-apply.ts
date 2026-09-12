@@ -326,6 +326,12 @@ export async function applyStockAdjustment({
         referenceType: 'StockMovement',
         referenceId: movement.id,
         payload: journal as unknown as Record<string, unknown>,
+        // o3d-j625: `inventoryAccountCode` on the journal is `settings.inventoryAccount`. The window is
+        // wider here than at a single call site, because `providedSettings` is read ONCE for a whole
+        // batch of adjustments by the caller (see the `settings` option) and every row in that batch is
+        // enqueued against it — so an unrouted enqueue could write the tail of a batch under the other
+        // connector while carrying the first connector's inventory account.
+        chartConnector: settings.connector,
       })
     }
   }

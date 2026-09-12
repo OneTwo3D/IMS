@@ -3773,6 +3773,12 @@ export async function markBillPaid(
               gainLossBase: realised.gainLossBase,
             },
             idempotencyKey: `realised-fx:bill-payment:${invoice.id}:${paymentDate.toISOString().slice(0, 10)}:${paymentAmount}`,
+            // o3d-j625: `lines` carries `accounts.controlAccount` (AP) and `accounts.fxGainLossAccount`,
+            // both read off the `accountingSettings` above — so the row is routed by the same resolution
+            // those codes came from instead of a second one taken at the enqueue. Same shape as the
+            // receivable side in app/actions/sales.ts; not named by o3d-j625, found by sweeping every
+            // queueAccountingSync caller.
+            chartConnector: accountingSettings.connector,
           })
         }
       }

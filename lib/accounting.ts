@@ -56,6 +56,29 @@ export type AccountingSettings = {
   /** Same as reverseChargeSalesTaxType but applied to bills (ACCPAY). Typical
    *  Xero value: REVERSECHARGES for EU services purchased into the UK. */
   reverseChargePurchaseTaxType: string
+  /**
+   * o3d-j625 — WHOSE CHART THIS IS. NOT A CONVENIENCE FIELD; IT IS WHAT MAKES THE ACCOUNT CODES
+   * ABOVE ATTRIBUTABLE.
+   *
+   * Every account code on this object is ONE CONNECTOR'S account code — `salesAccount` is Xero's or
+   * QuickBooks's, never "the business's" (`getAccountingSettingsFor` says so already). A caller that
+   * read these codes and then let an enqueue resolve "the active connector" for itself was building a
+   * payload from one resolution and writing a row under a second, so a connector switch between the
+   * two committed connector B's row carrying connector A's codes: the document posts to accounts that
+   * do not exist in the books it lands in, or is rejected there, and the row is durable and claimable.
+   *
+   * Carrying the connector ON THE CHART is what closes that, because the chart is the thing that
+   * crosses the gap — it is passed between functions (`queueRefundAccountingActions`,
+   * `applyStockAdjustment`), persisted onto staged retry requests, and read minutes later. A caller
+   * hands it back to {@link queueAccountingSync} as `chartConnector` and the row is written under the
+   * SAME resolution the codes came from. There is no second resolution left to disagree with.
+   *
+   * REQUIRED, not optional: an optional field would let a caller silently omit it and get the old
+   * unattributed behaviour back, which is the defect. `null` is the honest answer when no accounting
+   * connector is switched on at all — the codes are then the empty-string defaults, and an enqueue
+   * handed `null` writes nothing rather than posting empty accounts into whatever came on afterwards.
+   */
+  connector: AccountingConnectorInfo['id'] | null
 }
 
 type AccountingConnectorInfo = {
@@ -120,6 +143,7 @@ const DEFAULT_ACCOUNTING_SETTINGS: AccountingSettings = {
   billUrlTemplate: '',
   reverseChargeSalesTaxType: '',
   reverseChargePurchaseTaxType: '',
+  connector: null,
 }
 
 async function getActiveAccountingConnectorId(): Promise<AccountingConnectorInfo['id'] | null> {
@@ -288,12 +312,117 @@ export type AccountingEnqueueOutcome = ConnectorEnqueueOutcome & {
   connector: AccountingConnectorInfo['id'] | null
 }
 
+/**
+ * o3d-j625 — THE ACCOUNT CODES AND THE ROW MUST COME OUT OF ONE RESOLUTION OF "WHICH CONNECTOR".
+ *
+ * THE DEFECT, which the o3d-i0o6 r8 fence deliberately does NOT cover. That fence is for PINNED
+ * enqueues — a caller that PROVED something about a ledger — and it is a transactional advisory lock
+ * plus `FOR UPDATE` on the plugin rows, held to the inserting commit. Taking it for every enqueue
+ * would serialise invoicing, shipment confirmation and every journal against each other and against
+ * every settings save, so unpinned enqueues take no lock. What was left behind is not a locking gap at
+ * all, and no lock is needed to close it:
+ *
+ *   `getAccountingSettings()` internally resolves the active connector and returns THAT connector's
+ *   chart. The caller then builds a payload out of those account codes — through a numbering read, a
+ *   tax-rate lookup, an FX computation, a whole line map — and calls `queueAccountingSync` with NO
+ *   connector, which resolves the active connector AGAIN. A switch committing in that window writes
+ *   connector B's row carrying connector A's `salesAccount`, `shippingAccount`, `discountAccount`.
+ *   The document then posts to accounts that do not exist in the books it landed in, or is rejected
+ *   there — and the row is durable and claimable either way.
+ *
+ * THE FIX IS TO DELETE THE SECOND RESOLUTION, NOT TO LOCK THE WINDOW. `chartConnector` is the
+ * connector the CODES CAME FROM (`AccountingSettings.connector`, which the chart now carries). Given
+ * it, this function does not resolve anything: it routes the row through that connector's own queue.
+ * The row's connector and the payload's account codes then come from ONE read, and they cannot
+ * disagree however long the window is or however many switches commit inside it. That property is
+ * STRUCTURAL — it holds with no lock and no fence.
+ *
+ * AND THE CHART BEING RETIRED IS REPORTED, NOT WRITTEN. Having established which books the codes
+ * belong to, there is a second question: are those still the books this system is running? Asked
+ * here, pooled and unlocked — the same predicate `pinnedLedgerIsServiced` answers for a pin — and a
+ * `no` REFUSES rather than writing. `refused`, never `not-configured`: the posting is still owed (see
+ * ConnectorEnqueueOutcome). This is deliberately WEAKER than the r8 fence and says so: a switch
+ * committing after this read and before the connector queue's insert still writes the row, because
+ * closing THAT window is what costs the global lock. It is worth having anyway, because the window it
+ * does close is the wide one — the whole payload build — and because the row it declines to write is
+ * one no scheduled drain reads.
+ *
+ * `null` MEANS "NO CONNECTOR WAS SWITCHED ON WHEN THE CHART WAS READ", and it is answered
+ * `not-configured` — the same answer an unpinned enqueue has always given when nothing is on, and the
+ * honest one: the payload's account codes are the empty-string defaults. Resolving the connector here
+ * instead would post a document with no account codes into whichever connector came on in between.
+ *
+ * ONE IMPLEMENTATION, BOTH ENQUEUE PATHS. `queueAccountingSync` and `queueAccountingSyncTx` are two
+ * copies of this decision waiting to drift, which is what o3d-d0pd's three copies of the
+ * already-present check turned into; the in-transaction path calls this too and maps the answer through
+ * its own `answer()` out-channel. It takes no transaction and no lock on purpose: everything it decides
+ * is decidable from the caller's own chart plus one pooled read, and a lock here is the cost o3d-i0o6 r8
+ * deliberately confined to pinned enqueues.
+ *
+ * Returns the outcome to answer with, or `null` to carry on with the enqueue.
+ */
+async function refuseUnattributableChart(params: {
+  type: AccountingSyncType
+  referenceType: string
+  referenceId: string
+  connector?: AccountingConnectorInfo['id']
+  chartConnector?: AccountingConnectorInfo['id'] | null
+}): Promise<AccountingEnqueueOutcome | null> {
+  // Absent: the caller named no chart, so nothing about it can be checked and nothing changes for it.
+  if (params.chartConnector === undefined) return null
+  if (params.chartConnector === null) {
+    return { queued: false, reason: 'not-configured', connector: null }
+  }
+  // A PIN AND A CHART THAT NAME DIFFERENT LEDGERS CANNOT BOTH BE HONOURED. The pin says which books
+  // the posting belongs in; the chart says whose account codes the payload is written in. Writing the
+  // pin's row with the chart's codes is the very thing this guard exists to prevent, so a disagreement
+  // is refused rather than resolved in either direction. No caller passes both today.
+  if (params.connector && params.connector !== params.chartConnector) {
+    return { queued: false, reason: 'refused', connector: params.connector }
+  }
+  if (await pinnedLedgerIsServiced(params.chartConnector)) return null
+  const { logActivity } = await import('@/lib/activity-log')
+  await logActivity({
+    entityType: 'SYSTEM',
+    action: 'accounting_enqueue_refused_retired_chart',
+    tag: 'accounting',
+    level: 'WARNING',
+    description:
+      `NOTHING WAS QUEUED. The ${params.type} for ${params.referenceType} ${params.referenceId} was `
+      + `built from ${params.chartConnector}'s chart of accounts, and ${params.chartConnector} is no `
+      + 'longer the active accounting connector, so queueing it would write a row no scheduled sync '
+      + 'reads. This posting is still OUTSTANDING: re-queue it from the source document once the '
+      + 'accounting connector selection has settled.',
+    metadata: {
+      chartConnector: params.chartConnector,
+      type: params.type,
+      referenceType: params.referenceType,
+      referenceId: params.referenceId,
+    },
+    // A refusal must not become a throw because the audit write failed — the caller's own reporting of
+    // `refused` is what the obligation ledgers act on.
+  }).catch(() => { /* logging must never turn a refusal into a throw */ })
+  return { queued: false, reason: 'refused', connector: params.chartConnector }
+}
+
 export async function queueAccountingSync(params: {
   type: AccountingSyncType
   referenceType: string
   referenceId: string
   payload: Record<string, unknown>
   idempotencyKey?: string
+  /**
+   * o3d-j625 — THE CONNECTOR WHOSE CHART OF ACCOUNTS THIS PAYLOAD'S ACCOUNT CODES CAME FROM.
+   *
+   * `AccountingSettings.connector`, handed straight back. Given it, this function resolves nothing:
+   * the row is written through that connector's queue, so the codes and the row come from ONE
+   * resolution and cannot disagree. Also refuses — pooled, unlocked, `refused` not `not-configured` —
+   * when that connector is no longer the active one, and `not-configured` when it is `null`.
+   *
+   * NOT the pin. `connector` below is a proof about a LEDGER and buys the r8 lock-held fence; this is
+   * a statement about a PAYLOAD and buys no lock at all. See {@link refuseUnattributableChart}.
+   */
+  chartConnector?: AccountingConnectorInfo['id'] | null
   /**
    * PIN THE LEDGER (o3d-i0o6 r3, Codex HIGH 1) — the same parameter, with the same meaning, as the
    * one {@link queueAccountingSyncTx} takes.
@@ -324,12 +453,21 @@ export async function queueAccountingSync(params: {
    */
   connector?: AccountingConnectorInfo['id']
 }): Promise<AccountingEnqueueOutcome> {
-  const connector = params.connector ?? await getActiveAccountingConnectorId()
+  // o3d-j625: FIRST, before any resolution — this is the guard that makes a second resolution
+  // unnecessary, so it cannot run after one. See refuseUnattributableChart.
+  const unattributable = await refuseUnattributableChart(params)
+  if (unattributable) return unattributable
+  // o3d-j625: `params.chartConnector` before the resolve, so a caller that named the chart its codes
+  // came from gets ITS connector rather than a fresh answer to the same question. A `null` chart has
+  // already returned above, so the `??` chain cannot fall through a deliberate "no connector" into a
+  // resolution that finds one.
+  const connector = params.connector ?? params.chartConnector ?? await getActiveAccountingConnectorId()
   // o3d-i0o6 r9: the one pre-fence `not-configured` on this path a PIN CANNOT REACH, by construction
-  // rather than by luck — `connector` is `params.connector ?? <resolved>`, so a pinned enqueue always
-  // has one and this branch is dead for it. Left as a literal for that reason; every other pre-fence
-  // `not-configured` below and in the connector queues goes through
-  // `notConfiguredUnderPinnedLedgerFence`.
+  // rather than by luck — `connector` is `params.connector ?? params.chartConnector ?? <resolved>`, so
+  // a pinned enqueue always has one and this branch is dead for it. Left as a literal for that reason;
+  // every other pre-fence `not-configured` below and in the connector queues goes through
+  // `notConfiguredUnderPinnedLedgerFence`. o3d-j625: a CHARTED enqueue cannot reach it either — a
+  // `null` chart has already answered `not-configured` above, and a named one is this `connector`.
   if (!connector) return { queued: false, reason: 'not-configured', connector: null }
   // o3d-i0o6 r7 — AND THE PINNED LEDGER MUST STILL BE THE ONE THIS SYSTEM IS RUNNING. See
   // `pinnedLedgerIsServiced`: the pin establishes WHICH books the posting belongs in, the sync
@@ -493,6 +631,19 @@ export async function queueAccountingSyncTx(
      */
     connector?: AccountingConnectorInfo['id']
     /**
+     * o3d-j625 — THE CONNECTOR WHOSE CHART OF ACCOUNTS THIS PAYLOAD'S ACCOUNT CODES CAME FROM.
+     *
+     * The same parameter, with the same meaning, as the one {@link queueAccountingSync} takes, and for
+     * the same reason: without it this function resolves the active connector for itself
+     * (`getAccountingPostingContext`) after the caller has already resolved it once to read the chart,
+     * so a switch in between writes one connector's row carrying another's account codes.
+     *
+     * NOT the pin above. The pin is a proof about a LEDGER and takes the plugin-selection lock through
+     * `tx`; this is a statement about a PAYLOAD and takes no lock — it routes by the caller's own
+     * resolution and refuses, pooled, when that connector is no longer the active one.
+     */
+    chartConnector?: AccountingConnectorInfo['id'] | null
+    /**
      * Acknowledge that this call site CANNOT hoist the sales-order row lock, with the reason
      * (o3d-3zgy). Only for paths where hoisting is structurally impossible today — passing it keeps
      * the o3d-hrak delete race open for that path, so it must be justified and tracked.
@@ -597,6 +748,17 @@ export async function queueAccountingSyncTx(
   // (hoisted by the caller, asserted above) -> plugin selection -> follow-up scope. The connector
   // queues take the same three in the same order, and no plugin-selection writer holds a sales-order
   // row, so nothing can cycle.
+  // o3d-j625: the chart check, BEFORE the pin fence and before any posting context is resolved — it is
+  // the thing that removes the second resolution, so nothing may resolve ahead of it. Reported through
+  // `answer` so this path's out-channel names the same connector the refusal is about. Shared with the
+  // facade rather than restated: see refuseUnattributableChart.
+  const unattributable = await refuseUnattributableChart(params)
+  if (unattributable) {
+    return answer(
+      { queued: unattributable.queued, reason: unattributable.reason },
+      unattributable.connector,
+    )
+  }
   if (params.connector && !await pinnedLedgerIsServicedUnderLock(tx, params.connector)) {
     return answer({ queued: false, reason: 'refused' }, params.connector)
   }
@@ -604,8 +766,12 @@ export async function queueAccountingSyncTx(
   // question of the named connector that `getAccountingPostingContext` asks of whichever is active,
   // so a pinned caller gets the same verdict about the ledger it proved against — and a `null` here
   // means THAT connector does not post this type, never "some other connector does".
-  const context = params.connector
-    ? await getAccountingPostingContextFor(params.connector, params.type)
+  // o3d-j625: `params.chartConnector` joins the pin here for the same reason it does on the facade — a
+  // caller that named the chart its codes came from must get the verdict, and the row, for THAT
+  // connector rather than a fresh answer to the same question. A `null` chart has already returned above.
+  const routedConnector = params.connector ?? params.chartConnector
+  const context = routedConnector
+    ? await getAccountingPostingContextFor(routedConnector, params.type)
     : await getAccountingPostingContext(params.type)
   // A DECISION: there is no connector, or its sync (or this type) is switched off. No counterpart
   // will ever exist for this posting, so nothing is left outstanding.
@@ -856,6 +1022,10 @@ export async function getAccountingSettingsFor(
       billUrlTemplate: billUrlSetting?.value ?? '',
       reverseChargeSalesTaxType,
       reverseChargePurchaseTaxType,
+      // o3d-j625: the chart names its own connector on every path, including this one. `null` here is
+      // not "unknown" — it is "no connector is switched on", which is exactly what the empty-string
+      // account codes above already mean.
+      connector: null,
     }
   }
 
@@ -884,6 +1054,9 @@ export async function getAccountingSettingsFor(
         billUrlTemplate: billUrlSetting?.value ?? '',
         reverseChargeSalesTaxType,
         reverseChargePurchaseTaxType,
+        // o3d-j625: every code above is XERO's. Said out loud, and carried, so no downstream enqueue
+        // has to resolve "which connector" a second time to find out.
+        connector,
       }
     }
     case 'quickbooks': {
@@ -911,6 +1084,8 @@ export async function getAccountingSettingsFor(
         billUrlTemplate: billUrlSetting?.value ?? '',
         reverseChargeSalesTaxType,
         reverseChargePurchaseTaxType,
+        // o3d-j625: and every code above is QUICKBOOKS's.
+        connector,
       }
     }
   }

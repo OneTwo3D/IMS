@@ -6,6 +6,7 @@ import { decideStoredInvoiceNumberUpdate } from '@/lib/connectors/woocommerce/sy
 import {
   buildHeldSalesInvoicePayload,
   buildReleasedSalesInvoicePayload,
+  heldSalesInvoiceChartConnector,
   heldSalesInvoiceQueueWhere,
   isHeldSalesInvoicePayload,
   MISSING_INVOICE_NUMBER_QUEUE_REASON,
@@ -43,6 +44,7 @@ function held() {
     orderNumber: 'WC-164981',
     metaKey: '_wcpdf_invoice_number',
     accountingPayload: ACCOUNTING_PAYLOAD,
+    chartConnector: 'xero',
   })
 }
 
@@ -71,6 +73,7 @@ test('a parked payload never carries an invoice number — that is what it is wa
     orderNumber: 'WC-164981',
     metaKey: '_wcpdf_invoice_number',
     accountingPayload: { ...ACCOUNTING_PAYLOAD, invoiceNumber: 'SOMETHING-INVENTED' },
+    chartConnector: 'xero',
   })
   assert.equal('invoiceNumber' in payload.accountingPayload, false)
   assert.equal(isHeldSalesInvoicePayload(payload), true)
@@ -317,4 +320,70 @@ test('the ledger document outranks the sync row in the explanation an operator r
     salesInvoiceSyncRowCount: 3,
   })
   assert.match(withDoc.action === 'refuse-correction' ? withDoc.reason : '', /already posted for this order under 164981/)
+})
+
+// ---------------------------------------------------------------------------
+// o3d-j625 — THE FROZEN PAYLOAD'S ACCOUNT CODES BELONG TO A PARTICULAR CONNECTOR
+// ---------------------------------------------------------------------------
+
+/**
+ * This module's contract is that only the NUMBER is added on release: "Nothing else in the parked
+ * payload is recomputed, so a settings change between hold and release cannot quietly alter what
+ * posts." That is right, and it is exactly what makes the account codes in the parked payload ONE
+ * connector's — frozen at import time. The release then enqueued with no connector at all, which
+ * resolved the active one afresh, and the gap between the two is not a race at all: it is however long
+ * WooCommerce takes to number the order, which can be days. A hold taken while Xero was active and
+ * released after a move to QuickBooks posted a QuickBooks invoice carrying Xero account codes.
+ *
+ * So the chart is parked WITH the codes, and the release routes by it.
+ */
+
+test('[o3d-j625] the parked payload records whose chart its frozen account codes came from', () => {
+  const payload = held()
+  assert.equal(payload.chartConnector, 'xero')
+  assert.equal(
+    heldSalesInvoiceChartConnector(payload),
+    'xero',
+    'the release must route by this, not by whichever connector is active when the number arrives',
+  )
+  // The codes it is describing are really in there — otherwise this is a field about nothing.
+  const lines = payload.accountingPayload.lines as Array<{ accountCode?: unknown }>
+  assert.equal(lines[0].accountCode, '200')
+})
+
+test('[o3d-j625] a LEGACY hold, parked before the chart was recorded, keeps its old behaviour rather than being refused for ever', () => {
+  const legacy = { ...held() }
+  delete (legacy as { chartConnector?: unknown }).chartConnector
+
+  assert.equal(
+    heldSalesInvoiceChartConnector(legacy),
+    undefined,
+    'undefined means "unchartered", which is what the enqueue has always been for these rows \u2014 '
+    + 'inventing a connector here would be this code vouching for a chart read it never saw',
+  )
+  assert.equal(
+    isHeldSalesInvoicePayload(legacy),
+    true,
+    'and a legacy hold is still a valid hold: making the chart part of the verdict would strand every '
+    + 'row parked before this field existed',
+  )
+})
+
+test('[o3d-j625] a hold parked with NO accounting connector keeps its null, so the release does not post blank accounts', () => {
+  const none = { ...held(), chartConnector: null }
+  assert.equal(
+    heldSalesInvoiceChartConnector(none),
+    null,
+    'null is NOT collapsed into undefined: the frozen codes are the empty-string defaults, so the '
+    + 'release must answer not-configured rather than posting them into a connector switched on since',
+  )
+})
+
+test('[o3d-j625] a stored chart value this build cannot route is treated as unchartered, not as a chart', () => {
+  const bogus = { ...held(), chartConnector: 'sage' as unknown as 'xero' }
+  assert.equal(
+    heldSalesInvoiceChartConnector(bogus),
+    undefined,
+    'a value that names no queue is not a chart; treating it as one would refuse that hold for ever',
+  )
 })

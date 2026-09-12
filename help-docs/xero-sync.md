@@ -2138,6 +2138,40 @@ in the Activity log with the action `xero_sync_post_fenced_out`, which:
 So if you settled a row as "it did NOT post" and it turns out it did, you are told, with the id and
 with the right remedy, rather than the assertion being quietly believed.
 
+### Postings refused because they were built for the connector you switched away from
+
+Switching the active accounting connector while IMS is composing a document is the one moment the
+document's own account numbers can stop describing the ledger it is about to be written to. Every
+account code IMS sends — the sales account on each invoice line, the shipping and discount accounts,
+the inventory, COGS, unearned-revenue, allocated-inventory and FX accounts on a journal — is read from
+**one** connector's chart of accounts. The row is written a moment later. If the selection moves in
+between, the document would land in the other connector's queue still carrying the first connector's
+account numbers: it is then either rejected by that accounting system, or posted against whatever
+those numbers happen to mean in its own chart.
+
+IMS no longer writes such a row. The posting is **refused** and recorded in the activity log as
+`accounting_enqueue_refused_retired_chart` (or, for an edit to an invoice that has already posted,
+`sales_invoice_update_refused_retired_chart`), naming the document type, the order or refund it was
+for, the connector whose chart it was built from and the one that is active now. The message says
+plainly that **nothing was queued** and that the posting is **still outstanding**.
+
+**What to do.** Nothing is lost and nothing partial was written — there is no row to find, no document
+to reverse, no half-posted invoice. Once the connector selection has settled, queue the posting again
+from its source: re-save or re-finalise the sales order for an invoice, press **Retry accounting** on
+the refund for a credit note and its reversals, re-run the revaluation for an FX journal. A refund
+whose credit note was refused keeps its **accounting retry required** flag and its warning, so it
+stays on the list of refunds owing accounting rather than looking settled.
+
+This is a refusal, not a retry: IMS does not re-resolve the connector and try again on its own,
+because "which books does this belong in" is not a question it can answer for you in the middle of a
+switch.
+
+**It is a narrow window, not a general refusal.** A posting is refused only when the selection actually
+changed while that one document was being built. Ordinary posting, including posting to a connector you
+switched to hours ago, is unaffected — the document is built and written under the same connector, as
+before. A refund or order posted while no accounting connector was enabled at all is unchanged too: as
+before, nothing is queued, because there is nothing for it to post to.
+
 ### Rows stranded on a connector you switched away from
 
 Because the sync log is scoped to the active connector, unresolved rows left behind on a connector that has since been turned off appear in **no** sync log. They are listed instead in the amber banner at the top of **Integrations**, which shows each row's connector, type, reference, status, age in days, and last error — plus the external transaction ID if the row already posted something before it stalled.

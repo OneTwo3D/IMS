@@ -329,6 +329,14 @@ export async function runArApFxRevaluation(input?: {
         lines,
       },
       idempotencyKey: `unrealised-fx:reversal:${valuationDate}:${prior.id}`,
+      // o3d-j625: `lines` are a reversal of a PRIOR journal's account codes, and every account code
+      // reachable from here — the AR/AP control accounts and the unrealised FX account this run
+      // validated above — came from the single `getAccountingSettings()` at the top of this function.
+      // The window is the widest of any enqueue site in the sweep: `getPriorRevaluations`,
+      // `getOpenReceivables`, `getOpenPayables` and a per-document build all run inside it, and the
+      // loop enqueues once per prior revaluation. Routed by the chart's own connector, so a switch
+      // during the run cannot write one ledger's reversal into the other's books.
+      chartConnector: settings.connector,
     })
     reversed += 1
   }
@@ -373,6 +381,8 @@ export async function runArApFxRevaluation(input?: {
           documentCount: built.documents,
         },
         idempotencyKey: `unrealised-fx:revaluation:${valuationDate}:${side}`,
+        // o3d-j625: `accounts.controlAccount` / `accounts.fxGainLossAccount` are this run's chart.
+        chartConnector: settings.connector,
       })
       revalued += 1
     }

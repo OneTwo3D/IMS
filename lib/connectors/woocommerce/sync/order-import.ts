@@ -15,6 +15,7 @@ import { decideStoredInvoiceNumberUpdate, resolveWcAccountingInvoiceNumber } fro
 import {
   buildHeldSalesInvoicePayload,
   buildReleasedSalesInvoicePayload,
+  heldSalesInvoiceChartConnector,
   HELD_SALES_INVOICE_RECORD_KIND,
   heldSalesInvoiceQueueWhere,
   HELD_SALES_INVOICE_ORDER_MISSING_MESSAGE,
@@ -1004,6 +1005,8 @@ async function holdWcSalesInvoiceForMissingNumber(params: {
   orderNumber: string
   metaKey: string
   accountingPayload: Record<string, unknown>
+  /** o3d-j625: the chart the frozen account codes came from, parked with them. */
+  chartConnector: 'xero' | 'quickbooks' | null
 }): Promise<void> {
   const held = buildHeldSalesInvoicePayload({
     externalOrderId: String(params.wcOrder.id),
@@ -1012,6 +1015,7 @@ async function holdWcSalesInvoiceForMissingNumber(params: {
     orderNumber: params.orderNumber,
     metaKey: params.metaKey,
     accountingPayload: params.accountingPayload,
+    chartConnector: params.chartConnector,
   })
   const jsonPayload = JSON.parse(JSON.stringify(held)) as Prisma.InputJsonValue
   const data = {
@@ -1151,6 +1155,10 @@ async function releaseHeldWcSalesInvoice(
       referenceId: orderId,
       payload: buildReleasedSalesInvoicePayload(held, invoiceNumber),
       idempotencyKey,
+      // o3d-j625: route by the chart FROZEN with this payload, not by whatever is active at release
+      // time. `undefined` for a hold parked before the field existed, which keeps that hold's old
+      // behaviour rather than refusing it for ever — see heldSalesInvoiceChartConnector.
+      chartConnector: heldSalesInvoiceChartConnector(held),
     })
   } catch (error) {
     // Left PENDING on purpose — the release sweep retries it (see retryHeldWcSalesInvoiceReleases).
@@ -2424,6 +2432,11 @@ export async function importWcOrder(wcOrder: WcFullOrder, options: ImportWcOrder
           referenceType: 'SalesOrder',
           referenceId: so.id,
           payload: { invoiceNumber: invoiceNumberResolution.invoiceNumber, ...accountingPayload },
+          // o3d-j625: every `accountCode` in `accountingPayload` is `settings.*` from the single read
+          // above, and the import does a great deal of work between the two — the amount-convention
+          // resolution, the per-line tax mapping, the invoice-number resolution. Routed by the chart's
+          // own connector so the row cannot be the other connector's.
+          chartConnector: settings.connector,
         })
       } else {
         await holdWcSalesInvoiceForMissingNumber({
@@ -2432,6 +2445,9 @@ export async function importWcOrder(wcOrder: WcFullOrder, options: ImportWcOrder
           orderNumber,
           metaKey: invoiceNumberResolution.metaKey,
           accountingPayload,
+          // o3d-j625: the same chart read that produced every account code in `accountingPayload`,
+          // parked alongside them — the release can be days later and must not re-resolve it.
+          chartConnector: settings.connector,
         })
       }
     } catch (accountingError) {

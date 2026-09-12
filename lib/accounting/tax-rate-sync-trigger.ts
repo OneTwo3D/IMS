@@ -10,7 +10,7 @@
  */
 
 import { accountingPayloadKey } from '@/lib/accounting/payload-key'
-import { queueAccountingSync, isAccountingSyncTypeEnabled, getActiveAccountingConnectorInfo } from '@/lib/accounting'
+import { queueAccountingSync, isAccountingSyncTypeEnabledFor, getActiveAccountingConnectorInfo } from '@/lib/accounting'
 import { logActivity } from '@/lib/activity-log'
 
 type TaxRateForSync = {
@@ -44,7 +44,10 @@ export async function maybeQueueTaxRateSync(taxRate: TaxRateForSync): Promise<vo
     }
     return
   }
-  if (!(await isAccountingSyncTypeEnabled('TAX_RATE_SYNC'))) return
+  // o3d-j625: asked of the connector resolved ABOVE, not of whichever is active by now.
+  // `isAccountingSyncTypeEnabled` resolves it for itself, which made this function's Xero-only refusal
+  // and its posting verdict two independent reads of the same question.
+  if (!(await isAccountingSyncTypeEnabledFor(connector.id, 'TAX_RATE_SYNC'))) return
 
   const payload = {
     name: taxRate.name,
@@ -64,5 +67,11 @@ export async function maybeQueueTaxRateSync(taxRate: TaxRateForSync): Promise<vo
     referenceId: taxRate.id,
     payload,
     idempotencyKey,
+    // o3d-j625: this payload carries no account codes, but the SAME second resolution was here: the
+    // Xero-only refusal above is about the connector resolved at the top of this function, and the
+    // enqueue resolved it again. A switch in between wrote a QUICKBOOKS `TAX_RATE_SYNC` row — a type
+    // QUICKBOOKS_SYNC_TYPE_SETTING does not name, so it falls through to the default posting mode and is
+    // queued — which is exactly the posting the refusal above exists to prevent.
+    chartConnector: connector.id,
   })
 }
