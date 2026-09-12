@@ -591,8 +591,11 @@ test(
      * `permanentlyFailIntegrationOutboxAdminRow`, how old a lock must be before an admin may
      * DEAD-LETTER the row under it. It reclaims nothing and has no part in the story below. And the
      * email drain is documented HOURLY (help-docs/settings.md, the `/api/cron/email-outbox` cron-table
-     * row). Fifteen minutes is INSIDE the hour, so B's replay usually meets a copy that is still
-     * PENDING and the index REFUSES it. What the index leaves open is the timing that
+     * row). Fifteen minutes (INTEGRATION_OUTBOX_DRAIN_LEASES_MS.xeroAccountingEntry, above) is INSIDE
+     * the hour (the `/api/cron/email-outbox` cron-table row, above), so B's replay usually meets a
+     * copy that is still PENDING and the index REFUSES it. Both durations are sourced again in this
+     * sentence on purpose (Codex round 35, HIGH 1): it is the sentence the ordering rests on, and it
+     * named two windows and attributed neither. What the index leaves open is the timing that
      * CROSSES A DRAIN: once a drain settles A's copy to SENT, a SENT row is outside the predicate, B's
      * insert is accepted, and the customer is emailed a second time. That gap is what this test
      * drives below, and it is what decides the verdict; the RATE was the only thing wrong.

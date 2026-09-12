@@ -160,7 +160,7 @@ export const INTEGRATION_OUTBOX_REGISTRY = defineOutboxRegistry({
     //   (lib/connectors/woocommerce/sync/reconcile.ts) calls `pushStockToWc({ forceAll: true })`
     //   DIRECTLY. It never enqueues, never claims, never completes an outbox row. So it re-pushes
     //   the correct quantity once a day and leaves the park untouched — which means the park
-    //   survives every reconcile, and between two of them a change made a minute after the crash
+    //   survives every reconcile, and between two of them a change made immediately after the crash
     //   waits up to 24 hours — the reconcile is documented Daily (help-docs/settings.md, the
     //   `/api/cron/wc-reconcile` cron-table row, the repo's only statement of its cadence). For a
     //   stock quantity that is an oversell window, not a delay.
@@ -183,7 +183,8 @@ export const INTEGRATION_OUTBOX_REGISTRY = defineOutboxRegistry({
     // SO THE HONEST POSITION IS WORSE THAN ROUND 2 CLAIMED AND IS WRITTEN DOWN AS SUCH: a row parked
     // here is invisible on the exception inbox (the admin outbox API can still list PROCESSING rows
     // to somebody who already suspects one), the daily reconcile corrects the QUANTITY once a day
-    // without touching the row, and every stock change in between is folded into the park and waits.
+    // (the `/api/cron/wc-reconcile` cron-table row, as above) without touching the row, and every
+    // stock change in between is folded into the park and waits.
     // What this branch does fix is the VERDICT — `unsafe-to-replay` here and on `xero/accounting.post`
     // — so no second worker is handed the row at all. o3d-22jw tracks the black hole; o3d-7qdb tracks
     // an operator remedy that does not rest on elapsed time.
@@ -276,8 +277,12 @@ export const INTEGRATION_OUTBOX_REGISTRY = defineOutboxRegistry({
     //      N minutes" — which is exactly how the wrong one got substituted for the right one twice.
     //      The email drain is documented HOURLY (help-docs/settings.md, the `/api/cron/email-outbox`
     //      row of the cron table — the repo's only statement of its cadence).
-    //      FIFTEEN MINUTES IS INSIDE THE HOUR, so when worker B replays, worker A's copy is usually
-    //      STILL PENDING — inside the predicate — and the index REFUSES B's insert. The duplicate
+    //      FIFTEEN MINUTES (`INTEGRATION_OUTBOX_DRAIN_LEASES_MS.xeroAccountingEntry`, above) IS
+    //      INSIDE THE HOUR (the `/api/cron/email-outbox` cron-table row, above), so when worker B
+    //      replays, worker A's copy is usually STILL PENDING — inside the predicate — and the index
+    //      REFUSES B's insert. Both durations are sourced again here on purpose (Codex round 35,
+    //      HIGH 1): this is the sentence the whole ordering rests on, and it named two windows and
+    //      attributed neither. The duplicate
     //      arrives when the timing CROSSES A DRAIN: a drain settles A's copy to SENT, a SENT row is
     //      outside the predicate, B's insert is then accepted, and the customer is emailed twice.
     //      So the index closes the window in which nothing had been delivered yet and leaves open the

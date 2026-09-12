@@ -550,6 +550,7 @@ const DRAIN_CADENCE_MS: Record<string, number> = {
   Hourly: 3_600_000,
   'Every 5 min': 300_000,
   'Every 15 min': 900_000,
+  Daily: 86_400_000,
 }
 
 /**
@@ -614,14 +615,15 @@ const CITATIONS: Array<{ citedIn: string; citation: string; resolvesIn: string; 
 //   * NO SENTENCE THERE ASSERTS AN UNCONDITIONAL SECOND DELIVERY. "Both are delivered", with no
 //     drain condition in the same sentence, is refused AT THAT SITE rather than excused by a
 //     correction elsewhere in the file;
-//   * NO SENTENCE THERE NAMES A DURATION OTHER THAN THE RESOLVED WINDOW WITHOUT NAMING THE SOURCE
-//     THAT DURATION RESOLVES FROM, in either case (round 34; until then the exception was the WORD
-//     "lease", and that is what let the dead-letter gate in).
+//   * NO SENTENCE THERE NAMES ANY DURATION WITHOUT NAMING THE SOURCE THAT DURATION RESOLVES FROM, in
+//     either case (round 34; until then the exception was the WORD "lease", and that is what let the
+//     dead-letter gate in — and round 35, which removed the last value exemption and made the
+//     durations themselves be FOUND rather than enumerated).
 //
 // AND THE CLAIM IS MADE ONLY AT THOSE SITES. A file-wide sweep requires every paragraph of these two
-// files that names ANY duration this rationale has words for to be one of the located sites, or to
-// name the source that duration resolves from, so a window claim that drifts into an unwatched
-// paragraph fails here instead of being a fourth round of the same finding.
+// files that names ANY duration AT ALL (round 35: found by shape, not drawn from a list) to be one of
+// the located sites, or to name the source that duration resolves from, so a window claim that drifts
+// into an unwatched paragraph fails here instead of being a fourth round of the same finding.
 //
 // ---------------------------------------------------------------------------
 // ROUND 34 (Codex HIGH 1) — THE GUARD ROUND 33 ADDED WAS ENFORCING A NUMBER NOTHING PRODUCES.
@@ -645,11 +647,12 @@ const CITATIONS: Array<{ citedIn: string; citation: string; resolvesIn: string; 
 // WHAT THIS DOES NOT ESTABLISH, stated because that is what this round is about. (i) Double-quoted
 // spans are removed before sentences are examined, because quoting is how these files DISOWN a claim
 // ("This used to say …"); an overclaim written inside double quotes would pass. (ii) The sweep is
-// over WINDOW WORDS only, not over delivery claims, so a paragraph outside the three sites that
-// asserts an unconditional second delivery while naming no window at all is not reached — the
-// stale-park test's own "Round 3 asserted that … and both are delivered" paragraph is exactly that
-// shape, and it is past-tense disowning rather than asserting. (iii) It is a check on WORDING. That
-// the wording is TRUE of the code is what sections (1)-(3) above establish, out of the constants.
+// over DURATIONS only (round 35: every duration, by shape), not over delivery claims, so a paragraph
+// outside the three sites that asserts an unconditional second delivery while naming no window at all
+// is not reached — the stale-park test's own "Round 3 asserted that … and both are delivered"
+// paragraph is exactly that shape, and it is past-tense disowning rather than asserting. (iii) It is
+// a check on WORDING. That the wording is TRUE of the code is what sections (1)-(3) above establish,
+// out of the constants.
 
 /** Every PARAGRAPH of comment prose in a file: a run of comment lines, split on blank comment lines. */
 function commentParagraphs(source: string): string[] {
@@ -684,6 +687,100 @@ function windowSentences(prose: string): string[] {
     .split(/(?<=\.)\s+(?=[A-Z"`([])/)
     .map((sentence) => sentence.trim())
     .filter((sentence) => sentence.length > 0)
+}
+
+// ---------------------------------------------------------------------------
+// ROUND 35 (Codex HIGH 1) — THE RULE ROUND 34 WROTE DID NOT ENFORCE ITSELF.
+//
+// Round 34 installed the rule "EVERY duration a sentence names must name the constant it resolves
+// from" and then implemented it as a loop over the durations round 34 had ALREADY LISTED — and
+// skipped the `900_000` numeral outright, which is the very window the rule exists to police. So the
+// guard claimed "every duration" and enforced "the ones I enumerated, minus one": an unsourced
+// `900_000 ms`, an unsourced `960_000 ms` and the words "sixteen minutes" all walked through it. That
+// is the same shape this branch has spent a dozen rounds removing from its other guards, reproduced
+// inside the rule written to stop it, one round after writing it.
+//
+// SO DURATIONS ARE FOUND BY SHAPE AND NOT BY LIST. `durationsNamedIn` matches a NUMERAL with a unit
+// (`900_000 ms`, `1_200_000 ms`, `24 hours`, `15 min`) and a SPELLED-OUT quantity with a unit
+// ("fifteen minutes", "sixteen minutes", "five-minute", "an hour", "twenty-five minutes"), resolves
+// each to milliseconds, and the caller then requires the SAME SENTENCE to name a source that resolves
+// to that same number. No value is exempt: a number nothing in this build produces fails for having
+// no source at all, and a number this build does produce fails unless the sentence says which
+// constant — or which documented cron row — it came from.
+//
+// THE TWO EXEMPTIONS ARE KEYED ON GRAMMAR AND NEVER ON A VALUE. (i) An article plus the SINGULAR
+// "second" ("a second row", "the second claimant", "emailed a second time") is the English ORDINAL,
+// not one thousand milliseconds: "second" is the only unit noun in this vocabulary that is also an
+// ordinal, the prose uses it that way about fifteen times, and nothing in these two files states a
+// duration in seconds. (ii) An article plus a PLURAL unit ("the minutes the comments claim") is a
+// noun phrase, not a quantity. "one second", "two seconds", "an hour", "a day" and "the hour" all
+// remain durations, and every numeral form is checked whatever its value.
+
+/** Unit nouns a duration may be written in, and what ONE of each is in milliseconds. */
+const DURATION_UNIT_MS: Record<string, number> = {
+  ms: 1,
+  millisecond: 1,
+  milliseconds: 1,
+  sec: 1_000,
+  secs: 1_000,
+  second: 1_000,
+  seconds: 1_000,
+  min: 60_000,
+  mins: 60_000,
+  minute: 60_000,
+  minutes: 60_000,
+  hr: 3_600_000,
+  hrs: 3_600_000,
+  hour: 3_600_000,
+  hours: 3_600_000,
+  day: 86_400_000,
+  days: 86_400_000,
+}
+
+/** Spelled-out quantities, the articles included: "an hour" and "the hour" both state a duration. */
+const DURATION_QUANTITY: Record<string, number> = {
+  a: 1, an: 1, the: 1, one: 1, two: 2, three: 3, four: 4, five: 5, six: 6, seven: 7, eight: 8, nine: 9,
+  ten: 10, eleven: 11, twelve: 12, thirteen: 13, fourteen: 14, fifteen: 15, sixteen: 16, seventeen: 17,
+  eighteen: 18, nineteen: 19, twenty: 20, thirty: 30, forty: 40, fifty: 50, sixty: 60, seventy: 70,
+  eighty: 80, ninety: 90,
+}
+
+const DURATION_UNITS = Object.keys(DURATION_UNIT_MS).sort((a, b) => b.length - a.length).join('|')
+const DURATION_QUANTITIES = [
+  // The hyphenated compounds first, so "twenty-five minutes" is read as 25 and not as 20.
+  ...['twenty', 'thirty', 'forty', 'fifty', 'sixty', 'seventy', 'eighty', 'ninety'].flatMap((tens) =>
+    ['one', 'two', 'three', 'four', 'five', 'six', 'seven', 'eight', 'nine']
+      .map((ones) => `${tens}[- ]${ones}`)),
+  ...Object.keys(DURATION_QUANTITY).sort((a, b) => b.length - a.length),
+].join('|')
+
+/** `900_000 ms`, `24 hours`, `15 min`, `24-hour`. */
+const NUMERAL_DURATION = new RegExp(String.raw`\b(\d[\d_,]*)[- ]?(${DURATION_UNITS})\b`, 'gi')
+/** "fifteen minutes", "an hour", "five-minute", "twenty-five minutes". */
+const SPELLED_DURATION = new RegExp(String.raw`\b(${DURATION_QUANTITIES})[- ](${DURATION_UNITS})\b`, 'gi')
+/** The ordinal, which is not a duration — an exemption on the SHAPE, never on a value. */
+const ORDINAL_SECOND = /^(?:a|an|the)[- ]second$/i
+/**
+ * An article with a PLURAL unit is a noun phrase and not a quantity: "the minutes the comments
+ * claim", "the days this took". The second and last shape exemption, and like the first it is keyed
+ * on grammar rather than on any number — "an hour", "a day" and "the hour" are all still durations.
+ */
+const ARTICLE_PLUS_PLURAL = /^(?:a|an|the)[- ](?:milliseconds|secs|seconds|mins|minutes|hrs|hours|days)$/i
+
+/** EVERY DURATION A SENTENCE NAMES, found by shape. Nothing here is a list of expected values. */
+function durationsNamedIn(sentence: string): Array<{ text: string; ms: number }> {
+  const found: Array<{ text: string; ms: number }> = []
+  for (const match of sentence.matchAll(NUMERAL_DURATION)) {
+    const scale = DURATION_UNIT_MS[match[2].toLowerCase()]
+    found.push({ text: match[0], ms: Number(match[1].replace(/[_,]/g, '')) * scale })
+  }
+  for (const match of sentence.matchAll(SPELLED_DURATION)) {
+    if (ORDINAL_SECOND.test(match[0]) || ARTICLE_PLUS_PLURAL.test(match[0])) continue
+    let quantity = 0
+    for (const word of match[1].toLowerCase().split(/[- ]/)) quantity += DURATION_QUANTITY[word] ?? 0
+    found.push({ text: match[0], ms: quantity * DURATION_UNIT_MS[match[2].toLowerCase()] })
+  }
+  return found
 }
 
 /** A sentence that says a second copy of the email goes out. */
@@ -894,14 +991,31 @@ test('r22: the reclaim window is the RESOLVED constant, and BOTH copies of the r
   // because a later paragraph in the same file named the drain condition.
   const groupOf = (ms: number) => String(ms).replace(/\B(?=(\d{3})+(?!\d))/g, '_')
   const grouped = groupOf(reclaimMs)
-  const allWindowWords = Object.values(RECLAIM_WINDOW_WORDS)
-  const otherWindowWords = allWindowWords.filter((words) => words !== reclaimWords)
+  // THE RECONCILE CADENCE, out of the same cron table. The WooCommerce entry's prose states it as a
+  // duration ("once a day", "up to 24 hours"), and round 35's sweep finds durations by shape, so this
+  // one now has to RESOLVE as well — an unsourced day in that paragraph was invisible to round 34's
+  // enumeration, which had no entry for 86_400_000 at all.
+  const reconcileRow =
+    /^\|\s*`\/api\/cron\/wc-reconcile`\s*\|[^|]*\|\s*([^|]+?)\s*\|/m.exec(read('help-docs/settings.md'))
+  assert.ok(
+    reconcileRow,
+    'help-docs/settings.md no longer carries a cron-table row for /api/cron/wc-reconcile',
+  )
+  const reconcileMs = DRAIN_CADENCE_MS[reconcileRow[1]]
+  assert.ok(
+    reconcileMs,
+    `the reconcile is now documented as '${reconcileRow[1]}', which this rationale has no words for`,
+  )
 
-  // EVERY DURATION THIS PROSE MAY NAME, PAIRED WITH THE TOKEN THAT NAMES ITS SOURCE (round 34, HIGH 1).
+  // EVERY SOURCE A DURATION IN THIS PROSE MAY RESOLVE FROM (round 34, HIGH 1; made the only list in
+  // round 35, HIGH 1).
   //
   // The ms come from the constants and the cron table, never from this list, so the pairing cannot
-  // drift: change a constant and the words it supplies change with it. `reclaimMs` is here too, so the
-  // file-wide sweep in (4f) can hold an unanchored sentence to the same rule as an anchored one.
+  // drift: change a constant and the number it supplies changes with it. THIS IS A LIST OF SOURCES AND
+  // NOT OF EXPECTED DURATIONS — round 34's sweep looked for the durations IT had enumerated, which is
+  // why an unsourced `960_000 ms` or "sixteen minutes" passed it; the durations are now found by shape
+  // (see `durationsNamedIn`) and this list only answers "what could a number in this prose have come
+  // from". `reclaimMs` is here too, and no value is exempted from having to name one of these.
   const namedDurations: Array<{ token: string; ms: number }> = [
     { token: 'xeroAccountingEntry', ms: reclaimMs },
     // The DEFAULT lease, because `outbox-registry.ts` states it too: the WooCommerce stock entry's
@@ -912,46 +1026,37 @@ test('r22: the reclaim window is the RESOLVED constant, and BOTH copies of the r
     { token: 'ADMIN_OUTBOX_POST_LEASE_MARGIN_MS', ms: ADMIN_OUTBOX_POST_LEASE_MARGIN_MS },
     { token: 'INTEGRATION_OUTBOX_MAX_LEASE_MS', ms: INTEGRATION_OUTBOX_MAX_LEASE_MS },
     { token: '/api/cron/email-outbox', ms: drainMs },
+    { token: '/api/cron/wc-reconcile', ms: reconcileMs },
   ]
-  /** The tokens whose RESOLVED value is the duration those words name. Read out, not listed. */
-  const sourcesOf = (words: string) => namedDurations
-    .filter((duration) => RECLAIM_WINDOW_WORDS[String(duration.ms)] === words)
-    .map((duration) => duration.token)
-  /** …and the same for a duration written as digits, the way this repo groups them. */
-  const sourcesOfNumeral = (numeral: string) => namedDurations
-    .filter((duration) => groupOf(duration.ms) === numeral)
-    .map((duration) => duration.token)
 
   /**
-   * ONE SENTENCE, EVERY DURATION IT NAMES, EACH ONE SOURCED IN THAT SAME SENTENCE.
+   * ONE SENTENCE, EVERY DURATION IT NAMES — FOUND BY SHAPE — EACH ONE SOURCED IN THAT SAME SENTENCE.
    *
-   * This replaced "…unless the sentence says the word lease", which is what let the DEAD-LETTER GATE's
-   * twenty minutes be asserted as the reclaim window for a whole round. `words` is what the caller
-   * requires to be sourced: at a site the resolved window is stated on purpose and is exempt, in the
-   * file-wide sweep nothing is.
+   * NO VALUE IS EXEMPT, and that is round 35's HIGH 1. Round 34 wrote this rule as "every duration a
+   * sentence names" and implemented it as a walk over the durations it had already listed, with the
+   * `900_000` numeral skipped outright — the one number the rule exists to police. So the sentence
+   * "FIFTEEN MINUTES IS INSIDE THE HOUR", which sources neither of the two durations it rests the
+   * whole ordering on, passed a guard whose stated rule forbids it. Durations now come from
+   * `durationsNamedIn`, the sources come from `namedDurations`, and a duration nothing in this build
+   * resolves to fails for having no source at all rather than for being unlisted.
    */
-  const assertDurationsAreSourced = (where: string, sentence: string, words: readonly string[]) => {
-    const upper = sentence.toUpperCase()
-    for (const named of words) {
-      if (!upper.includes(named)) continue
-      const sources = sourcesOf(named)
+  let durationsChecked = 0
+  const assertDurationsAreSourced = (where: string, sentence: string) => {
+    for (const named of durationsNamedIn(sentence)) {
+      durationsChecked++
+      const sources = namedDurations
+        .filter((duration) => duration.ms === named.ms)
+        .map((duration) => duration.token)
       const how = sources.length === 0
         ? 'and NOTHING in this build resolves to that duration at all'
         : 'name one of: ' + sources.join(', ')
       assert.ok(
         sources.some((token) => sentence.includes(token)),
-        where + ': names ' + named + ', which is not the resolved reclaim window (' + reclaimWords
-        + '), without naming what it comes from — ' + how + '. Round 34: a duration with no named '
-        + 'source is how the dead-letter gate got asserted as the reclaim window: ' + JSON.stringify(sentence),
-      )
-    }
-    for (const numeral of [...new Set(namedDurations.map((duration) => groupOf(duration.ms)))]) {
-      if (numeral === grouped || !sentence.includes(numeral)) continue
-      const sources = sourcesOfNumeral(numeral)
-      assert.ok(
-        sources.some((token) => sentence.includes(token)),
-        where + ': writes ' + numeral + ' ms without naming ' + sources.join(' or ')
-        + ', the source it comes from: ' + JSON.stringify(sentence),
+        where + ': names the duration ' + JSON.stringify(named.text) + ' (' + named.ms + ' ms) without '
+        + 'naming, in that same sentence, what it resolves from — ' + how + '. Rounds 21 and 33: a '
+        + 'duration with no named source is how the dead-letter gate got asserted as the reclaim '
+        + 'window twice. Round 35: the rule said EVERY duration and the sweep only knew the ones it '
+        + 'had listed: ' + JSON.stringify(sentence),
       )
     }
   }
@@ -997,7 +1102,7 @@ test('r22: the reclaim window is the RESOLVED constant, and BOTH copies of the r
     // naming the constant it resolves from, in that sentence. Case-insensitive, so a lower-case stale
     // claim cannot walk through the way "fifteen minutes later worker B reclaims" did in rounds 19-32.
     for (const sentence of sentences) {
-      assertDurationsAreSourced(site.name, sentence, otherWindowWords)
+      assertDurationsAreSourced(site.name, sentence)
     }
     assert.ok(
       prose.toUpperCase().includes(reclaimWords),
@@ -1073,10 +1178,21 @@ test('r22: the reclaim window is the RESOLVED constant, and BOTH copies of the r
       // checks above use: sourcing is a property of the sentence naming the duration, and a paragraph
       // that QUOTES a window in order to disown it is not stating one.
       for (const sentence of windowSentences(prose)) {
-        assertDurationsAreSourced(`${file}: an unanchored sentence`, sentence, allWindowWords)
+        assertDurationsAreSourced(`${file}: an unanchored sentence`, sentence)
       }
     }
   }
+
+  // (4g) AND THE SWEEP ACTUALLY FOUND DURATIONS. A pattern that matches nothing passes every
+  // assertion above while checking nothing at all, which is the failure mode the round-34 sweep had in
+  // a different form. The two files state around twenty durations between them; the floor is set well
+  // under that so ordinary editing does not trip it, and far over zero so a broken pattern does.
+  assert.ok(
+    durationsChecked >= 15,
+    `the duration sweep found only ${durationsChecked} durations across ${WINDOW_CLAIM_SITES.length} sites `
+    + 'and both files entire — `durationsNamedIn` is no longer matching this prose, so every sourcing '
+    + 'assertion above passed by examining nothing',
+  )
 
   // (5) EVERY CITATION RESOLVES, AND NONE OF THEM IS A LINE NUMBER. A line number is falsified by
   // any edit above it and cannot be checked; an anchor can be, so it is.

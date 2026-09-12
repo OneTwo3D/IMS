@@ -134,7 +134,7 @@ the job's next run, not immediately.
   `Email outbox: 3 sent, 0 failed, 0 reclaimed after a send, 0 reclaimed before one, 0 unresolved
   after a send, 0 unresolved before one, out of 3 processed`. All four count a row this run had
   claimed and was then refused the final write on. They split along two questions, and the split
-  matters because only one corner means a customer probably got two emails.
+  matters because only one corner means a customer may have got two emails.
 
   *Was another run's takeover actually established?* **Reclaimed** means yes: the row was read back
   afterwards and it was either holding another run's claim, or holding no claim at all when every
@@ -150,9 +150,10 @@ the job's next run, not immediately.
   mail server at all, and it is counted here just the same. **Before one** means the send was never
   called, so this run put nothing on the wire whatever the cause.
 
-  So **reclaimed after a send** is the one that means the customer has probably received two copies —
-  probably, because it rests on the send having actually reached a mail server, which is not
-  something the run records.
+  So **reclaimed after a send** is the one that means the customer may have received two copies —
+  *may*, because it rests on the send having actually reached a mail server, which is not something
+  the run records: with SMTP unconfigured, or a rejected from-address, both runs can be counted here
+  having delivered nothing at all. It is a duplicate that is *possible*, not one that is "likely".
   **Unresolved after a send** means a copy may be on the wire but nothing establishes that a second
   one follows — it is not a duplicate report. The server log line for each row names the specific
   diagnosis behind it. None of the four leaves the email stuck: whichever run settled the row is the

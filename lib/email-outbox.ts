@@ -1246,10 +1246,12 @@ export type ProcessEmailOutboxResult = {
    * Rows this worker claimed, HANDED TO THE SENDER, and was then refused the terminal write for
    * WITH ANOTHER WORKER'S RECLAIM ESTABLISHED — the row read back holding someone else's token, or
    * holding no claim at all when every write this worker issued had answered. Non-zero means a
-   * duplicate send is LIKELY — it is the only signal that says so, and it used to be silent (the
-   * unfenced `update` simply landed). Likely rather than certain, and for a reason spelled out two
-   * paragraphs down: what this counter establishes is that the SENDER WAS ENTERED, which is not the
-   * same fact as SMTP having been reached.
+   * duplicate send is POSSIBLE — it is the only signal that says so, and it used to be silent (the
+   * unfenced `update` simply landed). POSSIBLE RATHER THAN LIKELY (r35, Codex HIGH 2), and for the
+   * reason spelled out two paragraphs down: what this counter establishes is that the SENDER WAS
+   * ENTERED, which is not the same fact as SMTP having been reached — with no SMTP host configured,
+   * or a from-address the mailer rejects, two workers can both be counted here having delivered
+   * nothing at all. "Likely" was a false reading of that case, not a cautious one.
    *
    * "ESTABLISHED", AND THAT IS THE WHOLE OF ROUND 33's MEDIUM. This counter used to be incremented
    * for every refused post-send terminal write, including the four diagnoses that establish NO
@@ -1257,7 +1259,7 @@ export type ProcessEmailOutboxResult = {
    * row), a row still carrying this worker's own token (rewritten under the claim — explicitly not a
    * reclaim), a row that is gone, and a read-back that failed. `describeClaimLoss` has said so in
    * WORDS since r30; the NUMBER went on asserting a takeover, so an operator reading telemetry was
-   * told a rival existed and a duplicate was probable where the diagnosis refused to say either.
+   * told a rival existed and a duplicate was "probable" where the diagnosis refused to say either.
    * Those four are counted in `unresolvedAfterSend` now. `establishesAReclaim` is the single
    * decision, and it is an exhaustive switch, so a new `ClaimLoss` kind cannot default into here.
    *
@@ -2160,12 +2162,25 @@ export async function processPendingEmailOutbox(
     }
   }
 
-  /** WHETHER A SECOND COPY OF THE EMAIL FOLLOWS — which only a confirmed rival makes likely. */
+  /**
+   * WHETHER A SECOND COPY OF THE EMAIL FOLLOWS — and "POSSIBLE" IS THE STRONGEST WORD ANY ARM OF THIS
+   * HAS EVIDENCE FOR, INCLUDING THE CONFIRMED-RIVAL ARM (r35, Codex HIGH 2).
+   *
+   * This said "a duplicate delivery is LIKELY" on the two readings that establish a rival. It is not.
+   * `sendEntered` flips BEFORE the `await`, and the production sender (`sendEmail` in lib/mailer.ts)
+   * returns `SMTP not configured` — or a from-address validation error — before
+   * `nodemailer.createTransport` runs at all. So on a system with no SMTP host configured, or a
+   * rejected from-address, BOTH workers are reclaimed-after-send having delivered ZERO copies, and
+   * "likely" is a false reading of that case rather than a cautious one. What a confirmed rival
+   * establishes is that a second worker ENTERED the sender; whether either send reached a transport
+   * is not visible from here, and nothing in `SendEmailResult` would make it visible without a new
+   * field the senders do not set. POSSIBLE is what the evidence supports, so POSSIBLE is what it says.
+   */
   const describeDuplicateRisk = (loss: ClaimLoss): string => {
     switch (loss.kind) {
       case 'held-by-another':
       case 'settled-by-another':
-        return 'A duplicate delivery is likely; the row was NOT re-armed.'
+        return 'A duplicate delivery is possible; the row was NOT re-armed.'
       case 'settled-outcome-unknown':
         return 'The sender WAS entered, so a message may be on the wire; whether a SECOND copy follows '
           + 'depends on whether any other worker ever held this row, which nothing here establishes. '
@@ -2383,6 +2398,13 @@ export async function processPendingEmailOutbox(
       // without reaching a mail server, so a label naming SMTP would assert of every row here something
       // true of only some. The weaker phrase is the accurate one, and the other two statements of these
       // counts — `ProcessEmailOutboxResult` above and help-docs/documents-email.md — define it that way.
+      //
+      // AND WHAT "reclaimed after a send" MEANS FOR THE CUSTOMER IS THAT A DUPLICATE IS POSSIBLE, AND
+      // NOT THAT ONE IS "likely" (r35, Codex HIGH 2). Entering the sender is not reaching SMTP, so when
+      // SMTP is unconfigured or the from-address is rejected BOTH workers can be counted here having
+      // delivered nothing at all; what an operator may take from this line is that a second copy is
+      // POSSIBLE, and no more than that. The same word is used in `ProcessEmailOutboxResult`, in the
+      // per-row log line (`describeDuplicateRisk`) and in help-docs/documents-email.md.
       description: `Email outbox: ${result.sent} sent, ${result.failed} failed, `
         + `${result.conflicted} reclaimed after a send, ${result.conflictedWithoutSend} reclaimed before one, `
         + `${result.unresolvedAfterSend} unresolved after a send, ${result.unresolvedWithoutSend} unresolved before one, `

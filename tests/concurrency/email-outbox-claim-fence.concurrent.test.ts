@@ -493,8 +493,11 @@ test(
 
         assert.equal(workerA.conflicted, 1, "worker A's refusal is recorded rather than silent")
         // AND IT IS THE POST-SEND COUNTER (r18): A was on the socket when it lost the row, so a
-        // duplicate delivery really is likely here — which is exactly what makes the suppression
-        // path, where nothing was sent, a different fact needing a different counter.
+        // duplicate delivery really did happen here — `deliveries` above is asserted to hold both, which
+        // is exactly what makes the suppression path, where nothing was sent, a different fact needing a
+        // different counter. (The MESSAGE the drain prints says only that a duplicate is POSSIBLE, and
+        // r35's HIGH 2 is why: this test arranges a sender that delivers, and production cannot know
+        // that it did.)
         assert.equal(workerA.conflictedWithoutSend, 0, 'a send WAS attempted, so this is not the no-send refusal')
         assert.equal(workerA.failed, 0, 'and not scored against a row it no longer owns')
 

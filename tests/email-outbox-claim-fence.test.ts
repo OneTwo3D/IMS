@@ -1422,7 +1422,7 @@ test('r22: the SENTENCE around the phrase is true on the post-send arms too, not
   assert.ok(thrownLine, 'no conflict was logged for a thrown send')
   assert.match(thrownLine, /after a thrown send/)
   assert.match(thrownLine, /was reclaimed by another worker after this one had ENTERED the sender/)
-  assert.match(thrownLine, /A duplicate delivery is likely/)
+  assert.match(thrownLine, /A duplicate delivery is possible/)
 
   const beforeTheSend = await makeClient([makeRow()])
   const before = await drainCapturingLog({
@@ -1616,8 +1616,8 @@ test('r30: a terminal write that COMMITS and loses its answer is not reported as
   )
   assert.doesNotMatch(
     conflict,
-    /A duplicate delivery is likely/,
-    'a lost response was reported as a likely duplicate delivery, which sends an operator looking for '
+    /A duplicate delivery is possible/,
+    'a lost response was reported as a possible duplicate delivery, which sends an operator looking for '
     + 'a second copy of an email only one worker ever sent',
   )
   // AND WHAT IT SAYS INSTEAD names the cause it can actually establish.
@@ -1656,7 +1656,7 @@ test('r30: NON-VACUITY — the same lost write WITH a real rival still reports t
   assert.ok(conflict, `no conflict was logged; captured: ${JSON.stringify(logged)}`)
   assert.match(conflict, /was reclaimed by another worker after this one had ENTERED the sender/)
   assert.match(conflict, /lockedBy another-worker/)
-  assert.match(conflict, /A duplicate delivery is likely/)
+  assert.match(conflict, /A duplicate delivery is possible/)
   assert.doesNotMatch(conflict, /NO RECLAIM IS ESTABLISHED/)
 })
 
@@ -1877,6 +1877,77 @@ function axisSentences(prose: string): string[] {
     .filter((sentence) => sentence.length > 0)
 }
 
+// ---------------------------------------------------------------------------
+// THE STRENGTH OF THE DUPLICATE CLAIM, ADDED IN r35 (Codex HIGH 2) — THE AXIS r34 CHECKED THE
+// PRESENCE OF AND NOT THE FORCE OF.
+//
+// r34 made all three sites state the ENTRY fact and disclaim SMTP. All three then went on saying, in
+// the same breath, that a duplicate was LIKELY (the per-row log line and the exported contract) or
+// that the customer had PROBABLY received two copies (the documentation). That does not follow from
+// the entry fact: `sendEntered` flips before the `await`, and `sendEmail` returns `SMTP not
+// configured` — or a from-address validation error — before `nodemailer.createTransport` runs, so
+// with SMTP unconfigured BOTH workers are reclaimed-after-send having delivered ZERO copies. The
+// honest word is POSSIBLE, and the guard now checks the WORD and not merely the presence of a claim,
+// because "likely" is exactly what will come back otherwise — it was written three times already.
+//
+// AT EVERY SITE, INDEPENDENTLY:
+//   * NO SENTENCE ABOUT A DUPLICATE MAY CARRY A MODALITY STRONGER THAN THE EVIDENCE — likely,
+//     probable/probably, almost certainly, certainly, definitely, "went out", "will follow";
+//   * AND ONE SENTENCE ABOUT A DUPLICATE MUST CARRY THE WEAKER ONE — possible, may, might, cannot be
+//     ruled in or out. That positive half is what stops the check being satisfied by a site that says
+//     nothing about duplicates at all.
+//
+// DOUBLE-QUOTED SPANS ARE STRIPPED, for the reason every other wording guard in this file strips
+// them: quoting is how these files cite a claim in order to disown it, and two of these sites quote
+// the removed wording in order to say it was wrong ("a duplicate delivery is likely" in the contract's
+// r18 paragraph, "likely" in the summary comment). An overclaim written inside double quotes would
+// pass here.
+//
+// WHAT IT DOES NOT COVER: the test titles and assertion messages in this file that call `conflicted`
+// "a probable duplicate". Those name WHICH COUNTER carries the delivery consequence rather than
+// telling an operator anything, and the four sites this axis walks are the four an operator actually
+// reads — the exported contract, the activity-log summary, the per-row log line, and the help page.
+// ---------------------------------------------------------------------------
+
+/** A sentence that is about a second copy of the email going out. */
+const ABOUT_A_DUPLICATE = /duplicate|second copy|two (?:emails|copies)|twice/i
+/** Modality the entry fact cannot support. */
+const OVERSTATES_THE_DUPLICATE =
+  /\blikely\b|\bprobable\b|\bprobably\b|almost certain|\bcertainly\b|\bdefinitely\b|went out|\bwill follow\b/i
+/** — and the strongest modality it can. */
+const DUPLICATE_IS_POSSIBLE = /\bpossible\b|\bmay\b|\bmight\b|cannot be ruled|\bunknown\b|not proof/i
+
+/** Sentences with quoted spans removed: a site CITES the removed sentence in order to disown it. */
+function strengthSentences(prose: string): string[] {
+  return axisSentences(prose.replace(/"[^"]*"/g, ' '))
+}
+
+/** The duplicate-strength axis, asked of one site's prose. */
+function assertDuplicateStrength(where: string, prose: string): void {
+  const sentences = strengthSentences(prose).filter((sentence) => ABOUT_A_DUPLICATE.test(sentence))
+  assert.ok(
+    sentences.length > 0,
+    `${where}: says nothing about a duplicate at all, so the strength of the claim it makes about one `
+    + 'cannot be checked here — and this is one of the four places a reader is told what these counts '
+    + 'mean for the customer',
+  )
+  const overstated = sentences.filter((sentence) => OVERSTATES_THE_DUPLICATE.test(sentence))
+  assert.deepEqual(
+    overstated,
+    [],
+    `${where}: ${overstated.length} sentence(s) here call a duplicate LIKELY or PROBABLE. Entering the `
+    + 'sender is not reaching SMTP: with no SMTP host configured, or a from-address the mailer rejects, '
+    + 'both workers are reclaimed-after-send having delivered nothing, so the strongest honest word is '
+    + `POSSIBLE (r35, Codex HIGH 2): ${JSON.stringify(overstated)}`,
+  )
+  assert.ok(
+    sentences.some((sentence) => DUPLICATE_IS_POSSIBLE.test(sentence)),
+    `${where}: never says a duplicate is POSSIBLE (or may/might follow, or cannot be ruled in or out). `
+    + 'Without that word the site either overstates the risk or states nothing, and "likely" is what has '
+    + `come back three times. Sentences about a duplicate here: ${JSON.stringify(sentences)}`,
+  )
+}
+
 /** The send axis, asked of one site's prose. */
 function assertSendAxis(where: string, prose: string, entryFact: RegExp): void {
   assert.match(
@@ -1962,6 +2033,10 @@ test('r33/r34: the three places that state what these counts mean state the same
     + 'builds a transport on both paths',
   )
 
+  // (1c) AND THE STRENGTH OF WHAT IT CLAIMS ABOUT THE CUSTOMER (r35, Codex HIGH 2). This field used to
+  // say a duplicate send was LIKELY, unconditionally.
+  assertDuplicateStrength("the exported contract's `conflicted`", contract.get('conflicted')!)
+
   // (2) THE ACTIVITY SUMMARY. Located as the one template that names these counters, and every counter
   // in the contract must appear in it — a count nobody logs is a count nobody reads.
   const summary = /description: `Email outbox:([\s\S]*?)`,\n/.exec(source)
@@ -2010,6 +2085,7 @@ test('r33/r34: the three places that state what these counts mean state the same
     + 'SMTP-named label asserts of every row something true of only some',
   )
   assertSendAxis('the activity-summary site', summaryProse, SENDER_WAS_ENTERED)
+  assertDuplicateStrength('the activity-summary site', summaryProse)
   assert.match(
     summaryProse,
     NOT_PROOF_OF_SMTP,
@@ -2056,6 +2132,7 @@ test('r33/r34: the three places that state what these counts mean state the same
   // made at. It asked "Had the message already been handed to SMTP?" and answered "After a send means
   // yes", which is a definite claim about a fact the drain does not have.
   assertSendAxis('the help documentation', flat, SENDER_WAS_ENTERED)
+  assertDuplicateStrength('the help documentation', flat)
   assert.match(
     flat,
     SENDER_WAS_NEVER_ENTERED,
@@ -2069,6 +2146,24 @@ test('r33/r34: the three places that state what these counts mean state the same
     + 'SMTP. That sentence is the whole of r34\'s HIGH 2: the section used to ask "Had the message '
     + 'already been handed to SMTP?" and answer "means yes"',
   )
+
+  // (4) AND THE PER-ROW LOG LINE, WHICH IS THE FOURTH STATEMENT OF THIS AND THE ONE r35 FOUND WRONG.
+  // `describeDuplicateRisk` is where "A duplicate delivery is likely" was printed; it is located as
+  // its own region so a correction made in the contract and the documentation and not in the sentence
+  // the drain actually writes fails here — which is the three-places-one-correction shape this whole
+  // test exists for.
+  const risk = /const describeDuplicateRisk = \(loss: ClaimLoss\): string => \{([\s\S]*?)\n  \}/.exec(source)
+  assert.ok(
+    risk,
+    'lib/email-outbox.ts no longer declares `describeDuplicateRisk` the way this guard locates it',
+  )
+  const riskArms = [...risk[1].matchAll(/'([^']*)'/g)].map((match) => match[1]).join(' ')
+  assert.ok(
+    riskArms.length > 200,
+    `the arms of describeDuplicateRisk are ${riskArms.length} characters of text, which is not the four `
+    + 'verdicts this guard is reading',
+  )
+  assertDuplicateStrength('the per-row log line (describeDuplicateRisk)', riskArms)
 })
 
 // ---------------------------------------------------------------------------
@@ -2485,5 +2580,5 @@ test('r30: a claim read-back that FAILS is an answer, not a thrown diagnostic', 
   assert.match(conflict, /could not be checked/)
   assert.match(conflict, /is UNKNOWN/)
   assert.doesNotMatch(conflict, /was reclaimed by another worker/)
-  assert.doesNotMatch(conflict, /A duplicate delivery is likely/)
+  assert.doesNotMatch(conflict, /A duplicate delivery is possible/)
 })
