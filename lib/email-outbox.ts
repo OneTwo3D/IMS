@@ -828,8 +828,10 @@ function mintEmailOutboxClient(
  *      database has no eligible row at that instant. Nothing about it is probe-aware, it mutates no
  *      receiver state, and it is not a write-destination trick, so (a)-(d) do not cover it — the
  *      module's own control test
- *      (`tests/email-outbox-injection-shape.test.ts`, "r30 HIGH: the empty-source read-through
- *      delegate") mints exactly this delegate on purpose. WHAT STOPS IT IS NOT THIS FUNCTION: it is
+ *      (`tests/email-outbox-injection-shape.test.ts`, "r30 HIGH: a read-through delegate whose
+ *      source FILLS UP after the mint is refused AT THE SWEEP") mints exactly this delegate on
+ *      purpose, and the claim guard checks that this citation RESOLVES rather than taking it on
+ *      trust. WHAT STOPS IT IS NOT THIS FUNCTION: it is
  *      (4) above, the drain's sweep-time check, which refuses the run when the rows that delegate
  *      returns are not rows its own store holds. The residue AFTER that is narrow and stated where
  *      the check lives: a delegate whose store carries rows with the SAME IDS as the ones its source

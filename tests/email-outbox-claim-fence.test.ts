@@ -1615,8 +1615,11 @@ test('r30: NON-VACUITY — the same lost write WITH a real rival still reports t
 // quoting is how this file disowns a claim. An overclaim written inside double quotes would pass.
 // (ii) It is a check on WORDING ONLY. It cannot tell whether the sentence it approves is true of the
 // code; what establishes that is the control test that mints exactly the delegate residue (e)
-// describes (`tests/email-outbox-injection-shape.test.ts`, "r30 HIGH: the empty-source read-through
-// delegate").
+// describes (`tests/email-outbox-injection-shape.test.ts`, "r30 HIGH: a read-through delegate whose
+// source FILLS UP after the mint is refused AT THE SWEEP"). THAT CITATION IS ITSELF CHECKED, in the
+// cross-module test below: r31 shipped it naming a test title that did not exist, which is this
+// round's own defect class — a claim pointing at evidence nobody had resolved — so the file and
+// title are now READ OUT OF THE CONTRACT and the named test must be found in the named file.
 
 /** Every doc comment in a source file, in order. */
 function docComments(source: string): string[] {
@@ -1873,6 +1876,28 @@ test('r31: the residue list, the establishment list and every count of them agre
   const mintContract = locateClaimSite(OUTBOX_SOURCE, MINT_CONTRACT_SITE)
   assert.match(mintContract, /e\. A READ-THROUGH DELEGATE WHOSE BACKING SOURCE IS EMPTY WHEN IT IS MINTED/)
   assert.match(mintContract, /refuseSweptRowsFromOutsideTheStore/)
+
+  // AND THE CONTROL TEST IT CITES RESOLVES. The contract answers "what establishes that residue (e)
+  // is a real case and not a story?" by naming a test. r31 shipped that citation naming a title that
+  // DID NOT EXIST — a pointer at evidence nobody had followed, which is the exact defect class this
+  // round is about, sitting inside the paragraph correcting it. The file and the title are read OUT
+  // OF THE CONTRACT rather than repeated here, so this cannot pass by agreeing with a copy of
+  // itself: rename either side and the citation stops resolving.
+  const citation = mintContract.match(/\(`(tests\/[^`]+)`, "([^"]+)"\)/)
+  assert.ok(
+    citation,
+    'residue (e) no longer cites a control test as (`tests/…`, "its title"), so what establishes that '
+    + 'the residue is a reachable case is not stated where the residue is declared',
+  )
+  const [, citedFile, citedTitle] = citation
+  const citedSource = readFileSync(fileURLToPath(new URL(`../${citedFile}`, import.meta.url)), 'utf8')
+  assert.ok(
+    citedSource.includes(`test('${citedTitle.replace(/'/g, "\\'")}'`)
+    || citedSource.includes(`test("${citedTitle}"`),
+    `the mint contract cites ${citedFile} test "${citedTitle}" as what mints residue (e)'s delegate on `
+    + 'purpose, and no test of that name is in that file — the citation does not resolve, so a reader '
+    + 'sent to the evidence finds nothing',
+  )
   assert.equal(
     [...OUTBOX_SOURCE.matchAll(/refuseSweptRowsFromOutsideTheStore\(/g)].length,
     2,
