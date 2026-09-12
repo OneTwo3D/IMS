@@ -106,9 +106,16 @@ export const REFUND_BASIS_NOTICE_CUSTOMER_MIX =
 export const REFUND_BASIS_NOTICE_GROSS_MARGIN =
   'Revenue is dispatched ex-VAT sales-line revenue LESS the net-basis credit raised in the period, so a fully credited sale no longer shows its original revenue and margin. Gross-basis and unproven-basis credit is reported but not deducted, and marks revenue and gross profit as at most (≤) the true figures; margin and contribution are ratios whose numerator and denominator both move, so they are marked (?) instead — a bound exists but its direction is not established.'
 
-/** COGS / inventory-turnover: revenue attributed back to the original sales line. */
-export const REFUND_BLIND_NOTICE_COGS_MARGIN =
-  'Refunds are NOT deducted: revenue and gross margin are attributed from the original sales line behind each dispatch, so a returned sale keeps its full revenue and margin in this report. Use Sales Statistics for a refund-aware net revenue.'
+/**
+ * COGS report: ex-VAT sales-line revenue behind each dispatch, net of the net-basis credit (o3d-rv4a).
+ *
+ * THE NAME CHANGED WITH THE BEHAVIOUR, ON PURPOSE. While this said `REFUND_BLIND_NOTICE_…` any stale
+ * reference to it compiled, and the round-5 disclosure would have gone on standing beside the
+ * correction — which is the one failure mode a whole-file `includes` check cannot see. Renaming makes
+ * every such site a compile error instead. (Same device as o3d-la3n r3's `show` -> `showAmount`.)
+ */
+export const REFUND_BASIS_NOTICE_COGS_MARGIN =
+  'Revenue is the ex-VAT sales-line revenue behind each dispatch LESS the net-basis credit raised in the period against those same orders, so a fully credited sale no longer shows its original revenue and margin. Gross-basis and unproven-basis credit is reported but NOT deducted — no stored rate converts one basis into the other — and marks revenue and gross margin as at most (≤) the true figures; margin % is a ratio whose numerator and denominator both move, so where its direction is not established it is marked (?) instead. Credit that reached no row is stated separately on its own basis and bounds the totals even where it is the figure’s own unit. Inventory Turnover is COGS over average inventory value and no refund moves either input.'
 
 /** What the Returns report prints where a period's credit is not on one basis. */
 export const RETURNS_MIXED_BASIS_MARKER = 'Mixed basis'
@@ -138,10 +145,10 @@ export const REFUND_FIGURE_SURFACES: readonly RefundFigureSurface[] = [
   },
   {
     file: 'app/(dashboard)/analytics/cogs/page.tsx',
-    figures: ['grossMarginBase', 'grossMarginPct', 'margin', 'marginPct', 'revenue', 'revenueBase', 'revenueCapturedRows'],
-    treatment: 'refund-blind',
+    figures: ['grossMarginBase', 'grossMarginBaseBound', 'grossMarginPct', 'grossMarginPctBound', 'margin', 'marginPct', 'revenue', 'revenueBase', 'revenueBaseBound', 'revenueCapturedRows'],
+    treatment: 'basis-aware',
     reason:
-      'Renders getCogsReport revenue/gross margin. Refund-blind by the producer; the disclosure is carried in report.notices, which this page renders.',
+      'Renders getCogsReport revenue net of the net-basis credit, gross margin, margin % and the per-basis credit columns, each figure with the producer’s own bound marker appended AFTER the amount renderer (o3d-la3n r3: the mark is a fact about the interval and the Unmatched branch must not be able to suppress it). o3d-rv4a.',
   },
   {
     file: 'app/(dashboard)/analytics/customers/page.tsx',
@@ -334,11 +341,10 @@ export const REFUND_FIGURE_SURFACES: readonly RefundFigureSurface[] = [
   },
   {
     file: 'app/api/export/inventory-costing/route.ts',
-    figures: ['getInventoryTurnoverReport', 'grossMarginBase', 'grossMarginPct', 'revenueBase', 'revenueCaptured', 'turnoverRatio'],
-    treatment: 'refund-blind',
+    figures: ['getInventoryTurnoverReport', 'grossMarginBase', 'grossMarginBaseBound', 'grossMarginPct', 'grossMarginPctBound', 'revenueBase', 'revenueBaseBound', 'revenueCaptured', 'turnoverRatio'],
+    treatment: 'basis-aware',
     reason:
-      'COGS/turnover CSV. Carries the disclosure as export metadata comment rows, which is this repo’s CSV-side equivalent of a notice.',
-    disclosure: REFUND_BLIND_NOTICE_COGS_MARGIN,
+      'COGS/turnover CSV. Every bounded figure carries its OWN bound column immediately right of it and the per-basis credit columns beside them, and the producer’s whole totals map travels as export metadata comment rows — a file reader has no tooltip, and a bound that exists only on the page is a disclosure the file reader never sees. o3d-rv4a.',
   },
   {
     file: 'app/api/export/sales-analytics/route.ts',
@@ -482,11 +488,10 @@ export const REFUND_FIGURE_SURFACES: readonly RefundFigureSurface[] = [
   },
   {
     file: 'lib/domain/inventory/inventory-costing-reports.ts',
-    figures: ['aggregateInventoryTurnoverRows', 'aggregateInventoryTurnoverTotalAverage', 'assertInventoryTurnoverSourceLimit', 'emptyInventoryTurnoverReportForSourceLimit', 'getInventoryTurnoverReport', 'grossMarginBase', 'grossMarginPct', 'groupRevenue', 'isInventoryTurnoverGroupBy', 'lineRevenueByKey', 'loadRevenueByOrderProduct', 'qtyByRevenueKey', 'resolveCogsRevenueKeys', 'resolvedRevenue', 'revenue', 'revenueBase', 'revenueByOrderProduct', 'revenueCaptured', 'revenueCapturedRows', 'revenueKey', 'turnover', 'turnoverGroupMetas', 'turnoverRatio', 'unkeyedRevenue'],
-    treatment: 'refund-blind',
+    figures: ['aggregateInventoryTurnoverRows', 'aggregateInventoryTurnoverTotalAverage', 'assertInventoryTurnoverSourceLimit', 'byRevenueKey', 'emptyInventoryTurnoverReportForSourceLimit', 'getInventoryTurnoverReport', 'grossMarginBase', 'grossMarginBaseBound', 'grossMarginPct', 'grossMarginPctBound', 'groupRevenue', 'isInventoryTurnoverGroupBy', 'lineRevenueByKey', 'loadRevenueByOrderProduct', 'netRevenue', 'qtyByRevenueKey', 'reportRevenueKeys', 'resolveCogsRevenueKeys', 'resolvedRevenue', 'revenue', 'revenueBase', 'revenueBaseBound', 'revenueByOrderProduct', 'revenueCaptured', 'revenueCapturedRows', 'revenueKey', 'turnover', 'turnoverGroupMetas', 'turnoverRatio', 'unkeyedRevenue'],
+    treatment: 'basis-aware',
     reason:
-      'COGS report revenue/gross margin and the turnover report. Revenue is the ORIGINAL ex-VAT sales-line total attributed through the dispatch; no refund line is loaded, so a credited sale still shows its full revenue and margin. Declared and disclosed rather than fixed — the fix needs refund lines attributed through the same order/product and line-linked keys, which is filed.',
-    disclosure: REFUND_BLIND_NOTICE_COGS_MARGIN,
+      'COGS report revenue/gross margin and the turnover report. o3d-rv4a: refund lines are loaded with their parent refund’s totalsBasis and attributed through the SAME line-linked and order:product keys the revenue uses, split across groups by the same quantity share; only the NET bucket is subtracted, the gross and unproven buckets are published beside the figures, and the totals classify from the unrounded credit INTERVAL carried up from the rows rather than from their published signed, rounded columns (o3d-la3n). Turnover is COGS over average inventory value and no refund line moves either input.',
   },
   {
     file: 'lib/domain/inventory/inventory-health-reports.ts',

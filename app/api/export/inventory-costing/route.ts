@@ -1,7 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { requireApiAuth } from '@/lib/auth/server'
 import { csvBufferedStreamResponse } from '@/lib/csv'
-import { REFUND_BLIND_NOTICE_COGS_MARGIN } from '@/lib/analytics/refund-figure-surfaces'
+import { REFUND_BASIS_NOTICE_COGS_MARGIN } from '@/lib/analytics/refund-figure-surfaces'
 import { db } from '@/lib/db'
 import {
   getCogsReport,
@@ -110,20 +110,43 @@ export async function getInventoryCostingExportResponse(
         qty: row.qty,
         cogsBase: row.cogsBase,
         revenueBase: row.revenueBase ?? '',
+        // o3d-rv4a: THE BOUND IS ITS OWN COLUMN, and a blank in it is the producer's `null` — no
+        // published figure, so no relation. A CSV that dropped this would be the same defect in a
+        // different skin: the page would mark revenue `≤` while the file an operator takes away shows
+        // an exact-looking number with nothing beside it, and a file is read as the whole picture.
+        revenueBaseBound: row.revenueBaseBound ?? '',
         grossMarginBase: row.grossMarginBase ?? '',
+        grossMarginBaseBound: row.grossMarginBaseBound ?? '',
         grossMarginPct: row.grossMarginPct ?? '',
+        // Separate from the two linear bounds: margin is a ratio, so this column can read
+        // `indeterminate` on a row whose revenue and margin beside it are sound ceilings. A single
+        // shared flag column could not say that, and a yes/no one could not say it at all.
+        grossMarginPctBound: row.grossMarginPctBound ?? '',
+        refundsNetBasis: row.refundsNetBasis,
+        refundsGrossBasis: row.refundsGrossBasis,
+        refundsUnknownBasis: row.refundsUnknownBasis,
         movementCount: row.movementCount,
         revenueCaptured: row.revenueCaptured,
       }))
       return csvBufferedStreamResponse(
         rows,
-        ['groupLabel', 'sku', 'mpn', 'categoryName', 'warehouseCode', 'customerName', 'channel', 'qty', 'cogsBase', 'revenueBase', 'grossMarginBase', 'grossMarginPct', 'movementCount', 'revenueCaptured'],
+        ['groupLabel', 'sku', 'mpn', 'categoryName', 'warehouseCode', 'customerName', 'channel', 'qty', 'cogsBase', 'revenueBase', 'revenueBaseBound', 'grossMarginBase', 'grossMarginBaseBound', 'grossMarginPct', 'grossMarginPctBound', 'refundsNetBasis', 'refundsGrossBasis', 'refundsUnknownBasis', 'movementCount', 'revenueCaptured'],
         `cogs-${date}.csv`,
-        // o3d-iigc round 5: A FILE READER HAS NO TOOLTIP, and revenueBase/grossMarginBase/
-        // grossMarginPct here are refund-blind. The repo's own CSV metadata channel turns that into
-        // `#` comment rows at the foot of the file (which parseCsv skips, so re-import is unharmed)
-        // and an X-IMS-Export-Metadata header for API consumers.
-        { dateFrom: report.dateFrom, dateTo: report.dateTo, groupBy: report.groupBy, generatedAt: report.generatedAt, refundTreatment: REFUND_BLIND_NOTICE_COGS_MARGIN },
+        // A FILE READER HAS NO TOOLTIP. The repo's own CSV metadata channel turns this into `#`
+        // comment rows at the foot of the file (which parseCsv skips, so re-import is unharmed) and an
+        // X-IMS-Export-Metadata header for API consumers. o3d-rv4a carries the producer's WHOLE totals
+        // map through it by ITERATION, not a hand-kept list: the bounds on the period figures and the
+        // credit that reached no row exist nowhere in `rows`, so an export built from rows alone drops
+        // them silently — and a totals key added tomorrow ships tomorrow. Same rule and same reason as
+        // app/api/export/sales-analytics/route.ts.
+        {
+          dateFrom: report.dateFrom,
+          dateTo: report.dateTo,
+          groupBy: report.groupBy,
+          generatedAt: report.generatedAt,
+          refundTreatment: REFUND_BASIS_NOTICE_COGS_MARGIN,
+          ...Object.fromEntries(Object.entries(report.totals).map(([key, value]) => [`totals.${key}`, value])),
+        },
       )
     }
 

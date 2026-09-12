@@ -12,10 +12,30 @@ import type { PageInfo } from '@/lib/domain/inventory/stock-position-reports'
 import { calculateInventoryTurnover, normalizeVelocityWindow } from '@/lib/domain/inventory/velocity'
 import { roundQuantity, toDecimal, type Decimal, type DecimalInput } from '@/lib/domain/math/decimal'
 import { dateOnly as utcDateOnly, exclusiveEndOfUtcDay, parseDateOnly as parseUtcDateOnly, subtractUtcDays } from '@/lib/domain/math/date-window'
-import { SourceScanTooLargeError } from '@/lib/security/source-scan-error'
+import { assertSourceLimit, SourceScanTooLargeError } from '@/lib/security/source-scan-error'
 import { getAccountingSettings, getActiveAccountingConnectorInfo, syncAccountingAccountBalanceSnapshots } from '@/lib/accounting'
 import { cache } from 'react'
-import { REFUND_BLIND_NOTICE_COGS_MARGIN } from '@/lib/analytics/refund-figure-surfaces'
+import { REFUND_BASIS_NOTICE_COGS_MARGIN } from '@/lib/analytics/refund-figure-surfaces'
+import type { DerivedFigureBound } from '@/lib/domain/sales/derived-figure-bound'
+import {
+  marginFigureBoundDecimal,
+  netLinearFigureBoundDecimal,
+} from '@/lib/domain/sales/refund-basis-analytics'
+import {
+  addCredit,
+  addUnplacedIntervals,
+  comparableCredit,
+  creditBasisComplete,
+  emptyCredits,
+  mergeCredits,
+  offRowCreditSummary,
+  scaleCredits,
+  unabsorbedCreditInterval,
+  unplacedCreditBound,
+  unplacedCreditInterval,
+  type CreditBuckets,
+  type UnplacedCreditInterval,
+} from '@/lib/domain/sales/refund-credit-buckets'
 
 const DEFAULT_PAGE_SIZE = 100
 const MIN_PAGE_SIZE = 50
@@ -24,6 +44,7 @@ const INVENTORY_COSTING_EXPORT_ROW_LIMIT = 100000
 const SOURCE_SCAN_PAGE_SIZE = 1000
 const INVENTORY_TURNOVER_COGS_SOURCE_ROW_LIMIT = 100000
 const INVENTORY_TURNOVER_SNAPSHOT_SOURCE_ROW_LIMIT = 100000
+const COGS_REFUND_SOURCE_ROW_LIMIT = 100000
 const NEAR_ZERO_LANDED_GOODS_UNIT_COST_BASE = '0.01'
 const DATE_ONLY_RE = /^\d{4}-\d{2}-\d{2}$/
 
@@ -124,9 +145,32 @@ export type CogsReportRow = {
   channel: string | null
   qty: string
   cogsBase: string
+  /**
+   * Ex-VAT sales-line revenue behind this group's dispatches, LESS the NET-basis credit against the
+   * same lines (o3d-rv4a). `null` where the dispatch could not be matched to a sales line at all —
+   * the null-not-zero discipline this report already had, now also covering the credit that
+   * therefore had nothing to be subtracted from.
+   */
   revenueBase: string | null
+  /**
+   * WHAT THE FIGURE BESIDE IT IS, not a decoration on it. `null` travels with a `null` amount: a
+   * withheld figure bears no relation to anything, and `'exact'` there would read as a measurement.
+   * See lib/domain/sales/derived-figure-bound.ts for what each verdict claims.
+   */
+  revenueBaseBound: DerivedFigureBound | null
   grossMarginBase: string | null
+  grossMarginBaseBound: DerivedFigureBound | null
   grossMarginPct: string | null
+  /**
+   * Separate from the two linear bounds ON PURPOSE. Margin is a RATIO, so unsubtracted credit moves
+   * the numerator and the denominator together and the direction is decided case by case — a row
+   * whose revenue and margin are sound ceilings can carry a margin % that is not one.
+   */
+  grossMarginPctBound: DerivedFigureBound | null
+  /** Credit against this group's lines, on the basis it was recorded on. Only `net` was subtracted. */
+  refundsNetBasis: string
+  refundsGrossBasis: string
+  refundsUnknownBasis: string
   movementCount: number
   revenueCaptured: boolean
 }
@@ -142,7 +186,29 @@ export type CogsReport = {
     qty: string
     cogsBase: string
     revenueBase: string
+    revenueBaseBound: DerivedFigureBound
     grossMarginBase: string
+    grossMarginBaseBound: DerivedFigureBound
+    refundsNetBasis: string
+    refundsGrossBasis: string
+    refundsUnknownBasis: string
+    /**
+     * CREDIT THAT REACHED NO ROW, STATED ON ITS OWN BASIS AND NEVER AS ONE SUM. A net amount and a
+     * gross amount added together are in no unit at all, and an operator reading that beside a NET
+     * revenue column would take it for one. Three amounts per case:
+     *   `Unattributed` — the credit line named no sales line and no product, so no revenue bucket
+     *                    could own it (a shipping or monetary-only credit line).
+     *   `OutsideReport` — it named one this report has no revenue row for: that dispatch is not in
+     *                    the window, or its revenue could not be matched to a line.
+     * Either makes the period figures bounded even where the credit is the figure's own unit — it is
+     * real credit that nothing subtracted.
+     */
+    refundsUnattributedNetBasis: string
+    refundsUnattributedGrossBasis: string
+    refundsUnattributedUnknownBasis: string
+    refundsOutsideReportNetBasis: string
+    refundsOutsideReportGrossBasis: string
+    refundsOutsideReportUnknownBasis: string
     revenueCapturedRows: number
     glBalanceBase: string | null
     glVarianceBase: string | null
@@ -729,7 +795,64 @@ export function inventoryCostingFiltersForUi(filters: InventoryCostingFilters): 
   }
 }
 
-export function aggregateCogsRows(inputs: CogsAggregationInput[], groupBy: CogsGroupBy): CogsReportRow[] {
+/**
+ * o3d-rv4a: THE CREDIT THIS REPORT HAS TO ACCOUNT FOR, ATTRIBUTED THROUGH ITS OWN REVENUE KEYS.
+ *
+ * `byRevenueKey` is keyed exactly as `resolveCogsRevenueKeys` keys revenue — `L:<salesLineId>` where
+ * the report attributes at line granularity, `<orderId>:<productId>` where it falls back to the
+ * blended pair — so the credit lands in the same bucket as the revenue it reverses and is split
+ * across groups by the same quantity share. The other two hold what could not be keyed at all.
+ */
+export type CogsCreditInput = {
+  byRevenueKey: Map<string, CreditBuckets>
+  /** Named a sales line or product this report holds no revenue key for. */
+  outsideReport: CreditBuckets
+  /** Named nothing keyable: no sales line, no product, or no order behind it. */
+  unattributed: CreditBuckets
+}
+
+/**
+ * WHAT THE PERIOD FIGURES COULD NOT ABSORB, CARRIED UNROUNDED SO THE TOTALS CLASSIFY FROM THE FACT.
+ *
+ * o3d-la3n's finding, applied here: a bound is an INTERVAL, the endpoints ADD when figures are
+ * summed, and the verdict is derived LAST, at the point of display. Reconstructing it from the rows'
+ * published `refunds*Basis` strings would be the defect that issue is named for twice over — those
+ * are SIGNED sums (a +120 and a -120 of gross credit cancel into a zero that is not negative) and
+ * they are ROUNDED (summing rounded rows can publish a ceiling below the truth, o3d-l4zz).
+ */
+export type CogsCreditSummary = {
+  /** Every row's credit, attributed. */
+  attributed: CreditBuckets
+  unattributed: CreditBuckets
+  outsideReport: CreditBuckets
+  /** The interval, in NET terms, of credit missing from the period revenue/margin. */
+  unaccountedInterval: UnplacedCreditInterval
+  /** False when ANY credit was left out of the period figures, for any reason. */
+  basisComplete: boolean
+}
+
+/** THIS REPORT'S REVENUE IS EX-VAT `SalesOrderLine.totalBase`, so a NET-basis credit is its unit. */
+const COGS_FIGURE_BASIS = 'NET' as const
+
+function emptyCogsCreditInput(): CogsCreditInput {
+  return { byRevenueKey: new Map(), outsideReport: emptyCredits(), unattributed: emptyCredits() }
+}
+
+/**
+ * Back-compatible wrapper: the rows alone, for callers that publish no bound.
+ *
+ * `aggregateCogsReport` is what `getCogsReport` uses, because the totals need the unrounded credit
+ * interval and a row list cannot carry it.
+ */
+export function aggregateCogsRows(inputs: CogsAggregationInput[], groupBy: CogsGroupBy, credits?: CogsCreditInput): CogsReportRow[] {
+  return aggregateCogsReport(inputs, groupBy, credits).rows
+}
+
+export function aggregateCogsReport(
+  inputs: CogsAggregationInput[],
+  groupBy: CogsGroupBy,
+  credits: CogsCreditInput = emptyCogsCreditInput(),
+): { rows: CogsReportRow[]; credits: CogsCreditSummary } {
   // A sales-order line (revenueKey = orderId:productId) can be fulfilled from
   // more than one group (e.g. split-warehouse dispatch produces two COGS
   // movements with the same revenueKey in different warehouse groups). Counting
@@ -783,22 +906,59 @@ export function aggregateCogsRows(inputs: CogsAggregationInput[], groupBy: CogsG
     groups.set(key, existing)
   }
 
-  return [...groups.entries()]
+  // o3d-rv4a: the credit that reached a row, and the interval of credit nothing subtracted.
+  const attributed = emptyCredits()
+  const unaccounted: UnplacedCreditInterval[] = []
+  const rows = [...groups.entries()]
     .map(([key, group]) => {
       // Sum this group's qty-proportional share of each line's revenue. When a
       // line's total fulfilled qty is zero (degenerate, e.g. fully reversed),
       // fall back to the full line revenue rather than dropping it.
+      //
+      // THE CREDIT AGAINST THAT LINE IS SHARED OUT BY THE SAME FACTOR, including the degenerate
+      // fallback. Two halves of one subtraction have to be on one denominator: allocating revenue by
+      // quantity share while charging every group the whole credit would understate margin by the
+      // credit once per extra group — the mirror of the double-count scjz.50 fixed for revenue.
+      const groupCredits = emptyCredits()
       const groupRevenue = [...group.qtyByRevenueKey.entries()].reduce((sum, [revKey, groupQty]) => {
         const line = lineRevenueByKey.get(revKey)
         if (!line) return sum
-        const share = line.totalQty.gt(0) ? line.revenue.mul(groupQty).div(line.totalQty) : line.revenue
+        const degenerate = !line.totalQty.gt(0)
+        const share = degenerate ? line.revenue : line.revenue.mul(groupQty).div(line.totalQty)
+        const credit = credits.byRevenueKey.get(revKey)
+        if (credit) {
+          mergeCredits(groupCredits, degenerate
+            ? credit
+            : scaleCredits(credit, groupQty, line.totalQty))
+        }
         return sum.add(share)
       }, group.unkeyedRevenue)
-      const revenueBase = group.revenueCaptured ? groupRevenue : null
+      // Only the credit on this figure's OWN basis is the same unit as it, so only that is taken off.
+      // Nothing is converted: on a mixed-rate order the rate behind a gross credit is not recoverable
+      // from stored data (refund-basis-analytics.ts, o3d-w00's fail-closed conclusion).
+      const revenueBase = group.revenueCaptured ? groupRevenue.sub(comparableCredit(groupCredits, COGS_FIGURE_BASIS)) : null
       const grossMarginBase = revenueBase ? revenueBase.sub(group.cogsBase) : null
-      const grossMarginPct = revenueBase && !revenueBase.isZero()
-        ? grossMarginBase!.div(revenueBase).mul(100)
-        : null
+      // The ratio guard is `revenue > 0`, matching the Gross Margin report's `pctString` exactly
+      // (o3d-kyey), so `marginFigureBoundDecimal`'s published case analysis is true OF THIS REPORT
+      // and not merely of a report shaped like it. Its case 2 reasons that a non-positive revenue
+      // pins published and true margin both to zero, which is a claim about that guard. Before
+      // o3d-rv4a this report divided by a NEGATIVE revenue and published the sign-flipped quotient
+      // (revenue -20 against 40 of cost printed +300%), which no case of that analysis covers — and
+      // a negative revenue was unreachable then and is routine now that credit is subtracted.
+      const grossMarginPct = revenueBase == null
+        ? null
+        : revenueBase.gt(0) ? grossMarginBase!.div(revenueBase).mul(100) : decimalZero()
+      mergeCredits(attributed, groupCredits)
+      const basisComplete = creditBasisComplete(groupCredits, COGS_FIGURE_BASIS)
+      if (group.revenueCaptured) {
+        unaccounted.push(unplacedCreditInterval(groupCredits, COGS_FIGURE_BASIS))
+      } else {
+        // There is no figure on this row to subtract from, so even the same-basis credit is missing
+        // from the period totals. `Unmatched` is the honest cell; a bounded zero would not be.
+        unaccounted.push(unabsorbedCreditInterval(groupCredits, COGS_FIGURE_BASIS))
+      }
+      const unplaced = unplacedCreditBound(unplacedCreditInterval(groupCredits, COGS_FIGURE_BASIS))
+      const linearBound = netLinearFigureBoundDecimal({ basisComplete, unplacedCredit: unplaced })
       return {
         groupKey: key,
         groupLabel: cogsGroupLabel(group.first, groupBy),
@@ -812,8 +972,16 @@ export function aggregateCogsRows(inputs: CogsAggregationInput[], groupBy: CogsG
         qty: decimalString(group.qty, 4),
         cogsBase: moneyString(group.cogsBase),
         revenueBase: revenueBase ? moneyString(revenueBase) : null,
+        revenueBaseBound: revenueBase ? linearBound : null,
         grossMarginBase: grossMarginBase ? moneyString(grossMarginBase) : null,
+        grossMarginBaseBound: grossMarginBase ? linearBound : null,
         grossMarginPct: grossMarginPct ? decimalString(grossMarginPct, 2) : null,
+        grossMarginPctBound: grossMarginPct
+          ? marginFigureBoundDecimal({ netRevenue: revenueBase!, cogs: group.cogsBase, unplacedCredit: unplaced, basisComplete })
+          : null,
+        refundsNetBasis: moneyString(groupCredits.net),
+        refundsGrossBasis: moneyString(groupCredits.gross),
+        refundsUnknownBasis: moneyString(groupCredits.unknown),
         movementCount: group.movementIds.size,
         revenueCaptured: group.revenueCaptured,
       }
@@ -825,6 +993,29 @@ export function aggregateCogsRows(inputs: CogsAggregationInput[], groupBy: CogsG
       if (aCogs.gt(bCogs)) return -1
       return a.groupLabel.localeCompare(b.groupLabel)
     })
+  // Credit that reached no row at all bounds the period figures WHATEVER BASIS IT IS ON. A NET credit
+  // is `placeable` — it is the figure's own unit — so a completeness flag read off the basis alone
+  // would publish the period revenue as exact with a credit note missing from it. Existence is
+  // decided from the INTERVAL, never a sum: +100 NET against -100 GROSS cancels across bases, and
+  // +120 GROSS against -120 GROSS cancels within one while their ex-VAT values need not.
+  const offRow = offRowCreditSummary(credits.unattributed, credits.outsideReport)
+  const unaccountedInterval = [...unaccounted, offRow.interval]
+    .reduce(addUnplacedIntervals, { lower: decimalZero(), upper: decimalZero() })
+  return {
+    rows,
+    credits: {
+      attributed,
+      unattributed: credits.unattributed,
+      outsideReport: credits.outsideReport,
+      unaccountedInterval,
+      // Both halves, as o3d-kyey's totals do it: the per-entry placeability flag (which a signed sum
+      // cannot reproduce — a +5 and a -5 of unplaceable credit sum to zero while neither was
+      // placeable) AND an all-zero interval, which is the only statement that nothing at all was
+      // left out. Either one false makes the period figures bounded.
+      basisComplete: creditBasisComplete(attributed, COGS_FIGURE_BASIS)
+        && unaccountedInterval.lower.isZero() && unaccountedInterval.upper.isZero(),
+    },
+  }
 }
 
 type TurnoverGroupMeta = {
@@ -1225,6 +1416,107 @@ export function resolveCogsRevenueKeys(
   })
 }
 
+/**
+ * A REFUND LINE AS THIS REPORT HAS TO ATTRIBUTE IT (o3d-rv4a).
+ *
+ * `salesOrderLine` is preferred over the refund line's own `productId` for the same reason
+ * `resolveCogsRevenueKeys` prefers the shipment line's: the sales line is what the revenue being
+ * reversed is denominated in, and for a KIT the two products differ.
+ */
+export type CogsRefundLineInput = {
+  totalBase: DecimalInput
+  productId: string | null
+  salesOrderLine: { id: string; orderId: string; productId: string | null } | null
+  refund: { orderId: string; totalsBasis: string | null }
+}
+
+/**
+ * PUT EACH REFUND LINE IN THE BUCKET THE REVENUE IT REVERSES IS IN — or say it reached no bucket.
+ *
+ * `reportKeys` is the set of keys `resolveCogsRevenueKeys` actually produced for rows that carry
+ * revenue, so this function never invents a key the report does not hold. It tries the line-level key
+ * FIRST and the blended `<orderId>:<productId>` key second, because the two schemes are mutually
+ * exclusive per (order, product): when the report is keying that pair by line, the pair key exists
+ * nowhere in it, and attributing credit to a key no row holds would silently drop the credit while
+ * the report claimed exactness.
+ *
+ * THE THREE OUTCOMES ARE DISTINCT AND ALL THREE ARE PUBLISHED. `attributed` reduces a row's revenue.
+ * `outsideReport` named something real that this window has no revenue row for — a dispatch in
+ * another period, or one whose revenue could not be matched — so it bounds the totals without
+ * touching a row. `unattributed` named nothing keyable at all (a shipping or monetary-only credit
+ * line), and bounds the totals for a different reason worth keeping separate: no product row could
+ * EVER own it, so it will not appear on a widened date range either.
+ */
+export function resolveCogsRefundCreditKeys(
+  lines: CogsRefundLineInput[],
+  reportKeys: ReadonlySet<string>,
+): CogsCreditInput {
+  const result = emptyCogsCreditInput()
+  for (const line of lines) {
+    const lineKey = line.salesOrderLine ? `L:${line.salesOrderLine.id}` : null
+    const productId = line.salesOrderLine?.productId ?? line.productId
+    const orderId = line.salesOrderLine?.orderId ?? line.refund.orderId
+    const pairKey = productId && orderId ? revenueKey({ orderId, productId }) : null
+    const key = lineKey && reportKeys.has(lineKey)
+      ? lineKey
+      : pairKey && reportKeys.has(pairKey) ? pairKey : null
+    if (key) {
+      const buckets = result.byRevenueKey.get(key) ?? emptyCredits()
+      addCredit(buckets, line.refund.totalsBasis, line.totalBase)
+      result.byRevenueKey.set(key, buckets)
+      continue
+    }
+    addCredit(lineKey || pairKey ? result.outsideReport : result.unattributed, line.refund.totalsBasis, line.totalBase)
+  }
+  return result
+}
+
+type CogsRefundLineRow = {
+  totalBase: Prisma.Decimal
+  productId: string | null
+  salesOrderLine: { id: string; orderId: string; productId: string | null } | null
+  refund: { orderId: string; totalsBasis: string | null }
+}
+
+/**
+ * The period's credit, on the SAME window boundary the report's COGS entries use.
+ *
+ * ANCHORED TO `refundedAt`, NOT TO THE DISPATCH DATE, and deliberately the same PERIOD rule Gross
+ * Margin applies (o3d-kyey): a credit belongs to the period it was raised in, which is what a credit
+ * note does to a month's accounts. A credit raised in this window against an earlier dispatch
+ * therefore reduces this window's revenue; one raised later against a dispatch in this window is not
+ * loaded, and this window's figures are the figures as they stood.
+ *
+ * THE SCOPE IS NARROWER THAN GROSS MARGIN'S, AND THE DIFFERENCE IS DELIBERATE. Gross Margin's rows
+ * are products, so every credit raised in the period can reach one. This report's revenue keys are
+ * per ORDER and per SALES LINE, so a credit against an order this report does not cover could never
+ * reach a row whatever we did with it — loading it would only ever inflate the off-report buckets.
+ * Worse, this report has product/warehouse/category/supplier filters, so an unrestricted load would
+ * fill those buckets with credit the operator deliberately filtered out and mark every filtered view
+ * bounded for that reason alone, which is how a bound marker becomes noise and stops being read.
+ * What remains off-report is credit against THESE orders that no row of this report could place.
+ */
+async function loadCogsRefundLines(from: Date, toExclusive: Date, orderIds: string[]): Promise<CogsRefundLineRow[]> {
+  const ids = [...new Set(orderIds)]
+  if (ids.length === 0) return []
+  const rows = await db.salesOrderRefundLine.findMany({
+    where: { refund: { orderId: { in: ids }, refundedAt: { gte: from, lt: toExclusive } } },
+    select: {
+      totalBase: true,
+      productId: true,
+      salesOrderLine: { select: { id: true, orderId: true, productId: true } },
+      // The parent refund's basis marker governs what `totalBase` MEANS (o3d-w00/o3d-n8p). It is read
+      // off the persisted column and never inferred from a note or a date.
+      refund: { select: { orderId: true, totalsBasis: true } },
+    },
+    take: COGS_REFUND_SOURCE_ROW_LIMIT + 1,
+  })
+  // Refuse rather than silently truncate: a dropped credit line is a revenue figure that is too high
+  // and a bound marker that says it is exact.
+  assertSourceLimit(rows.length, COGS_REFUND_SOURCE_ROW_LIMIT, 'COGS report refund source rows')
+  return rows
+}
+
 export async function getCogsReport(filters: InventoryCostingFilters = {}, options: ReportOptions = {}): Promise<CogsReport> {
   const dateFrom = filters.dateFrom ?? daysAgo(30)
   const dateTo = filters.dateTo ?? today()
@@ -1335,7 +1627,19 @@ export async function getCogsReport(filters: InventoryCostingFilters = {}, optio
       revenueBase,
     }
   })
-  const allRows = aggregateCogsRows(inputs, groupBy)
+  // o3d-rv4a: the credit against these very orders, keyed through the SAME revenue keys the rows are
+  // built from, so a credit lands in the bucket of the revenue it reverses.
+  const refundLines = await loadCogsRefundLines(from, toExclusive, sourceOrderIds)
+  // ONLY the keys that actually carry revenue. A key whose revenue could not be resolved holds no
+  // figure for a credit to reduce, so credit naming it belongs in the off-report buckets, not on a
+  // row that would then publish a bounded number it never computed.
+  const reportRevenueKeys = new Set<string>(
+    resolvedRevenue
+      .filter((resolved) => resolved.revenueKey != null && resolved.revenueBase != null)
+      .map((resolved) => resolved.revenueKey!),
+  )
+  const credits = resolveCogsRefundCreditKeys(refundLines, reportRevenueKeys)
+  const { rows: allRows, credits: creditSummary } = aggregateCogsReport(inputs, groupBy, credits)
   const totals = allRows.reduce(
     (sum, row) => ({
       qty: sum.qty.add(toDecimal(row.qty)),
@@ -1346,6 +1650,17 @@ export async function getCogsReport(filters: InventoryCostingFilters = {}, optio
     }),
     { qty: decimalZero(), cogsBase: decimalZero(), revenueBase: decimalZero(), grossMarginBase: decimalZero(), revenueCapturedRows: 0 },
   )
+  // The verdict is derived HERE, once, from the interval the rows carried up unrounded — not folded
+  // from the rows' own verdicts and not rebuilt from their published (signed, rounded) credit
+  // columns. That is o3d-la3n's whole finding: endpoints add, magnitudes matter, classify last.
+  const totalsBound = netLinearFigureBoundDecimal({
+    basisComplete: creditSummary.basisComplete,
+    unplacedCredit: unplacedCreditBound(creditSummary.unaccountedInterval),
+  })
+  const reportCredits = emptyCredits()
+  mergeCredits(reportCredits, creditSummary.attributed)
+  mergeCredits(reportCredits, creditSummary.unattributed)
+  mergeCredits(reportCredits, creditSummary.outsideReport)
   const gl = await cogsGlMovementForPeriod(dateFrom, dateTo, totals.cogsBase, filters)
   const paged = paginate(allRows, filters, options)
   return {
@@ -1359,7 +1674,18 @@ export async function getCogsReport(filters: InventoryCostingFilters = {}, optio
       qty: decimalString(totals.qty, 4),
       cogsBase: moneyString(totals.cogsBase),
       revenueBase: moneyString(totals.revenueBase),
+      revenueBaseBound: totalsBound,
       grossMarginBase: moneyString(totals.grossMarginBase),
+      grossMarginBaseBound: totalsBound,
+      refundsNetBasis: moneyString(reportCredits.net),
+      refundsGrossBasis: moneyString(reportCredits.gross),
+      refundsUnknownBasis: moneyString(reportCredits.unknown),
+      refundsUnattributedNetBasis: moneyString(creditSummary.unattributed.net),
+      refundsUnattributedGrossBasis: moneyString(creditSummary.unattributed.gross),
+      refundsUnattributedUnknownBasis: moneyString(creditSummary.unattributed.unknown),
+      refundsOutsideReportNetBasis: moneyString(creditSummary.outsideReport.net),
+      refundsOutsideReportGrossBasis: moneyString(creditSummary.outsideReport.gross),
+      refundsOutsideReportUnknownBasis: moneyString(creditSummary.outsideReport.unknown),
       revenueCapturedRows: totals.revenueCapturedRows,
       glBalanceBase: gl.glBalanceBase ? moneyString(gl.glBalanceBase) : null,
       glVarianceBase: gl.glVarianceBase ? moneyString(gl.glVarianceBase) : null,
@@ -1367,12 +1693,12 @@ export async function getCogsReport(filters: InventoryCostingFilters = {}, optio
     notices: [
       ...gl.notices,
       allRows.some((row) => !row.revenueCaptured)
-        ? 'Revenue and margin are shown only where COGS movement references can be matched to a sales order line for the same product.'
+        ? 'Revenue and margin are shown only where COGS movement references can be matched to a sales order line for the same product. Credit against an unmatched row has no revenue to come off and is reported in the off-report totals instead.'
         : '',
-      // o3d-iigc round 5: this report's revenue is the ORIGINAL sales line behind each dispatch, so
-      // a credited sale keeps its full revenue and margin here. Declared and disclosed rather than
-      // silently blind; the refund-aware version is filed.
-      REFUND_BLIND_NOTICE_COGS_MARGIN,
+      // o3d-rv4a: this report is no longer refund-blind. Revenue is the dispatch's ex-VAT sales-line
+      // revenue LESS the net-basis credit raised in the period; the gross-basis and unproven-basis
+      // credit is published beside it and bounds the figures rather than being converted or guessed.
+      REFUND_BASIS_NOTICE_COGS_MARGIN,
     ].filter(Boolean),
   }
 }
