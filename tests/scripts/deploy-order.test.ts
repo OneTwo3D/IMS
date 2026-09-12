@@ -8480,11 +8480,24 @@ test('every entrypoint defines what the shared fence library reads', () => {
     // `readonly` is a declaration prefix here too since o3d-secops.
     const missing = [...needed].filter((name) => !new RegExp(`(^|\\n)\\s*((export|readonly)\\s+)?${name}=`).test(source))
     assert.deepEqual(missing, [], `${label} sources the fence library but never assigns what it reads`)
-    // AND IT REALLY SOURCES IT, from its own directory rather than from an application path.
+    // AND IT REALLY SOURCES IT, from its own directory rather than from an application path — and from
+    // the PHYSICAL directory the running inode is in rather than through the pointer, which is what
+    // o3d-z5be r4 changed (Codex HIGH 1): plain `pwd` kept the symbolic link in the path, so every
+    // `source` re-traversed it and a concurrent publication could hand root another release's libraries.
     assert.match(
       source,
-      /IMS_SCRIPT_LIB_DIR="\$\(cd "\$\(dirname "\$\{BASH_SOURCE\[0\]\}"\)" && pwd\)\/lib"/,
+      /IMS_SCRIPT_LIB_DIR="\$\(dirname -- "\$\{IMS_ENTRYPOINT_SELF\}"\)\/lib"/,
       `${label} must resolve the library beside itself, not under an application-writable directory`,
+    )
+    assert.match(
+      source,
+      /IMS_ENTRYPOINT_SELF="\$\(readlink -- "\/proc\/\$\$\/fd\/255" 2>\/dev\/null \|\| true\)"/,
+      `${label} must pin itself to the descriptor bash is reading it from`,
+    )
+    assert.doesNotMatch(
+      source,
+      /IMS_SCRIPT_LIB_DIR="\$\(cd "\$\(dirname "\$\{BASH_SOURCE\[0\]\}"\)" && pwd\)\/lib"/,
+      `${label} must not resolve its library through the pointer on every source (o3d-z5be r4)`,
     )
     assert.match(source, /source "\$\{IMS_SCRIPT_LIB_DIR\}\/db-fence-protected\.sh"/, `${label} must source it`)
     assert.match(source, /source "\$\{IMS_SCRIPT_LIB_DIR\}\/crontab-lock\.sh"/,

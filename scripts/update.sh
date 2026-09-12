@@ -766,12 +766,55 @@ DB_FENCE_SCRIPT="${APP_DIR}/scripts/fence-db-connections.mjs"
 # entrypoint itself does not already have — unlike the fence helper, which is executed several
 # phases later, after the application account has had a cutover's worth of time to replace it.
 # That difference is the whole reason the helper needs protecting and this file does not.
-IMS_SCRIPT_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib"
+# WHERE THAT DIRECTORY IS, RESOLVED ONCE AND PINNED FOR THE WHOLE RUN (o3d-z5be r4, Codex HIGH 1).
+#
+# ${IMS_DRIVER_PROGRAM_DIR}, which is the documented way to run this script, IS A SYMBOLIC LINK, and a
+# publication flips it with one `rename(2)`. That makes every RESOLUTION of it atomic and says nothing
+# at all about a reader that resolves it MANY TIMES — which is what this script is: bash opens the
+# entrypoint through the link, and every `source` below would then traverse the link AGAIN. A publisher
+# that flips it in between (install.sh from another release; two privileged runs can overlap, the shared
+# cutover lock is taken later than this) would have root execute THIS release's script with ANOTHER
+# release's libraries. r3 argued that one atomic rename made a mixture impossible, and that argument was
+# about the commit rather than about the reader.
+#
+# SO THE PIN COMES OFF THE DESCRIPTOR BASH IS ALREADY READING THIS FILE FROM. /proc/<pid>/fd/255 is that
+# descriptor and `readlink` gives the PHYSICAL path of the inode being executed — the versioned
+# publication directory, never the pointer. There is no window in it: it is not a second resolution of a
+# name that could have moved, it is the object whose bytes are running. `cd -P … && pwd -P` is the
+# fallback for a host whose /proc cannot answer, and it is still a pin: one resolution, at entry, before
+# anything is sourced. `-P` is the whole difference — plain `pwd` prints the LOGICAL path, symbolic link
+# and all, which is how the previous form re-traversed the pointer on every `source`. The basename is
+# compared so a shell that does not keep this script on descriptor 255 takes the fallback instead of
+# pinning to whatever else is there.
+#
+# AND WHY DESCRIPTOR 255 IS THIS SCRIPT'S, since that is the first thing to ask of a pin taken off a
+# number. It is the descriptor bash opens the script on and it is CLOSE-ON-EXEC, so no child inherits
+# it and no nested shell can be holding somebody else's file there; `sudo` closes inherited descriptors
+# above stderr, so it is not reachable from the caller on the documented invocation either. What is left
+# is a root shell that deliberately opened another file on 255 before running this one, which is root
+# arranging its own substitution and not a boundary this file can defend. The basename comparison and
+# the fallback are what cover every shape where the descriptor is not what this expects.
+#
+# THIS IS THE SAME TEXT IN ALL THREE ENTRYPOINTS, and a test asserts that byte for byte. It cannot live
+# in a library: the libraries are what has to be read THROUGH it.
+IMS_ENTRYPOINT_SELF="$(readlink -- "/proc/$$/fd/255" 2>/dev/null || true)"
+if [[ "${IMS_ENTRYPOINT_SELF}" != /* ]] \
+  || [[ "${IMS_ENTRYPOINT_SELF##*/}" != "$(basename -- "${BASH_SOURCE[0]}")" ]] \
+  || [[ ! -f "${IMS_ENTRYPOINT_SELF}" ]]; then
+  IMS_ENTRYPOINT_SELF="$(cd -P "$(dirname -- "${BASH_SOURCE[0]}")" 2>/dev/null && pwd -P)/$(basename -- "${BASH_SOURCE[0]}")"
+fi
+IMS_SCRIPT_LIB_DIR="$(dirname -- "${IMS_ENTRYPOINT_SELF}")/lib"
 # THIS SCRIPT'S OWN ABSOLUTE PATH, for the one message that tells an operator to re-run it with a
 # credential on the invocation. `sudo -E scripts/update.sh` was a RELATIVE path: pasted from
 # anywhere but the release tree it is "No such file or directory", and `-E` additionally needs
 # SETENV in sudoers. An emergency instruction that fails when typed is worse than none
 # (o3d-2sm1.5 r32, Codex HIGH).
+#
+# AND THIS ONE IS DELIBERATELY THE LOGICAL PATH, not the pinned physical one above (o3d-z5be r4). It is
+# what an OPERATOR is told to type, so it has to be the documented name —
+# ${IMS_DRIVER_PROGRAM_DIR}/update.sh — and not the versioned directory behind the pointer, which is a
+# path that names one publication and will be swept once a later one supersedes it. The pin is for what
+# ROOT READS; this is for what a person types.
 IMS_ENTRYPOINT_PATH="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
 # shellcheck source=lib/db-fence-protected.sh
 source "${IMS_SCRIPT_LIB_DIR}/db-fence-protected.sh" || {
@@ -815,7 +858,7 @@ source "${IMS_SCRIPT_LIB_DIR}/privileged-helpers.sh" || {
 # privileged, so it has nothing to refuse); a privileged run that could NOT publish stops here,
 # before it has changed anything at all.
 publish_privileged_helper_set || {
-  echo "FATAL: the root-owned copy of ${IMS_SCRIPT_LIB_DIR} could not be published to ${IMS_DRIVER_HELPER_DIR}: ${IMS_DRIVER_REASON:-no reason was recorded}. Every node helper this run would otherwise execute as root would have to be read back out of a directory the service account owns, minutes from now; it will not do that. Nothing has been changed." >&2
+  echo "FATAL: the root-owned copy of ${IMS_SCRIPT_LIB_DIR} could not be published to ${IMS_DRIVER_HELPER_DIR}: ${IMS_DRIVER_REASON:-no reason was recorded}. Every node helper this run would otherwise execute as root would have to be read back out of a directory the service account owns, minutes from now; it will not do that. Nothing else on this host has been changed — and where the reason above says a publication IS STANDING but could not be made durable (o3d-z5be r4), that publication is a complete, sealed, digested tree and the only thing missing is the flush to disk." >&2
   exit 1
 }
 
@@ -5635,12 +5678,17 @@ FENCE_ARMED=false
 # AND YES, ON THE DOCUMENTED PATH THIS REPLACES THE TREE THIS SCRIPT WAS LAUNCHED FROM — by moving the
 # name, not the bytes (o3d-z5be r3). ${IMS_DRIVER_PROGRAM_DIR} is a symbolic link, and a publication
 # flips it to a new versioned directory; the directory THIS shell's own file is in is left standing and
-# is removed by a later run's sweep, once no pointer names it and its publisher is gone. So this run
-# goes on reading the bytes it started with for two independent reasons: the directory is still there,
-# and bash holds an open descriptor on the script it is executing so an unlinked inode would outlive
-# its last close anyway. The five libraries were read in full at startup. NOTHING BELOW THIS LINE
-# READS ${IMS_SCRIPT_LIB_DIR} AGAIN; the startup snapshot is what every later resolution goes through,
-# and it was taken before this.
+# is removed by a later run's sweep.
+#
+# AND THE THREE REASONS THAT IS SAFE, ONE OF WHICH r3 DID NOT HAVE (o3d-z5be r4). ${IMS_SCRIPT_LIB_DIR}
+# is PINNED at the top of this file to the versioned directory bash is reading this script out of, so
+# the flip below cannot change what any `source` resolves to — r3's claim that an atomic rename made a
+# mixture impossible was about the commit and not about a reader that resolves the name once per
+# library. The sweep that eventually removes this directory asks whether any process holds an open file,
+# a cwd or an executable under it, so it does not remove one a run is still reading out of — r3 offered
+# only bash's open descriptor, which covers the bytes already read and not the next `source`. And
+# NOTHING BELOW THIS LINE READS ${IMS_SCRIPT_LIB_DIR} AGAIN in any case: the startup snapshot is what
+# every later resolution goes through, and it was taken before this.
 CURRENT_STEP="publish-driver"
 if ! $DRY_RUN; then
   DRIVER_PUBLISH_RC=0
@@ -5648,7 +5696,12 @@ if ! $DRY_RUN; then
   if (( DRIVER_PUBLISH_RC == 0 )); then
     success "The root-owned deployment driver at ${IMS_DRIVER_PROGRAM_DIR} now holds this release (${IMS_DRIVER_PUBLISHED_DIGEST})."
   else
-    warn "The root-owned deployment driver at ${IMS_DRIVER_PROGRAM_DIR} was NOT refreshed: ${IMS_DRIVER_REASON:-the reason is printed above}."
+    # "OR NOT VERIFIABLY SO" IS NOT HEDGING (o3d-z5be r4, Codex MEDIUM 2). There is one refusal that
+    # arrives with the new tree already standing — the pointer was flipped and then the directory
+    # could not be flushed to disk — and it is reported as a refusal precisely so that nothing
+    # announces a digest for a commit that may not survive a crash. A flat "was NOT refreshed" would
+    # be the false half of that sentence, so the reason below is what says which of the two happened.
+    warn "The root-owned deployment driver at ${IMS_DRIVER_PROGRAM_DIR} was NOT refreshed, or not verifiably so: ${IMS_DRIVER_REASON:-the reason is printed above}."
     warn "This deployment is complete and serving. The copy standing there is whatever release last"
     warn "vouched for itself — NOT necessarily the previous one — and it is what the next update will"
     warn "run; that is supported, and running the next update out of ${APP_DIR} instead is what this"

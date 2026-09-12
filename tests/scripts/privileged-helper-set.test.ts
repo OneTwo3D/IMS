@@ -1645,3 +1645,470 @@ test('[o3d-xf9m] the preservation gate cannot return on an absent .env without c
   const publish = codeLines(INSTALL_SOURCE).find((line) => /write_app_env_file|APP_ENV_FILE_TARGET/.test(line.text) && line.n > gate!.n)
   assert.ok(publish, 'and the environment file must be written after the gate')
 })
+
+// ---------------------------------------------------------------------------
+// 3f. AN ATOMIC PUBLICATION IS NOT AN ATOMIC CONSUMPTION (o3d-z5be r4, Codex HIGH 1)
+//
+// THE FINDING. r3's argument for publishing by pointer was that the flip is one `rename(2)`, so
+// "a reader gets one publication or the other, never a mixture". That is a statement about ONE
+// resolution of the name. The reader this mechanism exists for performs MANY: bash opens
+// ${IMS_DRIVER_PROGRAM_DIR}/update.sh through the pointer, and then every
+// `source "${IMS_SCRIPT_LIB_DIR}/…"` traverses the pointer AGAIN. A publication that lands in
+// between therefore gave root one release's entrypoint with another release's libraries.
+//
+// THE FIX UNDER TEST is that each entrypoint resolves the pointer ONCE, at entry, off the
+// descriptor bash is already reading it from — and that the sweep of superseded publications
+// cannot then delete the directory a pinned run is still reading out of.
+// ---------------------------------------------------------------------------
+
+const PIN_FIRST_LINE = '# WHERE THAT DIRECTORY IS, RESOLVED ONCE AND PINNED FOR THE WHOLE RUN'
+const PIN_LAST_LINE = 'IMS_SCRIPT_LIB_DIR="$(dirname -- "${IMS_ENTRYPOINT_SELF}")/lib"'
+/** The shipped pin, lifted out of an entrypoint. Every behavioural assertion below runs THIS text. */
+function pinBlock(rel: string): string {
+  const source = ENTRYPOINT_SOURCE.get(rel)!
+  const start = source.indexOf(PIN_FIRST_LINE)
+  assert.notEqual(start, -1, `${rel} must carry the pin block`)
+  const end = source.indexOf(PIN_LAST_LINE, start)
+  assert.notEqual(end, -1, `${rel} must close the pin block with the library-directory assignment`)
+  return source.slice(start, end + PIN_LAST_LINE.length)
+}
+
+test('[o3d-z5be] every entrypoint resolves its library directory ONCE, physically, before it sources anything', () => {
+  const blocks = ENTRYPOINTS.map((rel) => [rel, pinBlock(rel)] as const)
+  // PRECONDITION: three files, really read.
+  assert.equal(blocks.length, 3)
+  for (const [rel, block] of blocks) {
+    assert.ok(block.length > 500, `${rel}: the pin block must have been lifted whole (${block.length} bytes)`)
+    // ONE TEXT, THREE FILES. A pin cannot live in a library — the libraries are what is read through
+    // it — so the only defence against the three drifting apart is that they are byte-identical.
+    assert.equal(block, blocks[0][1], `${rel} must carry the same pin as ${blocks[0][0]}, byte for byte`)
+    assert.ok(block.includes('readlink -- "/proc/$$/fd/255"'),
+      `${rel} must pin off the descriptor bash is reading the script from`)
+    assert.ok(block.includes('pwd -P'), `${rel} must resolve physically where /proc cannot answer`)
+  }
+  for (const rel of ENTRYPOINTS) {
+    const source = ENTRYPOINT_SOURCE.get(rel)!
+    // THE RETIRED FORM IS GONE. An ABSENCE check: a "the new form is present" check is existential and
+    // would pass with the old line still sitting three lines below the new one.
+    assert.ok(!source.includes('IMS_SCRIPT_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib"'),
+      `${rel} must not resolve its library through the pointer on every source`)
+    const assignments = codeLines(source).filter((line) => /(^|[\s;])IMS_SCRIPT_LIB_DIR=/.test(line.text))
+    assert.equal(assignments.length, 1,
+      `${rel} must assign the pinned directory exactly once: ${JSON.stringify(assignments)}`)
+    // AND THE ORDER IS THE CLAIM: the pin is a script-scope statement BEFORE the first library read, so
+    // even the FIRST `source` is already pinned. "Near the top" would be a proximity rule.
+    const lines = scriptScopeLines(source)
+    const pinAt = lines.findIndex((line) => /^IMS_SCRIPT_LIB_DIR=/.test(line.text))
+    const firstSource = lines.findIndex((line) => /^source "\$\{IMS_SCRIPT_LIB_DIR\}/.test(line.text))
+    assert.ok(pinAt >= 0, `${rel} must assign the pin at script scope`)
+    assert.ok(firstSource >= 0, `${rel} must source a library through it`)
+    assert.ok(pinAt < firstSource,
+      `${rel} must pin before the first library read (pin at statement ${pinAt}, first source at ${firstSource})`)
+  }
+})
+
+test('[o3d-z5be] a publication that lands mid-run cannot change which release a pinned run sources from', (t) => {
+  // THE RIG IS THE SHIPPED PIN, run through the shipped shape of the publication root: a documented
+  // name that is a symbolic link to `.version-…/driver`, and a second complete publication beside it.
+  // The subject script flips the pointer ITSELF, at the instant a concurrent publisher would, and then
+  // sources a library — so what is measured is which release the `source` reached, which is the whole
+  // of the finding.
+  const base = createTempDirSync('privileged-pin-', t)
+  const root = join(base, 'root')
+  const versionA = join(root, '.version-driver.1.aaaaaa')
+  const versionB = join(root, '.version-driver.2.bbbbbb')
+  mkdirSync(join(versionA, 'driver', 'lib'), { recursive: true })
+  mkdirSync(join(versionB, 'driver', 'lib'), { recursive: true })
+  writeFileSync(join(versionA, 'driver', 'lib', 'marker.sh'), 'RELEASE=A\n')
+  writeFileSync(join(versionB, 'driver', 'lib', 'marker.sh'), 'RELEASE=B\n')
+  symlinkSync('.version-driver.1.aaaaaa/driver', join(root, 'driver'))
+
+  const flipAndSource = [
+    'echo "SELF=${IMS_ENTRYPOINT_SELF}"',
+    'echo "LIB=${IMS_SCRIPT_LIB_DIR}"',
+    // THE CONCURRENT PUBLICATION, committed exactly the way driver_publish_tree() commits one: build the
+    // new link under a private name, then one rename over the documented name.
+    `ln -s -- .version-driver.2.bbbbbb/driver ${JSON.stringify(join(root, '.pointer-driver.9.cccccc'))}`,
+    `mv -T ${JSON.stringify(join(root, '.pointer-driver.9.cccccc'))} ${JSON.stringify(join(root, 'driver'))}`,
+    `echo "FLIPPED_TO=$(readlink ${JSON.stringify(join(root, 'driver'))})"`,
+    'source "${IMS_SCRIPT_LIB_DIR}/marker.sh"',
+    'echo "SOURCED=${RELEASE}"',
+  ].join('\n')
+
+  const pinned = join(versionA, 'driver', 'update.sh')
+  writeFileSync(pinned, `set -uo pipefail\n${pinBlock('scripts/update.sh')}\n${flipAndSource}\n`)
+  const out = spawnSync('bash', [join(root, 'driver', 'update.sh')], { encoding: 'utf8' })
+  const stdout = out.stdout ?? ''
+  // PRECONDITIONS, so a pass cannot be a rig in which nothing happened.
+  assert.match(stdout, /^FLIPPED_TO=\.version-driver\.2\.bbbbbb\/driver$/m,
+    `the concurrent publication must really have committed:\n${stdout}${out.stderr}`)
+  assert.match(stdout, new RegExp(`^SELF=${versionA}/driver/update\\.sh$`, 'm'),
+    `the pin must name the inode being executed, not the pointer:\n${stdout}${out.stderr}`)
+  assert.match(stdout, new RegExp(`^LIB=${versionA}/driver/lib$`, 'm'), stdout)
+  // AND THE ASSERTION THE OLD FORM FAILED.
+  assert.match(stdout, /^SOURCED=A$/m,
+    `a pinned run must source the release it was launched from, not the one published under it:\n${stdout}${out.stderr}`)
+
+  // AND THE FALLBACK BRANCH IS PINNED TOO, which is the half a rig can forget: `readlink` is refused so
+  // the /proc form cannot answer, and `cd -P … && pwd -P` has to resolve the pointer once, at entry.
+  rmSync(join(root, 'driver'))
+  symlinkSync('.version-driver.1.aaaaaa/driver', join(root, 'driver'))
+  const fallback = join(versionA, 'driver', 'update.sh')
+  writeFileSync(fallback, [
+    'set -uo pipefail',
+    // The shadow is what makes this the fallback branch rather than a second run of the same one.
+    'readlink() { return 1; }',
+    pinBlock('scripts/update.sh'),
+    flipAndSource,
+  ].join('\n') + '\n')
+  const viaPwd = spawnSync('bash', [join(root, 'driver', 'update.sh')], { encoding: 'utf8' })
+  assert.match(viaPwd.stdout ?? '', new RegExp(`^LIB=${versionA}/driver/lib$`, 'm'),
+    `the fallback must resolve the pointer once, physically:\n${viaPwd.stdout}${viaPwd.stderr}`)
+  assert.match(viaPwd.stdout ?? '', /^SOURCED=A$/m,
+    `and a flip under it must not change which release is sourced:\n${viaPwd.stdout}${viaPwd.stderr}`)
+
+  // NOT VACUOUS: the retired form, in the same rig, takes the other release's library. This is the
+  // finding reproduced — if this half stopped failing, the rig above would be measuring nothing.
+  rmSync(join(root, 'driver'))
+  symlinkSync('.version-driver.1.aaaaaa/driver', join(root, 'driver'))
+  const retired = join(versionA, 'driver', 'legacy.sh')
+  writeFileSync(retired, [
+    'set -uo pipefail',
+    // The retired form set no such variable, so the shared program body is given an empty one rather
+    // than being allowed to die on `set -u` — which would make this control pass for the wrong reason.
+    'IMS_ENTRYPOINT_SELF=""',
+    'IMS_SCRIPT_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib"',
+    flipAndSource,
+  ].join('\n') + '\n')
+  const before = spawnSync('bash', [join(root, 'driver', 'legacy.sh')], { encoding: 'utf8' })
+  assert.match(before.stdout ?? '', /^SOURCED=B$/m,
+    `the rig must be able to see the defect: the logical form must reach the other release:\n${before.stdout}${before.stderr}`)
+})
+
+test('[o3d-z5be] a superseded publication something is still reading out of is NOT swept, and is once nothing is', (t) => {
+  // THE INTERACTION THE PIN MAKES LOAD-BEARING. A pinned run reads its libraries out of ONE versioned
+  // directory for its whole life, and the shell that PUBLISHED that directory exited releases ago — so
+  // the sweep's two original questions ("is a pointer naming it?", "is its publisher alive?") both
+  // answer "reapable" the moment a newer publication takes the pointer, while a run is still sourcing
+  // out of it. r3's answer was bash's open descriptor, which covers the bytes already read and not the
+  // next `source`.
+  const dirs = scratch(t, ['chown-tree.mjs'])
+  writeFileSync(join(dirs.src, 'chown-tree.mjs'), '// release 0\n')
+  const first = run(dirs, 'publish_privileged_helper_set; echo "RC=$?"')
+  assert.match(first.stdout, /^RC=0$/m, `${first.stdout}${first.stderr}`)
+  const superseded = standingVersionDir(dirs.root, 'helpers')
+  writeFileSync(join(dirs.src, 'chown-tree.mjs'), '// release 1\n')
+  const second = run(dirs, 'publish_privileged_helper_set; echo "RC=$?"')
+  assert.match(second.stdout, /^RC=0$/m, `${second.stdout}${second.stderr}`)
+  const standing = standingVersionDir(dirs.root, 'helpers')
+  // PRECONDITIONS: two distinct publications, the first superseded and its publisher gone.
+  assert.notEqual(superseded, standing, 'the second publication must be its own directory')
+  assert.ok(existsSync(superseded), 'and the first must still be there for the sweep to decide about')
+  const publisher = Number(/\.version-helpers\.([0-9]+)\./.exec(superseded)![1])
+  assert.equal(spawnSync('kill', ['-0', String(publisher)]).status !== 0, true,
+    `the publisher of the superseded directory must be gone, or this test measures the liveness rule instead (pid ${publisher})`)
+
+  // THE SWEEP, RUN FOR REAL, WITH A DESCRIPTOR OPEN ON A FILE INSIDE THE SUPERSEDED DIRECTORY — which is
+  // exactly what bash holds on the script it is executing, and what a pinned run holds on a library it
+  // has not sourced yet.
+  const held = run(dirs, [
+    `exec 9< ${JSON.stringify(join(superseded, 'helpers', 'chown-tree.mjs'))}`,
+    'driver_sweep_orphans /nonexistent; echo "SWEEP1=$?"',
+    `echo "WHILE_HELD=$( [[ -d ${JSON.stringify(superseded)} ]] && echo kept || echo gone )"`,
+    'exec 9<&-',
+    'driver_sweep_orphans /nonexistent; echo "SWEEP2=$?"',
+    `echo "ONCE_RELEASED=$( [[ -d ${JSON.stringify(superseded)} ]] && echo kept || echo gone )"`,
+    `echo "STANDING=$( [[ -d ${JSON.stringify(standing)} ]] && echo kept || echo gone )"`,
+  ].join('\n'))
+  assert.match(held.stdout, /^SWEEP1=0$/m, `${held.stdout}${held.stderr}`)
+  assert.match(held.stdout, /^WHILE_HELD=kept$/m,
+    `a versioned directory a process is reading out of must not be swept:\n${held.stdout}${held.stderr}`)
+  // AND THE OTHER HALF, which is what proves the first is not a sweep that never deletes anything.
+  assert.match(held.stdout, /^ONCE_RELEASED=gone$/m,
+    `and it must be swept once nothing is reading it:\n${held.stdout}${held.stderr}`)
+  assert.match(held.stdout, /^STANDING=kept$/m, 'and the standing publication is never swept')
+})
+
+test('[o3d-z5be] a migration killed before it committed is RESTORED by the sweep, and reaped once the name is back', (t) => {
+  // THE RESIDUAL r3 LEFT (Codex MEDIUM 1). `mv -T ${target} ${retire_dir}` and the pointer flip are two
+  // operations; a kill between them leaves the documented name ABSENT and the only copy on the box under
+  // a `.retired-` name, which the sweep then deleted because its publisher was gone.
+  const dirs = scratch(t, ['chown-tree.mjs'])
+  // A pid that is certainly not running: this shell has already exited.
+  const deadPid = execFileSync('bash', ['-c', 'echo $$'], { encoding: 'utf8' }).trim()
+  assert.match(deadPid, /^[1-9][0-9]*$/)
+  const retired = join(dirs.root, `.retired-helpers.${deadPid}.aaaaaa`)
+  mkdirSync(retired, { recursive: true })
+  writeFileSync(join(retired, 'chown-tree.mjs'), '// THE ONLY COPY ON THE BOX\n')
+  assert.equal(existsSync(join(dirs.root, 'helpers')), false, 'precondition: the documented name is absent')
+
+  const restored = run(dirs, [
+    'driver_sweep_orphans /nonexistent; echo "RC=$?"',
+    `echo "RESTORED=$( [[ -d ${JSON.stringify(join(dirs.root, 'helpers'))} ]] && echo yes || echo no )"`,
+    `echo "RESIDUE=$( [[ -e ${JSON.stringify(retired)} ]] && echo yes || echo no )"`,
+  ].join('\n'))
+  assert.match(restored.stdout, /^RC=0$/m, `${restored.stdout}${restored.stderr}`)
+  assert.match(restored.stdout, /^RESTORED=yes$/m,
+    `the only copy on the box must be put back, not reaped:\n${restored.stdout}${restored.stderr}`)
+  assert.match(restored.stdout, /^RESIDUE=no$/m, 'and it must not be left under both names')
+  assert.equal(readFileSync(join(dirs.root, 'helpers', 'chown-tree.mjs'), 'utf8'), '// THE ONLY COPY ON THE BOX\n')
+
+  // AND IT ONLY EVER FILLS A HOLE. With the documented name occupied, the same residue is reaped and the
+  // standing publication is untouched — a restore that could displace a committed publication would be
+  // a worse bug than the one it fixes.
+  rmSync(join(dirs.root, 'helpers'), { recursive: true, force: true })
+  const published = run(dirs, 'publish_privileged_helper_set; echo "RC=$?"')
+  assert.match(published.stdout, /^RC=0$/m, `${published.stdout}${published.stderr}`)
+  const standingLink = readlinkSync(join(dirs.root, 'helpers'))
+  mkdirSync(retired, { recursive: true })
+  writeFileSync(join(retired, 'chown-tree.mjs'), '// A SUPERSEDED LEGACY TREE\n')
+  const reaped = run(dirs, [
+    'driver_sweep_orphans /nonexistent; echo "RC=$?"',
+    `echo "RESIDUE=$( [[ -e ${JSON.stringify(retired)} ]] && echo yes || echo no )"`,
+  ].join('\n'))
+  assert.match(reaped.stdout, /^RESIDUE=no$/m, `${reaped.stdout}${reaped.stderr}`)
+  assert.equal(readlinkSync(join(dirs.root, 'helpers')), standingLink,
+    'and the publication that is standing must be exactly the one that was standing before the sweep')
+})
+
+// ---------------------------------------------------------------------------
+// 3g. THE SNAPSHOT BLESSES THE BYTES IT TOOK, SO IT HAS TO PROVE THEY HELD STILL
+//     (o3d-kyqa r4, Codex HIGH 2)
+//
+// THE FINDING, AND IT DEFEATS THE ISSUE THIS BRANCH EXISTS FOR. driver_fill_helper_set() copied
+// ${IMS_SCRIPT_LIB_DIR} and driver_publish_tree() then digested WHAT HAD BEEN COPIED. On the
+// supported checkout invocation that directory belongs to ${APP_USER}, so that account could
+// rewrite chown-tree.mjs or pg-auth-request.mjs after root started and before or during the copy:
+// the recorded digest described the substituted bytes, privileged_helper_path() compared them
+// against themselves, and root executed them. A digest of what you took is not evidence about what
+// you should have taken.
+// ---------------------------------------------------------------------------
+
+test('[o3d-kyqa] a source rewritten IN PLACE while it is being copied publishes NOTHING', (t) => {
+  // THE INTERLEAVING IS DRIVEN THROUGH `cat`, which is the command the shipped copy reads with, so the
+  // rewrite lands inside the real copy loop without this harness reimplementing any of it. THREE SHAPES,
+  // and the third is the one that decides whether the staged tree has to be compared with the source at
+  // all — the two digests of the source agree in that case, and only the copy disagrees:
+  //
+  //   * rewritten BEFORE it is copied and left that way  → the digest after the copy != the one before;
+  //   * rewritten AFTER it has been copied               → likewise;
+  //   * rewritten before it is copied and PUT BACK after → both digests of the source agree, and the
+  //                                                        STAGED TREE holds the attacker's bytes.
+  const original = '// pg-auth-request.mjs\nprocess.exit(0)\n'
+  for (const shape of [
+    {
+      what: 'a file the copy has not reached yet',
+      victim: 'pg-auth-request.mjs', restore: false,
+      reason: /DID NOT HOLD STILL/,
+    },
+    {
+      what: 'a file the copy has already read',
+      victim: 'chown-tree.mjs', restore: false,
+      reason: /DID NOT HOLD STILL/,
+    },
+    {
+      what: 'a file rewritten for the copy and put back before the second digest',
+      victim: 'pg-auth-request.mjs', restore: true,
+      reason: /was assembled from a source that hashed to/,
+    },
+  ] as const) {
+    const dirs = scratch(t)
+    assert.equal(readFileSync(join(dirs.src, 'pg-auth-request.mjs'), 'utf8'), original,
+      'precondition: the scratch source is the tree this case restores to')
+    const attacker = `// ${shape.what}\nprocess.exit(1)\n`
+    const out = run(dirs, [
+      'calls=0',
+      'cat() {',
+      '  calls=$(( calls + 1 ))',
+      '  command cat "$@"',
+      '  if (( calls == 1 )); then',
+      `    printf ${JSON.stringify(attacker)} > ${JSON.stringify(join(dirs.src, shape.victim))}`,
+      '  fi',
+      ...(shape.restore
+        ? [`  if (( calls == 2 )); then printf ${JSON.stringify(original)} > ${JSON.stringify(join(dirs.src, shape.victim))}; fi`]
+        : []),
+      '}',
+      PUBLISH_THEN_RESOLVE,
+      'echo "CALLS=${calls}"',
+    ].join('\n'))
+    // PRECONDITIONS: the copy loop was reached for BOTH helpers, and the source really was rewritten
+    // under root's copy — and, in the third case, really was put back.
+    assert.match(out.stdout, /^CALLS=2$/m, `${shape.what}: the copy must have read both helpers:\n${out.stdout}${out.stderr}`)
+    assert.equal(readFileSync(join(dirs.src, shape.victim), 'utf8'), shape.restore ? original : attacker,
+      `${shape.what}: the harness must have left the source in the state this case is about`)
+    // AND NOTHING IS PUBLISHED, which is the property: no digest in the run, no tree at the destination.
+    assertPublishedNothing(out, dirs.root, shape.what)
+    assert.match(out.stdout, /^RESOLVE_RC=1$/m, `${shape.what}: ${out.stdout}${out.stderr}`)
+    assert.match(out.stderr, shape.reason, `${shape.what}: ${out.stderr}`)
+  }
+
+  // NOT VACUOUS: the same publication, the same shadowed `cat`, nothing rewritten.
+  const clean = scratch(t)
+  const ok = run(clean, [
+    'calls=0',
+    'cat() { calls=$(( calls + 1 )); command cat "$@"; }',
+    PUBLISH_THEN_RESOLVE,
+    'echo "CALLS=${calls}"',
+  ].join('\n'))
+  assert.match(ok.stdout, /^CALLS=2$/m, `the shadow must have been reached:\n${ok.stdout}${ok.stderr}`)
+  assert.match(ok.stdout, /^PUBLISH_RC=0$/m, `${ok.stdout}${ok.stderr}`)
+  assert.match(ok.stdout, /^DIGEST=[0-9a-f]{64}$/m, ok.stdout)
+  assert.match(ok.stdout, /^RESOLVE_RC=0$/m, ok.stdout)
+})
+
+test('[o3d-kyqa] a filler that does not say what its source held publishes NOTHING — the check cannot be skipped', (t) => {
+  // THE SHAPE OF THE PRE-r4 FILLER, RUN AGAINST THE SHIPPED PUBLICATION. This is the mutation, expressed
+  // as a test: `driver_fill_helper_set() { driver_copy_regular_files "${IMS_SCRIPT_LIB_DIR}" "$1"; }` is
+  // exactly what stood here before this round, and it establishes nothing about the source it copied. If
+  // the comparison in driver_publish_tree() were written `[[ -n "${expectation}" ]] && …`, deleting one
+  // line from a filler would turn it off silently; it is unconditional, so this refuses.
+  const dirs = scratch(t)
+  const out = run(dirs, [
+    'driver_fill_helper_set() { driver_copy_regular_files "${IMS_SCRIPT_LIB_DIR}" "$1"; }',
+    PUBLISH_THEN_RESOLVE,
+  ].join('\n'))
+  assertPublishedNothing(out, dirs.root, 'a filler that records no source digest')
+  assert.match(out.stderr, /nothing recorded which bytes the privileged helper set was assembled FROM/,
+    out.stderr)
+})
+
+test('[o3d-z5be] the driver source is held to the same content test, which the ident answer cannot make', (t) => {
+  // A REWRITE IN PLACE CHANGES NO PATH, NO OWNER, NO MODE, NO DEVICE AND NO INODE, so driver_source_trust()
+  // and driver_source_ident() — the two answers r2 added — both pass over it. Only content can see it.
+  const { root, scripts, dirs } = scratchRelease(t, 'privileged-driver-content-')
+  const out = run(dirs, [
+    'rewrote=0',
+    'cat() {',
+    '  command cat "$@"',
+    '  if (( rewrote == 0 )); then',
+    '    rewrote=1',
+    `    printf '# REWRITTEN UNDER THE COPY\\n' > ${JSON.stringify(join(scripts, 'update.sh'))}`,
+    '  fi',
+    '}',
+    `publish_privileged_driver ${JSON.stringify(scripts)}; echo "RC=$?"`,
+    'echo "REWROTE=${rewrote}"',
+    'echo "DIGEST=${IMS_DRIVER_PUBLISHED_DIGEST}"',
+  ].join('\n'))
+  assert.match(out.stdout, /^REWROTE=1$/m, `the harness must have rewritten the source:\n${out.stdout}${out.stderr}`)
+  assert.doesNotMatch(out.stdout, /^RC=0$/m, `${out.stdout}${out.stderr}`)
+  assert.match(out.stdout, /^DIGEST=$/m, 'no digest may be reported for bytes that moved under the copy')
+  assert.equal(existsSync(join(root, 'driver')), false, 'and nothing may be published')
+  assert.match(out.stderr, /DID NOT HOLD STILL|was assembled from a source that hashed to/, out.stderr)
+})
+
+// ---------------------------------------------------------------------------
+// 3h. TWO PUBLISHERS OVER A LEGACY DIRECTORY, AND A COMMIT THAT CANNOT BE MADE DURABLE
+//     (o3d-z5be r4, Codex MEDIUM 1 and MEDIUM 2)
+// ---------------------------------------------------------------------------
+
+test('[o3d-z5be] a publisher that finds the legacy name already replaced puts back what it moved and publishes NOTHING', (t) => {
+  // THE FINDING (Codex MEDIUM 1). "Is the documented name a real directory?" and `mv -T` are two
+  // operations. Two publishers can both see the legacy directory; if the first COMMITS ITS POINTER in
+  // between, the second's `mv -T` carries that fresh symbolic link off to a retirement name — which
+  // reopens the absent-name interval the pointer scheme exists to remove, and leaves the documented name
+  // missing altogether if the second run is killed before its own flip.
+  //
+  // THE COMPETITOR IS DRIVEN AT THE SHIPPED SEAM: `mv` is the command the migration moves with, so a
+  // shadow puts the other publisher exactly in the window and nothing here re-implements the migration.
+  const dirs = scratch(t, ['chown-tree.mjs'])
+  const legacy = join(dirs.root, 'helpers')
+  mkdirSync(legacy, { recursive: true })
+  writeFileSync(join(legacy, 'chown-tree.mjs'), '// THE LEGACY TREE\n')
+  // THE RIVAL'S VERSIONED DIRECTORY IS NAMED FOR A LIVE SHELL — this program's own. A directory named
+  // for a dead publisher that no pointer names yet is exactly what the sweep at the top of every
+  // publication reaps, so a rival built beforehand would be gone before the race could happen: the
+  // first version of this test measured that instead of the migration.
+  const out = run(dirs, [
+    'rival=".version-helpers.$$.rrrrrr"',
+    'command mkdir -p "${IMS_DRIVER_ROOT}/${rival}/helpers"',
+    'printf "// THE RIVAL PUBLICATION\\n" > "${IMS_DRIVER_ROOT}/${rival}/helpers/chown-tree.mjs"',
+    'raced=0',
+    'mv() {',
+    '  if [[ "$1" == "-T" ]] && [[ "$2" == "${IMS_DRIVER_HELPER_DIR}" ]] && (( raced == 0 )); then',
+    '    raced=1',
+    // The competitor commits: the legacy directory goes to its own retirement name and one rename puts
+    // its pointer at the documented name — which is what driver_publish_tree() itself does.
+    `    command mv -T ${JSON.stringify(legacy)} "\${IMS_DRIVER_ROOT}/.retired-helpers.$$.rrrrrr"`,
+    '    command ln -s -- "${rival}/helpers" "${IMS_DRIVER_ROOT}/.pointer-helpers.$$.rrrrrr"',
+    `    command mv -T "\${IMS_DRIVER_ROOT}/.pointer-helpers.$$.rrrrrr" ${JSON.stringify(legacy)}`,
+    '  fi',
+    '  command mv "$@"',
+    '}',
+    'publish_privileged_helper_set; echo "PUBLISH_RC=$?"',
+    'echo "RACED=${raced}"',
+    'echo "DIGEST=${IMS_DRIVER_HELPER_SHA256}"',
+  ].join('\n'))
+
+  // PRECONDITION: the competitor really did commit inside the window.
+  assert.match(out.stdout, /^RACED=1$/m, `${out.stdout}${out.stderr}`)
+  // AND THE RIVAL'S PUBLICATION IS THE ONE STANDING, whole and at the documented name.
+  assert.equal(lstatSync(legacy).isSymbolicLink(), true,
+    `the rival's pointer must still be at the documented name, not in a retirement directory:\n${out.stdout}${out.stderr}`)
+  assert.match(readlinkSync(legacy), /^\.version-helpers\.[1-9][0-9]*\.rrrrrr\/helpers$/,
+    `and it must name the rival's own versioned publication: ${readlinkSync(legacy)}`)
+  assert.equal(readFileSync(join(legacy, 'chown-tree.mjs'), 'utf8'), '// THE RIVAL PUBLICATION\n')
+  // AND THIS RUN REPORTS NOTHING, because it published nothing.
+  assert.match(out.stdout, /^DIGEST=$/m, out.stdout)
+  assert.match(out.stderr, /was replaced between the instant this run inspected it/, out.stderr)
+
+  // NOT VACUOUS: the same legacy shape with no competitor migrates once and publishes.
+  const alone = scratch(t, ['chown-tree.mjs'])
+  mkdirSync(join(alone.root, 'helpers'), { recursive: true })
+  writeFileSync(join(alone.root, 'helpers', 'chown-tree.mjs'), '// THE LEGACY TREE\n')
+  const migrated = run(alone, 'publish_privileged_helper_set; echo "RC=$?"')
+  assert.match(migrated.stdout, /^RC=0$/m, `${migrated.stdout}${migrated.stderr}`)
+  assert.equal(lstatSync(join(alone.root, 'helpers')).isSymbolicLink(), true,
+    'a legacy directory with nobody racing must be migrated to a pointer')
+})
+
+test('[o3d-z5be] a commit that could not be made durable is reported as a refusal, and the reason says the tree IS standing', (t) => {
+  // THE FINDING (Codex MEDIUM 2). The directory sync after the pointer rename was `|| true`, so a failed
+  // flush still returned a digest and the caller announced a publication that a crash could undo.
+  //
+  // THE INJECTION IS AT THE SHIPPED SEAM: _fence_fsync_path() runs `sync "$target"` and then a bare
+  // `sync`, so a shadow that fails BOTH on the SECOND call naming the publication root fails exactly the
+  // flush that follows the flip — the first such call is the one after the versioned directory's rename,
+  // and it must still succeed or the publication would be refused before it commits anything.
+  const dirs = scratch(t, ['chown-tree.mjs'])
+  writeFileSync(join(dirs.src, 'chown-tree.mjs'), '// THE PUBLICATION THAT LANDS\n')
+  const out = run(dirs, [
+    'rootsyncs=0',
+    'failing=0',
+    'sync() {',
+    '  if (( $# > 0 )) && [[ "$1" == "${IMS_DRIVER_ROOT}" ]]; then',
+    '    rootsyncs=$(( rootsyncs + 1 ))',
+    '    if (( rootsyncs == 2 )); then failing=1; return 1; fi',
+    '  elif (( failing == 1 )); then',
+    '    failing=0',
+    '    return 1',
+    '  fi',
+    '  command sync "$@"',
+    '}',
+    'publish_privileged_helper_set; echo "PUBLISH_RC=$?"',
+    'echo "ROOTSYNCS=${rootsyncs}"',
+    'echo "DIGEST=${IMS_DRIVER_HELPER_SHA256}"',
+  ].join('\n'))
+
+  // PRECONDITION: the flush after the flip was reached and refused, and only that one.
+  assert.match(out.stdout, /^ROOTSYNCS=2$/m,
+    `the flush after the pointer flip must have been reached:\n${out.stdout}${out.stderr}`)
+  // NOTHING IS REPORTED AS PUBLISHED: this is what "reported as success" meant, and it is what changed.
+  assert.match(out.stdout, /^DIGEST=$/m, `no digest may be announced for a commit that is not durable:\n${out.stdout}`)
+  // AND THE SENTENCE IS TRUE ABOUT THE HOST. The flip is NOT rolled back — undoing a committed pointer
+  // over a disk fault would replace a good publication with an older one — so the message has to say so,
+  // and the state has to match it.
+  assert.match(out.stderr, /IS STANDING at .*helpers/, out.stderr)
+  assert.match(out.stderr, /THE COMMIT IS NOT DURABLE/, out.stderr)
+  assert.equal(lstatSync(join(dirs.root, 'helpers')).isSymbolicLink(), true)
+  assert.equal(readFileSync(join(dirs.root, 'helpers', 'chown-tree.mjs'), 'utf8'), '// THE PUBLICATION THAT LANDS\n',
+    'the tree the message says is standing must be the tree that is standing')
+
+  // NOT VACUOUS: the same publication with the flush working reports the digest.
+  const clean = scratch(t, ['chown-tree.mjs'])
+  const ok = run(clean, [
+    'publish_privileged_helper_set; echo "RC=$?"',
+    'echo "DIGEST=${IMS_DRIVER_HELPER_SHA256}"',
+  ].join('\n'))
+  assert.match(ok.stdout, /^RC=0$/m, `${ok.stdout}${ok.stderr}`)
+  assert.match(ok.stdout, /^DIGEST=[0-9a-f]{64}$/m, ok.stdout)
+})

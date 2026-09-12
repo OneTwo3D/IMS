@@ -637,7 +637,44 @@ DB_FENCE_SCRIPT="${APP_DIR_REAL}/scripts/fence-db-connections.mjs"
 # SOURCED FROM THIS SCRIPT'S OWN DIRECTORY. It is read at startup, out of the same tree and in the
 # same instant as the body of this file, so it adds no window this entrypoint does not already
 # have — unlike the helper, which is executed several phases later.
-IMS_SCRIPT_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib"
+# WHERE THAT DIRECTORY IS, RESOLVED ONCE AND PINNED FOR THE WHOLE RUN (o3d-z5be r4, Codex HIGH 1).
+#
+# ${IMS_DRIVER_PROGRAM_DIR}, which is the documented way to run this script, IS A SYMBOLIC LINK, and a
+# publication flips it with one `rename(2)`. That makes every RESOLUTION of it atomic and says nothing
+# at all about a reader that resolves it MANY TIMES — which is what this script is: bash opens the
+# entrypoint through the link, and every `source` below would then traverse the link AGAIN. A publisher
+# that flips it in between (install.sh from another release; two privileged runs can overlap, the shared
+# cutover lock is taken later than this) would have root execute THIS release's script with ANOTHER
+# release's libraries. r3 argued that one atomic rename made a mixture impossible, and that argument was
+# about the commit rather than about the reader.
+#
+# SO THE PIN COMES OFF THE DESCRIPTOR BASH IS ALREADY READING THIS FILE FROM. /proc/<pid>/fd/255 is that
+# descriptor and `readlink` gives the PHYSICAL path of the inode being executed — the versioned
+# publication directory, never the pointer. There is no window in it: it is not a second resolution of a
+# name that could have moved, it is the object whose bytes are running. `cd -P … && pwd -P` is the
+# fallback for a host whose /proc cannot answer, and it is still a pin: one resolution, at entry, before
+# anything is sourced. `-P` is the whole difference — plain `pwd` prints the LOGICAL path, symbolic link
+# and all, which is how the previous form re-traversed the pointer on every `source`. The basename is
+# compared so a shell that does not keep this script on descriptor 255 takes the fallback instead of
+# pinning to whatever else is there.
+#
+# AND WHY DESCRIPTOR 255 IS THIS SCRIPT'S, since that is the first thing to ask of a pin taken off a
+# number. It is the descriptor bash opens the script on and it is CLOSE-ON-EXEC, so no child inherits
+# it and no nested shell can be holding somebody else's file there; `sudo` closes inherited descriptors
+# above stderr, so it is not reachable from the caller on the documented invocation either. What is left
+# is a root shell that deliberately opened another file on 255 before running this one, which is root
+# arranging its own substitution and not a boundary this file can defend. The basename comparison and
+# the fallback are what cover every shape where the descriptor is not what this expects.
+#
+# THIS IS THE SAME TEXT IN ALL THREE ENTRYPOINTS, and a test asserts that byte for byte. It cannot live
+# in a library: the libraries are what has to be read THROUGH it.
+IMS_ENTRYPOINT_SELF="$(readlink -- "/proc/$$/fd/255" 2>/dev/null || true)"
+if [[ "${IMS_ENTRYPOINT_SELF}" != /* ]] \
+  || [[ "${IMS_ENTRYPOINT_SELF##*/}" != "$(basename -- "${BASH_SOURCE[0]}")" ]] \
+  || [[ ! -f "${IMS_ENTRYPOINT_SELF}" ]]; then
+  IMS_ENTRYPOINT_SELF="$(cd -P "$(dirname -- "${BASH_SOURCE[0]}")" 2>/dev/null && pwd -P)/$(basename -- "${BASH_SOURCE[0]}")"
+fi
+IMS_SCRIPT_LIB_DIR="$(dirname -- "${IMS_ENTRYPOINT_SELF}")/lib"
 # shellcheck source=lib/db-fence-protected.sh
 source "${IMS_SCRIPT_LIB_DIR}/db-fence-protected.sh" || {
   echo "FATAL: ${IMS_SCRIPT_LIB_DIR}/db-fence-protected.sh could not be sourced. It decides which bytes the connection fence may be executed with, and without it this run cannot fence a migration window. Nothing has been changed." >&2
@@ -680,7 +717,7 @@ source "${IMS_SCRIPT_LIB_DIR}/privileged-helpers.sh" || {
 # privileged, so it has nothing to refuse); a privileged run that could NOT publish stops here,
 # before it has changed anything at all.
 publish_privileged_helper_set || {
-  echo "FATAL: the root-owned copy of ${IMS_SCRIPT_LIB_DIR} could not be published to ${IMS_DRIVER_HELPER_DIR}: ${IMS_DRIVER_REASON:-no reason was recorded}. Every node helper this run would otherwise execute as root would have to be read back out of a directory the service account owns, minutes from now; it will not do that. Nothing has been changed." >&2
+  echo "FATAL: the root-owned copy of ${IMS_SCRIPT_LIB_DIR} could not be published to ${IMS_DRIVER_HELPER_DIR}: ${IMS_DRIVER_REASON:-no reason was recorded}. Every node helper this run would otherwise execute as root would have to be read back out of a directory the service account owns, minutes from now; it will not do that. Nothing else on this host has been changed — and where the reason above says a publication IS STANDING but could not be made durable (o3d-z5be r4), that publication is a complete, sealed, digested tree and the only thing missing is the flush to disk." >&2
   exit 1
 }
 # The lock lives inside the service's systemd StateDirectory, which is the same directory this

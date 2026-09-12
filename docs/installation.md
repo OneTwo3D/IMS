@@ -3033,19 +3033,45 @@ and a drain, out of a directory the run has itself handed to the service account
 
 **`helpers` and `driver` are symbolic links, and that is what makes a publication atomic.** Each is the
 single mutable object of its publication: a run assembles a whole new `.version-…` directory — the tree,
-its digest record and its manifest together — and then replaces one link with a single `rename(2)`. At
-every instant, from every other process, the documented name resolves to exactly one **complete**,
-sealed, digested, vouched-for publication; there is no interval in which it resolves to nothing, to half
-a tree, or to two trees at once, and no lock is involved. The record lives *beside* the tree rather than
+its digest record and its manifest together — and then replaces one link with a single `rename(2)`.
+Every **resolution** of the documented name, at every instant and from every process, yields exactly one
+**complete**, sealed, digested, vouched-for publication; there is no instant at which it resolves to
+nothing, to half a tree, or to two trees at once, and no lock is involved.
+
+**An atomic publication is not an atomic consumption, and the reader is pinned separately** (o3d-z5be
+r4). The sentence above is about the commit. A reader that resolves the pointer *many times* is not
+pinned by it: `sudo bash /etc/ims-cutover-driver/driver/update.sh` resolves the name once for the
+entrypoint and again for each of the five libraries it sources, so a publication that landed in between
+would have root execute one release's script with another release's libraries. Each entrypoint therefore
+resolves the pointer **once, at entry**, off the descriptor bash is already reading it from
+(`readlink /proc/$$/fd/255`, which is the physical path of the inode being executed; `cd -P … && pwd -P`
+where `/proc` cannot answer), and every `source` below that reads the versioned directory the script
+itself came out of. The same text stands in all three entrypoints, and a test asserts it byte for
+byte.
+
+The record lives *beside* the tree rather than
 inside it (a record inside the tree would be part of its own digest) and *inside* the versioned directory
 rather than at a fixed path (a record at a fixed path would be a second mutable object, and two objects
 cannot be updated together without a lock). `/etc/ims-cutover-driver/driver/../driver.sha256` is
 therefore always the record of the driver that is standing: the kernel resolves `..` from the directory
 the link landed in.
 
-Superseded `.version-…` directories are left standing and removed by a later run's sweep, once no
-pointer names them and the shell that published them is gone — so a run already executing out of one
-keeps its bytes. The same sweep collects `.publish-…` staging trees abandoned by a killed run.
+Superseded `.version-…` directories are left standing and removed by a later run's sweep, once **three**
+questions all answer "reapable": no pointer names it, the shell that published it is gone, and **no
+process on the box holds an open file, a current directory or an executable under it** (o3d-z5be r4).
+The third is what the pin above makes necessary: a run reads its libraries out of one versioned
+directory for its whole life, and the shell that *published* that directory exited releases ago, so the
+first two questions both say "reapable" for a directory a running update is still sourcing out of. It is
+asked of `/proc` rather than of a marker this scheme writes, because the reader to protect may be an
+`update.sh` from an **older release** that would never write the marker — the same reason a publication
+lock would not help. A sweep that cannot ask the question deletes nothing. What remains is a
+check-then-delete window that no sweep can close without a protocol every publisher implements; its
+worst case is bounded and is **not** a substitution — only root can write anything here, and a swept
+name carries the publishing shell's pid and a `mktemp` suffix so nothing can take it back — so losing
+that race gives a `source` or a `node` that fails loudly, never one that succeeds on somebody else's
+bytes. The same sweep collects `.publish-…` staging trees abandoned by a killed run, and **restores**
+rather than reaps a `.retired-…` object left by a migration that was killed before it committed its
+pointer: the documented name is absent in exactly that case, so it is the only copy there is.
 
 What this replaced, and why: until o3d-z5be r3 a publication moved the standing tree aside and then
 renamed its own into place. Between those two steps the documented name did not exist, so a second
@@ -3053,6 +3079,23 @@ privileged run could take it — and `mv src dst` where `dst` is an existing **d
 *inside* `dst` and reports success, so the loser left its tree nested at `driver/staged`, recorded its
 own digest, and announced a publication while `sudo bash /etc/ims-cutover-driver/driver/update.sh` ran
 the winner's files. A rename over a symbolic link cannot nest and cannot half-happen.
+
+**The one legacy migration checks what it moved** (o3d-z5be r4). An installation whose `helpers` or
+`driver` is still a **real directory**, from a release older than the pointer scheme, has that
+directory moved aside once — `rename(2)` will not put a symbolic link over a non-empty directory. The
+type test and the move are two operations, so a second publisher can commit *its* pointer at that name
+in between and the move would carry that fresh link off, reopening the absent-name interval the scheme
+exists to remove. The object is therefore identified by `lstat` before the move and the object at the
+retirement name is compared with it after: anything but the directory it found is **put straight back**
+and the run publishes nothing. And a `.retired-…` object whose run never came back is **restored** by a
+later sweep rather than reaped, because the documented name is absent in exactly that case.
+
+**A publication that cannot be made durable is reported as a refusal, not as a success** (o3d-z5be r4).
+The directory sync after the pointer flip used to be discarded (`|| true`), so a failed flush still
+returned a digest and the caller announced a publication that a crash could undo. The flip is **not**
+rolled back — it names a complete, sealed tree, and undoing it over a disk fault would replace a good
+publication with an older one — but no digest is reported, the run stops or warns, and the message says
+plainly that the tree **is standing** and that the commit is not durable.
 
 Inside `helpers/` and `driver/` every file is mode `0644` and every directory `0755`, and everything
 in the whole root is owned by `root` — `imsapp` can read it and change none of it. `deploy-meta` is
@@ -3082,6 +3125,26 @@ sealed (root-owned, no group or other write, regular files and directories only 
 refused, because the manifest hashes regular files and `node` follows links), digested with the same
 recipe the fence artefact uses, and the digest is recorded twice: on disk beside the tree, and **in
 the running shell as a `readonly` variable**.
+
+**And the copy is evidence about its source rather than about itself** (o3d-kyqa r4). The snapshot used
+to digest *what it had copied*, which certifies whatever the copy picked up: on the supported checkout
+invocation — `sudo bash APP_DIR/scripts/update.sh`, the unprotected-but-supported form — `imsapp` owns
+that directory and could rewrite `chown-tree.mjs` after root started and before or during the copy, and
+the recorded digest would then describe the substituted bytes. Three independent reads of the source are
+now compared and all three must agree: its digest **before** the copy, the copy itself, and its digest
+**after** the copy. A rewrite before the copy, during it, after it, or one put back again before the
+second digest each make one of those comparisons disagree, so no racing application account can satisfy
+them — and any disagreement publishes **nothing**. What that does **not** establish is provenance: bytes
+chosen *before* the run started are the window this document has always named, and closing it is what
+`IMS_HELPER_SET_SHA256` (or a source only root can write, which the documented
+`/etc/ims-cutover-driver/driver/update.sh` invocation already is) is for.
+
+| how the run was launched | can `imsapp` write the snapshot's source? | what closes the post-start window |
+| --- | --- | --- |
+| `sudo bash /etc/ims-cutover-driver/driver/update.sh` (documented) | no — the pin resolves to a root-owned versioned directory under `/etc` | the ownership and modes; nothing unprivileged can write those bytes at all |
+| `sudo bash install.sh` from a release tree unpacked as root, group and other write off | no | the same |
+| `sudo bash APP_DIR/scripts/update.sh` (supported, unprotected) | **yes** | the three-read content-stability check above: a rewrite after the run starts is a refusal, not a publication |
+| any of the three, with bytes already replaced **before** the operator typed the command | — | **nothing here.** That is the choice-of-checkout window; `IMS_HELPER_SET_SHA256` is how an operator who wants provenance gets it |
 
 `privileged_helper_path <name>` is the only way anything names a helper it is about to execute. It
 resolves the `helpers` pointer — validating the link text rather than merely following it, so it can
@@ -3203,9 +3266,11 @@ privileged run is launched from. The driver moves when a release lands, which is
 `update.sh`.
 
 On the documented path the refresh **replaces the tree the running `update.sh` was read from**. That
-is safe for a stated reason rather than by luck: bash holds an open descriptor on the script it is
-executing and an unlinked inode stays alive until its last descriptor closes, the five libraries were
-read in full at startup, and nothing below that line reads `IMS_SCRIPT_LIB_DIR` again.
+is safe for three stated reasons rather than by luck: `IMS_SCRIPT_LIB_DIR` is pinned at the top of the
+script to the versioned directory bash is reading it out of, so the flip changes nothing that any
+`source` below it resolves to; the sweep that eventually removes that directory will not remove one a process is still
+reading out of; and nothing below that line reads `IMS_SCRIPT_LIB_DIR` again in any case — the five
+libraries were read in full at startup, and bash holds an open descriptor on the script itself.
 
 **`deploy-meta` — who reads it, when, and as whom.** `update.sh` reads `GIT_REPO_URL`, `GIT_BRANCH`
 and `GIT_DEPLOY_KEY_ENABLED` out of it **as root, at startup**, key by key through
