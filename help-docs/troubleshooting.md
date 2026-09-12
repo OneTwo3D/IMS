@@ -54,6 +54,7 @@ When something goes wrong, three places hold the information you need:
 ### EOL product won't auto-archive
 - The auto-archive job runs daily and archives EOL products only when total stock across all warehouses is zero AND no incoming supply remains.
 - "Incoming supply" includes WMS ASN states `CREATE_PENDING` and `CREATE_IN_FLIGHT` — stuck or dead-lettered ASNs can defer archive indefinitely. Check the WMS ASN list for the product.
+- A **retired** transfer reservation does not defer it. When a retry finds that the WMS stock-sync alignment has already brought units in, the old reservation is closed and its expected quantity is reduced to exactly what it was credited, so it counts as nothing still to come. Such a row stays visible in the transfer's ASN list as a closed `CREATE_PENDING` entry.
 - Manually archive from the product page if needed.
 
 

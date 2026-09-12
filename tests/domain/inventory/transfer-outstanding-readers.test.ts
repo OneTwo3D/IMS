@@ -4,6 +4,17 @@ import { test } from 'node:test'
 import { Prisma } from '@/app/generated/prisma/client'
 import { getProductIncomingStock } from '@/lib/domain/inventory/product-lifecycle-archive'
 import { getStockTransferReport } from '@/lib/domain/inventory/inventory-ledger-reports'
+import {
+  aggregateTransferLineOutstandingQty,
+  readTransferOutstandingTotal,
+  requireOutstandingQty,
+  resolveTransferLineLandedQty,
+  resolveTransferLineOutstandingQty,
+  transferOutstandingTotalEntries,
+  type TransferLineOutstandingQty,
+  type TransferLineResidualQty,
+  type TransferOutstandingTotals,
+} from '@/lib/domain/inventory/transfer-landed-quantity'
 
 // o3d-zzgp. THE FIXTURE THAT MATTERS IS A LINE THE WMS STOCK-SYNC ALIGNMENT LANDED
 // WITHOUT WRITING `qtyReceived`.
@@ -322,3 +333,75 @@ test('o3d-zzgp: the transfer report reports an alignment-landed transfer as rece
   }
   assert.deepEqual(totalsSelectedLineId, [true], 'the totals query must select line ids')
 })
+
+// ---------------------------------------------------------------------------
+// THE COMPILE-LEVEL HALF (o3d-zzgp, Codex round-1 MEDIUM)
+// ---------------------------------------------------------------------------
+//
+// Round 1's brand was unwrapped to `.qtyNumber` on the line after it was built, so
+// putting `Number(line.qty) − Number(line.qtyReceived)` back in place of the call still
+// type-checked and the ONLY guard on the drift was the behavioural cases above — which
+// enumerate today's readers, and a fifth reader turned up the same afternoon.
+//
+// The readers now accumulate through `aggregateTransferLineOutstandingQty` and read out
+// at the point where the response is built, so the subtraction cannot enter the
+// pipeline. The assertions below are the `@ts-expect-error` directives and the type
+// aliases themselves: `npx tsc --noEmit` (step 2 of the merge gate) FAILS with TS2578
+// if any of these stops being an error, i.e. if the aggregate ever starts accepting a
+// plain number again.
+
+test('o3d-zzgp: the outstanding aggregate accepts the branded reading and nothing else', () => {
+  const branded = requireOutstandingQty(
+    new Map([['tl-a', resolveTransferLineOutstandingQty({
+      lineQty: 10,
+      landed: resolveTransferLineLandedQty({
+        transferLineId: 'tl-a',
+        qtyReceived: 0,
+        wmsAsnLines: [{ qtyAccountedViaSnapshot: 6, qtyAccountedViaReceipt: 0 }],
+      }),
+    })]]),
+    'tl-a',
+  )
+
+  // The real reading works, and the total is the one the readers display.
+  const totals = aggregateTransferLineOutstandingQty([['p-1', branded] as const])
+  assert.deepEqual(transferOutstandingTotalEntries(totals), [['p-1', 4]])
+  assert.equal(readTransferOutstandingTotal(totals, 'p-1'), 4)
+  assert.equal(readTransferOutstandingTotal(totals, 'p-absent'), 0)
+
+  // THE DEFECT SHAPE, as a compile error: the old hand-rolled subtraction. The directive
+  // sits on the CALL, because that is where TypeScript reports an argument mismatch.
+  // @ts-expect-error — a plain number is not a TransferLineOutstandingQty (o3d-zzgp r2 MEDIUM)
+  aggregateTransferLineOutstandingQty([['p-1', Math.max(0, 10 - 0)] as const])
+
+  // And an object literal shaped like one cannot stand in for it either: the brand is a
+  // `declare`d unique symbol, so only the module can produce a value of this type.
+  // @ts-expect-error — the brand is unconstructible outside the module (o3d-zzgp r2 MEDIUM)
+  aggregateTransferLineOutstandingQty([['p-1', { transferLineId: 'tl-a', qty: new Prisma.Decimal(4), qtyNumber: 4 }] as const])
+})
+
+test('o3d-zzgp: the aggregate itself cannot be hand-built either', () => {
+  // Otherwise a caller could assemble the TOTALS from numbers and skip the per-line
+  // brand entirely — the same hole one level up.
+  // @ts-expect-error — TransferOutstandingTotals is branded too (o3d-zzgp r2 MEDIUM)
+  const handBuilt: TransferOutstandingTotals<string> = { totals: new Map([['p-1', new Prisma.Decimal(4)]]), lineCounts: new Map([['p-1', 1]]) }
+  assert.ok(handBuilt)
+})
+
+// Statement-level proofs, so the guarantee does not rest on suppression comments inside
+// two calls. Each alias is checked by `tsc --noEmit` whether or not anything reads it.
+type Assert<T extends true> = T
+type NotAssignable<A, B> = [A] extends [B] ? false : true
+
+export type ProofNumberIsNotOutstandingQty = Assert<NotAssignable<
+  number,
+  TransferLineOutstandingQty
+>>
+export type ProofOutstandingQtyIsNotResidualQty = Assert<NotAssignable<
+  TransferLineOutstandingQty,
+  TransferLineResidualQty
+>>
+export type ProofPlainMapIsNotOutstandingTotals = Assert<NotAssignable<
+  { totals: Map<string, Prisma.Decimal>; lineCounts: Map<string, number> },
+  TransferOutstandingTotals<string>
+>>

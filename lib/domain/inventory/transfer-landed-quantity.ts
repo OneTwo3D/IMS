@@ -473,15 +473,42 @@ export function requireTransferLineResidualQty(
  * it: an allocator handed an outstanding quantity would be missing the snapshot cap
  * that round 8 added, which is how the ASN planner came to book uncostable units.
  *
- * WHAT THE BRAND DOES AND DOES NOT BUY. It makes the value unconstructible outside
- * this module, and `sumTransferLineOutstandingQty` / `sumTransferLineLandedQty`
- * accept nothing else — so a reader that wants a total cannot feed a hand-rolled
- * number into one. It cannot stop a future call site writing its own
- * `Number(line.qty) − Number(line.qtyReceived)` and using that number directly;
- * TypeScript has no construct that forbids an expression. The behavioural regression
- * tests in tests/domain/inventory/transfer-outstanding-readers.test.ts are the guard
- * for that, and they are written against a line the WMS stock-sync alignment landed
- * WITHOUT touching `qtyReceived` — the one fixture the old arithmetic gets wrong.
+ * WHAT THE BRAND BUYS, AND WHERE IT STOPS (o3d-zzgp, Codex round-1 MEDIUM).
+ *
+ * Round 1 of this issue made the value unconstructible outside this module and then
+ * had every reader call `.qtyNumber` on the next line. A brand that is unwrapped
+ * immediately prevents nothing: putting `Number(line.qty) − Number(line.qtyReceived)`
+ * back in place of the call still type-checked, so the only guard on the drift was a
+ * set of behavioural tests that enumerate today's readers — and a fifth reader
+ * (transfer-list.tsx, o3d-ude1) was found the same afternoon.
+ *
+ * So the branded value is now carried THROUGH each reader's own types and unwrapped
+ * only where a number has to leave the process:
+ *
+ *   · the incoming-stock badges aggregate into `TransferOutstandingTotals` below,
+ *     whose only constructor accepts `TransferLineOutstandingQty` and nothing else,
+ *     and read out with `transferOutstandingTotalEntries` at the point where the
+ *     response object is built. At that point `line.qty` and `line.qtyReceived` are
+ *     not in scope, so the subtraction cannot be written there at all.
+ *   · the WMS transfer-ASN reservation (`ReservedAsnLine`, in the WMS connector's
+ *     transfer-ASN create action) carries the branded value from the reservation,
+ *     through its revalidation — which compares two branded readings with
+ *     `outstandingQtyEquals` rather than two numbers — to the single `.qtyNumber` that
+ *     becomes the quantity on the wire. The transfer line is out of scope there too.
+ *   · the archive reader and the stock-transfer report already totalled through
+ *     `sumTransferLineOutstandingQty` / `sumTransferLineLandedQty`, which accept
+ *     nothing else.
+ *
+ * WHAT IS STILL NOT PREVENTED, stated plainly rather than left to be discovered: a
+ * BRAND-NEW reader, with its own new types, can still compute `qty − qtyReceived` and
+ * return it — TypeScript has no construct that forbids an expression, and a number
+ * field on a serialised display row (`getIncomingDetails`) has to stay a number. What
+ * the types now forbid is an EXISTING reader drifting back, which is what the
+ * reviewer asked for and what the round-1 shape did not give. The behavioural
+ * regression tests in tests/domain/inventory/transfer-outstanding-readers.test.ts
+ * remain the guard for the rest, and they are written against a line the WMS
+ * stock-sync alignment landed WITHOUT touching `qtyReceived` — the one fixture the old
+ * arithmetic gets wrong.
  */
 
 declare const TRANSFER_LINE_OUTSTANDING_QTY_BRAND: unique symbol
@@ -568,4 +595,93 @@ export function sumTransferLineLandedQty(
   let total = toDecimal(0)
   for (const value of values) total = addMoney(total, value.qty)
   return roundQuantity(total, 6)
+}
+
+/** Is any part of this line still to come? The gate and badge predicate. */
+export function hasOutstandingQty(outstanding: TransferLineOutstandingQty): boolean {
+  return outstanding.qty.gt(TRANSFER_LANDED_QTY_EPSILON)
+}
+
+/**
+ * Are two readings of the SAME line's outstanding quantity the same reading?
+ *
+ * The WMS transfer-ASN create reserves against one reading and revalidates against a
+ * second one taken under the transfer's row lock; if they differ the push is refused.
+ * That comparison used to be `!==` between two plain numbers, which is exactly the
+ * shape that let the reservation hold a hand-computed figure. Taking two branded
+ * values means the revalidation cannot be handed anything but a reading this module
+ * produced, and the line-id check catches a caller that lined the two sets up wrongly.
+ */
+export function outstandingQtyEquals(
+  left: TransferLineOutstandingQty,
+  right: TransferLineOutstandingQty,
+): boolean {
+  return left.transferLineId === right.transferLineId && left.qty.equals(right.qty)
+}
+
+// ---------------------------------------------------------------------------
+// AGGREGATION THAT KEEPS THE BRAND (o3d-zzgp, Codex round-1 MEDIUM)
+// ---------------------------------------------------------------------------
+
+declare const TRANSFER_OUTSTANDING_TOTALS_BRAND: unique symbol
+
+/**
+ * Outstanding quantity totalled per key — per product for the incoming badges, per
+ * destination warehouse for the per-warehouse block.
+ *
+ * BRANDED FOR THE SAME REASON THE PER-LINE VALUE IS. A `Map<string, number>`
+ * accumulator accepts `Number(line.qty) − Number(line.qtyReceived)` as happily as it
+ * accepts a reading from this module, so the accumulator was where the brand used to
+ * die. This type can only be built by `aggregateTransferLineOutstandingQty`, which
+ * takes `TransferLineOutstandingQty` values, so the subtraction cannot enter the
+ * pipeline — and the totals can only be read back out through the two functions
+ * below, at which point the transfer line is no longer in scope.
+ */
+export type TransferOutstandingTotals<K> = {
+  readonly [TRANSFER_OUTSTANDING_TOTALS_BRAND]: 'transfer-outstanding-totals'
+  readonly totals: ReadonlyMap<K, Decimal>
+  /** How many lines went into each key's total, so a test can assert it saw them. */
+  readonly lineCounts: ReadonlyMap<K, number>
+}
+
+/** THE ONLY constructor of `TransferOutstandingTotals`. */
+export function aggregateTransferLineOutstandingQty<K>(
+  entries: Iterable<readonly [K, TransferLineOutstandingQty]>,
+): TransferOutstandingTotals<K> {
+  const totals = new Map<K, Decimal>()
+  const lineCounts = new Map<K, number>()
+  for (const [key, outstanding] of entries) {
+    totals.set(key, roundQuantity(addMoney(totals.get(key) ?? toDecimal(0), outstanding.qty), 6))
+    lineCounts.set(key, (lineCounts.get(key) ?? 0) + 1)
+  }
+  // `as unknown as` rather than the plain assertion the other brands in this file use:
+  // the generic key parameter stops TypeScript seeing enough overlap to allow it.
+  return { totals, lineCounts } as unknown as TransferOutstandingTotals<K>
+}
+
+/**
+ * OUTPUT BOUNDARY: the keys with something still to come, and how much.
+ *
+ * Zero totals are dropped, which is what every caller did per line before
+ * aggregating (`if (remaining > 0)`). That is the same set, because an outstanding
+ * quantity is floored at zero and so a key's total is zero only when every one of its
+ * lines was zero.
+ */
+export function transferOutstandingTotalEntries<K>(
+  totals: TransferOutstandingTotals<K>,
+): Array<[K, number]> {
+  const entries: Array<[K, number]> = []
+  for (const [key, total] of totals.totals) {
+    if (total.gt(TRANSFER_LANDED_QTY_EPSILON)) entries.push([key, total.toNumber()])
+  }
+  return entries
+}
+
+/** OUTPUT BOUNDARY: one key's total, zero when the key contributed nothing. */
+export function readTransferOutstandingTotal<K>(
+  totals: TransferOutstandingTotals<K>,
+  key: K,
+): number {
+  const total = totals.totals.get(key)
+  return total && total.gt(TRANSFER_LANDED_QTY_EPSILON) ? total.toNumber() : 0
 }
