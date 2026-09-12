@@ -14,9 +14,43 @@
  * take, which is what this is.
  *
  * SCOPE, precisely: keyed on (connector, type, referenceType, referenceId) — the same tuple the
- * partial unique index uses, and the same one the retry plans against. Two different documents
- * never contend. Taken ONLY for money-moving types, so the ordinary queue traffic (invoices,
- * journals, PDFs, emails) is untouched and pays nothing for it.
+ * partial unique index uses, the same one the retry plans against, and the same one the settlement
+ * action's mirror-ownership read filters on. Two different documents never contend.
+ *
+ * WHICH TYPES PAY FOR IT (widened by o3d-11rf). Two kinds of writer need this scope serialised:
+ *
+ *  1. MONEY-MOVING types (o3d-0m56, above) — two live rows for one document are two payments.
+ *  2. MIRRORED types (o3d-11rf) — every attempt at one document shares ONE logical accounting-event
+ *     mirror, and `settleAccountingSyncRow` decides whether to VOID that mirror by READING the
+ *     row's siblings. That read cannot be serialised against a sibling INSERT by any row lock, for
+ *     the reason given above, so the settlement and the enqueue have to take this.
+ *
+ * WHAT THIS LOCK DOES NOT DO, stated because a reader took it for more (o3d-11rf r2, Codex HIGH).
+ * It ORDERS the settlement and the enqueue. It does not make both orders correct, and only one of
+ * them was: enqueue-then-settlement is safe because the settlement's sibling read now sees the live
+ * row, while settlement-then-enqueue commits the shared event VOID and the enqueue that follows
+ * collides with it. That half is closed on the ENQUEUE side, by
+ * `reviveMirroredEventForNewAttempt`, on a basis recorded at void time. Serialisation is what makes
+ * that revive well-defined — it is the reason the enqueue is looking at a settled decision rather
+ * than at a half-made one — and it is not by itself the answer.
+ *
+ * The two sets are DISJOINT — no mirrored type is money-moving — so before o3d-11rf this lock was
+ * taken for exactly no mirrored type. "Settlement takes the same lock the enqueue takes" would have
+ * serialised nothing at all; widening the gate is what makes taking it mean something. Ordinary
+ * queue traffic that is neither (PDFs, emails, attachments, storefront notes) still pays nothing.
+ *
+ * RESIDUAL, recorded rather than implied (o3d-rznn). Widening the gate makes the lock MEANINGFUL
+ * for a type only where every writer in the scope takes it. The daily-batch enqueue
+ * (`createPendingSyncLog` in both connectors' daily-sync.ts) creates a DAILY_BATCH_* row and its
+ * mirror without taking this, because its transaction client is typed without `$executeRaw`. So for
+ * `referenceType='DailyBatch'` the lock is currently taken by settlement alone. That is not a
+ * regression — it is the pre-o3d-11rf state for those types, and the daily sync holds its own pinned
+ * per-connector batch lock — but it is not yet serialisation, and o3d-rznn is where it is tracked.
+ *
+ * DERIVED, NOT RESTATED. The mirrored set is read from `isMirrorableAccountingSyncType` rather than
+ * copied here, because a mirrored type added there and forgotten here would be a document whose
+ * settlement and enqueue silently stop serialising — the o3d-11rf defect, reintroduced for one
+ * type. followup-scope-lock.test.ts asserts the coverage over the exported list.
  *
  * LOCK ORDER. Enqueue writers take the sales-order/purchase row lock first and this second; the
  * retry takes ONLY this one, and one scope per transaction. There is therefore no pair of
@@ -33,6 +67,7 @@
 
 import type { Prisma } from '@/app/generated/prisma/client'
 import { ACCOUNTING_FOLLOWUP_SCOPE_LOCK_NAMESPACE } from '@/lib/db/advisory-locks'
+import { isMirrorableAccountingSyncType } from './mirrored-sync-types'
 import { isMoneyMovingSyncType } from './followup-retry-guard'
 
 export type FollowUpScope = {
@@ -58,6 +93,16 @@ export function followUpScopeLockId(scope: FollowUpScope): number {
 }
 
 /**
+ * Does this type's scope need serialising at all? See the two groups in the module doc block.
+ *
+ * Exported so the coverage over the mirrored set can be asserted directly, and so a reader asking
+ * "is my new type locked?" has one function to answer it rather than two sets to intersect.
+ */
+export function followUpScopeLockApplies(type: string): boolean {
+  return isMoneyMovingSyncType(type) || isMirrorableAccountingSyncType(type)
+}
+
+/**
  * Take the scope lock for the rest of `tx`, if this type needs it.
  *
  * Held to COMMIT (`_xact_`), never released early: the point is that the decision and the write
@@ -67,6 +112,6 @@ export async function lockFollowUpScope(
   tx: Pick<Prisma.TransactionClient, '$executeRaw'>,
   scope: FollowUpScope,
 ): Promise<void> {
-  if (!isMoneyMovingSyncType(scope.type)) return
+  if (!followUpScopeLockApplies(scope.type)) return
   await tx.$executeRaw`SELECT pg_advisory_xact_lock(${ACCOUNTING_FOLLOWUP_SCOPE_LOCK_NAMESPACE}, ${followUpScopeLockId(scope)})`
 }
