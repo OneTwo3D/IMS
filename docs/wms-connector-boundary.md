@@ -260,6 +260,52 @@ wizard's job in a broken state is to be *reachable*.
 applies to **none**, and deliberately not to **ambiguous**: falling back there would be
 the winner-picking this removes.
 
+## What holds the hook wiring in place (o3d-j8yq)
+
+Routing on the **presence** of a hook has a failure mode the seam suites cannot see. Both
+`tests/wms-second-connector-seam.test.ts` and
+`tests/wms-second-connector-seam-production.test.ts` replace the registry module wholesale
+with a seam registry holding the fictitious `acme-wms` and an **inert Mintsoft that declares
+no hooks at all** — that is what makes them able to prove the generic layer is generic. It
+is also why they say nothing about whether **the connector this build ships** still declares
+the hooks that layer routes to. Three of those hooks were inline code before
+`o3d-remove-shiphero` moved them onto the registration, and for each one, deleting it from
+`BUILT_IN_WMS_CONNECTOR_REGISTRATIONS` left every suite in the repo green:
+
+| Hook | What silently stops | Test that now goes red |
+| --- | --- | --- |
+| `dispatchPrecondition` | the ClientId scope gate — an **unscoped** Mintsoft sweep polls every order cross-client, so a foreign despatch marks *our* order shipped | `tests/wms-dispatch-hook-wiring.test.ts` |
+| `bookedInRecheck` | the post-maintenance ASN reconstruction: the resolver returns `null`, the caller reads that as "nothing to do", the marker is left set and nothing logs | `tests/wms-booked-in-recheck-wiring.test.ts` |
+| `deltaScopeLock` | the delta scope lock falls back to the **default** over the cursor rows, so a ClientId move is no longer serialized against the cursor read and the save-time scope check compares `unbound` to `unbound` | `tests/wms-dispatch-hook-wiring.test.ts` |
+
+Those two files are the mirror image of the seam suites: **the registry is not mocked**,
+`mintsoft` is the enabled connector, and the assertions are on what the production
+entrypoints (`runWmsDispatchSweep`, `runPostMaintenanceRecheckForActiveConnector`) actually
+did. Only process boundaries are doubled — the database, the advisory sweep lock, the
+activity log, the plugin state, and Mintsoft's booked-in job queue, whose real
+implementation re-fetches the ASN from the live warehouse. `lib/settings-store.ts` is
+deliberately **not** doubled, so the precondition reads its row through the same code
+production reads it through.
+
+`tests/wms-shipped-connector-hook-inventory.test.ts` is the universal backstop for the four
+hooks with no such test against the shipped connector (`asn`, `productSync`,
+`syncDashboard`, `onboarding` — driven only against `acme-wms`). It derives the hook names
+from the **parse tree** of `WmsConnectorHooks` rather than repeating them, so adding a hook
+to the contract fails until the shipped connector declares it or `DELIBERATELY_NOT_DECLARED`
+records why it cannot. Be clear about what it establishes: **declaration, not
+reachability**. A hook whose only coverage is there is a hook whose wiring is still
+unproven, and the remedy is a test like the two above, not a longer list.
+
+`tests/concurrency/wms-default-delta-scope-lock.concurrent.test.ts` races
+`defaultWmsDeltaScopeLock` on a real Postgres (gated on `RUN_DB_CONCURRENCY_TESTS=1`,
+throwaway keys only). The docstring's happens-before claim is about what two concurrent
+transactions can do to each other, which no in-memory double can decide. It also runs the
+**same interleaving without the lock** and asserts the stale read, so the locked case cannot
+pass by favourable timing alone. What it does *not* prove, and says so: that the generation
+chain alone is a sufficient fence for a connector with no scope binding. The default's token
+is the constant `unbound`, so a save-time scope comparison over it is unconditional — that
+premise is asserted; its sufficiency is a question about `saveWmsDeltaCursors`.
+
 ## Enforcement
 
 `scripts/check-wms-connector-boundary.mjs` (run by `npm run check:all` and the

@@ -121,6 +121,11 @@ test('[o3d-bjc #3] isMintsoftDispatchClientScoped: a positive integer ClientId i
   // `hooks.dispatchPrecondition` on Mintsoft's own registry definition, so a connector without one
   // is not exempted from a gate: there is no gate of anyone else's for it to be measured against.
   // That property is driven end to end in tests/wms-second-connector-seam.test.ts.
+  //
+  // o3d-j8yq: THIS TEST IS THE PREDICATE, NOT THE WIRING. Nothing here reaches the registry, so
+  // deleting `hooks.dispatchPrecondition` left it green while an unscoped sweep ran. The WIRING —
+  // `runWmsDispatchSweep` with Mintsoft enabled and `mintsoft_client_id` blank, skipping with the
+  // connector's own reason — is tests/wms-dispatch-hook-wiring.test.ts.
 })
 
 // --- Sweep-core delta behaviour --------------------------------------------
