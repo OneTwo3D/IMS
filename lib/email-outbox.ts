@@ -1985,10 +1985,12 @@ export async function processPendingEmailOutbox(
   const diagnoseClaimLoss = async (claim: EmailClaim, smtp: RowProgress): Promise<ClaimLoss> => {
     let rows: EmailOutboxRow[]
     try {
-      // THE ROW AS IT IS NOW, through the same delegate every other read uses. A failure here is an
-      // ANSWER ('unreadable'), never a throw: this function runs on a path that is already handling
-      // a lost claim, and a diagnostic that aborts the batch would be a worse defect than the one
-      // it was added to fix.
+      // THE ROW AS IT IS NOW, through the same delegate every other read uses. A REJECTED READ
+      // BECOMES AN ANSWER ('unreadable') rather than a throw: this function runs on a path that is
+      // already handling a lost claim, and a diagnostic that aborts the batch would be a worse defect
+      // than the one it was added to fix. That is the whole of the claim — it is about a read that
+      // REJECTS. A delegate that resolved with something that is not an array of rows would fail here
+      // like it fails at the sweep, which the whole drain assumes of `findMany` in the same way.
       rows = await client.emailOutbox.findMany({ where: { id: claim.id }, take: 1 })
     } catch (error) {
       return { kind: 'unreadable', why: String(error) }
