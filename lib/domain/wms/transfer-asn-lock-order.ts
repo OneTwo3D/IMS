@@ -62,9 +62,12 @@ import type { Prisma } from '@/app/generated/prisma/client'
  * BEFORE their stock-level locks, via `lockWmsAsnLineMapsForTransferLines` below.
  *
  * `wms_asn_maps` IS IN THE ORDER because booked-in-service updates the ASN header
- * after its line rows while `finalizePendingAsn` (app/actions/mintsoft-sync.ts:4183)
- * locks the header first and updates line rows after — the same crossing one table
- * up. booked-in-service now locks the header at step 3.
+ * after its line rows while the transfer-ASN `finalizePendingAsn`
+ * (app/actions/mintsoft-sync.ts) locks the header first and updates line rows after —
+ * the same crossing one table up. booked-in-service now locks the header at step 3.
+ * Since o3d-zzgp round 3 that finalizer also takes its transfer at step 2 before the
+ * header, because its conflict branch disposes of the reservation through
+ * lib/domain/wms/pending-asn-retirement.ts, which reads credit only under 2 → 3 → 4.
  *
  * ───────────────────────────────────────────────────────────────────────────────
  * WHAT A CALLER STILL HAS TO DO

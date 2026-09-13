@@ -65,12 +65,12 @@ import {
   type TransferLineOutstandingQty,
 } from '@/lib/domain/inventory/transfer-landed-quantity'
 import {
+  disposePendingTransferAsnReservation,
+  lockPendingTransferAsnReservation,
   pendingAsnReservationCarriesCredit,
-  planPendingAsnReservationRetirement,
-  retirePendingAsnReservation,
-  type PendingAsnReservationLine,
-  type PendingAsnRetirementClient,
+  type LockedPendingAsnReservation,
 } from '@/lib/domain/wms/pending-asn-retirement'
+import { lockStockTransfers, lockWmsAsnMaps } from '@/lib/domain/wms/transfer-asn-lock-order'
 import { getWmsConnector, isWmsConnectorConfigured } from '@/lib/connectors/wms/registry'
 import { getIntegrationPluginState, isIntegrationPluginEnabled } from '@/lib/integration-plugins'
 import { hasPermission } from '@/lib/permissions'
@@ -848,48 +848,6 @@ function mapMintsoftPurchaseOrderAsnRow(row: {
     totalExpectedQty: totals.expected.toString(),
     totalReceivedQty: totals.received.toString(),
   }
-}
-
-/** The credit columns every disposal site must read before it disposes of anything. */
-const PENDING_ASN_DISPOSAL_LINE_SELECT = {
-  id: true,
-  sourceLineId: true,
-  expectedQty: true,
-  qtyAccountedViaSnapshot: true,
-  qtyAccountedViaReceipt: true,
-  lastProcessedReceivedQty: true,
-} as const
-
-/**
- * GET RID OF A PENDING ASN RESERVATION WITHOUT DESTROYING EVIDENCE (o3d-zzgp, Codex
- * round-1 HIGH-1).
- *
- * THE ONLY WAY this file disposes of a `wms_asn_maps` reservation, because there is
- * exactly one rule and it is easy to get wrong in four places: delete it while it
- * holds no credit, RETIRE it when it does. See
- * lib/domain/wms/pending-asn-retirement.ts for why deleting a credited row loses the
- * only record that those units arrived and were costed, and for what retiring does
- * instead.
- *
- * `deleteUncreditedReservation` stays with the caller: the four sites delete with
- * different guards (one by id inside the reservation transaction, one by id plus the
- * pending-prefix and source filters outside it), and narrowing those guards here would
- * be a behaviour change smuggled in under a refactor.
- */
-async function disposePendingAsnReservation(
-  client: PendingAsnRetirementClient,
-  asnMapId: string,
-  lines: ReadonlyArray<PendingAsnReservationLine>,
-  deleteUncreditedReservation: () => Promise<void>,
-): Promise<'retired' | 'deleted'> {
-  const retirement = planPendingAsnReservationRetirement(lines)
-  if (!retirement) {
-    await deleteUncreditedReservation()
-    return 'deleted'
-  }
-
-  await retirePendingAsnReservation(client, asnMapId, retirement)
-  return 'retired'
 }
 
 async function requireMintsoftReadAccess() {
@@ -3931,30 +3889,39 @@ export async function createMintsoftTransferAsn(
         })
       }
 
-      let pendingAsn = await tx.wmsAsnMap.findFirst({
+      const pendingReservationWhere = {
+        connector: 'mintsoft',
+        closedAt: null,
+        status: 'CREATE_PENDING',
+        externalAsnId: {
+          startsWith: pendingAsnPrefix,
+        },
+      } satisfies Prisma.WmsAsnMapWhereInput
+
+      const pendingAsnHeader = await tx.wmsAsnMap.findFirst({
         where: {
-          connector: 'mintsoft',
+          ...pendingReservationWhere,
           sourceType: 'STOCK_TRANSFER',
           sourceId: transfer.id,
-          closedAt: null,
-          status: 'CREATE_PENDING',
-          externalAsnId: {
-            startsWith: pendingAsnPrefix,
-          },
         },
         orderBy: [{ createdAt: 'desc' }],
-        select: {
-          id: true,
-          lines: {
-            orderBy: [{ id: 'asc' }],
-            select: {
-              ...PENDING_ASN_DISPOSAL_LINE_SELECT,
-              productId: true,
-              sku: true,
-            },
-          },
-        },
+        select: { id: true },
       })
+
+      // o3d-zzgp round 3 (Codex HIGH). Everything below decides from the reservation's
+      // CREDIT and then acts on it, so the credit is read under the established locks
+      // — `stock_transfers` (held since the top of this transaction), then the ASN
+      // header, then its line maps — and not from the discovery read above. This path
+      // was already safe on the transfer lock alone, because every credit writer takes
+      // that row first; the header and line locks put it on the same footing as the
+      // disposal paths below rather than leaving it the one exception to explain.
+      let pendingAsn: LockedPendingAsnReservation | null = pendingAsnHeader
+        ? await lockPendingTransferAsnReservation(tx, {
+            transferId: transfer.id,
+            asnMapId: pendingAsnHeader.id,
+            reservationWhere: pendingReservationWhere,
+          })
+        : null
 
       // o3d-zzgp: THE ASN IS SIZED FROM THIS NUMBER AND IT GOES TO A LIVE WMS.
       // It used to be `qty − qtyReceived`, which ignores every unit the WMS
@@ -4010,14 +3977,16 @@ export async function createMintsoftTransferAsn(
       // path below. The o3d-bhvu outage (GET /api/ASN is 405, so no create can
       // currently finish) only MASKS this; it is not a defence.
       if (pendingAsn && pendingAsnReservationCarriesCredit(pendingAsn.lines)) {
-        await disposePendingAsnReservation(
-          tx,
-          pendingAsn.id,
-          pendingAsn.lines,
-          // Unreachable: `pendingAsnReservationCarriesCredit` is the same predicate
-          // the planner uses, so the planner cannot answer "delete" here.
-          async () => { throw new Error('A credited pending ASN reservation must be retired, not deleted.') },
-        )
+        const outcome = await disposePendingTransferAsnReservation(tx, {
+          transferId: transfer.id,
+          asnMapId: pendingAsn.asnMapId,
+          reservationWhere: pendingReservationWhere,
+        })
+        // The disposal re-reads under the same locks this transaction already holds,
+        // so it cannot see anything but the credit the predicate just saw.
+        if (outcome !== 'retired') {
+          throw new Error(`A credited pending ASN reservation was ${outcome}, not retired (o3d-zzgp r3).`)
+        }
         pendingAsn = null
       }
 
@@ -4029,22 +3998,21 @@ export async function createMintsoftTransferAsn(
 
         if (outstandingLines.length === 0) {
           // Uncredited by the branch above, so there is no evidence to lose and this
-          // deletes. `disposePendingAsnReservation` is still the only route out,
-          // because the fact that makes the delete safe is read there and nowhere
-          // else (o3d-zzgp round 2, Codex HIGH-1).
-          await disposePendingAsnReservation(
-            tx,
-            pendingAsn.id,
-            pendingAsn.lines,
-            async () => { await tx.wmsAsnMap.delete({ where: { id: pendingAsn!.id } }) },
-          )
+          // deletes. `disposePendingTransferAsnReservation` is still the only route
+          // out, because the fact that makes the delete safe is re-read there under
+          // the locks, and nowhere else (o3d-zzgp rounds 2 and 3).
+          await disposePendingTransferAsnReservation(tx, {
+            transferId: transfer.id,
+            asnMapId: pendingAsn.asnMapId,
+            reservationWhere: pendingReservationWhere,
+          })
           throw new Error('This transfer has no outstanding quantity left to place on an ASN.')
         }
 
         // q66in.4.6: a retry may carry a NEW ETA — keep the watchdog anchored to
         // the value actually sent to the WMS, not the first attempt's.
         await tx.wmsAsnMap.update({
-          where: { id: pendingAsn.id },
+          where: { id: pendingAsn.asnMapId },
           data: { eta: etaIso ? new Date(etaIso) : null },
         })
 
@@ -4053,14 +4021,19 @@ export async function createMintsoftTransferAsn(
 
         // A line drops out of the outstanding set BECAUSE something landed it, and the
         // alignment lands units by crediting these very columns — so this
-        // `deleteMany` was the per-line form of HIGH-1. The zero-credit conditions
-        // make the statement incapable of deleting evidence no matter what the branch
-        // predicate above concluded. DEFENCE IN DEPTH WITH NO CLAIM OF INDEPENDENT
-        // NECESSITY: this branch is only entered when no row of the reservation holds
-        // credit, so today these three conditions can never change the row set.
+        // `deleteMany` was the per-line form of HIGH-1.
+        //
+        // THE LOCKS ARE THE FIX (o3d-zzgp r3): this runs under the transfer, ASN header
+        // and line-map locks taken above, after a credit re-read under them, and this
+        // branch is only entered when that re-read found no credit anywhere on the
+        // reservation. The three zero-credit conditions are the BACKSTOP: they keep a
+        // row with visible credit out of the delete if the locks were ever lost, but
+        // they are evaluated against this statement's snapshot, so on their own they
+        // would not stop a credit committing mid-statement (see
+        // lib/domain/wms/pending-asn-retirement.ts).
         await tx.wmsAsnLineMap.deleteMany({
           where: {
-            asnMapId: pendingAsn.id,
+            asnMapId: pendingAsn.asnMapId,
             qtyAccountedViaSnapshot: 0,
             qtyAccountedViaReceipt: 0,
             lastProcessedReceivedQty: 0,
@@ -4084,7 +4057,7 @@ export async function createMintsoftTransferAsn(
           } else {
             await tx.wmsAsnLineMap.create({
               data: {
-                asnMapId: pendingAsn.id,
+                asnMapId: pendingAsn.asnMapId,
                 externalAsnLineId: `pending:${outstandingLine.sourceLineId}`,
                 sourceType: 'STOCK_TRANSFER_LINE',
                 sourceLineId: outstandingLine.sourceLineId,
@@ -4097,7 +4070,7 @@ export async function createMintsoftTransferAsn(
         }
 
         const refreshedPendingAsn = await tx.wmsAsnMap.findUnique({
-          where: { id: pendingAsn.id },
+          where: { id: pendingAsn.asnMapId },
           select: {
             id: true,
             lines: {
@@ -4360,26 +4333,30 @@ export async function createMintsoftTransferAsn(
    * is retired instead whenever it holds credit; the delete is kept for the ordinary
    * case, where the row holds nothing and leaving it would only get it re-used at the
    * wrong size.
+   *
+   * ROUND 3 (Codex HIGH): round 2 read the lines, decided, and deleted in THREE
+   * separate autocommit statements with no transaction and no lock, so an alignment
+   * committing between the read and the delete had its credit cascaded away — the
+   * round-2 rule, checked and then not held. It now runs as one transaction that
+   * takes `stock_transfers` → `wms_asn_maps` → `wms_asn_line_maps` before it reads
+   * anything; proved against a real interleaving in
+   * tests/concurrency/pending-asn-disposal-race.concurrent.test.ts.
    */
-  async function discardPendingReservation(asnMapId: string): Promise<void> {
-    const lines = await db.wmsAsnLineMap.findMany({
-      where: { asnMapId },
-      select: PENDING_ASN_DISPOSAL_LINE_SELECT,
-    })
-
-    await disposePendingAsnReservation(db, asnMapId, lines, async () => {
-      await db.wmsAsnMap.deleteMany({
-        where: {
-          id: asnMapId,
+  async function discardPendingReservation(
+    reservation: Extract<AsnReservation, { kind: 'pending' }>,
+  ): Promise<void> {
+    await db.$transaction(async (tx) => {
+      await disposePendingTransferAsnReservation(tx, {
+        transferId: reservation.transferId,
+        asnMapId: reservation.asnMapId,
+        reservationWhere: {
           connector: 'mintsoft',
-          sourceType: 'STOCK_TRANSFER',
-          sourceId: parsedId.data,
           externalAsnId: {
             startsWith: pendingAsnPrefix,
           },
         },
       })
-    })
+    }, { maxWait: 5000, timeout: 15000 })
   }
 
   async function finalizePendingAsn(
@@ -4398,7 +4375,14 @@ export async function createMintsoftTransferAsn(
     const mappedLines = mapCreatedMintsoftAsnLines(reservation.lines, createdAsn.externalAsnId, createdAsn)
 
     return db.$transaction(async (tx) => {
-      await tx.$queryRaw`SELECT id FROM wms_asn_maps WHERE id = ${reservation.asnMapId} FOR UPDATE`
+      // STEP 2 THEN STEP 3 (o3d-zzgp r3). This used to lock the header alone. The
+      // conflict branch below disposes of the reservation, and the disposal takes the
+      // transfer lock before it reads any credit — taking it there, after this header
+      // lock, would be the step-3-before-step-2 inversion the global order exists to
+      // forbid. So the transfer comes first here, and the header second, as they do on
+      // every other path that touches both.
+      await lockStockTransfers(tx, [reservation.transferId])
+      await lockWmsAsnMaps(tx, [reservation.asnMapId])
 
       const conflictingAsn = await tx.wmsAsnMap.findUnique({
         where: {
@@ -4422,14 +4406,11 @@ export async function createMintsoftTransferAsn(
         // deleted only while it holds no credit. A concurrent alignment can have
         // credited it between the reservation and this point — its lines are
         // candidates for exactly as long as `closedAt` is null (o3d-zzgp round 2).
-        const reservedLines = await tx.wmsAsnLineMap.findMany({
-          where: { asnMapId: reservation.asnMapId },
-          select: PENDING_ASN_DISPOSAL_LINE_SELECT,
-        })
-        await disposePendingAsnReservation(tx, reservation.asnMapId, reservedLines, async () => {
-          await tx.wmsAsnMap.delete({
-            where: { id: reservation.asnMapId },
-          })
+        // Decided under the transfer, header and line locks, in this transaction
+        // (o3d-zzgp round 3).
+        await disposePendingTransferAsnReservation(tx, {
+          transferId: reservation.transferId,
+          asnMapId: reservation.asnMapId,
         })
 
         return {
@@ -4504,7 +4485,7 @@ export async function createMintsoftTransferAsn(
       } else {
         const mismatch = await revalidatePendingReservation(reservation)
         if (mismatch) {
-          await discardPendingReservation(reservation.asnMapId)
+          await discardPendingReservation(reservation)
           throw new Error(`${mismatch} Please retry creating the Mintsoft ASN.`)
         }
 
@@ -4515,7 +4496,7 @@ export async function createMintsoftTransferAsn(
 
         const recheckedMismatch = await revalidatePendingReservation(reservation)
         if (recheckedMismatch) {
-          await discardPendingReservation(reservation.asnMapId)
+          await discardPendingReservation(reservation)
           throw new Error(`${recheckedMismatch} Please retry creating the Mintsoft ASN.`)
         }
 

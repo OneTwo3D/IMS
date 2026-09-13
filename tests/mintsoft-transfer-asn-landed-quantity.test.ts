@@ -183,7 +183,8 @@ const wmsAsnMapDelegate = {
   findFirst: async (args: { where: Record<string, unknown> }) => {
     const where = args.where
     const candidates = asnMaps.filter((row) => (
-      row.connector === where.connector
+      (where.id === undefined || row.id === where.id)
+      && (where.connector === undefined || row.connector === where.connector)
       && row.sourceType === where.sourceType
       && row.sourceId === where.sourceId
       && (where.closedAt !== null || row.closedAt === null)
@@ -259,6 +260,13 @@ const wmsAsnMapDelegate = {
   },
   deleteMany: async (args: { where: Record<string, unknown> }) => {
     const id = String(args.where.id)
+    // The zero-credit backstop the disposal puts in its own WHERE (o3d-zzgp r3),
+    // modelled so the fake refuses exactly what Postgres would.
+    if (args.where.lines && linesOf(id).some((line) => (
+      !isZero(line.qtyAccountedViaSnapshot) || !isZero(line.qtyAccountedViaReceipt) || !isZero(line.lastProcessedReceivedQty)
+    ))) {
+      return { count: 0 }
+    }
     return { count: deleteAsnMapById(id) }
   },
   create: async (args: { data: Record<string, unknown> }) => {

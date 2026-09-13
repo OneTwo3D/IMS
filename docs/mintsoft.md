@@ -93,6 +93,12 @@ Applied corrections log `mintsoft_align_down_applied` (WARNING) with before/afte
   different rows rather than two meanings of one. A reservation that holds no credit is still deleted
   or resized in place, which is what keeps a retry loop from leaving one closed row per attempt. A
   retired reservation stays visible in the transfer's ASN list as a closed `CREATE_PENDING` row.
+  The credit check and the disposal are ONE transaction that first takes the global lock order
+  (`stock_transfers` → `wms_asn_maps` → `wms_asn_line_maps`, see
+  `lib/domain/wms/transfer-asn-lock-order.ts`), so an alignment cannot credit a line between the
+  check and the delete; it waits on the transfer row and re-reads afterwards. The delete also refuses
+  a header whose lines visibly hold credit, but that is a backstop only — it is evaluated against the
+  delete statement's own snapshot and does not stop a credit that commits mid-statement.
   Purchase-order ASN reservations still delete on retry (see below).
 - Mintsoft callback metadata preserves the source type, source line, product, and expected quantity.
 - Booked-in webhook receipt is idempotent via `wms_inbound_receipt_events`.

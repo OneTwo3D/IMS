@@ -3,7 +3,9 @@ import { test } from 'node:test'
 
 import { Prisma } from '@/app/generated/prisma/client'
 import {
+  PendingAsnDisposalBackstopError,
   creditedQtyOnPendingAsnLine,
+  disposePendingTransferAsnReservation,
   pendingAsnReservationCarriesCredit,
   planPendingAsnReservationRetirement,
   retirePendingAsnReservation,
@@ -124,4 +126,150 @@ test('o3d-zzgp: the note names both figures', () => {
   })
   assert.match(note, /o3d-zzgp/)
   assert.match(note, /from 10 to the 6 unit/)
+})
+
+// ---------------------------------------------------------------------------
+// o3d-zzgp round 3 (Codex HIGH): the decision is HELD across the act it guards.
+//
+// These are the unit-level half. The race itself is proved against real PostgreSQL in
+// tests/concurrency/pending-asn-disposal-race.concurrent.test.ts; what is pinned here
+// is the SEQUENCE a real interleaving cannot cheaply enumerate — that the three locks
+// are taken in the established order, that every credit read the decision uses comes
+// after all three, and that the delete carries the backstop and refuses loudly when it
+// fires.
+// ---------------------------------------------------------------------------
+
+type FakeLine = {
+  id: string
+  sourceLineId: string
+  productId: string
+  sku: string
+  expectedQty: Prisma.Decimal
+  qtyAccountedViaSnapshot: Prisma.Decimal
+  qtyAccountedViaReceipt: Prisma.Decimal
+  lastProcessedReceivedQty: Prisma.Decimal
+  note: string | null
+}
+
+function fakeTx(options: {
+  lines: FakeLine[]
+  headerMatches?: boolean
+  /** Runs immediately before the delete statement: a writer that ignored the locks. */
+  beforeDelete?: (lines: FakeLine[]) => void
+}) {
+  const events: string[] = []
+  const state = { lines: options.lines, headerDeleted: false, closedAt: null as Date | null }
+  const credited = (line: FakeLine) => !line.qtyAccountedViaSnapshot.equals(0)
+    || !line.qtyAccountedViaReceipt.equals(0)
+    || !line.lastProcessedReceivedQty.equals(0)
+  const tx = {
+    $queryRaw: async (strings: TemplateStringsArray) => {
+      const sql = strings.join('?')
+      const table = /FROM (\w+)/.exec(sql)?.[1] ?? 'unknown'
+      events.push(`lock:${table}`)
+      return []
+    },
+    wmsAsnMap: {
+      findFirst: async () => {
+        events.push('read:header')
+        return options.headerMatches === false ? null : { id: 'asn-1' }
+      },
+      update: async (args: { data: { closedAt?: Date } }) => {
+        events.push('write:retire-header')
+        state.closedAt = args.data.closedAt ?? null
+        return {}
+      },
+      deleteMany: async (args: { where: Record<string, unknown> }) => {
+        options.beforeDelete?.(state.lines)
+        events.push('write:delete-header')
+        if (args.where.lines && state.lines.some(credited)) return { count: 0 }
+        state.headerDeleted = true
+        return { count: 1 }
+      },
+    },
+    wmsAsnLineMap: {
+      findMany: async (args: { select: Record<string, boolean> }) => {
+        const creditRead = 'qtyAccountedViaSnapshot' in args.select
+        events.push(creditRead ? 'read:credit' : 'read:line-ids')
+        return state.lines.map((line) => ({ ...line }))
+      },
+      update: async () => {
+        events.push('write:retire-line')
+        return {}
+      },
+    },
+  }
+  return { tx, events, state }
+}
+
+function fakeLine(overrides: Partial<Record<'snapshot' | 'receipt' | 'lastProcessed', string>> = {}): FakeLine {
+  return {
+    id: 'al-1',
+    sourceLineId: 'tl-1',
+    productId: 'p-1',
+    sku: 'SKU-1',
+    expectedQty: new Prisma.Decimal(10),
+    qtyAccountedViaSnapshot: new Prisma.Decimal(overrides.snapshot ?? '0'),
+    qtyAccountedViaReceipt: new Prisma.Decimal(overrides.receipt ?? '0'),
+    lastProcessedReceivedQty: new Prisma.Decimal(overrides.lastProcessed ?? '0'),
+    note: null,
+  }
+}
+
+test('o3d-zzgp r3: the disposal locks transfer → header → lines, and reads the credit only after all three', async () => {
+  const { tx, events } = fakeTx({ lines: [fakeLine()] })
+
+  const outcome = await disposePendingTransferAsnReservation(tx as never, { transferId: 'trf-1', asnMapId: 'asn-1' })
+
+  assert.equal(outcome, 'deleted')
+  const locks = events.filter((event) => event.startsWith('lock:'))
+  assert.deepEqual(locks, ['lock:stock_transfers', 'lock:wms_asn_maps', 'lock:wms_asn_line_maps'], 'the established order, and only it')
+  const lastLock = events.lastIndexOf('lock:wms_asn_line_maps')
+  const creditReads = events.map((event, index) => [event, index] as const).filter(([event]) => event === 'read:credit')
+  assert.equal(creditReads.length, 1, `exactly one credit read, saw ${creditReads.length}`)
+  for (const [, index] of creditReads) {
+    assert.ok(index > lastLock, `the credit read at ${index} must come after the step-4 lock at ${lastLock}: ${events.join(' → ')}`)
+  }
+  assert.ok(events.indexOf('write:delete-header') > creditReads[0]![1], 'and the delete comes after the read it depends on')
+})
+
+test('o3d-zzgp r3: a credited reservation is retired under the same locks, and never reaches the delete', async () => {
+  const { tx, events, state } = fakeTx({ lines: [fakeLine({ snapshot: '6' })] })
+
+  const outcome = await disposePendingTransferAsnReservation(tx as never, { transferId: 'trf-1', asnMapId: 'asn-1' })
+
+  assert.equal(outcome, 'retired')
+  assert.equal(events.includes('write:delete-header'), false)
+  assert.ok(state.closedAt instanceof Date)
+  assert.deepEqual(events.filter((event) => event.startsWith('lock:')), ['lock:stock_transfers', 'lock:wms_asn_maps', 'lock:wms_asn_line_maps'])
+})
+
+test('o3d-zzgp r3: the backstop refuses a delete if credit appears after the locked read, and says so loudly', async () => {
+  // Simulates a writer that ignored the locks — the case the backstop exists for. The
+  // real-database race where the lock is what prevents it lives in the concurrency test.
+  const { tx, state } = fakeTx({
+    lines: [fakeLine()],
+    beforeDelete: (lines) => { lines[0]!.qtyAccountedViaSnapshot = new Prisma.Decimal(5) },
+  })
+
+  await assert.rejects(
+    disposePendingTransferAsnReservation(tx as never, { transferId: 'trf-1', asnMapId: 'asn-1' }),
+    (error: unknown) => error instanceof PendingAsnDisposalBackstopError,
+  )
+  assert.equal(state.headerDeleted, false, 'the credited reservation must still be there')
+})
+
+test('o3d-zzgp r3: a reservation that is no longer the caller\'s is left alone', async () => {
+  const { tx, events } = fakeTx({ lines: [fakeLine()], headerMatches: false })
+
+  const outcome = await disposePendingTransferAsnReservation(tx as never, {
+    transferId: 'trf-1',
+    asnMapId: 'asn-1',
+    reservationWhere: { status: 'CREATE_PENDING' },
+  })
+
+  assert.equal(outcome, 'absent')
+  assert.equal(events.some((event) => event.startsWith('write:')), false, 'nothing written')
+  // The header was checked AFTER its lock, not before.
+  assert.ok(events.indexOf('read:header') > events.indexOf('lock:wms_asn_maps'))
 })

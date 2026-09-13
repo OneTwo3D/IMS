@@ -57,8 +57,14 @@
  * freshly created reservation carries the four-unit expectation with a zero credit.
  */
 
+import type { Prisma } from '@/app/generated/prisma/client'
 import type { Decimal, DecimalInput } from '@/lib/domain/math/decimal'
 import { roundQuantity, toDecimal } from '@/lib/domain/math/decimal'
+import {
+  lockStockTransfers,
+  lockWmsAsnLineMaps,
+  lockWmsAsnMaps,
+} from '@/lib/domain/wms/transfer-asn-lock-order'
 
 /**
  * Matching WMS_RECEIPT_QTY_EPSILON and TRANSFER_LANDED_QTY_EPSILON. Re-declared for
@@ -191,8 +197,10 @@ export type PendingAsnRetirementClient = {
 }
 
 /**
- * Apply a retirement. Runs in the caller's transaction, under whatever locks the
- * caller already holds — the transfer-ASN create holds the transfer row FOR UPDATE.
+ * Apply a retirement. Runs in the caller's transaction. Call it through
+ * `disposePendingTransferAsnReservation` below, which takes the transfer, header and
+ * line locks and re-reads the credit before deciding (o3d-zzgp r3) — a retirement
+ * planned from an unlocked read is the round-3 defect with a different last statement.
  *
  * `sloAlertedAt` is cleared alongside `closedAt` for tidiness and NOT because anything
  * needs it: the overdue-ASN watchdog (lib/domain/wms/watchdog-sweep.ts) excludes
@@ -227,4 +235,196 @@ export async function retirePendingAsnReservation(
       },
     })
   }
+}
+
+// ---------------------------------------------------------------------------
+// THE DECISION MUST BE HELD ACROSS THE ACT IT GUARDS (o3d-zzgp, Codex round-3 HIGH)
+// ---------------------------------------------------------------------------
+
+/**
+ * Round 2's rule above — delete only while nothing is credited — was right, and one
+ * of its call sites checked it and then acted in a SEPARATE autocommit statement.
+ * `discardPendingReservation` read the line maps, decided "uncredited", and deleted
+ * the header in its own statement. A WMS stock-sync alignment committing in between
+ * credits `qtyAccountedViaSnapshot` on one of those lines; the delete then cascades
+ * the newly credited line, and the only record that those units arrived goes with
+ * it. A live check is not a held check.
+ *
+ * THE FIX IS THE LOCK. The credit read, the retire-or-delete decision and the
+ * disposal all happen in ONE transaction, after taking the established order from
+ * lib/domain/wms/transfer-asn-lock-order.ts — step 2 `stock_transfers`, step 3
+ * `wms_asn_maps`, step 4 `wms_asn_line_maps` — and every credit writer takes at least
+ * one of those before writing:
+ *
+ *   · the alignment (lib/connectors/mintsoft/sync/stock-sync.ts) takes 2 → 3 → 4 and
+ *     only then increments `qtyAccountedViaSnapshot`, re-reading its candidates under
+ *     those locks;
+ *   · booked-in reconciliation takes its step-2 parents, then 3, then 4, before it
+ *     writes `qtyAccountedViaReceipt` / `lastProcessedReceivedQty`;
+ *   · `receiveTransfer`'s absorb takes 2 and 4 before writing `qtyAccountedViaReceipt`.
+ *
+ * So once this function holds the three, no credit can change under the decision,
+ * and an alignment that arrives meanwhile waits on the transfer row, re-reads after
+ * this commits, and finds the reservation gone or closed.
+ *
+ * THE WHERE CLAUSE IS THE BACKSTOP, NOT THE FIX. The header delete also carries
+ * `UNCREDITED_ASN_MAP_WHERE`, so a delete that somehow ran without the locks still
+ * refuses a reservation whose lines visibly hold credit. It does NOT close the race
+ * by itself, and must not be mistaken for doing so: under READ COMMITTED the
+ * `NOT EXISTS` is evaluated against the DELETE statement's own snapshot, and the
+ * `ON DELETE CASCADE` to the line maps runs afterwards against a newer one, so a
+ * credit that commits after the statement starts and before the cascade reaches its
+ * row is invisible to the guard and still deleted by the cascade.
+ * tests/concurrency/pending-asn-disposal-race.concurrent.test.ts parks the delete
+ * exactly there and shows it. And where the guard DOES see the credit it can only
+ * refuse, leaving a reservation the caller expected to be gone — round 2's mutation
+ * M4a showed that shape surfacing as a misleading hard failure. Hence the loud
+ * `PendingAsnDisposalBackstopError` below rather than a quiet zero-row delete.
+ */
+
+/** The credit columns every disposal decision reads — under the locks, never before. */
+export const PENDING_ASN_RESERVATION_LINE_SELECT = {
+  id: true,
+  sourceLineId: true,
+  productId: true,
+  sku: true,
+  expectedQty: true,
+  qtyAccountedViaSnapshot: true,
+  qtyAccountedViaReceipt: true,
+  lastProcessedReceivedQty: true,
+} as const
+
+/**
+ * THE BACKSTOP: a header none of whose lines holds any credit. Kept in the delete's
+ * own WHERE so the statement cannot remove visible evidence even if it ever ran
+ * unlocked. See the block above for why it is not sufficient on its own.
+ */
+export const UNCREDITED_ASN_MAP_WHERE = {
+  lines: {
+    none: {
+      OR: [
+        { qtyAccountedViaSnapshot: { not: 0 } },
+        { qtyAccountedViaReceipt: { not: 0 } },
+        { lastProcessedReceivedQty: { not: 0 } },
+      ],
+    },
+  },
+} as const satisfies Prisma.WmsAsnMapWhereInput
+
+/** Thrown when the backstop refuses a delete the locked decision said was safe. */
+export class PendingAsnDisposalBackstopError extends Error {
+  override readonly name = 'PendingAsnDisposalBackstopError'
+
+  constructor(asnMapId: string) {
+    super(
+      `Pending ASN reservation ${asnMapId} was judged uncredited under the transfer → ASN header → ASN line `
+      + 'locks, but the zero-credit guard on its delete refused it. Something wrote credit without taking '
+      + 'those locks. Nothing was deleted and the reservation is left as it is (o3d-zzgp r3).',
+    )
+  }
+}
+
+/** Thrown when a locked re-read finds a line row the step-4 lock did not cover. */
+export class PendingAsnLineNotLockedError extends Error {
+  override readonly name = 'PendingAsnLineNotLockedError'
+
+  constructor(asnMapId: string, lineIds: string[]) {
+    super(
+      `Pending ASN reservation ${asnMapId} gained line row(s) ${lineIds.join(', ')} after its step-4 lock was `
+      + 'taken. Lines of a transfer reservation are only created under the transfer lock this transaction '
+      + 'holds, so this should be impossible; the disposal is abandoned rather than acting on an unlocked row '
+      + '(o3d-zzgp r3).',
+    )
+  }
+}
+
+export type LockedPendingAsnReservation = {
+  asnMapId: string
+  lines: Array<PendingAsnReservationLine & { productId: string; sku: string }>
+}
+
+/**
+ * Take step 2, step 3 and step 4 for one transfer reservation, in that order, and
+ * return what the reservation looks like UNDER them.
+ *
+ * `null` when no header matching `reservationWhere` exists once the locks are held —
+ * a concurrent disposal or a finalizer got there first, or it is no longer the
+ * pending reservation the caller meant. The where is applied AFTER the header lock,
+ * so a status or external-id change that commits while this waits is seen.
+ *
+ * Re-locking a row this transaction already holds is a no-op in PostgreSQL, so a
+ * caller that took the transfer lock at the top of its transaction (the reservation)
+ * can call this without special-casing, and the order is still 2 → 3 → 4.
+ */
+export async function lockPendingTransferAsnReservation(
+  tx: Prisma.TransactionClient,
+  input: { transferId: string; asnMapId: string; reservationWhere?: Prisma.WmsAsnMapWhereInput },
+): Promise<LockedPendingAsnReservation | null> {
+  await lockStockTransfers(tx, [input.transferId]) // step 2
+  await lockWmsAsnMaps(tx, [input.asnMapId]) // step 3
+
+  const header = await tx.wmsAsnMap.findFirst({
+    where: {
+      ...input.reservationWhere,
+      id: input.asnMapId,
+      sourceType: 'STOCK_TRANSFER',
+      // The parent this transaction locked at step 2. A header pointing anywhere else
+      // is not one these locks cover, so it is not ours to dispose of.
+      sourceId: input.transferId,
+    },
+    select: { id: true },
+  })
+  if (!header) return null
+
+  const discovered = await tx.wmsAsnLineMap.findMany({
+    where: { asnMapId: input.asnMapId },
+    select: { id: true },
+    orderBy: [{ id: 'asc' }],
+  })
+  const locked = new Set(await lockWmsAsnLineMaps(tx, discovered.map((row) => row.id))) // step 4
+
+  const lines = await tx.wmsAsnLineMap.findMany({
+    where: { asnMapId: input.asnMapId },
+    select: PENDING_ASN_RESERVATION_LINE_SELECT,
+    orderBy: [{ id: 'asc' }],
+  })
+  const unlocked = lines.filter((line) => !locked.has(line.id)).map((line) => line.id)
+  if (unlocked.length > 0) throw new PendingAsnLineNotLockedError(input.asnMapId, unlocked)
+
+  return { asnMapId: header.id, lines }
+}
+
+export type PendingAsnDisposalOutcome = 'retired' | 'deleted' | 'absent'
+
+/**
+ * THE ONLY WAY a pending transfer ASN reservation is disposed of: lock (2 → 3 → 4),
+ * re-read the credit, then retire it if anything is credited or delete it if nothing
+ * is — all inside the caller's transaction, which must not have taken a step-3 or
+ * step-4 lock before calling (it may hold step 2).
+ */
+export async function disposePendingTransferAsnReservation(
+  tx: Prisma.TransactionClient,
+  input: { transferId: string; asnMapId: string; reservationWhere?: Prisma.WmsAsnMapWhereInput },
+): Promise<PendingAsnDisposalOutcome> {
+  const reservation = await lockPendingTransferAsnReservation(tx, input)
+  if (!reservation) return 'absent'
+
+  const retirement = planPendingAsnReservationRetirement(reservation.lines)
+  if (retirement) {
+    await retirePendingAsnReservation(tx, reservation.asnMapId, retirement)
+    return 'retired'
+  }
+
+  const { count } = await tx.wmsAsnMap.deleteMany({
+    where: {
+      ...input.reservationWhere,
+      id: reservation.asnMapId,
+      sourceType: 'STOCK_TRANSFER',
+      sourceId: input.transferId,
+      // THE BACKSTOP — see UNCREDITED_ASN_MAP_WHERE. The locks above are the fix.
+      ...UNCREDITED_ASN_MAP_WHERE,
+    },
+  })
+  if (count !== 1) throw new PendingAsnDisposalBackstopError(reservation.asnMapId)
+  return 'deleted'
 }
