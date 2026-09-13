@@ -1,0 +1,413 @@
+/**
+ * o3d-j625 r3 (Codex HIGH 2, HIGH 3) — A CHART PROVES WHOSE ACCOUNT CODES A PAYLOAD CARRIES, NOT WHOSE
+ * DOCUMENT IDs.
+ *
+ * `accountingInvoiceId` and `bankAccountId` are primary keys in the accounting system's own database.
+ * The invoice id deliberately SURVIVES a connector switch (the document still exists where it was
+ * posted), so after a switch the r2 chart check passes — the codes really are the active connector's —
+ * while the payload still names the retired connector's document. These tests drive the REAL facade and
+ * the REAL in-transaction enqueue through the same harness as chart-connector-routing.test.ts and assert
+ * that a payload carrying a connector-native id is written ONLY when its provenance is declared and
+ * agrees with the chart. Absent, `null` (unrecorded) and disagreeing are all refusals, and all `refused`
+ * — never `not-configured`, which is the one no-op an obligation may be settled with.
+ *
+ * The harness below is copied verbatim from chart-connector-routing.test.ts (lines 1–253 there) rather
+ * than imported, because node:test module mocks are per-file.
+ */
+import assert from 'node:assert/strict'
+import test, { mock } from 'node:test'
+
+/**
+ * o3d-j625 — ONE CONNECTOR'S ROW MUST NOT CARRY ANOTHER CONNECTOR'S ACCOUNT CODES.
+ *
+ * THE DEFECT. `getAccountingSettings()` resolves the active accounting connector internally and
+ * returns THAT connector's chart of accounts. An unpinned enqueue then built its whole payload out of
+ * those codes and called `queueAccountingSync` with no connector at all, which resolved the active
+ * connector AGAIN. Two independent reads of one question, with a numbering read, a tax-rate lookup and
+ * a full line map in between: a switch committing in that window wrote connector B's row carrying
+ * connector A's `salesAccount` / `shippingAccount` / `discountAccount`. The document then posts to
+ * accounts that mean something else in the books it landed in, or is rejected there — and the row is
+ * durable and claimable either way.
+ *
+ * WHY THE o3d-i0o6 r8 FENCE DOES NOT COVER IT, AND WHY NO LOCK IS ADDED HERE. That fence is for PINNED
+ * enqueues — callers that PROVED a debit stands in particular books — and it is a transactional
+ * advisory lock plus `FOR UPDATE` on the plugin rows, held to the inserting commit. Taking it for every
+ * enqueue would serialise invoicing, shipment confirmation and every journal against each other and
+ * against every settings save, which is precisely the decision PR #679 took and this must not reopen.
+ * It is also not needed: the defect is a SECOND RESOLUTION, not an unlocked window, and deleting the
+ * second resolution closes it outright. `chartConnector` is the connector the CODES came from, and the
+ * facade ROUTES by it — so the row's connector and the payload's codes come from one read and cannot
+ * disagree however long the window is or however many switches commit inside it. That property is
+ * structural and costs no lock.
+ *
+ * WHAT THIS FILE PINS:
+ *
+ *   1. THE RIG CAN FIND THE DEFECT. The first test drives the unchartered enqueue through the exact
+ *      production interleaving and asserts the mis-attributed row — connector B, codes from A. Without
+ *      it, every "nothing was written" assertion below could be passing for the wrong reason.
+ *   2. A chartered enqueue in that same state writes NOTHING and answers `refused` (never
+ *      `not-configured` — the posting is still owed), naming the chart's connector.
+ *   3. It is not merely "always refuse": with the chart still active the row IS written, and written
+ *      through the CHART'S queue.
+ *   4. A `null` chart — no connector was on when the codes were read, so they are the empty-string
+ *      defaults — answers `not-configured` and writes nothing even though a connector has since come on.
+ *   5. A chart and a PIN that name different ledgers are refused rather than reconciled in either
+ *      direction.
+ *   6. THE REFUSAL IS NOT SILENTLY SWALLOWED. Most of the sites this closes ignore the enqueue's return
+ *      value entirely, so the record has to come from the facade: a WARNING activity naming the type,
+ *      the reference, the chart and the fact that the posting is still outstanding.
+ *   7. And the in-transaction enqueue takes the same parameter with the same meaning, because two
+ *      copies of this decision is what o3d-d0pd's three copies of the already-present check became.
+ *
+ * WHAT IT DOES NOT PROVE. That a switch committing between this pooled check and the connector queue's
+ * INSERT is prevented — it is not, deliberately: closing that window is what costs the global lock.
+ * What is closed there is the thing this issue is about, because the row is then written under the
+ * chart's own connector: correct codes in correct books, on a ledger the manual sync can still drain.
+ */
+
+// --------------------------------------------------------------------------------------------
+// The plugin selection, and the two charts
+// --------------------------------------------------------------------------------------------
+
+/** Which accounting plugins are on. Mutated MID-TEST to model the switch committing. */
+let enabledPlugins: string[] = ['xero']
+
+/**
+ * How many plugin-selection reads the facade has made, and a switch that commits AFTER a given number
+ * of them.
+ *
+ * THIS IS THE FIXTURE FOR THE OTHER HALF OF THE FIX, and without it that half is untestable. Refusing
+ * when the chart has been retired is one thing; the thing that makes the refusal BINDING is that the
+ * row is then ROUTED BY THE CHART rather than by a second read of the selection. Those two reads are
+ * microseconds apart in a double and would always agree, so a rig that only mutates `enabledPlugins`
+ * between statements cannot tell "routed by the chart" from "resolved again and happened to match".
+ * Flipping the selection BETWEEN READS is exactly the production window — the unfixed facade asked
+ * twice — and it is the only way to see the difference.
+ */
+let selectionReads = 0
+let flipToQuickBooksAfterReads: number | null = null
+
+mock.module('@/lib/integration-plugins', {
+  namedExports: {
+    isIntegrationPluginEnabled: async (id: string) => {
+      const answer = enabledPlugins.includes(id)
+      selectionReads++
+      if (flipToQuickBooksAfterReads !== null && selectionReads >= flipToQuickBooksAfterReads) {
+        enabledPlugins = ['quickbooks']
+      }
+      return answer
+    },
+  },
+})
+
+/** Xero's chart. Every code is distinguishable from QuickBooks's, which is the whole point. */
+mock.module('@/lib/connectors/xero/settings', {
+  namedExports: {
+    getXeroSettings: async () => ({
+      xero_sync_enabled: 'true',
+      xero_sync_sales_invoice: 'submitted',
+      xero_sync_inventory_adjustment: 'submitted',
+      xero_sales_account: 'X-SALES',
+      xero_shipping_account: 'X-SHIP',
+      xero_discount_account: 'X-DISC',
+      xero_cogs_account: 'X-COGS',
+      xero_inventory_revaluation_account: '',
+      xero_inventory_account: 'X-INV',
+      xero_allocated_inventory_account: 'X-ALLOC',
+      xero_unearned_revenue_account: 'X-UNEARNED',
+      xero_transit_account: 'X-TRANSIT',
+      xero_accounts_receivable_account: 'X-AR',
+      xero_accounts_payable_account: 'X-AP',
+      xero_realised_fx_gain_loss_account: 'X-RFX',
+      xero_unrealised_fx_gain_loss_account: 'X-UFX',
+      xero_manufacturing_overhead_account: 'X-MOH',
+    }),
+  },
+})
+
+mock.module('@/lib/connectors/quickbooks/settings', {
+  namedExports: {
+    getQuickBooksSettings: async () => ({
+      quickbooks_sync_enabled: 'true',
+      quickbooks_sync_sales_invoice: 'submitted',
+      quickbooks_sync_inventory_adjustment: 'submitted',
+      quickbooks_sales_account: 'Q-SALES',
+      quickbooks_shipping_account: 'Q-SHIP',
+      quickbooks_discount_account: 'Q-DISC',
+      quickbooks_cogs_account: 'Q-COGS',
+      quickbooks_inventory_account: 'Q-INV',
+      quickbooks_allocated_inventory_account: 'Q-ALLOC',
+      quickbooks_unearned_revenue_account: 'Q-UNEARNED',
+      quickbooks_transit_account: 'Q-TRANSIT',
+      quickbooks_accounts_receivable_account: 'Q-AR',
+      quickbooks_accounts_payable_account: 'Q-AP',
+      quickbooks_realised_fx_gain_loss_account: 'Q-RFX',
+      quickbooks_unrealised_fx_gain_loss_account: 'Q-UFX',
+      quickbooks_manufacturing_overhead_account: 'Q-MOH',
+    }),
+  },
+})
+
+// --------------------------------------------------------------------------------------------
+// The queues, the activity log, and the transaction double
+// --------------------------------------------------------------------------------------------
+
+/** Rows the facade routed, with the queue they went to and the codes they carried. */
+const routed: Array<{ queue: 'xero' | 'quickbooks'; type: string; salesAccount: unknown }> = []
+
+function recordRouted(queue: 'xero' | 'quickbooks') {
+  return async (params: { type: string; payload: Record<string, unknown> }) => {
+    const lines = params.payload.lines as Array<{ accountCode?: unknown }> | undefined
+    routed.push({ queue, type: params.type, salesAccount: lines?.[0]?.accountCode })
+    return { queued: true }
+  }
+}
+
+mock.module('@/lib/connectors/xero/queue', {
+  namedExports: { queueXeroSync: recordRouted('xero') },
+})
+mock.module('@/lib/connectors/quickbooks/queue', {
+  namedExports: { queueQuickBooksSync: recordRouted('quickbooks') },
+})
+
+/** Activity records written by the facade. */
+const activity: Array<{ action: string; description: string; metadata?: Record<string, unknown> }> = []
+mock.module('@/lib/activity-log', {
+  namedExports: {
+    logActivity: async (params: { action: string; description: string; metadata?: Record<string, unknown> }) => {
+      activity.push({ action: params.action, description: params.description, metadata: params.metadata })
+    },
+  },
+})
+
+/**
+ * The in-transaction enqueue's order-scope assertion. `none` so a refusal below is attributable to the
+ * chart check and not to the o3d-3zgy order-lock guard.
+ */
+mock.module('@/lib/domain/accounting/enqueue-order-guard', {
+  namedExports: {
+    resolveAccountingEnqueueOrderScope: async () => ({ scope: 'none' as const }),
+    lockOrderForAccountingEnqueue: async () => false,
+    findStaleOrderLevelDiscount: async () => null,
+    logStaleOrderDiscountEnqueue: async () => undefined,
+  },
+})
+mock.module('@/lib/connectors/accounting-id-provenance', {
+  namedExports: { activeAccountingIdProvenance: async () => ({}) },
+})
+mock.module('@/lib/connectors/accounting-connection-provenance', {
+  namedExports: {
+    stampAccountingPayloadConnection: (payload: Record<string, unknown>) => payload,
+    mintAccountingConnectionProvenanceColumn: () => null,
+  },
+})
+mock.module('@/lib/base-currency', { namedExports: { getBaseCurrencyCode: async () => 'GBP' } })
+mock.module('@/lib/domain/accounting/accounting-event-mirror', {
+  namedExports: { mirrorAccountingSyncLogToEvent: async () => undefined },
+})
+mock.module('@/lib/connectors/xero/outbox', {
+  namedExports: { scheduleXeroAccountingOutbox: async () => undefined },
+})
+mock.module('@/lib/domain/accounting/followup-scope-lock', {
+  namedExports: { lockFollowUpScope: async () => undefined },
+})
+
+/** Rows the IN-TRANSACTION enqueue inserted, with the connector each was written under. */
+const insertedInTx: Array<{ connector: string; type: string; salesAccount: unknown }> = []
+
+function transactionDouble() {
+  return {
+    $executeRaw: async () => 1,
+    $queryRaw: async () => [],
+    accountingSyncLog: {
+      findMany: async () => [],
+      create: async ({ data }: { data: { connector: string; type: string; payload: Record<string, unknown> } }) => {
+        const lines = data.payload.lines as Array<{ accountCode?: unknown }> | undefined
+        insertedInTx.push({ connector: data.connector, type: data.type, salesAccount: lines?.[0]?.accountCode })
+        return { id: `log-${insertedInTx.length}`, ...data }
+      },
+    },
+    activityLog: { create: async () => ({ id: 'activity-1' }) },
+    $transaction: async <T>(fn: (tx: unknown) => Promise<T>): Promise<T> => fn(transactionDouble()),
+  }
+}
+
+/** The core settings table `getAccountingSettingsFor` reads its connector-agnostic values from. */
+mock.module('@/lib/db', {
+  namedExports: {
+    db: {
+      setting: { findUnique: async () => null },
+      accountingSyncLog: { findMany: async () => [] },
+      accountingToken: { findFirst: async () => null },
+      $transaction: async <T>(fn: (tx: unknown) => Promise<T>): Promise<T> => fn(transactionDouble()),
+    },
+  },
+})
+
+mock.module('@/lib/db/savepoint', {
+  namedExports: { withSavepoint: async <T>(_tx: unknown, fn: () => Promise<T>): Promise<T> => fn() },
+})
+
+function reset(selection: string[]): void {
+  enabledPlugins = selection
+  selectionReads = 0
+  flipToQuickBooksAfterReads = null
+  routed.length = 0
+  insertedInTx.length = 0
+  activity.length = 0
+}
+
+/** A sales invoice whose one line carries whatever the chart said `salesAccount` is. */
+function salesInvoiceRequest(salesAccount: string) {
+  return {
+    type: 'SALES_INVOICE' as const,
+    referenceType: 'SalesOrder',
+    referenceId: 'order-1',
+    payload: { lines: [{ description: 'Widget', quantity: 1, unitAmount: 100, accountCode: salesAccount }] },
+  }
+}
+
+
+const CHART_CONNECTORS = ['xero', 'quickbooks'] as const
+
+/** A payment whose payload carries the two connector-native ids the finding is about. */
+function paymentRequest(type: 'INVOICE_PAYMENT' | 'BILL_PAYMENT') {
+  return {
+    type,
+    referenceType: type === 'INVOICE_PAYMENT' ? 'SalesOrder' : 'PurchaseInvoice',
+    referenceId: 'doc-1',
+    payload: { accountingInvoiceId: 'XERO-INV-1', bankAccountId: 'XERO-BANK-1', amount: 100 },
+  }
+}
+
+// --------------------------------------------------------------------------------------------
+// THE RIG CAN SEE THE DEFECT: without the provenance rule, a switched connector writes the row
+// --------------------------------------------------------------------------------------------
+
+test('[o3d-j625 r3] PRECONDITION: a payment carrying a document id IS written when its provenance agrees — the rule is not "always refuse"', async () => {
+  reset(['quickbooks'])
+  const { queueAccountingSync } = await import('@/lib/accounting')
+
+  const outcome = await queueAccountingSync({
+    ...paymentRequest('INVOICE_PAYMENT'),
+    chartConnector: 'quickbooks',
+    documentConnector: 'quickbooks',
+  })
+
+  assert.equal(outcome.queued, true)
+  assert.equal(routed.length, 1, 'the control case writes exactly one row')
+  assert.equal(routed[0].queue, 'quickbooks')
+})
+
+// --------------------------------------------------------------------------------------------
+// FAMILY A — the three ways provenance can fail to be established, on both enqueues
+// --------------------------------------------------------------------------------------------
+
+for (const [label, documentConnector] of [
+  ['UNDECLARED (a site that never thought about provenance)', undefined],
+  ['NULL (the link predates the column that records it — fail closed)', null],
+  ['the OTHER connector (the id survived the switch)', 'xero'],
+] as const) {
+  test(`[o3d-j625 r3] facade: a payload carrying a document id attributed to ${label} is REFUSED, and says so`, async () => {
+    reset(['quickbooks'])
+    const { queueAccountingSync } = await import('@/lib/accounting')
+
+    // The chart check passes on its own: QuickBooks' chart, QuickBooks active. That is exactly the state
+    // after a switch in which r2 approved the payment.
+    const outcome = await queueAccountingSync({
+      ...paymentRequest('INVOICE_PAYMENT'),
+      chartConnector: 'quickbooks',
+      ...(documentConnector === undefined ? {} : { documentConnector }),
+    })
+
+    assert.equal(routed.length, 0, 'NOTHING may be written against a document the target ledger may not hold')
+    assert.equal(outcome.queued, false)
+    assert.equal(outcome.reason, 'refused', 'refused, never not-configured: the payment is still owed')
+    const record = activity.find((a) => a.action === 'accounting_enqueue_refused_unattributable_document_id')
+    assert.ok(record, 'the refusal is RECORDED — most sites that reach this ignore the return value')
+    assert.deepEqual(record.metadata?.connectorNativePayloadKeys, ['accountingInvoiceId', 'bankAccountId'])
+    assert.equal(record.metadata?.documentConnectorDeclared, documentConnector !== undefined)
+  })
+
+  test(`[o3d-j625 r3] in-transaction: a payload carrying a document id attributed to ${label} is REFUSED`, async () => {
+    reset(['quickbooks'])
+    const { queueAccountingSyncTx } = await import('@/lib/accounting')
+
+    const answered: { outcome?: { queued: boolean; reason?: string; connector: string | null } } = {}
+    const queued = await queueAccountingSyncTx(transactionDouble() as never, {
+      ...paymentRequest('BILL_PAYMENT'),
+      chartConnector: 'quickbooks',
+      ...(documentConnector === undefined ? {} : { documentConnector }),
+      reportOutcome: (outcome) => { answered.outcome = outcome },
+    })
+
+    assert.equal(queued, false)
+    assert.deepEqual(insertedInTx, [], 'nothing is inserted')
+    assert.equal(answered.outcome?.reason, 'refused')
+  })
+}
+
+test('[o3d-j625 r3] the rule is read off the PAYLOAD, so a payload with NO document id needs no declaration', async () => {
+  // Otherwise every journal site would have to declare a provenance it has nothing to declare about,
+  // and an optional parameter that every caller passes as noise is a parameter nobody reads.
+  for (const chart of CHART_CONNECTORS) {
+    reset([chart])
+    const { getAccountingSettings, queueAccountingSync } = await import('@/lib/accounting')
+    const settings = await getAccountingSettings()
+    const outcome = await queueAccountingSync({ ...salesInvoiceRequest(settings.salesAccount), chartConnector: settings.connector })
+    assert.equal(outcome.queued, true, `${chart}: a code-only payload is unaffected`)
+  }
+})
+
+test('[o3d-j625 r3] every connector-native key is guarded, each on its own', async () => {
+  const { CONNECTOR_NATIVE_PAYLOAD_ID_KEYS } = await import('@/lib/accounting')
+  // Match count printed and asserted, so a key list that shrank to nothing cannot pass by examining nothing.
+  assert.deepEqual([...CONNECTOR_NATIVE_PAYLOAD_ID_KEYS].sort(), [
+    'accountingCreditNoteId',
+    'accountingInvoiceId',
+    'allocateToInvoiceId',
+    'bankAccountId',
+    'creditNoteId',
+  ].sort())
+  let refusedCount = 0
+  for (const key of CONNECTOR_NATIVE_PAYLOAD_ID_KEYS) {
+    reset(['quickbooks'])
+    const { queueAccountingSync } = await import('@/lib/accounting')
+    const outcome = await queueAccountingSync({
+      type: 'PURCHASE_CREDIT_NOTE',
+      referenceType: 'SupplierCreditNote',
+      referenceId: 'cn-1',
+      payload: { [key]: 'SOME-NATIVE-ID' },
+      chartConnector: 'quickbooks',
+      documentConnector: null,
+    })
+    assert.equal(outcome.reason, 'refused', `${key} with no provenance is refused`)
+    assert.equal(routed.length, 0, `${key}: nothing written`)
+    refusedCount++
+  }
+  assert.equal(refusedCount, 5)
+})
+
+test('[o3d-j625 r3] an EMPTY id is not an id — a payload with `accountingInvoiceId: ""` is not refused for provenance', async () => {
+  reset(['xero'])
+  const { queueAccountingSync } = await import('@/lib/accounting')
+  const outcome = await queueAccountingSync({
+    type: 'INVOICE_PAYMENT',
+    referenceType: 'SalesOrder',
+    referenceId: 'order-1',
+    payload: { accountingInvoiceId: '', amount: 1 },
+    chartConnector: 'xero',
+  })
+  assert.equal(outcome.queued, true)
+  assert.equal(activity.some((a) => a.action === 'accounting_enqueue_refused_unattributable_document_id'), false)
+})
+
+test('[o3d-j625 r3] a recorded value this build cannot route is `null`, never narrowed to a supported one', async () => {
+  const { asRoutableAccountingConnector } = await import('@/lib/accounting')
+  assert.equal(asRoutableAccountingConnector('xero'), 'xero')
+  assert.equal(asRoutableAccountingConnector('quickbooks'), 'quickbooks')
+  assert.equal(asRoutableAccountingConnector('shiphero'), null)
+  assert.equal(asRoutableAccountingConnector(''), null)
+  assert.equal(asRoutableAccountingConnector(null), null)
+  assert.equal(asRoutableAccountingConnector(undefined), null)
+})

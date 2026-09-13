@@ -11,6 +11,7 @@
 
 import { accountingPayloadKey } from '@/lib/accounting/payload-key'
 import { queueAccountingSync, isAccountingSyncTypeEnabledFor, getActiveAccountingConnectorInfo } from '@/lib/accounting'
+import { postingIsOwed, reportPostingNotQueued } from '@/lib/domain/accounting/enqueue-outcome'
 import { logActivity } from '@/lib/activity-log'
 
 type TaxRateForSync = {
@@ -61,7 +62,7 @@ export async function maybeQueueTaxRateSync(taxRate: TaxRateForSync): Promise<vo
     status: 'ACTIVE' as const,
   }
   const idempotencyKey = accountingPayloadKey(`tax-rate-sync:${taxRate.id}`, payload)
-  await queueAccountingSync({
+  const enqueued = await queueAccountingSync({
     type: 'TAX_RATE_SYNC',
     referenceType: 'TaxRate',
     referenceId: taxRate.id,
@@ -74,4 +75,23 @@ export async function maybeQueueTaxRateSync(taxRate: TaxRateForSync): Promise<vo
     // queued — which is exactly the posting the refusal above exists to prevent.
     chartConnector: connector.id,
   })
+  // o3d-j625 r3 (Codex HIGH 1 family) — THE ANSWER IS READ.
+  //
+  // This function returns `void` and its caller (`app/actions/settings.ts`) goes on to save and report
+  // the tax rate as synced. A refusal produced NO record at all, which is the one thing the
+  // unsupported-connector path immediately above this does not do — it warns. Same channel, same shape.
+  if (postingIsOwed(enqueued)) {
+    await reportPostingNotQueued({
+      entityType: 'SETTING',
+      action: 'tax_rate_sync_not_queued',
+      posting: `the tax-rate push for "${taxRate.name}"`,
+      committed: 'the tax rate is saved in IMS',
+      remedy:
+        'The accounting connector still holds the OLD rate, so documents will post under it. Save the '
+        + 'rate again once the accounting connector selection has settled, or correct the rate by hand in '
+        + 'the connector.',
+      outcome: enqueued,
+      metadata: { taxRateId: taxRate.id, chartConnector: connector.id },
+    })
+  }
 }

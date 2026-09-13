@@ -58,7 +58,9 @@ import {
   isAccountingSyncTypeEnabledFor,
   type AccountingEnqueueOutcome,
   type AccountingSettings,
+  asRoutableAccountingConnector,
 } from '@/lib/accounting'
+import { postingIsOwed, reportPostingNotQueued } from '@/lib/domain/accounting/enqueue-outcome'
 import {
   openRefundAccountingObligationLedger,
   type RefundAccountingObligation,
@@ -1339,6 +1341,9 @@ async function queueSalesInvoiceForOrder(id: string): Promise<void> {
       pricesIncludeVat: true,
       discountAmount: true,
       accountingInvoiceId: true,
+      // o3d-j625 r3 (Codex HIGH 2): and whose invoice it is, for the UPDATE arm below — the id survives a
+      // connector switch and the chart cannot speak for it.
+      accountingInvoiceConnector: true,
       invoiceNumber: true,
       lines: {
         select: {
@@ -1473,6 +1478,9 @@ async function queueSalesInvoiceForOrder(id: string): Promise<void> {
       // o3d-j625: the chart these account codes came from, so this helper's own resolution of the
       // active connector cannot silently disagree with the one that produced them.
       chartConnector: settings.connector,
+      // o3d-j625 r3 (Codex HIGH 2): and whose invoice `so.accountingInvoiceId` — the document this update
+      // is posted AGAINST — actually is. The chart cannot answer that: the id survives a switch.
+      documentConnector: asRoutableAccountingConnector(so.accountingInvoiceConnector),
     }, {
       getActiveAccountingConnectorInfo,
       isAccountingSyncTypeEnabled,
@@ -1490,7 +1498,7 @@ async function queueSalesInvoiceForOrder(id: string): Promise<void> {
   // window remains for them to disagree across. A chart whose connector has since been retired is
   // refused and recorded by the facade (accounting_enqueue_refused_retired_chart) rather than posted to
   // the wrong books; the invoice is re-queued by finalising the order again.
-  await queueAccountingSync({
+  const invoiceEnqueued = await queueAccountingSync({
     type: 'SALES_INVOICE',
     referenceType: 'SalesOrder',
     referenceId: so.id,
@@ -1498,6 +1506,29 @@ async function queueSalesInvoiceForOrder(id: string): Promise<void> {
     idempotencyKey: accountingPayloadKey(`sales-invoice:${so.id}`, payload),
     chartConnector: settings.connector,
   })
+  // o3d-j625 r3 (Codex HIGH 1 family) — AND THE ANSWER IS READ.
+  //
+  // This function returns `void`, and both callers go straight on to report the order created or
+  // finalised. A refusal — the chart was retired between the settings read above and this line — left
+  // the order finalised with no invoice queued, no warning, and nothing that retries: the enqueue
+  // RETURNS a refusal rather than throwing, so the callers' `catch` never saw it.
+  //
+  // Reported rather than thrown: finalising the order is a local decision the operator made and is not
+  // wrong; what is wrong is nobody being told the invoice did not go.
+  if (postingIsOwed(invoiceEnqueued)) {
+    await reportPostingNotQueued({
+      entityType: 'SALES_ORDER',
+      entityId: so.id,
+      action: 'sales_invoice_not_queued',
+      posting: `the sales invoice for ${orderNumber}`,
+      committed: 'the order is invoiced in IMS',
+      remedy:
+        'Finalise the order again once the accounting connector selection has settled, or raise the '
+        + 'invoice by hand in the books it belongs to.',
+      outcome: invoiceEnqueued,
+      metadata: { orderNumber, chartConnector: settings.connector },
+    })
+  }
 }
 
 export async function updateSalesOrderStatus(
@@ -3791,7 +3822,7 @@ export async function addPayment(input: {
             description: `Realised FX ${realised.outcome} on payment for ${getSalesOrderReference(txResult.so)}`,
           })
           if (lines.length > 0) {
-            await queueAccountingSync({
+            const fxEnqueued = await queueAccountingSync({
               type: 'REALISED_FX_JOURNAL',
               referenceType: 'Payment',
               referenceId: txResult.paymentId,
@@ -3818,6 +3849,24 @@ export async function addPayment(input: {
               // o3d-i0o6 round 7's check was before it was reached.
               chartConnector: accountingSettings.connector,
             })
+            // o3d-j625 r3 (Codex HIGH 1 family): the surrounding `catch` swallows THROWS so a journal
+            // problem cannot block a captured payment — which is right, and which is exactly why the
+            // RETURNED refusal had to be read here. A refused realised-FX journal produced no throw, no
+            // warning and no row: the gain or loss on this payment simply vanished from the books.
+            if (postingIsOwed(fxEnqueued)) {
+              await reportPostingNotQueued({
+                entityType: 'SALES_ORDER',
+                entityId: input.orderId,
+                action: 'realised_fx_journal_not_queued',
+                posting: `the realised FX journal for the payment on ${getSalesOrderReference(txResult.so)}`,
+                committed: 'the payment is recorded in IMS',
+                remedy:
+                  'The realised gain/loss on this settlement is NOT in the ledger. Raise it by hand, or '
+                  + 'clear the connector selection and re-run the FX revaluation for this date.',
+                outcome: fxEnqueued,
+                metadata: { paymentId: txResult.paymentId, chartConnector: accountingSettings.connector },
+              })
+            }
           }
         }
       } catch {

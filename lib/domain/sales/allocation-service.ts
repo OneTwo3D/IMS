@@ -2,6 +2,7 @@ import { randomUUID } from 'node:crypto'
 
 import { Prisma } from '@/app/generated/prisma/client'
 import type { db } from '@/lib/db'
+import type { AccountingEnqueueOutcome } from '@/lib/accounting'
 import {
   availableQtyFromRequirements,
   calculateDecimalCoverageByLine,
@@ -1276,6 +1277,12 @@ export async function reverseOrphanedAllocationPosting(
   // whereas a token is unique per call and dedupes nothing.
   const reversalToken = randomUUID()
 
+  // o3d-j625 r3 (Codex HIGH 1 family): the ANSWER is captured. The token re-read below is the stronger
+  // check and it stays — it is what the relief write is gated on, and it survives a caller that forgets.
+  // What the re-read cannot say is WHY there is no row, and that is the half the ERROR record was
+  // missing: a REFUSAL (the pin and the chart disagree, or the pinned ledger has been retired) needs a
+  // different action from a switched-off posting type.
+  const reversalOutcome: { outcome?: AccountingEnqueueOutcome } = {}
   await queueAccountingSyncTx(tx, {
     type: 'ALLOCATION_REVERSAL',
     // o3d-i0o6 — PINNED TO THE LEDGER THE PROOF WAS MADE ON, carried out of the verdict itself
@@ -1310,9 +1317,10 @@ export async function reverseOrphanedAllocationPosting(
         { accountCode: settings.allocatedInventoryAccount, description: `Allocation reversal: ${orderRef}`, credit: amount },
       ],
     },
+    reportOutcome: (outcome) => { reversalOutcome.outcome = outcome },
   })
 
-  const wasQueued = await assertAllocationReversalQueued(tx, orderId, reversalToken, amount, orphaned, proof.provedOnConnector)
+  const wasQueued = await assertAllocationReversalQueued(tx, orderId, reversalToken, amount, orphaned, proof.provedOnConnector, reversalOutcome.outcome ?? null)
   if (!wasQueued) return
 
   // o3d-0i5y r12 / o3d-xlk7 — AND THE CREDIT IS RECORDED WHERE THE REFUND'S OPEN BALANCE LOOKS.
@@ -1390,6 +1398,16 @@ async function assertAllocationReversalQueued(
    * caller records that amount as relief against the refund's open balance.
    */
   connector: string,
+  /**
+   * o3d-j625 r3 (Codex HIGH 1 family) — WHAT THE ENQUEUE ITSELF SAID, where it said anything.
+   *
+   * The row re-read above is the predicate and it does not change. This is for the RECORD: without it
+   * the ERROR below could only describe the absence, so an operator reading "was NOT queued" had no way
+   * to tell a switched-off posting type (turn it on and re-trim) from a REFUSAL (the pinned ledger has
+   * been retired, or the pin and the chart disagree — nothing to turn on). `null` = the enqueue reported
+   * nothing at all, which is itself worth recording rather than papering over.
+   */
+  enqueueOutcome: AccountingEnqueueOutcome | null,
 ): Promise<boolean> {
   const queued = await tx.accountingSyncLog.findFirst({
     where: {
@@ -1418,7 +1436,23 @@ async function assertAllocationReversalQueued(
         + `AccountingSyncLog row exists for reversal token ${reversalToken}. `
         + `${sumCostLayerSnapshotQty(orphaned).toString()} recorded unit(s) left the order and their `
         + 'Group A2 Allocated Inventory debit has been left standing with nothing downstream to '
-        + 'relieve it. Post DR Inventory / CR Allocated Inventory for this amount by hand.',
+        + 'relieve it. Post DR Inventory / CR Allocated Inventory for this amount by hand. '
+        + (enqueueOutcome?.reason === 'refused'
+          ? 'The accounting queue REFUSED it: the ledger this reversal was proved against is no longer '
+            + 'the active one, or its chart of accounts and the pinned ledger disagree. Switching the '
+            + 'connector selection back does not undo the debit — post the journal by hand.'
+          : enqueueOutcome?.reason === 'not-configured'
+            ? 'The connector does not post this journal type, so nothing will ever queue for it.'
+            : 'The enqueue reported no reason.'),
+      metadata: {
+        reversalToken,
+        amount,
+        connector,
+        // o3d-j625 r3: the enqueue's own answer, beside the absence the re-read found.
+        enqueueQueued: enqueueOutcome?.queued ?? null,
+        enqueueReason: enqueueOutcome?.reason ?? null,
+        enqueueConnector: enqueueOutcome?.connector ?? null,
+      },
     },
   })
   return false

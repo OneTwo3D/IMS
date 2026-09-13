@@ -1,5 +1,6 @@
 import type { Prisma } from '@/app/generated/prisma/client'
 import { queueAccountingSync, getAccountingSettings } from '@/lib/accounting'
+import { postingIsOwed, reportPostingNotQueued } from '@/lib/domain/accounting/enqueue-outcome'
 import { cogsEntryDataFromConsumed, consumeFifoLayersStrict, createCostLayer, getAverageUnitCost, getHistoricalAverageUnitCost, lockStockLevelRow } from '@/lib/cost-layers'
 import { assertStockAdjustmentFeasible } from '@/lib/domain/inventory/stock-adjustment-edit'
 import {
@@ -321,7 +322,7 @@ export async function applyStockAdjustment({
       note: reasonName,
     })
     if (journal) {
-      await queueAccountingSync({
+      const enqueued = await queueAccountingSync({
         type: 'INVENTORY_ADJUSTMENT',
         referenceType: 'StockMovement',
         referenceId: movement.id,
@@ -333,6 +334,26 @@ export async function applyStockAdjustment({
         // connector while carrying the first connector's inventory account.
         chartConnector: settings.connector,
       })
+      // o3d-j625 r3 (Codex HIGH 1 family) — THE ANSWER IS READ. The movement and its cost layers are
+      // already written, and a non-null return from this function is every caller's success signal
+      // (stock actions, stock counts, the import, the WMS stock sync), so a refusal committed the
+      // stock change and reported it as done. Worse for a BATCH: `providedSettings` is read once for the
+      // whole batch, so every row in the tail can refuse in silence.
+      if (postingIsOwed(enqueued)) {
+        await reportPostingNotQueued({
+          entityType: 'STOCK_ADJUSTMENT',
+          entityId: movement.id,
+          action: 'inventory_adjustment_journal_not_queued',
+          posting: `the inventory adjustment journal for ${product?.sku ?? productId} at ${warehouse?.name ?? warehouseId}`,
+          committed: 'the stock movement and its cost layers are written in IMS',
+          remedy:
+            'Inventory in the ledger no longer matches IMS by the value of this adjustment. Post the '
+            + 'journal by hand, or re-run the daily reconcile once the accounting connector selection has '
+            + 'settled.',
+          outcome: enqueued,
+          metadata: { movementId: movement.id, productId, warehouseId, chartConnector: settings.connector },
+        })
+      }
     }
   }
 

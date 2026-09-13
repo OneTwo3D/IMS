@@ -180,7 +180,30 @@ async function queueShipmentCogsRevaluationSync(
   }
 
   const revaluationIdempotencyKey = `shipment-cogs-revalue:${input.shipmentId}:${input.costLayerId}:${payload.oldCogsBase}:${payload.newCogsBase}${options.recalcRunId ? `:${options.recalcRunId}` : ''}`
-  await (options.queueAccountingSync ?? queueAccountingSyncTx)(tx, {
+  // o3d-j625 r3 (Codex HIGH 1) — WHAT THE ENQUEUE ANSWERED, READ.
+  //
+  // This return value was DISCARDED, and it is the one place in the whole sweep where discarding it
+  // makes the two ledgers disagree rather than merely losing a posting. On a decline the function went
+  // on to record the COGS subledger movement and return `true`; `true` is how the caller decides the
+  // delta is already posted and DROPS IT from the compensating landed-cost COGS journal. So the GL
+  // received neither the COGS_REVERSAL nor the journal that was supposed to cover its absence, while
+  // the COGS subledger carried a movement claiming it had. Nothing anywhere said so.
+  //
+  // `false` here means the same thing `false` means at every other exit of this function — see
+  // audit-3aph: "this revaluation did NOT post here, so the caller must keep the delta in its own
+  // retrospective COGS journal". That is the correct answer for BOTH shapes of decline, which is why
+  // the boolean is enough and the `WithOutcome` adapter is not reached for:
+  //
+  //   refused          the chart was retired (or the document provenance could not be established).
+  //                    The posting is owed; leaving the delta in the journal is how it still gets made.
+  //   not-configured   the connector stopped posting COGS_REVERSAL between the `isEnabled()` check
+  //                    above and this write. Also "it did not post here" — and the journal, which is
+  //                    gated by the same connector, simply will not post either. No harm, no claim.
+  //
+  // AND THE SUBLEDGER ROW IS NOT WRITTEN. It exists to mirror the GL movement this enqueue makes
+  // (khdw), keyed identically to it; writing it for a journal that was declined is precisely the
+  // subledger-claims-what-the-GL-never-got divergence.
+  const queued = await (options.queueAccountingSync ?? queueAccountingSyncTx)(tx, {
     type: 'COGS_REVERSAL',
     referenceType: 'Shipment',
     referenceId: input.shipmentId,
@@ -205,9 +228,18 @@ async function queueShipmentCogsRevaluationSync(
     // by the chart is what makes each of those rows describe the books it is written into.
     chartConnector: settings.connector,
   })
+  if (!queued) {
+    console.warn(
+      `queueShipmentCogsRevaluationSync: the accounting queue DECLINED the COGS_REVERSAL for shipment `
+      + `${input.shipmentId} (cost layer ${input.costLayerId}), so no COGS subledger row was recorded and `
+      + 'the revaluation delta stays in the caller\'s retrospective COGS journal (o3d-j625 r3).',
+    )
+    return false
+  }
   // khdw: record the net COGS-account movement of this revaluation (reverse old +
   // repost new → net debit = newCogs − oldCogs, both 2dp) in the COGS subledger
   // ledger, keyed identically to the sync so it dedupes across retries.
+  // o3d-j625 r3: reached only when the journal was actually queued — see above.
   await recordCogsSubledgerMovement(tx, {
     sourceType: 'SHIPMENT_REVALUATION',
     sourceRef: input.shipmentId,

@@ -1,6 +1,7 @@
 import { randomUUID } from 'node:crypto'
 import { Prisma } from '@/app/generated/prisma/client'
 import { getAccountingSettings, queueAccountingSync, queueAccountingSyncTx, type AccountingSettings } from '@/lib/accounting'
+import { postingIsOwed, reportPostingNotQueued, type EnqueueOutcomeLike } from '@/lib/domain/accounting/enqueue-outcome'
 import { accountingPayloadKey } from '@/lib/accounting/payload-key'
 import { logActivity } from '@/lib/activity-log'
 import {
@@ -805,6 +806,9 @@ export async function queueLandedCostAdjustmentJournals(
     // signed delta follows the transit LEG: increase → CR transit (−), decrease → DR
     // transit (+). Keyed by the journal's OWN idempotency key.
     const reclassIdempotencyKey = landedCostAdjustmentIdempotencyKey('inventory', adj)
+    // o3d-j625 r3 (Codex HIGH 1 family): a HOLDER, so TypeScript does not collapse it to `never` on the
+    // strength of assignments it cannot see inside the transaction callback.
+    const postingOutcome: { outcome?: EnqueueOutcomeLike } = {}
     await db.$transaction(async (tx) => {
       const queued = await queueAccountingSyncTx(tx, {
         type: 'STOCK_IN_TRANSIT',
@@ -819,6 +823,10 @@ export async function queueLandedCostAdjustmentJournals(
         // split one run's journals across two ledgers while every one of them carried the first
         // connector's codes. Routed by the chart, the later ones refuse instead.
         chartConnector: settings.connector,
+        // o3d-j625 r3 (Codex HIGH 1 family): the whole answer. Each iteration opens its own transaction
+        // and nothing outside the loop accounts for a failure, so a mid-loop decline silently dropped
+        // that PO's reclass while the recalculation reported normally.
+        reportOutcome: (outcome) => { postingOutcome.outcome = outcome },
       })
       if (queued) {
         await recordTransitSubledgerMovement(tx, {
@@ -830,6 +838,21 @@ export async function queueLandedCostAdjustmentJournals(
         })
       }
     })
+    if (postingOutcome.outcome && postingIsOwed(postingOutcome.outcome)) {
+      await reportPostingNotQueued({
+        entityType: 'PURCHASE_ORDER',
+        entityId: adj.primaryPoId,
+        action: 'landed_cost_reclass_not_queued',
+        posting: `the landed-cost inventory/transit reclass for ${adj.primaryPoRef}`,
+        committed: 'the landed cost is applied to the stock on hand in IMS',
+        remedy:
+          'Inventory and goods-in-transit in the ledger no longer match IMS for this order. Post the '
+          + 'reclass by hand, or re-run the landed-cost recalculation once the accounting connector '
+          + 'selection has settled.',
+        outcome: postingOutcome.outcome,
+        metadata: { primaryPoRef: adj.primaryPoRef, chartConnector: settings.connector },
+      })
+    }
   }
 
   // scjz.34: the CONSUMED-qty correction (goods already sold) offsets COGS to the
@@ -859,6 +882,9 @@ export async function queueLandedCostAdjustmentJournals(
       ],
     }
     const cogsIdempotencyKey = landedCostAdjustmentIdempotencyKey('cogs', adj)
+    // o3d-j625 r3 (Codex HIGH 1 family): a HOLDER, so TypeScript does not collapse it to `never` on the
+    // strength of assignments it cannot see inside the transaction callback.
+    const cogsPostingOutcome: { outcome?: EnqueueOutcomeLike } = {}
     // bcz9.2: commit the COGS journal queue + its subledger ledger row atomically in
     // one transaction so a crash (or a posting-setting change) between them can't leave
     // a queued journal with no ledger row, or a ledger row with no journal — either of
@@ -876,6 +902,8 @@ export async function queueLandedCostAdjustmentJournals(
         // o3d-j625 r2: `settings.cogsAccount` and `resolveConsumedCogsOffsetAccount(settings)` — the
         // same `settings` object as the reclass loop above, and the same per-iteration transaction.
         chartConnector: settings.connector,
+        // o3d-j625 r3 (Codex HIGH 1 family): per-iteration, per-transaction, and previously unreported.
+        reportOutcome: (outcome) => { cogsPostingOutcome.outcome = outcome },
       })
       if (queued) {
         await recordCogsSubledgerMovement(tx, {
@@ -899,6 +927,21 @@ export async function queueLandedCostAdjustmentJournals(
         })
       }
     })
+    if (cogsPostingOutcome.outcome && postingIsOwed(cogsPostingOutcome.outcome)) {
+      await reportPostingNotQueued({
+        entityType: 'PURCHASE_ORDER',
+        entityId: adj.primaryPoId,
+        action: 'landed_cost_cogs_journal_not_queued',
+        posting: `the retrospective COGS adjustment for ${adj.primaryPoRef}`,
+        committed: 'the landed-cost change is applied to the sold units in IMS',
+        remedy:
+          'COGS in the ledger does not reflect this landed-cost change and the freight liability will '
+          + 'not drain out of goods-in-transit. Post the adjustment by hand, or re-run the landed-cost '
+          + 'recalculation once the accounting connector selection has settled.',
+        outcome: cogsPostingOutcome.outcome,
+        metadata: { primaryPoRef: adj.primaryPoRef, chartConnector: settings.connector },
+      })
+    }
   }
 }
 

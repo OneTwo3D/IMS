@@ -4,6 +4,7 @@
 
 import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
+import { postingIsOwed, reportPostingNotQueued, type EnqueueOutcomeLike } from '@/lib/domain/accounting/enqueue-outcome'
 import { wcFetch, MAX_WC_PAGE_WALK_PAGES, describeWcPageWalkCeilingStall } from '../api'
 import type { WcFullOrder, SyncResult } from './types'
 import {
@@ -1185,9 +1186,15 @@ async function releaseHeldWcSalesInvoice(
     }
     return 'not-queued'
   }
+  // o3d-j625 r3 (Codex HIGH 1 family): the outcome is CAPTURED, not because the row re-read below is
+  // insufficient — it is the stronger check and it stays — but because the re-read cannot say WHY there
+  // is no row, and the message written when there is none asserted the wrong reason ("the connector is
+  // disconnected, its sync is switched off") for a REFUSAL. A refusal is a retired chart, and telling an
+  // operator to check a toggle sends them somewhere the answer is not.
+  const enqueueOutcome: { outcome?: EnqueueOutcomeLike } = {}
   try {
     const { queueAccountingSync } = await import('@/lib/accounting')
-    await queueAccountingSync({
+    enqueueOutcome.outcome = await queueAccountingSync({
       type: 'SALES_INVOICE',
       referenceType: 'SalesOrder',
       referenceId: orderId,
@@ -1243,12 +1250,17 @@ async function releaseHeldWcSalesInvoice(
   if (!queued) {
     // Left PENDING on purpose, exactly as the throwing case is: the sweep tries again, and the
     // deterministic key means a later success adds one row, not two.
+    // o3d-j625 r3: the reason the enqueue itself gave, where it gave one.
+    const cause = enqueueOutcome.outcome?.reason === 'refused'
+      ? 'The accounting queue REFUSED it: this invoice was built from a chart of accounts whose connector '
+        + 'is no longer the active one (see the accounting activity log for which), so its account codes do '
+        + 'not describe the ledger it would be written to.'
+      : 'The usual cause is that the accounting connector is disconnected, its sync is switched off, or '
+        + 'Sales Invoices are set to off.'
     await noteHeldReleaseFailure(
       row.id,
       `WooCommerce numbered this invoice ${invoiceNumber}, but queueing the held sales invoice produced no `
-      + 'accounting sync row, so NOTHING will post. The usual cause is that the accounting connector is '
-      + 'disconnected, its sync is switched off, or Sales Invoices are set to off. Retried by the WooCommerce '
-      + 'reconcile sweep.',
+      + `accounting sync row, so NOTHING will post. ${cause} Retried by the WooCommerce reconcile sweep.`,
     )
     if (logFailure) {
       await logActivity({
@@ -1259,11 +1271,15 @@ async function releaseHeldWcSalesInvoice(
         level: 'WARNING',
         description:
           `WooCommerce order ${wcOrder.externalOrderNumber} has its invoice number (${invoiceNumber}), but queueing the held `
-          + 'sales invoice produced no accounting sync row, so NOTHING will post. The usual cause is that the '
-          + 'accounting connector is disconnected, its sync is switched off, or Sales Invoices are set to off; the '
-          + 'other is that the sales order was deleted. The order stays queued for release and is retried by the '
+          + `sales invoice produced no accounting sync row, so NOTHING will post. ${cause} The other possibility is `
+          + 'that the sales order was deleted. The order stays queued for release and is retried by the '
           + 'WooCommerce reconcile sweep.',
-        metadata: { connector: 'woocommerce', externalOrderId: wcOrder.externalOrderId, invoiceNumber, idempotencyKey },
+        metadata: {
+          connector: 'woocommerce', externalOrderId: wcOrder.externalOrderId, invoiceNumber, idempotencyKey,
+          // o3d-j625 r3: what the enqueue actually answered, beside the absence the re-read found.
+          enqueueReason: enqueueOutcome.outcome?.reason ?? null,
+          enqueueConnector: enqueueOutcome.outcome?.connector ?? null,
+        },
         resolveUser: false,
       }).catch(() => {})
     }
@@ -2464,7 +2480,7 @@ export async function importWcOrder(wcOrder: WcFullOrder, options: ImportWcOrder
       }
 
       if (invoiceNumberResolution.ok) {
-        await queueAccountingSync({
+        const enqueued = await queueAccountingSync({
           type: 'SALES_INVOICE',
           referenceType: 'SalesOrder',
           referenceId: so.id,
@@ -2475,6 +2491,31 @@ export async function importWcOrder(wcOrder: WcFullOrder, options: ImportWcOrder
           // own connector so the row cannot be the other connector's.
           chartConnector: settings.connector,
         })
+        // o3d-j625 r3 (Codex HIGH 1 family) — THE ANSWER IS READ, which on this arm nothing did.
+        //
+        // The enclosing `catch` only sees THROWS. A refusal returned cleanly, and the import then wrote
+        // `shoppingSyncLog { status: 'SYNCED' }`, an INFO "imported" activity log, and
+        // `{ success: true }` — an order recorded as fully synced with no invoice queued. Unlike the
+        // HELD-release arm below, there was no row re-read to catch it either.
+        if (postingIsOwed(enqueued)) {
+          await reportPostingNotQueued({
+            entityType: 'SALES_ORDER',
+            entityId: so.id,
+            action: 'sales_invoice_not_queued',
+            posting: `the sales invoice for imported WooCommerce order ${orderNumber}`,
+            committed: 'the order is imported and marked synced in IMS',
+            remedy:
+              'No invoice will post for this order. Re-queue it from the order once the accounting '
+              + 'connector selection has settled, or raise the invoice by hand in the books it belongs to.',
+            outcome: enqueued,
+            metadata: {
+              connector: 'woocommerce',
+              externalOrderId: String(wcOrder.id),
+              orderNumber,
+              chartConnector: settings.connector,
+            },
+          })
+        }
       } else {
         await holdWcSalesInvoiceForMissingNumber({
           salesOrderId: so.id,

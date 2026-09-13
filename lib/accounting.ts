@@ -18,6 +18,7 @@ import {
   PRIOR_ATTEMPT_SELECT,
   priorAttemptsWhere,
 } from '@/lib/domain/accounting/prior-posting-evidence'
+import { connectorNativePayloadIdKeys } from '@/lib/accounting/connector-provenance'
 
 export type AccountingSettings = {
   syncEnabled: boolean
@@ -312,6 +313,47 @@ export type AccountingEnqueueOutcome = ConnectorEnqueueOutcome & {
   connector: AccountingConnectorInfo['id'] | null
 }
 
+// o3d-j625 r3: the PURE provenance helpers live in lib/accounting/connector-provenance.ts, which imports
+// nothing, so a test that mocks this module does not have to re-implement them (and cannot drift from
+// them by doing so). Re-exported here so callers of the accounting facade keep one import.
+export {
+  CONNECTOR_NATIVE_PAYLOAD_ID_KEYS,
+  asRoutableAccountingConnector,
+  connectorNativePayloadIdKeys,
+} from '@/lib/accounting/connector-provenance'
+/**
+ * o3d-j625 r3 (Codex HIGH 3) — IS THIS BANK/PAYMENT ACCOUNT ID ONE OF THAT CONNECTOR'S?
+ *
+ * The one connector-native id with nowhere to record provenance. It is resolved through
+ * `lookupPaymentAccount(await getPaymentAccountMap(), method, currency)`, and
+ * `accounting_payment_account_map` is a SINGLE settings row shared by both connectors — r2 read the
+ * word "connector-agnostic" beside it and concluded it was therefore not a second resolution. Half
+ * true: the LOOKUP is agnostic (keys are `method:currency`), the VALUES are not — they are one
+ * connector's own account ids, and the setting was literally renamed out of `xero_payment_account_map`
+ * (migration 20260410180000_generic_payment_account_map) without being re-scoped, so a map an operator
+ * filled in under Xero returns Xero AccountIDs to a QuickBooks payment.
+ *
+ * Provenance here is therefore established by CONFIRMATION rather than by a recorded column: the id is
+ * looked up in `AccountingAccount`, which is keyed `(connector, externalAccountId)` and populated per
+ * connector from that connector's own chart. A hit proves the property the payload actually needs —
+ * that the id names a real, active bank account IN THE BOOKS THE ROW IS BEING ROUTED TO. It does NOT
+ * prove the id is unique across connectors, and does not need to: the failure being prevented is a
+ * payment naming an account the target ledger does not hold.
+ *
+ * A miss is answered `false`, which the caller turns into a refusal. It is a local read — no remote
+ * call — so it cannot itself fail open on a connector outage.
+ */
+export async function accountingBankAccountBelongsTo(
+  connector: AccountingConnectorInfo['id'],
+  externalAccountId: string,
+): Promise<boolean> {
+  if (!externalAccountId) return false
+  const accounts = connector === 'quickbooks'
+    ? await (await import('@/lib/connectors/quickbooks/accounts')).listStoredBankAccounts()
+    : await (await import('@/lib/connectors/xero/accounts')).listStoredBankAccounts()
+  return accounts.some((account) => account.id === externalAccountId)
+}
+
 /**
  * o3d-j625 — THE ACCOUNT CODES AND THE ROW MUST COME OUT OF ONE RESOLUTION OF "WHICH CONNECTOR".
  *
@@ -385,6 +427,31 @@ async function refuseUnattributableChart(params: {
    * omission.
    */
   chartConnector: AccountingConnectorInfo['id'] | null
+  /**
+   * WHAT THE PAYLOAD ACTUALLY CONTAINS — read, not described (o3d-j625 r3). See
+   * {@link CONNECTOR_NATIVE_PAYLOAD_ID_KEYS} for why this is a runtime read of the object rather than
+   * a promise the caller makes about it.
+   */
+  payload: Record<string, unknown>
+  /**
+   * o3d-j625 r3 (Codex HIGH 2/HIGH 3) — WHICH CONNECTOR'S DOCUMENT IDs THE PAYLOAD CARRIES.
+   *
+   * Only consulted when the payload actually carries one (the runtime read above), and then it must
+   * EQUAL `chartConnector`. All three ways it can fail to are refusals, and they are different
+   * problems with different fixes:
+   *
+   *   undefined   the caller put a connector-native id in the payload and declared nothing about it.
+   *               A NEW enqueue site that has not thought about provenance lands here, and it is
+   *               refused rather than routed — which is the only reason this can be optional at all:
+   *               the default is the SAFE answer, not the old behaviour. (Contrast `chartConnector`,
+   *               whose optional form defaulted to the defect.)
+   *   null        the id's provenance was never recorded — a row linked before
+   *               `accountingInvoiceConnector` existed. FAIL CLOSED: a retained id with no provenance
+   *               must not be assumed to belong to the active connector, which is the inference this
+   *               whole finding is about.
+   *   other id    the payload carries the OTHER connector's document id. The mis-routing itself.
+   */
+  documentConnector?: AccountingConnectorInfo['id'] | null
 }): Promise<AccountingEnqueueOutcome | null> {
   // AND IF SOMETHING GETS HERE NAMING NOTHING, IT IS REFUSED — NOT ACCOMMODATED.
   //
@@ -407,6 +474,47 @@ async function refuseUnattributableChart(params: {
   // is refused rather than resolved in either direction. No caller passes both today.
   if (params.connector && params.connector !== params.chartConnector) {
     return { queued: false, reason: 'refused', connector: params.connector }
+  }
+  // o3d-j625 r3 (Codex HIGH 2, HIGH 3) — AND THE DOCUMENT IDs IN THE PAYLOAD MUST BE THAT
+  // CONNECTOR'S TOO, ESTABLISHED RATHER THAN INFERRED FROM THE CHART.
+  //
+  // Checked BEFORE the retired-chart read below, and deliberately: this is decidable from the
+  // caller's own two values with no database read at all, and a payload carrying the other ledger's
+  // primary key must be refused whether or not the chart is still active.
+  const nativeIdKeys = connectorNativePayloadIdKeys(params.payload)
+  if (nativeIdKeys.length > 0 && params.documentConnector !== params.chartConnector) {
+    const declared = params.documentConnector === undefined
+      ? 'nothing at all'
+      : params.documentConnector === null
+        ? 'no connector (the link predates the column that records it)'
+        : params.documentConnector
+    const { logActivity } = await import('@/lib/activity-log')
+    await logActivity({
+      entityType: 'SYSTEM',
+      action: 'accounting_enqueue_refused_unattributable_document_id',
+      tag: 'accounting',
+      level: 'WARNING',
+      description:
+        `NOTHING WAS QUEUED. The ${params.type} for ${params.referenceType} ${params.referenceId} carries `
+        + `${params.chartConnector}'s account codes but its ${nativeIdKeys.join(', ')} `
+        + `${nativeIdKeys.length === 1 ? 'is' : 'are'} attributed to ${declared}. A connector-native `
+        + 'document or account id is a primary key in the accounting system\'s own database and it '
+        + 'SURVIVES a connector switch, so it cannot be assumed to belong to whichever connector is '
+        + 'active now: queueing this would send a payment or correction against a document '
+        + `${params.chartConnector} does not hold. This posting is still OUTSTANDING: re-raise it from `
+        + 'the source document once the connector selection has settled, or record the posting by hand '
+        + 'in the books that actually hold the document.',
+      metadata: {
+        chartConnector: params.chartConnector,
+        documentConnector: params.documentConnector ?? null,
+        documentConnectorDeclared: params.documentConnector !== undefined,
+        connectorNativePayloadKeys: nativeIdKeys,
+        type: params.type,
+        referenceType: params.referenceType,
+        referenceId: params.referenceId,
+      },
+    }).catch(() => { /* logging must never turn a refusal into a throw */ })
+    return { queued: false, reason: 'refused', connector: params.chartConnector }
   }
   // o3d-j625 r2 (Codex MEDIUM 2) — THE ACTIVE CONNECTOR IS READ INTO A VARIABLE, BECAUSE THE WARNING
   // HAS TO NAME IT.
@@ -501,6 +609,23 @@ export async function queueAccountingSync(params: {
    * `assertAllocationReversalQueued` finds and counts as relief. Otherwise: `refused`, which leaves
    * the posting owed.
    */
+  /**
+   * o3d-j625 r3 (Codex HIGH 2/HIGH 3) — WHICH CONNECTOR'S DOCUMENT IDs THIS PAYLOAD CARRIES.
+   *
+   * `chartConnector` proves the provenance of the ACCOUNT CODES. It proves nothing about a
+   * connector-native DOCUMENT ID, because those deliberately survive a connector switch and carry no
+   * provenance of their own — so after a switch the chart check passes while the payload still names
+   * the retired connector's invoice or bank account.
+   *
+   * Required in effect, not in the type: the enqueue reads the payload at runtime and REFUSES when it
+   * carries one of {@link CONNECTOR_NATIVE_PAYLOAD_ID_KEYS} and this does not equal `chartConnector`.
+   * Omitting it therefore fails closed instead of falling back to an inference, which is what makes an
+   * optional parameter legitimate here and was not true of `chartConnector`'s optional form.
+   *
+   * `null` is the recorded answer "nobody knows" — a row linked before the provenance column existed.
+   * It is a refusal, not a pass: see the column's own contract in prisma/schema.prisma.
+   */
+  documentConnector?: AccountingConnectorInfo['id'] | null
   connector?: AccountingConnectorInfo['id']
 }): Promise<AccountingEnqueueOutcome> {
   // o3d-j625: FIRST, before any resolution — this is the guard that makes a second resolution
@@ -742,6 +867,23 @@ export async function queueAccountingSyncTx(
      * resolution — on every path that has resolved one. Optional, so no existing caller pays for it or
      * has to know about it; {@link queueAccountingSyncTxWithOutcome} is the adapter that uses it.
      */
+    /**
+     * o3d-j625 r3 (Codex HIGH 2/HIGH 3) — WHICH CONNECTOR'S DOCUMENT IDs THIS PAYLOAD CARRIES.
+     *
+     * `chartConnector` proves the provenance of the ACCOUNT CODES. It proves nothing about a
+     * connector-native DOCUMENT ID, because those deliberately survive a connector switch and carry no
+     * provenance of their own — so after a switch the chart check passes while the payload still names
+     * the retired connector's invoice or bank account.
+     *
+     * Required in effect, not in the type: the enqueue reads the payload at runtime and REFUSES when it
+     * carries one of {@link CONNECTOR_NATIVE_PAYLOAD_ID_KEYS} and this does not equal `chartConnector`.
+     * Omitting it therefore fails closed instead of falling back to an inference, which is what makes an
+     * optional parameter legitimate here and was not true of `chartConnector`'s optional form.
+     *
+     * `null` is the recorded answer "nobody knows" — a row linked before the provenance column existed.
+     * It is a refusal, not a pass: see the column's own contract in prisma/schema.prisma.
+     */
+    documentConnector?: AccountingConnectorInfo['id'] | null
     reportOutcome?: (outcome: AccountingEnqueueOutcome) => void
   },
 ): Promise<boolean> {
@@ -1089,7 +1231,13 @@ export async function getAccountingSettings(): Promise<AccountingSettings> {
 export async function getAccountingSettingsFor(
   connector: AccountingConnectorInfo['id'] | null,
 ): Promise<AccountingSettings> {
-  // Read connector-agnostic settings directly from the core settings table.
+  // Read the settings that live in the core settings table rather than a connector's own.
+  //
+  // o3d-j625 r3 (Codex HIGH 3) — NOT ALL OF THEM ARE CONNECTOR-AGNOSTIC, and this comment used to say they
+  // were. `accounting_payment_account_map` is ONE row shared by every connector, but its VALUES are one
+  // connector's own bank-account ids (it was renamed out of `xero_payment_account_map` without being
+  // re-scoped). Its keys are agnostic; its contents are not. A payment built from it must CONFIRM the
+  // account against the target connector — see accountingBankAccountBelongsTo.
   const { db } = await import('@/lib/db')
   const [invoiceUrlSetting, billUrlSetting, paymentMapSetting, reverseChargeSalesSetting, reverseChargePurchaseSetting] = await Promise.all([
     db.setting.findUnique({ where: { key: 'accounting_invoice_url_template' } }),
@@ -1181,6 +1329,11 @@ export async function getAccountingSettingsFor(
 /**
  * Fetch just the payment account map JSON. Used by connector sync processors
  * so they don't have to re-fetch all accounting settings.
+ *
+ * o3d-j625 r3 (Codex HIGH 3): the LOOKUP is connector-agnostic (keys are `method:currency`); the VALUES
+ * are NOT — each is one connector's own bank-account id, from a single global row shared by every
+ * connector. A value read from here has no provenance: confirm it with accountingBankAccountBelongsTo
+ * before it goes into a payload routed to a particular connector.
  */
 export async function getPaymentAccountMap(): Promise<string> {
   const { db } = await import('@/lib/db')

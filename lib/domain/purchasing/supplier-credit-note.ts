@@ -276,6 +276,44 @@ export function buildSupplierCreditNoteSyncPayload(params: {
   }
 }
 
+/**
+ * o3d-j625 r3 (Codex HIGH 1 family) — THE ACCOUNTING QUEUE DECLINED THE ACCPAYCREDIT, SO THE POST IS
+ * ROLLED BACK.
+ *
+ * `postSupplierCreditNote` claimed DRAFT→POSTED and enqueued in one transaction specifically so the two
+ * would share a fate — and that only ever held against a THROW. `queueAccountingSyncTx` RETURNS false
+ * when it declines, so the claim committed and the credit note stood POSTED in IMS with nothing in the
+ * ledger. This is what makes the decline a throw, so the transaction rolls back and the credit note
+ * stays DRAFT, which is the retryable state.
+ *
+ * `reason` decides the operator's remedy: a `refused` is a connector-selection/provenance problem that
+ * no setting toggle fixes, everything else is a posting setting.
+ */
+export class SupplierCreditNoteEnqueueDeclined extends Error {
+  constructor(
+    readonly creditNoteId: string,
+    readonly reason: 'not-configured' | 'refused' | 'already-queued' | null = null,
+  ) {
+    super(`The accounting queue declined a PURCHASE_CREDIT_NOTE for supplier credit note ${creditNoteId} (${reason ?? 'no reason reported'})`)
+    this.name = 'SupplierCreditNoteEnqueueDeclined'
+  }
+
+  /** What the operator sees. Nothing here is recoverable by retrying the same action unchanged. */
+  get operatorMessage(): string {
+    return this.reason === 'refused'
+      ? 'The credit note was NOT posted. IMS could not establish that the accounting connector now '
+        + 'selected is the one holding the bill this credit is allocated against — an accounting invoice '
+        + 'id is kept when the connector selection changes and carries no provenance of its own, so '
+        + 'allocating against the wrong one would credit an unrelated document. The credit note is still '
+        + 'a draft. Switch back to the connector holding the bill, or re-post the bill to the connector '
+        + 'now in use, then post the credit note again.'
+      : 'The credit note was NOT posted: the accounting connector would not accept a supplier credit '
+        + 'note (accounting sync, or purchase-credit-note posting specifically, is switched off). The '
+        + 'credit note is still a draft — turn that posting back on and post it again, or enter the '
+        + 'credit in the ledger by hand.'
+  }
+}
+
 // ---------------------------------------------------------------------------
 // THE REPLAY FENCE ON THE SUPPLIER CREDIT-NOTE CREATE (o3d-tfri round 3)
 // ---------------------------------------------------------------------------

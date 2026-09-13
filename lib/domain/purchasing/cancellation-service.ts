@@ -2,6 +2,7 @@ import { Prisma, type PurchaseOrderStatus } from '@/app/generated/prisma/client'
 import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
 import { getAccountingSettings, queueAccountingSyncTx } from '@/lib/accounting'
+import { postingIsOwed, reportPostingNotQueued, type EnqueueOutcomeLike } from '@/lib/domain/accounting/enqueue-outcome'
 import { recordTransitSubledgerMovement } from '@/lib/domain/accounting/transit-subledger-movement'
 import { accountingPayloadKey } from '@/lib/accounting/payload-key'
 import { enqueueStockSync } from '@/lib/shopping'
@@ -109,6 +110,10 @@ export async function cancelPurchaseOrderService(
       return { success: true }
     }
 
+    // o3d-j625 r3 (Codex HIGH 1 family): a HOLDER, not a bare `let` — TypeScript narrows a `let` by the
+    // assignments it can see, and this one is assigned inside a callback it cannot, which collapses the
+    // variable to `never` and silently makes every later read of it unable to observe anything.
+    const reversalPostingOutcome: { outcome?: EnqueueOutcomeLike } = {}
     const cancellation = await deps.transaction(async (tx) => {
       // audit-g5u2.4 (Codex review): lock the PO before reading the invoice/credit
       // gate state so a concurrent bill create/credit-note post can't change the
@@ -215,6 +220,11 @@ export async function cancelPurchaseOrderService(
             // cancellation transaction — but that transaction has already reversed every cost layer and
             // recalculated landed cost on the linked goods PO, so the read is not adjacent to the write.
             chartConnector: accountingSettings.connector,
+            // o3d-j625 r3 (Codex HIGH 1 family): the whole answer, so a DECLINE is reported after the
+            // commit. `queued` gated the subledger row and nothing else: the PO was cancelled, every
+            // remaining cost layer reversed, an INFO log written saying so, and the reversing journal
+            // silently absent from the ledger.
+            reportOutcome: (outcome) => { reversalPostingOutcome.outcome = outcome },
           })
           // 6oyu.4 (khdw): this reversal DR transit / CR inventory, so it DEBITS the
           // transit clearing account (+amount). Record the transit subledger row
@@ -233,6 +243,23 @@ export async function cancelPurchaseOrderService(
 
       return { alreadyCancelled: false as const, existing, reversal, consumedCost, landedCostRecalc }
     }, PURCHASE_ORDER_CANCELLATION_TX_OPTIONS)
+
+    // o3d-j625 r3 (Codex HIGH 1 family): reported after the commit, so a rolled-back cancellation never
+    // leaves a report of a divergence that did not happen.
+    if (reversalPostingOutcome.outcome && postingIsOwed(reversalPostingOutcome.outcome)) {
+      await reportPostingNotQueued({
+        entityType: 'PURCHASE_ORDER',
+        entityId: id,
+        action: 'purchase_order_cancel_journal_not_queued',
+        posting: `the cost-layer reversal journal for cancelled purchase order ${id}`,
+        committed: 'the PO is cancelled and its remaining cost layers are reversed in IMS',
+        remedy:
+          'Inventory has been reduced in IMS with no reversing journal in the ledger, so inventory and '
+          + 'goods-in-transit are overstated there. Post the reversal by hand, or re-run the daily '
+          + 'reconcile once the accounting connector selection has settled.',
+        outcome: reversalPostingOutcome.outcome,
+      })
+    }
 
     if (cancellation.alreadyCancelled) {
       await logPurchaseOrderCancellationNoop(deps, id, cancellation.reference)

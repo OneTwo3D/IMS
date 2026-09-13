@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 
-import { balancedFrom, blankNonCode, productionSources, SHORTHAND } from './paid-provenance-scan'
+import { balancedFrom, blankNonCode, ownProperty, productionSources } from './paid-provenance-scan'
 
 /**
  * o3d-j625 — EVERY FACADE ACCOUNTING ENQUEUE SAYS WHOSE CHART ITS ACCOUNT CODES CAME FROM.
@@ -52,58 +52,9 @@ import { balancedFrom, blankNonCode, productionSources, SHORTHAND } from './paid
  * detector's own fixtures are the only thing left proving it could ever have fired.
  */
 
-/**
- * The value of an OWN top-level property `key` of the object literal `objectText`, or null.
- *
- * NOT the shared scanner's `topLevelProperty`, and the difference is a hole this census actually fell
- * into. That helper treats any occurrence of the key at brace depth 1 whose preceding character is not
- * a word character as a property — so in
- *
- *     queueAccountingSync({ type: 'SALES_INVOICE', payload, chartConnector: settings.connector })
- *
- * it reads the `connector` of `settings.connector` as a SHORTHAND `connector` property of the enqueue
- * itself, i.e. as a PIN. Every chartered site therefore also scored as pinned, which means the "or pins
- * the ledger" arm of the rule was satisfiable by an accidental member access — and the mutation that
- * removed `chartConnector: settings.connector` from a site could have gone red for the wrong reason,
- * because it removed the decoy member access in the same stroke. A `.` before the key disqualifies it
- * here, so a member access is never a property, and the M5b mutation below keeps that honest: it leaves
- * the member access in place and removes only the property.
- *
- * Shorthand still counts — `{ ...request, chartConnector }` is the same attribution with the colon left
- * off — reported as the shared scanner's SHORTHAND sentinel so the two agree on that much.
- */
-export function ownProperty(objectText: string, key: string): string | null {
-  let depth = 0
-  for (let i = 0; i < objectText.length; i++) {
-    const ch = objectText[i]
-    if (ch === '{' || ch === '[' || ch === '(') { depth++; continue }
-    if (ch === '}' || ch === ']' || ch === ')') { depth--; continue }
-    if (depth !== 1) continue
-    if (!objectText.startsWith(key, i)) continue
-    // `.` as well as the word characters: `settings.connector` is a member access, not a property.
-    if (i > 0 && /[\w$.]/.test(objectText[i - 1])) continue
-    const rest = objectText.slice(i + key.length)
-    // And the key must END here, so `connector` is not matched inside `connectorSomething`.
-    if (/^[\w$]/.test(rest)) continue
-    if (/^\s*[,}]/.test(rest)) return SHORTHAND
-    const colon = rest.match(/^\s*:/)
-    if (!colon) continue
-    let j = i + key.length + colon[0].length
-    while (j < objectText.length && /\s/.test(objectText[j])) j++
-    if ('({['.includes(objectText[j])) return balancedFrom(objectText, j)
-    let k = j
-    let d = 0
-    while (k < objectText.length) {
-      const c = objectText[k]
-      if ('({['.includes(c)) d++
-      else if (')}]'.includes(c)) { if (d === 0) break; d-- }
-      else if (c === ',' && d === 0) break
-      k++
-    }
-    return objectText.slice(j, k).trim()
-  }
-  return null
-}
+// o3d-j625 r3: `ownProperty` moved to ./paid-provenance-scan so the r3 consumption census can share it
+// without importing a test file (which would register this file's tests a second time in that process).
+export { ownProperty } from './paid-provenance-scan'
 
 const FACADE_CALL = 'queueAccountingSync('
 

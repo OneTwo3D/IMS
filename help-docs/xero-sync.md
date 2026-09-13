@@ -1382,6 +1382,8 @@ The IMS maps payment methods to Xero bank accounts using a composite key of `{me
 
 Configure this mapping in **Integrations → Xero → Payment Account Mapping**.
 
+The mapping is **shared by every accounting connector**, but its values are one connector's own bank-account IDs. A payment is only queued when the mapped account exists in the active connector's synced chart of accounts — see *Payments and updates refused because IMS cannot tell which connector holds the document* below.
+
 ## Settlement: is the payment actually in the ledger?
 
 Marking something paid in the IMS and the ledger agreeing are two different facts. Registering the payment is a separate sync (`INVOICE_PAYMENT` for a customer receipt, `BILL_PAYMENT` for a supplier payment) that can fail, be cancelled, or never be queued — so a green **Paid** badge on its own only means the IMS was told the money arrived.
@@ -2198,6 +2200,67 @@ every one of them is refused rather than mis-routed.
   the refund as still owing, logs `refund_accounting_replay_unchartered`, and leaves the flag set —
   check whether the reversal already posted and, if not, raise it by hand from the refund's own cost
   snapshots.
+
+### Payments and updates refused because IMS cannot tell which connector holds the document
+
+Some postings carry more than account numbers. A **customer payment** and a **supplier bill payment**
+name the invoice or bill they settle and the bank account the money moves through; a **bill edit** and a
+**sales invoice edit** name the document they overwrite; a **supplier credit note** names the bill it is
+allocated against. Those are the accounting system's own document and account IDs — and IMS keeps an
+invoice's ID when you change the accounting connector, because the invoice still exists in the books it
+was posted to. So "this payment's account numbers are the active connector's" says nothing about whether
+the invoice it pays is in that connector at all.
+
+**IMS now records which connector each posted document belongs to**, at the moment the ID is written
+back (sales invoices, credit notes, purchase bills and supplier credit notes). A payment, edit or
+allocation is only queued when that recorded connector is the one it would post to. Otherwise it is
+**refused**, nothing is queued, and it is reported:
+
+* customer payments: `invoice_payment_not_registered` with refusal **DOCUMENT_PROVENANCE_UNPROVEN**;
+* bill payments: the bill is **not** marked paid and `bill_payment_enqueue_declined` says the payment was
+  *refused* (not that posting is switched off);
+* bill edits: the edit is saved in IMS and `purchase_invoice_update_not_queued` (ERROR) says the ledger
+  still holds the previous version;
+* sales invoice edits: `sales_invoice_update_refused_unattributable_document`;
+* supplier credit notes: the credit note stays **draft** and `supplier_credit_note_not_posted` explains why;
+* anything else carrying a document ID: `accounting_enqueue_refused_unattributable_document_id`.
+
+**Documents posted before this version have no recorded connector, and are refused too.** This is
+deliberate and is *not* a narrow window like the chart refusal above: IMS does not guess which ledger holds
+an older invoice, because guessing is the mistake being prevented. To pay or edit such a document through
+IMS, re-post it so the document and its connector are recorded together. For a customer payment, follow
+the remedy in the refusal message itself: it says whether settling by hand is safe, because a deferred
+re-drive may still register the receipt.
+
+**The payment account mapping is shared by every accounting connector.** Its keys (`method:currency`)
+are connector-neutral, but each value is one connector's own bank-account ID. A customer payment is
+therefore only queued when the mapped account is an active bank account in the connector's synced chart
+of accounts; otherwise it is refused with **PAYMENT_ACCOUNT_NOT_IN_LEDGER**. After switching connector,
+sync the chart of accounts and re-map each method against the new connector.
+
+### Postings that were not queued are now reported where they happen
+
+Every place in IMS that queues an accounting posting now reads the answer. When a posting is refused or
+cannot be queued, the IMS action still completes where that is the right thing to do (a stock receipt is
+still received, a bill is still recorded), but an **ERROR** is written to the activity log naming what
+stands in IMS, what the ledger is missing, and what to do — for example `stock_receipt_journal_not_queued`,
+`purchase_invoice_not_queued`, `supplier_return_journal_not_queued`, `purchase_order_cancel_journal_not_queued`,
+`landed_cost_reclass_not_queued`, `landed_cost_cogs_journal_not_queued`, `manufacturing_journal_not_queued`,
+`manufacturing_reclass_not_queued`, `inventory_adjustment_journal_not_queued`, `sales_invoice_not_queued`,
+`realised_fx_journal_not_queued` and `tax_rate_sync_not_queued`. Where marking something done would be
+untrue without the posting, it is rolled back instead: a bill is not marked paid, a supplier credit note
+stays draft.
+
+Two consequences worth knowing:
+
+* **Landed-cost changes on already-journaled shipments.** If the COGS reversal for a shipment cannot be
+  queued, IMS no longer records it in the COGS subledger and no longer removes that amount from the
+  retrospective landed-cost COGS journal — so the adjustment still reaches the ledger through that
+  journal instead of disappearing from both.
+* **Unrealised FX revaluation.** The run's result now includes `refused` — journals it owed and could not
+  queue — and those are no longer counted in `reversed` or `revalued`. A run with refusals is never
+  reported as "already queued for this date". The "already revalued today" check is also per connector: a
+  revaluation posted to Xero earlier the same day no longer stops the QuickBooks revaluation after a switch.
 
 ### Rows stranded on a connector you switched away from
 

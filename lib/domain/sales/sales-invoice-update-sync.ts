@@ -24,6 +24,20 @@ export type SalesInvoiceUpdateQueueParams = {
    * "QuickBooks updates are not supported yet", which would be a true sentence about the wrong fact.
    */
   chartConnector: 'xero' | 'quickbooks' | null
+  /**
+   * o3d-j625 r3 (Codex HIGH 2) — WHICH CONNECTOR'S INVOICE `accountingInvoiceId` IS.
+   *
+   * SALES_INVOICE_UPDATE posts to `/Invoices/{accountingInvoiceId}`, so the id IS the target document.
+   * It is retained across a connector switch by design — the invoice it names still exists in the ledger
+   * it was posted to — which means `chartConnector` above, which proves only where the account CODES came
+   * from, says nothing about it. After a switch both halves of the chart check can agree (the codes really
+   * are the active connector's) while this update would rewrite a document the active connector does not
+   * hold, or, worse, one of its own that happens to carry the same id.
+   *
+   * `null` = the link predates `SalesOrder.accountingInvoiceConnector`. FAIL CLOSED: refused and reported,
+   * never resolved to the active connector.
+   */
+  documentConnector: 'xero' | 'quickbooks' | null
 }
 
 type QueueXeroSync = (params: {
@@ -78,6 +92,39 @@ export async function queueSalesInvoiceUpdateForExistingAccountingInvoice(
       metadata: {
         accountingInvoiceId: params.accountingInvoiceId,
         orderNumber: params.orderNumber,
+        chartConnector: params.chartConnector,
+        connector: connector?.id ?? null,
+        idempotencyKey: params.idempotencyKey,
+      },
+    })
+    return
+  }
+  // o3d-j625 r3 (Codex HIGH 2) — AND THE DOCUMENT ID MUST BE THIS CONNECTOR'S TOO.
+  //
+  // Asked immediately after the chart check and before the Xero-only gate, for the same reason the chart
+  // check is asked first: reporting this as "QuickBooks updates are not supported yet" would be a true
+  // sentence about the wrong fact.
+  if (params.documentConnector !== (connector?.id ?? null)) {
+    await deps.logActivity({
+      entityType: 'SALES_ORDER',
+      entityId: params.salesOrderId,
+      action: 'sales_invoice_update_refused_unattributable_document',
+      tag: 'accounting',
+      level: 'WARNING',
+      description:
+        `NOTHING WAS QUEUED. The sales invoice update for ${params.orderNumber} would be posted against `
+        + `accounting invoice ${params.accountingInvoiceId}, which IMS records as `
+        + `${params.documentConnector ?? 'no connector (the link predates the column that records it)'} `
+        + `while the active accounting connector is ${connector?.id ?? 'none'}. An accounting invoice id is `
+        + 'a document id in the accounting system\'s own database and IMS keeps it when the connector '
+        + 'selection changes, so it must not be assumed to belong to whichever connector is active now — '
+        + 'the update would rewrite a document this connector does not hold. The update is still '
+        + 'OUTSTANDING: re-post the invoice from this order so the document and its connector are recorded '
+        + 'together, or correct the invoice by hand in the books that hold it.',
+      metadata: {
+        accountingInvoiceId: params.accountingInvoiceId,
+        orderNumber: params.orderNumber,
+        documentConnector: params.documentConnector,
         chartConnector: params.chartConnector,
         connector: connector?.id ?? null,
         idempotencyKey: params.idempotencyKey,

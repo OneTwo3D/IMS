@@ -68,6 +68,31 @@ export type InvoicePaymentRegistrationRefusal =
   | 'SETTLED_ON_RETIRED_DOCUMENT'
   /** This receipt does not fit in what is left of the invoice after what the ledger already holds. */
   | 'WOULD_OVERPAY'
+  /**
+   * o3d-j625 r3 (Codex HIGH 3) — THE ORDER'S `accountingInvoiceId` CANNOT BE SHOWN TO BELONG TO THE
+   * CONNECTOR THIS REGISTRATION IS BEING BUILT FOR.
+   *
+   * The id is a primary key in the accounting system's own database and it DELIBERATELY SURVIVES a
+   * connector switch — nothing clears it when the operator moves from Xero to QuickBooks, because the
+   * Xero invoice it names still exists. So "the connector is on and posts payments" says nothing about
+   * whose document this is, and a payment queued for the new connector naming the old one's invoice id
+   * either fails or settles an unrelated document.
+   *
+   * Raised when the recorded provenance (`SalesOrder.accountingInvoiceConnector`) is ABSENT — a link
+   * made before that column existed — or names a different connector. FAIL CLOSED: unknown provenance
+   * is not "probably the active one".
+   */
+  | 'DOCUMENT_PROVENANCE_UNPROVEN'
+  /**
+   * o3d-j625 r3 (Codex HIGH 3) — THE MAPPED BANK ACCOUNT IS NOT ONE OF THIS CONNECTOR'S.
+   *
+   * Distinct from NO_BANK_ACCOUNT, which means the operator mapped nothing. Here a mapping EXISTS and
+   * resolves to an id the target connector's own chart does not contain, because
+   * `accounting_payment_account_map` is a SINGLE settings row shared by both connectors whose values
+   * are one connector's native account ids (it was renamed out of `xero_payment_account_map` without
+   * being re-scoped). Sending it would name an account the ledger does not hold.
+   */
+  | 'PAYMENT_ACCOUNT_NOT_IN_LEDGER'
 
 export type InvoicePaymentRegistrationDecision =
   | { register: true; bankAccountId: string }

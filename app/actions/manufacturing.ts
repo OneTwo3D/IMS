@@ -7,6 +7,7 @@ import { logActivity } from '@/lib/activity-log'
 import { requireInternalUser, requirePermission } from '@/lib/auth/server'
 import { enqueueStockSync } from '@/lib/shopping'
 import { queueAccountingSyncTx, getAccountingSettings, isAccountingSyncTypeEnabled } from '@/lib/accounting'
+import { postingIsOwed, reportPostingNotQueued, type EnqueueOutcomeLike } from '@/lib/domain/accounting/enqueue-outcome'
 import {
   addCostLayerSourceLines,
   cogsEntryDataFromConsumed,
@@ -536,6 +537,10 @@ export async function updateManufacturingOrderStatus(
     // Surface skip reason post-tx (set inside the tx). Lets us log a
     // readable warning without holding the tx open.
     let manufacturingJournalSkipReason: string | null = null
+    // o3d-j625 r3 (Codex HIGH 1 family): the enqueue's answer, out of the transaction the same way the
+    // skip reason is. A HOLDER, not a `let`: a `let` assigned only inside the callback is narrowed to
+    // `never` by TypeScript, which makes every later read of it unable to observe anything at all.
+    const manufacturingJournalOutcome: { outcome?: EnqueueOutcomeLike } = {}
     let disassemblyFallback = null as { recoveredLayerCount: number } | null
     // audit-wght: the quantity actually booked into stock at completion — the
     // ASSEMBLY actual (yield loss) when supplied, else the planned quantity.
@@ -966,6 +971,13 @@ export async function updateManufacturingOrderStatus(
                   narration,
                   lines,
                 },
+                // o3d-j625 r3 (Codex HIGH 1 family) — THE ANSWER, CAPTURED. The return value was
+                // discarded entirely and the same transaction then completed the order
+                // (`status, completedAt, qtyProduced`) having ALREADY rewritten the cost lines'
+                // `accountCode`s: the MO closed with overhead capitalised in IMS and no journal in the
+                // ledger, reported as a success. There is already a post-commit reporting channel here
+                // for the SKIPPED case (`manufacturingJournalSkipReason`); a decline uses the same one.
+                reportOutcome: (outcome) => { manufacturingJournalOutcome.outcome = outcome },
               })
             }
           }
@@ -983,6 +995,22 @@ export async function updateManufacturingOrderStatus(
           data: { status, completedAt: now, qtyProduced: producedQty, usedDisassemblyFallback: disassemblyFallback !== null || equalSplitOverheadUsed },
         })
       })
+
+      // o3d-j625 r3 (Codex HIGH 1 family): and the DECLINED case, which had no channel at all.
+      if (manufacturingJournalOutcome.outcome && postingIsOwed(manufacturingJournalOutcome.outcome)) {
+        await reportPostingNotQueued({
+          entityType: 'STOCK_ADJUSTMENT',
+          entityId: id,
+          action: 'manufacturing_journal_not_queued',
+          posting: `the manufacturing overhead journal for ${orderPreview.reference}`,
+          committed: 'the production order is COMPLETE in IMS and its overhead is capitalised into the output cost',
+          remedy:
+            'Inventory in the ledger does not carry the capitalised overhead and the overhead accounts '
+            + 'have not been relieved. Post the journal by hand, or re-run the daily reconcile once the '
+            + 'accounting connector selection has settled.',
+          outcome: manufacturingJournalOutcome.outcome,
+        })
+      }
 
       // Surface the journal-skipped warning post-tx if needed (set inside tx)
       if (manufacturingJournalSkipReason) {
@@ -1622,6 +1650,8 @@ export async function updateManufacturingCostLines(
     let newTotal = 0
     let cleanedForWrite = cleaned
 
+    // o3d-j625 r3 (Codex HIGH 1 family): see the holder note above.
+    const reclassOutcome: { outcome?: EnqueueOutcomeLike } = {}
     await db.$transaction(async (tx) => {
       await tx.$queryRaw(
         Prisma.sql`SELECT id FROM production_orders WHERE id = ${productionOrderId} FOR UPDATE`,
@@ -1751,6 +1781,10 @@ export async function updateManufacturingCostLines(
                 narration: `Reclass for retro manufacturing-cost change on ${po.reference} — overhead ${oldTotal.toFixed(2)} → ${newTotal.toFixed(2)}, total delta ${totalDeltaBase >= 0 ? '+' : ''}${totalDeltaBase.toFixed(4)} (COGS ${cogsDeltaBase.toFixed(4)} / Inventory ${inventoryDeltaBase.toFixed(4)})`,
                 lines: journalLines,
               },
+              // o3d-j625 r3 (Codex HIGH 1 family): the answer. Discarded, while the retro cost change it
+              // compensates for was persisted by this same transaction and an INFO log written saying
+              // the cost lines had been updated.
+              reportOutcome: (outcome) => { reclassOutcome.outcome = outcome },
             })
           }
         }
@@ -1768,6 +1802,21 @@ export async function updateManufacturingCostLines(
         },
       })
     }, { maxWait: 5000, timeout: 20000 })
+
+    if (reclassOutcome.outcome && postingIsOwed(reclassOutcome.outcome)) {
+      await reportPostingNotQueued({
+        entityType: 'STOCK_ADJUSTMENT',
+        entityId: productionOrderId,
+        action: 'manufacturing_reclass_not_queued',
+        posting: `the manufacturing reclass journal for production order ${productionOrderId}`,
+        committed: 'the retrospective manufacturing-cost change is saved in IMS',
+        remedy:
+          'The compensating reclass is NOT in the ledger, so COGS and inventory there still reflect the '
+          + 'old cost. Post it by hand, or re-save the cost lines once the accounting connector selection '
+          + 'has settled.',
+        outcome: reclassOutcome.outcome,
+      })
+    }
 
     revalidatePath('/manufacturing')
     revalidatePath(`/manufacturing/${productionOrderId}`)

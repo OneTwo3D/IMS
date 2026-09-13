@@ -1469,6 +1469,24 @@ model PurchaseInvoice {
   // Postgres does not treat NULLs as equal, so this is precisely a partial unique index over the
   // bills that HAVE an external id: any number of bills may be unlinked.
   accountingInvoiceId String?  @unique @map("accounting_invoice_id")
+  /// o3d-j625 r3 (Codex HIGH 2/HIGH 3) — WHICH CONNECTOR'S DOCUMENT THE ID BESIDE THIS IS.
+  ///
+  /// A connector-native document id is a PRIMARY KEY IN SOMEBODY ELSE'S DATABASE, and this one
+  /// deliberately SURVIVES a connector switch: nothing clears it when the operator moves from Xero to
+  /// QuickBooks, because the document it names still exists in the books it was posted to. So knowing
+  /// which chart of accounts a payload's CODES came from (o3d-j625's `chartConnector`) says nothing
+  /// about whose primary key this is — the r2 round proved the provenance of the codes and then reused
+  /// that proof for the ids, which is a proof of an adjacent property. A payment queued against the
+  /// wrong connector's invoice id either fails or settles an unrelated document.
+  ///
+  /// NULL means NOBODY RECORDED IT — every row written before this column existed. It is deliberately
+  /// NOT backfilled: a guess about which ledger holds a document is the mistake being corrected, and
+  /// the enqueue guard reads NULL as "provenance cannot be established" and REFUSES, leaving the
+  /// posting owed and reported. Fail-closed, never assumed-active.
+  ///
+  /// Written in the SAME statement as the id (lib/domain/accounting/back-reference.ts) so a linked row
+  /// can never be provenance-less, and cleared in the same statement when the claim is released.
+  accountingInvoiceConnector String? @map("accounting_invoice_connector")
   // o3d-wf86: HOW this bill acquired that id. NULL means "nobody recorded it" — every row written
   // before this column existed, and that unknown is exactly the state that makes a conflict
   // unadjudicable, so it is left honest rather than backfilled with a guess.
@@ -1586,6 +1604,24 @@ model SupplierCreditNote {
   // id. Without this index that lands as two local rows pointing at one ledger document; with it,
   // the second link is refused loudly. The number-collision defect itself is o3d-tfri.
   accountingCreditNoteId String?                 @unique @map("accounting_credit_note_id")
+  /// o3d-j625 r3 (Codex HIGH 2/HIGH 3) — WHICH CONNECTOR'S DOCUMENT THE ID BESIDE THIS IS.
+  ///
+  /// A connector-native document id is a PRIMARY KEY IN SOMEBODY ELSE'S DATABASE, and this one
+  /// deliberately SURVIVES a connector switch: nothing clears it when the operator moves from Xero to
+  /// QuickBooks, because the document it names still exists in the books it was posted to. So knowing
+  /// which chart of accounts a payload's CODES came from (o3d-j625's `chartConnector`) says nothing
+  /// about whose primary key this is — the r2 round proved the provenance of the codes and then reused
+  /// that proof for the ids, which is a proof of an adjacent property. A payment queued against the
+  /// wrong connector's invoice id either fails or settles an unrelated document.
+  ///
+  /// NULL means NOBODY RECORDED IT — every row written before this column existed. It is deliberately
+  /// NOT backfilled: a guess about which ledger holds a document is the mistake being corrected, and
+  /// the enqueue guard reads NULL as "provenance cannot be established" and REFUSES, leaving the
+  /// posting owed and reported. Fail-closed, never assumed-active.
+  ///
+  /// Written in the SAME statement as the id (lib/domain/accounting/back-reference.ts) so a linked row
+  /// can never be provenance-less, and cleared in the same statement when the claim is released.
+  accountingCreditNoteConnector String?         @map("accounting_credit_note_connector")
   recordedAt            DateTime                 @default(now())
   postedAt              DateTime?
   createdBy             String?
@@ -1748,6 +1784,24 @@ model SalesOrder {
   // Global and on the VALUE alone, deliberately — see PurchaseInvoice.accountingInvoiceId. NULLs are
   // not equal in Postgres, so any number of orders may be unlinked.
   accountingInvoiceId     String?    @unique @map("accounting_invoice_id") // Accounting invoice ID after sync
+  /// o3d-j625 r3 (Codex HIGH 2/HIGH 3) — WHICH CONNECTOR'S DOCUMENT THE ID BESIDE THIS IS.
+  ///
+  /// A connector-native document id is a PRIMARY KEY IN SOMEBODY ELSE'S DATABASE, and this one
+  /// deliberately SURVIVES a connector switch: nothing clears it when the operator moves from Xero to
+  /// QuickBooks, because the document it names still exists in the books it was posted to. So knowing
+  /// which chart of accounts a payload's CODES came from (o3d-j625's `chartConnector`) says nothing
+  /// about whose primary key this is — the r2 round proved the provenance of the codes and then reused
+  /// that proof for the ids, which is a proof of an adjacent property. A payment queued against the
+  /// wrong connector's invoice id either fails or settles an unrelated document.
+  ///
+  /// NULL means NOBODY RECORDED IT — every row written before this column existed. It is deliberately
+  /// NOT backfilled: a guess about which ledger holds a document is the mistake being corrected, and
+  /// the enqueue guard reads NULL as "provenance cannot be established" and REFUSES, leaving the
+  /// posting owed and reported. Fail-closed, never assumed-active.
+  ///
+  /// Written in the SAME statement as the id (lib/domain/accounting/back-reference.ts) so a linked row
+  /// can never be provenance-less, and cleared in the same statement when the claim is released.
+  accountingInvoiceConnector String? @map("accounting_invoice_connector")
   paidAt            DateTime?
   /// o3d-psrx r2 — THE PAID FLAG BESIDE IT WAS SET FROM EVIDENCE THE LEDGER WAS NEVER GIVEN.
   ///
@@ -2001,6 +2055,24 @@ model SalesOrderRefund {
   // replay paths return the EXISTING refund rather than creating a second one — so no split or
   // partial refund legitimately shares a credit note. Global, on the value alone, NULLs unconstrained.
   accountingCreditNoteId String?   @unique @map("accounting_credit_note_id") // Accounting credit note ID after sync
+  /// o3d-j625 r3 (Codex HIGH 2/HIGH 3) — WHICH CONNECTOR'S DOCUMENT THE ID BESIDE THIS IS.
+  ///
+  /// A connector-native document id is a PRIMARY KEY IN SOMEBODY ELSE'S DATABASE, and this one
+  /// deliberately SURVIVES a connector switch: nothing clears it when the operator moves from Xero to
+  /// QuickBooks, because the document it names still exists in the books it was posted to. So knowing
+  /// which chart of accounts a payload's CODES came from (o3d-j625's `chartConnector`) says nothing
+  /// about whose primary key this is — the r2 round proved the provenance of the codes and then reused
+  /// that proof for the ids, which is a proof of an adjacent property. A payment queued against the
+  /// wrong connector's invoice id either fails or settles an unrelated document.
+  ///
+  /// NULL means NOBODY RECORDED IT — every row written before this column existed. It is deliberately
+  /// NOT backfilled: a guess about which ledger holds a document is the mistake being corrected, and
+  /// the enqueue guard reads NULL as "provenance cannot be established" and REFUSES, leaving the
+  /// posting owed and reported. Fail-closed, never assumed-active.
+  ///
+  /// Written in the SAME statement as the id (lib/domain/accounting/back-reference.ts) so a linked row
+  /// can never be provenance-less, and cleared in the same statement when the claim is released.
+  accountingCreditNoteConnector String? @map("accounting_credit_note_connector")
   externalRefundId Int?
   returnWarehouseId String?
   reason          String?

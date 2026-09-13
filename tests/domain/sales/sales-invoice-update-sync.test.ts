@@ -42,6 +42,8 @@ const baseParams = {
   idempotencyKey: 'sales-invoice-update:so-1:xero-invoice-1:abc123',
   // o3d-j625: whose chart the account codes in `payload` came from.
   chartConnector: 'xero' as const,
+  // o3d-j625 r3: whose INVOICE the update is posted against.
+  documentConnector: 'xero' as const,
 }
 
 test('queueSalesInvoiceUpdateForExistingAccountingInvoice queues Xero update with idempotency key', async () => {
@@ -85,7 +87,9 @@ test('queueSalesInvoiceUpdateForExistingAccountingInvoice skips non-Xero connect
   // o3d-j625: the chart AGREES with the active connector here, so the refusal under test is the
   // unsupported-connector one and not the chart mismatch. A QuickBooks-charted payload offered while
   // QuickBooks is active is exactly the case this test is about.
-  await queueSalesInvoiceUpdateForExistingAccountingInvoice({ ...baseParams, chartConnector: 'quickbooks' }, deps)
+  // o3d-j625 r3: and the INVOICE is QuickBooks' too, so the document-provenance refusal is not the one
+  // exercised either.
+  await queueSalesInvoiceUpdateForExistingAccountingInvoice({ ...baseParams, chartConnector: 'quickbooks', documentConnector: 'quickbooks' }, deps)
 
   assert.equal(queued.length, 0)
   assert.equal(activity.length, 1)
@@ -184,3 +188,21 @@ test('[o3d-j625] the refusal is a MISMATCH check, not a new reason to skip Xero:
   assert.equal(queued.length, 1, 'an Xero-charted update, with Xero active, is queued exactly as before')
   assert.equal((activity[0] as { action: string }).action, 'sales_invoice_update_queued')
 })
+
+// o3d-j625 r3 (Codex HIGH 2) — the chart can agree while the INVOICE id is another connector's.
+for (const [label, documentConnector] of [
+  ['recorded under the OTHER connector', 'quickbooks'],
+  ['never recorded (a link predating the column)', null],
+] as const) {
+  test(`queueSalesInvoiceUpdateForExistingAccountingInvoice REFUSES an invoice ${label}, even with the chart agreeing`, async () => {
+    const { deps, queued, activity } = makeDeps({ connector: { id: 'xero', name: 'Xero' }, enabled: true })
+
+    await queueSalesInvoiceUpdateForExistingAccountingInvoice({ ...baseParams, chartConnector: 'xero', documentConnector }, deps)
+
+    assert.equal(queued.length, 0, 'an update must not rewrite a document the active connector may not hold')
+    assert.equal(activity.length, 1)
+    const record = activity[0] as { action: string; metadata: Record<string, unknown> }
+    assert.equal(record.action, 'sales_invoice_update_refused_unattributable_document')
+    assert.equal(record.metadata.documentConnector, documentConnector)
+  })
+}

@@ -5,7 +5,8 @@ import { z } from 'zod'
 import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
 import { requirePermission } from '@/lib/auth/server'
-import { queueAccountingSync, queueAccountingSyncTx, getAccountingSettings, getActiveAccountingConnectorInfo, isAccountingSyncTypeEnabled, listAccountingBankAccounts, listAccountingBankAccountsWithChart, type AccountingBankAccount } from '@/lib/accounting'
+import { queueAccountingSync, queueAccountingSyncTx, getAccountingSettings, getActiveAccountingConnectorInfo, isAccountingSyncTypeEnabled, listAccountingBankAccounts, listAccountingBankAccountsWithChart, asRoutableAccountingConnector, type AccountingBankAccount } from '@/lib/accounting'
+import { postingIsOwed, reportPostingNotQueued, type EnqueueOutcomeLike } from '@/lib/domain/accounting/enqueue-outcome'
 import { accountingPayloadKey } from '@/lib/accounting/payload-key'
 import { multiComponentTaxRateNames } from '@/lib/accounting/multi-component-warning'
 import { enqueueStockSync } from '@/lib/shopping'
@@ -24,12 +25,12 @@ import {
 import { getBaseCurrencyCode } from '@/lib/base-currency'
 import { cancelPurchaseOrderAction } from '@/lib/domain/purchasing/cancel-purchase-order-action'
 import { resolvePurchaseOrderFxRateToBase } from '@/lib/domain/purchasing/purchase-order-fx'
-import { validateRecordSupplierCreditNote, buildSupplierCreditNoteSyncPayload, resolveSupplierCreditNoteTaxType, resolveSupplierCreditNoteTransitBase } from '@/lib/domain/purchasing/supplier-credit-note'
+import { validateRecordSupplierCreditNote, buildSupplierCreditNoteSyncPayload, resolveSupplierCreditNoteTaxType, resolveSupplierCreditNoteTransitBase, SupplierCreditNoteEnqueueDeclined } from '@/lib/domain/purchasing/supplier-credit-note'
 import { recordTransitSubledgerMovement } from '@/lib/domain/accounting/transit-subledger-movement'
 import { settlementStatus, type PaymentSyncRow, type SettlementVerdict } from '@/lib/domain/accounting/settlement-status'
 import { readPayloadRegisteredAmount } from '@/lib/domain/accounting/registered-amount'
 import {
-  BILL_PAYMENT_ENQUEUE_DECLINED_MESSAGE,
+  billPaymentEnqueueDeclinedMessage,
   billPaymentRefusalMessage,
   BillPaymentEnqueueDeclined,
   BillPaymentSupersessionRollback,
@@ -1820,6 +1821,15 @@ export async function receivePurchaseOrder(
 
     const receiptRef = `RCP-${po.reference}-${Date.now().toString(36).toUpperCase()}`
     const idempotencyToken = options?.idempotencyToken
+    // o3d-j625 r3 (Codex HIGH 1 family): what the accounting enqueue inside the transaction answered,
+    // so a decline is reported after the commit instead of disappearing. `null` = the enqueue never ran.
+    // A HOLDER, NOT A BARE `let` (the idiom lib/accounting.ts uses for the same reason). TypeScript
+    // narrows a `let` by the assignments it can SEE, and the assignment here happens inside a callback
+    // it cannot — so the variable collapses to its initialiser's type and every later read of it is
+    // type-checked against a value the compiler believes is the only one possible. The runtime is
+    // unaffected, which is exactly what makes it dangerous: the guard still works and the types stop
+    // being able to say so. A property of an object is re-widened by the intervening call.
+    const receiptPostingOutcome: { outcome?: EnqueueOutcomeLike } = {}
     const receiptResult = await db.$transaction(async (tx) => {
       // Lock the PO row to prevent concurrent receipts from over-receiving
       await tx.$queryRaw`SELECT id FROM purchase_orders WHERE id = ${id} FOR UPDATE`
@@ -2073,6 +2083,17 @@ export async function receivePurchaseOrder(
           ],
         }
         const receiptIdempotencyKey = accountingPayloadKey(`purchase-receipt:${id}:${receiptRef}`, payload)
+        // o3d-j625 r3 (Codex HIGH 1 family) — WHAT THE ENQUEUE ANSWERED, CAPTURED FOR REPORTING AFTER
+        // THE COMMIT.
+        //
+        // `queued` was read only to gate the subledger row — correctly — and the decline itself went
+        // nowhere: the stock receipt commits and the action returns success with no GL posting and no warning.
+        // `reportOutcome` is used rather than the `WithOutcome` adapter because the whole ANSWER is
+        // wanted (a `not-configured` must not be reported as owed) while the boolean the gate below
+        // reads stays exactly as it is.
+        //
+        // Captured, not logged here: an activity-log write uses its own connection, so logging inside
+        // this transaction would leave the report standing if the transaction later rolled back.
         const queued = await queueAccountingSyncTx(tx, {
           type: 'STOCK_RECEIPT',
           referenceType: 'PurchaseOrder',
@@ -2086,6 +2107,7 @@ export async function receivePurchaseOrder(
           // chart means a connector switch inside it refuses the enqueue instead of writing the new
           // connector's row with the old connector's codes.
           chartConnector: accountingSettings.connector,
+          reportOutcome: (outcome) => { receiptPostingOutcome.outcome = outcome },
         })
         // 6oyu.4 (khdw): receipt DR inventory / CR transit → CREDITS the transit
         // clearing account (drains goods-in-transit into inventory). Record the transit
@@ -2104,6 +2126,21 @@ export async function receivePurchaseOrder(
 
       return { allReceived, newStatus, freightPoIds, totalReceiptValue: totalReceiptValue.toNumber() }
     }, STOCK_TX_OPTIONS)
+
+    // o3d-j625 r3 (Codex HIGH 1 family): the enqueue declined and the local state committed anyway.
+    if (receiptPostingOutcome.outcome && postingIsOwed(receiptPostingOutcome.outcome)) {
+      await reportPostingNotQueued({
+        entityType: 'PURCHASE_ORDER',
+        entityId: id,
+        action: 'stock_receipt_journal_not_queued',
+        posting: `the stock receipt journal for PO ${po.reference}`,
+        committed: 'the stock was received into inventory in IMS',
+        remedy:
+          'Goods-in-transit has NOT been drained into inventory in the ledger. Post the journal by hand, or clear the accounting connector selection and re-run the daily reconcile.',
+        outcome: receiptPostingOutcome.outcome,
+        metadata: { reference: po.reference, chartConnector: accountingSettings.connector },
+      })
+    }
 
     // opys: duplicate submission detected under the lock — the receipt was already
     // booked by the first submission. Skip the DB write and the (duplicate) activity
@@ -2320,6 +2357,15 @@ export async function returnPurchaseOrder(
     const returnRef = `RTN-${po.reference}-${Date.now().toString(36).toUpperCase()}`
     let purchaseReturnId = ''
     let totalReturnedCostBase = toDecimal(0)
+    // o3d-j625 r3 (Codex HIGH 1 family): what the accounting enqueue inside the transaction answered,
+    // so a decline is reported after the commit instead of disappearing. `null` = the enqueue never ran.
+    // A HOLDER, NOT A BARE `let` (the idiom lib/accounting.ts uses for the same reason). TypeScript
+    // narrows a `let` by the assignments it can SEE, and the assignment here happens inside a callback
+    // it cannot — so the variable collapses to its initialiser's type and every later read of it is
+    // type-checked against a value the compiler believes is the only one possible. The runtime is
+    // unaffected, which is exactly what makes it dangerous: the guard still works and the types stop
+    // being able to say so. A property of an object is re-widened by the intervening call.
+    const returnPostingOutcome: { outcome?: EnqueueOutcomeLike } = {}
     const { overBilling, creditNote, suppressedReturnCredit } = await db.$transaction(async (tx): Promise<{ overBilling: PurchaseOrderOverBillingSummary; creditNote: { id: string; amountForeign: number; invoiceId: string } | null; suppressedReturnCredit: number }> => {
       // audit-18s1: acquire locks in the SAME order the goods-receipt path uses
       // (stock_levels first, then PO lines) to avoid an AB/BA deadlock — receipt
@@ -2574,6 +2620,17 @@ export async function returnPurchaseOrder(
           ],
         }
         const returnIdempotencyKey = accountingPayloadKey(`purchase-return:${purchaseReturn.id}`, payload)
+        // o3d-j625 r3 (Codex HIGH 1 family) — WHAT THE ENQUEUE ANSWERED, CAPTURED FOR REPORTING AFTER
+        // THE COMMIT.
+        //
+        // `queued` was read only to gate the subledger row — correctly — and the decline itself went
+        // nowhere: the supplier return commits and the action returns success with no GL posting and no warning.
+        // `reportOutcome` is used rather than the `WithOutcome` adapter because the whole ANSWER is
+        // wanted (a `not-configured` must not be reported as owed) while the boolean the gate below
+        // reads stays exactly as it is.
+        //
+        // Captured, not logged here: an activity-log write uses its own connection, so logging inside
+        // this transaction would leave the report standing if the transaction later rolled back.
         const queued = await queueAccountingSyncTx(tx, {
           type: 'INVENTORY_ADJUSTMENT',
           referenceType: 'PurchaseReturn',
@@ -2583,6 +2640,7 @@ export async function returnPurchaseOrder(
           // o3d-j625 r2: `payload.lines` are `accountingSettings.transitAccount` and
           // `accountingSettings.inventoryAccount`, so the row goes through that chart's connector.
           chartConnector: accountingSettings.connector,
+          reportOutcome: (outcome) => { returnPostingOutcome.outcome = outcome },
         })
         // 6oyu.4 (khdw): a supplier return reverses received stock DR transit / CR
         // inventory → DEBITS the transit clearing account (+amount). Record the transit
@@ -2600,6 +2658,21 @@ export async function returnPurchaseOrder(
       }
       return { overBilling: overBillingComputed, creditNote: createdCreditNote, suppressedReturnCredit: suppressedReturnCreditForeign }
     }, STOCK_TX_OPTIONS)
+
+    // o3d-j625 r3 (Codex HIGH 1 family): the enqueue declined and the local state committed anyway.
+    if (returnPostingOutcome.outcome && postingIsOwed(returnPostingOutcome.outcome)) {
+      await reportPostingNotQueued({
+        entityType: 'PURCHASE_ORDER',
+        entityId: id,
+        action: 'supplier_return_journal_not_queued',
+        posting: `the supplier return journal for PO ${po.reference}`,
+        committed: 'the return is booked and the stock reduced in IMS',
+        remedy:
+          'The reversal out of inventory into goods-in-transit is NOT in the ledger. Post it by hand, or re-raise the return once the accounting connector selection has settled.',
+        outcome: returnPostingOutcome.outcome,
+        metadata: { reference: po.reference, chartConnector: accountingSettings.connector },
+      })
+    }
 
     revalidatePath('/purchase-orders')
     revalidatePath(`/purchase-orders/${id}`)
@@ -2925,6 +2998,15 @@ export async function createInvoice(
       supplierInvoicePath: input.supplierInvoiceUrl,
     })
 
+    // o3d-j625 r3 (Codex HIGH 1 family): what the accounting enqueue inside the transaction answered,
+    // so a decline is reported after the commit instead of disappearing. `null` = the enqueue never ran.
+    // A HOLDER, NOT A BARE `let` (the idiom lib/accounting.ts uses for the same reason). TypeScript
+    // narrows a `let` by the assignments it can SEE, and the assignment here happens inside a callback
+    // it cannot — so the variable collapses to its initialiser's type and every later read of it is
+    // type-checked against a value the compiler believes is the only one possible. The runtime is
+    // unaffected, which is exactly what makes it dangerous: the guard still works and the types stop
+    // being able to say so. A property of an object is re-widened by the intervening call.
+    const billPostingOutcome: { outcome?: EnqueueOutcomeLike } = {}
     await db.$transaction(async (tx) => {
       await tx.$queryRaw`SELECT id FROM purchase_orders WHERE id = ${poId} FOR UPDATE`
       await tx.$queryRaw`SELECT id FROM purchase_order_lines WHERE "poId" = ${poId} FOR UPDATE`
@@ -3022,6 +3104,17 @@ export async function createInvoice(
         // (same amount, same typo'd supplier ref) used to hash to one key under the PO and the
         // second would dedupe away. Per-bill, they cannot collide.
         const billIdempotencyKey = accountingPayloadKey(`purchase-invoice:${createdInvoice.id}`, accountingPayload)
+        // o3d-j625 r3 (Codex HIGH 1 family) — WHAT THE ENQUEUE ANSWERED, CAPTURED FOR REPORTING AFTER
+        // THE COMMIT.
+        //
+        // `queued` was read only to gate the subledger row — correctly — and the decline itself went
+        // nowhere: the bill commits and the action returns success with no GL posting and no warning.
+        // `reportOutcome` is used rather than the `WithOutcome` adapter because the whole ANSWER is
+        // wanted (a `not-configured` must not be reported as owed) while the boolean the gate below
+        // reads stays exactly as it is.
+        //
+        // Captured, not logged here: an activity-log write uses its own connection, so logging inside
+        // this transaction would leave the report standing if the transaction later rolled back.
         const queued = await queueAccountingSyncTx(tx, {
           type: 'PURCHASE_INVOICE',
           referenceType: 'PurchaseInvoice',
@@ -3034,6 +3127,7 @@ export async function createInvoice(
           // other connector's books against a transit account that does not exist there is rejected or,
           // worse, matched to an unrelated account of the same number.
           chartConnector: accountingSettings.connector,
+          reportOutcome: (outcome) => { billPostingOutcome.outcome = outcome },
         })
         // 6oyu.4 (khdw): the bill DEBITS the transit clearing account by its NET
         // subtotal (the ACCPAY bill posts EXCLUSIVE — all product + cost lines are
@@ -3052,6 +3146,21 @@ export async function createInvoice(
         }
       }
     }, STOCK_TX_OPTIONS)
+
+    // o3d-j625 r3 (Codex HIGH 1 family): the enqueue declined and the local state committed anyway.
+    if (billPostingOutcome.outcome && postingIsOwed(billPostingOutcome.outcome)) {
+      await reportPostingNotQueued({
+        entityType: 'PURCHASE_ORDER',
+        entityId: poId,
+        action: 'purchase_invoice_not_queued',
+        posting: `the purchase bill for PO ${po.reference}`,
+        committed: 'the bill is recorded in IMS',
+        remedy:
+          'The bill is NOT in the ledger, so payables understate it and goods-in-transit is not cleared. Re-create the bill once the accounting connector selection has settled, or enter it by hand in the books it belongs to.',
+        outcome: billPostingOutcome.outcome,
+        metadata: { reference: po.reference, invoiceNumber: input.invoiceNumber ?? null, chartConnector: accountingSettings.connector },
+      })
+    }
 
     revalidatePath('/purchase-orders')
     revalidatePath(`/purchase-orders/${poId}`)
@@ -3125,6 +3234,8 @@ export async function updateInvoice(
         notes: true,
         supplierInvoiceUrl: true,
         accountingInvoiceId: true,
+        // o3d-j625 r3 (Codex HIGH 2): and whose bill it is — the UPDATE payload carries the id.
+        accountingInvoiceConnector: true,
         paidAt: true,
         po: {
           select: {
@@ -3316,6 +3427,11 @@ export async function updateInvoice(
         })
       : null
 
+    // o3d-j625 r3 (Codex HIGH 1 family) — WHAT THE ENQUEUE ACTUALLY DID, CARRIED OUT OF THE
+    // TRANSACTION. The activity log below used to report `queuedAccountingUpdate` from a boolean derived
+    // from the bill's own columns (`accountingInvoiceId && idempotencyKey`), which consults the enqueue
+    // not at all — so a refused update was recorded as a queued one.
+    const billUpdateSync: { outcome: Awaited<ReturnType<typeof maybeQueuePurchaseInvoiceUpdate>> } = { outcome: 'skipped-no-external-id' }
     await db.$transaction(async (tx) => {
       await tx.$queryRaw`SELECT id FROM purchase_invoices WHERE id = ${invoice.id} FOR UPDATE`
       await tx.$queryRaw`SELECT id FROM purchase_orders WHERE id = ${invoice.poId} FOR UPDATE`
@@ -3414,13 +3530,17 @@ export async function updateInvoice(
         })
       }
 
-      await maybeQueuePurchaseInvoiceUpdate({
+      billUpdateSync.outcome = await maybeQueuePurchaseInvoiceUpdate({
         tx,
         syncEnabled: accountingSettings.syncEnabled,
         invoiceId: invoice.id,
         poId: invoice.poId,
         poReference: invoice.po.reference,
         accountingInvoiceId: invoice.accountingInvoiceId,
+        // o3d-j625 r3 (Codex HIGH 2): `accountingPayload` carries `accountingInvoiceId` — the document
+        // the UPDATE is posted AGAINST — so the update must also name whose document that is. The chart
+        // read beside it cannot: the id is retained across a switch.
+        documentConnector: asRoutableAccountingConnector(invoice.accountingInvoiceConnector),
         accountingPayload,
         // o3d-j625 r2: `accountingPayload` above carries `accountingSettings.transitAccount` on every
         // line and `accountingSettings.reverseChargePurchaseTaxType` on its tax code, so the update is
@@ -3451,9 +3571,41 @@ export async function updateInvoice(
         reference: invoice.po.reference,
         invoiceId: invoice.id,
         accountingInvoiceId: invoice.accountingInvoiceId,
-        queuedAccountingUpdate: Boolean(invoice.accountingInvoiceId && idempotencyKey),
+        // o3d-j625 r3: the enqueue's OWN answer.
+        queuedAccountingUpdate: billUpdateSync.outcome === 'queued',
+        accountingUpdateOutcome: billUpdateSync.outcome,
       },
     })
+    // o3d-j625 r3 (Codex HIGH 1 family) — A REFUSED UPDATE IS REPORTED, NOT SWALLOWED.
+    //
+    // The bill edit itself is kept: it is a local change an operator made, and rolling it back because
+    // the accounting connector selection moved would make a retired chart block bill editing. What must
+    // not happen is the operator being told the edit was pushed. The ledger still holds the PREVIOUS
+    // version of this bill and nothing retries on its own.
+    if (billUpdateSync.outcome === 'refused') {
+      await logActivity({
+        entityType: 'PURCHASE_ORDER',
+        entityId: invoice.poId,
+        action: 'purchase_invoice_update_not_queued',
+        tag: 'accounting',
+        level: 'ERROR',
+        description:
+          `The bill edit was SAVED IN IMS but NOT queued to the accounting connector: the accounting `
+          + `queue declined a PURCHASE_INVOICE_UPDATE for bill `
+          + `${normalizedHeader.invoiceNumber ?? invoice.invoiceNumber ?? invoice.id}. The ledger still `
+          + `holds the PREVIOUS version of this bill and nothing will retry on its own — either re-save `
+          + `the bill once the accounting connector selection has settled, or correct the bill by hand in `
+          + `the ledger.`,
+        metadata: {
+          reference: invoice.po.reference,
+          invoiceId: invoice.id,
+          accountingInvoiceId: invoice.accountingInvoiceId,
+          accountingInvoiceConnector: invoice.accountingInvoiceConnector,
+          chartConnector: accountingSettings.connector,
+          idempotencyKey,
+        },
+      }).catch(() => { /* the save already happened; logging must not turn it into a failure */ })
+    }
     if (accountingSettings.syncEnabled) {
       const multiComponentRateNames = multiComponentTaxRateNames(invoice.po.lines)
       if (multiComponentRateNames.length > 0) {
@@ -3528,6 +3680,9 @@ export async function markBillPaid(
         fxRateToBase: true,
         paidAt: true,
         accountingInvoiceId: true,
+        // o3d-j625 r3 (Codex HIGH 2): AND WHOSE BILL THAT ID IS. The id survives a connector switch and
+        // carries no provenance of its own, so the bank account's chart cannot speak for it.
+        accountingInvoiceConnector: true,
         po: { select: { reference: true, currency: true } },
       },
     })
@@ -3583,6 +3738,15 @@ export async function markBillPaid(
     // The remote call is still made later by the worker, which is the point: what commits here is the
     // INTENT to pay, durably, next to the state that claims it has been paid.
     let settlement: { requestedIds: string[]; retiredCount: number; queued: boolean }
+    // o3d-j625 r3 (Codex HIGH 2): the enqueue's whole answer, captured so the rollback handler can tell a
+    // refusal from an unconfigured connector.
+    // A HOLDER, NOT A BARE `let` (the idiom lib/accounting.ts uses for the same reason). TypeScript
+    // narrows a `let` by the assignments it can SEE, and the assignment here happens inside a callback
+    // it cannot — so the variable collapses to its initialiser's type and every later read of it is
+    // type-checked against a value the compiler believes is the only one possible. The runtime is
+    // unaffected, which is exactly what makes it dangerous: the guard still works and the types stop
+    // being able to say so. A property of an object is re-widened by the intervening call.
+    const billPaymentOutcome: { outcome?: EnqueueOutcomeLike } = {}
     try {
       settlement = await db.$transaction(async (tx) => {
         const result = await markBillPaidSupersedingStaleRegistrations(tx, {
@@ -3649,8 +3813,28 @@ export async function markBillPaid(
             // the bill is not left marked PAID with nothing queued — which is the invariant this
             // in-transaction enqueue exists to hold.
             chartConnector: bankAccountChartConnector,
+            // o3d-j625 r3 (Codex HIGH 2) — AND WHOSE INVOICE ID THIS PAYLOAD CARRIES, WHICH THE CHART
+            // ABOVE DOES NOT ESTABLISH.
+            //
+            // r2 named `bankAccountChartConnector` and argued that both ids in this payload are that
+            // connector's primary keys. The bank half is proved: `input.bankAccountId` was looked up in
+            // `listAccountingBankAccountsWithChart()`'s own list, which is where
+            // `bankAccountChartConnector` came from, so the account provably exists in those books. The
+            // INVOICE half was not, and cannot be from a chart read: `accountingInvoiceId` is retained
+            // across a connector switch precisely because the document it names still exists in the old
+            // ledger. After a switch the chart check passes and this payment would be queued to the new
+            // connector naming the old one's bill.
+            //
+            // So the bill's own recorded provenance is passed, and the enqueue refuses when it is
+            // absent (a link predating the column) or disagrees. A refusal rolls this transaction back
+            // through `BillPaymentEnqueueDeclined`, so the bill is NOT left marked paid.
+            documentConnector: asRoutableAccountingConnector(invoice.accountingInvoiceConnector),
+            // o3d-j625 r3 (Codex HIGH 2): the REASON, so the operator message is the right one of the
+            // two. r2 read the boolean alone and reported every decline as "posting is switched off",
+            // which for a refusal names a remedy that cannot work.
+            reportOutcome: (outcome) => { billPaymentOutcome.outcome = outcome },
           })
-          if (!queued) throw new BillPaymentEnqueueDeclined(invoice.accountingInvoiceId)
+          if (!queued) throw new BillPaymentEnqueueDeclined(invoice.accountingInvoiceId, billPaymentOutcome.outcome?.reason ?? null)
         }
         return { requestedIds: result.requestedIds, retiredCount: result.retiredCount, queued }
       }, STOCK_TX_OPTIONS)
@@ -3688,6 +3872,8 @@ export async function markBillPaid(
       // a fault to retry, a decline is a SETTING to change (round 4 #4). Telling an operator to
       // "retry" a switched-off connector would send them round the same loop indefinitely.
       const declined = rollback instanceof BillPaymentEnqueueDeclined
+      // o3d-j625 r3 (Codex HIGH 2): and WHICH decline it was.
+      const declineReason = declined ? rollback.reason : null
       await logActivity({
         entityType: 'PURCHASE_ORDER',
         entityId: invoice.poId,
@@ -3695,10 +3881,17 @@ export async function markBillPaid(
         tag: 'purchase',
         level: 'ERROR',
         description: declined
-          ? `Bill ${invoice.invoiceNumber ?? '(no number)'} was NOT marked paid: the accounting queue ` +
-            `declined a BILL_PAYMENT for a bill the ledger already holds (posting for this sync type ` +
-            `is switched off), so the paid status was rolled back rather than left standing with ` +
-            `nothing queued.`
+          ? declineReason === 'refused'
+            ? `Bill ${invoice.invoiceNumber ?? '(no number)'} was NOT marked paid: the accounting queue ` +
+              `REFUSED a BILL_PAYMENT for a bill the ledger already holds, because the bill's accounting ` +
+              `invoice id cannot be shown to belong to the connector this payment would post to (the id ` +
+              `is kept across a connector switch and carries no provenance of its own). The paid status ` +
+              `was rolled back rather than left standing with a payment queued against another ledger's ` +
+              `document.`
+            : `Bill ${invoice.invoiceNumber ?? '(no number)'} was NOT marked paid: the accounting queue ` +
+              `declined a BILL_PAYMENT for a bill the ledger already holds (posting for this sync type ` +
+              `is switched off), so the paid status was rolled back rather than left standing with ` +
+              `nothing queued.`
           : `Bill ${invoice.invoiceNumber ?? '(no number)'} was NOT marked paid: the payment could not be ` +
             `queued for the accounting connector, so the paid status was rolled back rather than left ` +
             `standing with nothing queued. Retry, or record the payment in the ledger by hand.`,
@@ -3706,6 +3899,10 @@ export async function markBillPaid(
           invoiceId: invoice.id,
           reference: invoice.po.reference,
           accountingInvoiceId: invoice.accountingInvoiceId,
+          // o3d-j625 r3 (Codex HIGH 2): the two halves an operator needs to see the disagreement.
+          accountingInvoiceConnector: invoice.accountingInvoiceConnector,
+          bankAccountChartConnector,
+          declineReason,
           amountForeign: paymentAmount,
           error: rollback instanceof Error ? rollback.message : String(rollback),
         },
@@ -3713,7 +3910,7 @@ export async function markBillPaid(
       return {
         success: false,
         error: declined
-          ? BILL_PAYMENT_ENQUEUE_DECLINED_MESSAGE
+          ? billPaymentEnqueueDeclinedMessage(declineReason)
           : 'The payment could not be queued for the accounting connector, so the bill was not marked ' +
             'paid. Nothing was changed — try again, or record the payment in the ledger by hand.',
       }
@@ -3786,7 +3983,7 @@ export async function markBillPaid(
           description: `Realised FX ${realised.outcome} on payment for bill ${invoice.invoiceNumber ?? invoice.po.reference}`,
         })
         if (lines.length > 0) {
-          await queueAccountingSync({
+          const fxEnqueued = await queueAccountingSync({
             type: 'REALISED_FX_JOURNAL',
             referenceType: 'PurchaseInvoice',
             referenceId: invoice.id,
@@ -3812,6 +4009,24 @@ export async function markBillPaid(
             // queueAccountingSync caller.
             chartConnector: accountingSettings.connector,
           })
+          // o3d-j625 r3 (Codex HIGH 1 family): the `catch` below swallows THROWS so a journal cannot
+          // block a captured bill payment. It never saw the RETURNED refusal, so a refused AP realised-FX
+          // journal produced no throw, no warning and no row — the gain or loss on the settlement simply
+          // left the books.
+          if (postingIsOwed(fxEnqueued)) {
+            await reportPostingNotQueued({
+              entityType: 'PURCHASE_ORDER',
+              entityId: invoice.poId,
+              action: 'realised_fx_journal_not_queued',
+              posting: `the realised FX journal for the payment on bill ${invoice.invoiceNumber ?? invoice.po.reference}`,
+              committed: 'the bill is marked paid in IMS',
+              remedy:
+                'The realised gain/loss on this settlement is NOT in the ledger. Raise it by hand, or '
+                + 'clear the connector selection and re-run the FX revaluation for this date.',
+              outcome: fxEnqueued,
+              metadata: { invoiceId: invoice.id, chartConnector: accountingSettings.connector },
+            })
+          }
         }
       }
     } catch {
@@ -3954,7 +4169,10 @@ export async function postSupplierCreditNote(id: string): Promise<{ success: boo
         amountForeign: true, creditNoteNumber: true, reference: true, reason: true, status: true,
         // audit-oy5p: the offset bill's tax + supplier tax type, to mirror the bill's tax treatment.
         // audit-v08m: + the bill's external (Xero) id, to allocate the credit to it.
-        purchaseInvoice: { select: { subtotalForeign: true, taxForeign: true, accountingInvoiceId: true } },
+        // o3d-j625 r3 (Codex HIGH 2): `accountingInvoiceId` goes into the payload as
+        // `allocateToInvoiceId` — the BILL the credit is allocated against in the ledger — so whose
+        // bill it is has to come with it.
+        purchaseInvoice: { select: { subtotalForeign: true, taxForeign: true, accountingInvoiceId: true, accountingInvoiceConnector: true } },
         po: {
           select: {
             reference: true, type: true,
@@ -4015,7 +4233,18 @@ export async function postSupplierCreditNote(id: string): Promise<{ success: boo
     // CRITICAL (Codex review): claim DRAFT->POSTED and enqueue the sync in ONE
     // transaction. If the queue insert fails, the whole tx rolls back and the row
     // stays DRAFT (retryable) — never "POSTED in IMS but never sent to Xero".
-    const posted = await db.$transaction(async (tx) => {
+    // o3d-j625 r3 (Codex HIGH 1 family): the enqueue's whole answer, for the rollback message.
+    // A HOLDER, NOT A BARE `let` (the idiom lib/accounting.ts uses for the same reason). TypeScript
+    // narrows a `let` by the assignments it can SEE, and the assignment here happens inside a callback
+    // it cannot — so the variable collapses to its initialiser's type and every later read of it is
+    // type-checked against a value the compiler believes is the only one possible. The runtime is
+    // unaffected, which is exactly what makes it dangerous: the guard still works and the types stop
+    // being able to say so. A property of an object is re-widened by the intervening call.
+    const creditNoteOutcome: { outcome?: EnqueueOutcomeLike } = {}
+    // o3d-j625 r3 (Codex HIGH 1 family): the decline is caught HERE, where the credit note and its chart
+    // are still in scope, rather than in the outer catch — which sees neither and would report a
+    // stack-trace string.
+    const postSupplierCreditNoteTransaction = () => db.$transaction(async (tx) => {
       const claimed = await tx.supplierCreditNote.updateMany({
         where: { id, status: 'DRAFT' },
         data: { status: 'POSTED', postedAt: new Date() },
@@ -4057,6 +4286,16 @@ export async function postSupplierCreditNote(id: string): Promise<{ success: boo
           // chart's own connector. The gate above already requires it to be Xero; naming it here is what
           // makes the row and the codes ONE read rather than two that happen to agree.
           chartConnector: settings.connector,
+          // o3d-j625 r3 (Codex HIGH 2) — AND WHOSE BILL `allocateToInvoiceId` NAMES.
+          //
+          // Consulted only when the payload actually carries it (it is omitted when the bill has no
+          // external id yet), and then it must agree with the chart. A bill linked under Xero and then
+          // allocated against after a switch to QuickBooks would otherwise hand QuickBooks a Xero
+          // InvoiceID to allocate a credit note to. `null` — a link predating the provenance column —
+          // refuses, which rolls this transaction back and leaves the credit note DRAFT and retryable.
+          documentConnector: asRoutableAccountingConnector(cn.purchaseInvoice?.accountingInvoiceConnector),
+          // o3d-j625 r3: the reason, so the rollback message names the right remedy.
+          reportOutcome: (outcome) => { creditNoteOutcome.outcome = outcome },
         })
         // 6oyu.4 (khdw): the ACCPAYCREDIT CREDITS the transit clearing account by its
         // NET (the credit posts INCLUSIVE, so Xero splits net→transit + VAT→tax) —
@@ -4077,9 +4316,50 @@ export async function postSupplierCreditNote(id: string): Promise<{ success: boo
             journalDate: creditNoteDate,
           })
         }
+        // o3d-j625 r3 (Codex HIGH 1 family) — A DECLINE ROLLS THE CLAIM BACK, WHICH IS WHAT THIS
+        // TRANSACTION WAS ALREADY CLAIMING IT DID.
+        //
+        // The comment above this transaction says, verbatim, "never POSTED in IMS but never sent to
+        // Xero" — and that held only against a THROW. `queueAccountingSyncTx` does not throw when it
+        // declines: it returns false. So DRAFT→POSTED was claimed one statement earlier, the enqueue
+        // declined, `queued` gated the subledger row (correctly) and nothing else, and the function
+        // returned `true`: the credit note stood POSTED in IMS with no ACCPAYCREDIT, no transit row, no
+        // failure, and an INFO activity log saying it had been posted. Payables overstate by the credit
+        // for as long as anyone cares to look.
+        //
+        // Throwing here is the same remedy the bill payment takes: roll back, leave the credit note
+        // DRAFT — which is the retryable state — and tell the operator. It costs nothing that the
+        // `shouldQueueXero` escape valve above does not already cover: a tenant with no Xero connector
+        // never reaches this branch and still posts credit notes locally.
+        if (!queued) throw new SupplierCreditNoteEnqueueDeclined(cn.id, creditNoteOutcome.outcome?.reason ?? null)
       }
       return true
     }, STOCK_TX_OPTIONS)
+    let posted: boolean
+    try {
+      posted = await postSupplierCreditNoteTransaction()
+    } catch (declined) {
+      if (!(declined instanceof SupplierCreditNoteEnqueueDeclined)) throw declined
+      await logActivity({
+        entityType: 'PURCHASE_ORDER',
+        entityId: cn.poId,
+        action: 'supplier_credit_note_not_posted',
+        tag: 'accounting',
+        level: 'ERROR',
+        description:
+          `Supplier credit note ${cn.creditNoteNumber ?? cn.id} for ${cn.po.reference} was NOT posted: the `
+          + `accounting queue ${declined.reason === 'refused' ? 'REFUSED' : 'declined'} the ACCPAYCREDIT, so `
+          + `the credit note was left DRAFT rather than marked POSTED in IMS with nothing in the ledger.`,
+        metadata: {
+          creditNoteId: cn.id,
+          reference: cn.po.reference,
+          declineReason: declined.reason,
+          chartConnector: settings.connector,
+          allocateToInvoiceConnector: cn.purchaseInvoice?.accountingInvoiceConnector ?? null,
+        },
+      }).catch(() => { /* the rollback already happened; logging must not mask it */ })
+      return { success: false, error: declined.operatorMessage }
+    }
     if (!posted) return { success: false, error: 'Credit note is already posted' }
 
     revalidatePath(`/purchase-orders/${cn.poId}`)

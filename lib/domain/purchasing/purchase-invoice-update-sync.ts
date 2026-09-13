@@ -39,6 +39,12 @@ type QueueAccountingSyncTxParams = {
    * `undefined` that type-checks at the injection site.
    */
   chartConnector: 'xero' | 'quickbooks' | null
+  /**
+   * o3d-j625 r3 (Codex HIGH 2) — WHOSE BILL `payload.accountingInvoiceId` IS. Declared here for the
+   * same reason `chartConnector` is: this local type is what the injected enqueue is checked against,
+   * so omitting it would let the real parameter be satisfied by an `undefined` that type-checks.
+   */
+  documentConnector: 'xero' | 'quickbooks' | null
 }
 
 // 6oyu.4 (khdw): a bill edit reposts to Xero, changing the NET (transit) leg from the
@@ -77,13 +83,22 @@ export async function maybeQueuePurchaseInvoiceUpdate<Tx extends PurchaseInvoice
    * line-by-line update between them. There is one answer now and it comes from the caller.
    */
   chartConnector: 'xero' | 'quickbooks' | null
+  /**
+   * o3d-j625 r3 (Codex HIGH 2) — WHICH CONNECTOR'S BILL `accountingPayload.accountingInvoiceId` NAMES.
+   *
+   * A PURCHASE_INVOICE_UPDATE posts to `/Invoices/{accountingInvoiceId}`, so the id IS the target. It
+   * is retained across a connector switch, so `chartConnector` — which proves only where the transit
+   * account code came from — cannot speak for it. `null` means the link predates the provenance column
+   * and the enqueue refuses rather than assuming the active connector.
+   */
+  documentConnector: 'xero' | 'quickbooks' | null
   idempotencyKey: string | null
   // 6oyu.4 (khdw): the bill's NET (transit) subtotal before and after this edit, in
   // base currency, so the transit subledger records the signed movement (new − old).
   previousSubtotalBase: number
   newSubtotalBase: number
   deps: PurchaseInvoiceUpdateSyncDeps<Tx>
-}): Promise<'queued' | 'skipped-disabled' | 'skipped-no-external-id' | 'skipped-unsupported-connector'> {
+}): Promise<'queued' | 'refused' | 'skipped-disabled' | 'skipped-no-external-id' | 'skipped-unsupported-connector'> {
   if (!params.accountingInvoiceId || !params.idempotencyKey) return 'skipped-no-external-id'
   if (!params.syncEnabled) return 'skipped-disabled'
 
@@ -127,6 +142,8 @@ export async function maybeQueuePurchaseInvoiceUpdate<Tx extends PurchaseInvoice
     // o3d-j625 r2: the same connector the gate above just required to be Xero, and the one the caller
     // read the transit account and tax-type code from. One resolution, carried to the write.
     chartConnector: params.chartConnector,
+    // o3d-j625 r3 (Codex HIGH 2): and whose bill the payload's `accountingInvoiceId` is.
+    documentConnector: params.documentConnector,
   })
   // 6oyu.4 (khdw): the Xero update REPLACES the bill, so the transit GL debit moves
   // from the old net subtotal to the new one — record the signed delta (new − old).
@@ -144,5 +161,18 @@ export async function maybeQueuePurchaseInvoiceUpdate<Tx extends PurchaseInvoice
       journalDate: String(params.accountingPayload.date),
     })
   }
-  return 'queued'
+  // o3d-j625 r3 (Codex HIGH 1 family) — AND THE ANSWER IS THE QUEUE'S, NOT A CONSTANT.
+  //
+  // This returned `'queued'` unconditionally, having just branched on `queued` one statement earlier to
+  // decide whether a subledger row was safe to write. So the subledger was right and the CALLER was
+  // told the posting had been queued when the enqueue had declined it — and the caller's activity log
+  // then recorded `queuedAccountingUpdate` from a boolean derived from the bill's own columns, which
+  // consults the enqueue not at all. Reporting a decline as a queue is how an edit that never reached
+  // the ledger leaves no trace anywhere.
+  //
+  // `'refused'` covers both shapes of decline the boolean can carry — the posting context changed under
+  // the write, or the chart/document provenance was refused — because the caller's action is the same
+  // for both: say so, loudly, and leave the bill edit standing (rolling a local edit back because the
+  // connector selection moved would make a retired chart block bill editing entirely).
+  return queued ? 'queued' : 'refused'
 }

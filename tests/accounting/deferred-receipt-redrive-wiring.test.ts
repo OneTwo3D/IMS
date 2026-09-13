@@ -43,6 +43,8 @@ const state = {
     orderNumber: 'SO-1',
     externalOrderNumber: null as string | null,
     accountingInvoiceId: 'INV-1' as string | null,
+    // o3d-j625 r3: a posted invoice records whose document it is (see SalesOrder.accountingInvoiceConnector).
+    accountingInvoiceConnector: 'xero' as string | null,
     currency: 'GBP',
     totalForeign: 100,
     taxForeign: 0,
@@ -138,6 +140,9 @@ mock.module('@/lib/accounting', {
     getActiveAccountingConnectorInfo: async () => ({ id: 'xero' }),
     getPaymentAccountMap: async () => ({ default: 'BANK-1' }),
     lookupPaymentAccount: () => 'BANK-1',
+    // o3d-j625 r3: the mapped bank account IS one of the target connector's own accounts. The refusal
+    // when it is not is covered by tests/accounting/invoice-payment-document-provenance.test.ts.
+    accountingBankAccountBelongsTo: async () => true,
     queueAccountingSyncTxWithOutcome: async (
       _tx: unknown,
       params: { type: string; payload: Record<string, unknown>; idempotencyKey?: string },
@@ -204,6 +209,7 @@ test.beforeEach(() => {
   state.payments = []
   state.markerClears = []
   state.order.accountingInvoiceId = 'INV-1'
+  state.order.accountingInvoiceConnector = 'xero'
   onOrderLock = null
   state.order.totalForeign = 100
   state.order.taxForeign = 0

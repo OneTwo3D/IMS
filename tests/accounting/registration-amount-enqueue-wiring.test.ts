@@ -45,6 +45,8 @@ const state = {
     orderNumber: 'SO-1',
     externalOrderNumber: null as string | null,
     accountingInvoiceId: 'INV-1' as string | null,
+    // o3d-j625 r3: a posted invoice records whose document it is (see SalesOrder.accountingInvoiceConnector).
+    accountingInvoiceConnector: 'xero' as string | null,
     currency: 'GBP',
     totalForeign: new Prisma.Decimal('100.0000') as Prisma.Decimal,
     taxForeign: new Prisma.Decimal('0.0000') as Prisma.Decimal,
@@ -101,6 +103,9 @@ mock.module('@/lib/accounting', {
     getActiveAccountingConnectorInfo: async () => ({ id: 'xero' }),
     getPaymentAccountMap: async () => ({ default: 'BANK-1' }),
     lookupPaymentAccount: () => 'BANK-1',
+    // o3d-j625 r3: the mapped bank account IS one of the target connector's own accounts. The refusal
+    // when it is not is covered by tests/accounting/invoice-payment-document-provenance.test.ts.
+    accountingBankAccountBelongsTo: async () => true,
     queueAccountingSyncTxWithOutcome: async (
       _tx: unknown,
       params: { type: string; payload: Record<string, unknown>; idempotencyKey?: string },
@@ -146,6 +151,7 @@ test.beforeEach(() => {
   state.activity = []
   state.payments = []
   state.order.accountingInvoiceId = 'INV-1'
+  state.order.accountingInvoiceConnector = 'xero'
   state.order.totalForeign = new Prisma.Decimal('100.0000')
   state.order.taxForeign = new Prisma.Decimal('0.0000')
   state.order.pricesIncludeVat = false

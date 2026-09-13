@@ -50,6 +50,9 @@ function baseParams<Tx extends { activityLog: { create: (input: ActivityLogCreat
   // tax-type code came from the caller's settings read and a second resolution is the o3d-j625 defect.
   // So the tests that used to vary that dependency now vary this.
   chartConnector: 'xero' | 'quickbooks' | null = 'xero',
+  // o3d-j625 r3: whose BILL `accountingPayload.accountingInvoiceId` is. Defaulted to the chart so the
+  // existing cases keep testing what they tested; varied by the r3 case below.
+  documentConnector: 'xero' | 'quickbooks' | null = chartConnector,
 ) {
   return {
     tx,
@@ -60,6 +63,7 @@ function baseParams<Tx extends { activityLog: { create: (input: ActivityLogCreat
     accountingInvoiceId: 'xero-bill-1',
     accountingPayload: basePayload(),
     chartConnector,
+    documentConnector,
     idempotencyKey: 'purchase-invoice-update:hash',
     previousSubtotalBase: 0,
     newSubtotalBase: 0,
@@ -100,6 +104,7 @@ test('maybeQueuePurchaseInvoiceUpdate queues Xero PURCHASE_INVOICE_UPDATE when e
       // o3d-j625 r2: the caller's chart travels to the enqueue, so the row and the payload's transit
       // account are one resolution.
       chartConnector: 'xero',
+      documentConnector: 'xero',
     },
   ])
 })
@@ -256,6 +261,9 @@ test('maybeQueuePurchaseInvoiceUpdate does not record a transit row when the que
     newSubtotalBase: 130.5,
   })
 
-  assert.equal(result, 'queued')
+  // o3d-j625 r3 (Codex HIGH 1 family): this asserted `'queued'` for a queue that DECLINED — the test
+  // was pinning the defect. The subledger half was right (no transit row); the answer to the caller was
+  // not, and the caller's activity log recorded the edit as pushed on the strength of it.
+  assert.equal(result, 'refused')
   assert.equal(transitRows.length, 0)
 })

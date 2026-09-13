@@ -13,6 +13,7 @@ import { ACCOUNTING_CONNECTORS } from '@/lib/connectors/accounting-registry'
 import type { Prisma } from '@/app/generated/prisma/client'
 import { logActivity } from '@/lib/activity-log'
 import {
+  accountingBankAccountBelongsTo,
   getActiveAccountingConnectorInfo,
   getPaymentAccountMap,
   isAccountingSyncTypeEnabled,
@@ -20,6 +21,7 @@ import {
   lookupPaymentAccount,
   queueAccountingSyncTxWithOutcome,
 } from '@/lib/accounting'
+import { asRoutableAccountingConnector } from '@/lib/accounting/connector-provenance'
 import { lockSalesOrder } from '@/lib/domain/sales/allocation-service'
 import { getSalesOrderReference } from '@/lib/sales-order-display'
 import {
@@ -909,6 +911,34 @@ export function describeInvoicePaymentRefusal(params: {
           + `Accounting → Payment Account Mapping. ${remedy}`,
         metadata: { ...base, method: params.method },
       }
+    // o3d-j625 r3 (Codex HIGH 3): a mapping EXISTS and resolves to an account the target ledger does
+    // not hold. Told apart from NO_BANK_ACCOUNT because the remedy is different: the mapping is not
+    // missing, it is the OTHER connector's.
+    case 'PAYMENT_ACCOUNT_NOT_IN_LEDGER':
+      return {
+        description:
+          `Recorded ${amount} against ${params.orderReference}, but the bank account mapped for method `
+          + `"${params.method ?? ''}" / currency "${params.currency}" is not an account of the accounting `
+          + `connector this payment would post to. The payment-account mapping is a SINGLE setting shared `
+          + `by every accounting connector, and its values are one connector's own account ids — so a `
+          + `mapping filled in under a previous connector resolves to an account the current one does not `
+          + `have. The payment was NOT registered. Re-map the method in Settings → Accounting → Payment `
+          + `Account Mapping against the connector now in use. ${remedy}`,
+        metadata: { ...base, method: params.method, detail: refused.detail },
+      }
+    // o3d-j625 r3 (Codex HIGH 3): the order's invoice id cannot be shown to be this connector's.
+    case 'DOCUMENT_PROVENANCE_UNPROVEN':
+      return {
+        description:
+          `Recorded ${amount} against ${params.orderReference}, but IMS cannot establish which accounting `
+          + `connector holds the invoice this payment would settle (${refused.detail ?? 'no provenance recorded'}). `
+          + `An accounting invoice id is a document id in the accounting system's own database and it is `
+          + `kept when the connector selection changes, so it must not be assumed to belong to whichever `
+          + `connector is active now — paying against the wrong one either fails or settles an unrelated `
+          + `document. The payment was NOT registered. Re-post the invoice from this order so the document `
+          + `and its connector are recorded together. ${remedy}`,
+        metadata: withLedger,
+      }
     // o3d-0m56: an earlier attempt on this order is FAILED or CANCELLED and the ledger could not be
     // shown NOT to hold its payment. The capacity arithmetic cannot see this — a failed row
     // consumes no capacity — so without this arm the receipt would look like it fits and a second
@@ -1274,6 +1304,9 @@ export async function registerInvoicePaymentWithLedger(params: {
         where: { id: params.orderId },
         select: {
           accountingInvoiceId: true, currency: true, totalForeign: true, taxForeign: true, pricesIncludeVat: true,
+          // o3d-j625 r3 (Codex HIGH 3): AND WHICH CONNECTOR HOLDS THAT INVOICE. The id is retained
+          // across a connector switch, so nothing else in this function establishes whose it is.
+          accountingInvoiceConnector: true,
           shoppingLinks: { select: { connector: true }, take: 1 },
         },
       }),
@@ -1359,6 +1392,48 @@ export async function registerInvoicePaymentWithLedger(params: {
     // `ledgerSettlements` is deliberately NOT re-read there: it is a network call, and holding the
     // order lock and the follow-up scope lock across one would let a slow remote block every payment
     // enqueue in the system. What changes fast is the local row set, which is what IS re-read.
+    // o3d-j625 r3 (Codex HIGH 3) — WHOSE DOCUMENT, AND WHOSE BANK ACCOUNT. TWO IDENTIFIERS IN THIS
+    // PAYLOAD THAT `connectorId` DOES NOT SPEAK FOR.
+    //
+    // r2 carried `connectorId` to the enqueue as `chartConnector` and reasoned that "every fact this
+    // enqueue rests on was taken for it". True of the facts — the posting verdict, the settlement probe,
+    // the capacity arithmetic, the follow-up scope lock were all taken for `connectorId`. NOT true of the
+    // two IDs the payload carries, and the reviewer's point is that those are a different kind of thing:
+    //
+    //   so.accountingInvoiceId    the connector's own document id. Retained across a switch BY DESIGN —
+    //                             the invoice it names still exists in the old ledger — so it has no
+    //                             connector provenance of its own and cannot acquire one from a settings
+    //                             read. It is now recorded beside the id
+    //                             (SalesOrder.accountingInvoiceConnector) and READ here; absent or
+    //                             disagreeing is a refusal, never an assumption.
+    //   underLock.bankAccountId   the connector's own account id, resolved through
+    //                             `getPaymentAccountMap()`. r2 called that "connector-agnostic, so not a
+    //                             second resolution" — the LOOKUP is (keys are `method:currency`), the
+    //                             VALUES are not: it is ONE settings row shared by every connector,
+    //                             renamed out of `xero_payment_account_map` without being re-scoped. Its
+    //                             provenance is established by CONFIRMATION against
+    //                             `AccountingAccount(connector, externalAccountId)` — the connector's own
+    //                             stored chart — rather than by a recorded column, because there is no row
+    //                             to record it on.
+    //
+    // Both are decided BEFORE the capacity arithmetic, so a receipt that cannot be routed is refused with
+    // its own reason instead of reaching the enqueue and being reported as POSTING_CONTEXT_CHANGED.
+    const documentConnector = connectorId === null
+      ? null
+      : asRoutableAccountingConnector(so.accountingInvoiceConnector)
+    const documentProvenanceRefused = Boolean(accountingInvoiceId)
+      && paymentSyncEnabled
+      && connectorId !== null
+      && documentConnector !== connectorId
+    const mappedBankAccountId = paymentSyncEnabled && accountingInvoiceId
+      ? lookupPaymentAccount(await getPaymentAccountMap(), params.method ?? '', params.currency)
+      : null
+    // A MAPPING THAT EXISTS BUT NAMES ANOTHER LEDGER'S ACCOUNT is told apart from no mapping at all: the
+    // operator's remedy differs, and collapsing it into NO_BANK_ACCOUNT would send them looking for a
+    // missing row that is in fact present and wrong. Awaited here, reported below (`reportRefusal` is
+    // declared after `decisionInput`).
+    const bankAccountIsThisLedgers = mappedBankAccountId !== null && connectorId !== null
+      && await accountingBankAccountBelongsTo(connectorId, mappedBankAccountId)
     const decisionInput = {
       syncEnabled: paymentSyncEnabled,
       accountingInvoiceId,
@@ -1369,9 +1444,8 @@ export async function registerInvoicePaymentWithLedger(params: {
       // go at all is done on the figure that cannot have moved.
       paymentAmount: params.amount,
       paymentId: params.paymentId,
-      bankAccountId: paymentSyncEnabled && accountingInvoiceId
-        ? lookupPaymentAccount(await getPaymentAccountMap(), params.method ?? '', params.currency)
-        : null,
+      // o3d-j625 r3: resolved and CONFIRMED against the target connector's own chart above.
+      bankAccountId: mappedBankAccountId,
       existing,
       ledgerSettlements,
       ledgerTotal: ledgerSalesInvoiceTotalForeign({
@@ -1409,6 +1483,29 @@ export async function registerInvoicePaymentWithLedger(params: {
       // SYNC_DISABLED produces no notice: nothing was expected to post at all.
       if (!notice) return
       await warn('invoice_payment_not_registered', notice.description, notice.metadata)
+    }
+
+    // o3d-j625 r3 (Codex HIGH 3) — REPORTED AS SOON AS `reportRefusal` EXISTS, AND BEFORE ANY CAPACITY
+    // DECISION IS ACTED ON. Both were decided above; only the reporting waits, because both reasons are
+    // about ROUTING and a receipt that cannot be routed must not be measured for capacity, queued, or
+    // reported as a posting-context change (which is what reaching the enqueue would have made of it).
+    if (documentProvenanceRefused) {
+      await reportRefusal({
+        register: false,
+        refusal: 'DOCUMENT_PROVENANCE_UNPROVEN',
+        detail: so.accountingInvoiceConnector === null
+          ? 'the invoice link predates the column that records which connector holds it'
+          : `the invoice is recorded as ${so.accountingInvoiceConnector}'s and this payment would post to ${connectorId}`,
+      })
+      return
+    }
+    if (mappedBankAccountId !== null && !bankAccountIsThisLedgers) {
+      await reportRefusal({
+        register: false,
+        refusal: 'PAYMENT_ACCOUNT_NOT_IN_LEDGER',
+        detail: `mapped account ${mappedBankAccountId} is not an active bank account of ${connectorId ?? 'no connector'}`,
+      })
+      return
     }
 
     if (!decision.register) {
@@ -1522,6 +1619,11 @@ export async function registerInvoicePaymentWithLedger(params: {
         // connector and the one now active. The throw is KEPT as a backstop rather than deleted: it is
         // the assertion that the routing did what it says, and if it ever fires the routing is broken.
         chartConnector: connectorId,
+        // o3d-j625 r3 (Codex HIGH 3) — AND WHOSE DOCUMENT IDs THE PAYLOAD CARRIES, which the chart does
+        // not establish. Refused above with its own reason, and restated here so the enqueue's own
+        // runtime guard is the backstop rather than this function's care being the only thing between a
+        // retained id and the wrong ledger.
+        documentConnector,
       })
       // THE ROW IS WRITTEN UNDER THE CONNECTOR THE ENQUEUE RESOLVED FOR ITSELF (o3d-ekn8 r2). A clean
       // `queued` says a row exists; `connector` is the only thing that says which ledger it is for. The

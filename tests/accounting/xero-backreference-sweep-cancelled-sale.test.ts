@@ -196,6 +196,9 @@ mock.module('@/lib/accounting', {
   namedExports: {
     getPaymentAccountMap: async () => ({ card: 'BANK-1' }),
     lookupPaymentAccount: () => 'BANK-1',
+    // o3d-j625 r3: the mapped bank account IS one of the target connector's own accounts. The refusal
+    // when it is not is covered by tests/accounting/invoice-payment-document-provenance.test.ts.
+    accountingBankAccountBelongsTo: async () => true,
   },
 })
 mock.module('@/lib/connectors/xero/auth', { namedExports: { getGrantedScopes: async () => null } })
