@@ -19,7 +19,7 @@ import {
 } from '@/lib/domain/sales/derived-figure-bound'
 import { boundedFigureString } from '@/lib/domain/sales/refund-basis-analytics'
 import { requireInventoryCostingReportAccess } from '@/lib/security/inventory-costing-access'
-import { formatMoneyCodeExact } from '@/lib/utils'
+import { formatMoneyCodeExact, moneyCodeFractionDigits } from '@/lib/utils'
 import {
   InventoryCostingReportPage,
   type InventoryCostingColumn,
@@ -30,8 +30,12 @@ export const metadata: Metadata = { title: 'COGS Report' }
 /** What the report prints where a dispatch could not be tied to a sales line at all. */
 const NO_AMOUNT = 'Unmatched'
 
-/** Pennies for money, hundredths for the ratio — the precision every cell on this page renders at. */
-const DISPLAY_PLACES = 2
+/**
+ * The margin % column's precision: the producer publishes the ratio at two decimals toward its own
+ * bound (`boundedPctString`), and it is rendered as text, never through a currency formatter, so the
+ * base currency has no say in it. Money columns use the currency's own digits instead — see below.
+ */
+const PERCENT_PLACES = 2
 
 /**
  * THE MARK IS APPENDED AFTER THE AMOUNT RENDERER, NEVER INSIDE IT (o3d-la3n r3, o3d-rv4a) — AND THE
@@ -45,7 +49,7 @@ const DISPLAY_PLACES = 2
  *
  * WHAT ROUND 2 OF THIS BRANCH ADDS IS THE ROUNDING, AND IT IS HERE FOR THE SAME STRUCTURAL REASON.
  * Every caller used to hand `money(row.revenueBase)` to this function, and `formatMoneyCode` is
- * `Intl.NumberFormat`, which rounds to the NEAREST penny — under a `≤`. For £100.004 of revenue
+ * `Intl.NumberFormat`, which rounds to the NEAREST minor unit — under a `≤`. For £100.004 of revenue
  * against £0.0001 of gross-basis credit the true figure is £100.0039167 at 20% VAT, and the cell
  * printed `£100.00 ≤`, a ceiling the truth exceeds. So the caller no longer gets the chance: it
  * receives a figure this function has already moved in the direction the relation allows (up for
@@ -56,7 +60,7 @@ const DISPLAY_PLACES = 2
  * LAYER OUT (Codex round 3 HIGH). Round 2 rounded with `roundBoundedAmountForDisplay`, which takes a
  * `number` — so the producer's decimal string was converted with `Number(...)` BEFORE the directed
  * rounding ran. Above 2^53 that conversion rounds to NEAREST and the representable doubles are
- * 0.015625 apart, wider than the penny being rounded to: the schema-valid `90071992547409.990000`
+ * 0.015625 apart, wider than the hundredth being rounded to: the schema-valid `90071992547409.990000`
  * becomes 90071992547409.984375, and a ceiling applied to that prints …409.98 over a true
  * …409.989917. Directed rounding cannot repair a value that a conversion has already moved the wrong
  * way, so there is no conversion. `boundedFigureString` rounds the STRING at two places in the
@@ -68,19 +72,27 @@ const DISPLAY_PLACES = 2
  * `bound === null` is the producer saying there is no published figure here at all, so there is no
  * relation to state — distinct from `'exact'`, which is a claim that the figure IS the figure.
  *
- * `trailingZeros` is a rendering shape and nothing else: money goes through `Intl`, which prints two
- * decimals whatever it is handed, and the ratio keeps `decimalString`'s trimmed form. The DIRECTION is
- * decided above it, from the bound, and no caller can reach it.
+ * ROUND 4: `places` IS THE PRECISION THE RENDERER WILL PRINT, NOT A HOUSE CONSTANT (Codex round 4
+ * HIGH). Round 3 rounded to two decimals here and then `Intl` rounded again to the base currency's own
+ * precision — `¥100 ≤` over a yen ceiling of 100.004, `KWD 100.000` over an exact 100.004. A money cell
+ * passes `moneyCodeFractionDigits(currency)` and a renderer that pins exactly those digits and refuses
+ * anything longer; the ratio passes `PERCENT_PLACES`. Either way the directed rounding below is the
+ * LAST rounding the figure receives.
+ *
+ * `trailingZeros` is a rendering shape and nothing else: the money renderer pins its digits whatever
+ * it is handed, and the ratio keeps `decimalString`'s trimmed form. The DIRECTION is decided above it,
+ * from the bound, and no caller can reach it.
  */
 function markFigure(
   amount: BoundedFigureString | null,
   bound: DerivedFigureBound | null,
   renderAmount: (value: BoundedFigureString) => string,
+  places: number,
   trailingZeros = true,
 ): string {
   const text = amount == null
     ? NO_AMOUNT
-    : renderAmount(boundedFigureString(amount, bound ?? 'exact', DISPLAY_PLACES, trailingZeros))
+    : renderAmount(boundedFigureString(amount, bound ?? 'exact', places, trailingZeros))
   return `${text}${bound == null ? '' : boundSuffix(bound)}`
 }
 
@@ -94,13 +106,15 @@ export default async function CogsPage({ searchParams }: { searchParams: Promise
     getOrganisation(),
   ])
   const currency = organisation.baseCurrency
-  // EVERY FIGURE ON THIS PAGE IS A DECIMAL STRING AND NONE OF THEM BECOMES A FLOAT (Codex r3 HIGH).
-  // These columns carry no relation, so nearest rounding is the right rule for them — but `Number`
-  // is not nearest-to-a-penny, it is nearest-to-a-double, and at 9e13 those are 1.5 pennies apart.
-  // `Intl` reads the string exactly and rounds to the penny itself.
-  const money = (value: string) => formatMoneyCodeExact(value, currency)
-  /** The same formatter over a string the bound-preserving rounder has already placed. */
-  const moneyOf = (value: BoundedFigureString) => formatMoneyCodeExact(value, currency)
+  // EVERY FIGURE ON THIS PAGE IS A DECIMAL STRING AND NONE OF THEM BECOMES A FLOAT (Codex r3 HIGH), AND
+  // EACH IS ROUNDED EXACTLY ONCE, TO THE DIGITS THE BASE CURRENCY PRINTS (Codex r4 HIGH): 0 for yen, 3 for
+  // dinars. The plain money columns carry no relation, so they round to nearest — here, in Decimal, not
+  // inside `Intl`, whose renderer now refuses a string it would have to round.
+  const digits = moneyCodeFractionDigits(currency)
+  const money = (value: string) => formatMoneyCodeExact(boundedFigureString(value, 'exact', digits), currency, { fractionDigits: digits })
+  /** The same pinned formatter over a string the bound-preserving rounder has already placed. */
+  const moneyOf = (value: BoundedFigureString) => formatMoneyCodeExact(value, currency, { fractionDigits: digits })
+  const markMoney = (amount: BoundedFigureString | null, bound: DerivedFigureBound | null) => markFigure(amount, bound, moneyOf, digits)
   const columns: Array<InventoryCostingColumn<CogsReportRow>> = [
     {
       key: 'group',
@@ -122,15 +136,15 @@ export default async function CogsPage({ searchParams }: { searchParams: Promise
       key: 'revenue',
       label: `Revenue (${currency}, net of credit)`,
       align: 'right',
-      render: (row) => markFigure(row.revenueBase, row.revenueBaseBound, moneyOf),
-      footer: markFigure(report.totals.revenueBase, report.totals.revenueBaseBound, moneyOf),
+      render: (row) => markMoney(row.revenueBase, row.revenueBaseBound),
+      footer: markMoney(report.totals.revenueBase, report.totals.revenueBaseBound),
     },
     {
       key: 'margin',
       label: `Margin (${currency})`,
       align: 'right',
-      render: (row) => markFigure(row.grossMarginBase, row.grossMarginBaseBound, moneyOf),
-      footer: markFigure(report.totals.grossMarginBase, report.totals.grossMarginBaseBound, moneyOf),
+      render: (row) => markMoney(row.grossMarginBase, row.grossMarginBaseBound),
+      footer: markMoney(report.totals.grossMarginBase, report.totals.grossMarginBaseBound),
     },
     {
       key: 'marginPct',
@@ -139,7 +153,7 @@ export default async function CogsPage({ searchParams }: { searchParams: Promise
       // The producer already rounded the ratio toward its own bound at two decimals, so this second
       // rounding at the same precision is a no-op — which is the point: a chain of bound-preserving
       // roundings is bound-preserving, and a nearest one anywhere in it is not.
-      render: (row) => markFigure(row.grossMarginPct, row.grossMarginPctBound, (value) => `${value}%`, false),
+      render: (row) => markFigure(row.grossMarginPct, row.grossMarginPctBound, (value) => `${value}%`, PERCENT_PLACES, false),
     },
     // The credit, on the basis it was recorded on. Three columns and never one sum: adding a NET to a
     // GROSS amount gives a figure on neither basis, and only the NET one was taken off revenue.
@@ -164,8 +178,8 @@ export default async function CogsPage({ searchParams }: { searchParams: Promise
         { label: `COGS (${currency})`, value: money(report.totals.cogsBase) },
         { label: `GL COGS (${currency})`, value: report.totals.glBalanceBase == null ? 'Not captured' : money(report.totals.glBalanceBase) },
         { label: 'GL variance', value: report.totals.glVarianceBase == null ? 'Not captured' : money(report.totals.glVarianceBase) },
-        { label: `Revenue (${currency}, net of credit)`, value: markFigure(report.totals.revenueBase, report.totals.revenueBaseBound, moneyOf) },
-        { label: `Gross margin (${currency})`, value: markFigure(report.totals.grossMarginBase, report.totals.grossMarginBaseBound, moneyOf) },
+        { label: `Revenue (${currency}, net of credit)`, value: markMoney(report.totals.revenueBase, report.totals.revenueBaseBound) },
+        { label: `Gross margin (${currency})`, value: markMoney(report.totals.grossMarginBase, report.totals.grossMarginBaseBound) },
         { label: 'Revenue matched rows', value: `${report.totals.revenueCapturedRows}/${report.pageInfo.totalRows}` },
         // Credit that reached no row, ON ITS BASIS — three amounts per case, for the reason the
         // per-row columns are three. A zero across all six is the claim that every credit reached a

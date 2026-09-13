@@ -78,19 +78,52 @@ export function formatMoneyCode(
  * is 90071992547409.984375, so a COGS row whose true completed-basis revenue is 90071992547409.989917
  * printed a ceiling of 90071992547409.98 — below the truth it claimed to be at or above. The defect is
  * invisible below 2^53 and unavoidable above it, because there the gap between representable doubles
- * (0.015625 at 9e13) is wider than the penny being rounded to.
+ * (0.015625 at 9e13) is wider than the hundredth being rounded to.
  *
- * THE VALUE MUST ARRIVE ALREADY ROUNDED TO THE TWO DECIMALS THIS PRINTS, IN THE DIRECTION ITS RELATION
- * ALLOWS. `boundedFigureString(value, bound, 2)` is what does that. `Intl` rounds anything longer to
- * nearest itself, so handing it an unrounded string moves the defect one step later rather than fixing
- * it; handing it a correctly directed one leaves it nothing to round.
+ * AND THE PRECISION IS THE CURRENCY'S, PINNED, SO NOTHING HERE ROUNDS AGAIN (o3d-rv4a r4, Codex round 4
+ * HIGH). Round 3 rounded every amount to two decimals and then let `Intl` apply the currency's own
+ * precision on top: a yen ceiling of 100.004 went to 100.01 and printed `¥100 ≤`, below the figure, and
+ * an exact dinar figure of 100.004 printed `KWD 100.000`. So the caller rounds in its bound's direction
+ * to `moneyCodeFractionDigits(currency)` — the digits THIS formatter prints for that currency — and
+ * this function pins minimum and maximum fraction digits to exactly that and REFUSES a string with
+ * more decimals, because pinning alone would let `Intl` round a longer string to nearest in silence.
  */
 export function formatMoneyCodeExact(
   amount: string,
   currencyCode: string,
-  options?: { locale?: string },
+  options: { fractionDigits: number; locale?: string },
 ): string {
-  return formatMoneyCodeOfValue(amount, currencyCode, options)
+  const { fractionDigits } = options
+  const match = /^-?\d+(?:\.(\d+))?$/.exec(amount)
+  if (!match) throw new RangeError(`formatMoneyCodeExact needs a plain decimal string, got ${JSON.stringify(amount)}`)
+  const decimals = match[1]?.length ?? 0
+  if (decimals > fractionDigits) {
+    throw new RangeError(
+      `formatMoneyCodeExact would have to round ${amount} to ${fractionDigits} decimals for ${currencyCode}; round it in the figure's own direction first`,
+    )
+  }
+  return formatMoneyCodeOfValue(amount, currencyCode, {
+    locale: options.locale,
+    minimumFractionDigits: fractionDigits,
+    maximumFractionDigits: fractionDigits,
+  })
+}
+
+/**
+ * THE FRACTION DIGITS `formatMoneyCodeExact` PRINTS FOR A CURRENCY — read off the formatter itself.
+ *
+ * Deliberately NOT `currencyMinorUnits` (lib/domain/math/decimal.ts). That is the ISO 4217 table, and
+ * ICU's currency data disagrees with it on seventeen currencies: HUF, IDR, COP, PKR and others are two
+ * decimals in ISO and printed with none. A bound rounded to the ISO digits and printed at ICU's would be
+ * rounded twice, which is round 4's defect again. The only precision a second rounding cannot undo is
+ * the one the formatter will print.
+ */
+export function moneyCodeFractionDigits(currencyCode: string, options?: { locale?: string }): number {
+  return new Intl.NumberFormat(options?.locale ?? 'en-GB', {
+    style: 'currency',
+    currency: currencyCode,
+    currencyDisplay: 'narrowSymbol',
+  }).resolvedOptions().maximumFractionDigits ?? 2
 }
 
 function formatMoneyCodeOfValue(

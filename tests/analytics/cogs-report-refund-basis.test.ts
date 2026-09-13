@@ -1,4 +1,6 @@
 import assert from 'node:assert/strict'
+import { readFileSync } from 'node:fs'
+import path from 'node:path'
 import test, { mock } from 'node:test'
 import { Prisma } from '@/app/generated/prisma/client'
 import { parseCsv } from '@/lib/csv'
@@ -104,6 +106,8 @@ function creditNamingNothing(orderId: string, totalBase: string, totalsBasis: st
   return { totalBase: D(totalBase), productId: null, salesOrderLine: null, refund: { orderId, totalsBasis } }
 }
 
+/** The organisation's base currency as the page reads it. Tests that change it restore GBP in `finally`. */
+let BASE_CURRENCY = 'GBP'
 let COGS_ROWS: unknown[] = []
 let ORDERS: unknown[] = []
 let CREDIT_LINES: unknown[] = []
@@ -163,7 +167,8 @@ mock.module('@/lib/auth/server', {
   },
 })
 mock.module('@/app/actions/company', {
-  namedExports: { getOrganisation: async () => ({ baseCurrency: 'GBP' }) },
+  // Read at CALL time, so a test can run the page in a zero- or three-decimal base currency (Codex r4).
+  namedExports: { getOrganisation: async () => ({ baseCurrency: BASE_CURRENCY }) },
 })
 mock.module('@/lib/domain/inventory/stock-position-reports', {
   namedExports: {
@@ -223,12 +228,14 @@ async function pageCells(): Promise<{ cell: (key: string) => string; cellOf: (ke
  * which is precisely where Codex round 2 found the broken ≤.
  */
 function printedNumber(text: string): Prisma.Decimal {
-  const cleaned = text.replace(/[\u00a3,%\s]/g, '').replace(/[\u2264\u2265?]/g, '')
+  // Everything but digits, the decimal point and the sign: currency symbols and codes (£, ¥, KWD),
+  // grouping separators, no-break spaces, the percent sign and the bound marker.
+  const cleaned = text.replace(/[^\d.\-]/g, '')
   assert.match(cleaned, /^-?\d+(\.\d+)?$/, `no number could be read out of ${JSON.stringify(text)}`)
   return D(cleaned)
 }
 
-async function csvRows(): Promise<{ rows: Record<string, string>[]; header: string[]; metadata: Map<string, string> }> {
+async function csvRows(): Promise<{ rows: Record<string, string>[]; header: string[]; metadata: Map<string, string>; body: string }> {
   const { GET } = await import('@/app/api/export/inventory-costing/route')
   const { NextRequest } = await import('next/server')
   const params = new URLSearchParams({ report: 'cogs', ...FILTERS })
@@ -239,7 +246,7 @@ async function csvRows(): Promise<{ rows: Record<string, string>[]; header: stri
     const match = /^"?# ([A-Za-z0-9_.]+)"?,(.*)$/.exec(line)
     if (match) metadata.set(match[1]!, match[2]!.replace(/^"|"$/g, '').replace(/""/g, '"'))
   }
-  return { rows: parseCsv(body), header: body.split('\r\n')[0]!.split(','), metadata }
+  return { rows: parseCsv(body), header: body.split('\r\n')[0]!.split(','), metadata, body }
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -894,24 +901,116 @@ test('the float boundary on a NEGATIVE ceiling and on a floor, the two signs ROU
   assert.equal(printedFloor, '£90,071,992,547,409.99 ≥')
 })
 
-test('the report itself explains why the rows do not add up to the total (Codex r3 MEDIUM)', async () => {
-  // Codex round 3, verbatim: "`report.notices` contains no rounding/reconciliation notice, so operators
-  // only see individually ceiled rows that may not sum to the independently ceiled total. The help
-  // document explains this, but the report itself does not; across 500 rows the visible discrepancy can
-  // approach £5 and look like a calculation defect."
+test('a bound is rounded to the digits the BASE CURRENCY prints, and printed without a second rounding (Codex r4 HIGH)', async () => {
+  // Codex round 4, verbatim: "`markFigure` always rounds to two decimals, but `Intl.NumberFormat`
+  // subsequently applies the currency's own precision. With supported JPY, `100.004 upper` becomes
+  // `100.01` and then renders as `¥100 ≤`, below the value it claims to bound. With three-decimal KWD,
+  // an exact `100.004` becomes `KWD 100.000`, yielding a wrong production result."
   //
-  // THE DISCREPANCY IS DELIBERATE AND NEITHER FIGURE IS WRONG. Each row is ceiled to its own penny and
-  // the total is ceiled ONCE from the unrounded sum — which is what makes both of them sound bounds —
-  // so the column misses the footer by up to a penny per row. Reconciling them the way o3d-8u4h's
-  // supplier-ageing bands were reconciled is not available here: there the parent was a measurement and
-  // the residue could be pushed into the largest component, while here both figures are bounds and
-  // moving either to make them tally is what would make it false. So the only thing owed is the
-  // explanation, and it has to travel WITH the figures.
+  // REACHABLE: `updateOrganisation` accepts any code as the base currency (creating the Currency row if
+  // it is missing) and `addCurrency` accepts any three-character code, so yen and dinars are ordinary
+  // configurations, not hypotheticals.
   //
-  // THE FIXTURE MAKES THE DISCREPANCY REAL rather than asserting a sentence into an empty report: three
-  // products, each with an ex-VAT line of 1.001 and a 0.0001 GROSS credit of its own so each row is
-  // bounded. Nothing is deducted (the credit is not the figure's unit), so each row publishes 1.001 and
-  // ceils to 1.01 — 3.03 down the column — while the period publishes 3.003 and ceils once to 3.01.
+  // The digits are the FORMATTER'S, not the ISO table's. `currencyMinorUnits` and ICU disagree on
+  // seventeen currencies (HUF, IDR, COP, PKR among them: ISO 2, printed 0), and the only precision that
+  // cannot be undone by a second rounding is the one the formatter will actually print.
+  //
+  // Each case is a synthetic row through the renderer, as the float-boundary tests above are, and each
+  // asserts the PROPERTY (the printed number is on the right side of the published one), the PRECISION
+  // (exactly the currency's digits reach the screen) and the exact string.
+  const cases = [
+    // [currency, digits, published, bound, expected cell, relation the printed number must satisfy]
+    ['JPY', 0, '100.004000', 'upper', '¥101 ≤', 'gte'],
+    ['JPY', 0, '100.996000', 'lower', '¥100 ≥', 'lte'],
+    ['JPY', 0, '100.496000', 'exact', '¥100', 'nearest'],
+    ['GBP', 2, '100.004000', 'upper', '£100.01 ≤', 'gte'],
+    ['GBP', 2, '100.006000', 'lower', '£100.00 ≥', 'lte'],
+    ['GBP', 2, '100.004900', 'exact', '£100.00', 'nearest'],
+    ['KWD', 3, '100.000400', 'upper', 'KWD 100.001 ≤', 'gte'],
+    ['KWD', 3, '100.000600', 'lower', 'KWD 100.000 ≥', 'lte'],
+    ['KWD', 3, '100.004000', 'exact', 'KWD 100.004', 'nearest'],
+    // Negative figures, where a ceiling rounds toward zero and a floor away from it.
+    ['JPY', 0, '-100.996000', 'upper', '-¥100 ≤', 'gte'],
+    ['KWD', 3, '-100.000400', 'lower', '-KWD 100.001 ≥', 'lte'],
+  ] as const
+  let checked = 0
+  try {
+    for (const [currency, digits, published, bound, expected, relation] of cases) {
+      BASE_CURRENCY = currency
+      workedExample([])
+      const page = await pageCells()
+      const printed = page.cellOf('revenue', { revenueBase: published, revenueBaseBound: bound })
+      const amount = printedNumber(printed)
+      const printedDigits = amount.toFixed().split('.')[1]?.length ?? 0
+      const shown = printed.replace(/[^\d.]/g, '').split('.')[1]?.length ?? 0
+      assert.equal(shown, digits, `${currency} ${bound} ${published} printed ${JSON.stringify(printed)} with ${shown} decimals, not ${digits}`)
+      assert.ok(printedDigits <= digits)
+      const figure = D(published)
+      if (relation === 'gte') assert.ok(amount.gte(figure), `${currency} ≤ printed ${printed}, BELOW the ${published} it bounds`)
+      if (relation === 'lte') assert.ok(amount.lte(figure), `${currency} ≥ printed ${printed}, ABOVE the ${published} it bounds`)
+      if (relation === 'nearest') {
+        assert.equal(amount.toFixed(digits), figure.toDecimalPlaces(digits, Prisma.Decimal.ROUND_HALF_UP).toFixed(digits), `${currency} exact ${published} printed ${printed}, not the figure to its own digits`)
+      }
+      assert.equal(printed, expected)
+      checked += 1
+    }
+  } finally {
+    BASE_CURRENCY = 'GBP'
+  }
+  assert.equal(checked, cases.length, 'every case reached its assertions')
+})
+
+test('a yen report rounds the footer, the summary, the plain money columns and not the percentage (Codex r4 HIGH)', async () => {
+  // The same rule through the producer, so the footer and summary card — the period figures — are
+  // covered too, and the columns that carry no relation get the currency's digits as well.
+  //
+  // PUBLISHED revenue 100.004 (the 0.0001 GROSS credit is not this figure's unit, so nothing comes off
+  // it) and COGS 40.5; margin 59.504; margin % = 100 x (1 - 40.5/100.004) = 59.50162… , published at
+  // two decimals toward its own bound. In yen: revenue ceils to 101, margin to 60, COGS rounds half-up
+  // to 41. The percentage is not money: no currency formatter touches it, so it keeps the producer's
+  // two decimals whatever the base currency is.
+  COGS_ROWS = [cogsEntry({ id: 'c1', orderId: 'O1', productId: 'p1', qty: '1', cost: '40.5', line: { id: 'L1', productId: 'p1', totalBase: '100.004' } })]
+  ORDERS = [order('O1', [{ productId: 'p1', totalBase: '100.004' }])]
+  CREDIT_LINES = [creditAgainstLine('L1', 'O1', 'p1', '0.0001', 'GROSS')]
+  FILTER_PRODUCT_IDS = [...ALL_FIXTURE_PRODUCTS]
+  try {
+    BASE_CURRENCY = 'JPY'
+    const { rows } = await report()
+    assert.equal(rows[0]!.revenueBaseBound, 'upper')
+    assert.equal(rows[0]!.grossMarginPctBound, 'upper')
+    const page = await pageCells()
+    assert.equal(page.cell('revenue'), '¥101 ≤')
+    assert.equal(page.footer('revenue'), '¥101 ≤')
+    assert.equal(page.summary.get('Revenue (JPY, net of credit)'), '¥101 ≤')
+    assert.equal(page.cell('margin'), '¥60 ≤')
+    assert.equal(page.cell('cogs'), '¥41')
+    assert.equal(page.footer('cogs'), '¥41')
+    assert.equal(page.cell('marginPct'), `${rows[0]!.grossMarginPct}% ≤`)
+    assert.match(page.cell('marginPct'), /^\d+\.\d{2}% ≤$/, 'the ratio keeps its own two decimals')
+  } finally {
+    BASE_CURRENCY = 'GBP'
+  }
+})
+
+test('the report says, truthfully, that rows and totals are rounded independently (Codex r3 MEDIUM, r4 MEDIUM 1)', async () => {
+  // Codex round 3 asked for the explanation to travel with the figures. Codex round 4, verbatim, on what
+  // round 3 then wrote: "The notice is unconditional, including for `indeterminate` (`?`) figures that
+  // are not one-sided bounds and paginated screens where visible rows do not cover the period. It is
+  // also possible to reconcile upper-bounded rows by increasing the total to their sum while preserving
+  // a sound, albeit looser, upper bound, contradicting the claim that making them tally necessarily
+  // makes one false. 'Penny' is also incorrect for supported zero- and three-decimal currencies."
+  //
+  // All four are right. Round 3's sentence called every figure a bound (exact and `?` figures exist),
+  // named a penny (the report prints in the organisation's base currency, which can be yen or dinars),
+  // blamed rounding alone (a paginated screen shows some rows against a total over all of them), and
+  // said tallying would falsify a figure (raising a ceiling to the sum of ceilings is still a ceiling).
+  // So the notice now claims only what holds every time it is shown, and this test pins the substance
+  // of that AND the absence of each false claim — an `includes` of the new wording alone would still
+  // pass beside a sentence that kept any of the four.
+  //
+  // THE FIXTURE STILL MAKES THE DISCREPANCY REAL: three products, each with an ex-VAT line of 1.001 and
+  // a 0.0001 GROSS credit of its own so each row is `≤`. Each row publishes 1.001 and ceils to 1.01 —
+  // 3.03 down the column — while the period publishes 3.003 and ceils once to 3.01.
   const line = (id: string, productId: string) => ({ id, productId, totalBase: '1.001' })
   COGS_ROWS = [
     cogsEntry({ id: 'c1', orderId: 'O1', productId: 'p1', qty: '1', cost: '0', line: line('L1', 'p1') }),
@@ -928,37 +1027,104 @@ test('the report itself explains why the rows do not add up to the total (Codex 
 
   const page = await pageCells()
   assert.equal(page.rows.length, 3, 'the three groups the example needs')
-  // THE READER'S CHECK, at the precision the reader sees: add the column up and compare it with the
-  // footer. Asserted as a real inequality, because a notice explaining a discrepancy that does not
-  // happen would be noise, and this test would then be proof of nothing.
+  // THE READER'S CHECK, at the precision the reader sees. A real inequality, so the notice is not
+  // explaining a discrepancy that never happens.
   const columnSum = page.rows
     .map((row) => printedNumber(page.cellOf('revenue', row)))
     .reduce((total, value) => total.add(value), D(0))
   const footer = printedNumber(page.footer('revenue'))
-  assert.equal(columnSum.toString(), '3.03', 'three rows of 1.001, each ceiled to its own penny')
+  assert.equal(columnSum.toString(), '3.03', 'three rows of 1.001, each ceiled on its own')
   assert.equal(footer.toString(), '3.01', 'and the period ceiled once from the unrounded 3.003')
   assert.ok(columnSum.gt(footer), 'the fixture must actually show the discrepancy the notice explains')
-  // Both are sound over the unrounded 3.003, which is why neither may be moved to make them tally.
-  assert.ok(footer.gte(D('3.003')) && columnSum.gte(D('3.003')))
 
-  // AND THE EXPLANATION IS IN THE PAYLOAD THE PAGE RENDERS — the constant itself, not a paraphrase, so
-  // the page and the CSV cannot drift apart on what it says.
-  const { BOUNDED_FIGURE_ROUNDING_NOTICE_COGS } = await import('@/lib/analytics/refund-figure-surfaces')
+  const { DISPLAY_ROUNDING_NOTICE_COGS } = await import('@/lib/analytics/refund-figure-surfaces')
   assert.ok(
-    page.notices.includes(BOUNDED_FIGURE_ROUNDING_NOTICE_COGS),
+    page.notices.includes(DISPLAY_ROUNDING_NOTICE_COGS),
     `the rounding notice never reached the page; notices were: ${JSON.stringify(page.notices)}`,
   )
-  // It has to say the USEFUL thing, not merely exist: that the two are not expected to sum, and how
-  // large the visible gap can get. A notice that only said "figures are rounded" would leave the
-  // operator exactly where the finding found them.
-  assert.match(BOUNDED_FIGURE_ROUNDING_NOTICE_COGS, /not expected to add up/)
-  assert.match(BOUNDED_FIGURE_ROUNDING_NOTICE_COGS, /penny per row/)
+  // THE SUBSTANCE: rows and totals are rounded independently, so they may not add up; and a page of
+  // rows is not the whole period the total covers.
+  assert.match(DISPLAY_ROUNDING_NOTICE_COGS, /rounded[^.;]*independently/i)
+  assert.match(DISPLAY_ROUNDING_NOTICE_COGS, /may not add up/i)
+  assert.match(DISPLAY_ROUNDING_NOTICE_COGS, /every page/i)
+  // THE ABSENCES — each of round 4's four objections, as a claim the sentence must not make.
+  for (const [pattern, why] of [
+    [/penny|pence|cent\b/i, 'names a minor unit, which is wrong for a zero- or three-decimal base currency'],
+    [/\bfalse\b|\bwrong\b/i, 'claims reconciling would make a figure false, which raising a ceiling does not'],
+    [/\bbound/i, 'calls the figures bounds, and exact and indeterminate figures are not one-sided bounds'],
+    [/not expected|by up to|only/i, 'quantifies or limits the gap, which pagination makes untrue'],
+  ] as const) {
+    assert.doesNotMatch(DISPLAY_ROUNDING_NOTICE_COGS, pattern, `the notice ${why}: ${DISPLAY_ROUNDING_NOTICE_COGS}`)
+  }
+  // And exactly once: a second, older notice standing beside the corrected one is the failure an
+  // existence check cannot see.
+  assert.equal(page.notices.filter((notice) => /rounded/i.test(notice)).length, 1, `notices: ${JSON.stringify(page.notices)}`)
+})
 
-  // THE FILE READER IS THE ONE WHO PUTS `=SUM()` UNDER THE COLUMN, so the CSV carries the same
-  // sentence in the only channel it has. Untruncated, for the reason the metadata test below gives.
-  const { metadata } = await csvRows()
-  assert.equal(metadata.get('metadataTruncated'), undefined, 'the metadata must still fit; see headerMetadata in lib/csv.ts')
-  assert.equal(metadata.get('roundingReconciliation'), BOUNDED_FIGURE_ROUNDING_NOTICE_COGS)
+test('the CSV adds no rounding-notice row to the record stream (Codex r4 MEDIUM 2)', async () => {
+  // Codex round 4, verbatim: "CSV has no standard `#` comment syntax. Only the repository's custom
+  // `parseCsv` skips these rows; common parsers will interpret the new reconciliation and `totals.*`
+  // rows as malformed report records, mapping their two fields into `groupLabel` and `sku`."
+  //
+  // True, and not provable away: no test can show a generic parser skipping a row that CSV has no
+  // syntax to mark. So round 3's rounding-notice row is REMOVED from the file rather than
+  // defended. The trailing `#` metadata section itself — dateFrom/dateTo/groupBy/generatedAt/
+  // refundTreatment on development, plus this branch's `totals.*` — is the repository-wide contract in
+  // docs/architecture.md (nineteen export files), and moving it out of the row stream is filed as its
+  // own issue rather than half-done for one report.
+  //
+  // WHAT THIS PINS IS THE EXACT KEY SET, so no further row can join the stream unnoticed: the five keys
+  // development already emitted and one `totals.<name>` per producer totals field — nothing else.
+  workedExample([creditAgainstLine('L1', 'O1', 'p1', '120', 'GROSS')])
+  const { metadata, body } = await csvRows()
+  const { totals } = await report()
+  const expected = ['dateFrom', 'dateTo', 'groupBy', 'generatedAt', 'refundTreatment', ...Object.keys(totals).map((key) => `totals.${key}`)].sort()
+  assert.ok(expected.length > 10, `the expected set was built from the producer: ${expected.length} keys`)
+  assert.deepEqual([...metadata.keys()].sort(), expected)
+  // Universal over the body, not an existence check on the parsed map: neither the key nor the sentence
+  // may appear on ANY line of the file.
+  const { DISPLAY_ROUNDING_NOTICE_COGS } = await import('@/lib/analytics/refund-figure-surfaces')
+  const lines = body.split('\r\n')
+  assert.ok(lines.length > 5, `the body was read: ${lines.length} lines`)
+  const offenders = lines.filter((text) => text.includes('roundingRecon' + 'ciliation') || text.includes(DISPLAY_ROUNDING_NOTICE_COGS.slice(0, 40)))
+  assert.deepEqual(offenders, [])
+})
+
+test('round 3’s false rounding claims are gone from every surface that made them (Codex r4 MEDIUM 1)', () => {
+  // Absence, swept over the files that carried the round-3 wording, because a corrected notice beside a
+  // stale docstring or help paragraph still tells the reader the stale thing. The phrases are assembled
+  // at runtime so this file's own list does not match itself.
+  const stale = [
+    ['what would make one of them ', 'false'],
+    ['penny per ', 'row'],
+    ['BOUNDED_FIGURE_ROUNDING_', 'NOTICE_COGS'],
+    ['roundingRecon', 'ciliation'],
+  ].map(([a, b]) => `${a}${b}`)
+  // Prove the matchers fire before trusting their silence.
+  assert.ok(('making them tally is what would make one of them ' + 'false').includes(stale[0]!))
+  assert.ok(('by up to a penny per ' + 'row').includes(stale[1]!))
+  assert.ok(('roundingRecon' + 'ciliation: X').includes(stale[3]!))
+  assert.ok(('BOUNDED_FIGURE_ROUNDING_' + 'NOTICE_COGS').includes(stale[2]!))
+  const files = [
+    'lib/analytics/refund-figure-surfaces.ts',
+    'lib/domain/inventory/inventory-costing-reports.ts',
+    'app/(dashboard)/analytics/cogs/page.tsx',
+    'app/api/export/inventory-costing/route.ts',
+    'help-docs/analytics.md',
+    'tests/analytics/cogs-report-refund-basis.test.ts',
+  ]
+  const offenders: string[] = []
+  let scanned = 0
+  for (const file of files) {
+    const source = readFileSync(path.join(process.cwd(), file), 'utf8')
+    assert.ok(source.length > 500, `${file} was not read`)
+    for (const [index, text] of source.split('\n').entries()) {
+      scanned += 1
+      for (const phrase of stale) if (text.includes(phrase)) offenders.push(`${file}:${index + 1} ${phrase}`)
+    }
+  }
+  assert.ok(scanned > 3000, `only ${scanned} lines scanned`)
+  assert.deepEqual(offenders, [])
 })
 
 // ---------------------------------------------------------------------------------------------

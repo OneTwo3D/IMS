@@ -1,7 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { requireApiAuth } from '@/lib/auth/server'
 import { csvBufferedStreamResponse } from '@/lib/csv'
-import { BOUNDED_FIGURE_ROUNDING_NOTICE_COGS, REFUND_BASIS_NOTICE_COGS_MARGIN } from '@/lib/analytics/refund-figure-surfaces'
+import { REFUND_BASIS_NOTICE_COGS_MARGIN } from '@/lib/analytics/refund-figure-surfaces'
 import { db } from '@/lib/db'
 import {
   getCogsReport,
@@ -145,12 +145,12 @@ export async function getInventoryCostingExportResponse(
           groupBy: report.groupBy,
           generatedAt: report.generatedAt,
           refundTreatment: REFUND_BASIS_NOTICE_COGS_MARGIN,
-          // THE FILE NEEDS IT MORE THAN THE PAGE DOES, and for the reason the block above gives: a
-          // spreadsheet reader is the one who puts `=SUM()` under the column and compares it with
-          // `totals.revenueBase` two rows down. Same constant as the page's notice, so the two cannot
-          // drift; a column header could not say it, because the discrepancy is BETWEEN the rows and
-          // the totals metadata rather than inside any one column.
-          roundingReconciliation: BOUNDED_FIGURE_ROUNDING_NOTICE_COGS,
+          // NO ROUNDING-NOTICE ROW (o3d-rv4a r4, Codex round 4 MEDIUM 2). Round 3 added one here, and
+          // CSV has no comment syntax: a standard parser reads every trailing `# key,value` line as a
+          // report record, mapping it into groupLabel and sku. Only this repository's parseCsv skips
+          // them. The trailing-row channel itself (the keys above and the totals below) is the
+          // repository-wide contract in docs/architecture.md and is filed as o3d-x5go rather than
+          // changed for one report; this branch adds no further row to it.
           ...Object.fromEntries(Object.entries(report.totals).map(([key, value]) => [`totals.${key}`, value])),
         },
       )

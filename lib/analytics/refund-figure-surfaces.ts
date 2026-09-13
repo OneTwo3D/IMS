@@ -118,26 +118,24 @@ export const REFUND_BASIS_NOTICE_COGS_MARGIN =
   'Revenue is the ex-VAT sales-line revenue behind each dispatch LESS the net-basis credit raised in the period against those same orders, so a fully credited sale no longer shows its original revenue and margin. Gross-basis and unproven-basis credit is reported but NOT deducted — no stored rate converts one basis into the other — and marks revenue and gross margin as at most (≤) the true figures; margin % is a ratio whose numerator and denominator both move, so where its direction is not established it is marked (?) instead. Credit that reached no row is stated separately on its own basis and bounds the totals even where it is the figure’s own unit. Inventory Turnover is COGS over average inventory value and no refund moves either input.'
 
 /**
- * COGS report: WHY THE ROWS DO NOT ADD UP TO THE TOTAL, ON THE SCREEN THAT PRINTS BOTH (o3d-rv4a r3,
- * Codex round 3 MEDIUM).
+ * COGS report: WHY THE ROWS MAY NOT ADD UP TO THE TOTAL (o3d-rv4a r3, Codex round 3 MEDIUM; rewritten
+ * r4, Codex round 4 MEDIUM 1).
  *
- * Every bounded figure on that report is rounded for display in the direction its own relation allows,
- * and the period total is rounded ONCE from the unrounded sum rather than from the rows on screen —
- * which is the whole of o3d-la3n r2's rule, and the reason a `≤` on either of them holds. The visible
- * consequence is that the column does not tally with the footer, by up to a penny per row: across 500
- * rows that is nearly £5, and it reads as a calculation defect to anyone who has not been told.
+ * THE SENTENCE CLAIMS ONLY WHAT HOLDS EVERY TIME IT IS SHOWN. Round 3's version claimed four things that
+ * do not: that every figure is a one-sided bound (exact and `?` figures exist), that the gap is at most
+ * one minor unit for each row (the report prints in the organisation's base currency, which may have zero or three
+ * decimals, and a paginated screen shows some rows against a total over all of them), and that making
+ * rows and total agree would falsify one of them (raising a ceiled total to the sum of ceiled rows
+ * gives a looser ceiling, not a false one). What is true in every case: each row and each total is
+ * rounded for display on its own, and the total is over the whole report. The totals are summed from
+ * the same unrounded group figures the rows are built from (aggregateCogsReport), so those two are the
+ * only reasons the column and the footer can differ.
  *
- * IT IS NOT FIXABLE BY RECONCILING, THE WAY o3d-8u4h's SUPPLIER AGEING BANDS WERE. There the parent was
- * a measurement and the residue could be pushed into the largest component; here each figure is a bound
- * in its own right over its own aggregate, and moving either one to make them tally is what would make
- * it false. So the discrepancy is deliberate and the only thing owed is the explanation — which has to
- * travel WITH the figures, on the page and in the file, not only in help-docs/analytics.md.
- *
- * ONE CONSTANT FOR BOTH SURFACES, and the wording is chosen so that it is true of both: "up to a penny
- * per row" is exactly the page's two decimals and a sound upper bound on the CSV's six.
+ * PAGE ONLY. Round 3 also wrote it into the CSV as a trailing `#` row; that row is gone (Codex round 4
+ * MEDIUM 2, see app/api/export/inventory-costing/route.ts).
  */
-export const BOUNDED_FIGURE_ROUNDING_NOTICE_COGS =
-  'Each row and each period total is rounded for display on its own, in the direction its ≤ or ≥ mark allows, so the rows are not expected to add up to the total beneath them — a difference of up to a penny per row is that rounding, not a calculation error. Both figures are sound bounds on the period, and making them tally is what would make one of them false.'
+export const DISPLAY_ROUNDING_NOTICE_COGS =
+  'Each row and each total is rounded independently for display, so the rows may not add up exactly to the total, which also covers every page of the report rather than just the rows shown.'
 
 /** What the Returns report prints where a period's credit is not on one basis. */
 export const RETURNS_MIXED_BASIS_MARKER = 'Mixed basis'
@@ -170,7 +168,7 @@ export const REFUND_FIGURE_SURFACES: readonly RefundFigureSurface[] = [
     figures: ['grossMarginBase', 'grossMarginBaseBound', 'grossMarginPct', 'grossMarginPctBound', 'margin', 'marginPct', 'revenue', 'revenueBase', 'revenueBaseBound', 'revenueCapturedRows'],
     treatment: 'basis-aware',
     reason:
-      'Renders getCogsReport revenue net of the net-basis credit, gross margin, margin % and the per-basis credit columns, each figure with the producer’s own bound marker appended AFTER the amount renderer (o3d-la3n r3: the mark is a fact about the interval and the Unmatched branch must not be able to suppress it). o3d-rv4a r2: markFigure also owns the DISPLAY ROUNDING — the amount reaches the cell’s renderer already moved in the direction the relation allows, because formatMoneyCode is Intl.NumberFormat and rounded a ≤ to the nearest penny, printing £100.00 over a true £100.0039167. A cell cannot obtain the unrounded number. o3d-rv4a r3 (Codex round 3 HIGH): that rounding now happens on the producer’s DECIMAL STRING via boundedFigureString and is printed by formatMoneyCodeExact, because the round-2 shape converted the string with Number() first and above 2^53 that conversion rounds to nearest — 90071992547409.990000 became …409.984375 and the ceiling printed …409.98 over a true …409.989917. No figure on this page becomes a float.',
+      'Renders getCogsReport revenue net of the net-basis credit, gross margin, margin % and the per-basis credit columns, each figure with the producer’s own bound marker appended AFTER the amount renderer (o3d-la3n r3: the mark is a fact about the interval and the Unmatched branch must not be able to suppress it). o3d-rv4a r2: markFigure also owns the DISPLAY ROUNDING — the amount reaches the cell’s renderer already moved in the direction the relation allows, because formatMoneyCode is Intl.NumberFormat and rounded a ≤ to the nearest penny, printing £100.00 over a true £100.0039167. A cell cannot obtain the unrounded number. o3d-rv4a r3 (Codex round 3 HIGH): that rounding now happens on the producer’s DECIMAL STRING via boundedFigureString and is printed by formatMoneyCodeExact, because the round-2 shape converted the string with Number() first and above 2^53 that conversion rounds to nearest — 90071992547409.990000 became …409.984375 and the ceiling printed …409.98 over a true …409.989917. No figure on this page becomes a float. o3d-rv4a r4 (Codex round 4 HIGH): every money figure is rounded exactly once, in Decimal and in its bound’s direction, to moneyCodeFractionDigits(baseCurrency) — the digits the formatter prints for that currency, not a fixed two — and formatMoneyCodeExact pins those digits and refuses a longer string, so a yen ceiling can no longer print ¥100 over 100.004.',
   },
   {
     file: 'app/(dashboard)/analytics/customers/page.tsx',
