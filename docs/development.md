@@ -72,8 +72,9 @@ in order to read a green `test:unit` log correctly:
 
 * `tests/concurrency/**` — all 22 files gate every test on `RUN_DB_CONCURRENCY_TESTS`, so under
   `test:unit` the tier is collected, reports `# SKIP`, and executes nothing.
-* `tests/db/**` — exactly ONE of the nine files is gated on a `RUN_DB_*` variable. The other eight
-  run under `test:unit`, four of them in full and four of them minus their live probes.
+* `tests/db/**` — exactly TWO of the ten files are gated on a `RUN_DB_*` variable, and it is the same
+  variable for both. The other eight run under `test:unit`, four of them in full and four of them
+  minus their live probes.
 
 MEASURED CENSUS OF `tests/db/**` — counted by running it, not by reading it. Each file under
 `npx tsx --test`, with `DATABASE_URL`, `RUN_DB_RETENTION_TESTS`, `REQUIRE_DB_RETENTION_TESTS` and
@@ -82,6 +83,7 @@ MEASURED CENSUS OF `tests/db/**` — counted by running it, not by reading it. E
 | file in `tests/db/` | what gates it | executes | skips |
 | --- | --- | ---: | ---: |
 | `shopping-webhook-retention-evidence` | `RUN_DB_RETENTION_TESTS` — the whole file | 0 | 2 |
+| `reconciliation-void-mirror-contradictions` | `RUN_DB_RETENTION_TESTS` — the whole file | 0 | 15 |
 | `connection-schema-pinning` | `DATABASE_URL` present — its live tests only | 33 | 13 |
 | `session-lock-affinity` | `DATABASE_URL` present — its live tests only | 26 | 4 |
 | `guarded-pool-routing` | `DATABASE_URL` present — its live test only | 7 | 1 |
@@ -90,16 +92,19 @@ MEASURED CENSUS OF `tests/db/**` — counted by running it, not by reading it. E
 | `post-remote-persist` | nothing | 12 | 0 |
 | `prisma-unique-violation` | nothing | 9 | 0 |
 | `pool-acquisition-bound` | nothing | 2 | 0 |
-| **total** | | **101** | **21** |
+| **total** | | **101** | **36** |
 
-101 of the tier's 122 tests therefore execute inside an ordinary `npm run test:unit`. What
+101 of the tier's 137 tests therefore execute inside an ordinary `npm run test:unit`. What
 `npm run test:db` adds is the database: the four `DATABASE_URL` files switch their live probes on,
-and the one `RUN_DB_*` file stops skipping entirely.
+and the two `RUN_DB_*` files stop skipping entirely.
 
-The 21 was then cross-checked against a WHOLE `npm run test:unit` run rather than left as a sum of
-per-file runs: that run reports 94 skips, of which 21 come from `tests/db/` — 13 schema-pinning, 4
-session-lock, 1 guarded-pool, 1 startup probe, 2 retention — and the remaining 73 are
-`tests/concurrency/**` (69) plus four unrelated `DATABASE_URL`/superuser skips elsewhere.
+The 21 skips the tier had before `reconciliation-void-mirror-contradictions` landed were
+cross-checked against a WHOLE `npm run test:unit` run rather than left as a sum of per-file runs: that
+run reported 94 skips, of which 21 came from `tests/db/` — 13 schema-pinning, 4 session-lock, 1
+guarded-pool, 1 startup probe, 2 retention — and the remaining 73 were `tests/concurrency/**` (69)
+plus four unrelated `DATABASE_URL`/superuser skips elsewhere. That whole-run figure predates the
+reconciliation file and was not re-derived per file when it landed; its row above (0/15) was measured
+on its own, with the same variables unset.
 
 Two qualifications on the row for `startup-option-verdict-across-bundles`, both read out of the file
 rather than measured, because the workspace this was counted in already held a build:
@@ -140,10 +145,13 @@ WHAT THAT DOES AND DOES NOT BUY YOU. State it precisely, because the looser vers
   not by reading: set `PRESERVE_LEGACY_WC_ORDER_CURRENCY_EVIDENCE = false` in
   `lib/connectors/shopping-webhook-retention.ts` and `npm run test:db` exits non-zero.
 * **ENFORCED, for `RUN_DB_RETENTION_TESTS` ALONE.** `test:db` sets it together with
-  `REQUIRE_DB_RETENTION_TESTS`, and the gated file throws on load if it is handed the `REQUIRE_` half
-  without its own. An edit that drops `RUN_DB_RETENTION_TESTS` from `test:db` therefore fails loudly
-  instead of skipping into a green run. This is a property of that one pair, written in that one
-  file. It says nothing about any other gate.
+  `REQUIRE_DB_RETENTION_TESTS`, and BOTH files gated on it throw on load if they are handed the
+  `REQUIRE_` half without its own. An edit that drops `RUN_DB_RETENTION_TESTS` from `test:db`
+  therefore fails loudly instead of skipping into a green run. This is a property of that one pair,
+  written out by hand in each of those two files. It says nothing about any other gate.
+  `reconciliation-void-mirror-contradictions` was written against a `RUN_DB_MIGRATION_TESTS` pair
+  that never reached this branch, and was re-gated onto this one when it landed — which is exactly the
+  kind of drift the next bullet says nothing catches.
 * **NOT ENFORCED: that a NEW gate cannot hide.** The census above is prose in two files and nothing
   reads it. A file added to `tests/db/` that gates itself on a variable `npm run test:db` does not set
   will report `# SKIP` inside a green job, exactly as `RUN_DB_RETENTION_TESTS` did, and only review

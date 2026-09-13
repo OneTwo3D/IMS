@@ -44,11 +44,12 @@ import { buildAccountingEventIdempotencyKey } from '../../lib/domain/accounting/
  * NOT contain the victim — so it cannot pass by accident against a version that never fixed anything.
  *
  * ROLLED BACK, ALWAYS. Every test runs inside a transaction that aborts, and the last one re-reads
- * from outside to prove it, so pointing RUN_DB_MIGRATION_TESTS at a database with real rows in it
+ * from outside to prove it, so pointing RUN_DB_RETENTION_TESTS at a database with real rows in it
  * cannot leave anything behind.
  *
- * Gated behind RUN_DB_MIGRATION_TESTS=1 (`npm run test:unit` has no database), against a database
- * built from `prisma migrate deploy`. Imports are RELATIVE for the same reason as the rest of
+ * Gated behind RUN_DB_RETENTION_TESTS=1 (`npm run test:unit` has no database), against a database
+ * built from `prisma migrate deploy`. The variable's name is about a different suite; see below for
+ * why this file reads it anyway. Imports are RELATIVE for the same reason as the rest of
  * tests/db/*.
  */
 
@@ -62,16 +63,23 @@ import { buildAccountingEventIdempotencyKey } from '../../lib/domain/accounting/
  * evidence — the ownership join, the truncation containment, the fold parity, the Turkish locale —
  * were checked in in a form that never ran, and a reader of the CI log had nothing to tell them so.
  *
- * WHAT IS DIFFERENT NOW, AND WHAT IS NOT (o3d-n3yt). What IS different: `npm run test:db` exists and
- * sets BOTH variables, so there is now a named invocation that runs this file. The tripwire is
- * `REQUIRE_DB_MIGRATION_TESTS=1`: it says "this environment PROMISED a database", so a
- * `RUN_DB_MIGRATION_TESTS` that is not also `1` is a wiring defect and the module refuses to load
- * rather than skipping fifteen tests under it. An unset pair is still an ordinary local run and
- * still skips.
+ * WHAT IS DIFFERENT NOW (o3d-n3yt, and the landing of this file on development). `npm run test:db`
+ * runs `tests/db/**`, and the `db-backed-regressions` job in `.github/workflows/schema-guardrails.yml`
+ * runs that script against a freshly migrated database. But the script sets exactly ONE pair:
+ * `RUN_DB_RETENTION_TESTS=1 REQUIRE_DB_RETENTION_TESTS=1`. This file was written on a branch whose
+ * `test:db` also set `RUN_DB_MIGRATION_TESTS`/`REQUIRE_DB_MIGRATION_TESTS`; that pair never reached
+ * development (its other reader, the void-basis backfill test, was dropped with the backfill), so
+ * gated on it this file would have reported fifteen `# SKIP`s inside a green `test:db` — the r13
+ * finding again, one merge later, and measured so rather than supposed. It therefore reads the pair
+ * the script ACTUALLY sets. The pair is named for the retention suite; what it means in practice is
+ * "this invocation promised a migrated database", which is the only thing either file asks of it.
  *
- * WHAT IS NOT DIFFERENT: NO CI JOB RUNS THAT SCRIPT. Somebody has to run it, against a database they
- * pointed `DATABASE_URL` at. The evidence below is real and it is mutation-proved, but it is
- * evidence you go and collect — it will not turn a pull request red on its own.
+ * THE TRIPWIRE. `REQUIRE_DB_RETENTION_TESTS=1` says "this environment PROMISED a database", so a
+ * `RUN_DB_RETENTION_TESTS` that is not also `1` is a wiring defect and the module refuses to load
+ * rather than skipping fifteen tests under it — an edit that drops the first variable from `test:db`
+ * fails loudly. An unset pair is still an ordinary local run and still skips. And it protects only
+ * this pair: NOTHING stops a future edit re-gating this file onto a variable `test:db` does not set
+ * (o3d-dzsd carries the runtime census that would).
  *
  * r13 did add a CI job and a standing guard (`tests/db-suite-ci-wiring.test.ts`) that read the
  * workflow to prove the job invoked the script, on the sound principle that a test which skips
@@ -83,11 +91,11 @@ import { buildAccountingEventIdempotencyKey } from '../../lib/domain/accounting/
  * tripwire BEHAVIOURALLY (import this file in a child process with REQUIRE set and RUN unset, and
  * require a fatal exit) rather than by parsing anything.
  */
-const skip = process.env.RUN_DB_MIGRATION_TESTS !== '1'
+const skip = process.env.RUN_DB_RETENTION_TESTS !== '1'
 
-if (skip && process.env.REQUIRE_DB_MIGRATION_TESTS === '1') {
+if (skip && process.env.REQUIRE_DB_RETENTION_TESTS === '1') {
   throw new Error(
-    'REQUIRE_DB_MIGRATION_TESTS=1 but RUN_DB_MIGRATION_TESTS is not 1, so every test in '
+    'REQUIRE_DB_RETENTION_TESTS=1 but RUN_DB_RETENTION_TESTS is not 1, so every test in '
     + 'tests/db/reconciliation-void-mirror-contradictions.test.ts would have been skipped in an '
     + 'environment that promised a migrated database. Fix the invocation (npm run test:db) rather '
     + 'than this check: a silent skip here is the o3d-11rf r13 finding.',
@@ -104,7 +112,7 @@ function loadEnv() {
   config({ path: '.env.local', quiet: true })
   config({ quiet: true })
   if (!process.env.DATABASE_URL) {
-    throw new Error('DATABASE_URL is required when RUN_DB_MIGRATION_TESTS=1')
+    throw new Error('DATABASE_URL is required when RUN_DB_RETENTION_TESTS=1')
   }
 }
 

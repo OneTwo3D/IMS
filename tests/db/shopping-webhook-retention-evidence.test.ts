@@ -69,10 +69,10 @@ const skip = process.env.RUN_DB_RETENTION_TESTS !== '1'
 
 /**
  * THE TRIPWIRE, MODELLED ON `REQUIRE_DB_MIGRATION_TESTS` (o3d-n3yt r19). Do not go looking for that
- * variable in this tree: the two files that carried it
- * (tests/db/accounting-event-void-basis-backfill.test.ts and
- * tests/db/reconciliation-void-mirror-contradictions.test.ts) live on o3d-11rf's branch and are not
- * on this one, so this block is the only instance of the pattern here.
+ * variable in this tree: the backfill test that carried it was never landed, and
+ * tests/db/reconciliation-void-mirror-contradictions.test.ts, which also carried it, was re-gated
+ * onto THIS pair when it landed, because this is the only pair `npm run test:db` sets. So this pair
+ * now gates two files, and the tripwire below is one of two copies of the same block.
  *
  * `REQUIRE_DB_RETENTION_TESTS=1` means "this environment PROMISED a migrated database". A
  * `RUN_DB_RETENTION_TESTS` that is not also `1` in such an environment is a wiring defect, and the

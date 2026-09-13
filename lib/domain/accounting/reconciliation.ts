@@ -605,7 +605,7 @@ const MAX_RECONCILIATION_ROWS = 10_000
  * on where a longer unreadable list is not.
  *
  * A run that fills this bound is a systemic breakage, not a work queue: 500 documents nothing will
- * ever post is a decision about the backfill, not 500 individual judgements.
+ * ever post is a decision about whatever is producing unrecorded voids, not 500 individual judgements.
  */
 export const MAX_VOID_MIRROR_CONTRADICTIONS = MAX_RECONCILIATION_FINDINGS_PER_RUN
 // Refunded orders are picked up by the refundStatus OR-branch in the source query;
@@ -1375,17 +1375,15 @@ export function evaluateAccountingReconciliationRows(
  * WHAT THIS IS THE OTHER HALF OF. `voidBasis` records WHY a mirrored event is VOID so a new live
  * attempt may take back a void that retired an ATTEMPT while never taking back one that retired the
  * DOCUMENT. NULL means no writer said which, and NULL is never revived — the only safe reading, and
- * the reason the column could be added with no default. The backfill migration
- * (20260908170000_accounting_event_void_basis_backfill) then repairs every historical row where a
- * NOT_POSTED settlement is PROVABLE from two independent witnesses.
+ * the reason the column could be added with no default.
  *
- * WHAT NEITHER OF THOSE REACHES. A void whose provenance is genuinely unrecoverable — both witnesses
- * present so only an untrustworthy clock could order them, a settlement made before
- * `accounting_sync_logs.settlement_basis` existed to record it, a row an administrator wrote by hand
- * — stays NULL for ever. If a LIVE sync row is still working on that document, that pairing is the
+ * WHAT NOTHING REACHES. The column's migration (20260912090000_accounting_event_void_basis) is
+ * structure only: NO migration classifies the voids that existed before it, by the standing decision
+ * not to make retrospective data fixes. So a void written before the column existed, a void written
+ * by a predecessor binary still serving across that deploy, and a row an administrator wrote by hand
+ * all stay NULL for ever. If a LIVE sync row is still working on that document, that pairing is the
  * exact o3d-11rf defect, frozen: a PENDING row that will never post, against a mirror that will
- * never be revived. Silently leaving those broken is what this exists to refuse. A migration that
- * repairs what it can prove and says nothing about the rest has still abandoned the rest.
+ * never be revived. Silently leaving those broken is what this exists to refuse.
  *
  * IT IS THE PAIRING THAT IS REPORTED, NOT THE NULL. Almost every VOID row in a mature database is a
  * legitimate cancellation from before the column existed, and reporting all of them would bury the
@@ -1461,7 +1459,8 @@ function addUnclassifiedVoidMirrorFindings(
       message:
         `${contradictions.total} unclassified VOID mirrors have live sync rows still working on the same `
         + `document; only the first ${contradictions.rows.length} are listed. The rest are not in this `
-        + 'report — at this scale it is the void-basis backfill that needs a decision, not the documents',
+        + 'report — at this scale it is whatever voided them without recording why that needs a decision, '
+        + 'not the documents one by one',
       details: {
         reported: contradictions.rows.length,
         total: contradictions.total,
@@ -1525,8 +1524,8 @@ function addAssumedRevisionOrderFindings(
  * VOIDs — and those compete for the same 10,000 slots as the rows this check exists to find.
  *
  * That is not a rounding error, it is an inversion. The victims this warning was built for are BY
- * DEFINITION old: a settlement made before `settlement_basis` existed, a row an administrator wrote
- * by hand, a void whose two witnesses only an untrustworthy clock could order. The older a victim is,
+ * DEFINITION old: a void written before `voidBasis` existed, or by a predecessor binary serving across
+ * that migration, or a row an administrator wrote by hand. The older a victim is,
  * the further down a `businessDate DESC` page it sits, and the more likely it is dropped BEFORE the
  * pairing that would have named it. The mechanism built to surface abandoned rows preferentially
  * discarded the most abandoned ones — and did so silently, because the generic
