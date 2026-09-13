@@ -10623,7 +10623,9 @@ test('r34: an unpinned bootstrap out of an application-writable checkout is REFU
     assert.match(boot.output, /published WITH THE RELEASE/, 'where a first-ever install gets it')
     assert.match(boot.output, /--dry-run/, 'how the release host produces it')
     assert.match(boot.output, /fence_artefact_sha256=/, 'and where a host that already has it keeps it')
-    assert.match(boot.output, /bootstrap from a source only this account can write/, 'and the way out that needs no digest at all')
+    assert.match(boot.output, /bootstrap from a source nobody but root has ever written/, 'and the way out that needs no digest at all')
+    // o3d-z5be r6 (Codex HIGH 1): and that way out is fresh inodes, never a relabel of an existing tree.
+    assert.doesNotMatch(boot.output, /take group and other write off/, 'the way out must not be a chown/chmod relabel')
 
     // THE CONTROL: the substitution is live, so what was refused was a real theft and not a
     // hypothetical one.

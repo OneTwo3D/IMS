@@ -260,7 +260,10 @@ set -euo pipefail
 #    THIS IS NOT A SECURITY BOUNDARY AND DOES NOT PRETEND TO BE ONE. It lives INSIDE the tree it
 #    distrusts. Bash reads this file incrementally and reads each library later still, so an account
 #    that can write the tree can rewrite this very block before bash reaches it, or rewrite a library
-#    after this check and before the `source` that reads it. What it catches is the honest mistake —
+#    after this check and before the `source` that reads it. NOR CAN IT TELL A RELABELLED TREE FROM A
+#    FRESH ONE (r6, Codex HIGH 1): `chown`/`chmod` change an inode's metadata and revoke no descriptor
+#    already open for writing, so a tree another account once wrote and root then relabelled passes
+#    this check while that account can still write it. What it catches is the honest mistake —
 #    `sudo bash /opt/one-two-inventory/scripts/update.sh` typed on a box nobody has tampered with yet.
 #    The boundary is not running root code from a tree another account can write AT ALL, and that is
 #    what /etc/ims-cutover-driver/driver is for. docs/installation.md says the same.
@@ -326,7 +329,7 @@ if [[ "${EUID}" == "0" ]]; then
     ims_startup_refuse "the ownership and modes of the tree ${IMS_ENTRYPOINT_SELF} lives in could not be read, so this run cannot say whether an account other than root could have written the code it is about to execute as root. Run the root-owned driver: sudo bash /etc/ims-cutover-driver/driver/$(basename -- "${IMS_ENTRYPOINT_SELF}")" || exit 1
   fi
   if [[ -n "${IMS_STARTUP_OFFENDER}" ]]; then
-    ims_startup_refuse "REFUSING TO RUN AS ROOT OUT OF A TREE ANOTHER ACCOUNT CAN WRITE. ${IMS_STARTUP_OFFENDER} is owned by an account other than root, is writable by group or other, or is not a regular file or directory, so the code this run would execute as root — this file and the libraries beside it — could have been chosen by that account. Running root code from such a tree is not supported. Run the root-owned driver instead: sudo bash /etc/ims-cutover-driver/driver/$(basename -- "${IMS_ENTRYPOINT_SELF}"). On a host that has no driver yet, run install.sh from a release tree only root can write — clone or unpack it as root, or: chown -R root:root <tree> && chmod -R go-w <tree> — and it publishes one. This check is best-effort (see docs/installation.md): it cannot defend a tree that was already tampered with." || exit 1
+    ims_startup_refuse "REFUSING TO RUN AS ROOT OUT OF A TREE ANOTHER ACCOUNT CAN WRITE. ${IMS_STARTUP_OFFENDER} is owned by an account other than root, is writable by group or other, or is not a regular file or directory, so the code this run would execute as root — this file and the libraries beside it — could have been chosen by that account. Running root code from such a tree is not supported. Run the root-owned driver instead: sudo bash /etc/ims-cutover-driver/driver/$(basename -- "${IMS_ENTRYPOINT_SELF}"). On a host that has no driver yet, fetch the release AS ROOT INTO A NEWLY CREATED DIRECTORY (git clone or tar -x as root into mktemp -d /root/ims-release.XXXXXX) and run install.sh from there; it publishes one. Do NOT chown or chmod an existing tree to get past this: that does not revoke write descriptors another account already holds, and this check cannot tell a relabelled tree from a fresh one. See *The supported bootstrap* in docs/installation.md. This check is best-effort (see docs/installation.md): it cannot defend a tree that was already tampered with." || exit 1
   fi
 fi
 IMS_SCRIPT_LIB_DIR="$(dirname -- "${IMS_ENTRYPOINT_SELF}")/lib"

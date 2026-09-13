@@ -11,19 +11,55 @@
 
 ## The Install Script
 
-Run the installer as root, **from a release tree only root can write**:
+<a id="supported-bootstrap"></a>
+### The supported bootstrap
+
+Run the installer as root, **from a release that root fetched into a directory root has just created**:
 
 ```bash
-bash scripts/install.sh
+# 1. As root: a NEW directory no other account has ever had open, under a root-owned parent that
+#    no other account can write (/root is root:root 0700 on Debian and Ubuntu).
+RELEASE_DIR="$(mktemp -d /root/ims-release.XXXXXX)"
+
+# 2. As root: fetch the release INTO it, so that every file is created by root, now.
+git clone --branch <release-tag> --depth 1 <repository-url> "${RELEASE_DIR}/one-two-inventory"
+#    ...or, from a release tarball root has downloaded into ${RELEASE_DIR}:
+#    tar -xzf "${RELEASE_DIR}/<release>.tar.gz" -C "${RELEASE_DIR}" --no-same-owner --no-same-permissions
+
+# 3. Run the installer from there. NOT from /opt/one-two-inventory: that is the directory it
+#    creates and hands to imsapp, and it refuses to be run from inside it.
+bash "${RELEASE_DIR}/one-two-inventory/scripts/install.sh"
 ```
 
-**A tree another account can write is refused** (o3d-z5be r5). Clone or unpack the release *as root*
-— or `chown -R root:root <tree> && chmod -R go-w <tree>` — before running it. As root, each of the
-three entrypoints checks, before it reads any library, that the file itself, its directory, `lib/`
-and everything in `lib/` are owned by root and writable by nobody else, and that every directory
-above it is owned by root and not writable by group or other unless sticky; otherwise it stops and
-names the offending path. See *Which invocations are supported* below for why this is not optional,
-and why the check is only best-effort.
+**Relabelling a tree does not make it trusted, and is not a supported bootstrap** (o3d-z5be r6).
+`chown -R root:root <tree> && chmod -R go-w <tree>` over a checkout another account has had write
+access to *looks* like the result above, and it is not. Permission to write a file is checked when the
+file is **opened**; `chown` and `chmod` change the inode's owner and mode *now*, and revoke nothing that
+was opened before. An account that could write that tree can keep a descriptor open for writing (or a
+writable `mmap`, or hand the descriptor to another process), wait for the relabel and for the installer's
+startup checks to pass, and then write the entrypoint or library bytes bash has not read yet — which root
+then executes. **Nothing a script can inspect rules that out**: an open descriptor leaves no trace on the
+file, one in transit over a Unix socket is in no process's descriptor table at all, and the ownership and
+modes the startup check reads are exactly what the relabel set. So the installer **cannot detect a
+relabelled tree** and does not claim to; the only answer is inodes no other account has ever had open,
+which is what creating the directory and fetching into it as root produces. (A copy made by root writes
+fresh inodes too, but its bytes are whatever the source held while it was being read, so it is only as
+good as a source nobody else can write — which is the same question again.)
+
+**A tree another account can write is refused** (o3d-z5be r5). As root, each of the three entrypoints
+checks, before it reads any library, that the file itself, its directory, `lib/` and everything in `lib/`
+are owned by root and writable by nobody else, and that every directory above it is owned by root and not
+writable by group or other unless sticky; otherwise it stops and names the offending path. See *Which
+invocations are supported* below for why this is not optional, and why the check is only best-effort.
+
+**And the installer never hands the tree it is running from to another account** (o3d-z5be r6). Every
+recursive ownership change, copy or delete it makes — `${APP_DIR}`, its `.git`, the state directory and
+the log directory, and the local-source copy into `${APP_DIR}` — is preceded by a check that the target and
+the directory the running `install.sh` lives in are **disjoint**: neither equals, contains or lies inside
+the other, decided by device and inode along the same walk the operation makes, so a symbolic link or a
+bind mount cannot make them look separate. `LOCAL_SOURCE_DIR` and `${APP_DIR}` are held to the same rule.
+The check runs once when the configuration is collected, before any package is installed, and again
+immediately before each operation. `update.sh` holds its copy into `${APP_DIR}` to the same rule.
 
 ```bash
 # ...or, on a box you will later upgrade, with the release's digest, which publishes the
@@ -1250,16 +1286,17 @@ Without it the deployment still completes and the driver that last vouched for i
 the previous release only if that release was vouched for, and otherwise something older. That is a
 supported state: the warning at the end of the run names it, says how old the standing copy is, and
 names this remedy. The other way to
-refresh it needs no digest at all — install the release tree somewhere only `root` can write, take
-group and other write off it, and run `install.sh` from there; then nobody else could have chosen
-those bytes and nothing has to vouch for them.
+refresh it needs no digest at all — fetch the release as root into a newly created directory and run
+`install.sh` from there, exactly as in *[The supported bootstrap](#supported-bootstrap)*; then nobody
+else has ever had those files open and nothing has to vouch for them. Relabelling an existing tree with
+`chown`/`chmod` does **not** qualify.
 
 **Running `update.sh` or `deploy.sh` as root out of `/opt/one-two-inventory` is not supported, and is
 refused** (o3d-z5be r5). That tree belongs to `imsapp`, and nothing inside a tree another account can
 write can make root's execution of it safe — see *Which invocations are supported* below. On a host
 that has no driver yet (one last installed by a release older than this change), run `install.sh` from a
-release tree only root can write; it publishes the driver, and every update after that is the command
-above.
+release fetched as root into a newly created directory — *[The supported bootstrap](#supported-bootstrap)*;
+it publishes the driver, and every update after that is the command above.
 
 **There is no manual equivalent, and this document deliberately no longer offers one.**
 
@@ -2380,7 +2417,7 @@ the fence rather than silently.
 invocation*:
 
 ```bash
-# as root, from the release tree being deployed — a tree only root can write (o3d-z5be r5)
+# as root, from the release being deployed — fetched as root into a new directory (o3d-z5be r5/r6)
 IMS_FENCE_SCRIPT_SHA256=<digest of the release's entry file> \
 IMS_FENCE_ARTEFACT_SHA256=<digest of the whole artefact tree> \
   bash /path/to/release/scripts/update.sh
@@ -2439,10 +2476,11 @@ deployment. There are three sources and they are not interchangeable:
    in for one. Every refusal that reports a digest labels it **reported and not authenticated** for
    the same reason.
 
-**And the route that needs no digest at all:** bootstrap from a source only root can write. Install
-the release tree as root and take group and other write off it — every path the vendoring reads,
-and every directory from the application directory up to `/` — and the provenance question answers
-itself, so an unpinned publication is accepted. This is the "root-owned authenticated release
+**And the route that needs no digest at all:** bootstrap from a source nobody but root has ever
+written — every path the vendoring reads, and every directory from the application directory up to `/`,
+created by root rather than relabelled (see *[The supported bootstrap](#supported-bootstrap)* for why a
+`chown`/`chmod` of an existing tree does not qualify, and why no check can tell the difference) — and the
+provenance question answers itself, so an unpinned publication is accepted. This is the "root-owned authenticated release
 source" option; it is the right shape for an image-built or configuration-managed box, and the
 wrong one for a checkout the application account deploys into.
 
@@ -3168,7 +3206,9 @@ before it, and nothing that lives in the tree runs early enough to see it.
 | how the run is launched | supported? | why |
 | --- | --- | --- |
 | `sudo bash /etc/ims-cutover-driver/driver/update.sh` (and `deploy.sh`) — the documented commands | **yes** | the startup pin lands in a root-owned, never-rewritten versioned directory under `/etc`; nothing unprivileged can write those bytes at all |
-| `sudo bash <tree>/scripts/install.sh` from a release tree only root can write | **yes** | the same, by the tree's ownership and modes, which the startup block reads |
+| `sudo bash <release>/scripts/install.sh` from a release root fetched **into a newly created directory** (*The supported bootstrap*), outside `/opt/one-two-inventory` | **yes** | every inode was created by root and no other account has ever had one open; the startup block confirms ownership and modes |
+| any tree made root-owned by **relabelling** it (`chown -R root:root`, `chmod -R go-w`) after another account could write it | **NOT SUPPORTED — and NOT detected** | a relabel revokes no descriptor already open for writing, and the startup block reads only ownership and modes, which the relabel set; see *The supported bootstrap* |
+| `install.sh` run from inside `/opt/one-two-inventory` (or with `LOCAL_SOURCE_DIR` equal to, inside, or containing it) | **NOT SUPPORTED — refused before any copy or ownership change** | the installer would hand the tree it is executing from to `imsapp` while bash is still reading it (o3d-z5be r6) |
 | `sudo bash /opt/one-two-inventory/scripts/update.sh` or `deploy.sh` — any tree `imsapp` (or anyone but root) can write | **NOT SUPPORTED — refused at startup** | the tree's own account can change what root executes after the run starts; see above |
 | any of these, with the operator's tree already tampered with before they typed the command | **not defended here** | choosing what the operator launches is outside what any script can check; `IMS_HELPER_SET_SHA256` and a release digest are how an operator adds provenance |
 

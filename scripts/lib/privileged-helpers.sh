@@ -186,8 +186,10 @@
 # close this: every byte in that tree arrived through an account that owns it, and no digest this box
 # computes from it is evidence about anything — it is what the tree under question says about itself.
 # The out-of-band digest IS the path, and docs/installation.md documents it as the path. The other
-# way out needs no digest: install the release tree as root, take group and other write off it, and
-# run install.sh from there — then the source vouches for itself and the question does not arise.
+# way out needs no digest: fetch the release as root into a directory root has just created, and run
+# install.sh from there — then the source vouches for itself and the question does not arise. (NOT by
+# relabelling an existing tree with chown/chmod: that revokes no descriptor another account already
+# holds open for writing, and no check can see one — o3d-z5be r6, Codex HIGH 1.)
 # install.sh publishes it from the release it is installing; update.sh refreshes it at the END of a
 # successful run from the release it has just deployed, so the copy tracks what is deployed rather
 # than freezing at install time — when something vouched for that release.
@@ -1176,7 +1178,7 @@ driver_fill_program() {
     driver_refuse "the ownership and modes of ${scripts_dir} could not be read, so this run cannot say whether an account other than this one could have chosen the bytes it was about to publish as the next root-owned driver. Nothing has been published" || return 1
   }
   if [[ -z "${IMS_DRIVER_PROGRAM_EXPECTED_SHA256}" && -n "${IMS_DRIVER_SOURCE_UNTRUSTED_PATH}" ]]; then
-    driver_refuse "NOTHING VOUCHES FOR THE BYTES IN ${scripts_dir}, so NOTHING was published to ${IMS_DRIVER_PROGRAM_DIR} and the copy standing there is unchanged. ${IMS_DRIVER_SOURCE_UNTRUSTED_PATH} is owned or writable by an account other than this one, which means that account could have replaced what is in that tree AFTER every check this run has made — and what is published there is what the NEXT privileged run executes AS ROOT, on the documented update command. Publishing it would postpone a privilege escalation by one release rather than close it. TWO WAYS OUT, and both put the answer outside that account: re-run supplying IMS_DRIVER_SHA256=<digest of the driver tree of the release you intend to install>, which must come from the release and not from this box — a digest computed here is what the tree under question says about itself and can CONFIRM the release's value, never stand in for it; or install the release tree as root, take group and other write off it, and publish from there, in which case nothing needs to vouch for it because nobody else could have written it. The digest is taken over the tree that WOULD be published — the three entrypoints and lib/ — with: ${DB_FENCE_ARTEFACT_RECIPE}" || true
+    driver_refuse "NOTHING VOUCHES FOR THE BYTES IN ${scripts_dir}, so NOTHING was published to ${IMS_DRIVER_PROGRAM_DIR} and the copy standing there is unchanged. ${IMS_DRIVER_SOURCE_UNTRUSTED_PATH} is owned or writable by an account other than this one, which means that account could have replaced what is in that tree AFTER every check this run has made — and what is published there is what the NEXT privileged run executes AS ROOT, on the documented update command. Publishing it would postpone a privilege escalation by one release rather than close it. TWO WAYS OUT, and both put the answer outside that account: re-run supplying IMS_DRIVER_SHA256=<digest of the driver tree of the release you intend to install>, which must come from the release and not from this box — a digest computed here is what the tree under question says about itself and can CONFIRM the release's value, never stand in for it; or fetch the release as root into a directory root has just created (git clone or tar -x as root into mktemp -d) and publish from there, in which case nothing needs to vouch for it because nobody else has ever had those files open. Relabelling an existing tree with chown/chmod does NOT qualify: it revokes no write descriptor another account already holds. The digest is taken over the tree that WOULD be published — the three entrypoints and lib/ — with: ${DB_FENCE_ARTEFACT_RECIPE}" || true
     return 2
   fi
 
@@ -1375,6 +1377,136 @@ privileged_helper_path() {
     driver_refuse "${IMS_DRIVER_HELPER_DIR}/${name} is not in the snapshot this run published from ${IMS_SCRIPT_LIB_DIR}, so this release does not ship it. Restore the checkout and run again" || return 1
   fi
   printf '%s' "${tree}/${name}"
+  return 0
+}
+
+# ---------------------------------------------------------------------------
+# NO PRIVILEGED RUN CHANGES THE OWNERSHIP OF THE TREE IT IS EXECUTING FROM (o3d-z5be r6, Codex HIGH 2)
+# ---------------------------------------------------------------------------
+
+# THE FINDING. install.sh copied LOCAL_SOURCE_DIR into ${APP_DIR} and then ran
+# `chown -R ${APP_USER} ${APP_DIR}` — and nothing stopped the root-only release being executed from
+# already BEING ${APP_DIR}. Bash reads the entrypoint incrementally off its descriptor, so the moment
+# that `chown` handed the entrypoint's inode to the application account, that account could write
+# the commands root had not read yet. The startup block had established a tree only root could
+# write; the run then undid it itself.
+#
+# THE STRUCTURAL RULE, stated once and asked before every recursive ownership change, recursive copy
+# or recursive delete a privileged entrypoint makes: THE TARGET AND THE DIRECTORY THIS RUN IS EXECUTING
+# FROM MUST BE DISJOINT. Neither may equal, contain or lie inside the other. The directory is the one
+# the startup block pinned — the parent of ${IMS_SCRIPT_LIB_DIR}, which holds the entrypoint and lib/.
+#
+# HOW "DISJOINT" IS DECIDED, AND WHY NOT BY COMPARING STRINGS. A pathname comparison is defeated by a
+# symbolic link anywhere in either path and by a bind mount, which shows one directory at two unrelated
+# paths. So each tree is walked the way a recursive `chown`, `rsync` or `rm -rf` walks it — by directory
+# entry, not following symbolic links, crossing mount points — and asked for the OTHER tree's device
+# and inode (`find -samefile`). If a recursive operation over one could reach the other, this walk
+# reaches it too; if the walk cannot finish, the answer is a refusal and not a pass. Both operands are
+# resolved to physical paths first, so a symbolic link named as the operand itself is treated as the
+# directory it names, which is the conservative reading of what `rsync dir/` and `chown -H` do.
+#
+# A TARGET THAT DOES NOT EXIST YET is the directory its nearest existing ancestor will receive, so it
+# overlaps a tree exactly when that ancestor lies inside, or is, that tree.
+#
+# ENOENT DURING THE WALK IS NOT A REFUSAL. A tree the service can write loses entries while it is walked
+# (a build cache, a pid file), and a subtree that vanished cannot be one a recursive operation reaches
+# afterwards: nothing but root can move the executing directory, whose ancestry the startup block
+# established. Every other error is.
+IMS_DRIVER_OVERLAP_REASON=""
+
+# The physical path of "$1", or of its nearest existing ancestor when it does not exist; prints
+# "<exists 0|1> <physical path>". Fails only if not even `/` resolves.
+privileged_physical_or_nearest() {
+  local path="$1" up resolved
+  if resolved="$(realpath -e -- "${path}" 2>/dev/null)" && [[ -d "${resolved}" ]]; then
+    printf '1 %s' "${resolved}"
+    return 0
+  fi
+  up="${path}"
+  while :; do
+    up="$(dirname -- "${up}")"
+    if resolved="$(realpath -e -- "${up}" 2>/dev/null)" && [[ -d "${resolved}" ]]; then
+      printf '0 %s' "${resolved}"
+      return 0
+    fi
+    [[ "${up}" != "/" && "${up}" != "." ]] || return 1
+  done
+}
+
+# Does a walk of "$1" reach the directory "$2" (same device and inode)? 0 yes, 1 no, 2 could not tell.
+privileged_walk_reaches() {
+  local from="$1" target="$2" errors hit rc=0
+  errors="$(mktemp 2>/dev/null)" || return 2
+  hit="$(find "${from}" -samefile "${target}" -print -quit 2>"${errors}")" || rc=$?
+  if (( rc != 0 )) && grep -qv 'No such file or directory' "${errors}" 2>/dev/null; then
+    rm -f "${errors}"
+    return 2
+  fi
+  rm -f "${errors}"
+  [[ -n "${hit}" ]] && return 0
+  return 1
+}
+
+# ARE "$1" AND "$2" DISJOINT? Returns 0 when neither equals, contains or lies inside the other, and 1
+# — with the reason in ${IMS_DRIVER_OVERLAP_REASON} and on stderr — when they overlap or the question
+# could not be answered. "$3" and "$4" say what each is, for the sentence.
+privileged_trees_disjoint() {
+  local a="$1" b="$2" what_a="$3" what_b="$4" ra rb a_exists b_exists r=0
+  IMS_DRIVER_OVERLAP_REASON=""
+  ra="$(privileged_physical_or_nearest "${a}")" || ra=""
+  rb="$(privileged_physical_or_nearest "${b}")" || rb=""
+  if [[ -z "${ra}" || -z "${rb}" ]]; then
+    IMS_DRIVER_OVERLAP_REASON="${what_a} (${a}) and ${what_b} (${b}) could not both be resolved, so this run cannot show that a recursive operation over one cannot reach the other. Nothing has been changed by this step"
+    echo "${IMS_DRIVER_OVERLAP_REASON}" >&2
+    return 1
+  fi
+  a_exists="${ra%% *}"; ra="${ra#* }"
+  b_exists="${rb%% *}"; rb="${rb#* }"
+  if [[ "${a_exists}" == "0" && "${b_exists}" == "0" ]]; then
+    IMS_DRIVER_OVERLAP_REASON="neither ${what_a} (${a}) nor ${what_b} (${b}) exists, so this run cannot show they are disjoint"
+    echo "${IMS_DRIVER_OVERLAP_REASON}" >&2
+    return 1
+  fi
+  # b inside-or-equal a?  (a's walk reaches b; for a missing b, b's nearest ancestor)
+  if [[ "${a_exists}" == "1" ]]; then
+    r=0
+    privileged_walk_reaches "${ra}" "${rb}" || r=$?
+    if (( r != 1 )); then
+      (( r == 0 )) && IMS_DRIVER_OVERLAP_REASON="${what_b} (${b}) is, or lies inside, ${what_a} (${a})"         || IMS_DRIVER_OVERLAP_REASON="${what_a} (${a}) could not be walked to show it does not contain ${what_b} (${b})"
+      echo "${IMS_DRIVER_OVERLAP_REASON}" >&2
+      return 1
+    fi
+  fi
+  if [[ "${b_exists}" == "1" ]]; then
+    r=0
+    privileged_walk_reaches "${rb}" "${ra}" || r=$?
+    if (( r != 1 )); then
+      (( r == 0 )) && IMS_DRIVER_OVERLAP_REASON="${what_a} (${a}) is, or lies inside, ${what_b} (${b})"         || IMS_DRIVER_OVERLAP_REASON="${what_b} (${b}) could not be walked to show it does not contain ${what_a} (${a})"
+      echo "${IMS_DRIVER_OVERLAP_REASON}" >&2
+      return 1
+    fi
+  fi
+  return 0
+}
+
+# THE CALL EVERY RECURSIVE OWNERSHIP CHANGE, COPY OR DELETE IN AN ENTRYPOINT IS PRECEDED BY: refuses
+# when "$1" overlaps the directory this run is executing from. tests/scripts/privileged-helper-set.test.ts
+# holds the census of those operations and fails on one that is not immediately preceded by this call
+# on the same target.
+privileged_spare_running_tree() {
+  local target="$1" what="$2" running
+  IMS_DRIVER_OVERLAP_REASON=""
+  if [[ -z "${IMS_SCRIPT_LIB_DIR:-}" ]]; then
+    IMS_DRIVER_OVERLAP_REASON="this run does not know which directory it is executing from, so it cannot show that a recursive operation over ${what} (${target}) leaves it alone. This is a bug in these scripts, not an operator error"
+    echo "${IMS_DRIVER_OVERLAP_REASON}" >&2
+    return 1
+  fi
+  running="$(dirname -- "${IMS_SCRIPT_LIB_DIR}")"
+  if ! privileged_trees_disjoint "${target}" "${running}" "${what}" "the directory this run is executing from"; then
+    IMS_DRIVER_OVERLAP_REASON="REFUSING to change the ownership of, copy into, or delete from ${what} (${target}): ${IMS_DRIVER_OVERLAP_REASON}. A privileged run never hands the tree it is executing from to another account — bash is still reading this script off that tree, so the account that received it could write the commands root has not read yet. Run the installer from a release directory outside ${target}; see *The supported bootstrap* in docs/installation.md"
+    echo "${IMS_DRIVER_OVERLAP_REASON}" >&2
+    return 1
+  fi
   return 0
 }
 

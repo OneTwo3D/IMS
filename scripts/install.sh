@@ -59,7 +59,10 @@ IFS=$'\n\t'
 #    THIS IS NOT A SECURITY BOUNDARY AND DOES NOT PRETEND TO BE ONE. It lives INSIDE the tree it
 #    distrusts. Bash reads this file incrementally and reads each library later still, so an account
 #    that can write the tree can rewrite this very block before bash reaches it, or rewrite a library
-#    after this check and before the `source` that reads it. What it catches is the honest mistake —
+#    after this check and before the `source` that reads it. NOR CAN IT TELL A RELABELLED TREE FROM A
+#    FRESH ONE (r6, Codex HIGH 1): `chown`/`chmod` change an inode's metadata and revoke no descriptor
+#    already open for writing, so a tree another account once wrote and root then relabelled passes
+#    this check while that account can still write it. What it catches is the honest mistake —
 #    `sudo bash /opt/one-two-inventory/scripts/update.sh` typed on a box nobody has tampered with yet.
 #    The boundary is not running root code from a tree another account can write AT ALL, and that is
 #    what /etc/ims-cutover-driver/driver is for. docs/installation.md says the same.
@@ -125,7 +128,7 @@ if [[ "${EUID}" == "0" ]]; then
     ims_startup_refuse "the ownership and modes of the tree ${IMS_ENTRYPOINT_SELF} lives in could not be read, so this run cannot say whether an account other than root could have written the code it is about to execute as root. Run the root-owned driver: sudo bash /etc/ims-cutover-driver/driver/$(basename -- "${IMS_ENTRYPOINT_SELF}")" || exit 1
   fi
   if [[ -n "${IMS_STARTUP_OFFENDER}" ]]; then
-    ims_startup_refuse "REFUSING TO RUN AS ROOT OUT OF A TREE ANOTHER ACCOUNT CAN WRITE. ${IMS_STARTUP_OFFENDER} is owned by an account other than root, is writable by group or other, or is not a regular file or directory, so the code this run would execute as root — this file and the libraries beside it — could have been chosen by that account. Running root code from such a tree is not supported. Run the root-owned driver instead: sudo bash /etc/ims-cutover-driver/driver/$(basename -- "${IMS_ENTRYPOINT_SELF}"). On a host that has no driver yet, run install.sh from a release tree only root can write — clone or unpack it as root, or: chown -R root:root <tree> && chmod -R go-w <tree> — and it publishes one. This check is best-effort (see docs/installation.md): it cannot defend a tree that was already tampered with." || exit 1
+    ims_startup_refuse "REFUSING TO RUN AS ROOT OUT OF A TREE ANOTHER ACCOUNT CAN WRITE. ${IMS_STARTUP_OFFENDER} is owned by an account other than root, is writable by group or other, or is not a regular file or directory, so the code this run would execute as root — this file and the libraries beside it — could have been chosen by that account. Running root code from such a tree is not supported. Run the root-owned driver instead: sudo bash /etc/ims-cutover-driver/driver/$(basename -- "${IMS_ENTRYPOINT_SELF}"). On a host that has no driver yet, fetch the release AS ROOT INTO A NEWLY CREATED DIRECTORY (git clone or tar -x as root into mktemp -d /root/ims-release.XXXXXX) and run install.sh from there; it publishes one. Do NOT chown or chmod an existing tree to get past this: that does not revoke write descriptors another account already holds, and this check cannot tell a relabelled tree from a fresh one. See *The supported bootstrap* in docs/installation.md. This check is best-effort (see docs/installation.md): it cannot defend a tree that was already tampered with." || exit 1
   fi
 fi
 IMS_SCRIPT_LIB_DIR="$(dirname -- "${IMS_ENTRYPOINT_SELF}")/lib"
@@ -1291,7 +1294,7 @@ if [[ "$(id -u)" == "0" ]]; then
   publish_privileged_driver "$(dirname "${IMS_SCRIPT_LIB_DIR}")" || DRIVER_PUBLISH_RC=$?
   if (( DRIVER_PUBLISH_RC == 2 )); then
     echo "WARNING: the root-owned deployment driver at ${IMS_DRIVER_PROGRAM_DIR} was NOT published from this checkout, and whatever copy was already there is unchanged: ${IMS_DRIVER_REASON:-no reason was recorded}" >&2
-    echo "WARNING: this install continues. Until a vouched-for driver stands there, the documented update command has nothing to run — and running update.sh as root out of a tree another account can write is refused and not supported (o3d-z5be r5). Re-run install.sh from a release tree only root can write to publish one." >&2
+    echo "WARNING: this install continues. Until a vouched-for driver stands there, the documented update command has nothing to run — and running update.sh as root out of a tree another account can write is refused and not supported (o3d-z5be r5). Re-run install.sh from a release fetched as root into a newly created directory (see *The supported bootstrap* in docs/installation.md) to publish one." >&2
   elif (( DRIVER_PUBLISH_RC != 0 )); then
     echo "FATAL: the root-owned deployment driver could not be published to ${IMS_DRIVER_PROGRAM_DIR}: ${IMS_DRIVER_REASON:-no reason was recorded}. The next privileged run would then have to be launched out of a tree the service account owns, which is what this publication exists to stop. Nothing else on this host has been changed — and where the reason above says a publication IS STANDING but could not be made durable (o3d-z5be r4), that publication is a complete, sealed, digested tree and the only thing missing is the flush to disk." >&2
     exit 1
@@ -7500,6 +7503,24 @@ if [[ "$INSTALL_FROM_GIT" == "y" ]]; then
 else
   prompt LOCAL_SOURCE_DIR "Path to local app directory (will be copied)" "/root/ims/onetwoinventory"
 fi
+# THE SOURCE, THE TARGETS AND THE RUNNING TREE MUST BE DISJOINT, AND THAT IS ASKED HERE — BEFORE A PACKAGE
+# IS INSTALLED — AS WELL AS AT EACH OPERATION BELOW (o3d-z5be r6, Codex HIGH 2). Section 9 copies
+# LOCAL_SOURCE_DIR into ${APP_DIR} and then `chown -R`s ${APP_DIR} to ${APP_USER}; sections 8 and 9
+# recursively change the ownership of ${DATA_DIR} and ${LOG_DIR} too. Nothing prevented the release
+# being executed from already being ${APP_DIR}, and then that `chown` handed this script's own inode to
+# the application account while bash was still reading it. privileged_trees_disjoint() and
+# privileged_spare_running_tree() compare by device and inode along the walk a recursive operation
+# makes, so neither a symbolic link nor a bind mount can make two overlapping trees look separate. The
+# checks at the operations are the ones the census in tests/scripts/privileged-helper-set.test.ts holds
+# every recursive operation to; these exist so an operator hears it before anything is installed.
+if [[ "$INSTALL_FROM_GIT" != "y" ]]; then
+  privileged_trees_disjoint "${LOCAL_SOURCE_DIR}" "${APP_DIR}" "the local source directory" "the application directory" || die \
+    "LOCAL_SOURCE_DIR must be a directory OUTSIDE ${APP_DIR}, and ${APP_DIR} must not be inside it: ${IMS_DRIVER_OVERLAP_REASON}. Copying a tree into itself, or into a tree that contains it, and then handing the result to ${APP_USER} is refused. Nothing has been changed."
+fi
+for IMS_OVERLAP_CHECK in "${APP_DIR}|the application directory" "${DATA_DIR}|the state directory" "${LOG_DIR}|the log directory"; do
+  privileged_spare_running_tree "${IMS_OVERLAP_CHECK%%|*}" "${IMS_OVERLAP_CHECK#*|}" || die "${IMS_DRIVER_OVERLAP_REASON} Nothing has been changed."
+done
+unset IMS_OVERLAP_CHECK
 prompt_yn GIT_DEPLOY_KEY_ENABLED "Configure a per-instance GitHub deploy key for private repo updates?" "n"
 if [[ "${GIT_DEPLOY_KEY_ENABLED}" == "y" ]]; then
   if [[ "${INSTALL_FROM_GIT}" != "y" ]]; then
@@ -8301,6 +8322,7 @@ migrate_uploads "${APP_DIR}/public/uploads/avatars" "${PUBLIC_UPLOAD_STORAGE_DIR
 # checked against each other here rather than left to be true.
 [[ "${CRONTAB_LOCK_DIR}" == "${DATA_DIR%/}/${CRONTAB_LOCK_DIRNAME}" ]] || die \
   "the crontab lock directory is ${CRONTAB_LOCK_DIR}, which is not ${DATA_DIR%/}/${CRONTAB_LOCK_DIRNAME}: the recursive ownership change over the state directory prunes it by its single name component, and a name that does not compose the same path would prune nothing. This is a bug in this script, not an operator error."
+privileged_spare_running_tree "${DATA_DIR}" "the state directory" || die "${IMS_DRIVER_OVERLAP_REASON}"
 chown_state_tree "${DATA_DIR}" "${APP_USER}" "${CRONTAB_LOCK_DIRNAME}" "the state directory"
 # ${LOG_DIR}'S OWNERSHIP IS AIMED AT A DESCRIPTOR, NOT AT A NAME (o3d-secops r7 second pass,
 # Codex HIGH).
@@ -8326,6 +8348,7 @@ chown_state_tree "${DATA_DIR}" "${APP_USER}" "${CRONTAB_LOCK_DIRNAME}" "the stat
 # is the no-follow, and `.` is the pinned root. (The ${DATA_DIR} line above still uses `find`
 # because it must PRUNE two subtrees by name, which chown cannot express; it carries the same
 # residual and is not this round's change.)
+privileged_spare_running_tree "${LOG_DIR}" "the log directory" || die "${IMS_DRIVER_OVERLAP_REASON}"
 if ! (
   enter_service_root "${LOG_DIR}" 022 "the log directory"
   chown -Rh "${APP_USER}:${APP_USER}" .
@@ -8454,6 +8477,7 @@ if [[ "$INSTALL_FROM_GIT" == "y" ]]; then
     chown "${APP_USER}:${APP_USER}" "${TMP_CLONE_DIR}"
     run_git_as_user "${APP_USER}" git clone --branch "${GIT_BRANCH}" --depth 1 \
       "${GIT_REPO_URL}" "${TMP_CLONE_WORKTREE}"
+    privileged_spare_running_tree "${APP_DIR}" "the application directory" || die "${IMS_DRIVER_OVERLAP_REASON}"
     rsync -a --delete \
       --exclude='.git' \
       --exclude='.deploy-meta' \
@@ -8463,7 +8487,9 @@ if [[ "$INSTALL_FROM_GIT" == "y" ]]; then
       --exclude='uploads' \
       --exclude='public/uploads' \
       "${TMP_CLONE_WORKTREE%/}/" "${APP_DIR}/"
+    privileged_spare_running_tree "${APP_DIR}/.git" "the application git directory" || die "${IMS_DRIVER_OVERLAP_REASON}"
     copy_tree_into_new_dir "${TMP_CLONE_WORKTREE}/.git" "${APP_DIR}/.git"
+    privileged_spare_running_tree "${APP_DIR}" "the application directory" || die "${IMS_DRIVER_OVERLAP_REASON}"
     chown -R "${APP_USER}:${APP_USER}" "${APP_DIR}"
     rm -rf "${TMP_CLONE_DIR}"
     success "Repository synced into existing directory."
@@ -8475,6 +8501,9 @@ if [[ "$INSTALL_FROM_GIT" == "y" ]]; then
   fi
 else
   info "Copying from ${LOCAL_SOURCE_DIR}..."
+  privileged_trees_disjoint "${LOCAL_SOURCE_DIR}" "${APP_DIR}" "the local source directory" "the application directory" || die \
+    "LOCAL_SOURCE_DIR must be a directory OUTSIDE ${APP_DIR}, and ${APP_DIR} must not be inside it: ${IMS_DRIVER_OVERLAP_REASON}. Nothing has been copied."
+  privileged_spare_running_tree "${APP_DIR}" "the application directory" || die "${IMS_DRIVER_OVERLAP_REASON}"
   rsync -a --delete \
     --exclude='.git' \
     --exclude='node_modules' \
@@ -8486,6 +8515,7 @@ else
     --exclude='public/uploads' \
     "${LOCAL_SOURCE_DIR%/}/" "${APP_DIR}/"
   rm -f "${APP_DIR}/.env.local"
+  privileged_spare_running_tree "${APP_DIR}" "the application directory" || die "${IMS_DRIVER_OVERLAP_REASON}"
   chown -R "${APP_USER}:${APP_USER}" "${APP_DIR}"
   success "Files copied."
 
@@ -8496,7 +8526,9 @@ else
     chown "${APP_USER}:${APP_USER}" "${TMP_CLONE_DIR}"
     run_git_as_user "${APP_USER}" git clone --branch "${GIT_BRANCH}" --depth 1 \
       "${GIT_REPO_URL}" "${TMP_CLONE_WORKTREE}"
+    privileged_spare_running_tree "${APP_DIR}/.git" "the application git directory" || die "${IMS_DRIVER_OVERLAP_REASON}"
     copy_tree_into_new_dir "${TMP_CLONE_WORKTREE}/.git" "${APP_DIR}/.git"
+    privileged_spare_running_tree "${APP_DIR}/.git" "the application git directory" || die "${IMS_DRIVER_OVERLAP_REASON}"
     chown -R "${APP_USER}:${APP_USER}" "${APP_DIR}/.git"
     rm -rf "${TMP_CLONE_DIR}"
     success "Git metadata attached."

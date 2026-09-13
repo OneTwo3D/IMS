@@ -951,7 +951,9 @@ test('[o3d-z5be] a driver source an unprivileged account could rewrite publishes
     assert.ok(refused.stderr.includes(shape.offender(scripts)),
       `${shape.name}: the refusal must NAME the path an operator has to act on; it said:\n${refused.stderr}`)
     assert.match(refused.stderr, /IMS_DRIVER_SHA256=/, `${shape.name}: and the out-of-band way out`)
-    assert.match(refused.stderr, /install the release tree as root/, `${shape.name}: and the other one`)
+    assert.match(refused.stderr, /fetch the release as root into a directory root has just created/, `${shape.name}: and the other one`)
+    // AND NOT A RELABEL (o3d-z5be r6, Codex HIGH 1): chown/chmod of an existing tree revokes no write descriptor.
+    assert.doesNotMatch(refused.stderr, /take group and other write off/, `${shape.name}: the remedy must not be a relabel`)
 
     // AND THE COPY STANDING THERE IS THE ONE THE CONTROL PUBLISHED, byte for byte.
     assert.equal(readFileSync(join(root, 'driver', 'update.sh'), 'utf8'), standing,
@@ -2242,4 +2244,276 @@ test('[o3d-z5be] a commit that could not be made durable is reported as a refusa
   ].join('\n'))
   assert.match(ok.stdout, /^RC=0$/m, `${ok.stdout}${ok.stderr}`)
   assert.match(ok.stdout, /^DIGEST=[0-9a-f]{64}$/m, ok.stdout)
+})
+
+// ---------------------------------------------------------------------------
+// 3j. NO PRIVILEGED RUN HANDS THE TREE IT IS EXECUTING FROM TO ANOTHER ACCOUNT (o3d-z5be r6, Codex HIGH 2)
+//
+// THE FINDING. install.sh copied LOCAL_SOURCE_DIR into ${APP_DIR} and `chown -R`ed ${APP_DIR} to the
+// application account, and nothing stopped the root-only release being executed from BEING ${APP_DIR}.
+// Bash reads the entrypoint off its descriptor as it goes, so that `chown` gave the application account
+// write access to the commands root had not read yet.
+// ---------------------------------------------------------------------------
+
+/** Source the shipped fence and privileged-helpers libraries (with the real root literal — these tests
+ *  publish nothing) and run `program` with IMS_SCRIPT_LIB_DIR pinned at `runningLib`. */
+function withGuardLibrary(runningLib: string, program: string) {
+  const out = spawnSync('bash', ['-c', [
+    'set -uo pipefail',
+    `source ${JSON.stringify(join(REPO, FENCE_LIB_REL))}`,
+    `source ${JSON.stringify(join(REPO, LIB_REL))}`,
+    `IMS_SCRIPT_LIB_DIR=${JSON.stringify(runningLib)}`,
+    program,
+  ].join('\n')], { encoding: 'utf8' })
+  return { status: out.status ?? -1, stdout: out.stdout ?? '', stderr: out.stderr ?? '' }
+}
+
+test('[o3d-z5be] two trees are disjoint only when a walk of neither reaches the other — equal, nested, symlinked and not-yet-created targets overlap', (t) => {
+  const base = createTempDirSync('trees-disjoint-', t)
+  const app = join(base, 'app')
+  const other = join(base, 'other')
+  mkdirSync(join(app, 'scripts', 'lib'), { recursive: true })
+  mkdirSync(join(app, 'sub'), { recursive: true })
+  mkdirSync(other)
+  symlinkSync(app, join(base, 'link-to-app'))
+  const cases: Array<[string, string, 'OVERLAP' | 'DISJOINT']> = [
+    [app, app, 'OVERLAP'],
+    [join(app, 'sub'), app, 'OVERLAP'],
+    [app, join(app, 'sub'), 'OVERLAP'],
+    [join(base, 'link-to-app'), app, 'OVERLAP'],
+    [join(base, 'link-to-app', 'sub'), app, 'OVERLAP'],
+    [join(app, 'not-yet'), app, 'OVERLAP'],
+    [join(base, 'link-to-app', 'not-yet'), join(app, 'scripts'), 'DISJOINT'],
+    [join(other, 'not-yet'), app, 'DISJOINT'],
+    [other, app, 'DISJOINT'],
+  ]
+  const program = cases.map(([a, b], i) =>
+    `if privileged_trees_disjoint ${JSON.stringify(a)} ${JSON.stringify(b)} A B 2>/dev/null; then echo "CASE${i}=DISJOINT"; else echo "CASE${i}=OVERLAP"; fi`).join('\n')
+  const out = withGuardLibrary(join(other, 'lib'), program)
+  for (const [i, [a, b, expected]] of cases.entries()) {
+    assert.match(out.stdout, new RegExp(`^CASE${i}=${expected}$`, 'm'), `${a} vs ${b} must be ${expected}:\n${out.stdout}${out.stderr}`)
+  }
+  // AN UNWALKABLE TREE IS NOT A DISJOINT ONE: a directory this account cannot read is a refusal.
+  const locked = join(base, 'locked')
+  mkdirSync(join(locked, 'inner'), { recursive: true })
+  chmodSync(locked, 0o000)
+  let unreadable: { status: number; stdout: string; stderr: string }
+  try {
+    unreadable = withGuardLibrary(join(other, 'lib'),
+      `if privileged_trees_disjoint ${JSON.stringify(locked)} ${JSON.stringify(other)} A B; then echo R=DISJOINT; else echo R=REFUSED; fi`)
+  } finally {
+    // Restored HERE rather than in t.after: the temp-dir cleanup is registered first and would fail on it.
+    chmodSync(locked, 0o755)
+  }
+  if (process.getuid!() !== 0) {
+    assert.match(unreadable.stdout, /^R=REFUSED$/m, `${unreadable.stdout}${unreadable.stderr}`)
+    assert.match(unreadable.stderr, /could not be walked/, unreadable.stderr)
+  }
+})
+
+/** install.sh's section 9 — from its header to the statement after the section — lifted verbatim and
+ *  run with every command that could change something replaced by a recorder. */
+function runInstallDeploySection(t: TestContext, opts: { appDir: string; localSource: string; runningLib: string }) {
+  const install = ENTRYPOINT_SOURCE.get('scripts/install.sh')!
+  const start = install.indexOf('header "Deploying application"\n')
+  const end = install.indexOf('readonly DEPLOY_META_FILE="${APP_DIR}/.deploy-meta"', start)
+  assert.ok(start > 0 && end > start, 'install.sh section 9 must be liftable between its header and DEPLOY_META_FILE')
+  const section = install.slice(start, end)
+  assert.ok(section.includes('chown -R "${APP_USER}:${APP_USER}" "${APP_DIR}"') && section.includes('"${LOCAL_SOURCE_DIR%/}/" "${APP_DIR}/"'),
+    'precondition: the lifted section must contain the local copy and its recursive chown')
+  const log = join(createTempDirSync('install-section9-', t), 'calls.log')
+  const program = [
+    `CALLS=${JSON.stringify(log)}`,
+    'header() { :; }; info() { :; }; success() { :; }; warn() { :; }',
+    'die() { echo "DIED: $*"; exit 3; }',
+    'rsync() { echo "rsync $*" >> "${CALLS}"; }',
+    'chown() { echo "chown $*" >> "${CALLS}"; }',
+    'copy_tree_into_new_dir() { echo "copy_tree_into_new_dir $*" >> "${CALLS}"; }',
+    'run_git_as_user() { echo "git $*" >> "${CALLS}"; }',
+    'APP_USER=imsapp',
+    `APP_DIR=${JSON.stringify(opts.appDir)}`,
+    `LOCAL_SOURCE_DIR=${JSON.stringify(opts.localSource)}`,
+    'INSTALL_FROM_GIT=n',
+    'GIT_DEPLOY_KEY_ENABLED=n',
+    section,
+    'echo "SECTION_COMPLETED"',
+  ].join('\n')
+  const out = withGuardLibrary(opts.runningLib, program)
+  const calls = existsSync(log) ? readFileSync(log, 'utf8') : ''
+  return { ...out, calls }
+}
+
+test('[o3d-z5be] install.sh refuses a local source equal to, inside, containing or symlinked to APP_DIR, and a running tree inside APP_DIR, BEFORE any copy or chown', (t) => {
+  const base = createTempDirSync('install-local-source-', t)
+  const mk = (...parts: string[]) => { const p = join(base, ...parts); mkdirSync(p, { recursive: true }); return p }
+  const release = mk('release')                     // the root-only release being executed, disjoint from everything
+  mk('release', 'scripts', 'lib')
+  const runningLib = join(release, 'scripts', 'lib')
+
+  const shapes: Array<{ what: string; appDir: string; localSource: string; runningLib: string }> = []
+  { const app = mk('same', 'app'); shapes.push({ what: 'LOCAL_SOURCE_DIR equal to APP_DIR', appDir: app, localSource: app, runningLib }) }
+  { const app = mk('nested', 'app'); const src = mk('nested', 'app', 'sub'); shapes.push({ what: 'LOCAL_SOURCE_DIR inside APP_DIR', appDir: app, localSource: src, runningLib }) }
+  { const src = mk('contains', 'src'); shapes.push({ what: 'APP_DIR inside LOCAL_SOURCE_DIR (not created yet)', appDir: join(src, 'app'), localSource: src, runningLib }) }
+  { const app = mk('symlink', 'app'); symlinkSync(app, join(base, 'symlink', 'link')); shapes.push({ what: 'LOCAL_SOURCE_DIR a symbolic link to APP_DIR', appDir: app, localSource: join(base, 'symlink', 'link'), runningLib }) }
+  // THE REVIEWER'S EXACT SHAPE: the release being executed IS APP_DIR, and it is also the local source.
+  { const app = mk('self', 'app'); mk('self', 'app', 'scripts', 'lib'); shapes.push({ what: 'the running release is APP_DIR and the local source', appDir: app, localSource: app, runningLib: join(app, 'scripts', 'lib') }) }
+  // And the running tree inside APP_DIR with a separate, disjoint source — only the running-tree guard stops it.
+  { const app = mk('inside', 'app'); mk('inside', 'app', 'scripts', 'lib'); const src = mk('inside', 'src'); shapes.push({ what: 'the running release inside APP_DIR, source elsewhere', appDir: app, localSource: src, runningLib: join(app, 'scripts', 'lib') }) }
+
+  for (const shape of shapes) {
+    const out = runInstallDeploySection(t, shape)
+    assert.match(out.stdout, /^DIED: /m, `${shape.what}: install.sh must refuse:\n${out.stdout}${out.stderr}`)
+    assert.doesNotMatch(out.stdout, /^SECTION_COMPLETED$/m, shape.what)
+    assert.equal(out.calls, '', `${shape.what}: nothing may be copied or chowned before the refusal:\n${out.calls}`)
+  }
+
+  // NOT VACUOUS: a disjoint source, target and running release copy and chown — the recorder can see both.
+  const app = mk('clean', 'app')
+  const src = mk('clean', 'src')
+  const clean = runInstallDeploySection(t, { appDir: app, localSource: src, runningLib })
+  assert.match(clean.stdout, /^SECTION_COMPLETED$/m, `${clean.stdout}${clean.stderr}`)
+  assert.match(clean.calls, /^rsync -a --delete /m, clean.calls)
+  assert.match(clean.calls, new RegExp(`^chown -R imsapp:imsapp ${app}$`, 'm'), clean.calls)
+})
+
+test('[o3d-z5be] update.sh refuses to copy into or chown an APP_DIR that holds the tree it is running from', (t) => {
+  const update = ENTRYPOINT_SOURCE.get('scripts/update.sh')!
+  const start = update.indexOf('    TMP_CLONE_DIR="$(mktemp -d -t ims-update.XXXXXX)"\n')
+  const endMarker = '    success "Repository synced into existing app directory."\n'
+  const end = update.indexOf(endMarker, start)
+  assert.ok(start > 0 && end > start, 'update.sh\'s copy block must be liftable')
+  const block = update.slice(start, end + endMarker.length)
+  assert.ok(block.includes('chown -R "${APP_USER}:${APP_USER}" "${APP_DIR}"'), 'precondition: the block holds the recursive chown')
+  const base = createTempDirSync('update-copy-', t)
+  const run = (appDir: string, runningLib: string) => {
+    const log = join(base, `calls-${Math.random().toString(36).slice(2)}.log`)
+    const out = withGuardLibrary(runningLib, [
+      `CALLS=${JSON.stringify(log)}`,
+      // The block's own `mktemp -d -t` lands inside this test's directory, so a refused run leaves nothing behind.
+      `export TMPDIR=${JSON.stringify(base)}`,
+      'info() { :; }; success() { :; }; die() { echo "DIED: $*"; exit 3; }',
+      'rsync() { echo "rsync $*" >> "${CALLS}"; }',
+      'chown() { echo "chown $*" >> "${CALLS}"; }',
+      'copy_tree_into_new_dir() { echo "copy_tree_into_new_dir $*" >> "${CALLS}"; }',
+      'run_git_as_user() { echo "git $*" >> "${CALLS}"; [[ "$*" == *rev-parse* ]] && echo 0123456789abcdef; return 0; }',
+      'APP_USER=imsapp', 'GIT_REPO_URL=https://example.invalid/r.git', 'GIT_BRANCH=main',
+      `APP_DIR=${JSON.stringify(appDir)}`,
+      block,
+      'echo "BLOCK_COMPLETED"',
+    ].join('\n'))
+    return { ...out, calls: existsSync(log) ? readFileSync(log, 'utf8') : '' }
+  }
+  const app = join(base, 'app')
+  mkdirSync(join(app, 'scripts', 'lib'), { recursive: true })
+  const refused = run(app, join(app, 'scripts', 'lib'))
+  assert.match(refused.stdout, /^DIED: .*REFUSING to change the ownership of, copy into, or delete from the application directory/m, `${refused.stdout}${refused.stderr}`)
+  assert.doesNotMatch(refused.calls, /^(rsync|chown -R|copy_tree_into_new_dir) /m, `nothing may be copied or chowned:\n${refused.calls}`)
+
+  const release = join(base, 'release')
+  mkdirSync(join(release, 'scripts', 'lib'), { recursive: true })
+  const clean = run(app, join(release, 'scripts', 'lib'))
+  assert.match(clean.stdout, /^BLOCK_COMPLETED$/m, `${clean.stdout}${clean.stderr}`)
+  assert.match(clean.calls, /^rsync -a --delete /m, clean.calls)
+  assert.match(clean.calls, new RegExp(`^chown -R imsapp:imsapp ${app}$`, 'm'), clean.calls)
+})
+
+test('[o3d-z5be] CENSUS: every recursive ownership change, copy or delete in the three entrypoints is guarded against the running tree', () => {
+  // THE AUDIT, AS A TEST THAT FAILS ON A NEW ONE. Every root-side statement in an entrypoint that can
+  // change ownership or content recursively is enumerated by grammar; the table below must account for
+  // each one exactly, and each guarded one must be IMMEDIATELY preceded — as the previous code statement,
+  // not "somewhere nearby" — by privileged_spare_running_tree on the named target.
+  const RECURSIVE = /(^|[\s;(])(chown|chmod|chgrp)\s+(-[A-Za-z]*R[A-Za-z]*|--recursive)\b|(^|[\s;(])setfacl\s|(^|[\s;(])rsync\s+-|(^|[\s;(])cp\s+-[A-Za-z]*[aRr]|(^|[\s;(])rm\s+-[A-Za-z]*r|^\s*(chown_state_tree|copy_tree_into_new_dir)\s/
+  type Entry = { file: string; op: RegExp; guard: string | null; up?: number; why?: string }
+  const G = (target: string) => `privileged_spare_running_tree "${target}" `
+  const table: Entry[] = [
+    { file: 'scripts/install.sh', op: /^chown_state_tree "\$\{DATA_DIR\}"/, guard: G('${DATA_DIR}') },
+    { file: 'scripts/install.sh', op: /^  chown -Rh "\$\{APP_USER\}:\$\{APP_USER\}" \.$/, guard: G('${LOG_DIR}'), up: 3 },
+    { file: 'scripts/install.sh', op: /^    rsync -a --delete \\$/, guard: G('${APP_DIR}') },
+    { file: 'scripts/install.sh', op: /^    copy_tree_into_new_dir "\$\{TMP_CLONE_WORKTREE\}\/\.git" "\$\{APP_DIR\}\/\.git"$/, guard: G('${APP_DIR}/.git') },
+    { file: 'scripts/install.sh', op: /^    chown -R "\$\{APP_USER\}:\$\{APP_USER\}" "\$\{APP_DIR\}"$/, guard: G('${APP_DIR}') },
+    { file: 'scripts/install.sh', op: /^    rm -rf "\$\{TMP_CLONE_DIR\}"$/, guard: null, why: 'TMP_CLONE_DIR is a `mktemp -d` this run created after the entrypoint was opened' },
+    { file: 'scripts/install.sh', op: /^  rsync -a --delete \\$/, guard: G('${APP_DIR}') },
+    { file: 'scripts/install.sh', op: /^  chown -R "\$\{APP_USER\}:\$\{APP_USER\}" "\$\{APP_DIR\}"$/, guard: G('${APP_DIR}') },
+    { file: 'scripts/install.sh', op: /^    copy_tree_into_new_dir "\$\{TMP_CLONE_WORKTREE\}\/\.git" "\$\{APP_DIR\}\/\.git"$/, guard: G('${APP_DIR}/.git') },
+    { file: 'scripts/install.sh', op: /^    chown -R "\$\{APP_USER\}:\$\{APP_USER\}" "\$\{APP_DIR\}\/\.git"$/, guard: G('${APP_DIR}/.git') },
+    { file: 'scripts/install.sh', op: /^    rm -rf "\$\{TMP_CLONE_DIR\}"$/, guard: null, why: 'mktemp -d' },
+    { file: 'scripts/update.sh', op: /^    rsync -a --delete \\$/, guard: G('${APP_DIR}') },
+    { file: 'scripts/update.sh', op: /^    copy_tree_into_new_dir "\$\{TMP_CLONE_WORKTREE\}\/\.git" "\$\{APP_DIR\}\/\.git"$/, guard: G('${APP_DIR}/.git') },
+    { file: 'scripts/update.sh', op: /^    chown -R "\$\{APP_USER\}:\$\{APP_USER\}" "\$\{APP_DIR\}"$/, guard: G('${APP_DIR}') },
+    { file: 'scripts/update.sh', op: /^    rm -rf "\$\{TMP_CLONE_DIR\}"$/, guard: null, why: 'mktemp -d' },
+  ]
+  for (const rel of ENTRYPOINTS) {
+    const code = codeLines(ENTRYPOINT_SOURCE.get(rel)!).filter((line) => line.text.trim() !== '')
+    // Messages quote commands; a statement is a line that does not begin inside a string.
+    const ops = code.map((line, index) => ({ ...line, index }))
+      .filter((line) => RECURSIVE.test(line.text) && !/^\s*(echo|printf|info|warn|die|error|ims_startup_refuse|"|')/.test(line.text) && !/^\s*"/.test(line.text))
+    const expected = table.filter((entry) => entry.file === rel)
+    assert.equal(ops.length, expected.length,
+      `${rel}: the census must account for every recursive operation, found ${ops.length}:\n${ops.map((op) => `${op.n}: ${op.text}`).join('\n')}`)
+    const used = new Set<number>()
+    for (const op of ops) {
+      const entryIndex = expected.findIndex((entry, i) => !used.has(i) && entry.op.test(op.text))
+      assert.notEqual(entryIndex, -1, `${rel}:${op.n}: a recursive operation the census does not know: ${op.text}`)
+      used.add(entryIndex)
+      const entry = expected[entryIndex]
+      if (entry.guard === null) {
+        assert.ok(entry.why && ENTRYPOINT_SOURCE.get(rel)!.includes('TMP_CLONE_DIR="$(mktemp -d -t '), `${rel}:${op.n}: an unguarded operation must be on a fresh mktemp directory`)
+        continue
+      }
+      const previous = code[op.index - (entry.up ?? 1)]
+      assert.ok(previous?.text.trim().startsWith(entry.guard),
+        `${rel}:${op.n} (${op.text.trim()}) must be immediately preceded by ${entry.guard}…, and is preceded by: ${previous?.text}`)
+    }
+  }
+  // deploy.sh makes no recursive ownership change, copy or delete at all — asserted by the census above
+  // (the table holds none for it), so one added there fails this test until it is guarded.
+})
+
+test('[o3d-z5be] the bootstrap creates fresh inodes and nothing tells an operator that relabelling a tree makes it trusted', () => {
+  // o3d-z5be r6, Codex HIGH 1: chown/chmod change an inode's owner and mode now and revoke no descriptor
+  // already open for writing, so a relabelled tree is not a trusted one — and no check can tell them apart.
+  const doc = readFileSync(join(REPO, 'docs/installation.md'), 'utf8')
+  const texts: Array<[string, string]> = [
+    ['docs/installation.md', doc],
+    [LIB_REL, LIB_SOURCE],
+    [FENCE_LIB_REL, readFileSync(join(REPO, FENCE_LIB_REL), 'utf8')],
+    ...ENTRYPOINTS.map((rel) => [rel, ENTRYPOINT_SOURCE.get(rel)!] as [string, string]),
+  ]
+  assert.equal(texts.length, 6, 'precondition: every file that instructs an operator was read')
+  // ABSENCE, universal: no file offers a relabel as the way to a supported tree.
+  for (const [where, text] of texts) {
+    for (const stale of [
+      'take group and other write off it',
+      '— or `chown -R root:root <tree> && chmod -R go-w <tree>` — before running it',
+      'or: chown -R root:root <tree> && chmod -R go-w <tree>',
+      'a release tree only root can write',
+      'install the release tree as root',
+    ]) {
+      assert.ok(!text.includes(stale), `${where} must no longer say "${stale}"`)
+    }
+  }
+  // The procedure itself: a new directory, a fetch INTO it as root, and the installer run from there.
+  const anchor = doc.indexOf('<a id="supported-bootstrap"></a>')
+  assert.notEqual(anchor, -1, 'the supported bootstrap must be a linkable section')
+  const bootstrap = doc.slice(anchor, doc.indexOf('**A tree another account can write is refused**', anchor))
+  assert.ok(bootstrap.length > 1500 && bootstrap.length < 6000, `the bootstrap section must have been isolated (${bootstrap.length})`)
+  const commands = bootstrap.slice(bootstrap.indexOf('```bash'), bootstrap.indexOf('```', bootstrap.indexOf('```bash') + 7))
+    .split('\n').filter((line) => line.trim() && !line.trim().startsWith('#') && !line.startsWith('```'))
+  assert.deepEqual(commands, [
+    'RELEASE_DIR="$(mktemp -d /root/ims-release.XXXXXX)"',
+    'git clone --branch <release-tag> --depth 1 <repository-url> "${RELEASE_DIR}/one-two-inventory"',
+    'bash "${RELEASE_DIR}/one-two-inventory/scripts/install.sh"',
+  ], 'the runnable bootstrap must be exactly: a new directory, a clone into it, the installer from there')
+  assert.match(bootstrap, /revoke nothing that\s+was opened before/, 'and it must say why a relabel is not enough')
+  assert.match(bootstrap, /cannot detect a\s+relabelled tree/, 'and that the installer cannot detect one')
+  // The startup refusal's own remedy says the same, and the same way in all three entrypoints.
+  for (const rel of ENTRYPOINTS) {
+    const block = blockCode(pinBlock(rel))
+    assert.ok(block.includes('Do NOT chown or chmod an existing tree to get past this'), `${rel}: the refusal must warn off a relabel`)
+    assert.ok(block.includes('mktemp -d /root/ims-release.XXXXXX'), `${rel}: and name the fresh-directory bootstrap`)
+  }
+  // And the invocation table carries the relabel as unsupported and undetected.
+  const row = doc.split('\n').find((line) => line.startsWith('| any tree made root-owned by **relabelling** it'))
+  assert.ok(row, 'the invocation table must have a relabel row')
+  assert.match(row, /\*\*NOT SUPPORTED — and NOT detected\*\*/, row)
 })

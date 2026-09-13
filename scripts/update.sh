@@ -167,7 +167,10 @@ IFS=$'\n\t'
 #    THIS IS NOT A SECURITY BOUNDARY AND DOES NOT PRETEND TO BE ONE. It lives INSIDE the tree it
 #    distrusts. Bash reads this file incrementally and reads each library later still, so an account
 #    that can write the tree can rewrite this very block before bash reaches it, or rewrite a library
-#    after this check and before the `source` that reads it. What it catches is the honest mistake —
+#    after this check and before the `source` that reads it. NOR CAN IT TELL A RELABELLED TREE FROM A
+#    FRESH ONE (r6, Codex HIGH 1): `chown`/`chmod` change an inode's metadata and revoke no descriptor
+#    already open for writing, so a tree another account once wrote and root then relabelled passes
+#    this check while that account can still write it. What it catches is the honest mistake —
 #    `sudo bash /opt/one-two-inventory/scripts/update.sh` typed on a box nobody has tampered with yet.
 #    The boundary is not running root code from a tree another account can write AT ALL, and that is
 #    what /etc/ims-cutover-driver/driver is for. docs/installation.md says the same.
@@ -233,7 +236,7 @@ if [[ "${EUID}" == "0" ]]; then
     ims_startup_refuse "the ownership and modes of the tree ${IMS_ENTRYPOINT_SELF} lives in could not be read, so this run cannot say whether an account other than root could have written the code it is about to execute as root. Run the root-owned driver: sudo bash /etc/ims-cutover-driver/driver/$(basename -- "${IMS_ENTRYPOINT_SELF}")" || exit 1
   fi
   if [[ -n "${IMS_STARTUP_OFFENDER}" ]]; then
-    ims_startup_refuse "REFUSING TO RUN AS ROOT OUT OF A TREE ANOTHER ACCOUNT CAN WRITE. ${IMS_STARTUP_OFFENDER} is owned by an account other than root, is writable by group or other, or is not a regular file or directory, so the code this run would execute as root — this file and the libraries beside it — could have been chosen by that account. Running root code from such a tree is not supported. Run the root-owned driver instead: sudo bash /etc/ims-cutover-driver/driver/$(basename -- "${IMS_ENTRYPOINT_SELF}"). On a host that has no driver yet, run install.sh from a release tree only root can write — clone or unpack it as root, or: chown -R root:root <tree> && chmod -R go-w <tree> — and it publishes one. This check is best-effort (see docs/installation.md): it cannot defend a tree that was already tampered with." || exit 1
+    ims_startup_refuse "REFUSING TO RUN AS ROOT OUT OF A TREE ANOTHER ACCOUNT CAN WRITE. ${IMS_STARTUP_OFFENDER} is owned by an account other than root, is writable by group or other, or is not a regular file or directory, so the code this run would execute as root — this file and the libraries beside it — could have been chosen by that account. Running root code from such a tree is not supported. Run the root-owned driver instead: sudo bash /etc/ims-cutover-driver/driver/$(basename -- "${IMS_ENTRYPOINT_SELF}"). On a host that has no driver yet, fetch the release AS ROOT INTO A NEWLY CREATED DIRECTORY (git clone or tar -x as root into mktemp -d /root/ims-release.XXXXXX) and run install.sh from there; it publishes one. Do NOT chown or chmod an existing tree to get past this: that does not revoke write descriptors another account already holds, and this check cannot tell a relabelled tree from a fresh one. See *The supported bootstrap* in docs/installation.md. This check is best-effort (see docs/installation.md): it cannot defend a tree that was already tampered with." || exit 1
   fi
 fi
 IMS_SCRIPT_LIB_DIR="$(dirname -- "${IMS_ENTRYPOINT_SELF}")/lib"
@@ -5085,6 +5088,7 @@ if ! $NO_GIT; then
     NEW_COMMIT="$(run_git_as_user "${APP_USER}" git -C "${TMP_CLONE_WORKTREE}" rev-parse HEAD)"
     info "Fetched commit: ${NEW_COMMIT:0:8}"
 
+    privileged_spare_running_tree "${APP_DIR}" "the application directory" || die "${IMS_DRIVER_OVERLAP_REASON}"
     rsync -a --delete \
       --exclude='.git' \
       --exclude='.deploy-meta' \
@@ -5104,7 +5108,9 @@ if ! $NO_GIT; then
     # install.sh's two clone paths; this one, which does the identical thing in the identical
     # place, was left on the raw pair. See the prose above the helper in
     # scripts/lib/cutover-namespace.sh for what the `mkdir`, the `cd` and the `..` check buy.
+    privileged_spare_running_tree "${APP_DIR}/.git" "the application git directory" || die "${IMS_DRIVER_OVERLAP_REASON}"
     copy_tree_into_new_dir "${TMP_CLONE_WORKTREE}/.git" "${APP_DIR}/.git"
+    privileged_spare_running_tree "${APP_DIR}" "the application directory" || die "${IMS_DRIVER_OVERLAP_REASON}"
     chown -R "${APP_USER}:${APP_USER}" "${APP_DIR}"
     rm -rf "${TMP_CLONE_DIR}"
     success "Repository synced into existing app directory."
@@ -5800,7 +5806,7 @@ if ! $DRY_RUN; then
       warn "That is the ordinary outcome when the release was deployed into ${APP_DIR}, which ${APP_USER} owns:"
       warn "nothing on this box can vouch for bytes that account could have replaced after this run's checks."
       warn "To refresh it, re-run with IMS_DRIVER_SHA256=<the release's driver digest, taken from the release"
-      warn "and not from this box>, or run install.sh from a release tree only root can write. See the"
+      warn "and not from this box>, or run install.sh from a release fetched as root into a NEW directory. See the"
       warn "*Updating* section of docs/installation.md."
     fi
   fi
