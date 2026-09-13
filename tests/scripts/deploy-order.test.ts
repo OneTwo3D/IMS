@@ -8491,7 +8491,7 @@ test('every entrypoint defines what the shared fence library reads', () => {
     )
     assert.match(
       source,
-      /IMS_ENTRYPOINT_SELF="\$\(readlink -- "\/proc\/\$\$\/fd\/255" 2>\/dev\/null \|\| true\)"/,
+      /link="\$\(readlink -- "\/proc\/\$\$\/fd\/255" 2>\/dev\/null\)" \|\| link=""/,
       `${label} must pin itself to the descriptor bash is reading it from`,
     )
     assert.doesNotMatch(

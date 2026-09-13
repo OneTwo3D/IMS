@@ -135,6 +135,110 @@
 set -euo pipefail
 IFS=$'\n\t'
 
+# =============================================================================
+# THE STARTUP BLOCK: WHICH TREE THIS RUN IS, AND WHETHER ROOT MAY RUN IT (o3d-z5be r4/r5)
+# =============================================================================
+# THE SAME TEXT IN ALL THREE ENTRYPOINTS, asserted byte for byte by
+# tests/scripts/privileged-helper-set.test.ts. It cannot live in a library: the libraries are what it
+# decides whether to read. It is the first code this file executes.
+#
+# 1. THE PIN. /etc/ims-cutover-driver/driver — the documented way to run this — is a symbolic link a
+#    publication flips with one rename(2). Each RESOLUTION of it is atomic; a reader that resolves it
+#    many times is not pinned by that, and bash opens this file through the link and every `source`
+#    would traverse the link again (r4, Codex HIGH 1). So the directory is taken off the descriptor
+#    bash is ALREADY reading this file from: /proc/$$/fd/255 names the physical inode being executed,
+#    never the link. It is bash's own close-on-exec descriptor, so no child inherits it and no nested
+#    shell holds somebody else's file there, and `sudo` closes inherited descriptors above stderr.
+#
+#    IF IT CANNOT BE VALIDATED THE RUN REFUSES. THERE IS NO FALLBACK (r5, Codex HIGH 2). r4 fell back
+#    to `cd -P "$(dirname "${BASH_SOURCE[0]}")" && pwd -P`, which resolves THE POINTER AGAIN: a sweep
+#    that unlinked the running release between open() and this block made the descriptor read
+#    "(deleted)", the validation fail, and the fallback land on whatever release the pointer named by
+#    then — root running one release's entrypoint with another's libraries, silently. A pin whose
+#    failure path re-resolves the thing it pins is not a pin. Refused: no readable descriptor (no
+#    /proc, or not run as `bash <file>`), a descriptor whose file has been DELETED, a descriptor that
+#    is not this script, and a path that no longer names the inode that is open.
+#
+# 2. THE REFUSAL (r5, Codex HIGH 1). As root, this run refuses unless the tree it was launched from is
+#    one only root can have written: this file, its directory, lib/ and everything in lib/ owned by
+#    uid 0 and writable by nobody else; every directory above it owned by uid 0 and not writable by
+#    group or other unless sticky. Ownership and modes are READ, not inferred from a path name.
+#
+#    THIS IS NOT A SECURITY BOUNDARY AND DOES NOT PRETEND TO BE ONE. It lives INSIDE the tree it
+#    distrusts. Bash reads this file incrementally and reads each library later still, so an account
+#    that can write the tree can rewrite this very block before bash reaches it, or rewrite a library
+#    after this check and before the `source` that reads it. What it catches is the honest mistake —
+#    `sudo bash /opt/one-two-inventory/scripts/update.sh` typed on a box nobody has tampered with yet.
+#    The boundary is not running root code from a tree another account can write AT ALL, and that is
+#    what /etc/ims-cutover-driver/driver is for. docs/installation.md says the same.
+ims_startup_refuse() {
+  echo "FATAL: $1 Nothing has been changed." >&2
+  return 1
+}
+
+# Sets ${IMS_ENTRYPOINT_SELF} to the physical path of the file bash is executing, or refuses.
+ims_startup_pin() {
+  local link open_id path_id name
+  IMS_ENTRYPOINT_SELF=""
+  name="$(basename -- "${BASH_SOURCE[0]}")"
+  link="$(readlink -- "/proc/$$/fd/255" 2>/dev/null)" || link=""
+  if [[ -z "${link}" ]]; then
+    ims_startup_refuse "this run cannot read /proc/$$/fd/255, the descriptor bash is reading ${name} from, so it cannot say which tree it is running out of — and it will not work that out by resolving its own path again, which is how a publication flipped underneath it hands root another release's libraries. Run it as a file (bash <path>) on a host with /proc: sudo bash /etc/ims-cutover-driver/driver/${name}" || return 1
+  fi
+  if [[ "${link}" == *' (deleted)' ]]; then
+    ims_startup_refuse "the file this run is executing (${link}) has been DELETED since bash opened it: a later publication superseded and swept the release this run was started from. Its libraries are not resolved from anywhere else. Re-run: sudo bash /etc/ims-cutover-driver/driver/${name}" || return 1
+  fi
+  if [[ "${link}" != /* ]] || [[ "${link##*/}" != "${name}" ]]; then
+    ims_startup_refuse "descriptor 255 is '${link}' and not ${name}, so this run cannot say which tree it is running out of. Run it as a file: sudo bash /etc/ims-cutover-driver/driver/${name}" || return 1
+  fi
+  open_id="$(stat -L -c '%d:%i' -- "/proc/$$/fd/255" 2>/dev/null)" || open_id=""
+  path_id="$(stat -c '%d:%i' -- "${link}" 2>/dev/null)" || path_id=""
+  if [[ -z "${open_id}" ]] || [[ "${open_id}" != "${path_id}" ]]; then
+    ims_startup_refuse "${link} no longer names the file this run is executing (open ${open_id:-unreadable}, path ${path_id:-unreadable}): it was replaced after bash opened it. Re-run: sudo bash /etc/ims-cutover-driver/driver/${name}" || return 1
+  fi
+  IMS_ENTRYPOINT_SELF="${link}"
+  return 0
+}
+
+# Sets ${IMS_STARTUP_OFFENDER} to the first path in the entrypoint's tree that an account other than
+# "$2" could have written, or to the empty string. Returns 1 when the tree could not be inspected,
+# which the caller refuses on: an unanswerable question is not a clean answer. "$2" is 0 in every
+# production call; it is a parameter so the suite can ask the same question of a tree it owns.
+ims_startup_tree_offender() {
+  local entry="$1" trusted="$2" dir up out
+  local -a above=()
+  IMS_STARTUP_OFFENDER=""
+  dir="$(dirname -- "${entry}")"
+  out="$(find "${entry}" "${dir}" "${dir}/lib" -maxdepth 0 \( ! -uid "${trusted}" -o -perm /022 \) -print -quit 2>/dev/null)" || return 1
+  if [[ -z "${out}" ]]; then
+    out="$(find "${dir}/lib" -mindepth 1 \( ! -uid "${trusted}" -o -perm /022 -o \( ! -type f ! -type d \) \) -print -quit 2>/dev/null)" || return 1
+  fi
+  if [[ -z "${out}" ]]; then
+    up="${dir}"
+    while [[ "${up}" != "/" ]]; do
+      up="$(dirname -- "${up}")"
+      above+=("${up}")
+    done
+    out="$(find "${above[@]}" -maxdepth 0 \( \( ! -uid "${trusted}" -a ! -uid 0 \) -o \( -perm /022 -a ! -perm -1000 \) \) -print -quit 2>/dev/null)" || return 1
+  fi
+  IMS_STARTUP_OFFENDER="${out}"
+  return 0
+}
+
+IMS_ENTRYPOINT_SELF=""
+IMS_STARTUP_OFFENDER=""
+ims_startup_pin || exit 1
+if [[ "${EUID}" == "0" ]]; then
+  if ! ims_startup_tree_offender "${IMS_ENTRYPOINT_SELF}" 0; then
+    ims_startup_refuse "the ownership and modes of the tree ${IMS_ENTRYPOINT_SELF} lives in could not be read, so this run cannot say whether an account other than root could have written the code it is about to execute as root. Run the root-owned driver: sudo bash /etc/ims-cutover-driver/driver/$(basename -- "${IMS_ENTRYPOINT_SELF}")" || exit 1
+  fi
+  if [[ -n "${IMS_STARTUP_OFFENDER}" ]]; then
+    ims_startup_refuse "REFUSING TO RUN AS ROOT OUT OF A TREE ANOTHER ACCOUNT CAN WRITE. ${IMS_STARTUP_OFFENDER} is owned by an account other than root, is writable by group or other, or is not a regular file or directory, so the code this run would execute as root — this file and the libraries beside it — could have been chosen by that account. Running root code from such a tree is not supported. Run the root-owned driver instead: sudo bash /etc/ims-cutover-driver/driver/$(basename -- "${IMS_ENTRYPOINT_SELF}"). On a host that has no driver yet, run install.sh from a release tree only root can write — clone or unpack it as root, or: chown -R root:root <tree> && chmod -R go-w <tree> — and it publishes one. This check is best-effort (see docs/installation.md): it cannot defend a tree that was already tampered with." || exit 1
+  fi
+fi
+IMS_SCRIPT_LIB_DIR="$(dirname -- "${IMS_ENTRYPOINT_SELF}")/lib"
+# ===================== END OF THE STARTUP BLOCK ==============================
+
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
 BLUE='\033[0;34m'; BOLD='\033[1m'; RESET='\033[0m'
 
@@ -766,44 +870,12 @@ DB_FENCE_SCRIPT="${APP_DIR}/scripts/fence-db-connections.mjs"
 # entrypoint itself does not already have — unlike the fence helper, which is executed several
 # phases later, after the application account has had a cutover's worth of time to replace it.
 # That difference is the whole reason the helper needs protecting and this file does not.
-# WHERE THAT DIRECTORY IS, RESOLVED ONCE AND PINNED FOR THE WHOLE RUN (o3d-z5be r4, Codex HIGH 1).
-#
-# ${IMS_DRIVER_PROGRAM_DIR}, which is the documented way to run this script, IS A SYMBOLIC LINK, and a
-# publication flips it with one `rename(2)`. That makes every RESOLUTION of it atomic and says nothing
-# at all about a reader that resolves it MANY TIMES — which is what this script is: bash opens the
-# entrypoint through the link, and every `source` below would then traverse the link AGAIN. A publisher
-# that flips it in between (install.sh from another release; two privileged runs can overlap, the shared
-# cutover lock is taken later than this) would have root execute THIS release's script with ANOTHER
-# release's libraries. r3 argued that one atomic rename made a mixture impossible, and that argument was
-# about the commit rather than about the reader.
-#
-# SO THE PIN COMES OFF THE DESCRIPTOR BASH IS ALREADY READING THIS FILE FROM. /proc/<pid>/fd/255 is that
-# descriptor and `readlink` gives the PHYSICAL path of the inode being executed — the versioned
-# publication directory, never the pointer. There is no window in it: it is not a second resolution of a
-# name that could have moved, it is the object whose bytes are running. `cd -P … && pwd -P` is the
-# fallback for a host whose /proc cannot answer, and it is still a pin: one resolution, at entry, before
-# anything is sourced. `-P` is the whole difference — plain `pwd` prints the LOGICAL path, symbolic link
-# and all, which is how the previous form re-traversed the pointer on every `source`. The basename is
-# compared so a shell that does not keep this script on descriptor 255 takes the fallback instead of
-# pinning to whatever else is there.
-#
-# AND WHY DESCRIPTOR 255 IS THIS SCRIPT'S, since that is the first thing to ask of a pin taken off a
-# number. It is the descriptor bash opens the script on and it is CLOSE-ON-EXEC, so no child inherits
-# it and no nested shell can be holding somebody else's file there; `sudo` closes inherited descriptors
-# above stderr, so it is not reachable from the caller on the documented invocation either. What is left
-# is a root shell that deliberately opened another file on 255 before running this one, which is root
-# arranging its own substitution and not a boundary this file can defend. The basename comparison and
-# the fallback are what cover every shape where the descriptor is not what this expects.
-#
-# THIS IS THE SAME TEXT IN ALL THREE ENTRYPOINTS, and a test asserts that byte for byte. It cannot live
-# in a library: the libraries are what has to be read THROUGH it.
-IMS_ENTRYPOINT_SELF="$(readlink -- "/proc/$$/fd/255" 2>/dev/null || true)"
-if [[ "${IMS_ENTRYPOINT_SELF}" != /* ]] \
-  || [[ "${IMS_ENTRYPOINT_SELF##*/}" != "$(basename -- "${BASH_SOURCE[0]}")" ]] \
-  || [[ ! -f "${IMS_ENTRYPOINT_SELF}" ]]; then
-  IMS_ENTRYPOINT_SELF="$(cd -P "$(dirname -- "${BASH_SOURCE[0]}")" 2>/dev/null && pwd -P)/$(basename -- "${BASH_SOURCE[0]}")"
-fi
-IMS_SCRIPT_LIB_DIR="$(dirname -- "${IMS_ENTRYPOINT_SELF}")/lib"
+# ${IMS_SCRIPT_LIB_DIR} IS NOT RESOLVED HERE ANY MORE. It is pinned to the physical directory of the file
+# bash is executing, and vetted, by THE STARTUP BLOCK at the top of this file (o3d-z5be r4/r5), before
+# any other code runs. AND "IT ADDS NO WINDOW" ABOVE IS TRUE ONLY OF A TREE NOBODY BUT ROOT CAN WRITE
+# (r5, Codex HIGH 1): bash reads this file incrementally and each library later still, so out of a tree
+# another account can write that account can change a library between bash starting and the `source`
+# below. That invocation is refused at the top of the file, best-effort, and is not supported.
 # THIS SCRIPT'S OWN ABSOLUTE PATH, for the one message that tells an operator to re-run it with a
 # credential on the invocation. `sudo -E scripts/update.sh` was a RELATIVE path: pasted from
 # anywhere but the release tree it is "No such file or directory", and `-E` additionally needs
@@ -857,10 +929,20 @@ source "${IMS_SCRIPT_LIB_DIR}/privileged-helpers.sh" || {
 # privileged exec. An unprivileged run publishes nothing and returns 0 (it executes nothing
 # privileged, so it has nothing to refuse); a privileged run that could NOT publish stops here,
 # before it has changed anything at all.
-publish_privileged_helper_set || {
-  echo "FATAL: the root-owned copy of ${IMS_SCRIPT_LIB_DIR} could not be published to ${IMS_DRIVER_HELPER_DIR}: ${IMS_DRIVER_REASON:-no reason was recorded}. Every node helper this run would otherwise execute as root would have to be read back out of a directory the service account owns, minutes from now; it will not do that. Nothing else on this host has been changed — and where the reason above says a publication IS STANDING but could not be made durable (o3d-z5be r4), that publication is a complete, sealed, digested tree and the only thing missing is the flush to disk." >&2
-  exit 1
-}
+# AND A WRITE-NOTHING MODE WRITES NOTHING (o3d-z5be r5, Codex MEDIUM). This used to run unconditionally
+# after the argument parser, so --dry-run and --print-fence-digest run as root created and flipped
+# /etc/ims-cutover-driver/helpers and SWEPT older publications — while promising to change nothing. They
+# publish no snapshot now, and say so in the note privileged_helper_path() quotes if anything ever asks
+# one of them for a helper: a run that published no snapshot may execute no helper as root, which is the
+# rule that already held for every unprivileged run.
+if ! $DRY_RUN && ! $PRINT_FENCE_DIGEST; then
+  publish_privileged_helper_set || {
+    echo "FATAL: the root-owned copy of ${IMS_SCRIPT_LIB_DIR} could not be published to ${IMS_DRIVER_HELPER_DIR}: ${IMS_DRIVER_REASON:-no reason was recorded}. Every node helper this run would otherwise execute as root would have to be read back out of a directory the service account owns, minutes from now; it will not do that. Nothing else on this host has been changed — and where the reason above says a publication IS STANDING but could not be made durable (o3d-z5be r4), that publication is a complete, sealed, digested tree and the only thing missing is the flush to disk." >&2
+    exit 1
+  }
+else
+  IMS_DRIVER_PUBLISH_NOTE="this run is a write-nothing mode (--dry-run and --print-fence-digest) and published no root-owned snapshot, so it may execute no helper as root"
+fi
 
 # AND THE DEPLOYMENT METADATA IS RESOLVED HERE, not three hundred lines above (o3d-z5be). The read
 # used to sit beside the .env reads at the top of this file, and it has to move down to here for one
@@ -5293,7 +5375,9 @@ else
   # WHY THE THREE `source`s AT THE TOP OF THIS FILE ARE NOT THE SAME THING, since a reader will
   # reach for them as the counter-example. The paragraph above ${IMS_SCRIPT_LIB_DIR} has always
   # said it: they are read AT STARTUP, in the same instant as this file's own body and out of the
-  # same tree, so they add NO WINDOW THE ENTRYPOINT DOES NOT ALREADY HAVE. A helper read at THIS
+  # same tree, so they add NO WINDOW THE ENTRYPOINT DOES NOT ALREADY HAVE — in a tree only root can
+  # write. Out of one the service account can write that is false (o3d-z5be r5, Codex HIGH 1), and
+  # root running out of such a tree is refused at the top of this file and unsupported. A helper read at THIS
   # line is read a build, a stop and a drain later — and after this run has itself re-handed the
   # tree to the account — so replacing it between the two is a window r3 opened and nothing else
   # in this file had. That distinction is this repository's own, and it is the entire reason the
@@ -5704,8 +5788,8 @@ if ! $DRY_RUN; then
     warn "The root-owned deployment driver at ${IMS_DRIVER_PROGRAM_DIR} was NOT refreshed, or not verifiably so: ${IMS_DRIVER_REASON:-the reason is printed above}."
     warn "This deployment is complete and serving. The copy standing there is whatever release last"
     warn "vouched for itself — NOT necessarily the previous one — and it is what the next update will"
-    warn "run; that is supported, and running the next update out of ${APP_DIR} instead is what this"
-    warn "publication exists to avoid."
+    warn "run; that is supported. Running the next update as root out of ${APP_DIR} instead is NOT: it is"
+    warn "refused at startup, because ${APP_USER} can write that tree (o3d-z5be r5)."
     # HOW OLD, IN A NUMBER (o3d-z5be r3, Codex MEDIUM 2). A refusal that says only "the copy standing
     # there is unchanged" reads the same on the first update that skips the refresh as on the tenth, so
     # an operator who never supplies a digest had nothing to notice. This names the age and the digest.

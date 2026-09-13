@@ -26,8 +26,12 @@
 # ALREADY ACCEPT when they typed the command. "OUT OF THE SAME TREE" IS A CLAIM THAT HAD TO BE MADE
 # TRUE (o3d-z5be r4, Codex HIGH 1): on the documented invocation those `source`s go through a
 # SYMBOLIC LINK, and until the entrypoints pinned themselves to the versioned directory they were
-# launched out of, a concurrent publication could make each one land in a different tree. A helper read LATER is a different statement, and
-# the distinction is this repository's own — it is the entire reason the connection fence keeps a
+# launched out of, a concurrent publication could make each one land in a different tree. AND "NO
+# WINDOW" IS TRUE ONLY OF A TREE NOBODY BUT ROOT CAN WRITE (o3d-z5be r5, Codex HIGH 1): bash reads the
+# entrypoint incrementally and each library later still, so out of a tree the service account can write
+# that account can change a library after bash starts and before the `source` reads it. Root running out
+# of such a tree is therefore UNSUPPORTED; see WHAT THIS DOES NOT CLAIM. A helper read LATER is a
+# different statement, and the distinction is this repository's own — it is the entire reason the connection fence keeps a
 # protected root-owned copy with a digest supplied on the privileged invocation.
 #
 # WHY "PIN THE HELPER AT STARTUP" IS NOT THE ANSWER EITHER. An already-verified descriptor
@@ -74,9 +78,18 @@
 #     of hardening the publication did not find them. One was in the READER: an atomic flip pins
 #     nothing across the MANY resolutions a reader performs, so a run could take one release's
 #     entrypoint and another's libraries — see the pointer block below, and the pin in the entrypoints.
-#     The other was in what the DIGEST IS ABOUT: the snapshot hashed WHAT IT HAD COPIED instead of
-#     establishing that what it copied had held still, so on the supported checkout invocation it
-#     certified substituted bytes rather than detecting them. See driver_fill_pin_digest().
+#     The other was that the snapshot hashed WHAT IT HAD COPIED, so out of a checkout the service
+#     account owns it certified bytes that account had substituted. r4 answered with a three-read
+#     content-stability check around the copy.
+#   * r5 (Codex HIGH twice, MEDIUM). The r4 content check was WITHDRAWN, because no check living in a
+#     tree another account can write can make root's execution of that tree safe: bash reads the
+#     entrypoint incrementally and every library later still, so that account can change a library
+#     between bash starting and its `source` — and can replace a helper ONCE, before the first digest,
+#     and then leave it alone, which every read then agrees on. Running root out of such a tree is now
+#     UNSUPPORTED and refused, best-effort, by the startup block at the top of each entrypoint; see WHAT
+#     THIS DOES NOT CLAIM below. And r4's pin had a FALLBACK that re-resolved the pointer when the
+#     descriptor could not be validated, which turned the sweep's race back into a silent mixture; it
+#     now refuses instead. See the pointer block below.
 #
 # WHY THE PUBLICATION IS NOT UNDER A LOCK — neither the shared cutover lock nor a narrow one over the
 # critical section, which is what the r3 reviewer proposed and which would have been a real
@@ -102,11 +115,15 @@
 #     critical section is protected when it is not.
 #
 # WHAT THIS DOES NOT CLAIM, STATED HERE RATHER THAN DISCOVERED LATER. It does not authenticate the
-# CHECKOUT. An account that can write ${APP_DIR}/scripts before a run starts can still choose what
-# the operator launches — it can replace the entrypoint itself, which is a window this repository
-# has always accepted and docs/installation.md names. What is gone is the LATE window: the bytes
-# root executes at minute twenty are the bytes that were on disk at minute zero, and nothing but
-# root can have touched them in between. Provenance, where an operator wants it, is
+# CHECKOUT, and nothing in this file makes it safe for root to run out of a tree another account can
+# write (o3d-z5be r5, Codex HIGH 1). Such an account can replace the entrypoint before the run, change a
+# library between bash starting and the `source`, or replace a helper ONCE before this snapshot is taken
+# and leave it alone — and every check that lives in that tree is itself written by that account before
+# bash reads it. So that invocation is UNSUPPORTED: each entrypoint's startup block refuses, as root, to
+# run out of a tree anybody but root could have written — best-effort, because the refusal lives in the
+# very tree it distrusts — and the supported way to run is the root-owned driver. On THAT path what this
+# file adds is the LATE window: the bytes root executes at minute twenty are the bytes that were on disk
+# at minute zero, and nothing but root can have touched them in between. Provenance, where an operator wants it, is
 # ${IMS_HELPER_SET_SHA256} on the privileged invocation — the same shape, the same refusal and the
 # same source of trust (outside the checkout, from the operator) as IMS_FENCE_ARTEFACT_SHA256.
 #
@@ -218,11 +235,19 @@ readonly IMS_DRIVER_ROOT="/etc/ims-cutover-driver"
 # SO THE POINTER IS RESOLVED ONCE, AT ENTRY, AND EVERY LATER READ GOES TO THE RESOLVED DIRECTORY. Each
 # of the three entrypoints derives ${IMS_SCRIPT_LIB_DIR} from THE DESCRIPTOR BASH IS ALREADY READING
 # THE SCRIPT FROM — `readlink /proc/$$/fd/255`, which is the physical path of the inode being executed —
-# and falls back to `cd -P … && pwd -P` where /proc cannot answer. Both name the VERSIONED DIRECTORY
-# and not the pointer, so every `source` below the pin reads the publication the entrypoint itself came
-# out of, whatever a later publisher does to the link. The descriptor form has no window at all: it is
-# not a second resolution of a name that could have moved in between, it is the object bash is already
-# executing. The statement lives in the entrypoints and not in this file for the reason that decides it:
+# and it names the VERSIONED DIRECTORY and not the pointer, so every `source` below the pin reads the
+# publication the entrypoint itself came out of, whatever a later publisher does to the link. It has no
+# window at all: it is not a second resolution of a name that could have moved in between, it is the
+# object bash is already executing.
+#
+# AND WHEN IT CANNOT BE VALIDATED THE RUN REFUSES; THERE IS NO FALLBACK (o3d-z5be r5, Codex HIGH 2). r4
+# fell back to `cd -P … && pwd -P` "where /proc cannot answer" — which resolves THE POINTER again. The
+# case that reaches it is not only a host without /proc: a sweep that unlinks the running release after
+# bash opened it makes the descriptor read "… (deleted)", the validation fails, and the fallback lands on
+# whatever release the pointer names by then, so root ran one release's entrypoint with another's
+# libraries without a word. A pin whose failure path re-resolves the thing it pins is not a pin. The
+# startup block now refuses on a missing descriptor, a DELETED one, one that is not the script, and a
+# path that no longer names the open inode. The statement lives in the entrypoints and not in this file for the reason that decides it:
 # this file is one of the things that must be read THROUGH the pin, so a pin defined here would be
 # defined too late to cover the first library read.
 #
@@ -238,10 +263,19 @@ readonly IMS_DRIVER_ROOT="/etc/ims-cutover-driver"
 # participant, exactly as the rename needs nothing of the other publisher.
 #
 # WHAT IS LEFT, NAMED RATHER THAN CLAIMED CLOSED: between that question and the `rm -rf` there is a
-# window no sweep can close without a protocol every publisher implements. Its worst case is bounded,
-# and it is NOT a substitution — only root can write anything under this root, and a swept name cannot
-# be recreated by anybody (it carries the publishing shell's pid and a `mktemp` suffix) — so losing that
-# race gives a `source` or a `node` that FAILS LOUDLY, never one that succeeds on somebody else's bytes.
+# window no sweep can close without a protocol every publisher implements.
+#
+# AND r4 SAID ITS WORST CASE WAS "A LOUD FAILURE". THAT WAS FALSE (o3d-z5be r5, Codex HIGH 2). A sweep
+# whose /proc snapshot predates a reader's open() can unlink the release that reader just opened, and
+# r4's pin then fell back to resolving the pointer — to the NEXT release — so the race produced a silent
+# mixture, not a failure. With the fallback gone the claim holds, and it holds BECAUSE of the refusal,
+# not because of the sweep: a release unlinked before the startup block makes the descriptor read
+# "(deleted)" and the run refuses before it sources anything; one unlinked after it makes a later
+# `source` or `node` fail on a path that no longer exists, and nothing can put different bytes at that
+# path — only root can write under this root, and a swept name (the publishing shell's pid and a `mktemp`
+# suffix) is never reused. Either way the failure is loud and every byte executed came from one release.
+# A failure minutes into a cutover is still a failure minutes into a cutover; that is what the cutover
+# namespace's adoption on the next run is for.
 readonly IMS_DRIVER_HELPER_DIR="${IMS_DRIVER_ROOT}/helpers"
 readonly IMS_DRIVER_PROGRAM_DIR="${IMS_DRIVER_ROOT}/driver"
 
@@ -343,16 +377,6 @@ IMS_DRIVER_FILL_SOURCE=""
 # a caller reading it through `$(...)` would lose ${IMS_DRIVER_REASON} with the subshell, which is how
 # the first version of this library reported every refusal as an empty sentence.
 IMS_DRIVER_STANDING_TREE=""
-
-# WHAT THE FILLER SAYS ITS SOURCE HELD, AND WHY IT IS A SEPARATE STATEMENT FROM THE DIGEST OF WHAT WAS
-# STAGED (o3d-kyqa r4, Codex HIGH 2). The staged digest is computed over the tree this run COPIED, so it
-# certifies whatever the copy took — including bytes an unprivileged account substituted after the run
-# began, which is the finding. This carries what the SOURCE hashed to, read before the copy and again
-# after it by the filler; driver_publish_tree() refuses unless the staged tree hashes to the same value.
-# Set by driver_fill_helper_set() and driver_fill_program() through driver_fill_pin_digest(), cleared by
-# driver_publish_tree() before it calls either, and an EMPTY value at the point of comparison is a
-# REFUSAL rather than a skip.
-IMS_DRIVER_FILL_EXPECTED_DIGEST=""
 
 # THE DIGEST THE LAST PUBLICATION TOOK, HANDED BACK IN A VARIABLE AND NOT ON STDOUT (the lesson
 # _fence_vendor_closure() records above itself in lib/db-fence-protected.sh). A caller reading it
@@ -646,7 +670,8 @@ driver_source_ident() {
 # gone — never root executing bytes it did not check. Nothing can take the name back, either: it
 # carries the publishing shell's pid and a `mktemp` suffix, and only root can create anything here at
 # all. The residual window between question 3 and the `rm -rf` is therefore an availability fault a
-# re-run fixes, and it is named in the header rather than claimed closed.
+# re-run fixes — PROVIDED the reader refuses rather than re-resolving the pointer when its release has
+# gone, which r4's pin did not do and r5's does; see WHAT IS LEFT in the header.
 #
 # AND THE ONE THING THIS SWEEP PUTS BACK RATHER THAN TAKING AWAY: a `.retired-` object from a migration
 # that was killed between moving the legacy name aside and committing the pointer (o3d-z5be r4, Codex
@@ -889,10 +914,6 @@ driver_publish_tree() {
   local published_at published_utc legacy_ident="" moved_ident=""
   IMS_DRIVER_REASON=""
   IMS_DRIVER_PUBLISHED_DIGEST=""
-  # WHAT THE FILLER WILL SAY ITS SOURCE HELD, CLEARED HERE SO IT CANNOT BE INHERITED (o3d-kyqa r4,
-  # Codex HIGH 2). Two publications happen in one shell — the snapshot at startup and the driver — and a
-  # value left over from the first would be compared against the second's tree.
-  IMS_DRIVER_FILL_EXPECTED_DIGEST=""
 
   # THE THREE NAMES INSIDE ONE PUBLICATION, TAKEN FROM THE CALLER'S PATHS RATHER THAN RESTATED. The
   # tree keeps the pointer's own basename inside the versioned directory, so `${pointer}/../<record>`
@@ -968,25 +989,6 @@ driver_publish_tree() {
 
   tree_manifest="$(_fence_tree_manifest "${staged}")" || { rm -rf "${run_dir}"; return 1; }
   digest="$(_fence_tree_digest "${staged}")" || { rm -rf "${run_dir}"; return 1; }
-
-  # AND THE TREE ABOUT TO BE PUBLISHED MUST BE THE BYTES THE FILLER READ (o3d-kyqa r4, Codex HIGH 2).
-  # The filler digested its source before the copy and again after it; this is the third of the three
-  # reads whose agreement is the whole argument in driver_fill_pin_digest(). Without it the digest below
-  # is taken over whatever the copy happened to pick up, so a source rewritten IN PLACE by the account
-  # that owns it would be published, recorded as expected, and handed to `node` by
-  # privileged_helper_path() — which is the finding that made this round.
-  #
-  # AN EMPTY EXPECTATION IS A REFUSAL AND NOT A SKIP. `[[ -n … ]] &&` here would mean that deleting the
-  # one line in a filler that answers this question silently turns the check off, which is the shape of
-  # a guard that cannot fail.
-  if [[ -z "${IMS_DRIVER_FILL_EXPECTED_DIGEST}" ]]; then
-    rm -rf "${run_dir}"
-    driver_refuse "nothing recorded which bytes ${what} was assembled FROM, so this run cannot say the tree it is about to publish is the tree it read. This is a bug in these scripts, not an operator error" || return 1
-  fi
-  if [[ "${digest}" != "${IMS_DRIVER_FILL_EXPECTED_DIGEST}" ]]; then
-    rm -rf "${run_dir}"
-    driver_refuse "${what} was assembled from a source that hashed to ${IMS_DRIVER_FILL_EXPECTED_DIGEST}, and the tree staged out of it hashes to ${digest}: the bytes changed between being read and being copied, so an account other than this one rewrote them AFTER this run started. NOTHING has been published to ${target} and the copy standing there is unchanged" || return 1
-  fi
 
   if [[ -n "${expected}" ]] && [[ "${digest}" != "${expected}" ]]; then
     rm -rf "${run_dir}"
@@ -1115,105 +1117,32 @@ driver_publish_tree() {
 # THE TWO PUBLICATIONS
 # ---------------------------------------------------------------------------
 
-# DID THE SOURCE HOLD STILL WHILE IT WAS BEING COPIED? ONE SENTENCE, FOR BOTH FILLERS (o3d-kyqa r4,
-# Codex HIGH 2).
-#
-# THE FINDING, WHICH IS THE ONE THIS BRANCH EXISTS TO FIX AND HAD LEFT OPEN AT ITS OWN FRONT DOOR. The
-# snapshot copied ${IMS_SCRIPT_LIB_DIR} and then digested WHAT IT HAD COPIED. On the supported checkout
-# invocation — `sudo bash ${APP_DIR}/scripts/update.sh`, which docs/installation.md names as the
-# unprotected-but-supported form — that directory belongs to ${APP_USER}, so that account could rewrite
-# chown-tree.mjs or pg-auth-request.mjs AFTER root started and BEFORE OR DURING this copy. The staged
-# digest then recorded the substituted bytes AS THE EXPECTED VALUE, privileged_helper_path() compared
-# them against themselves, and root executed them: a digest of what you took is not evidence about what
-# you should have taken.
-#
-# WHAT MAKES THIS DIFFERENT FROM THE OWNERSHIP CHECKS ABOVE. driver_source_trust() asks who COULD write
-# the source and driver_source_ident() asks whether an object was RENAMED under the copy. A file
-# rewritten IN PLACE changes no path, no owner, no mode, no device and no inode, so neither of them can
-# see it. Only content can.
-#
-# WHY THIS CANNOT BE SATISFIED BY A RACING APPLICATION ACCOUNT, which is the property the reviewer asked
-# for rather than "we looked and it was fine". Three independent reads of the source content are
-# compared: the digest BEFORE the copy, the copy itself, and the digest AFTER the copy, and all three
-# must agree — the third comparison is driver_publish_tree()'s, over the staged tree.
-#
-#   * a rewrite between the first digest and the copy  → staged != before            → REFUSED;
-#   * a rewrite during the copy                        → staged is torn, != before   → REFUSED;
-#   * a rewrite after the copy                         → after != before             → REFUSED;
-#   * a rewrite that is put BACK before the second digest → staged != before          → REFUSED.
-#
-# The only way through is for the source to hold the same bytes throughout, which is the statement the
-# publication needs. What it is NOT is provenance: bytes chosen BEFORE the run started are the window
-# docs/installation.md has always named, and closing it is what IMS_HELPER_SET_SHA256 and a root-owned
-# source are for.
-driver_fill_pin_digest() {
-  local what="$1" src="$2" before="$3" after="$4"
-  IMS_DRIVER_FILL_EXPECTED_DIGEST=""
-  local when="before"
-  [[ -z "${before}" ]] || when="after"
-  if [[ -z "${before}" ]] || [[ -z "${after}" ]]; then
-    driver_refuse "${src} could not be digested ${when} the copy, so this run cannot say the bytes it staged for ${what} are the bytes that were there. Nothing has been published" || return 1
-  fi
-  if [[ "${before}" != "${after}" ]]; then
-    driver_refuse "${src} DID NOT HOLD STILL while ${what} was being copied out of it: it hashed to ${before} before the copy and to ${after} after it, so an account other than this one rewrote it AFTER this run started. NOTHING has been published, and nothing this run executes later will come from those bytes. The digest is taken with: ${DB_FENCE_ARTEFACT_RECIPE}" || return 1
-  fi
-  IMS_DRIVER_FILL_EXPECTED_DIGEST="${before}"
-  return 0
-}
-
 # The run snapshot's filler: the whole of this run's scripts/lib. The WHOLE directory rather than a
 # list of helpers, so a helper added to it is covered by the digest on the day it is added instead
 # of on the day somebody remembers to extend a list.
 #
-# AND THE SOURCE IS DIGESTED BEFORE THE COPY AND AGAIN AFTER IT (o3d-kyqa r4, Codex HIGH 2) — see
-# driver_fill_pin_digest() above for why three reads is the whole of the argument, and which supported
-# invocations this closes.
-driver_fill_helper_set() {
-  local staged="$1" src="${IMS_SCRIPT_LIB_DIR:-}" before="" after="" rc=0
-  IMS_DRIVER_FILL_EXPECTED_DIGEST=""
-  if [[ -z "${src}" ]]; then
-    driver_refuse "no source directory was named for the privileged helper set: \${IMS_SCRIPT_LIB_DIR} is empty and this library never works out where a checkout's lib directory is. This is a bug in these scripts, not an operator error" || return 1
-  fi
-  # THE SOURCE BEFORE A BYTE IS COPIED. Taken FIRST, because everything after it is the window the
-  # finding is about.
-  before="$(_fence_tree_digest "${src}")" || before=""
-  if [[ -z "${before}" ]]; then
-    # A SOURCE THAT CANNOT BE DIGESTED IS STILL REFUSED — and the COPY is what names why. "is not a
-    # directory", "is not a flat set of regular files" and "holds no regular files" are its sentences,
-    # an operator can act on all three, and "it could not be hashed" is a sentence about this function
-    # instead. It is run as its own statement with its status captured; a copy that somehow SUCCEEDS
-    # over an undigestible source is refused here, because a tree whose content cannot be read twice
-    # cannot be shown to have held still.
-    driver_copy_regular_files "${src}" "${staged}" || rc=$?
-    if (( rc == 0 )); then
-      driver_refuse "${src} could not be digested before it was copied, so this run cannot say the bytes it published are the bytes that were there. Nothing has been published" || return 1
-    fi
-    return "${rc}"
-  fi
-  driver_copy_regular_files "${src}" "${staged}" || return 1
-  after="$(_fence_tree_digest "${src}")" || after=""
-  driver_fill_pin_digest "the privileged helper set" "${src}" "${before}" "${after}" || return 1
-  return 0
-}
-
-# THE DIGEST OF THE BYTES A DRIVER PUBLICATION WOULD TAKE, READ OUT OF THE SOURCE AND SPELLED IN THE
-# STAGED TREE'S OWN NAMES (o3d-kyqa r4, Codex HIGH 2).
+# AND WHY THERE IS NO CONTENT-STABILITY CHECK AROUND THIS COPY ANY MORE (o3d-kyqa r5). r4 digested the
+# source before the copy and after it and refused unless both agreed with the staged tree, to stop the
+# service account rewriting a helper under root's copy out of `sudo bash ${APP_DIR}/scripts/update.sh`.
+# It was withdrawn, not kept as a belt, for two reasons that are both about what it could claim:
 #
-# The driver is not a directory — it is three named entrypoints plus `lib` — so ${DB_FENCE_ARTEFACT_RECIPE}
-# cannot be pointed at the source the way it can for the snapshot. The manifest is therefore assembled
-# over exactly the paths the copy takes, with the SAME relative names they get in the staged tree
-# (`install.sh`, …, `lib/<file>`) and through the same `sort -z | xargs sha256sum` the recipe uses, so the
-# value is comparable with _fence_tree_digest() over the staged tree and with the recipe
-# docs/installation.md gives an operator for IMS_DRIVER_SHA256. A file that has appeared under lib/ in a
-# SUBDIRECTORY makes this disagree with the staged tree, which is correct: the copy refuses that shape.
-driver_program_source_digest() {
-  local scripts_dir="$1" manifest out
-  manifest="$(cd "${scripts_dir}" 2>/dev/null && { printf '%s\0' "${IMS_DRIVER_ENTRYPOINTS[@]}"; find lib -type f -printf '%p\0' 2>/dev/null; } | LC_ALL=C sort -z | xargs -0 -r sha256sum --)" || return 1
-  [[ -n "${manifest}" ]] || return 1
-  out="$(printf '%s\n' "${manifest}" | sha256sum 2>/dev/null)" || return 1
-  out="${out%% *}"
-  fence_valid_sha256 "${out}" || return 1
-  printf '%s' "${out}"
+#   * IT DID NOT CLOSE WHAT IT WAS FOR. An account that can write the source replaces the helper ONCE,
+#     before the first digest, and then leaves it alone; the before, copied, after and staged digests
+#     all agree on its bytes. And the same account could equally have rewritten a library before bash
+#     sourced it, which no check in this file runs early enough to see. Out of a tree another account
+#     can write, nothing read out of that tree can make root's execution of it safe — so that
+#     invocation is now UNSUPPORTED, and refused best-effort by the startup block in each entrypoint.
+#   * ON EVERY SUPPORTED SOURCE IT PROTECTS NOTHING. Those are a published versioned directory under
+#     /etc, which is never rewritten in place by anybody, and a release tree the startup block has just
+#     established only root can write. The one writer left is root, and a check that exists to stop root
+#     racing itself would be claiming a boundary this design does not have: the `source`s at the top of
+#     the entrypoint are exactly as exposed to that writer.
+#
+# What the snapshot still guarantees is what the header says: immutability after it is taken, and a
+# refusal in any run whose digest does not match. IMS_HELPER_SET_SHA256 is how an operator adds
+# provenance.
+driver_fill_helper_set() {
+  driver_copy_regular_files "${IMS_SCRIPT_LIB_DIR}" "$1"
 }
 
 # The driver's filler: the three entrypoints and the library beside them, one level down — and the
@@ -1225,7 +1154,7 @@ driver_program_source_digest() {
 # install.sh and update.sh both treat 1 as a failure and 2 as a warning with the previous driver
 # standing, which is why the two are not the same number.
 driver_fill_program() {
-  local staged="$1" scripts_dir name before after content_before="" content_after="" copied=0
+  local staged="$1" scripts_dir name before after copied=0
   # THE PATH LISTS AND THE PROVENANCE ANSWER ARE THIS CALL'S, NOT THE SCRIPT'S — see the block above
   # driver_source_paths(). Nothing at script scope carries these names, so no other code path can
   # pre-set the answer this frame is about to read.
@@ -1256,10 +1185,6 @@ driver_fill_program() {
   if [[ -z "${before}" ]]; then
     driver_refuse "${scripts_dir} could not be inspected at all, so this run cannot say the bytes it copies are the bytes it checked. Nothing has been published" || return 1
   fi
-  # AND THE CONTENT, BEFORE THE COPY (o3d-kyqa r4, Codex HIGH 2). The ident answer above is about which
-  # OBJECTS the paths name; this is about what is IN them, which is the only thing that can see a file
-  # rewritten in place.
-  content_before="$(driver_program_source_digest "${scripts_dir}")" || content_before=""
 
   for name in "${IMS_DRIVER_ENTRYPOINTS[@]}"; do
     cat < "${scripts_dir}/${name}" > "${staged}/${name}" || return 1
@@ -1276,9 +1201,6 @@ driver_fill_program() {
   if [[ "${before}" != "${after}" ]]; then
     driver_refuse "${scripts_dir} was not the same tree after the copy as before it: a component was renamed or replaced while the root-owned driver was being assembled from it, so the bytes staged are not the bytes this run checked. Nothing has been published" || return 1
   fi
-  # AND THE SAME CONTENT AFTER IT, which is what catches a rewrite that moved no object.
-  content_after="$(driver_program_source_digest "${scripts_dir}")" || content_after=""
-  driver_fill_pin_digest "the root-owned deployment driver" "${scripts_dir}" "${content_before}" "${content_after}" || return 1
   return 0
 }
 
