@@ -1127,6 +1127,178 @@ test('round 3’s false rounding claims are gone from every surface that made th
   assert.deepEqual(offenders, [])
 })
 
+/**
+ * Build a groupBy-warehouse fixture: one sales line of `lineTotal`, dispatched from several warehouses
+ * in the given quantities, each warehouse its own group. Optional credit against the line.
+ */
+function splitLineFixture(lineTotal: string, splits: Array<{ qty: string; cost: string }>, credit: unknown[] = []) {
+  const line = { id: 'L1', productId: 'p1', totalBase: lineTotal }
+  COGS_ROWS = splits.map((split, index) => {
+    const entry = cogsEntry({ id: `c${index}`, orderId: 'O1', productId: 'p1', qty: split.qty, cost: split.cost, line })
+    return { ...entry, movement: { ...entry.movement, fromWarehouseId: `wh-${index}`, fromWarehouse: { id: `wh-${index}`, code: `W${index}`, name: `Warehouse ${index}` } } }
+  })
+  ORDERS = [order('O1', [{ productId: 'p1', totalBase: lineTotal }])]
+  CREDIT_LINES = credit
+  FILTER_PRODUCT_IDS = [...ALL_FIXTURE_PRODUCTS]
+}
+
+/** The page, grouped by warehouse, in `currency`. Restores GBP whatever happens. */
+async function warehousePage(currency = 'GBP') {
+  const previous = { ...FILTERS }
+  try {
+    BASE_CURRENCY = currency
+    ;(FILTERS as Record<string, unknown>).groupBy = 'warehouse'
+    return await pageCells()
+  } finally {
+    delete (FILTERS as Record<string, unknown>).groupBy
+    Object.assign(FILTERS, previous)
+    BASE_CURRENCY = 'GBP'
+  }
+}
+
+async function warehouseCsv() {
+  try {
+    ;(FILTERS as Record<string, unknown>).groupBy = 'warehouse'
+    return await csvRows()
+  } finally {
+    delete (FILTERS as Record<string, unknown>).groupBy
+  }
+}
+
+/**
+ * THE ORACLE. Round `numerator / denominator` to `places` decimals, from the exact fraction, with plain
+ * bigint arithmetic written here and nowhere else — deliberately NOT the implementation's rounder, so
+ * a test of "rounded once" is not the rounder agreeing with itself.
+ */
+function oracleRound(numerator: bigint, denominator: bigint, places: number, mode: 'ceil' | 'floor' | 'halfUp'): string {
+  const zero = BigInt(0)
+  const one = BigInt(1)
+  let n = numerator
+  let d = denominator
+  if (d < zero) { n = -n; d = -d }
+  const scaled = n * BigInt(10) ** BigInt(places)
+  let q = scaled / d
+  if (scaled % d !== zero && scaled < zero) q -= one // floor
+  const r = scaled - q * d
+  if (mode === 'ceil' && r !== zero) q += one
+  if (mode === 'halfUp' && (r * BigInt(2) > d || (r * BigInt(2) === d && n > zero))) q += one
+  const negative = q < zero
+  const digits = (negative ? -q : q).toString().padStart(places + 1, '0')
+  const body = places === 0 ? digits : `${digits.slice(0, -places)}.${digits.slice(-places)}`
+  return negative && /[1-9]/.test(body) ? `-${body}` : body
+}
+
+test('a figure is rounded ONCE, from its exact value — the reviewer’s £1.0050 (Codex r5 HIGH)', async () => {
+  // Codex round 5, verbatim: "`aggregateCogsReport` first rounds derived figures to six decimals, then
+  // `markFigure` rounds that string again to the currency precision. For a £1.0050 line allocated by
+  // quantities 2.499999/2.5, the exact group revenue is 1.004999598, the producer emits 1.005000, and
+  // the page displays £1.01 instead of the correct £1.00."
+  //
+  // WORKED: warehouse A ships 2.499999 of the line's 2.5 units, so its revenue is exactly
+  // 1.005 x 2.499999 / 2.5 = 1.004999598. Rounded once to the penny: 1.00. Rounded to six decimals
+  // first (1.005000) and then to the penny: 1.01. No credit, so the figure is exact and rounds to nearest.
+  splitLineFixture('1.005', [{ qty: '2.499999', cost: '2' }, { qty: '0.000001', cost: '1' }])
+  const page = await warehousePage()
+  assert.equal(page.rows.length, 2)
+  const warehouseA = page.rows.find((row) => (row as { warehouseCode: string }).warehouseCode === 'W0')
+  assert.ok(warehouseA, 'warehouse W0 is a row')
+  assert.equal(oracleRound(BigInt(1004999598), BigInt(1000000000), 2, 'halfUp'), '1.00', 'the oracle agrees with the worked value')
+  assert.equal(page.cellOf('revenue', warehouseA), '£1.00')
+  // And the file, which rounds once too — to six decimals, from the same exact value.
+  const { rows } = await warehouseCsv()
+  const fileA = rows.find((row) => row.warehouseCode === 'W0')
+  assert.equal(fileA?.revenueBase, oracleRound(BigInt(1004999598), BigInt(1000000000), 6, 'halfUp'))
+})
+
+test('rounded once in a zero-decimal currency too: 100.499999598 is ¥100, not ¥101 (Codex r5 HIGH)', async () => {
+  // 100.5 x 249.999999 / 250 = 100.499999598. Six decimals first gives 100.500000, which rounds to 101.
+  // Once, to yen: 100.
+  splitLineFixture('100.5', [{ qty: '249.999999', cost: '2' }, { qty: '0.000001', cost: '1' }])
+  const page = await warehousePage('JPY')
+  const warehouseA = page.rows.find((row) => (row as { warehouseCode: string }).warehouseCode === 'W0')
+  assert.ok(warehouseA)
+  assert.equal(oracleRound(BigInt(100499999598), BigInt(1000000000), 0, 'halfUp'), '100')
+  assert.equal(page.cellOf('revenue', warehouseA), '¥100')
+})
+
+test('a ≤ total is the ceiling of the EXACT sum, not of a 20-digit Decimal one (Codex r5 HIGH)', async () => {
+  // A £2 line shipped in thirds from three warehouses, with a GROSS credit against it so every revenue
+  // figure is `≤` (rounded up). Each group is 2 x 1/3; the period total is exactly 2.
+  //
+  // Decimal holds 2/3 to twenty significant digits, rounded half-up: 0.66666666666666666667. Three of
+  // those sum to 2.0000000000000000001, whose ceiling is 2.000001 at six decimals, £2.01 on the page
+  // and ¥3 in yen. The ceiling of the exact 2 is 2.000000, £2.00 and ¥2 — which is what "rounded once, from
+  // full precision" means for a bound, and it is not a looser-but-sound nicety: the published figure
+  // is supposed to be the least ceiling at the displayed precision.
+  const credit = [creditAgainstLine('L1', 'O1', 'p1', '0.0001', 'GROSS')]
+  splitLineFixture('2', [{ qty: '1', cost: '3' }, { qty: '1', cost: '2' }, { qty: '1', cost: '1' }], credit)
+  const gbp = await warehousePage('GBP')
+  assert.equal(gbp.rows.length, 3)
+  assert.match(gbp.footer('revenue'), / ≤$/)
+  assert.equal(oracleRound(BigInt(2), BigInt(1), 2, 'ceil'), '2.00')
+  assert.equal(gbp.footer('revenue'), '£2.00 ≤')
+  assert.equal(gbp.summary.get('Revenue (GBP, net of credit)'), '£2.00 ≤')
+  // Each row is 2/3, whose ceiling at the penny is 0.67 however it is computed.
+  for (const row of gbp.rows) assert.equal(gbp.cellOf('revenue', row), `£${oracleRound(BigInt(2), BigInt(3), 2, 'ceil')} ≤`)
+  const jpy = await warehousePage('JPY')
+  assert.equal(jpy.footer('revenue'), '¥2 ≤')
+  const { metadata } = await warehouseCsv()
+  assert.equal(metadata.get('totals.revenueBaseBound'), 'upper')
+  assert.equal(metadata.get('totals.revenueBase'), oracleRound(BigInt(2), BigInt(1), 6, 'ceil'))
+})
+
+test('the credit footer can differ from the rows for a reason other than rounding, and the notice says so (Codex r5 MEDIUM 1)', async () => {
+  // Codex round 5, verbatim: "On a one-page report with an outside-report refund, every rendered credit
+  // row can be zero while the credit-column footer is non-zero because `reportCredits` includes
+  // unattributed and outside-report buckets."
+  //
+  // Round 4 claimed rounding and pagination were the only two causes. Read off how each footer is built:
+  // qty, COGS, revenue and margin footers are sums of the same group figures the rows show (withheld rows
+  // print Unmatched and are left out of both); the three credit footers are the rows' credit PLUS the
+  // credit that reached no row. So there are three causes, and the third applies to the credit columns.
+  //
+  // WORKED: one row, no credit against it, and a NET credit of 10 against a line this window has no
+  // revenue for. Every credit cell is 0.00; the net credit footer is 10.00.
+  workedExample([creditAgainstLine('L9', 'O1', 'p9', '10', 'NET')])
+  const page = await pageCells()
+  assert.equal(page.rows.length, 1)
+  assert.equal(page.cell('creditNet'), '£0.00')
+  assert.equal(page.footer('creditNet'), '£10.00')
+  const { DISPLAY_ROUNDING_NOTICE_COGS } = await import('@/lib/analytics/refund-figure-surfaces')
+  assert.ok(page.notices.includes(DISPLAY_ROUNDING_NOTICE_COGS))
+  assert.match(DISPLAY_ROUNDING_NOTICE_COGS, /credit totals[^.]*credit that reached no row/i, DISPLAY_ROUNDING_NOTICE_COGS)
+})
+
+test('an Unmatched row keeps the credit against its matched line in its own credit columns, and the notice says so (Codex r5 MEDIUM 2)', async () => {
+  // Codex round 5, verbatim: "A group containing one matched movement and one unmatched movement is
+  // rendered `Unmatched`, but credit keyed to its matched movement remains in that row's
+  // `refunds*Basis` fields and leaves both off-report summaries at zero. The notice nevertheless says
+  // credit against an unmatched row is reported in the off-report totals."
+  //
+  // WORKED: product p1 has two dispatches. One is linked to sales line L1 on order O1 (revenue 100); the
+  // other references order O2, which has no loaded lines, so it cannot be matched and the whole row reads
+  // Unmatched. A NET credit of 10 against L1 is attributed to the row: its net credit column reads 10.00,
+  // and both off-report lines stay at zero.
+  const matched = cogsEntry({ id: 'c1', orderId: 'O1', productId: 'p1', qty: '1', cost: '40', line: { id: 'L1', productId: 'p1', totalBase: '100' } })
+  const unmatched = cogsEntry({ id: 'c2', orderId: 'O2', productId: 'p1', qty: '1', cost: '40' })
+  COGS_ROWS = [matched, unmatched]
+  ORDERS = [order('O1', [{ productId: 'p1', totalBase: '100' }])]
+  CREDIT_LINES = [creditAgainstLine('L1', 'O1', 'p1', '10', 'NET')]
+  FILTER_PRODUCT_IDS = [...ALL_FIXTURE_PRODUCTS]
+  const page = await pageCells()
+  assert.equal(page.rows.length, 1, 'one product, one row')
+  assert.equal(page.cell('revenue'), 'Unmatched', 'the row is withheld, so it states no relation of its own')
+  assert.equal(page.cell('creditNet'), '£10.00', 'the credit against the matched line is in the row')
+  assert.equal(page.summary.get('Credit off-report — nothing to attribute to (net / gross / unproven)'), '£0.00 / £0.00 / £0.00')
+  assert.equal(page.summary.get('Credit off-report — no revenue row here (net / gross / unproven)'), '£0.00 / £0.00 / £0.00')
+  const notice = page.notices.find((line) => /Unmatched|matched to a sales order line/.test(line))
+  assert.ok(notice, `no unmatched-row notice; notices were ${JSON.stringify(page.notices)}`)
+  // The false claim, as an absence, and the true one, as substance.
+  assert.doesNotMatch(notice!, /credit against an unmatched row[^.]*off-report totals/i, notice)
+  assert.match(notice!, /credit columns/i, notice)
+  assert.match(notice!, /off-report/i, notice)
+})
+
 // ---------------------------------------------------------------------------------------------
 // The CSV — a file reader has no tooltip
 // ---------------------------------------------------------------------------------------------
