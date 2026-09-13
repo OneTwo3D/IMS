@@ -8,7 +8,7 @@
  */
 
 import type { Prisma, StockMovementType } from '@/app/generated/prisma/client'
-import { getAccountingSettings, isAccountingSyncTypeEnabled, isDailyBatchPostingEnabled, queueAccountingSyncTx } from '@/lib/accounting'
+import { accountingPostingVerdictForChart, getAccountingSettings, isDailyBatchPostingEnabled, queueAccountingSyncTx } from '@/lib/accounting'
 import { parseCostLayerSnapshot, serializeCostLayerSnapshot, sumCostLayerSnapshot } from '@/lib/cost-layer-snapshots'
 import { TRANSFER_STATUSES_WITH_OUTSTANDING_SOURCE_CONSUMPTION } from '@/lib/domain/inventory/movement-cogs-relevance'
 import { getInventoryConstraintMessage } from '@/lib/domain/inventory/prisma-errors'
@@ -133,7 +133,14 @@ async function queueShipmentCogsRevaluationSync(
   // audit-3aph: only treat this revaluation as posted (so the caller drops it
   // from the COGS journal) when COGS_REVERSAL posting is actually enabled —
   // otherwise the delta must remain in the COGS journal or it would post NOWHERE.
-  const isEnabled = options.isReversalPostingEnabled ?? (() => isAccountingSyncTypeEnabled('COGS_REVERSAL'))
+  // o3d-j625 r4 (SWEEP 1): the default verdict is asked OF `settings.connector`, not of whichever connector
+  // is active by now. `isAccountingSyncTypeEnabled` re-resolved it after the chart read above; a switch in
+  // between could answer about the OTHER connector's toggles. Every non-`post` verdict answers `false`,
+  // which here is the SAFE direction for all of them — "this revaluation did not post here, keep the delta
+  // in the caller's COGS journal" — and a retired chart is then refused, and reported, at that journal's
+  // own enqueue rather than silently absorbed.
+  const isEnabled = options.isReversalPostingEnabled
+    ?? (async () => (await accountingPostingVerdictForChart(settings.connector, 'COGS_REVERSAL')).verdict === 'post')
   if (!(await isEnabled())) return false
 
   // o3d-zpa7: THE PRECONDITION THAT MAKES THE UNLOCKED ENQUEUE SAFE, checked rather than argued.

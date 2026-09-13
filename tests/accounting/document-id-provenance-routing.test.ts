@@ -411,3 +411,22 @@ test('[o3d-j625 r3] a recorded value this build cannot route is `null`, never na
   assert.equal(asRoutableAccountingConnector(null), null)
   assert.equal(asRoutableAccountingConnector(undefined), null)
 })
+
+// --------------------------------------------------------------------------------------------
+// o3d-j625 r4 — the chart-scoped posting verdict, against the real plugin selection and settings
+// --------------------------------------------------------------------------------------------
+
+test('[o3d-j625 r4] accountingPostingVerdictForChart keeps "chart retired" apart from "type switched off"', async () => {
+  const { accountingPostingVerdictForChart } = await import('@/lib/accounting')
+
+  reset(['xero'])
+  assert.deepEqual(await accountingPostingVerdictForChart('xero', 'SALES_INVOICE'), { verdict: 'post', connector: 'xero' })
+  // Posting mode for this type is not in the Xero settings double, i.e. switched off, while Xero is active.
+  assert.deepEqual(await accountingPostingVerdictForChart('xero', 'COGS_REVERSAL'), { verdict: 'not-configured', connector: 'xero' })
+  // The chart is Xero's and QuickBooks is active: owed, not off — whatever QuickBooks' own toggles say.
+  reset(['quickbooks'])
+  assert.deepEqual(await accountingPostingVerdictForChart('xero', 'SALES_INVOICE'), { verdict: 'chart-retired', chartConnector: 'xero', activeConnector: 'quickbooks' })
+  reset([])
+  assert.deepEqual(await accountingPostingVerdictForChart('xero', 'SALES_INVOICE'), { verdict: 'chart-retired', chartConnector: 'xero', activeConnector: null })
+  assert.deepEqual(await accountingPostingVerdictForChart(null, 'SALES_INVOICE'), { verdict: 'no-chart' })
+})

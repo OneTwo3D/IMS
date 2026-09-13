@@ -32,7 +32,7 @@ import {
 } from '@/lib/connectors/accounting-connection-provenance'
 import { withAccountingPostingIntent } from '@/lib/connectors/accounting-posting-intent'
 import { xeroUploadAttachment, xeroPost } from './api'
-import { lookupPaymentAccount, getPaymentAccountMap } from '@/lib/accounting'
+import { accountingBankAccountBelongsTo, lookupPaymentAccount, getPaymentAccountMap } from '@/lib/accounting'
 import { updateMirroredAccountingEventStatus } from '@/lib/domain/accounting/accounting-event-mirror'
 import { retireSalesInvoiceForCancelledOrder } from '@/lib/domain/accounting/cancel-order-invoice-sync'
 import { readClaimedSyncLogOriginRecord } from '@/lib/domain/accounting/claimed-sync-payload'
@@ -6643,8 +6643,10 @@ export type CreditNoteAllocationReenqueueResult = {
 export type CreditNoteAllocationCandidate = {
   id: string
   accountingCreditNoteId: string | null
+  /** o3d-j625 r4: WHOSE credit note `accountingCreditNoteId` is. Absent on legacy fixtures = unrecorded. */
+  accountingCreditNoteConnector?: string | null
   amountForeign: unknown
-  purchaseInvoice: { accountingInvoiceId: string | null } | null
+  purchaseInvoice: { accountingInvoiceId: string | null; accountingInvoiceConnector?: string | null } | null
 }
 
 /**
@@ -6867,13 +6869,18 @@ export async function reenqueueMissingCreditNoteAllocations(limit = 200): Promis
     select: {
       id: true,
       accountingCreditNoteId: true,
+      // o3d-j625 r4 (SWEEP 2): WHOSE documents the two ids are. This sweep reads both ids straight off
+      // the tables, with no connector filter, and hands them to a XERO allocation — the header above
+      // named the missing provenance column as the residual it could not close. It exists now.
+      accountingCreditNoteConnector: true,
       amountForeign: true,
-      purchaseInvoice: { select: { accountingInvoiceId: true } },
+      purchaseInvoice: { select: { accountingInvoiceId: true, accountingInvoiceConnector: true } },
     },
     orderBy: { postedAt: 'asc' },
     take: limit,
   })
   if (candidates.length === 0) return result
+  const candidateById = new Map(candidates.map((candidate) => [candidate.id, candidate]))
 
   // A credit note that already has an allocation row (live OR terminal) is owned
   // by the normal retry/repair path — this sweep only fills the never-enqueued gap.
@@ -6921,6 +6928,37 @@ export async function reenqueueMissingCreditNoteAllocations(limit = 200): Promis
   for (const item of toEnqueue) {
     result.checked++
     try {
+      // o3d-j625 r4 (SWEEP 2) — BOTH DOCUMENT IDS MUST BE RECORDED AS XERO'S BEFORE A XERO ALLOCATION
+      // CARRIES THEM. A bill linked under QuickBooks (or linked before the provenance column existed)
+      // would otherwise be addressed to Xero by id. Fail closed: an unrecorded connector is refused,
+      // counted as failed, and reported — never assumed to be the connector this sweep belongs to.
+      const candidate = candidateById.get(item.supplierCreditNoteId)
+      const creditNoteConnector = candidate?.accountingCreditNoteConnector ?? null
+      const billConnector = candidate?.purchaseInvoice?.accountingInvoiceConnector ?? null
+      if (creditNoteConnector !== XERO_CONNECTOR || billConnector !== XERO_CONNECTOR) {
+        result.failed++
+        await logActivity({
+          entityType: 'SYSTEM',
+          action: 'xero_credit_note_allocation_refused_unattributable_document',
+          tag: 'sync',
+          level: 'WARNING',
+          description:
+            `Did NOT enqueue the missing supplier-credit-note allocation for ${item.supplierCreditNoteId}: IMS `
+            + `records the credit note ${item.creditNoteId} as ${creditNoteConnector ?? 'no connector'}'s and the bill `
+            + `${item.accountingInvoiceId} as ${billConnector ?? 'no connector'}'s, and a Xero allocation may only carry `
+            + 'Xero document ids. An accounting document id is kept when the connector selection changes, so it '
+            + 'cannot be assumed to be Xero\'s. The allocation is still OUTSTANDING: allocate the credit to the bill '
+            + 'in the accounting system that holds both, or re-post them so their connector is recorded.',
+          metadata: {
+            supplierCreditNoteId: item.supplierCreditNoteId,
+            creditNoteId: item.creditNoteId,
+            accountingInvoiceId: item.accountingInvoiceId,
+            creditNoteConnector,
+            billConnector,
+          },
+        }).catch(() => { /* a report that cannot be written must not stop the sweep */ })
+        continue
+      }
       const origin = selectIssuingPostOriginRecord(
         postsByCreditNote.get(item.supplierCreditNoteId) ?? [],
         item.creditNoteId,
@@ -7195,6 +7233,9 @@ async function decideInvoicePaymentFollowUp(
     { method, currency }: { method: string; currency: string },
     missing: string,
     configure: string,
+    // o3d-j625 r4: what the activity record can add about WHICH mapping failed, without a new reason
+    // code — the remedy is still a setting, which is what `payment_account_unmapped` means.
+    detail?: Record<string, unknown>,
   ): Promise<RefusedFollowUpEnqueue> => {
     const message = paymentAccountRefusalMessage({
       connector: 'Xero',
@@ -7226,6 +7267,7 @@ async function decideInvoicePaymentFollowUp(
         reason: 'payment_account_unmapped',
         method,
         currency,
+        ...detail,
         sourceEntryId: entryId,
       },
     })
@@ -7310,6 +7352,33 @@ async function decideInvoicePaymentFollowUp(
           { method, currency },
           `no bank account is mapped for method "${method}" / currency "${currency}"`,
           'Add that mapping under Settings → Accounting → Payment Account Mapping.',
+        )
+      }
+
+      // o3d-j625 r4 (Codex HIGH 1, was o3d-l9ok) — THE MAPPED ACCOUNT IS CONFIRMED AS XERO'S BEFORE
+      // IT IS CARRIED.
+      //
+      // `accounting_payment_account_map` is ONE settings row shared by every accounting connector, and
+      // its values are one connector's own account ids. This is the point where an imported order's
+      // payment first acquires a bank account — the WooCommerce import carries only method, currency and
+      // amount — so it is the only place the id can be validated, and it is validated HERE against this
+      // connector's own synced chart (`AccountingAccount(connector, externalAccountId)`, a local read).
+      // The id that passes is the one carried in the INVOICE_PAYMENT payload below, and the INVOICE_PAYMENT
+      // poster sends `payload.bankAccountId` verbatim — it never re-reads the map — so a later map edit
+      // cannot redirect a payment already queued, and a map value belonging to the other connector is
+      // refused rather than sent.
+      //
+      // Refused as `payment_account_unmapped`, because the remedy is the same kind of thing that reason
+      // already names: a SETTING, safe to repeat, which the retry picks up.
+      if (!await accountingBankAccountBelongsTo(XERO_CONNECTOR, stored)) {
+        return await refuse(
+          { method, currency },
+          `the bank account mapped for method "${method}" / currency "${currency}" (${stored}) is not an active `
+            + 'bank account in Xero\'s synced chart of accounts — the payment-account mapping is shared by every '
+            + 'accounting connector, so it can hold another connector\'s account id',
+          'Sync the chart of accounts, then re-map that payment method against Xero under Settings → Accounting → '
+            + 'Payment Account Mapping.',
+          { mappedBankAccountId: stored, paymentAccountRefusal: 'not_in_connector_chart' },
         )
       }
 

@@ -6,7 +6,7 @@ import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
 import { requireInternalUser, requirePermission } from '@/lib/auth/server'
 import { enqueueStockSync } from '@/lib/shopping'
-import { queueAccountingSyncTx, getAccountingSettings, isAccountingSyncTypeEnabled } from '@/lib/accounting'
+import { queueAccountingSyncTx, getAccountingSettings, accountingPostingVerdictForChart } from '@/lib/accounting'
 import { postingIsOwed, reportPostingNotQueued, type EnqueueOutcomeLike } from '@/lib/domain/accounting/enqueue-outcome'
 import {
   addCostLayerSourceLines,
@@ -907,9 +907,18 @@ export async function updateManufacturingOrderStatus(
           0,
         )
         if (journalTotalBase > 0) {
-          const shouldPostJournal = await isAccountingSyncTypeEnabled('MANUFACTURING_JOURNAL')
+          // o3d-j625 r4 (SWEEP 1): the chart FIRST, then the posting verdict asked OF IT. This used to ask
+          // `isAccountingSyncTypeEnabled` (a resolution of the active connector) and then read the chart
+          // (a second one), so the gate and the account codes could be about two different connectors.
+          // A retired chart is an OWED posting: recorded as a refusal and reported after the commit by
+          // the same channel a declined enqueue uses, never a silent skip.
+          const settings = await getAccountingSettings()
+          const journalVerdict = await accountingPostingVerdictForChart(settings.connector, 'MANUFACTURING_JOURNAL')
+          if (journalVerdict.verdict === 'chart-retired') {
+            manufacturingJournalOutcome.outcome = { queued: false, reason: 'refused', connector: journalVerdict.chartConnector }
+          }
+          const shouldPostJournal = journalVerdict.verdict === 'post'
           if (shouldPostJournal) {
-            const settings = await getAccountingSettings()
             const defaultOverheadAccount = settings.manufacturingOverheadAccount
             const inventoryAccount = settings.inventoryAccount
             if (!inventoryAccount) {
@@ -1664,10 +1673,17 @@ export async function updateManufacturingCostLines(
       oldTotal = existing.reduce((s, l) => s + Number(l.amountBase), 0)
       newTotal = cleaned.reduce((s, l) => s + l.amountBase, 0)
 
-      const shouldPostReclass = po.status === 'COMPLETED'
-        ? await isAccountingSyncTypeEnabled('MANUFACTURING_RECLASS')
-        : false
-      const settings = shouldPostReclass ? await getAccountingSettings() : null
+      // o3d-j625 r4 (SWEEP 1): chart first, verdict asked OF IT — see the completion journal above. A
+      // retired chart is recorded as a refusal and reported after the commit.
+      const reclassChart = po.status === 'COMPLETED' ? await getAccountingSettings() : null
+      const reclassVerdict = reclassChart
+        ? await accountingPostingVerdictForChart(reclassChart.connector, 'MANUFACTURING_RECLASS')
+        : null
+      if (reclassVerdict?.verdict === 'chart-retired') {
+        reclassOutcome.outcome = { queued: false, reason: 'refused', connector: reclassVerdict.chartConnector }
+      }
+      const shouldPostReclass = reclassVerdict?.verdict === 'post'
+      const settings = shouldPostReclass ? reclassChart : null
       if (shouldPostReclass && settings?.manufacturingOverheadAccount) {
         cleanedForWrite = cleaned.map((line) => (
           line.amountBase > 0 && !line.accountCode

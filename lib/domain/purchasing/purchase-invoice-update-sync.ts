@@ -57,10 +57,56 @@ type TransitSubledgerUpdateInput = {
   journalDate: string
 }
 
+/** o3d-j625 r4: the shape of `accountingPostingVerdictForChart`'s answer, restated so this module stays injectable. */
+export type PurchaseInvoiceUpdatePostingVerdict =
+  | { verdict: 'post'; connector: 'xero' | 'quickbooks' }
+  | { verdict: 'not-configured'; connector: 'xero' | 'quickbooks' }
+  | { verdict: 'chart-retired'; chartConnector: 'xero' | 'quickbooks'; activeConnector: 'xero' | 'quickbooks' | null }
+  | { verdict: 'no-chart' }
+
 export type PurchaseInvoiceUpdateSyncDeps<Tx extends PurchaseInvoiceUpdateSyncTx> = {
-  isAccountingSyncTypeEnabled: (type: 'PURCHASE_INVOICE_UPDATE') => Promise<boolean>
+  /**
+   * o3d-j625 r4 (Codex HIGH 3) — REPLACES `isAccountingSyncTypeEnabled`, WHICH RESOLVED THE ACTIVE
+   * CONNECTOR A SECOND TIME. That boolean's `false` meant both "posting is switched off" and "the chart
+   * this edit was built from belongs to a connector that is no longer active", and this function returned
+   * `skipped-disabled` for both — an informational outcome — before the enqueue's chart guard could ever
+   * refuse. The verdict is asked OF THE CHART'S CONNECTOR, and a retired chart is a refusal.
+   */
+  postingVerdictForChart: (
+    chartConnector: 'xero' | 'quickbooks' | null,
+    type: 'PURCHASE_INVOICE_UPDATE',
+  ) => Promise<PurchaseInvoiceUpdatePostingVerdict>
   queueAccountingSyncTx: (tx: Tx, params: QueueAccountingSyncTxParams) => Promise<boolean>
   recordTransitSubledgerMovement: (tx: Tx, input: TransitSubledgerUpdateInput) => Promise<void>
+}
+
+/**
+ * WHAT HAPPENED TO THE BILL EDIT'S LEDGER UPDATE.
+ *
+ * The two refusals are OWED postings and a caller must surface them; the three skips are informational.
+ * o3d-j625 r4 split `refused-chart-retired` out of what was `skipped-disabled`: "the connector this edit
+ * was built for is no longer the active one" is not "posting is switched off", and collapsing the two
+ * made a connector switch read as a setting.
+ *
+ *   queued                     the update row is durable.
+ *   refused                    the enqueue itself declined (its chart/document guard, or a posting
+ *                              context that changed under the write).
+ *   refused-chart-retired      the chart's connector is no longer active — detected before enqueueing.
+ *   skipped-disabled           the chart's connector is active and does not post bill updates.
+ *   skipped-no-external-id     the bill never reached a ledger.
+ *   skipped-unsupported-connector  the chart's connector has no bill-update poster (QuickBooks).
+ */
+export type PurchaseInvoiceUpdateOutcome =
+  | 'queued'
+  | 'refused'
+  | 'refused-chart-retired'
+  | 'skipped-disabled'
+  | 'skipped-no-external-id'
+  | 'skipped-unsupported-connector'
+
+/** The outcomes that leave a ledger update OWED. */
+export function purchaseInvoiceUpdateIsOwed(outcome: PurchaseInvoiceUpdateOutcome): boolean {
+  return outcome === 'refused' || outcome === 'refused-chart-retired'
 }
 
 export async function maybeQueuePurchaseInvoiceUpdate<Tx extends PurchaseInvoiceUpdateSyncTx>(params: {
@@ -98,7 +144,7 @@ export async function maybeQueuePurchaseInvoiceUpdate<Tx extends PurchaseInvoice
   previousSubtotalBase: number
   newSubtotalBase: number
   deps: PurchaseInvoiceUpdateSyncDeps<Tx>
-}): Promise<'queued' | 'refused' | 'skipped-disabled' | 'skipped-no-external-id' | 'skipped-unsupported-connector'> {
+}): Promise<PurchaseInvoiceUpdateOutcome> {
   if (!params.accountingInvoiceId || !params.idempotencyKey) return 'skipped-no-external-id'
   if (!params.syncEnabled) return 'skipped-disabled'
 
@@ -129,9 +175,10 @@ export async function maybeQueuePurchaseInvoiceUpdate<Tx extends PurchaseInvoice
     return 'skipped-unsupported-connector'
   }
 
-  if (!await params.deps.isAccountingSyncTypeEnabled('PURCHASE_INVOICE_UPDATE')) {
-    return 'skipped-disabled'
-  }
+  // o3d-j625 r4 (Codex HIGH 3): asked OF THE CHART, and a retired chart is a refusal, not a skip.
+  const verdict = await params.deps.postingVerdictForChart(params.chartConnector, 'PURCHASE_INVOICE_UPDATE')
+  if (verdict.verdict === 'chart-retired') return 'refused-chart-retired'
+  if (verdict.verdict !== 'post') return 'skipped-disabled'
 
   const queued = await params.deps.queueAccountingSyncTx(params.tx, {
     type: 'PURCHASE_INVOICE_UPDATE',

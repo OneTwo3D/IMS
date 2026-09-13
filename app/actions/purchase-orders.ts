@@ -5,7 +5,7 @@ import { z } from 'zod'
 import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
 import { requirePermission } from '@/lib/auth/server'
-import { queueAccountingSync, queueAccountingSyncTx, getAccountingSettings, getActiveAccountingConnectorInfo, isAccountingSyncTypeEnabled, listAccountingBankAccounts, listAccountingBankAccountsWithChart, asRoutableAccountingConnector, type AccountingBankAccount } from '@/lib/accounting'
+import { queueAccountingSync, queueAccountingSyncTx, getAccountingSettings, getActiveAccountingConnectorInfo, isAccountingSyncTypeEnabledFor, listAccountingBankAccounts, listAccountingBankAccountsWithChart, asRoutableAccountingConnector, accountingPostingVerdictForChart, type AccountingBankAccount } from '@/lib/accounting'
 import { postingIsOwed, reportPostingNotQueued, type EnqueueOutcomeLike } from '@/lib/domain/accounting/enqueue-outcome'
 import { accountingPayloadKey } from '@/lib/accounting/payload-key'
 import { multiComponentTaxRateNames } from '@/lib/accounting/multi-component-warning'
@@ -52,7 +52,7 @@ import {
   validatePurchaseInvoiceLineLimits,
   type PurchaseInvoiceInputLine,
 } from '@/lib/domain/purchasing/purchase-invoice-edit'
-import { maybeQueuePurchaseInvoiceUpdate } from '@/lib/domain/purchasing/purchase-invoice-update-sync'
+import { maybeQueuePurchaseInvoiceUpdate, purchaseInvoiceUpdateIsOwed } from '@/lib/domain/purchasing/purchase-invoice-update-sync'
 import {
   computeGrossUnitCostBaseByLine,
   queueLandedCostAdjustmentJournals,
@@ -814,7 +814,9 @@ export async function getPurchaseOrder(id: string): Promise<PoDetail | null> {
     // The TYPE's own posting mode, not just the connector flag: an installation with bill-payment sync
     // switched off expects no payment to post, and calling that a discrepancy would paint every paid
     // bill permanently red for a setting someone chose on purpose.
-    isAccountingSyncTypeEnabled('BILL_PAYMENT').catch(() => false),
+    // o3d-j625 r4 (SWEEP 1): asked OF the connector read on the line above, not re-resolved — otherwise the
+    // verdict and the rows it is judged against could be two different connectors'.
+    (activeConnector ? isAccountingSyncTypeEnabledFor(activeConnector.id, 'BILL_PAYMENT') : Promise.resolve(false)).catch(() => false),
     latestBillPaymentSyncRows(po.invoices.map((inv) => inv.id), activeConnector?.id ?? null, po.currency),
   ])
 
@@ -3551,7 +3553,8 @@ export async function updateInvoice(
         previousSubtotalBase: Number(lockedInvoice.subtotalBase),
         newSubtotalBase: Number(invoiceCalculation.subtotalBase),
         deps: {
-          isAccountingSyncTypeEnabled,
+          // o3d-j625 r4 (Codex HIGH 3): the chart-scoped verdict, not the active-connector boolean.
+          postingVerdictForChart: accountingPostingVerdictForChart,
           queueAccountingSyncTx,
           recordTransitSubledgerMovement,
         },
@@ -3582,7 +3585,8 @@ export async function updateInvoice(
     // the accounting connector selection moved would make a retired chart block bill editing. What must
     // not happen is the operator being told the edit was pushed. The ledger still holds the PREVIOUS
     // version of this bill and nothing retries on its own.
-    if (billUpdateSync.outcome === 'refused') {
+    // o3d-j625 r4: BOTH refusals — the enqueue's own and a chart retired before it was reached.
+    if (purchaseInvoiceUpdateIsOwed(billUpdateSync.outcome)) {
       await logActivity({
         entityType: 'PURCHASE_ORDER',
         entityId: invoice.poId,
@@ -3591,7 +3595,7 @@ export async function updateInvoice(
         level: 'ERROR',
         description:
           `The bill edit was SAVED IN IMS but NOT queued to the accounting connector: the accounting `
-          + `queue declined a PURCHASE_INVOICE_UPDATE for bill `
+          + `queue ${billUpdateSync.outcome === 'refused-chart-retired' ? 'REFUSED (the accounting connector this edit was built for is no longer the active one)' : 'declined'} a PURCHASE_INVOICE_UPDATE for bill `
           + `${normalizedHeader.invoiceNumber ?? invoice.invoiceNumber ?? invoice.id}. The ledger still `
           + `holds the PREVIOUS version of this bill and nothing will retry on its own — either re-save `
           + `the bill once the accounting connector selection has settled, or correct the bill by hand in `
@@ -4227,8 +4231,47 @@ export async function postSupplierCreditNote(id: string): Promise<{ success: boo
     })
     // Xero-only: the ACCPAYCREDIT poster exists for Xero. For other connectors the
     // credit note still records as POSTED in IMS (consistent with sync being off).
+    //
+    // o3d-j625 r4 (Codex HIGH 2) — THE POSTING VERDICT IS ASKED OF `settings.connector`, AND A RETIRED
+    // CHART REFUSES INSTEAD OF FALLING THROUGH TO "POST LOCALLY".
+    //
+    // This read `isAccountingSyncTypeEnabled('PURCHASE_CREDIT_NOTE')`, which resolves the ACTIVE connector
+    // again after `settings` had fixed one. A switch between the two made it `false`, `shouldQueueXero`
+    // became `false`, the enqueue — and its chart/document guard — was never called, and the transaction
+    // below still claimed DRAFT→POSTED: a posted supplier credit with no ledger entry, which is the state
+    // the comment on that transaction says cannot happen. "Posting is switched off" is the escape valve
+    // that legitimately posts locally; "the connector this credit was built for is no longer active" is
+    // not, and it now stops before anything is claimed.
+    const creditNotePosting = await accountingPostingVerdictForChart(settings.connector, 'PURCHASE_CREDIT_NOTE')
+    if (creditNotePosting.verdict === 'chart-retired') {
+      await logActivity({
+        entityType: 'PURCHASE_ORDER',
+        entityId: cn.poId,
+        action: 'supplier_credit_note_not_posted',
+        tag: 'accounting',
+        level: 'ERROR',
+        description:
+          `Supplier credit note ${cn.creditNoteNumber ?? cn.id} for ${cn.po.reference} was NOT posted: it was `
+          + `prepared against ${creditNotePosting.chartConnector}'s chart of accounts and the active accounting `
+          + `connector is now ${creditNotePosting.activeConnector ?? 'none'}. The credit note is still a draft.`,
+        metadata: {
+          creditNoteId: cn.id,
+          reference: cn.po.reference,
+          declineReason: 'chart-retired',
+          chartConnector: creditNotePosting.chartConnector,
+          activeConnector: creditNotePosting.activeConnector,
+        },
+      }).catch(() => { /* nothing was changed; logging must not turn the refusal into a throw */ })
+      return {
+        success: false,
+        error:
+          'The credit note was NOT posted: the accounting connector changed while it was being prepared, so its '
+          + 'account codes no longer describe the ledger it would be sent to. It is still a draft — post it again '
+          + 'once the accounting connector selection has settled.',
+      }
+    }
     const shouldQueueXero =
-      settings.connector === 'xero' && settings.syncEnabled && (await isAccountingSyncTypeEnabled('PURCHASE_CREDIT_NOTE'))
+      settings.connector === 'xero' && settings.syncEnabled && creditNotePosting.verdict === 'post'
 
     // CRITICAL (Codex review): claim DRAFT->POSTED and enqueue the sync in ONE
     // transaction. If the queue insert fails, the whole tx rolls back and the row

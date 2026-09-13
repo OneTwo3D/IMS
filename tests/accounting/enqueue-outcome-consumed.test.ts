@@ -36,7 +36,30 @@ import { balancedFrom, blankNonCode, ownProperty, productionSources } from './pa
  * is handled well".
  */
 
-const CALLEES = ['queueAccountingSyncTxWithOutcome', 'queueAccountingSyncTx', 'queueAccountingSync'] as const
+/**
+ * o3d-j625 r4 (Codex HIGH 4) — AND THE CONNECTOR QUEUES THEMSELVES.
+ *
+ * r3's census recognised only the facade names, and `lib/domain/sales/sales-invoice-update-sync.ts`
+ * called `queueXeroSync` directly, discarded the answer and logged "queued" — the exact defect the census
+ * existed for, escaping it by using a name it did not know. So the census now covers every function that
+ * INSERTS an accounting sync row and can decline:
+ *
+ *   queueXeroSync / queueQuickBooksSync   the connector queues the facade delegates to
+ *   enqueueFollowUpSyncLog                each connector's follow-up enqueuer (payments, PDFs, attachments,
+ *                                         credit-note allocations)
+ *
+ * DELIBERATELY NOT COVERED: the two daily-batch `createPendingSyncLog`s. They cannot decline — they return
+ * the new row's id or throw — so there is no refusal for a caller to discard, and "the id was not read"
+ * is not this defect. Stated here so their absence is a decision, not an oversight.
+ */
+const CALLEES = [
+  'queueAccountingSyncTxWithOutcome',
+  'queueAccountingSyncTx',
+  'queueAccountingSync',
+  'queueXeroSync',
+  'queueQuickBooksSync',
+  'enqueueFollowUpSyncLog',
+] as const
 
 type Verdict = 'assigned-and-read' | 'argument' | 'returned' | 'reportOutcome' | 'DISCARDED' | 'STORED-UNREAD' | 'UNCLASSIFIED'
 
@@ -103,7 +126,9 @@ export function enqueueSites(file: string, source: string): Site[] {
 function classify(prefix: string, after: string, hasReportOutcome: boolean, startsLine = false): { verdict: Verdict; detail?: string } {
   if (hasReportOutcome) return { verdict: 'reportOutcome' }
   if (/(?:^|[^\w$])return$/.test(prefix) || /=>$/.test(prefix)) return { verdict: 'returned' }
-  if (/[(,]$/.test(prefix)) return { verdict: 'argument' }
+  // `[` too: `outcomes = [await enqueue(…), …]`; and a SPREAD, `{ ...await queueXeroSync(…), connector }`,
+  // which hands the answer's fields onward (the facade's own delegation).
+  if (/[(,[]$/.test(prefix) || /\.\.\.$/.test(prefix)) return { verdict: 'argument' }
   // `x = await …` but not `==`, `===`, `!=`, `<=`, `>=`, `=>`.
   const assigned = prefix.match(/([\w$][\w$.]*)\s*=$/)
   if (assigned && !/[=!<>]=$/.test(prefix)) {

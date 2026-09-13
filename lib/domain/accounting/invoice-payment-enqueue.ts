@@ -16,7 +16,6 @@ import {
   accountingBankAccountBelongsTo,
   getActiveAccountingConnectorInfo,
   getPaymentAccountMap,
-  isAccountingSyncTypeEnabled,
   isAccountingSyncTypeEnabledFor,
   lookupPaymentAccount,
   queueAccountingSyncTxWithOutcome,
@@ -1290,16 +1289,27 @@ export async function registerInvoicePaymentWithLedger(params: {
       return
     }
 
-    const [paymentSyncEnabled, so, activeConnector] = await Promise.all([
+    // o3d-j625 r4 (SWEEP 1) — THE CONNECTOR IS READ ONCE, AND THE POSTING VERDICT IS ASKED OF THAT READ.
+    //
+    // The unpinned arm used to run `isAccountingSyncTypeEnabled('INVOICE_PAYMENT')` IN PARALLEL with
+    // `getActiveAccountingConnectorInfo()` — two independent resolutions of "which connector". A switch
+    // between them could hand this function connector A for `connectorId` and connector B's `false` for
+    // `paymentSyncEnabled`, and `false` is SYNC_DISABLED: a silent non-registration, with no notice, of a
+    // receipt connector A does post. The verdict is now `isAccountingSyncTypeEnabledFor(connectorId)`, so
+    // both facts are about one connector; a switch after this read is caught by the enqueue's chart guard
+    // and reported as POSTING_CONTEXT_CHANGED.
+    const activeConnector = pinned ? null : await getActiveAccountingConnectorInfo().catch(() => null)
+    const verdictConnector: string | null = pinned ? pinned.connector : (activeConnector?.id ?? null)
+    const [paymentSyncEnabled, so] = await Promise.all([
       // Not merely "is the connector on": if INVOICE_PAYMENT posting is off, queueAccountingSync would
       // drop this silently, so treat it as nothing being expected rather than as a failure to report.
       //
       // o3d-ekn8 r2: when a post is pinned, the question is whether the PINNED connector posts payments
       // — the active-connector form would answer about whatever is switched on now, which is not an
       // answer about the connector that just posted this invoice at all.
-      (pinned
-        ? isAccountingSyncTypeEnabledFor(pinned.connector, 'INVOICE_PAYMENT')
-        : isAccountingSyncTypeEnabled('INVOICE_PAYMENT')).catch(() => false),
+      (verdictConnector === null
+        ? Promise.resolve(false)
+        : isAccountingSyncTypeEnabledFor(verdictConnector, 'INVOICE_PAYMENT')).catch(() => false),
       db.salesOrder.findUnique({
         where: { id: params.orderId },
         select: {
@@ -1310,9 +1320,6 @@ export async function registerInvoicePaymentWithLedger(params: {
           shoppingLinks: { select: { connector: true }, take: 1 },
         },
       }),
-      // Not resolved at all when a connector was pinned: a second resolution can agree with the pin
-      // while the write did not, which is the race rather than a check of it.
-      pinned ? Promise.resolve(null) : getActiveAccountingConnectorInfo().catch(() => null),
     ])
     if (!so) return
 

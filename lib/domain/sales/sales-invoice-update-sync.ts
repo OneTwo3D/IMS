@@ -40,31 +40,49 @@ export type SalesInvoiceUpdateQueueParams = {
   documentConnector: 'xero' | 'quickbooks' | null
 }
 
-type QueueXeroSync = (params: {
+/**
+ * o3d-j625 r4 (Codex HIGH 4) — THE ACCOUNTING FACADE, NOT `queueXeroSync`.
+ *
+ * This module used to call the Xero queue directly, ignore what it answered, and log
+ * `sales_invoice_update_queued` unconditionally. `queueXeroSync` declines for reasons that have nothing
+ * to do with this module's own checks — an unresolved prior attempt, a deleted order, a stale discount,
+ * a posting mode switched off, a connector transition under the write — and every one of them left the
+ * local sale updated, the ledger stale, and an INFO record saying the update was queued. It also bypassed
+ * both facade guards (chart and document provenance), and the r3 consumption census, which only
+ * recognised `queueAccountingSync*`.
+ *
+ * Routed through the facade, the row gets the chart guard, the document-id guard and the connector
+ * queue's own verdicts, and this module gets the WHOLE answer back to act on.
+ */
+type QueueAccountingSync = (params: {
   type: 'SALES_INVOICE_UPDATE'
   referenceType: 'SalesOrder'
   referenceId: string
   payload: Record<string, unknown>
   idempotencyKey: string
-  // o3d-2sm1 r7: the real `queueXeroSync` now reports what it did, and `unknown` is what this
-  // injection point needs — it does not read the answer, and widening it to the outcome type here
-  // would make this module import the accounting facade's contract for no purpose.
-}) => Promise<unknown>
+  chartConnector: 'xero' | 'quickbooks' | null
+  documentConnector: 'xero' | 'quickbooks' | null
+}) => Promise<{ queued: boolean; reason?: 'not-configured' | 'refused' | 'already-queued'; connector: string | null }>
 
 type LogActivity = (params: {
   entityType: 'SALES_ORDER'
   entityId: string
   action: string
   tag: 'accounting'
-  level: 'INFO' | 'WARNING'
+  level: 'INFO' | 'WARNING' | 'ERROR'
   description: string
   metadata: Record<string, unknown>
 }) => Promise<void>
 
 export type QueueSalesInvoiceUpdateDeps = {
+  /** Read ONCE, and only to COMPARE with the chart and the document — never to route. */
   getActiveAccountingConnectorInfo(): Promise<SalesInvoiceUpdateConnectorInfo>
-  isAccountingSyncTypeEnabled(type: 'SALES_INVOICE_UPDATE'): Promise<boolean>
-  queueXeroSync: QueueXeroSync
+  /**
+   * o3d-j625 r4: `isAccountingSyncTypeEnabled` is GONE from this seam. It resolved the active connector a
+   * second time and its `false` silently returned; "is this type posted" is now the facade's
+   * `not-configured` answer, given for the chart's own connector.
+   */
+  queueAccountingSync: QueueAccountingSync
   logActivity: LogActivity
 }
 
@@ -132,7 +150,9 @@ export async function queueSalesInvoiceUpdateForExistingAccountingInvoice(
     })
     return
   }
-  if (connector?.id !== 'xero') {
+  // o3d-j625 r4: keyed on the CHART's connector, which the checks above have just shown to be the active
+  // one — not on a value re-read for the purpose.
+  if (params.chartConnector !== 'xero') {
     await deps.logActivity({
       entityType: 'SALES_ORDER',
       entityId: params.salesOrderId,
@@ -152,26 +172,59 @@ export async function queueSalesInvoiceUpdateForExistingAccountingInvoice(
     return
   }
 
-  if (!(await deps.isAccountingSyncTypeEnabled('SALES_INVOICE_UPDATE'))) return
-
-  await deps.queueXeroSync({
+  const enqueued = await deps.queueAccountingSync({
     type: 'SALES_INVOICE_UPDATE',
     referenceType: 'SalesOrder',
     referenceId: params.salesOrderId,
     payload: params.payload,
     idempotencyKey: params.idempotencyKey,
+    chartConnector: params.chartConnector,
+    documentConnector: params.documentConnector,
   })
+
+  // o3d-j625 r4 (Codex HIGH 4) — THE ANSWER DECIDES WHAT IS RECORDED.
+  if (!enqueued.queued && enqueued.reason === 'not-configured') {
+    // The chart's connector does not post invoice updates. What `isAccountingSyncTypeEnabled === false`
+    // used to mean here, and it stays silent for the same reason: nothing will ever post, nothing is owed.
+    return
+  }
+  if (!enqueued.queued) {
+    await deps.logActivity({
+      entityType: 'SALES_ORDER',
+      entityId: params.salesOrderId,
+      action: 'sales_invoice_update_not_queued',
+      tag: 'accounting',
+      level: 'ERROR',
+      description:
+        `NOTHING WAS QUEUED for the sales invoice update for ${params.orderNumber}, but the order is updated in `
+        + `IMS. The accounting queue REFUSED it (an unresolved earlier attempt, a deleted order, a stale discount, `
+        + `or an accounting connector change under the write — see the accounting activity log), so accounting `
+        + `invoice ${params.accountingInvoiceId} still shows the PREVIOUS version and nothing retries this on its `
+        + 'own. Re-save the order once the cause is resolved, or correct the invoice by hand in the ledger.',
+      metadata: {
+        accountingInvoiceId: params.accountingInvoiceId,
+        orderNumber: params.orderNumber,
+        idempotencyKey: params.idempotencyKey,
+        enqueueReason: enqueued.reason ?? null,
+        enqueueConnector: enqueued.connector,
+      },
+    })
+    return
+  }
   await deps.logActivity({
     entityType: 'SALES_ORDER',
     entityId: params.salesOrderId,
     action: 'sales_invoice_update_queued',
     tag: 'accounting',
     level: 'INFO',
-    description: `Queued sales invoice update for ${params.orderNumber} against accounting invoice ${params.accountingInvoiceId}`,
+    description: enqueued.reason === 'already-queued'
+      ? `Sales invoice update for ${params.orderNumber} against accounting invoice ${params.accountingInvoiceId} was already queued`
+      : `Queued sales invoice update for ${params.orderNumber} against accounting invoice ${params.accountingInvoiceId}`,
     metadata: {
       accountingInvoiceId: params.accountingInvoiceId,
       orderNumber: params.orderNumber,
       idempotencyKey: params.idempotencyKey,
+      alreadyQueued: enqueued.reason === 'already-queued',
     },
   })
 }

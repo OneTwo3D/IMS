@@ -783,6 +783,50 @@ export async function isAccountingSyncTypeEnabledFor(
   return (await getAccountingPostingContextFor(connector, type)) !== null
 }
 
+/**
+ * o3d-j625 r4 (Codex HIGH 2, HIGH 3) — "WILL THIS POST?" ASKED OF THE CHART'S CONNECTOR, WITH "THE CHART
+ * HAS BEEN RETIRED" KEPT APART FROM "THIS TYPE IS SWITCHED OFF".
+ *
+ * THE DEFECT, the original o3d-j625 shape through a resolver the r2/r3 sweeps did not recognise. A site
+ * read one connector's chart (`getAccountingSettings()`), built its decision from it, and then asked
+ * {@link isAccountingSyncTypeEnabled} — which RESOLVES THE ACTIVE CONNECTOR AGAIN. A switch in between
+ * made that answer `false`, and `false` was read as "posting is off": the supplier credit note was
+ * committed POSTED with no ACCPAYCREDIT, the bill edit returned `skipped-disabled`, and in both cases the
+ * enqueue's own chart guard was never reached because the enqueue was never called. A second resolution
+ * does not have to ROUTE anything to be the defect; it only has to DECIDE something.
+ *
+ * WHY A VERDICT AND NOT A BOOLEAN. The two `false`s mean opposite things for what is owed:
+ *
+ *   post            the chart's connector is the active one and posts this type.
+ *   not-configured  the chart's connector is still the active one and does not post this type (sync or
+ *                   the type is switched off). INFORMATIONAL: nothing will ever post, nothing is owed.
+ *   chart-retired   the chart's connector is no longer the active one. A REFUSAL: the posting is OWED to
+ *                   books that are not being serviced, and a caller must surface it, never skip quietly.
+ *   no-chart        the chart was read while no connector was on. Nothing to post to.
+ *
+ * The active connector IS read here — once, and only to COMPARE with the chart, never to route or to
+ * choose settings — which is the same predicate `refuseUnattributableChart` answers. `isAccountingSync-
+ * TypeEnabledFor` alone would not do: it answers about the named connector's own toggles and says
+ * nothing about whether that connector is still the one this system is running.
+ */
+export type ChartPostingVerdict =
+  | { verdict: 'post'; connector: AccountingConnectorInfo['id'] }
+  | { verdict: 'not-configured'; connector: AccountingConnectorInfo['id'] }
+  | { verdict: 'chart-retired'; chartConnector: AccountingConnectorInfo['id']; activeConnector: AccountingConnectorInfo['id'] | null }
+  | { verdict: 'no-chart' }
+
+export async function accountingPostingVerdictForChart(
+  chartConnector: AccountingConnectorInfo['id'] | null,
+  type: AccountingSyncType,
+): Promise<ChartPostingVerdict> {
+  if (chartConnector === null) return { verdict: 'no-chart' }
+  const activeConnector = await getActiveAccountingConnectorId()
+  if (activeConnector !== chartConnector) return { verdict: 'chart-retired', chartConnector, activeConnector }
+  return (await getAccountingPostingContextFor(chartConnector, type)) === null
+    ? { verdict: 'not-configured', connector: chartConnector }
+    : { verdict: 'post', connector: chartConnector }
+}
+
 export async function queueAccountingSyncTx(
   tx: Prisma.TransactionClient,
   params: {

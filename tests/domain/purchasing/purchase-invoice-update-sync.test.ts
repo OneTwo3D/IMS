@@ -83,7 +83,7 @@ test('maybeQueuePurchaseInvoiceUpdate queues Xero PURCHASE_INVOICE_UPDATE when e
   }
   const deps: PurchaseInvoiceUpdateSyncDeps<typeof tx> = {
     recordTransitSubledgerMovement: async () => {},
-    isAccountingSyncTypeEnabled: async () => true,
+    postingVerdictForChart: async (chart) => (chart ? { verdict: 'post' as const, connector: chart } : { verdict: 'no-chart' as const }),
     queueAccountingSyncTx: async (_tx, input) => {
       queueCalls.push(input)
       return true
@@ -121,7 +121,7 @@ test('maybeQueuePurchaseInvoiceUpdate logs unsupported connector without queuein
   }
   const deps: PurchaseInvoiceUpdateSyncDeps<typeof tx> = {
     recordTransitSubledgerMovement: async () => {},
-    isAccountingSyncTypeEnabled: async () => true,
+    postingVerdictForChart: async (chart) => (chart ? { verdict: 'post' as const, connector: chart } : { verdict: 'no-chart' as const }),
     queueAccountingSyncTx: async (_tx, input) => {
       queueCalls.push(input)
       return true
@@ -155,7 +155,7 @@ test('maybeQueuePurchaseInvoiceUpdate skips disabled sync type without warning l
   }
   const deps: PurchaseInvoiceUpdateSyncDeps<typeof tx> = {
     recordTransitSubledgerMovement: async () => {},
-    isAccountingSyncTypeEnabled: async () => false,
+    postingVerdictForChart: async (chart) => (chart ? { verdict: 'not-configured' as const, connector: chart } : { verdict: 'no-chart' as const }),
     queueAccountingSyncTx: async (_tx, input) => {
       queueCalls.push(input)
       return true
@@ -181,7 +181,7 @@ test('maybeQueuePurchaseInvoiceUpdate skips bills without external accounting id
   }
   const deps: PurchaseInvoiceUpdateSyncDeps<typeof tx> = {
     recordTransitSubledgerMovement: async () => {},
-    isAccountingSyncTypeEnabled: async () => true,
+    postingVerdictForChart: async (chart) => (chart ? { verdict: 'post' as const, connector: chart } : { verdict: 'no-chart' as const }),
     queueAccountingSyncTx: async (_tx, input) => {
       queueCalls.push(input)
       return true
@@ -203,7 +203,7 @@ test('maybeQueuePurchaseInvoiceUpdate records the signed transit delta (new − 
   const transitRows: Array<{ sourceType: string; sourceRef: string; idempotencyKey: string; baseDelta: number; journalDate: string }> = []
   const tx = { activityLog: { create: async (_input: ActivityLogCreateCall) => {} } }
   const deps: PurchaseInvoiceUpdateSyncDeps<typeof tx> = {
-    isAccountingSyncTypeEnabled: async () => true,
+    postingVerdictForChart: async (chart) => (chart ? { verdict: 'post' as const, connector: chart } : { verdict: 'no-chart' as const }),
     queueAccountingSyncTx: async () => true,
     recordTransitSubledgerMovement: async (_tx, input) => {
       transitRows.push({ ...input, baseDelta: Number(input.baseDelta) })
@@ -230,7 +230,7 @@ test('maybeQueuePurchaseInvoiceUpdate does not record a transit row when the upd
   const transitRows: unknown[] = []
   const tx = { activityLog: { create: async (_input: ActivityLogCreateCall) => {} } }
   const deps: PurchaseInvoiceUpdateSyncDeps<typeof tx> = {
-    isAccountingSyncTypeEnabled: async () => true,
+    postingVerdictForChart: async (chart) => (chart ? { verdict: 'post' as const, connector: chart } : { verdict: 'no-chart' as const }),
     queueAccountingSyncTx: async () => true,
     recordTransitSubledgerMovement: async (_tx, input) => { transitRows.push(input) },
   }
@@ -249,7 +249,7 @@ test('maybeQueuePurchaseInvoiceUpdate does not record a transit row when the que
   const transitRows: unknown[] = []
   const tx = { activityLog: { create: async (_input: ActivityLogCreateCall) => {} } }
   const deps: PurchaseInvoiceUpdateSyncDeps<typeof tx> = {
-    isAccountingSyncTypeEnabled: async () => true,
+    postingVerdictForChart: async (chart) => (chart ? { verdict: 'post' as const, connector: chart } : { verdict: 'no-chart' as const }),
     // queue declines (e.g. no active posting context) — no GL counterpart exists.
     queueAccountingSyncTx: async () => false,
     recordTransitSubledgerMovement: async (_tx, input) => { transitRows.push(input) },
@@ -266,4 +266,29 @@ test('maybeQueuePurchaseInvoiceUpdate does not record a transit row when the que
   // not, and the caller's activity log recorded the edit as pushed on the strength of it.
   assert.equal(result, 'refused')
   assert.equal(transitRows.length, 0)
+})
+
+// o3d-j625 r4 (Codex HIGH 3) — a chart whose connector is no longer active is a REFUSAL, not a skip.
+test('[o3d-j625 r4] maybeQueuePurchaseInvoiceUpdate REFUSES when the chart’s connector has been retired — never skipped-disabled', async () => {
+  const tx = { activityLog: { create: async (_input: ActivityLogCreateCall) => {} } }
+  let enqueues = 0
+  const asked: Array<[unknown, unknown]> = []
+  // The race in the finding: the chart is Xero's, and by the time the gate asks, the active connector is a
+  // QuickBooks that does not post bill updates. `isAccountingSyncTypeEnabled` — the dependency this seam
+  // used to take — answers `false` in that state, and it is supplied here too (by cast: it is no longer in
+  // the type) so that the old code, run against this test, takes its `skipped-disabled` exit instead of
+  // failing on a missing function.
+  const deps = {
+    isAccountingSyncTypeEnabled: async () => false,
+    postingVerdictForChart: async (chart: 'xero' | 'quickbooks' | null, type: 'PURCHASE_INVOICE_UPDATE') => {
+      asked.push([chart, type])
+      return { verdict: 'chart-retired' as const, chartConnector: 'xero' as const, activeConnector: 'quickbooks' as const }
+    },
+    queueAccountingSyncTx: async () => { enqueues++; return true },
+    recordTransitSubledgerMovement: async () => {},
+  } as unknown as PurchaseInvoiceUpdateSyncDeps<typeof tx>
+  const result = await maybeQueuePurchaseInvoiceUpdate(baseParams(tx, deps))
+  assert.deepEqual(asked, [['xero', 'PURCHASE_INVOICE_UPDATE']], 'the verdict is asked OF THE CHART’S connector')
+  assert.equal(result, 'refused-chart-retired')
+  assert.equal(enqueues, 0)
 })
