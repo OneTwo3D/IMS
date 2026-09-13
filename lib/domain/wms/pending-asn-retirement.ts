@@ -311,7 +311,17 @@ export const UNCREDITED_ASN_MAP_WHERE = {
   },
 } as const satisfies Prisma.WmsAsnMapWhereInput
 
-/** Thrown when the backstop refuses a delete the locked decision said was safe. */
+/**
+ * Thrown when the backstop refuses a delete the locked decision said was safe.
+ *
+ * THROWN, AND IT ROLLS BACK THE CALLER'S TRANSACTION ON PURPOSE (o3d-zzgp r4). By the
+ * time it is raised the disposal itself has written nothing — the refused delete changed
+ * no row — so what the rollback discards is whatever the CALLER wrote earlier in the same
+ * transaction (the reservation path's demotion of a stale in-flight claim). That is the
+ * intended result: firing means credit was written without the locks this transaction's
+ * reads relied on, so none of those reads should be acted on. It must never be converted
+ * into a returned refusal; that would commit decisions taken on untrustworthy reads.
+ */
 export class PendingAsnDisposalBackstopError extends Error {
   override readonly name = 'PendingAsnDisposalBackstopError'
 
@@ -324,7 +334,11 @@ export class PendingAsnDisposalBackstopError extends Error {
   }
 }
 
-/** Thrown when a locked re-read finds a line row the step-4 lock did not cover. */
+/**
+ * Thrown when a locked re-read finds a line row the step-4 lock did not cover.
+ * Raised before the disposal writes anything, and rolls the caller's transaction back
+ * deliberately for the same reason as the backstop error above.
+ */
 export class PendingAsnLineNotLockedError extends Error {
   override readonly name = 'PendingAsnLineNotLockedError'
 

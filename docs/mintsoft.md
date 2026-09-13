@@ -99,6 +99,10 @@ Applied corrections log `mintsoft_align_down_applied` (WARNING) with before/afte
   check and the delete; it waits on the transfer row and re-reads afterwards. The delete also refuses
   a header whose lines visibly hold credit, but that is a backstop only — it is evaluated against the
   delete statement's own snapshot and does not stop a credit that commits mid-statement.
+  A retirement (or the delete of an uncredited emptied reservation) is COMMITTED even when the same
+  attempt then refuses the create — "nothing outstanding", "not linked to a Mintsoft product": the
+  reservation transaction returns the refusal and the action raises it after commit, because a refusal
+  thrown inside the transaction would roll the retirement back and leave the reservation open.
   Purchase-order ASN reservations still delete on retry (see below).
 - Mintsoft callback metadata preserves the source type, source line, product, and expected quantity.
 - Booked-in webhook receipt is idempotent via `wms_inbound_receipt_events`.

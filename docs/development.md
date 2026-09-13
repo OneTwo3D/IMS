@@ -65,13 +65,31 @@ npm run test:concurrency   # RUN_DB_CONCURRENCY_TESTS=1                         
 npm run test:db            # RUN_DB_RETENTION_TESTS=1 REQUIRE_DB_RETENTION_TESTS=1 -> tests/db/**
 ```
 
+**Point `DATABASE_URL` at a scratch database you created for the run, never at a shared one.** The
+concurrency tier seeds fixture rows into whatever database the URL reaches. Files that also install
+DDL — currently `pending-asn-disposal-race` and `pending-asn-retirement-commit` — refuse to start,
+before any connection writes, unless `tests/concurrency/scratch-database-guard.ts` positively
+identifies the database: its name must match `ims_scratch_*` AND
+`IMS_CONCURRENCY_SCRATCH_DB` must name that exact database. For example:
+
+```bash
+createdb -O imsdev ims_scratch_$(date +%s)
+export DATABASE_URL=postgresql://imsdev:…@localhost:5432/ims_scratch_<suffix>
+export IMS_CONCURRENCY_SCRATCH_DB=ims_scratch_<suffix>
+npx prisma migrate deploy && npm run test:concurrency
+dropdb ims_scratch_<suffix>
+```
+
+The other 30 files have no such guard yet and seed before checking anything (tracked as o3d-yvn8).
+
 **Neither tier is absent from `npm run test:unit`, and only one of the two is gated end to end.**
 `test:unit`'s glob is `tests/**/*.test.ts`, so it collects `tests/concurrency/**` and `tests/db/**`
 along with everything else. What they then DO under it differs, and the difference is what you need
 in order to read a green `test:unit` log correctly:
 
-* `tests/concurrency/**` — all 22 files gate every test on `RUN_DB_CONCURRENCY_TESTS`, so under
-  `test:unit` the tier is collected, reports `# SKIP`, and executes nothing.
+* `tests/concurrency/**` — all 32 files (counted 2026-09-13) gate every test on
+  `RUN_DB_CONCURRENCY_TESTS`, so under `test:unit` the tier is collected, reports `# SKIP`, and
+  executes nothing.
 * `tests/db/**` — exactly ONE of the nine files is gated on a `RUN_DB_*` variable. The other eight
   run under `test:unit`, four of them in full and four of them minus their live probes.
 

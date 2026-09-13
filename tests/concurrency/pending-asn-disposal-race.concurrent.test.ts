@@ -1,6 +1,9 @@
 import assert from 'node:assert/strict'
 import test, { mock } from 'node:test'
+import { randomUUID } from 'node:crypto'
 import { config } from 'dotenv'
+
+import { assertScratchDatabaseBeforeAnyWrite } from './scratch-database-guard'
 
 /**
  * o3d-zzgp round 3 — Codex HIGH: A LIVE CHECK IS NOT A HELD CHECK.
@@ -23,9 +26,9 @@ import { config } from 'dotenv'
  * ═════════════════════════════════════════════════════════════════════════════════
  *
  * A statement-level `BEFORE DELETE` trigger on `wms_asn_maps` waits on an advisory lock
- * this test holds. It is conditioned on `application_name`, which this process — and no
- * other test file — sets on its application pool, so a parallel file's deletes are never
- * parked. A statement-level trigger fires before the statement locks any row, so the park
+ * this test holds. It is conditioned on a random per-run GUC, `o3d.zzgp_park_token`, which
+ * this process sets on its application pool's startup options and on nothing else, so a
+ * parallel file's deletes — and a later run's — are never parked. A statement-level trigger fires before the statement locks any row, so the park
  * adds NO row lock of its own: whatever blocks the alignment while the delete is parked
  * is a lock the code under test took earlier in its transaction, or nothing.
  *
@@ -49,13 +52,25 @@ import { config } from 'dotenv'
  *      BLOCKED by the disposal's backend, waiting on `stock_transfers`, on a lock that is
  *      not advisory. Checked after the money so the control reports its data loss first.
  *
- * Needs a real PostgreSQL. Run only with RUN_DB_CONCURRENCY_TESTS=1 against a scratch
- * database: it installs and drops a trigger.
+ * Needs a real PostgreSQL. It seeds rows and installs a trigger, so it refuses to start
+ * unless tests/concurrency/scratch-database-guard.ts positively identifies the database as
+ * a scratch database the operator named (o3d-zzgp r4).
  */
 
 const RUN = process.env.RUN_DB_CONCURRENCY_TESTS === '1'
 const APP_NAME = `o3d-zzgp-r3-${process.pid}`
-const TRIGGER = `zzgp_r3_park_${process.pid}`
+/**
+ * ONE FIXED NAME, and a trigger that holds nothing for anyone but this run (o3d-zzgp r4,
+ * Codex HIGH-2). Round 3 named the trigger per pid, so a run that crashed before its
+ * `finally` left a trigger no later run would ever drop. Now every run first sweeps any
+ * `zzgp_%park%` trigger and function off `wms_asn_maps`, and the function parks a delete
+ * only when the deleting session carries THIS run's random `o3d.zzgp_park_token` GUC —
+ * set on the application pool's startup options and on nothing else. A leftover from a
+ * crashed run therefore matches no session that will ever exist, and parks nothing even
+ * before the next run sweeps it.
+ */
+const TRIGGER = 'zzgp_park_asn_map_delete'
+const PARK_TOKEN = randomUUID()
 const CONNECTOR = 'mintsoft' // wms-connector-boundary-ok: o3d-zzgp: a test fixture value, not a core flow branch
 const LINE_QTY = 10
 const UNIT_COST = 5
@@ -141,17 +156,26 @@ async function backendPid(session: RawClient): Promise<number> {
  * The environment, pointed at the scratch database with THIS process's application_name
  * on every pooled connection. Must run before anything imports `@/lib/db`.
  */
-function prepareEnv(): { rawUrl: string } {
-  config({ path: '.env.local', quiet: true })
-  config({ quiet: true })
-  const exported = process.env.DATABASE_URL
-  if (!exported) throw new Error('DATABASE_URL is required when RUN_DB_CONCURRENCY_TESTS=1')
-  const url = new URL(exported)
-  url.searchParams.set('application_name', APP_NAME)
-  process.env.DATABASE_URL = url.toString()
-  const raw = new URL(exported)
-  raw.searchParams.delete('application_name')
-  return { rawUrl: raw.toString() }
+let preparedEnv: Promise<{ rawUrl: string }> | null = null
+
+async function prepareEnv(): Promise<{ rawUrl: string }> {
+  preparedEnv ??= (async () => {
+    config({ path: '.env.local', quiet: true })
+    config({ quiet: true })
+    // FIRST, before any connection this file makes can write: refuse anything that is
+    // not positively a scratch database the operator named (o3d-zzgp r4, Codex HIGH-2).
+    await assertScratchDatabaseBeforeAnyWrite()
+    const exported = process.env.DATABASE_URL!
+    const url = new URL(exported)
+    url.searchParams.set('application_name', APP_NAME)
+    url.searchParams.set('options', `-c o3d.zzgp_park_token=${PARK_TOKEN}`)
+    process.env.DATABASE_URL = url.toString()
+    const raw = new URL(exported)
+    raw.searchParams.delete('application_name')
+    raw.searchParams.delete('options')
+    return { rawUrl: raw.toString() }
+  })()
+  return preparedEnv
 }
 
 type Gate = {
@@ -306,17 +330,37 @@ async function seedWorld(label: string) {
   return { db, tag, product, destination, transfer, transferLineId: transfer.lines[0]!.id, binding }
 }
 
+/** Drop every park trigger and function a previous — possibly crashed — run left behind. */
+async function sweepParkTriggers(session: RawClient) {
+  const { rows: triggers } = await session.query(
+    `SELECT tgname FROM pg_trigger WHERE tgrelid = 'wms_asn_maps'::regclass AND tgname LIKE 'zzgp\\_%park%'`,
+  )
+  for (const row of triggers) await session.query(`DROP TRIGGER IF EXISTS "${String(row.tgname)}" ON wms_asn_maps`)
+  const { rows: functions } = await session.query(
+    `SELECT p.oid::regprocedure::text AS signature FROM pg_proc p
+       JOIN pg_namespace n ON n.oid = p.pronamespace
+      WHERE n.nspname = current_schema() AND p.proname LIKE 'zzgp\\_%park%'`,
+  )
+  for (const row of functions) await session.query(`DROP FUNCTION IF EXISTS ${String(row.signature)}`)
+  return { triggers: triggers.length, functions: functions.length }
+}
+
 async function installParkTrigger(session: RawClient) {
+  const swept = await sweepParkTriggers(session)
+  if (swept.triggers + swept.functions > 0) {
+    console.log(`[zzgp-r4] swept ${swept.triggers} leftover park trigger(s) and ${swept.functions} function(s)`)
+  }
+  // The token and the advisory key are literals in the function body, so this run's
+  // function can match only sessions carrying this run's token.
   await session.query(`
-    CREATE OR REPLACE FUNCTION ${TRIGGER}() RETURNS trigger LANGUAGE plpgsql AS $fn$
+    CREATE FUNCTION ${TRIGGER}() RETURNS trigger LANGUAGE plpgsql AS $fn$
     BEGIN
-      IF current_setting('application_name', true) = '${APP_NAME}' THEN
-        PERFORM pg_advisory_xact_lock(hashtext('${APP_NAME}'));
+      IF current_setting('o3d.zzgp_park_token', true) = '${PARK_TOKEN}' THEN
+        PERFORM pg_advisory_xact_lock(hashtext('${PARK_TOKEN}'));
       END IF;
       RETURN NULL;
     END
     $fn$`)
-  await session.query(`DROP TRIGGER IF EXISTS ${TRIGGER} ON wms_asn_maps`)
   await session.query(
     `CREATE TRIGGER ${TRIGGER} BEFORE DELETE ON wms_asn_maps FOR EACH STATEMENT EXECUTE FUNCTION ${TRIGGER}()`,
   )
@@ -397,15 +441,13 @@ test(
   'rig: the park trigger holds a delete from THIS pool before it locks its row, and ignores other sessions',
   { skip: !RUN && 'set RUN_DB_CONCURRENCY_TESTS=1' },
   async () => {
-    const { rawUrl } = prepareEnv()
+    const { rawUrl } = await prepareEnv()
     const { db } = await import('@/lib/db')
     const holder = await rawSession(rawUrl)
     const probe = await rawSession(rawUrl)
     const outsider = await rawSession(rawUrl)
     let holderHasLock = false
     try {
-      const { rows: dbRows } = await probe.query('SELECT current_database() AS name')
-      assert.notEqual(dbRows[0]!.name, 'onetwo3d_ims_dev', 'REFUSING: this test installs a trigger and must run on a scratch database')
 
       // Real rows, so "holds no row lock" is a claim about a row that exists.
       const uid = `${Date.now().toString(36)}${Math.floor(Math.random() * 1_679_616).toString(36)}`.toUpperCase()
@@ -429,7 +471,7 @@ test(
 
       await installParkTrigger(holder)
       const holderPid = await backendPid(holder)
-      await holder.query('SELECT pg_advisory_lock(hashtext($1))', [APP_NAME])
+      await holder.query('SELECT pg_advisory_lock(hashtext($1))', [PARK_TOKEN])
       holderHasLock = true
 
       // THE RIG CAN FIND SOMETHING: a delete from the application pool parks.
@@ -450,8 +492,10 @@ test(
       assert.equal(lockable.length, 1, 'the parked delete\'s target must still be lockable')
       await outsider.query('ROLLBACK')
 
-      // AND IT IS SPECIFIC: a delete from a session with another application_name is not
-      // parked. A statement timeout turns "parked" into a loud failure rather than a hang.
+      // AND IT IS SPECIFIC TO THE TOKEN: a session with the SAME application_name but
+      // without this run's token is not parked. A statement timeout turns "parked" into a
+      // loud failure rather than a hang.
+      await outsider.query(`SET application_name = '${APP_NAME}'`)
       await outsider.query(`SET statement_timeout = 3000`)
       const { rowCount } = await (outsider as unknown as {
         query: (sql: string, values: unknown[]) => Promise<{ rowCount: number }>
@@ -459,12 +503,12 @@ test(
       assert.equal(rowCount, 1, 'an unrelated session\'s delete must run straight through')
 
       assert.equal(settled, false, 'still parked while the advisory lock is held')
-      await holder.query('SELECT pg_advisory_unlock(hashtext($1))', [APP_NAME])
+      await holder.query('SELECT pg_advisory_unlock(hashtext($1))', [PARK_TOKEN])
       holderHasLock = false
       const deleted = await parkedDelete
       assert.equal(deleted.count, 1, 'released, the parked delete completes')
     } finally {
-      if (holderHasLock) await holder.query('SELECT pg_advisory_unlock(hashtext($1))', [APP_NAME]).catch(() => {})
+      if (holderHasLock) await holder.query('SELECT pg_advisory_unlock(hashtext($1))', [PARK_TOKEN]).catch(() => {})
       await dropParkTrigger(holder).catch(() => {})
       await holder.end().catch(() => {})
       await probe.end().catch(() => {})
@@ -477,7 +521,8 @@ test(
   'a discarded reservation cannot lose alignment credit that commits between its credit read and its delete (Codex r3 HIGH)',
   { skip: !RUN && 'set RUN_DB_CONCURRENCY_TESTS=1' },
   async () => {
-    const { rawUrl } = prepareEnv()
+    // The guard runs inside prepareEnv, BEFORE the modules load and before the seed below.
+    const { rawUrl } = await prepareEnv()
     const { createMintsoftTransferAsn } = await loadModules()
     const { loadTransferLineLandedQty, requireLandedQty } = await import('@/lib/domain/inventory/transfer-landed-quantity')
     const { applyMintsoftAlignmentForProduct } = await import('@/lib/connectors/mintsoft/sync/stock-sync')
@@ -488,8 +533,6 @@ test(
     const probe = await rawSession(rawUrl)
     let holderHasLock = false
     try {
-      const { rows: dbRows } = await probe.query('SELECT current_database() AS name')
-      assert.notEqual(dbRows[0]!.name, 'onetwo3d_ims_dev', 'REFUSING: must run on a scratch database')
       await installParkTrigger(holder)
       const holderPid = await backendPid(holder)
 
@@ -513,7 +556,7 @@ test(
       await holder.query(`UPDATE stock_transfer_lines SET "qtyReceived" = $1 WHERE id = $2`, [RECEIVED_BEFORE_DISCARD, world.transferLineId])
 
       // (3) Park every wms_asn_maps delete from this pool, then let the action continue.
-      await holder.query('SELECT pg_advisory_lock(hashtext($1))', [APP_NAME])
+      await holder.query('SELECT pg_advisory_lock(hashtext($1))', [PARK_TOKEN])
       holderHasLock = true
       gate.release()
       const parkedPid = await waitForParkedDelete(probe, holderPid, 'discard')
@@ -533,7 +576,7 @@ test(
       const observation = await observeAlignment(probe, parkedPid, alignmentSettled)
 
       // (5) Release the disposal and let both finish.
-      await holder.query('SELECT pg_advisory_unlock(hashtext($1))', [APP_NAME])
+      await holder.query('SELECT pg_advisory_unlock(hashtext($1))', [PARK_TOKEN])
       holderHasLock = false
       const createResult = await createPromise
       const alignment = await alignmentPromise
@@ -593,7 +636,7 @@ test(
       assert.equal(Number(destinationStock.quantity), 0)
       assert.equal(creditRows.length, 0)
     } finally {
-      if (holderHasLock) await holder.query('SELECT pg_advisory_unlock(hashtext($1))', [APP_NAME]).catch(() => {})
+      if (holderHasLock) await holder.query('SELECT pg_advisory_unlock(hashtext($1))', [PARK_TOKEN]).catch(() => {})
       listingGate.current?.release()
       await dropParkTrigger(holder).catch(() => {})
       await holder.end().catch(() => {})

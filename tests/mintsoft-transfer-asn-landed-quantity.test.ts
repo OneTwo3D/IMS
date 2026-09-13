@@ -98,12 +98,14 @@ let asnMaps: AsnMapRow[] = []
 let asnLines: AsnLineRow[] = []
 let transferLines: TransferLineSeed[] = []
 let nextId = 0
+let transactionRollbacks = 0
 const createAsnCalls: Array<{ lines: Array<{ sourceLineId: string; sku: string; quantity: number }> }> = []
 const landedLookups: Array<Record<string, unknown>> = []
 
 function seed(lines: TransferLineSeed[], options: { withPendingReservation?: boolean } = {}) {
   transferLines = lines
   nextId = 0
+  transactionRollbacks = 0
   createAsnCalls.length = 0
   landedLookups.length = 0
   asnMaps = []
@@ -389,9 +391,29 @@ const db: Record<string, unknown> = {
   },
   wmsSyncLog: { createMany: async () => ({ count: 1 }) },
   $queryRaw: async () => [{ id: TRANSFER_ID }],
+  // ROLLBACK SEMANTICS (o3d-zzgp r4, Codex HIGH-1). Round 3's fake ran the callback and
+  // kept every write even when the callback then threw — the opposite of a Prisma
+  // interactive transaction, which rolls back everything before the throw. That is how a
+  // retirement followed by a refusal thrown in the same transaction looked "retired" here
+  // while PostgreSQL undid it. The store is now snapshotted on entry and restored if the
+  // callback throws. It is still a fake: the real-transaction proof is
+  // tests/concurrency/pending-asn-retirement-commit.concurrent.test.ts.
   $transaction: async (arg: unknown) => {
     if (typeof arg !== 'function') return Promise.all(arg as unknown[])
-    return (arg as (tx: unknown) => Promise<unknown>)(db)
+    const snapshot = {
+      asnMaps: asnMaps.map((row) => ({ ...row })),
+      asnLines: asnLines.map((row) => ({ ...row })),
+      nextId,
+    }
+    try {
+      return await (arg as (tx: unknown) => Promise<unknown>)(db)
+    } catch (error) {
+      asnMaps = snapshot.asnMaps
+      asnLines = snapshot.asnLines
+      nextId = snapshot.nextId
+      transactionRollbacks += 1
+      throw error
+    }
   },
 }
 
@@ -499,6 +521,29 @@ function openMaps() {
 }
 
 // ---------------------------------------------------------------------------
+
+test('o3d-zzgp rig: a transaction that writes and then throws leaves the store as it found it (r4)', async () => {
+  // Without this, the round-3 fake ran the callback with no rollback at all, and a
+  // write followed by a throw in the same transaction looked like a kept write.
+  seed([{ id: 'tl-1', sku: 'SKU-1', productId: 'p-1', qty: '10', qtyReceived: '0', pending: { expectedQty: '10', snapshot: '6' } }])
+  const transaction = db.$transaction as (fn: (tx: typeof db) => Promise<unknown>) => Promise<unknown>
+
+  await assert.rejects(transaction(async () => {
+    await wmsAsnMapDelegate.update({ where: { id: ASN_MAP_ID }, data: { closedAt: new Date('2026-01-03T00:00:00Z') } })
+    await wmsAsnLineMapDelegate.update({ where: { id: 'al-tl-1' }, data: { expectedQty: '6.0000', note: 'retired' } })
+    throw new Error('refusal thrown inside the transaction')
+  }), /refusal thrown inside the transaction/)
+
+  assert.equal(transactionRollbacks, 1, 'the throw must have been seen as a rollback')
+  assert.equal(asnMaps[0]!.closedAt, null, 'closedAt written before the throw is rolled back')
+  assert.equal(Number(asnLines[0]!.expectedQty), 10, 'expectedQty written before the throw is rolled back')
+  assert.equal(asnLines[0]!.note, null, 'note written before the throw is rolled back')
+
+  await transaction(async () => {
+    await wmsAsnMapDelegate.update({ where: { id: ASN_MAP_ID }, data: { closedAt: new Date('2026-01-03T00:00:00Z') } })
+  })
+  assert.notEqual(asnMaps[0]!.closedAt, null, 'and a transaction that returns keeps its writes')
+})
 
 test('o3d-zzgp rig: the store cascades an ASN-map delete to its line maps', async () => {
   // If this did not hold, the HIGH-1 case below could pass with the defect present:
