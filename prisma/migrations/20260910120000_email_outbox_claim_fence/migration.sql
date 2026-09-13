@@ -67,8 +67,13 @@
 -- sending, and NOTHING IN THE DATABASE DISTINGUISHES THOSE. Keep the wrong one and its reclaim
 -- mails a second copy on top of a send that already went out. There is no ranking that is safe
 -- here and no way to find out from inside a migration, so it stops with an actionable message
--- rather than guessing. The window is small and self-clearing: the drain settles a claimed row
--- within its stale window, so re-running after a few minutes is the whole remedy.
+-- rather than guessing. THIS IS NOT SELF-CLEARING, and waiting is not a remedy (r38, correcting a
+-- sentence that stood here until then and said the drain settles a claimed row within its stale
+-- window, so that re-running after a few minutes was the whole remedy). Nothing settles a PROCESSING
+-- row by the passage of time: the stale window is an ELIGIBILITY THRESHOLD, not a settlement deadline,
+-- and before this migration succeeds the drain that becomes eligible is the UNFENCED one. The remedy
+-- is the ordered one in the HINT below — stop the drain, decide each row out of band, settle by hand,
+-- resolve and redeploy, and only then re-enable the drain — and the block after this one says why.
 --
 -- WHY IT IS OUT HERE INSTEAD OF UNDER THE LOCK. MEASURED, not reasoned about, against a real
 -- throwaway database running `prisma migrate deploy`:
@@ -208,7 +213,11 @@ ALTER TABLE "email_outbox" ADD COLUMN "lockedBy" TEXT;
 --   1 PROCESSING + PENDING-> keep the PROCESSING row, FAIL the PENDING ones. The only row
 --                            that may have sent is retained, and the retained row's future
 --                            sends are exactly what they would have been with no duplicate at
---                            all (one reclaim after the stale window, fenced by PART 1).
+--                            all: elapsed-time reclaim after the stale window, which is NOT
+--                            bounded at one — a reclaimer can itself be reclaimed a window later,
+--                            so successive sends are unbounded in count for this row exactly as
+--                            for any single row (lib/email-outbox.ts, o3d-hpeg; r38 corrected
+--                            "one reclaim" here) — with the RE-ARM fenced by PART 1.
 --   1 PROCESSING alone    -> not a duplicate; untouched.
 --   2+ PROCESSING         -> REFUSED. See the guard above, before BEGIN.
 --   any + SENT/FAILED     -> the SENT/FAILED rows are invisible to this statement and to the

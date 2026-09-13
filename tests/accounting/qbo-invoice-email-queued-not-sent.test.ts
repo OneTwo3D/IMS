@@ -485,12 +485,13 @@ test('r18: the sentence\'s cadences match the cron config and the cron doc, and 
     `the record's cadences do not match the repo's: sweep ${sweep[1]}, drain ${drain[1]}`,
   )
 
-  // AND NO OTHER CADENCE IS NAMED ANYWHERE IN THE RECORD (round 33). The match above is EXISTENTIAL:
-  // it finds the corrected sentence and says nothing about a second cadence sentence sitting beside
-  // it, which is the whole-file weakness round 33's HIGH was about. This arm is UNIVERSAL over the
-  // rendered record — every cadence this walk has words for, other than the two it resolved, must be
-  // absent — so a stale "the drain runs every five minutes" added elsewhere in the record fails here
-  // instead of being excused by the corrected sentence.
+  // AND NO OTHER CADENCE THIS WALK HAS WORDS FOR IS NAMED IN THE RECORD (round 33; scope restated in
+  // round 38). The match above is EXISTENTIAL: it finds the corrected sentence and says nothing about a
+  // second cadence sentence sitting beside it, which is the whole-file weakness round 33's HIGH was
+  // about. This arm is an absence check over the whole rendered record, but only for the cadence
+  // phrasings in `SWEEP_CADENCE_WORDS` and `DRAIN_CADENCE_WORDS` other than the two it resolved — so a
+  // stale "the drain runs every five minutes" fails here instead of being excused by the corrected
+  // sentence, while a stale cadence in words those maps lack ("each quarter-hour") is not reached.
   const namedCadences = new Set([sweepWords, drainWords])
   for (const words of new Set([...Object.values(SWEEP_CADENCE_WORDS), ...Object.values(DRAIN_CADENCE_WORDS)])) {
     if (namedCadences.has(words)) continue
@@ -619,22 +620,28 @@ const CITATIONS: Array<{ citedIn: string; citation: string; resolvesIn: string; 
 // SO THE UNIT OF CHECKING IS THE PARAGRAPH, NOT THE FILE — the same treatment round 31 gave the
 // four-site residue claims in tests/email-outbox-claim-fence.test.ts. Each site is one comment
 // PARAGRAPH, located by an anchor that must match EXACTLY ONE paragraph and whose block must be a
-// substantial one, and at that site:
+// substantial one, and at that site (scope of each bullet restated in round 38 — every recogniser below
+// is an enumeration of wordings, and the bullets used to read as if they were not):
 //   * A SENTENCE THERE STATES THE CORRECTED CLAIM — the duplicate needs the timing to CROSS A DRAIN
-//     — and every sentence that says "crosses a drain" is a sentence about the duplicate, so the
-//     qualifier cannot be stranded in a paragraph away from the claim it qualifies;
-//   * NO SENTENCE THERE ASSERTS AN UNCONDITIONAL SECOND DELIVERY. "Both are delivered", with no
-//     drain condition in the same sentence, is refused AT THAT SITE rather than excused by a
-//     correction elsewhere in the file;
-//   * NO SENTENCE THERE NAMES ANY DURATION WITHOUT NAMING THE SOURCE THAT DURATION RESOLVES FROM, in
-//     either case (round 34; until then the exception was the WORD "lease", and that is what let the
-//     dead-letter gate in — and round 35, which removed the last value exemption and made the
-//     durations themselves be FOUND rather than enumerated).
+//     — and every sentence containing the literal phrase "crosses a drain" also matches
+//     `ABOUT_THE_DUPLICATE`, so the qualifier cannot be stranded in a paragraph away from the claim it
+//     qualifies (a paraphrase of the qualifier is not held to this);
+//   * NO SENTENCE THERE ASSERTS A SECOND DELIVERY IN A WORDING `ASSERTS_A_SECOND_DELIVERY` LISTS
+//     WITHOUT A DRAIN CONDITION `DRAIN_CONDITION` LISTS. "Both are delivered", with no drain condition
+//     in the same sentence, is refused AT THAT SITE rather than excused by a correction elsewhere in
+//     the file; "an extra copy arrives" is not on the list and is not refused;
+//   * NO SENTENCE THERE NAMES A DURATION IN THE CHECKED VOCABULARY WITHOUT NAMING THE SOURCE THAT
+//     DURATION RESOLVES FROM, in either case (round 34; until then the exception was the WORD "lease",
+//     and that is what let the dead-letter gate in — and round 35, which removed the last value
+//     exemption and found durations by PATTERN over that vocabulary rather than from a list of expected
+//     values; "one week" is outside the vocabulary — see ROUND 37).
 //
-// AND THE CLAIM IS MADE ONLY AT THOSE SITES. A file-wide sweep requires every paragraph of these two
-// files that names ANY duration AT ALL (round 35: found by shape, not drawn from a list) to be one of
-// the located sites, or to name the source that duration resolves from, so a window claim that drifts
-// into an unwatched paragraph fails here instead of being a fourth round of the same finding.
+// AND THE CLAIM IS MADE ONLY AT THOSE SITES — AS FAR AS THE VOCABULARY REACHES. A file-wide sweep
+// requires every paragraph of these two files that names a duration IN THE CHECKED VOCABULARY to be one
+// of the located sites, or to name the source that duration resolves from, so a window claim written in
+// that vocabulary that drifts into an unwatched paragraph fails here. (This paragraph said "ANY duration
+// AT ALL … found by shape, not drawn from a list" until round 38; that was the universality round 37
+// withdrew everywhere else.)
 //
 // ---------------------------------------------------------------------------
 // ROUND 34 (Codex HIGH 1) — THE GUARD ROUND 33 ADDED WAS ENFORCING A NUMBER NOTHING PRODUCES.
@@ -660,7 +667,7 @@ const CITATIONS: Array<{ citedIn: string; citation: string; resolvesIn: string; 
 // WHAT THIS DOES NOT ESTABLISH, stated because that is what this round is about. (i) Double-quoted
 // spans are removed before sentences are examined, because quoting is how these files DISOWN a claim
 // ("This used to say …"); an overclaim written inside double quotes would pass. (ii) The sweep is
-// over DURATIONS only (round 35: every duration, by shape), not over delivery claims, so a paragraph
+// over DURATIONS only (and only those in the checked vocabulary — see ROUND 37), not over delivery claims, so a paragraph
 // outside the three sites that asserts an unconditional second delivery while naming no window at all
 // is not reached — the stale-park test's own "Round 3 asserted that … and both are delivered"
 // paragraph is exactly that shape, and it is past-tense disowning rather than asserting. (iii) It is
@@ -898,7 +905,8 @@ const ABOUT_THE_DUPLICATE = /duplicate|second (?:row|copy|email|time)|emailed a 
  *
  * Both windows are stated in identical English ("a PROCESSING row goes stale after N minutes"), which
  * is the third time on this branch that two windows so described have produced a wrong edit. So the
- * rule is no longer about a word: EVERY duration a sentence names must name, in that same sentence,
+ * rule is no longer about a word: a duration a sentence names — in the vocabulary the sweep checks, see
+ * ROUND 37; round 34 wrote "EVERY duration" here — must name, in that same sentence,
  * the constant (or documented row) it comes from — and that source must really RESOLVE to the
  * duration named, because the resolved value is what supplies the words. A number with no named
  * source is refused, and a number with the wrong named source is refused too.
@@ -1083,9 +1091,9 @@ test('r22: the reclaim window is the RESOLVED constant, and BOTH copies of the r
   const groupOf = (ms: number) => String(ms).replace(/\B(?=(\d{3})+(?!\d))/g, '_')
   const grouped = groupOf(reclaimMs)
   // THE RECONCILE CADENCE, out of the same cron table. The WooCommerce entry's prose states it as a
-  // duration ("once a day", "up to 24 hours"), and round 35's sweep finds durations by shape, so this
-  // one now has to RESOLVE as well — an unsourced day in that paragraph was invisible to round 34's
-  // enumeration, which had no entry for 86_400_000 at all.
+  // duration ("once a day", "up to 24 hours"), and "day" and "24 hours" are in the vocabulary round 35's
+  // sweep matches, so this one now has to RESOLVE as well — an unsourced day in that paragraph was
+  // invisible to round 34's list of expected values, which had no entry for 86_400_000.
   const reconcileRow =
     /^\|\s*`\/api\/cron\/wc-reconcile`\s*\|[^|]*\|\s*([^|]+?)\s*\|/m.exec(read('help-docs/settings.md'))
   assert.ok(
@@ -1104,9 +1112,11 @@ test('r22: the reclaim window is the RESOLVED constant, and BOTH copies of the r
   // The ms come from the constants and the cron table, never from this list, so the pairing cannot
   // drift: change a constant and the number it supplies changes with it. THIS IS A LIST OF SOURCES AND
   // NOT OF EXPECTED DURATIONS — round 34's sweep looked for the durations IT had enumerated, which is
-  // why an unsourced `960_000 ms` or "sixteen minutes" passed it; the durations are now found by shape
-  // (see `durationsInTheCheckedVocabulary`) and this list only answers "what could a number in this prose have come
-  // from". `reclaimMs` is here too, and no value is exempted from having to name one of these.
+  // why an unsourced `960_000 ms` or "sixteen minutes" passed it; durations are now found by pattern
+  // over the checked vocabulary of units and spelled quantities (see `durationsInTheCheckedVocabulary`
+  // and ROUND 37 for what that vocabulary leaves out) and this list only answers "what could a number
+  // in this prose have come from". `reclaimMs` is here too, and no value is exempted from having to
+  // name one of these.
   const namedDurations: Array<{ token: string; ms: number }> = [
     { token: 'xeroAccountingEntry', ms: reclaimMs },
     // The DEFAULT lease, because `outbox-registry.ts` states it too: the WooCommerce stock entry's
@@ -1190,7 +1200,8 @@ test('r22: the reclaim window is the RESOLVED constant, and BOTH copies of the r
       )
     }
 
-    // (4b) AND NO SENTENCE HERE ASSERTS A SECOND DELIVERY UNCONDITIONALLY. This is the exact shape
+    // (4b) AND NO SENTENCE HERE ASSERTS A SECOND DELIVERY UNCONDITIONALLY — IN THE WORDINGS
+    // `ASSERTS_A_SECOND_DELIVERY` LISTS (r38 scope; see its docstring). This is the exact shape
     // round 33 found: "…inserts a SECOND row. Both are delivered." — true only once a drain has
     // settled the first copy, asserted here as though the reclaim alone did it.
     const unconditional = sentences.filter(
@@ -1390,8 +1401,10 @@ test('r22: the reclaim window is the RESOLVED constant, and BOTH copies of the r
     + 'count here is not evidence that every duration in this prose was reached — see the ROUND 37 block.)',
   )
 
-  // (5) EVERY CITATION RESOLVES, AND NONE OF THEM IS A LINE NUMBER. A line number is falsified by
-  // any edit above it and cannot be checked; an anchor can be, so it is.
+  // (5) EVERY CITATION LISTED IN `CITATIONS` RESOLVES, AND THE ONE PARAGRAPH THAT USED A LINE NUMBER
+  // HAS NOT GONE BACK TO ONE. A line number is falsified by any edit above it and cannot be checked; an
+  // anchor can be, so it is. (Scope, r38: a citation not entered in `CITATIONS` is not resolved, and the
+  // file:line check reads only unrecorded-posted-document.ts, for two path shapes.)
   for (const citation of CITATIONS) {
     const citing = read(citation.citedIn)
     assert.ok(
