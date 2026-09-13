@@ -94,7 +94,7 @@ export function buildStockMovementValueFields(params: {
  * production writers that never reach this one — opening stock, purchase receipt, PO
  * cancellation reversal, customer-return inbound, the positive half of a stock adjustment,
  * the adjustment-edit addition branch, the WooCommerce and CSV historical imports, the
- * Mintsoft allocation sync, and three WMS booked-in paths. Negative-basis cover comes from
+ * WMS stock-sync allocation path, and three WMS booked-in paths. Negative-basis cover comes from
  * BOTH builders refusing (25 production call sites between them), not from this one being a
  * funnel. The TWELVE call sites that do reach here — five direct, seven via
  * `buildStockMovementValueFieldsFromConsumed` — are the FIFO-consumption and
