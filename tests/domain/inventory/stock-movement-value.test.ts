@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict'
-import { readFileSync } from 'node:fs'
+import { readFileSync, readdirSync } from 'node:fs'
+import path from 'node:path'
 import test from 'node:test'
 
 import { Prisma, StockMovementType } from '../../../app/generated/prisma/client.ts'
@@ -117,6 +118,84 @@ test('stock movement value fields normalize negative quantities to movement magn
   )
 })
 
+// o3d-gd2f. Four subsystems disagreed about the sign of a credit-derived
+// (negative-basis) cost layer: the movement value absolutised it, cogs_entries kept it,
+// and both connector journals emit a COGS pair only above zero. These pin the ONE thing
+// that is well-defined without deciding how a negative basis should behave: the builder
+// must not silently discard the sign the caller established. The sibling
+// buildStockMovementValueFields has always thrown on a negative unit cost; the
+// from-total form now enforces the same invariant.
+
+test('o3d-gd2f: a positive quantity with a negative total is REFUSED, not absolutised', () => {
+  // On the pre-fix builder this returned { unitCostBase: '2.500000', totalValueBase:
+  // '10.000000' } — a -£10 basis booked as a +£10 movement that looks entirely ordinary.
+  assert.throws(
+    () => buildStockMovementValueFieldsFromTotal({ qty: 4, totalValueBase: -10 }),
+    (error: unknown) => {
+      assert.ok(error instanceof Error, `expected an Error, got ${String(error)}`)
+      assert.match(error.message, /unit cost must be zero or greater/)
+      // The message must name the offending pair, or an operator cannot act on it.
+      assert.match(error.message, /-10\.000000/)
+      assert.match(error.message, /4\.000000/)
+      return true
+    },
+  )
+})
+
+test('o3d-gd2f: an inconsistent negative-quantity/positive-total pair is REFUSED', () => {
+  // The mirror of the case above. qty is a magnitude (a negative stored qty is itself a
+  // CRITICAL stock_movement_negative_quantity invariant finding), so this pair is
+  // incoherent rather than an outbound convention, and the implied unit cost is negative.
+  assert.throws(
+    () => buildStockMovementValueFieldsFromTotal({ qty: -4, totalValueBase: 10 }),
+    /unit cost must be zero or greater/,
+  )
+})
+
+test('o3d-gd2f: FIFO consumption of a negative-cost layer is REFUSED at the shared builder', () => {
+  // The path the round-5 transfer-receipt refusal never covered: a layer already carrying
+  // a negative unitCostBase (recalculateLandedCosts distributes credit freight lines with
+  // no positivity filter and grossUnitCostBase has no floor) being consumed by an ordinary
+  // sale, TRANSFER_OUT, supplier return, manufacturing run or stock adjustment. Pre-fix
+  // this produced a POSITIVE movement value while cogsEntryDataFromConsumed wrote the same
+  // consumption NEGATIVE into cogs_entries.
+  assert.throws(
+    () => buildStockMovementValueFieldsFromConsumed([
+      { qty: new Prisma.Decimal('4'), unitCostBase: new Prisma.Decimal('-1') },
+    ], new Prisma.Decimal('4')),
+    /unit cost must be zero or greater/,
+  )
+})
+
+test('o3d-gd2f: a mixed-cost consumption that still NETS positive is unaffected', () => {
+  // The refusal must be about the net basis, not about any negative appearing anywhere:
+  // this is the precondition that proves the guard is not simply rejecting everything.
+  const fields = buildStockMovementValueFieldsFromConsumed([
+    { qty: new Prisma.Decimal('4'), unitCostBase: new Prisma.Decimal('3') },
+    { qty: new Prisma.Decimal('1'), unitCostBase: new Prisma.Decimal('-1') },
+  ], new Prisma.Decimal('5'))
+  // net total 11 over 5 units → 2.200000, and the DB CHECK still holds.
+  assert.deepEqual(fields, { unitCostBase: '2.200000', totalValueBase: '11.000000' })
+  const dbCheck = new Prisma.Decimal('5').mul(fields.unitCostBase).toDecimalPlaces(6).toFixed(6)
+  assert.equal(fields.totalValueBase, dbCheck)
+})
+
+test('o3d-gd2f: zero-value and zero-cost movements are still accepted', () => {
+  // The other half of "the guard is not vacuous the other way": a £0 balancing layer
+  // (the transfer helper's BALANCE_AT_ZERO_COST policy) and the historical-import
+  // zero-cost sentinel must both keep working.
+  assert.deepEqual(
+    buildStockMovementValueFieldsFromTotal({ qty: 7, totalValueBase: 0 }),
+    { unitCostBase: '0.000000', totalValueBase: '0.000000' },
+  )
+  assert.deepEqual(
+    buildStockMovementValueFieldsFromConsumed([
+      { qty: new Prisma.Decimal('2'), unitCostBase: new Prisma.Decimal('0') },
+    ], new Prisma.Decimal('2')),
+    { unitCostBase: '0.000000', totalValueBase: '0.000000' },
+  )
+})
+
 test('stock movement value fields reject negative unit costs', () => {
   assert.throws(
     () => buildStockMovementValueFields({ qty: 1, unitCostBase: -1 }),
@@ -169,6 +248,12 @@ test('all stock movement enum values are covered by the reporting value contract
   )
 })
 
+// NOTE ON WHAT THIS TEST DOES *NOT* DO (o3d-gd2f round 2). The `assert.match` below is an
+// EXISTENTIAL whole-file check: it proves each movement type has an active writer and that
+// somewhere in that writer's file the value helper is named. It does NOT count call sites,
+// so it would pass unchanged if a writer gained a new unhelpered movement write, and it
+// would pass unchanged if a call site moved to a file not listed here. Do not cite it as
+// coverage of the call-site set — that is the census test immediately below.
 test('active stock movement writer files route reporting values through the helper', () => {
   const writerFilesByType: Partial<Record<StockMovementType, string[]>> = {
     ADJUSTMENT: ['app/actions/stock.ts', 'app/actions/purchase-orders.ts'],
@@ -196,4 +281,114 @@ test('active stock movement writer files route reporting values through the help
 
   assert.match(STOCK_MOVEMENT_VALUE_SOURCE_BY_TYPE.KIT_ASSEMBLY_IN, /reserved legacy type/)
   assert.match(STOCK_MOVEMENT_VALUE_SOURCE_BY_TYPE.KIT_ASSEMBLY_OUT, /reserved legacy type/)
+})
+
+// o3d-gd2f round 2: the EXACT production call-site census of the three value builders.
+//
+// Why this exists. The decision document claimed a thirteenth call site "would be caught by
+// the writer-coverage test". That was false: the writer-coverage test above is an
+// existential whole-file string match and counts nothing. This test counts. It walks the
+// whole of app/ and lib/ and asserts the per-file invocation count of each builder, so
+// ADDING, MOVING or REMOVING a call site anywhere — including in a file no previous test
+// names — fails here until the census is deliberately updated.
+//
+// It also fixes the census the refusal's reach is described by. `...FromTotal` is NOT a
+// choke point for every costed movement: the plain sibling has thirteen production callers
+// that never reach it. Negative-basis cover comes from BOTH builders refusing.
+const EXPECTED_BUILDER_CALL_SITES: Record<string, Record<string, number>> = {
+  // Reached via the from-total form: five direct invocations.
+  buildStockMovementValueFieldsFromTotal: {
+    'app/actions/manufacturing.ts': 1,
+    'app/actions/transfers.ts': 2,
+    'lib/connectors/mintsoft/sync/stock-sync.ts': 1,
+    'lib/domain/wms/booked-in-service.ts': 1,
+  },
+  // Reached via the from-consumed form, which delegates to the from-total form: seven.
+  buildStockMovementValueFieldsFromConsumed: {
+    'app/actions/manufacturing.ts': 2,
+    'app/actions/purchase-orders.ts': 1,
+    'app/actions/stock.ts': 1,
+    'app/actions/transfers.ts': 1,
+    'lib/domain/inventory/stock-adjustment-apply.ts': 1,
+    'lib/domain/sales/shipment-service.ts': 1,
+  },
+  // The SIBLING, which enforces the same non-negative invariant independently and is NOT
+  // reached through the from-total form at all: thirteen.
+  buildStockMovementValueFields: {
+    'app/actions/manufacturing.ts': 1,
+    'app/actions/purchase-orders.ts': 1,
+    'app/actions/stock.ts': 1,
+    'app/actions/wc-import.ts': 1,
+    'lib/connectors/mintsoft/sync/stock-sync.ts': 1,
+    'lib/connectors/woocommerce/orders.ts': 1,
+    'lib/domain/inventory/opening-stock.ts': 1,
+    'lib/domain/inventory/stock-adjustment-apply.ts': 1,
+    'lib/domain/purchasing/po-cancellation.ts': 1,
+    'lib/domain/sales/refund-service.ts': 1,
+    'lib/domain/wms/booked-in-service.ts': 3,
+  },
+}
+
+test('o3d-gd2f: the value builders have EXACTLY this census of production call sites', () => {
+  const definitionFile = 'lib/domain/inventory/stock-movement-value.ts'
+  const skipDirs = new Set(['node_modules', 'generated'])
+  const files: string[] = []
+  const walk = (dir: string): void => {
+    for (const entry of readdirSync(dir, { withFileTypes: true })) {
+      if (skipDirs.has(entry.name)) continue
+      const entryPath = path.posix.join(dir, entry.name)
+      if (entry.isDirectory()) walk(entryPath)
+      else if (/\.tsx?$/.test(entry.name)) files.push(entryPath)
+    }
+  }
+  for (const root of ['app', 'lib']) walk(root)
+
+  // PRECONDITION, asserted rather than assumed: without this the census below would
+  // compare {} against {} and pass vacuously if the walk reached nothing (wrong cwd,
+  // renamed directory, a throwing readdir swallowed upstream).
+  assert.ok(
+    files.length > 400,
+    `the walk must reach the app/lib tree; it scanned only ${files.length} files`,
+  )
+  assert.ok(
+    files.includes(definitionFile),
+    `the walk must reach ${definitionFile} (which is then deliberately excluded as the definition site)`,
+  )
+
+  const actual: Record<string, Record<string, number>> = {}
+  for (const builder of Object.keys(EXPECTED_BUILDER_CALL_SITES)) actual[builder] = {}
+  for (const file of [...files].sort()) {
+    if (file === definitionFile) continue
+    const source = readFileSync(file, 'utf8')
+    for (const builder of Object.keys(EXPECTED_BUILDER_CALL_SITES)) {
+      // `name(` is an INVOCATION. An import specifier (`name,`), a type position
+      // (`typeof name>`) and a prose/backtick reference all lack the paren and are
+      // correctly not counted. `buildStockMovementValueFields\(` cannot match the
+      // FromTotal/FromConsumed forms, whose identifiers continue past `Fields`.
+      const matches = source.match(new RegExp(`${builder}\\(`, 'g')) ?? []
+      if (matches.length > 0) actual[builder]![file] = matches.length
+    }
+  }
+
+  const total = (census: Record<string, number>): number =>
+    Object.values(census).reduce((sum, count) => sum + count, 0)
+
+  // Print the counts, so a failure shows what was actually found, not just that it differed.
+  console.log(
+    `[o3d-gd2f census] files scanned ${files.length} · ` +
+    Object.entries(actual).map(([builder, census]) =>
+      `${builder.replace('buildStockMovementValueFields', '…')}=${total(census)} in ${Object.keys(census).length} files`,
+    ).join(' · '),
+  )
+
+  assert.deepEqual(
+    actual,
+    EXPECTED_BUILDER_CALL_SITES,
+    'the builder call-site census changed. If you added, moved or removed a call site, update ' +
+    'EXPECTED_BUILDER_CALL_SITES *and* the reach description in the from-total docblock and in ' +
+    'docs/todo/negative-basis-cost-layers-decision.md §5, which quote these counts.',
+  )
+  assert.equal(total(actual.buildStockMovementValueFieldsFromTotal!), 5, 'five direct from-total call sites')
+  assert.equal(total(actual.buildStockMovementValueFieldsFromConsumed!), 7, 'seven from-consumed call sites')
+  assert.equal(total(actual.buildStockMovementValueFields!), 13, 'thirteen sibling call sites')
 })
