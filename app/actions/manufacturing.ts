@@ -6,7 +6,7 @@ import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
 import { requireInternalUser, requirePermission } from '@/lib/auth/server'
 import { enqueueStockSync } from '@/lib/shopping'
-import { queueAccountingSyncTx, getAccountingSettings, accountingPostingVerdictForChart } from '@/lib/accounting'
+import { queueAccountingSyncTx, getAccountingSettings, accountingPostingVerdictForChart, type AccountingSettings } from '@/lib/accounting'
 import { postingIsOwed, reportPostingNotQueued, type EnqueueOutcomeLike } from '@/lib/domain/accounting/enqueue-outcome'
 import {
   addCostLayerSourceLines,
@@ -1535,6 +1535,13 @@ async function recalculateManufacturingCostLayers(
   // and the companion MANUFACTURING_RECLASS journal share ONE nonce — an A→B→A
   // cost edit must post (or dedup) both together, never just one (cogs-audit scjz.33).
   recalcRunId: string,
+  /**
+   * o3d-j625 r4 (SWEEP 1): the chart the companion MANUFACTURING_RECLASS is built from, handed to the
+   * shipment COGS refresh so its COGS_REVERSAL rows and its batch-ownership decision are about the SAME
+   * connector as the reclass that nets their delta. `null` = no reclass chart (not posting): the refresh
+   * then reads its own, once.
+   */
+  reclassChart: AccountingSettings | null,
 ): Promise<{ cogsDeltaBase: number; inventoryDeltaBase: number }> {
   const po = await tx.productionOrder.findUnique({
     where: { id: productionOrderId },
@@ -1611,7 +1618,10 @@ async function recalculateManufacturingCostLayers(
     }
 
     await updateSnapshotsForCostLayerChange(tx, li.id, r.newUnitCostBase)
-    const shipmentRefresh = await refreshShipmentCogsForCostLayerChange(tx, li.id, { recalcRunId })
+    const shipmentRefresh = await refreshShipmentCogsForCostLayerChange(tx, li.id, {
+      recalcRunId,
+      ...(reclassChart ? { accountingSettings: reclassChart } : {}),
+    })
     // audit-3aph: the shipment path owns the sold-finished-goods COGS revaluation
     // (COGS_REVERSAL now / daily batch later), so subtract it from the reclass
     // journal's COGS leg to avoid double-posting COGS for sold units.
@@ -1720,7 +1730,7 @@ export async function updateManufacturingCostLines(
         // the recalc) and the MANUFACTURING_RECLASS key below, so an A→B→A edit
         // posts/dedups both together (cogs-audit scjz.33).
         const recalcRunId = randomUUID()
-        const deltas = await recalculateManufacturingCostLayers(tx, productionOrderId, recalcRunId)
+        const deltas = await recalculateManufacturingCostLayers(tx, productionOrderId, recalcRunId, reclassChart)
         cogsDeltaBase = deltas.cogsDeltaBase
         inventoryDeltaBase = deltas.inventoryDeltaBase
 

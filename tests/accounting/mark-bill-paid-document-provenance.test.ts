@@ -36,6 +36,8 @@ const state = {
   enqueued: [] as Array<{ type: string; chartConnector: unknown; documentConnector: unknown; payload: Record<string, unknown> }>,
   committedPaid: [] as unknown[],
   activity: [] as Array<{ action: string; metadata?: Record<string, unknown> }>,
+  activeSettingsReads: 0,
+  settingsForReads: [] as Array<string | null>,
 }
 
 mock.module('@/lib/auth', {
@@ -55,7 +57,9 @@ mock.module('@/lib/accounting', {
   namedExports: {
     listAccountingBankAccountsWithChart: async () => ({ connector: state.chart, accounts: [{ id: 'BANK-1', code: null, name: 'Bank' }] }),
     listAccountingBankAccounts: async () => [],
-    getAccountingSettings: async () => ({ syncEnabled: false, connector: state.chart }),
+    getAccountingSettings: async () => { state.activeSettingsReads++; return { syncEnabled: false, connector: state.chart } },
+    // o3d-j625 r4 (SWEEP 1): the realised-FX read after the payment is asked FOR the bank account's chart.
+    getAccountingSettingsFor: async (connector: string | null) => { state.settingsForReads.push(connector); return { syncEnabled: false, connector } },
     getActiveAccountingConnectorInfo: async () => ({ id: state.chart, name: state.chart }),
     isAccountingSyncTypeEnabled: async () => true,
     asRoutableAccountingConnector: (value: string | null | undefined) => (value === 'xero' || value === 'quickbooks' ? value : null),
@@ -112,6 +116,8 @@ test.beforeEach(() => {
   state.enqueued = []
   state.committedPaid = []
   state.activity = []
+  state.activeSettingsReads = 0
+  state.settingsForReads = []
 })
 
 test('[o3d-j625 r3 HIGH 2] PRECONDITION: an agreeing bill is paid, and the enqueue is handed the bill’s recorded provenance', async () => {
@@ -162,4 +168,13 @@ test('[o3d-j625 r3 HIGH 2] a NOT-CONFIGURED decline still gets the settings word
   assert.equal(result.success, false)
   assert.equal(state.committedPaid.length, 0)
   assert.match(String(result.error), /switched off/)
+})
+
+test('[o3d-j625 r4 SWEEP 1] the realised-FX journal after a bill payment reads the BANK ACCOUNT’S chart, not the active connector’s', async () => {
+  state.chart = 'xero'
+  state.enqueueAnswer = { queued: true, connector: 'xero' }
+  const result = await pay()
+  assert.equal(result.success, true, 'PRECONDITION: the payment was recorded, so the FX step was reached')
+  assert.deepEqual(state.settingsForReads, ['xero'], 'the FX chart is read FOR the connector the payment was committed under')
+  assert.equal(state.activeSettingsReads, 0, 'and not re-resolved')
 })

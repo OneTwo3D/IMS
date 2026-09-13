@@ -5,7 +5,7 @@ import { z } from 'zod'
 import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
 import { requirePermission } from '@/lib/auth/server'
-import { queueAccountingSync, queueAccountingSyncTx, getAccountingSettings, getActiveAccountingConnectorInfo, isAccountingSyncTypeEnabledFor, listAccountingBankAccounts, listAccountingBankAccountsWithChart, asRoutableAccountingConnector, accountingPostingVerdictForChart, type AccountingBankAccount } from '@/lib/accounting'
+import { queueAccountingSync, queueAccountingSyncTx, getAccountingSettings, getAccountingSettingsFor, getActiveAccountingConnectorInfo, isAccountingSyncTypeEnabledFor, listAccountingBankAccounts, listAccountingBankAccountsWithChart, asRoutableAccountingConnector, accountingPostingVerdictForChart, type AccountingBankAccount } from '@/lib/accounting'
 import { postingIsOwed, reportPostingNotQueued, type EnqueueOutcomeLike } from '@/lib/domain/accounting/enqueue-outcome'
 import { accountingPayloadKey } from '@/lib/accounting/payload-key'
 import { multiComponentTaxRateNames } from '@/lib/accounting/multi-component-warning'
@@ -3964,7 +3964,13 @@ export async function markBillPaid(
     }
 
     try {
-      const accountingSettings = await getAccountingSettings()
+      // o3d-j625 r4 (SWEEP 1): THE BANK ACCOUNT'S CHART, not a fresh resolution. The BILL_PAYMENT above was
+      // committed under `bankAccountChartConnector`; the realised gain/loss on that settlement belongs in
+      // the same books. `getAccountingSettings()` re-resolved the active connector here, so a switch after
+      // the payment either silently skipped the FX journal (the new connector's sync off) or built it from
+      // the other ledger's AP/FX accounts. Read FOR the payment's connector, a retired chart now reaches the
+      // enqueue and is refused and reported there.
+      const accountingSettings = await getAccountingSettingsFor(bankAccountChartConnector)
       const accounts = getRealisedFxAccounts(accountingSettings, 'payable')
       if (accountingSettings.syncEnabled && accounts && invoice.po.currency !== baseCurrency) {
         const realised = computeRealisedFx({

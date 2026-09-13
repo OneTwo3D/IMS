@@ -752,7 +752,32 @@ async function getAccountingPostingContextFor(connector: string, type: Accountin
  * app/api/cron/accounting-daily-batch/route.ts.
  */
 export async function isDailyBatchPostingEnabled(): Promise<boolean> {
-  const connector = await getActiveAccountingConnectorId()
+  return dailyBatchPostingEnabledFor(await getActiveAccountingConnectorId())
+}
+
+/**
+ * o3d-j625 r4 (SWEEP 1) — THE SAME QUESTION, ASKED OF A CHART'S CONNECTOR.
+ *
+ * `refreshShipmentCogsForCostLayerChange` uses the answer to decide whether an un-journaled shipment's
+ * revaluation delta belongs to the daily batch — and if it does, the delta is REMOVED from the caller's
+ * COGS journal. Asked of "the active connector" after the chart had been read, a switch in between could
+ * answer about a batch other than the one whose books the journal is built for: the delta leaves that
+ * journal and the batch that would have carried it is no longer the one that runs.
+ *
+ * `true` only when the chart's connector is STILL the active one (the daily batch cron runs the active
+ * connector's batch and no other) AND its batch posts. Every other answer is `false`, which is the safe
+ * direction: the delta stays in the journal, and the journal refuses at its own enqueue if the chart has
+ * been retired.
+ */
+export async function isDailyBatchPostingEnabledForChart(
+  chartConnector: AccountingConnectorInfo['id'] | null,
+): Promise<boolean> {
+  if (chartConnector === null) return false
+  if (await getActiveAccountingConnectorId() !== chartConnector) return false
+  return dailyBatchPostingEnabledFor(chartConnector)
+}
+
+async function dailyBatchPostingEnabledFor(connector: AccountingConnectorInfo['id'] | null): Promise<boolean> {
   if (!connector) return false
   if (connector === 'xero') {
     const { getXeroSettings } = await import('@/lib/connectors/xero/settings')

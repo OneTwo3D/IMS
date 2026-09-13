@@ -8,7 +8,7 @@
  */
 
 import type { Prisma, StockMovementType } from '@/app/generated/prisma/client'
-import { accountingPostingVerdictForChart, getAccountingSettings, isDailyBatchPostingEnabled, queueAccountingSyncTx } from '@/lib/accounting'
+import { accountingPostingVerdictForChart, getAccountingSettings, isDailyBatchPostingEnabledForChart, queueAccountingSyncTx } from '@/lib/accounting'
 import { parseCostLayerSnapshot, serializeCostLayerSnapshot, sumCostLayerSnapshot } from '@/lib/cost-layer-snapshots'
 import { TRANSFER_STATUSES_WITH_OUTSTANDING_SOURCE_CONSUMPTION } from '@/lib/domain/inventory/movement-cogs-relevance'
 import { getInventoryConstraintMessage } from '@/lib/domain/inventory/prisma-errors'
@@ -1194,6 +1194,16 @@ export async function refreshShipmentCogsForCostLayerChange(
 
   let updated = 0
   let cogsRevaluationDelta = toDecimal(0)
+  // o3d-j625 r4 (SWEEP 1) — ONE CHART FOR THE WHOLE CALL, and every connector question below is asked
+  // OF IT. This used to read `getAccountingSettings()` afresh inside each journaled shipment's revaluation
+  // and ask `isDailyBatchPostingEnabled()` — a separate resolution — for the un-journaled ones, so within
+  // one landed-cost recalculation the COGS_REVERSAL rows and the batch-ownership decision could each be
+  // about a different connector. Resolved lazily (only when a shipment needs it) and at most once.
+  let chart: ShipmentCogsRevaluationSyncOptions['accountingSettings'] | null | undefined = options.accountingSettings
+  const chartForCall = async () => {
+    if (chart === undefined) chart = await getAccountingSettings().catch(() => null)
+    return chart
+  }
   // Resolved lazily on the first un-journaled shipment, then reused, so a
   // settings read happens at most once per call (audit-gbzh).
   let dailyBatchPosts: boolean | null = null
@@ -1223,12 +1233,17 @@ export async function refreshShipmentCogsForCostLayerChange(
       // count it as shipment-owned (so the caller drops it from the COGS journal)
       // if that posting is actually enabled; otherwise leave it for the journal so
       // the delta isn't lost (audit-3aph).
-      const posted = await queueShipmentCogsRevaluationSync(tx, {
-        shipmentId: shipment.id,
-        costLayerId,
-        oldCogsBase: currentShipment.cogsBatchAmount,
-        newCogsBase: cogs,
-      }, options)
+      const callChart = await chartForCall()
+      const posted = callChart
+        ? await queueShipmentCogsRevaluationSync(tx, {
+          shipmentId: shipment.id,
+          costLayerId,
+          oldCogsBase: currentShipment.cogsBatchAmount,
+          newCogsBase: cogs,
+        }, { ...options, accountingSettings: callChart })
+        // No readable chart: exactly what `queueShipmentCogsRevaluationSync` answered for an unreadable
+        // settings read — nothing posted here, so the delta stays in the caller's journal.
+        : false
       if (posted) cogsRevaluationDelta = addMoney(cogsRevaluationDelta, shipmentDelta)
     } else {
       // Not yet journaled → the daily batch posts the updated cogsBatchAmount
@@ -1236,7 +1251,9 @@ export async function refreshShipmentCogsForCostLayerChange(
       // batch is actually enabled; otherwise it posts nowhere, so leave the delta
       // in the COGS journal (audit-gbzh).
       if (dailyBatchPosts === null) {
-        dailyBatchPosts = await (options.isDailyBatchPostingEnabled ?? isDailyBatchPostingEnabled)()
+        // o3d-j625 r4 (SWEEP 1): asked of the call's chart, not re-resolved — see isDailyBatchPostingEnabledForChart.
+        dailyBatchPosts = await (options.isDailyBatchPostingEnabled
+          ?? (async () => isDailyBatchPostingEnabledForChart((await chartForCall())?.connector ?? null)))()
       }
       if (dailyBatchPosts) cogsRevaluationDelta = addMoney(cogsRevaluationDelta, shipmentDelta)
     }
