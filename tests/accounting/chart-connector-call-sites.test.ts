@@ -666,12 +666,17 @@ test('[o3d-j625 r2] `chartConnector` is declared REQUIRED on both enqueues and o
   // Matched on the BLANKED code, so a doc comment describing the shape cannot stand in for a
   // declaration — and with a wildcard inside the index, because `blankNonCode` empties string bodies:
   // `AccountingConnectorInfo['id']` reads as `AccountingConnectorInfo['  ']` there.
+  //
+  // o3d-j625 r4: FIVE. The two chart-scoped verdicts (`accountingPostingVerdictForChart`,
+  // `isDailyBatchPostingEnabledForChart`) take the same REQUIRED parameter, for the same reason — an optional
+  // one would let a caller fall back to asking the active connector, which is the defect they replace.
   const required = code.match(/chartConnector:\s*AccountingConnectorInfo\[[^\]]*\]\s*\|\s*null/g) ?? []
   assert.equal(
     required.length,
-    3,
-    'expected the required declaration on refuseUnattributableChart, queueAccountingSync and '
-    + `queueAccountingSyncTx — found ${required.length}. ${JSON.stringify(required)}`,
+    5,
+    'expected the required declaration on refuseUnattributableChart, queueAccountingSync, '
+    + 'queueAccountingSyncTx, accountingPostingVerdictForChart and isDailyBatchPostingEnabledForChart — found '
+    + `${required.length}. ${JSON.stringify(required)}`,
   )
 
   // The chart object's own connector, which is what every site above passes. Required for the same

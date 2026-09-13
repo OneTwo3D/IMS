@@ -95,7 +95,10 @@ const CREDIT_NOTE = {
 }
 
 function transactionClient(pending: Array<() => void>) {
-  return {
+  // Any model the enqueue reads that this file does not model answers "nothing there" — a missing
+  // delegate would otherwise throw and the control case would fail for a reason unrelated to the gate.
+  const empty = { findFirst: async () => null, findUnique: async () => null, findMany: async () => [], count: async () => 0 }
+  const modelled = {
     supplierCreditNote: {
       updateMany: async () => { pending.push(() => { committed.posted++ }); return { count: 1 } },
     },
@@ -111,21 +114,30 @@ function transactionClient(pending: Array<() => void>) {
     $executeRaw: async () => 1,
     $queryRaw: async () => [],
   }
+  return new Proxy(modelled as Record<string, unknown>, {
+    get: (target, key: string) => (key in target ? target[key] : empty),
+  })
 }
 
+const dbModelled: Record<string, unknown> = {
+  supplierCreditNote: { findUnique: async () => CREDIT_NOTE },
+  setting: { findUnique: async () => null },
+  accountingToken: { findFirst: async () => null },
+  $transaction: async <T>(fn: (tx: unknown) => Promise<T>): Promise<T> => {
+    const pending: Array<() => void> = []
+    const result = await fn(transactionClient(pending))
+    for (const apply of pending) apply()
+    return result
+  },
+}
 mock.module('@/lib/db', {
   namedExports: {
-    db: {
-      supplierCreditNote: { findUnique: async () => CREDIT_NOTE },
-      setting: { findUnique: async () => null },
-      accountingToken: { findFirst: async () => null },
-      $transaction: async <T>(fn: (tx: unknown) => Promise<T>): Promise<T> => {
-        const pending: Array<() => void> = []
-        const result = await fn(transactionClient(pending))
-        for (const apply of pending) apply()
-        return result
-      },
-    },
+    // Unmodelled models answer "nothing there", for the reason given on the transaction client.
+    db: new Proxy(dbModelled, {
+      get: (target, key: string) => (key in target
+        ? target[key]
+        : { findFirst: async () => null, findUnique: async () => null, findMany: async () => [], count: async () => 0 }),
+    }),
   },
 })
 

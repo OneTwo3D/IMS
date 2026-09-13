@@ -158,7 +158,9 @@ test('[o3d-j625 r3] every production accounting enqueue HANDS ITS ANSWER TO SOME
   // round 3 (plus the adapter's own call inside lib/accounting.ts). A floor, so a new site does not fail
   // this for the wrong reason; printed, so a shrinking sweep is visible.
   console.log(`[o3d-j625 r3] enqueue call sites examined: ${sites.length}`)
-  assert.ok(sites.length >= 27, `expected at least 27 enqueue call sites, found ${sites.length}: the detector is not seeing its subjects`)
+  // o3d-j625 r4: 46 — the r3 27 facade calls plus the direct connector queue calls (`queueXeroSync`,
+  // `queueQuickBooksSync`, both processors' `enqueueFollowUpSyncLog`) the census now also covers.
+  assert.ok(sites.length >= 46, `expected at least 46 enqueue call sites, found ${sites.length}: the detector is not seeing its subjects`)
 
   const bad = sites.filter((site) => !CONSUMED.has(site.verdict))
   assert.deepEqual(
@@ -187,6 +189,10 @@ test('[o3d-j625 r3] the census covers every file r3 enumerated', () => {
     'lib/domain/purchasing/landed-cost-service.ts',
     'lib/domain/purchasing/purchase-invoice-update-sync.ts',
     'lib/domain/sales/allocation-service.ts',
+    // o3d-j625 r4: the direct connector queue callers.
+    'lib/domain/sales/sales-invoice-update-sync.ts',
+    'lib/connectors/xero/sync-processor.ts',
+    'lib/connectors/quickbooks/sync-processor.ts',
   ]) {
     assert.ok(files.has(expected), `the census no longer examines ${expected}`)
   }
@@ -252,4 +258,22 @@ test('[o3d-j625 r3] an unrecognised prefix FAILS CLOSED as UNCLASSIFIED rather t
   assert.deepEqual(verdicts(`
     const x = cond ? await queueAccountingSync({ type: 'X', payload, chartConnector }) : null
   `), ['UNCLASSIFIED'])
+})
+
+test('[o3d-j625 r4] FIRES on a discarded DIRECT connector queue call — the sales-invoice-update shape', () => {
+  assert.deepEqual(verdicts(`
+    if (!(await deps.isAccountingSyncTypeEnabled('SALES_INVOICE_UPDATE'))) return
+    await deps.queueXeroSync({ type: 'SALES_INVOICE_UPDATE', payload })
+    await deps.logActivity({ action: 'sales_invoice_update_queued' })
+  `), ['DISCARDED'])
+  assert.deepEqual(verdicts(`
+    await queueQuickBooksSync({ type: 'X', payload })
+    const outcome = await enqueueFollowUpSyncLog('INVOICE_PDF', ref, id, payload, origin)
+  `), ['DISCARDED', 'STORED-UNREAD'])
+})
+
+test('[o3d-j625 r4] ACCEPTS the facade’s own spread delegation to a connector queue', () => {
+  assert.deepEqual(verdicts(`
+    return { ...await queueXeroSync({ ...params, pinnedLedger: params.connector }), connector }
+  `), ['argument'])
 })

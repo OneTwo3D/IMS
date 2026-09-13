@@ -24,6 +24,8 @@ import { Prisma } from '@/app/generated/prisma/client'
  */
 
 const state = {
+  activeFormAnswer: true,
+  enabledForAsked: [] as string[],
   active: 'xero' as string,
   bankBelongs: true,
   enqueueAnswer: { queued: true, connector: 'xero' } as { queued: boolean; reason?: string; connector: string | null },
@@ -75,8 +77,11 @@ mock.module('@/lib/activity-log', {
 mock.module('@/lib/domain/sales/allocation-service', { namedExports: { lockSalesOrder: async () => {} } })
 mock.module('@/lib/accounting', {
   namedExports: {
-    isAccountingSyncTypeEnabled: async () => true,
-    isAccountingSyncTypeEnabledFor: async () => true,
+    // o3d-j625 r4 (SWEEP 1): the active-connector form answers about whatever is active by the time it
+    // is asked; the connector-scoped form answers about the connector the function read. They are made
+    // to DISAGREE in the r4 test below.
+    isAccountingSyncTypeEnabled: async () => state.activeFormAnswer,
+    isAccountingSyncTypeEnabledFor: async (connector: string) => { state.enabledForAsked.push(connector); return true },
     getActiveAccountingConnectorInfo: async () => ({ id: state.active, name: state.active }),
     getPaymentAccountMap: async () => '{"card:*":"XERO-BANK-1"}',
     lookupPaymentAccount: () => 'XERO-BANK-1',
@@ -113,6 +118,8 @@ function refusals(): unknown[] {
 }
 
 test.beforeEach(() => {
+  state.activeFormAnswer = true
+  state.enabledForAsked = []
   state.active = 'xero'
   state.bankBelongs = true
   state.enqueueAnswer = { queued: true, connector: 'xero' }
@@ -166,4 +173,14 @@ test('[o3d-j625 r2 message] an enqueue that REFUSES under the lock is reported a
   assert.equal(state.queued.length, 1, 'PRECONDITION: the enqueue was reached and answered')
   assert.deepEqual(refusals(), ['POSTING_CONTEXT_CHANGED'], 'the receipt is reported as not registered')
   assert.equal(state.activity[0]?.action, 'invoice_payment_not_registered')
+})
+
+test('[o3d-j625 r4 SWEEP 1] the posting verdict is asked OF the connector this registration read — not re-resolved in parallel', async () => {
+  // The interleaving: this function reads Xero as active; by the time a separately-resolved verdict is
+  // asked, the active connector is one with payment posting off. The old code ran both reads in
+  // parallel and took SYNC_DISABLED from the second — a silent non-registration of a receipt Xero posts.
+  state.activeFormAnswer = false
+  await register()
+  assert.deepEqual(state.enabledForAsked, ['xero'], 'the verdict is asked of the connector the function resolved')
+  assert.equal(state.queued.length, 1, 'and the receipt Xero posts is registered, not silently skipped')
 })
