@@ -489,7 +489,14 @@ test(
         // NON-VACUITY. A green here would mean nothing if B never took the row: the contended
         // path has to have been REACHED for the refusal to be evidence of anything.
         assert.equal(reclaimHappened, true, 'the contended path was not reached: worker B never reclaimed')
-        assert.deepEqual(deliveries, ['worker-A', 'worker-B'], 'the reclaim itself always costs one duplicate')
+        assert.deepEqual(
+          deliveries,
+          ['worker-A', 'worker-B'],
+          'the reclaim itself costs a duplicate delivery, and no fence can prevent that one. NOT "at most '
+          + 'one" (r37, Codex r36 HIGH 2): this interleaving has two workers, so two copies is what THIS '
+          + 'scenario costs. A reclaim resets the window, so a third worker can reclaim the second one a '
+          + 'window later (lib/email-outbox.ts, o3d-hpeg)',
+        )
 
         assert.equal(workerA.conflicted, 1, "worker A's refusal is recorded rather than silent")
         // AND IT IS THE POST-SEND COUNTER (r18): A was on the socket when it lost the row, so a

@@ -651,9 +651,11 @@ const CITATIONS: Array<{ citedIn: string; citation: string; resolvesIn: string; 
 // TWO WINDOWS DESCRIBED IN IDENTICAL ENGLISH IS THE ROOT CAUSE, AND IT HAS NOW DONE THIS THREE TIMES
 // ON THIS BRANCH. `lib/email-outbox.ts` has its own fifteen minutes (`EMAIL_CLAIM_STALE_MS`, and
 // correct); the leases map has fifteen; the dead-letter gate has twenty. All three read as "a row goes
-// stale after N minutes". So the rule this round installs is not about any number: EVERY duration the
-// prose asserts must name the constant it comes from IN THE PROSE, and this guard resolves that
-// constant rather than trusting the number beside it. See `assertDurationsAreSourced`.
+// stale after N minutes". So the rule this round installs is not about any number: a duration the prose
+// asserts must name the constant it comes from IN THE PROSE, and this guard resolves that constant
+// rather than trusting the number beside it. See `assertVocabularyDurationsAreSourced` — and read the
+// ROUND 37 block below first, because the reach of that sweep is a VOCABULARY and round 34 wrote it
+// down as "EVERY duration", which it was not and is not.
 //
 // WHAT THIS DOES NOT ESTABLISH, stated because that is what this round is about. (i) Double-quoted
 // spans are removed before sentences are examined, because quoting is how these files DISOWN a claim
@@ -711,13 +713,15 @@ function windowSentences(prose: string): string[] {
 // is the same shape this branch has spent a dozen rounds removing from its other guards, reproduced
 // inside the rule written to stop it, one round after writing it.
 //
-// SO DURATIONS ARE FOUND BY SHAPE AND NOT BY LIST. `durationsNamedIn` matches a NUMERAL with a unit
-// (`900_000 ms`, `1_200_000 ms`, `24 hours`, `15 min`) and a SPELLED-OUT quantity with a unit
-// ("fifteen minutes", "sixteen minutes", "five-minute", "an hour", "twenty-five minutes"), resolves
-// each to milliseconds, and the caller then requires the SAME SENTENCE to name a source that resolves
-// to that same number. No value is exempt: a number nothing in this build produces fails for having
-// no source at all, and a number this build does produce fails unless the sentence says which
-// constant — or which documented cron row — it came from.
+// SO DURATIONS ARE FOUND BY PATTERN RATHER THAN BY A LIST OF EXPECTED VALUES.
+// `durationsInTheCheckedVocabulary` matches a NUMERAL with a unit (`900_000 ms`, `1_200_000 ms`,
+// `24 hours`, `15 min`) and a SPELLED-OUT quantity with a unit ("fifteen minutes", "sixteen minutes",
+// "five-minute", "an hour", "twenty-five minutes"), resolves each to milliseconds, and the caller then
+// requires the SAME SENTENCE to name a source that resolves to that same number. NO VALUE IS EXEMPT
+// WITHIN THAT VOCABULARY: a number nothing in this build produces fails for having no source at all,
+// and a number this build does produce fails unless the sentence says which constant — or which
+// documented cron row — it came from. What "no value is exempt" does NOT mean is "no wording is
+// missed"; see ROUND 37.
 //
 // ROUND 36 (Codex ROUND 35, HIGH 1) — THE ORDINAL EXEMPTION IS GONE, BECAUSE IT WAS NOT STRUCTURAL.
 //
@@ -747,6 +751,45 @@ function windowSentences(prose: string): string[] {
 // phrase, because English has no quantity reading of "a minutes". "one second", "two seconds", "an
 // hour", "a day" and "the hour" all remain durations, and every numeral form is checked whatever its
 // value.
+
+// ---------------------------------------------------------------------------
+// ROUND 37 (Codex r36 HIGH 3) — THE CLAIM IS RESCOPED, NOT WIDENED AGAIN. DECISION: (b).
+//
+// THE FINDING. The detector enumerates units only as far as `day` and quantities only as far as the
+// words listed below, so "one week", "a fortnight" and "a hundred minutes" produce NO MATCH — and the
+// twenty durations this prose really states keep the non-vacuity floor in (4g) satisfied while they do
+// it. Round 35 widened the vocabulary and round 36 widened it again; each round a new paraphrase
+// escaped. That is the shape of the problem and not an accident of which words were chosen: A GUARD
+// THAT MATCHES ENGLISH PROSE IS AN ENUMERATION OF PHRASINGS SOMEBODY THOUGHT OF, and there is no
+// vocabulary that closes it.
+//
+// SO THIS ROUND DOES NOT ADD "week", "fortnight" OR "hundred". It stops claiming universality instead.
+// WHAT THIS SWEEP CHECKS, EXACTLY: every duration written as a NUMERAL (any magnitude, with or without
+// `_`/`,` grouping) followed by one of the units in `DURATION_UNIT_MS`, or as one of the SPELLED
+// quantities in `DURATION_QUANTITY` (including the hyphenated tens) followed by one of those same
+// units, must name its source in the same sentence. Nothing else is examined.
+//
+// WHAT IT DOES NOT REACH, NAMED SO NOBODY HAS TO REDISCOVER IT:
+//   • A UNIT OUTSIDE `DURATION_UNIT_MS`: "a week", "a fortnight", "two months", "a quarter".
+//   • A SPELLED QUANTITY OUTSIDE `DURATION_QUANTITY`: "a hundred minutes", "a couple of hours",
+//     "several minutes", "half an hour", "ninety-odd seconds".
+//   • A WINDOW STATED WITH NO QUANTITY-AND-UNIT PAIR AT ALL: "a full drain interval later", "after
+//     the lease expires", "the window in the leases map".
+//   • ANYTHING INSIDE DOUBLE QUOTES, which `windowSentences` strips on purpose (see (i) above).
+// A stale window written any of those ways passes this sweep, and the floor in (4g) will still report a
+// healthy match count while it does — that is exactly how this finding hid, and (4g) now says so.
+//
+// WHAT ACTUALLY CARRIES THE PROPERTY IS THE STRUCTURAL HALF, AND IT IS NOT PROSE MATCHING AT ALL:
+// section (1) resolves the reclaim window out of `INTEGRATION_OUTBOX_DRAIN_LEASES_MS.xeroAccountingEntry`
+// and asserts out of the worker's own source that `CLAIM_STALE_MS` is what reaches `staleLockMs`; (4e)
+// then requires the deriving paragraphs to contain THE GROUPED NUMERAL COMPUTED FROM THAT VALUE and the
+// words computed from it, plus the tokens `xeroAccountingEntry`, `CLAIM_STALE_MS` and
+// `claimIntegrationOutboxWork`. Change the constant and those requirements change with it; no
+// paraphrase gets round them, because they are assertions about a VALUE and not about a wording. The
+// sweep below is a REGRESSION CHECK over a known vocabulary sitting on top of that, and it is kept
+// because rounds 21, 33 and 34 each wrote an unsourced number INSIDE that vocabulary. It is not, and is
+// no longer described as, a universal property of this prose.
+// ---------------------------------------------------------------------------
 
 /** Unit nouns a duration may be written in, and what ONE of each is in milliseconds. */
 const DURATION_UNIT_MS: Record<string, number> = {
@@ -799,8 +842,14 @@ const SPELLED_DURATION = new RegExp(String.raw`\b(${DURATION_QUANTITIES})[- ](${
  */
 const ARTICLE_PLUS_PLURAL = /^(?:a|an|the)[- ](?:milliseconds|secs|seconds|mins|minutes|hrs|hours|days)$/i
 
-/** EVERY DURATION A SENTENCE NAMES, found by shape. Nothing here is a list of expected values. */
-function durationsNamedIn(sentence: string): Array<{ text: string; ms: number }> {
+/**
+ * EVERY DURATION A SENTENCE NAMES **IN THE VOCABULARY ABOVE** — not every duration it names (round 37,
+ * Codex r36 HIGH 3). Nothing here is a list of expected VALUES: any magnitude of numeral is matched.
+ * But the UNITS are `DURATION_UNIT_MS` and the spelled QUANTITIES are `DURATION_QUANTITY`, so "one
+ * week", "a fortnight" and "a hundred minutes" return NOTHING from this function. The ROUND 37 block
+ * above lists the residue in full and says which half of this test carries the real property.
+ */
+function durationsInTheCheckedVocabulary(sentence: string): Array<{ text: string; ms: number }> {
   const found: Array<{ text: string; ms: number }> = []
   for (const match of sentence.matchAll(NUMERAL_DURATION)) {
     const scale = DURATION_UNIT_MS[match[2].toLowerCase()]
@@ -815,14 +864,24 @@ function durationsNamedIn(sentence: string): Array<{ text: string; ms: number }>
   return found
 }
 
-/** A sentence that says a second copy of the email goes out. */
+/**
+ * A sentence that says a second copy of the email goes out, IN ONE OF THESE WORDINGS. An enumeration,
+ * and round 37 stopped describing it as anything else: a sentence asserting a second delivery in words
+ * that are not here ("an extra copy arrives") is not matched. The list covers the wordings rounds 33-36
+ * actually found in this prose.
+ */
 const ASSERTS_A_SECOND_DELIVERY =
   /both are delivered|both were delivered|both get delivered|delivered twice|emailed twice|emailed a second time|a second (?:copy|email) (?:is|was) delivered/i
 /** …and the condition the corrected claim puts on it. */
 const DRAIN_CONDITION = /crosses a drain|once a drain|after a drain|when the timing|outside the predicate/i
 /** The corrected claim itself, as both copies state it. */
 const CROSSES_A_DRAIN = /crosses a drain/i
-/** A sentence that is about the duplicate, whatever words it uses. */
+/**
+ * A sentence that is about the duplicate, IN ONE OF THESE WORDINGS — not "whatever words it uses",
+ * which is what this comment used to claim (round 37, Codex r36 HIGH 4/5). It is a recogniser built from
+ * the nouns this prose actually uses, and a sentence that talks about a duplicate without any of them is
+ * not reached by the checks that filter on it.
+ */
 const ABOUT_THE_DUPLICATE = /duplicate|second (?:row|copy|email|time)|emailed a second|invoice twice/i
 /**
  * ROUND 34 (Codex HIGH 1) — THE EXCEPTION USED TO BE A WORD, AND THAT IS WHY THE WRONG NUMBER GOT IN.
@@ -1046,7 +1105,7 @@ test('r22: the reclaim window is the RESOLVED constant, and BOTH copies of the r
   // drift: change a constant and the number it supplies changes with it. THIS IS A LIST OF SOURCES AND
   // NOT OF EXPECTED DURATIONS — round 34's sweep looked for the durations IT had enumerated, which is
   // why an unsourced `960_000 ms` or "sixteen minutes" passed it; the durations are now found by shape
-  // (see `durationsNamedIn`) and this list only answers "what could a number in this prose have come
+  // (see `durationsInTheCheckedVocabulary`) and this list only answers "what could a number in this prose have come
   // from". `reclaimMs` is here too, and no value is exempted from having to name one of these.
   const namedDurations: Array<{ token: string; ms: number }> = [
     { token: 'xeroAccountingEntry', ms: reclaimMs },
@@ -1062,19 +1121,27 @@ test('r22: the reclaim window is the RESOLVED constant, and BOTH copies of the r
   ]
 
   /**
-   * ONE SENTENCE, EVERY DURATION IT NAMES — FOUND BY SHAPE — EACH ONE SOURCED IN THAT SAME SENTENCE.
+   * ONE SENTENCE, EVERY DURATION IT NAMES **IN THE CHECKED VOCABULARY**, EACH ONE SOURCED IN THAT SAME
+   * SENTENCE. A REGRESSION CHECK OVER A KNOWN VOCABULARY — NOT A UNIVERSAL PROPERTY OF THIS PROSE.
    *
    * NO VALUE IS EXEMPT, and that is round 35's HIGH 1. Round 34 wrote this rule as "every duration a
    * sentence names" and implemented it as a walk over the durations it had already listed, with the
    * `900_000` numeral skipped outright — the one number the rule exists to police. So the sentence
    * "FIFTEEN MINUTES IS INSIDE THE HOUR", which sources neither of the two durations it rests the
    * whole ordering on, passed a guard whose stated rule forbids it. Durations now come from
-   * `durationsNamedIn`, the sources come from `namedDurations`, and a duration nothing in this build
-   * resolves to fails for having no source at all rather than for being unlisted.
+   * `durationsInTheCheckedVocabulary`, the sources come from `namedDurations`, and a duration nothing
+   * in this build resolves to fails for having no source at all rather than for being unlisted.
+   *
+   * NO WORDING IS EXEMPT IS A DIFFERENT CLAIM, AND IT IS NOT MADE (round 37, Codex r36 HIGH 3). The
+   * units and the spelled quantities are enumerated, so "one week", "a fortnight" and "a hundred
+   * minutes" are not reached AT ALL. The ROUND 37 block above lists the whole residue and names the
+   * structural half of this test — sections (1) and (4e), which assert against VALUES computed from the
+   * constants — as the part that a paraphrase cannot get round. Do not widen this vocabulary in answer
+   * to the next escape: rounds 35 and 36 each did that and each produced a new one.
    */
   let durationsChecked = 0
-  const assertDurationsAreSourced = (where: string, sentence: string) => {
-    for (const named of durationsNamedIn(sentence)) {
+  const assertVocabularyDurationsAreSourced = (where: string, sentence: string) => {
+    for (const named of durationsInTheCheckedVocabulary(sentence)) {
       durationsChecked++
       const sources = namedDurations
         .filter((duration) => duration.ms === named.ms)
@@ -1094,8 +1161,11 @@ test('r22: the reclaim window is the RESOLVED constant, and BOTH copies of the r
         where + ': names the duration ' + JSON.stringify(named.text) + ' (' + named.ms + ' ms) without '
         + 'naming, in that same sentence, what it resolves from — ' + how + '. Rounds 21 and 33: a '
         + 'duration with no named source is how the dead-letter gate got asserted as the reclaim '
-        + 'window twice. Round 35: the rule said EVERY duration and the sweep only knew the ones it '
-        + 'had listed: ' + JSON.stringify(sentence) + ordinalHint,
+        + 'window twice. THIS SWEEP IS A REGRESSION CHECK OVER A KNOWN VOCABULARY OF UNITS AND SPELLED '
+        + 'QUANTITIES (round 37): a duration written in a unit or quantity it does not enumerate — "a '
+        + 'week", "a hundred minutes" — is not reached at all, so passing it is not evidence that every '
+        + 'duration here is sourced. The value-based half is sections (1) and (4e): '
+        + JSON.stringify(sentence) + ordinalHint,
       )
     }
   }
@@ -1129,19 +1199,22 @@ test('r22: the reclaim window is the RESOLVED constant, and BOTH copies of the r
     assert.deepEqual(
       unconditional,
       [],
-      `${site.name}: ${unconditional.length} sentence(s) here assert a second delivery with no drain `
-      + 'condition in the same sentence, which is more than the partial index allows — it REFUSES B '
-      + `while A's copy is undelivered: ${JSON.stringify(unconditional)}`,
+      `${site.name}: ${unconditional.length} sentence(s) here assert a second delivery, in one of the `
+      + 'wordings ASSERTS_A_SECOND_DELIVERY enumerates, with no drain condition in the same sentence — '
+      + 'which is more than the partial index allows: it REFUSES B while A\'s copy is undelivered. NOTE '
+      + '(round 37): both halves of this filter are enumerations, so a second delivery asserted in words '
+      + `neither pattern lists is not caught here: ${JSON.stringify(unconditional)}`,
     )
 
-    // (4c) AND EVERY OTHER DURATION NAMED HERE NAMES ITS OWN SOURCE (round 34, HIGH 1). The old rule
+    // (4c) AND EVERY OTHER DURATION NAMED HERE **IN THE CHECKED VOCABULARY** NAMES ITS OWN SOURCE
+    // (round 34, HIGH 1; rescoped in round 37, Codex r36 HIGH 3 — see the ROUND 37 block). The old rule
     // exempted any sentence containing the word "lease", which is how the DEAD-LETTER GATE's twenty
     // minutes came to be enforced here as the reclaim window. A sentence may name another duration —
     // both copies now name the gate deliberately, so that the two stop being confusable — but only by
     // naming the constant it resolves from, in that sentence. Case-insensitive, so a lower-case stale
     // claim cannot walk through the way "fifteen minutes later worker B reclaims" did in rounds 19-32.
     for (const sentence of sentences) {
-      assertDurationsAreSourced(site.name, sentence)
+      assertVocabularyDurationsAreSourced(site.name, sentence)
     }
     assert.ok(
       prose.toUpperCase().includes(reclaimWords),
@@ -1203,9 +1276,10 @@ test('r22: the reclaim window is the RESOLVED constant, and BOTH copies of the r
     )
   }
 
-  // (4f) AND THE CLAIM IS MADE ONLY AT THOSE SITES. Every paragraph of these two files that names any
-  // duration this rationale has words for must be one of the located sites, or must name the source
-  // that duration resolves from. A window claim that drifts into a paragraph nobody anchored is what
+  // (4f) AND THE CLAIM IS MADE ONLY AT THOSE SITES — AS FAR AS THE CHECKED VOCABULARY REACHES (round
+  // 37). Every paragraph of these two files that names a duration IN THAT VOCABULARY must be one of the
+  // located sites, or must name the source that duration resolves from. A paragraph that states a window
+  // in words this sweep does not enumerate is not reached here; the ROUND 37 block lists the residue. A window claim that drifts into a paragraph nobody anchored is what
   // rounds 19, 21 and 33 each were — and round 34 is the one where the anchored paragraphs were
   // "corrected" to a number nothing in the code produces, so an unanchored sentence is held to the
   // STRICTER rule here: even the resolved window has to say where it came from.
@@ -1217,7 +1291,7 @@ test('r22: the reclaim window is the RESOLVED constant, and BOTH copies of the r
       // checks above use: sourcing is a property of the sentence naming the duration, and a paragraph
       // that QUOTES a window in order to disown it is not stating one.
       for (const sentence of windowSentences(prose)) {
-        assertDurationsAreSourced(`${file}: an unanchored sentence`, sentence)
+        assertVocabularyDurationsAreSourced(`${file}: an unanchored sentence`, sentence)
       }
     }
   }
@@ -1229,13 +1303,20 @@ test('r22: the reclaim window is the RESOLVED constant, and BOTH copies of the r
   // Reaching a second worker is no longer sufficient for anything: the duplicate needs the FIRST copy
   // to have left the partial index before the second enqueue.
   //
-  // CHECKED POSITIVELY AND THEN UNIVERSALLY. Positively, because deleting the false sentence would
-  // satisfy any absence check while leaving an operator with no statement at all: the paragraph must
-  // name the refusal (`already_queued`, and the index that produces it) and must condition the
-  // duplicate on crossing a drain, in a sentence that is about the duplicate. Universally, because a
-  // correction that sits beside the claim it corrects is the shape this whole file exists for: NO
-  // sentence in EITHER reader may state the sufficiency form, quoted spans stripped, so the history
-  // may be quoted (both readers quote it) and may not be asserted.
+  // CHECKED POSITIVELY, AND THEN AGAINST A KNOWN LIST OF WORDINGS. Positively, because deleting the
+  // false sentence would satisfy any absence check while leaving an operator with no statement at all:
+  // the paragraph must name the refusal (`already_queued`, and the index that produces it) and must
+  // condition the duplicate on crossing a drain, in a sentence that is about the duplicate. That
+  // positive half is what has teeth, and it is the half a paraphrase cannot satisfy by accident.
+  //
+  // THE ABSENCE HALF IS A REGRESSION LIST, AND ROUND 37 STOPPED CALLING IT UNIVERSAL (Codex r36
+  // HIGH 4). It used to say "NO sentence in EITHER reader may state the sufficiency form". It cannot
+  // say that: the pattern enumerates four subject forms, two connectives and five consequences, so "A
+  // replaying worker causes the customer to receive two invoices" is not matched and never was. Rounds
+  // 35 and 36 each answered such an escape by widening the vocabulary, and each widening produced the
+  // next escape; this round does not widen it. What it checks is that THE SPECIFIC SUFFICIENCY WORDING
+  // R36 REMOVED HAS NOT COME BACK — which is worth checking, because that wording stood in this file
+  // for many rounds — and it says so in its own message rather than implying more.
   const processorParagraphs = commentParagraphs(worker).filter(
     (prose) => prose.includes('Not a Xero call, but an external side effect all the same'),
   )
@@ -1265,41 +1346,48 @@ test('r22: the reclaim window is the RESOLVED constant, and BOTH copies of the r
     'the INVOICE_EMAIL fence comment no longer conditions the duplicate on the replay CROSSING A DRAIN in '
     + `a sentence about the duplicate. Sentences: ${JSON.stringify(processorSentences)}`,
   )
-  // THE SUFFICIENCY FORM ITSELF, ABSENT FROM BOTH READERS. A pattern on the claim's GRAMMAR — a worker
-  // as the subject, `means`/`so`, and a delivery consequence — and not on a list of adjectives.
-  const ASSERTS_SUFFICIENCY =
+  // THE KNOWN SUFFICIENCY WORDINGS, ABSENT FROM BOTH READERS. An ENUMERATION and described as one
+  // (round 37): four subject forms, two connectives, five consequences. It covers the wording r36
+  // removed and its close neighbours; it does not cover "A replaying worker causes the customer to
+  // receive two invoices", and nothing here should be widened to chase that — see the block above.
+  const ASSERTS_SUFFICIENCY_KNOWN_WORDINGS =
     /(?:a (?:second|further|reclaiming)|another) worker[^.]*\b(?:means|so)\b[^.]*(?:invoice twice|emailed twice|receives? the invoice|gets? the invoice|two copies)/i
   for (const file of ['lib/connectors/xero/sync-processor.ts', 'lib/domain/integrations/outbox-registry.ts']) {
     const asserting = commentParagraphs(read(file)).flatMap(windowSentences).filter(
-      (sentence) => ASSERTS_SUFFICIENCY.test(sentence),
+      (sentence) => ASSERTS_SUFFICIENCY_KNOWN_WORDINGS.test(sentence),
     )
     assert.deepEqual(
       asserting,
       [],
-      `${file}: ${asserting.length} sentence(s) here state that a second worker is BY ITSELF enough for the `
-      + 'customer to receive the invoice twice. It is not, since this branch: `queueEmail` refuses the row '
-      + 'while the first is undelivered and the caller answers success having written nothing, so a '
-      + 'duplicate needs the first copy out of the partial index FIRST (round 36, Codex round 35 MEDIUM). '
-      + `Quote the old wording if the history matters; do not assert it: ${JSON.stringify(asserting)}`,
+      `${file}: ${asserting.length} sentence(s) here state, IN ONE OF THE WORDINGS THIS CHECK ENUMERATES, `
+      + 'that a second worker is BY ITSELF enough for the customer to receive the invoice twice. It is not, '
+      + 'since this branch: `queueEmail` refuses the row while the first is undelivered and the caller '
+      + 'answers success having written nothing, so a duplicate needs the first copy out of the partial '
+      + 'index FIRST (round 36, Codex round 35 MEDIUM). Quote the old wording if the history matters; do '
+      + 'not assert it. NOTE (round 37): this is a REGRESSION LIST of known phrasings, not a universal '
+      + 'property — a paraphrase outside it passes, and the positive requirements above are what actually '
+      + `hold this paragraph to the mechanism: ${JSON.stringify(asserting)}`,
     )
   }
 
-  // (4g) AND THE SWEEP ACTUALLY FOUND DURATIONS. A pattern that matches nothing passes every
-  // assertion above while checking nothing at all, which is the failure mode the round-34 sweep had in
-  // a different form. The two files state around twenty durations between them; the floor is set well
-  // under that so ordinary editing does not trip it, and far over zero so a broken pattern does.
+  // (4g) AND THE SWEEP MATCHED SOMETHING. A pattern that matches nothing passes every assertion above
+  // while checking nothing at all, which is the failure mode the round-34 sweep had in a different form.
+  // The two files state around twenty durations between them; the floor is set well under that so
+  // ordinary editing does not trip it, and far over zero so a broken pattern does.
   //
-  // WHAT THIS FLOOR CANNOT DO, said here because round 35 relied on it to (Codex round 35, HIGH 1):
-  // it cannot make an EXEMPTION sound. The round-35 ordinal exemption silently discarded any sentence
-  // matching "a second", real durations included, and the twenty durations this prose really states
-  // cleared this floor on their own — so the sweep reported a healthy match count while dropping the
-  // one sentence that mattered. A floor proves the pattern matches SOMETHING; only removing the exemption (round
-  // 36, see the block over `durationsNamedIn`) proves nothing is being dropped.
+  // THIS FLOOR IS NOT EVIDENCE OF COMPLETENESS, AND IT IS HOW THREE SEPARATE FINDINGS HID (rounds 35,
+  // 36 and 37). It says one thing only: THE PATTERN MATCHED AT LEAST 15 THINGS. It cannot show that an
+  // exemption is sound — round 35's ordinal exemption silently discarded any sentence matching "a
+  // second", real durations included, and this floor was satisfied throughout by the twenty unrelated
+  // durations the prose does state. It cannot show that the VOCABULARY is complete either — "one week"
+  // and "a hundred minutes" match nothing, and this floor stays green (round 37, Codex r36 HIGH 3).
+  // Read it as "the regex is alive", never as "every duration here was examined".
   assert.ok(
     durationsChecked >= 15,
-    `the duration sweep found only ${durationsChecked} durations across ${WINDOW_CLAIM_SITES.length} sites `
-    + 'and both files entire — `durationsNamedIn` is no longer matching this prose, so every sourcing '
-    + 'assertion above passed by examining nothing',
+    `the duration sweep matched only ${durationsChecked} durations across ${WINDOW_CLAIM_SITES.length} sites `
+    + 'and both files entire — `durationsInTheCheckedVocabulary` is no longer matching this prose at all, so '
+    + 'every sourcing assertion above passed by examining nothing. (The converse does NOT hold: a healthy '
+    + 'count here is not evidence that every duration in this prose was reached — see the ROUND 37 block.)',
   )
 
   // (5) EVERY CITATION RESOLVES, AND NONE OF THEM IS A LINE NUMBER. A line number is falsified by

@@ -510,6 +510,138 @@ test('REAL: the reclaimed worker is refused its terminal write, so SENT stands a
   )
 })
 
+// ---------------------------------------------------------------------------
+// r37 (Codex r36 HIGH 2) — THE RECLAIM'S OWN COST IS NOT "AT MOST ONE DUPLICATE", AND THE FENCE DOES
+// NOT MAKE IT SO.
+//
+// Every round of this branch before this one rested on a sentence at the top of `lib/email-outbox.ts`
+// saying an elapsed-time reclaim "costs at most one duplicate send". IT DOES NOT. A reclaim RESETS the
+// row: `processingStartedAt` becomes the reclaimer's instant and `lockedBy` its own token, so the
+// reclaimer is itself reclaimable one window later. Nothing caps the chain.
+//
+// THIS IS THE PROOF, AND IT RUNS AGAINST THE SHIPPED FENCE — no `legacyUnfencedTerminalWrites`, no
+// re-arm anywhere in it. Three workers, each stalled inside the next one's whole run:
+//
+//   t0      A claims, enters the sender, does not return
+//   t0+16m  B finds the row stale, reclaims, enters the sender, does not return
+//   t0+32m  C finds the row stale AGAIN (B's own claim is now the stale one), reclaims, and delivers
+//
+// THREE copies of one email leave the building, and the fence is working perfectly throughout: A's
+// and B's terminal writes are both ISSUED AND REFUSED, C's SENT stands, the row is never re-armed and
+// a fourth tick delivers nothing. That is the whole point — the fence closes the RE-ARM, which needed
+// no further stale window, and closes nothing about the count. o3d-hpeg scopes the lease change that
+// would bound it; the honest interim claim is stated at the top of `lib/email-outbox.ts`.
+//
+// WHY THREE AND NOT TWO IS THE WHOLE ASSERTION: two deliveries are what "at most one duplicate"
+// predicts, and every other arm in this file produces exactly two. A third is the counterexample, and
+// the chain extends by one for each further window a holder outlives.
+// ---------------------------------------------------------------------------
+
+/** A second stale window past B's own claim, so C's reclaim is granted on elapsed time too. */
+const T_RECLAIM_2 = new Date('2026-09-10T10:32:00.000Z')
+/** Well past any backoff a re-armed row would carry, so a re-arm would show up as a delivery here. */
+const T_FOURTH_TICK = new Date('2026-09-10T10:40:00.000Z')
+
+test('r37: successive reclaims are UNBOUNDED — three workers, the shipped fence, and three copies delivered', async () => {
+  const deliveries: string[] = []
+  const { client, rows, updateManyCalls } = await makeClient([makeRow()])
+  let bReclaimed = false
+  let cReclaimed = false
+  let workerB: Awaited<ReturnType<typeof drain>> | undefined
+  let workerC: Awaited<ReturnType<typeof drain>> | undefined
+
+  const workerA = await drain({
+    client,
+    now: () => T0,
+    prepareQueuedEmail: noPrepare,
+    logActivity: noLog,
+    async sendEmail() {
+      deliveries.push('worker-A')
+      // B's ENTIRE run happens inside A's stalled send, a stale window later.
+      workerB = await drain({
+        client,
+        now: () => T_RECLAIM,
+        prepareQueuedEmail: noPrepare,
+        logActivity: noLog,
+        async sendEmail() {
+          deliveries.push('worker-B')
+          // ...and C's entire run happens inside B's stalled send, ANOTHER stale window later. B's
+          // own claim is what has gone stale by now, which is the step "at most one duplicate" denies.
+          workerC = await drain({
+            client,
+            now: () => T_RECLAIM_2,
+            prepareQueuedEmail: noPrepare,
+            logActivity: noLog,
+            async sendEmail() {
+              deliveries.push('worker-C')
+              return { success: true }
+            },
+          })
+          cReclaimed = workerC.processed === 1 && workerC.sent === 1
+          return { success: false, error: 'SMTP read timeout' }
+        },
+      })
+      bReclaimed = workerB.processed === 1
+      return { success: false, error: 'SMTP read timeout' }
+    },
+  })
+
+  // NON-VACUITY, BOTH STEPS. A green below would mean nothing if either reclaim had been refused:
+  // the chain has to have been WALKED for three deliveries to be evidence of anything.
+  assert.equal(bReclaimed, true, "worker B never reclaimed A's row, so the chain was not entered at all")
+  assert.equal(
+    cReclaimed,
+    true,
+    "worker C never reclaimed B's row — the SECOND reclaim is the step this test exists for, and without "
+    + 'it this is just the two-worker arm again',
+  )
+
+  // THE FINDING. Three sends, from one row, with the fence shipped and working.
+  assert.deepEqual(
+    deliveries,
+    ['worker-A', 'worker-B', 'worker-C'],
+    'THREE copies of one email were not delivered, so this test is no longer the counterexample to "an '
+    + 'elapsed-time reclaim costs at most one duplicate send" (r37, Codex r36 HIGH 2). Each reclaim resets '
+    + '`processingStartedAt` and mints a new `lockedBy`, so the reclaimer is itself reclaimable one window '
+    + 'later and the chain extends by one send per window a holder outlives (o3d-hpeg)',
+  )
+
+  // AND THE FENCE DID ITS JOB THROUGHOUT — this is not a regression in the fence, it is the fence's
+  // scope. Both losers were REFUSED, the winner's settlement stands, and nothing was re-armed.
+  assert.equal(workerA.conflicted, 1, "worker A's refused terminal write was not recorded as a reclaim")
+  assert.equal(workerB?.conflicted, 1, "worker B's refused terminal write was not recorded as a reclaim")
+  assert.equal(workerC?.sent, 1, 'worker C did not settle the row it delivered')
+  assert.equal(rows[0].status, 'SENT', "the row does not carry worker C's SENT")
+  assert.equal(rows[0].lockedBy, null, 'the settled row still carries a claim')
+  const refused = updateManyCalls.filter(
+    (call) => 'lockedBy' in call.where && call.data.status !== 'PROCESSING' && call.count === 0,
+  )
+  assert.equal(
+    refused.length,
+    2,
+    `${refused.length} fenced terminal writes were refused, not 2 — both losers must have ISSUED a write `
+    + 'and had it matched against zero rows, or the three deliveries below are not the fence working',
+  )
+
+  // A FOURTH TICK DELIVERS NOTHING. The count is unbounded in the number of OVER-RUNNING WORKERS, not
+  // in the number of drain ticks: with no fourth worker stalled on the socket, the row stays SENT.
+  await drain({
+    client,
+    now: () => T_FOURTH_TICK,
+    prepareQueuedEmail: noPrepare,
+    logActivity: noLog,
+    async sendEmail() {
+      deliveries.push('fourth-tick')
+      return { success: true }
+    },
+  })
+  assert.deepEqual(
+    deliveries,
+    ['worker-A', 'worker-B', 'worker-C'],
+    'a fourth copy went out with no fourth worker involved, which would be the RE-ARM this fence removes',
+  )
+})
+
 test('REAL: the fenced-out terminal write is ISSUED AND REFUSED, not skipped', async () => {
   // These are different, and only one of them prevents the SENT -> PENDING overwrite. A skip
   // would be an `if` in front of the write, which is a read-then-write check and therefore
@@ -885,12 +1017,21 @@ const FENCE_MIGRATION_SQL = readFileSync(
   'utf8',
 )
 
-/** Drop whole-line `--` comments; the file is comments-first by design and they are not statements. */
+/**
+ * Drop whole-line `--` comments; the file is comments-first by design and they are not statements. AND
+ * BLANK THE CONTENT OF SQL STRING LITERALS (r37). This function feeds a check for mutating STATEMENTS
+ * before the transaction, and r37's refusal HINT is operator PROSE telling them to write "UPDATE each
+ * row to SENT ..." by hand — which the old version read as an UPDATE statement running before BEGIN. A
+ * statement's verb is never inside a literal, so blanking literal content makes this a check on
+ * statements, which is what it claims to be. `''` is an escaped quote INSIDE a literal and must not be
+ * read as closing one, hence the alternation.
+ */
 function statementsOnly(sql: string): string {
   return sql
     .split('\n')
     .filter((line) => !line.trimStart().startsWith('--'))
     .join('\n')
+    .replace(/'(?:[^']|'')*'/g, "''")
     .trim()
 }
 
@@ -932,12 +1073,127 @@ test('the migration changes NOTHING before its transaction begins (o3d-alnk r6)'
   // where it would be false — while the guard that actually prints on a refusal said something
   // else. The claim belongs to the statement that makes it, so it is checked there.
   const refusalBlock = FENCE_MIGRATION_SQL.slice(0, begin)
-  assert.match(refusalBlock, /HINT = '[^']*Nothing was applied: this check is the migration''s first statement/)
+  // `(?:[^']|'')*` and not `[^']*`: the HINT is one SQL string literal containing DOUBLED quotes
+  // (`migration''s`, `winner''s`), so a character class that forbids every quote stops at the first of
+  // them and the claim below is never found. r37 added three such words ahead of this sentence.
+  assert.match(
+    refusalBlock,
+    /HINT = '(?:[^']|'')*Nothing was applied: this check is the migration''s first statement/,
+  )
   assert.equal(
     [...FENCE_MIGRATION_SQL.matchAll(/Nothing was applied: this check is the migration''s first statement/g)].length,
     1,
     'that claim is made more than once in the migration, and only the copy before BEGIN is true of the '
     + 'statement it is attached to',
+  )
+})
+
+// ---------------------------------------------------------------------------
+// r37 (Codex r36 HIGH 1) — THE REFUSAL'S OWN REMEDY COULD CAUSE THE DUPLICATE IT REFUSES TO RISK.
+//
+// The HINT's first remedy was "let the drain settle these claims (it does so within its stale window)".
+// The stale window is an ELIGIBILITY THRESHOLD, NOT A SETTLEMENT DEADLINE: waiting settles nothing, it
+// only makes the rows reclaimable — and until this migration succeeds the only drain in the build is the
+// UNFENCED one, which then re-sends every one of them and (unfenced) can re-arm the row on top. So the
+// remedy instructed an operator into the exact duplicate delivery the refusal exists to prevent.
+//
+// WHAT IS ASSERTED HERE, and why it is an ABSENCE plus an ORDERED PRESENCE rather than a wording match:
+// the dangerous instruction has to be GONE (absence, so a corrected sentence beside it does not satisfy
+// anything), and the safe one has to be THERE and FIRST — stopping the drain must precede deciding the
+// rows, because a decision taken while the drain runs is worthless. The step texts are located by the
+// numbered markers the HINT writes, so this reads the operator's actual running order.
+// ---------------------------------------------------------------------------
+
+test('r37: the refusal tells the operator to STOP THE DRAIN, and never to wait for the stale window', () => {
+  const begin = FENCE_MIGRATION_SQL.indexOf('\nBEGIN;')
+  assert.ok(begin > 0, 'the migration no longer has an explicit BEGIN')
+  const hint = /HINT = '((?:[^']|'')*)'/.exec(FENCE_MIGRATION_SQL.slice(0, begin))
+  assert.ok(hint, 'the refusal before BEGIN no longer carries a HINT at all')
+  const remedy = hint[1]
+  assert.ok(remedy.length > 600, `the HINT is ${remedy.length} characters, which is not the remedy this reads`)
+
+  // (1) THE DANGEROUS INSTRUCTION IS NOT GIVEN. Written as a COUNT and not as an absence, because the
+  // HINT now names the old advice in order to forbid it: "do not let the drain settle them". A bare
+  // `doesNotMatch` on that phrase fails on the very sentence that corrects it, which is the shape this
+  // branch has spent rounds removing in the other direction. So: EVERY occurrence of the phrase must be
+  // the NEGATED one. Universal over occurrences, with no proximity window to be vacuous about.
+  const mentionsTheOldAdvice = [...remedy.matchAll(/let the drain settle/gi)].length
+  const forbidsIt = [...remedy.matchAll(/do not let the drain settle/gi)].length
+  assert.ok(
+    mentionsTheOldAdvice > 0,
+    'the HINT does not mention letting the drain settle these claims at all. It is named here ON PURPOSE '
+    + 'and forbidden: it was this HINT\'s own first remedy for many rounds, and a reader who is not told '
+    + 'it was wrong is the reader who puts it back (r37, Codex r36 HIGH 1)',
+  )
+  assert.equal(
+    forbidsIt,
+    mentionsTheOldAdvice,
+    `the HINT mentions letting the drain settle these claims ${mentionsTheOldAdvice} time(s) and only `
+    + `${forbidsIt} of those is negated, so at least one of them READS AS AN INSTRUCTION. Before this `
+    + 'migration succeeds the only drain is the UNFENCED one, so waiting makes every one of these rows '
+    + 'eligible for reclaim and it re-sends each of them — the duplicate this refusal exists to avoid',
+  )
+  // AND THE PARENTHETICAL THAT CARRIED THE CONCEPTUAL ERROR IS GONE OUTRIGHT. "(it does so within its
+  // stale window)" is the claim that waiting SETTLES the rows; there is no negated form of it in this
+  // HINT, so this one is a plain absence.
+  assert.doesNotMatch(
+    remedy,
+    /it does so within its stale window|once (?:they|these rows) (?:go|are) stale, the drain/,
+    'the HINT still says the drain settles these claims within its stale window. It does not settle them '
+    + 'at all: the window is an eligibility threshold, and crossing it is what lets the UNFENCED drain '
+    + 're-send them (r37, Codex r36 HIGH 1)',
+  )
+
+  // (2) AND IT SAYS WHY WAITING IS NOT THE ANSWER, in the words the finding used, so the next editor
+  // meets the distinction rather than rediscovering it.
+  assert.match(
+    remedy,
+    /ELIGIBILITY THRESHOLD, NOT A SETTLEMENT DEADLINE/,
+    'the HINT no longer distinguishes the stale window as an eligibility threshold from a settlement '
+    + 'deadline, which is the conceptual error the old remedy rested on',
+  )
+  assert.match(
+    remedy,
+    /UNFENCED/,
+    'the HINT no longer tells the operator that the drain they are being warned about is the UNFENCED '
+    + 'one — which is the whole reason the old advice was unsafe BEFORE this migration and would be '
+    + 'harmless after it',
+  )
+
+  // (3) THE SAFE REMEDY IS THERE, AND IN AN ORDER THAT MAKES SENSE. Stopping the drain must come before
+  // deciding the rows: a verdict reached while a worker can still reclaim and send is worth nothing.
+  const stop = remedy.indexOf('STOP THE DRAIN')
+  const outOfBand = remedy.indexOf('OUT OF BAND')
+  const byHand = remedy.indexOf('SETTLE THEM BY HAND')
+  const resolve = remedy.indexOf('--rolled-back')
+  assert.ok(stop > 0, 'the HINT does not tell the operator to STOP THE DRAIN, which is the only action that '
+    + 'stops a reclaim before this migration is applied')
+  assert.ok(outOfBand > 0, 'the HINT does not tell the operator to decide each row OUT OF BAND — the database '
+    + 'cannot answer "did this message go out", which is precisely why this statement refuses')
+  assert.ok(byHand > 0, 'the HINT does not tell the operator to settle the rows by hand')
+  assert.ok(resolve > 0, 'the HINT no longer tells the operator how to mark the migration rolled back')
+  assert.ok(
+    stop < outOfBand && outOfBand < byHand && byHand < resolve,
+    `the HINT's steps are out of order (stop ${stop}, out-of-band ${outOfBand}, by-hand ${byHand}, `
+    + `resolve ${resolve}). Stopping the drain has to come FIRST: a verdict reached while the drain can `
+    + 'still reclaim and send is worth nothing, and settling a row by hand under a live unfenced drain is '
+    + 'the race this migration exists to close',
+  )
+
+  // (4) AND IT NAMES THE THING TO STOP. "Stop the drain" is not actionable unless the operator is told
+  // which job that is.
+  assert.match(
+    remedy,
+    /\/api\/cron\/email-outbox/,
+    'the HINT says to stop the drain without naming the job — /api/cron/email-outbox is the row in '
+    + 'help-docs/settings.md that runs it',
+  )
+  assert.match(
+    remedy,
+    /processPendingEmailOutbox is the only writer that claims email_outbox rows/,
+    'the HINT no longer states WHY stopping that one job is sufficient. If something else claimed these '
+    + 'rows, stopping the cron would not make the hand-settlement safe, and an operator cannot verify '
+    + 'that from the HINT unless it is said',
   )
 })
 
@@ -1891,8 +2147,9 @@ function axisSentences(prose: string): string[] {
 // because "likely" is exactly what will come back otherwise — it was written three times already.
 //
 // AT EVERY SITE, INDEPENDENTLY:
-//   * EVERY SENTENCE ABOUT A DUPLICATE MUST CARRY THE WEAKER MODALITY — possible, may, might, cannot
-//     be ruled in or out, unknown, not proof. UNIVERSAL, one sentence at a time;
+//   * EVERY SENTENCE **THAT `ABOUT_A_DUPLICATE` RECOGNISES** MUST CARRY THE WEAKER MODALITY — possible,
+//     may, might, cannot be ruled in or out, unknown, not proof. Universal over the RECOGNISED
+//     sentences, one at a time — which is not the same as universal over the site; see r37 below;
 //   * AND NO SENTENCE ABOUT A DUPLICATE MAY CARRY A MODALITY STRONGER THAN THE EVIDENCE — likely,
 //     probable/probably, almost certainly, certainly, definitely, "went out", "will follow".
 //
@@ -1912,11 +2169,43 @@ function axisSentences(prose: string): string[] {
 // still earns its place as a SECOND filter in the other direction: "a duplicate is likely, though it
 // may not happen" carries a hedge and is still an overclaim, and only the blacklist catches it.
 //
-// IT IS DELIBERATELY OVER-INCLUSIVE, AND THAT IS THE SAFE DIRECTION. `ABOUT_A_DUPLICATE` matches any
-// sentence naming a duplicate, including a cross-reference that names `describeDuplicateRisk` rather
-// than claiming anything. Narrowing it to "sentences that make a claim" would mean enumerating the
-// verbs that constitute a claim — the same enumeration `follows` already escaped. So such a sentence
-// has to carry the weaker word too; it costs a word, whereas the other error costs a false claim.
+// IT IS DELIBERATELY OVER-INCLUSIVE WITHIN ITS VOCABULARY, AND THAT IS THE SAFE DIRECTION.
+// `ABOUT_A_DUPLICATE` matches any sentence using one of its words, including a cross-reference that
+// names `describeDuplicateRisk` rather than claiming anything. Narrowing it to "sentences that make a
+// claim" would mean enumerating the verbs that constitute a claim — the same enumeration `follows`
+// already escaped. So such a sentence has to carry the weaker word too; it costs a word, whereas the
+// other error costs a false claim.
+//
+// r37 (Codex r36 HIGH 5) — THE RECOGNISER IS THE HOLE, AND THIS ROUND RESCOPES THE CLAIM RATHER THAN
+// WIDENING IT AGAIN. DECISION: (b).
+//
+// r36 made the modality requirement per-sentence instead of existential, and that fix was real. But it
+// only reaches sentences `ABOUT_A_DUPLICATE` RECOGNISES, and that regex is a list of nouns: "duplicate",
+// "second copy", "two emails", "two copies", "twice". So "An extra delivery follows" is not a sentence
+// this check examines at all — it is filtered out before the universal per-sentence rule runs, and the
+// non-vacuity floor below stays satisfied by the sentences that DO use the listed nouns. r35 widened the
+// wording rules, r36 widened them again, and each widening produced the next escape. A GUARD THAT MATCHES
+// ENGLISH PROSE IS AN ENUMERATION OF PHRASINGS SOMEBODY THOUGHT OF; there is no vocabulary that closes it,
+// so this round does not add "extra delivery" or anything else to the list.
+//
+// WHAT `assertKnownDuplicateWordingsAreHedged` THEREFORE CLAIMS, EXACTLY: at each of the four sites, every
+// sentence using one of the words in `ABOUT_A_DUPLICATE` carries the weaker modality in that same
+// sentence, and none of them carries a word from `OVERSTATES_THE_DUPLICATE`. Its value is as a REGRESSION
+// CHECK: "likely" was written into these four sites three separate times, and "A duplicate delivery
+// follows." sat beside its own hedge until r36. Both of those return through this check.
+//
+// WHAT IT DOES NOT CLAIM, NAMED SO THE NEXT ROUND DOES NOT HAVE TO FIND IT AGAIN:
+//   • A sentence asserting a second delivery WITHOUT any recognised noun ("An extra delivery follows",
+//     "the customer is mailed again", "a repeat message goes out") is not examined at all.
+//   • An overclaiming modality outside `OVERSTATES_THE_DUPLICATE` ("assuredly", "is guaranteed to")
+//     passes the second filter as long as some hedge word is present.
+//   • Anything inside double quotes is stripped, on purpose (these sites quote the removed wording).
+//   • The floor below proves the recogniser matched something. It is NOT evidence that every claim at
+//     the site was reached — that is precisely how this finding hid.
+// The part of this file that is NOT a wording check is where the real assurance lives: the driven tests
+// above (which arrange a sender that delivers and one that does not, and show the drain cannot tell) and
+// the arm-completeness assertion at the `describeDuplicateRisk` site, which proves the guard reads EVERY
+// arm of that switch rather than a subset.
 //
 // DOUBLE-QUOTED SPANS ARE STRIPPED, for the reason every other wording guard in this file strips
 // them: quoting is how these files cite a claim in order to disown it, and two of these sites quote
@@ -1930,7 +2219,13 @@ function axisSentences(prose: string): string[] {
 // reads — the exported contract, the activity-log summary, the per-row log line, and the help page.
 // ---------------------------------------------------------------------------
 
-/** A sentence that is about a second copy of the email going out. */
+/**
+ * A sentence that is about a second copy of the email going out, IN ONE OF THESE WORDINGS. An
+ * ENUMERATION of nouns, and r37 stopped describing it as anything else: a sentence that asserts a second
+ * delivery using none of these words ("An extra delivery follows") is never examined by the checks that
+ * filter on it. Do not widen it in answer to the next paraphrase — r35 and r36 each did, and each
+ * widening produced the next escape. See the r37 block above for the full residue.
+ */
 const ABOUT_A_DUPLICATE = /duplicate|second copy|two (?:emails|copies)|twice/i
 /** Modality the entry fact cannot support. */
 const OVERSTATES_THE_DUPLICATE =
@@ -1943,14 +2238,21 @@ function strengthSentences(prose: string): string[] {
   return axisSentences(prose.replace(/"[^"]*"/g, ' '))
 }
 
-/** The duplicate-strength axis, asked of one site's prose. */
-function assertDuplicateStrength(where: string, prose: string): void {
-  const sentences = strengthSentences(prose).filter((sentence) => ABOUT_A_DUPLICATE.test(sentence))
+/**
+ * THE DUPLICATE-STRENGTH REGRESSION CHECK, asked of one site's prose. Renamed in r37 (Codex r36 HIGH 5)
+ * from `assertDuplicateStrength`, because that name asserted a property of the site and this function
+ * checks a property of the sentences `ABOUT_A_DUPLICATE` recognises. The r37 block above states the claim
+ * and the residue in full.
+ */
+function assertKnownDuplicateWordingsAreHedged(where: string, prose: string): void {
+  const all = strengthSentences(prose)
+  const sentences = all.filter((sentence) => ABOUT_A_DUPLICATE.test(sentence))
   assert.ok(
     sentences.length > 0,
-    `${where}: says nothing about a duplicate at all, so the strength of the claim it makes about one `
-    + 'cannot be checked here — and this is one of the four places a reader is told what these counts '
-    + 'mean for the customer',
+    `${where}: not one of its ${all.length} sentence(s) uses a word ABOUT_A_DUPLICATE recognises, so the `
+    + 'strength of the claim it makes about a duplicate cannot be checked here at all — and this is one of '
+    + 'the four places a reader is told what these counts mean for the customer. (This floor says the '
+    + 'recogniser matched something; it is NOT evidence that every claim at this site was reached.)',
   )
   // (i) EVERY sentence, not one of them (r36, Codex r35 HIGH 2). A hedge in the sentence BEFORE an
   // unhedged claim is not a hedge on that claim; `sentences.some(...)` treated it as one.
@@ -1964,8 +2266,9 @@ function assertDuplicateStrength(where: string, prose: string): void {
     + 'configured, or a from-address the mailer rejects, both workers are reclaimed-after-send having '
     + 'delivered nothing, so POSSIBLE is the strongest honest word — and it has to be in the sentence '
     + 'that makes the claim. r35 asked only that ONE sentence carry it, which let "A duplicate delivery '
-    + 'is possible. A duplicate delivery follows." pass whole: '
-    + `${JSON.stringify(unhedged)}`,
+    + 'is possible. A duplicate delivery follows." pass whole. NOTE (r37): this rule is universal only '
+    + 'over the sentences ABOUT_A_DUPLICATE RECOGNISES — a second delivery asserted with none of its '
+    + `words is not examined here: ${JSON.stringify(unhedged)}`,
   )
   // (ii) AND THE BLACKLIST STAYS, as the filter in the other direction: a sentence can carry the
   // weaker word and still overclaim ("likely, though it may not happen"), and only this catches that.
@@ -2067,7 +2370,7 @@ test('r33/r34: the three places that state what these counts mean state the same
 
   // (1c) AND THE STRENGTH OF WHAT IT CLAIMS ABOUT THE CUSTOMER (r35, Codex HIGH 2). This field used to
   // say a duplicate send was LIKELY, unconditionally.
-  assertDuplicateStrength("the exported contract's `conflicted`", contract.get('conflicted')!)
+  assertKnownDuplicateWordingsAreHedged("the exported contract's `conflicted`", contract.get('conflicted')!)
 
   // (2) THE ACTIVITY SUMMARY. Located as the one template that names these counters, and every counter
   // in the contract must appear in it — a count nobody logs is a count nobody reads.
@@ -2117,7 +2420,7 @@ test('r33/r34: the three places that state what these counts mean state the same
     + 'SMTP-named label asserts of every row something true of only some',
   )
   assertSendAxis('the activity-summary site', summaryProse, SENDER_WAS_ENTERED)
-  assertDuplicateStrength('the activity-summary site', summaryProse)
+  assertKnownDuplicateWordingsAreHedged('the activity-summary site', summaryProse)
   assert.match(
     summaryProse,
     NOT_PROOF_OF_SMTP,
@@ -2164,7 +2467,7 @@ test('r33/r34: the three places that state what these counts mean state the same
   // made at. It asked "Had the message already been handed to SMTP?" and answered "After a send means
   // yes", which is a definite claim about a fact the drain does not have.
   assertSendAxis('the help documentation', flat, SENDER_WAS_ENTERED)
-  assertDuplicateStrength('the help documentation', flat)
+  assertKnownDuplicateWordingsAreHedged('the help documentation', flat)
   assert.match(
     flat,
     SENDER_WAS_NEVER_ENTERED,
@@ -2195,7 +2498,33 @@ test('r33/r34: the three places that state what these counts mean state the same
     `the arms of describeDuplicateRisk are ${riskArms.length} characters of text, which is not the four `
     + 'verdicts this guard is reading',
   )
-  assertDuplicateStrength('the per-row log line (describeDuplicateRisk)', riskArms)
+
+  // (4a) AND THE SET OF ARMS IT READS IS PROVABLY THE WHOLE SET (r37). The modality check below filters
+  // sentences through `ABOUT_A_DUPLICATE`, which is an enumeration of wordings and is now described as
+  // one. The ONE completeness claim this site can actually make is structural and about the arms rather
+  // than their words: `describeDuplicateRisk` must decide every `ClaimLoss` kind BY NAME and must carry
+  // no `default:`, so `riskArms` above is the whole of what this function can print and not a subset
+  // somebody remembered. Add a seventh kind and this goes red rather than silently going unchecked.
+  const riskUnion = /type ClaimLoss =\n([\s\S]*?)\n\n/.exec(source)
+  assert.ok(riskUnion, 'lib/email-outbox.ts no longer declares a `ClaimLoss` union, so nothing below read it')
+  const riskKinds = [...riskUnion[1].matchAll(/\{ kind: '([a-z-]+)'/g)].map((match) => match[1])
+  assert.ok(riskKinds.length >= 6, `the walk found ${riskKinds.length} ClaimLoss kinds — it read nothing useful`)
+  assert.doesNotMatch(
+    risk[1],
+    /\bdefault:/,
+    '`describeDuplicateRisk` grew a `default:`, so a new ClaimLoss kind now prints a duplicate verdict '
+    + 'nobody chose — and the arm walk below can no longer show it read every verdict this function emits',
+  )
+  const riskCases = [...risk[1].matchAll(/case '([a-z-]+)':/g)].map((match) => match[1])
+  assert.deepEqual(
+    [...riskCases].sort(),
+    [...riskKinds].sort(),
+    `describeDuplicateRisk decides ${JSON.stringify(riskCases.sort())} but ClaimLoss declares `
+    + `${JSON.stringify(riskKinds.sort())} — the arms read into \`riskArms\` are not all of them, so the `
+    + 'modality check below is examining a subset of what an operator can be shown',
+  )
+
+  assertKnownDuplicateWordingsAreHedged('the per-row log line (describeDuplicateRisk)', riskArms)
 })
 
 // ---------------------------------------------------------------------------
@@ -2216,8 +2545,11 @@ test('r33/r34: the three places that state what these counts mean state the same
 //   * THE CORRECTED CLAIM MUST BE THERE — one sentence that asserts a refusal AND carries the
 //     mint-time bound, in that same sentence, so the qualifier cannot be stranded in a different
 //     paragraph from the claim it qualifies;
-//   * NO SENTENCE MAY ASSERT THE UNBOUNDED CLAIM — a sentence about a database-reading delegate that
-//     says it is refused must carry the bound, whatever words it uses to say it;
+//   * NO SENTENCE MAY ASSERT THE UNBOUNDED CLAIM — a sentence that `DATABASE_READING_DELEGATE`
+//     recognises as being about such a delegate, and that says it is refused, must carry the bound in
+//     that same sentence. That recogniser is an ENUMERATION of wordings (r37): a sentence describing
+//     such a delegate in words it does not list is not reached, so this is a regression check over the
+//     phrasings this file has actually used and not a universal property of it;
 //   * EVERY RESIDUE COUNT THE SITE STATES MUST EQUAL THE LENGTH OF THE RESIDUE LIST ITSELF, which is
 //     read off the lettered items rather than written down here — so adding residue (f) turns every
 //     site that still says "five" red instead of leaving four sites to drift apart again.

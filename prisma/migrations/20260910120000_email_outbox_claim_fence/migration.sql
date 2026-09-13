@@ -95,6 +95,27 @@
 -- aborts the whole migration. The cost is a duplicate-key error instead of this message — the
 -- backstop is why that is a message problem and not a safety one.
 -- ---------------------------------------------------------------------------------------
+-- ---------------------------------------------------------------------------------------
+-- THE REMEDY THIS HINT GIVES USED TO BE ABLE TO CAUSE THE DUPLICATE IT REFUSES TO RISK
+-- (r37, Codex r36 HIGH 1).
+--
+-- Until this round the first remedy was "let the drain settle these claims (it does so within its
+-- stale window)". That reads as though WAITING resolves the ambiguity. IT DOES NOT. THE STALE WINDOW
+-- IS AN ELIGIBILITY THRESHOLD, NOT A SETTLEMENT DEADLINE: nothing settles a PROCESSING row by the
+-- passage of time. What crossing the window does is make the row ELIGIBLE FOR RECLAIM — and before
+-- this migration succeeds, the only drain in the build is the UNFENCED one. So an operator who
+-- followed that advice waited for exactly the moment at which the old drain could reclaim every one
+-- of these rows and SEND each of them again, and (unfenced) the loser of that race could write
+-- PENDING over the winner's SENT and re-arm the row. The refusal exists to avoid one duplicate
+-- delivery and its own first remedy invited several.
+--
+-- WHAT AN OPERATOR CAN ACTUALLY DO BEFORE THE FENCE EXISTS is the real constraint, and it is a short
+-- list: nothing in the database can settle these rows safely while a worker may still be on the
+-- socket for them, and no worker can be prevented from reclaiming them EXCEPT by not running. So the
+-- first step has to be STOPPING THE DRAIN, and only then can the rows be decided — out of band, from
+-- the mail server's own record, because that is the only place the answer exists. The HINT below says
+-- that, in that order, and no longer mentions waiting except to forbid it.
+-- ---------------------------------------------------------------------------------------
 -- o3d-alnk-sql-block: refuse-ambiguous-processing
 DO $$
 DECLARE
@@ -115,7 +136,7 @@ BEGIN
   IF ambiguous IS NOT NULL THEN
     RAISE EXCEPTION 'email_outbox: refusing to collapse duplicates for %', ambiguous
       USING DETAIL = 'More than one PROCESSING row exists for the same (kind, referenceType, referenceId). A worker may already be on the SMTP socket for either of them, and nothing in this table says which; discarding one and retaining the other can mail the customer a second copy on top of a send that already went out. Migration 20260910120000_email_outbox_claim_fence (o3d-alnk) refuses rather than guess.',
-            HINT = 'Let the drain settle these claims (it does so within its stale window) or settle the losers to FAILED by hand once you know their sends are finished. Nothing was applied: this check is the migration''s first statement and every statement that changes anything is inside the transaction that follows it. Mark the migration rolled back (prisma migrate resolve --rolled-back 20260910120000_email_outbox_claim_fence) and deploy again.';
+            HINT = 'DO NOT WAIT FOR THESE CLAIMS TO GO STALE, and do not let the drain settle them. That was this HINT''s first remedy until o3d-alnk r37, and it instructed the operator into the exact duplicate delivery this refusal exists to avoid: THE STALE WINDOW IS AN ELIGIBILITY THRESHOLD, NOT A SETTLEMENT DEADLINE. Until this migration is applied the only drain in the build is the UNFENCED one, so waiting does not resolve the ambiguity - it makes every one of these rows eligible for reclaim, and the unfenced drain then RE-SENDS each of them; worse, the loser of that race can write PENDING over the winner''s SENT and re-arm the row, so copies keep going out on ordinary ticks. WHAT AN OPERATOR CAN DO SAFELY BEFORE THE FENCE EXISTS, in this order: (1) STOP THE DRAIN. Disable or remove the /api/cron/email-outbox job (the crontab entry, or Settings > System > Scheduler), on EVERY replica, and confirm no run is in flight. processPendingEmailOutbox is the only writer that claims email_outbox rows, so with it stopped nothing can reclaim and nothing can send. (2) DECIDE EACH ROW OUT OF BAND. This table cannot tell you whether a PROCESSING row''s message reached the wire - that is precisely why this statement refuses - so read the answer off the mail server or provider log for each row listed above. (3) SETTLE THEM BY HAND, with the drain still stopped: UPDATE each row to SENT if its message went and FAILED if it did not, clearing processingStartedAt, until at most one undelivered (PENDING or PROCESSING) row is left per (kind, referenceType, referenceId). (4) Mark this migration rolled back (prisma migrate resolve --rolled-back 20260910120000_email_outbox_claim_fence) and deploy again. (5) RE-ENABLE THE DRAIN, which is fenced from this migration onwards. Nothing was applied: this check is the migration''s first statement and every statement that changes anything is inside the transaction that follows it.';
   END IF;
 END
 $$;

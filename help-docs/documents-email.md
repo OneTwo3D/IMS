@@ -153,7 +153,10 @@ the job's next run, not immediately.
   So **reclaimed after a send** is the one that means the customer may have received two copies —
   *may*, because it rests on the send having actually reached a mail server, which is not something
   the run records: with SMTP unconfigured, or a rejected from-address, both runs can be counted here
-  having delivered nothing at all. It is a duplicate that is *possible*, not one that is "likely".
+  having delivered nothing at all. It is a duplicate that is *possible*, not one that is "likely" —
+  and one extra copy is not a ceiling either: a reclaim restarts the stale window, so a run that
+  also overruns it may itself be reclaimed, and a further copy may go out for each window a run
+  outlives.
   **Unresolved after a send** means a copy may be on the wire but nothing establishes that a second
   one follows — it is not a duplicate report. The server log line for each row names the specific
   diagnosis behind it. None of the four leaves the email stuck: whichever run settled the row is the

@@ -5,9 +5,30 @@
  *
  * The drain reclaims a PROCESSING row on elapsed time alone (`processingStartedAt <
  * now - EMAIL_CLAIM_STALE_MS`). That is a statement about TIME, not about outcome: it
- * cannot tell a dead holder from a slow one. On its own that is survivable — it costs at
- * most one duplicate send, and nothing local can retract an SMTP message anyway. What made
- * it a P1 is what happened NEXT. Every terminal write used to be
+ * cannot tell a dead holder from a slow one.
+ *
+ * WHAT AN ELAPSED-TIME RECLAIM COSTS, AND IT IS NOT "AT MOST ONE DUPLICATE" (r37, Codex r36 HIGH 2).
+ * Every earlier version of this comment said the reclaim "costs at most one duplicate send" and that
+ * the fence leaves only that behind. THE BOUND WAS FALSE, and it was load-bearing for many rounds. A
+ * reclaim RESETS the row — `processingStartedAt` becomes the reclaimer's own instant and `lockedBy`
+ * its own token — so the reclaimer is itself reclaimable one window later. A can outlive
+ * `EMAIL_CLAIM_STALE_MS` and be reclaimed by B; B can outlive the NEXT window and be reclaimed by C;
+ * all three enter the sender, and nothing in this module caps the chain.
+ *
+ * SO THE HONEST STATEMENT IS THIS, AND IT IS THE ONE THIS MODULE NOW MAKES EVERYWHERE: AN
+ * ELAPSED-TIME RECLAIM ADMITS UNBOUNDEDLY MANY SUCCESSIVE SENDS, BOUNDED IN PRACTICE ONLY BY HOW
+ * LONG A WORKER CAN OUTLIVE THE WINDOW — one further send per `EMAIL_CLAIM_STALE_MS` of over-run,
+ * with no cap in this code — and no local write can retract any of them. This is MEASURED, not
+ * argued: `tests/email-outbox-claim-fence.test.ts` drives the three-worker chain against the SHIPPED
+ * fence and asserts that THREE copies are delivered from one row.
+ *
+ * A BOUND IS A DESIGN CHANGE, AND DELIBERATELY NOT THIS BRANCH'S. It needs either a lease the holder
+ * RENEWS while it is on the socket (so a reclaim means the holder really stopped) or a per-row count
+ * of SENDER ENTRIES with a cap that parks the row instead of reclaiming it again. Both change the
+ * lease model and need their own migration. o3d-hpeg scopes both, weighs their cost, and records the
+ * statement above as the INTERIM claim until one of them ships.
+ *
+ * WHAT MADE THIS A P1 IS SOMETHING ELSE ENTIRELY. Every terminal write used to be
  * `update({ where: { id } })`, keyed on the id and nothing else, so:
  *
  *   t0     worker A claims row R and calls sendEmail; the socket stalls
@@ -16,8 +37,10 @@
  *          availableAt = now + backoff — OVER B's SENT. The row is RE-ARMED and a THIRD
  *          copy goes out on the next tick.
  *
- * The loser did not merely duplicate: it reopened a row the winner had settled, so the
- * duplication was not bounded at two and did not converge on its own.
+ * The loser did not merely duplicate: it reopened a row the winner had settled, so further copies
+ * went out on ORDINARY DRAIN TICKS — needing no further stale window, and no further over-running
+ * worker — and the row did not converge on a settled state on its own. That is a DIFFERENT
+ * unboundedness from the successive-reclaim one above, and it is the one a fence can close.
  *
  * THE FIX IS A FENCE, NOT A LONGER TIMEOUT. `lockedBy` holds a per-CLAIM random token —
  * deliberately not a per-duty constant like the integration outbox's `lockedBy`, because two
@@ -30,8 +53,11 @@
  *
  * WHAT THIS DOES NOT FIX, STATED PLAINLY. The duplicate SEND at t0+15m still happens. The
  * fence sits between the reclaim and the ROW, and no local write can un-send an email
- * (o3d-ic9a property B). What it removes is the RE-ARM, which is the unbounded part, and it
- * makes the losing worker's outcome observable (`conflicted`) instead of silent.
+ * (o3d-ic9a property B). NOR DOES IT MAKE THE NUMBER OF SENDS FINITE: successive reclaims are
+ * unbounded with this fence exactly as they were without it, because each reclaim resets the window
+ * (see the correction at the top of this comment, and o3d-hpeg). What it removes is the RE-ARM — the
+ * copies that needed no further stale window at all, from a row another worker had already settled —
+ * and it makes the losing worker's outcome observable (`conflicted`) instead of silent.
  *
  * THE ENQUEUE SIDE IS GUARDED SEPARATELY, IN THE DATABASE. The fence protects one row from
  * being settled twice; it says nothing about two ROWS being created for one logical email.
@@ -1253,6 +1279,11 @@ export type ProcessEmailOutboxResult = {
    * or a from-address the mailer rejects, two workers can both be counted here having delivered
    * nothing at all. "Likely" was a false reading of that case, not a cautious one.
    *
+   * AND ONE DUPLICATE MAY NOT BE THE WHOLE OF IT (r37, Codex r36 HIGH 2). A reclaim resets the row's
+   * window, so a worker that also outruns it may itself be reclaimed, and this counter may be non-zero
+   * on several workers for the same row across successive windows. Read it as "a duplicate is
+   * possible", never as "at most one extra copy" — nothing in this module bounds that count (o3d-hpeg).
+   *
    * "ESTABLISHED", AND THAT IS THE WHOLE OF ROUND 33's MEDIUM. This counter used to be incremented
    * for every refused post-send terminal write, including the four diagnoses that establish NO
    * rival: a settlement write whose answer was lost (this worker's own write may be what settled the
@@ -2359,8 +2390,10 @@ export async function processPendingEmailOutbox(
         availableAt: permanentFailure ? email.availableAt : new Date(now().getTime() + getBackoffMs(email.attempts)),
         processingStartedAt: null,
       }))
-      // This is the write the issue was raised for: unfenced, it re-armed a row another
-      // worker had already settled to SENT, so the duplication was not bounded at two.
+      // This is the write the issue was raised for: unfenced, it re-armed a row another worker had
+      // already settled to SENT, so further copies went out on ordinary drain ticks with no further
+      // stale window needed. (The reclaim's OWN cost is not bounded either — see the correction at
+      // the top of this file and o3d-hpeg — but that part no fence can close.)
       if (settled) result.failed++
       else await recordConflict(claim, 'a failed send', smtp)
     } catch (error) {
