@@ -1391,8 +1391,9 @@ privileged_helper_path() {
 # the commands root had not read yet. The startup block had established a tree only root could
 # write; the run then undid it itself.
 #
-# THE STRUCTURAL RULE, stated once and asked before every recursive ownership change, recursive copy
-# or recursive delete a privileged entrypoint makes: THE TARGET AND THE DIRECTORY THIS RUN IS EXECUTING
+# THE STRUCTURAL RULE, stated once and asked before each tree-wide ownership change, copy, move or
+# delete THE CENSUS KNOWS ABOUT — see the regression net in tests/scripts/privileged-helper-set.test.ts
+# for what "knows about" covers and what it cannot: THE TARGET AND THE DIRECTORY THIS RUN IS EXECUTING
 # FROM MUST BE DISJOINT. Neither may equal, contain or lie inside the other. The directory is the one
 # the startup block pinned — the parent of ${IMS_SCRIPT_LIB_DIR}, which holds the entrypoint and lib/.
 #
@@ -1409,7 +1410,9 @@ privileged_helper_path() {
 # overlaps a tree exactly when that ancestor lies inside, or is, that tree.
 #
 # WHAT IT COSTS, AND THE ONE PROPERTY THAT IS ONLY AVAILABILITY (o3d-z5be r7, review LOW 4). Each call
-# walks the target tree once, and a privileged run makes three to six of them over ${APP_DIR} — which on
+# walks the target tree once, and a privileged run makes nine or more of them in install.sh alone (four
+# over ${APP_DIR} on the local-copy path, plus ${DATA_DIR}, ${LOG_DIR}, the three configuration-time
+# calls and one per migrated upload directory) — over trees which on
 # an installed host holds node_modules and .next, so this is seconds, not milliseconds. It is not
 # bounded, deliberately: a depth or count limit would be a walk that can miss the object it is looking
 # for, which is the one outcome this must not have. The consequence an operator should know: the service
@@ -1517,7 +1520,7 @@ privileged_tree_inode_list() {
 # — with the reason in ${IMS_DRIVER_OVERLAP_REASON} and on stderr — when they overlap or the question
 # could not be answered. "$3" and "$4" say what each is, for the sentence.
 privileged_trees_disjoint() {
-  local a="$1" b="$2" what_a="$3" what_b="$4" ra rb a_exists b_exists r=0 privileged_trees_disjoint_ids=""
+  local a="$1" b="$2" what_a="$3" what_b="$4" ra rb a_exists b_exists r=0 privileged_trees_disjoint_ids="" privileged_kind_ids="" privileged_kind_hit=2 privileged_kind_rev=2
   IMS_DRIVER_OVERLAP_REASON=""
   ra="$(privileged_physical_or_nearest "${a}")" || ra=""
   rb="$(privileged_physical_or_nearest "${b}")" || rb=""
@@ -1546,7 +1549,40 @@ privileged_trees_disjoint() {
     privileged_walk_reaches "${ra}" "${privileged_trees_disjoint_ids}" || r=$?
     rm -f "${privileged_trees_disjoint_ids}"
     if (( r != 1 )); then
-      (( r == 0 )) && IMS_DRIVER_OVERLAP_REASON="${what_b} (${b}) is, or lies inside, ${what_a} (${a})"         || IMS_DRIVER_OVERLAP_REASON="${what_a} (${a}) could not be walked to show it does not contain ${what_b} (${b})"
+      # WHICH KIND OF HIT IT WAS (o3d-z5be r8, review LOW 5). The walk looks for the other tree's own
+      # directory AND — when the caller supplied them — the inodes of every file in it, so a hit can be
+      # containment OR a second name (a hard link) for one of those files. Saying "lies inside" for a
+      # link would be false, and the remedy for one is not the remedy for the other.
+      # The second walk is given a FILE and not a process substitution: privileged_walk_reaches() asks
+      # `[[ -s ]]` of its id list, and a pipe is not a regular file — which made every hit read as a
+      # link. It is a `mktemp`, checked, and removed.
+      privileged_kind_ids="$(mktemp 2>/dev/null)" || privileged_kind_ids=""
+      privileged_kind_hit=2
+      if [[ -n "${privileged_kind_ids}" ]]; then
+        if privileged_tree_inode_list "${rb}" "${privileged_kind_ids}"; then
+          privileged_kind_hit=0
+          privileged_walk_reaches "${ra}" "${privileged_kind_ids}" || privileged_kind_hit=$?
+        fi
+        rm -f "${privileged_kind_ids}"
+      fi
+      # AND CONTAINMENT IS ASKED IN BOTH DIRECTIONS BEFORE CALLING IT A LINK (o3d-z5be r8). A target that
+      # lies INSIDE the running tree also holds files whose inodes are in the set, and reporting that as
+      # a hard link would be as wrong as the sentence this discrimination exists to avoid.
+      privileged_kind_rev=2
+      if [[ -n "${privileged_kind_ids}" ]] || privileged_kind_ids="$(mktemp 2>/dev/null)"; then
+        if privileged_tree_inode_list "${ra}" "${privileged_kind_ids}"; then
+          privileged_kind_rev=0
+          privileged_walk_reaches "${rb}" "${privileged_kind_ids}" || privileged_kind_rev=$?
+        fi
+        rm -f "${privileged_kind_ids}"
+      fi
+      if (( r == 0 )) && [[ -n "${IMS_DRIVER_OVERLAP_EXTRA_IDS:-}" ]] && (( privileged_kind_hit == 1 )) && (( privileged_kind_rev == 1 )); then
+        IMS_DRIVER_OVERLAP_REASON="${what_a} (${a}) holds a SECOND NAME — a hard link — for a file in ${what_b} (${b}); it does not contain that directory, but a recursive operation over it would reach the very inodes this run is executing"
+      elif (( r == 0 )); then
+        IMS_DRIVER_OVERLAP_REASON="${what_b} (${b}) is, or lies inside, ${what_a} (${a})"
+      else
+        IMS_DRIVER_OVERLAP_REASON="${what_a} (${a}) could not be walked to show it does not contain ${what_b} (${b})"
+      fi
       echo "${IMS_DRIVER_OVERLAP_REASON}" >&2
       return 1
     fi
@@ -1571,10 +1607,16 @@ privileged_trees_disjoint() {
   return 0
 }
 
-# THE CALL EVERY RECURSIVE OWNERSHIP CHANGE, COPY OR DELETE IN AN ENTRYPOINT IS PRECEDED BY: refuses
-# when "$1" overlaps the directory this run is executing from. tests/scripts/privileged-helper-set.test.ts
-# holds the census of those operations and fails on one that is not immediately preceded by this call
-# on the same target.
+# THE CALL THAT CARRIES THE PROPERTY, MADE IMMEDIATELY BEFORE EACH TREE-WIDE OWNERSHIP CHANGE, COPY,
+# MOVE OR DELETE THE CENSUS KNOWS ABOUT: it refuses when "$1" overlaps the directory this run is
+# executing from. THE SCOPE IS THE CENSUS'S (o3d-z5be r8, review HIGH 1/2): the regression net in
+# tests/scripts/privileged-helper-set.test.ts enumerates the SHAPES of such a statement, requires each
+# hit to be immediately preceded by this call with `|| die`, and fails on a new one — so it keeps these
+# guards in place and cannot promise that a shape nobody encoded is guarded. install.sh additionally
+# asks the same question of ${APP_DIR}, ${DATA_DIR} and ${LOG_DIR} at configuration time, which is an
+# EARLY REFUSAL and not the thing the property rests on: on a first install those directories do not
+# exist yet, so that call can only compare against their nearest existing ancestor — and update.sh and
+# deploy.sh have no such gate at all.
 privileged_spare_running_tree() {
   local target="$1" what="$2" running
   IMS_DRIVER_OVERLAP_REASON=""
@@ -1584,12 +1626,26 @@ privileged_spare_running_tree() {
     return 1
   fi
   running="$(dirname -- "${IMS_SCRIPT_LIB_DIR}")"
-  # AND THE FILES IN IT, NOT JUST THE DIRECTORY (o3d-z5be r7, review MEDIUM 3). A hard link to the
-  # entrypoint or to a library, created inside the target by the account that owns it, is a second name
-  # for the inode bash is reading — and `chown -R` over that name changes the owner of that inode. The
-  # directory's inode is not reachable through such a link, so the walk is given every inode under the
-  # running tree to look for as well. (On this host `fs.protected_hardlinks=1` also stops the service
-  # account creating such a link to a root-owned file; this does not depend on that sysctl being set.)
+  # AND THE FILES IN IT, NOT JUST THE DIRECTORY (o3d-z5be r7). A hard link to the entrypoint or to a
+  # library, created inside the target by the account that owns it, is a second name for the inode bash
+  # is reading — and `chown -R` over that name changes the owner of that inode. The directory's inode is
+  # not reachable through such a link, so the walk is given every inode under the running tree as well.
+  #
+  # WHAT THAT DOES AND DOES NOT BUY, STATED THE RIGHT WAY ROUND (o3d-z5be r8, review MEDIUM 3). The r7
+  # comment said this "does not depend on fs.protected_hardlinks"; that is true of the DETECTION and
+  # false of the PROPERTY, which is the half that matters:
+  #
+  #   * with `fs.protected_hardlinks=1` (the default on this host and on Debian/Ubuntu) the service
+  #     account cannot create a link to a root-owned file it does not own at all, so the property holds
+  #     because the link cannot exist — and this check finds nothing;
+  #   * with it OFF, the account can create the link AT ANY TIME, including in the window between this
+  #     check and the operation it guards. This is a live check acting on state it does not hold, so
+  #     what it closes is a link that was already there when it looked — an attacker who planted one
+  #     earlier and raced nothing — and not one planted in that window.
+  #
+  # Closing the window would need the operation itself to be inode-bound (a walk that opens what it
+  # changes), which coreutils' `chown -R` is but `rsync` and `rm -rf` are not. The guard is worth having
+  # for the planted-earlier case and is described here as exactly that.
   local IMS_DRIVER_OVERLAP_EXTRA_IDS="${running}"
   if ! privileged_trees_disjoint "${target}" "${running}" "${what}" "the directory this run is executing from"; then
     IMS_DRIVER_OVERLAP_REASON="REFUSING to change the ownership of, copy into, or delete from ${what} (${target}): ${IMS_DRIVER_OVERLAP_REASON}. A privileged run never hands the tree it is executing from to another account — bash is still reading this script off that tree, so the account that received it could write the commands root has not read yet. Run the installer from a release directory outside ${target}; see *The supported bootstrap* in docs/installation.md"

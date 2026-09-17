@@ -10627,6 +10627,10 @@ test('r34: an unpinned bootstrap out of an application-writable checkout is REFU
     // o3d-z5be r6 (Codex HIGH 1): and that way out is fresh inodes, never a relabel of an existing tree.
     // CASE-INSENSITIVE since r7 (review MEDIUM 1): one capital defeated the same check elsewhere.
     assert.doesNotMatch(boot.output, /take group and other write off/i, 'the way out must not be a chown/chmod relabel')
+    // AND NOT VACUOUS (o3d-z5be r8, review LOW 8): the refusal really does carry a remedy in this output,
+    // so the absence above is about the WORDING of that remedy and not about an output that has none.
+    assert.match(boot.output, /fetch the release as root into a directory root has just created/,
+      `the refusal must still name the fresh-inode bootstrap:\n${boot.output}`)
 
     // THE CONTROL: the substitution is live, so what was refused was a real theft and not a
     // hypothetical one.

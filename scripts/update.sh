@@ -5088,7 +5088,7 @@ if ! $NO_GIT; then
     NEW_COMMIT="$(run_git_as_user "${APP_USER}" git -C "${TMP_CLONE_WORKTREE}" rev-parse HEAD)"
     info "Fetched commit: ${NEW_COMMIT:0:8}"
 
-    privileged_spare_running_tree "${APP_DIR}" "the application directory" || die "${IMS_DRIVER_OVERLAP_REASON}"
+    privileged_spare_running_tree "${APP_DIR}" "the application directory" || { rm -rf "${TMP_CLONE_DIR}"; die "${IMS_DRIVER_OVERLAP_REASON}"; }
     rsync -a --delete \
       --exclude='.git' \
       --exclude='.deploy-meta' \
@@ -5108,7 +5108,7 @@ if ! $NO_GIT; then
     # install.sh's two clone paths; this one, which does the identical thing in the identical
     # place, was left on the raw pair. See the prose above the helper in
     # scripts/lib/cutover-namespace.sh for what the `mkdir`, the `cd` and the `..` check buy.
-    privileged_spare_running_tree "${APP_DIR}/.git" "the application git directory" || die "${IMS_DRIVER_OVERLAP_REASON}"
+    privileged_spare_running_tree "${APP_DIR}/.git" "the application git directory" || { rm -rf "${TMP_CLONE_DIR}"; die "${IMS_DRIVER_OVERLAP_REASON}"; }
     copy_tree_into_new_dir "${TMP_CLONE_WORKTREE}/.git" "${APP_DIR}/.git"
     privileged_spare_running_tree "${APP_DIR}" "the application directory" || { rm -rf "${TMP_CLONE_DIR}"; die "${IMS_DRIVER_OVERLAP_REASON}"; }
     chown -R "${APP_USER}:${APP_USER}" "${APP_DIR}"
@@ -5439,6 +5439,11 @@ else
   mv "${BACKUP_PARTIAL}" "${BACKUP_TARGET}"
   BACKUP_FILE="${BACKUP_TARGET}"
   success "Backup saved: ${BACKUP_FILE}"
+  # WHAT THIS ONE CLOSES, AND WHAT IT DOES NOT (o3d-z5be r8, review LOW 6). The delete below is a GLOB at
+  # one level, `pre-update-*.sql.gz`, so an overlapping ${BACKUP_DIR} could only reach a file in the
+  # running tree that is named like a backup — not the entrypoint, and not its libraries. The guard is
+  # kept because ${BACKUP_DIR} is operator-settable (IMS_BACKUP_DIR, o3d-noka) and because every
+  # tree-wide statement in these files answers the same question, not because a hole is known here.
   privileged_spare_running_tree "${BACKUP_DIR}" "the backup directory" || die "${IMS_DRIVER_OVERLAP_REASON}"
   ls -t "${BACKUP_DIR}"/pre-update-*.sql.gz 2>/dev/null | tail -n +11 | xargs -r rm --
 fi

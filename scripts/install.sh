@@ -706,7 +706,7 @@ readonly APP_NAME="one-two-inventory"
 APP_USER="imsapp"
 readonly APP_DIR="/opt/${APP_NAME}"
 readonly DATA_DIR="/var/lib/${APP_NAME}"
-LOG_DIR="/var/log/${APP_NAME}"
+readonly LOG_DIR="/var/log/${APP_NAME}"
 BACKUP_DIR="${DATA_DIR}/backups"
 UPLOAD_STORAGE_DIR="${DATA_DIR}/uploads"
 PUBLIC_UPLOAD_STORAGE_DIR="${DATA_DIR}/public-uploads"
@@ -7511,8 +7511,15 @@ fi
 # the application account while bash was still reading it. privileged_trees_disjoint() and
 # privileged_spare_running_tree() compare by device and inode along the walk a recursive operation
 # makes, so neither a symbolic link nor a bind mount can make two overlapping trees look separate. The
-# checks at the operations are the ones the census in tests/scripts/privileged-helper-set.test.ts holds
-# every recursive operation to; these exist so an operator hears it before anything is installed.
+# WHAT THESE THREE CALLS ARE, SAID EXACTLY (o3d-z5be r8, review HIGH 2). They are an EARLY REFUSAL, not
+# the thing that carries the property. What carries it is the check made IMMEDIATELY BEFORE each
+# tree-wide operation, in all three entrypoints, which the census in
+# tests/scripts/privileged-helper-set.test.ts keeps in place for the shapes it knows. These calls run
+# before a package is installed and before ${APP_USER} exists, so an operator hears about an overlapping
+# tree while nothing has been changed — and on a FIRST INSTALL ${APP_DIR}, ${DATA_DIR} and ${LOG_DIR} do
+# not exist yet, so what they can compare against is the nearest existing ancestor (`/opt`, `/var/lib`,
+# `/var/log`). That is a weaker statement than the one made later against the real, populated tree, and
+# it is why these are described as an early refusal rather than as the guarantee.
 if [[ "$INSTALL_FROM_GIT" != "y" ]]; then
   privileged_trees_disjoint "${LOCAL_SOURCE_DIR}" "${APP_DIR}" "the local source directory" "the application directory" || die \
     "LOCAL_SOURCE_DIR must be a directory OUTSIDE ${APP_DIR}, and ${APP_DIR} must not be inside it: ${IMS_DRIVER_OVERLAP_REASON}. Copying a tree into itself, or into a tree that contains it, and then handing the result to ${APP_USER} is refused. Nothing has been changed."
@@ -8493,7 +8500,7 @@ if [[ "$INSTALL_FROM_GIT" == "y" ]]; then
     chown "${APP_USER}:${APP_USER}" "${TMP_CLONE_DIR}"
     run_git_as_user "${APP_USER}" git clone --branch "${GIT_BRANCH}" --depth 1 \
       "${GIT_REPO_URL}" "${TMP_CLONE_WORKTREE}"
-    privileged_spare_running_tree "${APP_DIR}" "the application directory" || die "${IMS_DRIVER_OVERLAP_REASON}"
+    privileged_spare_running_tree "${APP_DIR}" "the application directory" || { rm -rf "${TMP_CLONE_DIR}"; die "${IMS_DRIVER_OVERLAP_REASON}"; }
     rsync -a --delete \
       --exclude='.git' \
       --exclude='.deploy-meta' \
@@ -8503,7 +8510,7 @@ if [[ "$INSTALL_FROM_GIT" == "y" ]]; then
       --exclude='uploads' \
       --exclude='public/uploads' \
       "${TMP_CLONE_WORKTREE%/}/" "${APP_DIR}/"
-    privileged_spare_running_tree "${APP_DIR}/.git" "the application git directory" || die "${IMS_DRIVER_OVERLAP_REASON}"
+    privileged_spare_running_tree "${APP_DIR}/.git" "the application git directory" || { rm -rf "${TMP_CLONE_DIR}"; die "${IMS_DRIVER_OVERLAP_REASON}"; }
     copy_tree_into_new_dir "${TMP_CLONE_WORKTREE}/.git" "${APP_DIR}/.git"
     privileged_spare_running_tree "${APP_DIR}" "the application directory" || { rm -rf "${TMP_CLONE_DIR}"; die "${IMS_DRIVER_OVERLAP_REASON}"; }
     chown -R "${APP_USER}:${APP_USER}" "${APP_DIR}"
@@ -8542,7 +8549,7 @@ else
     chown "${APP_USER}:${APP_USER}" "${TMP_CLONE_DIR}"
     run_git_as_user "${APP_USER}" git clone --branch "${GIT_BRANCH}" --depth 1 \
       "${GIT_REPO_URL}" "${TMP_CLONE_WORKTREE}"
-    privileged_spare_running_tree "${APP_DIR}/.git" "the application git directory" || die "${IMS_DRIVER_OVERLAP_REASON}"
+    privileged_spare_running_tree "${APP_DIR}/.git" "the application git directory" || { rm -rf "${TMP_CLONE_DIR}"; die "${IMS_DRIVER_OVERLAP_REASON}"; }
     copy_tree_into_new_dir "${TMP_CLONE_WORKTREE}/.git" "${APP_DIR}/.git"
     privileged_spare_running_tree "${APP_DIR}/.git" "the application git directory" || { rm -rf "${TMP_CLONE_DIR}"; die "${IMS_DRIVER_OVERLAP_REASON}"; }
     chown -R "${APP_USER}:${APP_USER}" "${APP_DIR}/.git"

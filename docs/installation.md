@@ -60,28 +60,35 @@ are owned by root and writable by nobody else, and that every directory above it
 writable by group or other unless sticky; otherwise it stops and names the offending path. See *Which
 invocations are supported* below for why this is not optional, and why the check is only best-effort.
 
-**And the installer never hands the tree it is running from to another account** (o3d-z5be r6/r7). The
-property is carried by a **configuration-time gate**: before a package is installed and before the
-service account is created, `install.sh` checks that `${APP_DIR}`, the state directory and the log
-directory are each **disjoint** from the directory the running `install.sh` lives in — neither equals,
-contains nor lies inside the other — and that `LOCAL_SOURCE_DIR` is disjoint from `${APP_DIR}`. Disjoint
-is decided by **device and inode** along the same walk a recursive operation makes, and the set asked
-about is the running directory *and every file under it*, so a symbolic link, a bind mount, or a **hard
-link** to the entrypoint or a library inside the target cannot make two overlapping trees look separate.
-A walk that cannot be completed is a refusal, not a pass. Because that gate covers the whole run, it
-holds for operations no list enumerates.
+**And no privileged run hands the tree it is running from to another account** (o3d-z5be r6/r7/r8). The
+property is carried by a check made **immediately before each tree-wide ownership change, copy, move or
+delete**, in all three entrypoints: the target and the directory the running script lives in must be
+**disjoint** — neither equals, contains nor lies inside the other. Disjoint is decided by **device and
+inode** along the same walk a recursive operation makes, and the set asked about is the running directory
+*and every file under it*, so a symbolic link, a bind mount, or a **hard link** to the entrypoint or a
+library inside the target cannot make two overlapping trees look separate. A walk that cannot be
+completed is a refusal, not a pass, and a refusal ends the run.
 
-Each recursive ownership change, copy, move or delete is then **also** checked immediately before it runs
-— `${APP_DIR}`, its `.git`, the state directory, the log directory, the legacy upload migration, the
-backup pruner, the local-source copy, and `useradd --create-home`, plus `update.sh`'s copy into
-`${APP_DIR}`. That is defence in depth, and `tests/scripts/privileged-helper-set.test.ts` holds it in
-place with a **regression net**: it enumerates the *known shapes* of such a statement (a recursive flag in
-any position, long options, `find -exec`, `xargs`, `mv -t`, `useradd --create-home`, `su`/`eval`/`bash -c`,
-and the two repository helpers), requires its table to account for every hit, and fails on a new one. It
-is **not** a proof that no unguarded operation can exist — a shape nobody thought of is invisible to it,
-which is why the configuration-time gate is the thing the property rests on. (r6's net missed
-`chown -h -R`, a flag order `install.sh` itself ships, and two statements it never counted; both are
-guarded now.)
+`tests/scripts/privileged-helper-set.test.ts` is what keeps those guards in place. It **tokenises** each
+line of the three entrypoints (quoting, `$( … )`, backticks, line continuations, assignments, wrapper
+commands like `env`/`command`/`timeout`, and the path form `/bin/chown`), classifies every command it
+finds, and requires its table to account for each one — guarded, with the guard immediately before it
+*and its failure ending the run*, or carrying a written reason. It also follows **calls to functions
+defined in the same file** whose own body contains such a statement. It fails on a new one. It is a
+**regression net over the shapes it can classify**, not a proof that no unguarded operation can exist:
+a statement built out of something it cannot see — a command name computed at run time, a helper defined
+in another file — is invisible to it, and the guards, not the net, are what the property rests on.
+
+`install.sh` **also** asks the same question of `${APP_DIR}`, the state directory and the log directory
+when the configuration is collected, and refuses `LOCAL_SOURCE_DIR` that is equal to, inside or
+containing `${APP_DIR}`. That is an **early refusal**, and this page does not claim more for it: it runs
+before a package is installed and before the service account is created, so an operator hears about an
+overlapping tree while nothing has been changed — but on a **first install** those three directories do
+not exist yet, so all it can compare against is their nearest existing ancestor (`/opt`, `/var/lib`,
+`/var/log`). The real question, against the real and populated tree, is the one asked at each operation.
+`update.sh` and `deploy.sh` have no such early gate; `update.sh`'s copy into `${APP_DIR}`, its git
+metadata copy, its recursive chown and its backup pruner each carry the per-operation check, and
+`deploy.sh` makes no tree-wide ownership change, copy, move or delete at all.
 
 ```bash
 # ...or, on a box you will later upgrade, with the release's digest, which publishes the
