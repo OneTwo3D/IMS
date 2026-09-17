@@ -17,13 +17,21 @@
 Run the installer as root, **from a release that root fetched into a directory root has just created**:
 
 ```bash
+# 0. As root: a umask that does not hand the group or other a write bit. The startup check refuses a
+#    tree that is group- or other-writable, and under a permissive root umask (002, 000) the clone
+#    below comes out exactly that way — a refusal whose only remedy would be the relabel this section
+#    rejects. 022 is the default on Debian and Ubuntu; set it explicitly rather than assume it.
+umask 022
+
 # 1. As root: a NEW directory no other account has ever had open, under a root-owned parent that
 #    no other account can write (/root is root:root 0700 on Debian and Ubuntu).
 RELEASE_DIR="$(mktemp -d /root/ims-release.XXXXXX)"
 
 # 2. As root: fetch the release INTO it, so that every file is created by root, now.
 git clone --branch <release-tag> --depth 1 <repository-url> "${RELEASE_DIR}/one-two-inventory"
-#    ...or, from a release tarball root has downloaded into ${RELEASE_DIR}:
+#    ...or, from a release tarball root has downloaded into ${RELEASE_DIR}. Check what the archive's
+#    top-level directory is called (tar -tzf | head -1) and use THAT name in step 3 — it is the
+#    release's, not necessarily `one-two-inventory`:
 #    tar -xzf "${RELEASE_DIR}/<release>.tar.gz" -C "${RELEASE_DIR}" --no-same-owner --no-same-permissions
 
 # 3. Run the installer from there. NOT from /opt/one-two-inventory: that is the directory it
@@ -52,14 +60,28 @@ are owned by root and writable by nobody else, and that every directory above it
 writable by group or other unless sticky; otherwise it stops and names the offending path. See *Which
 invocations are supported* below for why this is not optional, and why the check is only best-effort.
 
-**And the installer never hands the tree it is running from to another account** (o3d-z5be r6). Every
-recursive ownership change, copy or delete it makes — `${APP_DIR}`, its `.git`, the state directory and
-the log directory, and the local-source copy into `${APP_DIR}` — is preceded by a check that the target and
-the directory the running `install.sh` lives in are **disjoint**: neither equals, contains or lies inside
-the other, decided by device and inode along the same walk the operation makes, so a symbolic link or a
-bind mount cannot make them look separate. `LOCAL_SOURCE_DIR` and `${APP_DIR}` are held to the same rule.
-The check runs once when the configuration is collected, before any package is installed, and again
-immediately before each operation. `update.sh` holds its copy into `${APP_DIR}` to the same rule.
+**And the installer never hands the tree it is running from to another account** (o3d-z5be r6/r7). The
+property is carried by a **configuration-time gate**: before a package is installed and before the
+service account is created, `install.sh` checks that `${APP_DIR}`, the state directory and the log
+directory are each **disjoint** from the directory the running `install.sh` lives in — neither equals,
+contains nor lies inside the other — and that `LOCAL_SOURCE_DIR` is disjoint from `${APP_DIR}`. Disjoint
+is decided by **device and inode** along the same walk a recursive operation makes, and the set asked
+about is the running directory *and every file under it*, so a symbolic link, a bind mount, or a **hard
+link** to the entrypoint or a library inside the target cannot make two overlapping trees look separate.
+A walk that cannot be completed is a refusal, not a pass. Because that gate covers the whole run, it
+holds for operations no list enumerates.
+
+Each recursive ownership change, copy, move or delete is then **also** checked immediately before it runs
+— `${APP_DIR}`, its `.git`, the state directory, the log directory, the legacy upload migration, the
+backup pruner, the local-source copy, and `useradd --create-home`, plus `update.sh`'s copy into
+`${APP_DIR}`. That is defence in depth, and `tests/scripts/privileged-helper-set.test.ts` holds it in
+place with a **regression net**: it enumerates the *known shapes* of such a statement (a recursive flag in
+any position, long options, `find -exec`, `xargs`, `mv -t`, `useradd --create-home`, `su`/`eval`/`bash -c`,
+and the two repository helpers), requires its table to account for every hit, and fails on a new one. It
+is **not** a proof that no unguarded operation can exist — a shape nobody thought of is invisible to it,
+which is why the configuration-time gate is the thing the property rests on. (r6's net missed
+`chown -h -R`, a flag order `install.sh` itself ships, and two statements it never counted; both are
+guarded now.)
 
 ```bash
 # ...or, on a box you will later upgrade, with the release's digest, which publishes the
@@ -2525,7 +2547,8 @@ trap's re-fence — in all three. The library is sourced from **the entrypoint's
 (`${BASH_SOURCE[0]}`), not from `APP_DIR`: it is read at startup, out of the same tree and in the
 same instant as the body of the script, so it adds no window the entrypoint does not already have
 (in a tree only root can write — out of any other, root is refused at startup and the invocation is not
-supported, o3d-z5be r5) — unlike the helper, which is executed several phases later, after the
+supported, o3d-z5be r5; that refusal is **best-effort and cannot detect a tree that was merely relabelled**
+— see *[The supported bootstrap](#supported-bootstrap)*) — unlike the helper, which is executed several phases later, after the
 application account has had a cutover's worth of time to replace it.
 
 **The library's own paths are `readonly`, and it may be sourced only once.** Every constant the
@@ -3260,7 +3283,7 @@ crossed however those bytes got there. `fence-db-connections.mjs` runs as the ap
 out of the protected root-owned artefact at `/etc/ims-cutover-recovery/app`. `npm`, `npx prisma` and
 `next` likewise run as the application user. The five `source`s at the top of each entrypoint are
 read at startup, in the same instant as the entrypoint's own body, so they add no window the operator
-did not already accept — **in a tree only root can write**. Out of a tree another account can write that is false, because bash reads the entrypoint incrementally and each library later still, and root running out of such a tree is refused and not supported (o3d-z5be r5; see *Which invocations are supported*).
+did not already accept — **in a tree only root can write**. Out of a tree another account can write that is false, because bash reads the entrypoint incrementally and each library later still, and root running out of such a tree is refused and not supported (o3d-z5be r5; see *Which invocations are supported*). That refusal reads ownership and modes, so it is **best-effort**: it cannot tell a tree that was relabelled with `chown`/`chmod` from one root created — see *[The supported bootstrap](#supported-bootstrap)*.
 
 **An optional pin.** `IMS_HELPER_SET_SHA256=<64 hex>` on the privileged invocation makes the
 publication *authenticate* as well as freeze: the assembled tree must hash to that value or nothing
@@ -3824,7 +3847,8 @@ service account, so a file resolved from that checkout *in the middle of the cut
 account can replace after the operator started the run. The three libraries this script `source`s
 at startup are not the same case — they are read in the same instant as the entrypoint's own body,
 so they add no window the entrypoint does not already have (true only of a tree only root can write,
-which is why r5 refuses root out of any other) — and pinning the helper would only move
+which is why r5 refuses root out of any other — best-effort, and blind to a relabelled tree: see
+*[The supported bootstrap](#supported-bootstrap)*) — and pinning the helper would only move
 the boundary to a script read from the same checkout. `scripts/lib/pin-source-file.mjs` was built
 for exactly that and deleted for exactly that reason. The same late-read shape already ships twice,
 in `install.sh`'s `chown_state_tree()` and its auth probe; that is `o3d-kyqa`.

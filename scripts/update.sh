@@ -5110,7 +5110,7 @@ if ! $NO_GIT; then
     # scripts/lib/cutover-namespace.sh for what the `mkdir`, the `cd` and the `..` check buy.
     privileged_spare_running_tree "${APP_DIR}/.git" "the application git directory" || die "${IMS_DRIVER_OVERLAP_REASON}"
     copy_tree_into_new_dir "${TMP_CLONE_WORKTREE}/.git" "${APP_DIR}/.git"
-    privileged_spare_running_tree "${APP_DIR}" "the application directory" || die "${IMS_DRIVER_OVERLAP_REASON}"
+    privileged_spare_running_tree "${APP_DIR}" "the application directory" || { rm -rf "${TMP_CLONE_DIR}"; die "${IMS_DRIVER_OVERLAP_REASON}"; }
     chown -R "${APP_USER}:${APP_USER}" "${APP_DIR}"
     rm -rf "${TMP_CLONE_DIR}"
     success "Repository synced into existing app directory."
@@ -5439,6 +5439,7 @@ else
   mv "${BACKUP_PARTIAL}" "${BACKUP_TARGET}"
   BACKUP_FILE="${BACKUP_TARGET}"
   success "Backup saved: ${BACKUP_FILE}"
+  privileged_spare_running_tree "${BACKUP_DIR}" "the backup directory" || die "${IMS_DRIVER_OVERLAP_REASON}"
   ls -t "${BACKUP_DIR}"/pre-update-*.sql.gz 2>/dev/null | tail -n +11 | xargs -r rm --
 fi
 

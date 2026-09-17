@@ -7517,10 +7517,19 @@ if [[ "$INSTALL_FROM_GIT" != "y" ]]; then
   privileged_trees_disjoint "${LOCAL_SOURCE_DIR}" "${APP_DIR}" "the local source directory" "the application directory" || die \
     "LOCAL_SOURCE_DIR must be a directory OUTSIDE ${APP_DIR}, and ${APP_DIR} must not be inside it: ${IMS_DRIVER_OVERLAP_REASON}. Copying a tree into itself, or into a tree that contains it, and then handing the result to ${APP_USER} is refused. Nothing has been changed."
 fi
-for IMS_OVERLAP_CHECK in "${APP_DIR}|the application directory" "${DATA_DIR}|the state directory" "${LOG_DIR}|the log directory"; do
-  privileged_spare_running_tree "${IMS_OVERLAP_CHECK%%|*}" "${IMS_OVERLAP_CHECK#*|}" || die "${IMS_DRIVER_OVERLAP_REASON} Nothing has been changed."
+# THE THREE ROOTS ARE NAMED, NOT PACKED INTO ONE STRING (o3d-z5be r7, review LOW 8). The first form
+# carried "<path>|<description>" and split on `|`, so a path containing that byte would have been
+# silently truncated to its first component and the guard would have asked about the wrong directory.
+# The names are indirected and the description comes from a `case`, so no value is parsed.
+for IMS_OVERLAP_NAME in APP_DIR DATA_DIR LOG_DIR; do
+  case "${IMS_OVERLAP_NAME}" in
+    APP_DIR)  IMS_OVERLAP_WHAT="the application directory" ;;
+    DATA_DIR) IMS_OVERLAP_WHAT="the state directory" ;;
+    LOG_DIR)  IMS_OVERLAP_WHAT="the log directory" ;;
+  esac
+  privileged_spare_running_tree "${!IMS_OVERLAP_NAME}" "${IMS_OVERLAP_WHAT}" || die "${IMS_DRIVER_OVERLAP_REASON} Nothing has been changed."
 done
-unset IMS_OVERLAP_CHECK
+unset IMS_OVERLAP_NAME IMS_OVERLAP_WHAT
 prompt_yn GIT_DEPLOY_KEY_ENABLED "Configure a per-instance GitHub deploy key for private repo updates?" "n"
 if [[ "${GIT_DEPLOY_KEY_ENABLED}" == "y" ]]; then
   if [[ "${INSTALL_FROM_GIT}" != "y" ]]; then
@@ -8186,6 +8195,12 @@ fi
 header "Creating app user and directories"
 
 if ! id "${APP_USER}" &>/dev/null; then
+  # `--create-home` CREATES ${APP_DIR} AND GIVES IT TO ${APP_USER} when it does not exist yet, which is
+  # a recursive ownership change over that path by another name (o3d-z5be r7, re-audit). The
+  # configuration-time gate above has already refused a run whose own tree lies there; this is the same
+  # question asked at the operation, so the census in tests/scripts/privileged-helper-set.test.ts can
+  # hold every such statement to the same rule.
+  privileged_spare_running_tree "${APP_DIR}" "the application directory (about to become ${APP_USER}'s home)" || die "${IMS_DRIVER_OVERLAP_REASON}"
   useradd --system --shell /bin/bash --home-dir "${APP_DIR}" --create-home "${APP_USER}"
   success "System user '${APP_USER}' created."
 else
@@ -8281,6 +8296,7 @@ migrate_uploads() {
     # cannot see it, because there the two uids are one. The identity of the destination is what
     # mattered and ownership was standing in for it; the walk pins the identity directly.
     saved="$(pwd -P)" || die "this run cannot establish its own working directory, so it will not migrate ${src}."
+    privileged_spare_running_tree "${src}" "the legacy upload directory being migrated" || die "${IMS_DRIVER_OVERLAP_REASON}"
     enter_service_subdir "${DATA_DIR}" 022 "${dest}"
     find "${src}" -mindepth 1 -maxdepth 1 -exec mv -n -t . {} + \
       || die "Legacy uploads at ${src} could not be moved into ${dest}. Nothing has been started and nothing has been migrated."
@@ -8489,7 +8505,7 @@ if [[ "$INSTALL_FROM_GIT" == "y" ]]; then
       "${TMP_CLONE_WORKTREE%/}/" "${APP_DIR}/"
     privileged_spare_running_tree "${APP_DIR}/.git" "the application git directory" || die "${IMS_DRIVER_OVERLAP_REASON}"
     copy_tree_into_new_dir "${TMP_CLONE_WORKTREE}/.git" "${APP_DIR}/.git"
-    privileged_spare_running_tree "${APP_DIR}" "the application directory" || die "${IMS_DRIVER_OVERLAP_REASON}"
+    privileged_spare_running_tree "${APP_DIR}" "the application directory" || { rm -rf "${TMP_CLONE_DIR}"; die "${IMS_DRIVER_OVERLAP_REASON}"; }
     chown -R "${APP_USER}:${APP_USER}" "${APP_DIR}"
     rm -rf "${TMP_CLONE_DIR}"
     success "Repository synced into existing directory."
@@ -8528,7 +8544,7 @@ else
       "${GIT_REPO_URL}" "${TMP_CLONE_WORKTREE}"
     privileged_spare_running_tree "${APP_DIR}/.git" "the application git directory" || die "${IMS_DRIVER_OVERLAP_REASON}"
     copy_tree_into_new_dir "${TMP_CLONE_WORKTREE}/.git" "${APP_DIR}/.git"
-    privileged_spare_running_tree "${APP_DIR}/.git" "the application git directory" || die "${IMS_DRIVER_OVERLAP_REASON}"
+    privileged_spare_running_tree "${APP_DIR}/.git" "the application git directory" || { rm -rf "${TMP_CLONE_DIR}"; die "${IMS_DRIVER_OVERLAP_REASON}"; }
     chown -R "${APP_USER}:${APP_USER}" "${APP_DIR}/.git"
     rm -rf "${TMP_CLONE_DIR}"
     success "Git metadata attached."

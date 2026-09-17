@@ -451,7 +451,7 @@ driver_root_ancestry_is_private() {
       # ancestor of ours — but at the PARENT it would still let another account win the race to
       # create ${IMS_DRIVER_ROOT} before this run does.
       if (( parent == 1 )) || (( (8#${mode:-777} & 01000) == 0 )); then
-        driver_refuse "${dir} has mode ${mode} — writable by group or other, and $( (( parent == 1 )) && printf 'it is the immediate parent, where the sticky bit would still let another account create that name first' || printf 'it is not sticky, so another account can rename it' ) — so an account other than this one can replace ${IMS_DRIVER_ROOT} and everything root runs out of it. Take group and other write off it (chmod g-w,o-w ${dir}) and re-run; nothing has been published" || return 1
+        driver_refuse "${dir} has mode ${mode} — writable by group or other, and $( (( parent == 1 )) && printf 'it is the immediate parent, where the sticky bit would still let another account create that name first' || printf 'it is not sticky, so another account can rename it' ) — so an account other than this one can replace ${IMS_DRIVER_ROOT} and everything root runs out of it. Take the group and other WRITE BIT off that DIRECTORY (chmod g-w,o-w ${dir}) and re-run. That closes it, and it is not the relabel docs/installation.md refuses as a bootstrap: permission to create, rename or remove an entry IN a directory is checked on every operation, so a mode change there takes effect at once — where a FILE's mode change revokes no descriptor another account already opened for writing. Nothing has been published" || return 1
       fi
     fi
     parent=0
@@ -1408,6 +1408,16 @@ privileged_helper_path() {
 # A TARGET THAT DOES NOT EXIST YET is the directory its nearest existing ancestor will receive, so it
 # overlaps a tree exactly when that ancestor lies inside, or is, that tree.
 #
+# WHAT IT COSTS, AND THE ONE PROPERTY THAT IS ONLY AVAILABILITY (o3d-z5be r7, review LOW 4). Each call
+# walks the target tree once, and a privileged run makes three to six of them over ${APP_DIR} — which on
+# an installed host holds node_modules and .next, so this is seconds, not milliseconds. It is not
+# bounded, deliberately: a depth or count limit would be a walk that can miss the object it is looking
+# for, which is the one outcome this must not have. The consequence an operator should know: the service
+# account can make any walk of its own tree fail (a mode it sets, an I/O error it provokes) and every
+# later privileged run then REFUSES rather than proceeding. That is fail-closed and it is a denial of
+# service the account already has by simpler means — it owns the application directory — so it is
+# named here rather than traded away for a walk that could be fooled.
+#
 # ENOENT DURING THE WALK IS NOT A REFUSAL. A tree the service can write loses entries while it is walked
 # (a build cache, a pid file), and a subtree that vanished cannot be one a recursive operation reaches
 # afterwards: nothing but root can move the executing directory, whose ancestry the startup block
@@ -1418,6 +1428,14 @@ IMS_DRIVER_OVERLAP_REASON=""
 # "<exists 0|1> <physical path>". Fails only if not even `/` resolves.
 privileged_physical_or_nearest() {
   local path="$1" up resolved
+  # AN EMPTY PATH IS NOT THE WORKING DIRECTORY (o3d-z5be r7, review LOW 1). `realpath -e ""` fails and
+  # `dirname -- ""` is `.`, so without this the walk below answered confidently about the caller's cwd.
+  [[ -n "${path}" ]] || return 1
+  # AND A PATH CARRYING A NEWLINE IS REFUSED RATHER THAN TRIMMED (review LOW 2). Command substitution
+  # strips trailing newlines, so `realpath` of "/srv/app\n" would hand back "/srv/app" and every
+  # comparison below would be about a directory the caller did not name. ${LOCAL_SOURCE_DIR} is
+  # operator-supplied, which is how such a value gets here.
+  [[ "${path}" != *$'\n'* ]] || return 1
   if resolved="$(realpath -e -- "${path}" 2>/dev/null)" && [[ -d "${resolved}" ]]; then
     printf '1 %s' "${resolved}"
     return 0
@@ -1433,25 +1451,73 @@ privileged_physical_or_nearest() {
   done
 }
 
-# Does a walk of "$1" reach the directory "$2" (same device and inode)? 0 yes, 1 no, 2 could not tell.
+# DOES A WALK OF "$1" REACH ANY OF THE device:inode PAIRS LISTED IN THE FILE "$2"? 0 yes, 1 no, 2 could
+# not tell. The walk is the one a recursive `chown`, `rsync` or `rm` makes — by directory entry, not
+# following symbolic links, crossing mount points — so anything such an operation could reach, this
+# reaches too.
+#
+# AN INODE SET RATHER THAN ONE DIRECTORY (o3d-z5be r7, review MEDIUM 3). `find -samefile <dir>` asks
+# only about the running DIRECTORY, and a HARD LINK to the entrypoint or to a library inside the target
+# is not that directory: `ln <release>/scripts/install.sh ${APP_DIR}/x.sh` left the guard passing while
+# `chown -R ${APP_USER} ${APP_DIR}` changed the owner of the inode bash was reading. The caller lists
+# every inode whose ownership must not move — the directory, the entrypoint and every file under lib/ —
+# and this asks about all of them in one walk.
+#
+# AND THE ERROR TEST IS ON THE errno, ANCHORED (review MEDIUM 2). It was `grep -qv 'No such file or
+# directory'`, i.e. "is there a line NOT CONTAINING that substring" — so a directory literally NAMED
+# `No such file or directory` turned "could not tell" into "not reached", and the caller then treated
+# overlapping trees as disjoint. `find` writes `find: '<path>': <strerror>`, so the errno is the tail of
+# the line and is matched as such. A vanished entry is the one benign case: a tree the service account
+# writes loses entries while it is walked, and a subtree that is gone is not one a later recursive
+# operation reaches. Every other message — EACCES, EIO, ELOOP — is "could not tell", and the caller
+# refuses on it.
 privileged_walk_reaches() {
-  local from="$1" target="$2" errors hit rc=0
+  local from="$1" idfile="$2" errors hits rc=0
+  [[ -s "${idfile}" ]] || return 2
   errors="$(mktemp 2>/dev/null)" || return 2
-  hit="$(find "${from}" -samefile "${target}" -print -quit 2>"${errors}")" || rc=$?
-  if (( rc != 0 )) && grep -qv 'No such file or directory' "${errors}" 2>/dev/null; then
-    rm -f "${errors}"
-    return 2
+  hits="$(mktemp 2>/dev/null)" || { rm -f "${errors}"; return 2; }
+  # THE PIPELINE RUNS IN THIS SHELL, NOT IN A COMMAND SUBSTITUTION, because ${PIPESTATUS} is about the
+  # last pipeline THIS shell ran: read through `hit="$( … | … )"` it reports the assignment's status, 0,
+  # and every walk error then read as "the walk succeeded and found nothing". That is the same class of
+  # mistake as the errno test below, and it hid it.
+  find "${from}" -printf '%D:%i\n' 2>"${errors}" | grep -m1 -x -F -f "${idfile}" > "${hits}"
+  rc=${PIPESTATUS[0]}
+  if [[ -s "${hits}" ]]; then
+    rm -f "${errors}" "${hits}"
+    return 0
   fi
-  rm -f "${errors}"
-  [[ -n "${hit}" ]] && return 0
+  # NO HIT, SO THE WALK RAN TO THE END AND ITS STATUS IS ITS OWN. A failure is "could not tell" unless
+  # every message is a vanished entry: `find: '<path>': No such file or directory`, matched at the END
+  # of the line so that a directory NAMED after the errno cannot pass for one.
+  if (( rc != 0 )); then
+    if ! [[ -s "${errors}" ]] || grep -qvE ": No such file or directory$" "${errors}"; then
+      rm -f "${errors}" "${hits}"
+      return 2
+    fi
+  fi
+  rm -f "${errors}" "${hits}"
   return 1
+}
+
+# THE device:inode OF EVERY OBJECT A RECURSIVE OPERATION MUST NOT REACH, written to the file "$2": the
+# directory "$1" itself and — when it is the tree this run is executing from — the entrypoint and
+# everything under its lib/. Returns 1 if the list could not be built, which the caller refuses on.
+privileged_tree_inode_list() {
+  local root="$1" out="$2" extra="${3:-}"
+  : > "${out}" || return 1
+  LC_ALL=C stat -c '%d:%i' -- "${root}" >> "${out}" 2>/dev/null || return 1
+  if [[ -n "${extra}" ]]; then
+    find "${extra}" -printf '%D:%i\n' >> "${out}" 2>/dev/null || return 1
+  fi
+  [[ -s "${out}" ]] || return 1
+  return 0
 }
 
 # ARE "$1" AND "$2" DISJOINT? Returns 0 when neither equals, contains or lies inside the other, and 1
 # — with the reason in ${IMS_DRIVER_OVERLAP_REASON} and on stderr — when they overlap or the question
 # could not be answered. "$3" and "$4" say what each is, for the sentence.
 privileged_trees_disjoint() {
-  local a="$1" b="$2" what_a="$3" what_b="$4" ra rb a_exists b_exists r=0
+  local a="$1" b="$2" what_a="$3" what_b="$4" ra rb a_exists b_exists r=0 privileged_trees_disjoint_ids=""
   IMS_DRIVER_OVERLAP_REASON=""
   ra="$(privileged_physical_or_nearest "${a}")" || ra=""
   rb="$(privileged_physical_or_nearest "${b}")" || rb=""
@@ -1470,7 +1536,15 @@ privileged_trees_disjoint() {
   # b inside-or-equal a?  (a's walk reaches b; for a missing b, b's nearest ancestor)
   if [[ "${a_exists}" == "1" ]]; then
     r=0
-    privileged_walk_reaches "${ra}" "${rb}" || r=$?
+    privileged_trees_disjoint_ids="$(mktemp 2>/dev/null)" || return 1
+    if ! privileged_tree_inode_list "${rb}" "${privileged_trees_disjoint_ids}" "${IMS_DRIVER_OVERLAP_EXTRA_IDS:-}"; then
+      rm -f "${privileged_trees_disjoint_ids}"
+      IMS_DRIVER_OVERLAP_REASON="${what_b} (${b}) could not be identified, so this run cannot show ${what_a} (${a}) does not contain it"
+      echo "${IMS_DRIVER_OVERLAP_REASON}" >&2
+      return 1
+    fi
+    privileged_walk_reaches "${ra}" "${privileged_trees_disjoint_ids}" || r=$?
+    rm -f "${privileged_trees_disjoint_ids}"
     if (( r != 1 )); then
       (( r == 0 )) && IMS_DRIVER_OVERLAP_REASON="${what_b} (${b}) is, or lies inside, ${what_a} (${a})"         || IMS_DRIVER_OVERLAP_REASON="${what_a} (${a}) could not be walked to show it does not contain ${what_b} (${b})"
       echo "${IMS_DRIVER_OVERLAP_REASON}" >&2
@@ -1479,7 +1553,15 @@ privileged_trees_disjoint() {
   fi
   if [[ "${b_exists}" == "1" ]]; then
     r=0
-    privileged_walk_reaches "${rb}" "${ra}" || r=$?
+    privileged_trees_disjoint_ids="$(mktemp 2>/dev/null)" || return 1
+    if ! privileged_tree_inode_list "${ra}" "${privileged_trees_disjoint_ids}"; then
+      rm -f "${privileged_trees_disjoint_ids}"
+      IMS_DRIVER_OVERLAP_REASON="${what_a} (${a}) could not be identified, so this run cannot show ${what_b} (${b}) does not contain it"
+      echo "${IMS_DRIVER_OVERLAP_REASON}" >&2
+      return 1
+    fi
+    privileged_walk_reaches "${rb}" "${privileged_trees_disjoint_ids}" || r=$?
+    rm -f "${privileged_trees_disjoint_ids}"
     if (( r != 1 )); then
       (( r == 0 )) && IMS_DRIVER_OVERLAP_REASON="${what_a} (${a}) is, or lies inside, ${what_b} (${b})"         || IMS_DRIVER_OVERLAP_REASON="${what_b} (${b}) could not be walked to show it does not contain ${what_a} (${a})"
       echo "${IMS_DRIVER_OVERLAP_REASON}" >&2
@@ -1502,6 +1584,13 @@ privileged_spare_running_tree() {
     return 1
   fi
   running="$(dirname -- "${IMS_SCRIPT_LIB_DIR}")"
+  # AND THE FILES IN IT, NOT JUST THE DIRECTORY (o3d-z5be r7, review MEDIUM 3). A hard link to the
+  # entrypoint or to a library, created inside the target by the account that owns it, is a second name
+  # for the inode bash is reading — and `chown -R` over that name changes the owner of that inode. The
+  # directory's inode is not reachable through such a link, so the walk is given every inode under the
+  # running tree to look for as well. (On this host `fs.protected_hardlinks=1` also stops the service
+  # account creating such a link to a root-owned file; this does not depend on that sysctl being set.)
+  local IMS_DRIVER_OVERLAP_EXTRA_IDS="${running}"
   if ! privileged_trees_disjoint "${target}" "${running}" "${what}" "the directory this run is executing from"; then
     IMS_DRIVER_OVERLAP_REASON="REFUSING to change the ownership of, copy into, or delete from ${what} (${target}): ${IMS_DRIVER_OVERLAP_REASON}. A privileged run never hands the tree it is executing from to another account — bash is still reading this script off that tree, so the account that received it could write the commands root has not read yet. Run the installer from a release directory outside ${target}; see *The supported bootstrap* in docs/installation.md"
     echo "${IMS_DRIVER_OVERLAP_REASON}" >&2

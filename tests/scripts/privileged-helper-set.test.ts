@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import { execFileSync, spawnSync } from 'node:child_process'
-import { chmodSync, existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, readlinkSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs'
+import { chmodSync, existsSync, linkSync, lstatSync, mkdirSync, readFileSync, readdirSync, readlinkSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { test, type TestContext } from 'node:test'
 
@@ -2417,47 +2417,110 @@ test('[o3d-z5be] update.sh refuses to copy into or chown an APP_DIR that holds t
   assert.match(clean.calls, new RegExp(`^chown -R imsapp:imsapp ${app}$`, 'm'), clean.calls)
 })
 
-test('[o3d-z5be] CENSUS: every recursive ownership change, copy or delete in the three entrypoints is guarded against the running tree', () => {
-  // THE AUDIT, AS A TEST THAT FAILS ON A NEW ONE. Every root-side statement in an entrypoint that can
-  // change ownership or content recursively is enumerated by grammar; the table below must account for
-  // each one exactly, and each guarded one must be IMMEDIATELY preceded — as the previous code statement,
-  // not "somewhere nearby" — by privileged_spare_running_tree on the named target.
-  const RECURSIVE = /(^|[\s;(])(chown|chmod|chgrp)\s+(-[A-Za-z]*R[A-Za-z]*|--recursive)\b|(^|[\s;(])setfacl\s|(^|[\s;(])rsync\s+-|(^|[\s;(])cp\s+-[A-Za-z]*[aRr]|(^|[\s;(])rm\s+-[A-Za-z]*r|^\s*(chown_state_tree|copy_tree_into_new_dir)\s/
+test('[o3d-z5be] REGRESSION NET: every tree-wide ownership change, copy, move or delete the entrypoints make is accounted for, and the guarded ones carry their guard', () => {
+  // WHAT THIS IS, STATED BEFORE THE RULE (o3d-z5be r7, review HIGH). This is a REGRESSION NET OVER KNOWN
+  // FORMS, not a proof that no unguarded recursive operation can exist. It enumerates the shapes listed
+  // below — a recursive flag in any position, long options, `find -exec`, `xargs`, `mv -t`,
+  // `useradd --create-home`, `su`/`eval`/`bash -c`, and the two repository helpers — and requires the
+  // table to account for every hit exactly; a NEW statement in one of those shapes fails it until
+  // somebody decides which row it is. A statement in a shape nobody thought of is invisible to it.
+  //
+  // THE PROPERTY IS NOT HELD BY THIS TEST. It is held by the CONFIGURATION-TIME gate in install.sh,
+  // which asks the same question of APP_DIR, DATA_DIR and LOG_DIR before a package is installed and
+  // before `useradd` runs, so it covers the whole run including any operation this grammar misses. The
+  // per-operation guards are defence in depth and this test is what keeps them from rotting.
+  //
+  // r6's version of this test missed `chown -h -R` — a flag order install.sh ITSELF ships at the log
+  // directory — plus `rm -Rf`, `find -exec chown`, `xargs chown`, `cp --archive` and `su -c "chown -R"`,
+  // and its count floor was below the true count: `find … -exec mv -n -t .` (migrate_uploads) and
+  // `useradd --create-home` were never counted. Both are guarded now.
+  const RECURSIVE = new RegExp([
+    // a recursive flag ANYWHERE in the option cluster, or the long option
+    String.raw`(?:^|[\s;(&|])(?:chown|chmod|chgrp)\b(?=[^\n]*(?:\s-[A-Za-z]*R[A-Za-z]*(?:\s|$)|\s--recursive\b))`,
+    // whole-tree by construction, whatever the flags
+    String.raw`(?:^|[\s;(&|])(?:rsync|setfacl|chown_state_tree|copy_tree_into_new_dir)\b`,
+    String.raw`(?:^|[\s;(&|])cp\b(?=[^\n]*(?:\s-[A-Za-z]*[aRr][A-Za-z]*(?:\s|$)|\s--archive\b|\s--recursive\b))`,
+    String.raw`(?:^|[\s;(&|])rm\b(?=[^\n]*(?:\s-[A-Za-z]*[Rr][A-Za-z]*(?:\s|$)|\s--recursive\b))`,
+    String.raw`(?:^|[\s;(&|])mv\b(?=[^\n]*(?:\s-[A-Za-z]*t[A-Za-z]*(?:\s|$)|\s--target-directory\b))`,
+    // an enumeration that hands paths to another command, and the command that consumes one
+    String.raw`(?:^|[\s;(&|])find\b(?=[^\n]*(?:-exec|-execdir|-ok\b|-delete\b))`,
+    String.raw`(?:^|[\s;(&|])xargs\b`,
+    // an account creation that can create and own a home tree
+    String.raw`(?:^|[\s;(&|])(?:useradd|usermod)\b(?=[^\n]*(?:--create-home|--home-dir|\s-[A-Za-z]*m[A-Za-z]*(?:\s|$)|\s-d\s))`,
+    // and the indirections that could carry any of the above
+    String.raw`(?:^|[\s;(&|])(?:eval|su|sudo|runuser)\b`,
+    String.raw`(?:^|[\s;(&|])(?:bash|sh)\s+-c\b`,
+  ].join('|'))
+  // MESSAGES ARE NOT STATEMENTS. Every refusal in these files quotes the commands it is about, so the
+  // DOUBLE-QUOTED spans are removed before matching — which is a rule about the grammar rather than a
+  // list of command names, the way r6's `/^\s*(echo|printf|info|…)/` was. That list had no word
+  // boundary either, so any statement whose command merely STARTED with one of those words was dropped.
+  const statementOf = (text: string) => text.replace(/"(?:[^"\\]|\\.)*"/g, ' ')
   type Entry = { file: string; op: RegExp; guard: string | null; up?: number; why?: string }
   const G = (target: string) => `privileged_spare_running_tree "${target}" `
+  const MKTEMP = 'the clone directory this run made with `mktemp -d -t`, which cannot be the running tree'
   const table: Entry[] = [
+    { file: 'scripts/install.sh', op: /^  rsync \\$/, guard: null, why: 'the package NAME in the apt-get install list, not a command' },
+    { file: 'scripts/install.sh', op: /^  if command -v runuser >\/dev\/null 2>&1; then$/, guard: null, why: 'a probe for the binary with `command -v`, which runs nothing' },
+    { file: 'scripts/install.sh', op: /^  elif command -v sudo >\/dev\/null 2>&1; then$/, guard: null, why: 'a probe for the binary with `command -v`, which runs nothing' },
+    { file: 'scripts/install.sh', op: /^    runuser -u "\$user" -- "\$@"$/, guard: null, why: 'run_as_user: drops privilege to $user, never a root-side change' },
+    { file: 'scripts/install.sh', op: /^    sudo -u "\$user" "\$@"$/, guard: null, why: 'run_as_user fallback: drops privilege' },
+    { file: 'scripts/install.sh', op: /^    su -s \/bin\/bash -c "\$\(printf '%q ' "\$@"\)" "\$user"$/, guard: null, why: 'run_as_user fallback: drops privilege' },
+    { file: 'scripts/install.sh', op: /^  useradd --system --shell \/bin\/bash --home-dir "\$\{APP_DIR\}" --create-home "\$\{APP_USER\}"$/, guard: G('${APP_DIR}') },
+    { file: 'scripts/install.sh', op: /^    find "\$\{src\}" -mindepth 1 -maxdepth 1 -exec mv -n -t \. \{\} \+ \\$/, guard: G('${src}'), up: 2 },
     { file: 'scripts/install.sh', op: /^chown_state_tree "\$\{DATA_DIR\}"/, guard: G('${DATA_DIR}') },
     { file: 'scripts/install.sh', op: /^  chown -Rh "\$\{APP_USER\}:\$\{APP_USER\}" \.$/, guard: G('${LOG_DIR}'), up: 3 },
     { file: 'scripts/install.sh', op: /^    rsync -a --delete \\$/, guard: G('${APP_DIR}') },
     { file: 'scripts/install.sh', op: /^    copy_tree_into_new_dir "\$\{TMP_CLONE_WORKTREE\}\/\.git" "\$\{APP_DIR\}\/\.git"$/, guard: G('${APP_DIR}/.git') },
+    { file: 'scripts/install.sh', op: /^    privileged_spare_running_tree "\$\{APP_DIR\}" .*rm -rf "\$\{TMP_CLONE_DIR\}"/, guard: null, why: `the guard's own failure branch removes ${MKTEMP}` },
     { file: 'scripts/install.sh', op: /^    chown -R "\$\{APP_USER\}:\$\{APP_USER\}" "\$\{APP_DIR\}"$/, guard: G('${APP_DIR}') },
-    { file: 'scripts/install.sh', op: /^    rm -rf "\$\{TMP_CLONE_DIR\}"$/, guard: null, why: 'TMP_CLONE_DIR is a `mktemp -d` this run created after the entrypoint was opened' },
+    { file: 'scripts/install.sh', op: /^    rm -rf "\$\{TMP_CLONE_DIR\}"$/, guard: null, why: MKTEMP },
     { file: 'scripts/install.sh', op: /^  rsync -a --delete \\$/, guard: G('${APP_DIR}') },
     { file: 'scripts/install.sh', op: /^  chown -R "\$\{APP_USER\}:\$\{APP_USER\}" "\$\{APP_DIR\}"$/, guard: G('${APP_DIR}') },
     { file: 'scripts/install.sh', op: /^    copy_tree_into_new_dir "\$\{TMP_CLONE_WORKTREE\}\/\.git" "\$\{APP_DIR\}\/\.git"$/, guard: G('${APP_DIR}/.git') },
+    { file: 'scripts/install.sh', op: /^    privileged_spare_running_tree "\$\{APP_DIR\}\/\.git" .*rm -rf "\$\{TMP_CLONE_DIR\}"/, guard: null, why: `the guard's own failure branch removes ${MKTEMP}` },
     { file: 'scripts/install.sh', op: /^    chown -R "\$\{APP_USER\}:\$\{APP_USER\}" "\$\{APP_DIR\}\/\.git"$/, guard: G('${APP_DIR}/.git') },
-    { file: 'scripts/install.sh', op: /^    rm -rf "\$\{TMP_CLONE_DIR\}"$/, guard: null, why: 'mktemp -d' },
+    { file: 'scripts/install.sh', op: /^    rm -rf "\$\{TMP_CLONE_DIR\}"$/, guard: null, why: MKTEMP },
+    { file: 'scripts/update.sh', op: /^  if command -v runuser >\/dev\/null 2>&1; then$/, guard: null, why: 'a probe for the binary with `command -v`, which runs nothing' },
+    { file: 'scripts/update.sh', op: /^  elif command -v sudo >\/dev\/null 2>&1; then$/, guard: null, why: 'a probe for the binary with `command -v`, which runs nothing' },
+    { file: 'scripts/update.sh', op: /^    runuser -u "\$user" -- "\$@"$/, guard: null, why: 'run_as_user: drops privilege to $user' },
+    { file: 'scripts/update.sh', op: /^    sudo -u "\$user" "\$@"$/, guard: null, why: 'run_as_user fallback: drops privilege' },
+    { file: 'scripts/update.sh', op: /^    su -s \/bin\/bash -c "\$\(printf '%q ' "\$@"\)" "\$user"$/, guard: null, why: 'run_as_user fallback: drops privilege' },
     { file: 'scripts/update.sh', op: /^    rsync -a --delete \\$/, guard: G('${APP_DIR}') },
     { file: 'scripts/update.sh', op: /^    copy_tree_into_new_dir "\$\{TMP_CLONE_WORKTREE\}\/\.git" "\$\{APP_DIR\}\/\.git"$/, guard: G('${APP_DIR}/.git') },
+    { file: 'scripts/update.sh', op: /^    privileged_spare_running_tree "\$\{APP_DIR\}" .*rm -rf "\$\{TMP_CLONE_DIR\}"/, guard: null, why: `the guard's own failure branch removes ${MKTEMP}` },
     { file: 'scripts/update.sh', op: /^    chown -R "\$\{APP_USER\}:\$\{APP_USER\}" "\$\{APP_DIR\}"$/, guard: G('${APP_DIR}') },
-    { file: 'scripts/update.sh', op: /^    rm -rf "\$\{TMP_CLONE_DIR\}"$/, guard: null, why: 'mktemp -d' },
+    { file: 'scripts/update.sh', op: /^    rm -rf "\$\{TMP_CLONE_DIR\}"$/, guard: null, why: MKTEMP },
+    { file: 'scripts/update.sh', op: /^  ls -t "\$\{BACKUP_DIR\}"\/pre-update-\*\.sql\.gz .*xargs -r rm --$/, guard: G('${BACKUP_DIR}') },
+    { file: 'scripts/deploy.sh', op: /^    runuser -u "\$APP_USER" -- env \\$/, guard: null, why: 'as_app_user: drops privilege to ${APP_USER}' },
+    { file: 'scripts/deploy.sh', op: /^    as_app_user bash -c "cd '\$APP_DIR_REAL' && nohup npm start/, guard: null, why: 'runs as ${APP_USER}, and changes no ownership' },
   ]
   for (const rel of ENTRYPOINTS) {
-    const code = codeLines(ENTRYPOINT_SOURCE.get(rel)!).filter((line) => line.text.trim() !== '')
-    // Messages quote commands; a statement is a line that does not begin inside a string.
+    const source = ENTRYPOINT_SOURCE.get(rel)!
+    const code = codeLines(source).filter((line) => line.text.trim() !== '')
     const ops = code.map((line, index) => ({ ...line, index }))
-      .filter((line) => RECURSIVE.test(line.text) && !/^\s*(echo|printf|info|warn|die|error|ims_startup_refuse|"|')/.test(line.text) && !/^\s*"/.test(line.text))
+      // A function DEFINITION is not a call: `chown_state_tree() {` names the helper, it does not run it.
+      .filter((line) => !/^\s*[A-Za-z_][A-Za-z0-9_]*\(\)\s*\{/.test(line.text))
+      .filter((line) => RECURSIVE.test(statementOf(line.text)))
     const expected = table.filter((entry) => entry.file === rel)
     assert.equal(ops.length, expected.length,
-      `${rel}: the census must account for every recursive operation, found ${ops.length}:\n${ops.map((op) => `${op.n}: ${op.text}`).join('\n')}`)
+      `${rel}: the census must account for every matched statement, found ${ops.length} and the table has ${expected.length}:\n${ops.map((op) => `${op.n}: ${op.text}`).join('\n')}`)
     const used = new Set<number>()
     for (const op of ops) {
       const entryIndex = expected.findIndex((entry, i) => !used.has(i) && entry.op.test(op.text))
-      assert.notEqual(entryIndex, -1, `${rel}:${op.n}: a recursive operation the census does not know: ${op.text}`)
+      assert.notEqual(entryIndex, -1, `${rel}:${op.n}: a tree-wide operation the census does not know: ${op.text}`)
       used.add(entryIndex)
       const entry = expected[entryIndex]
       if (entry.guard === null) {
-        assert.ok(entry.why && ENTRYPOINT_SOURCE.get(rel)!.includes('TMP_CLONE_DIR="$(mktemp -d -t '), `${rel}:${op.n}: an unguarded operation must be on a fresh mktemp directory`)
+        assert.ok(entry.why && entry.why.length > 20, `${rel}:${op.n}: an unguarded operation needs a written reason`)
+        // AND THE mktemp JUSTIFICATION IS TIED TO THE ASSIGNMENT THAT PRECEDES *THIS* DELETE (review LOW 3).
+        // r6 proved only that SOME `mktemp -d -t` assignment existed somewhere in the file.
+        if (entry.why === MKTEMP || entry.why.endsWith(MKTEMP)) {
+          const before = code.slice(0, op.index).filter((line) => /(^|[\s;(])TMP_CLONE_DIR=/.test(line.text))
+          assert.ok(before.length > 0, `${rel}:${op.n}: no assignment of TMP_CLONE_DIR precedes this delete`)
+          assert.match(before[before.length - 1].text.trim(), /^TMP_CLONE_DIR="\$\(mktemp -d -t [A-Za-z.-]+XXXXXX\)"$/,
+            `${rel}:${op.n}: the nearest preceding assignment must be the mktemp that justifies it, and it is: ${before[before.length - 1].text}`)
+        }
         continue
       }
       const previous = code[op.index - (entry.up ?? 1)]
@@ -2465,8 +2528,37 @@ test('[o3d-z5be] CENSUS: every recursive ownership change, copy or delete in the
         `${rel}:${op.n} (${op.text.trim()}) must be immediately preceded by ${entry.guard}…, and is preceded by: ${previous?.text}`)
     }
   }
-  // deploy.sh makes no recursive ownership change, copy or delete at all — asserted by the census above
-  // (the table holds none for it), so one added there fails this test until it is guarded.
+
+  // AND THE NET CATCHES THE FORMS r6 MISSED. Each of these, injected into install.sh's text, must be
+  // seen — asserted on the matcher itself, because an injection into the shipped file would be a test
+  // that rewrites the subject. The control at the end is the form r6 did catch.
+  for (const missed of [
+    'chown -h -R "${APP_USER}:${APP_USER}" "${APP_DIR}"',
+    'rm -Rf "${APP_DIR}"',
+    'find "${APP_DIR}" -exec chown "${APP_USER}" {} +',
+    'find "${APP_DIR}" -print0 | xargs -0 chown "${APP_USER}"',
+    'cp --archive "${SRC}" "${APP_DIR}"',
+    'su -s /bin/bash -c "chown -R ${APP_USER} ${APP_DIR}" root',
+    'eval "chown -R ${APP_USER} ${APP_DIR}"',
+    'bash -c "chown -R ${APP_USER} ${APP_DIR}"',
+    'mv -t "${APP_DIR}" "${SRC}"/*',
+    'chmod --recursive go-w "${APP_DIR}"',
+    'useradd --create-home --home-dir "${APP_DIR}" "${APP_USER}"',
+    'chown -R "${APP_USER}:${APP_USER}" "${APP_DIR}"',
+  ]) {
+    assert.ok(RECURSIVE.test(statementOf(`  ${missed}`)), `the net must see: ${missed}`)
+  }
+  // AND IT DOES NOT FIRE ON A MESSAGE THAT MERELY QUOTES ONE, nor on single-file operations.
+  for (const quiet of [
+    'die "This script must be run as root. Try: sudo bash install.sh"',
+    'ims_startup_refuse "Do NOT chown or chmod an existing tree to get past this"',
+    'echoes_rsync_but_is_not_one=1',
+    'rm -f "$tmp"',
+    'mv -f -T "$tmp" "$target"',
+    'chown root:root "$DB_ENV_SNAPSHOT_FILE" 2>/dev/null || true',
+  ]) {
+    assert.ok(!RECURSIVE.test(statementOf(`  ${quiet}`)), `the net must NOT fire on: ${quiet}`)
+  }
 })
 
 test('[o3d-z5be] the bootstrap creates fresh inodes and nothing tells an operator that relabelling a tree makes it trusted', () => {
@@ -2480,30 +2572,43 @@ test('[o3d-z5be] the bootstrap creates fresh inodes and nothing tells an operato
     ...ENTRYPOINTS.map((rel) => [rel, ENTRYPOINT_SOURCE.get(rel)!] as [string, string]),
   ]
   assert.equal(texts.length, 6, 'precondition: every file that instructs an operator was read')
-  // ABSENCE, universal: no file offers a relabel as the way to a supported tree.
+  // WHAT THIS SWEEP IS, AND WHAT IT IS NOT (o3d-z5be r7, review MEDIUM 1). It is a CASE-INSENSITIVE
+  // BLACKLIST of the phrasings this branch has actually used to offer a relabel; it is not a proof that
+  // no file offers one, because any rewording passes it. r6's version was case-SENSITIVE and its own
+  // first forbidden phrase survived, capitalised, in scripts/lib/privileged-helpers.sh — "Take group and
+  // other write off it". (That message was about the MODES OF A DIRECTORY above the publication root,
+  // where a chmod does close the hole, so it was not a content regression; it is reworded now to say so
+  // rather than to read like the bootstrap remedy.) The claim that no supported path relabels anything
+  // is carried by the bootstrap section and the invocation table asserted below, not by this list.
   for (const [where, text] of texts) {
+    const lowered = text.toLowerCase()
     for (const stale of [
       'take group and other write off it',
       '— or `chown -R root:root <tree> && chmod -R go-w <tree>` — before running it',
-      'or: chown -R root:root <tree> && chmod -R go-w <tree>',
+      'or: chown -R root:root <tree> && chmod -r go-w <tree>',
       'a release tree only root can write',
       'install the release tree as root',
     ]) {
-      assert.ok(!text.includes(stale), `${where} must no longer say "${stale}"`)
+      assert.ok(!lowered.includes(stale.toLowerCase()), `${where} must no longer say "${stale}" (in any case)`)
     }
   }
   // The procedure itself: a new directory, a fetch INTO it as root, and the installer run from there.
   const anchor = doc.indexOf('<a id="supported-bootstrap"></a>')
   assert.notEqual(anchor, -1, 'the supported bootstrap must be a linkable section')
   const bootstrap = doc.slice(anchor, doc.indexOf('**A tree another account can write is refused**', anchor))
-  assert.ok(bootstrap.length > 1500 && bootstrap.length < 6000, `the bootstrap section must have been isolated (${bootstrap.length})`)
+  assert.ok(bootstrap.length > 1500 && bootstrap.length < 8000, `the bootstrap section must have been isolated (${bootstrap.length})`)
   const commands = bootstrap.slice(bootstrap.indexOf('```bash'), bootstrap.indexOf('```', bootstrap.indexOf('```bash') + 7))
     .split('\n').filter((line) => line.trim() && !line.trim().startsWith('#') && !line.startsWith('```'))
   assert.deepEqual(commands, [
+    'umask 022',
     'RELEASE_DIR="$(mktemp -d /root/ims-release.XXXXXX)"',
     'git clone --branch <release-tag> --depth 1 <repository-url> "${RELEASE_DIR}/one-two-inventory"',
     'bash "${RELEASE_DIR}/one-two-inventory/scripts/install.sh"',
-  ], 'the runnable bootstrap must be exactly: a new directory, a clone into it, the installer from there')
+  ], 'the runnable bootstrap must be exactly: a umask, a new directory, a clone into it, the installer from there')
+  // review LOW 6: the umask is stated (a permissive one makes the clone group-writable and the startup
+  // check then refuses, with the relabel as its only apparent remedy), and the tarball variant says the
+  // archive's top-level directory name is the release's to check, not one this page can assume.
+  assert.match(bootstrap, /tar -tzf \| head -1/, 'the tarball variant must tell the operator to check the archive top-level name')
   assert.match(bootstrap, /revoke nothing that\s+was opened before/, 'and it must say why a relabel is not enough')
   assert.match(bootstrap, /cannot detect a\s+relabelled tree/, 'and that the installer cannot detect one')
   // The startup refusal's own remedy says the same, and the same way in all three entrypoints.
@@ -2516,4 +2621,104 @@ test('[o3d-z5be] the bootstrap creates fresh inodes and nothing tells an operato
   const row = doc.split('\n').find((line) => line.startsWith('| any tree made root-owned by **relabelling** it'))
   assert.ok(row, 'the invocation table must have a relabel row')
   assert.match(row, /\*\*NOT SUPPORTED — and NOT detected\*\*/, row)
+})
+
+// ---------------------------------------------------------------------------
+// 3k. WHAT THE OVERLAP WALK ANSWERS WHEN IT CANNOT WALK, AND WHAT COUNTS AS THE RUNNING TREE
+//     (o3d-z5be r7 — independent review MEDIUM 2, MEDIUM 3, LOW 1, LOW 2)
+// ---------------------------------------------------------------------------
+
+test('[o3d-z5be] a walk that cannot finish is "cannot tell" and refuses — even when a directory is NAMED after the errno', (t) => {
+  // THE FINDING (review MEDIUM 2). The error test was `grep -qv 'No such file or directory'`: "is there a
+  // line not CONTAINING this substring". A directory the attacker names `No such file or directory` makes
+  // every `find` error line contain it, so the walk reported "not reached", the trees were declared
+  // disjoint, and the recursive operation proceeded. The errno is now matched at the END of the line.
+  //
+  // THIS RUNS AS THE TEST ACCOUNT, which is what makes it reachable: root does not get EACCES. In
+  // production the guards run as root, so the shapes below need an NFS root_squash or an idmapped mount
+  // — the refusal is what must be right either way.
+  if (process.getuid!() === 0) return
+  const base = createTempDirSync('walk-errno-', t)
+  const release = join(base, 'release', 'scripts', 'lib')
+  mkdirSync(release, { recursive: true })
+  const shapes = [['named-after-the-errno', 'No such file or directory'], ['plainly-named', 'plainlocked']] as const
+  const results: Record<string, string> = {}
+  for (const [what, name] of shapes) {
+    const app = join(base, what)
+    const locked = join(app, name)
+    mkdirSync(locked, { recursive: true })
+    chmodSync(locked, 0o000)
+    try {
+      const out = withGuardLibrary(release,
+        `if privileged_spare_running_tree ${JSON.stringify(app)} "the application directory"; then echo "R=PASSED"; else echo "R=REFUSED"; fi`)
+      results[what] = `${out.stdout}${out.stderr}`
+    } finally {
+      chmodSync(locked, 0o755)
+    }
+  }
+  // PRECONDITION: the walk really did fail — both runs must have produced a `find` error about the locked
+  // directory, or this test is measuring two clean walks.
+  for (const [what] of shapes) {
+    assert.match(results[what], /Permission denied|could not be walked/, `${what}: the walk must actually have failed:\n${results[what]}`)
+    assert.match(results[what], /^R=REFUSED$/m, `${what}: an unwalkable tree must refuse, not pass as disjoint:\n${results[what]}`)
+  }
+})
+
+test('[o3d-z5be] a HARD LINK to the entrypoint inside the target is caught: the walk asks about the running tree\'s inodes, not only its directory', (t) => {
+  // THE FINDING (review MEDIUM 3). The guard asked `find <target> -samefile <running directory>`, and a
+  // hard link to the ENTRYPOINT is not that directory: `ln <release>/scripts/install.sh ${APP_DIR}/x.sh`
+  // left the guard passing, and `chown -R ${APP_USER} ${APP_DIR}` then changed the owner of the inode
+  // bash was reading — the r6 HIGH through a link count instead of a path.
+  const base = createTempDirSync('hardlink-', t)
+  const scripts = join(base, 'release', 'scripts')
+  const lib = join(scripts, 'lib')
+  const app = join(base, 'app')
+  mkdirSync(lib, { recursive: true })
+  mkdirSync(app)
+  writeFileSync(join(scripts, 'install.sh'), '# install.sh\n')
+  writeFileSync(join(lib, 'privileged-helpers.sh'), '# lib\n')
+  const ask = () => withGuardLibrary(lib,
+    `if privileged_spare_running_tree ${JSON.stringify(app)} "the application directory"; then echo "R=PASSED"; else echo "R=REFUSED"; fi`)
+  // PRECONDITION: with no link, these trees are disjoint and the guard passes — so a REFUSED below is
+  // the link and not the rig.
+  assert.match(`${ask().stdout}`, /^R=PASSED$/m, 'a disjoint target must pass before the link exists')
+
+  linkSync(join(scripts, 'install.sh'), join(app, 'x.sh'))
+  const linkedEntry = ask()
+  assert.equal(statSync(join(app, 'x.sh')).ino, statSync(join(scripts, 'install.sh')).ino,
+    'precondition: the two names really are one inode')
+  assert.match(`${linkedEntry.stdout}`, /^R=REFUSED$/m, `a hard link to the entrypoint inside the target must be caught:\n${linkedEntry.stdout}${linkedEntry.stderr}`)
+
+  // AND THE SAME FOR A LIBRARY, which is the other half of what root executes.
+  rmSync(join(app, 'x.sh'))
+  linkSync(join(lib, 'privileged-helpers.sh'), join(app, 'y.sh'))
+  const linkedLib = ask()
+  assert.match(`${linkedLib.stdout}`, /^R=REFUSED$/m, `a hard link to a library must be caught too:\n${linkedLib.stdout}${linkedLib.stderr}`)
+})
+
+test('[o3d-z5be] an empty path, and a path carrying a newline, are refused rather than resolved to something else', (t) => {
+  // review LOW 1: `realpath -e ""` fails and `dirname -- ""` is `.`, so the helper answered about the
+  // caller's working directory. review LOW 2: command substitution strips a trailing newline, so
+  // "/srv/app\n" resolved to "/srv/app" — and LOCAL_SOURCE_DIR is operator-supplied.
+  const base = createTempDirSync('path-shapes-', t)
+  const lib = join(base, 'release', 'scripts', 'lib')
+  const app = join(base, 'app')
+  mkdirSync(lib, { recursive: true })
+  mkdirSync(app)
+  const out = withGuardLibrary(lib, [
+    'if privileged_physical_or_nearest "" >/dev/null 2>&1; then echo "EMPTY=ANSWERED"; else echo "EMPTY=REFUSED"; fi',
+    // A REAL newline: JSON.stringify writes the two characters `\` and `n`, which bash inside double
+    // quotes leaves as two characters, so the first version of this case tested nothing. $'\n' is bash's.
+    `nl=$'\\n'`,
+    `if privileged_physical_or_nearest "${JSON.stringify(app).slice(1, -1)}\${nl}" >/dev/null 2>&1; then echo "NEWLINE=ANSWERED"; else echo "NEWLINE=REFUSED"; fi`,
+    `if privileged_trees_disjoint "${JSON.stringify(app).slice(1, -1)}\${nl}" ${JSON.stringify(app)} A B >/dev/null 2>&1; then echo "DISJOINT_NEWLINE=PASSED"; else echo "DISJOINT_NEWLINE=REFUSED"; fi`,
+    `if privileged_physical_or_nearest ${JSON.stringify(app)} >/dev/null 2>&1; then echo "PLAIN=ANSWERED"; else echo "PLAIN=REFUSED"; fi`,
+    `if privileged_trees_disjoint "" ${JSON.stringify(app)} A B >/dev/null 2>&1; then echo "DISJOINT_EMPTY=PASSED"; else echo "DISJOINT_EMPTY=REFUSED"; fi`,
+  ].join('\n'))
+  assert.match(out.stdout, /^EMPTY=REFUSED$/m, out.stdout)
+  assert.match(out.stdout, /^NEWLINE=REFUSED$/m, out.stdout)
+  assert.match(out.stdout, /^DISJOINT_NEWLINE=REFUSED$/m, out.stdout)
+  // NOT VACUOUS: the same helper answers for the same directory without the newline.
+  assert.match(out.stdout, /^PLAIN=ANSWERED$/m, out.stdout)
+  assert.match(out.stdout, /^DISJOINT_EMPTY=REFUSED$/m, out.stdout)
 })
