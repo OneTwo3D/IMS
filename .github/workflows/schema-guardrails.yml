@@ -168,6 +168,13 @@ jobs:
           # another database -- an override naming a different database is refused outright, by
           # design, so a job-wide value would break such a step rather than help it.
           DATABASE_SESSION_LOCK_URL: ${{ steps.direct-db.outputs.url }}
+          # The concurrency tier's scratch-database guard (tests/concurrency/scratch-database-guard.ts)
+          # refuses to seed or install DDL into a database it cannot establish was made for the run and
+          # is disposable. This job's `ims_ci` is exactly that -- a service container created for this
+          # job and destroyed with it -- so the job declares it, by its exact name. The guard refuses
+          # this estate's real databases (onetwo3d*, prod/live-shaped, the server's own) however they
+          # are declared, so this line cannot be repointed at one.
+          IMS_CONCURRENCY_SCRATCH_DB: ims_ci
         run: npm run test:concurrency
 
   # ===========================================================================================

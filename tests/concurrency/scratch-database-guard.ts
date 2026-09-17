@@ -1,20 +1,36 @@
 /**
- * REFUSE TO TOUCH ANY DATABASE THAT IS NOT POSITIVELY A SCRATCH DATABASE — AND DO IT
- * BEFORE ANYTHING WRITES (o3d-zzgp round 4, Codex HIGH-2).
+ * REFUSE TO TOUCH ANY DATABASE THAT WAS NOT MADE FOR THIS RUN — AND DO IT BEFORE
+ * ANYTHING WRITES (o3d-zzgp round 4, Codex HIGH-2; widened in round 5).
  *
  * Round 3's race test checked `current_database() <> 'onetwo3d_ims_dev'` AFTER it had
  * already seeded products, warehouses, a transfer, stock and an active WMS binding —
  * so the one database it named was mutated before the refusal, and every OTHER database
  * (a shared one, a production one) passed the check and went on to receive DDL. That is
  * the shape that once put 335 fixture rows into the live-served development database.
+ * Running FIRST, on a read-only connection, is the half that made that a P1 fix and is
+ * unchanged.
  *
- * This is an ALLOWLIST, and it has two independent halves that must BOTH hold:
+ * THE PROPERTY IS "THIS DATABASE WAS CREATED FOR THIS RUN AND IS DISPOSABLE". Round 4
+ * accepted only one proxy for it — an `ims_scratch_*` NAME — and CI's own purpose-built,
+ * thrown-away `ims_ci` database has that property while having a different name, so the
+ * guard refused the one environment that most obviously satisfies it. A name is a proxy;
+ * an explicit declaration naming the exact database is a statement. So either is accepted:
  *
- *   1. the connected database's name matches `SCRATCH_DATABASE_PATTERN` — a name no
- *      shared, development or production database in this estate uses; and
- *   2. the operator has opted in to mutating THAT database by name:
- *      `IMS_CONCURRENCY_SCRATCH_DB=<exact database name>`. A flag that merely says "yes"
- *      would let a mistyped DATABASE_URL through; naming the database cannot.
+ *   · DECLARED — `IMS_CONCURRENCY_SCRATCH_DB` names the connected database EXACTLY.
+ *     Whoever configured the run said "this database is mine to destroy", about this
+ *     database and no other. A flag that merely said "yes" would let a mistyped
+ *     DATABASE_URL through; naming the database cannot.
+ *   · CONVENTIONALLY NAMED — the connected database matches `SCRATCH_DATABASE_PATTERN`,
+ *     for a local run that exports nothing.
+ *
+ * AND A DECLARATION CANNOT NAME A REAL DATABASE. `ALWAYS_REFUSED_DATABASE` is checked
+ * FIRST and overrides both: this estate's own databases (`onetwo3d…`), the server's
+ * built-ins, and any production-shaped name (`…prod…`, `…live…`) are refused however
+ * they are declared. That is what stops the opt-in from becoming "an environment
+ * variable can authorise anything", and it is why `onetwo3d_ims_dev` is refused even
+ * when it is the value of `IMS_CONCURRENCY_SCRATCH_DB`.
+ *
+ * WHEN IT CANNOT TELL — no declaration and no scratch-shaped name — it refuses.
  *
  * The check runs on its own connection with `default_transaction_read_only=on`, so the
  * guard itself cannot write even if it is wrong, and it asks the SERVER which database
@@ -25,6 +41,15 @@
 export const SCRATCH_DATABASE_PATTERN = /^ims_scratch_[a-z0-9_]{1,48}$/
 export const SCRATCH_DATABASE_OPT_IN_ENV = 'IMS_CONCURRENCY_SCRATCH_DB'
 
+/**
+ * Databases no declaration may nominate: every real database in this estate is named
+ * `onetwo3d…`, `postgres`/`template…` are the server's own, and a name whose first or any
+ * underscore-separated part begins `prod`/`live` is production-shaped. Matched on part
+ * boundaries so an innocent scratch name (`ims_scratch_delivery`) is not caught by the
+ * letters inside it.
+ */
+export const ALWAYS_REFUSED_DATABASE = /^(postgres|template\d+)$|^onetwo3d|(^|_)(prod|live)/i
+
 export class NotAScratchDatabaseError extends Error {
   override readonly name = 'NotAScratchDatabaseError'
 }
@@ -34,21 +59,27 @@ export function scratchDatabaseVerdict(input: {
   connectedDatabase: string
   optIn: string | undefined
 }): { ok: true } | { ok: false; reason: string } {
-  if (!SCRATCH_DATABASE_PATTERN.test(input.connectedDatabase)) {
+  // FIRST, and beyond appeal: a declaration may not nominate one of these.
+  if (ALWAYS_REFUSED_DATABASE.test(input.connectedDatabase)) {
     return {
       ok: false,
-      reason: `connected database "${input.connectedDatabase}" does not match ${SCRATCH_DATABASE_PATTERN}; `
-        + 'these tests seed rows and install DDL, so they only run against a database created for them',
+      reason: `connected database "${input.connectedDatabase}" is a real or production-shaped database `
+        + `(${ALWAYS_REFUSED_DATABASE}); these tests seed rows and install DDL, and no value of `
+        + `${SCRATCH_DATABASE_OPT_IN_ENV} makes one of these acceptable`,
     }
   }
-  if (input.optIn !== input.connectedDatabase) {
-    return {
-      ok: false,
-      reason: `${SCRATCH_DATABASE_OPT_IN_ENV} must name the connected database exactly `
-        + `("${input.connectedDatabase}"); it is ${input.optIn === undefined ? 'unset' : `"${input.optIn}"`}`,
-    }
+  // DECLARED: the run says this exact database was created for it and is disposable.
+  if (input.optIn === input.connectedDatabase) return { ok: true }
+  // Or CONVENTIONALLY NAMED, for a local run that exports nothing.
+  if (SCRATCH_DATABASE_PATTERN.test(input.connectedDatabase)) return { ok: true }
+  return {
+    ok: false,
+    reason: `connected database "${input.connectedDatabase}" is neither named ${SCRATCH_DATABASE_PATTERN} nor `
+      + `declared disposable by ${SCRATCH_DATABASE_OPT_IN_ENV} (which is `
+      + `${input.optIn === undefined ? 'unset' : `"${input.optIn}"`}); these tests seed rows and install DDL, `
+      + `so set ${SCRATCH_DATABASE_OPT_IN_ENV}="${input.connectedDatabase}" only if that database was created `
+      + 'for this run and can be thrown away',
   }
-  return { ok: true }
 }
 
 let verified: Promise<string> | null = null

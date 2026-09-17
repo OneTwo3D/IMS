@@ -68,9 +68,16 @@ npm run test:db            # RUN_DB_RETENTION_TESTS=1 REQUIRE_DB_RETENTION_TESTS
 **Point `DATABASE_URL` at a scratch database you created for the run, never at a shared one.** The
 concurrency tier seeds fixture rows into whatever database the URL reaches. Files that also install
 DDL — currently `pending-asn-disposal-race` and `pending-asn-retirement-commit` — refuse to start,
-before any connection writes, unless `tests/concurrency/scratch-database-guard.ts` positively
-identifies the database: its name must match `ims_scratch_*` AND
-`IMS_CONCURRENCY_SCRATCH_DB` must name that exact database. For example:
+before any connection writes, unless `tests/concurrency/scratch-database-guard.ts` can establish that
+the database was made for this run and is disposable. It accepts either piece of evidence:
+
+* the run DECLARES it — `IMS_CONCURRENCY_SCRATCH_DB` names the connected database exactly (this is
+  what CI does for its own `ims_ci` service database); or
+* the database is named `ims_scratch_*`, the local convention, for a run that exports nothing.
+
+Neither can admit this estate's own databases: anything named `onetwo3d…`, `postgres`/`template…`, or
+production-shaped (a name part starting `prod`/`live`) is refused however it is declared. With no
+declaration and no scratch-shaped name the guard refuses rather than guess. For example:
 
 ```bash
 createdb -O imsdev ims_scratch_$(date +%s)
