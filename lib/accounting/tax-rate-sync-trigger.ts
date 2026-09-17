@@ -84,6 +84,8 @@ export async function maybeQueueTaxRateSync(taxRate: TaxRateForSync): Promise<vo
     await reportPostingNotQueued({
       entityType: 'SETTING',
       action: 'tax_rate_sync_not_queued',
+      // o3d-j625 r4: WHICH posting this is, so the report is also an OUTSTANDING inbox row.
+      postingRef: { type: 'TAX_RATE_SYNC', referenceType: 'TaxRate', referenceId: taxRate.id },
       posting: `the tax-rate push for "${taxRate.name}"`,
       committed: 'the tax rate is saved in IMS',
       remedy:

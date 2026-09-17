@@ -19,6 +19,7 @@ import {
   priorAttemptsWhere,
 } from '@/lib/domain/accounting/prior-posting-evidence'
 import { connectorNativePayloadIdKeys } from '@/lib/accounting/connector-provenance'
+import { clearAccountingPostingRefusal, recordAccountingPostingRefusal, type PostingRefusalClient } from '@/lib/domain/accounting/posting-refusal-inbox'
 
 export type AccountingSettings = {
   syncEnabled: boolean
@@ -452,6 +453,18 @@ async function refuseUnattributableChart(params: {
    *   other id    the payload carries the OTHER connector's document id. The mis-routing itself.
    */
   documentConnector?: AccountingConnectorInfo['id'] | null
+  /**
+   * o3d-j625 r4 — WHETHER A REFUSAL HERE SHOULD BE RECORDED AS OUTSTANDING WORK IN THE EXCEPTION INBOX.
+   *
+   * True on the FACADE path only, and that is a decision rather than an omission. The facade is called
+   * outside any caller transaction, so a refusal there means the caller's own work stands and the posting
+   * really is owed. The in-transaction enqueue is called INSIDE a caller's transaction, and its refusal
+   * is frequently the thing that ROLLS THAT WORK BACK — a bill that is therefore not marked paid, a
+   * supplier credit note left DRAFT. Writing "outstanding" over a posting whose local half was undone
+   * would put a debt in the inbox that nobody owes. Those sites record their own row where they keep the
+   * local change instead — see reportPostingNotQueued.
+   */
+  recordRefusalAsOutstanding?: boolean
 }): Promise<AccountingEnqueueOutcome | null> {
   // AND IF SOMETHING GETS HERE NAMING NOTHING, IT IS REFUSED — NOT ACCOMMODATED.
   //
@@ -514,6 +527,25 @@ async function refuseUnattributableChart(params: {
         referenceId: params.referenceId,
       },
     }).catch(() => { /* logging must never turn a refusal into a throw */ })
+    if (params.recordRefusalAsOutstanding) {
+      const { db } = await import('@/lib/db')
+      await recordAccountingPostingRefusal(db as unknown as PostingRefusalClient, {
+        type: params.type,
+        referenceType: params.referenceType,
+        referenceId: params.referenceId,
+        chartConnector: params.chartConnector,
+        activeConnector: await getActiveAccountingConnectorId().catch(() => null),
+        reason: 'unattributable_document_id',
+        committed: 'the document it names stands in IMS',
+        remedy:
+          'Re-post the source document so its accounting document id and the connector that issued it are '
+          + 'recorded together, or make this posting by hand in the books that hold the document.',
+        detail: {
+          documentConnector: params.documentConnector ?? null,
+          connectorNativePayloadKeys: nativeIdKeys,
+        },
+      })
+    }
     return { queued: false, reason: 'refused', connector: params.chartConnector }
   }
   // o3d-j625 r2 (Codex MEDIUM 2) — THE ACTIVE CONNECTOR IS READ INTO A VARIABLE, BECAUSE THE WARNING
@@ -552,6 +584,22 @@ async function refuseUnattributableChart(params: {
     // A refusal must not become a throw because the audit write failed — the caller's own reporting of
     // `refused` is what the obligation ledgers act on.
   }).catch(() => { /* logging must never turn a refusal into a throw */ })
+  if (params.recordRefusalAsOutstanding) {
+    const { db } = await import('@/lib/db')
+    await recordAccountingPostingRefusal(db as unknown as PostingRefusalClient, {
+      type: params.type,
+      referenceType: params.referenceType,
+      referenceId: params.referenceId,
+      chartConnector: params.chartConnector,
+      activeConnector,
+      reason: 'retired_chart',
+      committed: 'the document this posting is for stands in IMS',
+      remedy:
+        `Re-queue this posting from its source document once the accounting connector selection has `
+        + `settled — either switch back to ${params.chartConnector}, or raise it again from `
+        + `${activeLabel}'s own chart of accounts.`,
+    })
+  }
   return { queued: false, reason: 'refused', connector: params.chartConnector }
 }
 
@@ -630,7 +678,9 @@ export async function queueAccountingSync(params: {
 }): Promise<AccountingEnqueueOutcome> {
   // o3d-j625: FIRST, before any resolution — this is the guard that makes a second resolution
   // unnecessary, so it cannot run after one. See refuseUnattributableChart.
-  const unattributable = await refuseUnattributableChart(params)
+  // o3d-j625 r4: a refusal on THIS path is recorded as outstanding work — the caller is not inside a
+  // transaction this refusal rolls back, so what it was for stands and the posting really is owed.
+  const unattributable = await refuseUnattributableChart({ ...params, recordRefusalAsOutstanding: true })
   if (unattributable) return unattributable
   // o3d-j625 r2: AND THERE IS NO SECOND RESOLUTION LEFT HERE AT ALL.
   //
@@ -690,12 +740,24 @@ export async function queueAccountingSync(params: {
   // o3d-i0o6 r8: `pinnedLedger` is what makes the check above binding at the moment of the write. It
   // is `params.connector` verbatim — never `connector`, which is the resolved-or-pinned value and
   // would silently turn EVERY unpinned enqueue into a pinned one.
+  let routed: AccountingEnqueueOutcome
   if (connector === 'quickbooks') {
     const { queueQuickBooksSync } = await import('@/lib/connectors/quickbooks/queue')
-    return { ...await queueQuickBooksSync({ ...params, pinnedLedger: params.connector }), connector }
+    routed = { ...await queueQuickBooksSync({ ...params, pinnedLedger: params.connector }), connector }
+  } else {
+    const { queueXeroSync } = await import('@/lib/connectors/xero/queue')
+    routed = { ...await queueXeroSync({ ...params, pinnedLedger: params.connector }), connector }
   }
-  const { queueXeroSync } = await import('@/lib/connectors/xero/queue')
-  return { ...await queueXeroSync({ ...params, pinnedLedger: params.connector }), connector }
+  // o3d-j625 r4 — AND A POSTING THAT IS NOW QUEUED IS NO LONGER OUTSTANDING.
+  //
+  // The inbox row a refusal left behind is cleared by the posting being MADE, never by a timer or by an
+  // operator ticking it off: this is the only event that means the debt is gone. `already-queued` counts —
+  // a row for this posting is durable either way, which is what the debt was about.
+  if (routed.queued) {
+    const { db } = await import('@/lib/db')
+    await clearAccountingPostingRefusal(db as unknown as PostingRefusalClient, params)
+  }
+  return routed
 }
 
 async function getAccountingPostingContext(type: AccountingSyncType): Promise<{
@@ -752,7 +814,32 @@ async function getAccountingPostingContextFor(connector: string, type: Accountin
  * app/api/cron/accounting-daily-batch/route.ts.
  */
 export async function isDailyBatchPostingEnabled(): Promise<boolean> {
-  const connector = await getActiveAccountingConnectorId()
+  return dailyBatchPostingEnabledFor(await getActiveAccountingConnectorId())
+}
+
+/**
+ * o3d-j625 r4 (SWEEP 1) — THE SAME QUESTION, ASKED OF A CHART'S CONNECTOR.
+ *
+ * `refreshShipmentCogsForCostLayerChange` uses the answer to decide whether an un-journaled shipment's
+ * revaluation delta belongs to the daily batch — and if it does, the delta is REMOVED from the caller's
+ * COGS journal. Asked of "the active connector" after the chart had been read, a switch in between could
+ * answer about a batch other than the one whose books the journal is built for: the delta leaves that
+ * journal and the batch that would have carried it is no longer the one that runs.
+ *
+ * `true` only when the chart's connector is STILL the active one (the daily batch cron runs the active
+ * connector's batch and no other) AND its batch posts. Every other answer is `false`, which is the safe
+ * direction: the delta stays in the journal, and the journal refuses at its own enqueue if the chart has
+ * been retired.
+ */
+export async function isDailyBatchPostingEnabledForChart(
+  chartConnector: AccountingConnectorInfo['id'] | null,
+): Promise<boolean> {
+  if (chartConnector === null) return false
+  if (await getActiveAccountingConnectorId() !== chartConnector) return false
+  return dailyBatchPostingEnabledFor(chartConnector)
+}
+
+async function dailyBatchPostingEnabledFor(connector: AccountingConnectorInfo['id'] | null): Promise<boolean> {
   if (!connector) return false
   if (connector === 'xero') {
     const { getXeroSettings } = await import('@/lib/connectors/xero/settings')
@@ -781,6 +868,50 @@ export async function isAccountingSyncTypeEnabledFor(
   type: AccountingSyncType,
 ): Promise<boolean> {
   return (await getAccountingPostingContextFor(connector, type)) !== null
+}
+
+/**
+ * o3d-j625 r4 (Codex HIGH 2, HIGH 3) — "WILL THIS POST?" ASKED OF THE CHART'S CONNECTOR, WITH "THE CHART
+ * HAS BEEN RETIRED" KEPT APART FROM "THIS TYPE IS SWITCHED OFF".
+ *
+ * THE DEFECT, the original o3d-j625 shape through a resolver the r2/r3 sweeps did not recognise. A site
+ * read one connector's chart (`getAccountingSettings()`), built its decision from it, and then asked
+ * {@link isAccountingSyncTypeEnabled} — which RESOLVES THE ACTIVE CONNECTOR AGAIN. A switch in between
+ * made that answer `false`, and `false` was read as "posting is off": the supplier credit note was
+ * committed POSTED with no ACCPAYCREDIT, the bill edit returned `skipped-disabled`, and in both cases the
+ * enqueue's own chart guard was never reached because the enqueue was never called. A second resolution
+ * does not have to ROUTE anything to be the defect; it only has to DECIDE something.
+ *
+ * WHY A VERDICT AND NOT A BOOLEAN. The two `false`s mean opposite things for what is owed:
+ *
+ *   post            the chart's connector is the active one and posts this type.
+ *   not-configured  the chart's connector is still the active one and does not post this type (sync or
+ *                   the type is switched off). INFORMATIONAL: nothing will ever post, nothing is owed.
+ *   chart-retired   the chart's connector is no longer the active one. A REFUSAL: the posting is OWED to
+ *                   books that are not being serviced, and a caller must surface it, never skip quietly.
+ *   no-chart        the chart was read while no connector was on. Nothing to post to.
+ *
+ * The active connector IS read here — once, and only to COMPARE with the chart, never to route or to
+ * choose settings — which is the same predicate `refuseUnattributableChart` answers. `isAccountingSync-
+ * TypeEnabledFor` alone would not do: it answers about the named connector's own toggles and says
+ * nothing about whether that connector is still the one this system is running.
+ */
+export type ChartPostingVerdict =
+  | { verdict: 'post'; connector: AccountingConnectorInfo['id'] }
+  | { verdict: 'not-configured'; connector: AccountingConnectorInfo['id'] }
+  | { verdict: 'chart-retired'; chartConnector: AccountingConnectorInfo['id']; activeConnector: AccountingConnectorInfo['id'] | null }
+  | { verdict: 'no-chart' }
+
+export async function accountingPostingVerdictForChart(
+  chartConnector: AccountingConnectorInfo['id'] | null,
+  type: AccountingSyncType,
+): Promise<ChartPostingVerdict> {
+  if (chartConnector === null) return { verdict: 'no-chart' }
+  const activeConnector = await getActiveAccountingConnectorId()
+  if (activeConnector !== chartConnector) return { verdict: 'chart-retired', chartConnector, activeConnector }
+  return (await getAccountingPostingContextFor(chartConnector, type)) === null
+    ? { verdict: 'not-configured', connector: chartConnector }
+    : { verdict: 'post', connector: chartConnector }
 }
 
 export async function queueAccountingSyncTx(
@@ -909,6 +1040,12 @@ export async function queueAccountingSyncTx(
           ? (params.connector ?? await getActiveAccountingConnectorId())
           : connector,
       })
+    }
+    // o3d-j625 r4 — A POSTING THAT IS NOW QUEUED IS NO LONGER OUTSTANDING, cleared inside the CALLER'S
+    // transaction so the clear and the sync row share one fate. A clear that survived a rolled-back
+    // enqueue would mark a debt paid over a posting that was never written.
+    if (outcome.queued) {
+      await clearAccountingPostingRefusal(tx as unknown as PostingRefusalClient, params)
     }
     return outcome.queued
   }

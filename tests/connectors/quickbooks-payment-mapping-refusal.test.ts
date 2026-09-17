@@ -122,8 +122,20 @@ mock.module('@/lib/activity-log', {
   },
 })
 mock.module('@/lib/domain/sales/allocation-service', { namedExports: { lockSalesOrder: async () => {} } })
+
+/**
+ * o3d-j625 r4 (Codex HIGH 1, was o3d-l9ok) — WHICH ACCOUNT IDS THE CONNECTOR'S OWN SYNCED CHART HOLDS.
+ * The processor confirms the mapped id against it before carrying it into INVOICE_PAYMENT. Every id is
+ * "held" by default, so every pre-existing test keeps testing what it tested; the r4 tests narrow it.
+ */
+let chartBankAccounts: Set<string> | 'all' = 'all'
+const belongsCalls: Array<{ connector: string; id: string }> = []
 mock.module('@/lib/accounting', {
   namedExports: {
+    accountingBankAccountBelongsTo: async (connector: string, id: string) => {
+      belongsCalls.push({ connector, id })
+      return chartBankAccounts === 'all' || chartBankAccounts.has(id)
+    },
     isAccountingSyncTypeEnabled: async () => true,
     isAccountingSyncTypeEnabledFor: async () => true,
     getActiveAccountingConnectorInfo: async () => ({ id: 'quickbooks' }),
@@ -223,6 +235,8 @@ function reset(map: Record<string, string> | null) {
   released.length = 0
   claimed.length = 0
   paymentMap = map
+  chartBankAccounts = 'all'
+  belongsCalls.length = 0
   order.accountingInvoiceId = null
 }
 
@@ -1409,4 +1423,38 @@ test('[o3d-batch-ret r12] the absent-currency refusal does not consult the IMS b
       + 'reads as blank, or will not read at all. Three different sentences would mean the decision '
       + `still depends on a value that says nothing about the ledger — got ${JSON.stringify([...new Set(sentences)])}`,
   )
+})
+
+// ---------------------------------------------------------------------------------------------------
+// o3d-j625 r4 (Codex HIGH 1, was o3d-l9ok) — the mapped account is confirmed as QuickBooks's before it is carried.
+// ---------------------------------------------------------------------------------------------------
+
+test('[o3d-j625 r4] a mapped bank account that is NOT in QuickBooks\'s synced chart is REFUSED, and no payment row is created', async () => {
+  // The shared map was filled in under the other connector: `card:GBP` resolves to an id this
+  // connector's chart does not hold.
+  reset({ 'card:GBP': 'OTHER-CONNECTOR-BANK' })
+  chartBankAccounts = new Set(['QBO-BANK-1'])
+
+  await runQuickBooks()
+
+  assert.deepEqual(belongsCalls, [{ connector: 'quickbooks', id: 'OTHER-CONNECTOR-BANK' }], 'PRECONDITION: the mapped id was checked against THIS connector')
+  assert.equal(followUpTypes().includes('INVOICE_PAYMENT'), false, 'no payment may be queued naming an account the ledger does not hold')
+  const refusal = paymentRefusals()
+  assert.equal(refusal.length, 1, 'the operator is told')
+  assert.equal(refusal[0].metadata?.reason, 'payment_account_unmapped', 'the remedy is a setting, as for an unmapped method')
+  assert.equal(refusal[0].metadata?.paymentAccountRefusal, 'not_in_connector_chart')
+  assert.equal(refusal[0].metadata?.mappedBankAccountId, 'OTHER-CONNECTOR-BANK')
+  assert.match(String(refusal[0].description), /shared by every accounting connector/)
+})
+
+test('[o3d-j625 r4] CONTROL: a mapped account that IS in the chart is carried into INVOICE_PAYMENT verbatim', async () => {
+  reset({ 'card:GBP': 'QBO-BANK-1' })
+  chartBankAccounts = new Set(['QBO-BANK-1'])
+
+  await runQuickBooks()
+
+  const payment = store.rows.find((row) => row.type === 'INVOICE_PAYMENT')
+  assert.ok(payment, 'the payment is queued')
+  assert.equal((payment.payload as Record<string, unknown>).bankAccountId, 'QBO-BANK-1', 'the CONFIRMED id is the one the poster will send')
+  assert.deepEqual(paymentRefusals(), [])
 })

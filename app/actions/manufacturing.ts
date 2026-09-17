@@ -6,7 +6,7 @@ import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
 import { requireInternalUser, requirePermission } from '@/lib/auth/server'
 import { enqueueStockSync } from '@/lib/shopping'
-import { queueAccountingSyncTx, getAccountingSettings, isAccountingSyncTypeEnabled } from '@/lib/accounting'
+import { queueAccountingSyncTx, getAccountingSettings, accountingPostingVerdictForChart, type AccountingSettings } from '@/lib/accounting'
 import { postingIsOwed, reportPostingNotQueued, type EnqueueOutcomeLike } from '@/lib/domain/accounting/enqueue-outcome'
 import {
   addCostLayerSourceLines,
@@ -907,9 +907,18 @@ export async function updateManufacturingOrderStatus(
           0,
         )
         if (journalTotalBase > 0) {
-          const shouldPostJournal = await isAccountingSyncTypeEnabled('MANUFACTURING_JOURNAL')
+          // o3d-j625 r4 (SWEEP 1): the chart FIRST, then the posting verdict asked OF IT. This used to ask
+          // `isAccountingSyncTypeEnabled` (a resolution of the active connector) and then read the chart
+          // (a second one), so the gate and the account codes could be about two different connectors.
+          // A retired chart is an OWED posting: recorded as a refusal and reported after the commit by
+          // the same channel a declined enqueue uses, never a silent skip.
+          const settings = await getAccountingSettings()
+          const journalVerdict = await accountingPostingVerdictForChart(settings.connector, 'MANUFACTURING_JOURNAL')
+          if (journalVerdict.verdict === 'chart-retired') {
+            manufacturingJournalOutcome.outcome = { queued: false, reason: 'refused', connector: journalVerdict.chartConnector }
+          }
+          const shouldPostJournal = journalVerdict.verdict === 'post'
           if (shouldPostJournal) {
-            const settings = await getAccountingSettings()
             const defaultOverheadAccount = settings.manufacturingOverheadAccount
             const inventoryAccount = settings.inventoryAccount
             if (!inventoryAccount) {
@@ -1002,6 +1011,8 @@ export async function updateManufacturingOrderStatus(
           entityType: 'STOCK_ADJUSTMENT',
           entityId: id,
           action: 'manufacturing_journal_not_queued',
+          // o3d-j625 r4: WHICH posting this is, so the report is also an OUTSTANDING inbox row.
+          postingRef: { type: 'MANUFACTURING_JOURNAL', referenceType: 'ProductionOrder', referenceId: id },
           posting: `the manufacturing overhead journal for ${orderPreview.reference}`,
           committed: 'the production order is COMPLETE in IMS and its overhead is capitalised into the output cost',
           remedy:
@@ -1526,6 +1537,13 @@ async function recalculateManufacturingCostLayers(
   // and the companion MANUFACTURING_RECLASS journal share ONE nonce — an A→B→A
   // cost edit must post (or dedup) both together, never just one (cogs-audit scjz.33).
   recalcRunId: string,
+  /**
+   * o3d-j625 r4 (SWEEP 1): the chart the companion MANUFACTURING_RECLASS is built from, handed to the
+   * shipment COGS refresh so its COGS_REVERSAL rows and its batch-ownership decision are about the SAME
+   * connector as the reclass that nets their delta. `null` = no reclass chart (not posting): the refresh
+   * then reads its own, once.
+   */
+  reclassChart: AccountingSettings | null,
 ): Promise<{ cogsDeltaBase: number; inventoryDeltaBase: number }> {
   const po = await tx.productionOrder.findUnique({
     where: { id: productionOrderId },
@@ -1602,7 +1620,10 @@ async function recalculateManufacturingCostLayers(
     }
 
     await updateSnapshotsForCostLayerChange(tx, li.id, r.newUnitCostBase)
-    const shipmentRefresh = await refreshShipmentCogsForCostLayerChange(tx, li.id, { recalcRunId })
+    const shipmentRefresh = await refreshShipmentCogsForCostLayerChange(tx, li.id, {
+      recalcRunId,
+      ...(reclassChart ? { accountingSettings: reclassChart } : {}),
+    })
     // audit-3aph: the shipment path owns the sold-finished-goods COGS revaluation
     // (COGS_REVERSAL now / daily batch later), so subtract it from the reclass
     // journal's COGS leg to avoid double-posting COGS for sold units.
@@ -1664,10 +1685,17 @@ export async function updateManufacturingCostLines(
       oldTotal = existing.reduce((s, l) => s + Number(l.amountBase), 0)
       newTotal = cleaned.reduce((s, l) => s + l.amountBase, 0)
 
-      const shouldPostReclass = po.status === 'COMPLETED'
-        ? await isAccountingSyncTypeEnabled('MANUFACTURING_RECLASS')
-        : false
-      const settings = shouldPostReclass ? await getAccountingSettings() : null
+      // o3d-j625 r4 (SWEEP 1): chart first, verdict asked OF IT — see the completion journal above. A
+      // retired chart is recorded as a refusal and reported after the commit.
+      const reclassChart = po.status === 'COMPLETED' ? await getAccountingSettings() : null
+      const reclassVerdict = reclassChart
+        ? await accountingPostingVerdictForChart(reclassChart.connector, 'MANUFACTURING_RECLASS')
+        : null
+      if (reclassVerdict?.verdict === 'chart-retired') {
+        reclassOutcome.outcome = { queued: false, reason: 'refused', connector: reclassVerdict.chartConnector }
+      }
+      const shouldPostReclass = reclassVerdict?.verdict === 'post'
+      const settings = shouldPostReclass ? reclassChart : null
       if (shouldPostReclass && settings?.manufacturingOverheadAccount) {
         cleanedForWrite = cleaned.map((line) => (
           line.amountBase > 0 && !line.accountCode
@@ -1704,7 +1732,7 @@ export async function updateManufacturingCostLines(
         // the recalc) and the MANUFACTURING_RECLASS key below, so an A→B→A edit
         // posts/dedups both together (cogs-audit scjz.33).
         const recalcRunId = randomUUID()
-        const deltas = await recalculateManufacturingCostLayers(tx, productionOrderId, recalcRunId)
+        const deltas = await recalculateManufacturingCostLayers(tx, productionOrderId, recalcRunId, reclassChart)
         cogsDeltaBase = deltas.cogsDeltaBase
         inventoryDeltaBase = deltas.inventoryDeltaBase
 
@@ -1808,6 +1836,8 @@ export async function updateManufacturingCostLines(
         entityType: 'STOCK_ADJUSTMENT',
         entityId: productionOrderId,
         action: 'manufacturing_reclass_not_queued',
+        // o3d-j625 r4: WHICH posting this is, so the report is also an OUTSTANDING inbox row.
+        postingRef: { type: 'MANUFACTURING_RECLASS', referenceType: 'ProductionOrder', referenceId: productionOrderId },
         posting: `the manufacturing reclass journal for production order ${productionOrderId}`,
         committed: 'the retrospective manufacturing-cost change is saved in IMS',
         remedy:

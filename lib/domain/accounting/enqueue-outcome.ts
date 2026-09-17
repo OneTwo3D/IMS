@@ -1,5 +1,6 @@
 import type { ActivityEntityType } from '@/app/generated/prisma/client'
 import { logActivity } from '@/lib/activity-log'
+import { recordAccountingPostingRefusal, type PostingRefusalClient } from '@/lib/domain/accounting/posting-refusal-inbox'
 
 /**
  * o3d-j625 r3 (Codex HIGH 1, MEDIUM) — A REFUSAL ON A PATH THAT DISCARDS THE RESULT IS A SILENT
@@ -84,6 +85,14 @@ export function postingIsOwed(outcome: EnqueueOutcomeLike): boolean {
  * warned, so there is nothing for the stronger signal to change.
  */
 export async function reportPostingNotQueued(params: {
+  /**
+   * o3d-j625 r4 — THE POSTING THIS IS ABOUT, so the report also lands in the exception inbox.
+   *
+   * Every caller of this function keeps its local change and tells the operator the ledger did not get
+   * the posting. An Activity-log line is not a surface anybody is watching, so the same facts are
+   * upserted as an OUTSTANDING row (see posting-refusal-inbox.ts) that clears when the posting is made.
+   */
+  postingRef: { type: string; referenceType: string; referenceId: string }
   entityType: ActivityEntityType
   entityId?: string | null
   /** The activity-log action, e.g. `manufacturing_journal_not_queued`. */
@@ -115,4 +124,27 @@ export async function reportPostingNotQueued(params: {
       enqueueConnector: params.outcome.connector ?? null,
     },
   }).catch(() => { /* a report that cannot be written must not become the site's exception */ })
+  // o3d-j625 r4: and the same thing, durably, where an operator will find it without going looking.
+  const { db } = await import('@/lib/db')
+  await recordAccountingPostingRefusal(db as unknown as PostingRefusalClient, {
+    type: params.postingRef.type,
+    referenceType: params.postingRef.referenceType,
+    referenceId: params.postingRef.referenceId,
+    chartConnector: (params.metadata?.chartConnector as string | undefined) ?? null,
+    activeConnector: await activeAccountingConnectorForReport(),
+    reason: params.outcome.reason ?? 'refused',
+    committed: params.committed,
+    remedy: params.remedy,
+    detail: { posting: params.postingRef, enqueueConnector: params.outcome.connector ?? null, ...params.metadata },
+  })
+}
+
+/** The connector active at the moment of the report — the half round 2's warning omitted. */
+async function activeAccountingConnectorForReport(): Promise<string | null> {
+  try {
+    const { getActiveAccountingConnectorInfo } = await import('@/lib/accounting')
+    return (await getActiveAccountingConnectorInfo())?.id ?? null
+  } catch {
+    return null
+  }
 }

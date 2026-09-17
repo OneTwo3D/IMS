@@ -344,6 +344,8 @@ export async function applyStockAdjustment({
           entityType: 'STOCK_ADJUSTMENT',
           entityId: movement.id,
           action: 'inventory_adjustment_journal_not_queued',
+          // o3d-j625 r4: WHICH posting this is, so the report is also an OUTSTANDING inbox row.
+          postingRef: { type: 'INVENTORY_ADJUSTMENT', referenceType: 'StockMovement', referenceId: movement.id },
           posting: `the inventory adjustment journal for ${product?.sku ?? productId} at ${warehouse?.name ?? warehouseId}`,
           committed: 'the stock movement and its cost layers are written in IMS',
           remedy:

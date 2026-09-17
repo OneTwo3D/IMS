@@ -774,10 +774,21 @@ export function resolveConsumedCogsOffsetAccount(
   return settings.transitAccount
 }
 
+/**
+ * o3d-j625 r4 (SWEEP 1) — HOW MANY OF THIS RUN'S JOURNALS ARE STILL OWED.
+ *
+ * Returned so the landed-cost journal OUTBOX — the backstop that exists precisely to re-run this — can
+ * tell a run that queued everything from a run whose journals were refused. It used to call this, get
+ * `void`, and mark the job SUCCEEDED either way, so a refused journal was reported once and then never
+ * retried by the one mechanism built to retry it.
+ */
+export type LandedCostJournalRunOutcome = { owed: number }
+
 export async function queueLandedCostAdjustmentJournals(
   adjustments: LandedCostRecalcResult,
-): Promise<void> {
+): Promise<LandedCostJournalRunOutcome> {
   const settings = await getAccountingSettings()
+  let owed = 0
 
   for (const adj of adjustments.inventoryTransitAdjustments) {
     const absDelta = Math.abs(adj.totalDelta)
@@ -839,10 +850,13 @@ export async function queueLandedCostAdjustmentJournals(
       }
     })
     if (postingOutcome.outcome && postingIsOwed(postingOutcome.outcome)) {
+      owed++
       await reportPostingNotQueued({
         entityType: 'PURCHASE_ORDER',
         entityId: adj.primaryPoId,
         action: 'landed_cost_reclass_not_queued',
+        // o3d-j625 r4: WHICH posting this is, so the report is also an OUTSTANDING inbox row.
+        postingRef: { type: 'STOCK_IN_TRANSIT', referenceType: 'PurchaseOrder', referenceId: adj.primaryPoId },
         posting: `the landed-cost inventory/transit reclass for ${adj.primaryPoRef}`,
         committed: 'the landed cost is applied to the stock on hand in IMS',
         remedy:
@@ -928,10 +942,13 @@ export async function queueLandedCostAdjustmentJournals(
       }
     })
     if (cogsPostingOutcome.outcome && postingIsOwed(cogsPostingOutcome.outcome)) {
+      owed++
       await reportPostingNotQueued({
         entityType: 'PURCHASE_ORDER',
         entityId: adj.primaryPoId,
         action: 'landed_cost_cogs_journal_not_queued',
+        // o3d-j625 r4: WHICH posting this is, so the report is also an OUTSTANDING inbox row.
+        postingRef: { type: 'COGS_JOURNAL', referenceType: 'PurchaseOrder', referenceId: adj.primaryPoId },
         posting: `the retrospective COGS adjustment for ${adj.primaryPoRef}`,
         committed: 'the landed-cost change is applied to the sold units in IMS',
         remedy:
@@ -943,6 +960,7 @@ export async function queueLandedCostAdjustmentJournals(
       })
     }
   }
+  return { owed }
 }
 
 /**

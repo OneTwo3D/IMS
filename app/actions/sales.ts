@@ -54,13 +54,13 @@ import {
   queueAccountingSyncTxWithOutcome,
   getAccountingSettings,
   getActiveAccountingConnectorInfo,
-  isAccountingSyncTypeEnabled,
   isAccountingSyncTypeEnabledFor,
   type AccountingEnqueueOutcome,
   type AccountingSettings,
   asRoutableAccountingConnector,
 } from '@/lib/accounting'
 import { postingIsOwed, reportPostingNotQueued } from '@/lib/domain/accounting/enqueue-outcome'
+import { recordAccountingPostingRefusal, type PostingRefusalClient } from '@/lib/domain/accounting/posting-refusal-inbox'
 import {
   openRefundAccountingObligationLedger,
   type RefundAccountingObligation,
@@ -835,7 +835,9 @@ export async function getSalesOrder(id: string): Promise<SoDetail | null> {
     // The TYPE's own posting mode, not just the connector flag: an installation that has payment sync
     // switched off expects no payment to post, and calling that a discrepancy would paint every paid
     // order permanently red for a setting someone chose on purpose.
-    isAccountingSyncTypeEnabled('INVOICE_PAYMENT').catch(() => false),
+    // o3d-j625 r4 (SWEEP 1): asked OF the connector read on the line above, not re-resolved — otherwise the
+    // verdict and the rows it is judged against could be two different connectors'.
+    (activeConnector ? isAccountingSyncTypeEnabledFor(activeConnector.id, 'INVOICE_PAYMENT') : Promise.resolve(false)).catch(() => false),
     loadInvoicePaymentSyncRows(so.id, activeConnector?.id ?? null, so.currency),
   ])
   const claimedForeign = claimedReceivedForeign(so)
@@ -1467,8 +1469,8 @@ async function queueSalesInvoiceForOrder(id: string): Promise<void> {
       accountingInvoiceId: so.accountingInvoiceId,
     }
     const idempotencyKey = accountingPayloadKey(`sales-invoice-update:${so.id}:${so.accountingInvoiceId}`, updatePayload)
-    const { queueXeroSync } = await import('@/lib/connectors/xero/queue')
-    const { getActiveAccountingConnectorInfo, isAccountingSyncTypeEnabled } = await import('@/lib/accounting')
+    // o3d-j625 r4 (Codex HIGH 4): the facade, not `queueXeroSync` — see sales-invoice-update-sync.ts.
+    const { getActiveAccountingConnectorInfo, queueAccountingSync: queueUpdate } = await import('@/lib/accounting')
     await queueSalesInvoiceUpdateForExistingAccountingInvoice({
       salesOrderId: so.id,
       orderNumber,
@@ -1483,9 +1485,10 @@ async function queueSalesInvoiceForOrder(id: string): Promise<void> {
       documentConnector: asRoutableAccountingConnector(so.accountingInvoiceConnector),
     }, {
       getActiveAccountingConnectorInfo,
-      isAccountingSyncTypeEnabled,
-      queueXeroSync,
+      queueAccountingSync: queueUpdate,
       logActivity,
+      // o3d-j625 r4: the refusal lands in the exception inbox, where an operator will find it.
+      recordPostingRefusal: (record) => recordAccountingPostingRefusal(db as unknown as PostingRefusalClient, record),
     })
     return
   }
@@ -1520,6 +1523,8 @@ async function queueSalesInvoiceForOrder(id: string): Promise<void> {
       entityType: 'SALES_ORDER',
       entityId: so.id,
       action: 'sales_invoice_not_queued',
+      // o3d-j625 r4: WHICH posting this is, so the report is also an OUTSTANDING inbox row.
+      postingRef: { type: 'SALES_INVOICE', referenceType: 'SalesOrder', referenceId: so.id },
       posting: `the sales invoice for ${orderNumber}`,
       committed: 'the order is invoiced in IMS',
       remedy:
@@ -3858,6 +3863,8 @@ export async function addPayment(input: {
                 entityType: 'SALES_ORDER',
                 entityId: input.orderId,
                 action: 'realised_fx_journal_not_queued',
+                // o3d-j625 r4: WHICH posting this is, so the report is also an OUTSTANDING inbox row.
+                postingRef: { type: 'REALISED_FX_JOURNAL', referenceType: 'Payment', referenceId: txResult.paymentId },
                 posting: `the realised FX journal for the payment on ${getSalesOrderReference(txResult.so)}`,
                 committed: 'the payment is recorded in IMS',
                 remedy:

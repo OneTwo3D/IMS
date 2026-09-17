@@ -52,7 +52,7 @@ const state = {
   created: [] as Array<{ type: string; referenceType: string; referenceId: string; payload: Record<string, unknown> }>,
   activities: [] as Array<{ action: string; level?: string; description?: string; metadata?: Record<string, unknown> }>,
   /** Candidates for the credit-note allocation sweep. */
-  creditNotes: [] as Array<{ id: string; accountingCreditNoteId: string | null; amountForeign: number; purchaseInvoice: { accountingInvoiceId: string | null } | null }>,
+  creditNotes: [] as Array<{ id: string; accountingCreditNoteId: string | null; accountingCreditNoteConnector?: string | null; amountForeign: number; purchaseInvoice: { accountingInvoiceId: string | null; accountingInvoiceConnector?: string | null } | null }>,
   /**
    * The PURCHASE_CREDIT_NOTE rows that survive for those credit notes. `externalTransactionId` is the
    * DOCUMENT each one's post actually issued — the column round 3's lookup never read, and the whole of
@@ -326,8 +326,9 @@ test('audit-w77e: the allocation sweep inherits the credit note post\'s organisa
   state.creditNotes = [{
     id: 'cn-1',
     accountingCreditNoteId: 'XCN-ISSUED-BY-A',
+    accountingCreditNoteConnector: 'xero',
     amountForeign: 40,
-    purchaseInvoice: { accountingInvoiceId: 'XBILL-1' },
+    purchaseInvoice: { accountingInvoiceId: 'XBILL-1', accountingInvoiceConnector: 'xero' },
   }]
   state.creditNotePosts = [{
     referenceId: 'cn-1',
@@ -355,8 +356,9 @@ test('audit-w77e: with no surviving post to inherit from, the sweep records noth
   state.creditNotes = [{
     id: 'cn-2',
     accountingCreditNoteId: 'XCN-ORIGIN-LOST',
+    accountingCreditNoteConnector: 'xero',
     amountForeign: 40,
-    purchaseInvoice: { accountingInvoiceId: 'XBILL-2' },
+    purchaseInvoice: { accountingInvoiceId: 'XBILL-2', accountingInvoiceConnector: 'xero' },
   }]
   // Retention took the row that would have known. Nothing here observed the post.
   state.creditNotePosts = []
@@ -399,8 +401,9 @@ function twoPostsOfOneCreditNote() {
     id: 'cn-9',
     // The id the allocation will carry. Issued by organisation A.
     accountingCreditNoteId: 'XCN-FIRST',
+    accountingCreditNoteConnector: 'xero',
     amountForeign: 40,
-    purchaseInvoice: { accountingInvoiceId: 'XBILL-9' },
+    purchaseInvoice: { accountingInvoiceId: 'XBILL-9', accountingInvoiceConnector: 'xero' },
   }]
   state.creditNotePosts = [
     {
@@ -470,8 +473,9 @@ test('r4: a FAILED row that NAMES the document is still the issuing post — sta
   state.creditNotes = [{
     id: 'cn-10',
     accountingCreditNoteId: 'XCN-POSTED-THEN-FAILED',
+    accountingCreditNoteConnector: 'xero',
     amountForeign: 25,
-    purchaseInvoice: { accountingInvoiceId: 'XBILL-10' },
+    purchaseInvoice: { accountingInvoiceId: 'XBILL-10', accountingInvoiceConnector: 'xero' },
   }]
   state.creditNotePosts = [
     {
@@ -508,8 +512,9 @@ test('r4: when NO row names the document it carries, the sweep records nothing r
   state.creditNotes = [{
     id: 'cn-11',
     accountingCreditNoteId: 'XCN-ISSUER-GONE',
+    accountingCreditNoteConnector: 'xero',
     amountForeign: 15,
-    purchaseInvoice: { accountingInvoiceId: 'XBILL-11' },
+    purchaseInvoice: { accountingInvoiceId: 'XBILL-11', accountingInvoiceConnector: 'xero' },
   }]
   // Retention took the row that posted XCN-ISSUER-GONE. A LATER post of the same credit note survives,
   // and it is not evidence about XCN-ISSUER-GONE.
@@ -546,8 +551,9 @@ test('r4: two rows claiming ONE document against different organisations resolve
   state.creditNotes = [{
     id: 'cn-12',
     accountingCreditNoteId: 'XCN-CONTESTED',
+    accountingCreditNoteConnector: 'xero',
     amountForeign: 15,
-    purchaseInvoice: { accountingInvoiceId: 'XBILL-12' },
+    purchaseInvoice: { accountingInvoiceId: 'XBILL-12', accountingInvoiceConnector: 'xero' },
   }]
   state.creditNotePosts = [
     {
@@ -587,8 +593,9 @@ test('r4: the warning for an unestablishable origin names a remedy that can actu
   state.creditNotes = [{
     id: 'cn-13',
     accountingCreditNoteId: 'XCN-NO-ORIGIN',
+    accountingCreditNoteConnector: 'xero',
     amountForeign: 15,
-    purchaseInvoice: { accountingInvoiceId: 'XBILL-13' },
+    purchaseInvoice: { accountingInvoiceId: 'XBILL-13', accountingInvoiceConnector: 'xero' },
   }]
   state.creditNotePosts = []
   state.tokenTenantId = 'tenant-C'
@@ -610,3 +617,37 @@ test('r4: the warning for an unestablishable origin names a remedy that can actu
   assert.match(description, /sits FAILED in the sync log/)
   assert.doesNotMatch(description, /Re-queue the allocation from the credit note itself/)
 })
+
+// o3d-j625 r4 (SWEEP 2) — the sweep carries two document ids it reads off the tables into a XERO
+// allocation, so both must be recorded as Xero's. Fail closed on an unrecorded connector.
+for (const [label, cn, bill] of [
+  ['the BILL is recorded as QuickBooks\'', 'xero', 'quickbooks'],
+  ['the bill has NO recorded connector', 'xero', null],
+  ['the CREDIT NOTE has no recorded connector', null, 'xero'],
+] as const) {
+  test(`o3d-j625 r4: the allocation sweep REFUSES when ${label}, and says so`, async () => {
+    reset()
+    state.creditNotes = [{
+      id: 'cn-p',
+      accountingCreditNoteId: 'XCN-P',
+      accountingCreditNoteConnector: cn,
+      amountForeign: 40,
+      purchaseInvoice: { accountingInvoiceId: 'BILL-P', accountingInvoiceConnector: bill },
+    }]
+    state.creditNotePosts = [{
+      referenceId: 'cn-p', externalTransactionId: 'XCN-P', status: 'SYNCED',
+      syncedAt: new Date('2026-01-01T00:00:00Z'), payload: { [CONNECTION_KEY]: 'xero:tenant-A' },
+    }]
+    state.tokenTenantId = 'tenant-A'
+
+    const { reenqueueMissingCreditNoteAllocations } = await import('@/lib/connectors/xero/sync-processor')
+    const result = await reenqueueMissingCreditNoteAllocations()
+
+    assert.equal(result.checked, 1, 'PRECONDITION: the candidate was examined')
+    assert.equal(state.created.length, 0, 'no allocation carrying a non-Xero document id is created')
+    assert.equal(result.failed, 1)
+    assert.equal(result.enqueued, 0)
+    const refusal = state.activities.find((entry) => entry.action === 'xero_credit_note_allocation_refused_unattributable_document')
+    assert.ok(refusal, 'the refusal is recorded')
+  })
+}

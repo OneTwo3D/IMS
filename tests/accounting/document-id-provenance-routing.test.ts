@@ -232,6 +232,48 @@ function transactionDouble() {
   }
 }
 
+/**
+ * o3d-j625 r4 — THE EXCEPTION INBOX'S REFUSAL TABLE, MODELLED.
+ *
+ * Upsert and updateMany semantics rather than a spy: what the tests below assert is that a refusal is
+ * SELECTABLE as outstanding work and stops being so once the posting is queued, and both are properties
+ * of the stored row.
+ */
+const applyRefusalUpdate = (row: Record<string, unknown>, update: Record<string, unknown>): void => {
+  for (const [key, value] of Object.entries(update)) {
+    // Prisma's atomic increment, modelled — the row's attempt count is an assertion below, and a double
+    // that stored the operator object instead of applying it would make that assertion meaningless.
+    if (value && typeof value === 'object' && 'increment' in (value as object)) {
+      row[key] = Number(row[key] ?? 0) + Number((value as { increment: number }).increment)
+    } else {
+      row[key] = value
+    }
+  }
+}
+
+const refusals: Array<Record<string, unknown>> = []
+const postingRefusalTable = {
+  upsert: async ({ where, create, update }: { where: { type_referenceType_referenceId: { type: string; referenceType: string; referenceId: string } }; create: Record<string, unknown>; update: Record<string, unknown> }) => {
+    const key = where.type_referenceType_referenceId
+    const existing = refusals.find((r) => r.type === key.type && r.referenceType === key.referenceType && r.referenceId === key.referenceId)
+    if (existing) { applyRefusalUpdate(existing, { ...update, resolvedAt: null }); return existing }
+    const row = { refusedCount: 1, ...create, resolvedAt: null }
+    refusals.push(row)
+    return row
+  },
+  updateMany: async ({ where, data }: { where: Record<string, unknown>; data: Record<string, unknown> }) => {
+    const hits = refusals.filter((r) => r.type === where.type && r.referenceType === where.referenceType
+      && r.referenceId === where.referenceId && r.resolvedAt === null)
+    for (const hit of hits) Object.assign(hit, data)
+    return { count: hits.length }
+  },
+}
+
+/** The inbox's own predicate. */
+function outstandingRefusals(): Array<Record<string, unknown>> {
+  return refusals.filter((row) => row.resolvedAt === null)
+}
+
 /** The core settings table `getAccountingSettingsFor` reads its connector-agnostic values from. */
 mock.module('@/lib/db', {
   namedExports: {
@@ -239,6 +281,7 @@ mock.module('@/lib/db', {
       setting: { findUnique: async () => null },
       accountingSyncLog: { findMany: async () => [] },
       accountingToken: { findFirst: async () => null },
+      accountingPostingRefusal: postingRefusalTable,
       $transaction: async <T>(fn: (tx: unknown) => Promise<T>): Promise<T> => fn(transactionDouble()),
     },
   },
@@ -249,6 +292,7 @@ mock.module('@/lib/db/savepoint', {
 })
 
 function reset(selection: string[]): void {
+  refusals.length = 0
   enabledPlugins = selection
   selectionReads = 0
   flipToQuickBooksAfterReads = null
@@ -410,4 +454,81 @@ test('[o3d-j625 r3] a recorded value this build cannot route is `null`, never na
   assert.equal(asRoutableAccountingConnector(''), null)
   assert.equal(asRoutableAccountingConnector(null), null)
   assert.equal(asRoutableAccountingConnector(undefined), null)
+})
+
+// --------------------------------------------------------------------------------------------
+// o3d-j625 r4 — the chart-scoped posting verdict, against the real plugin selection and settings
+// --------------------------------------------------------------------------------------------
+
+test('[o3d-j625 r4] accountingPostingVerdictForChart keeps "chart retired" apart from "type switched off"', async () => {
+  const { accountingPostingVerdictForChart } = await import('@/lib/accounting')
+
+  reset(['xero'])
+  assert.deepEqual(await accountingPostingVerdictForChart('xero', 'SALES_INVOICE'), { verdict: 'post', connector: 'xero' })
+  // Posting mode for this type is not in the Xero settings double, i.e. switched off, while Xero is active.
+  assert.deepEqual(await accountingPostingVerdictForChart('xero', 'COGS_REVERSAL'), { verdict: 'not-configured', connector: 'xero' })
+  // The chart is Xero's and QuickBooks is active: owed, not off — whatever QuickBooks' own toggles say.
+  reset(['quickbooks'])
+  assert.deepEqual(await accountingPostingVerdictForChart('xero', 'SALES_INVOICE'), { verdict: 'chart-retired', chartConnector: 'xero', activeConnector: 'quickbooks' })
+  reset([])
+  assert.deepEqual(await accountingPostingVerdictForChart('xero', 'SALES_INVOICE'), { verdict: 'chart-retired', chartConnector: 'xero', activeConnector: null })
+  assert.deepEqual(await accountingPostingVerdictForChart(null, 'SALES_INVOICE'), { verdict: 'no-chart' })
+})
+
+
+// ---------------------------------------------------------------------------------------------------
+// o3d-j625 r4 — A REFUSAL IS OUTSTANDING WORK, AND THE POSTING BEING MADE IS WHAT CLEARS IT.
+// ---------------------------------------------------------------------------------------------------
+
+test('[o3d-j625 r4] a refused posting becomes an OUTSTANDING inbox row naming BOTH connectors and a remedy', async () => {
+  reset(['xero'])
+  const { getAccountingSettings, queueAccountingSync } = await import('@/lib/accounting')
+  const settings = await getAccountingSettings()
+  enabledPlugins = ['quickbooks']
+
+  const outcome = await queueAccountingSync({ ...salesInvoiceRequest(settings.salesAccount), chartConnector: settings.connector })
+
+  assert.equal(outcome.reason, 'refused', 'PRECONDITION: this is the refusal path')
+  const rows = outstandingRefusals()
+  assert.equal(rows.length, 1, `the refusal is durable and selectable. Rows: ${JSON.stringify(refusals)}`)
+  assert.equal(rows[0].type, 'SALES_INVOICE')
+  assert.equal(rows[0].referenceType, 'SalesOrder')
+  assert.equal(rows[0].referenceId, 'order-1')
+  assert.equal(rows[0].chartConnector, 'xero', 'the chart the codes came from')
+  assert.equal(rows[0].activeConnector, 'quickbooks', 'AND what is active now — the half round 2 omitted')
+  assert.equal(rows[0].reason, 'retired_chart')
+  assert.match(String(rows[0].remedy), /switch back to xero|raise it again/)
+})
+
+test('[o3d-j625 r4] the SAME posting refused again updates one row rather than filling the inbox', async () => {
+  reset(['xero'])
+  const { getAccountingSettings, queueAccountingSync } = await import('@/lib/accounting')
+  const settings = await getAccountingSettings()
+  enabledPlugins = ['quickbooks']
+
+  await queueAccountingSync({ ...salesInvoiceRequest(settings.salesAccount), chartConnector: settings.connector })
+  await queueAccountingSync({ ...salesInvoiceRequest(settings.salesAccount), chartConnector: settings.connector })
+
+  assert.equal(outstandingRefusals().length, 1)
+  assert.equal(outstandingRefusals()[0].refusedCount, 2, 'and the row counts both attempts')
+})
+
+test('[o3d-j625 r4] the posting being QUEUED clears the outstanding row — nothing else does', async () => {
+  reset(['xero'])
+  const { getAccountingSettings, queueAccountingSync } = await import('@/lib/accounting')
+  const settings = await getAccountingSettings()
+
+  // Refused while the chart's connector is retired…
+  enabledPlugins = ['quickbooks']
+  await queueAccountingSync({ ...salesInvoiceRequest(settings.salesAccount), chartConnector: settings.connector })
+  assert.equal(outstandingRefusals().length, 1, 'PRECONDITION: the debt was recorded')
+
+  // …and the selection settles back, so the same posting is re-queued from its source document.
+  enabledPlugins = ['xero']
+  const outcome = await queueAccountingSync({ ...salesInvoiceRequest(settings.salesAccount), chartConnector: settings.connector })
+
+  assert.equal(outcome.queued, true, 'PRECONDITION: this time it really was queued')
+  assert.deepEqual(outstandingRefusals(), [], 'the row clears when the posting is MADE')
+  assert.equal(refusals.length, 1, 'and the record that the gap existed is kept, resolved')
+  assert.ok(refusals[0].resolvedAt, 'stamped with when it was resolved')
 })

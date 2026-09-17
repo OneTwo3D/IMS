@@ -251,6 +251,8 @@ export async function cancelPurchaseOrderService(
         entityType: 'PURCHASE_ORDER',
         entityId: id,
         action: 'purchase_order_cancel_journal_not_queued',
+        // o3d-j625 r4: WHICH posting this is, so the report is also an OUTSTANDING inbox row.
+        postingRef: { type: 'INVENTORY_ADJUSTMENT', referenceType: 'PurchaseOrder', referenceId: id },
         posting: `the cost-layer reversal journal for cancelled purchase order ${id}`,
         committed: 'the PO is cancelled and its remaining cost layers are reversed in IMS',
         remedy:

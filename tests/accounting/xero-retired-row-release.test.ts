@@ -176,6 +176,8 @@ mock.module('@/lib/connectors/xero/outbox', {
 mock.module('@/lib/accounting', {
   namedExports: {
     getPaymentAccountMap: async () => ({ card: 'BANK-1' }),
+    // o3d-j625 r4: the processor confirms the mapped account against its own chart; held here.
+    accountingBankAccountBelongsTo: async () => true,
     lookupPaymentAccount: () => 'BANK-1',
   },
 })

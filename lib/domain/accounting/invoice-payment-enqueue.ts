@@ -16,12 +16,12 @@ import {
   accountingBankAccountBelongsTo,
   getActiveAccountingConnectorInfo,
   getPaymentAccountMap,
-  isAccountingSyncTypeEnabled,
   isAccountingSyncTypeEnabledFor,
   lookupPaymentAccount,
   queueAccountingSyncTxWithOutcome,
 } from '@/lib/accounting'
 import { asRoutableAccountingConnector } from '@/lib/accounting/connector-provenance'
+import { recordAccountingPostingRefusal, type PostingRefusalClient } from '@/lib/domain/accounting/posting-refusal-inbox'
 import { lockSalesOrder } from '@/lib/domain/sales/allocation-service'
 import { getSalesOrderReference } from '@/lib/sales-order-display'
 import {
@@ -1290,16 +1290,27 @@ export async function registerInvoicePaymentWithLedger(params: {
       return
     }
 
-    const [paymentSyncEnabled, so, activeConnector] = await Promise.all([
+    // o3d-j625 r4 (SWEEP 1) — THE CONNECTOR IS READ ONCE, AND THE POSTING VERDICT IS ASKED OF THAT READ.
+    //
+    // The unpinned arm used to run `isAccountingSyncTypeEnabled('INVOICE_PAYMENT')` IN PARALLEL with
+    // `getActiveAccountingConnectorInfo()` — two independent resolutions of "which connector". A switch
+    // between them could hand this function connector A for `connectorId` and connector B's `false` for
+    // `paymentSyncEnabled`, and `false` is SYNC_DISABLED: a silent non-registration, with no notice, of a
+    // receipt connector A does post. The verdict is now `isAccountingSyncTypeEnabledFor(connectorId)`, so
+    // both facts are about one connector; a switch after this read is caught by the enqueue's chart guard
+    // and reported as POSTING_CONTEXT_CHANGED.
+    const activeConnector = pinned ? null : await getActiveAccountingConnectorInfo().catch(() => null)
+    const verdictConnector: string | null = pinned ? pinned.connector : (activeConnector?.id ?? null)
+    const [paymentSyncEnabled, so] = await Promise.all([
       // Not merely "is the connector on": if INVOICE_PAYMENT posting is off, queueAccountingSync would
       // drop this silently, so treat it as nothing being expected rather than as a failure to report.
       //
       // o3d-ekn8 r2: when a post is pinned, the question is whether the PINNED connector posts payments
       // — the active-connector form would answer about whatever is switched on now, which is not an
       // answer about the connector that just posted this invoice at all.
-      (pinned
-        ? isAccountingSyncTypeEnabledFor(pinned.connector, 'INVOICE_PAYMENT')
-        : isAccountingSyncTypeEnabled('INVOICE_PAYMENT')).catch(() => false),
+      (verdictConnector === null
+        ? Promise.resolve(false)
+        : isAccountingSyncTypeEnabledFor(verdictConnector, 'INVOICE_PAYMENT')).catch(() => false),
       db.salesOrder.findUnique({
         where: { id: params.orderId },
         select: {
@@ -1310,9 +1321,6 @@ export async function registerInvoicePaymentWithLedger(params: {
           shoppingLinks: { select: { connector: true }, take: 1 },
         },
       }),
-      // Not resolved at all when a connector was pinned: a second resolution can agree with the pin
-      // while the write did not, which is the race rather than a check of it.
-      pinned ? Promise.resolve(null) : getActiveAccountingConnectorInfo().catch(() => null),
     ])
     if (!so) return
 
@@ -1490,6 +1498,26 @@ export async function registerInvoicePaymentWithLedger(params: {
     // about ROUTING and a receipt that cannot be routed must not be measured for capacity, queued, or
     // reported as a posting-context change (which is what reaching the enqueue would have made of it).
     if (documentProvenanceRefused) {
+      // o3d-j625 r4: and it is OUTSTANDING work, not only a warning — the receipt stands in IMS while
+      // the ledger shows the invoice unpaid, and nothing re-drives this on its own.
+      await recordAccountingPostingRefusal(db as unknown as PostingRefusalClient, {
+        type: 'INVOICE_PAYMENT',
+        referenceType: 'SalesOrder',
+        referenceId: params.orderId,
+        chartConnector: connectorId,
+        activeConnector: activeConnector?.id ?? connectorId,
+        reason: 'document_provenance_unproven',
+        committed: `the receipt of ${params.currency} ${amountNumber.toFixed(2)} is recorded against ${params.orderReference} in IMS`,
+        remedy:
+          // o3d-0bfh r13: no instruction to re-drive or to settle by hand appears on the money path —
+          // either can double a payment already queued. What is stated is the CONFIGURATION to correct,
+          // which is safe to repeat, and the receipt's own remedy comes from invoicePaymentRemedyNote in
+          // the warning beside this row.
+          'IMS cannot establish which accounting connector holds the invoice this payment would settle. '
+          + 'Re-post the invoice from this order so the document and the connector that issued it are '
+          + 'recorded together.',
+        detail: { paymentId: params.paymentId, accountingInvoiceConnector: so.accountingInvoiceConnector },
+      })
       await reportRefusal({
         register: false,
         refusal: 'DOCUMENT_PROVENANCE_UNPROVEN',
@@ -1500,6 +1528,20 @@ export async function registerInvoicePaymentWithLedger(params: {
       return
     }
     if (mappedBankAccountId !== null && !bankAccountIsThisLedgers) {
+      await recordAccountingPostingRefusal(db as unknown as PostingRefusalClient, {
+        type: 'INVOICE_PAYMENT',
+        referenceType: 'SalesOrder',
+        referenceId: params.orderId,
+        chartConnector: connectorId,
+        activeConnector: activeConnector?.id ?? connectorId,
+        reason: 'payment_account_not_in_ledger',
+        committed: `the receipt of ${params.currency} ${amountNumber.toFixed(2)} is recorded against ${params.orderReference} in IMS`,
+        remedy:
+          'The bank account mapped for this payment method is not an account of the connector this payment '
+          + 'would post to. Re-map the method under Settings → Accounting → Payment Account Mapping against '
+          + 'the connector now in use.',
+        detail: { paymentId: params.paymentId, mappedBankAccountId },
+      })
       await reportRefusal({
         register: false,
         refusal: 'PAYMENT_ACCOUNT_NOT_IN_LEDGER',

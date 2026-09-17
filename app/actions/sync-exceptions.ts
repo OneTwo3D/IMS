@@ -445,6 +445,29 @@ export type AccountingFollowUpObligationRow = {
   operatorRemedy: string
 }
 
+/**
+ * o3d-j625 r4 — AN ACCOUNTING POSTING IMS REFUSED TO QUEUE, AND STILL OWES.
+ *
+ * The same shape every other row on this page has: what, which reference, since when, why, what to do.
+ * Both connectors are carried deliberately — the chart the payload was built from AND the one active
+ * when it was refused — because round 2's warning named only the first, which tells an operator what
+ * went wrong and not what to switch back to.
+ */
+export type AccountingPostingRefusalRow = {
+  id: string
+  type: string
+  referenceType: string
+  referenceId: string
+  chartConnector: string | null
+  activeConnector: string | null
+  reason: string
+  committed: string
+  remedy: string
+  refusedCount: number
+  firstRefusedAt: string
+  lastRefusedAt: string
+}
+
 export type ExceptionInboxSummary = {
   /**
    * o3d-hl8l r5: a held maintenance window, and/or a booked-in re-check that a closed one still
@@ -467,6 +490,13 @@ export type ExceptionInboxSummary = {
    * is the view that makes it visible without depending on a second write having landed.
    */
   accountingFollowUpObligations: number
+  /**
+   * o3d-j625 r4: postings the enqueues REFUSED — a retired chart, a document id that cannot be shown to
+   * belong to the connector it would post to, a payment account belonging to another connector. Counted
+   * in the total because that is the whole point of the decision: a refusal nobody is looking for is a
+   * silent non-posting, and these clear only when the posting is actually made.
+   */
+  accountingPostingRefusals: number
   total: number
 }
 
@@ -483,6 +513,7 @@ export type ExceptionInboxData = {
   productStructureConflicts: ProductStructureConflictRow[]
   unresolvedDrift: UnresolvedDriftRow[]
   accountingFollowUpObligations: AccountingFollowUpObligationRow[]
+  accountingPostingRefusals: AccountingPostingRefusalRow[]
 }
 
 // Codex r4: only PERMANENT_FAILED rows are actionable exceptions — a
@@ -728,7 +759,7 @@ async function loadExceptionCounts(): Promise<ExceptionInboxSummary> {
   // host's. Read before the batch because the predicate is built from it; `null` (unreadable clock)
   // means no grace at all, which lists every marked row — noise in the safe direction.
   const followUpDatabaseNow = await readFollowUpObligationDatabaseNow(db)
-  const [wmsPushDeadLetters, outboxFailures, deadReceipts, deadWebhooks, refundSyncParks, pennyMismatches, stuckDispatches, orderReconcileDrift, productStructureConflicts, driftIncidents, accountingFollowUpObligations] = await Promise.all([
+  const [wmsPushDeadLetters, outboxFailures, deadReceipts, deadWebhooks, refundSyncParks, pennyMismatches, stuckDispatches, orderReconcileDrift, productStructureConflicts, driftIncidents, accountingFollowUpObligations, accountingPostingRefusals] = await Promise.all([
     // o3d-92fu / o3d-2k5r: the count is over EVERY blocked push state, not DEAD_LETTER alone — a
     // VALIDATION_FAILED or AMBIGUOUS_CREATE order reaches the warehouse only via a human, so it
     // belongs in the same total. Kept through the merge with o3d-0bfh's follow-up obligations.
@@ -749,6 +780,9 @@ async function loadExceptionCounts(): Promise<ExceptionInboxSummary> {
     // payment owes it whether or not QuickBooks is the connector enabled today, and the whole reason
     // the row is here is that nothing will ever come back to it on its own.
     db.accountingSyncLog.count({ where: buildFollowUpObligationBacklogWhere({ databaseNow: followUpDatabaseNow }) }),
+    // o3d-j625 r4: outstanding refusals. NOT scoped to the active connector, for the same reason the
+    // follow-up obligations are not: a posting owed to the books you switched away from is still owed.
+    db.accountingPostingRefusal.count({ where: { resolvedAt: null } }),
   ])
 
   const maintenanceRecovery = countMaintenanceRecovery(await loadMaintenanceRecoveryState())
@@ -765,9 +799,10 @@ async function loadExceptionCounts(): Promise<ExceptionInboxSummary> {
     productStructureConflicts,
     unresolvedDrift: driftIncidents.length,
     accountingFollowUpObligations,
+    accountingPostingRefusals,
     total: maintenanceRecovery + wmsPushDeadLetters + outboxFailures + deadReceiptEvents + refundSyncParks
       + stuckDispatches + pennyMismatches + orderReconcileDrift + productStructureConflicts + driftIncidents.length
-      + accountingFollowUpObligations,
+      + accountingFollowUpObligations + accountingPostingRefusals,
   }
 }
 
@@ -838,7 +873,7 @@ export async function getExceptionInboxData(): Promise<ExceptionInboxData> {
   // threaded through, because the two loads are independent reads and a cutoff a few milliseconds
   // apart cannot change which side of a five-minute grace a row falls on.
   const followUpDatabaseNow = await readFollowUpObligationDatabaseNow(db)
-  const [pushLinks, outbox, deadReceiptRows, deadWebhookRows, refundLogs, stuckDispatches, mismatchLinks, orderReconcileDrift, productStructureConflicts, driftIncidents, followUpObligationRows] = await Promise.all([
+  const [pushLinks, outbox, deadReceiptRows, deadWebhookRows, refundLogs, stuckDispatches, mismatchLinks, orderReconcileDrift, productStructureConflicts, driftIncidents, followUpObligationRows, postingRefusalRows] = await Promise.all([
     db.wmsOrderPushLink.findMany({
       where: { state: { in: [...BLOCKED_WMS_PUSH_STATES] } },
       orderBy: { lastAttemptAt: 'desc' },
@@ -950,6 +985,28 @@ export async function getExceptionInboxData(): Promise<ExceptionInboxData> {
         // is a generation; and NOT syncedAt, which an application host writes with new Date().
         backReferenceFollowUpsClaimedAtDatabaseClock: true,
         createdAt: true,
+      },
+    }),
+    // o3d-j625 r4 — the refused postings behind the count above. Oldest debt first: `firstRefusedAt` is
+    // when the gap opened, and a refusal that has been repeating for a week is the one to look at, not
+    // the one that last happened to run.
+    db.accountingPostingRefusal.findMany({
+      where: { resolvedAt: null },
+      orderBy: { firstRefusedAt: 'asc' },
+      take: SECTION_LIMIT,
+      select: {
+        id: true,
+        type: true,
+        referenceType: true,
+        referenceId: true,
+        chartConnector: true,
+        activeConnector: true,
+        reason: true,
+        committed: true,
+        remedy: true,
+        refusedCount: true,
+        firstRefusedAt: true,
+        lastRefusedAt: true,
       },
     }),
   ])
@@ -1261,6 +1318,13 @@ export async function getExceptionInboxData(): Promise<ExceptionInboxData> {
       const described = describeFollowUpObligationBacklogRow(row)
       return { ...described, owedSince: described.owedSince?.toISOString() ?? null }
     }),
+    // o3d-j625 r4: rendered from the columns the refusal itself wrote — the remedy an operator reads is
+    // the one the refusing site stated, so the page and the accounting log cannot tell two stories.
+    accountingPostingRefusals: postingRefusalRows.map((row) => ({
+      ...row,
+      firstRefusedAt: row.firstRefusedAt.toISOString(),
+      lastRefusedAt: row.lastRefusedAt.toISOString(),
+    })),
   }
 
   return {

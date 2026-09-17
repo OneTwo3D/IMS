@@ -2949,6 +2949,55 @@ model AccountingReconciliationFinding {
   @@map("accounting_reconciliation_findings")
 }
 
+/// o3d-j625 r4 — A POSTING IMS REFUSED TO QUEUE, AS DURABLE, QUERYABLE WORK.
+///
+/// Rounds 2-4 gave the accounting enqueues the ability to REFUSE — a chart whose connector has been
+/// retired, a document id that cannot be shown to belong to the connector the row would post to, a
+/// payment-account mapping holding another connector's account — and reported every one of them as an
+/// Activity-log line. An Activity line is a thing somebody has to already be looking for. The refusals
+/// this table records are precisely the ones NOBODY is watching: the WooCommerce held-invoice release
+/// refuses days after the order imported, and nothing retries it.
+///
+/// So a refusal is recorded as OUTSTANDING WORK, in the shape the exception inbox already uses: what
+/// was owed, to which books, what IMS did instead, and what the operator must do. It carries BOTH
+/// connectors — the chart's and the one active at the moment of refusal — because round 2's warning
+/// named only the chart, which tells an operator what went wrong and not what to switch back to.
+///
+/// ONE OPEN ROW PER POSTING. The natural key is the posting itself (type + reference), so a sweep that
+/// refuses the same release every five minutes updates one row rather than filling the inbox; `count`
+/// says how many times, and `lastRefusedAt` when it last tried.
+///
+/// CLEARED BY THE POSTING BEING MADE, never by a timer: `resolvedAt` is stamped by the enqueue that
+/// finally writes the row for the same posting (see clearAccountingPostingRefusal). A resolved row is
+/// kept as the record that the gap existed and for how long.
+model AccountingPostingRefusal {
+  id              String    @id @default(cuid())
+  /// The accounting document that was not queued (AccountingSyncType, as the string the sync rows use).
+  type            String
+  referenceType   String
+  referenceId     String
+  /// Whose chart of accounts the refused payload was built from. NULL = nothing was switched on.
+  chartConnector  String?
+  /// The connector that was active when the refusal happened — the half round 2 omitted.
+  activeConnector String?
+  /// A machine code for what was refused, e.g. `retired_chart`, `unattributable_document_id`.
+  reason          String
+  /// What stands in IMS regardless, in the operator's words.
+  committed       String
+  /// What the operator has to do. Nothing retries these on their own.
+  remedy          String
+  detail          Json?
+  refusedCount    Int       @default(1)
+  firstRefusedAt  DateTime  @default(now())
+  lastRefusedAt   DateTime  @default(now())
+  /// Stamped when a posting for the same document is actually queued. NULL = still outstanding.
+  resolvedAt      DateTime?
+
+  @@unique([type, referenceType, referenceId])
+  @@index([resolvedAt, lastRefusedAt])
+  @@map("accounting_posting_refusals")
+}
+
 model AccountingToken {
   id           String   @id @default(cuid())
   connector    String   @default("xero")

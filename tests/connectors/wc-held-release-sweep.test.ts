@@ -30,6 +30,8 @@ type HeldRow = {
 type Order = { id: string; invoiceNumber: string | null; accountingInvoiceId: string | null }
 
 const state = {
+  /** o3d-j625 r4: the exception inbox's refusal table, as rows rather than as calls. */
+  refusals: [] as Array<Record<string, unknown>>,
   held: [] as HeldRow[],
   orders: [] as Order[],
   queued: [] as { referenceId: string; idempotencyKey: string; payload: Record<string, unknown> }[],
@@ -80,6 +82,18 @@ function matchesHeld(row: HeldRow, where: Record<string, unknown>): boolean {
   return reason === payload?.equals
 }
 
+const applyRefusalUpdate = (row: Record<string, unknown>, update: Record<string, unknown>): void => {
+  for (const [key, value] of Object.entries(update)) {
+    // Prisma's atomic increment, modelled — the row's attempt count is an assertion below, and a double
+    // that stored the operator object instead of applying it would make that assertion meaningless.
+    if (value && typeof value === 'object' && 'increment' in (value as object)) {
+      row[key] = Number(row[key] ?? 0) + Number((value as { increment: number }).increment)
+    } else {
+      row[key] = value
+    }
+  }
+}
+
 mock.module('@/lib/db', {
   namedExports: {
     db: {
@@ -99,6 +113,24 @@ mock.module('@/lib/db', {
       salesOrder: {
         findMany: async ({ where }: { where: { id: { in: string[] } } }) =>
           state.orders.filter((o) => where.id.in.includes(o.id)),
+      },
+      // o3d-j625 r4: the exception inbox's own table. Modelled (upsert semantics, not a spy) because the
+      // assertion below is that a refusal is SELECTABLE as outstanding work, which is a property of the
+      // stored row, not of a call having been made.
+      accountingPostingRefusal: {
+        upsert: async ({ where, create, update }: { where: { type_referenceType_referenceId: { type: string; referenceType: string; referenceId: string } }; create: Record<string, unknown>; update: Record<string, unknown> }) => {
+          const key = where.type_referenceType_referenceId
+          const existing = state.refusals.find((r) => r.type === key.type && r.referenceType === key.referenceType && r.referenceId === key.referenceId)
+          if (existing) { applyRefusalUpdate(existing, { ...update, resolvedAt: null }); return existing }
+          const row = { refusedCount: 1, ...create, resolvedAt: null } as Record<string, unknown>
+          state.refusals.push(row as never)
+          return row
+        },
+        updateMany: async ({ where, data }: { where: Record<string, unknown>; data: Record<string, unknown> }) => {
+          const hits = state.refusals.filter((r) => r.type === where.type && r.referenceType === where.referenceType && r.referenceId === where.referenceId && r.resolvedAt === null)
+          for (const hit of hits) Object.assign(hit, data)
+          return { count: hits.length }
+        },
       },
       accountingSyncLog: {
         findFirst: async ({ where }: { where: Record<string, unknown> }) => {
@@ -135,7 +167,13 @@ async function sweep(...args: Parameters<Sweep>): ReturnType<Sweep> {
   return mod.retryHeldWcSalesInvoiceReleases(...args)
 }
 
+/** The inbox's own predicate: an OPEN refusal is one with no resolvedAt. */
+function outstanding(): Array<Record<string, unknown>> {
+  return state.refusals.filter((row) => row.resolvedAt === null)
+}
+
 function reset() {
+  state.refusals = []
   state.held = []
   state.orders = []
   state.queued = []
@@ -306,4 +344,57 @@ test('the sweep is WIRED to the reconcile cron — an unreached sweep is not a d
   assert.ok(call > 0 && (reconcileDue < 0 || call > body.indexOf('results.orders')), 'the sweep must run on its own')
   const route = withoutComments(readFileSync('app/api/cron/wc-reconcile/route.ts', 'utf8'))
   assert.match(route, /runWcReconcile\(\)/, 'and the cron route must be what runs it')
+})
+
+// ---------------------------------------------------------------------------------------------------
+// o3d-j625 r4 — THE CASE THAT SETTLED "A REFUSAL IS OUTSTANDING WORK, NOT A LOG LINE".
+//
+// This release runs on a sweep, days after the order imported, with nobody watching. Before r4 the only
+// record of a refusal was an Activity line and a PENDING hold. Now it is a row the exception inbox
+// selects — carrying the chart it was built for, the connector active when it was refused, and what to do.
+// ---------------------------------------------------------------------------------------------------
+
+test('[o3d-j625 r4] a release that queues NOTHING becomes OUTSTANDING work in the exception inbox', async () => {
+  reset()
+  state.held = [heldRow({ id: 'hold-1', entityId: 'so-1' })]
+  state.orders = [{ id: 'so-1', invoiceNumber: '164981', accountingInvoiceId: null }]
+  state.enqueueNoOps = true
+
+  await sweep()
+
+  assert.equal(state.queued.length, 0, 'PRECONDITION: nothing was queued, which is the state under test')
+  const rows = outstanding()
+  assert.equal(rows.length, 1, `the refusal is selectable as outstanding work. Rows: ${JSON.stringify(state.refusals)}`)
+  assert.equal(rows[0].type, 'SALES_INVOICE')
+  assert.equal(rows[0].referenceType, 'SalesOrder')
+  assert.equal(rows[0].referenceId, 'so-1')
+  assert.equal(rows[0].chartConnector, 'xero', 'the chart the frozen payload was built from')
+  assert.ok(String(rows[0].remedy).length > 0, 'and what the operator must do')
+  assert.ok(String(rows[0].committed).includes('imported'), 'and what stands in IMS regardless')
+})
+
+test('[o3d-j625 r4] the refusal is ONE row however many times the sweep retries it', async () => {
+  reset()
+  state.held = [heldRow({ id: 'hold-1', entityId: 'so-1' })]
+  state.orders = [{ id: 'so-1', invoiceNumber: '164981', accountingInvoiceId: null }]
+  state.enqueueNoOps = true
+
+  await sweep()
+  await sweep()
+  await sweep()
+
+  const rows = outstanding()
+  assert.equal(rows.length, 1, 'a five-minute sweep must not fill the inbox with one row per attempt')
+  assert.equal(rows[0].refusedCount, 3, 'and the row counts every attempt')
+})
+
+test('[o3d-j625 r4] CONTROL: a release that DOES queue records nothing outstanding', async () => {
+  reset()
+  state.held = [heldRow({ id: 'hold-1', entityId: 'so-1' })]
+  state.orders = [{ id: 'so-1', invoiceNumber: '164981', accountingInvoiceId: null }]
+
+  await sweep()
+
+  assert.equal(state.queued.length, 1, 'PRECONDITION: the invoice was queued')
+  assert.deepEqual(outstanding(), [], 'nothing is owed, so nothing is outstanding')
 })

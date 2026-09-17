@@ -36,11 +36,15 @@ function makeJob(payloadJson: unknown) {
   return { id: 'job-1', connector: 'accounting', operation: 'landed-cost.adjustment-journal', idempotencyKey: 'k', payloadJson, status: 'PROCESSING', attempts: 0, nextAttemptAt: null, lastError: null, lockedAt: new Date('2026-06-13T00:00:00Z'), lockedBy: 'w', createdAt: new Date('2026-06-13T00:00:00Z'), updatedAt: new Date('2026-06-13T00:00:00Z') }
 }
 
-function makeDeps(over: Partial<LandedCostOutboxDrainDeps> & { jobs?: ReturnType<typeof makeJob>[]; throwOnQueue?: boolean }) {
+function makeDeps(over: Partial<LandedCostOutboxDrainDeps> & { jobs?: ReturnType<typeof makeJob>[]; throwOnQueue?: boolean; owed?: number }) {
   const calls = { queued: 0, success: 0, retry: 0 }
   const deps: LandedCostOutboxDrainDeps = {
     claimWork: async () => (over.jobs ?? []) as never,
-    queueJournals: async () => { calls.queued++; if (over.throwOnQueue) throw new Error('queue failed') },
+    queueJournals: async () => {
+      calls.queued++
+      if (over.throwOnQueue) throw new Error('queue failed')
+      return { owed: over.owed ?? 0 }
+    },
     markSuccess: async () => { calls.success++ },
     markRetry: async () => { calls.retry++ },
   }
@@ -80,6 +84,16 @@ test('drain: a payload missing the adjustment arrays is malformed → retry, not
   assert.equal(res.failed, 1)
   assert.equal(calls.retry, 1)
   assert.equal(calls.queued, 0)
+})
+
+// o3d-j625 r4 (SWEEP 1): a run whose journals were REFUSED is not a succeeded job.
+test('[o3d-j625 r4] drain: a run that leaves journals OWED marks the job retryable, not succeeded', async () => {
+  const { deps, calls } = makeDeps({ jobs: [makeJob({ inventoryTransitAdjustments: [adj(5)], cogsAdjustments: [] })], owed: 2 })
+  const res = await processLandedCostJournalOutbox(deps)
+  assert.equal(calls.queued, 1, 'PRECONDITION: the journals were attempted')
+  assert.equal(calls.success, 0, 'the backstop must not stop caring about journals it could not queue')
+  assert.equal(calls.retry, 1)
+  assert.deepEqual(res, { claimed: 1, succeeded: 0, failed: 1 })
 })
 
 test('drain: no jobs → nothing happens', async () => {

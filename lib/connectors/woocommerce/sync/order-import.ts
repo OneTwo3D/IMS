@@ -5,6 +5,7 @@
 import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
 import { postingIsOwed, reportPostingNotQueued, type EnqueueOutcomeLike } from '@/lib/domain/accounting/enqueue-outcome'
+import { recordAccountingPostingRefusal, type PostingRefusalClient } from '@/lib/domain/accounting/posting-refusal-inbox'
 import { wcFetch, MAX_WC_PAGE_WALK_PAGES, describeWcPageWalkCeilingStall } from '../api'
 import type { WcFullOrder, SyncResult } from './types'
 import {
@@ -1262,6 +1263,24 @@ async function releaseHeldWcSalesInvoice(
       `WooCommerce numbered this invoice ${invoiceNumber}, but queueing the held sales invoice produced no `
       + `accounting sync row, so NOTHING will post. ${cause} Retried by the WooCommerce reconcile sweep.`,
     )
+    // o3d-j625 r4 — THE CASE THAT SETTLED THE DECISION. This runs on a sweep, days after the order was
+    // imported, with no operator present: the hold stays PENDING and the only record was a log line
+    // nobody reads. The refusal is now outstanding work in the exception inbox, and the release that
+    // eventually queues the invoice clears it (the facade clears on a queued enqueue).
+    await recordAccountingPostingRefusal(db as unknown as PostingRefusalClient, {
+      type: 'SALES_INVOICE',
+      referenceType: 'SalesOrder',
+      referenceId: orderId,
+      chartConnector: heldChartConnector,
+      activeConnector: enqueueOutcome.outcome?.connector ?? null,
+      reason: enqueueOutcome.outcome?.reason === 'refused' ? 'retired_chart' : 'held_release_not_queued',
+      committed: `WooCommerce order ${wcOrder.externalOrderNumber} is imported and holds invoice number ${invoiceNumber}`,
+      remedy:
+        'No sales invoice will post for this order until the hold is released. Settle the accounting '
+        + 'connector selection and let the WooCommerce reconcile sweep retry, or queue the sales invoice '
+        + 'from the order.',
+      detail: { invoiceNumber, idempotencyKey, shoppingSyncLogId: row.id },
+    })
     if (logFailure) {
       await logActivity({
         entityType: 'SALES_ORDER',
@@ -2502,6 +2521,8 @@ export async function importWcOrder(wcOrder: WcFullOrder, options: ImportWcOrder
             entityType: 'SALES_ORDER',
             entityId: so.id,
             action: 'sales_invoice_not_queued',
+            // o3d-j625 r4: WHICH posting this is, so the report is also an OUTSTANDING inbox row.
+            postingRef: { type: 'SALES_INVOICE', referenceType: 'SalesOrder', referenceId: so.id },
             posting: `the sales invoice for imported WooCommerce order ${orderNumber}`,
             committed: 'the order is imported and marked synced in IMS',
             remedy:

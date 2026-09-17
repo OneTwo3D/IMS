@@ -2238,11 +2238,46 @@ therefore only queued when the mapped account is an active bank account in the c
 of accounts; otherwise it is refused with **PAYMENT_ACCOUNT_NOT_IN_LEDGER**. After switching connector,
 sync the chart of accounts and re-map each method against the new connector.
 
+The same check applies to payments registered for **imported (WooCommerce) orders**, whose bank account is
+chosen when the sales invoice posts rather than when the receipt is recorded. If the mapped account is not
+one of the posting connector's own bank accounts, the payment is not queued and `xero_payment_skipped` /
+`quickbooks_payment_skipped` names the mapped account; the retry picks it up once the mapping is fixed. The
+account that passes the check is the one written into the payment, so a later edit to the mapping does not
+redirect a payment that is already queued.
+
+**"Posting is switched off" and "the connector changed" are no longer the same answer.** A supplier credit
+note, a bill edit, a manufacturing journal or reclass, and a sales invoice edit each check whether the
+connector their account codes came from is still the active one. If it is and that posting type is off,
+nothing is expected, as before (a credit note posts locally). If the connector has changed, the posting is
+**refused** and reported instead — a credit note stays draft (`supplier_credit_note_not_posted`), a bill
+edit logs `purchase_invoice_update_not_queued`, a sales invoice edit whose update the queue declines logs
+`sales_invoice_update_not_queued` — rather than being silently treated as switched off.
+
+### Refused postings appear in the exception inbox as outstanding work
+
+A posting IMS refuses is **not** only an activity-log line. Each refusal is recorded as a row on
+**Sync → Exceptions**, in the section *"Accounting postings IMS refused to queue"*, beside the accounting
+follow-ups that page already lists. Each row names the document and its reference, the chart of accounts
+the payload was built from **and** the connector that was active when it was refused, how long it has been
+owed (and how many attempts), what still stands in IMS, and what to do about it.
+
+Two things about those rows:
+
+* **They clear when the posting is actually made**, not when anyone acknowledges them. Re-queue the
+  posting from its source document and the row disappears on the enqueue that writes the sync row; the
+  resolved record is kept.
+* **One row per posting.** A sweep that refuses the same work every few minutes updates the row and counts
+  the attempts rather than filling the page.
+
+This is what makes the WooCommerce **held invoice release** safe to leave to the sweep: it can refuse for
+days with nobody watching, and the debt is on the exceptions page the whole time.
+
 ### Postings that were not queued are now reported where they happen
 
 Every place in IMS that queues an accounting posting now reads the answer. When a posting is refused or
 cannot be queued, the IMS action still completes where that is the right thing to do (a stock receipt is
-still received, a bill is still recorded), but an **ERROR** is written to the activity log naming what
+still received, a bill is still recorded), but the posting is listed as outstanding on **Sync →
+Exceptions** (above) and an **ERROR** is written to the activity log naming what
 stands in IMS, what the ledger is missing, and what to do — for example `stock_receipt_journal_not_queued`,
 `purchase_invoice_not_queued`, `supplier_return_journal_not_queued`, `purchase_order_cancel_journal_not_queued`,
 `landed_cost_reclass_not_queued`, `landed_cost_cogs_journal_not_queued`, `manufacturing_journal_not_queued`,
@@ -2257,6 +2292,9 @@ Two consequences worth knowing:
   queued, IMS no longer records it in the COGS subledger and no longer removes that amount from the
   retrospective landed-cost COGS journal — so the adjustment still reaches the ledger through that
   journal instead of disappearing from both.
+* **The landed-cost journal backstop.** When a landed-cost recalculation's journals cannot be queued, its
+  background retry job is kept retrying (and fails visibly once its attempts are spent) instead of being
+  marked done.
 * **Unrealised FX revaluation.** The run's result now includes `refused` — journals it owed and could not
   queue — and those are no longer counted in `reversed` or `revalued`. A run with refusals is never
   reported as "already queued for this date". The "already revalued today" check is also per connector: a

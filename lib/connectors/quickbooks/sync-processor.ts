@@ -18,7 +18,7 @@ import { pushPurchaseBill } from './bills'
 import { pushCreditMemo } from './credit-notes'
 import { pushJournalEntry } from './journals'
 import { qboPost, qboUploadAttachment, resolveAccountRef, qboPostIdempotent} from './api'
-import { lookupPaymentAccount, getPaymentAccountMap } from '@/lib/accounting'
+import { accountingBankAccountBelongsTo, lookupPaymentAccount, getPaymentAccountMap } from '@/lib/accounting'
 import { updateMirroredAccountingEventStatus } from '@/lib/domain/accounting/accounting-event-mirror'
 import {
   liveRowOccupiesFollowUpSlot,
@@ -2173,6 +2173,9 @@ async function decideInvoicePaymentFollowUp(
     { method, currency }: { method: string; currency: string },
     missing: string,
     configure: string,
+    // o3d-j625 r4: what the activity record can add about WHICH mapping failed, without a new reason
+    // code — the remedy is still a setting, which is what `payment_account_unmapped` means.
+    detail?: Record<string, unknown>,
   ): Promise<RefusedFollowUpEnqueue> => {
     const message = paymentAccountRefusalMessage({
       connector: 'QuickBooks',
@@ -2217,6 +2220,7 @@ async function decideInvoicePaymentFollowUp(
         reason: 'payment_account_unmapped',
         method,
         currency,
+        ...detail,
       },
     })
     return refusedFollowUpEnqueue({
@@ -2310,6 +2314,33 @@ async function decideInvoicePaymentFollowUp(
         // Provenance-guarded (o3d-6nd): only enqueue an id that belongs to the active company, so a
         // follow-up queued now cannot carry a former realm's id.
         customerRef = (await customerContactIdIfCurrent(order?.customer)) ?? undefined
+      }
+
+      // o3d-j625 r4 (Codex HIGH 1, was o3d-l9ok) — THE MAPPED ACCOUNT IS CONFIRMED AS QUICKBOOKS'S BEFORE
+      // IT IS CARRIED.
+      //
+      // `accounting_payment_account_map` is ONE settings row shared by every accounting connector, and
+      // its values are one connector's own account ids. This is the point where an imported order's
+      // payment first acquires a bank account — the WooCommerce import carries only method, currency and
+      // amount — so it is the only place the id can be validated, and it is validated HERE against this
+      // connector's own synced chart (`AccountingAccount(connector, externalAccountId)`, a local read).
+      // The id that passes is the one carried in the INVOICE_PAYMENT payload below, and the INVOICE_PAYMENT
+      // poster sends `payload.bankAccountId` verbatim — it never re-reads the map — so a later map edit
+      // cannot redirect a payment already queued, and a map value belonging to the other connector is
+      // refused rather than sent.
+      //
+      // Refused as `payment_account_unmapped`, because the remedy is the same kind of thing that reason
+      // already names: a SETTING, safe to repeat, which the retry picks up.
+      if (!await accountingBankAccountBelongsTo(QBO_CONNECTOR, stored)) {
+        return await refuse(
+          { method, currency },
+          `the bank account mapped for method "${method}" / currency "${currency}" (${stored}) is not an active `
+            + 'bank account in QuickBooks\'s synced chart of accounts — the payment-account mapping is shared by every '
+            + 'accounting connector, so it can hold another connector\'s account id',
+          'Sync the chart of accounts, then re-map that payment method against QuickBooks under Settings → Accounting → '
+            + 'Payment Account Mapping.',
+          { mappedBankAccountId: stored, paymentAccountRefusal: 'not_in_connector_chart' },
+        )
       }
 
       return await enqueueFollowUpSyncLog('INVOICE_PAYMENT', referenceType, referenceId, {

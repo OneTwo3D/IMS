@@ -897,6 +897,50 @@ export function ExceptionsClient({ data }: Props) {
         </Card>
       ) : null}
 
+      {data.accountingPostingRefusals.length > 0 ? (
+        <Card className="p-4 space-y-3">
+          <SectionHeading
+            title={`Accounting postings IMS refused to queue (${data.summary.accountingPostingRefusals})`}
+            /*
+             * o3d-j625 r4. Every sentence a refusal shows below is the REFUSING SITE's own — the reason,
+             * what stands in IMS, and the remedy are columns on the row, so this page cannot drift into a
+             * second account of the same event. What is written here is only what is true of every row in
+             * the section: nothing re-drives these, and they clear when the posting is made.
+             */
+            detail="IMS would have written these postings into books whose chart of accounts does not describe them — the accounting connector changed while the document was being built, or the document id it names cannot be shown to belong to the connector it would post to. Nothing was sent and nothing retries on its own. Each row says what still stands in IMS and what to do; a row disappears from this list when the posting is actually queued, not when it is acknowledged."
+            shown={data.accountingPostingRefusals.length}
+            total={data.summary.accountingPostingRefusals}
+          />
+          <Table containerClassName="rounded-lg border" className="min-w-[860px]">
+            <TableHeader className="bg-muted/40">
+              <TableRow>
+                <TableHead>Document</TableHead>
+                <TableHead>Reference</TableHead>
+                <TableHead>Built for / active now</TableHead>
+                <TableHead>Owed since</TableHead>
+                <TableHead>What stands in IMS</TableHead>
+                <TableHead>What to do</TableHead>
+              </TableRow>
+            </TableHeader>
+            <TableBody>
+              {data.accountingPostingRefusals.map((row) => (
+                <TableRow key={row.id}>
+                  <TableCell className="text-xs">{row.type} <span className="text-muted-foreground">({row.reason})</span></TableCell>
+                  <TableCell className="text-xs font-mono">{row.referenceType}/{row.referenceId}</TableCell>
+                  <TableCell className="text-xs">{row.chartConnector ?? 'none'} → {row.activeConnector ?? 'none'}</TableCell>
+                  <TableCell className="text-xs">
+                    {new Date(row.firstRefusedAt).toLocaleString()}
+                    {row.refusedCount > 1 ? <span className="text-muted-foreground"> ({row.refusedCount} attempts)</span> : null}
+                  </TableCell>
+                  <TableCell className="text-xs text-muted-foreground">{row.committed}</TableCell>
+                  <TableCell className="text-xs text-muted-foreground">{row.remedy}</TableCell>
+                </TableRow>
+              ))}
+            </TableBody>
+          </Table>
+        </Card>
+      ) : null}
+
       {data.productStructureConflicts.length > 0 ? (
         <Card className="p-4 space-y-3">
           <SectionHeading
