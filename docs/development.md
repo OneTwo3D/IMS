@@ -71,31 +71,41 @@ DDL — currently `pending-asn-disposal-race` and `pending-asn-retirement-commit
 before any connection writes, unless `tests/concurrency/scratch-database-guard.ts` gets PROOF FROM THE
 SERVER that the database was created to be destroyed. All of these must hold:
 
-* the database is STAMPED disposable — a database comment applied by `npm run db:stamp-scratch`
-  (`COMMENT ON DATABASE … IS '<marker>'`, which lives outside every schema, so it does not show up as
-  schema drift and survives `prisma migrate deploy`); AND
+* the database is STAMPED FOR ITS OWN NAME — a database comment applied by `npm run db:stamp-scratch`
+  that contains the database's name, so a rename or a `pg_dump -C` restore under another name
+  invalidates it. The comment lives outside every schema, so it is not schema drift, and it survives
+  `prisma migrate deploy`; AND
 * the run DECLARES it — `IMS_CONCURRENCY_SCRATCH_DB` names the connected database exactly; AND
 * the server says it is not a replica (`pg_is_in_recovery()`), not a template, and not the target of a
   logical-replication subscription; AND
 * the name is not obviously real — `onetwoinventory`, `onetwo3d…`, `postgres…`/`template…`/`pg_…`, or
   anything containing `prod`/`live`, are refused however they are stamped and declared.
 
-**A NAME IS NOT EVIDENCE, which is why the stamp exists.** This product's tenant databases are
-`ims_<slug>` (`scripts/provision-ims-tenant.sh`) and its canonical database is `onetwoinventory`
-(`.env.example`), so no naming convention can separate a live database from a scratch one — earlier
-versions of this guard tried twice and admitted both. Stamping is a deliberate act on one database,
-and `npm run db:stamp-scratch` itself refuses to stamp a real-looking name, a replica, a template or a
-subscriber.
+**A NAME IS NOT EVIDENCE, and neither is ownership.** This product's tenant databases are `ims_<slug>`
+(`scripts/provision-ims-tenant.sh`) and its canonical database is `onetwoinventory` (`.env.example`),
+so no naming convention separates a live database from a scratch one — and `provision-ims-tenant.sh`
+hands each tenant database to the role in its own `DATABASE_URL`, so "only the owner can stamp it"
+excludes nobody who can read a `.env`. What the stamp costs instead is that `npm run db:stamp-scratch`
+**must be given the database name as an argument**, which must equal `current_database()`, and it
+**refuses a database that holds application data** — rows in any table other than the three a fresh
+`prisma migrate deploy` seeds (`_prisma_migrations`, `settings`, `shopping_status_mappings`, measured
+2026-09-17). A wrong `DATABASE_URL` supplies none of that.
 
 ```bash
 createdb -O "$PGUSER" ims_scratch_$(date +%s)          # any name that is not refused above
 export DATABASE_URL=postgresql://…@localhost:5432/ims_scratch_<suffix>
 npx prisma migrate deploy
-npm run db:stamp-scratch                                # stamps $DATABASE_URL's database
+npm run db:stamp-scratch -- ims_scratch_<suffix>        # names the database; refuses one holding data
 export IMS_CONCURRENCY_SCRATCH_DB=ims_scratch_<suffix>  # declare it, by exact name
 npm run test:concurrency
+npm run db:unstamp-scratch -- ims_scratch_<suffix>      # if you keep the database around
 dropdb ims_scratch_<suffix>
 ```
+
+RESIDUAL, so nobody has to discover it: a database that holds no rows outside those three seeded
+tables is not distinguished from a fresh one by the data check. Stamping such a database still takes a
+deliberate command naming it, and the belt and the declaration still apply — but the check is evidence
+of use, not proof of absence.
 
 `npm run validate:db` runs this tier only when `IMS_CONCURRENCY_SCRATCH_DB` is set, and prints a
 SKIPPED notice otherwise; CI (`fresh-db-drift` in `.github/workflows/schema-guardrails.yml`) stamps and

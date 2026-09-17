@@ -931,8 +931,19 @@ const RUNS_RUNTIME_ASSEMBLED_SQL = /\$(?:execute|query)RawUnsafe/
  * anything to be a writer.
  */
 const CONSTRUCTS_A_DATABASE_CLIENT = /new\s+PrismaClient\s*\(|new\s+(?:pg\.)?(?:Client|Pool)\s*\(/
-/** Roots where constructing a client is itself notable — the shipped app, plus the seed. */
-const CLIENT_CONSTRUCTION_ROOTS = ['app', 'lib', 'prisma']
+/**
+ * Roots where constructing a client is itself notable — the shipped app, the seed, and `scripts`.
+ *
+ * `scripts` WAS MISSING (o3d-zzgp r7, independent review MEDIUM-4). Until then every `scripts/`
+ * path in this inventory reached a database by shelling `psql`/`pg_dump`/`prisma migrate`, so the
+ * other detectors found them all and the omission cost nothing. scripts/stamp-scratch-database.ts
+ * is the first whose ONLY database reach is a self-built `new pg.Client` — and the thing that
+ * actually discovered it was the phrase "prisma migrate deploy" in its own docblock, which is to
+ * say: prose. A functionally identical script whose comments happened to name nothing would have
+ * been invisible to a test titled "every path that can reach this database outside the app's
+ * transactions is classified".
+ */
+const CLIENT_CONSTRUCTION_ROOTS = ['app', 'lib', 'prisma', 'scripts']
 
 const EXECUTION_ROOTS = ['app', 'lib', 'scripts', 'e2e', 'prisma']
 const EXECUTABLE_FILE = /\.(?:ts|tsx|mjs|cjs|js|sh)$/
@@ -1006,15 +1017,39 @@ function executableFiles(dir: string, found: string[] = []): string[] {
  *                             cannot read a row, let alone write one. It is discovered here because
  *                             its prose names `psql` while explaining which connection it has to
  *                             match. o3d-2sm1.5 r41.
+ *   'operator-run-write'    — a script a HUMAN runs: an e2e/repro fixture, a one-off repair, an
+ *                             instance provisioning step. It writes application rows through its own
+ *                             client and takes no selection lock; it cannot be made to, and nothing
+ *                             it does is concurrent with the app in the cases it exists for. What
+ *                             keeps it safe for THIS test's property is the lexical plugin-key
+ *                             inventory above, whose SCANNED_ROOTS already include `scripts`: a
+ *                             plugin-key write in any of these NAMES the key and is caught there.
+ *                             All of these arrived in the inventory at o3d-zzgp r7, when `scripts`
+ *                             was added to CLIENT_CONSTRUCTION_ROOTS — they were invisible before
+ *                             only because their prose happens not to name psql/pg_dump/prisma.
+ *   'operator-run-read'     — the same kind of script, but it only SELECTs: it builds a client to
+ *                             ask this database a question and writes nothing anywhere in it. (Two
+ *                             of them write to XERO, over HTTP; none writes a row here.)
+ *   'rolled-back-constraint-probe'
+ *                           — scripts/check-stock-quantity-constraints.mjs, run by
+ *                             `npm run validate:db`. It INSERTs deliberately invalid rows to prove
+ *                             the database's own CHECK constraints reject them, inside
+ *                             BEGIN/SAVEPOINT with ROLLBACK, so nothing it writes survives the
+ *                             statement that wrote it.
  *   'scratch-database-stamp'— connects to a database that is NOT this application's and writes ONE
  *                             DATABASE-LEVEL comment (`COMMENT ON DATABASE … IS '<marker>'`), which
  *                             is how the DB-backed concurrency tier is told a database was created
  *                             to be destroyed. It touches no schema, table or row anywhere, so it
- *                             cannot move a plugin key, and it refuses to run at all against a real
- *                             or server-owned name, a replica, a template, a subscription target, or
- *                             a database that already carries a different comment. Never runs in
- *                             production: CI's fresh-db-drift job and a developer setting up a
- *                             scratch database are its only callers. o3d-zzgp r6.
+ *                             cannot move a plugin key. It must be GIVEN the database name as an
+ *                             argument, which must equal `current_database()`, and it refuses a
+ *                             database that HOLDS APPLICATION DATA, is a replica, a template, a
+ *                             subscription target, already carries another comment, or is named in
+ *                             the belt. It does NOT refuse every "real-looking name" — a tenant
+ *                             database is `ims_<slug>`, which no name rule separates from CI's
+ *                             `ims_ci`; the data check and the argument are what cover that (o3d-zzgp
+ *                             r7, review HIGH-1/LOW-2). Never runs in production: CI's
+ *                             fresh-db-drift job and a developer setting up a scratch database are
+ *                             its only callers.
  *   'seed'                  — a standalone client that WRITES this database, run from install.sh.
  *                             It takes no lock and cannot practically be made to (it runs before the
  *                             app is up); what keeps it safe is that it must not write a plugin key,
@@ -1037,6 +1072,9 @@ const DATABASE_EXECUTION_PATHS: Record<string,
   | 'deploy-connection-fence'
   | 'protocol-handshake-only'
   | 'compatibility-probe'
+  | 'operator-run-write'
+  | 'operator-run-read'
+  | 'rolled-back-constraint-probe'
   | 'scratch-database-stamp'
   | 'seed'
 > = {
@@ -1154,6 +1192,23 @@ const DATABASE_EXECUTION_PATHS: Record<string,
   'lib/connectors/xero/payment-write-lock.ts': 'pinned-lock-session',
   'lib/domain/wms/dispatch-sweep-lock.ts': 'pinned-lock-session',
   'lib/ops/production-preflight.ts': 'pinned-lock-session',
+  // Discovered when `scripts` joined CLIENT_CONSTRUCTION_ROOTS (o3d-zzgp r7, review MEDIUM-4).
+  // Each was read to decide which of the three it is, not guessed from its name.
+  'scripts/audit-xero-live-contamination.ts': 'operator-run-read',
+  'scripts/check-stock-quantity-constraints.mjs': 'rolled-back-constraint-probe',
+  'scripts/cogs-e2e-fixture.ts': 'operator-run-write',
+  'scripts/copy-tax-rates.ts': 'operator-run-write',
+  'scripts/csv-import-e2e-fixture.ts': 'operator-run-write',
+  'scripts/find-aliased-purchase-bills.ts': 'operator-run-read',
+  'scripts/generate-xero-demo-template.ts': 'operator-run-read',
+  'scripts/invariant-check-preflight-fixture.ts': 'operator-run-write',
+  'scripts/provision-instance.mjs': 'operator-run-write',
+  'scripts/provision-xero-demo.ts': 'operator-run-write',
+  'scripts/remove-xero-live-e2e-footprint.ts': 'operator-run-read',
+  'scripts/repro-scjz68.ts': 'operator-run-write',
+  'scripts/restore-stage-connectors.ts': 'operator-run-write',
+  'scripts/retire-live-tenant-external-ids.ts': 'operator-run-write',
+  'scripts/xero-daily-batch-refund-fixture.ts': 'operator-run-write',
   'scripts/stamp-scratch-database.ts': 'scratch-database-stamp',
   'prisma/seed.ts': 'seed',
 }

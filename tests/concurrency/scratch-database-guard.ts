@@ -29,10 +29,20 @@
  *      (Round 5 let a scratch-shaped NAME satisfy this on its own; that is restored to a
  *      conjunction — see the review's MEDIUM-3. A declaration that names a different
  *      database is not a declaration about this one.)
- *   2. MARKED — the database carries `SCRATCH_DATABASE_MARKER` as its own comment
- *      (`COMMENT ON DATABASE … IS '…'`, read back with `shobj_description`). Whoever
- *      created the database stamped it; a database that was created to hold real data
- *      has no such stamp and cannot acquire one by accident.
+ *   2. MARKED FOR THIS DATABASE BY NAME — the database's own comment is exactly
+ *      `expectedScratchDatabaseMarker(current_database())`, read back with
+ *      `pg_catalog.shobj_description`. The name is INSIDE the marker, so a rename or a
+ *      restore under another name invalidates it (review MEDIUM-3: a comment is keyed to
+ *      the OID, which a rename preserves, and `pg_dump -C` carries it).
+ *
+ *      WHAT ISSUING THE STAMP COSTS, stated accurately after round 6 claimed otherwise:
+ *      NOT "ownership, which excludes the wrong people". provision-ims-tenant.sh ends with
+ *      `ALTER DATABASE … OWNER TO "$DB_USER"`, so a tenant's LIVE database is owned by the
+ *      very role in its own DATABASE_URL — and on the development server `imsdev` owns
+ *      every `ims_*`. Ownership excludes nobody who can read a `.env` (review MEDIUM-2).
+ *      What the stamp costs is that `scripts/stamp-scratch-database.ts` must be run
+ *      DELIBERATELY, NAMING the database as an argument, against a database that holds no
+ *      application data — none of which a wrong `DATABASE_URL` supplies on its own.
  *   3. NOT A REPLICA, NOT A TEMPLATE — `pg_is_in_recovery()` is false, `datistemplate` is
  *      false, and no logical-replication subscription targets it. A replica of production
  *      is invisible to every name rule, and a logical one is writable.
@@ -44,15 +54,20 @@
  * WHY A DATABASE COMMENT AND NOT A MARKER TABLE. The comment lives in `pg_shdescription`,
  * outside every schema, so it is invisible to `prisma migrate diff` and to the schema-drift
  * gate that runs beside these tests — a marker TABLE would show up as drift and could fail
- * the very CI job this guard runs in. It survives `prisma migrate deploy`, it needs
- * ownership of the database to set, and `scripts/stamp-scratch-database.ts` is the one
- * thing that sets it (and refuses to stamp anything rule 3 or 4 rejects).
+ * the very CI job this guard runs in. It survives `prisma migrate deploy` (measured across
+ * all 262 migrations) and it does not propagate through `CREATE DATABASE … TEMPLATE`
+ * (measured: the copy's comment is NULL). `scripts/stamp-scratch-database.ts` is the one
+ * thing that sets it.
  *
- * WHAT THIS STILL DOES NOT STOP, said plainly: someone who deliberately stamps a live
- * database AND declares it by name has performed two deliberate acts naming that database,
- * and the guard will accept it. That is what turning a convention into a capability means.
- * What it removes is the accident — a stale `DATABASE_URL`, an inherited `.env.local`, a
- * tenant host, a mistyped name — which is every way this has actually gone wrong.
+ * WHAT THIS STILL DOES NOT STOP, and round 6's version of this paragraph was WRONG about it.
+ * It claimed the stamp plus the declaration were "two deliberate acts naming that database".
+ * They were not: round 6's stamper took no argument, asked nothing, and printed the exact
+ * line to export, so both acts followed from ONE wrong `DATABASE_URL` — and the review
+ * reproduced it end to end on a tenant-shaped database holding rows. Now the stamper must be
+ * given the database NAME as an argument and refuses a database holding application data, so
+ * the remaining path is: create/keep a live database with no application rows in it, run the
+ * stamper naming it, and export the declaration. That is three deliberate acts, one of which
+ * is a lie about the database. A `DATABASE_URL` alone still buys nothing.
  *
  * The check runs on its own connection with `default_transaction_read_only=on`, so the
  * guard itself cannot write even if it is wrong, and it asks the SERVER for every fact
@@ -66,8 +81,21 @@ export const SCRATCH_DATABASE_OPT_IN_ENV = 'IMS_CONCURRENCY_SCRATCH_DB'
  * The stamp. Exact-match, and deliberately a sentence no one writes by accident.
  * `scripts/stamp-scratch-database.ts` applies it; docs/development.md tells operators to.
  */
-export const SCRATCH_DATABASE_MARKER =
-  'ims-scratch-database: created for a test run and safe to destroy (o3d-zzgp)'
+export const SCRATCH_DATABASE_MARKER_PREFIX = 'ims-scratch-database'
+
+/**
+ * THE STAMP, BOUND TO THE DATABASE IT WAS ISSUED FOR (o3d-zzgp r7, review MEDIUM-3).
+ *
+ * A bare sentinel is keyed to the database's OID, which a RENAME preserves — measured: a stamped
+ * database renamed to `ims_customer_rev6` kept its marker, and the belt does not catch that name, so
+ * a scratch database repurposed as a real one would have kept the capability for ever. `pg_dump -C`
+ * and `pg_dumpall` also carry a database comment, so a restore under another name would have carried
+ * it too. Naming the database INSIDE the marker makes both invalid by construction: the guard
+ * recomputes the expected text from `current_database()` and compares exactly.
+ */
+export function expectedScratchDatabaseMarker(databaseName: string): string {
+  return `${SCRATCH_DATABASE_MARKER_PREFIX}(${databaseName}): created for a test run and safe to destroy (o3d-zzgp)`
+}
 
 /**
  * THE BELT, not the fix. Names that can never be a scratch database however they are
@@ -140,19 +168,31 @@ export function scratchDatabaseVerdict(facts: ScratchDatabaseFacts): { ok: true 
     }
   }
   if (facts.optIn !== db) {
+    // DELIBERATELY DOES NOT PRINT THE VALUE TO SET (o3d-zzgp r7, review LOW-3). Round 6's message
+    // named the exact string to export, which — beside the stamper's own paste-ready line — composed
+    // into a two-step walkthrough for pointing this suite at whatever database the URL happened to
+    // reach. The name of the variable and the location of the instructions are enough for an
+    // operator who has a scratch database; they are not a recipe for one who does not.
     return {
       ok: false,
-      reason: `${SCRATCH_DATABASE_OPT_IN_ENV} must name the connected database exactly ("${db}"); it is `
-        + `${facts.optIn === undefined ? 'unset' : `"${facts.optIn}"`}`,
+      reason: `${SCRATCH_DATABASE_OPT_IN_ENV} does not name the connected database; it is `
+        + `${facts.optIn === undefined ? 'unset' : 'set to another name'}. See docs/development.md, `
+        + '"Database-backed tiers"',
     }
   }
-  if (facts.databaseComment !== SCRATCH_DATABASE_MARKER) {
+  if (facts.databaseComment !== expectedScratchDatabaseMarker(db)) {
+    const carriesAnotherDatabasesMarker = facts.databaseComment !== null
+      && facts.databaseComment.startsWith(`${SCRATCH_DATABASE_MARKER_PREFIX}(`)
     return {
       ok: false,
-      reason: `connected database "${db}" is not marked disposable: its database comment is `
-        + `${facts.databaseComment === null ? 'unset' : `"${facts.databaseComment}"`}, not the scratch marker. `
-        + 'A database created for a test run is stamped by scripts/stamp-scratch-database.ts; if this is a real '
-        + 'database, it is not one these tests may seed',
+      reason: `connected database "${db}" is not marked disposable for THIS database: its database comment is `
+        + `${facts.databaseComment === null ? 'unset' : `"${facts.databaseComment}"`}`
+        + (carriesAnotherDatabasesMarker
+          ? ' — a scratch marker issued for a DIFFERENT database name, so this database was renamed or restored '
+            + 'under another name and the marker no longer applies'
+          : '')
+        + '. See docs/development.md, "Database-backed tiers", for how a database created for a test run is '
+        + 'marked; if this is a real database, it is not one these tests may seed',
     }
   }
   return { ok: true }
@@ -170,9 +210,24 @@ export function assertScratchDatabaseBeforeAnyWrite(): Promise<string> {
     const databaseUrl = process.env.DATABASE_URL
     if (!databaseUrl) throw new NotAScratchDatabaseError('DATABASE_URL is not set')
 
+    // THE READ-ONLY CONNECTION HAS TO BE READ-ONLY (o3d-zzgp r7, review MEDIUM-1). node-pg
+    // resolves the connection string AFTER the config, so a URL carrying its own `options=`
+    // REPLACED this client's `-c default_transaction_read_only=on` — demonstrated by the
+    // reviewer: with `?options=…` the session came back `off` and a CREATE TABLE succeeded.
+    // lib/db/database-url-schema.mjs documents the identical bug for the search-path pin, and
+    // its `sanitisedProbeConnectionString()` is the fix it already ships: the same URL with
+    // `options` and `schema` removed. Reused rather than re-implemented.
+    const { sanitisedProbeConnectionString } = await import('@/lib/db/database-url-schema.mjs')
+    const connectionString = sanitisedProbeConnectionString(databaseUrl)
+    if (connectionString === null) {
+      throw new NotAScratchDatabaseError(
+        'REFUSING before any write: DATABASE_URL is not a URL, so the parameters that decide whether this '
+        + 'connection is read-only cannot be stripped from it',
+      )
+    }
     const { default: pg } = await import('pg')
     const client = new pg.Client({
-      connectionString: databaseUrl,
+      connectionString,
       options: '-c default_transaction_read_only=on',
       application_name: 'o3d-scratch-database-guard',
     })
@@ -184,16 +239,23 @@ export function assertScratchDatabaseBeforeAnyWrite(): Promise<string> {
         comment: string | null
         in_recovery: boolean
         is_template: boolean
-      }>(`SELECT current_database() AS name,
-                 shobj_description((SELECT oid FROM pg_database WHERE datname = current_database()), 'pg_database') AS comment,
-                 pg_is_in_recovery() AS in_recovery,
-                 (SELECT datistemplate FROM pg_database WHERE datname = current_database()) AS is_template`)
+        // EVERY catalogue reference is schema-qualified (review LOW-6): with a URL-supplied
+        // `search_path` — which MEDIUM-1 above shows could reach this connection — an
+        // unqualified `shobj_description` could be answered by a planted function.
+      }>(`SELECT pg_catalog.current_database() AS name,
+                 pg_catalog.shobj_description(
+                   (SELECT oid FROM pg_catalog.pg_database WHERE datname = pg_catalog.current_database()),
+                   'pg_database') AS comment,
+                 pg_catalog.pg_is_in_recovery() AS in_recovery,
+                 (SELECT datistemplate FROM pg_catalog.pg_database
+                   WHERE datname = pg_catalog.current_database()) AS is_template`)
       // Separate, and allowed to fail: pg_subscription is not readable to every role.
       let subscriptionCount: number | null = null
       try {
         const subscriptions = await client.query<{ count: string }>(
-          `SELECT count(*)::text AS count FROM pg_subscription
-            WHERE subdbid = (SELECT oid FROM pg_database WHERE datname = current_database())`,
+          `SELECT pg_catalog.count(*)::text AS count FROM pg_catalog.pg_subscription
+            WHERE subdbid = (SELECT oid FROM pg_catalog.pg_database
+                              WHERE datname = pg_catalog.current_database())`,
         )
         subscriptionCount = Number(subscriptions.rows[0]!.count)
       } catch {

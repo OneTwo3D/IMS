@@ -3,8 +3,8 @@ import { test } from 'node:test'
 
 import {
   ALWAYS_REFUSED_DATABASE,
-  SCRATCH_DATABASE_MARKER,
   SCRATCH_DATABASE_OPT_IN_ENV,
+  expectedScratchDatabaseMarker,
   scratchDatabaseVerdict,
   type ScratchDatabaseFacts,
 } from './concurrency/scratch-database-guard'
@@ -47,9 +47,9 @@ function facts(overrides: Partial<ScratchDatabaseFacts> & { connectedDatabase: s
   }
 }
 
-/** A database created for this run: declared by name and stamped disposable. */
+/** A database created for this run: declared by name and stamped disposable FOR THAT NAME. */
 function stamped(connectedDatabase: string): ScratchDatabaseFacts {
-  return facts({ connectedDatabase, databaseComment: SCRATCH_DATABASE_MARKER })
+  return facts({ connectedDatabase, databaseComment: expectedScratchDatabaseMarker(connectedDatabase) })
 }
 
 test('accepts a database that is declared by name AND stamped disposable', () => {
@@ -91,7 +91,7 @@ test('refuses the tenant and shared databases a name rule cannot see — they ca
 test('refuses a stamped database the run did not declare, or declared as another database', () => {
   // MEDIUM-3: round 5 let a scratch-shaped NAME satisfy this on its own, so a mistyped URL
   // between two scratch databases sailed through. The conjunction is restored.
-  const marker = { databaseComment: SCRATCH_DATABASE_MARKER }
+  const marker = { databaseComment: expectedScratchDatabaseMarker('ims_scratch_a') }
   assert.equal(scratchDatabaseVerdict(facts({ connectedDatabase: 'ims_scratch_a', optIn: undefined, ...marker })).ok, false)
   assert.equal(scratchDatabaseVerdict(facts({ connectedDatabase: 'ims_scratch_a', optIn: 'ims_scratch_b', ...marker })).ok, false)
   assert.equal(scratchDatabaseVerdict(facts({ connectedDatabase: 'ims_scratch_a', optIn: '1', ...marker })).ok, false)
@@ -101,17 +101,32 @@ test('refuses a stamped database the run did not declare, or declared as another
 test('refuses a declared database whose stamp is missing or is some other comment', () => {
   assert.match(
     (scratchDatabaseVerdict(facts({ connectedDatabase: 'ims_ci' })) as { reason: string }).reason,
-    /is not marked disposable: its database comment is unset/,
+    /is not marked disposable for THIS database: its database comment is unset/,
   )
   assert.match(
     (scratchDatabaseVerdict(facts({ connectedDatabase: 'ims_ci', databaseComment: 'tenant: acme' })) as { reason: string }).reason,
-    /not the scratch marker/,
+    /its database comment is "tenant: acme"/,
   )
   assert.equal(
-    scratchDatabaseVerdict(facts({ connectedDatabase: 'ims_ci', databaseComment: `${SCRATCH_DATABASE_MARKER} ` })).ok,
+    scratchDatabaseVerdict(facts({ connectedDatabase: 'ims_ci', databaseComment: `${expectedScratchDatabaseMarker('ims_ci')} ` })).ok,
     false,
     'the marker is matched exactly, not by prefix',
   )
+})
+
+test('refuses a database carrying a marker issued for ANOTHER name — a rename or a restore', () => {
+  // Review MEDIUM-3, measured: a database comment is keyed to the OID, so `ALTER DATABASE …
+  // RENAME` keeps it, and `pg_dump -C` carries it into a restore under another name. Binding the
+  // name into the marker makes both invalid without needing anyone to remember to unstamp.
+  const renamed = facts({
+    connectedDatabase: 'ims_customer_rev7',
+    databaseComment: expectedScratchDatabaseMarker('ims_scratch_rev7_src'),
+  })
+  const verdict = scratchDatabaseVerdict(renamed)
+  assert.equal(verdict.ok, false)
+  assert.match(verdict.ok === false ? verdict.reason : '', /issued for a DIFFERENT database name/)
+  // And the positive control: the same database stamped for its own name is accepted.
+  assert.deepEqual(scratchDatabaseVerdict(stamped('ims_customer_rev7')), { ok: true })
 })
 
 test('refuses on server state a name cannot show: replica, template, subscription target', () => {
@@ -134,18 +149,38 @@ test('refuses on server state a name cannot show: replica, template, subscriptio
 
 test('refuses when the server reports no name at all', () => {
   // LOW-6: the empty string used to satisfy an exact-match comparison against itself.
-  assert.equal(scratchDatabaseVerdict(facts({ connectedDatabase: '', optIn: '', databaseComment: SCRATCH_DATABASE_MARKER })).ok, false)
+  assert.equal(scratchDatabaseVerdict(facts({ connectedDatabase: '', optIn: '', databaseComment: expectedScratchDatabaseMarker('') })).ok, false)
 })
 
-test('the stamper refuses exactly what a stamp must never be applied to', () => {
-  // The stamp is the capability, so the thing that hands it out has the same belt.
+test('the stamper refuses every database a stamp must never be applied to — including one holding data', () => {
+  // Review LOW-1: round 6's version was titled "exactly what a stamp must never be applied to"
+  // while asserting nothing about the open question — a database holding rows. It does now, and
+  // that case is the review's own HIGH-1 reproduction.
+  const ok = { database: 'ims_ci', requestedName: 'ims_ci', inRecovery: false, isTemplate: false, subscriptionCount: 0, populatedTables: [] }
+  assert.equal(refuseToStamp(ok), null, 'the positive control: an empty database, named, stamps')
+
   for (const name of REAL_OR_SERVER_OWNED) {
-    assert.notEqual(refuseToStamp({ database: name, inRecovery: false, isTemplate: false, subscriptionCount: 0 }), null, name)
+    assert.notEqual(refuseToStamp({ ...ok, database: name, requestedName: name }), null, name)
   }
-  assert.equal(refuseToStamp({ database: 'ims_ci', inRecovery: false, isTemplate: false, subscriptionCount: 0 }), null)
-  assert.notEqual(refuseToStamp({ database: 'ims_ci', inRecovery: true, isTemplate: false, subscriptionCount: 0 }), null)
-  assert.notEqual(refuseToStamp({ database: 'ims_ci', inRecovery: false, isTemplate: true, subscriptionCount: 0 }), null)
-  assert.notEqual(refuseToStamp({ database: 'ims_ci', inRecovery: false, isTemplate: false, subscriptionCount: 2 }), null)
-  assert.notEqual(refuseToStamp({ database: '', inRecovery: false, isTemplate: false, subscriptionCount: 0 }), null)
+  // HIGH-1: a live tenant database holding application data, named correctly, is refused.
+  const withData = refuseToStamp({
+    ...ok,
+    database: 'ims_acme',
+    requestedName: 'ims_acme',
+    populatedTables: ['public.products', 'public.users', 'public.warehouses'],
+  })
+  assert.notEqual(withData, null)
+  assert.match(String(withData), /holds application data — rows in public\.products/)
+
+  // The name must be GIVEN, and must be the database this URL reaches.
+  assert.match(String(refuseToStamp({ ...ok, requestedName: undefined })), /no database name was given/)
+  assert.match(String(refuseToStamp({ ...ok, requestedName: 'ims_other' })), /is not the database this DATABASE_URL reaches/)
+
+  // Server state, with the subscription catalogue failing CLOSED here (review LOW-4).
+  assert.notEqual(refuseToStamp({ ...ok, inRecovery: true }), null)
+  assert.notEqual(refuseToStamp({ ...ok, isTemplate: true }), null)
+  assert.notEqual(refuseToStamp({ ...ok, subscriptionCount: 2 }), null)
+  assert.match(String(refuseToStamp({ ...ok, subscriptionCount: null })), /could not be read/)
+  assert.notEqual(refuseToStamp({ ...ok, database: '', requestedName: '' }), null)
   assert.equal(SCRATCH_DATABASE_OPT_IN_ENV, 'IMS_CONCURRENCY_SCRATCH_DB')
 })
