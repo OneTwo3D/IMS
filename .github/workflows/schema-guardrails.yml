@@ -29,6 +29,15 @@ on:
       # them a change to the predicate could not reach the only job that runs that evidence.
       - "lib/connectors/shopping-webhook-retention.ts"
       - "lib/connectors/shopping-webhook-inbox.ts"
+      # The three modules tests/db/reconciliation-void-mirror-contradictions.test.ts holds to
+      # account: the SQL that asks the database for the contradictions, and the two builders whose
+      # TypeScript mirror-key derivation that SQL is asserted to reproduce branch for branch. Without
+      # them a change to either side of that equality could not reach the only job that runs it.
+      - "lib/domain/accounting/reconciliation.ts"
+      - "lib/domain/accounting/accounting-event-builder.ts"
+      - "lib/domain/accounting/accounting-event-mirror.ts"
+      # The list the contradiction join itself filters on (`type = ANY(...)`, reconciliation.ts:1692).
+      - "lib/domain/accounting/mirrored-sync-types.ts"
   push:
     branches:
       - main
@@ -59,6 +68,15 @@ on:
       # them a change to the predicate could not reach the only job that runs that evidence.
       - "lib/connectors/shopping-webhook-retention.ts"
       - "lib/connectors/shopping-webhook-inbox.ts"
+      # The three modules tests/db/reconciliation-void-mirror-contradictions.test.ts holds to
+      # account: the SQL that asks the database for the contradictions, and the two builders whose
+      # TypeScript mirror-key derivation that SQL is asserted to reproduce branch for branch. Without
+      # them a change to either side of that equality could not reach the only job that runs it.
+      - "lib/domain/accounting/reconciliation.ts"
+      - "lib/domain/accounting/accounting-event-builder.ts"
+      - "lib/domain/accounting/accounting-event-mirror.ts"
+      # The list the contradiction join itself filters on (`type = ANY(...)`, reconciliation.ts:1692).
+      - "lib/domain/accounting/mirrored-sync-types.ts"
 
 jobs:
   migration-scope:
@@ -193,8 +211,8 @@ jobs:
   #   * FOUR never open one (`advisory-lock-keys`, `pool-acquisition-bound`, `post-remote-persist`,
   #     `prisma-unique-violation`) and run identically under `test:unit`.
   #
-  # So this tier is NOT held back from `test:unit` as a block: 101 of its 137 tests execute there,
-  # and 36 skip. docs/development.md carries the same census per file, with the counts.
+  # So this tier is NOT held back from `test:unit` as a block: 101 of its 139 tests execute there,
+  # and 38 skip. docs/development.md carries the same census per file, with the counts.
   #
   # The lesson is not "count the files again": a prose census goes stale silently, and this one is
   # prose. NOTHING MECHANICAL ENFORCES IT. A programmatic census was built on o3d-n3yt and

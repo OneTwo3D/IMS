@@ -59,7 +59,8 @@ import { buildAccountingEventIdempotencyKey } from '../../lib/domain/accounting/
  * Every test below is `{ skip }`, and `skip` was true whenever `RUN_DB_MIGRATION_TESTS` was unset —
  * which, until r13, was EVERY environment that exists, because no checked-in workflow set it and no
  * npm script passed it. `npm run test:unit`'s glob (`tests/**` + `*.test.ts`) COLLECTS this file on
- * every CI run, so the gate reported fifteen skipped tests inside a green suite. Five rounds of
+ * every CI run, so the gate reported every test in this file as skipped inside a green suite (fifteen
+ * of them at the time; sixteen now). Five rounds of
  * evidence — the ownership join, the truncation containment, the fold parity, the Turkish locale —
  * were checked in in a form that never ran, and a reader of the CI log had nothing to tell them so.
  *
@@ -69,17 +70,26 @@ import { buildAccountingEventIdempotencyKey } from '../../lib/domain/accounting/
  * `RUN_DB_RETENTION_TESTS=1 REQUIRE_DB_RETENTION_TESTS=1`. This file was written on a branch whose
  * `test:db` also set `RUN_DB_MIGRATION_TESTS`/`REQUIRE_DB_MIGRATION_TESTS`; that pair never reached
  * development (its other reader, the void-basis backfill test, was dropped with the backfill), so
- * gated on it this file would have reported fifteen `# SKIP`s inside a green `test:db` — the r13
+ * gated on it this file would have reported sixteen `# SKIP`s inside a green `test:db` — the r13
  * finding again, one merge later, and measured so rather than supposed. It therefore reads the pair
  * the script ACTUALLY sets. The pair is named for the retention suite; what it means in practice is
  * "this invocation promised a migrated database", which is the only thing either file asks of it.
  *
  * THE TRIPWIRE. `REQUIRE_DB_RETENTION_TESTS=1` says "this environment PROMISED a database", so a
  * `RUN_DB_RETENTION_TESTS` that is not also `1` is a wiring defect and the module refuses to load
- * rather than skipping fifteen tests under it — an edit that drops the first variable from `test:db`
- * fails loudly. An unset pair is still an ordinary local run and still skips. And it protects only
- * this pair: NOTHING stops a future edit re-gating this file onto a variable `test:db` does not set
- * (o3d-dzsd carries the runtime census that would).
+ * rather than skipping sixteen tests under it — an edit that drops the first variable from `test:db`
+ * fails loudly.
+ *
+ * IT COVERS EXACTLY ONE EDIT SHAPE, and the other shapes are not exotic. The tripwire can only fire
+ * once something has set the `REQUIRE_` half, so it sees an edit that drops the `RUN_` half alone.
+ * An edit that drops BOTH halves from `test:db`, or RENAMES the pair, or re-gates this file onto a
+ * variable that script does not set, puts all sixteen tests back into `# SKIP` inside a green
+ * `db-backed-regressions` job with nothing raised anywhere — and a RENAME is, bit for bit, the defect
+ * this pair exists to repair. So do not read an unset pair as merely "an ordinary local run": locally
+ * it is exactly that, but it is also what such a `package.json` edit leaves behind, and there it is a
+ * green tick over an unexecuted suite. Nothing here can catch that shape, because a file that skips
+ * cannot police its own invocation; o3d-dzsd carries the runtime census that can (require every file
+ * the runner collected to have executed at least one test and reported no skips).
  *
  * r13 did add a CI job and a standing guard (`tests/db-suite-ci-wiring.test.ts`) that read the
  * workflow to prove the job invoked the script, on the sound principle that a test which skips
@@ -713,6 +723,71 @@ test('o3d-11rf r5: a PERSISTED over-cap run still tells an operator the list is 
   assert.match(truncations[0].message, new RegExp(String(over)))
 
   // The run this test wrote must not outlive the probe transaction either.
+  loadEnv()
+  const { db } = await import('../../lib/db')
+  assert.equal(await db.accountingReconciliationRun.count({ where: { id: observed.runId } }), 0,
+    'the persisted run rolled back with everything else')
+})
+
+/**
+ * THE OTHER LEG OF THE SAME COLUMN, AGAINST REAL POSTGRESQL.
+ *
+ * The test above proves that a run which truncated says so on the run row. It says nothing about the
+ * state the whole design rests on: that a run which truncated NOTHING writes `[]` and not SQL NULL,
+ * because NULL is reserved for "no writer spoke" — a row from before the column, or from a
+ * predecessor binary serving across the deploy. Read `[]` as NULL and a complete run looks unknown;
+ * read NULL as `[]` and an unknown run looks complete, which is the failure the column exists to
+ * prevent. Only one of those two mistakes is caught by a double, because a double cannot show what
+ * PostgreSQL actually stored: `[]::jsonb` and NULL are different rows, and `IS NOT NULL` is the only
+ * question that tells them apart. So it is asked here, of the real writer and the real column.
+ */
+test('o3d-11rf r5: a run with nothing truncated records [] and NOT SQL NULL', { skip }, async () => {
+  const observed = await withRollback(async (tx) => {
+    const { findings } = await reportFindings(tx)
+    const truncating = findings.filter((finding: AccountingReconciliationFinding) => finding.code === TRUNCATED)
+    const report = {
+      checkedAt: '2026-09-08T12:00:00.000Z',
+      fromDate: '2026-06-10T12:00:00.000Z',
+      toDate: '2026-09-08T12:00:00.000Z',
+      findings,
+      summary: {
+        total: findings.length,
+        warning: findings.filter((finding: AccountingReconciliationFinding) => finding.severity === 'warning').length,
+        critical: findings.filter((finding: AccountingReconciliationFinding) => finding.severity === 'critical').length,
+      },
+    }
+    const persisted = await persistAccountingReconciliationReport(report, tx as never)
+    const runs = await listAccountingReconciliationRuns(tx as never, {
+      limit: MAX_RECONCILIATION_LIST_RUNS,
+      includeFindings: false,
+    })
+    // The column itself, not the reader's rendering of it. `IS NOT NULL` is the whole point.
+    const raw = await tx.$queryRaw`
+      SELECT "truncations" IS NOT NULL AS "recorded",
+             "truncations"::text       AS "payload"
+      FROM "accounting_reconciliation_runs"
+      WHERE "id" = ${persisted.runId}
+    ` as Array<{ recorded: boolean; payload: string | null }>
+
+    return {
+      truncatingFindings: truncating.length,
+      runId: persisted.runId,
+      reloaded: runs.find((entry) => entry.id === persisted.runId),
+      recorded: raw[0]?.recorded,
+      payload: raw[0]?.payload,
+    }
+  })
+
+  // THE PRECONDITION, ASSERTED: this run really had nothing to report as truncated, so `[]` below is
+  // the recorded-and-complete state and not an accident of a fixture that truncated after all.
+  assert.equal(observed.truncatingFindings, 0,
+    'the probe transaction produced no truncation finding, which is what makes [] the state under test')
+
+  assert.equal(observed.recorded, true, 'the writer recorded a verdict: the column is NOT NULL')
+  assert.equal(observed.payload, '[]', 'and the verdict it recorded is the empty list')
+  assert.deepEqual(observed.reloaded?.truncations, [],
+    'which is what the reader hands the list view — [] is "recorded, nothing truncated", never unknown')
+
   loadEnv()
   const { db } = await import('../../lib/db')
   assert.equal(await db.accountingReconciliationRun.count({ where: { id: observed.runId } }), 0,

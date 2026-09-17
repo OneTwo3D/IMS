@@ -21,4 +21,14 @@
 -- NULL — and NULL must not be read as "nothing was truncated", because nobody recorded that. A run
 -- whose completeness WAS recorded and had nothing to say carries `[]`. The distinction is the whole
 -- point of the column, so it is stated here and asserted in the suite.
+--
+-- AND THAT IS WHY THIS MIGRATION OWES NO verify.sql, unlike the migrations named in
+-- prisma/migrations/verification-required.txt. Those ask, after the fact, how many rows a deploy
+-- window could have left UNDECIDABLE — a predecessor binary writing NULL into them destroys a fact
+-- nothing can recover. Here a NULL is not a damaged row: it is an unreadable COMPLETENESS VERDICT
+-- about one reconciliation run, and the remedy needs no archaeology, because running reconciliation
+-- again on this build produces a run that records its own. Counting the NULLs a cutover left would
+-- therefore measure nothing that has to be repaired. (Same argument as this column's sibling,
+-- 20260912090000_accounting_event_void_basis, which says it for a column that can only ever grant a
+-- permission.)
 ALTER TABLE "accounting_reconciliation_runs" ADD COLUMN "truncations" JSONB;
