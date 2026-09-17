@@ -68,24 +68,38 @@ npm run test:db            # RUN_DB_RETENTION_TESTS=1 REQUIRE_DB_RETENTION_TESTS
 **Point `DATABASE_URL` at a scratch database you created for the run, never at a shared one.** The
 concurrency tier seeds fixture rows into whatever database the URL reaches. Files that also install
 DDL — currently `pending-asn-disposal-race` and `pending-asn-retirement-commit` — refuse to start,
-before any connection writes, unless `tests/concurrency/scratch-database-guard.ts` can establish that
-the database was made for this run and is disposable. It accepts either piece of evidence:
+before any connection writes, unless `tests/concurrency/scratch-database-guard.ts` gets PROOF FROM THE
+SERVER that the database was created to be destroyed. All of these must hold:
 
-* the run DECLARES it — `IMS_CONCURRENCY_SCRATCH_DB` names the connected database exactly (this is
-  what CI does for its own `ims_ci` service database); or
-* the database is named `ims_scratch_*`, the local convention, for a run that exports nothing.
+* the database is STAMPED disposable — a database comment applied by `npm run db:stamp-scratch`
+  (`COMMENT ON DATABASE … IS '<marker>'`, which lives outside every schema, so it does not show up as
+  schema drift and survives `prisma migrate deploy`); AND
+* the run DECLARES it — `IMS_CONCURRENCY_SCRATCH_DB` names the connected database exactly; AND
+* the server says it is not a replica (`pg_is_in_recovery()`), not a template, and not the target of a
+  logical-replication subscription; AND
+* the name is not obviously real — `onetwoinventory`, `onetwo3d…`, `postgres…`/`template…`/`pg_…`, or
+  anything containing `prod`/`live`, are refused however they are stamped and declared.
 
-Neither can admit this estate's own databases: anything named `onetwo3d…`, `postgres`/`template…`, or
-production-shaped (a name part starting `prod`/`live`) is refused however it is declared. With no
-declaration and no scratch-shaped name the guard refuses rather than guess. For example:
+**A NAME IS NOT EVIDENCE, which is why the stamp exists.** This product's tenant databases are
+`ims_<slug>` (`scripts/provision-ims-tenant.sh`) and its canonical database is `onetwoinventory`
+(`.env.example`), so no naming convention can separate a live database from a scratch one — earlier
+versions of this guard tried twice and admitted both. Stamping is a deliberate act on one database,
+and `npm run db:stamp-scratch` itself refuses to stamp a real-looking name, a replica, a template or a
+subscriber.
 
 ```bash
-createdb -O imsdev ims_scratch_$(date +%s)
-export DATABASE_URL=postgresql://imsdev:…@localhost:5432/ims_scratch_<suffix>
-export IMS_CONCURRENCY_SCRATCH_DB=ims_scratch_<suffix>
-npx prisma migrate deploy && npm run test:concurrency
+createdb -O "$PGUSER" ims_scratch_$(date +%s)          # any name that is not refused above
+export DATABASE_URL=postgresql://…@localhost:5432/ims_scratch_<suffix>
+npx prisma migrate deploy
+npm run db:stamp-scratch                                # stamps $DATABASE_URL's database
+export IMS_CONCURRENCY_SCRATCH_DB=ims_scratch_<suffix>  # declare it, by exact name
+npm run test:concurrency
 dropdb ims_scratch_<suffix>
 ```
+
+`npm run validate:db` runs this tier only when `IMS_CONCURRENCY_SCRATCH_DB` is set, and prints a
+SKIPPED notice otherwise; CI (`fresh-db-drift` in `.github/workflows/schema-guardrails.yml`) stamps and
+declares its own per-run `ims_ci` service database, so the tier is gated on every PR that touches it.
 
 The other 30 files have no such guard yet and seed before checking anything (tracked as o3d-yvn8).
 

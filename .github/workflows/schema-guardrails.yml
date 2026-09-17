@@ -162,18 +162,22 @@ jobs:
             exit 1
           fi
           echo "url=${DATABASE_URL/@127.0.0.1:5432/@${ip}:5432}" >> "$GITHUB_OUTPUT"
+      # The concurrency tier refuses to seed or install DDL into any database that is not
+      # PROVEN disposable: stamped with a database comment by the script below, and named in
+      # IMS_CONCURRENCY_SCRATCH_DB. A name rule is not enough -- this product's tenant
+      # databases are `ims_<slug>` and its canonical one is `onetwoinventory`, so no naming
+      # convention can tell a scratch database from a live one (o3d-zzgp r6). `ims_ci` here is
+      # a postgres:16 service container created for this job and destroyed with it.
+      - name: Stamp the service database as disposable
+        run: npm run db:stamp-scratch
       - name: Run DB-backed concurrency regressions
         env:
           # Scoped to THIS step on purpose. It must not reach a step that re-points DATABASE_URL at
           # another database -- an override naming a different database is refused outright, by
           # design, so a job-wide value would break such a step rather than help it.
           DATABASE_SESSION_LOCK_URL: ${{ steps.direct-db.outputs.url }}
-          # The concurrency tier's scratch-database guard (tests/concurrency/scratch-database-guard.ts)
-          # refuses to seed or install DDL into a database it cannot establish was made for the run and
-          # is disposable. This job's `ims_ci` is exactly that -- a service container created for this
-          # job and destroyed with it -- so the job declares it, by its exact name. The guard refuses
-          # this estate's real databases (onetwo3d*, prod/live-shaped, the server's own) however they
-          # are declared, so this line cannot be repointed at one.
+          # The run's declaration, which the guard requires IN ADDITION to the stamp applied by
+          # the step above: it must name the connected database exactly.
           IMS_CONCURRENCY_SCRATCH_DB: ims_ci
         run: npm run test:concurrency
 

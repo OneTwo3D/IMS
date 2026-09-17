@@ -1006,6 +1006,15 @@ function executableFiles(dir: string, found: string[] = []): string[] {
  *                             cannot read a row, let alone write one. It is discovered here because
  *                             its prose names `psql` while explaining which connection it has to
  *                             match. o3d-2sm1.5 r41.
+ *   'scratch-database-stamp'— connects to a database that is NOT this application's and writes ONE
+ *                             DATABASE-LEVEL comment (`COMMENT ON DATABASE … IS '<marker>'`), which
+ *                             is how the DB-backed concurrency tier is told a database was created
+ *                             to be destroyed. It touches no schema, table or row anywhere, so it
+ *                             cannot move a plugin key, and it refuses to run at all against a real
+ *                             or server-owned name, a replica, a template, a subscription target, or
+ *                             a database that already carries a different comment. Never runs in
+ *                             production: CI's fresh-db-drift job and a developer setting up a
+ *                             scratch database are its only callers. o3d-zzgp r6.
  *   'seed'                  — a standalone client that WRITES this database, run from install.sh.
  *                             It takes no lock and cannot practically be made to (it runs before the
  *                             app is up); what keeps it safe is that it must not write a plugin key,
@@ -1028,6 +1037,7 @@ const DATABASE_EXECUTION_PATHS: Record<string,
   | 'deploy-connection-fence'
   | 'protocol-handshake-only'
   | 'compatibility-probe'
+  | 'scratch-database-stamp'
   | 'seed'
 > = {
   'app/api/backup/restore/route.ts': 'replays-external-sql',
@@ -1144,6 +1154,7 @@ const DATABASE_EXECUTION_PATHS: Record<string,
   'lib/connectors/xero/payment-write-lock.ts': 'pinned-lock-session',
   'lib/domain/wms/dispatch-sweep-lock.ts': 'pinned-lock-session',
   'lib/ops/production-preflight.ts': 'pinned-lock-session',
+  'scripts/stamp-scratch-database.ts': 'scratch-database-stamp',
   'prisma/seed.ts': 'seed',
 }
 

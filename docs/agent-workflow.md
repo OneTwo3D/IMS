@@ -99,7 +99,11 @@ npx playwright test e2e/<relevant-spec>.spec.ts
 
 For GitHub Actions trigger or gating changes, validate both the static workflow checks and the event-specific behavior being changed. `npm run docs:workflows:check` does not simulate GitHub event payloads; push-trigger changes need either a real CI push run or focused tests that assert push and pull request event paths use the intended refs.
 
-Run `npm run validate:db` when a local `DATABASE_URL` is configured and the database is reachable.
+Run `npm run validate:db` when a local `DATABASE_URL` is configured and the database is reachable. Its
+last step, the DB-backed concurrency tier, runs only when `IMS_CONCURRENCY_SCRATCH_DB` names a scratch
+database stamped with `npm run db:stamp-scratch`; without one it prints a SKIPPED notice instead of
+seeding your ordinary local database, which its guard refuses outright. CI runs that tier on every PR
+that touches it. See docs/development.md, "Database-backed tiers".
 
 ## Documentation Updates
 
