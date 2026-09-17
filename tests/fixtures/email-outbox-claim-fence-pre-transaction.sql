@@ -1,0 +1,169 @@
+-- o3d-alnk — give the email outbox a HOLDER IDENTITY and make a duplicate undelivered
+-- row impossible at the database level.
+--
+-- PART 1 — the claim fence (schema-visible; see model EmailOutbox).
+--
+-- processPendingEmailOutbox reclaimed a PROCESSING row on ELAPSED TIME ALONE
+-- (processingStartedAt < now - 15min) and then settled it with
+-- update({ where: { id } }) — keyed on the id and nothing else. A worker paused on a
+-- stalled SMTP socket therefore came back and wrote over the reclaimer's outcome; when
+-- its send had failed retryably it wrote status PENDING + a fresh availableAt OVER the
+-- winner's SENT, RE-ARMING the row for a third delivery. `lockedBy` carries a per-claim
+-- random token so every terminal write can compare-and-set on (id, PROCESSING, lockedBy,
+-- processingStartedAt) and the loser's UPDATE matches zero rows.
+--
+-- THE ALTER ITSELF IS BELOW, INSIDE THE TRANSACTION (o3d-alnk r6, from Codex MEDIUM). It used to
+-- sit here, before the explicit BEGIN, and the review's reading was that a fired refusal would
+-- then leave a HALF-APPLIED migration: the column present, while the HINT says nothing was
+-- applied and sends the operator to `prisma migrate resolve --rolled-back` and a re-deploy whose
+-- ADD COLUMN dies on "column already exists".
+--
+-- THAT DID NOT REPRODUCE, AND THE MEASUREMENT IS WHY THE STATEMENT MOVED ANYWAY. Run against a
+-- real throwaway with two PROCESSING duplicates, `prisma migrate deploy` on the OLD layout left
+-- `lockedBy` ABSENT: the engine sends the whole file as ONE simple query, PostgreSQL wraps a
+-- multi-statement simple query in an implicit transaction, and an inner BEGIN does not start a
+-- second one — so the pre-BEGIN ALTER rolled back with everything else. The recovery the HINT
+-- describes already worked.
+--
+-- It is inside the transaction now because that safety must not depend on which of those two
+-- things the runner happens to do. A runner that sends statements SEPARATELY — which Prisma's
+-- own docs do not promise it will not — half-applies the old layout exactly as the review
+-- described. Inside BEGIN, both execution models give the same all-or-nothing result.
+--
+-- The same run turned up a defect that WAS live, and it is fixed at the guard below rather than
+-- here: with the refusal inside the explicit transaction, `migrate deploy` printed only
+-- `current transaction is aborted` and the message, DETAIL and HINT never reached the operator.
+
+-- PART 2 — the enqueue guard.
+--
+-- prisma-schema-scope-ok: db-native partial UNIQUE index — Prisma's schema language cannot
+-- express a filtered unique (a WHERE predicate on an index), so this constraint cannot live
+-- in schema.prisma and is declared here instead.
+--
+-- At most ONE UNDELIVERED row may exist per (kind, referenceType, referenceId). The claim
+-- fence above stops one row being SETTLED twice; it cannot stop two ROWS being created for
+-- the same logical email, and there was no uniqueness of any kind on this table. The
+-- concrete reachable case is o3d-8td2's: xero/accounting.post multiplexes every
+-- AccountingSyncType and INVOICE_EMAIL's whole effect is queueEmail -> a bare
+-- emailOutbox.create, so a replayed outbox row simply inserted a second invoice email.
+-- queueDispatchEmailIfEligible's findFirst-then-create is the same shape, guarded today
+-- only by the sales-order row lock.
+--
+-- SCOPED TO UNDELIVERED STATUSES ON PURPOSE. A lifetime unique on the triple would forbid a
+-- deliberate later re-send (an operator re-sending an invoice after correcting an address),
+-- which is a supported action in app/actions/email.ts. PENDING/PROCESSING is exactly the
+-- window in which a second row is a duplicate rather than a decision. Rows with a NULL
+-- reference are unconstrained: they carry no identity to deduplicate on.
+--
+-- NOTE ON WHAT THIS DOES AND DOES NOT MAKE IMPOSSIBLE: it makes a duplicate undelivered ROW
+-- impossible. It cannot make a duplicate SMTP SEND impossible — that effect is outside the
+-- database and no local write can retract it.
+
+-- ---------------------------------------------------------------------------------------
+-- THE REFUSAL RUNS BEFORE THE TRANSACTION, AND THAT POSITION IS LOAD-BEARING (o3d-alnk r6).
+--
+-- WHAT IT REFUSES, AND WHY IT REFUSES RATHER THAN PICKS. Two claimed rows for one logical email
+-- means two workers may each be mid-send, or one may have sent and the other have died before
+-- sending, and NOTHING IN THE DATABASE DISTINGUISHES THOSE. Keep the wrong one and its reclaim
+-- mails a second copy on top of a send that already went out. There is no ranking that is safe
+-- here and no way to find out from inside a migration, so it stops with an actionable message
+-- rather than guessing. THIS IS NOT SELF-CLEARING, and waiting is not a remedy (r38, correcting a
+-- sentence that stood here until then and said the drain settles a claimed row within its stale
+-- window, so that re-running after a few minutes was the whole remedy). Nothing settles a PROCESSING
+-- row by the passage of time: the stale window is an ELIGIBILITY THRESHOLD, not a settlement deadline,
+-- and before this migration succeeds the drain that becomes eligible is the UNFENCED one. The remedy
+-- is the ordered one in the HINT below — stop the drain, decide each row out of band, settle by hand,
+-- resolve and redeploy, and only then re-enable the drain — and the block after this one says why.
+--
+-- WHY IT IS OUT HERE INSTEAD OF UNDER THE LOCK. MEASURED, not reasoned about, against a real
+-- throwaway database running `prisma migrate deploy`:
+--
+--   With this DO block INSIDE the explicit transaction, the operator never saw ANY of the text
+--   above. Prisma sends the whole migration file as one simple query and then records the
+--   outcome in `_prisma_migrations` ON THE SAME CONNECTION. Because the script opened an
+--   EXPLICIT transaction block, the RAISE left that block open and aborted instead of being
+--   auto-rolled-back, so the engine's next statement failed with `current transaction is
+--   aborted, commands ignored until end of transaction block` — and THAT is the only error
+--   `migrate deploy` printed. Message, DETAIL and HINT all lost.
+--
+--   Hoisted out here, the same run prints `P3018` / `P0001` with the message, the DETAIL and the
+--   HINT in full. A refusal whose recovery instruction the operator cannot read is not a
+--   refusal, it is an outage.
+--
+-- NOTHING HAS BEEN APPLIED WHEN THIS FIRES, under either way a runner can execute the file: this
+-- is the first statement, and everything that changes anything is inside the BEGIN below.
+--
+-- WHAT THE POSITION COSTS, STATED PLAINLY. The guard no longer runs while the table is locked, so
+-- a duplicate PROCESSING pair that appears BETWEEN this statement and the LOCK below is not
+-- caught here. That race does not corrupt anything: the collapse cannot demote a claimed row
+-- (`AND a.status = 'PENDING'`), so the pair survives to CREATE UNIQUE INDEX, which fails and
+-- aborts the whole migration. The cost is a duplicate-key error instead of this message — the
+-- backstop is why that is a message problem and not a safety one.
+-- ---------------------------------------------------------------------------------------
+-- ---------------------------------------------------------------------------------------
+-- THE REMEDY THIS HINT GIVES USED TO BE ABLE TO CAUSE THE DUPLICATE IT REFUSES TO RISK
+-- (r37, Codex r36 HIGH 1).
+--
+-- Until this round the first remedy was "let the drain settle these claims (it does so within its
+-- stale window)". That reads as though WAITING resolves the ambiguity. IT DOES NOT. THE STALE WINDOW
+-- IS AN ELIGIBILITY THRESHOLD, NOT A SETTLEMENT DEADLINE: nothing settles a PROCESSING row by the
+-- passage of time. What crossing the window does is make the row ELIGIBLE FOR RECLAIM — and before
+-- this migration succeeds, the only drain in the build is the UNFENCED one. So an operator who
+-- followed that advice waited for exactly the moment at which the old drain could reclaim every one
+-- of these rows and SEND each of them again, and (unfenced) the loser of that race could write
+-- PENDING over the winner's SENT and re-arm the row. The refusal exists to avoid one duplicate
+-- delivery and its own first remedy invited several.
+--
+-- WHAT AN OPERATOR CAN ACTUALLY DO BEFORE THE FENCE EXISTS is the real constraint, and it is a short
+-- list: nothing in the database can settle these rows safely while a worker may still be on the
+-- socket for them, and no worker can be prevented from reclaiming them EXCEPT by not running. So the
+-- first step has to be STOPPING THE DRAIN, and only then can the rows be decided — out of band, from
+-- the mail server's own record, because that is the only place the answer exists. The HINT below says
+-- that, in that order, and no longer mentions waiting except to forbid it.
+-- ---------------------------------------------------------------------------------------
+-- o3d-alnk-sql-block: refuse-ambiguous-processing
+DO $$
+DECLARE
+  ambiguous text;
+BEGIN
+  SELECT string_agg(format('%s/%s/%s (%s rows)', kind, "referenceType", "referenceId", n), ', ')
+    INTO ambiguous
+    FROM (
+      SELECT kind, "referenceType", "referenceId", count(*) AS n
+        FROM "email_outbox"
+       WHERE status = 'PROCESSING'
+         AND "referenceType" IS NOT NULL
+         AND "referenceId" IS NOT NULL
+       GROUP BY kind, "referenceType", "referenceId"
+      HAVING count(*) > 1
+    ) ambiguous_groups;
+
+  IF ambiguous IS NOT NULL THEN
+    RAISE EXCEPTION 'email_outbox: refusing to collapse duplicates for %', ambiguous
+      USING DETAIL = 'More than one PROCESSING row exists for the same (kind, referenceType, referenceId). A worker may already be on the SMTP socket for either of them, and nothing in this table says which; discarding one and retaining the other can mail the customer a second copy on top of a send that already went out. Migration 20260910120000_email_outbox_claim_fence (o3d-alnk) refuses rather than guess.',
+            HINT = 'DO NOT WAIT FOR THESE CLAIMS TO GO STALE, and do not let the drain settle them. That was this HINT''s first remedy until o3d-alnk r37, and it instructed the operator into the exact duplicate delivery this refusal exists to avoid: THE STALE WINDOW IS AN ELIGIBILITY THRESHOLD, NOT A SETTLEMENT DEADLINE. Until this migration is applied the only drain in the build is the UNFENCED one, so waiting does not resolve the ambiguity - it makes every one of these rows eligible for reclaim, and the unfenced drain then RE-SENDS each of them; worse, the loser of that race can write PENDING over the winner''s SENT and re-arm the row, so copies keep going out on ordinary ticks. WHAT AN OPERATOR CAN DO SAFELY BEFORE THE FENCE EXISTS, in this order: (1) STOP THE DRAIN. Disable or remove the /api/cron/email-outbox job (the crontab entry, or Settings > System > Scheduler), on EVERY replica, and confirm no run is in flight. processPendingEmailOutbox is the only writer that claims email_outbox rows, so with it stopped nothing can reclaim and nothing can send. (2) DECIDE EACH ROW OUT OF BAND. This table cannot tell you whether a PROCESSING row''s message reached the wire - that is precisely why this statement refuses - so read the answer off the mail server or provider log for each row listed above. (3) SETTLE THEM BY HAND, with the drain still stopped: UPDATE each row to SENT if its message went and FAILED if it did not, clearing processingStartedAt, until at most one undelivered (PENDING or PROCESSING) row is left per (kind, referenceType, referenceId). (4) Mark this migration rolled back (prisma migrate resolve --rolled-back 20260910120000_email_outbox_claim_fence) and deploy again. (5) RE-ENABLE THE DRAIN, which is fenced from this migration onwards. Nothing was applied: this check is the migration''s first statement and every statement that changes anything is inside the transaction that follows it.';
+  END IF;
+END
+$$;
+-- o3d-alnk-sql-block-end
+
+-- ONE TRANSACTION AROUND EVERYTHING THIS MIGRATION DOES, INCLUDING THE DDL.
+--
+-- Two reasons, and the second was learned the hard way:
+--
+--   (1) A concurrent enqueue must not be able to insert a duplicate between the collapse UPDATE's
+--       snapshot and CREATE UNIQUE INDEX, which would abort the deploy with the very race the
+--       index exists to prevent. Prisma's runner does not auto-wrap a migration, so BEGIN/COMMIT
+--       is explicit.
+--
+--   (2) ALL-OR-NOTHING IS WHAT MAKES THE REFUSAL'S RECOVERY POSSIBLE (o3d-alnk r6, Codex MEDIUM).
+--       The guard above aborts on purpose, and its HINT tells the operator that nothing was
+--       applied and to `prisma migrate resolve --rolled-back` then deploy again. That is only
+--       true if every statement that changes anything is inside this transaction. It is now,
+--       whether the runner sends the file as one command or statement by statement. See PART 1
+--       for what was measured and what was not.
+--
+-- The lock is taken as ACCESS EXCLUSIVE rather than SHARE ROW EXCLUSIVE because the transaction
+-- now contains DDL: ALTER TABLE would upgrade to ACCESS EXCLUSIVE anyway, and taking the weaker
+-- lock first only opens a lock-upgrade deadlock window. Readers are blocked for the duration,
+-- which for this table is an ADD COLUMN with no default plus one small UPDATE and one index build.

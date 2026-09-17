@@ -1021,212 +1021,61 @@ const FENCE_MIGRATION_SQL = readFileSync(
 )
 
 /**
- * EVERY BYTE OF THE PRE-TRANSACTION REGION CLASSIFIED EXACTLY ONCE, IN ONE PASS (r39, Codex r38 HIGH).
+ * THE REGION BEFORE `BEGIN` IS PINNED BYTE FOR BYTE, AND THERE IS NO PARSER (r40).
  *
- * THE HISTORY, BECAUSE IT IS THE SAME MISTAKE THREE TIMES. r37 blanked string contents and then looked
- * for mutating verbs — `EXECUTE 'UPDATE ...'` hid the verb inside a blanked literal. r38 pinned the
- * region to an exact skeleton, but still DROPPED WHOLE `--` LINES BEFORE PARSING STRINGS. PostgreSQL
- * strings are multiline, so a HINT ending
+ * FOUR CONSECUTIVE ROUNDS WERE LOST INSIDE ONE FUNCTION, EVERY ONE OF THEM A PARSE-EQUIVALENCE ERROR
+ * against PostgreSQL's lexer rather than a mistake about the rule being enforced:
  *
- *     ... transaction that follows\n--'; EXECUTE 'UPDATE ...'; RAISE NOTICE '\nit.';
+ *   r37 blanked string contents and then hunted mutating verbs — `EXECUTE 'UPDATE ...'` runs the
+ *       literal, so the verb hid inside a blanked span;
+ *   r38 pinned the region to a token skeleton but stripped whole `--` lines BEFORE parsing strings —
+ *       a multiline HINT ending `\n--'; EXECUTE ...; RAISE NOTICE '\n` had the middle line deleted and
+ *       the two halves rejoined into the expected skeleton;
+ *   r39 wrote a single-pass scanner and got `standard_conforming_strings` BACKWARDS. Measured on
+ *       PostgreSQL 17.11: with scs OFF, `SELECT 'a\'' , length('a\'')` yields `a'` and 2 — the SERVER
+ *       ENDS the string there, while the scanner read the trailing `''` as a doubled quote and ran ON,
+ *       swallowing the bytes the server executes. The independent review built a working false pass on
+ *       exactly that: a HINT terminator of `it.\''; END IF; EXECUTE $q$CREATE TABLE ...$q$; PERFORM ';
+ *       END IF; -- ';` produced a byte-identical skeleton while the CREATE ran, unconditionally and
+ *       outside the IF, before BEGIN (`PWNED TABLE COUNT: 1` with scs off; 0 with it on).
+ *   …and the same class was open in two more places nobody had exploited yet: double-quoted
+ *       identifiers (`"x--"` is an identifier to the server and a comment opener to the scanner),
+ *       adjacent string continuation across a newline, and `$` as an identifier continuation byte.
  *
- * is, to the server, one string, then a REAL `EXECUTE`, then another string. To r38's function the
- * middle line began with `--`, so the whole line was deleted and the two halves of the HINT rejoined
- * into exactly the expected skeleton: a mutating statement ran before BEGIN and the guard was green.
+ * SO THE PARSER IS GONE RATHER THAN REPAIRED. A tokenizer here only ever bought ONE thing — letting the
+ * refusal's operator PROSE change without updating this test — and that was already worth very little:
+ * r38 conceded that any edit to the refusal's own SQL fails this test until the test is updated, and
+ * the HINT's prose is separately pinned, sentence by sentence, by the recovery-order test below. What it
+ * COST was an unbounded equivalence surface against a lexer with escape strings, dollar quoting,
+ * nesting block comments, quoted identifiers and a GUC that changes how a plain quote parses. The
+ * region is a fixed file in this repository: nothing in it legitimately varies between runs, machines
+ * or environments. So it is compared BYTE FOR BYTE against a pinned copy, and the class of defect ends.
  *
- * BOTH DEFECTS ARE THE ORDER OF THE PASSES, not the rule being enforced: whether a `--` is a comment,
- * and whether a quote opens a string, are the SAME question, and no pass that answers one before the
- * other can be right. So this is a single left-to-right scan that carries its own state and decides
- * each byte once:
+ * WHAT THIS COSTS, STATED PLAINLY. Every edit to the migration before `BEGIN` — including a comment, a
+ * typo fix, or a word of the HINT — fails this test until `tests/fixtures/…-pre-transaction.sql` is
+ * updated in the same commit. That is the intended friction: this is the region whose contents decide
+ * whether anything can run outside the all-or-nothing transaction, and the diff is exactly what a
+ * reviewer should be made to read. It is also the only remaining way to change it: there is no
+ * wording rule left to satisfy and no scanner to argue with.
  *
- *   * `--` outside a string starts a line comment (to the newline); inside a string it is content;
- *   * `/* ... *\/` outside a string is a block comment AND NESTS, as PostgreSQL's does;
- *   * `'...'` is a string, `''` inside it an escaped quote (never a terminator);
- *   * `E'...'` is an escape string where a backslash escapes the next byte, so `E'\''` is not closed;
- *   * `$tag$ ... $tag$` (tagged or bare `$$`) is dollar-quoted: NOTHING inside is special except the
- *     matching tag, so a `--`, a quote or another tag inside it is content.
+ * NORMALISATION IS LINE ENDINGS AND A BOM, AND NOTHING ELSE. `\r\n` becomes `\n` and a leading U+FEFF is
+ * dropped, so a checkout with `core.autocrlf` or an editor that adds a BOM does not produce a false
+ * failure. No whitespace collapsing, no comment handling, no quote handling — those are the passes
+ * that produced four rounds of findings.
  *
- * WHAT IS EMITTED. Code is emitted verbatim; a comment becomes one space; a string becomes its EMPTY
- * form (`''`, `E''`, `$tag$$tag$`), so the text an operator may edit — the RAISE message, DETAIL and
- * HINT — cannot move the token stream, while any change of SQL STRUCTURE does.
- *
- * THE ONE PLACE A BODY IS CODE. The refusal is `DO $$ ... $$`, and PostgreSQL hands that body to
- * PL/pgSQL, which lexes it as CODE (its `--` really is a comment there). So a dollar-quoted body found
- * at the OUTER level is re-entered as code — which is what lets the skeleton see inside the DO block,
- * and what makes an `EXECUTE` planted inside it fail. A dollar quote found INSIDE that body is a
- * PL/pgSQL string literal and is emitted empty, exactly as the server treats it.
- *
- * AN UNTERMINATED STRING OR COMMENT THROWS rather than returning a truncated stream: a region this
- * scanner cannot classify is not a region it may certify.
- *
- * `standard_conforming_strings` (r38 stated this as an assumption; r39 states what it costs). The
- * scanner does NOT treat a backslash as an escape inside a PLAIN `'...'` string, which is the ON
- * behaviour, i.e. the PostgreSQL default. With it OFF the server would read `'\''` as a continuing
- * string where this scanner ends it — so the scanner ends the string EARLY, and the rest of the
- * server's string is emitted as CODE. That direction adds tokens, so the skeleton comparison FAILS.
- * The setting can therefore cost a false failure of this test; it cannot buy a false pass.
+ * WHAT THIS DOES NOT ESTABLISH. It says nothing about the statements INSIDE the transaction (the
+ * assertions below cover those by name, and tests/concurrency drives them against a real database),
+ * and nothing about whether the refusal's SQL is CORRECT — only that it is unchanged.
  */
-function preTransactionTokens(sql: string): string {
-  const out: string[] = []
-  const dollarTagAt = (at: number): string | null => {
-    if (sql[at] !== '$') return null
-    const match = /^\$(?:[A-Za-z_][A-Za-z0-9_]*)?\$/.exec(sql.slice(at))
-    return match ? match[0] : null
-  }
-  const isIdentifierByte = (byte: string | undefined): boolean => byte !== undefined && /[A-Za-z0-9_$]/.test(byte)
+const PRE_TRANSACTION_FIXTURE = fileURLToPath(
+  new URL('./fixtures/email-outbox-claim-fence-pre-transaction.sql', import.meta.url),
+)
 
-  /** One scan of `from`..`to`. `bodyIsCode` is true only at the level where a `$$` body is PL/pgSQL. */
-  const scan = (from: number, to: number, bodyIsCode: boolean): void => {
-    let at = from
-    while (at < to) {
-      const byte = sql[at]
-
-      if (byte === '-' && sql[at + 1] === '-') {
-        const newline = sql.indexOf('\n', at)
-        at = newline === -1 || newline > to ? to : newline
-        out.push(' ')
-        continue
-      }
-
-      if (byte === '/' && sql[at + 1] === '*') {
-        let depth = 0
-        while (at < to) {
-          if (sql[at] === '/' && sql[at + 1] === '*') { depth += 1; at += 2; continue }
-          if (sql[at] === '*' && sql[at + 1] === '/') {
-            depth -= 1
-            at += 2
-            if (depth === 0) break
-            continue
-          }
-          at += 1
-        }
-        assert.equal(depth, 0, 'the region before BEGIN has an unterminated /* block comment, so it cannot be classified')
-        out.push(' ')
-        continue
-      }
-
-      if (byte === "'" || ((byte === 'E' || byte === 'e') && sql[at + 1] === "'" && !isIdentifierByte(sql[at - 1]))) {
-        const escapes = byte !== "'"
-        let cursor = at + (escapes ? 2 : 1)
-        let closed = false
-        while (cursor < to) {
-          if (escapes && sql[cursor] === '\\') { cursor += 2; continue }
-          if (sql[cursor] === "'") {
-            if (sql[cursor + 1] === "'") { cursor += 2; continue }
-            cursor += 1
-            closed = true
-            break
-          }
-          cursor += 1
-        }
-        assert.ok(closed, 'the region before BEGIN has an unterminated string literal, so it cannot be classified')
-        out.push(escapes ? "E''" : "''")
-        at = cursor
-        continue
-      }
-
-      const tag = dollarTagAt(at)
-      if (tag) {
-        const close = sql.indexOf(tag, at + tag.length)
-        assert.ok(close !== -1 && close < to, `the region before BEGIN has an unterminated ${tag} dollar quote, so it cannot be classified`)
-        if (bodyIsCode) {
-          out.push(tag)
-          scan(at + tag.length, close, false)
-          out.push(tag)
-        } else {
-          out.push(tag + tag)
-        }
-        at = close + tag.length
-        continue
-      }
-
-      out.push(byte)
-      at += 1
-    }
-  }
-
-  scan(0, sql.length, true)
-  return out.join('').trim()
+/** Line endings and a BOM, and nothing else — see the block above for why nothing else. */
+function normaliseForByteComparison(text: string): string {
+  return text.replace(/^\uFEFF/, '').replace(/\r\n/g, '\n')
 }
 
-// ---------------------------------------------------------------------------
-// r39 (Codex r38 HIGH) — THE SCANNER ITSELF, DRIVEN ON THE SHAPES THAT DEFEATED ITS PREDECESSORS.
-//
-// The guard below is only as good as `preTransactionTokens`, and the last two rounds were lost inside
-// that function rather than in the rule it feeds. Each case here is a construct where "is this a
-// comment?" and "is this inside a string?" disagree, written so that the WRONG answer produces the
-// text an attacker wants: a stream with the injected statement missing.
-// ---------------------------------------------------------------------------
-
-test('r39: the pre-transaction scanner classifies comments and strings in one pass', () => {
-  const tokens = (sql: string) => preTransactionTokens(sql).replace(/\s+/g, ' ').trim()
-
-  // THE REVIEWER'S PAYLOAD, in the shape it takes in the migration: a HINT that ends mid-line with
-  // `--`, so a comment-first pass deletes the line that carries the real statement and rejoins the
-  // string. Here the `EXECUTE` must SURVIVE into the stream.
-  assert.equal(
-    tokens("RAISE EXCEPTION 'x' USING HINT = 'follows\n--'; EXECUTE 'UPDATE email_outbox SET status = 1'; RAISE NOTICE '\nit.';"),
-    "RAISE EXCEPTION '' USING HINT = ''; EXECUTE ''; RAISE NOTICE '';",
-    'a `--` inside a multiline string was treated as a comment, so the statement after it vanished — '
-    + 'this is exactly the round-38 defect',
-  )
-
-  // The same trick through the OTHER string forms.
-  assert.equal(
-    tokens("SELECT E'follows\\'\n--'; EXECUTE 'UPDATE t SET x = 1'; SELECT E'\nit.';"),
-    "SELECT E''; EXECUTE ''; SELECT E'';",
-    'an E\'...\' escape string mis-parsed: a backslash-escaped quote does not end it, and a `--` inside it is content',
-  )
-  assert.equal(
-    tokens("DO $body$ BEGIN PERFORM $q$--$q$; EXECUTE 'UPDATE t SET x = 1'; END $body$;"),
-    "DO $body$ BEGIN PERFORM $q$$q$; EXECUTE ''; END $body$;",
-    'a `--` inside a dollar-quoted string was treated as a comment',
-  )
-  // A tag written INSIDE a string in the surrounding code is content, not the start of a dollar quote —
-  // otherwise everything up to the next matching tag disappears from the stream.
-  assert.equal(
-    tokens("SELECT '$body$'; EXECUTE 'UPDATE t SET x = 1'; DO $body$ BEGIN PERFORM 1; END $body$;"),
-    "SELECT ''; EXECUTE ''; DO $body$ BEGIN PERFORM 1; END $body$;",
-    'a dollar tag written inside a string literal was read as a real tag',
-  )
-  // AND THE BODY ENDS AT THE FIRST MATCHING TAG, exactly as PostgreSQL ends it: nothing inside a
-  // dollar-quoted string is special, so a nested quote cannot postpone the close. `$q$` here is a
-  // DIFFERENT tag, so it is an ordinary PL/pgSQL string inside the body and is emitted empty.
-  assert.equal(
-    tokens("DO $body$ BEGIN PERFORM $q$ has 'quotes' and -- dashes $q$; EXECUTE 'UPDATE t SET x = 1'; END $body$;"),
-    "DO $body$ BEGIN PERFORM $q$$q$; EXECUTE ''; END $body$;",
-    'a nested dollar-quoted string inside the body is no longer opaque: nothing in it is special except '
-    + 'its own closing tag, so the quotes and the `--` in it must not be read as a string or a comment',
-  )
-  // A `/*` inside a string must not open a comment — otherwise everything to the next `*/` disappears.
-  assert.equal(
-    tokens("SELECT '/*'; EXECUTE 'UPDATE t SET x = 1'; SELECT '*/';"),
-    "SELECT ''; EXECUTE ''; SELECT '';",
-    'a `/*` inside a string opened a block comment, which swallowed the statement after it',
-  )
-  // …and a quote inside a comment must not open a string, which would swallow the code after it.
-  assert.equal(
-    tokens("-- it's a comment\nEXECUTE 'UPDATE t SET x = 1';"),
-    "EXECUTE '';",
-    "an apostrophe inside a `--` comment opened a string",
-  )
-  // BLOCK COMMENTS NEST, as PostgreSQL's do. A non-nesting scanner ends this comment at the first
-  // `*/` and reports the rest as code: a false failure, not a hole, but it would make this file
-  // unreadable to the guard.
-  assert.equal(
-    tokens('/* outer /* inner */ still comment */ SELECT 1;'),
-    'SELECT 1;',
-    'block comments no longer nest, so the tail of a nested comment is being read as code',
-  )
-  // AND AN UNCLOSED CONSTRUCT IS A REFUSAL, not a truncated stream.
-  assert.throws(() => preTransactionTokens("SELECT 'unclosed"), /unterminated string literal/)
-  assert.throws(() => preTransactionTokens('/* unclosed'), /unterminated \/\* block comment/)
-  assert.throws(() => preTransactionTokens('DO $$ BEGIN END'), /unterminated \$\$ dollar quote/)
-
-  // NON-VACUITY: the scanner is not simply returning its input. Comments go, string CONTENTS go, and
-  // the structure stays.
-  assert.equal(tokens("/* c */ -- c\nSELECT 'kept structure';"), "SELECT '';")
-})
 
 test('the migration changes NOTHING before its transaction begins (o3d-alnk r6)', () => {
   const begin = FENCE_MIGRATION_SQL.indexOf('\nBEGIN;')
@@ -1234,43 +1083,52 @@ test('the migration changes NOTHING before its transaction begins (o3d-alnk r6)'
   const commit = FENCE_MIGRATION_SQL.indexOf('\nCOMMIT;')
   assert.ok(commit > begin, 'the migration no longer has a COMMIT after its BEGIN')
 
-  const beforeTransaction = preTransactionTokens(FENCE_MIGRATION_SQL.slice(0, begin))
-
   // THE ONLY STATEMENT OUT THERE IS THE READ-ONLY REFUSAL, and it is out there so that
   // `migrate deploy` can print its message at all (see the migration's own comment).
   //
-  // r38 (Codex r37 HIGH): ASSERTED AS AN EXACT SKELETON, NOT AS A SHAPE PLUS A VERB BLACKLIST. The old
-  // form accepted any `DO $$ ... $$;` and then looked for mutating verbs in text whose literals had been
-  // blanked, so `DO $$ BEGIN EXECUTE 'UPDATE email_outbox SET ...'; END $$;` passed both halves: it is a
-  // DO block, and its UPDATE sat inside a blanked literal. A verb blacklist cannot be repaired for this —
-  // EXECUTE, PERFORM of a mutating function, a dollar-quoted body and a call to a procedure are all ways
-  // to mutate without the verb appearing where it can be read. So the whole pre-transaction slice, with
-  // comments dropped, literal contents blanked and whitespace collapsed, must EQUAL the read-only
-  // refusal token for token. Anything added before BEGIN — dynamic SQL, a second DO block, a PERFORM, a
-  // statement after the block — changes the token stream and fails. Editing the guard's own SQL is
-  // meant to fail here too: that is the moment somebody should re-read what runs before the transaction.
-  const PRE_TRANSACTION_SKELETON = [
-    'DO $$ DECLARE ambiguous text; BEGIN',
-    `SELECT string_agg(format('', kind, "referenceType", "referenceId", n), '') INTO ambiguous`,
-    'FROM ( SELECT kind, "referenceType", "referenceId", count(*) AS n FROM "email_outbox"',
-    `WHERE status = '' AND "referenceType" IS NOT NULL AND "referenceId" IS NOT NULL`,
-    'GROUP BY kind, "referenceType", "referenceId" HAVING count(*) > 1 ) ambiguous_groups;',
-    `IF ambiguous IS NOT NULL THEN RAISE EXCEPTION '', ambiguous USING DETAIL = '', HINT = ''; END IF;`,
-    'END $$;',
-  ].join(' ')
-  assert.equal(
-    beforeTransaction.replace(/\s+/g, ' '),
-    PRE_TRANSACTION_SKELETON,
-    'what runs before the migration opens its transaction is no longer EXACTLY the read-only refusal. '
-    + 'Anything else there (dynamic SQL via EXECUTE, a PERFORM, a second DO block, any statement) runs '
-    + 'outside the all-or-nothing transaction, and a verb check cannot see a mutation carried inside a '
-    + 'string that EXECUTE runs (r38, Codex r37 HIGH)',
+  // ASSERTED AS BYTES, AGAINST A PINNED COPY (r40). Rounds 37-39 each asserted this property through a
+  // parser of the region, and each parser diverged from PostgreSQL's lexer somewhere an attacker could
+  // reach: verbs hidden inside blanked literals, a `--` inside a multiline string deleting the line that
+  // carried an EXECUTE, and an escape-string divergence that swallowed a `CREATE TABLE` outright. There
+  // is no version of that idea worth defending here, because the region is a FIXED FILE: it cannot vary
+  // legitimately, so the honest assertion is that it is UNCHANGED, byte for byte, and the diff below is
+  // what a reviewer reads when it is not. See the block over `PRE_TRANSACTION_FIXTURE` for the full
+  // history and for what this costs.
+  const beforeTransaction = normaliseForByteComparison(FENCE_MIGRATION_SQL.slice(0, begin))
+  const pinned = normaliseForByteComparison(readFileSync(PRE_TRANSACTION_FIXTURE, 'utf8'))
+
+  // A pin that had been emptied, truncated to the comment preamble, or reduced to the DO block alone
+  // would still "match" a region edited to match it, so the pin's own shape is asserted first.
+  assert.ok(
+    pinned.length > 10_000,
+    `the pinned pre-transaction text is ${pinned.length} characters, which is not this region — a short `
+    + 'or emptied pin would certify whatever the migration happens to say',
   )
-  for (const mutating of ['ALTER ', 'CREATE ', 'DROP ', 'INSERT ', 'UPDATE ', 'DELETE ', 'LOCK ']) {
+  for (const landmark of ['-- o3d-alnk-sql-block: refuse-ambiguous-processing', 'RAISE EXCEPTION',
+    'USING DETAIL =', 'HINT =', 'END\n$$;', '-- o3d-alnk-sql-block-end']) {
     assert.ok(
-      !beforeTransaction.toUpperCase().includes(mutating),
-      `a ${mutating.trim()} statement runs before the transaction: a refusal would then half-apply `
-      + 'this migration under any runner that sends statements separately',
+      pinned.includes(landmark),
+      `the pinned pre-transaction text does not contain ${JSON.stringify(landmark)}, so it is not a copy `
+      + 'of the region this test is about',
+    )
+  }
+
+  if (beforeTransaction !== pinned) {
+    // A 13 000-character `assert.equal` prints an unreadable diff, so the first differing LINE is
+    // located and shown with its neighbours. The assertion itself is still the byte comparison.
+    const actualLines = beforeTransaction.split('\n')
+    const pinnedLines = pinned.split('\n')
+    let at = 0
+    while (at < actualLines.length && at < pinnedLines.length && actualLines[at] === pinnedLines[at]) at += 1
+    const context = (lines: string[]) => lines.slice(Math.max(0, at - 2), at + 3)
+      .map((line, index) => `${Math.max(1, at - 1) + index}: ${line}`).join('\n')
+    assert.fail(
+      'WHAT RUNS BEFORE THIS MIGRATION OPENS ITS TRANSACTION HAS CHANGED. Everything in this region runs '
+      + 'OUTSIDE the all-or-nothing transaction, so a statement added here can half-apply the migration '
+      + 'and can execute even when the refusal fires. If the change is deliberate, read it as a reviewer '
+      + 'would and copy the region into tests/fixtures/email-outbox-claim-fence-pre-transaction.sql in '
+      + `the same commit.\n\nFirst difference at line ${at + 1}.\n\n--- pinned\n${context(pinnedLines)}`
+      + `\n\n+++ migration\n${context(actualLines)}`,
     )
   }
 
