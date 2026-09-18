@@ -2259,7 +2259,10 @@ test('[o3d-z5be] a commit that could not be made durable is reported as a refusa
  *  publish nothing) and run `program` with IMS_SCRIPT_LIB_DIR pinned at `runningLib`. */
 function withGuardLibrary(runningLib: string, program: string) {
   const out = spawnSync('bash', ['-c', [
-    'set -uo pipefail',
+    // `-e` LIKE PRODUCTION (o3d-z5be r9, review LOW 13): all three entrypoints run `set -euo pipefail`,
+    // and a rig without `-e` measures a shell that differs from them in exactly the option this project
+    // has twice been bitten by — a refusal path that only ends the run because of `-e` would look fine.
+    'set -euo pipefail',
     `source ${JSON.stringify(join(REPO, FENCE_LIB_REL))}`,
     `source ${JSON.stringify(join(REPO, LIB_REL))}`,
     `IMS_SCRIPT_LIB_DIR=${JSON.stringify(runningLib)}`,
@@ -2452,7 +2455,8 @@ function shellCommands(line: string): string[][] {
       i = close === -1 ? line.length : close + 1
       continue
     }
-    if (c === '"' || c === '`' || (c === '$' && line[i + 1] === '(')) {
+    if (c === '"' || c === '`' || (c === '$' && line[i + 1] === '(')
+      || ((c === '<' || c === '>') && line[i + 1] === '(')) {
       // A quoted span, a backtick, or a substitution: scan it, and recurse into the parts of it that are
       // COMMANDS. Quoting is dropped from the word; a nested command becomes its own entry.
       const { text, inner, next } = scanSpan(line, i)
@@ -2464,7 +2468,11 @@ function shellCommands(line: string): string[][] {
     if (c === ' ' || c === '\t') { endWord(); i += 1; continue }
     if (c === ';' || c === '\n') { endCommand(); i += 1; continue }
     if (c === '|' || c === '&') { endCommand(); i += line[i + 1] === c ? 2 : 1; continue }
-    if ((c === '(' || c === '{' || c === ')' || c === '}') && !hasWord) { endCommand(); i += 1; continue }
+    // `)` ENDS A COMMAND EVEN AFTER A WORD (review MEDIUM 1): in `APP_DIR) chown -R …` the pattern and
+    // its `)` are not part of the command that follows, and r8 read `APP_DIR)` as the command name. The
+    // three entrypoints hold 52 same-line case arms, including the one in the gate this test asserts.
+    if (c === ')') { endCommand(); i += 1; continue }
+    if ((c === '(' || c === '{' || c === '}') && !hasWord) { endCommand(); i += 1; continue }
     word += c; hasWord = true; i += 1
   }
   endCommand()
@@ -2473,10 +2481,44 @@ function shellCommands(line: string): string[][] {
   // without flagging every privilege-dropping `runuser -u imsapp -- npm ci` as a tree operation.
   for (const words of [...commands]) {
     const { name, args } = commandName(words)
+    if (name === 'trap') {
+      // `trap 'chown -R …' EXIT`: the handler is shell, quoted. Read it (review MEDIUM 6's list).
+      for (const nested of shellCommands(args[0] ?? '')) commands.push(nested)
+      continue
+    }
     if (!SHELL_RUNNERS.has(name)) continue
-    const script = name === 'eval' ? args.join(' ') : args[args.findIndex((a) => a === '-c') + 1]
     if (args.includes('-c') || name === 'eval') {
+      const script = name === 'eval' ? args.join(' ') : args[args.findIndex((a) => a === '-c') + 1]
       for (const nested of shellCommands(script ?? '')) commands.push(nested)
+      continue
+    }
+    // AND A RUNNER WITH NO `-c` STILL RUNS SOMETHING (review MEDIUM 2). `sudo chown -R …` and
+    // `runuser -u root -- chown -R …` were invisible, and the negative control for
+    // `runuser -u imsapp -- npm ci` passed because NOTHING was read — an adjacent property in the very
+    // test that claims payloads are read. The options are skipped and the rest is the payload.
+    if (name === 'su' || name === 'sudo' || name === 'runuser') {
+      let k = 0
+      let separated = false
+      let named = false
+      while (k < args.length) {
+        const a = args[k]
+        if (a === '--') { k += 1; separated = true; break }
+        if (a === '-') { k += 1; continue }
+        if (/^--[A-Za-z-]+=/.test(a)) { k += 1; continue }
+        if (/^-[A-Za-z-]/.test(a)) {
+          const takesValue = ['-u', '-g', '-G', '-s', '--user', '--group', '--shell'].includes(a)
+          if (takesValue && ['-u', '--user'].includes(a)) named = true
+          k += takesValue ? 2 : 1
+          continue
+        }
+        break
+      }
+      let payload = args.slice(k)
+      // `su`/`runuser` take the account as an operand unless `-u` named it; `sudo` does not.
+      if (!separated && !named && (name === 'su' || name === 'runuser')) payload = payload.slice(1)
+      if (payload[0] === '--') payload = payload.slice(1)
+      // `su imsapp -c …` is handled above; `su imsapp` alone runs a login shell, which is not a payload.
+      if (payload.length > 1 || (payload.length === 1 && /[/]/.test(payload[0]))) commands.push(payload)
     }
   }
   return commands
@@ -2600,7 +2642,8 @@ function treeWide(words: string[], extra: ReadonlySet<string>, aliases: Readonly
 /** `CH=chown` … `$CH -R …`: a variable assigned a tree-wide command NAME is resolved at its use. */
 function commandAliases(source: string): Map<string, string> {
   const aliases = new Map<string, string>()
-  for (const m of source.matchAll(/^\s*([A-Za-z_][A-Za-z0-9_]*)=["']?([A-Za-z0-9_./-]+)["']?\s*$/gm)) {
+  // `declare -x CH=chown` and `readonly CH=chown` are assignments too (review LOW 12).
+  for (const m of source.matchAll(/^\s*(?:(?:declare|readonly|export|local)\s+(?:-[A-Za-z]+\s+)?)?([A-Za-z_][A-Za-z0-9_]*)=["']?([A-Za-z0-9_./-]+)["']?\s*$/gm)) {
     const base = m[2].replace(/^.*\//, '')
     if (['chown', 'chmod', 'chgrp', 'rsync', 'cp', 'rm', 'mv', 'find', 'xargs', 'setfacl', 'tar', 'install', 'useradd'].includes(base)) {
       aliases.set(m[1], base)
@@ -2609,20 +2652,54 @@ function commandAliases(source: string): Map<string, string> {
   return aliases
 }
 
+/** Does this guard line's refusal END THE RUN? Only the two shipped shapes count. A predicate that
+ *  merely FINDS `die` on the line is satisfied by `guard || warn "…" || die "…"` (which continues,
+ *  because `warn` succeeds) and by `guard || { echo "die trying"; }` (the word, in a message), and it
+ *  is defeated by a pipeline `guard | cat || die` unless `pipefail` is set (review MEDIUM 3). */
+function refusalEndsRun(text: string): boolean {
+  const call = /^privileged_spare_running_tree "[^"]*" "[^"]*" \|\| (.*)$/.exec(text.trim())
+  if (!call) return false
+  return /^die "[^"]*"$/.test(call[1])
+    || /^\{ rm -rf "\$\{TMP_CLONE_DIR\}"; die "[^"]*"; \}$/.test(call[1])
+}
+
+/** The SHELL of a line, for the census: a bare definition HEAD contributes nothing, every other line —
+ *  a one-line definition included — itself. r8 skipped any line that STARTED a definition, which threw
+ *  the body of `fix() { chown -R … ; }` away (review HIGH 1); the tokeniser reads that body without help
+ *  (measured by mutation: extracting it separately changed nothing). What is load-bearing is the HEAD:
+ *  `fix_own () {`, `function fix_own {` or `fix_own ()` read as shell is a CALL to fix_own, a census row
+ *  for a statement that does not exist (measured: 3 rows instead of 2). */
+function functionBody(text: string): string {
+  if (new RegExp(`^${DEFINITION_HEAD}\\s*\\{?\\s*$`).test(text)) return ''
+  return text
+}
+
+/** The head of a bash function definition: `function NAME`, `function NAME ()` or `NAME ()`. A bare
+ *  `NAME {` is NOT one (it runs a command called NAME with an argument `{`), so it is not accepted. */
+const DEFINITION_HEAD = String.raw`\s*(?:function\s+([A-Za-z_][A-Za-z0-9_]*)\s*(?:\(\s*\))?|([A-Za-z_][A-Za-z0-9_]*)\s*\(\s*\))`
+
 /** Physical lines joined on backslash-continuations, keeping the number of the FIRST line: a matcher
- *  that reads one physical line at a time cannot see `chown \` + `  -R …` (review MEDIUM 1). */
+ *  that reads one physical line at a time cannot see `chown \` + `  -R …` (review MEDIUM 1). HEREDOC
+ *  BODIES ARE SKIPPED (review LOW 7): they are data, and r8 tokenised them as code, so a document that
+ *  quoted a `chown -R` produced a census row for a statement that does not exist. */
 function logicalLines(source: string): Array<{ n: number; text: string }> {
   const out: Array<{ n: number; text: string }> = []
   const lines = source.split('\n')
   for (let i = 0; i < lines.length; i += 1) {
     if (/^\s*#/.test(lines[i]) || lines[i].trim() === '') continue
     let text = lines[i]
-    let n = i + 1
+    const n = i + 1
     while (/\\$/.test(text) && i + 1 < lines.length) {
       i += 1
       text = `${text.replace(/\\$/, ' ')}${lines[i]}`
     }
     out.push({ n, text })
+    const heredoc = /<<-?\s*['"]?([A-Za-z_][A-Za-z0-9_]*)['"]?/.exec(text)
+    if (heredoc) {
+      const terminator = new RegExp(`^\\s*${heredoc[1]}\\s*$`)
+      while (i + 1 < lines.length && !terminator.test(lines[i + 1])) i += 1
+      i += 1
+    }
   }
   return out
 }
@@ -2634,9 +2711,27 @@ function treeWideFunctions(source: string): Set<string> {
   const bodies = new Map<string, string[]>()
   let current: string | null = null
   let depth = 0
+  let pending: string | null = null
   for (const raw of lines) {
-    const opening = /^([A-Za-z_][A-Za-z0-9_]*)\(\)\s*\{\s*$/.exec(raw)
-    if (!current && opening) { current = opening[1]; bodies.set(current, []); depth = 1; continue }
+    // `NAME ()` ALONE, WITH THE BRACE ON THE NEXT LINE, is a definition too (found by r9's own call-site
+    // assertion: the census counted that body's statements directly, so its COUNT was right, but the
+    // function was never registered and a call to it was not followed).
+    if (!current && pending && /^\s*\{\s*$/.test(raw)) { current = pending; pending = null; bodies.set(current, []); depth = 1; continue }
+    pending = null
+    const head = new RegExp(`^${DEFINITION_HEAD}\\s*$`).exec(raw)
+    if (!current && head) { pending = head[1] ?? head[2]; continue }
+    // A ONE-LINE DEFINITION IS A DEFINITION (o3d-z5be r9, review HIGH 1). `fix() { chown -R … ; }` is the
+    // house idiom in these very files (17 of them across the three), and r8 registered a function only
+    // when the brace was LAST on the line — so the body was never read and every call to it was
+    // invisible, while the documentation said such calls were followed.
+    const oneLine = new RegExp(`^${DEFINITION_HEAD}\\s*\\{(.*)\\}\\s*;?\\s*$`).exec(raw)
+    if (!current && oneLine && oneLine[3].trim() !== '') {
+      const name = oneLine[1] ?? oneLine[2]
+      bodies.set(name, [...(bodies.get(name) ?? []), oneLine[3]])
+      continue
+    }
+    const opening = new RegExp(`^${DEFINITION_HEAD}\\s*\\{\\s*$`).exec(raw)
+    if (!current && opening) { current = opening[1] ?? opening[2]; bodies.set(current, []); depth = 1; continue }
     if (current) {
       bodies.get(current)!.push(raw)
       if (/^\}/.test(raw)) { depth -= 1; if (depth === 0) current = null }
@@ -2661,21 +2756,29 @@ test('[o3d-z5be] REGRESSION NET: every tree-wide ownership change, copy, move or
   // WHAT THIS IS AND IS NOT (o3d-z5be r8, review HIGH 1/2). It is a REGRESSION NET over the shapes the
   // tokeniser above can classify. WHAT CARRIES THE PROPERTY is the guard made immediately before each
   // such statement, in all three entrypoints; this test is what keeps those guards in place and fails on
-  // a new statement until somebody decides which row it is. A statement built out of something this
-  // reader cannot resolve — a command name computed at run time, a helper defined in another file — is
-  // invisible to it, and that is why the claim in docs/installation.md is about the guards.
+  // a new statement until somebody decides which row it is.
+  //
+  // WHAT IT CANNOT SEE, MEASURED RATHER THAN IMAGINED (r9, review MEDIUM 6). Each of these was injected
+  // into a copy of the real install.sh and left the count at 25: a command name computed at run time
+  // (`c=ch; ${c}own -R …`), a name held in an ARRAY (`CMD=(chown -R); "${CMD[@]}"`), a default expansion
+  // (`${CH:-chown}`), and a helper defined in ANOTHER FILE. r8's concession named only the first and the
+  // last while FIVE more shapes were invisible — a one-line function definition and every call to it, a
+  // `case` arm body, a `sudo`/`runuser`/`su` payload without `-c`, a process substitution and a `trap`
+  // handler — all of which the positive list below now asserts, each verified to move the count.
   //
   // r7's version STRIPPED double-quoted spans before matching, with a regex that is not nesting-aware:
   // on `out="$(chown -R … )"` the opening quote paired with the first quote inside the substitution and
   // the command name went with it. That idiom appears throughout these files. It tokenises now.
   type Entry = { file: string; op: RegExp; guard: string | null; up?: number; why?: string }
   const G = (target: string) => `privileged_spare_running_tree "${target}" `
-  const MKTEMP = 'the clone directory this run made with `mktemp -d -t`, which cannot be the running tree'
+  // `mktemp -d -t` honours TMPDIR, which the operator controls, so this says what is true: the run made
+  // the directory itself, after its own entrypoint was already open (review LOW 11).
+  const MKTEMP = 'the clone directory this run itself made with `mktemp -d -t`, after its entrypoint was open'
   const CLEANUP = 'the guard\'s own failure branch removes that same mktemp clone directory'
   const PUBLISH = 'publish_durable_file/crontab backup: a rename of ONE staged file onto ONE target, not a tree'
   const HELPER = 'migrate_uploads guards its own `find … -exec mv` immediately before it (install.sh)'
   const table: Entry[] = [
-    ...Array.from({ length: 3 }, () => ({ file: 'scripts/install.sh', op: /^\s*if ! mv -f|^\s*if ! mv -f -T/, guard: null, why: PUBLISH })),
+    ...Array.from({ length: 3 }, () => ({ file: 'scripts/install.sh', op: /^\s*if ! mv -f (?:-T )?"\$\{?tmp\}?" /, guard: null, why: PUBLISH })),
     { file: 'scripts/install.sh', op: /^  useradd --system/, guard: G('${APP_DIR}') },
     { file: 'scripts/install.sh', op: /^    find "\$\{src\}" -mindepth 1/, guard: G('${src}'), up: 2 },
     ...Array.from({ length: 4 }, () => ({ file: 'scripts/install.sh', op: /^migrate_uploads "/, guard: null, why: HELPER })),
@@ -2691,7 +2794,7 @@ test('[o3d-z5be] REGRESSION NET: every tree-wide ownership change, copy, move or
     { file: 'scripts/install.sh', op: /^    copy_tree_into_new_dir "\$\{TMP_CLONE_WORKTREE\}\/\.git"/, guard: G('${APP_DIR}/.git') },
     { file: 'scripts/install.sh', op: /^    chown -R "\$\{APP_USER\}:\$\{APP_USER\}" "\$\{APP_DIR\}\/\.git"$/, guard: G('${APP_DIR}/.git') },
     { file: 'scripts/install.sh', op: /^    rm -rf "\$\{TMP_CLONE_DIR\}"$/, guard: null, why: MKTEMP },
-    ...Array.from({ length: 3 }, () => ({ file: 'scripts/update.sh', op: /^\s*if ! mv -f|^\s*if ! mv -f -T/, guard: null, why: PUBLISH })),
+    ...Array.from({ length: 3 }, () => ({ file: 'scripts/update.sh', op: /^\s*if ! mv -f (?:-T )?"\$\{?tmp\}?" /, guard: null, why: PUBLISH })),
     ...Array.from({ length: 3 }, () => ({ file: 'scripts/update.sh', op: /^\s*privileged_spare_running_tree .*\|\| \{ rm -rf "\$\{TMP_CLONE_DIR\}"/, guard: null, why: CLEANUP })),
     { file: 'scripts/update.sh', op: /^    rsync -a --delete/, guard: G('${APP_DIR}') },
     { file: 'scripts/update.sh', op: /^    copy_tree_into_new_dir "\$\{TMP_CLONE_WORKTREE\}\/\.git"/, guard: G('${APP_DIR}/.git') },
@@ -2699,16 +2802,17 @@ test('[o3d-z5be] REGRESSION NET: every tree-wide ownership change, copy, move or
     { file: 'scripts/update.sh', op: /^    rm -rf "\$\{TMP_CLONE_DIR\}"$/, guard: null, why: MKTEMP },
     { file: 'scripts/update.sh', op: /^  mv "\$\{BACKUP_PARTIAL\}" "\$\{BACKUP_TARGET\}"$/, guard: null, why: 'one finished dump file renamed onto its final name, not a tree' },
     { file: 'scripts/update.sh', op: /^  ls -t "\$\{BACKUP_DIR\}"\/pre-update-\*\.sql\.gz .*xargs -r rm --$/, guard: G('${BACKUP_DIR}') },
-    ...Array.from({ length: 3 }, () => ({ file: 'scripts/deploy.sh', op: /^\s*if ! mv -f|^\s*if ! mv -f -T/, guard: null, why: PUBLISH })),
+    ...Array.from({ length: 3 }, () => ({ file: 'scripts/deploy.sh', op: /^\s*if ! mv -f (?:-T )?"\$\{?tmp\}?" /, guard: null, why: PUBLISH })),
   ]
   for (const rel of ENTRYPOINTS) {
     const source = ENTRYPOINT_SOURCE.get(rel)!
     const functions = treeWideFunctions(source)
     const aliases = commandAliases(source)
     const lines = logicalLines(source)
-    const ops = lines.map((line, index) => ({ ...line, index }))
-      .filter((line) => !/^\s*[A-Za-z_][A-Za-z0-9_]*\(\)\s*\{/.test(line.text))
-      .filter((line) => shellCommands(line.text).some((words) => treeWide(words, functions, aliases)))
+    // A DEFINITION LINE IS NOT SKIPPED, ITS WRAPPER IS STRIPPED (review HIGH 1). r8 dropped any line
+    // starting a function definition, which threw away the BODY of a one-line definition with it.
+    const ops = lines.map((line, index) => ({ ...line, index, statement: functionBody(line.text) }))
+      .filter((line) => shellCommands(line.statement).some((words) => treeWide(words, functions, aliases)))
     const expected = table.filter((entry) => entry.file === rel)
     assert.equal(ops.length, expected.length,
       `${rel}: the census must account for every classified statement, found ${ops.length} and the table has ${expected.length}:\n${ops.map((op) => `${op.n}: ${op.text.trim().slice(0, 110)}`).join('\n')}`)
@@ -2726,16 +2830,31 @@ test('[o3d-z5be] REGRESSION NET: every tree-wide ownership change, copy, move or
           assert.match(before[before.length - 1].text.trim(), /^TMP_CLONE_DIR="\$\(mktemp -d -t [A-Za-z.-]+XXXXXX\)"$/,
             `${rel}:${op.n}: the nearest preceding assignment must be the mktemp that justifies it: ${before[before.length - 1].text}`)
         }
+        if (entry.why === PUBLISH) {
+          // NOT WAVED THROUGH ON THE SHAPE OF THE LINE (review LOW 8): the exemption is that ONE staged
+          // FILE is renamed, so the source's own nearest assignment must be a `mktemp` with no `-d`. A
+          // future publish that staged a DIRECTORY fails here instead of inheriting the reason. It sits
+          // INSIDE this branch, before its `continue`: r9's first draft put it after, where no PUBLISH row
+          // (all unguarded) ever reached it, and its mutation — a publish staging a directory — stayed green.
+          const source = /mv -f (?:-T )?"\$\{?([A-Za-z_][A-Za-z0-9_]*)\}?"/.exec(op.text)
+          assert.ok(source, `${rel}:${op.n}: an exempt publish must move a named staging variable: ${op.text.trim()}`)
+          const made = lines.slice(0, op.index).filter((line) => new RegExp(`(^|[\\s;(!])${source![1]}=`).test(line.text))
+          assert.ok(made.length > 0, `${rel}:${op.n}: no assignment of ${source![1]} precedes this move`)
+          const nearest = made[made.length - 1].text
+          assert.match(nearest, new RegExp(`${source![1]}="\\$\\(mktemp (?!-d)`),
+            `${rel}:${op.n}: ${source![1]} must be a single mktemp FILE for the publish exemption, and is: ${nearest.trim()}`)
+        }
         continue
       }
       const previous = lines[op.index - (entry.up ?? 1)]
       assert.ok(previous?.text.trim().startsWith(entry.guard),
         `${rel}:${op.n} (${op.text.trim().slice(0, 80)}) must be immediately preceded by ${entry.guard}…, and is preceded by: ${previous?.text}`)
-      // AND THE REFUSAL MUST END THE RUN (o3d-z5be r8, review MEDIUM 2). r7 checked only that the call
-      // was there: `privileged_spare_running_tree … || warn "…"`, `|| true`, or a discarded status all
-      // satisfied it while the chown ran anyway — a guard that cannot fail, in the test whose whole job
-      // is keeping these guards load-bearing.
-      assert.match(previous.text, /\|\| (die\b|\{[^\n]*\bdie\b)/,
+      // AND THE REFUSAL MUST END THE RUN (o3d-z5be r8/r9). r7 checked only that the call was there, so
+      // `|| warn "…"` or `|| true` satisfied it while the chown ran anyway. r8's regex was still
+      // satisfiable by a run that CONTINUES: `guard || warn "overlap" || die "…"` reaches `die` never
+      // (warn succeeds), and `guard || { echo "die trying"; }` matched the word inside a message
+      // (review MEDIUM 3, both executed). So the whole line must be one of the two shipped shapes.
+      assert.ok(refusalEndsRun(previous.text),
         `${rel}:${previous.n}: the guard's refusal must end the run (|| die …), and the line is: ${previous.text.trim()}`)
     }
   }
@@ -2781,9 +2900,64 @@ test('[o3d-z5be] REGRESSION NET: every tree-wide ownership change, copy, move or
     'command chown -R "${APP_USER}" "${APP_DIR}"',
     'setfacl -R -m u:imsapp:rwx "${APP_DIR}"',
     'chgrp --recursive imsapp "${APP_DIR}"',
+    // r9 (review HIGH 1, MEDIUM 1/2/5): shapes r8 read as NOTHING. The first is the house idiom — the
+    // three entrypoints hold 17 one-line definitions and 52 same-line case arms of their own.
+    'fix_own() { chown -R "${APP_USER}" "${APP_DIR}"; }',
+    'function fix_own() { chown -R "${APP_USER}" "${APP_DIR}"; }',
+    // no parentheses: only functionBody() separates the body from `function NAME {` here, because a
+    // `{` after a word is a word — this is the form that makes that helper load-bearing.
+    'function fix_own { chown -R "${APP_USER}" "${APP_DIR}"; }',
+    '  APP_DIR) chown -R imsapp "${APP_DIR}" ;;',
+    'sudo chown -R "${APP_USER}" "${APP_DIR}"',
+    'sudo -u root chown -R "${APP_USER}" "${APP_DIR}"',
+    'runuser -u root -- chown -R "${APP_USER}" "${APP_DIR}"',
+    'su - root -- chown -R "${APP_USER}" "${APP_DIR}"',
+    'diff <(chown -R imsapp "${APP_DIR}") /dev/null',
+    'tee >(chown -R imsapp "${APP_DIR}")',
+    "trap 'chown -R imsapp \"${APP_DIR}\"' EXIT",
   ]) {
     assert.ok(seen(form.replace(/\\\n/g, ' ')), `the net must see: ${form}`)
   }
+  // AND THE CALL, NOT ONLY THE BODY (review HIGH 1). Reading a one-line definition's body proves the
+  // definition line is counted; the reviewer's finding was that its CALLS vanished too, because the
+  // function was never registered. Each definition form is registered, and the bare call is tree-wide.
+  for (const definition of [
+    'fix_own() { chown -R "${APP_USER}" "${APP_DIR}"; }',
+    'function fix_own { chown -R "${APP_USER}" "${APP_DIR}"; }',
+    'fix_own() {\n  chown -R "${APP_USER}" "${APP_DIR}"\n}',
+    'fix_own ()\n{\n  chown -R "${APP_USER}" "${APP_DIR}"\n}',
+  ]) {
+    const functions = treeWideFunctions(`${definition}\nfix_own\n`)
+    assert.ok(functions.has('fix_own'), `the net must register: ${definition}`)
+    assert.ok(shellCommands('fix_own').some((w) => treeWide(w, functions, new Map())),
+      `and see a call to it: ${definition}`)
+  }
+  // AND A DEFINITION IS NOT A CALL OF ITSELF: body + call = exactly two rows in every form, the way the
+  // census counts them (functionBody, then the tokeniser). Without functionBody three of these are 3.
+  for (const definition of [
+    'fix_own() {\n  chown -R "${APP_USER}" "${APP_DIR}"\n}',
+    'fix_own () {\n  chown -R "${APP_USER}" "${APP_DIR}"\n}',
+    'function fix_own {\n  chown -R "${APP_USER}" "${APP_DIR}"\n}',
+    'fix_own ()\n{\n  chown -R "${APP_USER}" "${APP_DIR}"\n}',
+    'function fix_own { chown -R "${APP_USER}" "${APP_DIR}"; }',
+  ]) {
+    const source = `${definition}\nfix_own\n`
+    const functions = treeWideFunctions(source)
+    const rows = logicalLines(source).filter((line) => shellCommands(functionBody(line.text)).some((w) => treeWide(w, functions, new Map())))
+    assert.equal(rows.length, 2, `body and call, not the head: ${definition} -> ${rows.map((r) => r.text).join(' | ')}`)
+  }
+  // A ONE-LINE HELPER THAT IS NOT TREE-WIDE stays unregistered, or every `die` call would be a row.
+  assert.ok(!treeWideFunctions('die() { error "$*"; exit 1; }\ndie x\n').has('die'), 'die() is not tree-wide')
+
+  // An alias needs both lines, so it is asserted over a two-line source (review LOW 12: r8 resolved
+  // only a bare `NAME=value`, while `declare -x`/`readonly` are assignments of a command name too).
+  for (const alias of ['readonly CH=chown', 'declare -x CH=chown', 'CH=chown']) {
+    const source = `${alias}\n$CH -R "${'${APP_USER}'}" "${'${APP_DIR}'}"\n`
+    const aliases = commandAliases(source)
+    assert.ok(shellCommands('$CH -R "${APP_USER}" "${APP_DIR}"').some((w) => treeWide(w, new Set(), aliases)),
+      `the net must resolve the alias in: ${alias}`)
+  }
+
   // The continuation form goes through logicalLines() first, which is how the matcher sees it at all.
   assert.equal(logicalLines('chown \\\n  -R "${APP_USER}" "${APP_DIR}"').length, 1, 'continuations must be joined into one logical line')
 
@@ -2796,18 +2970,42 @@ test('[o3d-z5be] REGRESSION NET: every tree-wide ownership change, copy, move or
     'rm -f "$tmp"',
     'chown root:root "$DB_ENV_SNAPSHOT_FILE" 2>/dev/null || true',
     'chmod 600 "$tmp"',
+    // FOR THE RIGHT REASON NOW (review MEDIUM 2): r8 did not read a runner's payload unless it carried
+    // `-c`, so this control passed while `npm ci` was never looked at — it would have passed identically
+    // if the payload were `chown -R /`. The positive list above now contains that very shape.
     'runuser -u "$APP_USER" -- npm ci',
     'sudo -u "$user" "$@"',
     'run_as_user "${APP_USER}" git -C "${APP_DIR}" fetch origin',
   ]) {
     assert.ok(!seen(quiet), `the net must NOT fire on: ${quiet}`)
   }
+
+  // AND THE REFUSAL PREDICATE ITSELF, on the shapes that defeated r8's regex. Both rejected shapes were
+  // EXECUTED by the reviewer under `set -euo pipefail` and the run CONTINUED past the failing guard.
+  const GUARD_CALL = 'privileged_spare_running_tree "${APP_DIR}" "the application directory"'
+  for (const ends of [
+    `${GUARD_CALL} || die "${'${IMS_DRIVER_OVERLAP_REASON}'}"`,
+    `    ${GUARD_CALL} || { rm -rf "${'${TMP_CLONE_DIR}'}"; die "${'${IMS_DRIVER_OVERLAP_REASON}'}"; }`,
+  ]) assert.ok(refusalEndsRun(ends), `this refusal does end the run: ${ends}`)
+  for (const continues of [
+    `${GUARD_CALL} || warn "overlap" || die "stop"`,
+    `${GUARD_CALL} || { echo "die trying"; }`,
+    `${GUARD_CALL} || true`,
+    `${GUARD_CALL} || die_later "stop"`,
+    `${GUARD_CALL} || ( die "stop" )`,
+    `${GUARD_CALL} | cat || die "stop"`,
+    `${GUARD_CALL}`,
+  ]) assert.ok(!refusalEndsRun(continues), `this refusal does NOT end the run: ${continues}`)
 })
 
 test('[o3d-z5be] install.sh asks the same question at configuration time, before any package is installed and before the account exists', () => {
   // review HIGH 2.1: nothing tested this gate, while the documentation asserted its position. It is an
   // EARLY REFUSAL — the property is carried by the per-operation guards — but "runs before apt-get and
   // before useradd" is a claim about statement order, so it is asserted as one.
+  // THIS IS TEXT ORDER, NOT EXECUTION ORDER (r9, review LOW 9), and deliberately so: it does not run the
+  // gate, so a legitimate reordering that keeps the property would fail it and have to be re-argued
+  // here. That direction is the safe one; the direction that matters — does the guard actually refuse —
+  // is measured by execution in the withGuardLibrary tests above.
   const source = ENTRYPOINT_SOURCE.get('scripts/install.sh')!
   const code = codeLines(source).filter((line) => line.text.trim() !== '')
   const at = (re: RegExp) => {
@@ -2837,20 +3035,39 @@ test('[o3d-z5be] install.sh asks the same question at configuration time, before
   assert.match(doc, /nearest existing ancestor/, 'and say what it can compare against on a first install')
   assert.ok(!doc.includes('Because that gate covers the whole run, it holds for operations no list enumerates'),
     'and must not claim the gate covers the whole run')
-  // AND NO FILE MAY STILL CLAIM THE CENSUS IS UNIVERSAL (review HIGH 2, third part).
-  for (const [where, text] of [
+  // AND NO FILE MAY STILL CLAIM THE CENSUS IS UNIVERSAL (review HIGH 2, third part). CASE-INSENSITIVE
+  // AND OVER ALL SIX FILES THAT INSTRUCT AN OPERATOR (r9, review LOW 1/2): r8 read three of them and
+  // compared case-sensitively, forty lines above the relabel sweep that is deliberately case-insensitive
+  // BECAUSE one capital letter defeated r6's version — the same shape, repeated. r8 also carried a
+  // phrase that appears in NO commit of this branch (review LOW 3): an entry that cannot fail, counted
+  // in a report as a sentence fixed. Every entry below was the literal text of a shipped file at
+  // b68706c4 or earlier, and the positive control underneath proves the sweep can still fail.
+  const universality = [
+    'THE CALL EVERY RECURSIVE OWNERSHIP CHANGE, COPY OR DELETE IN AN ENTRYPOINT IS PRECEDED BY',
+    'asked before every recursive ownership change, recursive copy',
+    'the census in tests/scripts/privileged-helper-set.test.ts holds\n# every recursive operation to',
+    'MOVE OR DELETE THE CENSUS KNOWS ABOUT: it refuses when',
+    'delete**, in all three entrypoints: the target and the directory the running script lives in',
+    'AS WELL AS AT EACH OPERATION BELOW',
+    'hold every such statement to the same rule',
+  ]
+  const sweptFiles: Array<[string, string]> = [
     [LIB_REL, LIB_SOURCE],
-    ['scripts/install.sh', source],
+    [FENCE_LIB_REL, readFileSync(join(REPO, FENCE_LIB_REL), 'utf8')],
     ['docs/installation.md', doc],
-  ] as const) {
-    for (const stale of [
-      'THE CALL EVERY RECURSIVE OWNERSHIP CHANGE, COPY OR DELETE IN AN ENTRYPOINT IS PRECEDED BY',
-      'asked before every recursive ownership change, recursive copy',
-      'the census in tests/scripts/privileged-helper-set.test.ts holds\n# every recursive operation to',
-      'is preceded by a check that the target and',
-    ]) {
-      assert.ok(!text.includes(stale), `${where} must no longer claim universality: "${stale}"`)
+    ...ENTRYPOINTS.map((rel) => [rel, ENTRYPOINT_SOURCE.get(rel)!] as [string, string]),
+  ]
+  assert.equal(sweptFiles.length, 6, 'precondition: every file that could carry such a claim was read')
+  for (const [where, text] of sweptFiles) {
+    const lowered = text.toLowerCase()
+    for (const stale of universality) {
+      assert.ok(!lowered.includes(stale.toLowerCase()), `${where} must no longer claim universality: "${stale}"`)
     }
+  }
+  // NON-VACUITY: the sweep fires on the sentence it is made of, including on its case.
+  for (const stale of universality) {
+    const planted = `prologue\n${stale.toUpperCase()}\nepilogue`
+    assert.ok(planted.toLowerCase().includes(stale.toLowerCase()), `the sweep cannot detect: ${stale}`)
   }
 })
 
@@ -3124,4 +3341,23 @@ test('[o3d-z5be] an overlap hit says WHICH kind it is: containment in either dir
   const link = ask(join(scripts, 'lib'), linked).stdout
   assert.match(link, /holds a SECOND NAME — a hard link —/, `a hard link must be named as one:\n${link}`)
   assert.doesNotMatch(link, /lies inside/, 'and must not be described as containment')
+
+  // AND THE SECOND ID LIST IS A FRESH FILE (o3d-z5be r9, review LOW 10). The first block removes its
+  // mktemp; r8 left the VARIABLE set, so the second block's `[[ -n … ]]` short-circuited the mktemp that
+  // is plainly written there and privileged_tree_inode_list re-created that unowned name AS ROOT. The
+  // count of temp files this path asks for is exactly the claim, so `mktemp` is wrapped to count — it is
+  // not stubbed: the wrapper calls the real one and returns its path, so the guard's own behaviour is
+  // unchanged and the assertion below still requires the hard link to be reported.
+  const counter = join(base, 'mktemp.log')
+  const counted = withGuardLibrary(join(scripts, 'lib'), [
+    `mktemp() { local p; p="$(command mktemp "$@")" || return 1; echo "$p" >> ${JSON.stringify(counter)}; echo "$p"; }`,
+    `privileged_spare_running_tree ${JSON.stringify(linked)} "the target" 2>&1 | tail -1`,
+  ].join('\n'))
+  assert.match(counted.stdout, /holds a SECOND NAME — a hard link —/, 'precondition: the wrapped run takes the same path')
+  const asked = readFileSync(counter, 'utf8').trim().split('\n').filter((line) => line !== '')
+  assert.equal(new Set(asked).size, asked.length, `every temp file must be its own: ${asked.join(', ')}`)
+  // NINE, MEASURED: the disjointness question walks both ways and asks the kind question twice. With the
+  // variable left set it is EIGHT, because the second kind block reuses the name the first one removed.
+  assert.equal(asked.length, 9, `every temp file this path uses must be asked for: ${asked.join(', ')}`)
+  for (const path of asked) assert.ok(!existsSync(path), `and removes it: ${path}`)
 })

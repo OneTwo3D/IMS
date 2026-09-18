@@ -7503,14 +7503,16 @@ if [[ "$INSTALL_FROM_GIT" == "y" ]]; then
 else
   prompt LOCAL_SOURCE_DIR "Path to local app directory (will be copied)" "/root/ims/onetwoinventory"
 fi
-# THE SOURCE, THE TARGETS AND THE RUNNING TREE MUST BE DISJOINT, AND THAT IS ASKED HERE — BEFORE A PACKAGE
-# IS INSTALLED — AS WELL AS AT EACH OPERATION BELOW (o3d-z5be r6, Codex HIGH 2). Section 9 copies
+# THE SOURCE, THE TARGETS AND THE RUNNING TREE MUST BE DISJOINT. THAT IS ASKED AT EACH OPERATION BELOW,
+# WHICH IS WHAT CARRIES THE PROPERTY, AND — EARLY, SO NOTHING HAS BEEN CHANGED WHEN AN OPERATOR HEARS
+# ABOUT IT — HERE (o3d-z5be r6/r9, Codex HIGH 2, review LOW 4). Section 9 copies
 # LOCAL_SOURCE_DIR into ${APP_DIR} and then `chown -R`s ${APP_DIR} to ${APP_USER}; sections 8 and 9
 # recursively change the ownership of ${DATA_DIR} and ${LOG_DIR} too. Nothing prevented the release
 # being executed from already being ${APP_DIR}, and then that `chown` handed this script's own inode to
 # the application account while bash was still reading it. privileged_trees_disjoint() and
 # privileged_spare_running_tree() compare by device and inode along the walk a recursive operation
-# makes, so neither a symbolic link nor a bind mount can make two overlapping trees look separate. The
+# makes, so neither a symbolic link nor a bind mount can make two overlapping trees look separate.
+#
 # WHAT THESE THREE CALLS ARE, SAID EXACTLY (o3d-z5be r8, review HIGH 2). They are an EARLY REFUSAL, not
 # the thing that carries the property. What carries it is the check made IMMEDIATELY BEFORE each
 # tree-wide operation, in all three entrypoints, which the census in
@@ -8205,8 +8207,8 @@ if ! id "${APP_USER}" &>/dev/null; then
   # `--create-home` CREATES ${APP_DIR} AND GIVES IT TO ${APP_USER} when it does not exist yet, which is
   # a recursive ownership change over that path by another name (o3d-z5be r7, re-audit). The
   # configuration-time gate above has already refused a run whose own tree lies there; this is the same
-  # question asked at the operation, so the census in tests/scripts/privileged-helper-set.test.ts can
-  # hold every such statement to the same rule.
+  # question asked at the operation, so the census in tests/scripts/privileged-helper-set.test.ts holds
+  # it to the same rule as every other statement whose shape that census can classify (review LOW 5).
   privileged_spare_running_tree "${APP_DIR}" "the application directory (about to become ${APP_USER}'s home)" || die "${IMS_DRIVER_OVERLAP_REASON}"
   useradd --system --shell /bin/bash --home-dir "${APP_DIR}" --create-home "${APP_USER}"
   success "System user '${APP_USER}' created."

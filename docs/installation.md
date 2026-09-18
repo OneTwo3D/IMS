@@ -62,7 +62,9 @@ invocations are supported* below for why this is not optional, and why the check
 
 **And no privileged run hands the tree it is running from to another account** (o3d-z5be r6/r7/r8). The
 property is carried by a check made **immediately before each tree-wide ownership change, copy, move or
-delete**, in all three entrypoints: the target and the directory the running script lives in must be
+delete that these scripts make against a tree they did not create**, in all three entrypoints — the three
+exceptions are the deletes of the clone directory a run has just made with `mktemp -d -t` itself, which
+the census lists by line with that reason. The target and the directory the running script lives in must be
 **disjoint** — neither equals, contains nor lies inside the other. Disjoint is decided by **device and
 inode** along the same walk a recursive operation makes, and the set asked about is the running directory
 *and every file under it*, so a symbolic link, a bind mount, or a **hard link** to the entrypoint or a
@@ -74,10 +76,15 @@ line of the three entrypoints (quoting, `$( … )`, backticks, line continuation
 commands like `env`/`command`/`timeout`, and the path form `/bin/chown`), classifies every command it
 finds, and requires its table to account for each one — guarded, with the guard immediately before it
 *and its failure ending the run*, or carrying a written reason. It also follows **calls to functions
-defined in the same file** whose own body contains such a statement. It fails on a new one. It is a
+defined in the same file** whose own body contains such a statement — including a **one-line** definition
+(`fix() { chown -R …; }`, the house idiom here), a `case` arm body, the payload of `sudo`/`runuser`/`su`
+with or without `-c`, a process substitution and a `trap` handler. It fails on a new one. It is a
 **regression net over the shapes it can classify**, not a proof that no unguarded operation can exist:
-a statement built out of something it cannot see — a command name computed at run time, a helper defined
-in another file — is invisible to it, and the guards, not the net, are what the property rests on.
+a statement built out of something it cannot see is invisible to it. That list is
+**measured**, not imagined (r9): a command name computed at run time (`c=ch; ${c}own -R …`), a helper
+defined in another file, a command name held in an **array** (`CMD=(chown -R); "${CMD[@]}"`), and a
+default expansion (`${CH:-chown}`). The guards, not the net, are what the
+property rests on.
 
 `install.sh` **also** asks the same question of `${APP_DIR}`, the state directory and the log directory
 when the configuration is collected, and refuses `LOCAL_SOURCE_DIR` that is equal to, inside or
