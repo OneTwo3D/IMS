@@ -67,7 +67,8 @@ npm run test:db            # RUN_DB_RETENTION_TESTS=1 REQUIRE_DB_RETENTION_TESTS
 
 **Point `DATABASE_URL` at a scratch database you created for the run, never at a shared one.** The
 concurrency tier seeds fixture rows into whatever database the URL reaches. Files that also install
-DDL — currently `pending-asn-disposal-race` and `pending-asn-retirement-commit` — refuse to start,
+DDL — currently `pending-asn-disposal-race` and `pending-asn-retirement-commit`, plus
+`stamp-scratch-database`, which creates and drops sibling databases to exercise the stamper — refuse to start,
 before any connection writes, unless `tests/concurrency/scratch-database-guard.ts` gets a set of FACTS
 from the server that together make an accidental run against a real database hard. None of them is
 proof the database is disposable (see "WHAT A MARKER PROVES" below). All of these must hold:
@@ -84,6 +85,10 @@ proof the database is disposable (see "WHAT A MARKER PROVES" below). All of thes
   `organisations` or `currencies`, in any schema; AND
 * it has no foreign tables at all (partitions included) — they are listed before any table is probed,
   because probing a local parent would read a foreign child or partition on another server; AND
+* no table it probes has a row-level-security policy that applies to the connecting role — the check
+  connects with `row_security=off`, so the server refuses such a probe instead of evaluating the policy
+  (a policy is arbitrary code, and `USING (false)` would otherwise HIDE a `users` row). A superuser, or
+  a role with BYPASSRLS, sees every row and never evaluates a policy; AND
 * the name is not obviously real — `onetwoinventory`, `onetwo3d…`, `postgres…`/`template…`/`pg_…`, or
   anything containing `prod`/`live`, are refused however they are stamped and declared.
 
@@ -104,7 +109,10 @@ excludes nobody who can read a `.env`. What the stamp costs instead is that `npm
 **refuses a database that holds application data** — rows in any table (or materialized view) other
 than the three a fresh `prisma migrate deploy` seeds, and only in the application's own schema
 (`<schema>._prisma_migrations`, `.settings`, `.shopping_status_mappings`, measured 2026-09-17) — or that
-has foreign tables at all. A wrong `DATABASE_URL` supplies none of that.
+has foreign tables at all, or a table whose row-level-security policy applies to the stamper's role. A
+wrong `DATABASE_URL` supplies none of that. Both of its connections run with `row_security=off`, and the
+writer re-runs the data check inside a savepoint made read-only, so the COMMENT is the only statement
+that runs read-write (o3d-zzgp r10).
 
 ```bash
 createdb -O "$PGUSER" ims_scratch_$(date +%s)          # any name that is not refused above
@@ -135,7 +143,7 @@ RESIDUALS, so nobody has to discover them:
 SKIPPED notice otherwise; CI (`fresh-db-drift` in `.github/workflows/schema-guardrails.yml`) stamps and
 declares its own per-run `ims_ci` service database, so the tier is gated on every PR that touches it.
 
-Of the other 32 files (counted 2026-09-18), one — `email-outbox-claim-fence` — runs against a database it
+Of the other 32 files (counted 2026-09-18 on the merged tree), one — `email-outbox-claim-fence` — runs against a database it
 creates itself through `tests/helpers/throwaway-database.ts`; the remaining 31 have no guard yet and seed
 whatever `DATABASE_URL` reaches before checking anything (tracked as o3d-yvn8).
 
@@ -144,7 +152,7 @@ whatever `DATABASE_URL` reaches before checking anything (tracked as o3d-yvn8).
 along with everything else. What they then DO under it differs, and the difference is what you need
 in order to read a green `test:unit` log correctly:
 
-* `tests/concurrency/**` — all 34 files (re-counted 2026-09-18 on the tree merged with #686) gate
+* `tests/concurrency/**` — all 35 files (re-counted 2026-09-18 on the tree merged with #686) gate
   every test on `RUN_DB_CONCURRENCY_TESTS`, so under `test:unit` the tier is collected, reports
   `# SKIP`, and executes nothing.
 * `tests/db/**` — exactly THREE of the eleven files are gated on a `RUN_DB_*` variable, and it is the

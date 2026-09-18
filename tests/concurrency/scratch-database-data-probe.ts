@@ -7,7 +7,7 @@
  * imported by both, keeps the two from answering the question differently.
  *
  * ══════════════════════════════════════════════════════════════════════════════════════════════
- * THREE RULES FOR EVERY STATEMENT THIS MODULE SENDS (o3d-zzgp r9, review MEDIUM-1 and MEDIUM-2)
+ * FOUR RULES FOR EVERY STATEMENT THIS MODULE SENDS (o3d-zzgp r9 MEDIUM-1/-2, r10 MEDIUM-1)
  * ══════════════════════════════════════════════════════════════════════════════════════════════
  *
  *  1. NO CATALOGUE-DERIVED TEXT IS EVER A STRING LITERAL. Round 8 labelled each probe with a
@@ -23,7 +23,8 @@
  *  2. EVERY STATEMENT GOES THROUGH THE EXTENDED PROTOCOL (`queryMode: 'extended'`), whose Parse
  *     message accepts exactly one statement. A string that somehow still carried `;…` would be
  *     rejected by the server rather than run. Callers also pin `-c standard_conforming_strings=on`
- *     in their startup options; that is the third, independent layer, not the fix.
+ *     in their startup options (part of PROBE_SESSION_OPTIONS); that is the third, independent
+ *     layer, not the fix.
  *  3. FOREIGN TABLES ARE ENUMERATED FIRST AND STOP EVERYTHING. Round 8 said foreign tables were
  *     "refused on sight and never read"; that was false twice over. Its catalogue query filtered
  *     `NOT relispartition`, which hid a foreign PARTITION of a local partitioned table — and
@@ -32,6 +33,22 @@
  *     postgres_fdw: the remote tables' seq_scan went 0 → 1. Now every relkind 'f' relation is
  *     listed, partitions included, BEFORE any probe is built, and if there is one no probe runs
  *     at all — both callers refuse on the list.
+ *  4. ROW-LEVEL SECURITY NEVER APPLIES TO A PROBE (o3d-zzgp r10, review MEDIUM-1). A probe
+ *     `EXISTS (SELECT 1 FROM "s"."t")` evaluates `t`'s policies, and a policy is an arbitrary
+ *     expression — including a call to a function its creator wrote. The reviewer planted
+ *     `USING (s.evil())` where `evil()` runs `CREATE TABLE` whenever the transaction is read-write:
+ *     the stamper's read-only reader saw nothing, and its r9 writer, re-running the probe inside
+ *     the transaction that commits, executed it (reproduced here: `pwned_rls_*` created, owned by
+ *     the stamper's role, and the stamp committed). The same policy with `USING (false)` HID a
+ *     `users` row from the guard, which then accepted the database. Rules 1–3 do not touch this:
+ *     the statement is one fixed-shape, identifier-only SELECT, and the code runs anyway.
+ *     So every caller connects with `-c row_security=off` (PROBE_SESSION_OPTIONS), under which the
+ *     server REFUSES a query that any policy would affect — the policy expression is never
+ *     evaluated — and this module checks the setting itself before any probe
+ *     (`assertRowSecurityOff`) and reports the server's refusal as `RowSecurityPolicyPresent`,
+ *     which both callers turn into a refusal to stamp or seed. A role that BYPASSES row-level
+ *     security (a superuser, or BYPASSRLS) sees every row and evaluates no policy, so it is not
+ *     exposed to either half of this.
  *
  * WHAT COUNTS as data: every row-storing relation — ordinary and partitioned tables and
  * materialized views — in every schema but the server's own (partitions themselves are skipped
@@ -165,9 +182,53 @@ async function ask<T>(client: ExtendedQueryClient, text: string, values: unknown
   return rows as T[]
 }
 
+/**
+ * The startup options every connection that runs a probe must carry (rule 4). Callers add
+ * `-c default_transaction_read_only=on` where the connection must also default to read-only.
+ * Startup options outrank `ALTER DATABASE … SET` and `ALTER ROLE … SET`, and the callers strip the
+ * URL's own `options=` (sanitisedProbeConnectionString), so nothing in the database or the URL can
+ * put these back.
+ */
+export const PROBE_SESSION_OPTIONS = '-c row_security=off -c standard_conforming_strings=on'
+
+/** A probe met a table with a row-level-security policy that applies to this role (rule 4). */
+export class RowSecurityPolicyPresent extends Error {
+  override readonly name = 'RowSecurityPolicyPresent'
+}
+
+/**
+ * Rule 4, checked rather than assumed: a caller that forgot PROBE_SESSION_OPTIONS gets an error
+ * here, before any probe, instead of a probe that runs a policy.
+ */
+export async function assertRowSecurityOff(client: ExtendedQueryClient): Promise<void> {
+  const [row] = await ask<{ row_security: string }>(
+    client, `SELECT pg_catalog.current_setting('row_security') AS row_security`,
+  )
+  if (row?.row_security !== 'off') {
+    throw new RowSecurityPolicyPresent(
+      `this connection runs with row_security=${String(row?.row_security)}, so a table's policy would be `
+      + 'EVALUATED by the data probe; connect with PROBE_SESSION_OPTIONS (row_security=off)',
+    )
+  }
+}
+
 async function runProbe(client: ExtendedQueryClient, probe: RelationProbe): Promise<string[]> {
   if (probe.sql === null) return []
-  const rows = await ask<{ i: number }>(client, probe.sql)
+  let rows: Array<{ i: number }>
+  try {
+    rows = await ask<{ i: number }>(client, probe.sql)
+  } catch (error) {
+    // 42501 insufficient_privilege, raised by the rewriter under row_security=off BEFORE the
+    // policy is evaluated. Anything else propagates unchanged.
+    const e = error as { code?: string; message?: string }
+    if (e.code === '42501' && /row-level security/i.test(e.message ?? '')) {
+      throw new RowSecurityPolicyPresent(
+        `a table in this database has a row-level-security policy that applies to this role (${e.message}); `
+        + 'its rows cannot be counted without running the policy, and a database created for a test run has none',
+      )
+    }
+    throw error
+  }
   return rows.map((row) => {
     const name = probe.probed[Number(row.i)]
     if (name === undefined) throw new Error(`probe returned an index it did not issue: ${String(row.i)}`)
@@ -192,6 +253,7 @@ export type DataFacts = {
 
 /** The stamper's data check. Foreign tables first; if there are any, stop before building a probe. */
 export async function readDataFacts(client: ExtendedQueryClient, appSchema: string): Promise<DataFacts> {
+  await assertRowSecurityOff(client)
   const foreign = await readForeignTables(client)
   if (foreign.length > 0) return { foreign, populated: [], probed: false }
   const relations = await ask<CatalogueRelation>(client, ROW_STORING_RELATIONS_SQL)
@@ -208,6 +270,7 @@ export type InstallationFacts = {
 
 /** The guard's data term. Foreign tables first here too; then users/organisations/currencies anywhere. */
 export async function readInstallationEvidence(client: ExtendedQueryClient): Promise<InstallationFacts> {
+  await assertRowSecurityOff(client)
   const foreign = await readForeignTables(client)
   if (foreign.length > 0) return { foreign, evidence: [], probed: false }
   const relations = await ask<CatalogueRelation>(client, INSTALLATION_EVIDENCE_RELATIONS_SQL, [

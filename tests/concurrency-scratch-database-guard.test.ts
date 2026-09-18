@@ -8,10 +8,12 @@ import {
   scratchDatabaseVerdict,
   type ScratchDatabaseFacts,
 } from './concurrency/scratch-database-guard'
-import { refuseToStamp, sameServerAndDatabase } from '../scripts/stamp-scratch-database'
+import { connectionOptions, refuseToStamp, sameServerAndDatabase } from '../scripts/stamp-scratch-database'
 import {
   INSTALLATION_EVIDENCE_TABLE_NAMES,
   MIGRATION_SEEDED_TABLE_NAMES,
+  PROBE_SESSION_OPTIONS,
+  RowSecurityPolicyPresent,
   buildPopulatedTableProbe,
   readDataFacts,
   readInstallationEvidence,
@@ -278,7 +280,10 @@ test('the probe carries catalogue names ONLY inside double-quoted identifiers �
 type Sent = { text: string; values: unknown; queryMode: unknown }
 
 /** A client that answers the catalogue queries it recognises and records everything it is sent. */
-function recordingClient(catalogue: { foreign: object[]; relations: object[] }) {
+function recordingClient(
+  catalogue: { foreign: object[]; relations: object[] },
+  server: { rowSecurity?: string; probeError?: { code: string; message: string } } = {},
+) {
   const sent: Sent[] = []
   const client = {
     query: async (config: unknown) => {
@@ -288,6 +293,8 @@ function recordingClient(catalogue: { foreign: object[]; relations: object[] }) 
         values: typeof config === 'string' ? undefined : (config as { values?: unknown }).values,
         queryMode: typeof config === 'string' ? undefined : (config as { queryMode?: unknown }).queryMode,
       })
+      if (/current_setting\('row_security'\)/.test(text)) return { rows: [{ row_security: server.rowSecurity ?? 'off' }] }
+      if (server.probeError && /EXISTS/.test(text)) throw Object.assign(new Error(server.probeError.message), server.probeError)
       if (/relkind\s*=\s*'f'/.test(text)) return { rows: catalogue.foreign }
       if (/relkind IN/.test(text)) return { rows: [...catalogue.relations, ...catalogue.foreign] }
       return { rows: [] }
@@ -376,4 +383,46 @@ test('the writer must reach the same SERVER and DATABASE, not merely the same na
   assert.equal(sameServerAndDatabase(reader, { ...reader, postmasterStart: '2026-09-18 08:00:00+00' }), false, 'another server')
   assert.equal(sameServerAndDatabase(reader, { ...reader, serverAddr: '10.0.0.6/32' }), false, 'another host')
   assert.equal(sameServerAndDatabase(reader, { ...reader, serverPort: '6432' }), false, 'a pooler or another port')
+})
+
+// ---------------------------------------------------------------------------------------------
+// o3d-zzgp r10, review MEDIUM-1: a table's row-level-security policy is EVALUATED by a probe — the
+// reviewer's policy called a function that created a table on the stamper's read-write writer,
+// and `USING (false)` hid a users row from the guard. Rule 4: every probe connection runs with
+// row_security=off (the server then refuses, without evaluating the policy), the probe module
+// checks that setting itself, and reports the refusal as RowSecurityPolicyPresent.
+// ---------------------------------------------------------------------------------------------
+test('every connection that runs a probe starts with row_security=off', () => {
+  assert.match(PROBE_SESSION_OPTIONS, /(^| )-c row_security=off( |$)/)
+  assert.match(PROBE_SESSION_OPTIONS, /(^| )-c standard_conforming_strings=on( |$)/)
+  for (const readOnly of [true, false]) {
+    assert.ok(connectionOptions(readOnly).includes(PROBE_SESSION_OPTIONS),
+      `the stamper's ${readOnly ? 'reader' : 'writer'} must carry PROBE_SESSION_OPTIONS: ${connectionOptions(readOnly)}`)
+  }
+  assert.match(connectionOptions(true), /default_transaction_read_only=on/)
+})
+
+test('the probe refuses to run on a connection where row security is on — before any probe', async () => {
+  const catalogue = { foreign: [], relations: [{ schema: 'public', name: 'products', kind: 'r' }] }
+  for (const read of [
+    (client: never) => readDataFacts(client, 'public'),
+    (client: never) => readInstallationEvidence(client),
+  ]) {
+    const { client, sent } = recordingClient(catalogue, { rowSecurity: 'on' })
+    await assert.rejects(read(client as never), RowSecurityPolicyPresent)
+    assert.equal(sent.some((statement) => /EXISTS/.test(statement.text)), false, 'no probe may run with row security on')
+  }
+})
+
+test('a policy the server would not evaluate is reported as RowSecurityPolicyPresent, not a crash', async () => {
+  const probeError = { code: '42501', message: 'query would be affected by row-level security policy for table "t"' }
+  const data = recordingClient({ foreign: [], relations: [{ schema: 's', name: 't', kind: 'r' }] }, { probeError })
+  await assert.rejects(readDataFacts(data.client as never, 'public'), RowSecurityPolicyPresent)
+  const evidence = recordingClient({ foreign: [], relations: [{ schema: 'a', name: 'users', kind: 'r' }] }, { probeError })
+  await assert.rejects(readInstallationEvidence(evidence.client as never), RowSecurityPolicyPresent)
+  // Any OTHER 42501 (a plain permission failure) is not dressed up as a policy.
+  const denied = recordingClient({ foreign: [], relations: [{ schema: 's', name: 't', kind: 'r' }] },
+    { probeError: { code: '42501', message: 'permission denied for table t' } })
+  await assert.rejects(readDataFacts(denied.client as never, 'public'),
+    (error: unknown) => !(error instanceof RowSecurityPolicyPresent) && /permission denied/.test((error as Error).message))
 })

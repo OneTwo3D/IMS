@@ -107,13 +107,23 @@
  * place under the same name, and renaming a database BACK to the name in its marker makes the
  * marker valid again (review L-11, measured).
  *
- * The check runs on its own connection with `default_transaction_read_only=on`, and every
- * statement it sends is one fixed statement over the EXTENDED protocol. The read-only default
- * alone would NOT stop a write — a session can open `BEGIN READ WRITE`, which is exactly how r9's
- * reproduction escaped it through a multi-statement string — so it is the single-statement,
- * no-interpolation discipline that keeps this connection from writing, with the default as a
- * second layer. It asks the SERVER for every fact rather than trusting the URL. Call it first in every test, before importing anything
- * that opens the application pool.
+ * HOW THE CHECK TALKS TO THE SERVER (corrected in r10, review MEDIUM-1 and LOW-6). It runs on
+ * its own connection, started with `default_transaction_read_only=on` and PROBE_SESSION_OPTIONS
+ * (`row_security=off`, `standard_conforming_strings=on`), and sends every statement singly over
+ * the EXTENDED protocol. Its statements are NOT all fixed: the state and subscription queries are,
+ * but the installation-evidence probe is BUILT from catalogue names — one statement, table names
+ * only as double-quoted identifiers, labels as integers (the probe module's rules 1–3). Those rules
+ * stop catalogue TEXT from becoming SQL. They do not stop code a database already holds from
+ * running when a table is read: r9's version of this paragraph said the single-statement,
+ * no-interpolation discipline was what kept this connection from writing, and the r10 review
+ * showed otherwise — a row-level-security policy is evaluated by a plain SELECT, and one with
+ * `USING (false)` hid a `users` row from this check, which then ACCEPTED the database. What stops
+ * that vector is `row_security=off` (the server refuses any query a policy would affect, without
+ * evaluating the policy — the probe module's rule 4, turned into a refusal here), and what keeps
+ * this connection's own transactions read-only is the read-only default. Neither is an absolute:
+ * the default can be escaped by a statement that opens `BEGIN READ WRITE`, which is why the
+ * single-statement rule still matters. It asks the SERVER for every fact rather than trusting the
+ * URL. Call it first in every test, before importing anything that opens the application pool.
  */
 
 export const SCRATCH_DATABASE_OPT_IN_ENV = 'IMS_CONCURRENCY_SCRATCH_DB'
@@ -275,87 +285,108 @@ export function assertScratchDatabaseBeforeAnyWrite(): Promise<string> {
   verified ??= (async () => {
     const databaseUrl = process.env.DATABASE_URL
     if (!databaseUrl) throw new NotAScratchDatabaseError('DATABASE_URL is not set')
+    return checkScratchDatabase(databaseUrl, process.env[SCRATCH_DATABASE_OPT_IN_ENV])
+  })()
+  return verified
+}
 
-    // THE READ-ONLY CONNECTION HAS TO BE READ-ONLY (o3d-zzgp r7, review MEDIUM-1). node-pg
-    // resolves the connection string AFTER the config, so a URL carrying its own `options=`
-    // REPLACED this client's `-c default_transaction_read_only=on` — demonstrated by the
-    // reviewer: with `?options=…` the session came back `off` and a CREATE TABLE succeeded.
-    // lib/db/database-url-schema.mjs documents the identical bug for the search-path pin, and
-    // its `sanitisedProbeConnectionString()` is the fix it already ships: the same URL with
-    // `options` and `schema` removed. Reused rather than re-implemented.
-    const { sanitisedProbeConnectionString } = await import('@/lib/db/database-url-schema.mjs')
-    const { readInstallationEvidence } = await import('./scratch-database-data-probe')
-    const connectionString = sanitisedProbeConnectionString(databaseUrl)
-    if (connectionString === null) {
-      throw new NotAScratchDatabaseError(
-        'REFUSING before any write: DATABASE_URL is not a URL, so the parameters that decide whether this '
-        + 'connection is read-only cannot be stripped from it',
-      )
-    }
-    const { default: pg } = await import('pg')
-    const client = new pg.Client({
-      connectionString,
-      // standard_conforming_strings pinned ON as a third, independent layer under the data
-      // probe's own rules (no catalogue text in literals; extended protocol only) — r9 review M-1.
-      options: '-c default_transaction_read_only=on -c standard_conforming_strings=on',
-      application_name: 'o3d-scratch-database-guard',
+/**
+ * The check itself, unmemoised and with its two inputs passed in — so the integration test
+ * (tests/concurrency/stamp-scratch-database.test.ts) can run it against a database other than the
+ * one this process declared (r10). Every caller that is about to WRITE goes through
+ * `assertScratchDatabaseBeforeAnyWrite`, which reads both inputs from the environment once.
+ */
+export async function checkScratchDatabase(databaseUrl: string, optIn: string | undefined): Promise<string> {
+  // THE READ-ONLY CONNECTION HAS TO BE READ-ONLY (o3d-zzgp r7, review MEDIUM-1). node-pg
+  // resolves the connection string AFTER the config, so a URL carrying its own `options=`
+  // REPLACED this client's `-c default_transaction_read_only=on` — demonstrated by the
+  // reviewer: with `?options=…` the session came back `off` and a CREATE TABLE succeeded.
+  // lib/db/database-url-schema.mjs documents the identical bug for the search-path pin, and
+  // its `sanitisedProbeConnectionString()` is the fix it already ships: the same URL with
+  // `options` and `schema` removed. Reused rather than re-implemented.
+  const { sanitisedProbeConnectionString } = await import('@/lib/db/database-url-schema.mjs')
+  const { readInstallationEvidence, PROBE_SESSION_OPTIONS, RowSecurityPolicyPresent } = await import(
+    './scratch-database-data-probe'
+  )
+  const connectionString = sanitisedProbeConnectionString(databaseUrl)
+  if (connectionString === null) {
+    throw new NotAScratchDatabaseError(
+      'REFUSING before any write: DATABASE_URL is not a URL, so the parameters that decide whether this '
+      + 'connection is read-only cannot be stripped from it',
+    )
+  }
+  const { default: pg } = await import('pg')
+  const client = new pg.Client({
+    connectionString,
+    // PROBE_SESSION_OPTIONS = row_security=off (r10 review MEDIUM-1: no table policy is ever
+    // evaluated by this check) + standard_conforming_strings=on (r9 review M-1).
+    options: `-c default_transaction_read_only=on ${PROBE_SESSION_OPTIONS}`,
+    application_name: 'o3d-scratch-database-guard',
+  })
+  await client.connect()
+  let facts: ScratchDatabaseFacts
+  try {
+    // @types/pg's QueryConfig does not declare `queryMode`, which node-pg 8.20 honours; the probe
+    // module's ExtendedQueryClient type is the one that does.
+    const ext = client as unknown as import('./scratch-database-data-probe').ExtendedQueryClient
+    const { rows: stateRows } = await ext.query({
+      // EVERY catalogue reference is schema-qualified (review LOW-6): with a URL-supplied
+      // `search_path` — which MEDIUM-1 above shows could reach this connection — an
+      // unqualified `shobj_description` could be answered by a planted function.
+      // One fixed statement, over the extended protocol (r9). Not every statement this check sends
+      // is fixed: the installation probe is catalogue-built (identifier-only, single-statement).
+      text: `SELECT pg_catalog.current_database() AS name,
+               pg_catalog.shobj_description(
+                 (SELECT oid FROM pg_catalog.pg_database WHERE datname = pg_catalog.current_database()),
+                 'pg_database') AS comment,
+               pg_catalog.pg_is_in_recovery() AS in_recovery,
+               (SELECT datistemplate FROM pg_catalog.pg_database
+                 WHERE datname = pg_catalog.current_database()) AS is_template`,
+      values: [],
+      queryMode: 'extended',
     })
-    await client.connect()
-    let facts: ScratchDatabaseFacts
+    const rows = stateRows as Array<{ name: string; comment: string | null; in_recovery: boolean; is_template: boolean }>
+    // Separate, and allowed to fail: pg_subscription is not readable to every role.
+    let subscriptionCount: number | null = null
     try {
-      // @types/pg's QueryConfig does not declare `queryMode`, which node-pg 8.20 honours; the probe
-      // module's ExtendedQueryClient type is the one that does.
-      const ext = client as unknown as import('./scratch-database-data-probe').ExtendedQueryClient
-      const { rows: stateRows } = await ext.query({
-        // EVERY catalogue reference is schema-qualified (review LOW-6): with a URL-supplied
-        // `search_path` — which MEDIUM-1 above shows could reach this connection — an
-        // unqualified `shobj_description` could be answered by a planted function.
-        // One fixed statement, over the extended protocol (r9) — like every statement this sends.
-        text: `SELECT pg_catalog.current_database() AS name,
-                 pg_catalog.shobj_description(
-                   (SELECT oid FROM pg_catalog.pg_database WHERE datname = pg_catalog.current_database()),
-                   'pg_database') AS comment,
-                 pg_catalog.pg_is_in_recovery() AS in_recovery,
-                 (SELECT datistemplate FROM pg_catalog.pg_database
-                   WHERE datname = pg_catalog.current_database()) AS is_template`,
+      const subscriptions = await ext.query({
+        text: `SELECT pg_catalog.count(*)::text AS count FROM pg_catalog.pg_subscription
+          WHERE subdbid = (SELECT oid FROM pg_catalog.pg_database
+                            WHERE datname = pg_catalog.current_database())`,
         values: [],
         queryMode: 'extended',
       })
-      const rows = stateRows as Array<{ name: string; comment: string | null; in_recovery: boolean; is_template: boolean }>
-      // Separate, and allowed to fail: pg_subscription is not readable to every role.
-      let subscriptionCount: number | null = null
-      try {
-        const subscriptions = await ext.query({
-          text: `SELECT pg_catalog.count(*)::text AS count FROM pg_catalog.pg_subscription
-            WHERE subdbid = (SELECT oid FROM pg_catalog.pg_database
-                              WHERE datname = pg_catalog.current_database())`,
-          values: [],
-          queryMode: 'extended',
-        })
-        subscriptionCount = Number((subscriptions.rows[0] as { count: string }).count)
-      } catch {
-        subscriptionCount = null
-      }
-      const installation = await readInstallationEvidence(
+      subscriptionCount = Number((subscriptions.rows[0] as { count: string }).count)
+    } catch {
+      subscriptionCount = null
+    }
+    let installation: Awaited<ReturnType<typeof readInstallationEvidence>>
+    try {
+      installation = await readInstallationEvidence(
         client as unknown as Parameters<typeof readInstallationEvidence>[0],
       )
-      facts = {
-        installationEvidence: installation.evidence,
-        foreignTables: installation.foreign,
-        connectedDatabase: String(rows[0]!.name ?? ''),
-        optIn: process.env[SCRATCH_DATABASE_OPT_IN_ENV],
-        databaseComment: rows[0]!.comment ?? null,
-        inRecovery: rows[0]!.in_recovery === true,
-        isTemplate: rows[0]!.is_template === true,
-        subscriptionCount,
+    } catch (error) {
+      // A policy the probe was not allowed to evaluate is a refusal, not a crash (r10 MEDIUM-1).
+      if (error instanceof RowSecurityPolicyPresent) {
+        throw new NotAScratchDatabaseError(`REFUSING before any write: ${error.message}`)
       }
-    } finally {
-      await client.end().catch(() => {})
+      throw error
     }
+    facts = {
+      installationEvidence: installation.evidence,
+      foreignTables: installation.foreign,
+      connectedDatabase: String(rows[0]!.name ?? ''),
+      optIn,
+      databaseComment: rows[0]!.comment ?? null,
+      inRecovery: rows[0]!.in_recovery === true,
+      isTemplate: rows[0]!.is_template === true,
+      subscriptionCount,
+    }
+  } finally {
+    await client.end().catch(() => {})
+  }
 
-    const verdict = scratchDatabaseVerdict(facts)
-    if (!verdict.ok) throw new NotAScratchDatabaseError(`REFUSING before any write: ${verdict.reason}`)
-    return facts.connectedDatabase
-  })()
-  return verified
+  const verdict = scratchDatabaseVerdict(facts)
+  if (!verdict.ok) throw new NotAScratchDatabaseError(`REFUSING before any write: ${verdict.reason}`)
+  return facts.connectedDatabase
 }

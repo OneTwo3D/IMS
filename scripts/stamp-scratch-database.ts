@@ -26,19 +26,26 @@
  * NOT OWNERSHIP. provision-ims-tenant.sh hands every tenant database to the role in its own
  * DATABASE_URL, so "only an owner can set it" excludes nobody who can read a `.env`.
  *
- * HOW IT TALKS TO THE SERVER (r9):
- *   · every fact is read on a connection that defaults to read-only, with
- *     `standard_conforming_strings` pinned on, through the data probe's own rules (no catalogue
- *     text in string literals; one statement per call, extended protocol only). The read-only
- *     default is a second layer, not the barrier: review MEDIUM-1 reproduced a write THROUGH it
- *     with `COMMIT; BEGIN READ WRITE; …` smuggled in a catalogue name;
+ * HOW IT TALKS TO THE SERVER (r9, corrected r10):
+ *   · BOTH connections start with the data probe's PROBE_SESSION_OPTIONS — `row_security=off`
+ *     and `standard_conforming_strings=on` — and send one statement per call over the extended
+ *     protocol. The reader also defaults to read-only. The probe's rules 1–3 keep catalogue TEXT
+ *     from becoming SQL (review r9 MEDIUM-1 reproduced a write through the read-only default with
+ *     `COMMIT; BEGIN READ WRITE; …` smuggled in a catalogue name, so the default is a second layer).
+ *     Rule 4, `row_security=off`, is what keeps a table's POLICY from running: r10's review planted
+ *     a policy calling a function that creates a table whenever the transaction is read-write, and
+ *     r9's writer, re-running the probe in the transaction that commits, executed it.
  *   · the single COMMENT runs on a second connection, inside a transaction that FIRST re-checks
  *     it reached the same SERVER and the same DATABASE the facts came from (oid, postmaster start
- *     time, server address and port — review MEDIUM-3), and then RE-RUNS the data and installation
- *     checks immediately before writing (review L7). That re-check is not a lock: rows another
- *     session commits between it and COMMIT are not seen.
+ *     time, server address and port — review MEDIUM-3) and that the comment it is about to replace
+ *     is still the one the reader saw (r10 LOW-4), then RE-RUNS the data and installation checks
+ *     (review L7) inside a SAVEPOINT made read-only with `SET LOCAL transaction_read_only = on` and
+ *     rolled back before the COMMENT (r10 MEDIUM-1) — so the re-check runs under read-only
+ *     transaction semantics even on the writing connection, and the COMMENT is the only statement
+ *     that runs read-write. The re-check is not a lock: rows another session commits between it
+ *     and COMMIT are not seen.
  *   · `--unstamp` reads only the name, the server identity and the comment. It never runs the data
- *     probe (review L6).
+ *     probe (review L6), and it decides on the comment the WRITER re-reads (r10 LOW-4).
  */
 
 import { pathToFileURL } from 'node:url'
@@ -48,8 +55,10 @@ import {
   expectedScratchDatabaseMarker,
 } from '../tests/concurrency/scratch-database-guard'
 import {
+  PROBE_SESSION_OPTIONS,
   readDataFacts,
   readInstallationEvidence,
+  RowSecurityPolicyPresent,
   type ExtendedQueryClient,
 } from '../tests/concurrency/scratch-database-data-probe'
 
@@ -60,13 +69,21 @@ import {
  */
 const MARKER_OPENINGS = ['ims-scratch-database(', 'ims-scratch-database:'] as const
 
+export function isScratchMarker(comment: string | null): comment is string {
+  return comment !== null && MARKER_OPENINGS.some((opening) => comment.startsWith(opening))
+}
+
 type PgClient = ExtendedQueryClient & { connect: () => Promise<void>; end: () => Promise<void> }
 
 /**
  * Who answered: the database by name AND oid, and the server by postmaster start time, address and
- * port — the same identity lib/db/database-url-schema.mjs pins a lock connection to (review M3).
- * A DATABASE_URL that resolves differently the second time (DNS, a pooler, a failover) changes at
- * least one of these.
+ * port (review M3). This is this script's OWN identity, not the one lib/db/database-url-schema.mjs
+ * records for a backend (that is address, port, server_version, server_encoding and datctype — r10
+ * LOW-3 corrected a comment that said they were the same). The oid and the postmaster start time
+ * are what that one lacks and this needs: a database dropped and recreated under the same name, or
+ * a server restarted or failed over behind the same address, changes one of them. Through a Unix
+ * socket the address and port read `local-socket` on both connections, so there the oid and start
+ * time carry the comparison.
  */
 type Identity = {
   name: string
@@ -201,6 +218,17 @@ export function refuseToStamp(input: {
   return null
 }
 
+/**
+ * THE ONE PLACE CATALOGUE TEXT ENTERS A STRING LITERAL, and why it is allowed (r10 LOW-2). The
+ * probe module's rule 1 keeps catalogue-derived text out of string literals, because a literal's
+ * quoting changes with `standard_conforming_strings`. The marker in the COMMENT below contains
+ * `current_database()`, so it is an exception to that rule, and it is safe for two reasons that
+ * both hold here: the writer's startup options pin `standard_conforming_strings=on`, so a backslash
+ * is an ordinary character and doubling `'` is the complete escape; and the statement goes through
+ * the extended protocol, so even a mis-quoted literal could not start a second statement. The
+ * reviewer checked it with a database named `q'\` on a database with the setting forced off.
+ * `COMMENT … IS` accepts only a literal (no bind parameter), which is why it is not a parameter.
+ */
 function quoteLiteral(value: string): string {
   return `'${value.replace(/'/g, "''")}'`
 }
@@ -209,12 +237,24 @@ function quoteIdentifier(value: string): string {
   return `"${value.replace(/"/g, '""')}"`
 }
 
-/** Both connections: sanitised URL, conforming strings pinned; the reader is also read-only. */
-function connectionOptions(readOnly: boolean): string {
-  return `${readOnly ? '-c default_transaction_read_only=on ' : ''}-c standard_conforming_strings=on`
+/**
+ * Both connections: sanitised URL and PROBE_SESSION_OPTIONS (row_security=off, conforming strings
+ * on); the reader is also read-only by default.
+ */
+export function connectionOptions(readOnly: boolean): string {
+  return `${readOnly ? '-c default_transaction_read_only=on ' : ''}${PROBE_SESSION_OPTIONS}`
 }
 
-async function main(argv: string[]): Promise<number> {
+/**
+ * ONLY the integration test passes this (tests/concurrency/stamp-scratch-database.test.ts). It runs
+ * after the reader has closed and before the writer opens — the window the writer's checks exist
+ * for — so the test can change the database there (recreate it, add a row, change its comment) and
+ * show each check refusing. It widens nothing: whatever it does is done by the test's own
+ * connection, and every check below still runs.
+ */
+export type StampHooks = { betweenReadAndWrite?: () => Promise<void> }
+
+export async function main(argv: string[], hooks: StampHooks = {}): Promise<number> {
   const unstamp = argv.includes('--unstamp')
   const requestedName = argv.find((arg) => !arg.startsWith('--'))
 
@@ -265,17 +305,25 @@ async function main(argv: string[]): Promise<number> {
       console.log(`"${identity.name}" carries no database comment; nothing to remove.`)
       return 0
     }
-    if (!MARKER_OPENINGS.some((opening) => identity.comment!.startsWith(opening))) {
+    if (!isScratchMarker(identity.comment)) {
       console.error(`REFUSING to unstamp "${identity.name}": its comment is not a scratch marker, and this script `
         + 'will not remove a comment it did not write')
       return 1
     }
+    await hooks.betweenReadAndWrite?.()
     const writer = await open(false)
     try {
       await ask(writer, 'BEGIN')
-      if (!sameServerAndDatabase(identity, await readIdentity(writer))) {
+      const seen = await readIdentity(writer)
+      if (!sameServerAndDatabase(identity, seen)) {
         await ask(writer, 'ROLLBACK')
         console.error('REFUSING to unstamp: the writing connection reached a different server or database')
+        return 1
+      }
+      // DECIDED ON WHAT THE WRITER SEES (r10 LOW-4): r9 re-read the comment here and ignored it.
+      if (seen.comment !== identity.comment || !isScratchMarker(seen.comment)) {
+        await ask(writer, 'ROLLBACK')
+        console.error(`REFUSING to unstamp "${identity.name}": its comment changed after it was read`)
         return 1
       }
       await ask(writer, `COMMENT ON DATABASE ${quoteIdentifier(identity.name)} IS NULL`)
@@ -292,6 +340,12 @@ async function main(argv: string[]): Promise<number> {
   let facts: Facts
   try {
     facts = await readStampFacts(reader, appSchema)
+  } catch (error) {
+    if (error instanceof RowSecurityPolicyPresent) {
+      console.error(`REFUSING to stamp: ${error.message}`)
+      return 1
+    }
+    throw error
   } finally {
     await reader.end().catch(() => {})
   }
@@ -323,19 +377,49 @@ async function main(argv: string[]): Promise<number> {
     return 1
   }
 
+  await hooks.betweenReadAndWrite?.()
   const writer = await open(false)
   try {
     await ask(writer, 'BEGIN')
+    const seen = await readIdentity(writer)
     // SAME SERVER, SAME DATABASE (review M3) — not just the same name.
-    if (!sameServerAndDatabase(facts.identity, await readIdentity(writer))) {
+    if (!sameServerAndDatabase(facts.identity, seen)) {
       await ask(writer, 'ROLLBACK')
       console.error('REFUSING to stamp: the writing connection reached a different server or database than the checks')
       return 1
     }
-    // RE-CHECKED ON THE WRITER, IN THIS TRANSACTION, IMMEDIATELY BEFORE THE COMMENT (review L7).
-    // Not a lock: a row another session commits after this read and before COMMIT is not seen.
-    const data = await readDataFacts(writer, appSchema)
-    const installation = await readInstallationEvidence(writer)
+    // THE COMMENT THIS WILL REPLACE IS STILL THE ONE THE READER SAW — none (r10 LOW-4).
+    if (seen.comment !== facts.identity.comment) {
+      await ask(writer, 'ROLLBACK')
+      console.error(`REFUSING to stamp "${facts.identity.name}": its database comment changed after it was read`)
+      return 1
+    }
+    // RE-CHECKED ON THE WRITER, IN THIS TRANSACTION, IMMEDIATELY BEFORE THE COMMENT (review L7),
+    // under READ-ONLY transaction semantics (r10 MEDIUM-1): the savepoint is made read-only and
+    // rolled back, which restores read-write for the COMMENT alone. row_security=off (startup
+    // options) is what stops a policy running at all; the savepoint is the layer under it, twice
+    // over — anything the re-check did run could not write, and a transactional write that got
+    // through would be discarded by the rollback to the savepoint (measured by mutation: with
+    // row_security on and the read-only line removed, the policy's table was still gone; with the
+    // whole savepoint removed — r9's shape — it survived). Not a lock: a row another session
+    // commits after this read and before COMMIT is not seen.
+    let data: Awaited<ReturnType<typeof readDataFacts>>
+    let installation: Awaited<ReturnType<typeof readInstallationEvidence>>
+    try {
+      await ask(writer, 'SAVEPOINT stamp_recheck')
+      await ask(writer, 'SET LOCAL transaction_read_only = on')
+      data = await readDataFacts(writer, appSchema)
+      installation = await readInstallationEvidence(writer)
+      await ask(writer, 'ROLLBACK TO SAVEPOINT stamp_recheck')
+      await ask(writer, 'RELEASE SAVEPOINT stamp_recheck')
+    } catch (error) {
+      await ask(writer, 'ROLLBACK').catch(() => {})
+      if (error instanceof RowSecurityPolicyPresent) {
+        console.error(`REFUSING to stamp "${facts.identity.name}" at the last moment: ${error.message}`)
+        return 1
+      }
+      throw error
+    }
     const late = refuseToStamp({
       database: facts.identity.name,
       requestedName,

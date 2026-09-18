@@ -1049,8 +1049,14 @@ function executableFiles(dir: string, found: string[] = []): string[] {
  *   'scratch-database-stamp'— connects to a database that is NOT this application's and writes ONE
  *                             DATABASE-LEVEL comment (`COMMENT ON DATABASE … IS '<marker>'`), which
  *                             is how the DB-backed concurrency tier is told a database was created
- *                             to be destroyed. It touches no schema, table or row anywhere, so it
- *                             cannot move a plugin key. It must be GIVEN the database name as an
+ *                             to be destroyed. Its only WRITE is that comment; it does READ every
+ *                             table in the database (the data probe), which is why it runs with
+ *                             row_security=off and its writer re-checks inside a read-only
+ *                             savepoint — r9's writer, reading a planted table whose row-level
+ *                             policy called a function, executed that function and let it create
+ *                             a table (o3d-zzgp r10, review MEDIUM-1; r9 said here that it "touches
+ *                             no schema, table or row anywhere", which was false). It writes no
+ *                             application table, so it cannot move a plugin key. It must be GIVEN the database name as an
  *                             argument, which must equal `current_database()`, and it refuses a
  *                             database that HOLDS APPLICATION DATA, is a replica, a template, a
  *                             subscription target, already carries another comment, or is named in
