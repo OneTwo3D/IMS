@@ -112,11 +112,12 @@ test('every page request is Limit=100, PageNo >= 1 and asks for items, and pagin
   assert.deepEqual(requests.map((request) => new URL(request, 'https://mintsoft.test').searchParams.get('PageNo')), ['1', '2', '3', '1', '2', '3'])
 })
 
-test('duplicate recovery finds its ASN on page 2 of its warehouse, by POReference and expected quantity', async () => {
+test('duplicate recovery reads the WHOLE tenant and finds its ASN on page 2, by POReference and expected quantity', async () => {
   reset(() => tenant())
   const { fetchMintsoftAsnsForDuplicateRecovery } = await client()
-  const asns = await fetchMintsoftAsnsForDuplicateRecovery('6')
-  assert.ok(requests.every((request) => new URL(request, 'https://mintsoft.test').searchParams.get('WarehouseId') === '6'))
+  const asns = await fetchMintsoftAsnsForDuplicateRecovery()
+  // Tenant-wide, not scoped to a warehouse (review M3): no request narrows by WarehouseId.
+  assert.ok(requests.every((request) => !new URL(request, 'https://mintsoft.test').searchParams.has('WarehouseId')), requests.join(' '))
   assert.ok(requests.some((request) => new URL(request, 'https://mintsoft.test').searchParams.get('PageNo') === '2'), 'the scan reached page 2')
   const target = asns.find((asn) => asn.externalAsnId === '9999')
   assert.ok(target, 'the target on page 2 is found')
@@ -124,7 +125,7 @@ test('duplicate recovery finds its ASN on page 2 of its warehouse, by POReferenc
   assert.equal(target.lines.length, 1)
   assert.equal(target.lines[0]!.sourceLineId, 'line-9999')
   assert.equal(target.lines[0]!.quantity, 4, 'the EXPECTED quantity, not the received one')
-  assert.equal(asns.length, tenant().filter((row) => row.WarehouseId === 6).length)
+  assert.equal(asns.length, tenant().length, 'every ASN in the tenant, both warehouses')
 })
 
 test('a list whose pages never end FAILS CLOSED after a bounded number of requests', async () => {
@@ -135,7 +136,7 @@ test('a list whose pages never end FAILS CLOSED after a bounded number of reques
     return json(Array.from({ length: 100 }, (_, index) => ({ ID: pageNo * 1000 + index, POReference: 'x', WarehouseId: 6, Items: [] })))
   }
   const { fetchMintsoftAsnsForDuplicateRecovery, MINTSOFT_ASN_LIST_MAX_PAGES } = await client()
-  await assert.rejects(fetchMintsoftAsnsForDuplicateRecovery('6'), (error: unknown) => error instanceof Error && error.name === 'MintsoftAsnListIncompleteError' && /more than 50 pages/.test(error.message))
+  await assert.rejects(fetchMintsoftAsnsForDuplicateRecovery(), (error: unknown) => error instanceof Error && error.name === 'MintsoftAsnListIncompleteError' && /more than 50 pages/.test(error.message))
   assert.equal(requests.length, MINTSOFT_ASN_LIST_MAX_PAGES, 'it stopped at the cap instead of paging for ever')
 })
 
@@ -179,20 +180,41 @@ test('a recovery row that came back without its items is refused, not skipped', 
     return json([{ ID: 1, POReference: 'PO-1', WarehouseId: 6, Items: null }])
   }
   const { fetchMintsoftAsnsForDuplicateRecovery } = await client()
-  await assert.rejects(fetchMintsoftAsnsForDuplicateRecovery('6'), (error: unknown) => error instanceof Error && /without its items/.test(error.message))
+  await assert.rejects(fetchMintsoftAsnsForDuplicateRecovery(), (error: unknown) => error instanceof Error && /ASN 1 came back without its items/.test(error.message), 'and the error names the ASN')
 })
 
-test('both ASN creators recover through the complete list and match Mintsoft’s POReference (o3d-bhvu)', () => {
-  // A structural pin, stated as such: the creators are server actions whose duplicate recovery runs
-  // inside a database transaction, and no unit harness drives them. It asserts, over the whole file,
-  // that NO call to the old list function remains and that EVERY reference match reads POReference —
-  // universal counts, not an existence check a stale call site beside a new one would satisfy.
+test('a scan that LOSES the target is never accepted until two consecutive scans agree (review L1)', async () => {
+  // Scan 1 sees the target; scan 2 does not (it moved across a page boundary mid-scan); scan 3 sees it
+  // again. No two consecutive scans agree, so the read is refused: accepting scan 2 would report "no
+  // existing ASN" while one exists, and the creator would push a duplicate.
+  reset((scan) => (scan === 2 ? tenant().filter((row) => row.ID !== 9999) : tenant()))
+  const { fetchMintsoftAsnsForDuplicateRecovery } = await client()
+  await assert.rejects(fetchMintsoftAsnsForDuplicateRecovery(), (error: unknown) => error instanceof Error && /changed between 3 consecutive scans/.test(error.message))
+  assert.equal(scanCounter, 3, 'three scans were made, none of them accepted')
+})
+
+test('a rebind between a lost attempt and the retry still finds the earlier ASN, and refuses it by name (review M3)', async () => {
+  // ASN 9999 was created at warehouse 5 by an attempt whose response was lost; the binding now points at
+  // warehouse 6. A scan scoped to warehouse 6 would return no match and the retry would create a second
+  // inbound ASN. The tenant-wide scan finds it, and the matcher refuses the warehouse mismatch.
+  reset(() => tenant().map((row) => (row.ID === 9999 ? { ...row, WarehouseId: 5 } : row)))
+  const { fetchMintsoftAsnsForDuplicateRecovery } = await client()
+  const { findRecoverableMintsoftAsn } = await import('@/lib/connectors/mintsoft/api/asn-recovery')
+  const asns = await fetchMintsoftAsnsForDuplicateRecovery()
+  assert.throws(
+    () => findRecoverableMintsoftAsn(asns, { reference: 'PO-TARGET', externalWarehouseId: '6', correlatedCallbackUrl: null, lines: [{ sourceLineId: 'line-9999', expectedQty: 4 }] }),
+    (error: unknown) => error instanceof Error && error.name === 'MintsoftAsnRecoveryWarehouseMismatchError' && /ASN 9999/.test(error.message),
+  )
+})
+
+test('both ASN creators decide recover-or-create through findRecoverableMintsoftAsn over the tenant-wide list (o3d-bhvu)', () => {
+  // A structural pin that the creators USE the behaviour tested in tests/mintsoft-asn-recovery.test.ts —
+  // stated as such: the creators are server actions inside database transactions with no unit harness.
+  // Universal counts over the whole file, so a stale call site beside a new one fails.
   const source = readFileSync(path.join(process.cwd(), 'app/actions/mintsoft-sync.ts'), 'utf8')
-  assert.equal((source.match(/\bfetchMintsoftAsns\(/g) ?? []).length, 0, 'no call to the list the booked-in rollback path uses')
-  const recoveries = source.match(/async function findExistingRemoteAsn\(/g) ?? []
-  assert.equal(recoveries.length, 2, 'both creators still have their recovery step')
-  assert.equal((source.match(/await fetchMintsoftAsnsForDuplicateRecovery\(reservation\.externalWarehouseId\)/g) ?? []).length, 2)
-  const referenceReads = source.match(/getMintsoftAsnRawString\(asn\.raw, \[[^\]]*\]\) !== reservation\.reference/g) ?? []
-  assert.equal(referenceReads.length, 2, `reference matches found: ${referenceReads.length}`)
-  for (const read of referenceReads) assert.match(read, /'POReference'/, read)
+  assert.equal((source.match(/\bfetchMintsoftAsns\(/g) ?? []).length, 0, 'no call to the booked-in rollback list')
+  assert.equal((source.match(/async function findExistingRemoteAsn\(/g) ?? []).length, 2, 'both creators still recover first')
+  assert.equal((source.match(/await fetchMintsoftAsnsForDuplicateRecovery\(\)/g) ?? []).length, 2, 'both read the tenant-wide list')
+  assert.equal((source.match(/return findRecoverableMintsoftAsn\(remoteAsns, \{/g) ?? []).length, 2, 'both decide through the shared matcher')
+  assert.equal((source.match(/POReference/g) ?? []).length, 0, 'no creator keeps its own reference matching')
 })

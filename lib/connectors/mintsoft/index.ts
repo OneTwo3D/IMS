@@ -217,6 +217,7 @@ export {
   mintsoftRequest,
   upsertMintsoftProduct,
 } from './api/client'
+export { findRecoverableMintsoftAsn, MintsoftAsnRecoveryWarehouseMismatchError, type MintsoftAsnRecoveryCriteria } from './api/asn-recovery'
 export { fetchMintsoftOrderList, fetchMintsoftOrderStatus, normalizeMintsoftOrderRow } from './api/orders'
 export { cancelMintsoftOrder, pushMintsoftOrder, updateMintsoftOrder } from './api/order-push'
 export {
