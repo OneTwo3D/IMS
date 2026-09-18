@@ -2,6 +2,7 @@
  * Generic accounting facade — core code imports ONLY from here, never from connector modules.
  */
 
+import { createAccountingSyncLogRow } from '@/lib/domain/accounting/sync-log-row'
 import type { AccountingSyncType, Prisma } from '@/app/generated/prisma/client'
 import { isIntegrationPluginEnabled } from '@/lib/integration-plugins'
 import { pinnedLedgerIsServicedUnderLock } from '@/lib/integration-plugin-selection-lock'
@@ -20,6 +21,7 @@ import {
 } from '@/lib/domain/accounting/prior-posting-evidence'
 import { connectorNativePayloadIdKeys } from '@/lib/accounting/connector-provenance'
 import { clearAccountingPostingRefusal, recordAccountingPostingRefusal, type PostingRefusalClient } from '@/lib/domain/accounting/posting-refusal-inbox'
+import { defaultPostingRefusalKind } from '@/lib/domain/accounting/posting-refusal-kinds'
 
 export type AccountingSettings = {
   syncEnabled: boolean
@@ -659,9 +661,12 @@ async function refuseUnattributableChart(params: {
  */
 async function recordRefusalIfAsked(
   params: { recordRefusalAsOutstanding?: boolean; posting?: AccountingPostingKey; refusalClient?: { client: PostingRefusalClient; withSavepoint: <T>(fn: () => Promise<T>) => Promise<T> } },
-  record: Parameters<typeof recordAccountingPostingRefusal>[2],
+  given: Omit<Parameters<typeof recordAccountingPostingRefusal>[2], 'kind'>,
 ): Promise<boolean> {
   if (!params.recordRefusalAsOutstanding || !params.posting) return false
+  // o3d-j625 r6 (review H4): the enqueue does not know which SITE called it, so it records the posting's
+  // default kind; the site's own report (a merge) names the real one where a posting has several.
+  const record = { ...given, kind: defaultPostingRefusalKind(params.posting.type, params.posting.referenceType) }
   if (params.refusalClient) {
     await recordAccountingPostingRefusal(params.refusalClient.client, params.posting, record, {
       withSavepoint: params.refusalClient.withSavepoint,
@@ -1145,9 +1150,29 @@ export async function queueAccountingSyncTx(
    * reporter is listening, so the unchanged call sites do no extra work.
    */
   const answer = async (
-    outcome: ConnectorEnqueueOutcome,
+    given: ConnectorEnqueueOutcome & { activeConnector?: AccountingConnectorInfo['id'] | null; refusalRecorded?: boolean },
     connector?: AccountingConnectorInfo['id'] | null,
+    /**
+     * o3d-j625 r6 (review M4) — WHY THIS PATH REFUSED, for the outstanding row. r5 honoured
+     * `recordRefusalAsOutstanding` on the unattributable-chart refusal only; the deleted-order, unserviced-pin
+     * and unresolved-prior-attempt refusals below leave the same committed local state and recorded nothing.
+     * Every refusal through here now writes the row when the caller asked, in the caller's transaction.
+     */
+    refusal?: { reason: string; remedy: string; detail?: Record<string, unknown> },
   ): Promise<boolean> => {
+    let outcome = given
+    if (!outcome.queued && outcome.reason === 'refused' && refusal && refusalClient && !outcome.refusalRecorded) {
+      const activeNow = await getActiveAccountingConnectorId().catch(() => null)
+      const recorded = await recordRefusalIfAsked({ ...params, posting, refusalClient }, {
+        chartConnector: params.chartConnector,
+        activeConnector: activeNow,
+        reason: refusal.reason,
+        committed: 'the change that raised this posting is committed in IMS',
+        remedy: refusal.remedy,
+        detail: refusal.detail,
+      })
+      outcome = { ...outcome, activeConnector: activeNow, refusalRecorded: recorded }
+    }
     if (params.reportOutcome) {
       params.reportOutcome({
         ...outcome,
@@ -1202,7 +1227,12 @@ export async function queueAccountingSyncTx(
     // reference nothing can resolve, which is the o3d-hrak race the lock exists to close.
     // REFUSED, not decided: this posting is still owed, and a caller holding an obligation for it
     // must not read this as settled.
-    return answer({ queued: false, reason: 'refused' })
+    return answer({ queued: false, reason: 'refused' }, undefined, {
+      reason: 'order_deleted',
+      remedy:
+        'The sales order this posting belongs to was deleted before the posting could be queued, so nothing '
+        + 'in IMS will raise it again. Check whether the ledger still needs it.',
+    })
   }
 
   // Returns whether a GL counterpart for this posting exists or will post: false when
@@ -1235,13 +1265,18 @@ export async function queueAccountingSyncTx(
   // facade rather than restated: see refuseUnattributableChart.
   const unattributable = await refuseUnattributableChart({ ...params, posting, refusalClient })
   if (unattributable) {
-    return answer(
-      { queued: unattributable.queued, reason: unattributable.reason },
-      unattributable.connector,
-    )
+    // review L1: the WHOLE answer, so the caller sees the active connector and that the row was recorded.
+    return answer(unattributable, unattributable.connector)
   }
   if (params.connector && !await pinnedLedgerIsServicedUnderLock(tx, params.connector)) {
-    return answer({ queued: false, reason: 'refused' }, params.connector)
+    return answer({ queued: false, reason: 'refused' }, params.connector, {
+      reason: 'pinned_ledger_not_serviced',
+      remedy:
+        `This posting was proved against ${params.connector}, which is no longer the active accounting `
+        + 'connector. Settle the accounting connector selection, then raise the posting again from its '
+        + 'source document.',
+      detail: { pinnedConnector: params.connector },
+    })
   }
   // o3d-i0o6: the PIN wins where one was given. `getAccountingPostingContextFor` asks the same
   // question of the named connector that `getAccountingPostingContext` asks of whichever is active,
@@ -1332,7 +1367,13 @@ export async function queueAccountingSyncTx(
           description: describeUnresolvedPriorAttempt({ ...params, syncLogId: verdict.syncLogId }),
         },
       })
-      return answer({ queued: false, reason: 'refused' }, context.connector)
+      return answer({ queued: false, reason: 'refused' }, context.connector, {
+        reason: 'unresolved_prior_attempt',
+        remedy:
+          `An earlier attempt at this posting (accounting sync row ${verdict.syncLogId}) has an unresolved `
+          + 'outcome, so a second one could post it twice. Resolve that row in the accounting sync log first.',
+        detail: { syncLogId: verdict.syncLogId },
+      })
     }
   }
 
@@ -1361,8 +1402,7 @@ export async function queueAccountingSyncTx(
     // WRAPPED AROUND THE CREATE ALONE, not the whole block. The outbox schedule and the event mirror
     // that follow are ordinary work whose failure is NOT handled here — isolating them would only
     // hide it. The collision can come from nothing but this INSERT.
-    const log = await withSavepoint(tx, () => tx.accountingSyncLog.create({
-      data: {
+    const log = await createAccountingSyncLogRow(tx, {
         connector: context.connector,
         type: params.type,
         status: 'PENDING',
@@ -1379,8 +1419,7 @@ export async function queueAccountingSyncTx(
         // read this row's unset `remoteAttemptedAt` as proof no remote call ever left it — see
         // money-attempt-provenance.ts. A row created without it is never recycled again.
         ...stampingCustodyOnCreate(),
-      },
-    }))
+      }, { createInSavepoint: true })
     if (context.connector === 'xero') {
       const { scheduleXeroAccountingOutbox } = await import('@/lib/connectors/xero/outbox')
       await scheduleXeroAccountingOutbox(tx, {

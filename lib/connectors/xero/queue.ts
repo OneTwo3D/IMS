@@ -3,6 +3,7 @@
  * Moved from app/actions/xero-sync.ts — this is an internal utility, not a server action.
  */
 
+import { createAccountingSyncLogRow } from '@/lib/domain/accounting/sync-log-row'
 import { db } from '@/lib/db'
 import { activeAccountingIdProvenance } from '@/lib/connectors/accounting-id-provenance'
 import {
@@ -222,8 +223,7 @@ export async function queueXeroSync(params: {
         if (staleDiscount) return
       }
 
-      const log = await tx.accountingSyncLog.create({
-        data: {
+      const log = await createAccountingSyncLogRow(tx, {
           connector: 'xero',
           type: params.type,
           status: 'PENDING',
@@ -240,8 +240,7 @@ export async function queueXeroSync(params: {
           // read this row's unset `remoteAttemptedAt` as proof no remote call ever left it — see
           // money-attempt-provenance.ts. A row created without it is never recycled again.
           ...stampingCustodyOnCreate(),
-        },
-      })
+        })
       await scheduleXeroAccountingOutbox(tx, {
         accountingSyncLogId: log.id,
       })

@@ -8355,3 +8355,36 @@ test('o3d-i0o6 r6: a refund staged against the connector A2 did NOT post on stag
     'with the cross-ledger refusal named for an operator',
   )
 })
+
+// o3d-j625 r6 (review H4) — THE REFUND KINDS ARE AUTO because "Retry refund accounting" hands back the
+// SAME postings the refused attempt asked for: the persisted syncs, keyed as before. Whatever queues them
+// creates rows that clear the refusal (createAccountingSyncLogRow). Driven through the real retry.
+test('[o3d-j625 r6 H4] Retry refund accounting raises the SAME refund postings the refused attempt asked for', async () => {
+  const { accountingPostingKey } = await import('@/lib/accounting/posting-key')
+  const persisted = [
+    ...CREDIT_NOTE_SYNC,
+    {
+      type: 'COGS_REVERSAL' as const, referenceType: 'SalesOrderRefund', referenceId: 'refund-1',
+      idempotencyKey: 'sales-order-refund:refund-1:cogs-reversal', payload: { lines: [] },
+    },
+    {
+      type: 'UNEARNED_REV_REVERSAL' as const, referenceType: 'SalesOrderRefund', referenceId: 'refund-1',
+      idempotencyKey: 'sales-order-refund:refund-1:unearned-reversal', payload: { lines: [] },
+    },
+  ]
+  const retried = await retrySalesOrderRefundAccounting(createClient(retryFenceState(0.2, persisted)), {
+    refundId: 'refund-1',
+    accountingSettings,
+    creditNotePostingEnabled: true,
+  })
+  assert.equal(retried.success, true, `PRECONDITION: the retry succeeded (${retried.success === false ? retried.error : ''})`)
+  const keysOf = (syncs: Array<Record<string, unknown>>) => syncs.map((sync) => JSON.stringify(accountingPostingKey(sync as never))).sort()
+  const handedBack = retried.success ? retried.accountingSyncs as unknown as Array<Record<string, unknown>> : []
+  for (const type of ['CREDIT_NOTE', 'COGS_REVERSAL', 'UNEARNED_REV_REVERSAL']) {
+    assert.deepEqual(
+      keysOf(handedBack.filter((sync) => sync.type === type)),
+      keysOf(persisted.filter((sync) => sync.type === type) as unknown as Array<Record<string, unknown>>),
+      `${type}: the retry raises the posting the refused attempt asked for`,
+    )
+  }
+})

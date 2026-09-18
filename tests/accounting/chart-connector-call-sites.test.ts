@@ -136,8 +136,9 @@ test('[o3d-j625] every facade accounting enqueue in app/ and lib/ names the char
   // o3d-j625 sweep enumerated; it is a floor and not an equality so that adding an enqueue does not
   // fail this test for the wrong reason.
   assert.ok(
-    sites.length >= 12,
-    `expected to find at least the 11 facade enqueue call sites the o3d-j625 sweep enumerated, found `
+    // o3d-j625 r6: 11 — the stock adjustment moved into the caller's transaction (review M3). The floor is the count.
+    sites.length >= 11,
+    `expected to find the 11 facade enqueue call sites, found `
     + `${sites.length}. The detector is not examining the source it claims to.`,
   )
 
@@ -172,7 +173,7 @@ test('[o3d-j625] the census names the sites it examined, so a shrinking sweep is
     'lib/accounting-fx-revaluation.ts',
     'lib/accounting/tax-rate-sync-trigger.ts',
     'lib/connectors/woocommerce/sync/order-import.ts',
-    'lib/domain/inventory/stock-adjustment-apply.ts',
+    // (lib/domain/inventory/stock-adjustment-apply.ts moved to the transactional census in r6, review M3.)
   ]) {
     assert.ok(files.includes(expected), `the census no longer examines ${expected}. Files: ${files.join(', ')}`)
   }
@@ -499,8 +500,9 @@ test('[o3d-j625 r2] every IN-TRANSACTION accounting enqueue in app/ and lib/ nam
   // lib/domain/purchasing/purchase-invoice-update-sync.ts and lib/domain/sales/allocation-service.ts.
   // A floor rather than an equality so a new enqueue does not fail this test for the wrong reason.
   assert.ok(
-    sites.length >= 16,
-    `expected at least the 16 in-transaction enqueue call sites the o3d-j625 r2 sweep enumerated, found `
+    // o3d-j625 r6: 17 — the stock adjustment joined (review M3). The floor is the count.
+    sites.length >= 17,
+    `expected the 17 in-transaction enqueue call sites, found `
     + `${sites.length}. The detector is not examining the source it claims to.`,
   )
 
@@ -527,15 +529,15 @@ test('[o3d-j625 r2] every IN-TRANSACTION accounting enqueue in app/ and lib/ nam
   )
 })
 
-test('[o3d-j625 r2] the whole census — facade plus transactional — is at least 27 sites', () => {
+test('[o3d-j625 r2/r6] the whole census — facade plus transactional — is 28 sites (the floor is the count)', () => {
   // The number r1's scoping decision turned into "11 fixed, 16 filed". It is asserted as ONE total so
   // that shrinking either half is visible even if the other half grows.
   const total = allFacadeCallSites().length + allTxCallSites().length
-  // o3d-j625 r5 (review L-13): re-derived. 12 facade sites (the injected `deps.queueAccountingSync` in
-  // sales-invoice-update-sync joined them when this census stopped skipping member calls) + 16 in-transaction.
+  // o3d-j625 r5 (review L-13): re-derived. r6 (review L2 + M3): 11 facade + 17 in-transaction — the stock
+  // adjustment moved from the facade into the caller's transaction, so one site changed halves.
   assert.ok(
     total >= 28,
-    `the o3d-j625 sweep covers 28 accounting enqueue call sites (12 facade + 16 in-transaction); the `
+    `the o3d-j625 sweep covers 28 accounting enqueue call sites (11 facade + 17 in-transaction); the `
     + `census now sees ${total}. A census that stops seeing its subjects proves nothing about them.`,
   )
 })
@@ -549,6 +551,7 @@ test('[o3d-j625 r2] the transactional census names the files it examined, so a s
     'lib/accounting.ts',
     'lib/cost-layers.ts',
     'lib/domain/accounting/invoice-payment-enqueue.ts',
+    'lib/domain/inventory/stock-adjustment-apply.ts',
     'lib/domain/purchasing/cancellation-service.ts',
     'lib/domain/purchasing/landed-cost-service.ts',
     'lib/domain/purchasing/purchase-invoice-update-sync.ts',

@@ -1,3 +1,5 @@
+import { accountingPostingKey } from '@/lib/accounting/posting-key'
+
 export type SalesInvoiceUpdateConnectorInfo = {
   id: string
   name: string
@@ -38,12 +40,6 @@ export type SalesInvoiceUpdateQueueParams = {
    * never resolved to the active connector.
    */
   documentConnector: 'xero' | 'quickbooks' | null
-  /**
-   * o3d-j625 r5 (review HIGH 1/2/3) — the key of the posting this update IS, derived by
-   * `accountingPostingKey` from the very params the caller hands the facade. Passed in rather than rebuilt
-   * here so the refusal row and the clear cannot disagree.
-   */
-  posting: { type: string; referenceType: string; referenceId: string; scope: string }
 }
 
 /**
@@ -95,10 +91,9 @@ export type QueueSalesInvoiceUpdateDeps = {
    * operator has to already be reading. Injected like everything else this module uses.
    */
   recordPostingRefusal: (record: {
-    /**
-     * o3d-j625 r5: the key is the one THIS module's enqueue uses — `accountingPostingKey` over the same
-     * params — supplied by the caller's wiring so this seam cannot re-type it.
-     */
+    /** o3d-j625 r5/r6: the key THIS module's enqueue uses — derived here from the enqueue's own identity. */
+    /** o3d-j625 r6 (review H4): the kind of this site's refusal row — re-saving the order raises it again. */
+    kind: 'sales_invoice_update'
     posting: { type: string; referenceType: string; referenceId: string; scope: string }
     chartConnector: string | null
     activeConnector: string | null
@@ -113,6 +108,18 @@ export async function queueSalesInvoiceUpdateForExistingAccountingInvoice(
   params: SalesInvoiceUpdateQueueParams,
   deps: QueueSalesInvoiceUpdateDeps,
 ): Promise<void> {
+  // o3d-j625 r6 (review M1) — THE ENQUEUE'S IDENTITY, ONCE, AND THE KEY DERIVED FROM IT HERE. r5 had the
+  // caller build `posting` from its own re-typed copy of these fields and pass it in, which is the shape the
+  // review mutated: a caller could name a different posting than the one this module enqueues and nothing
+  // would notice. The refusal row, the enqueue and (through the facade) the clear now read one object.
+  const identity = {
+    type: 'SALES_INVOICE_UPDATE' as const,
+    referenceType: 'SalesOrder' as const,
+    referenceId: params.salesOrderId,
+    payload: params.payload,
+    idempotencyKey: params.idempotencyKey,
+  }
+  const posting = accountingPostingKey(identity)
   const connector = await deps.getActiveAccountingConnectorInfo()
   // o3d-j625: the codes and the row must come out of ONE resolution. Nothing is written when they do
   // not, and the posting stays outstanding — a sales-invoice update is re-derivable from the order, so
@@ -139,7 +146,8 @@ export async function queueSalesInvoiceUpdateForExistingAccountingInvoice(
       },
     })
     await deps.recordPostingRefusal({
-      posting: params.posting,
+      kind: 'sales_invoice_update',
+      posting,
       chartConnector: params.chartConnector,
       activeConnector: connector?.id ?? null,
       reason: 'retired_chart',
@@ -183,7 +191,8 @@ export async function queueSalesInvoiceUpdateForExistingAccountingInvoice(
       },
     })
     await deps.recordPostingRefusal({
-      posting: params.posting,
+      kind: 'sales_invoice_update',
+      posting,
       chartConnector: params.chartConnector,
       activeConnector: connector?.id ?? null,
       reason: 'unattributable_document_id',
@@ -218,11 +227,7 @@ export async function queueSalesInvoiceUpdateForExistingAccountingInvoice(
   }
 
   const enqueued = await deps.queueAccountingSync({
-    type: 'SALES_INVOICE_UPDATE',
-    referenceType: 'SalesOrder',
-    referenceId: params.salesOrderId,
-    payload: params.payload,
-    idempotencyKey: params.idempotencyKey,
+    ...identity,
     chartConnector: params.chartConnector,
     documentConnector: params.documentConnector,
   })
@@ -255,7 +260,8 @@ export async function queueSalesInvoiceUpdateForExistingAccountingInvoice(
       },
     })
     await deps.recordPostingRefusal({
-      posting: params.posting,
+      kind: 'sales_invoice_update',
+      posting,
       chartConnector: params.chartConnector,
       activeConnector: connector?.id ?? null,
       reason: 'enqueue_refused',

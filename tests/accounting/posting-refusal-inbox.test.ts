@@ -29,6 +29,8 @@ const rows: Array<Record<string, unknown>> = []
 /** The UPDATE branch of each upsert — what a second write would do to an existing row (review M-5). */
 const updates: Array<Record<string, unknown>> = []
 const activity: Array<{ action: string; level?: string }> = []
+/** o3d-j625 r6: every enqueue's params. */
+const asked: Array<Record<string, unknown>> = []
 let enqueueAnswer: { queued: boolean; reason?: string; connector: string | null; activeConnector?: string | null; refusalRecorded?: boolean } = { queued: true, connector: 'xero' }
 let activeConnector: string | null = 'quickbooks'
 
@@ -59,10 +61,10 @@ mock.module('@/lib/accounting', {
     // o3d-j625 r5: the facade reports the POSTING KEY it derived, and the report keys its row on that. The
     // REAL key function is used here — the contract under test is that the site forwards it, not that a
     // fixture can invent one.
-    queueAccountingSync: async (params: { type: string; referenceType: string; referenceId: string; idempotencyKey?: string; payload?: Record<string, unknown> }) => ({
-      ...enqueueAnswer,
-      posting: accountingPostingKey(params),
-    }),
+    queueAccountingSync: async (params: { type: string; referenceType: string; referenceId: string; idempotencyKey?: string; payload?: Record<string, unknown> }) => {
+      asked.push(params)
+      return { ...enqueueAnswer, posting: accountingPostingKey(params) }
+    },
   },
 })
 
@@ -212,7 +214,7 @@ test('[o3d-j625 r5 L-1] a refusal that cannot be recorded is itself reported, an
   const key = accountingPostingKey({ type: 'SALES_INVOICE', referenceType: 'SalesOrder', referenceId: 'so-9' })
 
   await recordAccountingPostingRefusal(broken, key, {
-    chartConnector: 'xero', activeConnector: 'quickbooks', reason: 'retired_chart', committed: 'x', remedy: 'y',
+    kind: 'sales_invoice_order', chartConnector: 'xero', activeConnector: 'quickbooks', reason: 'retired_chart', committed: 'x', remedy: 'y',
   })
   await clearAccountingPostingRefusal(broken, key)
 
@@ -247,4 +249,61 @@ test('[o3d-j625 r5 M-2] every reporting site names the chart it reports about', 
   assert.ok(sites.length >= 14, `PRECONDITION: the reporting sites were found (found ${sites.length})`)
   assert.deepEqual(sites.filter((site) => !site.named).map((site) => site.at), [],
     'these report a refused posting without naming its chart, and the inbox would show "none"')
+})
+
+// o3d-j625 r6 (review M3) — A SITE REPORTING FROM INSIDE A TRANSACTION WRITES THE ROW THROUGH IT, so a batch
+// that later throws takes the row with it. applyStockAdjustment runs inside the bulk adjustment and the
+// stock-count post; through the pool, a rolled-back batch left an outstanding posting for a movement that
+// never existed.
+test('[o3d-j625 r6 M3] reportPostingNotQueued writes through the caller\'s transaction when given one', async () => {
+  rows.length = 0
+  const { reportPostingNotQueued } = await import('@/lib/domain/accounting/enqueue-outcome')
+  const txRows: Array<Record<string, unknown>> = []
+  let savepoints = 0
+  await reportPostingNotQueued({
+    entityType: 'STOCK_ADJUSTMENT',
+    action: 'inventory_adjustment_journal_not_queued',
+    kind: 'stock_adjustment_journal',
+    posting: 'the inventory adjustment journal',
+    committed: 'the stock movement is written',
+    remedy: 'Post the journal by hand.',
+    outcome: { queued: false, reason: 'refused', connector: 'xero', posting: accountingPostingKey({ type: 'INVENTORY_ADJUSTMENT', referenceType: 'StockMovement', referenceId: 'mv-1' }) },
+    metadata: { chartConnector: 'xero' },
+    inTransaction: {
+      client: {
+        accountingPostingRefusal: {
+          upsert: async ({ create }) => { txRows.push(create); return create },
+          updateMany: async () => ({ count: 0 }),
+        },
+      },
+      withSavepoint: async (fn) => { savepoints++; return fn() },
+    },
+  })
+  assert.equal(txRows.length, 1, 'written through the transaction')
+  assert.equal(rows.length, 0, 'and not through the pool')
+  assert.ok(savepoints >= 1, 'under a savepoint, so a failed write cannot abort the batch')
+})
+
+test('[o3d-j625 r6 M3] applyStockAdjustment enqueues and reports inside the caller\'s transaction', async () => {
+  const { readFileSync } = await import('node:fs')
+  const code = blankNonCode(readFileSync(`${process.cwd()}/lib/domain/inventory/stock-adjustment-apply.ts`, 'utf8'))
+  assert.match(code, /await queueAccountingSyncTxWithOutcome\(tx, \{/, 'the enqueue shares the movement\'s transaction')
+  assert.doesNotMatch(code, /\bqueueAccountingSync\(/, 'not the facade, which commits on its own')
+  assert.match(code, /recordRefusalAsOutstanding: true,/)
+  assert.match(code, /inTransaction: \{\s*client: tx as unknown as PostingRefusalClient,/)
+})
+
+// o3d-j625 r6 (review H4) — `tax_rate_sync` IS AN AUTO KIND because saving the rate again raises the SAME
+// posting. Driven through the real trigger twice: refused, then queued.
+test('[o3d-j625 r6 H4] saving the tax rate again raises the SAME posting', async () => {
+  asked.length = 0
+  rows.length = 0
+  enqueueAnswer = { queued: false, reason: 'refused', connector: 'xero' }
+  await pushTaxRate()
+  assert.equal(rows.length, 1, 'PRECONDITION: refused and recorded')
+  enqueueAnswer = { queued: true, connector: 'xero' }
+  await pushTaxRate()
+  assert.equal(asked.length, 2)
+  assert.deepEqual(accountingPostingKey(asked[1] as never), accountingPostingKey(asked[0] as never))
+  assert.equal(rows[0]!.kind, 'tax_rate_sync', 'and the row names its kind')
 })

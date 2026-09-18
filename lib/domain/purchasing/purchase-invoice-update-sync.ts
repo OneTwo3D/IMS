@@ -1,3 +1,4 @@
+import { accountingPostingKey, type AccountingPostingKey } from '@/lib/accounting/posting-key'
 import type { PurchaseInvoiceAccountingPayload } from '@/lib/domain/purchasing/purchase-invoice-edit'
 
 type AccountingConnectorInfo = {
@@ -109,6 +110,31 @@ export function purchaseInvoiceUpdateIsOwed(outcome: PurchaseInvoiceUpdateOutcom
   return outcome === 'refused' || outcome === 'refused-chart-retired'
 }
 
+/**
+ * o3d-j625 r6 (review H2) — WHAT THE UPDATE'S ENQUEUE IS CALLED WITH, IN ONE PLACE, so the refusal row the
+ * caller writes is keyed on exactly what the enqueue (and the row-creating primitive's clear) will use.
+ * The reference is the PURCHASE ORDER, which holds several bills; the bill is told apart by the payload's
+ * `accountingInvoiceId` (see SCOPE_RULES.PURCHASE_INVOICE_UPDATE).
+ */
+export function purchaseInvoiceUpdateEnqueueIdentity(params: {
+  poId: string
+  accountingPayload: PurchaseInvoiceAccountingPayload
+  idempotencyKey: string
+}) {
+  return {
+    type: 'PURCHASE_INVOICE_UPDATE' as const,
+    referenceType: 'PurchaseOrder' as const,
+    referenceId: params.poId,
+    payload: params.accountingPayload,
+    idempotencyKey: params.idempotencyKey,
+  }
+}
+
+/** The key of the update's posting — the one its refusal row must carry. */
+export function purchaseInvoiceUpdatePostingKey(params: Parameters<typeof purchaseInvoiceUpdateEnqueueIdentity>[0]): AccountingPostingKey {
+  return accountingPostingKey(purchaseInvoiceUpdateEnqueueIdentity(params) as unknown as Parameters<typeof accountingPostingKey>[0])
+}
+
 export async function maybeQueuePurchaseInvoiceUpdate<Tx extends PurchaseInvoiceUpdateSyncTx>(params: {
   tx: Tx
   syncEnabled: boolean
@@ -181,11 +207,11 @@ export async function maybeQueuePurchaseInvoiceUpdate<Tx extends PurchaseInvoice
   if (verdict.verdict !== 'post') return 'skipped-disabled'
 
   const queued = await params.deps.queueAccountingSyncTx(params.tx, {
-    type: 'PURCHASE_INVOICE_UPDATE',
-    referenceType: 'PurchaseOrder',
-    referenceId: params.poId,
-    payload: params.accountingPayload,
-    idempotencyKey: params.idempotencyKey,
+    ...purchaseInvoiceUpdateEnqueueIdentity({
+      poId: params.poId,
+      accountingPayload: params.accountingPayload,
+      idempotencyKey: params.idempotencyKey,
+    }),
     // o3d-j625 r2: the same connector the gate above just required to be Xero, and the one the caller
     // read the transit account and tax-type code from. One resolution, carried to the write.
     chartConnector: params.chartConnector,

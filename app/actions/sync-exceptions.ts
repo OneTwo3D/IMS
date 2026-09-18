@@ -35,6 +35,8 @@ import {
 } from '@/lib/domain/accounting/follow-up-obligation-registry'
 import { withDispatchSweepLockOrSkip } from '@/lib/domain/wms/dispatch-sweep-lock'
 import { logActivity, logActivityInTransaction } from '@/lib/activity-log'
+import { POSTING_REFUSAL_KINDS, POSTING_REFUSAL_NOTE_MAX_LENGTH, postingRefusalClearing, type PostingRefusalKind } from '@/lib/domain/accounting/posting-refusal-kinds'
+import { markAccountingPostingRefusalHandled } from '@/lib/domain/accounting/posting-refusal-inbox'
 import { freshAuthFailureResult, requireFreshPermission, requirePermission } from '@/lib/auth/server'
 import {
   IntegrationOutboxAdminError,
@@ -466,6 +468,23 @@ export type AccountingPostingRefusalRow = {
   refusedCount: number
   firstRefusedAt: string
   lastRefusedAt: string
+  /** o3d-j625 r6 (review H4): the site kind, and from it whether the row may be marked handled. */
+  kind: string | null
+  clearing: 'auto' | 'manual' | null
+  /** What raises the posting again (auto), or why nothing does (manual) — from the kind, not the row. */
+  clearingNote: string | null
+}
+
+/** o3d-j625 r6 (review H4): a recently RESOLVED refusal, so the page says how each one was closed. */
+export type ResolvedAccountingPostingRefusalRow = {
+  id: string
+  type: string
+  referenceType: string
+  referenceId: string
+  resolvedAt: string
+  resolution: string | null
+  resolvedByName: string | null
+  resolutionNote: string | null
 }
 
 export type ExceptionInboxSummary = {
@@ -514,6 +533,7 @@ export type ExceptionInboxData = {
   unresolvedDrift: UnresolvedDriftRow[]
   accountingFollowUpObligations: AccountingFollowUpObligationRow[]
   accountingPostingRefusals: AccountingPostingRefusalRow[]
+  accountingPostingRefusalsResolved: ResolvedAccountingPostingRefusalRow[]
 }
 
 // Codex r4: only PERMANENT_FAILED rows are actionable exceptions — a
@@ -1007,6 +1027,7 @@ export async function getExceptionInboxData(): Promise<ExceptionInboxData> {
         refusedCount: true,
         firstRefusedAt: true,
         lastRefusedAt: true,
+        kind: true,
       },
     }),
   ])
@@ -1320,11 +1341,17 @@ export async function getExceptionInboxData(): Promise<ExceptionInboxData> {
     }),
     // o3d-j625 r4: rendered from the columns the refusal itself wrote — the remedy an operator reads is
     // the one the refusing site stated, so the page and the accounting log cannot tell two stories.
-    accountingPostingRefusals: postingRefusalRows.map((row) => ({
-      ...row,
-      firstRefusedAt: row.firstRefusedAt.toISOString(),
-      lastRefusedAt: row.lastRefusedAt.toISOString(),
-    })),
+    accountingPostingRefusals: postingRefusalRows.map((row) => {
+      const clearing = postingRefusalClearing(row.kind)
+      return {
+        ...row,
+        firstRefusedAt: row.firstRefusedAt.toISOString(),
+        lastRefusedAt: row.lastRefusedAt.toISOString(),
+        clearing,
+        clearingNote: clearing ? POSTING_REFUSAL_KINDS[row.kind as PostingRefusalKind].how : null,
+      }
+    }),
+    accountingPostingRefusalsResolved: await loadResolvedPostingRefusals(),
   }
 
   return {
@@ -1337,6 +1364,101 @@ export async function getExceptionInboxData(): Promise<ExceptionInboxData> {
 }
 
 type MutationResult = { success: boolean; error?: string } | FreshAuthFailureResult
+
+/**
+ * o3d-j625 r6 (review H4) — the refusals resolved in the last 30 days, newest first, with who resolved them
+ * and how: `queued` when IMS cleared the row by queueing the posting, `handled_manually` when someone marked
+ * a MANUAL-ONLY row handled after posting it by hand.
+ */
+async function loadResolvedPostingRefusals(): Promise<ResolvedAccountingPostingRefusalRow[]> {
+  const rows = await db.accountingPostingRefusal.findMany({
+    where: { resolvedAt: { gte: new Date(Date.now() - 30 * 24 * 60 * 60 * 1000) } },
+    orderBy: { resolvedAt: 'desc' },
+    take: SECTION_LIMIT,
+    select: {
+      id: true, type: true, referenceType: true, referenceId: true,
+      resolvedAt: true, resolution: true, resolvedBy: true, resolutionNote: true,
+    },
+  })
+  const userIds = [...new Set(rows.map((row) => row.resolvedBy).filter((id): id is string => Boolean(id)))]
+  const users = userIds.length === 0
+    ? []
+    : await db.user.findMany({ where: { id: { in: userIds } }, select: { id: true, name: true } })
+  const nameOf = new Map(users.map((user) => [user.id, user.name]))
+  return rows.map((row) => ({
+    id: row.id,
+    type: row.type,
+    referenceType: row.referenceType,
+    referenceId: row.referenceId,
+    resolvedAt: (row.resolvedAt as Date).toISOString(),
+    resolution: row.resolution,
+    resolvedByName: row.resolvedBy ? (nameOf.get(row.resolvedBy) ?? row.resolvedBy) : null,
+    resolutionNote: row.resolutionNote,
+  }))
+}
+
+/**
+ * o3d-j625 r6 (review H4; owner decision 2026-09-18) — MARK A REFUSED POSTING HANDLED, after posting it by
+ * hand in the ledger.
+ *
+ * ONLY FOR A MANUAL-ONLY KIND — decided here, server-side, from the row's stored kind and the closed
+ * classification in posting-refusal-kinds.ts, never from what the page showed. A row IMS clears itself
+ * (AUTO) is refused: dismissing it would hide a debt that is still real while IMS would have cleared it
+ * on its own. A row with no kind (written before the column) is refused too — fail closed.
+ *
+ * The write is ONE conditional update on "still outstanding and manual" (see
+ * markAccountingPostingRefusalHandled), so a double-click or two operators resolve it once. The same
+ * posting refused again later reopens the row as a new episode (posting-refusal-inbox.ts).
+ */
+export async function markAccountingPostingRefusalHandledAction(id: string, note: string): Promise<MutationResult> {
+  try {
+    const session = await requireFreshPermission('sync')
+    if (typeof id !== 'string' || id === '') return { success: false, error: 'No refused posting was named.' }
+    const trimmed = typeof note === 'string' ? note.trim() : ''
+    if (trimmed.length > POSTING_REFUSAL_NOTE_MAX_LENGTH) {
+      return { success: false, error: `The note is limited to ${POSTING_REFUSAL_NOTE_MAX_LENGTH} characters.` }
+    }
+    const row = await db.accountingPostingRefusal.findUnique({
+      where: { id },
+      select: { id: true, type: true, referenceType: true, referenceId: true, kind: true, resolvedAt: true },
+    })
+    if (!row) return { success: false, error: 'This refused posting no longer exists.' }
+    if (row.resolvedAt) return { success: false, error: 'This refused posting is already resolved.' }
+    const clearing = postingRefusalClearing(row.kind)
+    if (clearing !== 'manual') {
+      return {
+        success: false,
+        error: clearing === 'auto'
+          ? 'IMS clears this row itself when the posting is queued, so it cannot be marked handled. '
+            + POSTING_REFUSAL_KINDS[row.kind as PostingRefusalKind].how
+          : 'This row does not say which kind of refusal it is, so it cannot be marked handled.',
+      }
+    }
+    const manualKinds = (Object.keys(POSTING_REFUSAL_KINDS) as PostingRefusalKind[])
+      .filter((kind) => POSTING_REFUSAL_KINDS[kind].clearing === 'manual')
+    const resolved = await markAccountingPostingRefusalHandled(db, {
+      id, manualKinds, userId: session.user.id, note: trimmed === '' ? null : trimmed,
+    })
+    if (resolved === 0) return { success: false, error: 'This refused posting is already resolved.' }
+    await logActivity({
+      entityType: 'SYSTEM',
+      tag: 'accounting',
+      action: 'accounting_posting_refusal_marked_handled',
+      level: 'INFO',
+      description:
+        `Marked the refused ${row.type} for ${row.referenceType} ${row.referenceId} as handled — posted by hand `
+        + 'in the ledger.',
+      metadata: { refusalId: id, kind: row.kind, userId: session.user.id, note: trimmed === '' ? null : trimmed },
+      resolveUser: false,
+    })
+    revalidatePath('/sync/exceptions')
+    return { success: true }
+  } catch (error) {
+    const freshAuthFailure = freshAuthFailureResult(error)
+    if (freshAuthFailure) return freshAuthFailure
+    throw error
+  }
+}
 
 /**
  * Replay a failed integration-outbox row (accounting post / WC stock push /

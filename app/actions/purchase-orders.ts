@@ -5,7 +5,7 @@ import { z } from 'zod'
 import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
 import { requirePermission } from '@/lib/auth/server'
-import { queueAccountingSync, queueAccountingSyncTx, getAccountingSettings, getAccountingSettingsFor, getActiveAccountingConnectorInfo, isAccountingSyncTypeEnabledFor, accountingPostingKey, listAccountingBankAccounts, listAccountingBankAccountsWithChart, asRoutableAccountingConnector, accountingPostingVerdictForChart, type AccountingBankAccount } from '@/lib/accounting'
+import { queueAccountingSync, queueAccountingSyncTx, getAccountingSettings, getAccountingSettingsFor, getActiveAccountingConnectorInfo, isAccountingSyncTypeEnabledFor, listAccountingBankAccounts, listAccountingBankAccountsWithChart, asRoutableAccountingConnector, accountingPostingVerdictForChart, type AccountingBankAccount } from '@/lib/accounting'
 import { postingIsOwed, reportPostingNotQueued, type EnqueueOutcomeLike } from '@/lib/domain/accounting/enqueue-outcome'
 import { recordAccountingPostingRefusal, type PostingRefusalClient } from '@/lib/domain/accounting/posting-refusal-inbox'
 import { accountingPayloadKey } from '@/lib/accounting/payload-key'
@@ -53,7 +53,7 @@ import {
   validatePurchaseInvoiceLineLimits,
   type PurchaseInvoiceInputLine,
 } from '@/lib/domain/purchasing/purchase-invoice-edit'
-import { maybeQueuePurchaseInvoiceUpdate, purchaseInvoiceUpdateIsOwed } from '@/lib/domain/purchasing/purchase-invoice-update-sync'
+import { maybeQueuePurchaseInvoiceUpdate, purchaseInvoiceUpdateIsOwed, purchaseInvoiceUpdatePostingKey } from '@/lib/domain/purchasing/purchase-invoice-update-sync'
 import {
   computeGrossUnitCostBaseByLine,
   queueLandedCostAdjustmentJournals,
@@ -2136,10 +2136,12 @@ export async function receivePurchaseOrder(
         entityType: 'PURCHASE_ORDER',
         entityId: id,
         action: 'stock_receipt_journal_not_queued',
+        // o3d-j625 r6 (review H4): which site refused, and so whether its row clears itself or is marked handled.
+        kind: 'stock_receipt_journal',
         posting: `the stock receipt journal for PO ${po.reference}`,
         committed: 'the stock was received into inventory in IMS',
         remedy:
-          'Goods-in-transit has NOT been drained into inventory in the ledger. Post the journal by hand, or clear the accounting connector selection and re-run the daily reconcile.',
+          'Goods-in-transit has NOT been drained into inventory in the ledger. Post the journal by hand.',
         outcome: receiptPostingOutcome.outcome,
         metadata: { reference: po.reference, chartConnector: accountingSettings.connector },
       })
@@ -2668,10 +2670,12 @@ export async function returnPurchaseOrder(
         entityType: 'PURCHASE_ORDER',
         entityId: id,
         action: 'supplier_return_journal_not_queued',
+        // o3d-j625 r6 (review H4): which site refused, and so whether its row clears itself or is marked handled.
+        kind: 'supplier_return_reversal',
         posting: `the supplier return journal for PO ${po.reference}`,
         committed: 'the return is booked and the stock reduced in IMS',
         remedy:
-          'The reversal out of inventory into goods-in-transit is NOT in the ledger. Post it by hand, or re-raise the return once the accounting connector selection has settled.',
+          'The reversal out of inventory into goods-in-transit is NOT in the ledger. Post it by hand.',
         outcome: returnPostingOutcome.outcome,
         metadata: { reference: po.reference, chartConnector: accountingSettings.connector },
       })
@@ -3156,10 +3160,13 @@ export async function createInvoice(
         entityType: 'PURCHASE_ORDER',
         entityId: poId,
         action: 'purchase_invoice_not_queued',
+        // o3d-j625 r6 (review H4): which site refused, and so whether its row clears itself or is marked handled.
+        kind: 'purchase_invoice',
         posting: `the purchase bill for PO ${po.reference}`,
         committed: 'the bill is recorded in IMS',
         remedy:
-          'The bill is NOT in the ledger, so payables understate it and goods-in-transit is not cleared. Re-create the bill once the accounting connector selection has settled, or enter it by hand in the books it belongs to.',
+          // o3d-j625 r6 (review H4): "re-create the bill" would make a SECOND bill in IMS; nothing raises this one again.
+          'The bill is NOT in the ledger, so payables understate it and goods-in-transit is not cleared. Enter it by hand in the books it belongs to.',
         outcome: billPostingOutcome.outcome,
         metadata: { reference: po.reference, invoiceNumber: input.invoiceNumber ?? null, chartConnector: accountingSettings.connector },
       })
@@ -3611,14 +3618,16 @@ export async function updateInvoice(
         },
       }).catch(() => { /* the save already happened; logging must not turn it into a failure */ })
       // o3d-j625 r4: the ledger holds the PREVIOUS version of this bill and nothing retries — outstanding.
-      await recordAccountingPostingRefusal(db as unknown as PostingRefusalClient, accountingPostingKey({
-        // o3d-j625 r5: the key `maybeQueuePurchaseInvoiceUpdate`'s own enqueue uses — PURCHASE_INVOICE_UPDATE
-        // is DOCUMENT-scoped, because its idempotency key is a content hash that changes with every edit and
-        // would strand the previous attempt's row for ever.
-        type: 'PURCHASE_INVOICE_UPDATE',
-        referenceType: 'PurchaseOrder',
-        referenceId: invoice.poId,
+      // o3d-j625 r6 (review H2): the key `maybeQueuePurchaseInvoiceUpdate`'s own enqueue uses, from the SAME
+      // identity function — which tells this PO's bills apart by the payload's bill id. r5 re-typed the
+      // three reference fields here and keyed on the PURCHASE ORDER alone, so bill B's successful update
+      // cleared bill A's refusal.
+      await recordAccountingPostingRefusal(db as unknown as PostingRefusalClient, purchaseInvoiceUpdatePostingKey({
+        poId: invoice.poId,
+        accountingPayload,
+        idempotencyKey: idempotencyKey ?? '',
       }), {
+        kind: 'purchase_invoice_update',
         chartConnector: accountingSettings.connector,
         activeConnector: (await getActiveAccountingConnectorInfo().catch(() => null))?.id ?? null,
         reason: billUpdateSync.outcome === 'refused-chart-retired' ? 'retired_chart' : 'enqueue_refused',
@@ -4047,11 +4056,12 @@ export async function markBillPaid(
               entityType: 'PURCHASE_ORDER',
               entityId: invoice.poId,
               action: 'realised_fx_journal_not_queued',
+              // o3d-j625 r6 (review H4): which site refused, and so whether its row clears itself or is marked handled.
+              kind: 'realised_fx_bill_payment',
               posting: `the realised FX journal for the payment on bill ${invoice.invoiceNumber ?? invoice.po.reference}`,
               committed: 'the bill is marked paid in IMS',
               remedy:
-                'The realised gain/loss on this settlement is NOT in the ledger. Raise it by hand, or '
-                + 'clear the connector selection and re-run the FX revaluation for this date.',
+                'The realised gain/loss on this settlement is NOT in the ledger. Raise it by hand.',
               outcome: fxEnqueued,
               metadata: { invoiceId: invoice.id, chartConnector: accountingSettings.connector },
             })

@@ -3,6 +3,7 @@
  * Each entry represents one IMS transaction → one Xero API call.
  */
 
+import { createAccountingSyncLogRow } from '@/lib/domain/accounting/sync-log-row'
 import { readFile } from 'fs/promises'
 import { createHash } from 'crypto'
 import { db, POST_REMOTE_PERSIST_TX_OPTIONS } from '@/lib/db'
@@ -1534,8 +1535,7 @@ export async function enqueueFollowUpSyncLog(
         })
         return 'done' as const
       }
-      const log = await tx.accountingSyncLog.create({
-        data: {
+      const log = await createAccountingSyncLogRow(tx, {
           connector: XERO_CONNECTOR,
           type,
           status: 'PENDING',
@@ -1552,8 +1552,7 @@ export async function enqueueFollowUpSyncLog(
           // read this row's unset `remoteAttemptedAt` as proof no remote call ever left it — see
           // money-attempt-provenance.ts. A row created without it is never recycled again.
           ...stampingCustodyOnCreate(),
-        },
-      })
+        })
       // Same rule on the create arm: one transaction, so a money post cleared by an assertion cannot
       // exist without the line that says so.
       await recordEnqueueRestingOnAssertion(tx, { type, referenceType, referenceId }, plan)
@@ -6955,6 +6954,13 @@ export async function reenqueueMissingCreditNoteAllocations(limit = 200): Promis
       const candidate = candidateById.get(item.supplierCreditNoteId)
       const creditNoteConnector = candidate?.accountingCreditNoteConnector ?? null
       const billConnector = candidate?.purchaseInvoice?.accountingInvoiceConnector ?? null
+      // o3d-j625 r6 (review M1/H3): the allocation's enqueue identity, ONCE — the enqueue further down and the
+      // refusal row below both read it, and the row the enqueue creates clears the refusal it discharges.
+      const allocationIdentity = {
+        type: 'PURCHASE_CREDIT_NOTE_ALLOCATION' as const,
+        referenceType: 'SupplierCreditNote',
+        referenceId: item.supplierCreditNoteId,
+      }
       if (creditNoteConnector !== XERO_CONNECTOR || billConnector !== XERO_CONNECTOR) {
         result.failed++
         await logActivity({
@@ -6978,16 +6984,14 @@ export async function reenqueueMissingCreditNoteAllocations(limit = 200): Promis
           },
         }).catch(() => { /* a report that cannot be written must not stop the sweep */ })
         // o3d-j625 r5 (review M-15): the message says the allocation is still OUTSTANDING, so it goes where
-        // outstanding work is listed. Keyed exactly as the allocation's own enqueue is, so the follow-up
-        // that eventually queues it clears this row.
+        // outstanding work is listed. r6 (review H3): keyed on the allocation's own enqueue identity, and
+        // cleared when a later sweep creates that row — every sync row is created through
+        // createAccountingSyncLogRow, which clears the refusal the row discharges.
         await recordAccountingPostingRefusal(
           db as unknown as PostingRefusalClient,
-          accountingPostingKey({
-            type: 'PURCHASE_CREDIT_NOTE_ALLOCATION',
-            referenceType: 'SupplierCreditNote',
-            referenceId: item.supplierCreditNoteId,
-          }),
+          accountingPostingKey(allocationIdentity),
           {
+            kind: 'credit_note_allocation',
             chartConnector: creditNoteConnector,
             activeConnector: XERO_CONNECTOR,
             reason: 'unattributable_document_id',
@@ -7010,7 +7014,7 @@ export async function reenqueueMissingCreditNoteAllocations(limit = 200): Promis
       // and the same remedy as finding no row at all, with a description that says which it was.
       const inherited = origin.outcome === 'inherited' ? readAccountingPayloadConnectionStamp(origin.payload) : null
       const inheritedProvenance = inherited?.state === 'stamped' ? inherited.provenance : null
-      const enqueue = await enqueueFollowUpSyncLog('PURCHASE_CREDIT_NOTE_ALLOCATION', 'SupplierCreditNote', item.supplierCreditNoteId, {
+      const enqueue = await enqueueFollowUpSyncLog(allocationIdentity.type, allocationIdentity.referenceType, allocationIdentity.referenceId, {
         creditNoteId: item.creditNoteId,
         accountingInvoiceId: item.accountingInvoiceId,
         amount: item.amount,

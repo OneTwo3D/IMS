@@ -1,5 +1,7 @@
 import type { Prisma } from '@/app/generated/prisma/client'
-import { queueAccountingSync, getAccountingSettings } from '@/lib/accounting'
+import { queueAccountingSyncTxWithOutcome, getAccountingSettings } from '@/lib/accounting'
+import { withSavepoint } from '@/lib/db/savepoint'
+import type { PostingRefusalClient } from '@/lib/domain/accounting/posting-refusal-inbox'
 import { postingIsOwed, reportPostingNotQueued } from '@/lib/domain/accounting/enqueue-outcome'
 import { cogsEntryDataFromConsumed, consumeFifoLayersStrict, createCostLayer, getAverageUnitCost, getHistoricalAverageUnitCost, lockStockLevelRow } from '@/lib/cost-layers'
 import { assertStockAdjustmentFeasible } from '@/lib/domain/inventory/stock-adjustment-edit'
@@ -322,7 +324,12 @@ export async function applyStockAdjustment({
       note: reasonName,
     })
     if (journal) {
-      const enqueued = await queueAccountingSync({
+      // o3d-j625 r6 (review M3) — IN THE CALLER'S TRANSACTION. This runs inside the bulk adjustment and the
+      // stock-count post, whose later lines can throw and roll the batch back. Through the facade (its own
+      // transaction and the pool) both the sync row AND r5's refusal row survived that rollback — an
+      // outstanding posting, or a queued journal, for a stock movement that never existed. Written through
+      // `tx`, the sync row and the refusal row share the movement's fate.
+      const enqueued = await queueAccountingSyncTxWithOutcome(tx, {
         type: 'INVENTORY_ADJUSTMENT',
         referenceType: 'StockMovement',
         referenceId: movement.id,
@@ -333,6 +340,7 @@ export async function applyStockAdjustment({
         // enqueued against it — so an unrouted enqueue could write the tail of a batch under the other
         // connector while carrying the first connector's inventory account.
         chartConnector: settings.connector,
+        recordRefusalAsOutstanding: true,
       })
       // o3d-j625 r3 (Codex HIGH 1 family) — THE ANSWER IS READ. The movement and its cost layers are
       // already written, and a non-null return from this function is every caller's success signal
@@ -344,14 +352,19 @@ export async function applyStockAdjustment({
           entityType: 'STOCK_ADJUSTMENT',
           entityId: movement.id,
           action: 'inventory_adjustment_journal_not_queued',
+          // o3d-j625 r6 (review H4): which site refused, and so whether its row clears itself or is marked handled.
+          kind: 'stock_adjustment_journal',
           posting: `the inventory adjustment journal for ${product?.sku ?? productId} at ${warehouse?.name ?? warehouseId}`,
           committed: 'the stock movement and its cost layers are written in IMS',
           remedy:
             'Inventory in the ledger no longer matches IMS by the value of this adjustment. Post the '
-            + 'journal by hand, or re-run the daily reconcile once the accounting connector selection has '
-            + 'settled.',
+            + 'journal by hand.',
           outcome: enqueued,
           metadata: { movementId: movement.id, productId, warehouseId, chartConnector: settings.connector },
+          inTransaction: {
+            client: tx as unknown as PostingRefusalClient,
+            withSavepoint: <T,>(fn: () => Promise<T>) => withSavepoint(tx, fn),
+          },
         })
       }
     }

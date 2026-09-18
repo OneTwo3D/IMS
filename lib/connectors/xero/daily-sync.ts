@@ -13,6 +13,7 @@
  *   Per-shipment, with FIFO cost layer consumption.
  */
 
+import { createAccountingSyncLogRow } from '@/lib/domain/accounting/sync-log-row'
 import { createHash } from 'node:crypto'
 
 import { db } from '@/lib/db'
@@ -397,8 +398,7 @@ async function createPendingSyncLog(
     params.payload,
     await activeAccountingIdProvenance(XERO_CONNECTOR),
   )
-  const log = await tx.accountingSyncLog.create({
-    data: {
+  const log = await createAccountingSyncLogRow(tx, {
       connector: XERO_CONNECTOR,
       type: params.type,
       status: 'PENDING',
@@ -418,8 +418,7 @@ async function createPendingSyncLog(
       // read this row's unset `remoteAttemptedAt` as proof no remote call ever left it — see
       // money-attempt-provenance.ts. A row created without it is never recycled again.
       ...stampingCustodyOnCreate(),
-    },
-  })
+    })
   await scheduleXeroAccountingOutbox(tx, {
     accountingSyncLogId: log.id,
   })

@@ -4,6 +4,7 @@
  * Mirrors lib/connectors/xero/sync-processor.ts.
  */
 
+import { createAccountingSyncLogRow } from '@/lib/domain/accounting/sync-log-row'
 import { readFile } from 'fs/promises'
 import { createHash } from 'crypto'
 import { db } from '@/lib/db'
@@ -17,7 +18,7 @@ import { pushSalesInvoice } from './invoices'
 import { pushPurchaseBill } from './bills'
 import { pushCreditMemo } from './credit-notes'
 import { pushJournalEntry } from './journals'
-import { qboPost, qboUploadAttachment, resolveAccountRef, qboPostIdempotent} from './api'
+import { qboPost, qboUploadAttachment, resolvePaymentAccountRef, qboPostIdempotent} from './api'
 import { accountingBankAccountBelongsTo, lookupPaymentAccount, getPaymentAccountMap } from '@/lib/accounting'
 import { parsePaymentAccountMap } from '@/lib/accounting/payment-account-map'
 import { updateMirroredAccountingEventStatus } from '@/lib/domain/accounting/accounting-event-mirror'
@@ -765,8 +766,7 @@ export async function enqueueFollowUpSyncLog(
     }
     await db.$transaction(async (tx) => {
       await lockFollowUpScope(tx, { connector: QBO_CONNECTOR, type, referenceType, referenceId })
-      await tx.accountingSyncLog.create({
-        data: {
+      await createAccountingSyncLogRow(tx, {
           connector: QBO_CONNECTOR,
           type,
           status: 'PENDING',
@@ -777,8 +777,7 @@ export async function enqueueFollowUpSyncLog(
           // read this row's unset `remoteAttemptedAt` as proof no remote call ever left it — see
           // money-attempt-provenance.ts. A row created without it is never recycled again.
           ...stampingCustodyOnCreate(),
-        },
-      })
+        })
     })
   } catch (error) {
     // A concurrent run took the live slot and the partial unique index
@@ -1424,7 +1423,7 @@ async function processEntry(
       if (!customerRefId) {
         return { success: false, error: 'Missing customer reference for INVOICE_PAYMENT — customer has no QuickBooks contact ID' }
       }
-      const accountRef = await resolveAccountRef(bankAccountId)
+      const accountRef = await resolvePaymentAccountRef(bankAccountId)
       if (!accountRef) {
         return { success: false, error: `Bank account ${bankAccountId} not found in synced QuickBooks chart of accounts` }
       }
@@ -1569,7 +1568,7 @@ async function processEntry(
       if (!vendorRefId) {
         return { success: false, error: 'Missing vendor reference for BILL_PAYMENT — supplier has no QuickBooks contact ID' }
       }
-      const accountRef = await resolveAccountRef(bankAccountId)
+      const accountRef = await resolvePaymentAccountRef(bankAccountId)
       if (!accountRef) {
         return { success: false, error: `Bank account ${bankAccountId} not found in synced QuickBooks chart of accounts` }
       }

@@ -1,5 +1,6 @@
 import type { Prisma } from '@/app/generated/prisma/client'
 import { logActivity } from '@/lib/activity-log'
+import type { PostingRefusalKind } from '@/lib/domain/accounting/posting-refusal-kinds'
 
 /**
  * o3d-j625 r4/r5 — A REFUSED POSTING IS OUTSTANDING WORK, NOT A LOG LINE.
@@ -61,6 +62,12 @@ export type PostingRefusalClient = {
 export type PostingRefusalKey = { type: string; referenceType: string; referenceId: string; scope: string }
 
 export type AccountingPostingRefusalRecord = {
+  /**
+   * o3d-j625 r6 (review H4) — WHICH SITE REFUSED, from the closed set in posting-refusal-kinds.ts. Required,
+   * so a new refusal site cannot compile without saying whether its row clears itself or is marked handled.
+   * `null` only where the enqueue itself records and no kind is defined for the posting — never markable.
+   */
+  kind: PostingRefusalKind | null
   /** Whose chart of accounts the refused payload was built from; `null` = nothing was switched on. */
   chartConnector: string | null
   /** What was active at the moment of refusal — the half round 2's warning left out. */
@@ -136,6 +143,8 @@ export async function recordAccountingPostingRefusal(
       // `firstRefusedAt` is when THIS gap opened and the count is this episode's.
       await client.accountingPostingRefusal.updateMany({
         where: { ...key, resolvedAt: { not: null } },
+        // r6 (review H4): a row someone MARKED HANDLED reopens the same way — the same posting refused again
+        // is a new debt, whoever closed the last one. (How it was closed is cleared with `resolvedAt`, below.)
         data: { firstRefusedAt: now, refusedCount: 0, detail: null },
       })
     }
@@ -143,6 +152,7 @@ export async function recordAccountingPostingRefusal(
       where: { type_referenceType_referenceId_scope: key },
       create: {
         ...key,
+        kind: record.kind,
         chartConnector: record.chartConnector,
         activeConnector: record.activeConnector,
         reason: record.reason,
@@ -160,7 +170,12 @@ export async function recordAccountingPostingRefusal(
             // review L-2: `detail` is REPLACED, never merged — a stale detail can describe a different
             // refusal of the same posting.
             detail: (record.detail ?? null) as Prisma.InputJsonValue | null,
+            // The SITE names the kind; the enqueue's own write could only default it (posting-refusal-kinds.ts).
+            ...(record.kind ? { kind: record.kind } : {}),
             resolvedAt: null,
+            resolution: null,
+            resolvedBy: null,
+            resolutionNote: null,
           }
         : {
             chartConnector: record.chartConnector,
@@ -170,7 +185,11 @@ export async function recordAccountingPostingRefusal(
             remedy: record.remedy,
             detail: (record.detail ?? null) as Prisma.InputJsonValue | null,
             lastRefusedAt: now,
+            ...(record.kind ? { kind: record.kind } : {}),
             resolvedAt: null,
+            resolution: null,
+            resolvedBy: null,
+            resolutionNote: null,
             refusedCount: { increment: 1 },
           },
     })
@@ -192,7 +211,31 @@ export async function clearAccountingPostingRefusal(
   await guarded('clearing', key, options, async () => {
     await client.accountingPostingRefusal.updateMany({
       where: { ...key, resolvedAt: null },
-      data: { resolvedAt: new Date() },
+      data: { resolvedAt: new Date(), resolution: 'queued' },
     })
   })
+}
+
+/**
+ * o3d-j625 r6 (review H4; owner decision 2026-09-18) — MARK A MANUAL-ONLY ROW HANDLED.
+ *
+ * ONE CONDITIONAL UPDATE, so the checks and the write cannot be separated: the row must still be
+ * outstanding (`resolvedAt: null`) and of a MANUAL kind. A double-click or two operators at once therefore
+ * resolve it once — the second update matches nothing and is told so — and an AUTO row, or a row with no
+ * kind, can never be closed by hand however the request is made. Returns how many rows it resolved (0 or 1).
+ */
+export async function markAccountingPostingRefusalHandled(
+  client: { accountingPostingRefusal: { updateMany(args: { where: Record<string, unknown>; data: Record<string, unknown> }): Promise<{ count: number }> } },
+  params: { id: string; manualKinds: readonly string[]; userId: string; note: string | null; now?: Date },
+): Promise<number> {
+  const result = await client.accountingPostingRefusal.updateMany({
+    where: { id: params.id, resolvedAt: null, kind: { in: [...params.manualKinds] } },
+    data: {
+      resolvedAt: params.now ?? new Date(),
+      resolution: 'handled_manually',
+      resolvedBy: params.userId,
+      resolutionNote: params.note,
+    },
+  })
+  return result.count
 }

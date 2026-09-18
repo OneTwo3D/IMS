@@ -1,7 +1,13 @@
 'use client'
 
 import { Fragment, useState, useTransition } from 'react'
-import { ACCOUNTING_POSTING_REFUSAL_SECTION_DETAIL } from '@/lib/domain/accounting/posting-refusal-copy'
+import {
+  ACCOUNTING_POSTING_REFUSAL_CLEARING_LABEL,
+  ACCOUNTING_POSTING_REFUSAL_MARK_HANDLED_WARNING,
+  ACCOUNTING_POSTING_REFUSAL_RESOLVED_DETAIL,
+  ACCOUNTING_POSTING_REFUSAL_SECTION_DETAIL,
+} from '@/lib/domain/accounting/posting-refusal-copy'
+import { POSTING_REFUSAL_NOTE_MAX_LENGTH } from '@/lib/domain/accounting/posting-refusal-kinds'
 import Link from 'next/link'
 import { useRouter } from 'next/navigation'
 import { ArrowLeft, CheckCircle2, Inbox, Loader2, PackageCheck, PencilLine, RotateCcw, Split, XCircle } from 'lucide-react'
@@ -26,6 +32,7 @@ import { replayWmsOrderPush } from '@/app/actions/wms-order-push'
 import {
   clearPennyMismatchFlag,
   dismissWithdrawnDispatch,
+  markAccountingPostingRefusalHandledAction,
   endHeldMaintenanceWindow,
   recordWithdrawnDespatch,
   runPostMaintenanceRecheckNow,
@@ -76,6 +83,9 @@ export function ExceptionsClient({ data }: Props) {
   const [recoveringParkId, setRecoveringParkId] = useState<string | null>(null)
   // o3d-w00 (Codex r1 #3): the park currently being hand-recorded, or null.
   const [recordingPark, setRecordingPark] = useState<RefundSyncParkRow | null>(null)
+  // o3d-j625 r6 (review H4): the MANUAL-ONLY refusal being marked handled, and the operator's note.
+  const [markingRefusal, setMarkingRefusal] = useState<{ id: string; label: string } | null>(null)
+  const [markingNote, setMarkingNote] = useState('')
 
   async function withStepUp<T extends MaybeFreshAuthFailure>(run: () => Promise<T>): Promise<T> {
     const result = await run()
@@ -111,6 +121,43 @@ export function ExceptionsClient({ data }: Props) {
   return (
     <div className="space-y-4">
       {stepUpDialog}
+      {markingRefusal ? (
+        <Dialog open onOpenChange={() => { if (!isPending) setMarkingRefusal(null) }}>
+          <DialogContent showCloseButton={false} className="max-w-lg">
+            <DialogHeader>
+              <DialogTitle>Mark {markingRefusal.label} as handled</DialogTitle>
+            </DialogHeader>
+            <p className="text-sm text-muted-foreground">{ACCOUNTING_POSTING_REFUSAL_MARK_HANDLED_WARNING}</p>
+            <div className="space-y-1">
+              <Label htmlFor="refusal-handled-note">Note (optional) — e.g. the ledger journal number</Label>
+              <Input
+                id="refusal-handled-note"
+                value={markingNote}
+                maxLength={POSTING_REFUSAL_NOTE_MAX_LENGTH}
+                onChange={(event) => setMarkingNote(event.target.value)}
+              />
+            </div>
+            <DialogFooter>
+              <Button type="button" variant="outline" disabled={isPending} onClick={() => setMarkingRefusal(null)}>Cancel</Button>
+              <Button
+                type="button"
+                disabled={isPending}
+                onClick={() => {
+                  const target = markingRefusal
+                  runAction(
+                    () => markAccountingPostingRefusalHandledAction(target.id, markingNote),
+                    'Marked as handled.',
+                  )
+                  setMarkingRefusal(null)
+                  setMarkingNote('')
+                }}
+              >
+                <CheckCircle2 className="h-3 w-3 mr-1" />Mark as handled
+              </Button>
+            </DialogFooter>
+          </DialogContent>
+        </Dialog>
+      ) : null}
       {recordingPark ? (
         <RecordRefundManuallyDialog
           row={recordingPark}
@@ -922,6 +969,7 @@ export function ExceptionsClient({ data }: Props) {
                 <TableHead>Owed since</TableHead>
                 <TableHead>What stands in IMS</TableHead>
                 <TableHead>What to do</TableHead>
+                <TableHead>How it clears</TableHead>
               </TableRow>
             </TableHeader>
             <TableBody>
@@ -936,6 +984,59 @@ export function ExceptionsClient({ data }: Props) {
                   </TableCell>
                   <TableCell className="text-xs text-muted-foreground">{row.committed}</TableCell>
                   <TableCell className="text-xs text-muted-foreground">{row.remedy}</TableCell>
+                  <TableCell className="text-xs text-muted-foreground space-y-1">
+                    {/* o3d-j625 r6 (review H4): the action exists ONLY on MANUAL-ONLY rows; the server refuses it on any other. */}
+                    <div>{row.clearing ? ACCOUNTING_POSTING_REFUSAL_CLEARING_LABEL[row.clearing] : ''}{row.clearingNote ?? 'Unclassified.'}</div>
+                    {row.clearing === 'manual' ? (
+                      <Button
+                        type="button"
+                        variant="outline"
+                        size="sm"
+                        disabled={isPending}
+                        onClick={() => { setMarkingNote(''); setMarkingRefusal({ id: row.id, label: `${row.type} ${row.referenceType}/${row.referenceId}` }) }}
+                      >
+                        <CheckCircle2 className="h-3 w-3 mr-1" />Mark as handled
+                      </Button>
+                    ) : null}
+                  </TableCell>
+                </TableRow>
+              ))}
+            </TableBody>
+          </Table>
+        </Card>
+      ) : null}
+
+      {data.accountingPostingRefusalsResolved.length > 0 ? (
+        <Card className="p-4 space-y-3">
+          <SectionHeading
+            title="Refused postings resolved in the last 30 days"
+            detail={ACCOUNTING_POSTING_REFUSAL_RESOLVED_DETAIL}
+            shown={data.accountingPostingRefusalsResolved.length}
+            total={data.accountingPostingRefusalsResolved.length}
+          />
+          <Table containerClassName="rounded-lg border" className="min-w-[860px]">
+            <TableHeader className="bg-muted/40">
+              <TableRow>
+                <TableHead>Document</TableHead>
+                <TableHead>Reference</TableHead>
+                <TableHead>Resolved</TableHead>
+                <TableHead>How</TableHead>
+                <TableHead>Note</TableHead>
+              </TableRow>
+            </TableHeader>
+            <TableBody>
+              {data.accountingPostingRefusalsResolved.map((row) => (
+                <TableRow key={row.id}>
+                  <TableCell className="text-xs">{row.type}</TableCell>
+                  <TableCell className="text-xs font-mono">{row.referenceType}/{row.referenceId}</TableCell>
+                  <TableCell className="text-xs">{new Date(row.resolvedAt).toLocaleString()}</TableCell>
+                  <TableCell className="text-xs">
+                    {row.resolution === 'handled_manually'
+                      ? `Marked handled${row.resolvedByName ? ` by ${row.resolvedByName}` : ''}`
+                      : row.resolution === 'queued' ? 'Queued by IMS' : 'Resolved'}
+                  </TableCell>
+                  {/* Rendered as a text node, so React escapes it — the note is operator input. */}
+                  <TableCell className="text-xs text-muted-foreground">{row.resolutionNote ?? '—'}</TableCell>
                 </TableRow>
               ))}
             </TableBody>

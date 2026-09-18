@@ -1194,14 +1194,19 @@ async function releaseHeldWcSalesInvoice(
   // disconnected, its sync is switched off") for a REFUSAL. A refusal is a retired chart, and telling an
   // operator to check a toggle sends them somewhere the answer is not.
   const enqueueOutcome: { outcome?: EnqueueOutcomeLike } = {}
+  // o3d-j625 r6 (review M1): the release's enqueue identity, ONCE — the enqueue below and the refusal row's
+  // fallback key both read it, so the two cannot name different postings.
+  const releaseIdentity = {
+    type: 'SALES_INVOICE' as const,
+    referenceType: 'SalesOrder',
+    referenceId: orderId,
+    payload: buildReleasedSalesInvoicePayload(held, invoiceNumber),
+    idempotencyKey,
+  }
   try {
     const { queueAccountingSync } = await import('@/lib/accounting')
     enqueueOutcome.outcome = await queueAccountingSync({
-      type: 'SALES_INVOICE',
-      referenceType: 'SalesOrder',
-      referenceId: orderId,
-      payload: buildReleasedSalesInvoicePayload(held, invoiceNumber),
-      idempotencyKey,
+      ...releaseIdentity,
       // o3d-j625: route by the chart FROZEN with this payload, not by whatever is active at release
       // time. A hold that cannot name one never gets here — it is refused above.
       chartConnector: heldChartConnector,
@@ -1269,12 +1274,8 @@ async function releaseHeldWcSalesInvoice(
     // nobody reads. The refusal is now outstanding work in the exception inbox, and the release that
     // eventually queues the invoice clears it (the facade clears on a queued enqueue).
     // The key comes from the SAME params the enqueue above was given, so it is the key the facade's clear uses.
-    await recordAccountingPostingRefusal(db as unknown as PostingRefusalClient, enqueueOutcome.outcome?.posting ?? accountingPostingKey({
-      type: 'SALES_INVOICE',
-      referenceType: 'SalesOrder',
-      referenceId: orderId,
-      idempotencyKey,
-    }), {
+    await recordAccountingPostingRefusal(db as unknown as PostingRefusalClient, enqueueOutcome.outcome?.posting ?? accountingPostingKey(releaseIdentity), {
+      kind: 'sales_invoice_held_release',
       chartConnector: heldChartConnector,
       // o3d-j625 r5 (review M-4): the ACTIVE connector, read as such. r4 wrote the CHART's connector into
       // this column (via the enqueue's reported connector, which on a refusal is the chart's) and, because
@@ -2532,11 +2533,13 @@ export async function importWcOrder(wcOrder: WcFullOrder, options: ImportWcOrder
             entityType: 'SALES_ORDER',
             entityId: so.id,
             action: 'sales_invoice_not_queued',
+            // o3d-j625 r6 (review H4): which site refused, and so whether its row clears itself or is marked handled.
+            kind: 'sales_invoice_import',
             posting: `the sales invoice for imported WooCommerce order ${orderNumber}`,
             committed: 'the order is imported and marked synced in IMS',
             remedy:
-              'No invoice will post for this order. Re-queue it from the order once the accounting '
-              + 'connector selection has settled, or raise the invoice by hand in the books it belongs to.',
+              // o3d-j625 r6 (review H4): there is no re-queue from the order; the import queues the invoice once.
+              'No invoice will post for this order. Raise it by hand in the books it belongs to.',
             outcome: enqueued,
             metadata: {
               connector: 'woocommerce',

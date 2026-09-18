@@ -39,7 +39,6 @@ const refusalRows = [
  */
 /** One OPEN refusal and one already resolved, so a predicate that stops excluding resolved rows shows. */
 const resolvedRow = {
-  ...({} as Record<string, never>),
   id: 'refusal-resolved',
   type: 'CREDIT_NOTE',
   referenceType: 'SalesOrderRefund',
@@ -56,11 +55,15 @@ const resolvedRow = {
 }
 
 function matchesRefusalWhere(row: Record<string, unknown>, where: Record<string, unknown>): boolean {
-  if ('resolvedAt' in where) return row.resolvedAt === where.resolvedAt
-  return true
+  if (!('resolvedAt' in where)) return true
+  const condition = where.resolvedAt
+  if (condition && typeof condition === 'object' && 'gte' in (condition as object)) {
+    return row.resolvedAt instanceof Date && row.resolvedAt >= (condition as { gte: Date }).gte
+  }
+  return row.resolvedAt === condition
 }
 
-const seen: { countWhere?: Record<string, unknown>; listWhere?: Record<string, unknown>; listOrderBy?: unknown; listTake?: number } = {}
+const seen: { countWhere?: Record<string, unknown>; listWhere?: Record<string, unknown>; listOrderBy?: unknown; listTake?: number; resolvedWhere?: Record<string, unknown> } = {}
 
 const emptyModel = {
   findMany: async () => [],
@@ -82,9 +85,15 @@ const db = new Proxy({
       return allRows.filter((row) => matchesRefusalWhere(row, where)).length
     },
     findMany: async ({ where, orderBy, take }: { where: Record<string, unknown>; orderBy?: unknown; take?: number }) => {
-      seen.listWhere = where
-      seen.listOrderBy = orderBy
-      seen.listTake = take
+      // o3d-j625 r6: the page also reads RECENTLY RESOLVED rows (review H4). Only the OUTSTANDING list's
+      // arguments are recorded here — the resolved list is asserted by its own test below.
+      if (where.resolvedAt === null) {
+        seen.listWhere = where
+        seen.listOrderBy = orderBy
+        seen.listTake = take
+      } else {
+        seen.resolvedWhere = where
+      }
       return allRows.filter((row) => matchesRefusalWhere(row, where))
     },
   },

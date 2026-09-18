@@ -292,3 +292,88 @@ test('[o3d-j625 r4] maybeQueuePurchaseInvoiceUpdate REFUSES when the chart’s c
   assert.equal(result, 'refused-chart-retired')
   assert.equal(enqueues, 0)
 })
+
+// ---------------------------------------------------------------------------------------------------
+// o3d-j625 r6 (review H2 + M1) — THE BILL-UPDATE REFUSAL IS KEYED ON THE BILL, AND ON WHAT THE ENQUEUE USES.
+//
+// r5's refusal re-typed `PURCHASE_INVOICE_UPDATE/PurchaseOrder/<po>`, and the key function treated the type
+// as document-scoped — so on a PO holding two bills, bill B's successful update cleared bill A's refusal.
+// Driven through the real functions: the key the refusal site writes (`purchaseInvoiceUpdatePostingKey`)
+// is compared with the key derived from the params the enqueue was ACTUALLY called with, and then with the
+// key the row-creating primitive clears for the row those params produce.
+// ---------------------------------------------------------------------------------------------------
+async function enqueuedParamsFor(accountingInvoiceId: string, idempotencyKey: string) {
+  const calls: Array<Record<string, unknown>> = []
+  const tx = { activityLog: { create: async () => {} } }
+  const deps: PurchaseInvoiceUpdateSyncDeps<typeof tx> = {
+    recordTransitSubledgerMovement: async () => {},
+    postingVerdictForChart: async (chart) => (chart ? { verdict: 'post' as const, connector: chart } : { verdict: 'no-chart' as const }),
+    queueAccountingSyncTx: async (_tx, input) => { calls.push(input as unknown as Record<string, unknown>); return true },
+  }
+  const params = { ...baseParams(tx, deps), accountingInvoiceId, accountingPayload: { ...basePayload(), accountingInvoiceId }, idempotencyKey }
+  await maybeQueuePurchaseInvoiceUpdate(params)
+  assert.equal(calls.length, 1, 'PRECONDITION: the enqueue was called')
+  return { enqueued: calls[0]!, params }
+}
+
+test('[o3d-j625 r6 H2/M1] the refusal site writes the key the enqueue derives — for each bill on one PO', async () => {
+  const { accountingPostingKey } = await import('@/lib/accounting/posting-key')
+  const { purchaseInvoiceUpdatePostingKey } = await import('@/lib/domain/purchasing/purchase-invoice-update-sync')
+  for (const bill of ['xero-bill-A', 'xero-bill-B']) {
+    const { enqueued, params } = await enqueuedParamsFor(bill, `purchase-invoice-update:${bill}:hash`)
+    assert.deepEqual(
+      purchaseInvoiceUpdatePostingKey(params),
+      accountingPostingKey(enqueued as never),
+      'the refusal row and the enqueue must name the same posting',
+    )
+  }
+  const a = purchaseInvoiceUpdatePostingKey((await enqueuedParamsFor('xero-bill-A', 'k1')).params)
+  const b = purchaseInvoiceUpdatePostingKey((await enqueuedParamsFor('xero-bill-B', 'k1')).params)
+  assert.notDeepEqual(a, b, 'two bills on one purchase order are two postings')
+})
+
+test('[o3d-j625 r6 H2/H3] bill B\'s update row does not clear bill A\'s refusal; bill A\'s own row does', async () => {
+  const { purchaseInvoiceUpdatePostingKey } = await import('@/lib/domain/purchasing/purchase-invoice-update-sync')
+  const { recordAccountingPostingRefusal } = await import('@/lib/domain/accounting/posting-refusal-inbox')
+  const { createAccountingSyncLogRow } = await import('@/lib/domain/accounting/sync-log-row')
+
+  const refusals: Array<Record<string, unknown>> = []
+  const same = (row: Record<string, unknown>, key: Record<string, unknown>) =>
+    row.type === key.type && row.referenceType === key.referenceType && row.referenceId === key.referenceId && row.scope === key.scope
+  const client = {
+    accountingPostingRefusal: {
+      upsert: async ({ where, create }: { where: { type_referenceType_referenceId_scope: Record<string, unknown> }; create: Record<string, unknown> }) => {
+        const existing = refusals.find((row) => same(row, where.type_referenceType_referenceId_scope))
+        if (existing) return existing
+        const row = { ...create, resolvedAt: null }
+        refusals.push(row)
+        return row
+      },
+      updateMany: async ({ where, data }: { where: Record<string, unknown>; data: Record<string, unknown> }) => {
+        const wantResolved = where.resolvedAt !== null && typeof where.resolvedAt === 'object'
+        const hits = refusals.filter((row) => same(row, where) && (wantResolved ? row.resolvedAt !== null : row.resolvedAt === null))
+        for (const hit of hits) Object.assign(hit, data)
+        return { count: hits.length }
+      },
+    },
+    accountingSyncLog: { create: async () => ({ id: 'row' }) },
+  }
+
+  const billA = await enqueuedParamsFor('xero-bill-A', 'purchase-invoice-update:A:h1')
+  await recordAccountingPostingRefusal(client, purchaseInvoiceUpdatePostingKey(billA.params), {
+    kind: 'purchase_invoice_update', chartConnector: 'xero', activeConnector: 'quickbooks', reason: 'retired_chart', committed: 'c', remedy: 'r',
+  })
+  const rowFrom = (enqueued: Record<string, unknown>) => ({
+    connector: 'xero', status: 'PENDING', type: enqueued.type, referenceType: enqueued.referenceType,
+    referenceId: enqueued.referenceId, payload: { ...(enqueued.payload as object), _idempotencyKey: enqueued.idempotencyKey },
+  }) as never
+
+  const billB = await enqueuedParamsFor('xero-bill-B', 'purchase-invoice-update:B:h1')
+  await createAccountingSyncLogRow(client, rowFrom(billB.enqueued))
+  assert.equal(refusals.filter((row) => row.resolvedAt === null).length, 1, 'bill B posting does not discharge bill A')
+
+  // Bill A re-saved later: a DIFFERENT content hash, the same bill — one obligation.
+  const billAAgain = await enqueuedParamsFor('xero-bill-A', 'purchase-invoice-update:A:h2')
+  await createAccountingSyncLogRow(client, rowFrom(billAAgain.enqueued))
+  assert.equal(refusals.filter((row) => row.resolvedAt === null).length, 0, 'bill A\'s own update clears it')
+})

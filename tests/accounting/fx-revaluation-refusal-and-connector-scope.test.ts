@@ -29,6 +29,8 @@ const state = {
   /** Which enqueue kinds answer `refused`. */
   refuseKinds: new Set<string>(),
   enqueued: [] as Array<{ kind: unknown; chartConnector: unknown }>,
+  /** o3d-j625 r6 (review H4): every enqueue's params, refused or not, so a re-run's posting key can be compared. */
+  asked: [] as Array<Record<string, unknown>>,
   queries: [] as Array<Record<string, unknown>>,
 }
 
@@ -43,6 +45,7 @@ mock.module('@/lib/accounting', {
       realisedFxGainLossAccount: `${state.connector}-RFX`,
     }),
     queueAccountingSync: async (params: { payload: Record<string, unknown>; chartConnector: unknown }) => {
+      state.asked.push(params as unknown as Record<string, unknown>)
       const kind = params.payload.kind
       if (state.refuseKinds.has(String(kind))) {
         return { queued: false, reason: 'refused', connector: params.chartConnector }
@@ -116,6 +119,7 @@ function reset(connector: 'xero' | 'quickbooks', rows: Row[]): void {
   state.rows = rows
   state.receivables = [OPEN_USD_RECEIVABLE]
   state.refuseKinds = new Set()
+  state.asked = []
   state.enqueued = []
   state.queries = []
 }
@@ -205,4 +209,25 @@ test('[o3d-j625 r3 MEDIUM] a REFUSED revaluation is not counted as revalued eith
 
   assert.equal(result.revalued, 0)
   assert.equal(result.refused, 1)
+})
+
+// o3d-j625 r6 (review H4) — `unrealised_fx_journal` IS AN AUTO-CLEARING KIND, and this is the path that
+// clears it: running the revaluation for the same date again raises the SAME posting (same key), and the
+// row that run creates clears the refusal (createAccountingSyncLogRow). Driven through the real run twice.
+test('[o3d-j625 r6 H4] a refused revaluation is raised again, under the SAME posting key, by re-running the date', async () => {
+  const { accountingPostingKey } = await import('@/lib/accounting/posting-key')
+  reset('quickbooks', [])
+  state.refuseKinds.add('revaluation')
+  const { runArApFxRevaluation } = await import('@/lib/accounting-fx-revaluation')
+  await runArApFxRevaluation({ valuationDate: VALUATION_DATE })
+  const refused = state.asked.filter((p) => (p.payload as { kind?: string }).kind === 'revaluation')
+  assert.equal(refused.length, 1, 'PRECONDITION: the first run asked for the revaluation and was refused')
+
+  state.refuseKinds = new Set()
+  state.asked = []
+  await runArApFxRevaluation({ valuationDate: VALUATION_DATE })
+  const rerun = state.asked.filter((p) => (p.payload as { kind?: string }).kind === 'revaluation')
+  assert.equal(rerun.length, 1, 'PRECONDITION: the re-run asked again')
+  assert.deepEqual(accountingPostingKey(rerun[0] as never), accountingPostingKey(refused[0] as never),
+    'the re-run names the same posting, so the row it creates clears the refusal')
 })

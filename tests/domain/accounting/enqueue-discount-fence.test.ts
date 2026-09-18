@@ -139,6 +139,10 @@ function makeTx(hooks: { onCount?: () => Promise<void> | void } = {}) {
         return { count: 1 }
       },
     },
+    // o3d-j625 r6 (review H3): every row created now clears the refusal it discharges, in this transaction.
+    // Nothing is outstanding in this world, so the clear matches nothing — modelled rather than absent, so
+    // the clear running is not mistaken for a failure (which is itself reported, review L-1).
+    accountingPostingRefusal: { updateMany: async () => ({ count: 0 }), upsert: async () => ({}) },
     accountingSyncLog: {
       count: async ({ where }: { where: { referenceId: string; status: { in: string[] }; type: { in: string[] } } }) => {
         await hooks.onCount?.()

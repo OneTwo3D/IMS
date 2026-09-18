@@ -39,6 +39,8 @@ const state = {
   enqueueNoOps: false,
   // o3d-j625 r5: the facade's own refusal — it records the row (specific reason, both connectors) and says so.
   enqueueRefusesAndRecords: false,
+  // o3d-j625 r6: every enqueue's params, so a later sweep's posting key can be compared with a refused one's.
+  asked: [] as Array<Record<string, unknown>>,
   activity: [] as { action: string; description: string }[],
 }
 
@@ -161,6 +163,7 @@ mock.module('@/lib/activity-log', {
 mock.module('@/lib/accounting', {
   namedExports: {
     queueAccountingSync: async (params: { referenceId: string; idempotencyKey: string; payload: Record<string, unknown> }) => {
+      state.asked.push(params as unknown as Record<string, unknown>)
       // Returns void and returns EARLY — silently — when the connector is off. That is the state
       // the whole sweep exists for.
       if (state.enqueueNoOps) return
@@ -195,6 +198,7 @@ function reset() {
   state.queued = []
   state.enqueueNoOps = false
   state.enqueueRefusesAndRecords = false
+  state.asked = []
   state.activity = []
 }
 
@@ -430,4 +434,24 @@ test('[o3d-j625 r5 M-4/M-5] a refusal the FACADE already recorded is merged by t
   assert.equal(rows[0].reason, 'chart_retired', 'the facade\'s SPECIFIC reason survives the release\'s generic one')
   assert.equal(rows[0].activeConnector, 'quickbooks', 'and the ACTIVE connector is not overwritten with the chart\'s')
   assert.ok(String(rows[0].committed).includes('imported'), 'while what only the release knows is added')
+})
+
+// o3d-j625 r6 (review H4) — `sales_invoice_held_release` IS AN AUTO KIND because of THIS: the next sweep
+// raises the SAME posting (same key) the refused release asked for, and the row it creates clears the
+// refusal (createAccountingSyncLogRow). Driven through the real sweep twice.
+test('[o3d-j625 r6 H4] a refused held release is raised again, under the SAME posting key, by the next sweep', async () => {
+  const { accountingPostingKey } = await import('@/lib/accounting/posting-key')
+  reset()
+  state.held = [heldRow({ id: 'hold-1', entityId: 'so-1' })]
+  state.orders = [{ id: 'so-1', invoiceNumber: '164981', accountingInvoiceId: null }]
+  state.enqueueNoOps = true
+  await sweep()
+  assert.equal(state.asked.length, 1, 'PRECONDITION: the release asked, and nothing was queued')
+  const refused = state.asked[0]!
+
+  state.enqueueNoOps = false
+  await sweep()
+  assert.equal(state.queued.length, 1, 'PRECONDITION: the next sweep queued it')
+  assert.deepEqual(accountingPostingKey({ type: 'SALES_INVOICE', referenceType: 'SalesOrder', ...state.asked[1] } as never),
+    accountingPostingKey({ type: 'SALES_INVOICE', referenceType: 'SalesOrder', ...refused } as never))
 })

@@ -59,7 +59,6 @@ import {
   type AccountingEnqueueOutcome,
   type AccountingSettings,
   asRoutableAccountingConnector,
-  accountingPostingKey,
 } from '@/lib/accounting'
 import { postingIsOwed, reportPostingNotQueued } from '@/lib/domain/accounting/enqueue-outcome'
 import { recordAccountingPostingRefusal, type PostingRefusalClient } from '@/lib/domain/accounting/posting-refusal-inbox'
@@ -1485,14 +1484,6 @@ async function queueSalesInvoiceForOrder(id: string): Promise<void> {
       // o3d-j625 r3 (Codex HIGH 2): and whose invoice `so.accountingInvoiceId` — the document this update
       // is posted AGAINST — actually is. The chart cannot answer that: the id survives a switch.
       documentConnector: asRoutableAccountingConnector(so.accountingInvoiceConnector),
-      // o3d-j625 r5: the key the facade will derive for this very posting, built from the same params.
-      posting: accountingPostingKey({
-        type: 'SALES_INVOICE_UPDATE',
-        referenceType: 'SalesOrder',
-        referenceId: so.id,
-        idempotencyKey,
-        payload: updatePayload,
-      }),
     }, {
       getActiveAccountingConnectorInfo,
       queueAccountingSync: queueUpdate,
@@ -1533,11 +1524,13 @@ async function queueSalesInvoiceForOrder(id: string): Promise<void> {
       entityType: 'SALES_ORDER',
       entityId: so.id,
       action: 'sales_invoice_not_queued',
+      // o3d-j625 r6 (review H4): which site refused, and so whether its row clears itself or is marked handled.
+      kind: 'sales_invoice_order',
       posting: `the sales invoice for ${orderNumber}`,
       committed: 'the order is invoiced in IMS',
       remedy:
-        'Finalise the order again once the accounting connector selection has settled, or raise the '
-        + 'invoice by hand in the books it belongs to.',
+        // o3d-j625 r6 (review H4): a finalised order cannot be finalised again, so nothing raises this invoice again.
+        'Raise the invoice by hand in the books it belongs to.',
       outcome: invoiceEnqueued,
       metadata: { orderNumber, chartConnector: settings.connector },
     })
@@ -3881,11 +3874,12 @@ export async function addPayment(input: {
                 entityType: 'SALES_ORDER',
                 entityId: input.orderId,
                 action: 'realised_fx_journal_not_queued',
+                // o3d-j625 r6 (review H4): which site refused, and so whether its row clears itself or is marked handled.
+                kind: 'realised_fx_receipt',
                 posting: `the realised FX journal for the payment on ${getSalesOrderReference(txResult.so)}`,
                 committed: 'the payment is recorded in IMS',
                 remedy:
-                  'The realised gain/loss on this settlement is NOT in the ledger. Raise it by hand, or '
-                  + 'clear the connector selection and re-run the FX revaluation for this date.',
+                  'The realised gain/loss on this settlement is NOT in the ledger. Raise it by hand.',
                 outcome: fxEnqueued,
                 metadata: { paymentId: txResult.paymentId, chartConnector: accountingSettings.connector },
               })

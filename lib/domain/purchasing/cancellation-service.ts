@@ -258,12 +258,13 @@ export async function cancelPurchaseOrderService(
         entityType: 'PURCHASE_ORDER',
         entityId: id,
         action: 'purchase_order_cancel_journal_not_queued',
+        // o3d-j625 r6 (review H4): which site refused, and so whether its row clears itself or is marked handled.
+        kind: 'purchase_order_cancellation_reversal',
         posting: `the cost-layer reversal journal for cancelled purchase order ${id}`,
         committed: 'the PO is cancelled and its remaining cost layers are reversed in IMS',
         remedy:
           'Inventory has been reduced in IMS with no reversing journal in the ledger, so inventory and '
-          + 'goods-in-transit are overstated there. Post the reversal by hand, or re-run the daily '
-          + 'reconcile once the accounting connector selection has settled.',
+          + 'goods-in-transit are overstated there. Post the reversal by hand.',
         outcome: reversalPostingOutcome.outcome,
         // review M-3: `accountingSettings` was read in this very transaction and was not recorded.
         metadata: { chartConnector: cancellationChartConnector.connector, purchaseOrderId: id },

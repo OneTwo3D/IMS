@@ -3,6 +3,7 @@
  * Mirrors lib/connectors/xero/queue.ts with per-type enable/disable gating.
  */
 
+import { createAccountingSyncLogRow } from '@/lib/domain/accounting/sync-log-row'
 import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
 import { getBaseCurrencyCode } from '@/lib/base-currency'
@@ -171,8 +172,7 @@ export async function queueQuickBooksSync(params: {
         if (staleDiscount) return
       }
 
-      const log = await tx.accountingSyncLog.create({
-        data: {
+      const log = await createAccountingSyncLogRow(tx, {
           connector: 'quickbooks',
           type: params.type,
           status: 'PENDING',
@@ -183,8 +183,7 @@ export async function queueQuickBooksSync(params: {
           // read this row's unset `remoteAttemptedAt` as proof no remote call ever left it — see
           // money-attempt-provenance.ts. A row created without it is never recycled again.
           ...stampingCustodyOnCreate(),
-        },
-      })
+        })
       try {
         const baseCurrency = await getBaseCurrencyCode()
         await mirrorAccountingSyncLogToEvent(tx, {

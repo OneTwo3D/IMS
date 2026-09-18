@@ -71,6 +71,8 @@ mock.module('@/lib/connectors/quickbooks/api', {
     },
     qboUploadAttachment: async () => ({ ok: true }),
     resolveAccountRef: async () => ({ value: 'qbo-bank-1' }),
+    // o3d-j625 r6 (review H5): the payment paths resolve through their own, Id-first function.
+    resolvePaymentAccountRef: async () => ({ value: 'qbo-bank-1' }),
   },
 })
 mock.module('@/lib/connectors/accounting-settlement-probe', {

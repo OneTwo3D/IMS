@@ -1,6 +1,7 @@
 import type { ActivityEntityType } from '@/app/generated/prisma/client'
 import { logActivity } from '@/lib/activity-log'
 import { recordAccountingPostingRefusal, type PostingRefusalClient } from '@/lib/domain/accounting/posting-refusal-inbox'
+import type { PostingRefusalKind } from '@/lib/domain/accounting/posting-refusal-kinds'
 
 /**
  * o3d-j625 r3 (Codex HIGH 1, MEDIUM) — A REFUSAL ON A PATH THAT DISCARDS THE RESULT IS A SILENT
@@ -103,14 +104,26 @@ export async function reportPostingNotQueued(params: {
   entityId?: string | null
   /** The activity-log action, e.g. `manufacturing_journal_not_queued`. */
   action: string
+  /**
+   * o3d-j625 r6 (review H4) — WHICH KIND OF SITE THIS IS (posting-refusal-kinds.ts). Required: it decides
+   * whether the inbox row clears itself when the posting is queued or is closed by someone marking it handled.
+   */
+  kind: PostingRefusalKind
   /** The posting that is owed, as an operator would name it: "the COGS reversal for shipment X". */
   posting: string
   /** What IMS committed regardless, and therefore what the ledger now disagrees with. */
   committed: string
-  /** What a human has to do. Nothing retries these on its own. */
+  /** What a human has to do. */
   remedy: string
   outcome: EnqueueOutcomeLike
   metadata?: Record<string, unknown>
+  /**
+   * o3d-j625 r6 (review M3) — THE CALLER'S TRANSACTION, for a site that reports from INSIDE one. The row is
+   * then written through it (under a savepoint), so it rolls back with the change it is about: a batch
+   * that later throws leaves no outstanding row for a stock movement that never existed. Omitted, the row
+   * is written through the pool, which is right for a site that reports after its commit.
+   */
+  inTransaction?: { client: PostingRefusalClient; withSavepoint: <T>(fn: () => Promise<T>) => Promise<T> }
 }): Promise<void> {
   await logActivity({
     entityType: params.entityType,
@@ -150,11 +163,12 @@ export async function reportPostingNotQueued(params: {
     }).catch(() => { /* nothing else to try */ })
     return
   }
-  const { db } = await import('@/lib/db')
+  const client = params.inTransaction?.client ?? (await import('@/lib/db')).db as unknown as PostingRefusalClient
   await recordAccountingPostingRefusal(
-    db as unknown as PostingRefusalClient,
+    client,
     posting,
     {
+      kind: params.kind,
       chartConnector: (params.metadata?.chartConnector as string | undefined) ?? null,
       // review L-7: the connector the REFUSAL saw, where the enqueue reported it. A read taken now would be
       // a different moment's answer.
@@ -166,7 +180,7 @@ export async function reportPostingNotQueued(params: {
     },
     // review M-5: the facade already wrote this row with the SPECIFIC reason. Merging adds what only this
     // site knows (what stands in IMS, the remedy) without counting the refusal twice or degrading its reason.
-    { mergeOnly: params.outcome.refusalRecorded === true },
+    { mergeOnly: params.outcome.refusalRecorded === true, withSavepoint: params.inTransaction?.withSavepoint },
   )
 }
 

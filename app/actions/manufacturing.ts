@@ -1013,12 +1013,13 @@ export async function updateManufacturingOrderStatus(
           entityType: 'STOCK_ADJUSTMENT',
           entityId: id,
           action: 'manufacturing_journal_not_queued',
+          // o3d-j625 r6 (review H4): which site refused, and so whether its row clears itself or is marked handled.
+          kind: 'manufacturing_journal',
           posting: `the manufacturing overhead journal for ${orderPreview.reference}`,
           committed: 'the production order is COMPLETE in IMS and its overhead is capitalised into the output cost',
           remedy:
             'Inventory in the ledger does not carry the capitalised overhead and the overhead accounts '
-            + 'have not been relieved. Post the journal by hand, or re-run the daily reconcile once the '
-            + 'accounting connector selection has settled.',
+            + 'have not been relieved. Post the journal by hand.',
           outcome: manufacturingJournalOutcome.outcome,
           // review M-2: the chart WAS in scope here; r4 left it out and the inbox rendered "none",
           // which reads as "no connector was on" rather than "nobody wrote it down".
@@ -1841,12 +1842,13 @@ export async function updateManufacturingCostLines(
         entityType: 'STOCK_ADJUSTMENT',
         entityId: productionOrderId,
         action: 'manufacturing_reclass_not_queued',
+        // o3d-j625 r6 (review H4): which site refused, and so whether its row clears itself or is marked handled.
+        kind: 'manufacturing_reclass',
         posting: `the manufacturing reclass journal for production order ${productionOrderId}`,
         committed: 'the retrospective manufacturing-cost change is saved in IMS',
         remedy:
           'The compensating reclass is NOT in the ledger, so COGS and inventory there still reflect the '
-          + 'old cost. Post it by hand, or re-save the cost lines once the accounting connector selection '
-          + 'has settled.',
+          + 'old cost. Post it by hand.',
         outcome: reclassOutcome.outcome,
         // review M-2: the reclass chart was in scope (`reclassChart`), and was not recorded.
         metadata: { chartConnector: reclassOutcome.chartConnector ?? null, productionOrderId },

@@ -2995,16 +2995,31 @@ model AccountingPostingRefusal {
   reason          String
   /// What stands in IMS regardless, in the operator's words.
   committed       String
-  /// What the operator has to do. Nothing retries these on their own.
+  /// What the operator has to do. Most wait for it; a few are retried by a sweep (see posting-refusal-copy.ts).
   remedy          String
   detail          Json?
   refusedCount    Int       @default(1)
   firstRefusedAt  DateTime  @default(now())
   lastRefusedAt   DateTime  @default(now())
-  /// Stamped when a posting for the same document is actually queued. NULL = still outstanding.
+  /// Stamped when the row stops being outstanding: the posting was queued (resolution `queued`), or — for a
+  /// MANUAL-ONLY kind — someone marked it handled after posting it by hand (`handled_manually`). NULL = still
+  /// outstanding. A later refusal of the same posting reopens the row as a new episode and clears all four.
   resolvedAt      DateTime?
+  /// o3d-j625 r6 (review H4): WHICH SITE refused, as a key of POSTING_REFUSAL_KINDS
+  /// (lib/domain/accounting/posting-refusal-kinds.ts). It decides whether the row may be marked handled.
+  /// NULL = a row written before the column — never markable.
+  kind            String?
+  /// How the row was resolved: `queued` (IMS cleared it) or `handled_manually`. NULL while outstanding.
+  resolution      String?
+  /// The user who marked it handled. NULL for an automatic clear.
+  resolvedBy      String?
+  /// The operator's note when marking it handled (e.g. the ledger journal number). Plain text, length-limited.
+  resolutionNote  String?
 
-  @@unique([type, referenceType, referenceId, scope])
+  /// o3d-j625 r6 (review H1): named explicitly. The default name is 68 characters; Postgres truncates it to
+  /// 63 and Prisma truncates it DIFFERENTLY, so the migration's index and the schema's never matched and the
+  /// drift check failed every deploy.
+  @@unique([type, referenceType, referenceId, scope], map: "accounting_posting_refusals_posting_key")
   @@index([resolvedAt, firstRefusedAt])
   @@map("accounting_posting_refusals")
 }

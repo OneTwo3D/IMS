@@ -54,9 +54,10 @@ const baseParams = {
   chartConnector: 'xero' as const,
   // o3d-j625 r3: whose INVOICE the update is posted against.
   documentConnector: 'xero' as const,
-  // o3d-j625 r5: the key the caller derives from these same params and the facade will match on.
-  posting: { type: 'SALES_INVOICE_UPDATE', referenceType: 'SalesOrder', referenceId: 'so-1', scope: '' },
 }
+// o3d-j625 r6 (review M1): the key the module derives from its OWN enqueue identity. r5 took it from the
+// caller; the refusal row is now compared with the key of the params the facade was actually called with.
+const EXPECTED_POSTING = { type: 'SALES_INVOICE_UPDATE', referenceType: 'SalesOrder', referenceId: 'so-1', scope: '' }
 
 test('queueSalesInvoiceUpdateForExistingAccountingInvoice queues Xero update with idempotency key', async () => {
   const { deps, queued, activity } = makeDeps({
@@ -263,7 +264,7 @@ test('[o3d-j625 r4] every refusal on this path records an outstanding posting ca
     await queueSalesInvoiceUpdateForExistingAccountingInvoice(params, deps)
     assert.equal(outstanding.length, 1, `${reason}: exactly one outstanding row`)
     assert.equal(outstanding[0].reason, reason)
-    assert.deepEqual(outstanding[0].posting, baseParams.posting, 'keyed on the posting the enqueue itself would clear')
+    assert.deepEqual(outstanding[0].posting, EXPECTED_POSTING, 'keyed on the posting the enqueue itself would clear')
     assert.equal(outstanding[0].activeConnector, 'xero', 'the ACTIVE connector — the half round 2 omitted')
     assert.equal(outstanding[0].chartConnector, params.chartConnector)
     assert.ok(outstanding[0].remedy.length > 0, 'and what the operator must do')
@@ -281,4 +282,28 @@ test('[o3d-j625 r4] a queued update records NOTHING outstanding — the row is o
   const { deps, outstanding } = makeDeps({ connector: { id: 'xero', name: 'Xero' }, enabled: true })
   await queueSalesInvoiceUpdateForExistingAccountingInvoice(baseParams, deps)
   assert.deepEqual(outstanding, [])
+})
+
+test('[o3d-j625 r6 M1] a DECLINED update\'s row carries exactly the key of the params the facade was called with', async () => {
+  const { accountingPostingKey } = await import('@/lib/accounting/posting-key')
+  const { deps, queued, outstanding } = makeDeps({
+    connector: { id: 'xero', name: 'Xero' }, enabled: true, answer: { queued: false, reason: 'refused', connector: 'xero' },
+  })
+  await queueSalesInvoiceUpdateForExistingAccountingInvoice(baseParams, deps)
+  assert.equal(queued.length, 1, 'PRECONDITION: the facade was called')
+  assert.equal(outstanding.length, 1, 'PRECONDITION: and the decline recorded')
+  assert.deepEqual(outstanding[0].posting, accountingPostingKey(queued[0] as never),
+    'the refusal row is the posting the facade was asked for, so the facade\'s clear of it matches')
+})
+
+// o3d-j625 r6 (review H4) — `sales_invoice_update` IS AN AUTO KIND because re-saving the order raises the
+// SAME posting: a new content-hash idempotency key, the same order — one obligation (posting-key.ts).
+test('[o3d-j625 r6 H4] re-saving the order raises the SAME posting', async () => {
+  const { accountingPostingKey } = await import('@/lib/accounting/posting-key')
+  const refusedRun = makeDeps({ connector: { id: 'xero', name: 'Xero' }, enabled: true, answer: { queued: false, reason: 'refused', connector: 'xero' } })
+  await queueSalesInvoiceUpdateForExistingAccountingInvoice(baseParams, refusedRun.deps)
+  const resaved = makeDeps({ connector: { id: 'xero', name: 'Xero' }, enabled: true })
+  await queueSalesInvoiceUpdateForExistingAccountingInvoice({ ...baseParams, idempotencyKey: 'sales-invoice-update:so-1:xero-invoice-1:def456' }, resaved.deps)
+  assert.equal(refusedRun.outstanding.length, 1, 'PRECONDITION: the first save was refused and recorded')
+  assert.deepEqual(accountingPostingKey(resaved.queued[0] as never), refusedRun.outstanding[0]!.posting)
 })

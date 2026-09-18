@@ -1531,6 +1531,7 @@ export async function registerInvoicePaymentWithLedger(params: {
       // o3d-j625 r4: and it is OUTSTANDING work, not only a warning — the receipt stands in IMS while
       // the ledger shows the invoice unpaid, and nothing re-drives this on its own.
       await recordAccountingPostingRefusal(db as unknown as PostingRefusalClient, receiptPostingKey(), {
+        kind: 'invoice_payment_receipt',
         chartConnector: connectorId,
         activeConnector: activeConnector?.id ?? connectorId,
         reason: 'document_provenance_unproven',
@@ -1556,6 +1557,7 @@ export async function registerInvoicePaymentWithLedger(params: {
     }
     if (mappedBankAccountId !== null && !bankAccountIsThisLedgers) {
       await recordAccountingPostingRefusal(db as unknown as PostingRefusalClient, receiptPostingKey(), {
+        kind: 'invoice_payment_receipt',
         chartConnector: connectorId,
         activeConnector: activeConnector?.id ?? connectorId,
         reason: 'payment_account_not_in_ledger',

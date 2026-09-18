@@ -412,7 +412,8 @@ test('o3d-2sm1 r8: the transactional enqueue names the connector it resolved, on
     1,
     'and exactly one — the create — reports a queued row it actually wrote',
   )
-  assert.match(body, /return answer\(\{ queued: false, reason: 'refused' \}\)/, 'a deleted order scope is REFUSED, not decided')
+  // o3d-j625 r6 (review M4): the refusal now also carries why, so the caller's outstanding row can say so.
+  assert.match(body, /return answer\(\{ queued: false, reason: 'refused' \}(?:, undefined, \{\s*reason: 'order_deleted')?/, 'a deleted order scope is REFUSED, not decided')
 
   // The adapter must not resolve the connector for itself either: it exists to carry out the one the
   // enqueue resolved.

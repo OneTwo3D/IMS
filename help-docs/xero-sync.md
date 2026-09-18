@@ -2277,19 +2277,47 @@ follow-ups that page already lists. Each row names the document and its referenc
 the payload was built from **and** the connector that was active when it was refused, how long it has been
 owed (and how many attempts), what still stands in IMS, and what to do about it.
 
-Two things about those rows:
+Three things about those rows:
 
-* **They clear when the posting is actually made**, not when anyone acknowledges them — there is no
-  acknowledge action, because acknowledging one would not post it. Re-queue the posting from its source
-  document and the row leaves the list on the enqueue that records the posting as durable. That includes an
-  enqueue that finds the work **already queued** by an earlier attempt: a row for the posting exists either
-  way, which is what the debt was about. The resolved record is kept in the table (nothing reads or prunes
-  it today — it is a record, not a report).
+* **Some clear themselves, some are closed by you** — and the page says which on every row. Which kind a
+  row is depends on the place that refused it, not on its text:
+
+  | Clears itself when the posting is queued (no action offered) | What raises it again |
+  | --- | --- |
+  | A held WooCommerce invoice release | The WooCommerce reconcile sweep |
+  | A sales-invoice update, a bill update, a tax-rate push | Saving the order / bill / rate again |
+  | A customer receipt (INVOICE_PAYMENT) | The deferred-receipt recovery, once the cause is corrected |
+  | A supplier-credit-note allocation | The credit-note allocation sweep |
+  | An unrealised FX revaluation journal | Running the revaluation for that date again |
+  | A landed-cost COGS or transit journal raised by the landed-cost journal outbox | The outbox retries it |
+  | A refund's credit note, COGS reversal or unearned-revenue reversal | *Retry refund accounting* on the refund |
+
+  | Marked handled by you, after posting it by hand | Why nothing in IMS raises it again |
+  | --- | --- |
+  | A sales invoice for a manual order, or for an imported WooCommerce order | It is queued once, at finalise / import |
+  | A stock adjustment journal | It is queued once, with the movement |
+  | A purchase-order cancellation reversal | A PO is cancelled once |
+  | A supplier-return reversal | Raising the return again would be a second return |
+  | A goods-receipt journal | Receiving again is a different receipt |
+  | A purchase bill | Creating it again would be a second bill |
+  | A realised FX gain/loss (bill payment or customer receipt) | The FX revaluation raises *unrealised* journals, not this one |
+  | A manufacturing completion journal or retrospective reclass | A completion happens once; a later cost change is a different reclass |
+  | A landed-cost COGS or transit journal raised directly by a purchase-order edit, freight PO or cancellation | That edit runs once; nothing re-runs it |
+  | An allocation reversal | Each belongs to one trim of the order's allocations |
+
+  **Mark as handled** is offered only on the second kind, asks for an optional note (for example the ledger
+  journal number), and records who marked it and when. IMS refuses it on any other row, whatever the page
+  showed. A row that clears itself leaves the list when the posting is queued — by any path: every accounting
+  sync row IMS writes goes through one function, and that function clears the matching row. Resolved rows
+  from the last 30 days are listed underneath with how each was closed.
+* **A resolved posting refused again comes back as new work** — whether IMS queued it or someone marked it
+  handled, its age is the age of the NEW gap.
 * **One row per posting**, and a posting means the thing that is owed rather than the document it belongs
   to: a customer payment is one **receipt** against one invoice, a stock receipt is one delivery against a
-  purchase order, a landed-cost journal is one recalculation. A sweep that refuses the same work every few
-  minutes updates that row and counts the attempts rather than filling the page; if the posting is made and
-  later refused again, the row reopens and its age is the age of the NEW gap.
+  purchase order, a landed-cost journal is one recalculation, a bill update is one **bill** (a purchase
+  order can hold several), and an allocation reversal is one trim of an order's allocations. A sweep that
+  refuses the same work every few minutes updates that row and counts the attempts rather than filling the
+  page.
 
 This is what makes the WooCommerce **held invoice release** safe to leave to the sweep: it can refuse for
 days with nobody watching, and the debt is on the exceptions page the whole time.

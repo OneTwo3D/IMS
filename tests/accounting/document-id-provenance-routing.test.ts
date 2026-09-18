@@ -107,6 +107,8 @@ mock.module('@/lib/connectors/xero/settings', {
       xero_sync_enabled: 'true',
       xero_sync_sales_invoice: 'submitted',
       xero_sync_inventory_adjustment: 'submitted',
+      // o3d-j625 r6: posts, so the receipt-scoped cases (M2, M4) reach the idempotency check.
+      xero_sync_stock_receipt: 'submitted',
       xero_sales_account: 'X-SALES',
       xero_shipping_account: 'X-SHIP',
       xero_discount_account: 'X-DISC',
@@ -241,7 +243,8 @@ function transactionDouble() {
     $queryRaw: async () => [],
     accountingPostingRefusal: txRefusalTable(),
     accountingSyncLog: {
-      findMany: async () => [],
+      // o3d-j625 r6: a prior attempt the in-transaction enqueue's idempotency check can find (M2's case).
+      findMany: async () => txModel.priorAttempts,
       create: async ({ data }: { data: { connector: string; type: string; payload: Record<string, unknown> } }) => {
         if (txModel.aborted) throw new Error('25P02: current transaction is aborted')
         const lines = data.payload.lines as Array<{ accountCode?: unknown }> | undefined
@@ -339,7 +342,7 @@ mock.module('@/lib/db', {
  * below applies that rule, so "the refusal write failed and the caller's transaction is still committable"
  * is a property the tests can observe rather than a claim about a try/catch.
  */
-const txModel = { savepointDepth: 0, aborted: false, failRefusalWrites: false, txRefusalWrites: 0, pooledRefusalWrites: 0 }
+const txModel = { savepointDepth: 0, aborted: false, failRefusalWrites: false, txRefusalWrites: 0, pooledRefusalWrites: 0, priorAttempts: [] as Array<{ id: string; status: string; externalTransactionId: string | null }> }
 mock.module('@/lib/db/savepoint', {
   namedExports: {
     withSavepoint: async <T>(_tx: unknown, fn: () => Promise<T>): Promise<T> => {
@@ -360,6 +363,7 @@ function reset(selection: string[]): void {
   txModel.failRefusalWrites = false
   txModel.txRefusalWrites = 0
   txModel.pooledRefusalWrites = 0
+  txModel.priorAttempts = []
   enabledPlugins = selection
   selectionReads = 0
   flipToQuickBooksAfterReads = null
@@ -748,4 +752,136 @@ test('[o3d-j625 r5 HIGH 5] CONTROL: the confirmation still refuses a value that 
   assert.equal(await accountingBankAccountBelongsTo('quickbooks', 'xero-uuid-bank'), false, 'another connector\'s id')
   assert.equal(await accountingBankAccountBelongsTo('xero', 'nope'), false, 'a value in no chart at all')
   assert.equal(await accountingBankAccountBelongsTo('xero', ''), false, 'nothing mapped')
+})
+
+test('[o3d-j625 r6 H2] a second allocation-reversal TRIM queued does not clear the first trim\'s refusal', async () => {
+  reset(['xero'])
+  const { getAccountingSettings, queueAccountingSyncTx } = await import('@/lib/accounting')
+  const settings = await getAccountingSettings()
+  // The real payload shape (allocation-service.ts): each call mints its own `_reversalToken`.
+  const trim = (token: string) => ({
+    ...TX_REQUEST,
+    type: 'ALLOCATION_REVERSAL' as const,
+    payload: { _reversalToken: token, lines: [{ accountCode: settings.inventoryAccount, debit: 10 }] },
+    chartConnector: settings.connector,
+    recordRefusalAsOutstanding: true,
+  })
+
+  enabledPlugins = ['quickbooks']
+  assert.equal(await queueAccountingSyncTx(transactionDouble() as never, trim('trim-1')), false, 'PRECONDITION: trim 1 refused')
+  assert.equal(outstandingRefusals().length, 1, 'PRECONDITION: and recorded as outstanding')
+
+  enabledPlugins = ['xero']
+  assert.equal(await queueAccountingSyncTx(transactionDouble() as never, trim('trim-2')), true, 'PRECONDITION: trim 2 queued')
+
+  assert.equal(outstandingRefusals().length, 1,
+    'trim 1\'s pounds are still in Allocated Inventory — r5 keyed every trim of an order alike, so trim 2 cleared it')
+  assert.equal(outstandingRefusals()[0]!.scope, 'reversal:trim-1')
+})
+
+test('[o3d-j625 r6 M2] an in-transaction enqueue that finds the posting ALREADY QUEUED clears that posting\'s row — and only it', async () => {
+  reset(['xero'])
+  const { getAccountingSettings, queueAccountingSyncTx } = await import('@/lib/accounting')
+  const settings = await getAccountingSettings()
+  const request = {
+    ...TX_REQUEST,
+    type: 'STOCK_RECEIPT' as const,
+    payload: { lines: [{ accountCode: settings.inventoryAccount, debit: 10 }] },
+    idempotencyKey: 'purchase-receipt:po-1:GRN-2:h',
+    chartConnector: settings.connector,
+  }
+  // Two open refusals on one reference: THIS receipt's, and a DIFFERENT receipt's.
+  const open = (scope: string) => ({ type: 'STOCK_RECEIPT', referenceType: TX_REQUEST.referenceType, referenceId: TX_REQUEST.referenceId, scope, resolvedAt: null, refusedCount: 1 })
+  refusals.push(open('purchase-receipt:po-1:GRN-2:h'), open('purchase-receipt:po-1:GRN-1:h'))
+  // A live prior attempt for this key: nothing is written, the answer is `already-queued`.
+  txModel.priorAttempts = [{ id: 'prior-1', status: 'PENDING', externalTransactionId: null }]
+  insertedInTx.length = 0
+
+  assert.equal(await queueAccountingSyncTx(transactionDouble() as never, request), true)
+  assert.equal(insertedInTx.length, 0, 'PRECONDITION: already queued — no row written, so only the answer can clear')
+  assert.deepEqual(outstandingRefusals().map((row) => row.scope), ['purchase-receipt:po-1:GRN-1:h'],
+    'the receipt found queued is discharged; the other receipt is still owed')
+})
+
+// o3d-j625 r6 (review M4) — EVERY IN-TRANSACTION REFUSAL HONOURS `recordRefusalAsOutstanding`, not only the
+// chart check. The unresolved-prior-attempt and unserviced-pin refusals leave the same committed local state.
+test('[o3d-j625 r6 M4] an UNRESOLVED prior attempt refuses — and, when asked, records the refusal in the caller\'s transaction', async () => {
+  reset(['xero'])
+  const { getAccountingSettings, queueAccountingSyncTx } = await import('@/lib/accounting')
+  const settings = await getAccountingSettings()
+  txModel.priorAttempts = [{ id: 'failed-1', status: 'FAILED', externalTransactionId: null }]
+  const reported: { outcome?: Record<string, unknown> } = {}
+
+  const queued = await queueAccountingSyncTx(transactionDouble() as never, {
+    ...TX_REQUEST,
+    type: 'STOCK_RECEIPT' as const,
+    payload: { lines: [{ accountCode: settings.inventoryAccount, debit: 10 }] },
+    idempotencyKey: 'purchase-receipt:po-1:GRN-9:h',
+    chartConnector: settings.connector,
+    recordRefusalAsOutstanding: true,
+    reportOutcome: (outcome) => { reported.outcome = outcome as unknown as Record<string, unknown> },
+  })
+
+  assert.equal(queued, false, 'PRECONDITION: refused')
+  assert.equal(outstandingRefusals().length, 1)
+  assert.equal(outstandingRefusals()[0]!.reason, 'unresolved_prior_attempt')
+  assert.equal(outstandingRefusals()[0]!.scope, 'purchase-receipt:po-1:GRN-9:h')
+  assert.equal(txModel.txRefusalWrites, 1, 'through the caller\'s transaction')
+  assert.equal(reported.outcome?.refusalRecorded, true, 'and the answer says so, so the caller merges instead of recounting')
+})
+
+test('[o3d-j625 r6 M4] a PINNED ledger the selection no longer services refuses — and records, when asked', async () => {
+  reset(['xero'])
+  const { getAccountingSettings, queueAccountingSyncTx } = await import('@/lib/accounting')
+  const settings = await getAccountingSettings()
+
+  const queued = await queueAccountingSyncTx(transactionDouble() as never, {
+    ...TX_REQUEST,
+    payload: { lines: [{ accountCode: settings.inventoryAccount, debit: 10 }] },
+    chartConnector: settings.connector,
+    connector: 'xero',
+    recordRefusalAsOutstanding: true,
+  })
+
+  assert.equal(queued, false, 'PRECONDITION: the locked read of the plugin rows finds none, so the pin is not serviced')
+  assert.equal(outstandingRefusals().length, 1)
+  assert.equal(outstandingRefusals()[0]!.reason, 'pinned_ledger_not_serviced')
+})
+
+test('[o3d-j625 r6 M4] CONTROL: the same refusals record nothing when the caller did not ask (its work rolls back)', async () => {
+  reset(['xero'])
+  const { getAccountingSettings, queueAccountingSyncTx } = await import('@/lib/accounting')
+  const settings = await getAccountingSettings()
+  txModel.priorAttempts = [{ id: 'failed-1', status: 'FAILED', externalTransactionId: null }]
+
+  await queueAccountingSyncTx(transactionDouble() as never, {
+    ...TX_REQUEST,
+    type: 'STOCK_RECEIPT' as const,
+    payload: { lines: [{ accountCode: settings.inventoryAccount, debit: 10 }] },
+    idempotencyKey: 'purchase-receipt:po-1:GRN-9:h',
+    chartConnector: settings.connector,
+  })
+  assert.deepEqual(outstandingRefusals(), [])
+})
+
+// o3d-j625 r6 (review L1): the in-transaction answer dropped `activeConnector` and `refusalRecorded` on the
+// chart refusal, so a caller reporting it recounted the refusal and wrote the chart connector as active.
+test('[o3d-j625 r6 L1] the in-transaction answer carries the active connector and that the row was recorded', async () => {
+  reset(['xero'])
+  const { getAccountingSettings, queueAccountingSyncTx } = await import('@/lib/accounting')
+  const settings = await getAccountingSettings()
+  enabledPlugins = ['quickbooks']
+  const reported: { outcome?: Record<string, unknown> } = {}
+
+  await queueAccountingSyncTx(transactionDouble() as never, {
+    ...TX_REQUEST,
+    payload: { lines: [{ accountCode: settings.inventoryAccount, debit: 10 }] },
+    chartConnector: settings.connector,
+    recordRefusalAsOutstanding: true,
+    reportOutcome: (outcome) => { reported.outcome = outcome as unknown as Record<string, unknown> },
+  })
+
+  assert.equal(reported.outcome?.reason, 'refused', 'PRECONDITION')
+  assert.equal(reported.outcome?.activeConnector, 'quickbooks')
+  assert.equal(reported.outcome?.refusalRecorded, true)
 })

@@ -312,32 +312,39 @@ export function escapeQboQueryValue(value: string): string {
   return value.replace(/'/g, "''")
 }
 
+async function findQboAccount(column: 'code' | 'externalAccountId', value: string): Promise<{ value: string } | null> {
+  const hit = await db.accountingAccount.findFirst({
+    where: { connector: QBO_CONNECTOR, [column]: value, active: true },
+    select: { externalAccountId: true },
+  })
+  return hit ? { value: hit.externalAccountId } : null
+}
+
 /**
- * Resolve an account code or ID to a QBO AccountRef { value: id }.
- * Looks up AccountingAccount by externalAccountId first, then by code (o3d-j625 r5 HIGH 6).
- * Returns null if not found.
+ * Resolve a CHART-OF-ACCOUNTS setting (an account code, or an Id where the account has no number) to a QBO
+ * AccountRef { value: id }. CODE FIRST, then Id.
+ *
+ * o3d-j625 r6 (review H5) — r5 made THIS function Id-first for every caller, to fix the payment path. But
+ * the chart settings store an account's NUMBER (AcctNum) whenever it has one — the settings select offers
+ * `a.code`, and `listStoredAccounts` returns `code ?? externalAccountId` — so a journal, bill or invoice
+ * line configured as AcctNum "200" re-resolved to whichever account has Id "200": a silent mis-posting on
+ * every connector path. The ordering is per SOURCE of the value, so the two sources get two functions.
  */
 export async function resolveAccountRef(codeOrId: string): Promise<{ value: string } | null> {
   if (!codeOrId) return null
+  return await findQboAccount('code', codeOrId) ?? await findQboAccount('externalAccountId', codeOrId)
+}
 
-  // o3d-j625 r5 (review HIGH 6) — THE ID IS TRIED FIRST, AND THAT ORDERING IS THE POINT.
-  //
-  // This resolved by `AcctNum` first and both forms are short numeric strings in QuickBooks, so a value
-  // IMS had confirmed as an account Id — "35" — could be re-resolved here to whatever happens to carry
-  // AcctNum 35, and the payment would post to a different account. Round 3's finding was closed on the
-  // claim that the poster sends the confirmed id verbatim; this is what makes that claim true. A value
-  // that is genuinely a code still resolves, one lookup later.
-  const byId = await db.accountingAccount.findFirst({
-    where: { connector: QBO_CONNECTOR, externalAccountId: codeOrId, active: true },
-    select: { externalAccountId: true },
-  })
-  if (byId) return { value: byId.externalAccountId }
-
-  const byCode = await db.accountingAccount.findFirst({
-    where: { connector: QBO_CONNECTOR, code: codeOrId, active: true },
-    select: { externalAccountId: true },
-  })
-  if (byCode) return { value: byCode.externalAccountId }
-
-  return null
+/**
+ * Resolve a PAYMENT-ACCOUNT MAP value to a QBO AccountRef. ID FIRST, then code.
+ *
+ * o3d-j625 r5 (review HIGH 6), kept for the one source it was right for: the payment-account map stores the
+ * account's Id, and IMS confirmed that Id against the chart before enqueueing
+ * (`accountingBankAccountBelongsTo`). Resolving it code-first could send the payment to a DIFFERENT account
+ * whose AcctNum happens to equal the confirmed Id — both are short numeric strings in QuickBooks. A value
+ * that is genuinely a code still resolves, one lookup later.
+ */
+export async function resolvePaymentAccountRef(idOrCode: string): Promise<{ value: string } | null> {
+  if (!idOrCode) return null
+  return await findQboAccount('externalAccountId', idOrCode) ?? await findQboAccount('code', idOrCode)
 }

@@ -84,6 +84,8 @@ export async function maybeQueueTaxRateSync(taxRate: TaxRateForSync): Promise<vo
     await reportPostingNotQueued({
       entityType: 'SETTING',
       action: 'tax_rate_sync_not_queued',
+      // o3d-j625 r6 (review H4): which site refused, and so whether its row clears itself or is marked handled.
+      kind: 'tax_rate_sync',
       posting: `the tax-rate push for "${taxRate.name}"`,
       committed: 'the tax rate is saved in IMS',
       remedy:

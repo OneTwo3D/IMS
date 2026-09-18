@@ -100,7 +100,33 @@ type FindManyArgs = {
   }
 }
 
+/**
+ * o3d-j625 r6 (review H3) — THE EXCEPTION INBOX'S REFUSAL TABLE, with upsert/updateMany semantics over the
+ * four-column key, so "the refusal row is cleared" is a property of stored rows and not of a call made.
+ */
+const refusals: Array<Record<string, unknown>> = []
+const refusalKeyMatches = (row: Record<string, unknown>, key: Record<string, unknown>): boolean =>
+  row.type === key.type && row.referenceType === key.referenceType && row.referenceId === key.referenceId
+  && (row.scope ?? '') === (key.scope ?? '')
+
 const db = {
+  accountingPostingRefusal: {
+    async upsert(args: { where: { type_referenceType_referenceId_scope: Record<string, unknown> }; create: Record<string, unknown>; update: Record<string, unknown> }) {
+      const key = args.where.type_referenceType_referenceId_scope
+      const existing = refusals.find((row) => refusalKeyMatches(row, key))
+      if (existing) { Object.assign(existing, args.update, { resolvedAt: null }); return existing }
+      const row = { ...args.create, resolvedAt: null }
+      refusals.push(row)
+      return row
+    },
+    async updateMany(args: { where: Record<string, unknown>; data: Record<string, unknown> }) {
+      const wantResolved = args.where.resolvedAt !== null && typeof args.where.resolvedAt === 'object'
+      const hits = refusals.filter((row) => refusalKeyMatches(row, args.where)
+        && (wantResolved ? row.resolvedAt !== null : row.resolvedAt === null))
+      for (const hit of hits) Object.assign(hit, args.data)
+      return { count: hits.length }
+    },
+  },
   accountingSyncLog: {
     async findMany(args: FindManyArgs) {
       const where = args?.where ?? {}
@@ -226,6 +252,7 @@ function reset() {
   state.creditNotes = []
   state.creditNotePosts = []
   sent.length = 0
+  refusals.length = 0
 }
 
 async function runXeroSync() {
@@ -651,3 +678,40 @@ for (const [label, cn, bill] of [
     assert.ok(refusal, 'the refusal is recorded')
   })
 }
+
+// o3d-j625 r6 (review H3) — THE REFUSAL ROW THIS SWEEP WRITES MUST BE CLEARABLE, AND BY THIS SWEEP.
+//
+// r5 recorded it "keyed exactly as the allocation's own enqueue", but that enqueue is
+// `enqueueFollowUpSyncLog`, which created its row directly and cleared nothing — so the row could never
+// leave the inbox. Since r6 every row is created through `createAccountingSyncLogRow`, which clears the
+// refusal the row discharges. Driven end to end: refuse, repair the cause, sweep again.
+test('o3d-j625 r6 H3: a refused allocation leaves the inbox when a later sweep queues it', async () => {
+  reset()
+  state.creditNotes = [{
+    id: 'cn-h3',
+    accountingCreditNoteId: 'XCN-H3',
+    accountingCreditNoteConnector: 'xero',
+    amountForeign: 40,
+    purchaseInvoice: { accountingInvoiceId: 'BILL-H3', accountingInvoiceConnector: 'quickbooks' },
+  }]
+  state.creditNotePosts = [{
+    referenceId: 'cn-h3', externalTransactionId: 'XCN-H3', status: 'SYNCED',
+    syncedAt: new Date('2026-01-01T00:00:00Z'), payload: { [CONNECTION_KEY]: 'xero:tenant-A' },
+  }]
+  state.tokenTenantId = 'tenant-A'
+  const { reenqueueMissingCreditNoteAllocations } = await import('@/lib/connectors/xero/sync-processor')
+
+  await reenqueueMissingCreditNoteAllocations()
+  const open = () => refusals.filter((row) => row.resolvedAt === null)
+  assert.equal(state.created.length, 0, 'PRECONDITION: refused, nothing created')
+  assert.equal(open().length, 1, 'PRECONDITION: the refusal is outstanding')
+  assert.equal(open()[0]!.type, 'PURCHASE_CREDIT_NOTE_ALLOCATION')
+
+  // The bill is re-posted to Xero, so its connector is recorded, and the sweep runs again.
+  state.creditNotes[0]!.purchaseInvoice!.accountingInvoiceConnector = 'xero'
+  await reenqueueMissingCreditNoteAllocations()
+
+  assert.equal(state.created.length, 1, 'PRECONDITION: this time the allocation row was created')
+  assert.deepEqual(open(), [], 'and the refusal row it discharges is no longer outstanding')
+  assert.ok(refusals[0]!.resolvedAt, 'resolved, and kept as a record')
+})
