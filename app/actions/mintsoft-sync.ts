@@ -1,5 +1,7 @@
 'use server'
 
+import { randomUUID } from 'node:crypto'
+
 import { revalidatePath } from 'next/cache'
 import { Prisma, type WmsAsnStatus, type WmsStockMasterSystem, type WmsStockSyncMode } from '@/app/generated/prisma/client'
 import { z } from 'zod'
@@ -55,6 +57,20 @@ import {
 } from '@/lib/connectors/mintsoft/sync/returns-sync'
 import { enqueueMintsoftBookedInRecheckForAsn, replayMintsoftBookedInEventsForAsn } from '@/lib/jobs/wms/process-mintsoft-booked-in-event'
 import { WMS_INBOUND_EVENT_PROCESSING_STATUS } from '@/lib/domain/wms/booked-in-service'
+import {
+  hasOutstandingQty,
+  loadTransferLineOutstandingQty,
+  outstandingQtyEquals,
+  requireOutstandingQty,
+  type TransferLineOutstandingQty,
+} from '@/lib/domain/inventory/transfer-landed-quantity'
+import {
+  disposePendingTransferAsnReservation,
+  lockPendingTransferAsnReservation,
+  pendingAsnReservationCarriesCredit,
+  type LockedPendingAsnReservation,
+} from '@/lib/domain/wms/pending-asn-retirement'
+import { lockStockTransfers, lockWmsAsnMaps } from '@/lib/domain/wms/transfer-asn-lock-order'
 import { getWmsConnector, isWmsConnectorConfigured } from '@/lib/connectors/wms/registry'
 import { getIntegrationPluginState, isIntegrationPluginEnabled } from '@/lib/integration-plugins'
 import { hasPermission } from '@/lib/permissions'
@@ -1724,6 +1740,13 @@ export async function getMintsoftTransferAsnStates(
 
   const canManage = session?.user ? hasPermission(session.user.role, 'stock_control.transfer') : false
   const transfersById = new Map(transfers.map((transfer) => [transfer.id, transfer]))
+  // o3d-zzgp: "outstanding" is `qty − LANDED`, and landed counts the WMS stock-sync
+  // alignment credit as well as `qtyReceived`. This gate used `qty − qtyReceived`, so
+  // a transfer the alignment had already brought in still offered "create an ASN".
+  const outstandingByTransferLineId = await loadTransferLineOutstandingQty(
+    db,
+    transfers.flatMap((transfer) => transfer.lines),
+  )
   const productIds = Array.from(new Set(
     transfers.flatMap((transfer) => transfer.lines.map((line) => line.productId)),
   ))
@@ -1781,7 +1804,9 @@ export async function getMintsoftTransferAsnStates(
     }
 
     const binding = bindingByWarehouseId.get(transfer.toWarehouseId) ?? null
-    const outstandingLines = transfer.lines.filter((line) => Number(line.qty) > Number(line.qtyReceived))
+    const outstandingLines = transfer.lines.filter(
+      (line) => hasOutstandingQty(requireOutstandingQty(outstandingByTransferLineId, line.id)),
+    )
     const unmappedOutstandingCount = outstandingLines.filter((line) => !hasMintsoftProductLink.get(line.productId)).length
     const mappedAsns = (existingAsnsByTransferId.get(transfer.id) ?? []).map(mapMintsoftPurchaseOrderAsnRow)
 
@@ -3604,7 +3629,14 @@ export async function createMintsoftTransferAsn(
     sourceLineId: string
     productId: string
     sku: string
-    expectedQty: number
+    /**
+     * THE BRANDED READING, not a number (o3d-zzgp round 2, Codex MEDIUM). Only
+     * lib/domain/inventory/transfer-landed-quantity.ts can produce one, so a
+     * reservation cannot be assembled from `qty − qtyReceived`; it becomes a number
+     * exactly once, as the `quantity` on the wire, where the transfer line is not in
+     * scope to be subtracted.
+     */
+    outstanding: TransferLineOutstandingQty
     externalProductId: string
   }
 
@@ -3634,6 +3666,9 @@ export async function createMintsoftTransferAsn(
       lines: ReservedAsnLine[]
     }
 
+  /** An operator-facing refusal, RETURNED so the reservation transaction commits first (o3d-zzgp r4). */
+  type AsnReservationRefusal = { kind: 'refused'; error: string }
+
   type FinalizedAsnOutcome = {
     kind: 'existing' | 'recovered' | 'created'
     asnMapId: string
@@ -3646,8 +3681,16 @@ export async function createMintsoftTransferAsn(
   const pendingAsnPrefix = `pending:transfer:${parsedId.data}:`
   const createInFlightGraceMs = 5 * 60 * 1000
 
+  /**
+   * o3d-zzgp round 2: a retired reservation KEEPS its `pending:transfer:<id>:<ts>`
+   * external id for ever (it is closed, not deleted), and a retry then reaches this
+   * builder while that row still exists. `[connector, externalAsnId]` is unique, so the
+   * millisecond alone is no longer enough to be sure of a fresh id. Nothing parses this
+   * string — the prefix is only ever matched with `startsWith` — so a random suffix is
+   * free.
+   */
   function buildPendingExternalAsnId(): string {
-    return `${pendingAsnPrefix}${Date.now()}`
+    return `${pendingAsnPrefix}${Date.now()}-${randomUUID().slice(0, 8)}`
   }
 
   function getMintsoftAsnRawString(raw: Record<string, unknown> | null, keys: string[]): string | null {
@@ -3699,7 +3742,8 @@ export async function createMintsoftTransferAsn(
         sourceLineId: line.sourceLineId,
         productId: line.productId,
         sku: line.sku,
-        expectedQty: line.expectedQty,
+        // OUTPUT BOUNDARY: this figure only goes into the sync-log payload.
+        expectedQty: line.outstanding.qtyNumber,
         externalAsnLineId: createdLine.externalLineId,
         payload: createdLine.raw ?? null,
         externalAsnId,
@@ -3708,8 +3752,38 @@ export async function createMintsoftTransferAsn(
     })
   }
 
-  async function reserveAsn(): Promise<AsnReservation> {
-    return db.$transaction(async (tx) => {
+  /**
+   * THE RULE FOR EVERY `throw` IN THIS TRANSACTION (o3d-zzgp round 4, Codex HIGH-1).
+   *
+   * A throw inside a Prisma interactive transaction ROLLS BACK every write made before
+   * it. Round 3 retired a credited reservation — `closedAt`, the shrunk `expectedQty`,
+   * the `note` — and then, finding nothing outstanding (or an unlinked SKU), threw the
+   * operator's refusal from inside this same transaction. PostgreSQL undid the
+   * retirement, so production left the reservation OPEN, still an alignment candidate,
+   * with the guard it existed to apply quietly reverted on every attempt. The unit fake
+   * ran this callback without rollback semantics and reported "retired, then refused".
+   *
+   * So there are two kinds of exit, and they are not interchangeable:
+   *
+   *   · an OPERATOR REFUSAL — "nothing outstanding", "not linked to a Mintsoft product",
+   *     "already in progress", "not in transit", … — is RETURNED as
+   *     `{ kind: 'refused' }`, so this transaction COMMITS whatever it rightly did first
+   *     (a retirement, the delete of an uncredited emptied reservation, the demotion of a
+   *     stale in-flight claim) and the caller raises the refusal after commit. Chosen
+   *     over putting the retirement in a transaction of its own because the retirement
+   *     and the refusal are two consequences of ONE locked read: splitting them would
+   *     release the locks between the decision and one of its consequences, which is
+   *     round 3's defect moved somewhere else.
+   *   · an INTEGRITY ABORT — a stored figure that does not match the one just written,
+   *     a disposal whose outcome contradicts the credit read under the same locks, the
+   *     disposal backstop firing — is still THROWN, and rolls everything back ON PURPOSE:
+   *     each means this transaction's own reads or writes cannot be trusted, and keeping
+   *     half of them would be worse than keeping none. Each one says so where it stands.
+   */
+  async function reserveAsn(): Promise<AsnReservation | AsnReservationRefusal> {
+    const refuse = (error: string): AsnReservationRefusal => ({ kind: 'refused', error })
+
+    return db.$transaction(async (tx): Promise<AsnReservation | AsnReservationRefusal> => {
       await tx.$queryRaw`SELECT id FROM stock_transfers WHERE id = ${parsedId.data} FOR UPDATE`
 
       const transfer = await tx.stockTransfer.findUnique({
@@ -3738,7 +3812,7 @@ export async function createMintsoftTransferAsn(
       })
 
       if (!transfer) {
-        throw new Error('Transfer not found.')
+        return refuse('Transfer not found.')
       }
 
       const reusableOpenAsn = await tx.wmsAsnMap.findFirst({
@@ -3774,11 +3848,11 @@ export async function createMintsoftTransferAsn(
       }
 
       if (!transfer.toWarehouseId || !transfer.toWarehouse) {
-        throw new Error('This transfer does not have a destination warehouse.')
+        return refuse('This transfer does not have a destination warehouse.')
       }
 
       if (transfer.status !== 'IN_TRANSIT') {
-        throw new Error('Mintsoft ASNs can only be created for transfers that are already in transit.')
+        return refuse('Mintsoft ASNs can only be created for transfers that are already in transit.')
       }
 
       const productLinks = transfer.lines.length === 0
@@ -3819,7 +3893,7 @@ export async function createMintsoftTransferAsn(
       })
 
       if (!binding) {
-        throw new Error('Bind the destination warehouse to Mintsoft before creating an ASN.')
+        return refuse('Bind the destination warehouse to Mintsoft before creating an ASN.')
       }
 
       const inFlightAsn = await tx.wmsAsnMap.findFirst({
@@ -3842,7 +3916,7 @@ export async function createMintsoftTransferAsn(
 
       if (inFlightAsn) {
         if (inFlightAsn.updatedAt > new Date(Date.now() - createInFlightGraceMs)) {
-          throw new Error('Mintsoft ASN creation is already in progress for this transfer.')
+          return refuse('Mintsoft ASN creation is already in progress for this transfer.')
         }
 
         await tx.wmsAsnMap.update({
@@ -3851,70 +3925,157 @@ export async function createMintsoftTransferAsn(
         })
       }
 
-      const pendingAsn = await tx.wmsAsnMap.findFirst({
+      const pendingReservationWhere = {
+        connector: 'mintsoft',
+        closedAt: null,
+        status: 'CREATE_PENDING',
+        externalAsnId: {
+          startsWith: pendingAsnPrefix,
+        },
+      } satisfies Prisma.WmsAsnMapWhereInput
+
+      const pendingAsnHeader = await tx.wmsAsnMap.findFirst({
         where: {
-          connector: 'mintsoft',
+          ...pendingReservationWhere,
           sourceType: 'STOCK_TRANSFER',
           sourceId: transfer.id,
-          closedAt: null,
-          status: 'CREATE_PENDING',
-          externalAsnId: {
-            startsWith: pendingAsnPrefix,
-          },
         },
         orderBy: [{ createdAt: 'desc' }],
-        select: {
-          id: true,
-          lines: {
-            orderBy: [{ id: 'asc' }],
-            select: {
-              id: true,
-              sourceLineId: true,
-              productId: true,
-              sku: true,
-              expectedQty: true,
-            },
-          },
-        },
+        select: { id: true },
       })
 
+      // o3d-zzgp round 3 (Codex HIGH). Everything below decides from the reservation's
+      // CREDIT and then acts on it, so the credit is read under the established locks
+      // — `stock_transfers` (held since the top of this transaction), then the ASN
+      // header, then its line maps — and not from the discovery read above. This path
+      // was already safe on the transfer lock alone, because every credit writer takes
+      // that row first; the header and line locks put it on the same footing as the
+      // disposal paths below rather than leaving it the one exception to explain.
+      let pendingAsn: LockedPendingAsnReservation | null = pendingAsnHeader
+        ? await lockPendingTransferAsnReservation(tx, {
+            transferId: transfer.id,
+            asnMapId: pendingAsnHeader.id,
+            reservationWhere: pendingReservationWhere,
+          })
+        : null
+
+      // o3d-zzgp: THE ASN IS SIZED FROM THIS NUMBER AND IT GOES TO A LIVE WMS.
+      // It used to be `qty − qtyReceived`, which ignores every unit the WMS
+      // stock-sync alignment has already brought into stock — that path credits
+      // `wms_asn_line_maps.qtyAccountedViaSnapshot` and never touches `qtyReceived`.
+      // A retry after a failed push (the row is left CREATE_PENDING, its line maps
+      // are still alignment candidates because they are only filtered on
+      // `asn.closedAt IS NULL`) therefore told Mintsoft to expect units that were
+      // already on its own shelves. Read under the `FOR UPDATE` above, from `tx`, so
+      // a concurrent alignment cannot land between the lock and this read.
+      const outstandingByTransferLineId = await loadTransferLineOutstandingQty(tx, transfer.lines)
+      // o3d-zzgp round 2 (Codex MEDIUM): the BRANDED value travels, not a number. It
+      // reaches `ReservedAsnLine`, survives the revalidation as a branded comparison,
+      // and becomes a plain number once — at the `quantity` on the wire, where
+      // `line.qty` and `line.qtyReceived` are not in scope to be subtracted.
       const outstandingLines = transfer.lines
         .map((line) => ({
           sourceLineId: line.id,
           productId: line.productId,
           sku: line.sku,
           externalProductId: externalProductIdByProductId.get(line.productId) ?? null,
-          expectedQty: Number(line.qty) - Number(line.qtyReceived),
+          outstanding: requireOutstandingQty(outstandingByTransferLineId, line.id),
         }))
-        .filter((line) => line.expectedQty > 0)
+        .filter((line) => hasOutstandingQty(line.outstanding))
+      const outstandingBySourceLineId = new Map(outstandingLines.map((line) => [line.sourceLineId, line]))
+
+      // o3d-zzgp round 2, Codex HIGH-1 AND HIGH-2 — THE TWO HALVES OF ONE MISTAKE.
+      //
+      // A CREATE_PENDING reservation whose lines carry alignment credit cannot be
+      // re-used, because both things a retry does to it are destructive:
+      //
+      //  · HIGH-1: when nothing is outstanding any more it DELETED the
+      //    `wms_asn_maps` row, which cascades to `wms_asn_line_maps`. Those rows hold
+      //    `qtyAccountedViaSnapshot` while `qtyReceived` stays zero — they are the
+      //    ONLY record that the alignment brought those units in and costed them, so
+      //    the next read reported the whole line outstanding again and reopened ASN
+      //    creation and the cost-layer duplication behind it. (Round 1's test asserted
+      //    the deletion as DESIRED and never re-read the landed quantity afterwards,
+      //    which is how it pinned the defect as correct behaviour.)
+      //  · HIGH-2: when something IS outstanding it re-pointed the credited row's
+      //    `expectedQty` at the fresh figure — ten became four with six still credited
+      //    on the row. Booked-in reconciliation then compares a remote received of
+      //    four against a raw credit of six, emits `remote_regression` and blocks
+      //    approval for ever; and `reconcileBookedInQuantities` clamps that credit to
+      //    the new expectation and treats the four FRESH units as already covered by
+      //    it, so they would have added no stock at all.
+      //
+      // The historical credit and the fresh remote expectation are two different
+      // quantities about two different populations of units, so they are now two
+      // different rows: the credited reservation is RETIRED (closed, its expectation
+      // shrunk to exactly what it was credited, noted) and the outstanding remainder
+      // is reserved on a NEW ASN with a zero credit, by falling through to the create
+      // path below. The o3d-bhvu outage (GET /api/ASN is 405, so no create can
+      // currently finish) only MASKS this; it is not a defence.
+      if (pendingAsn && pendingAsnReservationCarriesCredit(pendingAsn.lines)) {
+        const outcome = await disposePendingTransferAsnReservation(tx, {
+          transferId: transfer.id,
+          asnMapId: pendingAsn.asnMapId,
+          reservationWhere: pendingReservationWhere,
+        })
+        // The disposal re-reads under the same locks this transaction already holds,
+        // so it cannot see anything but the credit the predicate just saw.
+        if (outcome !== 'retired') {
+          // INTEGRITY ABORT, rolls back on purpose: the disposal re-read the same
+          // locked rows and reached a different verdict, so neither read is trustworthy.
+          throw new Error(`A credited pending ASN reservation was ${outcome}, not retired (o3d-zzgp r3).`)
+        }
+        pendingAsn = null
+      }
 
       if (pendingAsn) {
         const unmappedLine = outstandingLines.find((line) => !line.externalProductId)
         if (unmappedLine) {
-          throw new Error(`Outstanding SKU ${unmappedLine.sku} is not linked to a Mintsoft product.`)
+          return refuse(`Outstanding SKU ${unmappedLine.sku} is not linked to a Mintsoft product.`)
         }
 
         if (outstandingLines.length === 0) {
-          await tx.wmsAsnMap.delete({
-            where: { id: pendingAsn.id },
+          // Uncredited by the branch above, so there is no evidence to lose and this
+          // deletes. `disposePendingTransferAsnReservation` is still the only route
+          // out, because the fact that makes the delete safe is re-read there under
+          // the locks, and nowhere else (o3d-zzgp rounds 2 and 3).
+          await disposePendingTransferAsnReservation(tx, {
+            transferId: transfer.id,
+            asnMapId: pendingAsn.asnMapId,
+            reservationWhere: pendingReservationWhere,
           })
-          throw new Error('This transfer has no outstanding quantity left to place on an ASN.')
+          // RETURNED, not thrown: the delete above must commit (o3d-zzgp r4).
+          return refuse('This transfer has no outstanding quantity left to place on an ASN.')
         }
 
         // q66in.4.6: a retry may carry a NEW ETA — keep the watchdog anchored to
         // the value actually sent to the WMS, not the first attempt's.
         await tx.wmsAsnMap.update({
-          where: { id: pendingAsn.id },
+          where: { id: pendingAsn.asnMapId },
           data: { eta: etaIso ? new Date(etaIso) : null },
         })
 
-        const outstandingBySourceLineId = new Map(outstandingLines.map((line) => [line.sourceLineId, line]))
         const pendingLineBySourceLineId = new Map(pendingAsn.lines.map((line) => [line.sourceLineId, line]))
         const activeSourceLineIds = outstandingLines.map((line) => line.sourceLineId)
 
+        // A line drops out of the outstanding set BECAUSE something landed it, and the
+        // alignment lands units by crediting these very columns — so this
+        // `deleteMany` was the per-line form of HIGH-1.
+        //
+        // THE LOCKS ARE THE FIX (o3d-zzgp r3): this runs under the transfer, ASN header
+        // and line-map locks taken above, after a credit re-read under them, and this
+        // branch is only entered when that re-read found no credit anywhere on the
+        // reservation. The three zero-credit conditions are the BACKSTOP: they keep a
+        // row with visible credit out of the delete if the locks were ever lost, but
+        // they are evaluated against this statement's snapshot, so on their own they
+        // would not stop a credit committing mid-statement (see
+        // lib/domain/wms/pending-asn-retirement.ts).
         await tx.wmsAsnLineMap.deleteMany({
           where: {
-            asnMapId: pendingAsn.id,
+            asnMapId: pendingAsn.asnMapId,
+            qtyAccountedViaSnapshot: 0,
+            qtyAccountedViaReceipt: 0,
+            lastProcessedReceivedQty: 0,
             ...(activeSourceLineIds.length > 0
               ? { sourceLineId: { notIn: activeSourceLineIds } }
               : {}),
@@ -3929,26 +4090,26 @@ export async function createMintsoftTransferAsn(
               data: {
                 productId: outstandingLine.productId,
                 sku: outstandingLine.sku,
-                expectedQty: outstandingLine.expectedQty,
+                expectedQty: outstandingLine.outstanding.qtyNumber,
               },
             })
           } else {
             await tx.wmsAsnLineMap.create({
               data: {
-                asnMapId: pendingAsn.id,
+                asnMapId: pendingAsn.asnMapId,
                 externalAsnLineId: `pending:${outstandingLine.sourceLineId}`,
                 sourceType: 'STOCK_TRANSFER_LINE',
                 sourceLineId: outstandingLine.sourceLineId,
                 productId: outstandingLine.productId,
                 sku: outstandingLine.sku,
-                expectedQty: outstandingLine.expectedQty,
+                expectedQty: outstandingLine.outstanding.qtyNumber,
               },
             })
           }
         }
 
         const refreshedPendingAsn = await tx.wmsAsnMap.findUnique({
-          where: { id: pendingAsn.id },
+          where: { id: pendingAsn.asnMapId },
           select: {
             id: true,
             lines: {
@@ -3965,13 +4126,28 @@ export async function createMintsoftTransferAsn(
         })
 
         if (!refreshedPendingAsn || refreshedPendingAsn.lines.length === 0) {
+          // INTEGRITY ABORT, rolls back on purpose: the lines were written a moment ago
+          // in this transaction, so an empty re-read means those writes did not land.
           throw new Error('This transfer has no outstanding quantity left to place on an ASN.')
         }
 
         const pendingLines = refreshedPendingAsn.lines.map((line) => {
           const outstandingLine = outstandingBySourceLineId.get(line.sourceLineId)
           if (!outstandingLine?.externalProductId) {
+            // INTEGRITY ABORT, rolls back on purpose (o3d-zzgp r4): every outstanding line's link was
+            // checked and RETURNED as a refusal above, so reaching this means the rows and the read disagree.
             throw new Error(`Outstanding SKU ${line.sku} is not linked to a Mintsoft product.`)
+          }
+          // The re-read is here to pick up the ids of rows created just above, so what
+          // it says about the QUANTITY is checked against the branded reading rather
+          // than substituted for it (o3d-zzgp round 2, Codex MEDIUM). A mismatch means
+          // the write above did not land the figure the reservation is about to push.
+          if (Number(line.expectedQty) !== outstandingLine.outstanding.qtyNumber) {
+            // INTEGRITY ABORT, rolls back on purpose: the resize did not store what it wrote.
+            throw new Error(
+              `Mintsoft ASN line for transfer line ${line.sourceLineId} stored ${Number(line.expectedQty)} `
+              + `where the outstanding quantity is ${outstandingLine.outstanding.qtyNumber}.`,
+            )
           }
 
           return {
@@ -3979,7 +4155,7 @@ export async function createMintsoftTransferAsn(
             sourceLineId: line.sourceLineId,
             productId: line.productId,
             sku: line.sku,
-            expectedQty: Number(line.expectedQty),
+            outstanding: outstandingLine.outstanding,
             externalProductId: outstandingLine.externalProductId,
           } satisfies ReservedAsnLine
         })
@@ -4003,12 +4179,14 @@ export async function createMintsoftTransferAsn(
       }
 
       if (outstandingLines.length === 0) {
-        throw new Error('This transfer has no outstanding quantity left to place on an ASN.')
+        // RETURNED, not thrown: a retirement or a stale-claim demotion made above in
+        // this transaction must commit (o3d-zzgp r4, Codex HIGH-1).
+        return refuse('This transfer has no outstanding quantity left to place on an ASN.')
       }
 
       const unmappedLine = outstandingLines.find((line) => !line.externalProductId)
       if (unmappedLine) {
-        throw new Error(`Outstanding SKU ${unmappedLine.sku} is not linked to a Mintsoft product.`)
+        return refuse(`Outstanding SKU ${unmappedLine.sku} is not linked to a Mintsoft product.`)
       }
 
       const asnMap = await tx.wmsAsnMap.create({
@@ -4028,7 +4206,7 @@ export async function createMintsoftTransferAsn(
               sourceLineId: line.sourceLineId,
               productId: line.productId,
               sku: line.sku,
-              expectedQty: line.expectedQty,
+              expectedQty: line.outstanding.qtyNumber,
             })),
           },
         },
@@ -4061,14 +4239,26 @@ export async function createMintsoftTransferAsn(
         packageCount: data.packageCount ?? null,
         autoCallback,
         callbackUrl,
-        lines: asnMap.lines.map((line, index) => ({
-          asnLineMapId: line.id,
-          sourceLineId: line.sourceLineId,
-          productId: line.productId,
-          sku: line.sku,
-          expectedQty: Number(line.expectedQty),
-          externalProductId: outstandingLines[index]!.externalProductId!,
-        })),
+        // Paired by `sourceLineId`, not by array index: the rows come back ordered by
+        // cuid while the outstanding lines are in transfer-line order, so the index
+        // pairing was only ever right by accident (o3d-zzgp round 2). The branded
+        // outstanding quantity travels with the pair.
+        lines: asnMap.lines.map((line) => {
+          const outstandingLine = outstandingBySourceLineId.get(line.sourceLineId)
+          if (!outstandingLine?.externalProductId) {
+            // INTEGRITY ABORT, rolls back on purpose (o3d-zzgp r4): every outstanding line's link was
+            // checked and RETURNED as a refusal above, so reaching this means the rows and the read disagree.
+            throw new Error(`Outstanding SKU ${line.sku} is not linked to a Mintsoft product.`)
+          }
+          return {
+            asnLineMapId: line.id,
+            sourceLineId: line.sourceLineId,
+            productId: line.productId,
+            sku: line.sku,
+            outstanding: outstandingLine.outstanding,
+            externalProductId: outstandingLine.externalProductId,
+          } satisfies ReservedAsnLine
+        }),
       } satisfies AsnReservation
     }, { maxWait: 5000, timeout: 30000 })
   }
@@ -4097,10 +4287,19 @@ export async function createMintsoftTransferAsn(
         return 'Transfer no longer exists.'
       }
 
-      const outstandingBySourceLineId = new Map<string, number>()
+      // o3d-zzgp: MUST use the same definition as `reserveAsn` above. If these two
+      // disagree the revalidation refuses every create with "Outstanding quantities
+      // changed after reservation" — and if both used `qty − qtyReceived` they agree
+      // on the wrong number, which is how the over-sized ASN got through.
+      const outstandingByTransferLineId = await loadTransferLineOutstandingQty(tx, transfer.lines)
+      // Branded on both sides (o3d-zzgp round 2, Codex MEDIUM): this map holds the
+      // readings this module produced, and the comparison below is
+      // `outstandingQtyEquals`, so neither side of the check that gates a push to a
+      // live warehouse can be a hand-computed number.
+      const outstandingBySourceLineId = new Map<string, TransferLineOutstandingQty>()
       for (const line of transfer.lines) {
-        const outstanding = Number(line.qty) - Number(line.qtyReceived)
-        if (outstanding > 0) {
+        const outstanding = requireOutstandingQty(outstandingByTransferLineId, line.id)
+        if (hasOutstandingQty(outstanding)) {
           outstandingBySourceLineId.set(line.id, outstanding)
         }
       }
@@ -4111,7 +4310,7 @@ export async function createMintsoftTransferAsn(
 
       for (const reservedLine of reservation.lines) {
         const currentOutstanding = outstandingBySourceLineId.get(reservedLine.sourceLineId)
-        if (currentOutstanding === undefined || currentOutstanding !== reservedLine.expectedQty) {
+        if (!currentOutstanding || !outstandingQtyEquals(currentOutstanding, reservedLine.outstanding)) {
           return 'Outstanding quantities changed after reservation.'
         }
       }
@@ -4149,7 +4348,8 @@ export async function createMintsoftTransferAsn(
       const lineBySourceId = new Map(asn.lines.map((line) => [line.sourceLineId, line]))
       return reservation.lines.every((line) => {
         const matchedLine = lineBySourceId.get(line.sourceLineId)
-        return Boolean(matchedLine) && quantitiesMatch(matchedLine?.quantity, line.expectedQty)
+        // OUTPUT BOUNDARY: matching a remote ASN's quantities against the reservation.
+        return Boolean(matchedLine) && quantitiesMatch(matchedLine?.quantity, line.outstanding.qtyNumber)
       })
     })
 
@@ -4176,18 +4376,38 @@ export async function createMintsoftTransferAsn(
     return claimed.count === 1
   }
 
-  async function discardPendingReservation(asnMapId: string): Promise<void> {
-    await db.wmsAsnMap.deleteMany({
-      where: {
-        id: asnMapId,
-        connector: 'mintsoft',
-        sourceType: 'STOCK_TRANSFER',
-        sourceId: parsedId.data,
-        externalAsnId: {
-          startsWith: pendingAsnPrefix,
+  /**
+   * o3d-zzgp round 2 (the same class as Codex HIGH-1, one route over). This runs when
+   * the revalidation finds the outstanding quantities have moved since the reservation
+   * — and an interleaving WMS alignment is WHAT MOVES THEM, by crediting
+   * `qtyAccountedViaSnapshot` on the very rows this used to delete. So the reservation
+   * is retired instead whenever it holds credit; the delete is kept for the ordinary
+   * case, where the row holds nothing and leaving it would only get it re-used at the
+   * wrong size.
+   *
+   * ROUND 3 (Codex HIGH): round 2 read the lines, decided, and deleted in THREE
+   * separate autocommit statements with no transaction and no lock, so an alignment
+   * committing between the read and the delete had its credit cascaded away — the
+   * round-2 rule, checked and then not held. It now runs as one transaction that
+   * takes `stock_transfers` → `wms_asn_maps` → `wms_asn_line_maps` before it reads
+   * anything; proved against a real interleaving in
+   * tests/concurrency/pending-asn-disposal-race.concurrent.test.ts.
+   */
+  async function discardPendingReservation(
+    reservation: Extract<AsnReservation, { kind: 'pending' }>,
+  ): Promise<void> {
+    await db.$transaction(async (tx) => {
+      await disposePendingTransferAsnReservation(tx, {
+        transferId: reservation.transferId,
+        asnMapId: reservation.asnMapId,
+        reservationWhere: {
+          connector: 'mintsoft',
+          externalAsnId: {
+            startsWith: pendingAsnPrefix,
+          },
         },
-      },
-    })
+      })
+    }, { maxWait: 5000, timeout: 15000 })
   }
 
   async function finalizePendingAsn(
@@ -4206,7 +4426,14 @@ export async function createMintsoftTransferAsn(
     const mappedLines = mapCreatedMintsoftAsnLines(reservation.lines, createdAsn.externalAsnId, createdAsn)
 
     return db.$transaction(async (tx) => {
-      await tx.$queryRaw`SELECT id FROM wms_asn_maps WHERE id = ${reservation.asnMapId} FOR UPDATE`
+      // STEP 2 THEN STEP 3 (o3d-zzgp r3). This used to lock the header alone. The
+      // conflict branch below disposes of the reservation, and the disposal takes the
+      // transfer lock before it reads any credit — taking it there, after this header
+      // lock, would be the step-3-before-step-2 inversion the global order exists to
+      // forbid. So the transfer comes first here, and the header second, as they do on
+      // every other path that touches both.
+      await lockStockTransfers(tx, [reservation.transferId])
+      await lockWmsAsnMaps(tx, [reservation.asnMapId])
 
       const conflictingAsn = await tx.wmsAsnMap.findUnique({
         where: {
@@ -4226,8 +4453,15 @@ export async function createMintsoftTransferAsn(
       })
 
       if (conflictingAsn && conflictingAsn.id !== reservation.asnMapId) {
-        await tx.wmsAsnMap.delete({
-          where: { id: reservation.asnMapId },
+        // Same rule as everywhere else on this path: the superseded reservation may be
+        // deleted only while it holds no credit. A concurrent alignment can have
+        // credited it between the reservation and this point — its lines are
+        // candidates for exactly as long as `closedAt` is null (o3d-zzgp round 2).
+        // Decided under the transfer, header and line locks, in this transaction
+        // (o3d-zzgp round 3).
+        await disposePendingTransferAsnReservation(tx, {
+          transferId: reservation.transferId,
+          asnMapId: reservation.asnMapId,
         })
 
         return {
@@ -4289,7 +4523,13 @@ export async function createMintsoftTransferAsn(
 
   try {
     const connector = getWmsConnector('mintsoft')
-    const reservation = await reserveAsn()
+    const reserved = await reserveAsn()
+    // Raised HERE, after the reservation transaction has committed, so a retirement it
+    // made is kept (o3d-zzgp r4, Codex HIGH-1). The catch below records it as before.
+    if (reserved.kind === 'refused') {
+      throw new Error(reserved.error)
+    }
+    const reservation = reserved
     let outcome: FinalizedAsnOutcome
     let replayWarning: string | null = null
 
@@ -4302,7 +4542,7 @@ export async function createMintsoftTransferAsn(
       } else {
         const mismatch = await revalidatePendingReservation(reservation)
         if (mismatch) {
-          await discardPendingReservation(reservation.asnMapId)
+          await discardPendingReservation(reservation)
           throw new Error(`${mismatch} Please retry creating the Mintsoft ASN.`)
         }
 
@@ -4313,7 +4553,7 @@ export async function createMintsoftTransferAsn(
 
         const recheckedMismatch = await revalidatePendingReservation(reservation)
         if (recheckedMismatch) {
-          await discardPendingReservation(reservation.asnMapId)
+          await discardPendingReservation(reservation)
           throw new Error(`${recheckedMismatch} Please retry creating the Mintsoft ASN.`)
         }
 
@@ -4331,7 +4571,9 @@ export async function createMintsoftTransferAsn(
             sourceLineId: line.sourceLineId,
             externalProductId: line.externalProductId,
             sku: line.sku,
-            quantity: line.expectedQty,
+            // THE OUTPUT BOUNDARY, and the only `.qtyNumber` on this path: what a LIVE
+            // warehouse is told to expect (o3d-zzgp).
+            quantity: line.outstanding.qtyNumber,
           })),
         })
 
@@ -4388,7 +4630,7 @@ export async function createMintsoftTransferAsn(
                 reference: reservation.reference,
                 eta: reservation.eta ?? null,
                 carrier: reservation.carrier ?? null,
-                lines: reservation.lines.map((line) => ({ sku: line.sku, quantity: line.expectedQty })),
+                lines: reservation.lines.map((line) => ({ sku: line.sku, quantity: line.outstanding.qtyNumber })),
               }
             : {}),
         },

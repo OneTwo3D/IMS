@@ -75,6 +75,35 @@ Applied corrections log `mintsoft_align_down_applied` (WARNING) with before/afte
 ## ASN Flow
 
 - IMS creates outbound ASN payloads for purchase orders and transfer lines.
+- A **transfer** ASN line's expected quantity is the line quantity less what has already **landed**,
+  by the one definition in `lib/domain/inventory/transfer-landed-quantity.ts`: `qtyReceived` plus any
+  `wms_asn_line_maps.qtyAccountedViaSnapshot` credit a receipt has not yet absorbed. It is deliberately
+  NOT `qty - qtyReceived` (o3d-zzgp): the stock-sync alignment above raises stock and lays cost layers
+  without writing `qtyReceived`, so that subtraction asked a live warehouse to expect units already on
+  its own shelves. The reservation and its pre-push revalidation read the same figure under the
+  transfer's row lock, so they cannot disagree and refuse every create. Purchase-order ASN lines are
+  still sized as `qty - qtyReceived`; a PO line has no landed-quantity definition yet (see below).
+- A **retry** of a transfer ASN create never deletes or resizes a reservation that already holds
+  credit. `wms_asn_line_maps.qtyAccountedViaSnapshot` is the ONLY record that the alignment brought
+  those units in and costed them, so the reservation is **retired** instead: `closedAt` is set (which
+  removes it from the alignment candidates, the reuse lookups and the overdue-ASN watchdog), each
+  line's `expectedQty` is shrunk to exactly what that row was credited so its own residue is zero, and
+  the shrunk figures are recorded in the line's `note`. Any quantity still outstanding is then reserved
+  on a NEW ASN with a zero credit, so the historical credit and the fresh remote expectation are two
+  different rows rather than two meanings of one. A reservation that holds no credit is still deleted
+  or resized in place, which is what keeps a retry loop from leaving one closed row per attempt. A
+  retired reservation stays visible in the transfer's ASN list as a closed `CREATE_PENDING` row.
+  The credit check and the disposal are ONE transaction that first takes the global lock order
+  (`stock_transfers` → `wms_asn_maps` → `wms_asn_line_maps`, see
+  `lib/domain/wms/transfer-asn-lock-order.ts`), so an alignment cannot credit a line between the
+  check and the delete; it waits on the transfer row and re-reads afterwards. The delete also refuses
+  a header whose lines visibly hold credit, but that is a backstop only — it is evaluated against the
+  delete statement's own snapshot and does not stop a credit that commits mid-statement.
+  A retirement (or the delete of an uncredited emptied reservation) is COMMITTED even when the same
+  attempt then refuses the create — "nothing outstanding", "not linked to a Mintsoft product": the
+  reservation transaction returns the refusal and the action raises it after commit, because a refusal
+  thrown inside the transaction would roll the retirement back and leave the reservation open.
+  Purchase-order ASN reservations still delete on retry (see below).
 - Mintsoft callback metadata preserves the source type, source line, product, and expected quantity.
 - Booked-in webhook receipt is idempotent via `wms_inbound_receipt_events`.
 - Accepted webhooks are persisted and acknowledged with `202 Accepted`; stock and purchase-order mutations run later through `/api/cron/mintsoft-webhook-sweeper`.
@@ -84,6 +113,24 @@ Applied corrections log `mintsoft_align_down_applied` (WARNING) with before/afte
 - **Known gap: ASN creation itself does not yet match Mintsoft's published contract (o3d-vcw8).** Mintsoft's swagger defines creation as `PUT /api/ASN` with a `NewASN` body (`POReference`, `Items`) returning a `ToolkitResult`. IMS sends `POST /api/ASN` with `Reference`/`Lines`. Until that is fixed, an ASN push against live Mintsoft is expected to fail at the push, because the swagger has no `POST /api/ASN`, and the reservation stays `CREATE_PENDING`. The POST has deliberately never been sent to the live tenant to confirm this. Never test ASN creation against the live tenant: Mintsoft fulfils what it is sent.
 - `/api/cron/mintsoft-webhook-sweeper` drains at most `MINTSOFT_WEBHOOK_SWEEPER_PAGE_SIZE` persisted events per run. Leave it unset for the default `250`.
 - Line deltas are applied only for previously unaccounted received quantities.
+
+### Purchase-order ASN lines are not landed-quantity aware yet
+
+The two asymmetries above are one scope boundary, not two oversights. A purchase-order line has no
+"landed quantity" definition: the alignment credits `wms_asn_line_maps.qtyAccountedViaSnapshot` for a
+PO-sourced row and lays its cost layer without writing `purchase_order_lines.qtyReceived` either, so
+the same two columns disagree — but nothing yet defines how to combine them for a PO (o3d-papk).
+
+Until that exists, the PO ASN path deliberately keeps BOTH of its old behaviours:
+
+- lines are sized `qty - qtyReceived`, which over-states when an alignment has already brought units in;
+- a retry deletes or resizes a credited pending reservation, which loses that credit.
+
+Retiring a credited PO reservation without landed-aware sizing would be worse, not better: the
+replacement reservation would be raised at the full outstanding quantity with a zero credit, so a
+booked-in receipt against it would find nothing to cover the already-landed units and would add their
+stock a second time. The delete is a lost-evidence bug; retiring it first would make it a
+double-stock bug. The order is therefore o3d-papk first, then the PO retry path.
 
 ### Receipt Review
 
