@@ -2,7 +2,8 @@ import assert from 'node:assert/strict'
 import test from 'node:test'
 
 import { toDecimal } from '@/lib/domain/math/decimal'
-import { collapseUnplacedCreditDecimal, marginFigureBound, marginFigureBoundDecimal, netLinearFigureBound, netLinearFigureBoundDecimal, shareFigureBound, boundSuffix, unplacedCreditBoundFromParts, type CollapsedUnplacedCreditDecimal } from '@/lib/domain/sales/refund-basis-analytics'
+import { ExactFigure } from '@/lib/domain/math/exact-figure'
+import { collapseUnplacedCreditDecimal, marginFigureBound, marginFigureBoundDecimal, marginFigureBoundExact, netLinearFigureBound, netLinearFigureBoundDecimal, netLinearFigureBoundExact, shareFigureBound, boundSuffix, unplacedCreditBoundFromParts, type CollapsedUnplacedCreditDecimal } from '@/lib/domain/sales/refund-basis-analytics'
 import {
   EXACT_LINEAR_FIGURE_BOUND,
   classifyLinearFigureBound,
@@ -194,11 +195,37 @@ const BOUND_CASES: Array<{ netRevenue: number; cogs: number; unplacedCredit: num
   { netRevenue: -20, cogs: 40, unplacedCredit: 10, basisComplete: false },   // margin case 2, negative
   { netRevenue: 100, cogs: 40, unplacedCredit: -1, basisComplete: false },   // negative credit
   { netRevenue: 100, cogs: 40, unplacedCredit: 0, basisComplete: false },    // sub-penny: flag decides
+  // BOUNDARY ROWS (review of o3d-rv4a r6, M1): each sits exactly on one comparison, so a `>=` / `>` or
+  // `<=` / `<` slip in ANY twin changes its answer. Expected verdicts are pinned below as well, so a slip
+  // made identically in all three twins cannot pass by agreement.
+  { netRevenue: 100, cogs: 100, unplacedCredit: 120, basisComplete: false }, // case 4, revenue == COGS: upper
+  { netRevenue: 100, cogs: 150, unplacedCredit: 100, basisComplete: false }, // case 3, revenue == credit: falls to 4b
+  { netRevenue: 100, cogs: 40, unplacedCredit: 100, basisComplete: false },  // case 3, revenue == credit: falls to 4a
 ]
 
-test('the Decimal bound classifiers answer exactly what their number twins do (o3d-kyey)', () => {
+/** The verdicts the boundary rows (and case 2's zero row) must give, from the case analysis itself. */
+const BOUNDARY_EXPECTED = new Map<string, { linear: string; margin: string }>([
+  [JSON.stringify({ netRevenue: 0, cogs: 40, unplacedCredit: 10, basisComplete: false }), { linear: 'upper', margin: 'exact' }],
+  [JSON.stringify({ netRevenue: 100, cogs: 100, unplacedCredit: 120, basisComplete: false }), { linear: 'upper', margin: 'upper' }],
+  [JSON.stringify({ netRevenue: 100, cogs: 150, unplacedCredit: 100, basisComplete: false }), { linear: 'upper', margin: 'indeterminate' }],
+  [JSON.stringify({ netRevenue: 100, cogs: 40, unplacedCredit: 100, basisComplete: false }), { linear: 'upper', margin: 'upper' }],
+])
+
+/**
+ * The exact twins take BOTH ends of the credit interval. A collapsed credit `c` stands for `[c, 0]` when
+ * negative (its lower end is what the collapse kept) and `[0, c]` otherwise — the intervals
+ * `collapseUnplacedCreditDecimal` maps back to `c`.
+ */
+function exactInterval(value: number): { unplacedLower: ExactFigure; unplacedUpper: ExactFigure } {
+  return value < 0
+    ? { unplacedLower: ExactFigure.of(value), unplacedUpper: ExactFigure.zero() }
+    : { unplacedLower: ExactFigure.zero(), unplacedUpper: ExactFigure.of(value) }
+}
+
+test('the Decimal and exact bound classifiers answer exactly what their number twins do (o3d-kyey, o3d-rv4a r6)', () => {
   const linear = new Set<string>()
   const margin = new Set<string>()
+  let boundaryChecked = 0
   for (const input of BOUND_CASES) {
     const linearNumber = netLinearFigureBound({ basisComplete: input.basisComplete, unplacedCredit: collapsed(input.unplacedCredit) })
     const linearDecimal = netLinearFigureBoundDecimal({ basisComplete: input.basisComplete, unplacedCredit: collapsedDecimal(input.unplacedCredit) })
@@ -208,7 +235,25 @@ test('the Decimal bound classifiers answer exactly what their number twins do (o
     const marginDecimal = marginFigureBoundDecimal({ ...input, unplacedCredit: collapsedDecimal(input.unplacedCredit) })
     assert.equal(marginDecimal, marginNumber, `margin disagreed on ${JSON.stringify(input)}`)
     margin.add(marginNumber)
+    // THE THIRD TWIN (o3d-rv4a r5): the exact classifiers the COGS report now uses.
+    const interval = exactInterval(input.unplacedCredit)
+    const linearExact = netLinearFigureBoundExact({ basisComplete: input.basisComplete, unplacedLower: interval.unplacedLower })
+    assert.equal(linearExact, linearNumber, `exact linear disagreed on ${JSON.stringify(input)}`)
+    const marginExact = marginFigureBoundExact({
+      netRevenue: ExactFigure.of(input.netRevenue),
+      cogs: ExactFigure.of(input.cogs),
+      ...interval,
+      basisComplete: input.basisComplete,
+    })
+    assert.equal(marginExact, marginNumber, `exact margin disagreed on ${JSON.stringify(input)}`)
+    const expected = BOUNDARY_EXPECTED.get(JSON.stringify(input))
+    if (expected) {
+      assert.equal(linearNumber, expected.linear, `boundary linear ${JSON.stringify(input)}`)
+      assert.equal(marginNumber, expected.margin, `boundary margin ${JSON.stringify(input)}`)
+      boundaryChecked += 1
+    }
   }
+  assert.equal(boundaryChecked, BOUNDARY_EXPECTED.size, 'every boundary row was found in the table')
   // The table must actually exercise the branches, or "they agree" is a statement about nothing.
   assert.deepEqual([...linear].sort(), ['exact', 'indeterminate', 'upper'])
   assert.deepEqual([...margin].sort(), ['exact', 'indeterminate', 'upper'])

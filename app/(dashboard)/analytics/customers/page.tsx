@@ -13,7 +13,7 @@ export default async function CustomerAnalyticsPage({ searchParams }: { searchPa
   const filters = salesAnalyticsFiltersFromSearch(await searchParams)
   const report = await loadCustomerAnalyticsReportForPage(filters)
   // o3d-kyey: the bound travels with every figure it qualifies, on the row AND in the footer, so a
-  // reader cannot see the number without seeing what it is. `≤` means at most the true figure; `?`
+  // reader cannot see the number without seeing what it is. `≤` means the true figure is at most the one shown; `?`
   // means a bound exists but its direction is not established (see derived-figure-bound.ts).
   const bound = (value: string | undefined) => boundSuffix((value ?? 'exact') as DerivedFigureBound)
   const columns: Array<SalesAnalyticsColumn<CustomerReportRow>> = [

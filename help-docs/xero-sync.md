@@ -1313,6 +1313,22 @@ safe**, whichever side of the line it lands on. What does the work instead:
   payment poll and the daily payment reconcile sweep, and the accounting reconciliation report's
   `duplicate_external_reference` finding. All of those need a person to unwind the duplicate in Xero.
 
+### Reading the accounting reconciliation report
+
+The accounting reconciliation run (`/api/admin/accounting/reconciliation`, with past runs at
+`/api/admin/accounting/reconciliation/runs`) lists **findings** — sync rows, events and documents
+that disagree — and records on each run whether its lists were **complete**. A run whose
+`truncations` is `[]` listed everything it found; a run whose `truncations` names a check listed only
+part of that check, and the entry says exactly how many it found in total.
+
+**`old_sync_log_without_mirrored_event`** is a sync row of a mirrored type (a sales or purchase
+invoice, a credit note, or a daily-batch, COGS or revenue-reversal journal) for which no accounting event exists. It is
+worked out over the whole database, not a sample of it, and listed **oldest first**, up to 500 rows.
+Past 500, the `old_sync_log_without_mirrored_event_truncated` finding and the run's `truncations`
+entry carry the exact total. **Read the count, not only the list:** because the oldest are listed
+first, a row that broke *today* will not appear in the list while 500 older ones remain unresolved —
+it shows up only as the total going up by one.
+
 ### Tax Rate Sync (Multi-Component Profiles)
 
 When an IMS VAT rate has one or more active components (e.g. Canada `GST 5% + PST 7%`), saving the

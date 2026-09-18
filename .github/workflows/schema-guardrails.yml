@@ -218,8 +218,8 @@ jobs:
   #   * FOUR never open one (`advisory-lock-keys`, `pool-acquisition-bound`, `post-remote-persist`,
   #     `prisma-unique-violation`) and run identically under `test:unit`.
   #
-  # So this tier is NOT held back from `test:unit` as a block: 101 of its 145 tests execute there,
-  # and 44 skip. docs/development.md carries the same census per file, with the counts.
+  # So this tier is NOT held back from `test:unit` as a block: 101 of its 147 tests execute there,
+  # and 46 skip. docs/development.md carries the same census per file, with the counts.
   #
   # The lesson is not "count the files again": a prose census goes stale silently, and this one is
   # prose. NOTHING MECHANICAL ENFORCES IT. A programmatic census was built on o3d-n3yt and

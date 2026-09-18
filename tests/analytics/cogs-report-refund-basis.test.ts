@@ -1459,6 +1459,68 @@ test('the row verdicts equal an exact-rational reference over non-terminating sh
   assert.ok(checked >= 300, `${checked} rows checked`)
 })
 
+test('a NEGATIVE same-basis credit on an Unmatched row\u2019s line marks the totals ?, not \u2264 (review of r6, M2)', async () => {
+  // Review of o3d-rv4a r6, M2: mutant M (`exactUnabsorbedInterval` dropping the same-basis credit from
+  // the interval's LOWER end) survived and printed a false \u2264 on the totals.
+  //
+  // WORKED: product p1 has one dispatch linked to line L1 (revenue 100) and one against order O2, which
+  // cannot be matched, so the row reads Unmatched and publishes no revenue. A NET credit of -10 (a
+  // reversal) against L1 reaches that row, where nothing can absorb it: the period's true revenue is the
+  // published figure PLUS 10, so the unabsorbed interval is [-10, -10]. A negative lower end means the
+  // truth may be above the published figure, and this report cannot mint `\u2265`, so the totals owe `?`.
+  // With the same-basis part dropped from the lower end the interval reads [0, -10], nothing looks
+  // negative, and the totals printed `\u2264` over a truth that is 10 ABOVE them.
+  const matched = cogsEntry({ id: 'c1', orderId: 'O1', productId: 'p1', qty: '1', cost: '40', line: { id: 'L1', productId: 'p1', totalBase: '100' } })
+  const unmatched = cogsEntry({ id: 'c2', orderId: 'O2', productId: 'p1', qty: '1', cost: '40' })
+  COGS_ROWS = [matched, unmatched]
+  ORDERS = [order('O1', [{ productId: 'p1', totalBase: '100' }])]
+  CREDIT_LINES = [creditAgainstLine('L1', 'O1', 'p1', '-10', 'NET')]
+  FILTER_PRODUCT_IDS = [...ALL_FIXTURE_PRODUCTS]
+  const { rows, totals } = await report()
+  assert.equal(rows.length, 1)
+  assert.equal(rows[0]!.revenueBase, null, 'the row is Unmatched')
+  assert.equal(rows[0]!.refundsNetBasis.exactString(), '-10', 'and the reversal reached it')
+  assert.equal(totals.revenueBaseBound, 'indeterminate')
+  const page = await pageCells()
+  assert.match(page.footer('revenue'), / \?$/, `the revenue footer is ${page.footer('revenue')}`)
+})
+
+test('a line with a non-positive dispatched quantity still has its credit subtracted (review of r6, L1)', async () => {
+  // The DEGENERATE branch: a line whose dispatched quantity sums to zero gets its whole revenue (there is
+  // no share to take), and its credit must follow the same rule. WORKED: line L1 of 100 with a single
+  // zero-quantity dispatch and a NET credit of 10 against it: revenue 100 - 10 = 90, credit column 10.
+  // Unreachable from today's writers (cogs_entries quantities are FIFO consumption, positive), and
+  // reachable through the exported aggregation API; covered so the branch cannot silently drop the credit.
+  COGS_ROWS = [cogsEntry({ id: 'c1', orderId: 'O1', productId: 'p1', qty: '0', cost: '0', line: { id: 'L1', productId: 'p1', totalBase: '100' } })]
+  ORDERS = [order('O1', [{ productId: 'p1', totalBase: '100' }])]
+  CREDIT_LINES = [creditAgainstLine('L1', 'O1', 'p1', '10', 'NET')]
+  FILTER_PRODUCT_IDS = [...ALL_FIXTURE_PRODUCTS]
+  const { rows, totals } = await report()
+  assert.equal(rows.length, 1)
+  assert.equal(rows[0]!.revenueBase!.exactString(), '90')
+  assert.equal(rows[0]!.refundsNetBasis.exactString(), '10')
+  assert.equal(rows[0]!.revenueBaseBound, 'exact')
+  assert.equal(totals.revenueBase.exactString(), '90')
+})
+
+test('a degenerate line split across two groups is counted ONCE in the totals (o3d-qf6q)', { todo: 'o3d-qf6q: degenerate lines are double-counted across groups; needs a semantic decision' }, async () => {
+  // Repro for o3d-qf6q, kept runnable and marked todo so it reports without failing the suite: two
+  // zero-quantity dispatches of line L1 (100) from two warehouses. Each group takes the FULL line revenue,
+  // so the period total is 200 for a 100 line.
+  const line = { id: 'L1', productId: 'p1', totalBase: '100' }
+  COGS_ROWS = [0, 1].map((index) => {
+    const entry = cogsEntry({ id: `c${index}`, orderId: 'O1', productId: 'p1', qty: '0', cost: '0', line })
+    return { ...entry, movement: { ...entry.movement, fromWarehouseId: `wh-${index}`, fromWarehouse: { id: `wh-${index}`, code: `W${index}`, name: `Warehouse ${index}` } } }
+  })
+  ORDERS = [order('O1', [{ productId: 'p1', totalBase: '100' }])]
+  CREDIT_LINES = []
+  FILTER_PRODUCT_IDS = [...ALL_FIXTURE_PRODUCTS]
+  const { getCogsReport } = await import('@/lib/domain/inventory/inventory-costing-reports')
+  const { rows, totals } = await getCogsReport({ ...FILTERS, groupBy: 'warehouse' }, { paginate: false })
+  assert.equal(rows.length, 2)
+  assert.equal(totals.revenueBase.exactString(), '100')
+})
+
 // ---------------------------------------------------------------------------------------------
 // The CSV — a file reader has no tooltip
 // ---------------------------------------------------------------------------------------------
@@ -1541,18 +1603,17 @@ test('a withheld AMOUNT still prints the relation the producer published (o3d-la
   assert.equal(page.cellOf('marginPct', row), 'Unmatched ?')
 })
 
-test('the credit-share helper refuses a negative share rather than inverting the interval (o3d-rv4a)', async () => {
-  // `Σ max(k·e, 0) = k · Σ max(e, 0)` holds only for k >= 0. A negative share would swap the
-  // interval's ends and turn a sound ceiling into a claim the figure cannot support, so the helper
-  // refuses instead of documenting the precondition. Asserted here because a defensive throw nothing
-  // exercises is a comment with a stack trace.
-  const { emptyCredits, scaleCredits } = await import('@/lib/domain/sales/refund-credit-buckets')
-  assert.throws(() => scaleCredits(emptyCredits(), D('-1'), D('4')), /non-negative share/)
-  assert.throws(() => scaleCredits(emptyCredits(), D('1'), D('0')), /non-negative share/)
-  // And the share is taken as `value * numerator / denominator`, in that order — the same expression
-  // the revenue allocation beside it uses. A third of 100 is 33.33… in both, so the two halves of the
-  // subtraction carry the same residual instead of drifting apart.
-  const buckets = emptyCredits()
-  buckets.net = D('100')
-  assert.equal(scaleCredits(buckets, D('1'), D('3')).net.toString(), D('100').mul(1).div(3).toString())
+test('a quantity share refuses a negative or empty share rather than inverting the interval (o3d-rv4a)', () => {
+  // `Σ max(k·e, 0) = k · Σ max(e, 0)` holds only for k >= 0, so a negative share would swap the ends of
+  // every credit interval shared by it and turn a sound ceiling into a claim the figure cannot support.
+  // The guard that actually stands between the COGS report and that is ExactFigure.mulDiv's RangeError
+  // (lib/domain/math/exact-figure.ts) — the Decimal scaleCredits it replaced is deleted (review of r6, L4).
+  assert.throws(() => ExactFigure.share('100', '-1', '4'), (error: unknown) => error instanceof RangeError && /non-negative share/.test(String(error)))
+  assert.throws(() => ExactFigure.share('100', '1', '0'), (error: unknown) => error instanceof RangeError && /non-negative share/.test(String(error)))
+  assert.throws(() => ExactFigure.of('100').mulDiv(ExactFigure.of('1'), ExactFigure.of('-3')), RangeError)
+  // A quotient cannot be a share's part or whole: only stored, terminating quantities are shares.
+  assert.throws(() => ExactFigure.of('100').mulDiv(ExactFigure.share('1', '1', '3'), ExactFigure.of('1')), /terminating/)
+  // And a legitimate share is exact: a third of 100, three times, is 100.
+  const third = ExactFigure.share('100', '1', '3')
+  assert.equal(ExactFigure.sum([third, third, third]).exactString(), '100')
 })

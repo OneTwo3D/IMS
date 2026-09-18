@@ -242,7 +242,7 @@ export class ExactFigure {
   /**
    * `value × part / whole`, kept as a quotient — the quantity share. `part` must be non-negative and
    * `whole` positive, which is what a share of a quantity is; anything else is refused rather than
-   * carried, for the same reason `scaleCredits` refuses it.
+   * carried: a negative factor would swap the ends of every credit interval shared by it.
    */
   static share(value: DecimalInput, part: DecimalInput, whole: DecimalInput): ExactFigure {
     return ExactFigure.of(value).mulDiv(ExactFigure.of(part), ExactFigure.of(whole))
@@ -267,7 +267,8 @@ export class ExactFigure {
   /**
    * `this x part / whole`, kept as quotients. `part` and `whole` must be terminating quantities (no
    * quotient terms of their own), `part` non-negative and `whole` positive — a share of a quantity —
-   * and anything else is refused rather than carried, as `scaleCredits` refuses it.
+   * and anything else is refused with a RangeError rather than carried, because `Σ max(k·e, 0) = k · Σ max(e, 0)`
+   * holds only for `k >= 0`: a negative share would swap the ends of every credit interval scaled by it.
    */
   mulDiv(part: ExactFigure, whole: ExactFigure): ExactFigure {
     if (part.terms.size > 0 || whole.terms.size > 0) throw new RangeError('ExactFigure.mulDiv takes terminating quantities')

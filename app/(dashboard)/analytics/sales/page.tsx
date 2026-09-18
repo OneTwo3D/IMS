@@ -20,7 +20,7 @@ export default async function SalesAnalyticsPage({ searchParams }: { searchParam
     { key: 'revenue', label: 'Revenue (invoiced)', align: 'right', render: (row) => row.revenue, footer: report.totals.revenue },
     // o3d-kyey: the refund-aware figure sits BESIDE the invoiced one rather than replacing it — this
     // report's contract is that its totals reconcile to SalesOrder totals, and a figure net of credit
-    // notes cannot also do that. `≤` means at most the true figure.
+    // notes cannot also do that. `≤` means the true figure is at most the one shown.
     { key: 'netRevenue', label: 'Net revenue', align: 'right', render: (row) => `${row.netRevenue}${boundSuffix(row.netRevenueBound)}`, footer: `${report.totals.netRevenue}${bound(report.totals.netRevenueBound)}` },
     { key: 'tax', label: 'Tax', align: 'right', render: (row) => row.tax, footer: report.totals.tax },
     { key: 'shipping', label: 'Shipping', align: 'right', render: (row) => row.shipping, footer: report.totals.shipping },
