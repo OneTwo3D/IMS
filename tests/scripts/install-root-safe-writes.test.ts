@@ -5001,7 +5001,9 @@ function runWalk(data: string, pruneAtRoot: string, opts: { helper?: string, env
     'set -uo pipefail',
     `node ${q(opts.helper ?? CHOWN_TREE)} . "$(${REAL.id} -u)" "$(${REAL.id} -g)" ${q(pruneAtRoot)}`,
     'echo "rc=$?"',
-  ].join('\n'), { cwd: data, env: opts.env })
+    // THE DIRECTORY THE CALLER VETTED (o3d-z5be r11): chown_state_tree() names it, and the walker now
+    // refuses to run anywhere else. The walker's own refusals are measured in privileged-helper-set.
+  ].join('\n'), { cwd: data, env: { IMS_CHOWN_TREE_ROOT: data, ...(opts.env ?? {}) } })
 }
 
 /** THE SHIPPED WALKER WITH ITS STAGING PRUNE REMOVED, and nothing else changed — the mutation every

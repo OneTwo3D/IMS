@@ -1,6 +1,13 @@
 {
- "_about": "THE LEXICAL BACKSTOP ALLOWLIST (o3d-z5be r10). Each entry is one EXACT line (trimmed) of a script that spells a privileged command word and is not a census row, how many times that exact line occurs in that file, what it is, and why it is not a guarded tree operation. Reviewed by hand; tests/scripts/privileged-helper-set.test.ts fails on any line not listed, on a changed count, and on an entry that matches nothing.",
+ "_about": "THE LEXICAL BACKSTOP ALLOWLIST (o3d-z5be r10/r11). Each entry is one statement (a physical line or a whole continuation group, trimmed) of a script that spells a privileged command word and is not wholly census rows, how many times that exact text occurs in that file, what it is, and why. The text is matched exactly and the count must agree. It binds neither context nor the values of variables: the entries of the tree-changing classes (code-owned-tree, census-helper) therefore name a run-time guard that checks the path at the operation, and tests/scripts/privileged-helper-set.test.ts requires that guard to be called before each occurrence. Drafted from the tokeniser and read by hand.",
  "entries": [
+  {
+   "file": "scripts/install.sh",
+   "line": "#    FRESH ONE (r6, Codex HIGH 1): `chown`/`chmod` change an inode's metadata and revoke no descriptor",
+   "count": 1,
+   "class": "comment",
+   "reason": "a comment by lexer state that quotes code in backticks or $( ); the strict rule reads it, and nothing on it runs"
+  },
   {
    "file": "scripts/install.sh",
    "line": "out=\"$(find \"${entry}\" \"${dir}\" \"${dir}/lib\" -maxdepth 0 \\( ! -uid \"${trusted}\" -o -perm /022 \\) -print -quit 2>/dev/null)\" || return 1",
@@ -31,10 +38,31 @@
   },
   {
    "file": "scripts/install.sh",
+   "line": "# `cat >` rather than `mv` so redis.conf keeps its own owner and mode.",
+   "count": 1,
+   "class": "comment",
+   "reason": "a comment by lexer state that quotes code in backticks or $( ); the strict rule reads it, and nothing on it runs"
+  },
+  {
+   "file": "scripts/install.sh",
    "line": "rm -f \"${tmp}\"",
    "count": 2,
    "class": "single-inode",
    "reason": "non-recursive rm -f on one named path"
+  },
+  {
+   "file": "scripts/install.sh",
+   "line": "# class of them: a re-install recovers `abc`, sees it differ from the installed `abc\\n`, and",
+   "count": 1,
+   "class": "comment",
+   "reason": "a comment by lexer state that quotes code in backticks or $( ); the strict rule reads it, and nothing on it runs"
+  },
+  {
+   "file": "scripts/install.sh",
+   "line": "# alternative — find the authority by taking everything up to the first `/` — is a",
+   "count": 1,
+   "class": "comment",
+   "reason": "a comment by lexer state that quotes code in backticks or $( ); the strict rule reads it, and nothing on it runs"
   },
   {
    "file": "scripts/install.sh",
@@ -59,6 +87,13 @@
   },
   {
    "file": "scripts/install.sh",
+   "line": "# `rm .env` set ENV_FILE_STATE=absent, require_preserved_secrets() returned without checking",
+   "count": 1,
+   "class": "comment",
+   "reason": "a comment by lexer state that quotes code in backticks or $( ); the strict rule reads it, and nothing on it runs"
+  },
+  {
+   "file": "scripts/install.sh",
    "line": "warn \"IMS_INSTALL_REMINT_SECRETS=yes: minting a fresh AUTH_SECRET, SETTINGS_ENCRYPTION_KEY and CRON_SECRET even though ${APP_DIR}/.env is ABSENT on a host that is not a first install. Every encrypted setting written under the previous SETTINGS_ENCRYPTION_KEY becomes permanently undecryptable, and every existing session is invalidated. Why this run is not a first install: ${witnesses[*]}\"",
    "count": 1,
    "class": "text",
@@ -77,6 +112,41 @@
    "count": 2,
    "class": "single-inode",
    "reason": "non-recursive rm -f on one named path"
+  },
+  {
+   "file": "scripts/install.sh",
+   "line": "# `fence_cron`, so an unwritable crontab backup, a failed chmod, a broken pipeline or a",
+   "count": 1,
+   "class": "comment",
+   "reason": "a comment by lexer state that quotes code in backticks or $( ); the strict rule reads it, and nothing on it runs"
+  },
+  {
+   "file": "scripts/install.sh",
+   "line": "#                                      the final component, and then `chown`ed and `chmod`ed by",
+   "count": 1,
+   "class": "comment",
+   "reason": "a comment by lexer state that quotes code in backticks or $( ); the strict rule reads it, and nothing on it runs"
+  },
+  {
+   "file": "scripts/install.sh",
+   "line": "# FUNCTIONS rather than these assignments — can measure the mechanism without measuring `chown`.",
+   "count": 1,
+   "class": "comment",
+   "reason": "a comment by lexer state that quotes code in backticks or $( ); the strict rule reads it, and nothing on it runs"
+  },
+  {
+   "file": "scripts/install.sh",
+   "line": "# action is different from the one a first install takes. It is a single line so the two `die`",
+   "count": 1,
+   "class": "comment",
+   "reason": "a comment by lexer state that quotes code in backticks or $( ); the strict rule reads it, and nothing on it runs"
+  },
+  {
+   "file": "scripts/install.sh",
+   "line": "# The reachable effect was an install that died with `DRY_RUN: unbound variable` at \"Setting up",
+   "count": 1,
+   "class": "comment",
+   "reason": "a comment by lexer state that quotes code in backticks or $( ); the strict rule reads it, and nothing on it runs"
   },
   {
    "file": "scripts/install.sh",
@@ -136,6 +206,13 @@
   },
   {
    "file": "scripts/install.sh",
+   "line": "# Is there something here to break? The unit FILE, not `is-active`: a previous install",
+   "count": 1,
+   "class": "comment",
+   "reason": "a comment by lexer state that quotes code in backticks or $( ); the strict rule reads it, and nothing on it runs"
+  },
+  {
+   "file": "scripts/install.sh",
    "line": "die \"this run cannot tell an in-place upgrade from a first install: ${CRONTAB_COMMAND_REASON}. Both answers act destructively on the wrong host — one migrates a live installation, the other stops and fences a box that has nothing on it — so NOTHING HAS BEEN CHANGED.\"",
    "count": 1,
    "class": "text",
@@ -147,6 +224,104 @@
    "count": 1,
    "class": "text",
    "reason": "not run: the word is text or an argument (read_crontab_for, die)"
+  },
+  {
+   "file": "scripts/install.sh",
+   "line": "# `chown -h ${APP_USER}` it runs over ${DATA_DIR}: half this function's targets live under that",
+   "count": 1,
+   "class": "comment",
+   "reason": "a comment by lexer state that quotes code in backticks or $( ); the strict rule reads it, and nothing on it runs"
+  },
+  {
+   "file": "scripts/install.sh",
+   "line": "# root — nothing is published under it — and it is still subject to `chown -R`, which dereferences",
+   "count": 1,
+   "class": "comment",
+   "reason": "a comment by lexer state that quotes code in backticks or $( ); the strict rule reads it, and nothing on it runs"
+  },
+  {
+   "file": "scripts/install.sh",
+   "line": "# `rm && mkdir -p && mount --bind` procedure with an apparatus in front of it deciding whether it",
+   "count": 1,
+   "class": "comment",
+   "reason": "a comment by lexer state that quotes code in backticks or $( ); the strict rule reads it, and nothing on it runs"
+  },
+  {
+   "file": "scripts/install.sh",
+   "line": "# `rm && mkdir -p && mount --bind` recipe, gated by a growing apparatus whose only job was to",
+   "count": 1,
+   "class": "comment",
+   "reason": "a comment by lexer state that quotes code in backticks or $( ); the strict rule reads it, and nothing on it runs"
+  },
+  {
+   "file": "scripts/install.sh",
+   "line": "# identity that was not globally unique, and finally the recipe itself: `rm ROOT && mkdir -p ROOT",
+   "count": 1,
+   "class": "comment",
+   "reason": "a comment by lexer state that quotes code in backticks or $( ); the strict rule reads it, and nothing on it runs"
+  },
+  {
+   "file": "scripts/install.sh",
+   "line": "# name between the `rm` and the `mount` and the operator binds their disk onto somebody else's",
+   "count": 1,
+   "class": "comment",
+   "reason": "a comment by lexer state that quotes code in backticks or $( ); the strict rule reads it, and nothing on it runs"
+  },
+  {
+   "file": "scripts/install.sh",
+   "line": "# HIGH). ${APP_DIR}/.env has to reach the application account readable, and a `chown` issued AFTER",
+   "count": 1,
+   "class": "comment",
+   "reason": "a comment by lexer state that quotes code in backticks or $( ); the strict rule reads it, and nothing on it runs"
+  },
+  {
+   "file": "scripts/install.sh",
+   "line": "# aside and leave a symlink at the same name. Then the `chmod` chmods their choice, the `chown`",
+   "count": 1,
+   "class": "comment",
+   "reason": "a comment by lexer state that quotes code in backticks or $( ); the strict rule reads it, and nothing on it runs"
+  },
+  {
+   "file": "scripts/install.sh",
+   "line": "# \"symbolic link\" and is refused), `chown -h` (which cannot dereference) — and it is a SIBLING of",
+   "count": 1,
+   "class": "comment",
+   "reason": "a comment by lexer state that quotes code in backticks or $( ); the strict rule reads it, and nothing on it runs"
+  },
+  {
+   "file": "scripts/install.sh",
+   "line": "# the publication was `mv -T \"$tmp\" \"../${base}\"` and the final barrier was `fsync_path ..`, on the",
+   "count": 1,
+   "class": "comment",
+   "reason": "a comment by lexer state that quotes code in backticks or $( ); the strict rule reads it, and nothing on it runs"
+  },
+  {
+   "file": "scripts/install.sh",
+   "line": "# So the destination is pinned the way chown-tree.mjs pins one: a descriptor, opened on `.` while",
+   "count": 1,
+   "class": "comment",
+   "reason": "a comment by lexer state that quotes code in backticks or $( ); the strict rule reads it, and nothing on it runs"
+  },
+  {
+   "file": "scripts/install.sh",
+   "line": "# to a pathname, so `mv -T … /proc/self/fd/N/${base}` IS `renameat(N, \"${base}\", …)` and",
+   "count": 1,
+   "class": "comment",
+   "reason": "a comment by lexer state that quotes code in backticks or $( ); the strict rule reads it, and nothing on it runs"
+  },
+  {
+   "file": "scripts/install.sh",
+   "line": "# the whole pathname to `mkdir`, `stat` and `chown`, so all three re-resolved every component",
+   "count": 1,
+   "class": "comment",
+   "reason": "a comment by lexer state that quotes code in backticks or $( ); the strict rule reads it, and nothing on it runs"
+  },
+  {
+   "file": "scripts/install.sh",
+   "line": "# check is run by an EXTERNAL command on purpose — it is the same route `mv` and `sync` take",
+   "count": 1,
+   "class": "comment",
+   "reason": "a comment by lexer state that quotes code in backticks or $( ); the strict rule reads it, and nothing on it runs"
   },
   {
    "file": "scripts/install.sh",
@@ -185,10 +360,158 @@
   },
   {
    "file": "scripts/install.sh",
+   "line": "if ! mv -f -T \"$tmp\" \"/proc/self/fd/${dest}/${base}\" 2>/dev/null; then rm -f \"$tmp\"; exit 1; fi",
+   "count": 1,
+   "class": "single-inode",
+   "reason": "the `mv` is a census PUBLISH row; the `rm -f` beside it removes that same single mktemp staging file on failure"
+  },
+  {
+   "file": "scripts/install.sh",
+   "line": "# the root. So on a host where /var/lib/one-two-inventory is a link, this script's `useradd",
+   "count": 1,
+   "class": "comment",
+   "reason": "a comment by lexer state that quotes code in backticks or $( ); the strict rule reads it, and nothing on it runs"
+  },
+  {
+   "file": "scripts/install.sh",
+   "line": "# backup, its `rsync`, its `git clone` and its `chown -R` all landed through the link — and the",
+   "count": 1,
+   "class": "comment",
+   "reason": "a comment by lexer state that quotes code in backticks or $( ); the strict rule reads it, and nothing on it runs"
+  },
+  {
+   "file": "scripts/install.sh",
+   "line": "#   • It CREATES nothing and must not: ${APP_DIR} is created by `useradd --create-home` a few",
+   "count": 1,
+   "class": "comment",
+   "reason": "a comment by lexer state that quotes code in backticks or $( ); the strict rule reads it, and nothing on it runs"
+  },
+  {
+   "file": "scripts/install.sh",
+   "line": "#     first-install `git clone`, which runs as ${APP_USER}, unable to write into it.",
+   "count": 1,
+   "class": "comment",
+   "reason": "a comment by lexer state that quotes code in backticks or $( ); the strict rule reads it, and nothing on it runs"
+  },
+  {
+   "file": "scripts/install.sh",
+   "line": "# `chown -R … \"${LOG_DIR}\"` would then hand that subtree to ${APP_USER}. NO SYMLINK IS INVOLVED, so",
+   "count": 1,
+   "class": "comment",
+   "reason": "a comment by lexer state that quotes code in backticks or $( ); the strict rule reads it, and nothing on it runs"
+  },
+  {
+   "file": "scripts/install.sh",
+   "line": "# installer can pin from here. `chmod +t /var/log` closes it host-wide, and docs/installation.md",
+   "count": 1,
+   "class": "comment",
+   "reason": "a comment by lexer state that quotes code in backticks or $( ); the strict rule reads it, and nothing on it runs"
+  },
+  {
+   "file": "scripts/install.sh",
+   "line": "# rename another /var/log subtree into its name; the `chown -R \"${LOG_DIR}\"` that used to follow",
+   "count": 1,
+   "class": "comment",
+   "reason": "a comment by lexer state that quotes code in backticks or $( ); the strict rule reads it, and nothing on it runs"
+  },
+  {
+   "file": "scripts/install.sh",
+   "line": "# THE FINDING. ${DATA_DIR}'s chown could not follow ${LOG_DIR}'s to `chown -Rh .` because it must",
+   "count": 1,
+   "class": "comment",
+   "reason": "a comment by lexer state that quotes code in backticks or $( ); the strict rule reads it, and nothing on it runs"
+  },
+  {
+   "file": "scripts/install.sh",
+   "line": "# publish_durable_file() has left behind, at any depth — and `chown -R` cannot express a prune. So",
+   "count": 1,
+   "class": "comment",
+   "reason": "a comment by lexer state that quotes code in backticks or $( ); the strict rule reads it, and nothing on it runs"
+  },
+  {
+   "file": "scripts/install.sh",
+   "line": "# and `find -exec` ENUMERATES PATHNAMES and hands them to a `chown` that resolves them AGAIN",
+   "count": 1,
+   "class": "comment",
+   "reason": "a comment by lexer state that quotes code in backticks or $( ); the strict rule reads it, and nothing on it runs"
+  },
+  {
+   "file": "scripts/install.sh",
+   "line": "# enumeration and the execution redirects a root-side ownership change through it: `find` prints",
+   "count": 1,
+   "class": "comment",
+   "reason": "a comment by lexer state that quotes code in backticks or $( ); the strict rule reads it, and nothing on it runs"
+  },
+  {
+   "file": "scripts/install.sh",
+   "line": "# ${DATA_DIR}/d/f, `d` becomes a link to /etc, and `chown -h ${DATA_DIR}/d/f` changes /etc/f. GNU",
+   "count": 1,
+   "class": "comment",
+   "reason": "a comment by lexer state that quotes code in backticks or $( ); the strict rule reads it, and nothing on it runs"
+  },
+  {
+   "file": "scripts/install.sh",
+   "line": "# THE ALTERNATIVE THAT WAS WEIGHED AND REJECTED was restructuring so that plain `chown -R` could do",
+   "count": 1,
+   "class": "comment",
+   "reason": "a comment by lexer state that quotes code in backticks or $( ); the strict rule reads it, and nothing on it runs"
+  },
+  {
+   "file": "scripts/install.sh",
+   "line": "# \"re-chown them afterwards\" would need a `find` to locate them, which is the same pathname",
+   "count": 1,
+   "class": "comment",
+   "reason": "a comment by lexer state that quotes code in backticks or $( ); the strict rule reads it, and nothing on it runs"
+  },
+  {
+   "file": "scripts/install.sh",
+   "line": "# dependency of `unattended-upgrades` and `apt-listchanges`, which section 3 happens to install),",
+   "count": 1,
+   "class": "comment",
+   "reason": "a comment by lexer state that quotes code in backticks or $( ); the strict rule reads it, and nothing on it runs"
+  },
+  {
+   "file": "scripts/install.sh",
    "line": "chown_state_tree() {",
    "count": 1,
    "class": "definition",
    "reason": "the definition of a helper the census classifies; its calls are census rows"
+  },
+  {
+   "file": "scripts/install.sh",
+   "line": "[[ \"${root}\" == \"${DATA_DIR}\" ]] || die \\\n\"chown_state_tree re-owns ${DATA_DIR} and nothing else, and was asked for ${root}. This is a bug in these scripts. Nothing has been changed.\"",
+   "count": 1,
+   "class": "text",
+   "reason": "not run: the word is text or an argument (${root}, die)"
+  },
+  {
+   "file": "scripts/install.sh",
+   "line": "# NUMERIC IDS, RESOLVED ONCE AND CHECKED. `chown` takes a name and resolves it itself; `fchown`",
+   "count": 1,
+   "class": "comment",
+   "reason": "a comment by lexer state that quotes code in backticks or $( ); the strict rule reads it, and nothing on it runs"
+  },
+  {
+   "file": "scripts/install.sh",
+   "line": "# IT USED TO BE `${IMS_SCRIPT_LIB_DIR}/chown-tree.mjs` — this script's own lib directory, resolved",
+   "count": 1,
+   "class": "comment",
+   "reason": "a comment by lexer state that quotes code in backticks or $( ); the strict rule reads it, and nothing on it runs"
+  },
+  {
+   "file": "scripts/install.sh",
+   "line": "# ${APP_USER}: install.sh and update.sh both `chown -R` the application directory to the service",
+   "count": 1,
+   "class": "comment",
+   "reason": "a comment by lexer state that quotes code in backticks or $( ); the strict rule reads it, and nothing on it runs"
+  },
+  {
+   "file": "scripts/install.sh",
+   "line": "helper=\"$(privileged_helper_path chown-tree.mjs)\" || die \\\n\"this run has no root-owned copy of chown-tree.mjs it is willing to execute, so it cannot set the ownership of ${root} — ${what} — and it will not fall back to reading the helper out of a directory the service account owns; the reason is printed above. Nothing has been started.\"",
+   "count": 1,
+   "class": "census-helper",
+   "reason": "resolves the house recursive-chown program inside chown_state_tree, whose one call is a census row; enforced at run time by privileged_spare_running_tree in chown_state_tree",
+   "guard": "privileged_spare_running_tree"
   },
   {
    "file": "scripts/install.sh",
@@ -255,10 +578,24 @@
   },
   {
    "file": "scripts/install.sh",
+   "line": "# a refused chown anywhere in that sequence left PostgreSQL holding the new password while `.env`",
+   "count": 1,
+   "class": "comment",
+   "reason": "a comment by lexer state that quotes code in backticks or $( ); the strict rule reads it, and nothing on it runs"
+  },
+  {
+   "file": "scripts/install.sh",
    "line": "chmod 700 \"${DB_ENV_SNAPSHOT_DIR}\" 2>/dev/null || return 1",
    "count": 1,
    "class": "single-inode",
    "reason": "non-recursive chmod on one named path"
+  },
+  {
+   "file": "scripts/install.sh",
+   "line": "# `marker_complete=1` is written LAST, so a reader that does not find it is looking at bytes no",
+   "count": 1,
+   "class": "comment",
+   "reason": "a comment by lexer state that quotes code in backticks or $( ); the strict rule reads it, and nothing on it runs"
   },
   {
    "file": "scripts/install.sh",
@@ -283,6 +620,13 @@
   },
   {
    "file": "scripts/install.sh",
+   "line": "# The reboot fence had only the visible half. `cat > \"$dropin\"` + `chmod 644` +",
+   "count": 1,
+   "class": "comment",
+   "reason": "a comment by lexer state that quotes code in backticks or $( ); the strict rule reads it, and nothing on it runs"
+  },
+  {
+   "file": "scripts/install.sh",
    "line": "if ! cat > \"$tmp\" 2>/dev/null; then rm -f \"$tmp\"; return 1; fi",
    "count": 1,
    "class": "single-inode",
@@ -304,6 +648,27 @@
   },
   {
    "file": "scripts/install.sh",
+   "line": "if ! mv -f \"$tmp\" \"$target\" 2>/dev/null; then rm -f \"$tmp\"; return 1; fi",
+   "count": 1,
+   "class": "single-inode",
+   "reason": "the `mv` is a census PUBLISH row; the `rm -f` beside it removes that same single mktemp staging file on failure"
+  },
+  {
+   "file": "scripts/install.sh",
+   "line": "# missing and changes the mode of nothing else. deploy.sh used to `chmod 700` its private",
+   "count": 1,
+   "class": "comment",
+   "reason": "a comment by lexer state that quotes code in backticks or $( ); the strict rule reads it, and nothing on it runs"
+  },
+  {
+   "file": "scripts/install.sh",
+   "line": "# a directory and `chmod` would then secure the target, leaving the name pointing wherever it",
+   "count": 1,
+   "class": "comment",
+   "reason": "a comment by lexer state that quotes code in backticks or $( ); the strict rule reads it, and nothing on it runs"
+  },
+  {
+   "file": "scripts/install.sh",
    "line": "chown \"$(id -u):$(id -g)\" \"${dir}\" || return 1",
    "count": 1,
    "class": "single-inode",
@@ -315,6 +680,13 @@
    "count": 1,
    "class": "single-inode",
    "reason": "non-recursive chmod on one named path"
+  },
+  {
+   "file": "scripts/install.sh",
+   "line": "# `mkdir -p`/`chown`/`chmod` trio and the old `exec 9>\"$LOCK_FILE\"` actually did.",
+   "count": 1,
+   "class": "comment",
+   "reason": "a comment by lexer state that quotes code in backticks or $( ); the strict rule reads it, and nothing on it runs"
   },
   {
    "file": "scripts/install.sh",
@@ -381,6 +753,13 @@
   },
   {
    "file": "scripts/install.sh",
+   "line": "# It used to be `printf > \"${CRON_BACKUP}\"` followed by `chmod`, and only then the flag",
+   "count": 1,
+   "class": "comment",
+   "reason": "a comment by lexer state that quotes code in backticks or $( ); the strict rule reads it, and nothing on it runs"
+  },
+  {
+   "file": "scripts/install.sh",
    "line": "if ! printf '%s\\n' \"${content}\" > \"${tmp}\" 2>/dev/null; then rm -f \"${tmp}\"; return 1; fi",
    "count": 1,
    "class": "single-inode",
@@ -430,6 +809,13 @@
   },
   {
    "file": "scripts/install.sh",
+   "line": "if ! mv -f \"${tmp}\" \"${CRON_BACKUP}\" 2>/dev/null; then rm -f \"${tmp}\"; return 1; fi",
+   "count": 1,
+   "class": "single-inode",
+   "reason": "the `mv` is a census PUBLISH row; the `rm -f` beside it removes that same single mktemp staging file on failure"
+  },
+  {
+   "file": "scripts/install.sh",
    "line": "if ! fsync_path \"$(dirname \"${CRON_BACKUP}\")\"; then rm -f \"${CRON_BACKUP}\"; return 1; fi",
    "count": 1,
    "class": "single-inode",
@@ -458,10 +844,31 @@
   },
   {
    "file": "scripts/install.sh",
+   "line": "# fence, and the worse half: a rejected write here used to be followed by `rm -f \"${CRON_BACKUP}\"`",
+   "count": 1,
+   "class": "comment",
+   "reason": "a comment by lexer state that quotes code in backticks or $( ); the strict rule reads it, and nothing on it runs"
+  },
+  {
+   "file": "scripts/install.sh",
    "line": "die \"${FENCE_FILE} could not be removed, so this host would still refuse to start ${APP_NAME}.service on its next boot. Remove it by hand (rm -f ${FENCE_FILE}) and re-run. Nothing has been stopped.\"",
    "count": 1,
    "class": "text",
    "reason": "not run: the word is text or an argument (die)"
+  },
+  {
+   "file": "scripts/install.sh",
+   "line": "# ACCEPTS a symlink-to-directory at the final component, and then a `chown` and a `chmod` that both",
+   "count": 1,
+   "class": "comment",
+   "reason": "a comment by lexer state that quotes code in backticks or $( ); the strict rule reads it, and nothing on it runs"
+  },
+  {
+   "file": "scripts/install.sh",
+   "line": "# HIGH 2 / o3d-mzcp): `application_name=ims-migration-<nonce>`. The nonce is minted here,",
+   "count": 1,
+   "class": "comment",
+   "reason": "a comment by lexer state that quotes code in backticks or $( ); the strict rule reads it, and nothing on it runs"
   },
   {
    "file": "scripts/install.sh",
@@ -521,6 +928,27 @@
   },
   {
    "file": "scripts/install.sh",
+   "line": "# ${LOG_DIR} is in the list because `chown -R` DEREFERENCES its operand: a link at /var/log/<app>",
+   "count": 1,
+   "class": "comment",
+   "reason": "a comment by lexer state that quotes code in backticks or $( ); the strict rule reads it, and nothing on it runs"
+  },
+  {
+   "file": "scripts/install.sh",
+   "line": "# LOCAL_SOURCE_DIR into ${APP_DIR} and then `chown -R`s ${APP_DIR} to ${APP_USER}; sections 8 and 9",
+   "count": 1,
+   "class": "comment",
+   "reason": "a comment by lexer state that quotes code in backticks or $( ); the strict rule reads it, and nothing on it runs"
+  },
+  {
+   "file": "scripts/install.sh",
+   "line": "# being executed from already being ${APP_DIR}, and then that `chown` handed this script's own inode to",
+   "count": 1,
+   "class": "comment",
+   "reason": "a comment by lexer state that quotes code in backticks or $( ); the strict rule reads it, and nothing on it runs"
+  },
+  {
+   "file": "scripts/install.sh",
    "line": "prompt SSH_AUTHORIZED_KEY \"Authorized SSH public key for root login (leave blank to skip key install)\" \"\"",
    "count": 1,
    "class": "text",
@@ -531,28 +959,28 @@
    "line": "apt-get install -y -qq \\\ncurl wget gnupg2 ca-certificates lsb-release \\\ngit build-essential \\\njq openssh-client \\\nrsync \\\nnginx \\\nfail2ban \\\nunattended-upgrades apt-listchanges \\\nopenssl \\\nlogrotate \\\nutil-linux",
    "count": 1,
    "class": "text",
-   "reason": "not run: package names and the apt-get subcommand `install`"
+   "reason": "not run: the word is text or an argument (apt-get)"
   },
   {
    "file": "scripts/install.sh",
    "line": "apt-get install -y nodejs",
    "count": 1,
    "class": "text",
-   "reason": "not run: package names and the apt-get subcommand `install`"
+   "reason": "not run: the word is text or an argument (apt-get)"
   },
   {
    "file": "scripts/install.sh",
    "line": "apt-get install -y -qq postgresql postgresql-contrib",
    "count": 1,
    "class": "text",
-   "reason": "not run: package names and the apt-get subcommand `install`"
+   "reason": "not run: the word is text or an argument (apt-get)"
   },
   {
    "file": "scripts/install.sh",
    "line": "apt-get install -y -qq openssh-server",
    "count": 1,
    "class": "text",
-   "reason": "not run: package names and the apt-get subcommand `install`"
+   "reason": "not run: the word is text or an argument (apt-get)"
   },
   {
    "file": "scripts/install.sh",
@@ -573,7 +1001,14 @@
    "line": "apt-get install -y -qq redis-server",
    "count": 1,
    "class": "text",
-   "reason": "not run: package names and the apt-get subcommand `install`"
+   "reason": "not run: the word is text or an argument (apt-get)"
+  },
+  {
+   "file": "scripts/install.sh",
+   "line": "# idempotent — `mv -n` skips files that already exist in the destination.",
+   "count": 1,
+   "class": "comment",
+   "reason": "a comment by lexer state that quotes code in backticks or $( ); the strict rule reads it, and nothing on it runs"
   },
   {
    "file": "scripts/install.sh",
@@ -581,6 +1016,97 @@
    "count": 1,
    "class": "read-only",
    "reason": "read-only: find with no action that writes"
+  },
+  {
+   "file": "scripts/install.sh",
+   "line": "# `mkdir -p \"${dest}\"` followed by `mv -t \"${dest}\"` was two resolutions of a path inside a",
+   "count": 1,
+   "class": "comment",
+   "reason": "a comment by lexer state that quotes code in backticks or $( ); the strict rule reads it, and nothing on it runs"
+  },
+  {
+   "file": "scripts/install.sh",
+   "line": "# AND THE WALK IS FD-RELATIVE, NOT `find -exec chown -h` (o3d-n8xx, Codex CRITICAL). See",
+   "count": 1,
+   "class": "comment",
+   "reason": "a comment by lexer state that quotes code in backticks or $( ); the strict rule reads it, and nothing on it runs"
+  },
+  {
+   "file": "scripts/install.sh",
+   "line": "# `chown -R \"${APP_USER}:${APP_USER}\" \"${LOG_DIR}\"` DEREFERENCES ITS OPERAND, and /var/log is",
+   "count": 1,
+   "class": "comment",
+   "reason": "a comment by lexer state that quotes code in backticks or $( ); the strict rule reads it, and nothing on it runs"
+  },
+  {
+   "file": "scripts/install.sh",
+   "line": "# this `chown -R` would transfer that subtree, recursively, to ${APP_USER}. A pathname check cannot",
+   "count": 1,
+   "class": "comment",
+   "reason": "a comment by lexer state that quotes code in backticks or $( ); the strict rule reads it, and nothing on it runs"
+  },
+  {
+   "file": "scripts/install.sh",
+   "line": "# AND IT IS `chown -Rh .`, NOT `find . -exec chown -h {} +` (o3d-secops r7 fourth pass, Codex HIGH).",
+   "count": 1,
+   "class": "comment",
+   "reason": "a comment by lexer state that quotes code in backticks or $( ); the strict rule reads it, and nothing on it runs"
+  },
+  {
+   "file": "scripts/install.sh",
+   "line": "# `find -exec` ENUMERATES pathnames and hands them to a chown that resolves them again afterwards;",
+   "count": 1,
+   "class": "comment",
+   "reason": "a comment by lexer state that quotes code in backticks or $( ); the strict rule reads it, and nothing on it runs"
+  },
+  {
+   "file": "scripts/install.sh",
+   "line": "# exactly this. coreutils' chown walks with fts and `fchownat(AT_SYMLINK_NOFOLLOW)` relative to",
+   "count": 1,
+   "class": "comment",
+   "reason": "a comment by lexer state that quotes code in backticks or $( ); the strict rule reads it, and nothing on it runs"
+  },
+  {
+   "file": "scripts/install.sh",
+   "line": "# is the no-follow, and `.` is the pinned root. (The ${DATA_DIR} line above still uses `find`",
+   "count": 1,
+   "class": "comment",
+   "reason": "a comment by lexer state that quotes code in backticks or $( ); the strict rule reads it, and nothing on it runs"
+  },
+  {
+   "file": "scripts/install.sh",
+   "line": "# `chown -R \"${APP_USER}:${APP_USER}\" \"${UPLOAD_STORAGE_DIR}\" \"${PUBLIC_UPLOAD_STORAGE_DIR}\"` here.",
+   "count": 1,
+   "class": "comment",
+   "reason": "a comment by lexer state that quotes code in backticks or $( ); the strict rule reads it, and nothing on it runs"
+  },
+  {
+   "file": "scripts/install.sh",
+   "line": "# done, and it did it with a `chown -R` that DEREFERENCES ITS OPERAND, at two names inside a",
+   "count": 1,
+   "class": "comment",
+   "reason": "a comment by lexer state that quotes code in backticks or $( ); the strict rule reads it, and nothing on it runs"
+  },
+  {
+   "file": "scripts/install.sh",
+   "line": "# It was `mkdir -p` + `chown -R` + `chmod 700`, all three of which resolve a path inside",
+   "count": 1,
+   "class": "comment",
+   "reason": "a comment by lexer state that quotes code in backticks or $( ); the strict rule reads it, and nothing on it runs"
+  },
+  {
+   "file": "scripts/install.sh",
+   "line": "# directory silently, and the `chmod 700` that followed it therefore made an arbitrary directory",
+   "count": 1,
+   "class": "comment",
+   "reason": "a comment by lexer state that quotes code in backticks or $( ); the strict rule reads it, and nothing on it runs"
+  },
+  {
+   "file": "scripts/install.sh",
+   "line": "# `chown -h` and NOT `chown -R`: -R's OPERAND is dereferenced, so a symlink that arrived between",
+   "count": 1,
+   "class": "comment",
+   "reason": "a comment by lexer state that quotes code in backticks or $( ); the strict rule reads it, and nothing on it runs"
   },
   {
    "file": "scripts/install.sh",
@@ -633,6 +1159,27 @@
   },
   {
    "file": "scripts/install.sh",
+   "line": "# upgrade reaches this line, so `cat >` followed by a `chown` and a `chmod 600` was three root-side",
+   "count": 1,
+   "class": "comment",
+   "reason": "a comment by lexer state that quotes code in backticks or $( ); the strict rule reads it, and nothing on it runs"
+  },
+  {
+   "file": "scripts/install.sh",
+   "line": "# unrestricted. Set an ID-based control on every non-production install: it is the only",
+   "count": 1,
+   "class": "text",
+   "reason": "a line of the .env template here-document: data written to a file, and `install` is prose"
+  },
+  {
+   "file": "scripts/install.sh",
+   "line": "# under `set -e` aborted the script from wherever it stood, and the `chown` and `chmod` after it",
+   "count": 1,
+   "class": "comment",
+   "reason": "a comment by lexer state that quotes code in backticks or $( ); the strict rule reads it, and nothing on it runs"
+  },
+  {
+   "file": "scripts/install.sh",
    "line": "die \"A password different from the installed one was supplied for '${DB_USER}', but this run has taken the first-install exemption: it created database '${DB_NAME}' itself and there is no existing installation to stop and no migration window to fence. The role '${DB_USER}' was ALREADY on this server, so rotating it would take the credential away from whatever else uses it, with nothing held closed. Re-run with the password that role already has, or rotate it deliberately on the server first. NOTHING HAS BEEN MIGRATED and the role's password is UNCHANGED.\"",
    "count": 1,
    "class": "text",
@@ -664,7 +1211,7 @@
    "line": "apt-get install -y -qq certbot python3-certbot-nginx",
    "count": 1,
    "class": "text",
-   "reason": "not run: package names and the apt-get subcommand `install`"
+   "reason": "not run: the word is text or an argument (apt-get)"
   },
   {
    "file": "scripts/install.sh",
@@ -675,10 +1222,45 @@
   },
   {
    "file": "scripts/install.sh",
+   "line": "# started, precisely so that no root-side `touch`/`chown`/`chmod` ever lands on a path the service",
+   "count": 1,
+   "class": "comment",
+   "reason": "a comment by lexer state that quotes code in backticks or $( ); the strict rule reads it, and nothing on it runs"
+  },
+  {
+   "file": "scripts/install.sh",
    "line": "rm -f \"${CRON_BLOCK_FILE}\"",
    "count": 1,
    "class": "single-inode",
    "reason": "non-recursive rm -f on one named path"
+  },
+  {
+   "file": "scripts/install.sh",
+   "line": "ufw allow 22/tcp  comment \"${APP_NAME} SSH\"   2>/dev/null || true",
+   "count": 1,
+   "class": "text",
+   "reason": "not run: the word is text or an argument (ufw, true)"
+  },
+  {
+   "file": "scripts/install.sh",
+   "line": "ufw allow 80/tcp  comment \"${APP_NAME} HTTP\"  2>/dev/null || true",
+   "count": 1,
+   "class": "text",
+   "reason": "not run: the word is text or an argument (ufw, true)"
+  },
+  {
+   "file": "scripts/install.sh",
+   "line": "ufw allow 443/tcp comment \"${APP_NAME} HTTPS\" 2>/dev/null || true",
+   "count": 1,
+   "class": "text",
+   "reason": "not run: the word is text or an argument (ufw, true)"
+  },
+  {
+   "file": "scripts/update.sh",
+   "line": "#    FRESH ONE (r6, Codex HIGH 1): `chown`/`chmod` change an inode's metadata and revoke no descriptor",
+   "count": 1,
+   "class": "comment",
+   "reason": "a comment by lexer state that quotes code in backticks or $( ); the strict rule reads it, and nothing on it runs"
   },
   {
    "file": "scripts/update.sh",
@@ -710,10 +1292,122 @@
   },
   {
    "file": "scripts/update.sh",
+   "line": "# `fence_cron`, so a crontab backup that could not be written, a failed chmod, a broken",
+   "count": 1,
+   "class": "comment",
+   "reason": "a comment by lexer state that quotes code in backticks or $( ); the strict rule reads it, and nothing on it runs"
+  },
+  {
+   "file": "scripts/update.sh",
+   "line": "#                                      the final component, and then `chown`ed and `chmod`ed by",
+   "count": 1,
+   "class": "comment",
+   "reason": "a comment by lexer state that quotes code in backticks or $( ); the strict rule reads it, and nothing on it runs"
+  },
+  {
+   "file": "scripts/update.sh",
    "line": "case \"$query\" in *%*) DB_IDENTITY_REASON=\"DATABASE_URL percent-escapes something in its query string, and this will not decode it to find out whether the escape spells host, port, user or dbname — node-postgres decodes query KEYS, so ?ho%73t= reaches the driver as host= and moves the connection off the address the URL states. Write the query plainly, or run with --skip-migrate\"; return 1 ;; esac",
    "count": 1,
    "class": "text",
    "reason": "not run: the word is text or an argument ($query, return)"
+  },
+  {
+   "file": "scripts/update.sh",
+   "line": "# is not its contents. So an atomic replacement, a `rm` or a symlink retarget in between still",
+   "count": 1,
+   "class": "comment",
+   "reason": "a comment by lexer state that quotes code in backticks or $( ); the strict rule reads it, and nothing on it runs"
+  },
+  {
+   "file": "scripts/update.sh",
+   "line": "# `chown -h ${APP_USER}` it runs over ${DATA_DIR}: half this function's targets live under that",
+   "count": 1,
+   "class": "comment",
+   "reason": "a comment by lexer state that quotes code in backticks or $( ); the strict rule reads it, and nothing on it runs"
+  },
+  {
+   "file": "scripts/update.sh",
+   "line": "# `rm && mkdir -p && mount --bind` procedure with an apparatus in front of it deciding whether it",
+   "count": 1,
+   "class": "comment",
+   "reason": "a comment by lexer state that quotes code in backticks or $( ); the strict rule reads it, and nothing on it runs"
+  },
+  {
+   "file": "scripts/update.sh",
+   "line": "# `rm && mkdir -p && mount --bind` recipe, gated by a growing apparatus whose only job was to",
+   "count": 1,
+   "class": "comment",
+   "reason": "a comment by lexer state that quotes code in backticks or $( ); the strict rule reads it, and nothing on it runs"
+  },
+  {
+   "file": "scripts/update.sh",
+   "line": "# identity that was not globally unique, and finally the recipe itself: `rm ROOT && mkdir -p ROOT",
+   "count": 1,
+   "class": "comment",
+   "reason": "a comment by lexer state that quotes code in backticks or $( ); the strict rule reads it, and nothing on it runs"
+  },
+  {
+   "file": "scripts/update.sh",
+   "line": "# name between the `rm` and the `mount` and the operator binds their disk onto somebody else's",
+   "count": 1,
+   "class": "comment",
+   "reason": "a comment by lexer state that quotes code in backticks or $( ); the strict rule reads it, and nothing on it runs"
+  },
+  {
+   "file": "scripts/update.sh",
+   "line": "# HIGH). ${APP_DIR}/.env has to reach the application account readable, and a `chown` issued AFTER",
+   "count": 1,
+   "class": "comment",
+   "reason": "a comment by lexer state that quotes code in backticks or $( ); the strict rule reads it, and nothing on it runs"
+  },
+  {
+   "file": "scripts/update.sh",
+   "line": "# aside and leave a symlink at the same name. Then the `chmod` chmods their choice, the `chown`",
+   "count": 1,
+   "class": "comment",
+   "reason": "a comment by lexer state that quotes code in backticks or $( ); the strict rule reads it, and nothing on it runs"
+  },
+  {
+   "file": "scripts/update.sh",
+   "line": "# \"symbolic link\" and is refused), `chown -h` (which cannot dereference) — and it is a SIBLING of",
+   "count": 1,
+   "class": "comment",
+   "reason": "a comment by lexer state that quotes code in backticks or $( ); the strict rule reads it, and nothing on it runs"
+  },
+  {
+   "file": "scripts/update.sh",
+   "line": "# the publication was `mv -T \"$tmp\" \"../${base}\"` and the final barrier was `fsync_path ..`, on the",
+   "count": 1,
+   "class": "comment",
+   "reason": "a comment by lexer state that quotes code in backticks or $( ); the strict rule reads it, and nothing on it runs"
+  },
+  {
+   "file": "scripts/update.sh",
+   "line": "# So the destination is pinned the way chown-tree.mjs pins one: a descriptor, opened on `.` while",
+   "count": 1,
+   "class": "comment",
+   "reason": "a comment by lexer state that quotes code in backticks or $( ); the strict rule reads it, and nothing on it runs"
+  },
+  {
+   "file": "scripts/update.sh",
+   "line": "# to a pathname, so `mv -T … /proc/self/fd/N/${base}` IS `renameat(N, \"${base}\", …)` and",
+   "count": 1,
+   "class": "comment",
+   "reason": "a comment by lexer state that quotes code in backticks or $( ); the strict rule reads it, and nothing on it runs"
+  },
+  {
+   "file": "scripts/update.sh",
+   "line": "# the whole pathname to `mkdir`, `stat` and `chown`, so all three re-resolved every component",
+   "count": 1,
+   "class": "comment",
+   "reason": "a comment by lexer state that quotes code in backticks or $( ); the strict rule reads it, and nothing on it runs"
+  },
+  {
+   "file": "scripts/update.sh",
+   "line": "# check is run by an EXTERNAL command on purpose — it is the same route `mv` and `sync` take",
+   "count": 1,
+   "class": "comment",
+   "reason": "a comment by lexer state that quotes code in backticks or $( ); the strict rule reads it, and nothing on it runs"
   },
   {
    "file": "scripts/update.sh",
@@ -752,6 +1446,20 @@
   },
   {
    "file": "scripts/update.sh",
+   "line": "if ! mv -f -T \"$tmp\" \"/proc/self/fd/${dest}/${base}\" 2>/dev/null; then rm -f \"$tmp\"; exit 1; fi",
+   "count": 1,
+   "class": "single-inode",
+   "reason": "the `mv` is a census PUBLISH row; the `rm -f` beside it removes that same single mktemp staging file on failure"
+  },
+  {
+   "file": "scripts/update.sh",
+   "line": "# The reboot fence had only the visible half. `cat > \"$dropin\"` + `chmod 644` +",
+   "count": 1,
+   "class": "comment",
+   "reason": "a comment by lexer state that quotes code in backticks or $( ); the strict rule reads it, and nothing on it runs"
+  },
+  {
+   "file": "scripts/update.sh",
    "line": "if ! cat > \"$tmp\" 2>/dev/null; then rm -f \"$tmp\"; return 1; fi",
    "count": 1,
    "class": "single-inode",
@@ -773,6 +1481,27 @@
   },
   {
    "file": "scripts/update.sh",
+   "line": "if ! mv -f \"$tmp\" \"$target\" 2>/dev/null; then rm -f \"$tmp\"; return 1; fi",
+   "count": 1,
+   "class": "single-inode",
+   "reason": "the `mv` is a census PUBLISH row; the `rm -f` beside it removes that same single mktemp staging file on failure"
+  },
+  {
+   "file": "scripts/update.sh",
+   "line": "# missing and changes the mode of nothing else. deploy.sh used to `chmod 700` its private",
+   "count": 1,
+   "class": "comment",
+   "reason": "a comment by lexer state that quotes code in backticks or $( ); the strict rule reads it, and nothing on it runs"
+  },
+  {
+   "file": "scripts/update.sh",
+   "line": "# a directory and `chmod` would then secure the target, leaving the name pointing wherever it",
+   "count": 1,
+   "class": "comment",
+   "reason": "a comment by lexer state that quotes code in backticks or $( ); the strict rule reads it, and nothing on it runs"
+  },
+  {
+   "file": "scripts/update.sh",
    "line": "chown \"$(id -u):$(id -g)\" \"${dir}\" || return 1",
    "count": 1,
    "class": "single-inode",
@@ -784,6 +1513,13 @@
    "count": 1,
    "class": "single-inode",
    "reason": "non-recursive chmod on one named path"
+  },
+  {
+   "file": "scripts/update.sh",
+   "line": "# `mkdir -p`/`chown`/`chmod` trio and the old `exec 9>\"$LOCK_FILE\"` actually did.",
+   "count": 1,
+   "class": "comment",
+   "reason": "a comment by lexer state that quotes code in backticks or $( ); the strict rule reads it, and nothing on it runs"
   },
   {
    "file": "scripts/update.sh",
@@ -871,6 +1607,20 @@
   },
   {
    "file": "scripts/update.sh",
+   "line": "# ACCEPTS a symlink-to-directory at the final component, and then a `chown` and a `chmod` that both",
+   "count": 1,
+   "class": "comment",
+   "reason": "a comment by lexer state that quotes code in backticks or $( ); the strict rule reads it, and nothing on it runs"
+  },
+  {
+   "file": "scripts/update.sh",
+   "line": "# HIGH 2 / o3d-mzcp): `application_name=ims-migration-<nonce>`. The nonce is minted here,",
+   "count": 1,
+   "class": "comment",
+   "reason": "a comment by lexer state that quotes code in backticks or $( ); the strict rule reads it, and nothing on it runs"
+  },
+  {
+   "file": "scripts/update.sh",
    "line": "rm -f \"${CRON_BACKUP}\"",
    "count": 5,
    "class": "single-inode",
@@ -896,6 +1646,13 @@
    "count": 1,
    "class": "text",
    "reason": "not run: the word is text or an argument (echo)"
+  },
+  {
+   "file": "scripts/update.sh",
+   "line": "# It used to be `printf > \"${CRON_BACKUP}\"` followed by `chmod`, and only then the flag",
+   "count": 1,
+   "class": "comment",
+   "reason": "a comment by lexer state that quotes code in backticks or $( ); the strict rule reads it, and nothing on it runs"
   },
   {
    "file": "scripts/update.sh",
@@ -941,6 +1698,13 @@
   },
   {
    "file": "scripts/update.sh",
+   "line": "if ! mv -f \"$tmp\" \"${CRON_BACKUP}\" 2>/dev/null; then rm -f \"$tmp\"; return 1; fi",
+   "count": 1,
+   "class": "single-inode",
+   "reason": "the `mv` is a census PUBLISH row; the `rm -f` beside it removes that same single mktemp staging file on failure"
+  },
+  {
+   "file": "scripts/update.sh",
    "line": "if ! fsync_path \"$(dirname \"${CRON_BACKUP}\")\"; then rm -f \"${CRON_BACKUP}\"; return 1; fi",
    "count": 1,
    "class": "single-inode",
@@ -959,6 +1723,13 @@
    "count": 1,
    "class": "text",
    "reason": "not run: the word is text or an argument ($rc, die)"
+  },
+  {
+   "file": "scripts/update.sh",
+   "line": "# fence, and the worse half: a rejected write here used to be followed by `rm -f \"${CRON_BACKUP}\"`",
+   "count": 1,
+   "class": "comment",
+   "reason": "a comment by lexer state that quotes code in backticks or $( ); the strict rule reads it, and nothing on it runs"
   },
   {
    "file": "scripts/update.sh",
@@ -1004,10 +1775,45 @@
   },
   {
    "file": "scripts/update.sh",
+   "line": "# `rm -rf \"${APP_DIR}/.git\"` and then `cp -a … \"${APP_DIR}/.git\"`, and the `rm` is what opened",
+   "count": 1,
+   "class": "comment",
+   "reason": "a comment by lexer state that quotes code in backticks or $( ); the strict rule reads it, and nothing on it runs"
+  },
+  {
+   "file": "scripts/update.sh",
+   "line": "# root-side `cp` runs. o3d-czpy built copy_tree_into_new_dir() for exactly this and gave it",
+   "count": 1,
+   "class": "comment",
+   "reason": "a comment by lexer state that quotes code in backticks or $( ); the strict rule reads it, and nothing on it runs"
+  },
+  {
+   "file": "scripts/update.sh",
    "line": "VERIFY_COUNT=$(find \"${APP_DIR}/prisma/migrations\" -mindepth 2 -maxdepth 2 -name 'verify.sql' -type f 2>/dev/null | wc -l)",
    "count": 1,
    "class": "read-only",
    "reason": "read-only: find with no action that writes"
+  },
+  {
+   "file": "scripts/update.sh",
+   "line": "#       publication `mv` and the `rm --` prune then each re-resolved ${BACKUP_DIR} by name. A",
+   "count": 1,
+   "class": "comment",
+   "reason": "a comment by lexer state that quotes code in backticks or $( ); the strict rule reads it, and nothing on it runs"
+  },
+  {
+   "file": "scripts/update.sh",
+   "line": "#       `chown -R \"${APP_USER}:${APP_USER}\" \"${APP_DIR}\"`, so that checkout — and everything the",
+   "count": 1,
+   "class": "comment",
+   "reason": "a comment by lexer state that quotes code in backticks or $( ); the strict rule reads it, and nothing on it runs"
+  },
+  {
+   "file": "scripts/update.sh",
+   "line": "# `pg_dump`, `mv` and `rm --` wherever an operator names, including underneath a path",
+   "count": 1,
+   "class": "comment",
+   "reason": "a comment by lexer state that quotes code in backticks or $( ); the strict rule reads it, and nothing on it runs"
   },
   {
    "file": "scripts/update.sh",
@@ -1020,8 +1826,22 @@
    "file": "scripts/update.sh",
    "line": "run rm -f \"${FENCE_FILE}\"",
    "count": 1,
-   "class": "single-inode",
-   "reason": "non-recursive rm -f of the one fence file, through the `run` wrapper"
+   "class": "text",
+   "reason": "not run: the word is text or an argument (run)"
+  },
+  {
+   "file": "scripts/deploy.sh",
+   "line": "#      fails), and `mask --runtime` lives in /run, which the reboot erases. The install",
+   "count": 1,
+   "class": "comment",
+   "reason": "a comment by lexer state that quotes code in backticks or $( ); the strict rule reads it, and nothing on it runs"
+  },
+  {
+   "file": "scripts/deploy.sh",
+   "line": "#    FRESH ONE (r6, Codex HIGH 1): `chown`/`chmod` change an inode's metadata and revoke no descriptor",
+   "count": 1,
+   "class": "comment",
+   "reason": "a comment by lexer state that quotes code in backticks or $( ); the strict rule reads it, and nothing on it runs"
   },
   {
    "file": "scripts/deploy.sh",
@@ -1053,10 +1873,122 @@
   },
   {
    "file": "scripts/deploy.sh",
+   "line": "#                                      the final component, and then `chown`ed and `chmod`ed by",
+   "count": 1,
+   "class": "comment",
+   "reason": "a comment by lexer state that quotes code in backticks or $( ); the strict rule reads it, and nothing on it runs"
+  },
+  {
+   "file": "scripts/deploy.sh",
+   "line": "# `fence_cron` and before any stop, so a crontab backup that could not be written, a chmod",
+   "count": 1,
+   "class": "comment",
+   "reason": "a comment by lexer state that quotes code in backticks or $( ); the strict rule reads it, and nothing on it runs"
+  },
+  {
+   "file": "scripts/deploy.sh",
    "line": "case \"$query\" in *%*) DB_IDENTITY_REASON=\"DATABASE_URL percent-escapes something in its query string, and this will not decode it to find out whether the escape spells host, port, user or dbname — node-postgres decodes query KEYS, so ?ho%73t= reaches the driver as host= and moves the connection off the address the URL states. Write the query plainly, or run with --skip-migrate\"; return 1 ;; esac",
    "count": 1,
    "class": "text",
    "reason": "not run: the word is text or an argument ($query, return)"
+  },
+  {
+   "file": "scripts/deploy.sh",
+   "line": "# and a path is not its contents. So an atomic replacement, a `rm`, or a symlink retarget in",
+   "count": 1,
+   "class": "comment",
+   "reason": "a comment by lexer state that quotes code in backticks or $( ); the strict rule reads it, and nothing on it runs"
+  },
+  {
+   "file": "scripts/deploy.sh",
+   "line": "# `chown -h ${APP_USER}` it runs over ${DATA_DIR}: half this function's targets live under that",
+   "count": 1,
+   "class": "comment",
+   "reason": "a comment by lexer state that quotes code in backticks or $( ); the strict rule reads it, and nothing on it runs"
+  },
+  {
+   "file": "scripts/deploy.sh",
+   "line": "# `rm && mkdir -p && mount --bind` procedure with an apparatus in front of it deciding whether it",
+   "count": 1,
+   "class": "comment",
+   "reason": "a comment by lexer state that quotes code in backticks or $( ); the strict rule reads it, and nothing on it runs"
+  },
+  {
+   "file": "scripts/deploy.sh",
+   "line": "# `rm && mkdir -p && mount --bind` recipe, gated by a growing apparatus whose only job was to",
+   "count": 1,
+   "class": "comment",
+   "reason": "a comment by lexer state that quotes code in backticks or $( ); the strict rule reads it, and nothing on it runs"
+  },
+  {
+   "file": "scripts/deploy.sh",
+   "line": "# identity that was not globally unique, and finally the recipe itself: `rm ROOT && mkdir -p ROOT",
+   "count": 1,
+   "class": "comment",
+   "reason": "a comment by lexer state that quotes code in backticks or $( ); the strict rule reads it, and nothing on it runs"
+  },
+  {
+   "file": "scripts/deploy.sh",
+   "line": "# name between the `rm` and the `mount` and the operator binds their disk onto somebody else's",
+   "count": 1,
+   "class": "comment",
+   "reason": "a comment by lexer state that quotes code in backticks or $( ); the strict rule reads it, and nothing on it runs"
+  },
+  {
+   "file": "scripts/deploy.sh",
+   "line": "# HIGH). ${APP_DIR}/.env has to reach the application account readable, and a `chown` issued AFTER",
+   "count": 1,
+   "class": "comment",
+   "reason": "a comment by lexer state that quotes code in backticks or $( ); the strict rule reads it, and nothing on it runs"
+  },
+  {
+   "file": "scripts/deploy.sh",
+   "line": "# aside and leave a symlink at the same name. Then the `chmod` chmods their choice, the `chown`",
+   "count": 1,
+   "class": "comment",
+   "reason": "a comment by lexer state that quotes code in backticks or $( ); the strict rule reads it, and nothing on it runs"
+  },
+  {
+   "file": "scripts/deploy.sh",
+   "line": "# \"symbolic link\" and is refused), `chown -h` (which cannot dereference) — and it is a SIBLING of",
+   "count": 1,
+   "class": "comment",
+   "reason": "a comment by lexer state that quotes code in backticks or $( ); the strict rule reads it, and nothing on it runs"
+  },
+  {
+   "file": "scripts/deploy.sh",
+   "line": "# the publication was `mv -T \"$tmp\" \"../${base}\"` and the final barrier was `fsync_path ..`, on the",
+   "count": 1,
+   "class": "comment",
+   "reason": "a comment by lexer state that quotes code in backticks or $( ); the strict rule reads it, and nothing on it runs"
+  },
+  {
+   "file": "scripts/deploy.sh",
+   "line": "# So the destination is pinned the way chown-tree.mjs pins one: a descriptor, opened on `.` while",
+   "count": 1,
+   "class": "comment",
+   "reason": "a comment by lexer state that quotes code in backticks or $( ); the strict rule reads it, and nothing on it runs"
+  },
+  {
+   "file": "scripts/deploy.sh",
+   "line": "# to a pathname, so `mv -T … /proc/self/fd/N/${base}` IS `renameat(N, \"${base}\", …)` and",
+   "count": 1,
+   "class": "comment",
+   "reason": "a comment by lexer state that quotes code in backticks or $( ); the strict rule reads it, and nothing on it runs"
+  },
+  {
+   "file": "scripts/deploy.sh",
+   "line": "# the whole pathname to `mkdir`, `stat` and `chown`, so all three re-resolved every component",
+   "count": 1,
+   "class": "comment",
+   "reason": "a comment by lexer state that quotes code in backticks or $( ); the strict rule reads it, and nothing on it runs"
+  },
+  {
+   "file": "scripts/deploy.sh",
+   "line": "# check is run by an EXTERNAL command on purpose — it is the same route `mv` and `sync` take",
+   "count": 1,
+   "class": "comment",
+   "reason": "a comment by lexer state that quotes code in backticks or $( ); the strict rule reads it, and nothing on it runs"
   },
   {
    "file": "scripts/deploy.sh",
@@ -1095,6 +2027,20 @@
   },
   {
    "file": "scripts/deploy.sh",
+   "line": "if ! mv -f -T \"$tmp\" \"/proc/self/fd/${dest}/${base}\" 2>/dev/null; then rm -f \"$tmp\"; exit 1; fi",
+   "count": 1,
+   "class": "single-inode",
+   "reason": "the `mv` is a census PUBLISH row; the `rm -f` beside it removes that same single mktemp staging file on failure"
+  },
+  {
+   "file": "scripts/deploy.sh",
+   "line": "# The reboot fence had only the visible half. `cat > \"$dropin\"` + `chmod 644` +",
+   "count": 1,
+   "class": "comment",
+   "reason": "a comment by lexer state that quotes code in backticks or $( ); the strict rule reads it, and nothing on it runs"
+  },
+  {
+   "file": "scripts/deploy.sh",
    "line": "if ! cat > \"$tmp\" 2>/dev/null; then rm -f \"$tmp\"; return 1; fi",
    "count": 1,
    "class": "single-inode",
@@ -1116,6 +2062,27 @@
   },
   {
    "file": "scripts/deploy.sh",
+   "line": "if ! mv -f \"$tmp\" \"$target\" 2>/dev/null; then rm -f \"$tmp\"; return 1; fi",
+   "count": 1,
+   "class": "single-inode",
+   "reason": "the `mv` is a census PUBLISH row; the `rm -f` beside it removes that same single mktemp staging file on failure"
+  },
+  {
+   "file": "scripts/deploy.sh",
+   "line": "# missing and changes the mode of nothing else. deploy.sh used to `chmod 700` its private",
+   "count": 1,
+   "class": "comment",
+   "reason": "a comment by lexer state that quotes code in backticks or $( ); the strict rule reads it, and nothing on it runs"
+  },
+  {
+   "file": "scripts/deploy.sh",
+   "line": "# a directory and `chmod` would then secure the target, leaving the name pointing wherever it",
+   "count": 1,
+   "class": "comment",
+   "reason": "a comment by lexer state that quotes code in backticks or $( ); the strict rule reads it, and nothing on it runs"
+  },
+  {
+   "file": "scripts/deploy.sh",
    "line": "chown \"$(id -u):$(id -g)\" \"${dir}\" || return 1",
    "count": 1,
    "class": "single-inode",
@@ -1127,6 +2094,13 @@
    "count": 1,
    "class": "single-inode",
    "reason": "non-recursive chmod on one named path"
+  },
+  {
+   "file": "scripts/deploy.sh",
+   "line": "# `mkdir -p`/`chown`/`chmod` trio and the old `exec 9>\"$LOCK_FILE\"` actually did.",
+   "count": 1,
+   "class": "comment",
+   "reason": "a comment by lexer state that quotes code in backticks or $( ); the strict rule reads it, and nothing on it runs"
   },
   {
    "file": "scripts/deploy.sh",
@@ -1186,6 +2160,20 @@
   },
   {
    "file": "scripts/deploy.sh",
+   "line": "# HIGH 2 / o3d-mzcp): `application_name=ims-migration-<nonce>`. The nonce is minted here, goes",
+   "count": 1,
+   "class": "comment",
+   "reason": "a comment by lexer state that quotes code in backticks or $( ); the strict rule reads it, and nothing on it runs"
+  },
+  {
+   "file": "scripts/deploy.sh",
+   "line": "# It used to be `printf > \"$CRON_BACKUP\"` followed by `chmod`, and only then the flag saying",
+   "count": 1,
+   "class": "comment",
+   "reason": "a comment by lexer state that quotes code in backticks or $( ); the strict rule reads it, and nothing on it runs"
+  },
+  {
+   "file": "scripts/deploy.sh",
    "line": "if ! printf '%s\\n' \"$content\" > \"$tmp\" 2>/dev/null; then rm -f \"$tmp\"; return 1; fi",
    "count": 1,
    "class": "single-inode",
@@ -1228,6 +2216,13 @@
   },
   {
    "file": "scripts/deploy.sh",
+   "line": "if ! mv -f \"$tmp\" \"$CRON_BACKUP\" 2>/dev/null; then rm -f \"$tmp\"; return 1; fi",
+   "count": 1,
+   "class": "single-inode",
+   "reason": "the `mv` is a census PUBLISH row; the `rm -f` beside it removes that same single mktemp staging file on failure"
+  },
+  {
+   "file": "scripts/deploy.sh",
    "line": "if ! fsync_path \"$(dirname \"$CRON_BACKUP\")\"; then rm -f \"$CRON_BACKUP\"; return 1; fi",
    "count": 1,
    "class": "single-inode",
@@ -1256,6 +2251,13 @@
   },
   {
    "file": "scripts/deploy.sh",
+   "line": "# fence, and the worse half: a rejected write here used to be followed by `rm -f \"${CRON_BACKUP}\"`",
+   "count": 1,
+   "class": "comment",
+   "reason": "a comment by lexer state that quotes code in backticks or $( ); the strict rule reads it, and nothing on it runs"
+  },
+  {
+   "file": "scripts/deploy.sh",
    "line": "die \"${FENCE_FILE} could not be removed, so this host would still refuse to start ${SERVICE_UNITS[0]:-the service} on its next boot. Remove it by hand (rm -f ${FENCE_FILE}) and re-run. Nothing has been stopped.\"",
    "count": 1,
    "class": "text",
@@ -1274,6 +2276,13 @@
    "count": 1,
    "class": "text",
    "reason": "not run: the word is text or an argument (echo)"
+  },
+  {
+   "file": "scripts/deploy.sh",
+   "line": "# fail — an unwritable backup, a failed chmod, a broken pipeline, a `crontab` that returns",
+   "count": 1,
+   "class": "comment",
+   "reason": "a comment by lexer state that quotes code in backticks or $( ); the strict rule reads it, and nothing on it runs"
   },
   {
    "file": "scripts/deploy.sh",
@@ -1307,8 +2316,15 @@
    "file": "scripts/deploy.sh",
    "line": "run rm -f \"$FENCE_FILE\"",
    "count": 1,
-   "class": "single-inode",
-   "reason": "non-recursive rm -f of the one fence file, through the `run` wrapper"
+   "class": "text",
+   "reason": "not run: the word is text or an argument (run)"
+  },
+  {
+   "file": "scripts/lib/db-fence-protected.sh",
+   "line": "# an `rm -rf`, ${DB_FENCE_PROBE_ARTEFACT_SHA256} was half of the equality that authenticated",
+   "count": 1,
+   "class": "comment",
+   "reason": "a comment by lexer state that quotes code in backticks or $( ); the strict rule reads it, and nothing on it runs"
   },
   {
    "file": "scripts/lib/db-fence-protected.sh",
@@ -1361,6 +2377,13 @@
   },
   {
    "file": "scripts/lib/db-fence-protected.sh",
+   "line": "# what `xargs sha256sum` emits and therefore what ${DB_FENCE_ARTEFACT_RECIPE} hashes. Command",
+   "count": 1,
+   "class": "comment",
+   "reason": "a comment by lexer state that quotes code in backticks or $( ); the strict rule reads it, and nothing on it runs"
+  },
+  {
+   "file": "scripts/lib/db-fence-protected.sh",
    "line": "offender=\"$(find \"$root\" \\( ! -type d -a ! -type f \\) -print -quit 2>/dev/null)\" || return 1",
    "count": 1,
    "class": "read-only",
@@ -1403,6 +2426,20 @@
   },
   {
    "file": "scripts/lib/db-fence-protected.sh",
+   "line": "# are the ARGV of the `find` whose answer decides whether an artefact assembled out of an",
+   "count": 1,
+   "class": "comment",
+   "reason": "a comment by lexer state that quotes code in backticks or $( ); the strict rule reads it, and nothing on it runs"
+  },
+  {
+   "file": "scripts/lib/db-fence-protected.sh",
+   "line": "# DEPLOY_ADMIN_DATABASE_URL for the rest of the box's life. Empty one of them and that `find`",
+   "count": 1,
+   "class": "comment",
+   "reason": "a comment by lexer state that quotes code in backticks or $( ); the strict rule reads it, and nothing on it runs"
+  },
+  {
+   "file": "scripts/lib/db-fence-protected.sh",
    "line": "offender=\"$(find \"${_FENCE_SRC_STRICT[@]}\" -maxdepth 0 \\( ! -uid \"${uid}\" -o -perm /022 \\) -print -quit 2>/dev/null)\" || return 1",
    "count": 1,
    "class": "read-only",
@@ -1431,6 +2468,13 @@
   },
   {
    "file": "scripts/lib/db-fence-protected.sh",
+   "line": "# the `find` that answers the provenance question can only ever be aimed at paths derived by",
+   "count": 1,
+   "class": "comment",
+   "reason": "a comment by lexer state that quotes code in backticks or $( ); the strict rule reads it, and nothing on it runs"
+  },
+  {
+   "file": "scripts/lib/db-fence-protected.sh",
    "line": "rm -f \"${list}\"",
    "count": 5,
    "class": "single-inode",
@@ -1445,10 +2489,18 @@
   },
   {
    "file": "scripts/lib/db-fence-protected.sh",
+   "line": "# account renames the examined subtree aside between the answer and the `cp`, and the bytes that",
+   "count": 1,
+   "class": "comment",
+   "reason": "a comment by lexer state that quotes code in backticks or $( ); the strict rule reads it, and nothing on it runs"
+  },
+  {
+   "file": "scripts/lib/db-fence-protected.sh",
    "line": "cp -R --no-dereference -- \"${app_dir}/${relative}\" \"${staged}/${relative}\" || { rc=1; break; }",
    "count": 1,
    "class": "code-owned-tree",
-   "reason": "copies FROM the app tree INTO the fence's own staging copy ${DB_FENCE_RECOVERY_DIR}/.app.staged, under the root-only recovery directory; the app tree is only read"
+   "reason": "copies FROM the app tree INTO the fence's own staging copy ${DB_FENCE_RECOVERY_DIR}/.app.staged, under the root-only recovery directory; the app tree is only read; enforced at run time by _fence_require_owned_tree in _fence_vendor_into",
+   "guard": "_fence_require_owned_tree"
   },
   {
    "file": "scripts/lib/db-fence-protected.sh",
@@ -1469,84 +2521,96 @@
    "line": "rm -rf \"${DB_FENCE_STAGED_APP_DIR}\" || return 1",
    "count": 1,
    "class": "code-owned-tree",
-   "reason": "deletes the fence's own staging copy ${DB_FENCE_RECOVERY_DIR}/.app.staged, under the root-only recovery directory"
+   "reason": "deletes the fence's own staging copy ${DB_FENCE_RECOVERY_DIR}/.app.staged, under the root-only recovery directory; enforced at run time by _fence_require_owned_tree in _fence_stage_and_publish",
+   "guard": "_fence_require_owned_tree"
   },
   {
    "file": "scripts/lib/db-fence-protected.sh",
    "line": "rm -rf \"${DB_FENCE_STAGED_APP_DIR}\"; return 1",
    "count": 2,
    "class": "code-owned-tree",
-   "reason": "deletes the fence's own staging copy ${DB_FENCE_RECOVERY_DIR}/.app.staged, under the root-only recovery directory on a failure path"
+   "reason": "deletes the fence's own staging copy ${DB_FENCE_RECOVERY_DIR}/.app.staged, under the root-only recovery directory on a failure path; enforced at run time by _fence_require_owned_tree in _fence_stage_and_publish",
+   "guard": "_fence_require_owned_tree"
   },
   {
    "file": "scripts/lib/db-fence-protected.sh",
    "line": "rm -rf \"${DB_FENCE_STAGED_APP_DIR}\"",
    "count": 6,
    "class": "code-owned-tree",
-   "reason": "deletes the fence's own staging copy ${DB_FENCE_RECOVERY_DIR}/.app.staged, under the root-only recovery directory"
+   "reason": "deletes the fence's own staging copy ${DB_FENCE_RECOVERY_DIR}/.app.staged, under the root-only recovery directory; enforced at run time by _fence_require_owned_tree in _fence_stage_and_publish",
+   "guard": "_fence_require_owned_tree"
   },
   {
    "file": "scripts/lib/db-fence-protected.sh",
    "line": "chown -R root:root \"${DB_FENCE_STAGED_APP_DIR}\" 2>/dev/null || true",
    "count": 1,
    "class": "code-owned-tree",
-   "reason": "gives the fence's own staging copy ${DB_FENCE_RECOVERY_DIR}/.app.staged, under the root-only recovery directory to root: the direction that removes write access"
+   "reason": "gives the fence's own staging copy ${DB_FENCE_RECOVERY_DIR}/.app.staged, under the root-only recovery directory to root: the direction that removes write access; enforced at run time by _fence_require_owned_tree in _fence_stage_and_publish",
+   "guard": "_fence_require_owned_tree"
   },
   {
    "file": "scripts/lib/db-fence-protected.sh",
    "line": "chmod -R u=rwX,go=rX \"${DB_FENCE_STAGED_APP_DIR}\" || { rm -rf \"${DB_FENCE_STAGED_APP_DIR}\"; return 1; }",
    "count": 1,
    "class": "code-owned-tree",
-   "reason": "takes group/other write off the fence's own staging copy ${DB_FENCE_RECOVERY_DIR}/.app.staged, under the root-only recovery directory"
+   "reason": "takes group/other write off the fence's own staging copy ${DB_FENCE_RECOVERY_DIR}/.app.staged, under the root-only recovery directory; enforced at run time by _fence_require_owned_tree in _fence_stage_and_publish",
+   "guard": "_fence_require_owned_tree"
   },
   {
    "file": "scripts/lib/db-fence-protected.sh",
    "line": "manifest=\"$(_fence_tree_manifest \"${DB_FENCE_STAGED_APP_DIR}\")\" || { rm -rf \"${DB_FENCE_STAGED_APP_DIR}\"; return 1; }",
    "count": 1,
    "class": "code-owned-tree",
-   "reason": "failure path deletes the fence's own staging copy ${DB_FENCE_RECOVERY_DIR}/.app.staged, under the root-only recovery directory"
+   "reason": "failure path deletes the fence's own staging copy ${DB_FENCE_RECOVERY_DIR}/.app.staged, under the root-only recovery directory; enforced at run time by _fence_require_owned_tree in _fence_stage_and_publish",
+   "guard": "_fence_require_owned_tree"
   },
   {
    "file": "scripts/lib/db-fence-protected.sh",
    "line": "artefact_digest=\"$(_fence_tree_digest \"${DB_FENCE_STAGED_APP_DIR}\")\" || { rm -rf \"${DB_FENCE_STAGED_APP_DIR}\"; return 1; }",
    "count": 1,
    "class": "code-owned-tree",
-   "reason": "failure path deletes the fence's own staging copy ${DB_FENCE_RECOVERY_DIR}/.app.staged, under the root-only recovery directory"
+   "reason": "failure path deletes the fence's own staging copy ${DB_FENCE_RECOVERY_DIR}/.app.staged, under the root-only recovery directory; enforced at run time by _fence_require_owned_tree in _fence_stage_and_publish",
+   "guard": "_fence_require_owned_tree"
   },
   {
    "file": "scripts/lib/db-fence-protected.sh",
    "line": "rm -rf \"${DB_FENCE_RETIRED_APP_DIR}\" || return 1",
    "count": 1,
    "class": "code-owned-tree",
-   "reason": "deletes the fence's own retired copy ${DB_FENCE_RECOVERY_DIR}/.app.retired"
+   "reason": "deletes the fence's own retired copy ${DB_FENCE_RECOVERY_DIR}/.app.retired; enforced at run time by _fence_require_owned_tree in _fence_stage_and_publish",
+   "guard": "_fence_require_owned_tree"
   },
   {
    "file": "scripts/lib/db-fence-protected.sh",
    "line": "mv -f \"${DB_FENCE_PROTECTED_APP_DIR}\" \"${DB_FENCE_RETIRED_APP_DIR}\" || { rm -rf \"${DB_FENCE_STAGED_APP_DIR}\"; return 1; }",
    "count": 1,
    "class": "code-owned-tree",
-   "reason": "rotates the fence's own copies inside the root-only recovery directory"
+   "reason": "rotates the fence's own copies inside the root-only recovery directory; enforced at run time by _fence_require_owned_tree in _fence_stage_and_publish",
+   "guard": "_fence_require_owned_tree"
   },
   {
    "file": "scripts/lib/db-fence-protected.sh",
    "line": "if ! mv -f \"${DB_FENCE_STAGED_APP_DIR}\" \"${DB_FENCE_PROTECTED_APP_DIR}\"; then",
    "count": 1,
    "class": "code-owned-tree",
-   "reason": "rotates the fence's own copies inside the root-only recovery directory"
+   "reason": "rotates the fence's own copies inside the root-only recovery directory; enforced at run time by _fence_require_owned_tree in _fence_stage_and_publish",
+   "guard": "_fence_require_owned_tree"
   },
   {
    "file": "scripts/lib/db-fence-protected.sh",
    "line": "[[ -e \"${DB_FENCE_RETIRED_APP_DIR}\" ]] && mv -f \"${DB_FENCE_RETIRED_APP_DIR}\" \"${DB_FENCE_PROTECTED_APP_DIR}\" 2>/dev/null",
    "count": 1,
    "class": "code-owned-tree",
-   "reason": "restores the fence's own retired copy inside the root-only recovery directory"
+   "reason": "restores the fence's own retired copy inside the root-only recovery directory; enforced at run time by _fence_require_owned_tree in _fence_stage_and_publish",
+   "guard": "_fence_require_owned_tree"
   },
   {
    "file": "scripts/lib/db-fence-protected.sh",
    "line": "rm -rf \"${DB_FENCE_RETIRED_APP_DIR}\"",
    "count": 1,
    "class": "code-owned-tree",
-   "reason": "deletes the fence's own retired copy ${DB_FENCE_RECOVERY_DIR}/.app.retired"
+   "reason": "deletes the fence's own retired copy ${DB_FENCE_RECOVERY_DIR}/.app.retired; enforced at run time by _fence_require_owned_tree in _fence_stage_and_publish",
+   "guard": "_fence_require_owned_tree"
   },
   {
    "file": "scripts/lib/db-fence-protected.sh",
@@ -1585,6 +2649,20 @@
   },
   {
    "file": "scripts/lib/db-fence-protected.sh",
+   "line": "fs.renameSync(temporary, destination);",
+   "count": 2,
+   "class": "single-inode",
+   "reason": "an embedded node program renames ONE temporary file it created with `wx` onto its destination"
+  },
+  {
+   "file": "scripts/lib/db-fence-protected.sh",
+   "line": "# release wrapper then has nothing to restore from. `rm -f` cannot ask the question -- it acts on",
+   "count": 1,
+   "class": "comment",
+   "reason": "a comment by lexer state that quotes code in backticks or $( ); the strict rule reads it, and nothing on it runs"
+  },
+  {
+   "file": "scripts/lib/db-fence-protected.sh",
    "line": "rm -f \"${destination}\" 2>/dev/null || true",
    "count": 1,
    "class": "single-inode",
@@ -1596,6 +2674,13 @@
    "count": 1,
    "class": "read-only",
    "reason": "read-only: find | xargs with no action that writes"
+  },
+  {
+   "file": "scripts/lib/db-fence-protected.sh",
+   "line": "# Narrowed BEFORE it is opened and proved AFTER, which is the order that matters: `chmod` cannot",
+   "count": 1,
+   "class": "comment",
+   "reason": "a comment of the wrapper script written through the QUOTED here-document WRAPPER_EOF: nothing is expanded when it is written, and it is a comment when the wrapper runs"
   },
   {
    "file": "scripts/lib/db-fence-protected.sh",
@@ -1620,52 +2705,108 @@
   },
   {
    "file": "scripts/lib/db-fence-protected.sh",
+   "line": "# with DEPLOY_ADMIN_DATABASE_URL in its environment, the second is the operand of an `rm -rf`, and",
+   "count": 1,
+   "class": "comment",
+   "reason": "a comment by lexer state that quotes code in backticks or $( ); the strict rule reads it, and nothing on it runs"
+  },
+  {
+   "file": "scripts/lib/db-fence-protected.sh",
    "line": "mkdir -p \"${dir}/scripts\" || { rm -rf \"${dir}\"; return 1; }",
    "count": 1,
    "class": "code-owned-tree",
-   "reason": "deletes the probe directory this function made with `mktemp -d` two lines up"
+   "reason": "deletes the probe directory this function made with `mktemp -d` two lines up; enforced at run time by _fence_require_owned_tree in _fence_probe_assemble",
+   "guard": "_fence_require_owned_tree"
   },
   {
    "file": "scripts/lib/db-fence-protected.sh",
    "line": "cat < \"${DB_FENCE_SCRIPT}\" > \"${dir}/scripts/fence-db-connections.mjs\" || { rm -rf \"${dir}\"; return 1; }",
    "count": 1,
    "class": "code-owned-tree",
-   "reason": "deletes the probe directory this function made with `mktemp -d`"
+   "reason": "deletes the probe directory this function made with `mktemp -d`; enforced at run time by _fence_require_owned_tree in _fence_probe_assemble",
+   "guard": "_fence_require_owned_tree"
   },
   {
    "file": "scripts/lib/db-fence-protected.sh",
    "line": "_fence_vendor_into \"${app_dir}\" \"${dir}\" || { rm -rf \"${dir}\"; return 1; }",
    "count": 1,
    "class": "code-owned-tree",
-   "reason": "deletes the probe directory this function made with `mktemp -d`"
+   "reason": "deletes the probe directory this function made with `mktemp -d`; enforced at run time by _fence_require_owned_tree in _fence_probe_assemble",
+   "guard": "_fence_require_owned_tree"
   },
   {
    "file": "scripts/lib/db-fence-protected.sh",
    "line": "chmod -R u=rwX,go=rX \"${dir}\" || { rm -rf \"${dir}\"; return 1; }",
    "count": 1,
    "class": "code-owned-tree",
-   "reason": "seals, or deletes, the probe directory this function made with `mktemp -d`"
+   "reason": "seals, or deletes, the probe directory this function made with `mktemp -d`; enforced at run time by _fence_require_owned_tree in _fence_probe_assemble",
+   "guard": "_fence_require_owned_tree"
   },
   {
    "file": "scripts/lib/db-fence-protected.sh",
    "line": "_fence_tree_is_sealed \"${dir}\" || { rm -rf \"${dir}\"; return 1; }",
    "count": 1,
    "class": "code-owned-tree",
-   "reason": "deletes the probe directory this function made with `mktemp -d`"
+   "reason": "deletes the probe directory this function made with `mktemp -d`; enforced at run time by _fence_require_owned_tree in _fence_probe_assemble",
+   "guard": "_fence_require_owned_tree"
   },
   {
    "file": "scripts/lib/db-fence-protected.sh",
    "line": "digest=\"$(_fence_tree_digest \"${dir}\")\" || { rm -rf \"${dir}\"; return 1; }",
    "count": 1,
    "class": "code-owned-tree",
-   "reason": "deletes the probe directory this function made with `mktemp -d`"
+   "reason": "deletes the probe directory this function made with `mktemp -d`; enforced at run time by _fence_require_owned_tree in _fence_probe_assemble",
+   "guard": "_fence_require_owned_tree"
   },
   {
    "file": "scripts/lib/db-fence-protected.sh",
-   "line": "[[ -z \"${_fence_probe_dir}\" ]] || rm -rf \"${_fence_probe_dir}\"",
+   "line": "[[ -z \"${_fence_probe_dir}\" ]] || { _fence_require_owned_tree \"${_fence_probe_dir}\" \"the fence probe directory\"; rm -rf \"${_fence_probe_dir}\"; }",
    "count": 4,
    "class": "code-owned-tree",
-   "reason": "deletes the `mktemp -d` probe directory _fence_probe_assemble made for this call"
+   "reason": "deletes the `mktemp -d` probe directory _fence_probe_assemble made for this call; enforced at run time by _fence_require_owned_tree in db_fence_preflight, db_fence_probe_digests, db_fence_report_candidate_digest",
+   "guard": "_fence_require_owned_tree"
+  },
+  {
+   "file": "scripts/lib/db-fence-protected.sh",
+   "line": "# on to clean it up, and nothing outside this frame can re-aim the `rm`.",
+   "count": 1,
+   "class": "comment",
+   "reason": "a comment by lexer state that quotes code in backticks or $( ); the strict rule reads it, and nothing on it runs"
+  },
+  {
+   "file": "scripts/lib/crontab-lock.sh",
+   "line": "# `touch`, `chown` and `chmod` on that path on every install and every upgrade. All three follow",
+   "count": 1,
+   "class": "comment",
+   "reason": "a comment by lexer state that quotes code in backticks or $( ); the strict rule reads it, and nothing on it runs"
+  },
+  {
+   "file": "scripts/lib/crontab-lock.sh",
+   "line": "#       `chown`ed to ${APP_USER}, and never written by anyone — its CONTENTS are meaningless,",
+   "count": 1,
+   "class": "comment",
+   "reason": "a comment by lexer state that quotes code in backticks or $( ); the strict rule reads it, and nothing on it runs"
+  },
+  {
+   "file": "scripts/lib/crontab-lock.sh",
+   "line": "#   • `chown -h` — never dereferences: on a symlink it changes the LINK, so even a path swapped",
+   "count": 1,
+   "class": "comment",
+   "reason": "a comment by lexer state that quotes code in backticks or $( ); the strict rule reads it, and nothing on it runs"
+  },
+  {
+   "file": "scripts/lib/crontab-lock.sh",
+   "line": "#   • NO `chmod`, anywhere on these two paths. chmod has no --no-dereference on Linux, so a",
+   "count": 1,
+   "class": "comment",
+   "reason": "a comment by lexer state that quotes code in backticks or $( ); the strict rule reads it, and nothing on it runs"
+  },
+  {
+   "file": "scripts/lib/crontab-lock.sh",
+   "line": "#     raced chmod is the same escalation with a different verb. Modes come from `umask` at",
+   "count": 1,
+   "class": "comment",
+   "reason": "a comment by lexer state that quotes code in backticks or $( ); the strict rule reads it, and nothing on it runs"
   },
   {
    "file": "scripts/lib/crontab-lock.sh",
@@ -1683,10 +2824,24 @@
   },
   {
    "file": "scripts/lib/crontab-lock.sh",
+   "line": "# `crontab(1)` is an EDITOR. It is setgid so an unprivileged user can install a file into the",
+   "count": 1,
+   "class": "comment",
+   "reason": "a comment by lexer state that quotes code in backticks or $( ); the strict rule reads it, and nothing on it runs"
+  },
+  {
+   "file": "scripts/lib/crontab-lock.sh",
    "line": "rm -f \"${err_file}\"",
    "count": 2,
    "class": "single-inode",
    "reason": "non-recursive rm -f on one named path"
+  },
+  {
+   "file": "scripts/lib/crontab-lock.sh",
+   "line": "# NOT THE SAME AS AN EMPTY CRONTAB. `write_crontab_for user \"\"` is a deliberate request to install",
+   "count": 1,
+   "class": "comment",
+   "reason": "a comment by lexer state that quotes code in backticks or $( ); the strict rule reads it, and nothing on it runs"
   },
   {
    "file": "scripts/lib/crontab-lock.sh",
@@ -1725,6 +2880,62 @@
   },
   {
    "file": "scripts/lib/cutover-namespace.sh",
+   "line": "#   there and returns 0. `chown` and `chmod` then both DEREFERENCE, as root, so `deploy` pointed",
+   "count": 1,
+   "class": "comment",
+   "reason": "a comment by lexer state that quotes code in backticks or $( ); the strict rule reads it, and nothing on it runs"
+  },
+  {
+   "file": "scripts/lib/cutover-namespace.sh",
+   "line": "#     THIS IS THE ONE PLACE A `chmod` IS ALLOWED, and the prose above enter_service_subdir()",
+   "count": 1,
+   "class": "comment",
+   "reason": "a comment by lexer state that quotes code in backticks or $( ); the strict rule reads it, and nothing on it runs"
+  },
+  {
+   "file": "scripts/lib/cutover-namespace.sh",
+   "line": "#     chmod OF A PATHNAME is the same escalation as the chown with another verb. A chmod of `.`",
+   "count": 1,
+   "class": "comment",
+   "reason": "a comment by lexer state that quotes code in backticks or $( ); the strict rule reads it, and nothing on it runs"
+  },
+  {
+   "file": "scripts/lib/cutover-namespace.sh",
+   "line": "#     `O_NOFOLLOW` proven rather than assumed, the way chown-tree.mjs proves `O_PATH`, and it",
+   "count": 1,
+   "class": "comment",
+   "reason": "a comment by lexer state that quotes code in backticks or $( ); the strict rule reads it, and nothing on it runs"
+  },
+  {
+   "file": "scripts/lib/cutover-namespace.sh",
+   "line": "# `chown -R ${APP_USER}` has already handed the containing directory to the service account — so",
+   "count": 1,
+   "class": "comment",
+   "reason": "a comment by lexer state that quotes code in backticks or $( ); the strict rule reads it, and nothing on it runs"
+  },
+  {
+   "file": "scripts/lib/cutover-namespace.sh",
+   "line": "# NO `chmod`, HERE EITHER. The mode comes from the umask the caller states, at creation. A",
+   "count": 1,
+   "class": "comment",
+   "reason": "a comment by lexer state that quotes code in backticks or $( ); the strict rule reads it, and nothing on it runs"
+  },
+  {
+   "file": "scripts/lib/cutover-namespace.sh",
+   "line": "# the whole reason this function can exist. `chmod` and `chown` are then issued against `.`,",
+   "count": 1,
+   "class": "comment",
+   "reason": "a comment by lexer state that quotes code in backticks or $( ); the strict rule reads it, and nothing on it runs"
+  },
+  {
+   "file": "scripts/lib/cutover-namespace.sh",
+   "line": "# THE `chown` IS BEST-EFFORT AND THE `chmod` IS NOT, which is deliberate and is the pre-existing",
+   "count": 1,
+   "class": "comment",
+   "reason": "a comment by lexer state that quotes code in backticks or $( ); the strict rule reads it, and nothing on it runs"
+  },
+  {
+   "file": "scripts/lib/cutover-namespace.sh",
    "line": "chmod \"${mode}\" . || { cd \"${saved}\" >/dev/null 2>&1 || true; die \"${path} could not be set to mode ${mode}. Nothing has been changed.\"; }",
    "count": 1,
    "class": "single-inode",
@@ -1739,6 +2950,55 @@
   },
   {
    "file": "scripts/lib/cutover-namespace.sh",
+   "line": "# `rm -rf \"${APP_DIR}/.git\"` followed by the same `cp -a` into the same name — kept the raw pair,",
+   "count": 1,
+   "class": "comment",
+   "reason": "a comment by lexer state that quotes code in backticks or $( ); the strict rule reads it, and nothing on it runs"
+  },
+  {
+   "file": "scripts/lib/cutover-namespace.sh",
+   "line": "# `rm -rf \"${APP_DIR}/.git\"` followed by `cp -a \"${clone}/.git\" \"${APP_DIR}/.git\"` is the same",
+   "count": 1,
+   "class": "comment",
+   "reason": "a comment by lexer state that quotes code in backticks or $( ); the strict rule reads it, and nothing on it runs"
+  },
+  {
+   "file": "scripts/lib/cutover-namespace.sh",
+   "line": "# finding one more time, and the `rm` is what opens it: it removes a symlink without following it",
+   "count": 1,
+   "class": "comment",
+   "reason": "a comment by lexer state that quotes code in backticks or $( ); the strict rule reads it, and nothing on it runs"
+  },
+  {
+   "file": "scripts/lib/cutover-namespace.sh",
+   "line": "# somewhere else before the `cp` runs. `cp -a src dest` with `dest` a symlink-to-directory copies",
+   "count": 1,
+   "class": "comment",
+   "reason": "a comment by lexer state that quotes code in backticks or $( ); the strict rule reads it, and nothing on it runs"
+  },
+  {
+   "file": "scripts/lib/cutover-namespace.sh",
+   "line": "# taken, so a link planted between the `rm` and here ends the run instead of being followed. Then",
+   "count": 1,
+   "class": "comment",
+   "reason": "a comment by lexer state that quotes code in backticks or $( ); the strict rule reads it, and nothing on it runs"
+  },
+  {
+   "file": "scripts/lib/cutover-namespace.sh",
+   "line": "# root-side `cp -a` writes the whole of the clone's .git into that directory, overwriting any",
+   "count": 1,
+   "class": "comment",
+   "reason": "a comment by lexer state that quotes code in backticks or $( ); the strict rule reads it, and nothing on it runs"
+  },
+  {
+   "file": "scripts/lib/cutover-namespace.sh",
+   "line": "# cannot be renamed by the service account and its device and inode, taken before the `rm`, are a",
+   "count": 1,
+   "class": "comment",
+   "reason": "a comment by lexer state that quotes code in backticks or $( ); the strict rule reads it, and nothing on it runs"
+  },
+  {
+   "file": "scripts/lib/cutover-namespace.sh",
    "line": "copy_tree_into_new_dir() {",
    "count": 1,
    "class": "definition",
@@ -1746,17 +3006,40 @@
   },
   {
    "file": "scripts/lib/cutover-namespace.sh",
+   "line": "privileged_spare_running_tree \"${dest}\" \"the directory copy_tree_into_new_dir would replace\" || die \"${IMS_DRIVER_OVERLAP_REASON:-the running-tree check is not loaded, so ${dest} cannot be shown to be separate from it}\"",
+   "count": 1,
+   "class": "text",
+   "reason": "not run: the word is text or an argument (privileged_spare_running_tree, die)"
+  },
+  {
+   "file": "scripts/lib/cutover-namespace.sh",
    "line": "rm -rf \"${dest}\"",
    "count": 1,
    "class": "census-helper",
-   "reason": "the body of copy_tree_into_new_dir: every call site is a census row with its own guard"
+   "reason": "the body of copy_tree_into_new_dir: every call site is a census row with its own guard; enforced at run time by privileged_spare_running_tree in copy_tree_into_new_dir",
+   "guard": "privileged_spare_running_tree"
   },
   {
    "file": "scripts/lib/cutover-namespace.sh",
    "line": "cp -a \"${src}/.\" . 2>/dev/null || exit 1",
    "count": 1,
    "class": "census-helper",
-   "reason": "the body of copy_tree_into_new_dir, copying into the directory it just created and verified"
+   "reason": "the body of copy_tree_into_new_dir, copying into the directory it just created and verified; enforced at run time by privileged_spare_running_tree in copy_tree_into_new_dir",
+   "guard": "privileged_spare_running_tree"
+  },
+  {
+   "file": "scripts/lib/cutover-namespace.sh",
+   "line": "#      proven rather than asked for — the same proof chown-tree.mjs makes of `O_PATH` — and it is",
+   "count": 1,
+   "class": "comment",
+   "reason": "a comment by lexer state that quotes code in backticks or $( ); the strict rule reads it, and nothing on it runs"
+  },
+  {
+   "file": "scripts/lib/cutover-namespace.sh",
+   "line": "#   • `chown -h` never dereferences, so even a path swapped between the check and the call",
+   "count": 1,
+   "class": "comment",
+   "reason": "a comment by lexer state that quotes code in backticks or $( ); the strict rule reads it, and nothing on it runs"
   },
   {
    "file": "scripts/lib/cutover-namespace.sh",
@@ -1767,10 +3050,38 @@
   },
   {
    "file": "scripts/lib/cutover-namespace.sh",
+   "line": "# `chmod` OF /proc/self/fd/N IS AN fchmod IN THE ONLY SPELLING A SHELL HAS, and it is the same",
+   "count": 1,
+   "class": "comment",
+   "reason": "a comment by lexer state that quotes code in backticks or $( ); the strict rule reads it, and nothing on it runs"
+  },
+  {
+   "file": "scripts/lib/cutover-namespace.sh",
+   "line": "# THE READ-BACK IS THE ASSERTION, taken through the same descriptor. A `chmod` that silently did",
+   "count": 1,
+   "class": "comment",
+   "reason": "a comment by lexer state that quotes code in backticks or $( ); the strict rule reads it, and nothing on it runs"
+  },
+  {
+   "file": "scripts/lib/cutover-namespace.sh",
    "line": "chmod 600 \"/proc/self/fd/${fd}\" 2>/dev/null || true",
    "count": 1,
    "class": "single-inode",
    "reason": "non-recursive chmod on one named path"
+  },
+  {
+   "file": "scripts/lib/cutover-namespace.sh",
+   "line": "# `fuser` in the way a lock is, and nothing about it is affected by a later `chmod`. It keeps a",
+   "count": 1,
+   "class": "comment",
+   "reason": "a comment by lexer state that quotes code in backticks or $( ); the strict rule reads it, and nothing on it runs"
+  },
+  {
+   "file": "scripts/lib/cutover-namespace.sh",
+   "line": "# `chown -h` never dereferences. The staging name is this process's own inside a directory only",
+   "count": 1,
+   "class": "comment",
+   "reason": "a comment by lexer state that quotes code in backticks or $( ); the strict rule reads it, and nothing on it runs"
   },
   {
    "file": "scripts/lib/cutover-namespace.sh",
@@ -1795,6 +3106,20 @@
   },
   {
    "file": "scripts/lib/cutover-namespace.sh",
+   "line": "# mode to the descriptor it lands on, so neither `chown` nor `chmod` ever names a path a second",
+   "count": 1,
+   "class": "comment",
+   "reason": "a comment by lexer state that quotes code in backticks or $( ); the strict rule reads it, and nothing on it runs"
+  },
+  {
+   "file": "scripts/lib/cutover-namespace.sh",
+   "line": "# now the privileged account that owns this install, asked with `id -un` for the same reason",
+   "count": 1,
+   "class": "comment",
+   "reason": "a comment by lexer state that quotes code in backticks or $( ); the strict rule reads it, and nothing on it runs"
+  },
+  {
+   "file": "scripts/lib/cutover-namespace.sh",
    "line": "if ! chmod 711 . || ! chown \"$(id -u):$(id -g)\" .; then",
    "count": 1,
    "class": "single-inode",
@@ -1802,10 +3127,73 @@
   },
   {
    "file": "scripts/lib/cutover-namespace.sh",
+   "line": "# to now, and `chmod` cannot reach a descriptor somebody is already holding. It decides whether",
+   "count": 1,
+   "class": "comment",
+   "reason": "a comment by lexer state that quotes code in backticks or $( ); the strict rule reads it, and nothing on it runs"
+  },
+  {
+   "file": "scripts/lib/cutover-namespace.sh",
    "line": "rotate_cutover_lock_inode \"$LOCK_FILE\" || die \\\n\"${LOCK_FILE} was inherited at mode ${inherited_lock_mode:-unreadable} — openable, and therefore lockable, by accounts other than this one — and this run could not replace it with a fresh 0600 inode it holds. Narrowing it in place would not help: \\`chmod\\` cannot reach a descriptor ${APP_USER} opened while the file was wide, and that descriptor can block every future deploy, update and install on this box. Refusing to run a cutover behind an exclusion this run cannot show it owns. Nothing has been stopped.\"",
    "count": 1,
    "class": "text",
    "reason": "not run: the word is text or an argument (rotate_cutover_lock_inode, die)"
+  },
+  {
+   "file": "scripts/lib/privileged-helpers.sh",
+   "line": "# deployment that checkout belongs to ${APP_USER}: install.sh and update.sh both `chown -R` the",
+   "count": 1,
+   "class": "comment",
+   "reason": "a comment by lexer state that quotes code in backticks or $( ); the strict rule reads it, and nothing on it runs"
+  },
+  {
+   "file": "scripts/lib/privileged-helpers.sh",
+   "line": "#     about the half it did not change. The sequence was retire-then-rename: `mv ${target} retired`",
+   "count": 1,
+   "class": "comment",
+   "reason": "a comment by lexer state that quotes code in backticks or $( ); the strict rule reads it, and nothing on it runs"
+  },
+  {
+   "file": "scripts/lib/privileged-helpers.sh",
+   "line": "#     then `mv staged ${target}`. Between those two the documented name did not exist, so a second",
+   "count": 1,
+   "class": "comment",
+   "reason": "a comment by lexer state that quotes code in backticks or $( ); the strict rule reads it, and nothing on it runs"
+  },
+  {
+   "file": "scripts/lib/privileged-helpers.sh",
+   "line": "#     run could put its tree there first; and `mv src dst` where `dst` IS AN EXISTING DIRECTORY moves",
+   "count": 1,
+   "class": "comment",
+   "reason": "a comment by lexer state that quotes code in backticks or $( ); the strict rule reads it, and nothing on it runs"
+  },
+  {
+   "file": "scripts/lib/privileged-helpers.sh",
+   "line": "# node: builtins — chown-tree.mjs takes `node:fs`, pg-auth-request.mjs takes `node:buffer`,",
+   "count": 1,
+   "class": "comment",
+   "reason": "a comment by lexer state that quotes code in backticks or $( ); the strict rule reads it, and nothing on it runs"
+  },
+  {
+   "file": "scripts/lib/privileged-helpers.sh",
+   "line": "# WHAT IS LEFT, NAMED RATHER THAN CLAIMED CLOSED: between that question and the `rm -rf` there is a",
+   "count": 1,
+   "class": "comment",
+   "reason": "a comment by lexer state that quotes code in backticks or $( ); the strict rule reads it, and nothing on it runs"
+  },
+  {
+   "file": "scripts/lib/privileged-helpers.sh",
+   "line": "#                                  and not an unlink-then-symlink, which is what `ln -sf` does and",
+   "count": 1,
+   "class": "comment",
+   "reason": "a comment by lexer state that quotes code in backticks or $( ); the strict rule reads it, and nothing on it runs"
+  },
+  {
+   "file": "scripts/lib/privileged-helpers.sh",
+   "line": "#                                  first. A unique destination is the point: `mv src dst` with `dst`",
+   "count": 1,
+   "class": "comment",
+   "reason": "a comment by lexer state that quotes code in backticks or $( ); the strict rule reads it, and nothing on it runs"
   },
   {
    "file": "scripts/lib/privileged-helpers.sh",
@@ -1830,6 +3218,27 @@
   },
   {
    "file": "scripts/lib/privileged-helpers.sh",
+   "line": "# `cp -a` would preserve the SOURCE's ownership and mode, which is the ownership this whole",
+   "count": 1,
+   "class": "comment",
+   "reason": "a comment by lexer state that quotes code in backticks or $( ); the strict rule reads it, and nothing on it runs"
+  },
+  {
+   "file": "scripts/lib/privileged-helpers.sh",
+   "line": "# mechanism exists to leave behind; `cp -R` follows symbolic links. So each file is read through a",
+   "count": 1,
+   "class": "comment",
+   "reason": "a comment by lexer state that quotes code in backticks or $( ); the strict rule reads it, and nothing on it runs"
+  },
+  {
+   "file": "scripts/lib/privileged-helpers.sh",
+   "line": "#     recipe — `find . -type f`, which has no maxdepth — would hash its contents. The two would then",
+   "count": 1,
+   "class": "comment",
+   "reason": "a comment by lexer state that quotes code in backticks or $( ); the strict rule reads it, and nothing on it runs"
+  },
+  {
+   "file": "scripts/lib/privileged-helpers.sh",
    "line": "offender=\"$(find \"${src}\" -mindepth 1 -maxdepth 1 ! -type f -print -quit 2>/dev/null)\" || return 1",
    "count": 1,
    "class": "read-only",
@@ -1841,6 +3250,41 @@
    "count": 1,
    "class": "read-only",
    "reason": "read-only: find with no action that writes"
+  },
+  {
+   "file": "scripts/lib/privileged-helpers.sh",
+   "line": "# cannot fail this run, and a `find` that printed no names would leave an EMPTY tree that seals",
+   "count": 1,
+   "class": "comment",
+   "reason": "a comment by lexer state that quotes code in backticks or $( ); the strict rule reads it, and nothing on it runs"
+  },
+  {
+   "file": "scripts/lib/privileged-helpers.sh",
+   "line": "# AND THEY ARE NOT SCRIPT-SCOPE NAMES. They read like scratch, but they are the argv of the `find`",
+   "count": 1,
+   "class": "comment",
+   "reason": "a comment by lexer state that quotes code in backticks or $( ); the strict rule reads it, and nothing on it runs"
+  },
+  {
+   "file": "scripts/lib/privileged-helpers.sh",
+   "line": "# privileged run is launched from. An empty list makes that `find` examine `.` instead — which can",
+   "count": 1,
+   "class": "comment",
+   "reason": "a comment by lexer state that quotes code in backticks or $( ); the strict rule reads it, and nothing on it runs"
+  },
+  {
+   "file": "scripts/lib/privileged-helpers.sh",
+   "line": "# name for another path to pre-set, and the lengths are asserted before the `find` runs.",
+   "count": 1,
+   "class": "comment",
+   "reason": "a comment by lexer state that quotes code in backticks or $( ); the strict rule reads it, and nothing on it runs"
+  },
+  {
+   "file": "scripts/lib/privileged-helpers.sh",
+   "line": "# `find` that cannot stat what it was asked about is a FAILURE, not a pass: this is the one question",
+   "count": 1,
+   "class": "comment",
+   "reason": "a comment by lexer state that quotes code in backticks or $( ); the strict rule reads it, and nothing on it runs"
   },
   {
    "file": "scripts/lib/privileged-helpers.sh",
@@ -1879,6 +3323,20 @@
   },
   {
    "file": "scripts/lib/privileged-helpers.sh",
+   "line": "# all. The residual window between question 3 and the `rm -rf` is therefore an availability fault a",
+   "count": 1,
+   "class": "comment",
+   "reason": "a comment by lexer state that quotes code in backticks or $( ); the strict rule reads it, and nothing on it runs"
+  },
+  {
+   "file": "scripts/lib/privileged-helpers.sh",
+   "line": "# this at a few milliseconds; `find` racing an exiting process is expected and its status is",
+   "count": 1,
+   "class": "comment",
+   "reason": "a comment by lexer state that quotes code in backticks or $( ); the strict rule reads it, and nothing on it runs"
+  },
+  {
+   "file": "scripts/lib/privileged-helpers.sh",
    "line": "find /proc/[0-9]*/fd /proc/[0-9]*/cwd /proc/[0-9]*/exe -maxdepth 1 -type l -printf '%l\\n' 2>/dev/null || true",
    "count": 1,
    "class": "read-only",
@@ -1886,31 +3344,42 @@
   },
   {
    "file": "scripts/lib/privileged-helpers.sh",
+   "line": "# killed between `mv -T ${target} ${retire_dir}` and the pointer flip leaves the documented name",
+   "count": 1,
+   "class": "comment",
+   "reason": "a comment by lexer state that quotes code in backticks or $( ); the strict rule reads it, and nothing on it runs"
+  },
+  {
+   "file": "scripts/lib/privileged-helpers.sh",
    "line": "mv -T \"${entry}\" \"${target}\" 2>/dev/null || true",
    "count": 1,
    "class": "code-owned-tree",
-   "reason": "legacy migration: renames a publication directory this library made back to its pointer name when nothing stands there"
+   "reason": "legacy migration: renames a publication directory this library made back to its pointer name when nothing stands there; enforced at run time by driver_require_owned_path in driver_sweep_orphans",
+   "guard": "driver_require_owned_path"
   },
   {
    "file": "scripts/lib/privileged-helpers.sh",
    "line": "rm -rf \"${entry}\" || true",
    "count": 1,
    "class": "code-owned-tree",
-   "reason": "the sweep: deletes a superseded publication directory under the root-only IMS_DRIVER_ROOT that no process has open (o3d-u460)"
+   "reason": "the sweep: deletes a superseded publication directory under the root-only IMS_DRIVER_ROOT that no process has open (o3d-u460); enforced at run time by driver_require_owned_path in driver_sweep_orphans",
+   "guard": "driver_require_owned_path"
   },
   {
    "file": "scripts/lib/privileged-helpers.sh",
    "line": "mv -T \"${retire_dir}\" \"${target}\" 2>/dev/null || true",
    "count": 1,
    "class": "code-owned-tree",
-   "reason": "rollback: puts this publication's own retired directory back"
+   "reason": "rollback: puts this publication's own retired directory back; enforced at run time by driver_require_owned_path in driver_publish_unwind",
+   "guard": "driver_require_owned_path"
   },
   {
    "file": "scripts/lib/privileged-helpers.sh",
    "line": "rm -rf \"${version_dir}\" \"${retire_dir}\" 2>/dev/null || true",
    "count": 1,
    "class": "code-owned-tree",
-   "reason": "rollback: deletes this publication's own version and retire directories"
+   "reason": "rollback: deletes this publication's own version and retire directories; enforced at run time by driver_require_owned_path in driver_publish_unwind",
+   "guard": "driver_require_owned_path"
   },
   {
    "file": "scripts/lib/privileged-helpers.sh",
@@ -1921,31 +3390,63 @@
   },
   {
    "file": "scripts/lib/privileged-helpers.sh",
+   "line": "# tree aside, then `mv staged target`, then write the record. Two defects, and they are the same defect",
+   "count": 1,
+   "class": "comment",
+   "reason": "a comment by lexer state that quotes code in backticks or $( ); the strict rule reads it, and nothing on it runs"
+  },
+  {
+   "file": "scripts/lib/privileged-helpers.sh",
+   "line": "#     ITS tree there first. `mv src dst` with `dst` an existing DIRECTORY does not replace dst — it",
+   "count": 1,
+   "class": "comment",
+   "reason": "a comment by lexer state that quotes code in backticks or $( ); the strict rule reads it, and nothing on it runs"
+  },
+  {
+   "file": "scripts/lib/privileged-helpers.sh",
+   "line": "# yields either the previous publication or this one, never neither and never half of one, and the `mv`",
+   "count": 1,
+   "class": "comment",
+   "reason": "a comment by lexer state that quotes code in backticks or $( ); the strict rule reads it, and nothing on it runs"
+  },
+  {
+   "file": "scripts/lib/privileged-helpers.sh",
+   "line": "# second run can be assembling in the same place — and the `rm -rf` of a fixed name that used to",
+   "count": 1,
+   "class": "comment",
+   "reason": "a comment by lexer state that quotes code in backticks or $( ); the strict rule reads it, and nothing on it runs"
+  },
+  {
+   "file": "scripts/lib/privileged-helpers.sh",
    "line": "mkdir -p \"${staged}\" || { rm -rf \"${run_dir}\"; return 1; }",
    "count": 1,
    "class": "code-owned-tree",
-   "reason": "deletes this publication's own `mktemp -d` run directory under IMS_DRIVER_ROOT"
+   "reason": "deletes this publication's own `mktemp -d` run directory under IMS_DRIVER_ROOT; enforced at run time by driver_require_owned_path in driver_publish_tree",
+   "guard": "driver_require_owned_path"
   },
   {
    "file": "scripts/lib/privileged-helpers.sh",
    "line": "rm -rf \"${run_dir}\"",
    "count": 8,
    "class": "code-owned-tree",
-   "reason": "deletes this publication's own `mktemp -d` run directory under IMS_DRIVER_ROOT"
+   "reason": "deletes this publication's own `mktemp -d` run directory under IMS_DRIVER_ROOT; enforced at run time by driver_require_owned_path in driver_publish_tree",
+   "guard": "driver_require_owned_path"
   },
   {
    "file": "scripts/lib/privileged-helpers.sh",
    "line": "chown -R \"$(id -u):$(id -g)\" \"${staged}\" 2>/dev/null || true",
    "count": 1,
    "class": "code-owned-tree",
-   "reason": "root takes ownership of its own staging copy inside the `mktemp -d` run directory"
+   "reason": "root takes ownership of its own staging copy inside the `mktemp -d` run directory; enforced at run time by driver_require_owned_path in driver_publish_tree",
+   "guard": "driver_require_owned_path"
   },
   {
    "file": "scripts/lib/privileged-helpers.sh",
    "line": "chmod -R u=rwX,go=rX \"${staged}\" || { rm -rf \"${run_dir}\"; return 1; }",
    "count": 1,
    "class": "code-owned-tree",
-   "reason": "takes group/other write off its own staging copy inside the `mktemp -d` run directory"
+   "reason": "takes group/other write off its own staging copy inside the `mktemp -d` run directory; enforced at run time by driver_require_owned_path in driver_publish_tree",
+   "guard": "driver_require_owned_path"
   },
   {
    "file": "scripts/lib/privileged-helpers.sh",
@@ -1959,21 +3460,24 @@
    "line": "chmod 755 \"${run_dir}\" || { rm -rf \"${run_dir}\"; return 1; }",
    "count": 1,
    "class": "code-owned-tree",
-   "reason": "deletes this publication's own `mktemp -d` run directory on failure"
+   "reason": "deletes this publication's own `mktemp -d` run directory on failure; enforced at run time by driver_require_owned_path in driver_publish_tree",
+   "guard": "driver_require_owned_path"
   },
   {
    "file": "scripts/lib/privileged-helpers.sh",
    "line": "tree_manifest=\"$(_fence_tree_manifest \"${staged}\")\" || { rm -rf \"${run_dir}\"; return 1; }",
    "count": 1,
    "class": "code-owned-tree",
-   "reason": "deletes this publication's own `mktemp -d` run directory on failure"
+   "reason": "deletes this publication's own `mktemp -d` run directory on failure; enforced at run time by driver_require_owned_path in driver_publish_tree",
+   "guard": "driver_require_owned_path"
   },
   {
    "file": "scripts/lib/privileged-helpers.sh",
    "line": "digest=\"$(_fence_tree_digest \"${staged}\")\" || { rm -rf \"${run_dir}\"; return 1; }",
    "count": 1,
    "class": "code-owned-tree",
-   "reason": "deletes this publication's own `mktemp -d` run directory on failure"
+   "reason": "deletes this publication's own `mktemp -d` run directory on failure; enforced at run time by driver_require_owned_path in driver_publish_tree",
+   "guard": "driver_require_owned_path"
   },
   {
    "file": "scripts/lib/privileged-helpers.sh",
@@ -1987,14 +3491,30 @@
    "line": "if ! mv -T \"${run_dir}\" \"${version_dir}\"; then",
    "count": 1,
    "class": "code-owned-tree",
-   "reason": "renames this publication's own run directory to its version name"
+   "reason": "renames this publication's own run directory to its version name; enforced at run time by driver_require_owned_path in driver_publish_tree",
+   "guard": "driver_require_owned_path"
+  },
+  {
+   "file": "scripts/lib/privileged-helpers.sh",
+   "line": "# committed its pointer, and `mv -T` would then move that fresh symbolic link into a retirement name —",
+   "count": 1,
+   "class": "comment",
+   "reason": "a comment by lexer state that quotes code in backticks or $( ); the strict rule reads it, and nothing on it runs"
   },
   {
    "file": "scripts/lib/privileged-helpers.sh",
    "line": "if ! mv -T \"${target}\" \"${retire_dir}\"; then",
    "count": 1,
    "class": "code-owned-tree",
-   "reason": "retires a legacy publication directory under the root-only IMS_DRIVER_ROOT"
+   "reason": "retires a legacy publication directory under the root-only IMS_DRIVER_ROOT; enforced at run time by driver_require_owned_path in driver_publish_tree",
+   "guard": "driver_require_owned_path"
+  },
+  {
+   "file": "scripts/lib/privileged-helpers.sh",
+   "line": "# THE POINTER, BUILT UNDER ITS OWN NAME AND THEN RENAMED. `ln -sf` would unlink the documented name",
+   "count": 1,
+   "class": "comment",
+   "reason": "a comment by lexer state that quotes code in backticks or $( ); the strict rule reads it, and nothing on it runs"
   },
   {
    "file": "scripts/lib/privileged-helpers.sh",
@@ -2015,7 +3535,8 @@
    "line": "rm -rf \"${retire_dir}\" 2>/dev/null || true",
    "count": 2,
    "class": "code-owned-tree",
-   "reason": "deletes this publication's own retire directory after the flip"
+   "reason": "deletes this publication's own retire directory after the flip; enforced at run time by driver_require_owned_path in driver_publish_tree",
+   "guard": "driver_require_owned_path"
   },
   {
    "file": "scripts/lib/privileged-helpers.sh",
@@ -2030,6 +3551,76 @@
    "count": 1,
    "class": "single-inode",
    "reason": "non-recursive chown on one named path"
+  },
+  {
+   "file": "scripts/lib/privileged-helpers.sh",
+   "line": "# `chown -R ${APP_USER} ${APP_DIR}` — and nothing stopped the root-only release being executed from",
+   "count": 1,
+   "class": "comment",
+   "reason": "a comment by lexer state that quotes code in backticks or $( ); the strict rule reads it, and nothing on it runs"
+  },
+  {
+   "file": "scripts/lib/privileged-helpers.sh",
+   "line": "# that `chown` handed the entrypoint's inode to the application account, that account could write",
+   "count": 1,
+   "class": "comment",
+   "reason": "a comment by lexer state that quotes code in backticks or $( ); the strict rule reads it, and nothing on it runs"
+  },
+  {
+   "file": "scripts/lib/privileged-helpers.sh",
+   "line": "# paths. So each tree is walked the way a recursive `chown`, `rsync` or `rm -rf` walks it — by directory",
+   "count": 1,
+   "class": "comment",
+   "reason": "a comment by lexer state that quotes code in backticks or $( ); the strict rule reads it, and nothing on it runs"
+  },
+  {
+   "file": "scripts/lib/privileged-helpers.sh",
+   "line": "# and inode (`find -samefile`). If a recursive operation over one could reach the other, this walk",
+   "count": 1,
+   "class": "comment",
+   "reason": "a comment by lexer state that quotes code in backticks or $( ); the strict rule reads it, and nothing on it runs"
+  },
+  {
+   "file": "scripts/lib/privileged-helpers.sh",
+   "line": "# directory it names, which is the conservative reading of what `rsync dir/` and `chown -H` do.",
+   "count": 1,
+   "class": "comment",
+   "reason": "a comment by lexer state that quotes code in backticks or $( ); the strict rule reads it, and nothing on it runs"
+  },
+  {
+   "file": "scripts/lib/privileged-helpers.sh",
+   "line": "# not tell. The walk is the one a recursive `chown`, `rsync` or `rm` makes — by directory entry, not",
+   "count": 1,
+   "class": "comment",
+   "reason": "a comment by lexer state that quotes code in backticks or $( ); the strict rule reads it, and nothing on it runs"
+  },
+  {
+   "file": "scripts/lib/privileged-helpers.sh",
+   "line": "# AN INODE SET RATHER THAN ONE DIRECTORY (o3d-z5be r7, review MEDIUM 3). `find -samefile <dir>` asks",
+   "count": 1,
+   "class": "comment",
+   "reason": "a comment by lexer state that quotes code in backticks or $( ); the strict rule reads it, and nothing on it runs"
+  },
+  {
+   "file": "scripts/lib/privileged-helpers.sh",
+   "line": "# is not that directory: `ln <release>/scripts/install.sh ${APP_DIR}/x.sh` left the guard passing while",
+   "count": 1,
+   "class": "comment",
+   "reason": "a comment by lexer state that quotes code in backticks or $( ); the strict rule reads it, and nothing on it runs"
+  },
+  {
+   "file": "scripts/lib/privileged-helpers.sh",
+   "line": "# `chown -R ${APP_USER} ${APP_DIR}` changed the owner of the inode bash was reading. The caller lists",
+   "count": 1,
+   "class": "comment",
+   "reason": "a comment by lexer state that quotes code in backticks or $( ); the strict rule reads it, and nothing on it runs"
+  },
+  {
+   "file": "scripts/lib/privileged-helpers.sh",
+   "line": "# overlapping trees as disjoint. `find` writes `find: '<path>': <strerror>`, so the errno is the tail of",
+   "count": 1,
+   "class": "comment",
+   "reason": "a comment by lexer state that quotes code in backticks or $( ); the strict rule reads it, and nothing on it runs"
   },
   {
    "file": "scripts/lib/privileged-helpers.sh",
@@ -2054,6 +3645,13 @@
   },
   {
    "file": "scripts/lib/privileged-helpers.sh",
+   "line": "# every message is a vanished entry: `find: '<path>': No such file or directory`, matched at the END",
+   "count": 1,
+   "class": "comment",
+   "reason": "a comment by lexer state that quotes code in backticks or $( ); the strict rule reads it, and nothing on it runs"
+  },
+  {
+   "file": "scripts/lib/privileged-helpers.sh",
    "line": "find \"${extra}\" -printf '%D:%i\\n' >> \"${out}\" 2>/dev/null || return 1",
    "count": 1,
    "class": "read-only",
@@ -2072,6 +3670,20 @@
    "count": 2,
    "class": "single-inode",
    "reason": "non-recursive rm -f on one named path"
+  },
+  {
+   "file": "scripts/lib/privileged-helpers.sh",
+   "line": "# is reading — and `chown -R` over that name changes the owner of that inode. The directory's inode is",
+   "count": 1,
+   "class": "comment",
+   "reason": "a comment by lexer state that quotes code in backticks or $( ); the strict rule reads it, and nothing on it runs"
+  },
+  {
+   "file": "scripts/lib/privileged-helpers.sh",
+   "line": "# changes), which coreutils' `chown -R` is but `rsync` and `rm -rf` are not. The guard is worth having",
+   "count": 1,
+   "class": "comment",
+   "reason": "a comment by lexer state that quotes code in backticks or $( ); the strict rule reads it, and nothing on it runs"
   }
  ]
 }

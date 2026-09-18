@@ -408,6 +408,47 @@ _fence_fsync_path() {
   return 1
 }
 
+# IS THIS A TREE THIS LIBRARY OWNS? IF NOT, THE RUN ENDS (o3d-z5be r11, review H3/M2).
+#
+# The fence copies into, deletes, re-owns and re-modes trees named by variables — one by a PARAMETER
+# (_fence_vendor_into's destination) and three by readonly names — and the only thing that made that
+# safe was that those names pointed under ${DB_FENCE_RECOVERY_DIR}. Nothing checked it. This does, at
+# the operation: the path must be absolute, have no `.` or `..` component, and CANONICALISE (every
+# symlink resolved, a final one included) strictly below the canonical recovery root — or be the one
+# `mktemp -d` directory _fence_probe_assemble() recorded in ${_FENCE_OWNED_TMP}, which must still be a
+# real directory owned by this uid. The refusal EXITS, so no `|| true` at a caller can soften it.
+# (${DB_FENCE_RECOVERY_DIR} is itself a readonly literal under /etc; tests/scripts/fence-artefact-
+# harness.ts asserts that shape.)
+_fence_require_owned_tree() {
+  local path="$1" what="$2" root canon owned
+  case "${path}" in
+    /*) ;;
+    *) _fence_owned_refuse "${what}" "${path}" "is not an absolute path" ;;
+  esac
+  case "/${path}/" in
+    */../*|*/./*) _fence_owned_refuse "${what}" "${path}" "has a '.' or '..' component" ;;
+  esac
+  root="$(readlink -m -- "${DB_FENCE_RECOVERY_DIR}" 2>/dev/null)" || root=""
+  canon="$(readlink -m -- "${path}" 2>/dev/null)" || canon=""
+  [[ -n "${canon}" ]] || _fence_owned_refuse "${what}" "${path}" "could not be canonicalised"
+  if [[ -n "${root}" && "${root}" != "/" && "${canon}" == "${root}/"?* ]]; then
+    return 0
+  fi
+  if [[ -n "${_FENCE_OWNED_TMP:-}" && ! -L "${_FENCE_OWNED_TMP}" && -d "${_FENCE_OWNED_TMP}" ]] \
+     && [[ "$(stat -c '%u' -- "${_FENCE_OWNED_TMP}" 2>/dev/null)" == "$(id -u)" ]]; then
+    owned="$(readlink -m -- "${_FENCE_OWNED_TMP}" 2>/dev/null)" || owned=""
+    if [[ -n "${owned}" && "${owned}" != "/" ]] && [[ "${canon}" == "${owned}" || "${canon}" == "${owned}/"?* ]]; then
+      return 0
+    fi
+  fi
+  _fence_owned_refuse "${what}" "${path}" "resolves to '${canon}', which is neither strictly inside ${DB_FENCE_RECOVERY_DIR} nor the probe directory this run made"
+}
+
+_fence_owned_refuse() {
+  echo "REFUSING: ${1} (${2}) ${3}. The fence library only copies into, deletes or re-owns trees it created; reaching here is a bug in these scripts, and the run stops rather than touch it." >&2
+  exit 1
+}
+
 # Publish stdin at "$1" atomically: a kill at any instant leaves the previous content or the
 # complete new content, never a truncation. Mode 0644 because the application user must read it.
 _fence_publish_file() {
@@ -780,6 +821,10 @@ _fence_source_ident() {
 # parent is skipped rather than copied into itself.
 _fence_vendor_into() {
   local app_dir="$1" staged="$2" list relative count rc=0 before after
+  # THE DESTINATION IS CHECKED AT RUN TIME (o3d-z5be r11, review H3): this copies a tree INTO a
+  # parameter, and "every caller passes the staging copy or the probe directory" was true only of
+  # today's callers. Anything else ends the run.
+  _fence_require_owned_tree "${staged}" "the directory _fence_vendor_into would copy into"
   # THE PATH LISTS ARE THIS CALL'S, NOT THE SCRIPT'S. _fence_source_paths() derives them and
   # _fence_source_trust() and _fence_source_ident() read them, all three inside this frame — so
   # the `find` that answers the provenance question can only ever be aimed at paths derived by
@@ -861,6 +906,12 @@ _fence_stage_and_publish() {
   # per call), so it is a `local` of the frame that consumes it, and there is no script-scope name
   # for another path to pre-set. Every caller of _fence_vendor_into() declares it the same way.
   local DB_FENCE_SOURCE_UNTRUSTED_PATH=""
+  # FIRST, BEFORE ANYTHING ELSE: THE THREE TREES THIS FUNCTION DELETES, RE-OWNS, RE-MODES AND RENAMES ARE CHECKED AT RUN TIME
+  # (o3d-z5be r11, review M2): they are readonly names, and re-aiming one of them — at ${APP_DIR}, say —
+  # needs no line that spells a privileged command. A name outside the recovery root ends the run.
+  _fence_require_owned_tree "${DB_FENCE_STAGED_APP_DIR}" "the fence staging copy"
+  _fence_require_owned_tree "${DB_FENCE_RETIRED_APP_DIR}" "the fence retired copy"
+  _fence_require_owned_tree "${DB_FENCE_PROTECTED_APP_DIR}" "the protected fence copy"
   [[ -f "${DB_FENCE_SCRIPT}" ]] || {
     DB_FENCE_ROTATION_NOTE="${DB_FENCE_SCRIPT} is not in this checkout, so there is nothing to publish into ${DB_FENCE_SCRIPT_COPY}"
     return 1
@@ -3376,6 +3427,10 @@ _fence_probe_assemble() {
   [[ -f "${DB_FENCE_SCRIPT}" ]] || return 1
   app_dir="$(dirname "$(dirname "${DB_FENCE_SCRIPT}")")"
   dir="$(mktemp -d 2>/dev/null)" || return 1
+  # THE ONE DIRECTORY OUTSIDE THE RECOVERY ROOT THIS LIBRARY MAY DELETE OR COPY INTO: the one it has
+  # just made, recorded here and checked (owner, not a link) wherever it is used (o3d-z5be r11).
+  _FENCE_OWNED_TMP="${dir}"
+  _fence_require_owned_tree "${dir}" "the fence probe directory"
   mkdir -p "${dir}/scripts" || { rm -rf "${dir}"; return 1; }
   cat < "${DB_FENCE_SCRIPT}" > "${dir}/scripts/fence-db-connections.mjs" || { rm -rf "${dir}"; return 1; }
   _fence_vendor_into "${app_dir}" "${dir}" || { rm -rf "${dir}"; return 1; }
@@ -3425,7 +3480,7 @@ db_fence_probe_digests() {
   DB_FENCE_PROBE_ARTEFACT_SHA256=""
   DB_FENCE_PROBE_STANDING_SHA256=""
   if _fence_probe_assemble; then DB_FENCE_PROBE_ARTEFACT_SHA256="${_fence_probe_sha}"; fi
-  [[ -z "${_fence_probe_dir}" ]] || rm -rf "${_fence_probe_dir}"
+  [[ -z "${_fence_probe_dir}" ]] || { _fence_require_owned_tree "${_fence_probe_dir}" "the fence probe directory"; rm -rf "${_fence_probe_dir}"; }
   _fence_standing_artefact || true
   DB_FENCE_PROBE_STANDING_SHA256="${_fence_standing_sha}"
   [[ -n "${DB_FENCE_PROBE_ARTEFACT_SHA256}" || -n "${DB_FENCE_PROBE_STANDING_SHA256}" ]]
@@ -3507,7 +3562,7 @@ db_fence_preflight() {
   fi
 
   if [[ -z "${probe}" ]]; then
-    [[ -z "${_fence_probe_dir}" ]] || rm -rf "${_fence_probe_dir}"
+    [[ -z "${_fence_probe_dir}" ]] || { _fence_require_owned_tree "${_fence_probe_dir}" "the fence probe directory"; rm -rf "${_fence_probe_dir}"; }
     if [[ -z "${DB_FENCE_PROBE_REASON}" ]]; then
       if [[ -z "${DB_FENCE_EXPECTED_ARTEFACT_SHA256}" ]]; then
         DB_FENCE_PROBE_REASON="there is no protected fence artefact on this box yet, and this run was given nothing that authenticates the tree the checkout would publish. The preflight opens the admin connection with DEPLOY_ADMIN_DATABASE_URL, and the tree it would run is assembled out of the checkout, so it will not be executed on the strength of the checkout's own account of itself. Supply IMS_FENCE_ARTEFACT_SHA256 and this dry run preflights with the tree that value names; every run after the first publication preflights with the standing artefact instead, and needs nothing supplied."
@@ -3519,7 +3574,7 @@ db_fence_preflight() {
   fi
 
   "$@" node "${probe}" --preflight "${DB_FENCE_IDENTITY_ARGS[@]:-}" || rc=$?
-  [[ -z "${_fence_probe_dir}" ]] || rm -rf "${_fence_probe_dir}"
+  [[ -z "${_fence_probe_dir}" ]] || { _fence_require_owned_tree "${_fence_probe_dir}" "the fence probe directory"; rm -rf "${_fence_probe_dir}"; }
   return "${rc}"
 }
 
@@ -3574,7 +3629,7 @@ db_fence_report_candidate_digest() {
   # THE THROWAWAY IS REMOVED HERE AND NOT BY A LATER CALL. The path to it is a `local` of this
   # function: nothing outside this frame can name it, so nothing outside this frame can be relied
   # on to clean it up, and nothing outside this frame can re-aim the `rm`.
-  [[ -z "${_fence_probe_dir}" ]] || rm -rf "${_fence_probe_dir}"
+  [[ -z "${_fence_probe_dir}" ]] || { _fence_require_owned_tree "${_fence_probe_dir}" "the fence probe directory"; rm -rf "${_fence_probe_dir}"; }
   # CALLED, NOT PROCESS-SUBSTITUTED (o3d-p9dq, Codex r33). The loop this replaces re-emitted the
   # report line by line through a producer whose exit reached nobody; calling it writes the same
   # bytes to the same stdout with no second process to fail, and its status is this shell's.

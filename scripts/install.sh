@@ -4045,6 +4045,12 @@ enter_service_root() {
 # subshell is why the installer's own cwd is unaffected.
 chown_state_tree() {
   local root="$1" owner="$2" prune_here="$3" what="$4" uid gid helper
+  # WHAT IT MAY RE-OWN, CHECKED AT RUN TIME (o3d-z5be r11, review H4): the state directory and nothing
+  # else, and never a tree that overlaps the one this run is executing from. Its one call site is also
+  # guarded; this is the check that does not depend on the call site.
+  [[ "${root}" == "${DATA_DIR}" ]] || die \
+    "chown_state_tree re-owns ${DATA_DIR} and nothing else, and was asked for ${root}. This is a bug in these scripts. Nothing has been changed."
+  privileged_spare_running_tree "${root}" "${what}" || die "${IMS_DRIVER_OVERLAP_REASON}"
   # NUMERIC IDS, RESOLVED ONCE AND CHECKED. `chown` takes a name and resolves it itself; `fchown`
   # takes numbers, so the resolution happens here — and a name that resolves to nothing must end
   # the run rather than reach the helper as an empty string.
@@ -4082,7 +4088,7 @@ chown_state_tree() {
     "node is not on PATH, so this run cannot set the ownership of ${root} — ${what}. Section 4 installs it; if you have reached here without it, something removed it. Nothing has been started."
   if ! (
     enter_service_root "${root}" 022 "${what}"
-    node "${helper}" . "${uid}" "${gid}" "${prune_here}"
+    IMS_CHOWN_TREE_ROOT="${root}" node "${helper}" . "${uid}" "${gid}" "${prune_here}"
   ); then
     die "The ownership of ${root} — ${what} — could not be set; the reason is above. Nothing has been started."
   fi

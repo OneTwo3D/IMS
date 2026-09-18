@@ -406,6 +406,38 @@ driver_refuse() {
   return 1
 }
 
+# IS THIS A PATH STRICTLY INSIDE ${IMS_DRIVER_ROOT}? IF NOT, THE RUN ENDS (o3d-z5be r11, review H3).
+#
+# Every helper in this library that deletes, renames, chowns or chmods a tree takes the tree from a
+# variable — several from a PARAMETER — and the only thing that ever made those operations safe was
+# that the callers named paths under the root. That is a property of the callers, which nothing checked.
+# This checks it where the operation is, at run time: the path must be absolute, contain no `.` or `..`
+# component, and CANONICALISE — every symbolic link resolved, including a final one — to something
+# strictly below the canonical root. A symlink inside the root that points at ${APP_DIR} canonicalises
+# to ${APP_DIR} and is refused. The refusal EXITS: a `|| true` or `2>/dev/null` at a caller cannot
+# turn it into a warning, which is the shape of many failure paths in this file.
+driver_require_owned_path() {
+  local path="$1" what="$2" root canon
+  case "${path}" in
+    /*) ;;
+    *) driver_owned_refuse "${what}" "${path}" "is not an absolute path" ;;
+  esac
+  case "/${path}/" in
+    */../*|*/./*) driver_owned_refuse "${what}" "${path}" "has a '.' or '..' component" ;;
+  esac
+  root="$(readlink -m -- "${IMS_DRIVER_ROOT}" 2>/dev/null)" || root=""
+  canon="$(readlink -m -- "${path}" 2>/dev/null)" || canon=""
+  if [[ -z "${root}" || "${root}" == "/" || -z "${canon}" || "${canon}" != "${root}/"?* ]]; then
+    driver_owned_refuse "${what}" "${path}" "resolves to '${canon:-nothing}', which is not strictly inside ${IMS_DRIVER_ROOT} (${root:-unresolvable})"
+  fi
+  return 0
+}
+
+driver_owned_refuse() {
+  echo "REFUSING: ${1} (${2}) ${3}. This library only deletes, renames or re-owns what it created under ${IMS_DRIVER_ROOT}; reaching here is a bug in these scripts, and the run stops rather than touch it." >&2
+  exit 1
+}
+
 # ---------------------------------------------------------------------------
 # THE ROOT
 # ---------------------------------------------------------------------------
@@ -720,6 +752,8 @@ driver_sweep_orphans() {
     esac
     [[ ! -e "${target}" ]] || continue
     [[ ! -L "${target}" ]] || continue
+    driver_require_owned_path "${entry}" "the retired publication the sweep would restore"
+    driver_require_owned_path "${target}" "the pointer name the sweep would restore it to"
     mv -T "${entry}" "${target}" 2>/dev/null || true
   done
 
@@ -766,6 +800,7 @@ driver_sweep_orphans() {
     if [[ "${open_paths}" == *"${entry}"* ]]; then
       continue
     fi
+    driver_require_owned_path "${entry}" "the superseded publication the sweep would delete"
     rm -rf "${entry}" || true
   done
   return 0
@@ -824,6 +859,13 @@ driver_standing_tree() {
 # over it would be this mechanism destroying a good publication on its way out.
 driver_publish_unwind() {
   local version_dir="$1" pointer_tmp="$2" retire_dir="$3" target="$4" migrated="$5"
+  # EVERY PATH IT IS HANDED IS CHECKED AT RUN TIME (o3d-z5be r11, review H3): this function deletes and
+  # renames what its CALLER names, and "today's callers only pass names under the root" is a claim
+  # about callers that no test of the text can bind. A path outside the root ends the run.
+  driver_require_owned_path "${version_dir}" "the version directory driver_publish_unwind would delete"
+  driver_require_owned_path "${pointer_tmp}" "the temporary pointer driver_publish_unwind would delete"
+  driver_require_owned_path "${retire_dir}" "the retire directory driver_publish_unwind would delete or restore"
+  driver_require_owned_path "${target}" "the pointer driver_publish_unwind would restore"
   # `-d` ALONE WOULD NOT DO IT since r4 (Codex MEDIUM 1): what a failed migration moved aside can be
   # another publication's POINTER as well as a legacy directory, and a symbolic link that resolves to a
   # directory answers `-d` while one whose publication has been swept answers neither `-d` nor `-e`.
@@ -951,6 +993,14 @@ driver_publish_tree() {
   retire_dir="${IMS_DRIVER_ROOT}/${IMS_DRIVER_RETIRE_PREFIX}${kind}.$$.${suffix}"
   driver_sweep_orphans "${run_dir}"
   staged="${run_dir}/${tree_name}"
+  # AND THE DIRECTORIES THIS PUBLICATION DELETES, CHOWNS, CHMODS OR RENAMES ARE CHECKED AT RUN TIME (r11).
+  # One call per name, so that a test can bind each operation below to the check of ITS operand.
+  driver_require_owned_path "${run_dir}" "the ${what} staging directory"
+  driver_require_owned_path "${staged}" "the ${what} staged tree"
+  driver_require_owned_path "${version_dir}" "the ${what} version directory"
+  driver_require_owned_path "${pointer_tmp}" "the ${what} temporary pointer"
+  driver_require_owned_path "${retire_dir}" "the ${what} retire directory"
+  driver_require_owned_path "${target}" "the ${what} pointer"
   mkdir -p "${staged}" || { rm -rf "${run_dir}"; return 1; }
 
   # THE FILLER'S STATUS IS CARRIED, NOT COLLAPSED. `|| filled=$?` rather than a bare call: under
@@ -1612,17 +1662,22 @@ privileged_trees_disjoint() {
   return 0
 }
 
-# THE CALL THAT CARRIES THE PROPERTY, made immediately before a tree-wide ownership change, copy, move
-# or delete in the entrypoints: it refuses when "$1" overlaps the directory this run is executing from.
-# The operations that run without it are listed by line, with reasons, in
-# tests/scripts/privileged-helper-set.test.ts — eleven deletes of the run's own `mktemp -d -t` clone
-# (three after a copy, eight in a guard's own failure branch) and single-file renames (o3d-z5be r10,
-# review L2). That test keeps these calls in place in two layers: a CENSUS, which is a classifier over
-# the shapes its tokeniser can parse and requires one of the two shipped `|| die` forms immediately
-# before each tree-wide statement it classifies; and a LEXICAL BACKSTOP, which requires every statement
-# in the entrypoints and the libraries they source (comment lines aside) that spells a privileged
-# command word to be a census row or an exact, reviewed allowlist entry. Neither sees a privileged command whose name is computed at
-# run time or lives outside these files. install.sh additionally
+# THE CALL THAT CARRIES THE PROPERTY IN THE ENTRYPOINTS, made immediately before a tree-wide ownership
+# change, copy, move or delete: it refuses when "$1" overlaps the directory this run is executing from.
+# The library helpers that change a tree they are HANDED carry their own run-time refusals
+# (driver_require_owned_path above, _fence_require_owned_tree in db-fence-protected.sh, and this call
+# inside copy_tree_into_new_dir and chown_state_tree), because a test of the text cannot bind what a
+# caller passes or what a variable holds (o3d-z5be r11, review H3/M2). The entrypoint operations that run
+# without this call are listed by line, with reasons, in tests/scripts/privileged-helper-set.test.ts:
+# eleven deletes of the run's own `mktemp -d -t` clone (three after a copy, eight in a guard's own
+# failure branch), nine single-file publishes and one backup rename, and four migrate_uploads calls
+# that check inside the function. THREAT MODEL: that test guards against an EDITOR'S MISTAKE, with a
+# fixed word list (the LEXICAL BACKSTOP, which requires every statement in the entrypoints and the
+# libraries they source that spells one of its words, comment lines aside, to be census rows or an
+# exact-text allowlist entry) and a CENSUS that classifies the shapes its tokeniser can parse. It binds
+# text, not values or context, and does not see a command whose name is computed at run time, is not on
+# its list, or lives outside these files.
+# install.sh additionally
 # asks the same question of ${APP_DIR}, ${DATA_DIR} and ${LOG_DIR} at configuration time, which is an
 # EARLY REFUSAL and not the thing the property rests on: on a first install those directories do not
 # exist yet, so that call can only compare against their nearest existing ancestor — and update.sh and

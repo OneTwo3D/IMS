@@ -60,41 +60,67 @@ are owned by root and writable by nobody else, and that every directory above it
 writable by group or other unless sticky; otherwise it stops and names the offending path. See *Which
 invocations are supported* below for why this is not optional, and why the check is only best-effort.
 
-**And no privileged run hands the tree it is running from to another account** (o3d-z5be r6–r10). The
-property is carried by a **per-operation check**, made immediately before a tree-wide ownership change,
-copy, move or delete: the target and the directory the running script lives in must be
-**disjoint** — neither equals, contains nor lies inside the other. The operations that run WITHOUT it are
-listed by line, each with its reason, in the test described below: eleven deletes of the clone directory
-the same run has just made with `mktemp -d -t` (three after a successful copy, eight in a guard's own
-failure branch), and renames of one staged file onto one target. Disjoint is decided by **device and
-inode** along the same walk a recursive operation makes, and the set asked about is the running directory
-*and every file under it*, so a symbolic link, a bind mount, or a **hard link** to the entrypoint or a
-library inside the target cannot make two overlapping trees look separate. A walk that cannot be
-completed is a refusal, not a pass, and a refusal ends the run.
+**And no privileged run hands the tree it is running from to another account** (o3d-z5be r6–r11).
 
-`tests/scripts/privileged-helper-set.test.ts` keeps those checks in place, in two layers.
+*The threat model, stated once.* What follows guards against a **mistake by someone editing these
+scripts** — a new `chown -R`, a helper aimed at the wrong directory, a constant changed to point
+somewhere else. It does not guard against an editor set on defeating it: they can change the test too.
+Two mechanisms carry the guarantee at **run time**, and a static test keeps them in place:
 
-- The **census** is a classifier over the shapes it can parse. It tokenises the three entrypoints —
-  quoting, `$( … )`, backticks, continuations, here-documents fed to a shell, same-file functions
-  (one-line ones included), the house pass-through wrappers `run`, `capture` and `run_as_user`, and the
-  payloads of `sudo`/`runuser`/`su` — and for each statement it classifies as tree-wide it requires a
-  table row: guarded, with the guard immediately before it and a refusal that ends the run, or carrying
-  a written reason. Nine review rounds each found a shape it could not parse, so it does not claim to be
-  complete.
-- It is **backed by a lexical backstop** that does not parse at all. Every statement in the three
-  entrypoints and the five libraries they source that *spells* a privileged command word — `chown`,
-  `chmod`, `chgrp`, `setfacl`, `rsync`, `rm`, `cp`, `mv`, `install`, `tar`, `ln`, `find`, `xargs`,
-  `cpio`, `unzip`, `useradd`, `usermod`, `git` with `clean`/`checkout`/`reset`/`-f`, and the two
-  tree-copying helpers — must be a census row or an **exact** entry, with a class and a reason, in
-  `tests/scripts/privileged-word-allowlist.json`. Here-document bodies and strings are included; only
-  `#` comment lines are not. A shape the census cannot parse still fails the test when the word is
-  written out.
+- **The per-operation check in the entrypoints.** Immediately before a tree-wide ownership change,
+  copy, move or delete, the entrypoint asks whether the target and the directory the running script
+  lives in are **disjoint** — neither equals, contains nor lies inside the other. Disjoint is decided by
+  **device and inode** along the same walk a recursive operation makes, and the set asked about is the
+  running directory *and every file under it*, so a symbolic link, a bind mount, or a **hard link** to the
+  entrypoint or a library inside the target cannot make two overlapping trees look separate. A walk that
+  cannot be completed is a refusal, and a refusal ends the run.
+- **The helpers' own refusals.** The library helpers that delete, rename, re-own or copy into a tree
+  they are *handed* check, when they run, that the path they were given is their own, and **exit** if not:
+  `driver_publish_unwind`, the driver sweep and the driver publication accept only paths that
+  canonicalise strictly inside `/etc/ims-cutover-driver`; the fence's `_fence_vendor_into` and
+  `_fence_stage_and_publish` accept only paths strictly inside `/etc/ims-cutover-recovery` (or the one
+  `mktemp -d` directory the probe just made), so re-aiming one of the fence's `readonly` names at the
+  application tree ends the run; `copy_tree_into_new_dir` runs the running-tree check on its own
+  destination; `chown_state_tree` re-owns `${DATA_DIR}` and nothing else, after the same check; and
+  `scripts/lib/chown-tree.mjs` refuses a directory its caller did not name, `/` or any top-level
+  directory, and its own tree. Canonical means every symbolic link resolved and no `..` component.
 
-What neither layer can see is **a privileged command whose name is computed at run time or lives outside
-these files** — assembled from variables (`c=ch; ${c}own`), from an escape (`$'\x63hown'`), from array
-elements (`"${CMD[0]}${CMD[1]}"`), or written in a file these scripts read but do not ship
-(`/etc/os-release`). The first three were each injected into an entrypoint and left both layers green. The guards
-are what the property rests on; the test keeps them there.
+The operations that run **without** a per-operation check in the entrypoints are listed by line, each
+with its reason, in the test described below: eleven deletes of the clone directory the same run has
+just made with `mktemp -d -t` (three after a successful copy, eight in a guard's own failure branch);
+nine single-file renames of a staged `mktemp` file onto its target, and `update.sh`'s rename of one
+finished backup dump; and the four calls of `migrate_uploads`, which checks its own `find … -exec mv`
+inside the function. The library operations are the helpers above, checked at run time.
+
+`tests/scripts/privileged-helper-set.test.ts` keeps all of this in place. It is a **fixed word list and
+a classifier over the shapes it can parse**; it is not a proof about what the scripts do.
+
+- The **census** tokenises the three entrypoints — quoting, `$( … )`, backticks, continuations,
+  here-documents fed to a shell, same-file functions (one-line ones included), the house pass-through
+  wrappers `run`, `capture` and `run_as_user`, and the payloads of `sudo`/`runuser`/`su` — splits each
+  line into its statements, and for each statement it classifies as tree-wide requires a table row
+  anchored to that whole statement: guarded, with the guard immediately before it and a refusal that
+  ends the run, or carrying a written reason. Nine review rounds each found a shape it could not parse.
+- A **lexical backstop** does not parse. Every statement in the three entrypoints and the five libraries
+  they source that spells a word on its list — `chown`, `chmod`, `chgrp`, `setfacl`, `rsync`, `rm`, `cp`
+  and any word ending in `cp`, `mv`, `install`, `tar` and any word ending in `tar`, `ln`, `find`,
+  `xargs`, `cpio`, `unzip`, `scp`, `useradd`, `usermod`, `chattr`, `chcon`, `rmtree`, `git` with
+  `clean`/`checkout`/`reset`/`restore`/`switch`/`-f`, `read-tree`, `stash`, the two tree-copying helpers,
+  and the house program `chown-tree` — must be wholly census rows or an entry in
+  `tests/scripts/privileged-word-allowlist.json` whose text matches exactly and whose count agrees.
+  Here-document bodies and strings are read; a `#` line is skipped only when it is a comment in code,
+  and never when it carries `$(` or a backtick.
+- The allowlist binds **text, not values or context**. Moving an allowlisted line, or changing a
+  variable it uses, does not fail it. That is why every entry that changes a tree (`code-owned-tree`,
+  `census-helper`) names the run-time guard that checks its path, and the test requires that guard to be
+  called before each occurrence.
+
+What this does **not** see: a privileged command whose name is computed at run time — assembled from
+variables (`c=ch; ${c}own`), an escape (`$'\x63hown'`), array elements (`"${CMD[0]}${CMD[1]}"`) or brace
+expansion (`r{m,m}`); a command that is not on the list (`dd`, a new tool, a new house program); code in
+a file these scripts read but do not ship (`/etc/os-release`); and a variable whose value changes so that
+an allowlisted line reaches another tree — which is exactly the case the helpers' run-time refusals, and
+the per-operation checks, exist to stop.
 
 `install.sh` **also** asks the same question of `${APP_DIR}`, the state directory and the log directory
 when the configuration is collected, and refuses `LOCAL_SOURCE_DIR` that is equal to, inside or
@@ -106,10 +132,10 @@ not exist yet, so all it can compare against is their nearest existing ancestor 
 `update.sh` and `deploy.sh` have no such early gate; `update.sh`'s copy into `${APP_DIR}`, its git
 metadata copy, its recursive chown and its backup pruner each carry the per-operation check, and
 `deploy.sh`'s own text makes no tree-wide ownership change, copy, move or delete: its census rows are
-single-file renames and its allowlist entries are single-inode, read-only or text. The tree-wide
+single-file renames and its allowlist entries are single-inode, read-only, text or comments. The tree-wide
 operations in the library code it calls are on directories that code creates itself — `mktemp -d`
 directories, and staging and publication directories under root-only directories — and each is an
-allowlist entry of class `code-owned-tree` with its reason.
+allowlist entry of class `code-owned-tree` naming the run-time guard that checks its path.
 
 ```bash
 # ...or, on a box you will later upgrade, with the release's digest, which publishes the

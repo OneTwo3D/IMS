@@ -6,6 +6,7 @@ import { test, type TestContext } from 'node:test'
 
 import { shellConstant, shellFunction } from './shell-symbol.ts'
 import { createTempDirSync } from './temp-dir.ts'
+import { protectedLibraryTextAt } from './fence-artefact-harness.ts'
 
 // ===========================================================================
 // o3d-kyqa / o3d-z5be / o3d-xf9m — WHAT A PRIVILEGED RUN MAY EXECUTE, AND WHAT IT MAY
@@ -2778,6 +2779,132 @@ function functionBody(text: string): string {
  *  `NAME {` is NOT one (it runs a command called NAME with an argument `{`), so it is not accepted. */
 const DEFINITION_HEAD = String.raw`\s*(?:function\s+([A-Za-z_][A-Za-z0-9_]*)\s*(?:\(\s*\))?|([A-Za-z_][A-Za-z0-9_]*)\s*\(\s*\))`
 
+/**
+ * WHICH LINES ARE COMMENTS — decided by LEXER STATE, not by the line's shape (o3d-z5be r11, review H1).
+ * r10 exempted every line whose first non-blank character is `#`. Inside a multi-line double-quoted
+ * string or an unquoted here-document body such a line is DATA, and a `$( … )` or a backtick on it
+ * EXECUTES: `msg="synced` / `#$(chown -R … "${DATA_DIR}")"` ran a chown on a line both layers skipped.
+ * So a line is a comment only if it starts in plain code (not inside a quote, a substitution, a
+ * backtick or a here-document body) with `#` as its first word. With `strict` — the BACKSTOP's mode —
+ * a line containing `$(` or a backtick is never exempt either, whatever the scanner concluded, so a
+ * mistake in this scanner cannot hide an executing line from the word check. (That costs one allowlist
+ * entry, class `comment`, per documentation comment that quotes a privileged command in backticks.)
+ * The census, which classifies code, uses the scanner's answer alone: a real comment is not code.
+ */
+function commentLines(source: string, strict = false): Set<number> {
+  const lines = source.split('\n')
+  const out = new Set<number>()
+  type Frame = { kind: 'code' | 'sub' | 'dq' | 'sq' | 'bt'; depth: number }
+  const stack: Frame[] = [{ kind: 'code', depth: 0 }]
+  let i = 0
+  while (i < lines.length) {
+    const line = lines[i]
+    const startsInCode = stack.length === 1
+    if (startsInCode && /^\s*#/.test(line)) {
+      if (!strict || !/\$\(|`/.test(line)) out.add(i + 1)
+      i += 1
+      continue
+    }
+    let j = 0
+    while (j < line.length) {
+      const top = stack[stack.length - 1]
+      const c = line[j]
+      if (top.kind === 'sq') { if (c === "'") stack.pop(); j += 1; continue }
+      if (top.kind === 'dq') {
+        if (c === '\\') { j += 2; continue }
+        if (c === '"') { stack.pop(); j += 1; continue }
+        if (c === '$' && line[j + 1] === '(') { stack.push({ kind: 'sub', depth: 0 }); j += 2; continue }
+        if (c === '`') { stack.push({ kind: 'bt', depth: 0 }); j += 1; continue }
+        j += 1; continue
+      }
+      if (top.kind === 'bt') {
+        if (c === '\\') { j += 2; continue }
+        if (c === '`') { stack.pop(); j += 1; continue }
+        if (c === "'") { stack.push({ kind: 'sq', depth: 0 }); j += 1; continue }
+        if (c === '"') { stack.push({ kind: 'dq', depth: 0 }); j += 1; continue }
+        j += 1; continue
+      }
+      if (c === '\\') { j += 2; continue }
+      if (c === '#' && (j === 0 || /[\s;&|(]/.test(line[j - 1]))) break
+      if (c === "'") { stack.push({ kind: 'sq', depth: 0 }); j += 1; continue }
+      if (c === '"') { stack.push({ kind: 'dq', depth: 0 }); j += 1; continue }
+      if (c === '`') { stack.push({ kind: 'bt', depth: 0 }); j += 1; continue }
+      if (c === '$' && line[j + 1] === '(') { stack.push({ kind: 'sub', depth: 0 }); j += 2; continue }
+      if (top.kind === 'sub') {
+        if (c === '(') { top.depth += 1; j += 1; continue }
+        if (c === ')') { if (top.depth === 0) stack.pop(); else top.depth -= 1; j += 1; continue }
+      }
+      j += 1
+    }
+    const documents = startsInCode && stack.length === 1 && !/\\$/.test(line) ? heredocDelimiters(line) : []
+    i += 1
+    // A HERE-DOCUMENT BODY IS NEVER A COMMENT, quoted delimiter or not: its lines are skipped here, so
+    // none of them can be added to the exempt set.
+    for (const doc of documents) {
+      const ends = (text: string) => (doc.strip ? text.replace(/^\t+/, '') : text) === doc.word
+      while (i < lines.length && !ends(lines[i])) i += 1
+      i += 1
+    }
+  }
+  return out
+}
+
+/**
+ * THE STATEMENTS OF ONE LOGICAL LINE, split at the operators that separate them — `;`, `;;`, `&&`,
+ * `||`, `|`, `&` — outside quotes, substitutions, backticks and `(( ))` (o3d-z5be r11, review H2). The
+ * census classifies, and the backstop credits, a STATEMENT and not a line: r10 credited
+ * `chown_state_tree "${DATA_DIR}" …; chown -R … /etc/…` wholly to the census row for its first half,
+ * whose guard checks ${DATA_DIR} and not the appended target. Each statement comes back trimmed, with
+ * leading grouping and keywords (`{` `(` `!` `if` `then` `do` `else` `elif` `while` `until` `time`) and
+ * trailing closers (`}` `)` `fi` `done` `esac`) removed, so a table row can be anchored at both ends.
+ */
+function statementsOf(line: string): string[] {
+  const out: string[] = []
+  let current = ''
+  const push = () => {
+    let text = current.trim()
+    let previous
+    do {
+      previous = text
+      text = text.replace(/^(?:\{|\(|!|then|do|else|elif|if|while|until|time)(?=\s|$)\s*/, '')
+        .replace(/\s*(?:\}|\)|fi|done|esac)$/, '').trim()
+    } while (text !== previous)
+    if (text) out.push(text)
+    current = ''
+  }
+  let i = 0
+  while (i < line.length) {
+    const c = line[i]
+    if (c === '\\') { current += c + (line[i + 1] ?? ''); i += 2; continue }
+    if (c === "'") {
+      const close = line.indexOf("'", i + 1)
+      const end = close === -1 ? line.length : close + 1
+      current += line.slice(i, end); i = end; continue
+    }
+    if (c === '"' || c === '`' || (c === '$' && line[i + 1] === '(') || ((c === '<' || c === '>') && line[i + 1] === '(')) {
+      const { next } = scanSpan(line, i)
+      current += line.slice(i, next); i = next; continue
+    }
+    if (c === '(' && line[i + 1] === '(') {
+      let depth = 0
+      const start = i
+      while (i < line.length) {
+        if (line[i] === '(') depth += 1
+        else if (line[i] === ')') { depth -= 1; if (depth === 0) { i += 1; break } }
+        i += 1
+      }
+      current += line.slice(start, i); continue
+    }
+    if (c === ';') { push(); i += line[i + 1] === ';' ? 2 : 1; continue }
+    if (c === '&' && (line[i - 1] === '>' || line[i + 1] === '>')) { current += c; i += 1; continue }
+    if (c === '|' && line[i - 1] === '>') { current += c; i += 1; continue }
+    if (c === '|' || c === '&') { push(); i += line[i + 1] === c ? 2 : 1; continue }
+    current += c; i += 1
+  }
+  push()
+  return out
+}
+
 /** Physical lines joined on backslash-continuations, keeping the number of the FIRST line (`n`) and the
  *  LAST (`last`): a matcher that reads one physical line at a time cannot see `chown \` + `  -R …`
  *  (review MEDIUM 1). A HERE-DOCUMENT BODY is skipped when it is data (r9, LOW 7) and READ AS CODE when
@@ -2785,8 +2912,9 @@ const DEFINITION_HEAD = String.raw`\s*(?:function\s+([A-Za-z_][A-Za-z0-9_]*)\s*(
 function logicalLines(source: string): Array<{ n: number; last: number; text: string }> {
   const out: Array<{ n: number; last: number; text: string }> = []
   const lines = source.split('\n')
+  const comments = commentLines(source)
   for (let i = 0; i < lines.length; i += 1) {
-    if (/^\s*#/.test(lines[i]) || lines[i].trim() === '') continue
+    if (comments.has(i + 1) || lines[i].trim() === '') continue
     let text = lines[i]
     const n = i + 1
     while (/\\$/.test(text) && i + 1 < lines.length) {
@@ -2904,13 +3032,23 @@ function treeWideFunctions(source: string, wrappers: ReadonlyMap<string, Wrapper
  * `$'\x63hown'`, `printf -v c '%s' ch; ${c}own`), or written in another file (`. /etc/os-release`).
  */
 const BACKSTOP_WORDS = ['chown', 'chgrp', 'chmod', 'setfacl', 'rsync', 'rm', 'cp', 'mv', 'install', 'tar', 'ln', 'find',
-  'xargs', 'cpio', 'unzip', 'useradd', 'usermod', 'chown_state_tree', 'copy_tree_into_new_dir']
+  'xargs', 'cpio', 'unzip', 'useradd', 'usermod', 'chown_state_tree', 'copy_tree_into_new_dir',
+  // r11 (review M1): the gaps the reviewer measured green. `[A-Za-z]*tar` and `[A-Za-z]*cp` catch the
+  // prefixed forms (`bsdtar`, `gtar`, `scp`, `rcp`); measured, the cp prefix adds only `tcp` (3 lines).
+  'scp', 'read-tree', 'stash', 'chattr', 'chcon', '[A-Za-z]+tar', '[A-Za-z]+cp']
 const BACKSTOP_WORD = new RegExp(`(?<![A-Za-z0-9_.])(${BACKSTOP_WORDS.join('|')})(?![A-Za-z0-9_.-])`, 'g')
+/** THE HOUSE'S OWN TREE-CHANGING PROGRAMS (r11, review H4), matched with a right boundary that lets
+ *  `.` and `-` through, because they are named as files: `chown-tree.mjs`. The test below enumerates
+ *  every program in scripts/lib that calls a filesystem-changing API and requires it to be listed. */
+const BACKSTOP_HELPERS = ['chown-tree']
+/** Library calls, which follow a `.`: `shutil.rmtree`, `os.chown`, `fs.rmSync`. */
+const BACKSTOP_CALL = /(?<![A-Za-z0-9_])(rmtree|rmSync|cpSync|chownSync|lchownSync|renameSync)(?![A-Za-z0-9_])/g
+const BACKSTOP_HELPER = new RegExp(`(?<![A-Za-z0-9_.])(${BACKSTOP_HELPERS.join('|')})(?![A-Za-z0-9_])`, 'g')
 const BACKSTOP_GIT = /(?<![A-Za-z0-9_.-])git(?![A-Za-z0-9_.-])/
 const BACKSTOP_GIT_WRITE = /(?<![A-Za-z0-9_.-])(clean|checkout|reset|restore|switch)(?![A-Za-z0-9_.-])|(?<![A-Za-z0-9_-])(-f|--force)(?![A-Za-z0-9_-])/
 function privilegedWords(line: string): string[] {
   const bare = line.replace(/[\\'"]/g, '')
-  const found = new Set([...bare.matchAll(BACKSTOP_WORD)].map((m) => m[1]))
+  const found = new Set([...bare.matchAll(BACKSTOP_WORD), ...bare.matchAll(BACKSTOP_HELPER), ...bare.matchAll(BACKSTOP_CALL)].map((m) => m[1]))
   if (BACKSTOP_GIT.test(bare) && BACKSTOP_GIT_WRITE.test(bare)) found.add('git')
   return [...found].sort()
 }
@@ -2919,17 +3057,23 @@ function privilegedWords(line: string): string[] {
  *  action added on a continuation line changes the key and fails the allowlist. The group is also read
  *  joined WITHOUT a space, so `ch\` + `own` is seen. Keyed by the exact text: each physical line trimmed,
  *  joined with a newline. `#`-first lines are exempt; nothing else is (heredoc bodies and strings are in). */
-function backstopHits(source: string): Array<{ n: number; last: number; line: string; words: string[] }> {
+function backstopHits(source: string): Array<{ n: number; last: number; line: string; text: string; words: string[] }> {
   const lines = source.split('\n')
-  const hits: Array<{ n: number; last: number; line: string; words: string[] }> = []
+  const comments = commentLines(source, true)
+  const hits: Array<{ n: number; last: number; line: string; text: string; words: string[] }> = []
   for (let i = 0; i < lines.length; i += 1) {
-    if (/^\s*#/.test(lines[i])) continue
+    if (comments.has(i + 1)) continue
     let j = i
     while (/\\$/.test(lines[j]) && j + 1 < lines.length) j += 1
     const group = lines.slice(i, j + 1)
     const words = new Set(group.flatMap((l) => privilegedWords(l)))
     if (j > i) for (const w of privilegedWords(group.map((l) => l.replace(/\\$/, '')).join(''))) words.add(w)
-    if (words.size) hits.push({ n: i + 1, last: j + 1, line: group.map((l) => l.trim()).join('\n'), words: [...words].sort() })
+    if (words.size) {
+      // `text` is the group joined exactly as logicalLines() joins it, so its statements are the
+      // census's statements, character for character.
+      const text = group.map((l, k) => (k < group.length - 1 ? l.replace(/\\$/, ' ') : l)).join('')
+      hits.push({ n: i + 1, last: j + 1, line: group.map((l) => l.trim()).join('\n'), text, words: [...words].sort() })
+    }
     i = j
   }
   return hits
@@ -2939,8 +3083,9 @@ function backstopHits(source: string): Array<{ n: number; last: number; line: st
  *  DEFINITION LINE IS NOT SKIPPED, only a bare definition head is (review r9 HIGH 1). */
 function censusOps(source: string) {
   const { functions, aliases, wrappers } = censusContext(source)
-  return logicalLines(source).map((line, index) => ({ ...line, index }))
-    .filter((line) => shellCommands(functionBody(line.text)).some((words) => treeWide(words, functions, aliases, wrappers)))
+  return logicalLines(source).flatMap((line, index) => statementsOf(line.text)
+    .filter((statement) => shellCommands(functionBody(statement)).some((words) => treeWide(words, functions, aliases, wrappers)))
+    .map((statement) => ({ n: line.n, last: line.last, line: line.text, text: statement, index })))
 }
 
 test('[o3d-z5be] CENSUS: the tree-wide statements its tokeniser can classify are each accounted for, guarded, and end the run on refusal', () => {
@@ -2950,8 +3095,11 @@ test('[o3d-z5be] CENSUS: the tree-wide statements its tokeniser can classify are
   // statement it classifies until somebody decides which row it is. It is not complete — nine review
   // rounds each found a shape it could not parse, the ninth being this codebase's own `run chown -R …` —
   // which is why the backstop, and not this, answers "is anything spelled out that nobody accounted for".
-  // What neither sees is a privileged command whose name is computed at run time or lives outside these
-  // files.
+  // THREAT MODEL (r11): this and the backstop guard against an EDITOR'S MISTAKE. They are a fixed word
+  // list and a classifier over parseable shapes; they bind text, not variable values or context. What
+  // they do not see — a name computed at run time or brace-built, a command not on the list, code outside
+  // these files, a changed value reaching an allowlisted line — is what the RUN-TIME GUARDS tests below
+  // exist for: the helpers refuse, when they run, a path that is not theirs.
   //
   // KNOWN GAPS OF THIS CLASSIFIER, LEFT TO THE BACKSTOP (review of c60997d8, L5/L6): a function whose name
   // has `-`, `:` or non-ASCII characters, or whose body is `( … )`, is read at its definition but calls to
@@ -2962,7 +3110,14 @@ test('[o3d-z5be] CENSUS: the tree-wide statements its tokeniser can classify are
   // r7's version STRIPPED double-quoted spans before matching, with a regex that is not nesting-aware:
   // on `out="$(chown -R … )"` the opening quote paired with the first quote inside the substitution and
   // the command name went with it. That idiom appears throughout these files. It tokenises now.
-  type Entry = { file: string; op: RegExp; guard: string | null; up?: number; why?: string }
+  type Entry = { file: string; op: RegExp; line?: RegExp; guard: string | null; up?: number; why?: string }
+  const PUB = /^mv -f (?:-T )?"\$\{?tmp\}?" "(?:\/proc\/self\/fd\/\$\{dest\}\/\$\{base\}|\$target|\$\{?CRON_BACKUP\}?)" 2>\/dev\/null$/
+  const CLONE_RM = /^rm -rf "\$\{TMP_CLONE_DIR\}"$/
+  const GUARD_CLEANUP_LINE = /^\s*privileged_spare_running_tree "[^"]+" "[^"]+" \|\| \{ rm -rf "\$\{TMP_CLONE_DIR\}"; die "\$\{IMS_DRIVER_OVERLAP_REASON\}"; \}$/
+  const MKTEMP_LINE = /^\s*rm -rf "\$\{TMP_CLONE_DIR\}"$/
+  const RSYNC_CLONE = /^rsync -a --delete(?:\s+--exclude='[^']+')+\s+"\$\{TMP_CLONE_WORKTREE%\/\}\/" "\$\{APP_DIR\}\/"$/
+  const COPY_GIT = /^copy_tree_into_new_dir "\$\{TMP_CLONE_WORKTREE\}\/\.git" "\$\{APP_DIR\}\/\.git"$/
+  const CHOWN_APP = /^chown -R "\$\{APP_USER\}:\$\{APP_USER\}" "\$\{APP_DIR\}"$/
   const G = (target: string) => `privileged_spare_running_tree "${target}" `
   // `mktemp -d -t` honours TMPDIR, which the operator controls, so this says what is true: the run made
   // the directory itself, after its own entrypoint was already open (review LOW 11).
@@ -2971,32 +3126,36 @@ test('[o3d-z5be] CENSUS: the tree-wide statements its tokeniser can classify are
   const PUBLISH = 'publish_durable_file/crontab backup: a rename of ONE staged file onto ONE target, not a tree'
   const HELPER = 'migrate_uploads guards its own `find … -exec mv` immediately before it (install.sh)'
   const table: Entry[] = [
-    ...Array.from({ length: 3 }, () => ({ file: 'scripts/install.sh', op: /^\s*if ! mv -f (?:-T )?"\$\{?tmp\}?" /, guard: null, why: PUBLISH })),
-    { file: 'scripts/install.sh', op: /^  useradd --system/, guard: G('${APP_DIR}') },
-    { file: 'scripts/install.sh', op: /^    find "\$\{src\}" -mindepth 1/, guard: G('${src}'), up: 2 },
-    ...Array.from({ length: 4 }, () => ({ file: 'scripts/install.sh', op: /^migrate_uploads "/, guard: null, why: HELPER })),
-    { file: 'scripts/install.sh', op: /^chown_state_tree "\$\{DATA_DIR\}"/, guard: G('${DATA_DIR}') },
-    { file: 'scripts/install.sh', op: /^  chown -Rh "\$\{APP_USER\}:\$\{APP_USER\}" \./, guard: G('${LOG_DIR}'), up: 3 },
-    ...Array.from({ length: 5 }, () => ({ file: 'scripts/install.sh', op: /^\s*privileged_spare_running_tree .*\|\| \{ rm -rf "\$\{TMP_CLONE_DIR\}"/, guard: null, why: CLEANUP })),
-    { file: 'scripts/install.sh', op: /^    rsync -a --delete/, guard: G('${APP_DIR}') },
-    { file: 'scripts/install.sh', op: /^    copy_tree_into_new_dir "\$\{TMP_CLONE_WORKTREE\}\/\.git"/, guard: G('${APP_DIR}/.git') },
-    { file: 'scripts/install.sh', op: /^    chown -R "\$\{APP_USER\}:\$\{APP_USER\}" "\$\{APP_DIR\}"$/, guard: G('${APP_DIR}') },
-    { file: 'scripts/install.sh', op: /^    rm -rf "\$\{TMP_CLONE_DIR\}"$/, guard: null, why: MKTEMP },
-    { file: 'scripts/install.sh', op: /^  rsync -a --delete/, guard: G('${APP_DIR}') },
-    { file: 'scripts/install.sh', op: /^  chown -R "\$\{APP_USER\}:\$\{APP_USER\}" "\$\{APP_DIR\}"$/, guard: G('${APP_DIR}') },
-    { file: 'scripts/install.sh', op: /^    copy_tree_into_new_dir "\$\{TMP_CLONE_WORKTREE\}\/\.git"/, guard: G('${APP_DIR}/.git') },
-    { file: 'scripts/install.sh', op: /^    chown -R "\$\{APP_USER\}:\$\{APP_USER\}" "\$\{APP_DIR\}\/\.git"$/, guard: G('${APP_DIR}/.git') },
-    { file: 'scripts/install.sh', op: /^    rm -rf "\$\{TMP_CLONE_DIR\}"$/, guard: null, why: MKTEMP },
-    ...Array.from({ length: 3 }, () => ({ file: 'scripts/update.sh', op: /^\s*if ! mv -f (?:-T )?"\$\{?tmp\}?" /, guard: null, why: PUBLISH })),
-    ...Array.from({ length: 3 }, () => ({ file: 'scripts/update.sh', op: /^\s*privileged_spare_running_tree .*\|\| \{ rm -rf "\$\{TMP_CLONE_DIR\}"/, guard: null, why: CLEANUP })),
-    { file: 'scripts/update.sh', op: /^    rsync -a --delete/, guard: G('${APP_DIR}') },
-    { file: 'scripts/update.sh', op: /^    copy_tree_into_new_dir "\$\{TMP_CLONE_WORKTREE\}\/\.git"/, guard: G('${APP_DIR}/.git') },
-    { file: 'scripts/update.sh', op: /^    chown -R "\$\{APP_USER\}:\$\{APP_USER\}" "\$\{APP_DIR\}"$/, guard: G('${APP_DIR}') },
-    { file: 'scripts/update.sh', op: /^    rm -rf "\$\{TMP_CLONE_DIR\}"$/, guard: null, why: MKTEMP },
-    { file: 'scripts/update.sh', op: /^  mv "\$\{BACKUP_PARTIAL\}" "\$\{BACKUP_TARGET\}"$/, guard: null, why: 'one finished dump file renamed onto its final name, not a tree' },
-    { file: 'scripts/update.sh', op: /^  ls -t "\$\{BACKUP_DIR\}"\/pre-update-\*\.sql\.gz .*xargs -r rm --$/, guard: G('${BACKUP_DIR}') },
-    ...Array.from({ length: 3 }, () => ({ file: 'scripts/deploy.sh', op: /^\s*if ! mv -f (?:-T )?"\$\{?tmp\}?" /, guard: null, why: PUBLISH })),
+    // EVERY ROW IS ANCHORED AT BOTH ENDS OF ONE STATEMENT (r11, review H2): `chown_state_tree … ; chown -R
+    // … /etc/x` is two statements now, and the second has no row. `line` pins the logical line where the
+    // same statement means two different things (a guard's own cleanup vs the delete after a copy).
+    ...Array.from({ length: 3 }, () => ({ file: 'scripts/install.sh', op: PUB, guard: null, why: PUBLISH })),
+    { file: 'scripts/install.sh', op: /^useradd --system --shell \/bin\/bash --home-dir "\$\{APP_DIR\}" --create-home "\$\{APP_USER\}"$/, guard: G('${APP_DIR}') },
+    { file: 'scripts/install.sh', op: /^find "\$\{src\}" -mindepth 1 -maxdepth 1 -exec mv -n -t \. \{\} \+$/, guard: G('${src}'), up: 2 },
+    ...Array.from({ length: 4 }, () => ({ file: 'scripts/install.sh', op: /^migrate_uploads "\$\{APP_DIR\}\/[a-z/]+" "\$\{(?:PUBLIC_)?UPLOAD_STORAGE_DIR\}\/[a-z/]+"$/, guard: null, why: HELPER })),
+    { file: 'scripts/install.sh', op: /^chown_state_tree "\$\{DATA_DIR\}" "\$\{APP_USER\}" "\$\{CRONTAB_LOCK_DIRNAME\}" "the state directory"$/, guard: G('${DATA_DIR}') },
+    { file: 'scripts/install.sh', op: /^chown -Rh "\$\{APP_USER\}:\$\{APP_USER\}" \.$/, guard: G('${LOG_DIR}'), up: 3 },
+    ...Array.from({ length: 5 }, () => ({ file: 'scripts/install.sh', op: CLONE_RM, line: GUARD_CLEANUP_LINE, guard: null, why: CLEANUP })),
+    { file: 'scripts/install.sh', op: RSYNC_CLONE, guard: G('${APP_DIR}') },
+    { file: 'scripts/install.sh', op: COPY_GIT, guard: G('${APP_DIR}/.git') },
+    { file: 'scripts/install.sh', op: CHOWN_APP, guard: G('${APP_DIR}') },
+    { file: 'scripts/install.sh', op: CLONE_RM, line: MKTEMP_LINE, guard: null, why: MKTEMP },
+    { file: 'scripts/install.sh', op: /^rsync -a --delete(?:\s+--exclude='[^']+')+\s+"\$\{LOCAL_SOURCE_DIR%\/\}\/" "\$\{APP_DIR\}\/"$/, guard: G('${APP_DIR}') },
+    { file: 'scripts/install.sh', op: CHOWN_APP, guard: G('${APP_DIR}') },
+    { file: 'scripts/install.sh', op: COPY_GIT, guard: G('${APP_DIR}/.git') },
+    { file: 'scripts/install.sh', op: /^chown -R "\$\{APP_USER\}:\$\{APP_USER\}" "\$\{APP_DIR\}\/\.git"$/, guard: G('${APP_DIR}/.git') },
+    { file: 'scripts/install.sh', op: CLONE_RM, line: MKTEMP_LINE, guard: null, why: MKTEMP },
+    ...Array.from({ length: 3 }, () => ({ file: 'scripts/update.sh', op: PUB, guard: null, why: PUBLISH })),
+    ...Array.from({ length: 3 }, () => ({ file: 'scripts/update.sh', op: CLONE_RM, line: GUARD_CLEANUP_LINE, guard: null, why: CLEANUP })),
+    { file: 'scripts/update.sh', op: RSYNC_CLONE, guard: G('${APP_DIR}') },
+    { file: 'scripts/update.sh', op: COPY_GIT, guard: G('${APP_DIR}/.git') },
+    { file: 'scripts/update.sh', op: CHOWN_APP, guard: G('${APP_DIR}') },
+    { file: 'scripts/update.sh', op: CLONE_RM, line: MKTEMP_LINE, guard: null, why: MKTEMP },
+    { file: 'scripts/update.sh', op: /^mv "\$\{BACKUP_PARTIAL\}" "\$\{BACKUP_TARGET\}"$/, guard: null, why: 'one finished dump file renamed onto its final name, not a tree' },
+    { file: 'scripts/update.sh', op: /^xargs -r rm --$/, line: /^\s*ls -t "\$\{BACKUP_DIR\}"\/pre-update-\*\.sql\.gz 2>\/dev\/null \| tail -n \+11 \| xargs -r rm --$/, guard: G('${BACKUP_DIR}') },
+    ...Array.from({ length: 3 }, () => ({ file: 'scripts/deploy.sh', op: PUB, guard: null, why: PUBLISH })),
   ]
+
   for (const rel of ENTRYPOINTS) {
     const source = ENTRYPOINT_SOURCE.get(rel)!
     const lines = logicalLines(source)
@@ -3006,7 +3165,7 @@ test('[o3d-z5be] CENSUS: the tree-wide statements its tokeniser can classify are
       `${rel}: the census must account for every classified statement, found ${ops.length} and the table has ${expected.length}:\n${ops.map((op) => `${op.n}: ${op.text.trim().slice(0, 110)}`).join('\n')}`)
     const used = new Set<number>()
     for (const op of ops) {
-      const entryIndex = expected.findIndex((entry, i) => !used.has(i) && entry.op.test(op.text))
+      const entryIndex = expected.findIndex((entry, i) => !used.has(i) && entry.op.test(op.text) && (!entry.line || entry.line.test(op.line)))
       assert.notEqual(entryIndex, -1, `${rel}:${op.n}: a tree-wide statement the census does not know: ${op.text.trim().slice(0, 140)}`)
       used.add(entryIndex)
       const entry = expected[entryIndex]
@@ -3047,25 +3206,39 @@ test('[o3d-z5be] CENSUS: the tree-wide statements its tokeniser can classify are
     }
   }
 
-  // AND `die` ITSELF ENDS THE RUN (r10, review L1). refusalEndsRun() accepts `|| die "…"` on the
-  // strength of the NAME; redefining `die() { error "$*"; }` kept this test green while every refusal
-  // continued. So each entrypoint must define `die` exactly once — nowhere in the libraries it sources,
-  // with no line starting `unset -f die` or `alias die=` — before its first guard, with a body whose last
-  // command is `exit` non-zero.
+  // AND `die` ITSELF ENDS THE RUN (r10/r11, review L1). refusalEndsRun() accepts `|| die "…"` on the
+  // strength of the NAME, so each entrypoint must define `die` exactly once — in itself, before its
+  // first guard, with a body whose last command is a non-zero `exit` — and NOTHING in it or its
+  // libraries may undo that: no definition, anywhere in a statement, of `die` again or of a builtin
+  // that `die` (or a guard) depends on (`exit() { return 0; }` made die return and the run continue),
+  // and no `unset … die` or `alias die=` anywhere in a statement (r10's check was anchored at line start).
+  const SHADOWED = new Set(['exit', 'return', 'builtin', 'command', 'set', 'trap', 'source', '.', 'die', 'unset', 'alias', 'eval'])
+  const definedIn = (text: string) => logicalLines(text).flatMap((line) => statementsOf(line.text).flatMap((statement) => {
+    const m = /^(?:function\s+([A-Za-z_][A-Za-z0-9_]*|\.)\s*(?:\(\s*\))?|([A-Za-z_][A-Za-z0-9_]*|\.)\s*\(\s*\))/.exec(statement)
+    return m ? [{ name: m[1] ?? m[2], n: line.n, text: line.text }] : []
+  }))
   for (const rel of ENTRYPOINTS) {
     const source = ENTRYPOINT_SOURCE.get(rel)!
     const texts: Array<[string, string]> = [[rel, source], ...SOURCED_LIBS.map((lib) => [lib, readFileSync(join(REPO, lib), 'utf8')] as [string, string])]
-    const definitions = texts.flatMap(([where, text]) => logicalLines(text)
-      .filter((line) => new RegExp(`^${DEFINITION_HEAD}`).exec(line.text)?.slice(1, 3).includes('die'))
-      .map((line) => ({ where, ...line })))
+    const all = texts.flatMap(([where, text]) => definedIn(text).map((d) => ({ where, ...d })))
+    assert.ok(all.length > 50, `precondition: ${all.length} function definitions were read`)
+    const definitions = all.filter((d) => d.name === 'die')
     assert.equal(definitions.length, 1, `${rel}: die must be defined exactly once across the entrypoint and its libraries: ${definitions.map((d) => `${d.where}:${d.n}`).join(', ')}`)
     assert.equal(definitions[0].where, rel, `${rel}: and in the entrypoint itself`)
+    const shadows = all.filter((d) => SHADOWED.has(d.name) && d.name !== 'die')
+    assert.deepEqual(shadows.map((d) => `${d.where}:${d.n} ${d.name}`), [], `${rel}: nothing may redefine a builtin die or a guard depends on`)
     const body = /\{(.*)\}\s*$/.exec(definitions[0].text)?.[1] ?? ''
     const commands = shellCommands(body)
     const last = commands[commands.length - 1] ?? []
     assert.ok(last[0] === 'exit' && /^[1-9][0-9]*$/.test(last[1] ?? ''), `${rel}:${definitions[0].n}: die's last command must be a non-zero exit: ${definitions[0].text.trim()}`)
     for (const [where, text] of texts) {
-      assert.ok(!/^\s*(unset\s+-f\s+die|alias\s+die=)/m.test(text), `${where}: must not unset or alias die`)
+      for (const line of logicalLines(text)) {
+        for (const words of shellCommands(line.text)) {
+          const { name, args } = commandName(words)
+          assert.ok(!(name === 'unset' && args.includes('die')), `${where}:${line.n}: must not unset die: ${line.text.trim()}`)
+          assert.ok(!(name === 'alias' && args.some((a) => /^(die|exit)=/.test(a))), `${where}:${line.n}: must not alias die or exit: ${line.text.trim()}`)
+        }
+      }
     }
     const firstGuard = logicalLines(source).find((line) => /^\s*privileged_spare_running_tree /.test(line.text))
     if (firstGuard) assert.ok(definitions[0].n < firstGuard.n, `${rel}: die must be defined before the first guard`)
@@ -3179,7 +3352,7 @@ test('[o3d-z5be] CENSUS: the tree-wide statements its tokeniser can classify are
     'if ! run rsync -a "${SRC}/" "${APP_DIR}/"; then die x; fi',
   ]) {
     const rows = censusOps(`${wrapperFile}\n${call}\n`)
-    assert.deepEqual(rows.map((row) => row.text), [call], `the census must read the wrapper call: ${call}`)
+    assert.deepEqual(rows.map((row) => row.line), [call], `the census must read the wrapper call: ${call}`)
   }
   for (const quiet of ['run npm ci', 'capture out git rev-parse HEAD', 'run_as_user imsapp npm ci', 'run rm -f "$tmp"']) {
     assert.deepEqual(censusOps(`${wrapperFile}\n${quiet}\n`).map((row) => row.text), [], `and must stay quiet on: ${quiet}`)
@@ -3269,23 +3442,264 @@ test('[o3d-z5be] CENSUS: the tree-wide statements its tokeniser can classify are
   ]) assert.ok(!refusalEndsRun(continues), `this refusal does NOT end the run: ${continues}`)
 })
 
-type AllowEntry = { file: string; line: string; count: number; class: string; reason: string }
+// ---------------------------------------------------------------------------
+// RUN-TIME GUARDS (o3d-z5be r11, review H3/H4/M2). The static net reads text; it cannot bind which
+// path a helper is handed, or what a readonly name holds. These tests EXECUTE the shipped helpers with
+// the paths an accident — or a retargeted constant — would hand them, and require each refusal to END
+// the run (non-zero status, and the statement after it never runs) with the target untouched, while a
+// legitimate path proceeds. Nothing here runs install.sh, update.sh or deploy.sh; the functions are the
+// shipped text, sourced or lifted.
+// ---------------------------------------------------------------------------
+
+/** A directory standing in for ${APP_DIR}, with one file whose survival is the assertion. */
+function appTree(t: TestContext): { app: string; victim: string } {
+  const app = join(createTempDirSync('runtime-guard-app-', t), 'app')
+  mkdirSync(app)
+  const victim = join(app, 'keep.txt')
+  writeFileSync(victim, 'the application tree\n')
+  return { app, victim }
+}
+
+function assertRefusedAndEnded(out: Run, what: string, victim?: string): void {
+  assert.notEqual(out.status, 0, `${what}: the refusal must end the run with a non-zero status:\n${out.stdout}${out.stderr}`)
+  assert.doesNotMatch(out.stdout, /^AFTER$/m, `${what}: nothing after the refusal may run:\n${out.stdout}`)
+  assert.match(out.stderr, /REFUSING/, `${what}: and it must say why:\n${out.stderr}`)
+  if (victim) assert.equal(readFileSync(victim, 'utf8'), 'the application tree\n', `${what}: the target must be untouched`)
+}
+
+test('[o3d-z5be] RUN-TIME GUARD driver_require_owned_path: driver_publish_unwind refuses, and ENDS the run on, any path outside IMS_DRIVER_ROOT', (t) => {
+  const dirs = scratch(t)
+  const { app, victim } = appTree(t)
+  const root = dirs.root
+  symlinkSync(app, join(root, 'link-into-app'))
+  const tail = `"${root}/.pointer-x" "${root}/.retire-x" "${root}/helpers" 0`
+  for (const [label, first] of [
+    ['${APP_DIR}', app],
+    ['/', '/'],
+    ['a symlink under the root that points into ${APP_DIR}', `${root}/link-into-app`],
+    ['a `..` escape', `${root}/../escape`],
+    ['a relative path', 'relative/x'],
+  ] as const) {
+    const out = run(dirs, `driver_publish_unwind ${JSON.stringify(first)} ${tail}\necho AFTER`)
+    assertRefusedAndEnded(out, `driver_publish_unwind with ${label}`, victim)
+  }
+  // EVERY argument is checked, not only the first: the target, the retire and the pointer too.
+  for (const args of [
+    `"${root}/.version-x" "${root}/.pointer-x" "${root}/.retire-x" ${JSON.stringify(app)} 1`,
+    `"${root}/.version-x" "${root}/.pointer-x" ${JSON.stringify(app)} "${root}/helpers" 0`,
+    `"${root}/.version-x" ${JSON.stringify(app)} "${root}/.retire-x" "${root}/helpers" 0`,
+  ]) {
+    assertRefusedAndEnded(run(dirs, `driver_publish_unwind ${args}\necho AFTER`), `driver_publish_unwind ${args}`, victim)
+  }
+  // AND A LEGITIMATE CALL PROCEEDS: the version directory it names is removed, and the run continues.
+  mkdirSync(join(root, '.version-x'))
+  writeFileSync(join(root, '.version-x', 'f'), 'x\n')
+  const ok = run(dirs, `driver_publish_unwind "${root}/.version-x" ${tail}\necho AFTER`)
+  assert.equal(ok.status, 0, `a path under the root must be accepted:\n${ok.stdout}${ok.stderr}`)
+  assert.match(ok.stdout, /^AFTER$/m)
+  assert.equal(existsSync(join(root, '.version-x')), false, 'and the unwind must have done its work')
+})
+
+/** The shipped fence library, its recovery root aimed at `recovery` (and, optionally, one more line
+ *  replaced), sourced, then `program`. */
+function withFenceLibrary(t: TestContext, recovery: string, program: string, replace?: [string, string]): Run {
+  let text = protectedLibraryTextAt(recovery)
+  if (replace) {
+    assert.equal(text.split(replace[0]).length, 2, `the fence library must contain exactly one ${replace[0]}`)
+    text = text.replace(replace[0], replace[1])
+  }
+  const work = createTempDirSync('runtime-guard-fence-', t)
+  const lib = join(work, 'db-fence-protected.sh')
+  writeFileSync(lib, text)
+  const out = spawnSync('bash', ['-c', ['set -uo pipefail', `source ${JSON.stringify(lib)}`, program].join('\n')], { encoding: 'utf8' })
+  return { status: out.status ?? -1, stdout: out.stdout ?? '', stderr: out.stderr ?? '' }
+}
+
+test('[o3d-z5be] RUN-TIME GUARD _fence_require_owned_tree: the fence copies into, and deletes, nothing outside its recovery root — even with a readonly re-aimed', (t) => {
+  const recovery = join(createTempDirSync('runtime-guard-recovery-', t), 'recovery')
+  mkdirSync(recovery)
+  const { app, victim } = appTree(t)
+  symlinkSync(app, join(recovery, 'link-into-app'))
+  for (const [label, dest] of [
+    ['${APP_DIR}', app],
+    ['/', '/'],
+    ['a symlink under the recovery root that points into ${APP_DIR}', join(recovery, 'link-into-app')],
+    ['a `..` escape', `${recovery}/../escape`],
+    ['the recovery root itself', recovery],
+  ] as const) {
+    const out = withFenceLibrary(t, recovery, `_fence_vendor_into ${JSON.stringify(app)} ${JSON.stringify(dest)}\necho AFTER`)
+    assertRefusedAndEnded(out, `_fence_vendor_into into ${label}`, victim)
+  }
+  // A LEGITIMATE DESTINATION PASSES THE GUARD: the function reaches its own `mkdir -p` of it.
+  const staged = join(recovery, '.app.staged')
+  const ok = withFenceLibrary(t, recovery, `_fence_vendor_into ${JSON.stringify(app)} ${JSON.stringify(staged)}; echo "RC=$?"\necho AFTER`)
+  assert.doesNotMatch(ok.stderr, /REFUSING/, `a destination under the recovery root must not be refused:\n${ok.stderr}`)
+  assert.match(ok.stdout, /^AFTER$/m)
+  assert.equal(existsSync(staged), true, 'and the function must have proceeded to create it')
+
+  // REVIEW M2: re-aiming a readonly needs no line that spells a privileged word. With the staging name
+  // pointed at ${APP_DIR}, _fence_stage_and_publish must refuse before its `rm -rf` of it.
+  const retargeted = withFenceLibrary(t, recovery, '_fence_stage_and_publish\necho AFTER',
+    ['readonly DB_FENCE_STAGED_APP_DIR="${DB_FENCE_RECOVERY_DIR}/.app.staged"', `readonly DB_FENCE_STAGED_APP_DIR=${JSON.stringify(app)}`])
+  assertRefusedAndEnded(retargeted, 'a staging name re-aimed at ${APP_DIR}', victim)
+
+  // THE PROBE DIRECTORY: the one `mktemp -d` directory it may use outside the root, and only while it
+  // is a real directory — a recorded name replaced by a symlink is refused.
+  const probe = createTempDirSync('runtime-guard-probe-', t)
+  const probeOk = withFenceLibrary(t, recovery, `_FENCE_OWNED_TMP=${JSON.stringify(probe)}\n_fence_require_owned_tree ${JSON.stringify(join(probe, 'scripts'))} probe\necho AFTER`)
+  assert.equal(probeOk.status, 0, probeOk.stderr)
+  assert.match(probeOk.stdout, /^AFTER$/m)
+  const linked = join(createTempDirSync('runtime-guard-probe-link-', t), 'probe')
+  symlinkSync(app, linked)
+  assertRefusedAndEnded(withFenceLibrary(t, recovery, `_FENCE_OWNED_TMP=${JSON.stringify(linked)}\n_fence_require_owned_tree ${JSON.stringify(linked)} probe\necho AFTER`),
+    'a recorded probe name that is a symlink into ${APP_DIR}', victim)
+})
+
+test('[o3d-z5be] RUN-TIME GUARD in copy_tree_into_new_dir: it refuses, and ends the run on, a destination that overlaps the running tree', (t) => {
+  const base = createTempDirSync('runtime-guard-copy-', t)
+  const release = join(base, 'release')
+  const runningLib = join(release, 'scripts', 'lib')
+  mkdirSync(runningLib, { recursive: true })
+  writeFileSync(join(release, 'scripts', 'install.sh'), '# the running entrypoint\n')
+  const src = join(base, 'clone', '.git')
+  mkdirSync(src, { recursive: true })
+  writeFileSync(join(src, 'HEAD'), 'ref: refs/heads/main\n')
+  const program = (dest: string) => [
+    'die() { echo "DIE: $*" >&2; exit 1; }',
+    `source ${JSON.stringify(join(REPO, 'scripts/lib/cutover-namespace.sh'))}`,
+    `copy_tree_into_new_dir ${JSON.stringify(src)} ${JSON.stringify(dest)}`,
+    'echo AFTER',
+  ].join('\n')
+  for (const [label, dest] of [['the release that holds the running tree', release], ['the running lib itself', runningLib], ['/', '/']] as const) {
+    const out = withGuardLibrary(runningLib, program(dest))
+    assert.notEqual(out.status, 0, `${label}: must end the run:\n${out.stdout}${out.stderr}`)
+    assert.doesNotMatch(out.stdout, /^AFTER$/m, `${label}: nothing after the refusal may run`)
+    assert.equal(existsSync(join(release, 'scripts', 'install.sh')), true, `${label}: the running tree must be untouched`)
+  }
+  const dest = join(base, 'app', '.git')
+  mkdirSync(join(base, 'app'))
+  const ok = withGuardLibrary(runningLib, program(dest))
+  assert.equal(ok.status, 0, `a separate destination must be accepted:\n${ok.stdout}${ok.stderr}`)
+  assert.equal(readFileSync(join(dest, 'HEAD'), 'utf8'), 'ref: refs/heads/main\n', 'and the copy must have happened')
+})
+
+test('[o3d-z5be] RUN-TIME GUARD in chown_state_tree: it re-owns ${DATA_DIR} and nothing else, and never a tree overlapping the running one', (t) => {
+  const base = createTempDirSync('runtime-guard-state-', t)
+  const release = join(base, 'release')
+  const runningLib = join(release, 'scripts', 'lib')
+  mkdirSync(runningLib, { recursive: true })
+  const data = join(base, 'var-lib', 'ims')
+  mkdirSync(data, { recursive: true })
+  const { app, victim } = appTree(t)
+  const fn = shellFunction(INSTALL_SOURCE, 'chown_state_tree', 'scripts/install.sh')
+  const program = (root: string, dataDir: string) => [
+    // A NEUTRAL die: r11's first version printed "REFUSING" from every die, so ANY later die satisfied
+    // the refusal assertion and deleting a guard left this test green (mutations R5a/R5b). Each case
+    // below now names the message of the guard it is about.
+    'die() { echo "DIE: $*" >&2; exit 1; }',
+    `DATA_DIR=${JSON.stringify(dataDir)}`,
+    fn,
+    `chown_state_tree ${JSON.stringify(root)} "$(id -un)" locks "the state directory"`,
+    'echo AFTER',
+  ].join('\n')
+  const ended = (out: Run, what: string, message: RegExp) => {
+    assert.notEqual(out.status, 0, `${what}: must end the run:\n${out.stderr}`)
+    assert.doesNotMatch(out.stdout, /^AFTER$/m, `${what}: nothing after the refusal may run`)
+    assert.match(out.stderr, message, `${what}: and it must be THIS guard that refused:\n${out.stderr}`)
+    assert.equal(readFileSync(victim, 'utf8'), 'the application tree\n', `${what}: the target must be untouched`)
+  }
+  ended(withGuardLibrary(runningLib, program(app, data)), 'chown_state_tree asked for ${APP_DIR}', /re-owns .* and nothing else, and was asked for/)
+  ended(withGuardLibrary(runningLib, program('/', data)), 'chown_state_tree asked for /', /re-owns .* and nothing else, and was asked for \//)
+  // ${DATA_DIR} itself, when ${DATA_DIR} holds the running tree, is refused by the running-tree check.
+  ended(withGuardLibrary(runningLib, program(base, base)), 'a ${DATA_DIR} that contains the running tree', /REFUSING to change the ownership of/)
+  // The accepted path reaches the helper resolution that follows the guard (the full walk is measured
+  // by install-root-safe-writes' section-8 rig, which runs this function end to end).
+  const ok = withGuardLibrary(runningLib, `IMS_CHOWN_TREE_HELPER=/nonexistent/chown-tree.mjs\n${program(data, data)}`)
+  assert.match(ok.stderr, /\/nonexistent\/chown-tree\.mjs is missing/, `the guard must let ${'${DATA_DIR}'} through to the next step:\n${ok.stderr}`)
+})
+
+test('[o3d-z5be] RUN-TIME GUARD in chown-tree.mjs: the walk refuses a directory its caller did not vet, `/` or a top-level directory, and its own tree', (t) => {
+  const helper = join(REPO, 'scripts/lib/chown-tree.mjs')
+  const walk = (cwd: string, env: Record<string, string>) => {
+    const out = spawnSync('node', [helper, '.', String(process.getuid!()), String(process.getgid!()), 'locks'],
+      { cwd, encoding: 'utf8', env: { ...process.env, IMS_CHOWN_TREE_ROOT: '', ...env } })
+    return { status: out.status ?? -1, stdout: out.stdout ?? '', stderr: out.stderr ?? '' }
+  }
+  const { app } = appTree(t)
+  const data = join(createTempDirSync('runtime-guard-walk-', t), 'data')
+  mkdirSync(join(data, 'sub'), { recursive: true })
+  for (const [label, cwd, env] of [
+    ['no vetted root at all', app, {}],
+    ['a vetted root that is not where it is', app, { IMS_CHOWN_TREE_ROOT: data }],
+    ['a `..` walk away from the vetted root', join(data, 'sub'), { IMS_CHOWN_TREE_ROOT: data }],
+    ['/', '/', { IMS_CHOWN_TREE_ROOT: '/' }],
+    ['a top-level directory', '/tmp', { IMS_CHOWN_TREE_ROOT: '/tmp' }],
+    ['the directory the walker runs from', join(REPO, 'scripts/lib'), { IMS_CHOWN_TREE_ROOT: join(REPO, 'scripts/lib') }],
+    ['a directory that contains it', join(REPO, 'scripts'), { IMS_CHOWN_TREE_ROOT: join(REPO, 'scripts') }],
+  ] as const) {
+    const out = walk(cwd, env)
+    assert.equal(out.status, 1, `${label}: the walk must refuse and exit non-zero:\n${out.stderr}`)
+    assert.match(out.stderr, /REFUSING/, `${label}: and say why:\n${out.stderr}`)
+  }
+  const ok = walk(data, { IMS_CHOWN_TREE_ROOT: data })
+  assert.equal(ok.status, 0, `a vetted state directory must be walked:\n${ok.stderr}`)
+})
+
+type AllowEntry = { file: string; line: string; count: number; class: string; reason: string; guard?: string }
 const ALLOWLIST_REL = 'tests/scripts/privileged-word-allowlist.json'
-const ALLOW_CLASSES = new Set(['text', 'single-inode', 'read-only', 'code-owned-tree', 'census-helper', 'definition', 'app-user'])
+const ALLOW_CLASSES = new Set(['text', 'comment', 'single-inode', 'read-only', 'code-owned-tree', 'census-helper', 'definition', 'app-user'])
+/** THE RUN-TIME GUARDS an allowlist entry of a tree-changing class must be protected by (r11). The
+ *  allowlist is text; it cannot bind a variable's VALUE (review M2). These functions check the value, at
+ *  the operation, and exit on a path outside what the code owns. */
+const RUNTIME_GUARDS = new Set(['driver_require_owned_path', '_fence_require_owned_tree', 'privileged_spare_running_tree'])
+/** The first variable a word refers to: `"${staged}/${relative}"` → `staged`. */
+function firstVariable(word: string): string | null {
+  const m = /\$\{([A-Za-z_][A-Za-z0-9_]*)|\$([A-Za-z_][A-Za-z0-9_]*)/.exec(word)
+  return m ? (m[1] ?? m[2]) : null
+}
+/** The variables naming what a tree-changing statement ACTS ON: every operand of rm and mv, the last
+ *  operand of cp, rsync, chown, chmod, chgrp. Flags and a leading mode/owner are not operands. */
+function operandVariables(statement: string): string[] {
+  const out: string[] = []
+  for (const words of shellCommands(statement)) {
+    const { name, args } = commandName(words.filter((w) => !/^[0-9]*[<>]/.test(w)))
+    const operands = args.filter((a) => !/^-/.test(a))
+    let targets: string[] = []
+    if (name === 'rm' || name === 'mv') targets = operands
+    else if (['cp', 'rsync', 'chown', 'chmod', 'chgrp'].includes(name)) targets = operands.slice(-1)
+    for (const t of targets) { const v = firstVariable(t); if (v) out.push(v) }
+  }
+  return out
+}
+/** The function (by line range) that encloses physical line `n`, or null at top level. */
+function enclosingFunction(source: string, n: number): { name: string; start: number; end: number } | null {
+  const lines = source.split('\n')
+  let found: { name: string; start: number; end: number } | null = null
+  for (let i = 0; i < lines.length; i += 1) {
+    const head = new RegExp(`^${DEFINITION_HEAD}\\s*\\{\\s*$`).exec(lines[i])
+    if (!head) continue
+    let end = i + 1
+    while (end < lines.length && !/^\}/.test(lines[end])) end += 1
+    if (i + 1 <= n && n <= end + 1) found = { name: head[1] ?? head[2], start: i + 1, end: end + 1 }
+  }
+  return found
+}
 /** The allowlist matches a WHOLE statement EXACTLY. A substring or prefix match would let
  *  `<an allowlisted line> ; chown imsapp "${APP_DIR}"/*` through on the strength of its first half. */
 function allowlisted(entries: readonly AllowEntry[], file: string, line: string): AllowEntry | undefined {
   return entries.find((entry) => entry.file === file && entry.line === line)
 }
 
-test('[o3d-z5be] LEXICAL BACKSTOP: in the entrypoints and the libraries they source, a statement that spells a privileged command word is a census row or an exact, reviewed allowlist entry', () => {
+test('[o3d-z5be] LEXICAL BACKSTOP: in the entrypoints and the libraries they source, a statement that spells a word on its fixed list is wholly census rows or an exact-text allowlist entry', () => {
   // WHY THIS EXISTS (o3d-z5be r10). Nine review rounds each found a shape the census tokeniser could not
   // read — the ninth was the house's own `run chown -R …`. The census is a classifier over the shapes it
   // can parse; THIS is what does not depend on parsing. A line that spells `chown` — in a heredoc, after
   // a redirect, behind `flock`, `doas`, `bash -ec`, an alias or a wrapper nobody taught the tokeniser —
   // is found because the word is there, and fails the test until somebody decides what it is. A false
-  // positive fails loudly, which is the right way for this to fail. The one thing it cannot see is a
-  // command whose NAME is never spelled out in these files; see backstopHits() for the exact list.
+  // positive fails loudly, which is the right way for this to fail. It is a FIXED WORD LIST keyed by TEXT:
+  // it does not see a name never spelled out (computed or brace-built), a command not on the list, or a
+  // variable whose value changes under an allowlisted line — so the tree-changing entries are bound to
+  // run-time guards below, which check the value when it runs (r11, review M2/H3).
   const allow: AllowEntry[] = JSON.parse(readFileSync(join(REPO, ALLOWLIST_REL), 'utf8')).entries
   for (const entry of allow) {
     assert.ok(ALLOW_CLASSES.has(entry.class), `${entry.file}: unknown class ${entry.class} for: ${entry.line}`)
@@ -3296,11 +3710,24 @@ test('[o3d-z5be] LEXICAL BACKSTOP: in the entrypoints and the libraries they sou
 
   // THE FILES: the three entrypoints and EVERY library they source — asserted against their text, so a
   // new `source` is a decision here. The one other file read, `. /etc/os-release`, is the host's.
-  for (const rel of ENTRYPOINTS) {
-    const text = ENTRYPOINT_SOURCE.get(rel)!
-    const sourced = [...text.matchAll(/^\s*(?:source|\.)\s+"\$\{IMS_SCRIPT_LIB_DIR\}\/([A-Za-z0-9_-]+\.sh)"/gm)].map((m) => `scripts/lib/${m[1]}`)
-    assert.deepEqual([...sourced].sort(), [...SOURCED_LIBS].sort(), `${rel} must source exactly the libraries this backstop reads`)
-    const others = [...text.matchAll(/^\s*(?:source|\.)\s+(\S+)/gm)].map((m) => m[1]).filter((f) => !f.startsWith('"${IMS_SCRIPT_LIB_DIR}/'))
+  // WHAT IS SOURCED IS READ FROM THE TOKENISER'S COMMANDS, not from a line-start regex (r11, review L2):
+  // `builtin source …`, `command . …` and a `source` after `;` all count, in the libraries as well.
+  for (const rel of [...ENTRYPOINTS, ...SOURCED_LIBS]) {
+    const text = readFileSync(join(REPO, rel), 'utf8')
+    const sourced: string[] = []
+    for (const line of logicalLines(text)) {
+      for (const words of shellCommands(line.text)) {
+        const { name, args } = commandName(words)
+        if (name === 'source' || name === '.') sourced.push(args[0] ?? '')
+      }
+    }
+    const libs = sourced.filter((f) => f.startsWith('${IMS_SCRIPT_LIB_DIR}/')).map((f) => `scripts/lib/${f.slice('${IMS_SCRIPT_LIB_DIR}/'.length)}`)
+    const others = sourced.filter((f) => !f.startsWith('${IMS_SCRIPT_LIB_DIR}/'))
+    if ((ENTRYPOINTS as readonly string[]).includes(rel)) {
+      assert.deepEqual([...libs].sort(), [...SOURCED_LIBS].sort(), `${rel} must source exactly the libraries this backstop reads`)
+    } else {
+      assert.deepEqual(libs, [], `${rel}: a library must not source another file this backstop does not read`)
+    }
     assert.ok(others.every((f) => f === '/etc/os-release'), `${rel}: an unexpected sourced file: ${others.join(', ')}`)
   }
   const files = [...ENTRYPOINTS, ...SOURCED_LIBS]
@@ -3310,13 +3737,17 @@ test('[o3d-z5be] LEXICAL BACKSTOP: in the entrypoints and the libraries they sou
   let censusRows = 0
   for (const rel of files) {
     const source = readFileSync(join(REPO, rel), 'utf8')
-    const covered = new Set<number>()
+    // CREDIT IS PER STATEMENT (r11, review H2): a group is the census's only when EVERY statement in it
+    // that spells a privileged word is itself a census row. `chown_state_tree …; chown -R … /etc/x`
+    // is a census row followed by a statement that stands on its own, and so needs its own decision.
+    const censusStatements = new Set<string>()
     if ((ENTRYPOINTS as readonly string[]).includes(rel)) {
-      for (const op of censusOps(source)) for (let k = op.n; k <= op.last; k += 1) covered.add(k)
+      for (const op of censusOps(source)) censusStatements.add(`${op.n}\n${op.text}`)
     }
     for (const hit of backstopHits(source)) {
       statements += 1
-      if (covered.has(hit.n)) { censusRows += 1; continue }
+      const spelled = statementsOf(hit.text).filter((st) => privilegedWords(st).length > 0)
+      if (spelled.length > 0 && spelled.every((st) => censusStatements.has(`${hit.n}\n${st}`))) { censusRows += 1; continue }
       const entry = allowlisted(allow, rel, hit.line)
       if (!entry) { unaccounted.push(`${rel}:${hit.n} [${hit.words.join(',')}] ${hit.line}`); continue }
       const key = `${entry.file}\n${entry.line}`
@@ -3329,12 +3760,65 @@ test('[o3d-z5be] LEXICAL BACKSTOP: in the entrypoints and the libraries they sou
   for (const entry of allow) {
     assert.equal(occurrences.get(`${entry.file}\n${entry.line}`) ?? 0, entry.count, `${entry.file}: expected ${entry.count} occurrence(s) of: ${entry.line}`)
   }
+  // A TREE-CHANGING ENTRY IS BOUND TO ITS RUN-TIME GUARD (r11, review H3/M2). Every `code-owned-tree`
+  // and `census-helper` entry names the guard that checks its path's VALUE at the operation, and at
+  // every occurrence that guard must be CALLED earlier in the same function (or on the same line). A
+  // new such entry without a guard fails here, and so does deleting a guard call.
+  let guardedOccurrences = 0
+  let operandChecks = 0
+  for (const entry of allow.filter((e) => e.class === 'code-owned-tree' || e.class === 'census-helper')) {
+    assert.ok(entry.guard && RUNTIME_GUARDS.has(entry.guard), `${entry.file}: a ${entry.class} entry must name its run-time guard: ${entry.line}`)
+    assert.match(entry.reason, new RegExp(`enforced at run time by ${entry.guard}`), `${entry.file}: and say so in its reason: ${entry.line}`)
+    const source = readFileSync(join(REPO, entry.file), 'utf8')
+    const lines = source.split('\n')
+    for (const hit of backstopHits(source).filter((h) => h.line === entry.line)) {
+      const fn = enclosingFunction(source, hit.n)
+      assert.ok(fn, `${entry.file}:${hit.n}: a guarded operation must be inside a function: ${entry.line}`)
+      // THE GUARD MUST CHECK *THIS* OPERATION'S OPERAND (r11 mutation R15): "a call somewhere earlier in
+      // the function" was satisfied by a guard on the same NAME in an earlier loop, after which the
+      // variable was reassigned. So for each variable the operation acts on, there must be a guard call
+      // on that variable, earlier in the function (or earlier on the same line), with no reassignment of
+      // it in between.
+      const region = logicalLines(lines.slice(fn!.start, hit.n).join('\n'))
+        .flatMap((l) => statementsOf(l.text).map((statement) => ({ n: fn!.start + l.n, statement })))
+      const opIndex = region.map((r, k) => ({ ...r, k })).filter((r) => r.n === hit.n && privilegedWords(r.statement).length > 0)
+      const guardCalls = region.map((r, k) => ({ ...r, k })).filter((r) => shellCommands(r.statement).some((w) => commandName(w).name === entry.guard))
+      assert.ok(guardCalls.length > 0, `${entry.file}:${hit.n}: ${fn!.name} must call ${entry.guard} before: ${entry.line}`)
+      for (const op of opIndex) {
+        for (const operand of operandVariables(op.statement)) {
+          const checks = guardCalls.filter((g) => g.k < op.k && firstVariable(commandName(shellCommands(g.statement)[0] ?? []).args[0] ?? '') === operand)
+          assert.ok(checks.length > 0, `${entry.file}:${hit.n}: ${entry.guard} must be called on \${${operand}} before: ${op.statement}`)
+          const last = checks[checks.length - 1]
+          const reassigned = region.slice(last.k + 1, op.k).find((r) => new RegExp(`(^|[\\s;(])(local\\s+[^;]*)?${operand}=|\\bfor\\s+${operand}\\s+in\\b|\\bread\\b[^;]*\\b${operand}\\b`).test(r.statement))
+          assert.equal(reassigned, undefined, `${entry.file}:${hit.n}: \${${operand}} is reassigned (${reassigned?.statement}) after its check and before: ${op.statement}`)
+          operandChecks += 1
+        }
+      }
+      guardedOccurrences += 1
+    }
+  }
+  assert.ok(guardedOccurrences >= 30, `precondition: ${guardedOccurrences} guarded occurrences were checked`)
+  assert.ok(operandChecks >= 30, `precondition: ${operandChecks} operands were bound to a guard call on themselves`)
+  console.log(`# backstop: ${guardedOccurrences} guarded occurrences, ${operandChecks} operand bindings`)
+
+  // AND EVERY HOUSE PROGRAM THAT CHANGES A FILESYSTEM IS A BACKSTOP WORD (r11, review H4): enumerated
+  // from scripts/lib, not remembered.
+  const programs = readdirSync(join(REPO, 'scripts/lib')).filter((f) => /\.(mjs|js|cjs|py)$/.test(f))
+  assert.ok(programs.length >= 3, `precondition: ${programs.length} programs in scripts/lib`)
+  for (const program of programs) {
+    const text = readFileSync(join(REPO, 'scripts/lib', program), 'utf8')
+    if (/\b(?:l?chownSync|fchownSync|rmSync|rmdirSync|unlinkSync|renameSync|cpSync|chmodSync|fchmodSync|lchmodSync)\b|shutil\.(?:rmtree|chown|move)/.test(text)) {
+      const name = program.replace(/\.[^.]+$/, '')
+      assert.ok(BACKSTOP_HELPERS.includes(name), `scripts/lib/${program} changes the filesystem and must be a backstop word`)
+    }
+  }
+
   // docs/installation.md says deploy.sh's own text makes no tree-wide change: that is enforced here.
-  assert.deepEqual([...new Set(allow.filter((e) => e.file === 'scripts/deploy.sh').map((e) => e.class))].sort(), ['read-only', 'single-inode', 'text'],
-    'deploy.sh may carry only single-inode, read-only and text entries')
+  assert.deepEqual([...new Set(allow.filter((e) => e.file === 'scripts/deploy.sh').map((e) => e.class))].sort(), ['comment', 'read-only', 'single-inode', 'text'],
+    'deploy.sh may carry only comment, single-inode, read-only and text entries')
   // NON-VACUITY: it read the files, and the census rows it credited are the census's.
   assert.ok(statements > 300, `precondition: the backstop found ${statements} statements`)
-  assert.ok(censusRows >= 30, `precondition: ${censusRows} of them are census rows`)
+  assert.ok(censusRows >= 20, `precondition: ${censusRows} of them are credited wholly to census rows`)
 
   // THE MATCH IS EXACT (mutation (c)): the first half of a line being allowlisted is not enough.
   const sample = allow.find((e) => e.line === 'rm -f "${CRON_BACKUP}"')!
@@ -3395,8 +3879,37 @@ test('[o3d-z5be] LEXICAL BACKSTOP: in the entrypoints and the libraries they sou
   // A here-document fed to a shell is seen line by line, because its body lines are physical lines.
   assert.deepEqual(backstopHits("bash <<'EOF'\nchown -R imsapp x\nEOF\n").map((h) => h.words), [['chown']], 'a here-document body is read')
   assert.deepEqual(backstopHits('ch\\\nown -R imsapp "${APP_DIR}"\n').map((h) => h.words), [['chown']], 'a name split across a continuation is seen')
+  // r11 (review of fddd872c, M1/H4): the fixed list's measured gaps, and the house's own walker.
+  for (const shape of [
+    'bsdtar -xpf release.tar -C "${APP_DIR}"',
+    'scp -rp src/. "${APP_DIR}/"',
+    'python3 -c \'import shutil,sys; shutil.rmtree(sys.argv[1])\' "${APP_DIR}"',
+    'git -C "${APP_DIR}" read-tree -u --reset HEAD',
+    'git -C "${APP_DIR}" stash push --include-untracked',
+    'chattr -R +i "${APP_DIR}"',
+    'chcon -R -t x "${APP_DIR}"',
+    '( cd "${APP_DIR}" && node "$(privileged_helper_path chown-tree.mjs)" . 1000 1000 "" )',
+  ]) assert.ok(privilegedWords(shape).length > 0, `the backstop must see: ${shape}`)
+  // H1: a `#` line is exempt only as a comment in CODE. Inside a multi-line string or an unquoted
+  // here-document body it is data, and the `$( … )` on it runs; the strict rule never exempts a line
+  // carrying `$(` or a backtick at all.
+  const inString = 'msg="synced\n#$(chown -R "${APP_USER}" "${DATA_DIR}")"\n'
+  const inHeredoc = 'cat >/dev/null <<EOF\n#$(rm -rf "${DATA_DIR}")\nEOF\n'
+  const inBackticks = 'msg="synced\n#`chown -R imsapp x`"\n'
+  for (const [label, src] of [['a string', inString], ['a here-document', inHeredoc], ['a string, with backticks', inBackticks]] as const) {
+    assert.ok(!commentLines(src).has(2) && !commentLines(src, true).has(2), `a # line inside ${label} is not a comment`)
+    assert.ok(backstopHits(src).some((h) => h.n === 2), `and the backstop reads it (${label})`)
+  }
+  assert.ok(commentLines('# a real comment about chown -R\n').has(1), 'a real comment is a comment')
+  assert.ok(!commentLines('# quotes `chown -R` in backticks\n', true).has(1), 'but the strict rule reads it anyway')
+  // H2: a statement appended to a census row is its own statement, classified and credited alone.
+  assert.deepEqual(statementsOf('chown_state_tree "${DATA_DIR}" a b c; chown -R x /etc/x'), ['chown_state_tree "${DATA_DIR}" a b c', 'chown -R x /etc/x'])
+  assert.deepEqual(statementsOf('if ! mv -f "$tmp" "$t" 2>/dev/null; then rm -f "$tmp"; exit 1; fi'), ['mv -f "$tmp" "$t" 2>/dev/null', 'rm -f "$tmp"', 'exit 1'])
+  assert.deepEqual(statementsOf('a 2>&1 | b >&2 && c &>/dev/null || d'), ['a 2>&1', 'b >&2', 'c &>/dev/null', 'd'])
+  assert.deepEqual(censusOps('migrate_uploads "a" "b"; chown -R imsapp /var/lib/postgresql\n').map((op) => op.text), ['chown -R imsapp /var/lib/postgresql'],
+    'the appended chown is a census row of its own')
   // AND WHAT IT CANNOT: a name never spelled out. These are the concession, asserted so it stays exact.
-  for (const unseen of ['c=ch; ${c}own -R imsapp "${APP_DIR}"', 'ch$()own -R imsapp "${APP_DIR}"', "$'\\x63hown' -R imsapp x", 'CMD=(ch own); "${CMD[0]}${CMD[1]}" -R x']) {
+  for (const unseen of ['c=ch; ${c}own -R imsapp "${APP_DIR}"', 'ch$()own -R imsapp "${APP_DIR}"', "$'\\x63hown' -R imsapp x", 'CMD=(ch own); "${CMD[0]}${CMD[1]}" -R x', 'r{m,m} -rf "${DATA_DIR}"', 'dd if=/dev/zero of="${APP_DIR}/x"']) {
     assert.deepEqual(privilegedWords(unseen), [], `stated as NOT seen — update the concession if this changes: ${unseen}`)
   }
 })
