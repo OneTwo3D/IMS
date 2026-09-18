@@ -376,6 +376,23 @@ function consumeSnapshotLayers(
   return consumed
 }
 
+/**
+ * o3d-sidy: hand back what `consumeSnapshotLayers` took, entry by entry, so an order Group A2 refuses
+ * leaves the in-memory layer snapshot exactly as it found it for the orders valued after it.
+ */
+function returnSnapshotLayers(
+  snapshot: LayerSnapshot,
+  productId: string,
+  warehouseId: string,
+  consumed: CostLayerSnapshotEntry[],
+): void {
+  const layers = snapshot.get(makeLayerKey(productId, warehouseId)) ?? []
+  for (const entry of consumed) {
+    const layer = layers.find((candidate) => candidate.id === entry.costLayerId)
+    if (layer) layer.remainingQty += toDecimal(entry.qty).toNumber()
+  }
+}
+
 async function createPendingSyncLog(
   tx: AccountingMirrorClient,
   params: {
@@ -787,7 +804,12 @@ async function dailyBatchRecreateVerdict(
  * journal never posted, so the sweep leaves it alone and the caller surfaces it on the run instead
  * of skipping silently. See `dailyBatchRecreateVerdict`.
  */
-export async function recreateMissingDailyBatchLogs(settings: Awaited<ReturnType<typeof getXeroSettings>>, baseCurrency: string): Promise<string[]> {
+export async function recreateMissingDailyBatchLogs(
+  settings: Awaited<ReturnType<typeof getXeroSettings>>,
+  baseCurrency: string,
+  // o3d-sidy: where a negative-basis refusal is also recorded, so the run can report it by name.
+  negativeBasisRefusals?: NegativeCostBasisRefusal[],
+): Promise<string[]> {
   const refusals: string[] = []
   // scjz.36: only recreate within the sync-log retention window — beyond it, SYNCED
   // daily-batch logs are pruned by data-retention, so a "missing" log can't be told
@@ -1030,6 +1052,27 @@ export async function recreateMissingDailyBatchLogs(settings: Awaited<ReturnType
   }
 
   for (const { referenceId, date, summary, ...batch } of bBatches.values()) {
+    // o3d-sidy (review M2): the rebuild values each shipment at its LIVE cogsBatchAmount, which a
+    // landed-cost revaluation rewrites — so a revalued negative would be rebuilt revenue-only under
+    // the `> 0` gate below and written to the subledger as a negative dispatch. Refuse the batch by
+    // name instead; it is rebuilt by a later sweep once the basis is corrected and the revaluation
+    // writes the shipment's COGS back. Before the empty-batch skip, so a batch whose ONLY content is a
+    // negative COGS is refused rather than passed over in silence.
+    const negativeShipments = summary.shipments.filter((shipment) => shipment.cogs < 0)
+    if (negativeShipments.length > 0) {
+      const named = negativeShipments.map((shipment) => `${shipment.id} (COGS ${round2(shipment.cogs).toFixed(2)})`).join(', ')
+      const refusal = new NegativeCostBasisRefusal(
+        `Daily batch DAILY_BATCH_GROUP_B not recreated: ${referenceId} — shipment(s) ${named} carry a negative `
+        + `cost basis. Rebuilding would post it revenue-only. ${NEGATIVE_BASIS_REMEDY}sweep rebuilds it (o3d-sidy).`,
+        {
+          group: 'B_RECREATE', orderId: null, orderRef: null, shipmentId: negativeShipments[0].id, batchRef: referenceId,
+          negativeEntries: [], value: round2(summary.cogs).toFixed(2),
+        },
+      )
+      refusals.push(refusal.message)
+      negativeBasisRefusals?.push(refusal)
+      continue
+    }
     if (summary.revenue <= 0 && summary.cogs <= 0) continue
     const verdict = await dailyBatchRecreateVerdict('DAILY_BATCH_GROUP_B', dailyBatchLiveRefs(batch))
     if (verdict.blocked) {
@@ -1087,51 +1130,126 @@ export async function recreateMissingDailyBatchLogs(settings: Awaited<ReturnType
 }
 
 /**
- * o3d-sidy (P1) — GROUP B REFUSES A NEGATIVE COST BASIS BY NAME, INSTEAD OF DROPPING ITS COGS LINE.
+ * o3d-sidy (P1) — THE DAILY BATCH REFUSES A NEGATIVE COST BASIS BY NAME, IN EVERY PLACE IT VALUES ONE.
  *
- * WHAT HAPPENED WITHOUT THIS, proved end to end on a scratch database (o3d-sidy): a landed-cost
- * recalc applying a CREDIT freight cost line drove a cost layer negative, and
- * `updateSnapshotsForCostLayerChange` rewrote an ALREADY-SHIPPED, not-yet-journaled line's snapshot
- * to that negative unit cost in place — with no movement builder in the path, so neither
- * negative-basis refusal (#683, transfer re-layering) saw it. Group B read the snapshot directly, the
- * batch COGS came out negative, and the COGS pair below is gated on `totalCogsNumber > 0`: the
- * journal went out with its revenue pair only (its own narration said "COGS £-6.00"), the shipment
- * was stamped journaled, the COGS subledger recorded a dispatch the ledger never received, and
- * nothing failed. Beside a healthy shipment the same negative was NETTED into the batch total
- * instead, understating COGS just as silently.
+ * WHAT HAPPENED WITHOUT THIS, proved end to end on scratch databases (o3d-sidy): a landed-cost recalc
+ * applying a CREDIT freight cost line drove a cost layer negative, and
+ * `updateSnapshotsForCostLayerChange` rewrote already-shipped and allocated snapshots to that
+ * negative unit cost in place — with no movement builder in the path, so neither negative-basis
+ * refusal (#683, transfer re-layering) saw it. The batch then took it in three places, each gated on
+ * a `> 0` total that turns a negative into SILENCE:
  *
- * WHY REFUSE RATHER THAN POST THE PAIR REVERSED. A reversed pair is how a signed COGS would be
- * represented, and whether IMS represents a negative basis at all is the deferred o3d-gd2f decision
- * (docs/todo/negative-basis-cost-layers-decision.md lists this very gate as its item (d)). Until it
- * is taken, the established answer everywhere else is to refuse where an operator can see it (#683,
- * transfer-cost-layer-recreation.ts). So the order is refused the way this loop already refuses a
- * shipment with incomplete or mismatched snapshots: the throw lands in the per-order catch, the
- * order's shipments stay UN-journaled (so a corrected basis flows through the next batch on its
- * own), and the reason is a named entry in `result.errors`, which fails the cron run with it.
+ *   • GROUP B journaled the shipment with its revenue pair only (its narration said "COGS £-6.00"),
+ *     stamped it, and wrote a COGS subledger dispatch the ledger never received;
+ *   • GROUP A2 valued the dispatched units at the negative cost and debited Allocated Inventory short
+ *     (£14 for a £24 batch, found by the independent review), stamped the order with the negative
+ *     amount — so the correction that followed, which re-values the layer, left Allocated Inventory
+ *     understated and Inventory overstated permanently;
+ *   • the GROUP B RECREATE SWEEP rebuilt a lost journal from a revalued negative cogsBatchAmount
+ *     revenue-only, writing a negative DISPATCH row.
+ *
+ * Beside healthy rows the same negative was NETTED into the total instead, understating it just as
+ * silently.
+ *
+ * WHY REFUSE RATHER THAN POST SIGNED. A reversed pair is how a signed amount would be represented,
+ * and whether IMS represents a negative basis at all is the deferred o3d-gd2f decision
+ * (docs/todo/negative-basis-cost-layers-decision.md catalogues every path that can carry one; this
+ * change covers the three above, not the rest of that list). Until it is taken, the established
+ * answer is to refuse where an operator can see it (#683, transfer-cost-layer-recreation.ts).
  *
  * WHY NOT A FAILED SYNC ROW. `resetFailedDailyBatchLogs` returns every FAILED daily-batch row to
  * PENDING at the start of the next run, so a FAILED row would be re-queued for posting — the opposite
- * of a refusal — and there is no journal to attach one to in the first place.
+ * of a refusal — and in A2 and Group B there is no journal to attach one to.
  *
- * PER ENTRY, NOT PER TOTAL. `parseCostLayerSnapshot` drops non-positive quantities, so an entry
- * values below zero exactly when its unit cost does; a shipment that nets positive still carries a
- * negative basis, which is the thing not represented. A ZERO basis is not refused: free goods have
- * zero COGS, and the `> 0` gate dropping a zero pair drops nothing.
+ * PER ENTRY, NOT PER TOTAL. `parseCostLayerSnapshot` drops non-positive quantities, so an entry values
+ * below zero exactly when its unit cost does; a row that nets positive still carries the basis IMS
+ * does not represent. A ZERO basis is not refused: free goods cost nothing, and a `> 0` gate dropping
+ * a zero pair drops nothing.
+ *
+ * HOW AN OPERATOR LEARNS OF IT. Each refusal is (1) an ERROR entry in the activity log
+ * against the sales order — or, for the recreate sweep, the batch — naming the shipment and the
+ * layers, and (2) an entry at the FRONT of the run's errors, which fails the cron run with it as the
+ * reason (CronRun.statusReason keeps 500 characters, so the refusals go first rather than behind the
+ * recreate sweep's own messages).
  */
-function refuseNegativeBasisShipmentCogs(shipmentId: string, entries: CostLayerSnapshotEntry[]): void {
-  const negative = entries.filter((entry) => toDecimal(entry.unitCostBase).lt(0))
+export class NegativeCostBasisRefusal extends Error {
+  constructor(
+    message: string,
+    readonly detail: {
+      group: 'A2' | 'B' | 'B_RECREATE'
+      orderId: string | null
+      orderRef: string | null
+      shipmentId: string | null
+      batchRef: string | null
+      negativeEntries: Array<{ costLayerId: string; qty: string; unitCostBase: string }>
+      value: string
+    },
+  ) {
+    super(message)
+    this.name = 'NegativeCostBasisRefusal'
+  }
+}
+
+/** The entries of a snapshot whose unit cost is below zero — what the batch refuses to post. */
+function negativeBasisEntries(entries: CostLayerSnapshotEntry[]): CostLayerSnapshotEntry[] {
+  return entries.filter((entry) => toDecimal(entry.unitCostBase).lt(0))
+}
+
+function describeNegativeEntries(entries: CostLayerSnapshotEntry[]): string {
+  return entries.map((entry) => `${entry.costLayerId} (${toDecimal(entry.qty).toString()} @ ${toDecimal(entry.unitCostBase).toString()})`).join(', ')
+}
+
+function negativeEntryDetail(entries: CostLayerSnapshotEntry[]) {
+  return entries.map((entry) => ({
+    costLayerId: entry.costLayerId,
+    qty: toDecimal(entry.qty).toString(),
+    unitCostBase: toDecimal(entry.unitCostBase).toString(),
+  }))
+}
+
+const NEGATIVE_BASIS_REMEDY = 'Correct the basis (usually a credit freight cost line a landed-cost recalculation '
+  + 'applied to the purchase order) and the next batch '
+
+/** Group B: refuse the shipment's ORDER when any entry it would post is negative. Thrown into the per-order catch. */
+function refuseNegativeBasisShipmentCogs(
+  order: { orderId: string; orderRef: string },
+  shipmentId: string,
+  entries: CostLayerSnapshotEntry[],
+): void {
+  const negative = negativeBasisEntries(entries)
   if (negative.length === 0) return
   const cogs = roundQuantity(sumCostLayerSnapshot(entries), 2)
-  const layers = negative
-    .map((entry) => `${entry.costLayerId} (${entry.qty} @ ${entry.unitCostBase})`)
-    .join(', ')
-  throw new Error(
-    `Negative cost basis on shipment ${shipmentId}: cost layer(s) ${layers} carry a NEGATIVE unit cost, `
-    + `so its COGS would be ${cogs.toFixed(2)}. IMS does not post a negative cost basis (o3d-gd2f), so this `
-    + 'order is not journaled and stays queued for the next batch. Correct the basis - usually a credit '
-    + 'freight cost line a landed-cost recalculation applied to the purchase order - and the next batch '
-    + 'posts it (o3d-sidy).',
+  throw new NegativeCostBasisRefusal(
+    `Group B order ${order.orderRef}: negative cost basis on shipment ${shipmentId} — cost layer(s) `
+    + `${describeNegativeEntries(negative)}; COGS would be ${cogs.toFixed(2)}. Not journaled; it stays `
+    + `queued. ${NEGATIVE_BASIS_REMEDY}posts it (o3d-sidy).`,
+    {
+      group: 'B', orderId: order.orderId, orderRef: order.orderRef, shipmentId, batchRef: null,
+      negativeEntries: negativeEntryDetail(negative), value: cogs.toFixed(2),
+    },
   )
+}
+
+/** Put this run's negative-basis refusals where an operator will see them. See NegativeCostBasisRefusal. */
+async function reportNegativeBasisRefusals(
+  result: XeroDailyBatchResult,
+  refusals: NegativeCostBasisRefusal[],
+): Promise<void> {
+  if (refusals.length === 0) return
+  const messages = refusals.map((refusal) => refusal.message)
+  result.errors = [...messages, ...result.errors.filter((error) => !messages.includes(error))]
+  for (const refusal of refusals) {
+    await logActivity({
+      entityType: refusal.detail.orderId ? 'SALES_ORDER' : 'SYSTEM',
+      entityId: refusal.detail.orderId ?? refusal.detail.batchRef ?? null,
+      action: 'daily_batch_negative_cost_basis_refused',
+      tag: 'sync',
+      level: 'ERROR',
+      description: refusal.message,
+      metadata: refusal.detail,
+      resolveUser: false,
+    })
+  }
 }
 
 export async function runDailyBatchSync(): Promise<XeroDailyBatchResult> {
@@ -1144,6 +1262,8 @@ export async function runDailyBatchSync(): Promise<XeroDailyBatchResult> {
     hasMore: { groupA1: false, groupA2: false, groupB: false },
     errors: [],
   }
+  // o3d-sidy: every negative-basis refusal this run makes, from A2, Group B and the recreate sweep.
+  const negativeBasisRefusals: NegativeCostBasisRefusal[] = []
   // o3d-4ajo: pinned to ONE connection. Taking this through Prisma and releasing
   // it through Prisma can hit different pooled sockets, so the unlock silently
   // no-ops and the lock leaks — and this key is shared with refund creation /
@@ -1168,7 +1288,7 @@ export async function runDailyBatchSync(): Promise<XeroDailyBatchResult> {
     // o3d-o97 r6: a batch the sweep REFUSED to rebuild (its only log is cancelled, which does not
     // establish that the journal never reached the ledger) is reported on the run rather than
     // skipped silently — it is the one outcome where a human has to decide whether to re-post.
-    result.errors.push(...await recreateMissingDailyBatchLogs(settings, baseCurrency))
+    result.errors.push(...await recreateMissingDailyBatchLogs(settings, baseCurrency, negativeBasisRefusals))
 
   // --- Group A1: Revenue Deferral ---
   try {
@@ -1395,13 +1515,6 @@ export async function runDailyBatchSync(): Promise<XeroDailyBatchResult> {
       })
       if (orders.length === 0) return { count: 0, hasMore: candidateWindow.hasMore }
 
-      // o3d-0qoo: batch identity, computed once from the run-start date and this batch's own
-      // order set, then persisted on every member row alongside its stage stamp. See the A1
-      // note above for why deriving it back from inventoryAllocatedDate is not equivalent.
-      // o3d-0i5y r9: derived from the LOCKED set, so the ref names the orders the journal is
-      // actually built from rather than the ones a pre-transaction read happened to see.
-      const referenceId = buildDailyBatchReferenceId('A2', today, orders.map((order) => order.id))
-
       let totalAllocatedValue = toDecimal(0)
       const plans = new Map(orders.map((order) => [order.id, planA2Reclassification(order)]))
 
@@ -1430,8 +1543,17 @@ export async function runDailyBatchSync(): Promise<XeroDailyBatchResult> {
       /** The quantity the planned-from base recorded, so a base that MOVED can be told from one that was revalued. */
       const allocationBaseQty = new Map<string, Decimal>()
 
+      // o3d-sidy (review H1): orders refused for a negative basis. Everything this pass computed for
+      // them is withdrawn before any journal, stamp or record is written, so they are exactly as if
+      // this batch had never seen them — see the refusal below the allocation loop.
+      const refusedOrderIds = new Set<string>()
+
       for (const order of orders) {
         const plan = plans.get(order.id)!
+        // o3d-sidy: what this order took from the shared in-memory layer snapshot, so a refusal can
+        // hand it back and the orders after it value exactly as they would without this one.
+        const orderConsumption: Array<{ productId: string; warehouseId: string; consumed: CostLayerSnapshotEntry[] }> = []
+        const orderAppended: CostLayerSnapshotEntry[] = []
         // o3d-0i5y r7: value is accumulated ROW BY ROW, from the entries this pass actually writes.
         // r6 valued the whole unjournaled shipment here instead, which posts the WHOLE of a MIXED
         // shipment — part of it already pinned and posted by an earlier pass. See the shipment-
@@ -1496,6 +1618,8 @@ export async function runDailyBatchSync(): Promise<XeroDailyBatchResult> {
                 outstanding.toNumber(),
               )
             : []
+          orderConsumption.push({ productId: alloc.productId, warehouseId: alloc.warehouseId, consumed })
+          orderAppended.push(...recorded, ...consumed)
           // APPENDED, not replaced, so `snapshotQty` keeps naming everything ever posted against
           // this row — which is what makes the next pass's outstanding calculation right. The
           // shipped record goes BEFORE the fresh pin, so the qty-based contra relief that Group B
@@ -1528,9 +1652,55 @@ export async function runDailyBatchSync(): Promise<XeroDailyBatchResult> {
         }
         orderCostValue = roundQuantity(orderCostValue, 2)
 
+        // o3d-sidy (review H1) — A2 REFUSES A NEGATIVE BASIS PER ORDER, BEFORE ANYTHING IS WRITTEN.
+        //
+        // Both halves of what this pass values can carry one: `recorded` comes off the shipment
+        // snapshots, which a landed-cost revaluation rewrites in place (same-day allocate-and-ship is
+        // the ordinary case), and `consumed` off live layers whose unit cost the same revaluation
+        // changed. Unrefused, the negative was debited to Allocated Inventory short, stamped onto the
+        // order and pinned as `postedUnitCostBase`, and the correction that followed re-valued the
+        // layer and left the ledger short for good. PER ORDER, like Group B, rather than failing the
+        // whole transaction: A2 is ONE journal for every order in the window, and aborting it would
+        // hold back every other order's reclassification — and so every other order's Group B, which
+        // waits for this stamp — until one purchase order was corrected.
+        const negative = negativeBasisEntries(orderAppended)
+        if (negative.length > 0) {
+          for (const { productId, warehouseId, consumed } of orderConsumption) {
+            returnSnapshotLayers(snapshot, productId, warehouseId, consumed)
+          }
+          for (const alloc of order.allocations) {
+            allocationSnapshots.delete(alloc.id)
+            allocationAppends.delete(alloc.id)
+            allocationBaseQty.delete(alloc.id)
+          }
+          refusedOrderIds.add(order.id)
+          const orderRef = order.orderNumber ?? order.externalOrderNumber ?? order.id.slice(0, 8)
+          negativeBasisRefusals.push(new NegativeCostBasisRefusal(
+            `Group A2 order ${orderRef}: negative cost basis — cost layer(s) ${describeNegativeEntries(negative)}; `
+            + `the reclassification would be ${orderCostValue.toFixed(2)}. Not reclassified, so its shipments `
+            + `wait too. ${NEGATIVE_BASIS_REMEDY}reclassifies it and posts its COGS (o3d-sidy).`,
+            {
+              group: 'A2', orderId: order.id, orderRef, shipmentId: null, batchRef: null,
+              negativeEntries: negativeEntryDetail(negative), value: orderCostValue.toFixed(2),
+            },
+          ))
+          continue
+        }
+
         totalAllocatedValue = addMoney(totalAllocatedValue, orderCostValue)
         orderValues.set(order.id, orderCostValue.toNumber())
       }
+
+      // o3d-sidy: the batch is built from the orders that were NOT refused, and only from them.
+      const accepted = orders.filter((order) => !refusedOrderIds.has(order.id))
+      if (accepted.length === 0) return { count: 0, hasMore: candidateWindow.hasMore }
+      // o3d-0qoo: batch identity, computed once from the run-start date and this batch's own
+      // order set, then persisted on every member row alongside its stage stamp. See the A1
+      // note above for why deriving it back from inventoryAllocatedDate is not equivalent.
+      // o3d-0i5y r9: derived from the LOCKED set, so the ref names the orders the journal is
+      // actually built from rather than the ones a pre-transaction read happened to see.
+      // o3d-sidy: and from the ACCEPTED set, so a refused order is not named by a batch it is not in.
+      const referenceId = buildDailyBatchReferenceId('A2', today, accepted.map((order) => order.id))
 
       const totalAllocatedValueNumber = round2Decimal(totalAllocatedValue)
       // o3d-o97 r3: null when NO journal was raised. The guard below is on the batch's ROUNDED
@@ -1546,15 +1716,15 @@ export async function runDailyBatchSync(): Promise<XeroDailyBatchResult> {
           payload: {
             date: today,
             reference: `Inventory Allocation ${today} ${referenceId.slice(-8)}`,
-            narration: `Daily inventory reclassification: ${orders.length} order(s), £${totalAllocatedValueNumber.toFixed(2)}`,
+            narration: `Daily inventory reclassification: ${accepted.length} order(s), £${totalAllocatedValueNumber.toFixed(2)}`,
             lines: [
-              { accountCode: settings.xero_allocated_inventory_account, description: `Daily inventory allocation — ${orders.length} order(s)`, debit: totalAllocatedValueNumber },
-              { accountCode: settings.xero_inventory_account, description: `Daily inventory allocation — ${orders.length} order(s)`, credit: totalAllocatedValueNumber },
+              { accountCode: settings.xero_allocated_inventory_account, description: `Daily inventory allocation — ${accepted.length} order(s)`, debit: totalAllocatedValueNumber },
+              { accountCode: settings.xero_inventory_account, description: `Daily inventory allocation — ${accepted.length} order(s)`, credit: totalAllocatedValueNumber },
             ],
             batchReferenceId: referenceId,
             batchDate: today,
             batchGroup: 'A2',
-            batchEntityCount: orders.length,
+            batchEntityCount: accepted.length,
             splitBatch: result.hasMore.groupA2,
             _postingMode: 'submitted',
           },
@@ -1594,12 +1764,12 @@ export async function runDailyBatchSync(): Promise<XeroDailyBatchResult> {
       // every path that changes WHICH units are recorded takes the order lock this pass holds.
       const lockedRecords = await lockAllocationRecords(
         tx,
-        orders.flatMap((order) => order.allocations
+        accepted.flatMap((order) => order.allocations
           .filter((alloc) => allocationSnapshots.has(alloc.id))
           .map((alloc) => alloc.id)),
       )
 
-      for (const order of orders) {
+      for (const order of accepted) {
         for (const alloc of order.allocations) {
           const next = allocationSnapshots.get(alloc.id)
           // `undefined` means "this row was already accounted and is not being changed". It is NOT
@@ -1678,7 +1848,7 @@ export async function runDailyBatchSync(): Promise<XeroDailyBatchResult> {
         })
       }
 
-      return { count: orders.length, hasMore: candidateWindow.hasMore }
+      return { count: accepted.length, hasMore: candidateWindow.hasMore }
     })
 
     result.groupA2 = groupA2.count
@@ -1937,6 +2107,10 @@ export async function runDailyBatchSync(): Promise<XeroDailyBatchResult> {
         // recognition and COGS posting.
         try {
         const orderLayerDecrements = new Map<string, number>()
+        const negativeBasisOrder = {
+          orderId,
+          orderRef: firstShipment.order.orderNumber ?? firstShipment.order.externalOrderNumber ?? orderId.slice(0, 8),
+        }
         const deferredBase = Number(firstShipment.order.unearnedRevenueAmount ?? firstShipment.order.totalBase)
         const orderLineTotal = firstShipment.order.lines.reduce((sum, line) => sum + Number(line.totalBase), 0)
         const requirementsByLine = new Map(
@@ -2036,7 +2210,7 @@ export async function runDailyBatchSync(): Promise<XeroDailyBatchResult> {
             : toDecimal(shipment.cogsBatchAmount ?? 0)
           const precomputedCogsNumber = precomputedCogs.toNumber()
           // o3d-sidy: before anything is accumulated, so a refusal leaves nothing behind.
-          if (hasPrecomputedSnapshots) refuseNegativeBasisShipmentCogs(shipment.id, shipmentSnapshotsForLines.flat())
+          if (hasPrecomputedSnapshots) refuseNegativeBasisShipmentCogs(negativeBasisOrder, shipment.id, shipmentSnapshotsForLines.flat())
           if (hasPrecomputedSnapshots) {
             const missingSnapshotLines = shipment.lines.filter((line, lineIndex) => (
               Number(line.qty) > 0 && shipmentSnapshotsForLines[lineIndex].length === 0
@@ -2088,7 +2262,7 @@ export async function runDailyBatchSync(): Promise<XeroDailyBatchResult> {
             }
 
             // o3d-sidy: the allocation snapshots are rewritten in place by the same revaluation.
-            refuseNegativeBasisShipmentCogs(shipment.id, shipmentCostSnapshot)
+            refuseNegativeBasisShipmentCogs(negativeBasisOrder, shipment.id, shipmentCostSnapshot)
 
             for (const entry of shipmentCostSnapshot) {
               orderLayerDecrements.set(
@@ -2129,7 +2303,10 @@ export async function runDailyBatchSync(): Promise<XeroDailyBatchResult> {
           // Per-order failure: skip this order, log the error, continue
           // with remaining orders so the batch isn't blocked by one bad order.
           const orderRef = firstShipment.order.orderNumber ?? firstShipment.order.externalOrderNumber ?? orderId.slice(0, 8)
-          result.errors.push(`Group B order ${orderRef}: ${String(orderError)}`)
+          // o3d-sidy: a negative-basis refusal is reported with the others at the end of the run —
+          // first in the errors and as an ERROR activity entry. See NegativeCostBasisRefusal.
+          if (orderError instanceof NegativeCostBasisRefusal) negativeBasisRefusals.push(orderError)
+          else result.errors.push(`Group B order ${orderRef}: ${String(orderError)}`)
           // Remove any partially-accumulated results for this order's shipments
           for (const s of orderShipments) {
             const sr = shipmentResults.get(s.id)
@@ -2415,6 +2592,8 @@ export async function runDailyBatchSync(): Promise<XeroDailyBatchResult> {
     } catch (e) {
       result.errors.push(`Transit reconciliation sweep error: ${String(e)}`)
     }
+
+    await reportNegativeBasisRefusals(result, negativeBasisRefusals)
 
     // Log summary
     if (result.groupA1 > 0 || result.groupA2 > 0 || result.groupB > 0) {

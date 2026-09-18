@@ -12,7 +12,7 @@ import test, { mock } from 'node:test'
 // The shipment was stamped journaled, no sync row failed, result.errors said nothing, and the
 // COGS subledger recorded a -6.00 dispatch the ledger never received.
 //
-// IMS does not post a negative cost basis (o3d-gd2f is the deferred decision; #683 refuses a
+// The daily batch does not post a negative cost basis (o3d-gd2f is the deferred decision; #683 refuses a
 // negative implied unit cost rather than flip its sign). So Group B now REFUSES the order the way it
 // already refuses a shipment with incomplete or mismatched snapshots: the order's shipments are left
 // UN-journaled, so a corrected basis flows through the next batch, and the refusal is a named entry
@@ -28,6 +28,7 @@ let allocations: Array<Record<string, unknown>> = []
 const created: Array<{ type: string; payload: Record<string, unknown> }> = []
 const cogsMovements: Array<{ sourceRef: string; baseDelta: unknown }> = []
 const shipmentUpdates: Array<{ id: string; data: Record<string, unknown> }> = []
+const activity: Array<Record<string, unknown>> = []
 
 function reset(next: Shipment[], nextAllocations: Array<Record<string, unknown>> = []) {
   shipments = next
@@ -35,6 +36,7 @@ function reset(next: Shipment[], nextAllocations: Array<Record<string, unknown>>
   created.length = 0
   cogsMovements.length = 0
   shipmentUpdates.length = 0
+  activity.length = 0
 }
 
 /** One order with one shipment of `qty` units whose line snapshot is `snapshot`. */
@@ -128,7 +130,9 @@ mock.module('@/lib/connectors/xero/settings', {
   },
 })
 mock.module('@/lib/base-currency', { namedExports: { getBaseCurrencyCode: async () => 'GBP' } })
-mock.module('@/lib/activity-log', { namedExports: { logActivity: async () => undefined } })
+mock.module('@/lib/activity-log', {
+  namedExports: { logActivity: async (params: Record<string, unknown>) => { activity.push(params) } },
+})
 mock.module('@/lib/domain/accounting/accounting-event-mirror', {
   namedExports: {
     mirrorAccountingSyncLogToEvent: async () => undefined,
@@ -263,4 +267,34 @@ test('o3d-sidy: a ZERO basis is not a negative one — it is journaled, with no 
   const [journal] = groupB()
   assert.ok(journal, 'with its revenue pair')
   assert.equal(linesOf(journal).some((l) => l.accountCode === '310'), false, 'and no COGS pair, because the COGS is zero')
+})
+
+test('o3d-sidy L1: the refusal survives the status-reason cap — it is FIRST in the errors, and an ERROR activity entry names the order', async () => {
+  // An ordinary per-order failure is raised BEFORE the refusal in this run: an order whose shipment has
+  // one line with a snapshot and one without. CronRun.statusReason keeps 500 characters of the joined
+  // errors, so a refusal left behind other messages could be cut off before it names anything.
+  const incomplete = shipment('inc', [{ costLayerId: 'cl-inc', qty: '1.000000', unitCostBase: '5.000000' }], { cogsBatchAmount: 5 })
+  ;(incomplete.lines as Array<Record<string, unknown>>).push({
+    id: 'sl-inc-2', lineId: 'line-inc', productId: 'prod-1', qty: 1, costLayerSnapshot: null,
+    line: { id: 'line-inc', productId: 'prod-1', qty: 1, totalBase: 10 },
+  })
+  reset([incomplete, shipment('neg', [{ costLayerId: 'cl-neg', qty: '1.000000', unitCostBase: '-6.000000' }], { cogsBatchAmount: -6 })])
+
+  const result = await runDailyBatchSync()
+
+  assert.ok(result.errors.some((e) => e.startsWith('Group B order SO-inc:') && /Incomplete precomputed FIFO snapshots/.test(e)),
+    `PRECONDITION: the ordinary failure really was raised in this run: ${JSON.stringify(result.errors)}`)
+  assert.equal(refusalFor(result.errors, 'SO-neg').length, 1)
+  assert.equal(result.errors[0], refusalFor(result.errors, 'SO-neg')[0], 'the refusal comes first')
+
+  const logged = activity.filter((entry) => entry.action === 'daily_batch_negative_cost_basis_refused')
+  assert.equal(logged.length, 1, 'one activity entry for the one refusal — none for the ordinary failure')
+  assert.equal(logged[0].level, 'ERROR')
+  assert.equal(logged[0].entityType, 'SALES_ORDER')
+  assert.equal(logged[0].entityId, 'order-neg')
+  assert.equal(logged[0].description, result.errors[0], 'carrying the same text the run reports')
+  const detail = logged[0].metadata as { group: string; shipmentId: string; negativeEntries: Array<{ costLayerId: string }> }
+  assert.equal(detail.group, 'B')
+  assert.equal(detail.shipmentId, 'neg')
+  assert.deepEqual(detail.negativeEntries.map((entry) => entry.costLayerId), ['cl-neg'])
 })

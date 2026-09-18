@@ -2204,16 +2204,36 @@ The daily batch intentionally processes A1 revenue deferral, A2 inventory alloca
 
 Retry behavior is marker-driven. If the process stops after A1, the next run skips A1-marked orders and continues with A2. If it stops after A2, the next run continues with Group B. If Group B partially fails, unmarked shipments remain eligible for the next run. Do not manually clear these dates unless finance has also reversed any exported journals.
 
-**A shipment valued at a negative cost is refused, not posted.** If a shipment's cost-layer
-snapshot carries a negative unit cost — which happens when a landed-cost recalculation applies a
-credit freight cost line larger than the goods it is spread over — Group B does not journal that
-order. The daily batch run is marked failed with a message naming the order, the shipment and the
-cost layer, and the order's shipments stay unjournaled. Nothing needs clearing: correct the cost
+**The daily batch refuses a negative cost, by name, instead of posting it short.** A cost layer's
+unit cost can go below zero when a landed-cost recalculation spreads a credit freight cost line
+larger than the goods it is spread over, and the recalculation rewrites the cost recorded on
+allocations and shipments that already used that layer. The daily batch now checks for it in three
+places:
+
+- **Group A2** — an order whose allocated or dispatched units would be reclassified at a negative
+  cost is not reclassified. The other orders in the batch are reclassified as normal, and the
+  journal is built from them alone.
+- **Group B** — an order whose shipment would be journaled at a negative cost is not journaled.
+- **Rebuilding a lost Group B journal** — a batch holding a shipment whose COGS was revalued below
+  zero is not rebuilt.
+
+In every case nothing about the refused order is stamped, so it stays queued: correct the cost
 basis (usually by removing or correcting the credit freight cost line on the purchase order, which
-re-runs the landed-cost recalculation) and the next batch posts the shipment with its COGS. Before
-this, such a shipment was journaled with its revenue only and its COGS line silently left out.
-IMS does not post a negative cost basis at all; whether it ever should is an open decision
-(o3d-gd2f).
+re-runs the landed-cost recalculation) and the next batch reclassifies the order, then posts its
+COGS — the Allocated Inventory debit and credit come out equal. Nothing needs clearing by hand.
+Before this, Group A2 debited Allocated Inventory short, Group B journaled revenue with no COGS, and
+the rebuild posted revenue only, all without an error.
+
+**How you find out.** Each refusal writes an **ERROR** entry in the activity log against the sales
+order (or, for a rebuild, against the batch reference), naming the shipment and the cost layer, and
+it is listed first in the daily batch run's errors, which marks that cron run failed. A failed cron
+run shows on System Health as a warning, not an alert, so the activity log is the place to look.
+
+**What this does not cover.** Only these three batch paths refuse. Other places a negative cost can
+reach — for example revaluing a shipment that was *already* journaled, which currently posts the
+reversal and drops the negative repost (o3d-c08y) — are catalogued in
+`docs/todo/negative-basis-cost-layers-decision.md`. Whether IMS should ever post a negative cost
+basis at all is an open decision (o3d-gd2f).
 
 ### Which batch a row belongs to
 
