@@ -125,14 +125,16 @@ the job's next run, not immediately.
   copy is still waiting to go out, the system does **not** queue a second one — the activity log
   records "already queued and undelivered — not duplicated". Once the email has actually been
   sent (or has permanently failed), pressing the button again queues a fresh copy, so a
-  deliberate re-send after correcting an address still works.
+  deliberate re-send after correcting an address still works. An email **parked at the send cap**
+  (below) also holds its place: nothing new is queued for that document until an operator resolves
+  it.
 - **Retries.** A temporary SMTP failure is retried with a growing delay, up to five attempts,
   after which the email is marked failed with the last error.
 - **Suppression.** A recipient the SMTP provider rejects as invalid is added to the suppression
   list, and later emails to that address fail immediately instead of being retried.
 - **What the four contention counts in the activity log mean.** Each run logs a line like
   `Email outbox: 3 sent, 0 failed, 0 reclaimed after a send, 0 reclaimed before one, 0 unresolved
-  after a send, 0 unresolved before one, out of 3 processed`. All four count a row this run had
+  after a send, 0 unresolved before one, out of 3 processed, 0 parked at the send cap`. All four count a row this run had
   claimed and was then refused the final write on. They split along two questions, and the split
   matters because only one corner means a customer may have got two emails.
 
@@ -153,14 +155,38 @@ the job's next run, not immediately.
   So **reclaimed after a send** is the one that means the customer may have received two copies —
   *may*, because it rests on the send having actually reached a mail server, which is not something
   the run records: with SMTP unconfigured, or a rejected from-address, both runs can be counted here
-  having delivered nothing at all. It is a duplicate that is *possible*, not one that is "likely" —
-  and one extra copy is not a ceiling either: a reclaim restarts the stale window, so a run that
-  also overruns it may itself be reclaimed, and a further copy may go out for each window a run
-  outlives.
+  having delivered nothing at all. It is a duplicate that is *possible*, not one that is "likely".
+  Over the life of one email the extra copies that may go out this way are capped at one: a reclaim
+  restarts the stale window, but an email is reclaimed at most once, and a run that finds it stale
+  again is refused and parks it instead (next item).
   **Unresolved after a send** means a copy may be on the wire but nothing establishes that a second
   one follows — it is not a duplicate report. The server log line for each row names the specific
   diagnosis behind it. None of the four leaves the email stuck: whichever run settled the row is the
   one that finished it.
+
+- **Parked at the send cap.** If a run is still sending an email fifteen minutes after it took it,
+  the next run takes the email back and tries again — which is how a copy may go out twice. That is
+  allowed **once** per email. If the second attempt also stays unfinished for fifteen minutes, the
+  next run does not try a third time: it sets the email to `PARKED_SEND_CAP` and leaves it alone.
+  A parked email is never retried automatically. Each one writes an **ERROR** entry to the activity log
+  (`email_outbox_parked_send_cap`) naming the row, the document and the recipient, and the run's
+  summary line counts it.
+
+  A parked email has entered the sender twice, so the customer **may** already have one copy or two.
+  Nothing in IMS can tell which, so check with the recipient or in your mail provider's sent log before
+  you act. Then an administrator with shell access runs one of these on the server (they are dry runs
+  until `--apply` is added):
+
+  - `npx tsx scripts/email-outbox-parked.ts` lists every parked email.
+  - `npx tsx scripts/email-outbox-parked.ts --row <id> --release --apply` puts it back in the queue for
+    one more send. Use this only if you have established that it did not arrive.
+  - `npx tsx scripts/email-outbox-parked.ts --row <id> --cancel --apply` marks it failed, so nothing
+    more is sent. It also frees the document's place, so the email button can queue a fresh copy.
+
+  Each action is written to the activity log. A released email keeps its count: if that send also
+  stays unfinished for fifteen minutes, the next run parks it again without taking it back. A release
+  never grants another take-back. (Ordinary retries after an SMTP error still apply, up to five
+  attempts in total.)
 
 ### Dispatch Email (direct orders)
 
